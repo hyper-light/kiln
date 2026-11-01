@@ -15,12 +15,13 @@ import { TableHold } from "@/components/ui/hold";
 import { Loadable } from "@/components/ui/loading";
 import { PageIntro, SectionHeading, SelectField, TextField } from "@/components/ui/misc";
 import { toast } from "@/components/ui/toast";
+import { useAction } from "@/lib/action";
 import { useRes } from "@/lib/data";
 import { absoluteDate, formatBytes, relativeTime } from "@/lib/format";
 import { errorMessage } from "@/lib/hooks";
 import { invalidate } from "@/lib/resource";
 import { swapped } from "@/lib/utils";
-import { archivesRes, cloudsRes, ObserveNav, rangeSaid, rehydrationSaid, rehydrationsRes } from "./parts";
+import { archivesRes, cloudsRes, HeldFields, ObserveNav, rangeSaid, rehydrationSaid, rehydrationsRes, useMoves, useOpening } from "./parts";
 
 const count = (n: number) => n.toLocaleString();
 const TONE: Record<ArchiveState, string> = { WORKING: "succeeded", FAILING: "failed", UNKNOWN: "skipped" };
@@ -106,28 +107,39 @@ function Head() {
 }
 
 function List({ onAdd, onEdit, onRehydrate }: { onAdd: () => void; onEdit: (a: Archive) => void; onRehydrate: (a: Archive) => void }) {
-  const all = useRes(archivesRes).data;
+  const res = useRes(archivesRes);
+  const all = res.data;
   const [removing, setRemoving] = React.useState<Archive | null>(null);
   const act = async (what: string, f: () => Promise<unknown>) => {
     try {
       await f();
       invalidate("observe/archives");
+      return true;
     } catch (e) {
       toast({ title: `Couldn't ${what}`, description: errorMessage(e), tone: "failed" });
+      return false;
     }
   };
+  const moves = useMoves();
+  // Moved at once (W21-R15), and put back if the server refuses.
   const move = (i: number, by: -1 | 1) => {
     const j = i + by;
-    if (j < 0 || j >= all.length) return;
-    void act("move it", () =>
-      observeApi.orderArchives(
-        swapped(
-          all.map((a) => a.id),
-          i,
-          j,
+    const a = all[i];
+    if (!a || j < 0 || j >= all.length) return;
+    moves.move(a.id, by, () => {
+      res.change((l) => swapped(l, i, j));
+      return act("move it", () =>
+        observeApi.orderArchives(
+          swapped(
+            all.map((x) => x.id),
+            i,
+            j,
+          ),
         ),
-      ),
-    );
+      ).then((ok) => {
+        if (!ok) invalidate(archivesRes.key);
+      });
+    });
   };
   if (all.length === 0)
     return (
@@ -167,10 +179,10 @@ function List({ onAdd, onEdit, onRehydrate }: { onAdd: () => void; onEdit: (a: A
               // On a phone they go under its name, which keeps the row's width.
               const controls = (
                 <>
-                  <Button variant="ghost" size="xs" aria-label={`Move ${a.name} up`} disabled={i === 0} onClick={() => move(i, -1)}>
+                  <Button variant="ghost" size="xs" aria-label={`Move ${a.name} up`} {...moves.props(a.id, -1, i === 0)} onClick={() => move(i, -1)}>
                     <ArrowUp />
                   </Button>
-                  <Button variant="ghost" size="xs" aria-label={`Move ${a.name} down`} disabled={i === all.length - 1} onClick={() => move(i, 1)}>
+                  <Button variant="ghost" size="xs" aria-label={`Move ${a.name} down`} {...moves.props(a.id, 1, i === all.length - 1)} onClick={() => move(i, 1)}>
                     <ArrowDown />
                   </Button>
                   <Button variant="ghost" size="xs" aria-label={`Rehydrate from ${a.name}`} title="Rehydrate: read a range of it back" onClick={() => onRehydrate(a)}>
@@ -310,7 +322,7 @@ const bodyOf = (f: Form, was: Archive | null): ArchiveIn => {
 function ArchiveDialog({ archive, onClose }: { archive: Archive | null; onClose: () => void }) {
   const clouds = useRes(cloudsRes).data;
   const [f, setF] = React.useState<Form>(() => formOf(archive));
-  const [busy, setBusy] = React.useState(false);
+  const opening = useOpening(f);
   const set = (patch: Partial<Form>) => setF((old) => ({ ...old, ...patch }));
   const kind = KIND[f.store];
   const fitting = clouds.filter((c) => c.kind === kind);
@@ -319,20 +331,13 @@ function ArchiveDialog({ archive, onClose }: { archive: Archive | null; onClose:
   const placed = f.store === "azure" ? storeName(f.account.trim()) && storeName(f.container.trim()) : storeName(f.bucket.trim());
   const prefix = f.path.replace(/^\/+|\/+$/g, "");
   const ok = f.name.trim() !== "" && cloud !== "" && placed && !(f.encryption === "SSE_KMS" && !f.key.trim()) && !f.path.split("/").includes("..");
-  const save = async () => {
-    setBusy(true);
-    try {
-      const body = bodyOf({ ...f, cloud }, archive);
-      const saved = archive ? await observeApi.updateArchive(archive.id, body) : await observeApi.createArchive(body);
-      invalidate("observe/archives");
-      toast({ title: archive ? "Saved" : "Made", description: `${saved.name}: the log files cut from now are written to ${where(saved.destination)}.`, tone: "succeeded" });
-      onClose();
-    } catch (err) {
-      toast({ title: "Couldn't save it", description: errorMessage(err), tone: "failed" });
-    } finally {
-      setBusy(false);
-    }
-  };
+  const [save, saving] = useAction(async () => {
+    const body = bodyOf({ ...f, cloud }, archive);
+    const saved = archive ? await observeApi.updateArchive(archive.id, body) : await observeApi.createArchive(body);
+    invalidate("observe/archives");
+    toast({ title: archive ? "Saved" : "Made", description: `${saved.name}: the log files cut from now are written to ${where(saved.destination)}.`, tone: "succeeded" });
+    if (opening.still(f)) onClose();
+  }, "Couldn't save it");
   return (
     <Dialog open onOpenChange={(o) => !o && onClose()}>
       <DialogContent
@@ -342,100 +347,103 @@ function ArchiveDialog({ archive, onClose }: { archive: Archive | null; onClose:
         }
       >
         <form
+          ref={opening.ref}
           className="space-y-4"
           onSubmit={(e) => {
             e.preventDefault();
-            if (ok) void save();
+            if (ok) save();
           }}
         >
-          <TextField label="Name" value={f.name} onChange={(e) => set({ name: e.target.value })} placeholder="everything, a year" required />
-          <TextField
-            label="Of the records"
-            value={f.query}
-            onChange={(e) => set({ query: e.target.value })}
-            placeholder="service:checkout"
-            className="font-mono"
-            spellCheck={false}
-            hint="A log search; empty, every record (kiln's own events only if it names source:kiln.event)."
-          />
-          <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
-            <SelectField
-              label="Store"
-              value={f.store}
-              onChange={(v) => set({ store: v === "gcs" || v === "azure" ? v : "s3" })}
-              options={Object.entries(STORES).map(([value, label]) => ({ value, label }))}
+          <HeldFields held={saving && !archive}>
+            <TextField label="Name" value={f.name} onChange={(e) => set({ name: e.target.value })} placeholder="everything, a year" required />
+            <TextField
+              label="Of the records"
+              value={f.query}
+              onChange={(e) => set({ query: e.target.value })}
+              placeholder="service:checkout"
+              className="font-mono"
+              spellCheck={false}
+              hint="A log search; empty, every record (kiln's own events only if it names source:kiln.event)."
             />
-            {fitting.length > 0 ? (
+            <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
               <SelectField
-                label={`${CLOUD[kind]} integration`}
-                value={cloud}
-                onChange={(v) => set({ cloud: v })}
-                options={[...(cloud ? [] : [{ value: "", label: "Choose one" }]), ...fitting.map((c) => ({ value: c.name, label: c.name }))]}
+                label="Store"
+                value={f.store}
+                onChange={(v) => set({ store: v === "gcs" || v === "azure" ? v : "s3" })}
+                options={Object.entries(STORES).map(([value, label]) => ({ value, label }))}
               />
+              {fitting.length > 0 ? (
+                <SelectField
+                  label={`${CLOUD[kind]} integration`}
+                  value={cloud}
+                  onChange={(v) => set({ cloud: v })}
+                  options={[...(cloud ? [] : [{ value: "", label: "Choose one" }]), ...fitting.map((c) => ({ value: c.name, label: c.name }))]}
+                />
+              ) : (
+                <div>
+                  <div className="field-label">{CLOUD[kind]} integration</div>
+                  <p className="field-hint">
+                    None yet: <Link to="/observe/integrations">make one in Integrations</Link>, paused if only archives write with it.
+                  </p>
+                </div>
+              )}
+            </div>
+            {f.store === "azure" ? (
+              <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
+                <TextField label="Storage account" value={f.account} onChange={(e) => set({ account: e.target.value })} placeholder="mylogs" spellCheck={false} />
+                <TextField label="Container" value={f.container} onChange={(e) => set({ container: e.target.value })} placeholder="archives" spellCheck={false} />
+              </div>
             ) : (
-              <div>
-                <div className="field-label">{CLOUD[kind]} integration</div>
-                <p className="field-hint">
-                  None yet: <Link to="/observe/integrations">make one in Integrations</Link>, paused if only archives write with it.
-                </p>
+              <TextField label="Bucket" value={f.bucket} onChange={(e) => set({ bucket: e.target.value })} placeholder="my-logs-archive" spellCheck={false} />
+            )}
+            <TextField
+              label="Path"
+              value={f.path}
+              onChange={(e) => set({ path: e.target.value })}
+              placeholder="/kiln"
+              className="font-mono"
+              spellCheck={false}
+              hint={`Its objects: ${prefix ? `${prefix}/` : ""}dt=YYYYMMDD/hour=HH/archive_….json.gz`}
+            />
+            {f.store === "s3" && (
+              <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
+                <TextField label="Region" value={f.region} onChange={(e) => set({ region: e.target.value })} placeholder="the integration's" spellCheck={false} />
+                <SelectField
+                  label="Storage class"
+                  value={f.storageClass}
+                  onChange={(v) => set({ storageClass: v })}
+                  options={[{ value: "", label: "The bucket's" }, ...STORAGE_CLASSES.map((c) => ({ value: c, label: c }))]}
+                />
+                <SelectField
+                  label="Encryption"
+                  value={f.encryption}
+                  onChange={(v) => set({ encryption: v === "NO_OVERRIDE" || v === "SSE_S3" || v === "SSE_KMS" ? v : "" })}
+                  options={[
+                    { value: "", label: "The bucket's" },
+                    { value: "SSE_S3", label: "S3's keys (SSE-S3)" },
+                    { value: "SSE_KMS", label: "A KMS key (SSE-KMS)" },
+                  ]}
+                />
+                {f.encryption === "SSE_KMS" && <TextField label="KMS key" value={f.key} onChange={(e) => set({ key: e.target.value })} placeholder="arn:aws:kms:…" spellCheck={false} />}
               </div>
             )}
-          </div>
-          {f.store === "azure" ? (
-            <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
-              <TextField label="Storage account" value={f.account} onChange={(e) => set({ account: e.target.value })} placeholder="mylogs" spellCheck={false} />
-              <TextField label="Container" value={f.container} onChange={(e) => set({ container: e.target.value })} placeholder="archives" spellCheck={false} />
-            </div>
-          ) : (
-            <TextField label="Bucket" value={f.bucket} onChange={(e) => set({ bucket: e.target.value })} placeholder="my-logs-archive" spellCheck={false} />
-          )}
-          <TextField
-            label="Path"
-            value={f.path}
-            onChange={(e) => set({ path: e.target.value })}
-            placeholder="/kiln"
-            className="font-mono"
-            spellCheck={false}
-            hint={`Its objects: ${prefix ? `${prefix}/` : ""}dt=YYYYMMDD/hour=HH/archive_….json.gz`}
-          />
-          {f.store === "s3" && (
-            <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
-              <TextField label="Region" value={f.region} onChange={(e) => set({ region: e.target.value })} placeholder="the integration's" spellCheck={false} />
-              <SelectField
-                label="Storage class"
-                value={f.storageClass}
-                onChange={(v) => set({ storageClass: v })}
-                options={[{ value: "", label: "The bucket's" }, ...STORAGE_CLASSES.map((c) => ({ value: c, label: c }))]}
-              />
-              <SelectField
-                label="Encryption"
-                value={f.encryption}
-                onChange={(v) => set({ encryption: v === "NO_OVERRIDE" || v === "SSE_S3" || v === "SSE_KMS" ? v : "" })}
-                options={[
-                  { value: "", label: "The bucket's" },
-                  { value: "SSE_S3", label: "S3's keys (SSE-S3)" },
-                  { value: "SSE_KMS", label: "A KMS key (SSE-KMS)" },
-                ]}
-              />
-              {f.encryption === "SSE_KMS" && <TextField label="KMS key" value={f.key} onChange={(e) => set({ key: e.target.value })} placeholder="arn:aws:kms:…" spellCheck={false} />}
-            </div>
-          )}
-          <TextField
-            label="Endpoint"
-            value={f.endpoint}
-            onChange={(e) => set({ endpoint: e.target.value })}
-            placeholder={f.store === "s3" ? "AWS's" : f.store === "gcs" ? "Google's" : `https://${f.account.trim() || "<account>"}.blob.core.windows.net`}
-            spellCheck={false}
-            hint={f.store === "s3" ? "Another S3-compatible store's address (MinIO, R2, …): objects at <endpoint>/<bucket>/<key>." : "Another address of the store's (an emulator's)."}
-          />
-          <label className="flex items-center gap-2 text-[13px] text-[#c8cad0]">
-            <input type="checkbox" className="check" checked={f.tags} onChange={(e) => set({ tags: e.target.checked })} /> Events carry their tags (service, host, source, env, version)
-          </label>
+            <TextField
+              label="Endpoint"
+              value={f.endpoint}
+              onChange={(e) => set({ endpoint: e.target.value })}
+              placeholder={f.store === "s3" ? "AWS's" : f.store === "gcs" ? "Google's" : `https://${f.account.trim() || "<account>"}.blob.core.windows.net`}
+              spellCheck={false}
+              hint={f.store === "s3" ? "Another S3-compatible store's address (MinIO, R2, …): objects at <endpoint>/<bucket>/<key>." : "Another address of the store's (an emulator's)."}
+            />
+            <label className="flex items-center gap-2 text-[13px] text-[#c8cad0]">
+              <input type="checkbox" className="check" checked={f.tags} onChange={(e) => set({ tags: e.target.checked })} /> Events carry their tags (service, host, source, env, version)
+            </label>
+          </HeldFields>
           <div className="flex justify-end gap-2">
             <Button variant="ghost" onClick={onClose}>
               Cancel
             </Button>
-            <Button type="submit" disabled={!ok || busy}>
+            <Button type="submit" disabled={!ok} pending={saving}>
               {archive ? "Save" : "Make it"}
             </Button>
           </div>
@@ -590,7 +598,7 @@ function RehydrateDialog({ archiveId, onClose }: { archiveId: string; onClose: (
     const now = Date.now();
     return { name: "", archive: archiveId || (archives[0]?.id ?? ""), query: "", from: localInput(now - 86_400_000), to: localInput(now), days: "15", gb: "" };
   });
-  const [busy, setBusy] = React.useState(false);
+  const opening = useOpening(f);
   const set = (patch: Partial<typeof f>) => setF((old) => ({ ...old, ...patch }));
   // A time picked to the minute: "to 15:54" holds 15:54's records too.
   const from = new Date(f.from).getTime();
@@ -601,27 +609,20 @@ function RehydrateDialog({ archiveId, onClose }: { archiveId: string; onClose: (
   const bound = archives.find((a) => a.id === f.archive)?.rehydration_max_scan_size_in_gb;
   const ranged = Number.isFinite(from) && Number.isFinite(to) && to > from;
   const ok = f.name.trim() !== "" && f.archive !== "" && ranged && Number.isInteger(days) && days >= 1 && days <= 180 && (gb === undefined || (Number.isFinite(gb) && gb > 0));
-  const save = async () => {
-    setBusy(true);
-    try {
-      const made = await observeApi.createRehydration({
-        name: f.name.trim(),
-        archive_id: f.archive,
-        query: f.query.trim() || "*",
-        from,
-        to,
-        retention_days: days,
-        ...(gb !== undefined ? { max_scan_size_in_gb: gb } : {}),
-      });
-      invalidate("observe/rehydrations");
-      toast({ title: "Asked", description: `${made.name}: its records are read from ${made.archive}, and searched in the logs explorer as they come.`, tone: "succeeded" });
-      onClose();
-    } catch (err) {
-      toast({ title: "Couldn't rehydrate", description: errorMessage(err), tone: "failed" });
-    } finally {
-      setBusy(false);
-    }
-  };
+  const [save, saving] = useAction(async () => {
+    const made = await observeApi.createRehydration({
+      name: f.name.trim(),
+      archive_id: f.archive,
+      query: f.query.trim() || "*",
+      from,
+      to,
+      retention_days: days,
+      ...(gb !== undefined ? { max_scan_size_in_gb: gb } : {}),
+    });
+    invalidate("observe/rehydrations");
+    toast({ title: "Asked", description: `${made.name}: its records are read from ${made.archive}, and searched in the logs explorer as they come.`, tone: "succeeded" });
+    if (opening.still(f)) onClose();
+  }, "Couldn't rehydrate");
   return (
     <Dialog open onOpenChange={(o) => !o && onClose()}>
       <DialogContent
@@ -632,45 +633,48 @@ function RehydrateDialog({ archiveId, onClose }: { archiveId: string; onClose: (
           <p className="field-hint">No archive yet: make one first, and its records can be read back once it has written them.</p>
         ) : (
           <form
+            ref={opening.ref}
             className="space-y-4"
             onSubmit={(e) => {
               e.preventDefault();
-              if (ok) void save();
+              if (ok) save();
             }}
           >
-            <TextField label="Name" value={f.name} onChange={(e) => set({ name: e.target.value })} placeholder="checkout errors, last March" required />
-            <SelectField label="From the archive" value={f.archive} onChange={(v) => set({ archive: v })} options={archives.map((a) => ({ value: a.id, label: a.name }))} />
-            <TextField
-              label="Of the records"
-              value={f.query}
-              onChange={(e) => set({ query: e.target.value })}
-              placeholder="service:checkout status:error"
-              className="font-mono"
-              spellCheck={false}
-              hint="A log search; empty, every record of the range."
-            />
-            <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
-              <TextField label="From" type="datetime-local" value={f.from} onChange={(e) => set({ from: e.target.value })} />
-              <TextField label="To" type="datetime-local" value={f.to} onChange={(e) => set({ to: e.target.value })} hint={ranged ? undefined : "After it starts"} />
-            </div>
-            <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
-              <TextField label="Kept for (days)" type="number" min={1} max={180} value={f.days} onChange={(e) => set({ days: e.target.value })} hint="1 to 180." />
+            <HeldFields held={saving}>
+              <TextField label="Name" value={f.name} onChange={(e) => set({ name: e.target.value })} placeholder="checkout errors, last March" required />
+              <SelectField label="From the archive" value={f.archive} onChange={(v) => set({ archive: v })} options={archives.map((a) => ({ value: a.id, label: a.name }))} />
               <TextField
-                label="Read at most (GB)"
-                type="number"
-                min={0}
-                step="any"
-                value={f.gb}
-                onChange={(e) => set({ gb: e.target.value })}
-                placeholder={bound === undefined ? "no bound" : `${bound} (the archive's)`}
-                hint="Of its objects, gzip'd: past it, it stops."
+                label="Of the records"
+                value={f.query}
+                onChange={(e) => set({ query: e.target.value })}
+                placeholder="service:checkout status:error"
+                className="font-mono"
+                spellCheck={false}
+                hint="A log search; empty, every record of the range."
               />
-            </div>
+              <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
+                <TextField label="From" type="datetime-local" value={f.from} onChange={(e) => set({ from: e.target.value })} />
+                <TextField label="To" type="datetime-local" value={f.to} onChange={(e) => set({ to: e.target.value })} hint={ranged ? undefined : "After it starts"} />
+              </div>
+              <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
+                <TextField label="Kept for (days)" type="number" min={1} max={180} value={f.days} onChange={(e) => set({ days: e.target.value })} hint="1 to 180." />
+                <TextField
+                  label="Read at most (GB)"
+                  type="number"
+                  min={0}
+                  step="any"
+                  value={f.gb}
+                  onChange={(e) => set({ gb: e.target.value })}
+                  placeholder={bound === undefined ? "no bound" : `${bound} (the archive's)`}
+                  hint="Of its objects, gzip'd: past it, it stops."
+                />
+              </div>
+            </HeldFields>
             <div className="flex justify-end gap-2">
               <Button variant="ghost" onClick={onClose}>
                 Cancel
               </Button>
-              <Button type="submit" disabled={!ok || busy}>
+              <Button type="submit" disabled={!ok} pending={saving}>
                 Rehydrate
               </Button>
             </div>

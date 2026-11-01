@@ -19,6 +19,7 @@ import { foldChips, sameFold, UNFOLDED, type Fold } from "@/components/ui/facet-
 import { Loadable } from "@/components/ui/loading";
 import { toast } from "@/components/ui/toast";
 import { Tip } from "@/components/ui/tooltip";
+import { sendingProps, useActions } from "@/lib/action";
 import { errorMessage, useMediaQuery } from "@/lib/hooks";
 import { useSuspenseResource } from "@/lib/resource";
 import { cn } from "@/lib/utils";
@@ -44,6 +45,8 @@ interface Ask {
   ask: string;
   label: string;
   danger?: boolean;
+  /** Who it's for: their ids, joined. */
+  to: string;
   run: () => Promise<unknown>;
 }
 
@@ -228,9 +231,8 @@ function Bar({
   const { files, pending } = attachments;
   const picker = React.useRef<HTMLInputElement>(null);
   const [ask, setAsk] = React.useState<Ask | null>(null);
-  const [busy, setBusy] = React.useState(false);
-  /** The last thing sent and its key, until it comes back sent. */
-  const lastTry = React.useRef<{ said: string; key: string } | null>(null);
+  /** The last thing sent to each set of agents and its key, until it comes back sent. */
+  const lastTry = React.useRef(new Map<string, { said: string; key: string }>());
   const [report, setReport] = React.useState<BroadcastReport | null>(null);
   /** On its way to this many agents (0: nothing is). */
   const [sending, setSending] = React.useState(0);
@@ -248,6 +250,7 @@ function Bar({
   const roomy = useMediaQuery("(min-width: 640px)");
 
   const ids = agents.map((a) => a.id);
+  const to = ids.join(",");
   const key = everyone.map((a) => a.id).join(",");
   // A different set of agents: whatever was being asked, and the settings held, are for the old one.
   const [askedOf, setAskedOf] = React.useState(key);
@@ -265,28 +268,46 @@ function Bar({
   const waiting = agents.reduce((s, a) => s + a.approvals.filter((p) => p.tool !== "question" && p.tool !== "plan").length, 0);
 
   const send = async (body: Omit<BroadcastBody, "to">) => {
-    setBusy(true);
-    // The same thing sent again after a try that didn't come back goes under the same key: each
-    // agent gets it once (CP-T3.2), its id made from the key and the agent. Anything else is new.
-    // The key is for what was said, not for the list's order or whose turn it shows, which change
-    // as agents start working.
+    // The same thing sent again to the same agents after a try that didn't come back goes under the
+    // same key: each agent gets it once (CP-T3.2), its id made from the key and the agent. Anything
+    // else is new. The key is for what was said, not for the list's order or whose turn it shows,
+    // which change as agents start working.
     const said = JSON.stringify(body);
-    const key = lastTry.current?.said === said ? lastTry.current.key : clientId();
-    lastTry.current = { said, key };
+    const tried = lastTry.current.get(to);
+    const key = tried?.said === said ? tried.key : clientId();
+    lastTry.current.set(to, { said, key });
     try {
       setReport(await harnessApi.broadcastTo({ to: { ids }, ...body, key }));
-      lastTry.current = null;
+      if (lastTry.current.get(to)?.key === key) lastTry.current.delete(to);
       setReportOpen(false);
       if (body.attachments) attachments.clear();
       return true;
     } catch (e) {
       toast.error("Couldn't send", errorMessage(e));
       return false;
-    } finally {
-      setBusy(false);
-      setAsk(null);
     }
   };
+  // One send at a time to the same agents (W21-R15): the control pressed says it's on its way and
+  // the others that would send to them wait, so each try keeps its key (CP-T3.2); a send to other
+  // agents doesn't wait. Cancel still puts a line away, and what was confirmed goes on.
+  const [out, setOut] = React.useState<ReadonlyMap<string, Ask | null>>(() => new Map());
+  const [deliver] = useActions((to: string, a: Ask | null, go: () => Promise<unknown>) => {
+    setOut((o) => new Map(o).set(to, a));
+    return go().finally(() => {
+      setOut((o) => {
+        const left = new Map(o);
+        left.delete(to);
+        return left;
+      });
+      // Its line goes once it's done, unless another was asked since.
+      if (a) setAsk((cur) => (cur === a ? null : cur));
+    });
+  });
+  /** What's on its way to these agents: the line it was confirmed in, null for a message from the box (undefined: nothing). */
+  const going = out.get(to);
+  /** The same, for the agents of the line on show. */
+  const lineGoing = shownAsk ? out.get(shownAsk.to) : undefined;
+  const asking = (a: Omit<Ask, "to">) => setAsk({ ...a, to });
   const command = (c: Command) => send({ command: c });
   // Every tool call waiting on them, answered: shown so at once (answered.ts), back if it didn't go.
   const answerAll = async (decision: "allow" | "deny") => {
@@ -341,7 +362,7 @@ function Bar({
   };
   const sendText = () => {
     const body = text.trim();
-    if ((!body && files.length === 0) || pending > 0 || n === 0 || busy) return;
+    if ((!body && files.length === 0) || pending > 0 || n === 0 || going !== undefined) return;
     // One of kiln's own: asked in the line under the field, not sent.
     const typed = parseSlash(body);
     if (typed && kilns(typed.name) && !typed.args && files.length === 0) {
@@ -349,10 +370,10 @@ function Bar({
       choose(typed.name);
       return;
     }
-    // The field empties at once (the line under it says it's on its way); the words come back
-    // if it didn't go and nothing new was typed meanwhile.
+    // The field empties at once, if it still says what's sent (the line under it says it's on its
+    // way); the words come back if it didn't go and nothing new was typed meanwhile.
     const go = async () => {
-      setText("");
+      setText((t) => (t.trim() === body ? "" : t));
       setSending(n);
       // The settings chosen, applied to them first (each a command to every one of them).
       const settings: Command[] = [];
@@ -368,19 +389,23 @@ function Bar({
     };
     const risky = tune.mode ? modes.find((m) => m.id === tune.mode)?.dangerous : false;
     if (risky)
-      setAsk({
+      asking({
         ask: `Switch ${count(n, "agent")} to ${modes.find((m) => m.id === tune.mode)?.label ?? tune.mode} and send? It skips permission checks.`,
         label: "Send",
         danger: true,
         run: go,
       });
     else if (mode === "now" && working > 0)
-      setAsk({
+      asking({
         ask: `Stop the turn of ${count(working, "working agent")} and send this now?`,
         label: "Send now",
         run: go,
       });
-    else void go();
+    else {
+      // Sent from the box instead of answering what's asked: that line goes.
+      setAsk(null);
+      deliver(to, null, go);
+    }
   };
 
   const modes = preview?.modes ?? [];
@@ -397,37 +422,36 @@ function Bar({
       return;
     }
     if (what === "interrupt")
-      setAsk({
+      asking({
         ask: `Stop the turn of ${count(working, "working agent")}?`,
         label: "Interrupt",
         run: () => command({ type: "interrupt" }),
       });
     else if (what === "restart")
-      setAsk({
+      asking({
         ask: `Restart ${many}?`,
         label: "Restart",
         run: () => command({ type: "restart" }),
       });
     else if (what === "allow")
-      setAsk({
+      asking({
         ask: `Allow ${count(waiting, "tool call")} waiting on you?`,
         label: "Allow",
         run: () => answerAll("allow"),
       });
     else if (what === "deny")
-      setAsk({
+      asking({
         ask: `Deny ${count(waiting, "tool call")} waiting on you?`,
         label: "Deny",
         run: () => answerAll("deny"),
       });
     else if (what === "end")
-      setAsk({
+      asking({
         ask: `End ${many}? Their processes stop on their machines.`,
         label: "End",
         danger: true,
         run: async () => {
           await Promise.allSettled(ids.map((id) => harnessApi.stop(id)));
-          setAsk(null);
           onEnded?.();
         },
       });
@@ -559,7 +583,7 @@ function Bar({
             <span className="cp-gap" />
             {working > 0 && (
               <Tip content={`Stop the turn of ${count(working, "working agent")}`}>
-                <button type="button" className="cp-stop" disabled={busy || n === 0} onClick={() => choose("interrupt")} aria-label={`Stop ${count(working, "working agent")}`}>
+                <button type="button" className="cp-stop" disabled={n === 0 || going !== undefined} onClick={() => choose("interrupt")} aria-label={`Stop ${count(working, "working agent")}`}>
                   <Square size={10} fill="currentColor" />
                   <span className="cp-label">Stop</span>
                 </button>
@@ -569,7 +593,8 @@ function Bar({
               type="button"
               className="cp-send"
               data-mode={working > 0 ? mode : "send"}
-              disabled={busy || (!text.trim() && files.length === 0) || pending > 0 || n === 0}
+              disabled={(!text.trim() && files.length === 0) || pending > 0 || n === 0 || !!going}
+              {...sendingProps(going === null)}
               onClick={sendText}
               aria-label={`${sendLabel} to ${n}`}
             >
@@ -645,10 +670,16 @@ function Bar({
         <Slide open={ask !== null} onGone={askGone}>
           <div className="ms-msg-line" role="group" aria-label="Confirm">
             <span className="ms-msg-ask">{shownAsk.ask}</span>
-            <Button size="xs" variant={shownAsk.danger ? "danger" : "primary"} disabled={busy} onClick={() => void shownAsk.run()}>
+            <Button
+              size="xs"
+              variant={shownAsk.danger ? "danger" : "primary"}
+              pending={lineGoing === shownAsk}
+              disabled={lineGoing !== undefined && lineGoing !== shownAsk}
+              onClick={() => deliver(shownAsk.to, shownAsk, shownAsk.run)}
+            >
               {shownAsk.label}
             </Button>
-            <Button size="xs" variant="ghost" disabled={busy} onClick={() => setAsk(null)}>
+            <Button size="xs" variant="ghost" onClick={() => setAsk(null)}>
               Cancel
             </Button>
           </div>

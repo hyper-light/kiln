@@ -12,6 +12,7 @@ import { Button } from "@/components/ui/button";
 import { Hold } from "@/components/ui/hold";
 import { Facts } from "@/components/ui/misc";
 import { SettingRow, SettingsGroup } from "@/components/ui/settings";
+import { useAction } from "@/lib/action";
 import { errorMessage } from "@/lib/hooks";
 import { useSuspenseResource } from "@/lib/resource";
 
@@ -40,20 +41,19 @@ function postToGithub(action: string, manifest: string) {
 export function GithubGroup() {
   const app = useSuspenseResource("ci/github/app", (s) => deployApi.githubApp(s)).data;
   const [org, setOrg] = React.useState("");
-  const [busy, setBusy] = React.useState(false);
   const [error, setError] = React.useState<string | null>(null);
+  // Posted to GitHub, the page goes there: the button says so until it has (W21-R15).
+  const [leaving, setLeaving] = React.useState(false);
   const created = typeof window !== "undefined" && new URLSearchParams(window.location.search).get("github") === "created";
-  const create = async () => {
-    setBusy(true);
-    setError(null);
-    try {
+  const [create, creating] = useAction(
+    async () => {
+      setError(null);
       const r = await request<{ action: string; manifest: string }>("POST", "/api/ci/github/app/manifest", org.trim() ? { org: org.trim() } : {});
+      setLeaving(true);
       postToGithub(r.action, r.manifest);
-    } catch (e) {
-      setError(errorMessage(e));
-      setBusy(false);
-    }
-  };
+    },
+    (e) => setError(errorMessage(e)),
+  );
   return (
     <SettingsGroup
       id="ci.github"
@@ -83,7 +83,7 @@ export function GithubGroup() {
           noValidate
           onSubmit={(e) => {
             e.preventDefault();
-            void create();
+            create();
           }}
         >
           <SettingRow label="Organization" htmlFor="st-gh-org" help="Where GitHub makes the App: an organization you own, or none for your own account.">
@@ -91,7 +91,7 @@ export function GithubGroup() {
               <div className="field st-wide">
                 <input id="st-gh-org" type="text" spellCheck={false} placeholder="Your account" value={org} onChange={(e) => setOrg(e.target.value)} />
               </div>
-              <Button type="submit" size="xs" disabled={busy}>
+              <Button type="submit" size="xs" pending={creating || leaving}>
                 Create kiln's GitHub App
               </Button>
             </div>

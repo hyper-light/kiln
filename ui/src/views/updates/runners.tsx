@@ -15,6 +15,7 @@ import { Button } from "@/components/ui/button";
 import { Confirm } from "@/components/ui/misc";
 import { StatusDot } from "@/components/ui/status";
 import { toast } from "@/components/ui/toast";
+import { useAction, useActions } from "@/lib/action";
 import { fuller, useUpdateJobs } from "@/lib/data";
 import { formatDuration, shortSha } from "@/lib/format";
 import { errorMessage, useNow } from "@/lib/hooks";
@@ -75,7 +76,6 @@ export function MachinesPanel({ resource, fleet, server, serverJob, serverPendin
   const data = resource.data;
   const newest = data.newest ?? null;
   const [confirm, setConfirm] = React.useState<Confirming | null>(null);
-  const [starting, setStarting] = React.useState(false);
   // Runners chosen for one update policy at once, and that policy.
   const [selected, setSelected] = React.useState<Set<string>>(() => new Set());
   const [bulk, setBulk] = React.useState<UpdatePolicy>("notify");
@@ -83,7 +83,6 @@ export function MachinesPanel({ resource, fleet, server, serverJob, serverPendin
   const [policyErrors, setPolicyErrors] = React.useState<Record<string, string>>({});
   const [bulkBusy, setBulkBusy] = React.useState(false);
   const policyRequests = React.useRef(new Set<string>());
-  const [checking, setChecking] = React.useState(false);
   // The machines whose upgrade output is open: "server" and runners' names.
   const [outputs, setOutputs] = React.useState<Set<string>>(() => new Set());
   // How long kiln waits, being changed: the field to start in.
@@ -91,7 +90,7 @@ export function MachinesPanel({ resource, fleet, server, serverJob, serverPendin
   // The runner an agent is being started for, to find out why its upgrade failed.
   const navigate = useNavigate();
   const uploads = useUploadPicker();
-  const uploading = useUploading((s) => s.target);
+  const uploading = useUploading((s) => s.targets);
 
   const selectable = data.runners.filter((r) => !r.locked);
   const selectedNames = selectable.filter((r) => selected.has(r.name)).map((r) => r.name);
@@ -115,17 +114,10 @@ export function MachinesPanel({ resource, fleet, server, serverJob, serverPendin
     useUpdateJobs.setState((m) => ({ ...m, [job.id]: fuller(m[job.id], job) }), true);
   };
 
-  const check = async () => {
-    setChecking(true);
-    try {
-      await api.checkUpdates();
-      invalidate("updates");
-    } catch (e) {
-      toast.error("Couldn't check for updates", errorMessage(e));
-    } finally {
-      setChecking(false);
-    }
-  };
+  const [check, checking] = useAction(async () => {
+    await api.checkUpdates();
+    invalidate("updates");
+  }, "Couldn't check for updates");
 
   const startRunner = async (r: RunnerUpdate, way?: UpgradeWay) => {
     try {
@@ -223,7 +215,32 @@ export function MachinesPanel({ resource, fleet, server, serverJob, serverPendin
   };
 
   const runningRunners = new Set(fleet.upgrading.map((e) => e.r.name));
-  const plan = (scope: string) => (confirm?.scope === scope ? <InlinePlan key={confirm.title} confirm={confirm} onClose={() => setConfirm(null)} onBusyChange={setStarting} /> : null);
+  // One start at a time for each thing (the server, every runner at once, a runner), by its
+  // confirm's scope: the confirm pressed says it's on its way, what would start that thing again is
+  // held until it's answered (Cancel still closes the confirm), and the answer closes, or says why
+  // in, only the confirm it was pressed in (W21-R15).
+  const [failed, setFailed] = React.useState<{ confirm: Confirming; why: string } | null>(null);
+  const [start, starting] = useActions(async (_scope: string, c: Confirming) => {
+    setFailed((f) => (f?.confirm === c ? null : f));
+    try {
+      await c.run();
+      setConfirm((cur) => (cur === c ? null : cur));
+    } catch (e) {
+      setFailed({ confirm: c, why: errorMessage(e) });
+    }
+  });
+  const runnerStarting = fleet.runners.some((e) => starting(`runner:${e.r.name}`));
+  const plan = (scope: string) =>
+    confirm?.scope === scope ? (
+      <InlinePlan
+        key={confirm.title}
+        confirm={confirm}
+        starting={starting(scope)}
+        problem={failed?.confirm === confirm ? failed.why : null}
+        onStart={() => start(scope, confirm)}
+        onClose={() => setConfirm(null)}
+      />
+    ) : null;
 
   return (
     <section className="up-panel" aria-labelledby="up-machines-title">
@@ -235,14 +252,15 @@ export function MachinesPanel({ resource, fleet, server, serverJob, serverPendin
           {data.follow === false && <p>Automatic upgrades are disabled on this server. Runners can still be upgraded here.</p>}
         </div>
         <div className="up-panel-actions up-fleet-actions">
-          <Button size="xs" variant="ghost" className="up-check-updates" disabled={checking || data.server.checking} onClick={() => void check()}>
-            <RefreshCw className={cn((checking || data.server.checking) && "animate-spin motion-reduce:animate-none")} /> Check for updates
+          <Button size="xs" variant="ghost" className="up-check-updates" pending={checking} disabled={data.server.checking} onClick={check}>
+            <RefreshCw className={cn(data.server.checking && "animate-spin motion-reduce:animate-none")} /> Check for updates
           </Button>
           <Button
             size="xs"
             variant="secondary"
             className="up-upgrade-all"
-            disabled={starting || fleet.ready.length === 0 || fleet.ready.every((r) => runningRunners.has(r.name))}
+            pending={starting("all") && confirm?.scope !== "all"}
+            disabled={fleet.ready.length === 0 || fleet.ready.every((r) => runningRunners.has(r.name)) || (starting("all") && confirm?.scope === "all") || runnerStarting}
             onClick={() =>
               setConfirm({
                 scope: "all",
@@ -260,14 +278,28 @@ export function MachinesPanel({ resource, fleet, server, serverJob, serverPendin
       </header>
       {confirm?.scope === "all" && <div className="up-wide">{plan("all")}</div>}
       {selectedNames.length > 0 && (
-        <div className="up-bulk" aria-label="Selected runner actions" aria-busy={bulkBusy}>
+        <div className="up-bulk" aria-label="Selected runner actions">
           <span className="up-bulk-count">{selectedNames.length} selected</span>
-          <PolicySelect label="Updates for the selected runners" value={bulk} onChange={setBulk} disabled={bulkBusy} />
-          <Button size="xs" variant="secondary" disabled={Object.keys(policyPending).length > 0} onClick={() => void setPolicy(selectedNames, bulk, true)}>
+          <PolicySelect label="Updates for the selected runners" value={bulk} onChange={setBulk} />
+          <Button
+            size="xs"
+            variant="secondary"
+            pending={bulkBusy}
+            disabled={!bulkBusy && selectedNames.some((name) => policyPending[name] !== undefined)}
+            onClick={() => void setPolicy(selectedNames, bulk, true)}
+          >
             {bulkBusy ? "Saving…" : "Apply"}
           </Button>
           <span className="up-spacer" />
-          <Button size="xs" variant="ghost" disabled={bulkBusy} onClick={() => setSelected(new Set())}>
+          <Button
+            size="xs"
+            variant="ghost"
+            disabled={bulkBusy}
+            onClick={() => {
+              setSelected(new Set());
+              setPolicyErrors((prev) => ({ ...prev, bulk: "" }));
+            }}
+          >
             Clear
           </Button>
           {policyErrors.bulk && (
@@ -298,7 +330,7 @@ export function MachinesPanel({ resource, fleet, server, serverJob, serverPendin
           view={server}
           job={serverJob}
           pending={serverPending}
-          starting={starting}
+          starting={starting("server")}
           uploading={uploading}
           picked={picked === "server"}
           output={outputs.has("server")}
@@ -324,8 +356,9 @@ export function MachinesPanel({ resource, fleet, server, serverJob, serverPendin
             newest={newest}
             picked={picked === `runner:${e.r.name}`}
             selected={selectedNames.includes(e.r.name)}
-            selectionDisabled={bulkBusy}
-            starting={starting}
+            bulkSaving={bulkBusy}
+            starting={starting(`runner:${e.r.name}`)}
+            held={starting("all")}
             uploading={uploading}
             plan={plan(`runner:${e.r.name}`)}
             output={outputs.has(e.r.name)}
@@ -397,42 +430,26 @@ function StateCell({ tone, word, sub, moving, title }: { tone: Tone; word: strin
   );
 }
 
-/** Confirm an upgrade in place, showing step by step what it will do. */
-function InlinePlan({ confirm, onClose, onBusyChange }: { confirm: Confirming; onClose: () => void; onBusyChange: (busy: boolean) => void }) {
-  const [busy, setBusy] = React.useState(false);
-  const [problem, setProblem] = React.useState<string | null>(null);
+/**
+ * Confirm an upgrade in place, showing step by step what it will do. `starting`: what it confirms is
+ * on its way (from here, or from this thing's confirm closed meanwhile): the other ways wait for it.
+ */
+function InlinePlan({ confirm, starting, problem, onStart, onClose }: { confirm: Confirming; starting: boolean; problem: string | null; onStart: () => void; onClose: () => void }) {
   return (
     <Confirm
       className="up-confirm"
       label={confirm.title}
       actions={
         <>
-          <Button
-            size="xs"
-            disabled={busy}
-            onClick={async () => {
-              setBusy(true);
-              onBusyChange(true);
-              setProblem(null);
-              try {
-                await confirm.run();
-                onClose();
-              } catch (e) {
-                setProblem(errorMessage(e));
-              } finally {
-                setBusy(false);
-                onBusyChange(false);
-              }
-            }}
-          >
-            {busy ? "Starting…" : confirm.confirmLabel}
+          <Button size="xs" pending={starting} onClick={onStart}>
+            {starting ? "Starting…" : confirm.confirmLabel}
           </Button>
           {confirm.instead?.map((w) => (
-            <Button key={w.label} size="xs" variant="ghost" disabled={busy} onClick={w.ask}>
+            <Button key={w.label} size="xs" variant="ghost" disabled={starting} onClick={w.ask}>
               {w.label}
             </Button>
           ))}
-          <Button size="xs" variant="ghost" disabled={busy} onClick={onClose}>
+          <Button size="xs" variant="ghost" onClick={onClose}>
             Cancel
           </Button>
         </>
@@ -471,8 +488,10 @@ function ServerRows({
   view: ServerView;
   job: UpdateJob | undefined;
   pending: boolean;
+  /** Its upgrade, confirmed, is on its way: its confirm says so, and once that's closed its button does. */
   starting: boolean;
-  uploading: string | null;
+  /** The platforms whose binary is being uploaded. */
+  uploading: string[];
   picked: boolean;
   output: boolean;
   onOutput: () => void;
@@ -482,7 +501,8 @@ function ServerRows({
   /** Its upgrade, being confirmed. */
   plan: React.ReactNode;
 }) {
-  const busy = job?.state === "running" || pending || starting;
+  const busy = job?.state === "running" || pending;
+  const held = starting && plan !== null;
   const { os, arch } = platformOf(s.target);
   return (
     <tbody className="up-machine" data-hl={picked || undefined}>
@@ -511,18 +531,18 @@ function ServerRows({
         <td className="up-c-act">
           <span className="up-acts" data-lead={(s.action === "restart" && s.newer) || (s.action === "replace" && s.replacement) ? "pill" : undefined}>
             {s.action === "restart" && (s.newer || !!s.image?.error) && (
-              <Button size="xs" variant={s.newer ? "secondary" : "ghost"} disabled={busy} onClick={() => onAction("restart")}>
+              <Button size="xs" variant={s.newer ? "secondary" : "ghost"} pending={starting && !held} disabled={busy || held} onClick={() => onAction("restart")}>
                 {s.newer ? <CircleArrowUp /> : <RotateCcw />} {s.newer ? "Upgrade server" : "Restart anyway"}
               </Button>
             )}
             {s.action === "replace" && s.replacement && (
-              <Button size="xs" variant="secondary" disabled={busy} onClick={() => onAction("replace")}>
+              <Button size="xs" variant="secondary" pending={starting && !held} disabled={busy || held} onClick={() => onAction("replace")}>
                 <CircleArrowUp /> {s.replacement.origin === "upload" ? `Install build ${s.replacement.build ?? ""}` : `Install kiln ${s.replacement.version ?? ""}`}
               </Button>
             )}
             {s.mode !== "kubernetes" && (
-              <Button size="xs" variant="ghost" disabled={uploading !== null} onClick={onUpload}>
-                <Upload /> {uploading === s.target ? "Uploading…" : "Upload a build"}
+              <Button size="xs" variant="ghost" pending={uploading.includes(s.target)} onClick={onUpload}>
+                <Upload /> {uploading.includes(s.target) ? "Uploading…" : "Upload a build"}
               </Button>
             )}
             {job && (
@@ -609,8 +629,9 @@ function RunnerRows({
   newest,
   picked,
   selected,
-  selectionDisabled,
+  bulkSaving,
   starting,
+  held,
   uploading,
   plan,
   output,
@@ -628,9 +649,13 @@ function RunnerRows({
   newest: FleetTarget | null;
   picked: boolean;
   selected: boolean;
-  selectionDisabled: boolean;
+  /** An update policy is being applied to the selected runners: the selection stays as it is meanwhile. */
+  bulkSaving: boolean;
+  /** Its upgrade, confirmed, is on its way (its Upgrade says so once its confirm is closed); `held`: every runner's is. */
   starting: boolean;
-  uploading: string | null;
+  held: boolean;
+  /** The platforms whose binary is being uploaded. */
+  uploading: string[];
   plan: React.ReactNode;
   output: boolean;
   policyPending: UpdatePolicy | undefined;
@@ -661,20 +686,24 @@ function RunnerRows({
       setDiag((s) => ({ ...(s ?? {}), looking: false, error: errorMessage(err) }));
     }
   };
-  const repair = async (f: RunnerFinding) => {
+  // One repair at a time for a runner (W21-R15): the one pressed says so and the others wait, even
+  // across its diagnosis being closed and opened again.
+  const [working, setWorking] = React.useState<string | null>(null);
+  const [repair, repairing] = useAction(async (f: RunnerFinding) => {
     const fix = f.fix;
     if (!fix) return;
-    setDiag((s) => s && { ...s, working: fix.action, said: undefined });
+    setWorking(fix.action);
+    setDiag((s) => s && { ...s, said: undefined });
     try {
       const out = await api.repairRunner(r.name, fix.action, fix.way);
       const text = out.job ? "The upgrade started: its output is in its row." : (out.message ?? "Done.");
-      setDiag((s) => s && { ...s, working: undefined, said: { ok: true, text } });
+      setDiag((s) => s && { ...s, said: { ok: true, text } });
       invalidate("updates");
       if (!out.job) void look();
     } catch (err) {
-      setDiag((s) => s && { ...s, working: undefined, said: { ok: false, text: errorMessage(err) } });
+      setDiag((s) => s && { ...s, said: { ok: false, text: errorMessage(err) } });
     }
-  };
+  });
   return (
     <tbody className="up-machine" data-hl={picked || undefined} data-picked={selected || undefined}>
       <tr className="up-row">
@@ -683,7 +712,7 @@ function RunnerRows({
             type="checkbox"
             className="check"
             checked={selected}
-            disabled={selectionDisabled || r.locked}
+            disabled={bulkSaving || r.locked}
             onChange={(ev) => onSelect(ev.target.checked)}
             aria-label={`Select ${r.name}`}
             title={r.locked ? "Update policy is locked on this machine" : undefined}
@@ -719,7 +748,7 @@ function RunnerRows({
           {r.locked ? (
             <span className="up-sub up-policy-words">Locked on its machine</span>
           ) : (
-            <PolicySelect label={`Updates for ${r.name}`} value={policyPending ?? r.policy} onChange={onPolicy} disabled={saving || selectionDisabled} />
+            <PolicySelect label={`Updates for ${r.name}`} value={policyPending ?? r.policy} onChange={onPolicy} disabled={bulkSaving && selected} />
           )}
           {saving && (
             <span className="up-saving" role="status">
@@ -731,13 +760,13 @@ function RunnerRows({
           {/* In one order on every row: its upgrade first, then a build to upload, its output, Diagnose. */}
           <span className="up-acts" data-lead={primary ? "pill" : undefined}>
             {primary && (
-              <Button size="xs" variant="secondary" disabled={saving || starting} title={sentence(primary.why)} onClick={() => onUpgrade(primary.way)}>
+              <Button size="xs" variant="secondary" pending={starting} disabled={held} title={sentence(primary.why)} onClick={() => onUpgrade(primary.way)}>
                 {failedWay === primary.way ? <RotateCcw /> : primary.way === "build" ? <Hammer /> : <CircleArrowUp />} {wayLabel(primary.way, true, failedWay === primary.way)}
               </Button>
             )}
             {offer.missing && (
-              <Button size="xs" variant="ghost" disabled={uploading !== null} onClick={onUpload}>
-                <Upload /> {uploading === r.target ? "Uploading…" : "Upload a build"}
+              <Button size="xs" variant="ghost" pending={uploading.includes(r.target ?? "")} onClick={onUpload}>
+                <Upload /> {uploading.includes(r.target ?? "") ? "Uploading…" : "Upload a build"}
               </Button>
             )}
             {job && (
@@ -790,7 +819,7 @@ function RunnerRows({
               <DoctorLine runner={r.name} />
             </React.Suspense>
             {plan}
-            {diag && <DiagnosisPanel name={r.name} s={diag} onRepair={(f) => void repair(f)} onAgain={() => void look()} onAskAgent={onAskAgent} />}
+            {diag && <DiagnosisPanel name={r.name} s={diag} working={repairing ? working : null} onRepair={repair} onAgain={() => void look()} onAskAgent={onAskAgent} />}
             {job && output && <UpgradeLog key={job.id} job={job} onChangeWaits={() => onChangeWaits(job.timed_out)} />}
           </div>
         </td>
@@ -901,12 +930,11 @@ function DoctorLine({ runner }: { runner: string }) {
 
 /* ---------------------------- diagnosing ---------------------------- */
 
-/** A row's diagnosis as it goes: being looked at, what was found, a repair under way and what it said. */
+/** A row's diagnosis as it goes: being looked at, what was found, and what its last repair said. */
 interface Diagnosing {
   looking?: boolean;
   d?: RunnerDiagnosis;
   error?: string;
-  working?: string;
   said?: { ok: boolean; text: string };
 }
 
@@ -919,12 +947,15 @@ const FINDING_TONE: Record<RunnerFinding["level"], string> = { fail: "failed", w
 function DiagnosisPanel({
   name,
   s,
+  working,
   onRepair,
   onAgain,
   onAskAgent,
 }: {
   name: string;
   s: Diagnosing;
+  /** The repair on its way, if one is: the others wait for it. */
+  working: string | null;
   onRepair: (f: RunnerFinding) => void;
   onAgain: () => void;
   onAskAgent: (findings: RunnerFinding[]) => void;
@@ -965,8 +996,8 @@ function DiagnosisPanel({
                   {f.detail && (f.detail.includes("\n") ? <pre className="up-diag-log">{f.detail}</pre> : <p className="up-note">{f.detail}</p>)}
                 </div>
                 {fix && (
-                  <Button size="xs" variant="secondary" disabled={s.working !== undefined} onClick={() => onRepair(f)}>
-                    {s.working === fix.action ? "Working…" : fix.label}
+                  <Button size="xs" variant="secondary" pending={working === fix.action} disabled={working !== null && working !== fix.action} onClick={() => onRepair(f)}>
+                    {working === fix.action ? "Working…" : fix.label}
                   </Button>
                 )}
               </li>
@@ -988,7 +1019,7 @@ function DiagnosisPanel({
         <Button size="xs" variant="ghost" onClick={() => onAskAgent(d.findings)}>
           <Bot /> Ask an agent
         </Button>
-        <Button size="xs" variant="ghost" disabled={s.looking} onClick={onAgain}>
+        <Button size="xs" variant="ghost" pending={s.looking} onClick={onAgain}>
           <RefreshCw /> {s.looking ? "Looking…" : "Look again"}
         </Button>
         {wrong.length > 0 && fine > 0 && (
@@ -1009,7 +1040,6 @@ function DiagnosisPanel({
  */
 function WaitsLine({ waits, editing, onEditing }: { waits: NonNullable<UpdatesOverview["waits"]>; editing: { focus: Which } | null; onEditing: (v: { focus: Which } | null) => void }) {
   const [draft, setDraft] = React.useState<WaitsDraft | null>(null);
-  const [busy, setBusy] = React.useState(false);
   const shown = draft ?? draftOf(waits.now);
   const read = readDraft(shown);
   const changed = typeof read !== "string" && WAITS.some((f) => read[f.key] !== waits.now[f.key]);
@@ -1027,19 +1057,19 @@ function WaitsLine({ waits, editing, onEditing }: { waits: NonNullable<UpdatesOv
     setDraft(null);
     onEditing(null);
   };
+  // The editor open now: an answer closes only the one it was asked from, so one opened since (from
+  // here, or from an upgrade's output) stays as it is, what's typed in it too (W21-R15).
+  const open = React.useRef(editing);
+  open.current = editing;
   const act = async (what: () => Promise<void>, done: string) => {
-    setBusy(true);
-    try {
-      await what();
-      close();
-      toast.success(done);
-      invalidate("updates");
-    } catch (e) {
-      toast.error("Couldn't change how long kiln waits", errorMessage(e));
-    } finally {
-      setBusy(false);
-    }
+    const at = editing;
+    await what();
+    if (open.current === at) close();
+    toast.success(done);
+    invalidate("updates");
   };
+  const [reset, resetting] = useAction(() => act(() => api.resetUpgradeWaits(), "kiln waits as kiln.toml says"), "Couldn't change how long kiln waits");
+  const [save, saving] = useAction((to: UpgradeWaits) => act(() => api.setUpgradeWaits(to), "kiln waits that long from now on"), "Couldn't change how long kiln waits");
   const config = WAITS.map((f) => `${f.label.toLowerCase()} ${minutesSaid(waits.config[f.key])}`).join(", ");
   const now = (key: keyof UpgradeWaits) => <b>{waits.now[key]}</b>;
   if (!editing) {
@@ -1049,7 +1079,7 @@ function WaitsLine({ waits, editing, onEditing }: { waits: NonNullable<UpdatesOv
           kiln waits {now("upgrade_minutes")} min for an upgrade, {now("wait_for_jobs_minutes")} min for running jobs and {now("build_minutes")} min for a build before it calls one failed.
         </span>
         {waits.changed && (
-          <Button size="xs" variant="ghost" disabled={busy} onClick={() => void act(() => api.resetUpgradeWaits(), "kiln waits as kiln.toml says")}>
+          <Button size="xs" variant="ghost" pending={resetting} disabled={saving} onClick={reset}>
             Use kiln.toml&rsquo;s
           </Button>
         )}
@@ -1067,7 +1097,7 @@ function WaitsLine({ waits, editing, onEditing }: { waits: NonNullable<UpdatesOv
       aria-label="How long kiln waits"
       onSubmit={(e) => {
         e.preventDefault();
-        if (typeof read !== "string" && changed) void act(() => api.setUpgradeWaits(read), "kiln waits that long from now on");
+        if (typeof read !== "string" && changed) save(read);
       }}
     >
       <div className="up-waits-fields">
@@ -1096,10 +1126,10 @@ function WaitsLine({ waits, editing, onEditing }: { waits: NonNullable<UpdatesOv
           );
         })}
         <span className="up-spacer" />
-        <Button type="button" size="xs" variant="ghost" disabled={busy} onClick={close}>
+        <Button type="button" size="xs" variant="ghost" onClick={close}>
           Cancel
         </Button>
-        <Button type="submit" size="xs" variant="secondary" disabled={busy || !changed}>
+        <Button type="submit" size="xs" variant="secondary" pending={saving} disabled={!changed || resetting}>
           Save
         </Button>
       </div>

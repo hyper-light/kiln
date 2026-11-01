@@ -17,6 +17,7 @@ import { Loadable } from "@/components/ui/loading";
 import { Crumbs, Panel, SelectField, TextField } from "@/components/ui/misc";
 import { Segmented } from "@/components/ui/tabs";
 import { toast } from "@/components/ui/toast";
+import { useAction, useActions } from "@/lib/action";
 import { useRes } from "@/lib/data";
 import { errorMessage } from "@/lib/hooks";
 import { invalidate, useSuspenseResource } from "@/lib/resource";
@@ -58,7 +59,6 @@ function NewFleetForm() {
   const [pick, setPick] = React.useState<Pick>("all");
   const [chosen, setChosen] = React.useState<string[]>([]);
   const [by, setBy] = React.useState("");
-  const [busy, setBusy] = React.useState(false);
   // A release goes to the apps registered in the environment; a change in sources to any app, or
   // those registered there when one is named.
   const there = new Set(board.cells.filter((c) => c.registration.environment === env).map((c) => c.registration.app));
@@ -93,9 +93,10 @@ function NewFleetForm() {
     return Object.keys(p.set).length ? { ask: { ...f, source: { ...where, set: p.set } } } : { wrong: "A value to set: path=value." };
   };
   const made = ask();
-  const go = async () => {
+  // Made, it opens the fleet change's page; until it's answered nothing moves, so a refusal is said
+  // with what was asked still there (W21-R15).
+  const [go, going] = useAction(async () => {
     if (!made.ask) return;
-    setBusy(true);
     try {
       const r = await deployApi.createFleet({ ...made.ask, idempotency_key: crypto.randomUUID() });
       toast({
@@ -105,13 +106,11 @@ function NewFleetForm() {
         href: fleetHref(r.fleet),
       });
       invalidate("deploy/");
-      navigate(fleetHref(r.fleet));
+      await navigate(fleetHref(r.fleet));
     } catch (e) {
       toast({ title: "No fleet change", description: errorMessage(e), tone: "failed" });
-    } finally {
-      setBusy(false);
     }
-  };
+  });
   const envOptions = [...(what === "source" ? [{ value: "", label: "Any app" }] : []), ...environments.map((e) => ({ value: e.name, label: e.name }))];
   return (
     <div className="rel-stack">
@@ -224,7 +223,7 @@ function NewFleetForm() {
       </Panel>
       {made.wrong && <p className="rel-msg">{made.wrong}</p>}
       <div className="rel-settings-actions">
-        <Button disabled={busy || !made.ask} onClick={() => void go()}>
+        <Button disabled={!made.ask} pending={going} onClick={go}>
           <Rocket /> {what === "release" ? "Release them" : "Propose it"}
         </Button>
       </div>
@@ -251,20 +250,31 @@ export default function NewFleet() {
 const PROPOSAL_WORDS: Record<Proposal["state"], string> = { open: "open", merged: "merged", closed: "closed", unchanged: "unchanged: it holds the change already", failed: "failed" };
 
 /** One repository's proposal: where it is, what it changes, and its merge on kiln's own git server. */
-function ProposalRow({ id, p }: { id: string; p: Proposal }) {
-  const [busy, setBusy] = React.useState(false);
-  const merge = async () => {
-    setBusy(true);
-    try {
-      await deployApi.mergeFleet(id, p.repo);
-      toast({ title: `${p.repo}: merged into ${p.into}`, tone: "succeeded" });
-      invalidate(`deploy/fleet/${id}`);
-    } catch (e) {
-      toast({ title: "Not merged", description: errorMessage(e), tone: "failed" });
-    } finally {
-      setBusy(false);
-    }
-  };
+function ProposalRow({
+  id,
+  p,
+  run,
+  merging,
+  held,
+}: {
+  id: string;
+  p: Proposal;
+  /** Merges, one per proposal at a time (`FleetView`). */
+  run: (repo: string, f: () => Promise<void>) => void;
+  merging: boolean;
+  /** Each is being merged, or the change withdrawn: a merge waits for it. */
+  held: boolean;
+}) {
+  const merge = () =>
+    run(p.repo, async () => {
+      try {
+        await deployApi.mergeFleet(id, p.repo);
+        toast({ title: `${p.repo}: merged into ${p.into}`, tone: "succeeded" });
+        invalidate(`deploy/fleet/${id}`);
+      } catch (e) {
+        toast({ title: "Not merged", description: errorMessage(e), tone: "failed" });
+      }
+    });
   return (
     <li>
       <span className="rel-object">
@@ -283,7 +293,7 @@ function ProposalRow({ id, p }: { id: string; p: Proposal }) {
         </a>
       )}
       {p.host === "kiln" && p.state === "open" && (
-        <Button size="sm" variant="secondary" disabled={busy} onClick={() => void merge()}>
+        <Button size="sm" variant="secondary" pending={merging} disabled={held} onClick={merge}>
           <GitMerge /> Merge
         </Button>
       )}
@@ -301,18 +311,23 @@ function ProposalRow({ id, p }: { id: string; p: Proposal }) {
 function FleetView({ id }: { id: string }) {
   const f: Fleet = useSuspenseResource(`deploy/fleet/${id}`, (s) => deployApi.fleet(id, s), { on: DEPLOY_EVENTS, pollMs: 10_000 }).data;
   const [withdrawing, setWithdrawing] = React.useState(false);
-  const [busy, setBusy] = React.useState(false);
   const open = (f.proposals ?? []).filter((p) => p.state === "open");
+  // Its changes: merging each and withdrawing it go alone; one proposal's merge goes beside
+  // another's. The one pressed says it's on its way, and what contradicts it waits (W21-R15).
+  const [mergeOne, mergingOne] = useActions((_: string, g: () => Promise<void>) => g());
+  const rowsOut = (f.proposals ?? []).some((p) => mergingOne(p.repo));
+  const [whole, setWhole] = React.useState<"merge" | "withdraw">("merge");
+  const [all, allGoing] = useAction((which: "merge" | "withdraw", g: () => Promise<void>) => {
+    setWhole(which);
+    return g();
+  });
   const mergeAll = async () => {
-    setBusy(true);
     try {
       await deployApi.mergeFleet(id);
       toast({ title: "Each open proposal on kiln's git server is merged", tone: "succeeded" });
       invalidate(`deploy/fleet/${id}`);
     } catch (e) {
       toast({ title: "Not merged", description: errorMessage(e), tone: "failed" });
-    } finally {
-      setBusy(false);
     }
   };
   const withdraw = async () => {
@@ -345,11 +360,11 @@ function FleetView({ id }: { id: string }) {
             open.length > 0 ? (
               <>
                 {open.some((p) => p.host === "kiln") && (
-                  <Button size="sm" variant="secondary" disabled={busy} onClick={() => void mergeAll()}>
+                  <Button size="sm" variant="secondary" pending={allGoing && whole === "merge"} disabled={rowsOut || (allGoing && whole !== "merge")} onClick={() => all("merge", mergeAll)}>
                     <GitMerge /> Merge each
                   </Button>
                 )}
-                <Button size="sm" variant="ghost-danger" onClick={() => setWithdrawing(true)}>
+                <Button size="sm" variant="ghost-danger" pending={allGoing && whole === "withdraw"} disabled={rowsOut || (allGoing && whole !== "withdraw")} onClick={() => setWithdrawing(true)}>
                   Withdraw
                 </Button>
               </>
@@ -358,7 +373,7 @@ function FleetView({ id }: { id: string }) {
         >
           <ul className="rel-objects">
             {(f.proposals ?? []).map((p) => (
-              <ProposalRow key={p.repo} id={id} p={p} />
+              <ProposalRow key={p.repo} id={id} p={p} run={mergeOne} merging={mergingOne(p.repo)} held={allGoing} />
             ))}
           </ul>
         </Panel>
@@ -390,7 +405,11 @@ function FleetView({ id }: { id: string }) {
         description="Each open pull request is closed, saying so, and each branch on kiln's git server deleted. Merged ones stay merged."
         confirmLabel="Withdraw it"
         danger
-        onConfirm={withdraw}
+        onConfirm={() => {
+          const done = withdraw();
+          all("withdraw", () => done);
+          return done;
+        }}
       />
     </>
   );

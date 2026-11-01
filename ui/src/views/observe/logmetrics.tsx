@@ -14,11 +14,12 @@ import { TableHold } from "@/components/ui/hold";
 import { Loadable } from "@/components/ui/loading";
 import { PageIntro, SelectField, TextField } from "@/components/ui/misc";
 import { toast } from "@/components/ui/toast";
+import { useAction } from "@/lib/action";
 import { useRes } from "@/lib/data";
 import { relativeTime } from "@/lib/format";
 import { errorMessage } from "@/lib/hooks";
 import { invalidate } from "@/lib/resource";
-import { logMetricsRes, ObserveNav } from "./parts";
+import { HeldFields, logMetricsRes, ObserveNav, useOpening } from "./parts";
 
 const count = (n: number) => n.toLocaleString();
 const records = (n: number) => `${count(n)} ${n === 1 ? "record" : "records"}`;
@@ -203,8 +204,10 @@ const bodyOf = (f: Form): LogMetricIn => ({
 
 function MetricDialog({ metric, onClose }: { metric: LogMetric | null; onClose: () => void }) {
   const [f, setF] = React.useState<Form>(() => formOf(metric));
-  const [busy, setBusy] = React.useState(false);
-  const [tried, setTried] = React.useState<LogMetricTry | string | null>(null);
+  const opening = useOpening(f);
+  const [result, setTried] = React.useState<{ of: Form; r: LogMetricTry | string } | null>(null);
+  // A try shows only under the form it tried: one that comes after an edit was of what was there before (W21-R15).
+  const tried = result?.of === f ? result.r : null;
   const set = (patch: Partial<Form>) => {
     setF((old) => ({ ...old, ...patch }));
     setTried(null);
@@ -213,29 +216,20 @@ function MetricDialog({ metric, onClose }: { metric: LogMetric | null; onClose: 
   const nameOk = validName(f.name.trim());
   const pathOk = f.kind === "count" || /^@.+/.test(f.path.trim());
   const ok = nameOk && pathOk && f.groups.length <= 8;
-  const save = async () => {
-    setBusy(true);
+  const [save, saving] = useAction(async () => {
+    if (metric) await observeApi.updateLogMetric(metric.name, bodyOf(f));
+    else await observeApi.createLogMetric(bodyOf(f));
+    invalidate("observe/log_metrics");
+    if (opening.still(f)) onClose();
+  }, "Couldn't save it");
+  const [tryIt, trying] = useAction(async () => {
+    const of = f;
     try {
-      if (metric) await observeApi.updateLogMetric(metric.name, bodyOf(f));
-      else await observeApi.createLogMetric(bodyOf(f));
-      invalidate("observe/log_metrics");
-      onClose();
+      setTried({ of, r: await observeApi.tryLogMetric(bodyOf(of)) });
     } catch (err) {
-      toast({ title: "Couldn't save it", description: errorMessage(err), tone: "failed" });
-    } finally {
-      setBusy(false);
+      setTried({ of, r: errorMessage(err) });
     }
-  };
-  const tryIt = async () => {
-    setBusy(true);
-    try {
-      setTried(await observeApi.tryLogMetric(bodyOf(f)));
-    } catch (err) {
-      setTried(errorMessage(err));
-    } finally {
-      setBusy(false);
-    }
-  };
+  });
   return (
     <Dialog open onOpenChange={(o) => !o && onClose()}>
       <DialogContent
@@ -245,101 +239,104 @@ function MetricDialog({ metric, onClose }: { metric: LogMetric | null; onClose: 
         }
       >
         <form
+          ref={opening.ref}
           className="space-y-4"
           onSubmit={(e) => {
             e.preventDefault();
-            if (ok) void save();
+            if (ok) save();
           }}
         >
-          <TextField
-            label="Name"
-            value={f.name}
-            readOnly={metric !== null}
-            onChange={(e) => set({ name: e.target.value })}
-            placeholder="checkout.errors"
-            spellCheck={false}
-            hint={f.name && !nameOk ? "A letter, then letters, digits, _ and . (kiln.*, system.* and datadog.* are kiln's)" : undefined}
-          />
-          <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
-            {metric ? (
-              <TextField label="Computes" value={computes(bodyOf(f))} readOnly />
-            ) : (
-              <SelectField
-                label="Computes"
-                value={f.kind}
-                onChange={(v) => set({ kind: v === "distribution" ? "distribution" : "count" })}
-                options={[
-                  { value: "count", label: "Count of records" },
-                  { value: "distribution", label: "Distribution of an attribute" },
-                ]}
-              />
-            )}
-            {f.kind === "distribution" && !metric && (
-              <TextField
-                label="Of the attribute"
-                value={f.path}
-                onChange={(e) => set({ path: e.target.value })}
-                placeholder="@duration"
-                spellCheck={false}
-                hint={!pathOk ? "An attribute: @name" : undefined}
-              />
-            )}
-          </div>
-          {f.kind === "distribution" && (
-            <label className="flex items-center gap-2 text-[13px] text-[#c8cad0]">
-              <input type="checkbox" className="check" checked={f.percentiles} onChange={(e) => set({ percentiles: e.target.checked })} /> Keep percentiles (p50, p95, p99, any)
-            </label>
-          )}
-          <TextField
-            label="Of the records"
-            value={f.query}
-            onChange={(e) => set({ query: e.target.value })}
-            placeholder="service:checkout status:error"
-            spellCheck={false}
-            hint="A log search; empty, every record."
-          />
-          <div>
-            <div className="field-label">Grouped by</div>
-            <div className="space-y-2">
-              {f.groups.map((g, i) => (
-                <div key={i} className="flex items-end gap-2">
-                  <TextField
-                    className="min-w-0 flex-1"
-                    label={`Attribute ${i + 1}`}
-                    value={g.path}
-                    onChange={(e) => setGroup(i, { path: e.target.value })}
-                    placeholder="@http.status_code"
-                    spellCheck={false}
-                  />
-                  <TextField
-                    className="min-w-0 flex-1"
-                    label="As the tag"
-                    value={g.tag}
-                    onChange={(e) => setGroup(i, { tag: e.target.value })}
-                    placeholder={g.path.trim().replace(/^@/, "") || "status_code"}
-                    spellCheck={false}
-                  />
-                  <Button variant="ghost" size="xs" className="mb-1.5" aria-label={`Group by ${g.path || "it"} no more`} onClick={() => set({ groups: f.groups.filter((_, j) => j !== i) })}>
-                    <X />
-                  </Button>
-                </div>
-              ))}
+          <HeldFields held={saving && !metric}>
+            <TextField
+              label="Name"
+              value={f.name}
+              readOnly={metric !== null}
+              onChange={(e) => set({ name: e.target.value })}
+              placeholder="checkout.errors"
+              spellCheck={false}
+              hint={f.name && !nameOk ? "A letter, then letters, digits, _ and . (kiln.*, system.* and datadog.* are kiln's)" : undefined}
+            />
+            <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
+              {metric ? (
+                <TextField label="Computes" value={computes(bodyOf(f))} readOnly />
+              ) : (
+                <SelectField
+                  label="Computes"
+                  value={f.kind}
+                  onChange={(v) => set({ kind: v === "distribution" ? "distribution" : "count" })}
+                  options={[
+                    { value: "count", label: "Count of records" },
+                    { value: "distribution", label: "Distribution of an attribute" },
+                  ]}
+                />
+              )}
+              {f.kind === "distribution" && !metric && (
+                <TextField
+                  label="Of the attribute"
+                  value={f.path}
+                  onChange={(e) => set({ path: e.target.value })}
+                  placeholder="@duration"
+                  spellCheck={false}
+                  hint={!pathOk ? "An attribute: @name" : undefined}
+                />
+              )}
             </div>
-            {f.groups.length < 8 && (
-              <Button variant="ghost" size="xs" className="mt-2" onClick={() => set({ groups: [...f.groups, { path: "", tag: "" }] })}>
-                <Plus /> Group by an attribute
-              </Button>
+            {f.kind === "distribution" && (
+              <label className="flex items-center gap-2 text-[13px] text-[#c8cad0]">
+                <input type="checkbox" className="check" checked={f.percentiles} onChange={(e) => set({ percentiles: e.target.checked })} /> Keep percentiles (p50, p95, p99, any)
+              </label>
             )}
-          </div>
-          {tried && <Tried tried={tried} />}
+            <TextField
+              label="Of the records"
+              value={f.query}
+              onChange={(e) => set({ query: e.target.value })}
+              placeholder="service:checkout status:error"
+              spellCheck={false}
+              hint="A log search; empty, every record."
+            />
+            <div>
+              <div className="field-label">Grouped by</div>
+              <div className="space-y-2">
+                {f.groups.map((g, i) => (
+                  <div key={i} className="flex items-end gap-2">
+                    <TextField
+                      className="min-w-0 flex-1"
+                      label={`Attribute ${i + 1}`}
+                      value={g.path}
+                      onChange={(e) => setGroup(i, { path: e.target.value })}
+                      placeholder="@http.status_code"
+                      spellCheck={false}
+                    />
+                    <TextField
+                      className="min-w-0 flex-1"
+                      label="As the tag"
+                      value={g.tag}
+                      onChange={(e) => setGroup(i, { tag: e.target.value })}
+                      placeholder={g.path.trim().replace(/^@/, "") || "status_code"}
+                      spellCheck={false}
+                    />
+                    <Button variant="ghost" size="xs" className="mb-1.5" aria-label={`Group by ${g.path || "it"} no more`} onClick={() => set({ groups: f.groups.filter((_, j) => j !== i) })}>
+                      <X />
+                    </Button>
+                  </div>
+                ))}
+              </div>
+              {f.groups.length < 8 && (
+                <Button variant="ghost" size="xs" className="mt-2" onClick={() => set({ groups: [...f.groups, { path: "", tag: "" }] })}>
+                  <Plus /> Group by an attribute
+                </Button>
+              )}
+            </div>
+            {tried && <Tried tried={tried} />}
+          </HeldFields>
           <div className="flex justify-end gap-2">
             <Button variant="ghost" onClick={onClose}>
               Cancel
             </Button>
-            <Button variant="ghost" disabled={!ok || busy} onClick={() => void tryIt()}>
+            <Button variant="ghost" disabled={!ok} pending={trying} onClick={tryIt}>
               Try it
             </Button>
-            <Button type="submit" disabled={!ok || busy}>
+            <Button type="submit" disabled={!ok} pending={saving}>
               {metric ? "Save" : "Make it"}
             </Button>
           </div>

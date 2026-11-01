@@ -13,11 +13,12 @@ import { TableHold } from "@/components/ui/hold";
 import { Loadable } from "@/components/ui/loading";
 import { PageIntro } from "@/components/ui/misc";
 import { toast } from "@/components/ui/toast";
+import { useActions } from "@/lib/action";
 import { useRes } from "@/lib/data";
 import { errorMessage } from "@/lib/hooks";
 import { invalidate } from "@/lib/resource";
 import { swapped } from "@/lib/utils";
-import { ObserveNav, pipelinesRes } from "./parts";
+import { ObserveNav, pipelinesRes, useMoves } from "./parts";
 
 export default function Pipelines() {
   return (
@@ -68,7 +69,8 @@ function State({ on }: { on: boolean }) {
 }
 
 function List() {
-  const all = useRes(pipelinesRes).data;
+  const res = useRes(pipelinesRes);
+  const all = res.data;
   const navigate = useNavigate();
   const [removing, setRemoving] = React.useState<Pipeline | null>(null);
   const mine = all.filter((p) => !p.builtin);
@@ -76,26 +78,44 @@ function List() {
     try {
       await f();
       invalidate("observe/pipelines");
+      return true;
     } catch (e) {
       toast({ title: `Couldn't ${what}`, description: errorMessage(e), tone: "failed" });
+      return false;
     }
   };
+  const putBack = (ok: boolean) => {
+    if (!ok) invalidate(pipelinesRes.key);
+  };
+  // Turned on or off, and moved, at once (W21-R15), and put back if the server refuses; a pipeline's
+  // next turn waits for its answer, so an answer never undoes a later turn.
+  const [turn, turning] = useActions((_id: string, p: Pipeline) => {
+    const on = !p.is_enabled;
+    res.change((l) => l.map((x) => (x.id === p.id ? { ...x, is_enabled: on } : x)));
+    return act(on ? "turn it on" : "turn it off", () => observeApi.updatePipeline(p.id, { name: p.name, is_enabled: on, filter: p.filter, processors: p.processors })).then(putBack);
+  });
+  const moves = useMoves();
   const move = (p: Pipeline, by: -1 | 1) => {
     const ids = mine.map((m) => m.id);
     const i = ids.indexOf(p.id);
     const j = i + by;
     if (i < 0 || j < 0 || j >= ids.length) return;
-    void act("move it", () => observeApi.orderPipelines(swapped(ids, i, j)));
+    moves.move(p.id, by, () => {
+      res.change((l) =>
+        swapped(
+          l,
+          l.findIndex((x) => x.id === p.id),
+          l.findIndex((x) => x.id === ids[j]),
+        ),
+      );
+      return act("move it", () => observeApi.orderPipelines(swapped(ids, i, j))).then(putBack);
+    });
   };
-  const copy = async (p: Pipeline) => {
-    try {
-      const made = await observeApi.createPipeline({ name: `${p.name} (copy)`, is_enabled: true, filter: p.filter, processors: p.processors });
-      invalidate("observe/pipelines");
-      navigate(`/observe/pipelines/${encodeURIComponent(made.id)}`);
-    } catch (e) {
-      toast({ title: "Couldn't copy it", description: errorMessage(e), tone: "failed" });
-    }
-  };
+  const [copy, copying] = useActions(async (_id: string, p: Pipeline) => {
+    const made = await observeApi.createPipeline({ name: `${p.name} (copy)`, is_enabled: true, filter: p.filter, processors: p.processors });
+    invalidate("observe/pipelines");
+    await navigate(`/observe/pipelines/${encodeURIComponent(made.id)}`);
+  }, "Couldn't copy it");
   return (
     <>
       <div className="table-wrap">
@@ -109,28 +129,20 @@ function List() {
               // On a phone they go under its name, which keeps the row's width.
               const controls = (
                 <>
-                  <Button
-                    variant="ghost"
-                    size="xs"
-                    onClick={() =>
-                      void act(p.is_enabled ? "turn it off" : "turn it on", () =>
-                        observeApi.updatePipeline(p.id, { name: p.name, is_enabled: !p.is_enabled, filter: p.filter, processors: p.processors }),
-                      )
-                    }
-                  >
+                  <Button variant="ghost" size="xs" pending={turning(p.id)} onClick={() => turn(p.id, p)}>
                     {p.is_enabled ? `Turn off` : `Turn on`}
                     <span className="sr-only"> {p.name}</span>
                   </Button>
                   {p.builtin ? (
-                    <Button variant="ghost" size="xs" aria-label={`Copy ${p.name} to change it`} onClick={() => void copy(p)}>
+                    <Button variant="ghost" size="xs" aria-label={`Copy ${p.name} to change it`} pending={copying(p.id)} onClick={() => copy(p.id, p)}>
                       <Copy />
                     </Button>
                   ) : (
                     <>
-                      <Button variant="ghost" size="xs" aria-label={`Move ${p.name} up`} disabled={at <= 0} onClick={() => move(p, -1)}>
+                      <Button variant="ghost" size="xs" aria-label={`Move ${p.name} up`} {...moves.props(p.id, -1, at <= 0)} onClick={() => move(p, -1)}>
                         <ArrowUp />
                       </Button>
-                      <Button variant="ghost" size="xs" aria-label={`Move ${p.name} down`} disabled={at < 0 || at >= mine.length - 1} onClick={() => move(p, 1)}>
+                      <Button variant="ghost" size="xs" aria-label={`Move ${p.name} down`} {...moves.props(p.id, 1, at < 0 || at >= mine.length - 1)} onClick={() => move(p, 1)}>
                         <ArrowDown />
                       </Button>
                       <Button variant="ghost-danger" size="xs" aria-label={`Remove ${p.name}`} onClick={() => setRemoving(p)}>

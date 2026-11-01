@@ -36,7 +36,7 @@ export const atLimit = (a: AgentInfo) => !!a.pause && a.status !== "running" && 
 /** Whether an agent has anything to show as a card. */
 export const notable = (a: AgentInfo) => a.approvals.length > 0 || !!a.held || stoppedItself(a) || atLimit(a);
 
-/** The cards for page `path`: requests answered here (`answered`) or put away or dealt with (`away`, your marks) aren't. */
+/** The cards for page `path`: requests answered here (`answered`, as are goals resumed and agents restarted here: their cards' keys) or put away or dealt with (`away`, your marks) aren't. */
 export function cardsOf(agents: readonly AgentInfo[], path: string, away: { has(key: string): boolean }, answered: { has(id: string): boolean }): Card[] {
   const cards = agents.flatMap((a): Card[] => {
     if (showsItsOwn(path, a.id)) return [];
@@ -46,7 +46,7 @@ export function cardsOf(agents: readonly AgentInfo[], path: string, away: { has(
     if (open[0]) return [{ kind: "request", a, key: open[0].id, since: open[0].at || a.last_activity, ap: open[0], more: open.length - 1 }];
     const card = (kind: CardKind, since: number): Card[] => {
       const key = `${kind}:${a.id}:${since}`;
-      return away.has(key) ? [] : [{ kind, a, key, since, more: 0 }];
+      return away.has(key) || answered.has(key) ? [] : [{ kind, a, key, since, more: 0 }];
     };
     if (a.held) return card("held", a.held.since);
     if (stoppedItself(a)) return card("stopped", a.exit?.at || a.last_activity);

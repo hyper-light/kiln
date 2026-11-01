@@ -12,10 +12,10 @@ import { Loadable } from "@/components/ui/loading";
 import { EmptyState, FoldSection, Panel } from "@/components/ui/misc";
 import { StatusDot } from "@/components/ui/status";
 import { toast } from "@/components/ui/toast";
+import { useAction } from "@/lib/action";
 import { useRes, type Res } from "@/lib/data";
 import { formatBytes } from "@/lib/format";
-import { errorMessage } from "@/lib/hooks";
-import { invalidate } from "@/lib/resource";
+import { change, invalidate } from "@/lib/resource";
 import { RelTime } from "../shared";
 import { RulesForm } from "./rules";
 import { triggerSaid } from "./words";
@@ -23,6 +23,16 @@ import "./keep.css";
 
 /** Every scope's rules and what each runner holds: read again when the server says they changed. */
 export const keepRes: Res<KeepView> = { key: "reach/keep", fetch: (s) => api.keep(s), opts: { pollMs: 15_000, on: ["keep"] } };
+
+/**
+ * After a scope's rules are saved: read again and shown before the save is done, so its form starts
+ * again from them while it still holds its fields (W21-R15); if that read fails, a reload.
+ */
+export const readKeepAgain = () =>
+  api.keep().then(
+    (v) => change<KeepView>(keepRes.key, () => v),
+    () => invalidate("reach/keep"),
+  );
 
 const LEAD =
   "A runner keeps a copy of each tree another runner runs commands on (~/.kiln/reach), so the next sync sends only what changed. Nothing goes until a schedule or a room limit says when; a copy in use, or used in the last ten minutes, always stays. Rules set for a runner, a repository (on its row in Repositories) or an agent (its settings) win over these, rule by rule.";
@@ -60,7 +70,7 @@ function KeepBody() {
           label="Every runner's rules"
           onSave={async (r) => {
             await api.setKeepRules(r);
-            invalidate("reach/keep");
+            await readKeepAgain();
           }}
         />
       </Panel>
@@ -113,19 +123,11 @@ function RunnerRow({ r, open, onOpen }: { r: KeepRunner; open: boolean; onOpen: 
   const t = taking(r.copies);
   const last = r.gone[0];
   const waiting = r.asked > r.done;
-  const [busy, setBusy] = React.useState(false);
-  const letGo = async () => {
-    setBusy(true);
-    try {
-      await api.keepNow(r.name);
-      toast.success(`${r.name} lets go now`, `${r.now.copies} ${r.now.copies === 1 ? "copy" : "copies"} its rules don't keep, within 20 seconds.`);
-      invalidate("reach/keep");
-    } catch (e) {
-      toast.error("Couldn't ask it", errorMessage(e));
-    } finally {
-      setBusy(false);
-    }
-  };
+  const [letGo, asking] = useAction(async () => {
+    await api.keepNow(r.name);
+    toast.success(`${r.name} lets go now`, `${r.now.copies} ${r.now.copies === 1 ? "copy" : "copies"} its rules don't keep, within 20 seconds.`);
+    invalidate("reach/keep");
+  }, "Couldn't ask it");
   return (
     <tr data-selected={open} className="cursor-pointer" onClick={(ev) => !(ev.target as HTMLElement).closest("button") && onOpen()}>
       <td>
@@ -156,9 +158,10 @@ function RunnerRow({ r, open, onOpen }: { r: KeepRunner; open: boolean; onOpen: 
         <Button
           size="xs"
           variant="secondary"
-          disabled={busy || waiting || !r.connected || r.now.copies === 0}
+          disabled={waiting || !r.connected || r.now.copies === 0}
+          pending={asking}
           title={r.now.copies ? `${r.now.copies} ${r.now.copies === 1 ? "copy" : "copies"} its rules don't keep (${formatBytes(r.now.bytes)} measured)` : "Its rules keep every copy it has"}
-          onClick={() => void letGo()}
+          onClick={letGo}
         >
           {waiting ? "Letting go…" : "Let go now"}
         </Button>
@@ -178,7 +181,7 @@ function RunnerPanel({ view, r }: { view: KeepView; r: KeepRunner }) {
           label={`${r.name}'s rules`}
           onSave={async (rules) => {
             await api.setRunnerKeep(r.name, rules);
-            invalidate("reach/keep");
+            await readKeepAgain();
           }}
         />
       </Panel>

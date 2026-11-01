@@ -44,6 +44,11 @@ export interface SuspenseResource<T> {
   reload: () => void;
   /** Change the data here, at once (after a change the server will confirm). */
   setData: (fn: (prev: T) => T) => void;
+  /**
+   * What a press shows at once, before its request is answered (W21-R15): `setData`, and made again
+   * over what a load already on its way brings, which was read before it.
+   */
+  change: (fn: (prev: T) => T) => void;
   /** The last refresh failed, and why: the data shown is the last there was. */
   refreshError?: unknown;
 }
@@ -76,6 +81,8 @@ interface Entry {
   /** Events to apply to its data, and when they will be. */
   news: ServerEvent[];
   applying: number;
+  /** Changes presses made (`change`) while the load on its way was out: made again over what it brings. */
+  made: ((data: unknown) => unknown)[];
   /** Out of date while not shown: refreshed when it's shown again. */
   stale: boolean;
   listeners: Set<() => void>;
@@ -114,6 +121,7 @@ function entry(key: string, fetcher: Fetcher<unknown>, opts: ResourceOptions): E
       soon: 0,
       news: [],
       applying: 0,
+      made: [],
       stale: false,
       listeners: new Set(),
       sub: () => () => undefined,
@@ -180,6 +188,7 @@ function load(e: Entry): Promise<void> {
   }
   e.stale = false;
   e.again = false;
+  e.made = [];
   const p: Promise<void> = e
     .fetcher(new AbortController().signal)
     .then(
@@ -187,7 +196,10 @@ function load(e: Entry): Promise<void> {
         const first = !e.snap.has;
         // Settled for React before anyone hears of the data: the render it replays reads on at once.
         Object.assign(p, { status: "fulfilled", value: undefined });
-        set(e, { data, has: true, error: undefined, failed: false, refreshing: false, refreshError: undefined });
+        // Read before what presses changed meanwhile: those changes stand over it.
+        const made = e.made;
+        e.made = [];
+        set(e, { data: made.reduce((d, fn) => fn(d), data), has: true, error: undefined, failed: false, refreshing: false, refreshError: undefined });
         if (first) land();
       },
       (error: unknown) => {
@@ -316,8 +328,16 @@ export function useSuspenseResource<T>(key: string, fetcher: Fetcher<T>, opts: R
     refreshing: snap.refreshing,
     reload: () => void load(e),
     setData: (fn) => set(e, { data: fn(e.snap.data as T), has: true }),
+    change: (fn) => changed(e, fn as (prev: unknown) => unknown),
     refreshError: snap.refreshError,
   };
+}
+
+/** `change`, of entry `e`. */
+function changed(e: Entry, fn: (prev: unknown) => unknown) {
+  if (!e.snap.has) return;
+  if (e.promise) e.made.push(fn);
+  set(e, { data: fn(e.snap.data) });
 }
 
 /**
@@ -350,6 +370,12 @@ export function invalidate(prefix = "") {
 export function setData<T>(key: string, fn: (prev: T) => T) {
   const e = entries.get(key);
   if (e?.snap.has) set(e, { data: fn(e.snap.data as T), has: true });
+}
+
+/** `useSuspenseResource`'s `change` from outside a component: what a press shows at once, standing over a load already on its way. */
+export function change<T>(key: string, fn: (prev: T) => T) {
+  const e = entries.get(key);
+  if (e) changed(e, fn as (prev: unknown) => unknown);
 }
 
 /** Lets the keys whose first load failed try again (`Loadable`'s Try again). */

@@ -10,6 +10,8 @@ import { Hold } from "@/components/ui/hold";
 import { Loadable } from "@/components/ui/loading";
 import { Confirm, SelectField } from "@/components/ui/misc";
 import { SettingRow, SettingsGroup } from "@/components/ui/settings";
+import { toast } from "@/components/ui/toast";
+import { useAction, useActions } from "@/lib/action";
 import { reposRes, useRes, type Res } from "@/lib/data";
 import { relativeTime } from "@/lib/format";
 import { errorMessage } from "@/lib/hooks";
@@ -56,28 +58,42 @@ export function PeopleGroup() {
   const roles = useRes(rolesRes).data.roles.map((r) => r.name);
   const [open, setOpen] = React.useState<string | null>(null);
   const [removing, setRemoving] = React.useState<string | null>(null);
-  const [link, setLink] = React.useState<{ id: string; url: string } | null>(null);
-  const [busy, setBusy] = React.useState(false);
+  // Each person's own sign-in link, under their row: links asked for two people show both.
+  const [links, setLinks] = React.useState<Record<string, string>>({});
+  // The line under the form is the form's: what a row's press says goes in a toast, so it never
+  // takes the place of what the form's answer said (W21-R15).
   const [note, setNote] = React.useState<Note>(null);
   const [name, setName] = React.useState("");
   const [email, setEmail] = React.useState("");
   const [role, setRole] = React.useState("developer");
   const [where, setWhere] = React.useState("server");
-  const act = async (f: () => Promise<unknown>, done: string | null) => {
-    setBusy(true);
-    setNote(null);
-    try {
-      await f();
-      res.reload();
-      if (done) setNote({ text: done });
-      return true;
-    } catch (e) {
-      setNote({ tone: "error", text: errorMessage(e) });
-      return false;
-    } finally {
-      setBusy(false);
-    }
+  const failed = (e: unknown) => setNote({ tone: "error", text: errorMessage(e) });
+  const [getLink, linking] = useActions(async (id: string) => {
+    const { url } = await people.link(id);
+    setLinks((l) => ({ ...l, [id]: url }));
+    res.reload();
+  }, "Couldn't make a sign-in link");
+  // Gone at once (W21-R15), and back, saying why, if the server keeps them.
+  const remove = (p: Person) => {
+    setRemoving(null);
+    res.change((l) => l.filter((x) => x.id !== p.id));
+    people.remove(p.id).then(
+      () => toast({ title: `Removed ${p.name}`, tone: "info" }),
+      (e: unknown) => {
+        toast.error(`Couldn't remove ${p.name}`, errorMessage(e));
+        res.reload();
+      },
+    );
   };
+  // Its answer empties the form, so the form is held as it is until then (W21-R15).
+  const [add, adding] = useAction(async (n: string) => {
+    setNote(null);
+    await people.add(n, [grantText(role, where)], email.trim() || null);
+    res.reload();
+    setNote({ text: `Added ${n}. Send them a sign-in link.` });
+    setName("");
+    setEmail("");
+  }, failed);
   return (
     <SettingsGroup
       id="people.people"
@@ -95,18 +111,18 @@ export function PeopleGroup() {
                 <span className="st-item-name">{p.name}</span>
                 <span className="st-item-meta font-mono text-[11.5px]">{p.grants.length ? p.grants.join(" · ") : "no grants: they may do nothing"}</span>
                 <span className="st-item-acts">
-                  <Button size="xs" variant="ghost" disabled={busy} onClick={() => void act(async () => setLink({ id: p.id, url: (await people.link(p.id)).url }), null)}>
+                  <Button size="xs" variant="ghost" pending={linking(p.id)} onClick={() => getLink(p.id)}>
                     Sign-in link
                   </Button>
                   <Button size="xs" variant="ghost" aria-expanded={open === p.id} onClick={() => setOpen(open === p.id ? null : p.id)}>
                     Grants
                   </Button>
-                  <Button size="xs" variant="ghost" disabled={busy} aria-expanded={removing === p.id} onClick={() => setRemoving(removing === p.id ? null : p.id)}>
+                  <Button size="xs" variant="ghost" aria-expanded={removing === p.id} onClick={() => setRemoving(removing === p.id ? null : p.id)}>
                     Remove
                   </Button>
                 </span>
               </div>
-              {link?.id === p.id && <Copyable label={`${p.name}'s sign-in link`} value={link.url} help="It works once, for a day: send it to them however you like." />}
+              {links[p.id] && <Copyable label={`${p.name}'s sign-in link`} value={links[p.id] ?? ""} help="It works once, for a day: send it to them however you like." />}
               {open === p.id && (
                 <Loadable label={`${p.name}'s grants`} fallback={<Hold height={80} />}>
                   <PersonGrants person={p} roles={roles} onChanged={() => res.reload()} />
@@ -119,10 +135,10 @@ export function PeopleGroup() {
                   className="mt-3"
                   actions={
                     <>
-                      <Button size="xs" variant="primary" disabled={busy} onClick={() => void act(() => people.remove(p.id), `Removed ${p.name}.`).then((ok) => ok && setRemoving(null))}>
+                      <Button size="xs" variant="primary" onClick={() => remove(p)}>
                         Remove {p.name}
                       </Button>
-                      <Button size="xs" variant="ghost" disabled={busy} onClick={() => setRemoving(null)}>
+                      <Button size="xs" variant="ghost" onClick={() => setRemoving(null)}>
                         Keep them
                       </Button>
                     </>
@@ -141,22 +157,16 @@ export function PeopleGroup() {
         onSubmit={(e) => {
           e.preventDefault();
           const n = name.trim();
-          if (n)
-            void act(() => people.add(n, [grantText(role, where)], email.trim() || null), `Added ${n}. Send them a sign-in link.`).then((ok) => {
-              if (ok) {
-                setName("");
-                setEmail("");
-              }
-            });
+          if (n) add(n);
         }}
       >
         <SettingRow label="Someone new" htmlFor="st-person-name" help="Their name here, and their email if they sign in with a host (it finds them).">
           <div className="st-control-line">
             <div className="field st-wide">
-              <input id="st-person-name" type="text" autoComplete="off" spellCheck={false} placeholder="ada" value={name} disabled={busy} onChange={(e) => setName(e.target.value)} />
+              <input id="st-person-name" type="text" autoComplete="off" spellCheck={false} placeholder="ada" value={name} disabled={adding} onChange={(e) => setName(e.target.value)} />
             </div>
             <div className="field st-wide">
-              <input aria-label="Their email" type="email" autoComplete="off" placeholder="ada@example.com" value={email} disabled={busy} onChange={(e) => setEmail(e.target.value)} />
+              <input aria-label="Their email" type="email" autoComplete="off" placeholder="ada@example.com" value={email} disabled={adding} onChange={(e) => setEmail(e.target.value)} />
             </div>
           </div>
         </SettingRow>
@@ -164,7 +174,7 @@ export function PeopleGroup() {
           <GrantPicker roles={roles} role={role} where={where} onRole={setRole} onWhere={setWhere} />
         </SettingRow>
         <div className="mt-3 flex justify-end">
-          <Button type="submit" size="xs" variant="secondary" disabled={busy || !name.trim()}>
+          <Button type="submit" size="xs" variant="secondary" pending={adding} disabled={!name.trim()}>
             Add them
           </Button>
         </div>
@@ -200,21 +210,22 @@ function PersonGrants({ person, roles, onChanged }: { person: Person; roles: str
   const res = useSuspenseResource(`people/grants/${person.id}`, (s) => people.grants(person.id, s));
   const [role, setRole] = React.useState("viewer");
   const [where, setWhere] = React.useState("server");
-  const [busy, setBusy] = React.useState(false);
   const [note, setNote] = React.useState<Note>(null);
-  const act = async (f: () => Promise<unknown>) => {
-    setBusy(true);
+  const failed = (e: unknown) => setNote({ tone: "error", text: errorMessage(e) });
+  const [grant, granting] = useAction(async () => {
     setNote(null);
-    try {
-      await f();
-      res.reload();
-      onChanged();
-    } catch (e) {
-      setNote({ tone: "error", text: errorMessage(e) });
-    } finally {
-      setBusy(false);
-    }
-  };
+    await people.grant(person.id, grantText(role, where));
+    res.reload();
+    onChanged();
+  }, failed);
+  // Its Take it back says it's on its way and the row goes with the answer (W21-R15): gone at once,
+  // the next grant would slide under a second click and go too.
+  const [takeBack, taking] = useActions(async (_key: string, id: number) => {
+    setNote(null);
+    await people.ungrant(id);
+    res.change((gs) => gs.filter((g) => g.id !== id));
+    onChanged();
+  }, failed);
   return (
     <div className="mt-3 border-l border-[#262932] pl-4">
       {res.data.length > 0 && (
@@ -231,7 +242,7 @@ function PersonGrants({ person, roles, onChanged }: { person: Person; roles: str
                   by {g.created_by} · {relativeTime(g.created_at)}
                 </span>
                 <span className="st-item-acts">
-                  <Button size="xs" variant="ghost" disabled={busy} onClick={() => void act(() => people.ungrant(g.id))}>
+                  <Button size="xs" variant="ghost" pending={taking(String(g.id))} onClick={() => takeBack(String(g.id), g.id)}>
                     Take it back
                   </Button>
                 </span>
@@ -245,12 +256,12 @@ function PersonGrants({ person, roles, onChanged }: { person: Person; roles: str
         className="mt-3"
         onSubmit={(e) => {
           e.preventDefault();
-          void act(() => people.grant(person.id, grantText(role, where)));
+          grant();
         }}
       >
         <div className="st-control-line">
           <GrantPicker roles={roles} role={role} where={where} onRole={setRole} onWhere={setWhere} />
-          <Button type="submit" size="xs" variant="secondary" disabled={busy}>
+          <Button type="submit" size="xs" variant="secondary" pending={granting}>
             Grant
           </Button>
         </div>
@@ -277,23 +288,30 @@ export function RolesGroup() {
   const { roles, capabilities } = res.data;
   const [name, setName] = React.useState("");
   const [caps, setCaps] = React.useState<string[]>([]);
-  const [busy, setBusy] = React.useState(false);
+  // The line under the form is the form's; a role's Remove says how it went in a toast.
   const [note, setNote] = React.useState<Note>(null);
-  const act = async (f: () => Promise<unknown>, done: string) => {
-    setBusy(true);
-    setNote(null);
+  const failed = (e: unknown) => setNote({ tone: "error", text: errorMessage(e) });
+  // Its Remove says it's on its way and the row goes with the answer (W21-R15): gone at once, the
+  // next role would slide under a second click and go too.
+  const [remove, removingRole] = useActions(async (role: string) => {
     try {
-      await f();
-      res.reload();
-      setNote({ text: done });
-      return true;
+      await people.removeRole(role);
     } catch (e) {
-      setNote({ tone: "error", text: errorMessage(e) });
-      return false;
-    } finally {
-      setBusy(false);
+      toast.error(`Couldn't remove ${role}`, errorMessage(e));
+      return;
     }
-  };
+    res.change((d) => ({ ...d, roles: d.roles.filter((x) => x.name !== role) }));
+    toast({ title: `Removed ${role}`, tone: "info" });
+  });
+  // Its answer empties the form, so the form is held as it is until then (W21-R15).
+  const [save, saving] = useAction(async (n: string) => {
+    setNote(null);
+    await people.putRole(n, caps);
+    res.reload();
+    setNote({ text: `Saved ${n}.` });
+    setName("");
+    setCaps([]);
+  }, failed);
   return (
     <SettingsGroup id="people.roles" title="Roles" about="What each role a grant names may do. The built-in ones are kiln's; yours are any capabilities together." words="roles capabilities custom">
       <ul className="st-list" aria-label="Roles">
@@ -306,7 +324,7 @@ export function RolesGroup() {
                 {r.builtin ? (
                   <span className="st-item-meta">built in</span>
                 ) : (
-                  <Button size="xs" variant="ghost" disabled={busy} onClick={() => void act(() => people.removeRole(r.name), `Removed ${r.name}.`)}>
+                  <Button size="xs" variant="ghost" pending={removingRole(r.name)} disabled={saving && name.trim() === r.name} onClick={() => remove(r.name)}>
                     Remove
                   </Button>
                 )}
@@ -321,22 +339,16 @@ export function RolesGroup() {
         onSubmit={(e) => {
           e.preventDefault();
           const n = name.trim();
-          if (n && caps.length)
-            void act(() => people.putRole(n, caps), `Saved ${n}.`).then((ok) => {
-              if (ok) {
-                setName("");
-                setCaps([]);
-              }
-            });
+          if (n && caps.length) save(n);
         }}
       >
         <SettingRow label="A role of your own" htmlFor="st-role-name" help="Saving one of the same name replaces it.">
           <div className="field st-wide">
-            <input id="st-role-name" type="text" spellCheck={false} placeholder="releaser" value={name} disabled={busy} onChange={(e) => setName(e.target.value)} />
+            <input id="st-role-name" type="text" spellCheck={false} placeholder="releaser" value={name} disabled={saving} onChange={(e) => setName(e.target.value)} />
           </div>
         </SettingRow>
         <SettingRow label="May">
-          <fieldset className="flex flex-wrap gap-x-4 gap-y-2" disabled={busy}>
+          <fieldset className="flex flex-wrap gap-x-4 gap-y-2" disabled={saving}>
             <legend className="sr-only">Capabilities</legend>
             {capabilities.map((c) => (
               <label key={c} className="flex items-center gap-2 font-mono text-[12px]">
@@ -347,7 +359,7 @@ export function RolesGroup() {
           </fieldset>
         </SettingRow>
         <div className="mt-3 flex justify-end">
-          <Button type="submit" size="xs" variant="secondary" disabled={busy || !name.trim() || caps.length === 0}>
+          <Button type="submit" size="xs" variant="secondary" pending={saving} disabled={!name.trim() || caps.length === 0 || removingRole(name.trim())}>
             Save the role
           </Button>
         </div>

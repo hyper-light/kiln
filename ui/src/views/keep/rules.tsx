@@ -7,7 +7,7 @@ import * as React from "react";
 import type { KeepRules } from "@/api/types";
 import { Button } from "@/components/ui/button";
 import { toast } from "@/components/ui/toast";
-import { errorMessage } from "@/lib/hooks";
+import { useAction } from "@/lib/action";
 import { draftOf, hoursSaid, merge, rulesOf, rulesSaid, SCHEDULES, scheduleSaid, type Draft, type Mode } from "./words";
 import "./keep.css";
 
@@ -25,28 +25,28 @@ interface Props {
   label: string;
 }
 
-/** The form, made again whenever the rules it shows were saved (its draft starts from them). */
+/**
+ * The form, made again whenever the rules it shows were saved (its draft starts from them). Its
+ * writes to the scope go one at a time (Save, Back), held here, above the form each answer makes
+ * again: the one pressed says it's on its way and the other waits (W21-R15).
+ */
 export function RulesForm(props: Props) {
-  return <Form key={JSON.stringify(props.rules)} {...props} />;
+  const [which, setWhich] = React.useState<Sending>("save");
+  const [save, saving] = useAction((what: Sending, r: KeepRules | null) => {
+    setWhich(what);
+    return props.onSave(r && Object.keys(r).length ? r : null).then(() => toast.success("Saved", "Runners have it within 20 seconds."));
+  }, "Couldn't save the rules");
+  return <Form key={JSON.stringify(props.rules)} {...props} save={save} sending={saving ? which : null} />;
 }
 
-function Form({ rules, above, aboveName = "the scope above's", top = false, onSave, label }: Props) {
+/** Which of the form's writes is on its way. */
+type Sending = "save" | "back";
+
+function Form({ rules, above, aboveName = "the scope above's", top = false, label, save, sending }: Props & { save: (what: Sending, r: KeepRules | null) => void; sending: Sending | null }) {
   const [draft, setDraft] = React.useState<Draft>(() => draftOf(rules, top));
-  const [busy, setBusy] = React.useState(false);
   const made = rulesOf(draft, top);
   const changed = "rules" in made && JSON.stringify(made.rules) !== JSON.stringify(rules);
   const set = <K extends keyof Draft>(k: K, v: Draft[K]) => setDraft((d) => ({ ...d, [k]: v }));
-  const save = async (r: KeepRules | null) => {
-    setBusy(true);
-    try {
-      await onSave(r && Object.keys(r).length ? r : null);
-      toast.success("Saved", "Runners have it within 20 seconds.");
-    } catch (e) {
-      toast.error("Couldn't save the rules", errorMessage(e));
-    } finally {
-      setBusy(false);
-    }
-  };
   const as = (said: string | null) => (top ? null : above ? `As ${aboveName}: ${said ?? "none"}` : `As ${aboveName}`);
   const settled = "rules" in made ? (above ? merge(made.rules, above) : made.rules) : null;
   const zone = typeof Intl !== "undefined" ? Intl.DateTimeFormat().resolvedOptions().timeZone : "";
@@ -57,104 +57,107 @@ function Form({ rules, above, aboveName = "the scope above's", top = false, onSa
       aria-label={label}
       onSubmit={(e) => {
         e.preventDefault();
-        if ("rules" in made) void save(made.rules);
+        if ("rules" in made) save("save", made.rules);
       }}
     >
-      <Row label="Keep the newest" hint="Copies, by when each was last used: counted among this scope's own.">
-        <Count field={draft.newest} unit="copies" none="No such rule" inherit={as(above?.newest ? `the newest ${above.newest}` : null)} onChange={(f) => set("newest", f)} />
-      </Row>
-      <Row label="Keep those used within" hint="How long since a sync into it or a run in it.">
-        <Count
-          field={draft.hours}
-          unit={
-            <select className="kp-select kp-unit" aria-label="Hours or days" value={draft.hours.unit} onChange={(e) => set("hours", { ...draft.hours, unit: e.target.value as "hours" | "days" })}>
-              <option value="hours">hours</option>
-              <option value="days">days</option>
-            </select>
-          }
-          none="No such rule"
-          inherit={as(above?.hours ? hoursSaid(above.hours) : null)}
-          onChange={(f) => set("hours", { ...draft.hours, ...f })}
-        />
-      </Row>
-      <Row label="A copy stays when" hint="With both rules set.">
-        <select className="kp-select" aria-label="A copy stays when" value={draft.both} onChange={(e) => set("both", e.target.value as Draft["both"])}>
-          {!top && <option value="inherit">{as(above ? (above.both ? "both keep it" : "either keeps it") : null)}</option>}
-          <option value="either">Either rule keeps it</option>
-          <option value="both">Both rules keep it</option>
-        </select>
-      </Row>
-      <Row label="Let go on a schedule" hint="What the rules don't keep goes when it comes round.">
-        <div className="kp-inputs">
-          <select
-            className="kp-select"
-            aria-label="Schedule"
-            value={preset}
-            onChange={(e) => {
-              const v = e.target.value;
-              if (v === "inherit" || v === "none") set("schedule", { mode: v, value: draft.schedule.value });
-              else if (v === "custom") set("schedule", { mode: "set", value: SCHEDULES.some((s) => s.cron === draft.schedule.value) ? "" : draft.schedule.value });
-              else set("schedule", { mode: "set", value: v.slice("cron:".length) });
-            }}
-          >
-            {!top && <option value="inherit">{as(above?.schedule?.trim() ? scheduleSaid(above.schedule, above.timezone) : null)}</option>}
-            <option value="none">Never on a schedule</option>
-            {SCHEDULES.map((s) => (
-              <option key={s.cron} value={`cron:${s.cron}`}>
-                {s.label}
-              </option>
-            ))}
-            <option value="custom">Cron…</option>
+      {/* Held while a write is on its way: its answer makes the form again, and would take what was typed meanwhile (W21-R15). */}
+      <fieldset className="kp-rules" disabled={sending !== null}>
+        <Row label="Keep the newest" hint="Copies, by when each was last used: counted among this scope's own.">
+          <Count field={draft.newest} unit="copies" none="No such rule" inherit={as(above?.newest ? `the newest ${above.newest}` : null)} onChange={(f) => set("newest", f)} />
+        </Row>
+        <Row label="Keep those used within" hint="How long since a sync into it or a run in it.">
+          <Count
+            field={draft.hours}
+            unit={
+              <select className="kp-select kp-unit" aria-label="Hours or days" value={draft.hours.unit} onChange={(e) => set("hours", { ...draft.hours, unit: e.target.value as "hours" | "days" })}>
+                <option value="hours">hours</option>
+                <option value="days">days</option>
+              </select>
+            }
+            none="No such rule"
+            inherit={as(above?.hours ? hoursSaid(above.hours) : null)}
+            onChange={(f) => set("hours", { ...draft.hours, ...f })}
+          />
+        </Row>
+        <Row label="A copy stays when" hint="With both rules set.">
+          <select className="kp-select" aria-label="A copy stays when" value={draft.both} onChange={(e) => set("both", e.target.value as Draft["both"])}>
+            {!top && <option value="inherit">{as(above ? (above.both ? "both keep it" : "either keeps it") : null)}</option>}
+            <option value="either">Either rule keeps it</option>
+            <option value="both">Both rules keep it</option>
           </select>
-          {preset === "custom" && (
-            <input
-              className="kp-input kp-cron"
-              aria-label="Cron schedule"
-              placeholder="0 3 * * *"
-              value={draft.schedule.value}
-              onChange={(e) => set("schedule", { mode: "set", value: e.target.value })}
-            />
-          )}
-          {draft.schedule.mode === "set" && (
-            <>
-              <input className="kp-input kp-zone" aria-label="Time zone" placeholder={above?.timezone || "UTC"} value={draft.timezone} onChange={(e) => set("timezone", e.target.value)} />
-              {zone && zone !== draft.timezone && (
-                <Button type="button" size="xs" variant="ghost" onClick={() => set("timezone", zone)}>
-                  Use {zone}
-                </Button>
-              )}
-            </>
-          )}
-        </div>
-      </Row>
-      <Row label="Let go when free space falls under" hint="Of the disk the copies are on: what the rules don't keep goes, least recently used first, until there's room.">
-        <div className="kp-inputs">
-          <Count field={draft.free_percent} unit="%" none="No share" inherit={as(above?.free_percent ? `${above.free_percent}%` : null)} onChange={(f) => set("free_percent", f)} />
-          <Count field={draft.free_gib} unit="GiB" none="No size" inherit={as(above?.free_gib ? `${above.free_gib} GiB` : null)} onChange={(f) => set("free_gib", f)} />
-        </div>
-      </Row>
-      <Row label="With too little room still" hint="Once what the rules let go is gone.">
-        <select className="kp-select" aria-label="With too little room still" value={draft.beyond} onChange={(e) => set("beyond", e.target.value as Draft["beyond"])}>
-          {!top && <option value="inherit">{as(above ? (above.beyond ? "the kept go too" : "stop there") : null)}</option>}
-          <option value="no">Stop at what the rules keep</option>
-          <option value="yes">Let the kept go too, least recently used first</option>
-        </select>
-      </Row>
+        </Row>
+        <Row label="Let go on a schedule" hint="What the rules don't keep goes when it comes round.">
+          <div className="kp-inputs">
+            <select
+              className="kp-select"
+              aria-label="Schedule"
+              value={preset}
+              onChange={(e) => {
+                const v = e.target.value;
+                if (v === "inherit" || v === "none") set("schedule", { mode: v, value: draft.schedule.value });
+                else if (v === "custom") set("schedule", { mode: "set", value: SCHEDULES.some((s) => s.cron === draft.schedule.value) ? "" : draft.schedule.value });
+                else set("schedule", { mode: "set", value: v.slice("cron:".length) });
+              }}
+            >
+              {!top && <option value="inherit">{as(above?.schedule?.trim() ? scheduleSaid(above.schedule, above.timezone) : null)}</option>}
+              <option value="none">Never on a schedule</option>
+              {SCHEDULES.map((s) => (
+                <option key={s.cron} value={`cron:${s.cron}`}>
+                  {s.label}
+                </option>
+              ))}
+              <option value="custom">Cron…</option>
+            </select>
+            {preset === "custom" && (
+              <input
+                className="kp-input kp-cron"
+                aria-label="Cron schedule"
+                placeholder="0 3 * * *"
+                value={draft.schedule.value}
+                onChange={(e) => set("schedule", { mode: "set", value: e.target.value })}
+              />
+            )}
+            {draft.schedule.mode === "set" && (
+              <>
+                <input className="kp-input kp-zone" aria-label="Time zone" placeholder={above?.timezone || "UTC"} value={draft.timezone} onChange={(e) => set("timezone", e.target.value)} />
+                {zone && zone !== draft.timezone && (
+                  <Button type="button" size="xs" variant="ghost" onClick={() => set("timezone", zone)}>
+                    Use {zone}
+                  </Button>
+                )}
+              </>
+            )}
+          </div>
+        </Row>
+        <Row label="Let go when free space falls under" hint="Of the disk the copies are on: what the rules don't keep goes, least recently used first, until there's room.">
+          <div className="kp-inputs">
+            <Count field={draft.free_percent} unit="%" none="No share" inherit={as(above?.free_percent ? `${above.free_percent}%` : null)} onChange={(f) => set("free_percent", f)} />
+            <Count field={draft.free_gib} unit="GiB" none="No size" inherit={as(above?.free_gib ? `${above.free_gib} GiB` : null)} onChange={(f) => set("free_gib", f)} />
+          </div>
+        </Row>
+        <Row label="With too little room still" hint="Once what the rules let go is gone.">
+          <select className="kp-select" aria-label="With too little room still" value={draft.beyond} onChange={(e) => set("beyond", e.target.value as Draft["beyond"])}>
+            {!top && <option value="inherit">{as(above ? (above.beyond ? "the kept go too" : "stop there") : null)}</option>}
+            <option value="no">Stop at what the rules keep</option>
+            <option value="yes">Let the kept go too, least recently used first</option>
+          </select>
+        </Row>
+      </fieldset>
       <p className="kp-said" aria-live="polite">
         {"error" in made ? <span className="kp-error">{made.error}</span> : settled ? rulesSaid(settled) : null}
         {!above && !top && "rules" in made && <span className="kp-dim"> Where this sets nothing, each copy's runner and repository rules apply.</span>}
       </p>
       <div className="kp-actions">
-        <Button type="submit" size="sm" disabled={busy || !changed}>
-          {busy ? "Saving…" : "Save"}
+        <Button type="submit" size="sm" disabled={!changed || sending === "back"} pending={sending === "save"}>
+          {sending === "save" ? "Saving…" : "Save"}
         </Button>
         {Object.keys(rules).length > 0 && (
-          <Button type="button" size="sm" variant="ghost" disabled={busy} onClick={() => void save(null)}>
+          <Button type="button" size="sm" variant="ghost" disabled={sending === "save"} pending={sending === "back"} onClick={() => save("back", null)}>
             {top ? "Clear" : `Back to ${aboveName}`}
           </Button>
         )}
         {changed && (
-          <Button type="button" size="sm" variant="ghost" disabled={busy} onClick={() => setDraft(draftOf(rules, top))}>
+          <Button type="button" size="sm" variant="ghost" disabled={sending !== null} onClick={() => setDraft(draftOf(rules, top))}>
             Undo
           </Button>
         )}

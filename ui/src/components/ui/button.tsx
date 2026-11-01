@@ -1,6 +1,7 @@
 import * as React from "react";
 import { Slot } from "radix-ui";
 import { cva, type VariantProps } from "class-variance-authority";
+import { sendingProps } from "@/lib/action";
 import { cn } from "@/lib/utils";
 
 // Verbatim from hyperlight-site components/ui/button.tsx, plus `danger` and `ghost-danger`, a
@@ -11,12 +12,10 @@ export const buttonVariants = cva(
     variants: {
       variant: {
         primary: "border-[#e4e5e7] bg-[#e4e5e7] text-[#111214] hover:border-white hover:bg-white",
-        secondary:
-          "border-white/15 bg-white/[0.03] text-[#e4e5e7] hover:border-white/30 hover:bg-white/[0.07]",
+        secondary: "border-white/15 bg-white/[0.03] text-[#e4e5e7] hover:border-white/30 hover:bg-white/[0.07]",
         ghost: "border-transparent bg-transparent text-[#b4b5ba] hover:bg-white/[0.06] hover:text-white",
         "ghost-danger": "border-transparent bg-transparent text-[#d1aaad] hover:bg-white/[0.06] hover:text-white",
-        danger:
-          "border-[#d1aaad]/30 bg-[#d1aaad]/[0.04] text-[#e2c4c6] hover:border-[#d1aaad]/60 hover:bg-[#d1aaad]/[0.09]",
+        danger: "border-[#d1aaad]/30 bg-[#d1aaad]/[0.04] text-[#e2c4c6] hover:border-[#d1aaad]/60 hover:bg-[#d1aaad]/[0.09]",
       },
       // Each size is whole (height, padding, text, icon): class lists are joined as they are, so
       // nothing may need overriding.
@@ -35,24 +34,27 @@ export const buttonVariants = cva(
   },
 );
 
-export interface ButtonProps
-  extends React.ButtonHTMLAttributes<HTMLButtonElement>,
-    VariantProps<typeof buttonVariants> {
+export interface ButtonProps extends React.ButtonHTMLAttributes<HTMLButtonElement>, VariantProps<typeof buttonVariants> {
   asChild?: boolean;
+  /** Its press's request is on its way (lib/action.ts): it says so, as it was, and a press meanwhile does nothing. */
+  pending?: boolean;
 }
 
-export const Button = React.forwardRef<HTMLButtonElement, ButtonProps>(
-  ({ className, variant, size, asChild = false, type, ...props }, ref) => {
-    const Component = asChild ? Slot.Root : "button";
-    return (
-      <Component
-        ref={ref}
-        data-slot="button"
-        type={asChild ? type : (type ?? "button")}
-        className={cn(buttonVariants({ variant, size }), className)}
-        {...props}
-      />
-    );
-  },
-);
+/** A press on a button whose request is on its way: nothing, not even a form's submit. */
+const held = (e: React.MouseEvent) => e.preventDefault();
+
+export const Button = React.forwardRef<HTMLButtonElement, ButtonProps>(({ className, variant, size, asChild = false, type, pending = false, onClick, ...props }, ref) => {
+  const Component = asChild ? Slot.Root : "button";
+  return (
+    <Component
+      ref={ref}
+      data-slot="button"
+      type={asChild ? type : (type ?? "button")}
+      className={cn(buttonVariants({ variant, size }), className)}
+      {...props}
+      {...sendingProps(pending)}
+      onClick={pending ? held : onClick}
+    />
+  );
+});
 Button.displayName = "Button";

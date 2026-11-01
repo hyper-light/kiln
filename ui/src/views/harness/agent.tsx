@@ -17,6 +17,7 @@ import type { AgentInfo, Command, FileChange, HEvent, Meta, SessionStore, Todo }
 import { harnessSessionsRes, useRes } from "@/lib/data";
 import { kilnSubagentsOf } from "./tasks";
 import { Button } from "@/components/ui/button";
+import { useAction } from "@/lib/action";
 import { ConfirmDialog } from "@/components/ui/dialog";
 import { toast } from "@/components/ui/toast";
 import { errorMessage, useLocalStorage, useMediaQuery } from "@/lib/hooks";
@@ -44,8 +45,10 @@ import { PlanSourceContext } from "@/views/plans/save";
 import { useReviewWaits } from "@/views/plans/review";
 import { revealReview } from "@/views/plans/reveal";
 import { useEndWithChildren } from "./family";
-import { LoadingMark, PrismLabel } from "./signals";
-import { markAnswered, stillAsked, unmark, useAnswered } from "./answered";
+import { LoadingMark } from "./signals";
+import { sendCommand, stillAsked, useAnswered } from "./answered";
+import { EarlyComposer, EarlyLine, EarlyTurns, takeTyping } from "./early";
+import { settled, useStart, type Start } from "./starting";
 import { AboutContext } from "@/components/code/about";
 
 type PhoneTab = "work" | InspectorTab;
@@ -70,13 +73,32 @@ export default function AgentPage() {
 
 function AgentConsole({ id }: { id: string }) {
   const store = sessionStore(id);
+  // Started from Mission control a moment ago (starting.ts): its page shows it starting, with what
+  // it was asked, until its machine has it, or why it couldn't (W21-R15).
+  const start = useStart(id);
+  // A server that made the agent's id itself: its own page, under that one.
+  const made = start?.started?.[start.ids.indexOf(id)]?.id;
+  if (made && made !== id) return <Navigate to={`/agents/${made}`} replace />;
+  // One that couldn't: its page says why, there being no conversation to wait for.
+  if (start?.state === "failed") return <AgentLoading id={id} start={start} />;
+  // While it starts, and then while its conversation comes, one stand-in: the box written in meanwhile stays as it is.
   return (
-    <React.Suspense fallback={<AgentLoading id={id} />}>
-      <InItsAgentsChat id={id}>
-        <Agent id={id} store={store} />
-      </InItsAgentsChat>
+    <React.Suspense fallback={<AgentLoading id={id} start={start} />}>
+      {start?.state === "starting" ? (
+        <Started start={start} />
+      ) : (
+        <InItsAgentsChat id={id}>
+          <Agent id={id} store={store} />
+        </InItsAgentsChat>
+      )}
     </React.Suspense>
   );
+}
+
+/** Waits, in Suspense, for start `start` to have started or not (starting.ts). */
+function Started({ start }: { start: Start }): React.ReactNode {
+  React.use(settled(start));
+  return null;
 }
 
 /**
@@ -180,16 +202,8 @@ function Agent({ id, store }: { id: string; store: SessionStore }) {
     void attachments.add(files);
   });
 
-  const send = React.useCallback(
-    (c: Command) => {
-      // An answer shows as given at once (answered.ts); back if it couldn't go.
-      if (c.type === "approve") markAnswered([c.id]);
-      if (store.send(c)) return;
-      if (c.type === "approve") unmark([c.id]);
-      toast.error("Not connected", "The agent's machine is reconnecting; try again in a moment.");
-    },
-    [store],
-  );
+  // An answer shows as given at once (answered.ts), and goes even while the socket reconnects.
+  const send = React.useCallback((c: Command) => sendCommand(store, id, c), [store, id]);
   const openTask = React.useCallback(
     (toolId: string) => {
       const child = store.get().state?.tasks.find((t) => t.tool_id === toolId || t.id === toolId);
@@ -278,13 +292,10 @@ function Agent({ id, store }: { id: string; store: SessionStore }) {
 
   // Ending it ends the agents it started too, unless the dialog says otherwise.
   const ending = useEndWithChildren(id);
+  // Its confirm says it's on its way, and a refusal is said in the dialog (ConfirmDialog).
   const stop = async () => {
-    try {
-      await ending.end();
-      navigate("/agents");
-    } catch (e) {
-      toast.error("Couldn't stop the agent", errorMessage(e));
-    }
+    await ending.end();
+    await navigate("/agents");
   };
 
   const footer = React.useMemo(() => <>{!task && <BesideTerminals agent={id} info={info} onInsert={hand} />}</>, [info, task, id, hand]);
@@ -379,6 +390,7 @@ function Agent({ id, store }: { id: string; store: SessionStore }) {
   const hasFiles = (e: React.DragEvent) => [...e.dataTransfer.types].includes("Files");
   return (
     <div
+      ref={takeTyping}
       className="hx-agent ag-ready"
       onDragEnter={(e) => {
         if (hasFiles(e)) setDragging(true);
@@ -560,15 +572,7 @@ function KilnThread({
   const accepts = useSession(store, (s) => acceptsOf(s.meta));
   const attachments = useAttachments(accepts);
   const [reply, setReply] = React.useState<ReplyTarget | null>(null);
-  const send = React.useCallback(
-    (c: Command) => {
-      if (c.type === "approve") markAnswered([c.id]);
-      if (store.send(c)) return;
-      if (c.type === "approve") unmark([c.id]);
-      toast.error("Not connected", "The subagent's machine is reconnecting; try again in a moment.");
-    },
-    [store],
-  );
+  const send = React.useCallback((c: Command) => sendCommand(store, id, c), [store, id]);
   const ownPage = React.useCallback((task?: string) => navigate(`/agents/${id}?own=1${task ? `&task=${encodeURIComponent(task)}` : ""}`), [navigate, id]);
   const end = () => void harnessApi.end(id, true).catch((e: unknown) => toast.error("Couldn't end it", errorMessage(e)));
   return (
@@ -637,7 +641,7 @@ function Dock({
   onTerminal: (o: { what: "shell" | "screen"; command?: string }) => void;
   onOpenTask: (toolId: string) => void;
   onRemove: () => void;
-  send: (c: Command) => void;
+  send: (c: Command) => void | Promise<void>;
   /** What the next message answers (a message's ⋯ → Reply to). */
   reply?: ReplyTarget | null;
   onClearReply?: () => void;
@@ -650,6 +654,8 @@ function Dock({
   const info = useSession(store, (s) => s.info);
   const harnessSession = useSession(store, (s) => s.state?.harness_session ?? s.info?.harness_session);
   const [moving, setMoving] = React.useState(false);
+  // Says it's on its way while it goes over HTTP (its socket reconnecting), and a press meanwhile does nothing.
+  const [restart, restarting] = useAction(() => send({ type: "restart" }));
   return (
     <div className="hx-dock" ref={liftNotices} onPointerDown={keepTyping} onMouseDown={keepTyping}>
       <ActivityLine store={store} onOpenTask={onOpenTask} kiln={kiln} inThread={task} />
@@ -679,7 +685,7 @@ function Dock({
               : `${exit?.error ?? `The agent stopped${exit?.code != null ? ` (exit ${exit.code})` : ""}.`} Sending a message picks up where it left off.`}
           </span>
           {resume && (
-            <Button size="sm" variant="secondary" onClick={() => send({ type: "restart" })}>
+            <Button size="sm" variant="secondary" pending={restarting} onClick={restart}>
               <RotateCcw /> Restart
             </Button>
           )}
@@ -780,48 +786,20 @@ function Settings({ store, open, onOpenChange, send }: { store: SessionStore; op
  * tabs or the side, the composer's place) as the page will have it, and the loader where the
  * conversation goes, so nothing moves when it's in.
  */
-function AgentLoading({ id }: { id: string }) {
+function AgentLoading({ id, start }: { id: string; start?: Start }) {
   const wide = useMediaQuery("(min-width: 1100px)");
   const [trayCollapsed, setTrayCollapsed] = useLocalStorage(INSPECTOR_COLLAPSED, false);
-  const draft = useDrafts((s) => s.drafts[id] ?? "");
-  const sizeDraft = React.useCallback(
-    (el: HTMLTextAreaElement | null) => {
-      void draft;
-      if (!el) return;
-      el.style.height = "auto";
-      el.style.height = `${el.scrollHeight}px`;
-    },
-    [draft],
-  );
   const work = (
     <div className="hx-main">
-      <div className="hx-timeline ag-loading" role="status">
-        <LoadingMark />
-        <PrismLabel live>Loading conversation</PrismLabel>
-      </div>
+      <EarlyTurns id={id} start={start} />
       <div className="hx-dock" ref={liftNotices}>
-        <div className="hx-composer cp">
-          <div className="hx-compose-box">
-            <div className="cp-field">
-              <div className="hx-compose-input cp-mirror" aria-hidden="true">
-                {draft}
-                {"​"}
-              </div>
-              <textarea ref={sizeDraft} className="hx-compose-input cp-input" rows={1} value={draft} placeholder="Loading conversation…" disabled aria-label="Message to the agent" />
-            </div>
-            <div className="cp-bar">
-              <span className="cp-gap" />
-              <button type="button" className="cp-send" data-mode="send" disabled aria-label="Send">
-                <span className="cp-label">Send</span>
-              </button>
-            </div>
-          </div>
-        </div>
+        {start && <EarlyLine id={id} start={start} />}
+        <EarlyComposer id={id} start={start} />
       </div>
     </div>
   );
   return (
-    <div className="hx-agent" aria-busy="true">
+    <div className="hx-agent" aria-busy={start?.state === "failed" ? undefined : true}>
       <title>Agent · kiln</title>
       <header className="ag-head">
         <p className="ag-eyebrow">
@@ -831,7 +809,7 @@ function AgentLoading({ id }: { id: string }) {
         </p>
         <div className="ag-top">
           <div className="ag-id">
-            <h1 className="ag-title hx-ghost">Agent</h1>
+            <h1 className={start ? "ag-title" : "ag-title hx-ghost"}>{start ? start.spec.name?.trim() || start.kindName : "Agent"}</h1>
           </div>
           <span className="ag-actions hx-ghost" aria-hidden="true">
             <span className="fig-round" />

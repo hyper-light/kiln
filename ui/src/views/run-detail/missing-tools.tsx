@@ -11,7 +11,7 @@ import type { Job, ToolFix } from "@/api/types";
 import { Button } from "@/components/ui/button";
 import { Confirm } from "@/components/ui/misc";
 import { toast } from "@/components/ui/toast";
-import { errorMessage } from "@/lib/hooks";
+import { useAction } from "@/lib/action";
 import { useSuspenseResource } from "@/lib/resource";
 import { Link } from "@/lib/router";
 import { Quiet } from "@/views/harness/change-bar";
@@ -64,8 +64,13 @@ function Lacks({ job }: { job: Job }) {
     apply: (d, ev) => (ev.type === "job" && ev.job.id === job.id ? undefined : d),
   });
   const [asking, setAsking] = React.useState(false);
-  const [busy, setBusy] = React.useState(false);
   const [chosen, setChosen] = React.useState<string | null>(null);
+  const [start, starting] = useAction(async (runner: string) => {
+    const r = await api.fixJobTools(job.id, { runner });
+    res.setData((d) => (d ? { ...d, fix: r.fix } : d));
+    toast({ title: `An agent is installing ${and(r.fix.tools)} on ${r.fix.runner}`, tone: "info" });
+    setAsking(false);
+  }, "No agent started");
   if (!res.data) return null;
   const { missing, fix } = res.data;
   // A failed job: what its log says wasn't there, on the runner it failed on.
@@ -84,21 +89,6 @@ function Lacks({ job }: { job: Job }) {
       : fix
         ? `${and(fix.tools)} on ${fix.runner}`
         : "";
-
-  const start = async () => {
-    if (!pick) return;
-    setBusy(true);
-    try {
-      const r = await api.fixJobTools(job.id, { runner: pick.runner });
-      res.setData((d) => (d ? { ...d, fix: r.fix } : d));
-      toast({ title: `An agent is installing ${and(r.fix.tools)} on ${r.fix.runner}`, tone: "info" });
-      setAsking(false);
-    } catch (e) {
-      toast.error("No agent started", errorMessage(e));
-    } finally {
-      setBusy(false);
-    }
-  };
 
   return (
     <section className="lacks" aria-label="What this job lacks" data-state={fix?.state ?? "lacks"}>
@@ -142,7 +132,7 @@ function Lacks({ job }: { job: Job }) {
           label={`Install ${and(pick.tools)} on ${pick.runner}?`}
           actions={
             <>
-              <Button size="xs" disabled={busy} onClick={() => void start()}>
+              <Button size="xs" pending={starting} onClick={() => start(pick.runner)}>
                 Start the agent
               </Button>
               <Button size="xs" variant="ghost" onClick={() => setAsking(false)}>

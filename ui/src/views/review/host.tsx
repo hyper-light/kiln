@@ -13,9 +13,10 @@ import { Loadable, Loading } from "@/components/ui/loading";
 import { PageIntro, SelectField } from "@/components/ui/misc";
 import { StatusDot } from "@/components/ui/status";
 import { toast } from "@/components/ui/toast";
+import { useAction } from "@/lib/action";
 import { useRes } from "@/lib/data";
 import { relativeTime, shortSha } from "@/lib/format";
-import { errorMessage, useMediaQuery } from "@/lib/hooks";
+import { useMediaQuery } from "@/lib/hooks";
 import { invalidate } from "@/lib/resource";
 import { FileDiff, ThreadView, type Pick } from "./diff";
 import { findMoves, parsePatch, type PatchFile } from "./patch";
@@ -286,23 +287,15 @@ function Checks({ p }: { p: HostPullDetail }) {
 
 function Merge({ repo, p }: { repo: string; p: HostPullDetail }) {
   const [method, setMethod] = React.useState(p.merge_methods[0] ?? "merge");
-  const [busy, setBusy] = React.useState(false);
+  const [merge, merging] = useAction(async () => {
+    const r = await hostPullsApi.merge(repo, p.number, method);
+    toast({
+      title: r.merged ? `Merged by ${method} ${acted(r.as)}${r.commit ? `: ${shortSha(r.commit)}` : ""}` : `${HOST_WORD[p.host]} took the merge ${acted(r.as)}`,
+      tone: "succeeded",
+    });
+    refresh(repo, p.number);
+  }, "It didn't merge");
   if (p.state !== "open") return null;
-  const merge = async () => {
-    setBusy(true);
-    try {
-      const r = await hostPullsApi.merge(repo, p.number, method);
-      toast({
-        title: r.merged ? `Merged by ${method} ${acted(r.as)}${r.commit ? `: ${shortSha(r.commit)}` : ""}` : `${HOST_WORD[p.host]} took the merge ${acted(r.as)}`,
-        tone: "succeeded",
-      });
-      refresh(repo, p.number);
-    } catch (e) {
-      toast.error("It didn't merge", errorMessage(e));
-    } finally {
-      setBusy(false);
-    }
-  };
   return (
     <section className="rv-land" aria-label="Merging">
       <div className="rv-land-go">
@@ -319,7 +312,7 @@ function Merge({ repo, p }: { repo: string; p: HostPullDetail }) {
             }))}
           />
         )}
-        <Button size="sm" disabled={busy || p.merge_methods.length === 0} onClick={() => void merge()}>
+        <Button size="sm" disabled={p.merge_methods.length === 0} pending={merging} onClick={merge}>
           Merge {hostNumber(p.host, p.number)}
         </Button>
       </div>
@@ -349,22 +342,16 @@ function Reviews({ p }: { p: HostPullDetail }) {
 /** Comments on the change as a whole, its threads that aren't on a line, and a new comment. */
 function Conversation({ repo, p, threads, onReply }: { repo: string; p: HostPullDetail; threads: Thread[]; onReply: (t: Thread, body: string) => Promise<void> }) {
   const [text, setText] = React.useState("");
-  const [busy, setBusy] = React.useState(false);
-  const send = async () => {
-    setBusy(true);
-    try {
-      const r = await hostPullsApi.comment(repo, p.number, {
-        body: text.trim(),
-      });
-      setText("");
-      toast({ title: `Commented ${acted(r.as)}`, tone: "succeeded" });
-      refresh(repo, p.number);
-    } catch (e) {
-      toast.error("Your comment didn't go", errorMessage(e));
-    } finally {
-      setBusy(false);
-    }
-  };
+  const [send, sending] = useAction(async () => {
+    const sent = text;
+    const r = await hostPullsApi.comment(repo, p.number, {
+      body: text.trim(),
+    });
+    // What's written since stays (W21-R15).
+    setText((t) => (t === sent ? "" : t));
+    toast({ title: `Commented ${acted(r.as)}`, tone: "succeeded" });
+    refresh(repo, p.number);
+  }, "Your comment didn't go");
   return (
     <section className="rv-general" aria-label="Conversation">
       {p.conversation.map((c) => (
@@ -376,7 +363,7 @@ function Conversation({ repo, p, threads, onReply }: { repo: string; p: HostPull
       <div className="rv-compose">
         <textarea className="rv-compose-input" rows={2} value={text} placeholder="Comment on the change" onChange={(e) => setText(e.target.value)} />
         <div className="rv-compose-acts">
-          <Button size="xs" disabled={busy || !text.trim()} onClick={() => void send()}>
+          <Button size="xs" disabled={!text.trim()} pending={sending} onClick={send}>
             Comment
           </Button>
         </div>
@@ -401,28 +388,22 @@ function Said({ c }: { c: HostComment }) {
 function ReviewForm({ repo, p }: { repo: string; p: HostPullDetail }) {
   const [text, setText] = React.useState("");
   const [verdict, setVerdict] = React.useState<"approve" | "request_changes" | "comment">("comment");
-  const [busy, setBusy] = React.useState(false);
+  const [send, sending] = useAction(async () => {
+    const sent = text;
+    const r = await hostPullsApi.review(repo, p.number, verdict, text.trim());
+    // What's written since stays (W21-R15).
+    setText((t) => (t === sent ? "" : t));
+    toast({ title: `Review sent ${acted(r.as)}`, tone: "succeeded" });
+    refresh(repo, p.number);
+  }, "Your review didn't go");
   if (p.state !== "open") return null;
-  const send = async () => {
-    setBusy(true);
-    try {
-      const r = await hostPullsApi.review(repo, p.number, verdict, text.trim());
-      setText("");
-      toast({ title: `Review sent ${acted(r.as)}`, tone: "succeeded" });
-      refresh(repo, p.number);
-    } catch (e) {
-      toast.error("Your review didn't go", errorMessage(e));
-    } finally {
-      setBusy(false);
-    }
-  };
   return (
     <section className="rv-review" aria-label="Your review">
       <p className="rv-land-title">Your review</p>
       <textarea className="rv-compose-input" rows={3} value={text} placeholder="What you think of it, overall (optional to approve)" onChange={(e) => setText(e.target.value)} />
       <div className="rv-compose-acts">
         <SelectField label="Your review" hideLabel value={verdict} onChange={(v) => setVerdict(v as typeof verdict)} options={VERDICTS} />
-        <Button size="sm" disabled={busy || (verdict !== "approve" && !text.trim())} onClick={() => void send()}>
+        <Button size="sm" disabled={verdict !== "approve" && !text.trim()} pending={sending} onClick={send}>
           Send review
         </Button>
       </div>

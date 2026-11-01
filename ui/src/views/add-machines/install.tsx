@@ -6,6 +6,7 @@ import { api } from "@/api/client";
 import type { InstallOs, JoinInfo, JoinRequest, OutpostInvite } from "@/api/types";
 import { Button } from "@/components/ui/button";
 import { SectionHeading } from "@/components/ui/misc";
+import { sendingProps } from "@/lib/action";
 import { relativeTime } from "@/lib/format";
 import { errorMessage, useNow } from "@/lib/hooks";
 import type { SuspenseResource } from "@/lib/resource";
@@ -65,7 +66,7 @@ export function InstallSection({
       </div>
       <p className="am-note">
         {os === "windows" ? "In PowerShell on the machine: downloads" : "On the machine: downloads"} kiln from this server, installs it as {SERVICE[os]} and joins as a runner.
-        <Expiry at={data.expires_at} onRenew={info.reload} />
+        <Expiry at={data.expires_at} onRenew={info.reload} renewing={info.refreshing} />
       </p>
       <Status arrived={arrived} asking={asking} rowOf={rowOf} />
       <Alternatives info={data} os={os} />
@@ -117,8 +118,7 @@ function Alternatives({ info, os }: { info: JoinInfo | undefined; os: InstallOs 
             <div>
               <h3 className="am-h3">Kubernetes</h3>
               <p>
-                No machine to add: with <code>[kubernetes] enabled = true</code> in the server&apos;s config, each job that <code>runs-on: [k8s]</code> gets a fresh pod in{" "}
-                <code>kiln-jobs</code>.{" "}
+                No machine to add: with <code>[kubernetes] enabled = true</code> in the server&apos;s config, each job that <code>runs-on: [k8s]</code> gets a fresh pod in <code>kiln-jobs</code>.{" "}
                 <a className="am-act am-inline-act" href={K8S_GUIDE} target="_blank" rel="noreferrer">
                   Kubernetes guide <ArrowUpRight aria-hidden="true" />
                 </a>
@@ -161,8 +161,8 @@ function OutpostLine({ os, invite, error, onRenew }: { os: InstallOs; invite: Ou
   return (
     <div className="am-alt">
       <p>
-        Run it as an outpost instead: kiln goes in a folder of its own and runs in that terminal until you stop it (Ctrl-C). Nothing is installed and nothing starts on boot. That
-        machine&apos;s terminals, its Claude Code, Codex and Gemini sessions, and agents show up here; it takes no jobs.
+        Run it as an outpost instead: kiln goes in a folder of its own and runs in that terminal until you stop it (Ctrl-C). Nothing is installed and nothing starts on boot. That machine&apos;s
+        terminals, its Claude Code, Codex and Gemini sessions, and agents show up here; it takes no jobs.
       </p>
       {error ? (
         <p className="am-warn">Couldn&apos;t make an invite: {error}</p>
@@ -187,8 +187,8 @@ function OutpostLine({ os, invite, error, onRenew }: { os: InstallOs; invite: Ou
   );
 }
 
-/** " Its token expires in 23h." — live, and a way to a fresh command once it has expired. */
-function Expiry({ at, onRenew }: { at: number | null | undefined; onRenew: () => void }) {
+/** " Its token expires in 23h." — live, and a way to a fresh command once it has expired (`renewing`: that one is on its way). */
+function Expiry({ at, onRenew, renewing = false }: { at: number | null | undefined; onRenew: () => void; renewing?: boolean }) {
   const now = useNow();
   if (!at) return null;
   if (at * 1000 <= now) {
@@ -196,7 +196,7 @@ function Expiry({ at, onRenew }: { at: number | null | undefined; onRenew: () =>
       <>
         {" "}
         <span className="am-warn">Its token has expired.</span>{" "}
-        <button type="button" className="am-act am-inline-act" onClick={onRenew}>
+        <button type="button" className="am-act am-inline-act" {...sendingProps(renewing)} onClick={renewing ? undefined : onRenew}>
           <RotateCcw aria-hidden="true" /> New command
         </button>
       </>

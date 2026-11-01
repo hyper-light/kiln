@@ -37,6 +37,7 @@ import {
 import { Chart } from "@/components/charts/chart";
 import { SERIES, type Band } from "@/components/charts/types";
 import { Segmented, tabsTriggerClass } from "@/components/ui/tabs";
+import { useAction } from "@/lib/action";
 import { useRes, type Res } from "@/lib/data";
 import { formatBytes, formatDuration } from "@/lib/format";
 
@@ -122,6 +123,65 @@ export function useParams(): (changes: Record<string, string | null>) => void {
 export function useRange(fallback: Range = "1h"): [Range, (r: Range) => void] {
   const [r, set] = useParam("range", fallback);
   return [isRange(r) ? r : fallback, set];
+}
+
+/**
+ * A list's moves up and down, one at a time (W21-R15): each shows at once, and the next waits for
+ * its answer, so the order sent is always the one shown and no answer's reload undoes a later move.
+ * `move(id, by, send)` does `send` (which shows the move and returns its request) unless a move is on
+ * its way; `props(id, by, cannot)` are a move button's: the one pressed says its move is on its way,
+ * the others wait for it.
+ */
+export function useMoves() {
+  const [pressed, setPressed] = React.useState("");
+  const [run, moving] = useAction((key: string, send: () => unknown) => {
+    setPressed(key);
+    return send();
+  });
+  return {
+    move: (id: string, by: -1 | 1, send: () => unknown) => run(`${id}/${by}`, send),
+    props: (id: string, by: -1 | 1, cannot: boolean) => {
+      const it = moving && pressed === `${id}/${by}`;
+      return { pending: it, disabled: cannot || (moving && !it) };
+    },
+  };
+}
+
+/** The same form: one value, or each of a list of them alike (a form kept in several). */
+const sameForm = (a: unknown, b: unknown) => a === b || (Array.isArray(a) && Array.isArray(b) && a.length === b.length && a.every((x, i) => Object.is(x, b[i])));
+
+/**
+ * A dialog's (or an edit form's) opening, for what its save's answer does (W21-R15). `ref` goes on
+ * its form; `still(sent)` says that opening is still shown and its form still says `sent` (what it
+ * said at the press). An answer closes it, or goes on from it, only then: one closed and opened again
+ * since isn't the answer's to close, and what's typed after the press stays, to be saved again. One
+ * whose fields are held while it's answered (`HeldFields`) needs no `form`: `still()` says it's shown.
+ */
+export function useOpening(form?: unknown) {
+  const now = React.useRef({ form, shown: false });
+  now.current.form = form;
+  const [ref] = React.useState(() => (el: HTMLElement | null) => {
+    if (!el) return;
+    now.current.shown = true;
+    return () => {
+      now.current.shown = false;
+    };
+  });
+  return { ref, still: (sent?: unknown) => now.current.shown && sameForm(now.current.form, sent) };
+}
+
+/**
+ * A form's fields, held while its save is answered where what's typed meanwhile couldn't be kept
+ * (W21-R15): one that makes something (pressed again, it would make a second, or be refused), or one
+ * its answer makes anew. Nothing is typed after the press for the answer to lose. A form that changes
+ * what's there keeps its fields instead, and its answer leaves it open if they changed.
+ */
+export function HeldFields({ held, className = "space-y-4", children }: { held: boolean; className?: string; children: React.ReactNode }) {
+  return (
+    <fieldset disabled={held} className={`min-w-0 ${className}`}>
+      {children}
+    </fieldset>
+  );
 }
 
 export function RangePicker({ value, onChange }: { value: Range; onChange: (r: Range) => void }) {

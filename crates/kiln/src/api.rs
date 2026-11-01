@@ -4802,6 +4802,11 @@ struct HarnessOpen {
     spec: crate::harness::session::Spec,
     #[serde(default)]
     count: Option<usize>,
+    /// The ids to start them under, one each, made by the client (`crate::util::is_id`), so its
+    /// page can open the first one's own page at once (W21-R15); asked again under the same ids, a
+    /// start is refused (409) rather than started twice.
+    #[serde(default)]
+    ids: Vec<String>,
 }
 
 async fn harness_open(hub: &Hub, req: Request) -> R {
@@ -4841,8 +4846,25 @@ async fn harness_open(hub: &Hub, req: Request) -> R {
         }
         Some(_) => {}
     }
+    let count = body.count.unwrap_or(1);
+    if !body.ids.is_empty() {
+        let n = count.clamp(1, 16);
+        if body.ids.len() != n {
+            return Err(err(StatusCode::BAD_REQUEST, format!("`ids` names one id for each agent it starts: {n}, not {}", body.ids.len())));
+        }
+        if let Some(bad) = body.ids.iter().find(|id| !crate::util::is_id(id)) {
+            return Err(err(StatusCode::BAD_REQUEST, format!("{bad:?} isn't an id: an id is 32 lowercase hex digits")));
+        }
+        let mut seen = std::collections::HashSet::new();
+        if !body.ids.iter().all(|id| seen.insert(id.as_str())) {
+            return Err(err(StatusCode::BAD_REQUEST, "`ids` names each agent's id once"));
+        }
+    }
     hub.store.audit("admin".into(), "agent.open".into(), format!("{} on {}", body.spec.kind, body.target)).await;
-    let infos = hub.harness.open(hub, &body.target, body.spec, body.count.unwrap_or(1)).await.map_err(|e| err(StatusCode::BAD_REQUEST, format!("{e:#}")))?;
+    let infos = hub.harness.open_as(hub, &body.target, body.spec, count, &body.ids).await.map_err(|e| {
+        let status = if e.downcast_ref::<crate::harness::registry::IdTaken>().is_some() { StatusCode::CONFLICT } else { StatusCode::BAD_REQUEST };
+        err(status, format!("{e:#}"))
+    })?;
     // Whom each acts for when its MCP server asks kiln for something (`crate::mcp::runner_ask`), and
     // whose it is.
     if let Some(c) = &caller {

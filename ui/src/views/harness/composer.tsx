@@ -10,6 +10,7 @@
 import * as React from "react";
 import { ArrowDown, ArrowUp, ChevronDown, CornerDownLeft, Navigation, Paperclip, Pencil, Square, X, Zap } from "lucide-react";
 import { clientId, FORCE_STOP_AFTER_MS, useSession, useStopAt, type Attachment, type QueueItem, type SendMode, type SessionStore, type SlashCommand } from "@/api/harness";
+import { sendingProps } from "@/lib/action";
 import { useNow } from "@/lib/hooks";
 import { Tip } from "@/components/ui/tooltip";
 import { Button } from "@/components/ui/button";
@@ -135,7 +136,14 @@ function QueueRow({ q, index, count, onEdit, onAttach, onRemove, onMove, onSteer
                   });
                 }}
               />
-              <button type="button" className="hx-attach-chip hx-attach-add" aria-label="Attach files" onClick={() => picker.current?.click()}>
+              {/* While files go up it says so (W21-R15), and takes no more till they're in: a batch joins the message as it was when picked. */}
+              <button
+                type="button"
+                className="hx-attach-chip hx-attach-add"
+                aria-label="Attach files"
+                {...sendingProps(attach.pending > 0)}
+                onClick={() => attach.pending === 0 && picker.current?.click()}
+              >
                 <Paperclip size={11} />
               </button>
             </>

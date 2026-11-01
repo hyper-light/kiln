@@ -13,10 +13,11 @@ import { Loadable, Loading } from "@/components/ui/loading";
 import { SelectField } from "@/components/ui/misc";
 import { StatusDot } from "@/components/ui/status";
 import { toast } from "@/components/ui/toast";
+import { useAction } from "@/lib/action";
 import { useRes } from "@/lib/data";
 import { relativeTime, shortSha } from "@/lib/format";
 import { errorMessage, useMediaQuery } from "@/lib/hooks";
-import { invalidate } from "@/lib/resource";
+import { change, invalidate } from "@/lib/resource";
 import { useListener } from "@/views/harness/dom";
 import { AboutContext } from "@/components/code/about";
 import { anchorOf, FileDiff, ThreadView, type Pick } from "./diff";
@@ -144,22 +145,22 @@ function Dependencies({ diffKey, to, from }: { diffKey: string; to: number; from
   );
 }
 
+/** What a diff's author does to it from its head. */
+type DiffAct = "ready" | "abandon" | "reclaim";
+
 function Head({ d }: { d: DiffDetail }) {
-  const [busy, setBusy] = React.useState(false);
   // The author's actions are the author's: on yours, or your agents'.
   const you = useRes(inboxRes).data.you;
   const yours = d.author === you || d.author_for === you;
-  const act = async (a: "ready" | "abandon" | "reclaim" | "commandeer") => {
-    setBusy(true);
-    try {
-      await reviewApi.act(d.name, a);
-      refresh(d.name);
-    } catch (e) {
-      toast.error("That didn't work", errorMessage(e));
-    } finally {
-      setBusy(false);
-    }
-  };
+  // Ready, Reclaim and Abandon change one diff's state: one at a time (W21-R15), the one pressed
+  // saying it's on its way and the others held until it's back.
+  const [sent, setSent] = React.useState<DiffAct | null>(null);
+  const [act, acting] = useAction(async (a: DiffAct) => {
+    setSent(a);
+    await reviewApi.act(d.name, a);
+    refresh(d.name);
+  }, "That didn't work");
+  const hold = (a: DiffAct) => ({ pending: acting && sent === a, disabled: acting && sent !== a });
   const agent = d.author_kind === "agent" || d.author.startsWith("agent:");
   return (
     <header className="rv-head">
@@ -196,17 +197,17 @@ function Head({ d }: { d: DiffDetail }) {
       {yours && (
         <div className="rv-acts">
           {d.state === "draft" && (
-            <Button size="xs" variant="secondary" disabled={busy} onClick={() => void act("ready")}>
+            <Button size="xs" variant="secondary" {...hold("ready")} onClick={() => act("ready")}>
               Ready for review
             </Button>
           )}
           {d.state === "abandoned" ? (
-            <Button size="xs" variant="ghost" disabled={busy} onClick={() => void act("reclaim")}>
+            <Button size="xs" variant="ghost" {...hold("reclaim")} onClick={() => act("reclaim")}>
               Reclaim
             </Button>
           ) : (
             d.state !== "landed" && (
-              <Button size="xs" variant="ghost" disabled={busy} onClick={() => void act("abandon")}>
+              <Button size="xs" variant="ghost" {...hold("abandon")} onClick={() => act("abandon")}>
                 Abandon
               </Button>
             )
@@ -239,20 +240,12 @@ function Checks({ d }: { d: DiffDetail }) {
 function Land({ d }: { d: DiffDetail }) {
   const r = useRes(readinessRes(d.name)).data;
   const [strategy, setStrategy] = React.useState(r.default ?? r.strategies[0] ?? "");
-  const [busy, setBusy] = React.useState(false);
+  const [land, landing] = useAction(async () => {
+    await reviewApi.land(d.name, strategy || undefined);
+    toast({ title: `${d.name} is in the land queue`, tone: "running" });
+    refresh(d.name);
+  }, "It can't land yet");
   if (d.state === "landed" || d.state === "abandoned") return null;
-  const land = async () => {
-    setBusy(true);
-    try {
-      await reviewApi.land(d.name, strategy || undefined);
-      toast({ title: `${d.name} is in the land queue`, tone: "running" });
-      refresh(d.name);
-    } catch (e) {
-      toast.error("It can't land yet", errorMessage(e));
-    } finally {
-      setBusy(false);
-    }
-  };
   return (
     <section className="rv-land" aria-label="Landing">
       {r.blockers.length > 0 ? (
@@ -270,7 +263,7 @@ function Land({ d }: { d: DiffDetail }) {
           {r.strategies.length > 1 && (
             <SelectField label="How it lands" hideLabel value={strategy} onChange={setStrategy} options={r.strategies.map((s) => ({ value: s, label: s.replace(/-/g, " ") }))} />
           )}
-          <Button size="sm" disabled={busy} onClick={() => void land()}>
+          <Button size="sm" pending={landing} onClick={land}>
             Land {d.name}
           </Button>
         </div>
@@ -284,15 +277,24 @@ async function reply(key: string, t: Thread, body: string, publish: boolean) {
   refresh(key);
 }
 
-async function resolve(key: string, t: Thread, on: boolean) {
+/** Resolved (or open again) at once (W21-R15), and as it was if that doesn't go: the promise fails then, for the thread to unfold. */
+function resolve(key: string, t: Thread, on: boolean): Promise<void> {
   const c = t.comments.at(-1) ?? t.comments[0];
-  if (!c) return;
-  await reviewApi.editComment(c.id, { state: on ? "resolved" : "open" });
-  refresh(key);
+  if (!c) return Promise.resolve();
+  change<Thread[]>(threadsRes(key).key, (ts) => ts.map((x) => (x.id === t.id ? { ...x, state: on ? "resolved" : "open" } : x)));
+  return reviewApi.editComment(c.id, { state: on ? "resolved" : "open" }).then(
+    () => refresh(key),
+    (e: unknown) => {
+      toast.error(on ? "Couldn't resolve it" : "Couldn't reopen it", errorMessage(e));
+      invalidate(`review/threads/${key}`);
+      throw e;
+    },
+  );
 }
 
 function Files({ diffKey, version, split, whitespace, threads }: { diffKey: string; version: number; split: boolean; whitespace: boolean; threads: Thread[] }) {
-  const v = useRes(filesRes(diffKey, version)).data;
+  const res = useRes(filesRes(diffKey, version));
+  const v = res.data;
   const files = React.useMemo(() => parsePatch(v.patch), [v.patch]);
   const moves = React.useMemo(() => findMoves(files), [files]);
   const meta = React.useMemo(() => new Map(v.files.map((f) => [f.path, f])), [v.files]);
@@ -318,13 +320,17 @@ function Files({ diffKey, version, split, whitespace, threads }: { diffKey: stri
     if (e.key === "n") go(1);
     else if (e.key === "p") go(-1);
   });
-  const viewedOne = async (path: string, on: boolean) => {
-    try {
-      await reviewApi.viewed(diffKey, path, on);
-      invalidate(`review/files/${diffKey}/${version}`);
-    } catch (e) {
-      toast.error("Couldn't mark it viewed", errorMessage(e));
-    }
+  // Ticked at once (W21-R15), and as it was if that doesn't go (the promise fails then, for the file to unfold).
+  const viewedOne = (path: string, on: boolean) => {
+    res.change((d) => ({ ...d, files: d.files.map((f) => (f.path === path ? { ...f, viewed: on } : f)) }));
+    return reviewApi.viewed(diffKey, path, on).then(
+      () => invalidate(`review/files/${diffKey}/${version}`),
+      (e: unknown) => {
+        toast.error("Couldn't mark it viewed", errorMessage(e));
+        invalidate(`review/files/${diffKey}/${version}`);
+        throw e;
+      },
+    );
   };
   const comment = async (path: string, pick: Pick, body: string, publish: boolean) => {
     await reviewApi.comment(diffKey, { body, publish, version, file: path, side: pick.side, start_line: pick.start, end_line: pick.end });
@@ -364,7 +370,7 @@ function Files({ diffKey, version, split, whitespace, threads }: { diffKey: stri
           moves={moves}
           pathOf={(k) => files[k]?.path ?? ""}
           threads={threads.filter((t) => t.file === f.path)}
-          onViewed={(path, on) => void viewedOne(path, on)}
+          onViewed={viewedOne}
           onComment={(pick, body, publish) => comment(f.path, pick, body, publish)}
           onReply={(t, body, publish) => reply(diffKey, t, body, publish)}
           onResolve={(t, on) => resolve(diffKey, t, on)}
@@ -396,28 +402,22 @@ const ACTIONS: { value: ReviewAction; label: string }[] = [
 function ReviewForm({ d, drafts }: { d: DiffDetail; drafts: number }) {
   const [text, setText] = React.useState("");
   const [action, setAction] = React.useState<ReviewAction>("comment");
-  const [busy, setBusy] = React.useState(false);
+  const [send, sending] = useAction(async () => {
+    const sent = text;
+    const r = await reviewApi.review(d.name, action, text.trim());
+    // What's written since stays (W21-R15).
+    setText((t) => (t === sent ? "" : t));
+    toast({ title: `Review sent: ${d.name} ${STATE_WORD[r.state]?.toLowerCase() ?? r.state}`, tone: "succeeded" });
+    refresh(d.name);
+  }, "Your review didn't go");
   if (d.state === "landed" || d.state === "abandoned") return null;
-  const send = async () => {
-    setBusy(true);
-    try {
-      const r = await reviewApi.review(d.name, action, text.trim());
-      setText("");
-      toast({ title: `Review sent: ${d.name} ${STATE_WORD[r.state]?.toLowerCase() ?? r.state}`, tone: "succeeded" });
-      refresh(d.name);
-    } catch (e) {
-      toast.error("Your review didn't go", errorMessage(e));
-    } finally {
-      setBusy(false);
-    }
-  };
   return (
     <section className="rv-review" aria-label="Your review">
       <p className="rv-land-title">Your review</p>
       <textarea className="rv-compose-input" rows={3} value={text} placeholder="What you think of it, overall (optional for Accept)" onChange={(e) => setText(e.target.value)} />
       <div className="rv-compose-acts">
         <SelectField label="Your review" hideLabel value={action} onChange={(v) => setAction(v as ReviewAction)} options={ACTIONS} />
-        <Button size="sm" disabled={busy || (action !== "accept" && !text.trim() && drafts === 0)} onClick={() => void send()}>
+        <Button size="sm" disabled={action !== "accept" && !text.trim() && drafts === 0} pending={sending} onClick={send}>
           Send review{drafts > 0 ? ` with ${drafts} comment${drafts === 1 ? "" : "s"}` : ""}
         </Button>
       </div>

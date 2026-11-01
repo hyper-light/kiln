@@ -14,6 +14,7 @@ import { Button } from "@/components/ui/button";
 import { RowsHold } from "@/components/ui/hold";
 import { Loadable } from "@/components/ui/loading";
 import { Crumbs, EmptyState } from "@/components/ui/misc";
+import { useActions } from "@/lib/action";
 import { useRes } from "@/lib/data";
 import { relativeTime } from "@/lib/format";
 import { errorMessage } from "@/lib/hooks";
@@ -77,19 +78,15 @@ function RunCrumbs({ v }: { v?: PlanRunView }) {
 }
 
 function Run({ v, onChange }: { v: PlanRunView; onChange: (v: PlanRunView) => void }) {
-  const [busy, setBusy] = React.useState<string | null>(null);
   const [error, setError] = React.useState<string | null>(null);
-  const act = async (key: string, f: () => Promise<PlanRunView>) => {
-    setBusy(key);
-    setError(null);
-    try {
+  // Each button its own request ("stop", "2:retry"): one on its way holds no other (W21-R15).
+  const [act, acting] = useActions(
+    async (_key: string, f: () => Promise<PlanRunView>) => {
+      setError(null);
       onChange(await f());
-    } catch (e) {
-      setError(errorMessage(e));
-    } finally {
-      setBusy(null);
-    }
-  };
+    },
+    (e) => setError(errorMessage(e)),
+  );
   return (
     <>
       <title>{`${v.title}: one agent per step · kiln`}</title>
@@ -117,8 +114,8 @@ function Run({ v, onChange }: { v: PlanRunView; onChange: (v: PlanRunView) => vo
       {v.state === "stopped" && v.reason && <p className="run-reason">Stopped: {v.reason}.</p>}
       {v.state === "running" && (
         <div className="plan-actions">
-          <Button size="sm" variant="secondary" disabled={busy !== null} onClick={() => void act("stop", () => plansApi.stopRun(v.id))}>
-            {busy === "stop" ? "Stopping…" : "Stop the run"}
+          <Button size="sm" variant="secondary" pending={acting("stop")} onClick={() => act("stop", () => plansApi.stopRun(v.id))}>
+            {acting("stop") ? "Stopping…" : "Stop the run"}
           </Button>
           {error && <span className="plan-error">{error}</span>}
         </div>
@@ -126,7 +123,7 @@ function Run({ v, onChange }: { v: PlanRunView; onChange: (v: PlanRunView) => vo
       {v.state !== "running" && error && <span className="plan-error">{error}</span>}
       <ol className="run-steps">
         {v.steps.map((s) => (
-          <Step key={s.n} s={s} stack={v.stack} busy={busy} onAct={(a) => void act(`${s.n}:${a}`, () => plansApi.step(v.id, s.n, a, s.tries))} />
+          <Step key={s.n} s={s} stack={v.stack} pending={(a) => acting(`${s.n}:${a}`)} onAct={(a) => act(`${s.n}:${a}`, () => plansApi.step(v.id, s.n, a, s.tries))} />
         ))}
       </ol>
     </>
@@ -175,7 +172,7 @@ function StepReview({ e, agentId, provider }: { e: StackStep; agentId: string | 
   );
 }
 
-function Step({ s, stack, busy, onAct }: { s: RunStep; stack: RunStack | null; busy: string | null; onAct: (a: "retry" | "take" | "met") => void }) {
+function Step({ s, stack, pending, onAct }: { s: RunStep; stack: RunStack | null; pending: (a: "retry" | "take" | "met") => boolean; onAct: (a: "retry" | "take" | "met") => void }) {
   const e = stack?.steps.find((x) => x.n === s.n);
   const a = s.agent;
   const live = s.stand === "working" || s.stand === "needs_you";
@@ -225,18 +222,18 @@ function Step({ s, stack, busy, onAct }: { s: RunStep; stack: RunStack | null; b
       {(live || s.stand === "unmet" || s.stand === "stopped" || s.stand === "yours") && (
         <div className="plan-actions">
           {(s.stand === "unmet" || s.stand === "stopped" || live) && (
-            <Button size="xs" variant="secondary" disabled={busy !== null} onClick={() => onAct("retry")}>
-              {busy === `${s.n}:retry` ? "Starting…" : s.given ? "Try it again" : "Retry with a new agent"}
+            <Button size="xs" variant="secondary" pending={pending("retry")} onClick={() => onAct("retry")}>
+              {pending("retry") ? "Starting…" : s.given ? "Try it again" : "Retry with a new agent"}
             </Button>
           )}
           {(live || s.stand === "unmet" || s.stand === "stopped") && (
-            <Button size="xs" variant="ghost" disabled={busy !== null} onClick={() => onAct("take")}>
+            <Button size="xs" variant="ghost" pending={pending("take")} onClick={() => onAct("take")}>
               Take it over
             </Button>
           )}
           {s.stand === "yours" && (
-            <Button size="xs" disabled={busy !== null} onClick={() => onAct("met")}>
-              {busy === `${s.n}:met` ? "Going on…" : "It's met: go on"}
+            <Button size="xs" pending={pending("met")} onClick={() => onAct("met")}>
+              {pending("met") ? "Going on…" : "It's met: go on"}
             </Button>
           )}
         </div>

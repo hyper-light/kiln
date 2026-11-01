@@ -1595,6 +1595,11 @@ button.cd-gnode:hover {
 .cd-autorb-field .field-hint {
   margin-top: 4px;
 }
+/* One scope's choice: on its way, it says so at its foot; while the other's is, it waits (disabled). */
+.cd-autorb-choice {
+  min-width: 0;
+  max-width: 100%;
+}
 
 @container (max-width: 640px) {
   /* One column on a phone: the list, then the chosen one's message, each its own height. */

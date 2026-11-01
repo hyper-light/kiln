@@ -26,6 +26,8 @@ test("other agents' cards sit above an agent's message box, not over it (W21-R13
   // Their cards back, whatever the checks before put away (mock/push.ts, forgetMarks).
   await page.request.post("/api/mock/asks");
   await page.goto("/agents/demo-claude");
+  // The page once it's whole: the box drawn while its conversation loads takes what's written too (W21-R15).
+  await expect(page.locator(".hx-agent.ag-ready")).toBeVisible();
   const field = page.getByRole("textbox", { name: "Message to the agent" });
   await expect(field).toBeEnabled();
   const cards = page.getByRole("list", { name: "Waiting on you" });

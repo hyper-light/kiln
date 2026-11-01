@@ -3200,6 +3200,48 @@ html[data-motion="paused"] :is(.overlay, .dialog, .drawer, .popover, .toast, .na
 :root[data-motion="paused"] .hl-rule {
   animation: hl-appear 0.01s linear 0.18s forwards;
 }
+/* A press's request on its way (lib/action.ts, W21-R15): the control stays as it was, readable and
+   where it was, and after a moment (an answer that comes at once shows nothing) the same rule drifts
+   at its foot, its prism mixed with the control's own text colour so it reads on a light pill as on
+   a dark one. A control already placed keeps its place (:where adds nothing to any rule's weight). */
+:where([data-sending]) {
+  position: relative;
+}
+[data-sending] {
+  cursor: progress;
+}
+[data-sending]::after {
+  content: "";
+  position: absolute;
+  left: 50%;
+  bottom: 3px;
+  width: min(34px, 60%);
+  height: 2px;
+  border-radius: 1px;
+  transform: translateX(-50%);
+  background: linear-gradient(
+    100deg,
+    color-mix(in oklab, #b8d9d2 62%, currentColor) 0%,
+    color-mix(in oklab, #a6c4ed 62%, currentColor) 28%,
+    color-mix(in oklab, #b8a6d5 62%, currentColor) 53%,
+    color-mix(in oklab, #d6a2aa 62%, currentColor) 75%,
+    color-mix(in oklab, #d8cbb0 62%, currentColor) 100%
+  );
+  background-size: 250% 100%;
+  opacity: 0;
+  pointer-events: none;
+  animation:
+    hl-appear 0.2s ease-out 0.12s forwards,
+    hl-drift 1.4s ease-in-out infinite alternate;
+}
+@media (prefers-reduced-motion: reduce) {
+  [data-sending]::after {
+    animation: hl-appear 0.01s linear 0.12s forwards;
+  }
+}
+:root[data-motion="paused"] [data-sending]::after {
+  animation: hl-appear 0.01s linear 0.12s forwards;
+}
 /* Stand-ins (hold.tsx): the space and frame of what loads, the loader over its top. */
 .hold {
   position: relative;

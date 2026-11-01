@@ -10,7 +10,7 @@ import "./mission.css";
 import { Link, useNavigate } from "@/lib/router";
 import { ArrowUpRight, ChevronRight, ListChecks, X } from "lucide-react";
 import { api } from "@/api/client";
-import { clientId, harnessApi, type AgentInfo, type ApprovalBrief } from "@/api/harness";
+import { harnessApi, type AgentInfo, type ApprovalBrief } from "@/api/harness";
 import { plansApi } from "@/api/plans";
 import type { AiSession } from "@/api/types";
 import { Button } from "@/components/ui/button";
@@ -21,8 +21,8 @@ import { pushDevicesRes, pushStateRes, thisDeviceRes } from "@/api/push";
 import { agentsRes, useAgentsLive, useRes, type Res } from "@/lib/data";
 import { relativeTime } from "@/lib/format";
 import { errorMessage, useLocalStorage, useMediaQuery, useNow } from "@/lib/hooks";
-import { invalidate, preload, useSuspenseResource } from "@/lib/resource";
-import { Tries } from "@/lib/tries";
+import { useAction } from "@/lib/action";
+import { invalidate, preload, setData, useSuspenseResource } from "@/lib/resource";
 import { heldWords } from "./cards";
 import { agentLabel, hasOwnName, plain } from "./derive";
 import { pauseLine } from "./pause";
@@ -41,7 +41,7 @@ import { MISSION_DRAFT } from "./new-agent-draft";
 import { useDrafts } from "./state";
 import { preloadAgents, useAgentList, useAgents } from "./use-agents";
 import { both, touchSelect, type TouchSelect } from "./touch-select";
-import { answer, asAnswered, useAnswered } from "./answered";
+import { answer, asAnswered, heldKey, resumeHeld, tried, tryKey, useAnswered } from "./answered";
 import { PushOffer } from "./push-offer";
 import { isMarked, markNotices, useMarks } from "./notices";
 import { swipeAway } from "./swipe-away";
@@ -124,13 +124,18 @@ function Decide({ a, ap, to }: { a: AgentInfo; ap: ApprovalBrief; to: string }) 
   );
 }
 
-/** Goals it paused for you: a plan they wait on approved here, or reviewed in its Plan tab (views/plans/review.tsx); else Resume. */
+/**
+ * Goals it paused for you: a plan they wait on approved here, or reviewed in its Plan tab
+ * (views/plans/review.tsx); else Resume. Either moves the row on at once (answered.ts), and back if
+ * it doesn't go (W21-R15).
+ */
 function HeldDecide({ a }: { a: AgentInfo }) {
-  // Asked again (its answer lost, or it failed), the same resume (or approval) under its key (CP-T3.2).
-  const [tries] = React.useState(() => new Tries(clientId));
+  // Asked again (its answer lost, or it failed), the same resume (or approval) under its key, its
+  // card's own across its going and coming back (CP-T3.2, answered.ts).
+  const card = heldKey(a);
   const resume = () =>
-    void harnessApi.goalAction(a.id, "start", undefined, tries.keyFor(a.id)).then(
-      () => tries.done(),
+    void resumeHeld(a, () => harnessApi.goalAction(a.id, "start", undefined, tryKey(card, a.id))).then(
+      () => tried(card),
       (e: unknown) => toast.error("Couldn't resume its goals", errorMessage(e)),
     );
   const plan = a.held?.plan;
@@ -141,8 +146,8 @@ function HeldDecide({ a }: { a: AgentInfo }) {
       </Button>
     );
   const approve = () =>
-    void plansApi.review(plan, { answer: "approve", key: tries.keyFor(`approve ${plan} ${a.held?.since ?? 0}`) }).then(
-      () => tries.done(),
+    void resumeHeld(a, () => plansApi.review(plan, { answer: "approve", key: tryKey(card, `approve ${plan} ${a.held?.since ?? 0}`) })).then(
+      () => tried(card),
       (e: unknown) => toast.error("Couldn't approve its plan", errorMessage(e)),
     );
   return (
@@ -187,7 +192,11 @@ const Row = React.memo(function Row({
   // A subagent's thread straight, not by its own address: that one's redirect into its agent's chat never lands.
   const answerAt = asking ? `/agents/${a.id}?task=${encodeURIComponent(asking.id)}` : `/agents/${a.id}`;
   const actions = useAgentActions(a);
-  const label = agentLabel(a);
+  // A name given here holds as it's taken, whatever older news of the agent says meanwhile.
+  const label = agentLabel({ ...a, name: actions.name });
+  // Each says it's on its way until the server has it, and a press meanwhile does nothing (W21-R15).
+  const [resume, resuming] = useAction(() => harnessApi.command(a.id, { type: "resume" }), "Couldn't resume");
+  const [restart, restarting] = useAction(() => harnessApi.command(a.id, { type: "restart" }), "Couldn't restart");
   // The harness, said under a label that isn't its own name.
   const kind = label.toLowerCase() !== a.kind_name.toLowerCase();
   const line = (
@@ -241,12 +250,12 @@ const Row = React.memo(function Row({
           {stand === "needs" && ap && <Decide a={who} ap={ap} to={answerAt} />}
           {stand === "needs" && !ap && who.held && <HeldDecide a={who} />}
           {stand === "paused" && (
-            <Button size="xs" variant="secondary" onClick={() => void harnessApi.command(a.id, { type: "resume" }).catch((e: unknown) => toast.error("Couldn't resume", errorMessage(e)))}>
+            <Button size="xs" variant="secondary" pending={resuming} onClick={resume}>
               Resume
             </Button>
           )}
           {stand === "crashed" && (
-            <Button size="xs" variant="secondary" onClick={() => void harnessApi.command(a.id, { type: "restart" }).catch((e: unknown) => toast.error("Couldn't restart", errorMessage(e)))}>
+            <Button size="xs" variant="secondary" pending={restarting} onClick={restart}>
               Restart
             </Button>
           )}
@@ -441,33 +450,36 @@ function Recover({ rows }: { rows: { a: AgentInfo; stand: Stand }[] }) {
   );
 }
 
+/** The ended agents cleared: gone from the list at once (W21-R15); any the server kept are back once it's read again, with why. */
+function clearEnded(ids: string[], reload: () => void) {
+  setData<AgentInfo[]>("harness/agents", (l) => l.filter((a) => !ids.includes(a.id)));
+  void Promise.allSettled(ids.map((id) => harnessApi.stop(id))).then((done) => {
+    const failed = done.filter((d): d is PromiseRejectedResult => d.status === "rejected");
+    if (failed.length > 0) toast.error(`Couldn't clear ${failed.length === 1 ? "one of them" : `${failed.length} of them`}`, errorMessage(failed[0]?.reason));
+    reload();
+  });
+}
+
 function RecoverMachine({ machine, count, since, others }: { machine: string; count: number; since: number; others: string[] }) {
   const [to, setTo] = React.useState("");
-  const [busy, setBusy] = React.useState(false);
   const key = goneKey(machine, since);
   const away = () => markNotices([key], "away");
-  const go = async () => {
-    setBusy(true);
-    try {
-      const { moved } = await harnessApi.recover(machine, to || undefined);
-      const failed = moved.filter((m) => m.error);
-      const n = moved.length - failed.length;
-      // All of them on elsewhere: done with, here and everywhere. Some left: the card stays for those.
-      if (n > 0 && failed.length === 0) markNotices([key], "done");
-      if (n > 0)
-        toast({
-          title: `${n} agent${n === 1 ? "" : "s"} of ${machine} going on elsewhere`,
-          description: failed.length > 0 ? `${failed.length} couldn't: ${failed[0]?.error ?? ""}` : undefined,
-          tone: "running",
-        });
-      else toast.error(`${machine}'s agents couldn't go on elsewhere`, failed[0]?.error ?? "");
-      invalidate("harness/agents");
-    } catch (e) {
-      toast.error(`${machine}'s agents couldn't go on elsewhere`, errorMessage(e));
-    } finally {
-      setBusy(false);
-    }
-  };
+  // Move them on says it's on its way until kiln has moved them (W21-R15).
+  const [go, moving] = useAction(async () => {
+    const { moved } = await harnessApi.recover(machine, to || undefined);
+    const failed = moved.filter((m) => m.error);
+    const n = moved.length - failed.length;
+    // All of them on elsewhere: done with, here and everywhere. Some left: the card stays for those.
+    if (n > 0 && failed.length === 0) markNotices([key], "done");
+    if (n > 0)
+      toast({
+        title: `${n} agent${n === 1 ? "" : "s"} of ${machine} going on elsewhere`,
+        description: failed.length > 0 ? `${failed.length} couldn't: ${failed[0]?.error ?? ""}` : undefined,
+        tone: "running",
+      });
+    else toast.error(`${machine}'s agents couldn't go on elsewhere`, failed[0]?.error ?? "");
+    invalidate("harness/agents");
+  }, `${machine}'s agents couldn't go on elsewhere`);
   return (
     <div className="ms-recover" role="status" {...swipeAway<HTMLDivElement>(away)}>
       <span>
@@ -483,8 +495,8 @@ function RecoverMachine({ machine, count, since, others }: { machine: string; co
             onChange={setTo}
             options={[{ value: "", label: "Each where it suits best" }, ...others.map((m) => ({ value: m, label: `All on ${m}` }))]}
           />
-          <Button size="xs" variant="secondary" disabled={busy} onClick={() => void go()}>
-            {busy ? "Moving…" : "Move them on"}
+          <Button size="xs" variant="secondary" pending={moving} onClick={go}>
+            Move them on
           </Button>
         </span>
       ) : (
@@ -803,7 +815,16 @@ function Agents() {
               Ended · {ended.length}
             </button>
             {ended.length > 0 && (
-              <button type="button" className="ms-link" onClick={() => void Promise.allSettled(ended.map((r) => harnessApi.stop(r.a.id))).then(() => reload())}>
+              <button
+                type="button"
+                className="ms-link"
+                onClick={() =>
+                  clearEnded(
+                    ended.map((r) => r.a.id),
+                    reload,
+                  )
+                }
+              >
                 Clear
               </button>
             )}

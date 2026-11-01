@@ -12,11 +12,12 @@ import { TableHold } from "@/components/ui/hold";
 import { Loadable } from "@/components/ui/loading";
 import { SectionHeading, SelectField, TextField } from "@/components/ui/misc";
 import { toast } from "@/components/ui/toast";
+import { useAction, useActions } from "@/lib/action";
 import { useRes } from "@/lib/data";
 import { relativeTime } from "@/lib/format";
 import { errorMessage } from "@/lib/hooks";
 import { invalidate } from "@/lib/resource";
-import { cloudsRes } from "./parts";
+import { cloudsRes, HeldFields, useOpening } from "./parts";
 
 const KINDS: { value: CloudKind; label: string }[] = [
   { value: "aws", label: "AWS CloudWatch" },
@@ -130,6 +131,15 @@ function credentials(c: Cloud): string {
 function List({ onAdd, onEdit }: { onAdd: () => void; onEdit: (c: Cloud) => void }) {
   const all = useRes(cloudsRes).data;
   const [removing, setRemoving] = React.useState<Cloud | null>(null);
+  const [pull, pulling] = useActions(async (name: string) => {
+    try {
+      await observeApi.pullCloud(name);
+      toast({ title: `Pulling ${name}`, tone: "info" });
+      window.setTimeout(() => invalidate("observe/clouds"), 3000);
+    } catch (e) {
+      toast({ title: `Couldn't pull ${name}`, description: errorMessage(e), tone: "failed" });
+    }
+  });
   if (all.length === 0)
     return (
       <p className="empty-line py-12 text-center">
@@ -205,20 +215,7 @@ function List({ onAdd, onEdit }: { onAdd: () => void; onEdit: (c: Cloud) => void
                     )}
                   </td>
                   <td className="w-1 whitespace-nowrap">
-                    <Button
-                      variant="ghost"
-                      size="xs"
-                      aria-label={`Pull ${c.name} now`}
-                      onClick={async () => {
-                        try {
-                          await observeApi.pullCloud(c.name);
-                          toast({ title: `Pulling ${c.name}`, tone: "info" });
-                          window.setTimeout(() => invalidate("observe/clouds"), 3000);
-                        } catch (e) {
-                          toast({ title: `Couldn't pull ${c.name}`, description: errorMessage(e), tone: "failed" });
-                        }
-                      }}
-                    >
+                    <Button variant="ghost" size="xs" aria-label={`Pull ${c.name} now`} pending={pulling(c.name)} onClick={() => pull(c.name)}>
                       <RefreshCw /> <span className="hidden sm:inline">Pull now</span>
                     </Button>
                     <Button variant="ghost" size="xs" aria-label={`Edit ${c.name}`} onClick={() => onEdit(c)}>
@@ -452,8 +449,10 @@ function bodyOf(f: Form, was: Cloud | null): CloudIn {
 
 function CloudDialog({ cloud, onClose }: { cloud: Cloud | null; onClose: () => void }) {
   const [f, setF] = React.useState<Form>(() => formOf(cloud));
-  const [busy, setBusy] = React.useState(false);
-  const [tested, setTested] = React.useState<CloudTest | null>(null);
+  const opening = useOpening(f);
+  const [result, setTested] = React.useState<{ of: Form; r: CloudTest } | null>(null);
+  // A test shows only under the form it tried: one that comes after an edit was of what was there before (W21-R15).
+  const tested = result?.of === f ? result.r : null;
   const set = (patch: Partial<Form>) => {
     setF((old) => ({ ...old, ...patch }));
     setTested(null);
@@ -486,28 +485,19 @@ function CloudDialog({ cloud, onClose }: { cloud: Cloud | null; onClose: () => v
     (f.hubsNamespace.trim() === "" && list(f.hubs).length === 0) ||
     (f.hubsNamespace.trim() !== "" && list(f.hubs).length > 0 && (f.hubsWith === "integration" || f.connection.trim() !== "" || hubsKept));
   const ok = validName && Number(f.interval) >= 10 && credsOk && hubsOk && (f.kind !== "aws" || list(f.stats).length > 0);
-  const save = async () => {
-    setBusy(true);
+  const [save, saving] = useAction(async () => {
+    await observeApi.putCloud(f.name, bodyOf(f, cloud));
+    invalidate("observe/clouds");
+    if (opening.still(f)) onClose();
+  }, "Couldn't save it");
+  const [test, testing] = useAction(async () => {
+    const of = f;
     try {
-      await observeApi.putCloud(f.name, bodyOf(f, cloud));
-      invalidate("observe/clouds");
-      onClose();
+      setTested({ of, r: await observeApi.testCloud(of.name || "new", bodyOf(of, cloud)) });
     } catch (err) {
-      toast({ title: "Couldn't save it", description: errorMessage(err), tone: "failed" });
-    } finally {
-      setBusy(false);
+      setTested({ of, r: { ok: false, error: errorMessage(err) } });
     }
-  };
-  const test = async () => {
-    setBusy(true);
-    try {
-      setTested(await observeApi.testCloud(f.name || "new", bodyOf(f, cloud)));
-    } catch (err) {
-      setTested({ ok: false, error: errorMessage(err) });
-    } finally {
-      setBusy(false);
-    }
-  };
+  });
   const credsOptions = [
     { value: "given", label: f.kind === "aws" ? "Keys given here" : f.kind === "gcp" ? "A service account's key" : "An app's secret" },
     { value: "server", label: "The server's own, where it runs" },
@@ -516,291 +506,321 @@ function CloudDialog({ cloud, onClose }: { cloud: Cloud | null; onClose: () => v
     <Dialog open onOpenChange={(o) => !o && onClose()}>
       <DialogContent title={cloud ? `Edit ${cloud.name}` : "Add a cloud"} description="Its secrets stay on the server, sealed: they are sent once, here, and never shown again.">
         <form
+          ref={opening.ref}
           className="space-y-4"
           onSubmit={(e) => {
             e.preventDefault();
-            if (ok) void save();
+            if (ok) save();
           }}
         >
-          <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
-            {cloud ? (
-              <TextField label="Cloud" value={WORDS[f.kind]} readOnly />
-            ) : (
-              <SelectField label="Cloud" value={f.kind} onChange={(k) => set({ ...formOf(null), name: f.name, kind: k as CloudKind })} options={KINDS} />
-            )}
-            <TextField
-              label="Name"
-              value={f.name}
-              readOnly={cloud !== null}
-              onChange={(e) => set({ name: e.target.value })}
-              placeholder="prod"
-              hint={f.name && !validName ? "Letters, digits, - _ and . only" : undefined}
-            />
-          </div>
-          <div>
-            <SelectField label="Credentials" value={f.creds} onChange={(v) => set({ creds: v as Form["creds"] })} options={credsOptions} />
-            <p className="field-hint">{given ? NEED[f.kind] : `${WHERE[f.kind]} ${NEED[f.kind]}`}</p>
-          </div>
-          {f.kind === "aws" && (
-            <>
-              {given && (
-                <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
-                  <TextField label="Access key ID" value={f.keyId} onChange={(e) => set({ keyId: e.target.value })} autoComplete="off" spellCheck={false} />
-                  <TextField label="Secret access key" type="password" value={f.secret} onChange={(e) => set({ secret: e.target.value })} autoComplete="new-password" hint={kept ? KEPT : undefined} />
-                </div>
+          <HeldFields held={saving && !cloud}>
+            <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
+              {cloud ? (
+                <TextField label="Cloud" value={WORDS[f.kind]} readOnly />
+              ) : (
+                <SelectField label="Cloud" value={f.kind} onChange={(k) => set({ ...formOf(null), name: f.name, kind: k as CloudKind })} options={KINDS} />
               )}
-              <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
-                <TextField label="Role to assume (optional)" value={f.role} onChange={(e) => set({ role: e.target.value })} placeholder="arn:aws:iam::123456789012:role/kiln" spellCheck={false} />
-                <TextField label="External ID (optional)" value={f.externalId} onChange={(e) => set({ externalId: e.target.value })} spellCheck={false} />
-              </div>
-              <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
-                <TextField
-                  label="Regions"
-                  value={f.regions}
-                  onChange={(e) => set({ regions: e.target.value })}
-                  placeholder="us-east-1, eu-west-1"
-                  hint="None: the server's own region."
-                  spellCheck={false}
-                />
-                <TextField
-                  label="Namespaces"
-                  value={f.namespaces}
-                  onChange={(e) => set({ namespaces: e.target.value })}
-                  placeholder="AWS/EC2, AWS/Lambda"
-                  hint="None: every namespace with metrics."
-                  spellCheck={false}
-                />
-              </div>
               <TextField
-                label="Statistics"
-                value={f.stats}
-                onChange={(e) => set({ stats: e.target.value })}
-                hint="With Sum and SampleCount, each metric's own name is its average. Each statistic is a query CloudWatch bills."
-                spellCheck={false}
+                label="Name"
+                value={f.name}
+                readOnly={cloud !== null}
+                onChange={(e) => set({ name: e.target.value })}
+                placeholder="prod"
+                hint={f.name && !validName ? "Letters, digits, - _ and . only" : undefined}
               />
-              <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
-                <TextField
-                  label="Log groups"
-                  value={f.logGroups}
-                  onChange={(e) => set({ logGroups: e.target.value })}
-                  placeholder="/aws/lambda/*, /ecs/web"
-                  hint="Names, or prefixes ending in *. None: no logs."
-                  spellCheck={false}
-                />
-                {list(f.logGroups).length > 0 && (
-                  <TextField
-                    label="Log filter (optional)"
-                    value={f.logFilter}
-                    onChange={(e) => set({ logFilter: e.target.value })}
-                    placeholder="ERROR"
-                    hint="CloudWatch Logs' filter pattern."
-                    spellCheck={false}
-                  />
-                )}
-              </div>
-            </>
-          )}
-          {f.kind === "gcp" && (
-            <>
-              {given ? (
-                <div>
-                  <label htmlFor="cloud-key" className="field-label">
-                    Service account key (JSON)
-                  </label>
-                  <div className="field">
-                    <textarea
-                      id="cloud-key"
-                      rows={5}
-                      className="font-mono"
-                      value={f.key}
-                      onChange={(e) => set({ key: e.target.value })}
-                      placeholder='{"type": "service_account", ...}'
-                      spellCheck={false}
-                      autoComplete="off"
-                    />
-                  </div>
-                  {(!gcpKey || kept) && <div className="field-hint">{!gcpKey ? <span className="text-[#e2c4c6]">Not a key file&apos;s JSON.</span> : KEPT}</div>}
-                </div>
-              ) : null}
-              <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
-                <TextField label="Projects" value={f.projects} onChange={(e) => set({ projects: e.target.value })} placeholder="my-project" hint="None: the credentials' project." spellCheck={false} />
-                <TextField
-                  label="Services"
-                  value={f.services}
-                  onChange={(e) => set({ services: e.target.value })}
-                  placeholder="compute.googleapis.com, kubernetes.io"
-                  hint="Metric type prefixes. None: every type."
-                  spellCheck={false}
-                />
-              </div>
-              <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
-                <SelectField
-                  label="Logs"
-                  value={f.readLogs}
-                  onChange={(v) => set({ readLogs: v })}
-                  options={[
-                    { value: "no", label: "Not read" },
-                    { value: "yes", label: "Read" },
-                  ]}
-                />
-                {f.readLogs === "yes" && (
-                  <TextField
-                    label="Log filter (optional)"
-                    value={f.logFilter}
-                    onChange={(e) => set({ logFilter: e.target.value })}
-                    placeholder="severity>=WARNING"
-                    hint="Cloud Logging's query language. None: every entry."
-                    spellCheck={false}
-                  />
-                )}
-              </div>
-            </>
-          )}
-          {f.kind === "azure" && (
-            <>
-              <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
-                {given && <TextField label="Tenant ID" value={f.tenant} onChange={(e) => set({ tenant: e.target.value })} autoComplete="off" spellCheck={false} />}
-                <TextField
-                  label={given ? "Client ID" : "Client ID of a user-assigned identity (optional)"}
-                  value={f.client}
-                  onChange={(e) => set({ client: e.target.value })}
-                  autoComplete="off"
-                  spellCheck={false}
-                />
-                {given && <TextField label="Client secret" type="password" value={f.key} onChange={(e) => set({ key: e.target.value })} autoComplete="new-password" hint={kept ? KEPT : undefined} />}
-              </div>
-              <SelectField
-                label="Metrics"
-                value={f.metrics}
-                onChange={(v) => set({ metrics: v })}
-                options={[
-                  { value: "yes", label: "Read" },
-                  { value: "no", label: "Not read: logs only" },
-                ]}
-              />
-              {f.metrics === "yes" && (
-                <>
+            </div>
+            <div>
+              <SelectField label="Credentials" value={f.creds} onChange={(v) => set({ creds: v as Form["creds"] })} options={credsOptions} />
+              <p className="field-hint">{given ? NEED[f.kind] : `${WHERE[f.kind]} ${NEED[f.kind]}`}</p>
+            </div>
+            {f.kind === "aws" && (
+              <>
+                {given && (
                   <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
-                    <TextField label="Subscriptions" value={f.subscriptions} onChange={(e) => set({ subscriptions: e.target.value })} hint="None: every one the credentials see." spellCheck={false} />
+                    <TextField label="Access key ID" value={f.keyId} onChange={(e) => set({ keyId: e.target.value })} autoComplete="off" spellCheck={false} />
                     <TextField
-                      label="Resource types"
-                      value={f.types}
-                      onChange={(e) => set({ types: e.target.value })}
-                      placeholder="Microsoft.Compute/virtualMachines"
-                      hint="None: every type with metrics."
-                      spellCheck={false}
+                      label="Secret access key"
+                      type="password"
+                      value={f.secret}
+                      onChange={(e) => set({ secret: e.target.value })}
+                      autoComplete="new-password"
+                      hint={kept ? KEPT : undefined}
                     />
                   </div>
-                  <TextField
-                    label="Aggregations besides each metric's own"
-                    value={f.aggregations}
-                    onChange={(e) => set({ aggregations: e.target.value })}
-                    placeholder="Maximum, Minimum"
-                    spellCheck={false}
-                  />
-                </>
-              )}
-              <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
-                <TextField
-                  label="Log Analytics workspaces"
-                  value={f.workspaces}
-                  onChange={(e) => set({ workspaces: e.target.value })}
-                  placeholder="a workspace's id"
-                  hint="None: no logs."
-                  spellCheck={false}
-                />
-                {list(f.workspaces).length > 0 && (
-                  <TextField
-                    label="Log query (optional)"
-                    value={f.logFilter}
-                    onChange={(e) => set({ logFilter: e.target.value })}
-                    placeholder="AppTraces"
-                    hint="A table, or a query in KQL. None: every table."
-                    spellCheck={false}
-                  />
                 )}
-              </div>
-              <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
-                <TextField
-                  label="Event Hubs namespace"
-                  value={f.hubsNamespace}
-                  onChange={(e) => set({ hubsNamespace: e.target.value })}
-                  placeholder="kiln-logs"
-                  hint="Where diagnostic settings stream logs. None: no event hubs."
-                  spellCheck={false}
-                />
-                {f.hubsNamespace.trim() !== "" && (
-                  <TextField
-                    label="Event hubs"
-                    value={f.hubs}
-                    onChange={(e) => set({ hubs: e.target.value })}
-                    placeholder="insights-activity-logs"
-                    hint="Each read as its events come, over its Kafka endpoint (Standard tier and above)."
-                    spellCheck={false}
-                  />
-                )}
-              </div>
-              {f.hubsNamespace.trim() !== "" && (
                 <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
-                  <SelectField
-                    label="Event hubs read with"
-                    value={f.hubsWith}
-                    onChange={(v) => set({ hubsWith: v as Form["hubsWith"] })}
-                    options={[
-                      { value: "string", label: "A connection string" },
-                      { value: "integration", label: "These credentials (Entra ID)" },
-                    ]}
+                  <TextField label="Role to assume (optional)" value={f.role} onChange={(e) => set({ role: e.target.value })} placeholder="arn:aws:iam::123456789012:role/kiln" spellCheck={false} />
+                  <TextField label="External ID (optional)" value={f.externalId} onChange={(e) => set({ externalId: e.target.value })} spellCheck={false} />
+                </div>
+                <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
+                  <TextField
+                    label="Regions"
+                    value={f.regions}
+                    onChange={(e) => set({ regions: e.target.value })}
+                    placeholder="us-east-1, eu-west-1"
+                    hint="None: the server's own region."
+                    spellCheck={false}
                   />
-                  {f.hubsWith === "string" ? (
+                  <TextField
+                    label="Namespaces"
+                    value={f.namespaces}
+                    onChange={(e) => set({ namespaces: e.target.value })}
+                    placeholder="AWS/EC2, AWS/Lambda"
+                    hint="None: every namespace with metrics."
+                    spellCheck={false}
+                  />
+                </div>
+                <TextField
+                  label="Statistics"
+                  value={f.stats}
+                  onChange={(e) => set({ stats: e.target.value })}
+                  hint="With Sum and SampleCount, each metric's own name is its average. Each statistic is a query CloudWatch bills."
+                  spellCheck={false}
+                />
+                <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
+                  <TextField
+                    label="Log groups"
+                    value={f.logGroups}
+                    onChange={(e) => set({ logGroups: e.target.value })}
+                    placeholder="/aws/lambda/*, /ecs/web"
+                    hint="Names, or prefixes ending in *. None: no logs."
+                    spellCheck={false}
+                  />
+                  {list(f.logGroups).length > 0 && (
                     <TextField
-                      label="Connection string"
-                      type="password"
-                      value={f.connection}
-                      onChange={(e) => set({ connection: e.target.value })}
-                      autoComplete="new-password"
-                      placeholder="Endpoint=sb://…"
-                      hint={hubsKept ? KEPT : "With Listen rights."}
+                      label="Log filter (optional)"
+                      value={f.logFilter}
+                      onChange={(e) => set({ logFilter: e.target.value })}
+                      placeholder="ERROR"
+                      hint="CloudWatch Logs' filter pattern."
+                      spellCheck={false}
                     />
-                  ) : (
-                    <p className="field-hint sm:pt-7">They need the Azure Event Hubs Data Receiver role.</p>
                   )}
                 </div>
-              )}
-            </>
-          )}
-          <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
-            <TextField
-              label="Every (seconds)"
-              inputMode="numeric"
-              value={f.interval}
-              onChange={(e) => set({ interval: e.target.value })}
-              hint={Number(f.interval) < 10 ? "10 at the least" : undefined}
-            />
-            <TextField label="Tags" value={f.tags} onChange={(e) => set({ tags: e.target.value })} placeholder="env:prod, team:infra" hint="Given to every series and log record." spellCheck={false} />
-          </div>
-          {tested && (
-            <div className="field-hint" role="status">
-              {tested.ok ? (
-                <span>
-                  Reads {count(tested.series ?? 0)} series of {count(tested.metrics ?? 0)} metrics, {count(tested.points ?? 0)} points
-                  {tested.records !== undefined && tested.records > 0 ? `, ${count(tested.records)} log records` : ""}, in {count(tested.calls ?? 0)} calls
-                  {tested.over ? `; ${count(tested.over)} more past the limit` : ""}.
-                  {tested.sample && tested.sample.length > 0 && <span className="font-mono"> {tested.sample.slice(0, 4).join(", ")}…</span>}
-                  {tested.records_sample && tested.records_sample.length > 0 && <span className="block truncate font-mono">{tested.records_sample[0]}</span>}
-                </span>
-              ) : (
-                <span className="text-[#e2c4c6]">{tested.error}</span>
-              )}
+              </>
+            )}
+            {f.kind === "gcp" && (
+              <>
+                {given ? (
+                  <div>
+                    <label htmlFor="cloud-key" className="field-label">
+                      Service account key (JSON)
+                    </label>
+                    <div className="field">
+                      <textarea
+                        id="cloud-key"
+                        rows={5}
+                        className="font-mono"
+                        value={f.key}
+                        onChange={(e) => set({ key: e.target.value })}
+                        placeholder='{"type": "service_account", ...}'
+                        spellCheck={false}
+                        autoComplete="off"
+                      />
+                    </div>
+                    {(!gcpKey || kept) && <div className="field-hint">{!gcpKey ? <span className="text-[#e2c4c6]">Not a key file&apos;s JSON.</span> : KEPT}</div>}
+                  </div>
+                ) : null}
+                <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
+                  <TextField
+                    label="Projects"
+                    value={f.projects}
+                    onChange={(e) => set({ projects: e.target.value })}
+                    placeholder="my-project"
+                    hint="None: the credentials' project."
+                    spellCheck={false}
+                  />
+                  <TextField
+                    label="Services"
+                    value={f.services}
+                    onChange={(e) => set({ services: e.target.value })}
+                    placeholder="compute.googleapis.com, kubernetes.io"
+                    hint="Metric type prefixes. None: every type."
+                    spellCheck={false}
+                  />
+                </div>
+                <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
+                  <SelectField
+                    label="Logs"
+                    value={f.readLogs}
+                    onChange={(v) => set({ readLogs: v })}
+                    options={[
+                      { value: "no", label: "Not read" },
+                      { value: "yes", label: "Read" },
+                    ]}
+                  />
+                  {f.readLogs === "yes" && (
+                    <TextField
+                      label="Log filter (optional)"
+                      value={f.logFilter}
+                      onChange={(e) => set({ logFilter: e.target.value })}
+                      placeholder="severity>=WARNING"
+                      hint="Cloud Logging's query language. None: every entry."
+                      spellCheck={false}
+                    />
+                  )}
+                </div>
+              </>
+            )}
+            {f.kind === "azure" && (
+              <>
+                <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
+                  {given && <TextField label="Tenant ID" value={f.tenant} onChange={(e) => set({ tenant: e.target.value })} autoComplete="off" spellCheck={false} />}
+                  <TextField
+                    label={given ? "Client ID" : "Client ID of a user-assigned identity (optional)"}
+                    value={f.client}
+                    onChange={(e) => set({ client: e.target.value })}
+                    autoComplete="off"
+                    spellCheck={false}
+                  />
+                  {given && <TextField label="Client secret" type="password" value={f.key} onChange={(e) => set({ key: e.target.value })} autoComplete="new-password" hint={kept ? KEPT : undefined} />}
+                </div>
+                <SelectField
+                  label="Metrics"
+                  value={f.metrics}
+                  onChange={(v) => set({ metrics: v })}
+                  options={[
+                    { value: "yes", label: "Read" },
+                    { value: "no", label: "Not read: logs only" },
+                  ]}
+                />
+                {f.metrics === "yes" && (
+                  <>
+                    <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
+                      <TextField
+                        label="Subscriptions"
+                        value={f.subscriptions}
+                        onChange={(e) => set({ subscriptions: e.target.value })}
+                        hint="None: every one the credentials see."
+                        spellCheck={false}
+                      />
+                      <TextField
+                        label="Resource types"
+                        value={f.types}
+                        onChange={(e) => set({ types: e.target.value })}
+                        placeholder="Microsoft.Compute/virtualMachines"
+                        hint="None: every type with metrics."
+                        spellCheck={false}
+                      />
+                    </div>
+                    <TextField
+                      label="Aggregations besides each metric's own"
+                      value={f.aggregations}
+                      onChange={(e) => set({ aggregations: e.target.value })}
+                      placeholder="Maximum, Minimum"
+                      spellCheck={false}
+                    />
+                  </>
+                )}
+                <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
+                  <TextField
+                    label="Log Analytics workspaces"
+                    value={f.workspaces}
+                    onChange={(e) => set({ workspaces: e.target.value })}
+                    placeholder="a workspace's id"
+                    hint="None: no logs."
+                    spellCheck={false}
+                  />
+                  {list(f.workspaces).length > 0 && (
+                    <TextField
+                      label="Log query (optional)"
+                      value={f.logFilter}
+                      onChange={(e) => set({ logFilter: e.target.value })}
+                      placeholder="AppTraces"
+                      hint="A table, or a query in KQL. None: every table."
+                      spellCheck={false}
+                    />
+                  )}
+                </div>
+                <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
+                  <TextField
+                    label="Event Hubs namespace"
+                    value={f.hubsNamespace}
+                    onChange={(e) => set({ hubsNamespace: e.target.value })}
+                    placeholder="kiln-logs"
+                    hint="Where diagnostic settings stream logs. None: no event hubs."
+                    spellCheck={false}
+                  />
+                  {f.hubsNamespace.trim() !== "" && (
+                    <TextField
+                      label="Event hubs"
+                      value={f.hubs}
+                      onChange={(e) => set({ hubs: e.target.value })}
+                      placeholder="insights-activity-logs"
+                      hint="Each read as its events come, over its Kafka endpoint (Standard tier and above)."
+                      spellCheck={false}
+                    />
+                  )}
+                </div>
+                {f.hubsNamespace.trim() !== "" && (
+                  <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
+                    <SelectField
+                      label="Event hubs read with"
+                      value={f.hubsWith}
+                      onChange={(v) => set({ hubsWith: v as Form["hubsWith"] })}
+                      options={[
+                        { value: "string", label: "A connection string" },
+                        { value: "integration", label: "These credentials (Entra ID)" },
+                      ]}
+                    />
+                    {f.hubsWith === "string" ? (
+                      <TextField
+                        label="Connection string"
+                        type="password"
+                        value={f.connection}
+                        onChange={(e) => set({ connection: e.target.value })}
+                        autoComplete="new-password"
+                        placeholder="Endpoint=sb://…"
+                        hint={hubsKept ? KEPT : "With Listen rights."}
+                      />
+                    ) : (
+                      <p className="field-hint sm:pt-7">They need the Azure Event Hubs Data Receiver role.</p>
+                    )}
+                  </div>
+                )}
+              </>
+            )}
+            <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
+              <TextField
+                label="Every (seconds)"
+                inputMode="numeric"
+                value={f.interval}
+                onChange={(e) => set({ interval: e.target.value })}
+                hint={Number(f.interval) < 10 ? "10 at the least" : undefined}
+              />
+              <TextField
+                label="Tags"
+                value={f.tags}
+                onChange={(e) => set({ tags: e.target.value })}
+                placeholder="env:prod, team:infra"
+                hint="Given to every series and log record."
+                spellCheck={false}
+              />
             </div>
-          )}
+            {tested && (
+              <div className="field-hint" role="status">
+                {tested.ok ? (
+                  <span>
+                    Reads {count(tested.series ?? 0)} series of {count(tested.metrics ?? 0)} metrics, {count(tested.points ?? 0)} points
+                    {tested.records !== undefined && tested.records > 0 ? `, ${count(tested.records)} log records` : ""}, in {count(tested.calls ?? 0)} calls
+                    {tested.over ? `; ${count(tested.over)} more past the limit` : ""}.
+                    {tested.sample && tested.sample.length > 0 && <span className="font-mono"> {tested.sample.slice(0, 4).join(", ")}…</span>}
+                    {tested.records_sample && tested.records_sample.length > 0 && <span className="block truncate font-mono">{tested.records_sample[0]}</span>}
+                  </span>
+                ) : (
+                  <span className="text-[#e2c4c6]">{tested.error}</span>
+                )}
+              </div>
+            )}
+          </HeldFields>
           <div className="flex justify-end gap-2">
             <Button variant="ghost" onClick={onClose}>
               Cancel
             </Button>
-            <Button variant="ghost" disabled={!ok || busy} onClick={() => void test()}>
+            <Button variant="ghost" disabled={!ok} pending={testing} onClick={test}>
               Test
             </Button>
-            <Button type="submit" disabled={!ok || busy}>
+            <Button type="submit" disabled={!ok} pending={saving}>
               {cloud ? "Save" : "Add"}
             </Button>
           </div>

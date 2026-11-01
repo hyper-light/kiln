@@ -167,7 +167,7 @@ function BuildsBody() {
   const releaseJobs = useReleaseJobs(releaseId);
   const picked = usePicked((s) => s.picked);
   const uploads = useUploadPicker();
-  const uploading = useUploading((s) => s.target);
+  const uploading = useUploading((s) => s.targets);
   const jobs = React.useMemo(() => mergeJobs(data, live), [data, live]);
   return (
     <>

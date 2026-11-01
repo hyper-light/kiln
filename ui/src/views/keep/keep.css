@@ -7,6 +7,13 @@
   flex-direction: column;
   gap: 2px;
 }
+/* The rules' rows, held as one (a disabled fieldset) while a write is on its way. */
+.kp-rules {
+  display: flex;
+  min-width: 0;
+  flex-direction: column;
+  gap: 2px;
+}
 .kp-row {
   display: flex;
   flex-wrap: wrap;

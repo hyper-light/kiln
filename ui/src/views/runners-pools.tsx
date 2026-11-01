@@ -10,6 +10,8 @@ import { ci, type CiImage, type CiPool, type CiPoolSpec } from "@/api/ci";
 import { Link } from "@/lib/router";
 import { Button } from "@/components/ui/button";
 import { Confirm, Panel, SelectField } from "@/components/ui/misc";
+import { toast } from "@/components/ui/toast";
+import { useAction } from "@/lib/action";
 import { useRes, type Res } from "@/lib/data";
 import { relativeTime } from "@/lib/format";
 import { errorMessage } from "@/lib/hooks";
@@ -17,7 +19,7 @@ import { Hold } from "@/components/ui/hold";
 import { Chart } from "@/components/charts/chart";
 import { SERIES } from "@/components/charts/types";
 import { Segmented } from "@/components/ui/tabs";
-import { useSuspenseResource } from "@/lib/resource";
+import { change, useSuspenseResource } from "@/lib/resource";
 import { ImageBuilder } from "@/views/ci/image-builder";
 
 export const poolsRes: Res<CiPool[]> = { key: "ci/pools", fetch: (s) => ci.pools(s), opts: { pollMs: 5000 } };
@@ -101,7 +103,11 @@ export function PoolsPanel({ manage }: { manage: boolean }) {
   const res = useRes(poolsRes);
   const pools = res.data;
   const [open, setOpen] = React.useState<string | null>(null);
-  const [adding, setAdding] = React.useState(false);
+  // The new pool's form, by its opening: a save answered after its form was closed (and one opened
+  // since) closes nothing, and what's typed there stays (W21-R15).
+  const [adding, setAdding] = React.useState<number | null>(null);
+  const openings = React.useRef(0);
+  const opening = adding;
   // What a pool just saved does now, as the server warns of it (W20-R03).
   const [warnings, setWarnings] = React.useState<string[]>([]);
   const saved = (w: string[]) => {
@@ -114,14 +120,14 @@ export function PoolsPanel({ manage }: { manage: boolean }) {
       title="Pools"
       description="Executors kiln starts for the legs that ask for them (runs-on a pool's labels), each discarded when its leg ends."
       actions={
-        manage && !adding ? (
-          <Button size="xs" variant="ghost" onClick={() => setAdding(true)}>
+        manage && adding === null ? (
+          <Button size="xs" variant="ghost" onClick={() => setAdding(++openings.current)}>
             Add a pool
           </Button>
         ) : undefined
       }
     >
-      {pools.length === 0 && !adding && <p className="empty-line px-5 py-4">No pools: legs run on the runners themselves.</p>}
+      {pools.length === 0 && adding === null && <p className="empty-line px-5 py-4">No pools: legs run on the runners themselves.</p>}
       {pools.length > 0 && (
         <div className="table-wrap">
           <table className="data-table" aria-label="Pools">
@@ -166,14 +172,15 @@ export function PoolsPanel({ manage }: { manage: boolean }) {
           </table>
         </div>
       )}
-      {adding && (
+      {adding !== null && (
         <div className="border-t border-[#20232b] px-5 py-4">
           <PoolForm
+            key={adding}
             onSaved={(w) => {
-              setAdding(false);
+              setAdding((a) => (a === opening ? null : a));
               saved(w);
             }}
-            onCancel={() => setAdding(false)}
+            onCancel={() => setAdding(null)}
           />
         </div>
       )}
@@ -286,10 +293,20 @@ function PoolHistory({ pool }: { pool: string }) {
 }
 
 function PoolDetail({ pool, manage, onDone, reload, saved }: { pool: CiPool; manage: boolean; onDone: () => void; reload: () => void; saved: (warnings: string[]) => void }) {
-  const [editing, setEditing] = React.useState(false);
+  // Its edit form, by its opening, as the new pool's is.
+  const [editing, setEditing] = React.useState<number | null>(null);
+  const edits = React.useRef(0);
+  const edit = editing;
   const [removing, setRemoving] = React.useState(false);
-  const [busy, setBusy] = React.useState(false);
-  const [problem, setProblem] = React.useState<string | null>(null);
+  // Gone from the list at once (W21-R15), and back, saying why, if the server keeps it.
+  const remove = () => {
+    change<CiPool[]>(poolsRes.key, (ps) => ps.filter((p) => p.name !== pool.name));
+    onDone();
+    ci.removePool(pool.name).then(reload, (e: unknown) => {
+      toast.error(`Couldn't remove ${pool.name}`, errorMessage(e));
+      reload();
+    });
+  };
   return (
     <div className="border-t border-[#20232b] bg-[#0d0e12] px-5 py-4">
       <p className="font-mono text-[11.5px] text-[#a1a4ad]">
@@ -317,9 +334,9 @@ function PoolDetail({ pool, manage, onDone, reload, saved }: { pool: CiPool; man
           Its last start failed on {pool.last_error[0]}: {pool.last_error[1]}
         </p>
       )}
-      {manage && !editing && (
+      {manage && editing === null && (
         <div className="mt-3 flex gap-2">
-          <Button size="xs" variant="secondary" onClick={() => setEditing(true)}>
+          <Button size="xs" variant="secondary" onClick={() => setEditing(++edits.current)}>
             Edit
           </Button>
           <Button size="xs" variant="ghost" aria-expanded={removing} onClick={() => setRemoving(!removing)}>
@@ -327,15 +344,16 @@ function PoolDetail({ pool, manage, onDone, reload, saved }: { pool: CiPool; man
           </Button>
         </div>
       )}
-      {editing && (
+      {editing !== null && (
         <div className="mt-4">
           <PoolForm
+            key={editing}
             pool={pool}
             onSaved={(w) => {
-              setEditing(false);
+              setEditing((x) => (x === edit ? null : x));
               saved(w);
             }}
-            onCancel={() => setEditing(false)}
+            onCancel={() => setEditing(null)}
           />
         </div>
       )}
@@ -346,27 +364,10 @@ function PoolDetail({ pool, manage, onDone, reload, saved }: { pool: CiPool; man
           className="mt-3"
           actions={
             <>
-              <Button
-                size="xs"
-                variant="primary"
-                disabled={busy}
-                onClick={async () => {
-                  setBusy(true);
-                  setProblem(null);
-                  try {
-                    await ci.removePool(pool.name);
-                    reload();
-                    onDone();
-                  } catch (e) {
-                    setProblem(errorMessage(e));
-                  } finally {
-                    setBusy(false);
-                  }
-                }}
-              >
+              <Button size="xs" variant="primary" onClick={remove}>
                 Remove {pool.name}
               </Button>
-              <Button size="xs" variant="ghost" disabled={busy} onClick={() => setRemoving(false)}>
+              <Button size="xs" variant="ghost" onClick={() => setRemoving(false)}>
                 Keep it
               </Button>
             </>
@@ -374,11 +375,6 @@ function PoolDetail({ pool, manage, onDone, reload, saved }: { pool: CiPool; man
         >
           <p>Its idle executors stop now; busy ones end with their legs. Legs that ask for it wait for another.</p>
         </Confirm>
-      )}
-      {problem && (
-        <p className={`mt-3 ${NOTE} text-[var(--color-fail)]`} role="status">
-          {problem}
-        </p>
       )}
     </div>
   );
@@ -391,8 +387,31 @@ function PoolForm({ pool, onSaved, onCancel }: { pool?: CiPool; onSaved: (warnin
   const [labels, setLabels] = React.useState((pool?.labels ?? []).join(", "));
   const [minIdle, setMinIdle] = React.useState(String(pool?.min_idle ?? 0));
   const [max, setMax] = React.useState(String(pool?.max ?? 4));
-  const [busy, setBusy] = React.useState(false);
   const [problem, setProblem] = React.useState<string | null>(null);
+  // Saved, the form closes, so it's held as it is until then; Cancel still closes it, and a refusal
+  // after that is still said (W21-R15).
+  const [save, saving] = useAction(
+    async () => {
+      setProblem(null);
+      const spec: CiPoolSpec = {
+        name: name.trim(),
+        executor,
+        image: image.trim() || null,
+        labels: labels
+          .split(",")
+          .map((l) => l.trim())
+          .filter(Boolean),
+        min_idle: Number(minIdle) || 0,
+        max: Number(max) || null,
+      };
+      const r = await ci.putPool(spec);
+      onSaved((r.diagnostics ?? []).map((d) => d.message));
+    },
+    (e) => {
+      setProblem(errorMessage(e));
+      toast.error(pool ? `Couldn't save ${pool.name}` : "Couldn't add the pool", errorMessage(e));
+    },
+  );
   const field = (id: string, label: string, input: React.ReactNode) => (
     <div>
       <label htmlFor={id} className="field-label">
@@ -405,56 +424,36 @@ function PoolForm({ pool, onSaved, onCancel }: { pool?: CiPool; onSaved: (warnin
     <form
       noValidate
       aria-label={pool ? `Edit ${pool.name}` : "A new pool"}
-      onSubmit={async (e) => {
+      onSubmit={(e) => {
         e.preventDefault();
-        setBusy(true);
-        setProblem(null);
-        const spec: CiPoolSpec = {
-          name: name.trim(),
-          executor,
-          image: image.trim() || null,
-          labels: labels
-            .split(",")
-            .map((l) => l.trim())
-            .filter(Boolean),
-          min_idle: Number(minIdle) || 0,
-          max: Number(max) || null,
-        };
-        try {
-          const r = await ci.putPool(spec);
-          onSaved((r.diagnostics ?? []).map((d) => d.message));
-        } catch (e2) {
-          setProblem(errorMessage(e2));
-        } finally {
-          setBusy(false);
-        }
+        save();
       }}
     >
       <div className="grid gap-4 sm:grid-cols-2">
         {field(
           "pool-name",
           "Name",
-          <input id="pool-name" type="text" spellCheck={false} placeholder="linux-docker" value={name} disabled={busy || Boolean(pool)} onChange={(e) => setName(e.target.value)} />,
+          <input id="pool-name" type="text" spellCheck={false} placeholder="linux-docker" value={name} disabled={saving || Boolean(pool)} onChange={(e) => setName(e.target.value)} />,
         )}
         <SelectField label="Executor" value={executor} onChange={setExecutor} options={KINDS} />
         {field(
           "pool-image",
           "Image",
-          <input id="pool-image" type="text" spellCheck={false} placeholder="kiln/runner-ubuntu-24.04" value={image} disabled={busy} onChange={(e) => setImage(e.target.value)} />,
+          <input id="pool-image" type="text" spellCheck={false} placeholder="kiln/runner-ubuntu-24.04" value={image} disabled={saving} onChange={(e) => setImage(e.target.value)} />,
         )}
         {field(
           "pool-labels",
           "Labels (comma-separated)",
-          <input id="pool-labels" type="text" spellCheck={false} placeholder="linux, docker" value={labels} disabled={busy} onChange={(e) => setLabels(e.target.value)} />,
+          <input id="pool-labels" type="text" spellCheck={false} placeholder="linux, docker" value={labels} disabled={saving} onChange={(e) => setLabels(e.target.value)} />,
         )}
-        {field("pool-min", "At least idle", <input id="pool-min" type="number" min={0} value={minIdle} disabled={busy} onChange={(e) => setMinIdle(e.target.value)} />)}
-        {field("pool-max", "At most", <input id="pool-max" type="number" min={1} value={max} disabled={busy} onChange={(e) => setMax(e.target.value)} />)}
+        {field("pool-min", "At least idle", <input id="pool-min" type="number" min={0} value={minIdle} disabled={saving} onChange={(e) => setMinIdle(e.target.value)} />)}
+        {field("pool-max", "At most", <input id="pool-max" type="number" min={1} value={max} disabled={saving} onChange={(e) => setMax(e.target.value)} />)}
       </div>
       <div className="mt-4 flex justify-end gap-2">
-        <Button type="button" size="xs" variant="ghost" disabled={busy} onClick={onCancel}>
+        <Button type="button" size="xs" variant="ghost" onClick={onCancel}>
           Cancel
         </Button>
-        <Button type="submit" size="xs" variant="secondary" disabled={busy || !name.trim() || !image.trim()}>
+        <Button type="submit" size="xs" variant="secondary" pending={saving} disabled={!name.trim() || !image.trim()}>
           {pool ? "Save" : "Add the pool"}
         </Button>
       </div>

@@ -13,7 +13,8 @@ import { WatchedBy } from "@/views/attach/here";
 import { Chips, StatusDot } from "@/components/ui/status";
 import { toast } from "@/components/ui/toast";
 import { Tip } from "@/components/ui/tooltip";
-import { agentsRes, historyRes, lastSamples, mergeJobs, updatesRes, useAgentsLive, useMetricsHistory, useRes, useUpdateJobs, warm } from "@/lib/data";
+import { sendingProps, useAction, useActions } from "@/lib/action";
+import { agentsRes, fuller, historyRes, lastSamples, mergeJobs, updatesRes, upsert, useAgentsLive, useMetricsHistory, useRes, useUpdateJobs, warm } from "@/lib/data";
 import { absoluteTime, formatBytes, formatPct } from "@/lib/format";
 import { errorMessage, useNow } from "@/lib/hooks";
 import { usePref } from "@/lib/prefs";
@@ -120,16 +121,17 @@ function RunnersBody() {
     setParams(n, { replace: true });
   };
 
-  const drain = async (a: Agent, draining: boolean) => {
-    agents.setData((l) => l.map((x) => (x.name === a.name ? { ...x, draining } : x)));
+  // Drained or resumed at once; while that's on its way, the next press on that runner waits (W21-R15).
+  const [drain, draining] = useActions(async (_name: string, a: Agent, on: boolean) => {
+    agents.change((l) => l.map((x) => (x.name === a.name ? { ...x, draining: on } : x)));
     try {
-      await api.drainAgent(a.name, draining);
-      toast({ title: draining ? `Draining ${a.name}` : `${a.name} accepting jobs`, tone: "info" });
+      await api.drainAgent(a.name, on);
+      toast({ title: on ? `Draining ${a.name}` : `${a.name} accepting jobs`, tone: "info" });
     } catch (e) {
-      agents.setData((l) => l.map((x) => (x.name === a.name ? { ...x, draining: !draining } : x)));
+      agents.change((l) => l.map((x) => (x.name === a.name ? { ...x, draining: !on } : x)));
       toast.error("Drain failed", errorMessage(e));
     }
-  };
+  });
 
   const all = agents.data.filter((a) => !a.ephemeral);
   const counts = { all: all.length, connected: all.filter((a) => a.connected).length };
@@ -150,19 +152,31 @@ function RunnersBody() {
 
   const slots = all.filter((a) => a.connected).reduce((s, a) => s + a.slots, 0);
   const busy = all.filter((a) => a.connected).reduce((s, a) => s + a.busy, 0);
-  const forget = async (a: Agent) => {
-    try {
-      await api.forgetAgent(a.name);
-      agents.setData((l) => l.filter((x) => x.name !== a.name));
-      if (selected === a.name) openAgent(null);
-      toast({ title: `${a.name} forgotten`, tone: "info" });
-    } catch (e) {
-      toast.error("Forget failed", errorMessage(e));
-    }
+  // Gone from the list at once (W21-R15), and back, saying why, if the server keeps it.
+  const forget = (a: Agent) => {
+    agents.change((l) => l.filter((x) => x.name !== a.name));
+    if (selected === a.name) openAgent(null);
+    api.forgetAgent(a.name).then(
+      () => {
+        toast({ title: `${a.name} forgotten`, tone: "info" });
+        agents.reload();
+      },
+      (e: unknown) => {
+        agents.change((l) => upsert<Agent>(l, a, (x) => x.name, false));
+        toast.error("Forget failed", errorMessage(e));
+      },
+    );
   };
   const details = (a: Agent) => (
     <Loadable label={`${a.name} in depth`} fallback={<Hold height={560} className="runner-details" />}>
-      <AgentDetails agent={a} onClose={() => openAgent(null)} onDrain={drain} onForget={forget} onTerminal={() => navigate(`/terminal?open=${encodeURIComponent(`agent:${a.name}`)}`)} />
+      <AgentDetails
+        agent={a}
+        draining={draining(a.name)}
+        onClose={() => openAgent(null)}
+        onDrain={(x, on) => drain(x.name, x, on)}
+        onForget={forget}
+        onTerminal={() => navigate(`/terminal?open=${encodeURIComponent(`agent:${a.name}`)}`)}
+      />
     </Loadable>
   );
 
@@ -177,10 +191,13 @@ function RunnersBody() {
       />
 
       <JoinNotice requests={joinRequests} discovery={discovery} />
-      <LowBattery agents={all} what={(m) => {
-        const n = all.find((a) => a.name === m)?.running.length ?? 0;
-        return n > 0 ? `its ${n} job${n === 1 ? "" : "s"}` : "";
-      }} />
+      <LowBattery
+        agents={all}
+        what={(m) => {
+          const n = all.find((a) => a.name === m)?.running.length ?? 0;
+          return n > 0 ? `its ${n} job${n === 1 ? "" : "s"}` : "";
+        }}
+      />
       <Upgrades />
 
       <RunnersTools q={q} onQ={setQ} facets={facets} chosen={chosen} onChosen={setChosen} view={view} onView={setView} />
@@ -287,7 +304,7 @@ function RunnersBody() {
                       <td className="num cell-mono hidden lg:table-cell">{s ? formatPct(memPct(s)) : "—"}</td>
                       <td className="num cell-mono hidden xl:table-cell">{s ? formatPct(diskPct(s)) : "—"}</td>
                       <td className="num cell-mono hidden xl:table-cell">{s ? s.load1.toFixed(2) : "—"}</td>
-                      <td className="hidden md:table-cell">{!a.outpost && <DrainCheck agent={a} onChange={(v) => drain(a, v)} />}</td>
+                      <td className="hidden md:table-cell">{!a.outpost && <DrainCheck agent={a} pending={draining(a.name)} onChange={(v) => drain(a.name, a, v)} />}</td>
                       <td className="hidden text-right whitespace-nowrap sm:table-cell">
                         <Tip content={a.connected ? "Open terminal" : "Runner offline"}>
                           <button
@@ -411,11 +428,7 @@ function UpgradeNote({ agent, detailed }: { agent: Agent; detailed?: boolean }) 
   const old = inst.filter((i) => !i.newest);
   if (!detailed) {
     const held = old.reduce((n, i) => n + i.terminals + i.agents + i.jobs, 0);
-    return (
-      <div className="truncate font-mono text-[10px] text-[#cbb69a]">
-        upgrading · old runner {held ? `keeps ${old.map(holding).join("; ")}` : "is retiring"}
-      </div>
-    );
+    return <div className="truncate font-mono text-[10px] text-[#cbb69a]">upgrading · old runner {held ? `keeps ${old.map(holding).join("; ")}` : "is retiring"}</div>;
   }
   return (
     <div className="mt-5 rounded-xl border border-[#cbb69a]/30 bg-[#cbb69a]/[0.04] px-4 py-3">
@@ -439,10 +452,10 @@ function UpgradeNote({ agent, detailed }: { agent: Agent; detailed?: boolean }) 
   );
 }
 
-/** Drain as a checkbox: on, the runner takes no new jobs. */
-function DrainCheck({ agent, onChange }: { agent: Agent; onChange: (v: boolean) => void }) {
+/** Drain as a checkbox: on, the runner takes no new jobs (`pending`: that's on its way). */
+function DrainCheck({ agent, pending, onChange }: { agent: Agent; pending: boolean; onChange: (v: boolean) => void }) {
   return (
-    <label className="inline-flex min-h-8 cursor-pointer items-center gap-2">
+    <label className="inline-flex min-h-8 cursor-pointer items-center gap-2" {...sendingProps(pending)}>
       <input type="checkbox" className="check" checked={agent.draining} disabled={!agent.connected} onChange={(e) => onChange(e.target.checked)} aria-label={`Drain ${agent.name}`} />
       <span className={cn("font-mono text-[10px]", agent.draining ? "text-[#cbb69a]" : "text-[#7b7e88]")}>{agent.draining ? "draining" : "off"}</span>
     </label>
@@ -472,15 +485,18 @@ function RefusedWords({ refused }: { refused: RefusedMessages | undefined }) {
 /** One runner in depth, open in the page under its row: what it is, what it runs, its last hour. */
 function AgentDetails({
   agent,
+  draining,
   onClose,
   onDrain,
   onForget,
   onTerminal,
 }: {
   agent: Agent;
+  /** Its drain or resume is on its way. */
+  draining: boolean;
   onClose: () => void;
   onDrain: (a: Agent, v: boolean) => void;
-  onForget: (a: Agent) => Promise<void>;
+  onForget: (a: Agent) => void;
   onTerminal: () => void;
 }) {
   const [forgetting, setForgetting] = React.useState(false);
@@ -517,7 +533,7 @@ function AgentDetails({
           </Button>
         )}
         {!agent.outpost && (
-          <Button variant="secondary" size="xs" disabled={!agent.connected} onClick={() => onDrain(agent, !agent.draining)}>
+          <Button variant="secondary" size="xs" pending={draining} disabled={!agent.connected} onClick={() => onDrain(agent, !agent.draining)}>
             {agent.draining ? "Resume" : "Drain"}
           </Button>
         )}
@@ -534,7 +550,7 @@ function AgentDetails({
           tone="danger"
           actions={
             <>
-              <Button size="xs" variant="danger" onClick={() => void onForget(agent).finally(() => setForgetting(false))}>
+              <Button size="xs" variant="danger" onClick={() => onForget(agent)}>
                 Forget runner
               </Button>
               <Button size="xs" variant="ghost" onClick={() => setForgetting(false)}>
@@ -628,27 +644,27 @@ function AgentLimit({ runner }: { runner: string }) {
   const v = view.data;
   const id = React.useId();
   const [draft, setDraft] = React.useState<string | null>(null);
-  const [saving, setSaving] = React.useState(false);
   const [msg, setMsg] = React.useState<{ tone: "ok" | "error"; text: string } | null>(null);
   // Until something is typed, the field follows what holds (another tab, another admin, its config).
   const shown = draft ?? String(v.max_sessions ?? v.held?.max_sessions ?? v.default);
   const save = async (max: number | null) => {
-    setSaving(true);
+    // What's typed after the press stays: the field follows what holds again only if it's unchanged.
+    const sent = draft;
     try {
       const next = await api.setAgentLimit(runner, max);
       view.setData(() => next);
-      setDraft(null);
+      setDraft((d) => (d === sent ? null : d));
       setMsg({ tone: "ok", text: max === null ? `Nothing set here now: ${runner} holds its config's, or kiln's default.` : `Saved: at most ${max} agents at work at once on ${runner}.` });
     } catch (e) {
       setMsg({ tone: "error", text: errorMessage(e) });
-    } finally {
-      setSaving(false);
     }
   };
+  const [put, saving] = useAction(save);
+  const [clear, clearing] = useAction(() => save(null));
   const submit = () => {
     const n = parseLimit(shown, v.max);
     if (typeof n === "string") setMsg({ tone: "error", text: n });
-    else void save(n);
+    else put(n);
   };
   return (
     <section className="runner-limit" aria-labelledby={`${id}-head`}>
@@ -681,11 +697,11 @@ function AgentLimit({ runner }: { runner: string }) {
               }}
             />
           </div>
-          <Button type="submit" variant="secondary" size="xs" disabled={saving || draft === null}>
+          <Button type="submit" variant="secondary" size="xs" pending={saving} disabled={draft === null || clearing}>
             {saving ? "Saving…" : "Save"}
           </Button>
           {v.max_sessions !== null && (
-            <Button type="button" variant="ghost" size="xs" disabled={saving} onClick={() => void save(null)}>
+            <Button type="button" variant="ghost" size="xs" pending={clearing} disabled={saving} onClick={clear}>
               Use its config
             </Button>
           )}
@@ -737,7 +753,34 @@ function Upgrades() {
   const data = useRes(updatesRes).data;
   const live = useUpdateJobs();
   const [asking, setAsking] = React.useState<string | null>(null);
-  const [busy, setBusy] = React.useState(false);
+  // Each confirm's Upgrade says it's on its way (W21-R15), and its runners show as upgrading once
+  // the server has started them, before their first event; a confirm opened meanwhile stays open.
+  // While a runner's is on its way, what would upgrade it again waits: its own Upgrade, and every
+  // runner's at once (or each runner's, while every runner's is).
+  const [upgrade, sending] = useActions(async (scope: string, runners: RunnerUpdate[]) => {
+    try {
+      for (const r of runners) {
+        const job = await api.upgradeRunner(r.name);
+        useUpdateJobs.setState((m) => ({ ...m, [job.id]: fuller(m[job.id], job) }), true);
+      }
+      toast({ title: runners.length === 1 ? `Upgrading ${runners[0]?.name ?? ""}` : `Upgrading ${runners.length} runners`, description: "Nothing they run is stopped.", tone: "running" });
+    } catch (e) {
+      toast.error("Couldn't upgrade", errorMessage(e));
+    } finally {
+      setAsking((a) => (a === scope ? null : a));
+      invalidate("updates");
+    }
+  });
+  const [build, starting] = useAction(async () => {
+    try {
+      const run = await api.buildEveryPlatform();
+      toast({ title: "Building every platform", description: `run #${run.number}`, tone: "running" });
+    } catch (e) {
+      toast.error("Couldn't start the build", errorMessage(e));
+    } finally {
+      invalidate("updates");
+    }
+  });
   const upgrading = new Set(
     mergeJobs(data, live)
       .filter((j) => j.kind === "runner" && j.state === "running")
@@ -750,40 +793,15 @@ function Upgrades() {
   const last = data.build?.last;
   const building = last != null && (last.status === "queued" || last.status === "running" || last.status === "pending");
 
-  const upgrade = async (runners: RunnerUpdate[]) => {
-    setBusy(true);
-    try {
-      for (const r of runners) await api.upgradeRunner(r.name);
-      toast({ title: runners.length === 1 ? `Upgrading ${runners[0]?.name ?? ""}` : `Upgrading ${runners.length} runners`, description: "Nothing they run is stopped.", tone: "running" });
-    } catch (e) {
-      toast.error("Couldn't upgrade", errorMessage(e));
-    } finally {
-      setBusy(false);
-      setAsking(null);
-      invalidate("updates");
-    }
-  };
-  const build = async () => {
-    setBusy(true);
-    try {
-      const run = await api.buildEveryPlatform();
-      toast({ title: "Building every platform", description: `run #${run.number}`, tone: "running" });
-    } catch (e) {
-      toast.error("Couldn't start the build", errorMessage(e));
-    } finally {
-      setBusy(false);
-      invalidate("updates");
-    }
-  };
-  const confirm = (text: string, runners: RunnerUpdate[]) => (
+  const confirm = (scope: string, text: string, runners: RunnerUpdate[]) => (
     <Confirm
       label="Confirm the upgrade"
       actions={
         <>
-          <Button size="xs" disabled={busy} onClick={() => void upgrade(runners)}>
+          <Button size="xs" pending={sending(scope)} onClick={() => upgrade(scope, runners)}>
             Upgrade
           </Button>
-          <Button size="xs" variant="ghost" disabled={busy} onClick={() => setAsking(null)}>
+          <Button size="xs" variant="ghost" onClick={() => setAsking(null)}>
             Cancel
           </Button>
         </>
@@ -798,12 +816,12 @@ function Upgrades() {
       <div className="runner-up-head">
         <p>{behind.length === 1 ? "1 runner is" : `${behind.length} runners are`} on an older build than this server hands out.</p>
         {ready.length > 1 && asking !== "all" && (
-          <Button size="xs" variant="secondary" onClick={() => setAsking("all")}>
+          <Button size="xs" variant="secondary" pending={sending("all")} disabled={behind.some((r) => sending(r.name))} onClick={() => setAsking("all")}>
             Upgrade all ({ready.length})
           </Button>
         )}
       </div>
-      {asking === "all" && confirm(`Upgrade ${ready.map((r) => r.name).join(", ")}? Each takes the new build without a restart; nothing they run stops.`, ready)}
+      {asking === "all" && confirm("all", `Upgrade ${ready.map((r) => r.name).join(", ")}? Each takes the new build without a restart; nothing they run stops.`, ready)}
       <ul className="runner-up-list">
         {behind.map((r) => (
           <li key={r.name}>
@@ -818,13 +836,20 @@ function Upgrades() {
               ) : (
                 r.target_build &&
                 asking !== r.name && (
-                  <Button size="xs" variant="secondary" className="runner-up-go" disabled={r.method === "terminal" && !r.terminal} onClick={() => setAsking(r.name)}>
+                  <Button
+                    size="xs"
+                    variant="secondary"
+                    className="runner-up-go"
+                    pending={sending(r.name)}
+                    disabled={(r.method === "terminal" && !r.terminal) || sending("all")}
+                    onClick={() => setAsking(r.name)}
+                  >
                     Upgrade
                   </Button>
                 )
               )}
             </div>
-            {asking === r.name && confirm(`Upgrade ${r.name} to build ${r.target_build ?? ""}? It takes it without a restart; its terminals, agents and jobs keep running.`, [r])}
+            {asking === r.name && confirm(r.name, `Upgrade ${r.name} to build ${r.target_build ?? ""}? It takes it without a restart; its terminals, agents and jobs keep running.`, [r])}
           </li>
         ))}
       </ul>
@@ -842,7 +867,7 @@ function Upgrades() {
             )}
           </p>
           {!building && (
-            <Button size="xs" variant="secondary" disabled={busy || Boolean(data.build?.error)} onClick={() => void build()}>
+            <Button size="xs" variant="secondary" pending={starting} disabled={Boolean(data.build?.error)} onClick={build}>
               Build every platform
             </Button>
           )}

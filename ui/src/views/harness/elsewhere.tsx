@@ -11,7 +11,7 @@ import { ChevronDown } from "lucide-react";
 import { harnessApi, type AgentInfo, type Command, type KindInfo, type MovePlan, type State } from "@/api/harness";
 import { Button } from "@/components/ui/button";
 import { toast } from "@/components/ui/toast";
-import { errorMessage } from "@/lib/hooks";
+import { useAction } from "@/lib/action";
 import { Link } from "@/lib/router";
 import { useSuspenseResource } from "@/lib/resource";
 import { useClock } from "./dom";
@@ -102,19 +102,24 @@ const chosenOf = (on: boolean, plan: MovePlan) => (on ? `${plan.to ?? "*"}|${pic
  */
 export function AtLimit({ agent, state, send }: { agent: Agent; state: State | null; send: (c: Command) => void }) {
   const { places } = usePlaces(agent);
-  const [asked, setAsked] = React.useState<{ at: number; want: string } | null>(null);
+  const [asked, setAsked] = React.useState<{ at: number; want: string; next: { on: boolean } & MovePlan } | null>(null);
   const now = useClock(asked ? 1000 : 60_000);
-  const on = state?.move_on_limit === true;
+  const has = state?.move_on_limit === true;
   // A runner from before a machine and harness could be chosen sends no plan: anywhere, its own.
   const plans = state?.move_plan !== undefined;
-  const plan: MovePlan = state?.move_plan ?? {};
+  const kept: MovePlan = state?.move_plan ?? {};
+  const answered = asked === null || asked.want === chosenOf(has, kept);
+  const unanswered = asked !== null && !answered && now - asked.at > 3500;
+  // Chosen and not said back yet: shown as chosen at once (W21-R15), and as the agent has it again if it isn't.
+  const waiting = asked !== null && !answered && !unanswered;
+  const on = waiting ? asked.next.on : has;
+  const plan: MovePlan = waiting ? asked.next : kept;
   const where = !on ? "" : (plan.to ?? "*");
-  const unanswered = asked !== null && asked.want !== chosenOf(on, plan) && now - asked.at > 3500;
   const there = places.find((p) => p.target === where);
   // Anywhere: the harnesses some machine has; there: those it has.
   const kinds = there ? there.kinds : [...new Map(places.flatMap((p) => p.kinds).map((k) => [k.id, k])).values()];
   const set = (next: { on: boolean } & MovePlan) => {
-    setAsked({ at: Date.now(), want: chosenOf(next.on, next) });
+    setAsked({ at: Date.now(), want: chosenOf(next.on, next), next });
     send({ type: "move_on_limit", ...next });
   };
   return (
@@ -154,7 +159,15 @@ export function GoOnNow({ agent, canSwitch, send }: { agent: Agent; canSwitch: b
   const switches = canSwitch ? here : [];
   const [where, setWhere] = React.useState<string | null>(null);
   const [what, setWhat] = React.useState("");
-  const [busy, setBusy] = React.useState(false);
+  // On another machine: Go says the move is on its way until it's answered (W21-R15). Here: a command on the agent's socket.
+  const [go, moving] = useAction((there: Place | undefined, chosen: string) => {
+    const { kind, model } = unpick(chosen);
+    if (!there) {
+      if (kind) send({ type: "set_model", model: model ?? "", kind });
+      return;
+    }
+    return harnessApi.move(agent.id, there.target, true, kind, model).then(() => toast.success(`Moving ${agent.name} to ${there.name}`, "The turn the limit cut off goes on there."));
+  }, "Couldn't move it");
   if (switches.length === 0 && places.length === 0) return null;
   // Here first when it can change harness here; else the first machine.
   const shown = where ?? (switches.length ? "" : (places[0]?.target ?? ""));
@@ -163,22 +176,6 @@ export function GoOnNow({ agent, canSwitch, send }: { agent: Agent; canSwitch: b
   const own = Boolean(there?.kinds.some((k) => k.id === agent.kind));
   // Here it changes harness: one must be chosen (its own default model, when it lists none). There it may go as it is.
   const chosen = what || (own ? "" : pick(kinds.find((k) => k.id !== agent.kind)?.id, kinds.find((k) => k.id !== agent.kind)?.models?.[0]?.id));
-  const go = async () => {
-    const { kind, model } = unpick(chosen);
-    if (!there) {
-      if (kind) send({ type: "set_model", model: model ?? "", kind });
-      return;
-    }
-    setBusy(true);
-    try {
-      await harnessApi.move(agent.id, there.target, true, kind, model);
-      toast.success(`Moving ${agent.name} to ${there.name}`, "The turn the limit cut off goes on there.");
-    } catch (e) {
-      toast.error("Couldn't move it", errorMessage(e));
-    } finally {
-      setBusy(false);
-    }
-  };
   return (
     <div className="hx-goon">
       <span className="hx-goon-label">Go on now</span>
@@ -200,8 +197,8 @@ export function GoOnNow({ agent, canSwitch, send }: { agent: Agent; canSwitch: b
       <Select label="In" value={chosen} onChange={setWhat}>
         <HarnessOptions agent={agent} kinds={kinds} own={own} />
       </Select>
-      <Button size="xs" variant="secondary" disabled={busy || (!there && !chosen)} onClick={() => void go()}>
-        {busy ? "Moving…" : "Go"}
+      <Button size="xs" variant="secondary" disabled={!there && !chosen} pending={moving} onClick={() => go(there, chosen)}>
+        {moving ? "Moving…" : "Go"}
       </Button>
     </div>
   );

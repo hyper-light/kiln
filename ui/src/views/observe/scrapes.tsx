@@ -13,11 +13,12 @@ import { TableHold } from "@/components/ui/hold";
 import { Loadable } from "@/components/ui/loading";
 import { SectionHeading, SelectField, TextField } from "@/components/ui/misc";
 import { toast } from "@/components/ui/toast";
+import { useAction } from "@/lib/action";
 import { useRes } from "@/lib/data";
 import { relativeTime } from "@/lib/format";
 import { errorMessage } from "@/lib/hooks";
 import { invalidate } from "@/lib/resource";
-import { scrapesRes, statusRes } from "./parts";
+import { HeldFields, scrapesRes, statusRes, useOpening } from "./parts";
 
 const SERVER = "server";
 const EVERY = "*";
@@ -217,8 +218,10 @@ const bodyOf = (f: Form): ScrapeIn => ({ url: f.url.trim(), on: f.on, every_s: N
 
 function ScrapeDialog({ target, onClose }: { target: Scrape | null; onClose: () => void }) {
   const [f, setF] = React.useState<Form>(() => formOf(target));
-  const [busy, setBusy] = React.useState(false);
-  const [tested, setTested] = React.useState<ScrapeTest | null>(null);
+  const opening = useOpening(f);
+  const [result, setTested] = React.useState<{ of: Form; r: ScrapeTest } | null>(null);
+  // A test shows only under the form it tried: one that comes after an edit was of what was there before (W21-R15).
+  const tested = result?.of === f ? result.r : null;
   const set = (patch: Partial<Form>) => {
     setF((old) => ({ ...old, ...patch }));
     setTested(null);
@@ -229,28 +232,19 @@ function ScrapeDialog({ target, onClose }: { target: Scrape | null; onClose: () 
   const timeout = Number(f.timeout);
   const timesOk = Number.isInteger(every) && every >= 1 && every <= 86_400 && Number.isInteger(timeout) && timeout >= 1 && timeout <= every;
   const ok = validName && validUrl && timesOk;
-  const save = async () => {
-    setBusy(true);
+  const [save, saving] = useAction(async () => {
+    await observeApi.putScrape(f.name, bodyOf(f));
+    invalidate("observe/scrapes");
+    if (opening.still(f)) onClose();
+  }, "Couldn't save it");
+  const [test, testing] = useAction(async () => {
+    const of = f;
     try {
-      await observeApi.putScrape(f.name, bodyOf(f));
-      invalidate("observe/scrapes");
-      onClose();
+      setTested({ of, r: await observeApi.testScrape(of.name || "new", bodyOf(of)) });
     } catch (err) {
-      toast({ title: "Couldn't save it", description: errorMessage(err), tone: "failed" });
-    } finally {
-      setBusy(false);
+      setTested({ of, r: { ok: false, error: errorMessage(err) } });
     }
-  };
-  const test = async () => {
-    setBusy(true);
-    try {
-      setTested(await observeApi.testScrape(f.name || "new", bodyOf(f)));
-    } catch (err) {
-      setTested({ ok: false, error: errorMessage(err) });
-    } finally {
-      setBusy(false);
-    }
-  };
+  });
   return (
     <Dialog open onOpenChange={(o) => !o && onClose()}>
       <DialogContent
@@ -258,76 +252,79 @@ function ScrapeDialog({ target, onClose }: { target: Scrape | null; onClose: () 
         description="Its samples are tagged job (its name) and instance (the endpoint's host and port), as Prometheus tags them."
       >
         <form
+          ref={opening.ref}
           className="space-y-4"
           onSubmit={(e) => {
             e.preventDefault();
-            if (ok) void save();
+            if (ok) save();
           }}
         >
-          <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
-            <TextField
-              label="Name"
-              value={f.name}
-              readOnly={target !== null}
-              onChange={(e) => set({ name: e.target.value })}
-              placeholder="node"
-              hint={f.name && !validName ? "Letters, digits, - _ and . only" : undefined}
-            />
-            <React.Suspense fallback={<ReadBy value={f.on} onChange={(v) => set({ on: v })} machines={[]} />}>
-              <ReadByMachines value={f.on} onChange={(v) => set({ on: v })} />
-            </React.Suspense>
-          </div>
-          <TextField
-            label="Endpoint"
-            value={f.url}
-            onChange={(e) => set({ url: e.target.value })}
-            placeholder="http://127.0.0.1:9100/metrics"
-            hint={f.url && !validUrl ? "An http:// or https:// URL" : f.on === EVERY ? "Each machine reads its own: 127.0.0.1 is each one's." : undefined}
-            spellCheck={false}
-          />
-          <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
-            <TextField label="Every (seconds)" inputMode="numeric" value={f.every} onChange={(e) => set({ every: e.target.value })} />
-            <TextField
-              label="Timeout (seconds)"
-              inputMode="numeric"
-              value={f.timeout}
-              onChange={(e) => set({ timeout: e.target.value })}
-              hint={!timesOk ? "1 at the least, and no longer than the interval" : undefined}
-            />
-          </div>
-          <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
-            <TextField label="Tags" value={f.tags} onChange={(e) => set({ tags: e.target.value })} placeholder="env:prod" hint="Given to every sample." spellCheck={false} />
-            <TextField
-              label="Bearer token (optional)"
-              type="password"
-              value={f.bearer}
-              onChange={(e) => set({ bearer: e.target.value })}
-              autoComplete="new-password"
-              hint={target?.bearer ? KEPT : undefined}
-            />
-          </div>
-          {tested && (
-            <div className="field-hint" role="status">
-              {tested.ok ? (
-                <span>
-                  Reads {count(tested.samples ?? 0)} samples of {count(tested.metrics ?? 0)} metrics ({tested.format === "openmetrics" ? "OpenMetrics" : "Prometheus text"}) in{" "}
-                  {count(tested.took_ms ?? 0)} ms
-                  {tested.skipped ? `; ${count(tested.skipped)} lines skipped` : ""}.
-                  {tested.sample && tested.sample.length > 0 && <span className="font-mono"> {tested.sample.slice(0, 4).join(", ")}…</span>}
-                </span>
-              ) : (
-                <span className="text-[#e2c4c6]">{tested.error}</span>
-              )}
+          <HeldFields held={saving && !target}>
+            <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
+              <TextField
+                label="Name"
+                value={f.name}
+                readOnly={target !== null}
+                onChange={(e) => set({ name: e.target.value })}
+                placeholder="node"
+                hint={f.name && !validName ? "Letters, digits, - _ and . only" : undefined}
+              />
+              <React.Suspense fallback={<ReadBy value={f.on} onChange={(v) => set({ on: v })} machines={[]} />}>
+                <ReadByMachines value={f.on} onChange={(v) => set({ on: v })} />
+              </React.Suspense>
             </div>
-          )}
+            <TextField
+              label="Endpoint"
+              value={f.url}
+              onChange={(e) => set({ url: e.target.value })}
+              placeholder="http://127.0.0.1:9100/metrics"
+              hint={f.url && !validUrl ? "An http:// or https:// URL" : f.on === EVERY ? "Each machine reads its own: 127.0.0.1 is each one's." : undefined}
+              spellCheck={false}
+            />
+            <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
+              <TextField label="Every (seconds)" inputMode="numeric" value={f.every} onChange={(e) => set({ every: e.target.value })} />
+              <TextField
+                label="Timeout (seconds)"
+                inputMode="numeric"
+                value={f.timeout}
+                onChange={(e) => set({ timeout: e.target.value })}
+                hint={!timesOk ? "1 at the least, and no longer than the interval" : undefined}
+              />
+            </div>
+            <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
+              <TextField label="Tags" value={f.tags} onChange={(e) => set({ tags: e.target.value })} placeholder="env:prod" hint="Given to every sample." spellCheck={false} />
+              <TextField
+                label="Bearer token (optional)"
+                type="password"
+                value={f.bearer}
+                onChange={(e) => set({ bearer: e.target.value })}
+                autoComplete="new-password"
+                hint={target?.bearer ? KEPT : undefined}
+              />
+            </div>
+            {tested && (
+              <div className="field-hint" role="status">
+                {tested.ok ? (
+                  <span>
+                    Reads {count(tested.samples ?? 0)} samples of {count(tested.metrics ?? 0)} metrics ({tested.format === "openmetrics" ? "OpenMetrics" : "Prometheus text"}) in{" "}
+                    {count(tested.took_ms ?? 0)} ms
+                    {tested.skipped ? `; ${count(tested.skipped)} lines skipped` : ""}.
+                    {tested.sample && tested.sample.length > 0 && <span className="font-mono"> {tested.sample.slice(0, 4).join(", ")}…</span>}
+                  </span>
+                ) : (
+                  <span className="text-[#e2c4c6]">{tested.error}</span>
+                )}
+              </div>
+            )}
+          </HeldFields>
           <div className="flex justify-end gap-2">
             <Button variant="ghost" onClick={onClose}>
               Cancel
             </Button>
-            <Button variant="ghost" disabled={!ok || busy} onClick={() => void test()}>
+            <Button variant="ghost" disabled={!ok} pending={testing} onClick={test}>
               Test
             </Button>
-            <Button type="submit" disabled={!ok || busy}>
+            <Button type="submit" disabled={!ok} pending={saving}>
               {target ? "Save" : "Add"}
             </Button>
           </div>

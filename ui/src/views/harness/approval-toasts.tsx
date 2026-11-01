@@ -11,20 +11,19 @@
 import * as React from "react";
 import "./approval-toasts.css";
 import { ArrowUpRight, X } from "lucide-react";
-import { clientId, harnessApi, type AgentInfo } from "@/api/harness";
+import { harnessApi, type AgentInfo } from "@/api/harness";
 import { plansApi } from "@/api/plans";
 import { Button } from "@/components/ui/button";
 import { toast } from "@/components/ui/toast";
 import { Link, useLocation, useNavigate } from "@/lib/router";
 import { errorMessage, useMediaQuery } from "@/lib/hooks";
-import { Tries } from "@/lib/tries";
 import { cardsOf, heldWords, type Card } from "./cards";
 import { agentLabel } from "./derive";
 import { useClock } from "./dom";
 import { machineName } from "./parts";
 import { pauseLine } from "./pause";
 import { getNoneWaiting, getWaiting, subscribeWaiting } from "./waiting";
-import { answer, useAnswered } from "./answered";
+import { answer, dealWith, resumeHeld, tried, tryKey, useAnswered } from "./answered";
 import { isMarked, markNotices, useMarks } from "./notices";
 import { swipeAway } from "./swipe-away";
 
@@ -63,13 +62,13 @@ function asks(ap: NonNullable<Card["ap"]>): React.ReactNode {
 }
 
 /** A card's frame: its agent and where it runs (and how many more it asks), what it says, what to do about it, and × to put it away. */
-function Shell({ card, line, busy, children }: { card: Card; line?: React.ReactNode; busy?: boolean; children?: React.ReactNode }) {
+function Shell({ card, line, children }: { card: Card; line?: React.ReactNode; children?: React.ReactNode }) {
   const { a, more } = card;
   const label = agentLabel(a);
   // A request puts away all its agent asks now; the rest, this one.
   const away = () => putAway(card.kind === "request" ? a.approvals.map((p) => p.id) : [card.key], a.id);
   return (
-    <li className="toast rq" data-kind={card.kind} aria-busy={busy || undefined} {...swipeAway<HTMLLIElement>(away)}>
+    <li className="toast rq" data-kind={card.kind} {...swipeAway<HTMLLIElement>(away)}>
       <span className="rq-dot" aria-hidden="true" />
       <div className="rq-body">
         <p className="rq-head">
@@ -100,7 +99,6 @@ function Open({ a }: { a: AgentInfo }) {
 }
 
 function RequestCard({ card }: { card: Card }) {
-  const [busy, setBusy] = React.useState(false);
   const navigate = useNavigate();
   const { a, ap } = card;
   if (!ap) return null;
@@ -109,15 +107,9 @@ function RequestCard({ card }: { card: Card }) {
   // More to see than the card has room for: a plan to read, an edit's diff.
   const review = plan || ap.tool === "edit";
   // Answered at once (answered.ts): the card goes now, and is back if the answer doesn't go.
-  const decide = (decision: "allow" | "deny") => {
-    setBusy(true);
-    void answer(a.id, { type: "approve", id: ap.id, decision }).catch((e: unknown) => {
-      toast.error(`Couldn't answer ${agentLabel(a)}`, errorMessage(e));
-      setBusy(false);
-    });
-  };
+  const decide = (decision: "allow" | "deny") => void answer(a.id, { type: "approve", id: ap.id, decision }).catch((e: unknown) => toast.error(`Couldn't answer ${agentLabel(a)}`, errorMessage(e)));
   return (
-    <Shell card={card} line={asks(ap)} busy={busy}>
+    <Shell card={card} line={asks(ap)}>
       {ap.tool === "question" ? (
         <Button size="xs" onClick={() => navigate(href)}>
           Answer
@@ -125,11 +117,11 @@ function RequestCard({ card }: { card: Card }) {
       ) : (
         <>
           {/* A plan is approved here; read, rejected or answered in your own words in its agent's Plan tab. */}
-          <Button size="xs" disabled={busy} onClick={() => void decide("allow")}>
+          <Button size="xs" onClick={() => decide("allow")}>
             {plan ? "Approve" : "Allow"}
           </Button>
           {!plan && (
-            <Button size="xs" variant="secondary" disabled={busy} onClick={() => void decide("deny")}>
+            <Button size="xs" variant="secondary" onClick={() => decide("deny")}>
               Deny
             </Button>
           )}
@@ -146,46 +138,29 @@ function RequestCard({ card }: { card: Card }) {
 
 /** Goals it paused for you: a plan they wait on approved here, or reviewed in its agent's Plan tab; else Resume. */
 function HeldCard({ card }: { card: Card }) {
-  const [busy, setBusy] = React.useState(false);
-  // Asked again (its answer lost, or it failed), the same resume (or approval) under its key (CP-T3.2).
-  const [tries] = React.useState(() => new Tries(clientId));
+  // Asked again (its answer lost, or it failed), the same resume (or approval) under its key, its
+  // card's own across its going and coming back (CP-T3.2, answered.ts).
   const { a } = card;
   const held = a.held;
   if (!held) return null;
   const plan = held.plan;
-  // Approved: the card goes now (the server lets go of the pause as it sends the plan's steps).
-  const approve = (id: string) => {
-    setBusy(true);
-    void plansApi.review(id, { answer: "approve", key: tries.keyFor(`approve ${id} ${held.since}`) }).then(
-      () => {
-        tries.done();
-        putAway([card.key], a.id, "done");
-      },
-      (e: unknown) => {
-        toast.error(`Couldn't approve ${agentLabel(a)}'s plan`, errorMessage(e));
-        setBusy(false);
-      },
+  // Approved, or resumed: the card goes now (answered.ts), and is back if it doesn't go (the server
+  // lets go of the pause within moments, as it sends the plan's steps).
+  const approve = (id: string) =>
+    void resumeHeld(a, () => plansApi.review(id, { answer: "approve", key: tryKey(card.key, `approve ${id} ${held.since}`) })).then(
+      () => tried(card.key),
+      (e: unknown) => toast.error(`Couldn't approve ${agentLabel(a)}'s plan`, errorMessage(e)),
     );
-  };
-  // Resumed: the card goes now (the server lets go of the pause within moments).
-  const resume = () => {
-    setBusy(true);
-    void harnessApi.goalAction(a.id, "start", undefined, tries.keyFor(a.id)).then(
-      () => {
-        tries.done();
-        putAway([card.key], a.id, "done");
-      },
-      (e: unknown) => {
-        toast.error(`Couldn't resume ${agentLabel(a)}'s goals`, errorMessage(e));
-        setBusy(false);
-      },
+  const resume = () =>
+    void resumeHeld(a, () => harnessApi.goalAction(a.id, "start", undefined, tryKey(card.key, a.id))).then(
+      () => tried(card.key),
+      (e: unknown) => toast.error(`Couldn't resume ${agentLabel(a)}'s goals`, errorMessage(e)),
     );
-  };
   return (
-    <Shell card={card} line={`Paused its goals${heldWords(held.why) ? `: ${heldWords(held.why)}` : ""}`} busy={busy}>
+    <Shell card={card} line={`Paused its goals${heldWords(held.why) ? `: ${heldWords(held.why)}` : ""}`}>
       {plan ? (
         <>
-          <Button size="xs" disabled={busy} onClick={() => approve(plan)}>
+          <Button size="xs" onClick={() => approve(plan)}>
             Approve
           </Button>
           <Link to={`/agents/${a.id}?tab=plan`} className="rq-open">
@@ -194,7 +169,7 @@ function HeldCard({ card }: { card: Card }) {
         </>
       ) : (
         <>
-          <Button size="xs" disabled={busy} onClick={resume}>
+          <Button size="xs" onClick={resume}>
             Resume
           </Button>
           <Open a={a} />
@@ -206,22 +181,13 @@ function HeldCard({ card }: { card: Card }) {
 
 /** It stopped by itself: why, and Restart. */
 function StoppedCard({ card }: { card: Card }) {
-  const [busy, setBusy] = React.useState(false);
   const { a } = card;
-  const restart = () => {
-    setBusy(true);
-    void harnessApi.command(a.id, { type: "restart" }).then(
-      () => putAway([card.key], a.id, "done"),
-      (e: unknown) => {
-        toast.error(`Couldn't restart ${agentLabel(a)}`, errorMessage(e));
-        setBusy(false);
-      },
-    );
-  };
+  // Restarted: the card goes now (answered.ts), and is back if the restart doesn't go.
+  const restart = () => void dealWith(card.key, a.id, () => harnessApi.command(a.id, { type: "restart" })).catch((e: unknown) => toast.error(`Couldn't restart ${agentLabel(a)}`, errorMessage(e)));
   const code = a.exit?.code;
   return (
-    <Shell card={card} line={`Stopped by itself: ${a.exit?.error ?? "its harness ended"}${typeof code === "number" ? ` (exit ${code})` : ""}`} busy={busy}>
-      <Button size="xs" disabled={busy} onClick={restart}>
+    <Shell card={card} line={`Stopped by itself: ${a.exit?.error ?? "its harness ended"}${typeof code === "number" ? ` (exit ${code})` : ""}`}>
+      <Button size="xs" onClick={restart}>
         Restart
       </Button>
       <Open a={a} />

@@ -5,7 +5,7 @@
  * System page: a line here says so.
  */
 import * as React from "react";
-import { Check, LoaderCircle, LogOut } from "lucide-react";
+import { Check, LogOut } from "lucide-react";
 import { ApiError, api } from "@/api/client";
 import { Button } from "@/components/ui/button";
 import { Hold } from "@/components/ui/hold";
@@ -15,6 +15,7 @@ import { SettingRow, SettingsGroup, SettingsSearch, SettingsSection, SettingsSec
 import { useMotionPreference } from "@/components/shell/motion";
 import { Link, useLocation } from "@/lib/router";
 import { toast } from "@/components/ui/toast";
+import { useAction } from "@/lib/action";
 import { useAuth } from "@/lib/auth";
 import { usePref } from "@/lib/prefs";
 import { useRes, warm, type Res } from "@/lib/data";
@@ -259,11 +260,7 @@ function GrafanaGroup() {
           });
         }}
       >
-        <SettingRow
-          label="Dashboard link"
-          htmlFor="st-grafana"
-          help="Open your dashboard from Observe › Live, beside kiln's own. Saved in this browser."
-        >
+        <SettingRow label="Dashboard link" htmlFor="st-grafana" help="Open your dashboard from Observe › Live, beside kiln's own. Saved in this browser.">
           <div className="st-control-stack">
             <div className="st-control-line">
               <div className="field st-wide">
@@ -275,7 +272,10 @@ function GrafanaGroup() {
                   value={draft}
                   aria-invalid={!valid || undefined}
                   aria-describedby={!valid || saved ? "st-grafana-feedback" : undefined}
-                  onChange={(e) => { setDraft(e.target.value); setSaved(false); }}
+                  onChange={(e) => {
+                    setDraft(e.target.value);
+                    setSaved(false);
+                  }}
                 />
               </div>
               <Button type="submit" size="xs" variant="secondary" disabled={!valid || trimmed === grafana}>
@@ -284,7 +284,13 @@ function GrafanaGroup() {
             </div>
             {(!valid || saved) && (
               <p id="st-grafana-feedback" className="st-note st-feedback" data-tone={!valid ? "error" : "success"} role="status">
-                {!valid ? "Enter a valid http:// or https:// URL." : <><Check size={13} aria-hidden="true" /> {trimmed ? "Link saved" : "Link removed"}</>}
+                {!valid ? (
+                  "Enter a valid http:// or https:// URL."
+                ) : (
+                  <>
+                    <Check size={13} aria-hidden="true" /> {trimmed ? "Link saved" : "Link removed"}
+                  </>
+                )}
               </p>
             )}
           </div>
@@ -316,52 +322,38 @@ function PasswordGroup() {
   const methods = useRes(methodsRes).data;
   const [pw, setPw] = React.useState("");
   const [again, setAgain] = React.useState("");
-  const [busy, setBusy] = React.useState<"save" | "remove" | null>(null);
   const [removing, setRemoving] = React.useState(false);
   const [problem, setProblem] = React.useState<string | null>(null);
   const isSet = methods.password;
   const tooShort = pw.length > 0 && pw.length < 8;
   const mismatch = again.length > 0 && pw !== again;
+  const failed = (err: unknown) => setProblem(err instanceof ApiError ? err.message : String(err));
 
-  const save = async (e: React.FormEvent) => {
-    e.preventDefault();
-    if (busy || removing || pw.length < 8 || pw !== again) return;
-    setBusy("save");
+  const [save, saving] = useAction(async () => {
     setProblem(null);
-    try {
-      await api.setPassword(pw);
-      setPw("");
-      setAgain("");
-      toast({
-        title: isSet ? "Password changed" : "Password set",
-        description: "Sign in from any device with it.",
-        tone: "info",
-      });
-      invalidate("auth/methods");
-    } catch (err) {
-      setProblem(err instanceof ApiError ? err.message : String(err));
-    } finally {
-      setBusy(null);
-    }
-  };
+    await api.setPassword(pw);
+    setPw("");
+    setAgain("");
+    toast({
+      title: isSet ? "Password changed" : "Password set",
+      description: "Sign in from any device with it.",
+      tone: "info",
+    });
+    invalidate("auth/methods");
+  }, failed);
 
-  const remove = async () => {
-    if (busy) return;
-    setBusy("remove");
+  const [remove, clearing] = useAction(async () => {
     setProblem(null);
-    try {
-      await api.clearPassword();
-      toast({ title: "Password removed", tone: "info" });
-      setPw("");
-      setAgain("");
-      setRemoving(false);
-      invalidate("auth/methods");
-    } catch (err) {
-      setProblem(err instanceof ApiError ? err.message : String(err));
-    } finally {
-      setBusy(null);
-    }
-  };
+    await api.clearPassword();
+    toast({ title: "Password removed", tone: "info" });
+    setPw("");
+    setAgain("");
+    setRemoving(false);
+    invalidate("auth/methods");
+  }, failed);
+  // One change to the password at a time, and either answer empties the fields: they're held as
+  // they are while it's on its way (W21-R15).
+  const busy = saving || clearing;
 
   return (
     <SettingsGroup
@@ -373,7 +365,15 @@ function PasswordGroup() {
       words={PASSWORD_WORDS}
       actions={
         isSet ? (
-          <Button variant="ghost" size="xs" disabled={!!busy} aria-expanded={removing} onClick={() => { setRemoving(!removing); setProblem(null); }}>
+          <Button
+            variant="ghost"
+            size="xs"
+            aria-expanded={removing}
+            onClick={() => {
+              setRemoving(!removing);
+              setProblem(null);
+            }}
+          >
             Remove
           </Button>
         ) : undefined
@@ -386,20 +386,36 @@ function PasswordGroup() {
           tone="danger"
           actions={
             <>
-              <Button size="xs" variant="danger" disabled={!!busy} onClick={() => void remove()}>
-                {busy === "remove" && <LoaderCircle className="animate-spin" aria-hidden="true" />}
-                {busy === "remove" ? "Removing…" : "Remove password"}
+              <Button size="xs" variant="danger" pending={clearing} disabled={saving} onClick={remove}>
+                {clearing ? "Removing…" : "Remove password"}
               </Button>
-              <Button size="xs" variant="ghost" disabled={!!busy} onClick={() => { setRemoving(false); setProblem(null); }}>
+              <Button
+                size="xs"
+                variant="ghost"
+                onClick={() => {
+                  setRemoving(false);
+                  setProblem(null);
+                }}
+              >
                 Cancel
               </Button>
             </>
           }
         >
-          <p>Devices will need the admin token or a <code>kiln login</code> link to sign in.</p>
+          <p>
+            Devices will need the admin token or a <code>kiln login</code> link to sign in.
+          </p>
         </Confirm>
       )}
-      <form className="st-password" onSubmit={save} autoComplete="on" aria-busy={!!busy}>
+      <form
+        className="st-password"
+        onSubmit={(e) => {
+          e.preventDefault();
+          if (!clearing && !removing && pw.length >= 8 && pw === again) save();
+        }}
+        autoComplete="on"
+        aria-busy={busy}
+      >
         <input type="text" name="username" autoComplete="username" value="admin" readOnly tabIndex={-1} aria-hidden="true" className="sr-only" />
         <TextField
           label={isSet ? "New password" : "Password"}
@@ -407,11 +423,18 @@ function PasswordGroup() {
           name="new-password"
           autoComplete="new-password"
           value={pw}
-          disabled={!!busy}
+          disabled={busy}
           aria-invalid={tooShort || undefined}
           aria-describedby="st-password-help"
-          onChange={(e) => { setPw(e.target.value); setProblem(null); }}
-          hint={<span id="st-password-help" data-tone={tooShort ? "error" : undefined}>At least 8 characters</span>}
+          onChange={(e) => {
+            setPw(e.target.value);
+            setProblem(null);
+          }}
+          hint={
+            <span id="st-password-help" data-tone={tooShort ? "error" : undefined}>
+              At least 8 characters
+            </span>
+          }
         />
         <TextField
           label="Confirm password"
@@ -419,16 +442,24 @@ function PasswordGroup() {
           name="new-password-repeat"
           autoComplete="new-password"
           value={again}
-          disabled={!!busy}
+          disabled={busy}
           aria-invalid={mismatch || undefined}
           aria-describedby={mismatch ? "st-password-match" : undefined}
-          onChange={(e) => { setAgain(e.target.value); setProblem(null); }}
-          hint={mismatch ? <span id="st-password-match" data-tone="error">The two passwords differ</span> : undefined}
+          onChange={(e) => {
+            setAgain(e.target.value);
+            setProblem(null);
+          }}
+          hint={
+            mismatch ? (
+              <span id="st-password-match" data-tone="error">
+                The two passwords differ
+              </span>
+            ) : undefined
+          }
         />
         <div className="st-password-actions">
-          <Button type="submit" size="xs" variant="secondary" disabled={!!busy || removing || pw.length < 8 || pw !== again}>
-            {busy === "save" && <LoaderCircle className="animate-spin" aria-hidden="true" />}
-            {busy === "save" ? "Saving…" : isSet ? "Change password" : "Set password"}
+          <Button type="submit" size="xs" variant="secondary" pending={saving} disabled={clearing || removing || pw.length < 8 || pw !== again}>
+            {saving ? "Saving…" : isSet ? "Change password" : "Set password"}
           </Button>
         </div>
       </form>
@@ -443,13 +474,15 @@ function PasswordGroup() {
 
 function SessionGroup() {
   const me = useAuth((s) => (s.kind === "authed" ? s.me : null));
+  // Says it's on its way until the server answers and sign-in shows (W21-R15).
+  const [signOut, signingOut] = useAction(api.logout, "Couldn't sign out");
   return (
     <SettingsGroup
       id="signin.session"
       title="This session"
       words="session sign out logout server version origin"
       actions={
-        <Button variant="ghost" size="xs" onClick={() => void api.logout()}>
+        <Button variant="ghost" size="xs" pending={signingOut} onClick={signOut}>
           <LogOut /> Sign out
         </Button>
       }

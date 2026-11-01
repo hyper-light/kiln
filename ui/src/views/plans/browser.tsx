@@ -15,6 +15,7 @@ import { FacetBox, type Chosen } from "@/components/ui/facet-box";
 import { RowsHold } from "@/components/ui/hold";
 import { Loadable } from "@/components/ui/loading";
 import { FilterBar, SelectField } from "@/components/ui/misc";
+import { useAction } from "@/lib/action";
 import { errorMessage } from "@/lib/hooks";
 import { invalidate, useSuspenseResource } from "@/lib/resource";
 import { Link } from "@/lib/router";
@@ -174,31 +175,26 @@ function Found({
 function Recall({ id, session, draft, onDraft, onSaved }: { id: string; session: string; draft: Draft | null; onDraft: (d: Draft | null) => void; onSaved: (p: Plan) => void }) {
   const p = useSuspenseResource(`plans/${id}`, (s) => plansApi.get(id, s).catch(unlessGone)).data;
   const [mode, setMode] = React.useState<HereMode>("message");
-  const [busy, setBusy] = React.useState(false);
   const [ran, setRan] = React.useState<PlanRan | null>(null);
   const [error, setError] = React.useState<string | null>(null);
   /** The run asked and its key, until it's sent (CP-T3.2). */
   const [tries] = React.useState(() => new Tries(clientId));
+  const [run, running] = useAction(
+    async (plan: Plan, n: number) => {
+      setError(null);
+      setRan(null);
+      const how = n ? mode : "message";
+      // Asked again (its answer lost, or it failed), the same run under its key, never a second.
+      const key = tries.keyFor(JSON.stringify({ plan: plan.id, version: plan.version, session, mode: how }));
+      setRan(await plansApi.run(plan.id, { session }, how, {}, key));
+      tries.done();
+    },
+    (e) => setError(errorMessage(e)),
+  );
   if (p === "gone") return <p className="in-none">This plan is gone.</p>;
   if (draft) return <DraftForm session={session} draft={draft} onDraft={onDraft} onSaved={onSaved} />;
   const titles = p.items.length ? p.items.map((it) => it.title || "Untitled step") : p.steps;
   const n = titles.length;
-  const run = async () => {
-    setBusy(true);
-    setError(null);
-    setRan(null);
-    try {
-      const how = n ? mode : "message";
-      // Asked again (its answer lost, or it failed), the same run under its key, never a second.
-      const key = tries.keyFor(JSON.stringify({ plan: p.id, version: p.version, session, mode: how }));
-      setRan(await plansApi.run(p.id, { session }, how, {}, key));
-      tries.done();
-    } catch (e) {
-      setError(errorMessage(e));
-    } finally {
-      setBusy(false);
-    }
-  };
   // Its overview: the words beside its written steps, or all of them when it has no steps.
   const overview = (p.items.length || !n ? p.body : "").trim();
   return (
@@ -222,8 +218,8 @@ function Recall({ id, session, draft, onDraft, onSaved }: { id: string; session:
       )}
       <div className="plan-actions">
         {p.phase !== "planning" && (
-          <Button size="sm" variant="secondary" disabled={busy} onClick={() => void run()}>
-            {busy ? "Sending…" : "Run here"}
+          <Button size="sm" variant="secondary" pending={running} onClick={() => run(p, n)}>
+            {running ? "Sending…" : "Run here"}
           </Button>
         )}
         <Button size="sm" variant="ghost" onClick={() => onDraft({ id: p.id, title: p.title, body: p.body, items: p.items })}>
@@ -242,22 +238,17 @@ function Recall({ id, session, draft, onDraft, onSaved }: { id: string; session:
 
 /** A plan written or changed here: its title, overview and steps (each with its description, examples, acceptance criteria and testing). */
 function DraftForm({ session, draft, onDraft, onSaved }: { session: string; draft: Draft; onDraft: (d: Draft | null) => void; onSaved: (p: Plan) => void }) {
-  const [busy, setBusy] = React.useState(false);
   const [error, setError] = React.useState<string | null>(null);
   const id = React.useId();
-  const save = async () => {
-    setBusy(true);
-    setError(null);
-    try {
+  const [save, saving] = useAction(
+    async () => {
+      setError(null);
       // Emptied, the title is taken from the plan (its overview, else its first step).
       const body = { title: draft.title.trim(), body: draft.body, items: draft.items };
       onSaved(draft.id ? await plansApi.update(draft.id, body) : await plansApi.create({ ...body, source: { session } }));
-    } catch (e) {
-      setError(errorMessage(e));
-    } finally {
-      setBusy(false);
-    }
-  };
+    },
+    (e) => setError(errorMessage(e)),
+  );
   return (
     <div className="ph">
       <div>
@@ -281,8 +272,8 @@ function DraftForm({ session, draft, onDraft, onSaved }: { session: string; draf
         <PlanItemsEditor items={draft.items} onChange={(items) => onDraft({ ...draft, items })} idPrefix={`pb-${session}`} />
       </div>
       <div className="plan-actions">
-        <Button size="sm" disabled={busy || (!draft.items.length && !draft.body.trim())} onClick={() => void save()}>
-          {busy ? "Saving…" : draft.id ? "Save changes" : "Save plan"}
+        <Button size="sm" disabled={!draft.items.length && !draft.body.trim()} pending={saving} onClick={save}>
+          {saving ? "Saving…" : draft.id ? "Save changes" : "Save plan"}
         </Button>
         <Button size="sm" variant="ghost" onClick={() => onDraft(null)}>
           Cancel

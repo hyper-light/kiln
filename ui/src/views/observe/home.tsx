@@ -3,7 +3,6 @@
  * happened (the newest events), and the store itself: what it keeps, from when, on which machines,
  * and whether every replica holds the same.
  */
-import * as React from "react";
 import { Link } from "@/lib/router";
 import { observeApi, type ObserveStatus } from "@/api/observe";
 import { Button } from "@/components/ui/button";
@@ -11,10 +10,9 @@ import { Hold } from "@/components/ui/hold";
 import { Loadable } from "@/components/ui/loading";
 import { Facts, PageIntro, Panel } from "@/components/ui/misc";
 import { StatusDot } from "@/components/ui/status";
-import { toast } from "@/components/ui/toast";
+import { useAction } from "@/lib/action";
 import { useRes, warm } from "@/lib/data";
 import { formatBytes } from "@/lib/format";
-import { errorMessage } from "@/lib/hooks";
 import { invalidate } from "@/lib/resource";
 import { ObserveNav, StateBadge, monitorsRes, recordsRes, statusRes } from "./parts";
 import { Stream } from "./widgets";
@@ -112,7 +110,12 @@ function agreement(mine: ObserveStatus["verified_hex"], theirs: ObserveStatus["v
 function Store() {
   const res = useRes(statusRes);
   const s = res.data;
-  const [busy, setBusy] = React.useState(false);
+  const [compare, comparing] = useAction(async () => {
+    await observeApi.verify();
+    // Each replica takes its digest as it reaches the entry asked about: a moment.
+    await new Promise((done) => window.setTimeout(done, 2_500));
+    invalidate("observe/status");
+  }, "Couldn't ask the replicas");
   const leaderApplied = s.applied;
   return (
     <section className="mt-10" aria-label="The store">
@@ -121,25 +124,7 @@ function Store() {
         title={`${s.series.toLocaleString()} series · ${formatBytes(s.disk_bytes)} on this machine`}
         description={`Every machine keeps a replica, kept alike through the server's log (Raft): a query is answered where it is asked. ${s.role === "server" ? "This is the server's." : "This is a runner's."}`}
         actions={
-          <Button
-            variant="secondary"
-            size="sm"
-            disabled={busy}
-            onClick={async () => {
-              setBusy(true);
-              try {
-                await observeApi.verify();
-                // Each replica takes its digest as it reaches the entry asked about: a moment.
-                window.setTimeout(() => {
-                  invalidate("observe/status");
-                  setBusy(false);
-                }, 2_500);
-              } catch (e) {
-                toast({ title: "Couldn't ask the replicas", description: errorMessage(e), tone: "failed" });
-                setBusy(false);
-              }
-            }}
-          >
+          <Button variant="secondary" size="sm" pending={comparing} onClick={compare}>
             Compare replicas
           </Button>
         }

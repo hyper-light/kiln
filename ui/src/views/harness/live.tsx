@@ -20,7 +20,9 @@ import { readStreamFrame } from "@/api/frames";
 import { harnessApi, recordingUrl, type Recording, type StreamUp, type ToolCall, type WebrtcDown } from "@/api/harness";
 import type { UnreadFrame } from "@/api/wire";
 import { SelectField } from "@/components/ui/misc";
+import { sendingProps, useAction } from "@/lib/action";
 import { formatBytes } from "@/lib/format";
+import { errorMessage } from "@/lib/hooks";
 import { useSuspenseResource } from "@/lib/resource";
 import { copyLater } from "@/views/terminal/clipboard";
 import { duration } from "./derive";
@@ -910,24 +912,35 @@ export function Live({ stream: first, ev, onClose }: { stream: LiveStream; ev: s
     setEditing("");
     addressEl.current?.focus();
   };
-  const startAgain = async () => {
-    const r = await fetch(`/api/harness/sessions/${encodeURIComponent(stream.session)}/streams`, {
-      method: "POST",
-      headers: { "content-type": "application/json" },
-      body: JSON.stringify({ url: address || stream.url, width: size.current.width || 390, height: size.current.height || 600, profile: stream.profile, engine: stream.engine, device: stream.device }),
-    });
-    if (!r.ok) {
-      setWhy((await r.text()) || "It couldn't start again.");
-      return;
-    }
-    const v = (await r.json()) as { id: string };
-    disconnect();
-    setStream({ ...stream, id: v.id });
-    live.current.stream = { ...stream, id: v.id };
-    setStatus("connecting");
-    setWhy("");
-    connect();
-  };
+  // Start it again says it's on its way (W21-R15); not reaching the server says so where the page was.
+  const [startAgain, startingAgain] = useAction(
+    async () => {
+      const r = await fetch(`/api/harness/sessions/${encodeURIComponent(stream.session)}/streams`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          url: address || stream.url,
+          width: size.current.width || 390,
+          height: size.current.height || 600,
+          profile: stream.profile,
+          engine: stream.engine,
+          device: stream.device,
+        }),
+      });
+      if (!r.ok) {
+        setWhy((await r.text()) || "It couldn't start again.");
+        return;
+      }
+      const v = (await r.json()) as { id: string };
+      disconnect();
+      setStream({ ...stream, id: v.id });
+      live.current.stream = { ...stream, id: v.id };
+      setStatus("connecting");
+      setWhy("");
+      connect();
+    },
+    (e) => setWhy(`It couldn't start again: ${errorMessage(e)}`),
+  );
 
   // The viewer's own field shows while it's typed in, or (on a phone; anywhere, for what a password
   // manager fills) while the page's field has the focus.
@@ -1129,7 +1142,7 @@ export function Live({ stream: first, ev, onClose }: { stream: LiveStream; ev: s
           <div className="lv-over">
             <p>{status === "unsupported" ? why || cantShow() : why || "This live page ended."}</p>
             {status === "ended" && (
-              <button type="button" className="pg-action" onClick={() => void startAgain()}>
+              <button type="button" className="pg-action" {...sendingProps(startingAgain)} onClick={startAgain}>
                 Start it again
               </button>
             )}

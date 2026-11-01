@@ -16,6 +16,7 @@ import type { CdAppDetail, CdAutoRollback, CdCommit, CdDeployment, CdRollbackTar
 import { Button } from "@/components/ui/button";
 import { Confirm } from "@/components/ui/misc";
 import { Segmented } from "@/components/ui/tabs";
+import { sendingProps } from "@/lib/action";
 import { useRes, type Res } from "@/lib/data";
 import { RelTime } from "@/views/shared";
 import { TRIGGER_WORD, shortRev } from "./parts";
@@ -94,13 +95,17 @@ function finds(d: CdDeployment, q: string) {
 export function RollbackPanel({
   res,
   name,
-  busy,
+  pending,
+  held,
   onRollback,
   onCancel,
 }: {
   res: Res<CdRollbackTargets>;
   name: string;
-  busy: boolean;
+  /** A rollback asked for is on its way. */
+  pending: boolean;
+  /** Another change to what it runs is on its way: a rollback waits for it. */
+  held: boolean;
   onRollback: (d: CdDeployment, prune: boolean) => void;
   onCancel: () => void;
 }) {
@@ -120,7 +125,7 @@ export function RollbackPanel({
       label={`Roll back ${name}`}
       actions={
         <>
-          <Button size="xs" onClick={() => chosen && onRollback(chosen, prune)} disabled={busy || !chosen}>
+          <Button size="xs" onClick={() => chosen && onRollback(chosen, prune)} pending={pending} disabled={!chosen || held}>
             <Undo2 aria-hidden="true" /> {chosen ? `Roll back to ${rollbackName(chosen)}` : "Roll back"}
           </Button>
           <Button size="xs" variant="ghost" onClick={onCancel}>
@@ -253,19 +258,21 @@ export function AutoRollbackLine({ a, open, onToggle }: { a: CdAppDetail; open: 
 
 /**
  * Auto-rollback, changed in place: for this app (or following its repository), and for every app
- * of its repository. Each change is made as it is chosen, as the sync policy's switches are.
+ * of its repository. Each change is made as it is chosen, as the sync policy's switches are; what it
+ * comes to is the server's to say, so the choice on its way (`sending`) says so until it has, and
+ * the other waits for it (W21-R15).
  */
 export function AutoRollbackPanel({
   a,
   name,
-  busy,
+  sending,
   onSetApp,
   onSetRepo,
   onClose,
 }: {
   a: CdAppDetail;
   name: string;
-  busy: boolean;
+  sending: "app" | "repo" | null;
   onSetApp: (on: boolean | null, said: string) => void;
   onSetRepo: (repo: string, on: boolean | null, said: string) => void;
   onClose: () => void;
@@ -292,37 +299,41 @@ export function AutoRollbackPanel({
       </p>
       <div className="cd-autorb-field">
         <span className="field-label">This app</span>
-        <Segmented
-          label={`Auto-rollback for ${name}`}
-          value={choiceOf(r.app)}
-          onChange={(c) =>
-            !busy && c !== choiceOf(r.app) && onSetApp(onOf(c), c === "inherit" ? `${name} follows ${app.from} again: auto-rollback ${word(app.on)}.` : `Auto-rollback ${c} for ${name}.`)
-          }
-          options={[
-            { value: "inherit", label: `${app.label} (${word(app.on)})` },
-            { value: "on", label: "On" },
-            { value: "off", label: "Off" },
-          ]}
-        />
-      </div>
-      {repo && r.repo && (
-        <div className="cd-autorb-field">
-          <span className="field-label">Every app of {repo}</span>
+        <fieldset className="cd-autorb-choice" disabled={sending === "repo"} {...sendingProps(sending === "app")}>
           <Segmented
-            label={`Auto-rollback for every app of ${repo}`}
-            value={choiceOf(r.repo_setting)}
+            label={`Auto-rollback for ${name}`}
+            value={choiceOf(r.app)}
             onChange={(c) =>
-              !busy &&
-              c !== choiceOf(r.repo_setting) &&
-              r.repo &&
-              onSetRepo(r.repo, onOf(c), c === "inherit" ? `${repo} no longer says: its apps follow ${fromRepo.from} (${word(fromRepo.on)}).` : `Auto-rollback ${c} for every app of ${repo}.`)
+              !sending && c !== choiceOf(r.app) && onSetApp(onOf(c), c === "inherit" ? `${name} follows ${app.from} again: auto-rollback ${word(app.on)}.` : `Auto-rollback ${c} for ${name}.`)
             }
             options={[
-              { value: "inherit", label: `Not set (${word(fromRepo.on)})` },
+              { value: "inherit", label: `${app.label} (${word(app.on)})` },
               { value: "on", label: "On" },
               { value: "off", label: "Off" },
             ]}
           />
+        </fieldset>
+      </div>
+      {repo && r.repo && (
+        <div className="cd-autorb-field">
+          <span className="field-label">Every app of {repo}</span>
+          <fieldset className="cd-autorb-choice" disabled={sending === "app"} {...sendingProps(sending === "repo")}>
+            <Segmented
+              label={`Auto-rollback for every app of ${repo}`}
+              value={choiceOf(r.repo_setting)}
+              onChange={(c) =>
+                !sending &&
+                c !== choiceOf(r.repo_setting) &&
+                r.repo &&
+                onSetRepo(r.repo, onOf(c), c === "inherit" ? `${repo} no longer says: its apps follow ${fromRepo.from} (${word(fromRepo.on)}).` : `Auto-rollback ${c} for every app of ${repo}.`)
+              }
+              options={[
+                { value: "inherit", label: `Not set (${word(fromRepo.on)})` },
+                { value: "on", label: "On" },
+                { value: "off", label: "Off" },
+              ]}
+            />
+          </fieldset>
           {r.app && <p className="field-hint">{name} says for itself, so its repository's doesn't change it.</p>}
         </div>
       )}

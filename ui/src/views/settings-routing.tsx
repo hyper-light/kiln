@@ -9,6 +9,7 @@ import { ci, type CiRouteExplain, type CiRoutingRule } from "@/api/ci";
 import { Button } from "@/components/ui/button";
 import { Hold } from "@/components/ui/hold";
 import { SettingRow, SettingsGroup } from "@/components/ui/settings";
+import { useAction } from "@/lib/action";
 import { reposRes, useRes } from "@/lib/data";
 import { errorMessage } from "@/lib/hooks";
 import { useSuspenseResource } from "@/lib/resource";
@@ -80,17 +81,17 @@ export function RoutingGroups() {
 
 function ServerRules({ initial, onSaved }: { initial: CiRoutingRule[]; onSaved: () => void }) {
   const [rules, setRules] = React.useState<CiRoutingRule[]>(initial);
-  const [busy, setBusy] = React.useState(false);
   const [problem, setProblem] = React.useState<string | null>(null);
-  const [saved, setSaved] = React.useState(false);
+  // The rules last saved: "Saved." while they're the ones shown, so an edit made while a save was
+  // on its way (the fields stay open meanwhile, W21-R15) isn't said to be saved.
+  const [savedRules, setSavedRules] = React.useState<CiRoutingRule[] | null>(null);
+  const saved = savedRules === rules;
   // What the saved rules do now, as the server warns of it (W20-R03).
   const [warnings, setWarnings] = React.useState<string[]>([]);
   const change = (i: number, f: (r: CiRoutingRule) => CiRoutingRule) => {
-    setSaved(false);
     setRules((rs) => rs.map((r, j) => (j === i ? f(r) : r)));
   };
   const move = (i: number, by: number) => {
-    setSaved(false);
     setRules((rs) => {
       const next = [...rs];
       const [r] = next.splice(i, 1);
@@ -98,20 +99,16 @@ function ServerRules({ initial, onSaved }: { initial: CiRoutingRule[]; onSaved: 
       return next;
     });
   };
-  const save = async () => {
-    setBusy(true);
-    setProblem(null);
-    try {
+  const [save, saving] = useAction(
+    async () => {
+      setProblem(null);
       const r = await ci.setRoutingRules("server", rules);
       setWarnings((r.diagnostics ?? []).map((d) => d.message));
-      setSaved(true);
+      setSavedRules(rules);
       onSaved();
-    } catch (e) {
-      setProblem(errorMessage(e));
-    } finally {
-      setBusy(false);
-    }
-  };
+    },
+    (e) => setProblem(errorMessage(e)),
+  );
   return (
     <SettingsGroup
       id="ci.routing.server"
@@ -119,15 +116,7 @@ function ServerRules({ initial, onSaved }: { initial: CiRoutingRule[]; onSaved: 
       about="Tried before the defaults, after a repository's and its organization's. Each field takes a comma-separated list; requirements take one a line."
       words="server rules edit add remove order"
       actions={
-        <Button
-          size="xs"
-          variant="secondary"
-          disabled={busy}
-          onClick={() => {
-            setSaved(false);
-            setRules((rs) => [...rs, { match: { labels: [] }, require: [] }]);
-          }}
-        >
+        <Button size="xs" variant="secondary" onClick={() => setRules((rs) => [...rs, { match: { labels: [] }, require: [] }])}>
           Add a rule
         </Button>
       }
@@ -136,7 +125,7 @@ function ServerRules({ initial, onSaved }: { initial: CiRoutingRule[]; onSaved: 
       <ol className="st-list" aria-label="The server's rules">
         {rules.map((r, i) => (
           <li key={i}>
-            <fieldset className="st-fields" disabled={busy} aria-label={`Rule ${i + 1}`}>
+            <fieldset className="st-fields" aria-label={`Rule ${i + 1}`}>
               <RuleField label="Labels" placeholder="gpu" value={(r.match?.labels ?? []).join(", ")} onChange={(v) => change(i, (x) => ({ ...x, match: { ...x.match, labels: list(v) } }))} />
               <RuleField
                 label="Repositories"
@@ -164,21 +153,13 @@ function ServerRules({ initial, onSaved }: { initial: CiRoutingRule[]; onSaved: 
               </div>
             </fieldset>
             <div className="mt-2 flex flex-wrap gap-1">
-              <Button size="xs" variant="ghost" disabled={busy || i === 0} onClick={() => move(i, -1)}>
+              <Button size="xs" variant="ghost" disabled={i === 0} onClick={() => move(i, -1)}>
                 Earlier
               </Button>
-              <Button size="xs" variant="ghost" disabled={busy || i === rules.length - 1} onClick={() => move(i, 1)}>
+              <Button size="xs" variant="ghost" disabled={i === rules.length - 1} onClick={() => move(i, 1)}>
                 Later
               </Button>
-              <Button
-                size="xs"
-                variant="ghost"
-                disabled={busy}
-                onClick={() => {
-                  setSaved(false);
-                  setRules((rs) => rs.filter((_, j) => j !== i));
-                }}
-              >
+              <Button size="xs" variant="ghost" onClick={() => setRules((rs) => rs.filter((_, j) => j !== i))}>
                 Remove
               </Button>
             </div>
@@ -191,7 +172,7 @@ function ServerRules({ initial, onSaved }: { initial: CiRoutingRule[]; onSaved: 
             Saved.
           </span>
         )}
-        <Button size="xs" variant="secondary" disabled={busy} onClick={() => void save()}>
+        <Button size="xs" variant="secondary" pending={saving} onClick={save}>
           Save the rules
         </Button>
       </div>
@@ -229,9 +210,21 @@ function RoutingTester() {
   const [labels, setLabels] = React.useState("");
   const [repo, setRepo] = React.useState(repos[0]?.name ?? "");
   const [requires, setRequires] = React.useState("");
-  const [busy, setBusy] = React.useState(false);
-  const [problem, setProblem] = React.useState<string | null>(null);
-  const [found, setFound] = React.useState<CiRouteExplain | null>(null);
+  // What an Explain said, with what it was asked of: shown only under that, never under what's been
+  // typed since (W21-R15).
+  const asked = JSON.stringify([labels, repo, requires]);
+  const [said, setSaid] = React.useState<{ asked: string; found?: CiRouteExplain; problem?: string } | null>(null);
+  const [explain, explaining] = useAction(async () => {
+    const at = asked;
+    setSaid(null);
+    try {
+      setSaid({ asked: at, found: await ci.routingExplain({ labels: list(labels), repo: repo || undefined, requires: list(requires, /\n/) }) });
+    } catch (e) {
+      setSaid({ asked: at, problem: errorMessage(e) });
+    }
+  });
+  const problem = said?.asked === asked ? said.problem : undefined;
+  const found = said?.asked === asked ? said.found : undefined;
   return (
     <SettingsGroup
       id="ci.routing.tester"
@@ -241,17 +234,9 @@ function RoutingTester() {
     >
       <form
         noValidate
-        onSubmit={async (e) => {
+        onSubmit={(e) => {
           e.preventDefault();
-          setBusy(true);
-          setProblem(null);
-          try {
-            setFound(await ci.routingExplain({ labels: list(labels), repo: repo || undefined, requires: list(requires, /\n/) }));
-          } catch (e2) {
-            setProblem(errorMessage(e2));
-          } finally {
-            setBusy(false);
-          }
+          explain();
         }}
       >
         <div className="st-fields">
@@ -289,7 +274,7 @@ function RoutingTester() {
           </div>
         </div>
         <div className="mt-3 flex justify-end">
-          <Button type="submit" size="xs" variant="secondary" disabled={busy}>
+          <Button type="submit" size="xs" variant="secondary" pending={explaining}>
             Explain
           </Button>
         </div>

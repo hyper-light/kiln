@@ -16,14 +16,13 @@ import { api } from "@/api/client";
 import { shipApi, type ShipDetail } from "@/api/ship";
 import type { RunnerFinding } from "@/api/types";
 import { Button } from "@/components/ui/button";
-import { toast } from "@/components/ui/toast";
 import { Loadable } from "@/components/ui/loading";
 import { Crumbs } from "@/components/ui/misc";
 import { JourneyStrip, StatusGlyph } from "@/components/ui/status-glyph";
 import { GLYPHS, STAGE_WORD } from "@/components/ui/status-glyph-spec";
+import { useAction } from "@/lib/action";
 import { clockTime } from "@/lib/format";
 import { updatesRes, useRes } from "@/lib/data";
-import { errorMessage } from "@/lib/hooks";
 import { invalidate, useSuspenseResource } from "@/lib/resource";
 import { Link, useParams } from "@/lib/router";
 import { cardsOf } from "./jobs";
@@ -294,32 +293,17 @@ function Runners({ detail }: { detail: ShipDetail }) {
 
 /** One runner: replanted, replanting, didn't replant (with why), or offline; one that didn't is retried, and either looked at, through System's own actions. */
 function Runner({ runner }: { runner: { name: string; state: string; why: string } }) {
-  const [busy, setBusy] = React.useState<"retry" | "diagnose" | null>(null);
   const [said, setSaid] = React.useState<string | null>(null);
   const [found, setFound] = React.useState<RunnerFinding[] | null>(null);
-  const retry = async () => {
-    setBusy("retry");
-    try {
-      await api.upgradeRunner(runner.name);
-      setSaid("Its upgrade started again.");
-      invalidate("ship/");
-      invalidate("updates");
-    } catch (e) {
-      toast({ title: `Couldn't retry ${runner.name}`, description: errorMessage(e), tone: "failed" });
-    } finally {
-      setBusy(null);
-    }
-  };
-  const diagnose = async () => {
-    setBusy("diagnose");
-    try {
-      setFound((await api.diagnoseRunner(runner.name)).findings);
-    } catch (e) {
-      toast({ title: `Couldn't diagnose ${runner.name}`, description: errorMessage(e), tone: "failed" });
-    } finally {
-      setBusy(null);
-    }
-  };
+  const [retry, retrying] = useAction(async () => {
+    await api.upgradeRunner(runner.name);
+    setSaid("Its upgrade started again.");
+    invalidate("ship/");
+    invalidate("updates");
+  }, `Couldn't retry ${runner.name}`);
+  const [diagnose, diagnosing] = useAction(async () => {
+    setFound((await api.diagnoseRunner(runner.name)).findings);
+  }, `Couldn't diagnose ${runner.name}`);
   const state = replantGlyph(runner.state);
   return (
     <li data-state={state}>
@@ -330,11 +314,11 @@ function Runner({ runner }: { runner: { name: string; state: string; why: string
       {runner.state === "failed" || runner.state === "offline" ? (
         <span className="ship-commit__acts">
           {runner.state === "failed" && (
-            <Button size="xs" variant="secondary" disabled={busy !== null} onClick={() => void retry()}>
+            <Button size="xs" variant="secondary" pending={retrying} onClick={retry}>
               Retry
             </Button>
           )}
-          <Button size="xs" variant="secondary" disabled={busy !== null} onClick={() => void diagnose()}>
+          <Button size="xs" variant="secondary" pending={diagnosing} onClick={diagnose}>
             Diagnose
           </Button>
         </span>

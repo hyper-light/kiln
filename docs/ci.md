@@ -127,6 +127,9 @@ These hold for every line written under this spec.
   - static by default, motion only for real state changes, and the motion toggle and
     reduced-motion are always respected;
   - no hidden horizontal scrollers;
+  - a press never waits on the server to show it was taken: what it changes shows at once, or the
+    control pressed says its request is on its way, and the rest of the page stays usable (W21-R15,
+    from the user, 2026-11-01);
   - change only what the task asks for, and mention any other improvement instead of making it.
   - Every UI acceptance criterion is checked in Chromium **and** WebKit (the Playwright image
     `mcr.microsoft.com/playwright:v1.64.1-noble`), desktop and phone widths.
@@ -6840,6 +6843,21 @@ image builder), review, environments, settings, insights (G-06, G-08, G-09, G-11
 - **W21-R14 Style.** Only standard controls (selects, the facet box, checkboxes, the composer
   field, pill buttons); no modals, sheets or floating panels; changes are scoped to what each
   workstream asks for.
+- **W21-R15 Presses answer at once** (from the user, 2026-11-01). Nothing a person presses waits
+  on the server to show it was taken.
+  - What a press changes shows at once where that's known (a toggle, a rename, an answer, a
+    resume), and goes back, saying why, if its request fails.
+  - Where it isn't known (a run, a sync, a test), the control pressed says its request is on its
+    way: `useAction` (`ui/src/lib/action.ts`) and Button's `pending` draw the loader's prism rule
+    at its foot after a moment, and a press meanwhile does nothing. Nothing else on the page waits:
+    fields, other controls and other rows stay usable, and a dialog's Cancel still closes it.
+  - A press that opens something goes there at once when it can know where: an agent started from
+    Mission control opens as it starts (its page saying so until it has), the page made to know its
+    id first (`POST /api/harness/sessions` takes the ids to start under). A form that makes
+    something keeps its fields until the answer, to say there what went wrong.
+  - A request never runs in an async transition (`startTransition(async …)`, `useOptimistic`):
+    React holds every transition begun while one is under way until it settles, so each tab,
+    filter and list switched in one would wait on the server too.
 
 **Acceptance criteria**
 

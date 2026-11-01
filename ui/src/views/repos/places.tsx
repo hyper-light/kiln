@@ -12,6 +12,7 @@ import { Button } from "@/components/ui/button";
 import { Confirm, SelectField, TextField } from "@/components/ui/misc";
 import { StatusDot } from "@/components/ui/status";
 import { Tip } from "@/components/ui/tooltip";
+import { sendingProps, useAction, useActions } from "@/lib/action";
 import { shortSha } from "@/lib/format";
 import { errorMessage } from "@/lib/hooks";
 import { RelTime } from "../shared";
@@ -139,14 +140,29 @@ export function PlaceList({
               </p>
             )}
             {copy?.status?.error && <p className="repo-error">{copy.status.error}</p>}
-            {what === "move" && <MoveForm entry={entry} place={p} machines={machines} onCancel={() => setOpen(null)} onStarted={(t) => {
+            {what === "move" && (
+              <MoveForm
+                entry={entry}
+                place={p}
+                machines={machines}
+                onCancel={() => setOpen(null)}
+                onStarted={(t) => {
                   setOpen(null);
                   onStarted(t);
-                }} />}
-            {what === "remove" && <RemoveForm entry={entry} place={p} onCancel={() => setOpen(null)} onStarted={(t) => {
+                }}
+              />
+            )}
+            {what === "remove" && (
+              <RemoveForm
+                entry={entry}
+                place={p}
+                onCancel={() => setOpen(null)}
+                onStarted={(t) => {
                   setOpen(null);
                   onStarted(t);
-                }} />}
+                }}
+              />
+            )}
           </li>
         );
       })}
@@ -164,23 +180,21 @@ function MoveForm({ entry, place, machines, onCancel, onStarted }: { entry: Entr
   const [to, setTo] = React.useState(eligible[0]?.name ?? "");
   const [path, setPath] = React.useState(() => defaultPath(entry, machines, place));
   const [del, setDel] = React.useState(false);
-  const [busy, setBusy] = React.useState(false);
   const [error, setError] = React.useState<string | null>(null);
   const resolved = resolvedOn(path, machines.get(to));
   const changed = place.git?.changed ?? 0;
   const ahead = place.git?.ahead ?? 0;
 
-  const submit = async (e: React.FormEvent) => {
-    e.preventDefault();
-    setBusy(true);
-    setError(null);
-    try {
+  const [move, moving] = useAction(
+    async () => {
+      setError(null);
       onStarted(await api.placesStart("move", { key: entry.key, from: { kind: "machine", machine: place.machine, path: place.path }, to: [{ machine: to, path: path.trim() }], delete: del }));
-    } catch (err) {
-      setError(errorMessage(err));
-    } finally {
-      setBusy(false);
-    }
+    },
+    (err) => setError(errorMessage(err)),
+  );
+  const submit = (e: React.FormEvent) => {
+    e.preventDefault();
+    move();
   };
 
   if (eligible.length === 0) {
@@ -201,15 +215,18 @@ function MoveForm({ entry, place, machines, onCancel, onStarted }: { entry: Entr
   return (
     <form className="confirm repo-inline repo-move" onSubmit={submit} aria-label={`Move ${entry.name} from ${place.machine}`}>
       <p>
-        {git ? "Its commits go as a git bundle and its working tree through sync, uncommitted work included" : "Its files go through sync"}, over kiln's own links. Once the new folder is in step, the one on {place.machine}{" "}
-        {entry.synced && place.copy ? "stops syncing" : "is let go"}.
+        {git ? "Its commits go as a git bundle and its working tree through sync, uncommitted work included" : "Its files go through sync"}, over kiln's own links. Once the new folder is in step, the
+        one on {place.machine} {entry.synced && place.copy ? "stops syncing" : "is let go"}.
       </p>
       <div className="repo-move-fields">
         <SelectField
           label="To"
           value={to}
           onChange={setTo}
-          options={eligible.map((m) => ({ value: m.name, label: `${m.name} · ${osLabel(m.os)} ${m.arch}${m.name === place.machine ? " · another folder here" : has(m.name) ? " · has it already" : ""}` }))}
+          options={eligible.map((m) => ({
+            value: m.name,
+            label: `${m.name} · ${osLabel(m.os)} ${m.arch}${m.name === place.machine ? " · another folder here" : has(m.name) ? " · has it already" : ""}`,
+          }))}
         />
         <TextField label="Folder" value={path} onChange={(e) => setPath(e.target.value)} spellCheck={false} hint={resolved ? `→ ${resolved}` : "A whole path, or ~/… on that machine"} />
       </div>
@@ -218,17 +235,14 @@ function MoveForm({ entry, place, machines, onCancel, onStarted }: { entry: Entr
         <span>
           Delete the old folder on {place.machine} once it has moved
           {(changed > 0 || ahead > 0) && (
-            <em>
-              {" "}
-              (it has {[changed > 0 && `${changed} changes not committed`, ahead > 0 && `${ahead} commits not pushed`].filter(Boolean).join(" and ")}: they move too)
-            </em>
+            <em> (it has {[changed > 0 && `${changed} changes not committed`, ahead > 0 && `${ahead} commits not pushed`].filter(Boolean).join(" and ")}: they move too)</em>
           )}
         </span>
       </label>
       {error && <p className="repo-error">{error}</p>}
       <div className="repo-actions">
-        <Button type="submit" size="xs" disabled={busy || !to || !path.trim()}>
-          {busy ? "Starting…" : `Move to ${to}`}
+        <Button type="submit" size="xs" disabled={!to || !path.trim()} pending={moving}>
+          {moving ? "Starting…" : `Move to ${to}`}
         </Button>
         <Button type="button" size="xs" variant="ghost" onClick={onCancel}>
           Cancel
@@ -242,21 +256,16 @@ function MoveForm({ entry, place, machines, onCancel, onStarted }: { entry: Entr
 function RemoveForm({ entry, place, onCancel, onStarted }: { entry: Entry; place: Place; onCancel: () => void; onStarted: (t: PlaceTask[]) => void }) {
   const found = place.kind === "found";
   const [del, setDel] = React.useState(found);
-  const [busy, setBusy] = React.useState(false);
   const [error, setError] = React.useState<string | null>(null);
   const changed = place.git?.changed ?? 0;
   const ahead = place.git?.ahead ?? 0;
-  const go = async () => {
-    setBusy(true);
-    setError(null);
-    try {
+  const [go, going] = useAction(
+    async () => {
+      setError(null);
       onStarted(await api.placesStart("remove", { key: entry.key, from: { kind: "machine", machine: place.machine, path: place.path }, delete: del }));
-    } catch (err) {
-      setError(errorMessage(err));
-    } finally {
-      setBusy(false);
-    }
-  };
+    },
+    (err) => setError(errorMessage(err)),
+  );
   const keep = place.kind === "copy" ? "Stop syncing it here" : "Forget kiln's clone";
   return (
     <Confirm
@@ -265,8 +274,8 @@ function RemoveForm({ entry, place, onCancel, onStarted }: { entry: Entry; place
       className="repo-inline"
       actions={
         <>
-          <Button size="xs" variant="danger" disabled={busy} onClick={() => void go()}>
-            {busy ? "Starting…" : del ? `Delete it on ${place.machine}` : keep}
+          <Button size="xs" variant="danger" pending={going} onClick={go}>
+            {going ? "Starting…" : del ? `Delete it on ${place.machine}` : keep}
           </Button>
           <Button size="xs" variant="ghost" onClick={onCancel}>
             Keep it
@@ -281,10 +290,7 @@ function RemoveForm({ entry, place, onCancel, onStarted }: { entry: Entry; place
             ? `${place.machine} stops syncing ${entry.name}. Its files stay unless you delete them.`
             : `kiln stops keeping its clone on ${place.machine}. Its files stay unless you delete them.`}
         {(changed > 0 || ahead > 0) && (
-          <strong className="repo-warn">
-            {" "}
-            It has {[changed > 0 && `${changed} changes not committed`, ahead > 0 && `${ahead} commits not pushed`].filter(Boolean).join(" and ")}.
-          </strong>
+          <strong className="repo-warn"> It has {[changed > 0 && `${changed} changes not committed`, ahead > 0 && `${ahead} commits not pushed`].filter(Boolean).join(" and ")}.</strong>
         )}
       </p>
       {!found && (
@@ -310,16 +316,26 @@ const TASK_DOT: Record<string, string> = { done: "succeeded", failed: "failed", 
 /** The tasks under way and done lately for a repository, newest first. */
 export function TaskList({ tasks, machines, onChange }: { tasks: PlaceTask[]; machines: Map<string, PlaceMachine>; onChange: () => void }) {
   const [error, setError] = React.useState<string | null>(null);
-  const shown = [...tasks.filter(isActive), ...tasks.filter((t) => !isActive(t)).slice(0, 4)];
-  if (shown.length === 0) return null;
-  const act = async (f: () => Promise<unknown>) => {
-    setError(null);
-    try {
-      await f();
+  // Dismissed here at once (W21-R15), back if that doesn't go.
+  const [dismissed, setDismissed] = React.useState<ReadonlySet<string>>(() => new Set());
+  const [retry, retrying] = useActions(
+    async (id: string) => {
+      setError(null);
+      await api.placesRetry(id);
       onChange();
-    } catch (e) {
+    },
+    (e) => setError(errorMessage(e)),
+  );
+  const left = tasks.filter((t) => !dismissed.has(t.id));
+  const shown = [...left.filter(isActive), ...left.filter((t) => !isActive(t)).slice(0, 4)];
+  if (shown.length === 0) return null;
+  const dismiss = (id: string) => {
+    setError(null);
+    setDismissed((d) => new Set(d).add(id));
+    api.placesDismiss(id).then(onChange, (e: unknown) => {
+      setDismissed((d) => new Set([...d].filter((x) => x !== id)));
       setError(errorMessage(e));
-    }
+    });
   };
   return (
     <div className="repo-tasks">
@@ -338,14 +354,14 @@ export function TaskList({ tasks, machines, onChange }: { tasks: PlaceTask[]; ma
               <span className="repo-place-acts">
                 {t.state === "failed" && (
                   <Tip content="Start it again">
-                    <button type="button" className="icon-btn" data-variant="bare" data-size="sm" aria-label="Start it again" onClick={() => void act(() => api.placesRetry(t.id))}>
+                    <button type="button" className="icon-btn" data-variant="bare" data-size="sm" aria-label="Start it again" {...sendingProps(retrying(t.id))} onClick={() => retry(t.id)}>
                       <RotateCcw size={14} />
                     </button>
                   </Tip>
                 )}
                 {!isActive(t) && (
                   <Tip content="Dismiss">
-                    <button type="button" className="icon-btn" data-variant="bare" data-size="sm" aria-label="Dismiss" onClick={() => void act(() => api.placesDismiss(t.id))}>
+                    <button type="button" className="icon-btn" data-variant="bare" data-size="sm" aria-label="Dismiss" onClick={() => dismiss(t.id)}>
                       <X size={14} />
                     </button>
                   </Tip>

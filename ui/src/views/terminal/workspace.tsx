@@ -90,12 +90,19 @@ export default function TerminalWorkspace({ visible }: { visible: boolean }) {
   const [tabs, setTabs] = React.useState<Tab[]>([]);
   /** The tab whose name is being edited where it shows. */
   const [renaming, setRenaming] = React.useState<string | null>(null);
-  /** Names a tab's session ("" gives it back its window title), on the server for every viewer. */
+  /**
+   * Names a tab's session ("" gives it back its window title), on the server for every viewer: shown
+   * at once, and as it was, saying why, if it doesn't go (unless it was named again since) (W21-R15).
+   */
   const renameTab = (tabId: string, name: string) => {
     const tab = tabs.find((x) => x.id === tabId);
     if (!tab?.sessionId) return;
-    setTabs((cur) => cur.map((x) => (x.id === tabId ? { ...x, name: name || undefined, title: tabTitle(x.target, name || x.wtitle || "") } : x)));
-    api.renameTerminalSession(tab.sessionId, name).catch((e: unknown) => toast.error("Couldn't rename the terminal", errorMessage(e)));
+    const named = (x: Tab, n: string | undefined) => ({ ...x, name: n, title: tabTitle(x.target, n || x.wtitle || "") });
+    setTabs((cur) => cur.map((x) => (x.id === tabId ? named(x, name || undefined) : x)));
+    api.renameTerminalSession(tab.sessionId, name).catch((e: unknown) => {
+      toast.error("Couldn't rename the terminal", errorMessage(e));
+      setTabs((cur) => cur.map((x) => (x.id === tabId && x.name === (name || undefined) ? named(x, tab.name) : x)));
+    });
   };
   const [activeId, setActiveId] = React.useState<string | null>(null);
   const [kbVisible, setKbVisible] = usePref("kiln.term.keyboard", isTouchDevice());
@@ -258,11 +265,20 @@ export default function TerminalWorkspace({ visible }: { visible: boolean }) {
     },
     [tabs, dropTab],
   );
+  /** Its tab goes at once; one whose end the server didn't hear (its shell still runs) is back where it was, saying why (W21-R15). */
   const endSession = (id: string) => {
-    const tab = tabs.find((x) => x.id === id);
-    if (tab?.sessionId) void api.closeTerminalSession(tab.sessionId).catch(() => undefined);
+    const at = tabs.findIndex((x) => x.id === id);
+    const tab = tabs[at];
     setEnding(null);
     dropTab(id);
+    const sid = tab?.sessionId;
+    if (!tab || !sid) return;
+    api.closeTerminalSession(sid).catch((e: unknown) => {
+      toast.error("Couldn't end the session", errorMessage(e));
+      dropped.current.delete(sid);
+      setTabs((cur) => (cur.some((t) => t.sessionId === sid) ? cur : [...cur.slice(0, at), { ...tab, state: { kind: "connecting" } }, ...cur.slice(at)]));
+      setActiveId((a) => a ?? tab.id);
+    });
   };
 
   // Deep links: ?open=<target> starts a session (command palette, runner cards); ?session=<id>

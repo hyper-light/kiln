@@ -7,8 +7,8 @@ import { Button } from "@/components/ui/button";
 import { Confirm, Panel, SelectField, TextField } from "@/components/ui/misc";
 import { Link } from "@/lib/router";
 import { toast } from "@/components/ui/toast";
+import { useAction, useActions } from "@/lib/action";
 import { formatBytes, formatDuration } from "@/lib/format";
-import { errorMessage } from "@/lib/hooks";
 import { invalidate, preload, useSuspenseResource } from "@/lib/resource";
 import { cn } from "@/lib/utils";
 import { DataFlow } from "./flow";
@@ -78,33 +78,29 @@ export function CiRunActions({ detail, jobs }: { detail: CiRunDetail; jobs: stri
   const [keepFailed, setKeepFailed] = React.useState(false);
   const [fresh, setFresh] = React.useState(false);
   const [confirm, setConfirm] = React.useState(false);
-  const [busy, setBusy] = React.useState(false);
   const debugId = React.useId();
   const keepId = React.useId();
   const freshId = React.useId();
 
-  const go = async (fn: () => Promise<unknown>, ok: string) => {
-    setBusy(true);
+  // Cancel and Rerun each say their own request is on its way (W21-R15).
+  const [go, going] = useActions(async (_: string, fn: () => Promise<unknown>, ok: string) => {
     try {
       await fn();
       toast({ title: ok, tone: "info" });
       invalidate(`run/${run.id}`);
       invalidate(`ci-run/${run.id}`);
       invalidate("runs/");
-    } catch (e) {
-      toast.error("Action failed", errorMessage(e));
     } finally {
-      setBusy(false);
       setConfirm(false);
     }
-  };
+  }, "Action failed");
 
   if (active) {
     return (
       <div className="flex flex-col items-start gap-3 md:items-end">
         <RunApproval detail={detail} />
         <DeployReview detail={detail} />
-        <Button variant="danger" disabled={busy} aria-expanded={confirm} onClick={() => setConfirm(!confirm)}>
+        <Button variant="danger" aria-expanded={confirm} onClick={() => setConfirm(!confirm)}>
           <Square /> Cancel
         </Button>
         {confirm && (
@@ -113,7 +109,7 @@ export function CiRunActions({ detail, jobs }: { detail: CiRunDetail; jobs: stri
             tone="danger"
             actions={
               <>
-                <Button size="xs" variant="danger" disabled={busy} onClick={() => go(() => ci.cancel(run.id), "Run cancelled")}>
+                <Button size="xs" variant="danger" pending={going("cancel")} onClick={() => go("cancel", () => ci.cancel(run.id), "Run cancelled")}>
                   Cancel run
                 </Button>
                 <Button size="xs" variant="ghost" onClick={() => setConfirm(false)}>
@@ -149,42 +145,42 @@ export function CiRunActions({ detail, jobs }: { detail: CiRunDetail; jobs: stri
           Fresh actions
         </label>
       )}
-      <Button variant="primary" disabled={busy} onClick={() => go(() => ci.rerun(run.id, m, job, debug, keepFailed, fresh), `Attempt ${run.attempt + 1} started`)}>
+      <Button variant="primary" pending={going("rerun")} onClick={() => go("rerun", () => ci.rerun(run.id, m, job, debug, keepFailed, fresh), `Attempt ${run.attempt + 1} started`)}>
         <RotateCcw /> Rerun
       </Button>
     </div>
   );
 }
 
+/** An approval's two answers. */
+type Decision = "approved" | "rejected";
+
 /** An outside contributor's run, waiting for a maintainer before any job starts: approved or
  * rejected in place, in one step (W18-R06). */
 function RunApproval({ detail }: { detail: CiRunDetail }) {
   const { run } = detail;
-  const [busy, setBusy] = React.useState(false);
+  // Approve and Reject are one decision (W21-R15): the one pressed says it's on its way, the other
+  // held until it's back.
+  const [sent, setSent] = React.useState<Decision | null>(null);
+  const [decide, deciding] = useAction(async (state: Decision) => {
+    setSent(state);
+    await ci.approve(run.id, [], state, "");
+    toast({ title: state === "approved" ? "Approved: the run starts" : "Rejected: the run is cancelled", tone: "info" });
+    invalidate(`run/${run.id}`);
+    invalidate(`ci-run/${run.id}`);
+  }, "Approval failed");
+  const hold = (state: Decision) => ({ pending: deciding && sent === state, disabled: deciding && sent !== state });
   if (run.approval !== "required") return null;
-  const decide = async (state: "approved" | "rejected") => {
-    setBusy(true);
-    try {
-      await ci.approve(run.id, [], state, "");
-      toast({ title: state === "approved" ? "Approved: the run starts" : "Rejected: the run is cancelled", tone: "info" });
-      invalidate(`run/${run.id}`);
-      invalidate(`ci-run/${run.id}`);
-    } catch (e) {
-      toast.error("Approval failed", errorMessage(e));
-    } finally {
-      setBusy(false);
-    }
-  };
   return (
     <Confirm
       label="Approve the run"
       className="w-full md:w-96"
       actions={
         <>
-          <Button size="xs" variant="primary" disabled={busy} onClick={() => decide("approved")}>
+          <Button size="xs" variant="primary" {...hold("approved")} onClick={() => decide("approved")}>
             Approve and run
           </Button>
-          <Button size="xs" variant="ghost" disabled={busy} onClick={() => decide("rejected")}>
+          <Button size="xs" variant="ghost" {...hold("rejected")} onClick={() => decide("rejected")}>
             Reject
           </Button>
         </>
@@ -201,21 +197,17 @@ function DeployReview({ detail }: { detail: CiRunDetail }) {
   const { run } = detail;
   const envs = [...new Set(detail.legs.map((l) => reviewOf(l.wait_reason)).filter((e): e is string => !!e))];
   const [comment, setComment] = React.useState("");
-  const [busy, setBusy] = React.useState(false);
+  // One decision, as the run's approval is.
+  const [sent, setSent] = React.useState<Decision | null>(null);
+  const [decide, deciding] = useAction(async (state: Decision) => {
+    setSent(state);
+    await ci.approve(run.id, envs, state, comment);
+    toast({ title: state === "approved" ? `Approved: deploying to ${envs.join(", ")}` : "Deployment rejected", tone: "info" });
+    invalidate(`run/${run.id}`);
+    invalidate(`ci-run/${run.id}`);
+  }, "Review failed");
+  const hold = (state: Decision) => ({ pending: deciding && sent === state, disabled: deciding && sent !== state });
   if (envs.length === 0) return null;
-  const decide = async (state: "approved" | "rejected") => {
-    setBusy(true);
-    try {
-      await ci.approve(run.id, envs, state, comment);
-      toast({ title: state === "approved" ? `Approved: deploying to ${envs.join(", ")}` : "Deployment rejected", tone: "info" });
-      invalidate(`run/${run.id}`);
-      invalidate(`ci-run/${run.id}`);
-    } catch (e) {
-      toast.error("Review failed", errorMessage(e));
-    } finally {
-      setBusy(false);
-    }
-  };
   const label = `Review the deployment to ${envs.join(", ")}`;
   return (
     <Confirm
@@ -223,10 +215,10 @@ function DeployReview({ detail }: { detail: CiRunDetail }) {
       className="w-full md:w-96"
       actions={
         <>
-          <Button size="xs" variant="primary" disabled={busy} onClick={() => decide("approved")}>
+          <Button size="xs" variant="primary" {...hold("approved")} onClick={() => decide("approved")}>
             Approve and deploy
           </Button>
-          <Button size="xs" variant="ghost" disabled={busy} onClick={() => decide("rejected")}>
+          <Button size="xs" variant="ghost" {...hold("rejected")} onClick={() => decide("rejected")}>
             Reject
           </Button>
         </>
@@ -616,24 +608,20 @@ const noop = () => {};
 /** A running or kept leg's terminal, and a kept one's time left with Extend and Release (W17-R01, R02). */
 function LegDebug({ runId, legId, running, keptUntil }: { runId: string; legId: string; running: boolean; keptUntil: number | null }) {
   const [open, setOpen] = React.useState(false);
-  const [busy, setBusy] = React.useState(false);
+  // Keep and Release change one leg's time: one at a time (W21-R15), the other held meanwhile.
+  const [sent, setSent] = React.useState<"keep" | "release" | null>(null);
+  const [act, acting] = useAction(async (what: "keep" | "release", fn: () => Promise<unknown>, ok: string) => {
+    setSent(what);
+    await fn();
+    toast({ title: ok, tone: "info" });
+    invalidate(`run/${runId}`);
+    invalidate(`ci-run/${runId}`);
+  }, "Action failed");
+  const hold = (what: "keep" | "release") => ({ pending: acting && sent === what, disabled: acting && sent !== what });
   const [state, setState] = React.useState<string | null>(null);
   const kept = keptUntil !== null && keptUntil * 1000 > Date.now();
   if (!running && !kept) return null;
   const minutes = kept ? Math.max(1, Math.round((keptUntil * 1000 - Date.now()) / 60000)) : 0;
-  const act = async (fn: () => Promise<unknown>, ok: string) => {
-    setBusy(true);
-    try {
-      await fn();
-      toast({ title: ok, tone: "info" });
-      invalidate(`run/${runId}`);
-      invalidate(`ci-run/${runId}`);
-    } catch (e) {
-      toast.error("Action failed", errorMessage(e));
-    } finally {
-      setBusy(false);
-    }
-  };
   return (
     <div className="border-b border-[#28313d]">
       <div className="flex flex-wrap items-center gap-2 px-5 py-3">
@@ -643,10 +631,10 @@ function LegDebug({ runId, legId, running, keptUntil }: { runId: string; legId: 
         </Button>
         {kept && (
           <>
-            <Button size="xs" variant="ghost" disabled={busy} onClick={() => act(() => ci.keep(legId, 30), "Kept 30 more minutes")}>
+            <Button size="xs" variant="ghost" {...hold("keep")} onClick={() => act("keep", () => ci.keep(legId, 30), "Kept 30 more minutes")}>
               Keep 30 more minutes
             </Button>
-            <Button size="xs" variant="ghost" disabled={busy} onClick={() => act(() => ci.release(legId), "Released")}>
+            <Button size="xs" variant="ghost" {...hold("release")} onClick={() => act("release", () => ci.release(legId), "Released")}>
               Release
             </Button>
           </>

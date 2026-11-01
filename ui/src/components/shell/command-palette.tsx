@@ -11,6 +11,7 @@ import { Activity, ArrowUpRight, Bot, Box, CornerDownLeft, Cpu, FolderSync, GitB
 import { api } from "@/api/client";
 import type { Agent, Repo, Run } from "@/api/types";
 import { StatusDot } from "@/components/ui/status";
+import { sendingProps, useAction } from "@/lib/action";
 import { relativeTime, shortSha } from "@/lib/format";
 import { cn } from "@/lib/utils";
 
@@ -110,14 +111,30 @@ function Palette() {
     },
     [navigate],
   );
+  // Sign out stays open, saying it's on its way, until the server answers and sign-in shows (W21-R15).
+  const [signOut, signingOut] = useAction(() => api.logout().finally(() => setPaletteOpen(false)), "Couldn't sign out");
 
   const items: Item[] = React.useMemo(() => {
     const pages: Item[] = [
       { id: "p-overview", group: "Pages", label: "Overview", icon: <LayoutGrid size={15} />, run: () => go("/") },
       { id: "p-runs", group: "Pages", label: "Runs", icon: <Activity size={15} />, run: () => go("/runs") },
       { id: "p-deployments", group: "Pages", label: "Deployments", hint: "sync and health", icon: <Rocket size={15} />, run: () => go("/deployments") },
-      { id: "p-environments", group: "Pages", label: "Environments", hint: "what runs in each, what drifts, what waits to deploy", icon: <Rocket size={15} />, run: () => go("/deployments/environments") },
-      { id: "p-releases", group: "Pages", label: "Releases", hint: "apps across environments: deploy, promote, roll back, approve", icon: <Rocket size={15} />, run: () => go("/deployments/releases") },
+      {
+        id: "p-environments",
+        group: "Pages",
+        label: "Environments",
+        hint: "what runs in each, what drifts, what waits to deploy",
+        icon: <Rocket size={15} />,
+        run: () => go("/deployments/environments"),
+      },
+      {
+        id: "p-releases",
+        group: "Pages",
+        label: "Releases",
+        hint: "apps across environments: deploy, promote, roll back, approve",
+        icon: <Rocket size={15} />,
+        run: () => go("/deployments/releases"),
+      },
       { id: "p-deploy-plans", group: "Pages", label: "Deploy plans", hint: "what a branch, commit or pull request would deploy", icon: <GitBranch size={15} />, run: () => go("/deployments/plans") },
       { id: "p-repos", group: "Pages", label: "Repositories", icon: <GitBranch size={15} />, run: () => go("/repos") },
       {
@@ -151,10 +168,7 @@ function Palette() {
         group: "Actions",
         label: "Sign out",
         icon: <LogOut size={15} />,
-        run: () => {
-          setPaletteOpen(false);
-          void api.logout();
-        },
+        run: signOut,
       },
     ];
     const repoItems: Item[] = repos.map((r) => ({
@@ -185,7 +199,7 @@ function Palette() {
         run: () => go(`/terminal?open=${encodeURIComponent(`agent:${a.name}`)}`),
       }));
     return [...pages, ...actions, ...repoItems, ...runItems, ...agentItems];
-  }, [repos, runs, agents, go]);
+  }, [repos, runs, agents, go, signOut]);
 
   const query = q.trim().toLowerCase();
   const filtered = React.useMemo(() => {
@@ -280,7 +294,15 @@ function Palette() {
             return (
               <React.Fragment key={it.id}>
                 {header && <div className="label px-3.5 pt-3 pb-1.5">{header}</div>}
-                <div id={`cmdk-${it.id}`} role="option" aria-selected={i === current} className="cmdk-item" onMouseMove={() => i !== current && setActive(i)} onClick={() => it.run()}>
+                <div
+                  id={`cmdk-${it.id}`}
+                  role="option"
+                  aria-selected={i === current}
+                  className="cmdk-item"
+                  {...sendingProps(signingOut && it.id === "a-logout")}
+                  onMouseMove={() => i !== current && setActive(i)}
+                  onClick={() => it.run()}
+                >
                   <span className="grid w-4 place-items-center text-[#9a9da6]">{it.icon}</span>
                   <span className="min-w-0 truncate">{it.label}</span>
                   {it.hint && <span className="min-w-0 flex-1 truncate font-mono text-[10px] text-[#7f838d]">{it.hint}</span>}

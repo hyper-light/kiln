@@ -14,11 +14,12 @@ import { TableHold } from "@/components/ui/hold";
 import { Loadable } from "@/components/ui/loading";
 import { SectionHeading, SelectField, TextField } from "@/components/ui/misc";
 import { toast } from "@/components/ui/toast";
+import { useAction } from "@/lib/action";
 import { useRes } from "@/lib/data";
 import { formatBytes, relativeTime } from "@/lib/format";
 import { errorMessage } from "@/lib/hooks";
 import { invalidate } from "@/lib/resource";
-import { logSourcesRes } from "./parts";
+import { HeldFields, logSourcesRes, useOpening } from "./parts";
 import { ReadBy, ReadByMachines } from "./scrapes";
 
 const SERVER = "server";
@@ -298,8 +299,10 @@ function Bare({ label, className, ...props }: React.InputHTMLAttributes<HTMLInpu
 
 function SourceDialog({ source, onClose }: { source: LogSource | null; onClose: () => void }) {
   const [f, setF] = React.useState<Form>(() => formOf(source));
-  const [busy, setBusy] = React.useState(false);
-  const [tested, setTested] = React.useState<LogSourceTest | null>(null);
+  const opening = useOpening(f);
+  const [result, setTested] = React.useState<{ of: Form; r: LogSourceTest } | null>(null);
+  // A test shows only under the form it tried: one that comes after an edit was of what was there before (W21-R15).
+  const tested = result?.of === f ? result.r : null;
   const set = (patch: Partial<Form>) => {
     setF((old) => ({ ...old, ...patch }));
     setTested(null);
@@ -318,28 +321,19 @@ function SourceDialog({ source, onClose }: { source: LogSource | null; onClose: 
   const channelsOk = !windows || f.channels.split(",").some((c) => c.trim() !== "");
   const queryOk = !windows || f.query.trim() === "" || /^\*\[.*\]$/.test(f.query.trim());
   const ok = validName && pathsOk && listenOk && rulesOk && channelsOk && queryOk;
-  const save = async () => {
-    setBusy(true);
+  const [save, saving] = useAction(async () => {
+    await observeApi.putLogSource(f.name, bodyOf(f));
+    invalidate("observe/log_sources");
+    if (opening.still(f)) onClose();
+  }, "Couldn't save it");
+  const [test, testing] = useAction(async () => {
+    const of = f;
     try {
-      await observeApi.putLogSource(f.name, bodyOf(f));
-      invalidate("observe/log_sources");
-      onClose();
+      setTested({ of, r: await observeApi.testLogSource(of.name || "new", bodyOf(of)) });
     } catch (err) {
-      toast({ title: "Couldn't save it", description: errorMessage(err), tone: "failed" });
-    } finally {
-      setBusy(false);
+      setTested({ of, r: { ok: false, files: [], matched: 0, records: [], excluded: 0, error: errorMessage(err), took_ms: 0 } });
     }
-  };
-  const test = async () => {
-    setBusy(true);
-    try {
-      setTested(await observeApi.testLogSource(f.name || "new", bodyOf(f)));
-    } catch (err) {
-      setTested({ ok: false, files: [], matched: 0, records: [], excluded: 0, error: errorMessage(err), took_ms: 0 });
-    } finally {
-      setBusy(false);
-    }
-  };
+  });
   const setRule = (i: number, patch: Partial<LogRule>) => set({ rules: f.rules.map((r, j) => (j === i ? { ...r, ...patch } : r)) });
   return (
     <Dialog open onOpenChange={(o) => !o && onClose()}>
@@ -348,223 +342,226 @@ function SourceDialog({ source, onClose }: { source: LogSource | null; onClose: 
         description="Each line a record, its place kept once it is written. A source reads what kiln may read on each machine that reads it."
       >
         <form
+          ref={opening.ref}
           className="space-y-4"
           onSubmit={(e) => {
             e.preventDefault();
-            if (ok) void save();
+            if (ok) save();
           }}
         >
-          <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
-            <TextField
-              label="Name"
-              value={f.name}
-              readOnly={source !== null}
-              onChange={(e) => set({ name: e.target.value })}
-              placeholder="nginx"
-              hint={f.name && !validName ? "Letters, digits, - _ and . only" : undefined}
-            />
-            <React.Suspense fallback={<ReadBy value={f.on} onChange={(v) => set({ on: v })} machines={[]} />}>
-              <ReadByMachines value={f.on} onChange={(v) => set({ on: v })} />
-            </React.Suspense>
-          </div>
-          <SelectField label="Type" value={f.type} onChange={(v) => set({ type: v as LogSourceKind })} options={TYPES} />
-          {syslog ? (
+          <HeldFields held={saving && !source}>
             <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
               <TextField
-                label="Listen on"
-                value={f.listen}
-                onChange={(e) => set({ listen: e.target.value })}
-                placeholder="udp://0.0.0.0:514, tcp://0.0.0.0:6514"
-                hint={f.listen && !listenOk ? "udp:// or tcp://, an IP address and a port" : "Each machine that reads it listens there."}
-                spellCheck={false}
+                label="Name"
+                value={f.name}
+                readOnly={source !== null}
+                onChange={(e) => set({ name: e.target.value })}
+                placeholder="nginx"
+                hint={f.name && !validName ? "Letters, digits, - _ and . only" : undefined}
               />
-              <TextField
-                label="Timezone (optional)"
-                value={f.timezone}
-                onChange={(e) => set({ timezone: e.target.value })}
-                placeholder="UTC"
-                hint="Of RFC 3164's times, which carry none: an IANA name."
-                spellCheck={false}
-              />
+              <React.Suspense fallback={<ReadBy value={f.on} onChange={(v) => set({ on: v })} machines={[]} />}>
+                <ReadByMachines value={f.on} onChange={(v) => set({ on: v })} />
+              </React.Suspense>
             </div>
-          ) : unified ? (
-            <div className="grid grid-cols-1 gap-3 sm:grid-cols-[2fr_1fr]">
-              <TextField
-                label="Predicate (optional)"
-                value={f.predicate}
-                onChange={(e) => set({ predicate: e.target.value })}
-                placeholder='subsystem == "com.example.app"'
-                hint="An NSPredicate, as log stream takes one; every event when none."
-                spellCheck={false}
-              />
-              <SelectField
-                label="Level"
-                value={f.level}
-                onChange={(v) => set({ level: v as Form["level"] })}
-                options={[
-                  { value: "default", label: "Default" },
-                  { value: "info", label: "Info" },
-                  { value: "debug", label: "Debug" },
-                ]}
-              />
-            </div>
-          ) : windows ? (
-            <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
-              <TextField
-                label="Channels"
-                value={f.channels}
-                onChange={(e) => set({ channels: e.target.value })}
-                placeholder="System, Application"
-                hint={f.channels && !channelsOk ? "A channel at the least" : "As Event Viewer names them, a comma between."}
-                spellCheck={false}
-              />
-              <TextField
-                label="Query (optional)"
-                value={f.query}
-                onChange={(e) => set({ query: e.target.value })}
-                placeholder="*[System[(Level=1 or Level=2)]]"
-                hint={!queryOk ? "An XPath of the events, *[...]" : "Which of their events; every one when none."}
-                spellCheck={false}
-              />
-            </div>
-          ) : journal ? (
-            <TextField
-              label="Units (optional)"
-              value={f.units}
-              onChange={(e) => set({ units: e.target.value })}
-              placeholder="nginx.service, sshd.service"
-              hint="Every unit's when none."
-              spellCheck={false}
-            />
-          ) : (
-            <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
-              <Field
-                id="log-paths"
-                label={f.type === "file" ? "Paths" : "Paths (optional)"}
-                hint={f.paths && !pathsOk ? "Absolute globs, one a line" : "One glob a line: * within a folder, ** across them."}
-              >
-                <textarea
-                  id="log-paths"
-                  rows={3}
-                  className="font-mono"
-                  value={f.paths}
-                  onChange={(e) => set({ paths: e.target.value })}
-                  placeholder={DEFAULT_PATHS[f.type] ?? "/var/log/nginx/*.log"}
+            <SelectField label="Type" value={f.type} onChange={(v) => set({ type: v as LogSourceKind })} options={TYPES} />
+            {syslog ? (
+              <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
+                <TextField
+                  label="Listen on"
+                  value={f.listen}
+                  onChange={(e) => set({ listen: e.target.value })}
+                  placeholder="udp://0.0.0.0:514, tcp://0.0.0.0:6514"
+                  hint={f.listen && !listenOk ? "udp:// or tcp://, an IP address and a port" : "Each machine that reads it listens there."}
                   spellCheck={false}
                 />
-              </Field>
-              <Field id="log-exclude" label="Leave out (optional)">
-                <textarea id="log-exclude" rows={3} className="font-mono" value={f.exclude} onChange={(e) => set({ exclude: e.target.value })} placeholder="/var/log/nginx/*.gz" spellCheck={false} />
-              </Field>
-            </div>
-          )}
-          {!syslog && (
-            <div className={files ? "grid grid-cols-1 gap-3 sm:grid-cols-3" : "grid grid-cols-1 gap-3"}>
-              {files && (
+                <TextField
+                  label="Timezone (optional)"
+                  value={f.timezone}
+                  onChange={(e) => set({ timezone: e.target.value })}
+                  placeholder="UTC"
+                  hint="Of RFC 3164's times, which carry none: an IANA name."
+                  spellCheck={false}
+                />
+              </div>
+            ) : unified ? (
+              <div className="grid grid-cols-1 gap-3 sm:grid-cols-[2fr_1fr]">
+                <TextField
+                  label="Predicate (optional)"
+                  value={f.predicate}
+                  onChange={(e) => set({ predicate: e.target.value })}
+                  placeholder='subsystem == "com.example.app"'
+                  hint="An NSPredicate, as log stream takes one; every event when none."
+                  spellCheck={false}
+                />
                 <SelectField
-                  label="Lines are"
-                  value={f.format}
-                  onChange={(v) => set({ format: v as Form["format"] })}
+                  label="Level"
+                  value={f.level}
+                  onChange={(v) => set({ level: v as Form["level"] })}
                   options={[
-                    { value: "auto", label: "Auto (JSON or text)" },
-                    { value: "text", label: "Text" },
-                    { value: "json", label: "JSON" },
-                    { value: "cri", label: "CRI (Kubernetes)" },
-                    { value: "docker", label: "Docker json-file" },
+                    { value: "default", label: "Default" },
+                    { value: "info", label: "Info" },
+                    { value: "debug", label: "Debug" },
                   ]}
                 />
-              )}
-              <SelectField
-                label="Start"
-                value={f.start}
-                onChange={(v) => set({ start: v as Form["start"] })}
-                options={[
-                  { value: "end", label: "New lines only" },
-                  { value: "beginning", label: "From the beginning" },
-                ]}
+              </div>
+            ) : windows ? (
+              <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
+                <TextField
+                  label="Channels"
+                  value={f.channels}
+                  onChange={(e) => set({ channels: e.target.value })}
+                  placeholder="System, Application"
+                  hint={f.channels && !channelsOk ? "A channel at the least" : "As Event Viewer names them, a comma between."}
+                  spellCheck={false}
+                />
+                <TextField
+                  label="Query (optional)"
+                  value={f.query}
+                  onChange={(e) => set({ query: e.target.value })}
+                  placeholder="*[System[(Level=1 or Level=2)]]"
+                  hint={!queryOk ? "An XPath of the events, *[...]" : "Which of their events; every one when none."}
+                  spellCheck={false}
+                />
+              </div>
+            ) : journal ? (
+              <TextField
+                label="Units (optional)"
+                value={f.units}
+                onChange={(e) => set({ units: e.target.value })}
+                placeholder="nginx.service, sshd.service"
+                hint="Every unit's when none."
+                spellCheck={false}
               />
-              {files && (
+            ) : (
+              <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
+                <Field
+                  id="log-paths"
+                  label={f.type === "file" ? "Paths" : "Paths (optional)"}
+                  hint={f.paths && !pathsOk ? "Absolute globs, one a line" : "One glob a line: * within a folder, ** across them."}
+                >
+                  <textarea
+                    id="log-paths"
+                    rows={3}
+                    className="font-mono"
+                    value={f.paths}
+                    onChange={(e) => set({ paths: e.target.value })}
+                    placeholder={DEFAULT_PATHS[f.type] ?? "/var/log/nginx/*.log"}
+                    spellCheck={false}
+                  />
+                </Field>
+                <Field id="log-exclude" label="Leave out (optional)">
+                  <textarea id="log-exclude" rows={3} className="font-mono" value={f.exclude} onChange={(e) => set({ exclude: e.target.value })} placeholder="/var/log/nginx/*.gz" spellCheck={false} />
+                </Field>
+              </div>
+            )}
+            {!syslog && (
+              <div className={files ? "grid grid-cols-1 gap-3 sm:grid-cols-3" : "grid grid-cols-1 gap-3"}>
+                {files && (
+                  <SelectField
+                    label="Lines are"
+                    value={f.format}
+                    onChange={(v) => set({ format: v as Form["format"] })}
+                    options={[
+                      { value: "auto", label: "Auto (JSON or text)" },
+                      { value: "text", label: "Text" },
+                      { value: "json", label: "JSON" },
+                      { value: "cri", label: "CRI (Kubernetes)" },
+                      { value: "docker", label: "Docker json-file" },
+                    ]}
+                  />
+                )}
                 <SelectField
-                  label="Encoding"
-                  value={f.encoding}
-                  onChange={(v) => set({ encoding: v as Form["encoding"] })}
+                  label="Start"
+                  value={f.start}
+                  onChange={(v) => set({ start: v as Form["start"] })}
                   options={[
-                    { value: "utf-8", label: "UTF-8" },
-                    { value: "utf-16le", label: "UTF-16 LE" },
-                    { value: "utf-16be", label: "UTF-16 BE" },
+                    { value: "end", label: "New lines only" },
+                    { value: "beginning", label: "From the beginning" },
                   ]}
                 />
-              )}
+                {files && (
+                  <SelectField
+                    label="Encoding"
+                    value={f.encoding}
+                    onChange={(v) => set({ encoding: v as Form["encoding"] })}
+                    options={[
+                      { value: "utf-8", label: "UTF-8" },
+                      { value: "utf-16le", label: "UTF-16 LE" },
+                      { value: "utf-16be", label: "UTF-16 BE" },
+                    ]}
+                  />
+                )}
+              </div>
+            )}
+            <div className="grid grid-cols-1 gap-3 sm:grid-cols-3">
+              <TextField
+                label="Service (optional)"
+                value={f.service}
+                onChange={(e) => set({ service: e.target.value })}
+                placeholder={
+                  f.type === "file"
+                    ? "the source's name"
+                    : syslog
+                      ? "each message's program"
+                      : journal
+                        ? "each entry's program"
+                        : unified
+                          ? "each event's process"
+                          : windows
+                            ? "each event's provider"
+                            : "each container's"
+                }
+                spellCheck={false}
+              />
+              <TextField label="Source (optional)" value={f.source} onChange={(e) => set({ source: e.target.value })} placeholder={f.type} spellCheck={false} />
+              <TextField label="Tags" value={f.tags} onChange={(e) => set({ tags: e.target.value })} placeholder="env:prod" spellCheck={false} />
             </div>
-          )}
-          <div className="grid grid-cols-1 gap-3 sm:grid-cols-3">
-            <TextField
-              label="Service (optional)"
-              value={f.service}
-              onChange={(e) => set({ service: e.target.value })}
-              placeholder={
-                f.type === "file"
-                  ? "the source's name"
-                  : syslog
-                    ? "each message's program"
-                    : journal
-                      ? "each entry's program"
-                      : unified
-                        ? "each event's process"
-                        : windows
-                          ? "each event's provider"
-                          : "each container's"
-              }
-              spellCheck={false}
-            />
-            <TextField label="Source (optional)" value={f.source} onChange={(e) => set({ source: e.target.value })} placeholder={f.type} spellCheck={false} />
-            <TextField label="Tags" value={f.tags} onChange={(e) => set({ tags: e.target.value })} placeholder="env:prod" spellCheck={false} />
-          </div>
-          <div>
-            <p className="field-label">Rules</p>
-            {f.rules.length === 0 && <p className="field-hint">None: every line kept as it is.</p>}
-            <ul className="space-y-2">
-              {f.rules.map((r, i) => (
-                <li key={i} className="grid grid-cols-[1fr_auto] items-start gap-2 sm:grid-cols-[11rem_1fr_auto]">
-                  <SelectField label={`Rule ${i + 1}`} hideLabel value={r.type} onChange={(v) => setRule(i, { type: v as LogRuleKind })} options={RULES} className="col-span-2 sm:col-span-1" />
-                  <div className={r.type === "mask_sequences" ? "grid grid-cols-[2fr_1fr] gap-2" : ""}>
-                    <Bare
-                      label={`Rule ${i + 1}'s pattern`}
-                      value={r.pattern}
-                      onChange={(e) => setRule(i, { pattern: e.target.value })}
-                      placeholder={r.type === "multi_line" ? "^\\d{4}-\\d{2}-\\d{2}" : "a regular expression"}
-                      className="font-mono"
-                      spellCheck={false}
-                    />
-                    {r.type === "mask_sequences" && (
+            <div>
+              <p className="field-label">Rules</p>
+              {f.rules.length === 0 && <p className="field-hint">None: every line kept as it is.</p>}
+              <ul className="space-y-2">
+                {f.rules.map((r, i) => (
+                  <li key={i} className="grid grid-cols-[1fr_auto] items-start gap-2 sm:grid-cols-[11rem_1fr_auto]">
+                    <SelectField label={`Rule ${i + 1}`} hideLabel value={r.type} onChange={(v) => setRule(i, { type: v as LogRuleKind })} options={RULES} className="col-span-2 sm:col-span-1" />
+                    <div className={r.type === "mask_sequences" ? "grid grid-cols-[2fr_1fr] gap-2" : ""}>
                       <Bare
-                        label={`Rule ${i + 1}'s mask`}
-                        value={r.replace_placeholder ?? ""}
-                        onChange={(e) => setRule(i, { replace_placeholder: e.target.value })}
-                        placeholder="[masked]"
+                        label={`Rule ${i + 1}'s pattern`}
+                        value={r.pattern}
+                        onChange={(e) => setRule(i, { pattern: e.target.value })}
+                        placeholder={r.type === "multi_line" ? "^\\d{4}-\\d{2}-\\d{2}" : "a regular expression"}
+                        className="font-mono"
                         spellCheck={false}
                       />
-                    )}
-                  </div>
-                  <Button variant="ghost" size="icon" aria-label={`Remove rule ${i + 1}`} onClick={() => set({ rules: f.rules.filter((_, j) => j !== i) })}>
-                    <X />
-                  </Button>
-                </li>
-              ))}
-            </ul>
-            <Button variant="ghost" size="xs" className="mt-2" onClick={() => set({ rules: [...f.rules, { type: "exclude_at_match", pattern: "" }] })}>
-              <Plus /> Add a rule
-            </Button>
-          </div>
-          {tested && <Tested t={tested} kind={f.type} />}
+                      {r.type === "mask_sequences" && (
+                        <Bare
+                          label={`Rule ${i + 1}'s mask`}
+                          value={r.replace_placeholder ?? ""}
+                          onChange={(e) => setRule(i, { replace_placeholder: e.target.value })}
+                          placeholder="[masked]"
+                          spellCheck={false}
+                        />
+                      )}
+                    </div>
+                    <Button variant="ghost" size="icon" aria-label={`Remove rule ${i + 1}`} onClick={() => set({ rules: f.rules.filter((_, j) => j !== i) })}>
+                      <X />
+                    </Button>
+                  </li>
+                ))}
+              </ul>
+              <Button variant="ghost" size="xs" className="mt-2" onClick={() => set({ rules: [...f.rules, { type: "exclude_at_match", pattern: "" }] })}>
+                <Plus /> Add a rule
+              </Button>
+            </div>
+            {tested && <Tested t={tested} kind={f.type} />}
+          </HeldFields>
           <div className="flex justify-end gap-2">
             <Button variant="ghost" onClick={onClose}>
               Cancel
             </Button>
-            <Button variant="ghost" disabled={!ok || busy} onClick={() => void test()}>
+            <Button variant="ghost" disabled={!ok} pending={testing} onClick={test}>
               Test
             </Button>
-            <Button type="submit" disabled={!ok || busy}>
+            <Button type="submit" disabled={!ok} pending={saving}>
               {source ? "Save" : "Add"}
             </Button>
           </div>

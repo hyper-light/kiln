@@ -452,7 +452,8 @@ function LlmTraceView({ id }: { id: string }) {
           </li>
         ))}
       </ol>
-      {picked && <StepDetail s={picked.span} traceId={root.attributes["llmobs.trace_id"] ?? root.trace_id ?? ""} />}
+      {/* Made anew for each step, so one picked shows at once, its messages and evaluations loading in it (W21-R15). */}
+      {picked && <StepDetail key={picked.span.span_id ?? picked.span.ts_ns} s={picked.span} traceId={root.attributes["llmobs.trace_id"] ?? root.trace_id ?? ""} />}
     </div>
   );
 }

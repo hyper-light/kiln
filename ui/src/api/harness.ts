@@ -4,7 +4,7 @@
  * Nothing here is specific to one harness: Claude Code, Codex and the rest all speak this.
  */
 import * as React from "react";
-import { wsUrl } from "@/api/client";
+import { ApiError, wsUrl } from "@/api/client";
 import { apiPath } from "@/lib/peer-base";
 import { events } from "@/api/events";
 import { readFrame, unread } from "./frames";
@@ -383,7 +383,8 @@ async function call<T>(method: string, path: string, body?: unknown, signal?: Ab
     } catch {
       /* not json */
     }
-    throw new Error(msg);
+    // With its status, for what tells one answer from another (a start asked again, refused as there already: starting.ts).
+    throw new ApiError(res.status, msg);
   }
   if (res.status === 204) return undefined as T;
   return (await res.json()) as T;
@@ -512,6 +513,12 @@ export const harnessApi = {
   /** Write it exactly as the plan whose manifest this is (a person's go-ahead); if it changed since, nothing is written and the new plan comes back. */
   land: (id: string, manifest: string) => call<{ landed?: unknown } & Partial<LandingPlan> & { changed?: boolean }>("POST", `/api/harness/agents/${encodeURIComponent(id)}/land`, { manifest }),
   list: () => call<AgentInfo[]>("GET", "/api/harness/sessions").then((all) => all.filter(listed)),
+  /** One agent, or null when there's none under `id` (yet, or any more). */
+  session: (id: string) =>
+    call<AgentInfo>("GET", `/api/harness/sessions/${encodeURIComponent(id)}`).catch((e: unknown) => {
+      if (e instanceof ApiError && e.status === 404) return null;
+      throw e;
+    }),
   /** An agent's goal stack. */
   goals: (id: string) => call<GoalStack>("GET", `/api/harness/sessions/${encodeURIComponent(id)}/goals`),
   /** Its goals still to go, as they should be (existing ones by id; the one under way among them puts it back or rewords it). */
@@ -547,7 +554,8 @@ export const harnessApi = {
     call<AgentInfo[]>("POST", `/api/ai-sessions/${encodeURIComponent(machine)}/${pid}/takeover`, opts?.stop ? { stop: true } : undefined),
   /** Continue a copy of a found session's conversation as an agent; the session keeps running. */
   fork: (machine: string, pid: number) => call<AgentInfo[]>("POST", `/api/ai-sessions/${encodeURIComponent(machine)}/${pid}/fork`),
-  start: (target: string, spec: Spec, count = 1) => call<AgentInfo[]>("POST", "/api/harness/sessions", { target, spec, count }),
+  /** `ids`: one made here for each (`clientId`), so its page can open before it has started (W21-R15); asked again under them, it's refused (409), never started twice. */
+  start: (target: string, spec: Spec, count = 1, ids?: string[]) => call<AgentInfo[]>("POST", "/api/harness/sessions", { target, spec, count, ...(ids ? { ids } : {}) }),
   stop: (id: string) => call<void>("DELETE", `/api/harness/sessions/${encodeURIComponent(id)}`),
   /** End an agent for good; with `children`, the agents it started (and theirs) end first. */
   end: (id: string, children: boolean) => call<{ ended: string[] }>("POST", `/api/harness/agents/${encodeURIComponent(id)}/stop`, { children }),
@@ -1050,10 +1058,13 @@ export class SessionStore {
     this.asked.set(id, { ...a, tries, why });
     this.patch({ asked: [...this.asked.values()] });
     const ws = this.ws;
-    window.setTimeout(() => {
-      const now = this.asked.get(id);
-      if (ws && this.ws === ws && ws.readyState === WebSocket.OPEN && now?.state === "pending" && now.tries === tries) ws.send(JSON.stringify({ t: "cmd", id, c: now.command } satisfies SessionUp));
-    }, AGAIN_AFTER_MS[Math.min(tries, AGAIN_AFTER_MS.length) - 1]);
+    window.setTimeout(
+      () => {
+        const now = this.asked.get(id);
+        if (ws && this.ws === ws && ws.readyState === WebSocket.OPEN && now?.state === "pending" && now.tries === tries) ws.send(JSON.stringify({ t: "cmd", id, c: now.command } satisfies SessionUp));
+      },
+      AGAIN_AFTER_MS[Math.min(tries, AGAIN_AFTER_MS.length) - 1],
+    );
   }
 
   /** Command `id` was refused: shown so a moment, then let go of. A message refused so says so where it shows in the conversation, until it's sent again or let go of. */

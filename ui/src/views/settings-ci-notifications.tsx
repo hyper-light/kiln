@@ -9,6 +9,7 @@ import { ci, type MyNotifications, type MyRule } from "@/api/ci";
 import { Button } from "@/components/ui/button";
 import { Hold } from "@/components/ui/hold";
 import { SettingRow, SettingsGroup } from "@/components/ui/settings";
+import { useAction } from "@/lib/action";
 import { relativeTime } from "@/lib/format";
 import { errorMessage } from "@/lib/hooks";
 import { useRes, type Res } from "@/lib/data";
@@ -39,22 +40,23 @@ function described(r: MyRule): { what: string; meta: string } {
 export function MyNotificationsGroup() {
   const res = useRes(myNotificationsRes);
   const d = res.data;
-  const [busy, setBusy] = React.useState(false);
   const [problem, setProblem] = React.useState<string | null>(null);
-  const save = async (rules: MyRule[], email?: string | null) => {
-    setBusy(true);
+  // The rules and the address are one thing, saved whole: one save at a time (W21-R15). The control
+  // pressed says it's on its way, the others wait for its answer, and the list is as that has it.
+  const [pressed, setPressed] = React.useState("");
+  const [save, saving] = useAction(async (what: string, rules: MyRule[], email?: string | null, done?: () => void) => {
+    setPressed(what);
     setProblem(null);
     try {
       const next = await ci.setMyNotifications(rules, email);
-      res.setData(() => next);
-      return true;
+      res.change(() => next);
+      done?.();
     } catch (e) {
       setProblem(errorMessage(e));
-      return false;
-    } finally {
-      setBusy(false);
     }
-  };
+  });
+  const on = (what: string) => saving && pressed === what;
+  const held = (what: string) => saving && pressed !== what;
   if (!d.person) {
     return (
       <SettingsGroup id={ID} title={TITLE} about={ABOUT} words={WORDS}>
@@ -66,7 +68,7 @@ export function MyNotificationsGroup() {
   }
   return (
     <SettingsGroup id={ID} title={TITLE} about={ABOUT} words={WORDS}>
-      <EmailRow email={d.email} busy={busy} onSave={(e) => save(d.rules, e)} />
+      <EmailRow email={d.email} pending={on("email")} held={held("email")} onSave={(e) => save("email", d.rules, e)} />
       {d.rules.length > 0 && (
         <ul className="st-list mt-2" aria-label="Your rules">
           {d.rules.map((r, i) => {
@@ -77,7 +79,18 @@ export function MyNotificationsGroup() {
                   <span className="st-item-name font-mono text-[12.5px]">{t.what}</span>
                   <span className="st-item-meta">{t.meta}</span>
                   <span className="st-item-acts">
-                    <Button size="xs" variant="ghost" disabled={busy} onClick={() => void save(d.rules.filter((_, j) => j !== i))}>
+                    <Button
+                      size="xs"
+                      variant="ghost"
+                      pending={on(`remove:${i}`)}
+                      disabled={held(`remove:${i}`)}
+                      onClick={() =>
+                        save(
+                          `remove:${i}`,
+                          d.rules.filter((_, j) => j !== i),
+                        )
+                      }
+                    >
                       Remove
                     </Button>
                   </span>
@@ -87,7 +100,7 @@ export function MyNotificationsGroup() {
           })}
         </ul>
       )}
-      <AddRule events={d.events} hasEmail={Boolean(d.email)} busy={busy} onAdd={(r) => save([...d.rules, r])} />
+      <AddRule events={d.events} hasEmail={Boolean(d.email)} pending={on("add")} held={held("add")} onAdd={(r, done) => save("add", [...d.rules, r], undefined, done)} />
       {problem && (
         <p className="st-note" data-tone="error" role="status">
           {problem}
@@ -97,7 +110,8 @@ export function MyNotificationsGroup() {
   );
 }
 
-function EmailRow({ email, busy, onSave }: { email: string | null; busy: boolean; onSave: (email: string | null) => Promise<boolean> }) {
+/** `pending`: its save is on its way; `held`: another of the same rules is. */
+function EmailRow({ email, pending, held, onSave }: { email: string | null; pending: boolean; held: boolean; onSave: (email: string | null) => void }) {
   const [draft, setDraft] = React.useState(email ?? "");
   const trimmed = draft.trim();
   return (
@@ -105,7 +119,7 @@ function EmailRow({ email, busy, onSave }: { email: string | null; busy: boolean
       noValidate
       onSubmit={(e) => {
         e.preventDefault();
-        void onSave(trimmed || null);
+        if (!held && trimmed !== (email ?? "")) onSave(trimmed || null);
       }}
     >
       <SettingRow label="Email" htmlFor="st-my-email" help="Where rules that send to your email go.">
@@ -113,7 +127,7 @@ function EmailRow({ email, busy, onSave }: { email: string | null; busy: boolean
           <div className="field st-wide">
             <input id="st-my-email" type="email" inputMode="email" autoComplete="email" placeholder="you@example.com" value={draft} onChange={(e) => setDraft(e.target.value)} />
           </div>
-          <Button type="submit" size="xs" variant="secondary" disabled={busy || trimmed === (email ?? "")}>
+          <Button type="submit" size="xs" variant="secondary" pending={pending} disabled={held || trimmed === (email ?? "")}>
             Save
           </Button>
         </div>
@@ -122,7 +136,8 @@ function EmailRow({ email, busy, onSave }: { email: string | null; busy: boolean
   );
 }
 
-function AddRule({ events, hasEmail, busy, onAdd }: { events: string[]; hasEmail: boolean; busy: boolean; onAdd: (r: MyRule) => Promise<boolean> }) {
+/** `pending`: the rule is being added (the form, which its answer empties, is held as it is until then); `held`: another save of the rules is on its way. */
+function AddRule({ events, hasEmail, pending, held, onAdd }: { events: string[]; hasEmail: boolean; pending: boolean; held: boolean; onAdd: (r: MyRule, done: () => void) => void }) {
   const [on, setOn] = React.useState<string[]>([]);
   const [aboutMe, setAboutMe] = React.useState(true);
   const [repos, setRepos] = React.useState("");
@@ -133,21 +148,21 @@ function AddRule({ events, hasEmail, busy, onAdd }: { events: string[]; hasEmail
     <form
       noValidate
       className="mt-4"
-      onSubmit={async (e) => {
+      onSubmit={(e) => {
         e.preventDefault();
-        if (!ready) return;
+        if (!ready || held) return;
         const list = repos
           .split(",")
           .map((r) => r.trim())
           .filter(Boolean);
-        if (await onAdd({ on, to, about_me: aboutMe, ...(list.length ? { repos: list } : {}) })) {
+        onAdd({ on, to, about_me: aboutMe, ...(list.length ? { repos: list } : {}) }, () => {
           setOn([]);
           setRepos("");
-        }
+        });
       }}
     >
       <SettingRow label="Tell me of" help="One rule takes any of these.">
-        <fieldset className="flex flex-wrap gap-x-4 gap-y-2" disabled={busy}>
+        <fieldset className="flex flex-wrap gap-x-4 gap-y-2" disabled={pending}>
           <legend className="sr-only">Events</legend>
           {events.map((ev) => (
             <label key={ev} className="flex items-center gap-2 font-mono text-[12px]">
@@ -158,15 +173,15 @@ function AddRule({ events, hasEmail, busy, onAdd }: { events: string[]; hasEmail
         </fieldset>
       </SettingRow>
       <SettingRow inline htmlFor="st-my-about" label="Only what's about me" help="Runs you started, reviews asked of you, replies to and mentions of you.">
-        <input id="st-my-about" type="checkbox" className="check" checked={aboutMe} disabled={busy} onChange={(e) => setAboutMe(e.target.checked)} />
+        <input id="st-my-about" type="checkbox" className="check" checked={aboutMe} disabled={pending} onChange={(e) => setAboutMe(e.target.checked)} />
       </SettingRow>
       <SettingRow label="Repositories" htmlFor="st-my-repos" help="Names or globs, comma-separated; every one you may read when left empty.">
         <div className="field st-wide">
-          <input id="st-my-repos" type="text" placeholder="acme/*" value={repos} disabled={busy} onChange={(e) => setRepos(e.target.value)} />
+          <input id="st-my-repos" type="text" placeholder="acme/*" value={repos} disabled={pending} onChange={(e) => setRepos(e.target.value)} />
         </div>
       </SettingRow>
       <SettingRow label="Send to" help={hasEmail ? undefined : "Save your email above to send there."}>
-        <fieldset className="flex flex-wrap gap-x-4 gap-y-2" disabled={busy}>
+        <fieldset className="flex flex-wrap gap-x-4 gap-y-2" disabled={pending}>
           <legend className="sr-only">Where it goes</legend>
           <label className="flex items-center gap-2">
             <input type="checkbox" className="check" checked={to.includes("inbox")} onChange={(e) => setTo(flip(to, "inbox", e.target.checked))} />
@@ -179,7 +194,7 @@ function AddRule({ events, hasEmail, busy, onAdd }: { events: string[]; hasEmail
         </fieldset>
       </SettingRow>
       <div className="mt-3 flex justify-end">
-        <Button type="submit" size="xs" variant="secondary" disabled={busy || !ready}>
+        <Button type="submit" size="xs" variant="secondary" pending={pending} disabled={held || !ready}>
           Add the rule
         </Button>
       </div>

@@ -26,6 +26,7 @@ import { useRes, warm, type Res } from "@/lib/data";
 import { errorMessage } from "@/lib/hooks";
 import { invalidate } from "@/lib/resource";
 import { Link, useNavigate } from "@/lib/router";
+import { useAction } from "@/lib/action";
 import "./deployments.css";
 import { Highlighted } from "@/components/code/highlighted";
 
@@ -204,59 +205,47 @@ function Builder() {
 
   // What the account holds, and what was adopted.
   const [found, setFound] = React.useState<CdDiscovery | null>(null);
-  const [looking, setLooking] = React.useState(false);
   const [adopted, setAdopted] = React.useState<{ name: string; note: string | null } | null>(null);
   const [checked, setChecked] = React.useState<{ deploy: string; result: CdValidation } | null>(null);
-  const [busy, setBusy] = React.useState(false);
 
+  // Each press says on its own control that it's on its way; the fields and the other steps go on working (W21-R15).
   const where = (): Record<string, string> => ({ provider: d.platform, account: d.account, environment: d.environment, ...d.place });
-  const look = async () => {
-    setLooking(true);
-    try {
-      setFound(await cdApi.discover(where()));
-    } catch (e) {
-      toast.error("Couldn't look in the account", errorMessage(e));
-    } finally {
-      setLooking(false);
-    }
-  };
-  const adopt = async (name: string, scope?: string) => {
-    setBusy(true);
+  const [look, looking] = useAction(async () => setFound(await cdApi.discover(where())), "Couldn't look in the account");
+  // Adopts fill one draft, so one at a time: the row pressed says it's on its way and the others wait.
+  // Its name follows what's adopted, unless it was typed; one asked for in another place (the
+  // platform, account or place changed since) fills nothing.
+  const here = JSON.stringify(where());
+  const place = React.useRef(here);
+  place.current = here;
+  const [row, setRow] = React.useState("");
+  const [adopt, adoptGoing] = useAction(async (key: string, name: string, scope?: string) => {
+    setRow(key);
     try {
       const a = await cdApi.adopt({ ...where(), name, ...(scope ? { scope } : {}) });
+      if (place.current !== here) return;
       const settings: Record<string, string> = {};
       for (const [k, v] of Object.entries(a.definition)) settings[k] = typeof v === "string" ? v : JSON.stringify(v, null, 2);
-      setD((x) => ({ ...x, name: x.name || name, settings }));
+      setD((x) => ({ ...x, name: !x.name || x.name === adopted?.name ? name : x.name, settings }));
       setAdopted({ name, note: a.note });
     } catch (e) {
       toast.error(`Couldn't read ${name}`, errorMessage(e));
-    } finally {
-      setBusy(false);
     }
-  };
-  const check = async () => {
-    setBusy(true);
-    try {
-      setChecked({ deploy, result: await cdApi.validate({ deploy, environments: environments || undefined, repo: d.repo || undefined }) });
-    } catch (e) {
-      toast.error("Couldn't check the app", errorMessage(e));
-    } finally {
-      setBusy(false);
-    }
-  };
-  const keep = async () => {
-    setBusy(true);
-    try {
-      const r = await cdApi.keep({ deploy, environments: environments || undefined, repo: d.repo });
-      invalidate("cd/");
-      toast({ title: r.apps.length === 1 ? `${r.apps[0] ?? "The app"} is kept in kiln` : `${r.apps.length} apps kept in kiln`, description: "It shows in Deployments as soon as its sources read.", tone: "succeeded" });
-      navigate("/deployments");
-    } catch (e) {
-      toast.error("Couldn't keep the app", errorMessage(e));
-    } finally {
-      setBusy(false);
-    }
-  };
+  });
+  const [check, checking] = useAction(
+    async () => setChecked({ deploy, result: await cdApi.validate({ deploy, environments: environments || undefined, repo: d.repo || undefined }) }),
+    "Couldn't check the app",
+  );
+  // Kept, it goes to Deployments; until it's answered the draft stays, so a refusal is said with it still there (W21-R15).
+  const [keep, keeping] = useAction(async () => {
+    const r = await cdApi.keep({ deploy, environments: environments || undefined, repo: d.repo });
+    invalidate("cd/");
+    toast({
+      title: r.apps.length === 1 ? `${r.apps[0] ?? "The app"} is kept in kiln` : `${r.apps.length} apps kept in kiln`,
+      description: "It shows in Deployments as soon as its sources read.",
+      tone: "succeeded",
+    });
+    await navigate("/deployments");
+  }, "Couldn't keep the app");
 
   const platformOptions = [
     { value: "", label: "Choose a platform…" },
@@ -288,8 +277,8 @@ function Builder() {
         </div>
         {provider && !provider.built && (
           <p className="cd-new-note">
-            {provider.title} is in kiln's plan and not built yet: kiln deploys to it once it is. Its accounts can be added in{" "}
-            <Link to="/settings#deployments.accounts">Settings → Deployments</Link> now.
+            {provider.title} is in kiln's plan and not built yet: kiln deploys to it once it is. Its accounts can be added in <Link to="/settings#deployments.accounts">Settings → Deployments</Link>{" "}
+            now.
           </p>
         )}
         {provider?.built && (
@@ -314,7 +303,12 @@ function Builder() {
         )}
         {d.platform === KUBERNETES && (
           <div className="cd-new-grid">
-            <SelectField label="Cluster" value={d.cluster} onChange={(v) => set("cluster", v)} options={clusters.map((c) => ({ value: c.name, label: c.connected ? c.name : `${c.name} (not connected)` }))} />
+            <SelectField
+              label="Cluster"
+              value={d.cluster}
+              onChange={(v) => set("cluster", v)}
+              options={clusters.map((c) => ({ value: c.name, label: c.connected ? c.name : `${c.name} (not connected)` }))}
+            />
             <TextField label="Namespace" placeholder="default" value={d.namespace} onChange={(e) => set("namespace", e.target.value)} />
             <TextField label="Source" placeholder="deploy/web" value={d.path} onChange={(e) => set("path", e.target.value)} hint="A directory of manifests, a Helm chart or a kustomization" />
           </div>
@@ -324,7 +318,7 @@ function Builder() {
       {provider?.built && d.account && (
         <Panel eyebrow="2" title="What runs there" description={`Adopt what ${d.account} already runs, as it runs now, or start new.`}>
           <div className="flex flex-wrap items-center gap-2">
-            <Button size="sm" variant="secondary" disabled={looking || provider.place.some((k) => !(d.place[k] ?? "").trim())} onClick={() => void look()}>
+            <Button size="sm" variant="secondary" pending={looking} disabled={provider.place.some((k) => !(d.place[k] ?? "").trim())} onClick={look}>
               <Search /> {found ? "Look again" : "Look in the account"}
             </Button>
             {adopted && <span className="cd-new-note">Adopted {adopted.name}: its definition is below.</span>}
@@ -336,7 +330,13 @@ function Builder() {
                 <li key={`${r.scope ?? ""}/${r.name}`}>
                   <span className="cd-new-found-name">{r.scope ? `${r.scope} / ${r.name}` : r.name}</span>
                   <span className="cd-new-found-meta">{r.summary}</span>
-                  <Button size="xs" variant="ghost" disabled={busy} onClick={() => void adopt(r.name, r.scope)}>
+                  <Button
+                    size="xs"
+                    variant="ghost"
+                    pending={adoptGoing && row === `${r.scope ?? ""}/${r.name}`}
+                    disabled={adoptGoing && row !== `${r.scope ?? ""}/${r.name}`}
+                    onClick={() => adopt(`${r.scope ?? ""}/${r.name}`, r.name, r.scope)}
+                  >
                     Adopt
                   </Button>
                 </li>
@@ -348,7 +348,13 @@ function Builder() {
       )}
 
       {(provider?.built || d.platform === KUBERNETES) && (
-        <Panel eyebrow="3" title="Its definition" description={provider ? `${provider.title}'s settings, as .kiln/deploy.yaml spells them. Objects take JSON, or a file of the repository by path.` : "kiln renders the source as Argo CD would."}>
+        <Panel
+          eyebrow="3"
+          title="Its definition"
+          description={
+            provider ? `${provider.title}'s settings, as .kiln/deploy.yaml spells them. Objects take JSON, or a file of the repository by path.` : "kiln renders the source as Argo CD would."
+          }
+        >
           <div className="space-y-3">
             <TextField label="Name" placeholder="api" value={d.name} onChange={(e) => set("name", e.target.value)} hint="Each environment's copy is named after it: api-production" />
             {provider?.settings.map((s) =>
@@ -389,11 +395,26 @@ function Builder() {
           <div className="space-y-3">
             {d.artifacts.map((a, i) => (
               <div key={i} className="cd-new-grid cd-new-artifact">
-                <TextField label="Name" placeholder="image" value={a.name} onChange={(e) => set("artifacts", d.artifacts.map((x, j) => (j === i ? { ...x, name: e.target.value } : x)))} />
+                <TextField
+                  label="Name"
+                  placeholder="image"
+                  value={a.name}
+                  onChange={(e) =>
+                    set(
+                      "artifacts",
+                      d.artifacts.map((x, j) => (j === i ? { ...x, name: e.target.value } : x)),
+                    )
+                  }
+                />
                 <SelectField
                   label="From"
                   value={a.kind}
-                  onChange={(v) => set("artifacts", d.artifacts.map((x, j) => (j === i ? { ...x, kind: v as DraftArtifact["kind"] } : x)))}
+                  onChange={(v) =>
+                    set(
+                      "artifacts",
+                      d.artifacts.map((x, j) => (j === i ? { ...x, kind: v as DraftArtifact["kind"] } : x)),
+                    )
+                  }
                   options={[
                     { value: "image", label: "A registry, tagged by commit" },
                     { value: "published", label: "An image kiln publishes" },
@@ -403,9 +424,25 @@ function Builder() {
                   label={a.kind === "image" ? "Image" : "Published as"}
                   placeholder={a.kind === "image" ? "docker.io/acme/api" : "api"}
                   value={a.value}
-                  onChange={(e) => set("artifacts", d.artifacts.map((x, j) => (j === i ? { ...x, value: e.target.value } : x)))}
+                  onChange={(e) =>
+                    set(
+                      "artifacts",
+                      d.artifacts.map((x, j) => (j === i ? { ...x, value: e.target.value } : x)),
+                    )
+                  }
                 />
-                <Button size="xs" variant="ghost-danger" className="mt-6" aria-label="Remove the artifact" onClick={() => set("artifacts", d.artifacts.filter((_, j) => j !== i))}>
+                <Button
+                  size="xs"
+                  variant="ghost-danger"
+                  className="mt-6"
+                  aria-label="Remove the artifact"
+                  onClick={() =>
+                    set(
+                      "artifacts",
+                      d.artifacts.filter((_, j) => j !== i),
+                    )
+                  }
+                >
                   <Trash2 />
                 </Button>
               </div>
@@ -466,7 +503,7 @@ function Builder() {
                 ))}
               </ul>
             )}
-            <Button size="sm" variant="secondary" disabled={busy || errors.length > 0} onClick={() => void check()}>
+            <Button size="sm" variant="secondary" pending={checking} disabled={errors.length > 0} onClick={check}>
               <Check /> Check it
             </Button>
             {checked && <Checked result={checked.result} stale={!fresh} />}
@@ -477,7 +514,7 @@ function Builder() {
       {(provider?.built || d.platform === KUBERNETES) && (
         <Panel eyebrow="7" title="Keep it" description="In the repository, where kiln reads it at every commit; or in kiln, until it moves to the repository.">
           <div className="flex flex-wrap items-center gap-2">
-            <Button size="sm" disabled={busy || errors.length > 0 || !d.repo || !fresh || !checked?.result.ok} onClick={() => void keep()}>
+            <Button size="sm" pending={keeping} disabled={errors.length > 0 || !d.repo || !fresh || !checked?.result.ok} onClick={keep}>
               Keep in kiln
             </Button>
             <span className="cd-new-note">{fresh && checked?.result.ok ? "Or copy the YAML above into the repository's files: kiln reads them at the next commit." : "Check it first."}</span>
@@ -490,7 +527,12 @@ function Builder() {
 
 /** What kiln made of the draft: each app, where it goes, and what it renders. */
 function Checked({ result, stale }: { result: CdValidation; stale: boolean }) {
-  if (!result.ok) return <p className="cd-notice" data-tone="fail">{result.error}</p>;
+  if (!result.ok)
+    return (
+      <p className="cd-notice" data-tone="fail">
+        {result.error}
+      </p>
+    );
   return (
     <div className="cd-new-checked" data-stale={stale || undefined}>
       {stale && <p className="cd-new-note">Changed since: check it again.</p>}

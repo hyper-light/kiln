@@ -17,6 +17,7 @@ import { Button } from "@/components/ui/button";
 import { Hold, RowsHold } from "@/components/ui/hold";
 import { Loadable } from "@/components/ui/loading";
 import { Confirm, CopyButton, EmptyState, SelectField, TextField } from "@/components/ui/misc";
+import { sendingProps, useAction, useActions } from "@/lib/action";
 import { useAuth } from "@/lib/auth";
 import { harnessSessionsRes, useRes, warm, type Res } from "@/lib/data";
 import { relativeTime } from "@/lib/format";
@@ -131,8 +132,9 @@ function PlanEditor({ id }: { id: string }) {
       .filter((n) => Number.isInteger(n) && n > 0),
   );
   const [cameToRun] = React.useState(() => search.has("pick"));
-  const [busy, setBusy] = React.useState(false);
   const [error, setError] = React.useState<string | null>(null);
+  /** What a save kept, with what the editor said when it went. */
+  const [saved, setSaved] = React.useState<{ p: Plan; sent: Omit<Base, "key"> } | null>(null);
 
   const take = (p: Plan) => {
     const b = baseOf(p);
@@ -142,6 +144,16 @@ function PlanEditor({ id }: { id: string }) {
     setItems(p.items ?? []);
     setTags(b.tags);
   };
+  // Saved, the editor takes what kiln kept and closes if it still says what went; what's written
+  // since stays, unsaved against the version kept (W21-R15).
+  if (saved) {
+    setSaved(null);
+    if (title === saved.sent.title && body === saved.sent.body && JSON.stringify(items) === saved.sent.items && tags === saved.sent.tags) {
+      take(saved.p);
+      setEditing(false);
+      setPicked([]);
+    } else setBase(baseOf(saved.p));
+  }
   const dirty = base !== null && (title !== base.title || body !== base.body || JSON.stringify(items) !== base.items || tagList(tags).join(",") !== tagList(base.tags).join(","));
   // A newer version saved elsewhere comes in, unless there are unsaved changes here.
   if (plan && keyOf(plan) !== base?.key && !dirty) take(plan);
@@ -150,22 +162,17 @@ function PlanEditor({ id }: { id: string }) {
   // What each step waits for, as it'll run: as they say, or each the one before.
   const waits = effectiveNeeds(items.map((x) => x.needs));
 
-  const save = async () => {
-    setBusy(true);
-    setError(null);
-    try {
+  const [save, saving] = useAction(
+    async () => {
+      setError(null);
+      const sent = { title, body, items: JSON.stringify(items), tags };
       const p = await plansApi.update(id, { title, body, items, tags: tagList(tags) });
+      setSaved({ p, sent });
       res.setData(() => p);
-      take(p);
       invalidate("plans");
-      setEditing(false);
-      setPicked([]);
-    } catch (e) {
-      setError(errorMessage(e));
-    } finally {
-      setBusy(false);
-    }
-  };
+    },
+    (e) => setError(errorMessage(e)),
+  );
   const discard = () => {
     if (plan) take(plan);
   };
@@ -264,8 +271,8 @@ function PlanEditor({ id }: { id: string }) {
           </label>
           <TextField label="Tags" value={tags} onChange={(e) => setTags(e.target.value)} placeholder="release, parser" hint="Separated by commas." />
           <div className="plan-actions">
-            <Button size="sm" disabled={!dirty || busy || (!body.trim() && items.length === 0)} onClick={() => void save()}>
-              {busy ? "Saving…" : "Save changes"}
+            <Button size="sm" disabled={!dirty || (!body.trim() && items.length === 0)} pending={saving} onClick={save}>
+              {saving ? "Saving…" : "Save changes"}
             </Button>
             <Button
               size="sm"
@@ -357,7 +364,6 @@ function RunPlan({ plan, dirty, picked, onPicked, onRan, focus }: { plan: Plan; 
   const [modeChoice, setMode] = React.useState<PlanMode>("message");
   // As goals, each step a goal stack of its own: its acceptance criteria and tests, a goal each.
   const [split, setSplit] = React.useState(true);
-  const [busy, setBusy] = React.useState(false);
   const [ran, setRan] = React.useState<PlanRan | null>(null);
   const [started, setStarted] = React.useState<PlanStarted | null>(null);
   const [error, setError] = React.useState<string | null>(null);
@@ -380,12 +386,11 @@ function RunPlan({ plan, dirty, picked, onPicked, onRan, focus }: { plan: Plan; 
   /** The run asked and its key, until it's started (CP-T3.2). */
   const [tries] = React.useState(() => new Tries(clientId));
 
-  const run = async () => {
-    setBusy(true);
-    setError(null);
-    setRan(null);
-    setStarted(null);
-    try {
+  const [run, running] = useAction(
+    async () => {
+      setError(null);
+      setRan(null);
+      setStarted(null);
       const to = { target, kind, cwd: cwd.trim() || undefined };
       const only = some ? picked : undefined;
       const splits = mode === "goals" && checks && split;
@@ -396,12 +401,9 @@ function RunPlan({ plan, dirty, picked, onPicked, onRan, focus }: { plan: Plan; 
       tries.done();
       onPicked([]);
       onRan();
-    } catch (e) {
-      setError(errorMessage(e));
-    } finally {
-      setBusy(false);
-    }
-  };
+    },
+    (e) => setError(errorMessage(e)),
+  );
 
   return (
     <section className="plan-section" id="plan-run" aria-label="Run the plan" ref={focus ? (el) => el?.scrollIntoView({ block: "start" }) : undefined}>
@@ -466,8 +468,8 @@ function RunPlan({ plan, dirty, picked, onPicked, onRan, focus }: { plan: Plan; 
         </p>
       )}
       <div className="plan-actions">
-        <Button size="sm" variant="secondary" disabled={busy || dirty || (fresh && !kind)} onClick={() => void run()}>
-          {busy ? (mode === "agents" ? "Starting…" : "Sending…") : some ? `Run ${picked.length === 1 ? `step ${picked[0]}` : `${picked.length} steps`}` : "Run plan"}
+        <Button size="sm" variant="secondary" disabled={dirty || (fresh && !kind)} pending={running} onClick={run}>
+          {running ? (mode === "agents" ? "Starting…" : "Sending…") : some ? `Run ${picked.length === 1 ? `step ${picked[0]}` : `${picked.length} steps`}` : "Run plan"}
         </Button>
         {dirty && <span className="plan-dim">Save your changes first: a run sends the saved version.</span>}
         {error && <span className="plan-error">{error}</span>}
@@ -492,23 +494,26 @@ function RunPlan({ plan, dirty, picked, onPicked, onRan, focus }: { plan: Plan; 
 
 /** Share by a link, stop sharing, or export the markdown. */
 function SharePlan({ plan, onChange }: { plan: Plan; onChange: (p: Plan) => void }) {
-  const [busy, setBusy] = React.useState(false);
   const [error, setError] = React.useState<string | null>(null);
   // The address it is opened at, or another the server answers on (its front doors).
   const me = useAuth((s) => (s.kind === "authed" ? s.me : null));
   const [base, setBase] = React.useState(window.location.origin);
   const bases = [...new Set([window.location.origin, ...(me?.origins ?? []), ...(me?.public_url ? [me.public_url.replace(/\/+$/, "")] : [])])];
-  const toggle = async (on: boolean) => {
-    setBusy(true);
-    setError(null);
-    try {
-      onChange(await plansApi.share(plan.id, on));
-    } catch (e) {
-      setError(errorMessage(e));
-    } finally {
-      setBusy(false);
-    }
-  };
+  // Asked, the box shows it at once (W21-R15): its link comes with the answer, and a refusal puts the box back.
+  const [asked, setAsked] = React.useState<boolean | null>(null);
+  const [toggle, sharing] = useAction(
+    async (on: boolean) => {
+      setAsked(on);
+      setError(null);
+      try {
+        onChange(await plansApi.share(plan.id, on));
+      } finally {
+        setAsked(null);
+      }
+    },
+    (e) => setError(errorMessage(e)),
+  );
+  const shared = asked ?? Boolean(plan.share);
   const exportMd = () => {
     const blob = new Blob([planMarkdown(plan.title, plan.body, plan.items ?? [])], { type: "text/markdown" });
     const a = document.createElement("a");
@@ -520,10 +525,10 @@ function SharePlan({ plan, onChange }: { plan: Plan; onChange: (p: Plan) => void
   return (
     <section className="plan-section" aria-label="Share the plan">
       <h2 className="plan-h">Share it</h2>
-      <label className="plan-check">
-        <input type="checkbox" className="check" checked={Boolean(plan.share)} disabled={busy} onChange={(e) => void toggle(e.target.checked)} /> Anyone with the link can read it
+      <label className="plan-check" {...sendingProps(sharing)}>
+        <input type="checkbox" className="check" checked={shared} onChange={(e) => toggle(e.target.checked)} /> Anyone with the link can read it
       </label>
-      {plan.share && (
+      {shared && plan.share && (
         <>
           {bases.length > 1 && <SelectField className="plan-share-base" label="Link through" value={base} onChange={setBase} options={bases.map((b) => ({ value: b, label: b }))} />}
           <div className="plan-link">
@@ -551,6 +556,13 @@ function Versions({ plan, onRestored }: { plan: Plan; onRestored: (p: Plan) => v
   const versions = useSuspenseResource(`plans/${plan.id}/versions`, (s) => plansApi.versions(plan.id, s)).data;
   const [open, setOpen] = React.useState<number | null>(null);
   const [error, setError] = React.useState<string | null>(null);
+  const [restore, restoring] = useActions(
+    async (_key: string, version: number) => {
+      setError(null);
+      onRestored(await plansApi.restore(plan.id, version));
+    },
+    (e) => setError(errorMessage(e)),
+  );
   if (versions.length <= 1) return null;
   return (
     <section className="plan-section" aria-label="Versions">
@@ -569,18 +581,7 @@ function Versions({ plan, onRestored }: { plan: Plan; onRestored: (p: Plan) => v
                 {open === v.version ? "Hide" : "Read"}
               </Button>
               {v.version !== plan.version && (
-                <Button
-                  size="xs"
-                  variant="ghost"
-                  onClick={async () => {
-                    setError(null);
-                    try {
-                      onRestored(await plansApi.restore(plan.id, v.version));
-                    } catch (e) {
-                      setError(errorMessage(e));
-                    }
-                  }}
-                >
+                <Button size="xs" variant="ghost" pending={restoring(String(v.version))} onClick={() => restore(String(v.version), v.version)}>
                   Make current
                 </Button>
               )}
@@ -628,6 +629,15 @@ function DeletePlan({ plan }: { plan: Plan }) {
   const navigate = useNavigate();
   const [asking, setAsking] = React.useState(false);
   const [error, setError] = React.useState<string | null>(null);
+  const [remove, removing] = useAction(
+    async () => {
+      await plansApi.remove(plan.id);
+      invalidate("plans");
+      // Back to the plans of the session it was kept with.
+      await navigate(plan.source?.session ? `/agents/${encodeURIComponent(plan.source.session)}?tab=plan` : "/agents", { replace: true });
+    },
+    (e) => setError(errorMessage(e)),
+  );
   return (
     <section className="plan-section" aria-label="Delete the plan">
       {!asking ? (
@@ -640,20 +650,7 @@ function DeletePlan({ plan }: { plan: Plan }) {
           tone="danger"
           actions={
             <>
-              <Button
-                size="xs"
-                variant="danger"
-                onClick={async () => {
-                  try {
-                    await plansApi.remove(plan.id);
-                    invalidate("plans");
-                    // Back to the plans of the session it was kept with.
-                    navigate(plan.source?.session ? `/agents/${encodeURIComponent(plan.source.session)}?tab=plan` : "/agents", { replace: true });
-                  } catch (e) {
-                    setError(errorMessage(e));
-                  }
-                }}
-              >
+              <Button size="xs" variant="danger" pending={removing} onClick={remove}>
                 Delete
               </Button>
               <Button size="xs" variant="ghost" onClick={() => setAsking(false)}>

@@ -8,6 +8,7 @@ import { shipApi, type ShipCommit, type ShipDetail, type ShipJob, type ShipJobDo
 import { whoSaid } from "@/api/review";
 import { StatusGlyph } from "@/components/ui/status-glyph";
 import { GLYPHS } from "@/components/ui/status-glyph-spec";
+import { sendingProps, useActions } from "@/lib/action";
 import { glyphOf, pickCard, shipGroups, strip } from "./model";
 import { reviewGroup, type ShipLane, type ShipLaneGroup } from "./review/lanes";
 import { formatDuration } from "@/lib/format";
@@ -137,7 +138,6 @@ export function JobsPane({ commit, output }: { commit: ShipCommit; output: (pick
   const [pick, setPick] = React.useState<Pick>({ at: null, sel: [], word: null });
   const [armed, setArmed] = React.useState(false);
   const [said, setSaid] = React.useState<{ text: string; refused: boolean } | null>(null);
-  const [busy, setBusy] = React.useState(false);
   const lanes = React.useMemo(() => stations.flatMap((g) => g.lanes.map((l) => ({ key: `${g.group}|${l.id}`, g, l, job: byLane.get(l.id) }))), [stations, byLane]);
   const at = pick.at ?? pickPart(stations);
   const sel = pick.sel.length ? pick.sel : at ? [at] : [];
@@ -163,10 +163,20 @@ export function JobsPane({ commit, output }: { commit: ShipCommit; output: (pick
     const keys = lanes.filter((x) => x.job && (w === "all" || WORD_OF[x.l.state] === w)).map((x) => x.key);
     choose({ at: keys.includes(at ?? "") ? at : (keys[0] ?? at), sel: keys, word: w });
   };
-  const act = async (verb: ShipVerb) => {
+  // One change to the jobs picked at a time (W21-R15): the verb pressed says it's on its way (Cancel
+  // for Cancel them, once the strip is back to its three) and the others are held until it's back;
+  // other jobs picked meanwhile are free.
+  const target = pick.word
+    ? `scope:${pick.word}`
+    : `jobs:${jobs
+        .map((j) => j.id)
+        .sort()
+        .join(",")}`;
+  const [sent, setSent] = React.useState<Record<string, ShipVerb>>({});
+  const [send, out] = useActions(async (key: string, verb: ShipVerb) => {
+    setSent((m) => ({ ...m, [key]: verb }));
     const ids = jobs.filter((j) => j.verbs.includes(verb)).map((j) => j.id);
     const body = pick.word ? { repo: commit.repo, sha: commit.sha, verb, scope: pick.word } : { repo: commit.repo, sha: commit.sha, verb, jobs: ids };
-    setBusy(true);
     setArmed(false);
     try {
       const r = await shipApi.jobs(body);
@@ -174,10 +184,12 @@ export function JobsPane({ commit, output }: { commit: ShipCommit; output: (pick
     } catch (e) {
       setSaid({ text: `${VERB_WORD[verb]}: ${errorMessage(e)}`, refused: true });
     } finally {
-      setBusy(false);
       detail.reload();
     }
-  };
+  });
+  const act = (verb: ShipVerb) => send(target, verb);
+  const sending = (v: ShipVerb) => out(target) && sent[target] === v;
+  const held = (v: ShipVerb) => out(target) && sent[target] !== v;
   const strip = (live: boolean) => (
     <Strip
       live={live}
@@ -189,12 +201,12 @@ export function JobsPane({ commit, output }: { commit: ShipCommit; output: (pick
         armed
           ? [
               { label: "Keep", on: true, keep: true, run: () => setArmed(false) },
-              { label: "Cancel them", on: !busy, go: true, run: () => void act("cancel") },
+              { label: "Cancel them", on: !held("cancel"), sending: sending("cancel"), go: true, run: () => act("cancel") },
             ]
           : [
-              { label: VERB_WORD.retry, on: !busy && can("retry"), run: () => void act("retry") },
-              { label: VERB_WORD[hold], on: !busy && can(hold), run: () => void act(hold) },
-              { label: VERB_WORD.cancel, on: !busy && can("cancel"), run: () => setArmed(true) },
+              { label: VERB_WORD.retry, on: can("retry") && !held("retry"), sending: sending("retry"), run: () => act("retry") },
+              { label: VERB_WORD[hold], on: can(hold) && !held(hold), sending: sending(hold), run: () => act(hold) },
+              { label: VERB_WORD.cancel, on: can("cancel") && !held("cancel"), sending: sending("cancel"), run: () => setArmed(true) },
             ]
       }
     />
@@ -241,6 +253,8 @@ interface Verb {
   label: string;
   on: boolean;
   run: () => void;
+  /** Its verb's request is on its way: it says so, and a press does nothing. */
+  sending?: boolean;
   keep?: boolean;
   go?: boolean;
 }
@@ -267,7 +281,15 @@ function Strip({ live, say, tone, word, onWord, verbs }: { live: boolean; say: R
       </div>
       <div className="jp-verbs" data-armed={verbs.some((v) => v.go) || undefined}>
         {verbs.map((v) => (
-          <button key={v.label} type="button" disabled={!v.on} data-keep={v.keep || undefined} data-go={v.go || undefined} onClick={v.run}>
+          <button
+            key={v.label}
+            type="button"
+            disabled={!v.on}
+            data-keep={v.keep || undefined}
+            data-go={v.go || undefined}
+            {...sendingProps(Boolean(v.sending))}
+            onClick={v.sending ? undefined : v.run}
+          >
             {v.label}
           </button>
         ))}

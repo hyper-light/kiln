@@ -2,18 +2,29 @@
 import * as React from "react";
 import { DropdownMenu } from "radix-ui";
 import { Check, MoreHorizontal } from "lucide-react";
-import { harnessApi, type AgentInfo, type Command } from "@/api/harness";
+import { harnessApi, sessionStore, type AgentInfo, type Command } from "@/api/harness";
 import { pushApi, pushStateRes } from "@/api/push";
 import { ConfirmDialog } from "@/components/ui/dialog";
 import { toast } from "@/components/ui/toast";
-import { useRes } from "@/lib/data";
+import { sendingProps, useAction } from "@/lib/action";
+import { harnessSessionsRes, useRes } from "@/lib/data";
 import { errorMessage } from "@/lib/hooks";
-import { invalidate } from "@/lib/resource";
+import { change, invalidate } from "@/lib/resource";
 import { copyText } from "@/views/terminal/clipboard";
 import { MoveDialog, movable } from "./move";
 import { useEndWithChildren } from "./family";
 
 const ReachDialog = React.lazy(() => import("./reach").then((m) => ({ default: m.ReachDialog })));
+
+/**
+ * The lists of agents the pages read, every page's (lib/data.ts) and Mission control's
+ * (use-agents.ts), as starting.ts has them: what's done to one here shows in both at once, over a
+ * load already on its way too (`change`).
+ */
+const LISTS = [harnessSessionsRes.key, "harness/agents"];
+const inLists = (f: (l: AgentInfo[]) => AgentInfo[]) => LISTS.forEach((key) => change<AgentInfo[]>(key, f));
+/** Both read again, as the server has them: what was shown at once and didn't go goes back. */
+const readLists = () => LISTS.forEach((key) => invalidate(key));
 
 type Act = "end" | "remove" | "rename" | "duplicate" | "move" | "reach" | null;
 
@@ -22,45 +33,91 @@ export function useAgentActions(
   after?: { onGone?: () => void },
 ) {
   const [act, setAct] = React.useState<Act>(null);
+  /** A command that didn't go says so, and `back` puts back what it showed at once. */
+  const command = (c: Command, what: string, back?: () => void) =>
+    harnessApi.command(a.id, c).catch((e: unknown) => {
+      back?.();
+      toast.error(`Couldn't ${what}`, errorMessage(e));
+    });
+  // Each of its changes goes one at a time (W21-R15): while one is on its way, its item says so and
+  // a press on it does nothing, so no answer lands out of order or puts back a later change.
   // Kiln keeps it going when it stops part-way unless switched off here (shown at once, kept on the server).
   const [keepSet, setKeepSet] = React.useState<boolean | null>(null);
   const keeping = keepSet ?? !a.keep_off;
+  const [keep, keepGoing] = useAction((on: boolean) => {
+    setKeepSet(on);
+    inLists((l) => l.map((x) => (x.id === a.id ? { ...x, keep_off: !on } : x)));
+    return command({ type: "control", id: "keep_going", value: on }, on ? "keep it going" : "stop keeping it going", () => {
+      setKeepSet(!on);
+      readLists();
+    });
+  });
+  // Once the agent says so too, its own word shows (changed elsewhere later, that shows).
+  if (keepSet !== null && !keepGoing && keepSet === !a.keep_off) setKeepSet(null);
+  // A name given here shows at once in both lists, and here while the agent still has the one it
+  // had; back if it couldn't be given. Once it went and the agent's name is another, that one shows
+  // (given again elsewhere too).
+  const [named, setNamed] = React.useState<{ to: string; from: string; went?: boolean } | null>(null);
+  if (named?.went && a.name !== named.from) setNamed(null);
+  const name = named && a.name === named.from ? named.to : a.name;
+  const [rename, naming] = useAction((n: string) => {
+    setNamed({ to: n, from: a.name });
+    inLists((l) => l.map((x) => (x.id === a.id ? { ...x, name: n } : x)));
+    return command({ type: "control", id: "rename", value: n }, "rename it", () => {
+      setNamed(null);
+      readLists();
+    }).then(() => setNamed((cur) => (cur?.to === n ? { ...cur, went: true } : cur)));
+  });
   // Renaming from the menu: the menu mustn't hand focus back to its button, the name field takes it.
   const renameNext = React.useRef(false);
   const live = a.status !== "exited";
-  const command = async (c: Command, what: string) => {
-    try {
-      await harnessApi.command(a.id, c);
-    } catch (e) {
-      toast.error(`Couldn't ${what}`, errorMessage(e));
-    }
-  };
-  // Ending it ends the agents it started too, unless the dialog says otherwise.
+  // Stopped through its session where that shows (its head then says Stopping…, as its own Stop
+  // does); from elsewhere over HTTP, saying so if it couldn't.
+  const [stopTurn, stoppingTurn] = useAction(() => {
+    const s = sessionStore(a.id);
+    if (!s.idle()) return s.stop();
+    return command({ type: "interrupt" }, "interrupt it");
+  });
+  // The menu has closed: a restart says it's on its way.
+  const [restart, restarting] = useAction(() => {
+    toast({ title: `Restarting ${name}`, tone: "running" });
+    return command({ type: "restart" }, "restart it");
+  });
+  // Ending it ends the agents it started too, unless the dialog says otherwise; the dialog says
+  // meanwhile that it's on its way, and why if it couldn't.
   const ending = useEndWithChildren(a.id);
   const end = async () => {
-    try {
-      await (live ? ending.end() : harnessApi.stop(a.id));
-      after?.onGone?.();
-    } catch (e) {
-      toast.error(live ? "Couldn't end the agent" : "Couldn't remove the agent", errorMessage(e));
-    }
+    await ending.end();
+    after?.onGone?.();
   };
-  const items: { label: string; onSelect: () => void; danger?: boolean; hidden?: boolean }[] = [
+  // An ended one leaves both lists at once, and is back if it couldn't go.
+  const [remove, removing] = useAction(async () => {
+    inLists((l) => l.filter((x) => x.id !== a.id));
+    try {
+      await harnessApi.stop(a.id);
+    } catch (e) {
+      readLists();
+      throw e;
+    }
+    after?.onGone?.();
+  }, "Couldn't remove the agent");
+  const items: { label: string; onSelect: () => void; danger?: boolean; hidden?: boolean; going?: boolean }[] = [
     {
       label: "Rename…",
       onSelect: () => {
         renameNext.current = true;
         setAct("rename");
       },
+      going: naming,
     },
-    { label: "Stop the current turn", onSelect: () => void command({ type: "interrupt" }, "interrupt it"), hidden: a.status !== "running" && a.status !== "waiting" },
-    { label: "Restart", onSelect: () => void command({ type: "restart" }, "restart it"), hidden: live },
+    { label: "Stop the current turn", onSelect: stopTurn, hidden: a.status !== "running" && a.status !== "waiting", going: stoppingTurn },
+    { label: "Restart", onSelect: restart, hidden: live, going: restarting },
     { label: "Duplicate…", onSelect: () => setAct("duplicate") },
     // Agents the kiln server itself runs stay there once they've started; an ended one goes nowhere.
     { label: "Move to…", onSelect: () => setAct("move"), hidden: !live || !movable(a) },
     { label: "Where commands run…", onSelect: () => setAct("reach"), hidden: !a.target.startsWith("agent:") },
     { label: "Copy session id", onSelect: () => void copyText(a.harness_session ?? a.id).then((ok) => ok && toast.success("Copied")) },
-    { label: live ? "End agent…" : "Remove", onSelect: () => (live ? setAct("end") : void end()), danger: true },
+    { label: live ? "End agent…" : "Remove", onSelect: () => (live ? setAct("end") : remove()), danger: true, going: removing },
   ];
   const menu = (trigger?: React.ReactNode, extra: { label: string; onSelect: () => void }[] = []) => (
     <DropdownMenu.Root>
@@ -86,24 +143,25 @@ export function useAgentActions(
         >
           {[...extra, ...items]
             .filter((i) => !("hidden" in i && i.hidden))
-            .map((i) => (
-              <DropdownMenu.Item key={i.label} className="menu-item" onSelect={i.onSelect} style={"danger" in i && i.danger ? { color: "var(--color-fail)" } : undefined}>
-                <span className="flex-1">{i.label}</span>
-              </DropdownMenu.Item>
-            ))}
+            .map((i) => {
+              const going = "going" in i && Boolean(i.going);
+              return (
+                <DropdownMenu.Item
+                  key={i.label}
+                  className="menu-item"
+                  {...sendingProps(going)}
+                  onSelect={(e) => (going ? e.preventDefault() : i.onSelect())}
+                  style={"danger" in i && i.danger ? { color: "var(--color-fail)" } : undefined}
+                >
+                  <span className="flex-1">{i.label}</span>
+                </DropdownMenu.Item>
+              );
+            })}
           <DropdownMenu.Separator className="my-1 h-px bg-white/10" />
           <React.Suspense fallback={null}>
             <MuteItem id={a.id} />
           </React.Suspense>
-          <DropdownMenu.CheckboxItem
-            className="menu-item"
-            checked={keeping}
-            onSelect={(e) => e.preventDefault()}
-            onCheckedChange={(on) => {
-              setKeepSet(on);
-              void command({ type: "control", id: "keep_going", value: on }, on ? "keep it going" : "stop keeping it going");
-            }}
-          >
+          <DropdownMenu.CheckboxItem className="menu-item" checked={keeping} {...sendingProps(keepGoing)} onSelect={(e) => e.preventDefault()} onCheckedChange={keep}>
             <span className="flex-1">Keep it going when it stops part-way</span>
             <DropdownMenu.ItemIndicator>
               <Check size={14} aria-hidden="true" />
@@ -136,14 +194,20 @@ export function useAgentActions(
   return {
     menu,
     dialogs,
-    end: () => (live ? setAct("end") : void end()),
+    end: () => (live ? setAct("end") : remove()),
     live,
+    /** An ended one's removal is on its way. */
+    removing,
+    /** Its name as shown: one given here, at once. */
+    name,
+    /** A name given here is on its way: the next waits for it. */
+    naming,
     /** Its name is being edited where it shows (`NameField`). */
     renaming: act === "rename",
-    startRenaming: () => setAct("rename"),
+    startRenaming: () => !naming && setAct("rename"),
     stopRenaming: () => setAct(null),
     /** Names it in kiln (and in its harness, which names conversations too); "" gives it back its harness's name. */
-    rename: (n: string) => command({ type: "control", id: "rename", value: n }, "rename it"),
+    rename,
   };
 }
 
@@ -153,7 +217,7 @@ function MuteItem({ id }: { id: string }) {
   const muted = push.data.muted.includes(id);
   if (!push.data.available && !muted) return null;
   const toggle = () => {
-    push.setData((s) => ({ ...s, muted: muted ? s.muted.filter((m) => m !== id) : [...s.muted, id] }));
+    push.change((s) => ({ ...s, muted: muted ? s.muted.filter((m) => m !== id) : [...s.muted, id] }));
     pushApi.mute(id, !muted).catch((e: unknown) => {
       toast.error(muted ? "Couldn't unmute it" : "Couldn't mute it", errorMessage(e));
       invalidate("push/state");

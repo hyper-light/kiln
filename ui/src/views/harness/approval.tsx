@@ -8,6 +8,7 @@ import { DropdownMenu } from "radix-ui";
 import { ArrowRight, Check, ChevronDown, ShieldAlert, X } from "lucide-react";
 import type { Approval, Command } from "@/api/harness";
 import { Button } from "@/components/ui/button";
+import { useAction } from "@/lib/action";
 import { cn } from "@/lib/utils";
 import { diffStats, relPath, tildify } from "./derive";
 import { DiffStat, FileDiffView } from "./diff";
@@ -130,19 +131,20 @@ function WithExperiment({
 }) {
   const where = useRes(experimentWhereRes(agentId)).data;
   const [error, setError] = React.useState<string | null>(null);
-  if (!where?.may) return render({});
-  const start = async (spec: ExperimentSpec, others: ChoiceAnswer[]) => {
-    setError(null);
-    const q = questions.find((x) => x.question === spec.question);
-    const names: string[] = [];
-    const options = spec.options.map((label) => {
-      const name = optionName(label, names);
-      names.push(name);
-      const description = q?.options.find((o) => o.label === label)?.description;
-      return { name, implement: description ? `${label}: ${description}` : label };
-    });
-    const byLabel = (label: string) => names[spec.options.indexOf(label)] ?? label;
-    try {
+  // Start experiment says it's on its way until kiln has made it (W21-R15), then answers the question.
+  const [start, starting] = useAction(
+    async (spec: ExperimentSpec, others: ChoiceAnswer[]) => {
+      if (!where?.may) return;
+      setError(null);
+      const q = questions.find((x) => x.question === spec.question);
+      const names: string[] = [];
+      const options = spec.options.map((label) => {
+        const name = optionName(label, names);
+        names.push(name);
+        const description = q?.options.find((o) => o.label === label)?.description;
+        return { name, implement: description ? `${label}: ${description}` : label };
+      });
+      const byLabel = (label: string) => names[spec.options.indexOf(label)] ?? label;
       const e = await experimentsApi.start({
         repo: where.repo,
         agent: agentId,
@@ -166,14 +168,15 @@ function WithExperiment({
           other: `Running experiment ${e.id} instead: kiln builds each option with an agent of its own and measures them. Wait for its results, which come as your next message.`,
         },
       ]);
-    } catch (err) {
-      setError(err instanceof Error ? err.message : String(err));
-    }
-  };
+    },
+    (err: unknown) => setError(err instanceof Error ? err.message : String(err)),
+  );
+  if (!where?.may) return render({});
   return (
     <>
       {render({
-        onExperiment: (spec, others) => void start(spec, others),
+        busy: starting || undefined,
+        onExperiment: start,
         pipelines: where.workflows,
         machine: where.machine,
         suggested: where.suggested?.map((s) => ({ question: s.question, criteria: s.criteria.map(criterionFrom) })),

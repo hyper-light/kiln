@@ -25,7 +25,7 @@ export function SignedIn() {
         <Splash />
       ) : auth.kind === "anon" ? (
         <React.Suspense fallback={<Splash />}>
-          <Login error={auth.error} onRetry={() => void checkAuth()} />
+          <Login error={auth.error} onRetry={checkAuth} />
         </React.Suspense>
       ) : (
         <AppShell me={auth.me} />

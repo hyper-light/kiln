@@ -13,11 +13,12 @@ import { TableHold } from "@/components/ui/hold";
 import { Loadable } from "@/components/ui/loading";
 import { PageIntro } from "@/components/ui/misc";
 import { toast } from "@/components/ui/toast";
+import { useActions } from "@/lib/action";
 import { useRes } from "@/lib/data";
 import { errorMessage } from "@/lib/hooks";
 import { invalidate } from "@/lib/resource";
 import { swapped } from "@/lib/utils";
-import { ObserveNav, scanningGroupsRes } from "./parts";
+import { ObserveNav, scanningGroupsRes, useMoves } from "./parts";
 
 export default function Scanner() {
   return (
@@ -68,28 +69,46 @@ function State({ on }: { on: boolean }) {
 }
 
 function List() {
-  const all = useRes(scanningGroupsRes).data;
+  const res = useRes(scanningGroupsRes);
+  const all = res.data;
   const [removing, setRemoving] = React.useState<ScanningGroup | null>(null);
   const act = async (what: string, f: () => Promise<unknown>) => {
     try {
       await f();
       invalidate("observe/scanner/groups");
+      return true;
     } catch (e) {
       toast({ title: `Couldn't ${what}`, description: errorMessage(e), tone: "failed" });
+      return false;
     }
   };
+  const putBack = (ok: boolean) => {
+    if (!ok) invalidate(scanningGroupsRes.key);
+  };
+  // Turned on or off, and moved, at once (W21-R15), and put back if the server refuses; a group's
+  // next turn waits for its answer, so an answer never undoes a later turn.
+  const [turn, turning] = useActions((_id: string, g: ScanningGroup) => {
+    const on = !g.is_enabled;
+    res.change((l) => l.map((x) => (x.id === g.id ? { ...x, is_enabled: on } : x)));
+    return act(on ? "turn it on" : "turn it off", () => observeApi.updateScanningGroup(g.id, { ...g, is_enabled: on })).then(putBack);
+  });
+  const moves = useMoves();
   const move = (i: number, by: -1 | 1) => {
     const j = i + by;
-    if (j < 0 || j >= all.length) return;
-    void act("move it", () =>
-      observeApi.orderScanningGroups(
-        swapped(
-          all.map((g) => g.id),
-          i,
-          j,
+    const g = all[i];
+    if (!g || j < 0 || j >= all.length) return;
+    moves.move(g.id, by, () => {
+      res.change((l) => swapped(l, i, j));
+      return act("move it", () =>
+        observeApi.orderScanningGroups(
+          swapped(
+            all.map((x) => x.id),
+            i,
+            j,
+          ),
         ),
-      ),
-    );
+      ).then(putBack);
+    });
   };
   if (all.length === 0)
     return (
@@ -110,18 +129,14 @@ function List() {
               // On a phone they go under its name, which keeps the row's width.
               const controls = (
                 <>
-                  <Button
-                    variant="ghost"
-                    size="xs"
-                    onClick={() => void act(g.is_enabled ? "turn it off" : "turn it on", () => observeApi.updateScanningGroup(g.id, { ...g, is_enabled: !g.is_enabled }))}
-                  >
+                  <Button variant="ghost" size="xs" pending={turning(g.id)} onClick={() => turn(g.id, g)}>
                     {g.is_enabled ? "Turn off" : "Turn on"}
                     <span className="sr-only"> {g.name}</span>
                   </Button>
-                  <Button variant="ghost" size="xs" aria-label={`Move ${g.name} up`} disabled={i === 0} onClick={() => move(i, -1)}>
+                  <Button variant="ghost" size="xs" aria-label={`Move ${g.name} up`} {...moves.props(g.id, -1, i === 0)} onClick={() => move(i, -1)}>
                     <ArrowUp />
                   </Button>
-                  <Button variant="ghost" size="xs" aria-label={`Move ${g.name} down`} disabled={i === all.length - 1} onClick={() => move(i, 1)}>
+                  <Button variant="ghost" size="xs" aria-label={`Move ${g.name} down`} {...moves.props(g.id, 1, i === all.length - 1)} onClick={() => move(i, 1)}>
                     <ArrowDown />
                   </Button>
                   <Button variant="ghost-danger" size="xs" aria-label={`Remove ${g.name}`} onClick={() => setRemoving(g)}>

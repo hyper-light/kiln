@@ -15,6 +15,7 @@ import { api } from "@/api/client";
 import { harnessApi, type AgentInfo, type BesideTerminal } from "@/api/harness";
 import { charKey, namedKey, type NamedKey } from "@/components/terminal/keys";
 import { SelectField } from "@/components/ui/misc";
+import { sendingProps } from "@/lib/action";
 import { errorMessage, useLocalStorage, useMediaQuery } from "@/lib/hooks";
 import { useSuspenseResource } from "@/lib/resource";
 import { Loading } from "@/components/ui/loading";
@@ -26,16 +27,17 @@ import "./beside.css";
 // not with the agent's page.
 const TerminalSession = React.lazy(() => import("@/views/terminal/session").then((m) => ({ default: m.TerminalSession })));
 
-/** What was done here to an agent's terminals: opened, closed, the one shown, what went wrong or what it said. */
+/** What was done here to an agent's terminals: opened, closed, the one shown, what went wrong or what it said; `opening`, how many were asked for and aren't here yet. */
 interface Here {
   opened: BesideTerminal[];
   closed: string[];
   current: string | null;
   error: string | null;
   said: string | null;
+  opening: number;
 }
 
-const NOTHING: Here = { opened: [], closed: [], current: null, error: null, said: null };
+const NOTHING: Here = { opened: [], closed: [], current: null, error: null, said: null, opening: 0 };
 
 const useHere = create<{ by: Record<string, Here> }>()(() => ({ by: {} }));
 const change = (agent: string, f: (h: Here) => Here) => useHere.setState((s) => ({ by: { ...s.by, [agent]: f(s.by[agent] ?? NOTHING) } }));
@@ -43,17 +45,26 @@ const change = (agent: string, f: (h: Here) => Here) => useHere.setState((s) => 
 /**
  * Opens a terminal beside an agent (from the composer: `!command`, /terminal, a command only its
  * own screen does): its shell, with `command` run in it, or its harness's own screen on `command`.
- * It shows under the conversation, brought into view.
+ * It shows under the conversation, brought into view; until it's open there, its place shows at once
+ * with the loader in it (W21-R15).
  */
 export function openBeside(agent: string, what: "shell" | "screen", command?: string) {
-  change(agent, (h) => ({ ...h, error: null, said: null }));
+  change(agent, (h) => ({ ...h, error: null, said: null, opening: h.opening + 1 }));
+  const into = () => requestAnimationFrame(() => document.querySelector(".bt")?.scrollIntoView({ block: "nearest", behavior: "smooth" }));
+  into();
   const width = document.querySelector<HTMLElement>(".hx-timeline .hx-flow")?.clientWidth || 760;
   harnessApi.openTerminal(agent, { what, command, cols: Math.max(40, Math.floor((width - 28) / 7.8)), rows: 26 }).then(
     (b) => {
-      change(agent, (h) => ({ ...h, opened: [b, ...h.opened.filter((x) => x.terminal.id !== b.terminal.id)], closed: h.closed.filter((id) => id !== b.terminal.id), current: b.terminal.id }));
-      requestAnimationFrame(() => document.querySelector(".bt")?.scrollIntoView({ block: "nearest", behavior: "smooth" }));
+      change(agent, (h) => ({
+        ...h,
+        opening: h.opening - 1,
+        opened: [b, ...h.opened.filter((x) => x.terminal.id !== b.terminal.id)],
+        closed: h.closed.filter((id) => id !== b.terminal.id),
+        current: b.terminal.id,
+      }));
+      into();
     },
-    (e: unknown) => change(agent, (h) => ({ ...h, error: errorMessage(e) })),
+    (e: unknown) => change(agent, (h) => ({ ...h, opening: h.opening - 1, error: errorMessage(e) })),
   );
 }
 
@@ -96,7 +107,7 @@ function Terminals({ agent, info, onInsert }: BesideProps) {
     const opened = new Set(here.opened.map((b) => b.terminal.id));
     return [...here.opened, ...there.data.filter((b) => !b.terminal.exited && !opened.has(b.terminal.id))].filter((b) => !here.closed.includes(b.terminal.id));
   }, [here.opened, here.closed, there.data]);
-  const { current, error, said } = here;
+  const { current, error, said, opening } = here;
   const setCurrent = (id: string) => change(agent, (h) => ({ ...h, current: id }));
   const [states, setStates] = React.useState<Record<string, SessionState>>({});
   const handle = React.useRef<SessionHandle | null>(null);
@@ -124,13 +135,10 @@ function Terminals({ agent, info, onInsert }: BesideProps) {
     [agent, list, harness],
   );
 
-  const close = async (b: BesideTerminal) => {
-    try {
-      await api.closeTerminalSession(b.terminal.id);
-    } catch {
-      /* already gone */
-    }
+  // It goes at once (W21-R15); closing one that's already gone there changes nothing.
+  const close = (b: BesideTerminal) => {
     onClosed(b.terminal.id);
+    void api.closeTerminalSession(b.terminal.id).catch(() => undefined);
   };
 
   /** The end of what's on its screen, as a block for the message. */
@@ -149,7 +157,7 @@ function Terminals({ agent, info, onInsert }: BesideProps) {
     h.focus();
   };
 
-  if (!shown && !error && !said) return null;
+  if (!shown && !error && !said && !opening) return null;
   const where = info ? `${machineName(info.target)} · ${info.cwd || "~"}` : "";
   const labelOf = (b: BesideTerminal) => (b.what === "shell" ? "Shell" : `${harness}${b.command ? ` · ${b.command}` : ""}`);
 
@@ -157,9 +165,15 @@ function Terminals({ agent, info, onInsert }: BesideProps) {
     <section className="bt" aria-label="Terminal beside the agent">
       {error && <p className="bt-error">{error}</p>}
       {said && !shown && <p className="bt-said">{said}</p>}
+      {!shown && opening > 0 && (
+        <div className="bt-screen">
+          <Loading label="Opening the terminal" block />
+        </div>
+      )}
       {shown && (
         <>
-          <div className="bt-head">
+          {/* A terminal asked for while this one shows: this one's head says that one is on its way (W21-R15). */}
+          <div className="bt-head" {...sendingProps(opening > 0)}>
             <div className="bt-what">
               <span className="bt-name">{shown.what === "shell" ? "Shell" : `${harness} · its own screen`}</span>
               <span className="bt-where">{where}</span>
@@ -168,7 +182,7 @@ function Terminals({ agent, info, onInsert }: BesideProps) {
               <button type="button" className="bt-btn" onClick={hand} disabled={st?.kind !== "open"}>
                 <CornerDownLeft size={13} aria-hidden="true" /> Add to message
               </button>
-              <button type="button" className="bt-btn bt-close" aria-label={`Close ${labelOf(shown)}`} onClick={() => void close(shown)}>
+              <button type="button" className="bt-btn bt-close" aria-label={`Close ${labelOf(shown)}`} onClick={() => close(shown)}>
                 <X size={13} aria-hidden="true" /> Close
               </button>
             </div>

@@ -9,6 +9,7 @@ import { api } from "@/api/client";
 import type { Place, PlaceMachine, PlaceTask, SyncMode, TaskSource } from "@/api/types";
 import { Button } from "@/components/ui/button";
 import { SelectField, TextField } from "@/components/ui/misc";
+import { useAction } from "@/lib/action";
 import { cn } from "@/lib/utils";
 import { errorMessage } from "@/lib/hooks";
 import { MODES } from "../sync";
@@ -61,7 +62,19 @@ interface Pick {
   typed: boolean;
 }
 
-export function PutForm({ entry, machines, mode: initial, onStarted, onCancel }: { entry: Entry; machines: PlaceMachine[]; mode: PutMode; onStarted: (tasks: PlaceTask[]) => void; onCancel: () => void }) {
+export function PutForm({
+  entry,
+  machines,
+  mode: initial,
+  onStarted,
+  onCancel,
+}: {
+  entry: Entry;
+  machines: PlaceMachine[];
+  mode: PutMode;
+  onStarted: (tasks: PlaceTask[]) => void;
+  onCancel: () => void;
+}) {
   const byName = React.useMemo(() => new Map(machines.map((m) => [m.name, m])), [machines]);
   const [mode, setMode] = React.useState<PutMode>(initial);
   const sources = React.useMemo(() => sourcesOf(entry, byName, mode), [entry, byName, mode]);
@@ -72,12 +85,19 @@ export function PutForm({ entry, machines, mode: initial, onStarted, onCancel }:
   const [keeps, setKeeps] = React.useState<SyncMode>("files_and_git");
   const choosesKeeps = mode === "sync" && !entry.synced && Boolean(source?.git);
   const [picks, setPicks] = React.useState<Record<string, Pick>>({});
-  const [busy, setBusy] = React.useState(false);
   const [error, setError] = React.useState<string | null>(null);
 
   const fits = (m: PlaceMachine) => m.connected && (mode === "clone" ? m.can_clone : m.can_sync && (!source?.git || m.can_clone));
   const why = (m: PlaceMachine) =>
-    !m.connected ? "offline" : mode === "clone" && !m.can_clone ? "its runner is too old to clone: upgrade it" : mode === "sync" && !m.can_sync ? "its runner is too old to sync: upgrade it" : source?.git && !m.can_clone ? "its runner is too old to clone: upgrade it" : null;
+    !m.connected
+      ? "offline"
+      : mode === "clone" && !m.can_clone
+        ? "its runner is too old to clone: upgrade it"
+        : mode === "sync" && !m.can_sync
+          ? "its runner is too old to sync: upgrade it"
+          : source?.git && !m.can_clone
+            ? "its runner is too old to clone: upgrade it"
+            : null;
   const sorted = [...machines].sort((a, b) => Number(b.connected) - Number(a.connected) || a.name.localeCompare(b.name));
   const fallback = defaultPath(entry, byName, source?.place);
   const pathOf = (m: string) => picks[m]?.path ?? fallback;
@@ -109,7 +129,9 @@ export function PutForm({ entry, machines, mode: initial, onStarted, onCancel }:
     ...count((m) => [m.os]).map(([v, c]) => ({ id: `os:${v}`, label: osLabel(v), count: c, want: (m: PlaceMachine) => m.os === v })),
     ...count((m) => [m.arch]).map(([v, c]) => ({ id: `arch:${v}`, label: v, count: c, want: (m: PlaceMachine) => m.arch === v })),
     // Labels that only say a machine's OS or architecture again are left out.
-    ...count((m) => m.labels.filter((l) => ![m.os, osLabel(m.os), m.arch, m.arch === "aarch64" ? "arm64" : m.arch, m.arch === "x86_64" ? "amd64" : m.arch].some((x) => x.toLowerCase() === l.toLowerCase()))).map(([v, c]) => ({
+    ...count((m) =>
+      m.labels.filter((l) => ![m.os, osLabel(m.os), m.arch, m.arch === "aarch64" ? "arm64" : m.arch, m.arch === "x86_64" ? "amd64" : m.arch].some((x) => x.toLowerCase() === l.toLowerCase())),
+    ).map(([v, c]) => ({
       id: `label:${v}`,
       label: v,
       count: c,
@@ -120,25 +142,23 @@ export function PutForm({ entry, machines, mode: initial, onStarted, onCancel }:
   const branches = (entry.built?.branches ?? []).filter((b) => !b.includes("*"));
   const fromBranchable = source?.from.kind === "kiln" || source?.from.kind === "url";
 
-  const submit = async (e: React.FormEvent) => {
-    e.preventDefault();
-    if (!source) return;
-    setBusy(true);
-    setError(null);
-    try {
+  const [put, putting] = useAction(
+    async (from: TaskSource) => {
+      setError(null);
       const tasks = await api.placesStart(mode, {
         key: entry.key,
-        from: source.from,
+        from,
         branch: fromBranchable && branch.trim() ? branch.trim() : undefined,
         to: chosen.map((m) => ({ machine: m.name, path: pathOf(m.name).trim() })),
         mode: choosesKeeps ? keeps : undefined,
       });
       onStarted(tasks);
-    } catch (err) {
-      setError(errorMessage(err));
-    } finally {
-      setBusy(false);
-    }
+    },
+    (err) => setError(errorMessage(err)),
+  );
+  const submit = (e: React.FormEvent) => {
+    e.preventDefault();
+    if (source) put(source.from);
   };
 
   const n = chosen.length;
@@ -235,8 +255,8 @@ export function PutForm({ entry, machines, mode: initial, onStarted, onCancel }:
       </fieldset>
       {error && <p className="repo-error">{error}</p>}
       <div className="repo-actions">
-        <Button type="submit" size="sm" disabled={busy || !source || n === 0 || chosen.some((m) => !pathOf(m.name).trim())}>
-          {busy ? "Starting…" : n === 0 ? `${verb} to machines` : `${verb} to ${n === 1 ? chosen[0]!.name : `${n} machines`}`}
+        <Button type="submit" size="sm" disabled={!source || n === 0 || chosen.some((m) => !pathOf(m.name).trim())} pending={putting}>
+          {putting ? "Starting…" : n === 0 ? `${verb} to machines` : `${verb} to ${n === 1 ? chosen[0]!.name : `${n} machines`}`}
         </Button>
         <Button type="button" size="sm" variant="ghost" onClick={onCancel}>
           Cancel

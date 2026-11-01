@@ -222,7 +222,7 @@ function Service({ name }: { name: string }) {
           try {
             await observeApi.undefineService(name);
             invalidate("observe/catalog");
-            navigate("/observe/catalog");
+            await navigate("/observe/catalog");
           } catch (e) {
             toast({ title: "Couldn't remove it", description: errorMessage(e), tone: "failed" });
           }

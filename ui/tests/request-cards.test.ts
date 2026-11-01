@@ -40,6 +40,10 @@ test("one card an agent, the most pressing first: requests, goals paused for you
   assert.deepEqual(kinds(fleet), ["request:ask", "request:both", "held:plan", "stopped:crash", "limit:lim"]);
 });
 
+test("W21-R15: goals resumed here and an agent restarted here go at once, as an answer does", () => {
+  assert.deepEqual(kinds(fleet, "/runs", none, new Set(["held:plan:30", "stopped:crash:40"])), ["request:ask", "request:both", "limit:lim"]);
+});
+
 test("none where the page shows it itself: Mission control, and the agent's own pages", () => {
   assert.deepEqual(kinds(fleet, "/agents"), []);
   assert.deepEqual(kinds(fleet, "/agents/plan"), ["request:ask", "request:both", "stopped:crash", "limit:lim"]);

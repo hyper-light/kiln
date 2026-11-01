@@ -12,6 +12,7 @@ import type { Job, KilnBinary, Run, UpdateJob, UpdatesOverview } from "@/api/typ
 import { Button } from "@/components/ui/button";
 import { Confirm } from "@/components/ui/misc";
 import { toast } from "@/components/ui/toast";
+import { useAction } from "@/lib/action";
 import { formatBytes, relativeTime, shortSha } from "@/lib/format";
 import { errorMessage } from "@/lib/hooks";
 import { PEER_BASE } from "@/lib/peer-base";
@@ -46,7 +47,8 @@ export function PlatformsPanel({
   updateJobs: UpdateJob[];
   picked: string | null;
   nowMs: number;
-  uploading: string | null;
+  /** The platforms whose binary is being uploaded. */
+  uploading: string[];
   /** Pick a binary to upload for a platform. */
   onChoose: (target: string) => void;
 }) {
@@ -54,26 +56,18 @@ export function PlatformsPanel({
   const last = build?.last ?? null;
   const building = isBuilding(last);
   const status = build ? buildStatus(build, platforms, nowMs, releaseJobs) : null;
-  const [busy, setBusy] = React.useState(false);
   const [uploadOpen, setUploadOpen] = React.useState(false);
   const [target, setTarget] = React.useState(data.targets[0] ?? "");
   const [removing, setRemoving] = React.useState<string | null>(null);
   const uploadId = React.useId();
   const logId = React.useId();
   const shown = platforms.find((p) => picked === `build:${p.key}`) ?? null;
-  const start = async () => {
+  const [start, starting] = useAction(async () => {
     if (!build) return;
-    setBusy(true);
-    try {
-      const run = await api.buildEveryPlatform();
-      toast({ title: "Building every platform", description: `${build.repo} ${build.pipeline} run #${run.number}`, tone: "running" });
-      readAgainSoon();
-    } catch (e) {
-      toast.error("Couldn't start the build", errorMessage(e));
-    } finally {
-      setBusy(false);
-    }
-  };
+    const run = await api.buildEveryPlatform();
+    toast({ title: "Building every platform", description: `${build.repo} ${build.pipeline} run #${run.number}`, tone: "running" });
+    readAgainSoon();
+  }, "Couldn't start the build");
   const remove = async (p: PlatformView) => {
     try {
       await api.deleteBinary(p.target);
@@ -81,7 +75,8 @@ export function PlatformsPanel({
     } catch (e) {
       toast.error("Couldn't remove it", errorMessage(e));
     } finally {
-      setRemoving(null);
+      // Only its own confirm closes: one opened meanwhile for another platform stays.
+      setRemoving((r) => (r === p.key ? null : r));
     }
   };
   // A tile picked opens its log under the tiles: brought into view where that's below the screen.
@@ -112,7 +107,7 @@ export function PlatformsPanel({
             <Upload /> Upload a build
           </Button>
           {build && (
-            <Button size="xs" variant="secondary" disabled={busy || building || Boolean(build.error)} onClick={() => void start()}>
+            <Button size="xs" variant="secondary" pending={starting} disabled={building || Boolean(build.error)} onClick={start}>
               {building ? "Building…" : "Build every platform"}
             </Button>
           )}
@@ -131,8 +126,8 @@ export function PlatformsPanel({
             </select>
             <ChevronDown size={13} aria-hidden="true" />
           </div>
-          <Button size="xs" variant="secondary" disabled={uploading !== null || !target} onClick={() => onChoose(target)}>
-            {uploading ? "Uploading…" : "Choose a file"}
+          <Button size="xs" variant="secondary" pending={uploading.includes(target)} disabled={!target} onClick={() => onChoose(target)}>
+            {uploading.includes(target) ? "Uploading…" : "Choose a file"}
           </Button>
           <Button size="xs" variant="ghost" onClick={() => setUploadOpen(false)}>
             Cancel
@@ -155,7 +150,7 @@ export function PlatformsPanel({
               onPick={() => choose(p)}
               onRemove={() => setRemoving(p.key)}
               onKeep={() => setRemoving(null)}
-              onRemoved={() => void remove(p)}
+              onRemoved={() => remove(p)}
               onChoose={onChoose}
             />
           ))}
@@ -211,11 +206,11 @@ function PlatformTile({
   logId: string;
   nowMs: number;
   removing: boolean;
-  uploading: string | null;
+  uploading: string[];
   onPick: () => void;
   onRemove: () => void;
   onKeep: () => void;
-  onRemoved: () => void;
+  onRemoved: () => Promise<void>;
   onChoose: (target: string) => void;
 }) {
   const b = p.binary;
@@ -281,8 +276,8 @@ function PlatformTile({
           </Button>
         )}
         {!b && (
-          <Button size="xs" variant="ghost" disabled={uploading !== null} onClick={() => onChoose(p.target)}>
-            {uploading === p.target ? "Uploading…" : "Upload a build"}
+          <Button size="xs" variant="ghost" pending={uploading.includes(p.target)} onClick={() => onChoose(p.target)}>
+            {uploading.includes(p.target) ? "Uploading…" : "Upload a build"}
           </Button>
         )}
       </div>
@@ -291,7 +286,8 @@ function PlatformTile({
 }
 
 /** Removing a platform's binary, confirmed in place: what runners get instead. */
-function RemoveConfirm({ target, binary, shadowed, onRemoved, onKeep }: { target: string; binary: KilnBinary; shadowed: boolean; onRemoved: () => void; onKeep: () => void }) {
+function RemoveConfirm({ target, binary, shadowed, onRemoved, onKeep }: { target: string; binary: KilnBinary; shadowed: boolean; onRemoved: () => Promise<void>; onKeep: () => void }) {
+  const [remove, removing] = useAction(onRemoved);
   return (
     <Confirm
       className="up-confirm"
@@ -299,7 +295,7 @@ function RemoveConfirm({ target, binary, shadowed, onRemoved, onKeep }: { target
       tone="danger"
       actions={
         <>
-          <Button size="xs" variant="danger" onClick={onRemoved}>
+          <Button size="xs" variant="danger" pending={removing} onClick={remove}>
             Remove
           </Button>
           <Button size="xs" variant="ghost" onClick={onKeep}>

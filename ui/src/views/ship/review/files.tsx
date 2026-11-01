@@ -3,7 +3,8 @@
  * R13), whatever the item's stage. A kiln change's Files draw its threads on their lines, its
  * conflicts where they fall, the kinds row and Approve by the gate's words, and the vorpal search;
  * a host's pull request reads and writes through the forge seam; a commit with no change shows
- * its diff from its parent, no Approve. Data through Suspense, mutations through React Actions.
+ * its diff from its parent, no Approve. Data through Suspense; a mutation shows at once where its
+ * outcome is known, and none runs in a transition (W21-R15).
  */
 import * as React from "react";
 import {
@@ -29,7 +30,7 @@ import { AboutContext, type AboutAgent } from "@/components/code/about";
 import { toast } from "@/components/ui/toast";
 import { useRes, warm } from "@/lib/data";
 import { errorMessage } from "@/lib/hooks";
-import { invalidate, setData } from "@/lib/resource";
+import { change, invalidate } from "@/lib/resource";
 import { parsePatch, type PatchFile } from "@/views/review/patch";
 import { Conversation, ConvoBox, Description } from "./convo";
 import { FileDiff, makeLinesOf, useThreadMap, WholeFile, type FilesCtx } from "./diffs";
@@ -193,34 +194,36 @@ function KilnFiles({ item }: { item: ShipCommit }) {
   const fileList = useStable(files.files, JSON.stringify(files.files));
   const list = React.useMemo(() => parsePatch(files.patch), [files.patch]);
   const rowsByFile = React.useMemo(() => new Map(list.map((f) => [f.path, rowsOf(f)])), [list]);
-  // Mutations are React Actions with optimistic state: the change shows at once, then the server's
-  // answer is written into the resource (setData) before the refresh it asks for lands.
-  const [shown, patchThreads] = React.useOptimistic(threads, applyThreadPatch);
+  // Mutations show at once: what one changes in place is a patch over kiln's threads while it's on
+  // its way. Answered, the change is written into the resource (change) before the patch comes off,
+  // ahead of the refresh it asks for; refused, the patch comes off and the threads are kiln's again.
+  // Plain state, not useOptimistic, whose transition would hold every other one begun meanwhile
+  // until the server answered (W21-R15).
+  const [patches, setPatches] = React.useState<readonly ThreadPatch[]>([]);
+  const shown = React.useMemo(() => (patches.length ? patches.reduce(applyThreadPatch, threads) : threads), [threads, patches]);
   const map = useThreadMap(shown, version);
   const meta = React.useMemo(() => new Map(fileList.map((f) => [f.path, f])), [fileList]);
   const linesOf = React.useMemo(() => makeLinesOf(rowsByFile), [rowsByFile]);
-  const act = React.useCallback(
-    (f: (patch: (p: ThreadPatch) => void) => Promise<void>) =>
-      new Promise<void>((res, rej) =>
-        React.startTransition(async () => {
-          try {
-            await f(patchThreads);
-            res();
-          } catch (e) {
-            rej(e);
-          }
-        }),
-      ),
-    [patchThreads],
-  );
+  const act = React.useCallback(async (f: (patch: (p: ThreadPatch) => void) => Promise<void>) => {
+    const mine: ThreadPatch[] = [];
+    try {
+      await f((p) => {
+        mine.push(p);
+        setPatches((was) => [...was, p]);
+      });
+    } finally {
+      if (mine.length) setPatches((was) => was.filter((p) => !mine.includes(p)));
+    }
+  }, []);
 
   const fullOps: Ops = React.useMemo(() => {
-    const merge = (p: ThreadPatch) => setData<{ threads: Thread[] }>(`review/comments/${key}`, (s) => ({ ...s, threads: applyThreadPatch(s.threads, p) }));
+    // Written over a load already on its way too, which read the threads before it (lib/resource.ts's change).
+    const merge = (p: ThreadPatch) => change<{ threads: Thread[] }>(`review/comments/${key}`, (s) => ({ ...s, threads: applyThreadPatch(s.threads, p) }));
     return {
       ...ops,
       // What goes out new (a comment, a thread) is written optimistically into the resource at
       // once and swapped for the server's ids when they land, or taken back out when refused;
-      // what changes in place (resolve, kind, edit, delete) goes through useOptimistic's patch.
+      // what changes in place (resolve, kind, edit, delete) is a patch over the threads shown.
       commentAt: (file, line, side, body, kind, start) =>
         act(async () => {
           const t = pendingThread(ops.me, version, { file, side, line, start }, kind, pendingComment(ops.me, body));
@@ -299,12 +302,16 @@ function KilnFiles({ item }: { item: ShipCommit }) {
   }, [ops, act, key, version]);
 
   // Viewed, kept by kiln for the change: the file folds at once, and its files are read again so it
-  // opens folded next time (Changes plan 01a17bd748ff73d98f09996ecdc6873d, step 2).
+  // opens folded next time (Changes plan 01a17bd748ff73d98f09996ecdc6873d, step 2). One kiln
+  // refuses says why, and its box goes back (W21-R15).
   const viewed = React.useCallback(
     (file: string, on: boolean) =>
-      void reviewApi.viewed(key, file, on).then(
+      reviewApi.viewed(key, file, on).then(
         () => invalidate(`review/files/${key}/`),
-        (e: unknown) => toast.error("Couldn't mark it viewed", errorMessage(e)),
+        (e: unknown) => {
+          toast.error("Couldn't mark it viewed", errorMessage(e));
+          throw e;
+        },
       ),
     [key],
   );

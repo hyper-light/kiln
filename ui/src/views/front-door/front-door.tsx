@@ -17,6 +17,7 @@ import { Button } from "@/components/ui/button";
 import { Hold } from "@/components/ui/hold";
 import { Loadable } from "@/components/ui/loading";
 import { SectionHeading } from "@/components/ui/misc";
+import { useAction } from "@/lib/action";
 import type { Res } from "@/lib/data";
 import { errorMessage } from "@/lib/hooks";
 import { getPref, setPref } from "@/lib/prefs";
@@ -73,8 +74,8 @@ export function FrontDoorSection({ agents, index }: { agents: Agent[]; index: st
               onChange={(e) => {
                 const v = e.target.value;
                 setPref(PICKED, v);
-                // The runner shown stays until the one chosen is in.
-                React.startTransition(() => setPicked(v));
+                // The runner chosen shows at once, its front door loading in its place (W21-R15).
+                setPicked(v);
               }}
             >
               {runners.map((a) => (
@@ -181,7 +182,6 @@ function FrontDoorPanel({ runner }: { runner: string }) {
   const v = view.data;
   const saved = React.useMemo(() => draftOf(v.settings), [v]);
   const [draft, setDraft] = React.useState<Draft | null>(null);
-  const [saving, setSaving] = React.useState(false);
   const [msg, setMsg] = React.useState<{ tone: "ok" | "error" | "quiet"; text: string } | null>(null);
   // Until something is typed, the form follows what is stored (another tab, another admin).
   const d = draft ?? saved;
@@ -191,24 +191,22 @@ function FrontDoorPanel({ runner }: { runner: string }) {
     setMsg(null);
   };
 
-  const save = async () => {
-    const s = settingsOf(d, v.settings);
-    if (typeof s === "string") {
-      setMsg({ tone: "error", text: s });
-      return;
-    }
-    setSaving(true);
-    try {
+  const [send, saving] = useAction(
+    async (s: FrontDoorSettings) => {
+      // What's changed after the press stays: the form follows what's stored again only if it's unchanged.
+      const sent = draft;
       const next = await frontDoorApi.save(runner, s);
       view.setData(() => next);
-      setDraft(null);
+      setDraft((cur) => (cur === sent ? null : cur));
       setMsg({ tone: "ok", text: next.connected ? `Saved. ${runner} applies it now.` : `Saved. ${runner} applies it when it connects.` });
       invalidate("front-door");
-    } catch (e) {
-      setMsg({ tone: "error", text: errorMessage(e) });
-    } finally {
-      setSaving(false);
-    }
+    },
+    (e) => setMsg({ tone: "error", text: errorMessage(e) }),
+  );
+  const save = () => {
+    const s = settingsOf(d, v.settings);
+    if (typeof s === "string") setMsg({ tone: "error", text: s });
+    else send(s);
   };
 
   return (
@@ -218,7 +216,7 @@ function FrontDoorPanel({ runner }: { runner: string }) {
         className="fd-form"
         onSubmit={(e) => {
           e.preventDefault();
-          void save();
+          save();
         }}
       >
         <NamesGroup d={d} set={set} />
@@ -226,10 +224,10 @@ function FrontDoorPanel({ runner }: { runner: string }) {
         <TailnetGroup d={d} set={set} v={v} />
         <HttpsGroup d={d} set={set} v={v} onView={(next) => view.setData(() => next)} />
         <div className="fd-actions">
-          <Button type="submit" size="xs" className="fd-btn" disabled={saving || !dirty}>
+          <Button type="submit" size="xs" className="fd-btn" pending={saving} disabled={!dirty}>
             {saving ? "Saving…" : "Save"}
           </Button>
-          <Button type="button" size="xs" variant="ghost" className="fd-btn" disabled={saving || !dirty} onClick={() => setDraft(null)}>
+          <Button type="button" size="xs" variant="ghost" className="fd-btn" disabled={!dirty} onClick={() => setDraft(null)}>
             Revert
           </Button>
           <span className="fd-msg" role="status" data-tone={msg?.tone ?? "quiet"}>
@@ -277,7 +275,9 @@ function linesOf(v: FrontDoorView | undefined): Line[] {
   const s = v?.settings;
   const st = v?.status ?? null;
   const offline = (name: string, on: boolean, detail: string): Line =>
-    on ? { name, state: "waiting", text: !v ? "…" : !v.connected ? "runner offline" : v.supported === false ? "this runner's kiln is too old" : "waiting for the runner", detail } : { name, state: "off", text: "off", muted: true };
+    on
+      ? { name, state: "waiting", text: !v ? "…" : !v.connected ? "runner offline" : v.supported === false ? "this runner's kiln is too old" : "waiting for the runner", detail }
+      : { name, state: "off", text: "off", muted: true };
   const dnsOn = Boolean(s?.dns.enabled);
   const httpsOn = Boolean(s?.https.enabled);
   const httpOn = httpsOn && (s?.https.http_port ?? 0) !== 0;
@@ -296,7 +296,7 @@ function linesOf(v: FrontDoorView | undefined): Line[] {
     name,
     state: "error",
     text: l.error ?? fallback,
-    detail: l.fix ? undefined : l.error ?? undefined,
+    detail: l.fix ? undefined : (l.error ?? undefined),
     fix: l.fix,
   });
 
@@ -349,7 +349,8 @@ function linesOf(v: FrontDoorView | undefined): Line[] {
     else httpsLine = { name: "HTTPS", state: "on", text: `${at} ✓ · ${kind}${cert.info ? `, until ${date(cert.info.not_after)}` : ""}`, detail: usual };
   } else if (h.state === "waiting" || cert.state === "waiting")
     httpsLine = { name: "HTTPS", state: "waiting", text: cert.state === "waiting" ? "waiting for its self-signed certificate" : (h.error ?? "waiting"), detail: cert.error ?? names };
-  else if (cert.state === "error") httpsLine = { name: "HTTPS", state: "error", text: cert.error ?? "no certificate", detail: cert.mode === "custom" ? "upload a certificate and its key below" : undefined };
+  else if (cert.state === "error")
+    httpsLine = { name: "HTTPS", state: "error", text: cert.error ?? "no certificate", detail: cert.mode === "custom" ? "upload a certificate and its key below" : undefined };
   else httpsLine = failed("HTTPS", h, "not listening");
 
   const lines = [dnsLine, httpsLine];
@@ -375,7 +376,17 @@ function StatusLines({ v }: { v: FrontDoorView | undefined }) {
     <div className="fd-live">
       <div className="fd-live-head">
         <span className="fd-key">Live</span>
-        <span className="fd-when">{v?.status_at ? <>reported <RelTime ts={v.status_at} /></> : v && !v.connected ? "runner offline" : " "}</span>
+        <span className="fd-when">
+          {v?.status_at ? (
+            <>
+              reported <RelTime ts={v.status_at} />
+            </>
+          ) : v && !v.connected ? (
+            "runner offline"
+          ) : (
+            " "
+          )}
+        </span>
       </div>
       <ul className="fd-lines" aria-label="How the front door is doing">
         {lines.map((l) => (
@@ -468,7 +479,9 @@ function NamesGroup({ d, set }: GroupProps) {
           )}
         </Field>
         <Field label="Aliases" hint="More names for the same door, separated by commas.">
-          {(id) => <input id={id} className="fd-input" value={d.aliases} placeholder="ci.home" autoCapitalize="off" autoCorrect="off" spellCheck={false} onChange={(e) => set({ aliases: e.target.value })} />}
+          {(id) => (
+            <input id={id} className="fd-input" value={d.aliases} placeholder="ci.home" autoCapitalize="off" autoCorrect="off" spellCheck={false} onChange={(e) => set({ aliases: e.target.value })} />
+          )}
         </Field>
       </div>
       {/* A .local name: an extra for networks whose DNS you can't set, quieter than the names. */}
@@ -512,18 +525,34 @@ function DnsGroup({ d, set, v }: GroupProps & { v: FrontDoorView }) {
                 </select>
               )}
             </Field>
-            <Field label="Port">
-              {(id) => <input id={id} className="fd-input fd-port" inputMode="numeric" value={d.dnsPort} onChange={(e) => set({ dnsPort: e.target.value })} />}
-            </Field>
+            <Field label="Port">{(id) => <input id={id} className="fd-input fd-port" inputMode="numeric" value={d.dnsPort} onChange={(e) => set({ dnsPort: e.target.value })} />}</Field>
             {d.dnsMode === "resolver" && (
               <Field label="Upstream resolvers" hint="Empty: the runner's own resolvers.">
                 {(id) => (
-                  <input id={id} className="fd-input" value={d.upstream} placeholder={system ?? "the system's"} autoCapitalize="off" spellCheck={false} onChange={(e) => set({ upstream: e.target.value })} />
+                  <input
+                    id={id}
+                    className="fd-input"
+                    value={d.upstream}
+                    placeholder={system ?? "the system's"}
+                    autoCapitalize="off"
+                    spellCheck={false}
+                    onChange={(e) => set({ upstream: e.target.value })}
+                  />
                 )}
               </Field>
             )}
             <Field label="Answer with" hint="Empty: the runner's address on the network that asks.">
-              {(id) => <input id={id} className="fd-input" value={d.addresses} placeholder={lan ?? "192.168.1.77"} autoCapitalize="off" spellCheck={false} onChange={(e) => set({ addresses: e.target.value })} />}
+              {(id) => (
+                <input
+                  id={id}
+                  className="fd-input"
+                  value={d.addresses}
+                  placeholder={lan ?? "192.168.1.77"}
+                  autoCapitalize="off"
+                  spellCheck={false}
+                  onChange={(e) => set({ addresses: e.target.value })}
+                />
+              )}
             </Field>
           </div>
           <p className="fd-hint">
@@ -582,9 +611,7 @@ function HttpsGroup({ d, set, v, onView }: GroupProps & { v: FrontDoorView; onVi
       {d.httpsEnabled && (
         <>
           <div className="fd-grid">
-            <Field label="Port">
-              {(id) => <input id={id} className="fd-input fd-port" inputMode="numeric" value={d.httpsPort} onChange={(e) => set({ httpsPort: e.target.value })} />}
-            </Field>
+            <Field label="Port">{(id) => <input id={id} className="fd-input fd-port" inputMode="numeric" value={d.httpsPort} onChange={(e) => set({ httpsPort: e.target.value })} />}</Field>
             <Field label="HTTP redirect port" hint="0: no plain-HTTP redirect.">
               {(id) => <input id={id} className="fd-input fd-port" inputMode="numeric" value={d.httpPort} onChange={(e) => set({ httpPort: e.target.value })} />}
             </Field>
@@ -754,7 +781,8 @@ function CertPart({ d, set, v, onView }: GroupProps & { v: FrontDoorView; onView
             size="xs"
             variant="secondary"
             className="fd-btn"
-            disabled={!savedSelf || !online || renewing}
+            pending={renewing}
+            disabled={!savedSelf || !online}
             title="A new key and certificate now; the one in use serves until it is in"
             onClick={() => void startRenew()}
           >
@@ -796,25 +824,20 @@ function CertPart({ d, set, v, onView }: GroupProps & { v: FrontDoorView; onView
 function Upload({ v, onView, onDone }: { v: FrontDoorView; onView: (v: FrontDoorView) => void; onDone: () => void }) {
   const [certPem, setCertPem] = React.useState("");
   const [keyPem, setKeyPem] = React.useState("");
-  const [busy, setBusy] = React.useState(false);
   const [note, setNote] = React.useState<{ tone: "ok" | "error"; text: string } | null>(null);
   const fileId = React.useId();
-  const upload = async () => {
-    setBusy(true);
-    setNote(null);
-    try {
+  const [upload, uploading] = useAction(
+    async () => {
+      setNote(null);
       const r = await frontDoorApi.uploadCert(v.runner, certPem, keyPem);
       onView(r.front_door);
       setCertPem("");
       setKeyPem("");
       setNote({ tone: "ok", text: `Sent to ${v.runner}: ${r.cert.names.join(", ")}, until ${date(r.cert.not_after)}. The key stays on the runner.` });
       onDone();
-    } catch (e) {
-      setNote({ tone: "error", text: errorMessage(e) });
-    } finally {
-      setBusy(false);
-    }
-  };
+    },
+    (e) => setNote({ tone: "error", text: errorMessage(e) }),
+  );
   return (
     <div className="fd-custom">
       <div className="fd-grid">
@@ -845,8 +868,8 @@ function Upload({ v, onView, onDone }: { v: FrontDoorView; onView: (v: FrontDoor
             e.target.value = "";
           }}
         />
-        <Button type="button" size="xs" variant="secondary" className="fd-btn" disabled={busy || !certPem.trim() || !keyPem.trim()} onClick={() => void upload()}>
-          {busy ? "Uploading…" : "Upload certificate"}
+        <Button type="button" size="xs" variant="secondary" className="fd-btn" pending={uploading} disabled={!certPem.trim() || !keyPem.trim()} onClick={upload}>
+          {uploading ? "Uploading…" : "Upload certificate"}
         </Button>
         <span className="fd-msg" role="status" data-tone={note?.tone ?? "quiet"}>
           {note?.text ?? (v.connected ? "" : `${v.runner} must be online to take it.`)}

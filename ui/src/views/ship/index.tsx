@@ -17,6 +17,7 @@ import { Loadable, Loading } from "@/components/ui/loading";
 import { EmptyState, PageIntro } from "@/components/ui/misc";
 import { JourneyStrip, StatusGlyph } from "@/components/ui/status-glyph";
 import { toast } from "@/components/ui/toast";
+import { useActions } from "@/lib/action";
 import { errorMessage } from "@/lib/hooks";
 import { Link, useNavigate, useSearchParams } from "@/lib/router";
 import { invalidate, useSuspenseResource } from "@/lib/resource";
@@ -322,16 +323,13 @@ const Row = React.memo(
   (a, b) => a.item === b.item && a.open === b.open && a.narrow.host === b.narrow.host && a.narrow.kind === b.narrow.kind,
 );
 
-/** The row's paired actions, each through the endpoint it names; Review opens the item at its files. */
+/**
+ * The row's paired actions, each through the endpoint it names; Review opens the item at its files.
+ * One on its way says so, holding neither the other nor another row's (W21-R15).
+ */
 function Actions({ commit, reload, onReview }: { commit: ShipCommit; reload: () => void; onReview: () => void }) {
-  const [busy, setBusy] = React.useState<string | null>(null);
   const navigate = useNavigate();
-  const act = async (a: ShipAction) => {
-    if (a.name === "review" && commit.change) {
-      onReview();
-      return;
-    }
-    setBusy(a.name);
+  const send = async (a: ShipAction) => {
     try {
       await shipApi.act(a);
       toast({ title: `${ACTION_WORD[a.name] ?? a.name}: ${commit.change?.name ?? commit.short}`, tone: "succeeded" });
@@ -339,10 +337,9 @@ function Actions({ commit, reload, onReview }: { commit: ShipCommit; reload: () 
       reload();
     } catch (e) {
       toast({ title: `${ACTION_WORD[a.name] ?? a.name} didn't go`, description: errorMessage(e), tone: "failed" });
-    } finally {
-      setBusy(null);
     }
   };
+  const [act, acting] = useActions((_name: string, a: ShipAction) => (a.name === "review" && commit.change ? onReview() : send(a)));
   const acts = (commit.actions ?? []).slice(0, 2);
   // Always a pair of one width: a slot no action fills keeps its place, unseen.
   const slot = (k: number) => (
@@ -360,8 +357,8 @@ function Actions({ commit, reload, onReview }: { commit: ShipCommit; reload: () 
           key={a.name}
           size="xs"
           variant={i === 0 ? "primary" : "secondary"}
-          disabled={busy !== null}
-          onClick={() => (a.method === "GET" && !commit.change ? navigate(a.path.replace(/^\/api/, "")) : void act(a))}
+          pending={acting(a.name)}
+          onClick={() => (a.method === "GET" && !commit.change ? navigate(a.path.replace(/^\/api/, "")) : act(a.name, a))}
         >
           {ACTION_WORD[a.name] ?? a.name}
         </Button>

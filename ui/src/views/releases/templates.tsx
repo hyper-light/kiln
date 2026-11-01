@@ -14,6 +14,7 @@ import { ConfirmDialog, Dialog, DialogContent } from "@/components/ui/dialog";
 import { Loadable } from "@/components/ui/loading";
 import { Crumbs, EmptyState, Facts, Panel } from "@/components/ui/misc";
 import { toast } from "@/components/ui/toast";
+import { useAction } from "@/lib/action";
 import { useRes } from "@/lib/data";
 import { errorMessage } from "@/lib/hooks";
 import { invalidate, useSuspenseResource } from "@/lib/resource";
@@ -86,24 +87,22 @@ function NewTemplate() {
   const navigate = useNavigate();
   const [open, setOpen] = React.useState(false);
   const [text, setText] = React.useState(SKELETON);
-  const [busy, setBusy] = React.useState(false);
   const read = yamlMap(text);
   const wrong = read.error ?? (typeof read.value?.name === "string" && read.value.name.trim() ? null : "It needs a name.");
-  const make = async () => {
+  // Made, it opens the template's page; until it's answered the dialog stays, so a refusal is said
+  // with what was written still there, and Close still closes it (W21-R15).
+  const [make, making] = useAction(async () => {
     if (!read.value) return;
-    setBusy(true);
     try {
       const t = await deployApi.createTemplate(read.value as unknown as Template);
       toast({ title: `Template ${t.name} is made`, tone: "succeeded", href: templateHref(t.name) });
       invalidate("deploy/");
       setOpen(false);
-      navigate(templateHref(t.name));
+      await navigate(templateHref(t.name));
     } catch (e) {
       toast({ title: "Not made", description: errorMessage(e), tone: "failed" });
-    } finally {
-      setBusy(false);
     }
-  };
+  });
   return (
     <>
       <Button size="sm" onClick={() => setOpen(true)}>
@@ -118,7 +117,7 @@ function NewTemplate() {
               <Button variant="ghost" onClick={() => setOpen(false)}>
                 Close
               </Button>
-              <Button disabled={busy || !!wrong} onClick={() => void make()}>
+              <Button disabled={!!wrong} pending={making} onClick={make}>
                 Make it
               </Button>
             </div>
@@ -172,32 +171,42 @@ export default function Templates() {
 }
 
 /** A template changed as YAML, saved whole; or deleted, once no app is made from it. */
-function Edit({ t, using }: { t: Template; using: App[] }) {
+/**
+ * A template's changes (saved, deleted), one at a time (`TemplateView`): `change` sends one, `doing`
+ * the one pressed, `held` the other; `going` holds its editor too, whose text the answer starts again.
+ */
+interface Edits {
+  change: (what: string, f: () => Promise<Template | null>) => void;
+  doing: (what: string) => boolean;
+  held: (what: string) => boolean;
+  going: boolean;
+}
+
+function Edit({ t, using, edits }: { t: Template; using: App[]; edits: Edits }) {
   const navigate = useNavigate();
   const [text, setText] = React.useState(() => toYaml(t));
-  const [busy, setBusy] = React.useState(false);
   const [deleting, setDeleting] = React.useState(false);
   const read = yamlMap(text);
   const wrong = read.error ?? (read.value?.name !== t.name ? `Its name stays ${t.name}: another name is another template.` : null);
-  const save = async () => {
-    if (!read.value) return;
-    setBusy(true);
-    try {
-      await deployApi.putTemplate(read.value as unknown as Template);
-      toast({ title: `${t.name} is saved`, tone: "succeeded" });
-      invalidate("deploy/");
-    } catch (e) {
-      toast({ title: "Not saved", description: errorMessage(e), tone: "failed" });
-    } finally {
-      setBusy(false);
-    }
-  };
+  const save = () =>
+    edits.change("save", async () => {
+      if (!read.value) return null;
+      try {
+        const next = await deployApi.putTemplate(read.value as unknown as Template);
+        toast({ title: `${t.name} is saved`, tone: "succeeded" });
+        invalidate("deploy/");
+        return next;
+      } catch (e) {
+        toast({ title: "Not saved", description: errorMessage(e), tone: "failed" });
+        return null;
+      }
+    });
   const remove = async () => {
     try {
       await deployApi.deleteTemplate(t.name);
       toast({ title: `${t.name} is deleted`, tone: "succeeded" });
       invalidate("deploy/");
-      navigate(templatesHref);
+      await navigate(templatesHref);
     } catch (e) {
       toast({ title: "Not deleted", description: errorMessage(e), tone: "failed" });
     }
@@ -208,16 +217,23 @@ function Edit({ t, using }: { t: Template; using: App[] }) {
       title="The template, as YAML"
       description="Saved whole: what isn't in it is gone. One that makes source repositories is saved by someone who may add them."
       actions={
-        <Button size="sm" variant="ghost-danger" disabled={using.length > 0} title={using.length ? "Apps are made from it" : undefined} onClick={() => setDeleting(true)}>
+        <Button
+          size="sm"
+          variant="ghost-danger"
+          disabled={using.length > 0 || edits.held("delete")}
+          pending={edits.doing("delete")}
+          title={using.length ? "Apps are made from it" : undefined}
+          onClick={() => setDeleting(true)}
+        >
           Delete
         </Button>
       }
     >
-      <YamlEditor value={text} onChange={setText} label={`${t.name}, as YAML`} />
+      <YamlEditor value={text} onChange={setText} label={`${t.name}, as YAML`} held={edits.going} />
       {wrong && <p className="rel-msg">{wrong}</p>}
       {using.length > 0 && <p className="rel-quiet">It can't be deleted while apps are made from it.</p>}
       <div className="rel-settings-actions">
-        <Button size="sm" disabled={busy || !!wrong} onClick={() => void save()}>
+        <Button size="sm" disabled={!!wrong || edits.held("save")} pending={edits.doing("save")} onClick={save}>
           Save
         </Button>
       </div>
@@ -228,14 +244,28 @@ function Edit({ t, using }: { t: Template; using: App[] }) {
         description="No app is made from it. It goes for good."
         confirmLabel="Delete the template"
         danger
-        onConfirm={remove}
+        onConfirm={() => {
+          // Its save waits for its deletion, as for any of its changes.
+          const done = remove();
+          edits.change("delete", () => done.then(() => null));
+          return done;
+        }}
       />
     </Panel>
   );
 }
 
 function TemplateView({ name }: { name: string }) {
-  const t = useSuspenseResource(`deploy/template/${name}`, (s) => deployApi.template(name, s), { on: DEPLOY_EVENTS }).data;
+  const res = useSuspenseResource(`deploy/template/${name}`, (s) => deployApi.template(name, s), { on: DEPLOY_EVENTS });
+  const t = res.data;
+  // Its changes go one at a time: the one pressed says it's on its way and the other waits. Held here,
+  // above the editor, which starts again from the template each answer brings (W21-R15).
+  const [which, setWhich] = React.useState("");
+  const [change, changing] = useAction((what: string, f: () => Promise<Template | null>) => {
+    setWhich(what);
+    return f().then((next) => next && res.change(() => next));
+  });
+  const edits: Edits = { change, doing: (what) => changing && which === what, held: (what) => changing && which !== what, going: changing };
   const using = useRes(appsRes).data.filter((a) => a.template === t.name);
   return (
     <>
@@ -248,7 +278,7 @@ function TemplateView({ name }: { name: string }) {
         <Panel eyebrow="Template" title="What its apps start with">
           <Facts items={[...templateFacts(t), { label: "Apps made from it", value: <MadeFrom apps={using} /> }]} />
         </Panel>
-        <Edit key={JSON.stringify(t)} t={t} using={using} />
+        <Edit key={JSON.stringify(t)} t={t} using={using} edits={edits} />
       </div>
     </>
   );
