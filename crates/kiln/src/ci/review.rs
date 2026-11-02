@@ -9,6 +9,7 @@ use std::collections::{BTreeMap, HashMap};
 
 use http::StatusCode;
 use kiln_ci::identity::verdict::{Asked, Holds};
+use kiln_ci::land::queue::Gate as LandGate;
 use kiln_ci::land::{self, Action, Facts, OwnerRule, Policy};
 use kiln_ci::review::{Gate, Kind, State};
 use rusqlite::{OptionalExtension as _, params};
@@ -608,25 +609,83 @@ pub async fn gates_on(hub: &Hub, repo: &str, shas: Vec<String>) -> anyhow::Resul
         .await
 }
 
-/// What keeps `d` from landing now, by its trunk's policy: each a sentence.
-pub async fn readiness(hub: &Hub, d: &Diff) -> Result<Value, Fail> {
-    let versions = super::diffs::versions(hub, d).await.map_err(fail)?;
-    let f = facts(hub, d, &versions).await?;
-    let (_, path) = super::diffs::home(hub, d).await?;
-    let (policy, owners) = policy(hub, &path, &d.trunk).await;
-    let mut blockers = land::blockers(&policy.land, &owners, &f);
-    // A blocking thread holds landing, and any automatic land, until its author resolves it
-    // (W26-R11): the gate's hold, as accepting and Ship read it. The change stays out of the queue
-    // until its review clears (W26-R02).
-    blockers.extend(gate_of(hub, d, None).await?.reasons());
-    match State::parse(&d.state) {
-        Some(State::Draft) => blockers.insert(0, "it's a draft".into()),
-        Some(State::Landed) => blockers = vec!["it landed".into()],
-        Some(State::Abandoned) => blockers = vec!["it's abandoned".into()],
-        Some(State::Landing) => blockers = vec!["it's in the land queue".into()],
-        _ => {}
+/// What Review says of a diff for landing now (docs/ci.md W28-R104): the single gate `land`,
+/// `land_when_ready` and the land queue's re-check just before a move ask.
+#[derive(Debug, Clone)]
+pub struct Readiness {
+    /// Ready: it lands. Held: its blockers, by its trunk's policy on its latest version, are the
+    /// reason. A conflict with the trunk's tip: back to Review's conflict ladder (R107).
+    pub gate: LandGate,
+    json: Value,
+}
+
+impl Readiness {
+    /// As `GET /api/diffs/:id/land` shows it: what keeps it from landing, each a sentence (its
+    /// state's word too: `it's in the land queue`), who accepts it and who asks for changes, its
+    /// checks, the policy's required checks and strategies, the gate, and the land queue's entry
+    /// that holds it, if one does.
+    pub fn json(&self) -> Value {
+        self.json.clone()
     }
-    Ok(json!({ "blockers": blockers, "accepting": f.accepting(&policy.land), "requesting": f.requesting(), "checks": f.checks, "required": policy.land.checks, "strategies": policy.land.strategies, "default": policy.strategy(None, d.kind != "diff").ok() }))
+}
+
+/// What Review says of `d` for landing now (docs/ci.md W28-R104), on top of the open diffs below
+/// it.
+pub async fn readiness(hub: &Hub, d: &Diff) -> Result<Readiness, Fail> {
+    let chain = super::land::stack_below(hub, d).await?;
+    readiness_of(hub, &chain).await?.pop().ok_or_else(|| (StatusCode::INTERNAL_SERVER_ERROR, format!("{}'s readiness couldn't be read", d.name)))
+}
+
+/// What Review says of each of a stack's diffs for landing now, bottom first (docs/ci.md W28-R104):
+/// each one's blockers by its trunk's policy on its latest version, and the files that version
+/// conflicts with the trunk's tip in, applied on top of the diffs below it (R107). Above a diff that
+/// conflicts, no diff is checked: theirs is its conflict, and a stack's prefix holds them for it.
+pub async fn readiness_of(hub: &Hub, chain: &[Diff]) -> Result<Vec<Readiness>, Fail> {
+    let Some(first) = chain.first() else { return Ok(Vec::new()) };
+    let (_, path) = super::diffs::home(hub, first).await?;
+    let (policy, owners) = policy(hub, &path, &first.trunk).await;
+    let mut each = Vec::new();
+    let mut picks = Vec::new();
+    for d in chain {
+        let versions = super::diffs::versions(hub, d).await.map_err(fail)?;
+        let f = facts(hub, d, &versions).await?;
+        let mut blockers = land::blockers(&policy.land, &owners, &f);
+        // A blocking thread holds landing, and any automatic land, until its author resolves it
+        // (W26-R11): the gate's hold, as accepting and Ship read it. The change stays out of the queue
+        // until its review clears (W26-R02).
+        blockers.extend(gate_of(hub, d, None).await?.reasons());
+        match State::parse(&d.state) {
+            Some(State::Draft) => blockers.insert(0, "it's a draft".into()),
+            Some(State::Landed) => blockers = vec!["it landed".into()],
+            Some(State::Abandoned) => blockers = vec!["it's abandoned".into()],
+            _ => {}
+        }
+        picks.push(versions.last().map(|v| (v.commit.clone(), v.parent.clone())));
+        each.push((f, blockers));
+    }
+    let conflicts = super::land::conflicts_on(hub, &path, &first.trunk, &picks).await;
+    let mut out = Vec::new();
+    for (i, (d, (f, blockers))) in chain.iter().zip(each).enumerate() {
+        let gate = LandGate::of(blockers.clone(), conflicts.get(i).cloned().unwrap_or_default());
+        // Shown, a diff in the land queue says so: the queue asks the gate of its own entries.
+        let shown = if d.state == State::Landing.as_str() { vec!["it's in the land queue".to_owned()] } else { blockers };
+        let queue = super::land::entry_of(hub, &d.id).await.map(|(entry, state, reason)| json!({ "entry": entry, "state": state, "reason": reason }));
+        let json = json!({
+            "blockers": shown, "accepting": f.accepting(&policy.land), "requesting": f.requesting(), "checks": f.checks, "required": policy.land.checks,
+            "strategies": policy.land.strategies, "default": policy.strategy(None, d.kind != "diff").ok(), "gate": gate, "queue": queue,
+        });
+        out.push(Readiness { gate, json });
+    }
+    Ok(out)
+}
+
+/// The review state `d`'s reviews give it now, by its trunk's policy: where a diff the land queue
+/// gives back to Review goes (docs/ci.md W28-R104, R107).
+pub async fn state_now(hub: &Hub, d: &Diff) -> Result<State, Fail> {
+    let versions = super::diffs::versions(hub, d).await.map_err(fail)?;
+    let (_, path) = super::diffs::home(hub, d).await?;
+    let (policy, _) = policy(hub, &path, &d.trunk).await;
+    Ok(land::review_state(&policy.land, &facts(hub, d, &versions).await?))
 }
 
 /// A diff's review request as its hand-overs name it (docs/ci.md W27-R08; the Transfers plan's
@@ -806,6 +865,8 @@ pub async fn review(hub: &std::sync::Arc<Hub>, d: &Diff, caller: &Caller, body: 
     }
     let shown = if matches!(state, State::NeedsReview | State::ChangesRequested | State::Accepted) { now } else { state };
     hub.store.audit(caller.name.clone(), format!("diffs.review.{}", action.as_str()), format!("{} {} v{latest}", d.repo, d.name)).await;
+    // What waits on Review's gate in the land queue is asked again (docs/ci.md W28-R104).
+    super::land::recheck();
     hub.emit(&crate::wire::events::ServerEvent::Review(Box::new(crate::wire::events::Review {
         repo: d.repo.clone(),
         diff: d.name.clone(),

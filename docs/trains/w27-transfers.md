@@ -94,30 +94,23 @@ reaching a process it isn't for.
 
 ## Deploying it
 
-- **The wire, before any runner runs it.** Its new message variants collide with production's as
-  this branch stands: d50f1fd322, checked 2026-10-30.
-  - `AgentMsg` 56–58 here are `LegResults`, `LegSignature`, `Custody`. Production has `Unread`
-    (56) and `LinkUnread` (57).
-  - `ServerMsg` 62–63 here are `SignAsLeg`, `Custody`. Production has `Unread` (62) and
-    `ReachRefused` (63).
-  The landing merge must put main's variants first, in the order agreed with Kiln PRs:
-  - `AgentMsg`: `HeadroomStatus`, `Unread`, `LinkUnread`, then `LegResults`, `LegSignature`,
-    then `Custody`;
-  - `ServerMsg`: `Headroom`, `Unread`, `ReachRefused`, then `SignAsLeg`, then `Custody`.
-  Then update `proto::w27_r08_custody_is_appended_after_headroom` to name the new indices.
-- **The capability bits collide too** (main at f122a88b3e, 2026-11-01): main has
-  `CAP_WORKSPACE_COMMITS` (42) and `CAP_WORKSPACE_COMPARE` (43). The landing merge moves W27's
-  `CAP_AGENT_GIT`, `CAP_LEG_SIGNS` and `CAP_CUSTODY` to 44, 45 and 46 (their tests with them);
-  `CAP_RELAYS` is 47 already. unify/takeover was told bits from 47 too, so whichever lands second
-  renumbers. Diff the tails against production's commit again before the runners take it
-  (`wire.py`).
-- **Merging main into it (Ship, from CI/CD Integration, 2026-10-31).** main's `ship.rs`
-  `hand_off_in` (88de8655b6, b1ef50d5ce, not in this branch) takes a commit's author from
-  `made_by(&rec).agent`, not `authors_agent`. This branch's `handing()` (the browser-signed Hand
-  off) must take that, keeping its live-revision and no-one-has-it filters;
-  `ship::tests::w26_r18_made_by_says_who_made_each_commit` holds it. Against `ship-actions`
-  (b978aaecd5), `ui/src/api/ship.ts`, `ui/mock/ship.ts`, `docs/api.md` and both conflicts in
-  `authz/mod.rs` keep both sides.
+- **The wire, as it landed.** W27 landed on main on 2026-11-01 (481fedb9a3, on Ada's word) with
+  main's variants first: `AgentMsg` 56 and 57 are main's `Unread` and `LinkUnread`, then 58 to 60
+  W27's `LegResults`, `LegSignature` and `Custody`; `ServerMsg` 62 to 64 are main's `Unread`,
+  `ReachRefused` and `Freeze` (W26-R22), then 65 and 66 W27's `SignAsLeg` and `Custody`. Bits 41
+  to 43 are main's (`CAP_UNREAD`, `CAP_WORKSPACE_COMMITS`, `CAP_WORKSPACE_COMPARE`), 44 to 46
+  W27's (`CAP_AGENT_GIT`, `CAP_LEG_SIGNS`, `CAP_CUSTODY`) and 53 main's `CAP_FREEZE`.
+- **What this plan adds to it.** No message variant: `CAP_RELAYS` (47), and reach's
+  `Ask::Custody` and `Say::Custody` (after main's reach `Unread`, only on links at reach version
+  2). unify/takeover was told bits from 47 too, so whichever lands second renumbers. Diff the
+  tails against production's commit again before the runners take it (`wire.py`).
+- **Merging main into it (2026-11-01, after W27 landed).** main reads messages typed
+  (`wire/payload.rs`): the relays' check of an agent's words runs over the bytes kiln sent
+  (`HarnessCmd`'s and `HarnessSend`'s, kept raw); `mcp::runner_ask` takes the typed question, the
+  ask as it came (`raw`, which `relays::call` and `Relays::placed` read) and its placing; path a's
+  `custody` question is `reach::Question::Custody`; blue/green's `Ready` says `relays` and main's
+  `stores`; `cd.apps.custody` takes a typed input (`CdAppsCustody`). main's `ship.rs` takes a
+  commit's author from `made_by(&rec).agent`, in this plan's `handing()`.
 - **Order.** The server first, then the runners. A runner from before signs nothing, and its
   hand-overs are recorded as unsigned, naming which side is from before. A server from before
   announces no `CAP_CUSTODY`, so runners send it nothing signed.

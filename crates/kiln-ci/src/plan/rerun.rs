@@ -15,6 +15,8 @@ pub enum Mode {
     Job(String),
     /// One leg of `job` (its key): the job's other legs keep their results.
     Leg { job: String, key: String },
+    /// Several at once (docs/ci.md W26-R21): what each would run again, together.
+    Set(Vec<Mode>),
 }
 
 /// The workflow job a leg's job belongs to: `call` for `call/inner`.
@@ -22,23 +24,35 @@ pub fn top(job: &str) -> &str {
     job.split('/').next().unwrap_or(job)
 }
 
-/// What a rerun runs again: every leg of `jobs`, and the leg `leg` (a key) besides.
+/// What a rerun runs again: every leg of `jobs`, and the legs `legs` (their keys) besides.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Again {
     pub jobs: BTreeSet<String>,
-    pub leg: Option<String>,
+    pub legs: BTreeSet<String>,
 }
 
 impl Again {
     /// Whether the leg `key` of job `job` (any form) runs again.
     pub fn runs(&self, job: &str, key: &str) -> bool {
-        self.jobs.contains(top(job)) || self.leg.as_deref() == Some(key)
+        self.jobs.contains(top(job)) || self.legs.contains(key)
     }
 }
 
 /// What runs again. `failed` are the jobs (any form) with a leg that failed, timed out or was
 /// cancelled in the last attempt.
 pub fn jobs(wf: &Workflow, mode: &Mode, failed: &BTreeSet<String>) -> Result<Again, String> {
+    if let Mode::Set(modes) = mode {
+        let mut all = Again::default();
+        for m in modes {
+            let one = jobs(wf, m, failed)?;
+            all.jobs.extend(one.jobs);
+            all.legs.extend(one.legs);
+        }
+        if all.jobs.is_empty() && all.legs.is_empty() {
+            return Err("nothing was named to run again".into());
+        }
+        return Ok(all);
+    }
     let known = |j: &str| wf.jobs.iter().any(|x| x.id == j);
     let unknown = |j: &str| format!("the workflow has no job `{j}`");
     let (mut again, leg): (BTreeSet<String>, Option<(String, String)>) = match mode {
@@ -63,6 +77,8 @@ pub fn jobs(wf: &Workflow, mode: &Mode, failed: &BTreeSet<String>) -> Result<Aga
             }
             (BTreeSet::new(), Some((job.clone(), key.clone())))
         }
+        // Taken above.
+        Mode::Set(_) => (BTreeSet::new(), None),
     };
     if again.is_empty() && leg.is_none() {
         return Err("no job failed: there is nothing to run again".into());
@@ -73,7 +89,7 @@ pub fn jobs(wf: &Workflow, mode: &Mode, failed: &BTreeSet<String>) -> Result<Aga
     loop {
         let more: Vec<String> = wf.jobs.iter().filter(|j| !needed.contains(&j.id) && j.needs.iter().any(|n| needed.contains(n.job()))).map(|j| j.id.clone()).collect();
         if more.is_empty() {
-            return Ok(Again { jobs: again, leg: leg.map(|(_, key)| key) });
+            return Ok(Again { jobs: again, legs: leg.map(|(_, key)| key).into_iter().collect() });
         }
         needed.extend(more.iter().cloned());
         again.extend(more);
@@ -92,6 +108,21 @@ mod tests {
 
     fn set(v: &[&str]) -> BTreeSet<String> {
         v.iter().map(|s| (*s).to_owned()).collect()
+    }
+
+    #[test]
+    fn w26_r21_a_set_runs_again_each_and_what_needs_it() {
+        let w = wf();
+        // Two jobs at once: each, and every job that needs either, transitively.
+        assert_eq!(jobs(&w, &Mode::Set(vec![Mode::Job("b".into()), Mode::Job("d".into())]), &set(&[])), Ok(Again { jobs: set(&["b", "c", "d", "e"]), legs: set(&[]) }));
+        // A job and a leg of another: the leg runs again, its job's other legs keep their results,
+        // and the jobs that need its job run again too.
+        assert_eq!(jobs(&w, &Mode::Set(vec![Mode::Job("d".into()), Mode::Leg { job: "a".into(), key: "a (2)".into() }]), &set(&[])), Ok(Again { jobs: set(&["b", "c", "d", "e"]), legs: set(&["a (2)"]) }));
+        // A passed job is run again like any other: what ran doesn't matter, only what was named.
+        assert_eq!(jobs(&w, &Mode::Set(vec![Mode::Job("c".into())]), &set(&["a"])), Ok(Again { jobs: set(&["c"]), legs: set(&[]) }));
+        // One unknown name refuses the set, saying which; nothing named, nothing to do.
+        assert!(jobs(&w, &Mode::Set(vec![Mode::Job("c".into()), Mode::Job("nope".into())]), &set(&[])).is_err_and(|e| e.contains("no job `nope`")));
+        assert!(jobs(&w, &Mode::Set(Vec::new()), &set(&[])).is_err_and(|e| e.contains("nothing was named")));
     }
 
     #[test]
@@ -116,14 +147,14 @@ mod tests {
     fn w05_r28_one_leg_runs_again() {
         let w = wf();
         let again = jobs(&w, &Mode::Leg { job: "b".into(), key: "b (1)".into() }, &set(&[]));
-        assert_eq!(again, Ok(Again { jobs: set(&["c"]), leg: Some("b (1)".into()) }));
+        assert_eq!(again, Ok(Again { jobs: set(&["c"]), legs: set(&["b (1)"]) }));
         let again = again.unwrap_or_default();
         assert!(again.runs("b", "b (1)") && again.runs("c", "c"));
         assert!(!again.runs("b", "b (2)") && !again.runs("a", "a") && !again.runs("e", "e"));
         // A leg of a job nothing needs runs alone.
-        assert_eq!(jobs(&w, &Mode::Leg { job: "c".into(), key: "c".into() }, &set(&[])), Ok(Again { jobs: set(&[]), leg: Some("c".into()) }));
+        assert_eq!(jobs(&w, &Mode::Leg { job: "c".into(), key: "c".into() }, &set(&[])), Ok(Again { jobs: set(&[]), legs: set(&["c"]) }));
         // A called workflow's leg reruns the job that calls it, whole.
-        assert_eq!(jobs(&w, &Mode::Leg { job: "call/inner".into(), key: "call / inner".into() }, &set(&[])), Ok(Again { jobs: set(&["call"]), leg: None }));
+        assert_eq!(jobs(&w, &Mode::Leg { job: "call/inner".into(), key: "call / inner".into() }, &set(&[])), Ok(Again { jobs: set(&["call"]), legs: set(&[]) }));
         assert!(jobs(&w, &Mode::Leg { job: "nope".into(), key: "nope".into() }, &set(&[])).is_err_and(|e| e.contains("no job `nope`")));
     }
 }

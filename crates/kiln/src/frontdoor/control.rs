@@ -215,14 +215,7 @@ pub async fn on_instance_lost(hub: &Hub, machine: &str) {
 }
 
 /// A runner reported its front door (`AgentMsg::FrontDoorStatus`).
-pub async fn on_status(hub: &Hub, peer: PeerId, machine: &str, json: &str) {
-    let status: Status = match serde_json::from_str(json) {
-        Ok(s) => s,
-        Err(e) => {
-            tracing::debug!(machine, error = %e, "front door: unreadable status");
-            return;
-        }
-    };
+pub async fn on_status(hub: &Hub, peer: PeerId, machine: &str, status: Status) {
     // Only the process that runs it speaks for the machine.
     if status.standby || peers(hub, machine).0 != Some(peer) {
         return;

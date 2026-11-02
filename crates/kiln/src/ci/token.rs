@@ -140,12 +140,26 @@ fn mint_at(key: &[u8], l: &Leg<'_>, now: i64) -> String {
     format!("{signing}.{sig}")
 }
 
-/// The claims of a genuine token that is valid now.
+/// The claims of a genuine token that is valid now. Its leg doesn't age while it's paused
+/// (docs/ci.md W26-R22): the token lives that while longer.
 pub fn verify(hub: &Hub, token: &str) -> Option<Claims> {
-    verify_at(&key(hub), token, crate::util::now_unix())
+    let now = crate::util::now_unix();
+    let c = claims_of(&key(hub), token)?;
+    live_at(&c, now, hub.paused_for(&c.sub, now)).then_some(c)
 }
 
+#[cfg(test)]
 fn verify_at(key: &[u8], token: &str, now: i64) -> Option<Claims> {
+    claims_of(key, token).filter(|c| live_at(c, now, 0))
+}
+
+/// Whether claims `c` are live at `now`, their leg paused `paused_s` seconds since they were made.
+fn live_at(c: &Claims, now: i64, paused_s: i64) -> bool {
+    c.nbf <= now && now < c.exp.saturating_add(paused_s)
+}
+
+/// The claims of a genuine token, live or not.
+fn claims_of(key: &[u8], token: &str) -> Option<Claims> {
     let (signing, sig) = token.trim().rsplit_once('.')?;
     let (head, body) = signing.split_once('.')?;
     let want = B64.encode(hmac_raw(key, signing.as_bytes()));
@@ -157,7 +171,7 @@ fn verify_at(key: &[u8], token: &str, now: i64) -> Option<Claims> {
         return None;
     }
     let c: Claims = serde_json::from_slice(&B64.decode(body).ok()?).ok()?;
-    (c.iss == "kiln" && c.nbf <= now && now < c.exp).then_some(c)
+    (c.iss == "kiln").then_some(c)
 }
 
 /// The token in a request: `Authorization: Bearer <token>` or `token <token>`, or Basic with the
@@ -289,6 +303,20 @@ mod tests {
             cache_mode: "write",
             ttl: 3600,
         }
+    }
+
+    /// W26-R22: a leg doesn't age while it's paused: its token lives that while longer, and no
+    /// longer.
+    #[test]
+    fn w26_r22_a_paused_legs_token_lives_the_paused_while_longer() -> Result<(), String> {
+        let k = b"key";
+        let t = mint_at(k, &leg(), 1000);
+        let c = claims_of(k, &t).ok_or("a genuine token")?;
+        assert!(!live_at(&c, 1000 + 3600, 0), "expired, never paused");
+        assert!(live_at(&c, 1000 + 3600, 120) && live_at(&c, 1000 + 3600 + 119, 120), "paused two minutes: two minutes more");
+        assert!(!live_at(&c, 1000 + 3600 + 120, 120), "and no more");
+        assert!(claims_of(b"other", &t).is_none(), "another key's isn't genuine, paused or not");
+        Ok(())
     }
 
     #[test]

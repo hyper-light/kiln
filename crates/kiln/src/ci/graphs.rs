@@ -45,10 +45,18 @@ pub async fn of_run(hub: &Hub, repo: &Repo, sha: &str, wf: &Workflow, called: &H
 /// commit's files can't be listed or read; manifests that don't read are the graph's own problems,
 /// which `affected()` reports.
 pub async fn at(hub: &Hub, repo: &Repo, sha: &str) -> Option<Arc<Graph>> {
+    let mirror = gitops::mirror_path(hub, &repo.name).to_string_lossy().into_owned();
+    at_in(hub, repo, &mirror, sha).await
+}
+
+/// [`at`], read from the git repository at `dir` (a native repository's own, where the land
+/// queue's candidates and diffs' versions are: docs/ci.md W28-R100). A commit's graph is the same
+/// wherever it's read, so it's kept alike.
+pub async fn at_in(hub: &Hub, repo: &Repo, dir: &str, sha: &str) -> Option<Arc<Graph>> {
     if let Some(g) = kept().lock().iter().find(|(r, s, _)| *r == repo.id && s == sha).map(|(_, _, g)| Arc::clone(g)) {
         return Some(g);
     }
-    match read(hub, repo, sha).await {
+    match read(hub, dir, sha).await {
         Ok(g) => {
             let g = Arc::new(g);
             let mut k = kept().lock();
@@ -67,14 +75,13 @@ pub async fn at(hub: &Hub, repo: &Repo, sha: &str) -> Option<Arc<Graph>> {
 
 /// The commit's manifests (`git ls-tree`), their texts (`git cat-file --batch`), and the graph
 /// they make.
-async fn read(hub: &Hub, repo: &Repo, sha: &str) -> anyhow::Result<Graph> {
-    let mirror = gitops::mirror_path(hub, &repo.name).to_string_lossy().into_owned();
-    let listing = gitops::run_git(hub, &["-C", &mirror, "ls-tree", "-r", "-z", "--full-tree", sha], LS_REMOTE_TIMEOUT).await?;
+async fn read(hub: &Hub, mirror: &str, sha: &str) -> anyhow::Result<Graph> {
+    let listing = gitops::run_git(hub, &["-C", mirror, "ls-tree", "-r", "-z", "--full-tree", sha], LS_REMOTE_TIMEOUT).await?;
     let manifests = manifests(&listing);
     anyhow::ensure!(manifests.len() <= MAX_MANIFESTS, "the commit has {} manifests, more than the {MAX_MANIFESTS} a graph reads", manifests.len());
     let oids: Vec<String> = manifests.iter().map(|(_, oid)| oid.clone()).collect();
     let mut cmd = gitops::git(hub);
-    cmd.args(["-C", &mirror, "cat-file", "--batch"]);
+    cmd.args(["-C", mirror, "cat-file", "--batch"]);
     let texts = crate::rt::blocking(move || batch(cmd, &oids)).await??;
     let by_path: HashMap<String, String> = manifests.into_iter().filter_map(|(path, oid)| texts.get(&oid).map(|t| (path, t.clone()))).collect();
     let paths: Vec<String> = by_path.keys().cloned().collect();

@@ -8,6 +8,7 @@ pub mod agents;
 pub mod cli;
 pub mod criteria;
 pub mod ops;
+pub mod review;
 pub mod stack;
 
 use rusqlite::{OptionalExtension as _, params};
@@ -56,6 +57,46 @@ pub struct Plan {
     pub phase: String,
     /// Its research: what its steps rest on (`crate::research`).
     pub research: Option<String>,
+    /// The last answer a person gave its review ([`review`]): a plan read alone ([`get`]) has it,
+    /// lists leave it out.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reviewed: Option<review::Reviewed>,
+}
+
+/// A plan in brief, as a list shows it (`brief`): what it is and where it stands, without its
+/// words, its items or its steps' titles (a kiln's plans in full run to megabytes).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct Brief {
+    pub id: String,
+    pub title: String,
+    pub tags: Vec<String>,
+    pub source: Option<Source>,
+    pub share: Option<String>,
+    pub version: i64,
+    pub created_at: i64,
+    pub updated_at: i64,
+    /// How many steps it has: its items, else its body's top-level list items.
+    pub step_count: usize,
+    pub runs: i64,
+    pub phase: String,
+    pub research: Option<String>,
+}
+
+pub fn brief(p: &Plan) -> Brief {
+    Brief {
+        id: p.id.clone(),
+        title: p.title.clone(),
+        tags: p.tags.clone(),
+        source: p.source.clone(),
+        share: p.share.clone(),
+        version: p.version,
+        created_at: p.created_at,
+        updated_at: p.updated_at,
+        step_count: p.steps.len(),
+        runs: p.runs,
+        phase: p.phase.clone(),
+        research: p.research.clone(),
+    }
 }
 
 /// One step of a plan: a piece of the work, what it's like, what makes it done, and how it's
@@ -667,6 +708,7 @@ fn row(r: &rusqlite::Row<'_>) -> rusqlite::Result<Plan> {
         runs: r.get(9)?,
         phase: r.get(11)?,
         research: r.get(12)?,
+        reviewed: None,
     })
 }
 
@@ -692,9 +734,17 @@ pub async fn list(hub: &Hub, q: Option<String>, tag: Option<String>) -> R<Vec<Pl
         .collect())
 }
 
+/// One plan, with the last answer to its review.
 pub async fn get(hub: &Hub, id: &str) -> R<Plan> {
     let id = id.to_owned();
-    hub.store.call(move |c| Ok(get_in(c, &id)?)).await?.ok_or(Error::Missing)
+    hub.store
+        .call(move |c| {
+            let Some(mut p) = get_in(c, &id)? else { return Ok(None) };
+            p.reviewed = review::last_in(c, &id)?;
+            Ok(Some(p))
+        })
+        .await?
+        .ok_or(Error::Missing)
 }
 
 /// A shared plan, by its link's token.
@@ -829,6 +879,7 @@ pub async fn delete(hub: &Hub, id: &str) -> R<()> {
             let n = tx.execute("DELETE FROM plans WHERE id = ?1", params![id])?;
             tx.execute("DELETE FROM plan_versions WHERE plan_id = ?1", params![id])?;
             tx.execute("DELETE FROM plan_runs WHERE plan_id = ?1", params![id])?;
+            tx.execute("DELETE FROM plan_reviews WHERE plan_id = ?1", params![id])?;
             tx.commit()?;
             Ok(n > 0)
         })
@@ -1275,6 +1326,32 @@ mod tests {
     }
 
     #[test]
+    fn a_plan_in_brief_says_how_many_steps_without_its_words() -> anyhow::Result<()> {
+        let p = Plan {
+            id: "p".into(),
+            title: "T".into(),
+            body: "Why, at length.\n\n- a\n- b".into(),
+            items: vec![],
+            tags: vec!["t".into()],
+            source: Some(Source { session: Some("s1".into()), proposed: true, ..Source::default() }),
+            share: None,
+            version: 3,
+            created_at: 1,
+            updated_at: 2,
+            steps: vec!["a".into(), "b".into()],
+            runs: 1,
+            phase: "ready".into(),
+            research: None,
+            reviewed: None,
+        };
+        let b = serde_json::to_value(brief(&p))?;
+        assert_eq!(b.get("step_count"), Some(&serde_json::json!(2)));
+        assert_eq!(b.get("source").and_then(|s| s.get("session")), Some(&serde_json::json!("s1")));
+        assert!(["body", "items", "steps"].iter().all(|k| b.get(k).is_none()), "{b}");
+        Ok(())
+    }
+
+    #[test]
     fn tags_are_trimmed_and_unique() {
         assert_eq!(clean_tags(vec![" a ".into(), "a".into(), "".into(), "b".into()]).ok(), Some(vec!["a".to_owned(), "b".to_owned()]));
         assert!(clean_tags(vec!["x".repeat(41)]).is_err());
@@ -1297,6 +1374,7 @@ mod tests {
             runs: 0,
             phase: "ready".into(),
             research: None,
+            reviewed: None,
         };
         assert!(message(&p, None).contains("# T\n\n- a\n- b"));
         let headed = Plan { body: "# T\n\n- a\n- b".into(), ..p.clone() };
@@ -1331,6 +1409,7 @@ mod tests {
             runs: 0,
             phase: "ready".into(),
             research: None,
+            reviewed: None,
         };
         let md = markdown(&p);
         assert!(md.starts_with("Why: the scanner grew.\n\n## 1. Split the scanner\n\nMove number scanning"), "{md}");
@@ -1420,6 +1499,7 @@ mod tests {
             runs: 0,
             phase: "ready".into(),
             research: None,
+            reviewed: None,
         };
         let whole = message(&p, Some(2));
         assert!(whole.contains("they go in this order: 1 and 4 side by side, then 2 and 3 side by side, then 5.") && whole.contains("at most 2 at once (your Subagents setting)"), "{whole}");

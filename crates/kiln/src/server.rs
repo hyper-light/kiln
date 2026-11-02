@@ -105,7 +105,7 @@ pub async fn run(cfg: Config, shutdown: Shutdown) -> anyhow::Result<()> {
     if let Some(c) = crate::runner::chaos::get() {
         net.command(crate::net::Out::Seed(c.seed)).await;
         for rule in c.faults.iter().copied() {
-            net.command(crate::net::Out::Shed(rule)).await;
+            net.command(crate::net::Out::Shed(rule.past(crate::wire::server_classes().len()))).await;
         }
     }
     // HTTPS on the HTTP port, when asked: the configured certificate, else the kiln CA's.
@@ -195,6 +195,8 @@ pub async fn run(cfg: Config, shutdown: Shutdown) -> anyhow::Result<()> {
         child!("pool-samples", h => crate::ci::pools::sample_loop(h));
         child!("diff-runs", h => crate::ci::review::runs_loop(h));
         child!("agent-changes", h => crate::workspace::follow::follow_loop(h));
+        // W28-R59: each commit's verdict, worked out again as its lane's runs end.
+        child!("ci-verdicts", h => crate::ci::verdict::verdict_loop(h));
         child!("attachments", h => crate::ci::attach::run(h));
         child!("previews", h => crate::ci::previews::run(h));
         child!("review-replies", h => crate::ci::replies::run(h));

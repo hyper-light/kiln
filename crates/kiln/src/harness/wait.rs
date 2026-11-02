@@ -79,7 +79,8 @@ fn on_its_way(info: &Info) -> bool {
 
 /// Where an agent stands, in a word: `needs_you` (an approval, a question or a plan waits on a
 /// person), `working`, `idle` (its turn is over, nothing queued), `paused` (a usage limit),
-/// `stopped` (it crashed or couldn't start), `offline` (its machine is away), `ended`.
+/// `stopped` (it crashed or couldn't start), `offline` (its machine is away), `ended`. One whose
+/// process ended while nobody ended it is working: kiln starts it again by itself.
 pub fn stand(info: &Info) -> &'static str {
     if !info.approvals.is_empty() || info.status == Status::Waiting {
         return "needs_you";
@@ -88,6 +89,7 @@ pub fn stand(info: &Info) -> &'static str {
         return "working";
     }
     match info.status {
+        Status::Exited if info.exit.as_ref().is_some_and(|e| e.again_at.is_some()) => "working",
         Status::Exited if info.exit.as_ref().is_some_and(|e| e.error.is_some()) => "stopped",
         Status::Exited => "ended",
         Status::Disconnected => "offline",

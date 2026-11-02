@@ -485,7 +485,7 @@ pub enum Brings {
 /// The taking side: one thread takes what feeds send into a store, in the order each sent it, and
 /// hands back what to answer. The server's takes runners' stores; a mirror's takes the server's.
 pub struct Intake {
-    tx: std::sync::mpsc::SyncSender<(hyper_transport::PeerId, String, String, Vec<u8>)>,
+    tx: std::sync::mpsc::SyncSender<(hyper_transport::PeerId, String, Msg, Vec<u8>)>,
     restores: std::sync::Arc<Restores>,
     peers: std::sync::Arc<Peers>,
     signs: Signs,
@@ -527,7 +527,7 @@ type Restores = std::sync::Mutex<std::collections::HashSet<String>>;
 impl Intake {
     /// `echoes`: where to note what a mirror's copy brought (the server's intake).
     pub fn start(store: Store, brings: Brings, echoes: Option<std::sync::Arc<Echoes>>) -> anyhow::Result<(Self, async_channel::Receiver<Out>)> {
-        let (tx, rx) = std::sync::mpsc::sync_channel::<(hyper_transport::PeerId, String, String, Vec<u8>)>(256);
+        let (tx, rx) = std::sync::mpsc::sync_channel::<(hyper_transport::PeerId, String, Msg, Vec<u8>)>(256);
         let (out_tx, out_rx) = async_channel::bounded::<Out>(1024);
         let restores: std::sync::Arc<Restores> = std::sync::Arc::default();
         let peers: std::sync::Arc<Peers> = std::sync::Arc::default();
@@ -535,10 +535,10 @@ impl Intake {
         let (restoring, seen, signing) = (restores.clone(), peers.clone(), signs.clone());
         std::thread::Builder::new().name("kiln-convo-intake".into()).spawn(move || {
             let mut taking: HashMap<(hyper_transport::PeerId, String), Taking> = HashMap::new();
-            while let Ok((peer, machine, json, data)) = rx.recv() {
+            while let Ok((peer, machine, msg, data)) = rx.recv() {
                 let signer = signing.read().clone();
                 let feed = Feed { store: &store, brings, restores: &restoring, echoes: echoes.as_deref(), peers: &seen, custodian: signer.as_deref() };
-                for m in take(&feed, &mut taking, peer, &machine, &json, data) {
+                for m in take(&feed, &mut taking, peer, &machine, msg, data) {
                     if out_tx.send_blocking(Out { peer, json: encode(&m) }).is_err() {
                         return;
                     }
@@ -564,10 +564,11 @@ impl Intake {
         self.restores.lock().unwrap_or_else(std::sync::PoisonError::into_inner).insert(store.to_owned());
     }
 
-    /// What runner process `peer` of `machine` sent on the feed's lane. Never blocks: when the
-    /// intake is behind, it's dropped (the runner asks again, [`STALL`]).
-    pub fn heard(&self, peer: hyper_transport::PeerId, machine: &str, json: String, data: Vec<u8>) {
-        let _ = self.tx.try_send((peer, machine.to_owned(), json, data));
+    /// What runner process `peer` of `machine` sent on the feed's lane, read where its frame was
+    /// (`crate::wire::payload_of`). Never blocks: when the intake is behind, it's dropped (the
+    /// runner asks again, [`STALL`]).
+    pub fn heard(&self, peer: hyper_transport::PeerId, machine: &str, msg: Msg, data: Vec<u8>) {
+        let _ = self.tx.try_send((peer, machine.to_owned(), msg, data));
     }
 }
 
@@ -597,7 +598,7 @@ impl Feed<'_> {
 }
 
 /// One message from a runner, taken: what to answer.
-fn take(feed: &Feed<'_>, taking: &mut HashMap<(hyper_transport::PeerId, String), Taking>, peer: hyper_transport::PeerId, machine: &str, json: &str, data: Vec<u8>) -> Vec<Msg> {
+fn take(feed: &Feed<'_>, taking: &mut HashMap<(hyper_transport::PeerId, String), Taking>, peer: hyper_transport::PeerId, machine: &str, msg: Msg, data: Vec<u8>) -> Vec<Msg> {
     let Feed { store, brings, restores, echoes, .. } = *feed;
     // Where the server's copy of a runner's store stands. When that can't be read (the store is
     // busy or failing), no answer: never "from 0", which would have the runner send everything
@@ -615,8 +616,8 @@ fn take(feed: &Feed<'_>, taking: &mut HashMap<(hyper_transport::PeerId, String),
     if taking.len() > TAKING_MAX {
         taking.retain(|_, t| t.batch.is_some());
     }
-    match decode(json) {
-        Some(Msg::Hello { store: s, .. }) => {
+    match msg {
+        Msg::Hello { store: s, .. } => {
             taking.remove(&(peer, s.clone()));
             feed.note(machine, &s, |v| v.hello_at = crate::util::now_ms());
             let Some(rev) = stands(&s) else { return Vec::new() };
@@ -624,7 +625,7 @@ fn take(feed: &Feed<'_>, taking: &mut HashMap<(hyper_transport::PeerId, String),
             taking.entry((peer, s.clone())).or_default().told = Some(rev);
             vec![Msg::From { store: s, rev, zip: true, kept: true, about: None }]
         }
-        Some(Msg::Batch { store: s, from, upto, part, parts, zip, told, hand_on }) => {
+        Msg::Batch { store: s, from, upto, part, parts, zip, told, hand_on } => {
             let key = (peer, s.clone());
             // Where to go on from, about this batch: to a runner from before (it doesn't say
             // where it was told to go on from), once until a batch of it is taken. It goes on from
@@ -740,7 +741,7 @@ fn take(feed: &Feed<'_>, taking: &mut HashMap<(hyper_transport::PeerId, String),
                 }
             }
         }
-        Some(Msg::From { .. } | Msg::Ack { .. } | Msg::Restore { .. } | Msg::Restored { .. } | Msg::Stats { .. }) | None => Vec::new(),
+        Msg::From { .. } | Msg::Ack { .. } | Msg::Restore { .. } | Msg::Restored { .. } | Msg::Stats { .. } => Vec::new(),
     }
 }
 
@@ -760,7 +761,8 @@ mod tests {
     #[allow(clippy::too_many_arguments)]
     fn took(store: &Store, partial: &mut HashMap<(hyper_transport::PeerId, String), Taking>, peer: hyper_transport::PeerId, machine: &str, brings: Brings, json: &str, data: Vec<u8>, restores: &Restores, echoes: Option<&Echoes>) -> Vec<Msg> {
         let peers = Peers::default();
-        take(&Feed { store, brings, restores, echoes, peers: &peers, custodian: None }, partial, peer, machine, json, data)
+        let Some(msg) = decode(json) else { return Vec::new() };
+        take(&Feed { store, brings, restores, echoes, peers: &peers, custodian: None }, partial, peer, machine, msg, data)
     }
 
     fn feed_all(runner: &Store, server: &Store, machine: &str, bytes: usize) -> anyhow::Result<u64> {
@@ -1050,7 +1052,7 @@ mod tests {
         let (restores, peers) = (Restores::default(), Peers::default());
         let feed = Feed { store: &server, brings: Brings::TheirMachine, restores: &restores, echoes: None, peers: &peers, custodian: Some(&signs) };
         let mut taking = HashMap::new();
-        let hello = take(&feed, &mut taking, 7, "box", &encode(&Msg::Hello { store: runner.id().to_owned(), restore: false }), Vec::new());
+        let hello = take(&feed, &mut taking, 7, "box", Msg::Hello { store: runner.id().to_owned(), restore: false }, Vec::new());
         let Some(Msg::From { rev, zip, kept, .. }) = hello.into_iter().next() else { anyhow::bail!("no answer to hello") };
         let batch = runner.changes_as(rev, BATCH_BYTES, kept)?;
         let json = serde_json::to_vec(&batch)?;
@@ -1058,7 +1060,7 @@ mod tests {
         let send = |taking: &mut HashMap<(hyper_transport::PeerId, String), Taking>, json: Vec<u8>, hand_on: Option<String>| -> anyhow::Result<Vec<Msg>> {
             let mut answer = Vec::new();
             for (m, data) in parts_of(runner.id(), rev, batch.upto, json, zip, Some(rev), hand_on)? {
-                answer = take(&feed, taking, 7, "box", &encode(&m), data);
+                answer = take(&feed, taking, 7, "box", m, data);
             }
             Ok(answer)
         };
@@ -1082,7 +1084,7 @@ mod tests {
         let next = runner.changes_as(batch.upto, BATCH_BYTES, kept)?;
         let mut answer = Vec::new();
         for (m, data) in parts(runner.id(), batch.upto, &next, zip, Some(batch.upto))? {
-            answer = take(&feed, &mut taking, 7, "box", &encode(&m), data);
+            answer = take(&feed, &mut taking, 7, "box", m, data);
         }
         assert!(matches!(answer.first(), Some(Msg::Ack { .. })), "{answer:?}");
         assert!(signs.received.lock().is_empty());
@@ -1110,10 +1112,11 @@ mod tests {
             let top = runner.top()?;
             for _ in 0..100 {
                 let Ok(Ok((json, data))) = crate::rt::timeout(Duration::from_secs(5), out.recv()).await else { break };
-                if let Some(Msg::Batch { part, hand_on, .. }) = decode(&json) {
-                    assert_eq!(hand_on.is_some(), part == 0, "its hand-on with its first part only");
+                let Some(msg) = decode(&json) else { anyhow::bail!("an unreadable message: {json}") };
+                if let Msg::Batch { part, hand_on, .. } = &msg {
+                    assert_eq!(hand_on.is_some(), *part == 0, "its hand-on with its first part only");
                 }
-                for m in take(&feed, &mut taking, 7, "box", &json, data) {
+                for m in take(&feed, &mut taking, 7, "box", msg, data) {
                     ship.link(Link::Heard(m));
                 }
                 if server.peer(&peer_name("box", runner.id()))? >= top {

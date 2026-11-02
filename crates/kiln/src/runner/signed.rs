@@ -409,7 +409,7 @@ mod tests {
         let facts = [(kiln_ci::identity::chain::fulcio::BUILD_SIGNER_URI, "https://kiln.home/hyper-light/kiln/.kiln/ci.yml@refs/heads/main"), (kiln_ci::identity::chain::fulcio::SOURCE_REPOSITORY_DIGEST, "4c1e2a90d1f3b5a7c9e1f3a5b7c9d1e3f5a7b9c1")];
         let pem = pki.issue_identity(&asked.csr, &identity, &facts, time::Duration::hours(1))?;
         let given = crate::proto::IdentityGiven { kind: asked.kind, of: asked.of, epoch: asked.epoch, uri: identity.uri()?, cert_pem: Some(pem), error: None, delegation: Some(DELEGATION.into()) };
-        crate::runner::identity::given(&serde_json::to_string(&given)?, dir, "main")?;
+        crate::runner::identity::given(given, dir, "main")?;
         Ok((identity, crate::runner::identity::slot("agent", Some(job), Some(1))))
     }
 
@@ -630,7 +630,9 @@ mod tests {
                 let st = state.clone();
                 crate::rt::spawn(async move {
                     crate::rt::sleep(Duration::from_millis(100)).await;
-                    let _ = crate::runner::identity::given(&answer, &st, "main");
+                    if let Ok(g) = serde_json::from_str(&answer) {
+                        let _ = crate::runner::identity::given(g, &st, "main");
+                    }
                 });
                 let t = Instant::now();
                 assert!(first_waits("e2e", &s, Duration::from_secs(5)).await, "{s}: answered");

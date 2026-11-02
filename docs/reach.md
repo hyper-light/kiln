@@ -153,8 +153,24 @@ link drops — its server connection, the server, the other runner's — it open
 waits for its asker 15 minutes without a link (`linger`), then is stopped. A link quiet for 15 s
 is pinged; at 45 s it is replaced.
 
+A detached run (`--detach`, §4.2) waits for no one: it asks for a linger of for ever
+(`wire::DETACHED`), and once it holds 16 MiB of output with no link up, or with none of it taken for
+10 s, its oldest output gives way (counted in its exit's `lost`, and an asker that comes back sees
+the jump in offsets) instead of the command waiting. A runner from before keeps it as long, but
+makes it wait on its output as on any run's.
+
 Nothing on the runner waits on reach (its input is unbounded, bounded in practice by the windows),
 and reach never waits on the runner: output to the server is batched, many messages per frame.
+
+A message either side can't read (a kind its build doesn't know, or bytes that aren't one) is
+answered in the link with what it was, a code and why (`Say::Unread`, `Ask::Unread`, appended last),
+and the link ends; a runner from before ends it on that as it would on any garbage, and its session
+goes on on a new link. The runner that couldn't read it tells the server (`AgentMsg::LinkUnread`, to
+one that says `CAP_UNREAD`), which notes it against the runner that sent it, checking the link's ends
+against its relay's (docs/wire.md, "What can't be read"). What the relay refuses it says with a code
+too (`ServerMsg::ReachRefused`): a link id taken, a link to itself, too many links, a runner that
+doesn't take links or doesn't accept them, one not connected, a link closed. A frame from a runner
+that isn't one of a link's ends, or from a job's pod, goes nowhere, and is noted.
 
 ### 4.2 Runs
 
@@ -167,6 +183,12 @@ people's tools live on), plus `KILN_REACH_FROM=<asking runner>`. A named shell (
 tool's `shell`) carries its working folder and exported variables from one run to the next.
 Signals: Ctrl-C on `kiln run` goes over as SIGINT; a client that goes away stops its run
 (SIGTERM, then SIGKILL after 5 s) unless it said `--detach`. `--timeout` stops it too.
+
+`--detach` keeps the command running to its end whatever becomes of `kiln run`: Ctrl-C or SIGTERM
+on it, or its going away, leaves the command running, on another runner or on its own. The asking
+runner follows a detached run on alone: it takes its output and lets it go, so the run never waits
+on it, and it makes the link again after a drop, so the doer never waits for it either; it forgets
+the run when the run ends. It isn't a run an upgrade of the asking runner waits for.
 
 ## 5. Sync
 
@@ -335,6 +357,10 @@ on its own machine, with its own tools. Its tools:
 | `goals_*` | its goal stack (docs/goals.md): without `agent`, its own |
 | `research_*`, `conversations_search` | research it records, each finding graded by kiln from its sources (docs/research.md), and every agent's conversations kiln keeps |
 | `plans_*` | plans kept, run (on itself without `session` or `new`; one agent per step, in its harness, on its machine and in its folder unless it says otherwise) and followed (docs/plans.md); a plan's versions and deleting one are code mode's |
+
+Each of its own tools (and each `kiln.machines.*` operation below) reads its arguments as a type
+(`reach::mcp::input`), its `inputSchema` made from it. A call that doesn't fit is a tool error
+saying where and why, and the server hears of it (docs/wire.md, `mcp_reach`).
 
 The `agents_*`, `goals_*`, `research_*` and `plans_*` tools are the ones the kiln server says agents
 have (its answer for the operations names them), each as the server describes it, so a server

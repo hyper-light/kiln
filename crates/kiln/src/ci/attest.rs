@@ -355,7 +355,7 @@ async fn ask_leg(hub: &Hub, asked: Asked, leg: &str, nonce: &str) {
 /// signed as the leg, is kept beside kiln's own (origin `leg`). That's once its signature verifies
 /// as the leg kiln gave `leg` on `machine`, over the very statement kiln wrote. Otherwise, or when
 /// the leg didn't sign it, why is logged, and kiln's stays alone.
-pub async fn leg_signed(hub: &Hub, machine: &str, leg: &str, nonce: &str, bundle: Option<String>, error: Option<String>) {
+pub async fn leg_signed(hub: &Hub, machine: &str, leg: &str, nonce: &str, bundle: Option<Value>, error: Option<String>) {
     let Some(asked) = ASKED.lock().remove(&(leg.to_owned(), nonce.to_owned())) else {
         tracing::debug!(leg, nonce, "a leg answered an ask kiln has no record of (a restart since): ignored");
         return;
@@ -369,11 +369,10 @@ pub async fn leg_signed(hub: &Hub, machine: &str, leg: &str, nonce: &str, bundle
     }
 }
 
-async fn keep_legs(hub: &Hub, machine: &str, leg: &str, nonce: &str, asked: Asked, bundle: &str) -> anyhow::Result<()> {
-    let v: Value = serde_json::from_str(bundle)?;
+async fn keep_legs(hub: &Hub, machine: &str, leg: &str, nonce: &str, asked: Asked, v: &Value) -> anyhow::Result<()> {
     let b64 = |p: &str| v.pointer(p).and_then(Value::as_str).and_then(|s| base64::engine::general_purpose::STANDARD.decode(s).ok());
     let payload_type = v.pointer("/dsseEnvelope/payloadType").and_then(Value::as_str).unwrap_or_default().to_owned();
-    let (Some(payload), Some(sig), Some(leaf)) = (payload_of(&v), b64("/dsseEnvelope/signatures/0/sig"), b64("/verificationMaterial/certificate/rawBytes")) else {
+    let (Some(payload), Some(sig), Some(leaf)) = (payload_of(v), b64("/dsseEnvelope/signatures/0/sig"), b64("/verificationMaterial/certificate/rawBytes")) else {
         anyhow::bail!("it isn't a signed bundle with its certificate");
     };
     anyhow::ensure!(payload_type == a::PAYLOAD_TYPE, "it signs a {payload_type}, not an in-toto statement");
@@ -384,7 +383,7 @@ async fn keep_legs(hub: &Hub, machine: &str, leg: &str, nonce: &str, asked: Aske
     }
     // The leg's is the very statement kiln wrote for that report, byte for byte.
     anyhow::ensure!(payload == asked.payload, "it signs another statement than the provenance kiln wrote");
-    keep(hub, asked.run, leg.to_owned(), asked.idx, nonce.to_owned(), "leg", &asked.subjects, vec![(a::PROVENANCE.to_owned(), v)]).await?;
+    keep(hub, asked.run, leg.to_owned(), asked.idx, nonce.to_owned(), "leg", &asked.subjects, vec![(a::PROVENANCE.to_owned(), v.clone())]).await?;
     tracing::info!(leg, signer = %signer, "a leg signed the provenance of what it built");
     Ok(())
 }

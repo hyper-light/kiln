@@ -39,7 +39,7 @@ const WORD: Record<Stand, string> = {
   ended: "Ended",
 };
 
-/** Where `.st-word` hides (stands.css): a phone, its counts' digits at the start of their slots. */
+/** Where `.sd-word` hides (stands.css): a phone, its counts' digits at the start of their slots. */
 const NARROW = "(max-width: 640px)";
 const watchNarrow = (changed: () => void) => {
   const m = window.matchMedia(NARROW);
@@ -50,12 +50,12 @@ const useNarrow = () => React.useSyncExternalStore(watchNarrow, () => window.mat
 
 const cleanId = (id: string) => id.replace(/[^a-zA-Z0-9_-]/g, "");
 
-/** A digit's width as the counts' tabular figures set it (Geist's 1 is narrower than its other digits even so), on the row as `--st-dw`: every cell is the widest, so no count's change moves what's beside it. Measured again once the fonts are in. */
+/** A digit's width as the counts' tabular figures set it (Geist's 1 is narrower than its other digits even so), on the row as `--sd-dw`: every cell is the widest, so no count's change moves what's beside it. Measured again once the fonts are in. */
 function measureDigits(el: HTMLDivElement | null) {
   if (!el) return;
   const measure = () => {
     const probe = document.createElement("span");
-    probe.className = "st-n st-probe";
+    probe.className = "sd-n sd-probe";
     el.append(probe);
     const width = (s: string) => {
       probe.textContent = s;
@@ -63,7 +63,7 @@ function measureDigits(el: HTMLDivElement | null) {
     };
     const widest = Math.max(...[..."0123456789"].map((d) => width(d + d) - width(d)));
     probe.remove();
-    if (widest > 0) el.style.setProperty("--st-dw", `${widest}px`);
+    if (widest > 0) el.style.setProperty("--sd-dw", `${widest}px`);
   };
   measure();
   void document.fonts?.ready.then(measure);
@@ -79,23 +79,23 @@ export function Stands({ rows = [], counts, every }: { rows?: readonly MissionRo
   const groups = shown.filter((g) => g.n > 0);
   const listed = every ? shown : groups;
   const narrow = useNarrow();
-  if (!every && rows.length === 0) return <p className="st-lead">Start coding agents on any of your machines and run them all from here.</p>;
+  if (!every && rows.length === 0) return <p className="sd-lead">Start coding agents on any of your machines and run them all from here.</p>;
   if (!every && groups.length === 0)
     return (
-      <div className="st">
-        <span className="st-quiet">All quiet</span>
+      <div className="sd">
+        <span className="sd-quiet">All quiet</span>
       </div>
     );
   return (
-    <div className="st" ref={measureDigits}>
+    <div className="sd" ref={measureDigits}>
       <p className="sr-only">{listed.map((g) => SAYS[g.stand](g.n)).join(", ")}</p>
       <Rule counts={groups.map((g) => `${g.stand}:${g.n}`).join(",")} />
-      <ul className="st-row" aria-hidden="true">
+      <ul className="sd-row" aria-hidden="true">
         {listed.map((g) => (
-          <li key={g.stand} className="st-item" data-stand={g.stand} data-zero={g.n === 0 || undefined} title={SAYS[g.stand](g.n)}>
+          <li key={g.stand} className="sd-item" data-stand={g.stand} data-zero={g.n === 0 || undefined} title={SAYS[g.stand](g.n)}>
             <Badge stand={g.stand} />
             <Count n={g.n} align={narrow ? "start" : "end"} />
-            <span className="st-word">{WORD[g.stand]}</span>
+            <span className="sd-word">{WORD[g.stand]}</span>
           </li>
         ))}
       </ul>
@@ -205,7 +205,7 @@ function Rule({ counts }: { counts: string }) {
     },
     [counts, paused],
   );
-  return <canvas ref={attach} className="st-rule" aria-hidden="true" />;
+  return <canvas ref={attach} className="sd-rule" aria-hidden="true" />;
 }
 
 /** What each state is, plainly, in its colour (14 × 14). Working's arc turns, needs you's bubble brightens and dims, ready's light breathes; the rest are still (stands.css). */
@@ -217,7 +217,7 @@ function Badge({ stand }: { stand: Shown }) {
   switch (stand) {
     case "working": // at work: an arc turning, in its ring's colours
       return (
-        <svg className="st-mark st-turning" {...box}>
+        <svg className="sd-mark sd-turning" {...box}>
           <defs>
             <linearGradient id={id} x1="0" x2="1" y1="0" y2="1">
               {RING.map(([colour, at]) => (
@@ -230,14 +230,14 @@ function Badge({ stand }: { stand: Shown }) {
       );
     case "ready": // ready for work: a lit ring
       return (
-        <svg className="st-mark" {...box}>
+        <svg className="sd-mark" {...box}>
           <circle cx="7" cy="7" r="5" {...line} strokeWidth="1.4" />
-          <circle className="st-breathing" cx="7" cy="7" r="2.3" fill={c} />
+          <circle className="sd-breathing" cx="7" cy="7" r="2.3" fill={c} />
         </svg>
       );
     case "needs": // it's asking you something: a speech bubble, "!"
       return (
-        <svg className="st-mark st-calling" {...box}>
+        <svg className="sd-mark sd-calling" {...box}>
           <path d="M3.2 1.8 H10.8 Q12.6 1.8 12.6 3.6 V8.2 Q12.6 10 10.8 10 H6.6 L3.8 12.4 V10 H3.2 Q1.4 10 1.4 8.2 V3.6 Q1.4 1.8 3.2 1.8 Z" {...line} strokeWidth="1.4" />
           <path d="M7 4 V6.6" {...line} strokeWidth="1.6" />
           <circle cx="7" cy="8.4" r="0.85" fill={c} />
@@ -245,25 +245,25 @@ function Badge({ stand }: { stand: Shown }) {
       );
     case "paused": // paused: the pause bars
       return (
-        <svg className="st-mark" {...box}>
+        <svg className="sd-mark" {...box}>
           <path d="M5 3 V11 M9 3 V11" {...line} strokeWidth="2" />
         </svg>
       );
     case "finished": // done: a tick
       return (
-        <svg className="st-mark" {...box}>
+        <svg className="sd-mark" {...box}>
           <path d="M2.6 7.4 L5.6 10.2 L11.4 3.8" {...line} strokeWidth="1.8" />
         </svg>
       );
     case "crashed": // stopped: the stop square
       return (
-        <svg className="st-mark" {...box}>
+        <svg className="sd-mark" {...box}>
           <rect x="3" y="3" width="8" height="8" rx="1.6" fill={c} />
         </svg>
       );
     case "offline": // offline: an empty ring, broken
       return (
-        <svg className="st-mark" {...box}>
+        <svg className="sd-mark" {...box}>
           <circle cx="7" cy="7" r="5" {...line} strokeWidth="1.4" strokeDasharray="2.2 2.1" />
         </svg>
       );
@@ -280,15 +280,15 @@ function Count({ n, align }: { n: number; align: "start" | "end" }) {
   const [roll, setRoll] = React.useState({ n, from: n });
   if (roll.n !== n) setRoll({ n, from: roll.n });
   return (
-    <span className="st-n">
+    <span className="sd-n">
       {cells(roll.from, roll.n, align).map((c, i) => (
-        <span key={`${roll.n}-${i}`} className="st-d">
+        <span key={`${roll.n}-${i}`} className="sd-d">
           {c.was === c.now ? (
             <b>{c.now}</b>
           ) : (
             <>
-              <b className={`st-out st-${c.dir}`}>{c.was}</b>
-              <b className={`st-in st-${c.dir}`}>{c.now}</b>
+              <b className={`sd-out sd-${c.dir}`}>{c.was}</b>
+              <b className={`sd-in sd-${c.dir}`}>{c.now}</b>
             </>
           )}
         </span>

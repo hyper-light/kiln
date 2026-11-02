@@ -158,13 +158,31 @@ html[data-window="short"] .hx-main:has(.ch :is(input, textarea, select):focus) >
   letter-spacing: -0.025em;
   overflow-wrap: anywhere;
 }
-/* The clock has a quiet row of its own. Keep its place between turns so the conversation stays put. */
+/* The clock has a quiet row of its own. Keep its place between turns so the conversation stays put.
+   The flag for refused messages sits at its end, so it comes and goes without moving anything. */
 .ag-clock-row {
+  display: flex;
+  align-items: center;
+  gap: 12px;
   height: 18px;
   margin-top: 6px;
   font-family: var(--font-mono);
   font-size: 10.5px;
   line-height: 18px;
+}
+/* A larger target than the row is tall, without making it taller. */
+.ag-refused {
+  display: inline-flex;
+  flex: none;
+  align-items: center;
+  gap: 6px;
+  min-height: 24px;
+  margin: -3px 0 -3px auto;
+  color: var(--color-fail);
+}
+.ag-refused:hover,
+.ag-refused[aria-expanded="true"] {
+  color: #ecc9cb;
 }
 /* The clock's column stays fixed as the number of digits changes. */
 .ag-turn-time {
@@ -185,7 +203,10 @@ html[data-window="short"] .hx-main:has(.ch :is(input, textarea, select):focus) >
   position: relative;
   isolation: isolate;
   border-color: transparent;
-  --ag-rim: conic-gradient(#8d869f, #aca1d5 21%, #d3c6ee 29%, #8a7cae 42%, #b5a7db 68%, #8d869f);
+}
+/* Each state's colours (the ring's stops, all the way round) and speeds. */
+.ag-turn-control {
+  --ag-rim: #8d869f, #aca1d5 21%, #d3c6ee 29%, #8a7cae 42%, #b5a7db 68%, #8d869f;
   --ag-glint: rgb(225 215 245 / 35%);
   --ag-current: 24s;
   --ag-spark: 19s;
@@ -206,7 +227,7 @@ html[data-window="short"] .hx-main:has(.ch :is(input, textarea, select):focus) >
   content: "";
 }
 .ag-turn-control::before {
-  background: var(--ag-rim);
+  background: conic-gradient(var(--ag-rim));
   animation: ag-rim-current var(--ag-current) linear infinite;
 }
 .ag-turn-control::after {
@@ -214,25 +235,32 @@ html[data-window="short"] .hx-main:has(.ch :is(input, textarea, select):focus) >
   animation: ag-rim-shimmer var(--ag-spark) linear infinite reverse;
 }
 .ag-turn-control[data-state="active"] {
-  --ag-rim: conic-gradient(#b8d9d2, #7194c9 8%, #c8e0ef 13%, #a6c4ed 23%, #8677ad 32%, #d7c1ee 37%, #b8a6d5 46%, #d6a2aa 55%, #eed6bc 59%, #a2bfae 66%, #d8cbb0 77%, #a6c4ed 85%, #d6a2aa 91%, #b8d9d2);
+  --ag-rim: #b8d9d2, #7194c9 8%, #c8e0ef 13%, #a6c4ed 23%, #8677ad 32%, #d7c1ee 37%, #b8a6d5 46%, #d6a2aa 55%, #eed6bc 59%, #a2bfae 66%, #d8cbb0 77%, #a6c4ed 85%, #d6a2aa 91%, #b8d9d2;
   --ag-glint: rgb(245 234 255 / 90%);
   --ag-current: 5.3s;
   --ag-spark: 3.7s;
 }
+/* Waiting for you: Mission control's needs-you sand, restless. */
+.ag-turn-control[data-state="needs"] {
+  --ag-rim: #b08d63, #e2cfae 10%, #f4e6cc 17%, #c9a274 28%, #e9c9a6 38%, #d6a2aa 47%, #f1dcbc 56%, #b99064 66%, #e3c9a0 75%, #f6ead2 83%, #cfae86 91%, #b08d63;
+  --ag-glint: rgb(255 241 216 / 75%);
+  --ag-current: 8s;
+  --ag-spark: 5.4s;
+}
 .ag-turn-control[data-state="stopped"] {
-  --ag-rim: conic-gradient(#996f77, #d1aaad 23%, #e1bdc0 30%, #a17b83 46%, #c29ba1 73%, #996f77);
+  --ag-rim: #996f77, #d1aaad 23%, #e1bdc0 30%, #a17b83 46%, #c29ba1 73%, #996f77;
   --ag-glint: rgb(233 197 200 / 20%);
   --ag-current: 52s;
   --ag-spark: 43s;
 }
 .ag-turn-control[data-state="finished"] {
-  --ag-rim: conic-gradient(#79978a, #a8c9bc 22%, #d2e6d8 32%, #8aafa0 49%, #b4d0bd 76%, #79978a);
+  --ag-rim: #79978a, #a8c9bc 22%, #d2e6d8 32%, #8aafa0 49%, #b4d0bd 76%, #79978a;
   --ag-glint: rgb(225 240 229 / 30%);
   --ag-current: 32s;
   --ag-spark: 27s;
 }
 .ag-turn-control[data-state="disconnected"] {
-  --ag-rim: conic-gradient(#555962, #797c84 24%, #898c94 34%, #656872 53%, #777a82 80%, #555962);
+  --ag-rim: #555962, #797c84 24%, #898c94 34%, #656872 53%, #777a82 80%, #555962;
   --ag-glint: rgb(163 166 173 / 10%);
   --ag-current: 100s;
   --ag-spark: 83s;
@@ -374,9 +402,6 @@ html[data-window="short"] .hx-main:has(.ch :is(input, textarea, select):focus) >
 .cp .hx-compose-box:focus-within {
   border-color: #47464f;
   box-shadow: none;
-}
-.cp .hx-compose-live {
-  border-color: #3a3550;
 }
 /* The field grows to ten lines (four on a phone, where the keyboard takes most of the screen),
    then scrolls inside. A line is 1.55em; 16px is its padding. */
@@ -859,8 +884,10 @@ html[data-window="short"] .hx-main:has(.ch :is(input, textarea, select):focus) >
   font-variant-numeric: tabular-nums;
   white-space: nowrap;
 }
+/* Room for the ribbon about the line while it compacts, kept by the marker it settles into, so
+   nothing moves as it does. */
 .hx-compaction .sg-condense {
-  margin-top: 7px;
+  margin: 18px 0 12px;
 }
 .hx-compaction[data-tone="warn"] .sg-label {
   color: var(--color-warn);
@@ -1378,6 +1405,78 @@ html[data-window="short"] .hx-main:has(.ch :is(input, textarea, select):focus) >
   animation: none;
 }
 
+/* ---------------------------------------------------------------- refused messages: the flag opens them in place */
+/* How many by wire and code, then a row each, the newest first: when, the wire and code, what and why. */
+.ag-refused-list {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  max-width: 720px;
+  margin-top: 8px;
+  padding-top: 8px;
+  border-top: 1px solid #1d1f23;
+  animation: ag-usage-in 0.12s ease-out;
+}
+.ag-refused-counts {
+  margin: 0;
+  color: var(--color-secondary);
+  font-family: var(--font-mono);
+  font-size: 10.5px;
+  overflow-wrap: anywhere;
+}
+.ag-refused-rows {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+.ag-refused-row {
+  display: grid;
+  grid-template-columns: 5rem minmax(0, 10rem) minmax(0, 1fr);
+  align-items: baseline;
+  gap: 12px;
+  min-height: 22px;
+  font-size: 12px;
+}
+.ag-refused-at {
+  color: var(--color-subtle);
+  font-family: var(--font-mono);
+  font-size: 10.5px;
+  white-space: nowrap;
+}
+.ag-refused-wire {
+  overflow: hidden;
+  color: var(--color-fail);
+  font-family: var(--font-mono);
+  font-size: 10.5px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.ag-refused-why {
+  color: var(--color-foreground);
+  overflow-wrap: anywhere;
+}
+/* A phone: what and why under when and the wire, the whole width. */
+@container (max-width: 520px) {
+  .ag-refused-row {
+    grid-template-columns: 4.5rem minmax(0, 1fr);
+    gap: 2px 10px;
+  }
+  .ag-refused-why {
+    grid-column: 1 / -1;
+  }
+}
+@media (prefers-reduced-motion: reduce) {
+  .ag-refused-list {
+    animation: none;
+  }
+}
+:root[data-motion="paused"] .ag-refused-list {
+  animation: none;
+}
+
 /* ---------------------------------------------------------------- queued messages: a line that opens in place */
 .qd {
   min-width: 0;
@@ -1662,6 +1761,123 @@ html[data-window="short"] .hx-main:has(.ch :is(input, textarea, select):focus) >
   .al-chev,
   .al-open {
     transition: none;
+  }
+}
+/* A subagent waiting on you, said on the line in Mission control's needs colours. */
+.al-needs {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  color: #e2cfae;
+}
+.al-needs > i,
+.sa-word > i {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: #d8bb95;
+  transform: translateY(-1px);
+}
+
+/* ---------------------------------------------------------------- a subagent waiting on you, over the composer
+   Mission control's row that needs you (mission.css), not a card: the tan bar inset at its left and
+   a rule above and below; its name, then the word and what it asks in mono, then its answer. On a
+   phone it stacks as Mission control's row does there. */
+.sa-row {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  grid-template-areas: "main acts";
+  align-items: center;
+  gap: 10px 16px;
+  padding: 12px 4px 12px 14px;
+  border-top: 1px solid #25272c;
+  border-bottom: 1px solid #25272c;
+  box-shadow: inset 2px 0 0 #c6b08e;
+}
+.sa-row + .sa-row {
+  border-top: 0;
+}
+.sa-main {
+  grid-area: main;
+  display: flex;
+  min-width: 0;
+  flex-direction: column;
+  gap: 6px;
+  text-align: left;
+}
+.sa-name {
+  overflow: hidden;
+  color: #ededee;
+  font-size: 16px;
+  line-height: 22px;
+  letter-spacing: -0.02em;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.sa-main:hover .sa-name {
+  color: #ffffff;
+}
+.sa-line {
+  display: flex;
+  min-width: 0;
+  align-items: baseline;
+  gap: 12px;
+}
+.sa-word {
+  display: inline-flex;
+  min-width: 86px;
+  flex: none;
+  align-items: center;
+  gap: 7px;
+  color: #e2cfae;
+  font-family: var(--font-mono);
+  font-size: 10px;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+}
+.sa-text {
+  min-width: 0;
+  overflow: hidden;
+  color: #ece0ca;
+  font-family: var(--font-mono);
+  font-size: 12px;
+  line-height: 20px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.sa-acts {
+  grid-area: acts;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+.sa-link {
+  margin: 0 4px;
+  color: #c9c3d8;
+  font-size: 13px;
+  white-space: nowrap;
+}
+.sa-link:hover {
+  color: #ededee;
+}
+@media (max-width: 640px) {
+  .sa-row {
+    grid-template-columns: minmax(0, 1fr);
+    grid-template-areas:
+      "main"
+      "acts";
+  }
+  .sa-line {
+    flex-direction: column;
+    align-items: stretch;
+    gap: 5px;
+  }
+  .sa-word {
+    min-width: 0;
+  }
+  /* The row itself opens its thread; one less word beside Allow and Deny, as Mission control's. */
+  .sa-link {
+    display: none;
   }
 }
 

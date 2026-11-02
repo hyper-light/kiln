@@ -58,6 +58,56 @@ pub struct Given {
     pub vars: Arc<std::collections::BTreeMap<String, String>>,
     /// Told the run's id once it's created.
     pub reply: Option<async_channel::Sender<String>>,
+    /// The run is a culprit-finding try (W28-R57): only kiln's bisections set it.
+    pub culprit: Option<Try>,
+}
+
+/// A culprit-finding try (docs/ci.md W28-R57), as kiln's bisection starts it. A gate's goes at
+/// once: at gate priority, never held by admission. The rest go at low priority, below W28-R64's
+/// work in progress, and where the workflow declares admission each is a speculative demand of its
+/// lane, under the lane's window (W28-R68). A try is no newer push of its branch: it joins no
+/// run-level concurrency group and supersedes nothing, so nothing on its branch waits for it,
+/// cancels it or is withdrawn by it. Kept with the run's input, so a restart keeps it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct Try {
+    /// Its branch is in `[ci] culprit_gates`.
+    pub gate: bool,
+}
+
+impl Try {
+    /// A gate's tries' priority: W28-R64's gate.
+    pub const GATE: u8 = 90;
+    /// The rest's: below W28-R64's work in progress (40).
+    pub const LOW: u8 = 20;
+
+    pub fn priority(self) -> u8 {
+        if self.gate { Self::GATE } else { Self::LOW }
+    }
+
+    /// Its class and why, as a leg's standing names them (W28-R64).
+    fn intent(self) -> (kiln_ci::sched::intent::Intent, String) {
+        if self.gate {
+            (kiln_ci::sched::intent::Intent::Gate, "a culprit-finding try on a gate's branch ([ci] culprit_gates): at once (W28-R57)".into())
+        } else {
+            (kiln_ci::sched::intent::Intent::Wip, format!("a culprit-finding try: at low priority, {} (W28-R57)", Self::LOW))
+        }
+    }
+
+    /// A run's try, from its saved input.
+    fn of_input(v: &serde_json::Value) -> Option<Try> {
+        v.get("culprit").cloned().and_then(|c| serde_json::from_value(c).ok())
+    }
+
+    /// What admission takes of a leg (W28-R60, R68), its run a try (`t`) or not, its workflow's
+    /// admission `a`: the workflow's `coalesce:` and `cadence:`, and not speculative. A try
+    /// coalesces with no push and keeps no cadence: it is speculative under its lane's window,
+    /// unless it is a gate's, which nothing holds.
+    fn admission(t: Option<Try>, a: kiln_ci::sched::admit::Spec) -> (Option<kiln_ci::sched::admit::Coalesce>, Option<kiln_ci::sched::admit::Cadence>, bool) {
+        match t {
+            Some(t) => (None, None, !t.gate),
+            None => (a.coalesce, a.cadence, false),
+        }
+    }
 }
 
 /// What the dispatcher hears.
@@ -69,7 +119,7 @@ pub enum Msg {
     RunnerLost { agent: String },
     /// A runner's probes reported (W13-R01): it is routed by what they found.
     RunnerFacts { agent: String },
-    Event { agent: String, leg: String, json: String },
+    Event { agent: String, leg: String, event: Box<crate::proto::JobEvent> },
     Finished { agent: String, result: JobResult },
     /// A repository deleted (its runs' records with it): its runs end here, their legs stopped
     /// where they run.
@@ -83,6 +133,14 @@ pub enum Msg {
     Cancel {
         run: String,
         reason: String,
+    },
+    /// Some of a run's legs cancelled by their ids, the run going on (docs/ci.md W26-R21): each
+    /// leg and whether it was, or why not.
+    CancelLegs {
+        run: String,
+        legs: Vec<String>,
+        reason: String,
+        reply: async_channel::Sender<Vec<(String, Result<(), String>)>>,
     },
     /// Why a leg waits, and how each runner measures up against it (W05-R11).
     Explain { leg: String, reply: async_channel::Sender<serde_json::Value> },
@@ -113,7 +171,7 @@ pub enum Msg {
         reply: async_channel::Sender<Result<u32, String>>,
     },
     /// A runner's word on a pool's executor it was asked to start (W13-R09).
-    Executor { agent: String, json: String },
+    Executor { agent: String, said: crate::runner::pool::Said },
     /// The stored pools changed: read them again.
     PoolsChanged,
     /// The pools and their executors now.
@@ -127,6 +185,9 @@ pub enum Msg {
     /// A runner sent a sample (its CPUs busy, its memory in use): the engine weighs its headroom
     /// by it (the scheduler's headroom, W05).
     RunnerSample { agent: String },
+    /// A person paused a leg, or resumed it (docs/ci.md W26-R22): waiting, it's placed nowhere
+    /// until it's resumed. The store has it paused already, and its runner froze it if it runs.
+    LegPaused { leg: String, paused: bool },
 }
 
 /// Where and how a leg runs, as the scheduler placed it.
@@ -382,20 +443,23 @@ fn leg_in(r: &RunSt, run: &str, id: &str, spec: &LegSpec, cfg: &crate::config::c
     // The workflow's `coalesce:` and `cadence:` (W28-R60): its lane is the repository's workflow on
     // this branch, the leg's unit its job and matrix, its place the run's number.
     let admission = r.plan.admission.any().then(|| {
-        let a = r.plan.admission.millis();
+        // A culprit-finding try's (W28-R57): speculative under its lane's window (W28-R68), or a
+        // gate's, never held.
+        let (coalesce, cadence, speculative) = Try::admission(r.culprit, r.plan.admission.millis());
         kiln_ci::sched::admit::Demand {
             lane: format!("{}\0{}\0{}", r.repo.id, r.path, r.event.ref_name()),
             unit: spec.key.clone(),
             order: r.github.get("run_number").and_then(serde_json::Value::as_u64).unwrap_or_else(|| u64::try_from(r.created).unwrap_or_default()),
-            coalesce: a.coalesce,
-            cadence: a.cadence,
-            speculative: false,
+            coalesce,
+            cadence,
+            speculative,
         }
     });
     // Priority by intent (W28-R64), opt-in: a job that deploys is a gate; the rest as its run is.
-    let intent = cfg.scheduler.by_intent().then(|| match spec.environment.as_ref().filter(|e| !e.name.is_empty()) {
-        Some(e) => (kiln_ci::sched::intent::Intent::Gate, format!("it deploys to {}", e.name)),
-        None => r.who.intent.clone().unwrap_or((kiln_ci::sched::intent::Intent::Trunk, "its run wasn't classified".into())),
+    let intent = cfg.scheduler.by_intent().then(|| match (spec.environment.as_ref().filter(|e| !e.name.is_empty()), r.culprit) {
+        (Some(e), _) => (kiln_ci::sched::intent::Intent::Gate, format!("it deploys to {}", e.name)),
+        (None, Some(t)) => t.intent(),
+        (None, None) => r.who.intent.clone().unwrap_or((kiln_ci::sched::intent::Intent::Trunk, "its run wasn't classified".into())),
     });
     // A job that keeps a warm workspace has a lane (W24-R11), as placement matches lanes: its
     // runners' toolchains apart. A cold rerun's legs (W24-R23) start from nothing kept, so warm
@@ -414,7 +478,8 @@ fn leg_in(r: &RunSt, run: &str, id: &str, spec: &LegSpec, cfg: &crate::config::c
         admission,
         actor: r.who.actor.as_ref().map(|a| a.id.clone()).unwrap_or_default(),
         lane: format!("{}\0{}\0{}", r.repo.id, r.path, r.event.ref_name()),
-        priority: intent.as_ref().map_or_else(|| priority(&r.event.name), |(i, _)| i.priority()),
+        // A culprit-finding try's own priority (W28-R57), else by intent or event.
+        priority: r.culprit.map_or_else(|| intent.as_ref().map_or_else(|| priority(&r.event.name), |(i, _)| i.priority()), Try::priority),
         intent,
         route,
         exclusive: job.is_some_and(|j| j.kiln.exclusive),
@@ -633,6 +698,8 @@ struct RunSt {
     sup: Option<Sup>,
     /// A cold run (`kiln rerun --cold`, W24-R23): no reuse, no kept folders, no cache restored.
     cold: bool,
+    /// A culprit-finding try (W28-R57).
+    culprit: Option<Try>,
     /// Where a person's retry asked its legs to run, by key (W05-R28).
     placed: HashMap<String, kiln_ci::sched::Placement>,
 }
@@ -688,12 +755,6 @@ struct LegSt {
     seq: u64,
     /// Gone with its repository while it ran: its end frees its slot, and nothing is written.
     gone: bool,
-}
-
-/// An event's place in its attempt (`seq`, from runners that send events again after a reconnect).
-#[derive(serde::Deserialize)]
-struct Seq {
-    seq: Option<u64>,
 }
 
 /// A leg its environment's protection holds back (W15-R03, R04): not yet the scheduler's.
@@ -1119,10 +1180,15 @@ impl Dispatch {
                 Box::pin(self.commands(cmds)).await;
                 Ok(())
             }
-            Msg::Event { agent, leg, json } => self.event(&agent, &leg, &json).await,
+            Msg::Event { agent, leg, event } => self.event(&agent, &leg, *event).await,
             Msg::Finished { agent, result } => self.finished(&agent, result).await,
             Msg::RepoDeleted { repo } => {
                 self.repo_deleted(&repo).await;
+                Ok(())
+            }
+            Msg::LegPaused { leg, paused } => {
+                let cmds = self.sched.handle(Input::LegPaused { leg, paused }, now_ms());
+                Box::pin(self.commands(cmds)).await;
                 Ok(())
             }
             Msg::Rejected { agent, leg } => {
@@ -1135,6 +1201,16 @@ impl Dispatch {
                 Ok(())
             }
             Msg::Cancel { run, reason } => self.cancel_run(&run, &reason).await,
+            Msg::CancelLegs { run, legs, reason, reply } => match self.cancel_legs(&run, &legs, &reason).await {
+                Ok(each) => {
+                    let _ = reply.try_send(each);
+                    Ok(())
+                }
+                Err(e) => {
+                    let _ = reply.try_send(legs.iter().map(|l| (l.clone(), Err(format!("{e:#}")))).collect());
+                    Err(e)
+                }
+            },
             Msg::ApproveRun { run, by, approve, reply } => {
                 let r = self.approve_run(&run, &by, approve).await;
                 let _ = reply.try_send(*r.as_ref().unwrap_or(&false));
@@ -1142,7 +1218,7 @@ impl Dispatch {
             }
             Msg::Explain { leg, reply } => {
                 let demand = self.decisions.get(&leg).map(|d| serde_json::json!({ "decision": d, "why": d.why() }));
-                let v = serde_json::json!({ "leg": leg, "known": self.legs.contains_key(&leg), "wait_reason": self.sched.reason(&leg), "standing": self.sched.standing(&leg), "runners": self.sched.explain(&leg), "demand": demand });
+                let v = serde_json::json!({ "leg": leg, "known": self.legs.contains_key(&leg), "wait_reason": self.sched.reason(&leg), "standing": self.sched.standing(&leg), "runners": self.sched.explain(&leg), "demand": demand, "overflow": self.sched.overflowed(&leg) });
                 let _ = reply.try_send(v);
                 Ok(())
             }
@@ -1160,8 +1236,7 @@ impl Dispatch {
                 }
                 Ok(())
             }
-            Msg::Executor { agent, json } => {
-                let said: crate::runner::pool::Said = serde_json::from_str(&json).unwrap_or_default();
+            Msg::Executor { agent, said } => {
                 let input = match said.state.as_str() {
                     "ready" => Input::ExecutorReady { executor: said.executor },
                     _ => {
@@ -1376,6 +1451,7 @@ impl Dispatch {
         let approval = kiln_ci::trust::needs_approval(self.hub.cfg.ci.untrusted.require_approval, trusted, association(&s.event).as_deref());
         let model = serde_json::to_string(&*s.workflow).unwrap_or_default();
         let name = s.workflow.name.clone().unwrap_or_else(|| s.path.clone());
+        let culprit = s.given.culprit;
         let new = runs::NewRun {
             id: id.clone(),
             workflow: s.path.clone(),
@@ -1388,7 +1464,7 @@ impl Dispatch {
             actor: s.event.actor.clone(),
             trigger: serde_json::json!({ "event": s.event.name, "action": s.event.action, "ref": s.event.git_ref, "before": s.event.before }),
             trusted,
-            priority: priority(&s.event.name),
+            priority: culprit.map_or_else(|| priority(&s.event.name), Try::priority),
             payload: s.event.payload.clone(),
             model,
             input: String::new(),
@@ -1426,7 +1502,7 @@ impl Dispatch {
         let tree = Arc::new(shard_files(&self.hub, &s.repo, &s.event.sha, &s.workflow, &files).await);
         // `affected()`'s package graph (W24-R17), kept with the input too.
         let graph = super::graphs::of_run(&self.hub, &s.repo, &s.event.sha, &s.workflow, &files).await;
-        let settings = serde_json::json!({ "default_permissions": perms, "only_matrix": only, "timing": *timing, "tree": *tree, "graph": graph.as_deref() });
+        let settings = serde_json::json!({ "default_permissions": perms, "only_matrix": only, "timing": *timing, "tree": *tree, "graph": graph.as_deref(), "culprit": culprit });
         self.save_input(&id, &input, &s.actions, &s.event, (false, None), &HashMap::new(), &settings).await?;
         let started = RunPlan::start(Arc::clone(&s.workflow), input, self.settings_with(&settings), &Graphed { source: Source { files: &files, timing: &timing, tree: &tree }, graph });
         let (plan, actions) = match started {
@@ -1438,10 +1514,11 @@ impl Dispatch {
             }
         };
         runs::set_run_name(&self.hub, &id, plan.name.clone()).await?;
-        let group = plan.concurrency.as_ref().map(|g| (format!("{}\0{}", s.repo.id, g.group), g.group.clone(), GroupConfig { cancel_in_progress: g.cancel_in_progress, queue_max: g.queue_max, limit: g.limit.map_or(1, |l| l.max(1) as usize), max_pending: 100 }));
+        // A culprit-finding try joins no run-level group and supersedes nothing (W28-R57).
+        let group = plan.concurrency.as_ref().filter(|_| culprit.is_none()).map(|g| (format!("{}\0{}", s.repo.id, g.group), g.group.clone(), GroupConfig { cancel_in_progress: g.cancel_in_progress, queue_max: g.queue_max, limit: g.limit.map_or(1, |l| l.max(1) as usize), max_pending: 100 }));
         let costs = super::insights::costs(&self.hub, &s.repo.id, &s.path).await;
-        let sup = sup_of(&s.workflow, &s.repo, &s.path, &s.event.name, &github);
-        let mut st = RunSt { plan, repo: s.repo, event: s.event, path: s.path, created: crate::util::now_unix(), in_progress: false, files, wf: s.workflow, github, vars, trusted, actions: s.actions, keys: HashMap::new(), held: Some(actions), seq: 0, keep: HashMap::new(), debug: false, keep_failed: None, given: s.given, timing, tree, removed: 0, costs, awaiting: None, no_reuse: false, who: Who::default(), sup, cold: false, placed: HashMap::new() };
+        let sup = if culprit.is_some() { None } else { sup_of(&s.workflow, &s.repo, &s.path, &s.event.name, &github) };
+        let mut st = RunSt { plan, repo: s.repo, event: s.event, path: s.path, created: crate::util::now_unix(), in_progress: false, files, wf: s.workflow, github, vars, trusted, actions: s.actions, keys: HashMap::new(), held: Some(actions), seq: 0, keep: HashMap::new(), debug: false, keep_failed: None, given: s.given, timing, tree, removed: 0, costs, awaiting: None, no_reuse: false, who: Who::default(), sup, cold: false, culprit, placed: HashMap::new() };
         st.who = who_of(&self.hub, &st).await;
         self.workflow_run(&st, "requested", None);
         if approval {
@@ -1662,7 +1739,7 @@ impl Dispatch {
     async fn save_input(&self, run: &str, input: &RunInput, actions: &std::collections::BTreeMap<String, wire::ActionRef>, event: &Event, debug: (bool, Option<u32>), keep: &HashMap<String, (LegReport, String)>, settings: &serde_json::Value) -> anyhow::Result<()> {
         let keep: serde_json::Map<String, serde_json::Value> = keep.iter().map(|(k, (rep, leg))| (k.clone(), serde_json::json!({ "report": report_json(rep), "leg": leg }))).collect();
         let (debug, keep_failed) = debug;
-        let json = serde_json::json!({ "github": input.github, "inputs": input.inputs, "vars": input.vars, "changed": input.changed.as_deref(), "trusted": input.trusted, "actions": actions, "event": event, "debug": debug, "keep_failed": keep_failed, "keep": keep, "default_permissions": settings.get("default_permissions"), "only_matrix": settings.get("only_matrix"), "timing": settings.get("timing"), "tree": settings.get("tree"), "no_reuse": settings.get("no_reuse"), "graph": settings.get("graph"), "cold": settings.get("cold"), "placed": settings.get("placed") }).to_string();
+        let json = serde_json::json!({ "github": input.github, "inputs": input.inputs, "vars": input.vars, "changed": input.changed.as_deref(), "trusted": input.trusted, "actions": actions, "event": event, "debug": debug, "keep_failed": keep_failed, "keep": keep, "default_permissions": settings.get("default_permissions"), "only_matrix": settings.get("only_matrix"), "timing": settings.get("timing"), "tree": settings.get("tree"), "no_reuse": settings.get("no_reuse"), "graph": settings.get("graph"), "cold": settings.get("cold"), "culprit": settings.get("culprit"), "placed": settings.get("placed") }).to_string();
         let run = run.to_owned();
         self.hub.store.call(move |c| Ok(c.execute("UPDATE ci_plans SET input = ?2 WHERE run_id = ?1", rusqlite::params![run, json]).map(|_| ())?)).await
     }
@@ -1866,7 +1943,8 @@ impl Dispatch {
         let files = Arc::new(super::reusable::files(&self.hub, &repo, &event.sha, &wf).await);
         let tree = Arc::new(shard_files(&self.hub, &repo, &event.sha, &wf, &files).await);
         let graph = super::graphs::of_run(&self.hub, &repo, &event.sha, &wf, &files).await;
-        let settings = serde_json::json!({ "default_permissions": v.get("default_permissions").and_then(serde_json::Value::as_str).unwrap_or("read"), "only_matrix": v.get("only_matrix"), "timing": *timing, "tree": *tree, "no_reuse": no_reuse, "graph": graph.as_deref(), "cold": cold, "placed": placed });
+        let culprit = Try::of_input(&v);
+        let settings = serde_json::json!({ "default_permissions": v.get("default_permissions").and_then(serde_json::Value::as_str).unwrap_or("read"), "only_matrix": v.get("only_matrix"), "timing": *timing, "tree": *tree, "no_reuse": no_reuse, "graph": graph.as_deref(), "cold": cold, "culprit": culprit, "placed": placed });
         self.save_input(run, &input, &actions, &event, (debug, keep_failed), &keep, &settings).await?;
         let (plan, acts) = match RunPlan::start(Arc::clone(&wf), input.clone(), self.settings_with(&v), &Graphed { source: Source { files: &files, timing: &timing, tree: &tree }, graph }) {
             Ok(x) => x,
@@ -1876,12 +1954,12 @@ impl Dispatch {
                 return Ok(attempt);
             }
         };
-        let group = plan.concurrency.as_ref().map(|g| (format!("{}\0{}", repo.id, g.group), g.group.clone(), GroupConfig { cancel_in_progress: g.cancel_in_progress, queue_max: g.queue_max, limit: g.limit.map_or(1, |l| l.max(1) as usize), max_pending: 100 }));
+        let group = plan.concurrency.as_ref().filter(|_| culprit.is_none()).map(|g| (format!("{}\0{}", repo.id, g.group), g.group.clone(), GroupConfig { cancel_in_progress: g.cancel_in_progress, queue_max: g.queue_max, limit: g.limit.map_or(1, |l| l.max(1) as usize), max_pending: 100 }));
         let path = run_path(&github);
         let costs = super::insights::costs(&self.hub, &repo.id, &path).await;
         // A maintainer reruns it: that is approval enough, as on GitHub.
-        let sup = sup_of(&wf, &repo, &path, &event.name, &github);
-        let mut st = RunSt { plan, repo, event, path, created: crate::util::now_unix(), in_progress: false, files, wf, github, vars: input.vars, trusted: input.trusted, actions, keys: HashMap::new(), held: Some(acts), seq, keep, debug, keep_failed, given: Given::default(), timing: Arc::clone(&timing), tree: Arc::clone(&tree), removed: 0, costs, awaiting: None, no_reuse, who: Who::default(), sup, cold, placed };
+        let sup = if culprit.is_some() { None } else { sup_of(&wf, &repo, &path, &event.name, &github) };
+        let mut st = RunSt { plan, repo, event, path, created: crate::util::now_unix(), in_progress: false, files, wf, github, vars: input.vars, trusted: input.trusted, actions, keys: HashMap::new(), held: Some(acts), seq, keep, debug, keep_failed, given: Given::default(), timing: Arc::clone(&timing), tree: Arc::clone(&tree), removed: 0, costs, awaiting: None, no_reuse, who: Who::default(), sup, cold, culprit, placed };
         st.who = who_of(&self.hub, &st).await;
         self.workflow_run(&st, "requested", None);
         self.runs.insert(run.to_owned(), st);
@@ -2268,6 +2346,13 @@ impl Dispatch {
                     r
                 }
                 Command::Adopted { leg, from, outcome } => self.adopted(&leg, &from, outcome).await,
+                // Its pool's executor was late, so it goes to the overflow's runners (W28-R80): the
+                // leg says why, on its run's page and in its routing.
+                Command::Overflowed { leg, why } => {
+                    let r = runs::annotation(&self.hub, &leg, None, "notice", Some("overflow".into()), &why, None, None, None, None, None).await;
+                    self.hub.emit_job(&leg).await;
+                    r
+                }
             };
             if let Err(e) = r {
                 tracing::warn!(error = %format!("{e:#}"), "CI dispatcher command");
@@ -2750,15 +2835,14 @@ impl Dispatch {
     }
 
     /// What a runner says about a leg while it runs (W06, §2.5).
-    async fn event(&mut self, agent: &str, leg: &str, json: &str) -> anyhow::Result<()> {
-        if let (Ok(Seq { seq: Some(seq) }), Some(l)) = (serde_json::from_str::<Seq>(json), self.legs.get_mut(leg)) {
+    async fn event(&mut self, agent: &str, leg: &str, event: crate::proto::JobEvent) -> anyhow::Result<()> {
+        if let (Some(seq), Some(l)) = (event.seq, self.legs.get_mut(leg)) {
             if seq <= l.seq {
                 return Ok(());
             }
             l.seq = seq;
         }
-        let e: JobEventV2 = serde_json::from_str(json)?;
-        match e {
+        match event.event {
             JobEventV2::StepStarted { idx, name, kind, action } => {
                 runs::step_started(&self.hub, leg, idx, &name, &kind, action).await?;
                 self.hub.logs.step(leg, idx, Status::Running.as_str());
@@ -3027,6 +3111,51 @@ impl Dispatch {
         Box::pin(self.actions(run, acts)).await
     }
 
+    /// Some of a run's legs cancelled by their ids, the run going on (docs/ci.md W26-R21): each
+    /// one of the run that hasn't finished goes to its plan by its key, logged so a restart cancels
+    /// it again; the others say why not.
+    async fn cancel_legs(&mut self, run: &str, ids: &[String], reason: &str) -> anyhow::Result<Vec<(String, Result<(), String>)>> {
+        let (run_owned, wanted) = (run.to_owned(), ids.to_vec());
+        let rows: Vec<(String, String, String)> = self
+            .hub
+            .store
+            .call(move |c| {
+                let mut st = c.prepare("SELECT id, key, status FROM jobs WHERE run_id = ?1 AND id IN (SELECT value FROM json_each(?2))")?;
+                let rows = st.query_map(rusqlite::params![run_owned, serde_json::to_string(&wanted).unwrap_or_default()], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?;
+                Ok(rows.collect::<Result<Vec<_>, _>>()?)
+            })
+            .await?;
+        let mut each = Vec::new();
+        let mut keys = Vec::new();
+        for id in ids {
+            match rows.iter().find(|(r, ..)| r == id) {
+                None => each.push((id.clone(), Err("not a leg of this run".to_owned()))),
+                Some((_, key, status)) if crate::store::Status::parse(status).is_terminal() => each.push((id.clone(), Err(format!("`{key}` already finished: it's {status}")))),
+                Some((_, key, _)) => {
+                    keys.push(key.clone());
+                    each.push((id.clone(), Ok(())));
+                }
+            }
+        }
+        if keys.is_empty() {
+            return Ok(each);
+        }
+        let Some(r) = self.runs.get_mut(run) else {
+            return Ok(ids.iter().map(|i| (i.clone(), Err("the run isn't going: nothing of it can be cancelled".to_owned()))).collect());
+        };
+        r.seq += 1;
+        let seq = r.seq;
+        let files = Arc::clone(&r.files);
+        let timing = Arc::clone(&r.timing);
+        let tree = Arc::clone(&r.tree);
+        let acts = r.plan.on_cancel_legs(&keys, reason, &Source { files: &files, timing: &timing, tree: &tree });
+        for key in &keys {
+            runs::log(&self.hub, run, seq, "cancel_leg", Some(key.clone()), Some(serde_json::json!({ "reason": reason }).to_string())).await?;
+        }
+        Box::pin(self.actions(run, acts)).await?;
+        Ok(each)
+    }
+
     /// Rebuilds unfinished runs by replaying their plans' logs (W05-R25); legs that were running
     /// wait for their runner to say it still has them.
     async fn restore(&mut self) -> anyhow::Result<()> {
@@ -3092,6 +3221,15 @@ impl Dispatch {
                         }
                     }
                 }
+                // Legs cancelled one by one (W26-R21), the run going on.
+                "cancel_leg" => {
+                    let why = report.as_deref().and_then(|r| serde_json::from_str::<serde_json::Value>(r).ok()).and_then(|v| v.get("reason").and_then(serde_json::Value::as_str).map(str::to_owned)).unwrap_or_else(|| "cancelled".to_owned());
+                    for act in plan.on_cancel_legs(&leg.iter().cloned().collect::<Vec<_>>(), &why, &Source { files: &files, timing: &timing, tree: &tree }) {
+                        if let PlanAction::Cancel { leg, reason, .. } = act {
+                            cancelled.push((leg, reason));
+                        }
+                    }
+                }
                 _ => {
                     let rep = report.as_deref().map(report_from_json).unwrap_or_default();
                     let key = leg.unwrap_or_default();
@@ -3120,6 +3258,21 @@ impl Dispatch {
             })
             .collect();
         let legs: Vec<(String, String, String, Option<String>, u32, Option<String>)> = rows.into_iter().map(|r| (r.0, r.1, r.2, r.3, r.4, r.5)).collect();
+        // Those a person paused (W26-R22): they come back paused, and their tokens live the while
+        // they were paused longer.
+        let run_owned = run.to_owned();
+        let pauses: Vec<(String, i64, Option<i64>)> = self
+            .hub
+            .store
+            .call(move |c| {
+                let mut st = c.prepare("SELECT id, paused_ms, paused_at FROM jobs WHERE run_id = ?1 AND job_id IS NOT NULL AND (paused_at IS NOT NULL OR paused_ms > 0)")?;
+                Ok(st.query_map([&run_owned], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?.collect::<Result<Vec<_>, _>>()?)
+            })
+            .await?;
+        for (id, ms, since) in &pauses {
+            self.hub.restore_paused(id, *ms, *since);
+        }
+        let paused: HashSet<String> = pauses.into_iter().filter(|p| p.2.is_some()).map(|p| p.0).collect();
         let event = v.get("event").and_then(|e| serde_json::from_value::<Event>(e.clone()).ok()).unwrap_or_else(|| Event { name: row.event.clone(), sha: row.sha.clone(), git_ref: input.github.get("ref").and_then(serde_json::Value::as_str).unwrap_or_default().to_owned(), trusted: input.trusted, ..Event::default() });
         let actions = v.get("actions").and_then(|a| serde_json::from_value(a.clone()).ok()).unwrap_or_default();
         let path = run_path(&input.github);
@@ -3141,16 +3294,18 @@ impl Dispatch {
         // Still waiting for a maintainer's approval (W18-R06): it starts from the plan's first
         // actions once approved.
         let unapproved = !logged && legs.is_empty() && runs::approval(&self.hub, run).await?.as_deref() == Some("required");
+        // A culprit-finding try (W28-R57) joins no run-level group and supersedes nothing.
+        let culprit = Try::of_input(&v);
         let (held, awaiting) = if unapproved {
-            let group = plan.concurrency.as_ref().map(|g| (format!("{}\0{}", repo.id, g.group), g.group.clone(), GroupConfig { cancel_in_progress: g.cancel_in_progress, queue_max: g.queue_max, limit: g.limit.map_or(1, |l| l.max(1) as usize), max_pending: 100 }));
+            let group = plan.concurrency.as_ref().filter(|_| culprit.is_none()).map(|g| (format!("{}\0{}", repo.id, g.group), g.group.clone(), GroupConfig { cancel_in_progress: g.cancel_in_progress, queue_max: g.queue_max, limit: g.limit.map_or(1, |l| l.max(1) as usize), max_pending: 100 }));
             (Some(initial), Some(Awaiting { group }))
         } else {
             (None, None)
         };
-        let sup = sup_of(&wf, &repo, &path, &event.name, &input.github);
+        let sup = if culprit.is_some() { None } else { sup_of(&wf, &repo, &path, &event.name, &input.github) };
         // Where a person's retry asked its legs to run (W05-R28), those queued after a restart too.
         let placed = v.get("placed").and_then(|p| serde_json::from_value(p.clone()).ok()).unwrap_or_default();
-        let mut st = RunSt { plan, repo: repo.clone(), event, path, created: row.created_at, in_progress: !unapproved, files: Arc::clone(&files), wf: Arc::clone(&wf), github: input.github.clone(), vars: input.vars.clone(), trusted: input.trusted, actions, keys: HashMap::new(), held, seq, keep, debug, keep_failed, given: Given::default(), timing: Arc::clone(&timing), tree: Arc::clone(&tree), removed: 0, costs, awaiting, no_reuse: v.get("no_reuse").and_then(serde_json::Value::as_bool).unwrap_or(false), who: Who::default(), sup, cold: v.get("cold").and_then(serde_json::Value::as_bool).unwrap_or(false), placed };
+        let mut st = RunSt { plan, repo: repo.clone(), event, path, created: row.created_at, in_progress: !unapproved, files: Arc::clone(&files), wf: Arc::clone(&wf), github: input.github.clone(), vars: input.vars.clone(), trusted: input.trusted, actions, keys: HashMap::new(), held, seq, keep, debug, keep_failed, given: Given::default(), timing: Arc::clone(&timing), tree: Arc::clone(&tree), removed: 0, costs, awaiting, no_reuse: v.get("no_reuse").and_then(serde_json::Value::as_bool).unwrap_or(false), who: Who::default(), sup, cold: v.get("cold").and_then(serde_json::Value::as_bool).unwrap_or(false), culprit, placed };
         st.who = who_of(&self.hub, &st).await;
         let mut queued = Vec::new();
         for (id, key, status, agent, attempt, leg) in legs {
@@ -3186,6 +3341,7 @@ impl Dispatch {
                 },
             );
             let mut li = leg_in(&st, run, &id, &spec, &self.hub.cfg.ci, &self.warm);
+            li.paused = paused.contains(&id);
             // Its work again, from the input hash it was queued with (W28-R46, W05-R25).
             li.work = work_of(&st, &spec, super::reuse::hash_of(&self.hub, &id).await.ok().flatten());
             li.finish_within = st.sup.as_ref().map(|s| s.finish_within);
@@ -3501,6 +3657,34 @@ pub(crate) fn sample_of(s: &crate::metrics::HostSample, facts: Option<&kiln_ci::
 
 #[cfg(test)]
 mod tests {
+    /// W28-R57: a culprit-finding try is no push of its branch. A gate's goes at once, at gate
+    /// priority, nothing holding it; the rest at low priority, below work in progress, speculative
+    /// under its lane's window and coalescing with no push. Its run keeps that through a restart,
+    /// and no request can make its run one.
+    #[test]
+    fn w28_r57_a_try_s_priority_and_admission() -> anyhow::Result<()> {
+        use kiln_ci::sched::admit::{Cadence, Coalesce, Spec};
+        use kiln_ci::sched::intent::Intent;
+
+        use super::Try;
+        let (low, gate) = (Try { gate: false }, Try { gate: true });
+        assert!(low.priority() < Intent::Wip.priority() && low.priority() == Try::LOW, "{}", low.priority());
+        assert_eq!(gate.priority(), Intent::Gate.priority());
+        assert_eq!((low.intent().0, gate.intent().0), (Intent::Wip, Intent::Gate));
+        let declared = Spec { coalesce: Some(Coalesce { quiet: 60_000, max_wait: 600_000, always: false }), cadence: Some(Cadence::Free) };
+        assert_eq!(Try::admission(None, declared), (declared.coalesce, declared.cadence, false), "a push's legs as its workflow says");
+        assert_eq!(Try::admission(Some(low), declared), (None, None, true), "speculative under the window, coalescing with nothing");
+        assert_eq!(Try::admission(Some(gate), declared), (None, None, false), "a gate's: never held");
+        // Kept with the run's input, and read back after a restart.
+        assert_eq!(Try::of_input(&serde_json::json!({ "culprit": gate })), Some(gate));
+        assert_eq!(Try::of_input(&serde_json::json!({ "culprit": null })), None);
+        assert_eq!(Try::of_input(&serde_json::json!({})), None);
+        // A request's `culprit` is no field of its: only kiln's bisection marks a try.
+        let ask: crate::ci::uploads::Ask = serde_json::from_value(serde_json::json!({ "sha": "a", "culprit": { "gate": true }, "vars": { "KILN_TRY_PRIORITY": "90" } }))?;
+        assert_eq!(ask.culprit, None);
+        Ok(())
+    }
+
     /// W05-R17: a rerun's `github.triggering_actor` is whoever reran it, as GitHub names people; an
     /// agent's is the person it acts for.
     #[test]

@@ -196,11 +196,8 @@ async fn under_it(store: &Store, digest: &str) -> anyhow::Result<Vec<String>> {
 
 /// A custody record a runner process sent ([`crate::proto::AgentMsg::Custody`]): taken as having
 /// come over that process's connection, and logged either way.
-pub async fn on_runner(hub: &crate::hub::Hub, peer: crate::instances::PeerId, machine: &str, json: &str) {
+pub async fn on_runner(hub: &crate::hub::Hub, peer: crate::instances::PeerId, machine: &str, bundle: Value) {
     let instance = hub.instances.lock().get(peer).map(|i| i.label()).unwrap_or_else(|| "legacy".to_owned());
-    let Ok(bundle) = serde_json::from_str::<Value>(json) else {
-        return tracing::debug!(%machine, "an unreadable custody record");
-    };
     let came_from = format!("runner {machine} (instance {instance})");
     // Something another runner handed it over a reach link that it refused where it would have
     // used it (W27-R08: a sync's workspace, a run, a run's output not what was handed on, or with

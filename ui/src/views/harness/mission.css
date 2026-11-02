@@ -658,8 +658,10 @@ a.ms-why:hover {
   position: relative;
   margin-bottom: 22px;
 }
+/* The field is the agent composer's own height from the start, as it starts an agent and as it messages
+   them, so nothing moves as it's used or as it turns. */
 .ms-msg .hx-compose-input {
-  min-height: 44px;
+  min-height: 46px;
   max-height: 200px;
   field-sizing: content;
 }
@@ -752,14 +754,17 @@ a.ms-why:hover {
 }
 
 /* Over the list: check them all, how many there are, and what to do with those picked, on one line a
-   finger's height (40 px); its hairline, held in view by touch, fading in and out with selecting. */
+   finger's height (40 px) with room above and below it (48 px in all: 8 px over and under its
+   buttons, as far as they are apart, empty or not, so nothing moves as it fills); its hairline, held
+   in view by touch, fading in and out with selecting. It sits on the list's own edges, its hairline's
+   ends, as the filter and the sort over it do: the check (or ring) at its left, the last button at its right. */
 .ms-listhead {
   display: flex;
   flex-wrap: wrap;
   align-items: center;
   gap: 0 22px;
-  min-height: 40px;
-  padding: 0 8px 0 9px;
+  min-height: 48px;
+  padding: 4px 0;
   transition: box-shadow 0.2s ease;
 }
 .ms-all {
@@ -1068,11 +1073,7 @@ a.ms-why:hover {
     user-select: none;
     -webkit-user-select: none;
   }
-  /* The head's left edge where the rows' is, and its ring as far from the count as theirs from their
-     names: the ring that picks them all sits over theirs. */
-  .ms-listhead {
-    padding-left: 6px;
-  }
+  /* The ring that picks them all as far from the count as theirs from their names. */
   .ms-all {
     gap: 0;
   }
@@ -1082,9 +1083,6 @@ a.ms-why:hover {
       grid-template-areas:
         "main main"
         "meta actions";
-      padding-left: 12px;
-    }
-    .ms-listhead {
       padding-left: 12px;
     }
   }
@@ -1205,15 +1203,17 @@ html[data-motion="paused"] .ms-pick::before {
   margin-left: 0;
 }
 
-/* ---------------------------------------------------------------- the message box's To line: those picked
-   (each with its ×; @ in the field finds more), or everyone the list shows */
-/* One line, whatever is picked: the chips that fit, then "+N more" (broadcast.tsx's ToChips), Clear at its end. */
+/* ---------------------------------------------------------------- the To line under the message box: those
+   picked (each with its ×; @ in the field finds more), or everyone the list shows */
+/* One line, whatever is picked: the chips that fit, then "+N more" (broadcast.tsx's ToChips), Clear at its end.
+   It's the row More options is under the box that starts an agent (.mc-under), in its size and place. */
 .ms-to {
   display: flex;
   align-items: center;
   gap: 6px;
-  min-height: 26px;
-  padding: 8px 12px 0;
+  min-height: 34px;
+  margin-top: 6px;
+  padding: 0 4px;
   font-size: 12px;
 }
 .ms-to > * {
@@ -1308,10 +1308,14 @@ html[data-motion="paused"] .ms-pick::before {
     height: 24px;
   }
 }
-/* Before the agents are known (RowsLoading): the bar and a few rows, in their own sizes. */
+/* Before the agents are known (PageLoading): the page's parts in their own sizes, and a few rows. The
+   stands' line holds its room unseen (a count of nothing would say something); the bar fills the filter's. */
+.ms-loading-sd {
+  visibility: hidden;
+}
 .ms-loading-bar {
-  height: 40px;
-  margin-bottom: 18px;
+  flex: 1 1 auto;
+  height: var(--field-h);
   border-radius: 7px;
 }
 .ms-row.ms-loading-row {
@@ -1339,6 +1343,10 @@ html[data-motion="paused"] .ms-pick::before {
 .mc-mode {
   display: flow-root;
   animation: mc-in 0.14s ease-out;
+}
+/* The composer the page opens with shows as it is: only a turn crossfades. */
+.mc-mode[data-first] {
+  animation: none;
 }
 @keyframes mc-in {
   from {
@@ -1545,10 +1553,6 @@ button.mc-pick[aria-expanded="true"] .mc-chev {
   .mc-under {
     gap: 0 18px;
   }
-}
-/* The field is the agent composer's own height from the start, so nothing moves as it's used. */
-.mc .hx-compose-input {
-  min-height: 46px;
 }
 /* Opening the agent it started: one view transition, each part landing where it goes on the agent's page (console.css names those). */
 :root[data-opening] .mc .mc-how {

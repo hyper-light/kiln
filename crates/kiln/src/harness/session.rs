@@ -935,6 +935,8 @@ fn end_tasks(core: &mut Core) {
         t.status = "stopped".to_owned();
         t.ended.get_or_insert_with(Core::now);
     }
+    // What it was sent and never finished, or that waited to go, doesn't go now.
+    core.drop_unfinished(true);
     core.touch_state();
 }
 
@@ -985,6 +987,9 @@ pub fn start_seeded(id: String, spec: Spec, sink: Sink, on_change: Arc<dyn Fn() 
     core.state.cwd.clone_from(&cwd);
     core.state.model = spec.model.clone().unwrap_or_default();
     core.state.mode = spec.mode.clone().unwrap_or_default();
+    // What it starts at, until its harness says what it applied.
+    core.state.effort = spec.effort.clone().unwrap_or_default();
+    core.state.speed = spec.speed.clone().unwrap_or_default();
     core.state.harness_session.clone_from(&spec.resume);
     // Moved here: its timeline as it was, then the line saying so.
     let mut items = None;
@@ -1023,7 +1028,38 @@ pub fn start_seeded(id: String, spec: Spec, sink: Sink, on_change: Arc<dyn Fn() 
         core.state.arriving = sd.synced;
     }
     core.state.reach.clone_from(&spec.reach);
+    named_ahead(&mut core.meta, kind, spec.model.as_deref());
     begin(id, spec, kind, core, sink, on_change, files, items, None)
+}
+
+/// Harness `kind`'s lists as this machine knows them, for a session's page to name its settings by
+/// before the harness says anything (a new session may wait for room on its machine, then take
+/// seconds to start; a switch starts the harness anew): its permission modes, its models (but an
+/// ACP agent's), and the effort levels and speeds of the one it runs (`model`; none, its default),
+/// as Mission control's composer offered them. What the harness says once it runs takes their place.
+fn named_ahead(meta: &mut super::model::Meta, kind: &Kind, model: Option<&str>) {
+    let models = super::kinds::models_of(kind.id);
+    let runs = match model.filter(|m| !m.is_empty()) {
+        Some(id) => models.iter().find(|m| m.id == id),
+        None => models.iter().find(|m| m.default).or(models.first()),
+    }
+    .cloned();
+    if meta.modes.is_empty() {
+        meta.modes = kind.modes().0;
+    }
+    if meta.efforts.is_empty() {
+        meta.efforts = match runs.as_ref().filter(|m| !m.efforts.is_empty()) {
+            Some(m) => m.efforts.iter().map(|e| super::model::ControlOption { id: e.clone(), label: super::model::effort_label(e), description: String::new(), dangerous: false }).collect(),
+            None => kind.efforts(),
+        };
+    }
+    if meta.speeds.is_empty() {
+        meta.speeds = runs.map(|m| m.speeds).unwrap_or_default();
+    }
+    // An ACP agent's own list says it can run them: it lists none before it's signed in.
+    if meta.models.is_empty() && !matches!(kind.protocol, Protocol::Acp(_)) {
+        meta.models = models;
+    }
 }
 
 /// A session with this core, its task started (`adopt`: going on with a harness process the
@@ -1238,7 +1274,7 @@ async fn pipe(rx: &async_channel::Receiver<Vec<u8>>, open: bool) -> Option<Vec<u
 }
 
 enum Ev {
-    Change((String, (Option<super::model::FileChange>, Option<super::core::Baseline>))),
+    Change((String, super::diff::Found)),
     Out(Option<Vec<u8>>),
     Err(Option<Vec<u8>>),
     Ctl(Option<Ctl>),
@@ -1273,6 +1309,35 @@ const RUN_OUTPUT_MAX: usize = 32 * 1024;
 const READ_MAX: u64 = 512 * 1024;
 /// How often the adapter gets a tick while the process runs.
 const TICK: Duration = Duration::from_secs(5);
+
+/// The wait before a harness whose process ended (nobody ending the agent) starts again; twice
+/// the wait before for each that ends after it, at most `AGAIN_MOST`, from `AGAIN_FIRST` again
+/// once one runs `AGAIN_RESET`.
+const AGAIN_FIRST: Duration = Duration::from_secs(2);
+const AGAIN_MOST: Duration = Duration::from_secs(300);
+const AGAIN_RESET: Duration = Duration::from_secs(600);
+/// A harness that ends within `SOON` of each of its last `SOON_TRIES` starts won't start: it
+/// waits for a person.
+const SOON: Duration = Duration::from_secs(20);
+const SOON_TRIES: u32 = 3;
+/// What an agent is told when its process ended part-way through a turn and started again.
+const PICK_UP: &str = "Your process ended part-way through your last turn, and kiln started it again: your conversation is as it was. Pick up where you left off.";
+
+/// How a harness's process ended, in words: its exit code, and the signal one past 128 stands for.
+fn ended_how(code: Option<i32>) -> String {
+    let signal = |n: i32| match n {
+        1 => "SIGHUP".to_owned(),
+        2 => "SIGINT".to_owned(),
+        9 => "SIGKILL".to_owned(),
+        15 => "SIGTERM".to_owned(),
+        n => format!("signal {n}"),
+    };
+    match code {
+        None => "a signal ended it".to_owned(),
+        Some(c) if (129..160).contains(&c) => format!("exit {c}: {} from outside it", signal(c - 128)),
+        Some(c) => format!("exit {c}"),
+    }
+}
 
 /// Completes when headroom has room for this session's held work: only while it holds some (so
 /// sessions with nothing waiting don't wake for it).
@@ -1626,6 +1691,13 @@ fn effects(s: &Arc<Session>, kind: &'static Kind, files: &Files, done: &async_ch
                     let _ = tx.send(Done::Reply { client, value }).await;
                 });
             }
+            super::core::Effect::Own { client, ask } => {
+                let tx = done.clone();
+                crate::rt::spawn(async move {
+                    let value = crate::rt::blocking(move || super::diff::own_edits(&ask, super::diff::read_now)).await.unwrap_or_else(|e| serde_json::json!({"error": format!("{e:#}")}));
+                    let _ = tx.send(Done::Reply { client, value }).await;
+                });
+            }
             super::core::Effect::Fetch { job, url } => {
                 let tx = done.clone();
                 crate::rt::spawn(async move {
@@ -1969,7 +2041,7 @@ fn carried_choices(from: &Kind, to: &Kind, mode: &str, effort: &str, allow_bypas
 
 /// The session's state for the harness it goes on in (`session`: its conversation's id there):
 /// the model, mode and effort it runs with; what was the old harness's own (its servers, skills,
-/// account, plan and limits, what it was doing) goes with it.
+/// account, plan and limits, its to-dos, what it was doing) goes with it.
 fn for_harness(st: &mut super::model::State, session: Option<String>, model: &str, mode: Option<String>, effort: Option<String>) {
     st.harness_session = session;
     model.clone_into(&mut st.model);
@@ -1994,6 +2066,9 @@ fn for_harness(st: &mut super::model::State, session: Option<String>, model: &st
     st.exit = None;
     st.activity = None;
     st.doing = None;
+    // Its to-dos too: the new harness has them in its note ("The plan as it stands") and keeps
+    // a list of its own, so keep-going never holds it to one only the old harness could change.
+    st.todos.clear();
 }
 
 /// A paused session moving to another machine goes on there: the pause (for this machine's
@@ -2082,6 +2157,7 @@ async fn carry_over(s: &Arc<Session>, from: &'static Kind, sw: Switch, left: usi
         for_harness(st, resume, &sw.model, mode, effort);
         st.status = Status::Starting;
         core.meta = super::model::Meta::default();
+        named_ahead(&mut core.meta, to, Some(&sw.model));
         core.hold = false;
         core.state.switching = None;
         // A pause for the old harness's limit ends: the new one runs on its own account. The turn
@@ -2848,6 +2924,20 @@ async fn drive(s: Arc<Session>, kind: &'static Kind, ctl_rx: async_channel::Rece
     if handed {
         s.prompted.store(true, std::sync::atomic::Ordering::Relaxed);
     }
+    // A new session (nothing in its timeline yet): the commit its folder has checked out as it
+    // begins, the commits after it its own (the Changes tab's Commits). One that came back (a
+    // restart, a move) has it, or is from before kiln kept it.
+    let new = {
+        let core = s.core.lock();
+        (core.events().next().is_none() && core.state.started_head.is_none()).then(|| core.state.cwd.clone())
+    };
+    if let Some(cwd) = new.filter(|_| !handed)
+        && let Some(head) = crate::workspace::git::head(std::path::Path::new(&cwd)).await
+    {
+        let mut core = s.core.lock();
+        core.state.started_head = Some(head);
+        core.touch_state();
+    }
     // Taking over a session: its transcript is read once it has ended (checked again before each
     // start while it has not).
     if !handed {
@@ -2883,7 +2973,11 @@ async fn drive(s: Arc<Session>, kind: &'static Kind, ctl_rx: async_channel::Rece
         let _ = sink.send((s.id.clone(), u)).await;
     }
     let mut first = !handed;
-    let mut crashes: Vec<Instant> = Vec::new();
+    // Its process ending never ends it: how many starts in a row ended soon after, the wait before
+    // its next start, and when that is.
+    let mut soon: u32 = 0;
+    let mut again = AGAIN_FIRST;
+    let mut again_at: Option<Instant>;
     // A message that arrived while the process was down, sent once it is back.
     let mut carry: Vec<Command> = Vec::new();
     // Skill runs sent while there was no room on its machine for it to go to work: run once there
@@ -2931,10 +3025,14 @@ async fn drive(s: Arc<Session>, kind: &'static Kind, ctl_rx: async_channel::Rece
     // A setting its harness takes when it starts (where its commands run) changed: it starts
     // again once nothing is under way.
     let mut reloading = false;
+    // Its harness ran here, a process of its own: one that never did has no group of processes
+    // here to end when it lets go.
+    let mut ran_here = false;
     // Tasks the harness left running that a switch stopped.
     let mut left = 0usize;
-    // The models it last listed (the machine keeps the list for its "new agent" and switches).
-    let mut models_seen: Vec<super::model::ModelOption> = Vec::new();
+    // The models it last listed (the machine keeps the list for its "new agent" and switches): not
+    // those kiln named ahead of its harness (`named_ahead`), which are the machine's list already.
+    let mut models_seen = s.core.lock().meta.models.clone();
     loop {
         // The harness it ran in is down: on in the other one.
         // Its turn is over: on to the other runner (or, if that can't be, on here).
@@ -2978,7 +3076,7 @@ async fn drive(s: Arc<Session>, kind: &'static Kind, ctl_rx: async_channel::Rece
             if let Some((to, carried)) = carry_over(&s, kind, sw, std::mem::take(&mut left), &sink).await {
                 kind = to;
                 seed = carried;
-                models_seen.clear();
+                models_seen = s.core.lock().meta.models.clone();
             }
             first = false;
             on_change();
@@ -3004,6 +3102,9 @@ async fn drive(s: Arc<Session>, kind: &'static Kind, ctl_rx: async_channel::Rece
                     // goes on), so two of it never run.
                     tracing::warn!(session = %s.id, error = %format!("{e:#}"), "couldn't take over the agent's process after the upgrade: it starts again");
                     crate::proc::terminate_tree(i32::try_from(a.process.pid).unwrap_or(0), Duration::from_secs(2)).await;
+                    // What its adapter held for it goes to the new one.
+                    let mut gone = a.adapter;
+                    gone.let_go(&mut s.core.lock());
                     continue;
                 }
             },
@@ -3027,9 +3128,8 @@ async fn drive(s: Arc<Session>, kind: &'static Kind, ctl_rx: async_channel::Rece
                     Some(why) => Err(anyhow::anyhow!(why)),
                     // In the session's group of processes where the machine has them, and marked as
                     // its, and so is everything it starts (`survivors`).
-                    None => kind
-                        .launch(&spec, &s.id)
-                        .map(|mut p| {
+                    None => match kind.launch(&spec, &s.id) {
+                        Ok(mut p) => {
                             p.env(super::survivors::MARK, &s.id);
                             // Its git signs as the agent, through this runner (W27-R03), where the
                             // server issues identities, and pushes to kiln as the agent where the
@@ -3047,20 +3147,24 @@ async fn drive(s: Arc<Session>, kind: &'static Kind, ctl_rx: async_channel::Rece
                                     Err(e) => tracing::warn!(session = %s.id, error = %format!("{e:#}"), "its git won't sign or push as the agent"),
                                 }
                             }
-                            p
-                        })
-                        .and_then(|p| crate::proc::spawn_duplex_in(p, crate::os::contain::Group::of(&s.id).as_ref())),
+                            crate::proc::spawn_duplex_in_pool(p, crate::os::contain::Group::of(&s.id)).await
+                        }
+                        Err(e) => Err(e),
+                    },
                 };
                 (adapter, spawned, Vec::new(), false)
             }
         };
         let started = Instant::now();
+        again_at = None;
+        let launched = spawned.is_ok();
         let mut code = None;
         let mut error = None;
         match spawned {
             Err(e) => error = Some(format!("{e:#}")),
             Ok(mut p) => {
                 *s.pid.lock() = Some(p.pid);
+                ran_here = true;
                 if adopted {
                     let mut core = s.core.lock();
                     // An older image may have left what the harness before a switch ran looking live.
@@ -3106,6 +3210,8 @@ async fn drive(s: Arc<Session>, kind: &'static Kind, ctl_rx: async_channel::Rece
                 let mut ending = false;
                 // Stopped by force (`Command::ForceStop`): it starts again now, whatever is under way.
                 let mut forcing = false;
+                // Where this machine keeps what's an agent's own: whose each file it changes is.
+                let roots = std::sync::Arc::new(super::whose::Roots::here(&spec.env));
                 loop {
                     for job in jobs.previews.drain(..) {
                         let tx = pv_tx.clone();
@@ -3116,15 +3222,19 @@ async fn drive(s: Arc<Session>, kind: &'static Kind, ctl_rx: async_channel::Rece
                         });
                     }
                     for job in jobs.changes.drain(..) {
-                        // Placed among its folder's repository's working trees (a worktree it went into).
-                        let home = {
+                        // Placed among its folder's repository's working trees (a worktree it went into),
+                        // and said whose it is: this project's, the person's or an agent's own.
+                        let (home, folders) = {
                             let mut core = s.core.lock();
                             core.start_change(&job.abs);
-                            core.state.cwd.clone()
+                            let cwd = core.state.cwd.clone();
+                            core.note_folder(&cwd);
+                            (cwd, core.folders().to_vec())
                         };
+                        let roots = roots.clone();
                         changes.push(async move {
                             let abs = job.abs.clone();
-                            let change = crate::rt::blocking(move || super::diff::placed_change(&job, &home)).await.unwrap_or((None, None));
+                            let change = crate::rt::blocking(move || super::diff::placed_change(&job, &home, &folders, &roots)).await.unwrap_or_default();
                             (abs, change)
                         });
                     }
@@ -3190,6 +3300,8 @@ async fn drive(s: Arc<Session>, kind: &'static Kind, ctl_rx: async_channel::Rece
                                     let _ = sink.send((s.id.clone(), u)).await;
                                 }
                             }
+                            // What one who changed its files did alone: the session keeps that, whatever its harness.
+                            Command::OwnEdits { client, by } => s.core.lock().ask_own(client, &by),
                             Command::Control { id, value } if id == "rename" => {
                                 if let Some(c) = name_session(&s, value.as_ref()) {
                                     adapter.command(&mut s.core.lock(), c);
@@ -3337,6 +3449,8 @@ async fn drive(s: Arc<Session>, kind: &'static Kind, ctl_rx: async_channel::Rece
                                 p.terminate(Duration::from_secs(2));
                                 let _ = crate::rt::timeout(Duration::from_secs(5), &mut p.exit).await;
                                 *s.pid.lock() = None;
+                                // What its adapter held goes with its record, in its queue.
+                                adapter.let_go(&mut s.core.lock());
                                 let _ = reply.send(None);
                                 return;
                             };
@@ -3417,10 +3531,10 @@ async fn drive(s: Arc<Session>, kind: &'static Kind, ctl_rx: async_channel::Rece
                             }
                         }
                         Ev::Preview(None) => {}
-                        Ev::Change((abs, (change, resolved))) => {
-                            s.core.lock().set_change(&abs, change, resolved);
-                            while let Some(Some((abs, (change, resolved)))) = changes.next().now_or_never() {
-                                s.core.lock().set_change(&abs, change, resolved);
+                        Ev::Change((abs, found)) => {
+                            s.core.lock().found(&abs, found);
+                            while let Some(Some((abs, found))) = changes.next().now_or_never() {
+                                s.core.lock().found(&abs, found);
                             }
                         }
                         Ev::Fx(Some(d)) => d.apply(&mut adapter, &mut s.core.lock()),
@@ -3532,6 +3646,7 @@ async fn drive(s: Arc<Session>, kind: &'static Kind, ctl_rx: async_channel::Rece
                     seed = None;
                 }
                 if rewind_to.is_some() {
+                    adapter.let_go(&mut s.core.lock());
                     first = false;
                     continue;
                 }
@@ -3564,19 +3679,48 @@ async fn drive(s: Arc<Session>, kind: &'static Kind, ctl_rx: async_channel::Rece
         if switching.is_some() || moving.is_some() || reloading {
             continue;
         }
-        // A crash after a good run comes back by itself (a few times), with room on its machine
-        // for it (at work when it crashed, it has its own still); a harness that will not start
-        // waits for a person.
+        // Its process ending never ends the agent, however it ended (a signal from outside it, a
+        // crash, an end of its own): an agent lives until a person, or the agent that started it,
+        // ends it (docs/agents.md, "An agent lives until it's ended"). It starts again by itself,
+        // its conversation resumed and the turn the end cut short picked up first, once there's
+        // room on its machine for it: after `AGAIN_FIRST`, each time twice the wait before (at most
+        // `AGAIN_MOST`), from `AGAIN_FIRST` again once it ran `AGAIN_RESET`. A harness that never
+        // started, or ended within `SOON` of each of its last `SOON_TRIES` starts, won't start: it
+        // waits for a person (a restart or a message), saying why.
         let ran = started.elapsed();
-        crashes.retain(|t| t.elapsed() < Duration::from_secs(600));
-        let auto = code != Some(0) && error.is_none() && ran > Duration::from_secs(20) && crashes.len() < 3;
-        if auto {
-            crashes.push(Instant::now());
-            if s.core.lock().has_room() {
-                crate::rt::sleep(Duration::from_secs(2)).await;
-                continue;
+        if ran >= AGAIN_RESET {
+            again = AGAIN_FIRST;
+        }
+        soon = if ran < SOON { soon.saturating_add(1) } else { 0 };
+        if launched && soon < SOON_TRIES {
+            let cut = s.turn_open.load(std::sync::atomic::Ordering::Relaxed);
+            again_at = Instant::now().checked_add(again);
+            {
+                let mut core = s.core.lock();
+                let now = Core::now();
+                if let Some(x) = core.state.exit.as_mut() {
+                    x.again_at = Some(now.saturating_add(i64::try_from(again.as_millis()).unwrap_or(i64::MAX)));
+                }
+                let then = if cut { ", and picks up the turn it was on" } else { "" };
+                core.upsert(&format!("harness-again:{now}"), None, super::model::Body::Notice { level: Level::Warn, text: format!("Its process ended ({}). kiln starts it again{then}: its conversation goes on.", ended_how(code)) });
+                if cut && !core.state.queue.first().is_some_and(|q| q.text == PICK_UP) {
+                    core.state.queue.insert(0, super::model::QueueItem { id: format!("{}again-{now}", super::core::KEEP_ID), text: PICK_UP.to_owned(), at: now, attachments: Vec::new(), overrides: None, reply_to: None });
+                }
+                core.touch_state();
             }
-            restart_wanted = true;
+            flush(&s, &sink, None).await;
+            on_change();
+            again = again.saturating_mul(2).min(AGAIN_MOST);
+        } else if launched {
+            {
+                let mut core = s.core.lock();
+                if let Some(x) = core.state.exit.as_mut() {
+                    x.error.get_or_insert_with(|| format!("It ended within {} s of each of its last {SOON_TRIES} starts, so kiln stopped starting it again: send a message or restart it.", SOON.as_secs()));
+                }
+                core.touch_state();
+            }
+            flush(&s, &sink, None).await;
+            on_change();
         }
         // Skill runs that waited for room go with its next start.
         carry.append(&mut for_room);
@@ -3603,9 +3747,21 @@ async fn drive(s: Arc<Session>, kind: &'static Kind, ctl_rx: async_channel::Rece
             if unwaited {
                 flush(&s, &sink, None).await;
             }
+            // Its process ended without anyone ending it: it starts again when its wait is over.
+            let due = again_at;
+            let wake = async move {
+                match due {
+                    Some(at) => crate::rt::sleep(at.saturating_duration_since(Instant::now())).await,
+                    None => futures::future::pending::<()>().await,
+                }
+            };
             let ev = futures::select_biased! {
                 c = ctl_rx.recv().fuse() => Ev::Ctl(c.ok()),
                 f = fx_rx.recv().fuse() => Ev::Fx(f.ok()),
+                () = wake.fuse() => {
+                    again_at = None;
+                    Ev::Ctl(Some(Ctl::Cmd(Box::new(Command::Restart))))
+                }
             };
             match ev {
                 Ev::Ctl(Some(Ctl::Cmd(c))) => match *c {
@@ -3620,6 +3776,7 @@ async fn drive(s: Arc<Session>, kind: &'static Kind, ctl_rx: async_channel::Rece
                             let _ = sink.send((s.id.clone(), u)).await;
                         }
                     }
+                    Command::OwnEdits { client, by } => s.core.lock().ask_own(client, &by),
                     // Another harness's model: the session goes on in it, now.
                     Command::SetModel { model, kind: Some(to) } if to != kind.id => {
                         if let Some(sw) = wanted(&s, kind, &to, model) {
@@ -3649,22 +3806,37 @@ async fn drive(s: Arc<Session>, kind: &'static Kind, ctl_rx: async_channel::Rece
                     c @ (Command::Send { .. } | Command::SkillRun { .. }) => {
                         let c = prepare(&files, c).await;
                         let mut core = s.core.lock();
-                        if core.has_room() {
+                        // What waits in its queue goes first (held for its harness when that
+                        // ended, CP-T3.2): one to go in turn waits behind it, and the harness,
+                        // started again, takes them in order.
+                        if matches!(&c, Command::Send { mode: super::model::SendMode::Queue, task: None, .. }) && !core.state.queue.is_empty() {
+                            if let Some(m) = self::queued(c) {
+                                core.state.queue.push(m);
+                                core.touch_state();
+                            }
+                            let room = core.has_room();
+                            drop(core);
+                            on_change();
+                            if room {
+                                break;
+                            }
+                        } else if core.has_room() {
                             drop(core);
                             carry.push(c);
                             break;
-                        }
-                        // No room on its machine for it to go to work: a message waits in its
-                        // queue till there is (a skill run with what goes with its next start).
-                        match c {
-                            Command::Send { id, text, attachments, overrides, reply_to, .. } => {
-                                core.state.queue.push(super::model::QueueItem { id, text, at: Core::now(), attachments, overrides, reply_to });
-                                core.touch_state();
+                        } else {
+                            // No room on its machine for it to go to work: a message waits in its
+                            // queue till there is (a skill run with what goes with its next start).
+                            match c {
+                                Command::Send { id, text, attachments, overrides, reply_to, .. } => {
+                                    core.state.queue.push(super::model::QueueItem { id, text, at: Core::now(), attachments, overrides, reply_to });
+                                    core.touch_state();
+                                }
+                                c => carry.push(c),
                             }
-                            c => carry.push(c),
+                            drop(core);
+                            on_change();
                         }
-                        drop(core);
-                        on_change();
                     }
                     // Where its commands run, while it isn't running: from its next start.
                     Command::Control { id, value } if id == "reach" => {
@@ -3719,7 +3891,11 @@ async fn drive(s: Arc<Session>, kind: &'static Kind, ctl_rx: async_channel::Rece
                     if !left.is_empty() {
                         let _ = crate::rt::blocking(move || left.iter().for_each(super::survivors::stop_tree)).await;
                     }
-                    if let Some(g) = crate::os::contain::Group::existing(&s.id) {
+                    // Gone on elsewhere without its harness ever running here (it couldn't start),
+                    // it has no group here: one under its id is the machine's it went on to, when
+                    // both kiln processes share a cgroup (a test's server and its runners), its
+                    // harness starting there, and isn't ended from here.
+                    if let Some(g) = crate::os::contain::Group::existing(&s.id).filter(|_| ran_here || !matches!(ctl, Some(Ctl::LetGo))) {
                         end_group(g, Duration::ZERO);
                     }
                     if matches!(ctl, Some(Ctl::LetGo)) {
@@ -4001,6 +4177,25 @@ mod tests {
         assert!(!switch_now(&core), "running");
     }
 
+    /// A switch leaves the old harness's to-dos to the note it gives the new one ("The plan as it
+    /// stands": the next test): the session goes on with none, so keep-going counts only the list
+    /// the new harness keeps, never one it has no way to change (Claude Code without a to-do tool,
+    /// after Devin).
+    #[test]
+    fn a_switch_leaves_the_to_dos_of_the_old_harness_in_its_note() {
+        use super::super::model::{State, Todo};
+        use super::{Info, for_harness};
+        let todo = |text: &str, status: &str| Todo { text: text.into(), status: status.into() };
+        let mut st = State { todos: vec![todo("find the cause", "completed"), todo("upgrade the studios", "in_progress"), todo("check them", "pending")], ..State::default() };
+        let mut info = Info::default();
+        info.apply(&st);
+        assert_eq!((info.todos_done, info.todos_total), (1, 3));
+        for_harness(&mut st, Some("S2".into()), "opus", Some("auto".into()), Some("max".into()));
+        info.apply(&st);
+        assert!(st.todos.is_empty(), "{:?}", st.todos);
+        assert_eq!((info.todos_done, info.todos_total), (0, 0), "nothing left open for keep-going to count");
+    }
+
     /// Into Devin, Antigravity or another ACP agent too: named by its own modes (kiln's Ask and
     /// Bypass for an agent that says its own only once started), at the same latitude.
     #[test]
@@ -4023,6 +4218,35 @@ mod tests {
         assert_eq!(carried_choices(claude, gemini, "plan", "", true, "").0, None);
         // And out of one: Devin's plan stays plan in Claude Code.
         assert_eq!(carried_choices(devin, claude, "plan", "", true, "opus").0.as_deref(), Some("plan"));
+        Ok(())
+    }
+
+    /// A session's page names its settings by its harness's lists before the harness says anything
+    /// (started, or switched to it anew): its modes by their names, the effort levels of the model it
+    /// runs where this machine has its list, else the harness's. What the harness said stays.
+    #[test]
+    fn a_harness_s_lists_name_a_session_s_settings_ahead_of_it() -> anyhow::Result<()> {
+        use super::super::model::{Meta, ModeOption};
+        use super::{Kind, named_ahead};
+        let kind = |id: &str| Kind::get(id).ok_or_else(|| anyhow::anyhow!("no {id}"));
+        let mut meta = Meta::default();
+        named_ahead(&mut meta, kind("codex")?, Some("gpt-6.1-sol"));
+        assert!(meta.modes.iter().any(|m| m.id == "untrusted" && m.label == "Ask"), "{:?}", meta.modes);
+        assert!(!meta.efforts.is_empty() && !meta.models.is_empty(), "{meta:?}");
+        // A model this machine hasn't listed: the harness's levels.
+        let mut meta = Meta::default();
+        named_ahead(&mut meta, kind("claude")?, Some("claude-unlisted-1"));
+        assert!(meta.modes.iter().any(|m| m.id == "acceptEdits" && m.label == "Accept edits"), "{:?}", meta.modes);
+        assert_eq!(meta.efforts.iter().map(|e| e.label.as_str()).collect::<Vec<_>>(), ["Low", "Medium", "High", "Extra high", "Max"]);
+        assert!(meta.speeds.is_empty(), "{:?}", meta.speeds);
+        // An ACP agent's models are its own to list (none before it's signed in); its modes are known.
+        let mut meta = Meta::default();
+        named_ahead(&mut meta, kind("devin")?, None);
+        assert!(meta.modes.iter().any(|m| m.id == "smart" && m.label == "Smart") && meta.models.is_empty(), "{meta:?}");
+        let said = vec![ModeOption { id: "said".into(), label: "Said".into(), description: String::new(), dangerous: false }];
+        let mut meta = Meta { modes: said.clone(), ..Meta::default() };
+        named_ahead(&mut meta, kind("claude")?, None);
+        assert_eq!(meta.modes, said);
         Ok(())
     }
 
@@ -4190,6 +4414,59 @@ mod tests {
         })
     }
 
+    /// CP-T3.2: a message sent as Codex started, held by its adapter for the thread (shown queued
+    /// by the agent), outlives Codex's process: it crashed before the thread opened, and the
+    /// message went first in kiln's queue, still shown queued. Another, sent while the agent is
+    /// down (which starts it again), goes after it; and what neither process ever got stays.
+    #[cfg(unix)]
+    #[test]
+    fn what_a_crashed_harness_held_goes_first_when_its_agent_starts_again() -> anyhow::Result<()> {
+        use super::super::model::{Delivery, SendMode};
+        use std::os::unix::fs::PermissionsExt;
+        async fn until(s: &Session, what: &str, done: impl Fn(&Core) -> bool) -> anyhow::Result<()> {
+            let came = crate::rt::timeout(Duration::from_secs(10), async {
+                while !done(&s.core.lock()) {
+                    crate::rt::sleep(Duration::from_millis(20)).await;
+                }
+            })
+            .await;
+            let core = s.core.lock();
+            anyhow::ensure!(came.is_ok(), "{what} never came: {:?}, its queue {:?}", core.state.status, core.state.queue.iter().map(|q| &q.id).collect::<Vec<_>>());
+            Ok(())
+        }
+        let queue = |c: &Core| c.state.queue.iter().map(|q| q.id.clone()).collect::<Vec<_>>();
+        crate::rt::block_on(async move {
+            let dir = tempfile::tempdir()?;
+            // A Codex that never opens a thread, and ends (code 3) a moment after it's told to.
+            let crash = dir.path().join("crash");
+            let codex = dir.path().join("stuck-codex");
+            std::fs::write(&codex, format!("#!/bin/sh\nwhile [ ! -e '{}' ]; do sleep 0.05; done\nsleep 0.3\nexit 3\n", crash.display()))?;
+            std::fs::set_permissions(&codex, std::fs::Permissions::from_mode(0o755))?;
+            let (tx, _rx) = async_channel::unbounded();
+            let host = super::super::host::Host::new(tx, None, super::super::host::Limits::default());
+            let spec = Spec { kind: "codex".into(), cwd: Some(dir.path().to_string_lossy().into_owned()), program: Some(codex.to_string_lossy().into_owned()), ..Spec::default() };
+            let s = host.open(Some("held".into()), spec)?;
+            let send = |id: &str| Command::Send { id: id.into(), text: format!("{id}'s words"), mode: SendMode::Queue, attachments: Vec::new(), overrides: None, reply_to: None, task: None };
+            until(&s, "its start", |c| !c.meta.features.is_empty()).await?;
+            anyhow::ensure!(s.command(send("m1")));
+            until(&s, "m1 held", |c| c.state.delivery.get("m1") == Some(&Delivery::Queued)).await?;
+            std::fs::write(&crash, "")?;
+            until(&s, "the crash", |c| c.state.status == Status::Exited).await?;
+            assert_eq!(queue(&s.core.lock()), ["m1"]);
+            // Sent while it's down, which starts it again (it ends at once, as it's told to).
+            anyhow::ensure!(s.command(send("m2")));
+            until(&s, "m2 behind m1", |c| queue(c) == ["m1", "m2"]).await?;
+            until(&s, "its second start", |c| c.state.exit.is_none()).await?;
+            until(&s, "its second end", |c| c.state.status == Status::Exited).await?;
+            let core = s.core.lock();
+            assert_eq!(queue(&core), ["m1", "m2"]);
+            assert_eq!((core.state.delivery.get("m1"), core.state.delivery.get("m2")), (Some(&Delivery::Queued), None));
+            drop(core);
+            host.close("held");
+            Ok(())
+        })
+    }
+
     #[test]
     fn an_ended_agent_shows_nothing_still_running() {
         let row = |id: &str, status: &str| Task { id: id.into(), tool_id: Some(format!("call-{id}")), class: Some("shell".into()), status: status.into(), ..Task::default() };
@@ -4201,6 +4478,19 @@ mod tests {
         assert_eq!(core.state.tasks.last().and_then(|t| t.ended), Some(7));
         assert!(core.get("call-terminal-dev").is_some_and(|e| matches!(&e.body, super::super::model::Body::Assistant { streaming: false, .. })));
         assert!(core.take_out().iter().any(|u| matches!(u, Update::State { state } if state.tasks.iter().all(|t| !t.live()))));
+    }
+
+    /// CP-T3.2: an agent ended with a message still waiting to go (held for a harness that had
+    /// ended, shown queued where it was said) says it was dropped, never queued for good; what it
+    /// finished stays done.
+    #[test]
+    fn an_ended_agent_says_what_never_went_was_dropped() {
+        use super::super::model::{Delivery, QueueItem};
+        let mut core = Core::new();
+        core.state.queue.push(QueueItem { id: "m2".into(), text: "and a search".into(), at: 1, attachments: Vec::new(), overrides: None, reply_to: None });
+        core.state.delivery = [("m1".to_owned(), Delivery::Completed), ("m2".to_owned(), Delivery::Queued)].into_iter().collect();
+        end_tasks(&mut core);
+        assert_eq!((core.state.delivery.get("m1"), core.state.delivery.get("m2")), (Some(&Delivery::Completed), Some(&Delivery::Cancelled)));
     }
 
     #[test]

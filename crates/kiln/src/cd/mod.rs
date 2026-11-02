@@ -19,6 +19,7 @@ pub mod guard;
 pub mod images;
 pub mod kube;
 pub mod live;
+pub mod logs;
 pub mod ops;
 pub mod plans;
 pub mod rollback;
@@ -285,10 +286,33 @@ impl Cd {
         })
     }
 
-    /// Registers (or replaces) an app and tells the engine.
+    /// A person's auto-sync for app `id`, if one set it (docs/ci.md W26-R27).
+    pub(crate) fn auto_sync_setting(&self, id: &str) -> Option<kiln_cd::autosync::Setting> {
+        self.store.read(|d| d.settings.get(&kiln_cd::autosync::app_setting(id)).cloned()).filter(|v| !v.is_null()).and_then(|v| serde_json::from_value(v).ok())
+    }
+
+    /// App `id`'s auto-sync: whether kiln syncs it on its own, and whose word that is.
+    pub(crate) fn auto_sync_of(&self, id: &str, def: &AppDef) -> kiln_cd::autosync::Decision {
+        kiln_cd::autosync::decide(def.sync.auto, self.auto_sync_setting(id).as_ref())
+    }
+
+    /// App `id`'s auto-sync as the API shows it: on or off, whose word (`from`: `app` or
+    /// `deploy-file`), what the deploy file says, and the person's setting.
+    pub(crate) fn auto_sync_json(&self, id: &str, def: &AppDef) -> serde_json::Value {
+        let setting = self.auto_sync_setting(id);
+        let d = kiln_cd::autosync::decide(def.sync.auto, setting.as_ref());
+        serde_json::json!({
+            "on": d.on,
+            "from": d.from.as_str(),
+            "deploy_file": def.sync.auto,
+            "app": setting.map(|s| serde_json::json!({"on": s.on, "by": s.by, "at_ms": s.at_ms})),
+        })
+    }
+
+    /// Registers (or replaces) an app and tells the engine, its auto-sync as a person set it.
     pub fn register(&self, def: AppDef) {
         let id = def.id();
-        let mut cfg = def.config();
+        let mut cfg = kiln_cd::autosync::config(&def, self.auto_sync_setting(&id).as_ref());
         cfg.read_only = is_shadow(&def);
         {
             let mut apps = self.apps.write();
@@ -1689,6 +1713,8 @@ pub async fn run(hub: Arc<Hub>) -> Result<()> {
         let c2 = cd.clone();
         crate::rt::spawn(async move {
             while let Ok(change) = crx.recv().await {
+                // Ship's Deploys reads what the store keeps (history, holds, settings).
+                crate::ship::deploys::heard();
                 match change {
                     kiln_cd::state::Change::App(id) => {
                         if let Some(def) = c2.store.read(|d| d.apps.get(&id).cloned()) {
@@ -1716,6 +1742,63 @@ pub async fn run(hub: Arc<Hub>) -> Result<()> {
     let _ = hub.shutdown.cancelled().await;
     *CD.write() = None;
     Ok(())
+}
+
+#[cfg(test)]
+impl Cd {
+    /// A KilnCD of its own over `hub`, its store under `dir`, for tests: never the server's (`get`
+    /// doesn't answer it), no cluster connected, nothing polled. Its engine is the one `drive`
+    /// leaves, on a thread of its own (the simulated cluster's, `kiln_cd::harness`): it answers
+    /// queries, and inputs change nothing. What `drive` gives besides comes back with it.
+    pub(crate) fn scratch<T: Send + 'static>(hub: Arc<Hub>, dir: &std::path::Path, drive: impl FnOnce() -> (kiln_cd::harness::Harness, T) + Send + 'static) -> Result<(Arc<Cd>, T)> {
+        let store = Store::open(&dir.join("store"), 1, &[1])?;
+        let (etx, erx) = std::sync::mpsc::channel::<ToEngine>();
+        let (ttx, trx) = std::sync::mpsc::channel::<T>();
+        std::thread::Builder::new().name("kiln-cd-scratch".into()).spawn(move || {
+            let (h, t) = drive();
+            if ttx.send(t).is_err() {
+                return;
+            }
+            while let Ok(m) = erx.recv() {
+                if let ToEngine::Query(f) = m {
+                    f(&h.engine);
+                }
+            }
+        })?;
+        let t = trx.recv().context("the scratch engine's drive ended")?;
+        let cd = Arc::new(Cd {
+            hub,
+            store,
+            engine: etx,
+            apps: RwLock::new(BTreeMap::new()),
+            clusters: RwLock::new(BTreeMap::new()),
+            statuses: RwLock::new(BTreeMap::new()),
+            dirty: Mutex::new(BTreeSet::new()),
+            deleting: Mutex::new(BTreeMap::new()),
+            watched: Mutex::new(BTreeSet::new()),
+            connecting: Mutex::new(BTreeSet::new()),
+            inputs_gate: Mutex::new(()),
+            dir: dir.to_path_buf(),
+            tools: Tools::default(),
+            poll: Duration::from_secs(60),
+            in_cluster_context: String::new(),
+            kubeconfig: String::new(),
+            kick: crate::rt::Notify::new(),
+            live: live::Live::default(),
+            plans: plans::Renders::default(),
+            artifacts: Mutex::new(HashMap::new()),
+            secret_values: Mutex::new(HashMap::new()),
+            deploy_errors: Mutex::new(BTreeMap::new()),
+            environments: RwLock::new(BTreeMap::new()),
+            started: Mutex::new(HashMap::new()),
+            targets: RwLock::new(BTreeMap::new()),
+            target_errors: Mutex::new(BTreeMap::new()),
+            repo_names: RwLock::new(HashMap::new()),
+            rollouts: rollouts::Drivers::default(),
+            custody: custody::Custody::default(),
+        });
+        Ok((cd, t))
+    }
 }
 
 #[cfg(test)]

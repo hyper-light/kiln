@@ -486,6 +486,17 @@ pub fn certified(session: &str, epoch: u64) -> bool {
     STATE.lock().waiting.remove(&(session.to_owned(), epoch)).is_some_and(|w| w.blue_green)
 }
 
+/// A bundle (a signed statement, as JSON) as it came: a hand-on passed from the runner before this
+/// one (blue/green), read here, where what's signed is checked.
+pub fn bundle_of(json: &str) -> Option<Value> {
+    serde_json::from_str(json).ok()
+}
+
+/// The server's signature beside hand-over's word `json` (its `word`), as it came.
+pub fn word_in(json: &str) -> Option<String> {
+    serde_json::from_str::<Value>(json).ok()?.get("word")?.as_str().map(str::to_owned)
+}
+
 /// Whether session command `json` the server sent is a hand-over's word (a local `MoveTo`: hand
 /// it to this machine's newest process; `HandedOver`: the server's word on such a hand-over): about
 /// the hold of the process it's sent to, never another's.
@@ -553,16 +564,15 @@ fn task_hand_on(slot: &str, by: &str, session: &str, task: &str) -> Option<Value
     }
 }
 
-/// kiln's server handed one of this process's agent sessions work (`json`: `{session, hand_on}`,
+/// kiln's server handed one of this process's agent sessions work (`v`: `{session, hand_on}`,
 /// `ServerMsg::Custody`): the session's receipt is signed as its next turn starts ([`status`]).
 /// Asked again for the same hand-on (after a reconnect), it's kept once. Or it handed this process
 /// a leg's inputs (`{leg, hand_on: [..]}`, the Transfers plan's step 11): kept for the leg, whose
 /// end this process signs its receipts of them at (`runner::signed`).
-pub fn handed(json: &str) {
+pub fn handed(v: &Value) {
     if !signs() {
         return;
     }
-    let Ok(v) = serde_json::from_str::<Value>(json) else { return };
     // kiln's record of a run of a reach link's frames its relay passed on to this process
     // (docs/ci.md W27-R08's relays).
     if let Some(r) = v.get("reach") {
@@ -1062,7 +1072,7 @@ fn statements_in(frame: &[u8]) -> Vec<Value> {
         Value::Object(_) => Some(v.clone()),
         _ => None,
     };
-    let json = match crate::proto::decode::<crate::proto::ServerMsg>(frame) {
+    let json = match crate::proto::read_server(frame) {
         Ok(crate::proto::ServerMsg::HarnessSend { json, .. } | crate::proto::ServerMsg::HarnessCmd { json, .. } | crate::proto::ServerMsg::Custody { json }) => json,
         _ => return Vec::new(),
     };
@@ -1080,7 +1090,7 @@ fn statements_in(frame: &[u8]) -> Vec<Value> {
 /// An agent's words relayed in server frame `frame` (`relayed` beside a session's message), and
 /// the body of the last relay's record of them.
 fn words_in(frame: &[u8]) -> Option<(Value, kiln_ci::identity::custody::Body)> {
-    let json = match crate::proto::decode::<crate::proto::ServerMsg>(frame).ok()? {
+    let json = match crate::proto::read_server(frame).ok()? {
         crate::proto::ServerMsg::HarnessSend { json, .. } | crate::proto::ServerMsg::HarnessCmd { json, .. } => json,
         _ => return None,
     };
@@ -1380,7 +1390,7 @@ mod tests {
         let certify = |kind: &str, of: Option<&str>, epoch: Option<u64>, who: &Identity| -> anyhow::Result<String> {
             let asked: IdentityAsk = serde_json::from_str(&identity::ask(kind, of, epoch)?)?;
             let pem = pki.issue_identity(&asked.csr, who, &[], time::Duration::hours(1))?;
-            identity::given(&serde_json::to_string(&crate::proto::IdentityGiven { kind: asked.kind, of: asked.of, epoch: asked.epoch, uri: who.uri()?, cert_pem: Some(pem), ..crate::proto::IdentityGiven::default() })?, dir.path(), "blue")?;
+            identity::given(crate::proto::IdentityGiven { kind: asked.kind, of: asked.of, epoch: asked.epoch, uri: who.uri()?, cert_pem: Some(pem), ..crate::proto::IdentityGiven::default() }, dir.path(), "blue")?;
             Ok(who.uri()?)
         };
         let runner = certify("runner", None, None, &Identity::new(&org, Actor::Runner { enrolled_by: "ada".into(), machine: machine.into(), instance: "blue".into() }))?;
@@ -1511,7 +1521,7 @@ mod tests {
             let pass = Pass { by: &server, from: "kiln://x/person/ada/machine/box-b/instance/main", to: &runner, stream: &stream, seq, why: "a reach link's frames" };
             server_signs(&passed_on(&pass, vec![run.thing(&name)], Vec::new()))
         };
-        let hand = |link: &str, record: &Value| handed(&serde_json::json!({ "reach": { "link": link, "from": "box-b", "record": record.to_string() } }).to_string());
+        let hand = |link: &str, record: &Value| handed(&serde_json::json!({ "reach": { "link": link, "from": "box-b", "record": record.to_string() } }));
         for f in [b"one".as_slice(), b"two", b"three"] {
             reach_frame("L-w27-relays", f);
         }
@@ -1575,7 +1585,7 @@ mod tests {
             let p = statement::payload(&Statement { subject: vec![crate::custody::work(name, &[name])], ..Statement::new(to_value(&body)) })?;
             Ok(statement::bundle(PAYLOAD_CUSTODY, &p, &signing.sign(&statement::to_sign(PAYLOAD_CUSTODY, &p))?, &crate::pki::der_of(&server_pem)?))
         };
-        let ask = |b: &Value| serde_json::json!({ "session": session, "hand_on": b.to_string() }).to_string();
+        let ask = |b: &Value| serde_json::json!({ "session": session, "hand_on": b.to_string() });
         let receipts = |name: &str| -> Vec<Statement> { drain().iter().filter_map(|r| serde_json::from_str::<Value>(r).ok()).filter_map(|b| statement_of(&b)).filter(|s| s.subject.first().is_some_and(|t| t.name == name)).collect() };
         let first = hand_on("plan run r1 step 1")?;
         handed(&ask(&first));
@@ -1585,7 +1595,7 @@ mod tests {
         let asked: IdentityAsk = serde_json::from_str(&identity::ask("agent", Some(session), Some(0))?)?;
         let me = Identity::new(&org, Actor::Agent { person: "ada".into(), agent: session.into(), epoch: 0, held_by: Some(kiln_ci::identity::chain::Holder { machine: "adacachy".into(), instance: "01a14794".into() }) });
         let pem = pki.issue_identity(&asked.csr, &me, &[], time::Duration::hours(1))?;
-        identity::given(&serde_json::to_string(&crate::proto::IdentityGiven { kind: asked.kind, of: asked.of, epoch: asked.epoch, uri: me.uri()?, cert_pem: Some(pem), ..crate::proto::IdentityGiven::default() })?, dir.path(), "main")?;
+        identity::given(crate::proto::IdentityGiven { kind: asked.kind, of: asked.of, epoch: asked.epoch, uri: me.uri()?, cert_pem: Some(pem), ..crate::proto::IdentityGiven::default() }, dir.path(), "main")?;
         assert!(take_up_due(), "signed once its identity is");
         let got = receipts("plan run r1 step 1");
         let body = got.first().map(|s| s.body.clone()).unwrap_or_default();

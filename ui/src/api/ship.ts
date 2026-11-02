@@ -7,6 +7,7 @@
 import { apiPath } from "@/lib/peer-base";
 import { browserSigns, signed } from "@/lib/signing";
 import { request } from "./client";
+import type { CdPlan } from "./types";
 
 export type ShipStand = "needs_you" | "failing" | "landing" | "checking" | "building" | "in_staging" | "waiting" | "shipping" | "replanting" | "shipped" | "fixed" | "rolled_back" | "superseded";
 
@@ -59,7 +60,20 @@ export interface ShipCommit {
   change?: ShipChange | null;
   /** The change's tip this commit folds under. */
   fold_under?: string | null;
+  /**
+   * Who made it, as far as kiln knows (ship.rs's made_by, W26-R18): the agent session that made it,
+   * and the person it traces back to. Hand off goes to `agent`, and Files' ask asks it. Today only a
+   * kiln change says it; Chain of Ownership fills it for every commit in time.
+   */
+  made_by?: { agent?: string; person?: string } | null;
   actions?: ShipAction[];
+  /**
+   * When its jobs ran (unix seconds): the first one's start to the last one's end, `to` null while
+   * one runs; null when none has started (docs/ci.md W26-R29).
+   */
+  ran?: { from: number; to: number | null } | null;
+  /** The machines its jobs ran on, in the order they started. */
+  machines?: string[];
   /** A hash of what the row shows (W26-R06): the same row, the same `v`. */
   v?: string;
 }
@@ -115,10 +129,38 @@ export interface ShipDetail extends ShipCommit {
   deployments?: { environment: string; production: boolean; state: string | null; description: string | null; at: number }[];
   releases?: { state: string; message: string | null; rolled_back: boolean }[];
   replant?: { name: string; state: string; why: string }[];
+  /** Every job of the commit, either engine's, as the jobs pane acts on them (docs/ci.md W26-R21, R22). */
+  jobs?: ShipJob[];
+}
+
+/** What can be done to a commit's jobs together (`POST /api/ship/jobs`). */
+export type ShipVerb = "retry" | "pause" | "resume" | "cancel";
+
+/** A commit's job: its run, its lane's pipeline and name, where it runs, whether it's paused, and
+ * the verbs that apply now (and why each other doesn't). */
+export interface ShipJob {
+  id: string;
+  run: string;
+  pipeline: string;
+  name: string;
+  runner?: string;
+  paused_at?: number;
+  verbs: ShipVerb[];
+  why_not: Partial<Record<ShipVerb, string>>;
+}
+
+/** What one job said to a verb: done, or why not. */
+export interface ShipJobDone {
+  job: string;
+  run?: string;
+  done: boolean;
+  why?: string;
 }
 
 /** What a list asks for: a repository, the facets (W26-R02), a page. */
 export interface ShipQuery {
+  /** `repo`: each repository's newest commit, Ship's rows (docs/ci.md W26-R29). */
+  by?: "repo";
   repo?: string;
   host?: string;
   kind?: string;
@@ -162,4 +204,186 @@ export const shipApi = {
     }
     return { answer: await request<unknown>("POST", apiPath(a.path), { ...body, unsigned: why }), unsigned: why };
   },
+  /** A commit's jobs run again, paused, resumed or cancelled together: those named, or those a word picks. */
+  jobs: (body: { repo: string; sha: string; verb: ShipVerb; jobs?: string[]; scope?: ShipScope }) => request<{ verb: ShipVerb; jobs: ShipJobDone[] }>("POST", apiPath("/api/ship/jobs"), body),
+  /** Every KilnCD app by project, needs-you first (docs/ci.md W26-R24); `q` finds by project, app, environment, cluster or namespace. */
+  deploys: (q: string, signal?: AbortSignal) => request<ShipDeploys>("GET", apiPath(`/api/ship/deploys${q ? `?q=${encodeURIComponent(q)}` : ""}`), undefined, { signal }),
+  /** An opened app's pane: its id is `project/name`. */
+  deploy: (app: string, signal?: AbortSignal) => request<ShipDeployPane>("GET", apiPath(`/api/ship/deploys/${app.split("/").map(encodeURIComponent).join("/")}`), undefined, { signal }),
+  /** What syncing a commit of `repo` would do to its apps against what runs (`cd.plans.get`, counts and keys only). */
+  plan: (repo: string, commit: string, signal?: AbortSignal) =>
+    request<CdPlan>("GET", apiPath(`/api/cd/plans?repo=${encodeURIComponent(repo)}&commit=${encodeURIComponent(commit)}&brief=true`), undefined, { signal }),
+  /** One of the strip's verbs on an app, as its CD operation. */
+  deployAct: (body: ShipDeployAct) => request<{ app: string; verb: ShipDeployVerb; op: string; done: unknown }>("POST", apiPath("/api/ship/deploys"), body),
 };
+
+/**
+ * Ship's Deploys (docs/ci.md W26-R24, `crates/kiln/src/ship/deploys.rs`): every KilnCD app as Ship's
+ * rows, by project, where each stands as `kiln_cd::stands` says; an opened app's pane; and the strip's
+ * verbs. Every field is new on the wire, so each is optional here but the basics.
+ */
+export interface ShipDeployRow {
+  /** Its id, `project/name`: what the pane and the verbs take. */
+  app: string;
+  name: string;
+  /** The repository it deploys from (`owner/name`), else its Argo CD project. */
+  project: string;
+  environment: string | null;
+  cluster: string;
+  namespace: string;
+  stand: ShipStand | string;
+  /** The stand as a word (`Out of sync`, `Rolled back`). */
+  word: string;
+  line: string;
+  /** Its latest deploy's Sync, Health and Soak. */
+  pips: ShipPip[];
+  /** Who did what it shows (a person, `agent:…`, `auto-sync`, `auto-rollback`), and when (unix seconds; 0 when nothing has). */
+  by: string | null;
+  at: number;
+  /** What runs: its commit, short, or its chart's version. */
+  runs: string | null;
+  sync: string;
+  health: string;
+  auto_sync: boolean;
+  pinned: { to: number; revision: string | null; by: string | null; at_ms: number } | null;
+  v?: string;
+}
+
+export interface ShipDeployProject {
+  project: string;
+  /** Its heading's words: `2 apps · 1 waits on you`. */
+  say: string;
+  /** Its most pressing app needs someone. */
+  needs: boolean;
+  apps: ShipDeployRow[];
+}
+
+export interface ShipDeploys {
+  projects: ShipDeployProject[];
+  total: number;
+  at_ms: number;
+}
+
+/** One of an app's objects as a line; `key` is the `:key` of `/api/cd/apps/:app/resources/:key`. */
+export interface ShipDeployItem {
+  key: string;
+  group: string;
+  kind: string;
+  namespace: string;
+  name: string;
+  state: string;
+  v: string;
+  logs: boolean;
+  differs: boolean;
+  /** A pod's node. */
+  node?: string;
+  /** The container a pod's logs read. */
+  container?: string;
+}
+
+/** Its objects of one owner (`Deployment kiln`) or one sort (`Network`, `Config`, …). */
+export interface ShipDeployGroup {
+  name: string;
+  note: string;
+  owner: ShipDeployItem | null;
+  items: ShipDeployItem[];
+}
+
+/** A line of its history: a deploy (`deploy`), or a commit of its source none ran. */
+export interface ShipDeployLine {
+  deploy: number | null;
+  sha: string | null;
+  short: string | null;
+  subject: string;
+  by: string | null;
+  at_ms: number;
+  state: string;
+  /** It runs now. */
+  now: boolean;
+  /** An older deploy than what runs. */
+  dim: boolean;
+  /** Where Roll back takes the app to go to it. */
+  to: number | null;
+  revision: string | null;
+  same_as: number | null;
+}
+
+export interface ShipDeployStep {
+  n: number;
+  state: string;
+  what: string;
+  v: string;
+  /** The step under way's analysis as measured: each check's latest measurement. */
+  detail?: string;
+}
+
+export interface ShipDeployRollout {
+  id: string;
+  revision: string | null;
+  state: string;
+  note: string;
+  steps: ShipDeployStep[];
+  under_way: boolean;
+  waits: string | null;
+  approvals?: string[];
+  /** The deploy it rolls out, the one it goes back to, and the new one's share of traffic (%). */
+  deploy?: number | null;
+  back_to?: number | null;
+  weight?: number;
+  /** `canary` or `blue/green`; how it's going in a few words; the share Promote moves it to now. */
+  strategy?: string;
+  said?: string;
+  promote_to?: number | null;
+  /** On a cluster: its workload's ReplicaSet that ran (`stable`) and the newest (`canary`). */
+  sides?: { side: "stable" | "canary"; name: string; pods: number; share: number; up: string | null }[];
+}
+
+export interface ShipDeploySetting {
+  key: "auto_sync" | "auto_rollback" | "prune" | "self_heal" | string;
+  on: boolean;
+  /** Whose word it is: `app` (a person's), `deploy-file`, `repo`, `default`. */
+  from: string;
+  what: string;
+  /** A person may change it here. */
+  can: boolean;
+}
+
+export interface ShipDeployPane {
+  app: ShipDeployRow;
+  /** Where it deploys, how many objects it has in git, where they come from, and its source's repository (to plan a commit of). */
+  about: { cluster: string; namespace: string; objects: number; source: string; repo?: string | null };
+  groups: ShipDeployGroup[];
+  tree: { live: boolean; errors: string[] };
+  rollout: ShipDeployRollout | null;
+  history: ShipDeployLine[];
+  settings: ShipDeploySetting[];
+  /** Why each verb can't apply now; a verb missing from it can. */
+  why_not: Partial<Record<ShipDeployVerb, string>>;
+}
+
+export type ShipDeployVerb = "sync" | "refresh" | "rollback" | "stop" | "follow" | "promote" | "abort" | "approve" | "deny" | "auto_sync" | "auto_rollback" | "delete";
+
+/** A verb's body: the app, the verb, and only what that verb takes. */
+export interface ShipDeployAct {
+  app: string;
+  verb: ShipDeployVerb;
+  /** Sync: the picked objects' keys. */
+  resources?: string[];
+  prune?: boolean;
+  /** Refresh: render again too. */
+  hard?: boolean;
+  /** Roll back: to a deployment, or to any commit. */
+  to?: number;
+  revision?: string;
+  full?: boolean;
+  reason?: string;
+  check?: string;
+  rollout?: string;
+  /** auto_sync, auto_rollback. */
+  on?: boolean | null;
+  /** Delete: `foreground` deletes its objects too, `orphan` leaves them in the cluster. */
+  cascade?: "foreground" | "orphan";
+}
+
+/** The words the jobs pane picks by. */
+export type ShipScope = "failed" | "running" | "waiting" | "all";

@@ -49,6 +49,7 @@ mod placement;
 pub mod preview;
 pub mod previews;
 pub mod providers;
+pub mod verdict;
 pub mod registry;
 pub mod replies;
 pub mod signed;

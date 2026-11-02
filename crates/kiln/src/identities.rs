@@ -798,11 +798,7 @@ const OPEN_WAIT: std::time::Duration = std::time::Duration::from_secs(10);
 /// serial (the key goes on in the same process). An agent's ask for a session kiln hasn't heard of
 /// yet waits for the session's Open, [`OPEN_WAIT`] at most, in a task of its own, so this runner's
 /// messages (the Open among them) go on being taken meanwhile; every other ask is answered at once.
-pub async fn on_ask(hub: &Arc<Hub>, peer: PeerId, machine: &str, json: &str) {
-    let ask: IdentityAsk = match serde_json::from_str(json) {
-        Ok(a) => a,
-        Err(e) => return tracing::debug!(agent = %machine, error = %e, "an unreadable identity request"),
-    };
+pub async fn on_ask(hub: &Arc<Hub>, peer: PeerId, machine: &str, ask: IdentityAsk) {
     // A test build's `identity_late` (the server's): a leg's identity answered that long late, as a
     // busy server's is, in a task of its own as below (docs/ci.md W27-R05).
     if ask.kind == "leg"

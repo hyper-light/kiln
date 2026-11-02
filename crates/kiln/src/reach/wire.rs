@@ -26,6 +26,12 @@ pub const MAX_MESSAGE: usize = 4 << 20;
 /// Output a run may have sent and not yet had acknowledged.
 pub const WINDOW: u64 = 4 << 20;
 
+/// [`RunSpec::linger_ms`] of a run its asker may never come back for (`kiln run --detach`,
+/// docs/reach.md §4.2): it's never stopped for want of its asker, and its output, held unread,
+/// gives way oldest first rather than make it wait (`node::BUFFER`). A runner from before takes it
+/// as a linger longer than any run.
+pub const DETACHED: u64 = u64::MAX;
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub enum Ask {
     /// First on every link: which session this is (the same across links) and, for each run the
@@ -50,12 +56,22 @@ pub enum Ask {
     /// [`Say::ObjectMissing`]); the asker asks again from where it got to. Appended last:
     /// postcard numbers variants by place.
     Object { id: u64, repo: String, digest: String, offset: u64 },
+    /// Word that a message of the other end's couldn't be read here (`crate::wire::unread`): what
+    /// it was (never what it said), a code and why. The link ends after it; a runner from before,
+    /// which can't read this either, ends it as it would on any garbage. Appended last: postcard
+    /// encodes variants by index.
+    Unread { what: String, code: crate::wire::unread::Code, why: String },
     /// A custody record of what this side hands the other, as JSON (docs/ci.md W27-R08): a sync's
     /// workspace (before its [`SyncAsk::Commit`]) or a run (before its [`Ask::Run`]), its hand-on
     /// and the delegation the other side takes it under, or why it goes unsigned. Only on a link at
-    /// [`CUSTODY`] or later. Appended last: postcard numbers variants by place.
+    /// [`CUSTODY`] or later. Appended last, after main's `Unread`: postcard numbers variants by place.
     Custody { json: String },
 }
+
+/// How many variants [`Ask`] has: a newer peer's past them is `unknown`.
+pub const ASK_VARIANTS: usize = 13;
+/// How many variants [`Say`] has.
+pub const SAY_VARIANTS: usize = 13;
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Resume {
@@ -88,10 +104,13 @@ pub enum Say {
     ObjectData { id: u64, offset: u64, data: Vec<u8>, last: bool },
     /// The object asked for isn't here, for that repository.
     ObjectMissing { id: u64 },
+    /// Word that a message of the asker's couldn't be read here, as [`Ask::Unread`]. Appended last:
+    /// postcard encodes variants by index.
+    Unread { what: String, code: crate::wire::unread::Code, why: String },
     /// A custody record of this side's, as JSON (docs/ci.md W27-R08): its receipt of a sync's
     /// workspace (before its [`SyncSay::Done`]) or of a run (before it starts), or its hand-on of a
     /// run's output (before its [`Say::Exit`]), or why it goes unsigned. Only on a link at
-    /// [`CUSTODY`] or later. Appended last.
+    /// [`CUSTODY`] or later. Appended last, after main's `Unread`.
     Custody { json: String },
 }
 
@@ -141,7 +160,8 @@ pub struct RunSpec {
     /// Ended (and reported as such) after this long.
     #[serde(default)]
     pub timeout_ms: Option<u64>,
-    /// How long it may wait for its asker once no link is up before it is stopped.
+    /// How long it may wait for its asker once no link is up before it is stopped ([`DETACHED`]:
+    /// for ever).
     #[serde(default)]
     pub linger_ms: Option<u64>,
     /// A named shell whose working folder and exported variables carry from one run to the next.
@@ -218,6 +238,21 @@ impl Deframer {
         self.buf.extend_from_slice(data);
     }
 
+    /// The next whole message of a link's protocol (an enum of `variants` variants), if one
+    /// arrived; or why what came can't be one (`crate::proto::read`: a variant past them is
+    /// `unknown`, the rest, and a message too large, `malformed`). An error ends the link.
+    pub fn read<T: for<'de> Deserialize<'de>>(&mut self, variants: usize) -> Result<Option<T>, crate::proto::Unreadable> {
+        let Some(head) = self.buf.first_chunk::<4>() else { return Ok(None) };
+        let len = usize::try_from(u32::from_be_bytes(*head)).unwrap_or(usize::MAX);
+        if len > MAX_MESSAGE {
+            return Err(crate::proto::Unreadable::Malformed { variant: None, why: format!("a message of {len} bytes, over the {MAX_MESSAGE}-byte limit") });
+        }
+        let Some(body) = self.buf.get(4..4 + len) else { return Ok(None) };
+        let msg = crate::proto::read(body, || variants)?;
+        self.buf.drain(..4 + len);
+        Ok(Some(msg))
+    }
+
     /// The next whole message, if one arrived. An error (too large, undecodable) ends the link.
     pub fn take<T: for<'de> Deserialize<'de>>(&mut self) -> anyhow::Result<Option<T>> {
         let Some(head) = self.buf.first_chunk::<4>() else { return Ok(None) };
@@ -261,6 +296,30 @@ mod tests {
         Ok(())
     }
 
+    /// Word that a message couldn't be read is appended in both after every older variant (W27's
+    /// custody frames after it), and the counts say so.
+    #[test]
+    fn word_of_an_unread_message_is_appended_last() -> anyhow::Result<()> {
+        use crate::wire::unread::Code;
+        let ask = postcard::to_allocvec(&Ask::Unread { what: "variant 13".into(), code: Code::Unknown, why: "Say has 13 variants".into() })?;
+        let say = postcard::to_allocvec(&Say::Unread { what: "Ask".into(), code: Code::Malformed, why: "cut short".into() })?;
+        assert_eq!((ask.first().copied(), say.first().copied()), (u8::try_from(ASK_VARIANTS - 2).ok(), u8::try_from(SAY_VARIANTS - 2).ok()));
+        let mut d = Deframer::default();
+        d.push(&frame(&Ask::Ping { at: 1 })?);
+        assert_eq!(d.read::<Ask>(ASK_VARIANTS).ok().flatten(), Some(Ask::Ping { at: 1 }));
+        // A newer peer's kind, one cut short inside its length, and one too large.
+        let mut d = Deframer::default();
+        d.push(&[0, 0, 0, 1, 13]);
+        assert!(d.read::<Ask>(ASK_VARIANTS).is_err_and(|e| e.code() == Code::Unknown && e.what() == "variant 13"));
+        let mut d = Deframer::default();
+        d.push(&[0, 0, 0, 1, 2]);
+        assert!(d.read::<Ask>(ASK_VARIANTS).is_err_and(|e| e.code() == Code::Malformed));
+        let mut d = Deframer::default();
+        d.push(&u32::MAX.to_be_bytes());
+        assert!(d.read::<Say>(SAY_VARIANTS).is_err_and(|e| e.code() == Code::Malformed));
+        Ok(())
+    }
+
     #[test]
     fn objects_are_appended_after_every_older_variant() -> anyhow::Result<()> {
         let first = |b: Vec<u8>| b.first().copied();
@@ -278,13 +337,14 @@ mod tests {
     /// link at version 1 reads as it did; and a link carries them only from [`CUSTODY`] on.
     #[test]
     fn w27_r08_custody_frames_are_appended_after_every_older_variant() -> anyhow::Result<()> {
+        use crate::wire::unread::Code;
         let first = |b: Vec<u8>| b.first().copied();
-        let object = first(postcard::to_allocvec(&Ask::Object { id: 1, repo: "acme/app".into(), digest: "d".into(), offset: 0 })?);
+        let unread = first(postcard::to_allocvec(&Ask::Unread { what: String::new(), code: Code::Unknown, why: String::new() })?);
         let custody = first(postcard::to_allocvec(&Ask::Custody { json: "{}".into() })?);
-        anyhow::ensure!(custody == object.map(|i| i + 1), "Ask::Custody comes right after Object");
-        let missing = first(postcard::to_allocvec(&Say::ObjectMissing { id: 1 })?);
+        anyhow::ensure!(custody == unread.map(|i| i + 1) && custody == u8::try_from(ASK_VARIANTS - 1).ok(), "Ask::Custody comes right after main's Unread, last");
+        let unread = first(postcard::to_allocvec(&Say::Unread { what: String::new(), code: Code::Unknown, why: String::new() })?);
         let said = first(postcard::to_allocvec(&Say::Custody { json: "{}".into() })?);
-        anyhow::ensure!(said == missing.map(|i| i + 1), "Say::Custody comes right after ObjectMissing");
+        anyhow::ensure!(said == unread.map(|i| i + 1) && said == u8::try_from(SAY_VARIANTS - 1).ok(), "Say::Custody comes right after main's Unread, last");
         anyhow::ensure!(MIN_VERSION == 1 && CUSTODY > MIN_VERSION && VERSION >= CUSTODY, "a build from before speaks 1, which carries no custody");
         Ok(())
     }

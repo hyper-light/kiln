@@ -862,7 +862,7 @@ impl Monitors {
             if v.leader == 0 || v.leader != v.member {
                 continue;
             }
-            let Some(store) = o.store() else { continue };
+            let Some(store) = o.store_replayed() else { continue };
             let me = self.clone();
             let _ = crate::rt::blocking(move || me.tick(&store, crate::util::now_ms())).await;
         }

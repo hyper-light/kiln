@@ -2,7 +2,8 @@
 # and applied once, every update once and in order, through link cuts, kill -9 of each side, frames
 # dropped, sent twice and sent late, and viewers' reloads. A gate runs it on seed 1; this runs it
 # nightly on eight more, each of which drops, doubles and delays other frames and falls its faults
-# at other moments.
+# at other moments; and on the same eight with frames made unreadable too (one in 64 of each side's
+# a kind the other doesn't know, as many garbled), every one that came refused.
 name: wire-lab
 on:
   schedule: ["17 3 * * *"]
@@ -16,3 +17,11 @@ jobs:
     steps:
       - name: the lab (release)
         run: WIRE_LAB_SEED=${{ matrix.seed }} cargo test --release --locked -p kiln --features chaos --test wire_lab -- --nocapture
+  garbled:
+    name: wire lab, seed ${{ matrix.seed }}, frames made unreadable
+    runs-on: [baremetal, linux]
+    timeout-minutes: 60
+    matrix: { seed: [2, 3, 4, 5, 6, 7, 8, 9] }
+    steps:
+      - name: the lab (release), one frame in 64 unknown and as many garbled
+        run: WIRE_LAB_SEED=${{ matrix.seed }} WIRE_LAB_GARBLE=64 cargo test --release --locked -p kiln --features chaos --test wire_lab -- --nocapture

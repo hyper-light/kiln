@@ -57,9 +57,15 @@ fn production_runners() -> Result<Vec<Runner>, String> {
     serde_json::from_str(include_str!("../../tests/fixtures/production-runners.json")).map_err(|e| format!("production-runners.json: {e}"))
 }
 
-/// The pool production's change adds (W28 step 3's plan): Kubernetes pods for `[k8s]` legs.
+/// The overflow production's change gives its `k8s` pool (W28-R80): a Linux runner with what ci's
+/// three `[k8s]` jobs run (cargo, node, python3 and git).
+const OVERFLOW_HOSTS: &str = "os == linux && tools has cargo && tools has node && tools has python3 && tools has git";
+
+/// The pool production's change adds (W28 step 3's plan): Kubernetes pods for `[k8s]` legs, and
+/// where they go when their pods are late (W28 step 8).
 fn k8s_pool() -> PoolSpec {
-    PoolSpec { name: "k8s".into(), executor: "k8s".into(), labels: vec!["k8s".into()], max: Some(64), ..PoolSpec::default() }
+    let overflow = kiln_ci::sched::pools::OverflowSpec { hosts: OVERFLOW_HOSTS.into(), after: Some("2m".into()) };
+    PoolSpec { name: "k8s".into(), executor: "k8s".into(), labels: vec!["k8s".into()], max: Some(64), overflow: Some(overflow), ..PoolSpec::default() }
 }
 
 /// A runner as the scheduler sees it (`runner_view`): its facts, and what this build's runner
@@ -140,8 +146,20 @@ fn problems(file: &str, text: &str, event: &str, branch: &str, runners: &[Runner
     let views: Vec<RunnerView> = runners.iter().map(view).collect();
     for leg in &plan.legs {
         let route = super::dispatch::route_of(leg, &path, REPO, event, false, None);
-        // The scheduler's `pool_for`: the first pool that serves its labels runs it.
-        if pools.iter().any(|p| p.serves(&route.labels)) {
+        // The scheduler's `pool_for`: the first pool that serves its labels runs it, and where its
+        // overflow sends it (W28-R80) is one of production's runners that meets its requirements.
+        if let Some(p) = pools.iter().find(|p| p.serves(&route.labels)) {
+            if let Some(o) = &p.overflow {
+                let input = kiln_ci::sched::state::LegIn { route: route.clone(), ..kiln_ci::sched::state::LegIn::default() };
+                match kiln_ci::sched::state::Scheduler::overflow_requirement(&input, o) {
+                    Some(req) if views.iter().any(|v| routing::eligible(&req, v)) => {}
+                    Some(req) => {
+                        let why: Vec<String> = views.iter().map(|v| format!("{} lacks {}", v.name, routing::checks(&req, v).iter().filter(|c| !c.pass).map(|c| c.requirement.as_str()).collect::<Vec<_>>().join(", "))).collect();
+                        out.push(format!("{path} ({event}): leg `{}` has no runner to overflow to: {}", leg.key, why.join("; ")));
+                    }
+                    None => out.push(format!("{path} ({event}): leg `{}` may not overflow to a host", leg.key)),
+                }
+            }
             continue;
         }
         match routing::resolve(&route, &rules) {
@@ -211,5 +229,10 @@ fn w28_a_label_nothing_serves_fails() -> Result<(), String> {
     }
     let p = problems("ci.yaml", &ci, "push", "main", &runners, &[]);
     assert!(p.iter().any(|x| x.contains("KCI6007") && x.contains("`k8s`")) && p.iter().any(|x| x.contains("has no pool and no runner")), "without the pool: {p:#?}");
+    // W28-R80: an overflow none of production's runners meets.
+    let mut nowhere = k8s_pool();
+    nowhere.overflow = Some(kiln_ci::sched::pools::OverflowSpec { hosts: "os == linux && tools has bazel".into(), after: None });
+    let p = problems("ci.yaml", &ci, "push", "main", &runners, &[nowhere]);
+    assert!(p.iter().any(|x| x.contains("has no runner to overflow to") && x.contains("tools has bazel")), "{p:#?}");
     Ok(())
 }

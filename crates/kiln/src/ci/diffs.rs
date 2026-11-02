@@ -1808,6 +1808,8 @@ pub async fn route(hub: &Arc<Hub>, method: &Method, segs: &[&str], q: &HashMap<S
         (&Method::POST, ["comments", id, "apply"]) => ok(super::review::apply_suggestion(hub, id, caller, body).await?),
         (&Method::GET, ["repos", repo, "queue"]) => ok(super::land::list(hub, repo).await?),
         (&Method::GET, ["repos", repo, "lands", commit]) => ok(super::lands::get(hub, repo, commit).await?),
+        // W28-R109: a host's changes into its host's own queue, each at the head Review cleared.
+        (&Method::POST, ["repos", repo, "queue"]) => ok(super::land::enqueue_route(hub, repo, body, &caller.name).await?),
         (&Method::GET, ["stacks", id]) => ok(stack(hub, id).await?),
         (&Method::GET, ["review", "inbox"]) => {
             let mut v = super::review::inbox(hub, caller).await?;
@@ -1834,6 +1836,15 @@ pub async fn route(hub: &Arc<Hub>, method: &Method, segs: &[&str], q: &HashMap<S
         (&Method::POST, ["comments", id, "statement"]) => ok(super::verdicts::edit_statement(hub, id, caller, body).await?),
         (&Method::DELETE, ["comments", id]) => ok(super::review::delete(hub, id, caller).await?),
         (&Method::DELETE, ["queue", id]) => ok(super::land::cancel(hub, id, caller).await?),
+        // Review holds, lets go of or withdraws an entry (docs/ci.md W28-R104).
+        (&Method::POST, ["queue", id, action @ ("hold" | "release" | "withdraw")]) => {
+            let reason = body.get("reason").and_then(Value::as_str).map(str::trim).filter(|r| !r.is_empty());
+            ok(match *action {
+                "hold" => super::land::hold(hub, id, &caller.name, reason).await?,
+                "release" => super::land::release(hub, id, &caller.name).await?,
+                _ => super::land::withdraw(hub, id, &caller.name, reason).await?,
+            })
+        }
         (_, ["diffs" | "change-requests", key, rest @ ..]) => {
             let d = find(hub, key).await.map_err(fail)?.ok_or((StatusCode::NOT_FOUND, format!("no diff {key}")))?;
             // A caller sees a diff where they may read diffs (the route table checked it there).
@@ -1893,7 +1904,7 @@ pub async fn route(hub: &Arc<Hub>, method: &Method, segs: &[&str], q: &HashMap<S
                 (&Method::POST, ["statement"]) => ok(super::verdicts::statement(hub, &d, caller, body).await?),
                 (&Method::GET, ["verdicts"]) => ok(super::verdicts::list(hub, &d).await?),
                 (&Method::POST, ["viewed"]) => ok(super::review::viewed(hub, &d, caller, body).await?),
-                (&Method::GET, ["land"]) => ok(super::review::readiness(hub, &d).await?),
+                (&Method::GET, ["land"]) => ok(super::review::readiness(hub, &d).await?.json()),
                 (&Method::POST, ["land"]) => {
                     if !caller.can("diffs.land", &Scope::Repo { repo: d.repo.clone() }) {
                         return Err((StatusCode::FORBIDDEN, "landing needs `diffs.land`".into()));

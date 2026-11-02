@@ -2003,7 +2003,7 @@ fn w27_ac04_a_verdict_verifies_on_its_revision() -> anyhow::Result<()> {
 /// server. The agent gives it as agents do, through its MCP server (`kiln reach mcp`'s `code_run`,
 /// `kiln.ci.diffs.review`): that server asks kiln what to sign and has the runner sign it for the
 /// session, as kiln-git-sign has its commits signed. The verdict kiln keeps verifies as the agent at
-/// its epoch on its runner, for its person.
+/// its epoch on its runner, for its person; its comment and its reply in that thread go signed too.
 #[test]
 fn w27_r04_an_agents_verdict_is_signed_by_its_runner() -> anyhow::Result<()> {
     use std::os::unix::fs::PermissionsExt as _;
@@ -2044,7 +2044,10 @@ fn w27_r04_an_agents_verdict_is_signed_by_its_runner() -> anyhow::Result<()> {
     let cwd = dir.path().join("agent-here");
     std::fs::create_dir_all(&cwd)?;
     let act = dir.path().join("act.sh");
-    let call = serde_json::json!({"jsonrpc": "2.0", "id": 2, "method": "tools/call", "params": {"name": "code_run", "arguments": {"program": "return await kiln.ci.diffs.review({diff: \"D1\", action: \"accept\", body: \"from the agent\"})"}}});
+    // Its verdict, a comment, one on a.py's second line, and a reply in the first one's thread
+    // (each published as it goes): each signed for its own place.
+    let program = "const v = await kiln.ci.diffs.review({diff: \"D1\", action: \"accept\", body: \"from the agent\"}); const c = await kiln.ci.diffs.comment({diff: \"D1\", body: \"a note from the agent\", publish: true}); const l = await kiln.ci.diffs.comment({diff: \"D1\", body: \"two, not one\", file: \"a.py\", line: 2, publish: true}); const r = await kiln.ci.diffs.reply({diff: \"D1\", thread: c.thread, body: \"and its reply\", publish: true}); return {v, c, l, r};";
+    let call = serde_json::json!({"jsonrpc": "2.0", "id": 2, "method": "tools/call", "params": {"name": "code_run", "arguments": {"program": program}}});
     let init = serde_json::json!({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {"protocolVersion": "2025-06-18", "capabilities": {}, "clientInfo": {"name": "test", "version": "1"}}});
     std::fs::write(
         &act,
@@ -2077,6 +2080,14 @@ fn w27_r04_an_agents_verdict_is_signed_by_its_runner() -> anyhow::Result<()> {
     assert_eq!((field(&v, "action"), field(&v, "standing")), ("accept", "given"), "{v}");
     let signer = kiln_ci::identity::chain::Identity::parse(field(&v, "signer")).map_err(|e| anyhow::anyhow!("{e}: {v}"))?;
     assert!(matches!(&signer.actor, kiln_ci::identity::chain::Actor::Agent { agent, held_by: Some(h), person, .. } if *agent == id && h.machine == "box-a" && person == "admin"), "as the agent, on its runner, for its person: {signer}");
+    // Its comments and its reply go signed the same way, each kept in the trail as a signed comment
+    // (an unsigned one isn't a statement): the reply too, which went unsigned before, and the
+    // comment on a line, each signed for where it is.
+    let (st, body) = http(s.port, "GET", "/api/trail?from=0&limit=1000", &s.admin, None)?;
+    anyhow::ensure!(st == 200, "trail: {st} {body}");
+    let trail: Value = serde_json::from_str(&body)?;
+    let comments = trail.get("entries").and_then(Value::as_array).into_iter().flatten().filter(|e| field(e, "kind") == kiln_ci::identity::verdict::PAYLOAD_COMMENT).count();
+    assert_eq!(comments, 3, "the agent's comment, its comment on a line and its reply, each signed\nthe agent's MCP server said: {}", out());
     Ok(())
 }
 

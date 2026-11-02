@@ -1520,6 +1520,7 @@ mod tests {
             runs: 0,
             phase: "ready".into(),
             research: None,
+            reviewed: None,
         }
     }
 

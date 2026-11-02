@@ -9,11 +9,16 @@
  * names itself in words.
  */
 import { expect, test, type Page } from "@playwright/test";
+import { pickCommit, repoRow } from "./ship-pick";
 import { STATES } from "../src/components/ui/status-glyph-spec";
 
 const REAL = !!process.env.E2E_BASE_URL;
 test.skip(REAL, "drives the mock's commits");
 test.use({ reducedMotion: "reduce" });
+// The commits a test adds go however it ends, a timeout too, so the specs after see the mock's own.
+test.afterEach(async ({ request }) => {
+  await request.post("/api/mock/ship/arrive?clear=1");
+});
 
 /** Each animation that ran (CSS animations and transitions, the Web Animations API) with time to take, by frame. */
 const watchMotion = (page: Page) =>
@@ -41,22 +46,25 @@ test("with reduced motion, nothing on Ship moves as commits arrive, a row opens 
   await watchMotion(page);
   try {
     await page.goto("/ship");
-    const list = page.getByRole("list", { name: "Commits", exact: true });
+    const list = page.getByRole("list", { name: "Repositories", exact: true });
     await expect(list.locator(":scope > li").first()).toBeVisible({ timeout: 15_000 });
     // The device's setting is the page's one switch: every animation looks at it.
     await expect(page.locator("html")).toHaveAttribute("data-motion", "paused");
     // The stands' rule, a canvas: drawn at rest, and not again while its counts hold.
-    const rule = page.locator("canvas.st-rule").first();
+    const rule = page.locator("canvas.sd-rule").first();
     await expect(rule).toBeVisible();
     const drawn = () => rule.evaluate((c) => (c as HTMLCanvasElement).toDataURL());
     const still = await drawn();
     await page.waitForTimeout(2_500);
     expect(await drawn(), "the rule held still").toBe(still);
-    // Commits arrive and the list takes a new order, the pointer off it: rows take their places at once.
+    // Commits arrive, the pointer off the list: kiln's row (Ship's rows are repositories, W26-R29) takes
+    // its newest at once.
     await page.request.post("/api/mock/ship/agents?n=6&over=3");
-    await expect(list.locator(":scope > li").filter({ hasText: "release: production waits on you" })).toBeVisible({ timeout: 20_000 });
-    await expect(list.locator(":scope > li").filter({ hasText: "agent: asks about flake 4" })).toBeVisible({ timeout: 20_000 });
-    // A row opens by its Diff (Review) button and its Files come into view: by one jump, not a scroll.
+    const row = repoRow(page);
+    await expect(row.locator(".ship-text")).toContainText(/^(agent: |release: )/, { timeout: 20_000 });
+    // A row opens, and its Diff brings its Files into view: by one jump, not a scroll. Pressed in the
+    // page: a click of Playwright's scrolls of its own to reach a control a notice covers (kiln's row
+    // needn't be the first now), and what's counted is the page's.
     await page.evaluate(() => {
       const w = window as unknown as { ys: number[] };
       w.ys = [];
@@ -66,8 +74,10 @@ test("with reduced motion, nothing on Ship moves as commits arrive, a row opens 
       };
       requestAnimationFrame(f);
     });
-    const row = list.locator(":scope > li").filter({ hasText: "D41" }).first();
-    await row.getByRole("button", { name: "Review", exact: true }).click();
+    await row.getByRole("button", { name: /^Open / }).evaluate((el) => (el as HTMLElement).click());
+    const diff = row.getByRole("navigation", { name: /'s pages$/ }).getByRole("button", { name: "Diff", exact: true });
+    await expect(diff).toBeVisible({ timeout: 15_000 });
+    await diff.evaluate((el) => (el as HTMLElement).click());
     await expect(row.locator('section[aria-label="Files"]')).toBeFocused({ timeout: 15_000 });
     await page.waitForTimeout(1_500);
     const ys = await page.evaluate(() => (window as unknown as { ys: number[] }).ys);
@@ -87,7 +97,7 @@ const glyphsOn = (page: Page) =>
 
 test("in grayscale, every state Ship draws is told from every other by its glyph's shape, and in words", async ({ page, browserName, isMobile }) => {
   test.skip(isMobile, "glyphs draw the same at every width: the desktop projects check them");
-  test.setTimeout(150_000);
+  test.setTimeout(180_000);
   // Every state Ship draws: its list (each row's journey, and the mock's commits whose journeys run
   // through every state a glyph has), opened rows (Lanes, the job cards), and commits' pages (Build,
   // Replant, Environments).
@@ -98,19 +108,19 @@ test("in grayscale, every state Ship draws is told from every other by its glyph
     for (const g of await glyphsOn(page)) if (g.state && !found.has(g.state)) found.set(g.state, g);
   };
   await page.goto("/ship");
-  const list = page.getByRole("list", { name: "Commits", exact: true });
+  const list = page.getByRole("list", { name: "Repositories", exact: true });
   await expect(list.locator(":scope > li").first()).toBeVisible({ timeout: 15_000 });
   await take();
-  for (const name of ["D41", "sync: a move carries its homes", "ci: a landed change"]) {
-    const row = list.locator(":scope > li").filter({ hasText: name }).first();
-    const go = row.locator(".ship-go");
-    if ((await go.getAttribute("aria-expanded")) !== "true") await go.click();
+  // Each picked in kiln's row (W26-R29), its Lanes and job cards drawn.
+  for (const name of ["pipeline: dynamic matrices", "sync: a move carries its homes", "ci: a landed change"]) {
+    const row = await pickCommit(page, name);
     await expect(row.locator('section[aria-label="Lanes"] .ship-lanesbox')).toBeVisible({ timeout: 15_000 });
     await take();
-    await go.click();
   }
   const commits = ((await (await page.request.get("/api/ship/commits")).json()) as { commits: { repo: string; sha: string }[] }).commits;
   for (const c of commits) {
+    // Every state found, the pages left can show none new.
+    if (STATES.every((s) => found.has(s))) break;
     await page.goto(`/ship/${c.repo}/${c.sha}`);
     await expect(page.getByRole("region", { name: "Commit" })).toBeVisible({ timeout: 15_000 });
     await expect(page.getByRole("region", { name: "Stages" })).toBeVisible({ timeout: 15_000 });

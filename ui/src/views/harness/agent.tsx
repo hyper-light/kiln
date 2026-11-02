@@ -26,6 +26,7 @@ import { useAgentActions } from "./actions";
 import { MoveDialog, movable } from "./move";
 import { SettingsSheet, useAttachments, type Attachments } from "./controls";
 import { agentLabel, changesetOf, editsOf, useSameList } from "./derive";
+import { inScope, useScope, type Sub } from "./changes";
 import { useListener } from "./dom";
 import { FindBar, findIn, type FindNow } from "./find";
 import { EarlierMatches } from "./said";
@@ -40,6 +41,8 @@ import { Timeline, type ReplyTarget } from "./timeline";
 import { BesideTerminals, openBeside as openTerminal } from "./beside";
 import { useDrafts } from "./state";
 import { PlanSourceContext } from "@/views/plans/save";
+import { useReviewWaits } from "@/views/plans/review";
+import { revealReview } from "@/views/plans/reveal";
 import { useEndWithChildren } from "./family";
 import { LoadingMark, PrismLabel } from "./signals";
 import { markAnswered, stillAsked, unmark, useAnswered } from "./answered";
@@ -49,6 +52,9 @@ type PhoneTab = "work" | InspectorTab;
 
 const NO_EVENTS: HEvent[] = [];
 const NO_TODOS: Todo[] = [];
+
+/** The composer's field, to type in: the field itself, not the marked copy drawn under it (compose-field.tsx), which has its class too. */
+const composerField = () => document.querySelector<HTMLTextAreaElement>("textarea.hx-compose-input");
 
 /** What a message to it can carry. */
 const acceptsOf = (meta: Meta | null) => {
@@ -103,6 +109,8 @@ function Agent({ id, store }: { id: string; store: SessionStore }) {
   // The subagents kiln started for its goals or plan steps: its, as its harness's own are.
   const everyone = useRes(harnessSessionsRes).data;
   const kiln = React.useMemo(() => kilnSubagentsOf(everyone, id), [everyone, id]);
+  // Every agent it started through kiln (its goals' and plan steps' too): the Changes tab's By lists them.
+  const started = React.useMemo(() => everyone.filter((a) => a.parent === id).map((a): Sub => ({ id: a.id, label: a.name, kind: a.target.replace(/^agent:/, "") })), [everyone, id]);
   // One of those, its thread shown here: a session of its own.
   const sub = taskId ? (kiln.find((a) => a.id === taskId) ?? null) : null;
   // Mission Control links by the stable task id; the timeline groups its events by spawn call.
@@ -130,7 +138,7 @@ function Agent({ id, store }: { id: string; store: SessionStore }) {
       const d = useDrafts.getState();
       const was = d.drafts[id] ?? "";
       d.setDraft(id, was.trim() ? `${was.replace(/\s+$/, "")}\n\n${text}` : text);
-      document.querySelector<HTMLTextAreaElement>(".hx-compose-input")?.focus();
+      composerField()?.focus();
     },
     [id],
   );
@@ -223,7 +231,7 @@ function Agent({ id, store }: { id: string; store: SessionStore }) {
     setFindOpen(false);
     setFindAt(null);
     setSearched("");
-    document.querySelector<HTMLTextAreaElement>(".hx-compose-input")?.focus();
+    composerField()?.focus();
   };
   const find = React.useMemo(() => (findOpen ? { q, now: findAt } : undefined), [findOpen, q, findAt]);
   const showTools = React.useCallback(() => {
@@ -235,6 +243,11 @@ function Agent({ id, store }: { id: string; store: SessionStore }) {
     setTrayCollapsed(false);
     setTab("plan");
     setPhoneTab("plan");
+  };
+  /** A plan it proposes, reviewed where its plans are: its Plan tab, the review at its top. */
+  const reviewPlan = () => {
+    showPlan();
+    revealReview();
   };
   /** /model, /effort, /permissions: that setting of the head's run settings, opened in place. */
   const openSetting = (label: "Model" | "Effort" | "Permissions") => {
@@ -336,6 +349,7 @@ function Agent({ id, store }: { id: string; store: SessionStore }) {
                 accountOpen={account !== null}
                 find={find}
                 footer={footer}
+                onReviewPlan={task ? undefined : reviewPlan}
               />
             </AboutContext.Provider>
           </PlanSourceContext.Provider>
@@ -402,7 +416,20 @@ function Agent({ id, store }: { id: string; store: SessionStore }) {
           onCollapsed={setTrayCollapsed}
           side={(actions) => (
             <AboutContext.Provider value={about}>
-              <Inspector tab={tab} onTab={setTab} store={store} cwd={cwd} onOpenTask={openTask} agentId={id} harness={info?.kind_name} send={send} kiln={kiln} className="hx-side" actions={actions} />
+              <Inspector
+                tab={tab}
+                onTab={setTab}
+                store={store}
+                cwd={cwd}
+                onOpenTask={openTask}
+                agentId={id}
+                harness={info?.kind_name}
+                send={send}
+                kiln={kiln}
+                started={started}
+                className="hx-side"
+                actions={actions}
+              />
             </AboutContext.Provider>
           )}
         >
@@ -425,6 +452,7 @@ function Agent({ id, store }: { id: string; store: SessionStore }) {
                 harness={info?.kind_name}
                 send={send}
                 kiln={kiln}
+                started={started}
                 hideTabs
                 className="hx-side hx-side-phone"
               />
@@ -605,8 +633,8 @@ function Dock({
   const harnessSession = useSession(store, (s) => s.state?.harness_session ?? s.info?.harness_session);
   const [moving, setMoving] = React.useState(false);
   return (
-    <div className="hx-dock" onPointerDown={keepTyping} onMouseDown={keepTyping}>
-      <ActivityLine store={store} onOpenTask={onOpenTask} kiln={kiln} />
+    <div className="hx-dock" ref={liftNotices} onPointerDown={keepTyping} onMouseDown={keepTyping}>
+      <ActivityLine store={store} onOpenTask={onOpenTask} kiln={kiln} inThread={task} />
       {status === "exited" && exit?.error && empty ? (
         <div className="hx-startfail" role="alert">
           <b>This agent couldn't start.</b> {exit.error}
@@ -627,7 +655,11 @@ function Dock({
         </div>
       ) : status === "exited" ? (
         <div className="hx-exited">
-          <span className="hx-dim">{exit?.error ?? `The agent stopped${exit?.code != null ? ` (exit ${exit.code})` : ""}.`} Sending a message picks up where it left off.</span>
+          <span className="hx-dim">
+            {exit?.again_at != null
+              ? `Its process ended${exit.code != null ? ` (exit ${exit.code})` : ""}. It starts again by itself, and its conversation goes on.`
+              : `${exit?.error ?? `The agent stopped${exit?.code != null ? ` (exit ${exit.code})` : ""}.`} Sending a message picks up where it left off.`}
+          </span>
           {resume && (
             <Button size="sm" variant="secondary" onClick={() => send({ type: "restart" })}>
               <RotateCcw /> Restart
@@ -651,6 +683,34 @@ function keepTyping(e: React.PointerEvent | React.MouseEvent) {
   if (document.activeElement?.classList.contains("hx-compose-input") && t.closest("button") && !t.closest("input, textarea, select")) e.preventDefault();
 }
 
+/** kiln's notifications at the window's bottom right (toasts, and the cards of other agents waiting
+ *  on you) sit above the dock wherever they'd cover it, not over the message box: at a phone's or a
+ *  tablet's width, or a desktop's with the inspector put away (W21-R13). The dock's height lifts
+ *  them (`--dock-height`, index.css). */
+function liftNotices(dock: HTMLElement | null) {
+  if (!dock) return;
+  const root = document.documentElement;
+  const measure = () => {
+    // Their column: the shell's toast stack's, which has its width even when it's empty.
+    const column = document.querySelector(".toast-viewport")?.getBoundingClientRect();
+    const box = dock.getBoundingClientRect();
+    const style = getComputedStyle(dock);
+    const covers = !!column && column.left < box.right - parseFloat(style.paddingRight) && box.left + parseFloat(style.paddingLeft) < column.right;
+    if (covers) root.style.setProperty("--dock-height", `${Math.round(box.height)}px`);
+    else root.style.removeProperty("--dock-height");
+  };
+  measure();
+  // Its border box: the side tray put away widens the dock but not its column, which its padding keeps.
+  const observer = new ResizeObserver(measure);
+  observer.observe(dock, { box: "border-box" });
+  window.addEventListener("resize", measure);
+  return () => {
+    observer.disconnect();
+    window.removeEventListener("resize", measure);
+    root.style.removeProperty("--dock-height");
+  };
+}
+
 /** A phone's tabs, with what each holds. */
 function PhoneTabs({ store, tab, onTab }: { store: SessionStore; tab: PhoneTab; onTab: (t: PhoneTab) => void }) {
   const asked = useSession(store, (s) => s.state?.approvals);
@@ -660,13 +720,17 @@ function PhoneTabs({ store, tab, onTab }: { store: SessionStore; tab: PhoneTab; 
   // Counted from the conversation's edits only when the server sends no changeset.
   const events = useSession(store, (s) => (s.changes ? NO_EVENTS : s.events));
   const edits = useSameList(React.useMemo(() => editsOf(events), [events]));
-  const fileCount = React.useMemo(() => (changes ? changes.length : changesetOf(edits).length), [changes, edits]);
+  // What the Changes tab counts is what its scope shows: this project's files at first.
+  const [scope] = useScope();
+  const fileCount = React.useMemo(() => (changes ? changes.filter((f) => inScope(f, scope)).length : changesetOf(edits).length), [changes, edits, scope]);
   const todos = useSession(store, (s) => s.state?.todos ?? NO_TODOS);
   const todosDone = todos.filter((t) => t.status === "completed").length;
-  const tabs: { id: PhoneTab; label: string; n?: string; warn?: boolean }[] = [
+  // A plan waiting on your review: its tab says so (review.tsx).
+  const reviewing = useReviewWaits(store);
+  const tabs: { id: PhoneTab; label: string; n?: string; warn?: boolean; waits?: boolean }[] = [
     { id: "work", label: "Work", n: approvals ? String(approvals) : undefined, warn: approvals > 0 },
     { id: "changes", label: "Changes", n: fileCount ? String(fileCount) : undefined },
-    { id: "plan", label: "Plan", n: todos.length ? `${todosDone}/${todos.length}` : undefined },
+    { id: "plan", label: "Plan", n: todos.length ? `${todosDone}/${todos.length}` : undefined, waits: reviewing !== null },
     { id: "tools", label: "Tools" },
   ];
   return (
@@ -679,6 +743,7 @@ function PhoneTabs({ store, tab, onTab }: { store: SessionStore; tab: PhoneTab; 
               {t.n}
             </span>
           )}
+          {t.waits && <i className="pr-tab-dot" role="img" aria-label="a plan waits on your review" />}
         </button>
       ))}
     </div>
@@ -716,7 +781,7 @@ function AgentLoading({ id }: { id: string }) {
         <LoadingMark />
         <PrismLabel live>Loading conversation</PrismLabel>
       </div>
-      <div className="hx-dock">
+      <div className="hx-dock" ref={liftNotices}>
         <div className="hx-composer cp">
           <div className="hx-compose-box">
             <div className="cp-field">

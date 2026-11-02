@@ -135,9 +135,12 @@ fn a_machine_s_containers_are_listed_with_their_limits_throttling_and_oom_kills(
 
     // Every container Docker says runs is found (and a minikube node's pods besides, where one
     // runs): those running before and after 20 s (others' jobs' containers come and go here).
-    let before: Vec<String> = docker(&["ps", "-q", "--no-trunc"])?.lines().map(str::to_owned).collect();
+    // Running, not restarting: `docker ps` lists a container that keeps failing as it waits to
+    // start again, with no process and so no cgroup to read (one crash-looping on adacachy,
+    // 2026-10-29).
+    let before: Vec<String> = docker(&["ps", "-q", "--no-trunc", "--filter", "status=running"])?.lines().map(str::to_owned).collect();
     std::thread::sleep(Duration::from_secs(20));
-    let after = docker(&["ps", "-q", "--no-trunc"])?;
+    let after = docker(&["ps", "-q", "--no-trunc", "--filter", "status=running"])?;
     let stable: Vec<&String> = before.iter().filter(|id| after.lines().any(|a| a == id.as_str())).collect();
     anyhow::ensure!(stable.len() >= 2, "its own two at least: {stable:?}");
     wait(&f, "every container Docker runs listed", Duration::from_secs(60), || {

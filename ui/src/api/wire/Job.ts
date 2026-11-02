@@ -14,4 +14,9 @@ matrix?: Record<string, unknown>,
 /**
  * Where a person's retry asked it to run (docs/ci.md W05-R28).
  */
-placement?: Placement | null, };
+placement?: Placement | null, 
+/**
+ * Paused since then (unix seconds; docs/ci.md W26-R22): waiting, it isn't dispatched; running,
+ * it's frozen where it runs.
+ */
+paused_at?: number, };

@@ -1,6 +1,7 @@
 /**
  * Ship's Hand off (docs/ci.md W26-R18, R02), as review-ship.html draws it, against the mock: a
- * person's failed commit offers Hand off first, then Retry; handed off, its failure is on the agent
+ * repository whose newest commit is a person's failure (hyper-raft's, W26-R29) offers Hand off
+ * first, then Retry; handed off, its failure is on the agent
  * the repository has attached (ci-doctor) and its row says so, with Retry alone. An agent's change
  * hands its open thread to its author's agent; its row then reads that agent at work, with no Hand
  * off and Review pair. The row holds its height throughout. A browser that can sign (WebCrypto, on a
@@ -13,7 +14,7 @@ import { expect, test, type Page } from "@playwright/test";
 const REAL = !!process.env.E2E_BASE_URL;
 test.skip(REAL, "drives the mock's commits");
 
-const rowOf = (page: Page, text: string) => page.getByRole("list", { name: "Commits", exact: true }).locator(":scope > li", { hasText: text }).first();
+const rowOf = (page: Page, text: string) => page.getByRole("list", { name: "Repositories", exact: true }).locator(":scope > li", { hasText: text }).first();
 
 /** What this browser sent with its hand-offs, as the mock kept it: its own hand-on, or why it had none. */
 const sentOf = async (page: Page) =>
@@ -27,15 +28,16 @@ test("a person's failure goes to the agent attached to it, and its row says who 
   await page.request.post("/api/mock/ship/hand-off?reset=1");
   try {
     await page.goto("/ship");
-    const row = rowOf(page, "sync: a move carries its homes");
-    await expect(row).toContainText("rust lint + test · assertion failed in sync::reconnect");
+    // Ship's rows are repositories (W26-R29): hyper-raft's newest is a person's failure.
+    const row = rowOf(page, "hyper-light/hyper-raft");
+    await expect(row).toContainText("rust lint + test · assertion failed in raft::lease");
     const acts = row.locator(".ship-acts > button");
     await expect(acts.nth(0)).toHaveText("Hand off");
     await expect(acts.nth(1)).toHaveText("Retry");
     const before = (await row.boundingBox())?.height ?? 0;
 
     await row.getByRole("button", { name: "Hand off" }).click();
-    await expect(row).toContainText("ci-doctor fixing · assertion failed in sync::reconnect");
+    await expect(row).toContainText("ci-doctor fixing · assertion failed in raft::lease", { timeout: 15_000 });
     // Handed off from this browser, signed with its own key (W27-R08): the person's hand-on went with
     // it, and nothing says kiln signed it for them.
     const [sent, ...more] = await sentOf(page);

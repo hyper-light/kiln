@@ -126,20 +126,26 @@ fn fail(code: StatusCode, msg: impl Into<String>) -> Fail {
 
 /// Asks the machine agent `info` works on about its folder: the answer's JSON, or why not.
 pub async fn ask_machine(hub: &Hub, info: &Info, ask: &super::Ask) -> Result<Value, Fail> {
-    let json = serde_json::to_string(ask).map_err(|e| fail(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
     let machine = crate::harness::wait::machine(&info.target).to_owned();
     let answer = if machine == "local" {
-        // The server holds no agent's key: what it commits of one here stays unsigned.
-        super::serve(std::path::Path::new(&info.cwd), std::path::Path::new(info.work_dir()), info.workspace.as_ref(), &json, None).await
+        // The server's own agents: their versions aren't kept here, so an agent's point is refused,
+        // saying so; and the server holds no agent's key, so what it commits of one stays unsigned.
+        super::serve(std::path::Path::new(&info.cwd), std::path::Path::new(info.work_dir()), info.workspace.as_ref(), ask.clone(), &super::git::Versions::new(), None).await
     } else {
+        // A question only a newer runner answers isn't sent to one that can't.
+        let wide = ask.wide_cap();
+        if wide != 0 && hub.instances.lock().wide_caps_for(&machine, &crate::instances::Owned::Agent(info.id.clone())) & wide != wide {
+            return Err(fail(StatusCode::CONFLICT, format!("{machine}'s kiln is too old to do this: upgrade it (System → Updates)")));
+        }
+        let json = serde_json::to_string(ask).map_err(|e| fail(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
         let id = info.id.clone();
         let got = hub
-            .ask_runner(&machine, crate::proto::CAP_WORKSPACE, super::WAIT, move |req| crate::proto::ServerMsg::Workspace { req, session: id, json })
+            .ask_runner::<Value>(&machine, crate::proto::CAP_WORKSPACE, super::WAIT, move |req| crate::proto::ServerMsg::Workspace { req, session: id, json })
             .await
             .map_err(|e| fail(StatusCode::BAD_GATEWAY, format!("{e:#}")))?;
         match got {
             None => return Err(fail(StatusCode::CONFLICT, format!("{machine}'s kiln is too old to do this: upgrade it (System → Updates)"))),
-            Some(text) => text.and_then(|t| serde_json::from_str(&t).ok()).unwrap_or(Value::Null),
+            Some(answer) => answer.unwrap_or(Value::Null),
         }
     };
     if let Some(e) = answer.get("error").and_then(Value::as_str) {
@@ -430,6 +436,18 @@ mod tests {
         assert_eq!(paths_in(&changes, None), ["README.md", "notes.txt", "src/old.rs", "/tmp/scratch.txt"], "no working tree known: every file, as named");
     }
 
+    /// A subagent's file in the working tree goes up with the change request, as the agent's own
+    /// do (docs/agents.md, "Who changed a file, and whose it is"); one outside it doesn't.
+    #[test]
+    fn a_subagents_file_goes_up_with_its_change_request() {
+        let changes = serde_json::json!([
+            {"path": "src/main.rs", "tree": "/w/repo", "by": ["main"], "place": "project"},
+            {"path": "src/parser.rs", "tree": "/w/repo", "by": ["spawn-kid"], "place": "project"},
+            {"path": "/h/.codex/memories/notes.md", "by": ["spawn-kid"], "place": "agent"}
+        ]);
+        assert_eq!(paths_in(&changes, Some("/w/repo")), ["src/main.rs", "src/parser.rs"]);
+    }
+
     #[test]
     fn a_folder_s_remote_finds_the_repository_kiln_knows_it_as() {
         assert_eq!(norm_url("git@github.com:Acme/App.git"), "github.com/Acme/App");
@@ -465,6 +483,36 @@ mod tests {
         assert!(compare_url("https://gitlab.com/g/p.git", "main", "agents/x").is_some_and(|u| u.contains("merge_requests/new")));
         assert!(compare_url("https://bitbucket.org/w/r.git", "main", "agents/x").is_some_and(|u| u.contains("pull-requests/new")));
         assert_eq!(compare_url("git@git.internal:a/b.git", "main", "x"), None);
+    }
+
+    /// Commits and Compare are asked only of a runner that has said it can answer them (the Changes
+    /// panel plan 01a194444b1d, step 4): one too old to is refused without being asked, saying so,
+    /// and the Changes tab greys the mode out with that reason. Once it has said so, it's asked.
+    #[test]
+    fn commits_are_asked_only_of_a_runner_that_says_it_can_and_an_older_one_is_told_why_not() -> anyhow::Result<()> {
+        crate::rt::block_on(async {
+            let hub = crate::hub::tests::scratch_hub().await?;
+            let hello = crate::proto::Hello { protocol: crate::proto::VERSION, name: "box".into(), labels: vec![], slots: 1, hostname: "box".into(), os: "linux".into(), arch: "x86_64".into(), version: "0.0.9".into(), ephemeral: false, dedicated_job: None, running: vec![], terminal: true };
+            {
+                let mut instances = hub.instances.lock();
+                assert!(instances.join(1, "box", hello, 1).newest);
+                instances.set_build(1, "0.0.9".into(), crate::proto::CAP_WORKSPACE);
+            }
+            let info = Info { id: "a1".into(), target: "agent:box".into(), cwd: "/w/app".into(), ..Info::default() };
+            let commits = crate::workspace::Ask::Commits { branch: None, trunk: None, since_head: None, since_at: None, picks: vec![] };
+            let too_old = (StatusCode::CONFLICT, "box's kiln is too old to do this: upgrade it (System → Updates)".to_owned());
+            for ask in [&commits, &crate::workspace::Ask::Refs] {
+                assert_eq!(ask_machine(&hub, &info, ask).await.err(), Some(too_old.clone()), "{ask:?}");
+            }
+            // Once it has said so, it's asked: no runner is connected here to answer, so the question waits.
+            hub.instances.lock().set_wide(1, crate::proto::CAP_WORKSPACE_COMMITS | crate::proto::CAP_WORKSPACE_COMPARE);
+            for ask in [&commits, &crate::workspace::Ask::Refs] {
+                if let Ok(Err(refused)) = crate::rt::timeout(std::time::Duration::from_millis(300), ask_machine(&hub, &info, ask)).await {
+                    assert_ne!(refused, too_old, "{ask:?}");
+                }
+            }
+            Ok(())
+        })
     }
 }
 

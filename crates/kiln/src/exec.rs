@@ -51,6 +51,12 @@ impl Uplink {
         let _ = self.0.send(Up::Msg(m)).await;
     }
 
+    /// A message that's only said along the way (an upgrade's progress): sent without waiting, so
+    /// what's doing it never waits on the connection; dropped when the uplink is full.
+    pub fn say(&self, m: AgentMsg) {
+        let _ = self.0.try_send(Up::Msg(m));
+    }
+
     pub async fn log(&self, job: &str, idx: u32, data: Vec<u8>) {
         let _ = self.0.send(Up::Log(LogChunk { job: job.to_owned(), idx, data })).await;
     }
@@ -234,6 +240,9 @@ impl Exec {
         }
 
         let deadline = Instant::now() + Duration::from_secs(u64::from(a.spec.timeout_minutes) * 60);
+        // It can be frozen where it runs while it runs here (docs/ci.md W26-R22); its time limit
+        // stops then.
+        let _freezing = crate::runner::freeze::begin(&job);
         let mut usage = Usage::default();
         let mut failed: Option<(Status, Option<i32>, String)> = None;
         for (i, step) in a.spec.steps.iter().enumerate() {
@@ -243,9 +252,10 @@ impl Exec {
                 continue;
             }
             self.up.msg(AgentMsg::StepStarted { job: job.clone(), idx }).await;
+            // Its own time limit runs from now: the while the job was frozen before doesn't count.
             let step_deadline = step
                 .timeout_minutes
-                .map(|m| (Instant::now() + Duration::from_secs(u64::from(m) * 60)).min(deadline))
+                .map(|m| crate::runner::freeze::base(&job, Instant::now() + Duration::from_secs(u64::from(m) * 60)).min(deadline))
                 .unwrap_or(deadline);
             let mut step_env = env.clone();
             step_env.extend(step.env.clone());
@@ -425,9 +435,15 @@ impl Exec {
         let (prog, args) = self.command_line(shell, script);
         let mut cmd = Command::new(prog);
         cmd.args(args).current_dir(cwd).envs(env);
+        // In its job's cgroup from its first instruction: the job can be frozen whole (W26-R22), and
+        // a kiln it starts holds its agents there, never in the runner's (the 2026-10-29 outage).
+        crate::runner::freeze::enter(&self.assign.job_id, &mut cmd);
         // On the CPUs its job may use: its own share, or what no share holds (W05-R03).
         let mut running = crate::runner::cpus::spawn_on(&self.assign.job_id, move || crate::proc::spawn_group(cmd))?;
         let pgid = running.pgid;
+        if let Some(f) = crate::runner::freeze::of(&self.assign.job_id) {
+            f.step(&running);
+        }
         let _guard = PgidRecord::new(&self.work_dir, &self.assign.job_id, pgid);
         let _pinned = crate::runner::cpus::Step::new(&self.assign.job_id, pgid);
         let mut pending: Vec<u8> = Vec::with_capacity(LOG_CHUNK);
@@ -452,7 +468,7 @@ impl Exec {
                 c = recv_if(&running.output, !output_done).fuse() => Ev::Chunk(c),
                 code = (&mut running.exit).fuse() => Ev::Exit(code.ok().flatten()),
                 () = self.cancel.cancelled().fuse() => Ev::Cancel,
-                () = crate::rt::sleep_until(deadline).fuse() => Ev::Deadline,
+                () = crate::rt::sleep_until(crate::runner::freeze::effective(&self.assign.job_id, deadline)).fuse() => Ev::Deadline,
                 () = flush.tick().fuse() => Ev::Flush,
                 () = sample.tick().fuse() => Ev::Sample,
             };
@@ -471,7 +487,11 @@ impl Exec {
                     }
                 }
                 Ev::Sample => self.sample(pgid, usage).await,
+                // Frozen, or frozen before (W26-R22): its time limit didn't run then.
+                Ev::Deadline if Instant::now() < crate::runner::freeze::effective(&self.assign.job_id, deadline) => {}
                 Ev::Cancel => {
+                    // Frozen, it's let go on first: a stopped process can't hear it's to end.
+                    crate::runner::freeze::thaw(&self.assign.job_id).await;
                     crate::proc::terminate_group(&mut running, Duration::from_secs(10)).await;
                     status = Some(Outcome::Cancelled);
                 }
@@ -513,6 +533,12 @@ impl Exec {
         let mut child = pty.slave.spawn_command(cmd)?;
         drop(pty.slave);
         let pgid = child.process_id().and_then(|p| i32::try_from(p).ok()).unwrap_or(0);
+        // A pty's step leads a session of its own: its process group is its id. It joins its job's
+        // cgroup as it starts (W26-R22).
+        if let Some(f) = crate::runner::freeze::of(&self.assign.job_id).filter(|_| pgid > 0) {
+            crate::runner::freeze::adopt(&self.assign.job_id, pgid.unsigned_abs());
+            f.group(pgid);
+        }
         let _guard = PgidRecord::new(&self.work_dir, &self.assign.job_id, pgid);
         let mut reader = pty.master.try_clone_reader()?;
         let (tx, rx) = async_channel::bounded::<Vec<u8>>(64);
@@ -538,7 +564,7 @@ impl Exec {
                 c = recv_if(&rx, output_open).fuse() => Ev::Chunk(c),
                 code = (&mut done_rx).fuse() => Ev::Exit(code.ok().flatten()),
                 () = self.cancel.cancelled().fuse() => Ev::Cancel,
-                () = crate::rt::sleep_until(deadline).fuse() => Ev::Deadline,
+                () = crate::rt::sleep_until(crate::runner::freeze::effective(&self.assign.job_id, deadline)).fuse() => Ev::Deadline,
                 () = flush.tick().fuse() => Ev::Flush,
                 () = sample.tick().fuse() => Ev::Sample,
             };
@@ -557,7 +583,9 @@ impl Exec {
                     }
                 }
                 Ev::Sample => self.sample(pgid, usage).await,
+                Ev::Deadline if Instant::now() < crate::runner::freeze::effective(&self.assign.job_id, deadline) => {}
                 Ev::Cancel => {
+                    crate::runner::freeze::thaw(&self.assign.job_id).await;
                     crate::proc::terminate_tree(pgid, Duration::from_secs(5)).await;
                     break Outcome::Cancelled;
                 }

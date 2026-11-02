@@ -5,8 +5,10 @@
  * queued after the current turn, steered into it, or sent now; a slash command read in their own
  * catalogs; or one of kiln's own, typed after / like theirs and listed first (interrupt, restart,
  * allow or deny everything waiting on you, end those picked), or Stop beside Send. Their mode,
- * model and effort are the agent page's line of settings, above the box. Commands are asked once,
- * in a line under the field; the same line then says how it went, and opens to each agent's outcome.
+ * model and effort are the agent page's line of settings, above the box; who it goes to is the To
+ * line under it. The rows are the composer's that starts an agent (new-agent.tsx), so Mission control
+ * turns from one to the other with nothing moving. Commands are asked once, in a line under those;
+ * the same line then says how it went, and opens to each agent's outcome.
  */
 import * as React from "react";
 import "./console.css";
@@ -22,12 +24,15 @@ import { useSuspenseResource } from "@/lib/resource";
 import { cn } from "@/lib/utils";
 import { CommandList, matchCommands, parseSlash } from "./palette";
 import { MODES, SendModes } from "./composer";
+import { ComposeField } from "./compose-field";
+import { commandNames } from "./marks";
 import { useAttachments } from "./controls";
 import { agentLabel } from "./derive";
 import { machineName } from "./parts";
 import { MicButton } from "./voice";
 import { RunSettings } from "./run-settings";
 import { markAnswered, unmark } from "./answered";
+import { Slide } from "./bulk";
 import { throughSubagents } from "./tasks";
 
 const machineLabel = (m: string) => (m === "local" ? "server" : m);
@@ -60,12 +65,14 @@ type BarProps = {
   /** Unselect them all: the composer turns to starting an agent. */
   onClear?: () => void;
   autoFocus?: boolean;
+  /** What's said under the To line: Mission control's word about its machines, as under the box that starts an agent. */
+  under?: React.ReactNode;
 };
 
 /**
  * Those picked, on the To line's one line, in the order they were picked: as many as fit, the rest
  * folded into "+N more" after them (facet-fold.ts, as a filter field's chips). The line never wraps,
- * so the box keeps its height however many are picked, and picking more moves no chip already there.
+ * so the composer keeps its height however many are picked, and picking more moves no chip already there.
  */
 function ToChips({ picked, onPick }: { picked: AgentInfo[]; onPick?: (ids: string[], on: boolean) => void }) {
   const [fold, setFold] = React.useState<Fold>(UNFOLDED);
@@ -159,10 +166,10 @@ const previewOf = (roster: string): Promise<BroadcastPreview | null> =>
 export function MessageBar(props: BarProps) {
   // What they understand (commands, modes, models, efforts, and how many have each): again as
   // the agents picked change, come or go. Meanwhile the bar keeps what it knew; before the first
-  // answer it shows as it does without one.
+  // answer its line of settings is there, empty, so nothing moves when the answer comes.
   const roster = React.useDeferredValue(props.agents.map((a) => `${a.id}:${a.status}`).join(","));
   return (
-    <Loadable label="Loading what the agents understand" fallback={<Bar {...props} preview={null} />}>
+    <Loadable label="Loading what the agents understand" fallback={<Bar {...props} preview={null} previewing />}>
       <Previewed roster={roster} {...props} />
     </Loadable>
   );
@@ -184,7 +191,29 @@ function tuned(agents: AgentInfo[], tune: Tune, preview: BroadcastPreview | null
   return sets.length === 0 ? agents : agents.filter((a) => sets.every((ids) => ids.has(a.id)));
 }
 
-function Bar({ agents: everyone, reach, onEnded, all = [], onPick, preview, text: given, onText, onClear, autoFocus }: BarProps & { preview: BroadcastPreview | null }) {
+/** The line of settings before the agents have said what they understand: its room, as the line will take it. */
+const TunerLoading = () => (
+  <div className="rs-tuner ms-tuner" aria-hidden="true">
+    <div className="rs-top">
+      <p className="rs-line" />
+    </div>
+  </div>
+);
+
+function Bar({
+  agents: everyone,
+  reach,
+  onEnded,
+  all = [],
+  onPick,
+  preview,
+  previewing,
+  text: given,
+  onText,
+  onClear,
+  autoFocus,
+  under,
+}: BarProps & { preview: BroadcastPreview | null; previewing?: boolean }) {
   const [tune, setTune] = React.useState<Tune>(ANY);
   // Who gets what's sent from here: those the selectors leave (all of them while each is Any).
   const agents = tuned(everyone, tune, preview);
@@ -208,6 +237,14 @@ function Bar({ agents: everyone, reach, onEnded, all = [], onPick, preview, text
   const [reportOpen, setReportOpen] = React.useState(false);
   const [index, setIndex] = React.useState(0);
   const [focused, setFocused] = React.useState(false);
+  // The lines under the To line slide open and shut (bulk.tsx's Slide), so the list under the
+  // composer moves smoothly: while one slides shut, it says what it last said.
+  const [shownAsk, setShownAsk] = React.useState<Ask | null>(null);
+  if (ask && ask !== shownAsk) setShownAsk(ask);
+  const askGone = React.useCallback(() => setShownAsk(null), []);
+  const [shownSending, setShownSending] = React.useState(0);
+  if (sending > 0 && sending !== shownSending) setShownSending(sending);
+  const sendingGone = React.useCallback(() => setShownSending(0), []);
   const roomy = useMediaQuery("(min-width: 640px)");
 
   const ids = agents.map((a) => a.id);
@@ -269,6 +306,13 @@ function Bar({ agents: everyone, reach, onEnded, all = [], onPick, preview, text
     ...(reach === "selected" ? [own("end", `End ${count(n, "agent")}: their processes stop`)] : []),
   ];
   const kilns = (name: string) => kiln.some((c) => c.name === name);
+  // Theirs and kiln's own, marked wherever they're typed, as an agent's composer marks its own. Their
+  // names change only with who it goes to (End is for those picked), not with kiln's counts.
+  const names = React.useMemo(
+    () => commandNames([...kiln, ...(preview?.commands ?? [])]),
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [reach, preview],
+  );
   // The slash palette: kiln's own first, then what the agents understand, marked where only some do.
   const slash = parseSlash(text);
   const items = focused && slash?.typingName ? [...matchCommands(kiln, slash.name), ...matchCommands(preview?.commands ?? [], slash.name).filter((c) => !kilns(c.name))] : [];
@@ -403,26 +447,16 @@ function Bar({ agents: everyone, reach, onEnded, all = [], onPick, preview, text
       "No agent to send to"
     : "";
 
-  // Grows with the text up to the stylesheet's most lines, then scrolls inside (as the composer).
-  const lengthWas = React.useRef(0);
-  const grow = React.useCallback(
-    (el: HTMLTextAreaElement | null) => {
-      field.current = el;
-      if (!el) return;
-      if (text.length < lengthWas.current || !text) el.style.height = "auto";
-      lengthWas.current = text.length;
-      const h = `${el.scrollHeight}px`;
-      if (el.style.height !== h) el.style.height = h;
-    },
-    [text],
-  );
   const picked = reach === "selected" ? agents : [];
   const sendLabel = working > 0 ? (mode === "queue" ? "Queue" : mode === "steer" ? "Steer" : "Send now") : "Send";
 
   return (
     <section className="ms-msg cp" aria-label="Message agents">
-      {/* What they're held to, as the agent page's line: each its own (unset) or one chosen, with which have it. */}
-      {(modes.length > 0 || models.length > 0 || efforts.length > 0 || speeds.length > 0) && (
+      {/* What they're held to, as the agent page's line: each its own (unset) or one chosen, with which have it. Always
+          there, as it is over the box that starts an agent: its room before they've said, a dash for what none of them has. */}
+      {previewing ? (
+        <TunerLoading />
+      ) : (
         <RunSettings
           className="ms-tuner"
           modes={modes.map(counted)}
@@ -457,28 +491,13 @@ function Bar({ agents: everyone, reach, onEnded, all = [], onPick, preview, text
           void attachments.add(e.dataTransfer.files);
         }}
       >
-        <div className={cn("hx-compose-box", working > 0 && "hx-compose-live")}>
-          {/* Who it goes to: those picked (each put back with its ×), or everyone the list shows. */}
-          <div className="ms-to">
-            <span className="ms-to-label">To</span>
-            {picked.length > 0 ? (
-              <ToChips picked={picked} onPick={onPick} />
-            ) : (
-              <span className="ms-to-all">{held ? `${n} of ${total} agents` : reach === "shown" ? `the ${n} shown` : n === 1 ? "the one agent" : `all ${n} agents`}</span>
-            )}
-            {onClear && picked.length > 0 && (
-              <Button size="xs" variant="secondary" className="mc-clear" onClick={onClear}>
-                <X aria-hidden="true" />
-                Clear
-              </Button>
-            )}
-          </div>
+        <div className="hx-compose-box">
           {attachments.chips}
-          <textarea
-            ref={grow}
-            className="hx-compose-input"
-            rows={1}
-            value={text}
+          {/* The agent page's field: it grows with the text, and what's typed is marked as it is there. */}
+          <ComposeField
+            text={text}
+            names={names}
+            field={field}
             disabled={n === 0}
             autoFocus={autoFocus}
             placeholder={placeholder}
@@ -604,28 +623,53 @@ function Bar({ agents: everyone, reach, onEnded, all = [], onPick, preview, text
           </div>
         )}
       </div>
-      {ask ? (
-        <div className="ms-msg-line" role="group" aria-label="Confirm">
-          <span className="ms-msg-ask">{ask.ask}</span>
-          <Button size="xs" variant={ask.danger ? "danger" : "primary"} disabled={busy} onClick={() => void ask.run()}>
-            {ask.label}
+      {/* Who it goes to, under the box where More options is under the box that starts an agent: those picked
+          (each put back with its ×), or everyone the list shows. */}
+      <div className="ms-to">
+        <span className="ms-to-label">To</span>
+        {picked.length > 0 ? (
+          <ToChips picked={picked} onPick={onPick} />
+        ) : (
+          <span className="ms-to-all">{held ? `${n} of ${total} agents` : reach === "shown" ? `the ${n} shown` : n === 1 ? "the one agent" : `all ${n} agents`}</span>
+        )}
+        {onClear && picked.length > 0 && (
+          <Button size="xs" variant="secondary" className="mc-clear" onClick={onClear}>
+            <X aria-hidden="true" />
+            Clear
           </Button>
-          <Button size="xs" variant="ghost" disabled={busy} onClick={() => setAsk(null)}>
-            Cancel
-          </Button>
-        </div>
-      ) : sending > 0 ? (
-        <div className="ms-msg-line" role="status">
-          <span className="ms-msg-ask">Sending to {count(sending, "agent")}…</span>
-        </div>
-      ) : report ? (
-        <div className="ms-msg-line">
-          <button type="button" className="ms-msg-result" aria-expanded={reportOpen} onClick={() => setReportOpen(!reportOpen)}>
-            <ChevronRight size={12} className={cn("ms-chev", reportOpen && "rotate-90")} aria-hidden="true" />
-            {outcome}
-          </button>
-        </div>
-      ) : null}
+        )}
+      </div>
+      {under}
+      {/* What's asked, then how it went, each sliding open in turn (one shuts as the other opens). */}
+      {shownAsk && (
+        <Slide open={ask !== null} onGone={askGone}>
+          <div className="ms-msg-line" role="group" aria-label="Confirm">
+            <span className="ms-msg-ask">{shownAsk.ask}</span>
+            <Button size="xs" variant={shownAsk.danger ? "danger" : "primary"} disabled={busy} onClick={() => void shownAsk.run()}>
+              {shownAsk.label}
+            </Button>
+            <Button size="xs" variant="ghost" disabled={busy} onClick={() => setAsk(null)}>
+              Cancel
+            </Button>
+          </div>
+        </Slide>
+      )}
+      {(shownSending > 0 || report) && (
+        <Slide open={!ask && (sending > 0 || report !== null)} onGone={sendingGone}>
+          {sending > 0 || !report ? (
+            <div className="ms-msg-line" role="status">
+              <span className="ms-msg-ask">Sending to {count(sending || shownSending, "agent")}…</span>
+            </div>
+          ) : (
+            <div className="ms-msg-line">
+              <button type="button" className="ms-msg-result" aria-expanded={reportOpen} onClick={() => setReportOpen(!reportOpen)}>
+                <ChevronRight size={12} className={cn("ms-chev", reportOpen && "rotate-90")} aria-hidden="true" />
+                {outcome}
+              </button>
+            </div>
+          )}
+        </Slide>
+      )}
       {report && reportOpen && !ask && (
         <ul className="ms-msg-outcomes">
           {report.results.map((r) => (

@@ -72,6 +72,47 @@ pub fn login_agent(command: &str) -> bool {
 /// (`eval "$(ssh-agent -s)" && ssh-add … && git push`) has had its use of it by then.
 pub const AGENT_KEPT: Duration = Duration::from_secs(30 * 60);
 
+/// Whether this host started `r` itself (`host`, this process, is its parent): an agent's harness,
+/// never something its commands left running. kiln is no subreaper, so what a command leaves runs
+/// on under init or the nearest subreaper, and kiln's own runs have groups of their own. Where kiln
+/// is init itself (PID 1 in a container), everything that outlived its parent is its child: this
+/// says nothing there.
+pub fn started_here(r: &Ran, host: u32) -> bool {
+    host != 1 && r.ppid == host
+}
+
+/// Whether `r` may be taken for something an agent left running: neither a session's harness as it
+/// is now (`harnesses`), nor what runs under one, nor a process this host started itself
+/// ([`started_here`]).
+pub fn leftover(r: &Ran, harnesses: &HashSet<u32>, host: u32) -> bool {
+    !harnesses.contains(&r.pid) && !harnesses.contains(&r.ppid) && !started_here(r, host)
+}
+
+/// A look ([`scan`]), less what it can't have found left running. Agents' own harnesses were taken
+/// for it, and stopped once the agents were between turns: on 2026-10-31 a sign-in started every
+/// Claude Code agent of a machine again at once, and each harness that started while a look went on
+/// was in its group without being the harness the look knew. `then`: each session's harness when
+/// the look began; `now`: since it ended. A session whose harness changed meanwhile is left out
+/// (its look is of another harness) and named in the answer. Of every other's, only a
+/// [`leftover`] runs apart from it, and nothing under one that isn't.
+pub fn spare(seen: &mut HashMap<String, Seen>, then: &[(String, Option<u32>)], now: &HashMap<String, Option<u32>>, host: u32) -> HashSet<String> {
+    let harnesses: HashSet<u32> = now.values().flatten().copied().collect();
+    let stale: HashSet<String> = then.iter().filter(|(id, pid)| now.get(id).is_some_and(|p| p != pid)).map(|(id, _)| id.clone()).collect();
+    seen.retain(|id, _| !stale.contains(id));
+    for s in seen.values_mut() {
+        let mut theirs: HashSet<u32> = s.apart.iter().filter(|r| !leftover(r, &harnesses, host)).map(|r| r.pid).collect();
+        loop {
+            let under: Vec<u32> = s.apart.iter().filter(|r| theirs.contains(&r.ppid) && !theirs.contains(&r.pid)).map(|r| r.pid).collect();
+            if under.is_empty() {
+                break;
+            }
+            theirs.extend(under);
+        }
+        s.apart.retain(|r| !theirs.contains(&r.pid));
+    }
+    stale
+}
+
 /// Of the shells' ssh-agents a look found, the ones to stop at `now_s` (seconds since the epoch):
 /// those [`AGENT_KEPT`] old.
 pub fn agents_to_stop(seen: &HashMap<String, Seen>, now_s: u64) -> Vec<u32> {
@@ -491,6 +532,68 @@ mod tests {
         assert_eq!(shown("bash -lc cargo watch -x test"), "cargo watch -x test");
         assert_eq!(shown("/usr/bin/python3 -m http.server 8000"), "/usr/bin/python3 -m http.server 8000");
         assert_eq!(shown("zsh -c echo 'it'\\''s'"), "echo 'it'\\''s'");
+    }
+
+    /// Agents' own harnesses were taken for what their commands left running, and stopped once the
+    /// agents were between turns (2026-10-31: a sign-in started every Claude Code agent again).
+    #[test]
+    fn an_agents_own_harness_is_never_taken_for_what_it_left_running() {
+        let host = 4_000;
+        let ran = |pid, ppid| Ran { pid, ppid, started: 1_000, command: format!("p{pid}") };
+        // "again": its harness (100) started while the look went on, which found it apart. "starting":
+        // its harness (300) runs a tool's shell (301), but the session hadn't said so by either
+        // reading. "idle": its harness (200) ran throughout; a command of its left 202 running,
+        // which runs 203.
+        let mut seen = HashMap::from([
+            ("again".to_owned(), Seen { apart: vec![ran(100, host)], ..Seen::default() }),
+            ("starting".to_owned(), Seen { apart: vec![ran(301, 300), ran(300, host)], ..Seen::default() }),
+            ("idle".to_owned(), Seen { apart: vec![ran(202, 1), ran(203, 202)], ..Seen::default() }),
+        ]);
+        let then = [("again".to_owned(), None), ("starting".to_owned(), None), ("idle".to_owned(), Some(200))];
+        let now = HashMap::from([("again".to_owned(), Some(100)), ("starting".to_owned(), None), ("idle".to_owned(), Some(200))]);
+        assert_eq!(spare(&mut seen, &then, &now, host), HashSet::from(["again".to_owned()]));
+        assert!(!seen.contains_key("again"), "looked at again next time");
+        let apart = |id: &str| seen.get(id).map(|s| s.apart.iter().map(|r| r.pid).collect::<Vec<_>>());
+        assert_eq!(apart("starting"), Some(vec![]), "a harness this host started, and what it runs");
+        assert_eq!(apart("idle"), Some(vec![202, 203]), "what a command left running still goes");
+        // Noted apart by an older look, it's still neither, by its pid or its parent's.
+        let running = HashSet::from([100, 200]);
+        assert!(!leftover(&ran(100, 1), &running, host) && !leftover(&ran(201, 200), &running, host) && leftover(&ran(202, 1), &running, host));
+        // Where kiln is init, everything that outlived its parent is its child: a parent says nothing.
+        assert!(started_here(&ran(5, host), host) && !started_here(&ran(5, 1), 1));
+    }
+
+    /// The same with a real process: a harness this host started, found by its mark by a look that
+    /// began before the session knew it, is nothing the session left running.
+    #[cfg(unix)]
+    #[test]
+    fn a_harness_started_while_a_look_goes_on_is_never_left_running() -> anyhow::Result<()> {
+        let Some(sleep_34) = sleeper(34) else {
+            eprintln!("skipped: nothing here sleeps as a process whose environment can be read");
+            return Ok(());
+        };
+        let id = format!("again-{}", std::process::id());
+        let mut harness = std::process::Command::new("sh").arg("-c").arg(format!("exec {sleep_34}")).env(MARK, &id).spawn()?;
+        let pid = harness.id();
+        let look = || scan(&[(id.clone(), None)]);
+        // Looked at again until it runs as the sleeper (between fork and exec it shows no mark).
+        let until = std::time::Instant::now() + Duration::from_secs(5);
+        let mut seen = look();
+        while !seen.get(&id).is_some_and(|s| s.apart.iter().any(|r| r.pid == pid)) && std::time::Instant::now() < until {
+            std::thread::sleep(Duration::from_millis(50));
+            seen = look();
+        }
+        let found = seen.get(&id).is_some_and(|s| s.apart.iter().any(|r| r.pid == pid));
+        let mut known = seen.clone();
+        let stale = spare(&mut known, &[(id.clone(), None)], &HashMap::from([(id.clone(), Some(pid))]), std::process::id());
+        let mut unknown = seen;
+        let none = spare(&mut unknown, &[(id.clone(), None)], &HashMap::from([(id.clone(), None)]), std::process::id());
+        let _ = harness.kill();
+        let _ = harness.wait();
+        anyhow::ensure!(found, "the look never found the harness apart from its session");
+        assert!(stale.contains(&id) && !known.contains_key(&id), "its harness changed while it was looked at");
+        assert!(none.is_empty() && unknown.get(&id).is_some_and(|s| s.apart.is_empty()), "{unknown:?}");
+        Ok(())
     }
 
     #[test]
