@@ -3033,6 +3033,13 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                     // with this process's receipts of them as they came.
                     Carried::Read(FromServer::Custody(handed)) => {
                         crate::runner::custody::handed(&handed);
+                        // A session's first work, handed after its first turn began, is signed for
+                        // at once.
+                        if server_custody {
+                            for json in crate::runner::custody::drain() {
+                                uplink.0.send(Up::Term(AgentMsg::Custody { json })).await.ok();
+                            }
+                        }
                         continue;
                     }
                     Carried::Read(FromServer::Cluster { msg, raft }) => {

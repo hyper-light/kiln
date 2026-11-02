@@ -9674,7 +9674,10 @@ Research `01a18abf2d28762d92104dca2fbfbf89`.
   `agents.start` ask, to kiln's server, which passes it on unchanged to each subagent it starts (a
   relay's record). The agent given work signs its receipt as it takes it up, at its next turn: kiln
   asks its runner (`ServerMsg::Custody`), again when it opens or its runner says what it holds, and
-  the receipt waits there for the session's identity if it isn't certified yet. A person's side is
+  the receipt waits there for the session's identity if it isn't certified yet. An agent's first
+  work (a subagent's task, or the step an agent was started for) is what its first turn takes up:
+  kiln's ask says so (`first`), and asked after that turn began, the runner signs the receipt at
+  once, as no other turn may come. A person's side is
   theirs when they sign it on their device: `kiln plans take <run> <n>` takes a step over and signs
   the receipt with the key `kiln login` made (`POST /api/plans/runs/<run>/steps/<n>/take` with
   `signs`, then `…/receipt`); a browser signs it with its own key (the signing plan's WebCrypto key,
@@ -9948,6 +9951,7 @@ Research `01a18abf2d28762d92104dca2fbfbf89`.
   to let go once its machine is back, the session at its next epoch untouched). Work: kiln-ci's
   `w27_r08_kiln_takes_for_a_person_with_no_key`, `custody::w27_r08_work_changes_hands_signed_by_both_sides`,
   `runner::custody::w27_r08_work_handed_is_received_at_the_sessions_next_turn`,
+  `runner::custody::w27_r08_first_work_handed_after_the_first_turn_began_is_received_at_once`,
   `ship::w27_r08_a_hand_off_changes_hands_signed` (a failure handed off from a device with no key:
   kiln's take for the person, answered by the agent's receipt),
   `ship::w27_r08_a_hand_off_from_a_browser_is_its_persons_own` (signed in a browser: the person's

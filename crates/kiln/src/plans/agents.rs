@@ -588,7 +588,7 @@ async fn begin(hub: &Hub, run: &str, head: &Head, row: &Row) -> R<()> {
         let paused = crate::goals::get(hub, to).await.is_ok_and(|s| s.state == "paused" && s.reason.is_some());
         mark_started(hub, run, row.idx, to).await?;
         crate::goals::add_at(hub, to, goal, !paused, &At::End).await.map_err(|e| Error::Bad(format!("its goal: {e}")))?;
-        hand_step(hub, run, head, row, to).await;
+        hand_step(hub, run, head, row, to, false).await;
         tracing::info!(%run, step = at + 1, agent = %to, "a plan step's goal goes on an agent's goal stack");
         return Ok(());
     }
@@ -628,7 +628,7 @@ async fn begin(hub: &Hub, run: &str, head: &Head, row: &Row) -> R<()> {
     let agent = started.map_err(|(_, m)| Error::Bad(m))?.ok_or_else(|| Error::Bad("the step's agent didn't start".into()))?;
     mark_started(hub, run, row.idx, &agent).await?;
     crate::goals::add_at(hub, &agent, goal, true, &At::End).await.map_err(|e| Error::Bad(format!("its goal: {e}")))?;
-    hand_step(hub, run, head, row, &agent).await;
+    hand_step(hub, run, head, row, &agent, true).await;
     tracing::info!(%run, step = at + 1, %agent, "a plan step's agent started");
     Ok(())
 }
@@ -669,8 +669,9 @@ async fn acts_for(hub: &Hub, head: &Head) -> Vec<String> {
 /// Step `row` changes hands, signed (docs/ci.md W27-R08; the Transfers plan's step 6): kiln, the
 /// run's driver, hands it to `agent`, acting for the agent that ran the plan (if one did) and its
 /// person; or, tried again after another agent had it, takes it for that one. `agent` signs its
-/// receipt as it takes the step up, at its first turn (`crate::custody::ask_receipt`).
-async fn hand_step(hub: &Hub, run: &str, head: &Head, row: &Row, agent: &str) {
+/// receipt as it takes the step up, at its next turn (`crate::custody::ask_receipt`); `first`, an
+/// agent started for the step, whose first turn takes it up (`crate::custody::ask_first_receipt`).
+async fn hand_step(hub: &Hub, run: &str, head: &Head, row: &Row, agent: &str, first: bool) {
     let n = row.idx + 1;
     let to = match crate::identities::agent_at(hub, agent, hub.harness.epoch_of(agent)).await {
         Ok(to) => to,
@@ -686,6 +687,7 @@ async fn hand_step(hub: &Hub, run: &str, head: &Head, row: &Row, agent: &str) {
     };
     let why = format!("step {n} of plan run {run}: {}", row.title);
     match crate::custody::hand_work(hub, step_work(run, row), &to, &why, giver).await {
+        Ok((_, bundle)) if first => crate::custody::ask_first_receipt(hub, agent, &bundle).await,
         Ok((_, bundle)) => crate::custody::ask_receipt(hub, agent, &bundle).await,
         Err(e) => tracing::warn!(target: "kiln.custody", %run, step = n, %agent, error = %format!("{e:#}"), "a plan step's hand-on wasn't kept"),
     }

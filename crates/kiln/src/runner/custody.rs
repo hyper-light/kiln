@@ -89,6 +89,9 @@ struct State {
     handed: BTreeMap<String, Vec<Work>>,
     /// The sessions whose turn is under way, as their harness last said.
     running: BTreeSet<String>,
+    /// The sessions whose first turn has begun here: a session's first work handed to it after
+    /// that was taken up by that turn ([`handed`]).
+    begun: BTreeSet<String>,
     /// Sessions that took work up before this process held their identity: signed for once it
     /// does ([`take_up_due`]).
     due: BTreeSet<String>,
@@ -566,7 +569,10 @@ fn task_hand_on(slot: &str, by: &str, session: &str, task: &str) -> Option<Value
 
 /// kiln's server handed one of this process's agent sessions work (`v`: `{session, hand_on}`,
 /// `ServerMsg::Custody`): the session's receipt is signed as its next turn starts ([`status`]).
-/// Asked again for the same hand-on (after a reconnect), it's kept once. Or it handed this process
+/// The session's first work (`first`: kiln started it with the work, or gave it the work as its
+/// first goal) is the work its first turn takes up: handed after that turn began, its receipt is
+/// signed at once, as no other turn may come (docs/ci.md W27-R08). Asked again for the same
+/// hand-on (after a reconnect), it's kept once. Or it handed this process
 /// a leg's inputs (`{leg, hand_on: [..]}`, the Transfers plan's step 11): kept for the leg, whose
 /// end this process signs its receipts of them at (`runner::signed`).
 pub fn handed(v: &Value) {
@@ -600,11 +606,17 @@ pub fn handed(v: &Value) {
     let follows = digest_of(&hand_on);
     let from = giver_of(&hand_on).unwrap_or_default();
     let why = statement.body.get("why").and_then(Value::as_str).unwrap_or_default().to_owned();
-    let mut st = STATE.lock();
-    let work = st.handed.entry(session.to_owned()).or_default();
-    if !work.iter().any(|w| w.follows == follows) {
-        tracing::info!(target: "kiln.custody", %session, %why, "work handed: its receipt is signed as the session takes it up");
-        work.push(Work { subject: statement.subject, follows, from, why });
+    let begun = {
+        let mut st = STATE.lock();
+        let work = st.handed.entry(session.to_owned()).or_default();
+        if !work.iter().any(|w| w.follows == follows) {
+            tracing::info!(target: "kiln.custody", %session, %why, "work handed: its receipt is signed as the session takes it up");
+            work.push(Work { subject: statement.subject, follows, from, why });
+        }
+        st.begun.contains(session)
+    };
+    if begun && v.get("first").and_then(Value::as_bool) == Some(true) {
+        take_up(session);
     }
 }
 
@@ -615,6 +627,7 @@ pub fn status(session: &str, status: &crate::harness::model::Status) -> bool {
     let started = {
         let mut st = STATE.lock();
         let started = if matches!(status, crate::harness::model::Status::Running) {
+            st.begun.insert(session.to_owned());
             st.running.insert(session.to_owned())
         } else {
             st.running.remove(session);
@@ -674,6 +687,7 @@ pub fn closed(session: &str) {
     let mut st = STATE.lock();
     st.handed.remove(session);
     st.running.remove(session);
+    st.begun.remove(session);
     st.due.remove(session);
 }
 
@@ -1613,6 +1627,63 @@ mod tests {
         assert!(receipts("plan run r1 step 1").is_empty(), "the first, signed for once");
         closed(session);
         identity::forget_prefix(&format!("agent/{session}/"));
+        Ok(())
+    }
+
+    /// W27-R08: a session's first work (a subagent's task, kiln starting it with the task) is what
+    /// its first turn takes up. Asked for after that turn began, its receipt is signed at once: the
+    /// subagent may have no other turn. Asked for before, it's signed as that turn starts.
+    #[test]
+    fn w27_r08_first_work_handed_after_the_first_turn_began_is_received_at_once() -> anyhow::Result<()> {
+        use crate::harness::model::Status;
+        use kiln_ci::identity::chain::{Actor, Identity};
+        let _one = ONE_AT_A_TIME.lock();
+        let dir = tempfile::tempdir()?;
+        let pki = crate::pki::Pki::open_scratch(&dir.path().join("pki"))?;
+        let org = pki.organization();
+        let server = Identity::new(&org, Actor::Server);
+        let key = crate::pki::new_key_pem()?;
+        let server_pem = pki.issue_identity(&crate::pki::make_csr_with_key("kiln-identity", &key)?, &server, &[], time::Duration::hours(1))?;
+        let signing = rcgen::KeyPair::from_pem(&key)?;
+        let hand_on = |session: &str, name: &str| -> anyhow::Result<Value> {
+            use rcgen::SigningKey as _;
+            let body = Body { to: Some(format!("kiln://{org}/person/ada/agent/{session}/epoch/0")), why: "a subagent's task, passed on unchanged as kiln started it".into(), ..Body::new(Kind::PassedOn, &server.uri()?) };
+            let p = statement::payload(&Statement { subject: vec![crate::custody::work(name, &[name])], ..Statement::new(to_value(&body)) })?;
+            Ok(statement::bundle(PAYLOAD_CUSTODY, &p, &signing.sign(&statement::to_sign(PAYLOAD_CUSTODY, &p))?, &crate::pki::der_of(&server_pem)?))
+        };
+        let certify = |session: &str| -> anyhow::Result<()> {
+            let asked: IdentityAsk = serde_json::from_str(&identity::ask("agent", Some(session), Some(0))?)?;
+            let me = Identity::new(&org, Actor::Agent { person: "ada".into(), agent: session.into(), epoch: 0, held_by: Some(kiln_ci::identity::chain::Holder { machine: "adacachy".into(), instance: "01a14794".into() }) });
+            let pem = pki.issue_identity(&asked.csr, &me, &[], time::Duration::hours(1))?;
+            identity::given(crate::proto::IdentityGiven { kind: asked.kind, of: asked.of, epoch: asked.epoch, uri: me.uri()?, cert_pem: Some(pem), ..crate::proto::IdentityGiven::default() }, dir.path(), "main")?;
+            Ok(())
+        };
+        let receipts = |name: &str| -> Vec<Statement> { drain().iter().filter_map(|r| serde_json::from_str::<Value>(r).ok()).filter_map(|b| statement_of(&b)).filter(|s| s.subject.first().is_some_and(|t| t.name == name)).collect() };
+        // The ask comes after the subagent's first turn began (and, here, ended): signed at once.
+        let late = "w27-r08-first-late";
+        certify(late)?;
+        assert!(!status(late, &Status::Running), "its first turn, nothing handed yet");
+        assert!(!status(late, &Status::Idle));
+        handed(&serde_json::json!({ "session": late, "hand_on": hand_on(late, "a late task")?.to_string(), "first": true }));
+        let got = receipts("a late task");
+        assert_eq!(got.len(), 1, "received at once");
+        assert_eq!(got.first().and_then(|s| s.body.get("kind").cloned()), Some(serde_json::json!("received")));
+        // Work that isn't its first, asked for after a turn began, waits for its next turn, as before.
+        handed(&serde_json::json!({ "session": late, "hand_on": hand_on(late, "more work")?.to_string() }));
+        assert!(receipts("more work").is_empty(), "not its first work: its next turn");
+        assert!(status(late, &Status::Running), "its next turn takes it up");
+        assert_eq!(receipts("more work").len(), 1);
+        // The ask comes before its first turn: signed as that turn starts.
+        let early = "w27-r08-first-early";
+        certify(early)?;
+        handed(&serde_json::json!({ "session": early, "hand_on": hand_on(early, "an early task")?.to_string(), "first": true }));
+        assert!(receipts("an early task").is_empty(), "no turn has begun");
+        assert!(status(early, &Status::Running), "its first turn takes it up");
+        assert_eq!(receipts("an early task").len(), 1);
+        for s in [late, early] {
+            closed(s);
+            identity::forget_prefix(&format!("agent/{s}/"));
+        }
         Ok(())
     }
 

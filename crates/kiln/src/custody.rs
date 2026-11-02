@@ -834,8 +834,20 @@ pub async fn work_taken_from(store: &Store, session: &str) -> anyhow::Result<Opt
 /// process kiln counts as its holder, else its machine's newest. Only one that signs custody
 /// (`CAP_CUSTODY`) is asked: another's hand-on stays unanswered, as a walk shows it.
 pub async fn ask_receipt(hub: &crate::hub::Hub, session: &str, hand_on: &Value) {
+    ask_receipt_of(hub, session, hand_on, false).await;
+}
+
+/// [`ask_receipt`] for the session's first work: kiln started it with the work (a subagent's
+/// task) or gave it the work as its first goal (a plan step's own agent). Its first turn takes the
+/// work up, and may begin before the ask reaches its runner, which then signs the receipt at once.
+pub async fn ask_first_receipt(hub: &crate::hub::Hub, session: &str, hand_on: &Value) {
+    ask_receipt_of(hub, session, hand_on, true).await;
+}
+
+async fn ask_receipt_of(hub: &crate::hub::Hub, session: &str, hand_on: &Value, first: bool) {
     let Some(crate::harness::registry::Location::Machine(machine)) = hub.harness.location(session) else { return };
-    let msg = crate::proto::ServerMsg::Custody { json: json!({ "session": session, "hand_on": hand_on.to_string() }).to_string() };
+    let ask = if first { json!({ "session": session, "hand_on": hand_on.to_string(), "first": true }) } else { json!({ "session": session, "hand_on": hand_on.to_string() }) };
+    let msg = crate::proto::ServerMsg::Custody { json: ask.to_string() };
     let (owner, signs) = {
         let inst = hub.instances.lock();
         let owner = inst.owner(&crate::instances::Owned::Agent(session.to_owned()));
@@ -875,7 +887,7 @@ pub async fn subagents_handed(hub: &crate::hub::Hub, came_from: &str, hand_on: &
             }
         };
         match pass_on(hub, s.subject.clone(), &taken.digest, &parent, &to, "a subagent's task, passed on unchanged as kiln started it").await {
-            Ok((_, bundle)) => ask_receipt(hub, child, &bundle).await,
+            Ok((_, bundle)) => ask_first_receipt(hub, child, &bundle).await,
             Err(e) => tracing::warn!(target: "kiln.custody", %child, error = %format!("{e:#}"), "a subagent's task passed on wasn't kept"),
         }
     }
