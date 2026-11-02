@@ -42,7 +42,7 @@ pub async fn sources(hub: &Hub) -> (Vec<Pool>, Vec<Reservation>) {
         .iter()
         .filter_map(|s| match s.pool() {
             // Its hosts' runners start executors when asked.
-            Ok(p) => Some(Pool { caps: u64::from(crate::proto::CAP_POOLS), ..p }),
+            Ok(p) => Some(Pool { caps: u64::from(crate::proto::CAP_POOLS), locked_caps: crate::proto::CAP_DEPENDENCY_LOCKS, ..p }),
             Err(e) => {
                 tracing::warn!(pool = %s.name, error = %e, "a pool is left out");
                 None

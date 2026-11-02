@@ -251,6 +251,7 @@ pub(crate) fn route_of(spec: &LegSpec, workflow: &str, repo: &str, event: &str, 
         caps,
         untrusted,
         nests_containers: job.is_some_and(|j| nests_containers(&j.steps)),
+        locked: false,
     }
 }
 
@@ -416,7 +417,7 @@ async fn who_of(hub: &Hub, st: &RunSt) -> Who {
 #[allow(clippy::too_many_arguments)]
 fn route_with(spec: &LegSpec, workflow: &str, repo: &str, event: &str, trusted: bool, actions: &std::collections::BTreeMap<String, wire::ActionRef>, locks: Option<&kiln_ci::lock::execution::Locks>, cfg: &crate::config::ci::Ci) -> LegRoute {
     let mut route = route_of(spec, workflow, repo, event, cfg.local, (!trusted).then(|| cfg.untrusted.route()));
-    if let Some(locks) = locks { route.caps |= crate::proto::CAP_DEPENDENCY_LOCKS; route.requires.extend(locks.runtime_requirements()); }
+    if let Some(locks) = locks { route.locked = true; route.caps |= crate::proto::CAP_DEPENDENCY_LOCKS; route.requires.extend(locks.runtime_requirements()); }
     for step in spec.def().map(|j| j.steps.as_slice()).unwrap_or_default() {
         if let Some(a) = step.uses.as_deref().and_then(|u| actions.get(u)) {
             route.requires.extend(a.requires.iter().filter(|q| !route.requires.contains(q)).cloned().collect::<Vec<_>>());
@@ -2438,10 +2439,22 @@ impl Dispatch {
                     crate::rt::spawn(async move { super::pools::stop_pod(&hub, &executor, &runner).await });
                     Ok(())
                 }
-                Command::StartExecutor { pool, executor, runner, kind, image, .. } => {
-                    let ask = super::pools::start_ask(&self.hub, &pool, &executor, &kind, image.as_deref());
-                    self.hub.send_to_agent(&runner, LANE_CONTROL, &ServerMsg::Executor { json: ask.to_string() }).await;
-                    Ok(())
+                Command::StartExecutor { pool, executor, runner, kind, image, leg } => {
+                    let pinned = leg.as_deref().map(|l| self.leg_pool_image(l, image.as_deref())).transpose();
+                    match pinned {
+                        Err(why) => {
+                            let l = leg.as_deref().unwrap_or_default();
+                            let attempt = self.legs.get(l).map_or(1, |x| x.attempt);
+                            self.next.extend(self.sched.handle(Input::ExecutorFailed { executor: executor.clone(), error: why.clone() }, now_ms()));
+                            self.fail_unstarted(l, attempt, "dependency-lock", why).await
+                        }
+                        Ok(pinned) => {
+                            let mut ask = super::pools::start_ask(&self.hub, &pool, &executor, &kind, pinned.as_deref().or(image.as_deref()));
+                            if leg.is_some() && let Some(ask) = ask.as_object_mut() { ask.insert("dependency_locked".into(), serde_json::json!(true)); }
+                            self.hub.send_to_agent(&runner, LANE_CONTROL, &ServerMsg::Executor { json: ask.to_string() }).await;
+                            Ok(())
+                        }
+                    }
                 }
                 Command::StopExecutor { executor, runner } => {
                     let ask = serde_json::json!({ "op": "stop", "executor": executor });
@@ -2516,6 +2529,14 @@ impl Dispatch {
     /// the run's `github`, `vars`, `needs`, `strategy`, `matrix` and `inputs`). Why not, when one of
     /// them can't be: an expression that fails, or `credentials` (a pod pulls with its namespace's
     /// image pull secrets).
+    /// W29-R24: a pool boots only this leg's accepted image, before it receives an assignment.
+    fn leg_pool_image(&self, leg: &str, image: Option<&str>) -> Result<String, String> {
+        let l = self.legs.get(leg).ok_or("KCI4050 the locked leg is gone")?;
+        let r = self.runs.get(&l.run).ok_or("KCI4050 its locked run is gone")?;
+        let locks = r.dependencies.as_ref().and_then(|s| s.execution_for(&l.spec.defined_in, &l.spec.job)).ok_or("KCI4050 its execution lock is missing")?;
+        locks.image(image.ok_or("KCI4050 the pool names no locked image")?)
+    }
+
     fn leg_pod(&self, leg: &str, pool_image: Option<&str>) -> Result<super::pools::LegPod, String> {
         use kiln_ci::expr::{self, Budget, MapContexts, Template, Value};
         use kiln_ci::wf::validate::{Site, options};

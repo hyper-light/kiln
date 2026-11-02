@@ -892,9 +892,9 @@ static WARM: std::sync::LazyLock<parking_lot::Mutex<HashMap<String, Booted>>> = 
 /// Starts pool executor `ask.executor`: a microVM of the pool's image, booted and waiting for its
 /// leg, which starts at once when it comes.
 pub async fn start_warm(work: &Path, ask: &super::pool::Ask) -> anyhow::Result<()> {
+    let image = ask.checked_image()?;
     let m = crate::rt::blocking(Machine::find).await?.context("this runner can't run microVMs now: they need KVM, Firecracker, its guest kernel and e2fsprogs")?;
-    let image = ask.image.clone().filter(|i| !i.trim().is_empty()).context("the pool names no image")?;
-    let pull = super::rootfs::Pull { origin: ask.registry.clone().unwrap_or_default(), token: ask.pull_token.clone().unwrap_or_default(), mirrors: Vec::new(), locked: false };
+    let pull = super::rootfs::Pull { origin: ask.registry.clone().unwrap_or_default(), token: ask.pull_token.clone().unwrap_or_default(), mirrors: Vec::new(), locked: ask.dependency_locked };
     let key = format!("p{}", crate::util::sha256_hex(ask.executor.as_bytes()).get(..11).unwrap_or("ool"));
     let cache = work.join("_firecracker");
     // Restored from its image's snapshot where it can be (W13-R09), else booted.
