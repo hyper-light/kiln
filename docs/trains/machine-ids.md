@@ -4,40 +4,48 @@ docs/machines.md: kiln knows every runner by its machine id, and shows it by its
 delivers, what deploying it does and how to watch it, its risks, its rollback, and what's still
 open.
 
-**Where it stands (2026-10-28, when written):**
-- **Merged:** with this file, onto main at f381c422, with what main brought since this began:
+**Where it stands (2026-11-02):**
+- **Merged:** with this file, onto main at 893c9a6a, with what main brought since this began:
   Ship's commit pages and Mission control's composer (their runners named by their labels too),
-  and kiln's identities (W27: a runner's move records its certificate for the id, moves who
-  enrolled it, and refuses a revoked key). The landing commit's message has the gate's evidence.
+  kiln's identities (W27: a runner's move records its certificate for the id, moves who enrolled
+  it, and refuses a revoked key), and W27's transfers: a runner process takes a hand-over's word
+  for itself by its id, and its local sockets keep the paths named by the name it was started
+  with (an id doesn't fit in one in a Mac's temporary folder). The landing commit's message has the
+  gate's evidence.
 - **Deployed:** not yet. Deploys go through Ada, and so do runner upgrades: a runner moves to its
   machine id only once it runs this build and starts.
-- **Gated** on adacachy (2026-10-28, 23:19 to 23:53Z) on 0c9be472, the tree this push carries but
-  for these notes: clippy across the workspace with all targets, clean, for Linux, Windows
+- **Gated** on kiln-a094a12d (2026-11-02, 19:57 to 21:07Z) on 61a271e8, the tree this push carries
+  but for these notes: clippy across the workspace with all targets, clean, for Linux, Windows
   (`x86_64-pc-windows-gnu`) and macOS (`aarch64-apple-darwin`, both through cargo-zigbuild); every
-  workspace test run, with 4 test threads (3,230 passed). What failed, none of it this train's:
-  - adacachy has a `/usr/bin/claude`, so the tests that expect no Claude Code on `/usr/bin:/bin`
-    find one: `couldnt_start`'s two and `harness_path`'s one (all three pass on macOS).
-  - The gate's own git config breaks `actions/checkout`'s token step: `hosted_actions`' `w14_ac05`,
-    on main too with the same git config.
-  - The gate's memory cap is what a runner reports: `facts`' `w13_ac01`.
-  - Under load: `harness::builds`' `w24_r24` (passes alone), and `resume`'s
-    `a_runner_that_starts_again_…`: its restarted runner connects again under its machine id at
-    once, and the session's turn sometimes doesn't go on in time; alone on adacachy it passed 7 of
-    8 times, and on macOS every time.
+  workspace test run, with 4 test threads (4,418 passed, 119 ignored). What failed (20), none of
+  it this train's:
+  - Docker's address pools used up on kiln-a094a12d (32 networks there; "all predefined address
+    pools have been fully subnetted" 32 times): the 18 tests that start containers, `runner::docker`'s
+    five, `docker_sock`'s, `freeze`'s and `runtime`'s in kiln's lib, and `actions`' `w07_r05`,
+    `deploy_containers`, `image_pool`, `leftovers`, `pools`, `post_steps`' two, `previews`,
+    `retries`' `w05_r15` and `services`.
+  - main's own, failing on main at 893c9a6a the same way (its durable Codex startup messages):
+    `harness::session`'s `cp_t3_2_a_restart_recovers_a_codex_startup_refusal_…` and `switch_held`'s
+    one.
 
-  The gate before the rebase (82155673, onto a946ea5f) found `runner_path` asking for its runner
-  by name: fixed in this train, passing on Linux and macOS. Its other failures were Docker's address
-  pools used up on adacachy (since freed), and main's `w28_ac77` and `wire::ts` (since fixed on
-  main). Its kiln lib tests aborted with a stack overflow, on main too; run on Linux with
-  `RUST_MIN_STACK=16777216`, their failures were only those. Five tries stopped themselves as their
-  machines' services' I/O pressure rose (adacachy three times, kiln-a094a12d twice), and one lost
-  its link to this Mac's runner mid-run: this train's own problem, two runners sharing a name.
-- **Checked on macOS,** on the rebased tree: clippy on every crate and target; kiln-ci's tests
-  (560); kiln's lib tests with `RUST_MIN_STACK=16777216` (2,088 passed; the 4 failing need Linux or
-  a quiet machine: two ACP catalog deadlines, an ELF check of a Mach-O binary, a 2 ms p99); the
-  runners' integration tests and `tests/machines.rs`; the UI's typecheck, lint, tests (333) and
-  build, and its browser tests in Chromium and WebKit at desktop and phone widths, main's composer
-  with the longest name a runner can have among them.
+  The gate before, on the merge of 893c9a6a alone (6ab40c6f), found main's W27 tests naming runners
+  by their names, and with them a runner process refusing a hand-over's word for itself once it
+  moved: fixed here. Gated before on adacachy (2026-10-28, on 0c9be472, 3,230 passed), its
+  failures none of this train's either (a `/usr/bin/claude` there, the gate's own git config and
+  memory cap, two tests under load).
+- **Checked on macOS,** on 61a271e8: clippy across the workspace with all targets, clean; main's
+  tests this train changed, on its build: `transfers` (7; the 3 that need a release build
+  aside), `identities` (23), `store_handover` (3), `experiments` (2), `verify` (4), and
+  `tests/machines.rs` (3); the UI's typecheck, lint, tests (421) and build. Failing here as on main
+  at 893c9a6a, run the same way: `switch_held`'s one (the message held for Codex never shows
+  queued) and four kiln lib tests (`cp_t3_2_a_restart_recovers_a_codex_startup_refusal_…`, "original
+  prompt was lost or delivered twice"; `w27_r03_only_a_sessions_own_process_signs_as_its_agent`;
+  `p_ac1_a_plan_s_steps_end_as_a_stack_of_diffs_…`; `a_detached_run_whose_asker_takes_none_of_…`).
+  These found the two things this train fixed last: a moved runner on a Mac had no `kiln run` (its
+  socket's path too long) and refused hand-overs for itself. On 2026-10-28, on the tree then:
+  kiln-ci's tests (560); kiln's lib tests with `RUST_MIN_STACK=16777216` (2,088 passed); the
+  runners' integration tests; the UI's browser tests in Chromium and WebKit at desktop and phone
+  widths, main's composer with the longest name a runner can have among them.
 - **Why:** on 2026-10-26 a second MacBook Pro joined under the first one's runner name
   (`adas-macbook-pro.local`, its host name then): the two laptops' connections pushed each other off
   about every 17 minutes, their agent sessions erased each other, and they were one member of the
