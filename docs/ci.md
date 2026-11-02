@@ -205,7 +205,7 @@ Statuses: `ready` (can start), `blocked` (waits on what is in brackets), `in pro
 | W24 | Incremental CI: fingerprints, reuse, warm state, shared caches | W04, W05, W06, W08, W13, W18 | ready | specified (2026-10-24): R01–R31, AC01–AC15; milestones M0–M7 and M1e are kiln goals with plans |
 | W26 | Review in Ship: changes as Ship items, each owning its review | W14, W23, W27, Ship (the CI/CD Integration plan) | in progress | R06–R15 built: each item's dropdown owns its review (Files and the Conversation, search on vorpal, kinds and the gate, suggestions and conflicts as revisions, the Review lanes), unsigned until W27-R03; AC06 in Chromium, not yet WebKit; specified (2026-10-25): R01–R20, AC01–AC11; plan `01a175b7d5e1772f8d3c7cb28e50ab2b` |
 | W27 | Attested end to end: identities, signatures, hand-offs, the trail | W10, W18, W26 | in progress | specified (2026-10-25): R01–R12, AC01–AC08; research `01a175c54441773fa28bf1488b82e6aa`; identities built (R01, R02, R12; AC01, AC02): plan `01a17856b1b0712babf8dfd37ce48756` |
-| W29 | Pipelines in Ship: author, run, share and lock workflows and actions | W02, W03, W04, W07, W13, W14, W21, W23, W26 | in progress | specified (2026-10-31): R01–R31, AC01–AC29, S01–S17; the design approved on stills `pl-1` to `pl-9`; the read model and API built (R02, R03, R04's pane, R09's reads); drafts built (R10–R14); sharing built (R17–R20: Access, one check, the catalog, Access and Used by in Ship); releases by tag and update drafts built (R21, R22); plan `01a19474452d7084bae269952cc6c26a` |
+| W29 | Pipelines in Ship: author, run, share and lock workflows and actions | W02, W03, W04, W07, W13, W14, W21, W23, W26 | in progress | specified (2026-10-31): R01–R31, AC01–AC29, S01–S17; the design approved on stills `pl-1` to `pl-9`; the read model and API built (R02, R03, R04's pane, R09's reads); drafts built (R10–R14); sharing built (R17–R20: Access, one check, the catalog, Access and Used by in Ship); releases by tag and update drafts built (R21, R22); the tab built (R01, R04–R08; R14, R21 and R22 in its strip); plan `01a19474452d7084bae269952cc6c26a` |
 
 ---
 
@@ -866,8 +866,13 @@ editor. Includes `kiln validate` and `POST /api/ci/validate`.
   workflow keeps running on GitHub. It may contain the workflow-level kiln keys and
   `jobs.<id>.<kiln key>` and `jobs.<id>.steps.<step id>.<kiln key>` (steps addressed by their
   `id`). It may also replace `runs-on` (to map GitHub's labels to kiln's) and nothing else of
-  GHA's. Overlays are read at the same commit as the workflow. Each overlay key a job ignores
-  because the workflow has no such job or step is a warning (`KCI4010`).
+  GHA's. Its `on:` names kiln's own events (W03-R09: `diff`, `land`, `review`, `comment`,
+  `pipeline`, `agent`, `deploy`, `webhook`), which join the workflow's triggers, and gives kiln's
+  keys (W03-R10) to the workflow's schedules, each entry to the workflow's entry with the same
+  cron. GitHub's events stay in the workflow, where GitHub reads them too (`KCI1010`). Overlays
+  are read at the same commit as the workflow. Each overlay key a job ignores because the
+  workflow has no such job or step, and each schedule whose cron the workflow doesn't have, is a
+  warning (`KCI4010`).
 - **W02-R08 Diagnostics.** `{ code, severity: "error"|"warning"|"info", message, path, range:
   {start:{line,col}, end:{line,col}}, fix?: { title, edits: [{range, text}] } }`. Codes are stable
   and documented: `KCI1xxx` structure, `KCI2xxx` expressions, `KCI3xxx` contexts, `KCI4xxx`
@@ -1492,10 +1497,13 @@ for GHA semantics; kiln's matrix and data-flow additions on top. Pure code in
 - **W04-R27 Environments.** `environment` (string or `{ name, url }`) is evaluated when the leg is
   ready and binds W15's protection rules, secrets and variables; `url` is evaluated after the steps.
 - **W04-R28 Defaults.** `defaults.run.shell` and `working-directory` at workflow and job level.
-- **W04-R29 Plan preview.** `POST /api/ci/plan-preview { repo, ref | sha, path | content, event }`
-  returns the plan without running it: jobs, legs with values, conditions decided now (with their
-  value) or later (marked), removed combinations with their reason, each leg's requirements and
-  routing candidates (W05-R20 explain), and diagnostics. The builder UI and agents use it.
+- **W04-R29 Plan preview.** `POST /api/ci/plan-preview { repo, ref | sha, path | content, overlay?,
+  event }` returns the plan without running it: jobs, legs with values, conditions decided now
+  (with their value) or later (marked), removed combinations with their reason, each leg's
+  requirements and routing candidates (W05-R20 explain), and diagnostics. The builder UI and
+  agents use it. With `content`, `overlay` is a GitHub workflow's overlay as edited (W02-R07),
+  applied as a run applies it. kiln's `diff` and `land` are made as a person's diff onto the
+  default branch would make them.
 
 **Design.** `crates/kiln-ci/src/plan/`: `graph.rs` (jobs, needs, readiness, skips),
 `matrix.rs` (W04-R07 to W04-R17), `outputs.rs`, `reusable.rs`, `perms.rs`, `preview.rs`. The
@@ -10095,8 +10103,9 @@ is kiln research `01a1947b2b0270fa9d1e32d07aebaa7e` (44 findings, 37 sources) an
   - The pane's height is held: nothing moves as lines are picked, verbs act or runs go on.
 - **W29-R05 Inline editing, backed by tree-sitter.** The file is edited where it's shown, in the
   detail. There's no edit mode: typing starts a draft (W29-R10).
-  - CodeMirror 6 (W21-R01's component) keeps input on every device, W21-R01's completion, lint and
-    search.
+  - CodeMirror 6 (W21-R01's component) keeps input on every device, W21-R01's lint and search.
+    Nothing floats over the page: no completion list, hover or tooltip; the lint's problems sit
+    under the code.
   - Its colours and structure come from kiln's tree-sitter engine (`ui/src/lib/syntax`, the
     grammars Vorpal compiles). A view plugin turns `Highlighter` tokens into decorations with
     `components/code/syntax.css`'s classes, so code reads as it does in Ship's Files.
@@ -10737,10 +10746,11 @@ lockfile, which pins commit A. An attacker moves `v45` and `v45.0.7` to commit M
 | `GET /api/ship/pipelines?q=&repo=` | `ship.pipelines.list` | `{ repos: ShipPipelineRepo[] }` |
 | `GET /api/ship/pipelines/:owner/:name?path=&ref=` | `ship.pipelines.get` | `ShipPipelinePane` |
 | `POST /api/ship/pipelines { repo, path, verb, … }` | `ship.pipelines.act` | what the verb's operation answers, and the pane again |
-| verb `save_draft` (W29-R11) | `ci.workflows.edit`, grown: `draft: true` | the draft diff, or the host's draft change and branch |
+| verb `save_draft` (W29-R11) | `ci.workflows.edit`, grown: `draft: true`; `files`, a GitHub workflow's overlay (W29-R06) | the draft diff, or the host's draft change and branch |
+| verb `new` (W29-R08) | `ci::workflows::new_draft`: `kind`, `name`, `language`, `from`, `files?`, `dry?` | the files, or the draft of them all |
 | verb `ready` (W29-R12) | `ci.diffs.ready`; `githost::ready_change`, new | the change asking for review |
 | verb `discard` (W29-R13) | `ci.diffs.abandon`; `githost::close_change`, `delete_branch` | the change closed |
-| verb `run` (W29-R14) | `ci.runs.trigger`, grown: `sha`, `event`, `jobs` | the run |
+| verb `run` (W29-R14) | `ci.runs.trigger`, grown: `sha`, `event`, `jobs`; `draft`, kiln's update draft by its id (W29-R22) | the run |
 | verbs `turn_off`, `turn_on` (W29-R15); `POST /api/ci/repos/:repo/workflows/:path/{disable,enable}` | `ci.workflows.disable`, `ci.workflows.enable`, new | the switch, who and why |
 | verb `settings` (W29-R16, R17, R22, R26) | `ci.workflows.edit`, grown to `.kiln/config.yaml`, as a draft | the draft |
 | verb `release` (W29-R21); `POST /api/ci/repos/:repo/releases { sha, tag, major?, confirm?, notes? }` | `ci.releases.tag`, new | the tag (and GitHub's release) |
@@ -10754,7 +10764,8 @@ lockfile, which pins commit A. An attacker moves `v45` and `v45.0.7` to commit M
 
 The TypeScript types (`ui/src/api/ship.ts`), each a Rust struct of `ship::pipelines`:
 `ShipPipelineRepo`, `ShipPipelineRow`, `ShipPipelinePane`, `ShipPipelineStrip`,
-`ShipPipelineLine`, `ShipPipelineDetail`, `ShipPipelineVerb { verb, label, enabled, why_not? }`.
+`ShipPipelineLine`, `ShipPipelineDetail { name, views, text, since?, changes?, overlay? }`,
+`ShipPipelineVerb { verb, label, enabled, why_not?, asks?, tags? }`.
 
 **W29's stills, part by part.** Every part of the approved stills (`pl-1` to `pl-9`, at 390 and 1280
 px), and the requirement that delivers it. A phone shows the same parts, with the detail under the
@@ -10825,10 +10836,10 @@ Each names the requirements it holds and how it's checked. UI checks run in Chro
   operation's entry (W19-AC04). A verb that doesn't apply is dimmed, with its `why_not`. *API tests,
   one for each verb.*
 - **W29-AC05 Inline editing** (R05). Typing in the detail starts a draft (Not saved), with W21-R01's
-  completion, lint and search. The editor's token classes equal Ship's Files' for the same file,
-  token by token. `run:` is coloured as its shell, and `${{ }}` as W01's expressions. Problems list
-  `POST /api/ci/validate`'s diagnostics under the code, with their fixes. *Unit tests
-  (`ui/src/lib/syntax`) and Playwright.*
+  lint and search, and nothing floating over the page. The editor's token classes equal Ship's
+  Files' for the same file, token by token. `run:` is coloured as its shell, and `${{ }}` as W01's
+  expressions. Problems list `POST /api/ci/validate`'s diagnostics under the code, with their
+  fixes. *Unit tests (`ui/src/lib/syntax`) and Playwright.*
 - **W29-AC06 Every key and every trigger** (R06). Each of Add a trigger's 18 kinds round-trips. It's
   added through Flow and written to the YAML (or to the overlay, for a kiln-only kind in a
   GitHub-dialect file). W02 reads it back with no diagnostics, and W04 plans it for its event. A
@@ -11031,11 +11042,35 @@ Its step 6, releases by tag and update drafts, is built (R21, R22):
   window's updates. Ship shows each as an Update row whose pane says what changes for it and
   what changed upstream. Regenerating locks comes with locks (R25, the plan's step 8).
 
-Not built yet: New (R08); GitHub's own dispatch where GitHub is the provider (R14); turning a
-workflow off and on (R15). Sharing step 3 found two gaps. Both are closed. R10's: a draft-only commit
-pinned through a native source's plain name, or by a reusable call, was let through. R12's: a
-kiln draft's own workflow didn't start when it was marked Ready, and a GitHub-dialect one wasn't
-held while it was a draft. Next are the tab (R01) and editing (R05, R06), the plan's step 7.
+Its step 7, the Pipelines tab, is built (R01, R04 to R08; R14, R21 and R22 in its strip):
+- The tab (R01, R02): `/ship/pipelines`, the third of Ship's views, each repository's rows as
+  Ship's, a New row last; `?repo=&path=` opens a row and brings it into view.
+- The pane (R04) is the jobs pane's anatomy: its kicker, strip and groups, and the picked line's
+  detail beside them, or under its line on a phone.
+- Inline editing (R05): CodeMirror, coloured by kiln's tree-sitter engine
+  (`ui/src/lib/syntax/codemirror.ts`). `run:` reads as its shell (`queries/workflow-injections.scm`,
+  with the engine's `kiln.replaces` and `kiln.block-scalar`). Typing starts a draft: the jobs and
+  uses it adds join their groups, marked new, and Problems sit under the code with their fixes.
+  Pipelines shows no completion list, hover or tooltip.
+- Triggers (R06): each kind edited where it's shown, Add a trigger's 18 kinds, and a schedule's
+  next runs (`kiln_ci::trigger::cron::next_runs`, in the plan preview) and options. In a GitHub
+  workflow, kiln's own kinds and a schedule's kiln keys go in its overlay (W02-R07 grew `on:`), so
+  the file keeps working on GitHub. Its draft carries the overlay (`files`).
+- The plan for each event (R07): "plan for:" picks a trigger, its plan is the preview's (with the
+  overlay as edited), and a draft's is set against what's published (`ui/src/lib/plan-diff.ts`).
+- New (R08): `kiln_ci::scaffold`'s seven kinds, saved as one draft of all their files.
+- In the strip: Run with inputs (R14); Release asked with the versions it offers
+  (`kiln_ci::releases::next_versions`) and, after a refusal over checks, Release anyway (R21); kiln's
+  update drafts run, readied and discarded by whoever may submit to the repository (R22).
+
+Not built yet: R04's pick words ("failed last run · changed in a draft · all": "plan for:" stands
+in their place); R09's ways in (Edit workflow from a commit's jobs pane and a run's page, and
+`/workflows` redirecting to Pipelines); a workflow's Code views (R27, the plan's step 9); GitHub's
+own dispatch where GitHub is the provider (R14); turning a workflow off and on (R15). Sharing step
+3 found two gaps. Both are closed. R10's: a draft-only commit pinned through a native source's
+plain name, or by a reusable call, was let through. R12's: a kiln draft's own workflow didn't
+start when it was marked Ready, and a GitHub-dialect one wasn't held while it was a draft. Next
+are locks (R23 to R26), the plan's step 8.
 
 ## 4. API, events, CLI and MCP reference
 
