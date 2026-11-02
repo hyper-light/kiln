@@ -168,6 +168,74 @@ test("nothing moves as lines are picked and views switched: the list holds still
   expect(await heightOf()).toBe(height);
 });
 
+test("no layout shift as lines are picked, views switched, a verb asked and kept, and the pane refreshed", async ({ page, isMobile, browserName }) => {
+  test.skip(browserName !== "chromium", "layout shifts are Chromium's to count");
+  test.setTimeout(60_000);
+  await page.request.get("/api/mock/ship/pipelines?reset=1");
+  const pane = await openPane(page, isMobile, "hyper-light/kiln", ".kiln/smoke.yaml");
+  await page.evaluate(() => document.fonts.ready.then(() => undefined));
+  await page.evaluate(() => {
+    const w = window as unknown as { __shift: number; __moved: string[] };
+    w.__shift = 0;
+    w.__moved = [];
+    new PerformanceObserver((l) => {
+      for (const e of l.getEntries() as unknown as { value: number; hadRecentInput: boolean; sources?: { node?: Node }[] }[]) {
+        if (e.hadRecentInput) continue;
+        if (!(e.sources ?? []).some((s) => (s.node instanceof Element ? s.node : (s.node?.parentElement ?? null))?.closest(".ship"))) continue;
+        w.__shift += e.value;
+        for (const s of e.sources ?? []) w.__moved.push(`${s.node?.nodeName ?? "?"} "${(s.node?.textContent ?? "").slice(0, 40)}"`);
+      }
+    }).observe({ type: "layout-shift" });
+  });
+  for (const k of ["jobs.report", "on.schedule", "on.deploy", "add-trigger", "jobs.smoke"]) {
+    await pane.locator(`.jp-j[data-key="${k}"] .jp-line`).click();
+    await page.waitForTimeout(600);
+  }
+  for (const v of ["Plan", "Last run", "YAML"]) {
+    await pane.locator(".ppl-detail").getByRole("tab", { name: v }).click();
+    await page.waitForTimeout(600);
+  }
+  // Run asks for its inputs in the strip; Keep goes back.
+  await pane.locator(".ppl-verbs button", { hasText: /^Run$/ }).click();
+  await page.waitForTimeout(300);
+  await pane.locator(".ppl-verbs button", { hasText: "Keep" }).click();
+  // The server says the repository's rows changed: the list and the pane ask again.
+  for (let i = 0; i < 2; i++) {
+    await page.request.post("/api/mock/ship/pipelines/tick?repo=hyper-light/kiln");
+    await page.waitForTimeout(2_000);
+  }
+  const seen = await page.evaluate(() => ({ shift: (window as unknown as { __shift: number }).__shift, moved: (window as unknown as { __moved: string[] }).__moved }));
+  expect(seen.shift, `what moved: ${seen.moved.join(" | ")}`).toBe(0);
+});
+
+for (const width of [320, 390, 1280]) {
+  test(`at ${width}, an opened workflow scrolls nothing sideways, whatever its detail shows`, async ({ page, isMobile }) => {
+    test.skip(isMobile, "each width is set here; the desktop projects run them");
+    await page.request.get("/api/mock/ship/pipelines?reset=1");
+    await page.setViewportSize({ width, height: 900 });
+    await page.goto(`/ship/pipelines?repo=${encodeURIComponent("hyper-light/kiln")}&path=${encodeURIComponent(".kiln/smoke.yaml")}`);
+    await notices(page);
+    const pane = page.getByRole("region", { name: "Pipeline" });
+    await expect(pane.locator(".jp-strip")).toBeVisible({ timeout: 15_000 });
+    const within = async (what: string) => {
+      expect(await sideways(page), what).toBe(0);
+      for (const sel of [".jp-strip", ".ppl-verbs button", ".jp-list", ".jp-j", ".ppl-detail"]) {
+        const right = await page.locator(sel).evaluateAll((els) => Math.max(0, ...els.map((n) => n.getBoundingClientRect().right)));
+        expect(right, `${what}: ${sel}`).toBeLessThanOrEqual(width + 0.5);
+      }
+    };
+    await within("its first job");
+    for (const k of ["on.schedule", "on.webhook", "add-trigger", "jobs.report"]) {
+      await pane.locator(`.jp-j[data-key="${k}"] .jp-line`).click();
+      await within(k);
+    }
+    await pane.locator(".ppl-detail").getByRole("tab", { name: "Plan" }).click();
+    await within("its plan");
+    await pane.locator(".ppl-verbs button", { hasText: /^Run$/ }).click();
+    await within("Run's inputs asked");
+  });
+}
+
 test("the file is edited where it's shown: kiln's colours, run: as bash; typing starts a draft; its problems under it with their fixes; nothing floats", async ({ page, isMobile }) => {
   const pane = await openPane(page, isMobile, "hyper-light/kiln", ".kiln/ci.yaml");
   const code = pane.locator(".ppl-detail .cm-content");
@@ -278,6 +346,54 @@ test("Add a trigger: 18 kinds in six groups, shown by whose; picking one adds it
 
 /** The bodies this browser sent `POST /api/ship/pipelines`, as the mock kept them. */
 const sentBodies = async (page: Page) => ((await (await page.request.get("/api/mock/ship/pipelines")).json()) as { bodies: Record<string, unknown>[] }).bodies;
+
+test("a GitHub workflow keeps working on GitHub: a schedule goes in its YAML, kiln's diff and the schedule's zone in its overlay; plan for: lists them all; Save draft carries both (W29-S03)", async ({
+  page,
+  isMobile,
+}) => {
+  await page.request.get("/api/mock/ship/pipelines?reset=1");
+  const pane = await openPane(page, isMobile, "hyper-light/quiver", ".github/workflows/ci.yml");
+  const kinds = pane.getByLabel("Add a trigger");
+  const add = async (kind: string) => {
+    await pane.locator('.jp-j[data-key="add-trigger"] .jp-line').click();
+    await kinds.locator(`li[data-kind="${kind}"] button`).click();
+  };
+  // A schedule, GitHub's too: into the workflow's YAML.
+  await add("schedule");
+  await expect(pane.locator(".jp-j[data-at]")).toHaveAttribute("data-key", "on.schedule");
+  await expect(page.locator('.ppl-row[data-key="hyper-light/quiver:.github/workflows/ci.yml"] .ship-r .ship-stand')).toHaveText("Not saved");
+  // kiln's diff: into its overlay, its filters the engine's, its YAML the overlay's.
+  await add("diff");
+  const diff = pane.locator('.jp-j[data-key="on.diff"]');
+  await expect(pane.locator(".jp-j[data-at]")).toHaveAttribute("data-key", "on.diff");
+  await expect(diff).toContainText("branches main · in its overlay");
+  await expect(pane.locator(".ppl-dname")).toHaveText("branches main · .kiln/overlays/ci.yaml");
+  const filters = pane.getByLabel("diff's filters");
+  await expect(filters.locator("li[data-field] > .n")).toHaveText(["branches", "paths", "paths-ignore", "drafts", "authors"]);
+  await expect(filters.locator('li[data-field="drafts"] [role=switch]')).toHaveAttribute("aria-checked", "false");
+  await pane.locator(".ppl-detail").getByRole("tab", { name: "YAML" }).click();
+  await expect(pane.locator(".ppl-detail .cm-content")).toContainText("# kiln's own keys for .github/workflows/ci.yml");
+  await expect(pane.locator(".ppl-detail .cm-content")).toContainText("diff:");
+  // plan for: lists GitHub's and kiln's alike.
+  await expect(pane.locator(".jp-q")).toHaveText(/plan for:\s*push to main\s*·\s*pull request\s*·\s*schedule\s*·\s*diff/);
+  // The schedule's zone is kiln's key: it goes in the overlay, on the entry with its cron.
+  await pane.locator('.jp-j[data-key="on.schedule"] .jp-line').click();
+  const zone = pane.getByLabel("0 3 * * *'s options").locator('li[data-field="timezone"] input');
+  await zone.fill("America/Los_Angeles");
+  await zone.press("Enter");
+  await expect(pane.getByLabel("0 3 * * *'s next runs").locator("li").first()).toContainText(/03:00 P[SD]T · 1[01]:00 UTC/);
+  // Saved: the workflow with its schedule and nothing of kiln's; its overlay beside it.
+  await pane.locator(".ppl-verbs button", { hasText: "Save draft" }).click();
+  await expect(pane.locator(".jp-said")).toContainText("as a draft");
+  const body = (await sentBodies(page)).at(-1) as { verb: string; content: string; files?: { path: string; text: string }[] };
+  expect(body.verb).toBe("save_draft");
+  expect(body.content).toContain("schedule:");
+  expect(body.content).not.toMatch(/diff|timezone/);
+  expect(body.files?.map((f) => f.path)).toEqual([".kiln/overlays/ci.yaml"]);
+  expect(body.files?.[0]?.text).toMatch(/diff:[\s\S]*schedule:[\s\S]*cron: "?0 3 \* \* \*"?[\s\S]*timezone: America\/Los_Angeles/);
+  await expect(page.locator(".cm-tooltip, [role=dialog]")).toHaveCount(0);
+  expect(await sideways(page)).toBe(0);
+});
 
 test("Run with inputs: the strip asks for them in place, each its default first; one with none runs at once; nothing moves", async ({ page, isMobile }) => {
   await page.request.get("/api/mock/ship/pipelines?reset=1");

@@ -719,3 +719,50 @@ fn w29_r08_new_makes_a_draft() -> anyhow::Result<()> {
     assert_eq!(g.sent("POST", "/repos/acme/app/pulls").first().and_then(|p| p.get("draft")), Some(&json!(true)));
     Ok(())
 }
+
+/// W29-S03 (R06, R07): kiln's own `diff` trigger of a GitHub-dialect workflow goes in its overlay,
+/// so the file stays GitHub's (W02-R07). The pane says where the overlay goes. The plan preview
+/// plans the `diff` event with the overlay as edited, its schedule in the overlay's zone, and
+/// doesn't without it. Save draft keeps the workflow and its overlay in one draft diff. Another
+/// workflow's overlay, or GitHub's events in one, is refused.
+#[test]
+fn w29_s03_kilns_own_trigger_goes_in_its_overlay() -> anyhow::Result<()> {
+    let (s, dir) = kiln_with_ci()?;
+    let (home, work) = (dir.path().join("githome"), dir.path().join("app"));
+    let sha = git(&home, &work, &["rev-parse", "HEAD"])?.trim().to_owned();
+    let path = ".github/workflows/ci.yml";
+    let pane = get(&s, &format!("/api/ship/pipelines/acme/app?path={path}"))?;
+    assert_eq!((at(&pane, "/detail/overlay/path"), at(&pane, "/detail/overlay/text")), (".kiln/overlays/ci.yaml", ""), "{pane}");
+    // A schedule in the file; kiln's `diff`, and the schedule's zone, in its overlay.
+    let content = "name: ci\non:\n  push:\n  schedule:\n    - cron: \"0 3 * * *\"\njobs:\n  build:\n    runs-on: local\n    steps:\n      - run: echo one\n";
+    let overlay = "on:\n  diff:\n    branches: [main]\n  schedule:\n    - cron: \"0 3 * * *\"\n      timezone: America/Los_Angeles\n";
+    let preview = |o: Option<&str>| -> anyhow::Result<Value> {
+        let mut b = json!({ "repo": "acme/app", "ref": "main", "sha": sha, "path": path, "content": content, "event": "diff" });
+        if let (Some(o), Some(m)) = (o, b.as_object_mut()) {
+            m.insert("overlay".into(), json!(o));
+        }
+        let (st, text) = http(s.port, "POST", "/api/ci/plan-preview", &s.admin, Some(&b))?;
+        anyhow::ensure!(st == 200, "{st} {text}");
+        Ok(serde_json::from_str(&text)?)
+    };
+    let with = preview(Some(overlay))?;
+    assert_eq!(with.get("runs"), Some(&json!(true)), "{with}");
+    assert_eq!(with.pointer("/schedules/0/timezone").and_then(Value::as_str), Some("America/Los_Angeles"), "{with}");
+    let without = preview(None)?;
+    assert_eq!(without.get("runs"), Some(&json!(false)), "{without}");
+    // Saved together: one draft diff of both, its pane holding the overlay as saved.
+    let (st, saved) = act(&s, &json!({ "repo": "acme/app", "path": path, "verb": "save_draft", "content": content, "files": [{ "path": ".kiln/overlays/ci.yaml", "text": overlay }], "title": "Run on diffs" }))?;
+    assert_eq!((st, at(&saved, "/draft/kind")), (200, "diff"), "{saved}");
+    let changed = get(&s, &format!("/api/diffs/{}/versions/1/files", at(&saved, "/draft/name")))?.to_string();
+    for p in [path, ".kiln/overlays/ci.yaml"] {
+        assert!(changed.contains(p), "{p} in the draft: {changed}");
+    }
+    let draft = get(&s, &format!("/api/ship/pipelines/acme/app?path={path}&draft={}", at(&saved, "/draft/id")))?;
+    assert_eq!(at(&draft, "/detail/overlay/text"), overlay, "{draft}");
+    // Another workflow's overlay: refused; GitHub's events in its own: its errors, nothing saved.
+    let (st, out) = act(&s, &json!({ "repo": "acme/app", "path": path, "verb": "save_draft", "content": content, "files": [{ "path": ".kiln/overlays/other.yaml", "text": overlay }] }))?;
+    assert_eq!(st, 400, "{out}");
+    let (st, out) = act(&s, &json!({ "repo": "acme/app", "path": path, "verb": "save_draft", "content": content, "files": [{ "path": ".kiln/overlays/ci.yaml", "text": "on:\n  pull_request: {}\n" }] }))?;
+    assert_eq!(st, 422, "{out}");
+    Ok(())
+}

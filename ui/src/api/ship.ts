@@ -271,6 +271,8 @@ export interface ShipPipelineDetail {
   since?: { tag: string; commits: { sha: string; subject: string; author: string; at: number }[] } | null;
   /** What releasing its head changes for those who use it (W29-R21). */
   changes?: ShipPipelineLine[] | null;
+  /** A GitHub workflow's overlay (W02-R07): its path and text, empty where it has none yet. Flow writes kiln's own triggers there (W29-R06). */
+  overlay?: { path: string; text: string } | null;
 }
 
 /** A workflow or action opened (W29-R04): `GET /api/ship/pipelines/{owner}/{name}?path=&ref=`. */

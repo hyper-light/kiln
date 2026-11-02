@@ -4,8 +4,11 @@
 //!
 //! ```json
 //! { "repo": "acme/app", "ref": "main", "sha": "…", "path": ".github/workflows/ci.yml",
-//!   "content": "…", "event": "push" | { "name": "…", "payload": {…}, "inputs": {…} } }
+//!   "content": "…", "overlay": "…", "event": "push" | { "name": "…", "payload": {…}, "inputs": {…} } }
 //! ```
+//!
+//! `overlay` is a GitHub workflow's overlay as edited (W02-R07), applied to `content` as a run
+//! applies it: Pipelines plans kiln's own triggers of a GitHub workflow with it (W29-R06, R07).
 //!
 //! The answer: the workflow's diagnostics, whether the event starts it (and why not), and the
 //! plan: legs with their values and routing against the runners connected now, what was decided
@@ -53,7 +56,23 @@ pub async fn of(hub: &Arc<Hub>, caller: Option<&crate::authz::Caller>, b: Value)
             let p = path.unwrap_or_else(|| ".github/workflows/preview.yml".into());
             let dialect = if p.starts_with(".kiln/") { Dialect::Kiln } else { Dialect::Gha };
             let (text, q) = (text.to_owned(), p.clone());
-            let (w, d) = crate::rt::blocking(move || kiln_ci::wf::parse_workflow(&q, &text, dialect)).await.map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")))?;
+            let overlay = b.get("overlay").and_then(Value::as_str).filter(|_| dialect == Dialect::Gha).map(str::to_owned);
+            let (w, d) = crate::rt::blocking(move || {
+                let (mut w, mut d) = kiln_ci::wf::parse_workflow(&q, &text, dialect);
+                if let (Some(w), Some(o)) = (w.as_mut(), overlay) {
+                    let (ov, mut od) = kiln_ci::wf::parse_overlay(&o);
+                    for x in &mut od {
+                        x.path = format!("its overlay: {}", x.path);
+                    }
+                    d.extend(od);
+                    if let Some(ov) = ov {
+                        d.extend(kiln_ci::wf::apply_overlay(w, &ov));
+                    }
+                }
+                (w, d)
+            })
+            .await
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")))?;
             (p, w, load::stored(&d))
         }
         None => {

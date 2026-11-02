@@ -1166,6 +1166,9 @@ pub struct Opened<'a> {
     pub changes: Option<&'a [crate::wf::diff::Change]>,
     /// Its newest release and the commits to its files since (pl-5's Changes view).
     pub since: Option<Since<'a>>,
+    /// A GitHub workflow's overlay (W02-R07): its path and text, empty where it has none yet. Flow
+    /// writes kiln's own triggers there (W29-R06).
+    pub overlay: Option<(&'a str, &'a str)>,
 }
 
 /// An action's or reusable workflow's commits since its newest release (W29-R21): what Release
@@ -1242,6 +1245,7 @@ pub fn pane_json(o: &Opened<'_>, groups: &[PaneGroup]) -> Value {
         "detail": {
             "name": f.path, "views": views, "text": o.text,
             "since": o.since.map(|s| json!({ "tag": s.tag, "commits": s.commits })),
+            "overlay": o.overlay.map(|(path, text)| json!({ "path": path, "text": text })),
             "changes": o.changes.filter(|_| o.since.is_some()).map(change_lines),
         },
         "repo": o.repo,

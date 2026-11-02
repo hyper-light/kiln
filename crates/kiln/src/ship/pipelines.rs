@@ -466,7 +466,9 @@ pub async fn get(hub: &Arc<Hub>, owner: &str, name: &str, q: &HashMap<String, St
         None => Vec::new(),
     };
     let since = newest.as_deref().map(|tag| core::Since { tag, commits: &commits });
-    let pane = core::pane_json(&core::Opened { repo: &full, row: &row, at: &at, sha: &sha, text: &text, viewer, by_hand, changes: changes.as_deref(), since }, &groups);
+    let overlay = overlay_of(hub, &repo, &sha, path).await;
+    let overlay = overlay.as_ref().map(|(p, t)| (p.as_str(), t.as_str()));
+    let pane = core::pane_json(&core::Opened { repo: &full, row: &row, at: &at, sha: &sha, text: &text, viewer, by_hand, changes: changes.as_deref(), since, overlay }, &groups);
     Ok(srv::json(StatusCode::OK, &pane))
 }
 
@@ -590,8 +592,26 @@ async fn draft_pane(hub: &Hub, repo: &Repo, id: &str, path: &str, viewer: core::
         groups.insert(1, core::PaneGroup { name: "Upstream".into(), lines: core::upstream_lines(&upstream) });
     }
     let at = d.branch.clone().or_else(|| d.name.clone()).unwrap_or_else(|| head.clone());
-    let pane = core::pane_json(&core::Opened { repo: &repo.name, row: &row, at: &at, sha: &head, text: &text, viewer, by_hand: runs_by_hand(loaded.as_ref()), changes: None, since: None }, &groups);
+    let overlay = overlay_of(hub, repo, &head, path).await;
+    let overlay = overlay.as_ref().map(|(p, t)| (p.as_str(), t.as_str()));
+    let pane = core::pane_json(&core::Opened { repo: &repo.name, row: &row, at: &at, sha: &head, text: &text, viewer, by_hand: runs_by_hand(loaded.as_ref()), changes: None, since: None, overlay }, &groups);
     Ok(srv::json(StatusCode::OK, &pane))
+}
+
+/// A GitHub workflow's overlay at `sha` (W02-R07): its path and text, or where Flow would write
+/// one and nothing, when it has none yet (W29-R06). None for what isn't a GitHub workflow.
+async fn overlay_of(hub: &Hub, repo: &Repo, sha: &str, path: &str) -> Option<(String, String)> {
+    if wf::file_kind(path) != Some(wf::FileKind::GhaWorkflow) {
+        return None;
+    }
+    let stem = stem_of(path);
+    for ext in ["yaml", "yml"] {
+        let at = format!(".kiln/overlays/{stem}.{ext}");
+        if let Ok(text) = crate::ci::load::blob(hub, repo, sha, &at).await {
+            return Some((at, text));
+        }
+    }
+    Some((format!(".kiln/overlays/{stem}.yaml"), String::new()))
 }
 
 /// What `git -C dir <args>` prints, or nothing when it fails: what it reads is the repository's

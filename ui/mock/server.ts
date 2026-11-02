@@ -38,7 +38,7 @@ import { handlePush, pushHeard } from "./push.ts";
 import { handleReview } from "./review.ts";
 import { handleShip } from "./ship.ts";
 import { handleDeploys, setDeploysEmit } from "./deploys.ts";
-import { handlePipelines } from "./pipelines.ts";
+import { handlePipelines, setPipelinesEmit } from "./pipelines.ts";
 import { handleDoctor } from "./doctor.ts";
 import { handleStores } from "./stores.ts";
 import {
@@ -517,6 +517,7 @@ function emit(ev: ServerEvent) {
 setLongEmit((ev) => emit(ev as ServerEvent));
 setDemoEmit((ev) => emit(ev as ServerEvent));
 setDeploysEmit((ev) => emit(ev as ServerEvent));
+setPipelinesEmit((ev) => emit(ev as ServerEvent));
 setFamilyEmit((ev) => emit(ev as ServerEvent));
 setReviewEmit((ev) => emit(ev as ServerEvent));
 

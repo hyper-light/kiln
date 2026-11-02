@@ -710,13 +710,14 @@ export function addTrigger(src: string, keys: string[], value: unknown): string 
       const on = root.get("on", true);
       const had = onMap(obj(c.d.toJS()));
       for (const k of keys) if (k in had) throw new EditRefused(`it has a ${k} trigger already`);
-      const added = Object.fromEntries(keys.map((k) => [k, value]));
+      // Each key its own copy: one value under two keys is written as an anchor and its alias.
+      const added = Object.fromEntries(keys.map((k) => [k, structuredClone(value)]));
       if (on === undefined) return setPair(c, [], "on", added, ["jobs"]);
       if (isMap(on) && !on.flow) return keys.reduce((s, k) => setPair({ ...c, src: s, d: parseDocument(s) }, ["on"], k, value), c.src);
       return setPair(c, [], "on", { ...had, ...added });
     },
     (js) => {
-      js.on = { ...onMap(js), ...Object.fromEntries(keys.map((k) => [k, value])) };
+      js.on = { ...onMap(js), ...Object.fromEntries(keys.map((k) => [k, structuredClone(value)])) };
     },
   );
 }
@@ -760,6 +761,36 @@ export function setTriggerFilter(src: string, key: string, filter: string, value
       if (empty) delete t[filter];
       else t[filter] = value;
       on[key] = t;
+    },
+  );
+}
+
+/** A GitHub workflow's overlay begun with `on` (W02-R07): what GitHub doesn't read, said so. */
+const overlayStart = (workflow: string, on: Js) => `# kiln's own keys for ${workflow}, which GitHub doesn't read (docs/ci.md W02-R07)\n${stringify({ on })}`;
+
+/** A kiln-only trigger added to a GitHub workflow's overlay (W29-R06), the overlay begun where it has none yet. */
+export function addOverlayTrigger(overlay: string, workflow: string, keys: string[], value: unknown): string {
+  if (!overlay.trim()) return overlayStart(workflow, Object.fromEntries(keys.map((k) => [k, structuredClone(value)])));
+  return addTrigger(overlay, keys, value);
+}
+
+/** A GitHub workflow's schedule's kiln key (W03-R10) set in its overlay, on the entry with its cron: the workflow keeps its cron alone, as GitHub reads it. */
+export function setOverlayScheduleField(overlay: string, workflow: string, cron: string, field: string, value: string | boolean | null): string {
+  const empty = value === null || value === "" || value === false;
+  if (!overlay.trim()) return empty ? overlay : overlayStart(workflow, { schedule: [{ cron, [field]: value }] });
+  const doc = parseDocument(overlay);
+  if (doc.errors.length) throw new EditRefused("its overlay's YAML has errors: fix them in its YAML first");
+  const at = list(obj(obj(doc.toJS()).on).schedule).findIndex((x) => String(obj(x).cron) === cron);
+  if (at >= 0) return setScheduleField(overlay, at, field, value);
+  if (empty) return overlay;
+  const entry = { cron, [field]: value };
+  return edit(
+    overlay,
+    (c) => (seqAt(c, ["on", "schedule"]) ? addItem(c, ["on", "schedule"], entry) : mapAt(c, ["on"]) ? setPair(c, ["on"], "schedule", [entry]) : setPair(c, [], "on", { schedule: [entry] }, ["jobs"])),
+    (js) => {
+      const on = obj(js.on);
+      on.schedule = [...list(on.schedule), entry];
+      js.on = on;
     },
   );
 }

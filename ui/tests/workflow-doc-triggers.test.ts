@@ -1,8 +1,9 @@
 import assert from "node:assert/strict";
+import { readFileSync, writeFileSync } from "node:fs";
 import { test } from "node:test";
 import { parse } from "yaml";
 import { TRIGGER_KINDS, TRIGGER_GROUPS, triggerLines } from "../src/lib/triggers.ts";
-import { addTrigger, EditRefused, removeTrigger, setScheduleField, setTriggerFilter } from "../src/lib/workflow-doc.ts";
+import { addOverlayTrigger, addTrigger, EditRefused, removeTrigger, setOverlayScheduleField, setScheduleField, setTriggerFilter } from "../src/lib/workflow-doc.ts";
 
 const JOBS = "jobs:\n  a:\n    runs-on: [baremetal]\n    steps:\n      - run: echo hi\n";
 const EMPTY = `name: x\n${JOBS}`;
@@ -67,4 +68,65 @@ test("w29_r06_one_line_triggers_become_a_mapping", () => {
   });
   assert.throws(() => addTrigger(`on: [push]\n${JOBS}`, ["push"], {}), EditRefused);
   assert.throws(() => removeTrigger(`on: [push]\n${JOBS}`, "push"), EditRefused);
+});
+
+test("w29_r06_kilns_own_triggers_go_in_a_github_workflows_overlay", () => {
+  const wf = ".github/workflows/ci.yml";
+  // None yet: one begun, saying what it is.
+  const begun = addOverlayTrigger("", wf, ["diff"], { branches: ["main"] });
+  assert.ok(begun.startsWith("# kiln's own keys for .github/workflows/ci.yml"), begun);
+  assert.deepEqual(parse(begun), { on: { diff: { branches: ["main"] } } });
+  // Another beside it, the first and its comment kept.
+  const two = addOverlayTrigger(begun, wf, ["land"], {});
+  assert.ok(two.startsWith(begun.trimEnd()), two);
+  assert.deepEqual(Object.keys((parse(two) as { on: object }).on), ["diff", "land"]);
+  // An overlay of jobs' keys gets its triggers before them.
+  const jobs = "jobs:\n  build:\n    retry: { max: 2 }\n";
+  const before = addOverlayTrigger(jobs, wf, ["comment"], { commands: ["/run"] });
+  assert.ok(before.endsWith(jobs), before);
+  assert.deepEqual((parse(before) as { on: unknown }).on, { comment: { commands: ["/run"] } });
+});
+
+test("w29_r06_a_github_schedules_kiln_keys_go_in_its_overlay_by_cron", () => {
+  const wf = ".github/workflows/bench.yml";
+  const tz = setOverlayScheduleField("", wf, "0 4 * * *", "timezone", "America/Los_Angeles");
+  assert.deepEqual((parse(tz) as { on: unknown }).on, { schedule: [{ cron: "0 4 * * *", timezone: "America/Los_Angeles" }] });
+  // Its entry again; another cron's entry beside it; one taken out, its cron kept.
+  const skip = setOverlayScheduleField(tz, wf, "0 4 * * *", "skip-if-unchanged", true);
+  const other = setOverlayScheduleField(skip, wf, "30 2 * * 1", "jitter", "10m");
+  assert.deepEqual((parse(other) as { on: unknown }).on, {
+    schedule: [
+      { cron: "0 4 * * *", timezone: "America/Los_Angeles", "skip-if-unchanged": true },
+      { cron: "30 2 * * 1", jitter: "10m" },
+    ],
+  });
+  assert.deepEqual((parse(setOverlayScheduleField(other, wf, "0 4 * * *", "timezone", null)) as { on: { schedule: unknown[] } }).on.schedule[0], { cron: "0 4 * * *", "skip-if-unchanged": true });
+  // Nothing to set, nothing begun.
+  assert.equal(setOverlayScheduleField("", wf, "0 4 * * *", "timezone", null), "");
+  // Beside its triggers.
+  const beside = setOverlayScheduleField(addOverlayTrigger("", wf, ["diff"], {}), wf, "0 4 * * *", "catch-up", true);
+  assert.deepEqual((parse(beside) as { on: unknown }).on, { diff: {}, schedule: [{ cron: "0 4 * * *", "catch-up": true }] });
+});
+
+/**
+ * Each kind's first lines as Add a trigger writes them, in a kiln workflow, in a GitHub one, and kiln's own kinds in a GitHub
+ * workflow's overlay: kiln-ci's tests/trigger_kinds.rs reads each with no errors, as the server will (W29-R06).
+ * `UPDATE_FIXTURES=1` writes the fixture again (then prettier it, as the UI's files are).
+ */
+test("w29_r06_each_kinds_first_lines_are_the_fixture_kiln_ci_reads", () => {
+  const out: { kind: string; path: string; events: string[]; text: string }[] = [];
+  for (const kiln of [true, false]) {
+    for (const k of TRIGGER_KINDS) {
+      const keys = kiln ? k.kiln : k.gha;
+      const events = (keys ?? k.kiln).map((key) => (key === "manual" ? "workflow_dispatch" : key));
+      if (keys) out.push({ kind: k.id, path: kiln ? ".kiln/x.yaml" : ".github/workflows/x.yml", events, text: addTrigger(EMPTY, keys, k.first(kiln)) });
+      else out.push({ kind: k.id, path: ".kiln/overlays/x.yaml", events, text: addOverlayTrigger("", ".github/workflows/x.yml", k.kiln, k.first(true)) });
+    }
+  }
+  assert.equal(out.length, 36);
+  // Written plainly: no kind's lines shared through an anchor and its alias.
+  for (const e of out) assert.ok(!/&a\d/.test(e.text), `${e.kind}: ${e.text}`);
+  const at = new URL("./fixtures/trigger-kinds.json", import.meta.url);
+  if (process.env.UPDATE_FIXTURES) writeFileSync(at, `${JSON.stringify(out, null, 2)}\n`);
+  assert.deepEqual(JSON.parse(readFileSync(at, "utf8")), out);
 });

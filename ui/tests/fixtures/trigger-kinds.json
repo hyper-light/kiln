@@ -1,0 +1,218 @@
+[
+  {
+    "kind": "push",
+    "path": ".kiln/x.yaml",
+    "events": ["push"],
+    "text": "name: x\non:\n  push:\n    branches: [main]\njobs:\n  a:\n    runs-on: [baremetal]\n    steps:\n      - run: echo hi\n"
+  },
+  {
+    "kind": "pull_request",
+    "path": ".kiln/x.yaml",
+    "events": ["pull_request"],
+    "text": "name: x\non:\n  pull_request:\n    branches: [main]\njobs:\n  a:\n    runs-on: [baremetal]\n    steps:\n      - run: echo hi\n"
+  },
+  {
+    "kind": "diff",
+    "path": ".kiln/x.yaml",
+    "events": ["diff"],
+    "text": "name: x\non:\n  diff:\n    branches: [main]\njobs:\n  a:\n    runs-on: [baremetal]\n    steps:\n      - run: echo hi\n"
+  },
+  {
+    "kind": "land",
+    "path": ".kiln/x.yaml",
+    "events": ["land"],
+    "text": "name: x\non:\n  land: {}\njobs:\n  a:\n    runs-on: [baremetal]\n    steps:\n      - run: echo hi\n"
+  },
+  {
+    "kind": "merge_group",
+    "path": ".kiln/x.yaml",
+    "events": ["merge_group"],
+    "text": "name: x\non:\n  merge_group: {}\njobs:\n  a:\n    runs-on: [baremetal]\n    steps:\n      - run: echo hi\n"
+  },
+  {
+    "kind": "create",
+    "path": ".kiln/x.yaml",
+    "events": ["create", "delete"],
+    "text": "name: x\non:\n  create: {}\n  delete: {}\njobs:\n  a:\n    runs-on: [baremetal]\n    steps:\n      - run: echo hi\n"
+  },
+  {
+    "kind": "schedule",
+    "path": ".kiln/x.yaml",
+    "events": ["schedule"],
+    "text": "name: x\non:\n  schedule:\n    - cron: 0 3 * * *\njobs:\n  a:\n    runs-on: [baremetal]\n    steps:\n      - run: echo hi\n"
+  },
+  {
+    "kind": "manual",
+    "path": ".kiln/x.yaml",
+    "events": ["workflow_dispatch"],
+    "text": "name: x\non:\n  manual: {}\njobs:\n  a:\n    runs-on: [baremetal]\n    steps:\n      - run: echo hi\n"
+  },
+  {
+    "kind": "agent",
+    "path": ".kiln/x.yaml",
+    "events": ["agent"],
+    "text": "name: x\non:\n  agent: {}\njobs:\n  a:\n    runs-on: [baremetal]\n    steps:\n      - run: echo hi\n"
+  },
+  {
+    "kind": "comment",
+    "path": ".kiln/x.yaml",
+    "events": ["comment"],
+    "text": "name: x\non:\n  comment:\n    commands: [/run]\njobs:\n  a:\n    runs-on: [baremetal]\n    steps:\n      - run: echo hi\n"
+  },
+  {
+    "kind": "review",
+    "path": ".kiln/x.yaml",
+    "events": ["review"],
+    "text": "name: x\non:\n  review: {}\njobs:\n  a:\n    runs-on: [baremetal]\n    steps:\n      - run: echo hi\n"
+  },
+  {
+    "kind": "pipeline",
+    "path": ".kiln/x.yaml",
+    "events": ["pipeline"],
+    "text": "name: x\non:\n  pipeline:\n    name: ci\n    conclusion: [success]\njobs:\n  a:\n    runs-on: [baremetal]\n    steps:\n      - run: echo hi\n"
+  },
+  {
+    "kind": "called",
+    "path": ".kiln/x.yaml",
+    "events": ["workflow_call"],
+    "text": "name: x\non:\n  workflow_call: {}\njobs:\n  a:\n    runs-on: [baremetal]\n    steps:\n      - run: echo hi\n"
+  },
+  {
+    "kind": "deploy",
+    "path": ".kiln/x.yaml",
+    "events": ["deploy"],
+    "text": "name: x\non:\n  deploy:\n    states: [synced]\njobs:\n  a:\n    runs-on: [baremetal]\n    steps:\n      - run: echo hi\n"
+  },
+  {
+    "kind": "release",
+    "path": ".kiln/x.yaml",
+    "events": ["release"],
+    "text": "name: x\non:\n  release:\n    types: [published]\njobs:\n  a:\n    runs-on: [baremetal]\n    steps:\n      - run: echo hi\n"
+  },
+  {
+    "kind": "package",
+    "path": ".kiln/x.yaml",
+    "events": ["registry_package"],
+    "text": "name: x\non:\n  registry_package: {}\njobs:\n  a:\n    runs-on: [baremetal]\n    steps:\n      - run: echo hi\n"
+  },
+  {
+    "kind": "webhook",
+    "path": ".kiln/x.yaml",
+    "events": ["webhook"],
+    "text": "name: x\non:\n  webhook:\n    hook: status-page\njobs:\n  a:\n    runs-on: [baremetal]\n    steps:\n      - run: echo hi\n"
+  },
+  {
+    "kind": "dispatch",
+    "path": ".kiln/x.yaml",
+    "events": ["repository_dispatch"],
+    "text": "name: x\non:\n  repository_dispatch:\n    types: [deploy]\njobs:\n  a:\n    runs-on: [baremetal]\n    steps:\n      - run: echo hi\n"
+  },
+  {
+    "kind": "push",
+    "path": ".github/workflows/x.yml",
+    "events": ["push"],
+    "text": "name: x\non:\n  push:\n    branches: [main]\njobs:\n  a:\n    runs-on: [baremetal]\n    steps:\n      - run: echo hi\n"
+  },
+  {
+    "kind": "pull_request",
+    "path": ".github/workflows/x.yml",
+    "events": ["pull_request"],
+    "text": "name: x\non:\n  pull_request:\n    branches: [main]\njobs:\n  a:\n    runs-on: [baremetal]\n    steps:\n      - run: echo hi\n"
+  },
+  {
+    "kind": "diff",
+    "path": ".kiln/overlays/x.yaml",
+    "events": ["diff"],
+    "text": "# kiln's own keys for .github/workflows/x.yml, which GitHub doesn't read (docs/ci.md W02-R07)\non:\n  diff:\n    branches:\n      - main\n"
+  },
+  {
+    "kind": "land",
+    "path": ".kiln/overlays/x.yaml",
+    "events": ["land"],
+    "text": "# kiln's own keys for .github/workflows/x.yml, which GitHub doesn't read (docs/ci.md W02-R07)\non:\n  land: {}\n"
+  },
+  {
+    "kind": "merge_group",
+    "path": ".github/workflows/x.yml",
+    "events": ["merge_group"],
+    "text": "name: x\non:\n  merge_group: {}\njobs:\n  a:\n    runs-on: [baremetal]\n    steps:\n      - run: echo hi\n"
+  },
+  {
+    "kind": "create",
+    "path": ".github/workflows/x.yml",
+    "events": ["create", "delete"],
+    "text": "name: x\non:\n  create: {}\n  delete: {}\njobs:\n  a:\n    runs-on: [baremetal]\n    steps:\n      - run: echo hi\n"
+  },
+  {
+    "kind": "schedule",
+    "path": ".github/workflows/x.yml",
+    "events": ["schedule"],
+    "text": "name: x\non:\n  schedule:\n    - cron: 0 3 * * *\njobs:\n  a:\n    runs-on: [baremetal]\n    steps:\n      - run: echo hi\n"
+  },
+  {
+    "kind": "manual",
+    "path": ".github/workflows/x.yml",
+    "events": ["workflow_dispatch"],
+    "text": "name: x\non:\n  workflow_dispatch: {}\njobs:\n  a:\n    runs-on: [baremetal]\n    steps:\n      - run: echo hi\n"
+  },
+  {
+    "kind": "agent",
+    "path": ".kiln/overlays/x.yaml",
+    "events": ["agent"],
+    "text": "# kiln's own keys for .github/workflows/x.yml, which GitHub doesn't read (docs/ci.md W02-R07)\non:\n  agent: {}\n"
+  },
+  {
+    "kind": "comment",
+    "path": ".kiln/overlays/x.yaml",
+    "events": ["comment"],
+    "text": "# kiln's own keys for .github/workflows/x.yml, which GitHub doesn't read (docs/ci.md W02-R07)\non:\n  comment:\n    commands:\n      - /run\n"
+  },
+  {
+    "kind": "review",
+    "path": ".github/workflows/x.yml",
+    "events": ["pull_request_review"],
+    "text": "name: x\non:\n  pull_request_review: {}\njobs:\n  a:\n    runs-on: [baremetal]\n    steps:\n      - run: echo hi\n"
+  },
+  {
+    "kind": "pipeline",
+    "path": ".github/workflows/x.yml",
+    "events": ["workflow_run"],
+    "text": "name: x\non:\n  workflow_run:\n    workflows: [ci]\n    types: [completed]\njobs:\n  a:\n    runs-on: [baremetal]\n    steps:\n      - run: echo hi\n"
+  },
+  {
+    "kind": "called",
+    "path": ".github/workflows/x.yml",
+    "events": ["workflow_call"],
+    "text": "name: x\non:\n  workflow_call: {}\njobs:\n  a:\n    runs-on: [baremetal]\n    steps:\n      - run: echo hi\n"
+  },
+  {
+    "kind": "deploy",
+    "path": ".kiln/overlays/x.yaml",
+    "events": ["deploy"],
+    "text": "# kiln's own keys for .github/workflows/x.yml, which GitHub doesn't read (docs/ci.md W02-R07)\non:\n  deploy:\n    states:\n      - synced\n"
+  },
+  {
+    "kind": "release",
+    "path": ".github/workflows/x.yml",
+    "events": ["release"],
+    "text": "name: x\non:\n  release:\n    types: [published]\njobs:\n  a:\n    runs-on: [baremetal]\n    steps:\n      - run: echo hi\n"
+  },
+  {
+    "kind": "package",
+    "path": ".github/workflows/x.yml",
+    "events": ["registry_package"],
+    "text": "name: x\non:\n  registry_package: {}\njobs:\n  a:\n    runs-on: [baremetal]\n    steps:\n      - run: echo hi\n"
+  },
+  {
+    "kind": "webhook",
+    "path": ".kiln/overlays/x.yaml",
+    "events": ["webhook"],
+    "text": "# kiln's own keys for .github/workflows/x.yml, which GitHub doesn't read (docs/ci.md W02-R07)\non:\n  webhook:\n    hook: status-page\n"
+  },
+  {
+    "kind": "dispatch",
+    "path": ".github/workflows/x.yml",
+    "events": ["repository_dispatch"],
+    "text": "name: x\non:\n  repository_dispatch:\n    types: [deploy]\njobs:\n  a:\n    runs-on: [baremetal]\n    steps:\n      - run: echo hi\n"
+  }
+]

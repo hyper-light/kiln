@@ -696,6 +696,20 @@ function paneOf(repo: string, row: ShipPipelineRow): ShipPipelinePane {
             changes: SINCE[key] ? [{ key: "changes.input.targets", kind: "change", name: "input targets", value: "added · optional: nothing they pass changes" }] : [],
           }
         : {}),
+      // A GitHub workflow's overlay, none yet in the mock: where Flow writes kiln's own triggers (W29-R06).
+      ...(row.dialect === "gha"
+        ? {
+            overlay: {
+              path: `.kiln/overlays/${
+                row.path
+                  .split("/")
+                  .pop()
+                  ?.replace(/\.ya?ml$/, "") ?? ""
+              }.yaml`,
+              text: "",
+            },
+          }
+        : {}),
     },
     repo,
   };
@@ -740,6 +754,16 @@ function nextDaily(cron: string, tz: string | null): { at: number; shift?: { at:
   return out;
 }
 
+/** A GitHub workflow's overlay's schedule entries (W02-R07); none where it isn't YAML. */
+function overlaySchedules(text: string): Obj[] {
+  try {
+    const o = obj(obj(parse(text)).on).schedule;
+    return Array.isArray(o) ? o.map(obj) : [];
+  } catch {
+    return [];
+  }
+}
+
 /** `POST /api/ci/plan-preview` (W04-R29), as the mock plans: a job's legs by its matrix, where linux legs would run. */
 function preview(body: Obj): unknown {
   const text = String(body.content ?? FILES[`${String(body.repo)}:${String(body.path)}`] ?? "");
@@ -765,20 +789,26 @@ function preview(body: Obj): unknown {
       routing: { labels, image: null, executors: ["baremetal"], runners: labels.includes("macos") ? [fit("metal-mac-mini")] : [fit("fedora"), fit("adacachy")] },
     }));
   });
-  const schedules = (Array.isArray(obj(doc.on).schedule) ? (obj(doc.on).schedule as unknown[]) : []).map(obj).map((s) => {
-    const tz = s.timezone ? String(s.timezone) : null;
-    const next = nextDaily(String(s.cron), tz);
-    return {
-      cron: String(s.cron),
-      timezone: tz,
-      skip_if_unchanged: s["skip-if-unchanged"] === true,
-      catch_up: s["catch-up"] === true,
-      jitter: s.jitter ? String(s.jitter) : null,
-      inputs: obj(s.inputs),
-      next,
-      error: next ? null : `the mock reads daily crons only, not ${String(s.cron)}`,
-    };
-  });
+  // A GitHub workflow's overlay gives its schedules kiln's keys, by their cron (W02-R07).
+  const over = overlaySchedules(String(body.overlay ?? ""));
+  const withOverlay = (s: Obj): Obj => ({ ...s, ...obj(over.find((o) => String(o.cron) === String(s.cron))) });
+  const schedules = (Array.isArray(obj(doc.on).schedule) ? (obj(doc.on).schedule as unknown[]) : [])
+    .map(obj)
+    .map(withOverlay)
+    .map((s) => {
+      const tz = s.timezone ? String(s.timezone) : null;
+      const next = nextDaily(String(s.cron), tz);
+      return {
+        cron: String(s.cron),
+        timezone: tz,
+        skip_if_unchanged: s["skip-if-unchanged"] === true,
+        catch_up: s["catch-up"] === true,
+        jitter: s.jitter ? String(s.jitter) : null,
+        inputs: obj(s.inputs),
+        next,
+        error: next ? null : `the mock reads daily crons only, not ${String(s.cron)}`,
+      };
+    });
   return {
     repo: body.repo,
     ref: "main",
@@ -876,6 +906,12 @@ const bodiesOf = (ua: string) => {
   return b;
 };
 
+let emit: (ev: unknown) => void = () => {};
+/** How the mock tells the pages a repository's rows changed (`pipelines { repo }`, W29-R03). */
+export function setPipelinesEmit(fn: (ev: unknown) => void) {
+  emit = fn;
+}
+
 export async function handlePipelines(req: http.IncomingMessage, res: http.ServerResponse, url: URL, ctx: Ctx): Promise<boolean> {
   const ua = String(req.headers["user-agent"] ?? "");
   const p = url.pathname;
@@ -886,6 +922,12 @@ export async function handlePipelines(req: http.IncomingMessage, res: http.Serve
       madeBy.delete(ua);
     }
     ctx.json(res, 200, { bodies: bodiesOf(ua) });
+    return true;
+  }
+  // A repository's rows gathered again, as a run, a job or a push makes the server do: the pages ask again.
+  if (p === "/api/mock/ship/pipelines/tick" && m === "POST") {
+    emit({ type: "pipelines", repo: url.searchParams.get("repo") ?? "hyper-light/kiln" });
+    ctx.json(res, 200, { ok: true });
     return true;
   }
   if (p === "/api/ship/pipelines" && m === "GET") {

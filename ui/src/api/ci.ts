@@ -922,7 +922,7 @@ export const ci = {
     request<CiInsightsWorkflow>("GET", `/api/ci/insights/workflows/${enc(repo)}?workflow=${enc(workflow)}&days=${days}`, undefined, { signal }),
   insightsRunners: (days: number, signal?: AbortSignal) => request<CiInsightsHead & { runners: CiRunnerInsight[] }>("GET", `/api/ci/insights/runners?days=${days}`, undefined, { signal }),
   insightsRunner: (runner: string, days: number, signal?: AbortSignal) => request<CiInsightsRunner>("GET", `/api/ci/insights/runners/${enc(runner)}?days=${days}`, undefined, { signal }),
-  preview: (body: { repo: string; ref?: string; sha?: string; path?: string; content?: string; event?: string | { name: string; inputs?: Record<string, string> } }) =>
+  preview: (body: { repo: string; ref?: string; sha?: string; path?: string; content?: string; overlay?: string; event?: string | { name: string; inputs?: Record<string, string> } }) =>
     request<CiPreview>("POST", `/api/ci/plan-preview`, body),
 };
 

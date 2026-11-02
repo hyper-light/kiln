@@ -408,6 +408,15 @@ pub async fn preview_event(hub: &Hub, repo: &Repo, name: &str, full_ref: &str, s
             e.payload = context::workflow_dispatch(&e, &f.repo, path, &strings);
             Ok((e, typed))
         }
+        // kiln's diff and land (W03-R09) as a person's diff onto the default branch makes them, not
+        // a draft: what Pipelines' "plan for:" asks of a trigger filtered by its trunks (W29-R07).
+        "diff" | "land" => {
+            let mut e = Event { name: name.to_owned(), repo: repo.name.clone(), git_ref: full_ref.to_owned(), sha: sha.to_owned(), base_ref: Some(f.default_branch.clone()), actor: "kiln".into(), trusted: true, source: Source::Api, ..Event::default() };
+            if name == "diff" {
+                e.payload = serde_json::json!({ "kiln": { "diff": { "author_kind": "human", "draft": false } } });
+            }
+            Ok((e, serde_json::Value::Null))
+        }
         other => {
             let mut e = Event { name: other.to_owned(), repo: repo.name.clone(), git_ref: full_ref.to_owned(), sha: sha.to_owned(), actor: "kiln".into(), trusted: true, source: Source::Api, ..Event::default() };
             if other == "schedule" {

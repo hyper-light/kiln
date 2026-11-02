@@ -41,7 +41,7 @@ export const TRIGGER_KINDS: readonly TriggerKind[] = [
     whose: "kiln",
     gha: null,
     kiln: ["diff"],
-    first: () => ({ trunks: ["main"] }),
+    first: () => ({ branches: ["main"] }),
   },
   { id: "land", words: "land", say: "the land queue's candidate, before it lands", group: "Code", whose: "kiln", gha: null, kiln: ["land"], first: () => ({}) },
   { id: "merge_group", words: "merge group", say: "a pull request in GitHub's merge queue", group: "Code", whose: "github", gha: ["merge_group"], kiln: ["merge_group"], first: () => ({}) },

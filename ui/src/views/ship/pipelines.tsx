@@ -24,7 +24,7 @@ import { lineDiff } from "@/lib/line-diff";
 import { jobsOf, planLines, whereWords, type PlanJob, type PlanLine } from "@/lib/plan-diff";
 import { manualInputs, spotOf, type ManualInput, type Spot } from "@/lib/pipeline-spot";
 import { TRIGGER_GROUPS, TRIGGER_KINDS, triggerKeys, triggerLines, type TriggerKind } from "@/lib/triggers";
-import { addTrigger, EditRefused, removeTrigger, setScheduleField, setTriggerFilter } from "@/lib/workflow-doc";
+import { addOverlayTrigger, addTrigger, EditRefused, removeTrigger, setOverlayScheduleField, setScheduleField, setTriggerFilter } from "@/lib/workflow-doc";
 import { parse as parseYaml } from "yaml";
 import { Link, useSearchParams } from "@/lib/router";
 import { invalidate, useSuspenseResource } from "@/lib/resource";
@@ -198,7 +198,7 @@ export function DraftMark() {
 /** A workflow or action as Ship's row: its name, its stand and line, its pips, who changed it and when, where it is. No buttons but to open it. */
 function PipelineRow({ repo, row, open, landed, onOpen }: { repo: ShipPipelineRepo; row: ShipPipelineRow; open: boolean; landed: boolean; onOpen: (open: boolean) => void }) {
   // Typed in and not saved: the row says so, as a draft does (W29-R10's Not saved).
-  const [notSaved, setNotSaved] = React.useState(() => unsaved.has(row.key));
+  const [notSaved, setNotSaved] = React.useState(() => unsaved.has(row.key) || unsaved.has(overlayKey(row.key)));
   return (
     <li className="ship-row dp-row ppl-row" data-stand={row.stand} data-key={row.key} ref={landed ? intoView : undefined}>
       <div className="ship-r">
@@ -581,8 +581,9 @@ function NewBody({
   );
 }
 
-/** Each row's text as it's being written, by its key, kept while the page is open (W29-R05: typing starts a draft). */
+/** Each row's text as it's being written, by its key, kept while the page is open (W29-R05: typing starts a draft); a GitHub workflow's overlay by its row's {@link overlayKey}. */
 const unsaved = new Map<string, string>();
+const overlayKey = (key: string) => `${key}#overlay`;
 
 /** A pick's key: a pane line's (`on.push`, `jobs.rust`, `uses.kiln/checkout@v1`, `versions.head`). */
 type Key = string;
@@ -706,11 +707,13 @@ function viewsFor(p: ShipPipelinePane, l: ShipPipelineLine | null): string[] {
   }
 }
 
-/** What a plan is asked for (W29-R07): its event, in the strip's words, and the text it's set against (a draft's published file, or the text typed over). */
+/** What a plan is asked for (W29-R07): its event, in the strip's words, and the text it's set against (a draft's published file, or the text typed over); a GitHub workflow's overlay with each (W29-R06). */
 interface PlanAsk {
   event: string | null;
   words: string | null;
   base: string | null;
+  overlay: string | null;
+  baseOverlay: string | null;
 }
 
 /** A trigger's event, as the preview takes it (kiln's `manual:` is GitHub's workflow_dispatch). */
@@ -722,20 +725,20 @@ function eventWords(t: ShipPipelineLine): string {
   return t.name === "push" && branch ? `push to ${branch}` : t.name;
 }
 
-/** The plan of `text` for `event` (W04-R29's preview); a manual run's with its inputs' defaults. */
-function planOf(pane: ShipPipelinePane, text: string, event: string | null): Promise<CiPreview> {
+/** The plan of `text` for `event` (W04-R29's preview), with a GitHub workflow's overlay applied; a manual run's with its inputs' defaults. */
+function planOf(pane: ShipPipelinePane, text: string, event: string | null, overlay: string | null = null): Promise<CiPreview> {
   const inputs = Object.fromEntries(manualInputs(text).flatMap((i) => (i.default === null ? [] : [[i.name, i.default]])));
   const ev = event === "workflow_dispatch" ? { name: event, inputs } : event;
-  return ci.preview({ repo: pane.repo, path: pane.head.path, content: text, ...(ev ? { event: ev } : {}) });
+  return ci.preview({ repo: pane.repo, path: pane.head.path, content: text, ...(overlay?.trim() ? { overlay } : {}), ...(ev ? { event: ev } : {}) });
 }
 
 /** The published text's plans, asked once each while the page is open: they don't change as you type. */
 const basePlans = new Map<string, Promise<CiPreview>>();
-function basePlanOf(pane: ShipPipelinePane, base: string, event: string | null): Promise<CiPreview> {
-  const key = `${pane.repo}\0${pane.head.path}\0${event ?? ""}\0${hashOf(base)}`;
+function basePlanOf(pane: ShipPipelinePane, base: string, event: string | null, overlay: string | null = null): Promise<CiPreview> {
+  const key = `${pane.repo}\0${pane.head.path}\0${event ?? ""}\0${hashOf(base)}\0${hashOf(overlay ?? "")}`;
   let had = basePlans.get(key);
   if (!had) {
-    had = planOf(pane, base, event);
+    had = planOf(pane, base, event, overlay);
     had.catch(() => basePlans.delete(key));
     basePlans.set(key, had);
   }
@@ -758,19 +761,35 @@ function PipelinePane({ repo, row, onChanged }: { repo: ShipPipelineRepo; row: S
   const [asking, setAsking] = React.useState<Record<string, string> | null>(null);
   // The file as it's being written: typing (or the Flow view) starts a draft, Not saved until it's saved (W29-R05, R10).
   const [text, setText] = React.useState(() => unsaved.get(row.key) ?? p.detail.text);
-  const changed = text !== p.detail.text;
+  // A GitHub workflow's overlay, where kiln's own triggers and its schedules' kiln keys go, so the file keeps working on GitHub (W02-R07, W29-R06).
+  const ov = p.detail.overlay ?? null;
+  const [overlay, setOverlay] = React.useState(() => unsaved.get(overlayKey(row.key)) ?? ov?.text ?? "");
+  const textChanged = text !== p.detail.text;
+  const overlayChanged = ov !== null && overlay !== ov.text;
+  const changed = textChanged || overlayChanged;
   const edit = (t: string) => {
     setText(t);
     if (t === p.detail.text) unsaved.delete(row.key);
     else unsaved.set(row.key, t);
-    onChanged(t !== p.detail.text);
+    onChanged(t !== p.detail.text || overlayChanged);
+    setSaid(null);
+  };
+  const editOverlay = (t: string) => {
+    setOverlay(t);
+    if (t === (ov?.text ?? "")) unsaved.delete(overlayKey(row.key));
+    else unsaved.set(overlayKey(row.key), t);
+    onChanged(textChanged || t !== (ov?.text ?? ""));
     setSaid(null);
   };
   // The Triggers group follows what's typed, and ends with Add a trigger where the file can be edited (W29-R06).
   const workflow = ["workflow", "reusable"].includes(h.kind);
   const kiln = h.dialect === "kiln";
   const editable = p.strip.verbs.some((v) => v.verb === "save_draft" && v.enabled);
-  const typed = workflow && changed ? triggerLines(text, kiln) : null;
+  // kiln's own triggers of a GitHub workflow come from its overlay, each saying so.
+  const overlaid = ov ? (triggerLines(overlay, true) ?? []).filter((l) => l.whose === "kiln").map((l) => ({ ...l, value: l.value ? `${l.value} · in its overlay` : "in its overlay" })) : [];
+  const inOverlay = (event: string) => overlaid.some((l) => eventKey(l) === event);
+  const written = workflow && (changed || overlaid.length) ? triggerLines(text, kiln) : null;
+  const typed = written ? [...written, ...overlaid] : null;
   const groups = p.groups.map((g) => (g.name === "Triggers" && workflow ? { ...g, lines: [...(typed ?? g.lines), ...(editable ? [ADD_TRIGGER] : [])] } : g));
   const lines = groups.flatMap((g) => g.lines);
   const at = picked && lines.some((l) => l.key === picked) ? picked : firstPick(p);
@@ -798,6 +817,8 @@ function PipelinePane({ repo, row, onChanged }: { repo: ShipPipelineRepo; row: S
     event,
     words: triggers.find((t) => eventKey(t) === event) ? eventWords(triggers.find((t) => eventKey(t) === event) as ShipPipelineLine) : null,
     base: draft ? (published?.detail.text ?? null) : changed ? p.detail.text : null,
+    overlay: ov ? overlay : null,
+    baseOverlay: draft ? (published?.detail.overlay?.text ?? null) : (ov?.text ?? null),
   };
   // Who gets a tag: a tag is the whole repository's (W29-R21).
   const sharing = (() => {
@@ -886,14 +907,27 @@ function PipelinePane({ repo, row, onChanged }: { repo: ShipPipelineRepo; row: S
       case "run":
         if (runInputs.length) return setAsking(Object.fromEntries(runInputs.map((i) => [i.name, i.default ?? (i.type === "boolean" ? "false" : (i.options[0] ?? ""))])));
         return runNow({});
-      case "save_draft":
-        // Saved, it's the draft's row now: this one reads as published again.
+      case "save_draft": {
+        // A GitHub workflow's overlay goes in the same draft where it isn't what its trunk has (W29-R06).
+        const trunkOverlay = draft ? (published?.detail.overlay?.text ?? "") : (ov?.text ?? "");
+        const files = ov && overlay !== trunkOverlay ? [{ path: ov.path, text: overlay }] : [];
         return void act(
-          { verb: "save_draft", content: text },
+          { verb: "save_draft", content: text, ...(files.length ? { files } : {}) },
           <>
             Saved <b>{h.title}</b> as a draft: unpublished until it lands.
           </>,
-        ).then((ok) => ok && edit(p.detail.text));
+        ).then((ok) => {
+          if (!ok) return;
+          // A draft's pane holds what's saved now; a published file's reads as published again, its draft a row of its own.
+          if (!draft) {
+            setText(p.detail.text);
+            setOverlay(ov?.text ?? "");
+          }
+          unsaved.delete(row.key);
+          unsaved.delete(overlayKey(row.key));
+          onChanged(false);
+        });
+      }
       case "ready":
         return void act(
           { verb: "ready", ...draftId },
@@ -968,29 +1002,67 @@ function PipelinePane({ repo, row, onChanged }: { repo: ShipPipelineRepo; row: S
     setAsking(null);
   };
   // What the detail edits the file with: a change made (or refused, saying why), a kind added and picked.
+  const refusal = (e: unknown) => setSaid({ text: e instanceof EditRefused ? e.message : errorMessage(e), refused: true });
   const tools: Tools = {
     kiln,
     show,
+    overlaid: ov !== null,
+    written: new Set([...triggerKeys(text, kiln).values(), ...(ov ? triggerKeys(overlay, true).values() : [])]),
     change: (make) => {
       try {
         edit(make(text));
       } catch (e) {
-        setSaid({ text: e instanceof EditRefused ? e.message : errorMessage(e), refused: true });
+        refusal(e);
+      }
+    },
+    // A GitHub workflow keeps its cron alone; kiln's keys for it go in its overlay, on the entry with its cron.
+    setSchedule: (i, cron, field, v) => {
+      try {
+        if (ov && !kiln) editOverlay(setOverlayScheduleField(overlay, h.path, cron, field, v));
+        else edit(setScheduleField(text, i, field, v));
+      } catch (e) {
+        refusal(e);
       }
     },
     say: (why) => setSaid({ text: why, refused: true }),
     addKind: (k) => {
       const keys = kiln ? k.kiln : k.gha;
-      if (!keys) return setSaid({ text: overlayWhy(h.path), refused: true });
       try {
-        edit(addTrigger(text, keys, k.first(kiln)));
-        setPicked(`on.${kiln && keys[0] === "manual" ? "workflow_dispatch" : (keys[0] ?? "")}`);
+        if (keys) edit(addTrigger(text, keys, k.first(kiln)));
+        // kiln's own, in a GitHub workflow: written to its overlay.
+        else if (ov) editOverlay(addOverlayTrigger(overlay, h.path, k.kiln, k.first(true)));
+        else return setSaid({ text: overlayWhy(h.path), refused: true });
+        const first = (keys ?? k.kiln)[0] ?? "";
+        setPicked(`on.${kiln && first === "manual" ? "workflow_dispatch" : first}`);
       } catch (e) {
-        setSaid({ text: e instanceof EditRefused ? e.message : errorMessage(e), refused: true });
+        refusal(e);
       }
     },
   };
-  const detail = <Detail key={`${at ?? "file"}|${event ?? ""}`} pane={p} line={line} text={text} onText={edit} editable={editable} ask={ask} tools={tools} rows={phone ? PHONE_ROWS : SIDE_ROWS} />;
+  // A trigger the overlay holds is edited there: its filters and its YAML are the overlay's, its plan the workflow's with it.
+  const inOwn = line?.kind === "trigger" && ov !== null && inOverlay(eventKey(line));
+  const own: OwnFile | null =
+    inOwn && ov
+      ? {
+          path: ov.path,
+          text: overlay,
+          onText: editOverlay,
+          tools: {
+            ...tools,
+            kiln: true,
+            change: (make) => {
+              try {
+                editOverlay(make(overlay));
+              } catch (e) {
+                refusal(e);
+              }
+            },
+          },
+        }
+      : null;
+  const detail = (
+    <Detail key={`${at ?? "file"}|${event ?? ""}`} pane={p} line={line} text={text} onText={edit} own={own} editable={editable} ask={ask} tools={tools} rows={phone ? PHONE_ROWS : SIDE_ROWS} />
+  );
   // On a phone, the picked line's detail is right under it, as the approved stills draw it.
   const below = (k: Key) => (phone && k === at ? <li className="jp-detail">{detail}</li> : null);
   return (
@@ -1098,24 +1170,36 @@ const ADD_TRIGGER: ShipPipelineLine = { key: "add-trigger", kind: "add", name: "
 /** Which kinds Add a trigger lists: all, or what GitHub's or kiln's dialect says. */
 type Shown = "all" | "github" | "kiln";
 
-/** What the detail edits the file with (W29-R06): a change made in its text, a kind added, why something can't be. */
+/** What the detail edits the file with (W29-R06): a change made in its text, a schedule's field set, a kind added, why something can't be. */
 interface Tools {
   kiln: boolean;
   show: Shown;
+  /** A GitHub workflow with its overlay: kiln's own kinds are added there. */
+  overlaid: boolean;
+  /** The trigger keys the file and its overlay have. */
+  written: Set<string>;
   change: (make: (text: string) => string) => void;
+  setSchedule: (index: number, cron: string, field: string, value: string | boolean | null) => void;
   addKind: (k: TriggerKind) => void;
   say: (why: string) => void;
+}
+
+/** The file a picked line lives in where it isn't the pane's own: a GitHub workflow's overlay, for kiln's own triggers (W29-R06). */
+interface OwnFile {
+  path: string;
+  text: string;
+  onText: (t: string) => void;
+  tools: Tools;
 }
 
 /** A workflow file's stem (`ci` of `.github/workflows/ci.yml`), as its overlay is named. */
 const stemOf = (path: string) => (path.split("/").pop() ?? path).replace(/\.ya?ml$/, "");
 
-/** Why a kiln-only trigger isn't added to a GitHub workflow here (W29-R06: it goes in the workflow's overlay). */
-const overlayWhy = (path: string) => `kiln's own: a GitHub workflow keeps working on GitHub with it in .kiln/overlays/${stemOf(path)}.yaml, which drafts of more than one file write (W29-R08)`;
+/** Why a kiln-only trigger isn't added to a GitHub workflow whose overlay the pane wasn't given (W29-R06: it goes there). */
+const overlayWhy = (path: string) => `kiln's own: it goes in .kiln/overlays/${stemOf(path)}.yaml, so the workflow keeps working on GitHub, and this pane wasn't given that file`;
 
 /** Add a trigger (W29-R06): the 18 kinds in six groups, each GitHub's, kiln's or both; picking one adds its lines, a draft, and opens its filters. */
-function AddTrigger({ pane, text, tools }: { pane: ShipPipelinePane; text: string; tools: Tools }) {
-  const written = new Set(triggerKeys(text, tools.kiln).values());
+function AddTrigger({ pane, tools }: { pane: ShipPipelinePane; tools: Tools }) {
   const shown = TRIGGER_KINDS.filter((k) => tools.show === "all" || k.whose === "both" || k.whose === tools.show);
   return (
     <div className="ppl-kinds" aria-label="Add a trigger">
@@ -1130,8 +1214,9 @@ function AddTrigger({ pane, text, tools }: { pane: ShipPipelinePane; text: strin
             </div>
             <ul className="ppl-lines">
               {kinds.map((k) => {
-                const keys = tools.kiln ? k.kiln : k.gha;
-                const why = !keys ? overlayWhy(pane.head.path) : keys.some((key) => written.has(key)) ? `it has a ${k.words} trigger already: pick it in Triggers to change its filters` : null;
+                // In a GitHub workflow, kiln's own kinds go in its overlay.
+                const keys = (tools.kiln ? k.kiln : k.gha) ?? (tools.overlaid ? k.kiln : null);
+                const why = !keys ? overlayWhy(pane.head.path) : keys.some((key) => tools.written.has(key)) ? `it has a ${k.words} trigger already: pick it in Triggers to change its filters` : null;
                 return (
                   <li key={k.id} data-kind={k.id}>
                     <button type="button" className="ppl-kind" aria-disabled={why ? true : undefined} onClick={() => (why ? tools.say(why) : tools.addKind(k))}>
@@ -1157,21 +1242,24 @@ const FILTERS: Record<string, string[]> = {
   push: ["branches", "branches-ignore", "tags", "tags-ignore", "paths", "paths-ignore"],
   pull_request: ["types", "branches", "branches-ignore", "paths", "paths-ignore"],
   pull_request_review: ["types"],
-  review: ["types"],
+  review: ["states"],
   merge_group: ["types"],
   workflow_run: ["workflows", "types", "branches"],
   pipeline: ["name", "conclusion", "branches"],
   release: ["types"],
   registry_package: ["types"],
   repository_dispatch: ["types"],
-  diff: ["trunks", "paths", "drafts"],
+  diff: ["branches", "paths", "paths-ignore", "drafts", "authors"],
+  land: ["branches"],
   deploy: ["app", "environment", "states"],
   webhook: ["hook", "filter"],
-  comment: ["commands"],
+  comment: ["mentions", "commands"],
   agent: ["agents"],
 };
 /** Filters that are lists: written as words split by commas. */
-const LISTS = new Set(["branches", "branches-ignore", "tags", "tags-ignore", "paths", "paths-ignore", "types", "workflows", "conclusion", "trunks", "states", "commands", "agents"]);
+const LISTS = new Set(["branches", "branches-ignore", "tags", "tags-ignore", "paths", "paths-ignore", "types", "workflows", "conclusion", "states", "commands", "mentions", "agents", "authors"]);
+/** Filters that are switches, off until set (W03-R09's `drafts`). */
+const SWITCHES = new Set(["drafts"]);
 
 /** A trigger's value in the text, by its key (a mapping, or nothing under it). */
 function triggerValue(text: string, key: string): Record<string, unknown> {
@@ -1233,8 +1321,8 @@ function TriggerFilters({ text, line, tools }: { text: string; line: ShipPipelin
           return (
             <li key={f} data-field={f}>
               <span className="n">{f}</span>
-              {typeof v === "boolean" ? (
-                <Switch on={v} label={f} onSet={(on) => set(f, on)} />
+              {typeof v === "boolean" || (v === undefined && SWITCHES.has(f)) ? (
+                <Switch on={v === true} label={f} onSet={(on) => set(f, on || null)} />
               ) : v !== undefined && v !== null && typeof v === "object" && !Array.isArray(v) ? (
                 <span className="v">{Object.keys(v).join(", ")} · edit it in the YAML</span>
               ) : (
@@ -1280,12 +1368,13 @@ function fromNow(at: number): string {
 }
 
 /** A schedule's next runs, from W03's cron as the server reads them, and its options, each edited where it's shown (W29-R06, W03-R10). */
-function ScheduleTimes({ pane, text, tools, editable }: { pane: ShipPipelinePane; text: string; tools: Tools; editable: boolean }) {
-  const preview = useSuspenseResource(`ci/schedules/${pane.repo}/${pane.head.path}/${hashOf(text)}`, () =>
-    ci.preview({ repo: pane.repo, path: pane.head.path, content: text, event: "schedule" }),
+function ScheduleTimes({ pane, text, ask, tools, editable }: { pane: ShipPipelinePane; text: string; ask: PlanAsk; tools: Tools; editable: boolean }) {
+  const overlay = ask.overlay?.trim() ? ask.overlay : null;
+  const preview = useSuspenseResource(`ci/schedules/${pane.repo}/${pane.head.path}/${hashOf(text)}/${hashOf(overlay ?? "")}`, () =>
+    ci.preview({ repo: pane.repo, path: pane.head.path, content: text, ...(overlay ? { overlay } : {}), event: "schedule" }),
   ).data;
-  const set = (i: number, field: string, v: string | boolean | null) => tools.change((t) => setScheduleField(t, i, field, v));
   const schedules = preview.schedules ?? [];
+  const set = (i: number, field: string, v: string | boolean | null) => tools.setSchedule(i, schedules[i]?.cron ?? "", field, v);
   if (!schedules.length) return <p className="ppl-empty">{preview.why ?? "Its schedule can't be read yet: fix the YAML first."}</p>;
   return (
     <div className="ppl-times">
@@ -1416,6 +1505,7 @@ function Detail({
   line,
   text,
   onText,
+  own,
   editable,
   ask,
   tools,
@@ -1425,6 +1515,7 @@ function Detail({
   line: ShipPipelineLine | null;
   text: string;
   onText: (t: string) => void;
+  own: OwnFile | null;
   editable: boolean;
   ask: PlanAsk;
   tools: Tools;
@@ -1433,7 +1524,8 @@ function Detail({
   const views = viewsFor(pane, line);
   const [view, setView] = React.useState(views[0] ?? "YAML");
   const shown = views.includes(view) ? view : (views[0] ?? "YAML");
-  const name = line ? `${wordsOf(line).name || line.name} · ${pane.head.path}` : pane.head.path;
+  const file = own?.path ?? pane.head.path;
+  const name = line ? `${(wordsOf(line).name || line.name).replace(/ · in its overlay$|^in its overlay$/, "") || line.name} · ${file}` : file;
   return (
     <div className="ppl-detail">
       <div className="ppl-dhead">
@@ -1448,7 +1540,7 @@ function Detail({
       </div>
       <div className="ppl-dbody" style={{ "--rows": rows } as React.CSSProperties}>
         <Loadable label={`Loading ${shown}`} fallback={<Loading label={`Loading ${shown}`} block className="ppl-slot" />}>
-          <View view={shown} pane={pane} line={line} text={text} onText={onText} editable={editable} ask={ask} tools={tools} rows={rows} />
+          <View view={shown} pane={pane} line={line} text={text} onText={onText} own={own} editable={editable} ask={ask} tools={tools} rows={rows} />
         </Loadable>
       </div>
     </div>
@@ -1461,6 +1553,7 @@ function View({
   line,
   text,
   onText,
+  own,
   editable,
   ask,
   tools,
@@ -1471,6 +1564,7 @@ function View({
   line: ShipPipelineLine | null;
   text: string;
   onText: (t: string) => void;
+  own: OwnFile | null;
   editable: boolean;
   ask: PlanAsk;
   tools: Tools;
@@ -1479,6 +1573,13 @@ function View({
   const h = pane.head;
   switch (view) {
     case "YAML":
+      // A trigger the overlay holds: the overlay's lines, its own Problems.
+      if (own)
+        return editable ? (
+          <YamlView pane={pane} line={line} text={own.text} onText={own.onText} ask={ask} file={own.path} />
+        ) : (
+          <CodeView text={own.text} path={own.path} spot={line ? spotOf(own.text, line) : null} rows={rows} />
+        );
       return editable ? <YamlView pane={pane} line={line} text={text} onText={onText} ask={ask} /> : <CodeView text={text} path={h.path} spot={line ? spotOf(text, line) : null} rows={rows} />;
     case "Flow":
       return <FlowView repo={pane.repo} text={text} onChange={onText} />;
@@ -1490,11 +1591,11 @@ function View({
     case "Run":
       return <Lines lines={(pane.groups.find((g) => g.name === "Runs")?.lines ?? []).filter((l) => view === "Last run" || l.key === line?.key)} empty="No run yet on its default branch." />;
     case "Add a trigger":
-      return <AddTrigger pane={pane} text={text} tools={tools} />;
+      return <AddTrigger pane={pane} tools={tools} />;
     case "Times":
-      return line ? <ScheduleTimes pane={pane} text={text} tools={tools} editable={editable} /> : null;
+      return line ? <ScheduleTimes pane={pane} text={text} ask={ask} tools={tools} editable={editable} /> : null;
     case "Filters":
-      if (editable && line) return <TriggerFilters text={text} line={line} tools={tools} />;
+      if (editable && line) return <TriggerFilters text={own?.text ?? text} line={line} tools={own?.tools ?? tools} />;
       return (
         <Lines
           lines={(line?.value ?? "")
@@ -1535,21 +1636,22 @@ function offsetOf(text: string, at: { line: number; col: number }): number {
  * it's saved. Checked 300 ms after typing stops; its errors and warnings sit under it, each with its
  * fix, never in a popup.
  */
-function YamlView({ pane, line, text, onText, ask }: { pane: ShipPipelinePane; line: ShipPipelineLine | null; text: string; onText: (t: string) => void; ask: PlanAsk }) {
+function YamlView({ pane, line, text, onText, ask, file }: { pane: ShipPipelinePane; line: ShipPipelineLine | null; text: string; onText: (t: string) => void; ask: PlanAsk; file?: string }) {
   const h = pane.head;
   const syntax = syntaxOf(h);
   const [problems, setProblems] = React.useState<CiDiagnostic[]>([]);
   // The text's plan for the strip's event, with the base's when it differs: asked as the text is checked.
   const [plan, setPlan] = React.useState<{ now: PlanJob[]; was: PlanJob[] | null } | null>(null);
-  const workflow = ["workflow", "reusable"].includes(h.kind);
+  // Another file (a GitHub workflow's overlay) is checked as itself, and plans nothing of its own.
+  const workflow = ["workflow", "reusable"].includes(h.kind) && !file;
   const editor = React.useRef<Editor>(null);
   const lint = async (t: string): Promise<Diagnostic[]> => {
     if (syntax !== "workflow") return [];
     try {
       const [r, now, was] = await Promise.all([
-        ci.validate(fileOf(h), t, pane.repo),
-        workflow ? planOf(pane, t, ask.event).catch(() => null) : null,
-        workflow && ask.base !== null ? basePlanOf(pane, ask.base, ask.event).catch(() => null) : null,
+        ci.validate(file ?? fileOf(h), t, pane.repo),
+        workflow ? planOf(pane, t, ask.event, ask.overlay).catch(() => null) : null,
+        workflow && ask.base !== null ? basePlanOf(pane, ask.base, ask.event, ask.baseOverlay).catch(() => null) : null,
       ]);
       const shown = r.diagnostics.filter((d) => d.severity === "error" || d.severity === "warning");
       setProblems(shown);
@@ -1579,7 +1681,7 @@ function YamlView({ pane, line, text, onText, ask }: { pane: ShipPipelinePane; l
         value={text}
         onChange={onText}
         lint={lint}
-        label={`${h.path}, edited in place: typing starts a draft`}
+        label={`${file ?? h.path}, edited in place: typing starts a draft`}
         syntax={syntax}
         inline
         tint={line ? spotOf(text, line) : null}
@@ -1798,8 +1900,10 @@ function hashOf(text: string): string {
 /** The plan for the strip's event (W04-R29's preview of the text): each job, its legs and where they'd run; a draft's against what's published. */
 function PlanView({ pane, text, ask }: { pane: ShipPipelinePane; text: string; ask: PlanAsk }) {
   const key = `${pane.repo}/${pane.head.path}/${ask.event ?? ""}`;
-  const now = useSuspenseResource(`ci/plan-preview/${key}/${hashOf(text)}`, () => planOf(pane, text, ask.event)).data;
-  const was = useSuspenseResource(`ci/plan-base/${key}/${ask.base === null ? "-" : hashOf(ask.base)}`, () => (ask.base === null ? Promise.resolve(null) : basePlanOf(pane, ask.base, ask.event))).data;
+  const now = useSuspenseResource(`ci/plan-preview/${key}/${hashOf(text)}/${hashOf(ask.overlay ?? "")}`, () => planOf(pane, text, ask.event, ask.overlay)).data;
+  const was = useSuspenseResource(`ci/plan-base/${key}/${ask.base === null ? "-" : hashOf(ask.base)}/${hashOf(ask.baseOverlay ?? "")}`, () =>
+    ask.base === null ? Promise.resolve(null) : basePlanOf(pane, ask.base, ask.event, ask.baseOverlay),
+  ).data;
   if (!now.plan) return <p className="ppl-empty">{now.why ?? "It plans nothing for this event."}</p>;
   return <PlanList lines={planLines(jobsOf(now.plan), ask.base === null ? null : was?.plan ? jobsOf(was.plan) : [], pane.head.ref)} label={`Its plan for ${ask.words ?? "its event"}`} />;
 }

@@ -267,6 +267,16 @@ struct EditAsk {
     /// a branch of its own.
     #[serde(default)]
     draft: Option<bool>,
+    /// Saved with it in the draft: a GitHub workflow's overlay, where Flow writes kiln's own
+    /// triggers (W29-R06).
+    #[serde(default)]
+    files: Vec<FileAsk>,
+}
+
+#[derive(Deserialize)]
+struct FileAsk {
+    path: String,
+    text: String,
 }
 
 /// `POST /api/ci/repos/:repo/workflows/:path/edit { content, to?, branch?, title?, draft?,
@@ -285,6 +295,8 @@ struct EditAsk {
 /// host a draft change from a branch of its own (`kiln/draft/<stem>-<id8>`) whose commits say
 /// `[skip ci]`. A later save of the caller's draft of the file adds to it: a new version of the
 /// diff, or a new commit on the branch. Its answer says the draft as kiln records it (`draft`).
+/// A GitHub workflow's draft may carry its overlay (`files: [{ path, text }]`, W29-R06), checked
+/// as the workflow is.
 ///
 /// Each answer has the diagnostics, and the plan a push of it to the default branch makes (W20-R03).
 pub async fn edit(hub: &Arc<Hub>, caller: &Caller, repo_key: &str, path: &str, body: &Value) -> Result<Value, Fail> {
@@ -299,6 +311,20 @@ pub async fn edit(hub: &Arc<Hub>, caller: &Caller, repo_key: &str, path: &str, b
     if !errors.is_empty() {
         return Err((StatusCode::UNPROCESSABLE_ENTITY, format!("{file} has errors, so it isn't saved:\n{}", errors.join("\n"))));
     }
+    // Its overlay, saved beside it in the draft (W29-R06): only its own, each checked as it is.
+    let mut more = Vec::new();
+    for f in &ask.files {
+        let own = matches!((wf::file_kind(file), wf::file_kind(&f.path)), (Some(wf::FileKind::GhaWorkflow), Some(wf::FileKind::Overlay { stem })) if file.rsplit('/').next().and_then(|n| n.rsplit_once('.')).is_some_and(|(s, _)| s == stem));
+        if !own || ask.draft != Some(true) {
+            return Err(bad(format!("`files` carries a GitHub workflow's own overlay in its draft (.kiln/overlays/<its name>.yaml, with `draft`), not `{}`", f.path)));
+        }
+        let c = self::checked(hub, Some(&repo), &f.path, f.text.clone(), None).await?;
+        let errors: Vec<String> = c.diagnostics.iter().filter(|d| d.is_error()).map(|d| d.render(&f.path)).collect();
+        if !errors.is_empty() {
+            return Err((StatusCode::UNPROCESSABLE_ENTITY, format!("{} has errors, so it isn't saved:\n{}", f.path, errors.join("\n"))));
+        }
+        more.push((f.path.clone(), f.text.clone()));
+    }
     let host = crate::githost::for_repo(hub, &repo).await;
     let kiln = matches!(host, Some(crate::githost::GitHost::Kiln));
     let to = match ask.to.as_deref() {
@@ -311,7 +337,7 @@ pub async fn edit(hub: &Arc<Hub>, caller: &Caller, repo_key: &str, path: &str, b
     let title = ask.title.as_deref().map(str::trim).filter(|t| !t.is_empty()).map_or_else(|| format!("Edit {file}"), str::to_owned);
     let branch = ask.branch.as_deref().map(str::trim).filter(|b| !b.is_empty());
     let mut out = match (to, &host) {
-        _ if ask.draft == Some(true) => save_draft(hub, caller, &repo, host.as_ref(), to, (file, &ask.content), &[], &title, body).await?,
+        _ if ask.draft == Some(true) => save_draft(hub, caller, &repo, host.as_ref(), to, (file, &ask.content), &more, &title, body).await?,
         ("patch", _) => json!({ "patch": patch(hub, &repo, file, &ask.content).await? }),
         ("diff", Some(crate::githost::GitHost::Kiln)) => {
             let content = ask.content.clone();

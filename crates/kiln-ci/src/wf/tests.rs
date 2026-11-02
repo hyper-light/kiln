@@ -224,6 +224,34 @@ fn w02_ac05_overlays() {
     assert!(d.iter().any(|x| x.code == "KCI1010"), "overlays can't change GitHub keys: {d:?}");
 }
 
+/// W29-R06, S03: a GitHub workflow's kiln-only triggers live in its overlay, so the file keeps
+/// working on GitHub (W02-R07, W03-R09). Its events join the workflow's triggers, and a schedule
+/// gives its kiln keys to the workflow's entry with the same cron.
+#[test]
+fn w29_r06_an_overlay_adds_kilns_own_triggers() {
+    let (wf, d) = gha("on:\n  push:\n    branches: [main]\n  schedule:\n    - cron: \"0 3 * * *\"\njobs:\n  build:\n    runs-on: ubuntu-latest\n    steps:\n      - run: make\n");
+    assert!(errors(&d).is_empty(), "{:?}", errors(&d));
+    let mut wf = wf.unwrap_or_default();
+    let ov = "on:\n  diff:\n    branches: [main]\n    authors: [human]\n  schedule:\n    - cron: \"0 3 * * *\"\n      timezone: America/Los_Angeles\n      skip-if-unchanged: true\n    - cron: \"0 4 * * *\"\n      timezone: UTC\n";
+    let (ov, d) = parse_overlay(ov);
+    assert!(d.is_empty(), "{d:?}");
+    let d = apply_overlay(&mut wf, &ov.unwrap_or_default());
+    assert_eq!(codes(&d), ["KCI4010"], "a schedule the workflow doesn't have: {d:?}");
+    assert_eq!(wf.on.iter().map(|t| t.event.as_str()).collect::<Vec<_>>(), ["push", "schedule", "diff"]);
+    let s = wf.trigger("schedule").and_then(|t| t.schedules.first()).cloned().unwrap_or_default();
+    assert_eq!((s.cron.as_str(), s.timezone.as_deref(), s.skip_if_unchanged), ("0 3 * * *", Some("America/Los_Angeles"), true));
+    // It runs on a diff as a kiln workflow's `diff` does.
+    let diff = |kind: &str| crate::trigger::Event { name: "diff".into(), base_ref: Some("main".into()), payload: serde_json::json!({"kiln": {"diff": {"author_kind": kind, "draft": false}}}), ..Default::default() };
+    assert!(crate::trigger::matches(&wf, &diff("human")).is_ok());
+    assert!(crate::trigger::matches(&wf, &diff("agent")).is_err());
+    // GitHub's events stay in the workflow, where GitHub runs them too; kiln's `manual` is one.
+    let (_, d) = parse_overlay("on:\n  pull_request:\n    branches: [main]\n  manual: {}\n");
+    assert_eq!(codes(&d), ["KCI1010", "KCI1010"], "{d:?}");
+    // A kiln event's filters are its own.
+    let (_, d) = parse_overlay("on:\n  diff:\n    trunks: [main]\n");
+    assert!(d.iter().any(Diag::is_error), "{d:?}");
+}
+
 /// W05-R03: a GitHub workflow's job says what it needs through its overlay (kiln's own keys, in
 /// `.kiln/overlays/`), and the scheduler reads it as it reads the kiln dialect's (`sched::needs`).
 #[test]
