@@ -344,6 +344,10 @@ pub static ROUTES: &[Rule] = &[
     r("GET", "/api/me/passkeys", SIGNED_IN, At::Server),
     r("POST", "/api/me/passkeys", SIGNED_IN, At::Server),
     r("POST", "/api/me/identity", SIGNED_IN, At::Server),
+    // W27-R03: the SSH keys one signs commits with.
+    r("GET", "/api/me/ssh-signers", SIGNED_IN, At::Server),
+    r("POST", "/api/me/ssh-signers", SIGNED_IN, At::Server),
+    r("DELETE", "/api/me/ssh-signers", SIGNED_IN, At::Server),
     r("POST", "/api/me/passkeys/options", SIGNED_IN, At::Server),
     r("DELETE", "/api/me/passkeys/*", SIGNED_IN, At::Server),
     r("GET", "/api/me/password", SIGNED_IN, At::Server),
@@ -377,12 +381,18 @@ pub static ROUTES: &[Rule] = &[
     r("POST", "/api/diffs/*/abandon", "diffs.submit", At::Diff(2)),
     r("POST", "/api/diffs/*/reclaim", "diffs.submit", At::Diff(2)),
     r("POST", "/api/diffs/*/commandeer", "diffs.submit", At::Diff(2)),
+    // A change given and taken, a review request passed on and taken, signed (W27-R08).
+    r("POST", "/api/diffs/*/give", "diffs.submit", At::Diff(2)),
+    r("POST", "/api/diffs/*/take", "diffs.submit", At::Diff(2)),
+    r("POST", "/api/diffs/*/reviewers/pass", "diffs.review", At::Diff(2)),
+    r("POST", "/api/diffs/*/reviewers/take", "diffs.review", At::Diff(2)),
     r("PATCH", "/api/diffs/*", "diffs.submit", At::Diff(2)),
     r("POST", "/api/diffs/*/labels", "diffs.review", At::Diff(2)),
     r("DELETE", "/api/diffs/*/labels/*", "diffs.review", At::Diff(2)),
     r("GET", "/api/stacks/*", "diffs.read", At::Stack(2)),
     r("POST", "/api/diffs/*/comments", "diffs.review", At::Diff(2)),
     r("POST", "/api/diffs/*/review", "diffs.review", At::Diff(2)),
+    r("POST", "/api/diffs/*/statement", "diffs.review", At::Diff(2)),
     r("POST", "/api/diffs/*/viewed", "diffs.read", At::Diff(2)),
     r("POST", "/api/diffs/*/land", "diffs.land", At::Diff(2)),
     // Conflicts resolved where they fall, then committed as a revision (W26-R12): code, as Apply is.
@@ -390,6 +400,7 @@ pub static ROUTES: &[Rule] = &[
     r("POST", "/api/diffs/*/conflicts/*/resolution", "diffs.submit", At::Diff(2)),
     r("DELETE", "/api/diffs/*/conflicts/*/resolution", "diffs.submit", At::Diff(2)),
     r("PATCH", "/api/comments/*", "diffs.review", At::Comment(2)),
+    r("POST", "/api/comments/*/statement", "diffs.review", At::Comment(2)),
     r("DELETE", "/api/comments/*", "diffs.review", At::Comment(2)),
     r("POST", "/api/comments/*/apply", "diffs.submit", At::Comment(2)),
     r("POST", "/api/repos/*/submit", "diffs.submit", At::Repo(2)),
@@ -397,6 +408,7 @@ pub static ROUTES: &[Rule] = &[
     // The caller's own notifications, marked read (W19-R06).
     r("POST", "/api/review/inbox/read", "diffs.read", At::Anywhere),
     r("GET", "/api/repos/*/queue", "diffs.read", At::Repo(2)),
+    r("GET", "/api/repos/*/lands/*", "diffs.read", At::Repo(2)),
     // A host's changes into its host's own queue (docs/ci.md W28-R109): landing them.
     r("POST", "/api/repos/*/queue", "diffs.land", At::Repo(2)),
     r("DELETE", "/api/queue/*", "queue.manage", At::Entry(2)),
@@ -647,6 +659,22 @@ pub static ROUTES: &[Rule] = &[
     r("GET", "/api/identities/revocations", "runners.read", At::Server),
     r("GET", "/api/identities", "runners.read", At::Server),
     r("POST", "/api/identities/revoke", "settings.manage", At::Server),
+    // Custody of what changes hands (W27-R08): a signed record taken from anyone signed in (its
+    // signature says who it's from); chains, breaks and refusals read by those who read the audit.
+    r("GET", "/api/trail/checkpoints", "audit.read", At::Server),
+    r("GET", "/api/trail/log/**", "audit.read", At::Server),
+    r("GET", "/api/trail/anchors", "audit.read", At::Server),
+    r("POST", "/api/trail/checkpoints", "settings.manage", At::Server),
+    r("GET", "/api/trail", "audit.read", At::Server),
+    // kiln verify (W27-R10): a chain walked back over the trail, read as the audit is.
+    r("GET", "/api/verify", "audit.read", At::Server),
+    r("GET", "/api/verify/export", "audit.read", At::Server),
+    r("POST", "/api/verify/vsa", "audit.read", At::Server),
+    r("POST", "/api/custody", SIGNED_IN, At::Server),
+    r("GET", "/api/custody/breaks", "audit.read", At::Server),
+    r("GET", "/api/custody", "audit.read", At::Server),
+    r("GET", "/api/transfers/refused", "audit.read", At::Server),
+    r("GET", "/api/transfers/unsigned", "audit.read", At::Server),
     r("GET", "/api/machines/*/dirs", "runners.terminal", At::Runner(2)),
     any("/api/terminal/**", "runners.terminal", At::Server),
     r("GET", "/api/updates", "runners.read", At::Server),

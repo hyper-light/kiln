@@ -221,6 +221,13 @@ impl Commands {
         self.peers.get(&peer).is_some_and(|p| p.up)
     }
 
+    /// Whether runner process `peer` is away: its link is down, and it isn't connecting. One whose
+    /// link is back but hasn't said yet what it has isn't (its commands go once it has), as a live
+    /// command to it isn't refused ([`Commands::push`]).
+    pub fn is_away(&self, peer: PeerId) -> bool {
+        self.peers.get(&peer).is_none_or(|p| !p.link && p.coming.is_none())
+    }
+
     /// Runner process `peer` keeps the channel, on a link that just came up: its commands go on
     /// it from now on, once it says what it has (a live one sent meanwhile waits for that, rather
     /// than being refused as if its runner were away). A link the server took for up went without
@@ -509,7 +516,7 @@ mod tests {
                         }
                         Stand::Current => {}
                     }
-                    match self.rx.on_item(&stream, seq, low, body) {
+                    match self.rx.on_item(&stream, seq, low, body, Instant::now()) {
                         Arrival::Take(body) => {
                             if refuse(&body) {
                                 back.push(self.rx.refused(&stream, seq, Refusal::Unknown, "no such leg"));
@@ -578,6 +585,7 @@ mod tests {
         let mut r = Runner::new();
         c.connected(1);
         c.down(1);
+        assert!(c.is_away(1), "its link is down");
         // Away (its link down): the live command ends at once, the parked one waits.
         let mut keys = c.push(1, Kind::Live, b"keys".to_vec(), base);
         assert!(matches!(answer(&mut keys), Some(Answer::Unreachable { .. })));
@@ -585,6 +593,9 @@ mod tests {
         assert!(c.poll(base).is_empty(), "nothing goes while it's away");
         c.connected(1);
         assert!(c.poll(base).is_empty(), "nothing goes before the runner says what it has");
+        // Back, before it says what it has: not away (a parked command sent now is answered by the
+        // runner, not as parked), though nothing goes yet.
+        assert!(!c.is_away(1) && !c.is_up(1));
         c.on_frame(1, r.rx.have());
         for a in r.deliver(c.poll(t(base, 10)), |_| false) {
             c.on_frame(1, a);

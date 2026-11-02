@@ -30,6 +30,12 @@ toml = "1.1.8"
 # backend the kiln crate's CA uses.
 x509-parser = { version = "0.18.1", features = ["verify-aws"] }
 aws-lc-rs = "1.18.2"
+# Commits' x509 signatures as git and gpgsm carry them (W27-R03): CMS signed data, on the same
+# RustCrypto encoders x509-cert brings.
+cms = { version = "0.2", default-features = false, features = ["std"] }
+der = { version = "0.7", features = ["alloc", "oid"] }
+x509-cert = "0.2"
+const-oid = { version = "0.9", features = ["db"] }
 
 [dev-dependencies]
 anyhow = "1.0.104"

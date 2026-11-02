@@ -213,12 +213,14 @@ const PLAN_TOOLS: &[&str] = &["plans.list", "plans.get", "plans.create", "plans.
 const CI_TOOLS: &[&str] = &["experiments.suggest"];
 
 /// kiln's operations an agent has as tools of its own (`agents_start`, `goals_plan`, `plans_run`,
-/// …): `agents.*`, `goals.*` but a stack's settings, most of `plans.*`, and `research.*`. The server says which
-/// ([`runner_ask`]'s registry answer), so its agents' MCP servers offer what it has, however old
-/// their runner: a deploy reaches the agents at work.
+/// …): `agents.*` but its credential, `goals.*` but a stack's settings, most of `plans.*`, and
+/// `research.*`. The server says which ([`runner_ask`]'s registry answer), so its agents' MCP
+/// servers offer what it has, however old their runner: a deploy reaches the agents at work.
 pub fn agent_ops() -> Vec<crate::ops::Op> {
     crate::harness::ops::list_ops()
         .into_iter()
+        // Its credential is its git's, which its runner asks for: not a token to show in its conversation.
+        .filter(|o| o.name != "agents.credential")
         // Whether a stack plans its big goals first is the person's to say, not its agent's.
         .chain(crate::goals::ops::list_ops().into_iter().filter(|o| o.name != "goals.settings"))
         .chain(crate::plans::ops::list_ops().into_iter().filter(|o| PLAN_TOOLS.contains(&o.name)))
@@ -229,12 +231,15 @@ pub fn agent_ops() -> Vec<crate::ops::Op> {
 /// What a runner asks for one of its agent sessions' MCP server (`kiln reach mcp`, whose code
 /// mode runs on the runner, `crate::reach::mcp`): the operations (`registry`), one run (`call`), a
 /// page it shows or streams (`page`, `stream`: `crate::harness::visuals::ask`,
-/// `crate::harness::streams::ask`), or word of a message from its agent it couldn't read
-/// (`unread`, `runner_unread`). The session must be one kiln knows on that runner, which
-/// mustn't be a job's; it acts for whoever started it (the owner on a kiln nobody else signs in
-/// to), audited as `agent:<session>@<runner> for <them>`. The answer: `{"registry", "skills"}`,
-/// `{"ok": <answer>}`, or `{"error", "status"?}`.
-pub async fn runner_ask(hub: &Arc<Hub>, runner: &str, ask: &crate::reach::Question) -> Value {
+/// `crate::harness::streams::ask`), an act it asks kiln to take before it does it (`act`), or word
+/// of a message from its agent it couldn't read (`unread`, `runner_unread`). The session must be one
+/// kiln knows on that runner, which mustn't be a job's; it acts for whoever started it (the owner on
+/// a kiln nobody else signs in to), audited as `agent:<session>@<runner> for <them>`. The answer:
+/// `{"registry", "skills"}`, `{"ok": <answer>}`, or `{"error", "status"?}`. An act (all but the
+/// registry) counts only from the session's holder now, signed so once kiln has certified one
+/// (`crate::custody::act_counts`, docs/ci.md W27-R08), checked over `raw`, the ask as it came; a copy
+/// left behind is refused, and told to let go of the session, which went on elsewhere.
+pub async fn runner_ask(hub: &Arc<Hub>, runner: &str, peer: crate::instances::PeerId, ask: &crate::reach::Question, raw: &Value) -> Value {
     use crate::reach::Question;
     if hub.agents.lock().get(runner).is_none_or(|a| a.ephemeral || a.outpost) {
         return json!({"error": "kiln's operations are for its agents' runners, not a job's"});
@@ -244,7 +249,7 @@ pub async fn runner_ask(hub: &Arc<Hub>, runner: &str, ask: &crate::reach::Questi
         // Noted whoever started the session (`runner_unread`).
         Question::Unread { session, what, code, why } => return runner_unread(hub, runner, session, what, *code, why).await,
         Question::Registry { session, terminal } | Question::Call { session, terminal, .. } => (session.as_str(), terminal.as_str()),
-        Question::Page { session, .. } | Question::Stream { session, .. } => (session.as_str(), ""),
+        Question::Page { session, .. } | Question::Stream { session, .. } | Question::Act { session, .. } => (session.as_str(), ""),
         // The hub answers these itself (`Hub::on_read`).
         Question::Keep { .. } | Question::Holds { .. } | Question::Holders { .. } => return json!({"error": "not a question for kiln's operations"}),
     };
@@ -252,10 +257,67 @@ pub async fn runner_ask(hub: &Arc<Hub>, runner: &str, ask: &crate::reach::Questi
     let caller = if session.is_empty() && !terminal.is_empty() && matches!(ask, Question::Call { .. }) {
         terminal_caller(hub, terminal, Some(runner)).await
     } else if session.is_empty() || !hub.harness.located_on(session, runner) {
-        return json!({"error": format!("kiln knows no agent session {session:?} on {runner}: its operations are for the agents it runs")});
+        let why = format!("kiln knows no agent session {session:?} on {runner}: its operations are for the agents it runs");
+        // A copy left behind of a session that went on elsewhere: its act refused and recorded,
+        // answered with why, and it's told to let go now, at its runner's first word since
+        // (W27-R08).
+        if !session.is_empty() && hub.harness.info(session).is_some() {
+            let mut answer = json!({"error": why});
+            if !matches!(ask, Question::Registry { .. }) {
+                let instance = hub.instances.lock().get(peer).map_or_else(|| "legacy".to_owned(), crate::instances::Instance::label);
+                let left = format!("session {session} went on elsewhere: this is a copy left behind on {runner}");
+                match crate::custody::refused_act(hub, runner, &instance, session, raw, &left, crate::util::now_unix()).await {
+                    Ok(why) => answer = json!({"error": format!("refused: {why}"), "status": 403}),
+                    Err(e) => tracing::warn!(target: "kiln.custody", %session, error = %format!("{e:#}"), "a refused act couldn't be recorded"),
+                }
+            }
+            let_go(hub, runner, peer, session).await;
+            return answer;
+        }
+        // A session kiln ended as the work it held went on to another (a plan's step tried again
+        // with another agent), still running where kiln couldn't end it: what it says is refused
+        // and recorded, and its runner told to close it (W27-R08).
+        if !session.is_empty()
+            && !matches!(ask, Question::Registry { .. })
+            && let Ok(Some((transfer, work, to))) = crate::custody::work_taken_from(&hub.store, session).await
+        {
+            let instance = hub.instances.lock().get(peer).map_or_else(|| "legacy".to_owned(), crate::instances::Instance::label);
+            let left = format!("agent session {session} no longer holds {work}: kiln took it for this agent and handed it to {to} (transfer {transfer})");
+            let answer = match crate::custody::refused_work_act(hub, runner, &instance, session, raw, &left, &transfer, crate::util::now_unix()).await {
+                Ok(why) => json!({"error": format!("refused: {why}"), "status": 403}),
+                Err(e) => {
+                    tracing::warn!(target: "kiln.custody", %session, error = %format!("{e:#}"), "a refused act couldn't be recorded");
+                    json!({"error": left, "status": 403})
+                }
+            };
+            let _ = hub.command_peers(runner, vec![peer], &crate::proto::ServerMsg::HarnessClose { session: session.to_owned() }).await;
+            return answer;
+        }
+        return json!({"error": why});
     } else {
         session_caller(hub, session, Some(runner)).await
     };
+    if !session.is_empty() && !matches!(ask, Question::Registry { .. }) {
+        let (instance, signs) = hub.instances.lock().get(peer).map(|i| (i.label(), (u64::from(i.caps) | i.wide) & crate::proto::CAP_CUSTODY != 0)).unwrap_or_else(|| ("legacy".to_owned(), false));
+        match crate::custody::act_counts(hub, runner, &instance, signs, session, raw, crate::util::now_unix()).await {
+            Ok(Ok(())) => {}
+            Ok(Err(why)) => {
+                tracing::info!(target: "kiln.custody", %session, %runner, %instance, %why, "an agent session's act refused: not its holder's now");
+                return json!({"error": format!("refused: {why}"), "status": 403});
+            }
+            Err(e) => return json!({"error": format!("whether the act counts couldn't be told: {e:#}"), "status": 503}),
+        }
+        // A plan step's goal said met by an agent that no longer holds the step (tried again with
+        // another, or taken over by a person): refused and recorded (W27-R08).
+        if let Question::Call { name, input, .. } = ask
+            && name == "goals.done"
+            && let Some((left, transfer)) = crate::plans::agents::step_left(hub, session, input).await
+        {
+            let why = crate::custody::refused_work_act(hub, runner, &instance, session, raw, &left, &transfer, crate::util::now_unix()).await.unwrap_or(left);
+            tracing::info!(target: "kiln.custody", %session, %runner, %why, "a plan step's goal said met by an agent that no longer holds it: refused");
+            return json!({"error": format!("refused: {why}"), "status": 403});
+        }
+    }
     let caller = match caller {
         Ok(c) => c,
         Err(e) => return json!({"error": e}),
@@ -277,7 +339,17 @@ pub async fn runner_ask(hub: &Arc<Hub>, runner: &str, ask: &crate::reach::Questi
                 a
             }
             None => match crate::ops::call(crate::ops::Cx { hub: Arc::clone(hub), caller }, name, input.clone()).await {
-                Ok(v) => json!({"ok": v}),
+                Ok(v) => {
+                    // Subagents started for a task the agent handed on signed: kiln passes it on
+                    // to each, signed for as each takes it up (W27-R08).
+                    if name == "agents.start"
+                        && let Some(hand_on) = raw.get("hand_on").and_then(Value::as_str).and_then(|h| serde_json::from_str::<Value>(h).ok())
+                    {
+                        let children: Vec<String> = v.get("agents").and_then(Value::as_array).into_iter().flatten().filter_map(|a| a.get("id").and_then(Value::as_str).map(str::to_owned)).collect();
+                        crate::custody::subagents_handed(hub, &format!("runner {runner}"), &hand_on, &children).await;
+                    }
+                    json!({"ok": v})
+                }
                 Err((status, msg)) => json!({"error": msg, "status": status.as_u16()}),
             },
         },
@@ -311,6 +383,9 @@ pub async fn runner_ask(hub: &Arc<Hub>, runner: &str, ask: &crate::reach::Questi
                 Err(e) => json!({"error": format!("{e:#}")}),
             }
         }
+        // An act its runner asks kiln to take before it does it (a run on another machine):
+        // taken above, as the session's holder's now (W27-R08).
+        Question::Act { .. } => json!({"ok": {}}),
         Question::Directory => json!({ "runners": hub.reach_directory() }),
         Question::Unread { session, what, code, why } => runner_unread(hub, runner, session, what, *code, why).await,
         Question::Keep { .. } | Question::Holds { .. } | Question::Holders { .. } => json!({"error": "not a question for kiln's operations"}),
@@ -320,6 +395,16 @@ pub async fn runner_ask(hub: &Arc<Hub>, runner: &str, ask: &crate::reach::Questi
         return json!({"error": format!("the answer is {size} bytes, more than the {RUNNER_ANSWER_MAX} a runner is sent: filter or page on the server")});
     }
     answer
+}
+
+/// Runner process `peer` of `runner` holds a copy of agent session `session`, which went on
+/// elsewhere: it lets go of it (a runner from before letting go stops it), as it would on its
+/// announcing it (W27-R08: at its runner's first word, whatever that is).
+pub async fn let_go(hub: &Hub, runner: &str, peer: crate::instances::PeerId, session: &str) {
+    let lets_go = hub.instances.lock().get(peer).is_some_and(|i| i.caps & crate::proto::CAP_CONVO != 0);
+    let msg = if lets_go { crate::proto::ServerMsg::HarnessRelease { session: session.to_owned() } } else { crate::proto::ServerMsg::HarnessClose { session: session.to_owned() } };
+    tracing::info!(target: "kiln.custody", %runner, peer, %session, "a copy of an agent session that went on elsewhere: its runner is told to let go of it");
+    let _ = hub.command_peers(runner, vec![peer], &msg).await;
 }
 
 /// Word from an agent session's MCP server on `runner` (`crate::reach::mcp`) of a message its
@@ -1187,12 +1272,12 @@ mod tests {
             }
             hub.harness.ingest(&hub, &crate::harness::registry::Location::Machine("box".into()), "s1", open("s1"));
             let unread = Question::Unread { session: "s1".into(), what: "tools/call teleport".into(), code: Code::Unknown, why: "Unknown tool: teleport".into() };
-            let a = runner_ask(&hub, "box", &unread).await;
+            let a = runner_ask(&hub, "box", 0, &unread, &serde_json::to_value(&unread)?).await;
             anyhow::ensure!(a.get("ok").is_some(), "{a}");
-            let elsewhere = runner_ask(&hub, "mac", &unread).await;
+            let elsewhere = runner_ask(&hub, "mac", 0, &unread, &serde_json::to_value(&unread)?).await;
             anyhow::ensure!(elsewhere.get("error").is_some(), "{elsewhere}");
-            let call = Question::Call { session: "s1".into(), terminal: String::new(), name: "goals.add".into(), input: json!({"golas": ["x"]}) };
-            let a = runner_ask(&hub, "box", &call).await;
+            let call = Question::Call { session: "s1".into(), terminal: String::new(), name: "goals.add".into(), input: json!({"golas": ["x"]}), act: None, hand_on: None };
+            let a = runner_ask(&hub, "box", 0, &call, &serde_json::to_value(&call)?).await;
             anyhow::ensure!(a.get("code") == Some(&json!("unknown_field")) && a.get("path") == Some(&json!("/golas")) && a.get("status") == Some(&json!(400)), "{a}");
             let session = hub.harness.list().into_iter().find(|i| i.id == "s1").and_then(|i| i.refused);
             anyhow::ensure!(session.as_ref().map(Kept::total) == Some(2), "the session's page: {session:?}");

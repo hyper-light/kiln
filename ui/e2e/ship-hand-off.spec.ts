@@ -28,6 +28,8 @@ test("a person's failure goes to the agent attached to it, and its row says who 
 
     await row.getByRole("button", { name: "Hand off" }).click();
     await expect(row).toContainText("ci-doctor fixing · assertion failed in raft::lease", { timeout: 15_000 });
+    // Handed off from this browser, which has no key: kiln signed it for them, and says so (W27-R08).
+    await expect(page.getByText("kiln signed the hand-off for you: this browser has no key.")).toBeVisible();
     await expect(row.getByRole("button", { name: "Hand off" })).toHaveCount(0);
     await expect(row.getByRole("button", { name: "Retry" })).toBeVisible();
     expect((await row.boundingBox())?.height ?? 0).toBe(before);

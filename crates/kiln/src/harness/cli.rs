@@ -111,15 +111,20 @@ fn shell() -> Option<String> {
 }
 
 #[cfg(unix)]
-fn request(req: &Request) -> anyhow::Result<Value> {
+pub(crate) fn request(req: &Request) -> anyhow::Result<Value> {
     request_for(req, std::time::Duration::from_secs(30))
 }
 
 /// A request whose answer may take up to `wait` (a wait for agents).
 #[cfg(unix)]
 fn request_for(req: &Request, wait: std::time::Duration) -> anyhow::Result<Value> {
-    let path = socket()?;
-    let mut s = std::os::unix::net::UnixStream::connect(&path).map_err(|e| anyhow::anyhow!("cannot reach kiln at {}: {e}", path.display()))?;
+    request_at(&socket()?, req, wait)
+}
+
+/// [`request_for`], to the socket at `path`.
+#[cfg(unix)]
+fn request_at(path: &std::path::Path, req: &Request, wait: std::time::Duration) -> anyhow::Result<Value> {
+    let mut s = std::os::unix::net::UnixStream::connect(path).map_err(|e| anyhow::anyhow!("cannot reach kiln at {}: {e}", path.display()))?;
     s.set_read_timeout(Some(wait))?;
     let mut line = serde_json::to_vec(req)?;
     line.push(b'\n');
@@ -134,8 +139,80 @@ fn request_for(req: &Request, wait: std::time::Duration) -> anyhow::Result<Value
 }
 
 #[cfg(not(unix))]
-fn request(_req: &Request) -> anyhow::Result<Value> {
+pub(crate) fn request(_req: &Request) -> anyhow::Result<Value> {
     anyhow::bail!("kiln spawn is not available on Windows yet")
+}
+
+/// `kiln harness-hook`: a harness's hook before each of its tool calls (Codex's, given by kiln as
+/// it starts it: `codex::hook_args`; Antigravity's, in its hooks.json: `antigravity::hooks_with`).
+#[derive(clap::Args, Debug)]
+pub struct HarnessHookArgs {
+    /// The harness socket of the runner the session is on (none: the one the harness was given,
+    /// `KILN_HARNESS_SOCK`).
+    #[arg(long)]
+    pub sock: Option<std::path::PathBuf>,
+    /// Antigravity's hook, for this event of its (`antigravity::HOOK_EVENTS`): agy names none in
+    /// its input, and takes an answer of its own form even when kiln holds nothing.
+    #[arg(long)]
+    pub agy: Option<String>,
+}
+
+/// The hook's input (stdin) goes to the session it runs in, told by its process, and the session's
+/// answer is printed once it gives it: a call a person holds waits for them, up to a week. What goes
+/// wrong lets the call go (nothing printed): a kiln that can't be reached holds nothing.
+/// Antigravity's is told its event and its conversation's tokens so far, and gets its own pass
+/// (`antigravity::hook_pass`) when kiln has no answer, as when agy runs outside kiln.
+#[cfg(unix)]
+pub fn harness_hook(a: HarnessHookArgs) -> anyhow::Result<()> {
+    let pass = || {
+        if let Some(ev) = &a.agy {
+            println!("{}", super::antigravity::hook_pass(ev));
+        }
+    };
+    let mut input = String::new();
+    if let Err(e) = std::io::Read::read_to_string(&mut std::io::stdin(), &mut input) {
+        eprintln!("kiln: the hook's input was unreadable: {e}");
+        pass();
+        return Ok(());
+    }
+    let mut input = serde_json::from_str(&input).unwrap_or(Value::Null);
+    let Some(sock) = a.sock.clone().or_else(|| std::env::var_os("KILN_HARNESS_SOCK").map(std::path::PathBuf::from)) else {
+        pass();
+        return Ok(());
+    };
+    if let Some(ev) = &a.agy {
+        let transcript = input.get("transcriptPath").and_then(Value::as_str).and_then(|p| read_small(std::path::Path::new(p)));
+        input = super::antigravity::hook_input(input, ev, transcript.as_deref());
+    }
+    match request_at(&sock, &Request::Hook { input }, std::time::Duration::from_secs(8 * 24 * 3600)) {
+        Ok(v) => match v.get("answer").filter(|a| a.as_object().is_some_and(|o| !o.is_empty())) {
+            Some(answer) => println!("{answer}"),
+            None => pass(),
+        },
+        Err(e) => {
+            eprintln!("kiln: {e:#}");
+            pass();
+        }
+    }
+    Ok(())
+}
+
+/// A file's text, unless it's past 64 MiB (a transcript too long to count). Read whole on each of
+/// the hook's calls (every tool call and model call of the conversation): fine for transcripts as
+/// agy keeps them, a cost that grows with a long one.
+#[cfg(unix)]
+fn read_small(path: &std::path::Path) -> Option<String> {
+    let len = std::fs::metadata(path).ok()?.len();
+    (len <= 64 << 20).then(|| std::fs::read_to_string(path).ok()).flatten()
+}
+
+/// No harness socket on Windows yet: nothing of kiln's holds the call.
+#[cfg(not(unix))]
+pub fn harness_hook(a: HarnessHookArgs) -> anyhow::Result<()> {
+    if let Some(ev) = &a.agy {
+        println!("{}", super::antigravity::hook_pass(ev));
+    }
+    Ok(())
 }
 
 #[cfg(not(unix))]

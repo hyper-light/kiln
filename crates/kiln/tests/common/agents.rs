@@ -70,6 +70,7 @@ pub fn runner_env(dir: &Path, port: u16, name: &str, chaos: Option<&str>, talk: 
         // Git's global configuration its home's, as a server's is (`common::server_command`).
         .env_remove("GIT_CONFIG_GLOBAL")
         .env("NO_COLOR", "1")
+        .env(super::WARM_FLOOR.0, super::WARM_FLOOR.1)
         .env("FAKE_CLAUDE_LINES", talk.lines.to_string())
         .env("FAKE_CLAUDE_EVERY_MS", talk.every_ms.to_string())
         .envs(env.iter().copied())
@@ -111,6 +112,26 @@ pub fn connected(port: u16, admin: &str, name: &str, log: &Path, within: Duratio
         }
         anyhow::ensure!(Instant::now() < deadline, "runner {name} never connected: {body}\n{}", std::fs::read_to_string(log).unwrap_or_default());
         std::thread::sleep(Duration::from_millis(300));
+    }
+}
+
+/// Turns runner `name`'s headroom off (docs/headroom.md) and waits until it says it applied that.
+/// A test's runner shares the machine running the tests: a disk the rest of them slowed would have
+/// it hold its sessions' turns and pace their harnesses down to nothing, though nothing the test
+/// looks at is wrong (as `common::start_once` keeps the scheduler's headroom out of a test).
+pub fn headroom_off(port: u16, admin: &str, name: &str, within: Duration) -> anyhow::Result<()> {
+    let path = format!("/api/runners/{name}/headroom");
+    let (st, body) = super::http(port, "PUT", &path, admin, Some(&json!({ "enabled": false })))?;
+    anyhow::ensure!(st == 200, "{name}'s headroom off: {st} {body}");
+    let deadline = Instant::now() + within;
+    loop {
+        let (_, body) = super::http(port, "GET", &path, admin, None)?;
+        let v: Value = serde_json::from_str(&body).unwrap_or_default();
+        if v.get("applied").and_then(Value::as_bool) == Some(true) {
+            return Ok(());
+        }
+        anyhow::ensure!(Instant::now() < deadline, "{name} didn't say it applied its headroom off: {body}");
+        std::thread::sleep(Duration::from_millis(200));
     }
 }
 

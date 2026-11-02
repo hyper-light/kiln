@@ -1226,8 +1226,8 @@ async fn author(hub: &Hub, path: &str, commit: &str) -> anyhow::Result<(String, 
     Ok((f.next().unwrap_or_default().to_owned(), f.next().unwrap_or_default().to_owned(), f.next().unwrap_or_default().to_owned()))
 }
 
-/// A commit of `tree` on `parents`, by `who` (committed by kiln, signed when
-/// `[ci.land_signing]` says so), saying `message`.
+/// A commit of `tree` on `parents`, by `who`, committed and signed by kiln (W27-R03: as kiln's
+/// server; with `[ci.land_signing]`'s key instead when it names one), saying `message`.
 async fn commit_tree(hub: &Hub, path: &str, tree: &str, parents: &[&str], who: &(String, String, String), message: &str) -> anyhow::Result<String> {
     let signing = hub.cfg.ci.land_signing.as_ref().filter(|s| !s.key.is_empty());
     let (fmt, key) = signing.map(|s| (format!("gpg.format={}", s.format.as_deref().unwrap_or("ssh")), format!("user.signingkey={}", s.key))).unwrap_or_default();
@@ -1239,14 +1239,22 @@ async fn commit_tree(hub: &Hub, path: &str, tree: &str, parents: &[&str], who: &
     for p in parents {
         args.extend(["-p", p]);
     }
-    if signing.is_some() {
-        args.push("-S");
-    }
+    args.push(if signing.is_some() { "-S" } else { "--no-gpg-sign" });
     args.extend(["-F", "-"]);
     let env = [("GIT_AUTHOR_NAME", who.0.as_str()), ("GIT_AUTHOR_EMAIL", who.1.as_str()), ("GIT_AUTHOR_DATE", who.2.as_str()), ("GIT_COMMITTER_NAME", "kiln"), ("GIT_COMMITTER_EMAIL", "kiln@localhost")];
     let r = diffs::git_run(hub, &args, &env, message.as_bytes().to_vec()).await?;
     anyhow::ensure!(r.ok, "git commit-tree: {}", String::from_utf8_lossy(&r.err).trim());
-    Ok(String::from_utf8_lossy(&r.out).trim().to_owned())
+    let sha = String::from_utf8_lossy(&r.out).trim().to_owned();
+    if signing.is_some() {
+        return Ok(sha);
+    }
+    match super::revision::sign_as_kiln(hub, path, &sha, "server").await {
+        Ok((signed, _)) => Ok(signed),
+        Err(e) => {
+            tracing::warn!(commit = %sha, error = %format!("{e:#}"), "a commit the land queue made isn't signed");
+            Ok(sha)
+        }
+    }
 }
 
 /// A commit of `tree` on `parent` that only a conflict check stands on: kiln's, never signed, no
@@ -1990,6 +1998,13 @@ async fn keep(hub: &Hub, standings: &BTreeMap<String, queue::Standing>) -> anyho
 /// The trunk moved (`mv`): the entries' diffs landed, each by its commit, each entry's land kept
 /// (docs/ci.md W28-R108); the open diffs above them restacked.
 async fn landed(hub: &Arc<Hub>, repo: &Repo, path: &str, trunk: &str, batch: &[(Entry, BTreeMap<String, String>)], mv: &Move, policy: &land::Policy) -> anyhow::Result<()> {
+    // Signed as the queue that tested it, as it moved the trunk (W27-R07): a land kiln can't sign
+    // stands, unsigned, and says so.
+    let carried: Vec<(String, String)> = batch.iter().flat_map(|(e, commits)| e.diffs.iter().filter_map(|d| commits.get(d).map(|c| (d.clone(), c.clone())))).collect();
+    let moved = super::lands::Moved { from: &mv.from, to: &mv.to, candidate: &mv.candidate, base: &mv.base, rebased: mv.rebased };
+    if let Err(e) = Box::pin(super::lands::sign(hub, repo, trunk, &moved, &carried)).await {
+        tracing::warn!(repo = %repo.name, %trunk, candidate = %mv.candidate, error = %format!("{e:#}"), "a land wasn't signed");
+    }
     let tip = mv.to.as_str();
     let runs = runs_on(hub, &repo.id, &mv.candidate).await.unwrap_or_default();
     let mut all = Vec::new();

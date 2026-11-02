@@ -661,6 +661,130 @@ fn w17_r01_a_terminal_into_a_leg_in_a_pod() -> anyhow::Result<()> {
 /// pool with a Docker sidecar (`docker` in its `[[ci.pools]]`), each pod has the Docker CLI copied
 /// in, the engine as a privileged native sidecar its job container shares a socket and the work
 /// directory with, and the step runs there.
+/// docs/ci.md W27-R01: an ephemeral runner (a `k8s` pool's pod) asks for its own identity and its
+/// leg's, as any runner does, so the leg verifies to kiln's root as the leg, on the pod's runner,
+/// enrolled by kiln; and the pod's runner has its own.
+#[test]
+fn w27_r01_an_ephemeral_runner_and_its_leg_have_identities() -> anyhow::Result<()> {
+    use kiln_ci::identity::chain::{Actor, verify};
+    let dir = tempfile::tempdir()?;
+    let kube = Kube::start(dir.path())?;
+    let kubeconfig = kube.kubeconfig(dir.path())?;
+    let pool = "\n[[ci.pools]]\nname = \"pods\"\nexecutor = \"k8s\"\nlabels = [\"pod\"]\nmax = 1\nidle_timeout = \"30s\"\n";
+    let extra = "[kubernetes]\nenabled = true\nnamespace = \"ci\"\nagent_image = \"kiln-agent:test\"\n";
+    let s = start_env(dir.path(), &Options { agent: false, ci: pool, extra }, false, &[("KUBECONFIG", &kubeconfig.to_string_lossy())])?;
+    let (st, body) = http(s.port, "POST", "/api/repos", &s.admin, Some(&json!({ "name": "acme/app", "mode": "native" })))?;
+    anyhow::ensure!(st == 200, "{st} {body}");
+    let (home, work) = (dir.path().join("githome"), dir.path().join("tree"));
+    std::fs::create_dir_all(&home)?;
+    std::fs::create_dir_all(work.join(".github/workflows"))?;
+    let push = format!("http://x:{}@127.0.0.1:{}/git/acme/app.git", s.admin, s.port);
+    git(&home, &work, &["init", "-q", "-b", "main"])?;
+    std::fs::write(work.join("README.md"), "app\n")?;
+    git(&home, &work, &["add", "."])?;
+    git(&home, &work, &["commit", "-qm", "first"])?;
+    git(&home, &work, &["push", "-q", &push, "HEAD:main"])?;
+    until(&s, 60, "the first poll", || {
+        let (_, body) = http(s.port, "GET", "/api/repos", &s.admin, None)?;
+        Ok(body.contains("\"last_polled_at\":null").then_some(body))
+    })?;
+    std::fs::write(work.join(".github/workflows/plain.yml"), PLAIN_WORKFLOW)?;
+    git(&home, &work, &["add", "."])?;
+    git(&home, &work, &["commit", "-qm", "plain"])?;
+    git(&home, &work, &["push", "-q", &push, "HEAD:main"])?;
+    let mut run = Value::Null;
+    until(&s, 240, "the run", || {
+        let (_, body) = http(s.port, "GET", "/api/ci/runs?repo=acme/app&limit=5", &s.admin, None)?;
+        run = serde_json::from_str::<Value>(&body)?.pointer("/runs/0").cloned().unwrap_or_default();
+        Ok(run.get("finished_at").is_none_or(Value::is_null).then(|| body.clone()))
+    })?;
+    let id = run.get("id").and_then(Value::as_str).unwrap_or_default();
+    let (_, detail) = http(s.port, "GET", &format!("/api/ci/runs/{id}"), &s.admin, None)?;
+    assert_eq!(run.get("conclusion"), Some(&json!("success")), "{detail}\n{}", s.log());
+    let runner = serde_json::from_str::<Value>(&detail)?.pointer("/legs/0/runner").and_then(Value::as_str).unwrap_or_default().to_owned();
+    assert!(runner.starts_with("kiln-x-pool-pods-"), "on its pod's runner: {detail}");
+    let db = rusqlite::Connection::open(dir.path().join("data/kiln.db"))?;
+    let of = |kind: &str| -> anyhow::Result<Vec<(String, String)>> {
+        let mut q = db.prepare("SELECT subject, cert_pem FROM identities WHERE kind = ?1 ORDER BY issued_at")?;
+        let rows = q.query_map([kind], |r| Ok((r.get(0)?, r.get(1)?)))?.collect::<Result<Vec<_>, _>>()?;
+        Ok(rows)
+    };
+    let root = kiln::pki::der_of(&std::fs::read_to_string(dir.path().join("data/pki/ca.pem"))?)?;
+    let now = i64::try_from(std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)?.as_secs())?;
+    // The leg's: its own, on the pod's runner, enrolled by kiln.
+    let legs = of("leg")?;
+    let (_, pem) = legs.last().ok_or_else(|| anyhow::anyhow!("no leg identity was issued: {}", s.log()))?;
+    let v = verify(&[&kiln::pki::der_of(pem)?], &root, &[], now)?;
+    match &v.identity.actor {
+        Actor::Leg { enrolled_by, machine, attempt, leg, .. } => assert_eq!((enrolled_by.as_str(), machine.as_str(), *attempt, leg.as_str()), ("kiln", runner.as_str(), 1, "plain"), "{v}"),
+        other => anyhow::bail!("the leg's certificate names {other:?}"),
+    }
+    // The pod's runner's own, for that process.
+    let runners = of("runner")?;
+    let mine = format!("/person/kiln/machine/{runner}/instance/");
+    assert!(runners.iter().any(|(subject, _)| subject.contains(&mine)), "no identity for {runner}'s process: {:?}", runners.iter().map(|(s, _)| s).collect::<Vec<_>>());
+    Ok(())
+}
+
+/// W27-R05: a `k8s` pool's pod leg signs its records as the leg, on the pod's runner, under the
+/// server's delegation of it. Its runner says nothing of itself past `Build`'s caps, so it says so
+/// of the leg as it asks for the leg's identity; kiln takes the records and they hold.
+#[test]
+fn w27_r05_a_pods_leg_signs_its_records_as_the_leg() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let kube = Kube::start(dir.path())?;
+    let kubeconfig = kube.kubeconfig(dir.path())?;
+    let pool = "\n[[ci.pools]]\nname = \"pods\"\nexecutor = \"k8s\"\nlabels = [\"pod\"]\nmax = 1\nidle_timeout = \"30s\"\n";
+    let extra = "[kubernetes]\nenabled = true\nnamespace = \"ci\"\nagent_image = \"kiln-agent:test\"\n";
+    let s = start_env(dir.path(), &Options { agent: false, ci: pool, extra }, false, &[("KUBECONFIG", &kubeconfig.to_string_lossy())])?;
+    let (st, body) = http(s.port, "POST", "/api/repos", &s.admin, Some(&json!({ "name": "acme/app", "mode": "native" })))?;
+    anyhow::ensure!(st == 200, "{st} {body}");
+    let (home, work) = (dir.path().join("githome"), dir.path().join("tree"));
+    std::fs::create_dir_all(&home)?;
+    std::fs::create_dir_all(work.join(".github/workflows"))?;
+    let push = format!("http://x:{}@127.0.0.1:{}/git/acme/app.git", s.admin, s.port);
+    git(&home, &work, &["init", "-q", "-b", "main"])?;
+    std::fs::write(work.join("README.md"), "app\n")?;
+    git(&home, &work, &["add", "."])?;
+    git(&home, &work, &["commit", "-qm", "first"])?;
+    git(&home, &work, &["push", "-q", &push, "HEAD:main"])?;
+    until(&s, 60, "the first poll", || {
+        let (_, body) = http(s.port, "GET", "/api/repos", &s.admin, None)?;
+        Ok(body.contains("\"last_polled_at\":null").then_some(body))
+    })?;
+    std::fs::write(work.join(".github/workflows/plain.yml"), PLAIN_WORKFLOW)?;
+    git(&home, &work, &["add", "."])?;
+    git(&home, &work, &["commit", "-qm", "plain"])?;
+    git(&home, &work, &["push", "-q", &push, "HEAD:main"])?;
+    let mut run = Value::Null;
+    until(&s, 240, "the run", || {
+        let (_, body) = http(s.port, "GET", "/api/ci/runs?repo=acme/app&limit=5", &s.admin, None)?;
+        run = serde_json::from_str::<Value>(&body)?.pointer("/runs/0").cloned().unwrap_or_default();
+        Ok(run.get("finished_at").is_none_or(Value::is_null).then(|| body.clone()))
+    })?;
+    let id = run.get("id").and_then(Value::as_str).unwrap_or_default();
+    let (_, detail) = http(s.port, "GET", &format!("/api/ci/runs/{id}"), &s.admin, None)?;
+    assert_eq!(run.get("conclusion"), Some(&json!("success")), "{detail}\n{}", s.log());
+    let runner = serde_json::from_str::<Value>(&detail)?.pointer("/legs/0/runner").and_then(Value::as_str).unwrap_or_default().to_owned();
+    let db = rusqlite::Connection::open(dir.path().join("data/kiln.db"))?;
+    let leg: String = db.query_row("SELECT id FROM jobs WHERE key = 'plain' ORDER BY rowid DESC LIMIT 1", [], |r| r.get(0))?;
+    let mut v = Value::Null;
+    until(&s, 30, "the leg's signed records", || {
+        let (_, body) = http(s.port, "GET", &format!("/api/ci/legs/{leg}/signed"), &s.admin, None)?;
+        v = serde_json::from_str(&body)?;
+        Ok((v.get("state").and_then(Value::as_str) == Some("unsigned")).then_some(body))
+    })?;
+    assert_eq!(v.get("state").and_then(Value::as_str), Some("verified"), "{v:#}\n{}", s.log());
+    let uri = v.get("uri").and_then(Value::as_str).unwrap_or_default();
+    assert!(uri.contains(&format!("/person/kiln/machine/{runner}/")) && uri.ends_with("/leg/plain"), "as the leg on the pod's runner, enrolled by kiln: {uri}");
+    assert!(v.pointer("/under/uri").and_then(Value::as_str).is_some_and(|u| u.ends_with("/server")), "under the server's delegation: {v:#}");
+    let kinds: Vec<&str> = v.get("records").and_then(Value::as_array).into_iter().flatten().filter_map(|r| r.get("kind").and_then(Value::as_str)).collect();
+    assert!(kinds.contains(&"received") && kinds.contains(&"handed-on"), "its receipts and its hand-on: {kinds:?}");
+    let ran = v.get("steps").and_then(Value::as_array).map_or(0, Vec::len);
+    assert!(ran >= 1, "its steps' ends, signed: {v:#}");
+    Ok(())
+}
+
 fn docker_works() -> bool {
     Command::new("docker").args(["info", "--format", "{{.ServerVersion}}"]).output().is_ok_and(|o| o.status.success())
 }

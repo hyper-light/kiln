@@ -207,6 +207,9 @@ classes! {
         AgentMsg::Observe { .. } => OBSERVE,
         AgentMsg::Unread { .. } => Class::Ack,
         AgentMsg::LinkUnread { .. } => Class::Ack,
+        AgentMsg::LegResults { .. } => Class::Stream,
+        AgentMsg::LegSignature { .. } => Class::Answer,
+        AgentMsg::Custody { .. } => Class::Stream,
     }
 }
 
@@ -278,6 +281,8 @@ classes! {
         ServerMsg::Unread { .. } => Class::Ack,
         ServerMsg::ReachRefused { .. } => REACH,
         ServerMsg::Freeze { .. } => REFUSED,
+        ServerMsg::SignAsLeg { .. } => Class::Ask,
+        ServerMsg::Custody { .. } => Class::Ask,
     }
 }
 
@@ -324,6 +329,9 @@ classes! {
         Command::MoveOnLimit { .. } => REFUSED,
         Command::LimitHold { .. } => REFUSED,
         Command::OwnEdits { .. } => Class::Ask,
+        Command::Pause { .. } => REFUSED,
+        Command::Perms { .. } => REFUSED,
+        Command::Branch { .. } => REFUSED,
     }
 }
 

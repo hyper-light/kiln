@@ -596,7 +596,7 @@ async fn authorized(hub: Arc<Hub>, caller: crate::authz::Caller, req: Request) -
             .map_err(|(c, m)| err(c, m))
         }
         // W14: diffs and stacks.
-        (_, ["api", "diffs" | "change-requests" | "stacks" | "comments" | "review" | "queue", ..]) | (&Method::GET, ["api", "repos", _, "diffs" | "queue" | "change-requests"]) | (&Method::POST, ["api", "repos", _, "change-requests" | "submit"]) => {
+        (_, ["api", "diffs" | "change-requests" | "stacks" | "comments" | "review" | "queue", ..]) | (&Method::GET, ["api", "repos", _, "diffs" | "queue" | "change-requests"] | ["api", "repos", _, "lands", _]) | (&Method::POST, ["api", "repos", _, "change-requests" | "submit"]) => {
             let segs: Vec<&str> = s.iter().skip(1).copied().collect();
             let body: serde_json::Value = if matches!(method, Method::POST | Method::PATCH | Method::PUT) { boxed(|| srv::body_json(req.into_body(), JSON_LIMIT)).await.unwrap_or(serde_json::Value::Null) } else { serde_json::Value::Null };
             boxed(|| crate::ci::diffs::route(&hub, &method, &segs, &q, &caller, &body)).await.map_err(|(c, m)| err(c, m))
@@ -647,7 +647,7 @@ async fn authorized(hub: Arc<Hub>, caller: crate::authz::Caller, req: Request) -
         (&Method::POST, ["api", "updates", "binaries"]) => boxed(|| upload_binary(&hub, &q, req)).await,
         (&Method::DELETE, ["api", "updates", "binaries", target]) => boxed(|| delete_binary(&hub, target)).await,
         (&Method::GET, ["api", "updates", "jobs", id]) => match hub.updates.job(id) {
-            Some(j) => Ok(srv::json(StatusCode::OK, &j)),
+            Some(j) => boxed(|| update_job(&hub, j)).await,
             None => Err(err(StatusCode::NOT_FOUND, "no such upgrade")),
         },
         (&Method::GET, ["api", "metrics", "history"]) => Ok(history(&hub, &q)),
@@ -731,6 +731,11 @@ async fn authorized(hub: Arc<Hub>, caller: crate::authz::Caller, req: Request) -
             let caller = caller_of(&hub, req.headers()).await.ok_or_else(|| err(StatusCode::UNAUTHORIZED, "sign in first"))?;
             boxed(|| me_identity(&hub, caller, req)).await
         }
+        // The SSH keys a person signs commits with, bound to their identity (W27-R03).
+        (&Method::GET | &Method::POST | &Method::DELETE, ["api", "me", "ssh-signers"]) => {
+            let caller = caller_of(&hub, req.headers()).await.ok_or_else(|| err(StatusCode::UNAUTHORIZED, "sign in first"))?;
+            boxed(|| me_ssh_signers(&hub, caller, req)).await
+        }
         (&Method::GET, ["api", "identities"]) => {
             let kind = srv::query(&req).remove("kind");
             boxed(|| async {
@@ -739,6 +744,106 @@ async fn authorized(hub: Arc<Hub>, caller: crate::authz::Caller, req: Request) -
             })
             .await
         }
+        // The trail of every signed statement kiln takes, a page of it at a time, and kiln's
+        // checkpoints of it, one signed now when asked (W27-R09).
+        (&Method::GET, ["api", "trail"]) => {
+            let q = srv::query(&req);
+            let number = |k: &str, or: u64| q.get(k).and_then(|v| v.parse().ok()).unwrap_or(or);
+            let (from, limit) = (number("from", 0), number("limit", 100));
+            boxed(|| async { crate::trail::page(&hub.store, from, limit).await.map(|v| srv::json(StatusCode::OK, &v)).map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}"))) }).await
+        }
+        (&Method::GET, ["api", "trail", "checkpoints"]) => {
+            let limit = srv::query(&req).get("limit").and_then(|v| v.parse().ok()).unwrap_or(10);
+            boxed(|| async { crate::trail::checkpoints_page(&hub.store, limit).await.map(|v| srv::json(StatusCode::OK, &v)).map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}"))) }).await
+        }
+        (&Method::GET, ["api", "trail", "anchors"]) => {
+            boxed(|| async { crate::trail::anchors(&hub).await.map(|v| srv::json(StatusCode::OK, &v)).map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}"))) }).await
+        }
+        // The trail as a tiled log (C2SP tlog-tiles): its checkpoint, its tiles and its entries.
+        (&Method::GET, ["api", "trail", "log", rest @ ..]) => {
+            let path = rest.join("/");
+            boxed(|| async {
+                match crate::trail::log(&hub.store, &path).await {
+                    Ok(Some((bytes, ctype, immutable))) => {
+                        let r = srv::response(StatusCode::OK, ctype, srv::full(bytes::Bytes::from(bytes)));
+                        Ok(srv::with_header(r, header::CACHE_CONTROL, if immutable { "private, max-age=31536000, immutable" } else { "private, max-age=5" }))
+                    }
+                    Ok(None) => Err(err(StatusCode::NOT_FOUND, format!("the trail has no {path}"))),
+                    Err(e) => Err(err(StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}"))),
+                }
+            })
+            .await
+        }
+        (&Method::POST, ["api", "trail", "checkpoints"]) => boxed(|| async {
+            let size = crate::trail::checkpoint(&hub, true).await.map_err(|e| err(StatusCode::CONFLICT, format!("the trail's checkpoint isn't signed: {e:#}")))?;
+            Ok(srv::json(StatusCode::OK, &json!({ "size": size })))
+        })
+        .await,
+        // kiln verify (W27-R10): the chain back from a deploy, an artifact, a commit or a change,
+        // each link with whether it holds, the first that doesn't named.
+        (&Method::GET, ["api", "verify"]) => {
+            let q = srv::query(&req);
+            boxed(|| async {
+                let target = crate::verify::Target::of(&q).map_err(|(s, e)| err(s, e))?;
+                crate::verify::verify(&hub, &target).await.map(|v| srv::json(StatusCode::OK, &v)).map_err(|(s, e)| err(s, e))
+            })
+            .await
+        }
+        // The same walk for an auditor, to check offline against kiln's root; and a revision's
+        // Source VSA (SLSA's source track), signed as kiln's server and kept in the trail.
+        (&Method::GET, ["api", "verify", "export"]) => {
+            let q = srv::query(&req);
+            boxed(|| async {
+                let target = crate::verify::Target::of(&q).map_err(|(s, e)| err(s, e))?;
+                crate::verify::export(&hub, &target).await.map(|v| srv::json(StatusCode::OK, &v)).map_err(|(s, e)| err(s, e))
+            })
+            .await
+        }
+        (&Method::POST, ["api", "verify", "vsa"]) => boxed(|| async {
+            let body: serde_json::Value = boxed(|| srv::body_json(req.into_body(), JSON_LIMIT)).await.map_err(|e| err(StatusCode::BAD_REQUEST, e.to_string()))?;
+            let asked = body.get("commit").and_then(serde_json::Value::as_str).unwrap_or_default();
+            let crate::verify::Target::Commit { repo, sha } = crate::verify::Target::parse("commit", asked).map_err(|e| err(StatusCode::BAD_REQUEST, e))? else {
+                return Err(err(StatusCode::BAD_REQUEST, "`commit`: <repository>@<commit>"));
+            };
+            crate::verify::vsa(&hub, &repo, &sha).await.map(|v| srv::json(StatusCode::OK, &v)).map_err(|(s, e)| err(s, e))
+        })
+        .await,
+        // Custody of what changes hands (W27-R08): a signed record taken, a thing's chain walked
+        // now, the breaks kiln found and what it refused.
+        (&Method::POST, ["api", "custody"]) => {
+            let by = caller_of(&hub, req.headers()).await.map_or_else(|| "admin".to_owned(), |c| c.name);
+            boxed(|| custody_take(&hub, req, &by)).await
+        }
+        (&Method::GET, ["api", "custody", "breaks"]) => boxed(|| async {
+            let breaks = crate::custody::breaks(&hub.store, crate::custody::LIST_MAX).await.map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")))?;
+            Ok(srv::json(StatusCode::OK, &json!({ "breaks": breaks })))
+        })
+        .await,
+        (&Method::GET, ["api", "custody"]) => {
+            let mut q = srv::query(&req);
+            let (digest, name) = (q.remove("digest").unwrap_or_default(), q.remove("name"));
+            boxed(|| async {
+                // By a thing's name: the head of its newest chain.
+                let digest = match name {
+                    Some(n) => crate::custody::head_named(&hub.store, &n).await.map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")))?.unwrap_or(n),
+                    None => digest,
+                };
+                let chain = crate::custody::chain(&hub.store, &hub.pki.ca_der, &hub.pki.organization(), &digest, crate::util::now_unix()).await.map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")))?;
+                chain.map(|v| srv::json(StatusCode::OK, &v)).ok_or_else(|| err(StatusCode::NOT_FOUND, format!("kiln has no custody record of {digest:?}")))
+            })
+            .await
+        }
+        (&Method::GET, ["api", "transfers", "refused"]) => boxed(|| async {
+            let refused = crate::custody::refusals(&hub.store, crate::custody::LIST_MAX).await.map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")))?;
+            Ok(srv::json(StatusCode::OK, &json!({ "refused": refused })))
+        })
+        .await,
+        // Agent sessions' hand-overs that went unsigned, newest first (docs/ci.md W27-R08).
+        (&Method::GET, ["api", "transfers", "unsigned"]) => boxed(|| async {
+            let unsigned = crate::custody::unsigned_list(&hub.store, crate::custody::LIST_MAX).await.map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")))?;
+            Ok(srv::json(StatusCode::OK, &json!({ "unsigned": unsigned })))
+        })
+        .await,
         (&Method::POST, ["api", "identities", "revoke"]) => {
             let by = caller_of(&hub, req.headers()).await.map_or_else(|| "admin".to_owned(), |c| c.name);
             boxed(|| identity_revoke(&hub, req, &by)).await
@@ -908,11 +1013,27 @@ async fn authorized(hub: Arc<Hub>, caller: crate::authz::Caller, req: Request) -
             boxed(|| own_op(&hub, &caller, "plans.runs.retry", body)).await
         }
         // Taking a step over, and saying it's met, are a person's: no operation does them.
-        (&Method::POST, ["api", "plans", "runs", run, "steps", n, what @ ("take" | "met")]) => {
+        (&Method::POST, ["api", "plans", "runs", run, "steps", n, "met"]) => {
             let n: usize = n.parse().map_err(|_| err(StatusCode::BAD_REQUEST, "a step's number, from 1"))?;
             let by = caller.name.clone();
-            let r = if *what == "take" { boxed(|| crate::plans::agents::take(&hub, run, n, &by)).await } else { boxed(|| crate::plans::agents::met(&hub, run, n, &by)).await };
-            r.map(|v| srv::json(StatusCode::OK, &v)).map_err(plan_err)
+            boxed(|| crate::plans::agents::met(&hub, run, n, &by)).await.map(|v| srv::json(StatusCode::OK, &v)).map_err(plan_err)
+        }
+        // Taken over, the step goes to the person the caller is, signed (docs/ci.md W27-R08): their
+        // receipt is theirs when they say they sign it on their device (`signs`, then `receipt`),
+        // else kiln's for them.
+        (&Method::POST, ["api", "plans", "runs", run, "steps", n, "take"]) => {
+            let n: usize = n.parse().map_err(|_| err(StatusCode::BAD_REQUEST, "a step's number, from 1"))?;
+            let by = caller.name.clone();
+            let signs = boxed(|| body_value(req)).await?.get("signs").and_then(serde_json::Value::as_bool).unwrap_or(false);
+            let person = crate::identities::person_identity(&hub.store, &hub.pki.organization(), &caller).await.ok();
+            boxed(|| crate::plans::agents::take(&hub, run, n, &by, person.as_deref(), signs)).await.map(|v| srv::json(StatusCode::OK, &v)).map_err(plan_err)
+        }
+        (&Method::POST, ["api", "plans", "runs", run, "steps", n, "receipt"]) => {
+            let n: usize = n.parse().map_err(|_| err(StatusCode::BAD_REQUEST, "a step's number, from 1"))?;
+            let person = crate::identities::person_identity(&hub.store, &hub.pki.organization(), &caller).await.map_err(|e| err(StatusCode::FORBIDDEN, e.to_string()))?;
+            let body = boxed(|| body_value(req)).await?;
+            let receipt = body.get("receipt").cloned().ok_or_else(|| err(StatusCode::BAD_REQUEST, "send your receipt: `receipt`, a Sigstore bundle signed on your device"))?;
+            boxed(|| crate::plans::agents::receipt(&hub, run, n, &person, &receipt)).await.map(|v| srv::json(StatusCode::OK, &v)).map_err(plan_err)
         }
         (&Method::GET, ["api", "programs"]) => boxed(|| own_op(&hub, &caller, "programs.list", json!({}))).await,
         (&Method::GET, ["api", "programs", id]) => boxed(|| own_op(&hub, &caller, "programs.get", json!({"program": id}))).await,
@@ -1015,7 +1136,7 @@ async fn authorized(hub: Arc<Hub>, caller: crate::authz::Caller, req: Request) -
             let op = format!("agents.{what}");
             boxed(|| own_op(&hub, &caller, &op, v)).await
         }
-        (&Method::POST, ["api", "harness", "agents", id, what @ ("send" | "interrupt" | "stop" | "change" | "land" | "about")]) => {
+        (&Method::POST, ["api", "harness", "agents", id, what @ ("send" | "interrupt" | "stop" | "change" | "land" | "about" | "credential")]) => {
             let (id, name) = ((*id).to_owned(), format!("agents.{what}"));
             // A send's idempotency key may come as the standard header (CP-T3.2).
             let key = idempotency_key(&req);
@@ -2692,6 +2813,9 @@ async fn add_repo(hub: &Hub, req: Request) -> R {
     } else {
         r.clone_url.unwrap_or_else(|| format!("https://github.com/{name}.git"))
     };
+    // A new repository kiln hosts requires signed commits as the server says (W27-R03); one added
+    // again keeps what it had.
+    let new = native && !hub.store.repos().await?.iter().any(|x| x.name == name);
     let repo = hub
         .store
         .upsert_repo(Repo {
@@ -2711,6 +2835,9 @@ async fn add_repo(hub: &Hub, req: Request) -> R {
         .await?;
     if native {
         hub.store.set_repo_public(repo.id.clone(), r.public).await?;
+    }
+    if new {
+        hub.store.set_repo_signatures(repo.id.clone(), hub.cfg.ci.signatures == kiln_ci::land::SignatureMode::Required).await?;
     }
     hub.store.audit("admin".into(), "repo.add".into(), name).await;
     crate::gitops::want(hub, &repo.id);
@@ -3142,6 +3269,62 @@ async fn me_identity(hub: &Hub, caller: crate::authz::Caller, req: Request) -> R
         }
         Err(crate::identities::PersonRefused::Failed(e)) => Err(e.into()),
         Err(r) => Ok(srv::json(r.status(), &json!({ "error": r.to_string(), "code": r.code() }))),
+    }
+}
+
+/// `POST /api/custody`: a signed custody record or delegation (its Sigstore bundle), taken from
+/// `by` (W27-R08): kept and its hop checked, or refused and recorded, saying why.
+async fn custody_take(hub: &Hub, req: Request, by: &str) -> R {
+    let bundle: serde_json::Value = boxed(|| srv::body_json(req.into_body(), JSON_LIMIT)).await.map_err(|e| err(StatusCode::BAD_REQUEST, e.to_string()))?;
+    let taken = crate::custody::take(&hub.store, &hub.pki.ca_der, &hub.pki.organization(), &bundle, &format!("api:{by}"), crate::util::now_unix())
+        .await
+        .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")))?;
+    match taken {
+        Ok(t) => Ok(srv::json(if t.again { StatusCode::OK } else { StatusCode::CREATED }, &json!({ "digest": t.digest, "again": t.again, "broke": t.broke }))),
+        Err(refused) => Err(err(StatusCode::UNPROCESSABLE_ENTITY, refused.to_string())),
+    }
+}
+
+/// `GET /api/me/ssh-signers`: the SSH keys bound to the caller, a person, so the commits each signs
+/// verify as them (docs/ci.md W27-R03); `POST` `{key}` binds one (its `.pub` file's line), and
+/// `DELETE ?fingerprint=` unbinds one. Never an agent's, a job's or a peer's to change. A refusal
+/// says why, with a `code`.
+async fn me_ssh_signers(hub: &Hub, caller: crate::authz::Caller, req: Request) -> R {
+    use crate::identities::PersonRefused;
+    let refused = |r: PersonRefused| -> R {
+        match r {
+            PersonRefused::Failed(e) => Err(e.into()),
+            r => Ok(srv::json(r.status(), &json!({ "error": r.to_string(), "code": r.code() }))),
+        }
+    };
+    match req.method().clone() {
+        Method::POST => {
+            let b: serde_json::Value = srv::body_json(req.into_body(), JSON_LIMIT).await.map_err(|e| err(StatusCode::BAD_REQUEST, e.to_string()))?;
+            let key = b.get("key").and_then(serde_json::Value::as_str).ok_or_else(|| err(StatusCode::BAD_REQUEST, "send a key: an SSH public key, as its .pub file has it"))?;
+            match crate::identities::add_ssh_signer(&hub.store, &caller, key).await {
+                Ok(signer) => {
+                    hub.store.audit(caller.name.clone(), "identity.ssh_signer".into(), format!("bound {} ({})", signer.fingerprint, signer.kind)).await;
+                    Ok(srv::json(StatusCode::OK, &json!({ "signer": signer })))
+                }
+                Err(r) => refused(r),
+            }
+        }
+        Method::DELETE => {
+            let fingerprint = srv::query(&req).remove("fingerprint").ok_or_else(|| err(StatusCode::BAD_REQUEST, "say which key: ?fingerprint=SHA256:…"))?;
+            match crate::identities::remove_ssh_signer(&hub.store, &caller, &fingerprint).await {
+                Ok(removed) => {
+                    if removed {
+                        hub.store.audit(caller.name.clone(), "identity.ssh_signer".into(), format!("unbound {fingerprint}")).await;
+                    }
+                    Ok(srv::json(StatusCode::OK, &json!({ "removed": removed })))
+                }
+                Err(r) => refused(r),
+            }
+        }
+        _ => match crate::identities::ssh_signers(&hub.store, &caller).await {
+            Ok(signers) => Ok(srv::json(StatusCode::OK, &json!({ "signers": signers }))),
+            Err(r) => refused(r),
+        },
     }
 }
 
@@ -3898,6 +4081,21 @@ async fn set_skew(hub: &Arc<Hub>, req: Request) -> R {
     hub.store.audit("admin".into(), "upgrade.skew".into(), format!("full within {} commits, upgrade within {}", t.full, t.upgrade)).await;
     hub.emit(&crate::wire::events::ServerEvent::Updates);
     Ok(srv::status(StatusCode::NO_CONTENT))
+}
+
+/// `GET /api/updates/jobs/{id}`: the upgrade, and, a runner's blue/green one, its replant's record
+/// of what it handed on (docs/ci.md W27-R08; the Transfers plan's step 8): its machine's runner role
+/// and its agent sessions, each a transfer signed by both sides (`transfers`), and what moved
+/// without one (`moved_without_a_transfer`).
+async fn update_job(hub: &Arc<Hub>, j: crate::updates::Job) -> R {
+    let mut v = serde_json::to_value(&j).map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    if let Some((machine, since, sessions)) = crate::updates::Updates::replant(&j) {
+        let r = crate::custody::replanted(&hub.store, &hub.pki.ca_der, &hub.pki.organization(), &machine, since, &sessions).await.map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")))?;
+        if let (Some(o), Some(r)) = (v.as_object_mut(), r.as_object()) {
+            o.extend(r.clone());
+        }
+    }
+    Ok(srv::json(StatusCode::OK, &v))
 }
 
 /// `DELETE /api/updates/skew`: back to what kiln.toml says.

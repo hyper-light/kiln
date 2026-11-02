@@ -605,6 +605,20 @@ pub struct Task {
     /// Messages waiting for it to finish what it's doing, oldest first.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub queue: Vec<QueueItem>,
+    /// A person can pause it (`Command::Pause` with its `task`): its harness holds it at its next
+    /// tool call (Claude Code's subagents).
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub pausable: bool,
+    /// A person paused it (unix ms): its next tool call, and those of the subagents under it, wait
+    /// until they resume it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(test, ts(optional))]
+    pub paused_at: Option<i64>,
+    /// What a person lets it do (`Command::Perms` with its `task`), within its session's and the
+    /// subagent's it's under.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(test, ts(optional))]
+    pub perms: Option<Perms>,
 }
 
 fn is_zero_u64(n: &u64) -> bool {
@@ -1350,6 +1364,16 @@ pub struct State {
     /// words by, said in the same state as its queue (CP-T3.2, the fourteenth adversarial check's).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub given: Vec<Given>,
+    /// A person paused it (unix ms, `Command::Pause`): its processes stopped where they are, held
+    /// by its machine's pacer (`crate::headroom::pause`) until they resume it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(test, ts(optional))]
+    pub frozen: Option<i64>,
+    /// What a person lets it do (`Command::Perms`): every call of its own and of its harness's
+    /// subagents, within its parent's (the server narrows it so).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(test, ts(optional))]
+    pub perms: Option<Perms>,
 }
 
 /// One of kiln's own messages its harness was handed (`State::given`).
@@ -1421,6 +1445,86 @@ pub struct TurnEnd {
     /// `State::kept` when it ended: kiln started it and that many before it.
     #[serde(default, skip_serializing_if = "is_zero")]
     pub kept: u32,
+}
+
+/// How far a subagent may go with one kind of tool call (`Perms`), narrowest first: not at all,
+/// asking a person each time, or as what it's under lets it.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord, Default)]
+#[cfg_attr(test, derive(ts_rs::TS))]
+#[serde(rename_all = "snake_case")]
+pub enum Grant {
+    Off,
+    Ask,
+    #[default]
+    Allow,
+}
+
+/// What a person lets a subagent do (`Command::Perms`): each kind of tool call, the folder its file
+/// calls stay in, and how long and how much it may work. Never more than what it's under lets it
+/// ([`Perms::narrow`]).
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[cfg_attr(test, derive(ts_rs::TS))]
+pub struct Perms {
+    /// Reading and searching files.
+    #[serde(default)]
+    pub read: Grant,
+    /// Changing files.
+    #[serde(default)]
+    pub edit: Grant,
+    /// Running commands, and MCP tools' calls.
+    #[serde(default)]
+    pub run: Grant,
+    /// Fetching and searching the web.
+    #[serde(default)]
+    pub web: Grant,
+    /// The folder its file calls stay in (absolute, or under its own folder).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(test, ts(optional))]
+    pub folder: Option<String>,
+    /// The most minutes it works, from when it started.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(test, ts(optional))]
+    pub minutes: Option<u32>,
+    /// The most tokens it uses.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(test, ts(optional))]
+    pub tokens: Option<u64>,
+}
+
+impl Perms {
+    /// These, never more than `up` lets: the narrower grant of each kind, the folder inside `up`'s
+    /// (`up`'s own where this one isn't in it), and the smaller of each limit.
+    #[must_use]
+    pub fn narrow(&self, up: &Perms) -> Perms {
+        let trim = |f: &str| f.trim_end_matches('/').to_owned();
+        let folder = match (self.folder.as_deref().map(trim), up.folder.as_deref().map(trim)) {
+            (Some(mine), Some(theirs)) if mine == theirs || mine.starts_with(&format!("{theirs}/")) => Some(mine),
+            (_, Some(theirs)) => Some(theirs),
+            (mine, None) => mine,
+        };
+        let least = |a: Option<u64>, b: Option<u64>| match (a, b) {
+            (Some(a), Some(b)) => Some(a.min(b)),
+            (a, b) => a.or(b),
+        };
+        Perms {
+            read: self.read.min(up.read),
+            edit: self.edit.min(up.edit),
+            run: self.run.min(up.run),
+            web: self.web.min(up.web),
+            folder,
+            minutes: least(self.minutes.map(u64::from), up.minutes.map(u64::from)).and_then(|m| u32::try_from(m).ok()),
+            tokens: least(self.tokens, up.tokens),
+        }
+    }
+
+    /// `mine` (none: no limits of its own), never more than `up` lets (none: no limits above).
+    #[must_use]
+    pub fn within(mine: Option<&Perms>, up: Option<&Perms>) -> Option<Perms> {
+        match (mine, up) {
+            (Some(m), Some(u)) => Some(m.narrow(u)),
+            (m, u) => m.or(u).cloned(),
+        }
+    }
 }
 
 /// Why a session waits, and until when (`State::pause`).
@@ -1593,7 +1697,10 @@ pub struct Meta {
     /// "interrupt", "set_mode", "set_model", "set_effort", "set_speed", "stop_task", "file_suggestions",
     /// "resume", "attachments", "images", "overrides", "switch_harness" (a model of another
     /// harness: `Command::SetModel::kind`), "own_edits" (`Command::OwnEdits`: the session answers
-    /// it whatever its harness).
+    /// it whatever its harness), "limits" (a person's pause and what each may do hold at its own
+    /// subagents' tool calls: `Command::Pause`, `Command::Perms` with a task), "limits_asked" (they
+    /// hold only at the calls it asks about before making them: an ACP agent's), "web_whole" (its
+    /// web search is set for the whole agent, allowed or off: no call of it can be held or asked).
     #[serde(default)]
     pub features: Vec<String>,
     /// Effort / reasoning levels the harness offers (empty: none).
@@ -1928,6 +2035,39 @@ pub enum Command {
         client: String,
         by: String,
     },
+    /// A person pauses it (`on`), or resumes it. Without `task`: its processes stop where they are,
+    /// held by its machine's pacer under its guard, and so does every subagent kiln started under
+    /// it (the server sends each its own). With `task`: that subagent of its harness's own
+    /// (`Task::pausable`) is held at its next tool call, and the subagents under it with it.
+    Pause {
+        on: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[cfg_attr(test, ts(optional))]
+        task: Option<String>,
+    },
+    /// What a person lets it do (none: no limits of its own). Without `task`: the whole of it, its
+    /// harness's subagents too, within its parent's; the server narrows it so, and narrows the
+    /// subagents kiln started under it by it. With `task`: that subagent of its harness's own,
+    /// within the session's and the subagent's it's under.
+    Perms {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[cfg_attr(test, ts(optional))]
+        perms: Option<Perms>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[cfg_attr(test, ts(optional))]
+        task: Option<String>,
+    },
+    /// A person branches it, or one of its harness's own subagents (`task`): a new session on its
+    /// machine from the conversation so far and their `words`, a Variant beside it (under the same
+    /// agent) or a New agent of its own (`top`) (`goback::branch_spec`).
+    Branch {
+        words: String,
+        #[serde(default, skip_serializing_if = "is_false")]
+        top: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[cfg_attr(test, ts(optional))]
+        task: Option<String>,
+    },
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -2058,6 +2198,25 @@ pub fn clip_json(v: &serde_json::Value, max: usize) -> serde_json::Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_subagent_s_perms_never_let_it_do_more_than_what_it_s_under() {
+        let up = Perms { read: Grant::Allow, edit: Grant::Ask, run: Grant::Off, web: Grant::Ask, folder: Some("/w/kiln/".into()), minutes: Some(30), tokens: None };
+        let asked = Perms { read: Grant::Ask, edit: Grant::Allow, run: Grant::Allow, web: Grant::Off, folder: Some("/w/kiln/crates/raft".into()), minutes: Some(90), tokens: Some(50_000) };
+        let got = asked.narrow(&up);
+        assert_eq!((got.read, got.edit, got.run, got.web), (Grant::Ask, Grant::Ask, Grant::Off, Grant::Off), "the narrower of each");
+        assert_eq!(got.folder.as_deref(), Some("/w/kiln/crates/raft"), "a folder inside its parent's stays");
+        assert_eq!((got.minutes, got.tokens), (Some(30), Some(50_000)), "the smaller of each limit");
+        // A folder beside its parent's, not in it, is its parent's; one under a sibling's name isn't in it.
+        let beside = Perms { folder: Some("/w/kiln-other".into()), ..Perms::default() };
+        assert_eq!(beside.narrow(&up).folder.as_deref(), Some("/w/kiln"));
+        // None of its own: its parent's; none above: its own.
+        assert_eq!(Perms::within(None, Some(&up)), Some(up.clone()));
+        assert_eq!(Perms::within(Some(&asked), None), Some(asked.clone()));
+        assert_eq!(Perms::within(None, None), None);
+        assert!(Grant::Off < Grant::Ask && Grant::Ask < Grant::Allow);
+        assert_eq!(serde_json::to_value(&got).ok(), Some(serde_json::json!({"read": "ask", "edit": "ask", "run": "off", "web": "off", "folder": "/w/kiln/crates/raft", "minutes": 30, "tokens": 50000})));
+    }
 
     #[test]
     fn a_catalog_has_one_entry_per_name_and_no_alias_hides_one() {

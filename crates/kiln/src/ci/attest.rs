@@ -203,14 +203,17 @@ async fn keep(hub: &Hub, run: String, leg: String, idx: u32, nonce: String, orig
             let now = crate::util::now_unix();
             let mut ids = Vec::new();
             for (kind, bundle) in made {
+                let text = bundle.to_string();
                 tx.execute(
                     "INSERT INTO ci_attestations (run_id, leg_id, idx, nonce, origin, predicate_type, subjects, bundle, created_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
-                    params![run, leg, idx, nonce, origin, kind, subjects_json, bundle.to_string(), now],
+                    params![run, leg, idx, nonce, origin, kind, subjects_json, text, now],
                 )?;
                 let id = tx.last_insert_rowid();
                 for d in &digests {
                     tx.execute("INSERT INTO ci_attestation_subjects (attestation_id, digest) VALUES (?1, ?2)", params![id, d])?;
                 }
+                // In the trail as taken, once its own rows are written (the trail's would be the last row's id).
+                crate::trail::take(&tx, &text, now)?;
                 ids.push(id);
             }
             tx.commit()?;
@@ -277,6 +280,12 @@ pub async fn reported(hub: &Hub, leg: &str, idx: u32, nonce: &str, mut subjects:
             Some((r, digest, made.clone()))
         })
         .collect();
+    // The leg signs the provenance kiln wrote as its own, once it's of what the leg reported
+    // (docs/ci.md W27-R06). It's asked before kiln's is kept: its attest step waits for that, so
+    // the leg still holds its key when it's asked. Its answer is kept beside kiln's.
+    if let Some(payload) = made.iter().find(|(kind, _)| kind == a::PROVENANCE).and_then(|(_, b)| payload_of(b)) {
+        ask_leg(hub, Asked { run: run.clone(), idx, subjects: subjects.clone(), payload }, leg, nonce).await;
+    }
     keep(hub, run, leg.to_owned(), idx, nonce.to_owned(), "kiln", &subjects, made).await?;
     for (r, digest, bundles) in elsewhere {
         let registry = match crate::ci::integrations::registry_for(hub, &r.registry).await {
@@ -301,6 +310,81 @@ pub async fn reported(hub: &Hub, leg: &str, idx: u32, nonce: &str, mut subjects:
             Err(e) => tracing::warn!(repo = %repo, error = %format!("{e:#}"), "an attestation couldn't be attached to its image"),
         }
     }
+    Ok(())
+}
+
+/// A bundle's DSSE payload.
+fn payload_of(bundle: &Value) -> Option<Vec<u8>> {
+    bundle.pointer("/dsseEnvelope/payload").and_then(Value::as_str).and_then(|p| base64::engine::general_purpose::STANDARD.decode(p).ok())
+}
+
+/// What kiln asked a leg to sign: the provenance it wrote for one report, and where it's kept.
+struct Asked {
+    run: String,
+    idx: u32,
+    subjects: Vec<Subject>,
+    payload: Vec<u8>,
+}
+
+/// The asks a leg hasn't answered yet, by leg and report: in memory, since an answer is only
+/// taken from a leg still running (a server restarted meanwhile keeps kiln's alone).
+static ASKED: std::sync::LazyLock<parking_lot::Mutex<std::collections::HashMap<(String, String), Asked>>> = std::sync::LazyLock::new(Default::default);
+
+/// Asks the runner holding `leg` to sign `asked`, the provenance kiln wrote for its report
+/// `nonce`, as the leg (docs/ci.md W27-R06), where that runner can: one announcing
+/// `CAP_LEG_SIGNS`, connected.
+async fn ask_leg(hub: &Hub, asked: Asked, leg: &str, nonce: &str) {
+    let id = leg.to_owned();
+    let agent: Option<String> = hub.store.call(move |c| Ok(c.query_row("SELECT agent FROM jobs WHERE id = ?1", [&id], |r| r.get::<_, Option<String>>(0)).optional()?.flatten())).await.unwrap_or_default();
+    let Some(agent) = agent else { return };
+    // Only a leg that signs is asked: its runner said so of itself (`CAP_LEG_SIGNS`) or, a pod's
+    // that says nothing of itself, of the leg as it asked for its identity.
+    let signs = hub.runner_wide_caps(&agent) & crate::proto::CAP_LEG_SIGNS != 0 || super::signed::leg_signs(&hub.store, leg).await.unwrap_or(false);
+    if !signs {
+        return;
+    }
+    let ask = crate::proto::ServerMsg::SignAsLeg { job: leg.to_owned(), nonce: nonce.to_owned(), payload_type: a::PAYLOAD_TYPE.to_owned(), payload: asked.payload.clone() };
+    ASKED.lock().insert((leg.to_owned(), nonce.to_owned()), asked);
+    if !hub.send_to_agent(&agent, crate::proto::LANE_CONTROL, &ask).await {
+        ASKED.lock().remove(&(leg.to_owned(), nonce.to_owned()));
+        tracing::debug!(leg, agent = %agent, "the leg's runner isn't connected: its provenance stays kiln's alone");
+    }
+}
+
+/// A leg's answer to `SignAsLeg` (docs/ci.md W27-R06). The provenance kiln wrote of what it built,
+/// signed as the leg, is kept beside kiln's own (origin `leg`). That's once its signature verifies
+/// as the leg kiln gave `leg` on `machine`, over the very statement kiln wrote. Otherwise, or when
+/// the leg didn't sign it, why is logged, and kiln's stays alone.
+pub async fn leg_signed(hub: &Hub, machine: &str, leg: &str, nonce: &str, bundle: Option<Value>, error: Option<String>) {
+    let Some(asked) = ASKED.lock().remove(&(leg.to_owned(), nonce.to_owned())) else {
+        tracing::debug!(leg, nonce, "a leg answered an ask kiln has no record of (a restart since): ignored");
+        return;
+    };
+    let Some(bundle) = bundle else {
+        tracing::info!(leg, nonce, why = %error.unwrap_or_default(), "the leg didn't sign the provenance kiln wrote: it stays kiln's alone");
+        return;
+    };
+    if let Err(e) = keep_legs(hub, machine, leg, nonce, asked, &bundle).await {
+        tracing::warn!(leg, nonce, error = %format!("{e:#}"), "a leg's signature of its provenance wasn't kept");
+    }
+}
+
+async fn keep_legs(hub: &Hub, machine: &str, leg: &str, nonce: &str, asked: Asked, v: &Value) -> anyhow::Result<()> {
+    let b64 = |p: &str| v.pointer(p).and_then(Value::as_str).and_then(|s| base64::engine::general_purpose::STANDARD.decode(s).ok());
+    let payload_type = v.pointer("/dsseEnvelope/payloadType").and_then(Value::as_str).unwrap_or_default().to_owned();
+    let (Some(payload), Some(sig), Some(leaf)) = (payload_of(v), b64("/dsseEnvelope/signatures/0/sig"), b64("/verificationMaterial/certificate/rawBytes")) else {
+        anyhow::bail!("it isn't a signed bundle with its certificate");
+    };
+    anyhow::ensure!(payload_type == a::PAYLOAD_TYPE, "it signs a {payload_type}, not an in-toto statement");
+    let revocations = crate::identities::revocations(&hub.store).await?;
+    let signer = kiln_ci::identity::chain::verify_signed(&[&leaf], &hub.pki.ca_der, &revocations, crate::util::now_unix(), &a::pae(&payload_type, &payload), &sig)?;
+    if let Some(why) = super::signed::not_the_leg(hub, machine, leg, &signer).await? {
+        anyhow::bail!(why);
+    }
+    // The leg's is the very statement kiln wrote for that report, byte for byte.
+    anyhow::ensure!(payload == asked.payload, "it signs another statement than the provenance kiln wrote");
+    keep(hub, asked.run, leg.to_owned(), asked.idx, nonce.to_owned(), "leg", &asked.subjects, vec![(a::PROVENANCE.to_owned(), v.clone())]).await?;
+    tracing::info!(leg, signer = %signer, "a leg signed the provenance of what it built");
     Ok(())
 }
 
@@ -329,7 +413,8 @@ fn row_json((id, leg, idx, origin, kind, subjects, bundle, at): Row) -> Value {
 pub async fn for_leg(hub: &Arc<Hub>, req: &Request) -> Result<Response, Fail> {
     let Some(claims) = token::of_request(hub, req.headers()) else { return Err((StatusCode::UNAUTHORIZED, "a leg's runtime token is needed".into())) };
     let nonce = srv::query(req).get("nonce").cloned().unwrap_or_default();
-    let list = rows(hub, format!("SELECT {COLUMNS} FROM ci_attestations a WHERE a.leg_id = ?1 AND a.nonce = ?2 ORDER BY a.id"), claims.sub.clone(), nonce).await.map_err(internal)?;
+    // Kiln's and the job's own: what the leg signed of them is kiln's record, not the step's.
+    let list = rows(hub, format!("SELECT {COLUMNS} FROM ci_attestations a WHERE a.leg_id = ?1 AND a.nonce = ?2 AND a.origin <> 'leg' ORDER BY a.id"), claims.sub.clone(), nonce).await.map_err(internal)?;
     Ok(srv::json(StatusCode::OK, &json!({ "attestations": list.into_iter().map(row_json).collect::<Vec<_>>() })))
 }
 

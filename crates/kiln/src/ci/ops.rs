@@ -480,6 +480,10 @@ pub fn ops() -> &'static [Op] {
                     let state = v.get("state").and_then(Value::as_str).unwrap_or("resolved");
                     diffs(&cx, Method::PATCH, &["comments", c.as_str()], &HashMap::new(), &json!({ "state": state })).await
                 }),
+            op!("ci.diffs.statement", "What to sign to give a verdict or comment on a diff (W27-R04): its statement, on the diff's latest version (a comment's `version`, if said) by its commit and verbatim patch-id, as you; and whether its repository requires it.", base: "", ro: false, destructive: false,
+                input: Input::of::<input::CiDiffsStatement>(),
+                route: |v| Ok((Method::POST, path(&["diffs", &text(v, "diff")?, "statement"]), HashMap::new())),
+                run: |cx: Cx, v: Value| async move { let d = text(&v, "diff")?; diffs(&cx, Method::POST, &["diffs", d.as_str(), "statement"], &HashMap::new(), &v).await }),
             op!("ci.diffs.review", "Review a diff: accept, request changes, comment, or resign; publishes your draft comments.", base: "", ro: false, destructive: false,
                 input: Input::of::<input::CiDiffsReview>(),
                 route: |v| Ok((Method::POST, path(&["diffs", &text(v, "diff")?, "review"]), HashMap::new())),
@@ -507,6 +511,10 @@ pub fn ops() -> &'static [Op] {
                 input: Input::of::<input::CiNotificationsDeliveries>(),
                 route: |v| Ok((Method::GET, path(&["notify", "deliveries"]), query(v, &["run", "limit"]))),
                 run: |cx: Cx, v: Value| async move { answer(super::notify::deliveries(&cx.hub, &query(&v, &["run", "limit"])).await).await }),
+            op!("ci.verify", "Walk the chain back from a deploy, an artifact, a commit or a change (W27-R10): the release; the artifact's provenance and the leg that built it; each commit on the trunk it brings and its signature; the land by the queue that tested it; the verdicts that let it land, people and agents apart, and the trunk's review policy; each revision's author; kiln's root. Each link says whether it holds or why not, resting on a signed statement in kiln's trail checked as of when kiln took it, and the first that doesn't is named. Give exactly one of `deploy`, `artifact`, `commit` or `change`.", base: "", ro: true, destructive: false,
+                input: Input::of::<input::CiVerify>(),
+                route: |v| Ok((Method::GET, path(&["verify"]), query(v, &["deploy", "artifact", "commit", "change"]))),
+                run: |cx: Cx, v: Value| async move { crate::verify::verify(&cx.hub, &crate::verify::Target::of(&query(&v, &["deploy", "artifact", "commit", "change"]))?).await }),
             op!("ci.tests.propose_quarantine", "Propose quarantining a test (W16-R05) as a diff adding it to the trunk's `.kiln/quarantine.yaml`: under `quarantine: enforce`, its failures alone then let a step pass, with a warning. It lands through review.", base: "", ro: false, destructive: false,
                 input: Input::of::<input::CiTestsProposeQuarantine>(),
                 route: |v| Ok((Method::POST, path(&["repos", &text(v, "repo")?, "submit"]), HashMap::new())),
@@ -1666,6 +1674,10 @@ pub mod input {
         pub suggestion: Option<String>,
         pub version: Option<i64>,
         pub publish: Option<bool>,
+        /// Its giver's signature (W27-R04): `ci.diffs.statement`'s statement signed where their key
+        /// is, as a Sigstore bundle. An agent's MCP server signs its verdicts and comments through
+        /// its runner by itself.
+        pub signed: Option<serde_json::Value>,
     }
 
     #[derive(Debug, Deserialize, JsonSchema)]
@@ -1676,6 +1688,10 @@ pub mod input {
         pub thread: String,
         pub body: String,
         pub publish: Option<bool>,
+        /// Its giver's signature (W27-R04): `ci.diffs.statement`'s statement signed where their key
+        /// is, as a Sigstore bundle. An agent's MCP server signs its verdicts and comments through
+        /// its runner by itself.
+        pub signed: Option<serde_json::Value>,
     }
 
     #[derive(Debug, Deserialize, JsonSchema)]
@@ -1709,6 +1725,57 @@ pub mod input {
         pub diff: String,
         pub action: CiDiffsReviewAction,
         pub body: Option<String>,
+        /// Its giver's signature (W27-R04): `ci.diffs.statement`'s statement signed where their key
+        /// is, as a Sigstore bundle. An agent's MCP server signs its verdicts and comments through
+        /// its runner by itself.
+        pub signed: Option<serde_json::Value>,
+    }
+
+    #[derive(Debug, Deserialize, JsonSchema)]
+    #[serde(rename_all = "snake_case")]
+    pub enum CiDiffsStatementKind {
+        Verdict,
+        Comment,
+    }
+
+    #[derive(Debug, Deserialize, JsonSchema)]
+    #[serde(rename_all = "snake_case")]
+    pub enum CiDiffsStatementSide {
+        Old,
+        New,
+    }
+
+    /// What to sign to give a verdict or a comment (W27-R04).
+    #[derive(Debug, Deserialize, JsonSchema)]
+    #[serde(deny_unknown_fields)]
+    pub struct CiDiffsStatement {
+        /// The diff: `D12`.
+        pub diff: String,
+        pub kind: CiDiffsStatementKind,
+        pub action: Option<CiDiffsReviewAction>,
+        pub body: Option<String>,
+        pub suggestion: Option<String>,
+        /// A comment's version of the diff; left out, its latest.
+        pub version: Option<i64>,
+        pub thread: Option<String>,
+        pub file: Option<String>,
+        pub side: Option<CiDiffsStatementSide>,
+        pub start_line: Option<i64>,
+        pub end_line: Option<i64>,
+    }
+
+    /// What `kiln verify` walks back from (W27-R10): one of them.
+    #[derive(Debug, Deserialize, JsonSchema)]
+    #[serde(deny_unknown_fields)]
+    pub struct CiVerify {
+        /// A release: its number, or `<environment>/<app>@<version>`.
+        pub deploy: Option<String>,
+        /// An artifact's digest, `sha256:<hex>`.
+        pub artifact: Option<String>,
+        /// `<repository>@<commit>`, of a repository kiln hosts.
+        pub commit: Option<String>,
+        /// A diff (`D12`), or its id.
+        pub change: Option<String>,
     }
 
     #[derive(Debug, Deserialize, JsonSchema)]

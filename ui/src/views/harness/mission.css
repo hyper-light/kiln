@@ -754,16 +754,17 @@ a.ms-why:hover {
 }
 
 /* Over the list: check them all, how many there are, and what to do with those picked, on one line a
-   finger's height (40 px); its hairline, held in view by touch, fading in and out with selecting. It
-   sits on the list's own edges, its hairline's ends, as the filter and the sort over it do: the check
-   (or ring) at its left, the last button at its right. */
+   finger's height (40 px) with room above and below it (48 px in all: 8 px over and under its
+   buttons, as far as they are apart, empty or not, so nothing moves as it fills); its hairline, held
+   in view by touch, fading in and out with selecting. It sits on the list's own edges, its hairline's
+   ends, as the filter and the sort over it do: the check (or ring) at its left, the last button at its right. */
 .ms-listhead {
   display: flex;
   flex-wrap: wrap;
   align-items: center;
   gap: 0 22px;
-  min-height: 40px;
-  padding: 0;
+  min-height: 48px;
+  padding: 4px 0;
   transition: box-shadow 0.2s ease;
 }
 .ms-all {
@@ -1579,4 +1580,216 @@ button.mc-pick[aria-expanded="true"] .mc-chev {
 }
 :root[data-motion="paused"] .mc-toggle .mc-chev {
   transition: none;
+}
+
+/* ---------------------------------------------------------------- an agent's subagents, under its row */
+/* Its toggle: the subagent's mark and which way the tree goes, in the row's tail before its menu. */
+.ms-subs {
+  display: inline-flex;
+  height: 32px;
+  align-items: center;
+  gap: 3px;
+  padding: 0 8px;
+  border-radius: 999px;
+  color: #a1a3ab;
+  transition: color 0.2s;
+}
+.ms-subs .kg {
+  color: #b8a6d5;
+}
+.ms-subs:hover,
+.ms-subs[data-on] {
+  color: #ededee;
+}
+.ms-subs[data-on] {
+  background: rgb(255 255 255 / 7%);
+}
+/* The tree: one row per subagent in the row's own columns, the path where the checkbox is. */
+.ms-tree {
+  border-bottom: 1px solid #25272c;
+}
+.ms-tree-rows {
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+.ms-node {
+  position: relative;
+  display: grid;
+  grid-template-columns: 22px minmax(0, 1fr) 168px 300px;
+  grid-template-areas: "path main meta actions";
+  align-items: start;
+  gap: 0 20px;
+  padding: 9px 8px 9px 6px;
+}
+.ms-node + .ms-node {
+  border-top: 1px solid #25272c;
+}
+.ms-node:hover,
+.ms-node:focus-within {
+  background: #0c0d0f;
+}
+.ms-node-main {
+  grid-area: main;
+  display: flex;
+  min-width: 0;
+  flex-direction: column;
+  gap: 4px;
+  text-align: left;
+}
+.ms-node-name {
+  overflow: hidden;
+  color: #ededee;
+  font-size: 14px;
+  line-height: 20px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.ms-node[data-stand="paused"] .ms-node-name {
+  color: #a9b1bf;
+}
+.ms-node-line {
+  display: flex;
+  min-width: 0;
+  align-items: baseline;
+  gap: 12px;
+}
+.ms-node-text {
+  min-width: 0;
+  overflow: hidden;
+  color: #97999f;
+  font-size: 13px;
+  line-height: 20px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.ms-node-text[data-mono] {
+  color: #ece0ca;
+  font-family: var(--font-mono);
+  font-size: 12px;
+}
+/* What it's at, timed in the meta's column; in the line itself where there's no meta column. */
+.ms-node-time {
+  display: none;
+  flex: none;
+  color: #7b7e88;
+  font-family: var(--font-mono);
+  font-size: 10.5px;
+  font-variant-numeric: tabular-nums;
+}
+.ms-node-meta {
+  grid-area: meta;
+  display: flex;
+  min-width: 0;
+  flex-direction: column;
+  gap: 5px;
+  padding-top: 2px;
+  color: #7b7e88;
+  font-family: var(--font-mono);
+  font-size: 11px;
+  line-height: 16px;
+  white-space: nowrap;
+}
+.ms-node-meta > span {
+  max-width: 100%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.ms-node-actions {
+  grid-area: actions;
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 8px;
+}
+.ms-node .ms-word > i {
+  background: #7e818a;
+}
+.ms-node[data-stand="working"] .ms-word {
+  color: #cdc6ea;
+}
+.ms-node[data-stand="working"] .ms-word > i {
+  background: #bab0e3;
+}
+.ms-node[data-stand="needs"] .ms-word {
+  color: #e2cfae;
+}
+.ms-node[data-stand="needs"] .ms-word > i {
+  background: #d8bb95;
+}
+.ms-node[data-stand="paused"] .ms-word {
+  color: #b8c2d3;
+}
+.ms-node[data-stand="paused"] .ms-word > i {
+  background: #a6b2c6;
+}
+.ms-node[data-stand="done"] .ms-word {
+  color: #bfdccf;
+}
+.ms-node[data-stand="done"] .ms-word > i {
+  background: #a8c9bc;
+}
+.ms-node[data-stand="failed"] .ms-word,
+.ms-node[data-stand="stopped"] .ms-word {
+  color: #e2b9bd;
+}
+.ms-node[data-stand="failed"] .ms-word > i,
+.ms-node[data-stand="stopped"] .ms-word > i {
+  background: #d1aaad;
+}
+/* Its first lane under the row's checkbox. */
+.ms-node .ms-node-path {
+  left: 0;
+  --tp-bg: #08090a;
+}
+.ms-node:hover .ms-node-path,
+.ms-node:focus-within .ms-node-path {
+  --tp-bg: #0c0d0f;
+}
+@container (max-width: 760px) {
+  /* Narrow: its name and line beside the path, its machine, time and answers beneath, as the row's. */
+  .ms-node {
+    grid-template-columns: 22px minmax(0, 1fr) auto;
+    grid-template-areas:
+      "path main main"
+      "path meta actions";
+    gap: 6px 12px;
+    padding-left: 6px;
+  }
+}
+@media (pointer: coarse) {
+  /* By touch the row has no checkbox column: the path has a column of its own. */
+  .ms-node {
+    grid-template-columns: 38px minmax(0, 1fr) 168px 300px;
+    padding-left: 0;
+  }
+  @container (max-width: 760px) {
+    /* A phone: name, then its word, what it's at and how long; its way in at the right. */
+    .ms-node {
+      grid-template-columns: 38px minmax(0, 1fr) auto;
+      grid-template-areas:
+        "path main actions"
+        "path decide decide";
+      gap: 0 8px;
+      padding: 9px 4px 9px 0;
+    }
+    .ms-node-meta {
+      display: none;
+    }
+    .ms-node-time {
+      display: inline;
+    }
+    /* Its answers on a line of their own under its words. */
+    .ms-node-actions {
+      display: contents;
+    }
+    .ms-node .ms-decide {
+      grid-area: decide;
+      justify-self: start;
+      padding-top: 8px;
+    }
+    .ms-node .ms-tail {
+      grid-area: actions;
+    }
+  }
 }

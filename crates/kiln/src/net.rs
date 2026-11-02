@@ -1105,14 +1105,16 @@ mod tests {
     fn a_frame_made_unreadable_goes_marked_and_is_read_unmarked() {
         let mut o = Outbox::default();
         let (peer, lane) = (7, crate::proto::LANE_TERM);
-        o.faults = vec![(Shed { lane, variant: Some(46), every: 1, act: Act::Unknown(60) }, 0x9e37_79b9_7f4a_7c15)];
+        // One past the runner's last message, as many as there are (W27's came after main's 60).
+        let past = u8::try_from(crate::wire::agent_classes().len()).unwrap_or(u8::MAX);
+        o.faults = vec![(Shed { lane, variant: Some(46), every: 1, act: Act::Unknown(past) }, 0x9e37_79b9_7f4a_7c15)];
         let frame = vec![46u8, 1, 2, 3];
         assert_eq!(o.push(peer, lane, Kind::Term, frame.clone()), Push::Queued);
         let sent = o.queues.get(&(peer, lane)).and_then(|q| q.front()).map(|(_, d)| d.clone()).unwrap_or_default();
         assert!(sent.starts_with(&MARK), "{sent:?}");
-        assert_eq!(unmarked(&sent), [60u8, 1, 2, 3], "its index one past, the mark off");
+        assert_eq!(unmarked(&sent), [past, 1, 2, 3], "its index one past, the mark off");
         assert_eq!(unmarked(&frame), frame, "one not made unreadable is read as it went");
-        assert!(matches!(crate::proto::read_agent(&sent), Err(crate::proto::Unreadable::Unknown { index: 60, .. })), "read as it was made");
+        assert!(matches!(crate::proto::read_agent(&sent), Err(crate::proto::Unreadable::Unknown { index, .. }) if index == u64::from(past)), "read as it was made");
     }
 
     async fn next_event(rx: &async_channel::Receiver<NetEvent>, deadline: Instant) -> anyhow::Result<NetEvent> {
@@ -1285,7 +1287,8 @@ mod tests {
             let patience = Duration::from_millis(300);
             // Updates up (the runner's sender, the server's receiver); commands down.
             let (mut up, mut up_in) = (Sender::new(1 << 20, patience), Receiver::new());
-            let (mut down, mut down_in) = (Sender::new(1 << 20, patience), Receiver::new());
+            // The runner's of the server's commands asks for a gap again on time, as a runner does.
+            let (mut down, mut down_in) = (Sender::new(1 << 20, patience), Receiver::timed());
             for n in 0..N {
                 up.push("s:x", n.to_be_bytes().to_vec()).map_err(|_| anyhow::anyhow!("full"))?;
                 down.push("cmd", n.to_be_bytes().to_vec()).map_err(|_| anyhow::anyhow!("full"))?;
@@ -1347,7 +1350,7 @@ mod tests {
                             };
                             let (rx, took, tx, answered) = if server { (&mut up_in, &mut took_up, &mut down, &mut answered_down) } else { (&mut down_in, &mut took_down, &mut up, &mut answered_up) };
                             match frame {
-                                Frame::Item { stream, seq, low, body } => match rx.on_item(&stream, seq, low, body) {
+                                Frame::Item { stream, seq, low, body } => match rx.on_item(&stream, seq, low, body, Instant::now()) {
                                     Arrival::Take(body) => {
                                         if let Some(i) = index(&body) {
                                             if let Some(t) = took.get_mut(i) {
@@ -1372,6 +1375,9 @@ mod tests {
                         }
                     }
                 }
+                // The gaps the runner still lacks of the server's commands, asked for again on its
+                // own clock.
+                answers.extend(down_in.wants(Instant::now()).into_iter().map(|f| (false, f)));
                 for (server, f) in answers {
                     match (server, peer) {
                         (true, Some(p)) => {

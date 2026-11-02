@@ -68,7 +68,7 @@ test("one of its harness's own subagents asks you: its row names it, opens its t
   await row.locator(".sa-main").click();
   await expect(page).toHaveURL(/\/agents\/ask-own\?task=a5d1c3e5f7a9b1c3d$/);
   await expect(row).toHaveCount(0);
-  await page.getByRole("button", { name: "Main thread", exact: true }).click();
+  await page.locator(".hx-crumbs").getByRole("link", { name: "Docs check", exact: true }).click();
   await expect(row).toBeVisible();
   const sent = commandTo(page, "ask-own");
   await row.getByRole("button", { name: "Allow" }).click();

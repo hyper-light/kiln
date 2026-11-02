@@ -435,7 +435,7 @@ pub enum Refusal {
 }
 
 /// A unix time, as RFC 3339 (the number itself when it's out of range).
-fn when(secs: i64) -> String {
+pub(crate) fn when(secs: i64) -> String {
     jiff::Timestamp::from_second(secs).map(|t| t.to_string()).unwrap_or_else(|_| secs.to_string())
 }
 
@@ -461,7 +461,7 @@ fn name_of(cert: &X509Certificate<'_>) -> String {
     }
 }
 
-fn hex(bytes: &[u8]) -> String {
+pub(crate) fn hex(bytes: &[u8]) -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
 

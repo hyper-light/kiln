@@ -384,6 +384,8 @@ pub async fn route(hub: &Arc<Hub>, rest: &[&str], q: &HashMap<String, String>, r
         // W16-R03: tests, failures first.
         (&Method::GET, ["runs", id, "tests"]) => boxed(|| super::results::of(hub, Some(id), None, q)).await,
         (&Method::GET, ["legs", id, "tests"]) => boxed(|| super::results::of(hub, None, Some(id), q)).await,
+        // W27-R05: a leg's results as it signed them, and how what kiln keeps holds to them.
+        (&Method::GET, ["legs", id, "signed"]) => boxed(|| super::signed::get(hub, id)).await,
         (&Method::GET, ["repos", repo, "tests"]) => boxed(|| super::results::repo(hub, repo, q)).await,
         (&Method::GET, ["repos", repo, "tests", id, "history"]) => boxed(|| super::results::history(hub, repo, id, q)).await,
         // W19-R06: what notifications went out.

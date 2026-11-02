@@ -5,6 +5,7 @@
 import type { Res } from "@/lib/data";
 import { apiPath } from "@/lib/peer-base";
 import { request } from "./client";
+import { signed } from "@/lib/signing";
 
 export type DiffState = "draft" | "needs-review" | "changes-requested" | "accepted" | "landing" | "landed" | "abandoned";
 
@@ -275,12 +276,20 @@ export const reviewApi = {
   dependencies: (key: string, to: number, from: number | null, signal?: AbortSignal) =>
     request<Dependencies>("GET", `/api/diffs/${enc(key)}/dependencies?to=${to}${from != null ? `&from=${from}` : ""}`, undefined, { signal }),
   threads: (key: string, signal?: AbortSignal) => request<{ threads: Thread[]; gate?: ReviewGate }>("GET", `/api/diffs/${enc(key)}/comments`, undefined, { signal }).then((r) => r.threads),
-  comment: (
+  /** A comment, signed by whoever gives it (W27-R04: `signed`). */
+  comment: async (
     key: string,
     body: { body: string; suggestion?: string; publish?: boolean; thread?: string; version?: number; file?: string; side?: "old" | "new"; start_line?: number; end_line?: number; kind?: ThreadKind },
-  ) => request<{ id: string; thread: string; draft: boolean }>("POST", `/api/diffs/${enc(key)}/comments`, body),
-  editComment: (id: string, body: { body?: string; suggestion?: string; state?: "resolved" | "open"; kind?: ThreadKind; reason?: string }) =>
-    request<{ id: string; thread: string; state: string; kind?: ThreadKind }>("PATCH", `/api/comments/${enc(id)}`, body),
+  ) => {
+    const s = await signed(`/api/diffs/${enc(key)}/statement`, { ...body, kind: "comment" });
+    return request<{ id: string; thread: string; draft: boolean }>("POST", `/api/diffs/${enc(key)}/comments`, s ? { ...body, signed: s } : body);
+  },
+  /** A comment edited; its new words signed by its author (W27-R04: `signed`). */
+  editComment: async (id: string, body: { body?: string; suggestion?: string; state?: "resolved" | "open"; kind?: ThreadKind; reason?: string }) => {
+    const words = body.body !== undefined || body.suggestion !== undefined;
+    const s = words ? await signed(`/api/comments/${enc(id)}/statement`, { body: body.body, suggestion: body.suggestion }) : undefined;
+    return request<{ id: string; thread: string; state: string; kind?: ThreadKind }>("PATCH", `/api/comments/${enc(id)}`, s ? { ...body, signed: s } : body);
+  },
   deleteComment: (id: string) => request<{ id: string; thread: string; deleted: boolean; thread_deleted: boolean }>("DELETE", `/api/comments/${enc(id)}`),
   applySuggestion: (id: string, suggestion?: number) =>
     request<{ diff: string; version: number; thread: string; state: string; commit?: string; suggestion?: number; signer?: string | null }>(
@@ -288,12 +297,16 @@ export const reviewApi = {
       `/api/comments/${enc(id)}/apply`,
       suggestion == null ? {} : { suggestion },
     ),
-  review: (key: string, action: ReviewAction, body: string, force?: boolean) =>
-    request<{ diff: string; action: string; version: number; published: number; state: string; note?: string | null }>(
-      "POST",
-      `/api/diffs/${enc(key)}/review`,
-      force ? { action, body, force } : { action, body },
-    ),
+  /** A verdict, signed by whoever gives it (W27-R04: `signed`). */
+  review: async (key: string, action: ReviewAction, body: string, force?: boolean) => {
+    const s = await signed(`/api/diffs/${enc(key)}/statement`, { kind: "verdict", action, body });
+    return request<{ diff: string; action: string; version: number; published: number; state: string; note?: string | null }>("POST", `/api/diffs/${enc(key)}/review`, {
+      action,
+      body,
+      ...(force ? { force } : {}),
+      ...(s ? { signed: s } : {}),
+    });
+  },
   viewed: (key: string, file: string, viewed: boolean) => request<{ file: string; viewed: boolean; version: number }>("POST", `/api/diffs/${enc(key)}/viewed`, { file, viewed }),
   readiness: (key: string, signal?: AbortSignal) => request<Readiness>("GET", `/api/diffs/${enc(key)}/land`, undefined, { signal }),
   land: (key: string, strategy?: string) => request<unknown>("POST", `/api/diffs/${enc(key)}/land`, strategy ? { strategy } : {}),
@@ -352,6 +365,20 @@ export interface HostThread {
   comments: HostComment[];
 }
 
+/** What a repository's host verified of a commit's signature, as kiln keeps it (W27-R03). */
+export interface HostSignature {
+  sha: string;
+  /** `unknown`: the host verifies none (Bitbucket), or kiln hasn't read it yet. */
+  state: "verified" | "unverified" | "unsigned" | "unknown";
+  /** The host's own word for it (GitHub's reason, GitLab's status), or why it can't say. */
+  reason: string;
+  /** Who the host says signed it, once verified. */
+  signer: string | null;
+  verified_at: number | null;
+  /** When kiln read it (none: not yet). */
+  read_at: number | null;
+}
+
 export interface HostPullDetail extends HostPull {
   files: { path: string; old_path: string | null; status: string; additions: number | null; deletions: number | null; patch: string | null }[];
   conversation: HostComment[];
@@ -360,6 +387,8 @@ export interface HostPullDetail extends HostPull {
   merge_methods: string[];
   /** Every provider's runs of its head commit, from kiln's own tables. */
   checks: { state?: "success" | "failure" | "pending" | "none"; checks?: HostCheck[]; error?: string };
+  /** What the host verified of each of its commits, oldest first, its head last. */
+  signatures: { commits?: HostSignature[]; error?: string };
 }
 
 /** Who acted on the host: you, with the account you signed in with, or kiln's credentials there. */
@@ -501,6 +530,42 @@ export const conflictsApi = {
 };
 
 export const conflictsRes = (key: string): Res<Conflicts> => ({ key: `review/conflicts/${key}`, fetch: (s) => conflictsApi.list(key, s), opts: { on: ["conflict", "diff_version", "diff"] } });
+
+/** A verdict carried to a rebase-only version, as kiln signs it (docs/ci.md W27-R08): from the version it was given on to the one it reached, the shared verbatim patch-id, each one's base, kiln's record of it, and its words ("carried from v2: rebase only, …"). */
+export interface VerdictCarried {
+  from: number;
+  to: number;
+  patch_id?: string;
+  base_from?: string;
+  base_to?: string;
+  record?: string;
+  said?: string;
+  error?: string;
+}
+
+/** Where a verdict's signature stands on a change's latest version (W27-R04): given there, carried there, not, or unsigned. */
+export interface VerdictStanding {
+  id: string;
+  reviewer: string;
+  version: number;
+  action: string;
+  standing: "given" | "carried" | "not" | "unsigned";
+  why?: string | null;
+  signer?: string | null;
+  carried?: VerdictCarried;
+}
+
+export interface Verdicts {
+  diff: string;
+  latest: number;
+  verdicts: VerdictStanding[];
+}
+
+export const verdictsRes = (key: string): Res<Verdicts> => ({
+  key: `review/verdicts/${key}`,
+  fetch: (s) => request<Verdicts>("GET", `/api/diffs/${enc(key)}/verdicts`, undefined, { signal: s }),
+  opts: { on: ["review", "diff_version"] },
+});
 
 /** The threads of a change, with the gate as it stands for the caller approving (W26-R11). */
 export interface Comments {

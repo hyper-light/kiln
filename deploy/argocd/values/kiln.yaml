@@ -30,8 +30,16 @@ config:
 
 # Production's memory limit (Ada, 2026-10-24). kiln:61b07ceb's start peaked at the chart's 2Gi,
 # which tripped the guard's memory check (share over 0.8) and rolled it back into a crash loop. The
-# chart's default stays 2Gi; the requests stay the chart's.
+# chart's default stays 2Gi.
+# Its requests near what it uses (about 4.6 GiB, 2026-11-01): kiln-m02, where its volume keeps it,
+# is also the one node big CI pods fit, and at the chart's 256Mi nothing there was set aside for
+# it. Two CPUs give it the CPU weight of the CI pods beside it (2 to 4 each) rather than a tenth of
+# it (Ada, 2026-11-01). If kiln-m02 is full when it restarts (Recreate), kiln-control preempts
+# kiln-job pods to make the room.
 resources:
+  requests:
+    cpu: "2"
+    memory: 6Gi
   limits:
     memory: 16Gi
 

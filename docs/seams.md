@@ -478,9 +478,10 @@ Methods: `agents`, `agent`, `catalog`, `send`.
 ## Forge
 
 What a git host does with changes (docs/ci.md W26-R20), for Review in Ship: stacks, the host's
-queue, updating a stale change, batched reviews, merging, and what a repository has of each
-(`abilities`). Theirs where a host has it, kiln's where it doesn't: a host lacking one refuses it
-`Unsupported`, naming what kiln does instead.
+queue, updating a stale change, batched reviews, merging, what the host verified of a change's
+commits' signatures (W27-R03), and what a repository has of each (`abilities`). Theirs where a
+host has it, kiln's where it doesn't: a host lacking one refuses it `Unsupported`, naming what kiln
+does instead, and one that verifies no signatures says each commit's is `Unknown`, and why.
 
 | | GitHub | GitLab | Bitbucket |
 |---|---|---|---|
@@ -490,6 +491,7 @@ queue, updating a stale change, batched reviews, merging, and what a repository 
 | Any host | a commit kiln replayed, pushed with a lease on the expected head | | |
 | Batched review | its pending review | its draft notes | held by kiln, then posted together |
 | Merging | in the background, polled (`merge_result`), cancelled if the head moved | at once, against an expected head | at once, against an expected head |
+| Signatures | each commit's `verification` on the pull request's commits, kept from the push on | each commit's signature, asked of it (none: unsigned) | none: each commit `Unknown` |
 
 Reads are conditional: a read with the ETag of a change, or of the open changes, that hasn't
 changed is `NotModified` and costs no request, as GitHub's 304s don't count. Every other request
@@ -508,15 +510,19 @@ resets, never dropped.
   rate limits of GitHub 5000 requests an hour, GitLab 7200, Bitbucket 1000 (a GitHub App
   installation's, Self-Managed GitLab's default once on, Bitbucket Cloud's), on the simulator's
   own clock (`advance`). Bitbucket's drafts are kiln's to hold and cost the host nothing.
+  `verifications` reads a change's first 250 commits (GitHub lists no more of a pull request's).
+  A simulated commit is unsigned until `sign` signs it: by a key the host has as the signer's
+  (verified on GitHub and GitLab, as each says it), or by one it hasn't (unverified).
 - **Used by:** Review in Ship (docs/ci.md W26): keeping changes fresh (R16), landing through a
   host's own queue where a repository has one (R19), batched reviews (R07, R08), and the hosts'
-  mirror of pull requests.
+  mirror of pull requests, which keeps what each host verified of each commit (W27-R03) in
+  `verifications`' terms, read from the same shapes.
 - **Passed by:** each simulator (GitHub's, GitLab's, Bitbucket's), every clause; githost against
   each simulator, served in its host's REST shape, every clause. The suite's fixture gives the
   host's git side too (pushes, the queue's checks, the clock), as the simulator the implementation
   reaches.
 
-Methods: `abilities`, `open`, `change`, `changes`, `update`, `stack`, `stack_add`, `stack_of`, `unstack`, `merge`, `merge_result`, `enqueue`, `dequeue`, `queued`, `draft`, `drafts`, `publish`, `comments`, `rate`.
+Methods: `abilities`, `open`, `change`, `changes`, `update`, `stack`, `stack_add`, `stack_of`, `unstack`, `merge`, `merge_result`, `enqueue`, `dequeue`, `queued`, `draft`, `drafts`, `publish`, `comments`, `rate`, `verifications`.
 
 - **FORGE-1** abilities say what the repository has of stacks, a queue, updating, batched reviews and merging, as its host has them, its queue only while it's on
 - **FORGE-2** a change opened is read back with its author, branches and head; one never opened is refused NotFound
@@ -537,6 +543,7 @@ Methods: `abilities`, `open`, `change`, `changes`, `update`, `stack`, `stack_add
 - **FORGE-17** a merged change refuses updates, merges, queueing, stacking and drafts: Closed
 - **FORGE-18** bad requests are refused Invalid and change nothing: a branch that isn't there, a change into itself or from a branch with one open, a blank title, a blank or long comment, an empty stack
 - **FORGE-19** unstacking takes a stack's unmerged changes out of it, leaving those queued in place, and dissolves it once none are left; a host that can't refuses Unsupported
+- **FORGE-20** a change's commits are read oldest first with what the host verified of each signature, and why: one by a key the host has as its signer's Verified, naming them; one by a key it hasn't Unverified; one unsigned Unsigned; a host that verifies none (its abilities say) says Unknown of each; a change never opened is refused NotFound
 
 ## Search
 
@@ -585,17 +592,25 @@ identity token names, the key's holder proving it has it by signing the token's 
 entries, numbered in the order they come, promises each (its signed entry timestamp), proves each
 is in its tree, and gives each back by its number.
 
-- **Implementations:** kiln's client of the Fulcio and Rekor `[ci.attest]` names
-  (`kiln::ci::signing::Remote`: Fulcio's `/api/v2/signingCert`, Rekor's `/api/v1/log/entries`);
+- **Implementations:** kiln's clients of the Fulcio and Rekor `[ci.attest]` names: Rekor's v1 API
+  (`kiln::ci::signing::Remote`: Fulcio's `/api/v2/signingCert`, Rekor's `/api/v1/log/entries`), or
+  with `rekor_api = "v2"` Rekor v2's (`kiln::ci::signing::RemoteV2`, rekor-tiles: an entry logged at
+  `/api/v2/log/entries`, hashedrekord the one kind it takes, read back from its tiles under
+  `/api/v2` and proven against its checkpoint; it promises nothing, its checkpoints and proofs are
+  what hold it);
   `kiln_seams::sigstore::SimSigstore`, which certifies with a CA of its own and logs in an RFC 6962
   tree of its own, its promises and checkpoints signed with a key of its own:
   `SimSigstore::trusted_root` is Sigstore's trust in it, so kiln's verifier verifies what it signs.
   Its keys come from a seed; its certificates are for code signing and valid ten minutes; its log
   holds 100,000 entries (past it, refused `Full`), each request a second after the last from the
   start it's given.
-- **Used by:** kiln's keyless signing (`[ci.attest] signing = "keyless"`, `ci/signing.rs`).
-- **Passed by:** the simulator, every clause; kiln's client, every clause, over Fulcio's and
-  Rekor's HTTP APIs against an HTTP front of the simulator (`ci::signing`'s tests). Not yet against
+- **Used by:** kiln's keyless signing (`[ci.attest] signing = "keyless"`, `ci/signing.rs`), and the
+  trail's anchors: each checkpoint the server signs, logged as a hashedrekord entry where
+  `[ci.attest] rekor_url` names a Rekor (`trail.rs`, docs/ci.md W27-R09).
+- **Passed by:** the simulator, every clause; kiln's clients, every clause, over Fulcio's and
+  Rekor's HTTP APIs (v1, and v2's with its tiles) against an HTTP front of the simulator
+  (`ci::signing`'s tests). Where a log takes hashedrekord entries alone (v2), the clauses log those,
+  and SIGSTORE-7 asks no promise of a log that makes none (`SigstoreFixture::kinds`, `promises`). Not yet against
   a real Fulcio and Rekor (one deployed in kiln's cluster, W18-R02).
 
 Methods: `certify`, `log`, `entry`.
@@ -606,5 +621,6 @@ Methods: `certify`, `log`, `entry`.
 - **SIGSTORE-4** entries are numbered in the order they're logged, and their times never go back
 - **SIGSTORE-5** the same entry logged twice is refused Conflict, naming where it is
 - **SIGSTORE-6** an index never logged is refused NotFound
-- **SIGSTORE-7** an entry comes with the log's promise and the proof of its inclusion: its index in a tree of more entries than that, the tree's root, and a checkpoint of that tree
+- **SIGSTORE-7** an entry comes with the proof of its inclusion: its index in a tree of more entries than that, the hashes leading from it to the tree's root, and a checkpoint of that tree; and with the log's promise, where the log promises
 - **SIGSTORE-8** an entry whose signature isn't its verifier's is refused Invalid, naming the entry
+- **SIGSTORE-9** a hashedrekord entry (a SHA-256, and its key's signature over it) is logged and found again, keeping its hash; one whose signature is over another hash is refused Invalid, naming the entry

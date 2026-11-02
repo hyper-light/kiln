@@ -297,13 +297,18 @@ pub async fn contents(s: &Site<'_>, path: &str, r: Option<&str>, raw: bool) -> R
 }
 
 /// `GET /repos/{o}/{r}/tarball/{ref}` and `/zipball/{ref}`: the commit's tree under one top-level
-/// directory, as GitHub's archives are (what `actions/checkout` unpacks when git is missing).
-pub async fn archive(s: &Site<'_>, r: &str, zip: bool) -> Result<Response, Fail> {
+/// directory, as GitHub's archives are (what `actions/checkout` unpacks when git is missing). A
+/// tarball is kept as served to the asking `leg` by its bytes' SHA-256 (docs/ci.md W27-R05): the
+/// leg's receipt of its checkout is held to it.
+pub async fn archive(s: &Site<'_>, r: &str, zip: bool, leg: &str) -> Result<Response, Fail> {
     let reference = if r.is_empty() { s.default_branch.clone() } else { r.to_owned() };
     let Some(sha) = s.resolve(&reference).await else { return Ok(not_found()) };
     let prefix = format!("{}-{}-{}/", s.owner(), s.name(), sha.get(..7).unwrap_or(&sha));
     let fmt = if zip { "--format=zip" } else { "--format=tar.gz" };
     let bytes = s.git(&["archive", fmt, &format!("--prefix={prefix}"), &sha]).await.map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")))?;
+    if !zip && let Err(e) = crate::ci::signed::served(s.hub, leg, &sha, &crate::util::sha256_hex(&bytes)).await {
+        tracing::warn!(leg, error = %format!("{e:#}"), "the tarball served to a leg wasn't recorded");
+    }
     let name = format!("{}-{}-{}.{}", s.owner(), s.name(), sha.get(..7).unwrap_or(&sha), if zip { "zip" } else { "tar.gz" });
     let r = srv::response(StatusCode::OK, if zip { "application/zip" } else { "application/x-gzip" }, srv::full(bytes));
     Ok(srv::with_header(r, http::header::CONTENT_DISPOSITION, &format!("attachment; filename={name}")))

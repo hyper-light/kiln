@@ -66,6 +66,10 @@ pub struct RunReq {
     /// Keep running if this client goes away.
     #[serde(default)]
     pub detach: bool,
+    /// The agent session asking, as this runner tells from the client's process (never on the
+    /// wire): a run on another machine is its act, which kiln must take first (docs/ci.md W27-R08).
+    #[serde(skip)]
+    pub asker: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -305,6 +309,23 @@ fn spec_of(req: &RunReq) -> RunSpec {
 }
 
 async fn run_inner(handle: &Handle, me: &str, req: RunReq, ev: &async_channel::Sender<Ev>, ctl: async_channel::Receiver<Req>) -> anyhow::Result<()> {
+    // An agent session's run on another machine is its act: it goes only once kiln takes it as
+    // the session's holder's now (a copy left behind's is refused, and so is any while kiln can't
+    // be asked), docs/ci.md W27-R08. One that names another machine is asked about first.
+    let elsewhere = !req.target.is_empty() && req.target != me;
+    let taken = |on: String| {
+        let session = req.asker.clone();
+        let what = format!("a run on {on}: {}", req.command);
+        async move {
+            match session {
+                Some(s) => crate::runner::custody::act_taken(handle, &s, &what).await.map_err(|why| anyhow::anyhow!("refused: {why}")),
+                None => Ok(()),
+            }
+        }
+    };
+    if elsewhere {
+        taken(req.target.clone()).await?;
+    }
     let choice = pick(handle, me, &req.target).await?;
     let peer = choice.runner.name.clone();
     let _ = ev.send(Ev::Picked { runner: peer.clone(), why: choice.why.clone() }).await;
@@ -313,6 +334,9 @@ async fn run_inner(handle: &Handle, me: &str, req: RunReq, ev: &async_channel::S
         // This machine suits best: no copy, no link — the folder as it is.
         spec.cwd = req.cwd.clone().or(req.remote_cwd.clone());
         return run_here(spec, req.detach, ev, ctl).await;
+    }
+    if !elsewhere {
+        taken(peer.clone()).await?;
     }
     handle.connect(&peer).await?;
     if req.sync {
@@ -485,6 +509,22 @@ pub fn serve(_handle: Handle, _me: String, _path: PathBuf, _take: bool) -> anyho
     anyhow::bail!("reach's local socket needs Unix sockets")
 }
 
+/// The process at the other end of a connection, where the system says.
+#[cfg(target_os = "linux")]
+fn peer_pid(fd: &std::os::fd::OwnedFd) -> Option<u32> {
+    nix::sys::socket::getsockopt(fd, nix::sys::socket::sockopt::PeerCredentials).ok().and_then(|c| u32::try_from(c.pid()).ok())
+}
+
+#[cfg(any(target_os = "macos", target_os = "ios"))]
+fn peer_pid(fd: &std::os::fd::OwnedFd) -> Option<u32> {
+    nix::sys::socket::getsockopt(fd, nix::sys::socket::sockopt::LocalPeerPid).ok().and_then(|p| u32::try_from(p).ok())
+}
+
+#[cfg(all(unix, not(any(target_os = "linux", target_os = "macos", target_os = "ios"))))]
+fn peer_pid(_fd: &std::os::fd::OwnedFd) -> Option<u32> {
+    None
+}
+
 /// One client: its first request decides what the connection is.
 #[cfg(unix)]
 async fn connection(handle: Handle, me: String, fd: std::sync::Arc<std::os::fd::OwnedFd>) {
@@ -523,7 +563,12 @@ async fn connection(handle: Handle, me: String, fd: std::sync::Arc<std::os::fd::
             }
         }
     });
-    let Ok(first) = crate::rt::timeout(Duration::from_secs(10), req_rx.recv()).await.unwrap_or(Err(async_channel::RecvError)) else { return };
+    let Ok(mut first) = crate::rt::timeout(Duration::from_secs(10), req_rx.recv()).await.unwrap_or(Err(async_channel::RecvError)) else { return };
+    // A run's asker: the agent session the client's process belongs to, if any.
+    if let Req::Run(r) | Req::RunReuse(r) = &mut first {
+        let pid = peer_pid(&fd);
+        r.asker = crate::rt::blocking(move || pid.and_then(crate::runner::custody::session_of_pid)).await.ok().flatten();
+    }
     match first {
         Req::Status => {
             let s = handle.status().await.map(|v| v.to_string()).unwrap_or_else(|e| format!("{{\"error\": {:?}}}", format!("{e:#}")));

@@ -8,7 +8,7 @@
 //! instance owns each terminal, agent session and job, so messages about them reach the process
 //! that holds them. Pure data (no I/O); the hub drives it.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::time::Instant;
 
 use serde::Serialize;
@@ -141,6 +141,9 @@ pub struct Instances {
     by_peer: HashMap<PeerId, Instance>,
     announced: HashMap<PeerId, InstanceHello>,
     owners: HashMap<Owned, PeerId>,
+    /// Joined peers connected again that haven't said hello on the new connection yet
+    /// ([`Instances::connected`]).
+    rejoining: HashSet<PeerId>,
 }
 
 /// What happened when an instance said hello.
@@ -156,12 +159,25 @@ pub struct Joined {
 }
 
 impl Instances {
+    /// A connection of `peer` came up ([`crate::net::NetEvent::Connected`]). A peer id is its
+    /// certificate's, so a runner that starts again, or connects again before its last connection
+    /// is seen to close, comes back under the one it joined with: its connection says which process
+    /// it is and hello again, and it joins as what it says, never as the instance the last one
+    /// joined as (docs/ci.md W27-R01: a restarted runner certified as "legacy").
+    pub fn connected(&mut self, peer: PeerId) {
+        self.announced.remove(&peer);
+        if self.by_peer.contains_key(&peer) {
+            self.rejoining.insert(peer);
+        }
+    }
+
     /// [`crate::proto::AgentMsg::Instance`], which precedes Hello.
     pub fn announce(&mut self, peer: PeerId, ih: InstanceHello) {
         self.announced.insert(peer, ih);
     }
 
     pub fn join(&mut self, peer: PeerId, name: &str, hello: Hello, now: i64) -> Joined {
+        self.rejoining.remove(&peer);
         let ih = self.announced.remove(&peer);
         let id = ih.as_ref().map(|i| i.id.clone());
         // The same instance (same id, or the one legacy runner) on another peer is a stale
@@ -211,9 +227,12 @@ impl Instances {
     /// An instance that has joined says again when it was set up: a blue/green upgrade's new build
     /// (`crate::bluegreen`) joins ranked oldest, so new work stays with the runner it takes over
     /// from, and once promoted says when it really was set up, which makes it the newest. `None`
-    /// when `peer` hasn't joined (its hello is still to come); else the machine's instances that
-    /// should stop taking jobs now (Drain).
+    /// when `peer` hasn't joined on its connection (its hello is still to come); else the machine's
+    /// instances that should stop taking jobs now (Drain).
     pub fn reannounce(&mut self, peer: PeerId, ih: &InstanceHello) -> Option<Vec<PeerId>> {
+        if self.rejoining.contains(&peer) {
+            return None;
+        }
         let i = self.by_peer.get_mut(&peer)?;
         i.created_at = ih.created_at;
         i.pid = Some(ih.pid);
@@ -302,6 +321,7 @@ impl Instances {
     /// The connection went away. Returns the instance and what it owned.
     pub fn lost(&mut self, peer: PeerId) -> Option<(Instance, Vec<Owned>)> {
         self.announced.remove(&peer);
+        self.rejoining.remove(&peer);
         let i = self.by_peer.remove(&peer)?;
         let owned = self.owned_by(peer);
         Some((i, owned))
@@ -508,6 +528,41 @@ mod tests {
         assert_eq!(inst.reannounce(2, &ih("green", 100)), Some(vec![]), "drained once");
         // Before its hello, an announcement is the one its hello comes with.
         assert_eq!(inst.reannounce(3, &ih("other", 5)), None);
+    }
+
+    /// W27-R01: a peer id is its certificate's, so a runner started again before its last
+    /// connection is seen to close comes back under the same one. What the new connection
+    /// announces is for its join: it joins as the instance it says (not "legacy", which its
+    /// certificates named), and isn't taken for a new build taking over.
+    #[test]
+    fn w27_r01_a_runner_connecting_again_under_its_peer_id_joins_as_the_instance_it_says() {
+        // What the hub does with a connection's Instance (hub.rs `on_agent_msg`).
+        fn instance(m: &mut Instances, peer: PeerId, ih: InstanceHello) -> Option<Vec<PeerId>> {
+            let again = m.reannounce(peer, &ih);
+            if again.is_none() {
+                m.announce(peer, ih);
+            }
+            again
+        }
+        let mut m = Instances::default();
+        m.connected(7);
+        assert_eq!(instance(&mut m, 7, ih("main", 0)), None);
+        m.join(7, "box", hello("1"), 1);
+        assert_eq!(m.get(7).map(Instance::label).as_deref(), Some("main"));
+        // Killed and started again: the new connection comes up before the last is seen to close.
+        m.connected(7);
+        assert_eq!(instance(&mut m, 7, ih("main", 0)), None, "an announcement before its hello, not a take-over");
+        assert_eq!(m.join(7, "box", hello("1"), 2), Joined { stale: vec![], drain: vec![], newest: true });
+        assert_eq!(m.get(7).map(Instance::label).as_deref(), Some("main"));
+        // Joined on this connection, it announces again as a promoted build does: a take-over.
+        assert_eq!(instance(&mut m, 7, ih("main", 0)), Some(vec![]));
+        // Connected again and gone before its hello: nothing of that connection is waited for.
+        m.connected(7);
+        assert!(m.lost(7).is_some());
+        m.connected(7);
+        assert_eq!(instance(&mut m, 7, ih("main", 0)), None);
+        m.join(7, "box", hello("1"), 3);
+        assert_eq!(m.get(7).map(Instance::label).as_deref(), Some("main"));
     }
 
     /// A machine's replica is its newest process's (docs/p2p.md, P2): a blue/green upgrade's new

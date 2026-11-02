@@ -440,7 +440,15 @@ fn p3_release_repositories_on_github() -> anyhow::Result<()> {
     })?;
     assert_eq!(git(&releases, &["rev-parse", "main"])?, commit);
     assert!(git(&releases, &["log", "-1", "--format=%B", &commit])?.contains(&format!("Kiln-Release: {id}")));
-    let status_of = |sha: &str, env: &str| -> Vec<Value> {
+    // CD made the release's commit, signed as CD; it verifies to kiln's root as CD (W27-R03, AC03).
+    let raw = Command::new("git").arg("-C").arg(&releases).args(["cat-file", "commit", &commit]).output()?.stdout;
+    let sig = kiln_ci::identity::gitsig::signature_of(&raw).ok_or_else(|| anyhow::anyhow!("CD's commit isn't signed: {}", String::from_utf8_lossy(&raw)))?;
+    let (st, ca) = http(s.port, "GET", "/ca.pem", "", None)?;
+    anyhow::ensure!(st == 200, "{st} {ca}");
+    let now = i64::try_from(std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)?.as_secs())?;
+    let v = kiln_ci::identity::gitsig::verify(&kiln_ci::identity::gitsig::payload(&raw), &sig, &kiln::pki::der_of(&ca)?, &[], now)?;
+    assert_eq!(v.identity.actor, kiln_ci::identity::chain::Actor::Cd, "as CD: {v}");
+    let status_of =|sha: &str, env: &str| -> Vec<Value> {
         fake.lock()
             .map(|g| {
                 let ids: Vec<u64> = g.deployments.iter().filter(|d| d.get("sha") == Some(&json!(sha)) && d.get("environment") == Some(&json!(env))).filter_map(|d| d.get("id").and_then(Value::as_u64)).collect();

@@ -57,6 +57,14 @@ struct Held {
     keys: HashMap<String, Key>,
     /// Certificates (PEM), by what they're for, with where each was written.
     certs: HashMap<String, (String, PathBuf)>,
+    /// What kiln said of each slot as it certified it: its identity's URI and, a leg's, the
+    /// server's delegation of the leg by its digest, which its records act under.
+    given: HashMap<String, Given>,
+}
+
+struct Given {
+    uri: String,
+    under: Option<String>,
 }
 
 impl Held {
@@ -69,6 +77,7 @@ impl Held {
     fn forget(&mut self, which: impl Fn(&str) -> bool) {
         let legs = self.holds_a_leg();
         self.keys.retain(|s, _| !which(s));
+        self.given.retain(|s, _| !which(s));
         let gone: Vec<String> = self.certs.keys().filter(|s| which(s)).cloned().collect();
         for s in gone {
             if let Some((_, file)) = self.certs.remove(&s) {
@@ -103,6 +112,12 @@ pub fn slot(kind: &str, of: Option<&str>, epoch: Option<u64>) -> String {
 /// A leg's key is kept only once the process's memory is out of its steps' reach (they haven't
 /// started: a leg's key is made as the leg is given to this runner).
 pub fn ask(kind: &str, of: Option<&str>, epoch: Option<u64>) -> anyhow::Result<String> {
+    Ok(serde_json::to_string(&request(kind, of, epoch)?)?)
+}
+
+/// [`ask`], before it's sent: what an agent session's ask carries beside its CSR is added to it
+/// (`crate::runner::custody::carrying`).
+pub fn request(kind: &str, of: Option<&str>, epoch: Option<u64>) -> anyhow::Result<IdentityAsk> {
     let slot = slot(kind, of, epoch);
     let csr = {
         let mut held = HELD.lock();
@@ -119,7 +134,9 @@ pub fn ask(kind: &str, of: Option<&str>, epoch: Option<u64>) -> anyhow::Result<S
         let key = held.keys.get(&slot).ok_or_else(|| anyhow::anyhow!("no key for {slot}"))?;
         rcgen::CertificateParams::new(vec!["kiln-identity".to_owned()])?.serialize_request(key)?.pem()?
     };
-    Ok(serde_json::to_string(&IdentityAsk { kind: kind.to_owned(), csr, of: of.map(str::to_owned), epoch })?)
+    // A leg this runner runs signs its records, and the provenance kiln writes when asked
+    // (docs/ci.md W27-R05, R06).
+    Ok(IdentityAsk { kind: kind.to_owned(), csr, of: of.map(str::to_owned), epoch, signs: kind == LEG, ..IdentityAsk::default() })
 }
 
 /// The server's answer: the certificate kept for its slot (and written, public, under
@@ -142,13 +159,83 @@ pub fn given(g: IdentityGiven, state_dir: &Path, label: &str) -> anyhow::Result<
     let path = dir.join(format!("{file}.pem"));
     crate::util::write_secret(&path, pem.as_bytes(), 0o644)?;
     tracing::info!(identity = %g.uri, "identity certified");
+    held.given.insert(slot.clone(), Given { uri: g.uri, under: g.delegation });
     held.certs.insert(slot, (pem, path));
     Ok(())
+}
+
+/// Whether this runner's server issues identities (`CAP_IDENTITY`), so its sessions' git signs as
+/// their agents (W27-R03, [`crate::gitsign`]): a server from before keeps them committing unsigned.
+static ENABLED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Says whether the server issues identities, as it said on connecting.
+pub fn set_enabled(on: bool) {
+    ENABLED.store(on, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Whether the server issues identities ([`set_enabled`]).
+pub fn enabled() -> bool {
+    ENABLED.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// The kiln server this runner works for, by the URLs it's reached at (the one this runner uses,
+/// then those it says it's at), when that server gives agents their own git credential
+/// (`CAP_AGENT_GIT`): its sessions' git pushes there as the agent (W27-R03,
+/// [`crate::gitsign::git_env`]).
+static KILN_GIT: Mutex<Vec<String>> = Mutex::new(Vec::new());
+
+/// Says where the server is (none: it gives agents no git credential of their own), as it said on
+/// connecting.
+pub fn set_kiln_git(urls: Vec<String>) {
+    KILN_GIT.lock().clear();
+    also_kiln_git(urls);
+}
+
+/// Where else the server says it's reached (its public URL, its front doors).
+pub fn also_kiln_git(urls: Vec<String>) {
+    let mut held = KILN_GIT.lock();
+    for u in urls.into_iter().map(|u| u.trim().trim_end_matches('/').to_owned()).filter(|u| u.contains("://")) {
+        if !held.contains(&u) {
+            held.push(u);
+        }
+    }
+}
+
+/// The URLs of the server whose git credential an agent session takes from it ([`set_kiln_git`]).
+pub fn kiln_git() -> Vec<String> {
+    KILN_GIT.lock().clone()
+}
+
+/// The newest epoch of agent session `session` this process holds a certified key at: the epoch
+/// it holds the session at, as kiln certified it.
+pub fn epoch_held(session: &str) -> Option<u64> {
+    let prefix = format!("agent/{session}/");
+    HELD.lock().certs.keys().filter_map(|k| k.strip_prefix(&prefix)?.parse::<u64>().ok()).max()
 }
 
 /// The certificate held for a slot.
 pub fn cert(slot: &str) -> Option<String> {
     HELD.lock().certs.get(slot).map(|(pem, _)| pem.clone())
+}
+
+/// The URI of the identity certified for a slot.
+pub fn uri(slot: &str) -> Option<String> {
+    HELD.lock().given.get(slot).map(|g| g.uri.clone())
+}
+
+/// The delegation a slot's identity acts under, by its digest: a leg's, the server's delegation of
+/// the leg, given with its certificate.
+pub fn under(slot: &str) -> Option<String> {
+    HELD.lock().given.get(slot).and_then(|g| g.under.clone())
+}
+
+/// Signs `message` with the slot's key before kiln has certified it (a receipt that goes with
+/// the ask for its certificate): the signature. The key stays here.
+pub fn sign_uncertified(slot: &str, message: &[u8]) -> anyhow::Result<Vec<u8>> {
+    use rcgen::SigningKey as _;
+    let held = HELD.lock();
+    let key = held.keys.get(slot).ok_or_else(|| anyhow::anyhow!("no key for {slot}"))?;
+    Ok(key.sign(message)?)
 }
 
 /// Signs `message` with the slot's key (ECDSA P-256, SHA-256, ASN.1): the signature, and the
@@ -180,7 +267,7 @@ mod tests {
     fn answer(pki: &crate::pki::Pki, asked: &str, identity: &Identity) -> anyhow::Result<String> {
         let a: IdentityAsk = serde_json::from_str(asked)?;
         let pem = pki.issue_identity(&a.csr, identity, &[], time::Duration::hours(1))?;
-        Ok(serde_json::to_string(&IdentityGiven { kind: a.kind, of: a.of, epoch: a.epoch, uri: identity.uri()?, cert_pem: Some(pem), error: None })?)
+        Ok(serde_json::to_string(&IdentityGiven { kind: a.kind, of: a.of, epoch: a.epoch, uri: identity.uri()?, cert_pem: Some(pem), ..IdentityGiven::default() })?)
     }
 
     /// W27-R02: a slot's key is made here and only a CSR leaves; what it signs verifies under the
