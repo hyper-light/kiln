@@ -618,7 +618,7 @@ code-mode function (`kiln.agents.start`) and, from a kiln shell, a CLI command.
 | `agents.children` | `GET /api/harness/agents/:id/children` | → `{children: [{id, name, kind, status, parent}]}`: the ones still running, and theirs |
 | `agents.interrupt` | `POST /api/harness/agents/:id/interrupt` | → `{interrupted}` |
 | `agents.stop` | `POST /api/harness/agents/:id/stop` | `{children?}` → `{ended: [id]}`: with `children`, what it started (and theirs) end first |
-| `agents.change` | `POST /api/harness/agents/:id/change` | `{title?, body?, draft?, ready?, trunk?, fix_checks?, answers?}` → `{change_request: Change}`: opens its change request from its work, or pushes a new version; `draft` opens it a draft on every host, `ready` marks its draft ready, and `answers` names the threads a new version answers ("Change requests from agents", below) |
+| `agents.change` | `POST /api/harness/agents/:id/change` | `{title?, body?, draft?, ready?, trunk?, fix_checks?, threads?}` → `{change_request: Change}`: opens its change request from its work, or pushes a new version; `draft` opens it a draft on every host, `ready` marks its draft ready, and `threads` names the threads a new version fixes ("Change requests from agents", below) |
 | `agents.changes` | `GET /api/harness/changes` | `agent?` → `{changes: [Change]}`, newest first |
 | `agents.workspace` | `GET /api/harness/agents/:id/workspace` | → `{workspace: {kind, over, sub, volume, mount} \| null, drift: [path]}` ("Workspaces of their own", below) |
 | `agents.commits` | `GET /api/harness/agents/:id/commits?picks=&branch=&trunk=` | → `{log: {top, head, branch, trunk, base, dirty: {files, added, removed} \| null, commits: [{sha, parents, subject, author, at, files, added, removed, session}], more, told, branches, listed}, picked: {from, files: [FileChange], needs: {pick, commit, subject}} \| null}` ("Commits", below) |
@@ -1011,7 +1011,7 @@ itself (`agents.change`; an agent may open one for its own work and for the agen
 - **Agents' feedback** (docs/ci.md W26-R18): another agent's comment on its change reaches it only
   where the repository lets agents fix code from agents' feedback (the switch in its Review section
   in Repos, off until turned on), saying why kiln sent it, and at most three times in a thread until
-  a person speaks there. A new version that names the threads it answers (`answers`) is the agent's
+  a person speaks there. A new version that names the threads it fixes (`threads`) is the agent's
   fix of them, and each thread says which version fixed it. Ship's **Hand off** sends it every open
   thread at once, each with its id, place and version.
 - **A plan run's steps** (`plans.run` with `mode: "agents"`, steps in order; docs/agentic.md P4)

@@ -478,7 +478,7 @@ impl Ac10 {
         let r = self.run(
             &self.matrix,
             name,
-            &format!("const c = await kiln.agents.change({{answers: [\"{thread}\"]}}); await kiln.ci.diffs.reply({{diff: \"{cr}\", thread: \"{thread}\", body: \"Fixed in v\" + c.change_request.version + \": no legs now.\", publish: true}}); return c;"),
+            &format!("const c = await kiln.agents.change({{threads: [\"{thread}\"]}}); await kiln.ci.diffs.reply({{diff: \"{cr}\", thread: \"{thread}\", body: \"Fixed in v\" + c.change_request.version + \": no legs now.\", publish: true}}); return c;"),
         )?;
         r.pointer("/change_request/version").and_then(Value::as_u64).ok_or_else(|| anyhow::anyhow!("the fix's version: {r}"))
     }

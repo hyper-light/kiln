@@ -103,8 +103,8 @@ pub struct Want {
     pub trunk: Option<String>,
     /// Failing checks go to the agent (default: yes).
     pub fix_checks: Option<bool>,
-    /// The threads of its change a new version answers (W26-R18): an agent's fix of theirs.
-    pub answers: Option<Vec<String>>,
+    /// The threads of its change a new version fixes (W26-R18): an agent's fix of theirs.
+    pub threads: Option<Vec<String>>,
     /// Its draft marked ready for review (W26-R18): with a new version, or with nothing new.
     pub ready: bool,
 }
@@ -121,9 +121,9 @@ impl Want {
             (false, true) => opts.push("ready".to_owned()),
             (false, false) => {}
         }
-        for t in self.answers.iter().flatten().map(|t| t.trim()).filter(|t| !t.is_empty()) {
+        for t in self.threads.iter().flatten().map(|t| t.trim()).filter(|t| !t.is_empty()) {
             if !t.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_') {
-                return Err(fail(StatusCode::BAD_REQUEST, format!("`answers`: {t:?} isn't a thread's id (letters, digits, - and _)")));
+                return Err(fail(StatusCode::BAD_REQUEST, format!("`threads`: {t:?} isn't a thread's id (letters, digits, - and _)")));
             }
             opts.push(format!("answer={t}"));
         }
