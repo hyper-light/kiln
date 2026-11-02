@@ -686,14 +686,14 @@
 .gp-who:hover {
   color: #c9cbd1;
 }
-.gp-live {
+.gp-doing {
   overflow: hidden;
   color: #a7a9b1;
   font-size: 11.5px;
   text-overflow: ellipsis;
   white-space: nowrap;
 }
-.gp-live[data-ask] {
+.gp-doing[data-ask] {
   color: #ece0ca;
   font-family: var(--font-mono);
   font-size: 11px;

@@ -38,7 +38,7 @@ function StepAgent({ who, live }: { who: string; live: StepLive }) {
         {live.started ? ` · ${duration(now - live.started)}` : ""}
       </Link>
       {(ask || live.line) && (
-        <span className="gp-live" data-ask={ask ? "" : undefined}>
+        <span className="gp-doing" data-ask={ask ? "" : undefined}>
           {ask ? askWords(ask) : live.line}
         </span>
       )}
