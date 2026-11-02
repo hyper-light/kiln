@@ -410,7 +410,7 @@ export const USED_BY: Record<string, { repo: string; ref: string; sha: string; r
 /**
  * kiln's update drafts (W29-R22), as the server says them: its strip before anything's picked and
  * the words it sets in bold, what it changes for its repository in sentences with its draft's run
- * (pl-7), its upstream's files, and the use it moves.
+ * (pl-7), its upstream's files (after them in its Changes), and the use it moves (marked in Uses).
  */
 export const UPDATES: Record<
   string,
@@ -420,6 +420,8 @@ export const UPDATES: Record<
     changes: { key: string; kind: string; name: string; value: string; state: string }[];
     upstream: [string, string][];
     update: { uses: string; from: string; to: string };
+    /** The use it moves, as it's written without its ref. */
+    moves: string;
   }
 > = {
   "hyper-light/quiver:.github/workflows/ci.yml:draft:d-update-88": {
@@ -435,6 +437,7 @@ export const UPDATES: Record<
       [".github/actions/setup-rust", "2 files changed, 12 insertions(+)"],
     ],
     update: { uses: "rust-check", from: "v2.3.0", to: "v2.4.0" },
+    moves: "hyper-light/ci-kit/.github/workflows/rust-check.yml",
   },
 };
 

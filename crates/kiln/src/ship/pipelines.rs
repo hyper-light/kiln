@@ -691,7 +691,7 @@ async fn update_changes(hub: &Hub, repo: &Repo, path: &str, trunk: &str, text: &
         let own = r.path.rsplit('/').next().filter(|s| !s.is_empty()).unwrap_or(&r.repo);
         let own = own.strip_suffix(".yml").or_else(|| own.strip_suffix(".yaml")).unwrap_or(own).to_owned();
         let commits = git(hub, &dir, &["rev-list", "--count", &format!("{old}..{new}"), "--", r.path.as_str()]).await.trim().parse().unwrap_or(0);
-        moved.push(core::Moved { name: own, from: old, to: new, commits });
+        moved.push(core::Moved { name: own, uses: name, from: old, to: new, commits });
     }
     (changes, upstream, moved)
 }
@@ -737,19 +737,20 @@ async fn draft_pane(hub: &Hub, repo: &Repo, id: &str, path: &str, viewer: core::
             action.as_ref().map(|a| core::action_groups(a, row.facts.kind, &text, &head, &ctx.versions, &sharing, &core::ActionSeen::default())).unwrap_or_default()
         }
     };
-    // kiln's update draft (W29-R22): what it moves and what that changes for this repository, in
-    // its strip and its Changes, with the draft's run (pl-7).
+    // kiln's update draft (W29-R22) in its ordinary groups, the use it moves marked in Uses; what
+    // that changes for this repository in its strip and its Changes, with the draft's run and the
+    // upstream files' diff (pl-7).
     let (mut said, mut lines, mut update) = (None, None, None);
     if d.author.starts_with(kiln_ci::updates::AUTHOR) {
         let (changes, upstream, moved) = update_changes(hub, repo, path, &tip, &text).await;
         let own = repo.name.rsplit('/').next().unwrap_or(&repo.name);
-        groups.insert(0, core::PaneGroup { name: "What changes for it".into(), lines: core::change_lines(&changes, Some(own)) });
-        groups.insert(1, core::PaneGroup { name: "Upstream".into(), lines: core::upstream_lines(&upstream) });
+        core::mark_moved(&mut groups, &moved, d.name.as_deref());
         let mut l = core::change_lines(&changes, Some(own));
         l.extend(core::access_line(&changes));
         if let Some((jobs, outcome, running, secs)) = draft_run(hub, &d.id).await {
             l.push(core::draft_run_line(d.name.as_deref(), &jobs, outcome, running, secs));
         }
+        l.extend(core::upstream_lines(&upstream));
         lines = Some(l);
         said = Some(core::update_said(&moved, &changes, row.draft.as_ref().and_then(|x| x.change.as_ref())));
         update = moved.into_iter().next().map(|m| (m.name, m.from, m.to));

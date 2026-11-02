@@ -148,11 +148,16 @@ test("an action's pane: its inputs, steps, versions, who uses it and its access;
   expect(await sideways(page)).toBe(0);
 });
 
-test("kiln's update draft: DRAFT on its head, what changes for its repository first, then upstream", async ({ page, isMobile }) => {
+test("kiln's update draft: DRAFT on its head, its ordinary groups, the use it moves marked and picked first (pl-7)", async ({ page, isMobile }) => {
   const pane = await openPane(page, isMobile, "hyper-light/quiver", ".github/workflows/ci.yml", "d-update-88");
   await expect(pane.locator(".ppl-kicker .ppl-draft")).toHaveText("DRAFT");
-  await expect(pane.locator(".jp-g > span:first-child").first()).toHaveText("What changes for it");
-  await expect(pane.locator(".jp-j[data-at]")).toHaveAttribute("data-key", "changes.input.targets");
+  await expect(pane.locator(".ppl-list > .jp-g > span:first-child")).toHaveText(["Triggers", "Stage 1", "Uses", "Secrets and variables", "Runs", "Settings"]);
+  const moved = pane.locator(".jp-j[data-at]");
+  await expect(moved).toHaveAttribute("data-key", "uses.hyper-light/ci-kit/.github/workflows/rust-check.yml@v2.4.0");
+  await expect(moved.locator(".n")).toHaveText(/rust-check@v2\.3\.0$/);
+  await expect(moved.locator(".v")).toHaveText("→ v2.4.0 in #88");
+  await expect(pane.locator('.jp-g[data-group="Uses"] > span:last-child')).toHaveText(/ · 1 update$/);
+  await expect(pane.locator(".ppl-dname")).toHaveText("#88 · rust-check v2.3.0 → v2.4.0");
   await expect(pane.locator(".ppl-detail").getByRole("tab")).toHaveText(["Changes", "YAML", "Plan"]);
   // Before anything's picked, the strip says what's out and what it changes, its names in bold (pl-7).
   await expect(pane.locator(".jp-said")).toHaveText(
@@ -396,10 +401,12 @@ test("Add a trigger: 18 kinds in six groups, shown by whose; picking one adds it
   await show.getByRole("button", { name: "GitHub's" }).click();
   await expect(kinds.locator("li[data-kind]")).toHaveCount(12);
   await show.getByRole("button", { name: "all" }).click();
-  // One it has already: dimmed, saying so.
-  await kinds.locator('li[data-kind="schedule"] button').click({ force: true });
-  await expect(pane.locator(".jp-said")).toContainText("it has a schedule trigger already");
-  // A push: its lines added, Not saved, its filters open under it.
+  // One it has already, as plain as the rest (pl-9): picking it picks its trigger's line.
+  await expect(kinds.locator("li[data-kind] button[aria-disabled]")).toHaveCount(0);
+  await kinds.locator('li[data-kind="schedule"] button').click();
+  await expect(pane.locator(".jp-j[data-at]")).toHaveAttribute("data-key", "on.schedule");
+  // A push, back in Add a trigger: its lines added, Not saved, its filters open under it.
+  await pane.locator('.jp-j[data-key="add-trigger"] .jp-line').click();
   await kinds.locator('li[data-kind="push"] button').click();
   await expect(page.locator('.ppl-row[data-key="hyper-light/kiln:.kiln/smoke.yaml"] .ship-r .ship-stand')).toHaveText("Not saved");
   await expect(pane.locator(".jp-j[data-at]")).toHaveAttribute("data-key", "on.push");
@@ -592,7 +599,7 @@ test("kiln's update draft: its lines against what's published, what it changes f
   await expect(diff.locator('li[data-kind="add"]')).toContainText("rust-check.yml@v2.4.0");
   // What the new version changes for quiver, in sentences, each marked; its plan against main's; its draft's run (pl-7).
   await expect(pane.locator(".ppl-detail")).toContainText("What v2.4.0 changes for quiver");
-  const changes = pane.locator(".ppl-changes .ppl-lines li");
+  const changes = pane.locator(".ppl-changes .ppl-lines").first().locator("li");
   await expect(changes).toHaveText([
     /^a new input, targets \(optional\): quiver passes none, so nothing changes\s*safe$/,
     /^no new secrets, permissions or egress\s*same$/,
@@ -600,6 +607,9 @@ test("kiln's update draft: its lines against what's published, what it changes f
     /^#88's run on its draft: rust \/ check running, bench queued\s*4m$/,
   ]);
   await expect(changes.first().locator("b")).toHaveText("targets");
+  // The upstream code's diff between the two versions, under its own head (W29-R22).
+  await expect(pane.locator(".ppl-changes .jp-g").last()).toContainText("Upstream, v2.3.0 → v2.4.0");
+  await expect(pane.locator(".ppl-changes .ppl-lines").last().locator("li")).toHaveCount(2);
   await expect(pane.locator(".ppl-verbs button[data-dim]")).toHaveText(["Save draft"]);
   await pane.locator(".ppl-verbs button", { hasText: "Ready" }).click();
   await expect(pane.locator(".jp-said")).toContainText("Asked for ci's review");

@@ -1665,14 +1665,29 @@ fn uses_in(w: &Workflow) -> Vec<&str> {
     w.jobs.iter().flat_map(|j| j.uses.as_deref().into_iter().chain(j.steps.iter().filter_map(|s| s.uses.as_deref()))).collect()
 }
 
-/// A `uses:` an update moves (W29-R22): its name as the pane says it (`rust-check`), its version
+/// A `uses:` an update moves (W29-R22): its name as the pane says it (`rust-check`) and as it's
+/// written without its ref (`hyper-light/ci-kit/.github/workflows/rust-check.yml`), its version
 /// before and after, and the commits to it between them.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Moved {
     pub name: String,
+    pub uses: String,
     pub from: String,
     pub to: String,
     pub commits: usize,
+}
+
+/// kiln's update draft in its ordinary groups (pl-7): each use it moves stands in Uses under the
+/// version it had, marked with where it goes (`rust-check@v2.3.0 → v2.4.0 in #88`). Its key stays
+/// the draft's text's, where its lines are.
+pub fn mark_moved(groups: &mut [PaneGroup], moved: &[Moved], draft: Option<&str>) {
+    for l in groups.iter_mut().filter(|g| g.name == "Uses").flat_map(|g| g.lines.iter_mut()) {
+        let Some(m) = moved.iter().find(|m| l.key == format!("uses.{}@{}", m.uses, m.to)) else { continue };
+        let from = l.value.split(" · ").next().unwrap_or_default().to_owned();
+        l.name = format!("{}@{}", m.uses, m.from);
+        l.value = format!("{from} · → {}{}", m.to, draft.map(|d| format!(" in {d}")).unwrap_or_default());
+        l.state = Some("changes");
+    }
 }
 
 /// An update draft's strip before anything's picked (pl-7), and the words it sets in bold: what's
@@ -1928,13 +1943,19 @@ mod tests {
         assert_eq!((run.name.as_str(), run.value.as_str(), run.state), ("#88's run on its draft: rust / check running, bench queued", "4m", Some("running")));
         assert_eq!(draft_run_line(Some("#88"), &[], Some(Outcome::Passed), false, 600).name, "#88's run on its draft passed");
         // pl-7's strip, and its bold words.
-        let moved = [Moved { name: "rust-check".into(), from: "v2.3.0".into(), to: "v2.4.0".into(), commits: 3 }];
+        let moved = [Moved { name: "rust-check".into(), uses: "hyper-light/ci-kit/.github/workflows/rust-check.yml".into(), from: "v2.3.0".into(), to: "v2.4.0".into(), commits: 3 }];
         let pr = DraftChange { kind: "change", name: "#88".into(), url: None };
         let (strip, strong) = update_said(&moved, &targets, Some(&pr));
         assert_eq!(strip.join(" · "), "rust-check v2.4.0 is out · 3 commits since v2.3.0 · a new optional input; no new secrets, permissions or egress · kiln opened draft pull request #88");
         assert_eq!(strong, ["rust-check v2.4.0", "#88"]);
         assert_eq!(update_said(&moved, &more, None).0.get(2).map(String::as_str), Some("a new required input, an input required now, a permission changed, a new host it reaches, a step taken out"));
         assert_eq!(update_said(&moved, &[], None).0.get(2).map(String::as_str), Some("no new inputs, secrets, permissions or egress"));
+        // pl-7's Uses: the moved use under the version it had, marked, its key the draft's.
+        let key = "uses.hyper-light/ci-kit/.github/workflows/rust-check.yml@v2.4.0";
+        let mut groups = vec![group("Uses", vec![Line::new(key, "use", "hyper-light/ci-kit/.github/workflows/rust-check.yml@v2.4.0", "a repository kiln hosts · newest"), Line::new("uses.kiln/checkout@v1", "use", "kiln/checkout@v1", "kiln's own")])];
+        mark_moved(&mut groups, &moved, Some("#88"));
+        let lines: Vec<(&str, &str, &str, Option<&str>)> = groups.iter().flat_map(|g| &g.lines).map(|l| (l.key.as_str(), l.name.as_str(), l.value.as_str(), l.state)).collect();
+        assert_eq!(lines, [(key, "hyper-light/ci-kit/.github/workflows/rust-check.yml@v2.3.0", "a repository kiln hosts · → v2.4.0 in #88", Some("changes")), ("uses.kiln/checkout@v1", "kiln/checkout@v1", "kiln's own", None)]);
     }
 
     #[test]

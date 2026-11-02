@@ -606,10 +606,11 @@ interface StripVerb {
 const SIDE_ROWS = 28;
 const PHONE_ROWS = 28;
 
-/** What's shown before anything's picked: the update's change, a workflow's first job, an action's tip, else the first line. */
+/** What's shown before anything's picked: the use kiln's update draft moves (pl-7), a workflow's first job, an action's tip, else the first line. */
 function firstPick(p: ShipPipelinePane): Key | null {
   const first = (name: string | ((n: string) => boolean)) => p.groups.find((g) => (typeof name === "string" ? g.name === name : name(g.name)))?.lines[0]?.key;
-  return first("What changes for it") ?? first((n) => n.startsWith("Stage ")) ?? first("Versions") ?? p.groups.find((g) => g.lines.length)?.lines[0]?.key ?? null;
+  const moved = p.groups.find((g) => g.name === "Uses")?.lines.find((l) => l.state === "changes")?.key;
+  return moved ?? first((n) => n.startsWith("Stage ")) ?? first("Versions") ?? p.groups.find((g) => g.lines.length)?.lines[0]?.key ?? null;
 }
 
 /** A group's words on its right, as the stills put them: how many, what a stage waits on, where runs are from. */
@@ -618,7 +619,9 @@ function noteOf(g: ShipPipelineGroup, p: ShipPipelinePane): string {
   const n = g.lines.filter((l) => l.kind !== "add").length;
   // What's typed in says how much is new (pl-3); an action's inputs mark theirs on their lines (pl-5).
   const added = g.name.startsWith("Stage ") || g.name === "Uses" ? g.lines.filter((l) => l.state === "added").length : 0;
-  const more = added ? ` · ${added} new` : "";
+  // The uses kiln's update draft moves (pl-7's `3 · 1 update`).
+  const moved = g.name === "Uses" ? g.lines.filter((l) => l.state === "changes").length : 0;
+  const more = (added ? ` · ${added} new` : "") + (moved ? ` · ${moved} ${moved === 1 ? "update" : "updates"}` : "");
   if (g.name.startsWith("Stage ")) {
     if (g.name === "Stage 1") return (n === 1 ? "1 job" : `${n} jobs at once`) + more;
     const after = [...new Set(g.lines.flatMap((l) => /· needs (.+)$/.exec(l.value)?.[1]?.split(", ") ?? []))];
@@ -639,9 +642,6 @@ function noteOf(g: ShipPipelineGroup, p: ShipPipelinePane): string {
     case "Settings":
       // Access is the whole repository's (pl-5's `all of ci-kit`).
       return g.lines.some((l) => l.key === "settings.access") ? `all of ${p.repo.split("/").pop() ?? p.repo}` : "";
-    case "What changes for it":
-    case "Upstream":
-      return "";
     default:
       return n ? `${n}${more}` : "none";
   }
@@ -726,13 +726,12 @@ function viewsFor(p: ShipPipelinePane, l: ShipPipelineLine | null): string[] {
     case "trigger":
       return [l.key === "on.schedule" ? "Times" : "Filters", "YAML", "Plan"];
     case "use":
-      return ["Use", "YAML"];
+      // The use kiln's update draft moves: what the update changes, its YAML, its plan (pl-7).
+      return l.state === "changes" && p.detail.update ? ["Changes", "YAML", "Plan"] : ["Use", "YAML"];
     case "run":
       return ["Run"];
     case "add":
       return ["Add a trigger"];
-    case "change":
-    case "upstream":
     case "note":
       return ["Changes", "YAML", "Plan"];
     default:
@@ -1123,6 +1122,7 @@ function PipelinePane({ repo, row, onChanged, onLine }: { repo: ShipPipelineRepo
       setChecked(c);
       onLine(lineFor(c.text, overlay, c));
     },
+    pick: (k) => pick(k),
     addKind: (k) => {
       const keys = kiln ? k.kiln : k.gha;
       try {
@@ -1282,6 +1282,8 @@ interface Tools {
   say: (why: string) => void;
   /** What the pane's own file's check found, as it's checked. */
   checked: (c: Checked) => void;
+  /** Picks a line, as picking it in the list does. */
+  pick: (k: Key) => void;
 }
 
 /** What the YAML view's check found of the pane's own file (pl-3): the text it checked, its problems, and its plan's jobs against what's published (none before it's typed in). */
@@ -1331,10 +1333,13 @@ function AddTrigger({ pane, tools }: { pane: ShipPipelinePane; tools: Tools }) {
               {kinds.map((k) => {
                 // In a GitHub workflow, kiln's own kinds go in its overlay.
                 const keys = (tools.kiln ? k.kiln : k.gha) ?? (tools.overlaid ? k.kiln : null);
-                const why = !keys ? overlayWhy(pane.head.path) : keys.some((key) => tools.written.has(key)) ? `it has a ${k.words} trigger already: pick it in Triggers to change its filters` : null;
+                const why = !keys ? overlayWhy(pane.head.path) : null;
+                // A kind the file has already is as plain as the rest (pl-9): picking it picks its trigger's line.
+                const had = keys?.find((key) => tools.written.has(key));
+                const go = () => (why ? tools.say(why) : had ? tools.pick(`on.${had === "manual" ? "workflow_dispatch" : had}`) : tools.addKind(k));
                 return (
                   <li key={k.id} data-kind={k.id}>
-                    <button type="button" className="ppl-kind" aria-disabled={why ? true : undefined} onClick={() => (why ? tools.say(why) : tools.addKind(k))}>
+                    <button type="button" className="ppl-kind" aria-disabled={why ? true : undefined} onClick={go}>
                       <StatusGlyph state="none" size={12} />
                       <span className="n">
                         <b>{k.words}</b> · {k.say}
@@ -1756,7 +1761,14 @@ function Detail({
   const [view, setView] = React.useState(views[0] ?? "YAML");
   const shown = views.includes(view) ? view : (views[0] ?? "YAML");
   const file = own?.path ?? pane.head.path;
-  const name = line ? `${wordsOf(line).name || line.name} · ${file}` : file;
+  // The use kiln's update draft moves names the draft and the move (pl-7's `#88 · rust-check v2.3.0 → v2.4.0`).
+  const u = pane.detail.update;
+  const name =
+    line?.state === "changes" && line.kind === "use" && u
+      ? `${pane.head.draft?.change?.name ?? "the draft"} · ${u.uses} ${u.from} → ${u.to}`
+      : line
+        ? `${wordsOf(line).name || line.name} · ${file}`
+        : file;
   return (
     <div className="ppl-detail">
       <div className="ppl-dhead">
@@ -2038,7 +2050,6 @@ function ChangesView({ pane, text, ask }: { pane: ShipPipelinePane; text: string
       </div>
     );
   }
-  const what = pane.groups.filter((g) => ["What changes for it", "Upstream"].includes(g.name)).flatMap((g) => g.lines);
   if (ask.base !== null) {
     return (
       <div className="ppl-changes">
@@ -2068,23 +2079,25 @@ function ChangesView({ pane, text, ask }: { pane: ShipPipelinePane; text: string
               </span>
               <span />
             </div>
-            <React.Suspense fallback={<Lines lines={d.changes} empty="" />}>
-              <UpdateLines pane={pane} text={text} ask={ask} lines={d.changes} />
+            <React.Suspense fallback={<Lines lines={d.changes.filter((l) => l.kind !== "upstream")} empty="" />}>
+              <UpdateLines pane={pane} text={text} ask={ask} lines={d.changes.filter((l) => l.kind !== "upstream")} />
             </React.Suspense>
-          </>
-        ) : what.length ? (
-          <>
-            <div className="jp-g">
-              <span>What it changes for {pane.repo.split("/").pop()}</span>
-              <span />
-            </div>
-            <Lines lines={what} empty="" />
+            {/* The upstream code's diff between its two versions (W29-R22), under its own head. */}
+            {d.changes.some((l) => l.kind === "upstream") ? (
+              <>
+                <div className="jp-g">
+                  <span>Upstream{d.update ? `, ${d.update.from} → ${d.update.to}` : ""}</span>
+                  <span />
+                </div>
+                <Lines lines={d.changes.filter((l) => l.kind === "upstream")} empty="" />
+              </>
+            ) : null}
           </>
         ) : null}
       </div>
     );
   }
-  return <Lines lines={pane.groups.filter((g) => ["What changes for it", "Upstream", "Versions"].includes(g.name)).flatMap((g) => g.lines)} empty="Nothing has changed since its newest tag." />;
+  return <Lines lines={pane.groups.filter((g) => g.name === "Versions").flatMap((g) => g.lines)} empty="Nothing has changed since its newest tag." />;
 }
 
 /** An update's lines (pl-7), its plan against the published one's for the strip's event put before its draft's run: `the plan for a push to main: the same 2 jobs, 4 legs · same`. */

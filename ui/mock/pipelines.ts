@@ -690,11 +690,14 @@ function paneOf(repo: string, row: ShipPipelineRow): ShipPipelinePane {
   const kiln = row.dialect === "kiln";
   const groups = action ? actionGroups(repo, key, text, row.kind, row.commit) : workflowGroups(key, text, kiln, row.stand !== "superseded");
   const update = UPDATES[key];
+  // kiln's update draft in its ordinary groups: the use it moves in Uses, under the version it had, marked (`kiln_ci::pipelines::mark_moved`, pl-7).
   if (update)
-    groups.unshift(
-      { name: "What changes for it", lines: update.changes.filter((l) => l.kind === "change") },
-      { name: "Upstream", lines: update.upstream.map(([n, v]) => ({ key: `upstream.${n}`, kind: "upstream", name: n, value: v })) },
-    );
+    for (const l of groups.find((g) => g.name === "Uses")?.lines ?? [])
+      if (l.key === `uses.${update.moves}@${update.update.to}`) {
+        l.name = `${update.moves}@${update.update.from}`;
+        l.value = `${l.value.split(" · ")[0] ?? ""} · → ${update.update.to} in ${row.draft?.change?.name ?? "the draft"}`;
+        l.state = "changes";
+      }
   // What releasing it changes for those who use it, in sentences, and its repository's own checks on its head (pl-5).
   const checks = CHECKS[key];
   const released: ShipPipelineLine[] = [
@@ -725,7 +728,7 @@ function paneOf(repo: string, row: ShipPipelineRow): ShipPipelinePane {
             changes: released,
           }
         : {}),
-      ...(update ? { changes: update.changes, update: update.update } : {}),
+      ...(update ? { changes: [...update.changes, ...update.upstream.map(([n, v]) => ({ key: `upstream.${n}`, kind: "upstream", name: n, value: v }))], update: update.update } : {}),
       // A GitHub workflow's overlay, none yet in the mock: where Flow writes kiln's own triggers (W29-R06).
       ...(row.dialect === "gha"
         ? {

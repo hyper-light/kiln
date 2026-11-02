@@ -690,17 +690,22 @@ fn w29_r21_r22_release_and_updates_in_ship() -> anyhow::Result<()> {
     let (st, body) = http(s.port, "GET", &format!("/api/ship/pipelines/acme/app?path=.github/workflows/ci.yml&draft={id}"), &s.admin, None)?;
     anyhow::ensure!(st == 200, "the update draft's pane: {st} {body}");
     let p: Value = serde_json::from_str(&body)?;
-    let changes: Vec<(&str, &str)> = group(&p, "What changes for it").iter().map(|l| (field(l, "name"), field(l, "value"))).collect();
-    assert_eq!(changes, [("a new input, where (required): app has to pass it", "breaks")], "{p}");
+    // Its ordinary groups (pl-7): the use it moves in Uses, under the version it had, marked with where it goes.
+    let names = group_names(&p);
+    assert!(!names.iter().any(|n| n == "What changes for it" || n == "Upstream"), "{names:?}");
+    let moved: Vec<(&str, &str, &str)> = group(&p, "Uses").iter().filter(|l| field(l, "state") == "changes").map(|l| (field(l, "key"), field(l, "name"), field(l, "value"))).collect();
+    assert_eq!(moved.len(), 1, "{p}");
+    assert!(moved.iter().all(|(k, n, v)| k.ends_with("/.github/actions/setup@v1.1.0") && n.ends_with("/.github/actions/setup@v1.0.0") && v.contains(" · → v1.1.0")), "{moved:?}");
     // Its strip says what's out, the commits since, and what it changes in short (pl-7); its
     // Changes, in sentences.
     let said: Vec<&str> = p.pointer("/strip/said").and_then(Value::as_array).into_iter().flatten().filter_map(Value::as_str).collect();
     assert_eq!(said.get(..3), Some(&["setup v1.1.0 is out", "1 commit since v1.0.0", "a new required input; no new secrets, permissions or egress"][..]), "{p}");
     assert_eq!(p.pointer("/strip/strong/0").and_then(Value::as_str), Some("setup v1.1.0"), "{p}");
-    let lines: Vec<&str> = p.pointer("/detail/changes").and_then(Value::as_array).into_iter().flatten().map(|l| field(l, "name")).collect();
-    assert_eq!(lines.get(..2), Some(&["a new input, where (required): app has to pass it", "no new secrets, permissions or egress"][..]), "{p}");
+    let lines: Vec<(&str, &str)> = p.pointer("/detail/changes").and_then(Value::as_array).into_iter().flatten().map(|l| (field(l, "kind"), field(l, "name"))).collect();
+    assert_eq!(lines.get(..2), Some(&[("change", "a new input, where (required): app has to pass it"), ("note", "no new secrets, permissions or egress")][..]), "{p}");
     assert_eq!(p.pointer("/detail/update"), Some(&json!({ "uses": "setup", "from": "v1.0.0", "to": "v1.1.0" })), "{p}");
-    let upstream: Vec<&str> = group(&p, "Upstream").iter().map(|l| field(l, "name")).collect();
+    // And the upstream code's diff between the two versions (W29-R22), last.
+    let upstream: Vec<&str> = lines.iter().filter(|(k, _)| *k == "upstream").map(|(_, n)| *n).collect();
     assert_eq!(upstream, ["acme/kit/.github/actions/setup v1.0.0 → v1.1.0"], "{p}");
     assert!(at(&p, "/detail/text").contains("setup@v1.1.0"), "{p}");
     Ok(())
