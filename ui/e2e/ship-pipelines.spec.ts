@@ -5,7 +5,7 @@
  * repository, needs-someone first, DRAFT beside a draft's title, and a New row last; `?repo=&path=`
  * opens a row and brings it into view; nothing scrolls sideways.
  */
-import { expect, test, type Page } from "@playwright/test";
+import { expect, test, type Locator, type Page } from "@playwright/test";
 
 const REAL = !!process.env.E2E_BASE_URL;
 test.skip(REAL, "drives the mock's pipelines");
@@ -19,6 +19,16 @@ const notices = (page: Page) => page.addStyleTag({ content: ".rq-viewport { disp
 const list = (page: Page) => page.getByRole("list", { name: "Workflows and actions by repository" });
 /** A repository's rows, in the list's order, up to the next heading. */
 const rowsOf = (page: Page, repo: string) => list(page).locator(`.ppl-row[data-key^="${repo}:"]:not(.ppl-new)`);
+
+/**
+ * The editor's end, its last line in view: CodeMirror draws only the lines the window shows, so the
+ * editor comes into view before its scroller goes to its end.
+ */
+async function toTheEnd(pane: Locator) {
+  await pane.locator(".ppl-detail .cm-editor").scrollIntoViewIfNeeded();
+  await pane.locator(".ppl-detail .cm-scroller").evaluate((e) => (e.scrollTop = e.scrollHeight));
+  await pane.page().waitForTimeout(150);
+}
 
 /** How far the page scrolls sideways. */
 const sideways = (page: Page) => page.evaluate(() => document.documentElement.scrollWidth - document.documentElement.clientWidth);
@@ -244,7 +254,7 @@ test("the file is edited where it's shown: kiln's colours, run: as bash; typing 
   await expect(pane.locator(".ppl-detail .cm-line .hl-prop", { hasText: "runs-on" }).first()).toBeVisible();
   await expect(pane.locator(".ppl-detail .cm-line .hl-fn", { hasText: "cargo" }).first()).toBeVisible();
   // A job typed at the end, its use following a tag (the end reached as a person would, on any platform).
-  await pane.locator(".ppl-detail .cm-scroller").evaluate((e) => (e.scrollTop = e.scrollHeight));
+  await toTheEnd(pane);
   await pane.locator(".ppl-detail .cm-line").last().click();
   await page.keyboard.press("End");
   await page.keyboard.insertText("\n  helm-lint:\n    runs-on: [baremetal, linux]\n    steps:\n      - uses: azure/setup-helm@v4\n");
@@ -252,7 +262,11 @@ test("the file is edited where it's shown: kiln's colours, run: as bash; typing 
   const row = page.locator('.ppl-row[data-key="hyper-light/kiln:.kiln/ci.yaml"]');
   await expect(row.locator(".ship-r .ship-stand")).toHaveText("Not saved");
   await expect(pane.locator(".ppl-kicker .ppl-draft")).toBeVisible();
-  await expect(pane.locator(".jp-said")).toContainText("Not saved yet");
+  // What it adds, said in the strip; its job and its use join their groups, marked new (pl-3).
+  await expect(pane.locator(".jp-said")).toContainText("Adds helm-lint, azure/setup-helm@v4 · not saved yet");
+  await expect(pane.locator('.jp-j[data-key="jobs.helm-lint"]')).toContainText("new job");
+  await expect(pane.locator('.jp-g[data-group="Stage 1"] > span:last-child')).toHaveText("4 jobs at once · 1 new");
+  await expect(pane.locator('.jp-j[data-key="uses.azure/setup-helm@v4"]')).toContainText("pin it?");
   await expect(pane.locator(".ppl-verbs button", { hasText: "Save draft" })).not.toHaveAttribute("data-dim");
   // Its problems sit under the code once typing stops: the pin, with its fix.
   const problems = pane.getByLabel("Problems");
@@ -288,7 +302,7 @@ test("the plan for each event: plan for: picks it, a picked job says where it wo
   // A job typed in: the plan for a push to main says what's new, and the rest as on main (pl-3).
   await planFor.getByRole("button", { name: "push to main" }).click();
   await pane.locator(".ppl-detail").getByRole("tab", { name: "YAML" }).click();
-  await pane.locator(".ppl-detail .cm-scroller").evaluate((e) => (e.scrollTop = e.scrollHeight));
+  await toTheEnd(pane);
   await pane.locator(".ppl-detail .cm-line").last().click();
   await page.keyboard.press("End");
   await page.keyboard.insertText("\n  helm-lint:\n    runs-on: [baremetal, linux]\n    steps:\n      - uses: kiln/checkout@v1\n");

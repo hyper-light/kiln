@@ -24,6 +24,7 @@ import { lineDiff } from "@/lib/line-diff";
 import { jobsOf, planLines, whereWords, type PlanJob, type PlanLine } from "@/lib/plan-diff";
 import { manualInputs, spotOf, type ManualInput, type Spot } from "@/lib/pipeline-spot";
 import { TRIGGER_GROUPS, TRIGGER_KINDS, triggerKeys, triggerLines, type TriggerKind } from "@/lib/triggers";
+import { addedOf, typedGroups } from "@/lib/typed-groups";
 import { addOverlayTrigger, addTrigger, EditRefused, removeTrigger, setOverlayScheduleField, setScheduleField, setTriggerFilter } from "@/lib/workflow-doc";
 import { parse as parseYaml } from "yaml";
 import { Link, useSearchParams } from "@/lib/router";
@@ -595,13 +596,14 @@ interface StripVerb {
   enabled: boolean;
   dim?: boolean;
   keep?: boolean;
-  go?: boolean;
+  /** The verb that answers an ask: `ask` where it takes nothing back (Release), else in a warning's tone. */
+  go?: boolean | "ask";
   run: () => void;
 }
 
 /** The detail's code, held to this many lines, scrolling inside itself: beside the list, and under its line on a phone. */
-const SIDE_ROWS = 24;
-const PHONE_ROWS = 20;
+const SIDE_ROWS = 28;
+const PHONE_ROWS = 28;
 
 /** What's shown before anything's picked: the update's change, a workflow's first job, an action's tip, else the first line. */
 function firstPick(p: ShipPipelinePane): Key | null {
@@ -611,11 +613,14 @@ function firstPick(p: ShipPipelinePane): Key | null {
 
 /** A group's words on its right, as the stills put them: how many, what a stage waits on, where runs are from. */
 function noteOf(g: ShipPipelineGroup, p: ShipPipelinePane): string {
-  const n = g.lines.length;
+  // Add a trigger is the group's last line, not one of its triggers.
+  const n = g.lines.filter((l) => l.kind !== "add").length;
+  const added = g.lines.filter((l) => l.state === "added").length;
+  const more = added ? ` · ${added} new` : "";
   if (g.name.startsWith("Stage ")) {
-    if (g.name === "Stage 1") return n === 1 ? "1 job" : `${n} jobs at once`;
+    if (g.name === "Stage 1") return (n === 1 ? "1 job" : `${n} jobs at once`) + more;
     const after = [...new Set(g.lines.flatMap((l) => /· needs (.+)$/.exec(l.value)?.[1]?.split(", ") ?? []))];
-    return after.length ? `after ${after.join(" and ")}` : `${n} jobs`;
+    return (after.length ? `after ${after.join(" and ")}` : `${n} jobs`) + more;
   }
   switch (g.name) {
     case "Secrets and variables":
@@ -631,7 +636,7 @@ function noteOf(g: ShipPipelineGroup, p: ShipPipelinePane): string {
     case "Upstream":
       return "";
     default:
-      return n ? String(n) : "none";
+      return n ? `${n}${more}` : "none";
   }
 }
 
@@ -665,6 +670,7 @@ function wordsOf(l: ShipPipelineLine): { kind: string | null; name: string; valu
     case "version":
       return { kind: l.key === "versions.head" ? "main" : "tag", name: l.key === "versions.head" ? l.value.slice(0, 7) : l.name, value: l.key === "versions.head" ? "" : l.value.slice(0, 7) };
     case "job":
+      return { kind: l.state === "added" ? "new job" : "job", name: l.name, value: l.value };
     case "secret":
     case "variable":
     case "input":
@@ -790,7 +796,10 @@ function PipelinePane({ repo, row, onChanged }: { repo: ShipPipelineRepo; row: S
   const inOverlay = (event: string) => overlaid.some((l) => eventKey(l) === event);
   const written = workflow && (changed || overlaid.length) ? triggerLines(text, kiln) : null;
   const typed = written ? [...written, ...overlaid] : null;
-  const groups = p.groups.map((g) => (g.name === "Triggers" && workflow ? { ...g, lines: [...(typed ?? g.lines), ...(editable ? [ADD_TRIGGER] : [])] } : g));
+  // A job or use typed in is a line of its own, marked new; one taken out is gone (pl-3).
+  const typedAll = workflow && textChanged ? typedGroups(text, p.groups) : null;
+  const added = typedAll ? addedOf(typedAll) : [];
+  const groups = (typedAll ?? p.groups).map((g) => (g.name === "Triggers" && workflow ? { ...g, lines: [...(typed ?? g.lines), ...(editable ? [ADD_TRIGGER] : [])] } : g));
   const lines = groups.flatMap((g) => g.lines);
   const at = picked && lines.some((l) => l.key === picked) ? picked : firstPick(p);
   const line = lines.find((l) => l.key === at) ?? null;
@@ -968,6 +977,17 @@ function PipelinePane({ repo, row, onChanged }: { repo: ShipPipelineRepo; row: S
     <>
       <b>Add a trigger</b> · pick what starts it; its filters open under it and the YAML gains its lines, as a draft
     </>
+  ) : changed && added.length ? (
+    <>
+      Adds{" "}
+      {added.map((l, i) => (
+        <React.Fragment key={l.key}>
+          {i ? ", " : ""}
+          <b>{l.kind === "use" ? shortUse(l.name) : l.name}</b>
+        </React.Fragment>
+      ))}{" "}
+      · not saved yet · a draft runs on no trigger until it lands
+    </>
   ) : changed ? (
     <>Not saved yet · a draft runs on no trigger until it lands</>
   ) : line ? (
@@ -989,7 +1009,7 @@ function PipelinePane({ repo, row, onChanged }: { repo: ShipPipelineRepo; row: S
     : release
       ? [
           { key: "keep", label: "Keep", enabled: true, keep: true, run: () => setRelease(null) },
-          { key: "release", label: release.confirm ? "Release anyway" : "Release", enabled: !busy && Boolean(release.tag), go: true, run: () => void releaseNow() },
+          { key: "release", label: release.confirm ? "Release anyway" : "Release", enabled: !busy && Boolean(release.tag), go: release.confirm ? true : "ask", run: () => void releaseNow() },
         ]
       : p.strip.verbs.map((v) => {
           const why = whyNot(v);
@@ -1076,7 +1096,7 @@ function PipelinePane({ repo, row, onChanged }: { repo: ShipPipelineRepo; row: S
       </div>
       <div className="jp">
         <div className="jp-strip">
-          <div className="jp-say" data-tone={release ? "ask" : said?.refused ? "warn" : undefined}>
+          <div className="jp-say" data-tone={release ? (release.why ? "ask" : undefined) : said?.refused ? "warn" : undefined}>
             <div className="jp-said" aria-live="polite">
               {say}
             </div>
@@ -1361,9 +1381,16 @@ function runWords(r: NonNullable<CiSchedule["next"]>[number], tz: string | null)
   return `${local}${tz && tz !== "UTC" ? ` · ${utc} UTC` : ""}${shift}`;
 }
 
-/** How far off a run is, in days: today, tomorrow, in 3 days. */
-function fromNow(at: number): string {
-  const days = Math.round((at * 1000 - Date.now()) / 86_400_000);
+/** How far off a run is, in its zone's calendar days: today, tomorrow, in 3 days. */
+function fromNow(at: number, tz: string | null): string {
+  let day: (ms: number) => number;
+  try {
+    const f = new Intl.DateTimeFormat("en-CA", { timeZone: tz ?? "UTC", year: "numeric", month: "2-digit", day: "2-digit" });
+    day = (ms) => Date.parse(f.format(ms));
+  } catch {
+    day = (ms) => Math.floor(ms / 86_400_000) * 86_400_000;
+  }
+  const days = Math.round((day(at * 1000) - day(Date.now())) / 86_400_000);
   return days <= 0 ? "today" : days === 1 ? "tomorrow" : `in ${days} days`;
 }
 
@@ -1395,7 +1422,7 @@ function ScheduleTimes({ pane, text, ask, tools, editable }: { pane: ShipPipelin
                 <li key={r.at}>
                   <StatusGlyph state="none" size={12} />
                   <span className="n">{runWords(r, s.timezone)}</span>
-                  <span className="v">{fromNow(r.at)}</span>
+                  <span className="v">{fromNow(r.at, s.timezone)}</span>
                 </li>
               ))
             )}
@@ -1486,7 +1513,11 @@ function PaneLine({ line, at, onLine }: { line: ShipPipelineLine; at: boolean; o
   return (
     <li className="jp-j" data-key={line.key} data-sel={at || undefined} data-at={at || undefined} data-state={line.state}>
       <span className="jp-glyph" aria-hidden="true">
-        {line.kind === "add" ? <Plus size={12} /> : <StatusGlyph state={glyphOf(glyphFor(line))} size={12} />}
+        {line.kind === "add" || (line.state === "added" && !line.value.includes("pin it?")) ? (
+          <Plus size={12} />
+        ) : (
+          <StatusGlyph state={line.state === "added" ? "flag" : glyphOf(glyphFor(line))} size={12} />
+        )}
       </span>
       <button type="button" className="jp-line" aria-current={at || undefined} onClick={() => onLine(line.key)}>
         <span className="n">

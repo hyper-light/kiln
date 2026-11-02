@@ -1436,6 +1436,12 @@
 .ppl-verbs[data-armed] {
   grid-auto-columns: 80px 166px;
 }
+/* What answers an ask that takes nothing back (Release) wears an ask's tone, as Deploys' Refresh does. */
+.ppl-verbs button[data-go="ask"] {
+  border-color: #e2cfae;
+  background: #e2cfae;
+  color: #171107;
+}
 .ppl-verbs button[data-dim] {
   opacity: 0.35;
   cursor: default;
@@ -1444,16 +1450,11 @@
   opacity: 0.6;
   cursor: progress;
 }
-.ppl-body {
-  height: 620px;
-}
-.ppl-list {
-  height: 100%;
-  overflow: auto;
-}
-.ppl-side {
-  height: 100%;
-  overflow: auto;
+/* The list runs its whole length, as Deploys' does and the approved stills draw it; the detail
+   beside it holds its height. */
+/* The detail's own groups sit as close as its lines, as the approved stills draw them. */
+.ppl-detail .jp-g {
+  padding: 5px 8px 3px;
 }
 .ppl-detail {
   display: grid;
@@ -1547,7 +1548,7 @@
   grid-template-columns: 20px minmax(0, 1fr) auto;
   align-items: center;
   gap: 8px;
-  min-height: 28px;
+  min-height: 21px;
   padding: 0 8px;
   color: #b9bbc2;
   font-size: 12.5px;
@@ -1585,14 +1586,6 @@
     grid-auto-flow: row;
     grid-auto-columns: auto;
     grid-template-columns: repeat(4, minmax(0, 1fr));
-  }
-  .ppl-body {
-    height: auto;
-  }
-  .ppl-list,
-  .ppl-side {
-    height: auto;
-    overflow: visible;
   }
 }
 /* A line's value gives way to its name: it ends in an ellipsis before it pushes anything past the
@@ -1670,11 +1663,15 @@
   align-items: center;
   gap: 8px;
   width: 100%;
-  min-height: 28px;
+  min-height: 21px;
   cursor: pointer;
 }
 .ppl-kinds .ppl-lines li {
   padding: 0;
+}
+/* Whose a kind is stays whole; its words give way first. */
+.ppl-kind .v {
+  flex: none;
 }
 .ppl-kind[aria-disabled] {
   opacity: 0.45;
@@ -1695,6 +1692,7 @@
 /* A trigger's filters and a schedule's options, each edited where it's shown. */
 .ppl-fields li {
   gap: 12px;
+  min-height: 28px;
 }
 .ppl-fields .n {
   white-space: normal;
