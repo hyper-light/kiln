@@ -1354,14 +1354,19 @@ pub async fn ship_commit_blob(hub: &std::sync::Arc<Hub>, repo_key: &str, sha: &s
 }
 
 /// The bare repository of `repo_key` (name or id) when `sha` exists in it and the caller may read
-/// the repository, else the API's "not found".
+/// the repository, else the API's "not found": the one kiln hosts, or else kiln's mirror of the
+/// one it builds, with the commit in it whole (fetched when it isn't yet). Ship's Files said "the
+/// repository isn't hosted here" of kiln's own commits, which its mirror holds (Ada, 2026-11-01).
 async fn commit_repo(hub: &std::sync::Arc<Hub>, repo_key: &str, sha: &str, caller: &crate::authz::Caller) -> Result<(String, String), Fail> {
     let repos = hub.store.repos().await.map_err(fail)?;
     let repo = repos.into_iter().find(|r| r.name == repo_key || r.id == repo_key).ok_or((StatusCode::NOT_FOUND, "no such repository".to_owned()))?;
     if !caller.can("runs.read", &Scope::Repo { repo: repo.name.clone() }) {
         return Err((StatusCode::NOT_FOUND, "no such commit".to_owned()));
     }
-    let path = super::hosting::native_path(hub, &repo).ok_or((StatusCode::NOT_FOUND, "the repository isn't hosted here".to_owned()))?;
+    let path = match super::hosting::native_path(hub, &repo) {
+        Some(path) => path,
+        None => gitops::ensure_commit(hub, &repo, sha).await.map_err(|_| (StatusCode::NOT_FOUND, "no such commit".to_owned()))?,
+    };
     let path = path.to_string_lossy().into_owned();
     gitops::run_git(hub, &["-C", &path, "cat-file", "-e", &format!("{sha}^{{commit}}")], LS_REMOTE_TIMEOUT)
         .await
