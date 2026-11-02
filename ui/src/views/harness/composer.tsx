@@ -24,7 +24,7 @@ import { ComposeField } from "./compose-field";
 import { SendWith } from "./run-settings";
 import { MicButton } from "./voice";
 import { modelLabel } from "./derive";
-import { useDraft, useHeld, useSendMode, type Held } from "./state";
+import { holdWith, uploadingHere, useDraft, useHeld, useSendMode, type Held } from "./state";
 import { stopperOf, subagentPlaceholder, takesMessages } from "./tasks";
 import { notShown } from "./queue-shown";
 
@@ -42,6 +42,8 @@ interface RowActs {
   onRemove: () => void;
   /** Its files change while it waits: the whole new set. */
   onAttach?: (attachments: Attachment[]) => void;
+  /** It no longer waits for the `i`th of its files still to come (one whose upload went with an earlier page). */
+  onWithout?: (i: number) => void;
   onMove?: (index: number) => void;
   onSteer?: () => void;
   onNow?: () => void;
@@ -54,8 +56,11 @@ const queueAttachSrc = (a: Attachment): string | undefined => {
   return a.data_base64 ? `data:${a.mime};base64,${a.data_base64}` : undefined;
 };
 
+/** What waits: its words, its files, and (one kept here) the names of those still on their way up. */
+type Waiting = { id: string; text: string; attachments?: Attachment[]; uploading?: string[] };
+
 /** One waiting message: its words (tap to read them whole), its files (add or drop until it goes), and what can be done with it. */
-function QueueRow({ q, index, count, onEdit, onAttach, onRemove, onMove, onSteer, onNow }: { q: { id: string; text: string; attachments?: Attachment[] }; index: number; count: number } & RowActs) {
+function QueueRow({ q, index, count, onEdit, onAttach, onWithout, onRemove, onMove, onSteer, onNow }: { q: Waiting; index: number; count: number } & RowActs) {
   const text = q.text;
   const attach = useAttachments("any");
   const picker = React.useRef<HTMLInputElement>(null);
@@ -96,7 +101,7 @@ function QueueRow({ q, index, count, onEdit, onAttach, onRemove, onMove, onSteer
           {text}
         </button>
       )}
-      {(q.attachments?.length || onAttach) && (
+      {(q.attachments?.length || q.uploading?.length || onAttach) && (
         <span className="hx-attach qd-attach">
           {(q.attachments ?? []).map((a, i) => {
             const src = queueAttachSrc(a);
@@ -119,6 +124,23 @@ function QueueRow({ q, index, count, onEdit, onAttach, onRemove, onMove, onSteer
               </span>
             );
           })}
+          {/* Sent before they were up (W21-R15), it goes once they are; one whose upload went with an earlier page waits to be let go. */}
+          {q.uploading?.map((name, i) =>
+            uploadingHere.has(q.id) ? (
+              <span key={`up-${i}`} className="hx-attach-chip hx-dim">
+                <span className="hx-trunc">Uploading {name}…</span>
+              </span>
+            ) : (
+              <span key={`up-${i}`} className="hx-attach-chip hx-bad">
+                <span className="hx-trunc">{name} didn't finish uploading</span>
+                {onWithout && (
+                  <button type="button" aria-label={`Send without ${name}`} onClick={() => onWithout(i)}>
+                    <X size={11} />
+                  </button>
+                )}
+              </span>
+            ),
+          )}
           {onAttach && (
             <>
               <input
@@ -229,7 +251,7 @@ function QueueRow({ q, index, count, onEdit, onAttach, onRemove, onMove, onSteer
  * What waits: one line until opened; it folds again a few seconds after you leave it. `label`:
  * where it waits ("Queued", "Kept here"); `hint`: when it goes; `acts`: what each one can do.
  */
-function Queued({ queue, label, hint, acts }: { queue: { id: string; text: string; attachments?: Attachment[] }[]; label: string; hint: string; acts: (id: string) => RowActs }) {
+function Queued({ queue, label, hint, acts }: { queue: Waiting[]; label: string; hint: string; acts: (id: string) => RowActs }) {
   const [open, setOpen] = React.useState(false);
   const timer = React.useRef(0);
   const root = React.useRef<HTMLDivElement>(null);
@@ -372,6 +394,8 @@ function sendHeld(store: SessionStore, agent: string) {
   if (s.conn !== "open" || s.state?.status === "disconnected") return;
   const went: string[] = [];
   for (const m of useHeld.getState().held[agent] ?? []) {
+    // One whose files are still on their way waits for them, and those after it behind it.
+    if (m.uploading?.length) break;
     // As it was to go: a "now" kept through a reconnection still stops what runs. One for a
     // subagent keeps its way too (the agent sends it the nearest way that one takes then).
     const running = s.state?.status === "running" || s.state?.status === "waiting";
@@ -467,7 +491,7 @@ export function Composer({
   const canAttach = attachments.enabled;
   const canOverride = !toSub && features.includes("overrides");
   const subStops = Boolean(toSub && running && stopperOf(toSub, features));
-  const { files, add, clear, chips, pending } = attachments;
+  const { files, add, chips, pending } = attachments;
   const picker = React.useRef<HTMLInputElement>(null);
   const [override, setOverride] = React.useState<{ model?: string; effort?: string }>({});
   /** "Send with": a model or effort for the next message only (long-press or right-click Send). */
@@ -627,17 +651,19 @@ export function Composer({
   };
 
   const sendText = (body: string) => {
-    if ((!body && files.length === 0) || pending > 0) return;
-    const m = { id: clientId(), text: body, attachments: files.length ? attachments.payload() : undefined, overrides: override.model || override.effort ? override : undefined, reply_to: replyTo?.id };
+    if (!body && files.length === 0 && pending === 0) return;
+    // Its files go with it, those still uploading too: Send doesn't wait for them (W21-R15).
+    const taken = attachments.take();
+    const m = { id: clientId(), text: body, attachments: taken.files.length ? taken.files : undefined, overrides: override.model || override.effort ? override : undefined, reply_to: replyTo?.id };
     // It can't take it now (or what was kept here hasn't all gone yet): kept here, sent once it
     // can, in order — never lost, never blocked. "Now" and "steer" don't wait behind what's kept:
-    // they're for the turn under way.
+    // they're for the turn under way. One whose files are still on their way is kept till they're up.
     const go = running ? mode : "queue";
     const behind = held.length > 0 && go === "queue";
     const to = toSub ? { task: toSub.id } : {};
-    if (behind || !(reachable && store.send({ type: "send", ...m, mode: go, ...to }))) useHeld.getState().hold(agent, { ...m, mode: go, at: Date.now(), ...to });
+    if (taken.uploading.length) holdWith(agent, { ...m, mode: go, at: Date.now(), ...to }, taken);
+    else if (behind || !(reachable && store.send({ type: "send", ...m, mode: go, ...to }))) useHeld.getState().hold(agent, { ...m, mode: go, at: Date.now(), ...to });
     write("");
-    clear();
     setOverride({});
     setWithOpen(false);
     onClearReply?.();
@@ -703,8 +729,12 @@ export function Composer({
         <Queued
           queue={held}
           label="Kept here"
-          hint={reachable ? "sending…" : `sent in order once ${away}`}
-          acts={(id) => ({ onEdit: (t) => useHeld.getState().edit(agent, id, t), onRemove: () => useHeld.getState().drop(agent, id) })}
+          hint={!reachable ? `sent in order once ${away}` : held.some((m) => m.uploading?.length) ? "sent in order once their files are up" : "sending…"}
+          acts={(id) => ({
+            onEdit: (t) => useHeld.getState().edit(agent, id, t),
+            onWithout: (i) => useHeld.getState().without(agent, id, i),
+            onRemove: () => useHeld.getState().drop(agent, id),
+          })}
         />
       )}
       {shownQueue.length > 0 && (
@@ -874,7 +904,7 @@ export function Composer({
             }}
             onPointerUp={() => window.clearTimeout(pressTimer.current)}
             onPointerLeave={() => window.clearTimeout(pressTimer.current)}
-            disabled={(!text.trim() && files.length === 0) || pending > 0}
+            disabled={!text.trim() && files.length === 0 && pending === 0}
             aria-label={sendLabel}
           >
             {sendLabel === "Queue" ? <CornerDownLeft size={15} /> : <ArrowUp size={15} />}

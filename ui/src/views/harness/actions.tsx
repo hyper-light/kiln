@@ -11,7 +11,10 @@ import { harnessSessionsRes, useRes } from "@/lib/data";
 import { errorMessage } from "@/lib/hooks";
 import { change, invalidate } from "@/lib/resource";
 import { copyText } from "@/views/terminal/clipboard";
+import { useNavigate } from "@/lib/router";
+import { agentLabel } from "./derive";
 import { MoveDialog, movable } from "./move";
+import { startFrom } from "./new-agent-draft";
 import { useEndWithChildren } from "./family";
 
 const ReachDialog = React.lazy(() => import("./reach").then((m) => ({ default: m.ReachDialog })));
@@ -26,12 +29,13 @@ const inLists = (f: (l: AgentInfo[]) => AgentInfo[]) => LISTS.forEach((key) => c
 /** Both read again, as the server has them: what was shown at once and didn't go goes back. */
 const readLists = () => LISTS.forEach((key) => invalidate(key));
 
-type Act = "end" | "remove" | "rename" | "duplicate" | "move" | "reach" | null;
+type Act = "end" | "remove" | "rename" | "move" | "reach" | null;
 
 export function useAgentActions(
-  a: Pick<AgentInfo, "id" | "name" | "status" | "kind" | "kind_name" | "target" | "cwd" | "harness_session" | "left_behind" | "reach" | "keep_off">,
+  a: Pick<AgentInfo, "id" | "name" | "status" | "kind" | "kind_name" | "target" | "cwd" | "harness_session" | "left_behind" | "reach" | "keep_off" | "mode" | "model">,
   after?: { onGone?: () => void },
 ) {
+  const navigate = useNavigate();
   const [act, setAct] = React.useState<Act>(null);
   /** A command that didn't go says so, and `back` puts back what it showed at once. */
   const command = (c: Command, what: string, back?: () => void) =>
@@ -112,7 +116,11 @@ export function useAgentActions(
     },
     { label: "Stop the current turn", onSelect: stopTurn, hidden: a.status !== "running" && a.status !== "waiting", going: stoppingTurn },
     { label: "Restart", onSelect: restart, hidden: live, going: restarting },
-    { label: "Duplicate…", onSelect: () => setAct("duplicate") },
+    // Mission control's composer, filled in as it runs: its harness, machine, folder, permissions and model (new-agent-draft.ts).
+    {
+      label: "Duplicate",
+      onSelect: () => startFrom(navigate, { from: `Like ${agentLabel(a)}`, kind: a.kind, target: a.target, cwd: a.cwd || undefined, mode: a.mode || undefined, model: a.model || undefined }),
+    },
     // Agents the kiln server itself runs stay there once they've started; an ended one goes nowhere.
     { label: "Move to…", onSelect: () => setAct("move"), hidden: !live || !movable(a) },
     { label: "Where commands run…", onSelect: () => setAct("reach"), hidden: !a.target.startsWith("agent:") },

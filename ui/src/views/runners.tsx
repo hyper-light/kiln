@@ -13,7 +13,7 @@ import { WatchedBy } from "@/views/attach/here";
 import { Chips, StatusDot } from "@/components/ui/status";
 import { toast } from "@/components/ui/toast";
 import { Tip } from "@/components/ui/tooltip";
-import { sendingProps, useAction, useActions } from "@/lib/action";
+import { sendingProps, useAction, useActions, useHold } from "@/lib/action";
 import { agentsRes, fuller, historyRes, lastSamples, mergeJobs, updatesRes, upsert, useAgentsLive, useMetricsHistory, useRes, useUpdateJobs, warm } from "@/lib/data";
 import { absoluteTime, formatBytes, formatPct } from "@/lib/format";
 import { errorMessage, useNow } from "@/lib/hooks";
@@ -659,8 +659,9 @@ function AgentLimit({ runner }: { runner: string }) {
       setMsg({ tone: "error", text: errorMessage(e) });
     }
   };
-  const [put, saving] = useAction(save);
-  const [clear, clearing] = useAction(() => save(null));
+  const hold = useHold();
+  const put = (max: number) => hold.change("save", () => save(max));
+  const clear = () => hold.change("clear", () => save(null));
   const submit = () => {
     const n = parseLimit(shown, v.max);
     if (typeof n === "string") setMsg({ tone: "error", text: n });
@@ -697,11 +698,11 @@ function AgentLimit({ runner }: { runner: string }) {
               }}
             />
           </div>
-          <Button type="submit" variant="secondary" size="xs" pending={saving} disabled={draft === null || clearing}>
-            {saving ? "Saving…" : "Save"}
+          <Button type="submit" variant="secondary" size="xs" pending={hold.doing("save")} disabled={draft === null || hold.held("save")}>
+            {hold.doing("save") ? "Saving…" : "Save"}
           </Button>
           {v.max_sessions !== null && (
-            <Button type="button" variant="ghost" size="xs" pending={clearing} disabled={saving} onClick={clear}>
+            <Button type="button" variant="ghost" size="xs" pending={hold.doing("clear")} disabled={hold.held("clear")} onClick={clear}>
               Use its config
             </Button>
           )}

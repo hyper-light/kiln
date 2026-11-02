@@ -9,7 +9,7 @@ import { ci, type MyNotifications, type MyRule } from "@/api/ci";
 import { Button } from "@/components/ui/button";
 import { Hold } from "@/components/ui/hold";
 import { SettingRow, SettingsGroup } from "@/components/ui/settings";
-import { useAction } from "@/lib/action";
+import { useHold } from "@/lib/action";
 import { relativeTime } from "@/lib/format";
 import { errorMessage } from "@/lib/hooks";
 import { useRes, type Res } from "@/lib/data";
@@ -43,20 +43,19 @@ export function MyNotificationsGroup() {
   const [problem, setProblem] = React.useState<string | null>(null);
   // The rules and the address are one thing, saved whole: one save at a time (W21-R15). The control
   // pressed says it's on its way, the others wait for its answer, and the list is as that has it.
-  const [pressed, setPressed] = React.useState("");
-  const [save, saving] = useAction(async (what: string, rules: MyRule[], email?: string | null, done?: () => void) => {
-    setPressed(what);
-    setProblem(null);
-    try {
-      const next = await ci.setMyNotifications(rules, email);
-      res.change(() => next);
-      done?.();
-    } catch (e) {
-      setProblem(errorMessage(e));
-    }
-  });
-  const on = (what: string) => saving && pressed === what;
-  const held = (what: string) => saving && pressed !== what;
+  const hold = useHold();
+  const save = (what: string, rules: MyRule[], email?: string | null, done?: () => void) =>
+    hold.change(what, async () => {
+      setProblem(null);
+      try {
+        const next = await ci.setMyNotifications(rules, email);
+        res.change(() => next);
+        done?.();
+      } catch (e) {
+        setProblem(errorMessage(e));
+      }
+    });
+  const { doing: on, held } = hold;
   if (!d.person) {
     return (
       <SettingsGroup id={ID} title={TITLE} about={ABOUT} words={WORDS}>

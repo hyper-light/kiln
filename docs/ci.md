@@ -6851,6 +6851,11 @@ image builder), review, environments, settings, insights (G-06, G-08, G-09, G-11
     way: `useAction` (`ui/src/lib/action.ts`) and Button's `pending` draw the loader's prism rule
     at its foot after a moment, and a press meanwhile does nothing. Nothing else on the page waits:
     fields, other controls and other rows stay usable, and a dialog's Cancel still closes it.
+  - One thing's changes go one at a time (`useHold`, `useHolds`, the same file): while one is on
+    its way its control says so, the thing's other controls wait, and a press meanwhile does
+    nothing, so no answer lands out of order or puts back a later change. Another thing's go.
+  - A message's files never hold its Send (or Mission control's Start): sent while one still
+    uploads, the message waits above the box, saying so, and goes with them once they're up.
   - A press that opens something goes there at once when it can know where: an agent started from
     Mission control opens as it starts (its page saying so until it has), the page made to know its
     id first (`POST /api/harness/sessions` takes the ids to start under). A form that makes

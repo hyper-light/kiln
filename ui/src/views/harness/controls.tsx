@@ -8,6 +8,7 @@ import { DropdownMenu } from "radix-ui";
 import { ArrowDownToLine, MoreHorizontal, SlidersHorizontal, X } from "lucide-react";
 import { harnessApi, type AgentInfo, type Attachment, type Command, type Control, type JsonValue, type Meta, type State } from "@/api/harness";
 import { formatBytes } from "@/lib/format";
+import { toast } from "@/components/ui/toast";
 import { Button } from "@/components/ui/button";
 import { Dialog, DialogContent } from "@/components/ui/dialog";
 import { Hold } from "@/components/ui/hold";
@@ -409,26 +410,58 @@ const previews = new Map<string, string>();
 /** The local preview kept for an uploaded attachment (queue/held rows show the image full size). */
 export const attachedPreview = (fileId: string) => previews.get(fileId);
 
+/** A message box's files: those up, the uploads on their way and their files' names, and why each that didn't make it. */
+interface Box {
+  files: Attached[];
+  going: Set<Promise<unknown>>;
+  names: string[];
+  lost: string[];
+}
+
+const emptyBox = (): Box => ({ files: [], going: new Set(), names: [], lost: [] });
+
+/** A message's files, taken from its box as it's sent (`take`). */
+export interface Taken {
+  /** Those up already. */
+  files: Attachment[];
+  /** The names of those still on their way. */
+  uploading: string[];
+  /** Every one that made it, once none is on its way (one that didn't is said in a toast: the message goes without it). */
+  up: Promise<Attachment[]>;
+  /** Puts them back in the box once they're up (what carried them didn't go), unless something's been attached since. */
+  back: () => void;
+}
+
 /** Files and screenshots to send with a message: pasted, dropped anywhere on the page, or picked (Photos, Camera or Files on a phone). */
 export function useAttachments(accepts: "any" | "images" | "none") {
   const enabled = accepts !== "none";
   const [files, setFiles] = React.useState<Attached[]>([]);
   const [pending, setPending] = React.useState(0);
   const [failed, setFailed] = React.useState<string | null>(null);
+  // The box's files as they are this moment (what's shown follows it): a send takes them all, the
+  // uploads still on their way included (`take`), and those then come to it, not to the box.
+  const box = React.useRef<Box>(emptyBox());
   const add = React.useCallback(
     async (list: FileList | File[]): Promise<Attachment[]> => {
       if (accepts === "none") return [];
       const picked = [...list].filter((f) => accepts === "any" || f.type.startsWith("image/"));
+      const mine = box.current;
+      const here = () => box.current === mine;
       setPending((n) => n + picked.length);
       setFailed(null);
+      mine.names.push(...picked.map((f) => f.name));
       const added: Attached[] = [];
+      const lose = (why: string) => {
+        mine.lost.push(why);
+        if (here()) setFailed(why);
+      };
       // Each file uploads as soon as it is attached, so sending is instant.
-      await Promise.all(
+      const batch = Promise.all(
         picked.map(async (f) => {
           try {
             const blob = f.type.startsWith("image/") ? await prepareImage(f) : f;
             if (blob.size > FILE_MAX_BYTES) {
-              setFailed(`${f.name} is larger than ${FILE_MAX_BYTES / 1024 / 1024} MB`);
+              lose(`${f.name} is larger than ${FILE_MAX_BYTES / 1024 / 1024} MB`);
               return;
             }
             const ext = blob.type === "image/jpeg" ? "jpg" : (blob.type.split("/")[1] ?? "bin");
@@ -446,34 +479,63 @@ export function useAttachments(accepts: "any" | "images" | "none") {
             }
             if (att.preview && att.file_id) previews.set(att.file_id, att.preview);
             added.push(att);
-            setFiles((cur) => [...cur, att]);
+            mine.files.push(att);
+            if (here()) setFiles([...mine.files]);
           } catch (e) {
-            setFailed(e instanceof Error ? e.message : String(e));
+            lose(e instanceof Error ? e.message : String(e));
           } finally {
-            setPending((n) => n - 1);
+            const i = mine.names.indexOf(f.name);
+            if (i >= 0) mine.names.splice(i, 1);
+            if (here()) setPending((n) => n - 1);
           }
         }),
       );
+      mine.going.add(batch);
+      await batch;
+      mine.going.delete(batch);
       // What this batch turned into, for a caller that merges it straight into a queued message.
       return added.map(asAttachment);
     },
     [accepts],
   );
-  const remove = (i: number) =>
-    setFiles((cur) => {
-      const f = cur[i];
-      if (f?.preview) URL.revokeObjectURL(f.preview);
-      return cur.filter((_, j) => j !== i);
-    });
+  const remove = (i: number) => {
+    const f = box.current.files[i];
+    if (f?.preview) URL.revokeObjectURL(f.preview);
+    box.current.files = box.current.files.filter((_, j) => j !== i);
+    setFiles([...box.current.files]);
+  };
   const clear = React.useCallback(() => {
-    setFiles((cur) => {
-      cur.forEach((f) => f.preview && URL.revokeObjectURL(f.preview));
-      return [];
-    });
+    box.current.files.forEach((f) => f.preview && URL.revokeObjectURL(f.preview));
+    box.current = emptyBox();
+    setFiles([]);
+    setPending(0);
     setFailed(null);
   }, []);
-  /** What a send carries. */
-  const payload = (): Attachment[] => files.map(asAttachment);
+  /**
+   * What a send carries, its uploads still on their way included (W21-R15): Send never waits for
+   * them, and the box is free at once for what's written next. Those come to the message, not the
+   * box; one that fails after this is said in a toast, as the box can't say it any more.
+   */
+  const take = (): Taken => {
+    const was = box.current;
+    box.current = emptyBox();
+    setFiles([]);
+    setPending(0);
+    setFailed(null);
+    const seen = was.lost.length;
+    const up = Promise.all([...was.going]).then(() => {
+      for (const why of was.lost.slice(seen)) toast.error("A file didn't upload: the message goes without it", why);
+      return was.files.map(asAttachment);
+    });
+    const back = () =>
+      void up.then(() => {
+        const now = box.current;
+        if (now.files.length || now.going.size || !was.files.length) return;
+        now.files = [...was.files];
+        setFiles([...now.files]);
+      });
+    return { files: was.files.map(asAttachment), uploading: [...was.names], up, back };
+  };
   // An attached image, full size, before it's sent (as a phone shows it): its name and size, Remove/Keep.
   const [viewing, setViewing] = React.useState<Attached | null>(null);
   const chips =
@@ -536,7 +598,7 @@ export function useAttachments(accepts: "any" | "images" | "none") {
         )}
       </>
     ) : null;
-  return { enabled, accepts, files, pending, add, clear, chips, payload };
+  return { enabled, accepts, files, pending, add, clear, chips, take };
 }
 
 export type Attachments = ReturnType<typeof useAttachments>;

@@ -1408,6 +1408,15 @@ reloads) and goes to the agent in order once it can take it, ahead of anything s
 Files attached go along when they were uploaded; ones that couldn't be (no server) stay with the
 page until it reloads.
 
+A message sent while one of its files still uploads waits there too (W21-R15): Send never waits
+for a file, and the box is free at once for what's written next. Its row says each file on its
+way; once they're up it goes, in its turn, carrying each that made it (one that didn't is said in
+a toast, and the message goes without it), and what's queued after it waits behind it. Kept from
+before a reload, its uploads went with that page: it waits for you to send it without each (its ×)
+or remove it. Mission control's Start doesn't wait for files either: the agent starts, and its first
+message waits for them on its page; several agents get theirs once they've started and the files
+are up.
+
 ### What you sent, at once
 
 A message shows at the end of the conversation the moment it goes, marked *sending…*, then *sent*

@@ -14,7 +14,7 @@ import { ConfirmDialog, Dialog, DialogContent } from "@/components/ui/dialog";
 import { Loadable } from "@/components/ui/loading";
 import { Crumbs, EmptyState, Facts, Panel } from "@/components/ui/misc";
 import { toast } from "@/components/ui/toast";
-import { useAction } from "@/lib/action";
+import { useAction, useHold, type Hold } from "@/lib/action";
 import { useRes } from "@/lib/data";
 import { errorMessage } from "@/lib/hooks";
 import { invalidate, useSuspenseResource } from "@/lib/resource";
@@ -172,15 +172,10 @@ export default function Templates() {
 
 /** A template changed as YAML, saved whole; or deleted, once no app is made from it. */
 /**
- * A template's changes (saved, deleted), one at a time (`TemplateView`): `change` sends one, `doing`
- * the one pressed, `held` the other; `going` holds its editor too, whose text the answer starts again.
+ * A template's changes (saved, deleted), one at a time (`TemplateView`'s hold): each answers with the
+ * template as it is now (none: unchanged), which the editor starts again from; `going` holds it too.
  */
-interface Edits {
-  change: (what: string, f: () => Promise<Template | null>) => void;
-  doing: (what: string) => boolean;
-  held: (what: string) => boolean;
-  going: boolean;
-}
+type Edits = Omit<Hold, "change"> & { change: (what: string, f: () => Promise<Template | null>) => void };
 
 function Edit({ t, using, edits }: { t: Template; using: App[]; edits: Edits }) {
   const navigate = useNavigate();
@@ -260,12 +255,8 @@ function TemplateView({ name }: { name: string }) {
   const t = res.data;
   // Its changes go one at a time: the one pressed says it's on its way and the other waits. Held here,
   // above the editor, which starts again from the template each answer brings (W21-R15).
-  const [which, setWhich] = React.useState("");
-  const [change, changing] = useAction((what: string, f: () => Promise<Template | null>) => {
-    setWhich(what);
-    return f().then((next) => next && res.change(() => next));
-  });
-  const edits: Edits = { change, doing: (what) => changing && which === what, held: (what) => changing && which !== what, going: changing };
+  const hold = useHold();
+  const edits: Edits = { ...hold, change: (what, f) => hold.change(what, () => f().then((next) => next && res.change(() => next))) };
   const using = useRes(appsRes).data.filter((a) => a.template === t.name);
   return (
     <>

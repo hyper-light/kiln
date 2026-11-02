@@ -17,7 +17,7 @@ import { Loadable } from "@/components/ui/loading";
 import { Crumbs, Panel, SelectField, TextField } from "@/components/ui/misc";
 import { Segmented } from "@/components/ui/tabs";
 import { toast } from "@/components/ui/toast";
-import { useAction, useActions } from "@/lib/action";
+import { useAction, useActions, useHold } from "@/lib/action";
 import { useRes } from "@/lib/data";
 import { errorMessage } from "@/lib/hooks";
 import { invalidate, useSuspenseResource } from "@/lib/resource";
@@ -316,11 +316,7 @@ function FleetView({ id }: { id: string }) {
   // another's. The one pressed says it's on its way, and what contradicts it waits (W21-R15).
   const [mergeOne, mergingOne] = useActions((_: string, g: () => Promise<void>) => g());
   const rowsOut = (f.proposals ?? []).some((p) => mergingOne(p.repo));
-  const [whole, setWhole] = React.useState<"merge" | "withdraw">("merge");
-  const [all, allGoing] = useAction((which: "merge" | "withdraw", g: () => Promise<void>) => {
-    setWhole(which);
-    return g();
-  });
+  const whole = useHold();
   const mergeAll = async () => {
     try {
       await deployApi.mergeFleet(id);
@@ -360,11 +356,11 @@ function FleetView({ id }: { id: string }) {
             open.length > 0 ? (
               <>
                 {open.some((p) => p.host === "kiln") && (
-                  <Button size="sm" variant="secondary" pending={allGoing && whole === "merge"} disabled={rowsOut || (allGoing && whole !== "merge")} onClick={() => all("merge", mergeAll)}>
+                  <Button size="sm" variant="secondary" pending={whole.doing("merge")} disabled={rowsOut || whole.held("merge")} onClick={() => whole.change("merge", mergeAll)}>
                     <GitMerge /> Merge each
                   </Button>
                 )}
-                <Button size="sm" variant="ghost-danger" pending={allGoing && whole === "withdraw"} disabled={rowsOut || (allGoing && whole !== "withdraw")} onClick={() => setWithdrawing(true)}>
+                <Button size="sm" variant="ghost-danger" pending={whole.doing("withdraw")} disabled={rowsOut || whole.held("withdraw")} onClick={() => setWithdrawing(true)}>
                   Withdraw
                 </Button>
               </>
@@ -373,7 +369,7 @@ function FleetView({ id }: { id: string }) {
         >
           <ul className="rel-objects">
             {(f.proposals ?? []).map((p) => (
-              <ProposalRow key={p.repo} id={id} p={p} run={mergeOne} merging={mergingOne(p.repo)} held={allGoing} />
+              <ProposalRow key={p.repo} id={id} p={p} run={mergeOne} merging={mergingOne(p.repo)} held={whole.going} />
             ))}
           </ul>
         </Panel>
@@ -407,7 +403,7 @@ function FleetView({ id }: { id: string }) {
         danger
         onConfirm={() => {
           const done = withdraw();
-          all("withdraw", () => done);
+          whole.change("withdraw", () => done);
           return done;
         }}
       />

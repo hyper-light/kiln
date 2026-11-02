@@ -33,7 +33,7 @@ import { Loadable } from "@/components/ui/loading";
 import { Crumbs, Facts, Panel, SelectField, TextField } from "@/components/ui/misc";
 import { Segmented } from "@/components/ui/tabs";
 import { toast } from "@/components/ui/toast";
-import { useAction } from "@/lib/action";
+import { useHold, type Hold } from "@/lib/action";
 import { useRes } from "@/lib/data";
 import { errorMessage } from "@/lib/hooks";
 import { change, invalidate, useSuspenseResource } from "@/lib/resource";
@@ -113,16 +113,11 @@ function checkSpec(r: CheckRow): CheckSpec {
 }
 
 /**
- * The environment's own changes, one at a time (`EnvView`): `edit` sends one, `doing` the control
- * pressed, `held` the others. While one is `going`, its settings' fields are held too: its answer
- * starts them again, and would take what was typed meanwhile (W21-R15).
+ * The environment's own changes, one at a time (`EnvView`'s hold), each answering with the
+ * environment as it is now (none: unchanged). While one is `going`, its settings' fields are held
+ * too: its answer starts them again, and would take what was typed meanwhile (W21-R15).
  */
-interface Edits {
-  edit: (which: string, f: () => Promise<Environment | null>) => void;
-  doing: (which: string) => boolean;
-  held: (which: string) => boolean;
-  going: boolean;
-}
+type Edits = Omit<Hold, "change"> & { change: (which: string, f: () => Promise<Environment | null>) => void };
 
 /** What every release here passes, how a second one waits, and what agents may do; saved whole. */
 function Settings({ e, edits }: { e: Environment; edits: Edits }) {
@@ -164,7 +159,7 @@ function Settings({ e, edits }: { e: Environment; edits: Edits }) {
   const setWindow = (i: number, patch: Partial<WindowRow>) => setWindows((ws) => ws.map((w, j) => (j === i ? { ...w, ...patch } : w)));
   const setCheck = (i: number, patch: Partial<CheckRow>) => setExternal((xs) => xs.map((x, j) => (j === i ? { ...x, ...patch } : x)));
   const save = () =>
-    edits.edit("save", async () => {
+    edits.change("save", async () => {
       const builtIn: Check[] = checks.map((n) => builtInSpecs.find((s) => s.name === n) ?? n);
       const gates: Gates = {
         // What this form doesn't show is kept as it is.
@@ -359,7 +354,7 @@ function Freeze({ e, edits }: { e: Environment; edits: Edits }) {
   // its button saying meanwhile that it's on its way; Why is emptied only if it still says what was
   // sent (W21-R15).
   const put = (freeze: string | undefined) =>
-    edits.edit(freeze ? "freeze" : "thaw", async () => {
+    edits.change(freeze ? "freeze" : "thaw", async () => {
       try {
         const next = await deployApi.putEnvironment({ ...e, gates: { ...e.gates, freeze } });
         toast({
@@ -478,13 +473,7 @@ function Provider({ e }: { e: Environment }) {
   };
   // The move's steps go one at a time (Hand over anyway and Cancel the move can't both be on their
   // way): the button pressed says so and the others wait, until the move shows its answer (W21-R15).
-  const [step, setStep] = React.useState("");
-  const [go, going] = useAction((which: string, f: () => Promise<void>) => {
-    setStep(which);
-    return f();
-  });
-  const doing = (which: string) => going && step === which;
-  const held = (which: string) => going && step !== which;
+  const { change: go, doing, held } = useHold();
   return (
     <Panel
       eyebrow="Provider"
@@ -601,7 +590,7 @@ function DeleteEnvironment({ e, edits }: { e: Environment; edits: Edits }) {
         onConfirm={() => {
           // Its other changes wait for its deletion, as for any of its changes.
           const done = remove();
-          edits.edit("delete", () => done.then(() => null));
+          edits.change("delete", () => done.then(() => null));
           return done;
         }}
       />
@@ -641,12 +630,8 @@ function EnvView({ name }: { name: string }) {
   // Its own changes (its freeze, its settings) go one at a time: the control pressed says it's on its
   // way and the others wait. Held here, above the settings, which start again from the environment
   // each answer brings (W21-R15).
-  const [changing, setChanging] = React.useState("");
-  const [edit, editing] = useAction((which: string, f: () => Promise<Environment | null>) => {
-    setChanging(which);
-    return f().then((next) => next && res.change(() => next));
-  });
-  const edits: Edits = { edit, doing: (which) => editing && changing === which, held: (which) => editing && changing !== which, going: editing };
+  const hold = useHold();
+  const edits: Edits = { ...hold, change: (which, f) => hold.change(which, () => f().then((next) => next && res.change(() => next))) };
   const gates = gateLines(e.gates);
   const clusters = e.targets.kubernetes.length ? e.targets.kubernetes.join(", ") : "the cluster kiln runs in";
   const platforms = Object.keys(e.targets.platforms ?? {});

@@ -15,7 +15,7 @@ import { Loadable } from "@/components/ui/loading";
 import { Crumbs, Panel, SelectField } from "@/components/ui/misc";
 import { Segmented } from "@/components/ui/tabs";
 import { toast } from "@/components/ui/toast";
-import { sendingProps, useAction } from "@/lib/action";
+import { useAction } from "@/lib/action";
 import { useRes, type Res } from "@/lib/data";
 import { relativeTime } from "@/lib/format";
 import { errorMessage } from "@/lib/hooks";
@@ -150,14 +150,13 @@ function Viewer({ n, onEdit }: { n: Notebook; onEdit: () => void }) {
         }
       />
       <div className="mb-6 flex flex-wrap items-center gap-3">
-        <span className="flex max-w-full" {...sendingProps(settingTime)}>
-          <Segmented<Range | "fixed">
-            label="Time"
-            value={fixed ? "fixed" : (span as Range)}
-            onChange={(v) => v !== "fixed" && setTime(v)}
-            options={[...(fixed ? [{ value: "fixed" as const, label: rangeSaid(fixed.from, fixed.to) }] : []), ...(Object.keys(RANGES) as Range[]).map((r) => ({ value: r, label: r }))]}
-          />
-        </span>
+        <Segmented<Range | "fixed">
+          label="Time"
+          value={fixed ? "fixed" : (span as Range)}
+          onChange={(v) => v !== "fixed" && setTime(v)}
+          pending={settingTime ? (fixed ? "fixed" : (span as Range)) : null}
+          options={[...(fixed ? [{ value: "fixed" as const, label: rangeSaid(fixed.from, fixed.to) }] : []), ...(Object.keys(RANGES) as Range[]).map((r) => ({ value: r, label: r }))]}
+        />
       </div>
       {(a.cells ?? []).length === 0 ? (
         <p className="empty-line py-14 text-center">

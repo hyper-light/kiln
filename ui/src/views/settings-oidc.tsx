@@ -11,7 +11,7 @@ import { Button } from "@/components/ui/button";
 import { Hold } from "@/components/ui/hold";
 import { Confirm, Facts } from "@/components/ui/misc";
 import { SettingsGroup } from "@/components/ui/settings";
-import { useAction } from "@/lib/action";
+import { useHold } from "@/lib/action";
 import { relativeTime } from "@/lib/format";
 import { errorMessage } from "@/lib/hooks";
 import { useSuspenseResource } from "@/lib/resource";
@@ -53,21 +53,20 @@ export function OidcGroups() {
   };
   // Publishing and rotating both change the keys kiln's issuer publishes: one at a time (W21-R15),
   // the one pressed saying so and the others waiting, so one message line says how each went.
-  const [pressed, setPressed] = React.useState<"publish" | "later" | "now">("publish");
-  const [keys, changing] = useAction((what: "publish" | "later" | "now") => {
-    setPressed(what);
-    if (what === "publish") return act(async () => `Published to ${(await ci.oidcPublish()).published}.`);
-    const at = now;
-    return act(async () => {
-      if (what === "now") {
-        await ci.oidcRotate(true);
-        return "A new key signs now.";
-      }
-      return `A new key signs from ${new Date((await ci.oidcRotate(false)).sign_from * 1000).toLocaleString()}.`;
-    }).then(() => setNow((n) => (n === at ? null : n)));
-  });
-  const on = (what: "publish" | "later" | "now") => changing && pressed === what;
-  const held = (what: "publish" | "later" | "now") => changing && pressed !== what;
+  const hold = useHold();
+  const keys = (what: "publish" | "later" | "now") =>
+    hold.change(what, () => {
+      if (what === "publish") return act(async () => `Published to ${(await ci.oidcPublish()).published}.`);
+      const at = now;
+      return act(async () => {
+        if (what === "now") {
+          await ci.oidcRotate(true);
+          return "A new key signs now.";
+        }
+        return `A new key signs from ${new Date((await ci.oidcRotate(false)).sign_from * 1000).toLocaleString()}.`;
+      }).then(() => setNow((n) => (n === at ? null : n)));
+    });
+  const { doing: on, held } = hold;
   return (
     <>
       <SettingsGroup

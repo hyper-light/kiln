@@ -56,7 +56,7 @@ import {
   type Chosen,
 } from "./spawn-setup";
 import { putBack, showsLine, startAgain, startAgents, useStart, type Start } from "./starting";
-import { useHeld } from "./state";
+import { holdWith } from "./state";
 import { MicButton } from "./voice";
 
 /** What starting agents needs to know: each machine's harnesses, the machines, their shells, the runners its commands can go to, and where it can have a workspace of its own. */
@@ -310,7 +310,7 @@ function HowLine({ c }: { c: Choices }) {
 }
 
 /** Start. `sending`: several are starting from here: it says so, and a press waits (a second would start more). */
-function StartButton({ c, blocked, sending, run }: { c: Choices; blocked: boolean; sending: boolean; run: (s: Setup) => void }) {
+function StartButton({ c, sending, run }: { c: Choices; sending: boolean; run: (s: Setup) => void }) {
   const s = useSetup(c);
   const label = c.count > 1 ? `Start ${c.count}` : "Start";
   return (
@@ -318,7 +318,7 @@ function StartButton({ c, blocked, sending, run }: { c: Choices; blocked: boolea
       type="button"
       className="cp-send mc-start"
       data-mode="send"
-      disabled={blocked || !s.target || s.noHarness}
+      disabled={!s.target || s.noHarness}
       {...sendingProps(sending)}
       onClick={() => {
         if (!sending) run(s);
@@ -706,7 +706,7 @@ export function NewAgent({
   const fromLink = params.get("new") === "1";
   const linked = React.useRef(false);
   const attachments = useAttachments("any");
-  const { files, pending } = attachments;
+  const { files } = attachments;
   const picker = React.useRef<HTMLInputElement>(null);
   const field = React.useRef<HTMLTextAreaElement | null>(null);
   const root = React.useRef<HTMLElement>(null);
@@ -731,10 +731,12 @@ export function NewAgent({
   // Start doesn't wait for the server (starting.ts): the agents are listed starting at once, under
   // ids made here, and one opens at once.
   const run = (s: Setup) => {
-    if (!s.target || pending > 0) return;
+    if (!s.target) return;
     const body = text.trim();
-    // Files go with the first message, so then the words go with them rather than in the spec.
-    const sending = files.length > 0 ? attachments.payload() : undefined;
+    // Files go with the first message (those still uploading too: Start doesn't wait for them), so
+    // then the words go with them rather than in the spec.
+    const taken = attachments.take();
+    const sending = taken.files.length > 0 || taken.uploading.length > 0 ? taken : undefined;
     const spec = specOf({
       kind: s.kind,
       cwd: s.cwd,
@@ -749,11 +751,11 @@ export function NewAgent({
       volume: s.volume,
     });
     const ids = Array.from({ length: c.count }, () => clientId());
-    // One agent: its files are kept for it, and its page sends them once it can take them. Several:
-    // sent to them all once they've started.
+    // One agent: its files are kept for it, and its page sends them once it can take them (and
+    // they're up). Several: sent to them all once they've started and the files are up.
     const only = ids.length === 1 ? ids[0] : undefined;
     const heldFirst = sending && only ? clientId() : undefined;
-    if (heldFirst && only) useHeld.getState().hold(only, { id: heldFirst, text: body, at: Date.now(), attachments: sending, mode: "queue" });
+    if (sending && heldFirst && only) holdWith(only, { id: heldFirst, text: body, at: Date.now(), mode: "queue" }, sending);
     // Once they've all started, the machine and folder are the next start's, and several agents'
     // files go to them all; a start that couldn't changes nothing kept.
     const dirs = c.shell ? undefined : withDir(c.dirs, s.target, s.cwd);
@@ -761,11 +763,23 @@ export function NewAgent({
     const after = () => {
       setLastTarget(s.target);
       if (dirs) setDirs(dirs);
-      if (sending && !only) return harnessApi.broadcastTo({ to: { ids }, text: body, attachments: sending, key: clientId() }).then(() => undefined);
+      if (sending && !only)
+        return sending.up.then((up) =>
+          body || up.length ? harnessApi.broadcastTo({ to: { ids }, text: body, attachments: up.length ? up : undefined, key: clientId() }).then(() => undefined) : undefined,
+        );
     };
-    startAgents({ ids, target: s.target, spec, kindName: s.kindName, machine: s.machine, text: body, files: files.map((f) => f.name), heldFirst, after });
+    startAgents({
+      ids,
+      target: s.target,
+      spec,
+      kindName: s.kindName,
+      machine: s.machine,
+      text: body,
+      files: sending ? [...sending.files.map((f) => f.name), ...sending.uploading] : [],
+      heldFirst,
+      after,
+    });
     onText("");
-    attachments.clear();
     c.reset();
     setMore(false);
     if (only) {
@@ -900,7 +914,7 @@ export function NewAgent({
                 </button>
               }
             >
-              <StartButton c={c} blocked={pending > 0} sending={manyStart?.state === "starting"} run={run} />
+              <StartButton c={c} sending={manyStart?.state === "starting"} run={run} />
             </React.Suspense>
           </div>
         </div>

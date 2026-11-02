@@ -33,7 +33,7 @@ import { CopyButton, Crumbs, Facts, Panel, SelectField, TextField } from "@/comp
 import { StatusDot } from "@/components/ui/status";
 import { Segmented } from "@/components/ui/tabs";
 import { toast } from "@/components/ui/toast";
-import { useAction, useActions } from "@/lib/action";
+import { useAction, useActions, useHold, type Hold } from "@/lib/action";
 import { errorMessage } from "@/lib/hooks";
 import { invalidate, useSuspenseResource } from "@/lib/resource";
 import { RelTime } from "@/views/shared";
@@ -285,16 +285,11 @@ function RegisterIn({ app, registered }: { app: string; registered: string[] }) 
 }
 
 /**
- * The app's own changes, one at a time (`AppView`): `edit` sends one, `doing` the control pressed,
- * `held` the others. While one is `going`, the forms' fields are held too: its answer starts them
+ * The app's own changes, one at a time (`AppView`'s hold), each answering with the app as it is now
+ * (none: unchanged). While one is `going`, the forms' fields are held too: its answer starts them
  * again, and would take what was typed meanwhile (W21-R15).
  */
-interface Edits {
-  edit: (which: string, f: () => Promise<App | null>) => void;
-  doing: (which: string) => boolean;
-  held: (which: string) => boolean;
-  going: boolean;
-}
+type Edits = Omit<Hold, "change"> & { change: (which: string, f: () => Promise<App | null>) => void };
 
 /** What an app is, changed here: its project and owners, who to reach, its source repository; it
  * archived (no new releases, what runs keeps running), or deleted. */
@@ -325,7 +320,7 @@ function Settings({ a, registered, edits }: { a: App; registered: string[]; edit
     }
   };
   const save = () =>
-    edits.edit("save", () =>
+    edits.change("save", () =>
       patch(
         { project: project.trim() || "default", owners: list(owners), contacts: { ...a.contacts, oncall: oncall.trim() || undefined, channels: list(channels) }, source: source.trim() },
         `${a.name} is saved`,
@@ -333,7 +328,7 @@ function Settings({ a, registered, edits }: { a: App; registered: string[]; edit
     );
   // Archived once the server says so: until then Archive says it's on its way (the forms here start
   // again from the app it answers with).
-  const archive = () => edits.edit("archive", () => patch({ archived: !a.archived }, a.archived ? `${a.name} takes releases again` : `${a.name} is archived`));
+  const archive = () => edits.change("archive", () => patch({ archived: !a.archived }, a.archived ? `${a.name} takes releases again` : `${a.name} is archived`));
   const remove = async () => {
     try {
       await deployApi.deleteApp(a.name, { everywhere: true, keep });
@@ -402,7 +397,7 @@ function Settings({ a, registered, edits }: { a: App; registered: string[]; edit
         onConfirm={() => {
           // The app's other changes wait for its deletion, as for any of its changes.
           const done = remove();
-          edits.edit("delete", () => done.then(() => null));
+          edits.change("delete", () => done.then(() => null));
           return done;
         }}
       />
@@ -455,7 +450,7 @@ function AsYaml({ a, edits }: { a: App; edits: Edits }) {
   // Saved, the dialog closes; until then Save says it's on its way, and Close still closes it, Edit as
   // YAML saying so then (W21-R15).
   const save = () =>
-    edits.edit("yaml", async () => {
+    edits.change("yaml", async () => {
       if (!read.value) return null;
       try {
         const next = await deployApi.putApp(read.value as unknown as App);
@@ -550,7 +545,7 @@ function Deploys({ a, registered, edits }: { a: App; registered: string[]; edits
           ? "Its repository, and a chart's name."
           : null;
   const save = () =>
-    edits.edit("deploys", async () => {
+    edits.change("deploys", async () => {
       const values = Object.fromEntries(lines.map((l) => [l.slice(0, l.indexOf("=")).trim(), l.slice(l.indexOf("=") + 1).trim()]));
       const pkg: Package =
         kind === "helm"
@@ -740,12 +735,8 @@ function AppView({ name }: { name: string }) {
   // Its own changes (its settings, archiving it, its YAML, how it deploys) go one at a time: the
   // control pressed says it's on its way and the others wait. Held here, above the forms, which start
   // again from the app each answer brings (W21-R15).
-  const [changing, setChanging] = React.useState("");
-  const [edit, editing] = useAction((which: string, f: () => Promise<App | null>) => {
-    setChanging(which);
-    return f().then((app) => app && res.change((x) => ({ ...x, app })));
-  });
-  const edits: Edits = { edit, doing: (which) => editing && changing === which, held: (which) => editing && changing !== which, going: editing };
+  const hold = useHold();
+  const edits: Edits = { ...hold, change: (which, f) => hold.change(which, () => f().then((app) => app && res.change((x) => ({ ...x, app })))) };
   const envs = d.environments.map((e) => e.registration.environment);
   const a = d.app;
   const pkg = packageWords(a.package);

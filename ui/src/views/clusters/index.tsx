@@ -15,7 +15,7 @@ import { Loadable } from "@/components/ui/loading";
 import { Confirm, Facts, PageIntro, Panel, SelectField, TextField } from "@/components/ui/misc";
 import { toast } from "@/components/ui/toast";
 import { openCluster, openRes } from "@/components/shell/clusters";
-import { useAction } from "@/lib/action";
+import { useAction, useHold, type Hold } from "@/lib/action";
 import { useRes, warm, type Res } from "@/lib/data";
 import { change, invalidate } from "@/lib/resource";
 import "./clusters.css";
@@ -118,13 +118,6 @@ function CodeField({ label, value, onChange, placeholder }: { label: string; val
   );
 }
 
-/** A peering's changes, one at a time (`OutRow`): `change` sends one, `doing` the one pressed, `held` the others. */
-interface Hold {
-  change: (what: string, f: () => Promise<unknown>) => void;
-  doing: (what: string) => boolean;
-  held: (what: string) => boolean;
-}
-
 /**
  * Asks before removing a peering: removed, it leaves the list and the header's cluster picker at
  * once, and is back in both, saying why, if it doesn't go (W21-R15).
@@ -176,14 +169,9 @@ function OutRow({ p }: { p: Peer }) {
   const [open, opening] = useAction(() => openCluster(p.id, p.name));
   // The peering's changes (a new challenge, the response pasted, a new address, its removal) go one
   // at a time: the one pressed says it's on its way and the others wait (W21-R15).
-  const [which, setWhich] = React.useState("");
-  const [change, changing] = useAction((what: string, f: () => Promise<unknown>) => {
-    setWhich(what);
-    return f();
-  });
-  const hold: Hold = { change, doing: (what) => changing && which === what, held: (what) => changing && which !== what };
+  const hold = useHold();
   const rechallenge = () =>
-    change("challenge", async () => {
+    hold.change("challenge", async () => {
       try {
         setChallenge((await peersApi.rechallenge(p.id)).challenge);
         changed();

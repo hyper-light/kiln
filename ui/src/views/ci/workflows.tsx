@@ -19,7 +19,7 @@ import { Link, useSearchParams } from "@/lib/router";
 import { unifiedPatch } from "@/lib/patch";
 import { describe, keysAt, siblingValue, yamlSpot, type Schema } from "@/lib/yaml-spot";
 import { placed } from "@/lib/diagnostics";
-import { sendingProps, useAction } from "@/lib/action";
+import { sendingProps, useHold } from "@/lib/action";
 import { errorMessage } from "@/lib/hooks";
 import { useSuspenseResource } from "@/lib/resource";
 import type { CompletionContext, CompletionResult, Diagnostic } from "@/components/code/editor";
@@ -325,10 +325,9 @@ function WorkflowFile({ repo, path, gitRef }: { repo: string; path: string; gitR
   // One save of the file at a time (W21-R15): the way pressed says it's on its way and the others
   // are held until it's back; a commit's answer closes the branch form only while it still names
   // the branch committed to.
-  const [sent, setSent] = React.useState<CiSave | null>(null);
-  const [save, saving] = useAction(
-    async (to: CiSave, onto?: string) => {
-      setSent(to);
+  const hold = useHold((e) => setSaved({ tone: "error", text: errorMessage(e) }));
+  const save = (to: CiSave, onto?: string) =>
+    hold.change(to, async () => {
       setSaved(null);
       const r = await ci.saveWorkflow(repo, path, { content: text, to, branch: onto });
       const d = r.diffs?.[0];
@@ -338,11 +337,8 @@ function WorkflowFile({ repo, path, gitRef }: { repo: string; path: string; gitR
         setSaved({ text: `Committed to ${r.branch} (${(r.sha ?? "").slice(0, 7)}).` });
         setBranch((b) => (b !== null && b.trim() === onto ? null : b));
       } else setSaved({ text: "Saved." });
-    },
-    (e) => setSaved({ tone: "error", text: errorMessage(e) }),
-  );
-  const going = (to: CiSave) => saving && sent === to;
-  const held = (to: CiSave) => saving && sent !== to;
+    });
+  const { doing: going, held } = hold;
   const patch = () => {
     const url = URL.createObjectURL(new Blob([unifiedPatch(path, file.source, text)], { type: "text/x-diff" }));
     const a = document.createElement("a");

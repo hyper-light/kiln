@@ -13,7 +13,7 @@ import { Loadable, Loading } from "@/components/ui/loading";
 import { SelectField } from "@/components/ui/misc";
 import { StatusDot } from "@/components/ui/status";
 import { toast } from "@/components/ui/toast";
-import { useAction } from "@/lib/action";
+import { useAction, useHold } from "@/lib/action";
 import { useRes } from "@/lib/data";
 import { relativeTime, shortSha } from "@/lib/format";
 import { errorMessage, useMediaQuery } from "@/lib/hooks";
@@ -154,13 +154,13 @@ function Head({ d }: { d: DiffDetail }) {
   const yours = d.author === you || d.author_for === you;
   // Ready, Reclaim and Abandon change one diff's state: one at a time (W21-R15), the one pressed
   // saying it's on its way and the others held until it's back.
-  const [sent, setSent] = React.useState<DiffAct | null>(null);
-  const [act, acting] = useAction(async (a: DiffAct) => {
-    setSent(a);
-    await reviewApi.act(d.name, a);
-    refresh(d.name);
-  }, "That didn't work");
-  const hold = (a: DiffAct) => ({ pending: acting && sent === a, disabled: acting && sent !== a });
+  const state = useHold("That didn't work");
+  const act = (a: DiffAct) =>
+    state.change(a, async () => {
+      await reviewApi.act(d.name, a);
+      refresh(d.name);
+    });
+  const hold = (a: DiffAct) => ({ pending: state.doing(a), disabled: state.held(a) });
   const agent = d.author_kind === "agent" || d.author.startsWith("agent:");
   return (
     <header className="rv-head">

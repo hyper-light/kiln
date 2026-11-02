@@ -16,7 +16,7 @@ import type { CdAppDetail, CdAutoRollback, CdCommit, CdDeployment, CdRollbackTar
 import { Button } from "@/components/ui/button";
 import { Confirm } from "@/components/ui/misc";
 import { Segmented } from "@/components/ui/tabs";
-import { sendingProps } from "@/lib/action";
+import { sendingProps, type Hold } from "@/lib/action";
 import { useRes, type Res } from "@/lib/data";
 import { RelTime } from "@/views/shared";
 import { TRIGGER_WORD, shortRev } from "./parts";
@@ -259,20 +259,21 @@ export function AutoRollbackLine({ a, open, onToggle }: { a: CdAppDetail; open: 
 /**
  * Auto-rollback, changed in place: for this app (or following its repository), and for every app
  * of its repository. Each change is made as it is chosen, as the sync policy's switches are; what it
- * comes to is the server's to say, so the choice on its way (`sending`) says so until it has, and
+ * comes to is the server's to say, so the choice on its way (`hold`) says so until it has, and
  * the other waits for it (W21-R15).
  */
 export function AutoRollbackPanel({
   a,
   name,
-  sending,
+  hold,
   onSetApp,
   onSetRepo,
   onClose,
 }: {
   a: CdAppDetail;
   name: string;
-  sending: "app" | "repo" | null;
+  /** Its two choices' changes, one at a time: "app" and "repo". */
+  hold: Hold;
   onSetApp: (on: boolean | null, said: string) => void;
   onSetRepo: (repo: string, on: boolean | null, said: string) => void;
   onClose: () => void;
@@ -299,12 +300,12 @@ export function AutoRollbackPanel({
       </p>
       <div className="cd-autorb-field">
         <span className="field-label">This app</span>
-        <fieldset className="cd-autorb-choice" disabled={sending === "repo"} {...sendingProps(sending === "app")}>
+        <fieldset className="cd-autorb-choice" disabled={hold.held("app")} {...sendingProps(hold.doing("app"))}>
           <Segmented
             label={`Auto-rollback for ${name}`}
             value={choiceOf(r.app)}
             onChange={(c) =>
-              !sending && c !== choiceOf(r.app) && onSetApp(onOf(c), c === "inherit" ? `${name} follows ${app.from} again: auto-rollback ${word(app.on)}.` : `Auto-rollback ${c} for ${name}.`)
+              !hold.going && c !== choiceOf(r.app) && onSetApp(onOf(c), c === "inherit" ? `${name} follows ${app.from} again: auto-rollback ${word(app.on)}.` : `Auto-rollback ${c} for ${name}.`)
             }
             options={[
               { value: "inherit", label: `${app.label} (${word(app.on)})` },
@@ -317,12 +318,12 @@ export function AutoRollbackPanel({
       {repo && r.repo && (
         <div className="cd-autorb-field">
           <span className="field-label">Every app of {repo}</span>
-          <fieldset className="cd-autorb-choice" disabled={sending === "app"} {...sendingProps(sending === "repo")}>
+          <fieldset className="cd-autorb-choice" disabled={hold.held("repo")} {...sendingProps(hold.doing("repo"))}>
             <Segmented
               label={`Auto-rollback for every app of ${repo}`}
               value={choiceOf(r.repo_setting)}
               onChange={(c) =>
-                !sending &&
+                !hold.going &&
                 c !== choiceOf(r.repo_setting) &&
                 r.repo &&
                 onSetRepo(r.repo, onOf(c), c === "inherit" ? `${repo} no longer says: its apps follow ${fromRepo.from} (${word(fromRepo.on)}).` : `Auto-rollback ${c} for every app of ${repo}.`)

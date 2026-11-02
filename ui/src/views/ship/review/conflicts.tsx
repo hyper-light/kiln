@@ -10,7 +10,7 @@
 import * as React from "react";
 import { BadgeCheck, Check, GitMerge, Pencil, RotateCcw, X } from "lucide-react";
 import { conflictsApi, type Conflict, type ConflictTake } from "@/api/review";
-import { sendingProps, useAction } from "@/lib/action";
+import { sendingProps, useHold } from "@/lib/action";
 import { invalidate } from "@/lib/resource";
 import "./review.css";
 
@@ -51,19 +51,16 @@ export function ConflictBlock({ cf, n, diffKey, onDone }: { cf: Conflict; n: num
   const [err, setErr] = React.useState<string | null>(null);
   // One answer at a time for a conflict: the press that sent it says so, and the rest are held
   // until it's back.
-  const [sent, setSent] = React.useState("");
-  const [run, busy] = useAction(
-    async (what: string, f: () => Promise<unknown>) => {
-      setSent(what);
+  const hold = useHold((e) => setErr(said(e)));
+  const run = (what: string, f: () => Promise<unknown>) =>
+    hold.change(what, async () => {
       setErr(null);
       await f();
       invalidate("review/");
       invalidate("ship/");
       onDone?.();
-    },
-    (e) => setErr(said(e)),
-  );
-  const sending = (what: string) => ({ disabled: busy && sent !== what, ...sendingProps(busy && sent === what) });
+    });
+  const sending = (what: string) => ({ disabled: hold.held(what), ...sendingProps(hold.doing(what)) });
   const take = (t: ConflictTake) => run(t, () => conflictsApi.resolve(diffKey, cf.id, { take: t }));
   const text_ = cf.kind === "text";
   const res = cf.resolution;

@@ -16,7 +16,7 @@ import { Loadable } from "@/components/ui/loading";
 import { CopyButton, Crumbs, SelectField, TextField } from "@/components/ui/misc";
 import { Segmented } from "@/components/ui/tabs";
 import { toast } from "@/components/ui/toast";
-import { useAction, useActions } from "@/lib/action";
+import { useAction, useHold, useHolds, type Hold } from "@/lib/action";
 import { relativeTime } from "@/lib/format";
 import { errorMessage } from "@/lib/hooks";
 import { invalidate, useSuspenseResource } from "@/lib/resource";
@@ -78,21 +78,17 @@ function ObjectActions({ app, env, o }: { app: string; env: string; o: RunningOb
   // Its actions go one at a time (the first done closes the dialog): the button pressed says it's on
   // its way and the others wait, the deletion its question confirms too. Held here, so that with the
   // dialog closed meanwhile, Actions says so (W21-R15).
-  const [which, setWhich] = React.useState("");
-  const [go, going] = useAction((name: string, f: () => Promise<void>) => {
-    setWhich(name);
-    return f();
-  });
+  const hold = useHold();
   return (
     <>
-      <Button size="sm" variant="ghost" pending={going} onClick={() => setOpen(true)} aria-label={`What can be done to ${o.kind} ${o.name}`}>
+      <Button size="sm" variant="ghost" pending={hold.going} onClick={() => setOpen(true)} aria-label={`What can be done to ${o.kind} ${o.name}`}>
         Actions
       </Button>
       <Dialog open={open} onOpenChange={setOpen}>
         <DialogContent eyebrow="Actions" title={`${o.kind} ${o.name}`} description="What its provider can do to it as it runs. A release changes what runs; a sync may undo what these change.">
           {open && (
             <Loadable label="what it can do">
-              <ActionList app={app} env={env} o={o} onDone={() => setOpen(false)} go={go} going={going} which={which} />
+              <ActionList app={app} env={env} o={o} onDone={() => setOpen(false)} hold={hold} />
             </Loadable>
           )}
         </DialogContent>
@@ -106,18 +102,14 @@ function ActionList({
   env,
   o,
   onDone,
-  go,
-  going,
-  which,
+  hold,
 }: {
   app: string;
   env: string;
   o: RunningObject;
   onDone: () => void;
-  /** Its actions, one at a time (`ObjectActions`): `which` is on its way while `going`. */
-  go: (name: string, f: () => Promise<void>) => void;
-  going: boolean;
-  which: string;
+  /** Its actions, one at a time (`ObjectActions`'), each by its name. */
+  hold: Hold;
 }) {
   const target = { group: o.group || undefined, kind: o.kind, namespace: o.namespace || undefined, name: o.name };
   const list = useSuspenseResource(`deploy/actions/${app}/${env}/${objectKey(o)}`, (s) => deployApi.actions(app, env, target, s)).data;
@@ -151,9 +143,9 @@ function ActionList({
           <Button
             size="sm"
             variant={a.name === "delete" ? "ghost-danger" : "secondary"}
-            disabled={a.disabled || (going && which !== a.name)}
-            pending={going && which === a.name}
-            onClick={() => (a.name === "delete" ? setDeleting(a) : go(a.name, () => act(a)))}
+            disabled={a.disabled || hold.held(a.name)}
+            pending={hold.doing(a.name)}
+            onClick={() => (a.name === "delete" ? setDeleting(a) : hold.change(a.name, () => act(a)))}
           >
             {actionWords(a.name)}
           </Button>
@@ -170,7 +162,7 @@ function ActionList({
         onConfirm={() => {
           if (!deleting) return;
           const done = act(deleting);
-          go(deleting.name, () => done);
+          hold.change(deleting.name, () => done);
           return done;
         }}
       />
@@ -296,16 +288,14 @@ function SecretRow({
   env,
   m,
   onDelete,
-  change,
-  changing,
+  hold,
 }: {
   app: string;
   env: string;
   m: SecretMeta;
   onDelete: () => void;
-  /** Its changes, one at a time (`Secrets`): `set:name` and `delete:name`. */
-  change: (key: string, f: () => Promise<unknown>) => void;
-  changing: (key: string) => boolean;
+  /** Its changes, one at a time (`Secrets`'): "set" and "delete". */
+  hold: Hold;
 }) {
   const [value, setValue] = React.useState("");
   const [setting, setSetting] = React.useState(false);
@@ -314,7 +304,7 @@ function SecretRow({
   const typed = React.useRef(value);
   typed.current = value;
   const save = () =>
-    change(`set:${m.name}`, async () => {
+    hold.change("set", async () => {
       const sent = value;
       try {
         const next = await deployApi.setSecret(app, env, m.name, sent);
@@ -343,7 +333,7 @@ function SecretRow({
         <Button size="sm" variant="ghost" onClick={() => setHistory(!history)}>
           Versions
         </Button>
-        <Button size="sm" variant="ghost-danger" pending={changing(`delete:${m.name}`)} disabled={changing(`set:${m.name}`)} onClick={onDelete}>
+        <Button size="sm" variant="ghost-danger" pending={hold.doing("delete")} disabled={hold.held("delete")} onClick={onDelete}>
           Delete
         </Button>
       </span>
@@ -356,7 +346,7 @@ function SecretRow({
           }}
         >
           <TextField label={`${m.name}'s new value`} type="password" autoComplete="off" value={value} onChange={(e) => setValue(e.target.value)} />
-          <Button size="sm" type="submit" disabled={!value || changing(`delete:${m.name}`)} pending={changing(`set:${m.name}`)}>
+          <Button size="sm" type="submit" disabled={!value || hold.held("set")} pending={hold.doing("set")}>
             Set
           </Button>
         </form>
@@ -395,7 +385,7 @@ function Secrets({ app, env, argo }: { app: string; env: string; argo: boolean }
   });
   // A secret's changes (a new value, its deletion) go one at a time: the one pressed says it's on its
   // way and the other waits; other secrets stay free (W21-R15).
-  const [change, changing] = useActions((_: string, f: () => Promise<unknown>) => f());
+  const holds = useHolds();
   const remove = async (name: string) => {
     try {
       const gone = await deployApi.deleteSecret(app, env, name);
@@ -415,7 +405,7 @@ function Secrets({ app, env, argo }: { app: string; env: string; argo: boolean }
       {secrets.length ? (
         <ul className="rel-objects">
           {secrets.map((m) => (
-            <SecretRow key={m.name} app={app} env={env} m={m} onDelete={() => setDeleting(m.name)} change={change} changing={changing} />
+            <SecretRow key={m.name} app={app} env={env} m={m} onDelete={() => setDeleting(m.name)} hold={holds(m.name)} />
           ))}
         </ul>
       ) : (
@@ -456,7 +446,7 @@ function Secrets({ app, env, argo }: { app: string; env: string; argo: boolean }
           if (!deleting) return;
           const name = deleting;
           const done = remove(name);
-          change(`delete:${name}`, () => done);
+          holds(name).change("delete", () => done);
           return done;
         }}
       />

@@ -15,7 +15,7 @@ import { SettingRow, SettingsGroup, SettingsSearch, SettingsSection, SettingsSec
 import { useMotionPreference } from "@/components/shell/motion";
 import { Link, useLocation } from "@/lib/router";
 import { toast } from "@/components/ui/toast";
-import { useAction } from "@/lib/action";
+import { useAction, useHold } from "@/lib/action";
 import { useAuth } from "@/lib/auth";
 import { usePref } from "@/lib/prefs";
 import { useRes, warm, type Res } from "@/lib/data";
@@ -329,31 +329,34 @@ function PasswordGroup() {
   const mismatch = again.length > 0 && pw !== again;
   const failed = (err: unknown) => setProblem(err instanceof ApiError ? err.message : String(err));
 
-  const [save, saving] = useAction(async () => {
-    setProblem(null);
-    await api.setPassword(pw);
-    setPw("");
-    setAgain("");
-    toast({
-      title: isSet ? "Password changed" : "Password set",
-      description: "Sign in from any device with it.",
-      tone: "info",
+  const hold = useHold(failed);
+  const save = () =>
+    hold.change("save", async () => {
+      setProblem(null);
+      await api.setPassword(pw);
+      setPw("");
+      setAgain("");
+      toast({
+        title: isSet ? "Password changed" : "Password set",
+        description: "Sign in from any device with it.",
+        tone: "info",
+      });
+      invalidate("auth/methods");
     });
-    invalidate("auth/methods");
-  }, failed);
 
-  const [remove, clearing] = useAction(async () => {
-    setProblem(null);
-    await api.clearPassword();
-    toast({ title: "Password removed", tone: "info" });
-    setPw("");
-    setAgain("");
-    setRemoving(false);
-    invalidate("auth/methods");
-  }, failed);
+  const remove = () =>
+    hold.change("remove", async () => {
+      setProblem(null);
+      await api.clearPassword();
+      toast({ title: "Password removed", tone: "info" });
+      setPw("");
+      setAgain("");
+      setRemoving(false);
+      invalidate("auth/methods");
+    });
   // One change to the password at a time, and either answer empties the fields: they're held as
   // they are while it's on its way (W21-R15).
-  const busy = saving || clearing;
+  const busy = hold.going;
 
   return (
     <SettingsGroup
@@ -386,8 +389,8 @@ function PasswordGroup() {
           tone="danger"
           actions={
             <>
-              <Button size="xs" variant="danger" pending={clearing} disabled={saving} onClick={remove}>
-                {clearing ? "Removing…" : "Remove password"}
+              <Button size="xs" variant="danger" pending={hold.doing("remove")} disabled={hold.held("remove")} onClick={remove}>
+                {hold.doing("remove") ? "Removing…" : "Remove password"}
               </Button>
               <Button
                 size="xs"
@@ -411,7 +414,7 @@ function PasswordGroup() {
         className="st-password"
         onSubmit={(e) => {
           e.preventDefault();
-          if (!clearing && !removing && pw.length >= 8 && pw === again) save();
+          if (!hold.held("save") && !removing && pw.length >= 8 && pw === again) save();
         }}
         autoComplete="on"
         aria-busy={busy}
@@ -458,8 +461,8 @@ function PasswordGroup() {
           }
         />
         <div className="st-password-actions">
-          <Button type="submit" size="xs" variant="secondary" pending={saving} disabled={clearing || removing || pw.length < 8 || pw !== again}>
-            {saving ? "Saving…" : isSet ? "Change password" : "Set password"}
+          <Button type="submit" size="xs" variant="secondary" pending={hold.doing("save")} disabled={hold.held("save") || removing || pw.length < 8 || pw !== again}>
+            {hold.doing("save") ? "Saving…" : isSet ? "Change password" : "Set password"}
           </Button>
         </div>
       </form>

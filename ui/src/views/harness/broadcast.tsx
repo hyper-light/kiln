@@ -280,7 +280,6 @@ function Bar({
       setReport(await harnessApi.broadcastTo({ to: { ids }, ...body, key }));
       if (lastTry.current.get(to)?.key === key) lastTry.current.delete(to);
       setReportOpen(false);
-      if (body.attachments) attachments.clear();
       return true;
     } catch (e) {
       toast.error("Couldn't send", errorMessage(e));
@@ -362,18 +361,20 @@ function Bar({
   };
   const sendText = () => {
     const body = text.trim();
-    if ((!body && files.length === 0) || pending > 0 || n === 0 || going !== undefined) return;
+    if ((!body && files.length === 0 && pending === 0) || n === 0 || going !== undefined) return;
     // One of kiln's own: asked in the line under the field, not sent.
     const typed = parseSlash(body);
-    if (typed && kilns(typed.name) && !typed.args && files.length === 0) {
+    if (typed && kilns(typed.name) && !typed.args && files.length === 0 && pending === 0) {
       setText("");
       choose(typed.name);
       return;
     }
     // The field empties at once, if it still says what's sent (the line under it says it's on its
-    // way); the words come back if it didn't go and nothing new was typed meanwhile.
+    // way), and its files go with it, those still uploading too (W21-R15); the words come back if it
+    // didn't go and nothing new was typed meanwhile, and the files if nothing new was attached.
     const go = async () => {
       setText((t) => (t.trim() === body ? "" : t));
+      const taken = attachments.take();
       setSending(n);
       // The settings chosen, applied to them first (each a command to every one of them).
       const settings: Command[] = [];
@@ -383,9 +384,13 @@ function Bar({
       if (tune.speed) settings.push({ type: "set_speed", speed: tune.speed });
       let ok = true;
       for (const c of settings) ok = ok && (await send({ command: c }));
-      ok = ok && (await send({ text: body, mode, attachments: files.length > 0 ? attachments.payload() : undefined }));
+      const up = ok ? await taken.up : [];
+      ok = ok && (body || up.length ? await send({ text: body, mode, attachments: up.length > 0 ? up : undefined }) : true);
       setSending(0);
-      if (!ok) setText((t) => t || body);
+      if (!ok) {
+        setText((t) => t || body);
+        taken.back();
+      }
     };
     const risky = tune.mode ? modes.find((m) => m.id === tune.mode)?.dangerous : false;
     if (risky)
@@ -593,7 +598,7 @@ function Bar({
               type="button"
               className="cp-send"
               data-mode={working > 0 ? mode : "send"}
-              disabled={(!text.trim() && files.length === 0) || pending > 0 || n === 0 || !!going}
+              disabled={(!text.trim() && files.length === 0 && pending === 0) || n === 0 || !!going}
               {...sendingProps(going === null)}
               onClick={sendText}
               aria-label={`${sendLabel} to ${n}`}

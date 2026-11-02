@@ -11,7 +11,7 @@ import { Loadable } from "@/components/ui/loading";
 import { Crumbs, Facts, PageIntro, Panel } from "@/components/ui/misc";
 import { Segmented } from "@/components/ui/tabs";
 import { toast } from "@/components/ui/toast";
-import { sendingProps, useAction } from "@/lib/action";
+import { useAction } from "@/lib/action";
 import { useRes, type Res } from "@/lib/data";
 import { relativeTime } from "@/lib/format";
 import { errorMessage } from "@/lib/hooks";
@@ -198,9 +198,13 @@ function IssueView({ id, range, onRange }: { id: string; range: Range; onRange: 
       </header>
       <div className="mb-5 flex flex-wrap items-center gap-3">
         <RangePicker value={range} onChange={onRange} />
-        <span className="flex max-w-full" {...sendingProps(changing)}>
-          <Segmented label="Its status" value={i.status} onChange={setStatus} options={FILTERS.filter((f): f is { value: IssueStatus; label: string } => f.value !== "all")} />
-        </span>
+        <Segmented
+          label="Its status"
+          value={i.status}
+          onChange={setStatus}
+          pending={changing ? i.status : null}
+          options={FILTERS.filter((f): f is { value: IssueStatus; label: string } => f.value !== "all")}
+        />
       </div>
       <div className="space-y-6">
         <Facts

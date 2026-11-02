@@ -11,7 +11,7 @@ import { cdApi } from "@/api/cd";
 import type { CdCheckRun, CdRollout, CdRolloutStep } from "@/api/types";
 import { Button } from "@/components/ui/button";
 import { Confirm } from "@/components/ui/misc";
-import { useAction } from "@/lib/action";
+import { useHold } from "@/lib/action";
 import { change } from "@/lib/resource";
 import { RelTime } from "@/views/shared";
 import { StatePair, appKey, shortRev } from "./parts";
@@ -144,18 +144,17 @@ function Rollout({ appId, appName, r, onAct, onFold }: { appId: string; appName:
   // Its actions go one at a time: the button pressed says it's on its way, and the others wait until
   // the rollout is read again with what it did (its state, its log); then the question it was asked
   // from closes, unless another is open by then (W21-R15).
-  const [which, setWhich] = React.useState("");
-  const [call, calling] = useAction((control: string, done: string, action: Parameters<typeof cdApi.rollout>[1], body: Parameters<typeof cdApi.rollout>[2] = {}) => {
-    const from = ask;
-    setWhich(control);
-    return onAct(done, async () => {
-      await cdApi.rollout(appId, action, { ...body, rollout: r.id });
-      const now = await cdApi.rollouts(appId);
-      change<typeof now>(`${appKey(appId)}rollout`, () => now);
-    }).then((ok) => ok && setAsk((cur) => (cur === from ? null : cur)));
-  });
-  const doing = (control: string) => calling && which === control;
-  const held = (control: string) => calling && which !== control;
+  const hold = useHold();
+  const call = (control: string, done: string, action: Parameters<typeof cdApi.rollout>[1], body: Parameters<typeof cdApi.rollout>[2] = {}) =>
+    hold.change(control, () => {
+      const from = ask;
+      return onAct(done, async () => {
+        await cdApi.rollout(appId, action, { ...body, rollout: r.id });
+        const now = await cdApi.rollouts(appId);
+        change<typeof now>(`${appKey(appId)}rollout`, () => now);
+      }).then((ok) => ok && setAsk((cur) => (cur === from ? null : cur)));
+    });
+  const { doing, held } = hold;
   const why = [st.why, st.waiting, !r.ready && r.unready ? `green isn't ready: ${r.unready}` : ""].filter((x, i, all) => x && all.indexOf(x) === i);
   return (
     <section className="cd-rollout" data-state={st.state} aria-label="Rollout">

@@ -26,7 +26,7 @@ import { Button } from "@/components/ui/button";
 import { Hold } from "@/components/ui/hold";
 import { Loadable } from "@/components/ui/loading";
 import { Facts, FoldSection, SelectField, TextField } from "@/components/ui/misc";
-import { useAction } from "@/lib/action";
+import { useHold } from "@/lib/action";
 import { useRes, type Res } from "@/lib/data";
 import { invalidate } from "@/lib/resource";
 
@@ -67,8 +67,9 @@ export function ReapPolicy({ scope, target, at }: { scope: ReapScope; target: st
     }
   };
   // Save and Clear both change this scope's policy: one at a time, each waiting for the other (W21-R15).
-  const [put, saving] = useAction(() => save(fields));
-  const [clear, clearing] = useAction(() => save(fieldsOf(undefined, scope)));
+  const hold = useHold();
+  const put = () => hold.change("save", () => save(fields));
+  const clear = () => hold.change("clear", () => save(fieldsOf(undefined, scope)));
   return (
     <div className="reap-policy flex flex-col gap-4">
       <Effective view={view} />
@@ -90,10 +91,10 @@ export function ReapPolicy({ scope, target, at }: { scope: ReapScope; target: st
         </p>
       )}
       <div className="flex flex-wrap items-center gap-2">
-        <Button size="sm" pending={saving} disabled={clearing} onClick={put}>
+        <Button size="sm" pending={hold.doing("save")} disabled={hold.held("save")} onClick={put}>
           Save
         </Button>
-        <Button size="sm" variant="ghost" pending={clearing} disabled={!mine || saving} onClick={clear}>
+        <Button size="sm" variant="ghost" pending={hold.doing("clear")} disabled={!mine || hold.held("clear")} onClick={clear}>
           Clear this scope's policy
         </Button>
         {mine && <span className="text-[12px] text-[#8b8f99]">Set by {mine.updated_by}</span>}

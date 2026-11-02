@@ -16,7 +16,7 @@ import { Loadable } from "@/components/ui/loading";
 import { Confirm, Crumbs, Facts, Panel, SelectField, TextField } from "@/components/ui/misc";
 import { Segmented } from "@/components/ui/tabs";
 import { toast } from "@/components/ui/toast";
-import { useAction } from "@/lib/action";
+import { useHold, type Hold } from "@/lib/action";
 import { agentsRes, useRes } from "@/lib/data";
 import { errorMessage } from "@/lib/hooks";
 import { invalidate, useSuspenseResource } from "@/lib/resource";
@@ -89,13 +89,6 @@ function IntegrationPicker({ value, onChange, disabled }: { value: string; onCha
   const options = [{ value: "", label: "An integration…" }, ...list.map((i) => ({ value: i.name, label: `${i.name} (${i.kind})` }))];
   if (value && !list.some((i) => i.name === value)) options.push({ value, label: `${value} (not one kiln has)` });
   return <SelectField label="Integration" value={value} onChange={(v) => !disabled && onChange(v)} options={options} className="env-field" />;
-}
-
-/** An environment's changes, one at a time (`EnvBody`): `change` sends one, `doing` the one pressed, `held` the others. */
-interface Hold {
-  change: (what: string, f: () => Promise<unknown>) => void;
-  doing: (what: string) => boolean;
-  held: (what: string) => boolean;
 }
 
 function EnvForm({ e, repo, others, hold }: { e: CiEnvironment; repo: string; others: string[]; hold: Hold }) {
@@ -335,12 +328,7 @@ function EnvBody({ repo, name }: { repo: string; name: string }) {
   const where = whereWords(e);
   // Its changes (its settings saved, its removal) go one at a time: the one pressed says it's on its
   // way and the other waits for it (W21-R15).
-  const [which, setWhich] = React.useState("");
-  const [change, changing] = useAction((what: string, f: () => Promise<unknown>) => {
-    setWhich(what);
-    return f();
-  });
-  const hold: Hold = { change, doing: (what) => changing && which === what, held: (what) => changing && which !== what };
+  const hold = useHold();
   return (
     <>
       <Facts

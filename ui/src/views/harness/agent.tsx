@@ -519,6 +519,9 @@ function Head({ store, cwd, send, onUsage, onSettings, onFind }: { store: Sessio
       // Its live state says where its commands run (absent: anywhere it needs).
       reach: state ? state.reach : info?.reach,
       keep_off: info?.keep_off,
+      // How it runs now, for Duplicate.
+      mode: state?.mode || info?.mode || "",
+      model: state?.model || info?.model || "",
     },
     { onGone: () => navigate("/agents") },
   );

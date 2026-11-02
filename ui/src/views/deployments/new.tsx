@@ -26,7 +26,7 @@ import { useRes, warm, type Res } from "@/lib/data";
 import { errorMessage } from "@/lib/hooks";
 import { invalidate } from "@/lib/resource";
 import { Link, useNavigate } from "@/lib/router";
-import { useAction } from "@/lib/action";
+import { useAction, useHold } from "@/lib/action";
 import "./deployments.css";
 import { Highlighted } from "@/components/code/highlighted";
 
@@ -217,20 +217,20 @@ function Builder() {
   const here = JSON.stringify(where());
   const place = React.useRef(here);
   place.current = here;
-  const [row, setRow] = React.useState("");
-  const [adopt, adoptGoing] = useAction(async (key: string, name: string, scope?: string) => {
-    setRow(key);
-    try {
-      const a = await cdApi.adopt({ ...where(), name, ...(scope ? { scope } : {}) });
-      if (place.current !== here) return;
-      const settings: Record<string, string> = {};
-      for (const [k, v] of Object.entries(a.definition)) settings[k] = typeof v === "string" ? v : JSON.stringify(v, null, 2);
-      setD((x) => ({ ...x, name: !x.name || x.name === adopted?.name ? name : x.name, settings }));
-      setAdopted({ name, note: a.note });
-    } catch (e) {
-      toast.error(`Couldn't read ${name}`, errorMessage(e));
-    }
-  });
+  const adopts = useHold();
+  const adopt = (key: string, name: string, scope?: string) =>
+    adopts.change(key, async () => {
+      try {
+        const a = await cdApi.adopt({ ...where(), name, ...(scope ? { scope } : {}) });
+        if (place.current !== here) return;
+        const settings: Record<string, string> = {};
+        for (const [k, v] of Object.entries(a.definition)) settings[k] = typeof v === "string" ? v : JSON.stringify(v, null, 2);
+        setD((x) => ({ ...x, name: !x.name || x.name === adopted?.name ? name : x.name, settings }));
+        setAdopted({ name, note: a.note });
+      } catch (e) {
+        toast.error(`Couldn't read ${name}`, errorMessage(e));
+      }
+    });
   const [check, checking] = useAction(
     async () => setChecked({ deploy, result: await cdApi.validate({ deploy, environments: environments || undefined, repo: d.repo || undefined }) }),
     "Couldn't check the app",
@@ -333,8 +333,8 @@ function Builder() {
                   <Button
                     size="xs"
                     variant="ghost"
-                    pending={adoptGoing && row === `${r.scope ?? ""}/${r.name}`}
-                    disabled={adoptGoing && row !== `${r.scope ?? ""}/${r.name}`}
+                    pending={adopts.doing(`${r.scope ?? ""}/${r.name}`)}
+                    disabled={adopts.held(`${r.scope ?? ""}/${r.name}`)}
                     onClick={() => adopt(`${r.scope ?? ""}/${r.name}`, r.name, r.scope)}
                   >
                     Adopt

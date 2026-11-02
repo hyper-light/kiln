@@ -14,7 +14,7 @@ import { Confirm, Crumbs, EmptyState, ErrorState, Facts, Panel } from "@/compone
 import { Chips, StatusBadge, StatusDot } from "@/components/ui/status";
 import { toast } from "@/components/ui/toast";
 import { Tip } from "@/components/ui/tooltip";
-import { useAction } from "@/lib/action";
+import { useAction, useHold } from "@/lib/action";
 import { upsert } from "@/lib/data";
 import { placementWords } from "@/api/retry";
 import { absoluteTime, firstLine, formatBytes, formatDuration, isActive, isTerminal, shortSha, spanSeconds } from "@/lib/format";
@@ -77,20 +77,19 @@ function RunBody({ id }: { id: string }) {
   // One change to the run at a time (W21-R15): the press that sent it says it's on its way (its
   // opener too, once its confirm is shut), the others are held until it's back, and a confirm closes
   // once its own has gone.
-  const [sent, setSent] = React.useState<RunAct | null>(null);
-  const [act, acting] = useAction(async (key: RunAct, fn: () => Promise<void>, ok: string) => {
-    setSent(key);
-    try {
-      await fn();
-      toast({ title: ok, tone: "info" });
-      invalidate(`run/${id}`);
-      invalidate("runs/");
-    } finally {
-      setConfirm((c) => (c === key ? null : c));
-    }
-  }, "Action failed");
-  const going = (key: RunAct) => acting && sent === key;
-  const held = (key: RunAct) => acting && sent !== key;
+  const hold = useHold("Action failed");
+  const act = (key: RunAct, fn: () => Promise<void>, ok: string) =>
+    hold.change(key, async () => {
+      try {
+        await fn();
+        toast({ title: ok, tone: "info" });
+        invalidate(`run/${id}`);
+        invalidate("runs/");
+      } finally {
+        setConfirm((c) => (c === key ? null : c));
+      }
+    });
+  const { doing: going, held } = hold;
   const [firstPick, setFirstPick] = React.useState(() => (res.data ? pickDefaultJob(res.data.jobs)?.id : undefined));
   if (firstPick === undefined && res.data?.jobs.length) setFirstPick(pickDefaultJob(res.data.jobs)?.id);
 

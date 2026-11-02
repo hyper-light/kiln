@@ -1,4 +1,5 @@
 import * as React from "react";
+import { sendingProps } from "@/lib/action";
 import { cn } from "@/lib/utils";
 
 const trigger =
@@ -24,6 +25,7 @@ export function Segmented<T extends string>({
   label,
   className,
   size = "default",
+  pending = null,
 }: {
   value: T;
   onChange: (v: T) => void;
@@ -31,12 +33,23 @@ export function Segmented<T extends string>({
   label: string;
   className?: string;
   size?: keyof typeof SIZES;
+  /** The option picked whose change is on its way (W21-R15): its pill says so, and a press meanwhile does nothing. */
+  pending?: T | null;
 }) {
   const s = SIZES[size];
   return (
     <div role="group" aria-label={label} className={cn("inline-flex max-w-full flex-wrap items-center rounded-[22px] border border-white/10 bg-white/[0.02]", s.box, className)}>
       {options.map((o) => (
-        <button key={o.value} type="button" aria-pressed={o.value === value} onClick={() => onChange(o.value)} className={s.pill}>
+        <button
+          key={o.value}
+          type="button"
+          aria-pressed={o.value === value}
+          {...sendingProps(o.value === pending)}
+          onClick={() => {
+            if (pending === null) onChange(o.value);
+          }}
+          className={s.pill}
+        >
           {o.label}
           {o.count !== undefined && <span className="ml-0.5 font-mono text-[9px] text-[#898d99] tabular-nums">{o.count}</span>}
         </button>

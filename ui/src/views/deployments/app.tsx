@@ -22,7 +22,7 @@ import { FacetBox, type Chosen } from "@/components/ui/facet-box";
 import { Hold, RowsHold } from "@/components/ui/hold";
 import { Loadable } from "@/components/ui/loading";
 import { Confirm, Crumbs, EmptyState, SelectField } from "@/components/ui/misc";
-import { sendingProps, useAction, useActions } from "@/lib/action";
+import { sendingProps, useActions, useHold, type Hold as Changes } from "@/lib/action";
 import { errorMessage, useElementWidth, useMediaQuery, useNow } from "@/lib/hooks";
 import { usePref } from "@/lib/prefs";
 import { useRes, warm } from "@/lib/data";
@@ -220,35 +220,31 @@ function AppPage({ id, project, name, a }: { id: string; project: string; name: 
   // What it runs and how kiln holds it (a sync, a rollback, following git, taking it over, stopping a
   // sync, deleting it) changes one at a time: the control pressed says it's on its way, and the
   // others wait for it (W21-R15).
-  const [pressed, setPressed] = React.useState("");
-  const [operate, operating] = useAction((which: string, done: string, f: () => Promise<unknown>, keepOpen?: boolean) => {
-    setPressed(which);
-    return act(done, f, keepOpen);
-  });
-  const doing = (which: string) => operating && pressed === which;
-  const held = (which: string) => operating && pressed !== which;
+  const ops = useHold();
+  const operate = (which: string, done: string, f: () => Promise<unknown>, keepOpen?: boolean) => ops.change(which, () => act(done, f, keepOpen));
+  const { doing, held } = ops;
   // The sync policy's switches show what they're set to at once; while one's change is on its way
   // the others wait, so no answer lands after a later change (W21-R15).
-  const [switching, setSwitching] = React.useState("");
-  const [setPolicy, policyGoing] = useAction((which: string, sync: SyncPolicyValue, said: string) => {
-    setSwitching(which);
-    change<AppData>(r.detail.key, (d) => ("notFound" in d || !d.definition ? d : { ...d, auto: sync.auto, definition: { ...d.definition, sync } }));
-    return act(said, () => cdApi.put({ ...(a.definition ?? {}), sync }), true).then((ok) => ok || invalidate(r.detail.key));
-  });
+  const policy = useHold();
+  const setPolicy = (which: string, sync: SyncPolicyValue, said: string) =>
+    policy.change(which, () => {
+      change<AppData>(r.detail.key, (d) => ("notFound" in d || !d.definition ? d : { ...d, auto: sync.auto, definition: { ...d.definition, sync } }));
+      return act(said, () => cdApi.put({ ...(a.definition ?? {}), sync }), true).then((ok) => ok || invalidate(r.detail.key));
+    });
   // What auto-rollback comes to (the Rollback line) is the server's to say: a choice shows once the
   // server has said what it comes to, both choices waiting meanwhile (W21-R15).
-  const [scope, setScope] = React.useState<"app" | "repo">("app");
-  const [setRollback, rollbackGoing] = useAction((which: "app" | "repo", said: string, f: () => Promise<CdAutoRollback | undefined>) => {
-    setScope(which);
-    return act(
-      said,
-      async () => {
-        const now = await f();
-        if (now) change<AppData>(r.detail.key, (d) => ("notFound" in d ? d : { ...d, auto_rollback: now }));
-      },
-      true,
+  const rollback = useHold();
+  const setRollback = (which: "app" | "repo", said: string, f: () => Promise<CdAutoRollback | undefined>) =>
+    rollback.change(which, () =>
+      act(
+        said,
+        async () => {
+          const now = await f();
+          if (now) change<AppData>(r.detail.key, (d) => ("notFound" in d ? d : { ...d, auto_rollback: now }));
+        },
+        true,
+      ),
     );
-  });
   const toggle = (x: Exclude<Ask, null>) => setAsk(ask === x ? null : x);
 
   const op = a.operation ?? null;
@@ -288,7 +284,7 @@ function AppPage({ id, project, name, a }: { id: string; project: string; name: 
           <div className="cd-lines-policy">
             <dt>Auto-sync</dt>
             <dd>
-              <SyncPolicy a={a} sending={policyGoing ? switching : null} onSet={setPolicy} />
+              <SyncPolicy a={a} hold={policy} onSet={setPolicy} />
             </dd>
           </div>
           <div className="cd-lines-policy">
@@ -302,7 +298,7 @@ function AppPage({ id, project, name, a }: { id: string; project: string; name: 
           <AutoRollbackPanel
             a={a}
             name={name}
-            sending={rollbackGoing ? scope : null}
+            hold={rollback}
             onSetApp={(on, said) => setRollback("app", said, () => cdApi.setAutoRollback(id, on))}
             onSetRepo={(repo, on, said) =>
               setRollback("repo", said, async () => {
@@ -676,7 +672,7 @@ const repoName = (url: string) => url.replace(/^[a-z+]+:\/\/(www\.)?(github\.com
  * a deploy file makes (shown where it's set: a change through kiln would be undone at the next
  * poll); Argo CD's for one it shadows.
  */
-function SyncPolicy({ a, sending, onSet }: { a: CdAppDetail; sending: string | null; onSet: (which: string, sync: SyncPolicyValue, said: string) => void }) {
+function SyncPolicy({ a, hold, onSet }: { a: CdAppDetail; hold: Changes; onSet: (which: string, sync: SyncPolicyValue, said: string) => void }) {
   const sync = a.definition?.sync;
   const words = sync?.auto ? ["On", sync.prune && "prunes what git drops", sync.self_heal && "undoes changes made in the cluster"].filter(Boolean).join(", ") : "Off: it syncs when you say";
   if (a.shadow || a.origin.kind === "argo") return <span className="cd-dim">Argo CD's: kiln compares this app and leaves syncing it to Argo CD</span>;
@@ -690,10 +686,10 @@ function SyncPolicy({ a, sending, onSet }: { a: CdAppDetail; sending: string | n
   if (!sync) return <span className="cd-dim">{words}</span>;
   const set = (which: keyof SyncPolicyValue, patch: Partial<SyncPolicyValue>, said: string) => onSet(which, { ...sync, ...patch }, said);
   // The one whose change is on its way says so; the others wait for it.
-  const held = (which: keyof SyncPolicyValue) => sending !== null && sending !== which;
+  const held = (which: keyof SyncPolicyValue) => hold.held(which);
   return (
     <span className="cd-policy">
-      <label className="cd-opt" {...sendingProps(sending === "auto")}>
+      <label className="cd-opt" {...sendingProps(hold.doing("auto"))}>
         <input
           type="checkbox"
           className="check"
@@ -703,7 +699,7 @@ function SyncPolicy({ a, sending, onSet }: { a: CdAppDetail; sending: string | n
         />{" "}
         Sync when git moves
       </label>
-      <label className="cd-opt" {...sendingProps(sending === "prune")}>
+      <label className="cd-opt" {...sendingProps(hold.doing("prune"))}>
         <input
           type="checkbox"
           className="check"
@@ -713,7 +709,7 @@ function SyncPolicy({ a, sending, onSet }: { a: CdAppDetail; sending: string | n
         />{" "}
         Prune what git drops
       </label>
-      <label className="cd-opt" {...sendingProps(sending === "self_heal")}>
+      <label className="cd-opt" {...sendingProps(hold.doing("self_heal"))}>
         <input
           type="checkbox"
           className="check"

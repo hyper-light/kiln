@@ -32,7 +32,7 @@ import { Loadable } from "@/components/ui/loading";
 import { Crumbs, EmptyState, Facts, Panel } from "@/components/ui/misc";
 import { StatusDot } from "@/components/ui/status";
 import { toast } from "@/components/ui/toast";
-import { useAction } from "@/lib/action";
+import { useHold, type Hold } from "@/lib/action";
 import { useRes, type Res } from "@/lib/data";
 import { errorMessage } from "@/lib/hooks";
 import { invalidate, useSuspenseResource } from "@/lib/resource";
@@ -59,25 +59,14 @@ export function ReleaseState({ r }: { r: Release }) {
   );
 }
 
-/** A release's changes, one at a time: `change` sends one, `doing` the one pressed, `held` the others. */
-export interface Hold {
-  change: (what: string, f: () => Promise<unknown>) => void;
-  doing: (what: string) => boolean;
-  held: (what: string) => boolean;
-}
-
 /**
  * Approve or reject a release waiting for people; the server says who may. One answer at a time: the
  * one pressed says it's on its way and the other waits for it, and so do the release's other changes
  * when its page gives its `hold` (W21-R15).
  */
 export function Answer({ r, compact, hold }: { r: Release; compact?: boolean; hold?: Hold }) {
-  const [answer, setAnswer] = React.useState("");
-  const [own, answering] = useAction((which: string, f: () => Promise<unknown>) => {
-    setAnswer(which);
-    return f();
-  });
-  const h: Hold = hold ?? { change: own, doing: (which) => answering && answer === which, held: (which) => answering && answer !== which };
+  const own = useHold();
+  const h = hold ?? own;
   const act = (which: "approve" | "reject") =>
     h.change(which, async () => {
       const yes = which === "approve";

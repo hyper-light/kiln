@@ -7,7 +7,7 @@ import * as React from "react";
 import type { KeepRules } from "@/api/types";
 import { Button } from "@/components/ui/button";
 import { toast } from "@/components/ui/toast";
-import { useAction } from "@/lib/action";
+import { useHold, type Hold } from "@/lib/action";
 import { draftOf, hoursSaid, merge, rulesOf, rulesSaid, SCHEDULES, scheduleSaid, type Draft, type Mode } from "./words";
 import "./keep.css";
 
@@ -31,18 +31,16 @@ interface Props {
  * again: the one pressed says it's on its way and the other waits (W21-R15).
  */
 export function RulesForm(props: Props) {
-  const [which, setWhich] = React.useState<Sending>("save");
-  const [save, saving] = useAction((what: Sending, r: KeepRules | null) => {
-    setWhich(what);
-    return props.onSave(r && Object.keys(r).length ? r : null).then(() => toast.success("Saved", "Runners have it within 20 seconds."));
-  }, "Couldn't save the rules");
-  return <Form key={JSON.stringify(props.rules)} {...props} save={save} sending={saving ? which : null} />;
+  const hold = useHold("Couldn't save the rules");
+  const save = (what: Sending, r: KeepRules | null) =>
+    hold.change(what, () => props.onSave(r && Object.keys(r).length ? r : null).then(() => toast.success("Saved", "Runners have it within 20 seconds.")));
+  return <Form key={JSON.stringify(props.rules)} {...props} save={save} hold={hold} />;
 }
 
-/** Which of the form's writes is on its way. */
+/** The form's writes. */
 type Sending = "save" | "back";
 
-function Form({ rules, above, aboveName = "the scope above's", top = false, label, save, sending }: Props & { save: (what: Sending, r: KeepRules | null) => void; sending: Sending | null }) {
+function Form({ rules, above, aboveName = "the scope above's", top = false, label, save, hold }: Props & { save: (what: Sending, r: KeepRules | null) => void; hold: Hold }) {
   const [draft, setDraft] = React.useState<Draft>(() => draftOf(rules, top));
   const made = rulesOf(draft, top);
   const changed = "rules" in made && JSON.stringify(made.rules) !== JSON.stringify(rules);
@@ -61,7 +59,7 @@ function Form({ rules, above, aboveName = "the scope above's", top = false, labe
       }}
     >
       {/* Held while a write is on its way: its answer makes the form again, and would take what was typed meanwhile (W21-R15). */}
-      <fieldset className="kp-rules" disabled={sending !== null}>
+      <fieldset className="kp-rules" disabled={hold.going}>
         <Row label="Keep the newest" hint="Copies, by when each was last used: counted among this scope's own.">
           <Count field={draft.newest} unit="copies" none="No such rule" inherit={as(above?.newest ? `the newest ${above.newest}` : null)} onChange={(f) => set("newest", f)} />
         </Row>
@@ -148,16 +146,16 @@ function Form({ rules, above, aboveName = "the scope above's", top = false, labe
         {!above && !top && "rules" in made && <span className="kp-dim"> Where this sets nothing, each copy's runner and repository rules apply.</span>}
       </p>
       <div className="kp-actions">
-        <Button type="submit" size="sm" disabled={!changed || sending === "back"} pending={sending === "save"}>
-          {sending === "save" ? "Saving…" : "Save"}
+        <Button type="submit" size="sm" disabled={!changed || hold.held("save")} pending={hold.doing("save")}>
+          {hold.doing("save") ? "Saving…" : "Save"}
         </Button>
         {Object.keys(rules).length > 0 && (
-          <Button type="button" size="sm" variant="ghost" disabled={sending === "save"} pending={sending === "back"} onClick={() => save("back", null)}>
+          <Button type="button" size="sm" variant="ghost" disabled={hold.held("back")} pending={hold.doing("back")} onClick={() => save("back", null)}>
             {top ? "Clear" : `Back to ${aboveName}`}
           </Button>
         )}
         {changed && (
-          <Button type="button" size="sm" variant="ghost" disabled={sending !== null} onClick={() => setDraft(draftOf(rules, top))}>
+          <Button type="button" size="sm" variant="ghost" disabled={hold.going} onClick={() => setDraft(draftOf(rules, top))}>
             Undo
           </Button>
         )}

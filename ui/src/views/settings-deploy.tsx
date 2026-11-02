@@ -15,7 +15,7 @@ import { Loadable } from "@/components/ui/loading";
 import { Confirm, TextField } from "@/components/ui/misc";
 import { SettingRow, SettingsGroup } from "@/components/ui/settings";
 import { toast } from "@/components/ui/toast";
-import { useAction } from "@/lib/action";
+import { useAction, useHold } from "@/lib/action";
 import { relativeTime } from "@/lib/format";
 import { upsert, useRes, warm, type Res } from "@/lib/data";
 import { invalidate } from "@/lib/resource";
@@ -675,23 +675,26 @@ function ChatCommandsLoaded({ a, id }: { a: Integration; id: string }) {
   const [problem, setProblem] = React.useState<string | null>(null);
   const [draft, setDraft] = React.useState("");
   const failed = (e: unknown) => setProblem(errorText(e));
-  const [connect, pointing] = useAction(async () => {
-    setProblem(null);
-    const next = await api.connectIntegrationChat(a.name);
-    chat.setData(() => next);
-    invalidate("ci/integrations");
-    toast({ title: `${a.name}'s bot reports to kiln`, description: "Commands and buttons in its chats come here now.", tone: "succeeded" });
-  }, failed);
+  const hold = useHold(failed);
+  const connect = () =>
+    hold.change("point", async () => {
+      setProblem(null);
+      const next = await api.connectIntegrationChat(a.name);
+      chat.setData(() => next);
+      invalidate("ci/integrations");
+      toast({ title: `${a.name}'s bot reports to kiln`, description: "Commands and buttons in its chats come here now.", tone: "succeeded" });
+    });
   // What Slack and Teams sign with, or Discord's public key, kept now.
-  const [keep, keeping] = useAction(async (value: string) => {
-    setProblem(null);
-    const changed = await api.updateIntegration(a.name, a.kind === "discord" ? { config: { ...a.config, public_key: value } } : { signing_secret: value });
-    setData((data) => ({ ...data, integrations: upsert(data.integrations, changed, (item) => item.id, false) }));
-    invalidate("ci/integrations");
-    const next = await api.integrationChat(a.name);
-    chat.setData(() => next);
-    setDraft((t) => (t.trim() === value ? "" : t));
-  }, failed);
+  const keep = (value: string) =>
+    hold.change("keep", async () => {
+      setProblem(null);
+      const changed = await api.updateIntegration(a.name, a.kind === "discord" ? { config: { ...a.config, public_key: value } } : { signing_secret: value });
+      setData((data) => ({ ...data, integrations: upsert(data.integrations, changed, (item) => item.id, false) }));
+      invalidate("ci/integrations");
+      const next = await api.integrationChat(a.name);
+      chat.setData(() => next);
+      setDraft((t) => (t.trim() === value ? "" : t));
+    });
   const missing = chatMissing(a.kind, setup);
   const asks =
     a.kind === "discord"
@@ -735,8 +738,8 @@ function ChatCommandsLoaded({ a, id }: { a: Integration; id: string }) {
             value={draft}
             onChange={(e) => setDraft(e.target.value)}
           />
-          <Button type="submit" size="xs" variant="secondary" pending={keeping} disabled={!draft.trim() || pointing}>
-            {keeping ? "Keeping…" : "Keep it"}
+          <Button type="submit" size="xs" variant="secondary" pending={hold.doing("keep")} disabled={!draft.trim() || hold.held("keep")}>
+            {hold.doing("keep") ? "Keeping…" : "Keep it"}
           </Button>
         </form>
       )}
@@ -747,8 +750,8 @@ function ChatCommandsLoaded({ a, id }: { a: Integration; id: string }) {
       )}
       {a.kind === "telegram" && (
         <div className="st-form-acts dep-form-actions">
-          <Button size="xs" variant="secondary" pending={pointing} disabled={keeping} onClick={connect}>
-            {pointing ? "Pointing…" : setup.commands ? "Point its webhook here again" : "Point its webhook at kiln"}
+          <Button size="xs" variant="secondary" pending={hold.doing("point")} disabled={hold.held("point")} onClick={connect}>
+            {hold.doing("point") ? "Pointing…" : setup.commands ? "Point its webhook here again" : "Point its webhook at kiln"}
           </Button>
         </div>
       )}

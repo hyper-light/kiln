@@ -8,7 +8,7 @@ import { shipApi, type ShipCommit, type ShipDetail, type ShipJob, type ShipJobDo
 import { whoSaid } from "@/api/review";
 import { StatusGlyph } from "@/components/ui/status-glyph";
 import { GLYPHS } from "@/components/ui/status-glyph-spec";
-import { sendingProps, useActions } from "@/lib/action";
+import { sendingProps, useHolds } from "@/lib/action";
 import { glyphOf, pickCard, shipGroups, strip } from "./model";
 import { reviewGroup, type ShipLane, type ShipLaneGroup } from "./review/lanes";
 import { formatDuration } from "@/lib/format";
@@ -172,24 +172,23 @@ export function JobsPane({ commit, output }: { commit: ShipCommit; output: (pick
         .map((j) => j.id)
         .sort()
         .join(",")}`;
-  const [sent, setSent] = React.useState<Record<string, ShipVerb>>({});
-  const [send, out] = useActions(async (key: string, verb: ShipVerb) => {
-    setSent((m) => ({ ...m, [key]: verb }));
-    const ids = jobs.filter((j) => j.verbs.includes(verb)).map((j) => j.id);
-    const body = pick.word ? { repo: commit.repo, sha: commit.sha, verb, scope: pick.word } : { repo: commit.repo, sha: commit.sha, verb, jobs: ids };
-    setArmed(false);
-    try {
-      const r = await shipApi.jobs(body);
-      setSaid(sayDone(verb, r.jobs, detail.data.jobs ?? []));
-    } catch (e) {
-      setSaid({ text: `${VERB_WORD[verb]}: ${errorMessage(e)}`, refused: true });
-    } finally {
-      detail.reload();
-    }
-  });
-  const act = (verb: ShipVerb) => send(target, verb);
-  const sending = (v: ShipVerb) => out(target) && sent[target] === v;
-  const held = (v: ShipVerb) => out(target) && sent[target] !== v;
+  const holds = useHolds();
+  const these = holds(target);
+  const act = (verb: ShipVerb) =>
+    these.change(verb, async () => {
+      const ids = jobs.filter((j) => j.verbs.includes(verb)).map((j) => j.id);
+      const body = pick.word ? { repo: commit.repo, sha: commit.sha, verb, scope: pick.word } : { repo: commit.repo, sha: commit.sha, verb, jobs: ids };
+      setArmed(false);
+      try {
+        const r = await shipApi.jobs(body);
+        setSaid(sayDone(verb, r.jobs, detail.data.jobs ?? []));
+      } catch (e) {
+        setSaid({ text: `${VERB_WORD[verb]}: ${errorMessage(e)}`, refused: true });
+      } finally {
+        detail.reload();
+      }
+    });
+  const { doing: sending, held } = these;
   const strip = (live: boolean) => (
     <Strip
       live={live}

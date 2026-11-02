@@ -19,7 +19,7 @@ import { clientId, harnessApi, type GoalItem, type GoalStack, type SessionStore 
 import { Button } from "@/components/ui/button";
 import { toast } from "@/components/ui/toast";
 import { Loadable } from "@/components/ui/loading";
-import { sendingProps, useAction } from "@/lib/action";
+import { sendingProps, useHold } from "@/lib/action";
 import { harnessSessionsRes, useRes } from "@/lib/data";
 import { relativeTime } from "@/lib/format";
 import { ApiError } from "@/api/client";
@@ -421,13 +421,13 @@ function GoalPanel({
   // One change to the stack at a time (W21-R15): the control pressed says it's on its way and the
   // stack's other controls wait for its answer, so answers come back in the order asked and each try
   // keeps its key (CP-T3.2). Add's field stays free to type the next goal in.
-  const [doing, setDoing] = React.useState<string | null>(null);
-  const [act] = useAction((what: string, go: () => Promise<unknown>) => {
-    setDoing(what);
-    return go().finally(() => setDoing(null));
-  }, failed);
+  const hold = useHold(failed);
+  const act = hold.change;
   /** A control that changes the stack as `whats` do: one of them on its way, it says so; another change, it waits. */
-  const stackControl = (...whats: string[]) => ({ pending: doing !== null && whats.includes(doing), disabled: doing !== null && !whats.includes(doing) });
+  const stackControl = (...whats: string[]) => {
+    const mine = whats.some((w) => hold.doing(w));
+    return { pending: mine, disabled: hold.going && !mine };
+  };
   /**
    * A change whose next stack is known: shown at once (`next` makes it of the stack shown), then
    * asked for. The stack the server answers shows once it comes; if it doesn't go, the stack is back
@@ -543,7 +543,7 @@ function GoalPanel({
             Until then kiln keeps it on the goal: whenever it stops short, or loses the goal when it starts again, kiln sends it again.
           </p>
           {/* Big goals planned first (docs/goals.md): a person's setting, on unless turned off. */}
-          <label className="gs-option" {...sendingProps(doing === "plan_big")}>
+          <label className="gs-option" {...sendingProps(hold.doing("plan_big"))}>
             <input
               type="checkbox"
               className="check"
@@ -697,7 +697,7 @@ function GoalPanel({
                 <div className="field">
                   <input id={`gs-add-${agent}`} value={adding} placeholder={items.length ? "Add the next goal" : "Add a goal"} onChange={(e) => setAdding(e.target.value)} />
                 </div>
-                <Button size="sm" variant="secondary" type="submit" pending={doing === "add"} disabled={stackControl("add").disabled || !adding.trim() || !onStack}>
+                <Button size="sm" variant="secondary" type="submit" pending={hold.doing("add")} disabled={stackControl("add").disabled || !adding.trim() || !onStack}>
                   Add
                 </Button>
               </form>

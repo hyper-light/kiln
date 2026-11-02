@@ -7,7 +7,7 @@ import { Button } from "@/components/ui/button";
 import { Confirm, Panel, SelectField, TextField } from "@/components/ui/misc";
 import { Link } from "@/lib/router";
 import { toast } from "@/components/ui/toast";
-import { useAction, useActions } from "@/lib/action";
+import { useActions, useHold } from "@/lib/action";
 import { formatBytes, formatDuration } from "@/lib/format";
 import { invalidate, preload, useSuspenseResource } from "@/lib/resource";
 import { cn } from "@/lib/utils";
@@ -161,15 +161,15 @@ function RunApproval({ detail }: { detail: CiRunDetail }) {
   const { run } = detail;
   // Approve and Reject are one decision (W21-R15): the one pressed says it's on its way, the other
   // held until it's back.
-  const [sent, setSent] = React.useState<Decision | null>(null);
-  const [decide, deciding] = useAction(async (state: Decision) => {
-    setSent(state);
-    await ci.approve(run.id, [], state, "");
-    toast({ title: state === "approved" ? "Approved: the run starts" : "Rejected: the run is cancelled", tone: "info" });
-    invalidate(`run/${run.id}`);
-    invalidate(`ci-run/${run.id}`);
-  }, "Approval failed");
-  const hold = (state: Decision) => ({ pending: deciding && sent === state, disabled: deciding && sent !== state });
+  const decision = useHold("Approval failed");
+  const decide = (state: Decision) =>
+    decision.change(state, async () => {
+      await ci.approve(run.id, [], state, "");
+      toast({ title: state === "approved" ? "Approved: the run starts" : "Rejected: the run is cancelled", tone: "info" });
+      invalidate(`run/${run.id}`);
+      invalidate(`ci-run/${run.id}`);
+    });
+  const hold = (state: Decision) => ({ pending: decision.doing(state), disabled: decision.held(state) });
   if (run.approval !== "required") return null;
   return (
     <Confirm
@@ -198,15 +198,15 @@ function DeployReview({ detail }: { detail: CiRunDetail }) {
   const envs = [...new Set(detail.legs.map((l) => reviewOf(l.wait_reason)).filter((e): e is string => !!e))];
   const [comment, setComment] = React.useState("");
   // One decision, as the run's approval is.
-  const [sent, setSent] = React.useState<Decision | null>(null);
-  const [decide, deciding] = useAction(async (state: Decision) => {
-    setSent(state);
-    await ci.approve(run.id, envs, state, comment);
-    toast({ title: state === "approved" ? `Approved: deploying to ${envs.join(", ")}` : "Deployment rejected", tone: "info" });
-    invalidate(`run/${run.id}`);
-    invalidate(`ci-run/${run.id}`);
-  }, "Review failed");
-  const hold = (state: Decision) => ({ pending: deciding && sent === state, disabled: deciding && sent !== state });
+  const decision = useHold("Review failed");
+  const decide = (state: Decision) =>
+    decision.change(state, async () => {
+      await ci.approve(run.id, envs, state, comment);
+      toast({ title: state === "approved" ? `Approved: deploying to ${envs.join(", ")}` : "Deployment rejected", tone: "info" });
+      invalidate(`run/${run.id}`);
+      invalidate(`ci-run/${run.id}`);
+    });
+  const hold = (state: Decision) => ({ pending: decision.doing(state), disabled: decision.held(state) });
   if (envs.length === 0) return null;
   const label = `Review the deployment to ${envs.join(", ")}`;
   return (
@@ -609,15 +609,15 @@ const noop = () => {};
 function LegDebug({ runId, legId, running, keptUntil }: { runId: string; legId: string; running: boolean; keptUntil: number | null }) {
   const [open, setOpen] = React.useState(false);
   // Keep and Release change one leg's time: one at a time (W21-R15), the other held meanwhile.
-  const [sent, setSent] = React.useState<"keep" | "release" | null>(null);
-  const [act, acting] = useAction(async (what: "keep" | "release", fn: () => Promise<unknown>, ok: string) => {
-    setSent(what);
-    await fn();
-    toast({ title: ok, tone: "info" });
-    invalidate(`run/${runId}`);
-    invalidate(`ci-run/${runId}`);
-  }, "Action failed");
-  const hold = (what: "keep" | "release") => ({ pending: acting && sent === what, disabled: acting && sent !== what });
+  const time = useHold("Action failed");
+  const act = (what: "keep" | "release", fn: () => Promise<unknown>, ok: string) =>
+    time.change(what, async () => {
+      await fn();
+      toast({ title: ok, tone: "info" });
+      invalidate(`run/${runId}`);
+      invalidate(`ci-run/${runId}`);
+    });
+  const hold = (what: "keep" | "release") => ({ pending: time.doing(what), disabled: time.held(what) });
   const [state, setState] = React.useState<string | null>(null);
   const kept = keptUntil !== null && keptUntil * 1000 > Date.now();
   if (!running && !kept) return null;

@@ -33,7 +33,7 @@ import { Loadable, Loading } from "@/components/ui/loading";
 import { EmptyState, PageIntro } from "@/components/ui/misc";
 import { JourneyStrip, StatusGlyph } from "@/components/ui/status-glyph";
 import { GLYPHS } from "@/components/ui/status-glyph-spec";
-import { sendingProps, useAction } from "@/lib/action";
+import { sendingProps, useHold } from "@/lib/action";
 import { errorMessage, useMediaQuery } from "@/lib/hooks";
 import { useSearchParams } from "@/lib/router";
 import { invalidate, useSuspenseResource } from "@/lib/resource";
@@ -274,23 +274,22 @@ function DeployPane({ row }: { row: ShipDeployRow }) {
   // One change to the app at a time (W21-R15): the verb pressed says it's on its way, and so does its
   // own once the strip is back to its four (Roll back for Roll back's answer); the others are held
   // until it's back, and Keep still takes a question back.
-  const [sent, setSent] = React.useState<ShipDeployVerb | null>(null);
-  const [act, acting] = useAction(async (body: Omit<ShipDeployAct, "app">, done: (r: unknown) => React.ReactNode) => {
-    setSent(body.verb);
-    setArmed(null);
-    try {
-      const r = await shipApi.deployAct({ app: row.app, ...body });
-      setSaid({ text: done(r.done), refused: false });
-    } catch (e) {
-      setSaid({ text: errorMessage(e), refused: true });
-    } finally {
-      // A deleted app has no pane to read again: the list drops its row.
-      if (body.verb !== "delete") pane.reload();
-      invalidate("ship/deploys");
-    }
-  });
-  const sending = (v: ShipDeployVerb) => acting && sent === v;
-  const held = (v: ShipDeployVerb) => acting && sent !== v;
+  const hold = useHold();
+  const act = (body: Omit<ShipDeployAct, "app">, done: (r: unknown) => React.ReactNode) =>
+    hold.change(body.verb, async () => {
+      setArmed(null);
+      try {
+        const r = await shipApi.deployAct({ app: row.app, ...body });
+        setSaid({ text: done(r.done), refused: false });
+      } catch (e) {
+        setSaid({ text: errorMessage(e), refused: true });
+      } finally {
+        // A deleted app has no pane to read again: the list drops its row.
+        if (body.verb !== "delete") pane.reload();
+        invalidate("ship/deploys");
+      }
+    });
+  const { doing: sending, held } = hold;
   // Sync takes what's picked of what differs; with none of it, all that differs.
   const differing = picked.filter((o) => o.item.differs);
   const sync = () =>

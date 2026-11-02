@@ -15,11 +15,11 @@ import { ConfirmDialog } from "@/components/ui/dialog";
 import { Loadable } from "@/components/ui/loading";
 import { Crumbs, Facts, Panel } from "@/components/ui/misc";
 import { toast } from "@/components/ui/toast";
-import { useAction } from "@/lib/action";
+import { useHold, type Hold } from "@/lib/action";
 import { errorMessage } from "@/lib/hooks";
 import { invalidate, useSuspenseResource } from "@/lib/resource";
 import { RelTime } from "@/views/shared";
-import { Answer, DEPLOY_EVENTS, ReleaseState, type Hold } from "./index";
+import { Answer, DEPLOY_EVENTS, ReleaseState } from "./index";
 import "@/views/deployments/deployments.css";
 import "./releases.css";
 import { Highlighted } from "@/components/code/highlighted";
@@ -163,12 +163,7 @@ function ReleaseView({ id }: { id: number }) {
   const cancellable = inFlight(r.state) && (r.state !== "committing" || !!pr);
   // Its changes (an answer, its cancelling) go one at a time: the one pressed says it's on its way and
   // the others wait for it (W21-R15).
-  const [which, setWhich] = React.useState("");
-  const [change, changing] = useAction((what: string, f: () => Promise<unknown>) => {
-    setWhich(what);
-    return f();
-  });
-  const hold: Hold = { change, doing: (what) => changing && which === what, held: (what) => changing && which !== what };
+  const hold = useHold();
   const cancel = async () => {
     try {
       await deployApi.cancel(r.id);
@@ -266,7 +261,7 @@ function ReleaseView({ id }: { id: number }) {
         danger
         onConfirm={() => {
           const done = cancel();
-          change("cancel", () => done);
+          hold.change("cancel", () => done);
           return done;
         }}
       />

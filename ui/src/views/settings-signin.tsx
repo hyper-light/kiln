@@ -9,7 +9,7 @@ import { Hold } from "@/components/ui/hold";
 import { Confirm } from "@/components/ui/misc";
 import { SettingRow, SettingsGroup } from "@/components/ui/settings";
 import { toast } from "@/components/ui/toast";
-import { useAction } from "@/lib/action";
+import { useAction, useHold } from "@/lib/action";
 import { useRes, type Res } from "@/lib/data";
 import { relativeTime } from "@/lib/format";
 import { errorMessage } from "@/lib/hooks";
@@ -162,11 +162,12 @@ export function MyPasswordGroup() {
     setNote({ text: done });
   };
   const failed = (e: unknown) => setNote({ tone: "error", text: errorMessage(e) });
-  const [change, changing] = useAction(() => save(next, has ? "Changed." : "Set: sign in with your name and it."), failed);
-  const [remove, removing] = useAction(() => save("", "Removed: sign in with links, a host or a passkey."), failed);
+  const hold = useHold(failed);
+  const change = () => hold.change("change", () => save(next, has ? "Changed." : "Set: sign in with your name and it."));
+  const remove = () => hold.change("remove", () => save("", "Removed: sign in with links, a host or a passkey."));
   // One change to the password at a time, and either answer empties the fields: they're held as
   // they are while it's on its way (W21-R15).
-  const busy = changing || removing;
+  const busy = hold.going;
   return (
     <SettingsGroup id="signin.mine" title="Your password" about={PASSWORD.about} words={PASSWORD.words} actions={<span className="st-value">{has ? "Set" : "None"}</span>}>
       <form
@@ -174,7 +175,7 @@ export function MyPasswordGroup() {
         autoComplete="on"
         onSubmit={(e) => {
           e.preventDefault();
-          if (next && !removing) change();
+          if (next && !hold.held("change")) change();
         }}
       >
         {has && (
@@ -191,11 +192,11 @@ export function MyPasswordGroup() {
         </SettingRow>
         <div className="mt-3 flex justify-end gap-2">
           {has && (
-            <Button type="button" size="xs" variant="ghost" pending={removing} disabled={!current || changing} onClick={remove}>
+            <Button type="button" size="xs" variant="ghost" pending={hold.doing("remove")} disabled={!current || hold.held("remove")} onClick={remove}>
               Remove it
             </Button>
           )}
-          <Button type="submit" size="xs" variant="secondary" pending={changing} disabled={removing || next.length < 8 || (has && !current)}>
+          <Button type="submit" size="xs" variant="secondary" pending={hold.doing("change")} disabled={hold.held("change") || next.length < 8 || (has && !current)}>
             {has ? "Change it" : "Set it"}
           </Button>
         </div>

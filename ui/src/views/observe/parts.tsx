@@ -37,7 +37,7 @@ import {
 import { Chart } from "@/components/charts/chart";
 import { SERIES, type Band } from "@/components/charts/types";
 import { Segmented, tabsTriggerClass } from "@/components/ui/tabs";
-import { useAction } from "@/lib/action";
+import { useHold } from "@/lib/action";
 import { useRes, type Res } from "@/lib/data";
 import { formatBytes, formatDuration } from "@/lib/format";
 
@@ -133,17 +133,10 @@ export function useRange(fallback: Range = "1h"): [Range, (r: Range) => void] {
  * the others wait for it.
  */
 export function useMoves() {
-  const [pressed, setPressed] = React.useState("");
-  const [run, moving] = useAction((key: string, send: () => unknown) => {
-    setPressed(key);
-    return send();
-  });
+  const hold = useHold();
   return {
-    move: (id: string, by: -1 | 1, send: () => unknown) => run(`${id}/${by}`, send),
-    props: (id: string, by: -1 | 1, cannot: boolean) => {
-      const it = moving && pressed === `${id}/${by}`;
-      return { pending: it, disabled: cannot || (moving && !it) };
-    },
+    move: (id: string, by: -1 | 1, send: () => unknown) => hold.change(`${id}/${by}`, send),
+    props: (id: string, by: -1 | 1, cannot: boolean) => ({ pending: hold.doing(`${id}/${by}`), disabled: cannot || hold.held(`${id}/${by}`) }),
   };
 }
 

@@ -15,7 +15,7 @@ import { Button } from "@/components/ui/button";
 import { Confirm } from "@/components/ui/misc";
 import { StatusDot } from "@/components/ui/status";
 import { toast } from "@/components/ui/toast";
-import { useAction, useActions } from "@/lib/action";
+import { useAction, useActions, useHold } from "@/lib/action";
 import { fuller, useUpdateJobs } from "@/lib/data";
 import { formatDuration, shortSha } from "@/lib/format";
 import { errorMessage, useNow } from "@/lib/hooks";
@@ -1068,8 +1068,9 @@ function WaitsLine({ waits, editing, onEditing }: { waits: NonNullable<UpdatesOv
     toast.success(done);
     invalidate("updates");
   };
-  const [reset, resetting] = useAction(() => act(() => api.resetUpgradeWaits(), "kiln waits as kiln.toml says"), "Couldn't change how long kiln waits");
-  const [save, saving] = useAction((to: UpgradeWaits) => act(() => api.setUpgradeWaits(to), "kiln waits that long from now on"), "Couldn't change how long kiln waits");
+  const hold = useHold("Couldn't change how long kiln waits");
+  const reset = () => hold.change("reset", () => act(() => api.resetUpgradeWaits(), "kiln waits as kiln.toml says"));
+  const save = (to: UpgradeWaits) => hold.change("save", () => act(() => api.setUpgradeWaits(to), "kiln waits that long from now on"));
   const config = WAITS.map((f) => `${f.label.toLowerCase()} ${minutesSaid(waits.config[f.key])}`).join(", ");
   const now = (key: keyof UpgradeWaits) => <b>{waits.now[key]}</b>;
   if (!editing) {
@@ -1079,7 +1080,7 @@ function WaitsLine({ waits, editing, onEditing }: { waits: NonNullable<UpdatesOv
           kiln waits {now("upgrade_minutes")} min for an upgrade, {now("wait_for_jobs_minutes")} min for running jobs and {now("build_minutes")} min for a build before it calls one failed.
         </span>
         {waits.changed && (
-          <Button size="xs" variant="ghost" pending={resetting} disabled={saving} onClick={reset}>
+          <Button size="xs" variant="ghost" pending={hold.doing("reset")} disabled={hold.held("reset")} onClick={reset}>
             Use kiln.toml&rsquo;s
           </Button>
         )}
@@ -1129,7 +1130,7 @@ function WaitsLine({ waits, editing, onEditing }: { waits: NonNullable<UpdatesOv
         <Button type="button" size="xs" variant="ghost" onClick={close}>
           Cancel
         </Button>
-        <Button type="submit" size="xs" variant="secondary" pending={saving} disabled={!changed || resetting}>
+        <Button type="submit" size="xs" variant="secondary" pending={hold.doing("save")} disabled={!changed || hold.held("save")}>
           Save
         </Button>
       </div>
