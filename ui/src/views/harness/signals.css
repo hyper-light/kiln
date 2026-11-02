@@ -472,8 +472,8 @@
 /* ------------------------------------------------------------ condense (a compaction) */
 
 /* The conversation's length as the timeline's hairline; the summary as the site's 30 px prism bar
-   at its start. While it compacts, Mission control's particle light on a wider ribbon turning
-   without end (a canvas, signals.tsx), centred on the line, its room held by the row (console.css)
+   at its start. While it compacts, grains gathering into a thread of the prism (a canvas,
+   signals.tsx, condense-light.ts), centred on the line, its room held by the row (console.css)
    so nothing moves as it settles into the bar. */
 .sg-condense {
   position: relative;
@@ -492,7 +492,7 @@
 .sg-condense[data-live="true"]::before {
   content: none;
 }
-/* stands-light.ts's HEIGHT, its string at the middle: on the line. */
+/* condense-light.ts's HEIGHT, its line at the middle: on the line. */
 .sg-condense-ribbon {
   position: absolute;
   top: calc(50% - 22px);
