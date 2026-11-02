@@ -1443,7 +1443,7 @@ impl Registry {
                     && info.epoch > self.epoch_of(id)
                     && hub.runner_wide_caps(machine) & crate::proto::CAP_CUSTODY == 0
                 {
-                    let why = format!("the process it went to, on {machine}, runs a kiln from before signed hand-overs: it signed no receipt");
+                    let why = format!("the process it went to, on {}, runs a kiln from before signed hand-overs: it signed no receipt", hub.shown(machine));
                     unsigned(hub, id, info.epoch, &format!("runner {machine}"), why);
                 }
                 self.raise_epoch(id, info.epoch);
@@ -2533,13 +2533,13 @@ impl Registry {
         // the take, which the receipt follows as a hand-on's (docs/ci.md W27-R08).
         let heard = hub.agents.lock().get(&from_name).map(|a| a.last_seen).unwrap_or_default();
         let when = time::OffsetDateTime::from_unix_timestamp(heard).ok().and_then(|t| t.format(&time::format_description::well_known::Rfc3339).ok()).unwrap_or_else(|| "never".to_owned());
-        let why = format!("resumed from kiln's copy: {from_name} was last heard from at {when}");
+        let why = format!("resumed from kiln's copy: {} was last heard from at {when}", hub.shown(&from_name));
         match crate::custody::take_for(&hub.store, &hub.pki, id, pkg.state.epoch, &pkg.events, &why).await {
             Ok(take) => pkg.hand_on = take,
             Err(e) => tracing::warn!(target: "kiln.custody", session = %id, error = %format!("{e:#}"), "kiln couldn't take a session it resumes from its copy: it goes on unsigned"),
         }
         if hub.runner_wide_caps(to) & crate::proto::CAP_CUSTODY == 0 {
-            let why = format!("{to} runs a kiln from before signed hand-overs: it signs no receipt of kiln's take");
+            let why = format!("{} runs a kiln from before signed hand-overs: it signs no receipt of kiln's take", hub.shown(to));
             unsigned(hub, id, pkg.state.epoch.saturating_add(1), &format!("runner {to}"), why);
         }
         let bytes = serde_json::to_vec(&pkg).map_err(|e| e.to_string())?;

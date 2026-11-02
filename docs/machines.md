@@ -49,6 +49,12 @@ approved under the first one's runner name. From then on:
   runs, jobs or sessions shows its label as it is now, after a rename too; so do the notes a
   runner writes into a session's timeline ("Moved here from …"), which only have the ids. Words
   kiln already wrote in a job's log keep the name they said then.
+- **What's signed names it by its id.** A runner's certificate names it by its id, and so does
+  what kiln verifies from one (docs/ci.md W27): an identity's description ("on runner <id>
+  (instance main)"), `kiln verify`'s links ("build leg … on <id>"), where a custody record came
+  from, and the timelines named for the machine ("runner role of <id>"). What kiln says in its own
+  words about a hand-over (whom a session was resumed from, which side went unsigned) names it by
+  its label.
 - **Metrics carry both:** every series of a machine (`kiln_runner_*`, `kiln_agent_*`, sync's copies
   and blobs, the conversation stores') has `machine_id` and `machine_name` beside its own labels,
   so they group by either.
@@ -114,6 +120,10 @@ first time the server starts.
   runner sends none and is named as before.
 - **The store gained two nullable columns** older builds never name (`agents.machine_id`,
   `agents.label`): no new epoch.
+- **A runner's local sockets keep their paths.** `kiln run`'s and `kiln spawn`'s sockets are named
+  by the name the runner was started with, never by its id, so a moved runner serves them where its
+  sessions were told they are (`KILN_REACH_SOCK`); an id wouldn't fit in a socket's path in a Mac's
+  temporary folder anyway.
 
 ## What's next
 

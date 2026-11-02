@@ -848,18 +848,19 @@ mod replica_tests {
     }
 }
 
-/// Serve the machine's local sockets (`kiln run`, `kiln spawn`) from this runner process: the new
-/// build once it has taken over, or the old one again after a rollback (the paths are the same).
+/// Serve the machine's local sockets (`kiln run`, `kiln spawn`) from this runner process (runner
+/// `name`, its sockets named by `sock`): the new build once it has taken over, or the old one again
+/// after a rollback (the paths are the same).
 #[cfg(unix)]
-fn serve_sockets(reach: Option<&crate::reach::node::Handle>, harness: Option<&Arc<crate::harness::host::Host>>, name: &str, state_dir: &std::path::Path) {
+fn serve_sockets(reach: Option<&crate::reach::node::Handle>, harness: Option<&Arc<crate::harness::host::Host>>, name: &str, sock: &str, state_dir: &std::path::Path) {
     crate::browser::set_home(state_dir);
     if let Some(r) = reach
-        && let Err(e) = crate::reach::local::serve(r.clone(), name.to_owned(), crate::reach::local::path(name, state_dir), true)
+        && let Err(e) = crate::reach::local::serve(r.clone(), name.to_owned(), crate::reach::local::path(sock, state_dir), true)
     {
         tracing::warn!(error = %format!("{e:#}"), "`kiln run` will not be available on this machine");
     }
     if let Some(h) = harness
-        && let Err(e) = crate::harness::socket::serve(h, crate::harness::socket::path(name, state_dir), true)
+        && let Err(e) = crate::harness::socket::serve(h, crate::harness::socket::path(sock, state_dir), true)
     {
         tracing::warn!(error = %format!("{e:#}"), "`kiln spawn` will not be available in this machine's terminals");
     }
@@ -1389,6 +1390,10 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
     if name != crate::pki::sanitize_name(&o.name) {
         tracing::info!(certificate = %name, requested = %o.name, "using the agent name from this agent's certificate");
     }
+    // Its sockets (`kiln run`'s, `kiln spawn`'s) are named by the name it was started with, never by
+    // its machine id: their paths stay the ones its sessions were given before it moved, and a Mac's
+    // temporary folder leaves a socket's path no room for an id (docs/machines.md).
+    let sock = crate::pki::sanitize_name(&o.name);
     let quic_addr = o
         .quic
         .clone()
@@ -1529,7 +1534,7 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                     }
                 }
             });
-            let path = crate::reach::local::path(&name, &o.state_dir);
+            let path = crate::reach::local::path(&sock, &o.state_dir);
             crate::browser::set_home(&o.state_dir);
             if take_over_pending.is_some() {
                 crate::reach::local::set_socket(path.to_string_lossy().into_owned());
@@ -1800,7 +1805,7 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
     let mut shipper = convo.as_ref().map(|st| start_feed(st, harness.as_ref(), &uplink.0));
     // What `kiln spawn` in this machine's terminals talks to.
     let harness_sock = harness.as_ref().and_then(|h| {
-        let path = crate::harness::socket::path(&name, &o.state_dir);
+        let path = crate::harness::socket::path(&sock, &o.state_dir);
         if take_over_pending.is_some() {
             return Some(path.to_string_lossy().into_owned());
         }
@@ -2296,7 +2301,7 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                                 }
                                 moved.clear();
                                 draining = false;
-                                serve_sockets(reach.as_ref(), harness.as_ref(), &name, &o.state_dir);
+                                serve_sockets(reach.as_ref(), harness.as_ref(), &name, &sock, &o.state_dir);
                                 announce(term_list(&terms), harness.as_ref(), &uplink).await;
                                 for d in held_back.drain(..) {
                                     let _ = bg_tx.try_send(Bg::Forwarded(d));
@@ -2325,7 +2330,7 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                                 }
                                 (convo, shipper) = (Some(st), Some(ship));
                             }
-                            serve_sockets(reach.as_ref(), harness.as_ref(), &name, &o.state_dir);
+                            serve_sockets(reach.as_ref(), harness.as_ref(), &name, &sock, &o.state_dir);
                             for d in held_back {
                                 let _ = bg_tx.try_send(Bg::Forwarded(d));
                             }
@@ -2415,12 +2420,12 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                         // The server learns they run here now.
                         announce(term_list(&terms), harness.as_ref(), &uplink).await;
                         if !std::mem::replace(&mut sockets_served, true) {
-                            serve_sockets(reach.as_ref(), harness.as_ref(), &name, &o.state_dir);
+                            serve_sockets(reach.as_ref(), harness.as_ref(), &name, &sock, &o.state_dir);
                         }
                     }
                     Bg::TakeOverEnded => {
                         if !std::mem::replace(&mut sockets_served, true) {
-                            serve_sockets(reach.as_ref(), harness.as_ref(), &name, &o.state_dir);
+                            serve_sockets(reach.as_ref(), harness.as_ref(), &name, &sock, &o.state_dir);
                         }
                         // It ended before the runner it upgraded said which conversation store this
                         // one goes on with (that one died, or their link broke, before its first
@@ -2958,7 +2963,7 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                         // kiln told.
                         let json = raw.as_deref().unwrap_or_default();
                         let epoch_here = harness.as_ref().and_then(|h| h.get(&session)).map(|s| s.epoch());
-                        let for_me = crate::runner::custody::word_for_me(&session, json, server_custody, &root, &o.name, &instance_id, epoch_here);
+                        let for_me = crate::runner::custody::word_for_me(&session, json, server_custody, &root, &name, &instance_id, epoch_here);
                         // One about a session this runner handed to its new build (blue/green): that
                         // build's now, whoever kiln still counts.
                         #[cfg(unix)]
@@ -3595,7 +3600,7 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                         // connected and welcomed, it says it's ready, and takes everything.
                         #[cfg(unix)]
                         if let Some(path) = take_over.take() {
-                            let (h, tx, me, takes) = (harness.clone(), bg_tx.clone(), Me { machine: o.name.clone(), instance: instance_id.clone(), root: root.clone() }, stores_wait);
+                            let (h, tx, me, takes) = (harness.clone(), bg_tx.clone(), Me { machine: name.clone(), instance: instance_id.clone(), root: root.clone() }, stores_wait);
                             crate::rt::spawn(async move {
                                 if let Err(e) = take_over_from(path, h, tx.clone(), me, takes).await {
                                     tracing::warn!(error = %format!("{e:#}"), "couldn't take over from the runner being upgraded");
