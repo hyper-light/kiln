@@ -557,23 +557,15 @@ pub async fn rerun(hub: &Hub, id: &str, body: &Value, by: &str) -> Result<Respon
         Some(Value::Number(n)) => n.as_u64().filter(|m| *m > 0).map(|m| u32::try_from(m.min(u64::from(crate::runner::kept::MAX_KEEP_MINUTES))).unwrap_or(30)),
         _ => None,
     };
-    // "Rerun with fresh actions" (W07-R02): pinned again now, instead of the run's pins.
-    let actions = if body.get("fresh_actions").and_then(Value::as_bool).unwrap_or(false) {
-        let run = id.to_owned();
-        let saved: Option<(String, String, String)> = hub.store.call(move |c| Ok(c.query_row("SELECT r.repo_id, r.sha, p.workflow FROM runs r JOIN ci_plans p ON p.run_id = r.id WHERE r.id = ?1", [&run], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?))).optional()?)).await.map_err(internal)?;
-        let Some((repo_id, sha, model)) = saved else { return Err(missing("no such run of the CI engine")) };
-        let repo = hub.store.repos().await.map_err(internal)?.into_iter().find(|r| r.id == repo_id).ok_or_else(|| missing("the run's repository is gone"))?;
-        let wf: kiln_ci::wf::Workflow = serde_json::from_str(&model).map_err(|e| (StatusCode::CONFLICT, format!("the run's workflow can't be read again: {e}")))?;
-        Some(super::actions::resolve(hub, &repo, &sha, &wf).await.map_err(|e| (StatusCode::UNPROCESSABLE_ENTITY, e))?)
-    } else {
-        None
-    };
+    // W29-R23: the dispatcher decides this after reading the saved lock snapshot, before
+    // any mutable ref or metadata is fetched.
+    let fresh_actions = body.get("fresh_actions").and_then(Value::as_bool).unwrap_or(false);
     // "Run anyway" (W08-R10): no leg takes an earlier result over. Run cold (W24-R23): nor does
     // any start from kept folders or restore a cache.
     let cold = body.get("cold").and_then(Value::as_bool).unwrap_or(false);
     let no_reuse = cold || body.get("no_reuse").and_then(Value::as_bool).unwrap_or(false);
     let (tx, rx) = async_channel::bounded(1);
-    hub.ci.send(super::dispatch::Msg::Rerun { run: id.to_owned(), mode, debug, keep_failed, actions, no_reuse, cold, placed: HashMap::new(), by: by.to_owned(), reply: tx });
+    hub.ci.send(super::dispatch::Msg::Rerun { run: id.to_owned(), mode, debug, keep_failed, fresh_actions, no_reuse, cold, placed: HashMap::new(), by: by.to_owned(), reply: tx });
     match crate::rt::timeout(std::time::Duration::from_secs(60), rx.recv()).await {
         Ok(Ok(Ok(attempt))) => Ok(srv::json(StatusCode::CREATED, &json!({ "run": id, "attempt": attempt }))),
         Ok(Ok(Err(e))) => Err((StatusCode::CONFLICT, e)),

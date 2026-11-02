@@ -38,6 +38,7 @@ pub mod land;
 pub mod lands;
 pub mod integrations;
 pub mod load;
+pub mod locks;
 pub mod local;
 pub mod logsearch;
 pub mod notify;

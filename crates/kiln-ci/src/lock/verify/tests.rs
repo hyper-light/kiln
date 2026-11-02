@@ -14,7 +14,7 @@ fn fixture(reference: &str, current: &str, reaches: bool) -> (File, BTreeMap<Str
     };
     let facts = [(key.clone(), GitFacts {
         hostname: "github.com".into(), owner_id: 1, repo_id: 2, reference: format!("refs/tags/{reference}"), current: current.into(),
-        reachable: if reaches { [A.to_owned()].into() } else { BTreeSet::new() }, previous: None,
+        reachable: if reaches { [A.to_owned()].into() } else { BTreeSet::new() }, previous: None, requested_ref: String::new(),
     })].into();
     (file, facts, vec![key])
 }
@@ -47,6 +47,21 @@ fn w29_r23_a_version_shaped_branch_is_still_a_branch() -> Result<(), String> {
     let ok = run(Some(&file), &facts, &uses, Policy::default()).map_err(|e| format!("{e:?}"))?;
     assert_eq!(ok.pins.values().next().map(|p| p.commit.as_str()), Some(A));
     assert_eq!(ok.warnings.iter().map(|d| d.code).collect::<Vec<_>>(), ["KCI4057"]);
+    Ok(())
+}
+
+#[test]
+fn w29_r23_head_keeps_its_real_default_branch_and_requires_the_actual_request() -> Result<(), String> {
+    let (file, mut facts, uses) = fixture("HEAD", M, true);
+    for asked in ["", "other"] {
+        if let Some(f) = facts.get_mut("acme/action@HEAD") { f.reference = "refs/heads/trunk".into(); f.requested_ref = asked.into(); }
+        assert_eq!(codes(&run(Some(&file), &facts, &uses, Policy::default())), ["KCI4051"]);
+    }
+    if let Some(f) = facts.get_mut("acme/action@HEAD") { f.requested_ref = "HEAD".into(); }
+    let ok = run(Some(&file), &facts, &uses, Policy::default()).map_err(|e| format!("{e:?}"))?;
+    assert_eq!(ok.pins.values().next().map(|p| p.commit.as_str()), Some(A));
+    if let Some(f) = facts.get_mut("acme/action@HEAD") { f.reference = M.into(); }
+    assert_eq!(codes(&run(Some(&file), &facts, &uses, Policy::default())), ["KCI4051"]);
     Ok(())
 }
 

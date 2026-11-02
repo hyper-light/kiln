@@ -86,7 +86,7 @@ async fn remote(hub: &Hub, r: &Remote) -> anyhow::Result<Workflow> {
 }
 
 /// `w`'s calls by `./`, named as `r`'s repository's at `sha`.
-fn own_calls(w: &mut Workflow, r: &Remote, sha: &str) {
+pub(crate) fn own_calls(w: &mut Workflow, r: &Remote, sha: &str) {
     for j in &mut w.jobs {
         if let Some(u) = j.uses.as_mut()
             && let Some(path) = u.strip_prefix("./")

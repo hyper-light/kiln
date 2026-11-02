@@ -104,32 +104,12 @@ pub async fn start_given(hub: &Hub, repo: &Repo, event: &Event, l: &load::Loaded
         tracing::debug!(workflow = %l.path, %why, "workflow not run");
         return Ok(false);
     }
-    match super::actions::resolve(hub, repo, &event.sha, w).await {
-        Ok(actions) => {
-            // Every resolution is audited (W07-R04): who, which ref, which commit.
-            if !actions.is_empty() {
-                let list: Vec<String> = actions.iter().map(|(u, a)| format!("{u} → {}", a.error.as_ref().map_or_else(|| a.sha.clone(), |e| format!("unresolved ({e})")))).collect();
-                hub.store.audit(event.actor.clone(), "ci.actions.resolve".into(), format!("{} {} at {}: {}", repo.name, l.path, event.sha, list.join(", "))).await;
-            }
-            hub.ci.send(Msg::Start(Box::new(Start {
-                repo: repo.clone(),
-                event: event.clone(),
-                path: l.path.clone(),
-                workflow: Arc::new(w.clone()),
-                message: message.to_owned(),
-                author: author.to_owned(),
-                actions,
-                inputs,
-                given,
-            })));
-        }
-        Err(e) => {
-            let id = fail_run(hub, repo, event, l, message, author, e).await?;
-            if let Some(r) = &given.reply {
-                let _ = r.try_send(id);
-            }
-        }
-    }
+    // W29-R23: dispatch preflights locks before any dependency metadata or policy check.
+    // It keeps the accepted pins and callees together for this run and its recovery.
+    hub.ci.send(Msg::Start(Box::new(Start {
+        repo: repo.clone(), event: event.clone(), path: l.path.clone(), workflow: Arc::new(w.clone()),
+        message: message.to_owned(), author: author.to_owned(), actions: Default::default(), inputs, given,
+    })));
     Ok(true)
 }
 

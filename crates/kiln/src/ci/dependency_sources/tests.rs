@@ -55,7 +55,7 @@ async fn serve(host: Arc<Host>) -> anyhow::Result<String> {
     Ok(format!("http://{addr}"))
 }
 
-async fn git(hub: &Hub, dir: &Path, args: &[&str]) -> anyhow::Result<String> {
+pub(crate) async fn git(hub: &Hub, dir: &Path, args: &[&str]) -> anyhow::Result<String> {
     let mut cmd = crate::gitops::git(hub);
     cmd.current_dir(dir).args(["-c", "user.name=Lock fixture", "-c", "user.email=lock@example.test", "-c", "commit.gpgsign=false", "-c", "tag.gpgsign=false"]).args(args);
     let output = crate::proc::output(cmd, WITHIN).await?;
@@ -63,15 +63,24 @@ async fn git(hub: &Hub, dir: &Path, args: &[&str]) -> anyhow::Result<String> {
     Ok(String::from_utf8_lossy(&output.stdout).trim().to_owned())
 }
 
-struct Live {
-    sources: Sources,
-    commits: FixtureCommits,
-    origin: PathBuf,
+pub(crate) struct Live {
+    pub(crate) sources: Sources,
+    pub(crate) commits: FixtureCommits,
+    pub(crate) origin: PathBuf,
     host: Arc<Host>,
     _dir: tempfile::TempDir,
 }
 
 impl Live {
+    pub(crate) fn hub(&self) -> Arc<Hub> { Arc::clone(&self.sources.hub) }
+    pub(crate) fn root(&self) -> &Path { self._dir.path() }
+
+    pub(crate) async fn for_locks() -> anyhow::Result<Self> {
+        let mut live = Self::new().await?;
+        if let Some(e) = &mut live.sources.endpoints { e.host = "github.com".into(); }
+        Ok(live)
+    }
+
     async fn new() -> anyhow::Result<Self> {
         Self::with_token(false).await
     }
@@ -84,6 +93,7 @@ impl Live {
         let token_copy = token_file.clone();
         if credential { crate::rt::blocking(move || std::fs::write(token_copy, "source-fixture-token")).await??; }
         let hub = crate::hub::tests::scratch_hub_with(|cfg| {
+            cfg.ci.enabled = true;
             cfg.ci.actions.sources.push(crate::config::ci::ActionSource { owners: vec!["acme".into()], url: Some(pattern), native: false });
             cfg.gitops.github_token_file = credential.then_some(token_file);
         }).await?;

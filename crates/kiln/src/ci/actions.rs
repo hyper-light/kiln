@@ -59,7 +59,7 @@ impl Remote {
         Some(Remote { owner: owner.into(), repo: repo.into(), path: parts.next().unwrap_or_default().trim_matches('/').into(), git_ref: git_ref.into(), native })
     }
 
-    fn full(&self) -> String {
+    pub(crate) fn full(&self) -> String {
         format!("{}/{}", self.owner, self.repo)
     }
 
@@ -74,19 +74,19 @@ impl Remote {
     }
 
     /// Where a leg downloads it at `sha`.
-    fn url(&self, sha: &str) -> String {
+    pub(crate) fn url(&self, sha: &str) -> String {
         format!("/_kiln/actions/{}{}/{}/{sha}.tar.gz", if self.native { "kiln/" } else { "" }, self.owner, self.repo)
     }
 
     /// Its name without its ref: `kiln://owner/repo/path`, `owner/repo/path`.
-    fn named(&self) -> String {
+    pub(crate) fn named(&self) -> String {
         let path = if self.path.is_empty() { String::new() } else { format!("/{}", self.path) };
         format!("{}{}{path}", if self.native { "kiln://" } else { "" }, self.full())
     }
 
     /// Whether its name leads to one of kiln's own repositories: `kiln://`, or a plain name a
     /// native `[[ci.actions.sources]]` sends there (W29-R18).
-    fn hosted(&self, hub: &Hub) -> bool {
+    pub(crate) fn hosted(&self, hub: &Hub) -> bool {
         self.native || hub.cfg.ci.actions.source_of(&self.owner).is_some_and(|s| s.native)
     }
 
@@ -95,7 +95,7 @@ impl Remote {
     /// whole or abbreviated) and reached by no branch or tag but a draft's, it's the draft's, and
     /// refused as a draft's ref is (KCI4023). For an action and a reusable workflow alike, and
     /// wherever the name leads to kiln's own: `kiln://`, or a native source's plain name.
-    async fn draft_only(&self, hub: &Hub, caller: &str, sha: &str) -> Result<(), String> {
+    pub(crate) async fn draft_only(&self, hub: &Hub, caller: &str, sha: &str) -> Result<(), String> {
         let by_commit = !self.git_ref.is_empty() && self.git_ref.bytes().all(|b| b.is_ascii_hexdigit()) && sha.to_ascii_lowercase().starts_with(&self.git_ref.to_ascii_lowercase());
         if by_commit && self.hosted(hub) && !self.full().eq_ignore_ascii_case(caller) && !published(hub, self, sha).await.unwrap_or(true) {
             return Err(format!("KCI4023 `{}@{}` names a commit only a draft reaches (a branch under {}), which is its author's until it's published", self.named(), self.git_ref, kiln_ci::drafts::DRAFT_PREFIX));
@@ -549,7 +549,7 @@ async fn pin_ref_with(hub: &Hub, r: &Remote, observe: bool, refresh: bool) -> an
 }
 
 /// `path`, percent-encoded for a query (its `/` kept).
-fn encode_path(path: &str) -> String {
+pub(crate) fn encode_path(path: &str) -> String {
     path.bytes().map(|b| if b.is_ascii_alphanumeric() || b"-._~/".contains(&b) { (b as char).to_string() } else { format!("%{b:02X}") }).collect()
 }
 

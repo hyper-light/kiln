@@ -10,6 +10,8 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
+use futures::FutureExt as _;
+
 use kiln_ci::plan::{self, Conclusion as PlanC, LegReport, LegSpec, PlanAction, PlanSource, RunInput, RunPlan, Settings};
 use kiln_ci::sched::groups::GroupConfig;
 use kiln_ci::sched::retry::{Failed, FailureClass, RetryOn, RetryPolicy};
@@ -27,6 +29,11 @@ use super::runs;
 use crate::hub::Hub;
 use crate::proto::{CAP_ACTIONS, CAP_CI2, CAP_DOCKER, JobResult, LANE_CONTROL, ServerMsg};
 use crate::store::{Repo, Status};
+
+fn preflight_slot() -> Option<async_lock::SemaphoreGuardArc> {
+    static SLOTS: std::sync::LazyLock<Arc<async_lock::Semaphore>> = std::sync::LazyLock::new(|| Arc::new(async_lock::Semaphore::new(32)));
+    SLOTS.try_acquire_arc()
+}
 
 /// A run to start: a workflow that matched an event.
 #[derive(Debug, Clone)]
@@ -117,6 +124,14 @@ impl Try {
 #[derive(Debug)]
 pub enum Msg {
     Start(Box<Start>),
+    /// W29-R23: network preflight runs outside the dispatcher. Its bounded slot stays held
+    /// until this message is consumed, bounding ready snapshots as well as active fetches.
+    PreparedStart { start: Box<Start>, snapshot: Result<Box<super::locks::Frozen>, String>, permit: async_lock::SemaphoreGuardArc },
+    PreparedRerun {
+        run: String, mode: RerunMode, debug: bool, keep_failed: Option<u32>, snapshot: Result<Box<super::locks::Frozen>, String>, fresh_actions: bool,
+        no_reuse: bool, cold: bool, placed: HashMap<String, kiln_ci::sched::Placement>, by: String,
+        reply: async_channel::Sender<Result<u32, String>>, permit: async_lock::SemaphoreGuardArc,
+    },
     /// A runner connected (or said what it can do); `running` are the legs it still runs.
     RunnerUp { agent: String, running: Vec<String> },
     RunnerLost { agent: String },
@@ -149,6 +164,7 @@ pub enum Msg {
     Explain { leg: String, reply: async_channel::Sender<serde_json::Value> },
     /// The plan `Start` would make, without a run (W04-R29).
     Preview { start: Box<Start>, reply: async_channel::Sender<serde_json::Value> },
+    PreparedPreview { start: Box<Start>, snapshot: Result<Box<super::locks::Frozen>, String>, reply: async_channel::Sender<serde_json::Value>, permit: async_lock::SemaphoreGuardArc },
     /// The stored routing rules changed (W05-R21): read them again.
     RoutingChanged,
     /// A run's deployments were reviewed (W15-R03): its legs held for approval are let go, or
@@ -166,7 +182,7 @@ pub enum Msg {
         mode: RerunMode,
         debug: bool,
         keep_failed: Option<u32>,
-        actions: Option<std::collections::BTreeMap<String, wire::ActionRef>>,
+        fresh_actions: bool,
         no_reuse: bool,
         cold: bool,
         placed: HashMap<String, kiln_ci::sched::Placement>,
@@ -308,7 +324,7 @@ fn docker_steps(steps: &[kiln_ci::wf::ir::Step], actions: &std::collections::BTr
 fn dockerless_pod(sched: &Scheduler, r: &RunSt, spec: &LegSpec, route: &LegRoute) -> Option<String> {
     let pool = sched.pool_for(route).filter(|p| p.executor == "k8s" && !p.docker)?;
     let mut steps = Vec::new();
-    docker_steps(spec.def().map(|j| j.steps.as_slice()).unwrap_or_default(), &r.actions, &mut steps);
+    docker_steps(spec.def().map(|j| j.steps.as_slice()).unwrap_or_default(), r.actions_for(spec), &mut steps);
     let named: Vec<String> = steps.iter().map(|u| format!("`{u}`")).collect();
     (!named.is_empty()).then(|| {
         format!(
@@ -414,24 +430,31 @@ fn route_with(spec: &LegSpec, workflow: &str, repo: &str, event: &str, trusted: 
 /// could run again (W05-R28). `None` for a row that isn't a leg of the engine's.
 pub(crate) async fn stored_route(hub: &Hub, leg: &str) -> anyhow::Result<Option<LegRoute>> {
     let id = leg.to_owned();
-    let row: Option<(String, String, String, String, String)> = hub
+    let row: Option<(String, String, String, String, String, String)> = hub
         .store
         .call(move |c| {
             Ok(c.query_row(
-                "SELECT j.leg, p.workflow, p.input, r.event, o.name FROM jobs j JOIN runs r ON r.id = j.run_id JOIN ci_plans p ON p.run_id = r.id JOIN repos o ON o.id = r.repo_id
+                "SELECT j.leg, p.workflow, p.input, r.event, o.name, r.sha FROM jobs j JOIN runs r ON r.id = j.run_id JOIN ci_plans p ON p.run_id = r.id JOIN repos o ON o.id = r.repo_id
                  WHERE j.id = ?1 AND j.job_id IS NOT NULL AND j.leg IS NOT NULL",
                 [&id],
-                |x| Ok((x.get(0)?, x.get(1)?, x.get(2)?, x.get(3)?, x.get(4)?)),
+                |x| Ok((x.get(0)?, x.get(1)?, x.get(2)?, x.get(3)?, x.get(4)?, x.get(5)?)),
             )
             .optional()?)
         })
         .await?;
-    let Some((leg, model, input, event, repo)) = row else { return Ok(None) };
+    let Some((leg, model, input, event, repo, sha)) = row else { return Ok(None) };
     let wf: Arc<Workflow> = Arc::new(serde_json::from_str(&model)?);
     let v: serde_json::Value = serde_json::from_str(&input)?;
-    let spec = rebuild_spec(&wf, &serde_json::from_str(&leg)?);
+    let snapshot = super::locks::Frozen::saved(&v, &repo, &wf.path, &sha).map_err(anyhow::Error::msg)?;
+    let stored: serde_json::Value = serde_json::from_str(&leg)?;
+    let defined: plan::DefinedIn = stored.get("defined_in").map(|d| serde_json::from_value(d.clone())).transpose()?.unwrap_or_default();
+    let defining = snapshot.as_ref().and_then(|s| s.workflow_for(&defined)).unwrap_or_else(|| Arc::clone(&wf));
+    let spec = rebuild_spec(&defining, &stored);
     let trusted = v.get("trusted").and_then(serde_json::Value::as_bool).unwrap_or(false);
-    let actions: std::collections::BTreeMap<String, wire::ActionRef> = v.get("actions").and_then(|a| serde_json::from_value(a.clone()).ok()).unwrap_or_default();
+    let actions: std::collections::BTreeMap<String, wire::ActionRef> = match &snapshot {
+        Some(s) => s.actions_for(&spec.defined_in).ok_or_else(|| anyhow::anyhow!("the saved dependency snapshot omits this leg's workflow"))?.clone(),
+        None => v.get("actions").and_then(|a| serde_json::from_value(a.clone()).ok()).unwrap_or_default(),
+    };
     Ok(Some(route_with(&spec, &wf.name.clone().unwrap_or_default(), &repo, &event, trusted, &actions, &hub.cfg.ci)))
 }
 
@@ -440,7 +463,7 @@ pub(crate) async fn stored_route(hub: &Hub, leg: &str) -> anyhow::Result<Option<
 /// warm), its job's container and workflow file, and its job's `prefer:`.
 fn leg_in(r: &RunSt, run: &str, id: &str, spec: &LegSpec, cfg: &crate::config::ci::Ci, warm: &HashMap<String, (u64, kiln_ci::work::slots::WorkState)>) -> LegIn {
     let job = spec.def();
-    let route = route_with(spec, &r.wf.name.clone().unwrap_or_default(), &r.repo.name, &r.event.name, r.trusted, &r.actions, cfg);
+    let route = route_with(spec, &r.wf.name.clone().unwrap_or_default(), &r.repo.name, &r.event.name, r.trusted, r.actions_for(spec), cfg);
     let group = spec.concurrency.as_ref().map(|g| (format!("{}\0{}", r.repo.id, g.group), g.group.clone(), GroupConfig { cancel_in_progress: g.cancel_in_progress, queue_max: g.queue_max, limit: g.limit.map_or(1, |l| l.max(1) as usize), max_pending: 100 }));
     let retry = job.and_then(|j| j.kiln.retry.as_ref()).and_then(RetryPolicy::from_yval);
     // The workflow's `coalesce:` and `cadence:` (W28-R60): its lane is the repository's workflow on
@@ -668,6 +691,8 @@ struct RunSt {
     vars: serde_json::Value,
     trusted: bool,
     actions: std::collections::BTreeMap<String, wire::ActionRef>,
+    /// W29-R23: accepted Git sources, including each callee's own action-lock scope.
+    dependencies: Option<Arc<super::locks::Frozen>>,
     /// The plan's leg keys, to leg ids.
     keys: HashMap<String, String>,
     /// Actions waiting for the run's concurrency group to let it start.
@@ -705,6 +730,16 @@ struct RunSt {
     culprit: Option<Try>,
     /// Where a person's retry asked its legs to run, by key (W05-R28).
     placed: HashMap<String, kiln_ci::sched::Placement>,
+}
+
+impl RunSt {
+    fn actions_for(&self, spec: &LegSpec) -> &std::collections::BTreeMap<String, wire::ActionRef> {
+        static EMPTY: std::sync::LazyLock<std::collections::BTreeMap<String, wire::ActionRef>> = std::sync::LazyLock::new(Default::default);
+        match &self.dependencies {
+            Some(snapshot) => snapshot.actions_for(&spec.defined_in).unwrap_or(&EMPTY),
+            None => &self.actions,
+        }
+    }
 }
 
 /// What an unapproved run is handed to the scheduler with, once it's approved.
@@ -1147,7 +1182,12 @@ pub fn spawn(hub: Arc<Hub>) {
 impl Dispatch {
     async fn handle(&mut self, m: Msg) {
         let r = match m {
-            Msg::Start(s) => self.start(*s).await,
+            Msg::Start(s) => self.prepare_start(*s).await,
+            Msg::PreparedStart { start, snapshot, permit } => {
+                let result = self.start(*start, snapshot.map(|s| *s)).await;
+                drop(permit);
+                result
+            }
             Msg::RunnerUp { agent, running } => {
                 self.runner_up(&agent, &running).await;
                 Ok(())
@@ -1226,7 +1266,20 @@ impl Dispatch {
                 Ok(())
             }
             Msg::Preview { start, reply } => {
-                let v = self.preview(&start).await;
+                if let Some(permit) = preflight_slot() {
+                    let fallback = reply.clone();
+                    let hub = Arc::clone(&self.hub);
+                    let task = crate::rt::spawn(async move {
+                        let snapshot = super::locks::prepare(&hub, &start.repo, &start.event.sha, &start.path, Arc::clone(&start.workflow)).await.map(Box::new);
+                        hub.ci.send(Msg::PreparedPreview { start, snapshot, reply, permit });
+                    });
+                    if let Some(Err(_)) = task.now_or_never() { let _ = fallback.try_send(serde_json::json!({ "error": "dependency preflight could not start: runtime is full" })); }
+                } else { let _ = reply.try_send(serde_json::json!({ "error": "dependency preflight is full (32 pending); retry later" })); }
+                Ok(())
+            }
+            Msg::PreparedPreview { start, snapshot, reply, permit } => {
+                let v = self.preview(&start, snapshot.map(|s| *s)).await;
+                drop(permit);
                 let _ = reply.try_send(v);
                 Ok(())
             }
@@ -1279,9 +1332,31 @@ impl Dispatch {
                 let _ = reply.try_send(v);
                 Ok(())
             }
-            Msg::Rerun { run, mode, debug, keep_failed, actions, no_reuse, cold, placed, by, reply } => {
-                let r = self.rerun(&run, &mode, debug, keep_failed, actions, no_reuse, cold, placed, &by).await.map_err(|e| format!("{e:#}"));
-                let _ = reply.try_send(r);
+            Msg::Rerun { run, mode, debug, keep_failed, fresh_actions, no_reuse, cold, placed, by, reply } => {
+                let recheck = if fresh_actions { Ok(true) } else { super::locks::retry_needs_preflight(&self.hub, &run).await };
+                if let Err(why) = recheck { let _ = reply.try_send(Err(why)); return; }
+                if recheck.unwrap_or(false) {
+                    let Some(permit) = preflight_slot() else { let _ = reply.try_send(Err("dependency preflight is full (32 pending); retry later".into())); return; };
+                    let fallback = reply.clone();
+                    let hub = Arc::clone(&self.hub);
+                    let task = crate::rt::spawn(async move {
+                        let snapshot = super::locks::prepare_retry(&hub, &run, fresh_actions).await.map(Box::new);
+                        hub.ci.send(Msg::PreparedRerun { run, mode, debug, keep_failed, snapshot, fresh_actions, no_reuse, cold, placed, by, reply, permit });
+                    });
+                    if let Some(Err(_)) = task.now_or_never() { let _ = fallback.try_send(Err("dependency preflight could not start: runtime is full".into())); }
+                } else {
+                    let r = self.rerun(&run, &mode, debug, keep_failed, None, false, no_reuse, cold, placed, &by).await.map_err(|e| format!("{e:#}"));
+                    let _ = reply.try_send(r);
+                }
+                Ok(())
+            }
+            Msg::PreparedRerun { run, mode, debug, keep_failed, snapshot, fresh_actions, no_reuse, cold, placed, by, reply, permit } => {
+                let result = match snapshot {
+                    Ok(snapshot) => self.rerun(&run, &mode, debug, keep_failed, Some(Arc::new(*snapshot)), fresh_actions, no_reuse, cold, placed, &by).await.map_err(|e| format!("{e:#}")),
+                    Err(why) => Err(why),
+                };
+                drop(permit);
+                let _ = reply.try_send(result);
                 Ok(())
             }
         };
@@ -1440,8 +1515,20 @@ impl Dispatch {
         cmds
     }
 
+    async fn prepare_start(&mut self, s: Start) -> anyhow::Result<()> {
+        let Some(permit) = preflight_slot() else { return self.start(s, Err("KCI4051 dependency preflight is full (32 pending); start the run again".into())).await };
+        let fallback = s.clone();
+        let hub = Arc::clone(&self.hub);
+        let task = crate::rt::spawn(async move {
+            let snapshot = super::locks::prepare(&hub, &s.repo, &s.event.sha, &s.path, Arc::clone(&s.workflow)).await.map(Box::new);
+            hub.ci.send(Msg::PreparedStart { start: Box::new(s), snapshot, permit });
+        });
+        if let Some(Err(_)) = task.now_or_never() { return self.start(fallback, Err("KCI4051 dependency preflight could not start: runtime is full".into())).await; }
+        Ok(())
+    }
+
     /// A workflow that matched an event becomes a run (W04-R01).
-    async fn start(&mut self, mut s: Start) -> anyhow::Result<()> {
+    async fn start(&mut self, mut s: Start, prepared: Result<super::locks::Frozen, String>) -> anyhow::Result<()> {
         // The repository's routing rules as its default branch has them now (W05-R21).
         let fresh = super::routing::repo_rules(&self.hub, &s.repo).await;
         if self.routing.set_repo(&s.repo.name, fresh) {
@@ -1479,12 +1566,6 @@ impl Dispatch {
         if let Some(r) = &s.given.reply {
             let _ = r.try_send(id.clone());
         }
-        // A kiln workflow that declares its secrets needs every required one (W09-R06).
-        if let Some(why) = self.missing_secrets(&s).await {
-            runs::finish_run(&self.hub, &id, Status::Failed, "startup_failure", Some(why)).await?;
-            self.hub.emit_run(&id).await;
-            return Ok(());
-        }
         let urls = github_api(&self.hub, &s.repo).await.map(|(app, _)| (app.web.clone(), app.api.clone()));
         let github = self.github_context(&s, number, rowid, &name, urls.as_ref());
         let inputs = if s.inputs.is_null() { s.event.payload.get("inputs").cloned().unwrap_or(serde_json::Value::Null) } else { s.inputs.clone() };
@@ -1503,14 +1584,39 @@ impl Dispatch {
         let input = RunInput { github: github.clone(), inputs, vars: vars.clone(), changed: s.event.changed.clone().map(Arc::new), trusted };
         let perms = if super::repo_config::load(&self.hub, &s.repo).await.default_permissions() == plan::perms::Default::Write { "write" } else { "read" };
         let only: serde_json::Map<String, serde_json::Value> = s.given.only_matrix.iter().map(|(k, v)| (k.clone(), serde_json::Value::String(v.clone()))).collect();
+        let prepared = prepared.and_then(|snapshot| {
+            let actions = snapshot.root_actions()?.clone();
+            Ok((Arc::new(snapshot), actions))
+        });
+        let (dependencies, actions) = match prepared {
+            Ok(frozen) => frozen,
+            Err(why) => {
+                self.save_input(&id, &input, &Default::default(), &s.event, (false, None), &HashMap::new(), &serde_json::json!({ "default_permissions": perms, "only_matrix": only, "culprit": culprit, "dependency_preflight_failed": true })).await?;
+                runs::finish_run(&self.hub, &id, Status::Failed, "startup_failure", Some(why)).await?;
+                self.hub.emit_run(&id).await;
+                return Ok(());
+            }
+        };
+        s.actions = actions;
+        // Persist acceptance before a later startup check can fail. A retry after missing
+        // secrets must retain these pins too; a failed preflight has no accepted snapshot.
+        self.save_input(&id, &input, &s.actions, &s.event, (false, None), &HashMap::new(), &serde_json::json!({ "default_permissions": perms, "only_matrix": only, "culprit": culprit, "dependency_snapshot": dependencies })).await?;
+        let pins: Vec<String> = dependencies.scopes.values().flat_map(|scope| scope.actions.iter().map(move |(uses, a)| format!("{}:{} {uses} → {}", scope.repository, scope.path, a.error.as_deref().unwrap_or(&a.sha)))).collect();
+        if !pins.is_empty() { self.hub.store.audit(s.event.actor.clone(), "ci.actions.resolve".into(), format!("{} {} at {}: {}", s.repo.name, s.path, s.event.sha, pins.join(", "))).await; }
+        // A kiln workflow that declares its secrets needs every required one (W09-R06).
+        if let Some(why) = self.missing_secrets(&s).await {
+            runs::finish_run(&self.hub, &id, Status::Failed, "startup_failure", Some(why)).await?;
+            self.hub.emit_run(&id).await;
+            return Ok(());
+        }
         let timing = super::results::timing(&self.hub, &s.repo.id).await;
-        let files = Arc::new(super::reusable::files(&self.hub, &s.repo, &s.event.sha, &s.workflow).await);
+        let files = Arc::new(dependencies.files.clone());
         let tree = Arc::new(shard_files(&self.hub, &s.repo, &s.event.sha, &s.workflow, &files).await);
         // `affected()`'s package graph (W24-R17), kept with the input too.
         let graph = super::graphs::of_run(&self.hub, &s.repo, &s.event.sha, &s.workflow, &files).await;
-        let settings = serde_json::json!({ "default_permissions": perms, "only_matrix": only, "timing": *timing, "tree": *tree, "graph": graph.as_deref(), "culprit": culprit });
+        let settings = serde_json::json!({ "default_permissions": perms, "only_matrix": only, "timing": *timing, "tree": *tree, "graph": graph.as_deref(), "culprit": culprit, "dependency_snapshot": dependencies });
         self.save_input(&id, &input, &s.actions, &s.event, (false, None), &HashMap::new(), &settings).await?;
-        Box::pin(super::catalog::record(&self.hub, &id, &s.repo, &s.actions, &files)).await;
+        for scope in dependencies.scopes.values() { Box::pin(super::catalog::record(&self.hub, &id, &s.repo, &scope.actions, &files)).await; }
         let started = RunPlan::start(Arc::clone(&s.workflow), input, self.settings_with(&settings), &Graphed { source: Source { files: &files, timing: &timing, tree: &tree }, graph });
         let (plan, actions) = match started {
             Ok(x) => x,
@@ -1525,7 +1631,7 @@ impl Dispatch {
         let group = plan.concurrency.as_ref().filter(|_| culprit.is_none()).map(|g| (format!("{}\0{}", s.repo.id, g.group), g.group.clone(), GroupConfig { cancel_in_progress: g.cancel_in_progress, queue_max: g.queue_max, limit: g.limit.map_or(1, |l| l.max(1) as usize), max_pending: 100 }));
         let costs = super::insights::costs(&self.hub, &s.repo.id, &s.path).await;
         let sup = if culprit.is_some() { None } else { sup_of(&s.workflow, &s.repo, &s.path, &s.event.name, &github) };
-        let mut st = RunSt { plan, repo: s.repo, event: s.event, path: s.path, created: crate::util::now_unix(), in_progress: false, files, wf: s.workflow, github, vars, trusted, actions: s.actions, keys: HashMap::new(), held: Some(actions), seq: 0, keep: HashMap::new(), debug: false, keep_failed: None, given: s.given, timing, tree, removed: 0, costs, awaiting: None, no_reuse: false, who: Who::default(), sup, cold: false, culprit, placed: HashMap::new() };
+        let mut st = RunSt { plan, repo: s.repo, event: s.event, path: s.path, created: crate::util::now_unix(), in_progress: false, files, wf: s.workflow, github, vars, trusted, actions: s.actions, dependencies: Some(dependencies), keys: HashMap::new(), held: Some(actions), seq: 0, keep: HashMap::new(), debug: false, keep_failed: None, given: s.given, timing, tree, removed: 0, costs, awaiting: None, no_reuse: false, who: Who::default(), sup, cold: false, culprit, placed: HashMap::new() };
         st.who = who_of(&self.hub, &st).await;
         self.workflow_run(&st, "requested", None);
         if approval {
@@ -1685,14 +1791,15 @@ impl Dispatch {
     /// What [`Self::start`] would plan for `s`, without a run: the `github` context of run 0,
     /// the variables and reusable workflows a run would get, and each leg's routing against the
     /// runners connected now.
-    async fn preview(&mut self, s: &Start) -> serde_json::Value {
+    async fn preview(&mut self, s: &Start, prepared: Result<super::locks::Frozen, String>) -> serde_json::Value {
+        let snapshot = match prepared { Ok(s) => s, Err(error) => return serde_json::json!({ "error": error }) };
         let name = s.workflow.name.clone().unwrap_or_else(|| s.path.clone());
         let urls = github_api(&self.hub, &s.repo).await.map(|(app, _)| (app.web.clone(), app.api.clone()));
         let github = self.github_context(s, 0, 0, &name, urls.as_ref());
         let inputs = if s.inputs.is_null() { s.event.payload.get("inputs").cloned().unwrap_or(serde_json::Value::Null) } else { s.inputs.clone() };
         let vars = super::secrets::vars_for(&self.hub, &s.repo, &s.path, None).await.map(serde_json::Value::Object).unwrap_or_else(|_| serde_json::json!({}));
         let input = RunInput { github, inputs, vars, changed: s.event.changed.clone().map(Arc::new), trusted: s.event.trusted };
-        let files = Arc::new(super::reusable::files(&self.hub, &s.repo, &s.event.sha, &s.workflow).await);
+        let files = Arc::new(snapshot.files.clone());
         let perms = if super::repo_config::load(&self.hub, &s.repo).await.default_permissions() == plan::perms::Default::Write { "write" } else { "read" };
         let timing = super::results::timing(&self.hub, &s.repo.id).await;
         let tree = shard_files(&self.hub, &s.repo, &s.event.sha, &s.workflow, &files).await;
@@ -1707,8 +1814,9 @@ impl Dispatch {
             .legs
             .iter()
             .map(|spec| {
-                let untrusted = (!trusted_of(&self.hub.cfg.ci, &s.repo, &s.event)).then(|| self.hub.cfg.ci.untrusted.route());
-                let mut route = route_of(spec, &workflow, &s.repo.name, &s.event.name, self.hub.cfg.ci.local, untrusted);
+                let empty = std::collections::BTreeMap::new();
+                let actions = snapshot.actions_for(&spec.defined_in).unwrap_or(&empty);
+                let mut route = route_with(spec, &workflow, &s.repo.name, &s.event.name, trusted_of(&self.hub.cfg.ci, &s.repo, &s.event), actions, &self.hub.cfg.ci);
                 // Where its environment deploys, as its gate adds it (W15-R02).
                 if let Some(d) = spec.environment.as_ref().and_then(|e| envs.get(&e.name.to_ascii_lowercase())) {
                     for q in super::environments::routing(d) {
@@ -1746,7 +1854,7 @@ impl Dispatch {
     async fn save_input(&self, run: &str, input: &RunInput, actions: &std::collections::BTreeMap<String, wire::ActionRef>, event: &Event, debug: (bool, Option<u32>), keep: &HashMap<String, (LegReport, String)>, settings: &serde_json::Value) -> anyhow::Result<()> {
         let keep: serde_json::Map<String, serde_json::Value> = keep.iter().map(|(k, (rep, leg))| (k.clone(), serde_json::json!({ "report": report_json(rep), "leg": leg }))).collect();
         let (debug, keep_failed) = debug;
-        let json = serde_json::json!({ "github": input.github, "inputs": input.inputs, "vars": input.vars, "changed": input.changed.as_deref(), "trusted": input.trusted, "actions": actions, "event": event, "debug": debug, "keep_failed": keep_failed, "keep": keep, "default_permissions": settings.get("default_permissions"), "only_matrix": settings.get("only_matrix"), "timing": settings.get("timing"), "tree": settings.get("tree"), "no_reuse": settings.get("no_reuse"), "graph": settings.get("graph"), "cold": settings.get("cold"), "culprit": settings.get("culprit"), "placed": settings.get("placed") }).to_string();
+        let json = serde_json::json!({ "github": input.github, "inputs": input.inputs, "vars": input.vars, "changed": input.changed.as_deref(), "trusted": input.trusted, "actions": actions, "event": event, "debug": debug, "keep_failed": keep_failed, "keep": keep, "default_permissions": settings.get("default_permissions"), "only_matrix": settings.get("only_matrix"), "timing": settings.get("timing"), "tree": settings.get("tree"), "no_reuse": settings.get("no_reuse"), "graph": settings.get("graph"), "cold": settings.get("cold"), "culprit": settings.get("culprit"), "placed": settings.get("placed"), "dependency_snapshot": settings.get("dependency_snapshot"), "dependency_preflight_failed": settings.get("dependency_preflight_failed") }).to_string();
         let run = run.to_owned();
         self.hub.store.call(move |c| Ok(c.execute("UPDATE ci_plans SET input = ?2 WHERE run_id = ?1", rusqlite::params![run, json]).map(|_| ())?)).await
     }
@@ -1898,7 +2006,8 @@ impl Dispatch {
         mode: &RerunMode,
         debug: bool,
         keep_failed: Option<u32>,
-        fresh: Option<std::collections::BTreeMap<String, wire::ActionRef>>,
+        fresh: Option<Arc<super::locks::Frozen>>,
+        fresh_actions: bool,
         no_reuse: bool,
         cold: bool,
         placed: HashMap<String, kiln_ci::sched::Placement>,
@@ -1914,6 +2023,12 @@ impl Dispatch {
         let v: serde_json::Value = serde_json::from_str(&input)?;
         let event: Event = v.get("event").and_then(|e| serde_json::from_value(e.clone()).ok()).ok_or_else(|| anyhow::anyhow!("the run predates saved events; it can't be run again"))?;
         let repo = self.hub.store.repos().await?.into_iter().find(|x| x.id == repo_id).ok_or_else(|| anyhow::anyhow!("the run's repository is gone"))?;
+        let mut dependencies = super::locks::Frozen::saved(&v, &repo.name, &wf.path, &event.sha).map_err(anyhow::Error::msg)?.map(Arc::new);
+        if let Some(fresh) = fresh {
+            if fresh_actions { anyhow::ensure!(!dependencies.as_ref().is_some_and(|s| s.root_locked) && !fresh.root_locked, "Fresh actions require a reviewed lock change (W29-R25)"); }
+            anyhow::ensure!(fresh.repository.eq_ignore_ascii_case(&repo.name) && fresh.commit == event.sha && fresh.path == wf.path && fresh.version == 1, "fresh dependency snapshot belongs to another workflow or commit");
+            if fresh_actions || dependencies.is_none() { dependencies = Some(fresh); }
+        }
         // The last attempt: each leg's last report, and its conclusion.
         let r = run.to_owned();
         let (reports, legs, seq): (Vec<(String, String)>, Vec<(String, String, Option<String>, Option<String>)>, i64) = self.hub.store.call(move |c| {
@@ -1942,16 +2057,19 @@ impl Dispatch {
         }
         let changed: Option<Vec<String>> = v.get("changed").and_then(|c| serde_json::from_value(c.clone()).ok());
         let input = RunInput { github: github.clone(), inputs: v.get("inputs").cloned().unwrap_or_default(), vars: v.get("vars").cloned().unwrap_or_default(), changed: changed.map(Arc::new), trusted: v.get("trusted").and_then(serde_json::Value::as_bool).unwrap_or(false) };
-        let actions = fresh.unwrap_or_else(|| v.get("actions").and_then(|a| serde_json::from_value(a.clone()).ok()).unwrap_or_default());
+        let actions = match &dependencies {
+            Some(snapshot) => snapshot.root_actions().map_err(anyhow::Error::msg)?.clone(),
+            None => v.get("actions").and_then(|a| serde_json::from_value(a.clone()).ok()).unwrap_or_default(),
+        };
         let timing = super::results::timing(&self.hub, &repo.id).await;
         // "Run anyway" (W08-R10): no leg of this attempt takes an earlier result over; nor, run
         // cold (W24-R23), does any start from kept folders or restore a cache.
         let no_reuse = no_reuse || cold;
-        let files = Arc::new(super::reusable::files(&self.hub, &repo, &event.sha, &wf).await);
+        let files = Arc::new(match &dependencies { Some(s) => s.files.clone(), None => super::reusable::files(&self.hub, &repo, &event.sha, &wf).await });
         let tree = Arc::new(shard_files(&self.hub, &repo, &event.sha, &wf, &files).await);
         let graph = super::graphs::of_run(&self.hub, &repo, &event.sha, &wf, &files).await;
         let culprit = Try::of_input(&v);
-        let settings = serde_json::json!({ "default_permissions": v.get("default_permissions").and_then(serde_json::Value::as_str).unwrap_or("read"), "only_matrix": v.get("only_matrix"), "timing": *timing, "tree": *tree, "no_reuse": no_reuse, "graph": graph.as_deref(), "cold": cold, "culprit": culprit, "placed": placed });
+        let settings = serde_json::json!({ "default_permissions": v.get("default_permissions").and_then(serde_json::Value::as_str).unwrap_or("read"), "only_matrix": v.get("only_matrix"), "timing": *timing, "tree": *tree, "no_reuse": no_reuse, "graph": graph.as_deref(), "cold": cold, "culprit": culprit, "placed": placed, "dependency_snapshot": dependencies });
         self.save_input(run, &input, &actions, &event, (debug, keep_failed), &keep, &settings).await?;
         let (plan, acts) = match RunPlan::start(Arc::clone(&wf), input.clone(), self.settings_with(&v), &Graphed { source: Source { files: &files, timing: &timing, tree: &tree }, graph }) {
             Ok(x) => x,
@@ -1966,7 +2084,7 @@ impl Dispatch {
         let costs = super::insights::costs(&self.hub, &repo.id, &path).await;
         // A maintainer reruns it: that is approval enough, as on GitHub.
         let sup = if culprit.is_some() { None } else { sup_of(&wf, &repo, &path, &event.name, &github) };
-        let mut st = RunSt { plan, repo, event, path, created: crate::util::now_unix(), in_progress: false, files, wf, github, vars: input.vars, trusted: input.trusted, actions, keys: HashMap::new(), held: Some(acts), seq, keep, debug, keep_failed, given: Given::default(), timing: Arc::clone(&timing), tree: Arc::clone(&tree), removed: 0, costs, awaiting: None, no_reuse, who: Who::default(), sup, cold, culprit, placed };
+        let mut st = RunSt { plan, repo, event, path, created: crate::util::now_unix(), in_progress: false, files, wf, github, vars: input.vars, trusted: input.trusted, actions, dependencies, keys: HashMap::new(), held: Some(acts), seq, keep, debug, keep_failed, given: Given::default(), timing: Arc::clone(&timing), tree: Arc::clone(&tree), removed: 0, costs, awaiting: None, no_reuse, who: Who::default(), sup, cold, culprit, placed };
         st.who = who_of(&self.hub, &st).await;
         self.workflow_run(&st, "requested", None);
         self.runs.insert(run.to_owned(), st);
@@ -2202,7 +2320,7 @@ impl Dispatch {
         let reuse = super::reuse::spec_of(spec)?;
         let (repo, sha, actions, vars, trusted) = {
             let r = self.runs.get(run).filter(|r| !r.no_reuse)?;
-            (r.repo.clone(), r.event.sha.clone(), r.actions.clone(), r.vars.clone(), r.trusted)
+            (r.repo.clone(), r.event.sha.clone(), r.actions_for(spec).clone(), r.vars.clone(), r.trusted)
         };
         match super::reuse::inputs(&self.hub, &repo, &sha, spec, &reuse, &actions, &vars, trusted).await {
             Ok(inputs) => Some((kiln_ci::plan::reuse::hash(&inputs), reuse.max_age)),
@@ -2510,11 +2628,11 @@ impl Dispatch {
         }
         // An action it uses that couldn't be resolved (W07-R03) fails it as it starts, as GitHub
         // fails a job at "Set up job"; the run's other jobs go on.
-        if let Some(m) = l.spec.def().and_then(|j| unresolved(&j.steps, &r.actions)) {
+        if let Some(m) = l.spec.def().and_then(|j| unresolved(&j.steps, r.actions_for(&l.spec))) {
             return self.fail_unstarted(leg, attempt, "actions", m).await;
         }
         // KCI4031 (W07-R11): a kiln action that needs more permissions than the job grants.
-        if let Some(m) = l.spec.def().and_then(|j| short_permissions(&j.steps, &r.actions, &l.spec.permissions)) {
+        if let Some(m) = l.spec.def().and_then(|j| short_permissions(&j.steps, r.actions_for(&l.spec), &l.spec.permissions)) {
             return self.fail_unstarted(leg, attempt, "permissions", m).await;
         }
         if let Some((app, _)) = &on_github {
@@ -2632,7 +2750,7 @@ impl Dispatch {
         let mut used = spec.def().map(kiln_ci::secrets::used).unwrap_or_default();
         // A kiln action's declared secrets: the job's of that name, or the one it maps (W09-R07).
         if let Some(j) = spec.def() {
-            used.names.extend(declared_sources(&j.steps, &r.actions).into_iter().map(|(_, _, from, _)| from));
+            used.names.extend(declared_sources(&j.steps, r.actions_for(spec)).into_iter().map(|(_, _, from, _)| from));
         }
         let needed = kiln_ci::secrets::needed(&spec.secrets, &used);
         // An untrusted run gets none of the server's secrets: only those given with it (W17-R06).
@@ -2825,7 +2943,7 @@ impl Dispatch {
                 server_ca: (self.hub.cfg.server.https || self.hub.cfg.server.public_url.starts_with("https://")).then(|| self.hub.pki.ca_pem.clone()),
             },
             checkout: if wf.checkout && job.is_none_or(|j| j.kiln.checkout != Some(false)) { "auto".into() } else { "none".into() },
-            actions: r.actions.clone(),
+            actions: r.actions_for(spec).clone(),
             debug: wire::Debug { runner_debug: r.debug, step_debug: r.debug, keep_on_failure_minutes: keep_minutes(job.and_then(|j| j.kiln.debug.as_ref())).or(r.keep_failed) },
             exports_env: job.map(|j| j.kiln.exports_env.clone()).unwrap_or_default(),
             secret_outputs: job.map(|j| j.outputs.iter().filter(|o| o.secret).map(|o| o.name.clone()).collect()).unwrap_or_default(),
@@ -3197,7 +3315,8 @@ impl Dispatch {
         };
         let row = self.hub.store.run(run.to_owned()).await?.ok_or_else(|| anyhow::anyhow!("no run"))?;
         let repo = self.hub.store.repos().await?.into_iter().find(|r| r.id == row.repo_id).ok_or_else(|| anyhow::anyhow!("no repository"))?;
-        let files = Arc::new(super::reusable::files(&self.hub, &repo, &row.sha, &wf).await);
+        let dependencies = super::locks::Frozen::saved(&v, &repo.name, &wf.path, &row.sha).map_err(anyhow::Error::msg)?.map(Arc::new);
+        let files = Arc::new(match &dependencies { Some(s) => s.files.clone(), None => super::reusable::files(&self.hub, &repo, &row.sha, &wf).await });
         let timing = saved_timing(&v);
         let tree = saved_tree(&v);
         let graph = match saved_graph(&v) {
@@ -3315,7 +3434,7 @@ impl Dispatch {
         let sup = if culprit.is_some() { None } else { sup_of(&wf, &repo, &path, &event.name, &input.github) };
         // Where a person's retry asked its legs to run (W05-R28), those queued after a restart too.
         let placed = v.get("placed").and_then(|p| serde_json::from_value(p.clone()).ok()).unwrap_or_default();
-        let mut st = RunSt { plan, repo: repo.clone(), event, path, created: row.created_at, in_progress: !unapproved, files: Arc::clone(&files), wf: Arc::clone(&wf), github: input.github.clone(), vars: input.vars.clone(), trusted: input.trusted, actions, keys: HashMap::new(), held, seq, keep, debug, keep_failed, given: Given::default(), timing: Arc::clone(&timing), tree: Arc::clone(&tree), removed: 0, costs, awaiting, no_reuse: v.get("no_reuse").and_then(serde_json::Value::as_bool).unwrap_or(false), who: Who::default(), sup, cold: v.get("cold").and_then(serde_json::Value::as_bool).unwrap_or(false), culprit, placed };
+        let mut st = RunSt { plan, repo: repo.clone(), event, path, created: row.created_at, in_progress: !unapproved, files: Arc::clone(&files), wf: Arc::clone(&wf), github: input.github.clone(), vars: input.vars.clone(), trusted: input.trusted, actions, dependencies, keys: HashMap::new(), held, seq, keep, debug, keep_failed, given: Given::default(), timing: Arc::clone(&timing), tree: Arc::clone(&tree), removed: 0, costs, awaiting, no_reuse: v.get("no_reuse").and_then(serde_json::Value::as_bool).unwrap_or(false), who: Who::default(), sup, cold: v.get("cold").and_then(serde_json::Value::as_bool).unwrap_or(false), culprit, placed };
         st.who = who_of(&self.hub, &st).await;
         let mut queued = Vec::new();
         for (id, key, status, agent, attempt, leg) in legs {

@@ -314,4 +314,4 @@ impl DependencySources for Sources {
 }
 
 #[cfg(all(test, unix))]
-mod tests;
+pub(crate) mod tests;

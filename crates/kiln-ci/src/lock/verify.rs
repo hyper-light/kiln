@@ -55,6 +55,10 @@ pub struct GitFacts {
     pub reachable: BTreeSet<String>,
     /// Previously accepted resolution, from trusted persistent history.
     pub previous: Option<String>,
+    /// W29-R23: the source's actual request, retained when HEAD resolves to a named default
+    /// branch. A bare commit is still no proof of membership in a branch or tag.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub requested_ref: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -113,8 +117,9 @@ fn sha(value: &str) -> Option<String> {
     (matches!(value.len(), 40 | 64) && value.bytes().all(|b| b.is_ascii_hexdigit())).then(|| value.to_ascii_lowercase())
 }
 
-fn recorded_ref_matches(written: &str, observed: &str) -> bool {
-    ["refs/heads/", "refs/tags/"].iter().any(|prefix| observed.strip_prefix(*prefix).is_some_and(|name| !name.is_empty() && (written == observed || written == name)))
+fn recorded_ref_matches(written: &str, facts: &GitFacts) -> bool {
+    ["refs/heads/", "refs/tags/"].iter().any(|prefix| facts.reference.strip_prefix(*prefix).is_some_and(|name| !name.is_empty() && (written == facts.reference || written == name)))
+        || (written == "HEAD" && facts.requested_ref == "HEAD" && facts.reference.strip_prefix("refs/heads/").is_some_and(|b| !b.is_empty()))
 }
 
 fn exact_tag(pin: &str, facts: &GitFacts) -> bool {
@@ -173,7 +178,7 @@ pub fn check_github(check: GithubCheck<'_>) -> Result<Verified, Refused> {
         let now = sha(&facts.current);
         if !onboarded && let Some(now) = &now {
             let reference = requested.split_once('@').map(|(_, r)| r).unwrap_or_default();
-            let bound = sha(reference).map_or_else(|| recorded_ref_matches(reference, &facts.reference), |s| s == *now);
+            let bound = sha(reference).map_or_else(|| recorded_ref_matches(reference, facts), |s| s == *now);
             if !bound {
                 diagnostics.push(diag("KCI4051", check.workflow, format!("{key}: source facts do not name the requested ref"), false));
                 continue;
@@ -204,7 +209,7 @@ pub fn check_github(check: GithubCheck<'_>) -> Result<Verified, Refused> {
             diagnostics.push(diag("KCI1022", check.workflow, format!("{key}: invalid locked commit digest"), false));
             continue;
         };
-        if !recorded_ref_matches(&entry.git_ref, &facts.reference)
+        if !recorded_ref_matches(&entry.git_ref, facts)
             || now.is_none()
             || !(now.as_ref() == Some(&wanted) || facts.reachable.iter().any(|s| s.eq_ignore_ascii_case(&wanted)))
         {

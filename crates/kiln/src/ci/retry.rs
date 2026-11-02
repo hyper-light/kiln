@@ -283,7 +283,7 @@ pub async fn retry_set(hub: &Hub, run: &str, ids: &[String], by: &str) -> Result
             return Ok(json!({ "kind": "ci", "run": run, "jobs": each }));
         }
         let (tx, rx) = async_channel::bounded(1);
-        hub.ci.send(super::dispatch::Msg::Rerun { run: run.to_owned(), mode: super::dispatch::RerunMode::Set(legs), debug: false, keep_failed: None, actions: None, no_reuse: true, cold: false, placed: HashMap::new(), by: by.to_owned(), reply: tx });
+        hub.ci.send(super::dispatch::Msg::Rerun { run: run.to_owned(), mode: super::dispatch::RerunMode::Set(legs), debug: false, keep_failed: None, fresh_actions: false, no_reuse: true, cold: false, placed: HashMap::new(), by: by.to_owned(), reply: tx });
         return match crate::rt::timeout(Duration::from_secs(60), rx.recv()).await {
             Ok(Ok(Ok(attempt))) => {
                 hub.store.audit(by.to_owned(), "ci.runs.retry_jobs".into(), format!("{run}: {}", ids.join(", "))).await;
@@ -396,7 +396,7 @@ pub async fn retry(hub: &Hub, id: &str, body: &Value, by: &str) -> Result<Respon
             let mode = super::dispatch::RerunMode::Leg { job: j.job.clone().unwrap_or_default(), key: j.key.clone() };
             let placed: HashMap<String, Placement> = placement.clone().map(|p| (j.key.clone(), p)).into_iter().collect();
             let (tx, rx) = async_channel::bounded(1);
-            hub.ci.send(super::dispatch::Msg::Rerun { run: j.run.clone(), mode, debug: false, keep_failed: None, actions: None, no_reuse: true, cold: false, placed, by: by.to_owned(), reply: tx });
+            hub.ci.send(super::dispatch::Msg::Rerun { run: j.run.clone(), mode, debug: false, keep_failed: None, fresh_actions: false, no_reuse: true, cold: false, placed, by: by.to_owned(), reply: tx });
             match crate::rt::timeout(Duration::from_secs(60), rx.recv()).await {
                 Ok(Ok(Ok(attempt))) => {
                     hub.store.audit(by.to_owned(), "ci.legs.retry".into(), format!("{id}{said}")).await;

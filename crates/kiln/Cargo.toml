@@ -75,7 +75,7 @@ rust-embed = "8.13.0"
 # kiln's own operations' inputs: their JSON Schemas generated from their Rust types (`crate::ops::Input`),
 # and where an input that doesn't fit went wrong.
 schemars = "1.2.3"
-serde = { version = "1.0.229", features = ["derive"] }
+serde = { version = "1.0.229", features = ["derive", "rc"] }
 serde_json = "1.0.154"
 serde_path_to_error = "0.1.20"
 serde_yaml = "0.9.34"
