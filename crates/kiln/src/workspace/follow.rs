@@ -173,7 +173,9 @@ async fn routed(hub: &Arc<Hub>, r: &Record, v: &Value, by: &str, fixes: u32, tex
     let runs = info.as_ref().is_some_and(|i| i.status != Status::Exited);
     let name = info.map(|i| i.name).filter(|n| !n.trim().is_empty()).unwrap_or_else(|| format!("agent {}", crate::harness::lineage::short(&r.agent)));
     match decide::route(Heard { speaker, own, agents_fix, fixes, runs }) {
-        Route::Tell if speaker == Speaker::Person => {
+        // A person's words for an agent that has ended still wait for its step's plan run while that
+        // goes on, and reach the agent when it ends (`tell`).
+        Route::Tell | Route::Hold(Why::Ended) if speaker == Speaker::Person => {
             tell(hub, r, text).await;
         }
         Route::Tell => {
