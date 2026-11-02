@@ -38,6 +38,7 @@ export const ACTION_WORD: Record<string, string> = {
   retry: "Retry",
   hand_off: "Hand off",
   review: "Review",
+  ready: "Ready",
   retry_runner: "Retry runner",
 };
 

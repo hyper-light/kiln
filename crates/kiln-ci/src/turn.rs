@@ -192,6 +192,31 @@ mod tests {
         assert_eq!(turn(&[asked(KIM), Event::Draft]), Vec::<String>::new(), "back to draft clears it");
     }
 
+    /// W26-R18: a review agent asked onto a change (as the session it starts as, `agent:<id's
+    /// start>@<runner>`) joins the turn as an asked reviewer does; its reply hands the turn back to
+    /// the author; the author's push hands it to the agent again.
+    #[test]
+    fn w26_r18_an_asked_review_agent_joins_the_turn_hands_it_back_and_has_it_after_a_push() {
+        const AGENT: &str = "agent:01a19c0f@box-a";
+        assert_eq!(turn(&[asked(AGENT)]), [AGENT]);
+        assert_eq!(turn(&[asked(AGENT), replied(AGENT)]), [SAM], "its reply hands the turn back");
+        assert_eq!(turn(&[asked(AGENT), replied(AGENT), Event::Pushed { rebase_only: false }]), [AGENT], "the author's push hands it to the agent again");
+        assert_eq!(turn(&[asked(AGENT), asked(KIM), replied(AGENT), replied(SAM)]), [AGENT, KIM], "the author's answer goes to each reviewer still to approve, the agent among them");
+    }
+
+    /// W26-R18: a review agent asked onto a draft reviews it without taking the turn, as a draft has
+    /// none; once the draft is marked ready, the agent joins the turn.
+    #[test]
+    fn w26_r18_a_review_agent_asked_onto_a_draft_joins_the_turn_once_it_is_ready() {
+        const AGENT: &str = "agent:01a19c0f@box-a";
+        let draft = [Event::Draft, asked(AGENT), replied(AGENT)];
+        let t = fold(SAM, &draft);
+        assert!(t.turn.is_empty() && t.reviewers.contains(AGENT), "no turn while it's a draft, though it's asked: {t:?}");
+        let mut ready = draft.to_vec();
+        ready.push(Event::Ready);
+        assert_eq!(turn(&ready), [AGENT], "marked ready, the agent's turn");
+    }
+
     #[test]
     fn w26_r05_a_removed_reviewer_leaves_the_turn() {
         let t = fold(SAM, &[asked(KIM), asked(LEE), Event::Removed(KIM.into())]);

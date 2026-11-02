@@ -17,7 +17,7 @@ export interface AttachmentRow {
 }
 
 /** What wakes one that looks after code; one that looks after runners. */
-export const WAKES_CODE = ["failure", "flaky", "ejected", "stuck", "slow", "unroutable", "degraded", "mention", "schedule"] as const;
+export const WAKES_CODE = ["failure", "flaky", "ejected", "stuck", "slow", "unroutable", "degraded", "mention", "review", "schedule"] as const;
 export const WAKES_RUNNERS = ["offline", "upgrade", "check", "schedule"] as const;
 /** What its agent may do beyond reading what it looks after (W20-R09). */
 export const CAN = ["rerun", "cancel", "diagnose", "fix", "edit-pipelines", "quarantine", "comment", "experiment", "manage-runners", "deploy", "land"] as const;

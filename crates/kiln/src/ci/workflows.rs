@@ -374,7 +374,7 @@ async fn on_host(hub: &Arc<Hub>, caller: &Caller, repo: &Repo, host: &crate::git
     }
     let body = format!("{title}, saved in kiln's workflow editor by {}.", caller.name);
     let opened =
-        host.open_change(hub, repo, &branch, &default, title, &body).await.map_err(|e| (StatusCode::BAD_GATEWAY, format!("the branch {branch} is saved, but its change wasn't opened: {e:#}")))?;
+        host.open_change(hub, repo, &branch, &default, title, &body, false).await.map_err(|e| (StatusCode::BAD_GATEWAY, format!("the branch {branch} is saved, but its change wasn't opened: {e:#}")))?;
     Ok(json!({ "branch": branch, "sha": sha, "change": { "number": opened.number, "url": opened.url } }))
 }
 

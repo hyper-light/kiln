@@ -377,8 +377,8 @@
 .rv-s[tabindex="-1"]:focus {
   outline: none;
 }
-/* The Conversation's head: its label, and the agent fixes switch on its right (Ship's mockups
-   plan, step 13); everything else under them, full width. */
+/* The Conversation's head: its label, and the repository's agent fixes on its right (Ship's mockups
+   plan, step 13; W26-R18), read here, a link to where it's set; everything else under them, full width. */
 .rv-s-convo {
   display: grid;
   grid-template-columns: minmax(0, 1fr) auto;
@@ -400,7 +400,11 @@
   font-family: var(--mono, ui-monospace, monospace);
   font-size: 11px;
   letter-spacing: 0.03em;
+  text-decoration: none;
   cursor: pointer;
+}
+.rv-switch:hover {
+  color: #c9ccd3;
 }
 .rv-switch i {
   position: relative;
@@ -421,14 +425,13 @@
   background: #c9ccd3;
   transition: transform 0.2s;
 }
-.rv-switch[aria-checked="true"] i {
+.rv-switch[data-on] i {
   background: #7fb5a0;
 }
-.rv-switch[aria-checked="true"] i::after {
+.rv-switch[data-on] i::after {
   transform: translateX(12px);
 }
-.rv-switch:disabled {
-  cursor: not-allowed;
+.rv-switch[data-unread] {
   opacity: 0.55;
 }
 .rv-h {
@@ -850,6 +853,14 @@
   align-items: center;
   padding: 8px 8px 8px 16px;
 }
+/* What came of an open thread (W26-R18): fixed in a version, or waiting for a person. */
+.rv-fix {
+  margin-left: auto;
+  font-size: 12px;
+}
+.rv-fix[data-waits] {
+  color: var(--color-warn);
+}
 .rv-done {
   display: inline-flex;
   gap: 6px;
@@ -889,11 +900,19 @@
   align-items: center;
   min-width: 0;
 }
-/* The signature's shield: dim while unsigned (comments are signed from W27-R03). */
+/* An agent's person, after its name: the agent for kim (W26-R18). */
+.rv-for {
+  color: var(--color-secondary);
+}
+/* The signature's shield: whole once signed (W27-R04), dim while unsigned; its title says who
+   signed it. */
 .rv-seal {
   display: inline-flex;
   color: #8fb5a6;
   opacity: 0.55;
+}
+.rv-seal[data-signed] {
+  opacity: 1;
 }
 /* The kind's chip in a comment's line: its icon alone. */
 .rv-k.rv-ki {
