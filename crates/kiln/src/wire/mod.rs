@@ -329,6 +329,9 @@ classes! {
         Command::MoveOnLimit { .. } => REFUSED,
         Command::LimitHold { .. } => REFUSED,
         Command::OwnEdits { .. } => Class::Ask,
+        Command::Pause { .. } => REFUSED,
+        Command::Perms { .. } => REFUSED,
+        Command::Branch { .. } => REFUSED,
     }
 }
 

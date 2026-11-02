@@ -676,3 +676,50 @@
   display: flex;
   margin-top: 3px;
 }
+
+/* ---------------------------------------------------------------- a step's agent, live under it */
+/* Who it is and how long (its thread opens there), then what it's at, or what it asks and the answer. */
+.gp-who {
+  color: #7d818b;
+  text-decoration: none;
+}
+.gp-who:hover {
+  color: #c9cbd1;
+}
+.gp-live {
+  overflow: hidden;
+  color: #a7a9b1;
+  font-size: 11.5px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.gp-live[data-ask] {
+  color: #ece0ca;
+  font-family: var(--font-mono);
+  font-size: 11px;
+}
+.gp-acts {
+  display: flex;
+  gap: 8px;
+  margin-top: 6px;
+}
+/* A step that needs you: its stretch of the path tan, on the branch or on the goal's line. */
+.gp-row[data-lane="branch"][data-stand="needs_you"]::before {
+  left: 42px;
+  width: 2px;
+  background: #c6b08e;
+}
+.gp-row[data-lane="main"][data-stand="needs_you"]::after {
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  left: 10px;
+  width: 2px;
+  background: #c6b08e;
+  content: "";
+}
+/* Its mark over its stretch of the line. */
+.gp-row[data-stand="needs_you"] .gp-glyph {
+  position: relative;
+  z-index: 1;
+}

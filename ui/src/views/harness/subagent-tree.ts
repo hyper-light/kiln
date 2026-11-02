@@ -1,0 +1,419 @@
+/**
+ * An agent's subagents as one tree, wherever it's drawn (under its row in Mission control, by the
+ * composer): the subagents kiln started for it (sessions of their own whose `parent` it is, and
+ * theirs in turn) and its harness's own (`SubagentBrief`, nested by `parent_task`), in the order
+ * they started. Each says where it stands, what it's doing or said it did, what it asks, and where
+ * its thread opens; each row has its piece of the path that draws the tree: the lines passing by
+ * it (an ancestor's, on to that one's next), the line or curve into its mark, and the line on from
+ * it. While it needs you, its own piece is tan.
+ */
+import type { AgentInfo, Approval, ApprovalBrief, HEvent, SubagentBrief, Task } from "@/api/harness";
+import type { Grant } from "@/api/wire/Grant";
+import type { Perms } from "@/api/wire/Perms";
+import { agentLabel, plain } from "./derive";
+import { standOf } from "./mission-rows";
+import { askWords, isSubagent, kilnSubagentsOf } from "./tasks";
+import type { StepLive } from "./goal-plan-layout";
+
+/** Its machine, as Mission control's rows name it (parts.tsx's `machineName`; that module brings the page's styles with it). */
+const machineName = (target: string) => (target === "local" ? "server" : target.replace(/^agent:/, ""));
+
+/** Where a subagent stands, as its row says it. */
+export type NodeStand = "working" | "needs" | "paused" | "done" | "failed" | "stopped" | "offline";
+
+export const NODE_WORD: Record<NodeStand, string> = {
+  working: "Working",
+  needs: "Needs you",
+  paused: "Paused",
+  done: "Done",
+  failed: "Failed",
+  stopped: "Stopped",
+  offline: "Offline",
+};
+
+/** One subagent, as the tree draws it. */
+export interface SubagentNode {
+  /** Unique in the tree: a kiln subagent's session id; a harness subagent's session and task. */
+  key: string;
+  /** A session of its own (kiln's), or its harness's own subagent: a task of `session`. */
+  kind: "kiln" | "harness";
+  /** The session it is (kiln's), or whose task it is: where what's sent to it, and its answers, go. */
+  session: string;
+  /** Its task's id in `session` (its harness's own). */
+  task?: string;
+  /** Its parent's key; null under the agent itself. */
+  parent: string | null;
+  depth: number;
+  name: string;
+  stand: NodeStand;
+  /** What it's doing now, what it asks, or what it said it did, in a line. */
+  line: string;
+  /** Its line is a request's command or words (drawn in the mono face, as Mission control's are). */
+  mono: boolean;
+  /** The request it waits on. */
+  ask?: ApprovalBrief;
+  machine: string;
+  harness: string;
+  started: number;
+  ended?: number;
+  /** Where its thread opens: its agent's page, it shown there. */
+  href: string;
+  /** A person paused it: its own pause, or one over it (its processes', or its harness's hold on a subagent above it). */
+  paused?: "own" | "above";
+  /** A person can pause it from here, or resume its own pause: it goes, its harness can hold it, and no pause over it holds it. */
+  pausable: boolean;
+  /** What a person lets it do, its own (`Perms`): never more than `over`. */
+  perms?: Perms;
+  /** What what it's under lets it do (its parent's, as narrowed): none, no limits. */
+  over?: Perms;
+  /** A person branched it from another (`variant_of`). */
+  variant?: boolean;
+}
+
+const RANK: Record<Grant, number> = { off: 0, ask: 1, allow: 2 };
+
+/** `mine`, never more than `up` lets (model.rs `Perms::narrow`, `Perms::within`): the narrower grant of each kind, the folder inside `up`'s, the smaller limits. */
+export function within(mine: Perms | undefined, up: Perms | undefined): Perms | undefined {
+  if (!mine || !up) return mine ?? up;
+  const least = <T extends number>(a: T | undefined, b: T | undefined) => (a != null && b != null ? (Math.min(a, b) as T) : (a ?? b));
+  const lower = (a: Grant, b: Grant): Grant => (RANK[a] <= RANK[b] ? a : b);
+  const trim = (f: string | undefined) => f?.replace(/\/+$/, "");
+  const [f, g] = [trim(mine.folder), trim(up.folder)];
+  return {
+    read: lower(mine.read, up.read),
+    edit: lower(mine.edit, up.edit),
+    run: lower(mine.run, up.run),
+    web: lower(mine.web, up.web),
+    folder: g == null ? f : f != null && (f === g || f.startsWith(`${g}/`)) ? f : g,
+    minutes: least(mine.minutes, up.minutes),
+    tokens: least(mine.tokens, up.tokens),
+  };
+}
+
+/** A grant `up` doesn't let (wider than its): not offered. */
+export const wider = (g: Grant, up: Grant | undefined) => up != null && RANK[g] > RANK[up];
+
+/** A row's piece of the path along one lane: from its top or its mark, to its mark or its bottom. */
+export interface Piece {
+  lane: number;
+  from: "top" | "mark";
+  to: "mark" | "bottom";
+  hot: boolean;
+}
+
+/** A row's piece of the tree: its lanes' lines, the curve into its mark from its parent's lane (a first child's), its mark's lane. */
+export interface RowPath {
+  lane: number;
+  pieces: Piece[];
+  curve: { from: number; to: number; hot: boolean } | null;
+}
+
+export type SubagentRow = SubagentNode & { path: RowPath };
+
+/**
+ * A harness's own subagent: as the agents list has it (what it's doing, never what it reported:
+ * `SubagentBrief::of`), or from its agent's live state, which also has its harness's summary of it.
+ */
+export type Brief = SubagentBrief & { summary?: string };
+
+/** A harness's own subagents from a live state's tasks, as the list has them and with their summaries. */
+export function briefsOf(tasks: readonly Task[]): Brief[] {
+  return tasks.filter(isSubagent).map((t) => ({
+    id: t.id,
+    tool_id: t.tool_id,
+    description: t.description,
+    status: t.status,
+    parent_task: t.parent_task,
+    started: t.started,
+    ended: t.ended,
+    last_tool: t.last_tool,
+    pausable: t.pausable,
+    paused_at: t.paused_at,
+    perms: t.perms,
+    summary: t.summary,
+  }));
+}
+
+/**
+ * The agent as its own page has it now: its own harness's subagents and requests from its live
+ * state (with what each said), less what you answered here (`done`, answered.ts); the rest as the
+ * list has it.
+ */
+export function liveRoot(base: AgentInfo, tasks: readonly Task[], approvals: readonly Approval[], done: ReadonlyMap<string, number>): AgentInfo {
+  return {
+    ...base,
+    subagents: briefsOf(tasks),
+    approvals: approvals.filter((p) => !done.has(p.id)).map((p) => ({ id: p.id, tool: p.tool, tool_name: p.tool_name, title: p.title, at: p.at, agent: p.agent ?? undefined })),
+  };
+}
+
+/** It can take a message: it hasn't ended. */
+export const takesMessage = (n: Pick<SubagentNode, "stand">) => n.stand !== "done" && n.stand !== "failed" && n.stand !== "stopped";
+
+/** Its harness's own subagent's request: one that names it (by its task, its spawning call or what it was sent to do). */
+const askOf = (approvals: readonly ApprovalBrief[], b: Brief): ApprovalBrief | undefined =>
+  approvals.find((p) => p.agent != null && (p.agent === b.id || p.agent === b.tool_id || p.agent === b.description));
+
+function harnessStand(b: Brief, ask: ApprovalBrief | undefined, paused: boolean): NodeStand {
+  if (ask) return "needs";
+  switch (b.status) {
+    case "completed":
+      return "done";
+    case "failed":
+      return "failed";
+    case "stopped":
+    case "killed":
+      return "stopped";
+    default:
+      // Running, waiting to start, or paused for a request already answered; or held by a person's pause.
+      return paused ? "paused" : "working";
+  }
+}
+
+function kilnStand(a: AgentInfo, paused = false): NodeStand {
+  if (paused && a.status !== "exited") return "paused";
+  switch (standOf(a, undefined)) {
+    case "needs":
+      return "needs";
+    case "crashed":
+      return a.exit?.error ? "failed" : "stopped";
+    case "paused":
+      return "paused";
+    case "working":
+      return "working";
+    case "offline":
+      return "offline";
+    default:
+      return "done";
+  }
+}
+
+function kilnLine(a: AgentInfo, stand: NodeStand): string {
+  const ap = a.approvals[0];
+  if (stand === "needs") return ap ? askWords(ap) : "Waiting for you";
+  if (stand === "done") return a.summary ? plain(a.summary) : a.goal || a.title || "";
+  if (stand === "failed" || stand === "stopped") return a.exit?.error ?? "";
+  if (stand === "offline") return "Its machine is offline";
+  return a.doing || a.activity || "";
+}
+
+/** An agent at a plan's step, as the step shows it (goal-plan-layout.ts `StepLive`): what it's doing or asks, since when, and where its thread opens. */
+export function stepLive(a: AgentInfo, href: string): StepLive {
+  const stand = kilnStand(a);
+  return { line: kilnLine(a, stand), ask: stand === "needs" ? a.approvals[0] : undefined, started: a.turn_started ?? a.created_at, href, session: a.id };
+}
+
+/** Where a subagent's thread opens: its agent's page, it shown there (`own`: a kiln subagent's own page, not redirected into its agent's). */
+export function threadHref(root: string, owner: string, id: string): string {
+  return owner === root ? `/agents/${root}?task=${encodeURIComponent(id)}` : `/agents/${owner}?own=1&task=${encodeURIComponent(id)}`;
+}
+
+/**
+ * The subagents of `root`, in tree order: under each, those it started, kiln's and its harness's
+ * own together in the order they started. `list` is every agent kiln runs (its kiln subagents and
+ * theirs are found there); `root` may carry its live state's subagents and requests (`briefsOf`).
+ */
+export function subagentTree(root: AgentInfo, list: readonly AgentInfo[]): SubagentNode[] {
+  const out: SubagentNode[] = [];
+  const seen = new Set<string>();
+  // `above`: a person paused something over these (the session they're in, a subagent they're under).
+  // `over`: what the session they're in lets them (its perms, as narrowed by those over it).
+  const walk = (owner: AgentInfo, parent: string | null, depth: number, above: boolean, over: Perms | undefined) => {
+    const briefs: Brief[] = (owner.subagents ?? []).filter((b) => !list.some((a) => a.id === b.id && a.subagent === true));
+    const ids = new Set(briefs.map((b) => b.id));
+    const harness = (under: string | undefined) => briefs.filter((b) => (under ? b.parent_task === under : !b.parent_task || !ids.has(b.parent_task)));
+    const place = (b: Brief, parentKey: string | null, d: number, pausedOver: boolean, permsOver: Perms | undefined) => {
+      const key = `${owner.id}/${b.id}`;
+      if (seen.has(key)) return;
+      seen.add(key);
+      const ask = askOf(owner.approvals, b);
+      const own = b.paused_at != null;
+      const stand = harnessStand(b, ask, own || pausedOver);
+      // What it's at: its harness's summary of it where the live state has one (Claude Code's progress, or what it reported), else its last tool.
+      const line = ask ? askWords(ask) : stand === "done" ? (b.summary ?? "") : b.summary || b.last_tool || "";
+      out.push({
+        key,
+        kind: "harness",
+        session: owner.id,
+        task: b.id,
+        parent: parentKey,
+        depth: d,
+        name: b.description || "Subagent",
+        stand,
+        line,
+        mono: !!ask,
+        ask,
+        machine: machineName(owner.target),
+        harness: owner.kind_name,
+        started: b.started,
+        ended: b.ended,
+        href: threadHref(root.id, owner.id, b.id),
+        paused: own ? "own" : pausedOver ? "above" : undefined,
+        pausable: !!b.pausable && !pausedOver,
+        perms: b.perms,
+        over: permsOver,
+      });
+      for (const c of harness(b.id).sort((x, y) => x.started - y.started)) place(c, key, d + 1, pausedOver || own, within(b.perms, permsOver));
+    };
+    const kiln = kilnSubagentsOf(list, owner.id);
+    const items = [
+      ...harness(undefined).map((b) => ({ at: b.started, go: () => place(b, parent, depth, above, over) })),
+      ...kiln.map((a) => ({
+        at: a.created_at,
+        go: () => {
+          if (seen.has(a.id) || a.id === root.id) return;
+          seen.add(a.id);
+          const own = a.frozen != null;
+          const stand = kilnStand(a, own || above);
+          const line = kilnLine(a, stand);
+          out.push({
+            key: a.id,
+            kind: "kiln",
+            session: a.id,
+            parent,
+            depth,
+            name: agentLabel(a),
+            stand,
+            line,
+            mono: stand === "needs",
+            ask: a.approvals[0],
+            machine: machineName(a.target),
+            harness: a.kind_name,
+            started: a.turn_started ?? a.created_at,
+            ended: stand === "done" || stand === "failed" || stand === "stopped" ? a.last_activity : undefined,
+            href: threadHref(root.id, owner.id, a.id),
+            paused: own ? "own" : above ? "above" : undefined,
+            pausable: a.status !== "exited" && !above,
+            perms: a.perms,
+            over,
+            variant: a.variant_of != null,
+          });
+          walk(a, a.id, depth + 1, above || own, within(a.perms, over));
+        },
+      })),
+    ].sort((x, y) => x.at - y.at);
+    for (const it of items) it.go();
+  };
+  walk(root, null, 0, root.frozen != null, root.perms);
+  return out;
+}
+
+/** The agent at the top of one's line: its parent, that one's, and so on, while each is a subagent kiln started whose parent is there. */
+export function topOf(list: readonly AgentInfo[], id: string): AgentInfo | undefined {
+  let at = list.find((a) => a.id === id);
+  const seen = new Set<string>();
+  while (at?.subagent && at.parent && !seen.has(at.id)) {
+    seen.add(at.id);
+    const up: AgentInfo | undefined = list.find((a) => a.id === at?.parent);
+    if (!up) break;
+    at = up;
+  }
+  return at;
+}
+
+/** One name on a thread's path: where its thread opens. */
+export interface Crumb {
+  key: string;
+  name: string;
+  href: string;
+}
+
+/**
+ * A subagent's whole path, for its thread's crumbs: the agent at the top (its main thread), each
+ * subagent it's under, then it (`key`, in `nodes`: the top's tree). Null when it isn't in the tree.
+ */
+export function threadCrumbs(top: AgentInfo, nodes: readonly SubagentNode[], key: string): Crumb[] | null {
+  const byKey = new Map(nodes.map((n) => [n.key, n]));
+  const line: SubagentNode[] = [];
+  for (let n = byKey.get(key); n && !line.includes(n); n = n.parent == null ? undefined : byKey.get(n.parent)) line.unshift(n);
+  if (line.length === 0) return null;
+  return [{ key: top.id, name: agentLabel(top), href: `/agents/${top.id}` }, ...line.map((n) => ({ key: n.key, name: n.name, href: n.href }))];
+}
+
+/**
+ * A subagent's thread: who started it (its parent: its name, and where its thread opens), whether
+ * your messages reach it by way of that one (`Task.via`), and how it ended, once it has.
+ */
+export interface ThreadFrom {
+  name: string;
+  href: string;
+  /** Your messages reach it by way of its parent, which passes them on. */
+  via: boolean;
+  /** A session of its own (one kiln started): its parent's id, which what its parent sent it carries (queued.rs `from_agent`). */
+  session?: string;
+  /** Done, failed or stopped: its word, and when. */
+  end?: { stand: NodeStand; word: string; at?: number };
+  /** A finished variant: Keep sends its parent (`to`) these words. */
+  keep?: { to: string; text: string };
+}
+
+/**
+ * What Keep on a finished variant (`variant_of`) sends its parent: to use its result in place of
+ * the one it varied, and how to read it whole. None: it isn't a variant, or has no parent.
+ */
+export function keepOf(v: AgentInfo, list: readonly AgentInfo[]): { to: string; text: string } | undefined {
+  if (!v.variant_of || !v.parent) return undefined;
+  const [session, task] = v.variant_of.split("/");
+  const owner = list.find((a) => a.id === session);
+  const of = task ? owner?.subagents?.find((b) => b.id === task)?.description : owner && agentLabel(owner);
+  const name = agentLabel(v);
+  return { to: v.parent, text: `Keep “${name}”, the variant of “${of ?? v.variant_of}”: use its result in place of that one's. Read it whole with agents_result (${v.id}).` };
+}
+
+/** Its thread's `ThreadFrom`, from its path (`crumbs`, it last) and its node in the tree (`here`). */
+export function threadFrom(crumbs: readonly Crumb[], here: SubagentNode | undefined, o: { via?: string | null; session?: string }): ThreadFrom | null {
+  const up = crumbs.at(-2);
+  if (!up) return null;
+  const end = here && !takesMessage(here) ? { stand: here.stand, word: NODE_WORD[here.stand], at: here.ended } : undefined;
+  return { name: up.name, href: up.href, via: o.via === "parent", session: o.session, end };
+}
+
+/**
+ * A message its parent wrote it. In a session of its own: its first (its brief), and what its
+ * parent sent it. In its harness's own subagent's thread: one kiln didn't send (its brief, what its
+ * agent sent it; Claude Code's are "system").
+ */
+export function parentWrote(from: ThreadFrom, e: Extract<HEvent, { kind: "user" }>, first: boolean): boolean {
+  if (from.session) return first || (e.client_id?.startsWith(`from-agent-${from.session}-`) ?? false);
+  return !e.client_id && e.origin !== "human";
+}
+
+/** Each row's piece of the path, drawn from its place among the rows (`nodes`, in tree order). */
+export function treePaths(nodes: readonly SubagentNode[]): RowPath[] {
+  const byKey = new Map(nodes.map((n) => [n.key, n]));
+  const kids = new Map<string | null, SubagentNode[]>();
+  for (const n of nodes) kids.set(n.parent, [...(kids.get(n.parent) ?? []), n]);
+  const sibling = (n: SubagentNode, by: number): SubagentNode | undefined => {
+    const s = kids.get(n.parent) ?? [];
+    return s[s.indexOf(n) + by];
+  };
+  return nodes.map((n) => {
+    const hot = n.stand === "needs";
+    const pieces: Piece[] = [];
+    // Its ancestors' lanes pass by it on to their next ones.
+    const line: SubagentNode[] = [];
+    for (let p = n.parent; p != null; p = byKey.get(p)?.parent ?? null) {
+      const a = byKey.get(p);
+      if (!a) break;
+      line.unshift(a);
+    }
+    line.forEach((a, k) => {
+      if (sibling(a, 1)) pieces.push({ lane: k, from: "top", to: "bottom", hot: false });
+    });
+    const d = line.length;
+    // Into its mark: a first child's curve from its parent's lane, else the line down its own.
+    let curve: RowPath["curve"] = null;
+    if (d > 0 && !sibling(n, -1)) curve = { from: d - 1, to: d, hot };
+    else pieces.push({ lane: d, from: "top", to: "mark", hot });
+    // On from it: to its next, or to its own first.
+    if (sibling(n, 1) || (kids.get(n.key)?.length ?? 0) > 0) pieces.push({ lane: d, from: "mark", to: "bottom", hot });
+    return { lane: d, pieces, curve };
+  });
+}
+
+/** The tree's rows: each subagent with its piece of the path. */
+export function subagentRows(root: AgentInfo, list: readonly AgentInfo[]): SubagentRow[] {
+  const nodes = subagentTree(root, list);
+  const paths = treePaths(nodes);
+  return nodes.map((n, i) => ({ ...n, path: paths[i] ?? { lane: n.depth, pieces: [], curve: null } }));
+}

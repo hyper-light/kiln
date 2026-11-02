@@ -12,6 +12,7 @@ import type { McpServer } from "./McpServer";
 import type { MovePlan } from "./MovePlan";
 import type { Objective } from "./Objective";
 import type { Pause } from "./Pause";
+import type { Perms } from "./Perms";
 import type { Plugin } from "./Plugin";
 import type { QueueItem } from "./QueueItem";
 import type { SessionStatus } from "./SessionStatus";
@@ -234,4 +235,14 @@ kept?: number,
  * each with a digest of the words it had then, the newest last: what the server judges its
  * words by, said in the same state as its queue (CP-T3.2, the fourteenth adversarial check's).
  */
-given?: Array<Given>, };
+given?: Array<Given>, 
+/**
+ * A person paused it (unix ms, `Command::Pause`): its processes stopped where they are, held
+ * by its machine's pacer (`crate::headroom::pause`) until they resume it.
+ */
+frozen?: number, 
+/**
+ * What a person lets it do (`Command::Perms`): every call of its own and of its harness's
+ * subagents, within its parent's (the server narrows it so).
+ */
+perms?: Perms, };

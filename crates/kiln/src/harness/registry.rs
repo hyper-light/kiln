@@ -2011,6 +2011,8 @@ impl Registry {
                         left_behind: 0,
                         reach: spec.reach.clone(),
                         pause: None,
+                        frozen: None,
+                        perms: None,
                         room_wait: None,
                         last_turn: None,
                         keep_off: false,
@@ -2024,6 +2026,7 @@ impl Registry {
                         plan_run: spec.plan_run.clone(),
                         helper: spec.helper.clone(),
                         subagent: spec.subagent,
+                        variant_of: spec.variant_of.clone(),
                         no_bypass: !spec.allow_bypass,
                         workspace: spec.workspace.clone(),
                     };
@@ -2341,6 +2344,35 @@ impl Registry {
     /// message) its inbox's answer to wait for ([`Registry::settle`]), so a sender that goes on
     /// meanwhile (a viewer's socket) waits for nothing.
     pub async fn dispatch(&self, hub: &Hub, id: &str, c: Command) -> Pending {
+        // A person's pause of a session holds the subagents kiln started under it too, and resuming
+        // it lets them go: each still going is sent its own, its answer not waited for.
+        if let Command::Pause { on, task: None } = &c {
+            let all = self.list();
+            for sub in super::lineage::subagents_under(&all, id) {
+                if all.iter().any(|i| i.id == sub && i.status != Status::Exited) {
+                    let _ = Box::pin(self.dispatch_one(hub, &sub, Command::Pause { on: *on, task: None })).await;
+                }
+            }
+        }
+        // What a person lets a session do: never more than its parent's, and the subagents kiln
+        // started under it narrowed by it, each sent its own.
+        if let Command::Perms { perms, task: None } = &c {
+            let all = self.list();
+            let mut mine = None;
+            for (sid, p) in super::lineage::perms_down(&all, id, perms.as_ref()) {
+                if sid == id {
+                    mine = Some(p);
+                } else if all.iter().any(|i| i.id == sid && i.status != Status::Exited) {
+                    let _ = Box::pin(self.dispatch_one(hub, &sid, Command::Perms { perms: p, task: None })).await;
+                }
+            }
+            return Box::pin(self.dispatch_one(hub, id, Command::Perms { perms: mine.flatten(), task: None })).await;
+        }
+        Box::pin(self.dispatch_one(hub, id, c)).await
+    }
+
+    /// [`Registry::dispatch`], to session `id` alone.
+    async fn dispatch_one(&self, hub: &Hub, id: &str, c: Command) -> Pending {
         let Some(loc) = self.location(id) else { return Pending::Now(Sent::NoSession) };
         // Kiln's own (`goals::keep`), kept here: its harness has nothing to do with it.
         if let Command::Control { id: control, value } = &c
