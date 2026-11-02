@@ -342,6 +342,16 @@ fn w29_r04_the_pane() -> anyhow::Result<()> {
     git(&home, &work, &["push", "-q", "origin", "main", "v1.0.0"])?;
     let head = git(&home, &work, &["rev-parse", "HEAD"])?.trim().to_owned();
 
+    // W29-R04: the action mirror already has a floating tag. A later release at a different
+    // commit must not be mistaken for what this workflow's v4 resolves to. Opening the pane
+    // reads these local facts without fetching the action.
+    git(&home, &work, &["tag", "v4", &tagged])?;
+    git(&home, &work, &["tag", "v4.2.3", &tagged])?;
+    git(&home, &work, &["tag", "v4.2.4", &head])?;
+    let mirrors = dir.path().join("data/actions");
+    std::fs::create_dir_all(&mirrors)?;
+    git(&home, &mirrors, &["clone", "-q", "--bare", &work.to_string_lossy(), "actions__checkout.git"])?;
+
     // The two workflows' Triggers: 46 lines between them, each with its group and words.
     let (st, gha) = pane(&s, &s.admin, ".github/workflows/every.yml", None)?;
     anyhow::ensure!(st == 200, "the GitHub workflow's pane: {st} {gha}");
@@ -352,6 +362,8 @@ fn w29_r04_the_pane() -> anyhow::Result<()> {
     assert!(lines.iter().all(|l| !field(l, "name").is_empty() && !field(l, "group").is_empty()), "{lines:?}");
     assert_eq!((at(&gha, "/head/title"), at(&gha, "/head/commit"), at(&gha, "/head/kind")), ("every event, renamed", head.as_str(), "reusable"), "{gha}");
     assert!(gha.pointer("/head/draft").is_some_and(Value::is_null));
+    let checkout = group(&gha, "Uses").into_iter().find(|l| field(l, "name") == "actions/checkout@v4");
+    assert_eq!(checkout.map(|l| field(l, "value")), Some(format!("fetched by name · 4.2.3 · {}", tagged.get(..7).unwrap_or_default()).as_str()), "{gha}");
     // A reusable workflow's interface: its workflow_call inputs, outputs and secrets.
     let call: Vec<(&str, &str)> = group(&gha, "Called with").iter().map(|l| (field(l, "kind"), field(l, "name"))).collect();
     assert_eq!(call, [("input", "toolchain"), ("output", "built"), ("secret", "TOKEN")], "{gha}");

@@ -1689,6 +1689,10 @@
 .ppl-kinds .ppl-lines li {
   padding: 0;
 }
+/* W29-R06, pl-9: all 18 kinds fit the held desktop detail; the six lists need no extra gutters. */
+.ppl-kinds .ppl-lines {
+  padding: 2px 0;
+}
 /* Whose a kind is stays whole; its words give way first. */
 .ppl-kind .v {
   flex: none;

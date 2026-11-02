@@ -564,6 +564,17 @@ pub fn newest_release<'a>(tags: impl IntoIterator<Item = &'a str>) -> Option<&'a
     releases(tags).into_iter().next()
 }
 
+/// W29-R04, pl-2: the full release at a floating tag's commit, and that commit. `tags` must be
+/// the tags pointing at that exact commit, not the repository's newest releases elsewhere.
+pub fn floating_words<'a>(git_ref: &str, tags: impl IntoIterator<Item = &'a str>, sha: &str) -> Option<String> {
+    if !matches!(crate::releases::kind_of(git_ref), crate::releases::TagKind::Floating) || sha.is_empty() {
+        return None;
+    }
+    let prefix = format!("{}.", git_ref.strip_prefix('v').unwrap_or(git_ref));
+    let tag = newest_release(tags.into_iter().filter(|t| t.strip_prefix('v').unwrap_or(t).starts_with(&prefix)))?;
+    Some(format!("{} · {}", tag.strip_prefix('v').unwrap_or(tag), sha.get(..7).unwrap_or(sha)))
+}
+
 /// Which of two rows comes first in W29-R02's order: what needs someone first (Review, then
 /// Failing, then Can't run), then drafts, then the rest; each by name (any case), then by path.
 fn before(fa: &Facts, sa: &Standing, fb: &Facts, sb: &Standing) -> Ordering {
@@ -953,6 +964,34 @@ pub struct RunSeen {
     pub sha: String,
     pub at: i64,
     pub failed: Vec<String>,
+    /// What started it, when its event names something beyond its commit (pl-8).
+    pub subject: Option<String>,
+}
+
+/// W29-R04, pl-8: a run by what started it. Only event metadata is read, never input values or
+/// the rest of a comment. Without enough metadata its line falls back to its commit.
+pub fn run_subject(event: &str, payload: &serde_json::Value) -> Option<String> {
+    let text = |p| payload.pointer(p).and_then(serde_json::Value::as_str).filter(|s| !s.is_empty());
+    match event {
+        "deploy" => {
+            let state = text("/kiln/deploy/state")?;
+            let op = payload.pointer("/kiln/deploy/operation/id").and_then(serde_json::Value::as_i64);
+            Some(op.map_or_else(|| format!("{} {state}", text("/kiln/deploy/app").unwrap_or("deploy")), |n| format!("#{n} {state}")))
+        }
+        "schedule" => {
+            let cron = text("/schedule")?;
+            let mut parts = cron.split_whitespace();
+            let minute = parts.next().and_then(|s| s.parse::<u8>().ok()).filter(|m| *m < 60);
+            let hour = parts.next().and_then(|s| s.parse::<u8>().ok()).filter(|h| *h < 24);
+            Some(match (hour, minute) { (Some(h), Some(m)) => format!("{h:02}:{m:02}"), _ => cron.to_owned() })
+        }
+        "comment" | "issue_comment" => {
+            let command = text("/comment/body")?.split_whitespace().next().filter(|s| s.starts_with('/') && s.len() <= 100)?;
+            let n = payload.pointer("/issue/number").or_else(|| payload.pointer("/pull_request/number")).and_then(serde_json::Value::as_i64)?;
+            Some(format!("{command} on #{n}"))
+        }
+        _ => None,
+    }
 }
 
 /// What kiln has seen of a workflow beyond its text, for its lines' words as the approved stills
@@ -1115,7 +1154,8 @@ fn outcome_glyph(outcome: Option<Outcome>, running: bool) -> &'static str {
     }
 }
 
-/// A workflow's groups (W29-R04): Triggers, its stages, Uses, Secrets and variables (names only),
+/// A workflow's groups (W29-R04): Triggers, its stages (Jobs for one stage containing a call), Uses,
+/// Secrets and variables (names only, when used),
 /// Runs, Settings, and a reusable workflow's interface; with `sharing`, a reusable workflow's Used
 /// by and its Access in Settings (W29-R17, R20).
 pub fn workflow_groups(w: &Workflow, text: &str, runs: &[RunSeen], runs_here: bool, note: &str, sharing: Option<&Sharing<'_>>, seen: &Seen) -> Vec<PaneGroup> {
@@ -1144,9 +1184,11 @@ pub fn workflow_groups(w: &Workflow, text: &str, runs: &[RunSeen], runs_here: bo
         lines.extend(call.secrets.iter().map(|x| Line::new(format!("call.secrets.{}", x.name), "secret", x.name.clone(), if x.required { "required" } else { "optional" })));
         out.push(group("Called with", lines));
     }
-    for (i, ids) in stages(w).iter().enumerate() {
+    let stages = stages(w);
+    let calls = stages.len() == 1 && w.jobs.iter().any(|j| j.uses.is_some());
+    for (i, ids) in stages.iter().enumerate() {
         let lines = ids.iter().filter_map(|id| w.job(id)).map(|j| job_line(j, seen)).collect();
-        out.push(group(format!("Stage {}", i + 1), lines));
+        out.push(group(if calls { "Jobs".to_owned() } else { format!("Stage {}", i + 1) }, lines));
     }
     let mut uses: Vec<Line> = Vec::new();
     let mut listed: std::collections::HashSet<&str> = std::collections::HashSet::new();
@@ -1173,7 +1215,9 @@ pub fn workflow_groups(w: &Workflow, text: &str, runs: &[RunSeen], runs_here: bo
             uses.push(line);
         }
     }
-    out.push(group("Uses", uses));
+    if !uses.is_empty() {
+        out.push(group("Uses", uses));
+    }
     let (secrets, vars) = names_used(text);
     let mut declared: Vec<String> = w.secrets.iter().map(|x| x.name.clone()).collect();
     declared.extend(w.trigger("workflow_call").map(|t| t.secrets.iter().map(|x| x.name.clone()).collect::<Vec<_>>()).unwrap_or_default());
@@ -1189,7 +1233,9 @@ pub fn workflow_groups(w: &Workflow, text: &str, runs: &[RunSeen], runs_here: bo
         names.push(Line::new(format!("secrets.{n}"), "secret", n.clone(), value));
     }
     names.extend(vars.iter().map(|n| Line::new(format!("vars.{n}"), "variable", n.clone(), seen.set_in.get(n).cloned().unwrap_or_else(|| "used".to_owned()))));
-    out.push(group("Secrets and variables", names));
+    if !names.is_empty() {
+        out.push(group("Secrets and variables", names));
+    }
     // Each run by its commit, what came of it (the jobs that failed), and how long ago, as pl-2
     // says them; its event beside it.
     let runs_lines: Vec<Line> = runs
@@ -1204,7 +1250,7 @@ pub fn workflow_groups(w: &Workflow, text: &str, runs: &[RunSeen], runs_here: bo
                 (false, None) => "queued".to_owned(),
             };
             let value = if r.at > 0 && seen.now > 0 { format!("{status} · {}", span_words(seen.now - r.at)) } else { status };
-            let name = r.sha.get(..7).map_or_else(|| format!("#{}", r.number), str::to_owned);
+            let name = r.subject.clone().unwrap_or_else(|| r.sha.get(..7).map_or_else(|| format!("#{}", r.number), str::to_owned));
             Line::new(format!("runs.{}", r.number), "run", name, value).state(outcome_glyph(r.outcome, r.running)).note(r.event.clone())
         })
         .collect();
@@ -1324,7 +1370,13 @@ pub fn action_groups(a: &Action, kind: Kind, text: &str, head: &str, tags: &[(St
                     // As pl-5: an action by what it uses and what it's given (`kiln/cache@v1 ·
                     // ~/.cargo, target`), a command by its name and that it runs.
                     let name = st.uses.clone().or_else(|| st.name.as_ref().map(|n| n.src.clone())).or_else(|| st.id.clone()).or_else(|| st.run.as_ref().map(|x| x.src.lines().next().unwrap_or_default().to_owned())).unwrap_or_else(|| format!("step {}", i + 1));
-                    let value = if st.uses.is_some() { st.with.iter().filter_map(|(_, v)| yval_words(v)).collect::<Vec<_>>().join(", ") } else { "run".to_owned() };
+                    let value = if st.uses.is_some() {
+                        st.with.iter().filter_map(|(_, v)| yval_words(v)).collect::<Vec<_>>().join(", ")
+                    } else if st.run.as_ref().is_some_and(|r| name == r.src.trim() && !name.contains('\n')) {
+                        "its output".to_owned()
+                    } else {
+                        "run".to_owned()
+                    };
                     Line::new(format!("runs.steps.{i}"), "step", name, value)
                 })
                 .collect();
@@ -2234,7 +2286,7 @@ mod tests {
     /// with its workflows, marked where it's behind.
     #[test]
     fn w29_r04_an_actions_lines_as_pl_5_says_them() {
-        let text = "name: setup-rust\ninputs:\n  toolchain:\n    description: the toolchain; rust-toolchain.toml's when not given\n    required: false\n  components:\n    default: clippy, rustfmt\n  targets:\n    required: false\nruns:\n  using: composite\n  steps:\n    - uses: kiln/cache@v1\n      with: { path: \"~/.cargo, target\" }\n    - name: rustup toolchain install\n      run: rustup toolchain install\n      shell: bash\n";
+        let text = "name: setup-rust\ninputs:\n  toolchain:\n    description: the toolchain; rust-toolchain.toml's when not given\n    required: false\n  components:\n    default: clippy, rustfmt\n  targets:\n    required: false\nruns:\n  using: composite\n  steps:\n    - uses: kiln/cache@v1\n      with: { path: \"~/.cargo, target\" }\n    - name: rustup toolchain install\n      run: rustup toolchain install stable\n      shell: bash\n    - name: rustc --version\n      run: rustc --version\n      shell: bash\n";
         let (a, _) = crate::wf::parse_action(text);
         let tags = vec![("v2.4.0".to_owned(), "7ac3e1d".to_owned()), ("v2.3.0".to_owned(), "5b2c9e1".to_owned()), ("v2".to_owned(), "7ac3e1d".to_owned())];
         let consumer = |repo: &str, workflows: &[&str], r: &str| crate::catalog::Consumer { repo: repo.into(), git_ref: r.into(), workflows: workflows.iter().map(|w| (*w).to_owned()).collect(), ..crate::catalog::Consumer::default() };
@@ -2244,10 +2296,29 @@ mod tests {
         let groups = action_groups(&a.unwrap_or_default(), Kind::Composite, text, "e41a9c2b7d6e", &tags, &Sharing { repo: "hyper-light/ci-kit", access: Access::Owner, used_by: &used }, &seen);
         let said = |n: &str| groups.iter().find(|g| g.name == n).map(|g| g.lines.iter().map(|l| (format!("{}: {}", l.name, l.value), l.state)).collect::<Vec<_>>()).unwrap_or_default();
         assert_eq!(said("Inputs"), [("toolchain: rust-toolchain.toml's".to_owned(), None), ("components: clippy, rustfmt".into(), None), ("targets: new since v2.4.0".into(), Some("added"))]);
-        assert_eq!(said("Steps"), [("kiln/cache@v1: ~/.cargo, target".to_owned(), None), ("rustup toolchain install: run".into(), None)]);
+        assert_eq!(said("Steps"), [("kiln/cache@v1: ~/.cargo, target".to_owned(), None), ("rustup toolchain install: run".into(), None), ("rustc --version: its output".into(), None)]);
         assert_eq!(said("Versions").into_iter().map(|(l, _)| l).collect::<Vec<_>>(), ["e41a9c2: 3 commits since v2.4.0", "v2.4.0: 3d · 1 repository", "v2.3.0: 3w · 1 repository", "v2: the newest v2: v2.4.0"]);
         assert_eq!(said("Used by"), [("hyper-light/kiln: ci, release · v2.3.0".to_owned(), Some("flag")), ("hyper-light/quiver: ci · v2.4.0".into(), None)]);
         assert!(groups.iter().all(|g| g.name != "Outputs"), "no Outputs group without outputs");
+    }
+
+    /// W29-R04: event subjects and floating releases come from the supplied records, with no
+    /// inference of a release from an unrelated commit; absent event facts leave the SHA fallback.
+    #[test]
+    fn w29_r04_recorded_run_subjects_and_floating_releases() {
+        use serde_json::json;
+        assert_eq!(run_subject("deploy", &json!({"kiln":{"deploy":{"state":"synced", "operation":{"id":153}}}})), Some("#153 synced".into()));
+        assert_eq!(run_subject("schedule", &json!({"schedule":"0 3 * * *"})), Some("03:00".into()));
+        assert_eq!(run_subject("schedule", &json!({"schedule":"*/15 * * * *"})), Some("*/15 * * * *".into()));
+        assert_eq!(run_subject("comment", &json!({"issue":{"number":212}, "comment":{"body":"/smoke some private arguments\nmore text"}})), Some("/smoke on #212".into()));
+        assert_eq!(run_subject("comment", &json!({"issue":{"number":212}, "comment":{"body":"a conversation"}})), None);
+        assert_eq!(run_subject("deploy", &json!({})), None);
+        assert_eq!(floating_words("v4", ["v4", "v4.2.3", "v4.2.2", "v5.0.0"], "5a3ec84d4a"), Some("4.2.3 · 5a3ec84".into()));
+        assert_eq!(floating_words("v4.2", ["v4.2.3", "v4.3.0"], "5a3ec84d4a"), Some("4.2.3 · 5a3ec84".into()));
+        assert_eq!(floating_words("v4", ["v4"], "5a3ec84d4a"), None);
+        assert_eq!(floating_words("v4.2.3", ["v4.2.3"], "5a3ec84d4a"), None);
+        let groups = workflow_groups(&Workflow::default(), "", &[], true, "", None, &Seen::default());
+        assert!(!groups.iter().any(|g| matches!(g.name.as_str(), "Uses" | "Secrets and variables")), "no empty groups");
     }
 
     /// W29-R17, R20: a shared repository's head says its access and its heading says shared; an

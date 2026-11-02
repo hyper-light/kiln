@@ -10,7 +10,7 @@
 import type http from "node:http";
 import { parse, parseDocument } from "yaml";
 import type { ShipPipelineDraft, ShipPipelineGroup, ShipPipelineLine, ShipPipelinePane, ShipPipelineRepo, ShipPipelineRow, ShipPipelineVerb, ShipPipelines } from "../src/api/ship.ts";
-import { ADDED, CHECKS, FILES, JOB_SECS, LAST_COMMIT, RUNS, SET_IN, TAG_AGO, TAGS, UPDATES, USED_BY } from "./pipelines-files.ts";
+import { ADDED, CHECKS, FILES, JOB_SECS, LAST_COMMIT, RESOLVED, RUNS, SET_IN, TAG_AGO, TAGS, UPDATES, USED_BY } from "./pipelines-files.ts";
 // The pane's words as the server words them: the UI's own, so the mock and the typed text agree.
 import { triggerLines } from "../src/lib/triggers.ts";
 import { jobLine, spanWords, type JobLast } from "../src/lib/typed-groups.ts";
@@ -412,9 +412,11 @@ function workflowGroups(key: string, text: string, kiln: boolean, runsHere: bool
   // Each job's outcome in the last finished run, and its commit, as the server reads them (pl-2's strip).
   const finished = (RUNS[key] ?? []).find((r) => r.status !== "under way");
   const lastOf = (id: string): JobLast | undefined => (finished?.sha ? { outcome: finished.failed?.includes(id) ? "failed" : "passed", sha: finished.sha } : undefined);
-  stagesOf(jobs).forEach((ids, i) =>
+  const stages = stagesOf(jobs);
+  const calls = stages.length === 1 && Object.values(jobs).some((j) => obj(j).uses);
+  stages.forEach((ids, i) =>
     out.push({
-      name: `Stage ${i + 1}`,
+      name: calls ? "Jobs" : `Stage ${i + 1}`,
       lines: ids.map((id) => jobLine(id, obj(jobs[id]), JOB_SECS[key]?.[id], lastOf(id))),
     }),
   );
@@ -442,13 +444,13 @@ function workflowGroups(key: string, text: string, kiln: boolean, runsHere: bool
         .join("/");
       const hosted = Boolean(SEEDS[owner]);
       const newest = hosted && /^v?\d+\.\d+\.\d+$/.test(ref) ? (TAGS[owner] ?? []).map(([t]) => t).find((t) => /^v?\d+\.\d+\.\d+$/.test(t)) : undefined;
-      const standing = newest ? (newest === ref ? "newest" : `${newest} is out`) : "";
+      const standing = newest ? (newest === ref ? "newest" : `${newest} is out`) : (RESOLVED[u] ?? "");
       uses.push({
         key: `uses.${u}`,
         kind: "use",
         name: u,
         value: `${isCall ? "a reusable workflow, " : ""}${hosted ? "a repository kiln hosts" : fromWords(u)}${standing ? ` · ${standing}` : ""}`,
-        ...(standing && standing !== "newest" ? { state: "flag" } : {}),
+        ...(newest && newest !== ref ? { state: "flag" } : {}),
       });
     }
   }
@@ -464,12 +466,12 @@ function workflowGroups(key: string, text: string, kiln: boolean, runsHere: bool
   out.push({
     name: "Runs",
     // As the server words them: its commit, what came of it, how long ago; its event beside it.
-    lines: (RUNS[key] ?? []).map((r) => {
+    lines: (RUNS[key.replace(/:draft:.*$/, "")] ?? []).map((r) => {
       const status = r.status === "failed" && r.failed?.length ? `${r.failed.join(", ")} failed` : r.status;
       return {
         key: `runs.${r.n}`,
         kind: "run",
-        name: r.sha ? r.sha.slice(0, 7) : `#${r.n}`,
+        name: r.subject ?? (r.sha ? r.sha.slice(0, 7) : `#${r.n}`),
         value: r.ago === undefined ? status : `${status} · ${spanWords(r.ago)}`,
         note: r.event,
         state: r.status === "passed" ? "passed" : r.status === "failed" ? "failed" : "running",
@@ -489,7 +491,7 @@ function workflowGroups(key: string, text: string, kiln: boolean, runsHere: bool
       ...(Object.keys(call).length ? [{ key: "settings.access", kind: "setting", name: "Access", value: "shared with hyper-light's repositories", state: "owner" }] : []),
     ],
   });
-  return out;
+  return out.filter((g) => g.lines.length > 0);
 }
 
 /** Used by's lines as the server words them (pl-5): each repository by its workflows and version, flagged where that's behind the newest. */
@@ -528,12 +530,15 @@ function actionGroups(repo: string, key: string, text: string, kind: string, hea
     out.push({
       name: "Steps",
       // An action by what it uses and is given, a command by its name and that it runs (pl-5).
-      lines: (Array.isArray(runs.steps) ? runs.steps.map(obj) : []).map((s, i) => ({
-        key: `runs.steps.${i}`,
-        kind: "step",
-        name: String(s.uses ?? s.name ?? s.id ?? String(s.run ?? "").split("\n")[0] ?? `step ${i + 1}`),
-        value: s.uses ? Object.values(obj(s.with)).map(String).join(", ") : "run",
-      })),
+      lines: (Array.isArray(runs.steps) ? runs.steps.map(obj) : []).map((s, i) => {
+        const name = String(s.uses ?? s.name ?? s.id ?? String(s.run ?? "").split("\n")[0] ?? `step ${i + 1}`);
+        return {
+          key: `runs.steps.${i}`,
+          kind: "step",
+          name,
+          value: s.uses ? Object.values(obj(s.with)).map(String).join(", ") : name === String(s.run ?? "").trim() && !name.includes("\n") ? "its output" : "run",
+        };
+      }),
     });
   else if (kind === "javascript")
     out.push({

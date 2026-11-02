@@ -680,7 +680,7 @@ const PHONE_ROWS = 28;
 function firstPick(p: ShipPipelinePane): Key | null {
   const first = (name: string | ((n: string) => boolean)) => p.groups.find((g) => (typeof name === "string" ? g.name === name : name(g.name)))?.lines[0]?.key;
   const moved = p.groups.find((g) => g.name === "Uses")?.lines.find((l) => l.state === "changes")?.key;
-  return moved ?? first((n) => n.startsWith("Stage ")) ?? first("Versions") ?? p.groups.find((g) => g.lines.length)?.lines[0]?.key ?? null;
+  return moved ?? first((n) => n === "Jobs" || n.startsWith("Stage ")) ?? first("Versions") ?? p.groups.find((g) => g.lines.length)?.lines[0]?.key ?? null;
 }
 
 /** A group's words on its right, as the stills put them: how many, what a stage waits on, where runs are from. */
@@ -688,7 +688,7 @@ function noteOf(g: ShipPipelineGroup, p: ShipPipelinePane): string {
   // Add a trigger is the group's last line, not one of its triggers.
   const n = g.lines.filter((l) => l.kind !== "add").length;
   // What's typed in says how much is new (pl-3); an action's inputs mark theirs on their lines (pl-5).
-  const added = g.name.startsWith("Stage ") || g.name === "Uses" ? g.lines.filter((l) => l.state === "added").length : 0;
+  const added = g.name.startsWith("Stage ") || g.name === "Jobs" || g.name === "Uses" ? g.lines.filter((l) => l.state === "added").length : 0;
   // The uses kiln's update draft moves (pl-7's `3 · 1 update`).
   const moved = g.name === "Uses" ? g.lines.filter((l) => l.state === "changes").length : 0;
   const more = (added ? ` · ${added} new` : "") + (moved ? ` · ${moved} ${moved === 1 ? "update" : "updates"}` : "");
@@ -698,6 +698,10 @@ function noteOf(g: ShipPipelineGroup, p: ShipPipelinePane): string {
     return (after.length ? `after ${after.join(" and ")}` : `${n} jobs`) + more;
   }
   switch (g.name) {
+    case "Jobs": {
+      const from = [...new Set(g.lines.flatMap((l) => (l.value.startsWith("calls ") ? [sourceOf(l.value.slice(6), "a repository kiln hosts")] : [])))];
+      return `${n}${from.length ? ` · called from ${from.join(", ")}` : ""}${more}`;
+    }
     case "Secrets and variables":
       return "names only";
     case "Runs":
@@ -763,7 +767,11 @@ function wordsOf(l: ShipPipelineLine): { kind: string | null; name: string; valu
       return { kind: l.note && l.note !== "push" ? l.note.replace(/_/g, " ") : null, name: l.name, value: l.value };
     case "job":
       // What it needs is its stage's note (`after rust and ui`), not its own.
-      return { kind: l.state === "added" ? "new job" : "job", name: l.name, value: l.value.replace(/(^| · )needs .*$/, "") };
+      return {
+        kind: l.state === "added" ? "new job" : l.value.startsWith("calls ") ? "calls" : "job",
+        name: l.name,
+        value: l.value.startsWith("calls ") ? shortUse(l.value.slice(6)).replace(/@[^ ·]+/, "") : l.value.replace(/(^| · )needs .*$/, ""),
+      };
     case "secret":
     case "variable":
     case "input":
@@ -1904,9 +1912,13 @@ function Detail({
   const name =
     line?.state === "changes" && line.kind === "use" && u
       ? `${pane.head.draft?.change?.name ?? "the draft"} · ${u.uses} ${u.from} → ${u.to}`
-      : line
-        ? `${wordsOf(line).name || line.name} · ${file}`
-        : file;
+      : line?.key === "versions.head"
+        ? `${line.name} · ${line.value}`
+        : line?.key === "on.schedule"
+          ? `schedule · ${file}`
+          : line
+            ? `${wordsOf(line).name || line.name} · ${file}`
+            : file;
   return (
     <div className="ppl-detail">
       <div className="ppl-dhead">
@@ -2158,13 +2170,8 @@ function ChangesView({ pane, text, ask }: { pane: ShipPipelinePane; text: string
   const d = pane.detail;
   const next = pane.strip.verbs.find((v) => v.verb === "release")?.tags?.[0];
   if (d.since) {
-    const n = d.since.commits.length;
     return (
       <div className="ppl-changes">
-        <div className="jp-g">
-          <span>{n ? `${n === 1 ? "1 commit" : `${n} commits`} since ${d.since.tag}` : `nothing since ${d.since.tag}`}</span>
-          <span />
-        </div>
         <ul className="ppl-lines" aria-label={`Commits since ${d.since.tag}`}>
           {d.since.commits.map((c) => (
             <li key={c.sha}>

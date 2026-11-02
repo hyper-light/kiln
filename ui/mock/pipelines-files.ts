@@ -352,26 +352,29 @@ export const FILES: Record<string, string> = {
 
 /** A workflow's newest runs on its default branch, newest first: its number, what started it, how it went. */
 /** Each workflow's runs, newest first: its commit, how long ago (seconds) and the jobs that failed, as pl-2 and pl-8 show them. */
-export const RUNS: Record<string, { n: number; event: string; status: "passed" | "failed" | "under way"; sha?: string; ago?: number; failed?: string[] }[]> = {
+export const RUNS: Record<string, { n: number; event: string; status: "passed" | "failed" | "under way"; sha?: string; ago?: number; failed?: string[]; subject?: string }[]> = {
   "hyper-light/kiln:.kiln/ci.yaml": [
     { n: 412, event: "push", status: "passed", sha: "a3f2c1d9e8b7", ago: 12 * 60 },
     { n: 411, event: "push", status: "failed", sha: "9e1b2c0f7a6d", ago: 2 * 3600, failed: ["rust"] },
     { n: 409, event: "push", status: "passed", sha: "15878aa3c2b1", ago: 86_400 },
   ],
   "hyper-light/kiln:.kiln/smoke.yaml": [
-    { n: 88, event: "deploy", status: "passed", sha: "a3f2c1d9e8b7", ago: 6 * 3600 },
-    { n: 87, event: "schedule", status: "passed", sha: "a3f2c1d9e8b7", ago: 14 * 3600 },
-    { n: 86, event: "comment", status: "failed", sha: "c71d0e2a9b8f", ago: 86_400 },
+    { n: 88, event: "deploy", status: "passed", subject: "#153 synced", sha: "a3f2c1d9e8b7", ago: 6 * 3600 },
+    { n: 87, event: "schedule", status: "passed", subject: "03:00", sha: "a3f2c1d9e8b7", ago: 14 * 3600 },
+    { n: 86, event: "comment", status: "failed", subject: "/smoke on #212", sha: "c71d0e2a9b8f", ago: 86_400 },
   ],
   "hyper-light/kiln:.kiln/e2e.yaml": [{ n: 301, event: "push", status: "failed", sha: "a3f2c1d9e8b7", ago: 3 * 3600, failed: ["e2e"] }],
   "hyper-light/kiln:.kiln/release.yaml": [{ n: 17, event: "push", status: "passed" }],
   "hyper-light/quiver:.github/workflows/ci.yml": [
-    { n: 54, event: "push", status: "passed" },
-    { n: 53, event: "push", status: "passed" },
+    { n: 54, event: "push", status: "passed", sha: "1f9b2c4", ago: 3 * 86_400 },
+    { n: 53, event: "push", status: "passed", sha: "8d02e7a", ago: 4 * 86_400 },
   ],
   "hyper-light/quiver:.github/workflows/ci.yml:draft:d-update-88": [{ n: 55, event: "pull_request", status: "under way" }],
   "hyper-light/quiver:.github/workflows/bench.yml": [{ n: 30, event: "schedule", status: "passed" }],
 };
+
+/** Full releases at the floating tag's exact mirrored commit (W29-R04, pl-2). */
+export const RESOLVED: Record<string, string> = { "actions/cache@v4": "4.2.3 · 5a3ec84" };
 
 /** Each repository's tags, newest first, with their commits. */
 /** How long ago each tag was made, in seconds, by `repo:tag` (pl-5's `3d`). */

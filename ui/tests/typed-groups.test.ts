@@ -72,6 +72,24 @@ test("w29_r05_a_job_taken_out_is_gone_and_its_stages_follow_needs", () => {
   assert.deepEqual(stagesOf({ a: { needs: "b" }, b: { needs: "a" }, c: {} }), [["a", "b", "c"]]);
 });
 
+test("w29_r05_typing_the_first_use_creates_its_group_and_a_call_still_edits_as_jobs", () => {
+  const groups: ShipPipelineGroup[] = [
+    { name: "Triggers", lines: [] },
+    { name: "Runs", lines: [] },
+  ];
+  const out = typedGroups("on: push\njobs:\n  rust:\n    uses: acme/kit/.github/workflows/check.yml@v1\n", groups);
+  assert.deepEqual(
+    out?.map((g) => g.name),
+    ["Triggers", "Jobs", "Uses", "Runs"],
+  );
+  assert.equal(out?.find((g) => g.name === "Uses")?.lines[0]?.name, "acme/kit/.github/workflows/check.yml@v1");
+  const next = typedGroups("on: push\njobs:\n  rust:\n    runs-on: local\n    steps:\n      - run: echo checked\n", out ?? []);
+  assert.deepEqual(
+    next?.filter((g) => g.name === "Jobs" || g.name.startsWith("Stage ")).map((g) => g.name),
+    ["Stage 1"],
+  );
+});
+
 test("w29_r04_a_picked_jobs_strip_says_what_it_reserves_and_its_last_run_as_the_server_does", () => {
   // As kiln_ci::pipelines::job_line's note (pl-2): where it runs, what it reserves, its last run.
   const rust = { "runs-on": ["baremetal", "linux"], resources: { cpu: 2, memory: "16Gi" } };

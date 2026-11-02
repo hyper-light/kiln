@@ -400,21 +400,24 @@ async fn runs_list(hub: &Hub, repo: &Repo, branch: &str, path: &str) -> anyhow::
             // Each with its commit, when it was made, and the jobs that failed in it (pl-2's `9e1b2c0 · rust failed`).
             let mut st = c.prepare(
                 "SELECT r.number, r.event, r.status, r.sha, r.created_at,
-                        (SELECT group_concat(j.key, ', ') FROM jobs j WHERE j.run_id = r.id AND j.status = 'failed')
+                        (SELECT group_concat(j.key, ', ') FROM jobs j WHERE j.run_id = r.id AND j.status = 'failed'),
+                        (SELECT e.payload FROM ci_events e WHERE e.run_id = r.id)
                  FROM runs r LEFT JOIN ci_workflows w ON w.id = r.workflow_id
                  WHERE r.repo_id = ?1 AND r.branch = ?2 AND (w.path = ?3 OR (r.workflow_id IS NULL AND r.pipeline = ?4))
                  ORDER BY r.created_at DESC LIMIT 10",
             )?;
             let mut out = Vec::new();
             let rows = st.query_map(rusqlite::params![id, branch, path, stem], |r| {
-                Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?, r.get::<_, String>(2)?, r.get::<_, String>(3)?, r.get::<_, i64>(4)?, r.get::<_, Option<String>>(5)?))
+                Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?, r.get::<_, String>(2)?, r.get::<_, String>(3)?, r.get::<_, i64>(4)?, r.get::<_, Option<String>>(5)?, r.get::<_, Option<String>>(6)?))
             })?;
             for row in rows {
-                let (number, event, status, sha, at, failed) = row?;
+                let (number, event, status, sha, at, failed, payload) = row?;
                 let mut seen = (None, false);
                 fold(&mut seen, &status);
                 let failed = failed.map(|f| f.split(", ").map(str::to_owned).collect()).unwrap_or_default();
-                out.push(core::RunSeen { number, event, outcome: seen.0, running: seen.1, sha, at, failed });
+                let payload = payload.and_then(|p| serde_json::from_str(&p).ok()).unwrap_or_default();
+                let subject = core::run_subject(&event, &payload);
+                out.push(core::RunSeen { number, event, outcome: seen.0, running: seen.1, sha, at, failed, subject });
             }
             Ok(out)
         })
@@ -465,18 +468,41 @@ async fn seen_of(hub: &Hub, repo: &Repo, branch: &str, path: &str, w: &wf::Workf
     // repository's newest release.
     let hosted = hub.store.repos().await.unwrap_or_default();
     let uses: Vec<String> = w.jobs.iter().flat_map(|j| j.uses.iter().cloned().chain(j.steps.iter().filter_map(|s| s.uses.clone()))).collect();
+    let mut listed = HashSet::new();
     for u in uses {
-        let Some(r) = crate::ci::actions::Remote::parse(&u) else { continue };
-        let Some(other) = hosted.iter().find(|x| x.name.eq_ignore_ascii_case(&format!("{}/{}", r.owner, r.repo))) else { continue };
-        seen.hosted.insert(u.clone());
-        if !matches!(kiln_ci::releases::kind_of(&r.git_ref), kiln_ci::releases::TagKind::Full) || seen.uses.contains_key(&u) {
+        if !listed.insert(u.clone()) {
             continue;
         }
-        let dir = crate::ci::hosting::native_path(hub, other).unwrap_or_else(|| crate::gitops::mirror_path(hub, &other.name)).to_string_lossy().into_owned();
-        let tags = git(hub, &dir, &["for-each-ref", "--format=%(refname:strip=2)", "refs/tags"]).await;
-        if let Some(newest) = core::newest_release(tags.lines()) {
-            let standing = if newest == r.git_ref.as_str() { ("newest".to_owned(), false) } else { (format!("{newest} is out"), true) };
-            seen.uses.insert(u, standing);
+        let Some(r) = crate::ci::actions::Remote::parse(&u) else { continue };
+        let other = hosted.iter().find(|x| x.name.eq_ignore_ascii_case(&format!("{}/{}", r.owner, r.repo)));
+        let dir = if let Some(other) = other {
+            seen.hosted.insert(u.clone());
+            crate::ci::hosting::native_path(hub, other).unwrap_or_else(|| crate::gitops::mirror_path(hub, &other.name))
+        } else {
+            r.mirror(hub)
+        };
+        let dir = dir.to_string_lossy().into_owned();
+        match kiln_ci::releases::kind_of(&r.git_ref) {
+            kiln_ci::releases::TagKind::Floating => {
+                // A read of an existing mirror only: opening a pane never fetches an action or
+                // changes its tag. Full releases must point at the floating tag's exact commit.
+                let sha = git(hub, &dir, &["rev-parse", "--verify", &format!("refs/tags/{}^{{commit}}", r.git_ref)]).await;
+                let sha = sha.trim();
+                if !sha.is_empty() {
+                    let tags = git(hub, &dir, &["for-each-ref", "--points-at", sha, "--format=%(refname:strip=2)", "refs/tags"]).await;
+                    if let Some(words) = core::floating_words(&r.git_ref, tags.lines(), sha) {
+                        seen.uses.insert(u, (words, false));
+                    }
+                }
+            }
+            kiln_ci::releases::TagKind::Full if other.is_some() => {
+                let tags = git(hub, &dir, &["for-each-ref", "--format=%(refname:strip=2)", "refs/tags"]).await;
+                if let Some(newest) = core::newest_release(tags.lines()) {
+                    let standing = if newest == r.git_ref.as_str() { ("newest".to_owned(), false) } else { (format!("{newest} is out"), true) };
+                    seen.uses.insert(u, standing);
+                }
+            }
+            _ => {}
         }
     }
     seen.set_in = crate::ci::secrets::set_in(hub, repo, path).await.unwrap_or_default();
@@ -740,7 +766,7 @@ async fn draft_pane(hub: &Hub, repo: &Repo, id: &str, path: &str, viewer: core::
     let sharing = core::Sharing { repo: &repo.name, access, used_by: &used };
     let mut groups = match &loaded {
         Some(l) => match l.workflow.as_ref() {
-            Some(w) => core::workflow_groups(w, &text, &[], true, "", Some(&sharing), &seen_of(hub, repo, &branch, path, w).await),
+            Some(w) => core::workflow_groups(w, &text, &runs_list(hub, repo, &branch, path).await.map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")))?, true, "", Some(&sharing), &seen_of(hub, repo, &branch, path, w).await),
             None => Vec::new(),
         },
         None => {

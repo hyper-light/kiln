@@ -113,6 +113,7 @@ test("an opened workflow is the jobs pane's anatomy: the strip, its groups, the 
   await expect(pane.locator(".jp-j[data-at]")).toHaveAttribute("data-key", "jobs.rust");
   // The strip says where it runs, what it reserves and its last run (pl-2).
   await expect(pane.locator(".jp-said")).toHaveText("rust picked · stage 1 · bare metal, linux · 2 CPUs, 16 GiB · its last run passed in 18m 40s on a3f2c1d");
+  await expect(pane.locator('.jp-j[data-key="uses.actions/cache@v4"] .v')).toHaveText("4.2.3 · 5a3ec84");
   const detail = pane.locator(".ppl-detail");
   await expect(detail.getByRole("tab")).toHaveText(["YAML", "Plan", "Last run"]);
   // Edited in place: the job's lines tinted in the editor, opened at a line above them.
@@ -149,13 +150,15 @@ test("an action's pane: its inputs, steps, versions, who uses it and its access;
   await expect(pane.locator('.jp-g[data-group="Used by"] > span:last-child')).toHaveText("3 repositories");
   await expect(pane.locator(".ppl-verbs button")).toHaveText(["Run", "Save draft", "Ready", "Discard", "Release"]);
   await expect(pane.locator(".ppl-kicker")).toContainText("hyper-light/ci-kit · .github/actions/setup-rust · composite action");
+  await expect(pane.locator('.jp-j[data-key="runs.steps.2"] .v')).toHaveText("its output");
+  await expect(pane.locator(".ppl-dname")).toHaveText("e41a9c2 · 3 commits since v2.4.0");
   expect(await sideways(page)).toBe(0);
 });
 
 test("kiln's update draft: DRAFT on its head, its ordinary groups, the use it moves marked and picked first (pl-7)", async ({ page, isMobile }) => {
   const pane = await openPane(page, isMobile, "hyper-light/quiver", ".github/workflows/ci.yml", "d-update-88");
   await expect(pane.locator(".ppl-kicker .ppl-draft")).toHaveText("DRAFT");
-  await expect(pane.locator(".ppl-list > .jp-g > span:first-child")).toHaveText(["Triggers", "Stage 1", "Uses", "Secrets and variables", "Runs", "Settings"]);
+  await expect(pane.locator(".ppl-list > .jp-g > span:first-child")).toHaveText(["Triggers", "Jobs", "Uses", "Runs", "Settings"]);
   const moved = pane.locator(".jp-j[data-at]");
   await expect(moved).toHaveAttribute("data-key", "uses.hyper-light/ci-kit/.github/workflows/rust-check.yml@v2.4.0");
   await expect(moved.locator(".n")).toHaveText(/rust-check@v2\.3\.0$/);
@@ -168,6 +171,8 @@ test("kiln's update draft: DRAFT on its head, its ordinary groups, the use it mo
     "rust-check v2.4.0 is out · 3 commits since v2.3.0 · a new optional input; no new secrets, permissions or egress · kiln opened draft pull request #88",
   );
   await expect(pane.locator(".jp-said b")).toHaveText(["rust-check v2.4.0", "#88"]);
+  await expect(pane.locator('.jp-j[data-key="runs.54"]')).toContainText("1f9b2c4");
+  await expect(pane.locator('.jp-j[data-key="runs.55"]')).toHaveCount(0);
   expect(await sideways(page)).toBe(0);
 });
 
@@ -393,9 +398,13 @@ test("the plan for each event: plan for: picks it, a picked job says where it wo
 
 test("Add a trigger: 18 kinds in six groups, shown by whose; picking one adds its lines as a draft and opens its filters; a schedule's times and options", async ({ page, isMobile }) => {
   const pane = await openPane(page, isMobile, "hyper-light/kiln", ".kiln/smoke.yaml");
+  await expect(pane.locator('.jp-j[data-key="runs.88"] .n')).toContainText("#153 synced");
+  await expect(pane.locator('.jp-j[data-key="runs.87"] .n')).toContainText("03:00");
+  await expect(pane.locator('.jp-j[data-key="runs.86"] .n')).toContainText("/smoke on #212");
   await pane.locator('.jp-j[data-key="add-trigger"] .jp-line').click();
   const kinds = pane.getByLabel("Add a trigger");
   await expect(kinds.locator("li[data-kind]")).toHaveCount(18);
+  if (!isMobile) expect(await kinds.evaluate((el) => el.scrollHeight - el.clientHeight), "all 18 kinds fit the held detail").toBe(0);
   await expect(kinds.locator(".jp-g > span:first-child")).toHaveText(["Code", "Time", "People and agents", "Other workflows", "Deploys and releases", "Outside kiln"]);
   await expect(pane.locator(".jp-said")).toContainText("pick what starts it");
   // show: kiln's lists kiln's own and both; GitHub's the rest and both.

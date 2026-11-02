@@ -187,18 +187,26 @@ export function typedGroups(text: string, groups: ShipPipelineGroup[]): ShipPipe
   const jobs = obj(obj(d.toJS()).jobs);
   if (!Object.keys(jobs).length) return null;
   const had = new Map(groups.flatMap((g) => g.lines.map((l) => [l.key, l] as const)));
-  const stages: ShipPipelineGroup[] = stagesOf(jobs).map((ids, i) => ({ name: `Stage ${i + 1}`, lines: ids.map((id) => had.get(`jobs.${id}`) ?? newJob(id, obj(jobs[id]))) }));
+  const idsByStage = stagesOf(jobs);
+  const calls = idsByStage.length === 1 && Object.values(jobs).some((j) => obj(j).uses);
+  const stages: ShipPipelineGroup[] = idsByStage.map((ids, i) => ({ name: calls ? "Jobs" : `Stage ${i + 1}`, lines: ids.map((id) => had.get(`jobs.${id}`) ?? newJob(id, obj(jobs[id]))) }));
   const uses = usesOf(jobs).map((u) => had.get(`uses.${u}`) ?? newUse(u));
   const out: ShipPipelineGroup[] = [];
   let placed = false;
   for (const g of groups) {
-    if (g.name.startsWith("Stage ")) {
+    if (g.name === "Jobs" || g.name.startsWith("Stage ")) {
       if (!placed) out.push(...stages);
       placed = true;
     } else out.push(g.name === "Uses" ? { ...g, lines: uses } : g);
   }
   // No stages before (a file that had no jobs): after its triggers.
   if (!placed) out.splice(out.findIndex((g) => g.name === "Triggers") + 1, 0, ...stages);
+  // The server omits an empty Uses group. Typing its first use still gives it a group, after
+  // the jobs and before the names, runs and settings (W29-R04, R05).
+  if (uses.length && !out.some((g) => g.name === "Uses")) {
+    const before = out.findIndex((g) => ["Secrets and variables", "Runs", "Used by", "Settings"].includes(g.name));
+    out.splice(before < 0 ? out.length : before, 0, { name: "Uses", lines: uses });
+  }
   return out;
 }
 
