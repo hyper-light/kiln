@@ -314,8 +314,13 @@ pub struct Codex {
     children: HashMap<String, Child>,
     /// The message that started (or was steered into) the turn under way.
     turn_messages: Vec<String>,
-    /// Messages to send once the thread exists or the turn under way has been interrupted.
+    /// Legacy buffered messages from an image predating the durable queue.
+    #[serde(default)]
     waiting: Vec<QueueItem>,
+    #[serde(default)]
+    now: Option<String>,
+    #[serde(default)]
+    interrupt_on_start: bool,
     /// The reasoning effort for turns (None: the model's default).
     effort: Option<String>,
     /// The service tier for the thread and its turns, as kiln set it ("" standard, else a tier's
@@ -477,6 +482,8 @@ impl Codex {
             children: HashMap::new(),
             turn_messages: Vec::new(),
             waiting: Vec::new(),
+            now: None,
+            interrupt_on_start: false,
             effort: None,
             speed: None,
             resume,
@@ -1279,6 +1286,28 @@ impl Codex {
         self.injecting || self.turn.is_some() || matches!(self.thread_status, Some(Status::Running | Status::Waiting)) || own_approval || self.pending.values().any(|p| matches!(p, Pending::Turn(_)))
     }
 
+    fn accepting(&self, core: &Core) -> bool {
+        self.thread.is_some() && !self.reopen && !self.injecting
+            && core.state.status != Status::Exited
+            && !matches!(self.thread_status, Some(Status::Starting | Status::Exited))
+            && !self.pending.values().any(|p| matches!(p, Pending::Initialize | Pending::Thread | Pending::History | Pending::Inject))
+    }
+
+    fn restore_waiting(&mut self, core: &mut Core) -> bool {
+        if self.waiting.is_empty() {
+            return false;
+        }
+        for m in std::mem::take(&mut self.waiting).into_iter().rev() {
+            let m = match core.state.queue.iter().position(|q| q.id == m.id) {
+                Some(pos) => core.state.queue.remove(pos),
+                None => m,
+            };
+            core.state.queue.insert(0, m);
+        }
+        core.touch_state();
+        true
+    }
+
     /// Start again with the changed settings (resuming the thread), unless a turn is under way or
     /// it left background terminals running: then once it's idle and they've ended.
     fn reload_when_idle(&mut self, core: &mut Core) {
@@ -1304,6 +1333,7 @@ impl Codex {
     }
 
     pub fn start(&mut self, core: &mut Core) {
+        self.restore_waiting(core);
         // Codex's commands (skills join when they are listed).
         if core.meta.commands.is_empty() {
             core.meta.commands = sort_catalog(codex_catalog());
@@ -1349,6 +1379,7 @@ impl Codex {
     }
 
     pub fn exited(&mut self, core: &mut Core, code: Option<i32>, error: Option<String>) {
+        self.restore_waiting(core);
         // Calls kiln held went with its process.
         self.held_hooks.clear();
         for id in std::mem::take(&mut self.hook_asks).into_keys() {
@@ -1364,6 +1395,7 @@ impl Codex {
         self.pending.clear();
         self.asks.clear();
         self.permissions_changing = false;
+        self.interrupt_on_start = false;
         self.turn_permissions = None;
         self.withheld.clear();
         self.stopped.clear();
@@ -1392,6 +1424,7 @@ impl Codex {
     // ------------------------------------------------------------------ commands
 
     pub fn command(&mut self, core: &mut Core, cmd: Command) {
+        self.restore_waiting(core);
         match cmd {
             Command::Send { id, text, mode, attachments, overrides, reply_to, .. } => {
                 // A checkpoint anchors the prompt's moment: kiln's go-back file restore
@@ -1687,6 +1720,9 @@ impl Codex {
     /// Every few seconds: a thread open to send again; servers still starting; the plan's rate
     /// limits now and then.
     pub fn tick(&mut self, core: &mut Core) {
+        if self.restore_waiting(core) {
+            self.next(core);
+        }
         // A hot upgrade adopts the adapter without start(); reconcile legacy override labels.
         self.permission_controls(core);
         self.reload_when_idle(core);
@@ -1897,7 +1933,10 @@ impl Codex {
 
     fn interrupt(&mut self, core: &mut Core) {
         if let (Some(thread), Some(turn)) = (self.thread.clone(), self.turn.clone()) {
+            self.interrupt_on_start = false;
             self.request(core, Pending::Interrupt, "turn/interrupt", json!({"threadId": thread, "turnId": turn}));
+        } else if self.pending.values().any(|p| matches!(p, Pending::Turn(_))) {
+            self.interrupt_on_start = true;
         }
     }
 
@@ -1908,16 +1947,21 @@ impl Codex {
         }
         if mode == SendMode::Now {
             self.permissions_changing = false;
+            self.now = Some(m.id.clone());
         }
         if core.state.goal.is_empty() {
             core.state.goal = clip_middle(&m.text, 600).0;
         }
-        let Some(thread) = self.thread.clone() else {
-            // Not ready yet: goes out once the thread exists.
-            self.show_sent(core, &m, Delivery::Queued);
-            self.waiting.push(m);
+        if !self.accepting(core) {
+            if mode == SendMode::Now {
+                core.state.queue.insert(0, m);
+            } else {
+                core.state.queue.push(m);
+            }
+            core.touch_state();
             return;
-        };
+        }
+        let Some(thread) = self.thread.clone() else { return };
         let busy = self.busy(core);
         match (busy, mode, self.turn.clone()) {
             (true, SendMode::Steer, Some(turn)) => {
@@ -1926,15 +1970,20 @@ impl Codex {
                 self.turn_messages.push(m.id.clone());
                 self.show_sent(core, &m, Delivery::Sent);
             }
-            (true, SendMode::Now, Some(_)) => {
+            (true, SendMode::Now, _) => {
                 // Stop the turn; this message starts the next one.
-                self.show_sent(core, &m, Delivery::Queued);
-                self.waiting.insert(0, m);
+                core.state.queue.insert(0, m);
+                core.touch_state();
                 self.interrupt(core);
             }
             (true, _, _) => {
                 core.state.queue.push(m);
                 core.touch_state();
+            }
+            (false, SendMode::Queue, _) => {
+                core.state.queue.push(m);
+                core.touch_state();
+                self.next(core);
             }
             (false, _, _) => self.start_turn(core, &thread, m),
         }
@@ -1959,6 +2008,9 @@ impl Codex {
     }
 
     fn start_turn(&mut self, core: &mut Core, thread: &str, m: QueueItem) {
+        if self.now.as_deref() == Some(&m.id) {
+            self.now = None;
+        }
         self.thread_status = None;
         let (approval, sandbox_mode, sandbox) = self.policies(core);
         self.turn_permissions = Some((approval.clone(), sandbox_mode));
@@ -2056,23 +2108,24 @@ impl Codex {
         }
     }
 
-    /// Between turns: the next waiting message, then kiln's queue.
+    /// Between turns: the next message in kiln's queue.
     pub(crate) fn next(&mut self, core: &mut Core) {
-        if self.busy(core) || core.state.status == Status::Exited {
+        self.restore_waiting(core);
+        if !self.accepting(core) || self.busy(core) || core.state.queue.is_empty() {
             return;
         }
         // A pause (or a switch) holds what waits, and the stop point may start one here.
-        if (!self.waiting.is_empty() || !core.state.queue.is_empty()) && !super::pause::open(core) {
+        let class = if core.state.queue.first().is_some_and(|m| self.now.as_deref() == Some(&m.id)) {
+            crate::headroom::Class::Person
+        } else {
+            crate::headroom::Class::Agent
+        };
+        if !super::pause::open_for(core, class) {
             return;
         }
         // No turn to steer into: what was to be steered goes out in order.
         self.steer_on_start.clear();
         let Some(thread) = self.thread.clone() else { return };
-        if !self.waiting.is_empty() {
-            let m = self.waiting.remove(0);
-            self.start_turn(core, &thread, m);
-            return;
-        }
         if !core.state.queue.is_empty() {
             let item = core.state.queue.remove(0);
             core.touch_state();
@@ -2119,12 +2172,6 @@ impl Codex {
 
     /// A pause ended: the turn it cut off goes on first, then kiln's queue.
     pub fn go_on(&mut self, core: &mut Core, p: super::model::Pause) {
-        if p.cut.is_some() && !self.busy(core) && core.state.status != Status::Exited {
-            let id = crate::util::new_id();
-            self.send(core, QueueItem { id: id.clone(), text: super::pause::CONTINUE.to_owned(), at: Core::now(), attachments: Vec::new(), overrides: None, reply_to: None }, SendMode::Queue);
-            super::pause::from_kiln(core, &id);
-            return;
-        }
         if p.cut.is_some() {
             super::pause::continue_later(core, super::pause::CONTINUE);
         }
@@ -2354,8 +2401,8 @@ impl Codex {
                 }
                 // Cancelled: the feedback starts the next turn.
                 _ => {
-                    self.note(core, &mid, &f, Delivery::Queued);
-                    self.waiting.insert(0, QueueItem { id: mid, text: f, at: Core::now(), attachments: Vec::new(), overrides: None, reply_to: None });
+                    core.state.queue.insert(0, QueueItem { id: mid, text: f, at: Core::now(), attachments: Vec::new(), overrides: None, reply_to: None });
+                    core.touch_state();
                 }
             }
         }
@@ -2391,18 +2438,25 @@ impl Codex {
         if let Some(err) = v.get("error") {
             let msg = err.get("message").and_then(Value::as_str).unwrap_or("request failed").to_owned();
             let wait = not_yet(&msg).filter(|_| self.open_tries < OPEN_TRIES);
+            let refused_turn = matches!(&kind, Pending::Turn(_));
             match kind {
                 Pending::Suggest(client) => core.reply(client, json!({"error": msg})),
                 // The turn ended before the steer reached it: the message starts the next one.
                 Pending::Steer(id, Some(m)) if self.turn.is_none() => {
                     self.turn_messages.retain(|x| *x != id);
-                    self.show_sent(core, &m, Delivery::Queued);
-                    self.waiting.insert(0, m);
+                    core.state.queue.insert(0, m);
+                    core.touch_state();
                     self.next(core);
                 }
                 Pending::Turn(id) => {
                     self.permissions_changing = false;
+                    self.interrupt_on_start = false;
                     self.turn_permissions = None;
+                    self.turn_messages.retain(|m| m != &id);
+                    if self.turn.is_none() {
+                        core.state.turn_started = None;
+                        core.state.doing = None;
+                    }
                     core.state.delivery.insert(id, Delivery::Cancelled);
                     self.notice(core, Level::Error, format!("Codex refused the message: {msg}"));
                     core.touch_state();
@@ -2437,8 +2491,12 @@ impl Codex {
                     core.touch_state();
                 }
                 Pending::Thread => {
-                    self.notice(core, Level::Error, format!("Codex could not open the conversation: {msg}"));
-                    core.set_status(Status::Idle);
+                    let text = format!("Codex could not open the conversation: {msg}");
+                    self.notice(core, Level::Error, text.clone());
+                    self.thread_status = Some(Status::Exited);
+                    core.state.exit = Some(ExitInfo::now(None, Some(text)));
+                    core.state.doing = None;
+                    core.touch_state();
                 }
                 Pending::History => {
                     self.notice(core, Level::Warn, format!("Codex could not list the conversation's history: {msg}"));
@@ -2524,9 +2582,19 @@ impl Codex {
                     self.ready(core);
                 }
                 Pending::Plain(what) => self.notice(core, Level::Warn, format!("{what}: {msg}")),
-                Pending::Initialize => self.notice(core, Level::Error, format!("Codex did not start: {msg}")),
+                Pending::Initialize => {
+                    let text = format!("Codex did not start: {msg}");
+                    self.notice(core, Level::Error, text.clone());
+                    self.thread_status = Some(Status::Exited);
+                    core.state.exit = Some(ExitInfo::now(None, Some(text)));
+                    core.state.doing = None;
+                    core.touch_state();
+                }
             }
             self.settle(core);
+            if refused_turn {
+                self.next(core);
+            }
             return;
         }
         match kind {
@@ -2697,6 +2765,9 @@ impl Codex {
                 }
                 core.state.delivery.insert(id, Delivery::Started);
                 core.touch_state();
+                if self.interrupt_on_start {
+                    self.interrupt(core);
+                }
                 self.interrupt_for_permissions(core);
                 self.steer_waiting(core);
             }
@@ -3403,7 +3474,14 @@ impl Codex {
             return;
         }
         match method {
-            "thread/status/changed" => self.thread_status(core, p.get("status").unwrap_or(&Value::Null)),
+            "thread/status/changed" => {
+                let loading = self.thread_status == Some(Status::Starting) && self.turn.is_none()
+                    && !self.pending.values().any(|p| matches!(p, Pending::Turn(_)));
+                self.thread_status(core, p.get("status").unwrap_or(&Value::Null));
+                if loading && self.thread_status == Some(Status::Idle) {
+                    self.next(core);
+                }
+            }
             "turn/started" => {
                 if p.pointer("/turn/id").and_then(Value::as_str).is_some_and(|id| self.completed_turn.as_deref() == Some(id)) {
                     return;
@@ -3411,6 +3489,9 @@ impl Codex {
                 self.thread_status = Some(Status::Running);
                 if let Some(t) = p.get("turn").and_then(|t| t.get("id")).and_then(Value::as_str) {
                     self.turn = Some(t.to_owned());
+                }
+                if self.interrupt_on_start {
+                    self.interrupt(core);
                 }
                 self.steer_waiting(core);
                 self.interrupt_for_permissions(core);
@@ -3489,6 +3570,7 @@ impl Codex {
                     core.take_approval(&id);
                 }
                 self.turn = None;
+                self.interrupt_on_start = false;
                 self.turn_permissions = None;
                 if !matches!(self.thread_status, Some(Status::Starting | Status::Exited)) {
                     self.thread_status = Some(Status::Idle);
@@ -4909,6 +4991,149 @@ mod tests {
     }
 
     #[test]
+    fn startup_messages_survive_a_process_restart_in_delivery_order() -> anyhow::Result<()> {
+        let mut core = Core::new();
+        let mut c = Codex::new(None, None, None, false);
+        c.start(&mut core);
+        let attachments = vec![super::super::model::Attachment { name: "picture.png".into(), mime: "image/png".into(), data_base64: "aW1hZ2U=".into(), file_id: None, path: Some("/work/picture.png".into()) }];
+        let overrides = Some(super::super::model::Overrides { model: Some("chosen-model".into()), effort: Some("high".into()) });
+        c.command(&mut core, Command::Send { id: "first".into(), text: "original task".into(), mode: SendMode::Queue, attachments: attachments.clone(), overrides: overrides.clone(), reply_to: Some("earlier".into()), task: None });
+        assert_eq!(core.state.queue.iter().map(|m| m.id.as_str()).collect::<Vec<_>>(), ["first"]);
+        assert!(!core.state.given.iter().any(|m| m.id == "first"));
+        c.exited(&mut core, Some(1), None);
+        let state = serde_json::from_value(serde_json::to_value(&core.state)?)?;
+        let mut restored = Core::new();
+        restored.restore(core.events().cloned().collect(), state);
+        let mut c = Codex::new(None, None, None, false);
+        c.start(&mut restored);
+        c.command(&mut restored, Command::Send { id: "second".into(), text: "And?".into(), mode: SendMode::Queue, attachments: vec![], overrides: None, reply_to: None, task: None });
+        let first = restored.state.queue.first().ok_or_else(|| anyhow::anyhow!("initial prompt lost"))?;
+        assert_eq!((&first.attachments, &first.overrides, first.reply_to.as_deref()), (&attachments, &overrides, Some("earlier")));
+        feed(&mut c, &mut restored, &[json!({"id": 1, "result": {}}), json!({"id": 2, "result": {"thread": {"id": "th1", "turns": []}}})]);
+        let writes = written(&mut restored);
+        let starts: Vec<_> = writes.iter().filter(|v| v.get("method") == Some(&json!("turn/start"))).collect();
+        assert_eq!(starts.len(), 1);
+        let start = starts.first().ok_or_else(|| anyhow::anyhow!("no initial turn"))?;
+        assert_eq!(start.pointer("/params/clientUserMessageId"), Some(&json!("first")));
+        assert_eq!(start.pointer("/params/model"), Some(&json!("chosen-model")));
+        assert_eq!(start.pointer("/params/effort"), Some(&json!("high")));
+        assert!(start.pointer("/params/input").and_then(Value::as_array).is_some_and(|items| items.contains(&json!({"type": "localImage", "path": "/work/picture.png"}))));
+        assert_eq!(restored.state.queue.iter().map(|m| m.id.as_str()).collect::<Vec<_>>(), ["second"]);
+        c.room(&mut restored);
+        assert!(!written(&mut restored).iter().any(|v| v.get("method") == Some(&json!("turn/start"))));
+        Ok(())
+    }
+
+    #[test]
+    fn startup_queue_controls_apply_before_the_thread_opens() {
+        let mut core = Core::new();
+        let mut c = Codex::new(None, None, None, false);
+        c.start(&mut core);
+        for id in ["first", "removed"] {
+            c.command(&mut core, Command::Send { id: id.into(), text: id.into(), mode: SendMode::Queue, attachments: vec![], overrides: None, reply_to: None, task: None });
+        }
+        c.command(&mut core, Command::QueueEdit { id: "first".into(), text: "edited".into(), attachments: None });
+        c.command(&mut core, Command::QueueRemove { id: "removed".into() });
+        feed(&mut c, &mut core, &[json!({"id": 1, "result": {}}), json!({"id": 2, "result": {"thread": {"id": "th1", "turns": []}}})]);
+        let writes = written(&mut core);
+        let starts: Vec<_> = writes.iter().filter(|v| v.get("method") == Some(&json!("turn/start"))).collect();
+        assert_eq!(starts.len(), 1);
+        assert_eq!(starts.first().and_then(|v| v.pointer("/params/input/0/text")), Some(&json!("edited")));
+        assert!(core.state.queue.is_empty());
+    }
+
+    #[test]
+    fn ordinary_messages_do_not_bypass_a_held_initial_prompt() {
+        let (mut c, mut core, _) = opened();
+        core.hold = true;
+        for id in ["first", "second"] {
+            c.command(&mut core, Command::Send { id: id.into(), text: id.into(), mode: SendMode::Queue, attachments: vec![], overrides: None, reply_to: None, task: None });
+        }
+        assert!(!written(&mut core).iter().any(|v| v.get("method") == Some(&json!("turn/start"))));
+        assert_eq!(core.state.queue.iter().map(|m| m.id.as_str()).collect::<Vec<_>>(), ["first", "second"]);
+        core.hold = false;
+        c.room(&mut core);
+        let writes = written(&mut core);
+        assert_eq!(writes.iter().find(|v| v.get("method") == Some(&json!("turn/start"))).and_then(|v| v.pointer("/params/clientUserMessageId")), Some(&json!("first")));
+    }
+
+    #[test]
+    fn startup_failures_keep_the_prompt_and_report_a_restartable_error() {
+        for initialize in [true, false] {
+            let mut core = Core::new();
+            let mut c = Codex::new(None, None, None, false);
+            c.start(&mut core);
+            c.command(&mut core, Command::Send { id: "first".into(), text: "original task".into(), mode: SendMode::Queue, attachments: vec![], overrides: None, reply_to: None, task: None });
+            if !initialize {
+                feed(&mut c, &mut core, &[json!({"id": 1, "result": {}})]);
+            }
+            feed(&mut c, &mut core, &[json!({"id": if initialize { 1 } else { 2 }, "error": {"message": "invalid configuration"}})]);
+            assert_eq!(core.state.status, Status::Exited);
+            assert!(core.state.exit.as_ref().is_some_and(|e| e.error.as_deref().is_some_and(|s| s.contains("invalid configuration"))));
+            assert_eq!(core.state.queue.iter().map(|m| m.id.as_str()).collect::<Vec<_>>(), ["first"]);
+            c.room(&mut core);
+            assert!(!written(&mut core).iter().any(|v| v.get("method") == Some(&json!("turn/start"))));
+        }
+    }
+
+    #[test]
+    fn a_hot_upgrade_recovers_legacy_buffered_prompts_once() -> anyhow::Result<()> {
+        let (c, mut core, _) = opened();
+        let mut image = serde_json::to_value(&c)?;
+        let legacy = QueueItem { id: "legacy".into(), text: "original".into(), at: 1, attachments: vec![], overrides: None, reply_to: None };
+        if let Some(obj) = image.as_object_mut() {
+            obj.insert("waiting".into(), serde_json::to_value(std::slice::from_ref(&legacy))?);
+            obj.remove("now");
+            obj.remove("interrupt_on_start");
+        }
+        let mut c: Codex = serde_json::from_value(image)?;
+        core.state.queue.push(QueueItem { text: "edited".into(), ..legacy });
+        c.tick(&mut core);
+        let writes = written(&mut core);
+        let starts: Vec<_> = writes.iter().filter(|v| v.get("method") == Some(&json!("turn/start"))).collect();
+        assert_eq!(starts.len(), 1);
+        assert_eq!(starts.first().and_then(|v| v.pointer("/params/input/0/text")), Some(&json!("edited")));
+        assert!(c.waiting.is_empty() && core.state.queue.is_empty());
+        c.tick(&mut core);
+        c.room(&mut core);
+        assert!(!written(&mut core).iter().any(|v| v.get("method") == Some(&json!("turn/start"))));
+        Ok(())
+    }
+
+    #[test]
+    fn send_now_interrupts_a_turn_whose_id_has_not_arrived() {
+        for outcome in ["notification_first", "response_first", "refused"] {
+            let (mut c, mut core, _) = opened();
+            c.command(&mut core, Command::Send { id: "first".into(), text: "original".into(), mode: SendMode::Queue, attachments: vec![], overrides: None, reply_to: None, task: None });
+            let starts = written(&mut core);
+            for (id, mode) in [("queued", SendMode::Queue), ("now", SendMode::Now)] {
+                c.command(&mut core, Command::Send { id: id.into(), text: id.into(), mode, attachments: vec![], overrides: None, reply_to: None, task: None });
+            }
+            assert_eq!(core.state.queue.iter().map(|m| m.id.as_str()).collect::<Vec<_>>(), ["now", "queued"]);
+            assert!(written(&mut core).is_empty());
+            if outcome == "refused" {
+                let id = starts.iter().find(|v| v.get("method") == Some(&json!("turn/start"))).and_then(|v| v.get("id")).cloned().unwrap_or_default();
+                feed(&mut c, &mut core, &[json!({"id": id, "error": {"message": "turn refused"}})]);
+                let writes = written(&mut core);
+                assert_eq!(writes.iter().find(|v| v.get("method") == Some(&json!("turn/start"))).and_then(|v| v.pointer("/params/clientUserMessageId")), Some(&json!("now")));
+                respond(&mut c, &mut core, &writes, "turn/start", json!({"turn": {"id": "t2", "status": "inProgress"}}));
+                assert!(!written(&mut core).iter().any(|v| v.get("method") == Some(&json!("turn/interrupt"))));
+                assert_eq!(core.state.delivery.get("first"), Some(&Delivery::Cancelled));
+                continue;
+            }
+            let notification = json!({"method": "turn/started", "params": {"threadId": "th1", "turn": {"id": "t1", "status": "inProgress"}}});
+            if outcome == "notification_first" { feed(&mut c, &mut core, std::slice::from_ref(&notification)); }
+            respond(&mut c, &mut core, &starts, "turn/start", json!({"turn": {"id": "t1", "status": "inProgress"}}));
+            if outcome == "response_first" { feed(&mut c, &mut core, &[notification]); }
+            assert_eq!(written(&mut core).iter().filter(|v| v.get("method") == Some(&json!("turn/interrupt"))).count(), 1);
+            feed(&mut c, &mut core, &[json!({"method": "turn/completed", "params": {"threadId": "th1", "turn": {"id": "t1", "status": "interrupted", "items": []}}})]);
+            let writes = written(&mut core);
+            assert_eq!(writes.iter().find(|v| v.get("method") == Some(&json!("turn/start"))).and_then(|v| v.pointer("/params/clientUserMessageId")), Some(&json!("now")));
+            assert_eq!(core.state.queue.iter().map(|m| m.id.as_str()).collect::<Vec<_>>(), ["queued"]);
+        }
+    }
+
+    #[test]
     fn a_usage_limit_pauses_the_thread_and_it_goes_on_at_the_reset() -> anyhow::Result<()> {
         let mut core = Core::new();
         core.state.cwd = "/work".into();
@@ -5494,7 +5719,7 @@ mod tests {
         let w = written(&mut core);
         let id = w.iter().find(|v| v.get("method") == Some(&json!("thread/fork"))).and_then(|v| v.get("id")).cloned().unwrap_or_default();
         feed(&mut c, &mut core, &[json!({"id": id, "error": {"code": -32600, "message": "no such thread"}})]);
-        assert!(core.events().any(|e| matches!(&e.body, Body::Notice { text, .. } if text.contains("no such thread"))) && core.state.status == Status::Idle);
+        assert!(core.events().any(|e| matches!(&e.body, Body::Notice { text, .. } if text.contains("no such thread"))) && core.state.status == Status::Exited);
         Ok(())
     }
 
@@ -6539,6 +6764,7 @@ mod tests {
         for (status, expected) in [
             (json!({"type": "active", "activeFlags": []}), Status::Running),
             (json!({"type": "active", "activeFlags": ["waitingOnUserInput"]}), Status::Waiting),
+            (json!({"type": "notLoaded"}), Status::Starting),
             (json!({"type": "systemError"}), Status::Exited),
         ] {
             let (mut c, mut core, _) = opened();
@@ -6547,8 +6773,15 @@ mod tests {
             let requests = written(&mut core);
             respond(&mut c, &mut core, &requests, "thread/resume", json!({"thread": {"id": "th1", "turns": [], "status": status}, "model": "gpt-5", "cwd": "/work"}));
             assert_eq!(core.state.status, expected);
-            assert_eq!(c.waiting.len(), 1);
+            assert!(c.waiting.is_empty());
+            assert_eq!(core.state.queue.len(), 1);
             assert!(!written(&mut core).iter().any(|v| v.get("method").and_then(Value::as_str) == Some("turn/start")));
+            if expected == Status::Starting {
+                feed(&mut c, &mut core, &[json!({"method": "thread/status/changed", "params": {"threadId": "th1", "status": {"type": "idle"}}})]);
+                let writes = written(&mut core);
+                assert_eq!(writes.iter().filter(|v| v.get("method") == Some(&json!("turn/start"))).count(), 1);
+                assert_eq!(core.state.queue.len(), 0);
+            }
         }
     }
 
