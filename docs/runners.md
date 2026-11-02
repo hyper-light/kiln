@@ -165,8 +165,11 @@ overloaded counting against it. It says which and why:
 and, when none suits, why each doesn't (`small: 16 GB free, under 32 GB`). The command finds its
 needs in `KILN_NEEDS`. Reach holds nothing for it: what's idle when it's picked is what it gets.
 
-**The gate** is a command like any other, `kiln run --needs cpus=12,mem=40g,linux/amd64 --detach
--- ci/gate.sh` (AGENTS.md). `ci/gate.sh` holds itself to what it asked (a systemd user unit:
-MemoryMax from the needs, as many rustc and test threads as its CPUs, CPUWeight 1, nice 19, I/O caps
-on the disk its build is on) and stops itself when the machine's own services stall on I/O;
-`ci/gate.sh --dry-run` prints its steps and caps.
+**A change's gate** is commands like any other, composed by the agent that owns the change
+(AGENTS.md): a run per platform, side by side, each `kiln run --needs <platform>,cpus=N,mem=M --
+ci/gate.sh [clippy|test] --since origin/main`, natively on Linux, macOS or Windows, scoped to the
+crates the change touches and those that depend on them. `ci/gate.sh` holds each step to what its
+run asked (on Linux a systemd user unit: MemoryMax from the needs, a rustc per 6 GiB and as many
+test threads, CPUWeight 1, nice 19, I/O caps on the disk its build is on; elsewhere nice 19), says
+its peak memory on Linux, and stops itself when the machine's own services stall on I/O;
+`ci/gate.sh --since origin/main --dry-run` prints its scope and why, its steps and its caps.

@@ -633,8 +633,8 @@ mod tests {
         assert_eq!(with_needs(mine.clone(), ""), mine);
     }
 
-    /// The gate asks for what it needs (AGENTS.md, ci/gate.sh) and goes to a runner that has it, by
-    /// no name: the one with 12 cores idle and 40 GiB free.
+    /// A gate's run asks for what it needs (AGENTS.md, ci/gate.sh) and goes to a runner that has it,
+    /// by no name: asked 12 CPUs and 40 GiB, the one with 12 cores idle and 40 GiB free.
     #[test]
     fn kiln_run_puts_the_gate_on_a_runner_with_room_for_it() -> anyhow::Result<()> {
         let fleet = [

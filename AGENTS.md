@@ -47,9 +47,8 @@ web UI embedded. Read this before you change it, then the documents it points to
   among them, and a restart ends their sessions. Say what the upgrade is; the person does it.
 - **Production runs on adacachy, beside other work.** Heavy builds and tests go where kiln puts
   them, never to a machine by name: ask for what they need (`kiln run --needs`, or MCP `run` with
-  `needs`). The gate is `kiln run --needs cpus=12,mem=40g,linux/amd64 --detach -- ci/gate.sh`: it
-  holds itself to what it asked and yields to production. Anything else heavy: `nice -n 10` and
-  your own `CARGO_TARGET_DIR`.
+  `needs`). Your change's gate (below) holds each of its runs to what it asked and yields to
+  production. Anything else heavy: `nice -n 10` and your own `CARGO_TARGET_DIR`.
 - **Big files go under `~/.cache`, never `/tmp`.** On the Linux machines `/tmp` is a RAM disk
   every session shares.
 - **Stop only what you started,** by the PID you recorded as you started it. Never `pkill -f` or
@@ -64,11 +63,33 @@ web UI embedded. Read this before you change it, then the documents it points to
 - **Git:** never a bare `git stash`; rebase and squash only onto a fixed SHA; gate every push on
   every check's exit code.
 
+## Your change's gate
+
+You compose it, not kiln. `ci/gate.sh` runs one step alone (`clippy`, or `test`; both when neither
+is named), natively where it runs, on the crates you name, held to what its run asked for.
+
+- **Scope:** `--since origin/main` takes the crates your change touches (committed or not), those
+  whose sources name a file it changed (a doc a test reads), and every crate depending on them.
+  `ci/gate.sh --since origin/main --dry-run` says which and why; `-p <crate>` adds one.
+- **Platforms:** clippy on Linux, macOS and Windows, each natively; tests on Linux, and on macOS or
+  Windows too where your change has code for them.
+- **Side by side:** a run per platform, all at once, each through `kiln run --needs`:
+  ```sh
+  kiln run --needs linux/amd64,cpus=4,mem=16g --detach -- ci/gate.sh --since origin/main &
+  kiln run --needs macos,cpus=4,mem=12g --detach -- ci/gate.sh clippy --since origin/main &
+  kiln run --needs windows,cpus=4,mem=12g --detach -- ci/gate.sh clippy --since origin/main &
+  wait
+  ```
+- **Sized** by what each step needs, not by the machine: the memory it can't do without and the
+  CPUs to use (a rustc per 6 GiB). kiln's own crate takes 7 GiB and more to build, and its tests
+  about 17 GiB at `-j 4`; other crates far less. On Linux each step says its peak memory: ask that.
+- **One verdict:** each run ends `GATE: PASS`, or `GATE: FAIL` and why; the gate passes when all do.
+
 ## Checks before handing over
 
 | You changed | Run |
 |---|---|
-| Rust | what you touched first (its tests, clippy on its crate), then the gate: `ci/gate.sh` through `kiln run --needs` (clippy for Linux, Windows and macOS, `cargo test --workspace`) |
+| Rust | what you touched first (its tests, clippy on its crate), then your change's gate (above) |
 | The UI | in `ui/`: `npm run typecheck`, `npm run lint`, `npm test` and `npm run build` |
 | A seam or `docs/seams.md` | `cargo test -p kiln-seams` (its `doc_truth` test holds the doc to the code) |
 | Vendored code | `python3 scripts/vendor.py check` |

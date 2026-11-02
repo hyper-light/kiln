@@ -1,19 +1,35 @@
 #!/usr/bin/env bash
-# kiln's full gate: clippy for Linux, every test of the workspace, then clippy for Windows and
-# macOS where zig is. Ask kiln for a machine that has what it needs and let it choose; never name
-# one:
+# kiln's gate, as steps the agent that owns a change composes that change's gate from (AGENTS.md,
+# "Your change's gate"): each step alone, natively on the machine it runs on (Linux, macOS,
+# Windows), scoped to crates, and held to what its run asked for. A gate is the runs its change
+# needs, side by side, each asking kiln for a machine with what it needs; never name one:
 #
-#   kiln run --needs cpus=12,mem=40g,linux/amd64 --detach -- ci/gate.sh
-#   ci/gate.sh --dry-run            # its steps and caps, running nothing
+#   kiln run --needs linux/amd64,cpus=4,mem=16g -- ci/gate.sh --since origin/main
+#   kiln run --needs macos,cpus=4,mem=12g -- ci/gate.sh clippy --since origin/main
+#   kiln run --needs windows,cpus=4,mem=12g -- ci/gate.sh clippy --since origin/main
+#   ci/gate.sh --since origin/main --dry-run    # its scope and why, its steps and caps; runs nothing
+#
+# Its steps, named first (both, in this order, when none is): clippy, `cargo clippy --all-targets`
+# with warnings denied; and test, the libraries' tests built first (kiln's crate compiled twice at
+# once, as itself and as its tests, is what runs a build out of memory), then every test. Its scope:
+# -p <crate> (again for each crate), and --since <rev>: what changed since rev's merge base with
+# HEAD, committed or not, untracked too, as docs/ci.md's affected() has it (W24-R17): each changed
+# file's crate, every crate below a changed Cargo.toml, Cargo.lock, .cargo/ or rust-toolchain that's
+# in no crate, and every crate that depends on one of those (cargo tree -i); and the crates whose
+# sources name a changed file that's in no crate, as a test that reads a doc does. It says which
+# crates, and why. Neither: the whole workspace. Nothing in scope: nothing to check, GATE: PASS.
 #
 # It holds itself to what it was asked: the needs `kiln run --needs` gives the command (KILN_NEEDS),
-# or --cpus and --mem. As a systemd user unit, its memory is capped at what it asked (MemoryMax),
-# and it yields to everything else on the machine: CPUWeight 1, nice 19, and I/O bandwidth caps on
-# each disk its build is on (--io-read, --io-write; --io off drops them). Its CPUs are what it runs
-# at once: a rustc per 6 GiB asked, at most one per CPU (--jobs), and as many test threads
-# (--test-threads). No CPU quota: one changes what the tests see of the machine (the CPUs a runner
-# reports, W13), as a runner never does. Without a systemd user manager (macOS, a container) it
-# runs uncapped at nice 19, and says so.
+# or --cpus and --mem; asked nothing, 4 CPUs and 16 GiB, the standard runner kiln's GitHub CI runs
+# these steps on. As a systemd user unit, its memory is capped at what it asked (MemoryMax), and it
+# yields to everything else on the machine: CPUWeight 1, nice 19, and I/O bandwidth caps on each
+# disk its build is on (--io-read, --io-write; --io off drops them); each step says the unit's peak memory
+# so far, the measure the next ask follows. Its CPUs are what it runs at once: a rustc per 6 GiB
+# asked, at most one per CPU (--jobs), and as many test threads (--test-threads). No CPU quota: one
+# changes what the tests see of the machine (the CPUs a runner reports, W13), as a runner never does.
+# Without a systemd user manager (macOS, Windows' Git Bash, a container) it runs uncapped at nice 19
+# (Windows' Idle priority), and says so. On Windows with no NASM, aws-lc-sys (kiln's cryptography)
+# builds from the objects it ships (AWS_LC_SYS_PREBUILT_NASM=1).
 #
 # While it runs it watches the services it shares the machine with, three checks running (10 s
 # apart) over the line stopping it: named with --guard-containers (KILN_GATE_GUARD_CONTAINERS), those
@@ -26,47 +42,58 @@
 # containers and networks with it only when it ends): those mounting its own dir, and those
 # labelled with the hash of a folder in its TMPDIR, as kiln's runners label what they make.
 #
-# Its build is its own: a target dir and TMPDIR under ${XDG_CACHE_HOME:-~/.cache}/kiln-gate/<tree>,
-# and git's environment cleared, with an empty global config of its own (writable: tests write it)
-# and no system one, so a machine's signing or hooks reach no test. HOME stays the person's: tests
-# start the coding agents installed there, signed in there. Each step's log is in its logs folder
-# (it says where); the last line is GATE: PASS, or GATE: FAIL and why.
+# Its build is its own: a target dir and TMPDIR under ${XDG_CACHE_HOME:-~/.cache}/kiln-gate/<tree>
+# (--target-dir names a shared target dir instead: cargo's lock queues the builds on it), and git's
+# environment cleared, with an empty global config of its own (writable: tests write it) and no
+# system one, so a machine's signing or hooks reach no test. HOME stays the person's: tests start
+# the coding agents installed there, signed in there. Each step's log is in its logs folder (it says
+# where); the last line is GATE: PASS, or GATE: FAIL and why.
 set -euo pipefail
 here=$(cd "$(dirname "$0")/.." && pwd)
 gate=$here/ci/gate.sh
 
 # ---------------------------------------------------------------- the steps, inside the unit
 if [ "${1:-}" = --steps ]; then
-  jobs=$2 threads=$3 logs=$4 cross=$5
+  jobs=$2 threads=$3 logs=$4 unit=$5 todo=$6
+  # What's left is the scope, as cargo takes it: --workspace, or -p <crate> for each crate.
+  shift 6
   cd "$here"
   export RUST_TEST_THREADS=$threads
   failed=()
+  # Run as a systemd unit, the unit's peak memory so far (cgroup v2's memory.peak).
+  peak() {
+    local cg bytes
+    [ "$unit" != - ] && [ -r /proc/self/cgroup ] || return 0
+    cg=$(awk -F: '$1 == "0" { print $3 }' /proc/self/cgroup)
+    case $cg in */"$unit.service") ;; *) return 0 ;; esac
+    bytes=$(cat "/sys/fs/cgroup$cg/memory.peak" 2> /dev/null) || return 0
+    awk -v b="$bytes" 'BEGIN { printf ", peak memory so far %.1f GiB", b / 1073741824 }'
+  }
   step() {
     local name=$1 t0=$SECONDS code=0
     shift
     echo "::: $name: $*"
     "$@" > "$logs/$name.log" 2>&1 || code=$?
     if [ $code -eq 0 ]; then
-      echo "    passed in $((SECONDS - t0)) s"
+      echo "    passed in $((SECONDS - t0)) s$(peak)"
       return
     fi
-    echo "    FAILED (exit $code) in $((SECONDS - t0)) s: $logs/$name.log"
+    echo "    FAILED (exit $code) in $((SECONDS - t0)) s$(peak): $logs/$name.log"
     # What failed: the errors, and each failing test with how to run it again alone.
     awk '/^ *Running .*\(.*\)$/ { bin = $NF; gsub(/[()]/, "", bin) }
          /^error(\[E[0-9]+\])?:/ && n < 20 { print "    | " $0; n++ }
          /^test .* \.\.\. FAILED$/ && n < 40 { print "    | " $2 " (alone: " bin " --exact " $2 ")"; n++ }' "$logs/$name.log" || true
     failed+=("$name")
   }
-  step clippy-linux cargo clippy --locked --workspace --all-targets -j "$jobs" -- -D warnings
-  # The libraries as their tests first, then the rest (.kiln/ci.yaml): kiln's crate compiled twice
-  # at once (as itself and as its tests) is what runs a build out of memory.
-  step test-build cargo test --locked --workspace --lib --no-run -j "$jobs"
-  step test cargo test --locked --workspace --no-fail-fast -j "$jobs"
-  if [ "$cross" = on ]; then
-    for t in x86_64-pc-windows-gnu aarch64-apple-darwin; do
-      step "clippy-$t" env CARGO_TARGET_DIR="$CARGO_TARGET_DIR-$t" cargo-zigbuild clippy --locked --workspace --target "$t" -j "$jobs" -- -D warnings
-    done
-  fi
+  case ,$todo, in *,clippy,*) step clippy cargo clippy --locked "$@" --all-targets -j "$jobs" -- -D warnings ;; esac
+  case ,$todo, in
+    *,test,*)
+      # The libraries as their tests first, then the rest (.kiln/ci.yaml): kiln's crate compiled
+      # twice at once (as itself and as its tests) is what runs a build out of memory.
+      step test-build cargo test --locked "$@" --lib --no-run -j "$jobs"
+      step test cargo test --locked "$@" --no-fail-fast -j "$jobs"
+      ;;
+  esac
   if [ ${#failed[@]} -eq 0 ]; then
     echo "GATE: PASS"
   else
@@ -77,25 +104,37 @@ if [ "${1:-}" = --steps ]; then
 fi
 
 # ---------------------------------------------------------------- what it was asked
-dry=false cpus='' mem='' jobs='' threads='' io=on io_read=400M io_write=150M guard_url=${KILN_GATE_GUARD_URL:-} guard_containers=${KILN_GATE_GUARD_CONTAINERS:-} cross=auto
+dry=false cpus='' mem='' jobs='' threads='' io=on io_read=400M io_write=150M guard_url=${KILN_GATE_GUARD_URL:-} guard_containers=${KILN_GATE_GUARD_CONTAINERS:-} since='' target_dir=''
+wanted=() crates=()
+value() { [ $# -ge 2 ] || { echo "ci/gate.sh: $1 takes a value (--help says what it takes)" >&2; exit 2; }; }
 while [ $# -gt 0 ]; do
   case $1 in
+    clippy | test) wanted+=("$1") ;;
+    -p | --package) value "$@"; crates+=("$2"); shift ;;
+    --since) value "$@"; since=$2; shift ;;
     --dry-run) dry=true ;;
-    --cpus) cpus=$2; shift ;;
-    --mem) mem=$2; shift ;;
-    --jobs) jobs=$2; shift ;;
-    --test-threads) threads=$2; shift ;;
-    --io) io=$2; shift ;;
-    --io-read) io_read=$2; shift ;;
-    --io-write) io_write=$2; shift ;;
-    --guard-url) guard_url=$2; shift ;;
-    --guard-containers) guard_containers=$2; shift ;;
-    --no-cross) cross=off ;;
+    --cpus) value "$@"; cpus=$2; shift ;;
+    --mem) value "$@"; mem=$2; shift ;;
+    --jobs) value "$@"; jobs=$2; shift ;;
+    --test-threads) value "$@"; threads=$2; shift ;;
+    --target-dir) value "$@"; target_dir=$2; shift ;;
+    --io) value "$@"; io=$2; shift ;;
+    --io-read) value "$@"; io_read=$2; shift ;;
+    --io-write) value "$@"; io_write=$2; shift ;;
+    --guard-url) value "$@"; guard_url=$2; shift ;;
+    --guard-containers) value "$@"; guard_containers=$2; shift ;;
+    # Each platform's steps run on that platform: there's no cross-compiling left to turn off.
+    --no-cross) ;;
     -h | --help) sed -n '2,/^set -euo pipefail/p' "$gate" | sed '$d; s/^# \{0,1\}//'; exit 0 ;;
-    *) echo "ci/gate.sh: no such option $1 (--help says what it takes)" >&2; exit 2 ;;
+    *) echo "ci/gate.sh: no such step or option $1 (--help says what it takes)" >&2; exit 2 ;;
   esac
   shift
 done
+todo=''
+for s in clippy test; do
+  case " ${wanted[*]-} " in *" $s "*) todo=${todo:+$todo,}$s ;; esac
+done
+todo=${todo:-clippy,test}
 asked_by="--cpus and --mem"
 for w in $(printf '%s' "${KILN_NEEDS:-}" | tr ', ' '\n\n'); do
   case $w in
@@ -103,30 +142,133 @@ for w in $(printf '%s' "${KILN_NEEDS:-}" | tr ', ' '\n\n'); do
     mem=* | memory=*) [ -n "$mem" ] || { mem=${w#*=}; asked_by="KILN_NEEDS=$KILN_NEEDS"; } ;;
   esac
 done
-if [ -z "$cpus" ] && [ -z "$mem" ]; then asked_by="nothing: what a full gate needs"; fi
-cpus=${cpus:-6} mem=${mem:-40g}
-# CPUs as kiln writes them (8, 0.5, 500m); memory in systemd's binary units (40G, 512M).
+if [ -z "$cpus" ] && [ -z "$mem" ]; then asked_by="nothing: the standard runner kiln's GitHub CI runs these steps on"; fi
+cpus=${cpus:-4} mem=${mem:-16g}
+# CPUs as kiln writes them (8, 0.5, 500m); memory in systemd's binary units (16G, 512M).
 cpu_n=$(awk -v c="$cpus" 'BEGIN { if (c ~ /m$/) { sub(/m$/, "", c); c /= 1000 } if (c !~ /^[0-9.]+$/ || c <= 0) exit 1; printf "%g", c }') ||
   { echo "ci/gate.sh: $cpus is not a number of CPUs (8, 0.5, 500m)" >&2; exit 2; }
 mem_cap=$(printf '%s' "$mem" | tr '[:lower:]' '[:upper:]' | sed -E 's/I?B?$//')
-printf '%s' "$mem_cap" | grep -Eq '^[0-9]+(\.[0-9]+)?[KMGT]?$' || { echo "ci/gate.sh: $mem is not a size (40g, 512m)" >&2; exit 2; }
+printf '%s' "$mem_cap" | grep -Eq '^[0-9]+(\.[0-9]+)?[KMGT]?$' || { echo "ci/gate.sh: $mem is not a size (16g, 512m)" >&2; exit 2; }
 mem_gib=$(awk -v m="$mem_cap" 'BEGIN { u = substr(m, length(m)); n = m + 0; k = (u == "T") ? 1024 : (u == "G") ? 1 : (u == "M") ? 1 / 1024 : (u == "K") ? 1 / 1048576 : 1 / 1073741824; print n * k }')
 jobs=${jobs:-$(awk -v c="$cpu_n" -v g="$mem_gib" 'BEGIN { j = int(c); if (j < c) j++; m = int(g / 6); if (m < j) j = m; if (j < 1) j = 1; print j }')}
 threads=${threads:-$jobs}
+case $(uname -s) in
+  Linux) os=linux ;;
+  Darwin) os=macos ;;
+  MINGW* | MSYS* | CYGWIN*) os=windows ;;
+  *) os=$(uname -s) ;;
+esac
 
 # ---------------------------------------------------------------- where it builds
 real_home=$HOME
 key=$(printf '%s' "$here" | { sha256sum 2>/dev/null || shasum -a 256; } | cut -c1-12)
 base=${KILN_GATE_DIR:-${XDG_CACHE_HOME:-$real_home/.cache}/kiln-gate/$key}
-target_dir=$base/target
+target_dir=${target_dir:-$base/target}
 logs=$base/logs/$(date -u +%Y%m%dT%H%M%SZ)
 gitconfig=$base/gitconfig
 cargo_home=${CARGO_HOME:-$real_home/.cargo}
 rustup_home=${RUSTUP_HOME:-$real_home/.rustup}
 path=$cargo_home/bin:$real_home/.local/bin:/opt/homebrew/bin:/usr/local/bin:$PATH
-if [ "$cross" = auto ]; then
-  if PATH=$path command -v cargo-zigbuild > /dev/null && PATH=$path command -v zig > /dev/null; then cross=on; else cross=off; fi
+platform_env=()
+if [ "$os" = windows ]; then
+  # Windows' own programs (cargo, rustc, the tests) take their temporary folder from TMP and TEMP.
+  platform_env+=(TMP="$base/tmp" TEMP="$base/tmp")
+  # aws-lc-sys assembles with NASM on x86-64 Windows; with none, from the objects it ships.
+  if [ -z "${AWS_LC_SYS_PREBUILT_NASM:-}" ] && ! PATH=$path command -v nasm > /dev/null; then platform_env+=(AWS_LC_SYS_PREBUILT_NASM=1); fi
 fi
+
+# ---------------------------------------------------------------- what it checks
+# The crates a change since rev $1 affects, as lines "S<tab><crate><tab><why>", and "N<tab><note>"
+# lines that say what was found. As docs/ci.md's affected() (W24-R17): each changed file's crate
+# (the package whose folder holds it most closely; vendored ones pass it on), every package below a
+# changed Cargo.toml, Cargo.lock, .cargo/ or rust-toolchain that's in no package, and every workspace
+# crate that depends on one of those (cargo tree -i, its dev and build dependencies and every
+# platform's); and the crates whose sources name a changed file that's in no package (its path, or a
+# folder of it below the top one), as a test that reads a doc does, and what depends on them.
+affected() {
+  local rev=$1 mb files root members pkgs where named seeds deps f cand hits unnamed=''
+  mb=$(git -C "$here" merge-base "$rev" HEAD 2> /dev/null) || { echo "ci/gate.sh: --since $rev: HEAD shares no commit with it here" >&2; return 2; }
+  files=$( { git -C "$here" -c core.quotepath=off diff --name-only --no-renames "$mb" --; git -C "$here" -c core.quotepath=off ls-files --others --exclude-standard; } | awk 'NF' | sort -u)
+  printf 'N\t%s changed since %s (%.12s), committed or not\n' "$(printf '%s' "$files" | awk 'NF { n++ } END { print n + 0, (n == 1) ? "file" : "files" }')" "$rev" "$mb"
+  [ -n "$files" ] || return 0
+  root=$(cd "$here" && PATH=$path cargo locate-project --workspace --message-format plain | tr '\\' '/') || return 2
+  root=${root%/Cargo.toml}
+  members=$(cd "$here" && PATH=$path cargo tree --locked --workspace --depth 0 --prefix none --format '{p}' -e normal | awk 'NF { print $1 }') || return 2
+  # Every package of the build in this tree: "<name><tab><version><tab><folder from the root><tab>member|dep".
+  pkgs=$(cd "$here" && PATH=$path cargo tree --locked --workspace --target all -e normal,build,dev --prefix none --format '{p}') || return 2
+  pkgs=$(printf '%s\n' "$pkgs" | tr '\\' '/' | M=$(printf '%s ' $members) awk -v root="$root" '
+    BEGIN { r = tolower(root); n = split(ENVIRON["M"], m, " "); for (i = 1; i <= n; i++) member[m[i]] = 1 }
+    { l = tolower($0); dir = ""
+      if (index(l, "(" r ")")) dir = "."
+      else if ((i = index(l, "(" r "/")) > 0) { rest = substr($0, i + length(r) + 2); j = index(rest, ")"); if (!j) next; dir = substr(rest, 1, j - 1) }
+      else next
+      v = $2; sub(/^v/, "", v)
+      if (!seen[$1 "@" v]++) print $1 "\t" v "\t" dir "\t" (($1 in member) ? "member" : "dep") }')
+  # Each changed file: "own" (in a package), "input" (one per package below a Cargo input), or "none".
+  where=$(printf '%s\n' "$files" | P=$pkgs awk '
+    BEGIN { n = split(ENVIRON["P"], L, "\n"); for (i = 1; i <= n; i++) { split(L[i], f, "\t"); name[i] = f[1]; spec[i] = f[1] "@" f[2]; dir[i] = f[3]; kind[i] = f[4] } }
+    { file = $0; best = 0; bl = -1
+      for (i = 1; i <= n; i++) { d = dir[i]; k = (d == ".") ? 0 : length(d); if ((d == "." || index(file, d "/") == 1) && k > bl) { best = i; bl = k } }
+      if (best) { print "own\t" spec[best] "\t" name[best] "\t" kind[best] "\t" file; next }
+      base = file; sub(/.*\//, "", base); folder = file; if (!sub(/\/[^\/]*$/, "", folder)) folder = ""
+      cargo = 0
+      if (index(file, ".cargo/") == 1) { cargo = 1; folder = "" }
+      else if ((p = index(file, "/.cargo/")) > 0) { cargo = 1; folder = substr(file, 1, p - 1) }
+      if (cargo || base == "Cargo.toml" || base == "Cargo.lock" || base ~ /^rust-toolchain/) {
+        for (i = 1; i <= n; i++) if (folder == "" || dir[i] == folder || index(dir[i], folder "/") == 1) print "input\t" spec[i] "\t" name[i] "\t" kind[i] "\t" file
+        next }
+      print "none\t\t\t\t" file }')
+  printf '%s\n' "$where" | awk -F'\t' '$1 == "own" && $4 == "member" && !c[$3]++ { first[$3] = $5; own[++n] = $3 }
+    $1 == "own" && $4 == "member" { more[$3] = c[$3] - 1 }
+    $1 == "input" && $4 == "member" && !seen[$3]++ { input[++m] = $3; by[$3] = $5 }
+    END { for (i = 1; i <= n; i++) { x = own[i]; print "S\t" x "\tchanged: " first[x] (more[x] ? " and " more[x] " more" : "") }
+      for (i = 1; i <= m; i++) { x = input[i]; print "S\t" x "\t" by[x] " changed, a Cargo input of every crate below it" } }'
+  # A changed file in no package: the crates whose sources name it, its path or a folder of it.
+  named=''
+  while IFS= read -r f; do
+    [ -n "$f" ] || continue
+    cand=$f hits=''
+    while :; do
+      hits=$(cd "$here" && git -c core.quotepath=off grep -l -F --untracked -e "$cand" -- $(printf '%s\n' "$pkgs" | awk -F'\t' '$4 == "member" { print $3 }') 2> /dev/null || true)
+      [ -z "$hits" ] || break
+      case $cand in */*/*) cand=${cand%/*} ;; *) break ;; esac
+    done
+    if [ -z "$hits" ]; then
+      unnamed=${unnamed:+$unnamed, }$f
+      continue
+    fi
+    named=$named$(printf '%s\n' "$hits" | P=$pkgs awk -v cand="$cand" '
+      BEGIN { n = split(ENVIRON["P"], L, "\n"); for (i = 1; i <= n; i++) { split(L[i], f, "\t"); if (f[4] == "member") { k++; nm[k] = f[1]; sp[k] = f[1] "@" f[2]; dr[k] = f[3] } } }
+      { best = 0; bl = -1; for (i = 1; i <= k; i++) { d = dr[i]; w = (d == ".") ? 0 : length(d); if ((d == "." || index($0, d "/") == 1) && w > bl) { best = i; bl = w } }
+        if (best && !seen[best]++) print "S\t" nm[best] "\tnames " cand " (" $0 ")\t" sp[best] }')$'\n'
+  done < <(printf '%s\n' "$where" | awk -F'\t' '$1 == "none" { print $5 }')
+  printf '%s' "$named" | cut -f1-3
+  [ -z "$unnamed" ] || printf 'N\tin no crate, and named in none: %s\n' "$unnamed"
+  # What depends on them: each workspace crate in an inverted tree of one, and which it depends on.
+  seeds=$( { printf '%s\n' "$where" | awk -F'\t' '$1 == "own" || $1 == "input" { print $2 }'; printf '%s' "$named" | awk -F'\t' 'NF >= 4 { print $4 }'; } | sort -u)
+  [ -n "$seeds" ] || return 0
+  set --
+  for s in $seeds; do set -- "$@" -i "$s"; done
+  deps=$(cd "$here" && PATH=$path cargo tree --locked --workspace --target all -e normal,build,dev --prefix depth --format '{p}' "$@") || return 2
+  printf '%s\n' "$deps" | P=$pkgs awk '
+    BEGIN { n = split(ENVIRON["P"], L, "\n"); for (i = 1; i <= n; i++) { split(L[i], f, "\t"); if (f[4] == "member") member[f[1]] = 1 } }
+    match($0, /^[0-9]+/) { d = substr($0, 1, RLENGTH) + 0; split(substr($0, RLENGTH + 1), a, " ")
+      if (d == 0) { at = a[1]; next }
+      if ((a[1] in member) && a[1] != at) print "S\t" a[1] "\tdepends on " at }'
+}
+scope=()
+reasons=''
+if [ -n "$since" ]; then
+  reasons=$(affected "$since") || exit 2
+fi
+names=$( { printf '%s\n' ${crates[@]+"${crates[@]}"}; printf '%s\n' "$reasons" | awk -F'\t' '$1 == "S" { print $2 }'; } | awk 'NF' | sort -u)
+if [ -z "$since" ] && [ ${#crates[@]} -eq 0 ]; then
+  scope=(--workspace)
+else
+  for c in $names; do scope+=(-p "$c"); done
+fi
+
+# ---------------------------------------------------------------- how it holds itself
 unit=kiln-gate-$key-$(date +%s)
 systemd=false
 if command -v systemd-run > /dev/null && systemctl --user show-environment > /dev/null 2>&1; then systemd=true; fi
@@ -165,11 +307,11 @@ fi
 # ones (`systemd-run`, this gate's own) aren't. Unit and pressure file, one a line.
 watched=''
 if command -v systemctl > /dev/null; then
-  for scope in --system --user; do
-    for u in $(systemctl "$scope" list-units --type=service --state=running --no-legend --plain 'kiln*' 2> /dev/null | awk '{ print $1 }'); do
+  for manager in --system --user; do
+    for u in $(systemctl "$manager" list-units --type=service --state=running --no-legend --plain 'kiln*' 2> /dev/null | awk '{ print $1 }'); do
       case $u in kiln-test-* | kiln-gate-*) continue ;; esac
-      systemctl "$scope" show -p Description --value "$u" 2> /dev/null | grep -q 'self-supervising CI/CD job server' || continue
-      cg=$(systemctl "$scope" show -p ControlGroup --value "$u" 2> /dev/null || true)
+      systemctl "$manager" show -p Description --value "$u" 2> /dev/null | grep -q 'self-supervising CI/CD job server' || continue
+      cg=$(systemctl "$manager" show -p ControlGroup --value "$u" 2> /dev/null || true)
       if [ -n "$cg" ] && [ -r "/sys/fs/cgroup$cg/io.pressure" ]; then watched="$watched$u /sys/fs/cgroup$cg/io.pressure"$'\n'; fi
     done
   done
@@ -180,44 +322,58 @@ else
   guarding="system.slice's I/O pressure (full avg10) over 30 (no kiln services here to watch)"
 fi
 
-steps=("clippy-linux: cargo clippy --locked --workspace --all-targets -j $jobs -- -D warnings"
-  "test-build: cargo test --locked --workspace --lib --no-run -j $jobs"
-  "test: cargo test --locked --workspace --no-fail-fast -j $jobs (RUST_TEST_THREADS=$threads)")
-if [ "$cross" = on ]; then
-  for t in x86_64-pc-windows-gnu aarch64-apple-darwin; do steps+=("clippy-$t: cargo-zigbuild clippy --locked --workspace --target $t -j $jobs -- -D warnings"); done
-fi
 caps=$(printf '%s ' "${props[@]#-p}" | sed 's/  */ /g; s/^ //; s/ $//')
-echo "ci/gate.sh: the gate of $here at $(git -C "$here" rev-parse --short HEAD 2> /dev/null || echo '(not a git tree)')"
+echo "ci/gate.sh: the gate of $here at $(git -C "$here" rev-parse --short HEAD 2> /dev/null || echo '(not a git tree)'), natively on $os/$(uname -m)"
 echo "asked: $(awk -v c="$cpu_n" 'BEGIN { printf "%g CPU%s", c, (c == 1) ? "" : "s" }'), $mem_cap of memory (from $asked_by)"
 if $systemd; then
   echo "caps: $caps (systemd user unit $unit)"
 else
-  echo "caps: $caps would apply, but this machine has no systemd user manager: it runs uncapped, at nice 19"
+  echo "caps: $caps would apply, but this machine has no systemd user manager: it runs uncapped, at nice 19$([ "$os" != windows ] || echo " (Idle priority)")"
 fi
 echo "cargo: -j $jobs, $threads test threads"
-if [ -n "$guard_containers" ]; then
+[ ${#platform_env[@]} -eq 0 ] || echo "env: ${platform_env[*]}"
+if ! $systemd; then
+  echo "guard: none (no systemd here: no cgroups of its own to watch from)"
+elif [ -n "$guard_containers" ]; then
   echo "guard: I/O pressure (full avg10) over 30 in ${guard_containers//,/, }${guard_url:+, or $guard_url over 3 s}, three checks running, stops it"
 elif [ -n "$watched" ]; then
   echo "guard: $guarding${guard_url:+, or $guard_url over 3 s}, three checks running, stops it"
 else
   echo "guard: system.slice I/O pressure (full avg10) over 30, its own tests' containers left out (no kiln services here to watch)${guard_url:+, or $guard_url over 3 s}, three checks running, stops it"
 fi
-echo "steps:"
-n=0
-for s in "${steps[@]}"; do n=$((n + 1)); echo "  $n. $s"; done
-[ "$cross" = on ] || echo "  (no clippy for Windows and macOS: no zig and cargo-zigbuild here)"
+if [ "${scope[0]-}" = --workspace ]; then
+  echo "scope: the workspace, every crate"
+elif [ ${#scope[@]} -eq 0 ]; then
+  echo "scope: none: nothing changed since $since is in a crate or named in one"
+else
+  echo "scope: $(printf '%s ' $names | sed 's/ $//')"
+fi
+{ printf '%s\n' "$reasons"; for c in ${crates[@]+"${crates[@]}"}; do printf 'S\t%s\tasked for (-p)\n' "$c"; done; } |
+  awk -F'\t' '$1 == "N" { print "  " $2 } $1 == "S" && !seen[$2]++ { print "  " $2 ": " $3 }'
+if [ ${#scope[@]} -eq 0 ]; then
+  echo "steps: none, with nothing in scope"
+else
+  echo "steps:"
+  n=0
+  case ,$todo, in *,clippy,*) n=$((n + 1)); echo "  $n. clippy: cargo clippy --locked ${scope[*]} --all-targets -j $jobs -- -D warnings" ;; esac
+  case ,$todo, in *,test,*) n=$((n + 1)); echo "  $n. test: cargo test --locked ${scope[*]} --lib --no-run -j $jobs, then cargo test --locked ${scope[*]} --no-fail-fast -j $jobs (RUST_TEST_THREADS=$threads)" ;; esac
+fi
 echo "build: $target_dir, TMPDIR $base/tmp, git config $gitconfig, logs $logs"
 if $dry; then exit 0; fi
+if [ ${#scope[@]} -eq 0 ]; then
+  echo "GATE: PASS (nothing in scope to check)"
+  exit 0
+fi
 
 # ---------------------------------------------------------------- the run
 mkdir -p "$target_dir" "$base/tmp" "$logs"
 : > "$gitconfig"
 env_vars=(HOME="$real_home" GIT_CONFIG_GLOBAL="$gitconfig" GIT_CONFIG_NOSYSTEM=1 CARGO_HOME="$cargo_home" RUSTUP_HOME="$rustup_home" PATH="$path" CARGO_TARGET_DIR="$target_dir"
-  TMPDIR="$base/tmp" CARGO_PROFILE_DEV_DEBUG=line-tables-only CARGO_TERM_COLOR=never)
-inner=(env -u GIT_DIR -u GIT_WORK_TREE -u GIT_INDEX_FILE "${env_vars[@]}" bash "$gate" --steps "$jobs" "$threads" "$logs" "$cross")
+  TMPDIR="$base/tmp" CARGO_PROFILE_DEV_DEBUG=line-tables-only CARGO_TERM_COLOR=never ${platform_env[@]+"${platform_env[@]}"})
 if ! $systemd; then
-  exec nice -n 19 "${inner[@]}"
+  exec nice -n 19 env -u GIT_DIR -u GIT_WORK_TREE -u GIT_INDEX_FILE "${env_vars[@]}" bash "$gate" --steps "$jobs" "$threads" "$logs" - "$todo" "${scope[@]}"
 fi
+inner=(env -u GIT_DIR -u GIT_WORK_TREE -u GIT_INDEX_FILE "${env_vars[@]}" bash "$gate" --steps "$jobs" "$threads" "$logs" "$unit" "$todo" "${scope[@]}")
 
 systemd-run --user --unit "$unit" --collect --wait --pipe --quiet --working-directory="$here" "${props[@]}" "${inner[@]}" &
 pid=$!
