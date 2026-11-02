@@ -153,6 +153,22 @@ pub(crate) fn spawn_at_execution(
     spawn_native(shell, command, program, cwd, cols, rows, env, false)
 }
 
+/// [`spawn_at_execution`] into a CI execution, for a runner's loop: the bridge's group is
+/// registered durably off the runtime's shards (W17-R01), so the loop goes on meanwhile.
+#[allow(clippy::too_many_arguments)] // The same terminal parameters, owned.
+pub(crate) async fn open_at_execution(
+    shell: Option<String>,
+    command: Option<String>,
+    program: Option<Vec<String>>,
+    cwd: Option<std::path::PathBuf>,
+    cols: u16,
+    rows: u16,
+    env: Vec<(String, String)>,
+    execution: std::sync::Arc<crate::runner::processes::Execution>,
+) -> anyhow::Result<(PtySession, async_channel::Receiver<PtyOut>)> {
+    ci_pty::open(shell, command, program, cwd, cols, rows, env, execution).await
+}
+
 #[allow(clippy::too_many_arguments)] // Keep the public terminal launch parameters together.
 fn spawn_native(
     shell: Option<&str>, command: Option<&str>, program: Option<&[String]>,

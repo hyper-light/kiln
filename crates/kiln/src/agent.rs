@@ -443,6 +443,8 @@ enum Ev {
     OrdinaryInput(AdmittedInput),
     /// This SAME local event has already entered the retained outbox.
     UpDurable(Up),
+    /// A terminal into a leg, opened off the loop ([`Bg::Opened`]).
+    Opened(Box<Opened>),
     /// A test build's fault: the connection drops (W22-AC04).
     ChaosDrop,
     /// A test build's fault: a frame held back, due now (W22-AC04).
@@ -599,6 +601,27 @@ enum Bg {
     /// A server frame to take again ([`Ev::Forwarded`]): a terminal into a leg this runner holds,
     /// asked for (by its session) before the leg had its shell.
     Again(String, Vec<u8>),
+    /// A terminal into a leg, opened off the loop ([`Ev::Opened`]).
+    Opened(Box<Opened>),
+}
+
+/// A terminal into a leg (W17-R01), opened off the loop: placing its bridge in the leg's
+/// execution writes the bridge's group durably first, which the loop doesn't wait on. Its PTY, or
+/// why it didn't open, and what goes with it.
+struct Opened {
+    session: String,
+    job: String,
+    cols: u16,
+    rows: u16,
+    masks: Vec<String>,
+    execution: Arc<crate::runner::processes::Execution>,
+    retained_child: bool,
+    pty: anyhow::Result<(terminal::PtySession, async_channel::Receiver<PtyOut>)>,
+}
+
+/// U03/W17-R01: bound input retained while the debug bridge is registering its group.
+fn pending_terminal_input_within(typed: &[Vec<u8>]) -> bool {
+    typed.len() <= 32 && typed.iter().try_fold(0usize, |n, bytes| n.checked_add(bytes.len())).is_some_and(|n| n <= 1024 * 1024)
 }
 
 /// What the new build said of one thing handed to it (blue/green).
@@ -1746,6 +1769,8 @@ pub(crate) async fn run_in(o: Opts, shutdown: Shutdown, admission_paths: crate::
     // Terminals into legs asked for before the leg had its shell, by session: taken again once it
     // has, with what was typed meanwhile.
     let mut shell_waits: HashMap<String, Vec<Vec<u8>>> = HashMap::new();
+    // Terminals into legs being opened off the loop ([`Bg::Opened`]), with what was typed meanwhile.
+    let mut opening: HashMap<String, Vec<Vec<u8>>> = HashMap::new();
     let (term_tx, term_rx) = async_channel::bounded::<(String, PtyOut)>(1024);
     // U16: upgrades are explicit CI/CD commands. Legacy terminal handovers are still
     // adopted, but a changed executable pathname never selects or activates a runner build.
@@ -2197,6 +2222,7 @@ pub(crate) async fn run_in(o: Opts, shutdown: Shutdown, admission_paths: crate::
                 Ok(Bg::Forwarded(data)) => Ev::Forwarded(data),
                 // Unless the terminal was closed meanwhile.
                 Ok(Bg::Again(session, data)) => if shell_waits.contains_key(&session) { Ev::Forwarded(data) } else { Ev::Watchdog },
+                Ok(Bg::Opened(opened)) => Ev::Opened(opened),
                 #[cfg(unix)]
                 Ok(b) => Ev::Bg(b),
                 Err(_) => Ev::Watchdog,
@@ -2854,8 +2880,8 @@ pub(crate) async fn run_in(o: Opts, shutdown: Shutdown, admission_paths: crate::
                         draining = false;
                         uplink.msg(AgentMsg::Instance(instance_hello.clone())).await;
                     }
-                    // Turned into Ev::Forwarded as they're received.
-                    Bg::Forwarded(_) | Bg::Again(..) => {}
+                    // Turned into Ev::Forwarded and Ev::Opened as they're received.
+                    Bg::Forwarded(_) | Bg::Again(..) | Bg::Opened(_) => {}
                 }
             }
             Ev::Redial => {
@@ -4212,6 +4238,12 @@ pub(crate) async fn run_in(o: Opts, shutdown: Shutdown, admission_paths: crate::
                             pty.write(data);
                         } else if let Some(typed) = shell_waits.get_mut(&session) {
                             typed.push(data);
+                        } else if let Some(typed) = opening.get_mut(&session) {
+                            typed.push(data);
+                            if !pending_terminal_input_within(typed) {
+                                opening.remove(&session);
+                                deferred_control.enqueue(&uplink.0, Up::Term(AgentMsg::TermExit { session, code: None, error: Some("terminal input queue is full; session closed".into()) }))?;
+                            }
                         }
                     }
                     ServerMsg::TermResize { session, cols, rows } => {
@@ -4245,6 +4277,7 @@ pub(crate) async fn run_in(o: Opts, shutdown: Shutdown, admission_paths: crate::
                             continue;
                         }
                         shell_waits.remove(&session);
+                        opening.remove(&session);
                         terms.remove(&session);
                     }
                     ServerMsg::AiTranscript { req, pid } => match &ai {
@@ -4516,7 +4549,11 @@ pub(crate) async fn run_in(o: Opts, shutdown: Shutdown, admission_paths: crate::
                             uplink.0.send(Up::Term(AgentMsg::TermExit { session, code: None, error: Some("terminal disabled on this agent".into()) })).await.ok();
                             continue;
                         }
-                        if terms.contains_key(&session) {
+                        if terms.contains_key(&session) || opening.contains_key(&session) {
+                            continue;
+                        }
+                        if opening.len() >= 64 {
+                            deferred_control.enqueue(&uplink.0, Up::Term(AgentMsg::TermExit { session, code: None, error: Some("too many debug terminals are opening".into()) }))?;
                             continue;
                         }
                         // A leg in a microVM here (W13-R05): its terminal opens in there.
@@ -4545,8 +4582,11 @@ pub(crate) async fn run_in(o: Opts, shutdown: Shutdown, admission_paths: crate::
                             continue;
                         };
                         let typed = shell_waits.remove(&session).unwrap_or_default();
+                        if !pending_terminal_input_within(&typed) {
+                            deferred_control.enqueue(&uplink.0, Up::Term(AgentMsg::TermExit { session, code: None, error: Some("terminal input queue is full; session closed".into()) }))?;
+                            continue;
+                        }
                         let l = shell.launch(command.as_deref(), o.shell.as_deref());
-                        let env: Vec<(&str, String)> = l.env.iter().map(|(k, v)| (k.as_str(), v.clone())).collect();
                         // U03: a host debug PTY must belong to the exact active execution or
                         // a child registered with the retained root before any raw PTY spawn.
                         let (execution, retained_child) = if let Some(running) = jobs.get(&job) {
@@ -4562,33 +4602,14 @@ pub(crate) async fn run_in(o: Opts, shutdown: Shutdown, admission_paths: crate::
                             refuse(&mut answer_after, crate::wire::channel::Refusal::Refused, "the job has no exact debug execution owner");
                             continue;
                         };
-                        match terminal::spawn_at_execution(l.shell.as_deref(), l.command.as_deref(), l.program.as_deref(), l.cwd.as_deref(), cols, rows, &env, Some(Arc::clone(&execution))) {
-                            Ok((pty, rx)) => {
-                                let (tx, s, masked) = (term_tx.clone(), session.clone(), crate::runner::kept::masked(rx, &shell.masks));
-                                crate::rt::spawn(async move {
-                                    while let Ok(out) = masked.recv().await {
-                                        let exited = matches!(&out, PtyOut::Exit(_));
-                                        // The bridge proves its own group empty for live jobs.
-                                        // Only retained children may fence their whole scope;
-                                        // stopping a live job's root would kill unrelated steps.
-                                        if exited && retained_child { execution.stop().await; }
-                                        if tx.send((s.clone(), out)).await.is_err() || exited {
-                                            break;
-                                        }
-                                    }
-                                    if retained_child { execution.stop().await; }
-                                });
-                                let state = crate::termsess::Session::detached(session.clone(), format!("leg:{job}"), None, cols, rows);
-                                for data in typed {
-                                    pty.write(data);
-                                }
-                                terms.insert(session, (pty, state));
-                            }
-                            Err(e) => {
-                                if retained_child { crate::rt::spawn(async move { execution.stop().await; }); }
-                                uplink.0.send(Up::Term(AgentMsg::TermExit { session, code: None, error: Some(format!("{e:#}")) })).await.ok();
-                            }
-                        }
+                        // Its bridge opens off the loop (W17-R01); what's typed meanwhile waits with it.
+                        opening.insert(session.clone(), typed);
+                        let (bg, masks) = (bg_tx.clone(), shell.masks.clone());
+                        let crate::runner::kept::Launch { program, env, cwd, shell: login, command } = l;
+                        crate::rt::spawn(async move {
+                            let pty = terminal::open_at_execution(login, command, program, cwd, cols, rows, env, Arc::clone(&execution)).await;
+                            let _ = bg.send(Bg::Opened(Box::new(Opened { session, job, cols, rows, masks, execution, retained_child, pty }))).await;
+                        });
                     }
                     // A kept leg let go now, or kept longer (W17-R02).
                     ServerMsg::KeepRelease { job } => {
@@ -4712,6 +4733,43 @@ pub(crate) async fn run_in(o: Opts, shutdown: Shutdown, admission_paths: crate::
                     }
                 } else {
                     uplink.0.send(Up::Term(msg)).await.ok();
+                }
+            }
+            // A terminal into a leg, its bridge opened off the loop (W17-R01).
+            Ev::Opened(opened) => {
+                let Opened { session, job, cols, rows, masks, execution, retained_child, pty } = *opened;
+                // Closed meanwhile: what opened ends with it here.
+                let Some(typed) = opening.remove(&session) else {
+                    drop(pty);
+                    if retained_child { crate::rt::spawn(async move { execution.stop().await; }); }
+                    continue;
+                };
+                match pty {
+                    Ok((pty, rx)) => {
+                        let (tx, s, masked) = (term_tx.clone(), session.clone(), crate::runner::kept::masked(rx, &masks));
+                        crate::rt::spawn(async move {
+                            while let Ok(out) = masked.recv().await {
+                                let exited = matches!(&out, PtyOut::Exit(_));
+                                // The bridge proves its own group empty for live jobs.
+                                // Only retained children may fence their whole scope;
+                                // stopping a live job's root would kill unrelated steps.
+                                if exited && retained_child { execution.stop().await; }
+                                if tx.send((s.clone(), out)).await.is_err() || exited {
+                                    break;
+                                }
+                            }
+                            if retained_child { execution.stop().await; }
+                        });
+                        let state = crate::termsess::Session::detached(session.clone(), format!("leg:{job}"), None, cols, rows);
+                        for data in typed {
+                            pty.write(data);
+                        }
+                        terms.insert(session, (pty, state));
+                    }
+                    Err(e) => {
+                        if retained_child { crate::rt::spawn(async move { execution.stop().await; }); }
+                        deferred_control.enqueue(&uplink.0, Up::Term(AgentMsg::TermExit { session, code: None, error: Some(format!("{e:#}")) }))?;
+                    }
                 }
             }
             event @ (Ev::Up(_) | Ev::UpDurable(_)) => {
@@ -5693,6 +5751,13 @@ fn adopt_handover(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn u03_w17_pending_terminal_input_has_frame_and_byte_bounds() {
+        assert!(super::pending_terminal_input_within(&vec![vec![0; 32768]; 32]));
+        assert!(!super::pending_terminal_input_within(&vec![vec![0]; 33]));
+        assert!(!super::pending_terminal_input_within(&[vec![0; 1024 * 1024 + 1]]));
+    }
+
     #[test]
     fn u03_inherited_pod_factory_fences_uid_node_grant_and_job_attempt() -> anyhow::Result<()> {
         let dir = tempfile::tempdir()?;

@@ -182,6 +182,22 @@ fn leader(nodes: &BTreeMap<u64, Database>, excluded: u64) -> anyhow::Result<u64>
     }
 }
 
+/// U15: roles can change while the earlier fixture writes commit. Select a follower at the
+/// boundary that needs one, rather than retaining the first election's role assignments.
+fn follower(nodes: &BTreeMap<u64, Database>) -> anyhow::Result<Database> {
+    let until = Instant::now() + Duration::from_secs(10);
+    loop {
+        for database in nodes.values() {
+            let status = database.replica().context("missing product replica")?.status()?;
+            if status.leader != 0 && status.leader != status.node_id && !status.bootstrapping && status.fenced.is_none() {
+                return Ok(database.clone());
+            }
+        }
+        anyhow::ensure!(Instant::now() < until, "product did not expose a ready follower");
+        std::thread::sleep(Duration::from_millis(5));
+    }
+}
+
 fn open_nodes(directory: &std::path::Path) -> anyhow::Result<BTreeMap<u64, Database>> {
     let mut nodes = BTreeMap::new();
     for id in 1..=3 {
@@ -262,7 +278,7 @@ fn cd_state(database: Database, directory: std::path::PathBuf, write: bool) -> a
         let status = database.replica().context("missing CD product replica")?.status()?;
         let legacy = directory.join(status.node_id.to_string()).join("cd-legacy");
         if write {
-            anyhow::ensure!(status.leader != 0 && status.leader != status.node_id && !status.bootstrapping && status.fenced.is_none(), "CD commands must originate on a ready product follower");
+            anyhow::ensure!(status.leader != 0 && status.leader != status.node_id && !status.bootstrapping && status.fenced.is_none(), "CD commands must originate on a ready product follower: {status:?}");
         }
         let bus: Arc<dyn kiln_seams::Bus> = Arc::new(crate::bus::QuiverBus::open(&Default::default(), crate::rt::clock())?);
         let shutdown = crate::rt::Shutdown::new();
@@ -316,11 +332,9 @@ fn u15_acknowledged_conversation_and_inbox_survive_product_leader_loss_and_resta
     let directory = tempfile::tempdir_in(cache)?;
     let nodes = open_nodes(directory.path())?;
     let network = Network::start(&nodes)?;
-    let original = leader(&nodes, 0)?;
-    let former_leader = nodes.get(&original).context("missing leader")?.clone();
     // Originate actual adaptive SQL and Records calls on a follower. Product-owned ReadIndex
     // and proposal forwarding must carry both the captured answer and durable application.
-    let database = nodes.iter().find_map(|(id, db)| (*id != original).then(|| db.clone())).context("missing follower")?;
+    let database = follower(&nodes)?;
     let shutdown = crate::rt::Shutdown::new();
     let waiting = database.clone();
     crate::rt::block_on(async move { crate::rt::timeout(Duration::from_secs(10), super::wait_for_writer(&waiting, &shutdown)).await? })?;
@@ -339,13 +353,16 @@ fn u15_acknowledged_conversation_and_inbox_survive_product_leader_loss_and_resta
         Ok(inbox.accept("session", "message", "digest", Some(1), 3).await?)
     })?;
     assert!(!accepted.repeat);
-    // U15/B2: these CD commands originate on the same follower through the actual adapter;
+    // U15/B2: these CD commands originate on a current follower through the actual adapter;
     // their ACKs must represent the same product quorum as conversation and inbox writes.
     // Each logical host has its own legacy directory. Canonical provenance must allow
     // another replica to consume completed state without revalidating a foreign path.
     let legacy = directory.path().to_path_buf();
-    cd_state(database.clone(), legacy.clone(), true)?;
+    cd_state(follower(&nodes)?, legacy.clone(), true)?;
     drop(conversation);
+    // Lose the leader that owns the product now, after all acknowledged fixture writes.
+    let original = leader(&nodes, 0)?;
+    let former_leader = nodes.get(&original).context("missing leader")?.clone();
     network.isolated.store(original, Ordering::SeqCst);
     let successor = leader(&nodes, original)?;
     let next = nodes.get(&successor).context("missing successor")?.clone();

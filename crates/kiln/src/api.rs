@@ -2593,7 +2593,8 @@ async fn retry(hub: &Hub, id: &str, req: Request) -> R {
     }
     let only_failed = body.is_none_or(|r| r.only_failed);
     let attempt = crate::ci::retry::run(hub, id, only_failed, &by).await.map_err(|(code, why)| err(code, &why))?;
-    let jobs = hub.store.jobs(id.to_owned(), false).await?.into_iter().filter(|j| !j.status.is_terminal()).count();
+    // U01/W26-R21: a dependent can still wait in the plan without a row in this attempt.
+    let jobs = hub.ci.unfinished_jobs(id).await?;
     hub.emit_run(id).await;
     hub.store.audit("admin".into(), "run.retry".into(), id.to_owned()).await;
     Ok(srv::json(StatusCode::OK, &json!({ "jobs": jobs, "attempt": attempt })))

@@ -726,6 +726,16 @@ impl RunPlan {
         self.finished
     }
 
+    /// W26-R21: unfinished work includes jobs whose needs have not allowed their legs to
+    /// expand yet. Such a job counts once until its matrix is known.
+    pub fn unfinished_jobs(&self) -> usize {
+        self.nodes.iter().fold(0usize, |count, node| count.saturating_add(match node.state {
+            JobState::Waiting => 1,
+            JobState::Expanded => node.legs.iter().filter(|leg| !matches!(leg.state, LegState::Done(_))).count(),
+            JobState::Done => 0,
+        }))
+    }
+
     /// Every job and leg as they stand.
     pub fn jobs(&self) -> Vec<JobView> {
         self.nodes
@@ -1172,7 +1182,7 @@ impl RunPlan {
             match self.job_if(&job, dialect, &cx) {
                 Ok(true) => {}
                 Ok(false) => {
-                    let reason = skip_reason(&job, cx.status);
+                    let reason = skip_reason(&job, cx.status, self.cancelled);
                     if !job.cond.as_ref().is_some_and(|t| unaffected_if(&job, t, dialect, &cx)) {
                         self.conclude_job(n, Conclusion::Skipped, reason, out);
                         return;
@@ -1612,9 +1622,9 @@ impl RunPlan {
                 match self.job_if(&job, dialect, &cx) {
                     Ok(true) => {}
                     // W24-R06: false only for what the change didn't touch: reused, else skipped.
-                    Ok(false) if job.cond.as_ref().is_some_and(|t| unaffected_if(&job, t, dialect, &cx)) => spec.unaffected = Some(skip_reason(&job, cx.status)),
+                    Ok(false) if job.cond.as_ref().is_some_and(|t| unaffected_if(&job, t, dialect, &cx)) => spec.unaffected = Some(skip_reason(&job, cx.status, self.cancelled)),
                     Ok(false) => {
-                        let reason = skip_reason(&job, cx.status);
+                        let reason = skip_reason(&job, cx.status, self.cancelled);
                         self.settle(n, l, spec, Conclusion::Skipped, reason, out);
                         changed = true;
                         continue;
@@ -1992,10 +2002,13 @@ fn aggregate(cs: impl Iterator<Item = Conclusion>) -> Conclusion {
     }
 }
 
-fn skip_reason(job: &Job, s: StatusView) -> String {
+/// Why `job` was skipped. `run_cancelled`: the run itself was, not only a job it needs (one of a
+/// set cancelled while the run goes on: "dependency cancelled", docs/ci.md W26-R21).
+fn skip_reason(job: &Job, s: StatusView, run_cancelled: bool) -> String {
     match &job.cond {
         Some(t) => format!("skipped: `if: {}` was false", t.src),
-        None if s.cancelled => "skipped: the run was cancelled".into(),
+        None if s.cancelled && run_cancelled => "skipped: the run was cancelled".into(),
+        None if s.cancelled => "dependency cancelled".into(),
         None if s.failed => "skipped: a job it needs failed".into(),
         None => "skipped: a job it needs was skipped".into(),
     }

@@ -7,6 +7,18 @@ use std::collections::HashMap;
 use super::*;
 use crate::wf::parse_workflow;
 
+#[test]
+fn w26_r21_unfinished_jobs_include_dependents_waiting_to_expand() {
+    let mut run = Run::kiln("on: push\njobs:\n  a:\n    steps: [{run: a}]\n  b:\n    needs: a\n    steps: [{run: b}]\n  c:\n    steps: [{run: c}]\n");
+    assert_eq!(run.queued.len(), 2);
+    assert_eq!(run.plan.unfinished_jobs(), 3);
+    run.finish("a", Conclusion::Success);
+    assert_eq!(run.plan.unfinished_jobs(), 2);
+    run.finish("b", Conclusion::Success);
+    run.finish("c", Conclusion::Success);
+    assert_eq!(run.plan.unfinished_jobs(), 0);
+}
+
 fn workflow(src: &str, dialect: Dialect) -> Arc<Workflow> {
     let path = if dialect == Dialect::Gha { ".github/workflows/t.yml" } else { ".kiln/t.yaml" };
     let (w, d) = parse_workflow(path, src, dialect);
@@ -255,7 +267,7 @@ fn cancelling_runs_only_what_still_holds() {
     r.cancel();
     assert_eq!(r.cancels, vec!["a"]);
     r.finish("a", Conclusion::Cancelled);
-    assert!(r.logged("b skipped"));
+    assert!(r.logged("b skipped: skipped: the run was cancelled"), "{:?}", r.log);
     assert!(r.queued.contains(&"cleanup".to_owned()) && r.queued.contains(&"oncancel".to_owned()), "{:?}", r.log);
     r.finish("cleanup", S);
     r.finish("oncancel", S);
@@ -270,7 +282,7 @@ fn w26_r21_cancelling_some_legs_stops_them_and_skips_what_needs_them_the_rest_go
     r.cancel_legs(&["a"]);
     assert_eq!(r.cancels, vec!["a"]);
     r.finish("a", Conclusion::Cancelled);
-    assert!(r.logged("b skipped"), "{:?}", r.log);
+    assert!(r.logged("b skipped: dependency cancelled"), "the run wasn't: {:?}", r.log);
     // The run goes on: `c` finishes and `d` runs after it.
     r.finish("c", S);
     assert!(r.queued.contains(&"d".to_owned()), "{:?}", r.queued);

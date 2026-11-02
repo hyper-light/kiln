@@ -225,6 +225,8 @@ pub enum Msg {
     /// A person paused a leg, or resumed it (docs/ci.md W26-R22): waiting, it's placed nowhere
     /// until it's resumed. The store has it paused already, and its runner froze it if it runs.
     LegPaused { leg: String, paused: bool },
+    /// W26-R21: the compatibility retry API also counts jobs waiting on their needs.
+    UnfinishedJobs { run: String, reply: async_channel::Sender<usize> },
 }
 
 /// Where and how a leg runs, as the scheduler placed it.
@@ -701,6 +703,15 @@ impl Default for Handle {
 }
 
 impl Handle {
+    pub(crate) async fn unfinished_jobs(&self, run: &str) -> anyhow::Result<usize> {
+        anyhow::ensure!(self.available() && self.tx.len() < 128, "the dispatcher cannot inspect unfinished jobs now");
+        let (reply, receive) = async_channel::bounded(1);
+        self.tx.try_send(Msg::UnfinishedJobs { run: run.to_owned(), reply })?;
+        crate::rt::timeout(Duration::from_secs(30), receive.recv()).await
+            .map_err(|_| anyhow::anyhow!("the dispatcher did not answer the unfinished jobs query"))?
+            .map_err(Into::into)
+    }
+
     /// Sends a message, unless the engine is off (then nothing listens).
     pub fn send(&self, m: Msg) {
         if self.on.load(Ordering::Relaxed) {
@@ -1499,6 +1510,10 @@ impl Dispatch {
                 let r = self.approve_run(&run, &by, approve).await;
                 let _ = reply.try_send(*r.as_ref().unwrap_or(&false));
                 r.map(|_| ())
+            }
+            Msg::UnfinishedJobs { run, reply } => {
+                let _ = reply.try_send(self.runs.get(&run).map_or(0, |state| state.plan.unfinished_jobs()));
+                Ok(())
             }
             Msg::Explain { leg, reply } => {
                 let demand = self.decisions.get(&leg).map(|d| serde_json::json!({ "decision": d, "why": d.why() }));
@@ -2340,8 +2355,15 @@ impl Dispatch {
         placed: HashMap<String, kiln_ci::sched::Placement>,
         by: &str,
     ) -> anyhow::Result<u32> {
-        if self.runs.contains_key(run) {
-            if let RerunMode::Leg {key,..}=mode {
+        if let Some(pipeline)=self.runs.get(run).map(|r|r.wf.dialect==Some(kiln_ci::expr::Dialect::Kiln)) {
+            // A `.kiln/` pipeline's run still going takes one job again at a time, in place: a
+            // leg, or a set of one (W26-R21). A workflow's run finishes first.
+            let one=match mode {
+                RerunMode::Leg {key,..}=>Some(key),
+                RerunMode::Set(legs)=>match legs.as_slice() { [RerunMode::Leg {key,..}]=>Some(key), _=>None },
+                _=>None,
+            };
+            if let Some(key)=one.filter(|_|pipeline) {
                 return Box::pin(self.retry_active_pipeline(run,key,placed,by)).await;
             }
             anyhow::bail!("the run is still in progress; cancel it or wait for it to finish");
@@ -2864,9 +2886,18 @@ impl Dispatch {
                     r
                 }
                 Command::Wait { leg, reason } => {
-                    let r = runs::wait_reason(&self.hub, &leg, &serde_json::to_value(&reason).unwrap_or_default()).await;
-                    self.hub.emit_job(&leg).await;
-                    r
+                    // The waits said beside it (a run's legs queued at once) are one write.
+                    let mut waits = vec![(leg, serde_json::to_value(&reason).unwrap_or_default())];
+                    while matches!(todo.front(), Some(Command::Wait { leg, .. }) if !leg.starts_with("reach-") && !leg.starts_with("retained-")) {
+                        if let Some(Command::Wait { leg, reason }) = todo.pop_front() {
+                            waits.push((leg, serde_json::to_value(&reason).unwrap_or_default()));
+                        }
+                    }
+                    let r = runs::wait_reasons(&self.hub, waits).await;
+                    for leg in r.as_ref().map_or(&[][..], Vec::as_slice) {
+                        self.hub.emit_job(leg).await;
+                    }
+                    r.map(|_| ())
                 }
                 Command::Settled { leg, outcome, reason } => self.settled(&leg, outcome, reason).await,
                 Command::Timer { at } => {
@@ -3931,7 +3962,7 @@ impl Dispatch {
         let mut keys = Vec::new();
         for id in ids {
             match rows.iter().find(|(r, ..)| r == id) {
-                None => each.push((id.clone(), Err("not a leg of this run".to_owned()))),
+                None => each.push((id.clone(), Err("not a job of this run".to_owned()))),
                 Some((_, key, status)) if crate::store::Status::parse(status).is_terminal() => each.push((id.clone(), Err(format!("`{key}` already finished: it's {status}")))),
                 Some((_, key, _)) => {
                     keys.push(key.clone());
@@ -4249,6 +4280,9 @@ impl Dispatch {
         if let Some(cmds) = self.after(cmds) {
             Box::pin(self.commands(cmds)).await;
         }
+        // What the scheduler says of them, carried out together: their waits are one write
+        // (W05-AC09: a thousand queued legs rebuilt).
+        let mut said = Vec::new();
         for li in queued {
             // Held for its environment before the restart: held again, its wait counted from then.
             if let Some(env) = self.legs.get(&li.id).and_then(|l| l.spec.environment.as_ref()).map(|e| e.name.clone()).filter(|n| !n.is_empty()) {
@@ -4261,10 +4295,10 @@ impl Dispatch {
                 }
                 continue;
             }
-            let cmds = self.sched.handle(Input::LegQueued(Box::new(li)), now_ms());
-            if let Some(cmds) = self.after(cmds) {
-                Box::pin(self.commands(cmds)).await;
-            }
+            said.extend(self.sched.handle(Input::LegQueued(Box::new(li)), now_ms()));
+        }
+        if let Some(cmds) = self.after(said) {
+            Box::pin(self.commands(cmds)).await;
         }
         if !unapproved {
             recovered.retain(|a| match a {

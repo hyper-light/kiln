@@ -94,7 +94,13 @@ fn physically_settled(c:&Connection<'_>,job:&Job)->anyhow::Result<()> {
     // never permitted through missing-journal inference.
     if job.status=="skipped" {
         let unexposed:bool=c.query_row("SELECT EXISTS(SELECT 1 FROM ci_attempts WHERE leg_id=?1 AND number=?2 AND status IN ('pending','queued','done') AND started_at IS NULL AND (runner IS NULL OR runner='-') AND EXISTS(SELECT 1 FROM jobs j WHERE j.id=leg_id AND j.attempt=number AND j.status='skipped' AND j.started_at IS NULL AND (j.agent IS NULL OR j.agent='-')))",params![job.id,job.from],|r|r.get(0))?;
-        anyhow::ensure!(unexposed,"`{}` has no accepted never-exposed skip",job.key);
+        if unexposed {return Ok(());}
+    }
+    // W26-R21: a leg the engine planned, skipped or cancelled before any runner claimed it.
+    // A claim records its attempt in the same transaction, so with none it never ran.
+    if matches!(job.status.as_str(),"skipped"|"cancelled") {
+        let unclaimed:bool=c.query_row("SELECT EXISTS(SELECT 1 FROM jobs WHERE id=?1 AND attempt=?2 AND status=?3 AND started_at IS NULL AND (agent IS NULL OR agent='-')) AND NOT EXISTS(SELECT 1 FROM ci_attempts WHERE leg_id=?1 AND number=?2)",params![job.id,job.from,job.status],|r|r.get(0))?;
+        anyhow::ensure!(unclaimed,"`{}` has no accepted never-exposed {}",job.key,job.status);
         return Ok(());
     }
     anyhow::bail!("`{}` needs its original physical retirement proof before in-place retry; historical ownership is unsupported",job.key)
@@ -126,8 +132,9 @@ impl Intent {
         let (attempt,status,workflow,input):(u32,String,String,String)=c.query_row("SELECT r.attempt,r.status,p.workflow,p.input FROM runs r JOIN ci_plans p ON p.run_id=r.id WHERE r.id=?1",[&self.run],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?)))?;
         anyhow::ensure!(attempt==self.run_attempt && matches!(status.as_str(),"queued"|"pending"|"running"),"the original active run attempt changed");
         let input:serde_json::Value=serde_json::from_str(&input)?;
-        anyhow::ensure!(input.get("legacy_import").and_then(serde_json::Value::as_bool)==Some(true),"the run is not an imported expanded pipeline");
         let workflow:Workflow=serde_json::from_str(&workflow)?;
+        // W26-R21: a `.kiln/` pipeline's, whether the engine planned it or imported it from v1.
+        anyhow::ensure!(input.get("legacy_import").and_then(serde_json::Value::as_bool)==Some(true) || workflow.dialect==Some(kiln_ci::expr::Dialect::Kiln),"the run is not an expanded pipeline");
         anyhow::ensure!(serde_json::to_string(&workflow)?==self.workflow,"the original pipeline workflow changed");
         let cancelled:bool=c.query_row("SELECT EXISTS(SELECT 1 FROM ci_plan_log WHERE run_id=?1 AND attempt=?2 AND kind='cancel')",params![self.run,self.run_attempt],|r|r.get(0))?;
         anyhow::ensure!(!cancelled,"the original run attempt has a cancellation intent");
@@ -176,8 +183,9 @@ impl Intent {
         let mut input:String=tx.query_row("SELECT input FROM ci_plans WHERE run_id=?1",[&self.run],|r|r.get(0))?;
         let mut value:serde_json::Value=serde_json::from_str(&input)?;
         let object=value.as_object_mut().ok_or_else(||anyhow::anyhow!("saved run input is not an object"))?;
-        let mut placed:HashMap<String,kiln_ci::sched::Placement>=object.get("placed").map(|v|serde_json::from_value(v.clone())).transpose()?.unwrap_or_default();
-        let mut fresh:HashSet<String>=object.get("retry_fresh").map(|v|serde_json::from_value(v.clone())).transpose()?.unwrap_or_default();
+        // A run the engine planned saves `placed: null` when nothing was placed.
+        let mut placed:HashMap<String,kiln_ci::sched::Placement>=object.get("placed").filter(|v|!v.is_null()).map(|v|serde_json::from_value(v.clone())).transpose()?.unwrap_or_default();
+        let mut fresh:HashSet<String>=object.get("retry_fresh").filter(|v|!v.is_null()).map(|v|serde_json::from_value(v.clone())).transpose()?.unwrap_or_default();
         for job in &self.jobs {
             match &job.placement {Some(p)=>{placed.insert(job.key.clone(),p.clone());},None=>{placed.remove(&job.key);}}
             fresh.insert(job.key.clone());
@@ -442,7 +450,7 @@ pub(super) async fn exercise_active_retry()->anyhow::Result<()> {
     let mut owners=Vec::new();
     for (index,id) in [target.clone(),sibling.clone()].into_iter().enumerate() {
         let sequence=u64::try_from(index)?.checked_add(1).ok_or_else(||anyhow::anyhow!("fixture sequence overflow"))?;
-        let owner=OrdinaryOwnerV1 {version:1,job:id.clone(),attempt:1,host:"retry-host".into(),process_nonce:"retry-process".into(),publication_epoch:"retry-domain".into(),connection:"a".repeat(64),grant:format!("retry-grant-{sequence}"),execution:format!("retry-execution-{sequence}"),allocation:format!("retained-retry-{sequence}"),command:OrdinaryCommandV1 {stream:"l:1.1".into(),seq:sequence}};
+        let owner=OrdinaryOwnerV1 {version:1,job:id.clone(),attempt:1,host:"retry-host".into(),process_nonce:"retry-process".into(),publication_epoch:"retry-domain".into(),connection:"a".repeat(64),grant:format!("retry-grant-{sequence}"),execution:format!("ci-retry-execution-{sequence}"),allocation:format!("retained-retry-{sequence}"),command:OrdinaryCommandV1 {stream:"l:1.1".into(),seq:sequence}};
         let spec=d.legs.get(&id).ok_or_else(||anyhow::anyhow!("fixture canonical leg missing"))?.spec.clone();
         let state=d.runs.get("active-retry").ok_or_else(||anyhow::anyhow!("fixture canonical run missing"))?;
         let mut leg:LegIn=leg_in(state,"active-retry",&id,&spec,&hub.cfg.ci,&d.warm);leg.initial_attempt=1;
@@ -520,7 +528,7 @@ pub(super) async fn exercise_active_retry()->anyhow::Result<()> {
     // path, then leave its dependent running. Retry must refuse before effects.
     for (index,id) in [target.clone(),dependent.clone()].into_iter().enumerate() {
         let sequence=u64::try_from(index)?.checked_add(3).ok_or_else(||anyhow::anyhow!("fixture sequence overflow"))?;
-        let owner=OrdinaryOwnerV1 {version:1,job:id.clone(),attempt:2,host:"retry-host".into(),process_nonce:"retry-process".into(),publication_epoch:"retry-domain".into(),connection:"a".repeat(64),grant:format!("retry-grant-{sequence}"),execution:format!("retry-execution-{sequence}"),allocation:format!("retained-retry-{sequence}"),command:OrdinaryCommandV1 {stream:"l:1.1".into(),seq:sequence}};
+        let owner=OrdinaryOwnerV1 {version:1,job:id.clone(),attempt:2,host:"retry-host".into(),process_nonce:"retry-process".into(),publication_epoch:"retry-domain".into(),connection:"a".repeat(64),grant:format!("retry-grant-{sequence}"),execution:format!("ci-retry-execution-{sequence}"),allocation:format!("retained-retry-{sequence}"),command:OrdinaryCommandV1 {stream:"l:1.1".into(),seq:sequence}};
         let spec=d.legs.get(&id).ok_or_else(||anyhow::anyhow!("new canonical retry leg missing"))?.spec.clone();
         let state=d.runs.get("active-retry").ok_or_else(||anyhow::anyhow!("active retry run missing"))?;
         let mut leg=leg_in(state,"active-retry",&id,&spec,&hub.cfg.ci,&d.warm);leg.initial_attempt=2;

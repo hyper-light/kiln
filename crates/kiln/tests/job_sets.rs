@@ -142,7 +142,12 @@ fn w26_r21_any_set_of_a_runs_jobs_run_again_or_stopped_on_both_engines() -> anyh
     // jobs run again (`{ jobs: n }`).
     let (st, _) = http(s.port, "POST", &format!("/api/runs/{run}/cancel"), &s.admin, None)?;
     anyhow::ensure!(st == 204, "cancel without jobs: {st}");
-    anyhow::ensure!(v1(&s)?.values().all(|j| j.1 == "cancelled" || j.1 == "skipped"), "{:?}", v1(&s)?);
+    // U01/W26-R21: the unified engine acknowledges the durable cancellation intent before
+    // its scheduler settles every leg, including dependents restored by the in-place retry.
+    until(&s, 60, "all pipeline jobs cancelled or skipped", || {
+        let now = v1(&s)?;
+        Ok(if now.values().all(|j| j.1 == "cancelled" || j.1 == "skipped") { Ok(()) } else { Err(format!("{now:?}")) })
+    })?;
     let (st, v) = post(&s, &format!("/api/runs/{run}/retry"), &json!({}))?;
     anyhow::ensure!(st == 200 && v.get("jobs").and_then(Value::as_u64) == Some(3), "retry without jobs: {st} {v}");
 

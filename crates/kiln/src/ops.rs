@@ -561,8 +561,10 @@ pub async fn http(cx: Cx, method: Method, path: &[&str], q: &std::collections::H
         let input = yours(&cx.caller, info.name, input);
         let (_, reached, _) = op.route(&input)?;
         let reached: Vec<&str> = reached.iter().map(String::as_str).collect();
+        let reply = definition.map(|d| d.reply).unwrap_or(Reply::Json(200));
+        let asked = matches!(reply, Reply::JsonBy(_)).then(|| input.clone());
         let value = run_reached(cx.clone(), op, input, &reached).await.map_err(|error| error.into_fail(info.name))?;
-        match definition.map(|d| d.reply).unwrap_or(Reply::Json(200)) {
+        match reply {
             Reply::Empty => Ok(srv::status(StatusCode::NO_CONTENT)),
             Reply::Yaml(field) => {
                 let text = value.get(field).and_then(Value::as_str).ok_or_else(|| (StatusCode::INTERNAL_SERVER_ERROR, format!("{} did not return {field}", info.name)))?;
@@ -575,6 +577,10 @@ pub async fn http(cx: Cx, method: Method, path: &[&str], q: &std::collections::H
             }
             Reply::Json(code) => {
                 let status = StatusCode::from_u16(code).map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+                Ok(if value.is_null() { srv::status(status) } else { srv::json(status, &value) })
+            }
+            Reply::JsonBy(decide) => {
+                let status = StatusCode::from_u16(decide(asked.as_ref().unwrap_or(&Value::Null), &value)).map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
                 Ok(if value.is_null() { srv::status(status) } else { srv::json(status, &value) })
             }
             Reply::Protocol => Err((StatusCode::INTERNAL_SERVER_ERROR, "a protocol adapter must handle this operation".to_owned())),
@@ -616,7 +622,7 @@ pub fn document_http(paths: &mut serde_json::Map<String, Value>, listed: &[Info]
                 Payload::Text(_) => json!({"type": "string"}),
                 Payload::Object | Payload::EmptyObject | Payload::Ignored => input,
             };
-            let code = match route.reply { Reply::Json(code) | Reply::JsonField(code, _) => code, Reply::Empty => 204, _ => 200 };
+            let code = match route.reply { Reply::Json(code) | Reply::JsonField(code, _) => code, Reply::JsonBy(decide) => decide(&Value::Null, &Value::Null), Reply::Empty => 204, _ => 200 };
             let mut response = json!({
                 "summary": info.summary,
                 "x-kiln-operation": info.name,
@@ -761,6 +767,34 @@ mod tests {
         assert_eq!(reaper.definition.input(&reaper.bindings, &query, json!({"keep_last": 3}), &reaper.operation.info().input.schema())?, json!({"policy": {"keep_last": 3}, "scope": "server"}));
         for path in [vec!["api", "ci", "legs", "leg", "logs"], vec!["api", "diffs", "D1", "versions", "1", "blob"], vec!["api", "ci", "runs", "run", "artifacts", "7", "download"]] {
             assert!(!owns_http(&Method::GET, &path), "the original protocol adapter owns {}", path.join("/"));
+        }
+        Ok(())
+    }
+
+    /// U12: a route answers with the status its legacy route did: W03-R02's hooks, W03-R11's
+    /// dispatch, an experiment's start, W26-R21's cancel of some jobs or the whole run, and
+    /// W13-R01's probe before and after its report comes.
+    #[test]
+    fn u12_http_statuses_are_the_legacy_routes() -> Result<(), Fail> {
+        for (method, path, input, answer, expected) in [
+            (Method::POST, &["api", "ci", "repos", "acme", "hooks"][..], json!({}), json!({"id": "h1"}), 201),
+            (Method::DELETE, &["api", "ci", "repos", "acme", "hooks", "h1"][..], json!({}), Value::Null, 204),
+            (Method::POST, &["api", "ci", "repos", "acme", "dispatch"][..], json!({"workflow": "ci.yml"}), json!({"dispatched": true, "ref": "main"}), 204),
+            (Method::POST, &["api", "experiments"][..], json!({}), json!({"experiment": {}}), 202),
+            (Method::POST, &["api", "ci", "runs", "r1", "cancel"][..], json!({"jobs": ["a"]}), json!({"run": "r1", "jobs": []}), 200),
+            (Method::POST, &["api", "ci", "runs", "r1", "cancel"][..], json!({"jobs": []}), Value::Null, 202),
+            (Method::POST, &["api", "ci", "runs", "r1", "cancel"][..], json!({}), Value::Null, 202),
+            (Method::POST, &["api", "agents", "box", "probe"][..], json!({}), json!({"runner": "box", "facts": {"os": "linux"}}), 200),
+            (Method::POST, &["api", "agents", "box", "probe"][..], json!({}), json!({"runner": "box", "facts": null, "note": "asked"}), 202),
+        ] {
+            let route = match_http(&method, path)?.ok_or_else(|| (StatusCode::NOT_FOUND, path.join("/")))?;
+            let status = match route.definition.reply {
+                Reply::Json(code) | Reply::JsonField(code, _) => code,
+                Reply::JsonBy(decide) => decide(&input, &answer),
+                Reply::Empty => 204,
+                Reply::Yaml(_) | Reply::Protocol => 200,
+            };
+            assert_eq!(status, expected, "{method} /{} with {input} answering {answer}", path.join("/"));
         }
         Ok(())
     }

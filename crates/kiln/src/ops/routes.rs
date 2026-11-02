@@ -55,6 +55,9 @@ pub enum Reply {
     Json(u16),
     /// U12: keep a legacy HTTP answer while named calls retain the whole domain result.
     JsonField(u16, &'static str),
+    /// U12: a legacy route whose status the call decides, from its input and its answer (a run's
+    /// cancel answers 200 for some of its jobs and 202 for the whole run).
+    JsonBy(fn(&Value, &Value) -> u16),
     Empty,
     Yaml(&'static str),
     /// Binary downloads, streaming and other protocol-owned responses stay adapters.
