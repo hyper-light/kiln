@@ -5,8 +5,9 @@
 //! the goal is skipped, the agent is told, and the stack waits for them), or revise (their words go
 //! to the agent as a part of the goal, the plan goes back to planning, and once its agent says it's
 //! ready again it comes back to them, changed). Each answer is kept, the last with the plan.
-//! A plan proposed in plan mode isn't answered here: its harness asks, and the `approve` command
-//! answers it.
+//! Running it (`plans.run`) is approving it ([`run_approves`]): it goes the one way, as the goal's
+//! parts. A plan proposed in plan mode isn't answered here: its harness asks, and the `approve`
+//! command answers it.
 use super::{Error, Plan, R};
 use crate::hub::Hub;
 use rusqlite::{OptionalExtension, params};
@@ -115,12 +116,10 @@ pub async fn answer(hub: &Hub, id: &str, asked: Asked, who: &str, by: &crate::go
         .and_then(|s| s.goal.clone())
         .ok_or_else(|| Error::Bad("only a plan made from a goal waits on a review here: one an agent proposed in plan mode is answered as its harness asks".into()))?;
     let stack_now = || async { crate::goals::get(hub, &goal.agent).await.map_err(goals_error) };
-    if let Some(k) = key.clone() {
-        let (pid, k2) = (p.id.clone(), k);
-        let seen = hub.store.call(move |c| Ok(c.query_row("SELECT 1 FROM plan_reviews WHERE plan_id = ?1 AND key = ?2", params![pid, k2], |_| Ok(())).optional()?.is_some())).await?;
-        if seen {
-            return Ok((super::get(hub, id).await?, stack_now().await?));
-        }
+    if let Some(k) = key.as_deref()
+        && answered_under(hub, &p.id, k).await?
+    {
+        return Ok((super::get(hub, id).await?, stack_now().await?));
     }
     let stack = stack_now().await?;
     if stack.held_for.as_deref() != Some(p.id.as_str()) {
@@ -153,6 +152,29 @@ pub async fn answer(hub: &Hub, id: &str, asked: Asked, who: &str, by: &crate::go
         tell(hub, &goal.agent, &p, made.as_deref()).await;
     }
     Ok((super::get(hub, id).await?, stack_now().await?))
+}
+
+/// Whether plan `id`'s review was answered under `key` already.
+async fn answered_under(hub: &Hub, id: &str, key: &str) -> R<bool> {
+    let (pid, k) = (id.to_owned(), key.to_owned());
+    Ok(hub.store.call(move |c| Ok(c.query_row("SELECT 1 FROM plan_reviews WHERE plan_id = ?1 AND key = ?2", params![pid, k], |_| Ok(())).optional()?.is_some())).await?)
+}
+
+/// Whether running plan `id` (`plans.run`) approves it instead: its agent's goals wait on a person's
+/// review of it, or a run under `key` approved it already (asked again, its answer lost). A plan
+/// made from a goal goes one way once it's ready, its steps to its agent as the goal's parts; run
+/// a second way beside them, each step would be done twice.
+pub async fn run_approves(hub: &Hub, id: &str, key: Option<&str>) -> R<bool> {
+    let p = super::get(hub, id).await?;
+    let Some(goal) = p.source.as_ref().and_then(|s| s.goal.as_ref()) else {
+        return Ok(false);
+    };
+    if let Some(k) = key
+        && answered_under(hub, &p.id, k).await?
+    {
+        return Ok(true);
+    }
+    Ok(crate::goals::get(hub, &goal.agent).await.map_err(goals_error)?.held_for.as_deref() == Some(p.id.as_str()))
 }
 
 /// Agent `agent` told its plan `p` was rejected (a message, queued behind a turn under way; `id`: the

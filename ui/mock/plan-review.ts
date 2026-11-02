@@ -11,6 +11,7 @@
  *
  *   GET  /api/plans/:id, /versions; GET /api/plans?session=   their plans (one read alone with `reviewed`)
  *   POST /api/plans/:id/review   {answer: approve|reject|revise, words?, version?, key}
+ *   POST /api/plans/:id/run      while its goals wait on its review: approved instead, as the server does
  *   GET  /api/research/:id; GET /api/research?agent=          their research
  *   GET  /api/harness/sessions/:id/goals; POST …/goals/start  their goal stacks
  *
@@ -917,10 +918,18 @@ export async function handlePlanReview(req: http.IncomingMessage, res: http.Serv
     );
     return true;
   }
-  if ((mm = p.match(/^\/api\/plans\/([^/]+)(\/versions|\/review|\/runs)?$/))) {
+  if ((mm = p.match(/^\/api\/plans\/([^/]+)(\/versions|\/review|\/runs|\/run)?$/))) {
     const kept = plans.get(decodeURIComponent(mm[1]!));
     if (!kept) return false;
-    if (mm[2] === "/review" && method === "POST") {
+    const goal = kept.plan.source?.goal;
+    const m = goal ? members.get(goal.agent) : undefined;
+    if (mm[2] === "/run") {
+      // Run while its goals wait on its review: approved instead, its steps going as the goal's parts.
+      if (method !== "POST" || !goal || m?.stack?.held_for !== kept.plan.id) return false;
+      const [status, out] = review(kept.plan.id, { answer: "approve", key: (await body<{ key?: string }>(req)).key });
+      const sent = m.stack.items.filter((i) => i.part_of === goal.id && i.part_kind === "plan" && (i.status === "pending" || i.status === "active")).length;
+      json(res, status, status === 200 ? { approved: true, session: goal.agent, sent, ...(out as object) } : out);
+    } else if (mm[2] === "/review" && method === "POST") {
       const [status, out] = review(kept.plan.id, await body(req));
       json(res, status, out);
     } else if (mm[2] === "/versions") json(res, 200, kept.versions);
