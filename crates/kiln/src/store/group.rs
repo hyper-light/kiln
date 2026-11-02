@@ -367,6 +367,9 @@ impl Group {
             // Driven by events: what's proposed is written at the first lull, together.
             quiet: Duration::ZERO,
             elections: Elections::Suspicion,
+            // Today's: a member's heartbeats wait on its flush proof, and a leader applies only
+            // what a majority's disks hold, its own among them (hyper-durable's `Disk`).
+            disk: hyper_durable::Disk::Flushed,
         };
         let (tx, rx) = mpsc::sync_channel(QUEUED);
         let (out_tx, outgoing) = async_channel::bounded(OUTGOING);

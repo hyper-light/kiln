@@ -50,6 +50,18 @@ const HEAD: usize = 16;
 
 /// One request and its reply on hyper-transport, `body` bytes each way.
 fn exchange(net: &mut Net<Node<Mantle>, Node<Mantle>>, body: Option<u64>, piece: &[u8]) {
+    exchange_held(net, body, piece, (0, false));
+}
+
+/// As [`exchange`], the server holding its reply `beats` beats of its notes (a third of the serve
+/// period each) once it has the request, and saying at each that it is at work where `vouch`:
+/// the two differ by the notes alone.
+fn exchange_held(
+    net: &mut Net<Node<Mantle>, Node<Mantle>>,
+    body: Option<u64>,
+    piece: &[u8],
+    (beats, vouch): (u32, bool),
+) {
     let progress = Progress::new(Duration::from_secs(10)).unwrap();
     let head = [7u8; HEAD];
     let id = net
@@ -84,6 +96,17 @@ fn exchange(net: &mut Net<Node<Mantle>, Node<Mantle>>, body: Option<u64>, piece:
                 *got += n as u64;
             }
             if *got == length && (body.is_none() || net.b.body_complete(*exchange)) && !*replied {
+                let beat = limits().serve_period / 3;
+                for _ in 0..beats {
+                    if vouch {
+                        net.b.working(*exchange);
+                    }
+                    let until = net.now + beat;
+                    while net.now < until {
+                        net.exchange();
+                        net.advance_within(until - net.now);
+                    }
+                }
                 net.b.reply(*exchange, &head, body).unwrap();
                 *replied = true;
             }
@@ -397,6 +420,16 @@ fn main() {
         "hyper-transport exchange, 16 B heads, no body",
         ROUNDS,
         || exchange(&mut net, None, &piece),
+    ));
+    rows.push(measure(
+        "hyper-transport exchange, no body, its reply held three beats",
+        ROUNDS / 4,
+        || exchange_held(&mut net, None, &piece, (3, false)),
+    ));
+    rows.push(measure(
+        "hyper-transport exchange, no body, its reply held three beats, a note at each",
+        ROUNDS / 4,
+        || exchange_held(&mut net, None, &piece, (3, true)),
     ));
     rows.push(measure(
         "hyper-transport exchange, 16 B heads, 4 KiB bodies",

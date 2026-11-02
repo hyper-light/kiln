@@ -25,7 +25,7 @@ use std::time::{Duration, Instant};
 use hyper_transport::tls::{CertificateDer, Credentials, PrivateKeyDer, PrivatePkcs8KeyDer, Tls};
 use hyper_transport::{
     AdmissionLimits, Authenticated, Budget, Classes, Config, Directory, Endpoint, Event, Fixed,
-    Limits, PeerId, Refusal, Transmit,
+    Limits, PeerId, Refusal, RestartKey, Transmit,
 };
 
 /// The deployment's authority, issuing one certificate per node.
@@ -368,6 +368,8 @@ pub fn limits() -> Limits {
         // A full 16 MiB window of unread data, packed: 16 MiB / 65,527 B, and one.
         receive_chunks: (16 << 20) / hyper_transport::RECEIVE_CHUNK + 1,
         retry_bytes: None,
+        acknowledgement: hyper_transport::Acknowledgement::Decimated,
+        fec_window: None,
     }
 }
 
@@ -379,6 +381,16 @@ pub trait Drive {
     fn fire(&mut self, now: Instant);
     /// The driver measured its timer granularity: what has a use for it takes it.
     fn granularity(&mut self, _granularity: Duration) {}
+    /// The address the datagram [`Drive::transmit`] gave last was sent from, for a driver that is
+    /// several endpoints at once ([`Several`]); none, the network's own address for its side.
+    fn source(&self) -> Option<SocketAddr> {
+        None
+    }
+    /// A datagram sent to `to`: a driver that is several endpoints gives it to the one there.
+    fn datagram_to(&mut self, now: Instant, from: SocketAddr, to: SocketAddr, bytes: &[u8]) {
+        let _ = to;
+        self.datagram(now, from, bytes);
+    }
     /// What the scheduling core read that differed from its fold, with the oracle on
     /// (hyper-transport src/tally.rs); a driver without one has none.
     #[cfg(feature = "oracle")]
@@ -412,6 +424,73 @@ impl<C: Classes, B: Budget<C::Class>, D: Directory<Role = C::Role>> Drive for En
 /// A node of the in-memory network.
 pub type Node<C> = Endpoint<C, Fixed, Book>;
 
+/// Several endpoints on one side of a [`Net`], each at an address of its own: connections of their
+/// own to the other side, as many peers' are. Each sends in turn, and a datagram goes to the one
+/// at the address it was sent to.
+pub struct Several<D> {
+    pub nodes: Vec<(SocketAddr, D)>,
+    next: usize,
+    last: Option<SocketAddr>,
+}
+
+impl<D> Several<D> {
+    pub fn new(nodes: Vec<(SocketAddr, D)>) -> Self {
+        Self {
+            nodes,
+            next: 0,
+            last: None,
+        }
+    }
+}
+
+impl<D: Drive> Drive for Several<D> {
+    fn datagram(&mut self, now: Instant, from: SocketAddr, bytes: &[u8]) {
+        let to = self.nodes[0].0;
+        self.datagram_to(now, from, to, bytes);
+    }
+    fn datagram_to(&mut self, now: Instant, from: SocketAddr, to: SocketAddr, bytes: &[u8]) {
+        if let Some((_, node)) = self.nodes.iter_mut().find(|(at, _)| *at == to) {
+            node.datagram(now, from, bytes);
+        }
+    }
+    fn transmit(&mut self, now: Instant, out: &mut Vec<u8>) -> Option<Transmit> {
+        let count = self.nodes.len();
+        for turn in 0..count {
+            let at = (self.next + turn) % count;
+            let (address, node) = &mut self.nodes[at];
+            if let Some(transmit) = node.transmit(now, out) {
+                self.last = Some(*address);
+                self.next = (at + 1) % count;
+                return Some(transmit);
+            }
+        }
+        None
+    }
+    fn source(&self) -> Option<SocketAddr> {
+        self.last
+    }
+    fn timeout(&mut self) -> Option<Instant> {
+        self.nodes
+            .iter_mut()
+            .filter_map(|(_, node)| node.timeout())
+            .min()
+    }
+    fn fire(&mut self, now: Instant) {
+        for (_, node) in &mut self.nodes {
+            node.fire(now);
+        }
+    }
+    fn granularity(&mut self, granularity: Duration) {
+        for (_, node) in &mut self.nodes {
+            node.granularity(granularity);
+        }
+    }
+    #[cfg(feature = "oracle")]
+    fn mismatches(&self) -> u64 {
+        self.nodes.iter().map(|(_, node)| node.mismatches()).sum()
+    }
+}
+
 /// What the network schedules on the world: a datagram's arrival.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Arrival {
@@ -441,6 +520,10 @@ pub struct Net<A: Drive, B: Drive> {
     wire: hyper_sim::net::Net<Vec<u8>>,
     spare: Vec<Vec<u8>>,
     out: Vec<u8>,
+    /// Where each of `a`'s datagrams in flight came from, and where each of `b`'s goes, in the
+    /// order sent: each way's are delivered in that order, so each is read off as it arrives.
+    sources: std::collections::VecDeque<SocketAddr>,
+    targets: std::collections::VecDeque<SocketAddr>,
 }
 
 /// Format: the most a datagram carries on the links these tests model: Ethernet's MTU (1,500,
@@ -517,13 +600,45 @@ impl<A: Drive, B: Drive> Net<A, B> {
         Self::with_links(now, a, b, source, 0)
     }
 
+    /// The network losing `loss_ppm` of each way's datagrams independently, `one_way` apart, its
+    /// world's draws from seed `seed`: a loss draw for each datagram, no more than `datagrams` each
+    /// way.
+    pub fn lossy(
+        now: Instant,
+        a: A,
+        b: B,
+        loss_ppm: u32,
+        one_way: Duration,
+        seed: u64,
+        datagrams: usize,
+    ) -> Self {
+        let mut net = Self::with_world(now, a, b, hyper_sim::Source::Seed(seed), 0, 2 * datagrams);
+        let one_way = u64::try_from(one_way.as_nanos()).unwrap();
+        let path = hyper_sim::net::Path::in_order(one_way, 0)
+            .with_loss(hyper_sim::net::Loss::random(loss_ppm));
+        net.wire.set_pair_path(A, B, path).unwrap();
+        net.wire.set_pair_path(B, A, path).unwrap();
+        net
+    }
+
     fn with_links(now: Instant, a: A, b: B, source: hyper_sim::Source, links: usize) -> Self {
+        Self::with_world(now, a, b, source, links, 0)
+    }
+
+    fn with_world(
+        now: Instant,
+        a: A,
+        b: B,
+        source: hyper_sim::Source,
+        links: usize,
+        trace_words: usize,
+    ) -> Self {
         let limits = hyper_sim::Limits {
             events: 1 << 12,
             nodes: 2,
             streams: 8,
             steps: u64::MAX,
-            trace_words: 0,
+            trace_words,
         };
         let mut world =
             hyper_sim::World::new(source, hyper_sim::Discipline::Ordered, limits).unwrap();
@@ -551,6 +666,8 @@ impl<A: Drive, B: Drive> Net<A, B> {
             wire,
             spare: Vec::with_capacity(64),
             out: Vec::with_capacity(1500),
+            sources: std::collections::VecDeque::new(),
+            targets: std::collections::VecDeque::new(),
         }
     }
 
@@ -575,7 +692,14 @@ impl<A: Drive, B: Drive> Net<A, B> {
             let mut bytes = self.spare.pop().unwrap_or_default();
             bytes.clear();
             bytes.extend_from_slice(&self.out[..transmit.size]);
-            let pair = if from_a { (A, B) } else { (B, A) };
+            let pair = if from_a {
+                self.sources
+                    .push_back(self.a.source().unwrap_or(self.a_address));
+                (A, B)
+            } else {
+                self.targets.push_back(transmit.destination);
+                (B, A)
+            };
             self.wire
                 .send(
                     &mut self.world,
@@ -610,11 +734,14 @@ impl<A: Drive, B: Drive> Net<A, B> {
                 .unwrap()
                 .unwrap();
             if node == B {
+                let from = self.sources.pop_front().unwrap_or(self.a_address);
                 if !self.b_dead {
-                    self.b.datagram(self.now, self.a_address, &delivery.payload);
+                    self.b.datagram(self.now, from, &delivery.payload);
                 }
             } else {
-                self.a.datagram(self.now, self.b_address, &delivery.payload);
+                let to = self.targets.pop_front().unwrap_or(self.a_address);
+                self.a
+                    .datagram_to(self.now, self.b_address, to, &delivery.payload);
             }
             self.spare.push(delivery.payload);
             any = true;
@@ -790,6 +917,41 @@ impl Pair {
     }
 }
 
+impl Pair {
+    /// [`Pair::node`], keyed by `restart`, the key the node keeps across its restarts
+    /// (`Endpoint::new_restartable`).
+    #[allow(clippy::too_many_arguments)]
+    pub fn restartable<C: Classes<Role = Role>>(
+        &self,
+        which: PeerId,
+        role: Role,
+        book: Book,
+        limits: Limits,
+        budget: u64,
+        now: Instant,
+        restart: &RestartKey,
+    ) -> Node<C> {
+        let (certificate, key) = if which == 1 { &self.one } else { &self.two };
+        let config = Config {
+            tls: Tls::mutual(&credentials(&self.pki.root, certificate, key), true).unwrap(),
+            role,
+            limits,
+            congestion: Default::default(),
+        };
+        let mut node = Endpoint::new_restartable(
+            config,
+            Fixed::new(budget, 64),
+            book,
+            now,
+            restart,
+            Some(seed_of(which)),
+        )
+        .unwrap();
+        node.set_default_path_ceiling(u16::try_from(LINK_PAYLOAD).unwrap());
+        node
+    }
+}
+
 /// The QUIC layer's seed for node `peer` of the tests: its own, the same in every run, so a run's
 /// handshakes take the same sizes from one run to the next (`Endpoint::new_seeded`).
 pub fn seed_of(peer: PeerId) -> [u8; 32] {
@@ -836,6 +998,8 @@ struct Served {
     reply: u64,
     /// When the request was whole, by the server's `now`.
     whole: Option<Instant>,
+    /// When its body's pause began, by the server's `now` ([`Server::pause_body`]).
+    paused: Option<Instant>,
 }
 
 /// A node that answers every request: it reads the request's body, checking every byte, and
@@ -849,6 +1013,15 @@ pub struct Server {
     pub hold_replies: bool,
     /// How long the server takes to answer once it has a request whole, by `now`.
     pub think: Duration,
+    /// While it thinks on a request whose seed is one of these, it says at each turn that it is at
+    /// work on it (`Endpoint::working`): its work advancing, as an owner's own asks answering do.
+    pub vouch_seeds: Vec<u64>,
+    /// It says so no more from this, by `now`: an owner whose work stopped moving.
+    pub vouch_until: Option<Instant>,
+    /// Once this much of a reply's body is written, it writes no more of it for this long, by
+    /// `now`, saying meanwhile that it is at work as it does while it thinks: a body paused between
+    /// blocks while its owner's own asks run.
+    pub pause_body: Option<(u64, Duration)>,
     /// A request body longer than this is never read (0: every body is read): a peer that holds
     /// a stream it accepted, its bytes in its buffer and none of its credit given back.
     pub unread_above: u64,
@@ -876,6 +1049,9 @@ impl Server {
             hold_bulk: false,
             hold_replies: false,
             think: Duration::ZERO,
+            vouch_seeds: Vec::new(),
+            vouch_until: None,
+            pause_body: None,
             unread_above: 0,
             pace: None,
             paced: None,
@@ -928,6 +1104,7 @@ impl Server {
                     written: 0,
                     reply: body.unwrap_or(0),
                     whole: None,
+                    paused: None,
                 });
             }
             Event::Frame {
@@ -958,6 +1135,50 @@ impl Server {
         let mut served = std::mem::take(&mut self.served);
         served.retain_mut(|exchange| !self.advance(node, exchange));
         self.served = served;
+    }
+
+    /// Says it is at work on `served` if it vouches for it now (`Endpoint::working`).
+    fn vouch<C: Classes<Kind = Kind, Class = Class, Role = Role>>(
+        &self,
+        node: &mut Node<C>,
+        served: &Served,
+    ) {
+        if self.vouches(served) {
+            node.working(served.exchange);
+        }
+    }
+
+    /// The most of `served`'s reply body to write now, a piece at most: none while its body is
+    /// paused ([`Server::pause_body`]), saying meanwhile that it is at work as it vouches, and up
+    /// to the pause where the pause is still ahead.
+    fn piece_to_write<C: Classes<Kind = Kind, Class = Class, Role = Role>>(
+        &self,
+        node: &mut Node<C>,
+        served: &mut Served,
+    ) -> Option<usize> {
+        let left = (served.reply - served.written).min(PIECE as u64);
+        let Some((after, pause)) = self.pause_body else {
+            return Some(left as usize);
+        };
+        if served.written < after {
+            return Some(left.min(after - served.written) as usize);
+        }
+        if let Some(now) = self.now
+            && now < *served.paused.get_or_insert(now) + pause
+        {
+            self.vouch(node, served);
+            return None;
+        }
+        Some(left as usize)
+    }
+
+    /// Whether it says now that it is at work on `served` ([`Server::vouch_seeds`]).
+    fn vouches(&self, served: &Served) -> bool {
+        let stopped = self
+            .now
+            .zip(self.vouch_until)
+            .is_some_and(|(now, until)| now >= until);
+        self.vouch_seeds.contains(&served.seed) && !stopped
     }
 
     /// The most of a body the server reads now: a piece, or what its pace has left of it.
@@ -1037,6 +1258,7 @@ impl Server {
             }
         }
         if !served.replied && !self.answer_due(served) {
+            self.vouch(node, served);
             return false;
         }
         if !served.replied {
@@ -1049,7 +1271,9 @@ impl Server {
             served.replied = true;
         }
         while served.written < served.reply {
-            let length = (served.reply - served.written).min(PIECE as u64) as usize;
+            let Some(length) = self.piece_to_write(node, served) else {
+                return false;
+            };
             fill(served.seed, served.written, &mut self.piece[..length]);
             match node.write_body(served.exchange, &self.piece[..length]) {
                 Ok(0) => return false,
