@@ -3622,7 +3622,7 @@ mod tests {
                     got.contains(&format!("- thread {id}k, src/a.rs:3 on version 1 (question), kim: why three?"))
                         && got.contains(&format!("- thread {id}a, src/a.rs:9 on version 1 (issue), "))
                         && got.contains("(an agent's): an empty matrix should mean no legs")
-                        && got.contains(&format!("agents.change {{\\\"answers\\\": [\\\"{id}a\\\", \\\"{id}k\\\"]}}")),
+                        && got.contains(&format!("agents.change {{\\\"threads\\\": [\\\"{id}a\\\", \\\"{id}k\\\"]}}")),
                     "{name}: each thread, the agent's marked, and how to answer them: {got}"
                 );
                 let (stand, line, _) = stand_of(&page().await?, v1.get(..7).unwrap_or_default());

@@ -728,6 +728,13 @@ mod tests {
             let sent = got.iter().find(|t| t.contains("> still one leg")).cloned().unwrap_or_default();
             anyhow::ensure!(sent.contains("Why kiln sent you this: acme/app lets agents fix code from agents' feedback (turned on by ada, 31 Oct 2026). Agents have started 0 of 3 fixes in thread th1"), "with why: {sent}");
             anyhow::ensure!(sent.contains("agents.change {\"threads\": [\"th1\"]}") && sent.contains("ci.diffs.reply"), "how to answer it: {sent}");
+            // kiln keeps its hand-off once the words have gone to the agent.
+            for _ in 0..250 {
+                if kept("threads").await? > 0 {
+                    break;
+                }
+                crate::rt::sleep(std::time::Duration::from_millis(20)).await;
+            }
             let hand: (String, String, u32, String) = hub.store.call(|c| Ok(c.query_row("SELECT to_name, sha, version, why FROM ship_handoffs WHERE what = 'threads' AND by = 'kiln'", [], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))?)).await?;
             anyhow::ensure!(hand.1 == "1".repeat(40) && hand.2 == 1 && hand.3.starts_with("acme/app lets agents fix code from agents' feedback"), "kiln's hand-off at CR1's newest version: {hand:?}");
 
