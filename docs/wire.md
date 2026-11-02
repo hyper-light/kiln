@@ -204,17 +204,22 @@ layer.
 
 The channel makes up for what of these it carried, without waiting for a reconnect:
 - A receiver that sees an item past a gap drops it and asks for the stream again from the gap
-  (`Want`): once for the gap, and again every 64 items past it in case that want was lost, rather
-  than for each. Its sender sends what follows the gap again at once; a want for the same items soon after (an older receiver's, made before they
-  got there again) sends them again only once 250 ms have passed.
+  (`Want`): once for the gap, and again every 64 items past it in case that want or what it brought
+  was lost, rather than for each. A runner's server's commands are few in flight, so fewer than 64
+  might ever come past a gap in them. The runner asks for such a gap again on time instead: every
+  half second while it's still there, as more items past it come, and on its own clock up to 8
+  times after the last of them came, so a stream its server let go of isn't asked for for ever. Its
+  sender sends what follows the gap again at once; a want for the same items soon after (an older
+  receiver's, made before they got there again) sends them again only once 250 ms have passed.
 - A receiver behind its sender's `low` (it started again with less, and the stream went on) goes on
   from there: every item through `low` is answered.
 - An item whose answer doesn't come within the stream's patience (15 s for session updates and
   terminal output) is sent again, and the receiver takes it once.
 - A closed connection resumes as every reconnect does (`Have`).
 - What each side has (`Have`) is said again every few seconds, the runner's with its samples and
-  the server's every 5 s. A lost one doesn't hold a link's sends up: a sender's sends wait for the
-  first, and it takes the ones after as answers only.
+  the server's every 5 s, and a runner's twice more in a link's first seconds, a second apart. A
+  lost one doesn't hold a link's sends up for long: a sender's sends wait for the first, and it
+  takes the ones after as answers only.
 
 What a runner's QUIC layer drops it tells the server with its samples (`NetDrops`), once that
 changes. The runner's page shows both sides' counts, and the server exports what each runner last

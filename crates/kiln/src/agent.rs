@@ -295,6 +295,14 @@ fn admits(slots: u32, size: Option<kiln_ci::sched::state::Resources>, jobs: impl
 /// How long a cancelled job has to end before the runner reports it over and lets it go.
 const CANCEL_GRACE: Duration = Duration::from_secs(120);
 
+/// How long after a link comes up a runner says again what it has of the server's commands
+/// (`Have`), and then again as long after: its server sends its commands on a link only once it
+/// has heard one, so one lost below the channel would hold them up until its next sample.
+const HAVE_SOON: Duration = Duration::from_secs(1);
+
+/// How many times a runner says what it has again so ([`HAVE_SOON`]), beside its samples'.
+const HAVES_SOON: u32 = 2;
+
 /// One turn of the agent's event loop (computed inside `select!`, handled after it).
 enum Ev {
     Shutdown,
@@ -319,6 +327,10 @@ enum Ev {
     Forwarded(Vec<u8>),
     /// A test build's fault: the connection drops (W22-AC04).
     ChaosDrop,
+    /// A gap in the server's commands it asked for is still there: it asks again.
+    Wants,
+    /// It says again what it has of the server's commands, soon after a link came up.
+    HaveSoon,
     /// A test build's fault: a frame held back, due now (W22-AC04).
     Delayed(crate::runner::chaos::Due),
 }
@@ -1595,10 +1607,12 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
     // The server's commands on the channel (`crate::wire::commands`): what this runner has of
     // each stream; and the one being applied, answered at the top of the next turn of the loop
     // (however its arm ended), taken unless its arm refused it.
-    let mut wire_in = crate::wire::channel::Receiver::new();
+    let mut wire_in = crate::wire::channel::Receiver::timed();
     // Which of the server's command streams are current: an item of one let go of is dropped.
     let mut wire_current = crate::wire::commands::Current::new();
     let mut answer_after: Option<(String, u64, Option<(crate::wire::channel::Refusal, String)>)> = None;
+    // When it says what it has of them again soon after a link came up, and how many more times.
+    let mut have_soon: Option<(Instant, u32)> = None;
     // What the server's copy of each session here has, said in digests on this connection: a
     // stream that starts sends only what the copy lacks (`crate::wire::sums`).
     let mut server_kept: HashMap<String, proto::KeptSession> = HashMap::new();
@@ -1828,6 +1842,8 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
             () = watchdog.tick().fuse() => Ev::Watchdog,
             () = sleep_until_opt(redial).fuse() => Ev::Redial,
             () = sleep_until_opt(chaos_drop).fuse() => Ev::ChaosDrop,
+            () = sleep_until_opt(wire_in.want_due().filter(|_| connected && server_wire)).fuse() => Ev::Wants,
+            () = sleep_until_opt(have_soon.map(|(at, _)| at)).fuse() => Ev::HaveSoon,
             d = recv_opt(delayed.as_ref()).fuse() => match d { Some(due) => Ev::Delayed(due), None => Ev::Watchdog },
             t = term_rx.recv().fuse() => match t { Ok((s, out)) => Ev::Term(s, out), Err(_) => Ev::Watchdog },
             up = up_rx.recv().fuse() => match up { Ok(u) => Ev::Up(u), Err(_) => Ev::Watchdog },
@@ -1878,6 +1894,21 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                     buffered += data.len();
                     buffer.push_back((lane, kind, data));
                 }
+            }
+            Ev::Wants => {
+                // Never waiting for the uplink's room: this loop is what drains it, and a want it
+                // has no room for now is asked again on the gap's clock.
+                for f in wire_in.wants(Instant::now()) {
+                    let _ = uplink.0.try_send(Up::Term(AgentMsg::Wire(f)));
+                }
+            }
+            Ev::HaveSoon => {
+                // Never waiting for the uplink's room (this loop drains it): one with no room now
+                // is said again soon, or with the next sample.
+                if connected && server_wire {
+                    let _ = uplink.0.try_send(Up::Term(AgentMsg::Wire(wire_in.have())));
+                }
+                have_soon = have_soon.filter(|(_, left)| *left > 1).map(|(_, left)| (Instant::now() + HAVE_SOON, left - 1));
             }
             Ev::ChaosDrop => {
                 chaos_drop = None;
@@ -2656,8 +2687,11 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                 }
                 connected = false;
                 welcomed = false;
-                // The channel's items in flight go again once the server says what it has.
+                // The channel's items in flight go again once the server says what it has, and
+                // the server's from what this side says it has.
                 updates.down();
+                wire_in.down();
+                have_soon = None;
                 server_wire = false;
                 server_drops = false;
                 server_unread = false;
@@ -2717,7 +2751,7 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                                 crate::wire::commands::Stand::Newer(prefix) => wire_in.forget_where(|s| s != stream && crate::wire::commands::prefix_of(s) == Some(prefix)),
                                 crate::wire::commands::Stand::Current => {}
                             }
-                            let answer = match wire_in.on_item(&stream, seq, low, body) {
+                            let answer = match wire_in.on_item(&stream, seq, low, body, Instant::now()) {
                                 Arrival::Take(body) => match proto::read_server(&body) {
                                     Ok(ServerMsg::Wire(_)) => {
                                         let why = "a channel frame inside a command";
@@ -3346,6 +3380,7 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                         }
                         if server_wire {
                             uplink.0.send(Up::Term(AgentMsg::Wire(wire_in.have()))).await.ok();
+                            have_soon = Some((Instant::now() + HAVE_SOON, HAVES_SOON));
                         }
                     }
                     // The relay refused a frame of this runner's reach links: as a close, its code

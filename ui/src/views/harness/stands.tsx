@@ -1,18 +1,18 @@
 /**
- * How your agents stand, in a row of its own under Mission control's head: a rule with a stretch
- * for each way they stand, as long as its share of them, and under it each one's badge and count
- * (on a desktop its name too). The rule is one string of light across every stretch, damped in
- * each as much as its agents are still, ripples running through it with each stretch a medium of
- * its own, each stretch particles in its own ring's colours, reaching for the next across the gap
- * between them (stands-light.ts). It's drawn each frame while it's on screen and motion plays;
- * paused (Kiln's toggle, or reduced motion) it holds still. The badges keep their own steady
- * animations (stands.css), each on its own.
+ * How your agents stand, in a row of its own under Mission control's head: a rule with a dot for
+ * each agent, the dots of each way they stand together in a band, each band's arrowhead fitting
+ * the notch of the one before, and under it each one's badge and count (on a desktop its name
+ * too). Each dot stirs as its state does and each band plays a game of life of its own, lighting
+ * and dimming its dots (stands-dots.ts). It's drawn each frame while it's on screen and motion
+ * plays; paused (Kiln's toggle, or reduced motion) it holds still. The badges keep their own
+ * steady animations (stands.css), each on its own.
  */
 import * as React from "react";
 import "./stands.css";
 import { useMotionPreference } from "@/components/shell/motion";
 import type { MissionRow, MissionStand as Stand } from "./mission-rows";
-import { cells, easeOut, frame, GROW_MS, HEIGHT, LOOK, newFrame, paint, RING, stretches, type Shown } from "./stands-light";
+import { between, dotsFrame, layout } from "./stands-dots";
+import { cells, GROW_MS, LOOK, newFrame, paint, RING, type Shown } from "./stands-light";
 
 /** The ways counted, in the order they read (ended agents aren't). */
 const SHOWN: readonly Shown[] = ["needs", "crashed", "paused", "working", "finished", "ready", "offline"];
@@ -103,75 +103,67 @@ export function Stands({ rows = [], counts, every }: { rows?: readonly MissionRo
   );
 }
 
-type Grow = { from: Map<Shown, number>; to: Map<Shown, number>; at: number };
+/** The bands shown: each way of standing and how many, in the order they read. */
+type Bands = readonly (readonly [Shown, number])[];
+type Grow = { from: Bands; to: Bands; at: number };
 
-/** The counts drawn at `now`: easing from those drawn when they last changed to these. */
-function countsAt(g: Grow, now: number): Map<Shown, number> {
-  const k = easeOut((now - g.at) / GROW_MS);
-  const out = new Map<Shown, number>();
-  for (const s of SHOWN) {
-    const a = g.from.get(s) ?? 0;
-    const b = g.to.get(s) ?? 0;
-    const v = a + (b - a) * k;
-    if (v > 0.001) out.set(s, v);
-  }
-  return out;
-}
-
-/** `needs:3,working:9` as counts by way of standing. */
-const parseCounts = (counts: string) =>
-  new Map(
+/** `needs:3,working:9` as bands, in the order they read. */
+const parseCounts = (counts: string): Bands => {
+  const by = new Map(
     counts
       .split(",")
       .filter(Boolean)
-      .map((pair): [Shown, number] => {
+      .map((pair) => {
         const [stand, n] = pair.split(":");
-        return [stand as Shown, Number(n)];
+        return [stand as Shown, Number(n)] as const;
       }),
   );
+  return SHOWN.map((s) => [s, by.get(s) ?? 0] as const);
+};
 
-/** The moment a still rule is drawn at: the string at rest in a gentle shape. */
+/** The moment a still rule is drawn at: each band's game where it stands then. */
 const STILL = 1.3;
 
 /**
- * The rule (stands-light.ts), wired to its canvas as it's attached: drawn each frame (at most every
- * 33 ms) while it's on screen and motion plays; still, it's drawn at rest, and again only as it's
- * resized or its counts change. A change of `counts` eases its stretches to their new lengths.
+ * The rule (stands-dots.ts), wired to its canvas as it's attached: drawn each frame (at most every
+ * 33 ms) while it's on screen and motion plays; still, it's drawn as it stands, and again only as
+ * it's resized or its counts change. A change of `counts` moves each dot to its new place, the new
+ * ones coming in and the gone ones going, and the canvas is as tall as its rows.
  */
 function Rule({ counts }: { counts: string }) {
   const { paused } = useMotionPreference();
-  const grow = React.useRef<Grow>({ from: new Map(), to: new Map(), at: -GROW_MS });
+  const grow = React.useRef<Grow>({ from: [], to: [], at: -GROW_MS });
   const attach = React.useCallback(
     (canvas: HTMLCanvasElement | null) => {
       const ctx = canvas?.getContext("2d");
       if (!canvas || !ctx) return;
       const g = grow.current;
       const begun = performance.now();
-      g.from = countsAt(g, begun);
-      g.to = parseCounts(counts);
       // The first counts, or any while motion is still, are drawn as they are.
-      g.at = g.from.size === 0 || paused ? begun - GROW_MS : begun;
+      const first = g.to.length === 0;
+      g.from = first ? parseCounts(counts) : g.to;
+      g.to = parseCounts(counts);
+      g.at = first || paused ? begun - GROW_MS : begun;
       let raf = 0;
       let last = -Infinity;
       let visible = true;
       let width = canvas.getBoundingClientRect().width;
       const kept = newFrame();
       const draw = (now: number) => {
-        const shown = countsAt(g, now);
-        const stands = SHOWN.filter((s) => shown.has(s));
         if (width <= 0) return;
-        // Nothing lit (every count at zero, as Ship's can be): an empty rule, not the last picture.
-        if (stands.length === 0) return void ctx.clearRect(0, 0, canvas.width, canvas.height);
+        const to = layout(g.to, width);
+        const { dots, height } = between(layout(g.from, width), to, Math.min(1, (now - g.at) / GROW_MS));
         const dpr = Math.min(3, window.devicePixelRatio || 1);
         const w = Math.round(width * dpr);
-        const h = Math.round(HEIGHT * dpr);
+        const h = Math.round(height * dpr);
         if (canvas.width !== w || canvas.height !== h) {
           canvas.width = w;
           canvas.height = h;
+          canvas.style.height = `${height}px`;
         }
         ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
-        ctx.clearRect(0, 0, width, HEIGHT);
-        paint(ctx, frame(stretches(stands, stands.map((s) => shown.get(s) ?? 0), width), width, paused ? STILL : now / 1000, kept));
+        ctx.clearRect(0, 0, width, height);
+        paint(ctx, dotsFrame(dots, to.rows, paused ? STILL : now / 1000, kept));
       };
       const tick = (now: number) => {
         raf = 0;

@@ -115,6 +115,26 @@ pub fn connected(port: u16, admin: &str, name: &str, log: &Path, within: Duratio
     }
 }
 
+/// Turns runner `name`'s headroom off (docs/headroom.md) and waits until it says it applied that.
+/// A test's runner shares the machine running the tests: a disk the rest of them slowed would have
+/// it hold its sessions' turns and pace their harnesses down to nothing, though nothing the test
+/// looks at is wrong (as `common::start_once` keeps the scheduler's headroom out of a test).
+pub fn headroom_off(port: u16, admin: &str, name: &str, within: Duration) -> anyhow::Result<()> {
+    let path = format!("/api/runners/{name}/headroom");
+    let (st, body) = super::http(port, "PUT", &path, admin, Some(&json!({ "enabled": false })))?;
+    anyhow::ensure!(st == 200, "{name}'s headroom off: {st} {body}");
+    let deadline = Instant::now() + within;
+    loop {
+        let (_, body) = super::http(port, "GET", &path, admin, None)?;
+        let v: Value = serde_json::from_str(&body).unwrap_or_default();
+        if v.get("applied").and_then(Value::as_bool) == Some(true) {
+            return Ok(());
+        }
+        anyhow::ensure!(Instant::now() < deadline, "{name} didn't say it applied its headroom off: {body}");
+        std::thread::sleep(Duration::from_millis(200));
+    }
+}
+
 /// Waits for the runner's next connection to begin (its log says so again), then a moment more.
 pub fn just_connected(log: &Path, deadline: Instant) {
     let count = || std::fs::read_to_string(log).unwrap_or_default().matches("connected to server").count();
