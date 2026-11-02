@@ -245,6 +245,20 @@ fn seams() -> Vec<Seam> {
             cases: said(&sigstore::cases::<sigstore::SimSigstoreFixture>()),
             bounds: vec![format!("{} entries", count(sigstore::SIM_ENTRIES as u64))],
         },
+        Seam {
+            title: "DependencySources",
+            file: "dependencies.rs",
+            tr: "DependencySources",
+            more: &[],
+            cases: said(&dependencies::cases::<dependencies::SimDependencySourcesFixture>()),
+            bounds: vec![
+                format!("names to {} bytes", dependencies::NAME_MAX), format!("paths and URLs to {} bytes", dependencies::PATH_MAX),
+                format!("files to {}", size(dependencies::FILE_MAX as u64)), format!("manifests to {}", size(dependencies::MANIFEST_MAX as u64)),
+                format!("{} repositories", count(dependencies::SIM_REPOSITORIES as u64)), format!("{} commits", count(dependencies::SIM_COMMITS as u64)),
+                format!("{} files", count(dependencies::SIM_FILES as u64)), format!("{} refs", count(dependencies::SIM_REFS as u64)),
+                format!("{} of repository file bytes", size(dependencies::SIM_BYTES as u64)), format!("{} manifests and runtime archives", count(dependencies::SIM_METADATA as u64)),
+            ],
+        },
     ]
 }
 

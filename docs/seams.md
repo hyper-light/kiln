@@ -624,3 +624,43 @@ Methods: `certify`, `log`, `entry`.
 - **SIGSTORE-7** an entry comes with the proof of its inclusion: its index in a tree of more entries than that, the hashes leading from it to the tree's root, and a checkpoint of that tree; and with the log's promise, where the log promises
 - **SIGSTORE-8** an entry whose signature isn't its verifier's is refused Invalid, naming the entry
 - **SIGSTORE-9** a hashedrekord entry (a SHA-256, and its key's signature over it) is logged and found again, keeping its hash; one whose signature is over another hash is refused Invalid, naming the entry
+
+## DependencySources
+
+Dependency source facts for locks (docs/ci.md W29-R23, R26): stable repository identity, a ref's
+peeled commit, ancestry from a captured revision, a file at a selected commit, OCI manifest
+bytes and the exact location and SHA-256 of a runtime archive. The adapter keeps credentials
+private; none enters a request, answer or refusal. Resolving may refresh a private mirror;
+it never writes to a host, announces a release or queues an update draft. Panes keep reading
+their existing cached facts without fetching. A cached resolution says `fresh = false` and
+cannot establish what an upstream ref names now. Missing or shallow history proves nothing.
+
+- **Implementations:** `kiln_seams::dependencies::SimDependencySources`, deterministic and in
+  memory; kiln's git, host, OCI and runtime adapter (`ci::dependency_sources`).
+- **Used by:** dependency lock preflight and explicit regeneration (W29-R23); acceptance policy
+  remains pure code in kiln-ci.
+- **Passed by:** the simulator's shared contract. The real adapter runs the same contract on
+  isolated git repositories and HTTP fixtures in its tests.
+- **Bounds:** names to 256 bytes; paths and URLs to 4096 bytes; files to 1 MiB; manifests to 4 MiB.
+  The simulator keeps 256 repositories, each with at most 4096 commits, 4096 files and 1024 refs,
+  16 parents per commit, 64 MiB of repository file bytes across repositories; 256 manifests and
+  runtime archives each, with at most 64 MiB of manifest bytes. Insertion past a table or byte
+  bound is refused atomically as `Full`. A read past its byte bound is refused `TooLarge`.
+  Runtime metadata is read with the existing downloader's bounds (at most 16 MiB); archive
+  bytes are downloaded and checked later by the runner. No archive bytes cross this seam.
+  The real adapter keeps an identity record beside its mirror, at most 8 KiB, bound to the
+  actual source's host and repository. Changing a source mapping cannot borrow that identity.
+
+Methods: `resolve`, `contains`, `file`, `manifest`, `runtime`.
+
+- **DEPENDENCIES-1** a ref resolves to its source identity and peeled commit, retaining the request and qualified ref; HEAD names its default branch
+- **DEPENDENCIES-2** moving a tag changes a new resolution, while a captured revision keeps its commit, history and file bytes
+- **DEPENDENCIES-3** history means ancestry from the captured commit in that source; an unrelated object is not proof, and an unknown object is refused Missing
+- **DEPENDENCIES-4** a file is read at the selected commit within captured history; outside history is refused NotReachable, a missing file Missing, and traversal Invalid
+- **DEPENDENCIES-5** a file over the byte bound is refused TooLarge before its bytes are copied into an answer
+- **DEPENDENCIES-6** a changed repository identity refuses the old revision as IdentityChanged, even when its name and commit remain
+- **DEPENDENCIES-7** an unreachable upstream can answer from a prior mirror, explicitly marked not fresh, preserving its identity and bytes
+- **DEPENDENCIES-8** an unreachable source without a prior mirror is refused Unavailable
+- **DEPENDENCIES-9** access denial refuses cached resolutions and files as Denied
+- **DEPENDENCIES-10** a manifest is bound to its bytes and requested digest, and runtime metadata names an immutable archive and SHA-256; credentials and unsupported runtimes are refused
+- **DEPENDENCIES-11** repository URLs and git revision expressions are refused Invalid, and a missing ref is refused Missing

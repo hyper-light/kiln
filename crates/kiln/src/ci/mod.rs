@@ -17,6 +17,7 @@ pub mod compare;
 pub mod conflicts;
 pub mod cr;
 pub mod deploy_step;
+pub mod dependency_sources;
 pub mod diffs;
 pub mod dispatch;
 pub mod environments;

@@ -3490,6 +3490,26 @@ async fn musl_node(http: &crate::http::client::Client, major: u32, arch: &str) -
     Ok((format!("{base}/{version}/{file}"), file, sha))
 }
 
+/// W29-R23: the same publisher metadata used by a runner, without downloading an archive.
+/// Official builds use an exact version URL, never the mutable latest-vN.x alias.
+pub(crate) async fn node_archive(http: &crate::http::client::Client, major: u32, musl: bool, arch: &str, os: &str) -> anyhow::Result<(String, String, String)> {
+    if musl { return musl_node(http, major, arch).await; }
+    let base = format!("https://nodejs.org/dist/latest-v{major}.x");
+    let response = http.get(&format!("{base}/SHASUMS256.txt")).timeout(Duration::from_secs(60)).send().await?;
+    anyhow::ensure!(response.is_success(), "Node's checksum list: HTTP {}", response.status());
+    let sums = response.bytes(1 << 20).await?;
+    node_archive_listed(&String::from_utf8_lossy(&sums), major, arch, os)
+}
+
+/// W29-R23: a platform's exact archive, bound to the version the checksum list names.
+pub(crate) fn node_archive_listed(sums: &str, major: u32, arch: &str, os: &str) -> anyhow::Result<(String, String, String)> {
+    let suffix = format!("-{os}-{arch}.tar.gz");
+    let (sha, file) = listed(sums, |f| f.starts_with(&format!("node-v{major}.")) && f.ends_with(&suffix)).ok_or_else(|| anyhow::anyhow!("nodejs.org lists no {suffix} build of Node {major}"))?;
+    let version = file.strip_prefix("node-").and_then(|s| s.split_once('-')).map(|(v, _)| v).ok_or_else(|| anyhow::anyhow!("Node's archive has no version"))?;
+    anyhow::ensure!(version_of(version).is_some_and(|v| v.0 == major) && sha.len() == 64 && sha.bytes().all(|b| b.is_ascii_hexdigit()), "Node's archive metadata doesn't read");
+    Ok((format!("https://nodejs.org/dist/{version}/{file}"), file, sha))
+}
+
 /// One Node runtime download at a time (they share `<work>/_externals`).
 static NODE_LOCK: async_lock::Mutex<()> = async_lock::Mutex::new(());
 /// Beside an action kept under `<work>/_actions`: its tarball's SHA-256 (hex), for the receipts of
@@ -3701,21 +3721,14 @@ impl Leg {
     /// One ask of [`Leg::node`]'s: Node `major`'s build for this machine, its bytes and its file,
     /// checked against the digest its publisher lists.
     async fn node_build(&self, major: u32, musl: bool, arch: &str) -> anyhow::Result<(Vec<u8>, String)> {
-        let (url, file, sha) = if musl {
-            musl_node(&self.http, major, arch).await?
-        } else {
-            let os = match std::env::consts::OS {
+        let os = if musl { "linux" } else {
+            match std::env::consts::OS {
                 "linux" => "linux",
                 "macos" => "darwin",
                 other => return Err(Refused(format!("no Node {major} build for {other} here yet")).into()),
-            };
-            let base = format!("https://nodejs.org/dist/latest-v{major}.x");
-            let sums = self.http.get(&format!("{base}/SHASUMS256.txt")).timeout(Duration::from_secs(60)).send().await?.bytes(1 << 20).await?;
-            let suffix = format!("-{os}-{arch}.tar.gz");
-            let (sha, file) =
-                listed(&String::from_utf8_lossy(&sums), |f| f.starts_with("node-v") && f.ends_with(&suffix)).ok_or_else(|| anyhow::anyhow!("nodejs.org lists no {suffix} build of Node {major}"))?;
-            (format!("{base}/{file}"), file, sha)
+            }
         };
+        let (url, file, sha) = node_archive(&self.http, major, musl, arch, os).await?;
         let mut resp = crate::updates::get_following(&self.http, &url, Duration::from_secs(600)).await?;
         if matches!(resp.status(), 403 | 404) {
             return Err(Refused(format!("downloading {file}: HTTP {}", resp.status())).into());

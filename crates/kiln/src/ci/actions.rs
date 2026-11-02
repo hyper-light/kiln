@@ -430,16 +430,70 @@ async fn mirror_tags(hub: &Hub, dir: &str) -> std::collections::HashSet<String> 
 /// [`pin`], and the ref as GitHub writes it, which it was found as: `refs/tags/v1`,
 /// `refs/heads/main`, or the commit's SHA.
 pub(crate) async fn pin_ref(hub: &Hub, r: &Remote) -> anyhow::Result<(String, String)> {
+    pin_ref_with(hub, r, true, true).await.map(|(sha, full, _)| (sha, full))
+}
+
+/// W29-R23: lock reads refresh mirrors without announcing releases or queuing updates. A
+/// failed refresh can use the mirror but cannot claim the ref is current upstream evidence.
+pub(crate) async fn pin_ref_readonly(hub: &Hub, r: &Remote, refresh: bool) -> anyhow::Result<(String, String, bool)> {
+    pin_ref_with(hub, r, false, refresh).await
+}
+
+/// A fixed number of locks, shared by pinning and lock-file reads. Fetch cannot expose a
+/// commit before its trees have arrived; hash collisions only serialize unrelated sources.
+pub(crate) fn source_lock(r: &Remote) -> anyhow::Result<&'static async_lock::RwLock<()>> {
+    static LOCKS: std::sync::OnceLock<[async_lock::RwLock<()>; 64]> = std::sync::OnceLock::new();
+    let locks = LOCKS.get_or_init(|| std::array::from_fn(|_| async_lock::RwLock::new(())));
+    let slot = r.full().bytes().fold(usize::from(r.native), |n, b| n.wrapping_mul(31).wrapping_add(usize::from(b))) % 64;
+    locks.get(slot).ok_or_else(|| anyhow::anyhow!("action mirror lock is unavailable"))
+}
+
+/// W29-R23: the App's read credential, scoped to this repository's HTTP URL, stays inside
+/// the adapter. Public actions outside its installation need no App credential. Git's
+/// configured credentials for other hosts continue to come from gitops::git.
+pub(crate) async fn source_command(hub: &Hub, r: &Remote) -> std::process::Command {
+    let mut command = gitops::git(hub);
+    command.env("GIT_NO_REPLACE_OBJECTS", "1");
+    if !r.hosted(hub) && let Ok(url) = source(hub, &r.owner, &r.repo)
+        && url.starts_with("https://") && let Some((host, name)) = crate::githost::split_url(&url)
+        && (kiln_seams::dependencies::Repository { name: name.clone(), native: false }).validate().is_ok()
+        && let Some(app) = crate::githost::github::app(hub).await.filter(|a| crate::githost::host_of(&a.web) == host)
+        && let Ok(token) = app.token(&name, &[("contents".into(), "read".into()), ("metadata".into(), "read".into())].into()).await {
+        use base64::Engine as _;
+        let basic = base64::engine::general_purpose::STANDARD.encode(format!("x-access-token:{token}"));
+        command.args(["-c", &format!("http.{url}.extraheader=Authorization: Basic {basic}")]);
+    }
+    command
+}
+
+async fn pin_git(hub: &Hub, r: &Remote, observe: bool, args: &[&str], within: Duration) -> anyhow::Result<Vec<u8>> {
+    if observe { return gitops::run_git(hub, args, within).await; }
+    let mut command = source_command(hub, r).await;
+    command.args(args);
+    let out = crate::proc::output(command, within).await.map_err(|_| anyhow::anyhow!("dependency git source is unavailable"))?;
+    anyhow::ensure!(out.status.success(), "dependency git source refused the read");
+    Ok(out.stdout)
+}
+
+async fn pin_ref_with(hub: &Hub, r: &Remote, observe: bool, refresh: bool) -> anyhow::Result<(String, String, bool)> {
+    let _guard = source_lock(r)?.write().await;
     let dir = r.mirror(hub);
     let d = dir.to_string_lossy().to_string();
-    let url = if r.native { native_source(hub, &r.owner, &r.repo)? } else { source(hub, &r.owner, &r.repo)? };
+    let url = if !refresh { None } else {
+        match if r.native { native_source(hub, &r.owner, &r.repo) } else { source(hub, &r.owner, &r.repo) } {
+            Ok(url) => Some(url),
+            Err(_) if !observe && dir.join("HEAD").exists() => None,
+            Err(e) => return Err(e),
+        }
+    };
     // The mirror's tags before it fetches: a new full version after is a release for consumers
     // (W29-R22). A first mirror's are all new, and no one's update.
-    let before = if dir.join("HEAD").exists() { Some(mirror_tags(hub, &d).await) } else { None };
+    let before = if observe && dir.join("HEAD").exists() { Some(mirror_tags(hub, &d).await) } else { None };
     if dir.join("HEAD").exists() {
         // The source may have moved (`[[ci.actions.sources]]` changed): fetch from where it is now.
-        let _ = gitops::run_git(hub, &["-C", &d, "remote", "set-url", "origin", &url], GIT_TIMEOUT).await;
+        if let Some(url) = &url { let _ = pin_git(hub, r, observe, &["-C", &d, "remote", "set-url", "origin", url], GIT_TIMEOUT).await; }
     } else {
+        let url = url.as_deref().ok_or_else(|| anyhow::anyhow!("action source unreachable and not mirrored"))?;
         if let Some(parent) = dir.parent() {
             let p = parent.to_path_buf();
             crate::rt::blocking(move || std::fs::create_dir_all(p)).await??;
@@ -447,20 +501,21 @@ pub(crate) async fn pin_ref(hub: &Hub, r: &Remote) -> anyhow::Result<(String, St
         // Treeless: every commit, and a commit's trees and files only when one is read (its
         // `action.yml`, its tarball). An action repository that keeps its built code in every
         // commit (codeql-action) mirrors in seconds, not minutes.
-        if let Err(e) = gitops::run_git(hub, &["clone", "--bare", "--quiet", "--filter=tree:0", &url, &d], GIT_TIMEOUT).await {
+        if let Err(e) = pin_git(hub, r, observe, &["clone", "--bare", "--quiet", "--filter=tree:0", url, &d], GIT_TIMEOUT).await {
             // What a failed clone leaves isn't a mirror.
             let _ = crate::rt::blocking(move || std::fs::remove_dir_all(dir)).await;
             anyhow::bail!("action source unreachable and not mirrored: {e:#}");
         }
     }
-    let full_sha = r.git_ref.len() == 40 && r.git_ref.bytes().all(|b| b.is_ascii_hexdigit());
-    let fetched = if full_sha {
-        gitops::run_git(hub, &["-C", &d, "fetch", "--quiet", "origin", &r.git_ref], GIT_TIMEOUT).await.or(Ok::<_, anyhow::Error>(Vec::new())).map(|_| ())
+    let full_sha = matches!(r.git_ref.len(), 40 | 64) && r.git_ref.bytes().all(|b| b.is_ascii_hexdigit());
+    let fetched = if url.is_none() { Err(anyhow::anyhow!("action source wasn't refreshed")) } else if full_sha {
+        pin_git(hub, r, observe, &["-C", &d, "fetch", "--quiet", "origin", &r.git_ref], GIT_TIMEOUT).await.map(|_| ())
     } else {
-        gitops::run_git(hub, &["-C", &d, "fetch", "--quiet", "--force", "--prune", "origin", "+refs/heads/*:refs/heads/*", "+refs/tags/*:refs/tags/*"], GIT_TIMEOUT).await.map(|_| ())
+        pin_git(hub, r, observe, &["-C", &d, "fetch", "--quiet", "--force", "--prune", "origin", "+refs/heads/*:refs/heads/*", "+refs/tags/*:refs/tags/*"], GIT_TIMEOUT).await.map(|_| ())
     };
+    let fresh = fetched.is_ok();
     if let Err(e) = fetched {
-        tracing::warn!(action = %r.full(), error = %format!("{e:#}"), "action source unreachable; using the mirror");
+        if observe { tracing::warn!(action = %r.full(), error = %format!("{e:#}"), "action source unreachable; using the mirror"); }
     } else if let Some(before) = before {
         for tag in mirror_tags(hub, &d).await.into_iter().filter(|t| !before.contains(t)) {
             if let Err(e) = super::updates::released(hub, &r.full(), &tag).await {
@@ -468,13 +523,25 @@ pub(crate) async fn pin_ref(hub: &Hub, r: &Remote) -> anyhow::Result<(String, St
             }
         }
     }
-    for full in [format!("refs/tags/{}", r.git_ref), format!("refs/heads/{}", r.git_ref), r.git_ref.clone()] {
-        if let Ok(o) = gitops::run_git(hub, &["-C", &d, "rev-parse", "--verify", "--quiet", &format!("{full}^{{commit}}")], GIT_TIMEOUT).await {
+    let mut choices = vec![format!("refs/tags/{}", r.git_ref), format!("refs/heads/{}", r.git_ref), r.git_ref.clone()];
+    if !observe && r.git_ref == "HEAD" {
+        // Refresh the default-branch alias too; fetch alone doesn't update a bare mirror's HEAD.
+        if fresh && let Ok(out) = pin_git(hub, r, observe, &["-C", &d, "ls-remote", "--symref", "origin", "HEAD"], GIT_TIMEOUT).await
+            && let Some(target) = String::from_utf8_lossy(&out).lines().find_map(|l| l.strip_prefix("ref: ").and_then(|s| s.strip_suffix("\tHEAD"))).filter(|s| s.starts_with("refs/heads/") && kiln_seams::dependencies::reference_valid(s)) {
+            let _ = pin_git(hub, r, observe, &["-C", &d, "symbolic-ref", "HEAD", target], GIT_TIMEOUT).await;
+        }
+        if let Ok(out) = pin_git(hub, r, observe, &["-C", &d, "symbolic-ref", "--quiet", "HEAD"], GIT_TIMEOUT).await {
+            let target = String::from_utf8_lossy(&out).trim().to_owned();
+            if target.starts_with("refs/heads/") { choices = vec![target]; }
+        }
+    }
+    for full in choices {
+        if let Ok(o) = pin_git(hub, r, observe, &["-C", &d, "rev-parse", "--verify", "--quiet", &format!("{full}^{{commit}}")], GIT_TIMEOUT).await {
             let sha = String::from_utf8_lossy(&o).trim().to_owned();
-            if sha.len() == 40 {
+            if matches!(sha.len(), 40 | 64) {
                 // A ref given as a commit stays the commit, as GitHub writes it.
                 let full = if full == r.git_ref && !full.starts_with("refs/") { sha.clone() } else { full };
-                return Ok((sha, full));
+                return Ok((sha, full, fresh));
             }
         }
     }
