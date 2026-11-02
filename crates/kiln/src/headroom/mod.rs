@@ -499,8 +499,37 @@ fn run(ctx: Ctx, mut settings: Settings) {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
+
+    pub(crate) struct Admission {
+        session: String,
+    }
+
+    impl Admission {
+        pub(crate) fn held(session: &str) -> Self {
+            SHARED.admit.lock().waiting.insert(session.to_owned(), now_us());
+            Self { session: session.to_owned() }
+        }
+
+        pub(crate) fn grant(&self) {
+            let mut a = SHARED.admit.lock();
+            a.waiting.remove(&self.session);
+            a.granted.insert(self.session.clone(), u64::MAX);
+            a.fresh.insert(self.session.clone());
+            drop(a);
+            SHARED.room.notify(usize::MAX);
+        }
+    }
+
+    impl Drop for Admission {
+        fn drop(&mut self) {
+            let mut a = SHARED.admit.lock();
+            a.waiting.remove(&self.session);
+            a.granted.remove(&self.session);
+            a.fresh.remove(&self.session);
+        }
+    }
 
     #[test]
     fn without_a_runner_every_session_is_let_in() {
