@@ -960,6 +960,10 @@ pub struct RunSeen {
 pub struct Seen {
     /// Seconds, by job id.
     pub job_secs: HashMap<String, i64>,
+    /// Each job's outcome in that run, by job id, and the run's commit: the strip's `its last run
+    /// passed in 18m 40s on a3f2c1d` (pl-2).
+    pub job_outcome: HashMap<String, Outcome>,
+    pub last_sha: Option<String>,
     /// By `uses`: `v2.4.0 is out` (and that it's behind) or `newest`.
     pub uses: HashMap<String, (String, bool)>,
     /// The `uses` of a repository kiln hosts, named plainly (`acme/kit/.github/actions/x@v1`).
@@ -995,49 +999,95 @@ pub fn span_words(secs: i64) -> String {
     }
 }
 
+/// A span in its two largest units, as pl-2's strip says a job's time: `40s`, `18m 40s`, `2h 5m`,
+/// `3d 4h`.
+pub fn span_exact(secs: i64) -> String {
+    let two = |a: i64, ua: &str, b: i64, ub: &str| if b == 0 { format!("{a}{ua}") } else { format!("{a}{ua} {b}{ub}") };
+    match secs.max(0) {
+        s if s < 60 => format!("{s}s"),
+        s if s < 3600 => two(s / 60, "m", s % 60, "s"),
+        s if s < 86_400 => two(s / 3600, "h", s % 3600 / 60, "m"),
+        s => two(s / 86_400, "d", s % 86_400 / 3600, "h"),
+    }
+}
+
 /// A job's line, as the approved stills word it (pl-2): its id, then its legs where a matrix
 /// makes more than one (`3 platforms`), where it runs (bare metal unless a container is asked
 /// for) and its labels beyond that, or the workflow it calls; its time in the last finished run;
-/// and what it needs, which the stage's note reads (`after rust and ui`).
-fn job_line(j: &crate::wf::Job, secs: Option<i64>) -> Line {
-    let mut parts: Vec<String> = Vec::new();
+/// and what it needs, which the stage's note reads (`after rust and ui`). Its note is what the
+/// strip says of it picked: where it runs, what it reserves and its last run (`bare metal, linux ·
+/// 2 CPUs, 16 GiB · its last run passed in 18m 40s on a3f2c1d`).
+fn job_line(j: &crate::wf::Job, seen: &Seen) -> Line {
+    let mut legs: Option<String> = None;
+    let mut at: Vec<String> = Vec::new();
     match &j.uses {
-        Some(u) => parts.push(format!("calls {u}")),
+        Some(u) => at.push(format!("calls {u}")),
         None => {
             if let Some(crate::wf::ir::Matrix::Spec(m)) = j.strategy.as_ref().and_then(|s| s.matrix.as_ref()) {
                 let count = |a: &crate::wf::ir::Axis| if let crate::wf::ir::Axis::Values(v) = a { v.len().max(1) } else { 1 };
                 // kiln's `platforms`, or an axis named for them (`platform`, `os`): pl-2's `3 platforms`.
                 let named = m.axes.iter().find(|(k, a)| matches!(k.as_str(), "platform" | "platforms" | "os") && count(a) > 1).map(|(_, a)| count(a));
-                match (&m.platforms, named) {
-                    (Some(p), _) if count(p) > 1 => parts.push(format!("{} platforms", count(p))),
-                    (_, Some(n)) => parts.push(format!("{n} platforms")),
-                    _ => {
-                        let legs: usize = m.axes.iter().map(|(_, a)| count(a)).product();
-                        if legs > 1 {
-                            parts.push(format!("{legs} legs"));
-                        }
-                    }
-                }
+                legs = match (&m.platforms, named) {
+                    (Some(p), _) if count(p) > 1 => Some(format!("{} platforms", count(p))),
+                    (_, Some(n)) => Some(format!("{n} platforms")),
+                    _ => Some(m.axes.iter().map(|(_, a)| count(a)).product::<usize>()).filter(|n| *n > 1).map(|n| format!("{n} legs")),
+                };
             }
-            parts.push(if j.container.is_some() || j.kiln.image.is_some() { "in a container" } else { "bare metal" }.to_owned());
+            at.push(if j.container.is_some() || j.kiln.image.is_some() { "in a container" } else { "bare metal" }.to_owned());
             match &j.runs_on {
-                Some(crate::wf::ir::RunsOn::Labels(l)) => parts.extend(l.iter().map(|t| t.src.clone()).filter(|t| !matches!(t.as_str(), "baremetal" | "bare-metal"))),
+                Some(crate::wf::ir::RunsOn::Labels(l)) => at.extend(l.iter().map(|t| t.src.clone()).filter(|t| !matches!(t.as_str(), "baremetal" | "bare-metal"))),
                 Some(crate::wf::ir::RunsOn::Group { group, labels }) => {
-                    parts.extend(group.iter().map(|g| format!("group {}", g.src)));
-                    parts.extend(labels.iter().map(|t| t.src.clone()).filter(|t| !matches!(t.as_str(), "baremetal" | "bare-metal")));
+                    at.extend(group.iter().map(|g| format!("group {}", g.src)));
+                    at.extend(labels.iter().map(|t| t.src.clone()).filter(|t| !matches!(t.as_str(), "baremetal" | "bare-metal")));
                 }
                 None => {}
             }
         }
     }
     // A job only a branch runs (`if: github.ref == 'refs/heads/main'`): pl-2's `on main`.
-    parts.extend(j.cond.as_ref().and_then(|c| on_branch(&c.src)).map(|b| format!("on {b}")));
+    let on = j.cond.as_ref().and_then(|c| on_branch(&c.src)).map(|b| format!("on {b}"));
+    let secs = seen.job_secs.get(&j.id).copied();
+    let mut parts: Vec<String> = legs.iter().chain(&at).chain(&on).cloned().collect();
     // Its time in the last finished run (pl-2's `18m`).
     parts.extend(secs.map(span_words));
     if !j.needs.is_empty() {
         parts.push(format!("needs {}", j.needs.iter().map(|n| n.job()).collect::<Vec<_>>().join(", ")));
     }
-    Line::new(format!("jobs.{}", j.id), "job", j.id.clone(), parts.join(" · "))
+    let mut said: Vec<String> = legs.into_iter().chain([at.join(", ")]).chain(on).collect();
+    said.extend(reserved_words(j));
+    let last = match (seen.job_outcome.get(&j.id), secs) {
+        (Some(o), Some(s)) => {
+            let on = seen.last_sha.as_deref().map(|c| format!(" on {}", c.get(..7).unwrap_or(c))).unwrap_or_default();
+            Some(match o {
+                Outcome::Passed => format!("its last run passed in {}{on}", span_exact(s)),
+                Outcome::Failed => format!("its last run failed after {}{on}", span_exact(s)),
+                Outcome::Cancelled => format!("its last run was cancelled after {}{on}", span_exact(s)),
+            })
+        }
+        _ => None,
+    };
+    said.extend(last);
+    Line::new(format!("jobs.{}", j.id), "job", j.id.clone(), parts.join(" · ")).note(said.join(" · "))
+}
+
+/// What a job reserves (`resources:`), as pl-2's strip says it: `2 CPUs, 16 GiB`.
+fn reserved_words(j: &crate::wf::Job) -> Option<String> {
+    use crate::sched::needs;
+    let r = needs::resource_spec(j.kiln.resources.as_ref()?).resources().ok()?;
+    let mut parts = Vec::new();
+    if r.cpu > 0.0 {
+        parts.push(needs::cpus(r.cpu));
+    }
+    if r.mem > 0 {
+        parts.push(needs::show_size(r.mem));
+    }
+    if r.disk > 0 {
+        parts.push(format!("{} of disk", needs::show_size(r.disk)));
+    }
+    if r.gpu > 0 {
+        parts.push(needs::gpus(r.gpu));
+    }
+    (!parts.is_empty()).then(|| parts.join(", "))
 }
 
 /// The branch a job's `if:` keeps it to, where that's all it says: `github.ref == 'refs/heads/main'`
@@ -1093,7 +1143,7 @@ pub fn workflow_groups(w: &Workflow, text: &str, runs: &[RunSeen], runs_here: bo
         out.push(group("Called with", lines));
     }
     for (i, ids) in stages(w).iter().enumerate() {
-        let lines = ids.iter().filter_map(|id| w.job(id)).map(|j| job_line(j, seen.job_secs.get(&j.id).copied())).collect();
+        let lines = ids.iter().filter_map(|id| w.job(id)).map(|j| job_line(j, seen)).collect();
         out.push(group(format!("Stage {}", i + 1), lines));
     }
     let mut uses: Vec<Line> = Vec::new();
@@ -1428,6 +1478,15 @@ pub struct Opened<'a> {
     /// A GitHub workflow's overlay (W02-R07): its path and text, empty where it has none yet. Flow
     /// writes kiln's own triggers there (W29-R06).
     pub overlay: Option<(&'a str, &'a str)>,
+    /// What the strip says before anything's picked, where the pane has its own words (an update
+    /// draft's, [`update_said`]), and the words it sets in bold.
+    pub said: Option<(Vec<String>, Vec<String>)>,
+    /// The Changes view's lines: what a release changes for those who use it and the repository's
+    /// own checks (pl-5), or what an update changes for its repository and its draft's run (pl-7).
+    pub lines: Option<Vec<Line>>,
+    /// An update draft's moved use: its name, and its version before and after (pl-7's `What
+    /// v2.4.0 changes for quiver`).
+    pub update: Option<(String, String, String)>,
 }
 
 /// An action's or reusable workflow's commits since its newest release (W29-R21): what Release
@@ -1469,12 +1528,185 @@ pub fn upstream_lines(upstream: &[(String, String)]) -> Vec<Line> {
     upstream.iter().map(|(name, stat)| Line::new(format!("upstream.{name}"), "upstream", name.clone(), if stat.is_empty() { "no change to its files".to_owned() } else { stat.clone() })).collect()
 }
 
-/// What an update changes for its consumer, as its pane's lines (W29-R22).
-pub fn change_lines(changes: &[crate::wf::diff::Change]) -> Vec<Line> {
+/// What a release or an update changes for those who use it (W29-R21, R22), in sentences as the
+/// approved stills say them (pl-5, pl-7): each names what changed (its key's last part, which the
+/// pane sets in bold) and is marked `safe` where nothing they pass has to change, `breaks` where
+/// something does, and `access` where it may read or reach more. `who` is the repository an update
+/// is for (`quiver passes none, so nothing changes`); none, those who use it.
+pub fn change_lines(changes: &[crate::wf::diff::Change], who: Option<&str>) -> Vec<Line> {
     if changes.is_empty() {
-        return vec![Line::new("changes", "note", "What changes", "nothing its workflows meet").state("none")];
+        let said = who.map_or_else(|| "nothing they pass changes".to_owned(), |w| format!("nothing {w} passes changes"));
+        return vec![Line::new("changes", "note", said, "same").state("passed")];
     }
-    changes.iter().map(|c| Line::new(format!("changes.{}.{}", c.kind, c.name), "change", format!("{} {}", c.kind, c.name), c.detail.as_ref().map_or_else(|| c.what.to_owned(), |d| format!("{} · {d}", c.what)))).collect()
+    let each = who.unwrap_or("each use");
+    let passes = who.map_or_else(|| "they pass".to_owned(), |w| format!("{w} passes"));
+    changes
+        .iter()
+        .map(|c| {
+            let n = &c.name;
+            let required = c.detail.as_deref() == Some("required");
+            let (said, mark, state) = match (c.kind, c.what) {
+                ("input", "added") if required => (format!("a new input, {n} (required): {each} has to pass it"), "breaks", "flag"),
+                ("input", "added") => (format!("a new input, {n} (optional): {}", who.map_or_else(|| "nothing they pass changes".to_owned(), |w| format!("{w} passes none, so nothing changes"))), "safe", "added"),
+                ("input", "removed") => (format!("input {n} removed: a use that passes it has to drop it"), "breaks", "flag"),
+                ("secret", "added") if required => (format!("a new secret, {n} (required): {each} has to pass it"), "breaks", "flag"),
+                ("secret", "added") => (format!("a new secret, {n} (optional): it may read one more"), "access", "flag"),
+                ("secret", "removed") => (format!("secret {n} removed: nothing {passes} has to change"), "safe", "passed"),
+                (k, "now required") => (format!("{k} {n} is required now: {each} has to pass it"), "breaks", "flag"),
+                (k, "no longer required") => (format!("{k} {n} is optional now: nothing {passes} has to change"), "safe", "passed"),
+                ("permission", "added") => (format!("a new permission, {n}: {}", c.detail.as_deref().unwrap_or("read")), "access", "flag"),
+                ("permission", "changed") => (format!("permission {n}: {}", c.detail.as_deref().unwrap_or("changed")), "access", "flag"),
+                ("permission", "removed") => (format!("permission {n} no longer asked for"), "safe", "passed"),
+                ("egress", "added") => (format!("a new host it may reach, {n}"), "access", "flag"),
+                ("egress", "removed") => (format!("host {n} no longer reached"), "safe", "passed"),
+                (k, "added") => (format!("a new {k}, {n}"), "safe", "added"),
+                (k, "removed") => (format!("{k} {n} taken out"), "safe", "passed"),
+                (k, what) => (format!("{k} {n} {what}{}", c.detail.as_deref().map(|d| format!(": {d}")).unwrap_or_default()), "", "passed"),
+            };
+            Line::new(format!("changes.{}.{}", c.kind, c.name), "change", said, mark).state(state)
+        })
+        .collect()
+}
+
+/// Whether `changes` let what's used read or reach more: a new secret or permission, a raised
+/// one, or a new host.
+fn more_access(changes: &[crate::wf::diff::Change]) -> bool {
+    changes.iter().any(|c| matches!((c.kind, c.what), ("secret", "added") | ("permission", "added" | "changed") | ("egress", "added")))
+}
+
+/// An update's line where it asks for no more than it had (pl-7): `no new secrets, permissions or
+/// egress · same`.
+pub fn access_line(changes: &[crate::wf::diff::Change]) -> Option<Line> {
+    (!more_access(changes)).then(|| Line::new("changes.access", "note", "no new secrets, permissions or egress", "same").state("passed"))
+}
+
+/// A repository's own checks on a commit (pl-5's Changes): `ci-kit's own checks passed on e41a9c2
+/// · 4 jobs`.
+pub fn checks_line(repo: &str, sha: &str, outcome: Option<Outcome>, running: bool, jobs: usize) -> Line {
+    let (own, at) = (repo.rsplit('/').next().unwrap_or(repo), sha.get(..7).unwrap_or(sha));
+    let (said, state) = match (outcome, running) {
+        (Some(Outcome::Failed), _) => (format!("{own}'s own checks failed on {at}"), "failed"),
+        (_, true) => (format!("{own}'s own checks are running on {at}"), "running"),
+        (Some(Outcome::Passed), false) => (format!("{own}'s own checks passed on {at}"), "passed"),
+        (Some(Outcome::Cancelled), false) => (format!("{own}'s own checks were cancelled on {at}"), "none"),
+        (None, false) => (format!("{own}'s own checks haven't run on {at}"), "none"),
+    };
+    Line::new("changes.checks", "note", said, match jobs {
+        0 => String::new(),
+        1 => "1 job".to_owned(),
+        n => format!("{n} jobs"),
+    })
+    .state(state)
+}
+
+/// A draft's newest run (pl-7's Changes): its jobs by what's become of them, and how long it's
+/// taken: `#88's run on its draft: rust / check running, bench queued · 4m`. `jobs` are each job's
+/// key and status, in its run's order.
+pub fn draft_run_line(name: Option<&str>, jobs: &[(String, String)], outcome: Option<Outcome>, running: bool, secs: i64) -> Line {
+    let run = name.map_or_else(|| "the draft's run".to_owned(), |n| format!("{n}'s run on its draft"));
+    let of = |states: &[&str]| jobs.iter().filter(|(_, s)| states.contains(&s.as_str())).map(|(k, _)| k.as_str()).collect::<Vec<_>>().join(", ");
+    let (failed, under_way, waiting) = (of(&["failed", "timed_out"]), of(&["running"]), of(&["queued", "pending"]));
+    let (said, state) = if running {
+        let parts: Vec<String> = [(failed, "failed"), (under_way, "running"), (waiting, "queued")].into_iter().filter(|(j, _)| !j.is_empty()).map(|(j, w)| format!("{j} {w}")).collect();
+        (if parts.is_empty() { format!("{run} is starting") } else { format!("{run}: {}", parts.join(", ")) }, "running")
+    } else {
+        match outcome {
+            Some(Outcome::Passed) => (format!("{run} passed"), "passed"),
+            Some(Outcome::Failed) if !failed.is_empty() => (format!("{run}: {failed} failed"), "failed"),
+            Some(Outcome::Failed) => (format!("{run} failed"), "failed"),
+            Some(Outcome::Cancelled) => (format!("{run} was cancelled"), "none"),
+            None => (format!("{run} hasn't started"), "none"),
+        }
+    };
+    Line::new("changes.run", "note", said, span_words(secs)).state(state)
+}
+
+/// A `uses:` an update moves (W29-R22): its name as the pane says it (`rust-check`), its version
+/// before and after, and the commits to it between them.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Moved {
+    pub name: String,
+    pub from: String,
+    pub to: String,
+    pub commits: usize,
+}
+
+/// An update draft's strip before anything's picked (pl-7), and the words it sets in bold: what's
+/// out, the commits since the version it had, what it changes in short, and the draft kiln
+/// opened: `rust-check v2.4.0 is out · 3 commits since v2.3.0 · a new optional input; no new
+/// secrets, permissions or egress · kiln opened draft pull request #88`.
+pub fn update_said(moved: &[Moved], changes: &[crate::wf::diff::Change], change: Option<&DraftChange>) -> (Vec<String>, Vec<String>) {
+    let names: Vec<String> = moved.iter().map(|m| format!("{} {}", m.name, m.to)).collect();
+    let mut said = Vec::new();
+    match names.as_slice() {
+        [] => {}
+        [one] => said.push(format!("{one} is out")),
+        [rest @ .., last] => said.push(format!("{} and {last} are out", rest.join(", "))),
+    }
+    let mut since: Vec<String> = Vec::new();
+    for m in moved {
+        let words = format!("{} since {}", if m.commits == 1 { "1 commit".to_owned() } else { format!("{} commits", m.commits) }, m.from);
+        if !since.contains(&words) {
+            since.push(words);
+        }
+    }
+    if !since.is_empty() {
+        said.push(since.join(", "));
+    }
+    said.push(change_summary(changes));
+    let mut strong = names;
+    if let Some(c) = change {
+        let what = if c.kind == "diff" {
+            "diff"
+        } else if c.name.starts_with('!') {
+            "merge request"
+        } else {
+            "pull request"
+        };
+        said.push(format!("kiln opened draft {what} {}", c.name));
+        strong.push(c.name.clone());
+    }
+    (said, strong)
+}
+
+/// What `changes` come to in short, for an update's strip: `a new optional input; no new secrets,
+/// permissions or egress`.
+fn change_summary(changes: &[crate::wf::diff::Change]) -> String {
+    let mut counted: Vec<(&'static str, &'static str, usize)> = Vec::new();
+    for c in changes {
+        let required = c.detail.as_deref() == Some("required");
+        let (one, many) = match (c.kind, c.what) {
+            ("input", "added") if required => ("a new required input", "new required inputs"),
+            ("input", "added") => ("a new optional input", "new optional inputs"),
+            ("input", "removed") => ("an input removed", "inputs removed"),
+            ("input", "now required") => ("an input required now", "inputs required now"),
+            ("input", "no longer required") => ("an input optional now", "inputs optional now"),
+            ("secret", "added") => ("a new secret", "new secrets"),
+            ("secret", "removed") => ("a secret removed", "secrets removed"),
+            ("secret", "now required") => ("a secret required now", "secrets required now"),
+            ("secret", "no longer required") => ("a secret optional now", "secrets optional now"),
+            ("permission", "added") => ("a new permission", "new permissions"),
+            ("permission", "changed") => ("a permission changed", "permissions changed"),
+            ("permission", "removed") => ("a permission removed", "permissions removed"),
+            ("egress", "added") => ("a new host it reaches", "new hosts it reaches"),
+            ("egress", "removed") => ("a host it no longer reaches", "hosts it no longer reaches"),
+            ("step", "added") => ("a new step", "new steps"),
+            ("step", "removed") => ("a step taken out", "steps taken out"),
+            ("job", "added") => ("a new job", "new jobs"),
+            ("job", "removed") => ("a job taken out", "jobs taken out"),
+            _ => ("a change", "changes"),
+        };
+        match counted.iter_mut().find(|(o, ..)| *o == one) {
+            Some(had) => had.2 += 1,
+            None => counted.push((one, many, 1)),
+        }
+    }
+    let said: Vec<String> = counted.into_iter().map(|(one, many, n)| if n == 1 { one.to_owned() } else { format!("{n} {many}") }).collect();
+    match (said.is_empty(), more_access(changes)) {
+        (true, _) => "no new inputs, secrets, permissions or egress".to_owned(),
+        (false, false) => format!("{}; no new secrets, permissions or egress", said.join(", ")),
+        (false, true) => said.join(", "),
+    }
 }
 
 /// An opened row's pane (W29-R04's `ShipPipelinePane { head, strip, groups, detail }`).
@@ -1490,7 +1722,8 @@ pub fn pane_json(o: &Opened<'_>, groups: &[PaneGroup]) -> Value {
             "stand": row.standing.stand, "word": row.standing.word, "pips": row.standing.pips,
         },
         "strip": {
-            "said": [format!("{} · {}", f.kind.words(), row.line)],
+            "said": o.said.as_ref().map_or_else(|| vec![format!("{} · {}", f.kind.words(), row.line)], |(said, _)| said.clone()),
+            "strong": o.said.as_ref().map(|(_, strong)| strong.clone()).unwrap_or_default(),
             "pick": ["all"],
             "verbs": verbs_for(row, o.viewer, o.by_hand).into_iter().map(|mut v| {
                 if v.verb == "release" && v.enabled {
@@ -1505,7 +1738,8 @@ pub fn pane_json(o: &Opened<'_>, groups: &[PaneGroup]) -> Value {
             "name": f.path, "views": views, "text": o.text,
             "since": o.since.map(|s| json!({ "tag": s.tag, "commits": s.commits })),
             "overlay": o.overlay.map(|(path, text)| json!({ "path": path, "text": text })),
-            "changes": o.changes.filter(|_| o.since.is_some()).map(change_lines),
+            "changes": o.lines,
+            "update": o.update.as_ref().map(|(uses, from, to)| json!({ "uses": uses, "from": from, "to": to })),
         },
         "repo": o.repo,
     })
@@ -1590,11 +1824,73 @@ mod tests {
         let text = "on: push\njobs:\n  ui-checks:\n    runs-on: [baremetal, docker]\n    if: github.ref == 'refs/heads/main'\n    steps: [{run: x}]\n  release-binary:\n    runs-on: [baremetal]\n    strategy:\n      matrix:\n        platform: [linux/amd64, darwin/arm64, windows/amd64]\n    steps: [{run: x}]\n  shards:\n    runs-on: [baremetal]\n    if: ${{ github.ref_name == 'release' }}\n    strategy:\n      matrix:\n        n: [1, 2]\n        m: [a, b]\n    steps: [{run: x}]\n";
         let (_, w) = crate::wf::check_model(".github/workflows/ci.yml", text, None);
         let w = w.unwrap_or_default();
-        let said = |id: &str| w.job(id).map(|j| job_line(j, None).value).unwrap_or_default();
+        let said = |id: &str| w.job(id).map(|j| job_line(j, &Seen::default()).value).unwrap_or_default();
         assert_eq!(said("ui-checks"), "bare metal · docker · on main");
         assert_eq!(said("release-binary"), "3 platforms · bare metal");
         assert_eq!(said("shards"), "4 legs · bare metal · on release");
         assert_eq!(on_branch("github.event_name == 'push'"), None, "a condition that isn't a branch's says nothing");
+    }
+
+    #[test]
+    fn w29_r22_changes_in_sentences_as_pl_5_and_pl_7_say_them() {
+        use crate::wf::diff::Change;
+        let c = |kind: &'static str, name: &str, what: &'static str, detail: Option<&str>| Change { kind, name: name.to_owned(), what, detail: detail.map(str::to_owned) };
+        let targets = [c("input", "targets", "added", None)];
+        let said = |lines: Vec<Line>| lines.into_iter().map(|l| (l.name, l.value, l.state)).collect::<Vec<_>>();
+        // pl-5: for those who use it.
+        assert_eq!(said(change_lines(&targets, None)), [("a new input, targets (optional): nothing they pass changes".to_owned(), "safe".to_owned(), Some("added"))]);
+        // pl-7: for the repository an update is for.
+        assert_eq!(said(change_lines(&targets, Some("quiver"))), [("a new input, targets (optional): quiver passes none, so nothing changes".to_owned(), "safe".to_owned(), Some("added"))]);
+        let more = [c("input", "where", "added", Some("required")), c("input", "how", "now required", None), c("permission", "contents", "changed", Some("read → write")), c("egress", "b.example", "added", None), c("step", "bye", "removed", None)];
+        assert_eq!(
+            said(change_lines(&more, None)).into_iter().map(|(n, v, _)| format!("{n} · {v}")).collect::<Vec<_>>(),
+            [
+                "a new input, where (required): each use has to pass it · breaks",
+                "input how is required now: each use has to pass it · breaks",
+                "permission contents: read → write · access",
+                "a new host it may reach, b.example · access",
+                "step bye taken out · safe",
+            ]
+        );
+        assert_eq!(said(change_lines(&[], Some("quiver"))), [("nothing quiver passes changes".to_owned(), "same".to_owned(), Some("passed"))]);
+        assert_eq!(access_line(&targets).map(|l| (l.name, l.value)), Some(("no new secrets, permissions or egress".to_owned(), "same".to_owned())));
+        assert!(access_line(&more).is_none(), "an update that may reach more says so line by line");
+        // pl-5's own checks, pl-7's draft run.
+        let checks = checks_line("hyper-light/ci-kit", "e41a9c2b8d", Some(Outcome::Passed), false, 4);
+        assert_eq!((checks.name.as_str(), checks.value.as_str(), checks.state), ("ci-kit's own checks passed on e41a9c2", "4 jobs", Some("passed")));
+        let jobs = [("rust / check".to_owned(), "running".to_owned()), ("bench".to_owned(), "queued".to_owned())];
+        let run = draft_run_line(Some("#88"), &jobs, None, true, 4 * 60 + 12);
+        assert_eq!((run.name.as_str(), run.value.as_str(), run.state), ("#88's run on its draft: rust / check running, bench queued", "4m", Some("running")));
+        assert_eq!(draft_run_line(Some("#88"), &[], Some(Outcome::Passed), false, 600).name, "#88's run on its draft passed");
+        // pl-7's strip, and its bold words.
+        let moved = [Moved { name: "rust-check".into(), from: "v2.3.0".into(), to: "v2.4.0".into(), commits: 3 }];
+        let pr = DraftChange { kind: "change", name: "#88".into(), url: None };
+        let (strip, strong) = update_said(&moved, &targets, Some(&pr));
+        assert_eq!(strip.join(" · "), "rust-check v2.4.0 is out · 3 commits since v2.3.0 · a new optional input; no new secrets, permissions or egress · kiln opened draft pull request #88");
+        assert_eq!(strong, ["rust-check v2.4.0", "#88"]);
+        assert_eq!(update_said(&moved, &more, None).0.get(2).map(String::as_str), Some("a new required input, an input required now, a permission changed, a new host it reaches, a step taken out"));
+        assert_eq!(update_said(&moved, &[], None).0.get(2).map(String::as_str), Some("no new inputs, secrets, permissions or egress"));
+    }
+
+    #[test]
+    fn w29_r04_a_picked_jobs_strip_says_what_it_reserves_and_its_last_run_as_pl_2_does() {
+        let text = "on: push\njobs:\n  rust:\n    runs-on: [baremetal, linux]\n    resources: { cpu: 2, memory: 16Gi }\n    steps: [{run: x}]\n  ui:\n    runs-on: [baremetal]\n    steps: [{run: x}]\n  vendor:\n    runs-on: [baremetal]\n    steps: [{run: x}]\n";
+        let (_, w) = crate::wf::check_model(".kiln/ci.yaml", text, None);
+        let w = w.unwrap_or_default();
+        let seen = Seen {
+            job_secs: HashMap::from([("rust".to_owned(), 18 * 60 + 40), ("ui".to_owned(), 4 * 60)]),
+            job_outcome: HashMap::from([("rust".to_owned(), Outcome::Passed), ("ui".to_owned(), Outcome::Failed)]),
+            last_sha: Some("a3f2c1d9e8b7".to_owned()),
+            ..Seen::default()
+        };
+        let note = |id: &str| w.job(id).and_then(|j| job_line(j, &seen).note).unwrap_or_default();
+        assert_eq!(note("rust"), "bare metal, linux · 2 CPUs, 16 GiB · its last run passed in 18m 40s on a3f2c1d");
+        assert_eq!(note("ui"), "bare metal · its last run failed after 4m on a3f2c1d");
+        assert_eq!(note("vendor"), "bare metal", "a job the last run didn't time says where it runs alone");
+        assert_eq!(w.job("rust").map(|j| job_line(j, &seen).value).unwrap_or_default(), "bare metal · linux · 18m", "its line keeps the stills' value");
+        for (secs, said) in [(40, "40s"), (18 * 60 + 40, "18m 40s"), (18 * 60, "18m"), (2 * 3600 + 5 * 60, "2h 5m"), (3 * 86_400 + 4 * 3600, "3d 4h")] {
+            assert_eq!(span_exact(secs), said);
+        }
     }
 
     #[test]

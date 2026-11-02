@@ -10,10 +10,10 @@
 import type http from "node:http";
 import { parse, parseDocument } from "yaml";
 import type { ShipPipelineDraft, ShipPipelineGroup, ShipPipelineLine, ShipPipelinePane, ShipPipelineRepo, ShipPipelineRow, ShipPipelineVerb, ShipPipelines } from "../src/api/ship.ts";
-import { ADDED, FILES, JOB_SECS, RUNS, SET_IN, TAG_AGO, TAGS, UPDATES, USED_BY } from "./pipelines-files.ts";
+import { ADDED, CHECKS, FILES, JOB_SECS, RUNS, SET_IN, TAG_AGO, TAGS, UPDATES, USED_BY } from "./pipelines-files.ts";
 // The pane's words as the server words them: the UI's own, so the mock and the typed text agree.
 import { triggerLines } from "../src/lib/triggers.ts";
-import { jobLine, spanWords } from "../src/lib/typed-groups.ts";
+import { jobLine, spanWords, type JobLast } from "../src/lib/typed-groups.ts";
 
 type Ctx = { json: (res: http.ServerResponse, status: number, body: unknown) => void };
 
@@ -402,10 +402,13 @@ function workflowGroups(key: string, text: string, kiln: boolean, runsHere: bool
         value: `${String(obj(i).type ?? "string")}${obj(i).required ? " · required" : ""}`,
       })),
     });
+  // Each job's outcome in the last finished run, and its commit, as the server reads them (pl-2's strip).
+  const finished = (RUNS[key] ?? []).find((r) => r.status !== "under way");
+  const lastOf = (id: string): JobLast | undefined => (finished?.sha ? { outcome: finished.failed?.includes(id) ? "failed" : "passed", sha: finished.sha } : undefined);
   stagesOf(jobs).forEach((ids, i) =>
     out.push({
       name: `Stage ${i + 1}`,
-      lines: ids.map((id) => jobLine(id, obj(jobs[id]), JOB_SECS[key]?.[id])),
+      lines: ids.map((id) => jobLine(id, obj(jobs[id]), JOB_SECS[key]?.[id], lastOf(id))),
     }),
   );
   const seen = new Set<string>();
@@ -662,13 +665,21 @@ function paneOf(repo: string, row: ShipPipelineRow): ShipPipelinePane {
   const update = UPDATES[key];
   if (update)
     groups.unshift(
-      { name: "What changes for it", lines: update.changes.map(([n, v]) => ({ key: `changes.${n}`, kind: "change", name: n, value: v })) },
+      { name: "What changes for it", lines: update.changes.filter((l) => l.kind === "change") },
       { name: "Upstream", lines: update.upstream.map(([n, v]) => ({ key: `upstream.${n}`, kind: "upstream", name: n, value: v })) },
     );
+  // What releasing it changes for those who use it, in sentences, and its repository's own checks on its head (pl-5).
+  const checks = CHECKS[key];
+  const released: ShipPipelineLine[] = [
+    SINCE[key]
+      ? { key: "changes.input.targets", kind: "change", name: "a new input, targets (optional): nothing they pass changes", value: "safe", state: "added" }
+      : { key: "changes", kind: "note", name: "nothing they pass changes", value: "same", state: "passed" },
+    ...(checks ? [{ key: "changes.checks", kind: "note", ...checks }] : []),
+  ];
   const byHand = groups.some((g) => g.name === "Triggers" && g.lines.some((l) => l.key === "on.workflow_dispatch"));
   return {
     head: { title: row.name, path: row.path, kind: row.kind, dialect: row.dialect, ref: row.ref, commit: row.commit, draft: row.draft, stand: row.stand, word: row.word, pips: row.pips },
-    strip: { said: [`${KIND_WORDS[row.kind] ?? row.kind} · ${row.line}`], pick: ["all"], verbs: verbsOf(row, byHand) },
+    strip: { said: update ? update.said : [`${KIND_WORDS[row.kind] ?? row.kind} · ${row.line}`], strong: update?.strong ?? [], pick: ["all"], verbs: verbsOf(row, byHand) },
     groups,
     detail: {
       name: row.path,
@@ -677,9 +688,10 @@ function paneOf(repo: string, row: ShipPipelineRow): ShipPipelinePane {
       ...(row.released && !row.draft && (action || row.kind === "reusable")
         ? {
             since: { tag: row.released, commits: SINCE[key] ?? [] },
-            changes: SINCE[key] ? [{ key: "changes.input.targets", kind: "change", name: "input targets", value: "added · optional: nothing they pass changes" }] : [],
+            changes: released,
           }
         : {}),
+      ...(update ? { changes: update.changes, update: update.update } : {}),
       // A GitHub workflow's overlay, none yet in the mock: where Flow writes kiln's own triggers (W29-R06).
       ...(row.dialect === "gha"
         ? {

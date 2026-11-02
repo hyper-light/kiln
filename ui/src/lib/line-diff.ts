@@ -53,3 +53,15 @@ export function lineDiff(a: string, b: string, context = 2): DiffLine[] {
   });
   return out;
 }
+
+/** How many places `b` changes `a`: each run of lines taken out or put in, as a typed draft's row counts them (pl-3's `1 change`). */
+export function changesIn(a: string, b: string): number {
+  let n = 0;
+  let inRun = false;
+  for (const l of lineDiff(a, b, 0)) {
+    const changed = l.kind === "add" || l.kind === "del";
+    if (changed && !inRun) n++;
+    inRun = changed;
+  }
+  return n;
+}

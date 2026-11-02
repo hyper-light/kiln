@@ -660,6 +660,10 @@ fn w29_r21_r22_release_and_updates_in_ship() -> anyhow::Result<()> {
     let verbs = p.pointer("/strip/verbs").and_then(Value::as_array).cloned().unwrap_or_default();
     let asks = verbs.iter().find(|v| field(v, "verb") == "release").map(|v| field(v, "asks").to_owned()).unwrap_or_default();
     assert!(asks.starts_with("Keep · Release") && asks.contains("input `where` added, required"), "{asks:?} in {verbs:?}");
+    // Its Changes says it in a sentence, marked, then its repository's own checks on its head (pl-5).
+    let lines: Vec<(&str, &str)> = p.pointer("/detail/changes").and_then(Value::as_array).into_iter().flatten().map(|l| (field(l, "name"), field(l, "value"))).collect();
+    assert_eq!(lines.first().copied(), Some(("a new input, where (required): each use has to pass it", "breaks")), "{p}");
+    assert!(lines.last().is_some_and(|(n, _)| n.starts_with("kit's own checks ") && n.ends_with(head.get(..7).unwrap_or_default())), "{lines:?}");
 
     // Released, acme/app's update draft says what changes for it.
     release(git(&home, &kit, &["rev-parse", "HEAD"])?.trim(), "v1.1.0")?;
@@ -677,7 +681,15 @@ fn w29_r21_r22_release_and_updates_in_ship() -> anyhow::Result<()> {
     anyhow::ensure!(st == 200, "the update draft's pane: {st} {body}");
     let p: Value = serde_json::from_str(&body)?;
     let changes: Vec<(&str, &str)> = group(&p, "What changes for it").iter().map(|l| (field(l, "name"), field(l, "value"))).collect();
-    assert_eq!(changes, [("input where", "added · required")], "{p}");
+    assert_eq!(changes, [("a new input, where (required): app has to pass it", "breaks")], "{p}");
+    // Its strip says what's out, the commits since, and what it changes in short (pl-7); its
+    // Changes, in sentences.
+    let said: Vec<&str> = p.pointer("/strip/said").and_then(Value::as_array).into_iter().flatten().filter_map(Value::as_str).collect();
+    assert_eq!(said.get(..3), Some(&["setup v1.1.0 is out", "1 commit since v1.0.0", "a new required input; no new secrets, permissions or egress"][..]), "{p}");
+    assert_eq!(p.pointer("/strip/strong/0").and_then(Value::as_str), Some("setup v1.1.0"), "{p}");
+    let lines: Vec<&str> = p.pointer("/detail/changes").and_then(Value::as_array).into_iter().flatten().map(|l| field(l, "name")).collect();
+    assert_eq!(lines.get(..2), Some(&["a new input, where (required): app has to pass it", "no new secrets, permissions or egress"][..]), "{p}");
+    assert_eq!(p.pointer("/detail/update"), Some(&json!({ "uses": "setup", "from": "v1.0.0", "to": "v1.1.0" })), "{p}");
     let upstream: Vec<&str> = group(&p, "Upstream").iter().map(|l| field(l, "name")).collect();
     assert_eq!(upstream, ["acme/kit/.github/actions/setup v1.0.0 → v1.1.0"], "{p}");
     assert!(at(&p, "/detail/text").contains("setup@v1.1.0"), "{p}");

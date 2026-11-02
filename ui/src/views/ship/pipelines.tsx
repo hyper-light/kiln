@@ -20,8 +20,8 @@ import { EmptyState, PageIntro } from "@/components/ui/misc";
 import { JourneyStrip, StatusGlyph } from "@/components/ui/status-glyph";
 import { GLYPHS, PIPELINE_STAGES, type GlyphState, type Pip } from "@/components/ui/status-glyph-spec";
 import { errorMessage, useMediaQuery } from "@/lib/hooks";
-import { lineDiff } from "@/lib/line-diff";
-import { jobsOf, planLines, whereWords, type PlanJob, type PlanLine } from "@/lib/plan-diff";
+import { changesIn, lineDiff } from "@/lib/line-diff";
+import { jobsOf, planDiff, planLines, whereWords, type PlanDiff, type PlanJob, type PlanLine } from "@/lib/plan-diff";
 import { manualInputs, spotOf, type ManualInput, type Spot } from "@/lib/pipeline-spot";
 import { TRIGGER_GROUPS, TRIGGER_KINDS, triggerKeys, triggerLines, type TriggerKind } from "@/lib/triggers";
 import { addedOf, typedGroups } from "@/lib/typed-groups";
@@ -198,8 +198,9 @@ export function DraftMark() {
 
 /** A workflow or action as Ship's row: its name, its stand and line, its pips, who changed it and when, where it is. No buttons but to open it. */
 function PipelineRow({ repo, row, open, landed, onOpen }: { repo: ShipPipelineRepo; row: ShipPipelineRow; open: boolean; landed: boolean; onOpen: (open: boolean) => void }) {
-  // Typed in and not saved: the row says so, as a draft does (W29-R10's Not saved).
+  // Typed in and not saved: the row says so, as a draft does (W29-R10's Not saved), with how much it changes and its plan once checked (pl-3).
   const [notSaved, setNotSaved] = React.useState(() => unsaved.has(row.key) || unsaved.has(overlayKey(row.key)));
+  const [typedLine, setTypedLine] = React.useState<string | null>(null);
   return (
     <li className="ship-row dp-row ppl-row" data-stand={row.stand} data-key={row.key} ref={landed ? intoView : undefined}>
       <div className="ship-r">
@@ -212,7 +213,7 @@ function PipelineRow({ repo, row, open, landed, onOpen }: { repo: ShipPipelineRe
             <span className="ship-stand" data-stand={notSaved ? "waiting" : row.stand}>
               {notSaved ? "Not saved" : row.word}
             </span>
-            <span className="ship-text">{notSaved ? "yours · changed here, not saved yet" : row.line}</span>
+            <span className="ship-text">{notSaved ? (typedLine ?? "yours · changed here, not saved yet") : row.line}</span>
           </span>
         </button>
         <span className="ship-pips">
@@ -244,7 +245,7 @@ function PipelineRow({ repo, row, open, landed, onOpen }: { repo: ShipPipelineRe
       {open ? (
         <div className="ship-open dp-open">
           <Loadable label={`Loading ${row.name}`} fallback={<Loading label={`Loading ${row.name}`} block className="dp-slot" />}>
-            <PipelinePane repo={repo} row={row} onChanged={setNotSaved} />
+            <PipelinePane repo={repo} row={row} onChanged={setNotSaved} onLine={setTypedLine} />
           </Loadable>
         </div>
       ) : null}
@@ -778,7 +779,7 @@ function basePlanOf(pane: ShipPipelinePane, base: string, event: string | null, 
 }
 
 /** An opened workflow or action (W29-R04): its head, the strip, its groups, and the picked line's detail beside them (under its line on a phone). */
-function PipelinePane({ repo, row, onChanged }: { repo: ShipPipelineRepo; row: ShipPipelineRow; onChanged: (changed: boolean) => void }) {
+function PipelinePane({ repo, row, onChanged, onLine }: { repo: ShipPipelineRepo; row: ShipPipelineRow; onChanged: (changed: boolean) => void; onLine: (line: string | null) => void }) {
   const draft = row.draft?.id ?? null;
   const pane = useSuspenseResource(`ship/pipeline/${repo.repo}/${row.path}/${draft ?? ""}`, (s) => shipApi.pipeline(repo.repo, row.path, { draft }, s), { on: PIPELINE_EVENTS, pollMs: 15_000 });
   const p = pane.data;
@@ -799,11 +800,29 @@ function PipelinePane({ repo, row, onChanged }: { repo: ShipPipelineRepo; row: S
   const textChanged = text !== p.detail.text;
   const overlayChanged = ov !== null && overlay !== ov.text;
   const changed = textChanged || overlayChanged;
+  // What its YAML's check found, for the strip's `checks clean but for 1 warning` and the row's plan (pl-3).
+  const [checked, setChecked] = React.useState<Checked | null>(null);
+  // The row's words while it's typed in (pl-3): how many places it changes, and its plan's jobs against the published one's once checked.
+  const lineFor = (t: string, o: string, c: Checked | null): string | null => {
+    const n = changesIn(p.detail.text, t) + (ov ? changesIn(ov.text, o) : 0);
+    if (!n) return null;
+    const jobs = (k: number) => (k === 1 ? "1 job" : `${k} jobs`);
+    const plan =
+      c?.text === t && c.jobs
+        ? c.jobs.was === null
+          ? `plans ${jobs(c.jobs.now)}`
+          : c.jobs.was === c.jobs.now
+            ? `plans the same ${jobs(c.jobs.now)}`
+            : `plans ${jobs(c.jobs.now)} (was ${c.jobs.was})`
+        : null;
+    return ["yours", n === 1 ? "1 change" : `${n} changes`, ...(plan ? [plan] : [])].join(" · ");
+  };
   const edit = (t: string) => {
     setText(t);
     if (t === p.detail.text) unsaved.delete(row.key);
     else unsaved.set(row.key, t);
     onChanged(t !== p.detail.text || overlayChanged);
+    onLine(lineFor(t, overlay, checked));
     setSaid(null);
   };
   const editOverlay = (t: string) => {
@@ -811,6 +830,7 @@ function PipelinePane({ repo, row, onChanged }: { repo: ShipPipelineRepo; row: S
     if (t === (ov?.text ?? "")) unsaved.delete(overlayKey(row.key));
     else unsaved.set(overlayKey(row.key), t);
     onChanged(textChanged || t !== (ov?.text ?? ""));
+    onLine(lineFor(text, t, checked));
     setSaid(null);
   };
   // The Triggers group follows what's typed, and ends with Add a trigger where the file can be edited (W29-R06).
@@ -825,6 +845,9 @@ function PipelinePane({ repo, row, onChanged }: { repo: ShipPipelineRepo; row: S
   // A job or use typed in is a line of its own, marked new; one taken out is gone (pl-3).
   const typedAll = workflow && textChanged ? typedGroups(text, p.groups) : null;
   const added = typedAll ? addedOf(typedAll) : [];
+  // What the strip says it adds: its new jobs, else its new uses (pl-3's `Adds helm-lint`); and what its check found.
+  const adds = added.some((l) => l.kind === "job") ? added.filter((l) => l.kind === "job") : added.filter((l) => l.kind === "use");
+  const checks = checked?.text === text ? checksWords(checked) : null;
   const groups = (typedAll ?? p.groups).map((g) => (g.name === "Triggers" && workflow ? { ...g, lines: [...(typed ?? g.lines), ...(editable ? [ADD_TRIGGER] : [])] } : g));
   const lines = groups.flatMap((g) => g.lines);
   const at = picked && lines.some((l) => l.key === picked) ? picked : firstPick(p);
@@ -1010,26 +1033,29 @@ function PipelinePane({ repo, row, onChanged }: { repo: ShipPipelineRepo; row: S
     <>
       <b>Add a trigger</b> · pick what starts it; its filters open under it and the YAML gains its lines, as a draft
     </>
-  ) : changed && added.length ? (
-    <>
-      Adds{" "}
-      {added.map((l, i) => (
-        <React.Fragment key={l.key}>
-          {i ? ", " : ""}
-          <b>{l.kind === "use" ? shortUse(l.name) : l.name}</b>
-        </React.Fragment>
-      ))}{" "}
-      · not saved yet · a draft runs on no trigger until it lands
-    </>
   ) : changed ? (
-    <>Not saved yet · a draft runs on no trigger until it lands</>
-  ) : line ? (
+    // What it adds (its jobs, else its uses), what its checks found, and that it isn't saved (pl-3).
     <>
-      <b>{wordsOf(line).name || line.name}</b> picked · {groupOf(line.key).toLowerCase()}
-      {wordsOf(line).value ? ` · ${wordsOf(line).value}` : ""}
+      {adds.length ? (
+        <>
+          Adds{" "}
+          {adds.map((l, i) => (
+            <React.Fragment key={l.key}>
+              {i ? ", " : ""}
+              <b>{l.kind === "use" ? shortUse(l.name) : l.name}</b>
+            </React.Fragment>
+          ))}{" "}
+          ·{" "}
+        </>
+      ) : null}
+      {checks ? `${checks} · ` : ""}
+      {adds.length || checks ? "not saved yet" : "Not saved yet"} · a draft runs on no trigger until it lands
     </>
+  ) : line && (picked !== null || h.draft?.state !== "update") ? (
+    <PickedSaid line={line} group={groupOf(line.key)} pane={p} text={text} ask={ask} />
   ) : (
-    p.strip.said.join(" · ")
+    // Before anything's picked, kiln's update draft says what it is (pl-7).
+    <Strong text={p.strip.said.join(" · ")} words={p.strip.strong ?? []} />
   );
   // A verb that doesn't apply is dimmed, never hidden; picking it says why (W29-R04).
   const whyNot = (v: ShipPipelineVerb): string | null =>
@@ -1078,6 +1104,10 @@ function PipelinePane({ repo, row, onChanged }: { repo: ShipPipelineRepo; row: S
       }
     },
     say: (why) => setSaid({ text: why, refused: true }),
+    checked: (c) => {
+      setChecked(c);
+      onLine(lineFor(c.text, overlay, c));
+    },
     addKind: (k) => {
       const keys = kiln ? k.kiln : k.gha;
       try {
@@ -1235,6 +1265,23 @@ interface Tools {
   setSchedule: (index: number, cron: string, field: string, value: string | boolean | null) => void;
   addKind: (k: TriggerKind) => void;
   say: (why: string) => void;
+  /** What the pane's own file's check found, as it's checked. */
+  checked: (c: Checked) => void;
+}
+
+/** What the YAML view's check found of the pane's own file (pl-3): the text it checked, its problems, and its plan's jobs against what's published (none before it's typed in). */
+interface Checked {
+  text: string;
+  errors: number;
+  warnings: number;
+  jobs: { now: number; was: number | null } | null;
+}
+
+/** A check's findings in the strip's words (pl-3): `checks clean`, `checks clean but for 1 warning`, `checks find 2 errors and 1 warning`. */
+function checksWords(c: Checked): string {
+  const n = (k: number, one: string) => `${k} ${one}${k === 1 ? "" : "s"}`;
+  if (c.errors) return `checks find ${n(c.errors, "error")}${c.warnings ? ` and ${n(c.warnings, "warning")}` : ""}`;
+  return c.warnings ? `checks clean but for ${n(c.warnings, "warning")}` : "checks clean";
 }
 
 /** The file a picked line lives in where it isn't the pane's own: a GitHub workflow's overlay, for kiln's own triggers (W29-R06). */
@@ -1394,6 +1441,111 @@ function TriggerFilters({ text, line, tools }: { text: string; line: ShipPipelin
       </button>
     </div>
   );
+}
+
+/** What the strip says of a picked line (pl-2, pl-8): a trigger by its kind, a schedule by when it runs next; a job by where it runs, what it reserves and its last run (its note); the rest by their words. */
+function PickedSaid({ line, group, pane, text, ask }: { line: ShipPipelineLine; group: string; pane: ShipPipelinePane; text: string; ask: PlanAsk }) {
+  const w = wordsOf(line);
+  if (line.kind === "trigger") {
+    const words = [w.name, w.value].filter(Boolean).join(" · ");
+    return (
+      <>
+        <b>{w.kind ?? line.name}</b> picked ·{" "}
+        {eventKey(line) === "schedule" ? (
+          <React.Suspense fallback={words}>
+            <ScheduleSaid pane={pane} text={text} ask={ask} or={words} />
+          </React.Suspense>
+        ) : (
+          words
+        )}
+      </>
+    );
+  }
+  const value = line.kind === "job" ? (line.note ?? w.value) : w.value;
+  return (
+    <>
+      <b>{w.name || line.name}</b> picked · {group.toLowerCase()}
+      {value ? ` · ${value}` : ""}
+    </>
+  );
+}
+
+/** A picked schedule in the strip (pl-8): `every day at 03:00 Los Angeles time · next tomorrow, 11:00 UTC: daylight saving ends tonight`; its line's words where the preview can't say. */
+function ScheduleSaid({ pane, text, ask, or }: { pane: ShipPipelinePane; text: string; ask: PlanAsk; or: string }) {
+  const overlay = ask.overlay?.trim() ? ask.overlay : null;
+  const preview = useSuspenseResource(`ci/schedule-said/${pane.repo}/${pane.head.path}/${hashOf(text)}/${hashOf(overlay ?? "")}`, () =>
+    ci.preview({ repo: pane.repo, path: pane.head.path, content: text, ...(overlay ? { overlay } : {}), event: "schedule" }).catch(() => null),
+  ).data;
+  const s = preview?.schedules?.[0];
+  if (!s || s.error) return <>{or}</>;
+  const next = s.next?.[0];
+  const utc = next ? new Intl.DateTimeFormat("en-US", { timeZone: "UTC", hour: "2-digit", minute: "2-digit", hourCycle: "h23" }).format(new Date(next.at * 1000)) : null;
+  const shift = next?.shift ? `: daylight saving ${next.shift.ends ? "ends" : "starts"} ${shiftWhen(next.shift, s.timezone)}` : "";
+  return (
+    <>
+      {cronWords(s.cron, s.timezone)}
+      {next && utc ? ` · next ${fromNow(next.at, s.timezone)}, ${utc} UTC${shift}` : ""}
+    </>
+  );
+}
+
+/** When a zone's clocks change, from now (pl-8's `tonight`): the coming night's small hours are tonight, else its day. */
+function shiftWhen(shift: { at: number; local: string }, tz: string | null): string {
+  const day = fromNow(shift.at, tz);
+  const hour = Number(shift.local.split(":")[0]);
+  return day === "today" || (day === "tomorrow" && hour < 6) ? "tonight" : day;
+}
+
+const DAY_NAMES = ["Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday"];
+
+/** A cron in words, with its zone (pl-8's strip): `every day at 03:00 Los Angeles time`, `every weekday at 09:30 UTC`, `every 30 minutes`; else as written. */
+function cronWords(cron: string, tz: string | null): string {
+  const f = cron.trim().split(/\s+/);
+  const [m, h, dom, mon, dow] = f;
+  const zone = !tz || tz === "UTC" || tz === "Etc/UTC" ? "UTC" : `${(tz.split("/").pop() ?? tz).replace(/_/g, " ")} time`;
+  const num = (x: string | undefined) => (x !== undefined && /^\d+$/.test(x) ? Number(x) : null);
+  const pad = (n: number) => String(n).padStart(2, "0");
+  const [mm, hh] = [num(m), num(h)];
+  const at = mm !== null && hh !== null ? `${pad(hh)}:${pad(mm)} ${zone}` : null;
+  const every = /^\*\/(\d+)$/.exec(m ?? "");
+  if (f.length !== 5 || mon !== "*") return `on cron ${cron.trim()}`;
+  if (at && dom === "*" && dow === "*") return `every day at ${at}`;
+  if (at && dom === "*" && dow === "1-5") return `every weekday at ${at}`;
+  if (at && dom === "*" && /^[0-6](,[0-6])*$/.test(dow ?? ""))
+    return `every ${(dow ?? "")
+      .split(",")
+      .map((d) => DAY_NAMES[Number(d)])
+      .join(", ")} at ${at}`;
+  if (at && num(dom) !== null && dow === "*") return `on day ${dom} of each month at ${at}`;
+  if (mm !== null && h === "*" && dom === "*" && dow === "*") return `every hour at :${pad(mm)}`;
+  if (every && h === "*" && dom === "*" && dow === "*") return `every ${every[1]} minutes`;
+  return `on cron ${cron.trim()}`;
+}
+
+/** Where `w` first stands as a word of its own in `text` (not inside another), else where it first appears; -1 where it doesn't. */
+function wholeAt(text: string, w: string): number {
+  const word = /\w/;
+  for (let i = text.indexOf(w); i >= 0; i = text.indexOf(w, i + 1)) if (!word.test(text[i - 1] ?? " ") && !word.test(text[i + w.length] ?? " ")) return i;
+  return text.indexOf(w);
+}
+
+/** Words with some set in bold, each where it first stands (an update draft's `rust-check v2.4.0`, `#88`; a change's name in its sentence). */
+function Strong({ text, words }: { text: string; words: readonly string[] }) {
+  const out: React.ReactNode[] = [];
+  let rest = text;
+  let left = words.filter(Boolean);
+  for (;;) {
+    const first = left
+      .map((w) => ({ w, at: wholeAt(rest, w) }))
+      .filter((x) => x.at >= 0)
+      .sort((a, b) => a.at - b.at)[0];
+    if (!first) break;
+    out.push(rest.slice(0, first.at), <b key={out.length}>{first.w}</b>);
+    rest = rest.slice(first.at + first.w.length);
+    left = left.filter((w) => w !== first.w);
+  }
+  out.push(rest);
+  return <>{out}</>;
 }
 
 /** A run's minute in its zone and in UTC, with daylight saving's change said: `Sun, Nov 1, 03:00 PST · 11:00 UTC (daylight saving ends at 02:00)`. */
@@ -1644,7 +1796,11 @@ function View({
         ) : (
           <CodeView text={own.text} path={own.path} spot={line ? spotOf(own.text, line) : null} rows={rows} />
         );
-      return editable ? <YamlView pane={pane} line={line} text={text} onText={onText} ask={ask} /> : <CodeView text={text} path={h.path} spot={line ? spotOf(text, line) : null} rows={rows} />;
+      return editable ? (
+        <YamlView pane={pane} line={line} text={text} onText={onText} ask={ask} onChecked={tools.checked} />
+      ) : (
+        <CodeView text={text} path={h.path} spot={line ? spotOf(text, line) : null} rows={rows} />
+      );
     case "Flow":
       return <FlowView repo={pane.repo} text={text} onChange={onText} />;
     case "Plan":
@@ -1700,7 +1856,23 @@ function offsetOf(text: string, at: { line: number; col: number }): number {
  * it's saved. Checked 300 ms after typing stops; its errors and warnings sit under it, each with its
  * fix, never in a popup.
  */
-function YamlView({ pane, line, text, onText, ask, file }: { pane: ShipPipelinePane; line: ShipPipelineLine | null; text: string; onText: (t: string) => void; ask: PlanAsk; file?: string }) {
+function YamlView({
+  pane,
+  line,
+  text,
+  onText,
+  ask,
+  file,
+  onChecked,
+}: {
+  pane: ShipPipelinePane;
+  line: ShipPipelineLine | null;
+  text: string;
+  onText: (t: string) => void;
+  ask: PlanAsk;
+  file?: string;
+  onChecked?: (c: Checked) => void;
+}) {
   const h = pane.head;
   const syntax = syntaxOf(h);
   const [problems, setProblems] = React.useState<CiDiagnostic[]>([]);
@@ -1719,7 +1891,14 @@ function YamlView({ pane, line, text, onText, ask, file }: { pane: ShipPipelineP
       ]);
       const shown = r.diagnostics.filter((d) => d.severity === "error" || d.severity === "warning");
       setProblems(shown);
-      setPlan(now?.plan ? { now: jobsOf(now.plan), was: ask.base === null ? null : was?.plan ? jobsOf(was.plan) : [] } : null);
+      const planned = now?.plan ? { now: jobsOf(now.plan), was: ask.base === null ? null : was?.plan ? jobsOf(was.plan) : [] } : null;
+      setPlan(planned);
+      onChecked?.({
+        text: t,
+        errors: shown.filter((d) => d.severity === "error").length,
+        warnings: shown.filter((d) => d.severity === "warning").length,
+        jobs: planned ? { now: planned.now.length, was: planned.was?.length ?? null } : null,
+      });
       return shown.map((d) => {
         const from = offsetOf(t, d.range.start);
         return { from, to: Math.max(from + 1, offsetOf(t, d.range.end)), severity: d.severity === "error" ? "error" : "warning", message: d.message };
@@ -1865,7 +2044,20 @@ function ChangesView({ pane, text, ask }: { pane: ShipPipelinePane; text: string
             ),
           )}
         </ol>
-        {what.length ? (
+        {d.changes?.length ? (
+          // In sentences (pl-7), with its plan against the published one's before the draft's run.
+          <>
+            <div className="jp-g">
+              <span>
+                What {d.update?.to ?? "it"} changes for {pane.repo.split("/").pop()}
+              </span>
+              <span />
+            </div>
+            <React.Suspense fallback={<Lines lines={d.changes} empty="" />}>
+              <UpdateLines pane={pane} text={text} ask={ask} lines={d.changes} />
+            </React.Suspense>
+          </>
+        ) : what.length ? (
           <>
             <div className="jp-g">
               <span>What it changes for {pane.repo.split("/").pop()}</span>
@@ -1880,6 +2072,29 @@ function ChangesView({ pane, text, ask }: { pane: ShipPipelinePane; text: string
   return <Lines lines={pane.groups.filter((g) => ["What changes for it", "Upstream", "Versions"].includes(g.name)).flatMap((g) => g.lines)} empty="Nothing has changed since its newest tag." />;
 }
 
+/** An update's lines (pl-7), its plan against the published one's for the strip's event put before its draft's run: `the plan for a push to main: the same 2 jobs, 4 legs · same`. */
+function UpdateLines({ pane, text, ask, lines }: { pane: ShipPipelinePane; text: string; ask: PlanAsk; lines: ShipPipelineLine[] }) {
+  const diff = useSuspenseResource(`ship/update-plan/${pane.repo}/${pane.head.path}/${ask.event ?? ""}/${hashOf(text)}/${hashOf(ask.base ?? "")}`, () =>
+    Promise.all([planOf(pane, text, ask.event, ask.overlay), basePlanOf(pane, ask.base ?? "", ask.event, ask.baseOverlay)])
+      .then(([now, was]) => (now.plan && was.plan ? planDiff(jobsOf(was.plan), jobsOf(now.plan)) : null))
+      .catch(() => null),
+  ).data;
+  const at = lines.findIndex((l) => l.key === "changes.run");
+  const plan = diff ? planSaid(diff, ask.words ? `the plan for a ${ask.words}` : "its plan") : null;
+  return <Lines lines={plan ? (at < 0 ? [...lines, plan] : [...lines.slice(0, at), plan, ...lines.slice(at)]) : lines} empty="" />;
+}
+
+/** A draft's plan against the published one's in a line (pl-7): the same jobs and legs, or how many now and before. */
+function planSaid(d: PlanDiff, of: string): ShipPipelineLine {
+  const n = (k: number, one: string) => `${k} ${one}${k === 1 ? "" : "s"}`;
+  const legsOf = (js: readonly PlanJob[]) => js.reduce((x, j) => x + j.legs, 0);
+  if (!d.added.length && !d.removed.length && !d.changed.length)
+    return { key: "changes.plan", kind: "note", name: `${of}: the same ${n(d.same.jobs, "job")}, ${n(d.same.legs, "leg")}`, value: "same", state: "passed" };
+  const jobs = [d.same.jobs + d.added.length + d.changed.length, d.same.jobs + d.removed.length + d.changed.length];
+  const legs = [d.same.legs + legsOf(d.added) + legsOf(d.changed.map((c) => c.now)), d.same.legs + legsOf(d.removed) + legsOf(d.changed.map((c) => c.was))];
+  return { key: "changes.plan", kind: "note", name: `${of}: ${n(jobs[0] ?? 0, "job")} (was ${jobs[1] ?? 0}), ${n(legs[0] ?? 0, "leg")} (was ${legs[1] ?? 0})`, value: "changes", state: "changes" };
+}
+
 /** Lines as the detail lists them: a glyph, the words, a value. */
 function Lines({ lines, empty }: { lines: ShipPipelineLine[]; empty: string }) {
   if (!lines.length) return <p className="ppl-empty">{empty}</p>;
@@ -1887,12 +2102,15 @@ function Lines({ lines, empty }: { lines: ShipPipelineLine[]; empty: string }) {
     <ul className="ppl-lines">
       {lines.map((l) => {
         const w = wordsOf(l);
+        // A change's sentence sets what changed in bold (pl-5, pl-7): its key's last part.
+        const strong = l.kind === "change" ? l.key.split(".").slice(2).join(".") : "";
         return (
           <li key={l.key}>
-            <StatusGlyph state={glyphOf(glyphFor(l))} size={12} />
+            {/* What's added is a +, as the list and the plan draw it (pl-5, pl-7). */}
+            {l.state === "added" ? <Plus size={12} aria-hidden="true" /> : <StatusGlyph state={glyphOf(glyphFor(l))} size={12} />}
             <span className="n">
               {w.kind ? <em>{w.kind}</em> : null}
-              {w.name}
+              {strong ? <Strong text={w.name} words={[strong]} /> : w.name}
             </span>
             <span className="v">{w.value}</span>
           </li>

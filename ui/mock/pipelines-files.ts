@@ -407,17 +407,39 @@ export const USED_BY: Record<string, { repo: string; ref: string; sha: string; r
   "hyper-light/ci-kit:.github/workflows/rust-check.yml": [{ repo: "hyper-light/quiver", ref: "v2.3.0", sha: "5b2c9e1a7d6f", runs: 54, workflows: ["ci"] }],
 };
 
-/** What an update draft changes for its repository (W29-R22), and its upstream's files. */
-export const UPDATES: Record<string, { changes: [string, string][]; upstream: [string, string][] }> = {
+/**
+ * kiln's update drafts (W29-R22), as the server says them: its strip before anything's picked and
+ * the words it sets in bold, what it changes for its repository in sentences with its draft's run
+ * (pl-7), its upstream's files, and the use it moves.
+ */
+export const UPDATES: Record<
+  string,
+  {
+    said: string[];
+    strong: string[];
+    changes: { key: string; kind: string; name: string; value: string; state: string }[];
+    upstream: [string, string][];
+    update: { uses: string; from: string; to: string };
+  }
+> = {
   "hyper-light/quiver:.github/workflows/ci.yml:draft:d-update-88": {
+    said: ["rust-check v2.4.0 is out", "3 commits since v2.3.0", "a new optional input; no new secrets, permissions or egress", "kiln opened draft pull request #88"],
+    strong: ["rust-check v2.4.0", "#88"],
     changes: [
-      ["input targets", "added · optional: quiver passes none, so nothing changes"],
-      ["secrets", "none new"],
-      ["plan for a push to main", "the same 2 jobs, 4 legs"],
+      { key: "changes.input.targets", kind: "change", name: "a new input, targets (optional): quiver passes none, so nothing changes", value: "safe", state: "added" },
+      { key: "changes.access", kind: "note", name: "no new secrets, permissions or egress", value: "same", state: "passed" },
+      { key: "changes.run", kind: "note", name: "#88's run on its draft: rust / check running, bench queued", value: "4m", state: "running" },
     ],
     upstream: [
       [".github/workflows/rust-check.yml", "1 file changed, 4 insertions(+), 1 deletion(-)"],
       [".github/actions/setup-rust", "2 files changed, 12 insertions(+)"],
     ],
+    update: { uses: "rust-check", from: "v2.3.0", to: "v2.4.0" },
   },
+};
+
+/** A repository's own checks on its head, by `repo:path` of what's released there, as the server says them in an action's Changes (pl-5); cache-cargo's failed, as its Release says. */
+export const CHECKS: Record<string, { name: string; value: string; state: string }> = {
+  "hyper-light/ci-kit:.github/actions/setup-rust": { name: "ci-kit's own checks passed on e41a9c2", value: "4 jobs", state: "passed" },
+  "hyper-light/ci-kit:.github/actions/cache-cargo": { name: "ci-kit's own checks failed on e41a9c2", value: "4 jobs", state: "failed" },
 };

@@ -234,7 +234,7 @@ export interface ShipPipelineLine {
   value: string;
   /** A glyph's name, where the line has a state. */
   state?: string;
-  /** What's said beside a trigger's value (`every push`, `03:00 Los Angeles`). */
+  /** What's said beside a trigger's value (`every push`, `03:00 Los Angeles`); what the strip says of a job picked (`bare metal, linux · 2 CPUs, 16 GiB · its last run passed in 18m 40s on a3f2c1d`). */
   note?: string;
   /** A trigger's group (`Code`, `Time`, …) and whose event it is (W29-R06). */
   group?: string;
@@ -260,6 +260,8 @@ export interface ShipPipelineVerb {
 
 export interface ShipPipelineStrip {
   said: string[];
+  /** The words of `said` it sets in bold (an update draft's `rust-check v2.4.0`, `#88`). */
+  strong?: string[];
   pick: string[];
   verbs: ShipPipelineVerb[];
 }
@@ -271,8 +273,10 @@ export interface ShipPipelineDetail {
   text: string;
   /** An action's or reusable workflow's newest release and the commits to it since (pl-5's Changes). */
   since?: { tag: string; commits: { sha: string; subject: string; author: string; at: number }[] } | null;
-  /** What releasing its head changes for those who use it (W29-R21). */
+  /** What releasing its head changes for those who use it and its repository's own checks (W29-R21, pl-5); what an update changes for its repository and its draft's run (W29-R22, pl-7). In sentences, each marked. */
   changes?: ShipPipelineLine[] | null;
+  /** An update draft's moved use: its name and its versions before and after (pl-7). */
+  update?: { uses: string; from: string; to: string } | null;
   /** A GitHub workflow's overlay (W02-R07): its path and text, empty where it has none yet. Flow writes kiln's own triggers there (W29-R06). */
   overlay?: { path: string; text: string } | null;
 }

@@ -107,6 +107,8 @@ test("an opened workflow is the jobs pane's anatomy: the strip, its groups, the 
   await expect(pane.locator('.jp-g[data-group="Stage 2"] > span:last-child')).toHaveText("after rust and ui");
   // The first job is picked: YAML · Plan · Last run, its lines tinted in the code.
   await expect(pane.locator(".jp-j[data-at]")).toHaveAttribute("data-key", "jobs.rust");
+  // The strip says where it runs, what it reserves and its last run (pl-2).
+  await expect(pane.locator(".jp-said")).toHaveText("rust picked · stage 1 · bare metal, linux · 2 CPUs, 16 GiB · its last run passed in 18m 40s on a3f2c1d");
   const detail = pane.locator(".ppl-detail");
   await expect(detail.getByRole("tab")).toHaveText(["YAML", "Plan", "Last run"]);
   // Edited in place: the job's lines tinted in the editor, opened at a line above them.
@@ -150,8 +152,13 @@ test("kiln's update draft: DRAFT on its head, what changes for its repository fi
   const pane = await openPane(page, isMobile, "hyper-light/quiver", ".github/workflows/ci.yml", "d-update-88");
   await expect(pane.locator(".ppl-kicker .ppl-draft")).toHaveText("DRAFT");
   await expect(pane.locator(".jp-g > span:first-child").first()).toHaveText("What changes for it");
-  await expect(pane.locator(".jp-j[data-at]")).toHaveAttribute("data-key", "changes.input targets");
+  await expect(pane.locator(".jp-j[data-at]")).toHaveAttribute("data-key", "changes.input.targets");
   await expect(pane.locator(".ppl-detail").getByRole("tab")).toHaveText(["Changes", "YAML", "Plan"]);
+  // Before anything's picked, the strip says what's out and what it changes, its names in bold (pl-7).
+  await expect(pane.locator(".jp-said")).toHaveText(
+    "rust-check v2.4.0 is out · 3 commits since v2.3.0 · a new optional input; no new secrets, permissions or egress · kiln opened draft pull request #88",
+  );
+  await expect(pane.locator(".jp-said b")).toHaveText(["rust-check v2.4.0", "#88"]);
   expect(await sideways(page)).toBe(0);
 });
 
@@ -176,6 +183,14 @@ test("nothing moves as lines are picked and views switched: the list holds still
   await pane.locator('.jp-j[data-key="on.schedule"] .jp-line').click();
   await expect(pane.locator(".ppl-detail").getByRole("tab")).toHaveText(["Times", "YAML", "Plan"]);
   expect(await heightOf()).toBe(height);
+});
+
+test("a picked schedule's strip says when it runs in its zone's words, and its next run (pl-8)", async ({ page, isMobile }) => {
+  const pane = await openPane(page, isMobile, "hyper-light/kiln", ".kiln/smoke.yaml");
+  await pane.locator('.jp-j[data-key="on.schedule"] .jp-line').click();
+  await expect(pane.locator(".jp-said")).toHaveText(/^schedule picked · every day at 03:00 Los Angeles time · next (today|tomorrow|in \d+ days), 1[01]:00 UTC(: daylight saving (ends|starts) \w+)?$/);
+  await expect(pane.locator(".jp-said b")).toHaveText("schedule");
+  expect(await sideways(page)).toBe(0);
 });
 
 test("no layout shift as lines are picked, views switched, a verb asked and kept, and the pane refreshed", async ({ page, isMobile, browserName }) => {
@@ -262,8 +277,10 @@ test("the file is edited where it's shown: kiln's colours, run: as bash; typing 
   const row = page.locator('.ppl-row[data-key="hyper-light/kiln:.kiln/ci.yaml"]');
   await expect(row.locator(".ship-r .ship-stand")).toHaveText("Not saved");
   await expect(pane.locator(".ppl-kicker .ppl-draft")).toBeVisible();
-  // What it adds, said in the strip; its job and its use join their groups, marked new (pl-3).
-  await expect(pane.locator(".jp-said")).toContainText("Adds helm-lint, azure/setup-helm@v4 · not saved yet");
+  // What it adds and what its checks found, said in the strip; the row says how much it changes and its plan against main's;
+  // its job and its use join their groups, marked new (pl-3).
+  await expect(pane.locator(".jp-said")).toHaveText("Adds helm-lint · checks clean but for 1 warning · not saved yet · a draft runs on no trigger until it lands");
+  await expect(row.locator(".ship-r .ship-text")).toHaveText("yours · 1 change · plans 6 jobs (was 5)");
   await expect(pane.locator('.jp-j[data-key="jobs.helm-lint"]')).toContainText("new job");
   await expect(pane.locator('.jp-g[data-group="Stage 1"] > span:last-child')).toHaveText("4 jobs at once · 1 new");
   await expect(pane.locator('.jp-j[data-key="uses.azure/setup-helm@v4"]')).toContainText("pin it?");
@@ -275,6 +292,7 @@ test("the file is edited where it's shown: kiln's colours, run: as bash; typing 
   await problems.getByRole("button", { name: "Pin it to 1a275c3" }).click();
   await expect(code).toContainText("azure/setup-helm@1a275c3f0b9e8d7c6b5a4f3e2d1c0b9a8f7e6d5c");
   await expect(problems.locator("li")).toHaveCount(0);
+  await expect(pane.locator(".jp-said")).toContainText("Adds helm-lint · checks clean · not saved yet");
   // Nothing floats over the page, hovering the code or not.
   await pane.locator(".ppl-detail .cm-line", { hasText: "helm-lint" }).hover();
   await expect(page.locator(".cm-tooltip, [role=dialog]")).toHaveCount(0);
@@ -523,7 +541,16 @@ test("kiln's update draft: its lines against what's published, what it changes f
   const diff = pane.getByLabel("Its lines against what's published");
   await expect(diff.locator('li[data-kind="del"]')).toContainText("rust-check.yml@v2.3.0");
   await expect(diff.locator('li[data-kind="add"]')).toContainText("rust-check.yml@v2.4.0");
-  await expect(pane.locator(".ppl-detail")).toContainText("What it changes for quiver");
+  // What the new version changes for quiver, in sentences, each marked; its plan against main's; its draft's run (pl-7).
+  await expect(pane.locator(".ppl-detail")).toContainText("What v2.4.0 changes for quiver");
+  const changes = pane.locator(".ppl-changes .ppl-lines li");
+  await expect(changes).toHaveText([
+    /^a new input, targets \(optional\): quiver passes none, so nothing changes\s*safe$/,
+    /^no new secrets, permissions or egress\s*same$/,
+    /^the plan for a push to main: the same \d+ jobs?, \d+ legs?\s*same$/,
+    /^#88's run on its draft: rust \/ check running, bench queued\s*4m$/,
+  ]);
+  await expect(changes.first().locator("b")).toHaveText("targets");
   await expect(pane.locator(".ppl-verbs button[data-dim]")).toHaveText(["Save draft"]);
   await pane.locator(".ppl-verbs button", { hasText: "Ready" }).click();
   await expect(pane.locator(".jp-said")).toContainText("Asked for ci's review");

@@ -419,26 +419,37 @@ async fn runs_list(hub: &Hub, repo: &Repo, branch: &str, path: &str) -> anyhow::
 async fn seen_of(hub: &Hub, repo: &Repo, branch: &str, path: &str, w: &wf::Workflow) -> core::Seen {
     let mut seen = core::Seen { now: crate::util::now_unix(), ..core::Seen::default() };
     let (id, b, p, stem) = (repo.id.clone(), branch.to_owned(), path.to_owned(), stem_of(path));
-    let times = hub
+    // Each job's time and outcome in that run, and its commit (the strip's `its last run passed
+    // in 18m 40s on a3f2c1d`).
+    let last = hub
         .store
         .call(move |c| {
             let mut st = c.prepare(
-                "SELECT j.key, j.started_at, j.finished_at FROM jobs j WHERE j.run_id = (
+                "SELECT j.key, j.started_at, j.finished_at, j.status, r.sha FROM jobs j JOIN runs r ON r.id = j.run_id WHERE j.run_id = (
                    SELECT r.id FROM runs r LEFT JOIN ci_workflows w ON w.id = r.workflow_id
                    WHERE r.repo_id = ?1 AND r.branch = ?2 AND (w.path = ?3 OR (r.workflow_id IS NULL AND r.pipeline = ?4)) AND r.finished_at IS NOT NULL
                    ORDER BY r.created_at DESC LIMIT 1)",
             )?;
-            let rows = st.query_map(rusqlite::params![id, b, p, stem], |r| Ok((r.get::<_, String>(0)?, r.get::<_, Option<i64>>(1)?, r.get::<_, Option<i64>>(2)?)))?;
-            let mut out = HashMap::new();
+            let rows = st.query_map(rusqlite::params![id, b, p, stem], |r| {
+                Ok((r.get::<_, String>(0)?, r.get::<_, Option<i64>>(1)?, r.get::<_, Option<i64>>(2)?, r.get::<_, String>(3)?, r.get::<_, String>(4)?))
+            })?;
+            let (mut secs, mut outcomes, mut sha) = (HashMap::new(), HashMap::new(), None);
             for row in rows {
-                if let (k, Some(s), Some(f)) = row? {
-                    out.insert(k, f - s);
+                let (k, started, finished, status, at) = row?;
+                if let (Some(s), Some(f)) = (started, finished) {
+                    secs.insert(k.clone(), f - s);
                 }
+                let mut o = (None, false);
+                fold(&mut o, &status);
+                if let Some(o) = o.0 {
+                    outcomes.insert(k, o);
+                }
+                sha = Some(at);
             }
-            Ok(out)
+            Ok((secs, outcomes, sha))
         })
         .await;
-    seen.job_secs = times.unwrap_or_default();
+    (seen.job_secs, seen.job_outcome, seen.last_sha) = last.unwrap_or_default();
     // Each use of a repository kiln hosts, by the full version it names, against that
     // repository's newest release.
     let hosted = hub.store.repos().await.unwrap_or_default();
@@ -541,8 +552,37 @@ pub async fn get(hub: &Arc<Hub>, owner: &str, name: &str, q: &HashMap<String, St
     let since = newest.as_deref().map(|tag| core::Since { tag, commits: &commits });
     let overlay = overlay_of(hub, &repo, &sha, path).await;
     let overlay = overlay.as_ref().map(|(p, t)| (p.as_str(), t.as_str()));
-    let pane = core::pane_json(&core::Opened { repo: &full, row: &row, at: &at, sha: &sha, text: &text, viewer, by_hand, changes: changes.as_deref(), since, overlay }, &groups);
-    Ok(srv::json(StatusCode::OK, &pane))
+    // What releasing it changes for those who use it, and the repository's own checks on its
+    // head (pl-5's Changes).
+    let lines = match (&since, &changes) {
+        (Some(_), Some(changes)) => {
+            let (outcome, running, jobs) = checks_on(hub, &repo, &sha).await;
+            let mut lines = core::change_lines(changes, None);
+            lines.push(core::checks_line(&repo.name, &sha, outcome, running, jobs));
+            Some(lines)
+        }
+        _ => None,
+    };
+    let opened = core::Opened { repo: &full, row: &row, at: &at, sha: &sha, text: &text, viewer, by_hand, changes: changes.as_deref(), since, overlay, said: None, lines, update: None };
+    Ok(srv::json(StatusCode::OK, &core::pane_json(&opened, &groups)))
+}
+
+/// A repository's own checks on `sha`: its runs' outcome as one, whether one's under way, and how
+/// many jobs they have.
+async fn checks_on(hub: &Hub, repo: &Repo, sha: &str) -> (Option<Outcome>, bool, usize) {
+    let (id, sha) = (repo.id.clone(), sha.to_owned());
+    let runs = hub
+        .store
+        .call(move |c| {
+            let mut st = c.prepare("SELECT r.status, (SELECT count(DISTINCT COALESCE(j.job_id, j.key)) FROM jobs j WHERE j.run_id = r.id) FROM runs r WHERE r.repo_id = ?1 AND r.sha = ?2 AND r.draft IS NULL")?;
+            let out = st.query_map(rusqlite::params![id, sha], |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?)))?.collect::<rusqlite::Result<Vec<_>>>()?;
+            Ok(out)
+        })
+        .await
+        .unwrap_or_default();
+    let statuses: Vec<String> = runs.iter().map(|(s, _)| s.clone()).collect();
+    let (outcome, running) = together(&statuses);
+    (outcome, running, runs.iter().map(|(_, n)| usize::try_from(*n).unwrap_or(0)).sum())
 }
 
 /// When each of `repo`'s tags was made (an annotated tag's own date, else its commit's), by name:
@@ -605,10 +645,11 @@ fn diff_of(path: &str, old: &str, new: &str) -> Vec<kiln_ci::wf::diff::Change> {
 /// consumer's file on its trunk, against the draft's head), what the used action or reusable
 /// workflow changes between the two versions, read from kiln's copy of it, and how much of its
 /// file changed upstream.
-async fn update_changes(hub: &Hub, repo: &Repo, path: &str, trunk: &str, text: &str) -> (Vec<kiln_ci::wf::diff::Change>, Vec<(String, String)>) {
+async fn update_changes(hub: &Hub, repo: &Repo, path: &str, trunk: &str, text: &str) -> (Vec<kiln_ci::wf::diff::Change>, Vec<(String, String)>, Vec<core::Moved>) {
     let before = crate::ci::load::blob(hub, repo, trunk, path).await.unwrap_or_default();
     let mut changes = Vec::new();
     let mut upstream = Vec::new();
+    let mut moved = Vec::new();
     for (name, old, new) in kiln_ci::updates::moved_between(&before, text) {
         let Some(r) = crate::ci::actions::Remote::parse(&format!("{name}@{new}")) else { continue };
         let full = format!("{}/{}", r.owner, r.repo);
@@ -625,8 +666,13 @@ async fn update_changes(hub: &Hub, repo: &Repo, path: &str, trunk: &str, text: &
         changes.extend(diff_of(&file, &a, &b));
         let stat = git(hub, &dir, &["diff", "--shortstat", &old, &new, "--", r.path.as_str()]).await;
         upstream.push((format!("{full}/{} {old} → {new}", r.path), stat.trim().to_owned()));
+        // By its own name, as the pane's Uses says it (`rust-check`), with the commits to it between its versions.
+        let own = r.path.rsplit('/').next().filter(|s| !s.is_empty()).unwrap_or(&r.repo);
+        let own = own.strip_suffix(".yml").or_else(|| own.strip_suffix(".yaml")).unwrap_or(own).to_owned();
+        let commits = git(hub, &dir, &["rev-list", "--count", &format!("{old}..{new}"), "--", r.path.as_str()]).await.trim().parse().unwrap_or(0);
+        moved.push(core::Moved { name: own, from: old, to: new, commits });
     }
-    (changes, upstream)
+    (changes, upstream, moved)
 }
 
 /// What sharing says of `path` in `repo`'s pane (W29-R17, R20): the repository's Access, and which
@@ -670,16 +716,71 @@ async fn draft_pane(hub: &Hub, repo: &Repo, id: &str, path: &str, viewer: core::
             action.as_ref().map(|a| core::action_groups(a, row.facts.kind, &text, &head, &ctx.versions, &sharing, &core::ActionSeen::default())).unwrap_or_default()
         }
     };
+    // kiln's update draft (W29-R22): what it moves and what that changes for this repository, in
+    // its strip and its Changes, with the draft's run (pl-7).
+    let (mut said, mut lines, mut update) = (None, None, None);
     if d.author.starts_with(kiln_ci::updates::AUTHOR) {
-        let (changes, upstream) = update_changes(hub, repo, path, &tip, &text).await;
-        groups.insert(0, core::PaneGroup { name: "What changes for it".into(), lines: core::change_lines(&changes) });
+        let (changes, upstream, moved) = update_changes(hub, repo, path, &tip, &text).await;
+        let own = repo.name.rsplit('/').next().unwrap_or(&repo.name);
+        groups.insert(0, core::PaneGroup { name: "What changes for it".into(), lines: core::change_lines(&changes, Some(own)) });
         groups.insert(1, core::PaneGroup { name: "Upstream".into(), lines: core::upstream_lines(&upstream) });
+        let mut l = core::change_lines(&changes, Some(own));
+        l.extend(core::access_line(&changes));
+        if let Some((jobs, outcome, running, secs)) = draft_run(hub, &d.id).await {
+            l.push(core::draft_run_line(d.name.as_deref(), &jobs, outcome, running, secs));
+        }
+        lines = Some(l);
+        said = Some(core::update_said(&moved, &changes, row.draft.as_ref().and_then(|x| x.change.as_ref())));
+        update = moved.into_iter().next().map(|m| (m.name, m.from, m.to));
     }
     let at = d.branch.clone().or_else(|| d.name.clone()).unwrap_or_else(|| head.clone());
     let overlay = overlay_of(hub, repo, &head, path).await;
     let overlay = overlay.as_ref().map(|(p, t)| (p.as_str(), t.as_str()));
-    let pane = core::pane_json(&core::Opened { repo: &repo.name, row: &row, at: &at, sha: &head, text: &text, viewer, by_hand: runs_by_hand(loaded.as_ref()), changes: None, since: None, overlay }, &groups);
-    Ok(srv::json(StatusCode::OK, &pane))
+    let opened = core::Opened { repo: &repo.name, row: &row, at: &at, sha: &head, text: &text, viewer, by_hand: runs_by_hand(loaded.as_ref()), changes: None, since: None, overlay, said, lines, update };
+    Ok(srv::json(StatusCode::OK, &core::pane_json(&opened, &groups)))
+}
+
+/// A draft's newest run: each job's key and status (a job's legs as one: failed, else under way,
+/// else waiting, else as it ended), its outcome, whether it's under way, and how long it's taken
+/// so far. None before it has one.
+async fn draft_run(hub: &Hub, draft: &str) -> Option<(Vec<(String, String)>, Option<Outcome>, bool, i64)> {
+    let draft = draft.to_owned();
+    let run = hub
+        .store
+        .call(move |c| {
+            use rusqlite::OptionalExtension as _;
+            let Some((id, status, started, finished)) = c
+                .query_row("SELECT id, status, COALESCE(started_at, created_at), finished_at FROM runs WHERE draft = ?1 ORDER BY created_at DESC LIMIT 1", [&draft], |r| {
+                    Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get::<_, i64>(2)?, r.get::<_, Option<i64>>(3)?))
+                })
+                .optional()?
+            else {
+                return Ok(None);
+            };
+            let mut st = c.prepare("SELECT key, status FROM jobs WHERE run_id = ?1 ORDER BY rowid")?;
+            let legs = st.query_map([&id], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?.collect::<rusqlite::Result<Vec<_>>>()?;
+            Ok(Some((status, started, finished, legs)))
+        })
+        .await
+        .ok()??;
+    let (status, started, finished, legs) = run;
+    let rank = |s: &str| match s {
+        "failed" | "timed_out" => 0,
+        "running" => 1,
+        "queued" | "pending" => 2,
+        _ => 3,
+    };
+    let mut jobs: Vec<(String, String)> = Vec::new();
+    for (key, s) in legs {
+        match jobs.iter_mut().find(|(k, _)| *k == key) {
+            Some(had) if rank(&s) < rank(&had.1) => had.1 = s,
+            Some(_) => {}
+            None => jobs.push((key, s)),
+        }
+    }
+    let mut seen = (None, false);
+    fold(&mut seen, &status);
+    Some((jobs, seen.0, seen.1, finished.unwrap_or_else(crate::util::now_unix) - started))
 }
 
 /// A GitHub workflow's overlay at `sha` (W02-R07): its path and text, or where Flow would write

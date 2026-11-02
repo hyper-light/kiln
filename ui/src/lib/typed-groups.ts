@@ -28,42 +28,113 @@ export function stagesOf(jobs: Js): string[][] {
   return out.filter(Boolean);
 }
 
+/** How a job's last finished run went, and its commit (the strip's `its last run passed in 18m 40s on a3f2c1d`). */
+export interface JobLast {
+  outcome: "passed" | "failed" | "cancelled";
+  sha: string;
+}
+
 /**
  * A job's line as the server words it (`kiln_ci::pipelines::job_line`, the approved stills'): its id;
  * its legs where a matrix makes more than one (`3 platforms`), where it runs (bare metal unless a
  * container is asked for) and its labels beyond that, or the workflow it calls; its time in the
- * last finished run; and what it needs.
+ * last finished run; and what it needs. Its note is what the strip says of it picked: where it
+ * runs, what it reserves and its last run (pl-2).
  */
-export function jobLine(id: string, j: Js, secs?: number): ShipPipelineLine {
-  const parts: string[] = [];
-  if (j.uses) parts.push(`calls ${String(j.uses)}`);
+export function jobLine(id: string, j: Js, secs?: number, last?: JobLast): ShipPipelineLine {
+  let legs: string | null = null;
+  const at: string[] = [];
+  if (j.uses) at.push(`calls ${String(j.uses)}`);
   else {
     const m = obj(obj(j.strategy).matrix);
     const count = (a: unknown) => (Array.isArray(a) ? Math.max(1, a.length) : 1);
     // kiln's `platforms`, or an axis named for them (`platform`, `os`): pl-2's `3 platforms`.
     const named = Object.entries(m).find(([k, a]) => ["platform", "platforms", "os"].includes(k) && count(a) > 1);
-    if (named) parts.push(`${count(named[1])} platforms`);
+    if (named) legs = `${count(named[1])} platforms`;
     else {
-      const legs = Object.entries(m)
+      const n = Object.entries(m)
         .filter(([k, a]) => Array.isArray(a) && !["include", "exclude", "platforms"].includes(k))
-        .reduce((n, [, a]) => n * count(a), 1);
-      if (legs > 1) parts.push(`${legs} legs`);
+        .reduce((x, [, a]) => x * count(a), 1);
+      if (n > 1) legs = `${n} legs`;
     }
-    parts.push(j.container || j.image ? "in a container" : "bare metal");
+    at.push(j.container || j.image ? "in a container" : "bare metal");
     const on = j["runs-on"];
     if (on && typeof on === "object" && !Array.isArray(on)) {
       const g = obj(on);
-      if (g.group) parts.push(`group ${String(g.group)}`);
-      parts.push(...strs(g.labels).filter((t) => !["baremetal", "bare-metal"].includes(t)));
-    } else parts.push(...strs(on).filter((t) => !["baremetal", "bare-metal"].includes(t)));
+      if (g.group) at.push(`group ${String(g.group)}`);
+      at.push(...strs(g.labels).filter((t) => !["baremetal", "bare-metal"].includes(t)));
+    } else at.push(...strs(on).filter((t) => !["baremetal", "bare-metal"].includes(t)));
   }
   // A job only a branch runs: pl-2's `on main`.
-  const on = onBranch(j.if === undefined ? "" : String(j.if));
-  if (on) parts.push(`on ${on}`);
+  const branch = onBranch(j.if === undefined ? "" : String(j.if));
+  const on = branch ? `on ${branch}` : null;
+  const parts = [...(legs ? [legs] : []), ...at, ...(on ? [on] : [])];
   // Its time in the last finished run (pl-2's `18m`).
   if (secs !== undefined) parts.push(spanWords(secs));
   if (strs(j.needs).length) parts.push(`needs ${strs(j.needs).join(", ")}`);
-  return { key: `jobs.${id}`, kind: "job", name: id, value: parts.join(" · ") };
+  const said = [...(legs ? [legs] : []), at.join(", "), ...(on ? [on] : [])];
+  const reserved = reservedWords(j);
+  if (reserved) said.push(reserved);
+  if (last && secs !== undefined) {
+    const how = last.outcome === "passed" ? "passed in" : last.outcome === "failed" ? "failed after" : "was cancelled after";
+    said.push(`its last run ${how} ${spanExact(secs)} on ${last.sha.slice(0, 7)}`);
+  }
+  return { key: `jobs.${id}`, kind: "job", name: id, value: parts.join(" · "), note: said.join(" · ") };
+}
+
+/** A quantity as kiln's routing reads it (`kiln_ci::sched::routing::number`): `16Gi`, `2G`, `512Mi`, bytes. */
+function quantity(v: unknown): number | null {
+  if (typeof v !== "string" && typeof v !== "number") return null;
+  const s = String(v).trim();
+  const m = /^(-?[\d.]+)(.*)$/.exec(s);
+  const n = m ? Number(m[1]) : NaN;
+  const unit: Record<string, number> = { "": 1, B: 1, s: 1, Ki: 2 ** 10, Mi: 2 ** 20, Gi: 2 ** 30, Ti: 2 ** 40, K: 1e3, k: 1e3, M: 1e6, G: 1e9, T: 1e12, m: 60, h: 3600, d: 86_400 };
+  const k = m ? unit[m[2] ?? ""] : undefined;
+  return Number.isFinite(n) && k !== undefined ? n * k : null;
+}
+
+/** A size as the server shows it (`kiln_ci::sched::needs::show_size`): `16 GiB`, `512 MiB`, `1.5 TiB`. */
+function showSize(n: number): string {
+  const unit = (
+    [
+      [2 ** 40, "TiB"],
+      [2 ** 30, "GiB"],
+      [2 ** 20, "MiB"],
+      [2 ** 10, "KiB"],
+    ] as const
+  ).find(([k]) => n >= k);
+  return unit ? `${Math.round((n / unit[0]) * 10) / 10} ${unit[1]}` : `${n} bytes`;
+}
+
+/** What a job reserves (`resources:`), as the server says it (`kiln_ci::pipelines::reserved_words`): `2 CPUs, 16 GiB`; nothing where one isn't a quantity. */
+function reservedWords(j: Js): string | null {
+  if (!j.resources || typeof j.resources !== "object") return null;
+  const r = obj(j.resources);
+  const text = (k: string) => (typeof r[k] === "string" || typeof r[k] === "number" ? String(r[k]).trim() : null);
+  const cpuText = text("cpu");
+  const cpu = cpuText === null ? 0 : cpuText.endsWith("m") ? Number(cpuText.slice(0, -1)) / 1000 : Number(cpuText);
+  const [mem, disk] = [text("memory"), text("disk")].map((t) => (t === null ? 0 : quantity(t)));
+  if (!Number.isFinite(cpu) || cpu < 0 || mem === null || disk === null || mem === undefined || disk === undefined || mem < 0 || disk < 0) return null;
+  const gpu = Number.parseInt(text("gpu") ?? "0", 10) || 0;
+  const parts: string[] = [];
+  if (cpu > 0) parts.push(`${cpu} CPU${cpu === 1 ? "" : "s"}`);
+  if (mem > 0) parts.push(showSize(Math.floor(mem)));
+  if (disk > 0) parts.push(`${showSize(Math.floor(disk))} of disk`);
+  if (gpu > 0) parts.push(gpu === 1 ? "1 GPU" : `${gpu} GPUs`);
+  return parts.length ? parts.join(", ") : null;
+}
+
+/** A span in its two largest units, as the server says a job's time (`kiln_ci::pipelines::span_exact`): `40s`, `18m 40s`, `2h 5m`, `3d 4h`. */
+export function spanExact(secs: number): string {
+  const s = Math.max(0, Math.floor(secs));
+  const two = (a: number, ua: string, b: number, ub: string) => (b ? `${a}${ua} ${b}${ub}` : `${a}${ua}`);
+  return s < 60
+    ? `${s}s`
+    : s < 3600
+      ? two(Math.floor(s / 60), "m", s % 60, "s")
+      : s < 86_400
+        ? two(Math.floor(s / 3600), "h", Math.floor((s % 3600) / 60), "m")
+        : two(Math.floor(s / 86_400), "d", Math.floor((s % 86_400) / 3600), "h");
 }
 
 /** The branch a job's `if:` keeps it to, where that's all it says (`kiln_ci::pipelines::on_branch`). */
