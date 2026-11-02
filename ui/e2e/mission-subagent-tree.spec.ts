@@ -9,7 +9,7 @@ import { expect, test, type Locator } from "@playwright/test";
 /** Against a real kiln server (playwright.config.ts): these drive the mock's agents. */
 const REAL = !!process.env.E2E_BASE_URL;
 
-const ORDER = ["Leader election over QUIC", "Check vote timeouts", "Measure election time", "Follower catch-up", "Snapshot transfer", "Verify the checksum", "Re-read the manifest", "Rotate the signing key"];
+const ORDER = ["Leader election over QUIC", "Check vote timeouts", "Measure election time", "Follower catch-up", "Snapshot transfer", "Verify the checksum", "Re-read the manifest", "Docs pass", "Rotate the signing key", "Port the lexer", "Bench the follower"];
 
 const left = async (l: Locator) => Math.round((await l.boundingBox())?.x ?? -1);
 /** Where it is on the page (scrolling doesn't move it; layout does). */
@@ -45,7 +45,7 @@ test("the subagents' toggle opens the tree under its row, every subagent in the 
   await expect(row.getByRole("button", { name: "Hide Storage lead's subagents" })).toHaveAttribute("aria-expanded", "true");
 
   const stands = await tree.locator(".ms-node").evaluateAll((els) => els.map((e) => e.getAttribute("data-stand")));
-  expect(stands).toEqual(["working", "working", "done", "needs", "working", "paused", "working", "needs"]);
+  expect(stands).toEqual(["working", "working", "done", "needs", "working", "paused", "working", "done", "needs", "stopped", "failed"]);
   // Those that need you: each its piece of the path tan, and only theirs.
   const catchUp = tree.locator(".ms-node", { hasText: "Follower catch-up" });
   const signing = tree.locator(".ms-node", { hasText: "Rotate the signing key" });

@@ -863,7 +863,11 @@ const treeLeadAsk: Approval = {
   // Background subagents, as Claude Code runs them: they take a message queued, or steered into their work.
   const sub = (id: string, description: string, started: number, rest: Partial<Task> = {}): Task => ({ ...defaultTask(), id, tool_id: `toolu_${id}`, description, class: "agent", kind: "local_agent", status: "running", background: true, started, stoppable: true, takes: ["queue", "steer"], pausable: true, ...rest });
   const lead = member("tree-lead", "claude", "local", "Storage lead", "idle", "default", "Replicate the metadata store's log over QUIC, then rotate the release signing key.", "Its steps are out on subagents; I'll check each as it comes back.");
-  lead.tasks = [sub("tl-h0", "Rotate the signing key", t + 30 * 60_000, { summary: "Signing kiln-x86_64-linux" })];
+  lead.tasks = [
+    sub("tl-h0", "Rotate the signing key", t + 30 * 60_000, { summary: "Signing kiln-x86_64-linux" }),
+    sub("tl-h1", "Port the lexer", t + 31 * 60_000, { status: "stopped", ended: t + 33 * 60_000, pausable: false, stoppable: false }),
+    sub("tl-h2", "Bench the follower", t + 32 * 60_000, { status: "failed", ended: t + 34 * 60_000, summary: "cargo bench exited 101", pausable: false, stoppable: false }),
+  ];
   const s1 = member("tree-s1", "claude", "agent:metal-ryzen-01", "Leader election over QUIC", "running", "default", "Step 2 of 5 of the plan \u201cReplicated log\u201d: Leader election over QUIC", "Electing a leader across three nodes.", {
     parent: "tree-lead",
     subagent: true,
@@ -915,7 +919,23 @@ const treeLeadAsk: Approval = {
   });
   s3a.info.created_at = t + 28 * 60_000;
   s3a.tasks = [sub("ts3a-a", "Re-read the manifest", t + 29 * 60_000, { last_tool: "Read" })];
-  for (const m of [lead, s1, s2, s3, s3a]) {
+  // One kiln started that has finished: its session ended (removed as Mission control's Remove removes an agent).
+  const s5 = member(
+    "tree-s5",
+    "claude",
+    "agent:metal-ryzen-01",
+    "Docs pass",
+    "exited",
+    "default",
+    "Step 5 of 5 of the plan \u201cReplicated log\u201d: Docs pass",
+    "docs/raft.md says how a follower catches up.",
+    {
+      parent: "tree-lead",
+      subagent: true,
+    },
+  );
+  s5.info.created_at = t + 200_000;
+  for (const m of [lead, s1, s2, s3, s3a, s5]) {
     leaves(m);
     family.set(m.info.id, m);
   }
@@ -1184,6 +1204,25 @@ function stopTask(m: Member, id: string) {
   emitEvent({ type: "harness", info: m.info });
 }
 
+/** One of its harness's subagents that ended, removed (`remove_task`): it and those under it that ended leave its tasks, as the session's core does. */
+function removeTask(m: Member, id: string) {
+  const live = (t: Task) => t.status === "running" || t.status === "pending" || t.status === "paused";
+  const t = m.tasks?.find((x) => x.id === id);
+  if (!t || live(t)) return;
+  const gone = new Set([id]);
+  for (let more = true; more;) {
+    more = false;
+    for (const x of m.tasks ?? [])
+      if (!gone.has(x.id) && !live(x) && x.parent_task && gone.has(x.parent_task)) {
+        gone.add(x.id);
+        more = true;
+      }
+  }
+  m.tasks = (m.tasks ?? []).filter((x) => !gone.has(x.id));
+  leaves(m);
+  tell(m);
+}
+
 interface MockStep {
   title: string;
   goal: string;
@@ -1403,7 +1442,7 @@ const META: Meta = {
   models: [],
   commands: [{ name: "btw", description: "Ask a side question without interrupting", hint: "<question>", group: "Session", args: "required", route: { kind: "prompt" } }],
   agents: [],
-  features: ["interrupt", "set_mode", "steer", "limits", "own_edits"],
+  features: ["interrupt", "set_mode", "steer", "limits", "own_edits", "remove_task"],
 };
 
 /** How a person's message reaches one of its subagents, as its harness lets one in (harness/subagent.rs): a Codex one on its own thread, a Claude Code one by way of its agent (not once stopped). */
@@ -1491,6 +1530,7 @@ export function handleFamilySession(ws: WebSocket, id: string): boolean {
     const c: Cmd = (under ? frame.c : frame) ?? {};
     if (c.type === "approve") takeAnswer(m, c);
     if (c.type === "stop_task" && c.task) setTimeout(() => stopTask(m, c.task ?? ""), 700);
+    if (c.type === "remove_task" && c.task) removeTask(m, c.task);
     if (c.type === "send" && c.task && c.text) tellSubagent(m, c.task, c.id ?? `sub-${Date.now()}`, c.text, c.mode ?? "queue");
     if (c.type?.startsWith("queue_")) subagentQueue(m, c);
     // What one who changed its files did alone, as its session keeps it (docs/agents.md, "One subagent's own edits").
@@ -2292,6 +2332,12 @@ export async function handleFamily(req: http.IncomingMessage, res: http.ServerRe
     json(res, 200, {});
     return true;
   }
+  // Removed (Mission control's Remove, a subagent's trash): gone, as its server forgets it.
+  const dm = p.match(/^\/api\/harness\/sessions\/([^/]+)$/);
+  if (dm && m === "DELETE" && end(decodeURIComponent(dm[1] ?? ""))) {
+    json(res, 200, {});
+    return true;
+  }
   // A command without its socket (a request answered from Mission control's row or a card): taken as its harness would.
   const cm = p.match(/^\/api\/harness\/sessions\/([^/]+)\/command$/);
   const told = cm ? family.get(decodeURIComponent(cm[1] ?? "")) : undefined;
@@ -2301,6 +2347,7 @@ export async function handleFamily(req: http.IncomingMessage, res: http.ServerRe
     if (c.type === "pause") pauseMember(told, c.on === true, c.task);
     if (c.type === "perms") permsMember(told, c.perms, c.task);
     if (c.type === "branch" && c.words) branchMember(told, c.words, c.top === true, c.task);
+    if (c.type === "remove_task" && c.task) removeTask(told, c.task);
     // A message sent without its socket (to one of a lead's subagents, from its page): to a subagent of its harness's own, or to it.
     if (c.type === "send" && c.text) {
       if (c.task) tellSubagent(told, c.task, c.id ?? `sub-${Date.now()}`, c.text, c.mode ?? "queue");

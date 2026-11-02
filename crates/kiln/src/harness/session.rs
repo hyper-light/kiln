@@ -3422,6 +3422,12 @@ async fn drive(s: Arc<Session>, kind: &'static Kind, ctl_rx: async_channel::Rece
                             }
                             // What one who changed its files did alone: the session keeps that, whatever its harness.
                             Command::OwnEdits { client, by } => s.core.lock().ask_own(client, &by),
+                            // A subagent of its harness's that ended, removed: the session's own, whatever its harness.
+                            Command::RemoveTask { task } => {
+                                if s.core.lock().remove_task(&task) {
+                                    on_change();
+                                }
+                            }
                             Command::Control { id, value } if id == "rename" => {
                                 if let Some(c) = name_session(&s, value.as_ref()) {
                                     adapter.command(&mut s.core.lock(), c);
@@ -3919,6 +3925,11 @@ async fn drive(s: Arc<Session>, kind: &'static Kind, ctl_rx: async_channel::Rece
                         }
                     }
                     Command::OwnEdits { client, by } => s.core.lock().ask_own(client, &by),
+                    Command::RemoveTask { task } => {
+                        if s.core.lock().remove_task(&task) {
+                            on_change();
+                        }
+                    }
                     // Another harness's model: the session goes on in it, now.
                     Command::SetModel { model, kind: Some(to) } if to != kind.id => {
                         if let Some(sw) = wanted(&s, kind, &to, model) {

@@ -1795,3 +1795,36 @@ button.mc-pick[aria-expanded="true"] .mc-chev {
     }
   }
 }
+
+/* ---------------------------------------------------------------- a question answered in place */
+/* Under its row (or its subagent's, in the tree), drawn as the chat draws it, the row's edge its
+   own: its options, Other, Decline and Submit (mission-answer.tsx). */
+.ms-answer {
+  grid-column: main-start / actions-end;
+  min-width: 0;
+}
+.ms-answer .ms-slide-clip > * {
+  margin-top: 14px;
+}
+.ms-answer .ch[data-layout="flow"] {
+  padding: 0;
+  border-left: 0;
+}
+.ms-answer .ch-keys {
+  display: none;
+}
+.ms-answer .ch-foot {
+  justify-content: flex-end;
+}
+.ms-answer-wait {
+  height: 120px;
+}
+
+/* A subagent that ended: its trash where its pause was (kiln's Remove), and it follows a finger
+   sideways (the list still scrolls up and down under it). */
+.ms-remove:hover {
+  color: #ecc9cc;
+}
+.ms-node:is([data-stand="done"], [data-stand="failed"], [data-stand="stopped"]) {
+  touch-action: pan-y;
+}
