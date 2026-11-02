@@ -16,6 +16,7 @@ pub enum FixtureChange {
     Offline,
     Denied,
     ShadowQualifiedRefs,
+    MoveRuntime,
 }
 
 /// A fresh source with `main` at `new`, `v1` at `old` (an annotated tag on real git),
@@ -39,9 +40,13 @@ pub fn fixture_manifest() -> Manifest {
     Manifest { digest: format!("sha256:{}", crate::sha256_hex(&bytes)), media_type: "application/vnd.oci.image.manifest.v1+json".into(), bytes }
 }
 
-pub fn fixture_runtime() -> Runtime { Runtime { using: "node20".into(), os: "linux".into(), arch: "amd64".into(), musl: false } }
+pub fn fixture_runtime() -> Runtime { Runtime { using: "node20".into(), os: "linux".into(), arch: "amd64".into(), musl: false, version: None } }
 pub fn fixture_archive() -> Archive {
     Archive { version: "v20.19.5".into(), url: "https://nodejs.org/dist/v20.19.5/node-v20.19.5-linux-x64.tar.gz".into(), file: "node-v20.19.5-linux-x64.tar.gz".into(), sha256: "a".repeat(64) }
+}
+
+pub fn fixture_new_archive() -> Archive {
+    Archive { version: "v20.19.6".into(), url: "https://nodejs.org/dist/v20.19.6/node-v20.19.6-linux-x64.tar.gz".into(), file: "node-v20.19.6-linux-x64.tar.gz".into(), sha256: "b".repeat(64) }
 }
 
 pub struct SimDependencySourcesFixture {
@@ -63,7 +68,8 @@ impl Default for SimDependencySourcesFixture {
             let m = fixture_manifest();
             source.put_manifest(FIXTURE_IMAGE.into(), m.clone())?;
             source.put_manifest(format!("registry.test/acme/base@{}", m.digest), m)?;
-            source.put_runtime(fixture_runtime(), fixture_archive())
+            source.put_runtime(fixture_runtime(), fixture_archive())?;
+            source.put_runtime(Runtime { version: Some(fixture_archive().version), ..fixture_runtime() }, fixture_archive())
         });
         Self { source, commits, made }
     }
@@ -84,6 +90,8 @@ impl DependencySourcesFixture for SimDependencySourcesFixture {
                 FixtureChange::ShadowQualifiedRefs => self.source.move_ref(&r, "refs/tags/refs/heads/main", &self.commits.old)
                     .and_then(|()| self.source.move_ref(&r, "refs/tags/refs/tags/v1", &self.commits.new))
                     .and_then(|()| self.source.move_ref(&r, &format!("refs/tags/{}", self.commits.old), &self.commits.new)),
+                FixtureChange::MoveRuntime => self.source.put_runtime(fixture_runtime(), fixture_new_archive())
+                    .and_then(|()| self.source.put_runtime(Runtime { version: Some(fixture_new_archive().version), ..fixture_runtime() }, fixture_new_archive())),
             };
             fine("change upstream", result)
         })
@@ -203,7 +211,13 @@ fn c10<F: DependencySourcesFixture>(f: &F) -> BoxFuture<'_, Result<(), Failure>>
         same("pinned manifest", fine("pinned", s.manifest(format!("registry.test/acme/base@{}", m.digest)).await)?, m)?;
         same("credential URL refused", s.manifest("https://user:secret@registry.test/base".into()).await, Err(Refusal::Invalid("image reference")))?;
         let r = fixture_runtime();
-        fine("immutable runtime archive", fine("runtime", s.runtime(r.clone()).await)?.validate(&r))?;
+        let old = fine("runtime", s.runtime(r.clone()).await)?;
+        fine("immutable runtime archive", old.validate(&r))?;
+        f.change(FixtureChange::MoveRuntime).await?;
+        same("new runtime resolution", fine("new runtime", s.runtime(r.clone()).await)?, fixture_new_archive())?;
+        same("old version survives a latest change", fine("old runtime", s.runtime(Runtime { version: Some(old.version.clone()), ..r.clone() }).await)?, old)?;
+        same("new version is exact too", fine("exact new runtime", s.runtime(Runtime { version: Some(fixture_new_archive().version), ..r.clone() }).await)?, fixture_new_archive())?;
+        same("wrong runtime version", s.runtime(Runtime { version: Some("v24.0.0".into()), ..r.clone() }).await, Err(Refusal::Invalid("runtime version")))?;
         same("unsupported runtime", s.runtime(Runtime { using: "node999".into(), ..r }).await, Err(Refusal::Unsupported("runtime")))
     })
 }

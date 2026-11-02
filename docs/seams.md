@@ -637,6 +637,8 @@ cannot establish what an upstream ref names now. Missing or shallow history prov
 Qualified refs are exact: a tag whose name looks like a qualified branch or tag cannot
 substitute its history for that requested ref (W29-R23/R24).
 A full commit SHA names that object, even if a tag has the same spelling.
+Runtime requests can name an exact version; a newer default does not replace that version's
+archive metadata (W29-R24).
 
 - **Implementations:** `kiln_seams::dependencies::SimDependencySources`, deterministic and in
   memory; kiln's git, host, OCI and runtime adapter (`ci::dependency_sources`).

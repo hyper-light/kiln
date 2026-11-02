@@ -16,6 +16,7 @@ struct Host {
     denied: AtomicBool,
     redirected: AtomicBool,
     repo_id: AtomicI64,
+    runtime_moved: AtomicBool,
     methods: Mutex<Vec<String>>,
     auth: Mutex<Vec<(String, bool)>>,
 }
@@ -31,8 +32,8 @@ impl srv::Handler for Host {
             if self.redirected.load(Ordering::SeqCst) { return srv::text(http::StatusCode::MOVED_PERMANENTLY, "moved"); }
             return srv::json(http::StatusCode::OK, &serde_json::json!({ "owner": { "id": 41 }, "id": self.repo_id.load(Ordering::SeqCst) }));
         }
-        if path == "/SHASUMS256.txt" {
-            let a = fixture_archive();
+        if matches!(path, "/SHASUMS256.txt" | "/v20.19.5/SHASUMS256.txt" | "/v20.19.6/SHASUMS256.txt") {
+            let a = if path.starts_with("/v20.19.6/") || path == "/SHASUMS256.txt" && self.runtime_moved.load(Ordering::SeqCst) { contract::fixture_new_archive() } else { fixture_archive() };
             return srv::text(http::StatusCode::OK, &format!("{}  {}\n", a.sha256, a.file));
         }
         if path.starts_with("/v2/acme/base/manifests/") {
@@ -144,6 +145,7 @@ impl DependencySourcesFixture for Fixture {
                 FixtureChange::MoveTag => { git(&live.sources.hub, &live.origin, &["tag", "-fam", "moved", "v1", &live.commits.new]).await.map_err(|e| e.to_string())?; },
                 FixtureChange::ReplaceIdentity => { live.host.repo_id.store(99, Ordering::SeqCst); },
                 FixtureChange::Denied => { live.host.denied.store(true, Ordering::SeqCst); },
+                FixtureChange::MoveRuntime => { live.host.runtime_moved.store(true, Ordering::SeqCst); },
                 FixtureChange::ShadowQualifiedRefs => {
                     git(&live.sources.hub, &live.origin, &["tag", "-am", "shadow branch spelling", "refs/heads/main", &live.commits.old]).await.map_err(|e| e.to_string())?;
                     git(&live.sources.hub, &live.origin, &["tag", "-am", "shadow tag spelling", "refs/tags/v1", &live.commits.new]).await.map_err(|e| e.to_string())?;

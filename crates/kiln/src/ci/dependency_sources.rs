@@ -296,14 +296,15 @@ impl DependencySources for Sources {
             let os = if runtime.os == "macos" { "darwin" } else { "linux" };
             #[cfg(test)]
             let fixture = if let Some(e) = &self.endpoints {
-                let response = http.get(&e.node).timeout(WITHIN).send().await.map_err(|_| Refusal::Unavailable("runtime metadata"))?;
+                let endpoint = match &runtime.version { Some(v) => format!("{}/{v}/SHASUMS256.txt", e.node.rsplit_once('/').map_or(e.node.as_str(), |(base, _)| base)), None => e.node.clone() };
+                let response = http.get(&endpoint).timeout(WITHIN).send().await.map_err(|_| Refusal::Unavailable("runtime metadata"))?;
                 if !response.is_success() { return Err(Refusal::Unavailable("runtime metadata")); }
                 let sums = response.bytes(dep::FILE_MAX).await.map_err(|_| Refusal::Unavailable("runtime metadata"))?;
                 Some(crate::runner::runtime::node_archive_listed(&String::from_utf8_lossy(&sums), major, arch, os))
             } else { None };
             #[cfg(not(test))]
             let fixture: Option<anyhow::Result<(String, String, String)>> = None;
-            let result = match fixture { Some(r) => r, None => crate::runner::runtime::node_archive(http, major, runtime.musl, arch, os).await };
+            let result = match fixture { Some(r) => r, None => crate::runner::runtime::node_archive_at(http, major, runtime.musl, arch, os, runtime.version.as_deref()).await };
             let (url, file, sha256) = result.map_err(|_| Refusal::Unavailable("runtime metadata"))?;
             let version = file.strip_prefix("node-").and_then(|s| s.split_once('-')).map(|(v, _)| v.to_owned()).ok_or(Refusal::Invalid("runtime archive metadata"))?;
             let archive = Archive { version, url, file, sha256 };

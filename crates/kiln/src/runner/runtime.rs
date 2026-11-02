@@ -3449,18 +3449,18 @@ fn version_of(tag: &str) -> Option<(u32, u32, u32)> {
 ///   nothing but musl, checked against the digest its release lists;
 /// - on arm64, which GitHub has none for, the Node project's unofficial builds, checked against
 ///   their `SHASUMS256.txt`; these need the image's `libstdc++` (Alpine's `apk add libstdc++`).
-async fn musl_node(http: &crate::http::client::Client, major: u32, arch: &str) -> anyhow::Result<(String, String, String)> {
+async fn musl_node(http: &crate::http::client::Client, major: u32, arch: &str, version: Option<&str>) -> anyhow::Result<(String, String, String)> {
     if arch == "x64" {
-        let list = "https://api.github.com/repos/actions/alpine_nodejs/releases?per_page=100";
-        let resp = http.get(list).header("Accept", "application/vnd.github+json").timeout(Duration::from_secs(60)).send().await?;
+        let list = version.map_or_else(|| "https://api.github.com/repos/actions/alpine_nodejs/releases?per_page=100".into(), |v| format!("https://api.github.com/repos/actions/alpine_nodejs/releases/tags/{v}"));
+        let resp = http.get(&list).header("Accept", "application/vnd.github+json").timeout(Duration::from_secs(60)).send().await?;
         anyhow::ensure!(resp.is_success(), "GitHub's list of its musl Node builds (actions/alpine_nodejs): HTTP {}", resp.status());
         let releases: serde_json::Value = resp.json(8 << 20).await?;
+        let releases = if version.is_some() { vec![releases] } else { releases.as_array().cloned().unwrap_or_default() };
         let best = releases
-            .as_array()
-            .into_iter()
-            .flatten()
+            .iter()
             .filter_map(|r| {
                 let tag = r.get("tag_name").and_then(serde_json::Value::as_str)?;
+                if version.is_some_and(|v| v != tag) { return None; }
                 let v = version_of(tag).filter(|v| v.0 == major)?;
                 let file = format!("node-{tag}-alpine-x64.tar.gz");
                 let a = r.get("assets").and_then(serde_json::Value::as_array)?.iter().find(|a| a.get("name").and_then(serde_json::Value::as_str) == Some(file.as_str()))?;
@@ -3472,9 +3472,12 @@ async fn musl_node(http: &crate::http::client::Client, major: u32, arch: &str) -
         return best.map(|(_, b)| b).ok_or_else(|| anyhow::anyhow!("GitHub has no musl build of Node {major} with a digest (actions/alpine_nodejs)"));
     }
     let base = "https://unofficial-builds.nodejs.org/download/release";
-    let index: serde_json::Value = http.get(&format!("{base}/index.json")).timeout(Duration::from_secs(60)).send().await?.json(16 << 20).await?;
     let kind = format!("linux-{arch}-musl");
-    let version = index
+    let version = match version {
+        Some(v) => v.to_owned(),
+        None => {
+            let index: serde_json::Value = http.get(&format!("{base}/index.json")).timeout(Duration::from_secs(60)).send().await?.json(16 << 20).await?;
+            index
         .as_array()
         .into_iter()
         .flatten()
@@ -3483,7 +3486,9 @@ async fn musl_node(http: &crate::http::client::Client, major: u32, arch: &str) -
         .filter_map(|t| version_of(t).filter(|v| v.0 == major).map(|v| (v, t.to_owned())))
         .max()
         .map(|(_, t)| t)
-        .ok_or_else(|| anyhow::anyhow!("the Node project has no {kind} build of Node {major}"))?;
+                .ok_or_else(|| anyhow::anyhow!("the Node project has no {kind} build of Node {major}"))?
+        }
+    };
     let sums = http.get(&format!("{base}/{version}/SHASUMS256.txt")).timeout(Duration::from_secs(60)).send().await?.bytes(1 << 20).await?;
     let file = format!("node-{version}-{kind}.tar.gz");
     let (sha, file) = listed(&String::from_utf8_lossy(&sums), |f| f == file).ok_or_else(|| anyhow::anyhow!("{base}/{version}/SHASUMS256.txt doesn't list {file}"))?;
@@ -3493,12 +3498,20 @@ async fn musl_node(http: &crate::http::client::Client, major: u32, arch: &str) -
 /// W29-R23: the same publisher metadata used by a runner, without downloading an archive.
 /// Official builds use an exact version URL, never the mutable latest-vN.x alias.
 pub(crate) async fn node_archive(http: &crate::http::client::Client, major: u32, musl: bool, arch: &str, os: &str) -> anyhow::Result<(String, String, String)> {
-    if musl { return musl_node(http, major, arch).await; }
-    let base = format!("https://nodejs.org/dist/latest-v{major}.x");
+    node_archive_at(http, major, musl, arch, os, None).await
+}
+
+/// W29-R24: accepted locks ask for their immutable version directly, without consulting latest.
+pub(crate) async fn node_archive_at(http: &crate::http::client::Client, major: u32, musl: bool, arch: &str, os: &str, version: Option<&str>) -> anyhow::Result<(String, String, String)> {
+    anyhow::ensure!(version.is_none_or(|v| version_of(v).is_some_and(|v| v.0 == major)), "the locked Node version is invalid");
+    if musl { return musl_node(http, major, arch, version).await; }
+    let base = version.map_or_else(|| format!("https://nodejs.org/dist/latest-v{major}.x"), |v| format!("https://nodejs.org/dist/{v}"));
     let response = http.get(&format!("{base}/SHASUMS256.txt")).timeout(Duration::from_secs(60)).send().await?;
     anyhow::ensure!(response.is_success(), "Node's checksum list: HTTP {}", response.status());
     let sums = response.bytes(1 << 20).await?;
-    node_archive_listed(&String::from_utf8_lossy(&sums), major, arch, os)
+    let archive = node_archive_listed(&String::from_utf8_lossy(&sums), major, arch, os)?;
+    anyhow::ensure!(version.is_none_or(|v| archive.1.starts_with(&format!("node-{v}-"))), "the checksum list names a different Node version");
+    Ok(archive)
 }
 
 /// W29-R23: a platform's exact archive, bound to the version the checksum list names.

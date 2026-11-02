@@ -64,6 +64,9 @@ pub struct Runtime {
     /// Go's architecture names: `amd64`, `arm64`, `arm`.
     pub arch: String,
     pub musl: bool,
+    /// W29-R24: an accepted archive's exact version; None asks for a new resolution.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub version: Option<String>,
 }
 
 /// An immutable archive location and its publisher's SHA-256; downloading and checking the
@@ -192,6 +195,13 @@ impl Runtime {
         if !matches!(self.os.as_str(), "linux" | "macos") || !matches!(self.arch.as_str(), "amd64" | "arm64" | "arm") || (self.musl && (self.os != "linux" || self.arch == "arm")) {
             return Err(Refusal::Unsupported("runtime platform"));
         }
+        if let Some(version) = &self.version {
+            if version.len() > NAME_MAX { return Err(Refusal::Invalid("runtime version")); }
+            let parts: Vec<_> = version.strip_prefix('v').unwrap_or_default().split('.').collect();
+            if parts.len() != 3 || parts.iter().any(|p| p.is_empty() || !p.bytes().all(|b| b.is_ascii_digit()) || p.parse::<u32>().is_err()) || parts.first().and_then(|p| p.parse::<u32>().ok()) != Some(major) {
+                return Err(Refusal::Invalid("runtime version"));
+            }
+        }
         Ok(major)
     }
 }
@@ -209,7 +219,7 @@ impl Archive {
             || !name(&self.file) || !self.file.starts_with(&format!("node-{}-", self.version)) || !self.file.ends_with(&suffix) || host.is_empty() || self.url.len() > PATH_MAX
             || self.url.contains(['@', '?', '#', '\\']) || self.url.chars().any(|c| c.is_control() || c.is_whitespace())
             || !self.url.ends_with(&format!("/{}", self.file)) || self.url.contains("/latest-")
-            || self.sha256.len() != 64 || !self.sha256.bytes().all(|b| b.is_ascii_hexdigit()) {
+            || self.sha256.len() != 64 || !self.sha256.bytes().all(|b| b.is_ascii_hexdigit()) || runtime.version.as_ref().is_some_and(|v| v != &self.version) {
             return Err(Refusal::Invalid("runtime archive metadata"));
         }
         Ok(())
