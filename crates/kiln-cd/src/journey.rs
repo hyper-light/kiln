@@ -29,6 +29,10 @@ pub enum Land {
     Testing,
     Landed,
     Ejected { why: String },
+    /// In the queue, waiting on Review (docs/ci.md W26-R19): its gate holds it, or Review did, and why.
+    Held { why: String },
+    /// Back with Review (W28-R107): it conflicts with the trunk, and where.
+    Returned { why: String },
     /// Not in the queue yet: a change under review.
     NotYet,
 }
@@ -409,6 +413,8 @@ pub fn pips(j: &Journey, now: i64) -> Vec<Pip> {
         Land::Testing => Glyph::Running,
         Land::Landed => Glyph::Passed,
         Land::Ejected { .. } => Glyph::Failed,
+        Land::Held { .. } => Glyph::Queued,
+        Land::Returned { .. } => Glyph::Needs,
         Land::NotYet => Glyph::None,
     };
     let staging = match &j.staging {
@@ -589,6 +595,8 @@ fn stand_and_line(j: &Journey) -> (Stand, String) {
         Land::Queued { ahead } => return (Stand::Landing, format!("Queued · {ahead} ahead")),
         Land::Testing => return (Stand::Landing, "Testing against trunk".to_string()),
         Land::Ejected { why } => return (Stand::Failing, format!("Didn't land · {why}")),
+        Land::Held { why } => return (Stand::Waiting, format!("Held · {why}")),
+        Land::Returned { why } => return (Stand::Waiting, format!("Back with Review · {why}")),
         Land::NotYet => return (Stand::Waiting, "Not landed".to_string()),
         Land::Landed => {}
     }
@@ -764,6 +772,27 @@ mod tests {
         let s = standing_as(&j, 0, true);
         assert_eq!((s.stand, s.line.as_str()), (Stand::Landing, "Queued · 2 ahead"));
         assert_eq!(pip(&s, Stage::Review), Some(Glyph::Approved));
+    }
+
+    /// docs/ci.md W26-R19: the Land stage says where the queue has a change: held by Review's gate
+    /// (waiting, saying why), back with Review on a conflict (needs its author, saying where), in
+    /// line with the entries ahead of it, under test, and landed.
+    #[test]
+    fn w26_r19_the_land_stage_says_where_the_queue_has_it() {
+        let mut j = under_review(ReviewState::Approved, &[], "");
+        let cases = [
+            (Land::Held { why: "D41: kim resolves this blocking comment first".into() }, Glyph::Queued, Stand::Waiting, "Held · D41: kim resolves this blocking comment first"),
+            (Land::Returned { why: "needs rebase: conflicts with the trunk in README.md".into() }, Glyph::Needs, Stand::Waiting, "Back with Review · needs rebase: conflicts with the trunk in README.md"),
+            (Land::Queued { ahead: 1 }, Glyph::Queued, Stand::Landing, "Queued · 1 ahead"),
+            (Land::Testing, Glyph::Running, Stand::Landing, "Testing against trunk"),
+        ];
+        for (land, glyph, stand, line) in cases {
+            j.land = land;
+            let s = standing_as(&j, 0, true);
+            assert_eq!((pip(&s, Stage::Land), s.stand, s.line.as_str()), (Some(glyph), stand, line));
+        }
+        j.land = Land::Landed;
+        assert_eq!(pip(&standing_as(&j, 0, true), Stage::Land), Some(Glyph::Passed));
     }
 
     #[test]

@@ -8947,6 +8947,112 @@ resolution makes, a comment, a resolution, an approval and each mark of the Revi
   reads its agent fixing, with no Hand off and Review pair, until a new revision. With nothing
   open, or no agent to take it, Hand off says why. Not yet: the switch that lets agents fix from
   agents' feedback, and "Fixed in" once the fix lands.
+- *R19*, landing through the merge queue (Review plan step 13, kiln plan
+  `01a17856b1e277c59e86661822612a25`; W28's queue is the Merge Queues agent's):
+  - **One gate before every queue.** kiln's own changes keep `review::readiness` (W28-R104). A
+    host's pull request gets the same gate, decided purely in `kiln_ci::land::host_blockers`: a
+    draft, merged or closed one isn't landing; else its reviewers' latest words, its open threads
+    and its head's checks, by its trunk's policy as kiln's mirror has it. `review::host_held`
+    reads the mirror. `POST /api/repos/:repo/queue` asks it before anything enters, and refuses a
+    change it holds (409, `Review's gate holds #12: github:kim asked for changes`), as it does one
+    kiln hasn't mirrored at that head. The queue asks it again just before each change goes into
+    its host's queue and every 10 s while it's there. A change it holds comes out, `held` (`hold:
+    gate`), saying why, and goes back in once the gate clears.
+  - **Land when ready.** `POST /api/diffs/:id/land` with `when_ready: true` has Review hand the
+    change over once its gate clears (W14's land when ready), and `GET /api/diffs/:id/land` says
+    `when_ready`. Ship's gate row has Land beside Approve: Land while the gate is clear, Land when
+    ready while it holds, then where the queue has the change ("Lands when ready", "In the queue",
+    "Testing", "Held", "Back with Review", "Landed"), disabled. A host's pull request's Land puts it
+    in its host's queue, and the gate's refusal shows under the row. Land keeps its place and width.
+  - **The queue's state at Land.** `kiln_cd::journey::Land` has `Held` (the gate or Review holds
+    it, saying why) and `Returned` (back with Review on a conflict, saying where), and `Queued`
+    counts the entries ahead of it in its component. Ship finds a host pull request's entry by its
+    number, so its strip lights Land as its host's queue lands it.
+  - **Each land signed into the trail.** kiln's queue signs its lands (W27-R07). A land through a
+    host's own queue is signed too, as kiln's server, saying what it saw (`lands::sign_host`): the
+    statement's `via` names the host's queue (`merge queue`, `merge train`), each change at the
+    version Review cleared and the commit it merged as. It names the tip it went onto where
+    kiln's mirror has the commit, else none. It's kept in `land_signatures` and the trail, read back
+    by `GET /api/repos/:repo/lands/:commit`, and `kiln verify` reads it as "landed on main by its
+    host's merge queue, as kiln saw it land". The land's record keeps its trunk's policy. A stack
+    its host's queue merges part-way, the rest leaving it unmerged, lands what merged before the
+    entry is out, saying which part merged.
+  - *Tests:*
+    - kiln-ci: `w26_r19_a_host_pulls_gate`, `w26_r19_a_host_queues_land_reads_back`,
+      `w26_r19_a_host_merges_only_what_kiln_tested`.
+    - kiln-cd: `w26_r19_the_land_stage_says_where_the_queue_has_it`.
+    - kiln: `w26_r19_a_host_pull_enters_its_hosts_queue_only_when_clear` (GitHub's merge queue and
+      GitLab's merge trains through the forge seam's simulator),
+      `w26_r19_a_host_queues_land_is_signed_into_the_trail`,
+      `w26_r19_a_stack_its_hosts_queue_merged_part_way_lands_what_merged`,
+      `w26_r19_a_change_its_host_merged_while_held_lands_signed`, and
+      `w26_r19_a_host_without_a_queue_lands_through_kilns` (a real mirror beside the simulator:
+      merged at the head tested; applied again when the trunk moved before the merge only for what
+      it shares nothing with; back with Review's gate when its head moved, then built and merged at
+      the new head once cleared). Side by side: `w26_r19_host_changes_land_side_by_side`. Batches:
+      `w26_r19_a_batch_merges_whole_or_not_at_all`,
+      `w26_r19_a_stack_merged_part_way_lands_what_merged`,
+      `w26_r19_a_batch_stops_once_its_merges_are_done`, `w26_r19_a_resumed_batch_checks_the_trunk_again`,
+      `w26_r19_what_kiln_lands_of_an_entry_is_signed_once` and
+      `w26_r19_a_merge_its_host_wont_do_takes_its_entry_out`. Signed as tested:
+      `w26_r19_a_host_merge_of_what_kiln_tested_is_signed_as_tested` (the host's merge a real commit
+      kiln's mirror fetches).
+    - The hosting test `w26_r19_d41_lands_through_the_queue`.
+    - Playwright: `ship-land.spec.ts`.
+  - **Hosts without a queue** (Bitbucket; GitHub without one) land through W28's queue, built with
+    the Merge Queues agent. The forge seam's `abilities(repo).queue` being none gives the route
+    `kiln, merged on its host` (`queue::Route::HostMerges`).
+    - Host changes are the queue's entries like kiln's own, never landed one at a time (queues
+      aren't serial, the person's decision of 2026-11-01). A change's files, read in kiln's mirror
+      from where it left the trunk, put it in its component (W28-R30, R31). Independent changes
+      land side by side (R35), and one component's are tested together in its window (R36).
+    - The entry goes through the queue's own `see` and `build_step` in kiln's mirror: each change's
+      head is merged onto the trunk's tip there, and the candidate's workflows run as any
+      candidate's do, under the trunk's own gating checks (`.kiln/review.yaml`'s `land.checks`, as
+      its users define them).
+    - Once it passes, the batch is decided whole before anything merges: each change is read on
+      its host, Review's gate is asked again of those still open, and while nothing has merged,
+      the mirror's trunk (fetched first; if the fetch fails, nothing merges that step) goes through
+      `kiln_ci::land::queue::host_merge`.
+      - Host-merges entries land side by side under R102, as kiln's own do: just before anything
+        merges, R102 is asked again. A trunk that moved since the candidate was built only for
+        what the batch shares nothing with leaves its result standing (merged, applied again);
+        one that moved for what it meets is tested again. kiln never builds a candidate of its
+        own on the trunk's tip, and a batch whose merges began is finished as it was decided: its
+        own merges are no reason to test it again, so the plan sees it running, its component
+        busy, until it's done. Resumed, it's asked again before its next merge: what moved the
+        trunk since its last merge (another land among it) against what's still to merge, so
+        whichever lands second is checked against the first, both ways round.
+      - A head that moved after the test is content Review hasn't cleared (R105). Its entry goes
+        back to Review's gate at its new head, saying so, and enters again, built at that head,
+        once the gate clears it. It's never tested or merged at a head Review didn't clear.
+      - A change closed takes its entry out (`INVALID_MERGE_COMMIT`).
+      - The rest of the batch goes back to the queue.
+      - A batch stops only once none of its merges is under way: that merge's result says what
+        merged.
+    - Then the host merges each change at the head tested, bottom first. A background merge is
+      read on the next step, never waited on. A change already merged counts as merged. A merge its
+      host won't do on any step (unsupported, invalid, not linear, past a stack's bound, not found)
+      takes its entry out, saying why. One it may do later (busy, rate-limited, unreachable) is
+      tried again on the next step.
+    - A batch stopped part-way still lands what merged: recorded and signed, not as tested. An
+      entry merged whole lands. One merged part-way goes out, held or back to the queue, and what
+      kiln landed of it is signed once: its later land signs only what merged since, and its
+      record names all it carries.
+    - Merged whole, each entry is checked against what kiln tested, read in kiln's mirror: the first
+      went onto the candidate's base (by its tree), each later one onto the one before, and each
+      one's tree is the candidate's after it (its applied commits). The land
+      is recorded with the candidate's runs and signed with `via` naming the route. The statement's
+      `to` is the host's merge commit and its `candidate` kiln's. Where the check fails, or kiln
+      can't read the merge, it's signed as applied again (`rebased`, `from` the real tip).
+      `kiln verify` reads it as "kiln's queue tested candidate …, and its host merged it", or
+      "… applied again onto …".
+    - Each entry goes by its own route, so a repository whose host gains a queue keeps landing
+      what kiln's queue holds through kiln.
+  - *Not yet:* thread kinds on a host's pull request aren't kept, so the gate counts its open
+    threads by the trunk's `resolve_threads`. A host's rebase or fast-forward merge is always signed
+    as applied again: its commits don't show kiln which tip they went onto. That's conservative,
+    never claiming as tested a land kiln can't show was.
 - *Tests.*
   - kiln-ci: `review.rs` (`w26_r11_*`, `w26_r12_a_resolved_conflict_waits_on_its_commit`),
     `suggest.rs` (`w26_r10_*`), `conflicts.rs` (`w26_r12_*`). The Search suite on its simulator
@@ -9947,8 +10053,10 @@ the queue)
   githost directly for it; kiln's own git server has no forge, so its repositories land on W28's.
   `POST /api/repos/:repo/queue` (`ci.queue.enqueue`, `{ trunk?, changes: [{ number, head }] }`,
   bottom first) puts a host's changes in: each read on its host first, a change whose head isn't the
-  one Review cleared is refused (409, naming the head it moved to), as is one merged or closed, and a
-  repository whose host has no queue for it (422). What it does next is each entry's in
+  one Review cleared is refused (409, naming the head it moved to), as is one merged or closed, or one
+  Review's gate holds (W26-R19). A repository whose host has no queue for it lands through kiln's
+  queue, its host merging what kiln tested (route `kiln, merged on its host`, W26-R19). What it does
+  next is each entry's in
   `GET /api/repos/:repo/queue`: `state` (queued, testing, landed, ejected with `reason`), `route`,
   `host` (each change's `state`, `entered`, `queued` and merged `commit`) and, once landed, `record`.
 
