@@ -193,6 +193,48 @@ test("a picked schedule's strip says when it runs in its zone's words, and its n
   expect(await sideways(page)).toBe(0);
 });
 
+test("R04's pick words: a published workflow's lines narrowed to its last run's failures or a draft's changes, the rest dimmed in place (pl-2)", async ({ page, isMobile }) => {
+  await page.request.get("/api/mock/ship/pipelines?reset=1");
+  const dimmed = (pane: Locator) => pane.locator(".ppl-list .jp-j:not([data-dim])").evaluateAll((els) => els.map((e) => e.getAttribute("data-key")));
+  // ci: the three words, all picked; its last run passed, so failed last run dims every line and says why.
+  const ci = await openPane(page, isMobile, "hyper-light/kiln", ".kiln/ci.yaml");
+  const pick = ci.locator(".jp-q");
+  await expect(pick).toHaveText(/^pick:\s*failed last run\s*·\s*changed in a draft\s*·\s*all$/);
+  await expect(pick.locator("button[aria-pressed=true]")).toHaveText("all");
+  await expect(ci.locator(".ppl-list .jp-j[data-dim]")).toHaveCount(0);
+  const tops = () => ci.locator(".jp-j").evaluateAll((els) => els.map((e) => Math.round(e.getBoundingClientRect().top + window.scrollY)));
+  const before = await tops();
+  await pick.getByRole("button", { name: "failed last run" }).click();
+  await expect(pick.locator("button[aria-pressed=true]")).toHaveText("failed last run");
+  await expect(ci.locator(".jp-said")).toHaveText("Nothing failed in its last run.");
+  expect(await dimmed(ci)).toEqual([]);
+  // Dimmed, never taken out: every line where it was.
+  expect(await tops()).toEqual(before);
+  await pick.getByRole("button", { name: "all" }).click();
+  await expect(ci.locator(".ppl-list .jp-j[data-dim]")).toHaveCount(0);
+  // e2e: its last run failed its e2e job, and only that line stays lit.
+  const e2e = await openPane(page, isMobile, "hyper-light/kiln", ".kiln/e2e.yaml");
+  await e2e.locator(".jp-q").getByRole("button", { name: "failed last run" }).click();
+  await expect.poll(() => dimmed(e2e)).toEqual(["jobs.e2e"]);
+  // quiver's ci: kiln's update draft moves rust-check, so the job that calls it and the use stay lit.
+  const quiver = await openPane(page, isMobile, "hyper-light/quiver", ".github/workflows/ci.yml");
+  await quiver.locator(".jp-q").getByRole("button", { name: "changed in a draft" }).click();
+  await expect.poll(() => dimmed(quiver)).toEqual(["jobs.rust", "uses.hyper-light/ci-kit/.github/workflows/rust-check.yml@v2.3.0"]);
+  expect(await sideways(page)).toBe(0);
+});
+
+test("plan for: takes the pick words' place when a trigger is picked, and lists what the preview plans without a payload (pl-8)", async ({ page, isMobile }) => {
+  const pane = await openPane(page, isMobile, "hyper-light/kiln", ".kiln/smoke.yaml");
+  await pane.locator('.jp-j[data-key="on.schedule"] .jp-line').click();
+  const q = pane.locator(".jp-q");
+  // Not webhook's or comment's: what they carry is what starts them.
+  await expect(q).toHaveText(/^plan for:\s*deploy\s*·\s*schedule\s*·\s*pipeline\s*·\s*manual$/);
+  await expect(q.locator("button[aria-pressed=true]")).toHaveText("schedule");
+  // A job picked again: the pick words.
+  await pane.locator('.jp-j[data-key="jobs.smoke"] .jp-line').click();
+  await expect(q).toHaveText(/^pick:/);
+});
+
 test("no layout shift as lines are picked, views switched, a verb asked and kept, and the pane refreshed", async ({ page, isMobile, browserName }) => {
   test.skip(browserName !== "chromium", "layout shifts are Chromium's to count");
   test.setTimeout(60_000);
@@ -219,6 +261,11 @@ test("no layout shift as lines are picked, views switched, a verb asked and kept
   for (const v of ["Plan", "Last run", "YAML"]) {
     await pane.locator(".ppl-detail").getByRole("tab", { name: v }).click();
     await page.waitForTimeout(600);
+  }
+  // The pick words narrow the list and widen it again (R04): dimmed in place, nothing moves.
+  for (const w of ["failed last run", "changed in a draft", "all"]) {
+    await pane.locator(".jp-q").getByRole("button", { name: w }).click();
+    await page.waitForTimeout(300);
   }
   // Run asks for its inputs in the strip; Keep goes back.
   await pane.locator(".ppl-verbs button", { hasText: /^Run$/ }).click();
@@ -301,15 +348,17 @@ test("the file is edited where it's shown: kiln's colours, run: as bash; typing 
 
 test("the plan for each event: plan for: picks it, a picked job says where it would run, a draft's plan says what changes", async ({ page, isMobile }) => {
   const pane = await openPane(page, isMobile, "hyper-light/kiln", ".kiln/ci.yaml");
-  // Its triggers, by event, the first picked.
+  // A job picked: the pick words (pl-2), and its machines under its code.
   const planFor = pane.locator(".jp-q");
-  await expect(planFor).toHaveText(/plan for:\s*push to main\s*·\s*pull request\s*·\s*manual/);
-  await expect(planFor.locator("button[aria-pressed=true]")).toHaveText("push to main");
-  // The picked job's machines, under its code.
+  await expect(planFor).toHaveText(/pick:\s*failed last run\s*·\s*changed in a draft\s*·\s*all/);
   const under = pane.locator(".ppl-problems");
   await expect(under).toContainText("Where it would run");
   await expect(under).toContainText("fedora, adacachy can take it now: baremetal, linux");
   await expect(under).toContainText("2 of 2");
+  // A trigger picked: its triggers, by event, its own picked.
+  await pane.locator('.jp-j[data-key="on.push"] .jp-line').click();
+  await expect(planFor).toHaveText(/plan for:\s*push to main\s*·\s*pull request\s*·\s*manual/);
+  await expect(planFor.locator("button[aria-pressed=true]")).toHaveText("push to main");
   // Another event: the Plan view asks for it.
   await planFor.getByRole("button", { name: "pull request" }).click();
   await expect(planFor.locator("button[aria-pressed=true]")).toHaveText("pull request");

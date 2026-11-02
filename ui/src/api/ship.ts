@@ -262,7 +262,10 @@ export interface ShipPipelineStrip {
   said: string[];
   /** The words of `said` it sets in bold (an update draft's `rust-check v2.4.0`, `#88`). */
   strong?: string[];
+  /** R04's pick words (`failed last run`, `changed in a draft`, `all`). */
   pick: string[];
+  /** The lines each pick word but `all` keeps undimmed, by their keys. */
+  narrow?: Record<string, string[]>;
   verbs: ShipPipelineVerb[];
 }
 

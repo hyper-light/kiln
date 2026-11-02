@@ -749,6 +749,9 @@ interface PlanAsk {
   baseOverlay: string | null;
 }
 
+/** Events the preview can't plan without what they carry (a webhook's body, a comment's words): "plan for:" leaves them out (pl-8). */
+const UNPLANNED = new Set(["webhook", "comment"]);
+
 /** A trigger's event, as the preview takes it (kiln's `manual:` is GitHub's workflow_dispatch). */
 const eventKey = (t: ShipPipelineLine) => t.key.replace(/^on\./, "");
 
@@ -855,9 +858,21 @@ function PipelinePane({ repo, row, onChanged, onLine }: { repo: ShipPipelineRepo
   const groupOf = (k: Key) => groups.find((g) => g.lines.some((l) => l.key === k))?.name ?? "";
   // The plan is for one of its triggers' events (W29-R07): a picked trigger's, else the one "plan for:" picks, else its first.
   const triggers = (groups.find((g) => g.name === "Triggers")?.lines ?? []).filter((l) => l.kind === "trigger");
+  // What "plan for:" lists: the events the preview plans without a payload (pl-8: not a webhook's or a comment's).
+  const plannable = triggers.filter((t) => !UNPLANNED.has(eventKey(t)));
   const [show, setShow] = React.useState<Shown>("all");
   const [planFor, setPlanFor] = React.useState<string | null>(null);
-  const event = line?.kind === "trigger" ? eventKey(line) : planFor && triggers.some((t) => eventKey(t) === planFor) ? planFor : triggers[0] ? eventKey(triggers[0]) : null;
+  const event = line?.kind === "trigger" ? eventKey(line) : planFor && plannable.some((t) => eventKey(t) === planFor) ? planFor : plannable[0] ? eventKey(plannable[0]) : null;
+  // R04's pick words (pl-2): on a published workflow with nothing typed and no trigger picked; the lines each narrows away are dimmed in place.
+  const picking = workflow && !h.draft && !changed && line?.kind !== "trigger";
+  const [narrowed, setNarrowed] = React.useState("all");
+  const kept = picking && narrowed !== "all" ? new Set(p.strip.narrow?.[narrowed] ?? []) : null;
+  const narrowTo = (w: string) => {
+    setNarrowed(w);
+    // Narrowed to nothing, the strip says why every line is dimmed.
+    const none = w !== "all" && !(p.strip.narrow?.[w] ?? []).length;
+    setSaid(none ? { text: w === "failed last run" ? "Nothing failed in its last run." : "No open draft changes it.", refused: false } : null);
+  };
   const pickEvent = (e: string) => {
     setPlanFor(e);
     if (line?.kind === "trigger") setPicked(`on.${e}`);
@@ -1189,10 +1204,10 @@ function PipelinePane({ repo, row, onChanged, onLine }: { repo: ShipPipelineRepo
                   </React.Fragment>
                 ))}
               </div>
-            ) : workflow && triggers.length ? (
+            ) : workflow && plannable.length && !picking ? (
               <div className="jp-q">
                 <span>plan for:</span>
-                {triggers.map((t, i) => (
+                {plannable.map((t, i) => (
                   <React.Fragment key={t.key}>
                     {i ? <span aria-hidden>·</span> : null}
                     <button type="button" aria-pressed={eventKey(t) === event} onClick={() => pickEvent(eventKey(t))}>
@@ -1207,7 +1222,7 @@ function PipelinePane({ repo, row, onChanged, onLine }: { repo: ShipPipelineRepo
                 {p.strip.pick.map((w, i) => (
                   <React.Fragment key={w}>
                     {i ? <span aria-hidden>·</span> : null}
-                    <button type="button" aria-pressed={w === "all"}>
+                    <button type="button" aria-pressed={w === (kept ? narrowed : "all")} onClick={() => narrowTo(w)}>
                       {w}
                     </button>
                   </React.Fragment>
@@ -1233,7 +1248,7 @@ function PipelinePane({ repo, row, onChanged, onLine }: { repo: ShipPipelineRepo
                 </li>
                 {g.lines.map((l) => (
                   <React.Fragment key={l.key}>
-                    <PaneLine line={l} at={at === l.key} onLine={pick} />
+                    <PaneLine line={l} at={at === l.key} dim={kept !== null && !kept.has(l.key)} onLine={pick} />
                     {below(l.key)}
                   </React.Fragment>
                 ))}
@@ -1693,10 +1708,10 @@ function RunInputs({ inputs, values, onSet }: { inputs: ManualInput[]; values: R
 }
 
 /** One line: its glyph, its kind word and name, its value; picking it shows its detail. */
-function PaneLine({ line, at, onLine }: { line: ShipPipelineLine; at: boolean; onLine: (k: Key) => void }) {
+function PaneLine({ line, at, dim, onLine }: { line: ShipPipelineLine; at: boolean; dim: boolean; onLine: (k: Key) => void }) {
   const w = wordsOf(line);
   return (
-    <li className="jp-j" data-key={line.key} data-sel={at || undefined} data-at={at || undefined} data-state={line.state}>
+    <li className="jp-j" data-key={line.key} data-sel={at || undefined} data-at={at || undefined} data-dim={dim || undefined} data-state={line.state}>
       <span className="jp-glyph" aria-hidden="true">
         {line.kind === "add" || (line.state === "added" && !line.value.includes("pin it?")) ? (
           <Plus size={12} />

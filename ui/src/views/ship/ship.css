@@ -1610,6 +1610,14 @@
   flex: 1 1 auto;
   min-width: 0;
 }
+/* A line the pick words narrow away (W29-R04, pl-2): dimmed whole, in its place, never taken out. */
+.ppl .jp-j[data-dim] .n em,
+.ppl .jp-j[data-dim] .v {
+  color: #55585f;
+}
+.ppl .jp-j[data-dim] .jp-glyph {
+  opacity: 0.4;
+}
 .ppl .jp-j .v {
   flex: 0 1 auto;
   min-width: 0;

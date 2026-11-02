@@ -655,6 +655,33 @@ const KIND_WORDS: Record<string, string> = {
   shards: "Shards action",
 };
 
+/** R04's pick words for a published workflow, as the server works them out (`kiln_ci::pipelines::narrows`, pl-2): its newest finished run's failed jobs, and what its open drafts change. */
+function narrowsOf(repo: string, path: string, text: string, kiln: boolean): Record<string, string[]> {
+  const key = `${repo}:${path}`;
+  const jobs = obj(yamlOf(text).jobs);
+  const finished = (RUNS[key] ?? []).find((r) => r.status !== "under way");
+  const failed = (finished?.failed ?? []).filter((id) => id in jobs).map((id) => `jobs.${id}`);
+  const changed: string[] = [];
+  const keep = (k: string) => {
+    if (!changed.includes(k)) changed.push(k);
+  };
+  const usesIn = (js: Record<string, unknown>) =>
+    Object.values(js)
+      .map(obj)
+      .flatMap((j) => [...(j.uses ? [String(j.uses)] : []), ...(Array.isArray(j.steps) ? j.steps.map(obj).flatMap((st) => (st.uses ? [String(st.uses)] : [])) : [])]);
+  const said = (l: ShipPipelineLine) => JSON.stringify([l.name, l.value, l.note ?? ""]);
+  for (const d of (SEEDS[repo]?.rows ?? []).filter((r) => r.path === path && r.draft)) {
+    const theirs = FILES[`${key}:draft:${d.draft?.id ?? ""}`] ?? "";
+    const on = new Map((triggerLines(theirs, kiln) ?? []).map((l) => [l.key, said(l)]));
+    for (const l of triggerLines(text, kiln) ?? []) if (on.get(l.key) !== said(l)) keep(l.key);
+    const dj = obj(yamlOf(theirs).jobs);
+    for (const id of Object.keys(jobs)) if (JSON.stringify(jobs[id]) !== JSON.stringify(dj[id])) keep(`jobs.${id}`);
+    const du = usesIn(dj);
+    for (const u of usesIn(jobs)) if (!du.includes(u)) keep(`uses.${u}`);
+  }
+  return { "failed last run": failed, "changed in a draft": changed };
+}
+
 /** A row's pane: its head, the strip, its groups as the server makes them, and its file. */
 function paneOf(repo: string, row: ShipPipelineRow): ShipPipelinePane {
   const key = row.draft ? `${repo}:${row.path}:draft:${row.draft.id}` : `${repo}:${row.path}`;
@@ -677,9 +704,16 @@ function paneOf(repo: string, row: ShipPipelineRow): ShipPipelinePane {
     ...(checks ? [{ key: "changes.checks", kind: "note", ...checks }] : []),
   ];
   const byHand = groups.some((g) => g.name === "Triggers" && g.lines.some((l) => l.key === "on.workflow_dispatch"));
+  const narrow = !action && !row.draft ? narrowsOf(repo, row.path, text, kiln) : null;
   return {
     head: { title: row.name, path: row.path, kind: row.kind, dialect: row.dialect, ref: row.ref, commit: row.commit, draft: row.draft, stand: row.stand, word: row.word, pips: row.pips },
-    strip: { said: update ? update.said : [`${KIND_WORDS[row.kind] ?? row.kind} · ${row.line}`], strong: update?.strong ?? [], pick: ["all"], verbs: verbsOf(row, byHand) },
+    strip: {
+      said: update ? update.said : [`${KIND_WORDS[row.kind] ?? row.kind} · ${row.line}`],
+      strong: update?.strong ?? [],
+      pick: narrow ? [...Object.keys(narrow), "all"] : ["all"],
+      ...(narrow ? { narrow } : {}),
+      verbs: verbsOf(row, byHand),
+    },
     groups,
     detail: {
       name: row.path,

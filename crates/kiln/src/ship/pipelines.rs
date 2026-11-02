@@ -517,21 +517,23 @@ pub async fn get(hub: &Arc<Hub>, owner: &str, name: &str, q: &HashMap<String, St
         Some(tag) => commits_since(hub, &repo, tag, &sha, path).await,
         None => Vec::new(),
     };
-    let (row, groups) = match loaded {
+    let (row, groups, narrow) = match loaded {
         Some(l) => {
             let row = workflow_row(&repo, l, &ctx, &env, &commit.github_note);
             let runs = runs_list(hub, &repo, &branch, path).await.map_err(internal)?;
             let (access, used) = used_by(hub, &repo, path, false).await;
             let sharing = core::Sharing { repo: &repo.name, access, used_by: &used };
-            let groups = match l.workflow.as_ref() {
+            let (groups, narrow) = match l.workflow.as_ref() {
                 Some(w) => {
                     let mut seen = seen_of(hub, &repo, &branch, path, w).await;
                     seen.newest.clone_from(&newest);
-                    core::workflow_groups(w, &text, &runs, l.runs, &commit.github_note, Some(&sharing), &seen)
+                    // R04's pick words: its last run's failed jobs, and what its open drafts change (pl-2).
+                    let narrow = core::narrows(w, &runs, &draft_workflows(hub, &repo, path).await);
+                    (core::workflow_groups(w, &text, &runs, l.runs, &commit.github_note, Some(&sharing), &seen), narrow)
                 }
-                None => Vec::new(),
+                None => (Vec::new(), Vec::new()),
             };
-            (row, groups)
+            (row, groups, narrow)
         }
         None => {
             let (action, diags) = wf::parse_action(&text);
@@ -545,7 +547,7 @@ pub async fn get(hub: &Arc<Hub>, owner: &str, name: &str, q: &HashMap<String, St
                 now: crate::util::now_unix(),
             };
             let groups = action.as_ref().map(|a| core::action_groups(a, row.facts.kind, &text, &sha, &ctx.versions, &sharing, &seen)).unwrap_or_default();
-            (row, groups)
+            (row, groups, Vec::new())
         }
     };
     let by_hand = runs_by_hand(commit.workflows.iter().find(|l| l.path == path));
@@ -563,8 +565,27 @@ pub async fn get(hub: &Arc<Hub>, owner: &str, name: &str, q: &HashMap<String, St
         }
         _ => None,
     };
-    let opened = core::Opened { repo: &full, row: &row, at: &at, sha: &sha, text: &text, viewer, by_hand, changes: changes.as_deref(), since, overlay, said: None, lines, update: None };
+    let opened = core::Opened { repo: &full, row: &row, at: &at, sha: &sha, text: &text, viewer, by_hand, changes: changes.as_deref(), since, overlay, said: None, lines, update: None, narrow };
     Ok(srv::json(StatusCode::OK, &core::pane_json(&opened, &groups)))
+}
+
+/// The open drafts of `path` in `repo`, each as its head has the workflow (with its overlay, as
+/// loading reads a GitHub workflow): what R04's `changed in a draft` sets the published file
+/// against. A draft whose head can't be read yet is left out.
+async fn draft_workflows(hub: &Hub, repo: &Repo, path: &str) -> Vec<wf::Workflow> {
+    let mut out = Vec::new();
+    for d in crate::ci::pipeline_drafts::open_in(hub, &repo.name).await.unwrap_or_default().iter().filter(|d| d.path == path) {
+        let Ok(head) = crate::ci::pipeline_drafts::head(hub, repo, d).await else { continue };
+        let Ok(text) = crate::ci::load::blob(hub, repo, &head, path).await else { continue };
+        let Some(mut w) = wf::check_model(path, &text, None).1 else { continue };
+        if let Some((_, o)) = overlay_of(hub, repo, &head, path).await.filter(|(_, o)| !o.trim().is_empty())
+            && let (Some(ov), _) = wf::parse_overlay(&o)
+        {
+            wf::apply_overlay(&mut w, &ov);
+        }
+        out.push(w);
+    }
+    out
 }
 
 /// A repository's own checks on `sha`: its runs' outcome as one, whether one's under way, and how
@@ -736,7 +757,7 @@ async fn draft_pane(hub: &Hub, repo: &Repo, id: &str, path: &str, viewer: core::
     let at = d.branch.clone().or_else(|| d.name.clone()).unwrap_or_else(|| head.clone());
     let overlay = overlay_of(hub, repo, &head, path).await;
     let overlay = overlay.as_ref().map(|(p, t)| (p.as_str(), t.as_str()));
-    let opened = core::Opened { repo: &repo.name, row: &row, at: &at, sha: &head, text: &text, viewer, by_hand: runs_by_hand(loaded.as_ref()), changes: None, since: None, overlay, said, lines, update };
+    let opened = core::Opened { repo: &repo.name, row: &row, at: &at, sha: &head, text: &text, viewer, by_hand: runs_by_hand(loaded.as_ref()), changes: None, since: None, overlay, said, lines, update, narrow: Vec::new() };
     Ok(srv::json(StatusCode::OK, &core::pane_json(&opened, &groups)))
 }
 

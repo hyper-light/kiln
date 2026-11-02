@@ -453,6 +453,16 @@ fn w29_r10_drafts_in_ship() -> anyhow::Result<()> {
     assert_eq!((field(&mine, "word"), field(&mine, "stand"), mine.pointer("/draft/state").and_then(Value::as_str)), ("Unpublished", "waiting", Some("unpublished")), "{mine}");
     assert!(field(&mine, "key").contains(":draft:"), "{mine}");
     assert!(rows_of(&pipelines(&s, &s.admin, "?repo=acme/app")?, "acme/app").iter().any(|r| field(r, "path") == ".github/workflows/ci.yml" && r.get("draft").is_some_and(Value::is_null)), "what's published stays");
+    // A draft of what's published: the published pane's `changed in a draft` keeps what it changes (R04, pl-2).
+    let ci = ".github/workflows/ci.yml";
+    let changed = "name: ci\non: push\njobs:\n  build:\n    runs-on: local\n    steps:\n      - run: echo changed\n";
+    let (st, saved) = act(&s, &s.admin, &json!({ "repo": "acme/app", "path": ci, "verb": "save_draft", "content": changed, "title": "Change ci" }))?;
+    assert_eq!(st, 200, "{saved}");
+    let (st, published) = http(s.port, "GET", &format!("/api/ship/pipelines/acme/app?path={ci}"), &s.admin, None)?;
+    anyhow::ensure!(st == 200, "{st} {published}");
+    let published: Value = serde_json::from_str(&published)?;
+    assert_eq!(published.pointer("/strip/pick"), Some(&json!(["failed last run", "changed in a draft", "all"])), "{published}");
+    assert_eq!(published.pointer("/strip/narrow/changed in a draft"), Some(&json!(["jobs.build"])), "{published}");
     // Its pane, for its author: the DRAFT mark, and Ready, Discard and Run.
     let (st, pane) = http(s.port, "GET", &format!("/api/ship/pipelines/acme/app?path={path}&draft={id}"), &s.admin, None)?;
     anyhow::ensure!(st == 200, "{st} {pane}");

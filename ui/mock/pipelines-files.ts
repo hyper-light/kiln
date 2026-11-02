@@ -363,7 +363,7 @@ export const RUNS: Record<string, { n: number; event: string; status: "passed" |
     { n: 87, event: "schedule", status: "passed", sha: "a3f2c1d9e8b7", ago: 14 * 3600 },
     { n: 86, event: "comment", status: "failed", sha: "c71d0e2a9b8f", ago: 86_400 },
   ],
-  "hyper-light/kiln:.kiln/e2e.yaml": [{ n: 301, event: "push", status: "failed" }],
+  "hyper-light/kiln:.kiln/e2e.yaml": [{ n: 301, event: "push", status: "failed", sha: "a3f2c1d9e8b7", ago: 3 * 3600, failed: ["e2e"] }],
   "hyper-light/kiln:.kiln/release.yaml": [{ n: 17, event: "push", status: "passed" }],
   "hyper-light/quiver:.github/workflows/ci.yml": [
     { n: 54, event: "push", status: "passed" },

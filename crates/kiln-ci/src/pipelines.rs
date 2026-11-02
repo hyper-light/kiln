@@ -1487,6 +1487,8 @@ pub struct Opened<'a> {
     /// An update draft's moved use: its name, and its version before and after (pl-7's `What
     /// v2.4.0 changes for quiver`).
     pub update: Option<(String, String, String)>,
+    /// A published workflow's pick words and the lines each keeps ([`narrows`]); none, `all` alone.
+    pub narrow: Vec<(&'static str, Vec<String>)>,
 }
 
 /// An action's or reusable workflow's commits since its newest release (W29-R21): what Release
@@ -1621,6 +1623,48 @@ pub fn draft_run_line(name: Option<&str>, jobs: &[(String, String)], outcome: Op
     Line::new("changes.run", "note", said, span_words(secs)).state(state)
 }
 
+/// R04's pick words (pl-2), each with the lines it keeps undimmed: the jobs its last finished run
+/// failed, and the lines an open draft changes (a trigger or job a draft has otherwise or not at
+/// all, a use it no longer has). `runs` are newest first; `drafts` are its open drafts' workflows.
+pub fn narrows(w: &Workflow, runs: &[RunSeen], drafts: &[Workflow]) -> Vec<(&'static str, Vec<String>)> {
+    let failed = runs.iter().find(|r| r.outcome.is_some()).map(|r| r.failed.iter().filter(|k| w.job(k).is_some()).map(|k| format!("jobs.{k}")).collect()).unwrap_or_default();
+    let mut changed: Vec<String> = Vec::new();
+    let mut keep = |k: String| {
+        if !changed.contains(&k) {
+            changed.push(k);
+        }
+    };
+    for d in drafts {
+        // Where it's written isn't part of either's JSON: only what they say is compared.
+        for t in &w.on {
+            if !d.on.iter().any(|x| x.event == t.event && same_json(x, t)) {
+                keep(format!("on.{}", t.event));
+            }
+        }
+        for j in &w.jobs {
+            if !d.job(&j.id).is_some_and(|x| same_json(x, j)) {
+                keep(format!("jobs.{}", j.id));
+            }
+        }
+        let theirs = uses_in(d);
+        for u in uses_in(w) {
+            if !theirs.contains(&u) {
+                keep(format!("uses.{u}"));
+            }
+        }
+    }
+    vec![("failed last run", failed), ("changed in a draft", changed)]
+}
+
+fn same_json<T: Serialize>(a: &T, b: &T) -> bool {
+    matches!((serde_json::to_value(a), serde_json::to_value(b)), (Ok(x), Ok(y)) if x == y)
+}
+
+/// Each `uses:` of a workflow's jobs and their steps, as written.
+fn uses_in(w: &Workflow) -> Vec<&str> {
+    w.jobs.iter().flat_map(|j| j.uses.as_deref().into_iter().chain(j.steps.iter().filter_map(|s| s.uses.as_deref()))).collect()
+}
+
 /// A `uses:` an update moves (W29-R22): its name as the pane says it (`rust-check`), its version
 /// before and after, and the commits to it between them.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1724,7 +1768,8 @@ pub fn pane_json(o: &Opened<'_>, groups: &[PaneGroup]) -> Value {
         "strip": {
             "said": o.said.as_ref().map_or_else(|| vec![format!("{} · {}", f.kind.words(), row.line)], |(said, _)| said.clone()),
             "strong": o.said.as_ref().map(|(_, strong)| strong.clone()).unwrap_or_default(),
-            "pick": ["all"],
+            "pick": o.narrow.iter().map(|(w, _)| *w).chain(["all"]).collect::<Vec<_>>(),
+            "narrow": o.narrow.iter().map(|(w, keys)| ((*w).to_owned(), json!(keys))).collect::<serde_json::Map<_, _>>(),
             "verbs": verbs_for(row, o.viewer, o.by_hand).into_iter().map(|mut v| {
                 if v.verb == "release" && v.enabled {
                     v.asks = o.changes.map(release_asks);
@@ -1829,6 +1874,26 @@ mod tests {
         assert_eq!(said("release-binary"), "3 platforms · bare metal");
         assert_eq!(said("shards"), "4 legs · bare metal · on release");
         assert_eq!(on_branch("github.event_name == 'push'"), None, "a condition that isn't a branch's says nothing");
+    }
+
+    #[test]
+    fn w29_r04_the_pick_words_keep_the_last_runs_failed_jobs_and_what_a_draft_changes() {
+        let text = "on:\n  push:\n    branches: [main]\njobs:\n  rust:\n    runs-on: local\n    steps:\n      - uses: acme/kit/setup@v1\n      - run: cargo test\n  ui:\n    runs-on: local\n    steps:\n      - run: npm test\n";
+        let parse = |t: &str| crate::wf::check_model(".github/workflows/ci.yml", t, None).1.unwrap_or_default();
+        let w = parse(text);
+        // The newest finished run's: one under way says nothing yet, and a key that isn't a job is left out.
+        let runs = [
+            RunSeen { running: true, ..RunSeen::default() },
+            RunSeen { outcome: Some(Outcome::Failed), failed: vec!["ui".into(), "gone".into()], ..RunSeen::default() },
+            RunSeen { outcome: Some(Outcome::Failed), failed: vec!["rust".into()], ..RunSeen::default() },
+        ];
+        // A draft that moves the use, a line above everything: only what it says counts, not where.
+        let moved = parse(&format!("# moved\n{}", text.replace("setup@v1", "setup@v2")));
+        let said = narrows(&w, &runs, &[moved]);
+        assert_eq!(said, [("failed last run", vec!["jobs.ui".to_owned()]), ("changed in a draft", vec!["jobs.rust".to_owned(), "uses.acme/kit/setup@v1".to_owned()])]);
+        let branches = parse(&text.replace("[main]", "[main, next]"));
+        assert_eq!(narrows(&w, &[], &[branches]).get(1).map(|(_, k)| k.clone()), Some(vec!["on.push".to_owned()]));
+        assert_eq!(narrows(&w, &[], &[parse(text)]), [("failed last run", Vec::<String>::new()), ("changed in a draft", Vec::new())], "a draft that's the same changes nothing");
     }
 
     #[test]
