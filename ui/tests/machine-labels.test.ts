@@ -100,6 +100,9 @@ test("why a leg waits names its runners by their labels, not their machine ids",
   assert.equal(waitSentence({ reason: "warm", runner: ID, saves_s: 30 }), `Waiting for ${MBP}, where it runs warm: about 30 s sooner.`);
   // A component's labels, handed in.
   assert.equal(waitSentence({ reason: "capability", runners: [ID] }, { [ID]: "studio" }), "The runners that match need a newer kiln: studio.");
+  // The runners a leg's headroom passes over, and the one held for it.
+  const room = waitSentence({ reason: "headroom", request: "4 CPUs", target: 85, runners: [ID, "fedora"], held: ID, room_at: null });
+  assert.ok(room.includes(`: ${MBP} is held for it`) && room.endsWith(`with it: ${MBP}, fedora.`), room);
 });
 
 test("a retry offers runners by their labels and asks for them by their names", () => {

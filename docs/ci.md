@@ -133,7 +133,9 @@ These hold for every line written under this spec.
 - **Opt-in automation.** Anything kiln decides on its own (routing preferences, retries beyond
   runner loss, quarantine, cancelling superseded runs, notifications, cache tiers, reuse of earlier
   results) is off until declared. Every such decision is explainable through the API and the UI:
-  "routed to X because…", "retried because…", "skipped because…".
+  "routed to X because…", "retried because…", "skipped because…". One exception, decided by the
+  user (2026-10-27): headroom (docs/headroom.md) is on by default, since its decisions keep a
+  machine from harming what runs on it; each of them says why, and Runners → Headroom turns it off.
 - **Tests and checks before handing over:**
   `cargo clippy --workspace --all-targets -- -D warnings`, `cargo test --workspace`, and in `ui/`
   `npm run typecheck && npm run lint && npm run build`. A workstream adds its own scenario suites
@@ -1656,7 +1658,22 @@ scans agents) with an event-driven state machine in `kiln_ci::sched`, driven by
   does one on a runner whose size isn't known. The v1 dispatcher and each runner's own admission
   hold to the same rule, so neither dispatcher's work lands in the other's share. A job's
   `resources:`, `requires:` and `exclusive:` are its needs, in the one spelling `kiln run --needs`
-  and the MCP tools take too: docs/runners.md.
+  and the MCP tools take too: docs/runners.md. **Headroom**, in either mode: each runner's live
+  sample (what it has in use of its CPUs and memory, and its I/O pressure, every 5 s) reaches the
+  engine, and a leg goes only where what the sample has in use, what kiln placed there since and
+  the leg's request stay within `[ci.scheduler] target_use` (0.85 by default, at most 1) of the
+  runner's CPUs and of its memory; a sample over a minute old is unknown, and the runner is placed
+  by its room alone, as before samples. `[ci.scheduler] headroom = false` places by room alone
+  everywhere (kiln's integration tests do: their runners share the machine running the tests; so
+  does `kiln workflow run`'s server, whose one runner is the machine it was asked to run on). The engine and the v1 dispatcher place through one function
+  shaped as kiln-seams' `Placement`, `kiln_ci::sched::place`, which Hex's placement (CP-T7.1) takes
+  over (docs/runners.md §5). **None starves**: smaller legs would otherwise take every gap before a
+  bigger one, so the first legs in a queue that no runner has had room for since a minute hold a
+  runner each (EASY backfilling's reservation, one a leg as conservative backfilling has it, up to
+  a runner each): the one whose running legs' expected ends leave it room within the target
+  soonest (its shadow). There, another leg starts only if it's expected to end by the shadow, or
+  fits in what the held leg will leave; the hold ends when its leg starts or leaves the queue, or
+  its runner goes or drains.
 - **W05-R04 Data structures.** Requirements are interned into **signatures**; each signature keeps
   its eligible runner set (recomputed when a runner or a rule changes) and a priority queue of its
   legs ordered by (effective priority descending, fair-share virtual time ascending, queue order
@@ -1697,9 +1714,10 @@ scans agents) with an event-driven state machine in `kiln_ci::sched`, driven by
 - **W05-R10 Fair share.** Within a priority, start-time fair queuing across repositories (or
   organizations, `[ci.scheduler] fair_by`), weighted by `[ci.fairness] weights`: each leg's virtual
   start is `max(V, finish[repo])`, and `finish[repo] += expected_cost / weight`, with
-  `expected_cost` the leg's median runner-seconds from history (W19) or a default. Under
-  saturation, two equally weighted repositories each get within 10 % of half the capacity
-  (W05-AC04).
+  `expected_cost` the leg's median runner-seconds from history (W19) or a default, times the CPUs
+  it asks (one at the least: a leg asking none costs its runner-seconds). Under saturation, two
+  equally weighted repositories each get within 10 % of half the capacity (W05-AC04), and of the
+  fleet's CPU-time whether their legs ask 8 CPUs or 1.
 - **W05-R11 Quotas** (opt-in): per repository or organization, maximum legs in progress and
   runner-minutes per day, per pool.
 - **W05-R12 Reservations** (opt-in): a pool or runner reserved for matching legs during windows
@@ -1708,7 +1726,10 @@ scans agents) with an event-driven state machine in `kiln_ci::sched`, driven by
 - **W05-R13 Wait reasons.** Every waiting leg has exactly one current reason, from: `needs`,
   `capacity` (with counts: eligible runners, busy, draining), `oversized` (in resource mode, it
   asks for more than any eligible runner has even idle: what it asks, and what each of them has of
-  it), `no-runner` (none eligible is
+  it), `headroom` (every runner with room for it would pass `[ci.scheduler] target_use` with it,
+  by its live samples: what it asks and where, "waiting for 14 CPUs and 1 GiB of memory free on a
+  linux/x86_64 runner", the target and those runners, and the runner held for it with when it's to
+  have room there), `no-runner` (none eligible is
   connected; lists the ones offline), `unroutable` (no runner known to kiln could ever run it; lists
   the failing requirements), `concurrency` (group and holder), `quota`, `reservation`,
   `exclusive`, `approval`, `scaling` (a pool is starting runners; how many and since when),
@@ -1822,9 +1843,11 @@ scans agents) with an event-driven state machine in `kiln_ci::sched`, driven by
 - **W05-R23 Preferences** (opt-in: only when a rule or the job declares them): weighted terms over
   facts (`higher`/`lower`), labels, pools, `affinity: { job: <id> }` (the runner that ran that
   job's leg last, for warm caches), `spread: host`. Score = Σ weight × term (each term
-  normalized to 0..1 across the eligible set). Ties break by least loaded, then most free
-  capacity, then name. **Without preferences** the choice is today's: least loaded, then most free
-  slots.
+  normalized to 0..1 across the eligible set). Ties break by the most headroom left by the
+  runners' live samples (W05-R03: the larger of the CPUs' and the memory's share in use after the
+  leg, I/O pressure on top, the lowest; runners without a fresh sample after those), then least
+  loaded, then most free capacity, then name. **Without preferences** the choice is the most
+  headroom left, then least loaded, then most free slots.
 - **W05-R24 Unroutable legs.** When no runner kiln has ever seen, and no pool, could satisfy a
   leg, it waits with reason `unroutable` and the failing requirements, or fails after
   `[ci.routing] unroutable_timeout` if one is set.
@@ -2531,7 +2554,9 @@ Gives step execution for `uses:`.
     - R05:
       - Node: `node24` runs on Node 24; `node20`, `node16` and `node12` run on Node 20. Builds
         come from nodejs.org, are checked against `SHASUMS256.txt`, and are kept in
-        `<work>/_externals`.
+        `<work>/_externals`. A download is asked for up to three times, a random 10–30 s apart
+        (a 404 or 403 once), each ask within 10 minutes, its body too, as GitHub's runner asks for
+        an action's archive. Each ask again is said in the step's log.
       - Inputs: `INPUT_*`, with defaults evaluated, and GitHub's "Unexpected input(s)" warning.
       - `GITHUB_ACTION_PATH`, `GITHUB_ACTION_REPOSITORY` and `GITHUB_ACTION_REF`.
       - `pre`, `post`, `pre-if`, `post-if` and `STATE_*` (W06-R11). What a pre step saves,
@@ -6789,8 +6814,9 @@ image builder), review, environments, settings, insights (G-06, G-08, G-09, G-11
 
 - **W21-AC01** For each page: a Playwright script runs in Chromium and WebKit at 1440×900 and
   390×844, checks the page's primary task end to end against a live or mock server, asserts that no
-  element scrolls horizontally, asserts that no element is `position: fixed` other than the shell's
-  own, and saves screenshots for review. *UI check, in CI.*
+  element scrolls horizontally but a code block, which keeps each line on one line (a comment's code
+  in Ship's Files and Conversation, marked `data-code-scroll`), asserts that no element is
+  `position: fixed` other than the shell's own, and saves screenshots for review. *UI check, in CI.*
 - **W21-AC02** The editor flags every negative-corpus file (F-04) at the right range, completes
   `needs.`, `steps.`, `matrix.`, `secrets.` and `uses:` correctly in fixtures, and round-trips a
   commented file through the flow view with comments intact. *UI test.*
@@ -7055,8 +7081,9 @@ live cluster, fault injection, security, performance, and mixed-version fleets.
   needs the GitHub account.*
 - **W22-AC04 Fault injection.** A test-only runner mode (`kiln agent --chaos <spec>`, compiled
   only with the `chaos` feature) drops connections, kills processes with the OOM signal, fills the
-  disk, delays the network and corrupts uploads. W05's retries and classes, W08's integrity checks
-  and W06's cleanup behave as specified under each.
+  disk, delays the network, corrupts uploads and fails a leg's first ask for a Node build. W05's
+  retries and classes, W08's integrity checks, W06's cleanup and a step's download tries behave as
+  specified under each.
 - **W22-AC05 Live end-to-end suite.** `.kiln/e2e-ci.yaml` (an extension of today's e2e.yaml) on
   pushes to `e2e/*`. It covers:
   - every executor the cluster's runners have;
@@ -8651,6 +8678,16 @@ resolution makes, a comment, a resolution, an approval and each mark of the Revi
   references. Drafts live in the browser's drafts store, which live updates never touch;
   mutations are React Actions with optimistic state; there are no effects; an open item holds
   still and is patched in place.
+- *R18*, Hand off (`crates/kiln/src/ship.rs`'s `hand_off`, `POST /api/ship/hand-off`, migration
+  `20261029-0100_w26_handoffs`). A row's Hand off names one endpoint, and the server decides
+  where it goes. While the change's author's agent runs, it gets the conflicts, open threads and
+  failed checks in one message, the way its comments reach it (docs/agentic.md C3). A failure
+  with no agent of its own goes to the agent attached to what failed, as the failure itself
+  wakes it (W20-R08: the same incident, never a second one). Each hand-off is kept, so the row
+  says who is on it. A person's failure reads "<who> fixing · …" and needs no one; a change
+  reads its agent fixing, with no Hand off and Review pair, until a new revision. With nothing
+  open, or no agent to take it, Hand off says why. Not yet: the switch that lets agents fix from
+  agents' feedback, and "Fixed in" once the fix lands.
 - *Tests.*
   - kiln-ci: `review.rs` (`w26_r11_*`, `w26_r12_a_resolved_conflict_waits_on_its_commit`),
     `suggest.rs` (`w26_r10_*`), `conflicts.rs` (`w26_r12_*`). The Search suite on its simulator
@@ -8660,12 +8697,17 @@ resolution makes, a comment, a resolution, an approval and each mark of the Revi
     `w26_r14_the_review_lanes_marks`), `tests/suggestions.rs` (`w26_ac03_*`), `tests/conflicts.rs`
     (`w26_ac04_conflicts_resolve_in_the_diff_and_commit_as_a_revision`,
     `w26_r12_a_change_requests_resolution_is_a_merge_commit`, on real git), `tests/search.rs`
-    (`w26_r07_a_search_across_the_change`, a 1,000-file change), `ship.rs`
-    (`w26_r14_a_commit_with_no_change_carries_its_push`).
+    (`w26_r07_a_search_across_the_change`, a 1,000-file change, the search's checks; its 250 ms at
+    p95 is `w26_r07_warm_searches_p95_within_250ms`, a benchmark run alone on an idle machine),
+    `ship.rs` (`w26_r14_a_commit_with_no_change_carries_its_push`, and R18's
+    `w26_r18_what_was_handed_off_says_who_is_on_it`,
+    `w26_r18_hand_off_gives_a_failure_to_the_agent_attached_to_it`,
+    `w26_r18_hand_off_gives_a_changes_threads_to_its_authors_agent`).
   - UI, in Chromium and WebKit at desktop and phone widths: `e2e/ship-review.spec.ts` (open, reply,
     resolve, change a kind, delete, apply a suggestion, the whole file, search, every way to resolve
     a conflict and commit it), `ship-lanes.spec.ts` (the sections' order on four kinds of item, and
-    D41's Review lanes), `ship-diff.spec.ts` (the Diff button), `ship-perf.spec.ts` (AC06: no
+    D41's Review lanes), `ship-diff.spec.ts` (the Diff button), `ship-hand-off.spec.ts` (R18),
+    `ship-perf.spec.ts` (AC06: no
     layout shift through 30 s of live updates; a keystroke renders its composer alone); unit tests
     `comment-markdown.test.ts` and `review-composer.test.ts`.
   - AC06 against a real server (`ci/ui/ship_ac06.mjs` on `ci/ui/review_setup.py`'s 10,000-line

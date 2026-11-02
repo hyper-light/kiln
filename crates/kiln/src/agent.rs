@@ -22,7 +22,7 @@ use crate::rt::{Interval, Shutdown};
 use crate::exec::{Exec, Up, Uplink};
 use crate::net::{self, Kind, NetEvent, Out, SERVER_PEER};
 use crate::pki::Leaf;
-use crate::proto::{self, AgentMsg, Hello, JobResult, LANE_CONTROL, LANE_CONVO, LANE_FILES, LANE_LOGS, LANE_PORTS, LANE_REACH, LANE_STREAM, LANE_SYNC, LANE_TERM, ServerMsg};
+use crate::proto::{self, AgentMsg, Hello, JobResult, LANE_CONTROL, LANE_CONVO, LANE_FILES, LANE_LOGS, LANE_OBSERVE, LANE_PORTS, LANE_REACH, LANE_STREAM, LANE_SYNC, LANE_TERM, ServerMsg};
 use crate::store::Status;
 use crate::terminal::{self, PtyOut, PtySession};
 
@@ -60,6 +60,9 @@ pub struct Opts {
     /// Reach (`crate::reach`): None leaves it off (the server's own in-process agent); otherwise
     /// whether this runner takes commands from other runners (it can always send them).
     pub reach: Option<bool>,
+    /// Observe (`crate::observe`): whether this runner keeps a replica of the observe group and
+    /// writes into it (off in a job pod and in the server's own in-process agent).
+    pub observe: bool,
     /// An outpost (`kiln outpost`, [`crate::proto::CAP_OUTPOST`]): kiln run where it isn't
     /// installed. Its terminals, AI sessions and agents work; it takes no jobs, keeps no front
     /// door or repo copies, and is never upgraded by the server.
@@ -183,6 +186,16 @@ async fn moved_to_its_id(o: &Opts, cert: &str, key: &str, ca: &str, cert_p: &std
 }
 
 /// Load stored credentials, enrolling (or renewing) when needed. Retries until it succeeds.
+/// Shutdown, or (lingering, shutdown already said) the next 50 ms tick, to look again whether the
+/// loop may end.
+async fn shutdown_or_tick(shutdown: &Shutdown, lingering: bool) {
+    if lingering {
+        crate::rt::sleep(Duration::from_millis(50)).await;
+    } else {
+        shutdown.cancelled().await;
+    }
+}
+
 async fn credentials(o: &Opts, shutdown: &Shutdown) -> anyhow::Result<(Vec<u8>, Leaf, Option<String>)> {
     if let Some((ca, leaf)) = &o.credentials {
         return Ok((ca.clone(), leaf.clone(), None));
@@ -375,6 +388,8 @@ enum Ev {
     Harness(String, crate::harness::core::Update),
     /// The front door's status changed.
     FrontDoor,
+    /// What headroom decides changed (docs/headroom.md).
+    Headroom,
     /// A blue/green upgrade step done off the loop (`crate::bluegreen`).
     #[cfg(unix)]
     Bg(Bg),
@@ -1028,6 +1043,13 @@ async fn take_session(h: Option<&Arc<crate::harness::host::Host>>, id: &str, rec
 }
 
 /// Completes when the front door (if this runner has one) reports something new.
+async fn headroom_changed(h: Option<&crate::headroom::Handle>) {
+    match h {
+        Some(h) => h.changed().await,
+        None => futures::future::pending().await,
+    }
+}
+
 async fn front_door_changed(fd: Option<&crate::frontdoor::runner::Handle>) {
     match fd {
         Some(h) => h.changed().await,
@@ -1112,6 +1134,13 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
     });
     // What the server last heard of it on this connection.
     let mut front_door_sent: Option<String> = None;
+    // This machine's headroom (docs/headroom.md): started before any agent session resumes, so a
+    // restart's sessions come back a few at a time; it runs from the settings it kept, server or not.
+    let headroom = (!o.ephemeral && !o.outpost)
+        .then(|| crate::headroom::start(crate::headroom::Ctx { dir: o.state_dir.join("headroom"), server_url: o.server_url.clone(), data_dir: o.state_dir.clone() }));
+    // What the server last heard of it, and whether this server takes it.
+    let mut headroom_sent: Option<String> = None;
+    let mut server_headroom = false;
     let (net, events) = net::start(net::Spec { bind: "0.0.0.0:0".parse()?, ca_der: ca, leaf, server: false, dial_deadline: net::DIAL_DEADLINE, revoked_keys: Vec::new() })?;
     // A test build's faults: frames lost, sent twice or sent late below the channel, which it
     // makes up for.
@@ -1147,6 +1176,53 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
             }
         });
         sync
+    });
+    // Observe: this machine's replica of the observe group and its writes (none in a job pod).
+    let observe = (o.observe && !o.ephemeral).then(|| {
+        let obs = crate::observe::Observe::start(crate::observe::Settings {
+            dir: o.state_dir.join("observe"),
+            role: crate::observe::Role::Runner { me: name.clone(), http: http.clone(), server: o.server_url.clone() },
+            // The server moves the cutoffs and states the bound.
+            metrics_retention: Duration::ZERO,
+            logs_retention: Duration::ZERO,
+            spans_retention: Duration::ZERO,
+            max_series: 0,
+        });
+        crate::observe::api::set_global(obs.clone());
+        // Prometheus's scrapes of the targets the server says this machine reads.
+        crate::observe::scrape::start(&name, &name, http.clone(), shutdown.clone());
+        // The synthetic tests the server says this machine runs (it is their location by name).
+        crate::observe::synthetics::start(&name, shutdown.clone());
+        // The DogStatsD listeners the server says this machine opens.
+        crate::observe::statsd::start(&name, &name, shutdown.clone());
+        // The logs the server says this machine collects (its files, its journal).
+        crate::observe::collect::start(&name, &name, &o.state_dir.join("observe"), shutdown.clone());
+        // This machine's own figures, as the server's are.
+        let every = std::env::var("KILN_OBSERVE_HOST_SECONDS").ok().and_then(|v| v.parse::<u64>().ok()).map_or(crate::observe::host::EVERY, Duration::from_secs);
+        crate::observe::host::start(obs.clone(), name.clone(), "runner", every);
+        // Every container this machine runs, as Datadog's container check sees them.
+        crate::observe::containers::start(obs.clone(), name.clone(), every);
+        // What the records this machine takes come to, as Datadog's estimated usage counts it.
+        crate::observe::indexes::start_usage(obs.clone(), name.clone(), crate::observe::indexes::USAGE_EVERY);
+        // And its own registry (`crate::metrics`: what this process counts, its repositories' sync
+        // and its moves among it), as the server's is read, of its host.
+        crate::observe::kiln::start_registry(obs.clone(), name.clone(), every, Some(net.clone()));
+        // Apps on this machine send OTLP here, as to a collector: OTLP/HTTP's port and OTLP/gRPC's,
+        // each taking either; and Datadog's tracers, as to their Agent, on its port too.
+        crate::observe::ddtrace::start(obs.clone(), name.clone(), shutdown.clone());
+        for addr in [crate::observe::otlp::local_addr(), crate::observe::otlp::local_grpc_addr(), crate::observe::otlp::local_dd_addr()].into_iter().flatten() {
+            crate::rt::spawn(crate::observe::otlp::serve_local(addr, obs.clone(), shutdown.clone()));
+        }
+        let (up, out) = (up_tx.clone(), obs.outgoing());
+        crate::rt::spawn(async move {
+            while let Ok(m) = out.recv().await {
+                let msg = AgentMsg::Observe { json: crate::observe::wire::encode(&m.msg), bytes: m.bytes };
+                if up.send(Up::Observe(msg)).await.is_err() {
+                    break;
+                }
+            }
+        });
+        obs
     });
     // The cluster group's learner: this machine's replica of kiln's records (docs/p2p.md, P2),
     // started once the server says which member it is (never in a job pod or an outpost).
@@ -1295,6 +1371,9 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
     // Their updates over the channel, once the server says it keeps it (docs/wire.md): kept until
     // the server has them, and sent again after a reconnect from where it has them, never whole.
     let mut updates = crate::wire::uplink::Updates::new(format!("{:016x}", rand::random::<u64>()));
+    // What each session's stream carried of its changeset, so a server that takes patches gets
+    // only what changed.
+    let mut sent_changes = SentChanges::default();
     // The server keeps the channel: it said so on this connection, before its Welcome.
     let mut server_wire = false;
     // The server takes what this runner's QUIC layer dropped (`AgentMsg::NetDrops`), and what it
@@ -1345,6 +1424,9 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
     let mut retire_at: Option<Instant> = None;
     let mut retire_span: Option<tracing::Span> = None;
     let mut retire_job: Option<String> = None;
+    // Shutting down, until when the loop runs on: the log sources' last writes come back over its
+    // connection before they write their places down (a stop then repeats no record).
+    let mut lingering: Option<Instant> = None;
     #[cfg(unix)]
     let mut moved: std::collections::HashSet<crate::instances::Owned> = std::collections::HashSet::new();
     #[cfg(unix)]
@@ -1490,6 +1572,11 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
             };
             uplink.0.send(Up::Term(AgentMsg::Wire(a))).await.ok();
         }
+        if let Some(until) = lingering
+            && ((crate::observe::collect::get().is_none_or(|c| c.stopped()) && crate::observe::last_written()) || Instant::now() >= until)
+        {
+            return Ok(());
+        }
         // Ephemeral agents leave once their one job is done and everything is delivered: its
         // result received, or given 30 s (a server older than receipts never says).
         if o.ephemeral && served_dedicated && jobs.is_empty() && buffer.is_empty() && up_rx.is_empty() && unreceived.values().all(|(at, _)| at.elapsed() > Duration::from_secs(30)) {
@@ -1505,6 +1592,8 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
         }
         if retiring && jobs.is_empty() && terms.is_empty() && retire_at.is_some_and(|t| Instant::now() >= t) {
             tracing::info!("handed everything to the new build, and its own jobs are done: this runner retires");
+            // What its tracers' spans counted, written before it goes, as a stop's is.
+            crate::observe::ddtrace::finish(Duration::from_secs(3)).await;
             if let Some(job) = retire_job.take() {
                 uplink.msg(AgentMsg::UpgradeLog { job, line: "the old runner's last jobs are done: it retired".to_owned() }).await;
                 crate::rt::sleep(Duration::from_millis(300)).await;
@@ -1517,7 +1606,7 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
             return Ok(());
         }
         let ev = futures::select_biased! {
-            () = shutdown.cancelled().fuse() => Ev::Shutdown,
+            () = shutdown_or_tick(&shutdown, lingering.is_some()).fuse() => Ev::Shutdown,
             ev = events.recv().fuse() => Ev::Net(ev.ok()),
             r = done_rx.recv().fuse() => match r { Ok(r) => Ev::Done(r), Err(_) => Ev::Watchdog },
             () = heartbeat.tick().fuse() => Ev::Heartbeat,
@@ -1530,6 +1619,7 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
             up = up_rx.recv().fuse() => match up { Ok(u) => Ev::Up(u), Err(_) => Ev::Watchdog },
             h = harness_rx.recv().fuse() => match h { Ok((s, u)) => Ev::Harness(s, u), Err(_) => Ev::Watchdog },
             () = front_door_changed(front_door.as_ref()).fuse() => Ev::FrontDoor,
+            () = headroom_changed(headroom.as_ref()).fuse() => Ev::Headroom,
             b = bg_rx.recv().fuse() => match b {
                 #[cfg(unix)]
                 Ok(Bg::Forwarded(data)) => Ev::Forwarded(data),
@@ -1543,11 +1633,27 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
         };
         match ev {
             Ev::Shutdown => {
+                if lingering.is_some() {
+                    continue;
+                }
                 for r in jobs.values() {
                     r.cancel.cancel();
                 }
+                // The browsers it drives closed before it goes.
                 crate::browser::driven::stop_all().await;
-                return Ok(());
+                // What this machine collected and counted written before it goes: three seconds
+                // at the most.
+                let collecting = match crate::observe::collect::get() {
+                    Some(c) if !c.stopped() => {
+                        c.stop_signal();
+                        true
+                    }
+                    _ => false,
+                };
+                if !collecting && crate::observe::last_written() {
+                    return Ok(());
+                }
+                lingering = Some(Instant::now() + Duration::from_secs(3));
             }
             Ev::Delayed(crate::runner::chaos::Due { lane, kind, data, again }) => {
                 // As an undelayed frame goes: sent while connected and welcomed, kept otherwise,
@@ -2031,6 +2137,9 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                     if let Some(s) = &sync {
                         s.connected(false);
                     }
+                    if let Some(ob) = &observe {
+                        ob.up("", false);
+                    }
                     if let Some(r) = &reach {
                         r.feed(crate::reach::node::In::Server(false)).await;
                     }
@@ -2042,6 +2151,9 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
             Ev::Net(Some(NetEvent::Connected { binding, .. })) => {
                 tracing::info!(server = %quic_addr, via = %paths.via(), "connected to server");
                 chaos_drop = chaos.and_then(|c| c.drop_every).map(|d| Instant::now() + d);
+                // How long saying what it is takes (its build's probes, its facts), told below: the
+                // server's frames wait meanwhile.
+                let said_from = Instant::now();
                 paths.connected(binding, Instant::now());
                 dialing_since = None;
                 dial_backoff = Duration::from_millis(500);
@@ -2062,13 +2174,20 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                     net.send(SERVER_PEER, LANE_CONTROL, Kind::Control, b).await;
                 }
                 // Which build this is and that it takes upgrade commands (an older server skips it);
-                // an outpost says it's one instead.
+                // an outpost says it's one instead. Its binary's hash was worked out as this runner
+                // started (`updates::warm_own_binary`), its engine's probes off the event loop.
+                let building = Instant::now();
                 let mut build = if o.outpost { crate::updates::outpost_build() } else { crate::updates::runner_build().await };
-                // It sends its conversations' store: the server keeps them from that.
-                if shipper.is_some()
-                    && let AgentMsg::Build { caps, .. } = &mut build
-                {
-                    *caps |= proto::CAP_CONVO;
+                let build_took = building.elapsed();
+                if let AgentMsg::Build { caps, .. } = &mut build {
+                    // It sends its conversations' store: the server keeps them from that.
+                    if shipper.is_some() {
+                        *caps |= proto::CAP_CONVO;
+                    }
+                    // A runner that keeps no replica does not say it replicates.
+                    if observe.is_none() {
+                        *caps &= !proto::CAP_OBSERVE;
+                    }
                 }
                 if !o.ephemeral
                     && let Ok(b) = proto::encode(&build)
@@ -2082,17 +2201,18 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                 if !o.ephemeral && !crate::runner::chaos::get().is_some_and(|c| c.old) {
                     let built = if let AgentMsg::Build { caps, .. } = &build { u64::from(*caps) } else { 0 };
                     let work = if o.outpost { 0 } else { proto::CAP_WORK };
+                    let headroom_cap = if headroom.is_some() { proto::CAP_HEADROOM } else { 0 };
                     let limit = if harness.is_some() { proto::CAP_AGENT_LIMIT } else { 0 };
-                    if let Ok(b) = proto::encode(&AgentMsg::Caps { caps: built | proto::CAP_WIRE | proto::CAP_HANDOVER | proto::CAP_INBOX | work | limit | proto::CAP_IDENTITY }) {
+                    if let Ok(b) = proto::encode(&AgentMsg::Caps { caps: built | proto::CAP_WIRE | proto::CAP_HANDOVER | proto::CAP_INBOX | work | limit | proto::CAP_IDENTITY | headroom_cap }) {
                         net.send(SERVER_PEER, LANE_CONTROL, Kind::Control, b).await;
                     }
                 }
                 // The kiln it runs, so the server knows its commit (`crate::fleet`; outposts aren't
                 // part of the fleet).
-                if !o.ephemeral
-                    && !o.outpost
-                    && let Ok(b) = proto::encode(&crate::updates::runner_facts())
-                {
+                let started = Instant::now();
+                let facts = (!o.ephemeral && !o.outpost).then(crate::updates::runner_facts);
+                let facts_took = started.elapsed();
+                if let Some(Ok(b)) = facts.as_ref().map(proto::encode) {
                     net.send(SERVER_PEER, LANE_CONTROL, Kind::Control, b).await;
                     // The rest, probed: they take a moment (docs/ci.md W13-R01).
                     probe_facts(&uplink, &o.work_dir, &o.declared, &probing);
@@ -2124,6 +2244,9 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                 if let Some(s) = &sync {
                     s.connected(true);
                 }
+                if let Some(ob) = &observe {
+                    ob.up("", true);
+                }
                 if let Some(f) = &shipper {
                     f.link(crate::convo::feed::Link::Up);
                 }
@@ -2134,6 +2257,14 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                 {
                     net.send(SERVER_PEER, LANE_CONTROL, Kind::Control, b).await;
                     front_door_sent = Some(json);
+                }
+                // Its frames waited all that while (the server's Welcome, observe's join): a slow one said.
+                let took = said_from.elapsed();
+                let (took_ms, build_ms, facts_ms) = (took.as_millis() as u64, build_took.as_millis() as u64, facts_took.as_millis() as u64);
+                if took > Duration::from_secs(2) {
+                    tracing::warn!(took_ms, build_ms, facts_ms, "saying what this runner is took long: the server's frames waited");
+                } else {
+                    tracing::debug!(took_ms, build_ms, facts_ms, "said what this runner is to the server");
                 }
             }
             Ev::Net(Some(NetEvent::Closed { reason, .. } | NetEvent::Unreachable { reason, .. })) => {
@@ -2163,6 +2294,9 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                 limit_said = None;
                 if let Some(s) = &sync {
                     s.connected(false);
+                }
+                if let Some(ob) = &observe {
+                    ob.up("", false);
                 }
                 if let Some(f) = &shipper {
                     f.link(crate::convo::feed::Link::Down);
@@ -2266,6 +2400,16 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                         server_drops = caps & proto::CAP_NET_DROPS != 0;
                         server_work = caps & proto::CAP_WORK != 0;
                         server_limit = caps & proto::CAP_AGENT_LIMIT != 0;
+                        sent_changes.server(caps & proto::CAP_CHANGES_PATCH != 0);
+                        server_headroom = caps & proto::CAP_HEADROOM != 0;
+                        // How headroom does, now that this server takes it.
+                        headroom_sent = None;
+                        if server_headroom
+                            && let Some(json) = headroom.as_ref().and_then(crate::headroom::Handle::latest)
+                        {
+                            uplink.0.send(Up::Term(AgentMsg::HeadroomStatus { json: json.clone() })).await.ok();
+                            headroom_sent = Some(json);
+                        }
                         if server_wire {
                             uplink.0.send(Up::Term(AgentMsg::Wire(wire_in.have()))).await.ok();
                         }
@@ -2279,7 +2423,7 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                         for key in updates.take_stale() {
                             if let Some(id) = key.strip_prefix("s:") {
                                 if let Some(s) = harness.as_ref().and_then(|h| h.get(id)) {
-                                    start_stream(&mut updates, id, &s, server_kept.get(id));
+                                    start_stream(&mut updates, id, &s, server_kept.get(id), &mut sent_changes);
                                 }
                             } else if let Some(id) = key.strip_prefix("t:")
                                 && let Some((_, state)) = terms.get(id)
@@ -2289,7 +2433,7 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                                 state.detach();
                                 updates.start(&key);
                                 if let Ok(b) = proto::encode(&AgentMsg::TermReplay { session: id.to_owned(), data: a.replay }) {
-                                    updates.push(&key, b);
+                                    updates.picture(&key, b);
                                 }
                             }
                         }
@@ -2353,7 +2497,7 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                                 while let Ok((session, u)) = harness_rx.try_recv() {
                                     note_announced(&mut announced, &session, &u);
                                     if updates.started(&crate::wire::uplink::session_key(&session)) {
-                                        push_update(&mut updates, &session, &u);
+                                        push_update(&mut updates, &session, &u, false, &mut sent_changes);
                                     }
                                 }
                             } else {
@@ -2369,7 +2513,7 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                                 let Some(s) = h.get(&info.id) else { continue };
                                 if updates_on {
                                     if !updates.started(&crate::wire::uplink::session_key(&info.id)) && announced.contains(&info.id) {
-                                        start_stream(&mut updates, &info.id, &s, server_kept.get(&info.id));
+                                        start_stream(&mut updates, &info.id, &s, server_kept.get(&info.id), &mut sent_changes);
                                     }
                                     continue;
                                 }
@@ -2408,6 +2552,9 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                         welcomed = false;
                         if let Some(s) = &sync {
                             s.connected(false);
+                        }
+                        if let Some(ob) = &observe {
+                            ob.up("", false);
                         }
                         if let Some(r) = &reach {
                             r.feed(crate::reach::node::In::Server(false)).await;
@@ -2893,6 +3040,11 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                             s.heard(&json, raft);
                         }
                     }
+                    ServerMsg::Observe { json, bytes } => {
+                        if let Some(ob) = &observe {
+                            ob.heard("", json, bytes);
+                        }
+                    }
                     ServerMsg::Cluster { json, raft } => {
                         use crate::store::learner::Msg;
                         match crate::store::learner::decode(&json) {
@@ -3053,6 +3205,11 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                             let json = crate::dirs::answer(path).await;
                             let _ = up.send(Up::Term(AgentMsg::DirList { req, json })).await;
                         });
+                    }
+                    ServerMsg::Headroom { json } => {
+                        if let Some(h) = &headroom {
+                            h.push(&json);
+                        }
                     }
                     ServerMsg::FrontDoor { json } => {
                         // Settings (and certificates) are never logged: an upload carries a key.
@@ -3311,6 +3468,17 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                     }
                 }
             }
+            Ev::Headroom => {
+                if connected
+                    && server_headroom
+                    && let Some(json) = headroom.as_ref().and_then(crate::headroom::Handle::latest)
+                    && headroom_sent.as_deref() != Some(json.as_str())
+                    && let Ok(b) = proto::encode(&AgentMsg::HeadroomStatus { json: json.clone() })
+                {
+                    net.send(SERVER_PEER, LANE_CONTROL, Kind::Control, b).await;
+                    headroom_sent = Some(json);
+                }
+            }
             Ev::FrontDoor => {
                 if connected
                     && let Some(json) = front_door.as_ref().and_then(crate::frontdoor::runner::Handle::latest)
@@ -3375,6 +3543,7 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                     Up::Term(m) => (LANE_TERM, Kind::Term, proto::encode(m)),
                     Up::Sync(m) => (LANE_SYNC, Kind::Control, proto::encode(m)),
                     Up::Reach(m) => (LANE_REACH, Kind::Term, proto::encode(m)),
+                    Up::Observe(m) => (LANE_OBSERVE, Kind::Control, proto::encode(m)),
                     Up::Convo(m) => (LANE_CONVO, Kind::Log, proto::encode(m)),
                     Up::File(m) => (LANE_FILES, Kind::Log, proto::encode(m)),
                     Up::Stream(m) => (LANE_STREAM, Kind::Term, proto::encode(m)),
@@ -3397,7 +3566,7 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                     }
                 } else if again {
                     // Sent from `unreceived` and `journal` once connected again.
-                } else if kind != Kind::Term && lane != LANE_SYNC && lane != LANE_REACH && lane != LANE_CONVO && lane != LANE_FILES {
+                } else if kind != Kind::Term && lane != LANE_SYNC && lane != LANE_REACH && lane != LANE_OBSERVE && lane != LANE_CONVO && lane != LANE_FILES {
                     buffered += data.len();
                     buffer.push_back((lane, kind, data));
                     // Shed the oldest log chunks first; results and step events are kept.
@@ -3433,6 +3602,7 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                     // Over the channel: kept until the server has it, down or not. A new session's
                     // stream starts with its Open; a closed one's ends once answered.
                     let key = crate::wire::uplink::session_key(&session);
+                    let mut opens = false;
                     if !updates.started(&key)
                         && let crate::harness::core::Update::Open { info, .. } = &u
                     {
@@ -3441,15 +3611,17 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                         // Welcome starts one, with only what the copy lacks.
                         let kept = server_kept.get(&session).filter(|k| k.epoch == info.epoch);
                         if let (Some(kept), Some(s)) = (kept, harness.as_ref().and_then(|h| h.get(&session))) {
-                            start_stream(&mut updates, &session, &s, Some(kept));
+                            start_stream(&mut updates, &session, &s, Some(kept), &mut sent_changes);
                             if connected {
                                 flush_updates(&mut updates, &uplink).await;
                             }
                             continue 'events;
                         }
                         updates.start(&key);
+                        opens = true;
                     }
-                    push_update(&mut updates, &session, &u);
+                    // A new session's Open is its stream's picture.
+                    push_update(&mut updates, &session, &u, opens, &mut sent_changes);
                     if matches!(u, crate::harness::core::Update::Closed) {
                         updates.closing(&key);
                     }
@@ -3601,14 +3773,161 @@ pub async fn enroll_only(o: &Opts) -> anyhow::Result<()> {
 }
 
 
-/// One agent-session update onto its session's channel stream, as the frames it needs.
-fn push_update(updates: &mut crate::wire::uplink::Updates, session: &str, u: &crate::harness::core::Update) -> usize {
+/// What each session's channel stream has carried of its changeset: a digest of each of its files,
+/// by key. To a server that takes patches (`proto::CAP_CHANGES_PATCH`), a changeset then goes as
+/// what changed in it: an agent touching one file of hundreds sends that one, not every file's diff
+/// again (a long session's changeset ran to 690 KB, sent whole for every edit).
+#[derive(Default)]
+struct SentChanges {
+    /// The server takes changesets as patches.
+    patches: bool,
+    sessions: HashMap<String, HashMap<crate::harness::model::FileKey, u64>>,
+}
+
+impl SentChanges {
+    /// The server says (again) whether it takes patches: one that doesn't has nothing to compare
+    /// with.
+    fn server(&mut self, patches: bool) {
+        if !patches {
+            self.sessions.clear();
+        }
+        self.patches = patches;
+    }
+
+    /// `session`'s stream carried an Open (its server's copy starts its changeset over) or ended.
+    fn forget(&mut self, session: &str) {
+        self.sessions.remove(session);
+    }
+
+    /// `session`'s changeset `files` as frames that fit, and what its stream carries of it noted:
+    /// to a server that takes patches, what changed since what the stream carried (or, in a
+    /// picture, all of it: its first part whole, the rest as patches); else whole, its largest
+    /// diffs left out to fit.
+    fn frames(&mut self, session: &str, files: &[crate::harness::model::FileChange], picture: bool) -> Vec<String> {
+        use crate::harness::core::Update;
+        if !self.patches {
+            return fit_changes(files).into_iter().collect();
+        }
+        let budget = HARNESS_FRAME - 1024;
+        let digest = |f: &crate::harness::model::FileChange| {
+            use std::hash::{Hash as _, Hasher as _};
+            let mut h = std::collections::hash_map::DefaultHasher::new();
+            serde_json::to_vec(f).unwrap_or_default().hash(&mut h);
+            h.finish()
+        };
+        let now: HashMap<crate::harness::model::FileKey, u64> = files.iter().map(|f| (f.key(), digest(f))).collect();
+        let frames = if picture {
+            let mut parts = file_parts(files, budget).into_iter();
+            let first = Update::Changes { files: parts.next().unwrap_or_default() };
+            std::iter::once(first).chain(parts.map(|set| Update::ChangesPatch { set, gone: Vec::new() })).filter_map(|u| serde_json::to_string(&u).ok()).collect()
+        } else {
+            let had = self.sessions.get(session);
+            let set: Vec<crate::harness::model::FileChange> = files.iter().filter(|f| had.and_then(|h| h.get(&f.key())) != now.get(&f.key())).cloned().collect();
+            let mut gone: Vec<crate::harness::model::FileKey> = had.map(|h| h.keys().filter(|k| !now.contains_key(*k)).cloned().collect()).unwrap_or_default();
+            gone.sort();
+            patch_frames(&set, gone)
+        };
+        self.sessions.insert(session.to_owned(), now);
+        frames
+    }
+}
+
+/// A changeset's patch as frames that fit, in order: what's gone first, then the files set, as
+/// many to a frame as fit (a file too large alone goes as its counts only).
+fn patch_frames(set: &[crate::harness::model::FileChange], gone: Vec<crate::harness::model::FileKey>) -> Vec<String> {
+    use crate::harness::core::Update;
+    let budget = HARNESS_FRAME - 1024;
+    let gone = (!gone.is_empty()).then_some(Update::ChangesPatch { set: Vec::new(), gone });
+    gone.into_iter().chain(file_parts(set, budget).into_iter().map(|set| Update::ChangesPatch { set, gone: Vec::new() })).filter_map(|u| serde_json::to_string(&u).ok()).collect()
+}
+
+/// A changeset's files as parts that each fit a frame of `budget` bytes, in order: a file too large
+/// to fit alone goes as its counts only (`FileChange::counts_only`: "Diff shortened" where it's
+/// shown).
+fn file_parts(files: &[crate::harness::model::FileChange], budget: usize) -> Vec<Vec<crate::harness::model::FileChange>> {
+    // What a part's frame holds besides its files.
+    let room = budget.saturating_sub(64);
+    let mut parts = Vec::new();
+    let mut part = Vec::new();
+    let mut size = 0usize;
+    for f in files {
+        let mut n = json_len(f).saturating_add(1);
+        let f = if n > room {
+            let short = f.counts_only();
+            n = json_len(&short).saturating_add(1);
+            short
+        } else {
+            f.clone()
+        };
+        if size.saturating_add(n) > room && !part.is_empty() {
+            parts.push(std::mem::take(&mut part));
+            size = 0;
+        }
+        size = size.saturating_add(n);
+        part.push(f);
+    }
+    if !part.is_empty() {
+        parts.push(part);
+    }
+    parts
+}
+
+/// A changeset whole, in a frame that fits: its largest files' diffs left out, the largest first,
+/// each file's counts kept (`FileChange::counts_only`), until it fits; then its longest texts cut
+/// (a path out of all reason). Its hundreds of short diff lines are what no text cut shortens: as
+/// it was cut before, a large changeset was dropped whole, and its page went on showing the old one.
+/// None: it can't fit even so.
+fn fit_changes(files: &[crate::harness::model::FileChange]) -> Option<String> {
+    use crate::harness::core::Update;
+    let budget = HARNESS_FRAME - 1024;
+    let whole = Update::Changes { files: files.to_vec() };
+    let json = serde_json::to_string(&whole).ok()?;
+    if json.len() <= budget {
+        return Some(json);
+    }
+    let Update::Changes { mut files } = whole else { return None };
+    let mut size = json.len();
+    let mut largest: Vec<(usize, usize)> = files.iter().enumerate().map(|(i, f)| (json_len(f), i)).collect();
+    largest.sort_unstable_by(|a, b| b.cmp(a));
+    for (n, i) in largest {
+        if size <= budget {
+            break;
+        }
+        if let Some(f) = files.get_mut(i) {
+            let short = f.counts_only();
+            size = size.saturating_sub(n).saturating_add(json_len(&short));
+            *f = short;
+        }
+    }
+    let fitted = serde_json::to_value(Update::Changes { files }).ok().map(|v| cut_value(v, budget))?;
+    serde_json::to_string(&fitted).ok().filter(|j| j.len() <= HARNESS_FRAME)
+}
+
+/// One agent-session update onto its session's channel stream, as the frames it needs: part of the
+/// picture its stream starts with (`picture`: its snapshot, a new session's Open), which goes
+/// whatever its size, or after it. A changeset goes as what changed in it where the server takes
+/// that (`sent`).
+fn push_update(updates: &mut crate::wire::uplink::Updates, session: &str, u: &crate::harness::core::Update, picture: bool, sent: &mut SentChanges) -> usize {
+    use crate::harness::core::Update;
     let key = crate::wire::uplink::session_key(session);
+    let frames = match u {
+        Update::Changes { files } => sent.frames(session, files, picture),
+        // Its server's copy starts its changeset over (an Open), or lets the session go.
+        Update::Open { .. } | Update::Closed => {
+            sent.forget(session);
+            harness_frames(session, u)
+        }
+        _ => harness_frames(session, u),
+    };
     let mut bytes = 0;
-    for json in harness_frames(session, u) {
+    for json in frames {
         if let Ok(b) = proto::encode(&AgentMsg::Harness { session: session.to_owned(), json }) {
             bytes += b.len();
-            updates.push(&key, b);
+            if picture {
+                updates.picture(&key, b);
+            } else {
+                updates.push(&key, b);
+            }
         }
     }
     bytes
@@ -3616,7 +3935,7 @@ fn push_update(updates: &mut crate::wire::uplink::Updates, session: &str, u: &cr
 
 /// Starts `session`'s channel stream (again), its snapshot first: when the server's copy is of
 /// the same epoch (`kept`), only what the copy lacks (`crate::wire::sums`), else all of it.
-fn start_stream(updates: &mut crate::wire::uplink::Updates, session: &str, s: &crate::harness::session::Session, kept: Option<&proto::KeptSession>) {
+fn start_stream(updates: &mut crate::wire::uplink::Updates, session: &str, s: &crate::harness::session::Session, kept: Option<&proto::KeptSession>, sent: &mut SentChanges) {
     use crate::harness::core::Update;
     let key = crate::wire::uplink::session_key(session);
     updates.start(&key);
@@ -3624,7 +3943,7 @@ fn start_stream(updates: &mut crate::wire::uplink::Updates, session: &str, s: &c
     // Its bytes, and of them its newest meta, state and changes, and its events after the copy's.
     let (mut bytes, mut newest, mut after) = (0, 0, 0);
     for u in &snapshot {
-        let n = push_update(updates, session, u);
+        let n = push_update(updates, session, u, true, sent);
         bytes += n;
         match u {
             Update::Meta { .. } | Update::State { .. } | Update::Changes { .. } => newest += n,
@@ -3730,10 +4049,11 @@ const HARNESS_FRAME: usize = 512 * 1024;
 
 /// An agent-session update as frames that fit: a long run of events goes in parts (events are
 /// upserts by id, so the parts mean what the whole did), and an event too large on its own has
-/// its longest texts cut, saying so. Anything else too large (a state, the changeset) is cut the
-/// same way: dropped, its page would go on showing what no longer is, the agent looking stuck. A
-/// state still too large sheds its finished tasks, the oldest first. Only what still doesn't fit
-/// is dropped, and logged.
+/// its longest texts cut, saying so. Anything else too large (a state) is cut the same way:
+/// dropped, its page would go on showing what no longer is, the agent looking stuck. A state still
+/// too large sheds its finished tasks, the oldest first; a changeset leaves out its largest diffs,
+/// their counts kept (`fit_changes`), and a changeset's patch goes in parts. Only what still doesn't
+/// fit is dropped, and logged.
 /// The command being applied on the channel (`answer_after`) is refused, saying how and why: a
 /// message that came alone has no one to tell.
 fn refuse(answer_after: &mut Option<(String, u64, Option<(crate::wire::channel::Refusal, String)>)>, code: crate::wire::channel::Refusal, why: impl Into<String>) {
@@ -3747,6 +4067,19 @@ fn harness_frames(session: &str, u: &crate::harness::core::Update) -> Vec<String
     let Ok(json) = serde_json::to_string(u) else { return Vec::new() };
     if json.len() <= HARNESS_FRAME {
         return vec![json];
+    }
+    // A changeset fits with its largest diffs left out; a patch of one goes in as many frames as
+    // it takes. Neither is dropped: a changeset's page would go on showing what no longer is.
+    if let Update::Changes { files } = u {
+        let fitted = fit_changes(files);
+        match &fitted {
+            Some(j) => tracing::debug!(session, bytes = json.len(), sent = j.len(), "agent session changeset too large whole: its largest diffs left out"),
+            None => tracing::warn!(session, bytes = json.len(), "agent session changeset too large to send, even as counts; dropped"),
+        }
+        return fitted.into_iter().collect();
+    }
+    if let Update::ChangesPatch { set, gone } = u {
+        return patch_frames(set, gone.clone());
     }
     let Update::Events { events } = u else {
         let budget = HARNESS_FRAME - 1024;
@@ -4260,6 +4593,117 @@ mod tests {
         // An instance's own runner (upgraded before) gives way to the new one, in either spelling.
         assert_eq!(with_instance(&args(&["agent", "--instance", "old", "--slots", "2"]), "g2"), args(&["agent", "--slots", "2", "--instance", "g2"]));
         assert_eq!(with_instance(&args(&["agent", "--instance=old"]), "g3"), args(&["agent", "--instance", "g3"]));
+    }
+
+    /// A long session's snapshot, larger than a stream's room (a Codex session's was 10 to 16 MB
+    /// against 8 MiB), starts its stream whole as its picture, and its updates go on after it.
+    /// Pushed against the room, as it was, it went stale part-way, and the stream started over
+    /// with the same snapshot at each frame from the server, without end: the server never heard
+    /// from the session again.
+    #[test]
+    fn a_snapshot_larger_than_a_streams_room_starts_it() {
+        let mut updates = crate::wire::uplink::Updates::new("boot");
+        let history = Update::Events { events: (0..5000).map(|i| said(i, "x".repeat(2000))).collect() };
+        let frames = harness_frames("s", &history).len();
+        let key = crate::wire::uplink::session_key("s");
+        let mut sent = SentChanges::default();
+        updates.start(&key);
+        let bytes = push_update(&mut updates, "s", &history, true, &mut sent);
+        assert!(bytes > crate::wire::uplink::ROOM, "{bytes} bytes");
+        push_update(&mut updates, "s", &Update::Events { events: vec![said(5000, "after".into())] }, false, &mut sent);
+        assert!(updates.take_stale().is_empty(), "its picture went whole");
+        assert_eq!(updates.unanswered(), frames + 1, "the snapshot and what came after it");
+        // As it was pushed before: held to the room, it goes stale part-way.
+        let other = crate::wire::uplink::session_key("t");
+        updates.start(&other);
+        push_update(&mut updates, "t", &history, false, &mut sent);
+        assert_eq!(updates.take_stale(), vec![other]);
+    }
+
+    /// A file of a changeset with `lines` added lines, each about as long as a line of code.
+    fn change(path: &str, lines: usize) -> crate::harness::model::FileChange {
+        let n = u32::try_from(lines).unwrap_or(u32::MAX);
+        let lines = (0..lines).map(|i| format!("+    let value_{i} = compute(argument_{i}, &context); // line {i}")).collect();
+        crate::harness::model::FileChange { path: path.into(), tree: None, created: false, deleted: false, added: n, removed: 0, hunks: vec![crate::harness::model::Hunk { old_start: 1, old_lines: 0, new_start: 1, new_lines: n, lines }], truncated: false, at: 1 }
+    }
+
+    /// A long session's changeset, as one's was: 43 files whose diffs are thousands of short lines,
+    /// about 700 KB together.
+    fn long_changeset() -> Vec<crate::harness::model::FileChange> {
+        (1..=43).map(|i| change(&format!("crates/kiln/src/f{i:02}.rs"), i * 10)).collect()
+    }
+
+    /// A changeset too large for a frame goes whole all the same, to a server that takes no patches:
+    /// its largest files as their counts only ("Diff shortened"), the rest as they are. Cut as other
+    /// updates are, its short lines left it too large, and it was dropped: its page showed the
+    /// changeset as it was before.
+    #[test]
+    fn a_changeset_too_large_for_a_frame_goes_with_its_largest_diffs_left_out() -> anyhow::Result<()> {
+        let files = long_changeset();
+        let whole = serde_json::to_string(&Update::Changes { files: files.clone() })?;
+        anyhow::ensure!(whole.len() > HARNESS_FRAME, "{} bytes", whole.len());
+        let frames = harness_frames("s", &Update::Changes { files: files.clone() });
+        let [frame] = frames.as_slice() else { anyhow::bail!("{} frames", frames.len()) };
+        anyhow::ensure!(frame.len() <= HARNESS_FRAME);
+        let Ok(Update::Changes { files: sent }) = serde_json::from_str::<Update>(frame) else { anyhow::bail!("not a changeset: {}", frame.get(..80).unwrap_or_default()) };
+        // Every file, each with its counts.
+        anyhow::ensure!(sent.iter().map(|f| (&f.path, f.added)).eq(files.iter().map(|f| (&f.path, f.added))));
+        // The largest left out, the smallest whole.
+        anyhow::ensure!(sent.last().is_some_and(|f| f.truncated && f.hunks.is_empty()));
+        anyhow::ensure!(sent.first() == files.first());
+        Ok(())
+    }
+
+    /// To a server that takes patches, a changeset goes as what changed in it: its picture whole, in
+    /// as many frames as it takes, every diff kept; then only the file an agent touched, or the one
+    /// it put back. The server's copy, taking them in, is the session's changeset each time; an Open
+    /// (the copy starting its changeset over) has it sent whole again.
+    #[test]
+    fn a_changeset_goes_as_what_changed_in_it_to_a_server_that_takes_that() -> anyhow::Result<()> {
+        crate::rt::block_on(async {
+            let hub = crate::hub::tests::scratch_hub().await?;
+            let there = crate::harness::registry::Location::Machine("box".into());
+            let info = crate::harness::session::Info { id: "s".into(), kind: "codex".into(), ..Default::default() };
+            hub.harness.ingest(&hub, &there, "s", Update::Open { info: Box::new(info.clone()), since: None });
+            let mut sent = SentChanges::default();
+            sent.server(true);
+            let take = |frames: &[String]| -> anyhow::Result<()> {
+                for f in frames {
+                    anyhow::ensure!(f.len() <= HARNESS_FRAME, "a frame of {} bytes", f.len());
+                    hub.harness.ingest(&hub, &there, "s", serde_json::from_str(f)?);
+                }
+                Ok(())
+            };
+            let copy = || hub.harness.conclusion("s").map(|(_, _, changes)| changes).unwrap_or_default();
+            let mut files = long_changeset();
+            let frames = sent.frames("s", &files, true);
+            anyhow::ensure!(frames.len() > 1 && frames.first().is_some_and(|f| f.starts_with(r#"{"t":"changes""#)));
+            take(&frames)?;
+            anyhow::ensure!(copy() == serde_json::to_value(&files)?, "the picture, whole, every diff kept");
+            // The agent edits one file of 43: one small frame, that file.
+            if let Some(f) = files.get_mut(20) {
+                *f = change(&f.path, 300);
+            }
+            let frames = sent.frames("s", &files, false);
+            let [edit] = frames.as_slice() else { anyhow::bail!("{} frames", frames.len()) };
+            anyhow::ensure!(edit.starts_with(r#"{"t":"changes_patch""#) && edit.len() < 32 << 10, "{} bytes", edit.len());
+            take(&frames)?;
+            anyhow::ensure!(copy() == serde_json::to_value(&files)?, "the edit taken in place");
+            // It puts one back: that file's key alone.
+            let back = files.remove(5);
+            let frames = sent.frames("s", &files, false);
+            anyhow::ensure!(frames == vec![serde_json::to_string(&Update::ChangesPatch { set: Vec::new(), gone: vec![back.key()] })?]);
+            take(&frames)?;
+            anyhow::ensure!(copy() == serde_json::to_value(&files)?, "the file put back gone");
+            anyhow::ensure!(sent.frames("s", &files, false).is_empty(), "nothing changed, nothing sent");
+            // The copy starts over (an Open on the stream): every file again.
+            let mut updates = crate::wire::uplink::Updates::new("boot");
+            updates.start(&crate::wire::uplink::session_key("s"));
+            push_update(&mut updates, "s", &Update::Open { info: Box::new(info), since: None }, true, &mut sent);
+            let again: Vec<crate::harness::model::FileChange> = sent.frames("s", &files, false).iter().filter_map(|f| match serde_json::from_str::<Update>(f) { Ok(Update::ChangesPatch { set, .. }) => Some(set), _ => None }).flatten().collect();
+            anyhow::ensure!(again == files);
+            Ok(())
+        })
     }
 
     #[test]

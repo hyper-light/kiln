@@ -1525,7 +1525,8 @@ impl Claude {
             return;
         }
         let busy = self.busy(core);
-        if busy && mode == SendMode::Queue {
+        // Past the machine's headroom, new work waits in kiln's queue (a person's "now" never does).
+        if mode == SendMode::Queue && (busy || !crate::headroom::admit(&core.session_id, crate::headroom::Class::Agent)) {
             core.state.queue.push(QueueItem { id, text, at: Core::now(), attachments, overrides, reply_to });
             core.touch_state();
             return;
@@ -1584,7 +1585,7 @@ impl Claude {
 
     /// The turn is over: the next message waiting in kiln's queue goes out (unless a pause or a
     /// switch holds it).
-    fn drain_queue(&mut self, core: &mut Core) {
+    pub(crate) fn drain_queue(&mut self, core: &mut Core) {
         if self.busy(core) || core.state.queue.is_empty() || core.state.status == Status::Exited || !super::pause::open(core) {
             return;
         }

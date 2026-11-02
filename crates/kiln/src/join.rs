@@ -1105,6 +1105,7 @@ pub async fn cli(a: JoinArgs, shutdown: Shutdown) -> anyhow::Result<Option<crate
             instance: None,
             config: None,
             reach: Some(true),
+            observe: true,
             outpost: false,
             declared: crate::runner::probe::Declared::default(),
         }));

@@ -11,6 +11,8 @@
 //!   killer kills (SIGKILL, and counted where kiln counts the OOM killer's kills);
 //! - `disk=<MiB>`: a leg's job container gets a workspace of that size, so filling it is ENOSPC;
 //! - `corrupt`: a leg's uploads to the server's blob store arrive with a byte flipped;
+//! - `fetch`: a leg's first ask for a Node build from the internet fails as a request that timed
+//!   out does, so its step asks again ([`crate::runner::runtime`]'s download tries);
 //! - `platform=<os>/<arch>`: the runner reports that platform's OS and architecture (and the
 //!   labels they give), a stand-in for a runner of another platform (W04-AC07);
 //! - `rebuild=<duration>`: the server's, not its runner's: the CI engine rebuilds its runs that
@@ -37,8 +39,8 @@
 //!   appended to `path` under what it's for, so a test can look for those very bytes where they
 //!   must never be (W27-R02).
 //!
-//! A leg's faults (`oom`, `disk`, `corrupt`) hit its first attempt only, so a retry shows how it
-//! recovers; `drop` and `delay` are the connection's.
+//! A leg's faults (`oom`, `disk`, `corrupt`, `fetch`) hit its first attempt only, so a retry shows
+//! how it recovers; `drop` and `delay` are the connection's.
 
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
@@ -60,6 +62,7 @@ pub struct Chaos {
     pub oom_after: Option<Duration>,
     pub disk_mib: Option<u32>,
     pub corrupt: bool,
+    pub fetch: bool,
     pub platform: Option<String>,
     pub rebuild_after: Option<Duration>,
     /// What goes wrong below the channel: `shed`, `twice`, `late`, in the order given, drawn from
@@ -111,6 +114,7 @@ pub fn parse(spec: &str) -> anyhow::Result<Chaos> {
             "oom" => c.oom_after = Some(d()?),
             "disk" => c.disk_mib = Some(v.parse().map_err(|_| anyhow::anyhow!("chaos `disk` takes MiB, not `{v}`"))?),
             "corrupt" => c.corrupt = true,
+            "fetch" => c.fetch = true,
             "platform" => {
                 kiln_ci::plan::matrix::Platform::parse(v).map_err(|e| anyhow::anyhow!("chaos `platform`: {e}"))?;
                 c.platform = Some(v.to_owned());
@@ -136,7 +140,7 @@ pub fn parse(spec: &str) -> anyhow::Result<Chaos> {
                 }
             }
             "seed" => c.seed = v.parse().map_err(|_| anyhow::anyhow!("chaos `seed` takes a number, not `{v}`"))?,
-            other => anyhow::bail!("chaos has no fault `{other}`: drop, down, delay, oom, disk, corrupt, platform, rebuild, shed, twice, late, seed, fanout, old, copy or keys"),
+            other => anyhow::bail!("chaos has no fault `{other}`: drop, down, delay, oom, disk, corrupt, fetch, platform, rebuild, shed, twice, late, seed, fanout, old, copy or keys"),
         }
     }
     Ok(c)
@@ -358,6 +362,7 @@ mod tests {
                 oom_after: Some(Duration::from_secs(1)),
                 disk_mib: Some(8),
                 corrupt: true,
+                fetch: false,
                 platform: None,
                 rebuild_after: None,
                 faults: Vec::new(),
@@ -374,6 +379,7 @@ mod tests {
         assert_eq!((c.copy.as_deref(), c.keys.as_deref()), (Some(std::path::Path::new("/tmp/a.frames")), Some(std::path::Path::new("/tmp/a.keys"))));
         assert!(parse("copy=").is_err() && parse("keys").is_err(), "each names its file");
         assert!(parse("drop=6s,old")?.old);
+        assert!(parse("fetch")?.fetch);
         assert_eq!(parse("rebuild=4s")?.rebuild_after, Some(Duration::from_secs(4)));
         assert_eq!(parse("drop=5s,down=30s")?.down_for, Some(Duration::from_secs(30)));
         assert!(parse("platform=plan9/mips").is_err());

@@ -768,8 +768,8 @@ fn error_line(f: &Value) -> String {
 }
 
 /// What a failed run is: its failed jobs, each one's failing step and excerpt, and the last green
-/// run of its workflow on its branch.
-async fn failure_of(hub: &Hub, v: &Value, wake: &'static str) -> Trigger {
+/// run of its workflow on its branch (also what Ship's Hand off gives, W26-R18).
+pub(crate) async fn failure_of(hub: &Hub, v: &Value, wake: &'static str) -> Trigger {
     let repo = s(v, "/repo/name").or_else(|| s(v, "/run/repo")).unwrap_or_default().to_owned();
     let run = s(v, "/run/id").unwrap_or_default().to_owned();
     let workflow = s(v, "/run/workflow").unwrap_or_default().to_owned();
@@ -1323,7 +1323,7 @@ async fn stuck(hub: &Hub, attached: &[Attachment]) -> Vec<Trigger> {
                 // its current wait.
                 "SELECT j.id, j.display, j.labels, r.id, p.name, COALESCE(r.workflow_id, ''), r.number, COALESCE(j.wait_since, j.queued_at) FROM jobs j JOIN runs r ON r.id = j.run_id JOIN repos p ON p.id = r.repo_id
                  WHERE j.status = 'queued' AND COALESCE(j.wait_since, j.queued_at) < ?1
-                   AND (j.wait_reason IS NULL OR json_extract(j.wait_reason, '$.reason') IN ('capacity', 'oversized', 'no-runner', 'unroutable', 'capability', 'scaling', 'reservation', 'other-runner'))
+                   AND (j.wait_reason IS NULL OR json_extract(j.wait_reason, '$.reason') IN ('capacity', 'oversized', 'headroom', 'no-runner', 'unroutable', 'capability', 'scaling', 'reservation', 'other-runner'))
                  ORDER BY COALESCE(j.wait_since, j.queued_at) LIMIT 50",
             )?;
             let rows = st.query_map([before], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?, r.get(6)?, r.get(7)?)))?.collect::<Result<Vec<_>, _>>()?;

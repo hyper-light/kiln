@@ -1783,6 +1783,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "hyper-measure"
+version = "0.1.0"
+dependencies = [
+ "libc",
+ "windows-sys 0.61.2",
+]
+
+[[package]]
 name = "hyper-quic"
 version = "0.1.0"
 dependencies = [
@@ -2225,6 +2233,7 @@ dependencies = [
  "event-listener",
  "filedescriptor",
  "flate2",
+ "foldhash",
  "futures",
  "glob",
  "hex",
@@ -2236,6 +2245,7 @@ dependencies = [
  "hyper-block",
  "hyper-durable",
  "hyper-log",
+ "hyper-measure",
  "hyper-quic",
  "hyper-raft",
  "hyper-rt",
@@ -2245,9 +2255,11 @@ dependencies = [
  "kiln-cd",
  "kiln-ci",
  "kiln-http",
+ "kiln-obs",
  "kiln-seams",
  "kiln-search",
  "kiln-sim",
+ "memchr",
  "mime_guess",
  "nix 0.31.3",
  "parking_lot",
@@ -2257,6 +2269,8 @@ dependencies = [
  "quiver-api",
  "rand 0.10.3",
  "rcgen",
+ "regex",
+ "regex-syntax",
  "rpassword",
  "rquickjs",
  "rusqlite",
@@ -2284,6 +2298,7 @@ dependencies = [
  "uuid",
  "vt100",
  "webpki-roots",
+ "winapi-util",
  "x509-parser",
  "zip",
 ]
@@ -2356,6 +2371,26 @@ dependencies = [
  "hyper-rt",
  "memchr",
  "tracing",
+]
+
+[[package]]
+name = "kiln-obs"
+version = "0.2.0"
+dependencies = [
+ "flate2",
+ "hashbrown 0.17.1",
+ "hyper-block",
+ "hyper-durable",
+ "hyper-log",
+ "hyper-measure",
+ "hyper-raft",
+ "jiff",
+ "parking_lot",
+ "regex",
+ "serde_json",
+ "sha2 0.11.1",
+ "tempfile",
+ "thiserror 2.0.21",
 ]
 
 [[package]]

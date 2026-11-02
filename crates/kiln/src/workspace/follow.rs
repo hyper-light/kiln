@@ -144,11 +144,11 @@ async fn tell(hub: &Arc<Hub>, r: &Record, text: String) {
     deliver(hub, &r.agent, text).await;
 }
 
-/// Sends agent `agent` `text`, queued after its turn, when it still runs.
-pub async fn deliver(hub: &Hub, agent: &str, text: String) {
-    let Some(info) = hub.harness.info(agent) else { return };
+/// Sends agent `agent` `text`, queued after its turn, when it still runs; whether it went.
+pub async fn deliver(hub: &Hub, agent: &str, text: String) -> bool {
+    let Some(info) = hub.harness.info(agent) else { return false };
     if info.status == Status::Exited {
-        return;
+        return false;
     }
     let message = crate::util::new_id();
     crate::harness::wait::sent(&info.id, info.last_turn.as_ref().map(|t| t.at));
@@ -156,6 +156,7 @@ pub async fn deliver(hub: &Hub, agent: &str, text: String) {
     if !sent.went() {
         tracing::info!(agent = %info.id, "a change request's news didn't reach its agent");
     }
+    sent.went()
 }
 
 /// Where a comment is: `src/a.rs lines 10–14`, `src/a.rs line 3`, or nothing for the change as a

@@ -193,6 +193,10 @@ pub enum Out {
     /// A test build's seed (`crate::runner::chaos`, `seed=`): the faults said after it pick other
     /// frames than they would without it (each seed its own, the same each run).
     Seed(u64),
+    /// What the endpoint measures now, answered on the loop's next turn ([`NetHandle::sample`]).
+    Sample {
+        reply: std::sync::mpsc::SyncSender<QuicSample>,
+    },
     /// A test build's copy (`crate::runner::chaos`, `copy=`): every frame sent from now on is
     /// appended to this file as it's handed below the channel, before any fault (W27-R02).
     Copy(std::path::PathBuf),
@@ -226,6 +230,71 @@ pub enum Act {
 /// How long a frame sent late waits for the next on its lane, at the most.
 pub const LATE_FOR: Duration = Duration::from_millis(20);
 
+/// What a node's QUIC endpoint measures now ([`NetHandle::sample`]): its own counts, and each
+/// connected peer's path and connection, as hyper-transport and hyper-quic keep them.
+#[derive(Clone, Debug, Default)]
+pub struct QuicSample {
+    /// Connections held, in any state.
+    pub connections: u64,
+    /// Exchanges (a message each way, each on a stream) open.
+    pub exchanges: u64,
+    /// Streams a peer opened past a bound, refused, since the endpoint was made.
+    pub streams_refused: u64,
+    /// Lane frames skipped because their class or the budget could not take them, since then.
+    pub frames_dropped: u64,
+    /// Endpoint responses dropped at their bound, since then.
+    pub responses_dropped: u64,
+    /// Each peer with a connection: its name, its path now and what its connection counted.
+    pub peers: Vec<PeerSample>,
+}
+
+/// A connected peer's path now and what its connection counted since it began.
+#[derive(Clone, Debug)]
+pub struct PeerSample {
+    /// Its name: a runner's, or `server` for an agent's one peer.
+    pub name: String,
+    pub path: hyper_transport::PathFacts,
+    pub conn: hyper_quic::ConnectionStats,
+}
+
+/// The peers a directory knows by name.
+trait Named {
+    fn each(&self, f: &mut dyn FnMut(PeerId, &str));
+}
+
+impl Named for ServerBook {
+    fn each(&self, f: &mut dyn FnMut(PeerId, &str)) {
+        for (peer, name) in &self.names {
+            f(*peer, name);
+        }
+    }
+}
+
+impl Named for AgentBook {
+    fn each(&self, f: &mut dyn FnMut(PeerId, &str)) {
+        f(SERVER_PEER, "server");
+    }
+}
+
+/// What `ep` measures now: its counts, and each named peer it has a connection to.
+fn sample<D: Directory<Role = Role> + Named>(ep: &Endpoint<Kiln, Fixed, D>) -> QuicSample {
+    let st = ep.stats();
+    let mut out = QuicSample {
+        connections: st.connections as u64,
+        exchanges: st.exchanges as u64,
+        streams_refused: st.streams_refused,
+        frames_dropped: st.frames_dropped,
+        responses_dropped: st.responses_dropped,
+        peers: Vec::new(),
+    };
+    ep.directory().each(&mut |peer, name| {
+        if let (Some(path), Some(conn)) = (ep.path(peer), ep.connection_stats(peer)) {
+            out.peers.push(PeerSample { name: name.to_owned(), path, conn });
+        }
+    });
+    out
+}
+
 /// Events out of the net thread.
 #[derive(Debug)]
 pub enum NetEvent {
@@ -255,6 +324,15 @@ impl NetHandle {
 
     pub async fn command(&self, out: Out) -> bool {
         self.tx.send(out).await.is_ok()
+    }
+
+    /// What the endpoint measures now (its counts, each peer's path and connection), asked of the
+    /// net thread and answered on its next turn; none if it does not answer `within`. Blocks: for a
+    /// thread of its own, never the runtime's.
+    pub fn sample(&self, within: Duration) -> Option<QuicSample> {
+        let (reply, answer) = std::sync::mpsc::sync_channel(1);
+        self.tx.try_send(Out::Sample { reply }).ok()?;
+        answer.recv_timeout(within).ok()
     }
 }
 
@@ -736,6 +814,10 @@ async fn run_loop(
                             if let AnyDriver::Server(d) = &mut driver {
                                 d.endpoint().directory_mut().revoked.remove(&name);
                             }
+                        }
+                        Out::Sample { reply } => {
+                            let now = with_driver!(&mut driver, d => sample(d.endpoint()));
+                            let _ = reply.try_send(now);
                         }
                         Out::RevokeKeys { keys, why } => {
                             if let AnyDriver::Server(d) = &mut driver {

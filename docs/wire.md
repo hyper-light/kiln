@@ -30,7 +30,7 @@ acknowledgements come from that process, never from the transport under it.
 | ack | An acknowledgement, or a NACK, itself. |
 | stream | An item of an ordered stream: a session's timeline, a terminal's output, a job's events. Items are numbered and acknowledged cumulatively. After a reconnect they are sent again from where the receiver says it has them, and a snapshot is sent only when the sender no longer has what's missing. |
 | state | The newest of something that changes: an inventory, a session's state, a terminal's size. The newest wins, and it is sent again on every connect, so one lost to a cut comes once the link is back. |
-| carried (…) | A protocol of its own, carried on the link, that acknowledges and resends by itself: the conversation feed (`convo/feed.rs`), repo sync's Raft, the cluster group's learners (docs/p2p.md), reach's links, ports' windows, the tunnel, and the channel itself (`crate::wire::channel`, whose items carry other messages, each with its own class). |
+| carried (…) | A protocol of its own, carried on the link, that acknowledges and resends by itself: the conversation feed (`convo/feed.rs`), repo sync's Raft, the cluster group's learners (docs/p2p.md), observe's group (docs/observe.md), reach's links, ports' windows, the tunnel, and the channel itself (`crate::wire::channel`, whose items carry other messages, each with its own class). |
 | telemetry | Measurements sent every few seconds. The next one stands in for a lost one, so there is no ACK. |
 | media | Live pictures and sound. A lost frame is overtaken by the next and never sent again. |
 
@@ -63,7 +63,9 @@ Messages to agents ride the same channel, and their answers are T3's inbox answe
 - An `Update::Inbox` rides its session's update stream like any update. The channel takes each item
   once. A stream that starts over drops what it hadn't had answered and starts from the session's
   snapshot, which holds no `Update::Inbox`. That happens when either side restarted, or the stream
-  filled up. One dropped this way leaves its send "on its way" after 10 s, as T3's registry has it.
+  filled up. The snapshot goes whole however large it is: a stream's room (8 MiB, 64 MiB for all of
+  a runner's together) bounds only what's sent after it, since a snapshot held to it could never
+  start a long session's stream again (`wire/uplink.rs`). One dropped this way leaves its send "on its way" after 10 s, as T3's registry has it.
   One case is open. After a server restart, a stream the old server took items of but answered
   none of goes on: nothing says it lost them, since a server that never received any says the
   same. Its inbox answer then reaches the new server too. That server finds no waiter for it,
@@ -145,7 +147,13 @@ An agent session's commands ride these streams too: `HarnessOpen`, `HarnessCmd`,
 `HarnessPackage` and `HarnessRelease`. A `HarnessCmd` rides the stream its `Command`'s class says
 (`crate::wire::command_class`):
 - **Parked** (waits for a runner that's away): a message (`Send`, `SkillRun`), a change to the
-  queue (`QueueEdit`, `QueueRemove`, `QueueMove`) and an approval (`Approve`).
+  queue (`QueueEdit`, `QueueRemove`, `QueueMove`) and an approval (`Approve`). A message with an
+  id never parks: to a runner that's away it's refused at once (`Unreachable`, 409), and one that
+  rides a `HarnessCmd` (to a process whose inbox isn't known: one from before inboxes, or one just
+  connected that hasn't said yet) rides the live stream, so a link that drops before its answer
+  ends it. Its sender sends it again under its id, wherever its session runs then; parked, it
+  would go to the copy there with no epoch even after its session went on elsewhere (CP-T3.2,
+  until CP-T3.3 parks it under its epoch).
 - **Asks**, which go as asks do, answered by what they ask for: `Suggest`, `Snapshot`, `McpAuth`
   and `SkillView`.
 - **Live**, refused at once while its runner is away: every other command (an interrupt, a model,
@@ -449,6 +457,7 @@ Four edges are left, and the lab steers clear of each:
 | `HarnessHistory` | answer | Answers `HarnessHistory`. | As its class says. |
 | `Sync` | carried (repo sync's Raft) | Repo sync: hyper-raft acknowledges and resends its own messages. | As its class says. |
 | `FrontDoorStatus` | state | The machine's front door. | Sent on every connect and change, not acknowledged. |
+| `HeadroomStatus` | state | The machine's headroom: its targets, window, held and paced work (docs/headroom.md). | Sent on every connect and when what it decides changes, not acknowledged. |
 | `JobEvent` | stream | A v2 leg's events, numbered per leg (`seq`). | Kept until `Received` and sent again after a reconnect (`CAP_RECEIVED`). |
 | `Facts` | state | What the runner is: OS, CPUs, tools and so on. | Sent on connect, every 10 minutes and when asked. |
 | `Reach` | carried (reach link) | A frame of a link between two runners, relayed. The link's ends frame it. | As its class says. |
@@ -476,6 +485,7 @@ Four edges are left, and the lab steers clear of each:
 | `WorkState` | state | What the runner holds warm: each lane's workspaces and how long its legs took there, for placement (ci.md W24-R18). Each supersedes the last. | New: with its samples once it changed, and every 10 minutes, to a server announcing `CAP_WORK`. |
 | `AgentLimit` | state | The most agent sessions the machine has at work at once, and where that comes from: set from the server, its config, or kiln's default (agents.md, "How many agents a machine runs"). Each supersedes the last. | New: as it's welcomed and whenever it changes, to a server announcing `CAP_AGENT_LIMIT`. |
 | `Identity` | ask | A CSR for a key the runner process made and keeps: for itself, an agent session it holds at an epoch, or a leg it runs (ci.md W27-R01). The server answers with `Identity`. | New: on each connection for the process's own, to a server announcing `CAP_IDENTITY`. |
+| `Observe` | carried (observe's group) | The runner's replica of observe's group (docs/observe.md §5): hyper-raft's messages, which it acknowledges and resends, and the writes it takes, offered to the leader until they commit. | Only from a runner announcing `CAP_OBSERVE`, on lane 5. |
 
 ## Server to runner: `ServerMsg`
 
@@ -504,6 +514,7 @@ Four edges are left, and the lab steers clear of each:
 | `HarnessHistory` | ask | Answered by `HarnessHistory`. | As its class says. |
 | `Sync` | carried (repo sync's Raft) | Repo sync. | As its class says. |
 | `FrontDoor` | state | The front door's settings and certificate. | On the channel ("Commands"), parked: the newest goes, answered once taken. Sent on connect and change. |
+| `Headroom` | state | The machine's headroom settings (docs/headroom.md). | Sent on connect and on change; the runner keeps them. |
 | `AssignV2` | command, refused while away | A v2 leg to run, as `Assign`. | On the channel ("Commands"): answered once taken, then by `JobStarted` or `Reject`. |
 | `SecretsFor` | command, parked | A running leg's secrets. A leg still running when its runner is back needs them. | Fire-and-forget. |
 | `JobTerminalOpen` | command, refused while away | A terminal into a leg. | On the channel ("Commands"): answered once applied; refused at once while away. |
@@ -541,6 +552,7 @@ Four edges are left, and the lab steers clear of each:
 | `HarnessSend` | command, parked | A message (or a skill run) for an agent session, for the epoch the server last heard it's at: its id made once, its inbox takes it once, refuses it typed (a stale epoch named), and answers either way (CP-T3.2, docs/sends.md). To runners that say `CAP_INBOX` in their `Caps`. | T3: answered (`Update::Inbox`); while its runner is away it's refused at once, until CP-T3.3 parks it. |
 | `AgentLimit` | state | What a person set from the server for the most agent sessions the machine has at work at once, over its config's; none set, its config's (or kiln's default) holds (agents.md, "How many agents a machine runs"). | On the channel ("Commands"), parked: the newest goes, answered once taken. Sent as the runner says `CAP_AGENT_LIMIT` and whenever it changes; the runner keeps it for its restarts. |
 | `Identity` | answer | The certificate kiln's CA issued for an `Identity` the runner asked for, or why there's none (ci.md W27-R01). | New: to runners that say `CAP_IDENTITY`. |
+| `Observe` | carried (observe's group) | To the runner's replica: hyper-raft's messages, and the leader's word on the writes it took. | Only to a runner announcing `CAP_OBSERVE`, on lane 5. |
 
 ## Commands to a session: `Command`
 
@@ -603,6 +615,7 @@ From wherever a session runs to the server, inside `Harness`, and on to its view
 | `Reply` | answer | Answers one client's ask. | As its class says. |
 | `Inbox` | answer | What a session's inbox made of a message (`HarnessSend`): taken, a repeat with the first time's answer, or refused and why (CP-T3.2). | T3: rides the session's stream. Sent again after a server restart, it finds no waiter, or a retry's own waiter (CP-T3.3 gives each send a nonce). |
 | `Reset` | stream | The timeline starts over (a snapshot follows). | As `Harness`. |
+| `ChangesPatch` | stream | What changed in its changeset since the last one the server's copy took: the files set (each in place of the one with its key, or after the rest) and those gone. Only to a server that says `CAP_CHANGES_PATCH`, so a file an agent touches doesn't send every file's diff again; a snapshot has the whole changeset, its first frame whole and the rest as patches when it doesn't fit one. | As `Harness`. The server stores the whole changeset it makes. |
 
 ## The UI's sockets
 
@@ -672,6 +685,7 @@ CIs typecheck the UI against them.
 | `/api/harness/sessions/:id/ws` | down | `state` | state | The newest wins. | Sent whole on every attach. |
 | `/api/harness/sessions/:id/ws` | down | `state_patch` | state | What changed since the last state. | As its class says. |
 | `/api/harness/sessions/:id/ws` | down | `changes` | state | The whole changeset. | Sent whole on every attach. |
+| `/api/harness/sessions/:id/ws` | down | `changes_patch` | state | What changed since the last changeset (`?patch=changes`): the files set and those gone, taken in place. | As its class says. |
 | `/api/harness/sessions/:id/ws` | down | `files` | state | Files its messages mention. | Sent on attach. |
 | `/api/harness/sessions/:id/ws` | down | `events` | stream | Timeline events. | Every attach, and a viewer that falls behind, gets them all again. |
 | `/api/harness/sessions/:id/ws` | down | `synced` | stream | Follows a snapshot. | As its class says. |

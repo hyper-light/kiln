@@ -245,6 +245,15 @@ impl Group {
     }
 }
 
+/// The sessions with processes followed now.
+pub fn sessions() -> Vec<String> {
+    let Some(t) = tracker() else { return Vec::new() };
+    let mut s: Vec<String> = t.members.lock().values().cloned().collect();
+    s.sort();
+    s.dedup();
+    s
+}
+
 /// The agent session process `pid` belongs to, when it's one followed.
 pub fn session_of(pid: u32) -> Option<String> {
     let pid = i32::try_from(pid).ok()?;

@@ -26,6 +26,9 @@ pub enum Up {
     /// Reach links (`crate::reach`), on their own lane: never buffered across a disconnect (a link
     /// does not outlive the connection; its runs resume on the next one).
     Reach(AgentMsg),
+    /// The observe group (`crate::observe`), on its own lane: never buffered across a disconnect
+    /// (Raft sends again, and a write is sent again until answered).
+    Observe(AgentMsg),
     /// The conversation feed (`crate::convo::feed`), on its own lane: never buffered across a
     /// disconnect (the feed goes on from what the server says it has, on the next connection).
     Convo(AgentMsg),
@@ -46,6 +49,12 @@ pub struct Uplink(pub async_channel::Sender<Up>);
 impl Uplink {
     pub async fn msg(&self, m: AgentMsg) {
         let _ = self.0.send(Up::Msg(m)).await;
+    }
+
+    /// A message that's only said along the way (an upgrade's progress): sent without waiting, so
+    /// what's doing it never waits on the connection; dropped when the uplink is full.
+    pub fn say(&self, m: AgentMsg) {
+        let _ = self.0.try_send(Up::Msg(m));
     }
 
     pub async fn log(&self, job: &str, idx: u32, data: Vec<u8>) {

@@ -20,10 +20,12 @@ import {
   pullSearchRes,
   reviewApi,
   searchRes,
+  whoSaid,
   type HostPullDetail,
   type Thread,
 } from "@/api/review";
 import type { ShipCommit } from "@/api/ship";
+import { AboutContext, type AboutAgent } from "@/components/code/about";
 import { toast } from "@/components/ui/toast";
 import { useRes, warm } from "@/lib/data";
 import { errorMessage } from "@/lib/hooks";
@@ -115,6 +117,13 @@ const refresh = () => {
 
 /** Shared empties and a no-op, so stable references stay stable (W26-R15). */
 const EMPTY_THREADS: Thread[] = [];
+
+/** Who asking about code goes to (components/code/about.tsx): its author, where an agent wrote it
+ * (`agent:<id>`, as its agent token pushed it); none for a person's, as on the review page. */
+function aboutOf(author: string): AboutAgent | null {
+  const id = author.startsWith("agent:") ? (author.slice("agent:".length).split(" ")[0] ?? "") : "";
+  return id ? { id, name: whoSaid(author), subagents: true, busy: false } : null;
+}
 const noop = () => {};
 
 interface FrameP {
@@ -124,6 +133,20 @@ interface FrameP {
   bar?: React.ReactNode;
   children: React.ReactNode;
   convo: React.ReactNode;
+}
+
+/**
+ * The Conversation head's agent fixes switch, where the mockup draws it (Ship's mockups plan, step
+ * 13): a repository's setting that lets agents fix code from agents' feedback. Nothing acts on it
+ * until Agents in review builds that, so it shows off and can't be turned on yet, and says why.
+ */
+function AgentFixes() {
+  return (
+    <button type="button" className="rv-switch" role="switch" aria-checked={false} disabled title="Agents fix code from agents' feedback · repository setting. Not yet: Agents in review builds it.">
+      <i aria-hidden="true" />
+      <span>agent fixes</span>
+    </button>
+  );
 }
 
 /** The two sections the Dropdown mounts, in their order: Files, then the Conversation. */
@@ -138,8 +161,9 @@ function Frame(p: FrameP) {
         {p.search && <SearchBox q={p.search.q} onQ={p.search.onQ} hits={p.search.res} onJump={p.onJump ?? (() => {})} />}
         <div className="rv-files">{p.children}</div>
       </section>
-      <section className="rv-s" aria-label="Conversation">
+      <section className="rv-s rv-s-convo" aria-label="Conversation">
         <h3 className="rv-h">Conversation</h3>
+        <AgentFixes />
         {p.convo}
       </section>
     </>
@@ -283,6 +307,7 @@ function KilnFiles({ item }: { item: ShipCommit }) {
       ),
     [key],
   );
+  const about = React.useMemo(() => aboutOf(d.author), [d.author]);
   const ctx: FilesCtx = React.useMemo(
     () => ({ ops: fullOps, threads: shown, conflicts, rowsByFile, version, draft, setDraft, open: setWhole, q, linesOf, viewed }),
     [fullOps, shown, conflicts, rowsByFile, version, draft, q, linesOf, viewed],
@@ -303,17 +328,25 @@ function KilnFiles({ item }: { item: ShipCommit }) {
       search={{ res: q.trim() ? searchRes(key, version, q) : null, q, onQ: setQ }}
       onJump={jump}
       convo={
-        <Conversation ops={fullOps} linesOf={linesOf} threads={general} draft={draft?.kind === "reply" ? draft.thread : null} setDraft={(t) => setDraft(t ? { kind: "reply", thread: t } : null)}>
-          <Description author={d.author} title={d.title} body={d.summary} at={d.created_at} />
-          <ConvoBox ops={fullOps} />
+        <Conversation
+          ops={fullOps}
+          linesOf={linesOf}
+          threads={general}
+          box={<ConvoBox ops={fullOps} />}
+          draft={draft?.kind === "reply" ? draft.thread : null}
+          setDraft={(t) => setDraft(t ? { kind: "reply", thread: t } : null)}
+        >
+          <Description item={fullOps.item} author={d.author} title={d.title} body={d.summary} at={d.created_at} />
         </Conversation>
       }
     >
-      {whole ? (
-        <WholeFile file={list.find((f) => f.path === whole)!} ctx={ctx} map={map} text={blobTextRes(key, version, whole, "new")} />
-      ) : (
-        list.map((f) => <FileDiff key={f.path} file={f} ctx={ctx} map={map} meta={meta.get(f.path)} />)
-      )}
+      <AboutContext.Provider value={about}>
+        {whole ? (
+          <WholeFile file={list.find((f) => f.path === whole)!} ctx={ctx} map={map} text={blobTextRes(key, version, whole, "new")} />
+        ) : (
+          list.map((f) => <FileDiff key={f.path} file={f} ctx={ctx} map={map} meta={meta.get(f.path)} />)
+        )}
+      </AboutContext.Provider>
     </Frame>
   );
 }
@@ -386,11 +419,11 @@ function HostFiles({ item }: { item: ShipCommit }) {
           ops={fullOps}
           linesOf={linesOf}
           threads={[...convoThreads(pull), ...general]}
+          box={<ConvoBox ops={fullOps} />}
           draft={draft?.kind === "reply" ? draft.thread : null}
           setDraft={(t) => setDraft(t ? { kind: "reply", thread: t } : null)}
         >
-          <Description author={pull.author} title={pull.title} body={pull.body} at={pull.updated_at ?? undefined} />
-          <ConvoBox ops={fullOps} />
+          <Description item={fullOps.item} author={pull.author} title={pull.title} body={pull.body} at={pull.updated_at ?? undefined} />
         </Conversation>
       }
     >
@@ -470,6 +503,7 @@ function CommitFiles({ item }: { item: ShipCommit }) {
     }),
     [ops],
   );
+  const about = React.useMemo(() => aboutOf(item.author), [item.author]);
   const ctx: FilesCtx = React.useMemo(
     () => ({ ops: fullOps, threads: EMPTY_THREADS, conflicts: [], rowsByFile, version: 1, draft, setDraft, open: setWhole, q: "", linesOf }),
     [fullOps, rowsByFile, draft, linesOf],
@@ -485,11 +519,13 @@ function CommitFiles({ item }: { item: ShipCommit }) {
         </ul>
       }
     >
-      {whole ? (
-        <WholeFile file={list.find((f) => f.path === whole)!} ctx={ctx} map={map} text={commitBlobTextRes(item.repo, item.sha, whole)} />
-      ) : (
-        list.map((f) => <FileDiff key={f.path} file={f} ctx={ctx} map={map} />)
-      )}
+      <AboutContext.Provider value={about}>
+        {whole ? (
+          <WholeFile file={list.find((f) => f.path === whole)!} ctx={ctx} map={map} text={commitBlobTextRes(item.repo, item.sha, whole)} />
+        ) : (
+          list.map((f) => <FileDiff key={f.path} file={f} ctx={ctx} map={map} />)
+        )}
+      </AboutContext.Provider>
     </Frame>
   );
 }

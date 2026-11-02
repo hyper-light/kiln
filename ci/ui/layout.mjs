@@ -1,8 +1,9 @@
 // W21-AC01's two page-wide asserts (docs/ci.md), for every check to make on each page it visits:
 // no element scrolls sideways (the page, or anything in it that would scroll its content left and
-// right), and nothing is `position: fixed` but the shell's own (its skip link, its toasts, a
-// tooltip, the overlay, dialog and drawer it opens). Each is said by what the element is, at most
-// eight a kind.
+// right) but a code block, which keeps each line on one line (`[data-code-scroll]`: a comment's
+// code in Ship's Files and Conversation), and nothing is `position: fixed` but the shell's own (its
+// skip link, its toasts, a tooltip, the overlay, dialog and drawer it opens). Each is said by what
+// the element is, at most eight a kind.
 
 /** The shell's own fixed layers. */
 const SHELL = ".skip-link, .toast-viewport, [role=tooltip], .overlay, .dialog, .drawer";
@@ -20,7 +21,8 @@ export async function layoutProblems(page) {
     if (doc && doc.scrollWidth > window.innerWidth + 1) sideways.push(`the page (${doc.scrollWidth - window.innerWidth}px)`);
     for (const el of document.querySelectorAll("body *")) {
       const cs = getComputedStyle(el);
-      if ((cs.overflowX === "auto" || cs.overflowX === "scroll") && el.clientWidth > 0 && el.scrollWidth > el.clientWidth + 1) sideways.push(`${name(el)} (${el.scrollWidth - el.clientWidth}px)`);
+      if ((cs.overflowX === "auto" || cs.overflowX === "scroll") && el.clientWidth > 0 && el.scrollWidth > el.clientWidth + 1 && !el.closest("[data-code-scroll]"))
+        sideways.push(`${name(el)} (${el.scrollWidth - el.clientWidth}px)`);
       // Only what can be seen: a screen reader's live region kept off screen isn't a layer.
       const r = el.getBoundingClientRect();
       const seen = r.width > 0 && r.height > 0 && r.right > 0 && r.bottom > 0 && r.left < window.innerWidth && r.top < window.innerHeight;

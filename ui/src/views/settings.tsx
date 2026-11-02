@@ -262,7 +262,7 @@ function GrafanaGroup() {
         <SettingRow
           label="Dashboard link"
           htmlFor="st-grafana"
-          help="Open your dashboard from Metrics. Saved in this browser."
+          help="Open your dashboard from Observe › Live, beside kiln's own. Saved in this browser."
         >
           <div className="st-control-stack">
             <div className="st-control-line">

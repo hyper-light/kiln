@@ -21,6 +21,10 @@ kiln-ci = { path = "../kiln-ci" }
 kiln-http = { path = "../kiln-http" }
 # The seams kiln reaches every product through, with their simulators (docs/seams.md).
 kiln-seams = { path = "../kiln-seams" }
+kiln-obs = { path = "../kiln-obs" }
+# Seeded fast hashing for maps of what the store holds (the containers' list): already built for
+# hashbrown and serde_json.
+foldhash = "0.2.0"
 # hyper-raft's shared crates, vendored at vendor/hyper-raft at the revision Focal's bus takes (the
 # root manifest's [patch.crates-io] points each name there; docs/vendoring.md). Every vendored name
 # is pinned exactly: crates.io has unrelated crates under some of them (`quiver`, `hyper-rt`), and
@@ -45,6 +49,12 @@ bytes = "1.12.1"
 clap = { version = "4.6.7", features = ["derive", "env"] }
 futures = "0.3.34"
 glob = "0.3.4"
+# Logs collected (observe::collect): lines found, processing rules. Both already in the tree (kiln-obs).
+memchr = "2.8.3"
+regex = "1"
+# regex's own parser (in the tree with it): what the fewest bytes a pattern matches are
+# (`observe::scanner`: a text shorter than every rule's is not looked through).
+regex-syntax = "0.8"
 hex = "0.4.3"
 httparse = "1.10.1"
 mime_guess = "2.0.5"
@@ -105,12 +115,14 @@ str0m = { version = "0.24.1", default-features = false, features = ["aws-lc-rs"]
 # Unix (Linux and macOS): signals and process groups, pidfd exit waits, PTY masters on readiness.
 [target.'cfg(unix)'.dependencies]
 nix = { version = "0.31.3", features = ["signal", "process", "fs", "user", "term", "feature", "hostname", "net", "socket", "uio", "mount", "reboot", "sched", "time"] }
-rustix = { version = "1.1", features = ["process", "termios", "net"] }
+rustix = { version = "1.1", features = ["process", "termios", "net", "thread"] }
 filedescriptor = "0.8"
 
-# Windows: process trees as job objects.
+# Windows: process trees as job objects; a file's identity (its volume and file index), which the
+# log collector knows files by.
 [target.'cfg(windows)'.dependencies]
 command-group = "5.0.1"
+winapi-util = "0.1.11"
 
 [lints]
 workspace = true
@@ -126,6 +138,52 @@ tempfile = "3.27.0"
 # hyper-durable's RamStore, for sync's tests alone: kiln's copy compiles it only where a test asks
 # (vendor/hyper-raft/UPSTREAM.md).
 hyper-durable = { version = "=0.1.0", features = ["test-store"] }
+# Allocations and page faults counted (benches/collect.rs), as kiln-obs's benches count them.
+hyper-measure = "=0.1.0"
+
+[[bench]]
+name = "collect"
+harness = false
+
+[[bench]]
+name = "issues"
+harness = false
+
+[[bench]]
+name = "scanner"
+harness = false
+
+[[bench]]
+name = "dora"
+harness = false
+
+[[bench]]
+name = "catalog"
+harness = false
+
+[[bench]]
+name = "grok"
+harness = false
+
+[[bench]]
+name = "incidents"
+harness = false
+
+[[bench]]
+name = "notebooks"
+harness = false
+
+[[bench]]
+name = "containers"
+harness = false
+
+[[bench]]
+name = "indexes"
+harness = false
+
+[[bench]]
+name = "profiles"
+harness = false
 
 # What a session's inbox adds to a send (CP-T3.2, AC-T3.2.3): `cargo bench -p kiln --bench send_path`.
 [[bench]]

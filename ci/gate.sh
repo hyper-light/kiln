@@ -16,7 +16,9 @@
 # runs uncapped at nice 19, and says so.
 #
 # While it runs it watches the machine's own services: system.slice's I/O pressure ("full" avg10)
-# over 30, or --guard-url answering in over 3 s, three checks running (10 s apart), stops it.
+# over 30, or --guard-url answering in over 3 s, three checks running (10 s apart), stops it. The
+# containers its own tests start in Docker are left out: their scopes are in system.slice too, and
+# tests/pools.rs' burst of them alone took it past 30 (fedora and adacachy, 2026-10-28).
 #
 # Its build is its own: a target dir and TMPDIR under ${XDG_CACHE_HOME:-~/.cache}/kiln-gate/<tree>,
 # and git's environment cleared, with an empty global config of its own (writable: tests write it)
@@ -142,7 +144,7 @@ else
   echo "caps: $caps would apply, but this machine has no systemd user manager: it runs uncapped, at nice 19"
 fi
 echo "cargo: -j $jobs, $threads test threads"
-echo "guard: system.slice I/O pressure (full avg10) over 30${guard_url:+, or $guard_url over 3 s}, three checks running, stops it"
+echo "guard: system.slice I/O pressure (full avg10) over 30, its own tests' containers left out${guard_url:+, or $guard_url over 3 s}, three checks running, stops it"
 echo "steps:"
 n=0
 for s in "${steps[@]}"; do n=$((n + 1)); echo "  $n. $s"; done
@@ -164,13 +166,37 @@ systemd-run --user --unit "$unit" --collect --wait --pipe --quiet --working-dire
 pid=$!
 stop() { systemctl --user stop "$unit" 2> /dev/null || true; }
 trap 'stop; exit 143' TERM INT HUP
+# A cgroup's I/O pressure: its "full" avg10.
+pressure() { awk '/^full/ { split($2, a, "="); print a[2] }' "$1/io.pressure" 2> /dev/null || true; }
+# The Docker scopes of the containers this gate's tests made. A test's kiln server labels all it
+# makes kiln.runner-work, the start of the sha256 of its runner's work folder
+# (runner::docker::owner_label), and those folders are under this gate's TMPDIR or its target's tmp.
+own_scopes() {
+  command -v docker > /dev/null || return 0
+  local works
+  works=$(find "$base/tmp" "$target_dir/tmp" -maxdepth 3 -type d -name work 2> /dev/null | while read -r d; do printf '%s' "$d" | { sha256sum 2> /dev/null || shasum -a 256; } | cut -c1-16; done || true)
+  [ -n "$works" ] || return 0
+  docker ps --no-trunc --filter label=kiln.runner-work --format '{{.ID}} {{.Label "kiln.runner-work"}}' 2> /dev/null | while read -r id h; do
+    if printf '%s\n' "$works" | grep -qxF -- "$h"; then echo "docker-$id.scope"; fi
+  done || true
+  return 0
+}
 bad=0 why=''
 while kill -0 "$pid" 2> /dev/null; do
   sleep 10
   strained=''
   if [ -r /sys/fs/cgroup/system.slice/io.pressure ]; then
-    full=$(awk '/^full/ { split($2, a, "="); print a[2] }' /sys/fs/cgroup/system.slice/io.pressure)
-    if awk -v f="$full" 'BEGIN { exit !(f > 30) }'; then strained="system services' I/O pressure $full"; fi
+    full=$(pressure /sys/fs/cgroup/system.slice)
+    if awk -v f="$full" 'BEGIN { exit !(f > 30) }'; then
+      own=$(own_scopes)
+      if [ -n "$own" ]; then
+        # The services' strain but for this gate's own containers: the worst any other cgroup shows.
+        rest=$(for d in /sys/fs/cgroup/system.slice/*/; do n=$(basename "$d"); printf '%s\n' "$own" | grep -qxF -- "$n" || pressure "$d"; done | sort -rn | head -1 || true)
+        echo "ci/gate.sh: system.slice's I/O pressure $full is partly its own tests' $(printf '%s\n' "$own" | grep -c .) containers; the worst of the rest is ${rest:-0}"
+        full=${rest:-0}
+      fi
+      if awk -v f="$full" 'BEGIN { exit !(f > 30) }'; then strained="system services' I/O pressure $full"; fi
+    fi
   fi
   if [ -n "$guard_url" ]; then
     took=$(curl -s -o /dev/null -w '%{time_total}' --max-time 10 "$guard_url" || echo 10)

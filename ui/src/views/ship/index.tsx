@@ -4,18 +4,18 @@
  * its commits: its tip's row carries its review, the rest fold under it. Each row is Ship's own:
  * the commit, its stand and the one line saying what it's doing, its journey strip, who and when,
  * its paired actions, and the dropdown (Files with the Conversation, Output, Jobs, Lanes). The
- * facets narrow by host and kind; Review is the lens on changes. Data through Suspense, changes
- * through the endpoints the row names; no effects.
+ * facets narrow by host and kind, and a change's kind is how to see only changes: no toggle of its
+ * own (Ada, 2026-10-28). Data through Suspense, changes through the endpoints the row names; no
+ * effects.
  */
 import * as React from "react";
 import { ChevronDown } from "lucide-react";
-import { shipApi, type ShipAction, type ShipCommit, type ShipQuery } from "@/api/ship";
-import { Button } from "@/components/ui/button";
+import { shipApi, type ShipAction, type ShipCommit, type ShipPace, type ShipQuery } from "@/api/ship";
+import { Button, buttonVariants } from "@/components/ui/button";
 import { FacetBox, type Chosen } from "@/components/ui/facet-box";
-import { Loadable } from "@/components/ui/loading";
+import { Loadable, Loading } from "@/components/ui/loading";
 import { EmptyState, PageIntro } from "@/components/ui/misc";
-import { JourneyStrip } from "@/components/ui/status-glyph";
-import { Segmented } from "@/components/ui/tabs";
+import { JourneyStrip, StatusGlyph } from "@/components/ui/status-glyph";
 import { toast } from "@/components/ui/toast";
 import { errorMessage } from "@/lib/hooks";
 import { Link, useNavigate, useSearchParams } from "@/lib/router";
@@ -25,14 +25,20 @@ import { ACTION_WORD, FACET_KEYS, fold, keyOf, HOSTS, KINDS, optionsOf, order, p
 import "./ship.css";
 import { ShipViews } from "./views";
 import { Stands } from "@/views/harness/stands";
+import { Shimmer } from "@/views/harness/signals";
+import { whoSaid } from "@/api/review";
 import { SelectField } from "@/components/ui/misc";
 import { useGlide, useListHold } from "@/views/harness/list-tools";
-import { firstStage, JobCards } from "./jobs";
+import { JobCards } from "./jobs";
 import { ShipOutput } from "./output";
 import { ReviewFiles, ShipLanes, warmReview } from "./review";
+import { SectionHead } from "./head";
 import { counted } from "./review/perf";
 
 const LIMIT = 100;
+
+/** The stands under way, whose word shimmers as Mission control's working agents' do (f-ship's). */
+const UNDER_WAY = new Set(["landing", "checking", "building", "shipping", "replanting"]);
 
 export default function ShipPage() {
   return (
@@ -49,12 +55,11 @@ export default function ShipPage() {
 
 function ShipList() {
   const [params, setParams] = useSearchParams();
-  const lens = params.get("lens") === "review" ? "review" : "all";
   const sort = sortOf(params.get("sort"));
   const chosen: Chosen = Object.fromEntries(FACET_KEYS.map((k): [string, string[]] => [k, (params.get(k) ?? "").split(",").filter(Boolean)]).filter(([, v]) => v.length > 0));
   // One value of a facet is the server's to narrow by; several are narrowed here.
   const one = (k: string) => (chosen[k]?.length === 1 ? chosen[k][0] : undefined);
-  const q: ShipQuery = { repo: one("repo"), host: one("host"), kind: one("kind"), lens: lens === "review" ? "review" : undefined, limit: LIMIT };
+  const q: ShipQuery = { repo: one("repo"), host: one("host"), kind: one("kind"), limit: LIMIT };
   const key = `ship/commits/${JSON.stringify(q)}`;
   // Every stage it shows moves on its own event: a run or a leg (checks, build), review, comments and
   // conflicts, an app's sync and a rollout (staging, production), a runner's update (replant).
@@ -87,9 +92,9 @@ function ShipList() {
   const items = order(fold(commits, opened), sort);
   const hold = useListHold(opened.size > 0);
   const { ref: holdRef, ...holdProps } = hold.bind;
-  // Your own change of view (lens, sort, filter) applies at once; only what arrives waits.
-  const view = `${lens}|${sort}|${JSON.stringify(chosen)}`;
-  const [kept] = React.useState(() => ({ order: [] as string[], last: new Map<string, { it: Item; sig: string }>(), view }));
+  // Your own change of view (sort, filter) applies at once; only what arrives waits.
+  const view = `${sort}|${JSON.stringify(chosen)}`;
+  const [kept] = React.useState(() => ({ order: [] as string[], last: new Map<string, { it: Item; sig: string }>(), view, pace: undefined as ShipPace | undefined }));
   // What a refetch brings that reads the same isn't a change (W26-R15): the item keeps its last
   // reference, so its memoized row doesn't render again; a changed item keeps its key and is
   // patched in place, never remounted.
@@ -107,6 +112,9 @@ function ShipList() {
   }
   const shown = hold.held ? kept.order.flatMap((k) => kept.last.get(k)?.it ?? []) : stable;
   if (!hold.held) kept.last = new Map(stable.map((it) => [keyOf(it), { it, sig: JSON.stringify(it) }]));
+  // The pace line holds with the rows: what it counts waits for the release too, so nothing beside
+  // the row you're reading moves (plan 01a1856fe81375b1bd1d1d86f270a45b, step 5).
+  if (!hold.held || kept.pace === undefined) kept.pace = page.data.pace;
   const glide = useGlide(shown.map(keyOf).join("\n"));
 
   const set = (k: string, v: string | null) =>
@@ -159,19 +167,11 @@ function ShipList() {
             )
           }
         />
-        <Segmented
-          label="Lens"
-          value={lens}
-          onChange={(v) => set("lens", v === "review" ? "review" : null)}
-          options={[
-            { value: "all", label: "All" },
-            { value: "review", label: "Review" },
-          ]}
-        />
         <SelectField className="ship-sort" label="Sort commits" hideLabel value={sort} onChange={(v) => set("sort", v === "needs" ? null : v)} options={SORTS} />
       </div>
+      <Pace pace={kept.pace} />
       {items.length === 0 ? (
-        <EmptyState title={lens === "review" ? "No changes under review" : "No commits yet"}>Commits show here from their first push: their runs, their review, their way to production.</EmptyState>
+        <EmptyState title="No commits yet">Commits show here from their first push: their runs, their review, their way to production.</EmptyState>
       ) : (
         <ul
           className="ship-list"
@@ -191,6 +191,46 @@ function ShipList() {
   );
 }
 
+/**
+ * The pace line under the list bar, as f-ship draws it (plan 01a1856fe81375b1bd1d1d86f270a45b, step
+ * 5): what's in flight and the agents behind it, what each environment runs and how far production
+ * is behind, and the runners on production's commit. One line, scrolling sideways when it doesn't
+ * fit; it keeps its height when the server sends none.
+ */
+function Pace({ pace }: { pace?: ShipPace }) {
+  const repos = new Set(pace?.envs.map((e) => e.repo) ?? []);
+  return (
+    <p className="ship-pace" aria-label="Pace">
+      {pace ? (
+        <>
+          <span>
+            <b>{pace.in_flight}</b> in flight · <b>{pace.agents}</b> agent{pace.agents === 1 ? "" : "s"}
+          </span>
+          {pace.envs.map((e) => (
+            <span key={`${e.repo} ${e.environment}`}>
+              {repos.size > 1 ? `${e.repo.split("/").pop() ?? e.repo} ` : ""}
+              {e.environment} <span className="ship-pace__sha">{e.short}</span>
+              {e.behind !== null && (
+                <>
+                  {" "}
+                  · <b>{e.behind}</b> behind
+                </>
+              )}
+            </span>
+          ))}
+          {pace.runners && (
+            <span>
+              runners <b>{pace.runners.on}</b>/{pace.runners.of}
+            </span>
+          )}
+        </>
+      ) : (
+        "\u00a0"
+      )}
+    </p>
+  );
+}
+
 const Row = React.memo(
   function Row({ item, reload, open, onOpen }: { item: Item; reload: () => void; open: boolean; onOpen: (open: boolean) => void }) {
     counted("ship/row");
@@ -201,12 +241,8 @@ const Row = React.memo(
     // One environment flag: production when it runs there, else the first it runs in.
     const env = c.environments?.find((e) => e.production) ?? c.environments?.[0];
     const n = item.riders.length;
-    const what =
-      item.folds === "rides"
-        ? `${n} commit${n === 1 ? "" : "s"} riding with it`
-        : item.folds === "shipped"
-          ? `${n} more shipped`
-          : `${n} more commit${n === 1 ? "" : "s"} of ${c.change?.name ?? "this change"}`;
+    // Riders say themselves as f-ship does (below); the rest of a fold says what it holds.
+    const what = item.folds === "shipped" ? `${n} more shipped` : `${n} more commit${n === 1 ? "" : "s"} of ${c.change?.name ?? "this change"}`;
     return (
       // Its review starts loading as the pointer comes onto the row or the focus into it (W26-R15).
       <li className="ship-row" data-stand={c.stand} data-glide={keyOf(item)} onPointerEnter={() => warmReview(c)} onFocus={() => warmReview(c)}>
@@ -215,17 +251,23 @@ const Row = React.memo(
             <span className="ship-name">{c.message || c.change?.title || c.short}</span>
             <span className="ship-line">
               <span className="ship-stand" data-stand={c.stand}>
-                {standWord(c.stand)}
+                <Shimmer on={UNDER_WAY.has(c.stand)} flow={keyOf(item)}>
+                  {standWord(c.stand)}
+                </Shimmer>
               </span>
               <span className="ship-text">{c.line}</span>
             </span>
           </button>
           <span className="ship-pips">
-            <JourneyStrip pips={strip(c.pips)} labels={false} />
+            <JourneyStrip pips={strip(c.pips)} />
           </span>
           <span className="ship-metas">
             <span>
-              {c.author} ·{" "}
+              <span className="ship-who">
+                <StatusGlyph state={c.author.startsWith("agent:") ? "agent" : "person"} size={12} />
+                <span>{whoSaid(c.author)}</span>
+              </span>{" "}
+              ·{" "}
               <span className="ship-ago">
                 <RelTime ts={c.at} />
               </span>
@@ -238,7 +280,8 @@ const Row = React.memo(
                 </span>
               ))}
               {env && (
-                <span className="ship-env" data-prod={env.production || undefined}>
+                <span className="ship-env" data-env={env.production ? "production" : "staging"}>
+                  <StatusGlyph state="flag" size={12} />
                   {env.environment}
                 </span>
               )}
@@ -259,7 +302,26 @@ const Row = React.memo(
         </div>
         {item.riders.length > 0 && (
           <button type="button" className="ship-fold" aria-expanded={riders} onClick={() => setRiders(!riders)}>
-            {riders ? "Hide" : "Show"} {what}
+            {item.folds === "rides" ? (
+              // f-ship's riders: how many ride with the approval, and the first of them.
+              <>
+                <StatusGlyph state="queued" size={14} />
+                <span>
+                  +{n} riding ·{" "}
+                  <span className="ship-fold__sha">
+                    {item.riders
+                      .slice(0, 3)
+                      .map((r) => r.short)
+                      .join(" ")}
+                  </span>
+                  {n > 3 ? " …" : ""}
+                </span>
+              </>
+            ) : (
+              <span>
+                {riders ? "Hide" : "Show"} {what}
+              </span>
+            )}
           </button>
         )}
         {riders && (
@@ -375,11 +437,17 @@ function showFiles(open: HTMLElement): (() => void) | undefined {
 
 /** An item's dropdown, in its order: Files (with the Conversation), Output, Jobs, Lanes. */
 function Dropdown({ commit, reveal }: { commit: ShipCommit; reveal: number }) {
-  // The picked job card: yours once you click one, else the cards' rule; Output shows its job.
-  const [stage, setStage] = React.useState<string | null>(null);
-  const shown = stage ?? firstStage(commit);
+  // The picked job (its stage and lane): yours once you click one, else the cards' rule; Output shows it.
+  const [picked, setPicked] = React.useState<string | null>(null);
   // A Diff press (reveal counts them) brings Files into view; opening the row any other way doesn't.
-  const files = React.useCallback((el: HTMLDivElement | null) => (el && reveal > 0 ? showFiles(el) : undefined), [reveal]);
+  const root = React.useRef<HTMLDivElement | null>(null);
+  const files = React.useCallback(
+    (el: HTMLDivElement | null) => {
+      root.current = el;
+      return el && reveal > 0 ? showFiles(el) : undefined;
+    },
+    [reveal],
+  );
   return (
     <div className="ship-open" ref={files}>
       {/* Dropdown boundary agreed with the Ship agent 01a1748c, 2026-10-26 20:28 PDT (NOTES.md):
@@ -388,32 +456,46 @@ function Dropdown({ commit, reveal }: { commit: ShipCommit; reveal: number }) {
       <Loadable label="Loading its review">
         <ReviewFiles item={commit} />
         <section aria-label="Output" className="ship-sec">
-          <h3>Output</h3>
+          <SectionHead label="Output" />
           <Loadable label="Loading the output" className="ship-output-slot">
-            <ShipOutput commit={commit} stage={shown} />
+            <ShipOutput commit={commit} picked={picked} />
           </Loadable>
         </section>
         <section aria-label="Jobs" className="ship-sec">
-          <h3>Jobs</h3>
-          <JobCards commit={commit} onPick={setStage} />
-          <ul>
-            {(commit.runs ?? []).map((r) => (
-              <li key={r.id}>
-                <Link to={`/runs/${r.id}`}>{r.pipeline}</Link>
-              </li>
-            ))}
-          </ul>
+          <JobCards commit={commit} picked={picked} onPick={setPicked} />
         </section>
         <section aria-label="Lanes" className="ship-sec">
-          <h3>Lanes</h3>
-          <Loadable label="Loading the lanes" className="ship-lanes-slot">
+          <Loadable
+            label="Loading the lanes"
+            fallback={
+              <>
+                <SectionHead label="Lanes" />
+                <Loading label="Loading the lanes" block className="ship-lanes-slot" />
+              </>
+            }
+          >
             <ShipLanes commit={commit} />
           </Loadable>
-          {commit.environments?.length ? <p>Runs in {commit.environments.map((e) => e.environment).join(", ")}.</p> : <p>Not in an environment yet.</p>}
         </section>
-        <p className="ship-open__page">
-          <Link to={`/ship/${commit.repo}/${commit.sha}`}>Commit {commit.short}</Link>, its stages and trace on a page of its own
-        </p>
+        {/* f-ship's foot (plan 01a1856fe81375b1bd1d1d86f270a45b, step 11): the commit's runs (on its
+            page), its Files (here), its page. */}
+        <nav className="ship-foot" aria-label={`${commit.short}'s pages`}>
+          <Link className={buttonVariants({ variant: "secondary", size: "xs" })} to={`/ship/${commit.repo}/${commit.sha}#runs`}>
+            Runs
+          </Link>
+          <Button
+            variant="secondary"
+            size="xs"
+            onClick={() => {
+              if (root.current) showFiles(root.current);
+            }}
+          >
+            Diff
+          </Button>
+          <Link className={`${buttonVariants({ variant: "secondary", size: "xs" })} ship-foot__page`} to={`/ship/${commit.repo}/${commit.sha}`}>
+            Commit ↗
+          </Link>
+        </nav>
       </Loadable>
     </div>
   );

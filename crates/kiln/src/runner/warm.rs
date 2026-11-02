@@ -181,10 +181,17 @@ fn try_lock_file(path: &Path) -> Option<File> {
     Some(f)
 }
 
-/// Whether a leg, of this process or another, holds `dir`'s lease.
+/// Whether a leg, of this process or another, holds `dir`'s lease. A probe that takes it lets go
+/// at once, as a lease does (`Lease`'s drop).
 fn held(dir: &Path) -> bool {
     let Ok(f) = File::open(lease_path(dir)) else { return false };
-    matches!(f.try_lock(), Err(std::fs::TryLockError::WouldBlock))
+    match f.try_lock() {
+        Ok(()) => {
+            let _ = f.unlock();
+            false
+        }
+        Err(e) => matches!(e, std::fs::TryLockError::WouldBlock),
+    }
 }
 
 fn remove_any(p: &Path) -> std::io::Result<()> {
@@ -476,6 +483,15 @@ pub struct Lease {
     name: String,
     quarantine: bool,
     _lock: File,
+}
+
+impl Drop for Lease {
+    /// Its lock let go of outright (W24-R18): closing it alone doesn't while a child of this
+    /// process holds a copy (a fork's descriptors live until its exec), and the lane's next leg
+    /// would find the slot leased and start cold.
+    fn drop(&mut self) {
+        let _ = self._lock.unlock();
+    }
 }
 
 /// What a lease gave.
@@ -1264,6 +1280,27 @@ mod tests {
         // The lane's next leg starts from that checkout: warm.
         let next = warm(lease_with(&work, &ask(&one, true), Clones::No, &ROOMY))?;
         assert!(next.warm, "{}", next.said);
+        release(&work, next);
+        Ok(())
+    }
+
+    /// W24-R18: a slot released is the lane's next leg's at once, though a copy of its lock's
+    /// descriptor lives on, as one does in a child this process forks until its exec: in kiln's lib
+    /// run on fedora (2026-10-28) the next lease found the slot leased and started cold.
+    #[test]
+    fn w24_r18_a_released_slot_is_free_though_its_lock_was_copied() -> anyhow::Result<()> {
+        let d = tempfile::tempdir()?;
+        let src = d.path().join("src");
+        std::fs::create_dir_all(&src)?;
+        let (one, _) = source(&src)?;
+        let work = d.path().join("work");
+        let first = warm(lease_with(&work, &ask(&one, true), Clones::No, &ROOMY))?;
+        check_out(&first.dir.join("app"), &one, &[], Some(&src))?;
+        let copy = first._lock.try_clone()?;
+        release(&work, first);
+        let next = warm(lease_with(&work, &ask(&one, true), Clones::No, &ROOMY))?;
+        assert!(next.warm, "{}", next.said);
+        drop(copy);
         release(&work, next);
         Ok(())
     }

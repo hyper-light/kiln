@@ -923,7 +923,7 @@ impl Acp {
         core.touch_state();
     }
 
-    fn next(&mut self, core: &mut Core) {
+    pub(crate) fn next(&mut self, core: &mut Core) {
         if self.account_refresh(core) {
             return;
         }

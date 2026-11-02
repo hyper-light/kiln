@@ -1,0 +1,7 @@
+logs.3_C.zst 179250 089b322e2239c7a3
+logs.19.zst 179250 089b322e2239c7a3
+logs.fast5.zst 179250 089b322e2239c7a3
+mixed.3.zst 34608 fde444837c9e8bd1
+mixed.19_C.zst 34608 fde444837c9e8bd1
+tiny.3.zst 16 faf2099c64287d5f
+empty.3_C.zst 0 ef46db3751d8e999

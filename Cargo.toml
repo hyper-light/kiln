@@ -26,6 +26,12 @@ indexing_slicing = "deny"
 exit = "deny"
 type_complexity = "allow"
 
+# Debug builds keep line tables (backtraces say file and line) but not full debug info: kiln's
+# test binaries were 1.3-2 GB each, about 130 GB written per `cargo test --workspace`, and several
+# gates at once stalled a whole file system's syncs (docs/headroom.md, 2026-10-26).
+[profile.dev]
+debug = "line-tables-only"
+
 # Debug builds hash with optimized SHA-256. A server hashes its own (debug: over a GiB) binary as
 # it starts, on one of its shards, and the content store hashes every chunk: unoptimized, that alone
 # kept test servers from answering within a minute on a loaded machine.
@@ -37,6 +43,13 @@ opt-level = 3
 # (every test that opens a store, CP-M2's test timings among them).
 [profile.dev.package.libsqlite3-sys]
 opt-level = 2
+
+# kiln's own crate in debug and test builds keeps line tables only (backtraces keep their files and
+# lines): with full debug info its library is one archive past 4 GiB (5.4 GB on Windows with observe
+# merged), and the COFF archive format MSVC's linker reads addresses members with 32 bits, so it
+# refuses the library (LNK4003) and nothing of kiln links there.
+[profile.dev.package.kiln]
+debug = "line-tables-only"
 
 [profile.release]
 lto = "thin"
@@ -53,6 +66,7 @@ hyper-block = { path = "vendor/hyper-raft/crates/hyper-block" }
 hyper-durable = { path = "vendor/hyper-raft/crates/hyper-durable" }
 hyper-liveness = { path = "vendor/hyper-raft/crates/hyper-liveness" }
 hyper-log = { path = "vendor/hyper-raft/crates/hyper-log" }
+hyper-measure = { path = "vendor/hyper-raft/crates/hyper-measure" }
 hyper-quic = { path = "vendor/hyper-raft/crates/hyper-quic" }
 hyper-raft = { path = "vendor/hyper-raft/crates/hyper-raft" }
 hyper-rt = { path = "vendor/hyper-raft/crates/hyper-rt" }

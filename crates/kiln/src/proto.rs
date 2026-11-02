@@ -23,6 +23,9 @@ pub const LANE_SYNC: u32 = 3;
 /// Reach's lane (`crate::reach`): links between runners, relayed by the server. Interactive class:
 /// a remote command's output must not queue behind job logs.
 pub const LANE_REACH: u32 = 4;
+/// Observe's lane (`crate::observe`): the observe group's messages and writes, a queue of their own
+/// so replication never sheds a job's, a terminal's or sync's frames, nor waits behind them.
+pub const LANE_OBSERVE: u32 = 5;
 /// The conversation feed's lane (`crate::convo::feed`): a runner's store sent to the server's, in
 /// bulk frames, never in the way of a job's or a terminal's (lane 5 is observe's).
 pub const LANE_CONVO: u32 = 6;
@@ -249,6 +252,16 @@ pub enum AgentMsg {
     /// runs); the server answers with [`ServerMsg::Identity`]. Only to a server announcing
     /// [`CAP_IDENTITY`]. Appended last: postcard encodes variants by index.
     Identity { json: String },
+    /// Observe (`crate::observe`, on [`LANE_OBSERVE`]): `json` a [`crate::observe::wire::Msg`],
+    /// `bytes` what it carries (a raft message's, or a write's entry; empty when none). Only from
+    /// runners announcing [`CAP_OBSERVE`]. Appended last, after main's (deployed first): postcard
+    /// encodes variants by index.
+    Observe { json: String, bytes: Vec<u8> },
+    /// This machine's headroom (JSON [`crate::headroom::Status`], docs/headroom.md): its targets'
+    /// latencies, its window, what waits and what is paced. Sent on every (re)connect and when what
+    /// it decides changes; only to a server announcing [`CAP_HEADROOM`]. Appended last: postcard
+    /// encodes variants by index.
+    HeadroomStatus { json: String },
 }
 
 /// Frames a QUIC layer let go of one lane, for one reason ([`AgentMsg::NetDrops`]).
@@ -273,6 +286,9 @@ pub const CAP_DIRS: u32 = 4;
 pub const CAP_TAKEOVER_STOP: u32 = 8;
 /// [`AgentMsg::Build`] capability: the runner syncs repos ([`ServerMsg::Sync`], `crate::sync`).
 pub const CAP_SYNC: u32 = 64;
+/// [`AgentMsg::Build`] capability: the runner replicates the observe group and writes into it
+/// ([`ServerMsg::Observe`], `crate::observe`).
+pub const CAP_OBSERVE: u32 = 128;
 /// [`AgentMsg::Build`] capability: the runner runs a front door ([`ServerMsg::FrontDoor`]: DNS for
 /// a domain, HTTPS in front of the server, a `.local` name) and reports it with
 /// [`AgentMsg::FrontDoorStatus`].
@@ -395,6 +411,17 @@ pub const CAP_AGENT_LIMIT: u64 = 1 << 37;
 /// that says it asks for certificates for keys it makes and keeps ([`AgentMsg::Identity`]); a
 /// server that says it issues them ([`ServerMsg::Identity`]).
 pub const CAP_IDENTITY: u64 = 1 << 38;
+
+/// [`AgentMsg::Caps`] and [`ServerMsg::Caps`] capability: headroom (docs/headroom.md). A runner
+/// that says it keeps its machine's headroom from settings the server sends
+/// ([`ServerMsg::Headroom`]) and reports it ([`AgentMsg::HeadroomStatus`]); a server that says it
+/// takes that.
+pub const CAP_HEADROOM: u64 = 1 << 39;
+
+/// [`ServerMsg::Caps`] capability: the server takes a session's changeset as what changed in it
+/// (`crate::harness::core::Update::ChangesPatch`), merged into its copy, so a runner sends the files
+/// an agent touched rather than the whole changeset each time. Without it, a runner sends it whole.
+pub const CAP_CHANGES_PATCH: u64 = 1 << 40;
 
 /// What an [`AgentMsg::Identity`] asks for: a certificate for the key of `csr`, as `kind` says.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
@@ -675,6 +702,14 @@ pub enum ServerMsg {
     /// docs/ci.md W27-R01). Only to runners announcing [`CAP_IDENTITY`]. Appended last: postcard
     /// encodes variants by index.
     Identity { json: String },
+    /// Observe (`crate::observe`, on [`LANE_OBSERVE`]): as [`AgentMsg::Observe`]. Only to runners
+    /// announcing [`CAP_OBSERVE`]. Appended last, after main's (deployed first): postcard encodes
+    /// variants by index.
+    Observe { json: String, bytes: Vec<u8> },
+    /// This machine's headroom settings (JSON [`crate::headroom::Push`]): applied at once and kept
+    /// for the runner's next start. Only to runners announcing [`CAP_HEADROOM`]. Appended last:
+    /// postcard encodes variants by index.
+    Headroom { json: String },
 }
 
 /// What the server's copy of one agent session has of its events, said in digests
@@ -1006,6 +1041,29 @@ mod tests {
         Ok(())
     }
 
+    /// Headroom (docs/headroom.md) comes after identities and observe, appended before it, and its
+    /// bit is a new one: none reads another's messages as its own.
+    #[test]
+    fn headroom_is_appended_after_observe() -> anyhow::Result<()> {
+        let agent = encode(&AgentMsg::Observe { json: String::new(), bytes: Vec::new() })?;
+        let server = encode(&ServerMsg::Observe { json: String::new(), bytes: Vec::new() })?;
+        let (a, s) = (AgentMsg::HeadroomStatus { json: "{}".into() }, ServerMsg::Headroom { json: "{}".into() });
+        let (ab, sb) = (encode(&a)?, encode(&s)?);
+        assert_eq!(ab.first().copied(), agent.first().map(|i| i + 1), "AgentMsg::HeadroomStatus comes right after Observe");
+        assert_eq!(sb.first().copied(), server.first().map(|i| i + 1), "ServerMsg::Headroom comes right after Observe");
+        assert_eq!((decode::<AgentMsg>(&ab)?, decode::<ServerMsg>(&sb)?), (a, s));
+        assert!(CAP_HEADROOM.is_power_of_two() && CAP_HEADROOM == 1 << 39 && CAP_HEADROOM & (CAP_WIRE | CAP_NET_DROPS | CAP_INBOX | CAP_HANDOVER | CAP_WORK | CAP_AGENT_LIMIT | CAP_IDENTITY) == 0);
+        Ok(())
+    }
+
+    /// A server that takes changesets as patches says so with a bit of its own: a runner never
+    /// takes another capability for it and sends a server patches it can't read.
+    #[test]
+    fn the_changes_patch_bit_is_a_new_one() {
+        let before = CAP_WIRE | CAP_NET_DROPS | CAP_INBOX | CAP_HANDOVER | CAP_WORK | CAP_AGENT_LIMIT | CAP_IDENTITY | CAP_HEADROOM;
+        assert!(CAP_CHANGES_PATCH.is_power_of_two() && CAP_CHANGES_PATCH == 1 << 40 && CAP_CHANGES_PATCH & before == 0);
+    }
+
     #[test]
     fn the_cluster_group_is_appended_after_the_channel() -> anyhow::Result<()> {
         // After `Wire` in both (AgentMsg 46, ServerMsg 54), so a peer from before P2 skips it.
@@ -1315,6 +1373,57 @@ mod tests {
         assert_eq!(b.first().copied(), last_agent.first().map(|n| n + 1), "AgentMsg::Undeployed comes right after Executor");
         assert_eq!(decode::<AgentMsg>(&b)?, said);
         assert!(CAP_UNDEPLOY.is_power_of_two() && CAP_UNDEPLOY > CAP_RECEIVED);
+        Ok(())
+    }
+
+    #[test]
+    fn observe_messages_are_appended_after_every_older_variant() -> anyhow::Result<()> {
+        // Right after main's last (deployed first): a machine's limit on agents at work, each way.
+        let last_server = encode(&ServerMsg::Identity { json: "{}".into() })?;
+        let s = ServerMsg::Observe { json: "{}".into(), bytes: vec![1, 2] };
+        let b = encode(&s)?;
+        assert_eq!(b.first().copied(), last_server.first().map(|n| n + 1), "ServerMsg::Observe comes right after Identity");
+        assert_eq!(decode::<ServerMsg>(&b)?, s);
+        let last_agent = encode(&AgentMsg::Identity { json: "{}".into() })?;
+        let a = AgentMsg::Observe { json: "{}".into(), bytes: vec![3] };
+        let b = encode(&a)?;
+        assert_eq!(b.first().copied(), last_agent.first().map(|n| n + 1), "AgentMsg::Observe comes right after Identity");
+        assert_eq!(decode::<AgentMsg>(&b)?, a);
+        let every = [
+            CAP_UPGRADE,
+            CAP_TAKEOVER,
+            CAP_DIRS,
+            CAP_TAKEOVER_STOP,
+            CAP_SYNC,
+            CAP_FRONT_DOOR,
+            CAP_OUTPOST,
+            CAP_REPOS,
+            CAP_UPDATES,
+            CAP_BLUE_GREEN,
+            CAP_CI2,
+            CAP_ACTIONS,
+            CAP_DOCKER,
+            CAP_FIRECRACKER,
+            CAP_SHARDS,
+            CAP_FACTS,
+            CAP_JOB_TTY,
+            CAP_DOCKER_ROOTLESS,
+            CAP_REACH,
+            CAP_CONVO,
+            CAP_DOCTOR,
+            CAP_FILES,
+            CAP_STREAM,
+            CAP_PREVIEW,
+            CAP_PORTS,
+            CAP_ENGINES,
+            CAP_WORKSPACE,
+            CAP_POOLS,
+            CAP_RECEIVED,
+            CAP_UNDEPLOY,
+            CAP_CLUSTER,
+        ];
+        assert!(CAP_OBSERVE.is_power_of_two() && every.iter().all(|c| c & CAP_OBSERVE == 0), "CAP_OBSERVE is a bit of its own");
+        const { assert!(LANE_OBSERVE != LANE_CONVO && LANE_OBSERVE != LANE_FILES && LANE_OBSERVE != LANE_STREAM && LANE_OBSERVE != LANE_PORTS) };
         Ok(())
     }
 

@@ -1,7 +1,8 @@
 //! `kiln reach mcp`: kiln's MCP server for the agents kiln starts on a runner (`docs/reach.md` §7,
 //! docs/access.md), over stdio, talking to the runner's reach socket. Every harness that takes MCP
 //! servers gets it as `kiln`: Claude Code through `--mcp-config`, Codex through `-c mcp_servers.*`,
-//! ACP agents through their session's `mcpServers`.
+//! ACP agents through their session's `mcpServers`, Antigravity through its own config (`agy mcp
+//! add`, once for every session), each session's identity in agy's environment.
 //!
 //! - `code_run`: a JavaScript program against kiln, in the bounded QuickJS sandbox
 //!   ([`crate::mcp::code`]) here on the runner. `kiln.machines.*` run commands on the kiln's
@@ -1051,9 +1052,95 @@ pub fn acp_config(kiln: &std::path::Path, sock: &str, prefer: Option<&str>, sess
     json!({"name": "kiln", "command": kiln, "args": ["reach", "mcp"], "env": env})
 }
 
+/// The same for Antigravity, which reads MCP servers only from its own config
+/// (`~/.gemini/config/mcp_config.json`; no flag or session setting adds one): `agy mcp add`'s
+/// arguments putting this server there, the same for every session. Which session it serves is
+/// in agy's environment (`agy_env`), which agy hands on to the servers it starts.
+pub fn agy_add(kiln: &std::path::Path) -> Vec<String> {
+    ["mcp", "add", "kiln"].map(str::to_owned).into_iter().chain([kiln.to_string_lossy().into_owned(), "reach".into(), "mcp".into()]).collect()
+}
+
+/// The environment a session's agy is started with, for this server (`agy_add`).
+pub fn agy_env(sock: &str, prefer: Option<&str>, session: &str) -> Vec<(&'static str, String)> {
+    env_of(sock, prefer, session)
+}
+
+/// Whether agy's MCP config (`config`, its `mcp_config.json`) has this server as `agy_add` puts
+/// it, or has it turned off (`agy mcp disable kiln`: a person's choice, kept).
+pub fn agy_has(config: &Value, kiln: &std::path::Path) -> bool {
+    let Some(s) = config.pointer("/mcpServers/kiln") else { return false };
+    s.get("disabled").and_then(Value::as_bool) == Some(true)
+        || (s.get("command").and_then(Value::as_str) == Some(kiln.to_string_lossy().as_ref()) && s.get("args") == Some(&json!(["reach", "mcp"])))
+}
+
+/// The tools of this server Antigravity calls without asking (it can't ask once started): showing
+/// and previewing a page. Its others are agy's to decide on.
+pub const AGY_ALLOWED: [&str; 2] = ["mcp(kiln/show_page)", "mcp(kiln/preview_page)"];
+
+/// agy's settings (`settings`, its `~/.gemini/antigravity-cli/settings.json`) with `AGY_ALLOWED` in
+/// `permissions.allow`, each unless a rule of a person's covers it already (allowed, asked or
+/// denied, the tool or all of this server's or every server's: agy's deny > ask > allow then
+/// decides). None when nothing needs adding, or the settings aren't as agy writes them.
+pub fn agy_allow(settings: &Value) -> Option<Value> {
+    let covers = |rule: &str| {
+        let rules = ["allow", "deny", "ask"].into_iter().filter_map(|k| settings.pointer(&format!("/permissions/{k}")).and_then(Value::as_array)).flatten();
+        rules.filter_map(Value::as_str).any(|r| r == rule || r == "mcp(kiln/*)" || r == "mcp(*)")
+    };
+    let missing: Vec<&str> = AGY_ALLOWED.into_iter().filter(|r| !covers(r)).collect();
+    if missing.is_empty() {
+        return None;
+    }
+    let mut out = settings.clone();
+    let permissions = out.as_object_mut()?.entry("permissions").or_insert_with(|| json!({}));
+    let allow = permissions.as_object_mut()?.entry("allow").or_insert_with(|| json!([]));
+    allow.as_array_mut()?.extend(missing.into_iter().map(Value::from));
+    Some(out)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Antigravity reads MCP servers only from its own config: kiln's is put there once for every
+    /// session (`agy mcp add`), whom it serves in agy's environment; again only when it names
+    /// another kiln, and one a person turned off stays off.
+    #[test]
+    fn antigravity_gets_the_server_through_its_own_config() {
+        let kiln = std::path::Path::new("/opt/kiln");
+        assert_eq!(agy_add(kiln), ["mcp", "add", "kiln", "/opt/kiln", "reach", "mcp"]);
+        assert_eq!(agy_env("/run/x.sock", Some("macos"), "s1"), [("KILN_REACH_SOCK", "/run/x.sock".to_owned()), ("KILN_REACH_ON", "macos".to_owned()), ("KILN_SESSION", "s1".to_owned())]);
+        // As `agy mcp add` writes it (agy 1.4.2), beside a person's own.
+        let put = json!({"mcpServers": {"kiln": {"args": ["reach", "mcp"], "command": "/opt/kiln", "disabled": false}, "github": {"command": "gh-mcp", "disabled": false}}});
+        assert!(agy_has(&put, kiln));
+        assert!(!agy_has(&put, std::path::Path::new("/opt/kiln-2")), "a runner upgraded since puts its own");
+        assert!(!agy_has(&json!({}), kiln));
+        assert!(!agy_has(&json!({"mcpServers": {}}), kiln));
+        let off = json!({"mcpServers": {"kiln": {"args": ["reach", "mcp"], "command": "/opt/old", "disabled": true}}});
+        assert!(agy_has(&off, kiln), "turned off by a person: kept");
+    }
+
+    /// Its page tools are allowed in agy's settings beside a person's own rules, unless a rule of
+    /// theirs covers them (agy's deny > ask > allow decides then).
+    #[test]
+    fn antigravity_allows_its_page_tools_unless_a_person_said_otherwise() {
+        let allow = |s: &Value| agy_allow(s).and_then(|s| s.pointer("/permissions/allow").cloned());
+        // As agy keeps its settings, without rules: both added, the rest kept; once.
+        let agys = json!({"model": "gemini-3.8-flash-low", "trustedWorkspaces": ["/w"]});
+        let added = agy_allow(&agys);
+        assert_eq!(added.as_ref().and_then(|s| s.pointer("/permissions/allow")), Some(&json!(AGY_ALLOWED)));
+        assert_eq!(added.as_ref().and_then(|s| s.get("trustedWorkspaces")), Some(&json!(["/w"])));
+        assert_eq!(added.as_ref().and_then(agy_allow), None);
+        // A person's own rules stay, beside them.
+        let theirs = json!({"permissions": {"allow": ["command(git)"], "deny": ["command(rm -rf)"]}});
+        assert_eq!(allow(&theirs), Some(json!(["command(git)", "mcp(kiln/show_page)", "mcp(kiln/preview_page)"])));
+        // One a person asks for, or this server or every server they deny or ask for, stays theirs.
+        assert_eq!(allow(&json!({"permissions": {"ask": ["mcp(kiln/show_page)"]}})), Some(json!(["mcp(kiln/preview_page)"])));
+        assert_eq!(agy_allow(&json!({"permissions": {"deny": ["mcp(kiln/*)"]}})), None);
+        assert_eq!(agy_allow(&json!({"permissions": {"ask": ["mcp(*)"]}})), None);
+        // Settings not as agy writes them are left alone.
+        assert_eq!(agy_allow(&json!(["x"])), None);
+        assert_eq!(agy_allow(&json!({"permissions": {"allow": "mcp(*)"}})), None);
+    }
 
     /// The agent tools are the server's: those it names (each as its registry has it, one it
     /// added since this binary was built included), and this binary's own from a server that
