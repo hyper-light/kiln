@@ -868,6 +868,13 @@ kiln-sim's model draws big items and gangs under its nemesis (E4.6). What it mea
 - **The views:** a leg waiting `reserved`, `behind` or `gang` says so in a sentence on its run, and
   the queue's breakdown names each, in Chromium and WebKit at desktop and phone widths
   (`ui/e2e/wait-reasons.spec.ts`).
+- **The gate:** `ci/gate.sh` through `kiln run --needs cpus=12,mem=40g,linux/amd64`, at
+  dc020b20f (the commit before the one adding this line, which changes nothing else): clippy for
+  Linux, Windows and macOS with `-D warnings`, and `cargo test --workspace`, 3,185 tests passed in
+  111 binaries, 0 failed, 34 ignored. `GATE: PASS`. A run before it on the same tree failed four
+  tests that its machine, loaded and with Docker's address pools full, failed and this run passed:
+  a timing test's p99 at 2.57 ms against its 2 ms, two that make Docker networks, and an account
+  action's dry run (`w22_ac02_…`).
 
 Building it changed nine of its rules, each for a test or a seed it failed:
 
