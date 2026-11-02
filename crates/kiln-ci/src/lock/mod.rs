@@ -2,3 +2,4 @@
 //! the server supplies source identity, resolution and reachability facts.
 
 pub mod github;
+pub mod verify;

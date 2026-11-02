@@ -186,7 +186,7 @@ fn positive(source: &Source<'_>, node: &Node) -> Read<i64> {
     Err(error(Some(node), "a repository or owner ID must be a positive integer"))
 }
 
-fn hostname(value: &str) -> bool {
+pub(crate) fn hostname(value: &str) -> bool {
     if value == "github.com" { return true; }
     let Some(tenant) = value.strip_suffix(".ghe.com") else { return false };
     let alnum = |b: u8| b.is_ascii_lowercase() || b.is_ascii_digit();
