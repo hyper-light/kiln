@@ -12,6 +12,7 @@ import * as React from "react";
 import "./approval-toasts.css";
 import { ArrowUpRight, X } from "lucide-react";
 import { clientId, harnessApi, type AgentInfo } from "@/api/harness";
+import { plansApi } from "@/api/plans";
 import { Button } from "@/components/ui/button";
 import { toast } from "@/components/ui/toast";
 import { Link, useLocation, useNavigate } from "@/lib/router";
@@ -126,7 +127,7 @@ function RequestCard({ card }: { card: Card }) {
         </Button>
       ) : (
         <>
-          {/* A plan is approved here; to keep it planning (with what to change), review it on its page. */}
+          {/* A plan is approved here; read, rejected or answered in your own words in its agent's Plan tab. */}
           <Button size="xs" disabled={busy} onClick={() => void decide("allow")}>
             {plan ? "Approve" : "Allow"}
           </Button>
@@ -136,7 +137,7 @@ function RequestCard({ card }: { card: Card }) {
             </Button>
           )}
           {review && (
-            <Link to={href} className="rq-open">
+            <Link to={plan ? `${href}?tab=plan` : href} className="rq-open">
               Review <ArrowUpRight size={12} aria-hidden="true" />
             </Link>
           )}
@@ -146,15 +147,29 @@ function RequestCard({ card }: { card: Card }) {
   );
 }
 
-/** Goals it paused for you: the plan they wait on to look at, and Resume. */
+/** Goals it paused for you: a plan they wait on approved here, or reviewed in its agent's Plan tab; else Resume. */
 function HeldCard({ card }: { card: Card }) {
   const [busy, setBusy] = React.useState(false);
-  // Asked again (its answer lost, or it failed), the same resume under its key (CP-T3.2).
+  // Asked again (its answer lost, or it failed), the same resume (or approval) under its key (CP-T3.2).
   const [tries] = React.useState(() => new Tries(clientId));
-  const navigate = useNavigate();
   const { a } = card;
   const held = a.held;
   if (!held) return null;
+  const plan = held.plan;
+  // Approved: the card goes now (the server lets go of the pause as it sends the plan's steps).
+  const approve = (id: string) => {
+    setBusy(true);
+    void plansApi.review(id, { answer: "approve", key: tries.keyFor(`approve ${id} ${held.since}`) }).then(
+      () => {
+        tries.done();
+        putAway([card.key], a.id, "done");
+      },
+      (e: unknown) => {
+        toast.error(`Couldn't approve ${agentLabel(a)}'s plan`, errorMessage(e));
+        setBusy(false);
+      },
+    );
+  };
   // Resumed: the card goes now (the server lets go of the pause within moments).
   const resume = () => {
     setBusy(true);
@@ -171,14 +186,14 @@ function HeldCard({ card }: { card: Card }) {
   };
   return (
     <Shell card={card} line={`Paused its goals${heldWords(held.why) ? `: ${heldWords(held.why)}` : ""}`} busy={busy}>
-      {held.plan ? (
+      {plan ? (
         <>
-          <Button size="xs" onClick={() => navigate(`/agents/plans/${held.plan}`)}>
-            Review the plan
+          <Button size="xs" disabled={busy} onClick={() => approve(plan)}>
+            Approve
           </Button>
-          <Button size="xs" variant="secondary" disabled={busy} onClick={resume}>
-            Resume
-          </Button>
+          <Link to={`/agents/${a.id}?tab=plan`} className="rq-open">
+            Review <ArrowUpRight size={12} aria-hidden="true" />
+          </Link>
         </>
       ) : (
         <>

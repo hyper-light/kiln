@@ -3,7 +3,7 @@
  * changeset, the commands it ran. Pure functions of the event list, memoized by the caller.
  */
 import { useState } from "react";
-import type { FileDiff, HEvent, Task, ToolCall, ToolKind } from "@/api/harness";
+import type { FileDiff, FilePlace, HEvent, Task, ToolCall, ToolKind } from "@/api/harness";
 import { isShowPage } from "./page-of";
 import { isShowLive } from "./live-of";
 
@@ -45,6 +45,37 @@ export interface Turn {
   by?: string;
   /** Not a turn: the line where the conversation went on in another harness, on another machine, or with another setting its harness starts with. */
   divider?: Extract<HEvent, { kind: "notice" }>;
+  /**
+   * A turn kiln began only to have the agent pass a person's message on to one of its subagents:
+   * drawn as nothing, the message being in that subagent's thread. One where the agent also did its
+   * own work shows that work.
+   */
+  relay?: boolean;
+  /** Its events the conversation doesn't show: what kiln wrote the agent to pass a message on, and the agent's call that did. */
+  hidden?: string[];
+}
+
+/** What kiln writes an agent so it passes a person's message on to its subagent: `kiln-relay-` then that message's id (harness/subagent.rs `RELAY_ID`). */
+const RELAY_ID = "kiln-relay-";
+const isRelay = (e: HEvent): e is Extract<HEvent, { kind: "user" }> => e.kind === "user" && !!e.client_id?.startsWith(RELAY_ID);
+
+/** The subagent a relay is for, as kiln names it to the agent ("… (agent id a575), …": `subagent::relay_words`). */
+const relayFor = (e: Extract<HEvent, { kind: "user" }>): string | null => /\(agent id ([^)\s]+)\)/.exec(e.text)?.[1] ?? null;
+
+/**
+ * Whether `e` is the agent passing a message on to its subagent `to` (null: to any), as each
+ * harness does it, and as kiln follows it there (`relaying` in harness/claude.rs, `relayed` in
+ * codex.rs): Claude Code's SendMessage; Codex's agent tools (send_input, send_message,
+ * followup_task), or its v2 interaction.
+ */
+function passesOn(e: HEvent, to: string | null): boolean {
+  if (e.kind !== "tool") return false;
+  const input = e.input && typeof e.input === "object" && !Array.isArray(e.input) ? e.input : {};
+  const codex =
+    (e.name === "collabAgentToolCall" && (input.tool === "sendInput" || input.tool === "sendMessage" || input.tool === "followupTask")) ||
+    (e.name === "subAgentActivity" && input.kind === "interacted");
+  const target = e.name === "SendMessage" ? (typeof input.to === "string" ? input.to : "") : codex ? (e.task ?? "") : null;
+  return target !== null && (to === null || target === to || target.includes(to));
 }
 
 /** The notice kiln puts where a conversation went on in another harness, on another machine, or with another setting its harness starts with (`harness-switch:` ids). */
@@ -139,6 +170,14 @@ export function turnsFrom(was: TurnsMemo | null, events: HEvent[], parent?: stri
  */
 function readTurns(events: HEvent[], at: number, parent: string | undefined, thread: string | undefined, turns: Turn[], starts: number[]) {
   const own = thread ? `child:${thread}:` : null;
+  // In the main thread, kiln's relays of a person's messages to subagents aren't the conversation's.
+  const main = parent === undefined && !thread;
+  // The subagents each turn has yet to pass a relay's message on to, in the order kiln asked; and
+  // those it has (Codex says so again in an interaction of its own, which is the relay's too).
+  const relayTo = new Map<Turn, (string | null)[]>();
+  const relayed = new Map<Turn, Set<string>>();
+  // The last of this thread's events read: whether the agent had answered (it was idle) or was at work.
+  let prev: HEvent | null = null;
   let cur: Turn | null = null;
   let i = at;
   const open = (prompt: Turn["prompt"], at: number, key: string) => {
@@ -150,7 +189,25 @@ function readTurns(events: HEvent[], at: number, parent: string | undefined, thr
   for (; i < events.length; i++) {
     const e = events[i]!;
     if ((e.parent ?? undefined) !== parent && !(own && e.id.startsWith(own))) continue;
+    const before = prev;
+    prev = e;
     if (e.kind === "user") {
+      if (main && isRelay(e)) {
+        const steered = cur !== null && !(before?.kind === "assistant" && !before.streaming);
+        // Steered into the agent's work (a harness takes it after a tool's result), it's no turn of
+        // its own; after the agent answered, it is one, drawn as nothing while all the agent does in
+        // it is pass the message on.
+        let t: Turn;
+        if (steered) t = cur as unknown as Turn;
+        else {
+          if (cur) (cur as Turn).ended = e.at;
+          t = open(null, e.at, e.id);
+          t.relay = true;
+        }
+        t.hidden = [...(t.hidden ?? []), e.id];
+        relayTo.set(t, [...(relayTo.get(t) ?? []), relayFor(e)]);
+        continue;
+      }
       if (cur) (cur as Turn).ended = e.at;
       open(e, e.at, e.id);
       continue;
@@ -165,7 +222,19 @@ function readTurns(events: HEvent[], at: number, parent: string | undefined, thr
     }
     const t: Turn = cur ?? open(null, e.at, `start-${e.id}`);
     t.ended = e.at;
+    // The call passing a relay's message on is kiln's, not the agent's work: one for each relay.
+    const waiting = relayTo.get(t);
+    const which = waiting?.findIndex((to) => passesOn(e, to)) ?? -1;
+    const echo = e.kind === "tool" && e.name === "subAgentActivity" && !!e.task && !!relayed.get(t)?.has(e.task);
+    if ((waiting && which >= 0) || echo) {
+      if (waiting && which >= 0) waiting.splice(which, 1);
+      if (e.kind === "tool" && e.task) relayed.set(t, (relayed.get(t) ?? new Set()).add(e.task));
+      t.hidden?.push(e.id);
+      continue;
+    }
     if (e.by && !t.by && e.kind !== "notice") t.by = e.by;
+    // Its own work in a relay's turn: the turn shows, its words with it.
+    if (t.relay && e.kind !== "assistant" && e.kind !== "thinking") t.relay = false;
     if (e.kind === "tool" && isShowPage(e)) {
       t.items.push({ type: "page", key: e.id, event: e });
     } else if (e.kind === "tool" && isShowLive(e)) {
@@ -190,6 +259,21 @@ function readTurns(events: HEvent[], at: number, parent: string | undefined, thr
       else t.items.push({ type: "notice", key: e.id, event: e });
     }
   }
+}
+
+/** The events an item shows. */
+const idsOf = (it: Item): string[] => (it.type === "step" ? it.calls.map((c) => c.id) : it.type === "thought" ? [it.event.id, ...(it.more ?? []).map((m) => m.id)] : [it.event.id]);
+
+/** The main thread's events that kiln's relays put there and the conversation doesn't show (`Turn.relay`, `Turn.hidden`): what finding in it leaves out. */
+export function relayHidden(events: HEvent[]): Set<string> {
+  const turns: Turn[] = [];
+  readTurns(events, 0, undefined, undefined, turns, []);
+  const out = new Set<string>();
+  for (const t of turns) {
+    for (const id of t.hidden ?? []) out.add(id);
+    if (t.relay) for (const it of t.items) for (const id of idsOf(it)) out.add(id);
+  }
+  return out;
 }
 
 const sameList = <T>(a: readonly T[] | undefined, b: readonly T[] | undefined) => (a ?? []).length === (b ?? []).length && (a ?? []).every((x, i) => x === b?.[i]);
@@ -218,7 +302,7 @@ export function shareTurns(kept: Map<string, Turn>, next: Turn[]): Turn[] {
       return b && sameItem(b, it) ? b : it;
     });
     const same = was.prompt === t.prompt && was.outcome === t.outcome && was.started === t.started && was.ended === t.ended && sameList(was.items, items);
-    return same ? was : { ...t, items };
+    return same && was.relay === t.relay && sameList(was.hidden, t.hidden) ? was : { ...t, items };
   });
   kept.clear();
   for (const t of out) kept.set(t.key, t);
@@ -248,6 +332,12 @@ export interface ChangedFile {
   del: number;
   /** Every edit to the file, in order, with the call that made it (one cumulative diff, call null, from the server). */
   edits: { call: ToolEvent | null; diff: FileDiff }[];
+  /** Who changed it, in the order they first did: `main` (the agent itself) or a subagent run by its spawning call's id. */
+  by?: string[];
+  /** Whose it is; none (an older runner) is this project's. */
+  place?: FilePlace;
+  /** Unix ms of its last change (the server's). */
+  at?: number;
 }
 
 /** Everything the agent changed (or proposed and was refused), file by file. */

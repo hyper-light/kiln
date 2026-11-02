@@ -7,6 +7,7 @@
 import * as React from "react";
 import {
   ArrowDown,
+  ArrowUpLeft,
   ArrowUpRight,
   ChevronRight,
   CircleAlert,
@@ -26,7 +27,7 @@ import {
 } from "lucide-react";
 import { useSession, type Approval, type Command, type Compacting, type Delivery, type HEvent, type Meta, type Outgoing, type QueueItem, type SessionStore, type Task } from "@/api/harness";
 import { labelOf, useLabels, withLabels } from "@/lib/data";
-import { useNavigate } from "@/lib/router";
+import { Link, useNavigate } from "@/lib/router";
 import { useNow } from "@/lib/hooks";
 import { cn } from "@/lib/utils";
 import { AccountCard, saysSignedOut } from "./account-card";
@@ -74,6 +75,9 @@ import { usePlaces, type Place } from "./state";
 import { stillAsked, useAnswered } from "./answered";
 import { useHeld, useRecent } from "./dom";
 import { unsending } from "./unsend";
+import { KindGlyph } from "./kind-glyph";
+import { parentWrote, type ThreadFrom } from "./subagent-tree";
+import { KeepButton } from "./subagent-branch";
 import { Highlighted } from "@/components/code/highlighted";
 
 /** Tool calls the agent is asking you about right now (the rest of the pending ones wait their turn). */
@@ -552,6 +556,9 @@ const DELIVERY: Record<Delivery, string> = {
 /** When something was said, "14:05": one formatter for every message (making one for each, as each renders, is slow). */
 const SAID_AT = new Intl.DateTimeFormat([], { hour: "2-digit", minute: "2-digit" });
 
+/** The thread shown is a subagent's: who started it, and how it ended (subagent-tree.ts `ThreadFrom`). None: an agent's main thread. */
+export const ThreadFromContext = React.createContext<ThreadFrom | null>(null);
+
 /* ------------------------------------------------------------------ messages: menus, replies, gestures */
 
 /** What "Reply to" hands the composer: the event it answers, who wrote it, its words. */
@@ -793,8 +800,14 @@ const Prompt = React.memo(function Prompt({
   lookup,
   spawn,
   kindName,
+  by,
+  via,
 }: {
   e: Extract<HEvent, { kind: "user" }>;
+  /** Its subagent's parent wrote it: its name, and the way back to its thread. */
+  by?: { name: string; href: string };
+  /** Yours, passed on to the subagent by this one. */
+  via?: string;
   delivery?: Delivery;
   meta?: Meta | null;
   /** Its kiln-queue entry while it waits (unsend restores its attachments from it). */
@@ -806,7 +819,8 @@ const Prompt = React.memo(function Prompt({
   spawn?: { target?: string; cwd?: string; kind?: string };
   kindName?: string;
 }) {
-  const system = e.origin && e.origin !== "human";
+  const system = Boolean(by) || (e.origin && e.origin !== "human");
+  const who = by ? by.name : String(e.origin);
   const files = React.useContext(FilesContext);
   const [editing, setEditing] = React.useState(false);
   const [draft, setDraft] = React.useState(e.text);
@@ -853,7 +867,7 @@ const Prompt = React.memo(function Prompt({
       [
         {
           rows: [
-            { icon: <Reply size={13} />, label: "Reply to", onSelect: () => onReply?.({ id: e.id, who: String(e.origin), text: e.text }) },
+            { icon: <Reply size={13} />, label: "Reply to", onSelect: () => onReply?.({ id: e.id, who, text: e.text }) },
             { icon: <Copy size={13} />, label: "Copy", onSelect: () => void copyText(e.text) },
           ],
         },
@@ -910,8 +924,21 @@ const Prompt = React.memo(function Prompt({
       )}
       <div className="hx-prompt" data-origin={e.origin ?? "human"} data-ev={e.id} data-held={hold.held || undefined} style={swipe.dx ? { transform: `translateX(${swipe.dx}px)` } : undefined}>
         <div className="hx-prompt-meta">
-          <span className="hx-eyebrow">{system ? e.origin : "You"}</span>
+          {by ? (
+            <span className="hx-eyebrow hx-by">
+              <KindGlyph kind="agent" className="hx-by-mark" />
+              {by.name}
+            </span>
+          ) : (
+            <span className="hx-eyebrow">{system ? e.origin : "You"}</span>
+          )}
           <span className="hx-dim">{SAID_AT.format(e.at)}</span>
+          {by && (
+            <Link to={by.href} className="hx-by-back" aria-label={by.name}>
+              <ArrowUpLeft size={12} />
+            </Link>
+          )}
+          {via && !system && <span className="hx-dim">· via {via}</span>}
           {delivery && (
             <span className="hx-dim">
               ·{" "}
@@ -1183,8 +1210,8 @@ function Since({ since }: { since: number }) {
 }
 
 /** A compaction under way, where the turn's live line is: what it does, the context it compacts
- *  and for how long; the optic draws in, and the conversation's spectrum is condensed into the bar
- *  its marker keeps, in the same place, once it's done. */
+ *  and for how long; the optic draws in, and the particle ribbon turns about the line until it's
+ *  done, when the bar its marker keeps takes its place, in the same room. */
 function CompactingRow({ c }: { c: Compacting }) {
   return (
     <div className="hx-compaction" data-state="live" role="status">
@@ -1279,9 +1306,15 @@ const TurnView = React.memo(function TurnView({
   lookup,
   spawn,
   kindName,
+  from,
+  first,
 }: {
   /** Who answers (the harness's name), over the agent's side of the turn. */
   agentLabel?: string;
+  /** A subagent's thread: who started it (its messages are labelled theirs, yours "via" it where it passes them on). */
+  from?: ThreadFrom | null;
+  /** The thread's first turn (nothing before it dropped): a session's brief. */
+  first?: boolean;
   turn: Turn;
   cwd: string;
   delivery?: Delivery;
@@ -1331,7 +1364,21 @@ const TurnView = React.memo(function TurnView({
   const label = turn.by ?? agentLabel;
   return (
     <section className="hx-turn">
-      {turn.prompt && <Prompt e={turn.prompt} delivery={delivery} meta={meta} queueItem={queueItem} onCommand={onCommand} onReply={onReply} lookup={lookup} spawn={spawn} kindName={kindName} />}
+      {turn.prompt && (
+        <Prompt
+          e={turn.prompt}
+          delivery={delivery}
+          meta={meta}
+          queueItem={queueItem}
+          onCommand={onCommand}
+          onReply={onReply}
+          lookup={lookup}
+          spawn={spawn}
+          kindName={kindName}
+          by={from && parentWrote(from, turn.prompt, first ?? false) ? from : undefined}
+          via={from?.via ? from.name : undefined}
+        />
+      )}
       <div className="hx-work">
         {label && (turn.items.length > 0 || turn.outcome || live) && <div className="hx-agent-label">{label}</div>}
         {hidden > 0 && !sought && (
@@ -1594,10 +1641,13 @@ export const Timeline = React.memo(function Timeline({
   accountOpen,
   find,
   onReply,
+  onReviewPlan,
 }: {
   store: SessionStore;
   /** The agent's id: where your place in it is kept. */
   agent: string;
+  /** A plan it proposes is reviewed in its Plan tab: this opens it there (none: the plan is read here, in full). */
+  onReviewPlan?: () => void;
   /** Find in the conversation: the words, and the match being shown. */
   find?: { q: string; now: FindNow | null };
   agentLabel?: string;
@@ -1623,6 +1673,7 @@ export const Timeline = React.memo(function Timeline({
   const state = useSession(store, (s) => s.state);
   const meta = useSession(store, (s) => s.meta);
   const done = useAnswered();
+  const threadFrom = React.useContext(ThreadFromContext);
   // What a reply quotes, by the event it answers.
   const byId = React.useMemo(() => new Map(events.map((e) => [e.id, e] as const)), [events]);
   const lookup = React.useCallback((id: string) => byId.get(id), [byId]);
@@ -1863,35 +1914,57 @@ export const Timeline = React.memo(function Timeline({
             ) : (
               mine.length === 0 && <div className="hx-empty">Nothing yet. Tell the agent what to do.</div>
             ))}
-          {turns.slice(from, to).map((t, j) => (
-            <TurnView
-              key={t.key}
-              turn={t}
-              cwd={cwd}
-              delivery={t.prompt?.client_id ? state?.delivery[t.prompt.client_id] : undefined}
-              live={running && from + j === turns.length - 1}
-              doing={running && from + j === turns.length - 1 ? state?.doing : undefined}
-              compacting={from + j === turns.length - 1 ? compacting : undefined}
-              turnStarted={running && from + j === turns.length - 1 ? (parent ? task?.started : (state?.turn_started ?? undefined)) : undefined}
-              onOpenTask={onOpenTask}
-              meta={meta}
-              onCommand={onCommand}
-              agentLabel={agentLabel}
-              reading={reading.current}
-              queueItem={t.prompt?.client_id ? state?.queue.find((q) => q.id === t.prompt?.client_id) : undefined}
-              onReply={onReply}
-              lookup={lookup}
-              spawn={spawn}
-              kindName={agentLabel ?? kind}
-            />
-          ))}
+          {/* A turn that only passed a person's message on to a subagent (`Turn.relay`) is drawn as nothing: the message is in that subagent's thread. */}
+          {turns
+            .slice(from, to)
+            .map((t, j) =>
+              t.relay ? null : (
+                <TurnView
+                  key={t.key}
+                  turn={t}
+                  cwd={cwd}
+                  delivery={t.prompt?.client_id ? state?.delivery[t.prompt.client_id] : undefined}
+                  live={running && from + j === turns.length - 1}
+                  doing={running && from + j === turns.length - 1 ? state?.doing : undefined}
+                  compacting={from + j === turns.length - 1 ? compacting : undefined}
+                  turnStarted={running && from + j === turns.length - 1 ? (parent ? task?.started : (state?.turn_started ?? undefined)) : undefined}
+                  onOpenTask={onOpenTask}
+                  meta={meta}
+                  onCommand={onCommand}
+                  agentLabel={agentLabel}
+                  reading={reading.current}
+                  queueItem={t.prompt?.client_id ? state?.queue.find((q) => q.id === t.prompt?.client_id) : undefined}
+                  onReply={onReply}
+                  lookup={lookup}
+                  spawn={spawn}
+                  kindName={agentLabel ?? kind}
+                  from={threadFrom}
+                  first={from + j === 0 && !state?.dropped}
+                />
+              ),
+            )}
+          {/* A finished subagent's thread ends with how and when, and the way back to its parent's. */}
+          {tail && threadFrom?.end && (
+            <div className="hx-thread-end" data-stand={threadFrom.end.stand}>
+              <span className="hx-thread-word">
+                <i aria-hidden="true" />
+                {threadFrom.end.word}
+              </span>
+              {threadFrom.end.at != null && <span className="hx-dim">{SAID_AT.format(threadFrom.end.at)}</span>}
+              <Link to={threadFrom.href} className="hx-thread-back">
+                <ArrowUpLeft size={13} />
+                {threadFrom.name}
+              </Link>
+              {threadFrom.keep && <KeepButton keep={threadFrom.keep} />}
+            </div>
+          )}
           {/* A window further back: what came after joins as you scroll down to it. */}
           {!tail && <div key={`to-${to}`} ref={later} className="hx-earlier" aria-hidden="true" />}
           {tail && mine.map((m) => <Sending key={m.id} m={m} live={live} lookup={lookup} onResend={resend} onDiscard={store.discard} />)}
           {tail && hasAsks && onDecide && (
             <div ref={asksRef} className="hx-asks">
               {pending.map((a) => (
-                <ApprovalCard key={a.id} a={a} cwd={cwd} onDecide={onDecide} agentName={agentName} kind={agentLabel} agentId={agent} />
+                <ApprovalCard key={a.id} a={a} cwd={cwd} onDecide={onDecide} agentName={agentName} kind={agentLabel} agentId={agent} onReviewPlan={parent ? undefined : onReviewPlan} />
               ))}
             </div>
           )}

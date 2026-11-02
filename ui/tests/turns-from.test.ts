@@ -1,7 +1,8 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import type { HEvent } from "../src/api/harness.ts";
-import { shareTurns, turnsFrom, turnsOf, type Turn, type TurnsMemo } from "../src/views/harness/derive.ts";
+import { relayHidden, shareTurns, turnsFrom, turnsOf, type Turn, type TurnsMemo } from "../src/views/harness/derive.ts";
+import { findIn } from "../src/views/harness/find.tsx";
 
 /** A seeded conversation that grows and changes as a live one does, event by event. */
 function conversation(seed: number) {
@@ -106,4 +107,143 @@ test("a Codex child's thread shows its own work whichever of its calls opened it
   // Nothing of another child's, nor of the main thread.
   assert(!words(turnsOf(ev, "send-2", false, "T1")).includes("someone else's"));
   assert.deepEqual(words(turnsOf(ev)), ["go"]);
+});
+
+/** The same conversations with kiln's relays in them: some asks are kiln's word to pass a message on to subagent sub1, some calls the agent passing one on. */
+function withRelays(e: HEvent, r: () => number): HEvent {
+  if (e.parent) return e;
+  if (e.kind === "user" && r() < 0.5)
+    return { ...e, text: `The person wrote a message to your subagent “Tests” (agent id sub1), which you started. <message>${e.text}</message>`, client_id: `kiln-relay-${e.id}`, origin: "kiln" };
+  if (e.kind === "tool" && r() < 0.3) return { ...e, name: "SendMessage", tool: "other", input: { to: "sub1", message: "use the v2 parser" } };
+  return e;
+}
+
+test("turns worked out from the last ones are the turns worked out afresh with kiln's relays to subagents among them", () => {
+  for (let seed = 1; seed <= 30; seed++) {
+    const c = conversation(seed);
+    const make = () => withRelays(c.make(), c.r);
+    let events: HEvent[] = Array.from({ length: 5 + Math.floor(c.r() * 40) }, make);
+    let memo: TurnsMemo | null = null;
+    for (let step = 0; step < 100; step++) {
+      const what = c.r();
+      const next = events.slice();
+      if (what < 0.45) next.push(...Array.from({ length: 1 + Math.floor(c.r() * 3) }, make));
+      else if (what < 0.7 && next.length) next[next.length - 1] = c.changed(next.at(-1)!);
+      else if (what < 0.85 && next.length) next.splice(Math.floor(c.r() * next.length), 0, make());
+      else if (next.length) next.splice(Math.floor(c.r() * next.length), 1);
+      events = next;
+      memo = turnsFrom(memo, events, undefined, true);
+      assert.deepEqual(memo.turns, turnsOf(events, undefined, true), `seed ${seed}, step ${step}`);
+    }
+  }
+});
+
+const ask = (id: string, text: string, at: number): HEvent => ({ id, seq: at, at, kind: "user", text, client_id: id, origin: "human" });
+const relay = (id: string, to: string, text: string, at: number): HEvent => ({
+  id,
+  seq: at,
+  at,
+  kind: "user",
+  text: `The person wrote a message to your subagent “Run the parser tests” (agent id ${to}), which you started, through kiln, which can't reach it directly. Send it with your SendMessage tool (to: "${to}"). Pass it on exactly as written and don't act on it yourself; if it can't be sent, say why.\n\n<message>\n${text}\n</message>`,
+  client_id: `kiln-relay-${id}`,
+  origin: "kiln",
+});
+const said = (id: string, text: string, at: number, parent?: string): HEvent => ({ id, seq: at, at, kind: "assistant", text, streaming: false, ...(parent ? { parent } : {}) });
+const call = (id: string, name: string, at: number, more: Partial<Extract<HEvent, { kind: "tool" }>> = {}): HEvent => ({
+  id,
+  seq: at,
+  at,
+  kind: "tool",
+  tool_id: id,
+  name,
+  tool: "other",
+  title: name,
+  input: {},
+  status: "done",
+  started: at,
+  ended: at + 1,
+  ...more,
+});
+
+test("a turn kiln began only to have the agent pass a message on to a subagent is drawn as nothing, and what came before keeps its answer", () => {
+  const events = [
+    ask("u1", "Rewrite the parser; send a subagent through its tests.", 1),
+    call("spawn", "Agent", 2, { tool: "agent", task: "a575" }),
+    said("a1", "A subagent is on the tests.", 3),
+    // The person wrote "Use the v2 parser" to the subagent: kiln asked the agent, idle, to pass it on.
+    { id: "m1", seq: 4, at: 4, parent: "spawn", kind: "user", text: "Use the v2 parser", client_id: "m1", origin: "human" } as HEvent,
+    relay("r1", "a575", "Use the v2 parser", 5),
+    said("a2", "Passing that on to the subagent.", 6),
+    call("send", "SendMessage", 7, { input: { to: "a575", message: "Use the v2 parser" } }),
+    said("a3", "Sent.", 8),
+  ];
+  const turns = turnsOf(events);
+  assert.deepEqual(
+    turns.map((t) => [t.key, t.relay ?? false, t.outcome?.text ?? null]),
+    [
+      ["u1", false, "A subagent is on the tests."],
+      ["r1", true, "Sent."],
+    ],
+  );
+  assert.deepEqual(turns[1]?.hidden, ["r1", "send"]);
+  assert.deepEqual([...relayHidden(events)].sort(), ["a2", "a3", "r1", "send"]);
+  // Found in the subagent's thread, where it shows; not in the main one, where it doesn't.
+  assert.deepEqual(findIn(events, undefined, "v2 parser"), []);
+  assert.deepEqual(findIn(events, "spawn", "v2 parser"), ["m1"]);
+  assert.deepEqual(findIn(events, undefined, "subagent is on"), ["a1"]);
+});
+
+test("a relay steered into the agent's work is no turn of its own: the turn goes on without kiln's words or the call passing it on", () => {
+  const events = [
+    ask("u1", "Also bump the version.", 1),
+    call("bash", "Bash", 2, { tool: "shell" }),
+    relay("r2", "a575", "Then run the figure tests", 3),
+    call("send", "SendMessage", 4, { input: { to: "a575", message: "Then run the figure tests" } }),
+    call("edit", "Edit", 5, { tool: "edit" }),
+    said("a1", "Version bumped.", 6),
+  ];
+  const turns = turnsOf(events);
+  assert.deepEqual(
+    turns.map((t) => [t.key, t.relay ?? false, t.prompt?.id ?? null, t.items.flatMap((it) => (it.type === "step" ? it.calls.map((c) => c.id) : [it.key])), t.outcome?.text ?? null]),
+    [["u1", false, "u1", ["bash", "edit"], "Version bumped."]],
+  );
+  assert.deepEqual(turns[0]?.hidden, ["r2", "send"]);
+  // Steered in just before its answer, the answer is still the turn's.
+  const last = turnsOf([
+    ask("u1", "Also bump the version.", 1),
+    call("bash", "Bash", 2, { tool: "shell" }),
+    relay("r3", "a575", "hi", 3),
+    call("send", "SendMessage", 4, { input: { to: "a575", message: "hi" } }),
+    said("a1", "Version bumped.", 5),
+  ]);
+  assert.deepEqual(
+    last.map((t) => [t.key, t.relay ?? false, t.outcome?.text ?? null, t.hidden]),
+    [["u1", false, "Version bumped.", ["r3", "send"]]],
+  );
+});
+
+test("the agent's own messages to its subagents show; Codex's agent tools passing a relay on don't", () => {
+  // Its own SendMessage, not one kiln asked it to make, is its work.
+  const own = turnsOf([ask("u1", "Coordinate the tests.", 1), call("send", "SendMessage", 2, { input: { to: "a575", message: "start with the lexer" } })]);
+  assert.deepEqual(
+    own.map((t) => [t.relay ?? false, t.items.length]),
+    [[false, 1]],
+  );
+  // A relay for one subagent doesn't take the agent's message to another.
+  const other = turnsOf([relay("r1", "a575", "hi", 1), call("send", "SendMessage", 2, { input: { to: "b880", message: "lexer first" } })]);
+  assert.deepEqual(
+    other.map((t) => [t.relay ?? false, t.hidden]),
+    [[false, ["r1"]]],
+  );
+  // Codex passes one on with send_message (or follow-up_task, send_input), or v2's interaction.
+  const codex = turnsOf([
+    relay("r1", "thr2", "use the v2 parser", 1),
+    call("collab", "collabAgentToolCall", 2, { tool: "agent", task: "thr2", input: { tool: "sendMessage" } }),
+    call("act", "subAgentActivity", 3, { tool: "agent", task: "thr2", input: { kind: "interacted" } }),
+    said("a1", "Sent it to the subagent.", 4),
+  ]);
+  assert.deepEqual(
+    codex.map((t) => [t.relay ?? false, t.hidden]),
+    [[true, ["r1", "collab", "act"]]],
+  );
 });

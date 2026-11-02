@@ -129,6 +129,140 @@ pub fn measured_workflow(trace: &Trace, workflow: &str) -> Figures {
     figures(&pushes, used, wasted)
 }
 
+/// Where a commit without an answer an hour after its push stood then (W28-R53).
+pub const LATE: [&str; 7] = [
+    "a suspect: its bisection still going",
+    "pending: a pod of its lane's work not started",
+    "pending: its answer's job waiting for a runner",
+    "pending: its answer's job running",
+    "pending: its answer's job waiting for its needs",
+    "pending: its answer's push not made yet",
+    "no answer in the window",
+];
+
+/// For a workflow's commits on main without an answer an hour after their push (P3 and later),
+/// how many stood where then, by [`LATE`]'s causes ([`late_runs`]).
+pub fn late(trace: &Trace, out: &Outcome, workflow: &str) -> [usize; 7] {
+    let mut n = [0usize; 7];
+    for l in late_runs(trace, out, workflow) {
+        if let Some(x) = n.get_mut(l.cause) {
+            *x += 1;
+        }
+    }
+    n
+}
+
+/// A commit on main without an answer an hour after its push (W28-R53), and what held it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Late {
+    /// Its push's run (its place in the trace).
+    pub run: usize,
+    /// Where it stood at the hour: an index into [`LATE`].
+    pub cause: usize,
+    /// The job whose result answered it at last, and the run that job ran for.
+    pub answer: Option<(String, usize)>,
+    /// A pod of its lane's work, asked for by the hour and not started then: its run, its job, and
+    /// how long the recorded week took to start that job's pod, when the trace says.
+    pub pod: Option<(usize, String, Option<i64>)>,
+}
+
+/// A workflow's commits on main without an answer an hour after their push (P3 and later), each
+/// with where it stood then, by [`LATE`]'s causes: a suspect waiting for its bisection; a pod of
+/// the lane's work since the commit (on a pool with a pod quota) still waiting to start; or pending
+/// on the job that answered it at last (waiting for a runner, running, waiting for its needs, or
+/// its push not made yet); or never answered in the window.
+pub fn late_runs(trace: &Trace, out: &Outcome, workflow: &str) -> Vec<Late> {
+    let mut found = Vec::new();
+    if !out.covers {
+        return found;
+    }
+    let lanes = super::verdict::lanes(trace);
+    let Some(runs) = lanes.get(&format!("{workflow}|push|main")) else { return found };
+    for (p, d) in super::verdict::lane_detail(trace, out, runs, Some(SOON)).into_iter().enumerate() {
+        let (Some(at_hour), Some(last), Some(&r)) = (d.late, d.last, runs.get(p)) else { continue };
+        let Some(run) = trace.runs.get(r) else { continue };
+        let t = run.at + SOON;
+        let mut late = Late { run: r, cause: 4, answer: None, pod: None };
+        late.cause = if d.verdict.is_none() {
+            6
+        } else if at_hour.kind == crate::verdict::Kind::Suspect {
+            0
+        } else {
+            // The check still pending then that was answered last, and the job that answered it.
+            let pending: Vec<&crate::verdict::Check> = at_hour.checks.iter().filter(|c| c.status == crate::verdict::Status::Pending).map(|c| &c.check).collect();
+            let answer = last.checks.iter().filter(|c| pending.contains(&&c.check)).max_by_key(|c| c.at);
+            match answer {
+                Some(a) => {
+                    let by = a.by.and_then(|q| runs.get(q)).copied().unwrap_or(r);
+                    late.answer = Some((a.check.unit.clone(), by));
+                    let pushed = trace.runs.get(by).is_some_and(|x| x.at <= t);
+                    // A pod of the lane's work from the commit to its answer, asked for by the
+                    // hour and not started then.
+                    let lane = runs.get(p..=runs.iter().position(|&q| q == by).unwrap_or(p)).unwrap_or(&[]);
+                    let pod = out.execs.iter().find(|e| {
+                        e.bisect.is_none() && lane.contains(&e.run) && e.queued <= t && e.started.is_none_or(|s| s > t) && e.ended.is_none_or(|x| x > t) && e.pool.and_then(|q| trace.pools.get(q)).is_some_and(|q| q.pods.is_some())
+                    });
+                    late.pod = pod.and_then(|e| {
+                        let job = trace.runs.get(e.run)?.jobs.get(e.job)?;
+                        Some((e.run, job.key.clone(), job.started.zip(job.queued).map(|(s, q)| s - q)))
+                    });
+                    let exec = out.execs.iter().filter(|e| e.bisect.is_none() && Some(e.ended) == Some(a.at)).find(|e| {
+                        let (Some(er), Some(br)) = (trace.runs.get(e.run), trace.runs.get(by)) else { return false };
+                        er.workflow == br.workflow && er.jobs.get(e.job).is_some_and(|j| j.key == a.check.unit)
+                    });
+                    match exec {
+                        _ if !pushed => 5,
+                        _ if pod.is_some() => 1,
+                        Some(e) if e.queued > t => 4,
+                        Some(e) if e.started.is_none_or(|s| s > t) => 2,
+                        Some(_) => 3,
+                        None => 4,
+                    }
+                }
+                None => 4,
+            }
+        };
+        found.push(late);
+    }
+    found
+}
+
+/// Which of ci's commits on main a policy leaves without an answer an hour after their push, over
+/// `seeds` (W28-AC51's rest): each late in any seed, with how many seeds it was late in, where it
+/// stood then in most of them, and what held it.
+pub fn late_table(trace: &Trace, policy: &Policy, seeds: &[u64]) -> String {
+    use std::collections::BTreeMap;
+    let mut by: BTreeMap<usize, Vec<Late>> = BTreeMap::new();
+    for s in seeds {
+        for l in late_runs(trace, &replay(trace, policy, *s), "ci") {
+            by.entry(l.run).or_default().push(l);
+        }
+    }
+    let hours = |s: i64| format!("{:.1} h", s as f64 / 3600.0);
+    let mut out = String::new();
+    let _ = writeln!(out, "| Run | Pushed | Late in seeds | Where it stood at the hour | What held it |\n|---|---|---|---|---|");
+    for (r, ls) in &by {
+        let Some(run) = trace.runs.get(*r) else { continue };
+        let mut causes = [0usize; 7];
+        for l in ls {
+            if let Some(c) = causes.get_mut(l.cause) {
+                *c += 1;
+            }
+        }
+        let cause = (0..causes.len()).max_by_key(|&c| (causes.get(c).copied().unwrap_or(0), std::cmp::Reverse(c))).unwrap_or(4);
+        let held = ls.iter().find(|l| l.cause == cause).map_or_else(String::new, |l| match (&l.pod, &l.answer) {
+            (Some((pr, job, waited)), _) if cause == 1 => {
+                let w = waited.map_or_else(|| "it never started in the recorded week".to_owned(), |w| format!("the recorded week took {} to start it", hours(w)));
+                format!("{job}'s pod for run {pr}: {w}")
+            }
+            (_, Some((job, by))) => format!("{job}, answered by run {by}"),
+            _ => String::new(),
+        });
+        let _ = writeln!(out, "| {r} | {} | {} of {} | {} | {held} |", hours(run.at), ls.len(), seeds.len(), LATE.get(cause).copied().unwrap_or_default());
+    }
+    out
+}
+
 /// The report's columns as the trace recorded them.
 pub fn measured(trace: &Trace) -> Row {
     let waits: Vec<i64> = trace.runs.iter().filter(|r| r.workflow == "bench").flat_map(|r| r.jobs.iter()).filter(|j| j.exclusive).filter_map(|j| Some(j.started? - j.queued?)).collect();
@@ -210,6 +344,16 @@ pub fn report(trace: &Trace, policies: &[Policy], seeds: &[u64]) -> String {
             let _ = writeln!(s, "- {}", calibration(trace, o));
         }
     }
+    let covering: Vec<&(String, Vec<Outcome>)> = outs.iter().filter(|(_, runs)| runs.first().is_some_and(|o| o.covers)).collect();
+    if !covering.is_empty() {
+        let _ = writeln!(s, "\nWhere ci's commits on main without a verdict an hour after their push stood then (W28-R53), medians over seeds with their ranges:\n");
+        let _ = writeln!(s, "| Policy | {} |\n|---|{}", LATE.join(" | "), "---|".repeat(LATE.len()));
+        for (name, runs) in covering {
+            let counts: Vec<[usize; 7]> = runs.iter().map(|o| late(trace, o, "ci")).collect();
+            let cols: Vec<String> = (0..LATE.len()).map(|k| spread_i(&counts.iter().map(|c| c.get(k).map_or(0, |x| i64::try_from(*x).unwrap_or(0))).collect::<Vec<_>>(), |x| x.to_string())).collect();
+            let _ = writeln!(s, "| {name} | {} |", cols.join(" | "));
+        }
+    }
     for wf in WORKFLOWS {
         let _ = writeln!(s, "\n{wf} on main:\n");
         s.push_str("| Policy | Verdict within 60 min | Latency p50 | p90 | Longest gap | Longest wait for any verdict | Runner-h used | Wasted | Runner-h per verdict |\n|---|---|---|---|---|---|---|---|---|\n");
@@ -260,6 +404,15 @@ pub fn sweeps(trace: &Trace, seeds: &[u64]) -> String {
     cases.push(("no window".into(), Policy { window: None, ..Policy::p4() }));
     sweep("speculation window on P4 (bisection runs; floor 1, cap 20)", cases);
     sweep("image_compile_share on P5 (assumed: the trace can't split the image's build)", [0.0, 0.3, 0.6].into_iter().map(|c| (format!("image_compile_share {c}"), Policy { share: Some(c), ..Policy::p5() })).collect());
+    // W28-R80: a k8s job whose pod is this late runs on a Linux machine's slot instead.
+    let mut cases: Vec<(String, Policy)> = Vec::new();
+    for (name, p) in [("P3", Policy::p3()), ("P4", Policy::p4())] {
+        cases.push((format!("{name}, no overflow"), p.clone()));
+        for after in [120, 300, 600] {
+            cases.push((format!("{name}, overflow after {after} s"), Policy { overflow: Some(after), ..p.clone() }));
+        }
+    }
+    sweep("overflow on P3 and P4 (W28-R80: a pod not started by then gives way to a Linux machine's slot)", cases);
     s
 }
 
@@ -293,7 +446,7 @@ pub fn fingerprint(out: &Outcome) -> String {
         }
     }
     for b in &out.bisections {
-        let _ = writeln!(s, "b {} {} {:?} {:?}", b.lane, b.key, b.suspects, b.done);
+        let _ = writeln!(s, "b {} {} {:?} {:?} {:?}", b.lane, b.key, b.suspects, b.done, b.culprit);
     }
     for d in &out.decisions {
         let _ = writeln!(s, "d {} {} {}", d.at, d.run, d.what);

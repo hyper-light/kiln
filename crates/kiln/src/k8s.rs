@@ -268,22 +268,21 @@ const CACHE_ENV: &[(&str, &str)] = &[
     ("KILN_GIT_CACHE", "/cache/git"),
 ];
 
-/// Prefer worker nodes: the control-plane node keeps room for the platform (kiln, ArgoCD,
-/// Prometheus), so restarting those rarely needs to preempt a build.
-fn worker_affinity() -> Affinity {
-    Affinity {
-        node_affinity: Some(NodeAffinity {
-            preferred_during_scheduling_ignored_during_execution: Some(vec![PreferredSchedulingTerm {
-                weight: 100,
-                preference: NodeSelectorTerm {
-                    match_expressions: Some(vec![NodeSelectorRequirement { key: "node-role.kubernetes.io/control-plane".into(), operator: "DoesNotExist".into(), values: None }]),
-                    ..Default::default()
-                },
-            }]),
-            ..Default::default()
-        }),
+/// Worker nodes: preferred, so the control-plane node keeps room for the platform (kiln, ArgoCD,
+/// Prometheus) and restarting those rarely needs to preempt a build; required with
+/// `[kubernetes] workers_only`, so a job never squeezes the control plane's etcd and API server,
+/// whose use runs past what they ask for (W13-R07).
+fn worker_affinity(required: bool) -> Affinity {
+    let worker = NodeSelectorTerm {
+        match_expressions: Some(vec![NodeSelectorRequirement { key: "node-role.kubernetes.io/control-plane".into(), operator: "DoesNotExist".into(), values: None }]),
         ..Default::default()
-    }
+    };
+    let nodes = if required {
+        NodeAffinity { required_during_scheduling_ignored_during_execution: Some(NodeSelector { node_selector_terms: vec![worker] }), ..Default::default() }
+    } else {
+        NodeAffinity { preferred_during_scheduling_ignored_during_execution: Some(vec![PreferredSchedulingTerm { weight: 100, preference: worker }]), ..Default::default() }
+    };
+    Affinity { node_affinity: Some(nodes), ..Default::default() }
 }
 
 /// The init container that copies the static `kiln` into the pod. Explicit requests: a namespace
@@ -349,7 +348,7 @@ fn job_pod(cfg: &KCfg, job: &Job, spec: &crate::pipeline::PlannedJob, run: &Run,
         spec: Some(PodSpec {
             restart_policy: Some("Never".into()),
             priority_class_name: cfg.priority_class.clone(),
-            affinity: Some(worker_affinity()),
+            affinity: Some(worker_affinity(cfg.workers_only)),
             service_account_name: Some(cfg.service_account.clone()),
             automount_service_account_token: Some(false),
             active_deadline_seconds: Some(i64::from(spec.timeout_minutes) * 60 + 900),
@@ -482,7 +481,7 @@ pub(crate) fn pool_pod(cfg: &KCfg, executor: &str, name: &str, token: &str, (ser
         spec: Some(PodSpec {
             restart_policy: Some("Never".into()),
             priority_class_name: cfg.priority_class.clone(),
-            affinity: Some(worker_affinity()),
+            affinity: Some(worker_affinity(cfg.workers_only)),
             service_account_name: Some(cfg.service_account.clone()),
             automount_service_account_token: Some(false),
             active_deadline_seconds: pod.and_then(|p| p.deadline_s),
@@ -693,6 +692,8 @@ mod tests {
             steps: Vec::new(),
             matrix: None,
             placement: None,
+            paused_at: None,
+            paused_ms: 0,
         }
     }
 
@@ -933,6 +934,38 @@ mod tests {
             "{v}"
         );
         assert_eq!(warm(&PodWarm::default(), "..", &[]).volume.host_path.map(|h| h.path).as_deref(), Some("/var/lib/kiln/warm/__"));
+        Ok(())
+    }
+
+    /// W13-R07: a job's pod prefers a worker node; with `[kubernetes] workers_only` it goes only to
+    /// one, and a warm pool's label joins that term rather than taking its place.
+    #[test]
+    fn w13_r07_workers_only_keeps_job_pods_off_the_control_plane() -> anyhow::Result<()> {
+        let worker = json!({ "matchExpressions": [{ "key": "node-role.kubernetes.io/control-plane", "operator": "DoesNotExist" }] });
+        let preferred = serde_json::to_value(worker_affinity(false))?;
+        assert_eq!(preferred.pointer("/nodeAffinity/preferredDuringSchedulingIgnoredDuringExecution"), Some(&json!([{ "weight": 100, "preference": worker }])), "{preferred}");
+        assert!(preferred.pointer("/nodeAffinity/requiredDuringSchedulingIgnoredDuringExecution").is_none(), "{preferred}");
+        let required = serde_json::to_value(worker_affinity(true))?;
+        assert_eq!(required.pointer("/nodeAffinity/requiredDuringSchedulingIgnoredDuringExecution/nodeSelectorTerms"), Some(&json!([worker])), "{required}");
+        assert!(required.pointer("/nodeAffinity/preferredDuringSchedulingIgnoredDuringExecution").is_none(), "{required}");
+        // As the pods kiln makes carry it: off by default, on as the configuration says.
+        let pool = PoolSpec { name: "rust".into(), executor: "k8s".into(), labels: vec!["rust".into()], ..PoolSpec::default() };
+        let made = |c: &KCfg| serde_json::to_value(pool_pod(c, "x1", "kiln-x-1", "t", ("http://kiln:7070", "kiln:7071"), &pool, None));
+        let v = made(&cfg())?;
+        assert!(v.pointer("/spec/affinity/nodeAffinity/requiredDuringSchedulingIgnoredDuringExecution").is_none(), "{v}");
+        let v = made(&KCfg { workers_only: true, ..cfg() })?;
+        assert_eq!(v.pointer("/spec/affinity/nodeAffinity/requiredDuringSchedulingIgnoredDuringExecution/nodeSelectorTerms"), Some(&json!([worker])), "{v}");
+        let mut pod = executor();
+        if let Some(spec) = pod.spec.as_mut() {
+            spec.affinity = Some(worker_affinity(true));
+        }
+        apply_warm(&mut pod, &warm(&PodWarm { node_label: Some("nvme".into()), ..PodWarm::default() }, "pods", &[]));
+        let v = serde_json::to_value(&pod)?;
+        assert_eq!(
+            v.pointer("/spec/affinity/nodeAffinity/requiredDuringSchedulingIgnoredDuringExecution/nodeSelectorTerms"),
+            Some(&json!([{ "matchExpressions": [{ "key": "node-role.kubernetes.io/control-plane", "operator": "DoesNotExist" }, { "key": "nvme", "operator": "Exists" }] }])),
+            "{v}"
+        );
         Ok(())
     }
 

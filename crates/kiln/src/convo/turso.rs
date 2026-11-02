@@ -1360,6 +1360,11 @@ impl Engine for Turso {
         }
     }
 
+    fn release(&mut self) -> anyhow::Result<()> {
+        self.compact_drop();
+        self.flush()
+    }
+
     fn look(&mut self, count: bool) -> anyhow::Result<Look> {
         let pages = |p: &str| -> anyhow::Result<u64> { Ok(self.one_int(&format!("PRAGMA {p}"), &[])?.and_then(|n| u64::try_from(n).ok()).unwrap_or(0)) };
         let page = pages("page_size")?;
@@ -1770,6 +1775,34 @@ mod tests {
                 Compacting::Done { .. } => break,
                 Compacting::Not => anyhow::bail!("compacting stopped"),
             }
+        }
+        drop(engine);
+        assert_eq!(dump(&Turso::open(&path)?)?, was);
+        Ok(())
+    }
+
+    /// A store let go of for a new build to take over (`Engine::release`) while it's being made
+    /// compact: the compaction stops, and its copy goes rather than stay behind as the file moves.
+    #[test]
+    fn a_store_let_go_of_while_it_is_made_compact_leaves_no_copy_beside_it() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let path = dir.path().join("c.db");
+        let mut t = Turso::open(&path)?;
+        let line = |n: u64, text: String| Row::Record(Box::new(RecordRow { session: "gone".into(), source: "cc".into(), n, end: n + 1, line: text, kept: None }));
+        t.apply(&[Row::Session { session: "gone".into(), info: Some("{}".into()), meta: None, state: None, changes: None, epoch: None, open: true, at: 5 }])?;
+        t.apply(&(0..1_000u64).map(|n| line(n, noise(2_000))).collect::<Vec<_>>())?;
+        t.apply(&[Row::RecordReset { session: "gone".into(), source: "cc".into(), at: 6 }, line(0, "{\"kept\":true}".into())])?;
+        let was = dump(&t)?;
+        let mut engine: Box<dyn Engine> = Box::new(t);
+        for _ in 0..3 {
+            let (e, step) = engine.compact_some(0, 16 << 10)?;
+            engine = e;
+            assert_eq!(step, Compacting::Going);
+        }
+        assert!(beside(&path, ".compact.tmp").exists());
+        engine.release()?;
+        for left in [".compact", ".compact.tmp", ".compact.tmp-wal", ".compact.tmp-shm"] {
+            assert!(!beside(&path, left).exists(), "{left} left beside the store");
         }
         drop(engine);
         assert_eq!(dump(&Turso::open(&path)?)?, was);

@@ -7,6 +7,9 @@
 //! - `down=<duration>`: after each drop, the runner stays away that long before it dials again (a
 //!   link cut for a while, not a blip);
 //! - `delay=<duration>`: everything it sends the server waits that long first;
+//! - `lag=<duration>`: the runner takes each thing its jobs send (a log's chunk, a job's event)
+//!   that long late, as a busy machine's runner falls behind its jobs: a job's end comes while
+//!   what it sent before still waits (W27-R05);
 //! - `oom=<duration>`: a leg's step on the host is killed that long after it starts, as the OOM
 //!   killer kills (SIGKILL, and counted where kiln counts the OOM killer's kills);
 //! - `disk=<MiB>`: a leg's job container gets a workspace of that size, so filling it is ENOSPC;
@@ -25,6 +28,10 @@
 //! - `twice=<lane>[/<variant>]:<every>` and `late=<lane>[/<variant>]:<every>`: as `shed`, the
 //!   frames it picks sent twice, or held back and sent after the next frame on their lane (out of
 //!   order), not dropped. Each may be given beside the others, each drawing on its own.
+//! - `unknown=<lane>[/<variant>]:<every>` and `garble=<lane>[/<variant>]:<every>`: as `shed`, the
+//!   frames it picks made unreadable, not dropped: their variant index made one past what their
+//!   sender's enum has, a kind the receiver doesn't know; or cut short, given bytes after them, or a
+//!   byte past their index flipped (docs/wire.md, "What can't be read").
 //! - `seed=<n>`: the frames those faults pick are another seed's, the same each run (a lab run
 //!   again on a seed goes wrong as it did).
 //! - `fanout=<frames>`: the server's: each session's live feed keeps that many frames for its
@@ -33,6 +40,13 @@
 //! - `old`: the runner says nothing of what it can do past `Build`'s 32 bits (no `Caps`), as a
 //!   runner from before the channel says nothing (docs/wire.md): the server sends it commands and
 //!   takes its updates as it did such runners'.
+//! - `unsigned`: the runner says nothing of custody (no `CAP_CUSTODY`, and taking over blue/green
+//!   it doesn't say it takes a session signed for) and signs no hand-over or receipt, as a runner
+//!   from before signed hand-overs does (docs/ci.md W27-R08): its hand-overs go unsigned.
+//! - `stale_words`: the server's: as kiln certifies an agent session at an epoch for a process
+//!   other than the one it counted as its holder, it also sends that one the words about a
+//!   hand-over it sent before transfers named the holder (hand it to the newest, it was taken), as
+//!   it did at 14:18 on 2026-10-25 (docs/ci.md W27-R08), so a test plays the drop again.
 //! - `copy=<path>`: every frame this runner sends, appended to `path` as it goes below the channel
 //!   (its lane and length, then its bytes), so a test can say what crossed the network (W27-R02).
 //! - `keys=<path>`: each identity key this runner process makes (`crate::runner::identity`),
@@ -59,6 +73,8 @@ pub struct Chaos {
     pub drop_every: Option<Duration>,
     pub down_for: Option<Duration>,
     pub delay: Option<Duration>,
+    /// Its jobs' sends taken this late (`lag=`).
+    pub lag: Option<Duration>,
     pub oom_after: Option<Duration>,
     pub disk_mib: Option<u32>,
     pub corrupt: bool,
@@ -71,6 +87,10 @@ pub struct Chaos {
     pub seed: u64,
     pub fanout: Option<usize>,
     pub old: bool,
+    /// Signs no hand-over (`unsigned`).
+    pub unsigned: bool,
+    /// The server's: sends a session's former holder its stale hand-over words (`stale_words`).
+    pub stale_words: bool,
     /// Where every frame this process sends is copied (`copy=`).
     pub copy: Option<std::path::PathBuf>,
     /// Where each identity key this process makes is copied (`keys=`).
@@ -111,6 +131,7 @@ pub fn parse(spec: &str) -> anyhow::Result<Chaos> {
             "drop" => c.drop_every = Some(d()?),
             "down" => c.down_for = Some(d()?),
             "delay" => c.delay = Some(d()?),
+            "lag" => c.lag = Some(d()?),
             "oom" => c.oom_after = Some(d()?),
             "disk" => c.disk_mib = Some(v.parse().map_err(|_| anyhow::anyhow!("chaos `disk` takes MiB, not `{v}`"))?),
             "corrupt" => c.corrupt = true,
@@ -120,16 +141,20 @@ pub fn parse(spec: &str) -> anyhow::Result<Chaos> {
                 c.platform = Some(v.to_owned());
             }
             "rebuild" => c.rebuild_after = Some(d()?),
-            "shed" | "twice" | "late" => {
+            "shed" | "twice" | "late" | "unknown" | "garble" => {
                 let act = match k {
                     "shed" => crate::net::Act::Drop,
                     "twice" => crate::net::Act::Twice,
-                    _ => crate::net::Act::Late,
+                    "late" => crate::net::Act::Late,
+                    "unknown" => crate::net::Act::Unknown(0),
+                    _ => crate::net::Act::Garble,
                 };
                 c.faults.push(shed(v, act).ok_or_else(|| anyhow::anyhow!("chaos `{k}` takes <lane>[/<variant>]:<every> (term/46:7), not `{v}`"))?);
             }
             "fanout" => c.fanout = Some(v.parse().ok().filter(|n: &usize| *n > 0).ok_or_else(|| anyhow::anyhow!("chaos `fanout` takes a number of frames, not `{v}`"))?),
             "old" => c.old = true,
+            "unsigned" => c.unsigned = true,
+            "stale_words" => c.stale_words = true,
             "copy" | "keys" => {
                 anyhow::ensure!(!v.is_empty(), "chaos `{k}` takes a file's path");
                 let path = Some(std::path::PathBuf::from(v));
@@ -140,7 +165,7 @@ pub fn parse(spec: &str) -> anyhow::Result<Chaos> {
                 }
             }
             "seed" => c.seed = v.parse().map_err(|_| anyhow::anyhow!("chaos `seed` takes a number, not `{v}`"))?,
-            other => anyhow::bail!("chaos has no fault `{other}`: drop, down, delay, oom, disk, corrupt, fetch, platform, rebuild, shed, twice, late, seed, fanout, old, copy or keys"),
+            other => anyhow::bail!("chaos has no fault `{other}`: drop, down, delay, lag, oom, disk, corrupt, fetch, platform, rebuild, shed, twice, late, unknown, garble, seed, fanout, old, unsigned, stale_words, copy or keys"),
         }
     }
     Ok(c)
@@ -359,6 +384,7 @@ mod tests {
                 drop_every: Some(Duration::from_secs(2)),
                 down_for: None,
                 delay: Some(Duration::from_millis(300)),
+                lag: None,
                 oom_after: Some(Duration::from_secs(1)),
                 disk_mib: Some(8),
                 corrupt: true,
@@ -369,6 +395,8 @@ mod tests {
                 seed: 0,
                 fanout: None,
                 old: false,
+                unsigned: false,
+                stale_words: false,
                 copy: None,
                 keys: None
             }
@@ -379,9 +407,11 @@ mod tests {
         assert_eq!((c.copy.as_deref(), c.keys.as_deref()), (Some(std::path::Path::new("/tmp/a.frames")), Some(std::path::Path::new("/tmp/a.keys"))));
         assert!(parse("copy=").is_err() && parse("keys").is_err(), "each names its file");
         assert!(parse("drop=6s,old")?.old);
+        assert!(parse("unsigned")?.unsigned && parse("stale_words")?.stale_words);
         assert!(parse("fetch")?.fetch);
         assert_eq!(parse("rebuild=4s")?.rebuild_after, Some(Duration::from_secs(4)));
         assert_eq!(parse("drop=5s,down=30s")?.down_for, Some(Duration::from_secs(30)));
+        assert_eq!(parse("lag=300ms")?.lag, Some(Duration::from_millis(300)));
         assert!(parse("platform=plan9/mips").is_err());
         assert!(parse("flood=1s").is_err_and(|e| e.to_string().contains("no fault `flood`")));
         assert!(parse("oom=soon").is_err());
@@ -394,6 +424,12 @@ mod tests {
         // Frames sent twice, or late, beside those dropped, each its own.
         let faults = parse("shed=term/46:7,twice=term/46:5,late=control:9")?.faults;
         assert_eq!(faults.iter().map(|f| (f.act, f.every)).collect::<Vec<_>>(), [(Act::Drop, 7), (Act::Twice, 5), (Act::Late, 9)]);
+        // Frames made unreadable (docs/wire.md, "What can't be read"): a kind the receiver doesn't
+        // know, one past what its sender's enum has, or garbled.
+        let faults = parse("unknown=control/10:3,garble=term:4")?.faults;
+        assert_eq!(faults.iter().map(|f| (f.act, f.variant, f.every)).collect::<Vec<_>>(), [(Act::Unknown(0), Some(10), 3), (Act::Garble, None, 4)]);
+        assert_eq!(faults.first().map(|f| f.past(52).act), Some(Act::Unknown(52)));
+        assert_eq!(faults.get(1).map(|f| f.past(52).act), Some(Act::Garble));
         assert!(parse("twice=term:0").is_err() && parse("late=nowhere:2").is_err());
         assert_eq!(parse("shed=term:3,seed=42")?.seed, 42);
         assert!(parse("seed=x").is_err());

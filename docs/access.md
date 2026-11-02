@@ -31,7 +31,7 @@ on a repository covers its pipelines and environments.
 
 | Area | Capabilities |
 | --- | --- |
-| Runs | `runs.read`, `runs.trigger`, `runs.cancel`, `runs.rerun`, `logs.read`, `artifacts.read`, `artifacts.write`, `caches.write` |
+| Runs | `runs.read`, `runs.trigger`, `runs.cancel`, `runs.rerun`, `runs.pause`, `logs.read`, `artifacts.read`, `artifacts.write`, `caches.write` |
 | Code | `diffs.read`, `diffs.submit`, `diffs.review`, `diffs.land`, `queue.manage` |
 | Pipelines | `pipelines.edit` (always as a reviewed diff), `environments.deploy` |
 | Machines | `machines.read`, `machines.manage`, `machines.terminal`, `binaries.publish` |
@@ -41,7 +41,7 @@ on a repository covers its pipelines and environments.
 | Server | `settings.manage`, `tokens.manage`, `users.manage`, `audit.read` |
 
 **Roles** are named sets of capabilities: `viewer` (reads, observe's too), `developer` (trigger,
-rerun, submit, review; observe's dashboards and monitors), `maintainer` (plus land, attach agents,
+rerun, pause, submit, review; observe's dashboards and monitors), `maintainer` (plus land, attach agents,
 manage everyone's agents, manage the queue; observe's integrations and clouds), `admin` (everything
 but ownership) and `owner`. Custom roles are allowed. A user holds roles per scope. Grants add up
 across scopes, and an explicit deny wins.
@@ -72,6 +72,28 @@ kiln's CA, its key made where it's used and never sent: each runner process
 each epoch, for its person, named by the runner process holding its key, and likewise people, CI
 legs, the server and CD. docs/ci.md W27 says what each kind's certificate names, how long it lasts
 and how a revoked one is refused from that moment (`kiln identities`).
+
+**Signed as themselves.** What each makes is signed as whoever made it, never with a key shared
+between them. A person's commits are signed on their device, with the key `kiln login` made there
+(`kiln clone` sets git up to) or an SSH key they bound to themselves (`/api/me/ssh-signers`). An
+agent's commits, and its pushes, are signed by its runner with the session's key, kiln's git
+credential for the agent making the push the agent's too. The commits kiln makes itself (revisions,
+lands) are signed as its server or CD. A review's verdicts and comments are signed by whoever gives
+them, a leg's results and provenance by the leg, a land by the queue that tested it. A repository
+kiln hosts that requires signatures (`.kiln/review.yaml`'s `signatures:`, new repositories by
+default) refuses a push whose commits aren't signed by someone kiln verifies, saying which commit
+and why. docs/ci.md W27 (R03 to R07) says what each signs, over what, and how it's checked.
+
+**Checking a trail.** Every signed statement kiln takes goes into one append-only trail, its
+checkpoints signed by kiln's server (docs/ci.md W27-R09). `kiln verify <deploy | artifact | commit |
+change> <id>` walks a chain back to whoever made it, each link resting on a statement in the trail,
+and names the first that doesn't hold (anyone with `audit.read`). An auditor needs no server and no
+kiln account: `kiln verify export deploy prod/api@1.4.2 > trail.json` (by whoever may read the
+audit) carries every statement the walk rested on, with its proof and the checkpoint the proofs
+lead to, and `kiln verify --offline trail.json --root kiln-root.pem` checks it against kiln's root
+(`/ca.pem`, taken from kiln once and kept): it fails where any statement, signature or proof was
+changed. A revision's Source VSA (SLSA's source track), `kiln verify vsa <repository>@<commit>`, is
+the same check's verdict signed as kiln's server.
 
 **Jobs ask for what they need** with a new pipeline key, so no pipeline needs the admin token in
 a secret:

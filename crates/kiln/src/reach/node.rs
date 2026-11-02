@@ -5,10 +5,13 @@
 //!
 //! Asking side: one session per runner it talks to, carried by one link at a time. A link that
 //! drops is replaced (backoff from 200 ms to 5 s) and the session resumed: each run it follows
-//! continues from the last byte that arrived.
+//! continues from the last byte that arrived. A detached run whose client went is followed on
+//! alone: its output taken and let go, its link made again after a drop, until it ends.
 //!
 //! Doing side: a run outlives its link. Its output waits (up to [`BUFFER`], then the command waits
 //! too) until the asker's session comes back on a new link, for as long as the run's linger allows.
+//! A detached run ([`wire::DETACHED`]) waits for no one: with [`BUFFER`] held and no link, or nothing
+//! taken for [`GIVE_WAY`], its oldest output gives way, counted as lost.
 
 use std::collections::{HashMap, VecDeque};
 use std::path::PathBuf;
@@ -35,6 +38,9 @@ pub const BUFFER: u64 = 16 << 20;
 const FRAME: usize = 256 * 1024;
 /// How long a run waits for its asker to come back, unless it says otherwise.
 const LINGER: Duration = Duration::from_secs(15 * 60);
+/// A detached run's output held at [`BUFFER`] with a link up but none of it taken this long (an
+/// asker from before detached runs were followed, or a stalled one) gives way, as with no link.
+const GIVE_WAY: Duration = Duration::from_secs(10);
 /// A finished run nobody collected is dropped after this long without a link.
 const UNCOLLECTED: Duration = Duration::from_secs(10 * 60);
 /// A link that has not finished its handshake in this long is given up.
@@ -143,9 +149,12 @@ pub enum In {
     /// A frame of a link, relayed by the server ([`crate::proto::ServerMsg::Reach`]).
     Frame { from: String, link: String, open: bool, data: Vec<u8>, close: Option<String> },
     /// The server's answer to a question ([`crate::proto::ServerMsg::ReachAnswer`]).
-    Answer { req: u64, json: String },
+    Answer { req: u64, answer: Value },
     /// The connection to the server came up (true) or went (false).
     Server(bool),
+    /// Whether the server takes word of a message a link couldn't read (it says
+    /// [`crate::proto::CAP_UNREAD`]: [`crate::proto::AgentMsg::LinkUnread`]).
+    Unread(bool),
     Local(Local),
     /// An event of a run this node does for another runner.
     Ran { key: (String, String), id: u64, ev: serve::Event },
@@ -170,6 +179,11 @@ pub enum Local {
     SyncAsk { peer: String, ask: SyncAsk },
     /// Stop following a run or a sync.
     Leave { peer: String, run: Option<u64>, sync: Option<String> },
+    /// A detached run's client went: the run is followed on alone ([`Follow::detached`]).
+    Detach { peer: String, run: u64 },
+    /// A test's: `bytes` as they are, on this node's link to `peer`, as if a message.
+    #[cfg(test)]
+    Garble { peer: String, bytes: Vec<u8> },
     Status { reply: oneshot::Sender<Value> },
     /// Forget a runner's pinned key (it was reinstalled).
     Forget { runner: String, reply: oneshot::Sender<bool> },
@@ -262,6 +276,18 @@ impl Handle {
         let _ = self.tx.send(In::Local(Local::Leave { peer: peer.to_owned(), run, sync })).await;
     }
 
+    /// The client of `run`, a detached run on `peer`, went (docs/reach.md §4.2): it's followed on
+    /// without one until it ends.
+    pub async fn detach(&self, peer: &str, run: u64) {
+        let _ = self.tx.send(In::Local(Local::Detach { peer: peer.to_owned(), run })).await;
+    }
+
+    /// A test's: `bytes` sent as they are on this node's link to `peer`, where a message would go.
+    #[cfg(test)]
+    pub async fn garble(&self, peer: &str, bytes: Vec<u8>) {
+        let _ = self.tx.send(In::Local(Local::Garble { peer: peer.to_owned(), bytes })).await;
+    }
+
     pub async fn status(&self) -> anyhow::Result<Value> {
         self.ask(|reply| Local::Status { reply }).await
     }
@@ -271,9 +297,20 @@ impl Handle {
     }
 
     /// Ask the kiln server `json` ([`crate::proto::AgentMsg::ReachAsk`]: an agent's MCP server
-    /// asking for kiln's operations, `crate::mcp::runner_ask`), and wait for its answer.
+    /// asking for kiln's operations, `crate::mcp::runner_ask`), and wait for its answer. An agent
+    /// session's act goes signed by the session this process holds (docs/ci.md W27-R08).
     pub async fn query(&self, json: String) -> anyhow::Result<String> {
-        self.ask(|reply| Local::Query { json, reply }).await?
+        let json = crate::runner::custody::signed_ask(json);
+        let sent = json.clone();
+        let answer = match self.ask(|reply| Local::Query { json, reply }).await {
+            Ok(a) => a,
+            Err(e) => Err(e),
+        };
+        // Unanswered, a session's act wasn't done: kiln hears of it once it's back.
+        if let Err(e) = &answer {
+            crate::runner::custody::unanswered(&sent, &format!("{e:#}"));
+        }
+        answer
     }
 
     /// Hand `data` to `peer` to take over (an agent session moving there), and wait until it has,
@@ -430,6 +467,7 @@ pub fn start(cfg: Config) -> anyhow::Result<(Handle, async_channel::Receiver<Age
         tx: net_tx.clone(),
         dirty: Vec::new(),
         server: false,
+        server_unread: false,
         directory: None,
         asked: HashMap::new(),
         queries: HashMap::new(),
@@ -506,6 +544,10 @@ struct Follow {
     /// Output offset received up to.
     got: u64,
     exited: bool,
+    /// Its client went and it said `--detach` (docs/reach.md §4.2): its output is taken and let go,
+    /// so it never waits on this side, and its peer has work, so a link that drops is made again;
+    /// it isn't a run an upgrade waits for.
+    detached: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -580,6 +622,30 @@ struct Served {
     /// Shared with the run's forwarder: bytes held, and its wake-up when that drops.
     held: Arc<AtomicU64>,
     room: Arc<event_listener::Event>,
+    /// Its asker may never come back for it ([`wire::DETACHED`]): held output gives way rather
+    /// than make it wait.
+    detached: bool,
+    /// When its asker last took output (or its session came back on a link).
+    taken: Instant,
+    /// Output that gave way unread: what its exit says was lost.
+    dropped: u64,
+}
+
+impl Served {
+    /// A detached run's held output gives way, oldest first, down to half of [`BUFFER`], and its
+    /// command goes on: what wasn't taken counts as lost, and an asker that comes back hears of it
+    /// by the jump in offsets.
+    fn give_way(&mut self) {
+        while self.held.load(Ordering::Relaxed) > BUFFER / 2 {
+            let Some((off, _, d)) = self.buf.pop_front() else { break };
+            let end = off + d.len() as u64;
+            self.held.fetch_sub(d.len() as u64, Ordering::Relaxed);
+            self.dropped += end.saturating_sub(self.acked.max(off));
+            self.acked = self.acked.max(end);
+            self.sent = self.sent.max(end);
+        }
+        self.room.notify(usize::MAX);
+    }
 }
 
 /// A session another runner holds with this one.
@@ -609,6 +675,8 @@ struct Node {
     /// Links with ciphertext waiting, flushed after each batch.
     dirty: Vec<String>,
     server: bool,
+    /// The server takes word of a message a link couldn't read ([`In::Unread`]).
+    server_unread: bool,
     directory: Option<(Instant, Vec<RunnerInfo>)>,
     asked: HashMap<u64, Instant>,
     /// Questions local tools asked the server, waiting for its answers.
@@ -624,9 +692,12 @@ impl Node {
     async fn on(&mut self, m: In) {
         match m {
             In::Frame { from, link, open, data, close } => self.on_frame(from, link, open, data, close).await,
-            In::Answer { req, json } => self.on_answer(req, &json).await,
+            In::Answer { req, answer } => self.on_answer(req, answer).await,
+            In::Unread(takes) => self.server_unread = takes,
             In::Server(up) => {
                 self.server = up;
+                // It says again what it takes once it's back.
+                self.server_unread &= up;
                 // Whatever the directory said may have changed while away: ask again.
                 self.directory = None;
                 if !up {
@@ -686,15 +757,15 @@ impl Node {
         self.directory.as_ref().filter(|(at, _)| at.elapsed() < DIRECTORY_TTL).map(|(_, d)| d.as_slice())
     }
 
-    async fn on_answer(&mut self, req: u64, json: &str) {
+    async fn on_answer(&mut self, req: u64, answer: Value) {
         if let Some((_, reply)) = self.queries.remove(&req) {
-            let _ = reply.send(Ok(json.to_owned()));
+            let _ = reply.send(Ok(answer.to_string()));
             return;
         }
         if self.asked.remove(&req).is_none() {
             return;
         }
-        let runners: Vec<RunnerInfo> = serde_json::from_str::<Value>(json).ok().and_then(|v| v.get("runners").cloned()).and_then(|r| serde_json::from_value(r).ok()).unwrap_or_default();
+        let runners: Vec<RunnerInfo> = answer.get("runners").cloned().and_then(|r| serde_json::from_value(r).ok()).unwrap_or_default();
         self.directory = Some((Instant::now(), runners.clone()));
         for (_, w) in std::mem::take(&mut self.waiting) {
             match w {
@@ -781,6 +852,29 @@ impl Node {
     async fn flush(&mut self) {
         for id in std::mem::take(&mut self.dirty) {
             self.send_frames(&id, None).await;
+        }
+    }
+
+    /// A message on link `id` this runner couldn't read: said to the other end (`Unread`: a runner
+    /// from before, which can't read that either, ends the link as on any garbage), and the link
+    /// ends; the server hears of it, naming the runner that sent it, when it takes word of it.
+    async fn unread_on(&mut self, id: &str, role: Role, e: &crate::proto::Unreadable) {
+        let of = match role {
+            Role::Asker => "Say",
+            Role::Doer => "Ask",
+        };
+        let (what, code, why) = (e.what(), e.code(), e.why(of));
+        let from = self.links.get(id).map(|l| l.peer.clone()).unwrap_or_default();
+        tracing::warn!(peer = %from, link = id, %what, code = code.name(), %why, "a reach message couldn't be read: the link ends");
+        let said = match role {
+            Role::Asker => self.say_on(id, &Ask::Unread { what: what.clone(), code, why: why.clone() }).await,
+            Role::Doer => self.say_on(id, &Say::Unread { what: what.clone(), code, why: why.clone() }).await,
+        };
+        if self.server_unread {
+            self.send_out(AgentMsg::LinkUnread { from, link: id.to_owned(), what: what.clone(), code, why: why.clone() }).await;
+        }
+        if said {
+            self.drop_link(id, &format!("{of} {what} couldn't be read ({}): {why}", code.name()), true).await;
         }
     }
 
@@ -895,15 +989,15 @@ impl Node {
             let Some(l) = self.links.get_mut(&link) else { return };
             let role = l.role;
             let next = match role {
-                Role::Asker => l.de.take::<Say>().map(|m| m.map(Msg::Say)),
-                Role::Doer => l.de.take::<Ask>().map(|m| m.map(Msg::Ask)),
+                Role::Asker => l.de.read::<Say>(wire::SAY_VARIANTS).map(|m| m.map(Msg::Say)),
+                Role::Doer => l.de.read::<Ask>(wire::ASK_VARIANTS).map(|m| m.map(Msg::Ask)),
             };
             match next {
                 Ok(Some(Msg::Say(s))) => self.on_say(&link, s).await,
                 Ok(Some(Msg::Ask(a))) => self.on_ask(&link, a).await,
                 Ok(None) => break,
                 Err(e) => {
-                    self.drop_link(&link, &format!("{e:#}"), true).await;
+                    self.unread_on(&link, role, &e).await;
                     return;
                 }
             }
@@ -1063,12 +1157,15 @@ impl Node {
                 let start = offset.max(f.got);
                 let data = data.get(usize::try_from(start - offset).unwrap_or(0)..).map(<[u8]>::to_vec).unwrap_or_default();
                 f.got = end;
-                let says = f.says.clone();
-                if lost > 0 {
-                    let note = format!("\n[kiln reach: {lost} bytes of output were dropped]\n").into_bytes();
-                    let _ = says.send(Say::Output { id, offset: start, stream: Stream::Err, data: note }).await;
+                // A detached run followed on alone: taken and let go, nobody here reads it.
+                if !f.detached {
+                    let says = f.says.clone();
+                    if lost > 0 {
+                        let note = format!("\n[kiln reach: {lost} bytes of output were dropped]\n").into_bytes();
+                        let _ = says.send(Say::Output { id, offset: start, stream: Stream::Err, data: note }).await;
+                    }
+                    let _ = says.send(Say::Output { id, offset: start, stream, data }).await;
                 }
-                let _ = says.send(Say::Output { id, offset: start, stream, data }).await;
                 self.say_on(link, &Ask::Ack { id, upto: end }).await;
             }
             Say::Exit { id, code, signal, error, end, lost } => {
@@ -1112,6 +1209,11 @@ impl Node {
                 }
             }
             Say::Pong { .. } => {}
+            // The other end couldn't read a message of this one's: it ends the link.
+            Say::Unread { what, code, why } => {
+                tracing::warn!(peer = %name, link, %what, code = code.name(), %why, "the other runner couldn't read a message of this one's on a reach link");
+                self.drop_link(link, &format!("{name} couldn't read {what} ({}): {why}", code.name()), false).await;
+            }
         }
     }
 
@@ -1170,6 +1272,7 @@ impl Node {
                         run.acked = r.from.max(run.acked);
                         run.sent = run.acked;
                         run.exit_sent = false;
+                        run.taken = Instant::now();
                         resumed.push(r.id);
                     }
                     None => lost.push(r.id),
@@ -1208,6 +1311,9 @@ impl Node {
             }
             Ask::Ack { id, upto } => {
                 if let Some(r) = self.served.get_mut(&key).and_then(|s| s.runs.get_mut(&id)) {
+                    if upto.min(r.next) > r.acked {
+                        r.taken = Instant::now();
+                    }
                     r.acked = r.acked.max(upto.min(r.next));
                     while r.buf.front().is_some_and(|(o, _, d)| o + d.len() as u64 <= r.acked) {
                         if let Some((_, _, d)) = r.buf.pop_front() {
@@ -1248,6 +1354,11 @@ impl Node {
                         self.say_on(link, &Say::ObjectMissing { id }).await;
                     }
                 }
+            }
+            // The asker couldn't read a message of this one's: it ends the link.
+            Ask::Unread { what, code, why } => {
+                tracing::warn!(peer = %key.0, link, %what, code = code.name(), %why, "the other runner couldn't read a message of this one's on a reach link");
+                self.drop_link(link, &format!("{} couldn't read {what} ({}): {why}", key.0, code.name()), false).await;
             }
         }
     }
@@ -1325,6 +1436,9 @@ impl Node {
                 timed_out: false,
                 held,
                 room,
+                detached: spec.linger_ms == Some(wire::DETACHED),
+                taken: now,
+                dropped: 0,
             },
         );
     }
@@ -1384,8 +1498,8 @@ impl Node {
                 && let Some((code, error)) = r.exit.clone()
             {
                 r.exit_sent = true;
-                let end = r.next;
-                self.say_on(&link, &Say::Exit { id, code, signal: None, error, end, lost: 0 }).await;
+                let (end, lost) = (r.next, r.dropped);
+                self.say_on(&link, &Say::Exit { id, code, signal: None, error, end, lost }).await;
             }
             return;
         }
@@ -1531,7 +1645,7 @@ impl Node {
                 let id = p.next_id;
                 p.next_id += 1;
                 spec.id = id;
-                p.follows.insert(id, Follow { says, got: 0, exited: false });
+                p.follows.insert(id, Follow { says, got: 0, exited: false, detached: false });
                 let _ = reply.send(id);
                 self.send_or_queue(&peer, Ask::Run(spec)).await;
             }
@@ -1550,6 +1664,16 @@ impl Node {
                     self.send_or_queue(&peer, Ask::Sync(ask)).await;
                 }
             }
+            #[cfg(test)]
+            Local::Garble { peer, bytes } => {
+                let link = self.peers.get(&peer).and_then(|p| p.link.clone());
+                if let Some(id) = link
+                    && let Some(l) = self.links.get_mut(&id)
+                    && l.tls.send(&bytes).is_ok()
+                {
+                    self.mark(&id);
+                }
+            }
             Local::Leave { peer, run, sync } => {
                 if let Some(p) = self.peers.get_mut(&peer) {
                     if let Some(id) = run {
@@ -1558,6 +1682,11 @@ impl Node {
                     if let Some(k) = sync {
                         p.syncs.remove(&k);
                     }
+                }
+            }
+            Local::Detach { peer, run } => {
+                if let Some(f) = self.peers.get_mut(&peer).and_then(|p| p.follows.get_mut(&run)) {
+                    f.detached = true;
                 }
             }
             Local::Status { reply } => {
@@ -1578,7 +1707,9 @@ impl Node {
 
     fn busy(&self) -> u64 {
         let doing: usize = self.served.values().map(|s| s.runs.values().filter(|r| r.exit.is_none()).count() + s.syncs.len()).sum();
-        let following: usize = self.peers.values().map(|p| p.follows.len() + p.syncs.len()).sum();
+        // A detached run followed on alone isn't waited for: nobody here reads it, and its runner
+        // goes on without this one.
+        let following: usize = self.peers.values().map(|p| p.follows.values().filter(|f| !f.detached).count() + p.syncs.len()).sum();
         u64::try_from(doing + following).unwrap_or(u64::MAX)
     }
 
@@ -1591,6 +1722,8 @@ impl Node {
                     "runner": n,
                     "state": format!("{:?}", p.state).split_whitespace().next().unwrap_or("").trim_end_matches('{').to_owned(),
                     "runs": p.follows.len(),
+                    "detached": p.follows.values().filter(|f| f.detached).count(),
+                    "link": p.link,
                     "syncs": p.syncs.len(),
                     "host": p.host,
                     "error": p.error,
@@ -1695,6 +1828,11 @@ impl Node {
                         Some(at) if now.duration_since(at) > Duration::from_secs(5) => serve::signal_group(pid, Signal::Kill),
                         Some(_) => {}
                     }
+                }
+                // A detached run waits for no one (docs/reach.md §4.1): holding BUFFER with no link
+                // up, or with none of it taken for GIVE_WAY, its oldest output gives way.
+                if r.detached && r.exit.is_none() && r.held.load(Ordering::Relaxed) >= BUFFER && (detached.is_some() || r.taken.elapsed() > GIVE_WAY) {
+                    r.give_way();
                 }
                 match detached {
                     Some(d) if r.exit.is_none() && d > r.linger => {

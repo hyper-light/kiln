@@ -12,7 +12,7 @@ mod pace;
 mod probes;
 pub mod settings;
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, LazyLock};
@@ -56,6 +56,8 @@ struct Shared {
     pushed: Mutex<Option<Settings>>,
     latest: Mutex<Option<String>>,
     changed: crate::rt::Notify,
+    /// Sessions a person paused ([`pause`]): their groups held stopped, paced or not.
+    paused: Mutex<HashSet<String>>,
 }
 
 static SHARED: LazyLock<Shared> = LazyLock::new(|| Shared {
@@ -68,6 +70,7 @@ static SHARED: LazyLock<Shared> = LazyLock::new(|| Shared {
     pushed: Mutex::new(None),
     latest: Mutex::new(None),
     changed: crate::rt::Notify::new(),
+    paused: Mutex::new(HashSet::new()),
 });
 
 fn kick() {
@@ -132,6 +135,34 @@ pub fn held(session: &str) -> bool {
     SHARED.admit.lock().waiting.contains_key(session)
 }
 
+/// A person pauses agent session `session` (`on`), or resumes it: its processes stop where they
+/// are, held by the pacer whether or not headroom paces, and its guard starts them again should the
+/// runner end (docs/headroom.md, "Failing safe"). Why it can't be paused here, when it can't.
+pub fn pause(session: &str, on: bool) -> Result<(), String> {
+    let s = &*SHARED;
+    if on {
+        if !s.running.load(Ordering::Acquire) {
+            return Err("its machine's runner doesn't pace its work, so it can't stop an agent's processes".to_owned());
+        }
+        if pace::how() == "none" {
+            return Err("its machine gives kiln no way to stop an agent's processes (no cgroup of kiln's own there)".to_owned());
+        }
+        s.paused.lock().insert(session.to_owned());
+    } else {
+        s.paused.lock().remove(session);
+    }
+    kick();
+    Ok(())
+}
+
+/// The pacer's shares with each group a person paused ([`pause`]) held all the time: at 0 it never
+/// runs, and only while a guard runs that will start it again.
+fn with_paused(shares: &mut HashMap<PathBuf, f64>, groups: &[pace::Group], paused: &HashSet<String>) {
+    for g in groups.iter().filter(|g| g.session.as_ref().is_some_and(|s| paused.contains(s))) {
+        shares.insert(g.dir.clone(), 0.0);
+    }
+}
+
 /// What a runner's headroom works from.
 #[derive(Clone, Debug)]
 pub struct Ctx {
@@ -148,9 +179,10 @@ pub struct Ctx {
 pub struct Handle;
 
 impl Handle {
-    /// What the server sent (`ServerMsg::Headroom`): applied at once, and kept for the next start.
-    pub fn push(&self, json: &str) {
-        match serde_json::from_str::<Push>(json).map_err(|e| e.to_string()).and_then(|p| p.settings.validated().map(|s| (s, p.standby))) {
+    /// What the server sent (`ServerMsg::Headroom`, read by `wire::payload`): applied at once, and
+    /// kept for the next start.
+    pub fn push(&self, p: Push) {
+        match p.settings.validated().map(|s| (s, p.standby)) {
             Ok((s, standby)) => {
                 SHARED.standby.store(standby, Ordering::Release);
                 *SHARED.pushed.lock() = Some(s);
@@ -316,11 +348,19 @@ fn id_of(g: &pace::Group) -> String {
     g.session.clone().unwrap_or_else(|| g.dir.display().to_string())
 }
 
+/// The share of the last `span` that a group was let run: all of it less what the pacer held it
+/// stopped (`stopped` in all now, `before` at the look before).
+fn ran_share(stopped: Option<&Duration>, before: Option<&Duration>, span: Option<Duration>) -> f64 {
+    let Some(span) = span.filter(|s| !s.is_zero()) else { return 1.0 };
+    let held = stopped.copied().unwrap_or_default().saturating_sub(before.copied().unwrap_or_default());
+    (1.0 - held.as_secs_f64() / span.as_secs_f64()).clamp(0.0, 1.0)
+}
+
 fn run(ctx: Ctx, mut settings: Settings) {
     let _ = std::fs::create_dir_all(&ctx.dir);
     let wake: Arc<dyn Fn() + Send + Sync> = Arc::new(kick);
     let specs = |s: &Settings| -> Vec<probes::Spec> { targets(s, &ctx).into_iter().map(|t| probes::Spec { tolerance: Duration::from_millis(u64::from(t.tolerance_ms())), name: t.name, probe: t.probe }).collect() };
-    let engine_targets = |s: &Settings| -> Vec<Target> { targets(s, &ctx).into_iter().map(|t| Target { tolerance_us: f64::from(t.tolerance_ms()) * 1e3, served: t.probe.served(), name: t.name }).collect() };
+    let engine_targets = |s: &Settings| -> Vec<Target> { targets(s, &ctx).into_iter().map(|t| Target { tolerance_us: f64::from(t.tolerance_ms()) * 1e3, name: t.name }).collect() };
     let learned_path = ctx.dir.join(LEARNED);
     let learned: Learned = read_json(&learned_path).unwrap_or_default();
     let mut engine = Engine::new(settings.policy(), engine_targets(&settings), learned, now_us());
@@ -332,7 +372,10 @@ fn run(ctx: Ctx, mut settings: Settings) {
     let mut loads: Vec<pace::Load> = Vec::new();
     let mut measured_at: Option<std::time::Instant> = None;
     let mut delivered: Option<f64> = None;
-    let mut shares: HashMap<PathBuf, f64> = HashMap::new();
+    // What each group was let run of the stretch it was measured over, and how long the pacer had
+    // held it stopped in all at the last look.
+    let mut ran: HashMap<PathBuf, f64> = HashMap::new();
+    let mut held_before: HashMap<PathBuf, Duration> = HashMap::new();
     let mut events: Vec<String> = Vec::new();
     let mut last_status: Option<String> = None;
     tracing::info!(pacing = pace::how(), targets = probes.specs.len(), "headroom: watching this machine");
@@ -361,13 +404,18 @@ fn run(ctx: Ctx, mut settings: Settings) {
             engine = Engine::new(settings.policy(), engine_targets(&settings), learned, now_us());
             SHARED.room.notify(usize::MAX);
         }
-        // The machine and its groups, measured as often as the fastest probe: the time scale the
-        // engine decides at.
-        if measured_at.is_none_or(|m| m.elapsed() >= Duration::from_micros(probes.fastest_us())) {
-            measured_at = Some(std::time::Instant::now());
+        // The machine and its groups, measured as often as the fastest probe, and never over less
+        // than a period: the time scale the engine decides at.
+        if measured_at.is_none_or(|m| m.elapsed() >= Duration::from_micros(probes.fastest_us()).max(pace::MIN_PERIOD)) {
+            let at = std::time::Instant::now();
+            let last = measured_at.replace(at);
             groups = pace::groups(settings.escapes);
             loads = meter.load(&groups);
             delivered = disks.rate();
+            let held = pacer.stopped();
+            let span = last.map(|l| at.duration_since(l));
+            ran = groups.iter().map(|g| (g.dir.clone(), ran_share(held.get(&g.dir), held_before.get(&g.dir), span))).collect();
+            held_before = held;
         }
         let (answers, inflight) = probes.drain();
         let now = now_us();
@@ -377,9 +425,12 @@ fn run(ctx: Ctx, mut settings: Settings) {
             let waiting: Vec<Waiting> = a.waiting.iter().map(|(s, since)| Waiting { id: s.clone(), key: s.clone(), class: Class::Agent, since_us: *since }).collect();
             (waiting, std::mem::take(&mut a.ended))
         };
+        // What a person paused is theirs, not the engine's: it neither counts nor learns from it.
+        let paused = SHARED.paused.lock().clone();
         let running: Vec<Group> = groups
             .iter()
             .zip(&loads)
+            .filter(|(g, _)| g.session.as_ref().is_none_or(|s| !paused.contains(s)))
             .map(|(g, l)| Group {
                 id: id_of(g),
                 key: g.session.clone().unwrap_or_else(|| g.label.clone()),
@@ -388,7 +439,7 @@ fn run(ctx: Ctx, mut settings: Settings) {
                 write_bps: l.write_rate,
                 cpu_cores: l.cpu_pct / 100.0,
                 mem_bytes: l.mem_bytes,
-                share: shares.get(&g.dir).copied().unwrap_or(1.0),
+                share: ran.get(&g.dir).copied().unwrap_or(1.0),
             })
             .collect();
         // Sessions whose turn ended, or that ended (with processes or without): by the same id
@@ -401,12 +452,13 @@ fn run(ctx: Ctx, mut settings: Settings) {
         }
         // Pacing: the engine's shares, unless off or another process of this machine paces.
         let pacing = settings.enabled && !SHARED.standby.load(Ordering::Acquire);
-        shares = if pacing {
+        let mut shares: HashMap<PathBuf, f64> = if pacing {
             plan.shares.iter().filter(|p| p.share < 1.0).filter_map(|p| groups.iter().find(|g| id_of(g) == p.id).map(|g| (g.dir.clone(), p.share))).collect()
         } else {
             HashMap::new()
         };
-        pacer.set(shares.iter().map(|(d, s)| (d.clone(), (s * kiln_ci::headroom::pace::SHARE_STEPS).floor().clamp(0.0, 99.0) as u8)).collect(), Duration::from_micros(probes.fastest_us()));
+        with_paused(&mut shares, &groups, &paused);
+        pacer.set(shares.iter().map(|(d, s)| (d.clone(), pace::step_of(*s))).collect(), Duration::from_micros(probes.fastest_us()));
         // Admission: who the engine let start.
         // A place holds until the session's turn ends (or it does): how long it was expected to
         // run is the engine's to plan with, not when the place goes.
@@ -462,7 +514,7 @@ fn run(ctx: Ctx, mut settings: Settings) {
                     cpu_pct: l.cpu_pct.round() as u32,
                     write_mb_s: (l.write_rate / 1e6).round() as u32,
                     mem_mb: (l.mem_bytes / 1e6).round() as u64,
-                    share: shares.get(&g.dir).map_or(100, |s| (s * kiln_ci::headroom::pace::SHARE_STEPS).floor() as u8),
+                    share: shares.get(&g.dir).map_or(100, |s| pace::step_of(*s)),
                     why: plan.shares.iter().find(|p| p.id == g.dir.display().to_string()).map(|p| p.why.clone()).unwrap_or_default(),
                 })
                 .collect(),
@@ -482,14 +534,80 @@ fn run(ctx: Ctx, mut settings: Settings) {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
+
+    pub(crate) struct Admission {
+        session: String,
+    }
+
+    impl Admission {
+        pub(crate) fn held(session: &str) -> Self {
+            SHARED.admit.lock().waiting.insert(session.to_owned(), now_us());
+            Self { session: session.to_owned() }
+        }
+
+        pub(crate) fn grant(&self) {
+            let mut a = SHARED.admit.lock();
+            a.waiting.remove(&self.session);
+            a.granted.insert(self.session.clone(), u64::MAX);
+            a.fresh.insert(self.session.clone());
+            drop(a);
+            SHARED.room.notify(usize::MAX);
+        }
+    }
+
+    impl Drop for Admission {
+        fn drop(&mut self) {
+            let mut a = SHARED.admit.lock();
+            a.waiting.remove(&self.session);
+            a.granted.remove(&self.session);
+            a.fresh.remove(&self.session);
+        }
+    }
 
     #[test]
     fn without_a_runner_every_session_is_let_in() {
         if !SHARED.running.load(Ordering::Acquire) {
             assert!(admit("s1", Class::Agent));
         }
+    }
+
+    #[test]
+    fn a_session_a_person_paused_is_held_all_the_time_whatever_the_engine_gave_it() {
+        let group = |dir: &str, session: Option<&str>| pace::Group { dir: dir.into(), label: dir.into(), session: session.map(str::to_owned) };
+        let groups = [group("/a", Some("a")), group("/b", Some("b")), group("/unit", None)];
+        let mut shares: HashMap<PathBuf, f64> = [(PathBuf::from("/b"), 0.5)].into_iter().collect();
+        with_paused(&mut shares, &groups, &["a".to_owned()].into_iter().collect());
+        assert_eq!(shares.get(Path::new("/a")), Some(&0.0));
+        assert_eq!(pace::step_of(0.0), 0, "never a slice: it doesn't run");
+        // The others keep what the engine gave them, or run.
+        assert_eq!(shares.get(Path::new("/b")), Some(&0.5));
+        assert_eq!(shares.get(Path::new("/unit")), None);
+        with_paused(&mut shares, &groups, &["b".to_owned()].into_iter().collect());
+        assert_eq!(shares.get(Path::new("/b")), Some(&0.0));
+    }
+
+    #[test]
+    fn without_a_runner_pacing_its_work_nothing_is_paused_and_resuming_always_goes() {
+        if !SHARED.running.load(Ordering::Acquire) {
+            assert!(pause("s-paused", true).is_err_and(|why| why.contains("can't stop an agent's processes")));
+            assert!(!SHARED.paused.lock().contains("s-paused"));
+        }
+        assert_eq!(pause("s-paused", false), Ok(()));
+    }
+
+    #[test]
+    fn a_groups_share_is_the_part_of_the_stretch_it_was_let_run() {
+        let ms = Duration::from_millis;
+        assert!((ran_share(Some(&ms(300)), Some(&ms(100)), Some(ms(1000))) - 0.8).abs() < 1e-9);
+        assert_eq!(ran_share(Some(&ms(1100)), Some(&ms(100)), Some(ms(1000))), 0.0);
+        assert_eq!(ran_share(Some(&ms(5000)), None, Some(ms(1000))), 0.0);
+        // Never held, held and let go since, or the first look: it ran it all as far as is known.
+        assert_eq!(ran_share(None, None, Some(ms(1000))), 1.0);
+        assert_eq!(ran_share(None, Some(&ms(100)), Some(ms(1000))), 1.0);
+        assert_eq!(ran_share(Some(&ms(300)), Some(&ms(100)), None), 1.0);
+        assert_eq!(ran_share(Some(&ms(300)), Some(&ms(100)), Some(Duration::ZERO)), 1.0);
     }
 
     #[test]

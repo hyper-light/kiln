@@ -6,6 +6,9 @@
 //! name gets a new key the revocation doesn't touch), and [`revocations`] feeds the chain checker
 //! (`kiln_ci::identity::chain`).
 
+use std::sync::Arc;
+
+use base64::Engine as _;
 use kiln_ci::identity::chain::{Actor, Holder, Identity, Revocation};
 use rusqlite::{OptionalExtension as _, params};
 
@@ -37,7 +40,7 @@ pub async fn own_identities(store: &Store, pki: &crate::pki::Pki) -> anyhow::Res
     for (kind, actor) in [("server", Actor::Server), ("cd", Actor::Cd)] {
         let identity = Identity::new(pki.organization(), actor);
         let uri = identity.uri().map_err(|e| anyhow::anyhow!("{e}"))?;
-        let (key_path, cert_path) = (pki.dir().join(format!("{kind}-signing.key")), pki.dir().join(format!("{kind}-signing.pem")));
+        let (key_path, cert_path) = signing_files(pki, kind);
         let held = std::fs::read_to_string(&cert_path).ok();
         let marks = held.as_deref().and_then(|c| crate::pki::fingerprints(c).ok());
         let key_revoked = marks.as_ref().is_some_and(|m| revoked.iter().any(|r| r.key.as_deref().is_some_and(|k| k.eq_ignore_ascii_case(&m.key))));
@@ -62,6 +65,86 @@ pub async fn own_identities(store: &Store, pki: &crate::pki::Pki) -> anyhow::Res
         tracing::info!(identity = %identity, "issued an identity");
     }
     Ok(())
+}
+
+/// Where the server's or CD's (`kind`) signing key and certificate are.
+fn signing_files(pki: &crate::pki::Pki, kind: &str) -> (std::path::PathBuf, std::path::PathBuf) {
+    (pki.dir().join(format!("{kind}-signing.key")), pki.dir().join(format!("{kind}-signing.pem")))
+}
+
+/// Signs `message` as the server itself, or CD (`kind`: `server` or `cd`), with its own key
+/// ([`own_identities`]), read from its file each time it signs, so the hub keeps no copy: the
+/// signature (ECDSA P-256 with SHA-256, ASN.1) and the certificate it verifies under (DER), as
+/// `kiln_ci::identity::statement::bundle` takes them. It verifies to kiln's root as
+/// `kiln://<org>/server` (CD's as `…/server/cd`) through `kiln_ci::identity::chain::verify_signed`.
+pub fn sign_own(pki: &crate::pki::Pki, kind: &str, message: &[u8]) -> anyhow::Result<(Vec<u8>, Vec<u8>)> {
+    use rcgen::SigningKey as _;
+    anyhow::ensure!(matches!(kind, "server" | "cd"), "kiln signs as its server or CD, not as {kind:?}");
+    let (key_path, cert_path) = signing_files(pki, kind);
+    let key = std::fs::read_to_string(&key_path).map_err(|e| anyhow::anyhow!("the {kind}'s signing key ({}): {e}", key_path.display()))?;
+    let cert = std::fs::read_to_string(&cert_path).map_err(|e| anyhow::anyhow!("the {kind}'s signing certificate ({}): {e}", cert_path.display()))?;
+    let signature = rcgen::KeyPair::from_pem(&key)?.sign(message)?;
+    Ok((signature, crate::pki::der_of(&cert)?))
+}
+
+/// `commit` (a commit object as `git cat-file commit` gives it) signed by `sign` in git's x509 form
+/// (W27-R03, `kiln_ci::identity::gitsig`): the object to write in its place. `sign` signs the bytes
+/// it's given and says the certificate (DER) its signature verifies under, as [`sign_own`] does.
+pub fn signed_commit(commit: &[u8], sign: impl FnOnce(&[u8]) -> anyhow::Result<(Vec<u8>, Vec<u8>)>) -> anyhow::Result<Vec<u8>> {
+    use kiln_ci::identity::gitsig;
+    let payload = gitsig::payload(commit);
+    let (signature, cert) = sign(&gitsig::to_sign(&payload).map_err(|e| anyhow::anyhow!("{e}"))?)?;
+    let armored = gitsig::armor(&payload, &signature, &[&cert]).map_err(|e| anyhow::anyhow!("{e}"))?;
+    Ok(gitsig::with_signature(commit, &armored))
+}
+
+/// `payload` of `payload_type`, signed as the server itself, or CD (`kind`), over its PAE
+/// ([`sign_own`]): a statement's bundle ([`kiln_ci::identity::statement::bundle`]).
+pub fn sign_as(pki: &crate::pki::Pki, kind: &str, payload_type: &str, payload: &[u8]) -> anyhow::Result<serde_json::Value> {
+    use kiln_ci::identity::statement;
+    let (signature, certificate) = sign_own(pki, kind, &statement::to_sign(payload_type, payload))?;
+    Ok(statement::bundle(payload_type, payload, &signature, &certificate))
+}
+
+/// The server's delegation of attempt `attempt` of leg `job` to the identity `uri` it just
+/// certified (`cert_pem`), signed as itself and kept as taken now (W27-R05, R06;
+/// [`kiln_ci::attest::leg::delegation`]): about what kiln handed it (the commit its certificate
+/// names, the assignment kiln sent it), until the certificate ends, with whether the leg signs
+/// (`signs`, as its runner said). Its digest, for the leg's records to name in `under`.
+async fn delegate_leg(hub: &Hub, job: &str, attempt: u32, uri: &str, cert_pem: &str, facts: &[(u64, String)], signs: bool) -> anyhow::Result<String> {
+    use kiln_ci::identity::{chain::fulcio, statement};
+    let commit = facts.iter().find(|(m, _)| *m == fulcio::SOURCE_REPOSITORY_DIGEST).map(|(_, c)| c.as_str());
+    let assignment = crate::ci::signed::handed_digest(&hub.store, job, attempt).await?;
+    let until = crate::pki::cert_info(cert_pem)?.not_after;
+    let server = Identity::new(hub.pki.organization(), Actor::Server).uri().map_err(|e| anyhow::anyhow!("{e}"))?;
+    let payload = statement::payload(&kiln_ci::attest::leg::delegation(&server, uri, commit, assignment.as_deref(), until))?;
+    let bundle = sign_as(&hub.pki, "server", statement::PAYLOAD_DELEGATION, &payload)?.to_string();
+    let digest = statement::digest(statement::PAYLOAD_DELEGATION, &payload);
+    let (j, d, at) = (job.to_owned(), digest.clone(), crate::util::now_unix());
+    hub.store
+        .call(move |c| {
+            let tx = crate::store::tx(c)?;
+            tx.execute("INSERT OR REPLACE INTO ci_leg_delegations (digest, job_id, bundle, taken_at, signs) VALUES (?1, ?2, ?3, ?4, ?5)", params![d, j, bundle, at, signs])?;
+            crate::trail::take(&tx, &bundle, at)?;
+            tx.commit()?;
+            Ok(())
+        })
+        .await?;
+    Ok(digest)
+}
+
+/// The delegations kiln's server gave leg `job` (each attempt's), by digest: each bundle and when
+/// kiln took it, as [`kiln_ci::identity::statement::verify_under`] asks of kiln's records.
+pub(crate) async fn delegations_of(store: &Store, job: &str) -> anyhow::Result<std::collections::HashMap<String, (serde_json::Value, i64)>> {
+    let id = job.to_owned();
+    let rows: Vec<(String, String, i64)> = store
+        .call(move |c| {
+            let mut st = c.prepare("SELECT digest, bundle, taken_at FROM ci_leg_delegations WHERE job_id = ?1")?;
+            let rows = st.query_map([&id], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?.collect::<Result<Vec<_>, _>>()?;
+            Ok(rows)
+        })
+        .await?;
+    Ok(rows.into_iter().filter_map(|(d, b, at)| Some((d, (serde_json::from_str(&b).ok()?, at)))).collect())
 }
 
 /// Keeps the server's and CD's identities current while the server runs (W27-R01):
@@ -113,6 +196,10 @@ pub enum PersonRefused {
     KeyTaken(String),
     #[error("not a certificate request: {0}")]
     BadCsr(String),
+    #[error("not an SSH public key kiln reads: {0}")]
+    BadKey(String),
+    #[error("this SSH key signs for {0} already, and a key signs for one person")]
+    KeyBound(String),
     #[error(transparent)]
     Failed(#[from] anyhow::Error),
 }
@@ -128,6 +215,8 @@ impl PersonRefused {
             Self::KeyRevoked(_) => "key_revoked",
             Self::KeyTaken(_) => "key_taken",
             Self::BadCsr(_) => "bad_csr",
+            Self::BadKey(_) => "bad_key",
+            Self::KeyBound(_) => "key_bound",
             Self::Failed(_) => "failed",
         }
     }
@@ -136,8 +225,8 @@ impl PersonRefused {
         use http::StatusCode;
         match self {
             Self::NotAPerson | Self::Disabled | Self::Unnamed(_) => StatusCode::FORBIDDEN,
-            Self::KeyRevoked(_) | Self::KeyTaken(_) => StatusCode::CONFLICT,
-            Self::BadCsr(_) => StatusCode::BAD_REQUEST,
+            Self::KeyRevoked(_) | Self::KeyTaken(_) | Self::KeyBound(_) => StatusCode::CONFLICT,
+            Self::BadCsr(_) | Self::BadKey(_) => StatusCode::BAD_REQUEST,
             Self::Failed(_) => StatusCode::INTERNAL_SERVER_ERROR,
         }
     }
@@ -157,6 +246,125 @@ pub fn person_name(user: Option<&str>) -> Result<String, String> {
         Err(kiln_ci::identity::chain::Refusal::BadIdentity { why, .. }) => Err(format!("kiln can't name `{name}` in an identity as it is ({why}), and changed to fit it could name someone else")),
         Err(e) => Err(format!("kiln can't name `{name}` in an identity: {e}")),
     }
+}
+
+/// The name of the person `caller` is (W27-R02): a person signed in (the owner, a user, a user's
+/// personal access token), never an agent, a job or a peer, and still enabled.
+async fn person_signed_in(store: &Store, caller: &crate::authz::Caller) -> Result<String, PersonRefused> {
+    use crate::authz::gate::Kind;
+    if caller.agent.is_some() || !matches!(caller.kind, Kind::Owner | Kind::User | Kind::Pat) {
+        return Err(PersonRefused::NotAPerson);
+    }
+    let name = match caller.user.clone() {
+        None => None,
+        Some(uid) => Some(store.call(move |c| Ok(c.query_row("SELECT name FROM users WHERE id = ?1 AND disabled_at IS NULL", [uid], |r| r.get::<_, String>(0)).optional()?)).await?.ok_or(PersonRefused::Disabled)?),
+    };
+    person_name(name.as_deref()).map_err(PersonRefused::Unnamed)
+}
+
+/// The identity of the person `caller` is, as `kiln login` certifies it (`kiln://<org>/person/<name>`):
+/// never an agent's, a job's or a peer's (docs/ci.md W27-R08: whom work handed to a person goes to).
+pub async fn person_identity(store: &Store, org: &str, caller: &crate::authz::Caller) -> Result<String, PersonRefused> {
+    let name = person_signed_in(store, caller).await?;
+    Identity::new(org, Actor::Person { name }).uri().map_err(|e| PersonRefused::Unnamed(e.to_string()))
+}
+
+/// Whether `signer`, a certificate's identity, is `caller` (W27-R04): the person signed in, or the
+/// agent session they are, for the person kiln says it acts for, at whatever epoch and on whatever
+/// runner holds its key.
+pub async fn is_caller(hub: &Hub, caller: &crate::authz::Caller, signer: &Identity) -> bool {
+    if signer.org != hub.pki.organization() {
+        return false;
+    }
+    match (&signer.actor, caller.agent.as_deref()) {
+        (Actor::Person { name }, None) => person_signed_in(&hub.store, caller).await.is_ok_and(|p| p == *name),
+        (Actor::Agent { person, agent, .. }, Some(session)) if agent == session => match crate::mcp::whose(hub, session).await {
+            Some(p) if p == "owner" => person == "admin",
+            Some(p) => *person == person_of(&p),
+            None => false,
+        },
+        _ => false,
+    }
+}
+
+/// The identity of the person `caller` is, as their verdicts and comments are signed (W27-R04).
+pub async fn person_uri(hub: &Hub, caller: &crate::authz::Caller) -> Result<String, PersonRefused> {
+    let name = person_signed_in(&hub.store, caller).await?;
+    Identity::new(hub.pki.organization(), Actor::Person { name }).uri().map_err(|e| PersonRefused::Unnamed(e.to_string()))
+}
+
+/// An SSH key a person signs commits with, bound to their identity (W27-R03).
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct SshSigner {
+    pub fingerprint: String,
+    pub kind: String,
+    pub comment: String,
+    pub added_at: i64,
+}
+
+/// Binds SSH public key `line` (as its `.pub` file has it) to the identity of the person `caller`
+/// is (W27-R03), so the commits it signs verify as them: a person signed in, never an agent, a job
+/// or a peer; a key is bound to one person.
+pub async fn add_ssh_signer(store: &Store, caller: &crate::authz::Caller, line: &str) -> Result<SshSigner, PersonRefused> {
+    let person = person_signed_in(store, caller).await?;
+    let key = kiln_ci::identity::sshsig::PublicKey::parse(line).map_err(PersonRefused::BadKey)?;
+    let signer = SshSigner { fingerprint: key.fingerprint(), kind: key.kind.clone(), comment: key.comment.clone(), added_at: crate::util::now_unix() };
+    let (b64, row) = (base64::engine::general_purpose::STANDARD.encode(&key.blob), signer.clone());
+    let bound = store
+        .call(move |c| {
+            let other: Option<String> = c.query_row("SELECT person FROM ssh_signers WHERE key = ?1 AND removed_at IS NULL AND person <> ?2", params![b64, person], |r| r.get(0)).optional()?;
+            if other.is_some() {
+                return Ok(other);
+            }
+            c.execute(
+                "INSERT INTO ssh_signers (key, person, kind, fingerprint, comment, added_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+                 ON CONFLICT(key) DO UPDATE SET person = excluded.person, comment = excluded.comment, added_at = excluded.added_at, removed_at = NULL",
+                params![b64, person, row.kind, row.fingerprint, row.comment, row.added_at],
+            )?;
+            Ok(None)
+        })
+        .await?;
+    match bound {
+        Some(other) => Err(PersonRefused::KeyBound(other)),
+        None => Ok(signer),
+    }
+}
+
+/// The SSH keys bound to the person `caller` is (W27-R03).
+pub async fn ssh_signers(store: &Store, caller: &crate::authz::Caller) -> Result<Vec<SshSigner>, PersonRefused> {
+    let person = person_signed_in(store, caller).await?;
+    Ok(store
+        .call(move |c| {
+            let mut q = c.prepare("SELECT fingerprint, kind, comment, added_at FROM ssh_signers WHERE person = ?1 AND removed_at IS NULL ORDER BY added_at, fingerprint")?;
+            let rows = q.query_map([person], |r| Ok(SshSigner { fingerprint: r.get(0)?, kind: r.get(1)?, comment: r.get(2)?, added_at: r.get(3)? }))?.collect::<Result<Vec<_>, _>>()?;
+            Ok(rows)
+        })
+        .await?)
+}
+
+/// Unbinds the SSH key with `fingerprint` from the person `caller` is (W27-R03): it signs for no
+/// one from now. Whether one was bound.
+pub async fn remove_ssh_signer(store: &Store, caller: &crate::authz::Caller, fingerprint: &str) -> Result<bool, PersonRefused> {
+    let person = person_signed_in(store, caller).await?;
+    let fingerprint = fingerprint.to_owned();
+    Ok(store.call(move |c| Ok(c.execute("UPDATE ssh_signers SET removed_at = ?3 WHERE person = ?1 AND fingerprint = ?2 AND removed_at IS NULL", params![person, fingerprint, crate::util::now_unix()])? > 0)).await?)
+}
+
+/// Every SSH key bound to a person still enabled, as a push's commits are checked against them
+/// (W27-R03): each person's name and their key's blob.
+pub async fn bound_ssh_keys(store: &Store) -> anyhow::Result<Vec<(String, Vec<u8>)>> {
+    let rows: Vec<(String, String)> = store
+        .call(|c| {
+            let mut q = c.prepare(
+                "SELECT s.person, s.key FROM ssh_signers s WHERE s.removed_at IS NULL
+                   AND (s.person = 'admin' OR EXISTS (SELECT 1 FROM users u WHERE u.name = s.person AND u.disabled_at IS NULL))
+                 ORDER BY s.person, s.added_at",
+            )?;
+            let rows = q.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?.collect::<Result<Vec<_>, _>>()?;
+            Ok(rows)
+        })
+        .await?;
+    Ok(rows.into_iter().filter_map(|(person, b64)| base64::engine::general_purpose::STANDARD.decode(b64).ok().map(|blob| (person, blob))).collect())
 }
 
 /// A person's identity for a key made on their own device (W27-R02): issued to a person signed
@@ -265,6 +473,49 @@ struct Kept {
 enum Cred<'a> {
     Bearer(&'a str),
     Cookie(&'a str),
+}
+
+/// `POST <path>` with `body` to the server `kiln login` signed this device in to, as the person it
+/// signed in as (docs/ci.md W27-R08: what a person signs on this device is theirs, so it's asked
+/// as them): its answer, or why not. A sign-in that's the machine's admin token is found again.
+pub async fn post_as_person(cfg: &crate::config::Config, path: &str, body: &serde_json::Value) -> anyhow::Result<serde_json::Value> {
+    use anyhow::Context as _;
+    let dir = device_dir();
+    let kept: Kept = serde_json::from_str(&std::fs::read_to_string(dir.join("identity.json")).context("this device isn't signed in: `kiln login` first")?)?;
+    let found;
+    let cred = match &kept.sign_in {
+        SignIn::Token(t) => Cred::Bearer(t),
+        SignIn::Session(s) => Cred::Cookie(s),
+        SignIn::Found => {
+            found = crate::access::resolve(cfg, Some(&kept.url), None).await?.token;
+            Cred::Bearer(&found)
+        }
+    };
+    let client = crate::http::client::Client::public()?;
+    let req = client.post(&format!("{}{path}", kept.url.trim_end_matches('/'))).json(body);
+    let req = match cred {
+        Cred::Bearer(t) => req.bearer(t),
+        Cred::Cookie(s) => req.header("Cookie", &format!("kiln_session={s}")),
+    };
+    let resp = req.send().await?;
+    let status = resp.status();
+    let v: serde_json::Value = resp.json(1 << 20).await.unwrap_or_default();
+    anyhow::ensure!((200..300).contains(&status), "{}", v.get("error").and_then(serde_json::Value::as_str).map_or_else(|| format!("HTTP {status}"), str::to_owned));
+    Ok(v)
+}
+
+/// `s` signed on this device as `payload_type`, with the key `kiln login` made it: its Sigstore
+/// bundle (docs/ci.md W27-R08: a person's receipt, signed on their own device).
+pub fn device_signed(payload_type: &str, s: &kiln_ci::identity::statement::Statement) -> anyhow::Result<serde_json::Value> {
+    use anyhow::Context as _;
+    use kiln_ci::identity::statement;
+    use rcgen::SigningKey as _;
+    let dir = device_dir();
+    let key = std::fs::read_to_string(dir.join("identity.key")).with_context(|| format!("this device has no key to sign with ({}): `kiln login` makes one", dir.display()))?;
+    let cert = std::fs::read_to_string(dir.join("identity.pem")).with_context(|| format!("this device's key has no certificate ({}): `kiln login` again", dir.display()))?;
+    let payload = statement::payload(s)?;
+    let signature = rcgen::KeyPair::from_pem(&key).context("this device's key")?.sign(&statement::to_sign(payload_type, &payload))?;
+    Ok(statement::bundle(payload_type, &payload, &signature, &crate::pki::der_of(&cert)?))
 }
 
 /// This device's certificate, as kiln issued it.
@@ -536,19 +787,41 @@ pub async fn runner_identity(hub: &Hub, machine: &str, instance: &str) -> anyhow
     Ok(Identity::new(hub.pki.organization(), Actor::Runner { enrolled_by, machine: machine.to_owned(), instance: instance.to_owned() }))
 }
 
+/// How long an agent's ask waits for its session to open on kiln. The runner asks as the session
+/// opens, and the ask can reach kiln before the session's Open does (the Open goes over the
+/// channel, kept until acknowledged): refused then, the session had no identity until its next
+/// update, and one done in a moment never had one (docs/ci.md W27-R01).
+const OPEN_WAIT: std::time::Duration = std::time::Duration::from_secs(10);
+
 /// A runner process asked for an identity ([`crate::proto::AgentMsg::Identity`]): the certificate,
 /// recorded, or why not, back to it. Its earlier certificates for the same subject are revoked by
-/// serial (the key goes on in the same process).
-pub async fn on_ask(hub: &Hub, peer: PeerId, machine: &str, json: &str) {
-    let ask: IdentityAsk = match serde_json::from_str(json) {
-        Ok(a) => a,
-        Err(e) => return tracing::debug!(agent = %machine, error = %e, "an unreadable identity request"),
-    };
+/// serial (the key goes on in the same process). An agent's ask for a session kiln hasn't heard of
+/// yet waits for the session's Open, [`OPEN_WAIT`] at most, in a task of its own, so this runner's
+/// messages (the Open among them) go on being taken meanwhile; every other ask is answered at once.
+pub async fn on_ask(hub: &Arc<Hub>, peer: PeerId, machine: &str, ask: IdentityAsk) {
+    let unopened = |hub: &Hub, ask: &IdentityAsk| ask.kind == "agent" && ask.of.as_deref().is_some_and(|s| hub.harness.info(s).is_none());
+    if unopened(hub, &ask) {
+        let (hub, machine) = (Arc::clone(hub), machine.to_owned());
+        crate::rt::spawn(async move {
+            let until = std::time::Instant::now() + OPEN_WAIT;
+            while unopened(&hub, &ask) && std::time::Instant::now() < until {
+                crate::rt::sleep(std::time::Duration::from_millis(50)).await;
+            }
+            answer(&hub, peer, &machine, &ask).await;
+        });
+        return;
+    }
+    answer(hub, peer, machine, &ask).await;
+}
+
+/// The certificate `ask` is for, recorded, or why not, back to the runner process that asked.
+async fn answer(hub: &Hub, peer: PeerId, machine: &str, ask: &IdentityAsk) {
     let mut given = IdentityGiven { kind: ask.kind.clone(), of: ask.of.clone(), epoch: ask.epoch, ..IdentityGiven::default() };
-    match issue(hub, peer, machine, &ask).await {
-        Ok((uri, pem)) => {
+    match issue(hub, peer, machine, ask).await {
+        Ok((uri, pem, delegation)) => {
             given.uri = uri;
             given.cert_pem = Some(pem);
+            given.delegation = delegation;
         }
         Err(e) => {
             tracing::warn!(agent = %machine, kind = %ask.kind, error = %format!("{e:#}"), "no identity issued");
@@ -560,23 +833,29 @@ pub async fn on_ask(hub: &Hub, peer: PeerId, machine: &str, json: &str) {
     }
 }
 
-async fn issue(hub: &Hub, peer: PeerId, machine: &str, ask: &IdentityAsk) -> anyhow::Result<(String, String)> {
+/// Which of `machine`'s runner processes asked, as it said when it joined. One that isn't joined
+/// now (gone while its ask waited for its session to open) is named in no certificate, rather than
+/// certified as a process kiln can't say it is (docs/ci.md W27-R01).
+fn asker(hub: &Hub, peer: PeerId, machine: &str) -> anyhow::Result<String> {
+    hub.instances.lock().get(peer).map(crate::instances::Instance::label).ok_or_else(|| anyhow::anyhow!("the runner process of {machine} that asked is no longer connected"))
+}
+
+/// The identity `ask` asks for, certified and recorded: its URI and certificate, and for a leg the
+/// server's delegation of it, by digest ([`delegate_leg`]). A leg's identity comes with its
+/// delegation or not at all, since its records are taken only under it.
+async fn issue(hub: &Hub, peer: PeerId, machine: &str, ask: &IdentityAsk) -> anyhow::Result<(String, String, Option<String>)> {
     let mut facts: Vec<(u64, String)> = Vec::new();
+    let instance = asker(hub, peer, machine)?;
     let (identity, lifetime) = match ask.kind.as_str() {
-        "runner" => {
-            let instance = hub.instances.lock().get(peer).map(|i| i.label()).unwrap_or_else(|| "legacy".to_owned());
-            (runner_identity(hub, machine, &instance).await?, time::Duration::hours(RUNNER_HOURS))
-        }
+        "runner" => (runner_identity(hub, machine, &instance).await?, time::Duration::hours(RUNNER_HOURS)),
         "agent" => {
             let session = ask.of.as_deref().ok_or_else(|| anyhow::anyhow!("an agent's identity names its session"))?;
             let epoch = ask.epoch.ok_or_else(|| anyhow::anyhow!("an agent's identity names its epoch"))?;
             // The runner process asking holds the session's key at this epoch: named in its certificate.
-            let instance = hub.instances.lock().get(peer).map(|i| i.label()).unwrap_or_else(|| "legacy".to_owned());
             (agent_identity(hub, machine, &instance, session, epoch).await?, time::Duration::hours(AGENT_HOURS))
         }
         "leg" => {
             let leg = ask.of.as_deref().ok_or_else(|| anyhow::anyhow!("a leg's identity names its leg"))?;
-            let instance = hub.instances.lock().get(peer).map(|i| i.label()).unwrap_or_else(|| "legacy".to_owned());
             let (identity, f, lifetime) = leg_identity(hub, machine, &instance, leg).await?;
             facts = f;
             (identity, lifetime)
@@ -584,9 +863,38 @@ async fn issue(hub: &Hub, peer: PeerId, machine: &str, ask: &IdentityAsk) -> any
         other => anyhow::bail!("kiln doesn't issue {other:?} identities"),
     };
     let uri = identity.uri().map_err(|e| anyhow::anyhow!("{e}"))?;
-    let facts: Vec<(u64, &str)> = facts.iter().map(|(m, v)| (*m, v.as_str())).collect();
-    let pem = hub.pki.issue_identity(&ask.csr, &identity, &facts, lifetime)?;
+    let named: Vec<(u64, &str)> = facts.iter().map(|(m, v)| (*m, v.as_str())).collect();
+    let pem = hub.pki.issue_identity(&ask.csr, &identity, &named, lifetime)?;
+    let delegation = match (&identity.actor, ask.of.as_deref()) {
+        (Actor::Leg { attempt, .. }, Some(job)) => Some(delegate_leg(hub, job, *attempt, &uri, &pem, &facts, ask.signs).await.map_err(|e| e.context("the server's delegation of the leg wasn't signed"))?),
+        _ => None,
+    };
     let now = crate::util::now_unix();
+    // A hand-over's (docs/ci.md W27-R08): its hand-on and the receipt for it kept first, so the
+    // epoch rises with them; the key isn't certified without them.
+    if let (Actor::Agent { .. }, Some(hand_on)) = (&identity.actor, ask.hand_on.as_deref()) {
+        let came_from = format!("runner {machine} (instance {instance})");
+        let epoch = ask.epoch.unwrap_or_default();
+        if let Err(why) = crate::custody::transfer(&hub.store, &hub.pki.ca_der, &hub.pki.organization(), &came_from, &uri, epoch, hand_on, ask.receipt.as_ref(), &pem, now).await? {
+            anyhow::bail!("its hand-over wasn't recorded, so kiln certifies no key at epoch {epoch}: {why}");
+        }
+    } else if let (Actor::Agent { epoch, .. }, Some(session)) = (&identity.actor, ask.of.as_deref())
+        && *epoch > 0
+        && holder_at(&hub.store, session, *epoch).await?.is_none()
+    {
+        // None came with it, to an epoch kiln certifies the session at for the first time: its
+        // hand-over went unsigned, recorded saying which side is from before signed hand-overs.
+        let gave = holder_at(&hub.store, session, epoch - 1).await?.unwrap_or_default();
+        let takes = hub.instances.lock().get(peer).is_some_and(|i| (u64::from(i.caps) | i.wide) & crate::proto::CAP_CUSTODY != 0);
+        let why = if !takes {
+            format!("the process it went to, on {machine}, runs a kiln from before signed hand-overs: it signed no receipt")
+        } else if gave.is_empty() {
+            "the process it came from was never certified: it runs a kiln from before identities, or the session went on before kiln had them".to_owned()
+        } else {
+            format!("{gave} signed no hand-on: it runs a kiln from before signed hand-overs")
+        };
+        crate::custody::unsigned(&hub.store, session, *epoch, &gave, &uri, &why, now).await?;
+    }
     revoke(&hub.store, Target::Certificates(uri.clone()), "superseded by a newer certificate", "kiln", now).await?;
     if let Actor::Agent { epoch, held_by, .. } = &identity.actor
         && let Some(session) = ask.of.as_deref()
@@ -598,10 +906,28 @@ async fn issue(hub: &Hub, peer: PeerId, machine: &str, ask: &IdentityAsk) -> any
         for (subject, left) in epochs_of(&hub.store, session).await?.into_iter().filter(|(_, e)| e < epoch) {
             revoke(&hub.store, Target::Subject(subject), &format!("epoch {left} left: moved on to epoch {epoch}{to}"), "kiln", now).await?;
         }
+        // The epoch rises with its transfer recorded, signed or said to be unsigned (W27-R08), and
+        // the session's words go to the process certified at it from now on, not to whichever one
+        // kiln's count of them last named (the 14:18 drop: words for the runner a blue/green
+        // upgrade took over from, passed on to the new build).
+        hub.harness.raise_epoch(session, *epoch);
+        hub.instances.lock().own(crate::instances::Owned::Agent(session.to_owned()), peer);
+        if let Some(h) = held_by {
+            hub.harness.held_by(session, &h.instance);
+        }
+        // A test build's `stale_words` (the server's): the 14:18 drop played again, its words to
+        // the machine's other processes, as kiln sent them to the one it still counted, which
+        // refuse them.
+        if crate::runner::chaos::get().is_some_and(|c| c.stale_words) {
+            let others: Vec<crate::instances::PeerId> = hub.instances.lock().of(machine).into_iter().filter(|p| *p != peer).collect();
+            for was in others {
+                stale_words(hub, machine, was, session).await;
+            }
+        }
     }
     record(&hub.store, &ask.kind, &uri, &pem).await?;
     tracing::info!(agent = %machine, identity = %identity, "issued an identity");
-    Ok((uri, pem))
+    Ok((uri, pem, delegation))
 }
 
 /// An agent session's identity at `epoch`, for the runner process of `machine` holding it
@@ -613,43 +939,69 @@ async fn agent_identity(hub: &Hub, machine: &str, instance: &str, session: &str,
     anyhow::ensure!(info.target == format!("agent:{machine}"), "agent session {session} runs on {}, not {machine}", info.target);
     let known = hub.harness.epoch_of(session);
     anyhow::ensure!(epoch >= known, "agent session {session} is at epoch {known}; epoch {epoch} is a copy left behind");
-    let person = match crate::mcp::whose(hub, session).await {
+    let person = agent_person(hub, session).await?;
+    let held_by = Some(Holder { machine: machine.to_owned(), instance: instance.to_owned() });
+    Ok(Identity::new(hub.pki.organization(), Actor::Agent { person, agent: session.to_owned(), epoch, held_by }))
+}
+
+/// The person agent session `session` acts for, as its identities name them.
+async fn agent_person(hub: &Hub, session: &str) -> anyhow::Result<String> {
+    Ok(match crate::mcp::whose(hub, session).await {
         Some(p) if p == "owner" => "admin".to_owned(),
         Some(p) => person_of(&p),
         None => anyhow::bail!("kiln can't say whom agent session {session} acts for"),
-    };
-    let held_by = Some(Holder { machine: machine.to_owned(), instance: instance.to_owned() });
-    Ok(Identity::new(hub.pki.organization(), Actor::Agent { person, agent: session.to_owned(), epoch, held_by }))
+    })
+}
+
+/// Agent session `session`'s identity at `epoch`, without the runner process that holds its key
+/// (`…/agent/<s>/epoch/<n>`): whom work handed to it goes to, before kiln has certified it there
+/// (docs/ci.md W27-R08; the Transfers plan's step 6).
+pub async fn agent_at(hub: &Hub, session: &str, epoch: u64) -> anyhow::Result<String> {
+    let person = agent_person(hub, session).await?;
+    Ok(Identity::new(hub.pki.organization(), Actor::Agent { person, agent: session.to_owned(), epoch, held_by: None }).uri()?)
 }
 
 /// A CI leg's identity, for the runner process of `machine` it was given to: its run's number,
 /// its attempt and key, on that runner (and through it who enrolled the machine); as facts, W10's
 /// claims for it in Fulcio's extensions, as Fulcio puts a CI job's (its workflow's ref and digest,
-/// its repository, commit and ref, the event, its run and attempt); and how long it lasts.
+/// its repository, commit and ref, the event, its run and attempt), a v1 job's from its run;
+/// and how long it lasts.
 async fn leg_identity(hub: &Hub, machine: &str, instance: &str, leg: &str) -> anyhow::Result<(Identity, Vec<(u64, String)>, time::Duration)> {
     use kiln_ci::identity::chain::fulcio;
     let id = leg.to_owned();
-    type Row = (i64, i64, String, Option<String>, Option<String>);
+    type Row = (i64, i64, String, Option<String>, Option<String>, serde_json::Map<String, serde_json::Value>);
     let row: Option<Row> = hub
         .store
         .call(move |c| {
-            Ok(c.query_row("SELECT r.number, j.attempt, j.key, j.agent, j.leg FROM jobs j JOIN runs r ON r.id = j.run_id WHERE j.id = ?1", [&id], |x| {
-                Ok((x.get(0)?, x.get(1)?, x.get(2)?, x.get(3)?, x.get(4)?))
+            let sql = "SELECT r.number, j.attempt, j.key, j.agent, j.leg, r.id, r.sha, r.pipeline, r.event, r.branch, p.name
+                       FROM jobs j JOIN runs r ON r.id = j.run_id LEFT JOIN repos p ON p.id = r.repo_id WHERE j.id = ?1";
+            Ok(c.query_row(sql, [&id], |x| {
+                let text = |i: usize| x.get::<_, Option<String>>(i).map(Option::unwrap_or_default);
+                let (attempt, repo, sha, branch) = (x.get::<_, i64>(1)?, text(10)?, text(6)?, text(9)?);
+                // A v1 job's claims, as W10 words a planned run's: its `.kiln/` pipeline at its commit.
+                let at = format!("refs/heads/{branch}");
+                let workflow = format!("{repo}/.kiln/{}.yaml@{at}", text(7)?);
+                let v1 = serde_json::json!({
+                    "job_workflow_ref": workflow, "job_workflow_sha": sha, "workflow_ref": workflow, "workflow_sha": sha, "repository": repo,
+                    "sha": sha, "ref": at, "event_name": text(8)?, "run_id": text(5)?, "run_attempt": attempt.max(1).to_string(),
+                });
+                Ok((x.get(0)?, attempt, x.get(2)?, x.get(3)?, x.get(4)?, v1.as_object().cloned().unwrap_or_default()))
             })
             .optional()?)
         })
         .await?;
-    let (number, attempt, key, agent, spec) = row.ok_or_else(|| anyhow::anyhow!("kiln knows no leg {leg}"))?;
+    let (number, attempt, key, agent, spec, v1) = row.ok_or_else(|| anyhow::anyhow!("kiln knows no leg {leg}"))?;
     anyhow::ensure!(agent.as_deref() == Some(machine), "leg {leg} was given to {}, not {machine}", agent.unwrap_or_else(|| "no runner".into()));
-    let claims = crate::ci::oidc::leg_claims(hub, leg).await?.ok_or_else(|| anyhow::anyhow!("leg {leg} is of no run kiln planned"))?;
+    // A run kiln planned: W10's claims for it. A v1 job's run has no plan: its claims are its
+    // pipeline's, at its commit, so its results sign as the leg all the same (W27-R05).
+    let claims = crate::ci::oidc::leg_claims(hub, leg).await?.unwrap_or(v1);
+    let facts = fulcio::from_claims(&claims, &hub.cfg.server.public_url);
     // Its spec's timeout, as the scheduler reads it (360 minutes when it has none).
     let timeout = spec
         .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
         .and_then(|v| v.get("timeout_minutes").and_then(serde_json::Value::as_u64))
         .map_or(360, |t| u32::try_from(t).unwrap_or(u32::MAX));
     let enrolled_by = enrolled_by(&hub.store, machine).await?;
-    let safe: String = key.chars().map(|c| if c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-') { c } else { '-' }).collect();
-    let safe = crate::util::truncate(safe.trim_matches('-'), 128).to_owned();
     let identity = Identity::new(
         hub.pki.organization(),
         Actor::Leg {
@@ -658,10 +1010,18 @@ async fn leg_identity(hub: &Hub, machine: &str, instance: &str, leg: &str) -> an
             instance: instance.to_owned(),
             run: u64::try_from(number).unwrap_or_default(),
             attempt: u32::try_from(attempt.max(1)).unwrap_or(1),
-            leg: if safe.is_empty() { "leg".to_owned() } else { safe },
+            leg: leg_name(&key),
         },
     );
-    Ok((identity, fulcio::from_claims(&claims, &hub.cfg.server.public_url), leg_lifetime(timeout)))
+    Ok((identity, facts, leg_lifetime(timeout)))
+}
+
+/// A leg's key as its identity names it: its letters, digits, `.`, `_` and `-` (the rest `-`), at
+/// most 128 of them, `leg` when none are left.
+pub(crate) fn leg_name(key: &str) -> String {
+    let safe: String = key.chars().map(|c| if c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-') { c } else { '-' }).collect();
+    let safe = crate::util::truncate(safe.trim_matches('-'), 128).to_owned();
+    if safe.is_empty() { "leg".to_owned() } else { safe }
 }
 
 /// Every subject an agent session's certificates were issued for, with its epoch.
@@ -681,6 +1041,61 @@ async fn epochs_of(store: &Store, session: &str) -> anyhow::Result<Vec<(String, 
             _ => None,
         })
         .collect())
+}
+
+/// The identity agent session `session` was last certified as at `epoch`, naming the runner
+/// process that held it then: whom kiln takes it for when that process can't hand it on
+/// (docs/ci.md W27-R08). None if kiln never certified it at that epoch.
+pub async fn holder_at(store: &Store, session: &str, epoch: u64) -> anyhow::Result<Option<String>> {
+    let pattern = format!("%/agent/{session}/epoch/{epoch}/%");
+    let subjects: Vec<String> = store
+        .call(move |c| {
+            let mut q = c.prepare("SELECT subject FROM identities WHERE kind = 'agent' AND subject LIKE ?1 ORDER BY issued_at DESC, rowid DESC")?;
+            let rows = q.query_map([pattern], |r| r.get(0))?.collect::<Result<Vec<String>, _>>()?;
+            Ok(rows)
+        })
+        .await?;
+    Ok(subjects.into_iter().find(|s| Identity::parse(s).is_ok_and(|i| matches!(i.actor, Actor::Agent { ref agent, epoch: e, .. } if agent == session && e == epoch))))
+}
+
+/// A test build's `stale_words`: the words about a hand-over kiln sent before transfers named a
+/// session's holder (hand it to the newest; it was taken), sent to `was`, another process of
+/// `machine` than the one certified for it (docs/ci.md W27-R08, the 14:18 drop).
+async fn stale_words(hub: &Hub, machine: &str, was: crate::instances::PeerId, session: &str) {
+    use crate::harness::model::Command;
+    let words = [Command::MoveTo { to: machine.to_owned(), cwd: String::new(), note: None, now: false, kind: None, model: None, local: true }, crate::handovers::Word::Taken.command()];
+    for c in words {
+        if let Some(json) = hub.worded(machine, was, session, &c).await {
+            tracing::info!(target: "kiln.custody", %session, %machine, was, "chaos: a stale hand-over's word to the process kiln counted before");
+            let _ = hub.command_peers(machine, vec![was], &crate::proto::ServerMsg::HarnessCmd { session: session.to_owned(), json }).await;
+        }
+    }
+}
+
+/// The newest epoch kiln certified agent session `session` at, and the identity it certified it
+/// as then, naming the process holding it: the session's epoch as its transfers say (an Open that
+/// says another doesn't move it), and its holder (docs/ci.md W27-R08).
+pub async fn newest_holder(store: &Store, session: &str) -> anyhow::Result<Option<(u64, String)>> {
+    let Some(epoch) = epochs_of(store, session).await?.into_iter().map(|(_, e)| e).max() else { return Ok(None) };
+    Ok(holder_at(store, session, epoch).await?.map(|h| (epoch, h)))
+}
+
+/// The newest epoch kiln certified agent session `session` at for runner process `instance` of
+/// `machine`: the epoch that process holds it at, as kiln knows it (docs/ci.md W27-R08, a hand-over's
+/// word for it). None if kiln never certified it there.
+pub async fn epoch_held(store: &Store, session: &str, machine: &str, instance: &str) -> anyhow::Result<Option<u64>> {
+    let at = |s: &str| match Identity::parse(s).map(|i| i.actor) {
+        Ok(Actor::Agent { agent, epoch, held_by: Some(h), .. }) if agent == session && h.machine == machine && h.instance == instance => Some(epoch),
+        _ => None,
+    };
+    Ok(epochs_of(store, session).await?.iter().filter_map(|(s, _)| at(s)).max())
+}
+
+/// The identity agent session `session` signs as (W27-R04): the one kiln issued it last. None: it
+/// has none yet.
+pub async fn agent_uri(store: &Store, session: &str) -> anyhow::Result<Option<String>> {
+    let pattern = format!("%/agent/{session}/epoch/%");
+    store.call(move |c| Ok(c.query_row("SELECT subject FROM identities WHERE kind = 'agent' AND subject LIKE ?1 ORDER BY issued_at DESC, rowid DESC LIMIT 1", [pattern], |r| r.get(0)).optional()?)).await
 }
 
 /// Agent session `session` ended: every certificate of every epoch it had is revoked from now.
@@ -775,11 +1190,14 @@ pub async fn revoke(store: &Store, target: Target, reason: &str, by: &str, at: i
                     vec![(None, Some(key.clone()), subject.unwrap_or(key))]
                 }
             };
+            let taken_at = crate::util::now_unix();
             for (serial, key, subject) in &rows {
                 tx.execute(
                     "INSERT INTO revocations (serial, key_sha256, subject, at, reason, by) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
                     params![serial, key, subject, at, reason, by],
                 )?;
+                let said = kiln_ci::identity::trail::revocation(serial.as_deref(), key.as_deref(), subject, at, &reason, &by);
+                crate::trail::own(&tx, kiln_ci::identity::trail::PAYLOAD_REVOCATION, &said, taken_at)?;
             }
             tx.commit()?;
             let mut keys: Vec<String> = rows.into_iter().filter_map(|(_, k, _)| k).collect();
@@ -1085,6 +1503,121 @@ mod tests {
             assert!(revoked_keys(&store).await?.iter().any(|(k, why)| *k == fb.key && why.contains("key lost, by sam")));
             // A subject with nothing recorded revokes nothing.
             assert!(revoke(&store, Target::Subject("nobody".into()), "x", "ada", 0).await?.is_empty());
+            Ok(())
+        })
+    }
+
+    /// W27-R01: the server and CD sign as themselves, with their own keys ([`sign_own`]): a
+    /// signature verifies to kiln's root as kiln://<org>/server, and CD's as kiln://<org>/server/cd,
+    /// over that message alone; nothing else signs as them.
+    #[test]
+    fn w27_r01_the_server_and_cd_sign_as_themselves() -> anyhow::Result<()> {
+        use kiln_ci::identity::chain::verify_signed;
+        crate::rt::block_on(async {
+            let dir = tempfile::tempdir()?;
+            let store = Store::in_memory()?;
+            let pki = crate::pki::Pki::open_scratch(&dir.path().join("pki"))?;
+            own_identities(&store, &pki).await?;
+            let (now, revoked) = (crate::util::now_unix(), revocations(&store).await?);
+            for (kind, actor) in [("server", Actor::Server), ("cd", Actor::Cd)] {
+                let (signature, certificate) = sign_own(&pki, kind, b"train 7 landed 4c1e2a")?;
+                let v = verify_signed(&[&certificate], &pki.ca_der, &revoked, now, b"train 7 landed 4c1e2a", &signature)?;
+                assert_eq!(v.identity, Identity::new(pki.organization(), actor.clone()));
+                assert_eq!(v.identity.uri()?, Identity::new(pki.organization(), actor).uri()?);
+                assert!(verify_signed(&[&certificate], &pki.ca_der, &revoked, now, b"train 8 landed 7d0e1f", &signature).is_err(), "over that message alone");
+            }
+            assert!(sign_own(&pki, "runner", b"x").is_err(), "the server and CD alone");
+            Ok(())
+        })
+    }
+
+    /// W27-R03: what kiln commits is signed as kiln. A commit CD makes in a hosted repository (a
+    /// release) carries a gpgsig, git's x509 form, that verifies to kiln's root as CD over the commit
+    /// as git keeps it; the server's signature over the same commit verifies as the server.
+    #[test]
+    fn w27_r03_kilns_own_commits_sign_as_kiln() -> anyhow::Result<()> {
+        use crate::deploy::host::{Author, Change, Committed, Hosted};
+        use kiln_ci::identity::gitsig;
+        crate::rt::block_on(async {
+            let dir = tempfile::tempdir()?;
+            let store = Store::in_memory()?;
+            let pki = std::sync::Arc::new(crate::pki::Pki::open_scratch(&dir.path().join("pki"))?);
+            own_identities(&store, &pki).await?;
+            let (now, revoked) = (crate::util::now_unix(), revocations(&store).await?);
+            let hosted = Hosted::new(&dir.path().join("hosted")).signing_as(std::sync::Arc::clone(&pki), "cd");
+            let change = Change { path: "app.yaml".into(), content: Some(b"image: kiln:4c1e2a\n".to_vec()) };
+            let made = hosted.commit("kiln/releases", "main", None, &[change], "release 7", &Author::default()).map_err(|e| anyhow::anyhow!("{e}"))?;
+            let Committed::New(sha) = made else { anyhow::bail!("nothing was committed") };
+            let out = std::process::Command::new("git").arg("-C").arg(hosted.path("kiln/releases")?).args(["cat-file", "commit", &sha]).output()?;
+            anyhow::ensure!(out.status.success(), "git cat-file: {}", String::from_utf8_lossy(&out.stderr));
+            let sig = gitsig::signature_of(&out.stdout).ok_or_else(|| anyhow::anyhow!("CD's commit isn't signed"))?;
+            let v = gitsig::verify(&gitsig::payload(&out.stdout), &sig, &pki.ca_der, &revoked, now)?;
+            assert_eq!(v.identity, Identity::new(pki.organization(), Actor::Cd));
+            assert_eq!(hosted.head("kiln/releases", "main")?.as_deref(), Some(sha.as_str()), "the branch holds the signed commit");
+            // The server signs the same commit as itself.
+            let unsigned = gitsig::payload(&out.stdout);
+            let by_server = signed_commit(&unsigned, |m| sign_own(&pki, "server", m))?;
+            let sig = gitsig::signature_of(&by_server).ok_or_else(|| anyhow::anyhow!("not signed"))?;
+            let v = gitsig::verify(&gitsig::payload(&by_server), &sig, &pki.ca_der, &revoked, now)?;
+            assert_eq!(v.identity, Identity::new(pki.organization(), Actor::Server));
+            Ok(())
+        })
+    }
+
+    /// W27-R05, R06: a leg's record verifies through kiln's records under the server's delegation
+    /// of the leg. Under a delegation kiln has no record of, another leg's, one signed by anyone but
+    /// the server (CD here, over the very same words), or none, it's refused, saying why.
+    #[test]
+    fn w27_r05_a_legs_records_verify_under_the_servers_delegation() -> anyhow::Result<()> {
+        use kiln_ci::attest::leg;
+        use kiln_ci::identity::statement;
+        use rcgen::SigningKey as _;
+        crate::rt::block_on(async {
+            let dir = tempfile::tempdir()?;
+            let store = Store::in_memory()?;
+            let pki = crate::pki::Pki::open_scratch(&dir.path().join("pki"))?;
+            own_identities(&store, &pki).await?;
+            let (org, now) = (pki.organization(), crate::util::now_unix());
+            let server = Identity::new(org.clone(), Actor::Server).uri()?;
+            let leg_of = |attempt| Identity::new(org.clone(), Actor::Leg { enrolled_by: "ada".into(), machine: "fedora-2".into(), instance: "01a174ed".into(), run: 812, attempt, leg: "e2e".into() });
+            // The leg's key, certified as attempt 1 of leg e2e, at commit 4c1e2a.
+            const COMMIT: &str = "4c1e2a90d1f3b5a7c9e1f3a5b7c9d1e3f5a7b9c1";
+            let facts = [(kiln_ci::identity::chain::fulcio::BUILD_SIGNER_URI, "https://kiln.home/hyper-light/kiln/.kiln/ci.yml@refs/heads/main"), (kiln_ci::identity::chain::fulcio::SOURCE_REPOSITORY_DIGEST, COMMIT)];
+            let key = rcgen::KeyPair::generate()?;
+            let leaf = crate::pki::der_of(&pki.issue_identity(&crate::pki::make_csr_with_key("kiln-identity", &key.serialize_pem())?, &leg_of(1), &facts, time::Duration::hours(1))?)?;
+            // A delegation of the leg `to`, signed as `kind`: its digest and bundle.
+            let delegation = |to: &Identity, kind: &str| -> anyhow::Result<(String, serde_json::Value)> {
+                let payload = statement::payload(&leg::delegation(&server, &to.uri()?, Some(COMMIT), None, now + 3600))?;
+                Ok((statement::digest(statement::PAYLOAD_DELEGATION, &payload), sign_as(&pki, kind, statement::PAYLOAD_DELEGATION, &payload)?))
+            };
+            let (kilns, by_kiln) = delegation(&leg_of(1), "server")?;
+            let (same, by_cd) = delegation(&leg_of(1), "cd")?;
+            let (attempt_2s, for_attempt_2) = delegation(&leg_of(2), "server")?;
+            assert_eq!(same, kilns, "a delegation's digest is its words', whoever signs them");
+            // The leg's results, under `under`, signed with its key.
+            let results = |under: Option<&str>| -> anyhow::Result<serde_json::Value> {
+                let mut st = leg::statement(&leg::Results::default());
+                st.under = under.map(str::to_owned);
+                let payload = statement::payload(&st)?;
+                let sig = key.sign(&statement::to_sign(leg::PAYLOAD_RESULTS, &payload))?;
+                Ok(statement::bundle(leg::PAYLOAD_RESULTS, &payload, &sig, &leaf))
+            };
+            // Checked as kiln takes it now, kiln's records holding `records` (each taken a second earlier).
+            let check = |bundle: &serde_json::Value, records: &[(&str, &serde_json::Value)]| {
+                statement::verify_under(bundle, &pki.ca_der, &[], now, |d| records.iter().find(|(k, _)| *k == d).map(|(_, b)| ((*b).clone(), now - 1)))
+            };
+            let u = check(&results(Some(&kilns))?, &[(&kilns, &by_kiln)])?;
+            assert_eq!((leg::under_kilns_delegation(&u, &server), u.through.first().map(|d| d.custodian.as_str())), (Ok(()), Some(server.as_str())));
+            // CD's signature over the same delegation, where kiln's should be: the link holds, but it isn't kiln's server's.
+            let forged = check(&results(Some(&kilns))?, &[(&kilns, &by_cd)])?;
+            assert!(leg::under_kilns_delegation(&forged, &server).is_err_and(|e| e.contains("not by kiln's server")), "{:?}", leg::under_kilns_delegation(&forged, &server));
+            // A delegation kiln has no record of.
+            assert!(check(&results(Some(&kilns))?, &[]).is_err_and(|e| e.to_string().contains("kiln has no record of it")));
+            // Another leg's (attempt 2's) delegation.
+            assert!(check(&results(Some(&attempt_2s))?, &[(&attempt_2s, &for_attempt_2)]).is_err_and(|e| e.to_string().contains("it delegates to")));
+            // None at all.
+            let none = check(&results(None)?, &[(&kilns, &by_kiln)])?;
+            assert!(leg::under_kilns_delegation(&none, &server).is_err_and(|e| e.contains("acts under no delegation")));
             Ok(())
         })
     }

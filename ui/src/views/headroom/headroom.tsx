@@ -137,7 +137,7 @@ function HeadroomPanel({ runner }: { runner: string }) {
             />
             <NumField
               label="Probe share (%)"
-              hint="How much of a served target's time its checks may take. The platform's own default is 10%."
+              hint="How much of each target's time its checks may take. The platform's own default is 10%."
               value={Math.round(d.probe_load_share * 1000) / 10}
               onChange={(pct) => set({ probe_load_share: pct / 100 })}
             />

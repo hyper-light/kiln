@@ -4,9 +4,10 @@
  * rest on, each finding graded), run on an agent (one that runs, or a new one; as one message, step
  * by step, as goals, or an agent per step), shared by a link, exported, its versions and runs. A
  * plan made from a goal is planned first: its agent researches it and writes its steps, and it runs
- * once it's ready. Everything in the page's flow. A plan is kept with its agent session (written in
- * its Plan tab, or by the agent): the way back is to that session's plans. A plan that isn't there
- * (deleted, or a wrong link) says so.
+ * once it's ready; while its agent's goals wait on your review of it, it's approved here instead of
+ * run (approve.tsx). Everything in the page's flow. A plan is kept with its agent session (written
+ * in its Plan tab, or by the agent): the way back is to that session's plans. A plan that isn't
+ * there (deleted, or a wrong link) says so.
  */
 import * as React from "react";
 import { Link, useNavigate, useParams, useSearchParams } from "@/lib/router";
@@ -26,6 +27,7 @@ import { Tries } from "@/lib/tries";
 import { Prose } from "@/views/harness/parts";
 import { Shimmer } from "@/views/harness/signals";
 import { ResearchPanel } from "@/views/research/research";
+import { ApproveInstead, useWaitsOn, type Approved } from "./approve";
 import { SessionCrumbs } from "./crumbs";
 import { effectiveNeeds, PlanGraph } from "./graph";
 import { PlanItemsEditor } from "./items";
@@ -209,7 +211,10 @@ function PlanEditor({ id }: { id: string }) {
               <Prose text={withoutTitle(plan.body, plan.title)} />
             </div>
           )}
-          <PlanSteps plan={plan} picked={picked} onPick={setPicked} onRun={() => document.getElementById("plan-run")?.scrollIntoView({ behavior: "smooth", block: "start" })} />
+          {/* Until the agents say whether its goals wait on your review of it, its steps without Run. */}
+          <Loadable label="its steps" fallback={<PlanSteps plan={plan} picked={picked} onPick={setPicked} />}>
+            <StepsToRun plan={plan} picked={picked} onPick={setPicked} />
+          </Loadable>
         </>
       ) : (
         <>
@@ -297,7 +302,7 @@ function PlanEditor({ id }: { id: string }) {
             </section>
           ) : (
             <Loadable label="where it can run" fallback={<RunHold />}>
-              <RunPlan plan={plan} dirty={dirty} picked={picked} onPicked={setPicked} onRan={() => invalidate(`plans/${plan.id}`)} focus={cameToRun} />
+              <RunOrApprove plan={plan} dirty={dirty} picked={picked} onPicked={setPicked} onRan={() => invalidate(`plans/${plan.id}`)} focus={cameToRun} />
             </Loadable>
           )}
           <SharePlan plan={plan} onChange={(p) => res.setData(() => p)} />
@@ -338,6 +343,26 @@ function RunHold() {
     <section className="plan-section" aria-label="Run the plan">
       <h2 className="plan-h">Run it</h2>
       <Hold height={128} />
+    </section>
+  );
+}
+
+/** Its steps, picked to run just those; not while its agent's goals wait on your review of it (it's approved whole). */
+function StepsToRun({ plan, picked, onPick }: { plan: Plan; picked: number[]; onPick: (n: number[]) => void }) {
+  const waits = useWaitsOn(plan.id);
+  return <PlanSteps plan={plan} picked={picked} onPick={onPick} onRun={waits ? undefined : () => document.getElementById("plan-run")?.scrollIntoView({ behavior: "smooth", block: "start" })} />;
+}
+
+/** Run it; or, while its agent's goals wait on your review of it, approve it: it runs no other way (approve.tsx). */
+function RunOrApprove(props: React.ComponentProps<typeof RunPlan>) {
+  const waits = useWaitsOn(props.plan.id);
+  // Approved here, it says so in Run's place, as its agent's goals go on.
+  const [approved, setApproved] = React.useState<Approved | null>(null);
+  if (!waits && !approved) return <RunPlan {...props} />;
+  return (
+    <section className="plan-section" id="plan-run" aria-label="Approve the plan" ref={props.focus ? (el) => el?.scrollIntoView({ block: "start" }) : undefined}>
+      <h2 className="plan-h">Approve it</h2>
+      <ApproveInstead plan={props.plan} a={waits} approved={approved} onApproved={setApproved} dirty={props.dirty} />
     </section>
   );
 }
@@ -475,9 +500,11 @@ function RunPlan({ plan, dirty, picked, onPicked, onRan, focus }: { plan: Plan; 
         {error && <span className="plan-error">{error}</span>}
         {ran && (
           <span className="plan-ok">
-            {mode === "goals"
-              ? `${ran.sent} goal${ran.sent === 1 ? "" : "s"} lined up${ran.split ? `, ${ran.split} as goal stacks of their criteria and tests` : ""}`
-              : `Sent ${ran.sent === 1 ? "the plan" : `${ran.sent} messages`}`}{" "}
+            {ran.approved
+              ? `Approved instead (its goals waited on your review of it): its ${ran.sent} step${ran.sent === 1 ? "" : "s"} go to it as its goal's parts`
+              : mode === "goals"
+                ? `${ran.sent} goal${ran.sent === 1 ? "" : "s"} lined up${ran.split ? `, ${ran.split} as goal stacks of their criteria and tests` : ""}`
+                : `Sent ${ran.sent === 1 ? "the plan" : `${ran.sent} messages`}`}{" "}
             · <Link to={`/agents/${encodeURIComponent(ran.session)}`}>open the agent</Link>
           </span>
         )}

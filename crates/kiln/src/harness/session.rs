@@ -103,6 +103,10 @@ pub struct Spec {
     /// folder (`crate::workspace`), made on its machine before it starts and kept with it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub workspace: Option<crate::workspace::Workspace>,
+    /// What a person branched it from (`Command::Branch`): a session's id, or `<session>/<task>`
+    /// for one of that session's harness's own subagents.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub variant_of: Option<String>,
 }
 
 fn yes() -> bool {
@@ -140,6 +144,7 @@ impl Default for Spec {
             helper: None,
             subagent: false,
             workspace: None,
+            variant_of: None,
         }
     }
 }
@@ -153,6 +158,11 @@ pub struct ApprovalBrief {
     pub tool_name: String,
     pub title: String,
     pub at: i64,
+    /// The subagent that asks, as its request names it (`Approval::agent`): a list says whose it
+    /// is without the agent's whole state.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(test, ts(optional))]
+    pub agent: Option<String>,
 }
 
 /// A native subagent as lists show it. Its work still belongs to its harness's task, not a
@@ -173,6 +183,21 @@ pub struct SubagentBrief {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[cfg_attr(test, ts(optional))]
     pub ended: Option<i64>,
+    /// What it's doing now, in a line (`Task::last_tool`): where it is, not what it made.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(test, ts(optional))]
+    pub last_tool: Option<String>,
+    /// A person can pause it (as `Task::pausable`).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub pausable: bool,
+    /// A person paused it (as `Task::paused_at`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(test, ts(optional))]
+    pub paused_at: Option<i64>,
+    /// What a person lets it do (as `Task::perms`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(test, ts(optional))]
+    pub perms: Option<super::model::Perms>,
 }
 
 impl SubagentBrief {
@@ -188,6 +213,10 @@ impl SubagentBrief {
                 parent_task: t.parent_task.clone(),
                 started: t.started,
                 ended: t.ended,
+                last_tool: t.last_tool.as_deref().map(|s| super::model::clip_middle(s, 200).0),
+                pausable: t.pausable,
+                paused_at: t.paused_at,
+                perms: t.perms.clone(),
             })
             .collect()
     }
@@ -357,6 +386,14 @@ pub struct Info {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[cfg_attr(test, ts(optional))]
     pub pause: Option<super::model::Pause>,
+    /// A person paused it: its processes stopped since (as `State::frozen`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(test, ts(optional))]
+    pub frozen: Option<i64>,
+    /// What a person lets it do (as `State::perms`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(test, ts(optional))]
+    pub perms: Option<super::model::Perms>,
     /// Since when it waits for room on its machine to go to work (as `State::room_wait`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub room_wait: Option<i64>,
@@ -406,6 +443,11 @@ pub struct Info {
     /// parent's row, not as an agent of its own.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub subagent: bool,
+    /// What a person branched it from (as `Spec::variant_of`): once it's done, Keep hands its result
+    /// to its parent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(test, ts(optional))]
+    pub variant_of: Option<String>,
     /// It was started without its harness's skip-every-check mode (`Spec::allow_bypass` off), so
     /// an agent it starts can't have it either.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
@@ -455,7 +497,7 @@ impl Info {
         self.approvals = s
             .approvals
             .iter()
-            .map(|a| ApprovalBrief { id: a.id.clone(), tool: a.tool, tool_name: a.tool_name.clone(), title: a.title.clone(), at: a.at })
+            .map(|a| ApprovalBrief { id: a.id.clone(), tool: a.tool, tool_name: a.tool_name.clone(), title: a.title.clone(), at: a.at, agent: a.agent.clone() })
             .collect();
         self.queued = s.queue.len();
         self.queue = s.queue.iter().map(|q| super::queued::Queued::of(&q.id, &q.text)).collect();
@@ -489,6 +531,8 @@ impl Info {
         self.left_behind = s.count_left_behind();
         self.reach.clone_from(&s.reach);
         self.pause.clone_from(&s.pause);
+        self.frozen = s.frozen;
+        self.perms.clone_from(&s.perms);
         self.room_wait = s.room_wait;
         self.last_turn.clone_from(&s.last_turn);
         self.move_on_limit = s.move_on_limit;
@@ -681,6 +725,12 @@ enum Ctl {
     /// There may be room on its machine for it to go to work: what waited for that goes, if it
     /// may now (`super::limit`).
     Room,
+    /// Its hand-over to this process is recorded (docs/ci.md W27-R08: a blue/green upgrade's): it
+    /// goes on at this epoch, its state saying so.
+    Epoch(u64),
+    /// Its harness's hook asks before a tool call (Codex's, `codex::hook_args`): the answer goes to
+    /// `reply`, at once or once what holds the call lets it go (`hold`).
+    Hook(serde_json::Value, futures::channel::oneshot::Sender<serde_json::Value>),
 }
 
 /// A session handed from this image of the process to the next (an in-place upgrade) with its
@@ -767,9 +817,25 @@ impl Session {
         let _ = self.ctl.try_send(Ctl::Close);
     }
 
+    /// Its harness's hook asks about a tool call (`input`, as the harness gives it): the hook's
+    /// answer, once the session gives it (a call a person holds waits for them). Nothing (`{}`) lets
+    /// the call go: the session ended, or nothing holds it.
+    pub async fn hook(&self, input: serde_json::Value) -> serde_json::Value {
+        let (tx, rx) = futures::channel::oneshot::channel();
+        if self.ctl.send(Ctl::Hook(input, tx)).await.is_err() {
+            return serde_json::json!({});
+        }
+        rx.await.unwrap_or_else(|_| serde_json::json!({}))
+    }
+
     /// There may be room on its machine now for it to go to work ([`Ctl::Room`]).
     pub fn room(&self) {
         let _ = self.ctl.try_send(Ctl::Room);
+    }
+
+    /// It goes on at `epoch` ([`Ctl::Epoch`]): its hand-over to this process is recorded.
+    pub fn go_on_at(&self, epoch: u64) {
+        let _ = self.ctl.try_send(Ctl::Epoch(epoch));
     }
 
     /// Hand its harness process to this process's next image (an in-place upgrade, next):
@@ -927,6 +993,8 @@ fn end_tasks(core: &mut Core) {
         t.status = "stopped".to_owned();
         t.ended.get_or_insert_with(Core::now);
     }
+    // What it was sent and never finished, or that waited to go, doesn't go now.
+    core.drop_unfinished(true);
     core.touch_state();
 }
 
@@ -977,6 +1045,9 @@ pub fn start_seeded(id: String, spec: Spec, sink: Sink, on_change: Arc<dyn Fn() 
     core.state.cwd.clone_from(&cwd);
     core.state.model = spec.model.clone().unwrap_or_default();
     core.state.mode = spec.mode.clone().unwrap_or_default();
+    // What it starts at, until its harness says what it applied.
+    core.state.effort = spec.effort.clone().unwrap_or_default();
+    core.state.speed = spec.speed.clone().unwrap_or_default();
     core.state.harness_session.clone_from(&spec.resume);
     // Moved here: its timeline as it was, then the line saying so.
     let mut items = None;
@@ -1015,7 +1086,38 @@ pub fn start_seeded(id: String, spec: Spec, sink: Sink, on_change: Arc<dyn Fn() 
         core.state.arriving = sd.synced;
     }
     core.state.reach.clone_from(&spec.reach);
+    named_ahead(&mut core.meta, kind, spec.model.as_deref());
     begin(id, spec, kind, core, sink, on_change, files, items, None)
+}
+
+/// Harness `kind`'s lists as this machine knows them, for a session's page to name its settings by
+/// before the harness says anything (a new session may wait for room on its machine, then take
+/// seconds to start; a switch starts the harness anew): its permission modes, its models (but an
+/// ACP agent's), and the effort levels and speeds of the one it runs (`model`; none, its default),
+/// as Mission control's composer offered them. What the harness says once it runs takes their place.
+fn named_ahead(meta: &mut super::model::Meta, kind: &Kind, model: Option<&str>) {
+    let models = super::kinds::models_of(kind.id);
+    let runs = match model.filter(|m| !m.is_empty()) {
+        Some(id) => models.iter().find(|m| m.id == id),
+        None => models.iter().find(|m| m.default).or(models.first()),
+    }
+    .cloned();
+    if meta.modes.is_empty() {
+        meta.modes = kind.modes().0;
+    }
+    if meta.efforts.is_empty() {
+        meta.efforts = match runs.as_ref().filter(|m| !m.efforts.is_empty()) {
+            Some(m) => m.efforts.iter().map(|e| super::model::ControlOption { id: e.clone(), label: super::model::effort_label(e), description: String::new(), dangerous: false }).collect(),
+            None => kind.efforts(),
+        };
+    }
+    if meta.speeds.is_empty() {
+        meta.speeds = runs.map(|m| m.speeds).unwrap_or_default();
+    }
+    // An ACP agent's own list says it can run them: it lists none before it's signed in.
+    if meta.models.is_empty() && !matches!(kind.protocol, Protocol::Acp(_)) {
+        meta.models = models;
+    }
 }
 
 /// A session with this core, its task started (`adopt`: going on with a harness process the
@@ -1071,6 +1173,8 @@ fn begin(id: String, spec: Spec, kind: &'static Kind, mut core: Core, sink: Sink
         left_behind: 0,
         reach: spec.reach.clone(),
         pause: None,
+        frozen: None,
+        perms: None,
         room_wait: None,
         last_turn: None,
         keep_off: false,
@@ -1084,6 +1188,7 @@ fn begin(id: String, spec: Spec, kind: &'static Kind, mut core: Core, sink: Sink
         plan_run: spec.plan_run.clone(),
         helper: spec.helper.clone(),
         subagent: spec.subagent,
+        variant_of: spec.variant_of.clone(),
         no_bypass: !spec.allow_bypass,
         workspace: spec.workspace.clone(),
     };
@@ -1182,6 +1287,14 @@ fn queued(c: Command) -> Option<super::model::QueueItem> {
     }
 }
 
+/// The session goes on at `epoch` (epochs only rise): its state says so, sent with its next flush.
+fn raise_epoch(core: &mut Core, epoch: u64) {
+    if core.state.epoch < epoch {
+        core.state.epoch = epoch;
+        core.touch_state();
+    }
+}
+
 /// Background work a step asked for.
 struct Jobs {
     previews: Vec<super::core::PreviewJob>,
@@ -1222,7 +1335,7 @@ async fn pipe(rx: &async_channel::Receiver<Vec<u8>>, open: bool) -> Option<Vec<u
 }
 
 enum Ev {
-    Change((String, (Option<super::model::FileChange>, Option<super::core::Baseline>))),
+    Change((String, super::diff::Found)),
     Out(Option<Vec<u8>>),
     Err(Option<Vec<u8>>),
     Ctl(Option<Ctl>),
@@ -1258,6 +1371,35 @@ const READ_MAX: u64 = 512 * 1024;
 /// How often the adapter gets a tick while the process runs.
 const TICK: Duration = Duration::from_secs(5);
 
+/// The wait before a harness whose process ended (nobody ending the agent) starts again; twice
+/// the wait before for each that ends after it, at most `AGAIN_MOST`, from `AGAIN_FIRST` again
+/// once one runs `AGAIN_RESET`.
+const AGAIN_FIRST: Duration = Duration::from_secs(2);
+const AGAIN_MOST: Duration = Duration::from_secs(300);
+const AGAIN_RESET: Duration = Duration::from_secs(600);
+/// A harness that ends within `SOON` of each of its last `SOON_TRIES` starts won't start: it
+/// waits for a person.
+const SOON: Duration = Duration::from_secs(20);
+const SOON_TRIES: u32 = 3;
+/// What an agent is told when its process ended part-way through a turn and started again.
+const PICK_UP: &str = "Your process ended part-way through your last turn, and kiln started it again: your conversation is as it was. Pick up where you left off.";
+
+/// How a harness's process ended, in words: its exit code, and the signal one past 128 stands for.
+fn ended_how(code: Option<i32>) -> String {
+    let signal = |n: i32| match n {
+        1 => "SIGHUP".to_owned(),
+        2 => "SIGINT".to_owned(),
+        9 => "SIGKILL".to_owned(),
+        15 => "SIGTERM".to_owned(),
+        n => format!("signal {n}"),
+    };
+    match code {
+        None => "a signal ended it".to_owned(),
+        Some(c) if (129..160).contains(&c) => format!("exit {c}: {} from outside it", signal(c - 128)),
+        Some(c) => format!("exit {c}"),
+    }
+}
+
 /// Completes when headroom has room for this session's held work: only while it holds some (so
 /// sessions with nothing waiting don't wake for it).
 async fn held_room(core: &Mutex<Core>) {
@@ -1265,12 +1407,17 @@ async fn held_room(core: &Mutex<Core>) {
     let room = crate::headroom::room();
     let (queued, held, granted) = {
         let c = core.lock();
-        (!c.state.queue.is_empty(), crate::headroom::held(&c.session_id), crate::headroom::take_grant(&c.session_id))
+        let queued = !c.state.queue.is_empty();
+        (queued, crate::headroom::held(&c.session_id), queued && crate::headroom::take_grant(&c.session_id))
     };
     if queued && granted {
         // Let in (perhaps before this looked): its queue goes now, once.
     } else if queued && held {
         room.await;
+        let c = core.lock();
+        if !c.state.queue.is_empty() {
+            crate::headroom::take_grant(&c.session_id);
+        }
     } else {
         futures::future::pending::<()>().await;
     }
@@ -1607,6 +1754,13 @@ fn effects(s: &Arc<Session>, kind: &'static Kind, files: &Files, done: &async_ch
                 let tx = done.clone();
                 crate::rt::spawn(async move {
                     let value = crate::rt::blocking(move || read_first(&paths)).await.unwrap_or_else(|e| serde_json::json!({"error": format!("{e:#}")}));
+                    let _ = tx.send(Done::Reply { client, value }).await;
+                });
+            }
+            super::core::Effect::Own { client, ask } => {
+                let tx = done.clone();
+                crate::rt::spawn(async move {
+                    let value = crate::rt::blocking(move || super::diff::own_edits(&ask, super::diff::read_now)).await.unwrap_or_else(|e| serde_json::json!({"error": format!("{e:#}")}));
                     let _ = tx.send(Done::Reply { client, value }).await;
                 });
             }
@@ -1953,7 +2107,7 @@ fn carried_choices(from: &Kind, to: &Kind, mode: &str, effort: &str, allow_bypas
 
 /// The session's state for the harness it goes on in (`session`: its conversation's id there):
 /// the model, mode and effort it runs with; what was the old harness's own (its servers, skills,
-/// account, plan and limits, what it was doing) goes with it.
+/// account, plan and limits, its to-dos, what it was doing) goes with it.
 fn for_harness(st: &mut super::model::State, session: Option<String>, model: &str, mode: Option<String>, effort: Option<String>) {
     st.harness_session = session;
     model.clone_into(&mut st.model);
@@ -1978,6 +2132,9 @@ fn for_harness(st: &mut super::model::State, session: Option<String>, model: &st
     st.exit = None;
     st.activity = None;
     st.doing = None;
+    // Its to-dos too: the new harness has them in its note ("The plan as it stands") and keeps
+    // a list of its own, so keep-going never holds it to one only the old harness could change.
+    st.todos.clear();
 }
 
 /// A paused session moving to another machine goes on there: the pause (for this machine's
@@ -2066,6 +2223,7 @@ async fn carry_over(s: &Arc<Session>, from: &'static Kind, sw: Switch, left: usi
         for_harness(st, resume, &sw.model, mode, effort);
         st.status = Status::Starting;
         core.meta = super::model::Meta::default();
+        named_ahead(&mut core.meta, to, Some(&sw.model));
         core.hold = false;
         core.state.switching = None;
         // A pause for the old harness's limit ends: the new one runs on its own account. The turn
@@ -2143,6 +2301,43 @@ fn move_wanted(s: &Session, to: String, cwd: String, note: Option<String>, now: 
     core.upsert("move-pending", None, super::model::Body::Notice { level: Level::Info, text });
     core.touch_state();
     Move { to, cwd, note, picks_up: picks_up && !local, kind: kind.filter(|_| !local), model, local }
+}
+
+/// A person pauses it, or resumes it (`Command::Pause` without a task): its processes held stopped by
+/// its machine's pacer (`crate::headroom::pause`), now or as soon as it has any, or why they can't
+/// be, said in its conversation.
+fn pause_session(s: &Session, on: bool) {
+    let mut core = s.core.lock();
+    match crate::headroom::pause(&s.id, on) {
+        Ok(()) => {
+            core.state.frozen = on.then(Core::now);
+            core.touch_state();
+        }
+        Err(why) => core.upsert(&format!("pause-refused-{}", Core::now()), None, super::model::Body::Notice { level: Level::Warn, text: format!("Not paused: {why}.") }),
+    }
+}
+
+/// A person's branch of it, or of one of its harness's own subagents (`Command::Branch`): a new
+/// session on this machine (`goback::branch_spec`), or why not, said in its conversation.
+fn branch(s: &Session, files: &Files, words: &str, top: bool, task: Option<&str>) {
+    let own = s.resume_spec();
+    let core = s.core.lock();
+    let can_fork = core.meta.features.iter().any(|f| f == "resume");
+    let task = match task {
+        None => None,
+        Some(t) => match core.state.tasks.iter().find(|x| x.subagent() && (x.id == t || x.tool_id.as_deref() == Some(t))) {
+            Some(x) => Some((x.id.clone(), super::goback::thread_words(&core, x.tool_id.as_deref().unwrap_or(""), x.prompt.as_deref()))),
+            None => {
+                drop(core);
+                s.core.lock().upsert(&format!("branch-refused-{}", Core::now()), None, super::model::Body::Notice { level: Level::Warn, text: "Not branched: it has no such subagent.".to_owned() });
+                return;
+            }
+        },
+    };
+    let conversation = if task.is_none() && !(can_fork && own.resume.is_some()) { super::goback::branch_prompt(&core, None) } else { String::new() };
+    drop(core);
+    let from = super::goback::BranchFrom { id: &s.id, own, can_fork, conversation, task: task.as_ref().map(|(t, w)| (t.as_str(), w.clone())) };
+    (files.spawn)(super::goback::branch_spec(from, words, top));
 }
 
 /// How a move is getting on before it starts (its repository being copied there).
@@ -2453,6 +2648,11 @@ async fn files_in(s: &Session, sink: &Sink, mark: &crate::sync::runner::Mark, ct
                 Ok(Ctl::Close) | Err(_) => return Arrived::End { let_go: false },
                 // What it carries goes once it's on, asking for room then.
                 Ok(Ctl::Room) => {}
+                Ok(Ctl::Epoch(e)) => raise_epoch(&mut s.core.lock(), e),
+                // No harness of its runs here to hold a call.
+                Ok(Ctl::Hook(_, reply)) => {
+                    let _ = reply.send(serde_json::json!({}));
+                }
             },
             () = tick => {}
         }
@@ -2531,6 +2731,8 @@ where
         _ => Carry::Nothing,
     };
     let mut pkg = super::moving::pack(&s.id, spec, &cwd, &mv.to, &cwd, carry, events, state);
+    // Signed for as it goes, by its identity at the epoch it leaves (docs/ci.md W27-R08).
+    pkg.hand_on = crate::runner::custody::hand_on(&s.id, pkg.state.epoch, &pkg.events, "taken over by this machine's newer runner process");
     // Its harness's own record is here already: it goes on from it, nothing started anew.
     if matches!(pkg.carry, Carry::Nothing) {
         pkg.spec.resume = resume;
@@ -2727,6 +2929,8 @@ async fn hand_over(s: &Arc<Session>, kind: &'static Kind, mv: &Move, ids: &Carri
     // Paused for a limit: it goes on there, where it moved for room, the cut-off turn first.
     let cut = picks_up_there(&mut state);
     let mut pkg = super::moving::pack(&s.id, spec, &mv.cwd, &me, &from_cwd, carry, events, state);
+    // Signed for as it goes, by its identity at the epoch it leaves (docs/ci.md W27-R08).
+    pkg.hand_on = crate::runner::custody::hand_on(&s.id, pkg.state.epoch, &pkg.events, "moved to another machine");
     if let Some(home) = home {
         pkg = pkg.with_home(home);
     }
@@ -2827,6 +3031,20 @@ async fn drive(s: Arc<Session>, kind: &'static Kind, ctl_rx: async_channel::Rece
     if handed {
         s.prompted.store(true, std::sync::atomic::Ordering::Relaxed);
     }
+    // A new session (nothing in its timeline yet): the commit its folder has checked out as it
+    // begins, the commits after it its own (the Changes tab's Commits). One that came back (a
+    // restart, a move) has it, or is from before kiln kept it.
+    let new = {
+        let core = s.core.lock();
+        (core.events().next().is_none() && core.state.started_head.is_none()).then(|| core.state.cwd.clone())
+    };
+    if let Some(cwd) = new.filter(|_| !handed)
+        && let Some(head) = crate::workspace::git::head(std::path::Path::new(&cwd)).await
+    {
+        let mut core = s.core.lock();
+        core.state.started_head = Some(head);
+        core.touch_state();
+    }
     // Taking over a session: its transcript is read once it has ended (checked again before each
     // start while it has not).
     if !handed {
@@ -2851,6 +3069,15 @@ async fn drive(s: Arc<Session>, kind: &'static Kind, ctl_rx: async_channel::Rece
             }
         }
     }
+    // Paused by a person before this runner started (its pacer's guard started its processes again
+    // as the last runner ended): held again, or said to run if this machine can't hold it.
+    let frozen = s.core.lock().state.frozen.is_some();
+    if frozen && let Err(why) = crate::headroom::pause(&s.id, true) {
+        let mut core = s.core.lock();
+        core.state.frozen = None;
+        core.touch_state();
+        core.upsert(&format!("pause-refused-{}", Core::now()), None, super::model::Body::Notice { level: Level::Warn, text: format!("No longer paused: {why}.") });
+    }
     // Announce it, whole, before anything else: whoever mirrors it starts from all of it. One
     // that started again from the conversation store announces all but its timeline: the store
     // has that, and the server's copy gets what it lacks as the session's stream starts.
@@ -2862,7 +3089,11 @@ async fn drive(s: Arc<Session>, kind: &'static Kind, ctl_rx: async_channel::Rece
         let _ = sink.send((s.id.clone(), u)).await;
     }
     let mut first = !handed;
-    let mut crashes: Vec<Instant> = Vec::new();
+    // Its process ending never ends it: how many starts in a row ended soon after, the wait before
+    // its next start, and when that is.
+    let mut soon: u32 = 0;
+    let mut again = AGAIN_FIRST;
+    let mut again_at: Option<Instant>;
     // A message that arrived while the process was down, sent once it is back.
     let mut carry: Vec<Command> = Vec::new();
     // Skill runs sent while there was no room on its machine for it to go to work: run once there
@@ -2910,10 +3141,14 @@ async fn drive(s: Arc<Session>, kind: &'static Kind, ctl_rx: async_channel::Rece
     // A setting its harness takes when it starts (where its commands run) changed: it starts
     // again once nothing is under way.
     let mut reloading = false;
+    // Its harness ran here, a process of its own: one that never did has no group of processes
+    // here to end when it lets go.
+    let mut ran_here = false;
     // Tasks the harness left running that a switch stopped.
     let mut left = 0usize;
-    // The models it last listed (the machine keeps the list for its "new agent" and switches).
-    let mut models_seen: Vec<super::model::ModelOption> = Vec::new();
+    // The models it last listed (the machine keeps the list for its "new agent" and switches): not
+    // those kiln named ahead of its harness (`named_ahead`), which are the machine's list already.
+    let mut models_seen = s.core.lock().meta.models.clone();
     loop {
         // The harness it ran in is down: on in the other one.
         // Its turn is over: on to the other runner (or, if that can't be, on here).
@@ -2957,7 +3192,7 @@ async fn drive(s: Arc<Session>, kind: &'static Kind, ctl_rx: async_channel::Rece
             if let Some((to, carried)) = carry_over(&s, kind, sw, std::mem::take(&mut left), &sink).await {
                 kind = to;
                 seed = carried;
-                models_seen.clear();
+                models_seen = s.core.lock().meta.models.clone();
             }
             first = false;
             on_change();
@@ -2983,6 +3218,9 @@ async fn drive(s: Arc<Session>, kind: &'static Kind, ctl_rx: async_channel::Rece
                     // goes on), so two of it never run.
                     tracing::warn!(session = %s.id, error = %format!("{e:#}"), "couldn't take over the agent's process after the upgrade: it starts again");
                     crate::proc::terminate_tree(i32::try_from(a.process.pid).unwrap_or(0), Duration::from_secs(2)).await;
+                    // What its adapter held for it goes to the new one.
+                    let mut gone = a.adapter;
+                    gone.let_go(&mut s.core.lock());
                     continue;
                 }
             },
@@ -3009,6 +3247,22 @@ async fn drive(s: Arc<Session>, kind: &'static Kind, ctl_rx: async_channel::Rece
                     None => match kind.launch(&spec, &s.id) {
                         Ok(mut p) => {
                             p.env(super::survivors::MARK, &s.id);
+                            // Its git signs as the agent, through this runner (W27-R03), where the
+                            // server issues identities, and pushes to kiln as the agent where the
+                            // server gives it a credential of its own; the person's own
+                            // configuration, key and credential never.
+                            let (sign, kiln) = (crate::runner::identity::enabled(), crate::runner::identity::kiln_git());
+                            if sign || !kiln.is_empty() {
+                                match crate::gitsign::installed() {
+                                    Ok(program) => {
+                                        let had = std::env::var("GIT_CONFIG_COUNT").ok().and_then(|n| n.parse().ok()).unwrap_or(0);
+                                        for (k, v) in crate::gitsign::git_env(&program, sign.then_some(crate::gitsign::AGENT_KEY), &kiln, had) {
+                                            p.env(k, v);
+                                        }
+                                    }
+                                    Err(e) => tracing::warn!(session = %s.id, error = %format!("{e:#}"), "its git won't sign or push as the agent"),
+                                }
+                            }
                             crate::proc::spawn_duplex_in_pool(p, crate::os::contain::Group::of(&s.id)).await
                         }
                         Err(e) => Err(e),
@@ -3018,12 +3272,15 @@ async fn drive(s: Arc<Session>, kind: &'static Kind, ctl_rx: async_channel::Rece
             }
         };
         let started = Instant::now();
+        again_at = None;
+        let launched = spawned.is_ok();
         let mut code = None;
         let mut error = None;
         match spawned {
             Err(e) => error = Some(format!("{e:#}")),
             Ok(mut p) => {
                 *s.pid.lock() = Some(p.pid);
+                ran_here = true;
                 if adopted {
                     let mut core = s.core.lock();
                     // An older image may have left what the harness before a switch ran looking live.
@@ -3069,6 +3326,8 @@ async fn drive(s: Arc<Session>, kind: &'static Kind, ctl_rx: async_channel::Rece
                 let mut ending = false;
                 // Stopped by force (`Command::ForceStop`): it starts again now, whatever is under way.
                 let mut forcing = false;
+                // Where this machine keeps what's an agent's own: whose each file it changes is.
+                let roots = std::sync::Arc::new(super::whose::Roots::here(&spec.env));
                 loop {
                     for job in jobs.previews.drain(..) {
                         let tx = pv_tx.clone();
@@ -3079,15 +3338,19 @@ async fn drive(s: Arc<Session>, kind: &'static Kind, ctl_rx: async_channel::Rece
                         });
                     }
                     for job in jobs.changes.drain(..) {
-                        // Placed among its folder's repository's working trees (a worktree it went into).
-                        let home = {
+                        // Placed among its folder's repository's working trees (a worktree it went into),
+                        // and said whose it is: this project's, the person's or an agent's own.
+                        let (home, folders) = {
                             let mut core = s.core.lock();
                             core.start_change(&job.abs);
-                            core.state.cwd.clone()
+                            let cwd = core.state.cwd.clone();
+                            core.note_folder(&cwd);
+                            (cwd, core.folders().to_vec())
                         };
+                        let roots = roots.clone();
                         changes.push(async move {
                             let abs = job.abs.clone();
-                            let change = crate::rt::blocking(move || super::diff::placed_change(&job, &home)).await.unwrap_or((None, None));
+                            let change = crate::rt::blocking(move || super::diff::placed_change(&job, &home, &folders, &roots)).await.unwrap_or_default();
                             (abs, change)
                         });
                     }
@@ -3140,7 +3403,11 @@ async fn drive(s: Arc<Session>, kind: &'static Kind, ctl_rx: async_channel::Rece
                             }
                         }
                         Ev::Ctl(Some(Ctl::Cmd(c))) => match *c {
-                            Command::Restart => {}
+                            Command::Restart => {
+                                if s.core.lock().state.status == Status::Exited {
+                                    rewind_to = Some(None);
+                                }
+                            }
                             Command::ForceStop => {
                                 // You ended the turn: a restart before it's back doesn't take it up again.
                                 s.turn_open.store(false, std::sync::atomic::Ordering::Relaxed);
@@ -3153,6 +3420,8 @@ async fn drive(s: Arc<Session>, kind: &'static Kind, ctl_rx: async_channel::Rece
                                     let _ = sink.send((s.id.clone(), u)).await;
                                 }
                             }
+                            // What one who changed its files did alone: the session keeps that, whatever its harness.
+                            Command::OwnEdits { client, by } => s.core.lock().ask_own(client, &by),
                             Command::Control { id, value } if id == "rename" => {
                                 if let Some(c) = name_session(&s, value.as_ref()) {
                                     adapter.command(&mut s.core.lock(), c);
@@ -3227,6 +3496,25 @@ async fn drive(s: Arc<Session>, kind: &'static Kind, ctl_rx: async_channel::Rece
                                 drop(core);
                                 on_change();
                             }
+                            // A person's pause of the whole of it: its processes, held where they are.
+                            Command::Pause { on, task: None } => {
+                                pause_session(&s, on);
+                                on_change();
+                            }
+                            // A person's branch: a new session beside it, or of its own.
+                            Command::Branch { words, top, task } => {
+                                branch(&s, &files, &words, top, task.as_deref());
+                                on_change();
+                            }
+                            // What a person lets the whole of it do (the server narrowed it to its parent's).
+                            Command::Perms { perms, task: None } => {
+                                let mut core = s.core.lock();
+                                core.state.perms = perms;
+                                core.touch_state();
+                                adapter.perms_changed(&mut core);
+                                drop(core);
+                                on_change();
+                            }
                             Command::MaxSubagents { count } => {
                                 let mut core = s.core.lock();
                                 core.state.max_subagents = count.filter(|n| *n >= 1);
@@ -3284,6 +3572,10 @@ async fn drive(s: Arc<Session>, kind: &'static Kind, ctl_rx: async_channel::Rece
                             }
                             adapter.room(&mut core);
                         }
+                        Ev::Ctl(Some(Ctl::Epoch(e))) => raise_epoch(&mut s.core.lock(), e),
+                        // Its harness's hook asks before a tool call: the adapter answers, at once or
+                        // once a person lets the call go.
+                        Ev::Ctl(Some(Ctl::Hook(input, reply))) => adapter.hook(&mut s.core.lock(), input, reply),
                         Ev::Ctl(Some(Ctl::HandOver(reply))) => {
                             // This image of the process ends next (an in-place upgrade): the next
                             // one goes on with this very process. What it has said so far is taken
@@ -3299,6 +3591,8 @@ async fn drive(s: Arc<Session>, kind: &'static Kind, ctl_rx: async_channel::Rece
                                 p.terminate(Duration::from_secs(2));
                                 let _ = crate::rt::timeout(Duration::from_secs(5), &mut p.exit).await;
                                 *s.pid.lock() = None;
+                                // What its adapter held goes with its record, in its queue.
+                                adapter.let_go(&mut s.core.lock());
                                 let _ = reply.send(None);
                                 return;
                             };
@@ -3379,10 +3673,10 @@ async fn drive(s: Arc<Session>, kind: &'static Kind, ctl_rx: async_channel::Rece
                             }
                         }
                         Ev::Preview(None) => {}
-                        Ev::Change((abs, (change, resolved))) => {
-                            s.core.lock().set_change(&abs, change, resolved);
-                            while let Some(Some((abs, (change, resolved)))) = changes.next().now_or_never() {
-                                s.core.lock().set_change(&abs, change, resolved);
+                        Ev::Change((abs, found)) => {
+                            s.core.lock().found(&abs, found);
+                            while let Some(Some((abs, found))) = changes.next().now_or_never() {
+                                s.core.lock().found(&abs, found);
                             }
                         }
                         Ev::Fx(Some(d)) => d.apply(&mut adapter, &mut s.core.lock()),
@@ -3494,6 +3788,7 @@ async fn drive(s: Arc<Session>, kind: &'static Kind, ctl_rx: async_channel::Rece
                     seed = None;
                 }
                 if rewind_to.is_some() {
+                    adapter.let_go(&mut s.core.lock());
                     first = false;
                     continue;
                 }
@@ -3526,19 +3821,48 @@ async fn drive(s: Arc<Session>, kind: &'static Kind, ctl_rx: async_channel::Rece
         if switching.is_some() || moving.is_some() || reloading {
             continue;
         }
-        // A crash after a good run comes back by itself (a few times), with room on its machine
-        // for it (at work when it crashed, it has its own still); a harness that will not start
-        // waits for a person.
+        // Its process ending never ends the agent, however it ended (a signal from outside it, a
+        // crash, an end of its own): an agent lives until a person, or the agent that started it,
+        // ends it (docs/agents.md, "An agent lives until it's ended"). It starts again by itself,
+        // its conversation resumed and the turn the end cut short picked up first, once there's
+        // room on its machine for it: after `AGAIN_FIRST`, each time twice the wait before (at most
+        // `AGAIN_MOST`), from `AGAIN_FIRST` again once it ran `AGAIN_RESET`. A harness that never
+        // started, or ended within `SOON` of each of its last `SOON_TRIES` starts, won't start: it
+        // waits for a person (a restart or a message), saying why.
         let ran = started.elapsed();
-        crashes.retain(|t| t.elapsed() < Duration::from_secs(600));
-        let auto = code != Some(0) && error.is_none() && ran > Duration::from_secs(20) && crashes.len() < 3;
-        if auto {
-            crashes.push(Instant::now());
-            if s.core.lock().has_room() {
-                crate::rt::sleep(Duration::from_secs(2)).await;
-                continue;
+        if ran >= AGAIN_RESET {
+            again = AGAIN_FIRST;
+        }
+        soon = if ran < SOON { soon.saturating_add(1) } else { 0 };
+        if launched && soon < SOON_TRIES {
+            let cut = s.turn_open.load(std::sync::atomic::Ordering::Relaxed);
+            again_at = Instant::now().checked_add(again);
+            {
+                let mut core = s.core.lock();
+                let now = Core::now();
+                if let Some(x) = core.state.exit.as_mut() {
+                    x.again_at = Some(now.saturating_add(i64::try_from(again.as_millis()).unwrap_or(i64::MAX)));
+                }
+                let then = if cut { ", and picks up the turn it was on" } else { "" };
+                core.upsert(&format!("harness-again:{now}"), None, super::model::Body::Notice { level: Level::Warn, text: format!("Its process ended ({}). kiln starts it again{then}: its conversation goes on.", ended_how(code)) });
+                if cut && !core.state.queue.first().is_some_and(|q| q.text == PICK_UP) {
+                    core.state.queue.insert(0, super::model::QueueItem { id: format!("{}again-{now}", super::core::KEEP_ID), text: PICK_UP.to_owned(), at: now, attachments: Vec::new(), overrides: None, reply_to: None });
+                }
+                core.touch_state();
             }
-            restart_wanted = true;
+            flush(&s, &sink, None).await;
+            on_change();
+            again = again.saturating_mul(2).min(AGAIN_MOST);
+        } else if launched {
+            {
+                let mut core = s.core.lock();
+                if let Some(x) = core.state.exit.as_mut() {
+                    x.error.get_or_insert_with(|| format!("It ended within {} s of each of its last {SOON_TRIES} starts, so kiln stopped starting it again: send a message or restart it.", SOON.as_secs()));
+                }
+                core.touch_state();
+            }
+            flush(&s, &sink, None).await;
+            on_change();
         }
         // Skill runs that waited for room go with its next start.
         carry.append(&mut for_room);
@@ -3565,9 +3889,21 @@ async fn drive(s: Arc<Session>, kind: &'static Kind, ctl_rx: async_channel::Rece
             if unwaited {
                 flush(&s, &sink, None).await;
             }
+            // Its process ended without anyone ending it: it starts again when its wait is over.
+            let due = again_at;
+            let wake = async move {
+                match due {
+                    Some(at) => crate::rt::sleep(at.saturating_duration_since(Instant::now())).await,
+                    None => futures::future::pending::<()>().await,
+                }
+            };
             let ev = futures::select_biased! {
                 c = ctl_rx.recv().fuse() => Ev::Ctl(c.ok()),
                 f = fx_rx.recv().fuse() => Ev::Fx(f.ok()),
+                () = wake.fuse() => {
+                    again_at = None;
+                    Ev::Ctl(Some(Ctl::Cmd(Box::new(Command::Restart))))
+                }
             };
             match ev {
                 Ev::Ctl(Some(Ctl::Cmd(c))) => match *c {
@@ -3582,6 +3918,7 @@ async fn drive(s: Arc<Session>, kind: &'static Kind, ctl_rx: async_channel::Rece
                             let _ = sink.send((s.id.clone(), u)).await;
                         }
                     }
+                    Command::OwnEdits { client, by } => s.core.lock().ask_own(client, &by),
                     // Another harness's model: the session goes on in it, now.
                     Command::SetModel { model, kind: Some(to) } if to != kind.id => {
                         if let Some(sw) = wanted(&s, kind, &to, model) {
@@ -3611,22 +3948,37 @@ async fn drive(s: Arc<Session>, kind: &'static Kind, ctl_rx: async_channel::Rece
                     c @ (Command::Send { .. } | Command::SkillRun { .. }) => {
                         let c = prepare(&files, c).await;
                         let mut core = s.core.lock();
-                        if core.has_room() {
+                        // What waits in its queue goes first (held for its harness when that
+                        // ended, CP-T3.2): one to go in turn waits behind it, and the harness,
+                        // started again, takes them in order.
+                        if matches!(&c, Command::Send { mode: super::model::SendMode::Queue, task: None, .. }) && !core.state.queue.is_empty() {
+                            if let Some(m) = self::queued(c) {
+                                core.state.queue.push(m);
+                                core.touch_state();
+                            }
+                            let room = core.has_room();
+                            drop(core);
+                            on_change();
+                            if room {
+                                break;
+                            }
+                        } else if core.has_room() {
                             drop(core);
                             carry.push(c);
                             break;
-                        }
-                        // No room on its machine for it to go to work: a message waits in its
-                        // queue till there is (a skill run with what goes with its next start).
-                        match c {
-                            Command::Send { id, text, attachments, overrides, reply_to, .. } => {
-                                core.state.queue.push(super::model::QueueItem { id, text, at: Core::now(), attachments, overrides, reply_to });
-                                core.touch_state();
+                        } else {
+                            // No room on its machine for it to go to work: a message waits in its
+                            // queue till there is (a skill run with what goes with its next start).
+                            match c {
+                                Command::Send { id, text, attachments, overrides, reply_to, .. } => {
+                                    core.state.queue.push(super::model::QueueItem { id, text, at: Core::now(), attachments, overrides, reply_to });
+                                    core.touch_state();
+                                }
+                                c => carry.push(c),
                             }
-                            c => carry.push(c),
+                            drop(core);
+                            on_change();
                         }
-                        drop(core);
-                        on_change();
                     }
                     // Where its commands run, while it isn't running: from its next start.
                     Command::Control { id, value } if id == "reach" => {
@@ -3653,11 +4005,33 @@ async fn drive(s: Arc<Session>, kind: &'static Kind, ctl_rx: async_channel::Rece
                         drop(core);
                         on_change();
                     }
+                    // Paused while it isn't running: its processes are held as soon as it has any.
+                    Command::Pause { on, task: None } => {
+                        pause_session(&s, on);
+                        on_change();
+                    }
+                    // Branched while it isn't running: from its conversation as it was.
+                    Command::Branch { words, top, task } => {
+                        branch(&s, &files, &words, top, task.as_deref());
+                        on_change();
+                    }
+                    // Its perms, set while it isn't running: they hold from its next start.
+                    Command::Perms { perms, task: None } => {
+                        let mut core = s.core.lock();
+                        core.state.perms = perms;
+                        core.touch_state();
+                        drop(core);
+                        on_change();
+                    }
                     c => adapter.command(&mut s.core.lock(), c),
                 },
                 // No process to hand over: the next image starts it from its record.
                 Ev::Ctl(Some(Ctl::HandOver(reply))) => {
                     let _ = reply.send(None);
+                }
+                // No harness of its runs now to hold a call.
+                Ev::Ctl(Some(Ctl::Hook(_, reply))) => {
+                    let _ = reply.send(serde_json::json!({}));
                 }
                 // There may be room on its machine now: it starts again if anything waits for that,
                 // the first message in its queue first.
@@ -3673,6 +4047,7 @@ async fn drive(s: Arc<Session>, kind: &'static Kind, ctl_rx: async_channel::Rece
                         break;
                     }
                 }
+                Ev::Ctl(Some(Ctl::Epoch(e))) => raise_epoch(&mut s.core.lock(), e),
                 Ev::Ctl(ctl @ (Some(Ctl::Close | Ctl::LetGo) | None)) => {
                     // Ending the agent ends what it left running that kiln took back over, and the
                     // rest of its group of processes, which then goes.
@@ -3680,7 +4055,11 @@ async fn drive(s: Arc<Session>, kind: &'static Kind, ctl_rx: async_channel::Rece
                     if !left.is_empty() {
                         let _ = crate::rt::blocking(move || left.iter().for_each(super::survivors::stop_tree)).await;
                     }
-                    if let Some(g) = crate::os::contain::Group::existing(&s.id) {
+                    // Gone on elsewhere without its harness ever running here (it couldn't start),
+                    // it has no group here: one under its id is the machine's it went on to, when
+                    // both kiln processes share a cgroup (a test's server and its runners), its
+                    // harness starting there, and isn't ended from here.
+                    if let Some(g) = crate::os::contain::Group::existing(&s.id).filter(|_| ran_here || !matches!(ctl, Some(Ctl::LetGo))) {
                         end_group(g, Duration::ZERO);
                     }
                     if matches!(ctl, Some(Ctl::LetGo)) {
@@ -3734,12 +4113,108 @@ mod tests {
     }
 
     #[test]
+    fn cp_t3_2_headroom_grants_wake_queued_work_once_and_survive_an_empty_queue() {
+        let (s, _rx) = idle("headroom-granted-before-queue");
+        s.core.lock().session_id = s.id.clone();
+        let admission = crate::headroom::tests::Admission::held(&s.id);
+        admission.grant();
+        assert!(held_room(&s.core).now_or_never().is_none(), "an empty queue never wakes for a grant");
+        s.core.lock().state.queue.push(super::super::model::QueueItem { id: "first".into(), text: "start the work".into(), at: 0, attachments: Vec::new(), overrides: None, reply_to: None });
+        assert!(held_room(&s.core).now_or_never().is_some(), "the grant stays available until there is work to wake");
+        assert!(held_room(&s.core).now_or_never().is_none(), "each grant wakes the queue once");
+
+        let (s, _rx) = idle("headroom-granted-after-listening");
+        s.core.lock().session_id = s.id.clone();
+        s.core.lock().state.queue.push(super::super::model::QueueItem { id: "second".into(), text: "continue the work".into(), at: 0, attachments: Vec::new(), overrides: None, reply_to: None });
+        let admission = crate::headroom::tests::Admission::held(&s.id);
+        let room = held_room(&s.core);
+        futures::pin_mut!(room);
+        assert!(room.as_mut().now_or_never().is_none(), "held work waits for its grant");
+        admission.grant();
+        assert!(room.as_mut().now_or_never().is_some(), "a grant wakes a listener that was already waiting");
+        assert!(held_room(&s.core).now_or_never().is_none(), "the notification also takes the grant so a second wait stays asleep");
+    }
+
+    #[test]
     fn a_first_message_its_harness_never_got_stays_in_what_resumes_it_until_it_goes() {
         let (s, _rx) = idle("never-started");
         *s.spec.lock() = Spec { kind: "claude".into(), prompt: Some("fix the flaky test".into()), ..Spec::default() };
         assert_eq!(s.resume_spec().prompt.as_deref(), Some("fix the flaky test"));
         s.prompted.store(true, std::sync::atomic::Ordering::Relaxed);
         assert_eq!(s.resume_spec().prompt, None);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cp_t3_2_a_restart_recovers_a_codex_startup_refusal_while_its_process_lives() -> anyhow::Result<()> {
+        use std::os::unix::fs::PermissionsExt as _;
+        crate::rt::block_on(async {
+            for failure in ["initialize", "thread/start"] {
+                let dir = tempfile::tempdir()?;
+                let program = dir.path().join("codex.py");
+                std::fs::write(&program, r##"#!/usr/bin/env python3
+import json, os, pathlib, sys
+mark = pathlib.Path(os.environ["RESTART_MARK"])
+first = not mark.exists()
+mark.write_text("started")
+for line in sys.stdin:
+    request = json.loads(line)
+    if "id" not in request:
+        continue
+    method = request.get("method")
+    if first and method == os.environ["RESTART_FAILURE"]:
+        response = {"error": {"message": "startup refused"}}
+    elif method == "thread/start":
+        response = {"result": {"thread": {"id": "native-thread", "turns": []}}}
+    elif method == "turn/start":
+        response = {"result": {"turn": {"id": "native-turn"}}}
+    else:
+        response = {"result": {}}
+    print(json.dumps({"id": request["id"], **response}), flush=True)
+"##)?;
+                std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o700))?;
+                let (sink, updates) = async_channel::unbounded();
+                let files = Files {
+                    dir: dir.path().to_owned(), take: Arc::new(|_| None), spawn: Arc::new(|_| {}), release: Arc::new(|_| {}),
+                    carried: Arc::new(|_| Box::pin(async { Ok(Vec::new()) })), fence: Arc::new(|_, _| Box::pin(async { Ok(()) })),
+                    settle: Arc::new(|_, _, _| Box::pin(async { Ok(None) })), room: Arc::new(|| true), work: Arc::new(|_, _| {}),
+                };
+                let s = start(crate::util::new_id(), Spec {
+                    kind: "codex".into(), cwd: Some(dir.path().to_string_lossy().into_owned()), program: Some(program.to_string_lossy().into_owned()),
+                    prompt: Some("original task".into()), reach: Some("off".into()),
+                    env: vec![("RESTART_MARK".into(), dir.path().join("started").to_string_lossy().into_owned()), ("RESTART_FAILURE".into(), failure.into())],
+                    ..Spec::default()
+                }, sink, Arc::new(|| {}), files)?;
+                let result = async {
+                    loop {
+                        if let (_, Update::State { state }) = updates.recv().await? && state.status == Status::Exited {
+                            anyhow::ensure!(state.exit.as_ref().and_then(|e| e.error.as_deref()).is_some_and(|e| e.contains("startup refused")), "unexpected startup error");
+                            break;
+                        }
+                    }
+                    anyhow::ensure!(s.pid.lock().is_some(), "the refused app-server must still be alive");
+                    let original = s.core.lock().state.queue.first().map(|q| q.id.clone()).ok_or_else(|| anyhow::anyhow!("original prompt disappeared"))?;
+                    anyhow::ensure!(s.command(Command::Restart) && s.command(Command::Snapshot), "session refused recovery commands");
+                    loop {
+                        if let (_, Update::Open { info, .. }) = updates.recv().await? {
+                            anyhow::ensure!(info.status != Status::Exited, "Restart left the refused app-server running");
+                            break;
+                        }
+                    }
+                    loop {
+                        if let (_, Update::State { state }) = updates.recv().await? && state.delivery.get(&original) == Some(&super::super::model::Delivery::Started) {
+                            anyhow::ensure!(state.queue.is_empty() && state.given.iter().filter(|m| m.id == original).count() == 1, "original prompt was lost or delivered twice");
+                            break;
+                        }
+                    }
+                    anyhow::Ok(())
+                }.await;
+                s.close();
+                while !matches!(updates.recv().await?, (_, Update::Closed)) {}
+                result?;
+            }
+            anyhow::Ok(())
+        })
     }
 
     /// CP-T3.2: a move gathers what a session was sent and hasn't taken (carried while its harness
@@ -3962,6 +4437,73 @@ mod tests {
         assert!(!switch_now(&core), "running");
     }
 
+    /// A switch leaves the old harness's to-dos to the note it gives the new one ("The plan as it
+    /// stands": the next test): the session goes on with none, so keep-going counts only the list
+    /// the new harness keeps, never one it has no way to change (Claude Code without a to-do tool,
+    /// after Devin).
+    #[test]
+    fn a_switch_leaves_the_to_dos_of_the_old_harness_in_its_note() {
+        use super::super::model::{State, Todo};
+        use super::{Info, for_harness};
+        let todo = |text: &str, status: &str| Todo { text: text.into(), status: status.into() };
+        let mut st = State { todos: vec![todo("find the cause", "completed"), todo("upgrade the studios", "in_progress"), todo("check them", "pending")], ..State::default() };
+        let mut info = Info::default();
+        info.apply(&st);
+        assert_eq!((info.todos_done, info.todos_total), (1, 3));
+        for_harness(&mut st, Some("S2".into()), "opus", Some("auto".into()), Some("max".into()));
+        info.apply(&st);
+        assert!(st.todos.is_empty(), "{:?}", st.todos);
+        assert_eq!((info.todos_done, info.todos_total), (0, 0), "nothing left open for keep-going to count");
+    }
+
+    /// A list says what each of its harness's own subagents is doing (a line), never what it
+    /// reported, and which subagent asks each request: Mission control's subagent tree draws from
+    /// the list, not the agent's whole state.
+    #[test]
+    fn a_list_says_what_each_subagent_does_and_which_subagent_asks() {
+        use super::super::model::{Approval, State, Task, ToolKind};
+        use super::Info;
+        let long = "x".repeat(500);
+        let task = |id: &str, status: &str, last: Option<&str>, summary: Option<&str>| Task {
+            id: id.into(),
+            description: format!("sub {id}"),
+            status: status.into(),
+            class: Some("agent".into()),
+            last_tool: last.map(str::to_owned),
+            summary: summary.map(str::to_owned),
+            ..Task::default()
+        };
+        let ask = Approval {
+            id: "ap1".into(),
+            tool_id: Some("toolu_1".into()),
+            tool_name: "Bash".into(),
+            tool: ToolKind::Shell,
+            title: "cargo test".into(),
+            detail: None,
+            input: serde_json::Value::Null,
+            command: Some("cargo test".into()),
+            cwd: "/w".into(),
+            diffs: Vec::new(),
+            reason: None,
+            always: Vec::new(),
+            default_to_no: false,
+            questions: Vec::new(),
+            plan: None,
+            agent: Some("a1".into()),
+            at: 5,
+        };
+        let st = State { tasks: vec![task("a1", "running", Some("Read src/raft/vote.rs"), None), task("a2", "completed", Some(&long), Some(&long))], approvals: vec![ask], ..State::default() };
+        let mut info = Info::default();
+        info.apply(&st);
+        let brief = |id: &str| info.subagents.iter().find(|b| b.id == id);
+        assert_eq!(brief("a1").and_then(|b| b.last_tool.as_deref()), Some("Read src/raft/vote.rs"));
+        let clipped = brief("a2").and_then(|b| b.last_tool.as_deref()).map_or(0, str::len);
+        assert!(clipped > 0 && clipped < long.len(), "what it's doing is clipped to a line: {clipped}");
+        let encoded = serde_json::to_value(brief("a2")).unwrap_or_default();
+        assert!(encoded.get("summary").is_none(), "what it reported stays out of the list: {encoded}");
+        assert_eq!(info.approvals.first().and_then(|a| a.agent.as_deref()), Some("a1"));
+    }
+
     /// Into Devin, Antigravity or another ACP agent too: named by its own modes (kiln's Ask and
     /// Bypass for an agent that says its own only once started), at the same latitude.
     #[test]
@@ -3984,6 +4526,35 @@ mod tests {
         assert_eq!(carried_choices(claude, gemini, "plan", "", true, "").0, None);
         // And out of one: Devin's plan stays plan in Claude Code.
         assert_eq!(carried_choices(devin, claude, "plan", "", true, "opus").0.as_deref(), Some("plan"));
+        Ok(())
+    }
+
+    /// A session's page names its settings by its harness's lists before the harness says anything
+    /// (started, or switched to it anew): its modes by their names, the effort levels of the model it
+    /// runs where this machine has its list, else the harness's. What the harness said stays.
+    #[test]
+    fn a_harness_s_lists_name_a_session_s_settings_ahead_of_it() -> anyhow::Result<()> {
+        use super::super::model::{Meta, ModeOption};
+        use super::{Kind, named_ahead};
+        let kind = |id: &str| Kind::get(id).ok_or_else(|| anyhow::anyhow!("no {id}"));
+        let mut meta = Meta::default();
+        named_ahead(&mut meta, kind("codex")?, Some("gpt-6.1-sol"));
+        assert!(meta.modes.iter().any(|m| m.id == "untrusted" && m.label == "Ask"), "{:?}", meta.modes);
+        assert!(!meta.efforts.is_empty() && !meta.models.is_empty(), "{meta:?}");
+        // A model this machine hasn't listed: the harness's levels.
+        let mut meta = Meta::default();
+        named_ahead(&mut meta, kind("claude")?, Some("claude-unlisted-1"));
+        assert!(meta.modes.iter().any(|m| m.id == "acceptEdits" && m.label == "Accept edits"), "{:?}", meta.modes);
+        assert_eq!(meta.efforts.iter().map(|e| e.label.as_str()).collect::<Vec<_>>(), ["Low", "Medium", "High", "Extra high", "Max"]);
+        assert!(meta.speeds.is_empty(), "{:?}", meta.speeds);
+        // An ACP agent's models are its own to list (none before it's signed in); its modes are known.
+        let mut meta = Meta::default();
+        named_ahead(&mut meta, kind("devin")?, None);
+        assert!(meta.modes.iter().any(|m| m.id == "smart" && m.label == "Smart") && meta.models.is_empty(), "{meta:?}");
+        let said = vec![ModeOption { id: "said".into(), label: "Said".into(), description: String::new(), dangerous: false }];
+        let mut meta = Meta { modes: said.clone(), ..Meta::default() };
+        named_ahead(&mut meta, kind("claude")?, None);
+        assert_eq!(meta.modes, said);
         Ok(())
     }
 
@@ -4151,6 +4722,58 @@ mod tests {
         })
     }
 
+    /// CP-T3.2: Codex crashes before opening its thread; its unsent message stays in kiln's
+    /// durable queue. A message sent while it is down starts it again, behind the first.
+    #[cfg(unix)]
+    #[test]
+    fn what_a_crashed_harness_held_goes_first_when_its_agent_starts_again() -> anyhow::Result<()> {
+        use super::super::model::SendMode;
+        use std::os::unix::fs::PermissionsExt;
+        async fn until(s: &Session, what: &str, done: impl Fn(&Core) -> bool) -> anyhow::Result<()> {
+            let came = crate::rt::timeout(Duration::from_secs(10), async {
+                while !done(&s.core.lock()) {
+                    crate::rt::sleep(Duration::from_millis(20)).await;
+                }
+            })
+            .await;
+            let core = s.core.lock();
+            anyhow::ensure!(came.is_ok(), "{what} never came: {:?}, its queue {:?}", core.state.status, core.state.queue.iter().map(|q| &q.id).collect::<Vec<_>>());
+            Ok(())
+        }
+        let queue = |c: &Core| c.state.queue.iter().map(|q| q.id.clone()).collect::<Vec<_>>();
+        crate::rt::block_on(async move {
+            let dir = tempfile::tempdir()?;
+            // A Codex that never opens a thread, and ends (code 3) a moment after it's told to.
+            let crash = dir.path().join("crash");
+            let codex = dir.path().join("stuck-codex");
+            std::fs::write(&codex, format!("#!/bin/sh\nwhile [ ! -e '{}' ]; do sleep 0.05; done\nsleep 0.3\nexit 3\n", crash.display()))?;
+            std::fs::set_permissions(&codex, std::fs::Permissions::from_mode(0o755))?;
+            let (tx, _rx) = async_channel::unbounded();
+            let host = super::super::host::Host::new(tx, None, super::super::host::Limits::default());
+            let spec = Spec { kind: "codex".into(), cwd: Some(dir.path().to_string_lossy().into_owned()), program: Some(codex.to_string_lossy().into_owned()), ..Spec::default() };
+            let s = host.open(Some("held".into()), spec)?;
+            let send = |id: &str| Command::Send { id: id.into(), text: format!("{id}'s words"), mode: SendMode::Queue, attachments: Vec::new(), overrides: None, reply_to: None, task: None };
+            until(&s, "its start", |c| !c.meta.features.is_empty()).await?;
+            anyhow::ensure!(s.command(send("m1")));
+            until(&s, "m1 held", |c| queue(c) == ["m1"]).await?;
+            std::fs::write(&crash, "")?;
+            until(&s, "the crash", |c| c.state.status == Status::Exited).await?;
+            assert_eq!(queue(&s.core.lock()), ["m1"]);
+            // Sent while it's down, which starts it again (it ends at once, as it's told to).
+            anyhow::ensure!(s.command(send("m2")));
+            until(&s, "m2 behind m1", |c| queue(c) == ["m1", "m2"]).await?;
+            until(&s, "its second start", |c| c.state.exit.is_none()).await?;
+            until(&s, "its second end", |c| c.state.status == Status::Exited).await?;
+            let core = s.core.lock();
+            assert_eq!(queue(&core), ["m1", "m2"]);
+            assert_eq!((core.state.delivery.get("m1"), core.state.delivery.get("m2")), (None, None));
+            assert!(core.get("m1").is_none() && core.get("m2").is_none(), "neither process received the queued messages");
+            drop(core);
+            host.close("held");
+            Ok(())
+        })
+    }
+
     #[test]
     fn an_ended_agent_shows_nothing_still_running() {
         let row = |id: &str, status: &str| Task { id: id.into(), tool_id: Some(format!("call-{id}")), class: Some("shell".into()), status: status.into(), ..Task::default() };
@@ -4162,6 +4785,19 @@ mod tests {
         assert_eq!(core.state.tasks.last().and_then(|t| t.ended), Some(7));
         assert!(core.get("call-terminal-dev").is_some_and(|e| matches!(&e.body, super::super::model::Body::Assistant { streaming: false, .. })));
         assert!(core.take_out().iter().any(|u| matches!(u, Update::State { state } if state.tasks.iter().all(|t| !t.live()))));
+    }
+
+    /// CP-T3.2: an agent ended with a message still waiting to go (held for a harness that had
+    /// ended, shown queued where it was said) says it was dropped, never queued for good; what it
+    /// finished stays done.
+    #[test]
+    fn an_ended_agent_says_what_never_went_was_dropped() {
+        use super::super::model::{Delivery, QueueItem};
+        let mut core = Core::new();
+        core.state.queue.push(QueueItem { id: "m2".into(), text: "and a search".into(), at: 1, attachments: Vec::new(), overrides: None, reply_to: None });
+        core.state.delivery = [("m1".to_owned(), Delivery::Completed), ("m2".to_owned(), Delivery::Queued)].into_iter().collect();
+        end_tasks(&mut core);
+        assert_eq!((core.state.delivery.get("m1"), core.state.delivery.get("m2")), (Some(&Delivery::Completed), Some(&Delivery::Cancelled)));
     }
 
     #[test]
@@ -4344,6 +4980,9 @@ mod tests {
             left_behind: 0,
             reach: None,
             pause: None,
+            frozen: None,
+            variant_of: None,
+            perms: None,
             room_wait: None,
             last_turn: None,
             keep_off: false,

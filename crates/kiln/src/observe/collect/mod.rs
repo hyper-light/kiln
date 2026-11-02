@@ -2216,7 +2216,12 @@ mod tests {
         let mut r = read_lines(std::process::Command::new("sh").args(["-c", &script]), "test")?;
         anyhow::ensure!(r.lines.recv_timeout(Duration::from_secs(10))?.trim() == "started");
         let child = std::fs::read_to_string(&pid)?.trim().to_owned();
-        let alive = |p: &str| std::process::Command::new("kill").args(["-0", p]).stderr(std::process::Stdio::null()).status().is_ok_and(|s| s.success());
+        // Running: on Linux a zombie isn't. In CI's pods kiln is PID 1 and no subreaper, so a killed
+        // orphan stays one until the pod goes.
+        let alive = |p: &str| match std::fs::read_to_string(format!("/proc/{p}/stat")) {
+            Ok(stat) => stat.rsplit_once(") ").is_some_and(|(_, rest)| !rest.starts_with('Z')),
+            Err(_) => std::process::Command::new("kill").args(["-0", p]).stderr(std::process::Stdio::null()).status().is_ok_and(|s| s.success()),
+        };
         anyhow::ensure!(alive(&child), "its child {child} running");
         r.stop();
         let start = Instant::now();

@@ -85,8 +85,12 @@ fn res_input(p: &str, n: &str, key: &str, q: &HashMap<String, String>, keys: &[&
 }
 
 /// Follows the logs of an object's pods over a WebSocket (docs/cd.md): the pods are found once,
-/// then their lines arrive as they are written (`live::follow`).
-fn follow_logs(cd: Arc<super::Cd>, input: Value, req: Request) -> Result<Response, Fail> {
+/// then their lines arrive as they are written (`live::follow`). What the page sends up that can't
+/// be read is answered `refused` and noted from its person.
+fn follow_logs(hub: Arc<Hub>, cd: Arc<super::Cd>, input: Value, req: Request) -> Result<Response, Fail> {
+    use crate::wire::unread::Wire;
+    let person = req.extensions().get::<crate::authz::Caller>().map_or_else(|| "admin".to_owned(), |c| c.name.clone());
+    let sock = crate::wire::ui::Socket::of(Wire::LogUp, Wire::LogDown, &person, None);
     let (resp, upgrade) = ws::accept(req).map_err(|r| (r.status, r.reason.to_owned()))?;
     crate::rt::spawn(async move {
         let socket = match upgrade.await {
@@ -96,6 +100,19 @@ fn follow_logs(cd: Arc<super::Cd>, input: Value, req: Request) -> Result<Respons
                 return;
             }
         };
+        // What a runner's job made (a Compose project, a host's service): followed on its hosts (W26-R26).
+        {
+            let f = |k: &str| input.get(k).and_then(Value::as_str).unwrap_or("");
+            let k = ResKey::new(f("group"), f("kind"), f("namespace"), f("name"));
+            if super::logs::on_runners(&k) {
+                let id = f("app").to_owned();
+                let ask = super::logs::ask_of(&input, true);
+                if let Err(e) = super::logs::follow(hub, cd, id, k, ask, sock, socket).await {
+                    tracing::debug!(error = %format!("{e:#}"), "a log stream ended");
+                }
+                return;
+            }
+        }
         let found = async {
             let id = input.get("app").and_then(Value::as_str).unwrap_or("").to_owned();
             let f = |k: &str| input.get(k).and_then(Value::as_str).unwrap_or("");
@@ -114,13 +131,13 @@ fn follow_logs(cd: Arc<super::Cd>, input: Value, req: Request) -> Result<Respons
         };
         match found.await {
             Ok((c, pods, q)) => {
-                if let Err(e) = super::live::follow(c, pods, q, socket).await {
+                if let Err(e) = super::live::follow(&hub, &sock, c, pods, q, socket).await {
                     tracing::debug!(error = %format!("{e:#}"), "a log stream ended");
                 }
             }
             Err((_, e)) => {
                 let (mut tx, _) = socket.split();
-                let _ = tx.send(ws::text(json!({"type": "error", "message": e}).to_string())).await;
+                let _ = tx.send(ws::text(crate::wire::ui::CdLogDown::Error { pod: String::new(), message: e }.text())).await;
                 let _ = tx.close(None).await;
             }
         }
@@ -136,7 +153,7 @@ pub async fn route(hub: &Arc<Hub>, rest: &[&str], q: &HashMap<String, String>, r
     let method = req.method().clone();
     if let (&Method::GET, ["apps", p, n, "resources", key, "logs", "ws"]) = (&method, rest) {
         let input = res_input(p, n, key, q, &["container", "pod", "tail_lines", "since_seconds"])?;
-        return follow_logs(cd, input, req);
+        return follow_logs(Arc::clone(hub), cd, input, req);
     }
     let body: Incoming = req.into_body();
     let cx = Cx { hub: hub.clone(), cd, actor: "admin".into() };
@@ -145,7 +162,7 @@ pub async fn route(hub: &Arc<Hub>, rest: &[&str], q: &HashMap<String, String>, r
         (&Method::GET, ["ops"]) => {
             let list: Vec<Value> = ops::ops()
                 .iter()
-                .map(|o| json!({"name": o.name, "summary": o.summary, "read_only": o.read_only, "destructive": o.destructive, "input": (o.input)()}))
+                .map(|o| json!({"name": o.name, "summary": o.summary, "read_only": o.read_only, "destructive": o.destructive, "input": o.input.schema()}))
                 .collect();
             return Ok(srv::json(StatusCode::OK, &json!({"ops": list})));
         }
@@ -191,6 +208,8 @@ pub async fn route(hub: &Arc<Hub>, rest: &[&str], q: &HashMap<String, String>, r
         }
         (&Method::GET, ["apps", p, n, "rollback-targets"]) => ("cd.apps.rollback_targets".into(), app(p, n)),
         (&Method::POST, ["apps", p, n, "follow"]) => ("cd.apps.follow".into(), app(p, n)),
+        (&Method::GET, ["apps", p, n, "auto-sync"]) => ("cd.apps.auto_sync".into(), app(p, n)),
+        (&Method::PUT, ["apps", p, n, "auto-sync"]) => ("cd.apps.set_auto_sync".into(), with(json_body(body).await?, "app", json!(format!("{p}/{n}")))),
         (&Method::GET, ["apps", p, n, "auto-rollback"]) => ("cd.apps.auto_rollback".into(), app(p, n)),
         (&Method::PUT, ["apps", p, n, "auto-rollback"]) => ("cd.apps.set_auto_rollback".into(), with(json_body(body).await?, "app", json!(format!("{p}/{n}")))),
         (&Method::GET, ["repos", "auto-rollback"]) => ("cd.repos.auto_rollback".into(), json!({})),

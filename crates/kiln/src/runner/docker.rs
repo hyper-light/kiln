@@ -149,6 +149,13 @@ pub async fn as_runner(cli: &Cli, image: &str) -> Option<String> {
     host_user().filter(|(uid, _)| *uid != 1001).map(|(uid, gid)| format!("{uid}:{gid}"))
 }
 
+/// What profilers run with, as file capabilities a container's bounding set must hold for their
+/// binaries to start at all (capabilities(7), "capability-dumb binaries"), and a hosted runner's
+/// root has: CodSpeed's memtrack (eBPF) asks these five (W13-R04, corpus pass 1025c). Not the
+/// rest of a root's: SYS_MODULE, SYS_TIME, SYS_BOOT and the like would reach the host's kernel
+/// and clock from a leg's container.
+pub const PROFILER_CAPS: &[&str] = &["SYS_ADMIN", "BPF", "PERFMON", "DAC_READ_SEARCH", "SYS_RESOURCE"];
+
 /// A container to start, its keys evaluated.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct Spec {
@@ -167,6 +174,9 @@ pub struct Spec {
     /// No seccomp filter, as on a hosted runner's machine: for a `docker` executor's container
     /// given the host's Docker, which can start any container it likes anyway.
     pub seccomp_unconfined: bool,
+    /// Capabilities beyond Docker's defaults (each a `--cap-add`): for a `docker` executor's
+    /// container given the host's Docker, [`PROFILER_CAPS`].
+    pub cap_add: Vec<String>,
     /// For a `docker` executor's container: the host user (uid, gid) its steps run as, through
     /// the image's `runner` user.
     pub user: Option<(u32, u32)>,
@@ -1169,6 +1179,9 @@ impl Containers {
                 if spec.seccomp_unconfined {
                     args.extend([s("--security-opt"), s("seccomp=unconfined")]);
                 }
+                for c in &spec.cap_add {
+                    args.extend([s("--cap-add"), c.clone()]);
+                }
                 if let Some(bytes) = spec.workspace_size {
                     args.extend([s("--mount"), format!("type=tmpfs,destination={workdir},tmpfs-size={bytes},tmpfs-mode=1777")]);
                 }
@@ -1536,6 +1549,65 @@ mod tests {
             n.into_iter().collect::<anyhow::Result<Vec<String>>>()
         })?;
         assert_eq!(cpus, ["1", "1"], "the job container's, then its service's");
+        Ok(())
+    }
+
+    /// W13-R04: a container given [`PROFILER_CAPS`] holds them in its bounding set, as a hosted
+    /// runner's root does, so a profiler's binary with them as file capabilities starts; one
+    /// without keeps Docker's defaults.
+    #[test]
+    fn w13_r04_a_socket_legs_container_holds_a_profilers_capabilities() -> anyhow::Result<()> {
+        let Some(bin) = find() else { return Ok(()) };
+        // Their bit numbers (linux/capability.h): SYS_ADMIN 21, BPF 39, PERFMON 38,
+        // DAC_READ_SEARCH 2, SYS_RESOURCE 24.
+        let bits: u64 = (1u64 << 21) | (1u64 << 39) | (1u64 << 38) | (1u64 << 2) | (1u64 << 24);
+        let mut held = Vec::new();
+        for caps in [PROFILER_CAPS.iter().map(|c| (*c).to_owned()).collect::<Vec<_>>(), Vec::new()] {
+            let tmp = tempfile::tempdir()?;
+            let leg = format!("test-caps-{}-{}", std::process::id(), caps.len());
+            let cli = Cli::new(&bin, tmp.path().join("config")).owned_by(tmp.path());
+            let job = Spec { image: "alpine:latest".into(), cap_add: caps, ..Spec::default() };
+            let bnd = crate::rt::block_on(async move {
+                let c = Containers::start(cli.clone(), &leg, PathMap::new(Vec::new()), "/", Some(job), Vec::new(), None, &|_| {}).await?;
+                let id = c.job.as_ref().map(|j| j.id.clone()).unwrap_or_default();
+                let status = cli.run(&[s("exec"), id, s("cat"), s("/proc/self/status")], &BTreeMap::new(), CALL).await;
+                c.stop().await;
+                status
+            })?;
+            let mask = bnd.lines().find_map(|l| l.strip_prefix("CapBnd:")).and_then(|h| u64::from_str_radix(h.trim(), 16).ok()).unwrap_or(0);
+            held.push((mask & bits) == bits);
+        }
+        assert_eq!(held, [true, false], "with PROFILER_CAPS the five are in the bounding set; without, not");
+        Ok(())
+    }
+
+    /// W13-R04, as the kernel holds it (capabilities(7)): a binary given the five as file
+    /// capabilities starts in a container holding [`PROFILER_CAPS`], and fails with "Operation
+    /// not permitted" in one with Docker's defaults. In kiln's runner image, which has `setcap`
+    /// (Alpine has none), when this machine has it built.
+    #[test]
+    fn w13_r04_a_profilers_binary_starts_with_the_capabilities() -> anyhow::Result<()> {
+        let Some(bin) = find() else { return Ok(()) };
+        let listed = std::process::Command::new(&bin).args(["images", "--format", "{{.Repository}}:{{.Tag}}", "kiln/runner-ubuntu-24.04"]).output()?;
+        let Some(image) = String::from_utf8_lossy(&listed.stdout).lines().find(|l| !l.ends_with(":<none>")).map(str::to_owned) else { return Ok(()) };
+        let tmp = tempfile::tempdir()?;
+        let cli = Cli::new(&bin, tmp.path().join("config")).owned_by(tmp.path());
+        let script = "cp /bin/true /tmp/t && setcap cap_dac_read_search,cap_sys_admin,cap_perfmon,cap_bpf,cap_sys_resource+ep /tmp/t && /tmp/t";
+        let started = crate::rt::block_on(async move {
+            let mut out = Vec::new();
+            for caps in [PROFILER_CAPS, &[]] {
+                let mut args = vec![s("run"), s("--rm"), s("--user"), s("0"), s("--entrypoint"), s("sh")];
+                args.extend(cli.owner_args());
+                for c in caps {
+                    args.extend([s("--cap-add"), (*c).to_owned()]);
+                }
+                args.extend([image.clone(), s("-c"), s(script)]);
+                out.push(cli.run(&args, &BTreeMap::new(), CALL).await.map_or_else(|e| format!("{e:#}"), |_| "started".to_owned()));
+            }
+            Ok::<_, anyhow::Error>(out)
+        })?;
+        assert_eq!(started.first().map(String::as_str), Some("started"), "with the five it starts: {started:?}");
+        assert!(started.get(1).is_some_and(|e| e.contains("Operation not permitted")), "with Docker's defaults it can't: {started:?}");
         Ok(())
     }
 

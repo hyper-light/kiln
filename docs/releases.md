@@ -85,10 +85,35 @@ replaced while it runs. The new build comes up beside it, and takes over only on
 3. Once it's ready, the runner hands it every agent session and terminal over a local socket.
    Their processes keep running: pipes and PTYs are passed across, not reopened. A reply that was
    streaming goes on, and background commands never stop. Whatever reaches the old runner
-   meanwhile (a message for an agent, keystrokes, a new session) goes on to the new build.
+   meanwhile (a message for an agent, keystrokes, a new session) goes on to the new build. The
+   server's word on a hand-over (hand a session to the newest process, or let go of one) doesn't:
+   it names the process it's for, its machine, instance and epoch, signed by the server
+   (docs/ci.md W27-R08), and any other process refuses it, and kiln records that. The old runner
+   keeps such a word and refuses one about a session it handed to the new build, and the new build
+   refuses one passed on to it. Once kiln certifies the new build for a session, it sends that
+   session's words to the new build. The old runner's conversation stores go first: let go of,
+   moved into the new build's folder and gone on with there under the same ids, so nothing is sent
+   to the server again (docs/conversations.md, "A runner's upgrade"). A new build from before takes
+   none, and opens its own; one that can't open them sets them aside, kept whole, and opens its
+   own: the stores never hold an upgrade back.
 4. The supervisor promotes the new build, and the server sends it new work from then on. The old
    runner finishes the jobs it's running (jobs aren't moved yet), then exits. The supervisor keeps
    the new build, and starts it again after a restart or reboot.
+
+Each agent session handed over running is signed for (docs/ci.md W27-R08): the runner upgraded
+signs its hand-on at the session's epoch, and the new build, once it's promoted, asks for the
+session's identity at the next epoch with its receipt, then goes on at that epoch. The session's
+copy on the server goes on where it was, nothing sent again. Before the new build is promoted, a
+rollback leaves the session with the runner it came from. A session started again from its record
+goes over as before.
+
+The machine's runner role goes over signed too (the Transfers plan's step 8): after its sessions,
+the runner upgraded hands it on, signed as its runner process, to a new build that says it takes it
+so, and the new build signs its receipt as its own runner process once that identity is
+certified; both go to the server. The upgrade's job, which is the replant's record of that machine
+(`GET /api/updates/jobs/<id>`), lists each transfer: the runner role, from the process replaced
+to its new build, and each agent session it held as the upgrade began (`transfers`), and anything
+that moved without one (`moved_without_a_transfer`).
 
 If the new build doesn't come up, the runner goes on with everything, as it was, and the machine
 never goes offline. That covers a build that can't connect, crashes, or can't take over in time.
@@ -172,6 +197,9 @@ runner's credentials would change under it):
 - **It works for another server:** joining stops it first, once asked (or with `--yes`). Its agents
   stay with that server.
 - **The server can't be asked:** nothing is joined. Try again once it answers.
+- **It is the server's own machine, and the server runs its local agent:** that agent is the
+  machine's runner, so joining under its name is refused (409) rather than enrolled as `<name>-2`.
+  Turn the server's off (`[local_agent] enabled = false`) to run a separate runner there.
 
 `kiln install` of a server, where none was, on a machine whose runner is running isn't installed
 either: the server's local agent would be a second runner beside it, under the machine's name. It

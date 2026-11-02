@@ -16,26 +16,35 @@ jobs:
     name: rust lint + test
     runs-on: [k8s]
     toolchain: rust
+    # Debian 13's: kiln's conflict replays pass --merge-base to git merge-tree, which git gained in
+    # 2.40, and the preset's rust:1-bookworm carries git 2.39.5 (w26_ac04 and w26_r14 failed on it,
+    # run #1661); trixie's is 2.47.
+    image: docker.io/library/rust:1-trixie
     # Compiling kiln's own crate takes 7 GiB and more, and `cargo test` compiles it twice at once
     # (the library, and the library as its tests): 8Gi ran out, rustc killed. Cargo runs a rustc
     # per CPU the machine has, not per CPU asked for, unless told; line tables are the debug info
     # a test's backtrace needs, at far less memory. Its CPUs are what it asks for to be placed, not
     # a cap (the pod has no CPU limit): the jobs namespace's quota (18 CPUs, 36Gi, every
     # repository's jobs together) refuses a pod that asks more than is left, and it waits until
-    # others' jobs end; it uses whatever's free once it runs.
-    resources: { cpu: "2", memory: 16Gi }
+    # others' jobs end; it uses whatever's free once it runs. Built from scratch as here, every
+    # library's tests at -j 4 peaked at 16.7 GiB of anonymous memory (2026-11-01): 16Gi had rustc
+    # killed on every main commit from run #1522 on. Only production's 48 GiB node has room for
+    # 24Gi, once each node's kubelet reserves what its container lacks (deploy/cluster/size-nodes.sh).
+    resources: { cpu: "2", memory: 24Gi }
     env:
       CARGO_BUILD_JOBS: "4"
       RUST_TEST_THREADS: "4"
       CARGO_PROFILE_DEV_DEBUG: line-tables-only
-    timeout-minutes: 45
+    # Clippy and the libraries' tests take about 8 minutes; every test binary took longer than the
+    # 37 minutes left of 45 (run #1661, cancelled in observe_replay with 84 binaries done).
+    timeout-minutes: 90
     steps:
       - name: toolchain
         run: rustup component add clippy && cargo --version
       - name: clippy (no-panic lint wall)
         run: cargo clippy --locked --all-targets -- -D warnings
       # Built apart, the libraries as their tests first, then the rest: kiln's crate compiled twice
-      # at once (the library, and the library as its tests) still ran out of 16Gi now and then.
+      # at once (the library, and the library as its tests) ran out of 16Gi now and then.
       - name: build the libraries' tests
         run: cargo test --locked --lib --no-run
       # Every test binary, whatever fails before it: each failing test shows in one run.
@@ -54,8 +63,10 @@ jobs:
       # (W28-R72). The PATH line is for a Mac's launchd service, whose PATH has no tools in it.
       - name: ui
         run: export PATH="$HOME/.cargo/bin:/opt/homebrew/bin:/usr/local/bin:$PATH" && npm ci --prefix ui --no-audit --no-fund && KILN_UI_SERVER=off npm run --prefix ui build
-      # Against the wire types made from Rust (ui/src/api/wire, held to the Rust by `wire::ts`).
-      - run: npm ci --prefix ui --no-audit --no-fund && npm run --prefix ui typecheck && npm run --prefix ui lint && npm --prefix ui test
+      # Against the wire types made from Rust (ui/src/api/wire, held to the Rust by `wire::ts`). The
+      # tests one file at a time (`test:ci`): each syntax samples' file compiles its grammars'
+      # WebAssembly, up to 3.3 GiB, and side by side they outgrew this job's 4 GiB (2026-11-02).
+      - run: npm ci --prefix ui --no-audit --no-fund && npm run --prefix ui typecheck && npm run --prefix ui lint && npm run --prefix ui test:ci
 
   ui-checks:
     name: ui checks (Chromium and WebKit, desktop and phone)

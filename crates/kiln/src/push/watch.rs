@@ -38,6 +38,10 @@ pub fn stand_of(i: &Info) -> Stand {
     if !i.approvals.is_empty() || i.status == Status::Waiting {
         return Stand::Needs;
     }
+    // Its process ended while nobody ended it: kiln starts it again by itself.
+    if i.status == Status::Exited && i.exit.as_ref().is_some_and(|e| e.again_at.is_some()) {
+        return Stand::Working;
+    }
     if i.status == Status::Exited && i.exit.as_ref().is_some_and(|e| e.error.is_some()) {
         return Stand::Stopped;
     }
@@ -416,7 +420,7 @@ mod tests {
     }
 
     fn ask(id: &str, at: i64, tool: ToolKind, title: &str) -> ApprovalBrief {
-        ApprovalBrief { id: id.into(), tool, tool_name: if tool == ToolKind::Shell { "Bash".into() } else { String::new() }, title: title.into(), at }
+        ApprovalBrief { id: id.into(), tool, tool_name: if tool == ToolKind::Shell { "Bash".into() } else { String::new() }, title: title.into(), at, agent: None }
     }
 
     fn ended(at: i64, how: &str) -> Option<TurnEnd> {

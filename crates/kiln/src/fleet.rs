@@ -935,19 +935,17 @@ pub async fn source(hub: &Hub, job: &str) -> anyhow::Result<async_channel::Recei
 
 /// The machine of build job `job` built a binary with this SHA-256; `bytes` is the binary when
 /// it is kept for its platform.
-pub async fn on_built(hub: &Arc<Hub>, job: &str, sha256: &str, bytes: Option<Vec<u8>>) -> anyhow::Result<()> {
-    use sha2::Digest as _;
+pub async fn on_built(hub: &Arc<Hub>, job: &str, sha256: &str, arrived: Option<crate::updates::Arrived>) -> anyhow::Result<()> {
     let b = hub.updates.fleet.building.lock().get(job).cloned().ok_or_else(|| anyhow::anyhow!("no such build"))?;
     anyhow::ensure!(sha256.len() == 64 && sha256.bytes().all(|c| c.is_ascii_hexdigit()), "not a SHA-256: {sha256}");
     let sha256 = sha256.to_ascii_lowercase();
     let build = crate::updates::build_id(&sha256);
     remember(hub, &build, &b.target, &b.commit);
     hub.updates.set_to_build(hub, job, &build);
-    let Some(bytes) = bytes.filter(|v| !v.is_empty()) else { return Ok(()) };
+    let Some(arrived) = arrived.filter(|a| a.size > 0) else { return Ok(()) };
     anyhow::ensure!(b.keep, "a build of {} isn't kept here", b.target);
-    let got = hex::encode(sha2::Sha256::digest(&bytes));
-    anyhow::ensure!(got == sha256, "the binary's SHA-256 is {got}, not {sha256}");
-    let kept = crate::updates::keep_built(hub, &b.target, bytes, &b.machine, &b.commit).await?;
+    anyhow::ensure!(arrived.sha256 == sha256, "the binary's SHA-256 is {}, not {sha256}", arrived.sha256);
+    let kept = crate::updates::keep_built(hub, &b.target, &arrived, &b.machine, &b.commit).await?;
     hub.store.audit("kiln".into(), "upgrade.binary".into(), format!("built by {} ({}): {} for {}", b.machine, short(&b.commit), kept.build, b.target)).await;
     hub.emit(&crate::wire::events::ServerEvent::Updates);
     hub.updates.fleet.wake();
@@ -1580,7 +1578,9 @@ mod tests {
         if let Some(head) = bytes.get_mut(..4) {
             head.copy_from_slice(&[0xcf, 0xfa, 0xed, 0xfe]);
         }
-        crate::updates::keep_built(hub, "aarch64-apple-darwin", bytes, "macbook", NEWEST).await
+        let mut arriving = crate::updates::Arriving::new(&crate::updates::arriving_dir(hub))?;
+        arriving.write(&bytes)?;
+        crate::updates::keep_built(hub, "aarch64-apple-darwin", &arriving.done()?, "macbook", NEWEST).await
     }
 
     async fn ended(hub: &Arc<Hub>, id: &str) -> anyhow::Result<Job> {

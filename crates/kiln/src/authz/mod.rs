@@ -36,6 +36,8 @@ pub const CAPABILITIES: &[&str] = &[
     "runs.trigger",
     "runs.cancel",
     "runs.rerun",
+    // Pause and Resume a run's jobs (docs/ci.md W26-R22).
+    "runs.pause",
     "runs.debug",
     "runs.approve",
     "logs.read",
@@ -89,7 +91,7 @@ pub const SIGNED_IN: &str = "signed-in";
 /// variables; `admin` and `owner` have every capability.
 pub fn role(name: &str) -> Option<Vec<&'static str>> {
     const VIEWER: &[&str] = &["runs.read", "logs.read", "artifacts.read", "runners.read", "diffs.read", "observe.read"];
-    const DEVELOPER: &[&str] = &["runs.trigger", "runs.rerun", "runs.cancel", "artifacts.write", "caches.write", "workflows.edit", "diffs.submit", "diffs.review", "agents.run", "secrets.use", "observe.write"];
+    const DEVELOPER: &[&str] = &["runs.trigger", "runs.rerun", "runs.cancel", "runs.pause", "artifacts.write", "caches.write", "workflows.edit", "diffs.submit", "diffs.review", "agents.run", "secrets.use", "observe.write"];
     const MAINTAINER: &[&str] = &[
         "runs.debug",
         "runs.approve",
@@ -342,6 +344,10 @@ pub static ROUTES: &[Rule] = &[
     r("GET", "/api/me/passkeys", SIGNED_IN, At::Server),
     r("POST", "/api/me/passkeys", SIGNED_IN, At::Server),
     r("POST", "/api/me/identity", SIGNED_IN, At::Server),
+    // W27-R03: the SSH keys one signs commits with.
+    r("GET", "/api/me/ssh-signers", SIGNED_IN, At::Server),
+    r("POST", "/api/me/ssh-signers", SIGNED_IN, At::Server),
+    r("DELETE", "/api/me/ssh-signers", SIGNED_IN, At::Server),
     r("POST", "/api/me/passkeys/options", SIGNED_IN, At::Server),
     r("DELETE", "/api/me/passkeys/*", SIGNED_IN, At::Server),
     r("GET", "/api/me/password", SIGNED_IN, At::Server),
@@ -375,12 +381,18 @@ pub static ROUTES: &[Rule] = &[
     r("POST", "/api/diffs/*/abandon", "diffs.submit", At::Diff(2)),
     r("POST", "/api/diffs/*/reclaim", "diffs.submit", At::Diff(2)),
     r("POST", "/api/diffs/*/commandeer", "diffs.submit", At::Diff(2)),
+    // A change given and taken, a review request passed on and taken, signed (W27-R08).
+    r("POST", "/api/diffs/*/give", "diffs.submit", At::Diff(2)),
+    r("POST", "/api/diffs/*/take", "diffs.submit", At::Diff(2)),
+    r("POST", "/api/diffs/*/reviewers/pass", "diffs.review", At::Diff(2)),
+    r("POST", "/api/diffs/*/reviewers/take", "diffs.review", At::Diff(2)),
     r("PATCH", "/api/diffs/*", "diffs.submit", At::Diff(2)),
     r("POST", "/api/diffs/*/labels", "diffs.review", At::Diff(2)),
     r("DELETE", "/api/diffs/*/labels/*", "diffs.review", At::Diff(2)),
     r("GET", "/api/stacks/*", "diffs.read", At::Stack(2)),
     r("POST", "/api/diffs/*/comments", "diffs.review", At::Diff(2)),
     r("POST", "/api/diffs/*/review", "diffs.review", At::Diff(2)),
+    r("POST", "/api/diffs/*/statement", "diffs.review", At::Diff(2)),
     r("POST", "/api/diffs/*/viewed", "diffs.read", At::Diff(2)),
     r("POST", "/api/diffs/*/land", "diffs.land", At::Diff(2)),
     // Conflicts resolved where they fall, then committed as a revision (W26-R12): code, as Apply is.
@@ -388,6 +400,7 @@ pub static ROUTES: &[Rule] = &[
     r("POST", "/api/diffs/*/conflicts/*/resolution", "diffs.submit", At::Diff(2)),
     r("DELETE", "/api/diffs/*/conflicts/*/resolution", "diffs.submit", At::Diff(2)),
     r("PATCH", "/api/comments/*", "diffs.review", At::Comment(2)),
+    r("POST", "/api/comments/*/statement", "diffs.review", At::Comment(2)),
     r("DELETE", "/api/comments/*", "diffs.review", At::Comment(2)),
     r("POST", "/api/comments/*/apply", "diffs.submit", At::Comment(2)),
     r("POST", "/api/repos/*/submit", "diffs.submit", At::Repo(2)),
@@ -395,7 +408,14 @@ pub static ROUTES: &[Rule] = &[
     // The caller's own notifications, marked read (W19-R06).
     r("POST", "/api/review/inbox/read", "diffs.read", At::Anywhere),
     r("GET", "/api/repos/*/queue", "diffs.read", At::Repo(2)),
+    r("GET", "/api/repos/*/lands/*", "diffs.read", At::Repo(2)),
+    // A host's changes into its host's own queue (docs/ci.md W28-R109): landing them.
+    r("POST", "/api/repos/*/queue", "diffs.land", At::Repo(2)),
     r("DELETE", "/api/queue/*", "queue.manage", At::Entry(2)),
+    // Review holds, lets go of or withdraws a land queue entry (docs/ci.md W28-R104).
+    r("POST", "/api/queue/*/hold", "diffs.review", At::Entry(2)),
+    r("POST", "/api/queue/*/release", "diffs.review", At::Entry(2)),
+    r("POST", "/api/queue/*/withdraw", "diffs.review", At::Entry(2)),
     // Change requests (W14-R04), as diffs.
     r("GET", "/api/repos/*/change-requests", "diffs.read", At::Repo(2)),
     r("POST", "/api/repos/*/change-requests", "diffs.submit", At::Repo(2)),
@@ -419,12 +439,15 @@ pub static ROUTES: &[Rule] = &[
     r("GET", "/api/experiments", "runs.read", At::Anywhere),
     r("GET", "/api/experiments/*", "runs.read", At::Anywhere),
     r("POST", "/api/experiments", "experiments.run", At::Anywhere),
+    r("POST", "/api/experiments/suggest", "experiments.run", At::Anywhere),
     r("POST", "/api/experiments/*/*", "experiments.run", At::Anywhere),
     // Lists narrowed row by row to the repositories the caller may read (W10).
     r("GET", "/api/runs", "runs.read", At::Anywhere),
     r("GET", "/api/runs/*", "runs.read", At::Run(2)),
     r("POST", "/api/runs/*/cancel", "runs.cancel", At::Run(2)),
     r("POST", "/api/runs/*/retry", "runs.rerun", At::Run(2)),
+    r("POST", "/api/runs/*/pause", "runs.pause", At::Run(2)),
+    r("POST", "/api/runs/*/resume", "runs.pause", At::Run(2)),
     r("GET", "/api/jobs/*", "runs.read", At::Job(2)),
     r("GET", "/api/jobs/*/tools", "runs.read", At::Job(2)),
     // The agent it starts is the asker's (`agents.start`), so at most their permissions.
@@ -583,6 +606,11 @@ pub static ROUTES: &[Rule] = &[
     r("GET", "/api/ship/**", "runs.read", At::Anywhere),
     // A row's Hand off: the handler checks `runs.rerun` on the repository its body names (W26-R18).
     r("POST", "/api/ship/hand-off", "runs.rerun", At::Anywhere),
+    // Each verb's own right on the repository is asked inside (`ship::jobs`): retry, cancel, pause.
+    r("POST", "/api/ship/jobs", "runs.read", At::Anywhere),
+    // Each verb is its CD operation, asked inside as `/api/cd`'s route asks it (`ship::deploys::act`):
+    // `environments.deploy` on the whole server (W26-R24).
+    r("POST", "/api/ship/deploys", "runs.read", At::Anywhere),
     // Releases are a deployer's in their environment, or an owner team's where it lets owners.
     r("POST", "/api/deploy/releases", "environments.deploy", At::Deploy),
     r("POST", "/api/deploy/fleets", "environments.deploy", At::Anywhere),
@@ -626,6 +654,22 @@ pub static ROUTES: &[Rule] = &[
     r("GET", "/api/identities/revocations", "runners.read", At::Server),
     r("GET", "/api/identities", "runners.read", At::Server),
     r("POST", "/api/identities/revoke", "settings.manage", At::Server),
+    // Custody of what changes hands (W27-R08): a signed record taken from anyone signed in (its
+    // signature says who it's from); chains, breaks and refusals read by those who read the audit.
+    r("GET", "/api/trail/checkpoints", "audit.read", At::Server),
+    r("GET", "/api/trail/log/**", "audit.read", At::Server),
+    r("GET", "/api/trail/anchors", "audit.read", At::Server),
+    r("POST", "/api/trail/checkpoints", "settings.manage", At::Server),
+    r("GET", "/api/trail", "audit.read", At::Server),
+    // kiln verify (W27-R10): a chain walked back over the trail, read as the audit is.
+    r("GET", "/api/verify", "audit.read", At::Server),
+    r("GET", "/api/verify/export", "audit.read", At::Server),
+    r("POST", "/api/verify/vsa", "audit.read", At::Server),
+    r("POST", "/api/custody", SIGNED_IN, At::Server),
+    r("GET", "/api/custody/breaks", "audit.read", At::Server),
+    r("GET", "/api/custody", "audit.read", At::Server),
+    r("GET", "/api/transfers/refused", "audit.read", At::Server),
+    r("GET", "/api/transfers/unsigned", "audit.read", At::Server),
     r("GET", "/api/machines/*/dirs", "runners.terminal", At::Runner(2)),
     any("/api/terminal/**", "runners.terminal", At::Server),
     r("GET", "/api/updates", "runners.read", At::Server),
@@ -724,7 +768,7 @@ pub fn openapi(version: &str, ops: &[crate::ops::Info]) -> serde_json::Value {
                 "summary": o.summary,
                 "x-kiln-read-only": o.read_only,
                 "x-kiln-destructive": o.destructive,
-                "requestBody": { "required": false, "content": { "application/json": { "schema": (o.input)() } } },
+                "requestBody": { "required": false, "content": { "application/json": { "schema": o.input.schema() } } },
                 "security": [{ "bearer": [] }, { "session": [] }],
                 "responses": { "200": { "description": "its answer" }, "400": { "description": "the input isn't right" }, "403": { "description": "its route's capability is missing in that scope" }, "404": { "description": "no such operation, or what it names" } },
             } }),

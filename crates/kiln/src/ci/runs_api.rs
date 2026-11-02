@@ -101,7 +101,7 @@ async fn legs(store: &crate::store::Store, run: &str, attempt: Option<i64>) -> R
             let mut st = c.prepare(
                 "SELECT id, key, display, job_id, matrix, status, conclusion, agent, executor, attempt, wait_reason, queued_at, started_at, finished_at, error, needs, exit_code, reused_from,
                         CASE WHEN kept_until > strftime('%s', 'now') THEN kept_until END, waits,
-                        (SELECT s.run_id FROM jobs s WHERE s.id = jobs.reused_from), (SELECT r.number FROM jobs s JOIN runs r ON r.id = s.run_id WHERE s.id = jobs.reused_from), reused_class
+                        (SELECT s.run_id FROM jobs s WHERE s.id = jobs.reused_from), (SELECT r.number FROM jobs s JOIN runs r ON r.id = s.run_id WHERE s.id = jobs.reused_from), reused_class, paused_at
                  FROM jobs WHERE run_id = ?1 AND job_id IS NOT NULL AND run_attempt = COALESCE(?2, (SELECT attempt FROM runs WHERE id = ?1)) ORDER BY rowid",
             )?;
             let rows = st.query_map(params![run, attempt], |r| {
@@ -124,6 +124,10 @@ async fn legs(store: &crate::store::Store, run: &str, attempt: Option<i64>) -> R
                 // What it did, as W24-R28 reports it: a reused leg says whose result, from where.
                 if let (Some(work), Some(o)) = (work, leg.as_object_mut()) {
                     o.insert("work".into(), work);
+                }
+                // Paused since then (W26-R22): waiting, it's placed nowhere; running, it's frozen.
+                if let (Some(at), Some(o)) = (r.get::<_, Option<i64>>(23)?, leg.as_object_mut()) {
+                    o.insert("paused_at".into(), at.into());
                 }
                 Ok(leg)
             })?;

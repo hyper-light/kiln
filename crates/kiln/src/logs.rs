@@ -2,11 +2,14 @@
 //! broadcast channel per live job so any number of UI viewers can tail without touching disk.
 //! A per-job byte cap protects the disk from runaway output. Beside each step's log, `<step>.times`
 //! notes when each piece of it arrived (its byte offset and unix ms, a line each), for the times
-//! Ship's Output puts beside its lines (plan 01a1856fe81375b1bd1d1d86f270a45b, step 9).
+//! Ship's Output puts beside its lines (plan 01a1856fe81375b1bd1d1d86f270a45b, step 9). And
+//! `<step>.digests` keeps each chunk the leg sent by its length and digest, with where it's kept
+//! (or `-` past the cap), a retry's mark between attempts, so what kiln keeps is checked against
+//! the chain the leg signed, a capped log included (docs/ci.md W27-R05, [`kiln_ci::logs`]).
 
 use std::collections::HashMap;
 use std::io::Write as _;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use bytes::Bytes;
@@ -26,6 +29,8 @@ struct Live {
     files: HashMap<u32, std::fs::File>,
     /// Each step's `<step>.times`, open while it's written.
     times: HashMap<u32, std::fs::File>,
+    /// Each step's `<step>.digests`, open while it's written.
+    digests: HashMap<u32, std::fs::File>,
     bytes: u64,
     truncated: bool,
 }
@@ -60,6 +65,10 @@ impl Logs {
         self.job_dir(job).join(format!("{idx}.times"))
     }
 
+    fn digests_path(&self, job: &str, idx: u32) -> PathBuf {
+        self.job_dir(job).join(format!("{idx}.digests"))
+    }
+
     fn with_live<R>(&self, job: &str, f: impl FnOnce(&mut Live) -> R) -> R {
         let mut g = self.live.lock();
         let live = g.entry(job.to_owned()).or_insert_with(|| {
@@ -68,7 +77,7 @@ impl Logs {
             tx.set_overflow(true);
             tx.set_await_active(false);
             let idle = rx.deactivate();
-            Live { tx, _idle: idle, files: HashMap::new(), times: HashMap::new(), bytes: 0, truncated: false }
+            Live { tx, _idle: idle, files: HashMap::new(), times: HashMap::new(), digests: HashMap::new(), bytes: 0, truncated: false }
         });
         f(live)
     }
@@ -76,13 +85,32 @@ impl Logs {
     /// Append output for a step. Never fails the caller: disk errors are logged and the data still
     /// reaches live viewers.
     pub fn append(&self, job: &str, idx: u32, data: &[u8]) {
+        self.put(job, idx, data, true);
+    }
+
+    /// Output kiln copies into a step's log from elsewhere (a reused step's, from its source leg,
+    /// W24-R07): kept and shown as [`Logs::append`] keeps it, and noted as no chunk of the leg's,
+    /// which it wasn't taken from, so the leg's log checks against what the leg itself sent
+    /// (docs/ci.md W27-R05).
+    pub fn append_copy(&self, job: &str, idx: u32, data: &[u8]) {
+        self.put(job, idx, data, false);
+    }
+
+    /// `data` appended to step `idx`'s log, and noted as a chunk its leg sent when it's `taken`.
+    fn put(&self, job: &str, idx: u32, data: &[u8], taken: bool) {
         crate::metrics::global().log_bytes.add(data.len() as u64);
         let path = self.step_path(job, idx);
         let times_path = self.times_path(job, idx);
+        let digests_path = self.digests_path(job, idx);
         let max = self.max_bytes;
         let notice: &[u8] = b"\r\n\x1b[33m[kiln] log size limit reached; further output discarded\x1b[0m\r\n";
+        // The chunk as the leg sent it, kept by its digest whether its bytes are or not.
+        let (len, digest) = (data.len() as u64, kiln_ci::logs::digest(data));
         self.with_live(job, |live| {
             if live.truncated {
+                if taken {
+                    note_piece(live, idx, &digests_path, &kiln_ci::logs::Piece { at: None, len, digest });
+                }
                 return;
             }
             let (chunk, truncate_now) = if live.bytes + data.len() as u64 > max {
@@ -123,6 +151,11 @@ impl Logs {
                 },
                 None => false,
             };
+            // The leg's chunk: where it's kept, or that it isn't (the cap's notice took its place).
+            let kept = at.filter(|_| wrote && !truncate_now);
+            if taken {
+                note_piece(live, idx, &digests_path, &kiln_ci::logs::Piece { at: kept, len, digest });
+            }
             // A piece that holds no bytes holds no line: nothing to note.
             if let (true, Some(at), false) = (wrote, at, chunk.is_empty()) {
                 let times = match live.times.entry(idx) {
@@ -150,6 +183,7 @@ impl Logs {
             if status != "running" {
                 live.files.remove(&idx);
                 live.times.remove(&idx);
+                live.digests.remove(&idx);
             }
             let _ = live.tx.try_broadcast(LogEvent::Step { idx, status });
         });
@@ -184,6 +218,36 @@ impl Logs {
         crate::rt::blocking(move || std::fs::read_to_string(p).map(|s| times_of(&s)).unwrap_or_default()).await.unwrap_or_default()
     }
 
+    /// Each attempt's pieces of a step's log, oldest first, as `<step>.digests` keeps them: a log
+    /// written before kiln kept them has one attempt of none.
+    pub async fn pieces(&self, job: &str, idx: u32) -> Vec<Vec<kiln_ci::logs::Piece>> {
+        let p = self.digests_path(job, idx);
+        crate::rt::blocking(move || std::fs::read_to_string(p).map(|s| kiln_ci::logs::parse(&s)).unwrap_or_else(|_| kiln_ci::logs::parse("")))
+            .await
+            .unwrap_or_else(|_| kiln_ci::logs::parse(""))
+    }
+
+    /// The steps of `job` whose chunks kiln keeps by digest (a `<step>.digests` beside each log), in
+    /// order: each step its leg sent a log of since kiln kept digests.
+    pub async fn kept_steps(&self, job: &str) -> Vec<u32> {
+        let dir = self.job_dir(job);
+        crate::rt::blocking(move || {
+            let mut steps: Vec<u32> = std::fs::read_dir(&dir).into_iter().flatten().flatten().filter_map(|e| e.file_name().to_str()?.strip_suffix(".digests")?.parse().ok()).collect();
+            steps.sort_unstable();
+            steps
+        })
+        .await
+        .unwrap_or_default()
+    }
+
+    /// A step's log as kiln keeps it against `signed`, the chain its leg signed for its latest
+    /// attempt (docs/ci.md W27-R05).
+    pub async fn check(&self, job: &str, idx: u32, signed: &kiln_ci::logs::Chain) -> kiln_ci::logs::Verdict {
+        let log = self.read(job, idx).await;
+        let pieces = self.pieces(job, idx).await;
+        kiln_ci::logs::check(&log, pieces.last().map(Vec::as_slice).unwrap_or_default(), signed)
+    }
+
     /// The last `max` bytes of a step's log on disk (all of it when it's shorter).
     pub async fn tail(&self, job: &str, idx: u32, max: u64) -> Vec<u8> {
         let p = self.step_path(job, idx);
@@ -195,12 +259,20 @@ impl Logs {
     /// with no log yet gets none.
     pub async fn mark(&self, job: &str, idx: u32, line: &str) {
         let path = self.step_path(job, idx);
+        let digests = self.digests_path(job, idx);
         let text = format!("\r\n\x1b[33m[kiln] {line}\x1b[0m\r\n");
+        let boundary = kiln_ci::logs::boundary(line);
         let r = crate::rt::blocking(move || -> std::io::Result<()> {
             if std::fs::metadata(&path).map_or(0, |m| m.len()) == 0 {
                 return Ok(());
             }
-            std::fs::OpenOptions::new().append(true).open(&path)?.write_all(text.as_bytes())
+            std::fs::OpenOptions::new().append(true).open(&path)?.write_all(text.as_bytes())?;
+            // The next attempt's pieces start after it: each attempt is a leg of its own.
+            match std::fs::OpenOptions::new().append(true).open(&digests) {
+                Ok(mut f) => writeln!(f, "{boundary}"),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+                Err(e) => Err(e),
+            }
         })
         .await;
         if let Ok(Err(e)) | Err(e) = r.map_err(|e| std::io::Error::other(format!("{e:#}"))) {
@@ -229,6 +301,26 @@ impl Logs {
         if let Err(e) = r {
             tracing::warn!(error = %e, "log prune task failed");
         }
+    }
+}
+
+/// Notes the leg's chunk `p` in its step's `<step>.digests` (opened once, kept open while the step
+/// writes). Never fails the caller: a disk error is logged.
+fn note_piece(live: &mut Live, idx: u32, path: &Path, p: &kiln_ci::logs::Piece) {
+    let file = match live.digests.entry(idx) {
+        std::collections::hash_map::Entry::Occupied(o) => Some(o.into_mut()),
+        std::collections::hash_map::Entry::Vacant(v) => match path.parent().map_or(Ok(()), std::fs::create_dir_all).and_then(|()| std::fs::OpenOptions::new().create(true).append(true).open(path)) {
+            Ok(f) => Some(v.insert(f)),
+            Err(e) => {
+                tracing::warn!(error = %e, path = %path.display(), "cannot open log digests");
+                None
+            }
+        },
+    };
+    if let Some(f) = file
+        && let Err(e) = writeln!(f, "{}", kiln_ci::logs::line(p))
+    {
+        tracing::warn!(error = %e, "log digests write failed");
     }
 }
 
@@ -285,6 +377,78 @@ mod tests {
         assert_eq!(n, 4);
         Ok(())
     })
+    }
+
+    /// W27-R05: each chunk a leg sends is kept by its digest, past the log's cap too, so the log
+    /// kiln keeps checks against the leg's chain: capped, it verifies what it kept by its bytes and
+    /// the rest by digest; a byte changed on disk since is found; a retry in place starts another
+    /// attempt's pieces, checked against that attempt's chain.
+    #[test]
+    fn w27_r05_the_server_keeps_each_chunk_by_digest_past_its_cap() -> anyhow::Result<()> {
+        use kiln_ci::logs::{Chain, Verdict};
+        crate::rt::block_on(async move {
+            let dir = tempfile::tempdir()?;
+            let logs = Logs::new(dir.path().to_path_buf(), 24);
+            let sent: [&[u8]; 4] = [b"$ cargo test\n", b"ok 1\n", b"this crosses the cap\n", b"dropped\n"];
+            for c in sent {
+                logs.append("job1", 0, c);
+            }
+            logs.step("job1", 0, "success");
+            let signed = Chain::of(sent);
+            let [first, second, ..] = sent;
+            let kept = (first.len() + second.len()) as u64;
+            assert_eq!(logs.check("job1", 0, &signed).await, Verdict::Verified { kept, dropped: 2 });
+            assert_eq!(logs.pieces("job1", 0).await.first().map(Vec::len), Some(4));
+            // A chain of other chunks, or of more, isn't what kiln took.
+            assert_eq!(logs.check("job1", 0, &Chain::of([first, b"ok 2\n".as_slice()])).await, Verdict::Differs);
+            let mut more = signed;
+            more.push(b"never arrived\n");
+            assert_eq!(logs.check("job1", 0, &more).await, Verdict::Incomplete { have: 4, want: 5 });
+            // A byte changed on disk afterwards.
+            let path = dir.path().join("b1").join("job1").join("0.log");
+            let mut on_disk = std::fs::read(&path)?;
+            if let Some(b) = on_disk.get_mut(first.len() + 1) {
+                *b ^= 0x20;
+            }
+            std::fs::write(&path, &on_disk)?;
+            assert_eq!(logs.check("job1", 0, &signed).await, Verdict::Altered { piece: 1, at: first.len() as u64 });
+            // A retry in place: its pieces are the next attempt's, checked against its own chain.
+            let logs = Logs::new(dir.path().to_path_buf(), 1 << 20);
+            logs.append("job2", 0, b"attempt one\n");
+            logs.step("job2", 0, "failure");
+            logs.mark("job2", 0, "attempt 2").await;
+            logs.append("job2", 0, b"attempt two\n");
+            logs.finish("job2");
+            let attempts = logs.pieces("job2", 0).await;
+            assert_eq!(attempts.iter().map(Vec::len).collect::<Vec<_>>(), vec![1, 1]);
+            let second_attempt = Chain::of([b"attempt two\n".as_slice()]);
+            assert_eq!(logs.check("job2", 0, &second_attempt).await, Verdict::Verified { kept: 12, dropped: 0 });
+            assert_eq!(logs.check("job2", 0, &Chain::of([b"attempt one\n".as_slice()])).await, Verdict::Differs);
+            // A log from before kiln kept digests has no pieces: a signed chain finds none of it.
+            assert_eq!(logs.check("job3", 0, &signed).await, Verdict::Incomplete { have: 0, want: 4 });
+            Ok(())
+        })
+    }
+
+    /// W27-R05: what kiln copies into a step's log (a reused step's, from its source leg) is kept
+    /// and read as the rest is, and is no chunk of the leg's: the step's log checks against what the
+    /// leg itself sent, and the steps kept by digest are those the leg sent a log of.
+    #[test]
+    fn w27_r05_a_copy_kiln_makes_is_kept_and_no_chunk_of_the_legs() -> anyhow::Result<()> {
+        use kiln_ci::logs::{Chain, Verdict};
+        crate::rt::block_on(async move {
+            let dir = tempfile::tempdir()?;
+            let logs = Logs::new(dir.path().to_path_buf(), 1 << 20);
+            let note: &[u8] = b"memo: reused from run #1\n";
+            logs.append_copy("job1", 0, b"built 1 as 7f3a\n");
+            logs.append("job1", 0, note);
+            logs.append_copy("job1", 1, b"tested\n");
+            logs.finish("job1");
+            assert_eq!(logs.read("job1", 0).await, [b"built 1 as 7f3a\n".as_slice(), note].concat());
+            assert_eq!(logs.check("job1", 0, &Chain::of([note])).await, Verdict::Verified { kept: note.len() as u64, dropped: 0 });
+            assert_eq!(logs.kept_steps("job1").await, [0]);
+            Ok(())
+        })
     }
 
     /// Plan 01a1856fe81375b1bd1d1d86f270a45b, step 9: each piece of a step's log is noted with

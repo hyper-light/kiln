@@ -76,6 +76,22 @@ again on the same conversation. A new model, effort or mode is a flag, so it sta
 between turns. Files you attach go to it as their paths on its machine; its models come from
 `agy models`.
 
+Its subagents (`invoke_subagent`, each a conversation of agy's own) are tasks of the session: the
+stream names each one its agent starts (a `subagent` step's `subagent_info`: its conversation, role,
+type and first prompt), under the call that started it, its transcript as its output. Their own
+steps aren't in the stream, so kiln hears of them from its hook: agy reads hooks only from its
+hooks.json, so kiln puts one entry, `kiln`, in `~/.gemini/config/hooks.json` as an agent starts
+(beside the person's own, rewritten only when this kiln's path differs): `PreToolUse` for every tool
+(its answer awaited up to 7 days; past that agy fails the call), `PreInvocation` and `Stop`, each
+`kiln harness-hook --agy <event>` behind a shell guard: the entry stays in the person's hooks.json,
+and once that kiln binary is gone (its version pruned, kiln uninstalled) it answers agy's pass
+itself, as agy fails a call whose hook fails. It hands each to the runner's harness socket (`KILN_HARNESS_SOCK`,
+which agy hands on), with its conversation's tokens so far from its transcript; agy run outside kiln
+gets the answer that changes nothing (`allow`). A subagent's `Stop` ends its task (completed); its
+agent's `manage_subagents` kill, stopped. A subagent's own subagents are named nowhere kiln reads
+(not in the stream, and a hook names only the conversation it's in), so they aren't in the tree;
+the session's limits hold their calls.
+
 An agent goes on in any other of these harnesses, its conversation carried over: picking another
 harness's model in the head's line (`set_model` with `kind`; a harness that lists no models yet
 offers its own default) switches it once the turn under way ends. The conversation is read from
@@ -86,7 +102,12 @@ where it has one; Devin, the other ACP agents and Antigravity take it in words, 
 first message they get (a restart before that gives it then), in less room. The permission mode
 goes at the same latitude, never wider (an ACP agent that names its modes only once started gets
 kiln's Ask, or Bypass from a mode that skipped every check), and the effort as near as the model
-takes. The timeline marks the line between the two.
+takes. The to-dos go in the note it's given ("The plan as it stands"), and the session goes on
+with none: the new harness keeps a list of its own, so keep-going ([goals.md](goals.md)) never
+holds it to one only the old harness could change. The timeline marks the line between the two. A
+message the old harness never got (one sent as Codex or an ACP agent was still starting: a harness
+that can't get going is switched out of at once) goes to the new one first, still shown queued where
+it was said, then what waited after it (docs/sends.md, "A harness that ends").
 
 ## Where a harness is found
 
@@ -132,6 +153,14 @@ drives). So does a job of the machine's own: a systemd user unit (`systemd-run -
 scope) leaves the agent's group of processes, and kiln leaves it alone. An `ssh-agent` a shell's startup file starts (`eval "$(ssh-agent -s)"`) is no work of the
 agent's at all: never shown as left running, and stopped between turns or once 30 minutes old.
 
+An agent's harness is never something it left running, nor is anything under it: neither any
+session's harness as it is now, nor a process kiln started itself (its parent is the runner, which is
+no subreaper, so what a command leaves runs on under init or the nearest subreaper). A harness can
+start while a look goes on (a sign-in starts every Claude Code agent's again at once): the look
+knew the harness before it, so the session it belongs to is left out of that look and looked at
+again ten seconds later. On 2026-10-31 such harnesses were noted as left running and stopped once
+their agents were between turns, and 26 agents on one machine ended.
+
 When the runner starts again (an upgrade, a crash, the system stopping it, a re-join), a harness
 that outlived it is stopped before the session resumes (what it started is kept), so two harnesses
 never work one conversation; then whatever the session started that still runs is taken back over
@@ -140,6 +169,27 @@ it goes when that turn ends, as anything else left running.
 Ending the agent stops what it left running, then ends whatever else is still in its group (what
 left its harness's tree included) and removes the group. kiln's own helpers and MCP servers aren't
 counted.
+
+## An agent lives until it's ended
+
+An agent lives from its start until a person ends it, or the agent that started it does (`agents.stop`).
+Its machine's record of its sessions holds it, and the server's conversation store holds its
+conversation. Its harness's process is only how it runs now. When that process ends and nobody
+ended the agent, whatever ended it (a signal from outside it, a machine short of memory, a crash,
+an end of its own), the agent goes on. kiln starts its harness again on the same conversation, and
+a turn the end cut short goes on first: the agent is told its process ended part-way through it and
+to pick up where it left off. Its timeline says how the process ended ("exit 143: SIGTERM from
+outside it") and that it starts again. Until it's back, it stands as working, and its `exit` says
+when it starts again (`again_at`, Unix ms).
+
+The first start again waits 2 s. Each after it waits twice as long as the one before, at most
+5 minutes, and once a process runs 10 minutes the wait is 2 s again. A harness that never starts
+(its program is missing), or that ends within 20 s of each of its last three starts, won't start:
+it stands stopped, saying why, until a person restarts it or sends it a message. Where its
+machine holds as many agents at work as it may, it starts again once there's room.
+
+A runner that starts again (an upgrade, a crash, the system stopping it) starts each of its agents
+again the same way, from its record (above).
 
 ## How many agents a machine runs
 
@@ -190,9 +240,10 @@ server says, and counts every session it has, ended ones included, until it's up
   purpose (by name, age, activity, runner, harness or cost) is followed as it is.
 - **Requests anywhere.** On any other page (and an agent's page, for the other agents), a card
   says what each agent has for you, the most pressing first: its oldest request (a tool call is
-  allowed or denied there, a plan it proposes approved there, **Review** to keep it planning with
-  what to change; a question opens the agent); goals it paused for you
-  (**Review the plan**, when they wait on one, and **Resume**); a stop of its own, its harness
+  allowed or denied there, a plan it proposes approved there, **Review** to read it, reject it or
+  answer in your own words in its Plan tab, docs/plans.md "Reviewing a plan"; a question opens the
+  agent); goals it paused for you (**Approve** and **Review** when they wait on a plan, else
+  **Resume**); a stop of its own, its harness
   ended with an error (**Restart**); a usage limit it reached, only said, with when it goes on.
   Two at once (one on a phone), then a line for the rest. Where kiln's other notifications are,
   on every screen: at the bottom, above any passing ones. ×, or a swipe, puts one away until
@@ -231,29 +282,39 @@ server says, and counts every session it has, ended ones included, until it's up
   opened in place with the same controls. The agent is picked as its page switches one: by a model
   of another harness the machine runs, each listed under its name (one that hasn't listed its
   models yet, as "Default"; a machine that hasn't listed a harness's models takes another
-  machine's list). The box is the agent page's composer, the field and its bar. Under it, More
+  machine's list). Its permissions and effort go along as the page's switch carries them (the
+  same latitude, never wider; the effort as near as the model takes): the composer keeps them as
+  chosen last, with the harness they were chosen in, so a switch back finds them as they were, and
+  a mode that skips every check goes along only as confirmed for this start. The box is the agent
+  page's composer, the field and its bar. Under it, More
   options opens to one row each: the machine, the folder, how many, its name, its workspace, where
   its commands run, a shell to run in and the machine's past sessions to continue (closed, it says
   what isn't as it starts out). Each opens in place. Start starts it and opens it: the agent's socket opens at once, and its page opens as
   soon as its first snapshot is in (a moment at most), one view transition carrying each part of
-  the composer to its place on the page. Several stay on Mission control: the line under the box
+  the composer to its place on the page. That snapshot names its settings as the composer did,
+  before its harness says anything (it may wait for room on its machine, then take seconds to
+  start): its permissions, model, effort and speed, by its harness's lists as the machine knows
+  them; what the harness says once it runs takes their place, as it does when a switch starts
+  another. Several stay on Mission control: the line under the box
   says what started, and they come into the list. Files go with the first message, sent once the
   agent can take it. Everything else that started agents (Duplicate, a message's "Start new agent
   on this", Ask an agent, a shell's "Start agents in this shell", the command palette) fills the
   composer in and says where it came from, with Clear for your own defaults.
 - **Messaging agents.** With agents selected (or one picked by typing @ and part of a name, machine
-  or harness), the same composer writes to them, each named in the To line where the folder was,
-  in the order they were picked (each new one at the end), put back with its ×, Clear for them
-  all. The To line is one line: as many as fit, the rest folded into "+N more" after them. What's
-  written stays as it turns, and it keeps the height it had starting an agent, so the list under
-  it doesn't move as the first is picked or the last put back. A prompt goes with
-  files (the paperclip, a paste or a drop) and what you say into the mic, queued, steered or sent
-  now as an agent's own box sends it. The line above is theirs: unset, each agent keeps its own;
-  chosen (the speed too), only the agents that have it are sent to, and given it first (Reset
-  unsets them all). In the field, / lists kiln's own commands for all of them first
+  or harness), the same composer writes to them, in the rows it has starting an agent: the line
+  above the box is theirs, and under the box, where More options is, the To line names each, in
+  the order they were picked (each new one at the end), put back with its ×, Clear for them all.
+  The To line is one line: as many as fit, the rest folded into "+N more" after them. What's
+  written stays as it turns, and with the same rows (the word about the machines under them too)
+  it keeps its height, so the list under it doesn't move as the first is picked or the last put
+  back. A prompt goes with files (the paperclip, a paste or a drop) and what you say into the mic,
+  queued, steered or sent now as an agent's own box sends it. On the line above, unset, each agent
+  keeps its own; chosen (the speed too), only the agents that have it are sent to, and given it
+  first (Reset unsets them all). In the field, / lists kiln's own commands for all of them first
   (`/interrupt`, `/restart`, `/allow` and `/deny` what waits on you, `/end` those selected),
-  each asked once under the field, then the agents' own; Stop beside Send stops the turns of those
-  working. It empties as it sends, and says how it went. Every agent the list shows is Select all.
+  each asked once in a line under the To line, then the agents' own; Stop beside Send stops the
+  turns of those working. It empties as it sends, and that line says how it went; it slides open
+  and shut, so the list under it moves smoothly. Every agent the list shows is Select all.
 
 ## API
 
@@ -512,7 +573,11 @@ Subagents setting, pause point, environment and program. The agent's row works t
 carries what one asks you (answered as that one's); its chat lists them with its harness's own
 (the line by its composer, Tools → Subagents), each opening its thread in place, and a subagent's
 own page opens there too (`?own=1` keeps it a page of its own). One whose agent has gone is a row
-of its own.
+of its own. A subagent that waits on you, either kind (its harness's own by the requests naming it,
+`Approval.agent`), says so on the line by its agent's composer, and has a row over the composer
+(two at most), drawn as Mission Control's row that needs you: its name, what it asks, and the
+answer, given as that subagent's. A question opens its thread, as the row and Review do; on its
+agent's page, a subagent kiln started has no card of its own for it.
 The session list carries small
 `subagents` summaries derived from `state.tasks`; prompts and output stay in the conversation.
 Shells, monitors, workflows and background MCP calls are not counted as subagents. These summaries
@@ -564,7 +629,7 @@ code-mode function (`kiln.agents.start`) and, from a kiln shell, a CLI command.
 | `agents.start` | `POST /api/harness/agents` | `{kind, on?, cwd?, prompt?, model?, effort?, mode?, name?, count?, workspace?}` → `{agents: [Agent], parent}` |
 | `agents.about` | `POST /api/harness/agents/:id/about` | `{path, code, line?, end_line?, selection?, change?, question?, now?}` → `{agents: [Agent], itself}`: a child of the agent, reading only, answers what a person tapped in its conversation (a name, a line, a change) in four parts (what it is, what it does here, where else it's used, what's worth knowing); when the agent runs no subagents (`max_subagents` 0) it answers itself (`itself: true`, `sent` as `agents.send` answers), after its turn or with `now` between its steps. The child is a helper (`helper: "about"` on it): no row of Mission Control, its parent not told of it, ended once no card has read it (`agents.result`) for 90 seconds |
 | `agents.send` | `POST /api/harness/agents/:id/send` | `{text, mode?: "queue" \| "steer" \| "now", key?}` (or the `Idempotency-Key` header) → `{sent, message, accepted?}`: `accepted` is the agent's inbox's answer, `repeat` on every one after the first ("Sending again", below) |
-| `agents.wait` | `GET /api/harness/agents/wait` | `agent?` or `agents?` (a list; over HTTP `a,b`), `until?: "settled" \| "change"`, `any?`, `timeout_s?`, `hand_over?` → `{done, timed_out, waited_ms, until, agents: [Agent], messages?: [{from, name, text, at}]}` (`messages`: what other agents sent the agent that waits, handed over: "Waiting") |
+| `agents.wait` | `POST /api/harness/agents/wait` | `{agent?` or `agents?` (a list, or `a,b`), `until?: "settled" \| "change"`, `any?`, `timeout_s?`, `hand_over?}` → `{done, timed_out, waited_ms, until, agents: [Agent], messages?: [{from, name, text, at}]}` (`messages`: what other agents sent the agent that waits, handed over: "Waiting") |
 | `agents.result` | `GET /api/harness/agents/:id/result` | → `{agent, reply: {text, at}, last_turn, changes: {files: [{path, added, removed, created, deleted}], files_changed, lines_added, lines_removed}, cwd, machine, cost_usd, workspace, branch, change_request}` |
 | `agents.children` | `GET /api/harness/agents/:id/children` | → `{children: [{id, name, kind, status, parent}]}`: the ones still running, and theirs |
 | `agents.interrupt` | `POST /api/harness/agents/:id/interrupt` | → `{interrupted}` |
@@ -572,7 +637,26 @@ code-mode function (`kiln.agents.start`) and, from a kiln shell, a CLI command.
 | `agents.change` | `POST /api/harness/agents/:id/change` | `{title?, body?, draft?, trunk?, fix_checks?}` → `{change_request: Change}`: opens its change request from its work, or pushes a new version ("Change requests from agents", below) |
 | `agents.changes` | `GET /api/harness/changes` | `agent?` → `{changes: [Change]}`, newest first |
 | `agents.workspace` | `GET /api/harness/agents/:id/workspace` | → `{workspace: {kind, over, sub, volume, mount} \| null, drift: [path]}` ("Workspaces of their own", below) |
+| `agents.commits` | `GET /api/harness/agents/:id/commits?picks=&branch=&trunk=` | → `{log: {top, head, branch, trunk, base, dirty: {files, added, removed} \| null, commits: [{sha, parents, subject, author, at, files, added, removed, session}], more, told, branches, listed}, picked: {from, files: [FileChange], needs: {pick, commit, subject}} \| null}` ("Commits", below) |
+| `agents.refs` | `GET /api/harness/agents/:id/refs` | → `{refs: {branches, tags, commits: [{sha, subject, at, ...}], trunk}}` ("Compare", below) |
+| `agents.compare` | `GET /api/harness/agents/:id/compare?from=&to=&split=&path=` | → `{compared: {files: [FileChange], counts_only, split, changed_by: {path: [who]}}}`; a point is `now`, `began`, `agent:<who>` or a branch, tag or commit ("Compare", below) |
 | `agents.land` | `POST /api/harness/agents/:id/land` | `{}` → `{plan, excludes, can_write, why_not?}`; `{manifest}` (that plan's; a person only) → `{landed}`, or `{changed, plan, …}` with nothing written when the plan isn't that one any more |
+| `agents.credential` | `POST /api/harness/agents/:id/credential` | → `{token, expires_at}`: the agent's own token for git, for a day, so its pushes to kiln's repositories go as the agent, for its person (ci.md W27-R03). Only that very agent is given it, as its runner asks when its git needs it: never a person or another agent, and it's no tool of an agent's |
+
+Each takes an input type of its own (`crate::ops::Input`), as every operation of the registry
+does (kiln's own, CI's, releases' and deployments'): its JSON Schema (the MCP tool's
+`inputSchema`, `GET /api/ops`' `input`) is generated from it, and a call's input is read as it
+before the call runs. A field it doesn't take is refused, as its schema
+says (`additionalProperties: false`), and so is one of the wrong type. Over MCP that's a tool error
+(`isError`) whose structured content says what's wrong (`code`: `unknown_field`, `missing_field`,
+`invalid_type` or `invalid_value`), where (`path`, a JSON Pointer) and why, so the agent can
+correct the call; it's noted as a message kiln couldn't read (docs/wire.md, "What can't be read"),
+on the agent's page.
+
+The tools that aren't operations are typed too: code mode's `code_search` and `code_run`, and on a
+runner its own MCP server's tools (`run`, `runners`, `output`, `stop` and the page tools) and a
+program's `kiln.machines.*` (docs/reach.md §7). Their arguments are read as their types before
+they run, and refused and noted the same way.
 
 Every route needs `agents.run`. An agent is named by its id or the start of it (8 characters, as
 lists shorten it). Called by an agent, `agents.change` without `agent` is about that agent itself,
@@ -706,6 +790,12 @@ program returns of the answer is its own. `kiln agents wait` prints them after w
 stands. A message an agent sends another says so in its id (`from-agent-<sender>-…`), which is how
 a wait finds it.
 
+So a wait is a change, not a read: a `POST`, written in the audit trail, and not marked read-only to
+MCP clients. What it hands over lives only in its answer, and a client may run a read-only tool beside
+others, again, or ahead of time and drop its answer; a wait's messages would be lost with it.
+`agents.result` stays a read: all it changes is what its caller is told of what it has just read in
+full (the line in its news, and the settle not told again).
+
 ### Who asks
 
 | How it asks | Who kiln takes it for |
@@ -764,6 +854,124 @@ composer → More options → Workspace → Own volume; `agents.start` with `wor
   runner's state directory) and a mount it can make: FUSE through `fusermount3` on Linux, NFS on
   loopback on macOS. `GET /api/harness/workspaces` says which machines can, and why each other
   can't. kiln keeps one Slates instance, `kiln`, per machine (two shards).
+
+## The Changes tab
+
+An agent's Changes tab shows what it changed, its change request above (see "Change requests from
+agents"). Its head says what's shown, a row each, each choice in a menu:
+
+- **Session**: the files it changed since it began, each against how it was before.
+- **Commits**: its branch's commits, and what the picked ones change together (see "Commits").
+- **Compare**: what changes from one point to another (see "Compare").
+- **Scope**: Project at first, then User, then All (see "Who changed a file, and whose it is"). The
+  browser keeps the choice.
+- **By**: everyone, the agent itself, or one of its harness's subagents, each with how many of the
+  files at that scope it changed. Narrowed to one, a file someone else changed too shows only their
+  part and says who else changed it (see "One subagent's own edits"). Under their own heading, the
+  agents it started through kiln (`agents.start`, its goals' and plan steps'): each a session of its
+  own, maybe on another machine, so picking one shows that agent's own changes, read from its own
+  session, at the same scope.
+
+The head's last row carries what's shown in all (`+added −removed`), and Sort (by path, latest change,
+most changed, new, changed or deleted, or who changed it) sits at its right. Its files are a flat
+list, each saying on the line under it who changed it, and which worktree it's in when that isn't its
+folder's; the person's files elsewhere and the agents' own are under bands of their own. A file picked
+shows its diff alone; picked again, every file's. The tab's count is the files its scope shows.
+
+## Commits
+
+The Changes tab's Commits lists its branch's commits since its trunk (its remote's default branch,
+else `main` or `master`), newest first along its first parents, at most 200; a branch with none of
+its own since lists its latest 50. What isn't committed yet (as `git add -A` would take it, new files
+included) is on top. Its machine answers, in the working tree its work is in (`agents.commits`):
+
+- **This session's.** A session keeps the commit its folder had checked out as it began (its state's
+  `started_head`); the commits after it are its own, under a band of their own, and picked at first.
+  A session from before kiln kept it, or whose branch was rewritten since, tells its own by when they
+  were made.
+- **What's shown.** The picked commits' change, together. A run of them is one diff, from the first
+  one's parent to the last. With gaps, each picked commit is applied in order onto the first one's
+  parent in a scratch index beside the folder (its branch, index and working tree untouched); one
+  that doesn't go without a commit left out says which.
+- **Picking.** As Mission control picks agents: a tap shows one commit alone; press and hold picks
+  it, or unpicks it if it was picked, and dragging on takes each commit passed the same way, the
+  list not scrolling under the finger; with a mouse, Shift picks a run and ⌘/Ctrl adds or takes away
+  one. The This session band's ring picks all of the session's, with a dash when only some are.
+- **On** picks the branch: the one checked out, or another of its repository's (the latest dozen).
+
+A runner answers only with `CAP_WORKSPACE_COMMITS` (docs/wire.md). Without it, or in a folder that
+isn't a repository, Commits is turned off, saying why.
+
+## Compare
+
+The Changes tab's Compare shows what changes from one point to another, From and To each picked in
+place from a list that filters as you type:
+
+- **This session:** Now (the folder as it is, untracked files too, as `git add -A` would take it,
+  in a scratch index beside the folder), Before it began (the commit it began at, `started_head`),
+  and each agent's version: the agent itself or one of its subagents, its files as it left them
+  (see "One subagent's own edits") over how the folder was as the session began. Only its machine
+  knows how they left them, so the server's own agents' versions are refused, saying so.
+- **Elsewhere:** its repository's branches (its own, then its remote's), tags and latest commits
+  (`agents.refs`).
+- **Between commits**, "Only what To adds since they split" (git's three-dot diff) is on at first;
+  it sits in the head's menu with Swap. Two agents' versions compare plainly, From → To, each
+  file's line naming who of them changed it, or saying both did.
+- **Large compares** (past 300 files or 20,000 lines) come as counts first, and a file's lines once
+  it's opened (`agents.compare` with `path`).
+
+From is its trunk at first, To is Now. A runner answers only with `CAP_WORKSPACE_COMPARE`
+(docs/wire.md); without it, or in a folder that isn't a repository, Compare is turned off, saying
+why.
+
+## Who changed a file, and whose it is
+
+Each file of a session's changeset (`changes {files}`, `agents.result`'s `changes.files`) says who
+changed it and whose it is, for the Changes tab's By and Scope:
+
+- **`by`**: who changed it, in the order they first did. `main` is the agent itself; anything else is
+  a subagent run of its harness, by the id of the call that spawned it (as its events' `parent` says):
+  Claude Code's Agent tool, Codex's subagent threads. Every harness's subagents' edits count, in the
+  session's changeset and so in what a change request takes.
+- **`place`**: whose it is.
+  - `project`: in a folder the session has worked in (where it started, and each it moved to), or in a
+    working tree of one of their repositories, wherever that is: a worktree under `~/.cache` is. The
+    home folder, or a folder above it, is no project's: a session started there has the repositories it
+    works in.
+  - `agent`: an agent's own. In a harness's home (`~/.claude` or `CLAUDE_CONFIG_DIR`, `~/.codex` or
+    `CODEX_HOME`, `~/.gemini`, Antigravity's, Goose's), but for what a person keeps there to tell it what
+    to do; in kiln's own folders (a runner's state); in the machine's cache (`XDG_CACHE_HOME`, else
+    `~/.cache`, macOS's `~/Library/Caches`) and temporary folders.
+  - `user`: anything else it changed for the person: another repository, their home folder's files,
+    and what they keep in a harness's home: its instructions (`CLAUDE.md`, `AGENTS.md`, `GEMINI.md`),
+    its settings (`settings.json`, `config.toml`...) and its `skills`, `commands`, `agents`, `prompts`.
+
+A file with neither (from a runner older than these) is read as this project's. The state's
+`files_changed`, `lines_added` and `lines_removed` (the tab's count, Mission control's) count this
+project's files only; the rest stay in the changeset, for the scope that shows them.
+
+## One subagent's own edits
+
+Narrowed to one who changed its files (By), the Changes tab shows each file as they changed it alone.
+A file only they changed shows the session's change to it. A file someone else changed too shows
+their part, and the line under it names who else changed it:
+
+- **What's kept.** The session's core keeps, for each file, who changed it in turn, and how the file
+  was as each turn began: the session's baseline for the first, then how the next one found it, as
+  its harness said before its edit (Claude Code's `originalFile`; Codex's patch, undone from the
+  file by its change job; an ACP agent's old text). One's part is each of their turns, from how they
+  found the file to how the next one did, or to how it is now for the latest. Taken in turns, one
+  after another, that's their edits alone; one who came back to it after another shows each of their
+  turns, edit by edit. An in-place upgrade keeps it all (`Frozen`).
+- **How it's asked for.** The panel asks on the session's stream (`own_edits {client, by}`) and the
+  session answers that client alone (`reply`), as file suggestions are answered, so the stream itself
+  doesn't grow: `{by, files: [{path, tree, kept: true, edits: [one FileChange a turn]}]}`, worked out
+  off the event loop. Sessions whose features have `own_edits` answer, whatever their harness.
+- **The cap.** The session keeps 64 MiB of files as turns began at them at most (the baselines
+  aside), and 256 turns a file. Past it, or where its harness didn't say how it found a file (a shell
+  command changed it), or where the runner started again since, a file's answer is `kept: false` with
+  why (`cap`, `unknown`): the panel then shows their edits one by one from the conversation's events,
+  and says so under them. It does the same for a runner that doesn't answer, saying that.
 
 ## Change requests from agents
 
@@ -1212,6 +1420,22 @@ reloads) and goes to the agent in order once it can take it, ahead of anything s
 Files attached go along when they were uploaded; ones that couldn't be (no server) stay with the
 page until it reloads.
 
+### A copy left behind
+
+An agent that goes on on another machine while its own is cut off (moved there from the server's
+copy) leaves its copy running where it was, at the epoch it left (docs/ci.md W27-R08). kiln fences
+what that copy does through it. Each act an agent makes through kiln (a kiln operation it calls, a
+page it shows, a run on another machine) is signed by the runner process holding it, with the
+agent's key at its epoch, and kiln takes it only from the agent's holder now. The copy's acts are
+refused, answered with why (the epoch it's at, and where and when the agent went on), and recorded
+with who signed them, that epoch and the transfer the agent went on with (`kiln transfers
+refused`). One its runner couldn't put to kiln while cut off isn't done, and kiln hears of it once
+the runner is back.
+At the runner's first word back, kiln tells it to let go of the copy. What kiln can't refuse is
+what the copy does on its own machine without kiln (the files it edits there, the commands it runs
+there): that goes on until its runner hears from kiln. A runner from before signed acts is taken by
+its machine, as before.
+
 ### What you sent, at once
 
 A message shows at the end of the conversation the moment it goes, marked *sending…*, then *sent*
@@ -1273,7 +1497,9 @@ messages for its subagents wait in their queues too.
 | Codex (multi-agent v1, its default) | on the subagent's own thread: `turn/start` (with the session's permissions then), `turn/steer` into its turn, `turn/interrupt` then `turn/start` for now; Codex says it back under kiln's id (`clientUserMessageId`) | queue, steer, now while it works; queue (a turn at once) between turns |
 | Codex (multi-agent v2; a subagent this process didn't spawn) | Codex refuses input there (`direct app-server input is not allowed for multi-agent v2 sub-agents`), so kiln asks the agent, in its turn, to pass it on with its own agent tools (`send_message`, `followup_task`; v1's `send_input`); delivered once the agent's call reaches it | queue, steer; agents it started itself only |
 | Claude Code | it takes nothing for a subagent from kiln (2.1.309 and 2.1.310 answer `send_task_message` "Unsupported control request subtype" in `-p`, and a prompt naming the subagent's call goes to the agent), so kiln asks the agent, in its turn, to pass it on with its SendMessage tool: at the subagent's next tool round while it works in the background, or resuming it once it has finished; under way when the agent's SendMessage to it starts, delivered when that succeeds | queue, steer while it works in the background; queue while in the foreground (its agent's turn waits on it) or once it finished; none once stopped (Claude Code doesn't resume one stopped) |
-| ACP agents, Antigravity CLI | kiln has no subagent threads for them | none |
+| Antigravity CLI | before the subagent's next model call: kiln's hook (below) answers agy's `PreInvocation` in that subagent's conversation with the message (`injectSteps`, a `userMessage`; the files attached by their paths); under way then, delivered once it goes on past that call. Not once it has ended (agy calls a stopped subagent's model no more), nor before kiln's hook is heard from it | steer while it goes |
+| ACP agents (opencode) | kiln can't prompt an opencode subagent itself (an ACP prompt goes to a session kiln opened), so it asks the agent, once its turn is free, to pass it on with opencode's subagent tool, which takes a follow-up by the subagent's session id, running or ended; sent once kiln asks | queue |
+| ACP agents (Gemini CLI, Goose, Amp, Devin) | kiln has no subagent threads for them: their subagents aren't reported over ACP (below) | none |
 
 What kiln asks an agent to pass on carries the person's words as written (the files attached by
 their paths) and is kiln's own message in its timeline (`kiln-relay-<message id>`); a turn that
@@ -1285,7 +1511,8 @@ messages and follow-up work. Read-only `thread/read` and `thread/turns/list` req
 status, latest 100 turns, elapsed time and result; live child notifications update that same
 view. Tracking never starts, resumes or attaches another executor to the child (it may interrupt
 one working with other permissions than the session's: see permission modes above). Its messages,
-commands, usage and edits stay separate from the parent's turn and changeset. A spawn call
+commands and usage stay separate from the parent's turn; its edits join the session's changeset,
+credited to its spawning call (see "Who changed a file, and whose it is"). A spawn call
 finishing does not mean the child has finished, and unavailable child history does not end the
 parent. As in Codex's own TUI, a message to a child (`send_message`, `followup_task`) doesn't
 change whether it runs: a message queued for an idle child starts no turn, and a follow-up's turn
@@ -1304,7 +1531,9 @@ left running that the list leaves out, should its end never have come.
 
 Nothing a harness ran outlives its process: when it ends (a switch to another harness, a stop, a
 restart, a crash), its live tasks end "stopped" and its calls still under way are cancelled, all
-of them kept to read; a new process starts with nothing of an earlier one's running. What kiln
+of them kept to read; a new process starts with nothing of an earlier one's running. A message it
+was handed and never finished ends dropped; one its adapter held for it, which it never got, goes
+to the next process first (docs/sends.md, "A harness that ends"). What kiln
 took back over (`left-<pid>`: "What an agent left running") is the exception. The state keeps
 the newest 200 tasks (the oldest finished go first, with the output kiln kept of them), and a
 finished task keeps 2,000 characters of a long command (its call keeps it whole), so the state
@@ -1329,6 +1558,106 @@ way to resume it from outside.
 A tool call reads `pending` while it is asked about (an approval in `state.approvals` names its
 `tool_id`) or while it waits its turn behind one; `running` once it is under way. MCP calls name
 their `server` and `tool_short`; skill calls their `skill`.
+
+### What a person does with an agent's subagents
+
+An agent's subagents show as one tree: those kiln started for it (sessions of their own, `subagent`
+with it as `parent`, and theirs) and its harness's own (`subagents` in lists, nested by
+`parent_task`; Antigravity's from its stream, but not a subagent's own), each under what started it, in the order they started. Mission control's row of
+an agent with subagents has a toggle (the subagent mark and a chevron) that opens the tree under
+it in the row's own columns: each subagent's piece of the path (the lines of those it's under
+passing by, a curve into its own mark), its name, its word and what it's at, its machine, time and
+harness, its pause, and the way to its thread. One that needs you has its own piece of the path
+tan, and its request is answered there unless its agent's row already answers it. The line by the
+composer opens the same tree with a pick box each, a select-all where its mark was; the Plan tab
+shows each step's agent live under its step.
+
+With subagents picked, the composer's To line names them (two on a phone, four wider, then +N),
+and a message goes to each its own way: one of the agent's own harness's as a `send` with its
+`task` on the agent's socket, any other over HTTP to its session (with `task` for a harness's
+own). Each name then has its mark: delivered, waiting (queued, or its session paused), or not
+sent.
+
+A subagent's crumbs name its whole path from the agent at the top, each earlier name opening its
+own thread, with Pause, Branch and Permissions on that line. What its parent wrote it (its brief,
+what it sent it: in a harness's own subagent's thread, a message without a client id; in a
+session of its own, its first and those whose id is `from-agent-<parent>-…`) is under its
+parent's name, with the way back to its parent's thread. A person's message its agent passes on
+(`via: "parent"`) says so ("You · via …"). A finished one ends with its word, when, and the way
+back.
+
+**Pausing** (`pause`, `{on, task?}`). Without `task`, the session's processes stop where they are:
+its machine's pacer holds its group at share 0 (cgroup.freeze on Linux, SIGSTOP on macOS, every
+thread suspended on Windows) under the pacer's guard, which starts them again should the runner
+end (docs/headroom.md, "A person's pause"). `state.frozen` says since when; a runner that can't
+pause says why, and one that restarts holds a paused session again. The server sends the pause,
+and its end, to every subagent kiln started under it. With `task`, that subagent of its harness's
+own is held at its next tool call: kiln has a hook on every one of Claude Code's tool calls (a
+`PreToolUse` matcher for every tool, its answer awaited up to 7 days), and on each of Codex's local
+ones (commands, `apply_patch`, MCP calls and its read tools): a `PreToolUse` command hook kiln gives
+in the session's flags, with that hook's trust for this session alone (the hash Codex trusts it
+by), so the person's own hooks keep theirs. Its command, `kiln harness-hook`, hands the call to the
+runner's harness socket, which knows the session by the asking process; Codex names no subagent,
+so kiln tells it by the call's turn. Antigravity's are on each of its tool calls too: kiln's entry
+in agy's hooks.json (above), the subagent told by the call's conversation. The call of a paused subagent, or of one under it, waits for
+its answer until it's resumed (`tasks[].paused_at`). `tasks[].pausable` says which can be held so:
+Claude Code's while they go; Codex's once Codex lists kiln's hook as trusted (a session whose hook
+it doesn't trust says why); an ACP agent's where its requests name them (opencode's, below);
+Antigravity's once kiln's hook is heard from it (its first hook turns `limits` on in its
+`meta.features`). What a pause holds says Paused; the
+one paused offers Resume, and those under it wait for that.
+
+**What each may do** (`perms`, `{perms?, task?}`): Read, Edit, Run and Web, each `allow`, `ask` or
+`off`; a `folder` its file calls stay in; the most `minutes` and `tokens` it may use. Never more
+than what it's under: the server narrows a session's to its parent's, and the subagents kiln
+started under it to its own (narrowing one narrows those under it; widening it widens none);
+Claude Code's, Codex's and Antigravity's adapters narrow one of their own subagents' to the
+session's and the one it's under. They hold at each tool call the same hook sees: `off` refuses the call with the reason,
+`ask` makes it ask the person (Codex's hook can't ask, nor can headless agy, so kiln holds the call
+and asks them itself; a yes is agy's `auto_approve`, so it goes even where agy's mode would deny it,
+and a no its `deny` with their words), a file outside its folder is refused (a command there asks; for Codex, the files an
+`apply_patch` names), and past its minutes or tokens each call is refused and it's told to finish.
+Codex's web search is hosted, out of any hook's reach (`web_whole` in its `meta.features`): `off`,
+and `ask`, which it can't do, turn it off for the session's threads (`web_search = "disabled"`), as
+it starts again once idle, the conversation going on; a subagent of its own has no Web choice.
+Antigravity's web tools (`search_web`, `read_url_content`, `browser_*`) are calls its hook sees, so
+Web holds per call there as each other kind does. The
+shield on the thread's crumbs opens the panel under them, every choice at its right edge; a
+session whose harness kiln doesn't answer that way (no `limits` in its `meta.features`) has it off.
+
+**Branching** (`branch`, `{words, top?, task?}`). The fork on a subagent's crumbs takes what
+changes, then a Variant or a New agent, and its runner makes the new session on its machine. A
+subagent kiln started branches from its own spec, so it lands beside it, under the same agent: its
+conversation forked where its harness can (`resume` in its features: its harness session, `fork`),
+the person's words its first message, and handed over in words where it can't. One of its
+harness's own is handed over in words (what it was asked, said and was told) as a subagent of its
+agent. A New agent (`top`) is an agent of its own. Each carries `variant_of`, and the tree marks
+it with the fork. A finished variant's thread ends with Keep, which tells its parent to use its
+result in place of the one it varied, and to read it whole with `agents_result`.
+
+**ACP agents** (Devin, Gemini CLI, opencode, Goose, Amp). ACP has one place a client can hold a
+tool call, the agent's `session/request_permission`, and the agent decides when to send it: kiln
+holds an ACP agent's calls **at the calls it asks about**, and no others. A call its own rules let
+it make without asking goes as they say. `meta.features` has `limits` and `limits_asked`, and the
+Permissions panel says so in one line. At each request: one from a paused subagent, or one under
+it, waits unanswered and unshown until it's resumed (answered `cancelled` if the turn is cancelled
+first); what its perms (the session's, narrowed by each subagent's) refuse is refused at once
+(`reject_once`), the reason on the call; what they say a person sees is shown with the reason,
+whatever kiln's mode, Bypass too; anything else goes as it always did. Per agent:
+
+| Agent | Its subagents in the tree | A message to one | Pause one | What each may do |
+|---|---|---|---|---|
+| opencode | yes: kiln asks for its child sessions (`_meta["opencode/child-session-updates"]` at `initialize`) and each `opencode/session/child_update` makes a subagent, its tool calls under it, ended as it says | through the agent that started it (`via: "parent"`), once its turn is free: opencode's own subagent tool takes a follow-up by the subagent's session id, running or ended | yes, at each call it asks about (its requests name the subagent in `_meta["opencode/child-session"]`) | the session's and each subagent's, at each call it asks about |
+| Gemini CLI | no: its subagents' calls never reach ACP (its policy engine decides them inside the agent) | no | no | the session's, at each call it asks about |
+| Goose | no: it passes a subagent's request on under a new id, naming no subagent | no | no | the session's, at each call it asks about |
+| Amp (amp-acp) | no: its adapter shows a subagent's calls inline and leaves permissions to Amp | no | no | the session's, at each call it asks about |
+| Devin | not known: its docs don't say what of its subagents reaches ACP, and kiln shows none | no | no | the session's, at each call it asks about |
+
+kiln's tests hold each to this with a stand-in ACP agent (`harness::acp`):
+`acp_subagent_paused_request_waits_until_resumed`, `acp_off_refuses_and_ask_shows_with_reason`,
+`acp_bypass_still_held_to_limits`, `acp_session_perms_hold_own_requests`,
+`acp_opencode_children_are_subagents_in_the_tree`, `acp_nested_child_under_its_parent` and
+`acp_opencode_message_goes_by_its_parent`; the UI's in `ui/e2e/subagent-acp.spec.ts`.
 
 ## Files in messages
 

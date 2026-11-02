@@ -4,10 +4,14 @@
  * it disabled saying whose to resolve, open issues ask "Approve anyway", open nits are said on
  * approval; while conflicts remain, "Commit resolution" stands in Approve's place (W26-R12).
  * A host's pull request approves through the forge seam; a commit with no change shows no row.
+ * Each approval carried to this version from an earlier one, a rebase-only version with its verbatim
+ * patch-id, is said under the row in kiln's words: "kim's approval carried from v2: rebase only, …"
+ * (docs/ci.md W27-R08: kiln signs the carry as a transfer).
  */
 import * as React from "react";
 import { BadgeCheck, Check, CircleQuestionMark, Feather, GitMerge, OctagonMinus, TriangleAlert, X } from "lucide-react";
-import { conflictsApi, reviewApi, type ReviewGate } from "@/api/review";
+import { conflictsApi, reviewApi, verdictsRes, type ReviewGate } from "@/api/review";
+import { useRes } from "@/lib/data";
 import { invalidate } from "@/lib/resource";
 import "./review.css";
 
@@ -33,6 +37,7 @@ export function GateRow({
 }) {
   const [ask, setAsk] = React.useState(false);
   const [note, setNote] = React.useState<{ k: string; t: string } | null>(null);
+  const carried = useRes(verdictsRes(diffKey)).data.verdicts.filter((v) => v.action === "accept" && v.standing === "carried" && v.carried?.said);
   const [busy, start] = React.useTransition();
   const [err, setErr] = React.useState<string | null>(null);
 
@@ -126,6 +131,14 @@ export function GateRow({
         {chips}
         {action}
       </div>
+      {carried.map((v) => (
+        <p key={v.id} className="rv-carried">
+          <BadgeCheck size={13} aria-hidden="true" />
+          <span>
+            {v.reviewer.replace(/^user:/, "")}'s approval {v.carried?.said}
+          </span>
+        </p>
+      ))}
       {ask && gate?.warning && (
         <div className="rv-note" data-k="issue">
           <TriangleAlert size={13} aria-hidden="true" />

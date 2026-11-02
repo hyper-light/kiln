@@ -293,7 +293,9 @@ fn w26_ac04_conflicts_resolve_in_the_diff_and_commit_as_a_revision() -> anyhow::
     let (st, r) = commit(&fixer)?;
     assert_eq!(st, 403, "{r}");
     let r = ok(&s, &dev, "POST", "/api/diffs/D1/conflicts/commit", Some(&json!({})))?;
-    assert_eq!((r.get("version"), text(&r, "why"), r.get("signer")), (Some(&json!(2)), "conflict resolved", Some(&Value::Null)), "unsigned until W27-R03: {r}");
+    assert_eq!((r.get("version"), text(&r, "why")), (Some(&json!(2)), "conflict resolved"), "{r}");
+    // kiln commits it, so it's signed as kiln's server (W27-R03), whoever resolved it.
+    assert!(r.get("signer").and_then(Value::as_str).is_some_and(|s| s.starts_with("kiln://") && s.ends_with("/server")), "signed as kiln: {r}");
     let d = ok(&s, &kim, "GET", "/api/diffs/D1", None)?;
     let v2 = d.pointer("/versions/1").cloned().unwrap_or_default();
     assert_eq!((v2.get("n"), text(&v2, "why"), text(&v2, "note"), v2.get("rebase_only")), (Some(&json!(2)), "conflict resolved", "conflict resolved", Some(&json!(false))), "{d}");

@@ -101,7 +101,12 @@ fn w13_r01_a_tool_on_its_users_path_alone_is_in_the_runners_facts() -> anyhow::R
 
     let deadline = Instant::now() + Duration::from_secs(90);
     loop {
-        let (_, body) = http(s.port, "POST", &format!("/api/agents/{}/probe", machine("box")), &s.admin, Some(&json!({})))?;
+        // The probe has the runner run its fact probes again before it answers (a login shell, each
+        // tool's version), past http's 30 s on a loaded machine: then it's asked again.
+        let Some((_, body)) = common::polled(http(s.port, "POST", &format!("/api/agents/{}/probe", machine("box")), &s.admin, Some(&json!({}))), deadline, "the probe")? else {
+            std::thread::sleep(Duration::from_millis(500));
+            continue;
+        };
         let v: Value = serde_json::from_str(&body).unwrap_or_default();
         let tools = v.pointer("/facts/tools").cloned().unwrap_or_default();
         if tools.get(tool).and_then(Value::as_str) == Some("9.8.7") {

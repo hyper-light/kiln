@@ -153,6 +153,24 @@ impl Mirror {
         Ok(Commit { sha: sha.trim().to_owned(), author, email, at: at.trim().parse().unwrap_or(0), subject, body: body.trim().to_owned() })
     }
 
+    /// The newest `n` commits of `revision`'s first-parent line, newest first, each who, when and
+    /// its first line (no body): what a rollback can go back to beside the deployments (docs/ci.md
+    /// W26-R25).
+    pub fn log(&self, revision: &str, n: usize) -> Result<Vec<Commit>> {
+        let rev = if revision.is_empty() { "HEAD" } else { revision };
+        let mut c = git(Some(&self.dir), &self.auth);
+        c.args(["log", "--first-parent", &format!("--max-count={n}"), "--format=%H%x00%an%x00%ae%x00%at%x00%s%x1e", &format!("{}^{{commit}}", self.resolve(rev)?), "--"]);
+        let out = String::from_utf8_lossy(&run(c)?).into_owned();
+        Ok(out
+            .split('\x1e')
+            .filter_map(|r| {
+                let mut f = r.trim_start_matches('\n').splitn(5, '\0');
+                let (sha, author, email, at, subject) = (f.next()?, f.next()?, f.next()?, f.next()?, f.next()?);
+                (!sha.trim().is_empty()).then(|| Commit { sha: sha.trim().to_owned(), author: author.to_owned(), email: email.to_owned(), at: at.trim().parse().unwrap_or(0), subject: subject.trim_end().to_owned(), body: String::new() })
+            })
+            .collect())
+    }
+
     /// The hash of each path at `commit` (`None` where nothing is there), in one call.
     pub fn hashes(&self, commit: &str, paths: &[&str]) -> Result<Vec<Option<String>>> {
         if paths.is_empty() {
@@ -455,6 +473,30 @@ mod tests {
         assert_eq!(c.body, "It timed out on cold starts.");
         assert!(c.at > 1_600_000_000);
         assert!(m.commit("0000000000000000000000000000000000000000").is_err());
+        Ok(())
+    }
+
+    /// W26-R25: a revision's newest commits, newest first, each who, when and what.
+    #[test]
+    fn w26_r25_a_log_lists_a_revisions_newest_commits() -> Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let work = tmp.path().join("work");
+        std::fs::create_dir_all(&work)?;
+        sh(&work, &["init", "-q", "-b", "main"])?;
+        let mut made = Vec::new();
+        for n in 1..=4 {
+            std::fs::write(work.join("a.yaml"), format!("v: {n}\n"))?;
+            sh(&work, &["add", "."])?;
+            sh(&work, &["commit", "-qm", &format!("Change {n}\n\nA body.")])?;
+            made.push(sh(&work, &["rev-parse", "HEAD"])?);
+        }
+        let m = Mirror::open(&tmp.path().join("mirror.git"), work.to_str().unwrap_or(""), Auth::default())?;
+        let log = m.log("main", 3)?;
+        assert_eq!(log.iter().map(|c| c.sha.clone()).collect::<Vec<_>>(), made.iter().rev().take(3).cloned().collect::<Vec<_>>());
+        assert_eq!(log.iter().map(|c| c.subject.as_str()).collect::<Vec<_>>(), ["Change 4", "Change 3", "Change 2"]);
+        assert!(log.iter().all(|c| c.author == "t" && c.at > 1_600_000_000 && c.body.is_empty()));
+        assert_eq!(m.log("main", 10)?.len(), 4);
+        assert!(m.log("nowhere", 3).is_err());
         Ok(())
     }
 

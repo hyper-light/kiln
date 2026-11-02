@@ -105,7 +105,7 @@ pub async fn run(cfg: Config, shutdown: Shutdown) -> anyhow::Result<()> {
     if let Some(c) = crate::runner::chaos::get() {
         net.command(crate::net::Out::Seed(c.seed)).await;
         for rule in c.faults.iter().copied() {
-            net.command(crate::net::Out::Shed(rule)).await;
+            net.command(crate::net::Out::Shed(rule.past(crate::wire::server_classes().len()))).await;
         }
     }
     // HTTPS on the HTTP port, when asked: the configured certificate, else the kiln CA's.
@@ -196,6 +196,8 @@ pub async fn run(cfg: Config, shutdown: Shutdown) -> anyhow::Result<()> {
         child!("pool-samples", h => crate::ci::pools::sample_loop(h));
         child!("diff-runs", h => crate::ci::review::runs_loop(h));
         child!("agent-changes", h => crate::workspace::follow::follow_loop(h));
+        // W28-R59: each commit's verdict, worked out again as its lane's runs end.
+        child!("ci-verdicts", h => crate::ci::verdict::verdict_loop(h));
         child!("attachments", h => crate::ci::attach::run(h));
         child!("previews", h => crate::ci::previews::run(h));
         child!("review-replies", h => crate::ci::replies::run(h));
@@ -209,6 +211,8 @@ pub async fn run(cfg: Config, shutdown: Shutdown) -> anyhow::Result<()> {
         child!("registry-collect", h => crate::ci::registry::collect_loop(h));
         // The server's and CD's own identities, renewed before they expire (docs/ci.md W27-R01).
         child!("identities", h => crate::identities::own_identities_loop(h));
+        // The trail's checkpoints, signed as they come due (docs/ci.md W27-R09).
+        child!("trail", h => crate::trail::checkpoints_loop(h));
         // kiln's base chart in its own registry, for apps' charts to depend on (docs/deploy-api.md §3.4).
         child!("kiln-base", h => crate::deploy::init::publish_base(h));
         if cfg.cd.enabled {

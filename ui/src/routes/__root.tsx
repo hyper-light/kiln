@@ -21,11 +21,22 @@ const NO_AUTO_ZOOM = `(function () {
   if (m) m.setAttribute("content", m.getAttribute("content") + ", maximum-scale=1");
 })();`;
 
+const VIEWPORT = "width=device-width, initial-scale=1, viewport-fit=cover";
+
+/**
+ * The viewport as NO_AUTO_ZOOM left it (W21-R13). React keeps the page's own tag only while its
+ * content is what React renders: otherwise it adds a plain one after it, and phones follow the last
+ * tag, so they zoomed into fields again once the page had loaded.
+ */
+function viewport() {
+  return (typeof document !== "undefined" && document.querySelector<HTMLMetaElement>('meta[name="viewport"]')?.content) || VIEWPORT;
+}
+
 export const Route = createRootRoute({
   head: () => ({
     meta: [
       { charSet: "utf-8" },
-      { name: "viewport", content: "width=device-width, initial-scale=1, viewport-fit=cover" },
+      { name: "viewport", content: viewport() },
       { name: "theme-color", content: "#08090a" },
       { name: "color-scheme", content: "dark" },
       { name: "description", content: "kiln — self-hosted CI/CD for the hyper-light stack" },

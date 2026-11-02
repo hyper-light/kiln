@@ -67,7 +67,9 @@ C, no SIMD, no FTS.
 
 - **Where:**
   - A runner's store is `<state>/conversations.db` and holds its own sessions. A runner beside
-    another one of its machine (`<state>/instances/<id>/`) has a store of its own.
+    another one of its machine (`<state>/instances/<id>/`) has a store of its own; a new build
+    taking over from one in an upgrade goes on with that one's store, moved into its folder (see
+    "A runner's upgrade" below).
   - The server's store is `<data_dir>/harness/conversations.db` and holds every session, from every
     machine.
 - **Reading it by hand:** the file is SQLite's format. kiln holds it open exclusively, so `sqlite3`
@@ -96,6 +98,11 @@ C, no SIMD, no FTS.
     Code's session id, or a Codex rollout's file name.
   - `drops(rev, session, what, source, n, at)`: what was dropped.
   - `peers(peer, rev, at)`: through where this store has each peer's feed.
+- **Migrations an older kiln lives with.** A new build that takes a runner's store over migrates
+  it, and a rollback hands it back to the older build, which skips the migrations it doesn't know
+  (see "A runner's upgrade"). So each migration leaves a store an older kiln still reads and
+  writes: tables added, columns added with defaults. Migration 3's rebuild of `records` wouldn't
+  have (it came before stores were handed over).
 - **Restarts.** A session restored after a restart (`host::restore`) takes its timeline and state
   from the store (`Core::adopt`), as a move does, instead of rebuilding them from the harness's
   transcript. The harness still resumes its own conversation.
@@ -165,8 +172,11 @@ the server's store (`convo/resume.rs`):
      (`handoff::as_words`): the harness there starts a new conversation and is given it, once, with
      the first message it gets. The timeline shows that message as the person wrote it.
 2. It raises the session's epoch, here and in its store.
-3. It sends the package to the target runner in pieces on the feed's lane (`HarnessPackage`).
-4. That runner installs the record where its harness looks for it, and takes the session over under
+3. It takes the session for the process that held it, which can't hand it on: a take signed by the
+   server, saying when it last heard from that machine, which the package carries (docs/ci.md
+   W27-R08). The runner taking the session signs its receipt of it.
+4. It sends the package to the target runner in pieces on the feed's lane (`HarnessPackage`).
+5. That runner installs the record where its harness looks for it, and takes the session over under
    the same id, as it does a moved one.
 
 The agent's folder is mapped as a move maps it: a copy of its repository kept in step there, else
@@ -388,11 +398,29 @@ compact = true       # make the store's file compact once a third of it is free 
   once copied the whole file in one go (`VACUUM INTO`, one transaction), which took more memory
   than the first server had: it was killed for it every minute until rolled back (2026-10-18).
 - **A runner's first feed** sends its whole store, everything it kept before the feed.
-- **A runner's upgrade** starts the new process's store anew (`<state>/instances/<id>/`): it
-  writes what each session it takes over has, and its feed sends all of it to the server. The
-  server has it already, as it is, so it writes nothing of it (a lookup a row), but the runner
-  reads it all and sends it (609k rows from adacachy on 2026-10-25). A mirror's new copy takes
-  the server's whole store again (5.7 GB). Neither store goes on with its upgrade yet.
+- **A runner's upgrade** (blue/green, docs/releases.md) hands its stores to the new build, which
+  goes on with them: its own store and, on a mirror, its copy of the server's. Once the old
+  runner has handed its sessions out and what they said last has gone into its store, it lets go
+  of each store, moves its files into the new build's folder (`<state>/instances/<id>/`) and
+  says so first (`Frame::Stores`, the new build saying it takes them: `Ready.stores`). The new
+  build opens them there, the same ids and numbers, so the server's feed of the store, and its
+  feed to the copy, go on where they are and nothing is sent again. The mirror's feed follows the
+  process the machine promotes. The stores never hold an upgrade back: one the new build can't
+  open (tried three times, a second apart) it sets aside, kept whole beside its new one
+  (`conversations.db.unopened`, `.unopened.2` and on if that's taken, its log by the same name
+  and `-wal`, so it still opens as it is), and goes on in a new store (a new copy, for a
+  mirror's), saying where in its answer (`Frame::StoresTaken`). One that can't keep a store at
+  all (not even a new one opens) leaves what it was handed in its folder under its own name, for
+  its next start, and takes the rest of the upgrade all the same: nothing is lost either way. A
+  rollback moves the files back before the new build's folder goes (a store it set aside comes
+  back from where it said, as it was, not the new one; one that couldn't be moved back keeps the
+  folder), and the old runner goes on with them. An old runner that ends before
+  it says (it died, or their link broke) leaves the new build the store in its own folder: the
+  files it had moved there, or a new one. A build from before neither says nor takes: an upgrade
+  from one opens a store of its own in the new build, which writes what each session it takes
+  over has, and its feed sends all of it to the server, which has it already, as it is, and
+  writes nothing of it (a lookup a row). Before this, every upgrade did that (609k rows from
+  adacachy on 2026-10-25), and a mirror's new copy took the server's whole store again (5.7 GB).
 
 ## Status
 

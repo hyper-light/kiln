@@ -197,13 +197,13 @@ Statuses: `ready` (can start), `blocked` (waits on what is in brackets), `in pro
 | W17 | Debugging | W06, W13 | in progress | terminals into running and kept legs (host, docker; on the run page and `kiln debug terminal`), keep on failure with extend and release, a step rerun in place, `kiln workflow run` here or on a server, agents through MCP (exec, rerun step, keep, release); log search and "compare with the last green run" (W19); terminals into `k8s` pods' legs; in Firecracker microVMs terminals, keeping, extend and release, and reruns in place (W13-R05); shards' left |
 | W18 | Supply chain, untrusted code | W10, W13 | in progress | provenance the server makes from its own records and signs (SLSA v1.0, DSSE, Sigstore bundles; its own P-256 key, a cosign key file, AWS KMS, or keyless through Fulcio and Rekor), images' referrers in kiln's registry, a provenance check CD's environments require before they deploy (R04, AC04), `kiln/attest@v1` and the job's `attest:`, bundles beside files, on the run and through GitHub's attestations API; SBOMs (SPDX 2.3, CycloneDX 1.6) from ten lockfile kinds and `syft`, `kiln sbom`; AC01 with cosign, AC02; untrusted code: trust (fork PRs polled or delivered, marks), approval of outside contributors' runs, untrusted executors (rootless Docker), isolated cache scopes, contained networks through a per-leg egress proxy (SNI checked, blocks annotated), AC03 in containers; the dependency changes a diff makes, on its review page (R03); attestations as referrers in other registries too; Firecracker microVMs contained (no network device: out only through the egress proxy, W13-R05); shards' left |
 | W19 | Insights, audit, notifications | W05 | done (AC05's real channels with W11-AC03's tenants) | notification rules from trunk and the server (events, `where`, `throttle`, `run.fixed`, `deploy.*`, `leg.flaky`, `land.ejected`, `runner.offline`, `review.requested`, `comment.reply`, `mention`, `quota.near`, `secret.unused`), Slack, Discord, Teams, Telegram, PagerDuty, Opsgenie, email (SMTP), kiln's inbox and signed webhooks, deliveries recorded, `kiln/notify@v1`, AC05; outgoing webhooks (per-scope subscriptions to kiln's events, signed, in order, retried, logged before sending, resumed after a restart, redelivered); insights (hourly and daily rollups that merge, percentiles within 1 %, waits by reason, attempts, flaky legs, cache, runner utilization, fair share, critical path, AC01, AC02) with Prometheus metrics; compare (differences in actions, variables, environment, images, machines and cache; changed files; steps side by side; "since the last green run", AC03); log search (a trigram index built as legs finish, filters, one leg's search, failure excerpts, AC06 under 1 ms in 10,000 runs); audit v2 (one row per change with principal, on-behalf-of, token, scope, route, result and address; handlers' notes as its detail; secret uses and integration exchanges; filters by every field; AC04 from the route table); OpenTelemetry export (OTLP traces of runs, legs and steps); a person's own rules (inbox, email; Settings → You); Linear and Jira as channels, `diff.landed` and `test.quarantined` |
-| W20 | Agents: MCP, skills, attachments, experiments | W02, W05 | in progress | one registry for deployments' and CI's operations, checked against the route table; `kiln.ci.*` and tools for runs, legs (exec, rerun step, keep, release), workflows (edits proposed as diffs), caches, artifacts, tests (quarantine proposed as a diff), metrics, runners, pools, images, routing, secrets' names, variables, integrations, environments, insights and diffs; the seven CI skills (author, diagnose, runners, review, migrate, secrets, performance), their programs run as written (AC05); users' tokens over MCP; every operation over HTTP, in the OpenAPI document and as `kiln op`; writes to routing rules, pools and environments that say what they do (R03); agents asking for runs (R07); attachments and incidents, with every wake R08 lists, Attach agent on each page it names, and daily limits on incidents, tokens and runner minutes (R08 to R10); every §4.1 route an operation on every surface, and §4.3's commands (AC01); bisecting a failure; experiments, their options built by agents too, measured by ordinary runs, with intervals, effects, interactions and a recommendation (R11, AC06); agents' own isolation left |
+| W20 | Agents: MCP, skills, attachments, experiments | W02, W05 | in progress | one registry for deployments' and CI's operations, checked against the route table; `kiln.ci.*` and tools for runs, legs (exec, rerun step, keep, release), workflows (edits proposed as diffs), caches, artifacts, tests (quarantine proposed as a diff), metrics, runners, pools, images, routing, secrets' names, variables, integrations, environments, insights and diffs; the seven CI skills (author, diagnose, runners, review, migrate, secrets, performance), their programs run as written (AC05); users' tokens over MCP; every operation over HTTP, in the OpenAPI document and as `kiln op`; writes to routing rules, pools and environments that say what they do (R03); agents asking for runs (R07); attachments and incidents, with every wake R08 lists, Attach agent on each page it names, and daily limits on incidents, tokens and runner minutes (R08 to R10); every §4.1 route an operation on every surface, and §4.3's commands (AC01); bisecting a failure; experiments, their options built by agents too, measured by commands in each variant's own worktree beside the agent that asks (no CI) or by ordinary runs, with intervals, effects, interactions and a recommendation (R11, AC06); agents' own isolation left |
 | W21 | UI | each backend it shows | in progress | the CI API; the run page (attempts, reruns, the graph from the plan with matrix grids, progress and what jobs wait for, critical path, summaries, annotations, artifacts, pins); the leg page (notes, timing bar, attempts, outputs, terminal, Keep); the runs list's facets and sorts; the workflow editor (checks against its repository, the schema's keys, the plan preview and its matrix, the flow view, saving as the repository takes it); Insights (repositories, workflows, runners, tests, benchmarks); Settings → CI, → People, → Tokens and → You; the Runners page's pools (their scaling history), images and executors, and the image builder; comparing runs; log search; environments (board and pages); AC01 in kiln's CI (`ci/ui/run-all.sh`), AC02, AC03 (25–30 ms, 60 fps), AC04, the run's data flow; the editor's Agentfile lints left (shards' own: blocked on shards) |
 | W22 | Conformance, e2e, performance | grows with the rest | in progress | local e2e harness; AC01: the corpus plans (804 plans), 39 of 57 runnable starter workflows green, the other 18 failing the same way on GitHub, every miss explained; AC02: 48 of F-21's 50 green, four of them needing accounts and passing in dry configurations against stand-ins (AWS's two, Google's, Codecov's); azure/login waits for a tenant, and attest-build-provenance for GitHub's Sigstore; AC04 (fault injection: drops, delays, OOM kills, full disks and corrupted uploads, each recovered from as specified); AC07 (the security suite: token scope on every route, secrets in no log, API, event or database file, YAML bombs, SSRF guards, archive traversal); AC06 (the UI suite in kiln's own CI: `ci/ui/run-all.sh` in `.kiln/ci.yaml`'s `ui-checks`); AC08 (`kiln ci bench`, every §1.5 target it measures met, regressions gated in kiln's own CI); AC09 (a runner from before the CI work beside this version's) |
 | W23 | CI providers: KilnCI, GitHub Actions, GitLab CI/CD, Bitbucket Pipelines | W03, W14, deploy-api.md §7 | in progress | the git-host interface (kiln, GitHub, GitLab, Bitbucket); the provider core; GitHub Actions, GitLab CI/CD and Bitbucket Pipelines behind one contract (runs, jobs, logs, rerun, cancel, dispatch, artifacts, approvals, environments, checks, lint, webhooks; AC01); the hosts' pull requests through one API (R06); events for agents; SSO with GitHub, GitLab and Bitbucket, and acting on the host as the person |
 | W24 | Incremental CI: fingerprints, reuse, warm state, shared caches | W04, W05, W06, W08, W13, W18 | ready | specified (2026-10-24): R01–R31, AC01–AC15; milestones M0–M7 and M1e are kiln goals with plans |
 | W26 | Review in Ship: changes as Ship items, each owning its review | W14, W23, W27, Ship (the CI/CD Integration plan) | in progress | R06–R15 built: each item's dropdown owns its review (Files and the Conversation, search on vorpal, kinds and the gate, suggestions and conflicts as revisions, the Review lanes), unsigned until W27-R03; AC06 in Chromium, not yet WebKit; specified (2026-10-25): R01–R20, AC01–AC11; plan `01a175b7d5e1772f8d3c7cb28e50ab2b` |
-| W27 | Attested end to end: identities, signatures, hand-offs, the trail | W10, W18, W26 | in progress | specified (2026-10-25): R01–R12, AC01–AC08; research `01a175c54441773fa28bf1488b82e6aa`; identities built (R01, R02, R12; AC01, AC02): plan `01a17856b1b0712babf8dfd37ce48756` |
+| W27 | Attested end to end: identities, signatures, hand-offs, the trail | W10, W18, W26 | in progress | specified (2026-10-25): R01–R12, AC01–AC08; research `01a175c54441773fa28bf1488b82e6aa`; identities built (R01, R02, R12; AC01, AC02): plan `01a17856b1b0712babf8dfd37ce48756`; hand-offs built (R08; AC05: the 14:18 drop and the twin played again, refused and recorded, and the transfers simulation): plan `01a17856b1b477eda14a574ae312a123` |
 
 ---
 
@@ -602,7 +602,10 @@ type JobEventV2 =
 
 A runner without `CAP_CI2` keeps getting `Assign` (v1) for v1-shaped kiln jobs, so a fleet can be
 upgraded one machine at a time. A leg that needs `CAP_CI2` is never routed to such a runner; its
-wait reason says so (W05).
+wait reason says so (W05). A v1 job is written for what its runner says it can do, so it goes to no
+runner that hasn't said yet (its `Build`, sent as it connects, a pod's aside): one written before,
+its capabilities reading none, reached a runner of today's build out of step and was read with no
+steps, passing without running (W05-R22).
 
 ### 2.6 Server endpoints
 
@@ -1764,7 +1767,10 @@ scans agents) with an event-driven state machine in `kiln_ci::sched`, driven by
 - **W05-R16 Defaults.** Without a policy: `runner-lost` is retried once on a different runner
   when one can take it, else on the same one (today's requeue, kept, and shown as "retried:
   runner X was lost"); nothing else is retried. A policy's `runner: different` waits for another
-  runner, and says so (`other-runner`).
+  runner, and says so (`other-runner`). A leg its runner refuses (an assignment that couldn't
+  reach it counts as refused) goes to another runner that can take it, on the same attempt; with
+  none, it's offered to the one that refused it again 15 s later, as v1 offers a declined job
+  again, and says so (`retry`).
 - **W05-R17 Reruns**, GitHub-exact: re-run all jobs, re-run failed jobs (and the jobs that need
   them), re-run one job (and its dependents), optionally with debug logging. A rerun is a new run
   attempt (`github.run_attempt`); automatic leg retries are attempts of the leg
@@ -3976,6 +3982,9 @@ support (G-11, G-18, G-25, G-27, G-28).
   (memory its limit too), else the pool's; with the cache claim, v1's cache variables
   (`CARGO_HOME`, `npm_config_cache`, `UV_CACHE_DIR`, `GOMODCACHE`, `GOCACHE`,
   `BUN_INSTALL_CACHE_DIR` under `/cache`); and v1's deadline. The pool's other legs keep its pods.
+  Each pod prefers a worker node (one without the `node-role.kubernetes.io/control-plane` label);
+  with `[kubernetes] workers_only = true` it goes only to one, so a cluster's control plane keeps
+  its room for etcd and the API server, whose use runs past what they ask for.
 - **W13-R08 Job containers and services**, GitHub-exact (G-27): `container` and `services` with
   `image`, `credentials`, `env`, `ports`, `volumes`, `options`; services reachable by their ids
   from a job container, or on `localhost` with mapped ports from a job on the host; health checks
@@ -4230,6 +4239,15 @@ enforcement points to W18, agent isolation to W20.
     handles rare in tests. *Left*: the container's overlay makes no file handles, so fanotify's
     watchers fail in it (TypeScript's `fswatch` tests, 126 of them, corpus pass 1024b) where a
     hosted runner's ext4 has them; a microVM leg (W13-R05) has an ext4 of its own;
+  - a leg given the host's Docker socket gets the capabilities profilers run with in its
+    container, SYS_ADMIN, BPF, PERFMON, DAC_READ_SEARCH and SYS_RESOURCE (`--cap-add`), as a
+    hosted runner's root has them (2026-10-25): a binary holding them as file capabilities can't
+    start where the container's bounding set lacks them (capabilities(7)), and CodSpeed's
+    memtrack (ruff's instrumented benchmarks, corpus pass 1025c) failed to spawn. Such a leg could
+    start any container anyway, as its seccomp is lifted for. *Left*: the rest of a root's
+    (SYS_MODULE, SYS_TIME, SYS_BOOT and the like would reach the host's kernel and clock); a leg
+    without the socket keeps Docker's defaults (`w13_r04_a_socket_legs_container_holds_a_profilers_capabilities`,
+    `w13_r04_a_profilers_binary_starts_with_the_capabilities`);
   - `/opt` is open to all, as GitHub's images leave it (`chmod -R 777 /opt`): steps make their own
     directories there without sudo (neovim's `old-cmake` job);
   - the runner user's `~/.cargo/bin`, `~/.config/composer/vendor/bin` and `~/.dotnet/tools` are
@@ -6435,9 +6453,11 @@ mode in QuickJS, a tool per operation, skills) from deployments to all of CI, an
   - decisions (bring results back, or pick automatically);
   - budgets.
 
-  Two things change. Measurement is ordinary CI: each variant's runs are workflow runs on routed
-  runners, so benchmarks land on exclusive hardware by routing rules. Isolation options now include
-  `firecracker` and `shards` (built from an Agentfile that declares the agent and its grants).
+  Two things change. Experiments don't need CI: a command runs in each variant's own worktree on
+  the machine of the agent that asks, and only a pipeline (or a command given `runs-on`) is a CI
+  run, on routed runners, so a benchmark can land on exclusive hardware by routing rules. Isolation
+  options now include `firecracker` and `shards` (built from an Agentfile that declares the agent
+  and its grants).
 
 **Acceptance criteria**
 
@@ -6516,6 +6536,10 @@ R04, R05's skills, and R06's rights.
   once as that route's would be), in the OpenAPI document (`/api/ops/{name}`, each with its
   summary and schema), and as `kiln op` (the list, `--schema`, and a run with a JSON object or
   `key=value` pairs). Checked end to end (`w20_r01_operations_over_http_and_the_cli`).
+- *R01's* input schemas are generated (docs/agents.md, "Operations"): each operation takes a Rust
+  input type (`crate::ops::Input`), whose JSON Schema is what every surface publishes, and a call's
+  input is read as it once its caller may run it. An argument it doesn't take, or one of the wrong
+  type, is refused saying where and why (`mcp::tests::every_operation_is_typed`).
 - *AC05* (`tests/skills.rs`): the skills' programs run as written. The test takes each program
   from its `SKILL.md` and calls `code_run` with it over MCP, against a server with a repository,
   a failing run, a leg no runner can take, a diff and a secret:
@@ -6661,16 +6685,24 @@ R04, R05's skills, and R06's rights.
     applies each option's change, resolves the conflicts and submits the combination as a diff
     (the variant's glue commit), and the variant is measured once it's made. Without one, or
     when it can't, the variant isn't measured; nor is one with an option an agent didn't make.
-  - **Measuring** is ordinary CI on routed runners:
-    - a `pipeline` criterion runs its workflow at the variant's commit, its triggers' filters
-      aside;
-    - a `command` criterion runs a one-job workflow, on a commit made on the variant's for it, on
-      its `runs-on`;
-    - a `metric` is read from those runs' `$KILN_METRICS`.
+  - **Measuring** needs no CI (the person's call, 2026-10-31):
+    - a `command` criterion runs in the variant's own worktree on the machine of the agent that
+      asks (`crate::workspace::measure`, asked through that agent's runner): the base with the
+      variant's change committed, made once for each variant under kiln's data folder there and
+      kept for its rounds, then removed with the experiment. The command runs as `kiln run` runs
+      one there (the person's login environment, bash, what it leaves running ended with it), and
+      passes when it exits 0; one that doesn't says why with what it printed last;
+    - a `pipeline` criterion, or a `command` given `runs-on`, is a CI run on routed runners: a
+      pipeline's workflow at the variant's commit, its triggers' filters aside; a command's
+      one-job workflow on a commit made on the variant's for it. Only these need CI's engine:
+      with it off, the experiment is refused, saying so;
+    - a `metric` is read from what they write to `$KILN_METRICS`, a JSON line each
+      (`{"name": "p95_ms", "value": 12.3}`).
 
     Repetitions are interleaved: each round runs every variant once, in a shuffled order (seeded
-    by the experiment), `max_parallel` at once. A `budget_minutes` that runs out cancels what
-    runs and reports what was measured, as a cancel does. Each variant counts its runner
+    by the experiment), `max_parallel` at once. A time limit (`budget_seconds`, set in any unit
+    from seconds to years; or `budget_minutes`) that runs out cancels what runs and reports what
+    was measured, as a cancel does. Each variant counts its runner
     minutes. Its runs are trusted as the owner's are, and anyone else's as a fork's.
   - **Results**:
     - each variant's required checks (passes of repetitions), and each metric's median and its
@@ -6684,13 +6716,22 @@ R04, R05's skills, and R06's rights.
     `experiments.decide` chooses one. The asking agent is told the variant's commit and ref,
     which it fetches by its commit from kiln's git.
   - **From a question**: an agent's multiple-choice question offers "Experiment…" beside its
-    answers (the choices dialog's experiment form: options, strategy, isolation, criteria and
-    thresholds, repetitions, a budget, who decides). Its pipelines are the workflows of the
-    repository the agent's folder is a checkout of (`GET /api/experiments/where?agent=`). The
-    options become options for agents to implement, and the question is answered "running
-    experiment E12"; the results come as the agent's next message. Started from an agent
-    without a `repo`, the experiment is in that repository; a command criterion without
-    `runs-on` runs on the agent's machine.
+    answers (the choices dialog's experiment form: options, strategy, isolation, its checks and
+    its metrics with their thresholds, repetitions, a budget, who decides). A check is a command,
+    or, while CI's engine is on, one of the workflows of the repository the agent's folder is a
+    checkout of (`GET /api/experiments/where?agent=`, which also names the machine the checks
+    run on, and what the agent suggested). A metric is lower or higher being better, with no
+    threshold, one to stay within (at most, or at least), or a % better than the baseline; one
+    with a threshold may be required to meet it, and one without is only compared. The form is
+    the experiment at a glance, a line for each part (its variants, checks, metrics, runs, and
+    what happens when it's done) saying what it's set to; each opens a page of its own to change
+    it, and Start is on the glance, so starting as the agent suggested is one tap. A time limit
+    is in any unit from seconds to years. The form starts with what the agent suggested for its
+    question (`experiments.suggest`, one of every agent's tools: the commands its options' variants
+    run, the metrics they write and their thresholds). The options become options for agents to
+    implement, and the question is answered "running experiment E12"; the results come as the
+    agent's next message. Started from an agent without a `repo`, the experiment is in that
+    repository.
   - **Its page**: every variant with its checks and its metrics' intervals on one scale (a dot and
     whiskers against the baseline's line, said in words beside them), the effects and
     interactions, its runs by variant, "Continue with this" on each once it's done, and Cancel.
@@ -6703,6 +6744,12 @@ R04, R05's skills, and R06's rights.
   a variant records its commit. A second experiment's conflicting options make a variant said
   to conflict, and cancelling it stops it. The analysis is checked on its own too
   (`w20_r11_measurements_say_what_helps_and_what_fights`, `w20_r11_strategies_make_their_variants`).
+  Without CI (`w20_r11_measured_beside_the_agent_without_ci`): CI's engine off, the same options and
+  bench, the bench a command run beside an agent on a runner, give the same results, every run on
+  that agent's machine and none a CI run, and the worktrees go when it's done; a pipeline is
+  refused. A variant's worktree, its rounds and its end are checked on their own
+  (`w20_r11_a_variant_is_measured_in_its_own_worktree`), and the form in the browser
+  (`ui/e2e/experiment-setup.spec.ts`).
 - *AC02*, against a local server (`tests/code_mode.rs`, `w20_ac02_one_program_over_the_last_hundred_runs`):
   a hundred runs of a workflow with two jobs failing each its own way (a plain failure, a full
   disk). One `code_run` program pages through the runs and reads the failed ones' legs, then each
@@ -8462,10 +8509,11 @@ a time. The design was agreed on a live mock built on Ship's own prototype
 - **W26-R01 Changes in Ship, by commit.** Ship's unit stays the commit (or tag). A stacked diff is
   one commit, its row carrying the diff's review; a branch pull request (kiln's change requests and
   hosts' pull requests, W23-R06) is its commits, its head commit's row carrying the request's review
-  and its other commits folded under it. A new revision's commit supersedes the one it replaces, as
-  Ship's rows already do, and after it lands the commit carries on. Rows, glyphs, stand words,
-  author lines and paired actions are Ship's, with nothing special-cased; Ship's per-commit read
-  model grows to review: one read model, not two.
+  and its other commits folded under it (since W26-R29, Ship's rows are repositories, and a change's
+  commits are lines among its repository's commits). A new revision's commit supersedes the one it
+  replaces, as Ship's rows already do, and after it lands the commit carries on. Rows, glyphs, stand
+  words, author lines and paired actions are Ship's, with nothing special-cased; Ship's per-commit
+  read model grows to review: one read model, not two.
 - **W26-R02 Review is the first stage.** Ship's journey strip reads review, land, checks, build,
   staging, production, replant. Review states (needs you, agent fixing, waiting on others,
   conflicts, approved) map onto Ship's stands and its needs-you-first order. Ship's facets gain host
@@ -8565,6 +8613,143 @@ a time. The design was agreed on a live mock built on Ship's own prototype
 - **W26-R20 Hosts.** What each host can do (stacks, queues, updating a stale change, batched reviews,
   merging) is a seam in `crates/kiln-seams`, with a simulator per host and a conformance suite, kept
   within the hosts' rate limits (webhooks, and polling with ETags).
+- **W26-R21 Any set of jobs.** Any set of a run's jobs runs again or stops, on either engine, passed
+  jobs included:
+  - Retrying a set gives each its next attempt, and the jobs that need it run again after it.
+  - Cancelling a set stops each job that hasn't finished. The jobs that need it are skipped as
+    "dependency cancelled", and the run's other jobs go on.
+  - Each job named answers what became of it, or why not: it hasn't finished, it already finished,
+    it isn't the run's.
+  - `POST /api/runs/:id/retry` and `/cancel` take `jobs`, and so does the engine's
+    `/api/ci/runs/:id/cancel`; the engine's `/rerun` takes `{ mode: "set", jobs }`. Without `jobs`,
+    each does what it did.
+  - On the engine, a set's rerun is one new attempt of a finished run, `kiln_ci::plan::rerun`'s
+    `Mode::Set`. Legs cancelled one by one go through the plan (`on_cancel_legs`), logged, so a
+    restart replays them.
+  - A run another provider keeps (GitHub Actions, GitLab CI, Bitbucket Pipelines) is that
+    provider's: kiln holds only its record, so no set of its jobs runs again, stops, pauses or
+    resumes here. Each job named answers "GitHub Actions runs it, not kiln" (or its provider's
+    name), nothing changes, and Ship's commit offers none of those verbs for them, saying the same.
+- **W26-R22 Pause and Resume.** Any set of a run's jobs pauses where it stands and resumes from
+  there, on either engine. `POST /api/runs/:id/pause` and `/resume` take `{ jobs }`, under
+  `runs.pause`, and each job named answers what became of it, or why not.
+  - A running job is frozen where it runs, keeping its runner and its slot. On Linux its steps are
+    in a cgroup of the job's own (`kiln-jobs-<pid>/<job>` under the runner's), joined before they
+    run anything, and that's frozen (`cgroup.freeze`), whatever they started. Elsewhere on Unix,
+    and on Linux without a cgroup v2 the runner may write, its steps' process groups are stopped
+    (SIGSTOP). On Windows each of its steps is in a job object of its own, put in it before it ran
+    anything (created suspended), so whatever it starts is there however that's parented, and a
+    step on a pty (which ConPTY starts outside any job) is followed by its process tree: every one
+    of their processes is suspended where it is (`NtSuspendProcess`), listed again until none is
+    new, and exactly those are let go on (`NtResumeProcess`). A step that starts while its job is
+    frozen is frozen as it starts. Its job container is paused (`docker pause`). Resume undoes each.
+  - The runner is asked with `ServerMsg::Freeze` (appended last), only a runner that says it can
+    (`CAP_FREEZE`, bit 53: Unix and Windows). Its answer comes once it's done, or why not. Pausing
+    a job on any other runner (a kiln from before Pause came to its platform) is refused saying so,
+    and nothing is sent.
+  - Its time limits stop while it's paused: the job's and a step's on the runner, and v1's
+    `timeout_minutes` on the server, which leaves out the paused while (`paused_at`, `paused_ms`).
+  - A waiting job paused isn't dispatched until it's resumed: v1's queue skips it; the engine's
+    scheduler holds the leg (`Input::LegPaused`, waiting `paused`), its place in the queue kept,
+    and a restart brings it back paused.
+  - Nothing resumes a job by itself, but cancelling: a cancelled job is let go on first, so it
+    hears it's to end. A runner process that starts lets go of what runner processes before it
+    left frozen as they ended, as a dead runner's jobs always ran on.
+  - A job that has ended can't be paused, and one that isn't paused can't be resumed: each says so.
+    Pausing a paused job changes nothing.
+  - Ship acts on a commit's jobs through one endpoint, across its runs and either engine's:
+    `POST /api/ship/jobs { repo, sha, verb, jobs?, scope? }`, `verb` one of retry, pause, resume
+    and cancel, the jobs named or those `scope` picks (failed, running, waiting, all). Each run gets
+    its own call underneath, as the caller, who needs the verb's right on the repository
+    (`runs.rerun`, `runs.pause`, `runs.cancel`), and each job answers. The commit's detail lists
+    its `jobs`: each one's id, run, pipeline and name, runner, `paused_at`, the `verbs` that apply
+    now and why each other doesn't (`why_not`), Pause where its runner can't freeze it included.
+- **W26-R23 The jobs pane.** An opened commit's Output and Jobs are one pane, as Ada approved it
+  (2026-10-30). Flat throughout: no box round any of it, hairlines between.
+  - A strip on top says what's picked and what each action would do: Retry, Pause (Resume when
+    what's picked is paused) and Cancel, one width each, dimmed where they don't apply and never
+    hidden. The words "failed · running · waiting · all" pick those jobs. Cancel asks again in the
+    strip (Keep, Cancel them), and what an action did, or why it couldn't, is said there.
+  - Under it, the jobs by stage, no buttons on a line: a line picks its job alone, its glyph adds it
+    to the pick or takes it out. The picked line is a square tint, the one shown with a straight
+    2px edge. A paused job says "paused".
+  - The picked job's output is beside the list on a desktop, and under its line on a phone, where
+    the strip comes again.
+  - Each action goes to `POST /api/ship/jobs`: a word's jobs as its `scope`, a pick's as its
+    `jobs`, those the action applies to.
+  - Its heights are held: nothing moves as jobs are picked, acted on and go on, and nothing scrolls
+    sideways from 320 px up.
+- **W26-R24 Deploys in Ship.** Ship's Deploys lists every app KilnCD holds as Ship's rows, by
+  project (the repository its deploy file is in or its manifests come from), what needs someone
+  first (a rollout waiting on a person, then what failed, then what went back, then what's out of
+  sync for a person to sync): each app's stand, word and line; the pips of its latest deploy (Sync, Health, Soak: healthy
+  for ten minutes after its sync, or the guard's word); who did it and when; where it deploys and
+  what runs (`GET /api/ship/deploys`). Where it stands is `kiln_cd::stands`'s to say, the first that
+  holds: Argo CD's; can't read, render or compare; syncing; its rollout waits for a person, or rolls
+  out; rolled back; its latest deploy failed; degraded or missing; out of sync (a person's to sync,
+  unless auto-sync syncs it); progressing or suspended; comparing; soaking; synced. The list is held
+  in memory as Ship's commits are, and gathered again once CD says something it reads changed (its
+  `cd_apps`, `cd_rollout` and `cd_app_deleted` events, its store's changes) or Ship acted.
+  - An opened app (`GET /api/ship/deploys/:app`) has the jobs pane's anatomy: its components, each
+    workload a group (its pods with their node, container, uptime and restarts, its ReplicaSets)
+    and then the rest by what they are (network, config, storage, jobs, access), live from its
+    cluster or else what KilnCD holds; a rollout's steps, its strategy, the deploy it rolls out and
+    the one it goes back to, and its traffic between them (on a cluster, its two ReplicaSets and
+    their pods); a sync under way named by the deploy it will be and the wave it's at; its settings (auto-sync and auto-rollback, a
+    person's to set; prune and self-heal, its deploy file's); its history, its source's newest commits each as the
+    deploy that ran it or one a rollback can go to, then older deploys; and why each verb can't
+    apply, where one can't.
+  - The strip's verbs go to `POST /api/ship/deploys { app, verb, … }`, each its CD operation (sync,
+    of the picked objects when some are picked; refresh and hard refresh; roll back to a deploy or
+    any commit; stop; follow git again; promote, abort, approve and deny a rollout; auto-sync and
+    auto-rollback; delete, with its objects or leaving them), as that operation's route would let
+    the caller, and audited in the request's one row. Deleting an app something else declares (its
+    repository's `.kiln/deploy.yaml`, an app that renders it) is refused, as it would come back.
+  - Ship's tabs are Commits and Deploys: the runs' list and the apps' list are gone from it (/runs
+    lands on Ship, /deployments on Deploys; a run's and an app's pages keep their addresses). Deploys
+    draws them as Ada's approved stills do (v5, v6): apps as Ship's rows by project, the stand word,
+    the edge, the pips, no buttons; an opened app the jobs pane's anatomy. Its strip has Sync (what's
+    picked of what differs), Refresh (asking Refresh or Hard refresh), Roll back and Stop; Promote and
+    Abort while a rollout runs; a setting's change when one is picked; Delete when the Settings
+    group's last line is. Roll back, Stop, Abort and Delete ask again. Under it are its objects by
+    owner, its rollout, its history and its settings. The picked
+    one's detail is beside them, or under its line on a phone with the strip again: an object's Logs
+    (the commits' Output, its LogViewer following CD's log), Events and Manifest, or its Diff; a
+    commit, where it sits among the deploys and what syncing it would change against what runs
+    (`cd.plans.get`). Flat, every height held.
+- **W26-R25 Roll back to any commit.** A deploy can go back to any commit of its app's sources, not
+  only one it deployed: rendered with that source at the commit and the others at their heads,
+  synced as a rollback, recorded as a deployment, and held there until trunk changes what the app
+  renders (cd.md, "Any commit"). Its rollback targets list main's newest commits beside the
+  deployments, each naming the deployment that ran it and the one whose render it matches.
+- **W26-R26 Logs beyond pods.** A deploy's logs read in the same API and stream as a pod's, for
+  what kiln's runners run too: a Compose project's containers (`docker compose logs`, one service's
+  or all; previous, its newest container that exited) and a host's service (its user unit's journal
+  on Linux; on macOS the files its launch agent now writes its stdout and stderr to). Each takes the
+  last lines, since when, and following. kiln reads them on each host the object was made on, by the
+  runner there, in a terminal of its own nobody's list shows, each line naming its host where a
+  pod's names its pod. A Windows service's logs, and the clouds', come later.
+- **W26-R27 Auto-sync from the UI.** A person turns an app's auto-sync on or off from Ship
+  (`cd.apps.set_auto_sync`), kept in the store's settings and audited, as auto-rollback is. It beats
+  the deploy file until the file changes what it says (cd.md, "Auto-sync"). Prune keeps its own
+  knob; deleting an app is as before.
+- **W26-R29 Repositories as Ship's rows.** Ada, 2026-11-01: "each item maps to a repo, and commits
+  are browsable from within there".
+  - Each of Ship's rows is a repository, showing its newest commit: its stand and line, its journey,
+    who and when, and its actions (`GET /api/ship/commits?by=repo`). While the list holds still (a
+    row open, the pointer on it), a row keeps the commit it shows: a newer one waits for the
+    release, as a new row does.
+  - Opened, its first section is the repository's commits, newest first, a page at a time (5, 10,
+    25, 50 or 100; ten by default), with Newer and Older, narrowed by the host and kind the list is
+    narrowed by. Each line has its checks' glyph, sha, message (cut), author, the machines its jobs
+    ran on, how long they ran (first start to last end: `ran`, open while one runs) and when; two
+    lines on a phone.
+  - Picking a line fills the sections below with its commit: Files with the Conversation, Jobs and
+    Lanes. A divider separates the commits from Files. The commit picked stays picked as newer ones
+    arrive (the row shows the newest); the row's Review picks the newest again.
+  - Paging moves the list only: the page before stays until the next is in, and the list holds a
+    page's height, so nothing beside it moves. A page keeps the commits it shows: one that arrives
+    meanwhile waits behind Newer.
 
 **Hosts.** Theirs where a host has it, kiln's where it doesn't (R20's seam says which, per
 repository):
@@ -8609,6 +8794,84 @@ repository):
 - **W26-AC11 Both kinds.** A branch pull request and a stack of three diffs each go from first
   push to landed: the stack's commits land in stack order, each reviewed on its own; the branch's
   commits land together under its review. *Integration test on real git.*
+- **W26-AC12 Any set of jobs.** On both engines, over HTTP: a set cancelled stops those jobs, skips
+  what needs them as "dependency cancelled" and lets the rest go on. Run again, the same set's jobs
+  take their next attempts with what needs them. What can't be done says why, and without `jobs`
+  nothing changes.
+  *`tests/job_sets.rs` `w26_r21_any_set_of_a_runs_jobs_run_again_or_stopped_on_both_engines`;
+  store `w26_r21_a_set_of_jobs_retried_together` and `w26_r21_a_set_of_jobs_cancelled_the_run_going_on`;
+  `kiln-ci` `w26_r21_a_set_runs_again_each_and_what_needs_it` and
+  `w26_r21_cancelling_some_legs_stops_them_and_skips_what_needs_them_the_rest_go_on`.*
+- **W26-AC13 Pause and Resume.** On a runner of the server's own, a v1 job and an engine leg each
+  running, paused: each reads paused, its processes are frozen (`cgroup.freeze` 1) and nothing of it
+  moves. Resumed, each runs on and finishes, the leg after more than its step's 15 s all told,
+  paused 12 of them. A job paused while it waited isn't dispatched once its need is met, until it's
+  resumed. A runner that can't freeze is sent nothing, and the pause says why.
+  *`tests/pause.rs` `w26_r22_a_running_job_paused_is_frozen_in_place_and_goes_on_when_resumed`;
+  `runner::freeze` `w26_r22_*` (a cgroup, process groups, a Docker container); store
+  `w26_r22_a_paused_job_waits_and_its_paused_time_is_kept`; hub `w26_r22_an_old_runner_gets_no_freeze`;
+  `kiln-ci` `w26_r22_a_paused_leg_waits_until_it_is_resumed`; proto
+  `w26_r22_freeze_is_appended_after_every_older_variant`; contain
+  `w26_r22_a_job_left_frozen_by_an_ended_runner_goes_on`.*
+- **W26-AC19 The Deploys tab.** In Chromium and WebKit, at a desktop's width and a phone's: Ship's tabs
+  are Commits and Deploys, /runs landing on Ship and /deployments on Deploys; the apps by project,
+  needs-you first, with no buttons; an opened app as approved (the strip, its objects by owner, its
+  rollout, history and settings, the picked one's detail beside them or under its line with the strip
+  again); each action reaching `POST /api/ship/deploys` with its body (Sync with what's picked of
+  what differs, Refresh and Hard refresh, Roll back to a deploy or any commit, Stop, Promote, Abort,
+  a setting, Delete leaving its objects), Refresh, Roll back, Stop, Abort and Delete asking again and
+  Keep sending nothing, Delete dimmed where a deploy file declares the app, a refusal's why in the
+  strip; no layout shift through picking, acting and CD's events; nothing sideways at
+  320, 390 and 1280. *`ui/e2e/ship-deploys.spec.ts`; `ui/e2e/ship-routes.spec.ts`; every Ship e2e.*
+- **W26-AC20 Repositories as rows.** Over the store and from memory alike, Ship's rows are each
+  repository's newest commit, newest first, through every facet and as each viewer. A commit says
+  when its jobs ran (open while one runs) and on which machines, in the order they started. In
+  Chromium and WebKit, at a desktop's width and a phone's:
+  - an opened repository's commits page 5, 10, 25, 50 and 100 at a time, Newer and Older off at
+    either end;
+  - picking a commit puts its own Files, Jobs and Lanes below the divider;
+  - the list keeps its height as it pages, and nothing scrolls sideways at 320, 390 and 1280.
+
+  *`ship::tests::w26_r29_*`, `ship_memory_is_what_the_store_says_through_random_changes`;
+  `ui/e2e/ship-repos.spec.ts`; every Ship e2e.*
+- **W26-AC18 Deploys in Ship.** On a server with KilnCD, apps of two repositories list under them
+  as CD holds each (sync, health, auto-sync, environment), and an app's pane has its settings and
+  its source's commits; each verb reaches its operation: done and audited as a maintainer's, the
+  operation's own refusal said, refused for a viewer, an agent held to what its environment lets
+  agents do; an app deleted, its objects left, gone from the list. Apps the engine leaves on the simulated cluster stand as defined (soaking then
+  synced, waiting for a person, behind git, rolled back, failed). Over a scratch hub with a KilnCD
+  of its own holding what the simulated cluster's engine left, its store's history, pin and rollout
+  and its mirrors, Ship's list, panes and verbs read and do as defined for two projects: an app out
+  of sync and trunk ahead of it, one synced, one whose rollout waits for an approval, one rolled
+  back; the list held until CD's `cd_apps` and `cd_rollout` events say what changed. *`tests/ship_deploys.rs`
+  `w26_r24_ship_lists_cds_apps_by_project_and_each_verb_reaches_its_operation_as_the_caller`;
+  `ship::deploys`
+  `w26_r24_over_a_scratch_hub_with_the_simulated_cluster_ship_reads_what_cd_holds_and_acts_through_its_ops`
+  and `w26_r24_*`; `kiln-cd` `w26_r24_apps_stand_as_the_engine_leaves_them` (the simulated
+  cluster) and `stands` `w26_r24_*`.*
+- **W26-AC17 Logs beyond pods.** On this machine's Docker, a Compose project's log reads its last
+  lines in order with their times, follows as lines come, and reads a stopped container's as its
+  previous one; each source's command is as asked. *`cd::logs`
+  `w26_r26_a_compose_projects_log_reads_follows_and_reads_a_stopped_containers` and
+  `w26_r26_a_terminals_bytes_read_as_plain_lines`; `kiln-cd`
+  `w26_r26_each_source_reads_its_log_as_asked`.*
+- **W26-AC16 Auto-sync from the UI.** An app whose deploy file leaves auto-sync off syncs once a
+  person turns it on, and stops when they turn it off; once the file changes its word, the file's
+  stands. *`kiln-cd` `w26_r27_a_persons_auto_sync_beats_the_file_until_the_file_changes` and
+  `w26_r27_auto_sync_set_for_an_app_starts_and_stops_its_syncs` (the simulated cluster).*
+- **W26-AC15 Roll back to any commit.** A commit no deployment ran is rendered, synced and recorded
+  as a deployment; a revision resolves to a deployment first, else to a commit or a tag's commit git
+  has in a source; a commit that renders what a deployment rendered names it. *`kiln-cd`
+  `w26_r25_a_rollback_goes_to_any_commit_and_names_the_render_it_matches`,
+  `w26_r25_a_rollback_to_a_commit_never_deployed_renders_syncs_and_records_it` (the simulated
+  cluster), `w26_r25_a_log_lists_a_revisions_newest_commits`; server
+  `w26_r25_a_rollback_goes_to_a_deployment_or_any_commit_git_has`.*
+- **W26-AC14 The jobs pane.** In Chromium and WebKit, at a desktop's width and a phone's: the pane
+  as approved (the strip, the jobs by stage, the output beside them or under the line with the strip
+  again), a line and its glyph picking, each word and each action reaching `POST /api/ship/jobs`
+  with what's picked (a word's scope, a pick's jobs), Cancel asking again and Keep sending nothing,
+  a refusal's why in the strip; no layout shift through picking, acting and 30 s of updates; nothing
+  sideways at 320, 390 and 1280. *`ui/e2e/ship-jobs-pane.spec.ts`; every Ship e2e.*
 
 **Progress.** In progress. R06 to R15, each Ship item's dropdown owning its review, are built
 (Review plan step 3, kiln plan `01a17856b1aa77df93c0ef014cda0a71`, with the CI/CD Integration
@@ -8825,10 +9088,13 @@ research `01a17947fdad71e5a4f15866e3541c41`.
 - *Keys stay put.* Every kind is issued from a CSR only (`Pki::issue_identity`). A runner process
   makes keys in its own memory for itself, for each agent session it holds at each epoch, and for
   each leg it runs, and asks for their certificates over its channel (`AgentMsg::Identity`,
-  `ServerMsg::Identity`, `CAP_IDENTITY`; docs/wire.md). The server's and CD's keys are made in
-  `<data>/pki`, each in its own 0600 file (`server-signing.key`, `cd-signing.key`), apart from the
+  `ServerMsg::Identity`, `CAP_IDENTITY`; docs/wire.md). An ephemeral runner (a `k8s` pool's pod, a
+  v1 job's) does too, enrolled by kiln (`…/person/kiln/machine/<pod>/…`), so its one leg signs as
+  the leg (`w27_r01_an_ephemeral_runner_and_its_leg_have_identities`). The server's and CD's keys
+  are made in `<data>/pki`, each in its own 0600 file (`server-signing.key`, `cd-signing.key`), apart from the
   TLS leaf, and certified for 90 days (`kiln://<org>/server`; CD's `kiln://<org>/server/cd`, acting
-  for the server). The server looks at them as it starts, every 6 hours while it runs and after any
+  for the server). They sign with `identities::sign_own` (ECDSA P-256, the certificate as DER),
+  which reads the key from its file each time, so the hub keeps no copy. The server looks at them as it starts, every 6 hours while it runs and after any
   revocation: one with less than 30 days left is renewed, and one revoked is replaced at once, a new
   key and a certificate for it (a revocation takes the certificate's key with it). Test:
   `w27_r01_server_and_cd` (each verifies to kiln's root, as the server and as CD for the server;
@@ -8896,17 +9162,632 @@ research `01a17947fdad71e5a4f15866e3541c41`.
   body or DER); the migration's `w27_r01_identities_and_revocations_tables`; `identities.rs`'s
   `w27_r02_*`; `ci::signing`'s `w27_r12_*` (keyless signing through the simulator verifies; kiln's
   client passes the Sigstore suite).
-- *Not yet.* kiln's Sigstore client hasn't run the suite against a real Fulcio and Rekor; nothing
-  signs with these identities yet (commits, reviews, CI output, lands and deploys: R03 to R11); the
-  CLI signs in with a passkey only through a personal access token (no approving a device from the
-  browser yet).
+- *Not yet.* kiln's Sigstore clients haven't run the suite against a real Fulcio and Rekor; deploys
+  don't sign with these identities yet (Ship's plan; commits, verdicts and comments, a leg's
+  results and provenance, and lands do: the *Built* entries below); the CLI signs in with a passkey
+  only through a personal access token (no approving a device from the browser yet).
+
+**Built: signatures (R03: commits, pushes and what hosts verified; AC03).** Plan
+`01a17856b1b273268adf6ce8c4f78410`, research `01a18abcef987683938692b8832c1831`.
+
+- *A signed statement.* `kiln_ci::identity::statement`, the record every signature here takes: a
+  DSSE envelope (payload type, payload, one signature over its PAE) in a Sigstore bundle with the
+  signer's certificate; its digest SHA-256 over the PAE, so a reference doesn't depend on its
+  signatures. It's checked at the time kiln took it, never a time the signer claims; it names its
+  subjects by digest, the statements it follows, its number on its signer's stream (`gaps` names
+  each one missing and each number used twice) and the delegation it acts `under`, walked through
+  kiln's records back to one under none (`verify_under`).
+- *Commits.* A commit's signature is git's x509 kind: CMS SignedData (RFC 5652) in its `gpgsig`
+  header, armored as gpgsm armors it, over the commit without its signature headers, signed
+  attributes and ECDSA P-256 with the signer's certificate in it (`kiln_ci::identity::gitsig`;
+  stock git with gpgsm reads it as a good signature). It's checked against kiln's root at the time
+  kiln took the commit. git signs through `kiln-git-sign`, kiln's binary by that name, which
+  speaks gpgsm's interface (`--status-fd=2 -bsau <key>`), as `gpg.format=x509`,
+  `gpg.x509.program`, `user.signingkey` and `commit.gpgsign` say; each kiln keeps its own link to
+  it, under `<state>/kiln/git-sign/`. It signs where the key is:
+  - a person's commit with `kiln login`'s key on their device (`kiln clone` sets the repository's
+    git so);
+  - an agent's as the agent, for its person: the program asks the runner holding the session's key
+    over its socket, which tells the session by the asking process's group of processes or its
+    ancestry alone, never by `KILN_AGENT`, which any process can set (one outside the session gets
+    nothing). The runner sets the session's git through `GIT_CONFIG_COUNT`, `GIT_CONFIG_KEY_<n>`
+    and `GIT_CONFIG_VALUE_<n>`, after any the session inherited, so the person's own configuration
+    and key are never used. What the runner commits of the agent's work itself (its change request,
+    a plan step's commit, a restack) it signs as the agent with the same key (never with the key
+    the person's git names: the server's own sessions, whose keys it doesn't hold, stay unsigned);
+  - kiln's own as the server (`identities::sign_own`): revisions (suggestions applied, conflicts
+    resolved) and the land queue's commits and restacks (`[ci.land_signing]`'s key file, when
+    given, signs those instead); CD's as CD. A commit kiln can't sign is kept unsigned, with a
+    warning.
+- *Pushes.* An agent's push to kiln goes as the agent. Where the server gives agents a credential
+  of their own (`CAP_AGENT_GIT`), the runner sets each session's git to take its credential for
+  kiln's server from `kiln-git-sign credential` alone, at the URL the runner reaches the server at
+  and at those `/api/me` names (its public URL, its front doors), an empty helper first dropping
+  every one the person's configuration names there. Asked, the runner tells the session as it does
+  for signing and asks the server for the agent's own token (`agents.credential`, which only that
+  very session is given): `agent:<session>` for its person, for a day, to fetch, push and submit
+  (`git.read`, `diffs.submit`, `diffs.land`; an agent kiln started for an attachment, its
+  capabilities), and never more than its person may. The runner keeps it until an hour before it
+  ends and hands it only to the session's own processes; kiln refusing it, the next ask gets
+  another. Short of it, git stops rather than push as anyone else. kiln's audit names the agent,
+  for its person, as the pusher.
+- *A push's commits checked.* A repository kiln hosts checks each commit a push brings that it
+  hasn't got, once git has the push's objects (quarantined) and before any ref moves: git's
+  `update` hook, for each ref, is kiln's binary (`kiln __git-hook`, set with `core.hooksPath` for
+  that push alone), given what the server knew as the push began in a folder of the push's own
+  (`<data>/pushes/<id>`: its organization, root and revocations, the trunk's `signatures:`,
+  whether the repository requires them, whom an agent pushing acts for, the SSH keys people
+  bound). Each signature is checked as of the push (`kiln_ci::identity::push`): kiln's x509 ones
+  against its root and revocations, SSH ones against the keys people bound. Where signatures are
+  required, a ref is refused when a commit it brings isn't signed, doesn't verify (another root,
+  a revoked signer, another commit's signature), is signed by someone the ref doesn't take, or,
+  pushed by an agent, is signed as the person it acts for; git's report says which commit and why
+  in kiln's words, in place of git's "hook declined" (`! [remote rejected] main (commit 3f2a1c9
+  isn't signed: main takes commits signed by people, agents or kiln of hyper-light)`), the audit
+  records it, and the other refs go on. Where they're not, the push is taken and names each such
+  commit (`kiln: warning: 3f2a1c9 isn't signed (.kiln/review.yaml can require signatures)`). A push
+  that can't be checked is taken nowhere.
+- *Policy.* `.kiln/review.yaml` on the trunk says it: `signatures: {mode: required | warn,
+  signers: [{refs: [<globs>], by: [<who>]}]}`. A rule's refs are branches by name (so a trunk's
+  rule is its review submissions' too) and tags as `tags/<name>`; whom it takes are `people`,
+  `agents`, `kiln` (its server and CD), a person by name, or a person's agents (`ada/agents`); the
+  first rule naming a ref decides, and a ref none names takes anyone of the organization. Without
+  a `mode`, the repository's own decides: a new one requires signatures (the server's
+  `[ci] signatures`, `required` unless it says `warn`, recorded as the repository is made), and
+  one from before warns until its policy says `required` (migration `w27_repo_signatures`).
+- *SSH signers.* A person who signs with SSH binds their key to their identity
+  (`POST /api/me/ssh-signers` `{key}`, its `.pub` line; `GET` lists theirs, `DELETE
+  ?fingerprint=` unbinds one), as a person signed in, never an agent, a job or a peer; a key is
+  bound to one person (migration `w27_ssh_signers`). A commit signed in git's SSH form (OpenSSH's
+  SSHSIG, in git's namespace; Ed25519, ECDSA P-256 or RSA) verifies as the person its key is bound
+  to (`kiln_ci::identity::sshsig`), checked in kiln's own code, so a server needs no `ssh-keygen`;
+  one by a key bound to no one, or unbound, or whose person is disabled, doesn't.
+- *Where the person's key stops.* `identity.key` is a 0600 file of the OS user that agents run as
+  too. kiln's own paths never use it for an agent (its git signs and pushes through its runner),
+  but past them the boundary is the OS's: a separate user, a container or a sandbox.
+- *Tests.* `kiln-ci`'s `identity::statement` (`w27_r03_a_statement_verifies_as_its_signer` for each
+  kind, backdated, changed and malformed ones; `w27_r08_*`) and `identity::gitsig`
+  (`w27_r03_a_commit_verifies_as_its_maker`, `w27_r03_the_gpgsig_header_is_where_git_keeps_it`,
+  `w27_r03_a_changed_or_foreign_commit_signature_is_refused`); `identities.rs`'s
+  `w27_r03_kilns_own_commits_sign_as_kiln` (the server's and CD's commits, made and verified with
+  git); `crates/kiln/tests/identities.rs`: `w27_ac03_a_persons_commit_verifies_as_them` (the key
+  nowhere on the server), `w27_ac03_an_agents_commit_verifies_as_the_agent` (as the agent at its
+  epoch, on its runner, never as its person; its push recorded as the agent's, the person's
+  credential helper never asked); `suggestions.rs` (an applied suggestion's commit verifies as the
+  server) and `deploy_github.rs` (a release's commit verifies as CD); `survivors`'
+  `w27_r03_only_a_sessions_own_process_signs_as_its_agent` (a process outside the session with
+  `KILN_AGENT` set gets no signature); `workspace::git`'s
+  `w27_r03_an_agents_commit_the_runner_makes_is_signed_as_the_agent`; `gitsign`'s `w27_r03_*`.
+  Pushes: `kiln-ci`'s `identity::push` (`w27_r03_*`: required and warn, a revoked or foreign
+  signature, each ref's signers, an agent's push signed as its person, the policy as read) and
+  `identity::sshsig` (`w27_r03_*`: Ed25519 and ECDSA, another commit, namespace or key);
+  `crates/kiln/tests/identities.rs`'s `w27_ac03_an_unsigned_push_is_refused` (a repository from
+  before warns before and after new ones come to require; a new one refuses an unsigned commit,
+  takes sam's, refuses sam's where its policy takes only kim's, and refuses what sam signs once
+  sam is disabled; nothing refused moves) and `w27_r03_a_persons_ssh_key_signs_as_them` (git
+  signing through `ssh-keygen`: a bound key's commit lands, a loose or unbound key's is refused,
+  an agent binds none).
+- *Hosts.* GitHub, GitLab and Bitbucket don't trust kiln's CA, so a commit signed as kiln, an
+  agent or a person through kiln reads "unverified" on them. For a host's pull request, kiln
+  records what the host verified of each commit and marks what it couldn't (step 3's host half),
+  in the forge seam's terms (`verifications`, FORGE-20 in docs/seams.md): verified (and as whom),
+  unverified (and why, in the host's word), unsigned, or unknown. The mirror of pull requests
+  keeps each verdict in `host_verifications` as it reads the pull request: GitHub's
+  `verification` comes on the commits it reads already, at no request more; GitLab is asked of
+  each commit's signature once (`repository/commits/:sha/signature`, its 404 an unsigned
+  commit); Bitbucket verifies none, so each of its commits is kept unknown, saying so. A verdict
+  read again unchanged keeps when kiln first read it. The review page lists them, oldest first,
+  its head last; one kiln hasn't read yet is unknown, saying so. Tests:
+  `w27_r03_kiln_records_what_each_host_verified_of_a_pull_requests_commits` (the mirror against
+  each host's simulator), `w27_r03_githost_reads_a_pull_requests_first_250_commits_in_three_requests`,
+  `w27_r03_githost_asks_gitlab_for_each_commits_signature_once`, and FORGE-20 against each
+  simulator and githost.
+- *Not yet.* A host's pull request isn't judged by `.kiln/review.yaml`'s `signatures:` on what its
+  host verified; the mirror reads a pull request's first 100 commits, so later ones have no
+  verdict. A remote naming kiln's server by another name
+  than those (another host name for it) keeps the person's credential. A job's push (its
+  `GITHUB_TOKEN`) can't sign its commits, so it's refused where signatures are required. Agents
+  the server runs itself hold no key of theirs, so what they commit is unsigned.
+
+**Built: verdicts and comments, signed by whoever gives them (R04, AC04).** Plan
+`01a17856b1b273268adf6ce8c4f78410` step 4.
+
+- *What's signed.* Each verdict and comment is a signed statement (`kiln_ci::identity::verdict`):
+  a verdict's `application/vnd.kiln.review.verdict+json`, a comment's
+  `application/vnd.kiln.review.comment+json`. Its subject is the diff's version it's given on, by
+  its commit and its verbatim patch-id (`git patch-id --verbatim`: context and whitespace kept; the
+  `--stable` one stays for finding changes). A verdict says its action and the SHA-256 of its
+  words; a comment says where it is (its thread, or its file's side and lines) and the SHA-256 of
+  its words and of its suggestion.
+- *Who signs.* kiln says what to sign, as whoever asks (`POST /api/diffs/:id/statement`; `POST
+  /api/comments/:id/statement` for an edit's new words; the `ci.diffs.statement` operation). The
+  giver signs it where their key is and gives it with the verdict or comment as `signed`:
+  - a person in a browser, with a key of the browser's own (WebCrypto's ECDSA P-256, never
+    extractable), made on their first verdict's or comment's click and kept in IndexedDB,
+    certified from its CSR as `kiln login`'s is (`POST /api/me/identity`) and again at half its
+    life; a page that isn't secure can't sign;
+  - a person at the command line, `kiln review`, with `kiln login`'s key;
+  - an agent, through its MCP server (`kiln reach mcp`), which has the runner holding the
+    session's key sign it, as kiln-git-sign has its commits signed (`kiln review` in its session
+    too); never with its person's key.
+- *Taken.* kiln checks a signature as of when it takes it (against its root and the revocations).
+  It must be by whoever gives it (the person signed in, or the agent session for its person), and
+  say what's asked, on the diff's latest version (a comment's, its own). Its envelope is kept beside
+  the verdict or comment (migration `w27_review_signatures`). An edit's new words replace their
+  comment's signature, or, given unsigned, drop it.
+- *Where a verdict holds.* On its own version, and on a later one with its verbatim patch-id (a
+  rebase that only moved the change; a replay's `same_patch`, W26-R16, is that same comparison);
+  never on one that changed the code, a whitespace-only change or one whose surrounding lines
+  changed included, saying why. `GET /api/diffs/:id/verdicts` says where each stands on the latest
+  version: given, carried, not, or unsigned.
+- *Where signatures are required* (its trunk's `.kiln/review.yaml` `signatures: mode`, else the
+  repository's own, as for pushes), an unsigned verdict or comment is refused (428, saying how to
+  sign it), and the gate counts only verdicts that hold on the version it judges: rebase-only
+  versions alone carry nothing. Elsewhere, unsigned ones are taken and count as before. A job's
+  reviews (through the GitHub-compatible API) are taken unsigned and never count where signatures
+  are required.
+- *Tests.* kiln-ci's `identity::verdict` (`w27_r04_a_verdict_reads_back_from_its_statement`,
+  `w27_r04_a_signed_verdict_is_held_to_what_its_request_asks`,
+  `w27_ac04_a_verdict_holds_on_its_revision_and_on_rebases_of_its_patch`: v2 checked on v5, v6, v6ws
+  and v5ctx) and `land` (`w27_r04_where_signatures_are_required_only_verdicts_that_hold_count`);
+  integration `w27_ac04_a_verdict_verifies_on_its_revision` (Kim's approval, signed on her laptop,
+  carried to v5 and not v6; then, required, an unsigned verdict and comment refused, the gate
+  counting only hers, comments and their edits signed) and
+  `w27_r04_an_agents_verdict_is_signed_by_its_runner`; `ci::verdicts`'s
+  `w27_r04_a_browsers_key_is_certified_and_what_it_signs_verifies` (a CSR and a signature the
+  browser's own code made, certified and verified by kiln) and the UI's `signing.test.ts`.
+- *Not yet.* Ship's marks don't name a verdict's signer yet (their `signer` stays null; the CI/CD
+  Integration agent's, its shape agreed: `signer`, and `signed`'s standing on approval marks). A
+  conflict resolution's acceptance (W26-R17's ladder) takes this verdict path once both are on one
+  branch. Jobs' reviews aren't signed as their legs.
+
+**Built: each land, signed as the queue that tested it (R07).** Plan
+`01a17856b1b273268adf6ce8c4f78410` step 6.
+
+- *What's signed.* When a land queue moves a trunk (its compare-and-swap), kiln signs the land as
+  its server, whose queue it is (`ci::lands::sign`). The statement (`kiln_ci::identity::landing`,
+  `application/vnd.kiln.land+json`) is about the trunk at the commit it moved to (`to`;
+  `<repo>@refs/heads/<trunk>`, by `gitCommit`). It names its queue (`<repo>:<trunk>`), the tip it
+  was applied onto (`from`), the candidate the queue tested and that candidate's `base`.
+  - `to` is the candidate itself, unless the trunk moved since the candidate's base only for
+    changes it shares nothing with and the queue applied the batch again onto the tip (`rebased`, a
+    queue's that does: the Merge Queues agent's). A land not applied again that moved the trunk
+    anywhere but its candidate isn't taken.
+  - It names the batch's diffs, each at the version that landed, with the commit that carries it on
+    `to` and the signed accepts that hold on it (their statements' digests, R04).
+  - It names the checks run on the candidate, each with its conclusion and its legs' signed results
+    (their statements' digests, R05). A leg that signs sends those at its end, after the events its
+    conclusion comes from, so the queue can see a check pass first (a moment first, or longer on a
+    loaded machine): the land's signing waits for them up to a minute, then signs with what kiln
+    has.
+- *Kept and read.* It's kept in `land_signatures` by the commit the trunk moved to (migration
+  `w27_land_signatures`). `GET /api/repos/:repo/lands/:commit` reads it back: its trunk, head,
+  candidate, base, signer, digest, when, what it says, and its envelope. A land kiln can't sign
+  stands, unsigned, and the log says so.
+- *Tests.* kiln-ci's `identity::landing` (`w27_r07_a_lands_statement_reads_back`,
+  `w27_r07_a_land_applied_again_is_about_the_commit_the_trunk_moved_to`,
+  `w27_r07_a_land_that_doesnt_hold_together_is_refused`), and integration
+  `w27_r07_a_land_is_signed_by_its_queue`. In it D1, approved by Kim on her laptop, lands through
+  main's queue with its `gate` run on the candidate. The statement verifies as kiln's server and
+  names main's queue, the candidate that landed, D1 at v1 with Kim's verdict, and `gate` with its
+  legs' signed results.
+- *Not yet.* The Merge Queues agent's queue signs its lands the same way, from its `landed()`, right
+  after its compare-and-swap (it has the statement's shape). A land's statement isn't posted to
+  hosts.
+
+**Built: a leg's results and provenance, signed as the leg (R05, R06).** Plan
+`01a17856b1b273268adf6ce8c4f78410` step 5, planned as `01a18b12f931749d83a2acdfbf55e67a` (research
+`01a18b12f9487223be9926cdb890fe22`), on step 1's statement (`kiln_ci::identity::statement`). A leg
+is a custodian. It signs a receipt of each thing it's given and a hand-on of what it makes, as the
+Transfers plan's custody records (`application/vnd.kiln.custody+json`), under the server's
+delegation of it.
+
+- *The server signs as itself* (`identities::sign_own`, with `server-signing.key`). As it certifies
+  a leg it signs its delegation of the leg (`application/vnd.kiln.delegation+json`,
+  `kiln_ci::attest::leg::delegation`).
+  - The delegation names the leg's identity as its delegate, what the leg may do, and until when
+    (its certificate's end).
+  - It's about what kiln handed the leg: the run's commit (`checkout`, `gitCommit`) and its
+    assignment (`assignment`, by the digest the leg's receipt of it names).
+  - It's kept in `ci_leg_delegations`. Its digest goes back with the certificate
+    (`IdentityGiven.delegation`), and each of the leg's records names it in `under`.
+- *Its logs by digest* (`kiln_ci::logs`): a step's log is the chain of the chunks its leg sent,
+  `h₀ = SHA-256("kiln/log/v1")`, `hᵢ = SHA-256(hᵢ₋₁ ‖ SHA-256(chunkᵢ))`, with their count and bytes.
+  The server keeps each chunk it takes by its length and digest in `<step>.digests`, beside the log,
+  past the log's size cap too (its offset `-`), with a retry's mark between attempts.
+  - A capped log still checks: what kiln kept by its bytes, the rest by digest.
+  - A changed byte is found and placed, and a lost chunk is counted.
+  - A log that isn't the one the leg sent says so (`Logs::check`).
+- *What it received* (`runner::signed`): a `received` record of each thing, numbered on its
+  `custody` stream, following the delegation. Each record names its signer (`by`), since a
+  statement's digest is the same whoever signs it, as the Transfers plan's records do.
+  - Its assignment: the SHA-256 of the fields that say what it's to do, as canonical JSON
+    (`leg::assignment`). Its secrets are named, never by a digest of their value. No mask, token or
+    integration's token is in it.
+  - Its checkout: git's commit and tree, from the server or from what its runner already held. Or
+    the server's tarball by its SHA-256, with the commit it was of.
+  - Its inputs: artifacts and caches by their SHA-256; actions by their pin, and by their tarball's
+    SHA-256 once its runner kept that; images by their content-addressed id; reused steps by their
+    replay's digest (`kiln-replay-v1`).
+- *What it made*: one `handed-on` record to the server, following every receipt. It names each
+  step's log by its chain (`log/<step>`, `kiln-log-v1`, with its bytes and chunks), each report it
+  uploaded (`report/<step>/<path>`), its artifacts and caches, and its results by their digest.
+- *Its results* (`application/vnd.kiln.ci.results+json`): one statement, numbered 1 on its
+  `results` stream. Its body is each step's end and the leg's conclusion; its subjects are its logs
+  and reports.
+- *Signed at its end*, in `Ev::Done`, with the leg's key before letting go of it. What the leg
+  sent before it ended goes first, however far its runner is behind: an end that comes while its
+  last log chunks or step ends still wait on the runner's uplink waits behind them, so its records
+  cover all it sent. `AgentMsg::LegResults` carries them all. It goes before `JobFinished`, and
+  again with it until it's received (`CAP_LEG_SIGNS`, docs/wire.md). A `k8s` pool's pod's leg
+  signs too: its runner says nothing of itself past `Build`'s caps, so it says so of the leg as it
+  asks for the leg's identity (`IdentityAsk.signs`), and kiln asks the leg for provenance by that.
+- *Taken*: the server checks each record as it takes it, at that time, through its records
+  (`verify_under`).
+  - Each must be the leg's, signed by the leg it gave that job on that runner, under its delegation
+    and no other.
+  - It keeps them in `ci_leg_records` (by job and attempt), and refused ones with why.
+  - It signs its own receipt of the leg's hand-on as the server, following it (`leg::receipt`).
+  - As it sends a leg its assignment, it keeps the digest the leg's receipt will name
+    (`ci_leg_assignments`).
+- *Judged when read*: `GET /api/ci/legs/:id/signed` holds the records against what kiln keeps.
+  - The results: each step's end, each log's verdict, each report by its CAS digest, and the leg's
+    end.
+  - A log kiln keeps as taken from the leg, of a step the leg signed no log of, is a break too.
+    What kiln copies into a reused step's log (W24-R07, its source leg's) it keeps as no chunk of
+    the leg's (`Logs::append_copy`), so the step's log checks against what the leg itself sent.
+    That step's reports are its source's too, and aren't held against the leg (its receipt of
+    `reused/<step>` says it was reused).
+  - The custody (`leg::judge_custody`): its stream whole, and its hand-on naming its results and
+    received by kiln. Its receipts of its assignment and commit must be of what kiln handed, and a
+    checkout by tarball of the tarball kiln served it, by the bytes kiln sent (`ci_leg_served`).
+  - It says each break, or `verified`. It gives each record's bundle, and the delegation's, to check
+    apart from kiln.
+- *Provenance*: kiln still writes it from its own records (W18-R01's words). Then it asks the leg's
+  runner to sign the very statement (`ServerMsg::SignAsLeg`).
+  - The runner signs only when the statement's subjects are what the leg's attest step reported
+    (its hand-ons) and its materials are among what the leg received (`AgentMsg::LegSignature`).
+  - The server keeps the leg's bundle beside its own (origin `leg`) once it verifies as that leg,
+    over those bytes.
+  - CD's check (W15-R03) and the attest step's own bundles stay kiln's.
+- *Tests*:
+  - kiln-ci's `w27_r05_*` (the chain, the sidecar, the statement read back, each break said, the
+    delegation, the assignment's receipt) and `w27_r06_*` (the subjects, the materials);
+  - `logs`'s `w27_r05_the_server_keeps_each_chunk_by_digest_past_its_cap`;
+  - `identities`'s `w27_r01_the_server_and_cd_sign_as_themselves` (`identities::sign_own`) and
+    `w27_r05_a_legs_records_verify_under_the_servers_delegation`;
+  - `runner::signed`'s `w27_r05_a_legs_results_are_signed_as_the_leg`,
+    `w27_r05_a_legs_receipts_and_hand_ons_are_signed_as_the_leg`,
+    `w27_r05_a_legs_custody_is_judged_whole` and
+    `w27_r06_provenance_is_signed_as_the_leg_only_when_its_subjects_are_the_legs`;
+  - `proto`'s `w27_r05_leg_signing_is_appended_after_every_older_variant`;
+  - integration: `identities`'s `w27_r05_a_legs_results_verify_as_the_leg`,
+    `w27_r05_a_v1_jobs_results_verify_as_the_leg`,
+    `w27_r06_provenance_verifies_as_the_leg_that_built_it` and (with `chaos`)
+    `w27_r05_a_leg_on_an_older_runner_reads_unsigned_with_why` and
+    `w27_r05_a_runner_behind_its_legs_signs_all_they_sent`; `k8s_pool`'s
+    `w27_r05_a_pods_leg_signs_its_records_as_the_leg`; `memo`'s `w24_r07` (a leg with reused steps).
+- *v1 jobs too*: a `.kiln/` workflow on v1, as production runs them, signs as the leg on its
+  runner. Its runner asks for the job's identity as it takes it (`ServerMsg::Assign`), as a v2
+  leg's does. kiln issues it from the job's run: its run has no plan, so its claims are its
+  pipeline's (`<repo>/.kiln/<pipeline>.yaml@refs/heads/<branch>`, at its commit).
+- *Not yet*:
+  - Legs on runners from before identities, and v1 jobs on runners from before v1 jobs signed, have
+    no leg identity. Their records stay unsigned, and the API says why.
+  - kiln signs no hand-on of what it gives a leg. The delegation names its assignment and commit,
+    but a leg's inputs (artifacts, caches, actions, images) are received with no hand-on of kiln's
+    to follow. Only the assignment, the commit and the tarball are judged against what kiln
+    handed.
+  - kiln's receipt takes the leg's digests as handed on. Whether what kiln keeps still is them is
+    judged when read.
+  - kiln's provenance names every action the job resolved. A leg asked to sign it before a later
+    step fetches one refuses, saying which; kiln's own bundle is kept either way.
+  - Ship shows none of this yet (the CI/CD Integration plan's).
+
+**Built: the trail, and kiln verify (R09, R10; AC06, AC07).** Plan
+`01a17856b1b670deb829ec1600f2c2fd`, its steps 1 to 4 and 6; research
+`01a17856b1b670deb829ec1763cc1245`.
+
+- *The trail* (`kiln_ci::identity::trail`, pure): an entry names the statement it records by digest,
+  its kind and subjects, when kiln took it, its index and the hash of the entry before it (as
+  gittuf's reference state log chains its entries); the entries are the leaves of an RFC 6962
+  Merkle tree, so an inclusion or consistency proof is at most ⌈log₂ n⌉ + 1 hashes. Checking a run
+  of entries names an edited, dropped, inserted or reordered one. A checkpoint is a C2SP signed
+  note (origin `kiln://<org>/trail`, size, root; an ECDSA signature, key ID the first four bytes of
+  the SHA-256 of its SubjectPublicKeyInfo), signed with the server's key; kiln never signs one that
+  doesn't extend the one before, saying why.
+- *Kept* (migration `w27_trail`; `crate::trail`): each statement kiln takes goes in, in the
+  transaction that takes it, once by digest, every signature of it kept beside it (a leg's of the
+  provenance kiln wrote, beside kiln's): W18's attestations, a leg's records and the server's
+  delegations of legs, custody records, verdicts and comments, lands; and what kiln checked that
+  isn't a statement itself as kiln's own words (a push's commits' signatures, the commits kiln makes,
+  what a host verified, revocations), which the checkpoints over them vouch for. Nothing is pruned.
+  A checkpoint is signed every `[ci.trail] checkpoint_every` entries (256) or `checkpoint_minutes`
+  (10), whichever comes first, once the entries since the last hold as a chain and hash as kept.
+- *Served and anchored*: `GET /api/trail` (entries), `/api/trail/checkpoints`, and the trail as a
+  tiled log (`/api/trail/log/…`, C2SP tlog-tiles: its checkpoint, tiles and entry bundles, each
+  whole tile kept as a node above as its last leaf comes, so a proof is a few reads); each
+  checkpoint logged in the Rekor `[ci.attest] rekor_url` names (v1, or v2's rekor-tiles by
+  `rekor_api`, through the Sigstore seam) as a hashedrekord of its note, and `GET
+  /api/trail/anchors` holds the trail to what Rekor saw.
+- *kiln verify* (`kiln verify <deploy | artifact | commit | change> <id>`, `GET /api/verify`, the
+  `ci.verify` operation): the chain back from a release (`prod/api@1.4.2` or its number), an
+  artifact's digest, `<repository>@<commit>` or a diff, a link at a time, the first that doesn't
+  hold named. The release as kiln's deploy records have it (deploys sign with Ship's plan); each
+  artifact's provenance, which names it and the commit it was built from, signed as the leg that
+  built it; every commit on the trunk it brings (since the commit the release before ran, else since
+  the trunk's first land), each on the trunk and signed as kiln checked it; the land that put it
+  there, signed as the queue that tested it (the candidate tested is what landed, each check
+  passing); each verdict the land names, signed by whom it names, an accept holding on the version
+  that landed (given there or carried by verbatim patch-id), people and agents apart, as many as
+  the trunk's policy asked where the land began; each revision's author; a change's custody where
+  it changed hands; kiln's root. Each link rests on a statement checked as of when kiln took it
+  (its signer's chain to kiln's root, the revocations as of then) and found in the trail by an
+  inclusion proof against the newest checkpoint, signed first when any entry came after the last.
+  A deploy of 10 commits, each reviewed, tested and landed, verifies in about 170 ms on a warm
+  server (AC07 asks 2 s).
+- *For an auditor* (`kiln verify export <kind> <id>`, `GET /api/verify/export`): the same walk with
+  every statement each link rested on (its payload, its entry, the entry's proof, each signature
+  as kiln kept it and whom the walk found it signed by), kiln's own statement of each revocation
+  under the checkpoint, and that checkpoint; `kiln verify --offline <file> --root <kiln's root>`
+  checks it with no server (`kiln_ci::identity::verify::offline`): it fails where any statement,
+  signature, proof or the checkpoint was changed, or the trail says a signer's key was revoked
+  before kiln took what it signed. A revision's Source VSA (`kiln verify vsa <repository>@<commit>`,
+  `POST /api/verify/vsa`; SLSA v1.2's source track): an in-toto statement of
+  `https://slsa.dev/verification_summary/v1` about its `gitCommit` (`sourceRefs` the trunk that
+  holds it), `resourceUri` `git+<kiln>/<repository>`, verifier `<kiln>/api/verify`, its trunk's
+  review policy as the policy, PASSED with `SLSA_SOURCE_LEVEL_3` where its chain verifies (FAILED,
+  `SLSA_SOURCE_LEVEL_1`, where it doesn't), signed as kiln's server and kept in the trail.
+- *Tests*: `kiln_ci::identity::trail`'s `w27_ac06_an_edited_dropped_or_reordered_entry_is_found`
+  and `w27_r09_*` (RFC 6962's tree and proofs, at most ⌈log₂ n⌉ + 1 hashes over 1 to 10,000
+  leaves; checkpoints as Rekor's signed notes, never contradicting the one before; tiles);
+  `identity::verify`'s `w27_r10_*` (a statement held, each link's words, the Source VSA's fields, an
+  export offline and changed); `tests/trail.rs`'s `w27_r09_*` (every kind kiln takes, in order;
+  restart and concurrent appends; the tiled log; a rewritten trail caught against its anchor);
+  `tests/verify.rs`'s `w27_ac07_a_deploy_verifies_end_to_end` (10 commits, timed),
+  `w27_ac07_kiln_verify_names_each_broken_link` (an artifact rebuilt, a forged review, a trail
+  entry edited, a commit pushed to main without the queue) and
+  `w27_r10_an_exported_trail_verifies_offline`; `ci::signing`'s `w27_r12_kilns_rekor_v2_*`.
+- *Not yet.* Deploys aren't signed (Ship's plan), so kiln verify rests a release on kiln's record
+  of it; it takes each check's conclusion from the land its queue signed, not from each leg's own
+  signed results; a change's custody is walked by its change's identity, as the hand-offs of a
+  change name it; no witness cosigns the checkpoints; an export carries the revocations the trail
+  holds, those recorded since it began; Ship's What happened and commit page draw the links from
+  `GET /api/verify` (the CI/CD Integration agent's).
+
+**Built: a verified chain to deploy (R11, AC08).** Plan `01a17856b1b670deb829ec1600f2c2fd`, step 5.
+
+- The deploy gate `chain` (docs/deploy-api.md §9.1) walks what a new version deploys, or a
+  rollback puts back, as kiln verify does, as the release is asked for. `gates.require_chain: true`
+  refuses one whose chain breaks, naming the link; elsewhere the release says whether its chain
+  verifies. An environment made as `production` requires it from the start; one from before keeps
+  what it has until its settings change it, as a repository's signatures do.
+- *Tests*: `tests/verify.rs`'s `w27_ac08_production_refuses_an_unverified_chain` (made as
+  production, the rebuilt image refused at its artifact and main's build taken; from before, the
+  rebuilt one taken, saying its chain doesn't verify).
+- *Not yet.* The environment's page doesn't show `require_chain` or `production` (an edit there
+  keeps them).
+
+**Built: custody, and agent sessions handed over signed (R08, in part).** Plan
+`01a17856b1b477eda14a574ae312a123`, its steps 1 to 6 and step 7's changes and review requests;
+research `01a18abf2d28762d92104dca2fbfbf89`.
+
+- *Custody records* are signed statements (`kiln_ci::identity::statement`) whose body says the
+  things they're about were handed on, received, passed on unchanged by a relay, or taken by kiln's
+  server for a giver that can't sign (`kiln_ci::identity::custody`). Each names its signer (`by`:
+  a statement's digest is the same whoever signs it), whom it went to or came from, and why; a
+  thing is a set of digests, and two records of one hop agree on every algorithm they share.
+  `walk` goes back from where a thing is used, through what each record follows, to where each
+  thing began, and names the first break (`Break::code`: a digest changed or none shared, a receipt
+  of what wasn't handed on or of less, the wrong taker, giver or holder, a receipt without its
+  hand-on, records out of order, a take not signed by the server, a record kiln lacks, a gap in a
+  custodian's stream). Delegations only narrow (`entitled`); `fence` takes an agent session's act
+  only at its current epoch from the process holding it. All pure, the time and the revocations
+  passed in.
+- *Kept* (migration `w27_custody`; `crate::custody`): each record once, by its digest, its envelope
+  as signed, judged as of when kiln took it (a revocation made later doesn't undo it); one kiln
+  has already is answered as such before it's judged, so a record sent again after its signer
+  moved on isn't refused. Its own hop is checked as it's taken (a receipt that comes before its
+  hand-on waits for it); a break is recorded with the records around it, and a statement kiln
+  can't take (its signer's identity revoked, as a copy left behind's is) is refused and recorded
+  with its signer and envelope; both are audited (what an API caller sent, once, as their request). `POST /api/custody`, `GET /api/custody?digest=`
+  or `?name=` (a thing's newest chain: who holds it, an offer no one took lapsing after 10
+  minutes), `/api/custody/breaks`, `/api/transfers/refused` and `/api/transfers/unsigned`;
+  `kiln custody show|breaks`, `kiln transfers refused|unsigned`.
+- *Sessions handed over.* What a session's hand-over is about is its timeline at the epoch it
+  leaves ("session <id> at epoch <n>", `kiln-timeline-v1`: its id, the epoch and each event's
+  digest), which both sides work out alike. The runner process handing it on (to another
+  machine, or its machine's newer process) signs a hand-on with the session's identity at that
+  epoch, to the session at the next, following its own receipt of it: its package carries it, and
+  it sends it too (`AgentMsg::Custody`, `CAP_CUSTODY`). The process taking it signs its receipt
+  with the key it asks to have certified at the next epoch, and both go in that ask
+  (`IdentityAsk::hand_on`, `::receipt`): kiln keeps the hand-on, then the receipt (bundled with the
+  certificate it issues), and only then revokes the epoch left and raises the session's epoch, so
+  anything signed at the epoch left that reaches kiln afterwards is refused, the same second
+  included. A hand-on kiln refuses, or one to another epoch, or one without its receipt, gets no
+  certificate; a receipt of other than what was handed on is kept and its break recorded. A runner
+  re-asks, every heartbeat, for any session it holds that has no certificate yet (a move's ask can
+  reach kiln before its Open).
+- *Blue/green.* The new build says it takes sessions signed for (`Frame::Ready::custody`), and the
+  runner upgraded signs a hand-on of each it hands it running (`Frame::Session::hand_on`). The new
+  build goes on with each at its epoch until it's promoted (a rollback before then leaves the
+  session where it was, the hand-on lapsing), then asks for the next epoch with its receipt, and
+  once that's certified goes on at it in place: its state says so, and nothing the server's copy
+  has is sent again.
+- *Words about a hand-over* (hand a session to the machine's newest process, the server's word
+  on such a hand-over) name the process they're for, its machine, instance and the epoch kiln last
+  certified it at, signed by the server (`kiln_ci::identity::custody::Word`, `addressed`; the word
+  goes beside the command as `word`, which a runner from before ignores). A runner that checks them
+  (`CAP_CUSTODY`) applies one only if it's that process at that epoch (once it let go of the
+  session, only the process is checked), and refuses any other, or an unsigned one, telling kiln,
+  which records whom it was for and who refused it. The runner a blue/green upgrade replaces keeps
+  such words and refuses one about a session it handed to the new build; the new build refuses one
+  passed on to it (the 14:18 drop: such words, passed on, let go of six sessions in the new build).
+  Once kiln certifies a process for a session, it sends that session's words there. A test
+  build's `stale_words` (the server's) sends the old holder its stale words, to play the drop
+  again.
+- *Acts, the session's holder's only* (the twin). Each act an agent session makes through kiln
+  (a kiln operation its MCP server calls: goals, plans, agents and messages to them, research, CI
+  runs and deploys, changes; a page's answer; a run on another machine, asked before it's done) is
+  signed by the runner process holding it, with the session's key at the epoch it holds it at,
+  beside the ask (`act`: `kiln_ci::identity::custody::Act`, its subject the ask itself by digest).
+  kiln takes it only from the session's holder now (`crate::custody::act_counts`): signed at the
+  newest epoch kiln certified the session at (what an Open says doesn't move it), by the process
+  certified then (`acted`, `fence`), the ask unchanged. Signed at an epoch the session left (its key
+  revoked as it went on), by another process of its epoch, or beside another ask, it's refused,
+  answered with why ("it was signed at epoch 0 of session …, which went on at epoch 1, on runner
+  box-b (instance …) at … (transfer …): it's from a copy left behind"), and recorded with its
+  envelope, its signer, the epoch it's from and the transfer that superseded that epoch
+  (`transfer_refusals.epoch`, `.superseded_by`). A runner that signs acts (`CAP_CUSTODY`) can't send
+  one unsigned for a session kiln certified it for; one kiln hasn't certified for it yet (it just
+  took it over) or a runner from before goes by its machine, as before. An act from a machine the
+  session no longer runs on is refused the same way before it's checked. A run on another machine
+  is asked of kiln first (op `act`) by the runner the agent's process asks, which tells an agent's
+  processes from the machine's by the asking process's tree; one its runner can't put to kiln (cut
+  off) isn't done, and kiln records it once the runner is back. A copy left behind is told to let
+  go of the session at its runner's first word since (its inventory, which says each session's
+  epoch there, or any ask), not once it announces the session again: the twin of 2026-10-25 ran on
+  for ten minutes after its machine came back. A session just arriving, at the epoch it goes on
+  at, isn't one. Updates go by where the session runs, not by signatures: only the machine it runs on
+  speaks for it, and of two of that machine's processes that say they hold it, the newer.
+- *Work handed* (step 6): a plan's step, a subagent's task, what a person hands off in Ship, and a
+  step a person takes over change hands as custody records of the work (`kiln-work-v1`: "plan run
+  <run> step <n>" by its run, number and goal; a task by its words; a hand-off by its commit and what
+  was handed). kiln, a plan run's driver, hands each step to its agent at its epoch, saying whom it
+  acts for, nearest first (`acts_for`: the agent that ran the plan, its person); tried again, it
+  takes the step for the agent before (following that agent's receipt of it) and hands it to the
+  next. An agent's subagent task is the agent's own hand-on, signed by its runner beside its
+  `agents.start` ask, to kiln's server, which passes it on unchanged to each subagent it starts (a
+  relay's record). The agent given work signs its receipt as it takes it up, at its next turn: kiln
+  asks its runner (`ServerMsg::Custody`), again when it opens or its runner says what it holds, and
+  the receipt waits there for the session's identity if it isn't certified yet. A person's side is
+  theirs when they sign it on their device: `kiln plans take <run> <n>` takes a step over and signs
+  the receipt with the key `kiln login` made (`POST /api/plans/runs/<run>/steps/<n>/take` with
+  `signs`, then `…/receipt`); Ship's Hand off takes the person's own signed hand-on beside it. Without
+  a key, kiln's server signs for them on their signed-in session (a take, or a receipt, `taken_for`
+  the person), saying their own signature is missing and why; a walk reads that link as kiln's for
+  them, never as theirs (`taken_for` on its hop), and the page says in place how to get a key. Once a
+  step changes hands, what its former agent says of it is refused and recorded with the transfer
+  that superseded it: a goal met for a step tried again or taken over, and, from an agent kiln ended
+  as the step went on to another (still running where kiln couldn't end it), any act, its runner
+  told to close it.
+- *Changes and review requests* (step 7): a change's authorship ("change <repo> <name>") and its
+  review request ("review request of <repo> <name>") change hands as work does. Its author gives a
+  change to another (`POST /api/diffs/:id/give` `{to}`), their own hand-on when they send it signed,
+  else kiln's take for them; it stays theirs until the other takes it (`…/take`), with their receipt,
+  and only then is theirs. Commandeered, it's kiln's take for the author it's taken from, who isn't
+  there to sign, and the new author's receipt. A reviewer passes their review request on
+  (`POST /api/diffs/:id/reviewers/pass` `{to}`); it moves only once the other takes it
+  (`…/reviewers/take`), and stays the first reviewer's until then. A person's side without a key is
+  kiln's for them, as for work; an agent taker's receipt is asked of its runner. Once a change has
+  changed hands, what its former author does as its author (a version pushed, an abandon, a give) is
+  refused, saying who its author is now, and recorded with the transfer that superseded them. An
+  approval carried to a rebase-only version (the signing plan's `holds_on`: the same verbatim
+  patch-id) is a transfer kiln signs as it reads the verdicts: its hand-on for the version the
+  approval was given on and its receipt for the one it reached, each naming its version's commit
+  and base, about the verdict (its statement's digest) and the patch-id
+  (`custody::carry`). `GET /api/diffs/:id/verdicts` says so ("carried from v2: rebase only, patch-id
+  9f3c41a…, base a1b2c3d to c3d4e5f") and names the record, and Ship's review shows it under
+  Approve.
+- *Promotions and the replant* (step 8): a deploy promoted from an environment of this server's
+  (its `after` passed there, or `promote_from` named it) is a transfer signed by CD for each
+  environment (`deploy::promotion`, docs/deploy-api.md §9.2): CD's hand-on for the one it leaves as
+  the release goes, naming its images by digest, kept on the release as its `promotion` gate, and
+  CD's receipt for the one it reaches as it lands, the same digests; each record names its
+  environment as its `component`. One whose version or images aren't what runs upstream is refused
+  as a promotion and recorded with both sides' digests. In a replant, each runner's blue/green
+  upgrade hands on its machine's runner role too: the runner upgraded signs its hand-on to the new
+  build as its runner process (`Frame::Role`, to a new build that says `Frame::Ready::role`), the
+  new build its receipt as its own once that identity is certified, both to the server; the
+  upgrade's job is the replant's record of the machine, listing each transfer (the runner role and
+  each session the machine held as it began) and what moved without one.
+- *A resume from the server's store* is kiln's take: signed with the server's own key for the
+  identity kiln last certified the session as at that epoch (`identities::holder_at`), to the next,
+  saying when kiln last heard from the machine; kiln keeps it at once, the package carries it, and
+  the receipt follows it as it follows a hand-on.
+- *Unsigned.* A hand-over in which a side is from before signed hand-overs goes as before, and
+  kiln records it (`transfers_unsigned`, once per session and epoch), naming the side from before:
+  a certificate asked for at a new epoch with no hand-on ("… signed no hand-on"), a session
+  announced at a later epoch by a runner without `CAP_CUSTODY`, or resumed to one ("… signed no
+  receipt"). A test build's `unsigned` fault stands in for such a runner.
+- *Tests.* `kiln-ci` `w27_r08_*` (bodies, chains and each break, relays, takes, gaps, delegations,
+  a session's next epoch whoever holds it, the fence); `custody::w27_r08_*` (records kept, breaks
+  and refusals; a transfer kept before its epoch rises; the timeline);
+  `store::migrations::w27_r08_custody_tables`; `proto::w27_r08_custody_is_appended_after_headroom`;
+  `crates/kiln/tests/custody.rs`: records through the API and the CLI; `crates/kiln/tests/transfers.rs`
+  (`cargo test -p kiln --test transfers`), every kind of hand-over: two take-overs, a move, a
+  resume from kiln's copy, each walking unbroken with both sides signed; in a release build (an
+  upgrade downloads the server's own kiln, and a debug one is larger than kiln serves) a blue/green
+  upgrade sending nothing again and `w27_r08_session_hand_overs` (moved, upgraded, taken over,
+  resumed: four verified transfers); with `chaos`, runners from before going unsigned, and
+  `w27_ac05_the_1418_drop_played_again` (seven sessions upgraded blue/green, the old runner told
+  to hand each on and that it was taken: every such word refused and recorded, all seven held by
+  the new build). `custody::w27_r08_a_hand_overs_word_goes_only_to_its_process`, kiln-ci's
+  `w27_r08_a_hand_overs_word_is_only_its_processs`, and
+  `agent::w27_ac05_a_hand_overs_word_for_the_runner_being_upgraded_never_reaches_the_new_build`
+  (fix/upgrade-keeps-agents' test, come over). Acts: kiln-ci's
+  `w27_r08_an_act_is_only_its_holders_at_its_epoch`, `custody::w27_r08_an_act_counts_only_from_its_holder_now`
+  (a goal met, a message, a CI run, a page's answer and a run, each from the holder, a copy left
+  behind, a former holder of the epoch, unsigned, changed), and, with `chaos`,
+  `w27_ac05_the_twin_played_again` (a session moved off a machine cut off goes on elsewhere from
+  kiln's copy; the copy marks its goal met, starts a CI run and a run on another machine: none
+  done, each recorded with the epoch it's from and the transfer that superseded it, the copy told
+  to let go once its machine is back, the session at its next epoch untouched). Work: kiln-ci's
+  `w27_r08_kiln_takes_for_a_person_with_no_key`, `custody::w27_r08_work_changes_hands_signed_by_both_sides`,
+  `runner::custody::w27_r08_work_handed_is_received_at_the_sessions_next_turn`,
+  `ship::w27_r08_a_hand_off_changes_hands_signed` (a failure handed off from a device with no key:
+  kiln's take for the person, answered by the agent's receipt), and `w27_r08_work_handed` (a plan run with an agent per step: each step signed for at its agent's
+  first turn; one tried again, the agent before refused and recorded as it says it's met; one taken
+  over without a key, kiln's receipt for the person, one with a key, the person's own; a subagent's
+  task handed on, passed on and received; every chain unbroken, none open); in the UI,
+  `e2e/plan-run-take.spec.ts` and `ship-hand-off.spec.ts` (the line saying how a take-over or a
+  hand-off from a browser is signed, in Chromium and WebKit at desktop and phone widths);
+  `w27_r08_change_hands` (D1 given by kim, taken by sam, commandeered by lee: two transfers, each
+  with both sides; sam's version pushed afterwards, and his abandon, refused and recorded with the
+  transfer) and `w27_r08_review_passed_on` (passed on and taken, the request moves with both sides;
+  passed on again and never taken, it stays); `deploy::flow::tests::w27_r08_promotion` (web 1.2.0
+  at digest A, ten minutes in staging, promoted to production: CD's hand-on for staging and receipt
+  for production, one transfer walking unbroken, both naming A; then 1.2.0 at digest B refused as a
+  promotion and recorded with both digests); `w27_ac04_approval_carried` (Kim's signed approval of
+  v2 carried to v5 across two rewords and a rebase: kiln's carry walks unbroken from v5 back to v2,
+  saying so, and her verdict still hers; v6, a code change, and v7, whitespace only, carry it to
+  neither, saying why) and, in the UI, `e2e/ship-carried.spec.ts` (the carried line under Approve,
+  in Chromium and WebKit at desktop and phone widths); and, in a release build, `w27_r08_replant` (box-a
+  upgraded blue/green with two sessions: its job lists the runner role, from the process replaced to
+  its new build, and both sessions, each a verified transfer, nothing without one). Simulation (the
+  Transfers plan's step 9, W27-AC05):
+  `sim::transfers::tests::w27_ac05_no_stale_act_is_ever_applied` (docs/sim.md's transfers model:
+  moves, resumes from kiln's copy while a machine is cut off, take-overs with the old process still
+  acting, blue/green upgrades and their rollbacks, the server restarting with its count stale, under
+  kiln-sim's nemesis, through the server's act check, its signed words and the runner's check of
+  them, and the custody chain's hop and walk: over its 200 seeds, no act of a copy left behind
+  applied, no word applied by a process it isn't for, one holder per epoch, every transfer with both
+  sides, and once the world calms every holder runs its session and no copy left behind does),
+  `w27_ac05_the_transfers_model_finds_each_planted_bug` (an act check by machine, a word passed on
+  applied unchecked, a resume that keeps the epoch it leaves, a release only on the copy's own
+  announcement, no addressee check: each found by a seed that passes without it) and
+  `w27_ac05_a_transfers_seed_replays_exactly`. Nightly: `.kiln/custody-lab.yaml`, and the transfers
+  model's 20,000 seeds in `.kiln/sim.yaml`.
+- *Not yet.* A session's package isn't yet addressed to the process it goes to (its hand-on is to
+  the session at its next epoch); a runner's Open at a later epoch still raises the epoch the
+  registry keeps (what its inbox and updates are fenced by) before its transfer is recorded, though
+  acts are held to the epoch kiln certified; what a copy left behind does on its own machine
+  without kiln goes on until its runner hears from kiln (docs/agents.md, "A copy left behind"); a
+  person signs on their device only through the CLI until the browser has a key of its own (the
+  signing plan's step 4); an agent kiln's server runs itself (`local`) signs no receipt of work
+  handed to it yet, so its hand-on stays unanswered; an agent's give or pass is kiln's take for it
+  (its signed act verified), not yet a hand-on its runner signs; a promotion
+  from a linked server's environment, which this server's CD doesn't sign for, nor KilnCD's apps'
+  syncs, which take no `after`; Ship's journey listing a replant's transfers beside its runners
+  (its job does); artifacts, machines and intermediaries (steps 11 to 16).
 
 ### W28 Demand-driven CI: adopt, cover, stagger, land by conflict graph
 
 **Scope.** The land queue, builds and deploys of a trunk many agents change at once (kiln plan
 `01a17502affc74b3af5a30092f8418bc`). This section holds step 9's requirements, R30–R39 (kiln plan
-`01a1751638e773b98b5092662fc06bf5`); the other steps take their ranges as they come. Commits
-before this one call this workstream "W25 step N". Step 6's, admission, are R60–R69 (kiln plan `01a17603d7cd701bb0a238c056af91ae`).
+`01a1751638e773b98b5092662fc06bf5`) and its third step's, R100–R109, and step 5's, R50–R59 (kiln plan
+`01a17604e26a73e187efb3a2859aaacb`); the other steps take their ranges as they come. Commits
+before this one call this workstream "W25 step N". Step 6's, admission, are R60–R69 (kiln plan `01a17603d7cd701bb0a238c056af91ae`); step 8's, spreading load, R80–R89.
 
 **Requirements: the conflict graph**
 
@@ -9000,6 +9881,98 @@ before this one call this workstream "W25 step N". Step 6's, admission, are R60�
   broken trunk (the last push to finish the job had failed it at the same step) fails only on a
   stack that holds the change that started its streak. *Replay* (`cargo test -p kiln-ci
   w28_ac33`); ci/sim/README.md keeps the report.
+
+**Requirements: the land queue by component** (step 9's third step, R100–R109: R30–R37 wired into
+`crates/kiln/src/ci/land.rs`, the decisions pure in `kiln_ci::land::queue`, with what Review needs of
+the queue)
+
+- **W28-R100 Components.** The entries queued and under test make a conflict graph (R30, R31) over
+  the repository's units: the trunk's package graph and each entry's own (its top pinned
+  revision's), each package a unit by its folder, its dependencies and its workspace's root files.
+  An entry's change is the files its pinned revisions change, and those of the diffs below it that
+  entries ahead of it land, so a stack split at its clear prefix stays one component, its later part
+  after the rest. Each component is a queue of its own: entries of different components never wait
+  for each other. Each entry keeps its standing: its component (by its head's id), its place there,
+  its component's window, and its decision against each entry ahead of it (R34).
+- **W28-R101 Candidates by component.** Each component without a candidate under test gets one,
+  tested beside every other component's: its first entries, as many as its window allows (R36's
+  AIMD window, starting at and never passing the trunk's `queue.batch`, or a bisection's bound),
+  applied in order onto the trunk's tip. A joint candidate holds only entries that meet, and says
+  where (their interaction units, files or targets); an entry that meets no other has a candidate
+  of its own, its own change's result. An entry that conflicts with one ahead of it in its
+  candidate waits for that one to land; the candidate ends before it. New candidates go in R35's
+  order. Each entry counts the candidates that held it (`tested`).
+- **W28-R102 Results stand; bisection stays inside.** A candidate that passed after the trunk moved
+  for another component lands as tested, its entries applied again onto the trunk's tip, when what
+  moved the trunk shares no file, unit or target with it (asked again just before the move); else it
+  is tested again on the trunk as it is, saying why. So when the trunk moves for one component, the
+  others aren't tested again. A failure is bisected inside its component: alone, its entry is the
+  culprit and is ejected, saying which check failed; else the component's window halves and its next
+  candidate ends at the middle suspect.
+- **W28-R103 One move at a time.** The trunk moves by compare-and-swap, each move taking every entry
+  of one ready candidate at once; a move the trunk raced builds the candidate again.
+- **W28-R104 Review's gate.** `review::readiness` is the single gate of `land`, `land_when_ready` and
+  the queue's re-check just before each move: ready means it lands; blockers (by the trunk's policy
+  on the diff's latest version) mean it holds, with them as the reason; a conflict with the trunk's
+  tip, each diff applied on top of those below it, sends it back to Review's conflict ladder (R107).
+  `GET /api/diffs/:id/land` shows the gate, and the entry that holds the diff. An entry the gate
+  holds (`held`, `hold: gate`) is asked again as reviews come and at least every 10 s, and joins the
+  queue once the gate clears it. Review holds an entry (`POST /api/queue/:entry/hold`, `hold:
+  review`) until it lets it go (`/release`), or withdraws it (`/withdraw`, `withdrawn`), each
+  saying who and why (`diffs.review`). Held, returned or withdrawn, an entry's diffs are Review's
+  again, in the state their reviews give them.
+- **W28-R105 Pinned revisions.** An entry pins each diff's approved revision: its version, commit,
+  the commit below it and its patch-id. A newer revision invalidates the pin unless it only rebased,
+  with the same patch-id: the entry holds (`it has v2 since v1 was approved, which changes its patch:
+  v2 lands once Review approves it`), and once Review approves the newer one it's pinned and the
+  entry joins the queue again. The candidate tested is the pinned revision onto the trunk, never a
+  newer one. The commit is the unit: entries name their commits.
+- **W28-R106 A stack's clear prefix.** A stack lands its clear prefix, in order; the rest holds in an
+  entry of its own, each diff saying why (`D3: 0 of 1 accepts`, `D4: D3, below it, holds`), and
+  follows once Review's gate clears it. With nothing clear, `land` lands nothing and says why. An
+  entry whose upper diffs stop being clear before its move lands its prefix, tested on its own.
+- **W28-R107 Conflicts go back to Review.** An entry that conflicts with the trunk isn't ejected: it's
+  `returned` to Review, saying where (`needs rebase: conflicts with the trunk in README.md`, the
+  files kept in `conflicts`) and, beside it, what Review's gate says of the diff (W26's conflicts,
+  each where it falls: `README.md:3: resolve this conflict first`), and the same entry joins the
+  queue again once a version resolves it and Review's gate clears that version.
+- **W28-R108 The land record.** Each land keeps (`land_records`, one row per entry; `record` in
+  `GET /api/repos/:repo/queue`): the change and its kind (`diff`, `stack`, `change_request`,
+  `host`), the strategy, the approved revisions with their patch-ids, the candidate tested and the
+  trunk it was built on, its checks' runs, whether it landed as tested onto a trunk that moved
+  since, the trunk's move, the commit carrying each change, the trunk's policy it landed under, who
+  asked, and which queue landed it.
+- **W28-R109 A host's own queue.** Which queue lands a repository's changes is the forge seam's
+  `abilities(repo).queue` (`kiln_seams::Forge`, docs/seams.md): none means W28's queue; one means
+  the host's (GitHub's merge queue, GitLab's merge trains), followed through the seam alone:
+  `enqueue` each change at the head Review cleared, `queued` read back after each call (a stacked
+  change takes those below it), `change` read conditionally until it merged (landed, recorded) or
+  left the queue unmerged (out), `dequeue` when Review holds or withdraws it. kiln never calls
+  githost directly for it; kiln's own git server has no forge, so its repositories land on W28's.
+  `POST /api/repos/:repo/queue` (`ci.queue.enqueue`, `{ trunk?, changes: [{ number, head }] }`,
+  bottom first) puts a host's changes in: each read on its host first, a change whose head isn't the
+  one Review cleared is refused (409, naming the head it moved to), as is one merged or closed, and a
+  repository whose host has no queue for it (422). What it does next is each entry's in
+  `GET /api/repos/:repo/queue`: `state` (queued, testing, landed, ejected with `reason`), `route`,
+  `host` (each change's `state`, `entered`, `queued` and merged `commit`) and, once landed, `record`.
+
+**Acceptance criteria: the land queue by component**
+
+- **W28-AC100 Four diffs in two components, one culprit.** W14-AC03 with the diffs in packages `a`
+  and `b`: a candidate for each component under test at once; the clean component lands, none of its
+  entries tested again, before the culprit's bisection ends; only the culprit is ejected, with its
+  reason. *Integration test* (`cargo test -p kiln --test hosting w14_ac03`).
+- **W28-AC101 Independent diffs.** Two diffs that share nothing, side by side on one trunk: both
+  land, each tested once, the second as tested onto the trunk the first moved. *Integration test*
+  (`w28_r102_independent_diffs_land_without_testing_each_other_again`); the planner's
+  (`cargo test -p kiln-ci land::queue`).
+- **W28-AC102 Review's needs.** One test each: the gate holds a candidate whose diff was asked for
+  changes just before its move and lands it once accepted, and Review holds, lets go and withdraws
+  (`w28_r104_one_gate_for_land_and_the_move`); pins hold through a rebase-only revision and not
+  through one that changes the patch (`w28_r105_entries_pin_what_review_approved`); a stack lands
+  its clear prefix (`w28_r106_a_stack_lands_its_clear_prefix`); a conflict goes back to Review and
+  comes back (`w28_r107_a_conflict_goes_back_to_review_and_comes_back`); a host's queue through
+  the forge seam's simulator (`cargo test -p kiln w28_r109`).
 
 **Requirements: deploys by what they share**
 
@@ -9112,8 +10085,12 @@ before this one call this workstream "W25 step N". Step 6's, admission, are R60�
 batches with a 60 min hold land changes 73% sooner than today's serial queue (5.0 h to 1.3 h) at
 54% fewer runner-hours per landed change (0.453 to 0.208), more than half on every seed; no job
 waits for a runner and no window opens past 8. Per-change speculation lands faster (-88%) but
-saves 7%, its candidates waiting past the aging bound (ci/sim/README.md). The land queue uses none of this yet: that
-is step 9's third step, in `crates/kiln/src/ci/land.rs`. R38, R39 and AC38 built (2026-10-25): `kiln_cd::deploys` decides, and the release worker in `crates/kiln/src/deploy` carries it out for every release in flight, the objects two apps share read from KilnCD's engine (`Engine::shared_objects`). One target coalescing applies with an environment's `concurrency: queue`; with `reject`, the default, a second release is refused as before.
+saves 7%, its candidates waiting past the aging bound (ci/sim/README.md). R100–R109 and AC100–AC102 built
+(2026-10-26): the land queue in `crates/kiln/src/ci/land.rs` carries out `kiln_ci::land::queue`'s plan by
+component, asks `review::readiness` before every move, pins approved revisions, lands a stack's clear
+prefix, returns conflicts to Review, keeps `land_records`, and routes on the forge seam (migration
+`20261026-1700_w28_land_wire`). Deploy targets aren't read into the conflict graph's changes yet, and
+R37's batch hold isn't applied by the server. R38, R39 and AC38 built (2026-10-25): `kiln_cd::deploys` decides, and the release worker in `crates/kiln/src/deploy` carries it out for every release in flight, the objects two apps share read from KilnCD's engine (`Engine::shared_objects`). One target coalescing applies with an environment's `concurrency: queue`; with `reject`, the default, a second release is refused as before.
 
 **Requirements: demands and adopt-on-supersede** (step 4's, R40–R49; kiln plan
 `01a17607cd1273c5836771efb9d377d7`)
@@ -9224,6 +10201,150 @@ is step 9's third step, in `crates/kiln/src/ci/land.rs`. R38, R39 and AC38 built
 `kiln_ci::sched::state`, `crates/kiln/src/ci/dispatch.rs`, step 1's replayer and
 `crates/kiln/tests/warm_cancel.rs`.
 
+**Requirements: verdicts**
+
+- **W28-R50 Lanes, checks and verdicts.** `kiln_ci::verdict`, pure: a lane is a workflow's commits
+  on one branch, first parents, oldest first, each with the units its diff could affect (W24-R17,
+  `Units::affected`; every unit when that isn't known). A check is a workflow's test of a unit, or
+  the unit (a job) as a whole, with the checks it needs. A result is a check's outcome at a commit
+  (passed; failed, with its signature: the test, or a job's failed step; skipped because a need
+  failed), how it came (ran, reused, adopted) and when. Each commit gets a verdict per check, and
+  a kind for the whole: the weakest of the checks its diff could affect (direct, covered, pending,
+  suspect, culprit). Checks its diff can't affect are unaffected and never count against it; a
+  check whose need fails at a commit is settled with that need. Every verdict says why.
+- **W28-R51 Covered.** A check with no result of its own at a commit is covered by the nearest
+  later commit with one, when that result passed, or failed as the base (the nearest earlier
+  result) already did, or failed a test W16 marks flaky or quarantined. Covered is a kind of its
+  own, optimistic: it carries no outcome, so it is never shown or kept as passed.
+- **W28-R52 Suspects and culprits.** A failure is new when the check passed, or failed otherwise,
+  at its base. Its suspects are exactly the commits from just after the base to the failing one
+  whose diffs could affect the check's unit; a later commit's new failure makes a commit suspect
+  before its needs settle it. A culprit finding's outcome names the culprit among them (those before
+  it are cleared, those after it fail because of it), finds no culprit (a flake: all cleared), or
+  can't tell (they stay suspects, saying why).
+- **W28-R53 The replay.** Step 1's replayer decides P3's verdicts with `kiln_ci::verdict`: each job a
+  check, a commit affecting the jobs whose input keys it changed, a new failure bisecting only its
+  suspects, each try where R56's planner says (a suspect's job doing what its draw says; one
+  suspect is the culprit at once), and keeping what is under way: a run whose own work has begun
+  runs its jobs as they come ready though newer pushes withdrew it, and the newest execution of
+  each job of a lane (launching or running) stays until a live demand of the same job needs its
+  room. A commit's verdict counts from
+  when it was answered for good. ci/sim/README.md reports where the commits answered after an hour
+  stood at the hour.
+- **W28-R54 A Cargo workspace's units.** `kiln_ci::verdict::cargo`, pure: from the root manifest's
+  `members` and `exclude`, one unit per member (its package name and folder) with the members it
+  depends on by path, normal, dev and build dependencies and target tables alike, `workspace =
+  true` resolved through `[workspace.dependencies]`; every member reads the root `Cargo.toml` and
+  `Cargo.lock`. A file no unit takes affects every unit.
+- **W28-R55 Verdicts on the server.** `ci.verdict` (`GET /api/ci/repos/:repo/commits/:sha/verdict`)
+  gives the commit's verdict on each lane whose first parents hold it, its commits named by SHA.
+  The server reads the lane from the mirror (the branch's first parents up to its tip, 200 back
+  from the commit), each commit's changed files over the units the newest commit's manifests
+  give, and each run's latest attempt: every test W16 recorded as a check (its unit from its file,
+  else its suite's crate, else its job), every job without a report as a check of its own (its
+  conclusion as the failure's signature). A test W16 found flaky in a run (W16-R04's first rule)
+  or quarantined (W16-R05) is marked: its failures don't count. `kiln_ci::verdict` decides.
+- **W28-R56 Flake-aware culprit finding.** `kiln_ci::verdict::culprit`, pure, after Google's Flake
+  Aware Culprit Finding: a posterior over "suspect i broke it" and "no culprit, a flake", from a
+  prior (the check's flake rate; at least 0.1 for a test W16 marks flaky) and every try's outcome,
+  a broken check failing every time and an unbroken one at the flake rate. It names a culprit, or
+  no culprit, at a posterior of 0.99; a flaky check's first try runs the failing commit again;
+  each other try is the first suspect whose cumulative posterior reaches one half (the one before
+  it when that one already failed); past ceil(log2 n) + 1 + 3 tries it stops inconclusive. With
+  no flakiness it is a binary search: at most ceil(log2 n) + 1 tries for n suspects.
+- **W28-R57 Bisecting a test.** `ci.runs.bisect` takes a `test` (W16's `suite name`): the job is
+  the one that reported it, `good` the last run of the lane it passed in, and only the commits
+  whose diffs could affect its unit are tried (`suspects`), each try judged by the test's own
+  result in its run, with `vars.KILN_VERDICT_UNITS` and `vars.KILN_VERDICT_TESTS` set. Every
+  bisection's tries come from R56's planner; a try that can't run gives way to its nearest
+  testable neighbour. A bisection's end is a culprit finding (R52) for its lane's verdicts: found
+  (`culprit`), `no-culprit` (a flake) or `inconclusive`. Once declared (`[ci] culprits = true`),
+  culprit finding starts on its own for each new failure with two or more suspects, a test's over
+  its unit's commits, as the run that opened the suspect ends. Its tries run at low priority (20,
+  below W28-R64's work in progress), each a speculative demand of its lane under the lane's window
+  (W28-R68) where the workflow declares admission; on a branch in `[ci] culprit_gates` they go at
+  once, at gate priority (90), nothing holding them. A try is no newer push of its branch: it joins
+  no run-level concurrency group, coalesces with no push and supersedes nothing (W05-R08,
+  W28-R46), so nothing on the branch waits for it, cancels it or is withdrawn by it. Only kiln's
+  bisection marks a run a try (kept with its input, so a restart keeps it); no request can. Result
+  reuse sits behind a trait (`kiln_ci::verdict::Ledger`): before each try the bisection asks what a
+  run of the same inputs concluded, takes it as the try's outcome, and runs nothing. kiln has no
+  ledger for it yet (`NoLedger`: W24-R06's keys a leg's inputs as dispatch plans it, which a
+  bisection can't yet), so every try runs, its legs reusing what W24-R06 finds as they are queued.
+- **W28-R58 Waiting for a verdict.** `ci.verdict.wait` (`GET
+  /api/ci/repos/:repo/commits/:sha/verdict/wait`) answers once the commit's verdict is final (every
+  lane's direct, covered or culprit; `until: final`, the default) or once it changes at all
+  (`until: any`), or when `timeout_s` (600 at most) runs out: the verdict then, whether it is
+  final, and whether the time ran out, as `deploy.releases.wait` does. Code mode has
+  `kiln.ci.verdict()` and `kiln.ci.verdict.wait()` both, whatever the registry's order.
+- **W28-R59 The pushing agent hears.** When a run of a workflow ends, or a bisection, the lane's
+  verdicts around it are worked out again. Each commit whose verdict changed since it was last kept
+  gets a `ci_verdict` event (§4.2), and the agent that pushed it, as step 6 attributes it
+  (`kiln_ci::sched::actor`, W28-R67: the agent token its push came with, as kiln kept the push for
+  the lane's first run at or after the commit, and only for the commits that push brought; else
+  the agent change request whose last pushed commit it is; else its `Kiln-Agent` line), a
+  `verdict.changed` message, queued after its turn as `fix_checks`' messages are:
+  a change of a verdict kept before, or the first answer of a commit the run newly answers.
+  Direct and covered say so in a line, covered as optimistic, not passed; suspect says the failing
+  check, the commit it failed at, its base and how to find the culprit (`ci.runs.bisect` with the
+  test); culprit says why.
+
+**Acceptance criteria**
+
+- **W28-AC50 Random lanes.** Over 10,000 random lanes: each check's verdict is as worked out afresh;
+  a failure already at the base, or of a marked test, makes no suspect; a new failure names exactly
+  the commits whose diffs could affect its unit; covered is never shown as passed; the verdicts
+  don't depend on the order results come in; a culprit named clears those before it. *Property
+  test* (`cargo test -p kiln-ci verdict`).
+- **W28-AC51 The recorded week.** At least 95% of ci's commits on main answered within an hour of
+  their push, with steps 4 and 6 on (P4: the demand table and admission), over seeds 1-8 (`cargo
+  run -p kiln-ci --example replay -- ci/sim/trace.json`; `--late` names each commit left late and
+  what held it).
+- **W28-AC52 End to end.** A native repository with a two-crate Cargo workspace whose workflow
+  reports each test with TAP: a test failing at the base makes no later commit suspect; a new
+  failure in crate p names exactly the commits whose diffs affect p; a quarantined test's failure
+  makes none, and its verdict says so; covered checks carry no outcome. *Integration test*
+  (`cargo test -p kiln --test verdicts`).
+- **W28-AC53 Culprits.** Without flakiness the planner names the culprit within ceil(log2 n) + 1
+  tries for every culprit position (up to 64 suspects); over 10,000 random searches with flake
+  rates up to 0.3, every search ends within its cap and the same outcomes give the same tries.
+  End to end, a bisection of one test tries only the commits that change its crate, names the
+  culprit, and the culprit's verdict is culprit. *Unit, property and integration tests* (`cargo
+  test -p kiln-ci culprit`, `cargo test -p kiln --test verdicts`).
+- **W28-AC54 Agents hear and wait.** End to end, an agent's commit (its `Kiln-Agent` trailer)
+  covered by a later run's pass gets the agent a `verdict.changed` message saying it is covered,
+  and no other commit's; so does a commit without the trailer that the agent pushed with its own
+  token, and not what its branch already held; `ci.verdict.wait` answers at once for a final
+  verdict and says the time ran out when nothing changes. `ci.verdict` and `ci.verdict.wait` are
+  §4.1 routes and operations on every surface (`w20_r01_each_operation_is_a_route`). *Integration
+  and unit tests* (`cargo test -p kiln --test verdicts`, `cargo test -p kiln w28_r58`,
+  `cargo test -p kiln-ci w28_r67`).
+- **W28-AC55 Culprit finding on its own.** End to end, with `[ci] culprits = true`, a new failure
+  of a test with two suspects is bisected without anyone asking, over only its unit's commits,
+  naming the culprit, and the tries' ends start no other bisection. A try's priority is 20 (gate:
+  90), its admission speculative (gate: never held), and no request can make a run a try; a
+  ledger's answers replace tries without changing the search. *Integration and unit tests* (`cargo
+  test -p kiln --test verdicts`, `cargo test -p kiln w28_r57`, `cargo test -p kiln-ci w28_r57`).
+
+**Progress.** R50–R59, AC50 and AC52–AC55 built (2026-10-25; R57's tries, R59's attribution and
+the ledger trait 2026-10-26) in `kiln_ci::verdict` (its `cargo` reader, `culprit` planner and
+`Ledger`), the replayer, `crates/kiln/src/ci/verdict.rs` (`ci.verdict`, `ci.verdict.wait`,
+`ci_verdict`, `verdict.changed` to the agent `kiln_ci::sched::actor` names), `ci/bisect.rs`
+(culprit finding on its own) and `ci/dispatch.rs` (its tries). AC51 is not met: with steps 4 and 6
+on (P4) 85.6% (84.8%–86.3%) of ci's commits are answered within the hour, against 95%; P3, without
+admission, 90.0% (87.8%–90.7%), against 75.9% before verdicts. What holds the rest, each commit
+named in ci/sim/README.md: at the hour about 13 a week wait for a rust pod the recorded week's
+cluster started 2.5 h late or never (superseded first), which no policy answers sooner on this
+trace; 6 (P4 alone) wait for release-binary on the server machine, which the bench's cadence keeps
+free for its exclusive job; 7 for a job running, 7 for a job's needs, 4 for a push made after the
+hour, and 3 have no answer before the window ends. With every pool's capacity unlimited P4 reaches
+89.6%. With step 8's overflow (W28-R80: a pod not started in 2 min gives way to a Linux machine's
+slot) AC51 is met: P4 answers 95.2% (94.1%–97.0%) and P3 99.6% (98.5%–100.0%), wasting 2.4
+runner-h, release, the image and the bench as before (W28-AC81, 2026-10-29); the synthetic lane of
+W25 step 5's step 2 (a push every 10 min, ui-checks 25 min after its push) answers every commit
+within the hour and runs ui-checks every hour under P3, where P2 answers only the last
+(`w28_ac51_a_steady_lane_keeps_its_tail_jobs`).
+
 **Requirements: identical steps shared across pipelines** (step 7's, R70–R79; kiln plan
 `01a1751638db73ba809b8bf4abb6f386`)
 
@@ -9301,6 +10422,56 @@ flight}`, `crates/kiln/src/ci/services/memo.rs`, `crates/kiln/src/runner/runtime
 and the `Dockerfile`, on W24's ledger and memo steps (land/w24, through ci-w25-engine) and the
 runner's cache service (ci-w24-m2-cache), merged in. Live counts wait for step 3's switch.
 
+**Requirements: spreading load across machines** (step 8's, R80–R89; kiln plan
+`01a1751638df77cbb4720dbbb4e407ff`)
+
+- **W28-R80 Overflow.** A `k8s` pool may say where its legs go when their pods are late: `overflow
+  = { hosts = "os == linux && tools has cargo", after = "2m" }` in its `[[ci.pools]]`, `hosts` a
+  constraint over runners' facts as a pool's own `hosts` is, `after` a duration (2 min when left
+  out; another pool kind's `overflow` is refused). A leg of the pool that its executor hasn't
+  taken `after` it was queued (its pod not started, or none started for it within `max`) goes to
+  a runner meeting `hosts` and its own `requires`, capabilities and preferences, on the host and
+  never a pool's executor, as soon as one has room for it, asking of that runner what its
+  `resources:` ask (W05-R03); until one has, it keeps waiting for its pod and looks again every
+  30 s. Its own pod, still starting, stops. Once gone it stays there, its retries too. An untrusted
+  leg goes only when `host` is among its executors (W18-R07). Without `overflow`, a pool's legs
+  wait for its pods, as before. 2 min: half the recorded week's pods started within 8 s, and one
+  not started by 2 min was already in the slowest 13% (ci/sim/README.md).
+- **W28-R81 Every overflow says why.** The leg's notice (`overflow`) and its routing
+  (`ci.legs.routing`'s `overflow`: `pool`, `hosts`, `waited_s`, `at`, `why`) say what it waited
+  for, how long, and where it may run now: `its executor in pool k8s hadn't taken it 2 min after
+  it was queued (1 of the pool's starting, 3 of 64 in all): it runs on a runner where os == linux
+  && tools has cargo, on the host`. Its routing's runners are measured against the overflow's
+  checks from then on, and admission by load (W24-R19) and warm placement (W24-R18) weigh them
+  as any runner.
+- **W28-R82 The replay.** Step 1's replayer models it (`Policy::overflow`): a k8s job whose pod
+  hasn't started `after` the quota took it runs on a free slot of a machine labelled `linux`, the
+  least busy, giving the quota back, and looks again every 30 s; ci/sim/README.md reports "P3 +
+  overflow" and "P4 + overflow" beside P0 to P5, and sweeps `after`.
+
+**Acceptance criteria: spreading load**
+
+- **W28-AC80 Overflow, simulated.** A leg whose pod is late runs, `after` it was queued, on a runner
+  of `hosts` with room and never on one lacking what `hosts` or its own `requires` ask; its pod,
+  starting, stops; it says why, and its routing shows the overflow's checks. A pod on time keeps
+  its leg, a pool without `overflow` waits for its pods however late, a leg with no room keeps
+  waiting and goes within 30 s of a runner freeing (or runs in its pod if that comes first), and
+  an untrusted leg goes only with `host` among its executors. `overflow` is a `k8s` pool's, with
+  a constraint and a duration, and an unknown key in it is refused. *Unit tests* (`cargo test -p
+  kiln-ci w28_r80`).
+- **W28-AC81 The recorded week.** With the overflow at 2 min, P3 gives at least 95% of ci's commits
+  on main a direct or covered verdict within 60 min over seeds 1-8 (99.6%: 90.0% without), wasting
+  at most 2.4 runner-h (2.38); release's, the image's and the bench's shares are no lower than
+  P3's without it; and P4 with it meets W28-AC51 (95.2%). *Replay test* (`cargo test -p kiln-ci
+  w28_ac81`).
+
+**Progress (step 8).** v1's part on main (eb400ce1c, cfba6d8c3: benches and release's Linux and
+Windows builds and ci's release-binary placed by `requires`). R80–R82 and AC80–AC81 built
+(2026-10-29) in `kiln_ci::sched::{pools, state}` and the replay. Production's change (W28 step 3's,
+docs/trains/w28-step3.md) carries the `k8s` pool's `overflow` and `[ci.scheduler.admission]`;
+adacachy's load per CPU over CI hours (1.62 before, at most 1.0 asked) is measured from
+`GET /api/metrics/history` once production runs them.
+
 **M2 (built 2026-10-25, awaiting review).**
 
 - **The runner's cache service** (R08, `crates/kiln/src/runner/work`): objects at `<work>/_cas`,
@@ -9364,8 +10535,8 @@ errors as `{ error, code, details? }`. Today's routes (`/api/runs`, `/api/jobs/.
 | GET | `/api/ci/repos/:repo/heads` | `ci.uploads.heads` (the commits a pack can leave out) | runs.read | W17 |
 | POST | `/api/ci/repos/:repo/packs?sha=` | `ci.uploads.pack` (a working tree's commit, as a thin pack) | runs.trigger | W17 |
 | POST | `/api/ci/repos/:repo/local-runs` | `ci.runs.local` (`{ sha, ref, event, payload?, workflows?, job?, matrix?, inputs?, vars?, secrets? }`; untrusted unless the owner's) | runs.trigger | W17 |
-| POST | `/api/ci/runs/:id/cancel` | `ci.runs.cancel` | runs.cancel | W05 |
-| POST | `/api/ci/runs/:id/rerun` | `ci.runs.rerun` (`{ mode: all\|failed\|job, job?, debug?, fresh_actions?, no_reuse?, cold? }`) | runs.rerun | W05, W24 |
+| POST | `/api/ci/runs/:id/cancel` | `ci.runs.cancel` (`{ jobs? }`: just those legs, the run going on) | runs.cancel | W05, W26 |
+| POST | `/api/ci/runs/:id/rerun` | `ci.runs.rerun` (`{ mode: all\|failed\|job\|set, job?, jobs?, debug?, fresh_actions?, no_reuse?, cold? }`; `set` runs `jobs` again) | runs.rerun | W05, W24, W26 |
 | POST | `/api/ci/runs/:id/approve` | `ci.runs.approve` (untrusted run or environment) | runs.approve | W15, W18 |
 | GET | `/api/ci/runs/:id/{summary,annotations,artifacts,tests,flow,metrics,attestations}` (built; the actions it pinned come with the run) | `ci.runs.summary`, `ci.runs.annotations`, `ci.artifacts.list`, `ci.tests.run`, `ci.runs.flow`, `ci.metrics.run`, `ci.runs.attestations` | runs.read | W06, W08, W16, W04, W18 |
 | GET | `/api/ci/legs/:id/tests` · `/api/ci/repos/:repo/tests?sort=failing\|slowest\|flaky` | `ci.tests.leg`, `ci.tests.repo` | runs.read | W16 |
@@ -9429,16 +10600,19 @@ errors as `{ error, code, details? }`. Today's routes (`/api/runs`, `/api/jobs/.
 | GET/POST | `/api/repos/:repo/change-requests` · `/api/change-requests/:id/...` | `ci.change_requests.list`, `.open`, `.get` (the rest as diffs') | diffs.* | W14 |
 | GET | `/api/review/inbox` | `ci.review.inbox` (your conversations) | diffs.read | W14 |
 | GET · DELETE | `/api/repos/:repo/queue` · `/api/queue/:entry` | `ci.queue.list`, `.remove` | diffs.read, queue.manage | W14 |
+| POST | `/api/repos/:repo/queue` | `ci.queue.enqueue` (`{ trunk?, changes: [{ number, head }] }`: a host's changes into its host's own queue, each at the head Review cleared) | diffs.land | W28-R109 |
 | GET | `/api/stacks/:id` | `ci.stacks.get` | diffs.read | W14 |
 | POST | `/api/repos/:repo/submit` | `ci.diffs.submit_patch` (no git needed) | diffs.submit | W14 |
 | GET/POST · PUT/DELETE · POST | `/api/attachments` · `/:id` · `/pause` (built) | `attachments.list`, `.get`, `.save`, `.remove`, `.pause` | runs.read · agents.attach | W20 |
 | GET · POST | `/api/incidents?state=&attachment=` · `/:id` · `/:id/report` (built) | `incidents.list`, `.get`, `.report` | runs.read · its agent, or who may attach there | W20 |
 | POST · GET | `/api/ci/runs/:id/bisect` · `/api/ci/runs/:id/bisects[/:bisect]` (built) | `ci.runs.bisect` (`{ job?, good?, bad? }`: the job run on the commits between, halving them), `ci.runs.bisects` | runs.debug (bisecting is diagnosing) · runs.read | W20 |
-| POST · GET · POST | `/api/experiments` · `/:id` · `/:id/{decide,cancel}` (built) | `experiments.start`, `.list`, `.get`, `.decide`, `.cancel` | experiments.run · runs.read (reading) | W20 |
+| POST · GET · POST · POST | `/api/experiments` · `/:id` · `/:id/{decide,cancel}` · `/suggest` (built) | `experiments.start`, `.list`, `.get`, `.decide`, `.cancel`, `.suggest` | experiments.run · runs.read (reading) | W20 |
 | GET · PUT | `/api/ci/repos/:repo/providers` | `ci.providers.get`, `.set` (`{ providers }`: what its CI runs on) | runs.read · settings.manage | W23 |
 | POST | `/api/ci/repos/:repo/providers/sync` | `ci.providers.sync` (other providers' runs, looked at now) | runs.read | W23 |
 | GET | `/api/ci/repos/:repo/providers/workflows` | `ci.providers.workflows` (each provider's CI files, checked) | runs.read | W23 |
 | GET | `/api/ci/repos/:repo/commits/:sha/checks` | `ci.providers.checks` (every provider's runs of a commit) | runs.read | W23 |
+| GET | `/api/ci/repos/:repo/commits/:sha/verdict?workflow=` | `ci.verdict` (a commit's verdict per unit and test on each lane: direct, covered, suspect, culprit) | runs.read | W28 |
+| GET | `/api/ci/repos/:repo/commits/:sha/verdict/wait?until=&timeout_s=&workflow=` | `ci.verdict.wait` (until the verdict is final, or changes with `until: any`; `timeout_s` at most 600) | runs.read | W28 |
 | GET | `/api/ci/runs/:id/pending` | `ci.runs.pending` (whichever provider's run) | runs.read | W23 |
 | GET · POST | `/api/ci/repos/:repo/pulls[/:n]` · `/:n/{comments,reviews,merge}` | `host.pulls.list`, `.get`, `.comment`, `.review`, `.merge` (GitHub's, GitLab's and Bitbucket's; as the person when they signed in with that host) | diffs.read · diffs.review · diffs.land | W23 |
 | POST | `/api/hooks/gitlab` · `/api/hooks/bitbucket` | GitLab's and Bitbucket's webhooks | open, their secret | W23 |
@@ -9457,8 +10631,9 @@ token model.
 read and coalesced per object at most every 250 ms: `ci_run`, `ci_leg` (status, wait reason,
 progress), `ci_step`, `ci_annotation`, `ci_artifact`, `ci_runner` (facts, health), `ci_pool`,
 `ci_routing` (rules changed), `diff`, `diff_version`, `review`, `comment`, `queue`, `deployment`,
-`environment`, `incident`, `experiment`, `notification`. Today's `run`, `job`, `agent`, `sample`,
-`queue` messages stay.
+`environment`, `incident`, `experiment`, `notification`, `ci_verdict` (a commit's verdict on a lane
+changed: `repo`, `workflow`, `branch`, `sha`, `kind`, `why`, the verdict; W28-R59). Today's `run`,
+`job`, `agent`, `sample`, `queue` messages stay.
 
 ### 4.3 CLI
 
@@ -9478,6 +10653,7 @@ kiln metrics criterion|hyperfine|gobench|pytest-benchmark|gbench|k6 PATH
 kiln store verify|gc                    kiln ci bench [--scheduler|--expr|--parse|--cache|--logs]
 kiln tokens create|list|revoke          kiln login
 kiln repo provider <repo> [provider…]
+kiln verify <deploy|artifact|commit|change> <id>   kiln verify export|vsa …   kiln verify --offline FILE --root PEM
 kiln work why <run|leg|step>            kiln work status|warm|verify|gc|reap   kiln rerun <run> --cold
 kiln gocacheprog                        kiln rustc   (W24: the runner's cache helpers)
 ```

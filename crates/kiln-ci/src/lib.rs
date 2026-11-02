@@ -11,10 +11,12 @@
 //! - [`oidc`]: the OIDC issuer's key rotation, claims and subjects (W10).
 //! - [`sched`]: queues, concurrency, priorities, fairness, routing, retries (W05).
 //! - [`results`]: test reports and flaky classification (W16).
+//! - [`verdict`]: each commit's verdict per unit and test: direct, covered, suspect, culprit (W28).
 //! - [`insights`]: rollups that merge, percentiles, critical paths (W19).
 //! - [`compare`]: what differs between two runs or legs (W19).
 //! - [`sbom`]: SBOMs from lockfiles, SPDX and CycloneDX (W18).
 //! - [`attest`]: provenance statements, DSSE envelopes and Sigstore bundles (W18).
+//! - [`logs`]: a step's log by digest, its chunks' chain against what kiln keeps of it (W27).
 //! - [`trust`]: which untrusted runs wait for approval, and where legs may connect (W18).
 //! - [`turn`]: whose turn it is on a change under review (W26).
 //! - [`suggest`]: a comment's suggestion blocks, and what applying one does to a file (W26).
@@ -44,6 +46,7 @@ pub mod headroom;
 pub mod identity;
 pub mod insights;
 pub mod land;
+pub mod logs;
 pub mod mirror;
 pub mod oidc;
 pub mod plan;
@@ -60,6 +63,7 @@ pub mod suggest;
 pub mod trigger;
 pub mod trust;
 pub mod turn;
+pub mod verdict;
 pub mod wf;
 pub mod wire;
 pub mod work;

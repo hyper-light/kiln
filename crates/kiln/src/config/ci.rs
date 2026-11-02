@@ -17,6 +17,12 @@ pub struct Ci {
     /// its typed outputs, exports, implicit checkout and the rest. v1 then runs nothing for a
     /// commit the engine took. Off by default: `.kiln/` pipelines stay on v1 until it's on.
     pub kiln_workflows: bool,
+    /// Culprit finding starts on its own for each new failure with two or more suspects (docs/ci.md
+    /// W28-R57). Off until declared: kiln decides it only then.
+    pub culprits: bool,
+    /// Branches whose culprit finding is a gate's: its tries go at once, at gate priority
+    /// (W28-R57); elsewhere they run at low priority.
+    pub culprit_gates: Vec<String>,
     /// Route GitHub's hosted labels (`ubuntu-latest`, `macos-latest`, …) by OS and architecture
     /// (docs/ci.md W05-R21). Off by default: then such a label must be on a runner, as it must for
     /// GitHub's self-hosted runners.
@@ -157,10 +163,33 @@ pub struct Ci {
     /// key = "/etc/kiln/land_ed25519"   # an SSH private key; with format = "openpgp", a key id
     /// ```
     pub land_signing: Option<LandSigning>,
+    /// Whether a new repository kiln hosts requires the commits pushed to it to be signed by
+    /// someone kiln verifies (`required`, the default) or only warns (`warn`), where its
+    /// `.kiln/review.yaml` doesn't say (docs/ci.md W27-R03). Repositories from before warn.
+    pub signatures: kiln_ci::land::SignatureMode,
+    /// `[ci.trail]`: when kiln signs a checkpoint of its trail of signed statements (docs/ci.md
+    /// W27-R09).
+    pub trail: Trail,
     /// `kiln workflow run`'s own server (docs/ci.md W17-R06): every leg runs on its one runner,
     /// whatever names for runners its `runs-on` uses. Not a setting.
     #[serde(skip)]
     pub local: bool,
+}
+
+/// `[ci.trail]`'s settings: kiln signs a checkpoint of its trail once `checkpoint_every` entries
+/// came after the last one, or the oldest of them has waited `checkpoint_minutes`, whichever comes
+/// first (docs/ci.md W27-R09).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct Trail {
+    pub checkpoint_every: u64,
+    pub checkpoint_minutes: u64,
+}
+
+impl Default for Trail {
+    fn default() -> Self {
+        Trail { checkpoint_every: 256, checkpoint_minutes: 10 }
+    }
 }
 
 /// `[ci.advisories]`'s settings.
@@ -355,11 +384,23 @@ pub struct Attest {
     /// `keyless`: Fulcio and Rekor, and the audience of kiln's identity token for Fulcio.
     pub fulcio_url: Option<String>,
     pub rekor_url: Option<String>,
+    /// Which of Rekor's APIs `rekor_url` speaks: `v1` (the default), or `v2` (rekor-tiles, which
+    /// takes hashedrekord entries alone: the trail's anchors, not keyless signing's DSSE entries).
+    pub rekor_api: RekorApi,
     pub audience: Option<String>,
     /// The Sigstore trusted root (`trusted_root.json`: its Fulcios, Rekors and CT logs) keyless
     /// bundles are verified against: the instance's kiln signs with, when that's its own.
     /// Without one, Sigstore's public instance's, through its TUF repository.
     pub trusted_root: Option<std::path::PathBuf>,
+}
+
+/// Which of Rekor's APIs kiln speaks to `[ci.attest] rekor_url` (docs/seams.md, "Sigstore").
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum RekorApi {
+    #[default]
+    V1,
+    V2,
 }
 
 /// How landed commits are signed.

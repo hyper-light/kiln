@@ -12,7 +12,8 @@
 //! answer and to one application at the most: exactly one when it was answered taken, accepted or
 //! parked, none when it was refused. It holds every update to the server's copy once and in order,
 //! and each viewer to its copy. It prints its counts and its seed, and at full scale needs 200
-//! faults and 100,000 updates.
+//! faults and 100,000 updates: with frames made unreadable (below), 50,000, and 10,000 of those
+//! frames come.
 //!
 //! The commands are the UI's:
 //! - models to change to, live commands refused while their runner is away, over the API and on
@@ -20,7 +21,9 @@
 //! - messages and skill runs under their ids, on sockets, which their sessions' inboxes take once.
 //!
 //! A runner isn't killed within a moment of a command it was sent, from the API or a socket, nor
-//! within a moment of one of its sessions handing its harness a message that waited in its queue.
+//! while a model change it was sent is unanswered or within a moment of one's answer (frames made
+//! unreadable can hold one up for seconds after it was sent), nor within a moment of one of its
+//! sessions handing its harness a message that waited in its queue.
 //! Its record of what its inbox took and of its sessions' queues is written half a second after it
 //! changes: a crash before then loses a message (CP-T3.1's journal closes that), or hands one again
 //! that its session had already handed its harness (CP-T3.5's). What its session took and its
@@ -33,6 +36,17 @@
 //! fall. `WIRE_LAB_SESSIONS`, `WIRE_LAB_COMMANDS`, `WIRE_LAB_LINES` and `WIRE_LAB_SECONDS` scale
 //! it down for a quick run; `WIRE_LAB_FRAMES` is how rare a frame's fault is (one in 101 dropped
 //! by default; 0: none). kiln's CI runs it nightly on more seeds (`.kiln/wire-lab.yaml`).
+//!
+//! `WIRE_LAB_GARBLE` (0, none, by default) makes frames unreadable too, besides those dropped,
+//! doubled and late: about one in that many of each side's channel frames a kind the other doesn't
+//! know (`unknown=`), and as many cut short, given bytes after them or mangled (`garble=`;
+//! docs/wire.md, "What can't be read"). The channel makes up for each as for a frame lost below it,
+//! so the commands and updates are held as before. A frame made unreadable goes marked, and its
+//! receiver says it came (`kiln::net`), so the account counts them from the processes' logs, which
+//! outlive their kills and the server's restart: the frames made unreadable, those that came (the
+//! rest were lost below the channel with their connection), and those refused. Every one that came
+//! must have been refused: the server's refusals are what `kiln_wire_refused_total` counts, each
+//! said in its log (`kiln::refused`), and a runner says each frame of the server's it couldn't read.
 //!
 //! `cargo test -p kiln --features chaos --test wire_lab --release`: its account prints as it passes
 //! too, and `-- --nocapture` shows its progress as it goes. Without `chaos` it has no faults to
@@ -51,7 +65,7 @@ use std::time::{Duration, Instant};
 use anyhow::Context as _;
 
 use common::agents::{self, Runner, Talk};
-use common::lab::{Viewer, copy, turns};
+use common::lab::{Viewer, copy, field, turns};
 use common::{Options, http};
 use serde_json::{Value, json};
 
@@ -226,10 +240,10 @@ fn must_of(answer: &Value) -> (Must, String) {
 /// Starts runner `n` again (or the first time) on its state, with the lab's faults.
 /// Each new session's first turn waits for `go` (`FAKE_CLAUDE_GO`), so the sessions are all open
 /// before they stream.
-fn start_runner(dir: &Path, port: u16, n: usize, seed: u64, lines: &str, go: &Path, framed: u64) -> anyhow::Result<(Runner, PathBuf)> {
+fn start_runner(dir: &Path, port: u16, n: usize, seed: u64, lines: &str, go: &Path, (framed, garble): (u64, u64)) -> anyhow::Result<(Runner, PathBuf)> {
     let mut chaos = format!("drop={}s,down=1s", 5 + n);
-    if framed != 0 {
-        chaos = format!("{chaos},{}", frames("term", 46, seed + 1 + u64::try_from(n)?, framed));
+    if framed != 0 || garble != 0 {
+        chaos = format!("{chaos},{}", frames("term", 46, seed + 1 + u64::try_from(n)?, framed, garble));
     }
     let go = go.to_string_lossy();
     agents::runner_with(dir, port, &format!("lab-{n}"), Some(&chaos), Talk { lines: 1, every_ms: 10 }, &[("FAKE_CLAUDE_FIRST_LINES", lines), ("FAKE_CLAUDE_GO", &go)])
@@ -238,10 +252,48 @@ fn start_runner(dir: &Path, port: u16, n: usize, seed: u64, lines: &str, go: &Pa
 /// The faults a side's channel frames go through (`crate::runner::chaos`), of `lane`'s frames of
 /// message `variant`: about one in `every` dropped, one in `every` × 7/11 sent twice and one in
 /// `every` × 5/11 sent late. At one in 11 dropped, the channel's repairs (an item's resend after a
-/// gap, or after its patience) take most of its time.
-fn frames(lane: &str, variant: u8, seed: u64, every: u64) -> String {
+/// gap, or after its patience) take most of its time. With `garble`, about one in that many made a
+/// kind the receiver doesn't know, and as many garbled (none: 0).
+fn frames(lane: &str, variant: u8, seed: u64, every: u64, garble: u64) -> String {
     let (twice, late) = ((every * 7 / 11).max(2), (every * 5 / 11).max(2));
-    format!("shed={lane}/{variant}:{every},twice={lane}/{variant}:{twice},late={lane}/{variant}:{late},seed={seed}")
+    let mut faults = String::new();
+    if every != 0 {
+        faults = format!("shed={lane}/{variant}:{every},twice={lane}/{variant}:{twice},late={lane}/{variant}:{late},");
+    }
+    if garble != 0 {
+        faults.push_str(&format!("unknown={lane}/{variant}:{garble},garble={lane}/{variant}:{garble},"));
+    }
+    format!("{faults}seed={seed}")
+}
+
+/// What the lab's processes said of the frames made unreadable, from their logs (which outlive
+/// their kills and the server's restart): how many each side made (a copy sent twice counts twice),
+/// how many came, and how many their readers refused.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+struct Unreadable {
+    made: usize,
+    came: usize,
+    refused: usize,
+}
+
+impl Unreadable {
+    fn of(logs: &[PathBuf]) -> Unreadable {
+        let mut u = Unreadable::default();
+        for log in logs {
+            for line in std::fs::read_to_string(log).unwrap_or_default().lines() {
+                if line.contains("chaos: frames made unreadable") {
+                    u.made += field(line, "copies").unwrap_or(1);
+                } else if line.contains("chaos: an unreadable frame came") {
+                    u.came += 1;
+                } else if line.contains("a frame from the server couldn't be read") || (line.contains("refused what it couldn't read") && (line.contains("wire=\"runner\"") || line.contains("wire=runner "))) {
+                    // A runner's of the server's frames; the server's of a runner's (`kiln::refused`,
+                    // where `kiln_wire_refused_total` counts them).
+                    u.refused += 1;
+                }
+            }
+        }
+        u
+    }
 }
 
 #[test]
@@ -254,16 +306,23 @@ fn every_command_once_and_every_update_once_in_order_through_every_fault() -> an
     // About one frame in this many dropped on each side, and some doubled and late (0: none, to
     // compare).
     let framed = knob("WIRE_LAB_FRAMES", 101);
+    // About one frame in this many made unreadable on each side, and as many garbled (0: none).
+    let garble = knob("WIRE_LAB_GARBLE", 0);
+    let faulted = (framed, garble);
     let lines_s = lines.to_string();
     let mut draw = Draw::new(seed);
     let dir = tempfile::tempdir()?;
     let go = dir.path().join("go");
-    let server_faults = if framed != 0 { frames("control", 54, seed, framed) } else { String::new() };
-    let chaos_env: Vec<(&str, &str)> = if framed != 0 { vec![("KILN_CHAOS", server_faults.as_str())] } else { Vec::new() };
+    let server_faults = if framed != 0 || garble != 0 { frames("control", 54, seed, framed, garble) } else { String::new() };
+    let mut chaos_env: Vec<(&str, &str)> = if server_faults.is_empty() { Vec::new() } else { vec![("KILN_CHAOS", server_faults.as_str())] };
+    // Each refusal the server notes, in its log (`kiln::refused`), for the account.
+    if garble != 0 {
+        chaos_env.push(("KILN_LOG", "info,kiln::refused=debug"));
+    }
     let mut s = common::start_env(dir.path(), &Options { agent: false, ci: "", extra: "" }, false, &chaos_env)?;
     let mut runners = Vec::new();
     for n in 0..RUNNERS {
-        runners.push(start_runner(dir.path(), s.port, n, seed, &lines_s, &go, framed)?);
+        runners.push(start_runner(dir.path(), s.port, n, seed, &lines_s, &go, faulted)?);
     }
     for (n, (_, log)) in runners.iter().enumerate() {
         agents::connected(s.port, &s.admin, &format!("lab-{n}"), log, Duration::from_secs(120))?;
@@ -309,10 +368,15 @@ fn every_command_once_and_every_update_once_in_order_through_every_fault() -> an
     // The runner about to be killed (none: usize::MAX): it hears no command for a moment first,
     // from the API or a socket. What it took and hadn't yet applied would go with it.
     let quiet_runner = Arc::new(AtomicUsize::new(usize::MAX));
+    // Each runner's model changes from the API that are on their way, and how many have been
+    // answered: it isn't killed while one is unanswered, nor a moment after one's answer.
+    let api_open: Arc<Vec<AtomicUsize>> = Arc::new((0..RUNNERS).map(|_| AtomicUsize::new(0)).collect());
+    let api_answered: Arc<Vec<AtomicUsize>> = Arc::new((0..RUNNERS).map(|_| AtomicUsize::new(0)).collect());
     let started = Instant::now();
     let api: Vec<std::thread::JoinHandle<()>> = (0..API_THREADS)
         .map(|t| {
             let (port, admin, ids, out, quiet_runner) = (s.port, s.admin.clone(), ids.clone(), Arc::clone(&api_sent), Arc::clone(&quiet_runner));
+            let (open, answered) = (Arc::clone(&api_open), Arc::clone(&api_answered));
             let share = api_n / API_THREADS + usize::from(t < api_n % API_THREADS);
             let every = run_for / u32::try_from(share.max(1)).unwrap_or(1);
             std::thread::spawn(move || {
@@ -330,11 +394,19 @@ fn every_command_once_and_every_update_once_in_order_through_every_fault() -> an
                     };
                     let token = format!("m-a{t}-{k:06}");
                     let path = format!("/api/harness/sessions/{}/command", ids.get(session).map_or("", |(id, _)| id.as_str()));
+                    let runner = ids.get(session).map_or(usize::MAX, |(_, r)| *r);
+                    if let Some(o) = open.get(runner) {
+                        o.fetch_add(1, Ordering::SeqCst);
+                    }
                     let answer = match http(port, "POST", &path, &admin, Some(&json!({"type": "set_model", "model": token}))) {
                         // No status: the answer broke off as it came.
                         Ok((0, _)) | Err(_) => Answered::CutOff,
                         Ok((st, _)) => Answered::Status(st),
                     };
+                    if let (Some(o), Some(a)) = (open.get(runner), answered.get(runner)) {
+                        a.fetch_add(1, Ordering::SeqCst);
+                        o.fetch_sub(1, Ordering::SeqCst);
+                    }
                     if let Ok(mut o) = out.lock() {
                         o.push(Sent { session, how: How::ApiModel, token, answer });
                     }
@@ -351,9 +423,10 @@ fn every_command_once_and_every_update_once_in_order_through_every_fault() -> an
     let kills: Vec<(Duration, Option<usize>)> = (0..RUNNERS).map(|n| (run_for.mul_f64(0.2 + 0.2 * n as f64), Some(n))).chain([(run_for.mul_f64(0.85), None)]).collect();
     let mut next_kill = 0;
     let mut quiet: Option<(usize, Instant)> = None;
-    // A runner whose kill is due, its sessions watched for what their harnesses are handed: since
-    // when, when they last were, and the sizes of their files of messages then.
-    let mut handing: Option<(Instant, Instant, Vec<u64>)> = None;
+    // A runner whose kill is due, its sessions watched for what their harnesses are handed and its
+    // model changes' answers: since when, when either last changed, and the sizes of their files of
+    // messages and how many of its model changes had been answered then.
+    let mut handing: Option<(Instant, Instant, (Vec<u64>, usize))> = None;
     let (mut reloads, mut kills_done, mut server_restarts) = (0usize, 0usize, 0usize);
     let mut next_reload = started + Duration::from_millis(500);
     let mut next_said = started + Duration::from_secs(15);
@@ -373,25 +446,34 @@ fn every_command_once_and_every_update_once_in_order_through_every_fault() -> an
                     quiet_runner.store(n, Ordering::Relaxed);
                 }
                 Some(n) if quiet.is_some_and(|(_, at)| now >= at) && {
-                    // Killed once its sessions' harnesses have been handed nothing for a moment,
-                    // the rest of the lab going on meanwhile.
+                    // Killed once its sessions' harnesses have been handed nothing for a moment and
+                    // every model change it was sent has been answered a moment before, the rest of
+                    // the lab going on meanwhile: one it took just before and hadn't applied yet
+                    // would go with it. (Its messages are its inboxes', watched by what their
+                    // harnesses are handed.)
+                    let theirs = |v: &&Viewer| ids.iter().any(|(id, r)| *r == n && *id == v.session);
+                    let models = |done: bool| viewers.iter().filter(theirs).map(|v| v.asked.values().filter(|a| !a.message && a.answer().is_some() == done).count()).sum::<usize>();
+                    let open = api_open.get(n).map_or(0, |o| o.load(Ordering::SeqCst)) + models(false);
+                    let answered = api_answered.get(n).map_or(0, |a| a.load(Ordering::SeqCst)) + models(true);
                     let sizes: Vec<u64> = sessions.iter().filter(|x| x.runner == n).map(|x| std::fs::metadata(&x.messages).map_or(0, |m| m.len())).collect();
-                    let (since, last, before) = handing.get_or_insert_with(|| (now, now, sizes.clone()));
-                    if *before != sizes {
-                        (*last, *before) = (now, sizes);
+                    let state = (sizes, answered);
+                    let (since, last, before) = handing.get_or_insert_with(|| (now, now, state.clone()));
+                    if *before != state {
+                        (*last, *before) = (now, state);
                     }
                     let (handed_quiet, waited) = (now.saturating_duration_since(*last), now.saturating_duration_since(*since));
-                    if handed_quiet < HANDED_QUIET && waited >= HANDED_WAIT {
-                        eprintln!("wire lab: lab-{n}'s sessions were still being handed messages {} s on: killed anyway", HANDED_WAIT.as_secs());
+                    let calm = handed_quiet >= HANDED_QUIET && open == 0;
+                    if !calm && waited >= HANDED_WAIT {
+                        eprintln!("wire lab: lab-{n} was still being handed messages or answering model changes ({open} unanswered) {} s on: killed anyway", HANDED_WAIT.as_secs());
                     }
-                    handed_quiet >= HANDED_QUIET || waited >= HANDED_WAIT
+                    calm || waited >= HANDED_WAIT
                 } => {
                     handing = None;
                     let (mut runner, _) = runners.remove(n);
                     let _ = runner.0.kill();
                     let _ = runner.0.wait();
                     drop(runner);
-                    runners.insert(n, start_runner(dir.path(), s.port, n, seed, &lines_s, &go, framed)?);
+                    runners.insert(n, start_runner(dir.path(), s.port, n, seed, &lines_s, &go, faulted)?);
                     kills_done += 1;
                     quiet = None;
                     quiet_runner.store(usize::MAX, Ordering::Relaxed);
@@ -591,9 +673,24 @@ fn every_command_once_and_every_update_once_in_order_through_every_fault() -> an
     for ((how, words), n) in &answers {
         say(&format!("  {how:?} answered {words}: {n}"));
     }
-    let framing = if framed != 0 { format!("and frames dropped, doubled and late on both sides ({server_faults} at the server)") } else { "no frame faults".to_owned() };
+    let framing = if server_faults.is_empty() { "no frame faults".to_owned() } else { format!("and frame faults on both sides ({server_faults} at the server)") };
     say(&format!("faults: {faults} ({cuts} link cuts, {reloads} socket reloads, {kills_done} runners killed, {server_restarts} server restarts), {framing}"));
     say(&format!("commands lost {lost}, doubled {doubled}, unanswered {unanswered}, applied though refused {wrongly}; updates lost {updates_lost}, doubled {updates_doubled}"));
+    // The frames made unreadable: each that came refused by its reader, none taken.
+    let mut logs: Vec<PathBuf> = runners.iter().map(|(_, l)| l.clone()).collect();
+    logs.push(dir.path().join("server.log"));
+    let unreadable = Unreadable::of(&logs);
+    if garble != 0 {
+        let since = ["runner", "server"].iter().flat_map(|w| ["unknown", "malformed"].map(|c| common::refused(s.port, &s.admin, w, c))).sum::<u64>();
+        say(&format!(
+            "frames made unreadable: {} ({} came, {} lost below the channel with their connections); refused {}; came and not refused {} (kiln_wire_refused_total of runner and server frames since the server's last start: {since})",
+            unreadable.made,
+            unreadable.came,
+            unreadable.made.saturating_sub(unreadable.came),
+            unreadable.refused,
+            unreadable.came.abs_diff(unreadable.refused),
+        ));
+    }
     for o in odd.iter().take(40) {
         eprintln!("  {o}");
     }
@@ -629,9 +726,22 @@ fn every_command_once_and_every_update_once_in_order_through_every_fault() -> an
     anyhow::ensure!(sent.len() == commands_n, "{} commands sent of {commands_n}", sent.len());
     anyhow::ensure!((lost, doubled, unanswered, wrongly) == (0, 0, 0, 0), "commands lost {lost}, doubled {doubled}, unanswered {unanswered}, applied though refused {wrongly}");
     anyhow::ensure!((updates_lost, updates_doubled) == (0, 0), "updates lost {updates_lost}, doubled {updates_doubled}");
+    if garble != 0 {
+        anyhow::ensure!(unreadable.made > 0 && unreadable.came > 0, "no frame was made unreadable: {unreadable:?}");
+        anyhow::ensure!(unreadable.came == unreadable.refused, "frames made unreadable that came: {}, refused: {}", unreadable.came, unreadable.refused);
+    }
     if commands_n >= 10_000 {
         anyhow::ensure!(faults >= 200, "{faults} faults: the lab needs 200");
-        anyhow::ensure!(updates >= 100_000, "{updates} updates: the lab needs 100,000");
+        // A frame made unreadable is made up for as one lost below the channel is: at one in 64 of
+        // each kind they about double its repairs, and updates come about half as fast (seed 1 on
+        // one machine, the same hour: 173,587 without them, 80,978 with, and 65,247 with twice the
+        // frames dropped and late instead, WIRE_LAB_FRAMES=50). The repairs are what's held then,
+        // so it needs half the updates, and that many of those frames to have come.
+        let floor = if garble == 0 { 100_000 } else { 50_000 };
+        anyhow::ensure!(updates >= floor, "{updates} updates: the lab needs {floor}");
+        if garble != 0 {
+            anyhow::ensure!(unreadable.came >= 10_000, "{} frames made unreadable came: the lab needs 10,000", unreadable.came);
+        }
     }
     Ok(())
 }

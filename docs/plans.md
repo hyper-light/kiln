@@ -3,16 +3,19 @@
 A plan is what an agent will do, kept with the agent session it belongs to: written in its Plan
 tab, made by the agent or from one of its goals, or saved from the plan it proposed; changed (each
 change a version), shared by a link, and run on that agent or any other of any harness kiln runs
-(Claude Code, Codex, Gemini CLI, opencode, Goose, Amp, ...). Each agent's Plan tab lists its own
-plans (**Your plans**); there's no list of every plan apart from them. A plan's page, its runs and
-its research lead back to the agent it's kept with.
+(Claude Code, Codex, Gemini CLI, opencode, Goose, Amp, ...). Each agent's Plan tab has **Plans**:
+the plan under way up top, as it moves (its to-do list, or the plan it proposed), and under it,
+**Saved plans**: every plan kept, in brief, newest first, to search by their words and narrow by
+whose they are (this agent's, other agents', no agent's), where they stand (being planned, not run
+yet, run before) and their tags, a row each that opens in place to run it on that agent. A plan's
+page, its runs and its research lead back to the agent it's kept with.
 
 ## Keeping one
 
-- **In an agent's Plan tab**, under **Your plans**: **New plan**, then its steps one at a time,
+- **In an agent's Plan tab**, under **Plans**: **New plan**, then its steps one at a time,
   each with its own **description**, **examples**, **acceptance criteria** and **tests**; an
   optional overview for what every step should know. Save it, change it (**Edit**), and run it on
-  that agent, without leaving it.
+  that agent (**Run here**), without leaving it; any plan found under **Saved plans** the same way.
 
   A step's **acceptance criteria** are as many as it needs, each **in words** or **a measure**: a
   target ("p99.9 latency"), how it compares (is at most, less than, at least, more than, exactly,
@@ -168,6 +171,12 @@ waits for instead (**after 2, 3**).
   nothing is at work and nothing more can start, the run stops, saying which steps hold it up:
   **Retry with a new agent** (a step given to an agent: its goal on that agent's stack again) or
   **Take it over** (kiln stops holding the agent to it; **It's met: go on** when it is).
+  Each step changes hands signed (docs/ci.md W27-R08): kiln hands it to its agent, which signs its
+  receipt as it takes the step up; tried again, kiln takes it for the agent before; taken over, it
+  goes to you. Your receipt is yours when you sign it on your device (`kiln plans take <run> <n>`,
+  with the key `kiln login` made); taken over in the browser, which has no key, kiln signs it for
+  you, saying your own signature is missing, and the page says so beside the button. The agent
+  before you, or before the new try, can't say the step is met: kiln refuses it, and records it.
   **Stop the run** lets every step under way go: their own agents interrupted, and a step's goal
   on an agent it was given to taken out of that agent's stack.
 - **What comes out.** In a git repository, each step's work goes up for review as it's met, as
@@ -203,13 +212,63 @@ run until it's ready.
      goal saying the step it's made from (`goals_split` turns one into its acceptance criteria and
      tests), the steps that don't wait for each other side by side on subagents of the agent's own
      (docs/goals.md, "A plan's steps side by side");
-   - `review`: the same, and the goal stack pauses for a person to look at the plan first; resuming
-     it carries on;
+   - `review`: the same, and the goal stack pauses for a person to review the plan first
+     ("Reviewing a plan", below);
    - `agents`: the plan runs with an agent per step, as its graph says; the goal waits for the run
      (a part held for it, nothing sent to its agent for it).
 
 Once every step is met (or the run is done), the goal is met too, at once, with no check of its
 own: "Met with its plan: its 4 steps are met."
+
+## Reviewing a plan
+
+A plan waiting on you is read and answered where its agent is: at the top of the agent's **Plan**
+tab, beside its conversation (the tab says so with a mark, on a desktop's tray and a phone's
+tabs). Two kinds come there: a plan an agent's goal stack waits on (readied with `then: review`),
+and one it proposed in plan mode, its harness asking. Every **Review** in kiln opens it there
+(`/agents/:id?tab=plan`): Mission control's row, the card on other pages, the plan's card in the
+conversation, and the goal on its stack ("waits for your review"). A row or a card approves it at
+once too.
+
+The review says where the plan came from (the goal it was made from, or the agent proposing it),
+then its steps, a line each, those that run side by side together ("2 at once · after 2"). A step
+opens in place to what to do, when it's done and how it's tested, and what it rests on, each
+long part a few lines first and the rest on asking. **Comment on step n** starts an answer in
+your own words with the step named.
+
+However much research a plan has, the review shows a fixed few lines of it: how many findings
+and sources, how many of each grade, and the findings its steps rest on that are worth a look
+before answering, worst first: weak (graded D or F, what `plans_ready` warns of), contested
+(counterclaims weighing a quarter or more), or quoted where kiln couldn't find the words. Three
+show; the rest on asking. A step resting on no finding says so. Every finding is there on asking,
+a line each (its grade, id and claim), one opened at a time to why kiln graded it so, what's
+against it and its quotes. An open step says how many findings it rests on and how they're
+graded, and lists those worth a look, every one on asking. Under the review, the agent's research
+shows in brief.
+
+Then the answer, one of three (keys 1 to 3, then ⌘↵):
+
+| | A plan its goals wait on | A plan proposed in plan mode |
+|---|---|---|
+| **Approve** | its steps go to the agent as the goal's parts: the stack resumes | it leaves plan mode and starts (with what its harness offers to allow from now on, if you tick it) |
+| **Reject** | its steps come off the stack, the goal is skipped, the agent is told, and the stack waits, paused, until you resume it | it stops there and waits (a denial with no words) |
+| **Other…** | your words go to the agent as a part of the goal: it changes the plan and says it's ready again, and it comes back to you, whatever `then` it says | it stays in plan mode with your words (a denial with them) and proposes again |
+
+A plan that comes back after **Other…** says what changed since you looked: what you asked, and
+each step added, taken out, rewritten or changed (and in what: what to do, when it's done, what
+it rests on…), from the versions kiln keeps. Answered, the review gives way to what you answered,
+for a while. An answer being written is kept in this browser until it's sent.
+
+A plan its goals wait on is answered by a person (`plans.review`, `POST /api/plans/:id/review`),
+for the version they looked at: one that changed since, or that nothing waits on any more, is
+refused. Each answer is kept, the last with the plan (`reviewed`). The moment it's answered (or
+its goals resumed), its agent needs you no longer: Mission control's row, the card and the Plan
+tab's mark go at once, not on the goal stacks' next round.
+
+It goes one way, as the goal's parts: wherever a plan is run, one its goals wait on is approved
+instead. Its page has **Approve it** in **Run it**'s place (its steps picked are shown, not run on
+their own), and its row among an agent's saved plans has **Approve** in **Run here**'s. A person's
+`plans.run` of it approves it too, and an agent's is refused: approving is a person's.
 
 ## Sharing one
 
@@ -229,17 +288,19 @@ A plan's written steps are `items` in the API: `[{title, description, examples, 
 
 | Method | Path | |
 | --- | --- | --- |
-| GET | `/api/plans` | every plan, newest change first; `session`: an agent's (made in its conversation), `proposed=1`: the plans agents proposed (plan mode), kept by kiln |
+| GET | `/api/plans` | every plan, newest change first; `q`: those whose title, text, steps or tags hold it (any case), `session`: an agent's (made in its conversation), `proposed=1`: the plans agents proposed (plan mode), kept by kiln; `brief=1`: each without its text, items or steps' titles (`step_count` says how many), as the Plan tab lists them |
 | POST | `/api/plans` | `{title?, body, tags?, source?}` |
-| GET / PATCH / DELETE | `/api/plans/:id` | one plan; `{title?, body?, items?, tags?}` (a title given empty is taken from the text, else the first step, as for a new plan) |
+| GET / PATCH / DELETE | `/api/plans/:id` | one plan (with `reviewed`: the last answer to its review, `{answer, words?, version, by, at}`); `{title?, body?, items?, tags?}` (a title given empty is taken from the text, else the first step, as for a new plan) |
 | GET | `/api/plans/:id/versions` | every version, newest first |
 | POST | `/api/plans/:id/restore` | `{version}`: made current again, as a new version |
+| POST | `/api/plans/:id/review` | `{answer: approve \| reject \| revise, words?, version?, key?}`: a person's answer to the plan its agent's goal stack waits on, for `version` (none: as it is now); `words` with `revise`; answers `{plan, stack}`; refused (409) when nothing waits on its review or it changed since; asked again under `key` (or `Idempotency-Key`), answered as things stand (CP-T3.2) |
 | POST | `/api/plans/:id/ready` | `{then?: goals \| review \| agents, skipped?: {internal?, external?}}`: its planning phase ended (a plan made from a goal goes on as `then` says); answers `{plan, warnings, research?, say?, then?, goal?, run?, stack?}` (`research`: its research's markdown, for the agent to show) |
-| POST | `/api/plans/:id/run` | `{session}` or `{new: {target, kind, cwd?}}`, `mode`: `message`, `steps`, `goals` or `agents`; `agents` takes `new` `{on, kind, cwd, model?, effort?, mode?}` for every step, `steps` `[{on?, kind?, cwd?, model?, effort?, mode?, agent?}]` for each (`agent`: `main` or an agent's id), `session` (the main agent), `parallel` and `max_parallel`, and answers `{run, steps, note}`; any mode but `message` takes `only` (step numbers from 1: just those, each keeping its number, the steps they wait for outside them taken as done), and `goals` takes `split` (each step a goal stack of its acceptance criteria and tests; answers `split`: how many were) |
+| POST | `/api/plans/:id/run` | `{session}` or `{new: {target, kind, cwd?}}`, `mode`: `message`, `steps`, `goals` or `agents`; `agents` takes `new` `{on, kind, cwd, model?, effort?, mode?}` for every step, `steps` `[{on?, kind?, cwd?, model?, effort?, mode?, agent?}]` for each (`agent`: `main` or an agent's id), `session` (the main agent), `parallel` and `max_parallel`, and answers `{run, steps, note}`; any mode but `message` takes `only` (step numbers from 1: just those, each keeping its number, the steps they wait for outside them taken as done), and `goals` takes `split` (each step a goal stack of its acceptance criteria and tests; answers `split`: how many were); while its agent's goals wait on a person's review of it, a person's run approves it instead, however it's asked (as `/review`'s `approve`; answers `{approved: true, session, sent, plan, stack}`, `sent`: its steps going to that agent as the goal's parts; asked again under the same `key`, the same) and an agent's is refused (403) |
 | GET | `/api/plans/:id/runs` | runs, newest first |
 | GET | `/api/plans/runs` | runs of one agent per step (`?active=1`: those under way) |
 | GET | `/api/plans/runs/:run` | a run: each step's `{n, title, goal, stand, needs, given, agent, agent_id, reason, tries}`, its `state`, `reason`, `note` and stack |
 | POST | `/api/plans/runs/:run/stop` | stop it |
-| POST | `/api/plans/runs/:run/steps/:n/{retry,take,met}` | retry a step, take it over, say it's met |
+| POST | `/api/plans/runs/:run/steps/:n/{retry,take,met}` | retry a step, take it over (`{signs: true}`: you'll sign your receipt on your device; the answer's `custody` says what to sign), say it's met |
+| POST | `/api/plans/runs/:run/steps/:n/receipt` | `{receipt}`: your receipt of a step you took over, signed on your device |
 | POST | `/api/plans/:id/share` | `{on}` |
 | GET | `/api/shared/plans/:token` | **open**: a shared plan's title, text and steps |

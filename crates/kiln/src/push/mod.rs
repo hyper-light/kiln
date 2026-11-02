@@ -397,7 +397,7 @@ mod tests {
                 let mut said = 0;
                 for i in 0..400u64 {
                     let id = format!("ag{}", i % 5);
-                    let approvals = if i % 3 == 0 { vec![ApprovalBrief { id: format!("a{t}-{i}"), tool: ToolKind::Shell, tool_name: "Bash".into(), title: "ls".into(), at: i64::try_from(i).unwrap_or(0) }] } else { Vec::new() };
+                    let approvals = if i % 3 == 0 { vec![ApprovalBrief { id: format!("a{t}-{i}"), tool: ToolKind::Shell, tool_name: "Bash".into(), title: "ls".into(), at: i64::try_from(i).unwrap_or(0), agent: None }] } else { Vec::new() };
                     let status = if approvals.is_empty() { Status::Running } else { Status::Waiting };
                     let due = svc.watch.lock().heard(Info { id: id.clone(), status, approvals, ..Info::default() });
                     if let Some(d) = due

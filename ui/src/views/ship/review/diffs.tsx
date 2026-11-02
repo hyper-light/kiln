@@ -388,6 +388,10 @@ function Line({ file, row, ctx, map, q, toks, asking }: { file: PatchFile; row: 
   );
 }
 
+/** A whole file over this many lines reads plain: its rows stay as cheap as before the colours, a
+ * file of thousands still scrolling as a short one (W26-R15, AC06). */
+const WHOLE_COLOURED = 2000;
+
 /** The whole file in place of the file list (no popup), its lines numbered, threads where they sit. */
 export function WholeFile({ file, ctx, map, text }: { file: PatchFile; ctx: FilesCtx; map: Map<string, { t: Thread; a: Anchor }[]>; text: Res<string> }) {
   return (
@@ -396,6 +400,12 @@ export function WholeFile({ file, ctx, map, text }: { file: PatchFile; ctx: File
     </React.Suspense>
   );
 }
+
+/**
+ * The whole file takes the focus as it opens, and only then: a ref made anew each render would take
+ * it back on every one (each word typed in the Files filter, each thread that comes).
+ */
+const takeFocus = (el: HTMLElement | null) => el?.focus({ preventScroll: true });
 
 function WholeBody({ file, ctx, map, text }: { file: PatchFile; ctx: FilesCtx; map: Map<string, { t: Thread; a: Anchor }[]>; text: Res<string> }) {
   const body = useResText(text);
@@ -408,8 +418,9 @@ function WholeBody({ file, ctx, map, text }: { file: PatchFile; ctx: FilesCtx; m
   const linesOf = React.useMemo(() => makeLinesOf(all), [all]);
   const whole = React.useMemo(() => ({ ...ctx, rowsByFile: all, linesOf }), [ctx, all, linesOf]);
   const q = ctx.q.trim().toLowerCase();
-  // The whole file read as one piece of code, in its colours; asked about, its own lines around it.
-  const hl = useHighlighter(resolveLanguage(null, file.path, body));
+  // The whole file read as one piece of code, in its colours, up to WHOLE_COLOURED lines; asked about, its own lines around it.
+  const coloured = rows.length <= WHOLE_COLOURED;
+  const hl = useHighlighter(coloured ? resolveLanguage(null, file.path, body) : null);
   const toks = React.useMemo<FileToks>(() => ({ old: new Map(), neu: new Map((hl?.(body) ?? []).map((t, i): [number, Tok[]] => [i + 1, t])) }), [hl, body]);
   const asking = useFileAsk(file.path, (_side, from, to) =>
     body
@@ -418,7 +429,7 @@ function WholeBody({ file, ctx, map, text }: { file: PatchFile; ctx: FilesCtx; m
       .join("\n"),
   );
   return (
-    <div className="rv-full" role="region" aria-label={file.path} tabIndex={-1} ref={(el) => el?.focus({ preventScroll: true })} onKeyDown={(e) => e.key === "Escape" && ctx.open("")}>
+    <div className="rv-full" role="region" aria-label={file.path} tabIndex={-1} ref={takeFocus} onKeyDown={(e) => e.key === "Escape" && ctx.open("")}>
       <div className="rv-fullh">
         <span className="rv-path">{file.path}</span>
         <button type="button" className="rv-ib" aria-label="Close" title="Close" onClick={() => ctx.open("")}>

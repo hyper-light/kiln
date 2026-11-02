@@ -6,7 +6,7 @@
  * does.
  */
 import type http from "node:http";
-import type { ShipChange, ShipCommit, ShipDetail, ShipMark, ShipPace, ShipPage, ShipPip } from "../src/api/ship.ts";
+import type { ShipChange, ShipCommit, ShipDetail, ShipJob, ShipJobDone, ShipMark, ShipPace, ShipPage, ShipPip, ShipScope, ShipVerb } from "../src/api/ship.ts";
 import { STATES } from "../src/components/ui/status-glyph-spec.ts";
 import { Trunk } from "./ship-sim.ts";
 
@@ -80,6 +80,9 @@ function commits(): ShipCommit[] {
       host: "kiln",
       change: { ...change("D41", "diff", "kiln", "pipeline: dynamic matrices", "requested", ["user:ada"], { question: 1, nit: 0, issue: 0, blocking: 0 }), revision: 7, latest: 7 },
       runs: [{ id: "run-41", pipeline: "ci" }],
+      // Who made it (ship.rs's made_by): the mock's long agent stands in for the Matrix agent, so
+      // Files' ask reaches one (mock/agents.ts's agents.about), for sam.
+      made_by: { agent: "demo-long", person: "user:sam" },
       actions: [
         { name: "hand_off", method: "POST", path: "/api/ship/hand-off", body: { repo: REPO, sha: sha("4") } },
         { name: "review", method: "GET", path: "/api/diffs/D41", body: null },
@@ -218,6 +221,54 @@ function commits(): ShipCommit[] {
       tags: ["v0.2.0"],
       runs: [{ id: "run-1", pipeline: "ci" }],
     }),
+    // Two other repositories (docs/ci.md W26-R29: Ship's rows are repositories, each its newest
+    // commit): hyper-raft's newest a person's failure, Hand off and Retry on its row (the one before
+    // it in production); acme/web's in production. kiln's row stays first.
+    row({
+      repo: "hyper-light/hyper-raft",
+      sha: sha("e1"),
+      short: "e1e1e1e",
+      message: "raft: a lease outlives a term",
+      author: "mei",
+      at: t - 2700,
+      stand: "needs_you",
+      line: "rust lint + test · assertion failed in raft::lease",
+      cursor: 22,
+      pips: pips("none", "passed", "failed"),
+      runs: [{ id: "run-hr-2", pipeline: "ci" }],
+      actions: [
+        { name: "hand_off", method: "POST", path: "/api/ship/hand-off", body: { repo: "hyper-light/hyper-raft", sha: sha("e1") } },
+        { name: "retry", method: "POST", path: "/api/ci/runs/run-hr-2/rerun", body: { mode: "failed" } },
+      ],
+    }),
+    row({
+      repo: "hyper-light/hyper-raft",
+      sha: sha("e0"),
+      short: "e0e0e0e",
+      message: "raft: elections back off",
+      author: "user:mei",
+      at: t - 5400,
+      stand: "shipped",
+      line: "In production",
+      cursor: 21,
+      pips: pips("none", "passed", "passed", "passed", "passed", "healthy"),
+      environments: [{ environment: "production", production: true }],
+      runs: [{ id: "run-hr-1", pipeline: "ci" }],
+    }),
+    row({
+      repo: "acme/web",
+      sha: sha("f1"),
+      short: "f1f1f1f",
+      message: "web: the cart keeps its items",
+      author: "user:sam",
+      at: t - 1800,
+      stand: "shipped",
+      line: "In production",
+      cursor: 31,
+      pips: pips("approved", "passed", "passed", "passed", "passed", "healthy"),
+      environments: [{ environment: "production", production: true }],
+      runs: [{ id: "run-web-1", pipeline: "ci" }],
+    }),
   ];
 }
 
@@ -230,9 +281,60 @@ const PI = "pi-kitchen";
 /** Retried, by browser (its User-Agent), so the e2e projects running side by side each have their own Pi. */
 const piRetried = new Set<string>();
 
+/** What a hand-off from a browser says of its custody (docs/ci.md W27-R08): kiln's take for the person. */
+const SIGNED_FOR_YOU = { hand_on: `sha256:${"5".repeat(64)}`, kiln_signed_for_you: true };
+
 /** The fixed rows each browser handed off (`POST /api/ship/hand-off`), by its user agent as Pi's
  * retry is, so a desktop's and a phone's tests don't see each other's. */
 const handedBy = new Map<string, Set<string>>();
+
+/** What each browser did to the fixed rows' jobs (`POST /api/ship/jobs`, docs/ci.md W26-R21, R22), by
+ * its user agent as Hand off's: what it paused, cancelled and ran again, and each body it sent. */
+interface JobActs {
+  paused: Set<string>;
+  cancelled: Set<string>;
+  again: Set<string>;
+  bodies: unknown[];
+}
+const jobActs = new Map<string, JobActs>();
+function actsOf(ua: string): JobActs {
+  let a = jobActs.get(ua);
+  if (!a) {
+    a = { paused: new Set(), cancelled: new Set(), again: new Set(), bodies: [] };
+    jobActs.set(ua, a);
+  }
+  return a;
+}
+
+/** A leg's glyph when it has ended. */
+const ENDED = new Set(["passed", "failed", "error", "superseded", "reused", "flaky"]);
+
+/** A fixed row's jobs as the jobs pane acts on them (ship.rs `jobs_json`): its legs' own jobs, waiting
+ * ones too, as this browser left them; each says the verbs that apply and why each other doesn't. */
+function jobsOf(legs: readonly { name: string; state: string; job: string; run: string }[], acts: JobActs): ShipJob[] {
+  return legs.map((l) => {
+    const state = acts.cancelled.has(l.job) ? "superseded" : acts.again.has(l.job) ? "queued" : l.state;
+    const ended = ENDED.has(state);
+    const paused = !ended && acts.paused.has(l.job);
+    const running = !ended && state === "running";
+    const verbs: ShipVerb[] = [];
+    const why_not: Partial<Record<ShipVerb, string>> = {};
+    const say = (v: ShipVerb, no: string | null) => (no ? (why_not[v] = no) : verbs.push(v));
+    say("retry", ended ? null : "it hasn't finished");
+    say("cancel", ended ? "it has finished" : null);
+    say("pause", ended ? "it has finished" : paused ? "it's paused" : null);
+    say("resume", ended ? "it has finished" : paused ? null : "it isn't paused");
+    return { id: l.job, run: l.run, pipeline: "ci", name: l.name, ...(running ? { runner: "metal-epyc-01" } : {}), ...(paused ? { paused_at: T0 } : {}), verbs, why_not };
+  });
+}
+
+/** Whether a word picks a job that stands so (ship.rs `jobs_in`). */
+function inScope(state: string, scope: ShipScope): boolean {
+  if (scope === "all") return true;
+  if (scope === "failed") return state === "failed" || state === "error";
+  if (ENDED.has(state)) return false;
+  return scope === "running" ? state === "running" : state !== "running";
+}
 
 /** Who takes a fixed row's Hand off, as the server decides (W26-R18): its author's agent when an
  * agent wrote it, else ci-doctor, the agent the mock's repository has attached. */
@@ -469,6 +571,54 @@ function paceOf(list: ShipCommit[]): ShipPace {
 /** Every row: those a test added, the trunk's commits (newest first), then the fixed ones. */
 const all = (): ShipCommit[] => [...arrived, ...(trunk?.commits() ?? []), ...commits()];
 
+/** The machines the mock's commits ran on (examples). */
+const MACHINES = ["adacachy", "kiln-a094a12d", "adas-mac-studio-2", "jupiter"];
+
+/**
+ * A commit's run time and machines as the server says them (docs/ci.md W26-R29), where its row
+ * doesn't: from its checks pip, none before they start, no end while they run (examples).
+ */
+function withRan(c: ShipCommit): ShipCommit {
+  if (c.ran !== undefined) return c;
+  const checks = c.pips.find((x) => x.stage === "checks")?.state ?? "none";
+  const from = c.at + 20;
+  const machines = [MACHINES[Math.abs(c.cursor) % MACHINES.length] ?? "adacachy"];
+  if (checks === "none" || checks === "waiting" || checks === "queued") return { ...c, ran: null, machines: [] };
+  if (checks === "running") return { ...c, ran: { from, to: null }, machines };
+  return { ...c, ran: { from, to: from + 38 + ((Math.abs(c.cursor) * 97) % 900) }, machines };
+}
+
+/** The failing row's (3333333) Checks, fixed as Ada's approved stills of its jobs pane draw them (docs/ci.md
+ * W26-R23): its failed leg, two waiting and one running, each a job of its own to act on, whatever
+ * the mock's live run is doing; the failed and the running one stream the live job's log (Output). */
+function failingLegs(row: ShipCommit, live: { run: string; job: string }) {
+  return [
+    {
+      name: row.line.split(" · ")[0] ?? "checks",
+      state: "failed",
+      job: `fail-${row.short}`,
+      run: live.run,
+      log: live.job,
+      attempts: 2,
+      note: row.line.split(" · ").slice(1).join(" · "),
+      start: T0 - 900,
+      end: T0 - 840,
+    },
+    { name: "linux", state: "queued", job: `linux-${row.short}`, run: live.run, log: null, attempts: 1, note: "", start: null, end: null },
+    { name: "windows", state: "queued", job: `windows-${row.short}`, run: live.run, log: null, attempts: 1, note: "", start: null, end: null },
+    { name: "macos", state: "running", job: `macos-${row.short}`, run: live.run, log: live.job, attempts: 1, note: "", start: T0 - 60, end: null },
+  ];
+}
+
+/** A fixed row's Checks legs with their jobs, waiting ones too: the failing row's own, or else the
+ * failed one its line names (for a row whose checks failed), then each job of the mock's live run. */
+function liveLegs(row: ShipCommit, live: { run: string; job: string }, ctx: Ctx): { name: string; state: string; job: string; run: string }[] {
+  if (row.short === "3333333") return failingLegs(row, live);
+  // Its failed leg streams the live job's log (Output), but is a job of its own to act on.
+  const failed = row.pips.find((x) => x.stage === "checks")?.state === "failed" ? [{ name: row.line.split(" · ")[0] ?? "checks", state: "failed", job: `fail-${row.short}`, run: live.run }] : [];
+  return [...failed, ...(ctx.liveRun?.()?.jobs ?? []).map((j) => ({ name: j.name, state: LEG_STATE[j.status] ?? "queued", job: j.job, run: live.run }))];
+}
+
 /** Ship's routes, and the actions its rows name for the trunk's own ids (`ship-run-…`,
  * `ship-rel-…`, a trunk runner whose upgrade failed), so they answer before the routes the rest of
  * the mock keeps for those paths. True when it answered. */
@@ -482,7 +632,22 @@ export async function handleShip(req: http.IncomingMessage, res: http.ServerResp
     const list = all().filter(
       (c) => (!repo || c.repo === repo) && (!q.get("host") || c.host === q.get("host")) && (!q.get("kind") || c.kind === q.get("kind")) && (q.get("lens") !== "review" || c.kind !== "commit"),
     );
-    const page: ShipPage = { commits: list.map((c) => handedRow(c, ua)), next_cursor: null, pace: paceOf(all().filter((c) => !repo || c.repo === repo)) };
+    const pace = paceOf(all().filter((c) => !repo || c.repo === repo));
+    // Ship's rows (docs/ci.md W26-R29): each repository's newest commit, the first of its own list.
+    if (q.get("by") === "repo") {
+      const seen = new Set<string>();
+      const heads = list.filter((c) => !seen.has(c.repo) && !!seen.add(c.repo));
+      const page: ShipPage = { commits: heads.map((c) => withRan(handedRow(c, ua))), next_cursor: null, pace };
+      ctx.json(res, 200, page);
+      return true;
+    }
+    // A page: `limit` of them from where the last page's last (`cursor`) left off, as the server pages.
+    const limit = Number(q.get("limit") ?? "") || list.length;
+    const after = q.get("cursor");
+    const from = after === null ? 0 : list.findIndex((c) => String(c.cursor) === after) + 1;
+    const slice = list.slice(from, from + limit);
+    const next = from + limit < list.length ? (slice.at(-1)?.cursor ?? null) : null;
+    const page: ShipPage = { commits: slice.map((c) => withRan(handedRow(c, ua))), next_cursor: next, pace };
     ctx.json(res, 200, page);
     return true;
   }
@@ -500,36 +665,48 @@ export async function handleShip(req: http.IncomingMessage, res: http.ServerResp
             ? [
                 {
                   pipeline: "ci",
-                  legs: [
-                    // A row whose checks failed failed in a leg its line names ("rust lint + test · assertion failed in
-                    // sync::reconnect"), which streams one of the mock's own jobs so its log opens.
-                    ...(row.pips.find((x) => x.stage === "checks")?.state === "failed"
-                      ? [
-                          {
-                            name: row.line.split(" · ")[0] ?? "checks",
-                            state: "failed",
-                            attempts: 2,
-                            note: row.line.split(" · ").slice(1).join(" · "),
-                            job: live.job,
-                            run: live.run,
-                            start: T0 - 900,
-                            end: T0 - 840,
-                          },
-                        ]
-                      : []),
-                    // Then each job of the live run, as it stands: its own job, its times once it has them.
-                    ...(ctx.liveRun?.()?.jobs ?? []).map((j) => ({
-                      name: j.name,
-                      state: LEG_STATE[j.status] ?? "queued",
-                      attempts: 1,
-                      note: j.error ?? "",
-                      ...(j.start != null ? { job: j.job, run: live.run, start: j.start } : {}),
-                      ...(j.end != null ? { end: j.end } : {}),
-                    })),
-                  ],
+                  legs:
+                    row.short === "3333333"
+                      ? failingLegs(row, live).map((l) => ({
+                          name: l.name,
+                          state: l.state,
+                          attempts: l.attempts,
+                          note: l.note,
+                          ...(l.log ? { job: l.log, run: l.run } : {}),
+                          ...(l.start != null ? { start: l.start } : {}),
+                          ...(l.end != null ? { end: l.end } : {}),
+                        }))
+                      : [
+                          // A row whose checks failed failed in a leg its line names ("rust lint + test · assertion failed in
+                          // sync::reconnect"), which streams one of the mock's own jobs so its log opens.
+                          ...(row.pips.find((x) => x.stage === "checks")?.state === "failed"
+                            ? [
+                                {
+                                  name: row.line.split(" · ")[0] ?? "checks",
+                                  state: "failed",
+                                  attempts: 2,
+                                  note: row.line.split(" · ").slice(1).join(" · "),
+                                  job: live.job,
+                                  run: live.run,
+                                  start: T0 - 900,
+                                  end: T0 - 840,
+                                },
+                              ]
+                            : []),
+                          // Then each job of the live run, as it stands: its own job, its times once it has them.
+                          ...(ctx.liveRun?.()?.jobs ?? []).map((j) => ({
+                            name: j.name,
+                            state: LEG_STATE[j.status] ?? "queued",
+                            attempts: 1,
+                            note: j.error ?? "",
+                            ...(j.start != null ? { job: j.job, run: live.run, start: j.start } : {}),
+                            ...(j.end != null ? { end: j.end } : {}),
+                          })),
+                        ],
                 },
               ]
             : [],
+          ...(live ? { jobs: jobsOf(liveLegs(row, live, ctx), actsOf(ua)) } : {}),
           ...(replantOf(row, ua) ? { replant: replantOf(row, ua) ?? [] } : {}),
           // Its runs are the mock's own (as its legs are), so their pages open (the commit page's step 3).
           runs: live ? [{ id: live.run, pipeline: "ci" }] : (row.runs ?? []),
@@ -557,7 +734,63 @@ export async function handleShip(req: http.IncomingMessage, res: http.ServerResp
     else ctx.json(res, 200, detail);
     return true;
   }
-  // A row's Hand off (W26-R18), answered as the server answers: who took it, or why no one did.
+  // A commit's jobs acted on together (W26-R21, R22), answered as the server answers: each job done, or why not.
+  if (p === "/api/ship/jobs" && m === "POST") {
+    let body: { repo?: unknown; sha?: unknown; verb?: unknown; jobs?: unknown; scope?: unknown } = {};
+    try {
+      body = JSON.parse((await readBody(req)) || "{}") as typeof body;
+    } catch {
+      body = {};
+    }
+    const verb = body.verb as ShipVerb;
+    const scope = typeof body.scope === "string" ? (body.scope as ShipScope) : null;
+    const named = Array.isArray(body.jobs) ? body.jobs.filter((x): x is string => typeof x === "string") : null;
+    if (typeof body.repo !== "string" || typeof body.sha !== "string" || !["retry", "pause", "resume", "cancel"].includes(verb) || (!named?.length && !scope)) {
+      ctx.json(res, 400, { error: "`repo`, `sha` and `verb`, and the `jobs` or a `scope`" });
+      return true;
+    }
+    const row = all().find((c) => c.repo === body.repo && c.sha.startsWith(String(body.sha)));
+    const live = ctx.liveJob?.();
+    if (!row || !live) {
+      ctx.json(res, 404, { error: "no such commit" });
+      return true;
+    }
+    const acts = actsOf(ua);
+    acts.bodies.push(body);
+    const legs = liveLegs(row, live, ctx);
+    const jobs = jobsOf(legs, acts);
+    const stateOf = (id: string) => (acts.cancelled.has(id) ? "superseded" : acts.again.has(id) ? "queued" : (legs.find((l) => l.job === id)?.state ?? "none"));
+    const out: ShipJobDone[] = [];
+    for (const id of named ?? []) if (!jobs.some((j) => j.id === id)) out.push({ job: id, done: false, why: "not a job of this commit" });
+    const picked = named ? jobs.filter((j) => named.includes(j.id)) : jobs.filter((j) => inScope(stateOf(j.id), scope ?? "all"));
+    for (const j of picked) {
+      if (!j.verbs.includes(verb)) {
+        out.push({ job: j.id, run: j.run, done: false, why: j.why_not[verb] ?? "not now" });
+        continue;
+      }
+      if (verb === "pause") acts.paused.add(j.id);
+      if (verb === "resume" || verb === "cancel") acts.paused.delete(j.id);
+      if (verb === "cancel") {
+        acts.cancelled.add(j.id);
+        acts.again.delete(j.id);
+      }
+      if (verb === "retry") {
+        acts.again.add(j.id);
+        acts.cancelled.delete(j.id);
+      }
+      out.push({ job: j.id, run: j.run, done: true });
+    }
+    ctx.json(res, 200, { repo: row.repo, sha: row.sha, verb, jobs: out });
+    return true;
+  }
+  // What this browser sent the jobs pane's endpoint, for the e2e to read; `reset` starts it over.
+  if (p === "/api/mock/ship/jobs") {
+    if (q.get("reset")) jobActs.delete(ua);
+    ctx.json(res, 200, { bodies: jobActs.get(ua)?.bodies ?? [] });
+    return true;
+  }
+  // A row's Hand off (W26-R18), answered as the server answers: who took it, or why no one did;
+  // handed off from a browser, which has no key, kiln signs it for the person (W27-R08).
   if (p === "/api/ship/hand-off" && m === "POST") {
     let body: { repo?: unknown; sha?: unknown } = {};
     try {
@@ -572,7 +805,7 @@ export async function handleShip(req: http.IncomingMessage, res: http.ServerResp
     }
     const taken = trunk?.handOff(sha);
     if (taken != null) {
-      if (taken) ctx.json(res, 200, { handed: { to: "ci-doctor", agent: "agent-ci-doctor", incident: `inc-${sha.slice(0, 7)}`, what: ["checks"] } });
+      if (taken) ctx.json(res, 200, { handed: { to: "ci-doctor", agent: "agent-ci-doctor", incident: `inc-${sha.slice(0, 7)}`, what: ["checks"] }, custody: SIGNED_FOR_YOU });
       else ctx.json(res, 409, { error: `${sha.slice(0, 7)} has nothing open to hand off` });
       return true;
     }
@@ -584,7 +817,7 @@ export async function handleShip(req: http.IncomingMessage, res: http.ServerResp
     }
     handedBy.set(ua, mine.add(sha));
     const to = takerOf(row);
-    ctx.json(res, 200, { handed: { to, agent: `agent-${to}`, ...(row.change ? {} : { incident: `inc-${row.short}` }), what: [row.change ? "threads" : "checks"] } });
+    ctx.json(res, 200, { handed: { to, agent: `agent-${to}`, ...(row.change ? {} : { incident: `inc-${row.short}` }), what: [row.change ? "threads" : "checks"] }, custody: SIGNED_FOR_YOU });
     return true;
   }
   if (p === "/api/mock/ship/hand-off" && m === "POST") {

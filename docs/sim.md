@@ -48,7 +48,7 @@ KILN_SIM_SEEDS=2000 KILN_SIM_FROM=100000 taskset -c <cpu> <the binary> --exact <
 ```
 
 The model's test is `sim::sync::tests::sync_converges_and_loses_nothing_under_the_nemesis` or
-`sim::moves::tests::a_moving_session_never_leaves_its_work_behind`.
+`sim::moves::tests::a_moving_session_never_leaves_its_work_behind` (and the transfers model's, `sim::transfers::tests::w27_ac05_no_stale_act_is_ever_applied`, not measured yet).
 
 ## What it is
 
@@ -70,6 +70,7 @@ The model's test is `sim::sync::tests::sync_converges_and_loses_nothing_under_th
 | sync | a synced repo's copies on two or three machines and the server's member: `sync::Copy`, `Feed` and `Index` as hyper-durable replicas, `sync::server::take_steps`. The runner's own decisions: its looks (`sync::runner::look_now_at`) and what it sends (`to_send`). The model plays the network around them, as the runner's and the server's shells would. Each copy is on a simulated disk through `sync::fs` | frames lost and cut off on the sync lane (its order kept, as a QUIC stream keeps it); contents' requests lost, and in some seeds sent twice and overtaking one another (a client trying again), their answers lost; runners and the server crashing; power losses; a crash at a chosen write; fsync and write errors; full disks; people editing all the while, a file's size often kept | nothing spreads that nobody wrote; every copy converges on the log's repo; no one's last write is lost |
 | moves | the same, with an agent session moving between the machines: `sync::runner`'s `look_now_at`, `left_at` and `arrived` (the copy it goes to has saved the log through where it left), as `harness::session`'s `files_out` and `files_in` use them | the sync model's | a session leaves no write of its own behind, goes on with each in its folder, and every move finishes |
 | goal driver | the goal driver's own round of the stacks (`Driver::round`, adopting, resuming and stepping them) each tick, as `Driver::drive` runs it, on a simulated clock, through `SimHarness`. Its store is inline, so each call is a wait a crash can come at | the server crashing at waits the seed picks (up to 0.8% of the driver's polls) and between them; machines away; harnesses starting again; usage limits; people clearing goals | one goal under way, in order, ended ones never back; nothing to a paused agent; no goal again within 30 s unless the agent was cut off from it; every stack runs to its end |
+| transfers | agent sessions changing hands (docs/ci.md W27-R08), over statements signed under a test CA: kiln's server's act check (`custody::act_check`: its signer's identity not revoked, then `kiln_ci::identity::custody::acted`'s fence), its check of a hand-on (`custody::hands_on_to`), its signed words (`custody::word_signed`) and the runner's check of one (`runner::custody::addressed`), and the custody chain's hop and walk. The model plays the processes and the server's store around them: a hand-over certifies the new holder and revokes every epoch below, as kiln's server does as it issues an epoch's identity | two or three machines, each with one or two runner processes: sessions moved, resumed from the server's store while their machine is cut off (kiln's take, for the process left behind), taken over by a newer process of their machine (the old one still acting), carried through blue/green upgrades and their rollbacks; the server restarting, its count of which process holds what stale; frames lost, doubled and late, a cut-off machine's kept until its link comes back; copies left behind acting, handing their session on and announcing it, at random | no act a copy left behind signs is ever applied; no hand-over's word is applied by a process it isn't for; one holder per epoch; every transfer carries both its sides' signatures, each session's chain walking back to where it began; once the world calms, every holder runs its session and no copy left behind still runs |
 
 Not modelled yet, and where they will be:
 
@@ -96,6 +97,7 @@ What the models leave out, so what no seed can find:
 - **The goal driver's model has one node, the server's:** the scheduler never chooses between nodes
   there.
 - **kiln's temporary files** left in a folder (`.kiln-sync-*.tmp`) are left out of the check.
+- **The transfers model's processes** are their copies' keys and whether they run: the host's own take-over (its package, files and harness) isn't run, a take-over there being the epoch up, the receipt signed at it, and a session refused where a copy of it runs already. The server's store doesn't crash there: what kiln certified and revoked is kept whole. Work, changes and reviews changing hands aren't modelled (`crates/kiln/tests/transfers.rs` tests them end to end).
 
 ## The bugs it found
 
@@ -125,3 +127,5 @@ folder never synced. `sim::sync`'s `the_planted_lost_write_after_a_torn_page_is_
 budget with it, and passes once the checker finds it: a power loss tears, zeroes or loses such a
 file, and contents nobody wrote spread, a last write is lost, or a copy stays apart from the log.
 The seed that finds it must pass without the plant.
+
+The transfers model plants five, each a bug kiln had or could have (W27-AC05): the act check going by machine; a process a newer one superseded passing the server's words on to it, which applies them as its own (the 14:18 drop); a resume from the server's store that doesn't revoke the epoch it leaves; a copy left behind told to let go only once it announces itself (the twin, which ran on for ten minutes); and no check of whom a word is for. `sim::transfers`' `w27_ac05_the_transfers_model_finds_each_planted_bug` runs the CI budget with each, and passes once each is found by a seed that passes without it.

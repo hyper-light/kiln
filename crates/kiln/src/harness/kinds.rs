@@ -140,6 +140,12 @@ impl Kind {
                 if let Some((kiln, sock, prefer)) = local_tools(spec) {
                     p.args(crate::reach::mcp::codex_config(&kiln, sock, prefer, session));
                 }
+                // kiln's hook before each tool call, trusted for this session alone: what holds a
+                // subagent (a pause, what it may do) holds its calls (docs/agents.md).
+                #[cfg(unix)]
+                if let (Some(sock), Ok(kiln)) = (super::socket::served(), crate::os::this_kiln()) {
+                    p.args(super::codex::hook_args(&kiln, sock));
+                }
             }
             Protocol::Acp(args) => {
                 p.args(args);
@@ -215,6 +221,18 @@ impl Kind {
                 tracing::warn!(error = %format!("{e:#}"), "kiln's page tools couldn't be allowed in Antigravity's settings: agy decides on them as on its other tools");
             }
         }
+        // kiln's hook in agy's own hooks.json, the only place agy reads hooks from: every
+        // conversation's tool calls, model calls and stops come to kiln, so a person's pause and
+        // what each subagent may do hold them (docs/agents.md). One agy runs outside kiln passes.
+        #[cfg(unix)]
+        if self.protocol == Protocol::AgyStreamJson
+            && let Ok(kiln) = crate::os::this_kiln()
+        {
+            let hooks = crate::os::home_dir().join(".gemini/config/hooks.json");
+            if let Err(e) = crate::rt::blocking(move || agy_hooks_in(&hooks, &kiln.to_string_lossy())).await.and_then(|r| r) {
+                tracing::warn!(error = %format!("{e:#}"), "kiln's hook couldn't be put in Antigravity's hooks.json: its subagents can't be paused or limited");
+            }
+        }
     }
 }
 
@@ -233,6 +251,24 @@ fn agy_allow_in(path: &std::path::Path) -> anyhow::Result<bool> {
         Err(e) => return Err(e.into()),
     };
     let Some(next) = crate::reach::mcp::agy_allow(&settings) else { return Ok(false) };
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir)?;
+    }
+    crate::runner::auth::write_private(path, &serde_json::to_vec_pretty(&next)?)?;
+    Ok(true)
+}
+
+/// kiln's hook entry for this kiln binary (`kiln`) in agy's hooks.json at `path`
+/// (`antigravity::hooks_with`): its other hooks kept, written whole and readable by its user alone,
+/// only when it differs; a file it can't read is left as it is. Whether it wrote.
+#[cfg(unix)]
+fn agy_hooks_in(path: &std::path::Path, kiln: &str) -> anyhow::Result<bool> {
+    let config = match std::fs::read(path) {
+        Ok(b) => serde_json::from_slice::<serde_json::Value>(&b)?,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => serde_json::json!({}),
+        Err(e) => return Err(e.into()),
+    };
+    let Some(next) = super::antigravity::hooks_with(&config, kiln) else { return Ok(false) };
     if let Some(dir) = path.parent() {
         std::fs::create_dir_all(dir)?;
     }
@@ -403,6 +439,7 @@ impl Adapter {
     }
 
     pub fn command(&mut self, core: &mut Core, c: Command) {
+        core.shown_queued(&c);
         // A message waiting for one of its subagents is changed where it waits, or goes to it now.
         match super::subagent::queue_command(core, c) {
             super::subagent::Queued::Done => {}
@@ -440,7 +477,8 @@ impl Adapter {
         match self {
             Self::Claude(a) => a.send_task(core, &t, m, mode),
             Self::Codex(a) => a.send_task(core, &t, m, mode),
-            Self::Acp(_) | Self::Agy(_) => super::subagent::refuse(core, task, &m, "its harness takes no message for it from kiln."),
+            Self::Acp(a) => a.send_task(core, &t, m),
+            Self::Agy(a) => a.send_task(core, &t, m, mode),
         }
     }
 
@@ -450,8 +488,20 @@ impl Adapter {
         match self {
             Self::Claude(a) => super::subagent::settle(core, |core, t| a.takes(core, t)),
             Self::Codex(a) => super::subagent::settle(core, |core, t| a.takes(core, t)),
-            Self::Acp(_) | Self::Agy(_) => super::subagent::settle(core, |_, _| (Vec::new(), None)),
+            Self::Acp(a) => super::subagent::settle(core, |core, t| a.takes(core, t)),
+            Self::Agy(a) => super::subagent::settle(core, |core, t| a.takes(core, t)),
         }
+        // Held at its next tool call: Claude Code asks kiln before each (`claude::HOLD_HOOK`), and so
+        // does Codex once it trusts kiln's hook (`codex::hook_args`).
+        let can = match self {
+            Self::Claude(_) => true,
+            Self::Codex(a) => a.holds_calls(),
+            // At each call an ACP agent asks about, where it names its subagent (opencode's).
+            Self::Acp(_) => true,
+            // And Antigravity, once kiln's hook in its hooks.json is heard (`antigravity::hooks_with`).
+            Self::Agy(a) => a.holds_calls(),
+        };
+        super::subagent::settle_pausable(core, |t| can && t.tool_id.is_some());
     }
 
     /// What waits for its subagents goes to each that can take it now (one at a time each).
@@ -459,7 +509,8 @@ impl Adapter {
         match self {
             Self::Claude(a) => a.drain_subagents(core),
             Self::Codex(a) => a.drain_subagents(core),
-            Self::Acp(_) | Self::Agy(_) => {}
+            Self::Acp(a) => a.drain_subagents(core),
+            Self::Agy(_) => {}
         }
         self.settle_subagents(core);
     }
@@ -475,6 +526,28 @@ impl Adapter {
         // (a switch, a stop, a restart or a crash), its subagents' and shells' calls with it.
         core.end_harness_work();
         self.settle_subagents(core);
+        self.let_go(core);
+    }
+
+    /// Its process is gone, and this adapter goes with it (it ended, was stopped, or starts again,
+    /// in this harness or another: a switch, a move, a rewind, a setting): no message it was given
+    /// is lost or left on its way (CP-T3.2). What it held for its harness, which never got it (sent
+    /// as Codex or an ACP agent started, or to go first as a turn stopped), goes first in kiln's
+    /// queue, in order, still shown queued: the next process takes it, whichever harness that is.
+    /// One a rewind took out of the conversation goes with it. What its harness was handed and
+    /// never finished ends dropped (`Core::drop_unfinished`).
+    pub fn let_go(&mut self, core: &mut Core) {
+        let held = match self {
+            Self::Codex(a) => a.take_held(),
+            Self::Acp(a) => a.take_held(),
+            Self::Claude(_) | Self::Agy(_) => Vec::new(),
+        };
+        let held: Vec<QueueItem> = held.into_iter().filter(|m| core.get(&m.id).is_some()).collect();
+        if !held.is_empty() {
+            core.state.queue.splice(0..0, held);
+            core.touch_state();
+        }
+        core.drop_unfinished(false);
     }
 
     /// A run (`Effect::Run` or `Effect::Fetch`) ended: its exit code (None: it could not start
@@ -566,6 +639,29 @@ impl Adapter {
             Self::Agy(a) => a.room(core),
         }
         self.drain_subagents(core);
+    }
+
+    /// What the person lets the session do changed (`Command::Perms` for the whole session): what
+    /// only its harness's own settings hold follows (Codex's web search).
+    pub fn perms_changed(&mut self, core: &mut Core) {
+        if let Self::Codex(a) = self {
+            a.perms_changed(core);
+        }
+    }
+
+    /// Its harness's hook asks before a tool call (`input`): the answer goes to `reply`, at once or
+    /// once a person lets the call go (`hold`). Codex's and Antigravity's hooks ask this way; Claude
+    /// Code's comes over its own control protocol.
+    pub fn hook(&mut self, core: &mut Core, input: serde_json::Value, reply: futures::channel::oneshot::Sender<serde_json::Value>) {
+        match self {
+            Self::Codex(a) => a.hook(core, input, reply),
+            Self::Agy(a) => a.hook(core, input, reply),
+            Self::Claude(_) | Self::Acp(_) => {
+                let _ = reply.send(serde_json::json!({}));
+            }
+        }
+        // What the hook told of its subagents (Antigravity's: one ended, its hook heard).
+        self.settle_subagents(core);
     }
 
     /// Something waits to go to its harness: kiln's queue, what its adapter holds till its harness
@@ -884,6 +980,55 @@ mod tests {
         Ok(())
     }
 
+    /// kiln's hook goes into agy's hooks.json beside the person's own, once, for this kiln binary
+    /// (another rewrites it); hooks it can't read are left as they are. Run as agy runs it (a
+    /// shell), it hands each event to this kiln, and where the binary is gone (a version pruned,
+    /// kiln uninstalled) it passes, so the person's own agy goes on as without kiln.
+    #[cfg(unix)]
+    #[test]
+    fn antigravitys_hooks_get_kilns_hook_once() -> anyhow::Result<()> {
+        use std::os::unix::fs::PermissionsExt as _;
+        let dir = tempfile::tempdir()?;
+        let path = dir.path().join("config/hooks.json");
+        let read = |p: &std::path::Path| -> anyhow::Result<serde_json::Value> { Ok(serde_json::from_slice(&std::fs::read(p)?)?) };
+        let command = |v: &serde_json::Value, ev: &str| v.pointer(&format!("/kiln/{ev}/0/hooks/0/command")).or_else(|| v.pointer(&format!("/kiln/{ev}/0/command"))).and_then(serde_json::Value::as_str).map(str::to_owned).unwrap_or_default();
+        let run = |command: &str| -> anyhow::Result<String> { Ok(String::from_utf8(std::process::Command::new("sh").arg("-c").arg(command).output()?.stdout)?.trim().to_owned()) };
+        let gone = dir.path().join("versions/old/kiln");
+        let gone = gone.to_string_lossy();
+        assert!(agy_hooks_in(&path, &gone)?);
+        let made = read(&path)?;
+        assert_eq!(made.pointer("/kiln/PreToolUse/0/matcher"), Some(&serde_json::json!("*")));
+        assert_eq!(made.pointer("/kiln/PreToolUse/0/hooks/0/timeout"), Some(&serde_json::json!(super::super::antigravity::HOOK_FOR_S)));
+        // Its binary gone: each event passes.
+        assert_eq!(run(&command(&made, "PreToolUse"))?, r#"{"decision":"allow"}"#);
+        assert_eq!(run(&command(&made, "PreInvocation"))?, "{}");
+        assert_eq!(run(&command(&made, "Stop"))?, r#"{"decision":""}"#);
+        // There: the event goes to it (a stand-in that says what it was asked), a path with a
+        // space and a quote in it too.
+        let bin = dir.path().join("it's kiln/kiln");
+        std::fs::create_dir_all(bin.parent().ok_or_else(|| anyhow::anyhow!("no parent"))?)?;
+        std::fs::write(&bin, "#!/bin/sh\necho \"$@\"\n")?;
+        std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755))?;
+        assert!(agy_hooks_in(&path, &bin.to_string_lossy())?);
+        let there = read(&path)?;
+        assert_eq!(run(&command(&there, "PreToolUse"))?, "harness-hook --agy PreToolUse");
+        assert_eq!(run(&command(&there, "Stop"))?, "harness-hook --agy Stop");
+        // The person's own: kept; once there, left alone; another kiln, rewritten.
+        std::fs::write(&path, r#"{"lint":{"PostToolUse":[{"matcher":"write_to_file","hooks":[{"command":"./lint.sh"}]}]}}"#)?;
+        assert!(agy_hooks_in(&path, "/k/kiln")?);
+        let kept = read(&path)?;
+        assert_eq!(kept.pointer("/lint/PostToolUse/0/hooks/0/command"), Some(&serde_json::json!("./lint.sh")));
+        assert!(command(&kept, "PreInvocation").contains("k='/k/kiln';"));
+        assert_eq!(std::fs::metadata(&path)?.permissions().mode() & 0o777, 0o600);
+        assert!(!agy_hooks_in(&path, "/k/kiln")?);
+        assert!(agy_hooks_in(&path, "/k2/kiln")?);
+        assert!(read(&path)?.get("lint").is_some());
+        std::fs::write(&path, "{not json")?;
+        assert!(agy_hooks_in(&path, "/k/kiln").is_err());
+        assert_eq!(std::fs::read(&path)?, b"{not json");
+        Ok(())
+    }
+
     #[test]
     fn devin_runs_its_acp_protocol_and_keeps_its_terminal_interface() -> anyhow::Result<()> {
         let kind = Kind::get("devin").ok_or_else(|| anyhow::anyhow!("no Devin harness"))?;
@@ -1040,5 +1185,157 @@ mod tests {
         assert!(core.state.tasks.iter().filter(|t| t.id != "left-77").all(|t| !t.live()));
         assert!(core.get("exec-3").is_some_and(|e| matches!(&e.body, Body::Tool(t) if t.status == ToolStatus::Cancelled)));
         assert_eq!(core.state.tasks.iter().find(|t| t.id == "left-77").map(|t| t.status.as_str()), Some("running"), "kiln's own, taken back over");
+    }
+
+    fn message(id: &str, text: &str) -> Command {
+        Command::Send { id: id.into(), text: text.into(), mode: SendMode::Queue, attachments: Vec::new(), overrides: None, reply_to: None, task: None }
+    }
+
+    /// The ids of the user messages kiln wrote its harness since the last look (Claude Code's
+    /// `uuid`), and the id of its request `subtype` among what it wrote.
+    fn wrote(core: &mut Core, subtype: &str) -> (Vec<String>, Option<serde_json::Value>) {
+        let lines: Vec<serde_json::Value> = core.take_writes().iter().filter_map(|w| serde_json::from_str(w).ok()).collect();
+        let users = lines.iter().filter(|v| v.get("type").and_then(serde_json::Value::as_str) == Some("user")).filter_map(|v| v.get("uuid").and_then(serde_json::Value::as_str).map(str::to_owned)).collect();
+        let asked = lines.iter().find(|v| v.pointer("/request/subtype").and_then(serde_json::Value::as_str) == Some(subtype)).and_then(|v| v.get("request_id").cloned());
+        (users, asked)
+    }
+
+    fn queue(core: &Core) -> Vec<&str> {
+        core.state.queue.iter().map(|q| q.id.as_str()).collect()
+    }
+
+    /// CP-T3.2: a switch out of Codex before its thread opens leaves its messages in kiln's
+    /// durable queue, in order. Claude Code takes them once ready, each shown sent only then.
+    #[test]
+    fn a_message_held_for_a_harness_that_ends_goes_to_the_one_after_it() {
+        use super::super::model::{Delivery, Status};
+        let mut core = Core::new();
+        let mut codex = Adapter::Codex(Box::new(Codex::new(None, None, None, false)));
+        codex.start(&mut core);
+        codex.command(&mut core, message("m1", "Plans and Research, one tab each"));
+        codex.command(&mut core, message("m2", "Research searchable, its results as cards"));
+        assert_eq!(queue(&core), ["m1", "m2"]);
+        assert_eq!([core.state.delivery.get("m1"), core.state.delivery.get("m2")], [None; 2]);
+        assert!(core.get("m1").is_none() && core.get("m2").is_none(), "unsent messages stay in the durable queue");
+        // The switch: Codex's process ends.
+        codex.exited(&mut core, None, None);
+        assert_eq!(queue(&core), ["m1", "m2"]);
+        assert_eq!([core.state.delivery.get("m1"), core.state.delivery.get("m2")], [None; 2]);
+        // Claude Code, once up, takes the first; the next once that's done.
+        core.state.exit = None;
+        core.set_status(Status::Starting);
+        let mut claude = Adapter::Claude(Box::new(Claude::new(false)));
+        claude.start(&mut core);
+        let (_, init) = wrote(&mut core, "initialize");
+        claude.line(&mut core, &serde_json::json!({"type": "control_response", "response": {"subtype": "success", "request_id": init, "response": {}}}).to_string());
+        assert_eq!(wrote(&mut core, "").0, ["m1"]);
+        assert_eq!(core.state.delivery.get("m1"), Some(&Delivery::Sent));
+        assert!(core.get("m1").is_some() && core.get("m2").is_none(), "only the message handed to Claude is shown sent");
+        assert_eq!(queue(&core), ["m2"]);
+        for line in [
+            r#"{"type":"command_lifecycle","command_uuid":"m1","state":"started","uuid":"x","session_id":"s"}"#,
+            r#"{"type":"result","subtype":"success","is_error":false,"result":"Two designs.","stop_reason":"end_turn","session_id":"s"}"#,
+            r#"{"type":"command_lifecycle","command_uuid":"m1","state":"completed","uuid":"y","session_id":"s"}"#,
+        ] {
+            claude.line(&mut core, line);
+        }
+        assert_eq!(core.state.delivery.get("m1"), Some(&Delivery::Completed));
+        assert_eq!(wrote(&mut core, "").0, ["m2"]);
+        assert!(core.state.queue.is_empty());
+    }
+
+    /// An ACP agent (Devin, Gemini) holds a message till its session opens: one that ends first
+    /// (it can't sign in, and is switched out of) lets go of it for the next harness.
+    #[test]
+    fn an_acp_agent_that_ends_before_its_session_opens_lets_go_of_what_it_held() {
+        use super::super::model::Delivery;
+        let mut core = Core::new();
+        let mut acp = Adapter::Acp(Box::new(Acp::new(None)));
+        acp.start(&mut core);
+        acp.command(&mut core, message("m1", "Plans and Research, one tab each"));
+        assert_eq!((core.state.delivery.get("m1"), queue(&core).len()), (Some(&Delivery::Queued), 0));
+        acp.exited(&mut core, Some(1), Some("not signed in".into()));
+        assert_eq!(queue(&core), ["m1"]);
+        assert_eq!(core.state.delivery.get("m1"), Some(&Delivery::Queued));
+    }
+
+    /// CP-T3.2: its process gone, what its harness was handed and never finished (sent, in its own
+    /// queue, under way) ends dropped, never on its way for good; it may have run, so it isn't sent
+    /// again. What waits in kiln's queue or a subagent's still goes, and what ended stays as it
+    /// ended. The agent ended, nothing that waited goes either.
+    #[test]
+    fn what_a_harness_never_finished_ends_dropped_with_its_process() {
+        use super::super::model::{Delivery, Task};
+        let item = |id: &str| QueueItem { id: id.into(), text: "next".into(), at: 1, attachments: Vec::new(), overrides: None, reply_to: None };
+        let mut core = Core::new();
+        let all = [("sent", Delivery::Sent), ("its-queue", Delivery::Queued), ("under-way", Delivery::Started), ("done", Delivery::Completed), ("unsent", Delivery::Cancelled), ("kiln-queue", Delivery::Queued), ("sub-queue", Delivery::Queued)];
+        core.state.delivery = all.into_iter().map(|(id, d)| (id.to_owned(), d)).collect();
+        core.state.queue.push(item("kiln-queue"));
+        core.state.tasks.push(Task { id: "t1".into(), queue: vec![item("sub-queue")], ..Task::default() });
+        core.drop_unfinished(false);
+        let now = |core: &Core| all.map(|(id, _)| core.state.delivery.get(id).copied());
+        use Delivery::{Cancelled, Completed, Queued};
+        assert_eq!(now(&core), [Some(Cancelled), Some(Cancelled), Some(Cancelled), Some(Completed), Some(Cancelled), Some(Queued), Some(Queued)]);
+        core.drop_unfinished(true);
+        assert_eq!(now(&core), [Some(Cancelled), Some(Cancelled), Some(Cancelled), Some(Completed), Some(Cancelled), Some(Cancelled), Some(Cancelled)]);
+    }
+
+    /// CP-T3.2: Claude Code's process ends (a crash, a stop by force) while it works on a message:
+    /// that message ends dropped, never "being worked on" for good, and one waiting in kiln's
+    /// queue behind it goes to the process after it.
+    #[test]
+    fn a_message_under_way_when_its_harness_ends_is_dropped_and_the_next_still_goes() {
+        use super::super::model::{Delivery, Status};
+        let mut core = Core::new();
+        let mut claude = Adapter::Claude(Box::new(Claude::new(false)));
+        claude.start(&mut core);
+        let (_, init) = wrote(&mut core, "initialize");
+        claude.line(&mut core, &serde_json::json!({"type": "control_response", "response": {"subtype": "success", "request_id": init, "response": {}}}).to_string());
+        claude.command(&mut core, message("m1", "Plans and Research, one tab each"));
+        claude.line(&mut core, r#"{"type":"command_lifecycle","command_uuid":"m1","state":"started","uuid":"x","session_id":"s"}"#);
+        claude.command(&mut core, message("m2", "and a search"));
+        assert_eq!((core.state.delivery.get("m1"), queue(&core)), (Some(&Delivery::Started), vec!["m2"]));
+        claude.exited(&mut core, Some(137), None);
+        assert_eq!(core.state.delivery.get("m1"), Some(&Delivery::Cancelled));
+        assert_eq!(queue(&core), ["m2"]);
+        core.state.exit = None;
+        core.set_status(Status::Starting);
+        let mut again = Adapter::Claude(Box::new(Claude::new(false)));
+        again.start(&mut core);
+        let (_, init) = wrote(&mut core, "initialize");
+        again.line(&mut core, &serde_json::json!({"type": "control_response", "response": {"subtype": "success", "request_id": init, "response": {}}}).to_string());
+        assert_eq!(wrote(&mut core, "").0, ["m2"]);
+    }
+
+    /// CP-T3.2: Edit and Unsend reach Codex's startup queue before and after a crash. A legacy
+    /// message already shown in the conversation is changed or dropped there too.
+    #[test]
+    fn a_message_shown_waiting_in_kiln_s_queue_is_changed_and_taken_back_there() {
+        use super::super::model::{Body, Delivery};
+        let shown = |core: &Core, id: &str| match core.get(id).map(|e| &e.body) {
+            Some(Body::User { text, .. }) => text.clone(),
+            _ => String::new(),
+        };
+        for legacy in [false, true] {
+            let mut core = Core::new();
+            let mut codex = Adapter::Codex(Box::new(Codex::new(None, None, None, false)));
+            codex.start(&mut core);
+            codex.command(&mut core, message("m1", "Plans"));
+            codex.command(&mut core, message("m2", "Research"));
+            if legacy {
+                for (id, text) in [("m1", "Plans"), ("m2", "Research")] {
+                    core.state.delivery.insert(id.into(), Delivery::Queued);
+                    core.upsert(id, None, Body::User { text: text.into(), images: 0, client_id: Some(id.into()), origin: None, attachments: Vec::new(), reply_to: None });
+                }
+            }
+            codex.command(&mut core, Command::QueueRemove { id: "m2".into() });
+            assert_eq!(queue(&core), ["m1"], "Unsend reaches startup work");
+            assert_eq!(core.state.delivery.get("m2"), legacy.then_some(&Delivery::Cancelled));
+            codex.exited(&mut core, None, None);
+            codex.command(&mut core, Command::QueueEdit { id: "m1".into(), text: "Plans, one tab".into(), attachments: None });
+            assert_eq!(core.state.queue.first().map(|q| q.text.as_str()), Some("Plans, one tab"));
+            assert_eq!(shown(&core, "m1"), if legacy { "Plans, one tab" } else { "" });
+            assert_eq!(shown(&core, "m2"), if legacy { "Research" } else { "" });
+        }
     }
 }

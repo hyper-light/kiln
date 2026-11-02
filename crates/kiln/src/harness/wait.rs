@@ -79,7 +79,8 @@ fn on_its_way(info: &Info) -> bool {
 
 /// Where an agent stands, in a word: `needs_you` (an approval, a question or a plan waits on a
 /// person), `working`, `idle` (its turn is over, nothing queued), `paused` (a usage limit),
-/// `stopped` (it crashed or couldn't start), `offline` (its machine is away), `ended`.
+/// `stopped` (it crashed or couldn't start), `offline` (its machine is away), `ended`. One whose
+/// process ended while nobody ended it is working: kiln starts it again by itself.
 pub fn stand(info: &Info) -> &'static str {
     if !info.approvals.is_empty() || info.status == Status::Waiting {
         return "needs_you";
@@ -88,6 +89,7 @@ pub fn stand(info: &Info) -> &'static str {
         return "working";
     }
     match info.status {
+        Status::Exited if info.exit.as_ref().is_some_and(|e| e.again_at.is_some()) => "working",
         Status::Exited if info.exit.as_ref().is_some_and(|e| e.error.is_some()) => "stopped",
         Status::Exited => "ended",
         Status::Disconnected => "offline",
@@ -279,11 +281,11 @@ mod tests {
         assert_eq!(stand(&info("w3", Status::Idle)), "idle");
         assert_eq!(stand(&Info { queued: 1, ..info("w4", Status::Idle) }), "working", "a message waits in its queue");
         let sub =
-            |status: &str| crate::harness::session::SubagentBrief { id: "s".into(), tool_id: None, description: "audit".into(), status: status.into(), parent_task: None, started: 1, ended: None };
+            |status: &str| crate::harness::session::SubagentBrief { id: "s".into(), tool_id: None, description: "audit".into(), status: status.into(), parent_task: None, started: 1, ended: None, last_tool: None, pausable: false, paused_at: None, perms: None };
         assert_eq!(stand(&Info { subagents: vec![sub("running")], ..info("w4b", Status::Idle) }), "working", "a subagent it sent off still works");
         assert_eq!(stand(&Info { subagents: vec![sub("completed")], ..info("w4c", Status::Idle) }), "idle", "its subagents are done");
         assert_eq!(stand(&info("w5", Status::Waiting)), "needs_you");
-        let asking = Info { approvals: vec![ApprovalBrief { id: "p".into(), tool: ToolKind::Shell, tool_name: "Bash".into(), title: "rm".into(), at: 1 }], ..info("w6", Status::Running) };
+        let asking = Info { approvals: vec![ApprovalBrief { id: "p".into(), tool: ToolKind::Shell, tool_name: "Bash".into(), title: "rm".into(), at: 1, agent: None }], ..info("w6", Status::Running) };
         assert_eq!(stand(&asking), "needs_you");
         assert_eq!(stand(&Info { exit: Some(ExitInfo { code: Some(1), error: Some("boom".into()), ..Default::default() }), ..info("w7", Status::Exited) }), "stopped");
         assert_eq!(stand(&info("w8", Status::Exited)), "ended");

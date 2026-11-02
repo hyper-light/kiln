@@ -363,17 +363,22 @@ production:
     windows:
       - { deny: "0 0 * * 6,0", duration: 48h, timezone: UTC }
     checks: [no-snapshots, artifact-signed, { vulnerabilities: { max: high } }, owners-set]
+    require_chain: true               # each release verifies back to whoever made it (ci.md W27-R11)
     via: commit                       # or pull-request: the release commit is merged by a reviewer
   sync: { auto: true, prune: true, self_heal: true }
   watch: { timeout: 15m, settle: 30s, refused: 60s }
   concurrency: queue                  # a second release takes the first's place; or reject
   agents: { deploy: false, approve: false }   # what agents may do here (cd-targets.md D6)
   argocd: { applications: false }     # Argo CD: true, kiln writes each Application (no ApplicationSet)
+  production: true                    # made as production: requires the chain from the start
   notify: { chat: ["#deploys"], webhooks: [] }
 ```
 
 - An environment names one CD provider. Staging may run on KilnCD while production has its own
   Argo CD, and the same app moves between them.
+- One made as `production` requires a verified chain to deploy (`gates.require_chain`, §9.1)
+  unless its gates say otherwise; one made before keeps what it has until its settings change it,
+  as a repository's signatures do (ci.md W27-R11).
 - An environment on KilnCD may name targets of any kind; one on Argo CD names clusters registered
   in that Argo CD. Its apps run in its first cluster, on either provider.
 - On Argo CD, one ApplicationSet makes the environment's Applications (§8.3); `argocd:
@@ -774,11 +779,12 @@ git says then.
 | `windows` | no deny window covers now (Argo CD's sync windows: allow and deny, cron, duration, timezone) |
 | `checks` | each check passes: built in (`no-snapshots`, `artifact-exists`, `artifact-signed`, `vulnerabilities`, `owners-set`) or external (a URL that answers pass or fail, a kiln workflow). A check is `required` or `report-only` |
 | `provenance` | each artifact a new version deploys has kiln's provenance, its signature verified, from the workflows and branches the environment allows (`require_provenance: { builder, workflows, branches }`, ci.md W18-R04) |
+| `chain` | what a new version deploys, or a rollback puts back, verifies by kiln verify back to whoever made it: each artifact's provenance and the leg that built it, each commit it brings landed by its queue with the reviews the trunk's policy asked, each author (ci.md W27-R10). Where the environment requires it (`require_chain: true`; an environment made as `production` does from the start) a chain that breaks is refused, naming the link; elsewhere the release says whether its chain verifies (ci.md W27-R11) |
 | `freeze` | no freeze holds the environment or the app (incidents, holidays) |
 
 Each gate's result is recorded on the release, with its evidence. A release kiln can't gate is
-refused, never let through. In order: a freeze, windows, the built-in checks, provenance, `after`
-and `soak`, the external checks, approvals.
+refused, never let through. In order: a freeze, windows, the built-in checks, provenance, the
+chain, `after` and `soak`, the external checks, approvals.
 
 How each one holds or refuses (built: all but the checks `artifact-exists`, `artifact-signed` and
 `vulnerabilities`):
@@ -830,6 +836,16 @@ don't approve their own change on its way, and once per landing and environment 
 `promote:<release>:<environment>`). One refused (a release in flight there, or an upstream
 that doesn't run the version yet) goes when the next of its `after` lands, or by hand. Config
 releases and rollbacks never move on by themselves.
+
+A promotion is a transfer (docs/ci.md W27-R08): as a deploy promoted from an environment of this
+server's goes (its `after` passed there, or `promote_from` named it), CD signs a hand-on for the
+environment it leaves, naming the images that ran there by their digests; as it lands, CD signs
+its receipt for the one it reached, the same digests. Both are kept as custody records (CD's
+identity, `kiln://<org>/server/cd`, each naming its environment as its `component`), and the
+release keeps the hand-on's digest as its `promotion` gate. A release whose version or images
+aren't what runs in an environment it must run in first is refused as a promotion, and that's
+recorded with both sides' digests (`kiln transfers refused`, `GET /api/transfers/refused`). A release naming no image digests
+is said to be a promotion not signed; an `after` on a linked server is that server's to sign.
 
 ## 10. Rollback, versions and history
 

@@ -35,6 +35,11 @@ pub type PeerId = u64;
 pub const ROOM: usize = 4 << 20;
 /// How long a command sent on a live link waits for its answer before it goes again.
 pub const PATIENCE: Duration = Duration::from_secs(3);
+/// The most a command carries: the frame its item rides (`ServerMsg::Wire`, on the control lane) is
+/// at most 1 MiB (the transport's bound for its class), and the item's head takes some of that. One
+/// larger would never go, and every command after it would wait behind it: it's answered at once,
+/// and counted as a frame the server let go (`refused`).
+pub const ITEM_MOST: usize = (1 << 20) - 1024;
 /// How long a parked command waits for its runner to come back before it ends unreachable.
 pub const PARK_FOR: Duration = Duration::from_secs(24 * 3600);
 
@@ -216,6 +221,13 @@ impl Commands {
         self.peers.get(&peer).is_some_and(|p| p.up)
     }
 
+    /// Whether runner process `peer` is away: its link is down, and it isn't connecting. One whose
+    /// link is back but hasn't said yet what it has isn't (its commands go once it has), as a live
+    /// command to it isn't refused ([`Commands::push`]).
+    pub fn is_away(&self, peer: PeerId) -> bool {
+        self.peers.get(&peer).is_none_or(|p| !p.link && p.coming.is_none())
+    }
+
     /// Runner process `peer` keeps the channel, on a link that just came up: its commands go on
     /// it from now on, once it says what it has (a live one sent meanwhile waits for that, rather
     /// than being refused as if its runner were away). A link the server took for up went without
@@ -244,6 +256,11 @@ impl Commands {
         let p = self.peer(peer);
         if kind == Kind::Live && !p.link && p.coming.is_none() {
             let _ = tx.send(Answer::Unreachable { why: "its runner is away".into() });
+            return rx;
+        }
+        if body.len() > ITEM_MOST {
+            crate::metrics::net().dropped(peer, crate::proto::LANE_CONTROL, "refused", 1);
+            let _ = tx.send(Answer::Unreachable { why: format!("it's too large to send: {} bytes, more than the {ITEM_MOST} a command carries", body.len()) });
             return rx;
         }
         let stream = match kind {
@@ -499,7 +516,7 @@ mod tests {
                         }
                         Stand::Current => {}
                     }
-                    match self.rx.on_item(&stream, seq, low, body) {
+                    match self.rx.on_item(&stream, seq, low, body, Instant::now()) {
                         Arrival::Take(body) => {
                             if refuse(&body) {
                                 back.push(self.rx.refused(&stream, seq, Refusal::Unknown, "no such leg"));
@@ -537,6 +554,30 @@ mod tests {
         assert_eq!(c.waiting(), 0);
     }
 
+    /// A command too large for the frame its item rides is answered at once, never queued: it
+    /// would never go, and the commands after it would wait behind it.
+    #[test]
+    fn a_command_too_large_for_a_frame_is_answered_at_once_and_the_next_goes() {
+        // A peer of its own: the count is the process's.
+        const PEER: PeerId = 9_001;
+        let base = Instant::now();
+        let mut c = Commands::new(7);
+        let mut r = Runner::new();
+        c.connected(PEER);
+        c.on_frame(PEER, r.rx.have());
+        let refused = || crate::metrics::net().toward(PEER).iter().filter(|d| d.lane == "control" && d.reason == "refused").map(|d| d.frames).sum::<u64>();
+        let before = refused();
+        let mut large = c.push(PEER, Kind::Live, vec![7; ITEM_MOST + 1], base);
+        assert!(matches!(answer(&mut large), Some(Answer::Unreachable { why }) if why.contains("too large")));
+        assert_eq!(refused(), before + 1, "counted as a frame let go toward its runner");
+        let mut next = c.push(PEER, Kind::Live, b"interrupt".to_vec(), base);
+        for a in r.deliver(c.poll(base), |_| false) {
+            c.on_frame(PEER, a);
+        }
+        assert_eq!(answer(&mut next), Some(Answer::Taken));
+        assert_eq!(r.took, vec![b"interrupt".to_vec()]);
+    }
+
     #[test]
     fn a_parked_command_waits_for_its_runner_and_a_live_one_is_refused_while_it_is_away() {
         let base = Instant::now();
@@ -544,6 +585,7 @@ mod tests {
         let mut r = Runner::new();
         c.connected(1);
         c.down(1);
+        assert!(c.is_away(1), "its link is down");
         // Away (its link down): the live command ends at once, the parked one waits.
         let mut keys = c.push(1, Kind::Live, b"keys".to_vec(), base);
         assert!(matches!(answer(&mut keys), Some(Answer::Unreachable { .. })));
@@ -551,6 +593,9 @@ mod tests {
         assert!(c.poll(base).is_empty(), "nothing goes while it's away");
         c.connected(1);
         assert!(c.poll(base).is_empty(), "nothing goes before the runner says what it has");
+        // Back, before it says what it has: not away (a parked command sent now is answered by the
+        // runner, not as parked), though nothing goes yet.
+        assert!(!c.is_away(1) && !c.is_up(1));
         c.on_frame(1, r.rx.have());
         for a in r.deliver(c.poll(t(base, 10)), |_| false) {
             c.on_frame(1, a);

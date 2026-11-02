@@ -16,9 +16,11 @@ pub mod pool;
 pub mod egress;
 #[cfg(target_os = "linux")]
 pub mod firecracker;
+pub mod freeze;
 #[cfg(target_os = "linux")]
 pub mod guest;
 pub mod hashfiles;
+pub mod custody;
 pub mod identity;
 #[cfg(target_os = "linux")]
 pub mod jail;
@@ -30,6 +32,7 @@ pub mod rootfs;
 pub mod rustc;
 pub mod runtime;
 pub mod setup;
+pub mod signed;
 pub mod warm;
 pub mod work;
 pub mod workspaces;

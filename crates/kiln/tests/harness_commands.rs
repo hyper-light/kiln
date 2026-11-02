@@ -62,6 +62,9 @@ fn a_sessions_commands_are_answered_by_its_runner_through_cuts_and_lost_frames()
     // (`AgentMsg::Wire`, variant 46, on the terminal lane) lost.
     let (_runner, log) = agents::runner(dir.path(), s.port, "box", Some("drop=6s,down=2s,shed=term/46:3"), Talk { lines: 1, every_ms: 10 })?;
     agents::connected(s.port, &s.admin, "box", &log, Duration::from_secs(120))?;
+    // Its headroom off: on a busy machine it would freeze the session's harness, and messages the
+    // runner took would wait past the test.
+    agents::headroom_off(s.port, &s.admin, "box", Duration::from_secs(60))?;
     let work = dir.path().join("work");
     std::fs::create_dir_all(&work)?;
     let (controls, messages) = (work.join(".fake-claude-controls"), work.join(".fake-claude-messages"));

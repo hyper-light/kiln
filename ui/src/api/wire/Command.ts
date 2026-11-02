@@ -4,6 +4,7 @@ import type { Attachment } from "./Attachment";
 import type { ChoiceAnswer } from "./ChoiceAnswer";
 import type { Decision } from "./Decision";
 import type { Overrides } from "./Overrides";
+import type { Perms } from "./Perms";
 import type { SendMode } from "./SendMode";
 import type { JsonValue } from "./serde_json/JsonValue";
 
@@ -83,4 +84,4 @@ none_newer?: boolean, } | { "type": "control", id: string, value?: JsonValue | n
  * The account that reached it (`account_id`): a session signed in as another by now, as
  * it knows itself, takes no hold for it. None from a server that didn't say.
  */
-account?: string, };
+account?: string, } | { "type": "own_edits", client: string, by: string, } | { "type": "pause", on: boolean, task?: string, } | { "type": "perms", perms?: Perms, task?: string, } | { "type": "branch", words: string, top?: boolean, task?: string, };

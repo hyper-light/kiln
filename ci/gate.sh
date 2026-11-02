@@ -9,7 +9,7 @@
 # It holds itself to what it was asked: the needs `kiln run --needs` gives the command (KILN_NEEDS),
 # or --cpus and --mem. As a systemd user unit, its memory is capped at what it asked (MemoryMax),
 # and it yields to everything else on the machine: CPUWeight 1, nice 19, and I/O bandwidth caps on
-# the disk its build is on (--io-read, --io-write; --io off drops them). Its CPUs are what it runs
+# each disk its build is on (--io-read, --io-write; --io off drops them). Its CPUs are what it runs
 # at once: a rustc per 6 GiB asked, at most one per CPU (--jobs), and as many test threads
 # (--test-threads). No CPU quota: one changes what the tests see of the machine (the CPUs a runner
 # reports, W13), as a runner never does. Without a systemd user manager (macOS, a container) it
@@ -19,6 +19,10 @@
 # over 30, or --guard-url answering in over 3 s, three checks running (10 s apart), stops it. The
 # containers its own tests start in Docker are left out: their scopes are in system.slice too, and
 # tests/pools.rs' burst of them alone took it past 30 (fedora and adacachy, 2026-10-28).
+# Named with --guard-containers (KILN_GATE_GUARD_CONTAINERS), it watches those containers alone: a
+# machine's production, say. Stopped or ended, it removes what its tests left in Docker (a test
+# server takes its containers and networks with it only when it ends): those mounting its own dir,
+# and those labelled with the hash of a folder in its TMPDIR, as kiln's runners label what they make.
 #
 # Its build is its own: a target dir and TMPDIR under ${XDG_CACHE_HOME:-~/.cache}/kiln-gate/<tree>,
 # and git's environment cleared, with an empty global config of its own (writable: tests write it)
@@ -71,7 +75,7 @@ if [ "${1:-}" = --steps ]; then
 fi
 
 # ---------------------------------------------------------------- what it was asked
-dry=false cpus='' mem='' jobs='' threads='' io=on io_read=400M io_write=150M guard_url=${KILN_GATE_GUARD_URL:-} cross=auto
+dry=false cpus='' mem='' jobs='' threads='' io=on io_read=400M io_write=150M guard_url=${KILN_GATE_GUARD_URL:-} guard_containers=${KILN_GATE_GUARD_CONTAINERS:-} cross=auto
 while [ $# -gt 0 ]; do
   case $1 in
     --dry-run) dry=true ;;
@@ -83,6 +87,7 @@ while [ $# -gt 0 ]; do
     --io-read) io_read=$2; shift ;;
     --io-write) io_write=$2; shift ;;
     --guard-url) guard_url=$2; shift ;;
+    --guard-containers) guard_containers=$2; shift ;;
     --no-cross) cross=off ;;
     -h | --help) sed -n '2,/^set -euo pipefail/p' "$gate" | sed '$d; s/^# \{0,1\}//'; exit 0 ;;
     *) echo "ci/gate.sh: no such option $1 (--help says what it takes)" >&2; exit 2 ;;
@@ -124,9 +129,33 @@ unit=kiln-gate-$key-$(date +%s)
 systemd=false
 if command -v systemd-run > /dev/null && systemctl --user show-environment > /dev/null 2>&1; then systemd=true; fi
 props=(-p "MemoryMax=$mem_cap" -p CPUWeight=1 -p Nice=19)
+# The disks its build is on, one a line, as systemd's I/O caps want them: a path on btrfs (a
+# subvolume, as adacachy's /home is) has an anonymous st_dev that systemd maps to no disk ("Failed
+# to set 'io.max' … to '0:0 …': No such device", and no cap at all), so they're the disks under the
+# mount's block device (lsblk's inverse tree: a partition's disk, a RAID's or a mapped device's
+# disks), and under each device of a btrfs, which can spread over several disks and put its chunks
+# on any of them (adacachy's /home, over four; findmnt names one); the path where none can be found
+# (no findmnt or lsblk).
+io_disks() {
+  local p=$1 src='' fs='' uuid='' d devs=() disks=''
+  while [ ! -e "$p" ] && [ "$p" != / ]; do p=$(dirname "$p"); done
+  read -r src fs uuid < <(findmnt -no SOURCE,FSTYPE,UUID -T "$p" 2> /dev/null || true) || true
+  if [ "$fs" = btrfs ] && [ -n "$uuid" ]; then
+    for d in "/sys/fs/btrfs/$uuid/devices"/*; do
+      if [ -b "/dev/${d##*/}" ]; then devs+=("/dev/${d##*/}"); fi
+    done
+  fi
+  src=${src%%\[*}
+  if [ ${#devs[@]} -eq 0 ] && [ -b "$src" ]; then devs=("$src"); fi
+  if [ ${#devs[@]} -gt 0 ]; then
+    disks=$(lsblk -snro KNAME,TYPE "${devs[@]}" 2> /dev/null | awk '$2 == "disk" { print "/dev/" $1 }' | sort -u || true)
+  fi
+  echo "${disks:-$1}"
+}
 if [ "$io" != off ]; then
-  # A path: systemd caps the whole disk it's on.
-  props+=(-p "IOReadBandwidthMax=$base $io_read" -p "IOWriteBandwidthMax=$base $io_write")
+  while read -r io_dev; do
+    props+=(-p "IOReadBandwidthMax=$io_dev $io_read" -p "IOWriteBandwidthMax=$io_dev $io_write")
+  done < <(io_disks "$base")
 fi
 
 steps=("clippy-linux: cargo clippy --locked --workspace --all-targets -j $jobs -- -D warnings"
@@ -144,7 +173,11 @@ else
   echo "caps: $caps would apply, but this machine has no systemd user manager: it runs uncapped, at nice 19"
 fi
 echo "cargo: -j $jobs, $threads test threads"
-echo "guard: system.slice I/O pressure (full avg10) over 30, its own tests' containers left out${guard_url:+, or $guard_url over 3 s}, three checks running, stops it"
+if [ -n "$guard_containers" ]; then
+  echo "guard: I/O pressure (full avg10) over 30 in ${guard_containers//,/, }${guard_url:+, or $guard_url over 3 s}, three checks running, stops it"
+else
+  echo "guard: system.slice I/O pressure (full avg10) over 30, its own tests' containers left out${guard_url:+, or $guard_url over 3 s}, three checks running, stops it"
+fi
 echo "steps:"
 n=0
 for s in "${steps[@]}"; do n=$((n + 1)); echo "  $n. $s"; done
@@ -165,7 +198,6 @@ fi
 systemd-run --user --unit "$unit" --collect --wait --pipe --quiet --working-directory="$here" "${props[@]}" "${inner[@]}" &
 pid=$!
 stop() { systemctl --user stop "$unit" 2> /dev/null || true; }
-trap 'stop; exit 143' TERM INT HUP
 # A cgroup's I/O pressure: its "full" avg10.
 pressure() { awk '/^full/ { split($2, a, "="); print a[2] }' "$1/io.pressure" 2> /dev/null || true; }
 # The Docker scopes of the containers this gate's tests made. A test's kiln server labels all it
@@ -181,11 +213,47 @@ own_scopes() {
   done || true
   return 0
 }
+# With --guard-containers: the most strained of the containers named, its "full" avg10 and its name.
+# None of them running, there's nothing of theirs to keep from: 0.
+named_strain() {
+  local worst=-1 who='' id n v
+  while read -r id n; do
+    v=$(pressure "/sys/fs/cgroup/system.slice/docker-$id.scope")
+    [ -n "$v" ] || continue
+    if awk -v v="$v" -v w="$worst" 'BEGIN { exit !(v > w) }'; then worst=$v who=$n; fi
+  done < <(docker ps -q --no-trunc 2> /dev/null | xargs -r docker inspect -f '{{.Id}} {{.Name}}' 2> /dev/null | awk -v want=",$guard_containers," '{ n = substr($2, 2); if (index(want, "," n ",")) print $1, n }')
+  if [ -z "$who" ]; then worst=0 who="$guard_containers (none running)"; fi
+  echo "$worst $who"
+}
+
+# What its tests left in Docker: containers mounting its dir, and containers and networks labelled
+# kiln.runner-work=<h> or kiln.socket.runner.<h>, h the hash of a folder in its TMPDIR (a test
+# server's work dir, a test's own).
+sweep() {
+  command -v docker > /dev/null 2>&1 || return 0
+  local hashes containers networks
+  hashes=$(mktemp)
+  find "$base/tmp" -mindepth 1 -maxdepth 3 -type d 2> /dev/null | while read -r d; do printf '%s' "$d" | { sha256sum 2> /dev/null || shasum -a 256; } | cut -c1-16; done | sort -u > "$hashes"
+  containers=$(docker ps -aq --no-trunc 2> /dev/null | xargs -r docker inspect -f '{{.Id}} {{range .Mounts}}{{.Source}} {{end}}| {{range $k, $v := .Config.Labels}}{{$k}}={{$v}} {{end}}' 2> /dev/null |
+    awk -v b="$base/" -v hf="$hashes" 'BEGIN { while ((getline h < hf) > 0) own[h] = 1 } { mine = index($0, b) > 0; for (i = 2; i <= NF; i++) { if ($i ~ /^kiln\.runner-work=/) { split($i, kv, "="); if (kv[2] in own) mine = 1 } if ($i ~ /^kiln\.socket\.runner\./) { k = $i; sub(/^kiln\.socket\.runner\./, "", k); sub(/=.*/, "", k); if (k in own) mine = 1 } } if (mine) print $1 }')
+  [ -z "$containers" ] || docker rm -f $containers > /dev/null 2>&1 || true
+  networks=$(docker network ls -q 2> /dev/null | xargs -r docker network inspect -f '{{.Id}} {{range $k, $v := .Labels}}{{$k}}={{$v}} {{end}}' 2> /dev/null |
+    awk -v hf="$hashes" 'BEGIN { while ((getline h < hf) > 0) own[h] = 1 } { for (i = 2; i <= NF; i++) { if ($i ~ /^kiln\.runner-work=/) { split($i, kv, "="); if (kv[2] in own) { print $1; next } } if ($i ~ /^kiln\.socket\.runner\./) { k = $i; sub(/^kiln\.socket\.runner\./, "", k); sub(/=.*/, "", k); if (k in own) { print $1; next } } } }')
+  [ -z "$networks" ] || docker network rm $networks > /dev/null 2>&1 || true
+  rm -f "$hashes"
+  if [ -n "$containers$networks" ]; then
+    echo "ci/gate.sh: removed what its tests left in Docker (containers: $(printf '%s\n' $containers | grep -c .), networks: $(printf '%s\n' $networks | grep -c .))"
+  fi
+}
+trap 'stop; sweep; exit 143' TERM INT HUP
 bad=0 why=''
 while kill -0 "$pid" 2> /dev/null; do
   sleep 10
   strained=''
-  if [ -r /sys/fs/cgroup/system.slice/io.pressure ]; then
+  if [ -n "$guard_containers" ]; then
+    read -r full who < <(named_strain)
+    if awk -v f="$full" 'BEGIN { exit !(f > 30) }'; then strained="$who's I/O pressure $full"; fi
+  elif [ -r /sys/fs/cgroup/system.slice/io.pressure ]; then
     full=$(pressure /sys/fs/cgroup/system.slice)
     if awk -v f="$full" 'BEGIN { exit !(f > 30) }'; then
       own=$(own_scopes)
@@ -217,6 +285,7 @@ done
 code=0
 wait "$pid" || code=$?
 trap - TERM INT HUP
+sweep
 if [ -n "$why" ]; then
   echo "GATE: FAIL (stopped: the machine was strained three checks running: $why)"
   exit 1

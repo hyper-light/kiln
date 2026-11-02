@@ -20,7 +20,9 @@ import type { DiscoveredInstance, DiscoveryInfo, DiscoveryMethod, DiscoveryProbl
 import { defaultRunner } from "./defaults.ts";
 import { AUTHORS, REPOS, commitMessage, hashStr, mockDirList, mulberry32, pick, pipelineFor, sha, stepLog, type JobTpl, type LogPlan, type Toolchain } from "./data.ts";
 import { handleAccounts, handleDemoSession, setDemoEmit } from "./accounts.ts";
-import { handleFamily, handleFamilySession, setFamilyEmit } from "./agents.ts";
+import { handleFamily, handleFamilySession, refuseAgent, setFamilyEmit } from "./agents.ts";
+import { handlePlanReview, handleReviewSession, reviewInfos, setReviewEmit } from "./plan-review.ts";
+import { ahead, note, runnerRefused } from "./refused.ts";
 import { handleGoals } from "./goals.ts";
 import { handlePrograms } from "./programs.ts";
 import { handlePages } from "./pages.ts";
@@ -28,12 +30,14 @@ import { handleSettings } from "./settings.ts";
 import { handleMachines } from "./machines.ts";
 import { handleKeep } from "./keep.ts";
 import { handleReap } from "./reap.ts";
+import { handleExperiments } from "./experiments.ts";
 import { handlePlaces } from "./places.ts";
 import { handleLongFiles, handleLongSession, handleShownPages, longInfo, searchSaid, sendAway, setLongEmit } from "./conversation.ts";
 import { fastInfos, handleFastSession } from "./fast.ts";
 import { handlePush, pushHeard } from "./push.ts";
 import { handleReview } from "./review.ts";
 import { handleShip } from "./ship.ts";
+import { handleDeploys, setDeploysEmit } from "./deploys.ts";
 import { handleDoctor } from "./doctor.ts";
 import { handleStores } from "./stores.ts";
 import {
@@ -106,10 +110,22 @@ const repoTc = new Map<string, Toolchain>();
 const runs: Run[] = []; // newest first
 const jobsByRun = new Map<string, SimJob[]>();
 const jobsById = new Map<string, SimJob>();
-/** A job for Ship's fixed rows to stream (ship.ts): one running, else the first. */
+/** The run Ship's fixed rows stream, kept while it has jobs to go: the first running job's run
+ * changes each time one run's job ends before its next starts, and the lanes jumped run to run. One
+ * none of whose jobs will fail where there is one: a fixed row that failed has its own failed leg
+ * (ship.ts), and the rest show no failure they don't have. */
+let liveRunId: string | null = null;
+/** A job for Ship's fixed rows to stream (ship.ts): the live run's running one, else its first. */
 function liveJob() {
   const all = [...jobsById.values()];
-  const sj = all.find((j) => j.job.status === "running") ?? all[0];
+  const going = (j: SimJob) => j.job.run_id === liveRunId && ["pending", "queued", "running"].includes(j.job.status);
+  if (liveRunId === null || !all.some(going)) {
+    const clean = (run: string) => (jobsByRun.get(run) ?? []).every((j) => j.failStep === null && j.job.status !== "failed");
+    const running = all.filter((j) => j.job.status === "running");
+    liveRunId = (running.find((j) => clean(j.job.run_id)) ?? running[0])?.job.run_id ?? null;
+  }
+  const its = all.filter((j) => j.job.run_id === liveRunId);
+  const sj = its.find((j) => j.job.status === "running") ?? its[0] ?? all[0];
   return sj ? { run: sj.job.run_id, job: sj.job.id, name: sj.job.display || sj.job.key, state: sj.job.status } : null;
 }
 /** The run of Ship's live job, each of its jobs (ship.ts: a commit's Checks, each leg its own job,
@@ -350,6 +366,9 @@ addAgent(
   },
   newHost(8, 16, 500),
 );
+// What kiln couldn't read of metal-ryzen-01, of the server's to it and of reach's, kept for its page (refused.ts).
+const refusing = agents.get("metal-ryzen-01");
+if (refusing) refusing.refused = runnerRefused();
 
 /* ------------------------------------------------------------------ */
 /* Repos & runs                                                        */
@@ -611,7 +630,9 @@ function emit(ev: ServerEvent) {
 }
 setLongEmit((ev) => emit(ev as ServerEvent));
 setDemoEmit((ev) => emit(ev as ServerEvent));
+setDeploysEmit((ev) => emit(ev as ServerEvent));
 setFamilyEmit((ev) => emit(ev as ServerEvent));
+setReviewEmit((ev) => emit(ev as ServerEvent));
 
 function queueCounts() {
   let queued = 0;
@@ -1643,6 +1664,19 @@ const server = http.createServer(async (req, res) => {
       quiet = (await body<{ on?: boolean }>(req)).on ?? true;
       return json(res, 200, { quiet });
     }
+    // The browser checks note a message kiln couldn't read, `what` it was: a runner's frame
+    // (`?runner=`), or its runner's update of an agent (`?agent=`). Its page is told, as kiln's are.
+    if (p === "/api/mock/refuse" && m === "POST") {
+      const what = url.searchParams.get("what") ?? "variant 53";
+      const a = agents.get(url.searchParams.get("runner") ?? "");
+      if (a) {
+        a.refused = note(a.refused, ahead(a.name, what), Date.now());
+        emit({ type: "agent", agent: a });
+        return json(res, 200, a.refused);
+      }
+      const refused = refuseAgent(url.searchParams.get("agent") ?? "", what);
+      return refused ? json(res, 200, refused) : err(res, 404, "no such runner or agent");
+    }
     // ---- files the long session's messages mention ----
     if (handleLongFiles(p, url, req, res)) return;
     // ---- live pages a person opens (the Tools tab): what its machine serves; no streams here ----
@@ -1664,18 +1698,24 @@ const server = http.createServer(async (req, res) => {
     const opened = /^\/api\/harness\/sessions\/([^/]+)\/opened$/.exec(p);
     if (opened && m === "GET") return json(res, 200, []);
     if (opened && m === "POST") return err(res, 409, "opening an app on your device needs pages' own site: set [server] pages_url (docs/previews.md)");
+    // ---- plans waiting on a person's review (their stacks, plans and research first) ----
+    if (await handlePlanReview(req, res, url)) return;
     // ---- goal stacks ----
     if (await handleGoals(req, res, url)) return;
     if (await handlePrograms(req, res, url)) return;
     // ---- agents that run agents ----
+    // Ship's Deploys, and the CD routes its panes read for its apps (W26-R24), before the rest of CD's.
+    if (await handleDeploys(req, res, url, { json })) return;
     if (await handleShip(req, res, url, { json, liveJob, liveRun, push: () => void startRun(repos.find((r) => r.name === "hyper-light/kiln") ?? repos[0]!, { branch: "main", event: "push" }) })) return;
-    if (await handleFamily(req, res, url, () => [longInfo(), ...fastInfos()])) return;
+    if (await handleFamily(req, res, url, () => [longInfo(), ...fastInfos(), ...reviewInfos()])) return;
     // ---- harness accounts (and the demo agents to see them from) ----
     if (await handleMachines(req, res, url, { json, body, label: (name) => agents.get(name)?.label })) return;
     // ---- copies runners keep of other runners' trees (docs/reach.md §5.1) ----
     if (await handleKeep(req, res, url, { json, body })) return;
     // ---- the reaper's policies (W24-R31) ----
     if (await handleReap(req, res, url, { json, body })) return;
+    // ---- experiments from an agent's question (docs/ci.md W20-R11) ----
+    if (await handleExperiments(req, res, url, { json, body })) return;
     if (await handleAccounts(req, res, url)) return;
     if (p === "/api/overview") return json(res, 200, overview());
 
@@ -2109,6 +2149,7 @@ server.on("upgrade", (req, socket, head) => {
     if (
       hm &&
       (handleDemoSession(ws, decodeURIComponent(hm[1]!)) ||
+        handleReviewSession(ws, decodeURIComponent(hm[1]!)) ||
         handleFamilySession(ws, decodeURIComponent(hm[1]!)) ||
         handleFastSession(ws, decodeURIComponent(hm[1]!), url.searchParams.get("patch") === "state") ||
         handleLongSession(ws, decodeURIComponent(hm[1]!), url.searchParams.get("z") === "gzip", url.searchParams.get("patch") === "state"))

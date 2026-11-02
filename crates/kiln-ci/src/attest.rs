@@ -1,6 +1,7 @@
 //! Attestations (docs/ci.md W18-R01, R02): in-toto statements of SLSA v1.0 provenance and of
 //! SBOMs, DSSE envelopes and Sigstore bundles. Pure: the server passes what it knows of the run
-//! and the signature it made; nothing here comes from a job's own steps but the subjects.
+//! and the signature it made; nothing here comes from a job's own steps but the subjects. What a
+//! leg signs of what it did and made, as itself, is [`leg`]'s (W27-R05, R06).
 
 use std::collections::BTreeMap;
 
@@ -9,6 +10,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 use crate::wf::ir::{Step, Tpl, YVal};
+
+pub mod leg;
 
 pub const STATEMENT: &str = "https://in-toto.io/Statement/v1";
 pub const PROVENANCE: &str = "https://slsa.dev/provenance/v1";

@@ -26,7 +26,7 @@ test("each section's head: its label on the left over its card, its controls on 
   const row = page.locator(".ship-row").filter({ hasText: "D41" }).first();
   await expect(row).toBeVisible({ timeout: 15_000 });
   await row.locator(".ship-go").click();
-  await expect(row.locator(".ship-sech > h3")).toHaveText(["Output", "Jobs", "Lanes"], { timeout: 15_000 });
+  await expect(row.locator(".ship-sech > h3")).toHaveText(["Commits", "Jobs", "Lanes"], { timeout: 15_000 });
   await expect(row.locator(".ship-lanesbox")).toBeVisible({ timeout: 15_000 });
   for (const width of [320, 390, 640, 800, 1080, 1280, 1440]) {
     await page.setViewportSize({ width, height: 900 });
@@ -51,7 +51,7 @@ test("each section's head: its label on the left over its card, its controls on 
       }),
     );
     const at = (what: string) => `at ${width}: ${what}`;
-    expect(heads.map((h) => h.label)).toEqual(["Output", "Jobs", "Lanes"]);
+    expect(heads.map((h) => h.label)).toEqual(["Commits", "Jobs", "Lanes"]);
     for (const h of heads) {
       if (!h.labelBox || !h.card) throw new Error(at(`${h.label} has no label or no card`));
       // The label on the left, the controls to its right and inside the head, none over another.
@@ -65,7 +65,8 @@ test("each section's head: its label on the left over its card, its controls on 
       expect(h.card.y, at(`${h.label}'s card under its head`)).toBeGreaterThanOrEqual(h.head.y + h.head.h - 0.5);
       expect(h.cardLabel, at(`${h.label}'s card holds no label`)).toBeNull();
     }
-    expect(heads.find((h) => h.label === "Jobs")?.controls.length, at("Jobs' previous and next")).toBe(2);
+    expect(heads.find((h) => h.label === "Commits")?.controls.length, at("Commits' head holds its page sizes (W26-R29)")).toBe(1);
+    expect(heads.find((h) => h.label === "Jobs")?.controls.length, at("Jobs' head holds none: its strip has the actions")).toBe(0);
     expect(heads.find((h) => h.label === "Lanes")?.controls.length, at("Lanes' scale, Earlier, Now and Later")).toBe(4);
   }
   // Files' head (Review's) the same way: its label on the left, its count on the right.

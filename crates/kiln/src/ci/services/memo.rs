@@ -481,9 +481,10 @@ async fn take_over(hub: &Arc<Hub>, leg: &LegOf, idx: u32, rec: &Recorded) -> any
     let log = hub.logs.read(&source, from).await;
     if !log.is_empty() {
         let (logs, id) = (hub.logs.clone(), leg.id.clone());
+        // The source leg's, copied: no chunk this leg sent, which signs only its own (W27-R05).
         crate::rt::blocking(move || {
             for piece in log.chunks(crate::proto::LOG_CHUNK) {
-                logs.append(&id, idx, piece);
+                logs.append_copy(&id, idx, piece);
             }
         })
         .await?;

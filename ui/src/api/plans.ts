@@ -80,6 +80,39 @@ export interface Plan {
   phase: "planning" | "ready";
   /** Its research: what its steps rest on. */
   research: string | null;
+  /** The last answer a person gave its review (one plan read alone has it; lists leave it out). */
+  reviewed?: PlanReviewed | null;
+}
+
+/** A person's answer to a plan its goal stack waits on: its steps run, they don't (its goal skipped), or its agent changes it as they say and it comes back to look at again. */
+export type ReviewAnswer = "approve" | "reject" | "revise";
+
+export interface PlanReviewed {
+  answer: ReviewAnswer;
+  /** Revise: what to change, in their words. */
+  words?: string | null;
+  /** The version they answered. */
+  version: number;
+  by: string;
+  /** Unix seconds. */
+  at: number;
+}
+
+/** A plan in brief (`brief`), as an agent's Plan tab lists every plan: without its words, items or steps' titles. */
+export interface PlanBrief {
+  id: string;
+  title: string;
+  tags: string[];
+  source: PlanSource | null;
+  share: string | null;
+  version: number;
+  created_at: number;
+  updated_at: number;
+  /** How many steps it has: its items, else its text's list items. */
+  step_count: number;
+  runs: number;
+  phase: Plan["phase"];
+  research: string | null;
 }
 
 export interface PlanVersion {
@@ -214,9 +247,12 @@ export interface PlanRunBrief {
 export interface PlanRan {
   session: string;
   sent: number;
-  run: string;
+  /** None when it was approved instead (`approved`). */
+  run?: string;
   /** As goals, split into its acceptance criteria and tests: how many steps were. */
   split?: number;
+  /** Approved instead of run: its agent's goals waited on your review of it, and its `sent` steps go to that agent (`session`) as its goal's parts (docs/plans.md, "Reviewing a plan"). */
+  approved?: boolean;
 }
 
 /** Which of a plan's steps a run takes (`only`, by number), and as goals, each split into its acceptance criteria and tests (`split`). */
@@ -245,6 +281,8 @@ export const plansApi = {
   list: (signal?: AbortSignal) => request<Plan[]>("GET", "/api/plans", undefined, { signal }),
   /** The plans kept with agent `session`: made in its Plan tab, by it, from its goals, or proposed by it. */
   of: (session: string, signal?: AbortSignal) => request<Plan[]>("GET", `/api/plans?session=${enc(session)}`, undefined, { signal }),
+  /** Every plan in brief, newest change first; `q`: those whose title, text, steps or tags hold it. */
+  briefs: (q: string, signal?: AbortSignal) => request<PlanBrief[]>("GET", `/api/plans?brief=1${q ? `&q=${enc(q)}` : ""}`, undefined, { signal }),
   get: (id: string, signal?: AbortSignal) => request<Plan>("GET", `/api/plans/${enc(id)}`, undefined, { signal }),
   /** The plan agent `session` proposed (plan mode), as kiln keeps it: one at most. */
   proposedBy: (session: string, signal?: AbortSignal) => request<Plan[]>("GET", `/api/plans?session=${enc(session)}&proposed=1`, undefined, { signal }),
@@ -269,6 +307,12 @@ export const plansApi = {
   step: (run: string, n: number, act: "retry" | "take" | "met", tries?: number) =>
     request<PlanRunView>("POST", `/api/plans/runs/${enc(run)}/steps/${n}/${act}`, act === "retry" && tries !== undefined ? { try: tries } : undefined),
   share: (id: string, on: boolean) => request<Plan>("POST", `/api/plans/${enc(id)}/share`, { on }),
+  /**
+   * Answer the review its goal stack waits on, for the version looked at (`version`: changed since,
+   * it's refused; none, as it is now: Approve from a row or a card). `key`: asked again under it (its
+   * answer lost), it's answered as things stand and does nothing more (CP-T3.2).
+   */
+  review: (id: string, r: { answer: ReviewAnswer; words?: string; version?: number; key: string }) => request<{ plan: Plan }>("POST", `/api/plans/${enc(id)}/review`, r),
   shared: (token: string, signal?: AbortSignal) => request<SharedPlan>("GET", `/api/shared/plans/${enc(token)}`, undefined, { signal }),
 };
 

@@ -90,6 +90,9 @@ KNOWN = [
     # ruff's ecosystem check builds its base first, checked out (`HEAD is now at … F-03: an empty
     # trunk`) steps before the build that finds no Cargo.toml.
     (r"Build baseline version: error: could not find `Cargo\.toml`", "it builds the pull request's base to compare, and the base is the corpus's empty trunk"),
+    # CodSpeed's upload: codspeed.io knows the upstream's repository (by GitHub's ID token or its
+    # CODSPEED_TOKEN secret), not the corpus's copy; the benchmarks themselves ran.
+    (r"Failed to retrieve upload data: 401 Unauthorized", "its benchmark results go to codspeed.io, which knows the upstream's repository by GitHub's ID token or its CODSPEED_TOKEN secret, and neither the corpus's copy nor kiln's ID tokens: the benchmarks themselves ran"),
     # openai/codex-action (ruff's security review) starts its Responses API proxy only with an
     # OpenAI API key (`if: inputs['openai-api-key'] != ''`), the upstream's secrets.OPENAI_API_KEY.
     (r"Failed to read server info from \S*codex", "openai/codex-action starts its Responses API proxy only with an OpenAI API key, the upstream's secrets.OPENAI_API_KEY, which the corpus's copy hasn't: it then finds no proxy's server info"),

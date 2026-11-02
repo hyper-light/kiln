@@ -621,6 +621,7 @@ mod tests {
             agents: AgentPolicy::default(),
             argocd: Default::default(),
             owners: Default::default(),
+            production: false,
         }
     }
 

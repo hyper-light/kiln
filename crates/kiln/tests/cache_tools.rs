@@ -188,3 +188,56 @@ fn w24_ac08_turborepo_builds_twice_the_second_from_the_cache() -> anyhow::Result
         Ok(())
     })
 }
+
+/// W24-R08: a signal to the client's thread while it waits for an answer leaves its request
+/// whole. Its socket has a timeout, so Linux never restarts that read after the signal's handler
+/// (signal(7)): the read ends EINTR and the client reads again. Before, the request failed
+/// "Interrupted system call", as W24-R08's own test did in a gate (2026-10-30) when another test's
+/// signal came to its thread.
+#[cfg(target_os = "linux")]
+#[test]
+fn w24_r08_a_signal_while_the_client_waits_leaves_its_request_whole() -> anyhow::Result<()> {
+    use std::io::{Read as _, Write as _};
+    use kiln::runner::work::client::{Conn, Endpoint};
+    // A handler for SIGHUP (kiln's own, as `kiln supervise` installs), so the signal interrupts
+    // rather than ends the process.
+    let _hup = kiln::rt::Signals::new(&[kiln::rt::SIGHUP])?;
+    let listener = std::net::TcpListener::bind("127.0.0.1:0")?;
+    let at = listener.local_addr()?;
+    let (asked_tx, asked) = std::sync::mpsc::channel::<()>();
+    // The service, slow: it answers 500 ms after the request has come.
+    let server = std::thread::spawn(move || -> anyhow::Result<()> {
+        let (mut s, _) = listener.accept()?;
+        let mut got = Vec::new();
+        let mut b = [0u8; 4096];
+        while !got.windows(4).any(|w| w == b"\r\n\r\n") {
+            let n = s.read(&mut b)?;
+            anyhow::ensure!(n > 0, "the client closed before asking");
+            got.extend_from_slice(b.get(..n).unwrap_or_default());
+        }
+        let _ = asked_tx.send(());
+        std::thread::sleep(Duration::from_millis(500));
+        s.write_all(b"HTTP/1.1 200 OK\r\ncontent-length: 5\r\n\r\nwhole")?;
+        Ok(())
+    });
+    let (tid_tx, tid) = std::sync::mpsc::channel();
+    let client = std::thread::spawn(move || -> anyhow::Result<(u16, Vec<u8>)> {
+        let _ = tid_tx.send(nix::sys::pthread::pthread_self());
+        let mut c = Conn::new(Endpoint::Tcp { addr: at.to_string(), prefix: String::new() });
+        let r = c.request("GET", "/_kiln/cas/v1/entries/bench/0", &[], b"")?;
+        Ok((r.status, r.body))
+    });
+    let tid = tid.recv_timeout(Duration::from_secs(10))?;
+    asked.recv_timeout(Duration::from_secs(10))?;
+    // The client is reading its answer now, which comes in 500 ms: three signals meanwhile.
+    for _ in 0..3 {
+        std::thread::sleep(Duration::from_millis(100));
+        nix::sys::pthread::pthread_kill(tid, nix::sys::signal::Signal::SIGHUP)?;
+    }
+    let answered = client.join().map_err(|_| anyhow::anyhow!("the client's thread panicked"))?;
+    let served = server.join().map_err(|_| anyhow::anyhow!("the service's thread panicked"))?;
+    let (status, body) = answered?;
+    served?;
+    anyhow::ensure!(status == 200 && body == b"whole", "the answer as sent: {status} {:?}", String::from_utf8_lossy(&body));
+    Ok(())
+}

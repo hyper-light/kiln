@@ -61,7 +61,7 @@ pub struct Made {
     pub files: Vec<String>,
 }
 
-fn git(dir: &Path) -> Command {
+pub(super) fn git(dir: &Path) -> Command {
     let mut c = Command::new("git");
     c.arg("-C").arg(dir);
     // Never a prompt: a question nobody sees would hang the call until its timeout.
@@ -70,7 +70,7 @@ fn git(dir: &Path) -> Command {
 }
 
 /// Runs `c`, its stdout trimmed; an error carries what git said.
-async fn run(c: Command, timeout: Duration) -> anyhow::Result<String> {
+pub(super) async fn run(c: Command, timeout: Duration) -> anyhow::Result<String> {
     let what = format!("{:?}", c.get_args().skip(2).collect::<Vec<_>>());
     let out = crate::proc::output(c, timeout).await?;
     if !out.status.success() {
@@ -194,10 +194,10 @@ impl Drop for Scratch {
 }
 
 /// Commits `paths` (relative to `top`; `None`: every change git sees, as `git add -A` takes it) as
-/// they are in the working tree, on `parent` (`None`: a first commit), by `who`, saying `message`.
-/// `Ok(None)` when that changes nothing. Ignored files among `paths` are left out, as git would
-/// leave them out; files that are gone are deleted.
-pub async fn commit(top: &Path, parent: Option<&str>, paths: Option<&[String]>, message: &str, who: &Ident) -> anyhow::Result<Option<Made>> {
+/// they are in the working tree, on `parent` (`None`: a first commit), by `who`, saying `message`;
+/// signed as [`commit_tree`] signs. `Ok(None)` when that changes nothing. Ignored files among
+/// `paths` are left out, as git would leave them out; files that are gone are deleted.
+pub async fn commit(top: &Path, parent: Option<&str>, paths: Option<&[String]>, message: &str, who: &Ident, sign: Option<&str>) -> anyhow::Result<Option<Made>> {
     let scratch = Scratch(std::env::temp_dir().join(format!("kiln-change-{}.index", crate::util::new_id())));
     let with_index = |c: &mut Command| {
         c.env("GIT_INDEX_FILE", &scratch.0);
@@ -242,16 +242,18 @@ pub async fn commit(top: &Path, parent: Option<&str>, paths: Option<&[String]>, 
     if before.as_deref() == Some(tree.as_str()) {
         return Ok(None);
     }
-    let sha = commit_tree(top, &tree, parent, message, (who, None), who).await?;
+    let sha = commit_tree(top, &tree, parent, message, (who, None), who, sign).await?;
     let files = changed(top, parent, &sha).await?;
     Ok(Some(Made { sha, parent: parent.map(str::to_owned), files }))
 }
 
 /// Writes the commit of `tree` on `parent`, saying `message`, by `author` (at the time given, else
-/// now), committed by `who`.
-async fn commit_tree(top: &Path, tree: &str, parent: Option<&str>, message: &str, author: (&Ident, Option<&str>), who: &Ident) -> anyhow::Result<String> {
+/// now), committed by `who`: an agent's work, so signed as the agent with the key this runner holds
+/// in slot `sign` (its session's at its epoch, W27-R03), and never with a key the person's git
+/// configuration names. A commit that can't be signed so is kept unsigned.
+async fn commit_tree(top: &Path, tree: &str, parent: Option<&str>, message: &str, author: (&Ident, Option<&str>), who: &Ident, sign: Option<&str>) -> anyhow::Result<String> {
     let mut c = git(top);
-    c.args(["commit-tree", tree, "-F", "-"]);
+    c.args(["commit-tree", "--no-gpg-sign", tree, "-F", "-"]);
     if let Some(p) = parent {
         c.args(["-p", p]);
     }
@@ -259,7 +261,31 @@ async fn commit_tree(top: &Path, tree: &str, parent: Option<&str>, message: &str
     if let Some(at) = author.1 {
         c.env("GIT_AUTHOR_DATE", at);
     }
-    with_stdin(c, message.as_bytes()).await
+    let sha = with_stdin(c, message.as_bytes()).await?;
+    let Some(slot) = sign else { return Ok(sha) };
+    match signed_as(top, &sha, slot).await {
+        Ok(signed) => Ok(signed),
+        Err(e) => {
+            tracing::warn!(commit = %sha, error = %format!("{e:#}"), "an agent's commit is kept unsigned");
+            Ok(sha)
+        }
+    }
+}
+
+/// Commit `sha` signed with the key this runner holds in `slot`, git's x509 way
+/// (`crate::identities::signed_commit`): the signed commit, written beside it.
+async fn signed_as(top: &Path, sha: &str, slot: &str) -> anyhow::Result<String> {
+    let mut c = git(top);
+    c.args(["cat-file", "commit", sha]);
+    let out = crate::proc::output(c, GIT_TIMEOUT).await?;
+    anyhow::ensure!(out.status.success(), "git cat-file: {}", String::from_utf8_lossy(&out.stderr).trim());
+    let signed = crate::identities::signed_commit(&out.stdout, |m| {
+        let (signature, pem) = crate::runner::identity::sign(slot, m)?;
+        Ok((signature, crate::pki::der_of(&pem)?))
+    })?;
+    let mut c = git(top);
+    c.args(["hash-object", "-t", "commit", "-w", "--stdin"]);
+    with_stdin(c, &signed).await
 }
 
 /// The files commit `sha` changes over `parent` (`None`: all of them, a first commit).
@@ -326,9 +352,10 @@ async fn tree_of(top: &Path, sha: &str) -> anyhow::Result<String> {
 /// on the new one below. `message` replaces the first's. Refused, saying why, when a change
 /// doesn't go where it must (it changes what a commit above changed too), or when the new top
 /// wouldn't be what the folder has.
-pub async fn restack(top: &Path, commits: &[String], paths: &[String], message: Option<&str>, who: &Ident) -> anyhow::Result<Vec<Made>> {
+pub async fn restack(top: &Path, commits: &[String], paths: &[String], message: Option<&str>, who: &Ident, sign: Option<&str>) -> anyhow::Result<Vec<Made>> {
     let (Some(first), Some(last)) = (commits.first(), commits.last()) else { anyhow::bail!("no commits to make again") };
-    let Some(change) = commit(top, Some(last), Some(paths), "kiln: an agent's change, before it is restacked", who).await? else {
+    // A scratch commit to take the change from, never pushed: unsigned.
+    let Some(change) = commit(top, Some(last), Some(paths), "kiln: an agent's change, before it is restacked", who, None).await? else {
         anyhow::bail!("nothing to add: its files are as the stack has them")
     };
     let mut c = git(top);
@@ -349,7 +376,7 @@ pub async fn restack(top: &Path, commits: &[String], paths: &[String], message: 
         })?;
         let (said, author, date) = authored(top, old).await?;
         let message = if i == 0 { message.map_or(said, str::to_owned) } else { said };
-        let sha = commit_tree(top, &tree, Some(&new_below), &message, (&author, Some(&date)), who).await?;
+        let sha = commit_tree(top, &tree, Some(&new_below), &message, (&author, Some(&date)), who, sign).await?;
         let files = changed(top, Some(&new_below), &sha).await?;
         made.push(Made { sha: sha.clone(), parent: Some(new_below.clone()), files });
         old_below.clone_from(old);
@@ -367,6 +394,7 @@ fn short_sha(sha: &str) -> &str {
 async fn with_stdin(mut c: Command, input: &[u8]) -> anyhow::Result<String> {
     use std::io::Write as _;
     use std::process::Stdio;
+    let what = c.get_args().nth(2).map(|a| a.to_string_lossy().into_owned()).unwrap_or_default();
     let input = input.to_vec();
     c.stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped());
     let out = crate::rt::blocking(move || -> anyhow::Result<std::process::Output> {
@@ -378,14 +406,14 @@ async fn with_stdin(mut c: Command, input: &[u8]) -> anyhow::Result<String> {
     })
     .await??;
     if !out.status.success() {
-        anyhow::bail!("git commit-tree: {}", String::from_utf8_lossy(&out.stderr).trim());
+        anyhow::bail!("git {what}: {}", String::from_utf8_lossy(&out.stderr).trim());
     }
     Ok(String::from_utf8_lossy(&out.stdout).trim().to_owned())
 }
 
 /// Commits `paths` as the working tree has them on `on` (`None`: the folder's last commit), as
 /// [`commit`] does: one step of a plan run's stack. `Ok(None)` when that changes nothing.
-pub async fn commit_on(cwd: &Path, on: Option<&str>, paths: &[String], message: &str, fallback: &Ident) -> anyhow::Result<Option<Made>> {
+pub async fn commit_on(cwd: &Path, on: Option<&str>, paths: &[String], message: &str, fallback: &Ident, sign: Option<&str>) -> anyhow::Result<Option<Made>> {
     let facts = facts(cwd).await?;
     let top = Path::new(&facts.top);
     let who = identity(top, fallback).await;
@@ -395,7 +423,7 @@ pub async fn commit_on(cwd: &Path, on: Option<&str>, paths: &[String], message: 
         c.args(["cat-file", "-e", &format!("{p}^{{commit}}")]);
         run(c, GIT_TIMEOUT).await.map_err(|_| anyhow::anyhow!("the commit of the step before ({}) isn't in {} any more", short_sha(p), facts.top))?;
     }
-    commit(top, parent, Some(paths), message, &who).await
+    commit(top, parent, Some(paths), message, &who, sign).await
 }
 
 /// Of `paths`, those a commit takes: inside the repository, and not ignored (unless git tracks them).
@@ -481,6 +509,592 @@ pub async fn identity(top: &Path, fallback: &Ident) -> Ident {
     }
 }
 
+/// The commit `cwd`'s repository has checked out, if any: where a session began, its commits after
+/// it its own (the Changes tab's Commits).
+pub async fn head(cwd: &Path) -> Option<String> {
+    let mut c = git(cwd);
+    c.args(["rev-parse", "--verify", "--quiet", "HEAD^{commit}"]);
+    ask(c).await
+}
+
+/// Most commits [`log`] lists.
+const LOG_MOST: usize = 200;
+/// Commits [`log`] lists of a branch with none of its own since its trunk: its latest.
+const LOG_LATEST: usize = 50;
+
+/// One commit as the Changes tab's Commits lists it.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[cfg_attr(test, derive(ts_rs::TS))]
+#[cfg_attr(test, ts(rename = "LoggedCommit"))]
+pub struct Logged {
+    pub sha: String,
+    pub parents: Vec<String>,
+    pub subject: String,
+    pub author: String,
+    /// When it was committed (unix ms).
+    pub at: i64,
+    /// What it changes over its first parent: files, and lines added and removed.
+    pub files: u32,
+    pub added: u32,
+    pub removed: u32,
+    /// The session's own: made after the commit its folder had as it began.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub session: bool,
+}
+
+/// What isn't committed yet, as `git add -A` would take it: how many files, and lines.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[cfg_attr(test, derive(ts_rs::TS))]
+#[cfg_attr(test, ts(rename = "UncommittedCounts"))]
+pub struct Counts {
+    pub files: u32,
+    pub added: u32,
+    pub removed: u32,
+}
+
+/// A branch's commits since its trunk ([`log`]).
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[cfg_attr(test, derive(ts_rs::TS))]
+#[cfg_attr(test, ts(rename = "CommitLog"))]
+pub struct Log {
+    /// The working tree's top.
+    pub top: String,
+    pub head: Option<String>,
+    pub branch: Option<String>,
+    /// The trunk it's measured from (`origin/main`), and the commit where they split; none when
+    /// it has none, or nothing of its own since (then its latest commits are listed).
+    pub trunk: Option<String>,
+    pub base: Option<String>,
+    /// Not committed yet; none when everything is.
+    pub dirty: Option<Counts>,
+    /// Newest first, along its first parents.
+    pub commits: Vec<Logged>,
+    /// There are more than are listed.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub more: bool,
+    /// How its session's commits were told: `head` (after the commit it began at), `time` (made
+    /// after it began: a session from before kiln kept that commit, or one whose branch was
+    /// rewritten since), or `none`.
+    pub told: String,
+    /// Its repository's branches, the latest committed to first (a dozen at most): what Commits
+    /// may list instead.
+    pub branches: Vec<String>,
+    /// The branch listed, when it isn't the one checked out.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(test, ts(optional))]
+    pub listed: Option<String>,
+}
+
+/// `cwd`'s branch's commits (or `branch`'s) since `trunk` (none: `origin`'s default branch, else
+/// `main` or `master`), newest first along its first parents; or its latest, when it has none of
+/// its own. A session's own are marked: those after `since_head` (the commit it began at), else
+/// those made after `since_at` (unix ms). What isn't committed yet is the checked-out branch's.
+pub async fn log(cwd: &Path, branch: Option<&str>, trunk: Option<&str>, since_head: Option<&str>, since_at: Option<i64>) -> anyhow::Result<Log> {
+    let f = facts(cwd).await?;
+    let top = PathBuf::from(&f.top);
+    let mut out = Log { top: f.top.clone(), head: f.head.clone(), branch: f.branch.clone(), told: "none".into(), ..Log::default() };
+    let mut c = git(&top);
+    c.args(["for-each-ref", "--sort=-committerdate", "--count=12", "--format=%(refname:short)", "refs/heads"]);
+    out.branches = ask(c).await.unwrap_or_default().lines().map(str::to_owned).collect();
+    let Some(checked_out) = f.head.clone() else {
+        out.dirty = counts_of(&top, None).await?;
+        return Ok(out);
+    };
+    // Another branch than the one checked out: its commits, and nothing uncommitted of its.
+    let other = branch.filter(|b| f.branch.as_deref() != Some(*b));
+    let head = match other {
+        Some(b) => {
+            let mut c = git(&top);
+            c.args(["rev-parse", "--verify", "--quiet", &format!("refs/heads/{b}^{{commit}}")]);
+            out.listed = Some(b.to_owned());
+            ask(c).await.ok_or_else(|| anyhow::anyhow!("there's no branch {b} here"))?
+        }
+        None => checked_out.clone(),
+    };
+    let wanted: Vec<String> = match trunk {
+        Some(t) => vec![t.to_owned()],
+        None => f.default_branch.iter().map(|b| format!("origin/{b}")).chain(["origin/main", "origin/master", "main", "master"].map(str::to_owned)).collect(),
+    };
+    for t in wanted {
+        let mut c = git(&top);
+        c.args(["rev-parse", "--verify", "--quiet", &format!("{t}^{{commit}}")]);
+        if ask(c).await.is_none() {
+            continue;
+        }
+        let mut c = git(&top);
+        c.args(["merge-base", &head, &t]);
+        if let Some(base) = ask(c).await.filter(|b| *b != head) {
+            out.trunk = Some(t);
+            out.base = Some(base);
+        }
+        break;
+    }
+    let mut c = git(&top);
+    c.args(["log", "--first-parent", "--diff-merges=first-parent", "--no-renames", "--numstat", "--format=%x1e%H%x1f%P%x1f%an%x1f%ct%x1f%s"]);
+    match &out.base {
+        Some(base) => c.arg(format!("-n{}", LOG_MOST + 1)).arg(format!("{base}..{head}")),
+        None => c.arg(format!("-n{}", LOG_LATEST + 1)).arg(&head),
+    };
+    let text = run(c, GIT_TIMEOUT).await?;
+    let mut commits = parse_log(&text);
+    let most = if out.base.is_some() { LOG_MOST } else { LOG_LATEST };
+    out.more = commits.len() > most;
+    commits.truncate(most);
+    // Its session's own: after the commit it began at, while that's still in its history.
+    let mut ours: Option<Vec<String>> = None;
+    if let Some(h) = since_head.filter(|h| !h.is_empty()) {
+        let mut c = git(&top);
+        c.args(["merge-base", "--is-ancestor", h, &head]);
+        if crate::proc::output(c, GIT_TIMEOUT).await.is_ok_and(|o| o.status.success()) {
+            let mut c = git(&top);
+            c.args(["rev-list", "--first-parent", &format!("{h}..{head}")]);
+            ours = Some(run(c, GIT_TIMEOUT).await?.lines().map(str::to_owned).collect());
+        }
+    }
+    match (ours, since_at) {
+        (Some(ours), _) => {
+            out.told = "head".into();
+            for c in &mut commits {
+                c.session = ours.contains(&c.sha);
+            }
+        }
+        (None, Some(at)) => {
+            out.told = "time".into();
+            for c in &mut commits {
+                c.session = c.at >= at;
+            }
+        }
+        (None, None) => {}
+    }
+    out.commits = commits;
+    if other.is_none() {
+        out.dirty = counts_of(&top, Some(&checked_out)).await?;
+    }
+    Ok(out)
+}
+
+/// Commits from `git log --numstat` in [`log`]'s format: each record a line of its fields, then a
+/// line a file it changes.
+fn parse_log(text: &str) -> Vec<Logged> {
+    let mut out = Vec::new();
+    for record in text.split('\u{1e}').filter(|r| !r.trim().is_empty()) {
+        let mut lines = record.lines();
+        let mut fields = lines.next().unwrap_or_default().split('\u{1f}');
+        let mut field = || fields.next().unwrap_or_default().to_owned();
+        let (sha, parents, author, at, subject) = (field(), field(), field(), field(), field());
+        let mut l = Logged { sha, parents: parents.split_whitespace().map(str::to_owned).collect(), subject, author, at: at.parse::<i64>().unwrap_or(0).saturating_mul(1000), ..Logged::default() };
+        for line in lines.filter(|l| !l.trim().is_empty()) {
+            let mut cols = line.split('\t');
+            let (add, del) = (cols.next().unwrap_or_default(), cols.next().unwrap_or_default());
+            l.files += 1;
+            // A binary file's counts are `-`.
+            l.added += add.parse::<u32>().unwrap_or(0);
+            l.removed += del.parse::<u32>().unwrap_or(0);
+        }
+        out.push(l);
+    }
+    out
+}
+
+/// The tree of `top`'s working tree as `git add -A` would take it onto `head` (none: no commits
+/// yet), made beside the folder in a scratch index: its untracked files too, never its ignored.
+async fn now_tree(top: &Path, head: Option<&str>) -> anyhow::Result<String> {
+    let scratch = Scratch(std::env::temp_dir().join(format!("kiln-now-{}.index", crate::util::new_id())));
+    let mut c = git(top);
+    c.env("GIT_INDEX_FILE", &scratch.0);
+    match head {
+        Some(h) => c.args(["read-tree", h]),
+        None => c.args(["read-tree", "--empty"]),
+    };
+    run(c, GIT_TIMEOUT).await?;
+    let mut c = git(top);
+    c.env("GIT_INDEX_FILE", &scratch.0).args(["add", "-A"]);
+    run(c, GIT_TIMEOUT).await?;
+    let mut c = git(top);
+    c.env("GIT_INDEX_FILE", &scratch.0).arg("write-tree");
+    run(c, GIT_TIMEOUT).await
+}
+
+/// The empty tree's id: what a repository without commits is compared from.
+const EMPTY_TREE: &str = "4b825dc642cb6eb9a060e54bf8d69288fbee4904";
+
+/// What isn't committed yet over `head`: none when nothing.
+async fn counts_of(top: &Path, head: Option<&str>) -> anyhow::Result<Option<Counts>> {
+    let now = now_tree(top, head).await?;
+    let mut c = git(top);
+    c.args(["diff", "--no-renames", "--numstat", head.unwrap_or(EMPTY_TREE), &now]);
+    let text = run(c, GIT_TIMEOUT).await?;
+    let mut n = Counts::default();
+    for line in text.lines().filter(|l| !l.trim().is_empty()) {
+        let mut cols = line.split('\t');
+        n.files += 1;
+        n.added += cols.next().unwrap_or_default().parse::<u32>().unwrap_or(0);
+        n.removed += cols.next().unwrap_or_default().parse::<u32>().unwrap_or(0);
+    }
+    Ok((n.files > 0).then_some(n))
+}
+
+/// What isn't committed yet, as a pick of [`picked`] names it.
+pub const NOW: &str = "now";
+
+/// The picked commits' change, together ([`picked`]).
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+#[cfg_attr(test, derive(ts_rs::TS))]
+#[cfg_attr(test, ts(rename = "PickedCommits"))]
+pub struct Picked {
+    /// What it's measured from: the first pick's parent.
+    pub from: String,
+    pub files: Vec<crate::harness::model::FileChange>,
+    /// A pick that doesn't go on the ones before it without a commit that wasn't picked: the
+    /// pick, and the commit it needs (none: no single one makes it go).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(test, ts(optional))]
+    pub needs: Option<Needs>,
+}
+
+/// A pick that doesn't go without a commit left out ([`Picked::needs`]).
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[cfg_attr(test, derive(ts_rs::TS))]
+#[cfg_attr(test, ts(rename = "PickNeeds"))]
+pub struct Needs {
+    pub pick: String,
+    pub commit: Option<String>,
+    pub subject: Option<String>,
+}
+
+/// What `picks` (commits of `cwd`'s branch, or `branch`'s; [`NOW`] for what isn't committed yet
+/// on the one checked out) change together: a run of them, from the first one's parent to the
+/// last; with gaps, each applied in order onto the first one's parent in a scratch index, the
+/// folder untouched. One that doesn't go without a commit left out says which.
+pub async fn picked(cwd: &Path, branch: Option<&str>, picks: &[String]) -> anyhow::Result<Picked> {
+    let f = facts(cwd).await?;
+    let top = PathBuf::from(&f.top);
+    let head = f.head.clone();
+    let other = branch.filter(|b| f.branch.as_deref() != Some(*b));
+    // The branch's first-parent line, oldest first, what isn't committed yet after the one checked out's.
+    let tip = match other {
+        Some(b) => Some(format!("refs/heads/{b}")),
+        None => head.clone(),
+    };
+    let mut line: Vec<String> = match &tip {
+        Some(t) => {
+            let mut c = git(&top);
+            c.args(["rev-list", "--first-parent", "--reverse", t]);
+            run(c, GIT_TIMEOUT).await?.lines().map(str::to_owned).collect()
+        }
+        None => Vec::new(),
+    };
+    if other.is_none() {
+        line.push(NOW.to_owned());
+    }
+    let mut at: Vec<usize> = Vec::new();
+    for p in picks {
+        let i = line.iter().position(|s| s == p || (p.len() >= 7 && s.starts_with(p.as_str()))).ok_or_else(|| anyhow::anyhow!("{} isn't on this branch's line of commits", short_sha(p)))?;
+        if !at.contains(&i) {
+            at.push(i);
+        }
+    }
+    at.sort_unstable();
+    let (Some(&first), Some(&last)) = (at.first(), at.last()) else { anyhow::bail!("no commits picked") };
+    // A commit's tree, what isn't committed yet as a tree, and what came before each.
+    let now = if line.get(last).is_some_and(|s| s == NOW) { Some(now_tree(&top, head.as_deref()).await?) } else { None };
+    let tree_at = |i: usize| -> String { if line.get(i).is_some_and(|s| s == NOW) { now.clone().unwrap_or_default() } else { line.get(i).cloned().unwrap_or_default() } };
+    let before = |i: usize| -> String { i.checked_sub(1).and_then(|j| line.get(j).cloned()).unwrap_or_else(|| EMPTY_TREE.to_owned()) };
+    let from = before(first);
+    let run_of_them = at.windows(2).all(|w| matches!(w, [a, b] if b - a == 1));
+    let mut needs = None;
+    let to = if run_of_them {
+        tree_at(last)
+    } else {
+        let mut acc = from.clone();
+        let mut prev: Option<usize> = None;
+        for &i in &at {
+            let what = patch(&top, &before(i), &tree_at(i)).await?;
+            match applied(&top, &acc, &what).await {
+                Ok(t) => acc = t,
+                Err(_) => {
+                    // The commit left out between the last pick and this one that it needs: the
+                    // first that, put in, lets it go.
+                    let mut found = None;
+                    for j in prev.map_or(first, |p| p + 1)..i {
+                        let Ok(with) = applied(&top, &acc, &patch(&top, &before(j), &tree_at(j)).await?).await else { continue };
+                        if applied(&top, &with, &what).await.is_ok() {
+                            found = line.get(j).cloned();
+                            break;
+                        }
+                    }
+                    let subject = match &found {
+                        Some(sha) => {
+                            let mut c = git(&top);
+                            c.args(["log", "-1", "--format=%s", sha]);
+                            ask(c).await
+                        }
+                        None => None,
+                    };
+                    needs = Some(Needs { pick: line.get(i).cloned().unwrap_or_default(), commit: found, subject });
+                    break;
+                }
+            }
+            prev = Some(i);
+        }
+        acc
+    };
+    let files = if needs.is_some() {
+        Vec::new()
+    } else {
+        let mut c = git(&top);
+        c.args(["diff", "--no-renames", "--no-color", "--no-ext-diff", "--no-textconv", "-U3", &from, &to]);
+        crate::harness::diff::git_changes(&run(c, GIT_TIMEOUT).await?, &f.top, crate::util::now_ms())
+    };
+    Ok(Picked { from, files, needs })
+}
+
+/// A point Compare's From or To picks.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum Point {
+    /// The folder as it is now, untracked files too (as `git add -A` would take it).
+    Now,
+    /// As its session began: the commit its folder had checked out then.
+    Began,
+    /// A branch, a tag or a commit.
+    Ref { name: String },
+    /// One who changed its files (`main`, the agent itself, or a subagent run): the folder as its
+    /// session began, with the files it changed as it left them.
+    Agent { by: String },
+}
+
+/// One who changed files' version of one: as they left it.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Left {
+    Text(std::sync::Arc<str>),
+    Absent,
+    /// As it is now: the latest to change it, or how they left it isn't known.
+    Now,
+}
+
+/// A file one who changed files left: where it is in its repository, where on disk (in whichever
+/// of its working trees), and how they left it.
+#[derive(Debug, Clone, PartialEq)]
+pub struct LeftFile {
+    pub path: String,
+    pub abs: String,
+    pub left: Left,
+}
+
+/// Each one who changed files' version of them, by who (`super::super::harness::model::FileChange::by`'s names).
+pub type Versions = std::collections::HashMap<String, Vec<LeftFile>>;
+
+/// What Compare's pickers offer of a repository besides the session's own points ([`refs`]).
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[cfg_attr(test, derive(ts_rs::TS))]
+#[cfg_attr(test, ts(rename = "CompareRefs"))]
+pub struct Refs {
+    /// Its branches, the latest committed to first; its remote's after its own.
+    pub branches: Vec<String>,
+    pub tags: Vec<String>,
+    /// The latest commits on the branch checked out.
+    pub commits: Vec<Logged>,
+    /// Its trunk (`origin/main`), when it has one: From at first.
+    pub trunk: Option<String>,
+}
+
+/// Most of each kind [`refs`] offers.
+const REFS_MOST: usize = 50;
+
+/// `cwd`'s repository's branches (its own, then its remote's), tags and latest commits, for
+/// Compare's pickers.
+pub async fn refs(cwd: &Path) -> anyhow::Result<Refs> {
+    let f = facts(cwd).await?;
+    let top = PathBuf::from(&f.top);
+    let list = |pattern: &'static str, sort: &'static str| {
+        let mut c = git(&top);
+        c.args(["for-each-ref", sort, &format!("--count={REFS_MOST}"), "--format=%(refname:short)", pattern]);
+        c
+    };
+    let mut branches: Vec<String> = ask(list("refs/heads", "--sort=-committerdate")).await.unwrap_or_default().lines().map(str::to_owned).collect();
+    branches.extend(ask(list("refs/remotes", "--sort=-committerdate")).await.unwrap_or_default().lines().filter(|b| !b.ends_with("/HEAD")).map(str::to_owned));
+    let tags = ask(list("refs/tags", "--sort=-creatordate")).await.unwrap_or_default().lines().map(str::to_owned).collect();
+    let commits = match &f.head {
+        Some(_) => {
+            let mut c = git(&top);
+            c.args(["log", "--first-parent", "--no-renames", "--numstat", "--format=%x1e%H%x1f%P%x1f%an%x1f%ct%x1f%s", &format!("-n{REFS_MOST}"), "HEAD"]);
+            parse_log(&run(c, GIT_TIMEOUT).await?)
+        }
+        None => Vec::new(),
+    };
+    let trunk = f.default_branch.map(|b| format!("origin/{b}")).filter(|t| branches.contains(t)).or_else(|| ["origin/main", "origin/master", "main", "master"].into_iter().map(str::to_owned).find(|t| branches.contains(t)));
+    Ok(Refs { branches, tags, commits, trunk })
+}
+
+/// Two points compared ([`compare`]): what changes from one to the other.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+#[cfg_attr(test, derive(ts_rs::TS))]
+#[cfg_attr(test, ts(rename = "Compared"))]
+pub struct Compared {
+    pub files: Vec<crate::harness::model::FileChange>,
+    /// Too many to send whole: their counts only; a file's lines come when it's asked for alone.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub counts_only: bool,
+    /// Compared from where they split (git's three-dot), as asked; off where one of them isn't a
+    /// commit's (two agents' versions).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub split: bool,
+    /// For two agents' versions: of each file (by its path), which of them changed it.
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub changed_by: std::collections::BTreeMap<String, Vec<String>>,
+}
+
+/// Most files, and lines, a compare sends whole; past them, counts first.
+const COMPARE_FILES: usize = 300;
+const COMPARE_LINES: usize = 20_000;
+
+/// A point as a tree, and the commit it stands on (for where two split).
+struct Resolved {
+    tree: String,
+    commit: Option<String>,
+    /// An agent's: the paths it changed.
+    touched: Option<Vec<String>>,
+}
+
+/// `point` in `top`'s repository: `began` the commit its session began at (else the one checked
+/// out), `versions` who changed files' versions of them.
+async fn resolve(top: &Path, head: Option<&str>, began: Option<&str>, point: &Point, versions: &Versions) -> anyhow::Result<Resolved> {
+    let began = began.or(head);
+    match point {
+        Point::Now => Ok(Resolved { tree: now_tree(top, head).await?, commit: head.map(str::to_owned), touched: None }),
+        Point::Began => {
+            let b = began.ok_or_else(|| anyhow::anyhow!("its folder has no commit to say how it was as it began"))?;
+            Ok(Resolved { tree: tree_of(top, b).await?, commit: Some(b.to_owned()), touched: None })
+        }
+        Point::Ref { name } => {
+            let mut c = git(top);
+            c.args(["rev-parse", "--verify", "--quiet", &format!("{name}^{{commit}}")]);
+            let sha = ask(c).await.ok_or_else(|| anyhow::anyhow!("there's no branch, tag or commit {name} here"))?;
+            Ok(Resolved { tree: tree_of(top, &sha).await?, commit: Some(sha), touched: None })
+        }
+        Point::Agent { by } => {
+            let files = versions.get(by).ok_or_else(|| anyhow::anyhow!("how {by} left its files is known only on the machine it works on"))?;
+            let scratch = Scratch(std::env::temp_dir().join(format!("kiln-version-{}.index", crate::util::new_id())));
+            let mut c = git(top);
+            c.env("GIT_INDEX_FILE", &scratch.0);
+            match began {
+                Some(b) => c.args(["read-tree", b]),
+                None => c.args(["read-tree", "--empty"]),
+            };
+            run(c, GIT_TIMEOUT).await?;
+            for f in files {
+                match &f.left {
+                    Left::Text(t) => {
+                        let mut c = git(top);
+                        c.args(["hash-object", "-w", "--stdin"]);
+                        let blob = with_stdin(c, t.as_bytes()).await?;
+                        let mut c = git(top);
+                        c.env("GIT_INDEX_FILE", &scratch.0).args(["update-index", "--add", "--cacheinfo", &format!("100644,{blob},{}", f.path)]);
+                        run(c, GIT_TIMEOUT).await?;
+                    }
+                    Left::Absent => {
+                        let mut c = git(top);
+                        c.env("GIT_INDEX_FILE", &scratch.0).args(["update-index", "--force-remove", "--", &f.path]);
+                        run(c, GIT_TIMEOUT).await?;
+                    }
+                    Left::Now => {
+                        // As it is on disk, in whichever working tree it's in; gone, it's gone.
+                        let mut c = git(top);
+                        c.args(["hash-object", "-w", "--no-filters", "--", &f.abs]);
+                        let mut c2 = git(top);
+                        match run(c, GIT_TIMEOUT).await {
+                            Ok(blob) => c2.env("GIT_INDEX_FILE", &scratch.0).args(["update-index", "--add", "--cacheinfo", &format!("100644,{blob},{}", f.path)]),
+                            Err(_) => c2.env("GIT_INDEX_FILE", &scratch.0).args(["update-index", "--force-remove", "--", &f.path]),
+                        };
+                        run(c2, GIT_TIMEOUT).await?;
+                    }
+                }
+            }
+            let mut c = git(top);
+            c.env("GIT_INDEX_FILE", &scratch.0).arg("write-tree");
+            let tree = run(c, GIT_TIMEOUT).await?;
+            Ok(Resolved { tree, commit: began.map(str::to_owned), touched: Some(files.iter().map(|f| f.path.clone()).collect()) })
+        }
+    }
+}
+
+/// What changes from `from` to `to` in `cwd`'s repository: with `split`, from where they split
+/// (git's three-dot), where both stand on commits, never between two agents' versions; `path`:
+/// that file alone, its lines whatever the compare's size. `began`: the commit its session began
+/// at; `versions`: who changed files' versions of them.
+pub async fn compare(cwd: &Path, from: &Point, to: &Point, split: bool, path: Option<&str>, began: Option<&str>, versions: &Versions) -> anyhow::Result<Compared> {
+    let f = facts(cwd).await?;
+    let top = PathBuf::from(&f.top);
+    let head = f.head.as_deref();
+    let a = resolve(&top, head, began, from, versions).await?;
+    let b = resolve(&top, head, began, to, versions).await?;
+    let agents = a.touched.is_some() && b.touched.is_some();
+    let mut out = Compared::default();
+    let mut base = a.tree.clone();
+    if split && !agents
+        && let (Some(x), Some(y)) = (&a.commit, &b.commit)
+    {
+        let mut c = git(&top);
+        c.args(["merge-base", x, y]);
+        if let Some(m) = ask(c).await {
+            base = tree_of(&top, &m).await?;
+            out.split = true;
+        }
+    }
+    let mut c = git(&top);
+    c.args(["diff", "--no-renames", "--numstat", &base, &b.tree]);
+    let numstat = run(c, GIT_TIMEOUT).await?;
+    let (mut files, mut lines) = (0usize, 0usize);
+    for l in numstat.lines().filter(|l| !l.trim().is_empty()) {
+        let mut cols = l.split('\t');
+        files += 1;
+        lines += cols.next().unwrap_or_default().parse::<usize>().unwrap_or(0) + cols.next().unwrap_or_default().parse::<usize>().unwrap_or(0);
+    }
+    let whole = path.is_some() || (files <= COMPARE_FILES && lines <= COMPARE_LINES);
+    let mut c = git(&top);
+    c.args(["diff", "--no-renames", "--no-color", "--no-ext-diff", "--no-textconv", "-U3", &base, &b.tree]);
+    if let Some(p) = path {
+        c.args(["--", p]);
+    }
+    if whole {
+        out.files = crate::harness::diff::git_changes(&run(c, GIT_TIMEOUT).await?, &f.top, crate::util::now_ms());
+    } else {
+        // Counts first: each file as numstat says, its lines when asked for alone.
+        out.counts_only = true;
+        let mut c = git(&top);
+        c.args(["diff", "--no-renames", "--numstat", "--summary", &base, &b.tree]);
+        let text = run(c, GIT_TIMEOUT).await?;
+        let created: Vec<&str> = text.lines().filter_map(|l| l.trim().strip_prefix("create mode ")).filter_map(|l| l.split_once(' ').map(|(_, p)| p)).collect();
+        let deleted: Vec<&str> = text.lines().filter_map(|l| l.trim().strip_prefix("delete mode ")).filter_map(|l| l.split_once(' ').map(|(_, p)| p)).collect();
+        for l in text.lines().filter(|l| l.contains('\t')) {
+            let mut cols = l.split('\t');
+            let (add, del, p) = (cols.next().unwrap_or_default(), cols.next().unwrap_or_default(), cols.next().unwrap_or_default());
+            out.files.push(crate::harness::model::FileChange {
+                path: p.to_owned(),
+                tree: Some(f.top.clone()),
+                created: created.contains(&p),
+                deleted: deleted.contains(&p),
+                added: add.parse().unwrap_or(0),
+                removed: del.parse().unwrap_or(0),
+                hunks: Vec::new(),
+                truncated: true,
+                at: crate::util::now_ms(),
+                by: Vec::new(),
+                place: Some(crate::harness::model::FilePlace::Project),
+            });
+        }
+    }
+    // Two agents' versions: which of them changed each file.
+    if let (Point::Agent { by: x }, Point::Agent { by: y }, Some(ta), Some(tb)) = (from, to, &a.touched, &b.touched) {
+        for file in &out.files {
+            let who: Vec<String> = [(x, ta), (y, tb)].into_iter().filter(|(_, t)| t.contains(&file.path)).map(|(w, _)| w.clone()).collect();
+            out.changed_by.insert(file.path.clone(), who);
+        }
+    }
+    Ok(out)
+}
+
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
@@ -521,20 +1135,20 @@ mod tests {
             let head = f.head.clone().unwrap_or_default();
             let paths: Vec<String> = vec![top.join("a").to_string_lossy().into_owned(), "src/new.rs".into(), top.join("src/s.rs").to_string_lossy().into_owned(), "target/out".into(), "x.log".into()];
             let who = Ident { name: "Ada".into(), email: "ada@example.com".into() };
-            let made = commit(Path::new(&f.top), Some(&head), Some(&paths), "The agent's work\n\nKiln-Agent: test", &who).await?.ok_or_else(|| anyhow::anyhow!("no commit"))?;
+            let made = commit(Path::new(&f.top), Some(&head), Some(&paths), "The agent's work\n\nKiln-Agent: test", &who, None).await?.ok_or_else(|| anyhow::anyhow!("no commit"))?;
             let mut files = made.files.clone();
             files.sort();
             assert_eq!(files, vec!["a".to_owned(), "src/new.rs".into(), "src/s.rs".into()], "the person's b, the build output and the ignored log stay out");
             assert_eq!(made.parent.as_deref(), Some(head.as_str()));
             // The same again changes nothing.
-            assert!(commit(Path::new(&f.top), Some(&made.sha), Some(&paths), "again", &who).await?.is_none(), "nothing more to commit");
+            assert!(commit(Path::new(&f.top), Some(&made.sha), Some(&paths), "again", &who, None).await?.is_none(), "nothing more to commit");
             // Everything git sees, as `add -A` takes it (the person's b too; never the ignored).
-            let all = commit(Path::new(&f.top), Some(&head), None, "all", &who).await?.ok_or_else(|| anyhow::anyhow!("no commit"))?;
+            let all = commit(Path::new(&f.top), Some(&head), None, "all", &who, None).await?.ok_or_else(|| anyhow::anyhow!("no commit"))?;
             let mut files = all.files;
             files.sort();
             assert_eq!(files, vec!["a".to_owned(), "b".into(), "src/new.rs".into(), "src/s.rs".into()]);
             // A path outside the repository is refused.
-            assert!(commit(Path::new(&f.top), Some(&head), Some(&["/etc/hostname".to_owned()]), "x", &who).await.is_err());
+            assert!(commit(Path::new(&f.top), Some(&head), Some(&["/etc/hostname".to_owned()]), "x", &who, None).await.is_err());
             anyhow::Ok(())
         })?;
         assert_eq!(status_before, out(&top, &["status", "--porcelain"])?, "the folder's index and working tree are as they were");
@@ -552,7 +1166,7 @@ mod tests {
         crate::rt::block_on(async move {
             let f = facts(&work).await?;
             let who = Ident { name: "Ada".into(), email: "ada@example.com".into() };
-            let made = commit(&work, f.head.as_deref(), Some(&["z".to_owned()]), "z", &who).await?.ok_or_else(|| anyhow::anyhow!("no commit"))?;
+            let made = commit(&work, f.head.as_deref(), Some(&["z".to_owned()]), "z", &who, None).await?.ok_or_else(|| anyhow::anyhow!("no commit"))?;
             let url = bare.to_string_lossy().into_owned();
             push(&work, &url, &format!("+{}:refs/heads/agents/one", made.sha), None).await?;
             assert_eq!(out(&bare, &["rev-parse", "refs/heads/agents/one"])?, made.sha);
@@ -621,19 +1235,19 @@ mod tests {
             let one = |s: &str| std::fs::write(top.join("one.txt"), s);
             // Step 1 writes one.txt, step 2 two.txt, step 3 changes one.txt's last line.
             one("1\n2\n3\n4\n5\n6\n7\n8\n")?;
-            let s1 = commit_on(&top, None, &["one.txt".into()], "Step one\n\nChange-Id: I1111111111111111111111111111111111111111\n", &who).await?.ok_or_else(|| anyhow::anyhow!("no commit"))?;
+            let s1 = commit_on(&top, None, &["one.txt".into()], "Step one\n\nChange-Id: I1111111111111111111111111111111111111111\n", &who, None).await?.ok_or_else(|| anyhow::anyhow!("no commit"))?;
             std::fs::write(top.join("two.txt"), "two\n")?;
-            let s2 = commit_on(&top, Some(&s1.sha), &["two.txt".into()], "Step two\n", &who).await?.ok_or_else(|| anyhow::anyhow!("no commit"))?;
+            let s2 = commit_on(&top, Some(&s1.sha), &["two.txt".into()], "Step two\n", &who, None).await?.ok_or_else(|| anyhow::anyhow!("no commit"))?;
             one("1\n2\n3\n4\n5\n6\n7\nEIGHT\n")?;
-            let s3 = commit_on(&top, Some(&s2.sha), &[top.join("one.txt").to_string_lossy().into_owned()], "Step three\n", &who).await?.ok_or_else(|| anyhow::anyhow!("no commit"))?;
+            let s3 = commit_on(&top, Some(&s2.sha), &[top.join("one.txt").to_string_lossy().into_owned()], "Step three\n", &who, None).await?.ok_or_else(|| anyhow::anyhow!("no commit"))?;
             assert_eq!((s2.parent.as_deref(), s3.parent.as_deref(), s3.files.clone()), (Some(s1.sha.as_str()), Some(s2.sha.as_str()), vec!["one.txt".to_owned()]));
-            assert!(commit_on(&top, Some(&s3.sha), &["one.txt".into()], "again", &who).await?.is_none(), "nothing new: no commit");
-            assert!(commit_on(&top, Some("0123456789012345678901234567890123456789"), &["one.txt".into()], "x", &who).await.is_err(), "a step before that isn't there");
+            assert!(commit_on(&top, Some(&s3.sha), &["one.txt".into()], "again", &who, None).await?.is_none(), "nothing new: no commit");
+            assert!(commit_on(&top, Some("0123456789012345678901234567890123456789"), &["one.txt".into()], "x", &who, None).await.is_err(), "a step before that isn't there");
             look(&top)?;
             // Step 1's agent fixes its first line in the folder, which has the whole stack's work.
             one("ONE\n2\n3\n4\n5\n6\n7\nEIGHT\n")?;
             let stack = [s1.sha.clone(), s2.sha.clone(), s3.sha.clone()];
-            let made = restack(&top, &stack, &["one.txt".into()], None, &who).await?;
+            let made = restack(&top, &stack, &["one.txt".into()], None, &who, None).await?;
             let [m1, m2, m3] = made.as_slice() else { anyhow::bail!("{made:?}") };
             assert_eq!(show(&m1.sha, "one.txt")?, "ONE\n2\n3\n4\n5\n6\n7\n8", "the fix, in step 1's own commit");
             assert_eq!(m1.parent, s1.parent, "on what step 1 was on");
@@ -642,14 +1256,14 @@ mod tests {
             assert_eq!(show(&m3.sha, "one.txt")?, "ONE\n2\n3\n4\n5\n6\n7\nEIGHT", "step 3 on it, the fix kept");
             assert_eq!(out(&top, &["log", "-1", "--format=%s", &m3.sha])?, "Step three");
             // A new message for it.
-            let titled = restack(&top, std::slice::from_ref(&m3.sha), &["one.txt".into()], Some("Step three, renamed\n"), &who).await.err().map(|e| format!("{e:#}")).unwrap_or_default();
+            let titled = restack(&top, std::slice::from_ref(&m3.sha), &["one.txt".into()], Some("Step three, renamed\n"), &who, None).await.err().map(|e| format!("{e:#}")).unwrap_or_default();
             assert!(titled.contains("nothing to add"), "{titled}");
             // A fix to what a later step changed can't go into step 1 alone: refused, saying so.
             one("ONE\n2\n3\n4\n5\n6\n7\nEIGHT!\n")?;
-            let e = restack(&top, &[m1.sha.clone(), m2.sha.clone(), m3.sha.clone()], &["one.txt".into()], None, &who).await.err().map(|e| format!("{e:#}")).unwrap_or_default();
+            let e = restack(&top, &[m1.sha.clone(), m2.sha.clone(), m3.sha.clone()], &["one.txt".into()], None, &who, None).await.err().map(|e| format!("{e:#}")).unwrap_or_default();
             assert!(e.contains("changes what a later one changed too"), "{e}");
             // At the top, it goes.
-            let top_only = restack(&top, std::slice::from_ref(&m3.sha), &["one.txt".into()], Some("Step three, again\n"), &who).await?;
+            let top_only = restack(&top, std::slice::from_ref(&m3.sha), &["one.txt".into()], Some("Step three, again\n"), &who, None).await?;
             assert_eq!(top_only.first().map(|m| show(&m.sha, "one.txt")).transpose()?.as_deref(), Some("ONE\n2\n3\n4\n5\n6\n7\nEIGHT!"));
             look(&top)?;
             anyhow::Ok(())
@@ -658,5 +1272,186 @@ mod tests {
         assert!(seen.len() == 2 && seen.first() == seen.last(), "the folder's branch and index didn't move: {seen:?}");
         assert_eq!(out(&top, &["log", "--format=%s", "-1"])?, "init");
         Ok(())
+    }
+
+    /// W27-R03: what a runner commits of an agent's work (its change request, a plan step's
+    /// commit, a restack) is signed as the agent, with the key the runner holds for its session at
+    /// its epoch; never with a key the person's git names (here a signing program that fails, so
+    /// a commit it signed couldn't be made). With no key here (the server's own sessions), it's
+    /// unsigned.
+    #[test]
+    fn w27_r03_an_agents_commit_the_runner_makes_is_signed_as_the_agent() -> anyhow::Result<()> {
+        use kiln_ci::identity::chain::{Actor, Identity};
+        use kiln_ci::identity::gitsig;
+        let d = repo()?;
+        let top = d.path().to_path_buf();
+        sh(&top, "git config commit.gpgsign true && git config gpg.program false && echo a2 > a")?;
+        let keys = tempfile::tempdir()?;
+        let pki = crate::pki::Pki::open_scratch(&keys.path().join("pki"))?;
+        let session = format!("w27-r03-runner-commit-{}", std::process::id());
+        let asked: crate::proto::IdentityAsk = serde_json::from_str(&crate::runner::identity::ask("agent", Some(&session), Some(2))?)?;
+        let identity = Identity::new(pki.organization(), Actor::Agent { person: "sam".into(), agent: session.clone(), epoch: 2, held_by: None });
+        let pem = pki.issue_identity(&asked.csr, &identity, &[], time::Duration::hours(1))?;
+        let given = crate::proto::IdentityGiven { kind: asked.kind, of: asked.of, epoch: asked.epoch, uri: identity.uri()?, cert_pem: Some(pem), error: None, delegation: None };
+        crate::runner::identity::given(given, keys.path(), "main")?;
+        let slot = crate::runner::identity::slot("agent", Some(&session), Some(2));
+        let here = top.clone();
+        let (signed, plain) = crate::rt::block_on(async move {
+            let f = facts(&here).await?;
+            let who = Ident { name: "Ada".into(), email: "ada@example.com".into() };
+            let signed = commit(Path::new(&f.top), f.head.as_deref(), Some(&["a".to_owned()]), "The agent's", &who, Some(&slot)).await?.ok_or_else(|| anyhow::anyhow!("no commit"))?;
+            let plain = commit(Path::new(&f.top), f.head.as_deref(), None, "All of it", &who, None).await?.ok_or_else(|| anyhow::anyhow!("no commit"))?;
+            crate::runner::identity::forget(&slot);
+            anyhow::Ok((signed, plain))
+        })?;
+        let raw = Command::new("git").args(["cat-file", "commit", &signed.sha]).current_dir(&top).output()?.stdout;
+        let sig = gitsig::signature_of(&raw).ok_or_else(|| anyhow::anyhow!("not signed: {}", String::from_utf8_lossy(&raw)))?;
+        let v = gitsig::verify(&gitsig::payload(&raw), &sig, &pki.ca_der, &[], crate::util::now_unix())?;
+        assert_eq!(v.identity, identity, "as the agent, at its epoch");
+        let raw = Command::new("git").args(["cat-file", "commit", &plain.sha]).current_dir(&top).output()?.stdout;
+        assert!(gitsig::signature_of(&raw).is_none(), "no key here: unsigned, and not with the person's");
+        Ok(())
+    }
+
+    /// A commit of `file` saying `text`, made at `at` (unix s), its id.
+    fn commit_at(top: &Path, file: &str, text: &str, subject: &str, at: i64) -> anyhow::Result<String> {
+        sh(top, &format!("printf '{text}' > {file} && git add {file} && GIT_AUTHOR_DATE='@{at} +0000' GIT_COMMITTER_DATE='@{at} +0000' git commit -qm '{subject}'"))?;
+        out(top, &["rev-parse", "HEAD"])
+    }
+
+    /// The Changes tab's Commits (the Changes panel plan 01a194444b1d, step 4): a branch with commits
+    /// before and after its session began marks only the session's as its own, by the commit it began
+    /// at, else by when it began; counted from its trunk, only the branch's own are listed.
+    #[test]
+    fn log_marks_only_the_sessions_commits_as_its_own() -> anyhow::Result<()> {
+        let d = repo()?;
+        let top = d.path().to_path_buf();
+        let before = commit_at(&top, "a", "a2\\n", "before it began", 2_000)?;
+        let began = out(&top, &["rev-parse", "HEAD"])?;
+        let s1 = commit_at(&top, "b", "b2\\n", "its first", 3_000)?;
+        let s2 = commit_at(&top, "src/s.rs", "s2\\n", "its second", 4_000)?;
+        sh(&top, "echo new > new.txt && echo a3 > a")?;
+        crate::rt::block_on(async move {
+            let marked = |l: &Log| l.commits.iter().map(|c| (c.sha.clone(), c.session)).collect::<Vec<_>>();
+            // By the commit it began at; on its trunk itself, its latest are listed.
+            let l = log(&top, None, None, Some(&began), None).await?;
+            assert_eq!((l.told.as_str(), l.trunk.as_deref()), ("head", None));
+            assert_eq!(marked(&l).get(..3).map(<[_]>::to_vec), Some(vec![(s2.clone(), true), (s1.clone(), true), (before.clone(), false)]));
+            assert_eq!(l.commits.first().map(|c| (c.subject.as_str(), c.files, c.added, c.removed, c.at)), Some(("its second", 1, 1, 1, 4_000_000)));
+            // What isn't committed yet: a file changed and one new (untracked).
+            assert_eq!(l.dirty, Some(Counts { files: 2, added: 2, removed: 1 }));
+            // Without that commit, by when it began.
+            let l = log(&top, None, None, None, Some(2_500_000)).await?;
+            assert_eq!(l.told, "time");
+            assert_eq!(marked(&l).get(..3).map(<[_]>::to_vec), Some(vec![(s2.clone(), true), (s1.clone(), true), (before.clone(), false)]));
+            // A branch counted from its trunk: only its own.
+            sh(&top, "git stash -u -q && git checkout -q -b feature")?;
+            let f1 = commit_at(&top, "c", "c\\n", "on the branch", 5_000)?;
+            let l = log(&top, None, Some("main"), Some(&s2), None).await?;
+            assert_eq!((l.trunk.as_deref(), l.base.as_deref(), marked(&l)), (Some("main"), Some(s2.as_str()), vec![(f1, true)]));
+            assert_eq!(l.dirty, None);
+            anyhow::Ok(())
+        })
+    }
+
+    /// Picked commits, together: a run of them is `git diff <first>^ <last>`; with one left out
+    /// between, each goes on in order; one that needs the one left out says which.
+    #[test]
+    fn picked_commits_go_together_in_order_or_name_the_commit_they_need() -> anyhow::Result<()> {
+        let d = repo()?;
+        let top = d.path().to_path_buf();
+        let one = commit_at(&top, "x.txt", "1\\n2\\n3\\n", "one", 2_000)?;
+        let two = commit_at(&top, "y.txt", "y\\n", "two", 3_000)?;
+        let three = commit_at(&top, "x.txt", "1\\n2\\nTHREE\\n", "three", 4_000)?;
+        let four = commit_at(&top, "y.txt", "Y\\n", "four", 5_000)?;
+        let numstat = |from: &str, to: &str| -> anyhow::Result<Vec<(String, u32, u32)>> {
+            Ok(out(&top, &["diff", "--numstat", from, to])?.lines().filter_map(|l| {
+                let mut c = l.split('\t');
+                let (a, r, p) = (c.next()?.parse().ok()?, c.next()?.parse().ok()?, c.next()?.to_owned());
+                Some((p, a, r))
+            }).collect())
+        };
+        let want_run = numstat(&format!("{two}^"), &three)?;
+        let here = top.clone();
+        let (one2, two2, three2, four2) = (one.clone(), two.clone(), three.clone(), four.clone());
+        crate::rt::block_on(async move {
+            let top = here;
+            let counted = |p: &Picked| p.files.iter().map(|f| (f.path.clone(), f.added, f.removed)).collect::<Vec<_>>();
+            // A run: what git diff says from the first's parent to the last.
+            let run = picked(&top, None, &[three2.clone(), two2.clone()]).await?;
+            assert_eq!((run.from.clone(), counted(&run), run.needs.clone()), (one2.clone(), want_run, None));
+            // One and three, two left out: each goes on in order.
+            let gap = picked(&top, None, &[one2.clone(), three2.clone()]).await?;
+            assert_eq!((counted(&gap), gap.needs.clone()), (vec![("x.txt".to_owned(), 3, 0)], None));
+            // Four needs two, which isn't picked: it says so.
+            let needs = picked(&top, None, &[one2.clone(), four2.clone()]).await?;
+            assert_eq!(needs.needs.map(|n| (n.pick, n.commit, n.subject)), Some((four2.clone(), Some(two2.clone()), Some("two".to_owned()))));
+            // What isn't committed yet, after the last commit.
+            sh(&top, "printf 'Y\\nmore\\n' > y.txt")?;
+            let now = picked(&top, None, &[four2, NOW.to_owned()]).await?;
+            assert_eq!(counted(&now), vec![("y.txt".to_owned(), 2, 1)]);
+            // A commit not on the branch's line is refused.
+            assert!(picked(&top, None, &["0123456789abcdef".to_owned()]).await.is_err());
+            anyhow::Ok(())
+        })
+    }
+
+    /// Compare (the Changes panel plan 01a194444b1d, step 5): between branches that both moved since
+    /// they split, from where they split only what To adds; without, every difference.
+    #[test]
+    fn compare_between_branches_that_both_moved_splits_or_shows_every_difference() -> anyhow::Result<()> {
+        let d = repo()?;
+        let top = d.path().to_path_buf();
+        sh(&top, "git checkout -q -b feature")?;
+        commit_at(&top, "f.txt", "f\\n", "on the branch", 2_000)?;
+        sh(&top, "git checkout -q main")?;
+        commit_at(&top, "m.txt", "m\\n", "on main", 3_000)?;
+        crate::rt::block_on(async move {
+            let name = |n: &str| Point::Ref { name: n.to_owned() };
+            let files = |c: &Compared| c.files.iter().map(|f| (f.path.clone(), f.created, f.deleted)).collect::<Vec<_>>();
+            let only = compare(&top, &name("main"), &name("feature"), true, None, None, &Versions::new()).await?;
+            assert_eq!((files(&only), only.split), (vec![("f.txt".to_owned(), true, false)], true));
+            let every = compare(&top, &name("main"), &name("feature"), false, None, None, &Versions::new()).await?;
+            assert_eq!((files(&every), every.split), (vec![("f.txt".to_owned(), true, false), ("m.txt".to_owned(), false, true)], false));
+            // Now: the folder as it is, a new untracked file too.
+            sh(&top, "echo n > n.txt")?;
+            let now = compare(&top, &name("main"), &Point::Now, true, None, None, &Versions::new()).await?;
+            assert_eq!(files(&now), vec![("n.txt".to_owned(), true, false)]);
+            anyhow::Ok(())
+        })
+    }
+
+    /// Two agents' versions, each its files as it left them over how the folder was as the session
+    /// began: compared From → To plainly, each file saying which of them changed it; turned around,
+    /// what one added reads as deleted.
+    #[test]
+    fn two_agents_versions_compare_and_name_who_changed_each_file() -> anyhow::Result<()> {
+        let d = repo()?;
+        let top = d.path().to_path_buf();
+        let began = out(&top, &["rev-parse", "HEAD"])?;
+        let at = |p: &str| top.join(p).to_string_lossy().into_owned();
+        let mut versions = Versions::new();
+        versions.insert("toolu_x".into(), vec![LeftFile { path: "a".into(), abs: at("a"), left: Left::Text("x's a\n".into()) }, LeftFile { path: "new.txt".into(), abs: at("new.txt"), left: Left::Text("x's own\n".into()) }]);
+        versions.insert("toolu_y".into(), vec![LeftFile { path: "a".into(), abs: at("a"), left: Left::Text("y's a\n".into()) }, LeftFile { path: "b".into(), abs: at("b"), left: Left::Absent }]);
+        crate::rt::block_on(async move {
+            let (x, y) = (Point::Agent { by: "toolu_x".into() }, Point::Agent { by: "toolu_y".into() });
+            let c = compare(&top, &x, &y, true, None, Some(&began), &versions).await?;
+            let seen = |c: &Compared| c.files.iter().map(|f| (f.path.clone(), f.created, f.deleted, c.changed_by.get(&f.path).cloned().unwrap_or_default())).collect::<Vec<_>>();
+            assert!(!c.split, "two agents' versions compare plainly");
+            assert_eq!(
+                seen(&c),
+                vec![
+                    ("a".to_owned(), false, false, vec!["toolu_x".to_owned(), "toolu_y".to_owned()]),
+                    ("b".to_owned(), false, true, vec!["toolu_y".to_owned()]),
+                    ("new.txt".to_owned(), false, true, vec!["toolu_x".to_owned()]),
+                ]
+            );
+            // Swapped: the file only x added reads as added now, b as y's deletion undone.
+            let back = compare(&top, &y, &x, true, None, Some(&began), &versions).await?;
+            assert_eq!(back.files.iter().map(|f| (f.path.clone(), f.created, f.deleted)).collect::<Vec<_>>(), vec![("a".to_owned(), false, false), ("b".to_owned(), true, false), ("new.txt".to_owned(), true, false)]);
+            // An agent whose versions this machine doesn't keep is refused, saying why.
+            assert!(compare(&top, &Point::Agent { by: "toolu_z".into() }, &Point::Now, true, None, Some(&began), &versions).await.is_err());
+            anyhow::Ok(())
+        })
     }
 }

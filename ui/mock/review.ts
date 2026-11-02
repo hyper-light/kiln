@@ -807,6 +807,13 @@ const hostPullOf = (number: number) => ({
   ] as HostThreadMock[],
   reviews: [] as { author: string; state: string; body: string; at: number | null }[],
   merge_methods: ["merge", "squash"],
+  signatures: {
+    commits: [
+      { sha: sha(`w23-${number}-1`), state: "verified", reason: "verified", signer: "ada@example.com", verified_at: null, read_at: T0 + 7200 },
+      { sha: sha(`w23-${number}-2`), state: "unverified", reason: "unknown_key", signer: null, verified_at: null, read_at: T0 + 7200 },
+      { sha: sha(`w23-${number}`), state: "unsigned", reason: "unsigned", signer: null, verified_at: null, read_at: T0 + 7200 },
+    ],
+  },
   checks: {
     state: "failure",
     checks: [
@@ -839,7 +846,8 @@ const hostPulls = [
 async function handleHostPulls(req: http.IncomingMessage, res: http.ServerResponse, rest: string[], ctx: Ctx): Promise<boolean> {
   const m = req.method ?? "GET";
   const [n, what] = rest;
-  const summary = (hp: (typeof hostPulls)[number]) => Object.fromEntries(Object.entries(hp).filter(([k]) => !["files", "conversation", "threads", "reviews", "merge_methods", "checks"].includes(k)));
+  const summary = (hp: (typeof hostPulls)[number]) =>
+    Object.fromEntries(Object.entries(hp).filter(([k]) => !["files", "conversation", "threads", "reviews", "merge_methods", "checks", "signatures"].includes(k)));
   if (!n && m === "GET") return (ctx.json(res, 200, { repo: HOST_REPO, pulls: hostPulls.filter((x) => x.state === "open").map(summary) }), true);
   const hp = hostPulls.find((x) => x.number === Number(n));
   if (!hp) return (ctx.err(res, 502, `merge request !${n} (404): 404 Not found`), true);
@@ -906,6 +914,18 @@ interface MockConflict {
   takes: ("main" | "this" | "both" | "agent" | "edit")[];
   agent: { by: string; take: string | null; lines: string[] | null; at: number | null } | null;
   resolution: { take: string; lines: string[] | null; by: string | null; at: number | null } | null;
+}
+
+/**
+ * Where each verdict's signature stands on a diff's latest version (W27-R04). D41's: lee's
+ * approval, given on v1 and carried to v2, a rebase-only version, as kiln signs the carry (W27-R08).
+ */
+function verdictsOf(d: MockDiff) {
+  if (d.name !== "D41" || d.versions < 2) return [];
+  const [from, to] = [sha("main-1"), sha("main-2")];
+  const said = `carried from v1: rebase only, patch-id 9f3c41a…, base ${from.slice(0, 7)} to ${to.slice(0, 7)}`;
+  const carried = { from: 1, to: d.versions, patch_id: "9f3c41a2".repeat(5), base_from: from, base_to: to, record: `sha256:${"c".repeat(64)}`, said };
+  return [{ id: "r41", reviewer: "user:lee", version: 1, action: "accept", standing: "carried", why: null, signer: "kiln://hyper-light/person/lee", on: d.versions, carried }];
 }
 
 /** D41's conflicts with main when a test turns them on (`POST /api/mock/review/conflicts`). */
@@ -1157,6 +1177,7 @@ export async function handleReview(req: http.IncomingMessage, res: http.ServerRe
       true
     );
   }
+  if (c === "verdicts" && m === "GET") return (ctx.json(res, 200, { diff: d.name, latest: d.versions, verdicts: verdictsOf(d) }), true);
   if (c === "comments" && m === "GET") return (ctx.json(res, 200, { threads: threadsOf(d), gate: gateOf(d) }), true);
   if (c === "comments" && m === "POST") {
     const body = await ctx.body<{ body?: string; publish?: boolean; thread?: string; version?: number; file?: string; side?: "old" | "new"; start_line?: number; end_line?: number }>(req);

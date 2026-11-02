@@ -12,13 +12,22 @@
 //! dropped. githost (`kiln::githost::forge`) is the real implementation, for kiln's GitHub App,
 //! GitLab and Bitbucket; [`SimForge`] simulates each host, keeping its limits (GitLab: one author
 //! and 20 merge requests a stack; GitHub: stacks merged bottom-up, with a linear history).
+//!
+//! A change's commits come with what its host verified of their signatures (docs/ci.md W27-R03):
+//! GitHub's and GitLab's verdicts; Bitbucket verifies none, so each of its commits is
+//! [`Signature::Unknown`], saying so.
 
 use futures::future::BoxFuture;
 
 mod sim;
 mod suite;
 
-pub use sim::{BITBUCKET_HOURLY, BODY_MAX, GITHUB_HOURLY, GITLAB_HOURLY, GITLAB_STACK_MOST, SIM_CHANGES, SIM_COMMITS, SIM_DRAFTS, SIM_TICKETS, SimForge, SimForgeFixture, TITLE_MAX, TRUNK};
+pub use sim::{BITBUCKET_HOURLY, BITBUCKET_UNVERIFIED, BODY_MAX, GITHUB_HOURLY, GITLAB_HOURLY, GITLAB_STACK_MOST, SIM_CHANGES, SIM_COMMITS, SIM_DRAFTS, SIM_TICKETS, SimForge, SimForgeFixture, Signing, TITLE_MAX, TRUNK};
+
+/// Most of a change's commits [`Forge::verifications`] reads: GitHub lists a pull request's first
+/// 250, and GitLab and Bitbucket are held to as many, so that a change costs a bounded number of
+/// requests.
+pub const COMMITS_MOST: usize = 250;
 pub use suite::{ForgeFixture, cases};
 
 /// A git host the seam reaches.
@@ -155,6 +164,9 @@ pub struct Abilities {
     /// Merges run in the background, polled with `merge_result` (GitHub's asynchronous merge).
     pub merge_async: bool,
     pub methods: Vec<Method>,
+    /// The host verifies commits' signatures (GitHub, GitLab); where it doesn't (Bitbucket),
+    /// `verifications` says each commit is Unknown.
+    pub verifies: bool,
 }
 
 /// A conditional read's answer.
@@ -267,6 +279,36 @@ pub struct Review {
     pub comments: Vec<Comment>,
 }
 
+/// What a host says of a commit's signature.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Signature {
+    /// Signed, and the host verified it: the key is the signer's, as the host has them.
+    Verified,
+    /// Signed, and the host couldn't verify it (a key it doesn't know, a bad signature, an
+    /// email the signer hasn't shown is theirs): the reason says which.
+    Unverified,
+    /// Not signed.
+    Unsigned,
+    /// The host doesn't say: it verifies no signatures (Bitbucket).
+    Unknown,
+}
+
+/// What a host verified of one of a change's commits.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Verification {
+    pub sha: String,
+    pub state: Signature,
+    /// The host's own word for it (GitHub's `verification.reason`, GitLab's
+    /// `verification_status`, `unsigned` where there's no signature), or why it can't say.
+    pub reason: String,
+    /// Who the host says signed it, as it names them (GitHub: the login whose key it is; GitLab:
+    /// the key's or the certificate's email), once verified.
+    pub signer: Option<String>,
+    /// When the host verified it (Unix seconds), where it says (GitHub keeps its verdict from the
+    /// push on).
+    pub verified_at: Option<i64>,
+}
+
 /// A host's rate limit as it stands.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Rate {
@@ -351,4 +393,8 @@ pub trait Forge: Send + Sync + 'static {
     /// The host's rate limit as it stands: free where the host has a free way to ask (GitHub's),
     /// else as its last answer said (asked once if it hasn't answered yet).
     fn rate<'a>(&'a self, repo: &'a str) -> BoxFuture<'a, Result<Rate, Refusal>>;
+    /// Change `number`'s commits, oldest first (its first [`COMMITS_MOST`]), each with what the
+    /// host verified of its signature (docs/ci.md W27-R03); a merged change's as they were when it
+    /// merged.
+    fn verifications<'a>(&'a self, repo: &'a str, number: u64) -> BoxFuture<'a, Result<Vec<Verification>, Refusal>>;
 }

@@ -7,7 +7,7 @@
  */
 import * as React from "react";
 import { Link, useParams } from "@/lib/router";
-import { HOST_WORD, hostNumber, hostPullRes, hostPullsApi, hostPullsRes, type HostComment, type HostPullDetail, type HostThread, type Thread } from "@/api/review";
+import { HOST_WORD, hostNumber, hostPullRes, hostPullsApi, hostPullsRes, type HostComment, type HostPullDetail, type HostSignature, type HostThread, type Thread } from "@/api/review";
 import { Button } from "@/components/ui/button";
 import { Loadable, Loading } from "@/components/ui/loading";
 import { PageIntro, SelectField } from "@/components/ui/misc";
@@ -40,6 +40,15 @@ const VERDICTS = [
 ];
 
 const acted = (as: "person" | "kiln") => (as === "person" ? "as you" : "with kiln's credentials");
+
+const SIGNED: Record<HostSignature["state"], { word: string; status: string }> = {
+  verified: { word: "Verified", status: "succeeded" },
+  unverified: { word: "Unverified", status: "failed" },
+  unsigned: { word: "Unsigned", status: "neutral" },
+  unknown: { word: "Not known", status: "neutral" },
+};
+/** The host's words that only repeat what the state says. */
+const SAID_BY_STATE = new Set(["valid", "verified", "unsigned"]);
 
 /** `/review/hosts/:repo`: the repository's open pull requests on its host. */
 export function HostPullsPage() {
@@ -183,6 +192,7 @@ function Pull({ repo, n }: { repo: string; n: number }) {
     <>
       <Head repo={repo} p={p} />
       <Checks p={p} />
+      <Signatures p={p} />
       <Merge repo={repo} p={p} />
       <Reviews p={p} />
       <Conversation repo={repo} p={p} threads={threads.filter((t) => t.file == null)} onReply={reply} />
@@ -277,6 +287,34 @@ function Checks({ p }: { p: HostPullDetail }) {
           <Link to={`/runs/${r.run}`}>{r.name ?? `run ${r.number}`}</Link>
           <span className="rv-sub">
             {r.provider} · {r.conclusion ?? r.status}
+          </span>
+        </li>
+      ))}
+    </ul>
+  );
+}
+
+/** What the host verified of each of its commits' signatures (docs/ci.md W27-R03), oldest first. */
+function Signatures({ p }: { p: HostPullDetail }) {
+  const host = HOST_WORD[p.host];
+  const commits = p.signatures.commits ?? [];
+  if (p.signatures.error)
+    return (
+      <p className="rv-sub rv-checks">
+        What {host} verified of its commits can't be read: {p.signatures.error}
+      </p>
+    );
+  if (commits.length === 0) return <p className="rv-sub rv-checks">kiln hasn't read its commits from {host} yet.</p>;
+  return (
+    <ul className="rv-checks" aria-label={`What ${host} verified of its commits`}>
+      {commits.map((c) => (
+        <li key={c.sha}>
+          <StatusDot status={SIGNED[c.state].status} title={c.reason} />
+          <span>{shortSha(c.sha)}</span>
+          <span className="rv-sub">
+            {SIGNED[c.state].word}
+            {c.signer ? ` as ${c.signer}` : ""}
+            {SAID_BY_STATE.has(c.reason) ? "" : ` · ${c.reason.replace(/_/g, " ")}`}
           </span>
         </li>
       ))}

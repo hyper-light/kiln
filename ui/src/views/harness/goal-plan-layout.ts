@@ -7,6 +7,7 @@
  * line across the others.
  */
 import type { Stand } from "@/views/plans/status";
+import type { ApprovalBrief } from "@/api/harness";
 import { labelOf } from "@/lib/data";
 
 /** A step as a goal's plan draws it. */
@@ -23,6 +24,20 @@ export interface GoalStep {
   checks?: { met: number; of: number };
   /** Where it stands in its own word, when its stand's isn't the one ("Planning"). */
   word?: string;
+  /** The agent at it, live: what it's doing or asks, since when, where its thread opens, and the session that answers it. */
+  live?: StepLive;
+}
+
+/** An agent at a step, as the step shows it under who it is. */
+export interface StepLive {
+  /** What it's doing now, in a line. */
+  line: string;
+  /** What it asks you, if anything (answered here, or in its thread). */
+  ask?: ApprovalBrief;
+  /** When its turn started (unix ms). */
+  started?: number;
+  href: string;
+  session: string;
 }
 
 export type GoalPlanRow =

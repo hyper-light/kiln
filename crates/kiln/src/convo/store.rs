@@ -268,6 +268,12 @@ pub trait Engine: Send + 'static {
     /// Where its file stands, for its telemetry: cheap (the file's header, its log's size), as
     /// the writer looks every few seconds. `count`: its sessions counted too.
     fn look(&mut self, count: bool) -> anyhow::Result<Look>;
+    /// Ready to be let go ([`Store::close`]): everything written goes into the file itself, its
+    /// log emptied, for another process to open it next; a compaction under way stops, its copy
+    /// gone (it would stay behind as the file moves).
+    fn release(&mut self) -> anyhow::Result<()> {
+        Ok(())
+    }
 }
 
 type Job = Box<dyn FnOnce(&mut dyn Engine) + Send>;
@@ -276,6 +282,8 @@ enum Msg {
     Rows(Vec<Row>),
     /// Run on the engine, between commits (whatever was sent before it is committed first).
     Run(Job),
+    /// Commit what was sent before, let go of the file ([`Engine::release`]) and stop.
+    Close(mpsc::Sender<anyhow::Result<()>>),
 }
 
 /// Who wants to know that something was committed (a feed with nothing left to send waits on it).
@@ -320,6 +328,16 @@ impl Store {
     /// Where [`Store::hold_prune`] holds it: None, nothing held back.
     pub fn held(&self) -> Option<i64> {
         Some(self.hold.load(Ordering::Acquire)).filter(|h| *h != i64::MAX)
+    }
+
+    /// Let go of the store's file for another process to open it (the new build taking over from
+    /// this runner, `crate::bluegreen`): what was sent before is committed, the log emptied into the
+    /// file, and the file closed. Whatever is asked of it after fails, and rows put after go.
+    /// Blocking, for `READ_WAIT` at most.
+    pub fn close(&self) -> anyhow::Result<()> {
+        let (rtx, rrx) = mpsc::channel();
+        self.tx.send_wait(Msg::Close(rtx)).map_err(|()| anyhow::anyhow!("the conversation store has stopped, or is full"))?;
+        rrx.recv_timeout(READ_WAIT).unwrap_or_else(|_| Err(anyhow::anyhow!("the conversation store didn't let go of its file in time")))
     }
 
     /// Who this store is to its peers.
@@ -604,6 +622,14 @@ fn writer(mut engine: Box<dyn Engine>, rx: &mpsc::Receiver<Msg>, watchers: &Watc
                 f(engine.as_mut());
                 meter.ran();
             }
+            Ok(Msg::Close(reply)) => {
+                commit(&mut engine, &mut pending);
+                // Its files closed before it says so: whoever moves them next finds them let go of.
+                let released = engine.release();
+                drop(engine);
+                let _ = reply.send(released);
+                return;
+            }
             Err(mpsc::RecvTimeoutError::Timeout) => {
                 let had = !pending.is_empty();
                 commit(&mut engine, &mut pending);
@@ -716,6 +742,74 @@ pub fn tee(sink: Sink, store: Store, room: usize) -> Sink {
     tx
 }
 
+/// Where the store a [`tee_held`] keeps what passes in stands.
+enum Keeping {
+    /// Not given yet: the rows wait for it, in order.
+    Waiting(Vec<Row>),
+    Store(Store),
+    /// Taken away: what passes after goes nowhere.
+    Gone,
+}
+
+/// The store a [`tee_held`] keeps what passes through it in, held so that it can be given later
+/// (a new build taking over waits for the store the runner it takes over from hands it,
+/// `crate::bluegreen`) or taken away (that runner, handing its store over).
+#[derive(Clone)]
+pub struct Held {
+    keeping: Arc<Mutex<Keeping>>,
+    /// The tee's way in, held weakly: the tee still ends once its senders have.
+    input: async_channel::WeakSender<(String, Update)>,
+}
+
+impl Held {
+    /// Keep what passes in `store` from now on, what waited for it first, in order.
+    pub fn give(&self, store: Store) {
+        let mut k = self.keeping.lock().unwrap_or_else(PoisonError::into_inner);
+        if let Keeping::Waiting(rows) = std::mem::replace(&mut *k, Keeping::Gone) {
+            for part in rows.chunks(COMMIT_ROWS) {
+                store.put(part.to_vec());
+            }
+        }
+        *k = Keeping::Store(store);
+    }
+
+    /// The store, taken away: what is being kept is in it first, and what passes after goes
+    /// nowhere. None: it had none.
+    pub fn take(&self) -> Option<Store> {
+        match std::mem::replace(&mut *self.keeping.lock().unwrap_or_else(PoisonError::into_inner), Keeping::Gone) {
+            Keeping::Store(st) => Some(st),
+            Keeping::Waiting(_) | Keeping::Gone => None,
+        }
+    }
+
+    /// Nothing waits to pass: what was sent through it before is kept (or waits for the store).
+    pub fn drained(&self) -> bool {
+        self.input.upgrade().is_none_or(|s| s.is_empty())
+    }
+}
+
+/// [`tee`], with its store [`Held`]: given now, or later, or taken away. Rows that come before
+/// the store wait for it in memory; never given, they go.
+pub fn tee_held(sink: Sink, store: Option<Store>, room: usize) -> (Sink, Held) {
+    let (tx, rx) = async_channel::bounded::<(String, Update)>(room);
+    let keeping = Arc::new(Mutex::new(store.map_or_else(|| Keeping::Waiting(Vec::new()), Keeping::Store)));
+    let held = Held { keeping: keeping.clone(), input: tx.downgrade() };
+    crate::rt::spawn(async move {
+        while let Ok((id, u)) = rx.recv().await {
+            // Kept before it goes on, under the lock a taker waits on.
+            match &mut *keeping.lock().unwrap_or_else(PoisonError::into_inner) {
+                Keeping::Waiting(rows) => rows.extend(rows::of(&id, &u, crate::util::now_ms())),
+                Keeping::Store(st) => st.send(&id, &u),
+                Keeping::Gone => {}
+            }
+            if sink.send((id, u)).await.is_err() {
+                break;
+            }
+        }
+    });
+    (tx, held)
+}
+
 /// A store on a new database in a temporary folder, for tests.
 #[cfg(test)]
 pub fn scratch() -> anyhow::Result<(tempfile::TempDir, Store)> {
@@ -738,6 +832,118 @@ mod tests {
 
     fn said(id: &str, seq: u64, text: &str) -> Update {
         Update::Events { events: vec![Event { id: id.into(), seq, at: 1_000 + seq as i64, parent: None, by: None, body: Body::Assistant { text: text.into(), streaming: false } }] }
+    }
+
+    #[test]
+    fn a_store_let_go_of_goes_on_in_another_process_folder_with_what_it_wrote_and_its_numbers() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let (from, to) = (dir.path().join("old").join(super::super::FILE), dir.path().join("new").join(super::super::FILE));
+        std::fs::create_dir_all(dir.path().join("old"))?;
+        let st = Store::start(Box::new(super::super::turso::Turso::open(&from)?), Upkeep::default())?;
+        st.send("a1", &said("m1", 1, "kept across the upgrade"));
+        let (id, top) = (st.id().to_owned(), st.top()?);
+        st.close()?;
+        // Its files closed by the time it says so: nothing here holds them as they move.
+        #[cfg(target_os = "linux")]
+        {
+            let file = std::fs::canonicalize(&from)?.to_string_lossy().into_owned();
+            let open: Vec<std::path::PathBuf> = std::fs::read_dir("/proc/self/fd")?.filter_map(|fd| std::fs::read_link(fd.ok()?.path()).ok()).filter(|p| p.to_string_lossy().starts_with(&file)).collect();
+            assert!(open.is_empty(), "still open once let go of: {open:?}");
+        }
+        // Let go of: nothing more is taken, and asking fails at once.
+        st.send("a1", &said("m2", 2, "too late"));
+        assert!(st.top().is_err());
+        // Moved to the new build's folder and opened there: the same store, numbers and all.
+        super::super::move_file(&from, &to)?;
+        assert!(!from.exists());
+        assert!(super::super::move_file(&from, &to).is_err(), "never over a store that's there");
+        let again = Store::start(Box::new(super::super::turso::Turso::open(&to)?), Upkeep::default())?;
+        assert_eq!((again.id(), again.top()?), (id.as_str(), top));
+        assert_eq!(again.kept("a1", 10)?.map(|k| k.events.into_iter().map(|e| e.text).collect::<Vec<_>>()), Some(vec!["kept across the upgrade".to_owned()]));
+        Ok(())
+    }
+
+    /// A store that won't open (here, not a database at all) is set aside whole, its log beside it,
+    /// never over another set aside before, and a new store takes its place: a new build handed it
+    /// keeps conversations all the same.
+    #[test]
+    fn a_store_that_wont_open_is_set_aside_whole_and_a_new_one_takes_its_place() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let (name, junk) = (super::super::FILE, vec![0xab_u8; 8192]);
+        let at = |suffix: &str| dir.path().join(format!("{name}{suffix}"));
+        std::fs::write(at(""), &junk)?;
+        std::fs::write(at("-wal"), b"nor is this a log")?;
+        let (st, aside) = super::super::open_or_set_aside(dir.path(), name, Upkeep::default(), 2, Duration::from_millis(10));
+        let st = st.ok_or_else(|| anyhow::anyhow!("no new store"))?;
+        assert_eq!(aside, Some(at(".unopened")));
+        assert_eq!(std::fs::read(at(".unopened"))?, junk);
+        assert_eq!(std::fs::read(at(".unopened-wal"))?, b"nor is this a log");
+        st.send("a1", &said("m1", 1, "kept in the new one"));
+        st.sync()?;
+        assert_eq!(st.kept("a1", 10)?.map(|k| k.events.len()), Some(1));
+        st.close()?;
+        // Another that won't open, set aside beside the first.
+        std::fs::write(at(""), &junk)?;
+        for side in ["-wal", "-shm"] {
+            let _ = std::fs::remove_file(at(side));
+        }
+        let (st, aside) = super::super::open_or_set_aside(dir.path(), name, Upkeep::default(), 1, Duration::ZERO);
+        assert!(st.is_some());
+        assert_eq!(aside, Some(at(".unopened.2")));
+        assert_eq!(std::fs::read(at(".unopened"))?, junk);
+        // A store set aside still opens as it is, by its new name, its log by the same name.
+        let real = dir.path().join("real.db");
+        let st = Store::start(Box::new(super::super::turso::Turso::open(&real)?), Upkeep::default())?;
+        st.send("a1", &said("m1", 1, "set aside whole"));
+        let id = st.id().to_owned();
+        st.close()?;
+        let aside = super::super::set_aside(&real)?;
+        assert_eq!(aside, dir.path().join("real.db.unopened"));
+        let again = Store::start(Box::new(super::super::turso::Turso::open(&aside)?), Upkeep::default())?;
+        assert_eq!(again.id(), id);
+        assert_eq!(again.kept("a1", 10)?.map(|k| k.events.len()), Some(1));
+        Ok(())
+    }
+
+    #[test]
+    fn a_tee_whose_store_comes_later_passes_everything_on_and_keeps_it_all_in_order() -> anyhow::Result<()> {
+        crate::rt::block_on(async move {
+            let (out, passed) = async_channel::unbounded();
+            let (sink, held) = tee_held(out, None, 16);
+            sink.send(("a1".to_owned(), said("m1", 1, "before the store"))).await.map_err(|_| anyhow::anyhow!("closed"))?;
+            // It goes on at once, with no store yet.
+            let (id, _) = crate::rt::timeout(Duration::from_secs(5), passed.recv()).await??;
+            assert_eq!(id, "a1");
+            let (_d, st) = scratch()?;
+            held.give(st.clone());
+            sink.send(("a1".to_owned(), said("m2", 2, "after it"))).await.map_err(|_| anyhow::anyhow!("closed"))?;
+            crate::rt::timeout(Duration::from_secs(5), passed.recv()).await??;
+            st.sync()?;
+            let texts = st.kept("a1", 10)?.map(|k| k.events.into_iter().map(|e| e.text).collect::<Vec<_>>()).unwrap_or_default();
+            assert_eq!(texts, vec!["before the store".to_owned(), "after it".to_owned()]);
+            Ok(())
+        })
+    }
+
+    #[test]
+    fn a_tee_whose_store_is_taken_away_keeps_nothing_more_in_it_and_says_when_it_is_drained() -> anyhow::Result<()> {
+        crate::rt::block_on(async move {
+            let (out, passed) = async_channel::unbounded();
+            let (_d, st) = scratch()?;
+            let (sink, held) = tee_held(out, Some(st.clone()), 16);
+            sink.send(("a1".to_owned(), said("m1", 1, "kept"))).await.map_err(|_| anyhow::anyhow!("closed"))?;
+            crate::rt::timeout(Duration::from_secs(5), passed.recv()).await??;
+            assert!(held.drained());
+            let taken = held.take().ok_or_else(|| anyhow::anyhow!("no store"))?;
+            assert_eq!(taken.id(), st.id());
+            assert!(held.take().is_none(), "taken once");
+            // After: it still goes on, and isn't kept.
+            sink.send(("a1".to_owned(), said("m2", 2, "not kept"))).await.map_err(|_| anyhow::anyhow!("closed"))?;
+            crate::rt::timeout(Duration::from_secs(5), passed.recv()).await??;
+            st.sync()?;
+            assert_eq!(st.kept("a1", 10)?.map(|k| k.events.into_iter().map(|e| e.text).collect::<Vec<_>>()), Some(vec!["kept".to_owned()]));
+            Ok(())
+        })
     }
 
     #[test]

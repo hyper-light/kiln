@@ -43,6 +43,10 @@ const devices = new Map<string, Device>();
 const muted = new Set<string>();
 /** Your marks (`/api/push/notices`): what you put away, acted on or saw, by key. */
 const marks = new Map<string, { key: string; how: "away" | "done" | "seen"; at: number }>();
+/** These requests asked again (`POST /api/mock/asks`): their cards show again, whatever was done with them before. */
+export function forgetMarks(keys: string[]) {
+  for (const key of keys) marks.delete(key);
+}
 interface Sent {
   at: number;
   to: string[];

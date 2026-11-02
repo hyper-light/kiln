@@ -79,11 +79,12 @@ function Act({ icon: Icon, label, k, n, danger, disabled, onSelect }: { icon: Lu
 }
 
 /**
- * A line under the head that slides open and shut (its height from nothing and back, as the About
- * card's does), so the list under it moves smoothly rather than jumps; shut, it's out of reach, and
- * `onGone` says it's done sliding (a moment later where motion is paused and nothing slides).
+ * A line under the head (or under the composer's box, broadcast.tsx) that slides open and shut (its
+ * height from nothing and back, as the About card's does), so the list under it moves smoothly rather
+ * than jumps; shut, it's out of reach, and `onGone` says it's done sliding (a moment later where
+ * motion is paused and nothing slides).
  */
-function Slide({ open, onGone, children }: { open: boolean; onGone?: () => void; children: React.ReactNode }) {
+export function Slide({ open, onGone, children }: { open: boolean; onGone?: () => void; children: React.ReactNode }) {
   const gone = React.useCallback(
     (el: HTMLDivElement | null) => {
       if (!el || !onGone) return;

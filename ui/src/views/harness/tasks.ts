@@ -5,7 +5,7 @@
  * workflows and background calls it left running never keep it working by themselves. The server
  * says the same (`stand` in harness/wait.rs, `SubagentBrief::of`, `Task::live`).
  */
-import type { AgentInfo, SendMode, Status, SubagentBrief, Task } from "@/api/harness";
+import type { AgentInfo, Approval, ApprovalBrief, SendMode, Status, SubagentBrief, Task } from "@/api/harness";
 import { agentLabel, taskLive } from "./derive";
 
 /**
@@ -16,9 +16,12 @@ import { agentLabel, taskLive } from "./derive";
  */
 export const kilnSubagentsOf = (list: readonly AgentInfo[], id: string): AgentInfo[] => list.filter((a) => a.subagent === true && a.parent === id);
 
+/** Its process ended while nobody ended it: kiln starts it again by itself (docs/agents.md, "An agent lives until it's ended"). */
+export const startingAgain = (a: Pick<AgentInfo, "status" | "exit">) => a.status === "exited" && a.exit?.again_at != null;
+
 /** Where one of them stands, in a task's words: running, paused (on you, or for a usage limit), pending (its machine away), else done. */
 export function kilnStatus(a: Pick<AgentInfo, "status" | "approvals" | "pause" | "exit" | "held">): string {
-  if (a.status === "running" || a.status === "starting") return "running";
+  if (a.status === "running" || a.status === "starting" || startingAgain(a)) return "running";
   if (a.status === "waiting" || a.approvals.length > 0 || a.held || a.pause) return "paused";
   if (a.status === "disconnected") return "pending";
   if (a.status === "exited" && a.exit?.error) return "failed";
@@ -40,6 +43,51 @@ export const classOf = (t: Pick<Task, "class" | "kind">): string =>
 
 /** One of its own subagents, not something it left running in the background. */
 export const isSubagent = (t: Pick<Task, "class" | "kind">): boolean => classOf(t) === "agent";
+
+/** What a request asks, in one line, as Mission control's row says it. */
+export const askWords = (ap: Pick<ApprovalBrief, "tool" | "tool_name" | "title">): string =>
+  ap.tool === "question" ? `Asks: ${ap.title}` : ap.tool === "plan" ? "Proposes a plan" : `${ap.tool_name || ap.tool}: ${ap.title}`;
+
+/**
+ * One of its subagents waiting on you: its first request, its name, the session the answer goes to
+ * (`who`: a subagent kiln started is a session of its own; one of its harness's own asks through its
+ * agent's), and what opens its thread (`thread`, as the agent page's `onOpenTask` takes it).
+ */
+export interface SubagentAsk {
+  ap: Pick<ApprovalBrief, "id" | "tool" | "tool_name" | "title" | "at">;
+  name: string;
+  who: string;
+  thread: string;
+}
+
+/**
+ * The subagents of agent `agent` that wait on you, longest waiting first: those kiln started for it
+ * with a request (`kiln`), and its harness's own, whose requests are the agent's and name them
+ * (`Approval.agent`: Claude Code by the task's id, Codex by what it was sent to do). What you
+ * answered here (`done`, answered.ts) no longer waits.
+ */
+export function subagentAsks(
+  agent: string,
+  approvals: readonly Pick<Approval, "id" | "tool" | "tool_name" | "title" | "at" | "agent">[],
+  tasks: readonly Task[],
+  kiln: readonly AgentInfo[],
+  done: ReadonlyMap<string, number>,
+): SubagentAsk[] {
+  const asks: SubagentAsk[] = [];
+  for (const a of kiln) {
+    const ap = a.approvals.find((p) => !done.has(p.id));
+    if (ap) asks.push({ ap, name: agentLabel(a), who: a.id, thread: a.id });
+  }
+  const asking = new Set<string>();
+  for (const ap of approvals) {
+    if (!ap.agent || done.has(ap.id)) continue;
+    const t = tasks.find((x) => isSubagent(x) && (x.id === ap.agent || x.tool_id === ap.agent || x.description === ap.agent));
+    if (!t || asking.has(t.id)) continue;
+    asking.add(t.id);
+    asks.push({ ap, name: t.description || ap.agent, who: agent, thread: t.tool_id ?? t.id });
+  }
+  return asks.sort((x, y) => x.ap.at - y.ap.at);
+}
 
 /** Its subagents still at work (running, waiting to start, or paused for an approval), as the agents list says. */
 export const subagentsAtWork = (subagents: readonly SubagentBrief[] | undefined): SubagentBrief[] => (subagents ?? []).filter(taskLive);

@@ -3,7 +3,9 @@
 //! one author's merge requests, 20 at most, and rebases in the background; Bitbucket has neither
 //! stacks nor a queue. Each repository holds a small commit graph (commits and their parents,
 //! branches), so staleness, linear history, rebases and leases are real. Requests count against
-//! the host's rate limit in a window of the simulator's own time ([`SimForge::advance`]).
+//! the host's rate limit in a window of the simulator's own time ([`SimForge::advance`]). A commit
+//! is unsigned until [`SimForge::sign`] signs it; GitHub and GitLab verify it as their APIs say,
+//! and Bitbucket verifies none.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
@@ -39,9 +41,20 @@ pub const GITLAB_HOURLY: u32 = 7200;
 pub const BITBUCKET_HOURLY: u32 = 1000;
 /// Where the simulator's clock starts (Unix seconds).
 const EPOCH: u64 = 1_800_000_000;
+/// Why each of Bitbucket's commits is Unknown.
+pub const BITBUCKET_UNVERIFIED: &str = "Bitbucket verifies no commit's signature";
 
 struct Commit {
     parents: Vec<String>,
+}
+
+/// How a simulated commit is signed ([`SimForge::sign`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Signing {
+    /// With a key the host has as `signer`'s: it verifies it.
+    Known { signer: String },
+    /// With a key the host doesn't have: it can't verify it.
+    UnknownKey,
 }
 
 struct Ch {
@@ -55,6 +68,8 @@ struct Ch {
     version: u64,
     drafts: Vec<Comment>,
     comments: Vec<Comment>,
+    /// Its commits as they were when it merged.
+    merged_with: Option<Vec<String>>,
 }
 
 struct Ticket {
@@ -69,6 +84,8 @@ struct Repo {
     detect: bool,
     commits: BTreeMap<String, Commit>,
     branches: BTreeMap<String, String>,
+    /// Signed commits: how, and when (the simulator's time).
+    signed: BTreeMap<String, (Signing, u64)>,
     changes: BTreeMap<u64, Ch>,
     stacks: BTreeMap<u64, Vec<u64>>,
     queue_on: bool,
@@ -120,6 +137,7 @@ impl Repo {
             detect,
             commits: BTreeMap::new(),
             branches: BTreeMap::new(),
+            signed: BTreeMap::new(),
             changes: BTreeMap::new(),
             stacks: BTreeMap::new(),
             queue_on: false,
@@ -189,6 +207,58 @@ impl Repo {
             }
         }
         false
+    }
+
+    /// The commits `head` has that `base` hasn't, each after its parents (oldest first).
+    fn between(&self, base: Option<&str>, head: &str) -> Vec<String> {
+        let mut theirs = BTreeSet::new();
+        let mut todo: Vec<String> = base.map(str::to_owned).into_iter().collect();
+        while let Some(c) = todo.pop() {
+            if let Some(k) = self.commits.get(&c)
+                && theirs.insert(c)
+            {
+                todo.extend(k.parents.iter().cloned());
+            }
+        }
+        let (mut out, mut seen) = (Vec::new(), BTreeSet::new());
+        let mut walk = vec![(head.to_owned(), false)];
+        while let Some((c, parents_out)) = walk.pop() {
+            if parents_out {
+                out.push(c);
+                continue;
+            }
+            if theirs.contains(&c) || !seen.insert(c.clone()) {
+                continue;
+            }
+            let parents = self.commits.get(&c).map(|k| k.parents.clone()).unwrap_or_default();
+            walk.push((c, true));
+            walk.extend(parents.into_iter().rev().map(|p| (p, false)));
+        }
+        out
+    }
+
+    /// Change `number`'s commits, oldest first: those its head has that its base hasn't, or as
+    /// they were when it merged.
+    fn commits_of(&self, number: u64) -> Result<Vec<String>, Refusal> {
+        let c = self.ch(number)?;
+        if let Some(kept) = &c.merged_with {
+            return Ok(kept.clone());
+        }
+        let head = self.tip(&c.head_ref)?;
+        Ok(self.between(self.branches.get(&c.base_ref).map(String::as_str), &head))
+    }
+
+    /// What `host` says of commit `sha`'s signature, as GitHub's and GitLab's APIs say it.
+    fn verification(&self, host: Host, sha: &str) -> Verification {
+        let signed = self.signed.get(sha);
+        let (state, reason, signer, verified_at) = match (host, signed) {
+            (Host::Bitbucket, _) => (Signature::Unknown, BITBUCKET_UNVERIFIED, None, None),
+            (_, None) => (Signature::Unsigned, "unsigned", None, None),
+            (Host::Github, Some((Signing::Known { signer }, at))) => (Signature::Verified, "valid", Some(signer.clone()), i64::try_from(*at).ok()),
+            (Host::Gitlab, Some((Signing::Known { signer }, _))) => (Signature::Verified, "verified", Some(signer.clone()), None),
+            (_, Some((Signing::UnknownKey, _))) => (Signature::Unverified, "unknown_key", None, None),
+        };
+        Verification { sha: sha.to_owned(), state, reason: reason.to_owned(), signer, verified_at }
     }
 
     /// `head`'s commits that `onto` hasn't, replayed onto it one by one: the new head.
@@ -338,6 +408,13 @@ impl Repo {
         self.bump(number);
     }
 
+    /// Change `number` merged with `commits`: kept as its commits from now on.
+    fn merged_with(&mut self, number: u64, commits: Vec<String>) {
+        if let Some(c) = self.changes.get_mut(&number) {
+            c.merged_with = Some(commits);
+        }
+    }
+
     /// Changes based on `from` are based on `to` now (a merged change's branch is gone).
     fn retarget(&mut self, from: &str, to: &str) {
         let moved: Vec<u64> = self.changes.values().filter(|c| c.state == State::Open && c.base_ref == from).map(|c| c.number).collect();
@@ -373,12 +450,15 @@ impl Repo {
         if host == Host::Github && self.stack_number_of(number).is_some() {
             let group = self.bottom_up_group(number)?;
             let mut top = String::new();
+            let mut kept = Vec::new();
             for n in &group {
                 top = self.head(*n)?;
+                kept.push(self.commits_of(*n)?);
             }
             self.branches.insert(TRUNK.to_owned(), top.clone());
-            for n in &group {
+            for (n, commits) in group.iter().zip(kept) {
                 self.set_state(*n, State::Merged { commit: top.clone() });
+                self.merged_with(*n, commits);
                 let head_ref = self.ch(*n)?.head_ref.clone();
                 self.retarget(&head_ref, TRUNK);
             }
@@ -388,6 +468,7 @@ impl Repo {
             let c = self.open_ch(number)?;
             (c.head_ref.clone(), c.base_ref.clone())
         };
+        let kept = self.commits_of(number)?;
         let (head, base) = (self.tip(&head_ref)?, self.tip(&base_ref)?);
         let new = match method {
             Method::Merge => self.commit(vec![base, head], &format!("merge change {number}"))?,
@@ -398,6 +479,7 @@ impl Repo {
         };
         self.branches.insert(base_ref.clone(), new.clone());
         self.set_state(number, State::Merged { commit: new.clone() });
+        self.merged_with(number, kept);
         if let Some(s) = self.stack_number_of(number)
             && let Some(v) = self.stacks.get_mut(&s)
         {
@@ -450,6 +532,7 @@ impl Engine {
                 review: Batched::PendingReview,
                 merge_async: true,
                 methods: vec![Method::Merge, Method::Squash, Method::Rebase],
+                verifies: true,
             },
             Host::Gitlab => Abilities {
                 host: self.host,
@@ -459,6 +542,7 @@ impl Engine {
                 review: Batched::DraftNotes,
                 merge_async: false,
                 methods: vec![Method::Merge, Method::Squash, Method::FastForward],
+                verifies: true,
             },
             Host::Bitbucket => Abilities {
                 host: self.host,
@@ -468,6 +552,7 @@ impl Engine {
                 review: Batched::Held,
                 merge_async: false,
                 methods: vec![Method::Merge, Method::Squash, Method::FastForward],
+                verifies: false,
             },
         }
     }
@@ -619,6 +704,30 @@ impl SimForge {
         Ok(())
     }
 
+    /// Signs commit `sha` as `signing` says, now: the host verifies it as pushed, and keeps that
+    /// (as GitHub does).
+    pub fn sign(&self, repo: &str, sha: &str, signing: Signing) -> Result<(), Refusal> {
+        let mut e = self.inner.lock();
+        let now = e.now;
+        let r = e.repo(repo)?;
+        if !r.commits.contains_key(sha) {
+            return Err(not_found(format!("commit {sha}")));
+        }
+        r.signed.insert(sha.to_owned(), (signing, now));
+        Ok(())
+    }
+
+    /// What the host says of commit `sha`'s signature, asked of that commit alone (as GitLab is).
+    pub fn verification_of(&self, repo: &str, sha: &str) -> Result<Verification, Refusal> {
+        let mut e = self.inner.lock();
+        let host = e.host;
+        let r = e.repo(repo)?;
+        if !r.commits.contains_key(sha) {
+            return Err(not_found(format!("commit {sha}")));
+        }
+        Ok(r.verification(host, sha))
+    }
+
     /// Moves the simulator's clock on.
     pub fn advance(&self, secs: u64) {
         let mut e = self.inner.lock();
@@ -726,7 +835,7 @@ impl Forge for SimForge {
             r.next_number = number.saturating_add(1);
             r.changes.insert(
                 number,
-                Ch { number, author: open.by, title: open.title, head_ref: open.head, base_ref: open.base, state: State::Open, rebasing: false, version: 0, drafts: Vec::new(), comments: Vec::new() },
+                Ch { number, author: open.by, title: open.title, head_ref: open.head, base_ref: open.base, state: State::Open, rebasing: false, version: 0, drafts: Vec::new(), comments: Vec::new(), merged_with: None },
             );
             r.bump(number);
             if r.detect {
@@ -1099,6 +1208,10 @@ impl Forge for SimForge {
         };
         ready(out)
     }
+
+    fn verifications<'a>(&'a self, repo: &'a str, number: u64) -> BoxFuture<'a, Result<Vec<Verification>, Refusal>> {
+        self.run(repo, move |host, r| Ok(r.commits_of(number)?.iter().take(COMMITS_MOST).map(|sha| r.verification(host, sha)).collect()))
+    }
 }
 
 /// The fixture for a [`SimForge`]: a fresh host with the repository [`SimForgeFixture::REPO`].
@@ -1251,6 +1364,27 @@ mod tests {
         let before = s.counted();
         block(s.draft(R, first, "alice", Draft { body: "held".into(), line: None }))?;
         assert_eq!(s.counted(), before, "a held draft reached the host");
+        Ok(())
+    }
+
+    /// W27-R03: a change of 251 commits reads its first 250, oldest first, as GitHub lists a pull
+    /// request's; one merged reads its commits as they were when it merged.
+    #[test]
+    fn w27_r03_a_change_reads_its_first_250_commits_and_keeps_them_once_merged() -> Result<(), Refusal> {
+        let s = SimForge::gitlab();
+        let mut pushed = Vec::new();
+        for i in 0..251 {
+            pushed.push(s.push(R, "long", if i == 0 { TRUNK } else { "long" }, &format!("commit {i}"))?);
+        }
+        let n = block(s.open(R, Open { head: "long".into(), base: TRUNK.into(), title: "long".into(), by: "alice".into() }))?.number;
+        let read: Vec<String> = block(s.verifications(R, n))?.into_iter().map(|v| v.sha).collect();
+        assert_eq!(read, pushed.get(..COMMITS_MOST).map(<[String]>::to_vec).unwrap_or_default());
+        s.push(R, "short", TRUNK, "one")?;
+        let short = block(s.open(R, Open { head: "short".into(), base: TRUNK.into(), title: "short".into(), by: "alice".into() }))?.number;
+        let before = block(s.verifications(R, short))?;
+        block(s.merge(R, short, Merge { method: Method::Merge, expected: head(&s, short)? }))?;
+        assert_eq!(block(s.verifications(R, short))?, before, "its commits once merged");
+        assert_eq!(before.len(), 1);
         Ok(())
     }
 

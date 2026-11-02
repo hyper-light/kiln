@@ -92,8 +92,17 @@ submit again. Only the diffs that changed get new versions.
   General comments sit on the diff.
 - **Suggestions**: a comment can propose replacement lines; the author (or their agent) applies
   them as an amend.
-- **Actions**: reviewers accept, request changes, comment or resign. Authors mark ready,
-  abandon or reclaim. Anyone allowed can **commandeer** a diff and take over authorship.
+- **Actions**: reviewers accept, request changes, comment or resign, or pass their review on to
+  someone else, who takes it (until then it stays theirs). Authors mark ready, abandon, reclaim or
+  give the diff to another author, who takes it. Anyone allowed can **commandeer** a diff and take
+  over authorship. Each of these hand-overs is signed by both sides (docs/ci.md W27-R08), kiln
+  signing for a side that isn't there or has no key, and a former author's acts as its author
+  afterwards are refused.
+- **Approvals carried**: a signed approval holds on a later version that only rebased or reworded
+  the diff (the same verbatim patch-id), and kiln signs that carry as a transfer from the version
+  it was given on to the one it reached. The verdicts (`GET /api/diffs/:id/verdicts`) and Ship's
+  review say so: "kim's approval carried from v2: rebase only, patch-id 9f3c41a…, base a1b2c3d to
+  c3d4e5f". A code change, whitespace included, carries no approval.
 - Reviews and comments are drafted privately and published together, like a review in other tools.
 
 ### Conflicts in the diff (W26-R12)
@@ -222,6 +231,10 @@ production:
 | GET/POST | `/api/diffs/:id/comments` | threads; `PATCH /api/comments/:id` resolves or edits |
 | POST | `/api/diffs/:id/review` | `{ action: accept \| request_changes \| comment \| resign, body, comments }` |
 | POST | `/api/diffs/:id/{ready,abandon,reclaim,commandeer}` | |
+| POST | `/api/diffs/:id/give` | `{ to }`: give it to another author (`user:<name>`, `agent:<id>`); `hand_on`: yours, signed |
+| POST | `/api/diffs/:id/take` | take a diff given to you; `receipt`: yours, signed |
+| POST | `/api/diffs/:id/reviewers/pass` | `{ to }`: pass your review request on; `hand_on`: yours, signed |
+| POST | `/api/diffs/:id/reviewers/take` | take a review request passed on to you; `receipt`: yours, signed |
 | GET | `/api/diffs/:id/conflicts` | its latest revision replayed onto where it lands: each conflict where it falls, what's left to resolve, whether Commit resolution may go (`ready`) |
 | POST/DELETE | `/api/diffs/:id/conflicts/:conflict/resolution` | `{ take: main \| this \| both \| agent \| edit, lines? \| text? }` (an agent's is kept as the agent's); DELETE takes it back |
 | POST | `/api/diffs/:id/conflicts/commit` | Commit resolution: one revision, its why `conflict resolved` (`diffs.submit`, a person) |

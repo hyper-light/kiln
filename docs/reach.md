@@ -132,8 +132,24 @@ link drops — its server connection, the server, the other runner's — it open
 waits for its asker 15 minutes without a link (`linger`), then is stopped. A link quiet for 15 s
 is pinged; at 45 s it is replaced.
 
+A detached run (`--detach`, §4.2) waits for no one: it asks for a linger of for ever
+(`wire::DETACHED`), and once it holds 16 MiB of output with no link up, or with none of it taken for
+10 s, its oldest output gives way (counted in its exit's `lost`, and an asker that comes back sees
+the jump in offsets) instead of the command waiting. A runner from before keeps it as long, but
+makes it wait on its output as on any run's.
+
 Nothing on the runner waits on reach (its input is unbounded, bounded in practice by the windows),
 and reach never waits on the runner: output to the server is batched, many messages per frame.
+
+A message either side can't read (a kind its build doesn't know, or bytes that aren't one) is
+answered in the link with what it was, a code and why (`Say::Unread`, `Ask::Unread`, appended last),
+and the link ends; a runner from before ends it on that as it would on any garbage, and its session
+goes on on a new link. The runner that couldn't read it tells the server (`AgentMsg::LinkUnread`, to
+one that says `CAP_UNREAD`), which notes it against the runner that sent it, checking the link's ends
+against its relay's (docs/wire.md, "What can't be read"). What the relay refuses it says with a code
+too (`ServerMsg::ReachRefused`): a link id taken, a link to itself, too many links, a runner that
+doesn't take links or doesn't accept them, one not connected, a link closed. A frame from a runner
+that isn't one of a link's ends, or from a job's pod, goes nowhere, and is noted.
 
 ### 4.2 Runs
 
@@ -146,6 +162,12 @@ people's tools live on), plus `KILN_REACH_FROM=<asking runner>`. A named shell (
 tool's `shell`) carries its working folder and exported variables from one run to the next.
 Signals: Ctrl-C on `kiln run` goes over as SIGINT; a client that goes away stops its run
 (SIGTERM, then SIGKILL after 5 s) unless it said `--detach`. `--timeout` stops it too.
+
+`--detach` keeps the command running to its end whatever becomes of `kiln run`: Ctrl-C or SIGTERM
+on it, or its going away, leaves the command running, on another runner or on its own. The asking
+runner follows a detached run on alone: it takes its output and lets it go, so the run never waits
+on it, and it makes the link again after a drop, so the doer never waits for it either; it forgets
+the run when the run ends. It isn't a run an upgrade of the asking runner waits for.
 
 ## 5. Sync
 
@@ -311,6 +333,10 @@ on its own machine, with its own tools. Its tools:
 | `research_*`, `conversations_search` | research it records, each finding graded by kiln from its sources (docs/research.md), and every agent's conversations kiln keeps |
 | `plans_*` | plans kept, run (on itself without `session` or `new`; one agent per step, in its harness, on its machine and in its folder unless it says otherwise) and followed (docs/plans.md); a plan's versions and deleting one are code mode's |
 
+Each of its own tools (and each `kiln.machines.*` operation below) reads its arguments as a type
+(`reach::mcp::input`), its `inputSchema` made from it. A call that doesn't fit is a tool error
+saying where and why, and the server hears of it (docs/wire.md, `mcp_reach`).
+
 The `agents_*`, `goals_*`, `research_*` and `plans_*` tools are the ones the kiln server says agents
 have (its answer for the operations names them), each as the server describes it, so a server
 deployed with new ones offers them to agents on runners not yet upgraded. Every minute the MCP
@@ -327,7 +353,12 @@ exit code; a machine that can't be reached rejects). Calls run side by side, up 
 `kiln.machines.list`, `.start` (in the background), `.output` and `.stop`. kiln's own operations
 (`kiln.ci.*`, `kiln.cd.*`, as `code_search` lists them) go to the server through the runner's own
 connection (`Req::Ask` → `AgentMsg::ReachAsk`, `mcp::runner_ask`), for the session: it must be one
-the server knows on that runner, and not a job's runner. The session acts for whoever started it
+the server knows on that runner, and not a job's runner. Once kiln has certified a holder of the
+session, each such ask is the session's act, signed beside it (`act`) by the runner process
+holding the session's key at its epoch (docs/ci.md W27-R08): kiln takes it only from that holder
+now. One from a copy left behind (at an epoch the session left, or from another process) is
+refused, answered with why (where and when the session went on), and recorded with who signed it
+(`kiln transfers refused`). A run on another machine is asked as an act first. The session acts for whoever started it
 (their rights, or the owner's), audited as `agent:<session>@<runner> for <them>`; on a kiln nobody
 but the owner signs in to, a session kiln doesn't know the starter of acts for the owner, and on
 others it can't call kiln's operations. A program has 10 minutes unless `timeout_s` says otherwise
@@ -354,6 +385,14 @@ and is answered over there.
 When the agent's machine is away, it can't hand the agent over. The move then goes on from the
 server's copy of the conversation instead, its transcript included (`{"from_store": true}`; see
 [conversations.md](conversations.md), "Resuming on another machine").
+
+A move is a transfer signed by both sides (docs/ci.md W27-R08). The runner the agent leaves signs
+its hand-on at the agent's epoch, which the package carries. The runner it goes to signs its
+receipt with the key it asks kiln to certify at the next epoch. kiln records both before the epoch
+rises, and certifies the key only then. A move from the server's copy is kiln's take, signed by
+kiln's server for the runner that can't hand it on, saying when kiln last heard from it. The copy
+left behind there is told to let go at its runner's first word back, and what it asks of kiln
+meanwhile is refused (§7).
 
 An agent that isn't running moves too: one that crashed or couldn't start on its runner goes as
 any other (its runner hands it over), and starts again where it goes, with the first message it
@@ -504,6 +543,9 @@ agent stays where it is.
 
 ## 9. Not yet
 
+- A runner's Open of an agent at a later epoch isn't signed itself: it raises the epoch kiln's
+  registry keeps (what the agent's inbox and updates are fenced by) before its transfer is recorded,
+  though acts are held to the epoch kiln certified (docs/ci.md W27-R08).
 - A direct runner-to-runner path when two runners can reach each other (the link would move to it
   and keep its session); today every link goes through the server.
 - Pinning fingerprints from the UI (today: `kiln reach status`, `kiln reach forget`).

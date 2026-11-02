@@ -16,6 +16,8 @@
 //!   before its commit ([`external`]: the checks that ask a URL or run a workflow; [`link`]: linked
 //!   kiln servers, whose signed statements prove an `after`).
 //! - [`flow`]: releases, from request to landed, and the worker that follows them.
+//! - [`promotion`]: a promotion as a transfer, CD's hand-on for the environment it leaves and its
+//!   receipt for the one it reaches (docs/ci.md W27-R08).
 //! - [`scaffold`]: an app's source repository, made from its template's starter; [`init`]: its
 //!   chart on kiln's base chart (`kiln app init`).
 //! - [`api`], [`cli`], [`ops`]: `/api/deploy`, `kiln deploy` and `kiln app`, and the `deploy.*`
@@ -40,6 +42,7 @@ pub mod model;
 pub mod moves;
 pub mod ops;
 pub mod preflight;
+pub mod promotion;
 pub mod provider;
 pub mod reads;
 pub mod remote;
@@ -100,7 +103,8 @@ pub fn not_running() -> String {
 
 /// Runs the service until the server shuts down: the worker that follows releases.
 pub async fn run(hub: Arc<Hub>) -> anyhow::Result<()> {
-    let hosted = host::Hosted::new(&crate::ci::hosting::root(&hub));
+    // CD's commits, signed as CD (W27-R03).
+    let hosted = host::Hosted::new(&crate::ci::hosting::root(&hub)).signing_as(Arc::clone(&hub.pki), "cd");
     // Release repositories from before they were native ones move into kiln's hosted root.
     for repo in hosted.adopt(&hub.cfg.server.data_dir.join("deploy").join("repos")) {
         tracing::info!(%repo, "deploy: a release repository moved into kiln's hosted root");

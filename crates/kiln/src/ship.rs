@@ -17,6 +17,10 @@
 //!   first, cursor-paged; `host` (kiln, github, gitlab, bitbucket) and `kind` (diff, request, commit)
 //!   filter, and `lens=review` keeps the changes' commits (W26-R02).
 //! - `GET /api/ship/commits/:repo/:sha`: one commit, its records and where it stands.
+//!
+//! Its Deploys, every KilnCD app by project and an opened app's pane, are [`deploys`]'s (W26-R24).
+
+pub mod deploys;
 
 use std::collections::{HashMap, HashSet};
 
@@ -47,6 +51,8 @@ pub struct RunnerSeen {
     pub connected: bool,
     pub commit: Option<String>,
     pub failed: Option<String>,
+    /// It freezes a job in place (`CAP_FREEZE`, docs/ci.md W26-R22): Pause applies to its jobs.
+    pub freeze: bool,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -80,6 +86,12 @@ struct LegRec {
     reused: bool,
     error: Option<String>,
     attempts: Vec<AttemptRec>,
+    /// Paused since then (W26-R22), and the runner it runs on.
+    paused_at: Option<i64>,
+    agent: Option<String>,
+    /// The provider that runs it when that isn't KilnCI (GitHub Actions, GitLab CI, Bitbucket
+    /// Pipelines): kiln keeps only its record.
+    provider: Option<String>,
 }
 
 /// A KilnCD deployment of a commit, as Ship reads it: kiln deploys itself through KilnCD, not CI's
@@ -853,12 +865,30 @@ fn load_with(c: &rusqlite::Connection, ctx: &RepoCtx, sha: &str, first_row: i64)
     // The engine's legs are its run's latest attempt's; v1's jobs (no `job_id`, no `run_attempt`:
     // production's runs, 2026-10-28) are their run's, retried in place.
     let mut st = c.prepare(
-        "SELECT j.id, j.run_id, COALESCE(NULLIF(j.display, ''), j.key), j.status, j.conclusion, j.reused_from IS NOT NULL, j.error, j.started_at, j.finished_at
+        "SELECT j.id, j.run_id, COALESCE(NULLIF(j.display, ''), j.key), j.status, j.conclusion, j.reused_from IS NOT NULL, j.error, j.started_at, j.finished_at, j.paused_at, j.agent,
+                NULLIF(r.provider, 'kiln')
          FROM jobs j JOIN runs r ON r.id = j.run_id WHERE r.repo_id = ?1 AND r.sha = ?2 AND (j.job_id IS NULL OR j.run_attempt = r.attempt) ORDER BY j.rowid",
     )?;
     let legs: Vec<(String, LegRec)> = st
         .query_map(params![repo_id, sha], |r| {
-            Ok((r.get::<_, String>(0)?, LegRec { job: r.get(0)?, run_id: r.get(1)?, name: r.get(2)?, status: r.get(3)?, conclusion: r.get(4)?, reused: r.get(5)?, error: r.get(6)?, started: r.get(7)?, finished: r.get(8)?, attempts: Vec::new() }))
+            Ok((
+                r.get::<_, String>(0)?,
+                LegRec {
+                    job: r.get(0)?,
+                    run_id: r.get(1)?,
+                    name: r.get(2)?,
+                    status: r.get(3)?,
+                    conclusion: r.get(4)?,
+                    reused: r.get(5)?,
+                    error: r.get(6)?,
+                    started: r.get(7)?,
+                    finished: r.get(8)?,
+                    attempts: Vec::new(),
+                    paused_at: r.get(9)?,
+                    agent: r.get::<_, Option<String>>(10)?.filter(|a| !a.is_empty() && a != "-"),
+                    provider: r.get(11)?,
+                },
+            ))
         })?
         .collect::<Result<_, _>>()?;
     let mut at = c.prepare("SELECT status, conclusion, failure_class FROM ci_attempts WHERE leg_id = ?1 ORDER BY number")?;
@@ -925,13 +955,31 @@ fn journey_of(rec: &Records, runners: &[RunnerSeen], now: i64) -> Journey {
         _ => Land::Landed,
     };
     let run_pipeline: HashMap<&str, &str> = rec.runs.iter().map(|r| (r.id.as_str(), r.pipeline.as_str())).collect();
+    let run_made: HashMap<&str, i64> = rec.runs.iter().map(|r| (r.id.as_str(), r.created_at)).collect();
     let mut checks: Vec<Check> = Vec::new();
-    let mut platforms: Vec<Platform> = Vec::new();
+    // Each platform once, as the newest release run that builds it has it (a release run again
+    // replaces the one before, as a leg tried again keeps its lane), beside when that run was made.
+    let mut releases: Vec<(i64, Platform)> = Vec::new();
     let mut image_parts: Vec<Part> = Vec::new();
     for leg in &rec.legs {
         let pipeline = run_pipeline.get(leg.run_id.as_str()).copied().unwrap_or_default();
+        // A leg names its job and run once it has run (Output streams that job's log).
+        let ran = !matches!(leg.status.as_str(), "queued" | "waiting" | "pending" | "blocked" | "skipped");
         if is_release(pipeline) {
-            platforms.push(Platform { name: leg.name.clone(), state: part_of(&leg.status, leg.conclusion.as_deref()) });
+            let made = run_made.get(leg.run_id.as_str()).copied().unwrap_or_default();
+            let p = Platform {
+                name: leg.name.clone(),
+                state: part_of(&leg.status, leg.conclusion.as_deref()),
+                job: ran.then(|| leg.job.clone()),
+                run: ran.then(|| leg.run_id.clone()),
+                start: leg.started,
+                end: leg.finished,
+            };
+            match releases.iter_mut().find(|(_, q)| q.name == p.name) {
+                Some(slot) if slot.0 <= made => *slot = (made, p),
+                Some(_) => {}
+                None => releases.push((made, p)),
+            }
             continue;
         }
         if is_image(pipeline) {
@@ -945,14 +993,13 @@ fn journey_of(rec: &Records, runners: &[RunnerSeen], now: i64) -> Journey {
         } else {
             leg.attempts.iter().map(|a| attempt_of(&a.status, a.conclusion.as_deref(), a.class.as_deref())).collect()
         };
-        // A leg names its job and run once it has run (Output streams that job's log).
-        let ran = !matches!(leg.status.as_str(), "queued" | "waiting" | "pending" | "blocked" | "skipped");
         let l = Leg { name: leg.name.clone(), attempts, note: leg.error.clone().unwrap_or_default(), job: ran.then(|| leg.job.clone()), run: ran.then(|| leg.run_id.clone()), start: leg.started, end: leg.finished };
         match checks.iter_mut().find(|c| c.pipeline == pipeline) {
             Some(c) => c.legs.push(l),
             None => checks.push(Check { pipeline: pipeline.to_string(), legs: vec![l] }),
         }
     }
+    let platforms: Vec<Platform> = releases.into_iter().map(|(_, p)| p).collect();
     // The image: an image the commit's runs pushed; else what its image pipeline's job says; else
     // under way while a release (the engine's, which pushes it) builds; else nothing built it.
     let release_running = platforms.iter().any(|p| matches!(p.state, Part::Queued | Part::Running));
@@ -1089,7 +1136,7 @@ fn actions(rec: &Records, j: &Journey, yours: bool) -> Vec<Value> {
         && r.superseded_by.is_none()
         && r.state != ReviewState::Fixing
     {
-        if authors_agent(ch).is_some() && (r.conflicts > 0 || !ch.threads.is_empty()) && !out.iter().any(|a| a.get("name").and_then(Value::as_str) == Some("hand_off")) {
+        if made_by(rec).agent.is_some() && (r.conflicts > 0 || !ch.threads.is_empty()) && !out.iter().any(|a| a.get("name").and_then(Value::as_str) == Some("hand_off")) {
             out.push(hand());
         }
         out.push(act("review", "GET", format!("/api/diffs/{}", ch.name), Value::Null));
@@ -1105,6 +1152,46 @@ fn failed_leg(rec: &Records) -> Option<&LegRec> {
 /// The agent that wrote a change (`agent:<id>`, as its agent token pushed it), if an agent did.
 fn authors_agent(ch: &ChangeRec) -> Option<&str> {
     ch.author.strip_prefix("agent:").and_then(|s| s.split(' ').next()).filter(|s| !s.is_empty())
+}
+
+/// Who made a commit, as far as kiln knows: the agent session that made it, and the person it traces
+/// back to (a kiln principal, `user:ada`). Ship asks this one place: Hand off goes to `agent`
+/// (W26-R18), Files' ask asks it (the UI reads `made_by`), and a commit with neither is a person's
+/// or no one's kiln knows. Today it's a kiln change's author and author_for; for a lone commit,
+/// production's runs record only git's author name, so nothing. Chain of Ownership (Ada,
+/// 2026-10-29: any conversation or action traced back to its human initiator) fills it for every
+/// commit, and what reads it follows unchanged.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct MadeBy {
+    agent: Option<String>,
+    person: Option<String>,
+}
+
+fn made_by(rec: &Records) -> MadeBy {
+    match rec.change.as_ref() {
+        Some(ch) => match authors_agent(ch) {
+            Some(agent) => MadeBy { agent: Some(agent.to_owned()), person: ch.author_for.clone().filter(|p| !p.is_empty()) },
+            None => MadeBy { agent: None, person: Some(ch.author.clone()).filter(|p| !p.is_empty()) },
+        },
+        None => MadeBy::default(),
+    }
+}
+
+impl MadeBy {
+    /// `{agent?, person?}` (optional fields, W26-R18), or null when kiln knows neither.
+    fn json(&self) -> Value {
+        if self.agent.is_none() && self.person.is_none() {
+            return Value::Null;
+        }
+        let mut v = serde_json::Map::new();
+        if let Some(a) = &self.agent {
+            v.insert("agent".into(), json!(a));
+        }
+        if let Some(p) = &self.person {
+            v.insert("person".into(), json!(p));
+        }
+        Value::Object(v)
+    }
 }
 
 /// A commit's kind for the facets: its change's (`diff`, `request`), else `commit`.
@@ -1167,8 +1254,23 @@ fn summary_of(rec: &Records, j: &Journey, now: i64, yours: bool) -> Value {
         }),
         (None, _) => Value::Null,
     };
+    // When its jobs ran, the first one's start to the last one's end (`to` null while one runs), and
+    // the machines they ran on in the order they started: each commit's line in a repository's
+    // commits says them (docs/ci.md W26-R29). Times, not a running count, so the row's JSON (and its
+    // version) holds still while a job runs.
+    let running = rec.legs.iter().any(|l| l.started.is_some() && l.finished.is_none());
+    let ran = rec.legs.iter().filter_map(|l| l.started).min().map(|from| json!({ "from": from, "to": if running { None } else { rec.legs.iter().filter_map(|l| l.finished).max() } }));
+    let mut by_start: Vec<&LegRec> = rec.legs.iter().filter(|l| l.agent.is_some()).collect();
+    by_start.sort_by_key(|l| l.started.unwrap_or(i64::MAX));
+    let mut machines: Vec<&str> = Vec::new();
+    for a in by_start.iter().filter_map(|l| l.agent.as_deref()) {
+        if !machines.contains(&a) {
+            machines.push(a);
+        }
+    }
     let row = json!({
         "repo": rec.repo, "sha": rec.sha, "short": short(&rec.sha),
+        "ran": ran, "machines": machines,
         "message": message,
         "author": first.map(|r| r.actor.clone()).or_else(|| ch.map(|c| c.author.clone())).unwrap_or_default(),
         "branch": first.map(|r| r.branch.clone()).unwrap_or_default(),
@@ -1179,6 +1281,7 @@ fn summary_of(rec: &Records, j: &Journey, now: i64, yours: bool) -> Value {
         "cursor": rec.first_row,
         "kind": kind_of(rec), "host": ch.map(|c| c.host.clone()), "change": change,
         "fold_under": ch.map(ChangeRec::tip).filter(|tip| *tip != rec.sha),
+        "made_by": made_by(rec).json(),
         "actions": actions(rec, j, yours),
     });
     with_version(row)
@@ -1240,6 +1343,88 @@ fn leg_json(l: &journey::Leg) -> Value {
     v
 }
 
+/// A platform of the build as the detail shows it, as a leg is: `job`, `run` and its times only
+/// once it has them (optional new fields; its Output and its lane, W26-R23).
+fn platform_json(p: &journey::Platform, state: &str) -> Value {
+    let mut v = json!({ "name": p.name, "state": state });
+    if let Some(o) = v.as_object_mut() {
+        if let Some(job) = &p.job {
+            o.insert("job".into(), json!(job));
+        }
+        if let Some(run) = &p.run {
+            o.insert("run".into(), json!(run));
+        }
+        if let Some(start) = p.start {
+            o.insert("start".into(), json!(start));
+        }
+        if let Some(end) = p.end {
+            o.insert("end".into(), json!(end));
+        }
+    }
+    v
+}
+
+/// What a person can do to one of a commit's jobs from its row (docs/ci.md W26-R21, R22), through
+/// `POST /api/ship/jobs`: each verb that applies now, and why each other doesn't, as that endpoint
+/// would answer. Another provider's job is that provider's: none applies here.
+fn job_verbs(leg: &LegRec, runners: &[RunnerSeen]) -> (Vec<&'static str>, serde_json::Map<String, Value>) {
+    if let Some(p) = &leg.provider {
+        let why = Value::String(format!("{} runs it, not kiln", crate::ci::retry::provider_says(p)));
+        return (Vec::new(), ["retry", "cancel", "pause", "resume"].into_iter().map(|v| (v.to_owned(), why.clone())).collect());
+    }
+    let status = crate::store::Status::parse(&leg.status);
+    let paused = leg.paused_at.is_some();
+    let ended = status.is_terminal() || matches!(leg.status.as_str(), "completed");
+    let running = status == crate::store::Status::Running && !ended;
+    let freezes = leg.agent.as_deref().is_none_or(|a| runners.iter().any(|r| r.name == a && r.freeze));
+    let mut can = Vec::new();
+    let mut why = serde_json::Map::new();
+    let mut say = |verb: &'static str, no: Option<String>| match no {
+        None => can.push(verb),
+        Some(w) => {
+            why.insert(verb.to_owned(), Value::String(w));
+        }
+    };
+    let finished = || Some("it has finished".to_owned());
+    say("retry", if !ended { Some("it hasn't finished".to_owned()) } else if leg.status == "skipped" { Some("it was skipped: retry what it needs".to_owned()) } else { None });
+    say("cancel", if ended { finished() } else { None });
+    let pause = if ended {
+        finished()
+    } else if paused {
+        Some("it's paused".to_owned())
+    } else if running && !freezes {
+        Some(format!("its runner {} can't freeze a job in place", leg.agent.as_deref().unwrap_or_default()))
+    } else {
+        None
+    };
+    say("pause", pause);
+    say("resume", if ended { finished() } else if !paused { Some("it isn't paused".to_owned()) } else { None });
+    (can, why)
+}
+
+/// Every job of a commit, either engine's, as the jobs pane acts on them (W26-R21, R22): its id
+/// and run, its pipeline and name (a lane's), the runner it runs on, whether it's paused, and the
+/// verbs that apply.
+fn jobs_json(rec: &Records, runners: &[RunnerSeen]) -> Vec<Value> {
+    let pipeline: HashMap<&str, &str> = rec.runs.iter().map(|r| (r.id.as_str(), r.pipeline.as_str())).collect();
+    rec.legs
+        .iter()
+        .map(|l| {
+            let (can, why) = job_verbs(l, runners);
+            let mut v = json!({ "id": l.job, "run": l.run_id, "pipeline": pipeline.get(l.run_id.as_str()).copied().unwrap_or_default(), "name": l.name, "verbs": can, "why_not": why });
+            if let Some(o) = v.as_object_mut() {
+                if let Some(a) = &l.agent {
+                    o.insert("runner".into(), json!(a));
+                }
+                if let Some(at) = l.paused_at {
+                    o.insert("paused_at".into(), json!(at));
+                }
+            }
+            v
+        })
+        .collect()
+}
+
 /// A commit with every record its stand came from, as `viewer` sees it.
 fn detail(rec: &Records, runners: &[RunnerSeen], now: i64, viewer: Option<&HashSet<String>>) -> Value {
     let j = journey_of(rec, runners, now);
@@ -1258,7 +1443,7 @@ fn detail(rec: &Records, runners: &[RunnerSeen], now: i64, viewer: Option<&HashS
         Part::NotYet => "none",
     };
     let build = json!({
-        "platforms": j.build.platforms.iter().map(|p| json!({ "name": p.name, "state": part(p.state) })).collect::<Vec<_>>(),
+        "platforms": j.build.platforms.iter().map(|p| platform_json(p, part(p.state))).collect::<Vec<_>>(),
         "image": { "state": part(j.build.image), "digest": rec.images.last() },
     });
     let deployments: Vec<Value> = rec.own.iter().map(|d| json!({ "environment": d.environment, "production": d.production, "state": d.state, "description": d.description, "at": d.at })).collect();
@@ -1277,6 +1462,7 @@ fn detail(rec: &Records, runners: &[RunnerSeen], now: i64, viewer: Option<&HashS
         o.insert("deployments".into(), json!(deployments));
         o.insert("releases".into(), json!(rec.releases.iter().map(|r| json!({ "state": r.state, "message": r.message, "rolled_back": r.rolled_back })).collect::<Vec<_>>()));
         o.insert("replant".into(), json!(replant));
+        o.insert("jobs".into(), json!(jobs_json(rec, runners)));
     }
     v
 }
@@ -1321,6 +1507,46 @@ pub async fn list_in(store: &crate::store::Store, q: &HashMap<String, String>, o
         .collect();
     let next = if more { page.last().and_then(|c| c.get("cursor")).cloned() } else { None };
     Ok(json!({ "commits": page, "next_cursor": next }))
+}
+
+/// Each repository's newest commit in view, newest first, from the store (`by=repo`, when memory
+/// can't say: docs/ci.md W26-R29). Each is the first of its repository's own list, so it's the
+/// commit that list shows on top, with the same facets.
+pub async fn heads_in(store: &crate::store::Store, q: &HashMap<String, String>, only: Option<String>, viewer: Option<&HashSet<String>>, runners: Vec<RunnerSeen>, deploys: &[CdDeploy], now: i64) -> Result<Value, Fail> {
+    let names: Option<Vec<String>> = only.as_deref().map(|o| serde_json::from_str(o).unwrap_or_default());
+    let repos = store.repos().await.map_err(internal)?;
+    let mut heads: Vec<Value> = Vec::new();
+    for r in repos.iter().filter(|r| names.as_ref().is_none_or(|n| n.contains(&r.name))) {
+        let mut one = q.clone();
+        one.insert("repo".into(), r.name.clone());
+        one.insert("limit".into(), "1".into());
+        one.remove("cursor");
+        let page = list_in(store, &one, only.clone(), viewer, runners.clone(), deploys, now).await?;
+        if let Some(c) = page.get("commits").and_then(Value::as_array).and_then(|a| a.first()) {
+            heads.push(c.clone());
+        }
+    }
+    heads.sort_by_key(|c| std::cmp::Reverse(c.get("cursor").and_then(Value::as_i64).unwrap_or(0)));
+    Ok(json!({ "commits": heads, "next_cursor": null }))
+}
+
+/// A page's JSON as the list sends it: its commits' JSON as held, and where the next page starts.
+fn page_body(page: &[(i64, &str)], next: Option<i64>) -> String {
+    let mut out = String::with_capacity(page.iter().map(|(_, j)| j.len() + 1).sum::<usize>() + 48);
+    out.push_str("{\"commits\":[");
+    for (i, (_, json)) in page.iter().enumerate() {
+        if i > 0 {
+            out.push(',');
+        }
+        out.push_str(json);
+    }
+    out.push_str("],\"next_cursor\":");
+    match next {
+        Some(f) => out.push_str(&f.to_string()),
+        None => out.push_str("null"),
+    }
+    out.push('}');
+    out
 }
 
 /// One commit of a repository, with the records its stand came from.
@@ -1603,21 +1829,28 @@ impl ShipCache {
         }
         let more = picked.len() > limit;
         let page = picked.get(..limit.min(picked.len())).unwrap_or_default();
-        let mut out = String::with_capacity(page.iter().map(|(_, j)| j.len() + 1).sum::<usize>() + 48);
-        out.push_str("{\"commits\":[");
-        for (i, (_, json)) in page.iter().enumerate() {
-            if i > 0 {
-                out.push(',');
+        Ok(Some(page_body(page, page.last().filter(|_| more).map(|(f, _)| *f))))
+    }
+
+    /// Each repository's newest commit in view, newest first: Ship's rows are repositories, each
+    /// showing its newest commit (docs/ci.md W26-R29). None until the model is built, or when a
+    /// repository in view holds none that matches though it has commits memory doesn't hold: the
+    /// store says then.
+    pub fn heads(&self, only: Option<&[String]>, facets: &Facets, viewer: Option<&HashSet<String>>) -> Result<Option<String>, Fail> {
+        let h = self.held.read().map_err(|_| poisoned())?;
+        if !h.built {
+            return Ok(None);
+        }
+        let mut picked: Vec<(i64, &str)> = Vec::new();
+        for (_, r) in h.repos.iter().filter(|(name, _)| only.is_none_or(|o| o.iter().any(|n| n == *name))) {
+            match r.order.iter().find_map(|(f, sha)| r.rows.get(sha).filter(|row| facets.matches(row.kind, row.host.as_deref())).map(|row| (*f, row.json(viewer)))) {
+                Some(p) => picked.push(p),
+                None if r.order.len() < r.total => return Ok(None),
+                None => {}
             }
-            out.push_str(json);
         }
-        out.push_str("],\"next_cursor\":");
-        match page.last().filter(|_| more) {
-            Some((f, _)) => out.push_str(&f.to_string()),
-            None => out.push_str("null"),
-        }
-        out.push('}');
-        Ok(Some(out))
+        picked.sort_unstable_by_key(|p| std::cmp::Reverse(p.0));
+        Ok(Some(page_body(&picked, None)))
     }
 
     /// The list's pace line for the repositories in view, from memory (plan
@@ -1684,7 +1917,8 @@ async fn runners_seen(hub: &std::sync::Arc<Hub>) -> Vec<RunnerSeen> {
                 .find(|j| j.kind == "runner" && j.target == r.name)
                 .filter(|j| matches!(j.state, crate::updates::JobState::Failed))
                 .map(|j| j.error.clone().unwrap_or_else(|| "the upgrade failed".to_string()));
-            RunnerSeen { name: r.name, connected: r.connected, commit: r.commit, failed }
+            let freeze = hub.instances.lock().newest_wide_caps(&r.name) & crate::proto::CAP_FREEZE != 0;
+            RunnerSeen { name: r.name, connected: r.connected, commit: r.commit, failed, freeze }
         })
         .collect()
 }
@@ -1712,7 +1946,16 @@ pub async fn list(hub: &std::sync::Arc<Hub>, q: &HashMap<String, String>, caller
         None => None,
     };
     let repo = q.get("repo").map(String::as_str).filter(|r| !r.is_empty());
-    match c.page(repo, only.as_deref(), &Facets::from_query(q), viewer.as_ref(), cursor, limit)? {
+    // `by=repo`: Ship's rows, each repository's newest commit (docs/ci.md W26-R29); a repository
+    // chosen narrows them to it.
+    let heads = q.get("by").is_some_and(|b| b == "repo");
+    let in_view: Option<Vec<String>> = match (repo, only.as_ref()) {
+        (Some(r), Some(o)) => Some(o.iter().filter(|n| n.as_str() == r).cloned().collect()),
+        (Some(r), None) => Some(vec![r.to_owned()]),
+        (None, o) => o.cloned(),
+    };
+    let held = if heads { c.heads(in_view.as_deref(), &Facets::from_query(q), viewer.as_ref())? } else { c.page(repo, only.as_deref(), &Facets::from_query(q), viewer.as_ref(), cursor, limit)? };
+    match held {
         Some(mut body) => {
             // The pace line's words go with the page (an optional field).
             if let Some(pace) = c.pace(repo, only.as_deref(), &runners).and_then(|p| serde_json::to_string(&p).ok())
@@ -1724,6 +1967,10 @@ pub async fn list(hub: &std::sync::Arc<Hub>, q: &HashMap<String, String>, caller
                 body.push('}');
             }
             Ok(srv::response(StatusCode::OK, "application/json", srv::full(body)))
+        }
+        None if heads => {
+            let in_view = in_view.map(|names| serde_json::to_string(&names).unwrap_or_else(|_| "[]".into()));
+            Ok(srv::json(StatusCode::OK, &heads_in(&hub.store, q, in_view, viewer.as_ref(), runners, &deploys, now).await?))
         }
         None => {
             let only = only.map(|names| serde_json::to_string(&names).unwrap_or_else(|_| "[]".into()));
@@ -1788,6 +2035,92 @@ pub async fn get(hub: &std::sync::Arc<Hub>, repo: &str, sha: &str, caller: Optio
     Ok(srv::json(StatusCode::OK, &v))
 }
 
+/// `POST /api/ship/jobs` `{repo, sha, verb, jobs?, scope?}` (docs/ci.md W26-R21, R22): a commit's
+/// jobs acted on together, across its runs: run again (`retry`), paused, resumed or cancelled.
+/// Those named (`jobs`), or those a word picks (`scope`): `failed`, `running`, `waiting` or `all`.
+/// Each run they belong to gets its own call underneath (`runs/:id/retry`, `cancel`, `pause`,
+/// `resume`, as the caller), and each job answers: done, or why not. As the caller, who needs
+/// `runs.rerun` (retry), `runs.cancel` (cancel) or `runs.pause` (pause, resume) on the repository.
+pub async fn jobs(hub: &std::sync::Arc<Hub>, caller: &crate::authz::Caller, body: &Value) -> Result<Response, Fail> {
+    jobs_in(hub, caller, body).await.map(|v| srv::json(StatusCode::OK, &v))
+}
+
+async fn jobs_in(hub: &std::sync::Arc<Hub>, caller: &crate::authz::Caller, body: &Value) -> Result<Value, Fail> {
+    let field = |k: &str| body.get(k).and_then(Value::as_str).map(str::trim).filter(|s| !s.is_empty()).map(str::to_owned);
+    let (Some(repo), Some(sha), Some(verb)) = (field("repo"), field("sha"), field("verb")) else {
+        return Err((StatusCode::BAD_REQUEST, "`repo`, `sha` and `verb`: the commit, and what to do to its jobs".to_string()));
+    };
+    let (cap, word) = match verb.as_str() {
+        "retry" => ("runs.rerun", "again"),
+        "cancel" => ("runs.cancel", "cancelled"),
+        "pause" => ("runs.pause", "paused"),
+        "resume" => ("runs.pause", "resumed"),
+        _ => return Err((StatusCode::BAD_REQUEST, format!("`verb` {verb}: retry, pause, resume or cancel"))),
+    };
+    if !caller.can(cap, &crate::authz::Scope::Repo { repo: repo.clone() }) {
+        return Err((StatusCode::FORBIDDEN, format!("{verb} needs `{cap}` on {repo}")));
+    }
+    let named: Option<Vec<String>> = body.get("jobs").and_then(Value::as_array).map(|a| a.iter().filter_map(Value::as_str).map(str::to_owned).collect());
+    let scope = field("scope");
+    if named.as_ref().is_none_or(Vec::is_empty) && scope.is_none() {
+        return Err((StatusCode::BAD_REQUEST, "name the `jobs`, or a `scope`: failed, running, waiting or all".to_string()));
+    }
+    let (r, s, deploys) = (repo.clone(), sha.clone(), cd_deploys());
+    let rec = hub.store.call(move |c| load(c, &r, &s, &deploys)).await.map_err(internal)?.ok_or_else(|| (StatusCode::NOT_FOUND, "no such commit".to_string()))?;
+    let mut out: Vec<Value> = Vec::new();
+    // The jobs it's for, by run, in the commit's order.
+    let picked: Vec<&LegRec> = match (named.filter(|n| !n.is_empty()), scope.as_deref()) {
+        (Some(ids), _) => {
+            for id in ids.iter().filter(|id| !rec.legs.iter().any(|l| &l.job == *id)) {
+                out.push(json!({ "job": id, "done": false, "why": "not a job of this commit" }));
+            }
+            rec.legs.iter().filter(|l| ids.contains(&l.job)).collect()
+        }
+        (None, Some(scope)) => {
+            let status = |l: &LegRec| crate::store::Status::parse(&l.status);
+            let ended = |l: &LegRec| status(l).is_terminal() || l.status == "completed";
+            let pick = |l: &LegRec| match scope {
+                "failed" => part_of(&l.status, l.conclusion.as_deref()) == Part::Failed,
+                "running" => !ended(l) && status(l) == crate::store::Status::Running,
+                "waiting" => !ended(l) && status(l) != crate::store::Status::Running,
+                _ => true,
+            };
+            if !matches!(scope, "failed" | "running" | "waiting" | "all") {
+                return Err((StatusCode::BAD_REQUEST, format!("`scope` {scope}: failed, running, waiting or all")));
+            }
+            rec.legs.iter().filter(|l| pick(l)).collect()
+        }
+        (None, None) => Vec::new(),
+    };
+    let mut runs: Vec<(String, Vec<String>)> = Vec::new();
+    for l in picked {
+        match runs.iter_mut().find(|(r, _)| *r == l.run_id) {
+            Some((_, ids)) => ids.push(l.job.clone()),
+            None => runs.push((l.run_id.clone(), vec![l.job.clone()])),
+        }
+    }
+    for (run, ids) in runs {
+        let said = match verb.as_str() {
+            "retry" => crate::ci::retry::retry_set(hub, &run, &ids, &caller.name).await,
+            "cancel" => crate::ci::retry::cancel_set(hub, &run, ids.clone(), &caller.name).await,
+            _ => crate::ci::retry::pause_set(hub, &run, ids.clone(), verb == "pause", &caller.name).await,
+        };
+        match said {
+            Ok(v) => {
+                for j in v.get("jobs").and_then(Value::as_array).into_iter().flatten() {
+                    let mut one = json!({ "job": j.get("job"), "run": run, "done": j.get(word).and_then(Value::as_bool).unwrap_or(false) });
+                    if let (Some(why), Some(o)) = (j.get("why"), one.as_object_mut()) {
+                        o.insert("why".into(), why.clone());
+                    }
+                    out.push(one);
+                }
+            }
+            Err((_, why)) => out.extend(ids.iter().map(|id| json!({ "job": id, "run": run, "done": false, "why": why }))),
+        }
+    }
+    Ok(json!({ "repo": repo, "sha": rec.sha, "verb": verb, "jobs": out }))
+}
+
 /// Failure lines the agent a failure is handed to gets with it.
 const HANDED_LINES: usize = 40;
 
@@ -1822,8 +2155,9 @@ async fn hand_off_in(hub: &std::sync::Arc<Hub>, caller: &crate::authz::Caller, b
         return Err((StatusCode::CONFLICT, format!("{at} has nothing open to hand off")));
     }
     let base = hub.cfg.server.public_url.trim_end_matches('/').to_owned();
-    let author = rec.change.as_ref().and_then(authors_agent);
-    let running = match author {
+    // Its maker's agent, from the one place Ship reads it (made_by: Chain of Ownership fills it in time).
+    let author = made_by(&rec).agent;
+    let running = match author.as_deref() {
         Some(id) => {
             let agent = crate::workspace::change::of(hub, id).await.map_or_else(|| id.to_owned(), |r| r.agent);
             hub.harness.info(&agent).filter(|i| i.status != crate::harness::model::Status::Exited)
@@ -1841,7 +2175,8 @@ async fn hand_off_in(hub: &std::sync::Arc<Hub>, caller: &crate::authz::Caller, b
         }
         let what: Vec<&str> = [(!conflicts.is_empty(), "conflicts"), (!threads.is_empty(), "threads"), (failed.is_some(), "checks")].into_iter().filter_map(|(y, w)| y.then_some(w)).collect();
         keep(hub, &rec, &what, &info.name, Some(&info.id), None, Some(ch.n), &caller.name).await?;
-        return Ok(json!({ "handed": { "to": info.name, "agent": info.id, "what": what } }));
+        let custody = hand_off_signed(hub, caller, &rec, &what, &info.id, body.get("hand_on")).await;
+        return Ok(json!({ "handed": { "to": info.name, "agent": info.id, "what": what }, "custody": custody }));
     }
     // No agent of its own: a failure goes to what looks after it; a change's review has no one.
     let Some(leg) = failed else {
@@ -1868,7 +2203,51 @@ async fn hand_off_in(hub: &std::sync::Arc<Hub>, caller: &crate::authz::Caller, b
         return Err((StatusCode::CONFLICT, format!("{} didn't take {at}: {}", a.name, i.why.unwrap_or_else(|| "its incident waits on a person".to_string()))));
     };
     keep(hub, &rec, &["checks"], &a.name, Some(&agent), Some(&i.id), None, &caller.name).await?;
-    Ok(json!({ "handed": { "to": a.name, "agent": agent, "incident": i.id, "what": ["checks"] } }))
+    let custody = hand_off_signed(hub, caller, &rec, &["checks"], &agent, body.get("hand_on")).await;
+    Ok(json!({ "handed": { "to": a.name, "agent": agent, "incident": i.id, "what": ["checks"] }, "custody": custody }))
+}
+
+/// What `caller` handed agent session `agent` of `rec`'s commit (`what`: its checks, threads or
+/// conflicts) changes hands signed (docs/ci.md W27-R08; the Transfers plan's step 6). The person's
+/// own hand-on when they sent one (`signed`, signed on their device: a hand-on of that work to the
+/// agent), else kiln's take for them on their signed-in session, saying their own signature is
+/// missing; the agent signs its receipt as it takes the work up, at its next turn. What the answer
+/// says of it: the hand-on, and whether kiln signed it for them.
+async fn hand_off_signed(hub: &Hub, caller: &crate::authz::Caller, rec: &Records, what: &[&str], agent: &str, signed: Option<&Value>) -> Value {
+    let org = hub.pki.organization();
+    let what = what.join(", ");
+    let thing = crate::custody::work(&format!("{}@{} {what}", rec.repo, short(&rec.sha)), &[&rec.repo, &rec.sha, &what]);
+    let person = crate::identities::person_identity(&hub.store, &org, caller).await.unwrap_or_else(|_| crate::custody::person_uri(&org, &crate::identities::person_of(&caller.name)));
+    let to = match crate::identities::agent_at(hub, agent, hub.harness.epoch_of(agent)).await {
+        Ok(to) => to,
+        Err(e) => {
+            tracing::warn!(target: "kiln.custody", %agent, error = %format!("{e:#}"), "a hand-off went unsigned: kiln can't name the agent");
+            return Value::Null;
+        }
+    };
+    let why = format!("handed off: {what} of {}@{}", rec.repo, short(&rec.sha));
+    // Their own, signed on their device: kept if it's theirs, and of this work to this agent.
+    if let Some(bundle) = signed {
+        match crate::custody::person_hand_on(hub, &person, &to, &thing, bundle, &format!("api:{}", caller.name)).await {
+            Ok(Ok(digest)) => {
+                crate::custody::ask_receipt(hub, agent, bundle).await;
+                return json!({ "hand_on": digest, "kiln_signed_for_you": false });
+            }
+            Ok(Err(why)) => tracing::info!(target: "kiln.custody", %agent, %why, "a person's own hand-off refused: kiln signs it for them"),
+            Err(e) => tracing::warn!(target: "kiln.custody", %agent, error = %format!("{e:#}"), "a person's own hand-off couldn't be checked"),
+        }
+    }
+    let why = format!("{why}: kiln's take for them, on their signed-in session; their own signature is missing: no key on the device that asked");
+    match crate::custody::hand_work(hub, thing, &to, &why, crate::custody::Giver::For(person)).await {
+        Ok((digest, bundle)) => {
+            crate::custody::ask_receipt(hub, agent, &bundle).await;
+            json!({ "hand_on": digest, "kiln_signed_for_you": true })
+        }
+        Err(e) => {
+            tracing::warn!(target: "kiln.custody", %agent, error = %format!("{e:#}"), "a hand-off's take wasn't kept");
+            Value::Null
+        }
+    }
 }
 
 /// What a change's author's agent is handed: where its change stands open, and what to do about
@@ -1979,8 +2358,8 @@ mod tests {
 
     fn runners() -> Vec<RunnerSeen> {
         vec![
-            RunnerSeen { name: "metal-ryzen-01".into(), connected: true, commit: Some(short(C1)), failed: None },
-            RunnerSeen { name: "metal-epyc-01".into(), connected: true, commit: Some(C1.into()), failed: None },
+            RunnerSeen { name: "metal-ryzen-01".into(), connected: true, commit: Some(short(C1)), failed: None, freeze: true },
+            RunnerSeen { name: "metal-epyc-01".into(), connected: true, commit: Some(C1.into()), failed: None, freeze: false },
         ]
     }
 
@@ -2064,6 +2443,40 @@ mod tests {
             let two = get_in(&store, "hyper-light/kiln", C2, None, Vec::new(), &[], now).await.map_err(|(_, m)| anyhow::anyhow!(m))?;
             assert_eq!((pip(&two, "checks"), pip(&two, "build"), field(&two, &["build", "image", "state"]).and_then(Value::as_str)), ("passed".into(), "none".into(), Some("none")));
             assert_eq!((text(&two, "stand"), text(&two, "line")), ("waiting".into(), "Checks passed".into()));
+            Ok(())
+        })
+    }
+
+    /// W26-R23: a release run again (production's 4ecf691f7e had three) leaves each platform one
+    /// lane, as the newest run that builds it has it: the job and run its Output streams once it
+    /// has run, and the times its lane draws. A platform the newer run doesn't build stays as the
+    /// older run built it.
+    #[test]
+    fn w26_r23_a_platform_is_one_lane_as_its_newest_release_run_has_it() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let store = crate::store::Store::open(&dir.path().join("kiln.db"))?;
+        crate::rt::block_on(async move {
+            let mut sql = production_fixture();
+            sql += &format!(
+                "INSERT INTO runs (id, repo_id, number, pipeline, event, branch, sha, message, author, status, created_at) VALUES ('release2', 'kiln', 1430, 'release', 'push', 'main', '{C1}', 'again', 'user.email', 'running', {});",
+                NOW_S + 3000
+            );
+            sql += &format!(
+                "INSERT INTO jobs (id, run_id, key, display, status, labels, needs, spec, started_at) VALUES ('r2a', 'release2', 'linux', 'Linux (x86-64, ARM64)', 'running', '[]', '[]', '{{}}', {});",
+                NOW_S + 3100
+            );
+            sql += "INSERT INTO jobs (id, run_id, key, display, status, labels, needs, spec) VALUES ('r2b', 'release2', 'macos', 'macOS (ARM64), on a Mac', 'queued', '[]', '[]', '{}');";
+            store.call(move |c| Ok(c.execute_batch(&sql)?)).await?;
+            let one = get_in(&store, "hyper-light/kiln", C1, None, Vec::new(), &[], (NOW_S + 4000) * 1000).await.map_err(|(_, m)| anyhow::anyhow!(m))?;
+            let platforms = field(&one, &["build", "platforms"]).and_then(Value::as_array).cloned().unwrap_or_default();
+            assert_eq!(
+                platforms,
+                vec![
+                    json!({ "name": "Linux (x86-64, ARM64)", "state": "running", "job": "r2a", "run": "release2", "start": NOW_S + 3100 }),
+                    json!({ "name": "macOS (ARM64), on a Mac", "state": "queued" }),
+                    json!({ "name": "Windows (x86-64, cross-built)", "state": "passed", "job": "j9", "run": "release", "start": NOW_S + 292, "end": NOW_S + 855 }),
+                ]
+            );
             Ok(())
         })
     }
@@ -2488,6 +2901,16 @@ mod tests {
                         assert_eq!(serde_json::from_str::<Value>(&got)?, want, "round {round}: the list of {limit} {fq:?} for {viewer:?} from memory isn't the store's");
                         compared += 1;
                     }
+                    // Ship's rows (W26-R29): each repository's newest commit, through the same facets.
+                    if limit == 2 {
+                        let mut hq: HashMap<String, String> = fq.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect();
+                        hq.insert("by".into(), "repo".into());
+                        let want = heads_in(store, &hq, None, viewer, runners(), &[], now).await.map_err(|(_, m)| anyhow::anyhow!(m))?;
+                        if let Some(got) = cache.heads(None, &Facets::from_query(&hq), viewer).map_err(|(_, m)| anyhow::anyhow!(m))? {
+                            assert_eq!(serde_json::from_str::<Value>(&got)?, want, "round {round}: the repositories' newest commits {fq:?} for {viewer:?} from memory aren't the store's");
+                            compared += 1;
+                        }
+                    }
                     if !fq.is_empty() {
                         continue;
                     }
@@ -2839,6 +3262,40 @@ mod tests {
         })
     }
 
+    /// Who made each commit, from the one place Ship reads it (made_by, W26-R18; Chain of Ownership
+    /// fills it for every commit in time): an agent's change says its agent and the person it acts
+    /// for; a person's change, its person; a lone commit, nothing yet (git's author name isn't a
+    /// kiln principal).
+    #[test]
+    fn w26_r18_made_by_says_who_made_each_commit() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let store = crate::store::Store::open(&dir.path().join("kiln.db"))?;
+        crate::rt::block_on(async move {
+            let sql = fixture() + &d41("agent:matrix");
+            store.call(move |c| Ok(c.execute_batch(&sql)?)).await?;
+            let page = list_in(&store, &HashMap::new(), None, None, runners(), &[], NOW_S * 1000).await.map_err(|(_, m)| anyhow::anyhow!(m))?;
+            let made = |short: &str| page.get("commits").and_then(Value::as_array).into_iter().flatten().find(|c| c.get("short") == Some(&json!(short))).and_then(|c| c.get("made_by").cloned());
+            assert_eq!(made("4141414"), Some(json!({ "agent": "matrix", "person": "user:sam" })), "an agent's change: its agent, for its person");
+            assert_eq!(made("3333333"), Some(Value::Null), "a lone commit: git's author name names no one kiln knows");
+            let sql = fixture_person_change();
+            store.call(move |c| Ok(c.execute_batch(&sql)?)).await?;
+            let page = list_in(&store, &HashMap::new(), None, None, runners(), &[], NOW_S * 1000).await.map_err(|(_, m)| anyhow::anyhow!(m))?;
+            let lee = page.get("commits").and_then(Value::as_array).into_iter().flatten().find(|c| c.get("short") == Some(&json!("5151515"))).and_then(|c| c.get("made_by").cloned());
+            assert_eq!(lee, Some(json!({ "person": "user:lee" })), "a person's change: its person, and no agent");
+            Ok(())
+        })
+    }
+
+    /// D51: lee's own diff, a person's change.
+    fn fixture_person_change() -> String {
+        let t = NOW_S - 300;
+        let sha = "5151515aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        format!(
+            "INSERT INTO diffs (id, repo_id, number, kind, title, author, author_kind, state, trunk, created_at, updated_at) VALUES ('d51', 'kiln', 51, 'diff', 'sched: lee', 'user:lee', 'human', 'needs-review', 'main', {t}, {t});
+             INSERT INTO diff_versions (diff_id, n, commit_sha, parent, base, message, pushed_by, created_at) VALUES ('d51', 1, '{sha}', 'p', 'b', 'sched: lee', 'user:lee', {t});"
+        )
+    }
+
     /// W26-R18: Hand off gives a person's failure to the agent attached to what failed, as the
     /// failure itself would (an incident with its agent), and keeps who took it; with no one
     /// attached, nothing open, or no right to rerun, it says why and keeps nothing.
@@ -2886,6 +3343,60 @@ mod tests {
             anyhow::ensure!(stand_of(&page, "3333333") == row("failing", "ci-doctor fixing · assertion failed in sync::reconnect", &["retry"]), "{:?}", stand_of(&page, "3333333"));
             let (code, why) = refused(hand_off_in(&hub, &owner, &c3).await);
             anyhow::ensure!(code == 409 && why.contains("nothing open"), "{code}: {why}");
+            Ok(())
+        })
+    }
+
+    /// W27-R08 (the Transfers plan's step 6): a Hand off changes hands signed. From a device with
+    /// no key, it's kiln's take for the person on their signed-in session, saying their own
+    /// signature is missing, to the agent the failure goes to; the agent's receipt answers it, and
+    /// the chain walks unbroken, its first link kiln's for the person, never the person's.
+    #[test]
+    fn w27_r08_a_hand_off_changes_hands_signed() -> anyhow::Result<()> {
+        within(async {
+            let hub = crate::hub::tests::scratch_hub_with(|c| c.terminal.enabled = true).await?;
+            let h = std::sync::Arc::clone(&hub);
+            crate::rt::spawn(async move {
+                let _ = crate::harness::registry::Registry::run_local(h).await;
+            });
+            hub.harness.set_test_program("/nonexistent/kiln-test-no-harness");
+            crate::identities::own_identities(&hub.store, &hub.pki).await?;
+            let sql = fixture();
+            hub.store.call(move |c| Ok(c.execute_batch(&sql)?)).await?;
+            let owner = crate::authz::Caller::owner();
+            let folder = tempfile::tempdir()?;
+            let cwd = folder.path().to_string_lossy().into_owned();
+            let cx = crate::ops::Cx { hub: std::sync::Arc::clone(&hub), caller: owner.clone() };
+            crate::ops::call(cx, "attachments.save", json!({ "name": "ci-doctor", "on": "repo:hyper-light/kiln", "harness": { "kind": "claude", "on": "local", "cwd": cwd }, "wake": ["failure"] }))
+                .await
+                .map_err(|(c, m)| anyhow::anyhow!("{c}: {m}"))?;
+            let handed = hand_off_in(&hub, &owner, &json!({ "repo": "hyper-light/kiln", "sha": C3 })).await.map_err(|(c, m)| anyhow::anyhow!("{c}: {m}"))?;
+            anyhow::ensure!(handed.pointer("/custody/kiln_signed_for_you") == Some(&json!(true)), "{handed}");
+            let hand_on = handed.pointer("/custody/hand_on").and_then(Value::as_str).unwrap_or_default().to_owned();
+            let agent = handed.pointer("/handed/agent").and_then(Value::as_str).unwrap_or_default().to_owned();
+            // The agent's receipt, signed with a key certified for its identity.
+            let to = crate::identities::agent_at(&hub, &agent, hub.harness.epoch_of(&agent)).await?;
+            let key = crate::pki::new_key_pem()?;
+            let csr = crate::pki::make_csr_with_key("kiln-identity", &key)?;
+            let pem = hub.pki.issue_identity(&csr, &kiln_ci::identity::chain::Identity::parse(&to)?, &[], time::Duration::hours(1))?;
+            let org = hub.pki.organization();
+            let (person, server) = (crate::custody::person_uri(&org, "admin"), crate::custody::server_uri(&org));
+            let thing = crate::custody::work("hyper-light/kiln@3333333 checks", &["hyper-light/kiln", C3, "checks"]);
+            let body = kiln_ci::identity::custody::Body { from: Some(person.clone()), why: "handed off".into(), ..kiln_ci::identity::custody::Body::new(kiln_ci::identity::custody::Kind::Received, &to) };
+            let st = kiln_ci::identity::statement::Statement { subject: vec![thing], follows: vec![hand_on], ..kiln_ci::identity::statement::Statement::new(kiln_ci::identity::custody::to_value(&body)) };
+            let receipt = {
+                use rcgen::SigningKey as _;
+                use kiln_ci::identity::statement::{PAYLOAD_CUSTODY, bundle, payload, to_sign};
+                let p = payload(&st)?;
+                bundle(PAYLOAD_CUSTODY, &p, &rcgen::KeyPair::from_pem(&key)?.sign(&to_sign(PAYLOAD_CUSTODY, &p))?, &crate::pki::der_of(&pem)?)
+            };
+            let now = crate::util::now_unix();
+            let got = crate::custody::take(&hub.store, &hub.pki.ca_der, &org, &receipt, "runner local", now).await?.map_err(|r| anyhow::anyhow!("{r}"))?;
+            let v = crate::custody::chain(&hub.store, &hub.pki.ca_der, &org, &got.digest, now).await?.ok_or_else(|| anyhow::anyhow!("no chain"))?;
+            anyhow::ensure!(v.get("unbroken") == Some(&json!(true)), "{v}");
+            let taken = v.pointer("/hops/1").cloned().unwrap_or_default();
+            anyhow::ensure!(taken.get("kind") == Some(&json!("taken")) && taken.get("custodian") == Some(&json!(server)) && taken.get("taken_for") == Some(&json!(person)), "kiln for the person: {taken}");
+            anyhow::ensure!(taken.get("why").and_then(Value::as_str).is_some_and(|w| w.contains("no key on the device that asked")), "{taken}");
             Ok(())
         })
     }
@@ -2958,6 +3469,241 @@ mod tests {
     }
 
     /// A future run to its end on a thread of its own, within two minutes.
+    /// W26-R21, R22: a commit's jobs acted on together across its two runs (`POST /api/ship/jobs`):
+    /// paused by a word (`waiting`) and resumed by name, cancelled by a word (`running`), run again
+    /// (`failed`). A running job whose runner can't freeze it says why, as do a job that isn't the
+    /// commit's, a verb or scope that isn't one, a caller without the verb's right, and a commit
+    /// that isn't. The commit's `jobs` say what each can do, and why not.
+    #[test]
+    fn w26_r21_r22_one_endpoint_acts_on_a_commits_jobs_across_its_runs() -> anyhow::Result<()> {
+        within(async {
+            let hub = crate::hub::tests::scratch_hub_with(|_| {}).await?;
+            let repo = hub
+                .store
+                .upsert_repo(crate::store::Repo { id: "r-two".into(), name: "acme/two".into(), clone_url: "https://example/two".into(), branches: vec![], poll_seconds: 60, enabled: true, created_at: 0, last_polled_at: None, last_error: None, mode: "upstream".into(), default_branch: None, mirror: None })
+                .await?;
+            let sha = "abcabcabcabcabcabcabcabcabcabcabcabcabca";
+            // Two v1 runs of the commit: ci (a fails, b needs it) and lint (c runs on ag1, d waits).
+            let mut ids: HashMap<String, String> = HashMap::new();
+            for (n, (id, yaml)) in [("r1", "name: ci\njobs:\n  a: {steps: [{run: x}]}\n  b: {needs: [a], steps: [{run: y}]}\n"), ("r2", "name: lint\njobs:\n  c: {steps: [{run: z}]}\n  d: {steps: [{run: w}]}\n")].into_iter().enumerate() {
+                let p = crate::pipeline::parse(yaml)?;
+                let planned = crate::pipeline::plan(&p, &crate::pipeline::Context::default())?;
+                let run = crate::store::Run {
+                    id: id.into(),
+                    repo_id: repo.id.clone(),
+                    repo_name: repo.name.clone(),
+                    number: i64::try_from(n)? + 1,
+                    pipeline: p.name.clone(),
+                    event: "push".into(),
+                    branch: "main".into(),
+                    sha: sha.into(),
+                    message: "two runs".into(),
+                    author: "ada".into(),
+                    status: crate::store::Status::Queued,
+                    created_at: NOW_S,
+                    started_at: None,
+                    finished_at: None,
+                    error: None,
+                    concurrency_group: None,
+                };
+                hub.store.create_run(run, planned).await?;
+                ids.extend(hub.store.jobs(id.into(), false).await?.into_iter().map(|j| (j.key, j.id)));
+            }
+            let id = |k: &str| ids.get(k).cloned().unwrap_or_default();
+            let (a, b, c, d) = (id("a"), id("b"), id("c"), id("d"));
+            anyhow::ensure!(hub.store.claim_job(a.clone(), "ag1".into(), "baremetal".into()).await?);
+            hub.store.finish_job(a.clone(), crate::store::Status::Failed, Some(1), None, None, None).await?;
+            anyhow::ensure!(hub.store.claim_job(c.clone(), "ag1".into(), "baremetal".into()).await?);
+            let owner = crate::authz::Caller::owner();
+            let act = |body: Value| {
+                let (hub, owner) = (std::sync::Arc::clone(&hub), owner.clone());
+                async move { jobs_in(&hub, &owner, &body).await.map_err(|(c, m)| anyhow::anyhow!("{c}: {m}")) }
+            };
+            let each = |v: &Value| -> HashMap<String, (bool, String)> {
+                v.get("jobs").and_then(Value::as_array).into_iter().flatten().map(|j| (j.get("job").and_then(Value::as_str).unwrap_or_default().to_owned(), (j.get("done").and_then(Value::as_bool).unwrap_or(false), j.get("why").and_then(Value::as_str).unwrap_or_default().to_owned()))).collect()
+            };
+            let ask = |verb: &str, extra: Value| {
+                let mut body = json!({ "repo": "acme/two", "sha": sha, "verb": verb });
+                if let (Some(o), Some(x)) = (body.as_object_mut(), extra.as_object()) {
+                    o.extend(x.clone());
+                }
+                body
+            };
+
+            // Paused by a word: the one waiting, d (b, skipped, has ended).
+            let v = act(ask("pause", json!({ "scope": "waiting" }))).await?;
+            anyhow::ensure!(each(&v) == HashMap::from([(d.clone(), (true, String::new()))]), "{v}");
+            // c runs on ag1, which can't freeze it: refused, saying so; nothing was sent to stop it.
+            let v = act(ask("pause", json!({ "jobs": [c] }))).await?;
+            anyhow::ensure!(each(&v).get(&c).is_some_and(|(done, why)| !done && why.contains("its runner ag1 can't freeze a job in place")), "{v}");
+            // What the commit says each can do.
+            let seen = vec![RunnerSeen { name: "ag1".into(), connected: true, ..RunnerSeen::default() }];
+            let detail = get_in(&hub.store, "acme/two", sha, None, seen, &[], NOW_S * 1000).await.map_err(|(_, m)| anyhow::anyhow!(m))?;
+            let job = |id: &str| detail.get("jobs").and_then(Value::as_array).and_then(|a| a.iter().find(|j| j.get("id").and_then(Value::as_str) == Some(id))).cloned().unwrap_or_default();
+            let verbs = |j: &Value| j.get("verbs").and_then(Value::as_array).map(|a| a.iter().filter_map(Value::as_str).map(str::to_owned).collect::<Vec<_>>()).unwrap_or_default();
+            let (jd, jc, ja) = (job(&d), job(&c), job(&a));
+            anyhow::ensure!(jd.get("paused_at").is_some() && verbs(&jd) == ["cancel", "resume"] && jd.pointer("/why_not/pause") == Some(&json!("it's paused")), "d: {jd}");
+            anyhow::ensure!(verbs(&jc) == ["cancel"] && jc.pointer("/why_not/pause").and_then(Value::as_str).is_some_and(|w| w.contains("can't freeze")) && jc.get("runner") == Some(&json!("ag1")), "c: {jc}");
+            anyhow::ensure!(verbs(&ja) == ["retry"] && ja.get("pipeline") == Some(&json!("ci")) && ja.get("run") == Some(&json!("r1")), "a: {ja}");
+            // Resumed by name.
+            let v = act(ask("resume", json!({ "jobs": [d] }))).await?;
+            anyhow::ensure!(each(&v).get(&d) == Some(&(true, String::new())), "{v}");
+            anyhow::ensure!(hub.store.job(d.clone()).await?.and_then(|j| j.paused_at).is_none(), "d goes on");
+            // Cancelled by a word: what runs, c; d waits on.
+            let v = act(ask("cancel", json!({ "scope": "running" }))).await?;
+            anyhow::ensure!(each(&v) == HashMap::from([(c.clone(), (true, String::new()))]), "{v}");
+            anyhow::ensure!(hub.store.job(c.clone()).await?.map(|j| j.status) == Some(crate::store::Status::Cancelled), "c stopped");
+            // Run again by a word: what failed, a, with b back to wait on it.
+            let v = act(ask("retry", json!({ "scope": "failed" }))).await?;
+            anyhow::ensure!(each(&v).get(&a).is_some_and(|(done, _)| *done) && each(&v).len() == 1, "{v}");
+            anyhow::ensure!(hub.store.job(b.clone()).await?.map(|j| j.status) == Some(crate::store::Status::Pending), "b waits on a again");
+            // Not the commit's, not a verb, not a scope, nothing named, no right, no commit.
+            let v = act(ask("cancel", json!({ "jobs": ["nope"] }))).await?;
+            anyhow::ensure!(each(&v).get("nope") == Some(&(false, "not a job of this commit".to_owned())), "{v}");
+            let code = |r: Result<Value, Fail>| r.err().map(|(c, _)| c.as_u16()).unwrap_or(200);
+            anyhow::ensure!(code(jobs_in(&hub, &owner, &ask("explode", json!({ "scope": "all" }))).await) == 400);
+            anyhow::ensure!(code(jobs_in(&hub, &owner, &ask("retry", json!({ "scope": "everything" }))).await) == 400);
+            anyhow::ensure!(code(jobs_in(&hub, &owner, &ask("retry", json!({}))).await) == 400);
+            anyhow::ensure!(code(jobs_in(&hub, &crate::authz::Caller::peer("user:ro", "viewer"), &ask("pause", json!({ "scope": "all" }))).await) == 403);
+            anyhow::ensure!(code(jobs_in(&hub, &owner, &json!({ "repo": "acme/two", "sha": "f00d", "verb": "retry", "scope": "all" })).await) == 404);
+            Ok(())
+        })
+    }
+
+    /// W26-R29: Ship's rows are repositories, each its newest commit, newest first (`by=repo`); and
+    /// each commit says when its jobs ran, the first one's start to the last one's end (open while
+    /// one runs), and the machines they ran on, in the order they started.
+    #[test]
+    fn w26_r29_rows_are_repositories_and_a_commit_says_when_and_where_it_ran() -> anyhow::Result<()> {
+        within(async {
+            let hub = crate::hub::tests::scratch_hub_with(|_| {}).await?;
+            let p = crate::pipeline::parse("name: ci\njobs:\n  a: {steps: [{run: x}]}\n  b: {steps: [{run: y}]}\n")?;
+            let older = "1111111aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+            let other = "2222222bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+            let newer = "3333333ccccccccccccccccccccccccccccccccc";
+            let mut jobs: HashMap<String, Vec<String>> = HashMap::new();
+            for (n, (repo_id, repo, sha)) in [("r-one", "acme/one", older), ("r-two", "acme/two", other), ("r-one", "acme/one", newer)].into_iter().enumerate() {
+                let r = hub
+                    .store
+                    .upsert_repo(crate::store::Repo { id: repo_id.into(), name: repo.into(), clone_url: format!("https://example/{repo}"), branches: vec![], poll_seconds: 60, enabled: true, created_at: 0, last_polled_at: None, last_error: None, mode: "upstream".into(), default_branch: None, mirror: None })
+                    .await?;
+                let run = crate::store::Run {
+                    id: format!("run-{n}"),
+                    repo_id: r.id.clone(),
+                    repo_name: r.name.clone(),
+                    number: i64::try_from(n)? + 1,
+                    pipeline: p.name.clone(),
+                    event: "push".into(),
+                    branch: "main".into(),
+                    sha: sha.into(),
+                    message: format!("commit {n}"),
+                    author: "ada".into(),
+                    status: crate::store::Status::Queued,
+                    created_at: NOW_S + i64::try_from(n)?,
+                    started_at: None,
+                    finished_at: None,
+                    error: None,
+                    concurrency_group: None,
+                };
+                hub.store.create_run(run, crate::pipeline::plan(&p, &crate::pipeline::Context::default())?).await?;
+                jobs.insert(sha.into(), hub.store.jobs(format!("run-{n}"), false).await?.into_iter().map(|j| j.id).collect());
+            }
+            let of = |sha: &str, i: usize| jobs.get(sha).and_then(|j| j.get(i)).cloned().unwrap_or_default();
+            // The newer commit: a on ag2, then b on ag1, both ended. The other repository's: a, still running.
+            for (job, agent) in [(of(newer, 0), "ag2"), (of(newer, 1), "ag1"), (of(other, 0), "ag1")] {
+                anyhow::ensure!(hub.store.claim_job(job, agent.into(), "baremetal".into()).await?, "claimed");
+            }
+            for job in [of(newer, 0), of(newer, 1)] {
+                hub.store.finish_job(job, crate::store::Status::Succeeded, Some(0), None, None, None).await?;
+            }
+            let heads = heads_in(&hub.store, &HashMap::from([("by".to_string(), "repo".to_string())]), None, None, Vec::new(), &[], NOW_S * 1000).await.map_err(|(_, m)| anyhow::anyhow!(m))?;
+            let rows = heads.get("commits").and_then(Value::as_array).cloned().unwrap_or_default();
+            let shas: Vec<&str> = rows.iter().filter_map(|c| c.get("sha").and_then(Value::as_str)).collect();
+            anyhow::ensure!(shas == [newer, other], "each repository's newest, newest first: {shas:?}");
+            let row = |sha: &str| rows.iter().find(|c| c.get("sha").and_then(Value::as_str) == Some(sha)).cloned().unwrap_or_default();
+            let (n, o) = (row(newer), row(other));
+            let (from, to) = (n.pointer("/ran/from").and_then(Value::as_i64), n.pointer("/ran/to").and_then(Value::as_i64));
+            anyhow::ensure!(from.is_some() && to.is_some() && from <= to, "the newer ran from its first start to its last end: {n}");
+            anyhow::ensure!(n.get("machines") == Some(&json!(["ag2", "ag1"])), "its machines in the order they started: {n}");
+            anyhow::ensure!(o.pointer("/ran/from").is_some_and(Value::is_i64) && o.pointer("/ran/to") == Some(&Value::Null), "a commit still running has no end yet: {o}");
+            anyhow::ensure!(o.get("machines") == Some(&json!(["ag1"])), "{o}");
+            // A commit none of whose jobs started says neither.
+            let d = get_in(&hub.store, "acme/one", older, None, Vec::new(), &[], NOW_S * 1000).await.map_err(|(_, m)| anyhow::anyhow!(m))?;
+            anyhow::ensure!(d.get("ran") == Some(&Value::Null) && d.get("machines") == Some(&json!([])), "{d}");
+            Ok(())
+        })
+    }
+
+    /// W26-R21, R22: a run another provider keeps (GitHub Actions here) is that provider's. Each
+    /// verb, by name and by a word, is refused for its jobs saying so, and none of them changes in
+    /// kiln's tables; the commit offers none of the verbs for them, saying why.
+    #[test]
+    fn w26_r21_r22_a_providers_jobs_are_that_providers_to_act_on() -> anyhow::Result<()> {
+        within(async {
+            let hub = crate::hub::tests::scratch_hub_with(|_| {}).await?;
+            let repo = hub
+                .store
+                .upsert_repo(crate::store::Repo { id: "r-gh".into(), name: "acme/gh".into(), clone_url: "https://example/gh".into(), branches: vec![], poll_seconds: 60, enabled: true, created_at: 0, last_polled_at: None, last_error: None, mode: "upstream".into(), default_branch: None, mirror: None })
+                .await?;
+            let sha = "fedfedfedfedfedfedfedfedfedfedfedfedfedf";
+            let p = crate::pipeline::parse("name: build\njobs:\n  a: {steps: [{run: x}]}\n  b: {steps: [{run: y}]}\n")?;
+            let planned = crate::pipeline::plan(&p, &crate::pipeline::Context::default())?;
+            let run = crate::store::Run {
+                id: "g1".into(),
+                repo_id: repo.id.clone(),
+                repo_name: repo.name.clone(),
+                number: 1,
+                pipeline: p.name.clone(),
+                event: "push".into(),
+                branch: "main".into(),
+                sha: sha.into(),
+                message: "on GitHub".into(),
+                author: "ada".into(),
+                status: crate::store::Status::Queued,
+                created_at: NOW_S,
+                started_at: None,
+                finished_at: None,
+                error: None,
+                concurrency_group: None,
+            };
+            hub.store.create_run(run, planned).await?;
+            // What kiln keeps of a GitHub Actions run (`ci::providers::record`): its provider, and its id there.
+            hub.store.call(|c| Ok(c.execute("UPDATE runs SET provider = 'github-actions', external_id = '4242' WHERE id = 'g1'", [])?)).await?;
+            let ids: Vec<String> = hub.store.jobs("g1".into(), false).await?.into_iter().map(|j| j.id).collect();
+            anyhow::ensure!(ids.len() == 2, "{ids:?}");
+            let kept = |hub: std::sync::Arc<crate::hub::Hub>, ids: Vec<String>| async move {
+                let mut out = Vec::new();
+                for id in ids {
+                    out.push(hub.store.job(id).await?.map(|j| (j.status, j.attempt, j.paused_at)));
+                }
+                anyhow::Ok(out)
+            };
+            let before = kept(std::sync::Arc::clone(&hub), ids.clone()).await?;
+            let owner = crate::authz::Caller::owner();
+            let why = "GitHub Actions runs it, not kiln";
+            for (verb, pick) in [("retry", json!({ "jobs": [ids.first()] })), ("cancel", json!({ "scope": "all" })), ("pause", json!({ "scope": "waiting" })), ("resume", json!({ "jobs": ids }))] {
+                let mut body = json!({ "repo": "acme/gh", "sha": sha, "verb": verb });
+                if let (Some(o), Some(x)) = (body.as_object_mut(), pick.as_object()) {
+                    o.extend(x.clone());
+                }
+                let v = jobs_in(&hub, &owner, &body).await.map_err(|(c, m)| anyhow::anyhow!("{verb}: {c}: {m}"))?;
+                let said = v.get("jobs").and_then(Value::as_array).cloned().unwrap_or_default();
+                anyhow::ensure!(!said.is_empty() && said.iter().all(|j| j.get("done") == Some(&json!(false)) && j.get("why") == Some(&json!(why))), "{verb}: {v}");
+            }
+            anyhow::ensure!(kept(std::sync::Arc::clone(&hub), ids.clone()).await? == before, "nothing changed in kiln's tables");
+            let detail = get_in(&hub.store, "acme/gh", sha, None, Vec::new(), &[], NOW_S * 1000).await.map_err(|(_, m)| anyhow::anyhow!(m))?;
+            let jobs = detail.get("jobs").and_then(Value::as_array).cloned().unwrap_or_default();
+            anyhow::ensure!(jobs.len() == 2, "{detail}");
+            for j in &jobs {
+                anyhow::ensure!(j.get("verbs") == Some(&json!([])), "{j}");
+                for verb in ["retry", "cancel", "pause", "resume"] {
+                    anyhow::ensure!(j.pointer(&format!("/why_not/{verb}")) == Some(&json!(why)), "{verb}: {j}");
+                }
+            }
+            Ok(())
+        })
+    }
+
     fn within(f: impl std::future::Future<Output = anyhow::Result<()>> + Send + 'static) -> anyhow::Result<()> {
         let (tx, rx) = std::sync::mpsc::channel();
         std::thread::spawn(move || {

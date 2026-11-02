@@ -84,6 +84,22 @@ pub enum Request {
         #[serde(default)]
         terminal: Option<String>,
     },
+    /// What `kiln-git-sign` asks for an agent's commit (W27-R03): `message` (base64) signed with
+    /// the asking process's session's key at its epoch ([`sign_for`]).
+    Sign { message: String },
+    /// What an agent session's git asks for its credential for kiln (W27-R03, `kiln-git-sign
+    /// credential`): the asking process's session's own token ([`credential_for`]); `forget`: kiln
+    /// refused the one it was given.
+    Credential {
+        #[serde(default)]
+        forget: bool,
+    },
+    /// A harness's hook asking before a tool call (`kiln harness-hook`, `codex::hook_args`): the
+    /// session it's for is the one whose process asks; its answer (`answer`) may wait for a person.
+    Hook {
+        #[serde(default)]
+        input: Value,
+    },
 }
 
 /// Who asks the server, as the socket tells them apart.
@@ -179,7 +195,87 @@ pub async fn answer(host: &Host, req: Request, peer: Option<u32>, forward: Optio
         Request::Stop { id: Some(id), .. } if agent.is_some() => as_agent("agents.stop", json!({"agent": id})).await,
         Request::Interrupt { id: Some(id), .. } if agent.is_some() => as_agent("agents.interrupt", json!({"agent": id})).await,
         Request::Stop { id: None, .. } | Request::Interrupt { id: None, .. } if agent.is_some() => json!({"ok": false, "error": "say which agent (its id): an agent stops only the agents it started"}),
+        Request::Sign { message } => sign_for(host, peer, &message).await,
+        Request::Credential { forget } => credential_for(host, peer, forward, forget).await,
+        // Its harness's hook, told by its process: what holds the call answers, maybe later.
+        Request::Hook { input } => match agent.as_deref().and_then(|a| host.get(a)) {
+            Some(s) => json!({"ok": true, "answer": s.hook(input).await}),
+            None => json!({"ok": true, "answer": {}}),
+        },
         other => handle(host, other),
+    }
+}
+
+/// The agent session process `peer` belongs to, told by the process alone: its group of processes
+/// or a harness among its ancestors, never by what it says (the mark any process can set).
+async fn session_by_peer(host: &Host, peer: Option<u32>) -> Option<String> {
+    let pid = peer?;
+    let sessions = host.harness_pids();
+    crate::rt::blocking(move || super::survivors::session_by_process(pid, &sessions)).await.ok().flatten()
+}
+
+/// The tokens agent sessions here were given for their git (`session → (token, until)`).
+static CREDENTIALS: std::sync::LazyLock<parking_lot::Mutex<std::collections::HashMap<String, (String, i64)>>> = std::sync::LazyLock::new(Default::default);
+
+/// An agent session's credential for kiln (W27-R03): a token of the agent's own, for its person,
+/// which this runner asks the server for (`agents.credential`) as that session, told by the asking
+/// process alone ([`session_by_peer`]), and keeps until an hour before it ends. One outside every
+/// session is told it's no agent's (`"agent": false`); the token goes back only to the session's
+/// own processes. `forget`: kiln refused it, so the next ask gets another.
+async fn credential_for(host: &Host, peer: Option<u32>, forward: Option<&Forward>, forget: bool) -> Value {
+    let Some(session) = session_by_peer(host, peer).await else {
+        return json!({"ok": true, "agent": false});
+    };
+    if forget {
+        CREDENTIALS.lock().remove(&session);
+        return json!({"ok": true, "agent": true});
+    }
+    let now = crate::util::now_unix();
+    let kept = CREDENTIALS.lock().get(&session).filter(|(_, until)| *until - 3600 > now).map(|(t, _)| t.clone());
+    let token = match kept {
+        Some(t) => t,
+        None => {
+            let a = ask_server(forward, &Asker::Agent(session.clone()), "agents.credential", json!({"agent": session})).await;
+            let (Some(t), Some(until)) = (a.pointer("/ok/token").and_then(Value::as_str), a.pointer("/ok/expires_at").and_then(Value::as_i64)) else {
+                let why = a.get("error").and_then(Value::as_str).unwrap_or("the kiln server gave none");
+                return json!({"ok": false, "error": format!("no credential for agent session {session}: {why}")});
+            };
+            let mut held = CREDENTIALS.lock();
+            // What ended goes (an ended session's among them).
+            held.retain(|_, (_, until)| *until > now);
+            held.insert(session.clone(), (t.to_owned(), until));
+            t.to_owned()
+        }
+    };
+    json!({"ok": true, "agent": true, "username": "kiln", "password": token})
+}
+
+/// An agent's commit signature (W27-R03): `message` (base64) signed with the key this runner
+/// process holds for the asking process's session at its epoch. The session is told by the process
+/// alone, its group of processes or a harness among its ancestors, never by what it says (the
+/// mark any process can set): one outside every session gets nothing. The key stays here; the
+/// signature and its certificate (DER) go back, base64.
+async fn sign_for(host: &Host, peer: Option<u32>, message: &str) -> Value {
+    use base64::Engine as _;
+    let b64 = base64::engine::general_purpose::STANDARD;
+    let refuse = |why: String| json!({"ok": false, "error": why});
+    if peer.is_none() {
+        return refuse("the system doesn't say which process asks, so nothing is signed".into());
+    }
+    let Some(session) = session_by_peer(host, peer).await else {
+        return refuse("only a process of an agent session kiln runs here signs as that agent: its group of processes or its harness among its ancestors says so, never what it says".into());
+    };
+    let Some(epoch) = host.list().into_iter().find(|i| i.id == session).map(|i| i.epoch) else { return refuse(format!("agent session {session} is gone")) };
+    let Ok(bytes) = b64.decode(message) else { return refuse("what to sign isn't base64".into()) };
+    let slot = crate::runner::identity::slot("agent", Some(&session), Some(epoch));
+    // A session just opened, or just moved to its epoch, may have its key's certificate on the way.
+    let until = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while crate::runner::identity::cert(&slot).is_none() && std::time::Instant::now() < until {
+        crate::rt::sleep(std::time::Duration::from_millis(100)).await;
+    }
+    match crate::runner::identity::sign(&slot, &bytes).and_then(|(sig, pem)| Ok((sig, crate::pki::der_of(&pem)?))) {
+        Ok((sig, cert)) => json!({"ok": true, "session": session, "epoch": epoch, "signature": b64.encode(sig), "certificate": b64.encode(cert)}),
+        Err(e) => refuse(format!("agent session {session} has no key at epoch {epoch} to sign with: {e:#}")),
     }
 }
 
@@ -207,9 +303,13 @@ fn peer_pid(_s: &std::os::unix::net::UnixStream) -> Option<u32> {
 /// name and directory (a local server's own agent) never takes it from a live one ([`Kept`]).
 pub fn path(name: &str, home: &std::path::Path) -> PathBuf {
     let safe: String = name.chars().map(|c| if c.is_ascii_alphanumeric() || c == '-' || c == '_' { c } else { '_' }).take(32).collect();
-    // Two kiln processes on one machine (a server and runners, or test instances) never share one.
-    let tag = crate::util::sha256_hex(home.to_string_lossy().as_bytes());
-    runtime_path(&format!("harness-{safe}-{}.sock", tag.get(..8).unwrap_or("0")))
+    runtime_path(&format!("harness-{safe}-{}.sock", tag_of(home)))
+}
+
+/// What a socket's name says of the state directory `home` it was made for, so two kiln processes
+/// on one machine (a server and runners, or test instances) never share one.
+pub(crate) fn tag_of(home: &std::path::Path) -> String {
+    crate::util::sha256_hex(home.to_string_lossy().as_bytes()).get(..8).unwrap_or("0").to_owned()
 }
 
 /// `file` in the user's runtime directory for sockets (else a private one in /tmp).
@@ -289,6 +389,11 @@ pub fn handle(host: &Host, req: Request) -> Value {
             json!({"ok": ok, "message": message})
         }
         Request::Op { .. } => json!({"ok": false, "error": "kiln's operations go to the kiln server"}),
+        // Signing and an agent's credential are told by the asking process, which only `answer` knows.
+        Request::Sign { .. } => json!({"ok": false, "error": "signing asks the process's own runner (its socket's answer)"}),
+        Request::Credential { .. } => json!({"ok": false, "error": "an agent's credential asks the process's own runner (its socket's answer)"}),
+        // Not an agent kiln runs here: nothing of kiln's holds the call.
+        Request::Hook { .. } => json!({"ok": true, "answer": {}}),
     }
 }
 
@@ -322,7 +427,7 @@ fn file_id(path: &std::path::Path) -> Option<(u64, u64)> {
 /// Whether a live process answers at `path`. Without waiting: a connection the listener hasn't
 /// taken yet (its queue full) is a live one's.
 #[cfg(unix)]
-fn answers(path: &std::path::Path) -> bool {
+pub(crate) fn answers(path: &std::path::Path) -> bool {
     use nix::sys::socket::{AddressFamily, SockFlag, SockType, UnixAddr};
     use std::os::fd::AsRawFd as _;
     let Ok(addr) = UnixAddr::new(path) else { return false };
@@ -340,6 +445,61 @@ pub(crate) fn held(path: &std::path::Path, ours: Option<(u64, u64)>) -> Held {
         Some(f) if Some(f) == ours => Held::Ours,
         Some(_) if answers(path) => Held::Theirs,
         _ => Held::Dead,
+    }
+}
+
+/// How old a socket's file must be before a sweep may take it as left behind: a process binds its
+/// file a moment before it listens on it.
+#[cfg(unix)]
+const LEFT_AFTER: std::time::Duration = std::time::Duration::from_secs(60);
+/// How often a process sweeps its sockets' folder while it runs.
+#[cfg(unix)]
+const SWEEP_EVERY: std::time::Duration = std::time::Duration::from_secs(600);
+
+/// Removes the kiln sockets in `dir` (`harness-*.sock`, `reach-*.sock`) nothing answers on whose
+/// files are older than `min_age`: each was left by a process that ended without removing it, as a
+/// test's or a lab's runner does when it's killed, and nothing binds its path again. A socket a live
+/// process serves answers, so it stays. How many went.
+#[cfg(unix)]
+pub(crate) fn sweep(dir: &std::path::Path, min_age: std::time::Duration) -> usize {
+    use std::os::unix::fs::FileTypeExt as _;
+    let mut gone = 0;
+    for e in std::fs::read_dir(dir).into_iter().flatten().flatten() {
+        let name = e.file_name().to_string_lossy().into_owned();
+        if !(name.starts_with("harness-") || name.starts_with("reach-")) || !name.ends_with(".sock") {
+            continue;
+        }
+        let path = e.path();
+        let Ok(meta) = std::fs::symlink_metadata(&path) else { continue };
+        let old = meta.modified().ok().and_then(|m| m.elapsed().ok()).is_some_and(|age| age >= min_age);
+        if meta.file_type().is_socket() && old && !answers(&path) && std::fs::remove_file(&path).is_ok() {
+            gone += 1;
+        }
+    }
+    gone
+}
+
+/// [`sweep`] of the folder `path` is in, on a thread of its own, at most once per [`SWEEP_EVERY`]
+/// in this process: when it first binds a socket, then while it serves them.
+#[cfg(unix)]
+fn sweep_now_and_then(path: &std::path::Path) {
+    static LAST: parking_lot::Mutex<Option<std::time::Instant>> = parking_lot::Mutex::new(None);
+    {
+        let mut last = LAST.lock();
+        if last.is_some_and(|t| t.elapsed() < SWEEP_EVERY) {
+            return;
+        }
+        *last = Some(std::time::Instant::now());
+    }
+    let Some(dir) = path.parent().map(std::path::Path::to_path_buf) else { return };
+    let spawned = std::thread::Builder::new().name("kiln-socket-sweep".into()).spawn(move || {
+        let gone = sweep(&dir, LEFT_AFTER);
+        if gone > 0 {
+            tracing::info!(dir = %dir.display(), gone, "removed the sockets of kiln processes that ended without removing them");
+        }
+    });
+    if let Err(e) = spawned {
+        tracing::debug!(error = %e, "the socket sweep couldn't start; it's tried again later");
     }
 }
 
@@ -393,6 +553,7 @@ impl Kept {
     /// log.
     pub(crate) fn new(path: PathBuf, take: bool, what: &'static str) -> anyhow::Result<Self> {
         let bound = bind(&path, take)?;
+        sweep_now_and_then(&path);
         if bound.is_none() {
             tracing::info!(path = %path.display(), "{what}: another kiln process serves this machine's socket; this one serves it once that one stops");
         }
@@ -410,6 +571,7 @@ impl Kept {
         if self.looked.elapsed() < if self.theirs { LOOK_THEIRS } else { LOOK } {
             return false;
         }
+        sweep_now_and_then(&self.path);
         self.look()
     }
 
@@ -528,6 +690,31 @@ pub fn serve_with(_host: &Arc<Host>, _path: PathBuf, _forward: Option<Forward>, 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The 2026-10-29 outage left 1,532 sockets of ended test and lab runners in the runtime
+    /// folder: a sweep takes those nothing answers on, and leaves a live one, a young one (bound,
+    /// not yet listening), and anything not a kiln socket.
+    #[cfg(unix)]
+    #[test]
+    fn sockets_nothing_answers_on_are_swept_and_live_ones_stay() -> anyhow::Result<()> {
+        use std::os::unix::net::UnixListener;
+        let dir = tempfile::tempdir()?;
+        let ended = |name: &str| -> anyhow::Result<PathBuf> {
+            let p = dir.path().join(name);
+            drop(UnixListener::bind(&p)?);
+            Ok(p)
+        };
+        let (dead_reach, dead_harness) = (ended("reach-lab-0-deadbeef.sock")?, ended("harness-lab-0-deadbeef.sock")?);
+        let live = dir.path().join("reach-adacachy-4b48ed43.sock");
+        let _listening = UnixListener::bind(&live)?;
+        let (foreign, notes) = (ended("someone-else.sock")?, dir.path().join("reach-notes.sock"));
+        std::fs::write(&notes, "not a socket")?;
+        anyhow::ensure!(sweep(dir.path(), std::time::Duration::from_secs(3600)) == 0, "a young socket went");
+        anyhow::ensure!(sweep(dir.path(), std::time::Duration::ZERO) == 2, "not just the two ended kiln sockets went");
+        anyhow::ensure!(!dead_reach.exists() && !dead_harness.exists(), "an ended runner's socket stayed");
+        anyhow::ensure!(live.exists() && foreign.exists() && notes.exists(), "a live socket, another program's or a plain file went");
+        Ok(())
+    }
 
     /// One request on the socket at `path`, from this process (on the blocking pool: the socket is
     /// served on the runtime). Linux's, as the one test that asks is (on macOS it was never used,

@@ -35,7 +35,9 @@ import { GoalPlan } from "./goal-plan";
 import { useFold } from "./fold";
 import { cn } from "@/lib/utils";
 import { machineWord, type GoalStep } from "./goal-plan-layout";
+import { stepLive, threadHref } from "./subagent-tree";
 import { PlannerLive } from "./planner";
+import { revealReview } from "@/views/plans/reveal";
 import "./goals.css";
 
 const WORD: Record<GoalItem["status"], string> = { met: "met", active: "under way", pending: "waiting", unmet: "not met", skipped: "skipped" };
@@ -141,24 +143,38 @@ function usePlanned(goal: GoalItem, items: GoalItem[], paused: boolean, agent: s
     const n = i + 1;
     const r = ran?.find((x) => x.n === n);
     if (r) {
-      const who = whoOf(sessions.find((x) => x.id === r.agent_id)) ?? (r.agent ? `${r.agent.kind} · ${machineWord(r.agent.machine)}` : undefined);
-      return { n, title, needs: waits[i] ?? [], stand: r.stand, who };
+      const at = sessions.find((x) => x.id === r.agent_id);
+      const who = whoOf(at) ?? (r.agent ? `${r.agent.kind} · ${machineWord(r.agent.machine)}` : undefined);
+      // Its own agent, live under the step: what it's at, and its thread.
+      return { n, title, needs: waits[i] ?? [], stand: r.stand, who, live: at ? stepLive(at, `/agents/${at.id}`) : undefined };
     }
     const part = items.find((x) => x.part_of === goal.id && x.part_kind === "plan" && x.step?.n === n);
     // Out on a subagent, side by side with the plan's other steps: who it is, and whether it waits on you.
     const sub = part && outOn(part) ? sessions.find((x) => x.id === part.subagent) : undefined;
     const stand = sub && !paused && (sub.approvals.length > 0 || sub.status === "waiting") ? "needs_you" : (stepStand(goal, items, n, paused) ?? "waiting");
-    return { n, title, needs: waits[i] ?? [], stand, who: sub ? whoOf(sub) : own, checks: checksOf(part, items) };
+    return { n, title, needs: waits[i] ?? [], stand, who: sub ? whoOf(sub) : own, checks: checksOf(part, items), live: sub ? stepLive(sub, threadHref(agent, agent, sub.id)) : undefined };
   });
   return { plan: p, run, steps, planning };
 }
 
 /** A planned goal, in its line: how many of its plan's steps are met (its plan to open), its run, its research. */
-function PlannedWords({ goal, items, paused, agent }: { goal: GoalItem; items: GoalItem[]; paused: boolean; agent: string }) {
+function PlannedWords({ goal, items, paused, agent, review }: { goal: GoalItem; items: GoalItem[]; paused: boolean; agent: string; review?: boolean }) {
   const planned = usePlanned(goal, items, paused, agent);
   if (!planned) return null;
   const { plan, run, steps, planning } = planned;
   const met = steps.filter((s) => s.stand === "met").length;
+  // Its plan waiting on your review: that's at the top of this tab (views/plans/review.tsx).
+  if (review)
+    return (
+      <>
+        {" · "}
+        <b className="gs-review">waits for your review</b>
+        {" · "}
+        <button type="button" className="gs-review-it" onClick={revealReview}>
+          review it ↑
+        </button>
+      </>
+    );
   return (
     <>
       {" · "}
@@ -276,6 +292,11 @@ export function Goals({ agent, harness, working, store, onOpenTask }: { agent: s
       <AgentGoals key={shown} agent={shown} harness={harness} working={working} store={shown === agent ? store : undefined} onOpenTask={onOpenTask} />
     </Loadable>
   );
+}
+
+/** Agent `agent`'s goal stack, as its panel reads it (none yet: null). */
+export function useGoalStack(agent: string): GoalStack | null {
+  return useSuspenseResource(`harness/goals/${agent}`, () => readGoals(agent), { pollMs: 2500 }).data.stack;
 }
 
 /** The agent's goal stack, read again every few seconds while it shows. */
@@ -575,7 +596,7 @@ function GoalPanel({
                             )}
                             {g.planned_as ? (
                               <Loadable label="the plan" fallback={null}>
-                                <PlannedWords goal={g} items={items} paused={paused} agent={agent} />
+                                <PlannedWords goal={g} items={items} paused={paused} agent={agent} review={!!stack?.held_for && stack.held_for === g.planned_as} />
                               </Loadable>
                             ) : g.status === "active" && !held && !g.waits_on ? (
                               sentWords(g)

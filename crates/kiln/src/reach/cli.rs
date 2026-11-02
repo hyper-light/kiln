@@ -161,6 +161,7 @@ pub async fn run(a: RunArgs, shutdown: crate::rt::Shutdown) -> anyhow::Result<()
         timeout_ms: a.timeout.map(|s| s.saturating_mul(1000)),
         shell: a.shell.clone(),
         detach: a.detach,
+        asker: None,
     };
     let stream = std::os::unix::net::UnixStream::connect(&path).map_err(|e| anyhow::anyhow!("cannot reach the kiln runner at {}: {e}", path.display()))?;
     stream.set_nonblocking(true)?;
@@ -191,6 +192,7 @@ pub async fn run(a: RunArgs, shutdown: crate::rt::Shutdown) -> anyhow::Result<()
     let mut de = super::wire::Deframer::default();
     let mut buf = vec![0u8; 64 * 1024];
     let mut interrupted = false;
+    let mut on = String::new();
     let say = |line: String| {
         if !a.quiet {
             let _ = writeln!(std::io::stderr(), "\x1b[2m[kiln] {line}\x1b[0m");
@@ -199,7 +201,10 @@ pub async fn run(a: RunArgs, shutdown: crate::rt::Shutdown) -> anyhow::Result<()
     loop {
         while let Some(ev) = de.take::<Ev>()? {
             match ev {
-                Ev::Picked { runner, why } => say(format!("on {runner} · {why}")),
+                Ev::Picked { runner, why } => {
+                    say(format!("on {runner} · {why}"));
+                    on = runner;
+                }
                 Ev::Syncing { files, bytes } => say(format!("syncing {files} files ({})…", human(bytes))),
                 Ev::Synced { sent, removed, bytes, ms, root } => {
                     let what = if sent == 0 && removed == 0 { "already in sync".to_owned() } else { format!("sent {sent} files ({}), removed {removed}", human(bytes)) };
@@ -262,6 +267,12 @@ pub async fn run(a: RunArgs, shutdown: crate::rt::Shutdown) -> anyhow::Result<()
             Next::Read(Ok(Some(n))) if n > 0 => de.push(buf.get(..n).unwrap_or_default()),
             Next::Read(_) if a.reuse => anyhow::bail!("the kiln runner closed the connection (one older than `kiln run --reuse` doesn't know it: run without it, or upgrade the runner)"),
             Next::Read(_) => anyhow::bail!("the kiln runner closed the connection"),
+            // --detach: stopping this one (Ctrl-C, SIGTERM) leaves the command running
+            // (docs/reach.md §4.2).
+            Next::Stop if a.detach => {
+                say(format!("left running on {} (--detach)", if on.is_empty() { "its runner" } else { on.as_str() }));
+                return Ok(());
+            }
             Next::Stop => {
                 // Ctrl-C: the command over there gets it too; its exit comes back as usual.
                 interrupted = true;

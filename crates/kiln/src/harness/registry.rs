@@ -316,7 +316,7 @@ impl Mirror {
     fn resync(&mut self) {
         self.started_over();
         if self.feed.viewers() > 0 {
-            self.feed.publish(&Frame::of(super::live::RESYNC.to_owned()));
+            self.feed.publish(&Frame::resync());
         }
     }
 
@@ -495,10 +495,13 @@ pub struct Attachment {
     pub rev: u64,
 }
 
-/// A live frame for a session's viewers. A state comes as well as only what changed since the
-/// last one (`patch`), for a viewer that takes that: during a turn its usage and activity change
-/// all the time, its skills, plugins and servers seldom. So does a changeset: an agent touches a
-/// file or two of the hundreds it may have changed.
+/// A live frame for a session's viewers: a frame of the session socket's ([`SessionDown`],
+/// serialized), as the session's feed carries it, so the registry and its viewers share the type. A
+/// state comes as well as only what changed since the last one (`patch`), for a viewer that takes
+/// that: during a turn its usage and activity change all the time, its skills, plugins and servers
+/// seldom. So does a changeset: an agent touches a file or two of the hundreds it may have changed.
+///
+/// [`SessionDown`]: crate::wire::ui::SessionDown
 #[derive(Clone)]
 pub struct Frame {
     pub text: Arc<str>,
@@ -545,11 +548,27 @@ impl Patches {
 }
 
 impl Frame {
-    pub fn of(text: String) -> Self {
+    /// `down`, as the feed carries it.
+    pub fn of(down: crate::wire::ui::SessionDown) -> Self {
+        Self { text: Arc::from(down.text()), patch: None, patch_of: PatchOf::State, rev: down.rev.unwrap_or(0) }
+    }
+
+    /// The feed's resync marker ([`super::live::RESYNC`]): its viewers start over from a snapshot.
+    /// It's the feed's own, never sent to a viewer.
+    pub fn resync() -> Self {
+        Self { text: Arc::from(super::live::RESYNC), patch: None, patch_of: PatchOf::State, rev: 0 }
+    }
+
+    /// Any text as a frame: the feed's tests, which carry words of their own.
+    #[cfg(test)]
+    pub fn text(text: &str) -> Self {
         Self { text: Arc::from(text), patch: None, patch_of: PatchOf::State, rev: 0 }
     }
 
-    /// The frame with its copy's revision in it, as `"rev"`.
+    /// The frame with its copy's revision in it, as `"rev"`: as [`SessionDown`] says it, its last
+    /// field (`a_frame_says_its_copys_revision`).
+    ///
+    /// [`SessionDown`]: crate::wire::ui::SessionDown
     fn stamped(self, rev: u64) -> Self {
         let stamp = |t: &str| -> Arc<str> {
             match t.strip_suffix('}') {
@@ -845,6 +864,7 @@ impl Registry {
         let local = Host::with_clock(tx, Some(dir.join("local.json")), Limits::default(), clock);
         // The server's own agents' workspaces of their own are kept beside their record.
         crate::workspace::slates::init(&dir);
+        super::whose::note_kiln(&dir);
         let keeper = Keeper::new(&dir);
         let visuals = super::visuals::Visuals::new(&dir);
         Self {
@@ -1307,7 +1327,7 @@ impl Registry {
                 let task = task.to_owned();
                 Ok(Some(crate::rt::blocking(move || s.task_output(&task, since)).await?))
             }
-            Some(Location::Machine(m)) => Ok(hub.harness_task_output(&m, id, task, since).await?.and_then(|j| serde_json::from_str(&j).ok())),
+            Some(Location::Machine(m)) => hub.harness_task_output(&m, id, task, since).await,
         }
     }
 
@@ -1325,7 +1345,7 @@ impl Registry {
                 .await?;
                 Ok(Some(serde_json::to_value(past)?))
             }
-            Location::Machine(m) => Ok(hub.harness_history(&m, kind, u32::try_from(limit).unwrap_or(u32::MAX)).await?.and_then(|j| serde_json::from_str(&j).ok())),
+            Location::Machine(m) => hub.harness_history(&m, kind, u32::try_from(limit).unwrap_or(u32::MAX)).await?.map(serde_json::to_value).transpose().map_err(Into::into),
         }
     }
 
@@ -1351,8 +1371,16 @@ impl Registry {
         self.epochs.lock().get(id).is_some_and(|e| *e > epoch)
     }
 
+    /// The sessions runner `machine` reports holding (`inv`) whose copy there is one left behind:
+    /// the session runs elsewhere now, at a later epoch than that copy (docs/ci.md W27-R08). One
+    /// just arriving there (its Open on its way) is at the epoch it goes on at, which isn't; a
+    /// runner from before says no epochs, so none of its are.
+    pub fn left_behind(&self, machine: &str, inv: &super::host::Inventory) -> Vec<String> {
+        inv.sessions.iter().filter(|id| !self.runs_on(id, machine) && inv.epochs.get(*id).is_some_and(|e| self.stale(id, *e))).cloned().collect()
+    }
+
     /// Session `id` is at `epoch` now (epochs only rise), kept when it changes.
-    fn raise_epoch(&self, id: &str, epoch: u64) {
+    pub(crate) fn raise_epoch(&self, id: &str, epoch: u64) {
         let snapshot = {
             let mut g = self.epochs.lock();
             let e = g.entry(id.to_owned()).or_insert(0);
@@ -1408,7 +1436,18 @@ impl Registry {
             other => other,
         };
         match &u {
-            Update::Open { info, .. } if info.epoch > 0 => self.raise_epoch(id, info.epoch),
+            Update::Open { info, .. } if info.epoch > 0 => {
+                // Gone on at a later epoch on a runner from before signed hand-overs: unsigned,
+                // recorded saying so (docs/ci.md W27-R08).
+                if let Location::Machine(machine) = from
+                    && info.epoch > self.epoch_of(id)
+                    && hub.runner_wide_caps(machine) & crate::proto::CAP_CUSTODY == 0
+                {
+                    let why = format!("the process it went to, on {machine}, runs a kiln from before signed hand-overs: it signed no receipt");
+                    unsigned(hub, id, info.epoch, &format!("runner {machine}"), why);
+                }
+                self.raise_epoch(id, info.epoch);
+            }
             Update::Open { .. } => {}
             // Only the machine a session runs on speaks for it: a copy left behind where it went
             // on from says nothing more of it.
@@ -1587,7 +1626,7 @@ impl Registry {
                 Update::Open { since: Some(_), .. } => None,
                 Update::State { .. } => m.state_frame(),
                 Update::Changes { .. } | Update::ChangesPatch { .. } => m.changes_frame(),
-                _ if m.feed.viewers() > 0 => serde_json::to_string(&u).ok().map(Frame::of),
+                _ if m.feed.viewers() > 0 => Some(Frame::of(crate::wire::ui::SessionFrame::of(&u).into())),
                 _ => None,
             };
             if let Some(frame) = frame {
@@ -1694,7 +1733,7 @@ impl Registry {
             for id in &gone {
                 if let Some(mut m) = g.remove(id) {
                     // Its feed's topic goes with it once its viewers are told.
-                    m.feed.publish(&Frame::of(super::live::CLOSED.to_owned()));
+                    m.feed.publish(&Frame::of(crate::wire::ui::SessionFrame::Closed.into()));
                 }
             }
             gone
@@ -1705,6 +1744,16 @@ impl Registry {
             super::archive::closed(hub, &id);
             hub.emit(&crate::wire::events::ServerEvent::HarnessClosed { id: id.to_string() });
         }
+    }
+
+    /// Of the sessions a runner of `machine` just said it holds (`held`), those this server still
+    /// has as disconnected. Its link dropped and came back, and only a session's own update clears
+    /// that, so one that's quiet (idle, ended, waiting on a person) stays offline while its machine
+    /// is connected. Their snapshots are asked for ([`Command::Snapshot`]).
+    pub fn still_disconnected(&self, machine: &str, held: &[String]) -> Vec<String> {
+        let at = Location::Machine(machine.to_owned());
+        let g = self.mirrors.lock();
+        held.iter().filter(|id| g.get(*id).is_some_and(|m| m.location == at && m.info.status == Status::Disconnected)).cloned().collect()
     }
 
     /// Session `id` is held by runner process `instance` of its machine, as that process said:
@@ -1871,7 +1920,7 @@ impl Registry {
         if let Some(m) = self.mirrors.lock().get_mut(id) {
             // A revision of its own, past what its viewers have: else they'd take it as had.
             m.rev = m.rev.saturating_add(1);
-            m.send(Frame::of(crate::wire::ui::SessionDown::from(crate::wire::ui::SessionFrame::Files { files: added.to_vec() }).text()));
+            m.send(Frame::of(crate::wire::ui::SessionFrame::Files { files: added.to_vec() }.into()));
         }
     }
 
@@ -1992,6 +2041,8 @@ impl Registry {
                         left_behind: 0,
                         reach: spec.reach.clone(),
                         pause: None,
+                        frozen: None,
+                        perms: None,
                         room_wait: None,
                         last_turn: None,
                         keep_off: false,
@@ -2005,6 +2056,7 @@ impl Registry {
                         plan_run: spec.plan_run.clone(),
                         helper: spec.helper.clone(),
                         subagent: spec.subagent,
+                        variant_of: spec.variant_of.clone(),
                         no_bypass: !spec.allow_bypass,
                         workspace: spec.workspace.clone(),
                     };
@@ -2322,6 +2374,35 @@ impl Registry {
     /// message) its inbox's answer to wait for ([`Registry::settle`]), so a sender that goes on
     /// meanwhile (a viewer's socket) waits for nothing.
     pub async fn dispatch(&self, hub: &Hub, id: &str, c: Command) -> Pending {
+        // A person's pause of a session holds the subagents kiln started under it too, and resuming
+        // it lets them go: each still going is sent its own, its answer not waited for.
+        if let Command::Pause { on, task: None } = &c {
+            let all = self.list();
+            for sub in super::lineage::subagents_under(&all, id) {
+                if all.iter().any(|i| i.id == sub && i.status != Status::Exited) {
+                    let _ = Box::pin(self.dispatch_one(hub, &sub, Command::Pause { on: *on, task: None })).await;
+                }
+            }
+        }
+        // What a person lets a session do: never more than its parent's, and the subagents kiln
+        // started under it narrowed by it, each sent its own.
+        if let Command::Perms { perms, task: None } = &c {
+            let all = self.list();
+            let mut mine = None;
+            for (sid, p) in super::lineage::perms_down(&all, id, perms.as_ref()) {
+                if sid == id {
+                    mine = Some(p);
+                } else if all.iter().any(|i| i.id == sid && i.status != Status::Exited) {
+                    let _ = Box::pin(self.dispatch_one(hub, &sid, Command::Perms { perms: p, task: None })).await;
+                }
+            }
+            return Box::pin(self.dispatch_one(hub, id, Command::Perms { perms: mine.flatten(), task: None })).await;
+        }
+        Box::pin(self.dispatch_one(hub, id, c)).await
+    }
+
+    /// [`Registry::dispatch`], to session `id` alone.
+    async fn dispatch_one(&self, hub: &Hub, id: &str, c: Command) -> Pending {
         let Some(loc) = self.location(id) else { return Pending::Now(Sent::NoSession) };
         // Kiln's own (`goals::keep`), kept here: its harness has nothing to do with it.
         if let Command::Control { id: control, value } = &c
@@ -2444,10 +2525,23 @@ impl Registry {
         }
         let (st, i, f) = (store.clone(), id.to_owned(), from_name.clone());
         let (from_shown, to_shown) = (hub.shown(&from_name), hub.shown(to));
-        let pkg = crate::rt::blocking(move || crate::convo::resume::package(&st, &i, &f, cwd.as_deref(), (&from_shown, &to_shown)))
+        let mut pkg = crate::rt::blocking(move || crate::convo::resume::package(&st, &i, &f, cwd.as_deref(), (&from_shown, &to_shown)))
             .await
             .map_err(|e| format!("{e:#}"))?
             .map_err(|e| format!("{e:#}"))?;
+        // kiln takes it for the process that held it, which can't hand it on: the package carries
+        // the take, which the receipt follows as a hand-on's (docs/ci.md W27-R08).
+        let heard = hub.agents.lock().get(&from_name).map(|a| a.last_seen).unwrap_or_default();
+        let when = time::OffsetDateTime::from_unix_timestamp(heard).ok().and_then(|t| t.format(&time::format_description::well_known::Rfc3339).ok()).unwrap_or_else(|| "never".to_owned());
+        let why = format!("resumed from kiln's copy: {from_name} was last heard from at {when}");
+        match crate::custody::take_for(&hub.store, &hub.pki, id, pkg.state.epoch, &pkg.events, &why).await {
+            Ok(take) => pkg.hand_on = take,
+            Err(e) => tracing::warn!(target: "kiln.custody", session = %id, error = %format!("{e:#}"), "kiln couldn't take a session it resumes from its copy: it goes on unsigned"),
+        }
+        if hub.runner_wide_caps(to) & crate::proto::CAP_CUSTODY == 0 {
+            let why = format!("{to} runs a kiln from before signed hand-overs: it signs no receipt of kiln's take");
+            unsigned(hub, id, pkg.state.epoch.saturating_add(1), &format!("runner {to}"), why);
+        }
         let bytes = serde_json::to_vec(&pkg).map_err(|e| e.to_string())?;
         // Its copy where it was doesn't count from now on: not here, not in the store (rows that
         // machine still sends are left out).
@@ -2537,7 +2631,7 @@ impl Registry {
         if loc.is_some() && (!ok || matches!(loc, Some(Location::Local))) {
             if let Some(mut m) = self.mirrors.lock().remove(id) {
                 // Its feed's topic goes with it once its viewers are told.
-                m.feed.publish(&Frame::of(super::live::CLOSED.to_owned()));
+                m.feed.publish(&Frame::of(crate::wire::ui::SessionFrame::Closed.into()));
             }
             self.keeper.forget(id);
             self.visuals.forget(id);
@@ -2609,6 +2703,18 @@ fn proposed_in(e: &super::model::Event) -> Option<String> {
     call.input.get("plan").and_then(Value::as_str).map(str::trim).filter(|p| !p.is_empty()).map(str::to_owned)
 }
 
+
+/// Session `id`'s hand-over to `epoch`, taken by `took`, went unsigned because `why`: recorded,
+/// with the process kiln last certified it as before then (docs/ci.md W27-R08).
+fn unsigned(hub: &Hub, id: &str, epoch: u64, took: &str, why: String) {
+    let (store, session, took) = (hub.store.clone(), id.to_owned(), took.to_owned());
+    crate::rt::spawn(async move {
+        let gave = crate::identities::holder_at(&store, &session, epoch.saturating_sub(1)).await.ok().flatten().unwrap_or_default();
+        if let Err(e) = crate::custody::unsigned(&store, &session, epoch, &gave, &took, &why, crate::util::now_unix()).await {
+            tracing::warn!(target: "kiln.custody", %session, error = %format!("{e:#}"), "an unsigned hand-over couldn't be recorded");
+        }
+    });
+}
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2731,10 +2837,16 @@ mod tests {
 
     #[test]
     fn a_frame_says_its_copys_revision() -> anyhow::Result<()> {
-        let f = Frame::of(json!({"t": "events", "events": []}).to_string()).stamped(7);
+        use crate::wire::ui::{SessionDown, SessionFrame};
+        let f = Frame::of(SessionFrame::Events { events: Vec::new() }.into()).stamped(7);
         let v: Value = serde_json::from_str(&f.text)?;
         assert_eq!(v.get("rev").and_then(Value::as_u64), Some(7));
         assert_eq!(f.rev, 7);
+        // Stamped, a frame is its type's with its revision.
+        for frame in [SessionFrame::Events { events: vec![json!({"id": "e1"})] }, SessionFrame::Closed, SessionFrame::Stream { id: "e1".into(), text: "}".into() }] {
+            let stamped = Frame::of(frame.clone().into()).stamped(7);
+            assert_eq!(stamped.text.as_ref(), SessionDown { frame, rev: Some(7) }.text());
+        }
         Ok(())
     }
 
@@ -3038,7 +3150,7 @@ mod tests {
             // Its viewer hears it's gone: its feed's last frame.
             let read = futures::executor::block_on(kiln_seams::Bus::read(&hub.bus, &att.topic, at, 100))?;
             let said: Vec<String> = read.messages.iter().filter_map(|m| super::super::live::decode(&m.payload)).map(|f| f.text.to_string()).collect();
-            anyhow::ensure!(said.last().is_some_and(|t| t == super::super::live::CLOSED), "its viewer heard {said:?}");
+            anyhow::ensure!(said.last().is_some_and(|t| t == super::super::live::closed()), "its viewer heard {said:?}");
             // Its machine announces it: from then on its reports count.
             hub.harness.ingest(&hub, &there, "opened", Update::Open { info: Box::new(info("opened")), since: None });
             hub.harness.inventory(&hub, "box", None, &[], crate::harness::host::Inventory::default());
@@ -3081,6 +3193,53 @@ mod tests {
             // Who holds what is kept for the next start.
             let kept: HashMap<String, String> = serde_json::from_slice(&std::fs::read(hub.harness.dir.join("holders.json"))?)?;
             anyhow::ensure!(kept.get("old-1").map(String::as_str) == Some("01a14794") && !kept.contains_key("old-2"), "{kept:?}");
+            Ok(())
+        })
+    }
+
+    /// W27-R08 (the twin): a runner's report names the sessions it holds a copy of that went on
+    /// elsewhere at a later epoch, which it's told to let go of; not one just arriving there (its
+    /// Open on its way, at the epoch it goes on at), not one it runs, and none from a runner that
+    /// says no epochs.
+    #[test]
+    fn w27_r08_a_report_names_the_copies_left_behind() -> anyhow::Result<()> {
+        crate::rt::block_on(async {
+            let hub = crate::hub::tests::scratch_hub().await?;
+            let info = |id: &str, epoch: u64| Info { id: id.into(), kind: "claude".into(), epoch, ..Info::default() };
+            // "twin" went on on box-b at epoch 1, its copy left on box-a; "arriving" is on its way
+            // from box-b to box-a, at epoch 1 there; "here" runs on box-a.
+            let (a, b) = (Location::Machine("box-a".into()), Location::Machine("box-b".into()));
+            hub.harness.ingest(&hub, &b, "twin", Update::Open { info: Box::new(info("twin", 1)), since: None });
+            hub.harness.ingest(&hub, &b, "arriving", Update::Open { info: Box::new(info("arriving", 0)), since: None });
+            hub.harness.ingest(&hub, &a, "here", Update::Open { info: Box::new(info("here", 0)), since: None });
+            let report = |held: &[(&str, u64)]| crate::harness::host::Inventory { sessions: held.iter().map(|(s, _)| (*s).to_owned()).collect(), epochs: held.iter().map(|(s, e)| ((*s).to_owned(), *e)).collect(), ..Default::default() };
+            assert_eq!(hub.harness.left_behind("box-a", &report(&[("twin", 0), ("arriving", 1), ("here", 0)])), ["twin"]);
+            let before = crate::harness::host::Inventory { sessions: vec!["twin".into()], ..Default::default() };
+            assert!(hub.harness.left_behind("box-a", &before).is_empty(), "a runner from before says no epochs");
+            Ok(())
+        })
+    }
+
+    /// A runner's link dropped and came back to the same server: the sessions it holds that have
+    /// said nothing since still read disconnected, offline while their machine is connected (19
+    /// agents on three machines, 2026-11-01). Its report finds them, for their snapshots.
+    #[test]
+    fn a_report_finds_its_sessions_that_still_read_disconnected() -> anyhow::Result<()> {
+        crate::rt::block_on(async {
+            let hub = crate::hub::tests::scratch_hub().await?;
+            let there = Location::Machine("box".into());
+            let info = |id: &str| Info { id: id.into(), kind: "claude".into(), ..Info::default() };
+            for id in ["quiet", "busy"] {
+                hub.harness.ingest(&hub, &there, id, Update::Open { info: Box::new(info(id)), since: None });
+            }
+            hub.harness.ingest(&hub, &Location::Machine("elsewhere".into()), "away", Update::Open { info: Box::new(info("away")), since: None });
+            hub.harness.machine_lost(&hub, "box");
+            hub.harness.machine_lost(&hub, "elsewhere");
+            // Back: one has something to say at once, the other is quiet.
+            hub.harness.ingest(&hub, &there, "busy", Update::Open { info: Box::new(info("busy")), since: None });
+            let held = ["quiet", "busy", "away", "unknown"].map(str::to_owned);
+            let stale = hub.harness.still_disconnected("box", &held);
+            anyhow::ensure!(stale == ["quiet"], "only its own quiet session: {stale:?}");
             Ok(())
         })
     }

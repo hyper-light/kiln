@@ -245,6 +245,28 @@ each with its commit (author, time, the whole message) and the tags that name it
 the app's history (`history_limit`, 10 by default; failures go first when it's full). The choosing
 is `kiln_cd::rollback`, pure; the server resolves a tag to its commit first.
 
+**Any commit** (ci.md W26-R25). A commit, or a tag's commit, that no deployment kiln can go back to
+ran is gone back to all the same when one of the app's git sources has it: kiln renders the app
+with that source at the commit and its other sources at their heads, syncs it as any rollback, and
+records it as a deployment. Its artifacts are its own, resolved now (an image CI never built for it
+says so). It holds there, its pin naming no deployment (`to` 0), until git changes what the app
+renders, as rollbacks do. `rollback_targets` also lists the newest 20 commits of the app's first own
+git source at the revision it follows (`commits`), each with who, when and what, the deployment
+that ran it (`deployment`), and the newest deployment that rendered what it renders (`same_as`, by
+its inputs' content address, read from git without rendering). Which way a rollback goes stays
+`kiln_cd::rollback`'s (`pick_any`, `held_commits`, `same_as`); the server asks git first what the
+revision is in the app's sources.
+
+**Auto-sync** (ci.md W26-R27). Whether kiln syncs an app on its own whenever git changes what it
+renders is its deploy file's `sync.auto` (its definition's, for an app made by API), unless a person
+set it for the app (`cd.apps.set_auto_sync`, `PUT /api/cd/apps/:app/auto-sync` with `{ on: true |
+false | null }`; Ship's Deploys tab). A person's word wins while the deploy file says what it said
+when they set it; once the file changes its `sync.auto`, the file's word stands again and the
+person's is set aside. `null` clears it. Each change is audited (`cd.auto_sync`) and kept in the
+store's settings (`auto-sync/app/<id>`, with the file's word then), and the engine takes it at once.
+Prune and self-heal keep their own settings. `cd.apps.auto_sync` says which way it stands and whose
+word that is (`from`: `app` or `deploy-file`); the app's `auto` is that word.
+
 **Auto-rollback.** When a deploy fails, kiln goes back on its own: an app whose rollout aborted
 goes back to the deployment before (cd-targets.md §5), kiln's own restart that didn't take has its
 previous image put back by the guard (cd-targets.md §10), and a release that failed after its
@@ -381,9 +403,9 @@ Agents use deployments the way people do, through the same API and the same rule
   tools (`await kiln.cd.apps.list({ health: "Degraded" })`) in a bounded sandbox inside kiln. Only
   what the program returns enters the agent's context, so "every degraded app in production with
   its failing pods' last events" is one call, whether there are 10 apps or 100,000. Lists are
-  async iterators that page on the server. Bulk operations (`kiln.cd.apps.sync({ selector })`)
-  are single, idempotent operations. The same tools are offered one by one for clients without
-  code mode.
+  async iterators that page on the server. Bulk operations
+  (`kiln.cd.apps.sync_many({ health: "Degraded" })`) are single, idempotent operations. The same
+  tools are offered one by one for clients without code mode.
 - **Skills.** kiln ships skills for deploying a change, diagnosing a degraded app, rolling back,
   writing app definitions, running fleets and moving from Argo CD. They are served over MCP (the
   skills extension) and installed into every agent kiln starts.
@@ -407,12 +429,13 @@ The API lives under `/api/cd`. It follows [access.md](access.md)'s conventions: 
 | GET | `/api/cd/apps/:app/manifests` | what the app renders now, as kiln applies it (another revision's: not yet) |
 | POST | `/api/cd/apps/:app/{refresh,sync,rollback,follow,terminate}` | `rollback` takes `{ to }` (a deployment's id) or `{ revision }` (a commit, a tag, a chart version), and `prune` |
 | GET | `/api/cd/apps/:app/history` | deployments, each with its commit and the tags that name it |
-| GET | `/api/cd/apps/:app/rollback-targets` | what a rollback can go to, newest first, and what runs now |
+| GET | `/api/cd/apps/:app/rollback-targets` | what a rollback can go to, newest first, and what runs now; `commits`: its source's newest commits, each with the deployment that ran it and the one whose render it matches (any of them can be gone back to, ci.md W26-R25) |
+| GET / PUT | `/api/cd/apps/:app/auto-sync` | whether kiln syncs the app on its own, and whose word that is (`from`: `app` or `deploy-file`); PUT `{ on: true \| false \| null }` (ci.md W26-R27) |
 | GET / PUT | `/api/cd/apps/:app/auto-rollback` | whether kiln goes back on its own, and who said so (`from`: `app`, `repo`, `deploy-file`, `default`); PUT `{ on: true \| false \| null }` sets or clears the app's |
 | GET / PUT | `/api/cd/repos/auto-rollback` | auto-rollback by repository; PUT `{ repo, on: true \| false \| null }` |
 | GET | `/api/cd/apps/:app/resources/:key` | one object of the tree: its node, live manifest, desired manifest and diff (managed objects), labels, annotations, conditions and owners. `:key` is `group~kind~namespace~name` |
 | GET | `/api/cd/apps/:app/resources/:key/events` | its Kubernetes events, newest first |
-| GET | `/api/cd/apps/:app/resources/:key/logs?container=&pod=&tail_lines=&since_seconds=&previous=` | the last lines of a pod's log, or of a workload's pods merged by time; `/logs/ws` follows them over a WebSocket |
+| GET | `/api/cd/apps/:app/resources/:key/logs?container=&pod=&tail_lines=&since_seconds=&previous=` | the last lines of a pod's log, or of a workload's pods merged by time; `/logs/ws` follows them over a WebSocket A Compose project's or a host's service's (`compose.kiln.dev`, `host.kiln.dev`) are read on its hosts by their runners, each line naming its host (ci.md W26-R26) |
 | POST / DELETE | `/api/cd/apps/:app/resources/:key/actions/:action` | resource actions (restart, delete a pod): not yet |
 | POST | `/api/cd/bulk` | `{ selector, action }` over many apps |
 | GET / POST | `/api/cd/plans?repo=&commit=\|head=&base=\|pr=&trunk=&brief=` | a plan of a commit, a stack or a pull request (POST takes the same as JSON, with app filters); `diff=` (kiln's own diffs): not yet |

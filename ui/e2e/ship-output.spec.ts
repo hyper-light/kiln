@@ -1,39 +1,44 @@
 /**
- * The opened commit's Output (plan 01a17ba155a17737a39348c6c5362210, step 3), against the mock: the
- * first row's picked job (Checks, streaming one of the mock's own jobs) shows in a card exactly the
- * lanes card's width from 320 to 1440 (the Opened commit plan's Output step) at 1440, 1280, 1000, 800,
- * 600, 390 and 320; as the job prints, nothing moves; scrolled up, the log stays where it was.
+ * The opened commit's output (plan 01a17ba155a17737a39348c6c5362210, step 3), in its jobs pane (docs/ci.md
+ * W26-R23), against the mock: the first row's picked job (Checks, streaming one of the mock's own jobs)
+ * fills its place, the pane's side beside the jobs on a desktop and the list's width under its line on a
+ * phone, at 1440, 1280, 1000, 800, 600, 390 and 320; as the job prints, nothing moves; scrolled up, the
+ * log stays where it was.
  */
 import { expect, test, type Locator } from "@playwright/test";
 
 const REAL = !!process.env.E2E_BASE_URL;
 test.skip(REAL, "drives the mock's commits");
 
-/** The Output card's width, the lanes card's inner width, and where the card sits. */
+/** The output's width, its place's inner width (the pane's side, or under the line on a phone), where it sits, and its job. */
 const measure = (row: Locator) =>
   row.evaluate((li) => {
     const out = li.querySelector(".ship-output");
-    const lanes = li.querySelector('section[aria-label="Lanes"]');
-    if (!out || !lanes) return null;
-    const cs = getComputedStyle(lanes);
-    const inner = lanes.getBoundingClientRect().width - parseFloat(cs.paddingLeft) - parseFloat(cs.paddingRight) - parseFloat(cs.borderLeftWidth) - parseFloat(cs.borderRightWidth);
+    const place = li.querySelector(".jp-side") ?? li.querySelector(".jp-detail");
+    if (!out || !place) return null;
+    const cs = getComputedStyle(place);
+    const inner = place.getBoundingClientRect().width - parseFloat(cs.paddingLeft) - parseFloat(cs.paddingRight) - parseFloat(cs.borderLeftWidth) - parseFloat(cs.borderRightWidth);
     const r = out.getBoundingClientRect();
-    return { width: r.width, lanes: inner, top: Math.round(r.top), height: Math.round(r.height) };
+    return { width: r.width, lanes: inner, top: Math.round(r.top), height: Math.round(r.height), job: out.getAttribute("data-job") };
   });
 
 for (const width of [1440, 1280, 1000, 800, 600, 390, 320]) {
-  test(`at ${width}, the output is the lanes card's width and holds still as the job prints`, async ({ page, isMobile, browserName }) => {
+  test(`at ${width}, the output fills its place in the jobs pane and holds still as the job prints`, async ({ page, isMobile, browserName }) => {
     test.skip(isMobile, "each width is set here; the desktop projects run them all");
     await page.setViewportSize({ width, height: 900 });
     await page.goto("/ship");
-    const row = page.getByRole("list", { name: "Commits", exact: true }).locator(":scope > li").first();
+    const row = page.getByRole("list", { name: "Repositories", exact: true }).locator(":scope > li").first();
     await row.getByRole("button", { name: /^Open / }).click();
     await expect(row.locator(".ship-output .xterm")).toBeVisible({ timeout: 15_000 });
     // Review's Files above it drawn first: what's measured is lines arriving, not Files finishing its load.
     await expect(row.locator('section[aria-label="Files"]')).toBeVisible({ timeout: 15_000 });
-    const first = await measure(row);
-    expect(first).not.toBeNull();
-    expect(Math.abs((first?.width ?? 0) - (first?.lanes ?? 0))).toBeLessThanOrEqual(1);
+    // The job it shows, picked, so it's that job printing: until one is picked the pane shows the job
+    // under way, which on a narrow pane puts the output under the next job's line once it starts.
+    await row.locator('.jp-j[data-at="true"] .jp-line').first().click();
+    await expect(row.locator(".ship-output .xterm")).toBeVisible({ timeout: 15_000 });
+    const placed = await measure(row);
+    expect(placed).not.toBeNull();
+    expect(Math.abs((placed?.width ?? 0) - (placed?.lanes ?? 0))).toBeLessThanOrEqual(1);
 
     // What's measured is lines arriving, so the fonts are in first (a late swap isn't a line).
     await page.evaluate(() => document.fonts.ready.then(() => undefined));
@@ -57,15 +62,23 @@ for (const width of [1440, 1280, 1000, 800, 600, 390, 320]) {
           }
         }).observe({ type: "layout-shift" });
       });
-    await page.waitForTimeout(3000);
-    const after = await measure(row);
+    // As its job prints, nothing moves. The mock's live run can end within the 3 s, its next run's
+    // job taking the place: a window that saw that (the output loading again, or another job's) is
+    // watched again, three at most.
+    const watch = async () => {
+      if (browserName === "chromium") await page.evaluate(() => Object.assign(window as unknown as { __shift: number; __moved: string[] }, { __shift: 0, __moved: [] }));
+      const first = await measure(row);
+      await page.waitForTimeout(3000);
+      return { first, after: await measure(row) };
+    };
+    let seen = await watch();
+    for (let i = 0; i < 2 && (seen.after === null || seen.after.job !== seen.first?.job); i++) seen = await watch();
+    const { first, after } = seen;
     expect(after?.top).toBe(first?.top);
     expect(after?.height).toBe(first?.height);
     if (browserName === "chromium") {
-      const seen = await page
-        .evaluate(() => window as unknown as { __shift: number; __moved: string[] })
-        .then(() => page.evaluate(() => ({ shift: (window as unknown as { __shift: number }).__shift, moved: (window as unknown as { __moved: string[] }).__moved })));
-      expect(seen.shift, `what moved: ${seen.moved.join(" | ")}`).toBe(0);
+      const shift = await page.evaluate(() => ({ shift: (window as unknown as { __shift: number }).__shift, moved: (window as unknown as { __moved: string[] }).__moved }));
+      expect(shift.shift, `what moved: ${shift.moved.join(" | ")}`).toBe(0);
     }
   });
 }
@@ -73,7 +86,7 @@ for (const width of [1440, 1280, 1000, 800, 600, 390, 320]) {
 test("scrolled up, the output stays where you are", async ({ page, isMobile }) => {
   test.skip(isMobile, "the desktop projects run it");
   await page.goto("/ship");
-  const row = page.getByRole("list", { name: "Commits", exact: true }).locator(":scope > li").first();
+  const row = page.getByRole("list", { name: "Repositories", exact: true }).locator(":scope > li").first();
   await row.getByRole("button", { name: /^Open / }).click();
   const viewport = row.locator(".ship-output .xterm-viewport");
   await expect(viewport).toBeAttached({ timeout: 15_000 });
@@ -86,11 +99,12 @@ test("scrolled up, the output stays where you are", async ({ page, isMobile }) =
 /** Opens the first row at a job of its Checks that has run and waits for the log; its job and step. */
 async function openOutput(page: import("@playwright/test").Page) {
   await page.goto("/ship");
-  const row = page.getByRole("list", { name: "Commits", exact: true }).locator(":scope > li").first();
+  const row = page.getByRole("list", { name: "Repositories", exact: true }).locator(":scope > li").first();
   await row.getByRole("button", { name: /^Open / }).click();
-  const checks = row.getByRole("list", { name: "Checks jobs" });
-  await expect(checks.getByRole("button").first()).toBeVisible({ timeout: 15_000 });
-  await checks.getByRole("button").last().click();
+  // One still waiting has no output yet: the last of those that have run.
+  const last = row.locator('.jp-j[data-stage="checks"]:is([data-state="running"], [data-state="failed"], [data-state="passed"])').last();
+  await expect(last).toBeVisible({ timeout: 15_000 });
+  await last.locator(".jp-line").click();
   const out = row.locator(".ship-output");
   await expect(out.locator(".xterm")).toBeVisible({ timeout: 15_000 });
   return { out, url: `/api/jobs/${encodeURIComponent((await out.getAttribute("data-job")) ?? "")}/logs?step=${(await out.getAttribute("data-step")) ?? "0"}` };
@@ -104,7 +118,8 @@ test("copy puts the job step's whole output on the clipboard", async ({ page, is
   });
   const { out } = await openOutput(page);
   // A running job moves from step to step, so each copy is checked against the very log it fetched
-  // (GET /api/jobs/:id/logs?step=N for the job and step the card showed), until one carries text.
+  // (GET /api/jobs/:id/logs?step=N for the job and step the card showed), until one carries text
+  // (an empty one copies nothing).
   let copied = "";
   let url = "";
   for (let i = 0; i < 15 && !copied; i++) {
@@ -112,7 +127,7 @@ test("copy puts the job step's whole output on the clipboard", async ({ page, is
     await out.getByRole("button", { name: /^Cop(y|ied) the output$/ }).click();
     const res = await got;
     const fetched = await res.text();
-    await expect.poll(() => page.evaluate(() => (window as unknown as { __copied?: string }).__copied ?? null)).toBe(fetched);
+    await expect.poll(() => page.evaluate(() => (window as unknown as { __copied?: string }).__copied ?? "")).toBe(fetched);
     copied = fetched;
     url = new URL(res.url()).pathname + new URL(res.url()).search;
     if (!copied) await page.waitForTimeout(1000);
@@ -126,8 +141,10 @@ test("copy puts the job step's whole output on the clipboard", async ({ page, is
 
 test("a refused copy says so", async ({ page, isMobile }) => {
   test.skip(isMobile, "the desktop projects run it");
+  // Refused both ways: the clipboard API, and the copy command it falls back to.
   await page.addInitScript(() => {
     Object.defineProperty(navigator, "clipboard", { configurable: true, value: { writeText: async () => Promise.reject(new DOMException("Write permission denied.", "NotAllowedError")) } });
+    Object.defineProperty(document, "execCommand", { configurable: true, value: () => false });
   });
   const { out } = await openOutput(page);
   await out.getByRole("button", { name: "Copy the output" }).click();
@@ -148,19 +165,22 @@ test("Output as f-ship draws it: the job's glyph and Stage · job, stdout · std
   test.setTimeout(90_000);
   await page.setViewportSize({ width: 1280, height: 900 });
   await page.goto("/ship");
-  const row = page.getByRole("list", { name: "Commits", exact: true }).locator(":scope > li").first();
-  const sha = ((await row.locator(".ship-sha").first().textContent()) ?? "").trim();
+  const row = page.getByRole("list", { name: "Repositories", exact: true }).locator(":scope > li").first();
+  // The row's commit, its repository's newest (docs/ci.md W26-R29).
+  const repo = ((await row.locator(".ship-r .ship-name").textContent()) ?? "").trim();
+  const sha = ((await row.locator(".ship-r .ship-sha").textContent()) ?? "").trim();
   await row.getByRole("button", { name: /^Open / }).click();
-  const checks = row.getByRole("list", { name: "Checks jobs" });
-  await expect(checks.getByRole("button").first()).toBeVisible({ timeout: 15_000 });
+  await expect(row.locator('.jp-j[data-stage="checks"]').first()).toBeVisible({ timeout: 15_000 });
+  // A job's line in the pane, by its name.
+  const line = (name: string) => row.locator(".jp-j").filter({ has: page.locator(".n", { hasText: new RegExp(`^${name.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}$`) }) });
   // A job that ran, from the read model: picked, the card is its.
-  const detail = (await (await page.request.get(`/api/ship/commits/hyper-light/kiln/${sha}`)).json()) as {
+  const detail = (await (await page.request.get(`/api/ship/commits/${repo}/${sha}`)).json()) as {
     checks: { pipeline: string; legs: { name: string; state: string; job?: string }[] }[];
   };
   const ran = detail.checks.flatMap((c) => c.legs.filter((l) => l.job).map((l) => ({ ...l, shown: `${c.pipeline} · ${l.name}` })));
   const leg = ran[0];
   if (!leg?.job) throw new Error("no job that ran");
-  await checks.getByRole("button", { name: leg.shown }).click();
+  await line(leg.shown).locator(".jp-line").click();
   const out = row.locator(`.ship-output[data-job="${leg.job}"]`);
   await expect(out).toBeVisible({ timeout: 15_000 });
   const bar = out.locator(".ship-output__bar");
@@ -191,7 +211,7 @@ test("Output as f-ship draws it: the job's glyph and Stage · job, stdout · std
   // A running job's lines arrive in place: the card holds its box.
   const live = ran.find((l) => l.state === "running");
   if (live) {
-    await checks.getByRole("button", { name: live.shown }).click();
+    await line(live.shown).locator(".jp-line").click();
     const card = row.locator(`.ship-output[data-job="${live.job}"]`);
     await expect(card).toBeVisible({ timeout: 15_000 });
     const before = await card.boundingBox();

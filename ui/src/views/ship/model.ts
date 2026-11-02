@@ -259,7 +259,8 @@ export function shipGroups(detail: ShipDetail): ShipLaneGroup[] {
   const built = detail.build;
   const build: ShipLane[] = built
     ? [
-        ...built.platforms.map((p) => ({ id: `platform/${p.name}`, name: p.name, state: glyph(p.state), start: null, end: null })),
+        // As its newest release run has it: once it has run, its job (Output) and its times (its lane).
+        ...built.platforms.map((p) => ({ id: `platform/${p.name}`, name: p.name, state: glyph(p.state), start: p.start ?? null, end: p.end ?? null, ...(p.job ? { job: p.job } : {}) })),
         { id: "image", name: "image", state: glyph(built.image.state), start: null, end: null },
       ]
     : [];

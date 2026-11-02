@@ -194,6 +194,9 @@ async fn outside(hub: &Arc<Hub>, method: &Method, rest: &[&str], q: &HashMap<Str
         (&Method::POST, ["repos", repo, "providers", "sync"]) => Ok(ok(&super::providers::sync_now(hub, repo).await?)),
         (&Method::GET, ["repos", repo, "providers", "workflows"]) => Ok(ok(&super::providers::workflows(hub, repo).await?)),
         (&Method::GET, ["repos", repo, "commits", sha, "checks"]) => Ok(ok(&super::providers::checks(hub, repo, sha).await?)),
+        // W28-R55: a commit's verdict on each lane it is on, per unit and test.
+        (&Method::GET, ["repos", repo, "commits", sha, "verdict"]) => Ok(ok(&super::verdict::of_commit(hub, repo, sha, q).await?)),
+        (&Method::GET, ["repos", repo, "commits", sha, "verdict", "wait"]) => Ok(ok(&super::verdict::wait(hub, repo, sha, q).await?)),
         // W26-R07: a search across a host's pull request, at its mirrored head.
         (&Method::GET, ["repos", repo, "pulls", n, "search"]) => Ok(ok(&super::search::pull(hub, repo, n, q, caller).await?)),
         // W23-R06: the host's pull requests (merge requests).
@@ -203,8 +206,23 @@ async fn outside(hub: &Arc<Hub>, method: &Method, rest: &[&str], q: &HashMap<Str
         (&Method::GET, ["runs", id, "pending"]) => super::runs_api::pending(hub, id).await,
         (&Method::GET, ["runs", id, "artifacts"]) => super::runs_api::part(hub, id, "artifacts", q).await,
         (&Method::GET, ["runs", id, "artifacts", artifact, "download"]) => super::runs_api::download(hub, id, artifact).await,
-        (&Method::POST, ["runs", id, "cancel"]) => super::runs_api::cancel(hub, id).await,
-        (&Method::POST, ["runs", id, "rerun"]) => super::runs_api::rerun(hub, id, &body, caller.map_or("admin", |c| c.name.as_str())).await,
+        (&Method::POST, ["runs", id, "cancel"]) => match body.get("jobs").and_then(serde_json::Value::as_array).filter(|j| !j.is_empty()) {
+            // Some of its jobs (W26-R21), the run going on.
+            Some(jobs) => {
+                let ids: Vec<String> = jobs.iter().filter_map(serde_json::Value::as_str).map(str::to_owned).collect();
+                super::retry::cancel_set(hub, id, ids, caller.map_or("admin", |c| c.name.as_str())).await.map(|v| crate::http::server::json(StatusCode::OK, &v))
+            }
+            None => super::runs_api::cancel(hub, id).await,
+        },
+        (&Method::POST, ["runs", id, "rerun"]) => match (body.get("mode").and_then(serde_json::Value::as_str), body.get("jobs").and_then(serde_json::Value::as_array)) {
+            // Some of its jobs (W26-R21), passed ones too.
+            (Some("set"), Some(jobs)) if !jobs.is_empty() => {
+                let ids: Vec<String> = jobs.iter().filter_map(serde_json::Value::as_str).map(str::to_owned).collect();
+                super::retry::retry_set(hub, id, &ids, caller.map_or("admin", |c| c.name.as_str())).await.map(|v| crate::http::server::json(StatusCode::CREATED, &v))
+            }
+            (Some("set"), _) => Err((StatusCode::BAD_REQUEST, "mode `set` names its `jobs`".to_owned())),
+            _ => super::runs_api::rerun(hub, id, &body, caller.map_or("admin", |c| c.name.as_str())).await,
+        },
         (&Method::POST, ["runs", id, "approve"]) => super::environments::approve(hub, id, body, caller).await,
         // W05-R28: a finished job again, here or elsewhere (another provider's, by its provider).
         (&Method::POST, ["legs", id, "retry"]) => super::retry::retry(hub, id, &body, caller.map_or("admin", |c| c.name.as_str())).await,
@@ -360,6 +378,8 @@ pub async fn route(hub: &Arc<Hub>, rest: &[&str], q: &HashMap<String, String>, r
         // W16-R03: tests, failures first.
         (&Method::GET, ["runs", id, "tests"]) => boxed(|| super::results::of(hub, Some(id), None, q)).await,
         (&Method::GET, ["legs", id, "tests"]) => boxed(|| super::results::of(hub, None, Some(id), q)).await,
+        // W27-R05: a leg's results as it signed them, and how what kiln keeps holds to them.
+        (&Method::GET, ["legs", id, "signed"]) => boxed(|| super::signed::get(hub, id)).await,
         (&Method::GET, ["repos", repo, "tests"]) => boxed(|| super::results::repo(hub, repo, q)).await,
         (&Method::GET, ["repos", repo, "tests", id, "history"]) => boxed(|| super::results::history(hub, repo, id, q)).await,
         // W19-R06: what notifications went out.
