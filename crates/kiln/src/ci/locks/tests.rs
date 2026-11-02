@@ -32,7 +32,8 @@ impl DependencySources for Counted {
 struct Caller { repo: Repo, commit: String, model: Arc<Workflow> }
 
 fn model(path: &str, text: &str) -> anyhow::Result<Arc<Workflow>> {
-    let (model, diagnostics) = wf::parse_workflow(path, text, Dialect::Gha);
+    let dialect = if path.starts_with(".kiln/") { Dialect::Kiln } else { Dialect::Gha };
+    let (model, diagnostics) = wf::parse_workflow(path, text, dialect);
     anyhow::ensure!(!diagnostics.iter().any(|d| d.is_error()), "{diagnostics:?}");
     model.map(Arc::new).ok_or_else(|| anyhow::anyhow!("no workflow"))
 }
@@ -80,7 +81,11 @@ impl PlanSource for SavedSource<'_> {
 }
 
 fn input(caller: &Caller) -> RunInput {
-    RunInput { github: serde_json::json!({ "repository": caller.repo.name, "sha": caller.commit, "ref": "refs/heads/main", "workflow_ref": format!("{}/{PATH}@refs/heads/main", caller.repo.name) }), trusted: true, ..Default::default() }
+    input_for(caller, PATH)
+}
+
+fn input_for(caller: &Caller, path: &str) -> RunInput {
+    RunInput { github: serde_json::json!({ "repository": caller.repo.name, "sha": caller.commit, "ref": "refs/heads/main", "workflow_ref": format!("{}/{path}@refs/heads/main", caller.repo.name) }), trusted: true, ..Default::default() }
 }
 
 #[test]
@@ -225,3 +230,5 @@ fn w29_r23_lock_failure_is_a_startup_failure_with_zero_jobs() -> anyhow::Result<
         Ok(())
     })
 }
+
+mod native;

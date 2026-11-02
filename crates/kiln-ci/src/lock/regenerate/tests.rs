@@ -243,3 +243,17 @@ fn w29_r25_conflicting_facts_fail_independent_of_order_and_large_graphs_are_refu
     assert!(generate(None, None, &[edit(KL, &["acme/build@v1"])], &[large], &[], Mode::Preserve).err().is_some_and(|d| d.iter().any(|d| d.code == "KCI1022")));
     Ok(())
 }
+
+#[test]
+fn w29_r24_head_keeps_the_recorded_branch_beside_githubs_head_spelling() -> Result<(), String> {
+    let key = "acme/build@HEAD";
+    let mut root = git(key, A, &["node24"]);
+    if let Dependency::Git(g) = &mut root.dependency { g.git_ref = "refs/heads/main".into(); }
+    let facts = [root, runtime("linux/amd64", HASH)];
+    let files = generate(None, None, &[edit(GH, &[key])], &facts, &[], Mode::Preserve).map_err(|d| format!("{d:?}"))?;
+    let (gh, kl) = parsed(&files)?;
+    assert_eq!(gh.dependencies.get(key).map(|a| a.git_ref.as_str()), Some("HEAD"));
+    assert!(matches!(kl.dependencies.get(key), Some(Dependency::Git(g)) if g.git_ref == "refs/heads/main"));
+    assert_eq!(generate(Some(&gh), Some(&kl), &[edit(GH, &[key])], &facts, &[], Mode::Preserve).map_err(|d| format!("{d:?}"))?, files);
+    Ok(())
+}

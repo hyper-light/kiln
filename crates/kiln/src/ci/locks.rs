@@ -1,4 +1,4 @@
-//! W29-R23: preflight fixes Git dependencies before policy, metadata and planning. The accepted
+//! W29-R23/R24: preflight fixes Git dependencies before policy, metadata and planning. The accepted
 //! snapshot is plain JSON in the run's existing input, reused through reruns and recovery.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
@@ -140,10 +140,17 @@ struct Owner {
     repository: String,
     commit: String,
     remote: Option<Remote>,
+    revision: Option<Revision>,
 }
 
 impl Owner {
-    async fn file(&self, hub: &Hub, path: &str) -> Result<Option<Vec<u8>>, String> {
+    async fn file(&self, hub: &Hub, source: &dyn DependencySources, path: &str) -> Result<Option<Vec<u8>>, String> {
+        if let Some(revision) = &self.revision {
+            return match source.file(revision.clone(), self.commit.clone(), path.into()).await {
+                Ok(bytes) => Ok(Some(bytes)), Err(kiln_seams::dependencies::Refusal::Missing("file")) => Ok(None),
+                Err(e) => Err(format!("KCI4051 {}:{path}: {e}", self.repository)),
+            };
+        }
         let dir = self.remote.as_ref().map(|r| r.mirror(hub)).unwrap_or_else(|| crate::gitops::mirror_path(hub, &self.repository));
         blob(hub, &dir, self.remote.as_ref(), &self.commit, path).await
     }
@@ -158,6 +165,7 @@ struct Work {
     workflow: Arc<Workflow>,
     owner: Owner,
     depth: usize,
+    native: Vec<native::Layer>,
 }
 
 struct Capture<'a> {
@@ -170,6 +178,7 @@ struct Capture<'a> {
     legacy: BTreeMap<String, Result<(String, String), String>>,
     origins: BTreeMap<String, Remote>,
     locks: BTreeMap<String, Option<Arc<github::File>>>,
+    native_locks: BTreeMap<String, Option<Arc<kiln_ci::lock::kiln::File>>>,
     texts: BTreeMap<String, Option<Arc<str>>>,
     bytes: usize,
     items: usize,
@@ -199,11 +208,26 @@ impl Capture<'_> {
         kiln_ci::policy::check(&policies, uses).map_err(|r| format!("{} {}", r.code, r.message))
     }
 
+    fn allowed_pinned(&self, uses: &str) -> Result<(), String> {
+        let policies: Vec<_> = self.policies.iter().collect();
+        kiln_ci::policy::check_pinned(&policies, uses).map_err(|r| format!("{} {}", r.code, r.message))
+    }
+
+    fn captured(&self, remote: &Remote, reference: &str) -> Option<Revision> {
+        self.revisions.get(&Self::ref_key(remote, reference)).cloned().or_else(|| {
+            // A captured qualified tag also proves its bare spelling. HEAD still needs its
+            // own request, and a qualified branch must not assume no same-named tag exists.
+            let canonical = if reference.starts_with("refs/") { reference.to_owned() }
+                else if reference != "HEAD" && !kiln_seams::dependencies::commit_valid(reference) { format!("refs/tags/{reference}") } else { return None };
+            self.revisions.values().find(|r| r.repository.name.eq_ignore_ascii_case(&remote.full()) && r.repository.native == remote.native && r.reference == canonical).cloned()
+        })
+    }
+
     async fn lock(&mut self, owner: &Owner, path: &str) -> Result<Option<Arc<github::File>>, String> {
         if !path.starts_with(".github/workflows/") { return Ok(None); }
         let key = format!("{}:{}@{}", if owner.remote.is_some() { "remote" } else { "own" }, owner.repository, owner.commit);
         if let Some(cached) = self.locks.get(&key) { return Ok(cached.clone()); }
-        let Some(bytes) = owner.file(self.hub, github::PATH).await? else { self.locks.insert(key, None); return Ok(None) };
+        let Some(bytes) = owner.file(self.hub, self.source, github::PATH).await? else { self.locks.insert(key, None); return Ok(None) };
         self.count(bytes.len())?;
         let text = String::from_utf8(bytes).map_err(|_| format!("KCI1022 {}:{} is not UTF-8", owner.repository, github::PATH))?;
         let file = github::parse(&text).map_err(|ds| ds.iter().map(|d| format!("{}: {}", owner.repository, d.render(github::PATH))).collect::<Vec<_>>().join("\n"))?;
@@ -230,14 +254,23 @@ impl Capture<'_> {
 
     /// W29-R23: select and prove the pin before opening its action metadata. The proof stays
     /// anchored to the captured revision, even if a subsequent request sees a moved tag.
-    async fn select(&mut self, uses: &str, remote: &Remote, workflow: &str, lock: Option<&github::File>, home: &str) -> Result<(String, Option<Revision>, bool), String> {
+    async fn select(&mut self, uses: &str, remote: &Remote, workflow: &str, lock: Option<&github::File>, native: &[native::Layer], home: &str) -> Result<(String, Option<Revision>, bool), String> {
         let onboarded = lock.is_some_and(|f| f.workflows.contains_key(workflow));
+        if let Some(selection) = self.native_selection(uses, remote, native).await? {
+            let same = github::action_pin(uses).and_then(|pin| lock.and_then(|f| verify::pin_for(f, workflow, &pin)))
+                .is_some_and(|(_, entry)| github::digest(&entry.commit).is_some_and(|c| c.eq_ignore_ascii_case(&selection.0)));
+            // A caller may override a callee's seed. Where both files select the same tree,
+            // retain the GitHub file's own provenance, HEAD and moved-full-tag checks too.
+            if !same { return Ok(selection); }
+        }
         if onboarded && remote.hosted(self.hub) && let Some(pin) = github::action_pin(uses)
             && lock.is_some_and(|f| verify::pin_for(f, workflow, &pin).is_some()) {
             return Err(format!("KCI4052 {uses}: the source is now hosted by kiln, not the GitHub repository whose ids were locked"));
         }
         // Hosted sources belong to .kiln/lock (W29-R24), never GitHub's numeric-id file.
-        if !onboarded || remote.hosted(self.hub) {
+        if remote.hosted(self.hub) && onboarded { return Err(format!("KCI4050 {uses}: a hosted action needs its entry in .kiln/lock")); }
+        if !onboarded {
+            if !native.is_empty() { return Err(format!("KCI4050 {workflow}: {uses} is missing from its caller and workflow locks")); }
             self.allowed(uses)?;
             let key = Self::ref_key(remote, &remote.git_ref);
             let (sha, _) = self.pin(remote).await?;
@@ -248,8 +281,8 @@ impl Capture<'_> {
         let (key, entry) = verify::pin_for(file, workflow, &canonical).ok_or_else(|| format!("KCI4050 {workflow}: {uses} is missing from this workflow's lock closure"))?;
         let wanted = github::digest(&entry.commit).ok_or_else(|| format!("KCI1022 {uses}: invalid locked commit"))?.to_ascii_lowercase();
         let ref_key = Self::ref_key(remote, &entry.git_ref);
-        let revision = match self.revisions.get(&ref_key) {
-            Some(r) => r.clone(),
+        let revision = match self.captured(remote, &entry.git_ref) {
+            Some(r) => r,
             None => {
                 let r = self.source.resolve(Repository { name: remote.full(), native: remote.native }, entry.git_ref.clone()).await.map_err(|e| format!("KCI4051 {uses}: {e}"))?;
                 if self.legacy.get(&ref_key).and_then(|r| r.as_ref().ok()).is_some_and(|(old, _)| *old != r.commit) {
@@ -276,7 +309,7 @@ impl Capture<'_> {
         self.warnings.extend(checked.warnings.iter().map(|d| d.render(workflow)));
         let selected = checked.pins.get(&canonical).ok_or_else(|| format!("KCI4050 {uses}: no verified selection"))?;
         // The action policy judges the code that will run, including require_sha_pins.
-        self.allowed(&format!("{}@{}", uses.rsplit_once('@').map_or(uses, |(name, _)| name), selected.commit))?;
+        self.allowed_pinned(&format!("{}@{}", uses.split_once('@').map_or(uses, |(name, _)| name), selected.commit))?;
         Ok((selected.commit.clone(), Some(revision), true))
     }
 
@@ -304,8 +337,8 @@ impl Capture<'_> {
         Ok(None)
     }
 
-    async fn action_map(&mut self, workflow: &Workflow, lock: Option<&github::File>, home: &str) -> Result<Actions, String> {
-        let locked = lock.is_some_and(|f| f.workflows.contains_key(&workflow.path));
+    async fn action_map(&mut self, workflow: &Workflow, lock: Option<&github::File>, native: &[native::Layer], home: &str) -> Result<Actions, String> {
+        let locked = !native.is_empty() || lock.is_some_and(|f| f.workflows.contains_key(&workflow.path));
         let mut todo = Vec::new();
         for job in &workflow.jobs { step_uses(&job.steps, &mut todo, 0, None); }
         let mut out = Actions::new();
@@ -336,12 +369,12 @@ impl Capture<'_> {
             let local = uses.strip_prefix("./").or_else(|| uses.strip_prefix("$/"));
             let (mut resolved, text, strict) = if let Some(path) = local {
                 if !path.is_empty() && !kiln_seams::dependencies::path_valid(path.trim_end_matches('/')) { return Err(format!("KCI1022 {uses}: action path must stay inside the repository")); }
-                let owner = Owner { repository: self.caller.name.clone(), commit: self.root_commit.to_owned(), remote: None };
+                let owner = Owner { repository: self.caller.name.clone(), commit: self.root_commit.to_owned(), remote: None, revision: None };
                 let base = path.trim_matches('/');
                 let mut text = None;
                 for name in ["action.yml", "action.yaml"] {
                     let file = if base.is_empty() { name.to_owned() } else { format!("{base}/{name}") };
-                    if let Some(bytes) = owner.file(self.hub, &file).await? {
+                    if let Some(bytes) = owner.file(self.hub, self.source, &file).await? {
                         self.count(bytes.len())?;
                         text = Some(Arc::<str>::from(String::from_utf8(bytes).map_err(|_| format!("KCI1022 {uses}: action metadata is not UTF-8"))?));
                         break;
@@ -354,7 +387,7 @@ impl Capture<'_> {
                 (resolved, text, false)
             } else {
                 let Some(remote) = Remote::parse(&uses) else { continue };
-                let selected = self.select(&uses, &remote, &workflow.path, lock, home).await;
+                let selected = self.select(&uses, &remote, &workflow.path, lock, native, home).await;
                 let (sha, revision, strict) = match selected {
                     Ok(s) => s,
                     Err(why) if locked || why.starts_with("KCI402") => return Err(why),
@@ -391,10 +424,10 @@ impl Capture<'_> {
         Ok(out)
     }
 
-    async fn called(&mut self, uses: &str, owner: &Owner, files: &mut Files) -> Result<(Arc<Workflow>, Owner), String> {
+    async fn called(&mut self, uses: &str, owner: &Owner, native: &[native::Layer], files: &mut Files) -> Result<(Arc<Workflow>, Owner), String> {
         if let Some(why) = kiln_ci::drafts::uses_of_another(uses, &self.caller.name) { return Err(format!("KCI4023 {why}")); }
-        self.allowed(uses)?;
         if let Some(path) = uses.strip_prefix("./").or_else(|| uses.strip_prefix("$/")) {
+            self.allowed(uses)?;
             if let Some(wf) = files.get(uses) { return Ok((Arc::clone(wf), owner.clone())); }
             // Local workflows include their overlays, exactly as the normal loader reads them.
             let loaded = super::load::load(self.hub, self.caller, self.root_commit).await.map_err(|_| format!("KCI4051 {uses}: caller workflow tree is unavailable"))?;
@@ -404,17 +437,33 @@ impl Capture<'_> {
             self.count(0)?;
             files.insert(uses.to_owned(), Arc::clone(&wf));
             files.insert(path.to_owned(), Arc::clone(&wf));
-            return Ok((wf, Owner { repository: self.caller.name.clone(), commit: self.root_commit.into(), remote: None }));
+            return Ok((wf, Owner { repository: self.caller.name.clone(), commit: self.root_commit.into(), remote: None, revision: None }));
         }
         let remote = Remote::parse(uses).ok_or_else(|| format!("{uses}: not a reusable workflow reference"))?;
+        remote.usable_by(self.hub, &self.caller.name).await?;
+        // own_calls rewrites a publisher's relative call to that same captured tree. It
+        // inherits the parent's proof; a tag is neither fetched nor selected a second time.
+        let relative = remote.full().eq_ignore_ascii_case(&owner.repository) && remote.git_ref == owner.commit;
+        let (commit, reference, revision) = if relative {
+            self.allowed_pinned(&format!("{}@{}", remote.named(), owner.commit))?;
+            (owner.commit.clone(), owner.revision.as_ref().map_or_else(|| owner.commit.clone(), |r| r.reference.clone()), owner.revision.clone())
+        } else if let Some((commit, revision, _)) = self.native_selection(uses, &remote, native).await? {
+            let reference = revision.as_ref().map_or_else(|| remote.git_ref.clone(), |r| r.reference.clone());
+            (commit, reference, revision)
+        } else {
+            if !native.is_empty() { return Err(format!("KCI4050 {uses}: reusable workflow is missing from its caller's lock")); }
+            self.allowed(uses)?;
+            let (commit, reference) = self.pin(&remote).await?;
+            (commit, reference, None)
+        };
         if let Some(wf) = files.get(uses) {
             let origin = wf.origin.as_ref().ok_or_else(|| format!("{uses}: captured workflow has no origin"))?;
-            return Ok((Arc::clone(wf), Owner { repository: origin.repository.clone(), commit: origin.sha.clone(), remote: Some(self.origin(&remote)) }));
+            if origin.sha != commit { return Err(format!("KCI4054 {uses}: caller lock entries select both {} and {commit} for the same call", origin.sha)); }
+            return Ok((Arc::clone(wf), Owner { repository: origin.repository.clone(), commit: origin.sha.clone(), remote: Some(self.origin(&remote)), revision }));
         }
-        let (commit, reference) = self.pin(&remote).await?;
         let remote = self.origin(&remote);
-        let owner = Owner { repository: remote.full(), commit: commit.clone(), remote: Some(remote.clone()) };
-        let bytes = owner.file(self.hub, &remote.path).await?.ok_or_else(|| format!("{uses}: reusable workflow file is missing at {commit}"))?;
+        let owner = Owner { repository: remote.full(), commit: commit.clone(), remote: Some(remote.clone()), revision };
+        let bytes = owner.file(self.hub, self.source, &remote.path).await?.ok_or_else(|| format!("{uses}: reusable workflow file is missing at {commit}"))?;
         self.count(bytes.len())?;
         let text = String::from_utf8(bytes).map_err(|_| format!("KCI1022 {uses}: workflow is not UTF-8"))?;
         let dialect = if matches!(wf::file_kind(&remote.path), Some(wf::FileKind::KilnWorkflow)) { kiln_ci::expr::Dialect::Kiln } else { kiln_ci::expr::Dialect::Gha };
@@ -446,25 +495,36 @@ async fn prepare_with(hub: &Hub, source: &dyn DependencySources, caller: &Repo, 
     if workflow.path != path { return Err("KCI1022 the workflow model's path differs from the run's path".into()); }
     let mut capture = Capture {
         hub, caller, source, root_commit: commit, policies: actions::policies(hub, caller).await,
-        revisions: BTreeMap::new(), legacy: BTreeMap::new(), origins: BTreeMap::new(), locks: BTreeMap::new(), texts: BTreeMap::new(),
+        revisions: BTreeMap::new(), legacy: BTreeMap::new(), origins: BTreeMap::new(), locks: BTreeMap::new(), native_locks: BTreeMap::new(), texts: BTreeMap::new(),
         bytes: 0, items: 0, warnings: BTreeSet::new(),
     };
     let mut frozen = Frozen { version: 1, repository: caller.name.clone(), path: path.into(), commit: commit.into(), root_locked: false, scopes: BTreeMap::new(), files: Files::new(), warnings: Vec::new() };
-    let mut todo = vec![Work { workflow, owner: Owner { repository: caller.name.clone(), commit: commit.into(), remote: None }, depth: 0 }];
+    let mut todo = vec![Work { workflow, owner: Owner { repository: caller.name.clone(), commit: commit.into(), remote: None, revision: None }, depth: 0, native: Vec::new() }];
     while let Some(work) = todo.pop() {
         let key = scope_key(&work.owner.repository, &work.workflow.path, &work.owner.commit);
-        if frozen.scopes.contains_key(&key) { continue; }
         if work.depth > 10 { return Err("reusable workflows nest at most 10 deep".into()); }
         capture.count(0)?;
         let lock = capture.lock(&work.owner, &work.workflow.path).await?;
-        let locked = lock.as_ref().is_some_and(|f| f.workflows.contains_key(&work.workflow.path));
+        let own_native = capture.native_lock(&work.owner, &work.workflow.path).await?;
+        if let (Some(gh), Some(layer)) = (&lock, &own_native) {
+            kiln_ci::lock::regenerate::compare(gh, &layer.file, &layer.home).map_err(|ds| ds.iter().map(|d| d.render(&work.workflow.path)).collect::<Vec<_>>().join("\n"))?;
+        }
+        let mut native = work.native;
+        if let Some(layer) = own_native { native.push(layer); }
+        let locked = !native.is_empty() || lock.as_ref().is_some_and(|f| f.workflows.contains_key(&work.workflow.path));
         if work.depth == 0 { frozen.root_locked = locked; }
         let home = work.owner.home_host(hub, caller);
-        let actions = capture.action_map(&work.workflow, lock.as_deref(), &home).await?;
+        let actions = capture.action_map(&work.workflow, lock.as_deref(), &native, &home).await?;
+        if let Some(before) = frozen.scopes.get(&key) {
+            let pins = |actions: &Actions| actions.iter().map(|(k, a)| (k.clone(), a.sha.clone())).collect::<BTreeMap<_, _>>();
+            if serde_json::to_value(&before.actions).map_err(|_| "KCI1022 action snapshot cannot be encoded")? != serde_json::to_value(&actions).map_err(|_| "KCI1022 action snapshot cannot be encoded")? {
+                return Err(format!("KCI4054 {}: caller lock contexts select both {:?} and {:?}", work.workflow.path, pins(&before.actions), pins(&actions)));
+            }
+        }
         frozen.scopes.insert(key, Scope { repository: work.owner.repository.clone(), path: work.workflow.path.clone(), commit: work.owner.commit.clone(), locked, actions });
         for uses in work.workflow.jobs.iter().filter_map(|j| j.uses.as_ref()) {
-            let (workflow, owner) = capture.called(uses, &work.owner, &mut frozen.files).await?;
-            todo.push(Work { workflow, owner, depth: work.depth.saturating_add(1) });
+            let (workflow, owner) = capture.called(uses, &work.owner, &native, &mut frozen.files).await?;
+            todo.push(Work { workflow, owner, depth: work.depth.saturating_add(1), native: native.clone() });
         }
     }
     frozen.warnings = capture.warnings.into_iter().collect();
@@ -477,10 +537,18 @@ async fn prepare_with(hub: &Hub, source: &dyn DependencySources, caller: &Repo, 
 pub async fn refresh_allowed(hub: &Arc<Hub>, caller: &Repo, commit: &str, path: &str, saved: Option<&Frozen>) -> Result<(), String> {
     let locked = match saved {
         Some(f) => f.root_locked,
-        None if path.starts_with(".github/workflows/") => {
+        None => {
             crate::gitops::ensure_commit(hub, caller, commit).await.map_err(|_| "the original workflow tree is unavailable; fresh actions cannot bypass its locks".to_owned())?;
-            let owner = Owner { repository: caller.name.clone(), commit: commit.into(), remote: None };
-            match owner.file(hub, github::PATH).await? {
+            let owner = Owner { repository: caller.name.clone(), commit: commit.into(), remote: None, revision: None };
+            let source = super::dependency_sources::Sources::new(Arc::clone(hub), caller.name.clone());
+            if let Some(bytes) = owner.file(hub, &source, kiln_ci::lock::kiln::PATH).await? {
+                let text = String::from_utf8(bytes).map_err(|_| "KCI1022 the original kiln lock is not UTF-8".to_owned())?;
+                if kiln_ci::lock::kiln::parse(&text).map_err(|_| "KCI1022 the original kiln lock doesn't read".to_owned())?.workflows.contains_key(path) {
+                    return Err("This workflow is locked. Fresh actions require a reviewed lock change (W29-R25).".into());
+                }
+            }
+            if !path.starts_with(".github/workflows/") { return Ok(()); }
+            match owner.file(hub, &source, github::PATH).await? {
                 None => false,
                 Some(bytes) => {
                     let text = String::from_utf8(bytes).map_err(|_| "KCI1022 the original lock is not UTF-8".to_owned())?;
@@ -488,7 +556,6 @@ pub async fn refresh_allowed(hub: &Arc<Hub>, caller: &Repo, commit: &str, path: 
                 }
             }
         }
-        None => false,
     };
     if locked { Err("This workflow is locked. Fresh actions require a reviewed lock change (W29-R25).".into()) } else { Ok(()) }
 }
@@ -523,3 +590,5 @@ pub async fn prepare_retry(hub: &Arc<Hub>, run: &str, fresh: bool) -> Result<Fro
 
 #[cfg(all(test, unix))]
 mod tests;
+
+mod native;

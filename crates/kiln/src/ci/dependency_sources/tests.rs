@@ -144,6 +144,11 @@ impl DependencySourcesFixture for Fixture {
                 FixtureChange::MoveTag => { git(&live.sources.hub, &live.origin, &["tag", "-fam", "moved", "v1", &live.commits.new]).await.map_err(|e| e.to_string())?; },
                 FixtureChange::ReplaceIdentity => { live.host.repo_id.store(99, Ordering::SeqCst); },
                 FixtureChange::Denied => { live.host.denied.store(true, Ordering::SeqCst); },
+                FixtureChange::ShadowQualifiedRefs => {
+                    git(&live.sources.hub, &live.origin, &["tag", "-am", "shadow branch spelling", "refs/heads/main", &live.commits.old]).await.map_err(|e| e.to_string())?;
+                    git(&live.sources.hub, &live.origin, &["tag", "-am", "shadow tag spelling", "refs/tags/v1", &live.commits.new]).await.map_err(|e| e.to_string())?;
+                    git(&live.sources.hub, &live.origin, &["tag", "-am", "shadow commit spelling", &live.commits.old, &live.commits.new]).await.map_err(|e| e.to_string())?;
+                }
                 FixtureChange::Offline => {
                     live.host.offline.store(true, Ordering::SeqCst);
                     let origin = live.origin.clone();

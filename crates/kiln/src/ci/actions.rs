@@ -523,7 +523,11 @@ async fn pin_ref_with(hub: &Hub, r: &Remote, observe: bool, refresh: bool) -> an
             }
         }
     }
-    let mut choices = vec![format!("refs/tags/{}", r.git_ref), format!("refs/heads/{}", r.git_ref), r.git_ref.clone()];
+    // W29-R23/R24: a qualified ref is exact. A tag literally named refs/heads/main must
+    // never substitute its history for the branch a lock recorded.
+    let mut choices = if full_sha { vec![r.git_ref.to_ascii_lowercase()] }
+        else if r.git_ref.starts_with("refs/") { vec![r.git_ref.clone()] }
+        else { vec![format!("refs/tags/{}", r.git_ref), format!("refs/heads/{}", r.git_ref), r.git_ref.clone()] };
     if !observe && r.git_ref == "HEAD" {
         // Refresh the default-branch alias too; fetch alone doesn't update a bare mirror's HEAD.
         if fresh && let Ok(out) = pin_git(hub, r, observe, &["-C", &d, "ls-remote", "--symref", "origin", "HEAD"], GIT_TIMEOUT).await
@@ -538,6 +542,7 @@ async fn pin_ref_with(hub: &Hub, r: &Remote, observe: bool, refresh: bool) -> an
     for full in choices {
         if let Ok(o) = pin_git(hub, r, observe, &["-C", &d, "rev-parse", "--verify", "--quiet", &format!("{full}^{{commit}}")], GIT_TIMEOUT).await {
             let sha = String::from_utf8_lossy(&o).trim().to_owned();
+            if full_sha && !sha.eq_ignore_ascii_case(&r.git_ref) { continue; }
             if matches!(sha.len(), 40 | 64) {
                 // A ref given as a commit stays the commit, as GitHub writes it.
                 let full = if full == r.git_ref && !full.starts_with("refs/") { sha.clone() } else { full };

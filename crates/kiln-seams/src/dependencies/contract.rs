@@ -15,6 +15,7 @@ pub enum FixtureChange {
     ReplaceIdentity,
     Offline,
     Denied,
+    ShadowQualifiedRefs,
 }
 
 /// A fresh source with `main` at `new`, `v1` at `old` (an annotated tag on real git),
@@ -80,6 +81,9 @@ impl DependencySourcesFixture for SimDependencySourcesFixture {
                 FixtureChange::ReplaceIdentity => self.source.replace_identity(&r, Identity::Native { repo_id: "replacement".into() }),
                 FixtureChange::Offline => self.source.availability(&r, false, false),
                 FixtureChange::Denied => self.source.availability(&r, true, true),
+                FixtureChange::ShadowQualifiedRefs => self.source.move_ref(&r, "refs/tags/refs/heads/main", &self.commits.old)
+                    .and_then(|()| self.source.move_ref(&r, "refs/tags/refs/tags/v1", &self.commits.new))
+                    .and_then(|()| self.source.move_ref(&r, &format!("refs/tags/{}", self.commits.old), &self.commits.new)),
             };
             fine("change upstream", result)
         })
@@ -94,8 +98,15 @@ fn c1<F: DependencySourcesFixture>(f: &F) -> BoxFuture<'_, Result<(), Failure>> 
         fine("valid revision", tag.validate())?;
         same("peeled tag", (&tag.commit, tag.reference.as_str(), tag.requested.as_str(), tag.fresh), (&c.old, "refs/tags/v1", "v1", true))?;
         let head = fine("resolve HEAD", s.resolve(f.repository(), "HEAD".into()).await)?;
-        same("default branch", (head.commit, head.reference, head.requested), (c.new, "refs/heads/main".into(), "HEAD".into()))?;
-        same("same source identity", head.identity, tag.identity)
+        same("default branch", (&head.commit, head.reference.as_str(), head.requested.as_str()), (&c.new, "refs/heads/main", "HEAD"))?;
+        same("same source identity", head.identity, tag.identity)?;
+        f.change(FixtureChange::ShadowQualifiedRefs).await?;
+        let branch = fine("qualified branch", s.resolve(f.repository(), "refs/heads/main".into()).await)?;
+        same("qualified branch is not shadowed by a tag", (branch.reference.as_str(), branch.commit), ("refs/heads/main", c.new))?;
+        let tag = fine("qualified tag", s.resolve(f.repository(), "refs/tags/v1".into()).await)?;
+        same("qualified tag is not shadowed by another tag", (tag.reference.as_str(), tag.commit), ("refs/tags/v1", c.old.clone()))?;
+        let commit = fine("literal commit", s.resolve(f.repository(), c.old.clone()).await)?;
+        same("a tag named as a SHA cannot replace that object", (commit.reference, commit.commit), (c.old.clone(), c.old))
     })
 }
 

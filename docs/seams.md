@@ -634,6 +634,9 @@ private; none enters a request, answer or refusal. Resolving may refresh a priva
 it never writes to a host, announces a release or queues an update draft. Panes keep reading
 their existing cached facts without fetching. A cached resolution says `fresh = false` and
 cannot establish what an upstream ref names now. Missing or shallow history proves nothing.
+Qualified refs are exact: a tag whose name looks like a qualified branch or tag cannot
+substitute its history for that requested ref (W29-R23/R24).
+A full commit SHA names that object, even if a tag has the same spelling.
 
 - **Implementations:** `kiln_seams::dependencies::SimDependencySources`, deterministic and in
   memory; kiln's git, host, OCI and runtime adapter (`ci::dependency_sources`).

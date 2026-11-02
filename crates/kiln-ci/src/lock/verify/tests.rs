@@ -82,6 +82,18 @@ fn w29_r23_forks_unknown_history_and_different_refs_never_prove_a_pin() {
 }
 
 #[test]
+fn w29_r23_a_tag_named_like_a_qualified_ref_cannot_prove_that_refs_history() {
+    for reference in ["refs/heads/main", "refs/tags/v1"] {
+        let (file, mut facts, uses) = fixture(reference, A, true);
+        assert_eq!(codes(&run(Some(&file), &facts, &uses, Policy::default())), ["KCI4051"]);
+        if let Some(f) = facts.get_mut(&format!("acme/action@{reference}")) { f.reference = reference.into(); }
+        assert!(run(Some(&file), &facts, &uses, Policy::default()).is_ok());
+    }
+    let (file, facts, uses) = fixture(A, A, true);
+    assert_eq!(codes(&run(Some(&file), &facts, &uses, Policy::default())), ["KCI4051"], "a tag named as a bare SHA cannot establish that SHA's source history");
+}
+
+#[test]
 fn w29_r23_owner_repository_and_host_identities_are_all_bound() {
     for (owner_id, repo_id, host) in [(9, 2, "github.com"), (1, 9, "github.com"), (1, 2, "evil.ghe.com"), (0, 0, "github.com")] {
         let (file, mut facts, uses) = fixture("v1", A, true);

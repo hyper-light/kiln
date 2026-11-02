@@ -5,3 +5,4 @@ pub mod github;
 pub mod kiln;
 pub mod regenerate;
 pub mod verify;
+pub mod verify_kiln;

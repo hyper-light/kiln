@@ -118,6 +118,8 @@ fn sha(value: &str) -> Option<String> {
 }
 
 fn recorded_ref_matches(written: &str, facts: &GitFacts) -> bool {
+    if written.starts_with("refs/") { return written == facts.reference; }
+    if matches!(written.len(), 40 | 64) && written.bytes().all(|b| b.is_ascii_hexdigit()) { return false; }
     ["refs/heads/", "refs/tags/"].iter().any(|prefix| facts.reference.strip_prefix(*prefix).is_some_and(|name| !name.is_empty() && (written == facts.reference || written == name)))
         || (written == "HEAD" && facts.requested_ref == "HEAD" && facts.reference.strip_prefix("refs/heads/").is_some_and(|b| !b.is_empty()))
 }

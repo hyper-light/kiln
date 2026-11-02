@@ -59,6 +59,7 @@ struct Entry { pin: Dependency, source: String }
 
 fn git_ref_equal(a: &str, b: &str) -> bool {
     a == b || ["refs/heads/", "refs/tags/"].iter().any(|p| a.strip_prefix(p) == Some(b) || b.strip_prefix(p) == Some(a))
+        || a == "HEAD" && b.starts_with("refs/heads/") || b == "HEAD" && a.starts_with("refs/heads/")
 }
 
 fn same_pin(a: &Dependency, b: &Dependency, home: &str) -> bool {

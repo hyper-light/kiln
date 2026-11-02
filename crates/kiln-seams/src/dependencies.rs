@@ -346,11 +346,13 @@ impl DependencySources for SimDependencySources {
             if r.denied { return Err(Refusal::Denied); }
             if r.online { r.cached = Some((r.source.identity.clone(), r.source.refs.clone())); }
             let (identity, refs) = r.cached.as_ref().ok_or(Refusal::Unavailable("mirror"))?;
-            let resolved = if reference == "HEAD" { vec![format!("refs/heads/{}", r.source.default_branch)] }
+            let raw = commit_valid(&reference);
+            let resolved = if raw { Vec::new() }
+                else if reference == "HEAD" { vec![format!("refs/heads/{}", r.source.default_branch)] }
                 else if reference.starts_with("refs/") { vec![reference.clone()] }
                 else { vec![format!("refs/tags/{reference}"), format!("refs/heads/{reference}")] };
             let found = resolved.into_iter().find_map(|name| refs.get(&name).map(|c| (name, c.clone())));
-            let (full, commit) = found.or_else(|| (commit_valid(&reference) && r.source.commits.contains_key(&reference)).then(|| (reference.clone(), reference.to_ascii_lowercase())))
+            let (full, commit) = found.or_else(|| (raw && r.source.commits.contains_key(&reference.to_ascii_lowercase())).then(|| (reference.to_ascii_lowercase(), reference.to_ascii_lowercase())))
                 .ok_or(if r.online { Refusal::Missing("ref") } else { Refusal::Unavailable("uncached ref") })?;
             Ok(Revision { repository: repository.canonical(), identity: identity.clone(), requested: reference, reference: full, commit, fresh: r.online })
         })
