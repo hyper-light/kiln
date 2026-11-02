@@ -78,6 +78,13 @@ impl Cluster {
         anyhow::ensure!(context != "kiln", "context `kiln` is production's cluster: name a test cluster's");
         let c = Self { kubeconfig, context, namespace: format!("kiln-custody-{}", std::process::id()) };
         c.kubectl(&["create", "namespace", &c.namespace])?;
+        // Its default service account comes from the cluster's controllers a while after, longer on
+        // a cluster just started: a pod applied before it is refused.
+        let deadline = Instant::now() + Duration::from_secs(120);
+        while c.kubectl(&["get", "serviceaccount", "default", "-n", &c.namespace]).is_err() {
+            anyhow::ensure!(Instant::now() < deadline, "namespace {}'s default service account never came", c.namespace);
+            std::thread::sleep(Duration::from_millis(500));
+        }
         Ok(c)
     }
 
