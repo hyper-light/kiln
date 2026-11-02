@@ -1789,6 +1789,46 @@
   gap: 4px 14px;
   padding: 8px 8px 4px;
 }
+/* W29-R08, pl-6: file tabs keep the files' spelling. */
+.ppl-files button {
+  text-transform: none;
+  letter-spacing: normal;
+}
+.ppl-dialect {
+  padding: 5px 12px 7px 28px;
+}
+/* W29-R06, pl-8: an option is a line, with the YAML underneath it. */
+.ppl-option {
+  all: unset;
+  box-sizing: border-box;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  width: 100%;
+  cursor: pointer;
+}
+.ppl-option:focus-visible {
+  outline: 2px solid #a6c4ed;
+  outline-offset: 2px;
+}
+.ppl-options .n b,
+.ppl-detail > .ppl-lines .n b {
+  color: #e4e5e7;
+  font-weight: 400;
+}
+.ppl-options .ppl-option .n {
+  flex: 1;
+  min-width: 0;
+}
+.ppl-options .n,
+.ppl-new .ppl-detail > .ppl-lines .n {
+  white-space: normal;
+  overflow-wrap: anywhere;
+}
+.ppl-options .v,
+.ppl-option > svg {
+  flex: none;
+}
 /* What changed (pl-5, pl-7): commits since a release by their short hashes; a draft's lines against what's published, taken out struck through. */
 .ppl-sha {
   flex: none;

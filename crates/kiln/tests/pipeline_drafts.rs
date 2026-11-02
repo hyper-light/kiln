@@ -681,6 +681,11 @@ fn w29_r08_new_makes_a_draft() -> anyhow::Result<()> {
     let (st, dry) = act(&s, &json!({ "repo": "acme/app", "verb": "new", "kind": "firecracker", "name": "fuzz-target", "dry": true }))?;
     assert_eq!(st, 200, "{dry}");
     assert_eq!(paths(&dry), [".github/actions/fuzz-target/action.yml", ".github/actions/fuzz-target/Dockerfile", ".github/actions/fuzz-target/run.sh"]);
+    // W29-R08, pl-6: New's machines are the connected runners' facts; its draft is not allocated by a preview.
+    assert!(dry.pointer("/machines/firecracker").is_some_and(Value::is_array), "{dry}");
+    assert_eq!(dry.pointer("/machines/shards"), Some(&json!([])), "{dry}");
+    assert_eq!(at(&dry, "/next_version"), "v0.1.0", "no previous release: {dry}");
+    assert_eq!(at(&dry, "/draft_name"), "D1", "{dry}");
     assert!(get(&s, "/api/repos/acme%2Fapp/diffs")?.to_string().matches("\"name\":\"D").count() == 0, "a dry run saves nothing");
     // Saved as edited: one draft diff of the three.
     let mut files = dry.get("files").cloned().unwrap_or_default();

@@ -309,6 +309,15 @@ export interface ShipPipelinePane {
  * own operation and with its right. Save draft takes `content` and `title`; Run takes `event` (a
  * draft's), `jobs`, `inputs`, and a published workflow's `ref` or `sha`.
  */
+/** New's preview (W29-R08): files, connected machines' executor facts, and what publishing it would use. A host's draft number is unknown until it opens it. */
+export interface ShipPipelineNew {
+  path: string;
+  files: { path: string; text: string }[];
+  machines?: { firecracker: string[]; shards: string[] };
+  next_version?: string | null;
+  draft_name?: string | null;
+}
+
 export interface ShipPipelineAct {
   repo: string;
   path: string;

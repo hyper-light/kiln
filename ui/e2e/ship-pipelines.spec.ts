@@ -425,9 +425,13 @@ test("Add a trigger: 18 kinds in six groups, shown by whose; picking one adds it
   await expect(times.locator("li")).toHaveCount(3);
   await expect(times.locator("li").first()).toContainText(/03:00 P[SD]T · 1[01]:00 UTC/);
   const options = pane.getByLabel("0 3 * * *'s options");
-  await expect(options.locator('li[data-field="skip-if-unchanged"] [role=switch]')).toHaveAttribute("aria-checked", "true");
-  await options.locator('li[data-field="catch-up"] [role=switch]').click();
-  await expect(pane.getByLabel("0 3 * * *'s options").locator('li[data-field="catch-up"] [role=switch]')).toHaveAttribute("aria-checked", "true");
+  await expect(options.locator(".v")).toHaveText(["kiln", "kiln", "kiln", "kiln", "kiln"]);
+  await expect(options.locator("input, [role=switch]")).toHaveCount(0);
+  await expect(options.getByRole("button", { name: "Skip if unchanged", exact: true })).toHaveAttribute("aria-pressed", "true");
+  await options.getByRole("button", { name: "Catch up", exact: true }).click();
+  await expect(pane.getByLabel("0 3 * * *'s options").getByRole("button", { name: "Catch up", exact: true })).toHaveAttribute("aria-pressed", "true");
+  await expect(pane.locator(".ppl-times .cm-content")).toContainText("catch-up: true");
+  await expect(pane.locator(".ppl-times .cm-line.cm-picked").first()).toContainText("schedule:");
   await expect(page.locator(".cm-tooltip, [role=dialog]")).toHaveCount(0);
   expect(await sideways(page)).toBe(0);
 });
@@ -467,9 +471,12 @@ test("a GitHub workflow keeps working on GitHub: a schedule goes in its YAML, ki
   await expect(pane.locator(".jp-q")).toHaveText(/plan for:\s*push to main\s*·\s*pull request\s*·\s*schedule\s*·\s*diff/);
   // The schedule's zone is kiln's key: it goes in the overlay, on the entry with its cron.
   await pane.locator('.jp-j[data-key="on.schedule"] .jp-line').click();
-  const zone = pane.getByLabel("0 3 * * *'s options").locator('li[data-field="timezone"] input');
-  await zone.fill("America/Los_Angeles");
-  await zone.press("Enter");
+  // The zone is written in the YAML below its read-only options, in the overlay.
+  const cron = pane.locator(".ppl-times .cm-line").filter({ hasText: "cron:" }).first();
+  await cron.click();
+  await page.keyboard.press("End");
+  await page.keyboard.insertText("\n      timezone: America/Los_Angeles");
+  await expect(pane.getByLabel("0 3 * * *'s options").locator('li[data-field="timezone"]')).toContainText("America/Los_Angeles");
   await expect(pane.getByLabel("0 3 * * *'s next runs").locator("li").first()).toContainText(/03:00 P[SD]T · 1[01]:00 UTC/);
   // Saved: the workflow with its schedule and nothing of kiln's; its overlay beside it.
   await pane.locator(".ppl-verbs button", { hasText: "Save draft" }).click();
@@ -519,17 +526,27 @@ test("New: seven kinds, the dialect a workflow's, where it starts; the files it 
   const pane = row.getByRole("region", { name: "New" });
   await expect(pane.locator('.jp-j[data-key^="make."]')).toHaveCount(7);
   await expect(pane.locator('.jp-j[data-key="lang.ts"]')).toHaveAttribute("data-dim", "true");
+  await expect(pane.locator('.jp-j[data-key^="lang."] .n')).toHaveText(["YAML", "TypeScript"]);
+  const shards = pane.locator('.jp-j[data-key="make.shards"]');
+  await expect(shards).toHaveAttribute("data-dim", "true");
+  await expect(shards).toContainText("no machine runs shards yet");
+  await shards.locator(".jp-line").click({ force: true });
+  await expect(pane.locator(".jp-said")).toHaveText("no machine runs shards yet");
   // A Firecracker action: its three files, its path under its name.
   await pane.locator('.jp-j[data-key="make.firecracker"] .jp-line').click();
   await expect(pane.locator(".jp-said")).toContainText("Firecracker action");
+  await expect(pane.locator(".jp-said")).toContainText("runs on machines with KVM: fedora, adacachy");
   const tabs = pane.getByRole("tablist", { name: "Its files" }).getByRole("tab");
   await expect(tabs).toHaveText(["action.yml", "Dockerfile", "run.sh"]);
   const name = pane.getByLabel("Name", { exact: true });
   await name.fill("fuzz-more");
   await name.press("Enter");
-  await expect(pane.locator('li[data-field="path"] .v')).toHaveText(".github/actions/fuzz-more/action.yml");
+  await expect(pane.locator('li[data-field="path"] .v')).toHaveText(".github/actions/fuzz-more");
+  await expect(pane.locator(".ppl-detail")).toContainText("as #18 in ci-kit");
+  await expect(pane.locator(".ppl-detail")).toContainText("uses: hyper-light/ci-kit/.github/actions/fuzz-more@v2.5.0");
+  expect(await tabs.first().evaluate((el) => getComputedStyle(el).textTransform)).toBe("none");
   // A dialect is a workflow's: dimmed for an action, saying why.
-  await pane.locator('.jp-j[data-key="lang.kiln"] .jp-line').click({ force: true });
+  await pane.locator('.jp-j[data-key="lang.yaml"] .jp-line').click({ force: true });
   await expect(pane.locator(".jp-said")).toContainText("An action is its action.yml");
   // run.sh edited where it's shown, then saved with the rest.
   await pane.getByRole("tablist", { name: "Its files" }).getByRole("tab", { name: "run.sh" }).click();
@@ -548,7 +565,7 @@ test("New: seven kinds, the dialect a workflow's, where it starts; the files it 
   await expect(made.locator(".ppl-draft")).toHaveText("DRAFT");
   // A workflow in kiln's dialect: its path under .kiln/.
   await pane.locator('.jp-j[data-key="make.workflow"] .jp-line').click();
-  await pane.locator('.jp-j[data-key="lang.kiln"] .jp-line').click();
+  await pane.getByLabel("YAML dialect").getByRole("button", { name: "kiln's", exact: true }).click();
   await expect(pane.locator('li[data-field="path"] .v')).toHaveText(".kiln/new-workflow.yaml");
   await expect(page.locator("[role=dialog], .cm-tooltip")).toHaveCount(0);
   expect(await sideways(page)).toBe(0);

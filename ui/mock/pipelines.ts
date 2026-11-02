@@ -996,7 +996,8 @@ export async function handlePipelines(req: http.IncomingMessage, res: http.Serve
     if (body.verb === "new") {
       const made = scaffoldOf(body);
       if (body.dry === true) {
-        ctx.json(res, 200, made);
+        // W29-R08, pl-6: a preview from the same facts as the server's, without making a draft.
+        ctx.json(res, 200, { ...made, machines: { firecracker: ["fedora", "adacachy"], shards: [] }, next_version: "v2.5.0", draft_name: `#${18 + (madeBy.get(ua)?.length ?? 0)}` });
         return true;
       }
       bodiesOf(ua).push(body);

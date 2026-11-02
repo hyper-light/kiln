@@ -11,7 +11,17 @@ import * as React from "react";
 import { ChevronDown, FileText, Minus, Plus, Tag } from "lucide-react";
 import { ci, type CiDiagnostic, type CiPreview, type CiSchedule } from "@/api/ci";
 import { ApiError } from "@/api/client";
-import { shipApi, type ShipPipelineAct, type ShipPipelineGroup, type ShipPipelineLine, type ShipPipelinePane, type ShipPipelineRepo, type ShipPipelineRow, type ShipPipelineVerb } from "@/api/ship";
+import {
+  shipApi,
+  type ShipPipelineAct,
+  type ShipPipelineGroup,
+  type ShipPipelineLine,
+  type ShipPipelineNew,
+  type ShipPipelinePane,
+  type ShipPipelineRepo,
+  type ShipPipelineRow,
+  type ShipPipelineVerb,
+} from "@/api/ship";
 import type { Diagnostic } from "@/components/code/editor";
 import { Toks } from "@/components/code/highlighted";
 import { FacetBox, type Chosen } from "@/components/ui/facet-box";
@@ -428,11 +438,17 @@ function NewBody({
   copyOf: string | null;
   acts: NewActs;
 }) {
-  const dry = useSuspenseResource(`ship/pipelines/new/${askKey}`, () => shipApi.pipelinesAct({ ...ask, dry: true }) as Promise<{ path: string; files: { path: string; text: string }[] }>).data;
+  const dry = useSuspenseResource(`ship/pipelines/new/${askKey}`, () => shipApi.pipelinesAct({ ...ask, dry: true }) as Promise<ShipPipelineNew>).data;
   const [file, setFile] = React.useState(0);
   const phone = useMediaQuery("(max-width: 700px)");
   const files = dry.files;
   const shown = files[Math.min(file, files.length - 1)];
+  // W29-R08, pl-6: what connected machines run, from their facts, never their names.
+  const whyKind = (m: Make) =>
+    (m.kind === "shards" || m.kind === "firecracker") && dry.machines?.[m.kind].length === 0 ? `no machine runs ${m.kind === "shards" ? "shards" : "Firecracker"} yet` : null;
+  const machines = make.kind === "firecracker" || make.kind === "shards" ? dry.machines?.[make.kind] : null;
+  const own = String(ask.repo).split("/").pop() ?? String(ask.repo);
+  const actionPath = dry.path.replace(/\/action\.ya?ml$/, "");
   // A file's tab: its path in the action's folder, or a workflow's own name.
   const folder = action ? dry.path.replace(/[^/]+$/, "") : "";
   const tab = (path: string) => (action ? path.slice(folder.length) : (path.split("/").pop() ?? path));
@@ -456,7 +472,7 @@ function NewBody({
         </li>
         <li data-field="path">
           <span className="n">Path</span>
-          <span className="v">{dry.path}</span>
+          <span className="v">{action ? actionPath : dry.path}</span>
         </li>
       </ul>
       <span className="dp-w ppl-views ppl-files" role="tablist" aria-label="Its files">
@@ -485,11 +501,37 @@ function NewBody({
       <ul className="ppl-lines">
         <li>
           <StatusGlyph state="draft" size={12} />
-          <span className="n">Create draft keeps it unpublished on its own branch: no trigger runs it and nobody can use it</span>
+          <span className="n">
+            Create draft keeps it unpublished on its own branch
+            {dry.draft_name ? (
+              <>
+                , as <b>{dry.draft_name}</b> in {own}
+              </>
+            ) : (
+              <> in {own}</>
+            )}
+            : no trigger runs it and nobody can use it
+          </span>
         </li>
         <li>
           <StatusGlyph state="tag" size={12} />
-          <span className="n">{action ? `others use it once a tag has it: uses: ${String(ask.repo)}/${dry.path.replace(/\/action\.ya?ml$/, "")}@<tag>` : "it runs on its triggers once it lands"}</span>
+          <span className="n">
+            {action ? (
+              <>
+                others use it once a tag has it
+                {dry.next_version ? (
+                  <>
+                    :{" "}
+                    <b>
+                      uses: {String(ask.repo)}/{actionPath}@{dry.next_version}
+                    </b>
+                  </>
+                ) : null}
+              </>
+            ) : (
+              "it runs on its triggers once it lands"
+            )}
+          </span>
         </li>
       </ul>
     </div>
@@ -503,7 +545,13 @@ function NewBody({
               said.text
             ) : (
               <>
-                <b>{make.label}</b> · {make.strip}
+                <b>{make.label}</b> · {make.strip.replace(/, on machines with KVM$/, "")}
+                {machines ? (
+                  <>
+                    {" "}
+                    · {make.kind === "firecracker" ? "runs on machines with KVM" : "runs on machines with shards"}: {machines.length ? <b>{machines.join(", ")}</b> : "none connected"}
+                  </>
+                ) : null}
               </>
             )}
           </div>
@@ -534,48 +582,70 @@ function NewBody({
             <span>Make</span>
             <span />
           </li>
-          {MAKE.map((m) => (
-            <li key={m.kind} className="jp-j" data-key={`make.${m.kind}`} data-sel={m === make || undefined} data-at={m === make || undefined}>
-              <span className="jp-glyph" aria-hidden="true">
-                <StatusGlyph state={m === make ? "passed" : "none"} size={12} />
-              </span>
-              <button type="button" className="jp-line" aria-current={m === make || undefined} onClick={() => acts.onKind(m.kind)}>
-                <span className="n">{m.label}</span>
-                <span className="v">{m.say}</span>
-              </button>
-            </li>
-          ))}
+          {MAKE.map((m) => {
+            const why = whyKind(m);
+            return (
+              <React.Fragment key={m.kind}>
+                <li className="jp-j" data-key={`make.${m.kind}`} data-sel={m === make || undefined} data-at={m === make || undefined} data-dim={Boolean(why) || undefined}>
+                  <span className="jp-glyph" aria-hidden="true">
+                    <StatusGlyph state={why ? "blocked" : m === make ? "passed" : "none"} size={12} />
+                  </span>
+                  <button
+                    type="button"
+                    className="jp-line"
+                    aria-current={m === make || undefined}
+                    aria-disabled={Boolean(why) || undefined}
+                    onClick={() => (why ? acts.onSay(why) : acts.onKind(m.kind))}
+                  >
+                    <span className="n">{m.label}</span>
+                    <span className="v">{why ?? m.say}</span>
+                  </button>
+                </li>
+                {phone && m === make ? <li className="jp-detail">{detail}</li> : null}
+              </React.Fragment>
+            );
+          })}
           <li className="jp-g">
             <span>Write it in</span>
-            <span>{action ? "an action is its action.yml" : "workflows"}</span>
+            <span>workflows</span>
           </li>
           {(
             [
-              ["gha", "YAML, GitHub's dialect", ".github/workflows/"],
-              ["kiln", "YAML, kiln's dialect", ".kiln/"],
-              ["ts", "TypeScript", "or Python, Go, Rust …: with code workflows (W29-R27)"],
+              ["yaml", "YAML", "GitHub's or kiln's dialect"],
+              ["ts", "TypeScript", "or Python, Go, Rust …"],
             ] as const
           ).map(([id, label, say]) => {
-            const on = !action && (id === "kiln") === acts.kiln && id !== "ts";
+            const on = !action && id === "yaml";
             const dim = action || id === "ts";
             return (
-              <li key={id} className="jp-j" data-key={`lang.${id}`} data-sel={on || undefined} data-dim={dim || undefined}>
-                <span className="jp-glyph" aria-hidden="true">
-                  <StatusGlyph state={on ? "passed" : "none"} size={12} />
-                </span>
-                <button
-                  type="button"
-                  className="jp-line"
-                  aria-disabled={dim || undefined}
-                  onClick={() => (dim ? acts.onSay(action ? "An action is its action.yml: a dialect is a workflow's" : "Workflows in code come with W29-R27") : acts.onDialect(id === "kiln"))}
-                >
-                  <span className="n">{label}</span>
-                  <span className="v">{say}</span>
-                </button>
-              </li>
+              <React.Fragment key={id}>
+                <li className="jp-j" data-key={`lang.${id}`} data-sel={on || undefined} data-dim={dim || undefined}>
+                  <span className="jp-glyph" aria-hidden="true">
+                    <StatusGlyph state={on ? "passed" : "none"} size={12} />
+                  </span>
+                  <button
+                    type="button"
+                    className="jp-line"
+                    aria-disabled={dim || undefined}
+                    onClick={() => (dim ? acts.onSay(action ? "An action is its action.yml: a dialect is a workflow's" : "Workflows in code come with W29-R27") : undefined)}
+                  >
+                    <span className="n">{label}</span>
+                    <span className="v">{say}</span>
+                  </button>
+                </li>
+                {id === "yaml" && !action ? (
+                  <li className="jp-q ppl-dialect" aria-label="YAML dialect">
+                    <span>dialect:</span>
+                    {([false, true] as const).map((k) => (
+                      <button key={String(k)} type="button" aria-pressed={acts.kiln === k} onClick={() => acts.onDialect(k)}>
+                        {k ? "kiln's" : "GitHub's"}
+                      </button>
+                    ))}
+                  </li>
+                ) : null}
+              </React.Fragment>
             );
           })}
-          {phone ? <li className="jp-detail">{detail}</li> : null}
         </ol>
         {phone ? null : <div className="jp-side ppl-side">{detail}</div>}
       </div>
@@ -1139,18 +1209,22 @@ function PipelinePane({ repo, row, onChanged, onLine }: { repo: ShipPipelineRepo
   };
   // A trigger the overlay holds is edited there: its filters and its YAML are the overlay's, its plan the workflow's with it.
   const inOwn = line?.kind === "trigger" && ov !== null && inOverlay(eventKey(line));
+  // W29-R06: schedule options of a GitHub workflow always live in its overlay. Show its cron
+  // there as an editing starting point; merely opening this view saves and changes nothing.
+  const scheduleOwn = line?.key === "on.schedule" && ov !== null;
+  const ownText = scheduleOwn ? scheduleOverlay(overlay, h.path, text) : overlay;
   const own: OwnFile | null =
-    inOwn && ov
+    (inOwn || scheduleOwn) && ov
       ? {
           path: ov.path,
-          text: overlay,
+          text: ownText,
           onText: editOverlay,
           tools: {
             ...tools,
             kiln: true,
             change: (make) => {
               try {
-                editOverlay(make(overlay));
+                editOverlay(make(ownText));
               } catch (e) {
                 refusal(e);
               }
@@ -1307,6 +1381,17 @@ interface OwnFile {
   text: string;
   onText: (t: string) => void;
   tools: Tools;
+}
+
+/** A GitHub schedule's overlay editing text, with its cron present even before any kiln options are set (W29-R06). Pure: displaying it makes no edit. */
+function scheduleOverlay(overlay: string, path: string, text: string): string {
+  try {
+    const doc = parseYaml(text) as { on?: { schedule?: { cron?: unknown }[] } } | null;
+    const schedules = doc?.on?.schedule;
+    return Array.isArray(schedules) ? schedules.reduce((o, s) => (typeof s.cron === "string" ? setOverlayScheduleField(o, path, s.cron, "cron", s.cron) : o), overlay) : overlay;
+  } catch {
+    return overlay;
+  }
 }
 
 /** A workflow file's stem (`ci` of `.github/workflows/ci.yml`), as its overlay is named. */
@@ -1600,7 +1685,25 @@ function fromNow(at: number, tz: string | null): string {
 }
 
 /** A schedule's next runs, from W03's cron as the server reads them, and its options, each edited where it's shown (W29-R06, W03-R10). */
-function ScheduleTimes({ pane, text, ask, tools, editable }: { pane: ShipPipelinePane; text: string; ask: PlanAsk; tools: Tools; editable: boolean }) {
+function ScheduleTimes({
+  pane,
+  line,
+  text,
+  onText,
+  own,
+  ask,
+  tools,
+  editable,
+}: {
+  pane: ShipPipelinePane;
+  line: ShipPipelineLine;
+  text: string;
+  onText: (t: string) => void;
+  own: OwnFile | null;
+  ask: PlanAsk;
+  tools: Tools;
+  editable: boolean;
+}) {
   const overlay = ask.overlay?.trim() ? ask.overlay : null;
   const preview = useSuspenseResource(`ci/schedules/${pane.repo}/${pane.head.path}/${hashOf(text)}/${hashOf(overlay ?? "")}`, () =>
     ci.preview({ repo: pane.repo, path: pane.head.path, content: text, ...(overlay ? { overlay } : {}), event: "schedule" }),
@@ -1636,44 +1739,79 @@ function ScheduleTimes({ pane, text, ask, tools, editable }: { pane: ShipPipelin
             <span>Its options</span>
             <span />
           </div>
-          <ul className="ppl-lines ppl-fields" aria-label={`${s.cron}'s options`}>
+          {/* W29-R06, pl-8: options as sentences. Toggle the two booleans here; other values live in the YAML below. */}
+          <ul className="ppl-lines ppl-options" aria-label={`${s.cron}'s options`}>
             <li data-field="timezone">
+              <StatusGlyph state="passed" size={12} />
               <span className="n">
-                <b>Time zone</b> · a missing local time runs at the next minute, a repeated one once
+                <b>Time zone</b> {s.timezone ?? "UTC"}: a missing local time runs at the next minute, a repeated one once
               </span>
-              {editable ? <Field value={s.timezone ?? ""} label="Time zone" onSet={(v) => set(i, "timezone", v.trim() || null)} /> : <span className="v">{s.timezone ?? "UTC"}</span>}
+              <span className="v">kiln</span>
             </li>
             <li data-field="skip-if-unchanged">
-              <span className="n">
-                <b>Skip if unchanged</b> · no run when its branch hasn&apos;t moved since the last one passed
-              </span>
-              {editable ? <Switch on={s.skip_if_unchanged} label="Skip if unchanged" onSet={(v) => set(i, "skip-if-unchanged", v)} /> : <span className="v">{s.skip_if_unchanged ? "on" : "off"}</span>}
+              <button
+                type="button"
+                className="ppl-option"
+                aria-label="Skip if unchanged"
+                aria-pressed={s.skip_if_unchanged}
+                aria-disabled={!editable || undefined}
+                onClick={() => (editable ? set(i, "skip-if-unchanged", !s.skip_if_unchanged) : undefined)}
+              >
+                <StatusGlyph state={s.skip_if_unchanged ? "passed" : "none"} size={12} />
+                <span className="n">
+                  <b>Skip if unchanged</b>: {s.skip_if_unchanged ? `no run when ${pane.head.ref} hasn't moved since the last one passed` : "off: run at every scheduled time"}
+                </span>
+                <span className="v">kiln</span>
+              </button>
             </li>
             <li data-field="catch-up">
-              <span className="n">
-                <b>Catch up</b> after downtime · off is GitHub&apos;s: missed times are dropped
-              </span>
-              {editable ? <Switch on={s.catch_up} label="Catch up" onSet={(v) => set(i, "catch-up", v)} /> : <span className="v">{s.catch_up ? "on" : "off"}</span>}
+              <button
+                type="button"
+                className="ppl-option"
+                aria-label="Catch up"
+                aria-pressed={s.catch_up}
+                aria-disabled={!editable || undefined}
+                onClick={() => (editable ? set(i, "catch-up", !s.catch_up) : undefined)}
+              >
+                <StatusGlyph state={s.catch_up ? "passed" : "none"} size={12} />
+                <span className="n">
+                  <b>Catch up</b> after downtime: {s.catch_up ? "on: run the latest missed time" : "off, as GitHub (missed times are dropped)"}
+                </span>
+                <span className="v">kiln</span>
+              </button>
             </li>
             <li data-field="jitter">
+              <StatusGlyph state={s.jitter ? "passed" : "none"} size={12} />
               <span className="n">
-                <b>Jitter</b> · a delay the same each time, so schedules spread out
+                <b>Jitter</b>: {s.jitter ?? "off"}
               </span>
-              {editable ? <Field value={s.jitter ?? ""} label="Jitter" onSet={(v) => set(i, "jitter", v.trim() || null)} /> : <span className="v">{s.jitter ?? "off"}</span>}
+              <span className="v">kiln</span>
             </li>
             <li data-field="inputs">
+              <StatusGlyph state={Object.keys(s.inputs).length ? "passed" : "none"} size={12} />
               <span className="n">
-                <b>Inputs</b> · what a scheduled run is given
-              </span>
-              <span className="v">
+                <b>Inputs</b>:{" "}
                 {Object.entries(s.inputs)
                   .map(([k, v]) => `${k} = ${String(v)}`)
                   .join(", ") || "none"}
               </span>
+              <span className="v">kiln</span>
             </li>
           </ul>
         </React.Fragment>
       ))}
+      {editable ? (
+        <CodeEditor
+          value={own?.text ?? text}
+          onChange={own?.onText ?? onText}
+          label={`${own?.path ?? pane.head.path}, schedule options in YAML`}
+          syntax="workflow"
+          inline
+          tint={spotOf(own?.text ?? text, line)}
+        />
+      ) : (
+        <CodeView text={own?.text ?? text} path={own?.path ?? pane.head.path} spot={spotOf(own?.text ?? text, line)} rows={SIDE_ROWS} />
+      )}
     </div>
   );
 }
@@ -1840,7 +1978,7 @@ function View({
     case "Add a trigger":
       return <AddTrigger pane={pane} tools={tools} />;
     case "Times":
-      return line ? <ScheduleTimes pane={pane} text={text} ask={ask} tools={tools} editable={editable} /> : null;
+      return line ? <ScheduleTimes pane={pane} line={line} text={text} onText={onText} own={own} ask={ask} tools={tools} editable={editable} /> : null;
     case "Filters":
       if (editable && line) return <TriggerFilters text={own?.text ?? text} line={line} tools={own?.tools ?? tools} />;
       return (

@@ -570,7 +570,27 @@ pub async fn new_draft(hub: &Arc<Hub>, caller: &Caller, repo_key: &str, body: &V
         files = out;
     }
     if body.get("dry").and_then(Value::as_bool) == Some(true) {
-        return Ok(json!({ "path": main, "files": files }));
+        // W29-R08, pl-6: New says which connected machines run each microVM kind, and the next
+        // version that could publish a new action. A host assigns its draft's number when it
+        // opens it; only kiln's own next diff number can be read without making a draft.
+        let machines = {
+            let agents = hub.agents.lock();
+            let names = |executor: &str| {
+                let mut names: Vec<String> = agents.values().filter(|a| a.connected && a.facts.as_deref().is_some_and(|f| kiln_ci::sched::routing::has_executor(f, executor))).map(|a| a.name.clone()).collect();
+                names.sort();
+                names
+            };
+            json!({ "firecracker": names("firecracker"), "shards": names("shards") })
+        };
+        let tags = crate::gitops::run_git(hub, &["-C", &d, "for-each-ref", "--format=%(refname:strip=2)", "refs/tags"], crate::gitops::LS_REMOTE_TIMEOUT).await.map(|o| String::from_utf8_lossy(&o).into_owned()).unwrap_or_default();
+        let added = kiln_ci::wf::diff::Change { kind: "action", name: name.to_owned(), what: "added", detail: None };
+        let next_version = kiln_ci::releases::next_versions(kiln_ci::pipelines::newest_release(tags.lines()), &[added]).into_iter().next();
+        let draft_name = if repo.mode == "native" {
+            hub.store.call(|c| c.query_row("SELECT COALESCE(MAX(number), 0) + 1 FROM diffs", [], |r| r.get::<_, i64>(0)).map(|n| Some(format!("D{n}"))).map_err(Into::into)).await.map_err(|e| internal(&e))?
+        } else {
+            None
+        };
+        return Ok(json!({ "path": main, "files": files, "machines": machines, "next_version": next_version, "draft_name": draft_name }));
     }
     if load::blob(hub, &repo, &tip, &main).await.is_ok() {
         return Err((StatusCode::CONFLICT, format!("{} has {main} on {default} already: open it in Pipelines to change it", repo.name)));
