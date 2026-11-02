@@ -1537,6 +1537,8 @@ async fn control_counted(hub: &Hub, agent: &str, action: Action, by: &By, pausin
     for _ in 0..skipped {
         metrics.goal_ended(false);
     }
+    // A plan approved or the goals resumed: Needs you goes now (paused for a person, it comes now).
+    say_held(hub).await;
     // You started or resumed it, skipped its goal or brought its goals back: what's next goes to
     // the agent now, whatever it's doing (behind a turn under way, by its harness's queue).
     if running && matches!(action, Action::Start | Action::Skip | Action::Restore) && !running_already {
@@ -1935,8 +1937,12 @@ where
                 // Subagents given the rest of their agent's settings once their harness lists them.
                 crate::harness::lineage::settle_settings(hub).await;
                 // What agents' goals wait on a person for, on their info: Mission Control's Needs
-                // you, and a card wherever you are in kiln.
-                hub.harness.set_held(hub, &held_stacks(self.store).await);
+                // you, and a card wherever you are in kiln (said at once too, as each change makes
+                // it: `say_held`).
+                {
+                    let _one = CHANGING.lock().await;
+                    say_held(hub).await;
+                }
                 // The plans agents proposed (plan mode) since the last look, kept as kiln's plans:
                 // one an agent, a version each time it proposes another.
                 for (agent, words) in hub.harness.take_proposed() {
@@ -2453,6 +2459,8 @@ pub async fn answer_plan(hub: &Hub, agent: &str, goal: &str, plan: &crate::plans
         if reject {
             crate::metrics::agents().goal_ended(false);
         }
+        // Answered, it waits on them no longer: Needs you goes now.
+        say_held(hub).await;
     }
     let Some(text) = part else { return get(hub, agent).await };
     add_at(hub, agent, vec![NewGoal { id: made, text, part_of: Some(goal.to_owned()), kind: Some("planning"), ..NewGoal::default() }], false, &At::Before(goal.to_owned())).await?;
@@ -2588,6 +2596,15 @@ pub async fn held_stacks(store: &crate::store::Store) -> HashMap<String, Held> {
         })
         .await
         .unwrap_or_default()
+}
+
+/// What agents' goals wait on a person for, on their info now ([`held_stacks`]): each tick of the
+/// driver says it, and so does each change to a stack's hold as it's made (a plan approved, goals
+/// resumed, or paused for a person), so Needs you goes the moment it's answered rather than a
+/// round of the driver later. With the stacks held (`CHANGING`), so a read from before a change
+/// can't put back what it let go.
+async fn say_held(hub: &Hub) {
+    hub.harness.set_held(hub, &held_stacks(&hub.store).await);
 }
 
 async fn paused_for_usage(store: &crate::store::Store) -> Vec<String> {
@@ -4640,39 +4657,41 @@ mod stack_tests {
     }
 
     /// What waits on a person: a pause its agent made with no time to resume, or a plan an agent
-    /// wants looked at first; not yours, nor one for a while. On the agent's info while it waits
-    /// (as each tick of the driver puts it), gone once it's resumed.
+    /// wants looked at first; not yours, nor one for a while. On the agent's info as soon as it's
+    /// paused (and each tick of the driver says it again), gone as soon as it's resumed: no tick
+    /// of the driver here.
     #[test]
     fn goals_an_agent_pauses_for_you_are_on_its_info_until_resumed() -> anyhow::Result<()> {
         within(async {
             let (hub, id, _folder) = agent_with_goals(&["tests pass", "ship it"]).await?;
             let id = id.as_str();
             settled(&hub, id).await;
-            let tick = async || {
-                hub.harness.set_held(&hub, &held_stacks(&hub.store).await);
-                hub.harness.info(id).and_then(|i| i.held)
-            };
+            let held = || hub.harness.info(id).and_then(|i| i.held);
             // For a while: it resumes by itself.
             let later = hub.clock.unix_ms() + 600_000;
             let s = control_as(&hub, id, Action::Pause, &By::Itself, Pausing { why: Some("waiting for CI".into()), until: Some(later), review: None }).await?;
             assert_eq!((s.state.as_str(), s.held_for), ("paused", None));
-            assert_eq!(tick().await, None);
+            assert_eq!(held(), None);
             // Until someone resumes it: it waits on you, saying why.
             let s = control_as(&hub, id, Action::Pause, &By::Itself, Pausing { why: Some("I need the staging password".into()), until: None, review: None }).await?;
             assert_eq!(s.held_for.as_deref(), Some(""));
-            let held = tick().await;
-            assert!(held.as_ref().is_some_and(|h| h.why == "Paused by the agent: I need the staging password" && h.plan.is_none() && h.since > 0), "{held:?}");
+            let now = held();
+            assert!(now.as_ref().is_some_and(|h| h.why == "Paused by the agent: I need the staging password" && h.plan.is_none() && h.since > 0), "{now:?}");
             // Resumed: nothing waits.
             let s: Stack = control(&hub, id, serde_json::from_value(serde_json::json!("resume"))?).await?;
             assert_eq!((s.state.as_str(), s.held_for), ("running", None));
-            assert_eq!(tick().await, None);
+            assert_eq!(held(), None);
             // Yours doesn't wait on you.
             let s = control_as(&hub, id, Action::Pause, &By::You, Pausing::default()).await?;
             assert_eq!((s.state.as_str(), s.held_for), ("paused", None));
+            assert_eq!(held(), None);
             // A plan to look at first: its id, whichever agent asked.
             let s = control_as(&hub, id, Action::Pause, &By::Agent("Release prep".into()), Pausing { why: Some("plan ready".into()), until: None, review: Some("pl_1".into()) }).await?;
             assert_eq!(s.held_for.as_deref(), Some("pl_1"));
-            assert_eq!(tick().await.and_then(|h| h.plan).as_deref(), Some("pl_1"));
+            assert_eq!(held().and_then(|h| h.plan).as_deref(), Some("pl_1"));
+            // As each tick of the driver says it, the same.
+            hub.harness.set_held(&hub, &held_stacks(&hub.store).await);
+            assert_eq!(held().and_then(|h| h.plan).as_deref(), Some("pl_1"));
             Ok(())
         })
     }
@@ -5025,7 +5044,8 @@ mod stack_tests {
     /// a part asks the agent to change it, and said ready again, whatever `then` the agent gives,
     /// it's held for their review once more, a version on. Asked again under its key nothing more
     /// happens; an agent can't answer; a version that changed since, or a plan nothing waits on, is
-    /// refused.
+    /// refused. Needs you (the plan on its agent's info) comes as it's held and goes as it's
+    /// answered, with no tick of the driver.
     #[test]
     fn a_plan_held_for_review_is_approved_rejected_or_sent_back() -> anyhow::Result<()> {
         within(async {
@@ -5038,10 +5058,12 @@ mod stack_tests {
             let ids: Vec<String> = get(&hub, id).await?.items.iter().map(|i| i.id.clone()).collect();
             let goal = |k: usize| ids.get(k).cloned().unwrap_or_default();
             let parts = |s: &Stack, g: &str, kind: &str| s.items.iter().filter(|i| i.part_of.as_deref() == Some(g) && i.part_kind.as_deref() == Some(kind) && matches!(i.status.as_str(), "pending" | "active")).map(|i| i.text.clone()).collect::<Vec<_>>();
+            let needs = || hub.harness.info(id).and_then(|i| i.held);
 
             // Approved: its steps go; asked again under its key, nothing more; asked anew, refused.
             let one = held_for_review(&hub, id, &goal(0), &["a", "b"]).await?;
             assert_eq!(get(&hub, id).await?.held_for.as_deref(), Some(one.as_str()));
+            assert_eq!(needs().and_then(|h| h.plan).as_deref(), Some(one.as_str()));
             let refused = crate::ops::call(itself.clone(), "plans.review", serde_json::json!({"id": one, "answer": "approve"})).await;
             assert!(matches!(&refused, Err((c, _)) if *c == http::StatusCode::FORBIDDEN), "an agent can't answer: {refused:?}");
             let stale = crate::ops::call(person.clone(), "plans.review", serde_json::json!({"id": one, "answer": "approve", "version": 99})).await;
@@ -5051,6 +5073,7 @@ mod stack_tests {
             let s = get(&hub, id).await?;
             assert_eq!((s.state.as_str(), s.held_for.as_deref()), ("running", None), "{:?}", words(&s));
             assert_eq!(parts(&s, &goal(0), "plan").len(), 2, "{:?}", words(&s));
+            assert_eq!(needs(), None, "approved, it needs you no longer");
             call_ok(crate::ops::call(person.clone(), "plans.review", serde_json::json!({"id": one, "answer": "approve", "key": "k1"})).await)?;
             let again = crate::ops::call(person.clone(), "plans.review", serde_json::json!({"id": one, "answer": "reject", "key": "k2"})).await;
             assert!(matches!(&again, Err((c, _)) if *c == http::StatusCode::CONFLICT), "nothing waits on it now: {again:?}");
@@ -5064,6 +5087,7 @@ mod stack_tests {
             let g = s.items.iter().find(|i| i.id == goal(1)).cloned().unwrap_or_default();
             assert!(g.status == "skipped" && g.reason.as_deref().is_some_and(|r| r.contains("rejected")), "{:?}", words(&s));
             assert!(s.state == "paused" && s.held_for.is_none() && s.reason.as_deref().is_some_and(|r| r.contains("rejected")), "{:?} {:?}", s.state, s.reason);
+            assert_eq!(needs(), None, "rejected, it needs you no longer");
 
             // Sent back with words: its steps come off, a part asks the agent to change it, the stack
             // runs; said ready again (as goals, it says), it's back for review, a version on.
@@ -5079,16 +5103,65 @@ mod stack_tests {
             let asks = parts(&s, &goal(2), "planning");
             assert!(asks.len() == 1 && asks.iter().all(|t| t.contains("f before e, please") && t.contains(&three)), "one part asks for the change, once: {asks:?}");
             assert_eq!((s.state.as_str(), s.held_for.as_deref()), ("running", None));
+            assert_eq!(needs(), None, "sent back, it needs you no longer");
             assert_eq!(crate::plans::get(&hub, &three).await?.phase, "planning");
             let items = ["f", "e"].iter().map(|t| crate::plans::Item { title: (*t).into(), basis: vec!["f1".into()], ..crate::plans::Item::default() }).collect();
             crate::plans::update(&hub, &three, crate::plans::Patch { items: Some(items), ..crate::plans::Patch::default() }, "admin").await?;
             call_ok(crate::ops::call(itself.clone(), "plans.ready", serde_json::json!({"id": three, "then": "goals"})).await)?;
             let s = get(&hub, id).await?;
             assert_eq!(s.held_for.as_deref(), Some(three.as_str()), "back for review: {:?}", words(&s));
+            assert_eq!(needs().and_then(|h| h.plan).as_deref(), Some(three.as_str()), "and it needs you again");
             let p = crate::plans::get(&hub, &three).await?;
             assert!(p.version > before, "a version on");
             assert_eq!(p.reviewed.map(|r| (r.answer, r.words, r.version)), Some((crate::plans::review::Answer::Revise, Some("f before e, please".to_owned()), before)));
             assert_eq!(s.items.iter().filter(|i| i.step.as_ref().is_some_and(|st| st.plan == three && st.version == p.version)).count(), 2, "{:?}", words(&s));
+            Ok(())
+        })
+    }
+
+    /// A plan held for a person's review, run (`plans.run`, its page's Run): a person's run approves
+    /// it, whichever way it was asked to run, and goes no other way: its steps go to the agent once,
+    /// as the goal's parts, nothing is sent or started beside them, and Needs you goes at once.
+    /// Asked again under its key, nothing more (not run, now nothing waits). An agent's run of it is
+    /// refused, and it still waits; once nothing waits on its review, it runs as asked.
+    #[test]
+    fn running_a_plan_held_for_review_approves_it() -> anyhow::Result<()> {
+        within(async {
+            let (hub, id, _folder) = agent_with_goals(&["one"]).await?;
+            let id = id.as_str();
+            let person = crate::ops::Cx { hub: Arc::clone(&hub), caller: crate::authz::Caller::owner() };
+            let mut me = crate::authz::Caller::owner();
+            me.agent = Some(id.to_owned());
+            let itself = crate::ops::Cx { hub: Arc::clone(&hub), caller: me };
+            let goal = get(&hub, id).await?.items.first().map(|i| i.id.clone()).unwrap_or_default();
+            let steps = |s: &Stack| s.items.iter().filter(|i| i.part_of.as_deref() == Some(goal.as_str()) && i.part_kind.as_deref() == Some("plan")).count();
+            let one = held_for_review(&hub, id, &goal, &["a", "b"]).await?;
+            assert_eq!(hub.harness.info(id).and_then(|i| i.held).and_then(|h| h.plan).as_deref(), Some(one.as_str()));
+            // Its runs so far (its steps lined up as the goal's parts as it was said ready).
+            let runs = crate::plans::get(&hub, &one).await?.runs;
+
+            let by_agent = crate::ops::call(itself.clone(), "plans.run", serde_json::json!({"id": one, "mode": "steps"})).await;
+            assert!(matches!(&by_agent, Err((c, _)) if *c == http::StatusCode::FORBIDDEN), "approving is a person's: {by_agent:?}");
+            assert_eq!(get(&hub, id).await?.held_for.as_deref(), Some(one.as_str()), "it still waits on you");
+
+            // As the plan's page runs it: one message, on its agent.
+            let ran = call_ok(crate::ops::call(person.clone(), "plans.run", serde_json::json!({"id": one, "session": id, "mode": "message", "key": "r1"})).await)?;
+            assert_eq!((at(&ran, &["session"]), ran.get("approved"), ran.get("sent")), (Some(id), Some(&serde_json::json!(true)), Some(&serde_json::json!(2))), "{ran}");
+            let s = get(&hub, id).await?;
+            assert_eq!((s.state.as_str(), s.held_for.as_deref(), steps(&s)), ("running", None, 2), "{:?}", words(&s));
+            assert_eq!(hub.harness.info(id).and_then(|i| i.held), None, "it needs you no longer");
+            let p = crate::plans::get(&hub, &one).await?;
+            assert_eq!((p.runs, p.reviewed.map(|r| r.answer)), (runs, Some(crate::plans::review::Answer::Approve)), "approved, not run");
+
+            // Asked again under its key: answered as things stand, not run now that nothing waits.
+            let again = call_ok(crate::ops::call(person.clone(), "plans.run", serde_json::json!({"id": one, "session": id, "mode": "message", "key": "r1"})).await)?;
+            assert_eq!(again.get("approved"), Some(&serde_json::json!(true)), "{again}");
+            assert_eq!((crate::plans::get(&hub, &one).await?.runs, steps(&get(&hub, id).await?)), (runs, 2));
+
+            // Under a key of its own, now that nothing waits on its review: it runs as asked.
+            let ran = call_ok(crate::ops::call(person.clone(), "plans.run", serde_json::json!({"id": one, "session": id, "mode": "message", "key": "r2"})).await)?;
+            assert_eq!((ran.get("approved"), ran.get("sent")), (None, Some(&serde_json::json!(1))), "{ran}");
+            assert_eq!(crate::plans::get(&hub, &one).await?.runs, runs + 1);
             Ok(())
         })
     }
