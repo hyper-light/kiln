@@ -34,6 +34,9 @@ pub struct Scope {
     pub commit: String,
     pub locked: bool,
     pub actions: Actions,
+    /// W29-R24: only the execution inputs each job needs, including its composite actions.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub execution: BTreeMap<String, kiln_ci::lock::execution::Locks>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -73,6 +76,11 @@ impl Frozen {
         self.scopes.get(&scope_key(&defined.workflow_repository, &defined.workflow_file_path, &defined.workflow_sha)).map(|s| &s.actions)
     }
 
+    pub fn execution_for(&self, defined: &kiln_ci::plan::DefinedIn, job: &str) -> Option<&kiln_ci::lock::execution::Locks> {
+        self.scopes.get(&scope_key(&defined.workflow_repository, &defined.workflow_file_path, &defined.workflow_sha))?
+            .execution.get(job.rsplit('/').next().unwrap_or(job).trim())
+    }
+
     pub fn workflow_for(&self, defined: &kiln_ci::plan::DefinedIn) -> Option<Arc<Workflow>> {
         self.files.values().find(|wf| {
             let (repo, sha) = wf.origin.as_ref().map(|o| (o.repository.as_str(), o.sha.as_str())).unwrap_or((&self.repository, &self.commit));
@@ -98,6 +106,10 @@ impl Frozen {
         for (key, scope) in &snapshot.scopes {
             if *key != scope_key(&scope.repository, &scope.path, &scope.commit) || !kiln_seams::dependencies::commit_valid(&scope.commit) || scope.actions.values().any(|a| a.error.is_none() && (!kiln_seams::dependencies::commit_valid(&a.sha) || !a.url.starts_with("/_kiln/actions/") || !a.url.contains(&format!("/{}.tar.gz", a.sha)))) {
                 return Err("the run's saved dependency snapshot contains an invalid source pin".into());
+            }
+            for (job, locks) in &scope.execution {
+                if job.is_empty() || job.contains('/') || job.chars().any(char::is_control) { return Err("the saved execution lock names an invalid job".into()); }
+                locks.validate()?;
             }
         }
         for wf in snapshot.files.values() {
@@ -183,6 +195,8 @@ struct Capture<'a> {
     bytes: usize,
     items: usize,
     warnings: BTreeSet<String>,
+    manifests: BTreeSet<String>,
+    archives: BTreeMap<kiln_seams::dependencies::Runtime, kiln_seams::dependencies::Archive>,
 }
 
 impl Capture<'_> {
@@ -337,11 +351,13 @@ impl Capture<'_> {
         Ok(None)
     }
 
-    async fn action_map(&mut self, workflow: &Workflow, lock: Option<&github::File>, native: &[native::Layer], home: &str) -> Result<Actions, String> {
+    async fn action_map(&mut self, workflow: &Workflow, lock: Option<&github::File>, native: &[native::Layer], home: &str) -> Result<(Actions, BTreeMap<String, kiln_ci::lock::execution::Locks>), String> {
         let locked = !native.is_empty() || lock.is_some_and(|f| f.workflows.contains_key(&workflow.path));
         let mut todo = Vec::new();
         for job in &workflow.jobs { step_uses(&job.steps, &mut todo, 0, None); }
         let mut out = Actions::new();
+        let mut assets = BTreeMap::new();
+        let mut children = BTreeMap::new();
         let mut seen = BTreeSet::new();
         let mut beneath = Vec::new();
         let mut docker = BTreeSet::new();
@@ -361,13 +377,18 @@ impl Capture<'_> {
             }
             let top = root.clone().unwrap_or_else(|| uses.clone());
             if uses.starts_with("docker://") {
-                self.allowed(&uses)?;
+                if native.is_empty() { self.allowed(&uses)?; }
                 docker.insert(top);
+                if !native.is_empty() {
+                    let mut locks = kiln_ci::lock::execution::Locks::default();
+                    self.image(&uses, native, &mut locks).await?;
+                    assets.insert(uses, locks);
+                }
                 continue;
             }
             if depth > 9 { return Err(format!("{uses}: composite actions nest at most 10 deep")); }
             let local = uses.strip_prefix("./").or_else(|| uses.strip_prefix("$/"));
-            let (mut resolved, text, strict) = if let Some(path) = local {
+            let (mut resolved, text, strict, location, base) = if let Some(path) = local {
                 if !path.is_empty() && !kiln_seams::dependencies::path_valid(path.trim_end_matches('/')) { return Err(format!("KCI1022 {uses}: action path must stay inside the repository")); }
                 let owner = Owner { repository: self.caller.name.clone(), commit: self.root_commit.to_owned(), remote: None, revision: None };
                 let base = path.trim_matches('/');
@@ -384,7 +405,7 @@ impl Capture<'_> {
                     repo: self.caller.name.clone(), sha: owner.commit.clone(), path: base.to_owned(),
                     url: format!("/_kiln/actions/{}/{}.tar.gz?path={}", self.caller.name, owner.commit, actions::encode_path(base)), ..ActionRef::default()
                 });
-                (resolved, text, false)
+                (resolved, text, !native.is_empty(), owner, base.to_owned())
             } else {
                 let Some(remote) = Remote::parse(&uses) else { continue };
                 let selected = self.select(&uses, &remote, &workflow.path, lock, native, home).await;
@@ -406,13 +427,18 @@ impl Capture<'_> {
                     Err(e) if strict => return Err(e),
                     Err(_) => None,
                 };
-                (Some(ActionRef { repo: effective.full(), sha: sha.clone(), path: effective.path.clone(), url: effective.url(&sha), ..ActionRef::default() }), text, strict)
+                let owner = Owner { repository: effective.full(), commit: sha.clone(), remote: Some(effective.clone()), revision };
+                (Some(ActionRef { repo: effective.full(), sha: sha.clone(), path: effective.path.clone(), url: effective.url(&sha), ..ActionRef::default() }), text, strict, owner, effective.path.clone())
             };
             let action = text.as_deref().map(wf::parse_action);
             if strict && action.as_ref().is_none_or(|(a, d)| a.is_none() || d.iter().any(|d| d.is_error())) {
                 return Err(format!("KCI4051 {uses}: locked action metadata is missing or invalid"));
             }
             if let Some((Some(action), _)) = action {
+                assets.insert(uses.clone(), self.action_execution(&uses, &action, &location, &base, native).await?);
+                let mut nested = Vec::new();
+                step_uses(&action.runs.steps, &mut nested, 0, None);
+                children.insert(uses.clone(), nested.into_iter().map(|(u, _, _)| u).collect());
                 if let Some(a) = &mut resolved { a.declares(&action); }
                 if action.runs.using == "docker" { docker.insert(top.clone()); }
                 if action.runs.using == "composite" { step_uses(&action.runs.steps, &mut todo, depth.saturating_add(1), Some(top)); }
@@ -421,7 +447,8 @@ impl Capture<'_> {
         }
         for root in docker { if let Some(a) = out.get_mut(&root) { a.docker = true; } }
         for (root, why) in beneath { if let Some(a) = out.get_mut(&root) && a.error.is_none() { a.error = Some(format!("an action it uses could not be resolved, {why}")); } }
-        Ok(out)
+        let execution = self.job_execution(workflow, native, &assets, &children).await?;
+        Ok((out, execution))
     }
 
     async fn called(&mut self, uses: &str, owner: &Owner, native: &[native::Layer], files: &mut Files) -> Result<(Arc<Workflow>, Owner), String> {
@@ -496,7 +523,7 @@ async fn prepare_with(hub: &Hub, source: &dyn DependencySources, caller: &Repo, 
     let mut capture = Capture {
         hub, caller, source, root_commit: commit, policies: actions::policies(hub, caller).await,
         revisions: BTreeMap::new(), legacy: BTreeMap::new(), origins: BTreeMap::new(), locks: BTreeMap::new(), native_locks: BTreeMap::new(), texts: BTreeMap::new(),
-        bytes: 0, items: 0, warnings: BTreeSet::new(),
+        bytes: 0, items: 0, warnings: BTreeSet::new(), manifests: BTreeSet::new(), archives: BTreeMap::new(),
     };
     let mut frozen = Frozen { version: 1, repository: caller.name.clone(), path: path.into(), commit: commit.into(), root_locked: false, scopes: BTreeMap::new(), files: Files::new(), warnings: Vec::new() };
     let mut todo = vec![Work { workflow, owner: Owner { repository: caller.name.clone(), commit: commit.into(), remote: None, revision: None }, depth: 0, native: Vec::new() }];
@@ -514,14 +541,14 @@ async fn prepare_with(hub: &Hub, source: &dyn DependencySources, caller: &Repo, 
         let locked = !native.is_empty() || lock.as_ref().is_some_and(|f| f.workflows.contains_key(&work.workflow.path));
         if work.depth == 0 { frozen.root_locked = locked; }
         let home = work.owner.home_host(hub, caller);
-        let actions = capture.action_map(&work.workflow, lock.as_deref(), &native, &home).await?;
+        let (actions, execution) = capture.action_map(&work.workflow, lock.as_deref(), &native, &home).await?;
         if let Some(before) = frozen.scopes.get(&key) {
             let pins = |actions: &Actions| actions.iter().map(|(k, a)| (k.clone(), a.sha.clone())).collect::<BTreeMap<_, _>>();
-            if serde_json::to_value(&before.actions).map_err(|_| "KCI1022 action snapshot cannot be encoded")? != serde_json::to_value(&actions).map_err(|_| "KCI1022 action snapshot cannot be encoded")? {
+            if before.execution != execution || serde_json::to_value(&before.actions).map_err(|_| "KCI1022 action snapshot cannot be encoded")? != serde_json::to_value(&actions).map_err(|_| "KCI1022 action snapshot cannot be encoded")? {
                 return Err(format!("KCI4054 {}: caller lock contexts select both {:?} and {:?}", work.workflow.path, pins(&before.actions), pins(&actions)));
             }
         }
-        frozen.scopes.insert(key, Scope { repository: work.owner.repository.clone(), path: work.workflow.path.clone(), commit: work.owner.commit.clone(), locked, actions });
+        frozen.scopes.insert(key, Scope { repository: work.owner.repository.clone(), path: work.workflow.path.clone(), commit: work.owner.commit.clone(), locked, actions, execution });
         for uses in work.workflow.jobs.iter().filter_map(|j| j.uses.as_ref()) {
             let (workflow, owner) = capture.called(uses, &work.owner, &native, &mut frozen.files).await?;
             todo.push(Work { workflow, owner, depth: work.depth.saturating_add(1), native: native.clone() });
@@ -592,3 +619,4 @@ pub async fn prepare_retry(hub: &Arc<Hub>, run: &str, fresh: bool) -> Result<Fro
 mod tests;
 
 mod native;
+mod execution;

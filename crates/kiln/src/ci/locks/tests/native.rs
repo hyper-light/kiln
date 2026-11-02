@@ -110,7 +110,8 @@ fn w29_r24_caller_pins_choose_the_publisher_tree_and_survive_dispatcher_recovery
         };
         assert_eq!((recovered.runs, recovered.legs), (1, 1));
         assert!(hub.ci.is_leg("native-lock-leaf"));
-        assert!(crate::ci::dispatch::stored_route(&hub, "native-lock-leaf").await?.is_some());
+        let route = crate::ci::dispatch::stored_route(&hub, "native-lock-leaf").await?.ok_or_else(|| anyhow::anyhow!("no restored route"))?;
+        assert_ne!(route.caps & crate::proto::CAP_DEPENDENCY_LOCKS, 0, "recovery retains the locked job's enforcement requirement");
         assert!(hub.store.run("native-lock-recovery".into()).await?.is_some_and(|r| r.error.is_none()));
         assert_eq!(reads.lock().len(), count);
         assert!(refresh_allowed(&hub, &caller.repo, &caller.commit, ROOT, None).await.is_err());

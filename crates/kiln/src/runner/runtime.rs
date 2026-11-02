@@ -30,6 +30,7 @@ use crate::store::Status;
 /// Step reuse (docs/ci.md W24-R07).
 mod binaries;
 mod memo;
+mod locks;
 
 /// One leg, run on this machine.
 #[derive(Clone)]
@@ -1335,6 +1336,7 @@ impl Leg {
     }
 
     async fn run_inner(&self, layout: Layout, warm: Option<Warmed>) -> anyhow::Result<Status> {
+        if let Some(locks) = &self.a.dependency_locks { locks.validate().map_err(anyhow::Error::msg)?; }
         let a = &self.a;
         let dialect = if a.dialect == "kiln" { Dialect::Kiln } else { Dialect::Gha };
         let (ws, temp, cmds) = (layout.workspace.clone(), layout.temp.clone(), layout.commands.clone());
@@ -2356,6 +2358,7 @@ impl Leg {
             Some(i) => i.clone(),
             None => st.render(&c.image, site, "image")?,
         };
+        let image = match &self.a.dependency_locks { Some(locks) => locks.image(&image)?, None => image };
         let credentials = match &c.credentials {
             Some((u, p)) => Some((st.render(u, creds, "credentials.username")?, st.render(p, creds, "credentials.password")?)),
             None => None,
@@ -2574,7 +2577,7 @@ impl Leg {
                 // So do the capabilities profilers run with, which a hosted runner's root has
                 // (CodSpeed's memtrack, W13-R04).
                 Some(super::docker::Spec {
-                    image: image.clone(),
+                    image: match &a.dependency_locks { Some(locks) => locks.image(image).map_err(anyhow::Error::msg)?, None => image.clone() },
                     user: super::docker::host_user(),
                     docker_socket: socket,
                     docker_proxy,
@@ -3670,6 +3673,7 @@ impl Leg {
     /// (`node20_alpine`): see [`musl_node`]. Asked for up to [`DOWNLOAD_TRIES`] times, each ask
     /// again said in step `idx`'s log.
     async fn node(&self, idx: u32, using: &str, musl: bool) -> anyhow::Result<PathBuf> {
+        if self.a.dependency_locks.is_some() { return self.locked_node(using, musl).await; }
         let major = if using == "node24" { 24 } else { 20 };
         let dir = self.work_dir.join("_externals").join(if musl { format!("node{major}_alpine") } else { format!("node{major}") });
         let bin = if cfg!(windows) { dir.join("node.exe") } else { dir.join("bin").join("node") };
@@ -4696,7 +4700,9 @@ impl Leg {
         if uses.starts_with("docker://") {
             let cli = self.cli(st).await?;
             let said = parking_lot::Mutex::new(Vec::<String>::new());
-            let image = super::docker::action_image(&cli, Path::new("."), uses, "", &|m: String| said.lock().push(m)).await?;
+            let locked = self.a.dependency_locks.as_ref().map(|locks| locks.image(uses)).transpose().map_err(anyhow::Error::msg)?;
+            let source = locked.as_ref().map(|image| format!("docker://{image}"));
+            let image = super::docker::action_image(&cli, Path::new("."), source.as_deref().unwrap_or(uses), "", &|m: String| said.lock().push(m)).await?;
             let lines = std::mem::take(&mut *said.lock());
             for line in lines {
                 self.log(idx, format!("{line}\r\n").into_bytes()).await;
@@ -4868,7 +4874,18 @@ impl Leg {
         let spec_image = action.runs.image.clone().ok_or_else(|| anyhow::anyhow!("`{uses}` has no `runs.image`"))?;
         let tag = format!("kiln-action/{}:{}", if loc.repo.is_empty() { "local".to_owned() } else { loc.repo.to_ascii_lowercase().replace('/', "-") }, crate::util::sha256_hex(loc.dir.to_string_lossy().as_bytes()).get(..12).unwrap_or("latest"));
         let said = parking_lot::Mutex::new(Vec::<String>::new());
-        let image = super::docker::action_image(&cli, &loc.dir, &spec_image, &tag, &|m: String| said.lock().push(m)).await;
+        let image = if let Some(locks) = &self.a.dependency_locks {
+            if spec_image.starts_with("docker://") {
+                let pinned = locks.image(&spec_image).map_err(anyhow::Error::msg)?;
+                cli.pull(&pinned, &|m: String| said.lock().push(m)).await
+            } else {
+                let (dockerfile, context, tag) = self.locked_dockerfile(uses, &loc.dir).await?;
+                said.lock().push(format!("{} build -t {tag} -f {} {} (locked image digests)", cli.bin, dockerfile.display(), context.display()));
+                // Always ask the builder. An image bearing a mutable local cache tag is no proof
+                // that it was built from these accepted bases; BuildKit's digest cache is.
+                cli.run(&["build".into(), "--quiet".into(), "--pull".into(), "-t".into(), tag.clone(), "-f".into(), dockerfile.to_string_lossy().into(), context.to_string_lossy().into()], &BTreeMap::new(), Duration::from_secs(1800)).await.map(|_| tag)
+            }
+        } else { super::docker::action_image(&cli, &loc.dir, &spec_image, &tag, &|m: String| said.lock().push(m)).await };
         let lines = std::mem::take(&mut *said.lock());
         for line in lines {
             self.log(idx, format!("{line}\r\n").into_bytes()).await;

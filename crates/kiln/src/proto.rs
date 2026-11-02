@@ -572,6 +572,10 @@ pub const CAP_WORKSPACE_COMPARE: u64 = 1 << 43;
 /// on their branches before the Changes tab took 42 and 43.
 pub const CAP_FREEZE: u64 = 1 << 53;
 
+/// W29-R24: verifies immutable runtime archives and enforces image and Dockerfile locks.
+/// Assignments carrying dependency_locks go only to runners announcing this bit.
+pub const CAP_DEPENDENCY_LOCKS: u64 = 1 << 54;
+
 /// See [`AgentMsg::Instance`].
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct InstanceHello {
@@ -1410,6 +1414,14 @@ mod tests {
         let older = CAP_WIRE | CAP_NET_DROPS | CAP_INBOX | CAP_HANDOVER | CAP_WORK | CAP_AGENT_LIMIT | CAP_IDENTITY | CAP_HEADROOM | CAP_CHANGES_PATCH | CAP_UNREAD | CAP_WORKSPACE_COMMITS | CAP_WORKSPACE_COMPARE;
         assert!(CAP_FREEZE.is_power_of_two() && CAP_FREEZE & older == 0 && CAP_FREEZE & u64::from(u32::MAX) == 0);
         Ok(())
+    }
+
+    #[test]
+    fn w29_r24_dependency_lock_capability_is_appended_without_reusing_any_bit() {
+        assert_eq!(CAP_DEPENDENCY_LOCKS, 1u64 << 54);
+        assert_eq!(CAP_DEPENDENCY_LOCKS & ((1u64 << 54) - 1), 0);
+        assert_eq!(CAP_FREEZE, 1u64 << 53);
+        assert_eq!(CAP_CUSTODY, 1u64 << 46);
     }
 
     /// A frame is read whole into its message, or said why not: a variant past the enum's is

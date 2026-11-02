@@ -113,6 +113,10 @@ pub struct AssignmentV2 {
     /// From an older server, neither: a leg like any other.
     pub exclusive: bool,
     pub holds: Option<crate::sched::state::Resources>,
+    /// W29-R24: exact image/runtime inputs selected before scheduling. A leg carrying these
+    /// requires the runner's dependency-lock capability; older assignments omit the field.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dependency_locks: Option<crate::lock::execution::Locks>,
 }
 
 /// A leg's warm workspace (W24-R11, R15), from its job's `work: { warm }`: the runner keeps it for
@@ -486,6 +490,17 @@ pub enum JobEventV2 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn w29_r24_execution_locks_are_optional_json_and_roundtrip_without_changing_old_assignments() -> Result<(), serde_json::Error> {
+        let old: AssignmentV2 = serde_json::from_str(r#"{"job_id":"old"}"#)?;
+        assert!(old.dependency_locks.is_none());
+        assert!(serde_json::to_value(&old)?.get("dependency_locks").is_none());
+        let new = AssignmentV2 { dependency_locks: Some(crate::lock::execution::Locks::default()), ..old };
+        let back: AssignmentV2 = serde_json::from_value(serde_json::to_value(&new)?)?;
+        assert_eq!(back.dependency_locks, new.dependency_locks);
+        Ok(())
+    }
 
     /// What an exclusive leg holds travels with it; from an older server, neither field is there,
     /// and the leg is like any other; to an older runner, they're keys it doesn't read.

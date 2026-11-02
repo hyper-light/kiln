@@ -469,10 +469,11 @@ pub async fn run(leg: Leg, ca: Option<Vec<u8>>) -> JobResult {
 async fn drive(leg: &Leg, ca: Option<Vec<u8>>) -> anyhow::Result<JobResult> {
     let a = &leg.a;
     let image = a.executor.image.clone().filter(|i| !i.trim().is_empty()).unwrap_or_else(|| crate::pipeline::toolchain_image(None).to_owned());
+    let image = match &a.dependency_locks { Some(locks) => { locks.validate().map_err(anyhow::Error::msg)?; locks.image(&image).map_err(anyhow::Error::msg)? }, None => image };
     // Its pool's microVM, booted before it came (W13-R09), when that's of its image.
     let warm = a.executor.slot.as_deref().and_then(|s| WARM.lock().remove(s));
     let warm = match warm {
-        Some(b) if b.image == image => Some(b),
+        Some(b) if b.image == image && a.dependency_locks.is_none() => Some(b),
         Some(b) => {
             crate::rt::spawn(b.discard());
             None
@@ -893,7 +894,7 @@ static WARM: std::sync::LazyLock<parking_lot::Mutex<HashMap<String, Booted>>> = 
 pub async fn start_warm(work: &Path, ask: &super::pool::Ask) -> anyhow::Result<()> {
     let m = crate::rt::blocking(Machine::find).await?.context("this runner can't run microVMs now: they need KVM, Firecracker, its guest kernel and e2fsprogs")?;
     let image = ask.image.clone().filter(|i| !i.trim().is_empty()).context("the pool names no image")?;
-    let pull = super::rootfs::Pull { origin: ask.registry.clone().unwrap_or_default(), token: ask.pull_token.clone().unwrap_or_default(), mirrors: Vec::new() };
+    let pull = super::rootfs::Pull { origin: ask.registry.clone().unwrap_or_default(), token: ask.pull_token.clone().unwrap_or_default(), mirrors: Vec::new(), locked: false };
     let key = format!("p{}", crate::util::sha256_hex(ask.executor.as_bytes()).get(..11).unwrap_or("ool"));
     let cache = work.join("_firecracker");
     // Restored from its image's snapshot where it can be (W13-R09), else booted.

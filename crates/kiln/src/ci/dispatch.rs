@@ -413,8 +413,10 @@ async fn who_of(hub: &Hub, st: &RunSt) -> Who {
 /// A leg's route with what its run brings: untrusted code only where `ci.untrusted` lets it
 /// (W18-R07), what kiln actions' steps need of the runner (W07-R11), and Docker for Docker
 /// actions (W07-R06).
-fn route_with(spec: &LegSpec, workflow: &str, repo: &str, event: &str, trusted: bool, actions: &std::collections::BTreeMap<String, wire::ActionRef>, cfg: &crate::config::ci::Ci) -> LegRoute {
+#[allow(clippy::too_many_arguments)]
+fn route_with(spec: &LegSpec, workflow: &str, repo: &str, event: &str, trusted: bool, actions: &std::collections::BTreeMap<String, wire::ActionRef>, locks: Option<&kiln_ci::lock::execution::Locks>, cfg: &crate::config::ci::Ci) -> LegRoute {
     let mut route = route_of(spec, workflow, repo, event, cfg.local, (!trusted).then(|| cfg.untrusted.route()));
+    if let Some(locks) = locks { route.caps |= crate::proto::CAP_DEPENDENCY_LOCKS; route.requires.extend(locks.runtime_requirements()); }
     for step in spec.def().map(|j| j.steps.as_slice()).unwrap_or_default() {
         if let Some(a) = step.uses.as_deref().and_then(|u| actions.get(u)) {
             route.requires.extend(a.requires.iter().filter(|q| !route.requires.contains(q)).cloned().collect::<Vec<_>>());
@@ -455,7 +457,7 @@ pub(crate) async fn stored_route(hub: &Hub, leg: &str) -> anyhow::Result<Option<
         Some(s) => s.actions_for(&spec.defined_in).ok_or_else(|| anyhow::anyhow!("the saved dependency snapshot omits this leg's workflow"))?.clone(),
         None => v.get("actions").and_then(|a| serde_json::from_value(a.clone()).ok()).unwrap_or_default(),
     };
-    Ok(Some(route_with(&spec, &wf.name.clone().unwrap_or_default(), &repo, &event, trusted, &actions, &hub.cfg.ci)))
+    Ok(Some(route_with(&spec, &wf.name.clone().unwrap_or_default(), &repo, &event, trusted, &actions, snapshot.as_ref().and_then(|s| s.execution_for(&spec.defined_in, &spec.job)), &hub.cfg.ci)))
 }
 
 /// What the scheduler gets of a leg: its route, priority, concurrency group and retries; and for
@@ -463,7 +465,7 @@ pub(crate) async fn stored_route(hub: &Hub, leg: &str) -> anyhow::Result<Option<
 /// warm), its job's container and workflow file, and its job's `prefer:`.
 fn leg_in(r: &RunSt, run: &str, id: &str, spec: &LegSpec, cfg: &crate::config::ci::Ci, warm: &HashMap<String, (u64, kiln_ci::work::slots::WorkState)>) -> LegIn {
     let job = spec.def();
-    let route = route_with(spec, &r.wf.name.clone().unwrap_or_default(), &r.repo.name, &r.event.name, r.trusted, r.actions_for(spec), cfg);
+    let route = route_with(spec, &r.wf.name.clone().unwrap_or_default(), &r.repo.name, &r.event.name, r.trusted, r.actions_for(spec), r.dependencies.as_ref().and_then(|s| s.execution_for(&spec.defined_in, &spec.job)), cfg);
     let group = spec.concurrency.as_ref().map(|g| (format!("{}\0{}", r.repo.id, g.group), g.group.clone(), GroupConfig { cancel_in_progress: g.cancel_in_progress, queue_max: g.queue_max, limit: g.limit.map_or(1, |l| l.max(1) as usize), max_pending: 100 }));
     let retry = job.and_then(|j| j.kiln.retry.as_ref()).and_then(RetryPolicy::from_yval);
     // The workflow's `coalesce:` and `cadence:` (W28-R60): its lane is the repository's workflow on
@@ -514,7 +516,7 @@ fn leg_in(r: &RunSt, run: &str, id: &str, spec: &LegSpec, cfg: &crate::config::c
         cost: r.costs.get(&spec.job).copied(),
         // On a `k8s` pool, a pod of its own, its containers in it (W13-R07); a kiln-dialect leg
         // that sets its `toolchain:`, `image:` or `resources:`, v1's job pod (W02-R06).
-        own_executor: job.is_some_and(|j| j.container.is_some() || !j.services.is_empty() || (spec.workflow.dialect == Some(kiln_ci::expr::Dialect::Kiln) && super::pools::sets_pod(j))),
+        own_executor: r.dependencies.as_ref().and_then(|s| s.execution_for(&spec.defined_in, &spec.job)).is_some() || job.is_some_and(|j| j.container.is_some() || !j.services.is_empty() || (spec.workflow.dialect == Some(kiln_ci::expr::Dialect::Kiln) && super::pools::sets_pod(j))),
         request: request_of(job, cfg),
         // Its I/O, for admission by load (W24-R19).
         load: kiln_ci::sched::load::load_of(job.and_then(|j| j.kiln.resources.as_ref())),
@@ -774,6 +776,42 @@ fn association(e: &Event) -> Option<String> {
         .and_then(serde_json::Value::as_str)
         .map(str::to_owned)
         .or_else(|| (e.source == kiln_ci::trigger::Source::Api).then(|| "CONTRIBUTOR".to_owned()))
+}
+
+/// W29-R24: a pod starts from accepted images before its dedicated runner connects.
+fn lock_pod(pod: &mut super::pools::LegPod, pool_image: Option<&str>, locks: Option<&kiln_ci::lock::execution::Locks>) -> Result<(), String> {
+    let Some(locks) = locks else { return Ok(()) };
+    locks.validate()?;
+    let image = pod.image.as_deref().or(pool_image).unwrap_or_else(|| crate::pipeline::toolchain_image(None));
+    pod.image = Some(locks.image(image)?);
+    for service in &mut pod.services { service.image = locks.image(&service.image)?; }
+    Ok(())
+}
+
+/// A runner as the scheduler sees it: what its probes found (W13-R01), else what its build
+/// announced; never an executor its build didn't.
+fn runner_view(hub: &Hub, a: &crate::hub::AgentLive) -> RunnerView {
+    let caps = hub.runner_wide_caps(&a.name);
+    let mut facts = match &a.facts {
+        Some(f) => (**f).clone(),
+        None => {
+            let mut executors = std::collections::BTreeMap::new();
+            // Never on Windows (`crate::runner::probe`'s executors).
+            if caps & u64::from(CAP_DOCKER) != 0 && a.os != "windows" {
+                let rootless = caps & u64::from(crate::proto::CAP_DOCKER_ROOTLESS) != 0;
+                executors.insert("docker".to_owned(), kiln_ci::facts::Executor { details: [("rootless".to_owned(), rootless.to_string())].into(), ..kiln_ci::facts::Executor::default() });
+            }
+            kiln_ci::facts::RunnerFacts { os: a.os.clone(), arch: a.arch.clone(), executors, ..kiln_ci::facts::RunnerFacts::default() }
+        }
+    };
+    if caps & u64::from(CAP_DOCKER) == 0 {
+        facts.executors.remove("docker");
+    }
+    if caps & u64::from(crate::proto::CAP_FIRECRACKER) == 0 {
+        facts.executors.remove("firecracker");
+    }
+    facts.executors.entry("host".to_owned()).or_default();
+    RunnerView { name: a.name.clone(), labels: a.labels.clone(), pool: None, facts, caps }
 }
 
 /// A leg the scheduler has.
@@ -1395,32 +1433,6 @@ impl Dispatch {
         Box::pin(self.commands(cmds)).await;
     }
 
-    /// A runner as the scheduler sees it: what its probes found (W13-R01), else what its build
-    /// announced; never an executor its build didn't.
-    fn runner_view(&self, a: &crate::hub::AgentLive) -> RunnerView {
-        let caps = self.hub.runner_caps(&a.name);
-        let mut facts = match &a.facts {
-            Some(f) => (**f).clone(),
-            None => {
-                let mut executors = std::collections::BTreeMap::new();
-                // Never on Windows (`crate::runner::probe`'s executors).
-                if caps & CAP_DOCKER != 0 && a.os != "windows" {
-                    let rootless = caps & crate::proto::CAP_DOCKER_ROOTLESS != 0;
-                    executors.insert("docker".to_owned(), kiln_ci::facts::Executor { details: [("rootless".to_owned(), rootless.to_string())].into(), ..kiln_ci::facts::Executor::default() });
-                }
-                kiln_ci::facts::RunnerFacts { os: a.os.clone(), arch: a.arch.clone(), executors, ..kiln_ci::facts::RunnerFacts::default() }
-            }
-        };
-        if caps & CAP_DOCKER == 0 {
-            facts.executors.remove("docker");
-        }
-        if caps & crate::proto::CAP_FIRECRACKER == 0 {
-            facts.executors.remove("firecracker");
-        }
-        facts.executors.entry("host".to_owned()).or_default();
-        RunnerView { name: a.name.clone(), labels: a.labels.clone(), pool: None, facts, caps: u64::from(caps) }
-    }
-
     /// The `k8s` pool's executor a runner is (W13-R07): its pod's, by the name it enrolled
     /// with; `Some("")` for another ephemeral runner (a v1 job's pod, or an executor's from
     /// before a restart), which takes no leg of the engine's.
@@ -1445,7 +1457,7 @@ impl Dispatch {
 
     async fn runner_facts(&mut self, agent: &str) {
         let Some(a) = self.hub.agents.lock().get(agent).cloned() else { return };
-        let r = RunnerIn { id: agent.to_owned(), view: self.runner_view(&a), slots: work_slots(&a), capacity: self.capacity_of(&a), executor: self.hosted_executor(agent, a.ephemeral) };
+        let r = RunnerIn { id: agent.to_owned(), view: runner_view(&self.hub, &a), slots: work_slots(&a), capacity: self.capacity_of(&a), executor: self.hosted_executor(agent, a.ephemeral) };
         let cmds = self.sched.handle(Input::RunnerChanged(Box::new(r)), now_ms());
         Box::pin(self.commands(cmds)).await;
     }
@@ -1467,7 +1479,7 @@ impl Dispatch {
 
     async fn runner_up(&mut self, agent: &str, running: &[String]) {
         let Some(a) = self.hub.agents.lock().get(agent).cloned() else { return };
-        let view = self.runner_view(&a);
+        let view = runner_view(&self.hub, &a);
         // Legs this runner was running that it no longer has were lost.
         let gone: Vec<(String, u32)> = self.legs.iter().filter(|(id, l)| l.agent.as_deref() == Some(agent) && !running.contains(id) && !a.running.contains(id)).map(|(id, l)| (id.clone(), l.attempt)).collect();
         // Legs it says it runs that aren't its own now (given up while it was away, past the
@@ -1816,7 +1828,7 @@ impl Dispatch {
             .map(|spec| {
                 let empty = std::collections::BTreeMap::new();
                 let actions = snapshot.actions_for(&spec.defined_in).unwrap_or(&empty);
-                let mut route = route_with(spec, &workflow, &s.repo.name, &s.event.name, trusted_of(&self.hub.cfg.ci, &s.repo, &s.event), actions, &self.hub.cfg.ci);
+                let mut route = route_with(spec, &workflow, &s.repo.name, &s.event.name, trusted_of(&self.hub.cfg.ci, &s.repo, &s.event), actions, snapshot.execution_for(&spec.defined_in, &spec.job), &self.hub.cfg.ci);
                 // Where its environment deploys, as its gate adds it (W15-R02).
                 if let Some(d) = spec.environment.as_ref().and_then(|e| envs.get(&e.name.to_ascii_lowercase())) {
                     for q in super::environments::routing(d) {
@@ -2403,8 +2415,8 @@ impl Dispatch {
                 Command::Assign { leg, runner, attempt, executor, image, docker, slot } => self.assign(&leg, &runner, attempt, Placement { executor, image, docker, slot }).await,
                 // A `k8s` pool's executor is this server's: its pod (W13-R07), made for a leg with
                 // its containers in it when it has them.
-                Command::StartExecutor { pool, executor, runner, kind, leg, .. } if runner.is_empty() => {
-                    match leg.as_deref().map(|l| (l.to_owned(), self.leg_pod(l))) {
+                Command::StartExecutor { pool, executor, runner, kind, leg, image } if runner.is_empty() => {
+                    match leg.as_deref().map(|l| (l.to_owned(), self.leg_pod(l, image.as_deref()))) {
                         // Its containers can't be said: the leg fails, saying why, and the executor
                         // made for it goes.
                         Some((l, Err(why))) => {
@@ -2456,7 +2468,13 @@ impl Dispatch {
                     r
                 }
                 Command::Wait { leg, reason } => {
-                    let r = runs::wait_reason(&self.hub, &leg, &serde_json::to_value(&reason).unwrap_or_default()).await;
+                    let mut value = serde_json::to_value(&reason).unwrap_or_default();
+                    if matches!(reason, kiln_ci::sched::WaitReason::Capability { .. })
+                        && self.legs.get(&leg).and_then(|l| self.runs.get(&l.run).map(|r| (l, r)))
+                            .is_some_and(|(l, r)| r.dependencies.as_ref().and_then(|s| s.execution_for(&l.spec.defined_in, &l.spec.job)).is_some())
+                        && let Some(object) = value.as_object_mut()
+                    { object.insert("message".into(), "This locked job needs a runner that enforces dependency locks (W29-R24).".into()); }
+                    let r = runs::wait_reason(&self.hub, &leg, &value).await;
                     self.hub.emit_job(&leg).await;
                     r
                 }
@@ -2498,7 +2516,7 @@ impl Dispatch {
     /// the run's `github`, `vars`, `needs`, `strategy`, `matrix` and `inputs`). Why not, when one of
     /// them can't be: an expression that fails, or `credentials` (a pod pulls with its namespace's
     /// image pull secrets).
-    fn leg_pod(&self, leg: &str) -> Result<super::pools::LegPod, String> {
+    fn leg_pod(&self, leg: &str, pool_image: Option<&str>) -> Result<super::pools::LegPod, String> {
         use kiln_ci::expr::{self, Budget, MapContexts, Template, Value};
         use kiln_ci::wf::validate::{Site, options};
         let l = self.legs.get(leg).ok_or("the leg is gone")?;
@@ -2560,9 +2578,13 @@ impl Dispatch {
                 (None, Some(t)) => Some(render(t, Site::KilnJob, "image")?).filter(|i| !i.trim().is_empty()),
                 (None, None) => None,
             };
-            return Ok(super::pools::LegPod { env, services, containers, ..super::pools::kiln_pod(job, image, l.spec.timeout_minutes) });
+            let mut pod = super::pools::LegPod { env, services, containers, ..super::pools::kiln_pod(job, image, l.spec.timeout_minutes) };
+            lock_pod(&mut pod, pool_image, r.dependencies.as_ref().and_then(|s| s.execution_for(&l.spec.defined_in, &l.spec.job)))?;
+            return Ok(pod);
         }
-        Ok(super::pools::LegPod { image, env, services, containers, ..super::pools::LegPod::default() })
+        let mut pod = super::pools::LegPod { image, env, services, containers, ..super::pools::LegPod::default() };
+        lock_pod(&mut pod, pool_image, r.dependencies.as_ref().and_then(|s| s.execution_for(&l.spec.defined_in, &l.spec.job)))?;
+        Ok(pod)
     }
 
     /// Sends a leg to its runner (W05, W06).
@@ -2959,6 +2981,7 @@ impl Dispatch {
             // Exclusive, it has its runner to itself: the share it asked for, or the whole runner.
             exclusive: job.is_some_and(|j| j.kiln.exclusive),
             holds: job.filter(|j| j.kiln.exclusive).and_then(|j| asked_of(Some(j))).filter(|q| q.cpu > 0.0),
+            dependency_locks: r.dependencies.as_ref().and_then(|s| s.execution_for(&spec.defined_in, &spec.job)).cloned(),
         }
     }
 
@@ -3786,6 +3809,49 @@ pub(crate) fn sample_of(s: &crate::metrics::HostSample, facts: Option<&kiln_ci::
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn w29_r24_wide_enforcement_capabilities_reach_the_schedulers_runner_view() -> anyhow::Result<()> {
+        crate::rt::block_on(async {
+            let hub = crate::hub::tests::scratch_hub().await?;
+            let hello = crate::proto::Hello { protocol: crate::proto::VERSION, name: "lock-runner".into(), labels: vec![], slots: 1, hostname: "lock-runner".into(), os: "linux".into(), arch: "x86_64".into(), version: String::new(), ephemeral: true, dedicated_job: None, running: vec![], terminal: false };
+            hub.instances.lock().join(1, "lock-runner", hello, 0);
+            let live = crate::hub::tests::live_runner("lock-runner", "linux", "x86_64");
+            assert_eq!(super::runner_view(&hub, &live).caps & crate::proto::CAP_DEPENDENCY_LOCKS, 0);
+            hub.instances.lock().set_wide(1, crate::proto::CAP_DEPENDENCY_LOCKS | u64::from(crate::proto::CAP_CI2));
+            let updated = super::runner_view(&hub, &live);
+            assert_ne!(updated.caps & crate::proto::CAP_DEPENDENCY_LOCKS, 0);
+            assert_ne!(updated.caps & u64::from(crate::proto::CAP_CI2), 0);
+            Ok(())
+        })
+    }
+
+    #[test]
+    fn w29_r24_old_runners_cannot_take_locked_legs_and_pods_use_the_same_pins() -> anyhow::Result<()> {
+        use kiln_ci::sched::routing::{RunnerView, checks, resolve};
+        let (wf, diagnostics) = kiln_ci::wf::parse_workflow(".kiln/ci.yml", "on: push\njobs:\n  check:\n    runs-on: baremetal\n    steps: [{run: echo accepted}]\n", kiln_ci::expr::Dialect::Kiln);
+        assert!(!diagnostics.iter().any(|d| d.is_error()));
+        let workflow = std::sync::Arc::new(wf.ok_or_else(|| anyhow::anyhow!("no workflow"))?);
+        let (_, actions) = kiln_ci::plan::RunPlan::start(workflow, kiln_ci::plan::RunInput::default(), kiln_ci::plan::Settings::default(), &kiln_ci::plan::NoSource).map_err(anyhow::Error::msg)?;
+        let spec = actions.iter().find_map(|a| if let kiln_ci::plan::PlanAction::Queue(spec) = a { Some(spec) } else { None }).ok_or_else(|| anyhow::anyhow!("no queued leg"))?;
+        let config = crate::config::ci::Ci::default();
+        let route = super::route_with(spec, "ci", "acme/app", "push", true, &Default::default(), Some(&Default::default()), &config);
+        assert_ne!(route.caps & crate::proto::CAP_DEPENDENCY_LOCKS, 0);
+        let requirement = resolve(&route, &[]).map_err(anyhow::Error::msg)?;
+        let old = RunnerView { caps: route.caps & !crate::proto::CAP_DEPENDENCY_LOCKS, ..Default::default() };
+        assert!(checks(&requirement, &old).iter().any(|c| !c.pass && c.requirement.starts_with("capabilities")));
+        let new = RunnerView { caps: route.caps, ..old };
+        assert!(checks(&requirement, &new).iter().filter(|c| c.requirement.starts_with("capabilities")).all(|c| c.pass));
+        let pin = format!("alpine@sha256:{}", "a".repeat(64));
+        let locks = kiln_ci::lock::execution::Locks { images: [("alpine:3".into(), pin.clone())].into(), ..Default::default() };
+        let mut pod = crate::ci::pools::LegPod { services: vec![crate::ci::pools::PodService { id: "db".into(), image: "alpine:3".into(), ..Default::default() }], ..Default::default() };
+        super::lock_pod(&mut pod, Some("alpine:3"), Some(&locks)).map_err(anyhow::Error::msg)?;
+        assert_eq!(pod.image.as_ref(), Some(&pin));
+        assert_eq!(pod.services.first().map(|s| &s.image), Some(&pin));
+        assert!(super::lock_pod(&mut pod, Some("unknown:latest"), Some(&locks)).is_ok(), "the explicit accepted image precedes the pool default");
+        pod.image = None;
+        assert!(super::lock_pod(&mut pod, Some("unknown:latest"), Some(&locks)).is_err());
+        Ok(())
+    }
     /// W28-R57: a culprit-finding try is no push of its branch. A gate's goes at once, at gate
     /// priority, nothing holding it; the rest at low priority, below work in progress, speculative
     /// under its lane's window and coalescing with no push. Its run keeps that through a restart,

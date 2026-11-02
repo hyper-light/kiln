@@ -2103,6 +2103,8 @@ impl Hub {
             // server has of its streams, and sends from there (docs/wire.md).
             AgentMsg::Caps { caps } => {
                 self.instances.lock().set_wide(peer, caps);
+                // W29-R24: wide capabilities decide eligibility too, after Build's 32 bits.
+                self.ci.send(crate::ci::dispatch::Msg::RunnerFacts { agent: agent.clone() });
                 crate::headroom::control::on_caps(self, &agent, caps).await;
                 // One that takes hand-overs: its machine's older processes hand their sessions on.
                 if caps & proto::CAP_HANDOVER != 0 {

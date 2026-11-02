@@ -2,6 +2,8 @@
 //! the server supplies source identity, resolution and reachability facts.
 
 pub mod github;
+pub mod execution;
+pub mod dockerfile;
 pub mod kiln;
 pub mod regenerate;
 pub mod verify;
