@@ -325,6 +325,9 @@ fn w29_r04_the_pane() -> anyhow::Result<()> {
     let work = dir.path().join("kit");
     let mut files: Vec<(&str, &str)> = vec![(".github/workflows/every.yml", EVERY_GITHUB_EVENT), (".kiln/every.yaml", EVERY_KILN_EVENT), (".github/actions/comment/index.js", "console.log('hi');\n"), (".github/actions/image/Dockerfile", "FROM alpine:3.20\n")];
     files.extend_from_slice(ACTIONS);
+    let called = "on: workflow_call\njobs:\n  build:\n    runs-on: local\n    steps:\n      - uses: actions/checkout@v4\n      - run: echo checked\n";
+    files.push((".github/workflows/called.yml", called));
+    files.push((".kiln/caller.yaml", "name: caller\non: manual\njobs:\n  rust:\n    uses: kiln://acme/kit/.github/workflows/called.yml@v1.0.0\n"));
     for (path, text) in &files {
         let p = work.join(path);
         if let Some(parent) = p.parent() {
@@ -338,6 +341,7 @@ fn w29_r04_the_pane() -> anyhow::Result<()> {
     git(&home, &work, &["tag", "v1.0.0"])?;
     // The workflow changes after its release.
     std::fs::write(work.join(".github/workflows/every.yml"), EVERY_GITHUB_EVENT.replacen("name: every event", "name: every event, renamed", 1))?;
+    std::fs::write(work.join(".github/workflows/called.yml"), called.replacen("  build:\n", "  next:\n", 1))?;
     git(&home, &work, &["commit", "-qam", "renamed"])?;
     git(&home, &work, &["push", "-q", "origin", "main", "v1.0.0"])?;
     let head = git(&home, &work, &["rev-parse", "HEAD"])?.trim().to_owned();
@@ -364,6 +368,11 @@ fn w29_r04_the_pane() -> anyhow::Result<()> {
     assert!(gha.pointer("/head/draft").is_some_and(Value::is_null));
     let checkout = group(&gha, "Uses").into_iter().find(|l| field(l, "name") == "actions/checkout@v4");
     assert_eq!(checkout.map(|l| field(l, "value")), Some(format!("fetched by name · 4.2.3 · {}", tagged.get(..7).unwrap_or_default()).as_str()), "{gha}");
+    // The exact cached tag's job and dependency, without a run or a network fetch (pl-7).
+    let (st, caller) = pane(&s, &s.admin, ".kiln/caller.yaml", None)?;
+    anyhow::ensure!(st == 200, "the caller's pane: {st} {caller}");
+    assert_eq!(group(&caller, "Jobs").first().map(|l| field(l, "name")), Some("rust / build"), "{caller}");
+    assert!(group(&caller, "Uses").iter().any(|l| field(l, "name") == "actions/checkout@v4"), "{caller}");
     // A reusable workflow's interface: its workflow_call inputs, outputs and secrets.
     let call: Vec<(&str, &str)> = group(&gha, "Called with").iter().map(|l| (field(l, "kind"), field(l, "name"))).collect();
     assert_eq!(call, [("input", "toolchain"), ("output", "built"), ("secret", "TOKEN")], "{gha}");

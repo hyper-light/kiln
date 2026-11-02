@@ -66,6 +66,6 @@ test("w29_r07_a_drafts_plan_against_the_published_one", () => {
   );
   assert.deepEqual(
     planLines([job("rust", 2)], null, "main").map((l) => [l.mark, l.text]),
-    [["job", "rust: 2 legs, on fedora (baremetal)"]],
+    [["job", "rust: 2 legs, on fedora"]],
   );
 });

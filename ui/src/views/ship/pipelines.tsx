@@ -34,7 +34,7 @@ import { changesIn, lineDiff } from "@/lib/line-diff";
 import { jobsOf, planDiff, planLines, whereWords, type PlanDiff, type PlanJob, type PlanLine } from "@/lib/plan-diff";
 import { manualInputs, spotOf, type ManualInput, type Spot } from "@/lib/pipeline-spot";
 import { TRIGGER_GROUPS, TRIGGER_KINDS, triggerKeys, triggerLines, type TriggerKind } from "@/lib/triggers";
-import { addedOf, typedGroups } from "@/lib/typed-groups";
+import { addedOf, jobResources, typedGroups } from "@/lib/typed-groups";
 import { addOverlayTrigger, addTrigger, EditRefused, removeTrigger, setOverlayScheduleField, setScheduleField, setTriggerFilter } from "@/lib/workflow-doc";
 import { parse as parseYaml } from "yaml";
 import { Link, useSearchParams } from "@/lib/router";
@@ -462,6 +462,7 @@ function NewBody({
     <div className="ppl-detail">
       <div className="ppl-dhead">
         <span className="ppl-dname">
+          <StatusGlyph state="running" size={12} label="Preview" className="ppl-preview" />
           {name} · {files.length === 1 ? "1 file" : `${files.length} files`}
         </span>
       </div>
@@ -674,7 +675,8 @@ interface StripVerb {
 
 /** The detail's code, held to this many lines, scrolling inside itself: beside the list, and under its line on a phone. */
 const SIDE_ROWS = 28;
-const PHONE_ROWS = 28;
+// W29-R06: the same phone frame for every workflow view, tall enough for all 18 wrapped kinds.
+const PHONE_ROWS = 42;
 
 /** What's shown before anything's picked: the use kiln's update draft moves (pl-7), a workflow's first job, an action's tip, else the first line. */
 function firstPick(p: ShipPipelinePane): Key | null {
@@ -765,6 +767,8 @@ function wordsOf(l: ShipPipelineLine): { kind: string | null; name: string; valu
     case "run":
       // A push is what most runs are: other events say so (pl-8's DEPLOY, SCHEDULE, COMMENT).
       return { kind: l.note && l.note !== "push" ? l.note.replace(/_/g, " ") : null, name: l.name, value: l.value };
+    case "setting":
+      return { kind: null, name: l.name, value: l.key === "settings.access" ? l.value.replace(/^shared with /, "") : l.value };
     case "job":
       // What it needs is its stage's note (`after rust and ui`), not its own.
       return {
@@ -791,7 +795,9 @@ const glyphFor = (l: ShipPipelineLine): string =>
     ? l.state === "none"
       ? "none"
       : "passed"
-    : (l.state ?? (l.kind === "version" && l.key !== "versions.head" ? "tag" : l.kind === "note" || (l.kind === "setting" && l.key !== "settings.on") ? "none" : "passed"));
+    : l.state === "flag" && (l.kind === "use" || l.kind === "consumer")
+      ? "changes"
+      : (l.state ?? (l.kind === "version" && l.key !== "versions.head" ? "tag" : l.kind === "note" || (l.kind === "setting" && l.key !== "settings.on") ? "none" : "passed"));
 
 /** What a picked line's detail shows (W29-R04): a job's YAML · Plan · Last run, a trigger's Times or Filters, a use's own, a run's jobs; an action's Changes · YAML · Try it. */
 function viewsFor(p: ShipPipelinePane, l: ShipPipelineLine | null): string[] {
@@ -928,7 +934,20 @@ function PipelinePane({ repo, row, onChanged, onLine }: { repo: ShipPipelineRepo
   // What the strip says it adds: its new jobs, else its new uses (pl-3's `Adds helm-lint`); and what its check found.
   const adds = added.some((l) => l.kind === "job") ? added.filter((l) => l.kind === "job") : added.filter((l) => l.kind === "use");
   const checks = checked?.text === text ? checksWords(checked) : null;
-  const groups = (typedAll ?? p.groups).map((g) => (g.name === "Triggers" && workflow ? { ...g, lines: [...(typed ?? g.lines), ...(editable ? [ADD_TRIGGER] : [])] } : g));
+  // W29-R04, pl-7/8: implicit workflow defaults need no Settings group. An override, an off
+  // workflow or sharing remains explicit; the read model still carries all the default facts.
+  const groups = (typedAll ?? p.groups)
+    .filter(
+      (g) =>
+        !(
+          workflow &&
+          g.name === "Settings" &&
+          g.lines.every(
+            (l) => (l.key === "settings.on" && l.name === "Turned on" && l.value === "runs on its triggers") || (l.key === "settings.machines" && l.value === "bare metal unless a job says"),
+          )
+        ),
+    )
+    .map((g) => (g.name === "Triggers" && workflow ? { ...g, lines: [...(typed ?? g.lines), ...(editable ? [ADD_TRIGGER] : [])] } : g));
   const lines = groups.flatMap((g) => g.lines);
   const at = picked && lines.some((l) => l.key === picked) ? picked : firstPick(p);
   const line = lines.find((l) => l.key === at) ?? null;
@@ -978,10 +997,12 @@ function PipelinePane({ repo, row, onChanged, onLine }: { repo: ShipPipelineRepo
     const n = (k: number, one: string, many: string) => `${k === 1 ? "its" : `its ${k}`} ${k === 1 ? one : many}`;
     return [actions ? n(actions, "action", "actions") : "", calls ? n(calls, "workflow", "workflows") : ""].filter(Boolean).join(" and ") || "its files";
   })();
-  // Its repository and path, then a workflow's dialect, ref and commit (`from main` while it's typed in, pl-3), or an action's kind (pl-5).
+  // W29-R04, pl-2/3: a private published workflow is relative to its repository's heading.
+  // Shared resources and saved drafts keep the repository, distinguishing publisher and consumer (pl-5/7).
+  const qualified = !h.dialect || h.kind === "reusable" || Boolean(h.draft) || repo.access !== "none";
   const where = (
     h.dialect
-      ? [repo.repo, h.path, changed && !h.draft ? null : `${DIALECT_WORD[h.dialect] ?? h.dialect} dialect`, changed && !h.draft ? `from ${h.ref}` : h.ref, h.commit.slice(0, 7)]
+      ? [qualified ? repo.repo : null, h.path, changed && !h.draft ? null : `${DIALECT_WORD[h.dialect] ?? h.dialect} dialect`, changed && !h.draft ? `from ${h.ref}` : h.ref, h.commit.slice(0, 7)]
       : [repo.repo, h.path, `${(KIND_WORD[h.kind] ?? h.kind).toLowerCase()} action`]
   )
     .filter(Boolean)
@@ -1241,7 +1262,18 @@ function PipelinePane({ repo, row, onChanged, onLine }: { repo: ShipPipelineRepo
         }
       : null;
   const detail = (
-    <Detail key={`${at ?? "file"}|${event ?? ""}`} pane={p} line={line} text={text} onText={edit} own={own} editable={editable} ask={ask} tools={tools} rows={phone ? PHONE_ROWS : SIDE_ROWS} />
+    <Detail
+      key={`${at ?? "file"}|${event ?? ""}`}
+      pane={p}
+      line={line}
+      text={text}
+      onText={edit}
+      own={own}
+      editable={editable}
+      ask={ask}
+      tools={tools}
+      rows={phone && workflow ? PHONE_ROWS : SIDE_ROWS}
+    />
   );
   // On a phone, the picked line's detail is right under it, as the approved stills draw it.
   const below = (k: Key) => (phone && k === at ? <li className="jp-detail">{detail}</li> : null);
@@ -1922,7 +1954,10 @@ function Detail({
   return (
     <div className="ppl-detail">
       <div className="ppl-dhead">
-        <span className="ppl-dname">{name}</span>
+        <span className="ppl-dname">
+          <StatusGlyph state="running" size={12} label="Preview" className="ppl-preview" />
+          {name}
+        </span>
         <span className="dp-w ppl-views" role="tablist" aria-label="Views" hidden={views.length < 2}>
           {views.map((v) => (
             <button key={v} type="button" role="tab" aria-selected={v === shown} onClick={() => setView(v)}>
@@ -2054,7 +2089,7 @@ function YamlView({
   const syntax = syntaxOf(h);
   const [problems, setProblems] = React.useState<CiDiagnostic[]>([]);
   // The text's plan for the strip's event, with the base's when it differs: asked as the text is checked.
-  const [plan, setPlan] = React.useState<{ now: PlanJob[]; was: PlanJob[] | null } | null>(null);
+  const [plan, setPlan] = React.useState<{ text: string; now: PlanJob[]; was: PlanJob[] | null } | null>(null);
   // Another file (a GitHub workflow's overlay) is checked as itself, and plans nothing of its own.
   const workflow = ["workflow", "reusable"].includes(h.kind) && !file;
   const editor = React.useRef<Editor>(null);
@@ -2066,9 +2101,10 @@ function YamlView({
         workflow ? planOf(pane, t, ask.event, ask.overlay).catch(() => null) : null,
         workflow && ask.base !== null ? basePlanOf(pane, ask.base, ask.event, ask.baseOverlay).catch(() => null) : null,
       ]);
+      if (editor.current && editor.current.state.doc.toString() !== t) return [];
       const shown = r.diagnostics.filter((d) => d.severity === "error" || d.severity === "warning");
       setProblems(shown);
-      const planned = now?.plan ? { now: jobsOf(now.plan), was: ask.base === null ? null : was?.plan ? jobsOf(was.plan) : [] } : null;
+      const planned = now?.plan ? { text: t, now: jobsOf(now.plan), was: ask.base === null ? null : was?.plan ? jobsOf(was.plan) : [] } : null;
       setPlan(planned);
       onChecked?.({
         text: t,
@@ -2081,14 +2117,19 @@ function YamlView({
         return { from, to: Math.max(from + 1, offsetOf(t, d.range.end)), severity: d.severity === "error" ? "error" : "warning", message: d.message };
       });
     } catch {
+      if (editor.current && editor.current.state.doc.toString() !== t) return [];
       setProblems([]);
+      setPlan(null);
       return [];
     }
   };
   // Under the code: a picked job's machines, and a draft's plan against the published one's (pl-2, pl-3).
   const job = line?.kind === "job" ? line.key.replace(/^jobs\./, "") : null;
-  const where = job ? (plan?.now.find((j) => j.job === job) ?? null) : null;
-  const changes = plan?.was ? planLines(plan.now, plan.was, h.ref) : null;
+  const currentPlan = plan?.text.replace(/\r\n?/g, "\n") === text.replace(/\r\n?/g, "\n") ? plan : null;
+  const where = job ? (currentPlan?.now.find((j) => j.job === job || j.job === line?.name.replaceAll(" / ", "/")) ?? null) : null;
+  const reserved = job ? jobResources(text, job) : null;
+  const needs = where ? [...where.labels.filter((l) => !["baremetal", "bare-metal"].includes(l)), ...(reserved ? [`${reserved.replace(/, ([^,]+)$/, " and $1")} free`] : [])].join(", ") : "";
+  const changes = currentPlan?.was ? planLines(currentPlan.now, currentPlan.was, h.ref) : null;
   const fix = (d: CiDiagnostic) => {
     const v = editor.current;
     if (!v || !d.fix) return;
@@ -2110,29 +2151,33 @@ function YamlView({
         }}
       />
       <div className="ppl-problems">
-        <div className="jp-g">
-          <span>Problems</span>
-          <span>{problems.length || "none"}</span>
-        </div>
-        <ul className="ppl-lines" aria-label="Problems">
-          {problems.map((d, i) => (
-            <li key={`${d.code}-${d.range.start.line}-${i}`} data-severity={d.severity}>
-              <StatusGlyph state={d.severity === "error" ? "failed" : "flag"} size={12} />
-              <span className="n">
-                <em>{d.code}</em>
-                line {d.range.start.line}: {d.message}
-              </span>
-              {d.fix ? (
-                <button type="button" className="ppl-fix" onClick={() => fix(d)}>
-                  {d.fix.title}
-                </button>
-              ) : (
-                <span className="v">{d.severity}</span>
-              )}
-            </li>
-          ))}
-        </ul>
-        {where ? (
+        {problems.length ? (
+          <>
+            <div className="jp-g">
+              <span>Problems</span>
+              <span>{problems.length}</span>
+            </div>
+            <ul className="ppl-lines" aria-label="Problems">
+              {problems.map((d, i) => (
+                <li key={`${d.code}-${d.range.start.line}-${i}`} data-severity={d.severity}>
+                  <StatusGlyph state={d.severity === "error" ? "failed" : "flag"} size={12} />
+                  <span className="n">
+                    <em>{d.code}</em>
+                    line {d.range.start.line}: {d.message}
+                  </span>
+                  {d.fix ? (
+                    <button type="button" className="ppl-fix" onClick={() => fix(d)}>
+                      {d.fix.title}
+                    </button>
+                  ) : (
+                    <span className="v">{d.severity}</span>
+                  )}
+                </li>
+              ))}
+            </ul>
+          </>
+        ) : null}
+        {where && !changes ? (
           <>
             <div className="jp-g">
               <span>Where it would run</span>
@@ -2141,7 +2186,7 @@ function YamlView({
             <ul className="ppl-lines">
               <li>
                 <StatusGlyph state={where.runners.length ? "passed" : "blocked"} size={12} />
-                <span className="n">{where.runners.length ? `${where.runners.join(", ")} can take it now${where.labels.length ? `: ${where.labels.join(", ")}` : ""}` : whereWords(where)}</span>
+                <span className="n">{where.runners.length ? `${where.runners.join(", ")} can take it now${needs ? `: ${needs}` : ""}` : whereWords(where)}</span>
                 <span className="v">{where.of ? `${where.runners.length} of ${where.of}` : ""}</span>
               </li>
             </ul>

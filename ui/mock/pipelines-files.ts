@@ -312,7 +312,7 @@ const quiverCi = (version: string) =>
     "  bench:",
     "    runs-on: [baremetal, bench]",
     "    steps:",
-    "      - uses: actions/checkout@v4",
+    "      - uses: kiln/checkout@v1",
     "      - run: cargo bench --no-run",
   );
 
@@ -375,6 +375,21 @@ export const RUNS: Record<string, { n: number; event: string; status: "passed" |
 
 /** Full releases at the floating tag's exact mirrored commit (W29-R04, pl-2). */
 export const RESOLVED: Record<string, string> = { "actions/cache@v4": "4.2.3 · 5a3ec84" };
+
+/** W29-R04, pl-7: display facts at the called tags, which need not be their repository's current file. */
+export const CALLED: Record<string, { job?: string; machine?: string; uses: [string, boolean][] }> = Object.fromEntries(
+  ["v2.3.0", "v2.4.0"].map((tag) => [
+    `hyper-light/ci-kit/.github/workflows/rust-check.yml@${tag}`,
+    {
+      job: "check",
+      machine: "bare metal",
+      uses: [
+        [`hyper-light/ci-kit/.github/actions/setup-rust@${tag}`, false],
+        ["kiln/checkout@v1", false],
+      ],
+    },
+  ]),
+);
 
 /** Each repository's tags, newest first, with their commits. */
 /** How long ago each tag was made, in seconds, by `repo:tag` (pl-5's `3d`). */

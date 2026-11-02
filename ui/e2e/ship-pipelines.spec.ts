@@ -87,6 +87,7 @@ test("?repo=&path= opens that row and brings it into view", async ({ page, isMob
   const row = list(page).locator('.ppl-row[data-key="hyper-light/kiln:.kiln/ci.yaml"]');
   await expect(row.locator(".ship-main")).toHaveAttribute("aria-expanded", "true");
   await expect(row.locator(".ppl-kicker")).toContainText(".kiln/ci.yaml · kiln's dialect · main · a3f2c1d");
+  await expect(row.locator(".ppl-kicker > span").last()).toHaveText(".kiln/ci.yaml · kiln's dialect · main · a3f2c1d");
   await expect(row).toBeInViewport();
   // Closing it takes it out of the address; another opens in its place.
   await row.locator(".ship-go").click();
@@ -150,6 +151,7 @@ test("an action's pane: its inputs, steps, versions, who uses it and its access;
   await expect(pane.locator('.jp-g[data-group="Used by"] > span:last-child')).toHaveText("3 repositories");
   await expect(pane.locator(".ppl-verbs button")).toHaveText(["Run", "Save draft", "Ready", "Discard", "Release"]);
   await expect(pane.locator(".ppl-kicker")).toContainText("hyper-light/ci-kit · .github/actions/setup-rust · composite action");
+  await expect(pane.locator('.jp-j[data-key="settings.access"] .v')).toHaveText("hyper-light's repositories");
   await expect(pane.locator('.jp-j[data-key="runs.steps.2"] .v')).toHaveText("its output");
   await expect(pane.locator(".ppl-dname")).toHaveText("e41a9c2 · 3 commits since v2.4.0");
   expect(await sideways(page)).toBe(0);
@@ -158,7 +160,10 @@ test("an action's pane: its inputs, steps, versions, who uses it and its access;
 test("kiln's update draft: DRAFT on its head, its ordinary groups, the use it moves marked and picked first (pl-7)", async ({ page, isMobile }) => {
   const pane = await openPane(page, isMobile, "hyper-light/quiver", ".github/workflows/ci.yml", "d-update-88");
   await expect(pane.locator(".ppl-kicker .ppl-draft")).toHaveText("DRAFT");
-  await expect(pane.locator(".ppl-list > .jp-g > span:first-child")).toHaveText(["Triggers", "Jobs", "Uses", "Runs", "Settings"]);
+  await expect(pane.locator(".ppl-list > .jp-g > span:first-child")).toHaveText(["Triggers", "Jobs", "Uses", "Runs"]);
+  await expect(pane.locator('.jp-j[data-key="jobs.rust"] .n')).toContainText("rust / check");
+  await expect(pane.locator('.jp-j[data-key="jobs.rust"] .v')).toHaveText("rust-check · bare metal");
+  await expect(pane.locator('.jp-g[data-group="Uses"] > span:last-child')).toHaveText("3 · 1 update");
   const moved = pane.locator(".jp-j[data-at]");
   await expect(moved).toHaveAttribute("data-key", "uses.hyper-light/ci-kit/.github/workflows/rust-check.yml@v2.4.0");
   await expect(moved.locator(".n")).toHaveText(/rust-check@v2\.3\.0$/);
@@ -367,7 +372,8 @@ test("the plan for each event: plan for: picks it, a picked job says where it wo
   await expect(planFor).toHaveText(/pick:\s*failed last run\s*·\s*changed in a draft\s*·\s*all/);
   const under = pane.locator(".ppl-problems");
   await expect(under).toContainText("Where it would run");
-  await expect(under).toContainText("fedora, adacachy can take it now: baremetal, linux");
+  await expect(under).toContainText("fedora, adacachy can take it now: linux, 2 CPUs and 16 GiB free");
+  await expect(under).not.toContainText("Problems");
   await expect(under).toContainText("2 of 2");
   // A trigger picked: its triggers, by event, its own picked.
   await pane.locator('.jp-j[data-key="on.push"] .jp-line').click();
@@ -386,10 +392,13 @@ test("the plan for each event: plan for: picks it, a picked job says where it wo
   await toTheEnd(pane);
   await pane.locator(".ppl-detail .cm-line").last().click();
   await page.keyboard.press("End");
-  await page.keyboard.insertText("\n  helm-lint:\n    runs-on: [baremetal, linux]\n    steps:\n      - uses: kiln/checkout@v1\n");
+  await page.keyboard.insertText("\n  helm-lint:\n    runs-on: [baremetal, linux]\n    steps:\n      - uses: kiln/checkout@v1\n      - uses: azure/setup-helm@v4\n");
+  await pane.locator('.jp-j[data-key="jobs.helm-lint"] .jp-line').click();
   await expect(under).toContainText("Plan for a push to main");
-  await expect(under.locator("li[data-mark=added]")).toHaveText(/helm-lint, a new job: 1 leg, on fedora or adacachy \(baremetal, linux\)\s*\+1 job/);
+  await expect(under).not.toContainText("Where it would run");
+  await expect(under.locator("li[data-mark=added]")).toHaveText(/helm-lint, a new job: 1 leg, on fedora or adacachy \(linux\)\s*\+1 job/);
   await expect(under.locator("li[data-mark=same]")).toContainText("the other 5 jobs and 7 legs as on main");
+  await expect.poll(() => under.evaluate((e) => e.scrollHeight - e.clientHeight)).toBe(0);
   // The Plan view says the same, against what's published.
   await pane.locator(".ppl-detail").getByRole("tab", { name: "Plan" }).click();
   await expect(pane.locator(".ppl-detail .ppl-lines li[data-mark=added]")).toContainText("helm-lint, a new job");
@@ -404,7 +413,7 @@ test("Add a trigger: 18 kinds in six groups, shown by whose; picking one adds it
   await pane.locator('.jp-j[data-key="add-trigger"] .jp-line').click();
   const kinds = pane.getByLabel("Add a trigger");
   await expect(kinds.locator("li[data-kind]")).toHaveCount(18);
-  if (!isMobile) expect(await kinds.evaluate((el) => el.scrollHeight - el.clientHeight), "all 18 kinds fit the held detail").toBe(0);
+  expect(await kinds.evaluate((el) => el.scrollHeight - el.clientHeight), "all 18 kinds fit the held detail").toBe(0);
   await expect(kinds.locator(".jp-g > span:first-child")).toHaveText(["Code", "Time", "People and agents", "Other workflows", "Deploys and releases", "Outside kiln"]);
   await expect(pane.locator(".jp-said")).toContainText("pick what starts it");
   // show: kiln's lists kiln's own and both; GitHub's the rest and both.

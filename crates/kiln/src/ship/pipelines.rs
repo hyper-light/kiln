@@ -467,9 +467,11 @@ async fn seen_of(hub: &Hub, repo: &Repo, branch: &str, path: &str, w: &wf::Workf
     // Each use of a repository kiln hosts, by the full version it names, against that
     // repository's newest release.
     let hosted = hub.store.repos().await.unwrap_or_default();
-    let uses: Vec<String> = w.jobs.iter().flat_map(|j| j.uses.iter().cloned().chain(j.steps.iter().filter_map(|s| s.uses.clone()))).collect();
+    let mut uses: Vec<_> = core::direct_uses(w).into_iter().map(|(u, call)| (u, call, 0)).collect();
     let mut listed = HashSet::new();
-    for u in uses {
+    let mut cursor = 0;
+    while let Some((u, call, depth)) = uses.get(cursor).cloned() {
+        cursor += 1;
         if !listed.insert(u.clone()) {
             continue;
         }
@@ -482,6 +484,24 @@ async fn seen_of(hub: &Hub, repo: &Repo, branch: &str, path: &str, w: &wf::Workf
             r.mirror(hub)
         };
         let dir = dir.to_string_lossy().into_owned();
+        // W29-R04, pl-7: describe the exact cached workflow a job calls, including its own
+        // dependencies. Never fetch to open a pane, or read a hosted callee the consumer may
+        // not use. Invalid, absent and excessively nested callees leave the direct line alone.
+        let allowed = if call && let Some(other) = other {
+            kiln_ci::sharing::allows(crate::ci::sharing::access_of(hub, other).await, &other.name, &repo.name).is_ok()
+        } else {
+            true
+        };
+        if call && depth < 4 && seen.called.len() < 64 && allowed {
+            let source = git(hub, &dir, &["show", &format!("{}:{}", r.git_ref, r.path)]).await;
+            let dialect = if r.path.starts_with(".kiln/") { kiln_ci::expr::Dialect::Kiln } else { kiln_ci::expr::Dialect::Gha };
+            let (callee, diags) = wf::parse_workflow(&r.path, &source, dialect);
+            if let Some(callee) = callee.filter(|_| !diags.iter().any(wf::Diag::is_error)) {
+                let facts = core::called_seen(&callee);
+                uses.extend(facts.uses.iter().map(|(u, call)| (u.clone(), *call, depth + 1)));
+                seen.called.insert(u.clone(), facts);
+            }
+        }
         match kiln_ci::releases::kind_of(&r.git_ref) {
             kiln_ci::releases::TagKind::Floating => {
                 // A read of an existing mirror only: opening a pane never fetches an action or

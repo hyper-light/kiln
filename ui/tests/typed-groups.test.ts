@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import type { ShipPipelineGroup } from "../src/api/ship.ts";
-import { addedOf, jobLine, spanExact, stagesOf, typedGroups } from "../src/lib/typed-groups.ts";
+import { addedOf, jobLine, jobResources, spanExact, stagesOf, typedGroups } from "../src/lib/typed-groups.ts";
 
 const SERVER: ShipPipelineGroup[] = [
   { name: "Triggers", lines: [{ key: "on.push", kind: "trigger", name: "push", value: "branches main" }] },
@@ -88,11 +88,18 @@ test("w29_r05_typing_the_first_use_creates_its_group_and_a_call_still_edits_as_j
     next?.filter((g) => g.name === "Jobs" || g.name.startsWith("Stage ")).map((g) => g.name),
     ["Stage 1"],
   );
+  const call = jobLine("rust", { uses: "acme/kit/.github/workflows/check.yml@v1" }, undefined, undefined, { job: "check", machine: "bare metal" });
+  assert.equal(call.key, "jobs.rust", "the caller's YAML and Run selection keep the caller's id");
+  assert.equal(call.name, "rust / check");
+  assert.equal(call.value, "calls acme/kit/.github/workflows/check.yml@v1 · bare metal");
 });
 
 test("w29_r04_a_picked_jobs_strip_says_what_it_reserves_and_its_last_run_as_the_server_does", () => {
   // As kiln_ci::pipelines::job_line's note (pl-2): where it runs, what it reserves, its last run.
   const rust = { "runs-on": ["baremetal", "linux"], resources: { cpu: 2, memory: "16Gi" } };
+  assert.equal(jobResources("jobs:\n  rust:\n    resources: { cpu: 2, memory: 16Gi }\n", "rust"), "2 CPUs, 16 GiB");
+  assert.equal(jobResources("jobs:\r\n  rust:\r\n    resources: { cpu: 2, memory: 16Gi }\r\n", "rust"), "2 CPUs, 16 GiB");
+  assert.equal(jobResources("jobs: [", "rust"), null);
   assert.equal(jobLine("rust", rust, 18 * 60 + 40, { outcome: "passed", sha: "a3f2c1d9e8b7" }).note, "bare metal, linux · 2 CPUs, 16 GiB · its last run passed in 18m 40s on a3f2c1d");
   assert.equal(jobLine("rust", rust, 18 * 60 + 40, { outcome: "passed", sha: "a3f2c1d9e8b7" }).value, "bare metal · linux · 18m");
   assert.equal(jobLine("ui", { "runs-on": ["baremetal"] }, 240, { outcome: "failed", sha: "a3f2c1d9e8b7" }).note, "bare metal · its last run failed after 4m on a3f2c1d");

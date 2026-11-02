@@ -34,6 +34,12 @@ export interface JobLast {
   sha: string;
 }
 
+/** W29-R04: facts from the exact cached workflow a job calls, when available. */
+export interface CalledJob {
+  job?: string;
+  machine?: string;
+}
+
 /**
  * A job's line as the server words it (`kiln_ci::pipelines::job_line`, the approved stills'): its id;
  * its legs where a matrix makes more than one (`3 platforms`), where it runs (bare metal unless a
@@ -41,11 +47,13 @@ export interface JobLast {
  * last finished run; and what it needs. Its note is what the strip says of it picked: where it
  * runs, what it reserves and its last run (pl-2).
  */
-export function jobLine(id: string, j: Js, secs?: number, last?: JobLast): ShipPipelineLine {
+export function jobLine(id: string, j: Js, secs?: number, last?: JobLast, called?: CalledJob): ShipPipelineLine {
   let legs: string | null = null;
   const at: string[] = [];
-  if (j.uses) at.push(`calls ${String(j.uses)}`);
-  else {
+  if (j.uses) {
+    at.push(`calls ${String(j.uses)}`);
+    if (called?.machine) at.push(called.machine);
+  } else {
     const m = obj(obj(j.strategy).matrix);
     const count = (a: unknown) => (Array.isArray(a) ? Math.max(1, a.length) : 1);
     // kiln's `platforms`, or an axis named for them (`platform`, `os`): pl-2's `3 platforms`.
@@ -79,7 +87,7 @@ export function jobLine(id: string, j: Js, secs?: number, last?: JobLast): ShipP
     const how = last.outcome === "passed" ? "passed in" : last.outcome === "failed" ? "failed after" : "was cancelled after";
     said.push(`its last run ${how} ${spanExact(secs)} on ${last.sha.slice(0, 7)}`);
   }
-  return { key: `jobs.${id}`, kind: "job", name: id, value: parts.join(" · "), note: said.join(" · ") };
+  return { key: `jobs.${id}`, kind: "job", name: called?.job ? `${id} / ${called.job}` : id, value: parts.join(" · "), note: said.join(" · ") };
 }
 
 /** A quantity as kiln's routing reads it (`kiln_ci::sched::routing::number`): `16Gi`, `2G`, `512Mi`, bytes. */
@@ -122,6 +130,16 @@ function reservedWords(j: Js): string | null {
   if (disk > 0) parts.push(`${showSize(Math.floor(disk))} of disk`);
   if (gpu > 0) parts.push(gpu === 1 ? "1 GPU" : `${gpu} GPUs`);
   return parts.length ? parts.join(", ") : null;
+}
+
+/** W29-R04, pl-2: a picked job's literal reservations from the text being edited. */
+export function jobResources(text: string, id: string): string | null {
+  try {
+    const d = parseDocument(text);
+    return d.errors.length ? null : reservedWords(obj(obj(obj(d.toJS()).jobs)[id]));
+  } catch {
+    return null;
+  }
 }
 
 /** A span in its two largest units, as the server says a job's time (`kiln_ci::pipelines::span_exact`): `40s`, `18m 40s`, `2h 5m`, `3d 4h`. */

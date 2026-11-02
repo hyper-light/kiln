@@ -70,10 +70,13 @@ export interface PlanLine {
 const legs = (n: number) => (n === 1 ? "1 leg" : `${n} legs`);
 const jobs = (n: number) => (n === 1 ? "1 job" : `${n} jobs`);
 /** Where a job's legs can go now: `on fedora or adacachy (linux)`, or that nothing connected can take them. */
-export const whereWords = (j: PlanJob) =>
-  j.runners.length
-    ? `on ${j.runners.length > 2 ? `${j.runners.slice(0, -1).join(", ")} or ${j.runners.at(-1)}` : j.runners.join(" or ")}${j.labels.length ? ` (${j.labels.join(", ")})` : ""}`
-    : `no machine connected can take ${j.labels.length ? j.labels.join(", ") : "it"} now`;
+export const whereWords = (j: PlanJob) => {
+  // W29-R04: bare metal is the default machine kind, rather than an extra routing label.
+  const labels = j.labels.filter((l) => !["baremetal", "bare-metal"].includes(l));
+  return j.runners.length
+    ? `on ${j.runners.length > 2 ? `${j.runners.slice(0, -1).join(", ")} or ${j.runners.at(-1)}` : j.runners.join(" or ")}${labels.length ? ` (${labels.join(", ")})` : ""}`
+    : `no machine connected can take ${labels.length ? labels.join(", ") : "it"} now`;
+};
 
 /** A plan's lines: each job, or (with the published plan) what changes and how much is as on `ref`. */
 export function planLines(draft: readonly PlanJob[], published: readonly PlanJob[] | null, ref: string): PlanLine[] {

@@ -10,7 +10,7 @@
 import type http from "node:http";
 import { parse, parseDocument } from "yaml";
 import type { ShipPipelineDraft, ShipPipelineGroup, ShipPipelineLine, ShipPipelinePane, ShipPipelineRepo, ShipPipelineRow, ShipPipelineVerb, ShipPipelines } from "../src/api/ship.ts";
-import { ADDED, CHECKS, FILES, JOB_SECS, LAST_COMMIT, RESOLVED, RUNS, SET_IN, TAG_AGO, TAGS, UPDATES, USED_BY } from "./pipelines-files.ts";
+import { ADDED, CALLED, CHECKS, FILES, JOB_SECS, LAST_COMMIT, RESOLVED, RUNS, SET_IN, TAG_AGO, TAGS, UPDATES, USED_BY } from "./pipelines-files.ts";
 // The pane's words as the server words them: the UI's own, so the mock and the typed text agree.
 import { triggerLines } from "../src/lib/triggers.ts";
 import { jobLine, spanWords, type JobLast } from "../src/lib/typed-groups.ts";
@@ -417,13 +417,14 @@ function workflowGroups(key: string, text: string, kiln: boolean, runsHere: bool
   stages.forEach((ids, i) =>
     out.push({
       name: calls ? "Jobs" : `Stage ${i + 1}`,
-      lines: ids.map((id) => jobLine(id, obj(jobs[id]), JOB_SECS[key]?.[id], lastOf(id))),
+      lines: ids.map((id) => jobLine(id, obj(jobs[id]), JOB_SECS[key]?.[id], lastOf(id), CALLED[String(obj(jobs[id]).uses ?? "")])),
     }),
   );
   const seen = new Set<string>();
   const uses: ShipPipelineLine[] = [];
-  for (const j of Object.values(jobs).map(obj)) {
-    const all: [string, boolean][] = [
+  const direct: [string, boolean][] = Object.values(jobs)
+    .map(obj)
+    .flatMap((j) => [
       ...(j.uses ? [[String(j.uses), true] as [string, boolean]] : []),
       ...(Array.isArray(j.steps)
         ? j.steps
@@ -431,28 +432,38 @@ function workflowGroups(key: string, text: string, kiln: boolean, runsHere: bool
             .filter((s) => s.uses)
             .map((s): [string, boolean] => [String(s.uses), false])
         : []),
-    ];
-    for (const [u, isCall] of all) {
-      if (seen.has(u)) continue;
-      seen.add(u);
-      // As the server words it: a repository kiln hosts by its plain name too, and its standing against that repository's newest release.
-      const ref = u.includes("@") ? u.slice(u.lastIndexOf("@") + 1) : "";
-      const owner = u
-        .replace(/^kiln:\/\//, "")
-        .split("/")
-        .slice(0, 2)
-        .join("/");
-      const hosted = Boolean(SEEDS[owner]);
-      const newest = hosted && /^v?\d+\.\d+\.\d+$/.test(ref) ? (TAGS[owner] ?? []).map(([t]) => t).find((t) => /^v?\d+\.\d+\.\d+$/.test(t)) : undefined;
-      const standing = newest ? (newest === ref ? "newest" : `${newest} is out`) : (RESOLVED[u] ?? "");
-      uses.push({
-        key: `uses.${u}`,
-        kind: "use",
-        name: u,
-        value: `${isCall ? "a reusable workflow, " : ""}${hosted ? "a repository kiln hosts" : fromWords(u)}${standing ? ` · ${standing}` : ""}`,
-        ...(newest && newest !== ref ? { state: "flag" } : {}),
-      });
-    }
+    ]);
+  const todo: [string, boolean, number][] = direct.reverse().map(([u, call]) => [u, call, 0]);
+  while (todo.length) {
+    const next = todo.pop();
+    if (!next) break;
+    const [u, isCall, depth] = next;
+    if (seen.has(u)) continue;
+    seen.add(u);
+    if (isCall && depth < 4)
+      todo.push(
+        ...(CALLED[u]?.uses ?? [])
+          .slice()
+          .reverse()
+          .map(([u, call]): [string, boolean, number] => [u, call, depth + 1]),
+      );
+    // As the server words it: a repository kiln hosts by its plain name too, and its standing against that repository's newest release.
+    const ref = u.includes("@") ? u.slice(u.lastIndexOf("@") + 1) : "";
+    const owner = u
+      .replace(/^kiln:\/\//, "")
+      .split("/")
+      .slice(0, 2)
+      .join("/");
+    const hosted = Boolean(SEEDS[owner]);
+    const newest = hosted && /^v?\d+\.\d+\.\d+$/.test(ref) ? (TAGS[owner] ?? []).map(([t]) => t).find((t) => /^v?\d+\.\d+\.\d+$/.test(t)) : undefined;
+    const standing = newest ? (newest === ref ? "newest" : `${newest} is out`) : (RESOLVED[u] ?? "");
+    uses.push({
+      key: `uses.${u}`,
+      kind: "use",
+      name: u,
+      value: `${isCall ? "a reusable workflow, " : ""}${hosted ? "a repository kiln hosts" : fromWords(u)}${standing ? ` · ${standing}` : ""}`,
+      ...(newest && newest !== ref ? { state: "flag" } : {}),
+    });
   }
   out.push({ name: "Uses", lines: uses });
   const names = (re: RegExp) => [...new Set([...text.matchAll(re)].map((m) => m[1] ?? ""))];

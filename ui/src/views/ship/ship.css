@@ -1487,6 +1487,13 @@
   color: #c9ccd3;
   font-size: 12.5px;
 }
+.ppl-dname > .ppl-preview {
+  margin-right: 8px;
+  vertical-align: -1px;
+}
+.ppl-preview .sg-m {
+  animation: none;
+}
 .ppl-views {
   flex: none;
 }
@@ -1645,7 +1652,7 @@
 /* The file edited in place (W29-R05): the editor over its problems, one height between them. */
 .ppl-yaml {
   display: grid;
-  grid-template-rows: minmax(0, 1fr) 132px;
+  grid-template-rows: minmax(0, 1fr) 164px;
 }
 /* W21's editor holds 420px at the least (index.css); here it's its frame's height. */
 .ppl-yaml .code-editor,
@@ -1791,6 +1798,7 @@
   display: flex;
   flex-wrap: wrap;
   gap: 4px 14px;
+  margin-left: 0;
   padding: 8px 8px 4px;
 }
 /* W29-R08, pl-6: file tabs keep the files' spelling. */
@@ -1855,4 +1863,15 @@
 }
 .ppl-diff li[data-kind="gap"] .ppl-ln {
   color: #4f545e;
+}
+/* W29-R04/R06: a phone keeps change sentences and trigger descriptions readable in its held detail. */
+@media (max-width: 700px) {
+  .ppl-yaml {
+    grid-template-rows: minmax(0, 1fr) 224px;
+  }
+  .ppl-changes .ppl-lines .n,
+  .ppl-kinds .ppl-lines .n {
+    white-space: normal;
+    overflow-wrap: anywhere;
+  }
 }

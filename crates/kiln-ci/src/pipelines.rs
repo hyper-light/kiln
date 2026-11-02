@@ -1009,11 +1009,57 @@ pub struct Seen {
     pub uses: HashMap<String, (String, bool)>,
     /// The `uses` of a repository kiln hosts, named plainly (`acme/kit/.github/actions/x@v1`).
     pub hosted: std::collections::HashSet<String>,
+    /// Facts read from the exact cached version a job calls (W29-R04, pl-7).
+    pub called: HashMap<String, CalledSeen>,
     /// By name: `repository`, `organization`, `server`.
     pub set_in: HashMap<String, String>,
     pub now: i64,
     /// A reusable workflow's newest release, against which its Used by marks who's behind.
     pub newest: Option<String>,
+}
+
+/// A called workflow's one job, where its jobs run when they agree, and its own references.
+/// No file is fetched to supply these facts: absent cached facts leave the caller's line alone.
+#[derive(Debug, Clone, Default)]
+pub struct CalledSeen {
+    pub job: Option<String>,
+    pub machine: Option<&'static str>,
+    pub uses: Vec<(String, bool)>,
+}
+
+/// W29-R04: references in the file's order, with workflow calls distinguished from actions.
+pub fn direct_uses(w: &Workflow) -> Vec<(String, bool)> {
+    w.jobs.iter().flat_map(|j| j.uses.iter().cloned().map(|u| (u, true)).chain(j.steps.iter().filter_map(|s| s.uses.clone()).map(|u| (u, false)))).collect()
+}
+
+/// W29-R04: the cached callee's display facts, without changing the caller's job identity.
+pub fn called_seen(w: &Workflow) -> CalledSeen {
+    let machine = |j: &crate::wf::Job| {
+        j.uses.is_none().then_some(if j.container.is_some() || j.kiln.image.is_some() { "in a container" } else { "bare metal" })
+    };
+    let first = w.jobs.first();
+    CalledSeen {
+        job: first.filter(|_| w.jobs.len() == 1).map(|j| j.id.clone()),
+        machine: first.and_then(machine).filter(|m| w.jobs.iter().all(|j| machine(j) == Some(*m))),
+        uses: direct_uses(w),
+    }
+}
+
+/// W29-R04, pl-7: a call followed by its cached dependencies, once each, in file order. Cycles
+/// and excessive nesting cannot recurse or grow the pane indefinitely.
+fn pane_uses(w: &Workflow, seen: &Seen) -> Vec<(String, bool)> {
+    let mut todo: Vec<_> = direct_uses(w).into_iter().rev().map(|(u, call)| (u, call, 0)).collect();
+    let (mut out, mut listed) = (Vec::new(), std::collections::HashSet::new());
+    while let Some((u, call, depth)) = todo.pop() {
+        if !listed.insert(u.clone()) {
+            continue;
+        }
+        if call && depth < 4 && let Some(c) = seen.called.get(&u) {
+            todo.extend(c.uses.iter().rev().map(|(u, call)| (u.clone(), *call, depth + 1)));
+        }
+        out.push((u, call));
+    }
+    out
 }
 
 /// What kiln has seen of an action beyond its text, for its lines' words as pl-5 has them: when
@@ -1059,10 +1105,14 @@ pub fn span_exact(secs: i64) -> String {
 /// strip says of it picked: where it runs, what it reserves and its last run (`bare metal, linux ·
 /// 2 CPUs, 16 GiB · its last run passed in 18m 40s on a3f2c1d`).
 fn job_line(j: &crate::wf::Job, seen: &Seen) -> Line {
+    let called = j.uses.as_ref().and_then(|u| seen.called.get(u));
     let mut legs: Option<String> = None;
     let mut at: Vec<String> = Vec::new();
     match &j.uses {
-        Some(u) => at.push(format!("calls {u}")),
+        Some(u) => {
+            at.push(format!("calls {u}"));
+            at.extend(called.and_then(|c| c.machine).map(str::to_owned));
+        }
         None => {
             if let Some(crate::wf::ir::Matrix::Spec(m)) = j.strategy.as_ref().and_then(|s| s.matrix.as_ref()) {
                 let count = |a: &crate::wf::ir::Axis| if let crate::wf::ir::Axis::Values(v) = a { v.len().max(1) } else { 1 };
@@ -1108,7 +1158,8 @@ fn job_line(j: &crate::wf::Job, seen: &Seen) -> Line {
         _ => None,
     };
     said.extend(last);
-    Line::new(format!("jobs.{}", j.id), "job", j.id.clone(), parts.join(" · ")).note(said.join(" · "))
+    let name = called.and_then(|c| c.job.as_ref()).map(|id| format!("{} / {id}", j.id)).unwrap_or_else(|| j.id.clone());
+    Line::new(format!("jobs.{}", j.id), "job", name, parts.join(" · ")).note(said.join(" · "))
 }
 
 /// What a job reserves (`resources:`), as pl-2's strip says it: `2 CPUs, 16 GiB`.
@@ -1191,29 +1242,21 @@ pub fn workflow_groups(w: &Workflow, text: &str, runs: &[RunSeen], runs_here: bo
         out.push(group(if calls { "Jobs".to_owned() } else { format!("Stage {}", i + 1) }, lines));
     }
     let mut uses: Vec<Line> = Vec::new();
-    let mut listed: std::collections::HashSet<&str> = std::collections::HashSet::new();
-    for j in &w.jobs {
-        let calls = j.uses.iter().map(|u| (u.as_str(), true));
-        let steps = j.steps.iter().filter_map(|s| s.uses.as_deref()).map(|u| (u, false));
-        for (u, call) in calls.chain(steps) {
-            if !listed.insert(u) {
-                continue;
-            }
-            let from = if seen.hosted.contains(u) { UseFrom::Hosted } else { use_from(u) };
-            let mut value = from.words().to_owned();
-            if call {
-                value = format!("a reusable workflow, {value}");
-            }
-            // Its standing against its newest release, where kiln knows it (pl-2's `v2.4.0 is out`).
-            let line = match seen.uses.get(u) {
-                Some((words, behind)) => {
-                    let l = Line::new(format!("uses.{u}"), "use", u, format!("{value} · {words}"));
-                    if *behind { l.state("flag") } else { l }
-                }
-                None => Line::new(format!("uses.{u}"), "use", u, value),
-            };
-            uses.push(line);
+    for (u, call) in pane_uses(w, seen) {
+        let from = if seen.hosted.contains(&u) { UseFrom::Hosted } else { use_from(&u) };
+        let mut value = from.words().to_owned();
+        if call {
+            value = format!("a reusable workflow, {value}");
         }
+        // Its standing against its newest release, where kiln knows it (pl-2's `v2.4.0 is out`).
+        let line = match seen.uses.get(&u) {
+            Some((words, behind)) => {
+                let l = Line::new(format!("uses.{u}"), "use", u, format!("{value} · {words}"));
+                if *behind { l.state("flag") } else { l }
+            }
+            None => Line::new(format!("uses.{u}"), "use", u, value),
+        };
+        uses.push(line);
     }
     if !uses.is_empty() {
         out.push(group("Uses", uses));
@@ -2319,6 +2362,30 @@ mod tests {
         assert_eq!(floating_words("v4.2.3", ["v4.2.3"], "5a3ec84d4a"), None);
         let groups = workflow_groups(&Workflow::default(), "", &[], true, "", None, &Seen::default());
         assert!(!groups.iter().any(|g| matches!(g.name.as_str(), "Uses" | "Secrets and variables")), "no empty groups");
+    }
+
+    /// W29-R04, pl-7: cached callee facts name its job and machine, and put its dependencies
+    /// after the call, once each. Cycles cannot recurse; absent facts preserve the direct call.
+    #[test]
+    fn w29_r04_a_cached_callees_job_and_dependencies() {
+        let reference = "acme/kit/.github/workflows/check.yml@v2.4.0";
+        let caller = format!("on: push\njobs:\n  rust:\n    uses: {reference}\n  bench:\n    runs-on: local\n    steps:\n      - uses: kiln/checkout@v1\n");
+        let child = "on: workflow_call\njobs:\n  check:\n    runs-on: local\n    steps:\n      - uses: acme/kit/.github/actions/setup@v2.4.0\n      - uses: kiln/checkout@v1\n";
+        let w = crate::wf::parse_workflow(".github/workflows/ci.yml", &caller, crate::expr::Dialect::Gha).0.unwrap_or_default();
+        let callee = crate::wf::parse_workflow(".github/workflows/check.yml", child, crate::expr::Dialect::Gha).0.unwrap_or_default();
+        let mut seen = Seen { called: [(reference.to_owned(), called_seen(&callee))].into(), ..Seen::default() };
+        let groups = workflow_groups(&w, &caller, &[], true, "", None, &seen);
+        let job = groups.iter().find(|g| g.name == "Jobs").and_then(|g| g.lines.first());
+        assert_eq!(job.map(|l| (l.key.as_str(), l.name.as_str(), l.value.as_str())), Some(("jobs.rust", "rust / check", format!("calls {reference} · bare metal").as_str())));
+        let want = [reference, "acme/kit/.github/actions/setup@v2.4.0", "kiln/checkout@v1"];
+        assert_eq!(pane_uses(&w, &seen).iter().map(|(u, _)| u.as_str()).collect::<Vec<_>>(), want);
+        if let Some(c) = seen.called.get_mut(reference) {
+            c.uses.push((reference.into(), true));
+        }
+        assert_eq!(pane_uses(&w, &seen).iter().map(|(u, _)| u.as_str()).collect::<Vec<_>>(), want);
+        assert_eq!(w.jobs.first().map(|j| job_line(j, &Seen::default()).name), Some("rust".into()));
+        let delegated = Workflow { jobs: vec![crate::wf::Job { uses: Some(reference.into()), ..crate::wf::Job::default() }], ..Workflow::default() };
+        assert_eq!(called_seen(&delegated).machine, None, "a delegated job's machine is not guessed");
     }
 
     /// W29-R17, R20: a shared repository's head says its access and its heading says shared; an
