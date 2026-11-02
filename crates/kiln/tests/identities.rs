@@ -251,20 +251,20 @@ fn w27_r01_a_runner_started_again_is_certified_as_its_instance() -> anyhow::Resu
     let s = start(dir.path(), &Options::default())?;
     let (mut first, log) = agents::runner(dir.path(), s.port, "fedora-2", None, TALK)?;
     agents::connected(s.port, &s.admin, "fedora-2", &log, Duration::from_secs(60))?;
-    let main_uri = "kiln://hyper-light/person/admin/machine/fedora-2/instance/main";
+    let main_uri = format!("kiln://hyper-light/person/admin/machine/{}/instance/main", machine("fedora-2"));
     until_identities(&s, "runner", Duration::from_secs(30), |l| l.iter().any(|i| field(i, "subject") == main_uri))?;
     first.0.kill()?;
     first.0.wait()?;
     let upto = std::fs::read_to_string(&log)?.len();
     let (_again, _) = agents::runner(dir.path(), s.port, "fedora-2", None, TALK)?;
-    let certified = "identity certified identity=kiln://hyper-light/person/admin/machine/fedora-2/instance/";
+    let certified = format!("identity certified identity=kiln://hyper-light/person/admin/machine/{}/instance/", machine("fedora-2"));
     let since = || std::fs::read_to_string(&log).unwrap_or_default().get(upto..).unwrap_or_default().to_owned();
     let deadline = Instant::now() + Duration::from_secs(90);
-    while !since().contains(certified) {
+    while !since().contains(&certified) {
         anyhow::ensure!(Instant::now() < deadline, "the runner started again was never certified:\n{}", since());
         std::thread::sleep(Duration::from_millis(200));
     }
-    let lines: Vec<String> = since().lines().filter(|l| l.contains(certified)).map(str::to_owned).collect();
+    let lines: Vec<String> = since().lines().filter(|l| l.contains(&certified)).map(str::to_owned).collect();
     assert!(lines.iter().all(|l| l.trim_end().ends_with("/instance/main")), "certified as another instance: {lines:?}");
     let all = identities(&s, "runner")?;
     assert!(all.iter().all(|i| field(i, "subject") == main_uri), "{all:?}");
@@ -658,7 +658,7 @@ fn w27_ac03_an_agents_commit_verifies_as_the_agent() -> anyhow::Result<()> {
     let out = std::process::Command::new("git").arg("-C").arg(&cwd).args(["cat-file", "commit", "HEAD"]).output()?;
     let sig = gitsig::signature_of(&out.stdout).ok_or_else(|| anyhow::anyhow!("the agent's commit isn't signed: {}", String::from_utf8_lossy(&out.stdout)))?;
     let v = gitsig::verify(&gitsig::payload(&out.stdout), &sig, &root, &revocations_now(&s)?, unix_now()?)?;
-    assert!(matches!(&v.identity.actor, Actor::Agent { agent, held_by: Some(h), .. } if *agent == id && h.machine == "box-a"), "as the agent, on its runner: {v}");
+    assert!(matches!(&v.identity.actor, Actor::Agent { agent, held_by: Some(h), .. } if *agent == id && h.machine == machine("box-a")), "as the agent, on its runner: {v}");
     assert!(!v.identity.is_person("admin"), "never as its person: {v}");
     assert_eq!(v.acts_for(), vec![Identity::new("hyper-light", Actor::Person { name: "admin".into() })], "for its person");
     // Its push went as the agent, for its person; the person's own credential was never asked for.
@@ -1593,7 +1593,7 @@ fn the_leg(dir: &Path) -> anyhow::Result<String> {
 /// The test runner's leg of run 1, as its certificate names it.
 fn e2e_leg() -> kiln_ci::identity::chain::Identity {
     use kiln_ci::identity::chain::{Actor, Identity};
-    Identity::new("hyper-light", Actor::Leg { enrolled_by: "admin".into(), machine: "fedora-2".into(), instance: "main".into(), run: 1, attempt: 1, leg: "e2e".into() })
+    Identity::new("hyper-light", Actor::Leg { enrolled_by: "admin".into(), machine: machine("fedora-2"), instance: "main".into(), run: 1, attempt: 1, leg: "e2e".into() })
 }
 
 /// W27-R05: a leg's logs, its steps' ends, its test report and its conclusion are signed as the
@@ -1612,9 +1612,9 @@ fn w27_r05_a_legs_results_verify_as_the_leg() -> anyhow::Result<()> {
     };
     let v = signed()?;
     assert_eq!(field(&v, "state"), "verified", "{v:#}");
-    assert_eq!(field(&v, "uri"), "kiln://hyper-light/person/admin/machine/fedora-2/instance/main/run/1/attempt/1/leg/e2e");
+    assert_eq!(field(&v, "uri"), format!("kiln://hyper-light/person/admin/machine/{}/instance/main/run/1/attempt/1/leg/e2e", machine("fedora-2")));
     let short = run.sha.get(..7).unwrap_or_default();
-    assert!(field(&v, "signer").starts_with(&format!("leg e2e of run 1 (attempt 1) at {short}, on runner fedora-2")), "{v:#}");
+    assert!(field(&v, "signer").starts_with(&format!("leg e2e of run 1 (attempt 1) at {short}, on runner {}", machine("fedora-2"))), "{v:#}");
     let ends = v.get("steps").and_then(Value::as_array).cloned().unwrap_or_default();
     assert!(ends.len() >= 2 && ends.iter().all(|s| field(s, "status") == "succeeded"), "{v:#}");
     let reports = v.get("reports").and_then(Value::as_array).cloned().unwrap_or_default();
@@ -1685,7 +1685,7 @@ fn w27_r05_a_v1_jobs_results_verify_as_the_leg() -> anyhow::Result<()> {
     let v: Value = serde_json::from_str(&body)?;
     assert_eq!(field(&v, "state"), "verified", "{v:#}");
     let uri = field(&v, "uri");
-    assert!(uri.starts_with("kiln://hyper-light/person/admin/machine/fedora-2/instance/main/run/") && uri.ends_with("/attempt/1/leg/e2e"), "{v:#}");
+    assert!(uri.starts_with(&format!("kiln://hyper-light/person/admin/machine/{}/instance/main/run/", machine("fedora-2"))) && uri.ends_with("/attempt/1/leg/e2e"), "{v:#}");
     let ends = v.get("steps").and_then(Value::as_array).cloned().unwrap_or_default();
     assert!(ends.len() >= 2 && ends.iter().all(|s| field(s, "status") == "succeeded"), "{v:#}");
     let logs = v.get("logs").and_then(Value::as_array).cloned().unwrap_or_default();
@@ -1768,7 +1768,7 @@ fn w27_r06_provenance_verifies_as_the_leg_that_built_it() -> anyhow::Result<()> 
     let st: Value = serde_json::from_slice(&body)?;
     assert_eq!(st.get("predicateType").and_then(Value::as_str), Some(kiln_ci::attest::PROVENANCE));
     assert!(st.pointer("/subject/0/name").and_then(Value::as_str).is_some_and(|n| n.ends_with("artifact.txt")), "{st}");
-    assert_eq!(st.pointer("/predicate/runDetails/byproducts/0/annotations/runner").and_then(Value::as_str), Some("fedora-2"), "{st}");
+    assert_eq!(st.pointer("/predicate/runDetails/byproducts/0/annotations/runner").and_then(Value::as_str), Some(machine("fedora-2").as_str()), "{st}");
     // Its one material is the commit the leg checked out, which is the one pushed.
     let materials = st.pointer("/predicate/buildDefinition/resolvedDependencies").and_then(Value::as_array).cloned().unwrap_or_default();
     assert_eq!(materials.iter().map(|m| m.pointer("/digest/gitCommit").and_then(Value::as_str).unwrap_or_default()).collect::<Vec<_>>(), [run.sha.as_str()], "{st}");
@@ -1778,7 +1778,7 @@ fn w27_r06_provenance_verifies_as_the_leg_that_built_it() -> anyhow::Result<()> 
         serde_json::from_str(&body)?
     };
     let short = run.sha.get(..7).unwrap_or_default();
-    assert!(field(&signed, "signer").starts_with(&format!("leg e2e of run 1 (attempt 1) at {short}, on runner fedora-2")), "{signed:#}");
+    assert!(field(&signed, "signer").starts_with(&format!("leg e2e of run 1 (attempt 1) at {short}, on runner {}", machine("fedora-2"))), "{signed:#}");
     Ok(())
 }
 
@@ -2016,7 +2016,7 @@ fn w27_r04_an_agents_verdict_is_signed_by_its_runner() -> anyhow::Result<()> {
     let v = verdicts.get("verdicts").and_then(Value::as_array).and_then(|l| l.first()).cloned().ok_or_else(|| anyhow::anyhow!("no verdict: {body}\nthe agent's MCP server said: {}", out()))?;
     assert_eq!((field(&v, "action"), field(&v, "standing")), ("accept", "given"), "{v}");
     let signer = kiln_ci::identity::chain::Identity::parse(field(&v, "signer")).map_err(|e| anyhow::anyhow!("{e}: {v}"))?;
-    assert!(matches!(&signer.actor, kiln_ci::identity::chain::Actor::Agent { agent, held_by: Some(h), person, .. } if *agent == id && h.machine == "box-a" && person == "admin"), "as the agent, on its runner, for its person: {signer}");
+    assert!(matches!(&signer.actor, kiln_ci::identity::chain::Actor::Agent { agent, held_by: Some(h), person, .. } if *agent == id && h.machine == machine("box-a") && person == "admin"), "as the agent, on its runner, for its person: {signer}");
     // Its comments and its reply go signed the same way, each kept in the trail as a signed comment
     // (an unsigned one isn't a statement): the reply too, which went unsigned before, and the
     // comment on a line, each signed for where it is.
