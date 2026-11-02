@@ -313,7 +313,7 @@ function Deployments({ n }: { n: Narrowed }) {
   // change with it. One change to each at a time, whichever is pressed (Not failed, or Mark it failed
   // in its dialog): the row's control says meanwhile that it's on its way, also after the dialog's
   // Cancel (W21-R15).
-  const [markAs, changing] = useActions(async (_id: string, d: DoraDeployment, body: Mark, what: string, then?: () => void) => {
+  const [markAs, changing] = useActions(async (_id: string, d: DoraDeployment, body: DeployMark, what: string, then?: () => void) => {
     try {
       await observeApi.markDeployment(d.id, body);
       invalidate("observe/dora");
@@ -403,10 +403,22 @@ function Deployments({ n }: { n: Narrowed }) {
   );
 }
 
-type Mark = Parameters<typeof observeApi.markDeployment>[1];
+type DeployMark = Parameters<typeof observeApi.markDeployment>[1];
 
 /** A deployment marked failed by hand, and what put it right (a later one of its service and environment), when one did. */
-function MarkDialog({ d, later, pending, onMark, onClose }: { d: DoraDeployment; later: DoraDeployment[]; pending: boolean; onMark: (body: Mark, then: () => void) => void; onClose: () => void }) {
+function MarkDialog({
+  d,
+  later,
+  pending,
+  onMark,
+  onClose,
+}: {
+  d: DoraDeployment;
+  later: DoraDeployment[];
+  pending: boolean;
+  onMark: (body: DeployMark, then: () => void) => void;
+  onClose: () => void;
+}) {
   const [by, setBy] = React.useState("");
   const [kind, setKind] = React.useState<DoraRemedyKind>("rollback");
   const form = [by, kind];

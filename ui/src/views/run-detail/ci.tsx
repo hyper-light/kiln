@@ -153,7 +153,7 @@ export function CiRunActions({ detail, jobs }: { detail: CiRunDetail; jobs: stri
 }
 
 /** An approval's two answers. */
-type Decision = "approved" | "rejected";
+type Answer = "approved" | "rejected";
 
 /** An outside contributor's run, waiting for a maintainer before any job starts: approved or
  * rejected in place, in one step (W18-R06). */
@@ -162,14 +162,14 @@ function RunApproval({ detail }: { detail: CiRunDetail }) {
   // Approve and Reject are one decision (W21-R15): the one pressed says it's on its way, the other
   // held until it's back.
   const decision = useHold("Approval failed");
-  const decide = (state: Decision) =>
+  const decide = (state: Answer) =>
     decision.change(state, async () => {
       await ci.approve(run.id, [], state, "");
       toast({ title: state === "approved" ? "Approved: the run starts" : "Rejected: the run is cancelled", tone: "info" });
       invalidate(`run/${run.id}`);
       invalidate(`ci-run/${run.id}`);
     });
-  const hold = (state: Decision) => ({ pending: decision.doing(state), disabled: decision.held(state) });
+  const hold = (state: Answer) => ({ pending: decision.doing(state), disabled: decision.held(state) });
   if (run.approval !== "required") return null;
   return (
     <Confirm
@@ -199,14 +199,14 @@ function DeployReview({ detail }: { detail: CiRunDetail }) {
   const [comment, setComment] = React.useState("");
   // One decision, as the run's approval is.
   const decision = useHold("Review failed");
-  const decide = (state: Decision) =>
+  const decide = (state: Answer) =>
     decision.change(state, async () => {
       await ci.approve(run.id, envs, state, comment);
       toast({ title: state === "approved" ? `Approved: deploying to ${envs.join(", ")}` : "Deployment rejected", tone: "info" });
       invalidate(`run/${run.id}`);
       invalidate(`ci-run/${run.id}`);
     });
-  const hold = (state: Decision) => ({ pending: decision.doing(state), disabled: decision.held(state) });
+  const hold = (state: Answer) => ({ pending: decision.doing(state), disabled: decision.held(state) });
   if (envs.length === 0) return null;
   const label = `Review the deployment to ${envs.join(", ")}`;
   return (
