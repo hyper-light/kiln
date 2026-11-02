@@ -626,7 +626,8 @@ function noteOf(g: ShipPipelineGroup, p: ShipPipelinePane): string {
     case "Secrets and variables":
       return "names only";
     case "Runs":
-      return `on ${p.head.ref}`;
+      // Runs of more than one event say so (pl-8); a push's alone, its branch (pl-2).
+      return new Set(g.lines.map((l) => l.note ?? "")).size > 1 ? "by what started them" : `on ${p.head.ref}`;
     case "Versions":
       return "tags";
     case "Used by":
@@ -640,13 +641,22 @@ function noteOf(g: ShipPipelineGroup, p: ShipPipelinePane): string {
   }
 }
 
-/** A use's source, as its line's kind word says it: built in, this repository, an image, GitHub's, or the repository's name. */
-function sourceOf(uses: string): string {
-  if (uses.startsWith("kiln/")) return "built in";
-  if (uses.startsWith("./")) return "this repository";
-  if (uses.startsWith("docker://")) return "image";
-  const [owner, repo] = uses.replace(/^kiln:\/\//, "").split("/");
-  return owner === "actions" || owner === "github" ? "GitHub" : (repo?.split("@")[0] ?? owner ?? "");
+/** A use's source, as its line's kind word says it (pl-2): built in, this repository, an image, the name of a repository kiln hosts, else GitHub; by the server's words for where it's from, else by its name. */
+function sourceOf(uses: string, from = ""): string {
+  const f = from.replace(/^a reusable workflow, /, "");
+  if (f === "a repository kiln hosts")
+    return (
+      uses
+        .replace(/^kiln:\/\//, "")
+        .split("/")[1]
+        ?.split("@")[0] ?? "kiln"
+    );
+  if (f === "fetched by name") return "GitHub";
+  if (uses.startsWith("kiln/") || f === "kiln's own") return "built in";
+  if (uses.startsWith("./") || f === "this repository") return "this repository";
+  if (uses.startsWith("docker://") || f === "a container image") return "image";
+  if (uses.startsWith("kiln://")) return uses.slice("kiln://".length).split("/")[1]?.split("@")[0] ?? "kiln";
+  return "GitHub";
 }
 
 /** A use as its line names it: an action or workflow in another repository by its own name (`setup-rust@v2.3.0`), the kind word saying whose; the rest as written. */
@@ -664,13 +674,17 @@ function shortUse(uses: string): string {
 function wordsOf(l: ShipPipelineLine): { kind: string | null; name: string; value: string } {
   switch (l.kind) {
     case "trigger":
-      return { kind: l.name, name: l.value, value: "" };
+      return { kind: l.name, name: l.value, value: l.note ?? "" };
     case "use":
-      return { kind: sourceOf(l.name), name: shortUse(l.name), value: l.value.split(" · ").slice(1).join(" · ") };
+      return { kind: sourceOf(l.name, l.value.split(" · ")[0]), name: shortUse(l.name), value: l.value.split(" · ").slice(1).join(" · ") };
     case "version":
       return { kind: l.key === "versions.head" ? "main" : "tag", name: l.key === "versions.head" ? l.value.slice(0, 7) : l.name, value: l.key === "versions.head" ? "" : l.value.slice(0, 7) };
+    case "run":
+      // A push is what most runs are: other events say so (pl-8's DEPLOY, SCHEDULE, COMMENT).
+      return { kind: l.note && l.note !== "push" ? l.note.replace(/_/g, " ") : null, name: l.name, value: l.value };
     case "job":
-      return { kind: l.state === "added" ? "new job" : "job", name: l.name, value: l.value };
+      // What it needs is its stage's note (`after rust and ui`), not its own.
+      return { kind: l.state === "added" ? "new job" : "job", name: l.name, value: l.value.replace(/(^| · )needs .*$/, "") };
     case "secret":
     case "variable":
     case "input":
@@ -727,8 +741,8 @@ const eventKey = (t: ShipPipelineLine) => t.key.replace(/^on\./, "");
 
 /** A trigger as "plan for:" says it: a push to its branch, else its event's words. */
 function eventWords(t: ShipPipelineLine): string {
-  const branch = /(?:^|· )branches ([^,·]+)/.exec(t.value)?.[1]?.trim();
-  return t.name === "push" && branch ? `push to ${branch}` : t.name;
+  const branch = t.value.split(",")[0]?.trim();
+  return t.name === "push" && branch && branch !== "any branch" && !branch.startsWith("tags ") ? `push to ${branch}` : t.name;
 }
 
 /** The plan of `text` for `event` (W04-R29's preview), with a GitHub workflow's overlay applied; a manual run's with its inputs' defaults. */
@@ -792,7 +806,7 @@ function PipelinePane({ repo, row, onChanged }: { repo: ShipPipelineRepo; row: S
   const kiln = h.dialect === "kiln";
   const editable = p.strip.verbs.some((v) => v.verb === "save_draft" && v.enabled);
   // kiln's own triggers of a GitHub workflow come from its overlay, each saying so.
-  const overlaid = ov ? (triggerLines(overlay, true) ?? []).filter((l) => l.whose === "kiln").map((l) => ({ ...l, value: l.value ? `${l.value} · in its overlay` : "in its overlay" })) : [];
+  const overlaid = ov ? (triggerLines(overlay, true) ?? []).filter((l) => l.whose === "kiln").map((l) => ({ ...l, note: l.note ? `${l.note} · in its overlay` : "in its overlay" })) : [];
   const inOverlay = (event: string) => overlaid.some((l) => eventKey(l) === event);
   const written = workflow && (changed || overlaid.length) ? triggerLines(text, kiln) : null;
   const typed = written ? [...written, ...overlaid] : null;
@@ -1556,7 +1570,7 @@ function Detail({
   const [view, setView] = React.useState(views[0] ?? "YAML");
   const shown = views.includes(view) ? view : (views[0] ?? "YAML");
   const file = own?.path ?? pane.head.path;
-  const name = line ? `${(wordsOf(line).name || line.name).replace(/ · in its overlay$|^in its overlay$/, "") || line.name} · ${file}` : file;
+  const name = line ? `${wordsOf(line).name || line.name} · ${file}` : file;
   return (
     <div className="ppl-detail">
       <div className="ppl-dhead">
@@ -1878,7 +1892,7 @@ function UseView({ line }: { line: ShipPipelineLine }) {
       <li>
         <StatusGlyph state="passed" size={12} />
         <span className="n">
-          <em>{sourceOf(line.name)}</em>
+          <em>{sourceOf(line.name, line.value.split(" · ")[0])}</em>
           {line.name}
         </span>
         <span className="v">{line.value}</span>

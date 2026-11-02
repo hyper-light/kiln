@@ -10,7 +10,10 @@
 import type http from "node:http";
 import { parse, parseDocument } from "yaml";
 import type { ShipPipelineDraft, ShipPipelineGroup, ShipPipelineLine, ShipPipelinePane, ShipPipelineRepo, ShipPipelineRow, ShipPipelineVerb, ShipPipelines } from "../src/api/ship.ts";
-import { FILES, RUNS, TAGS, UPDATES, USED_BY } from "./pipelines-files.ts";
+import { FILES, JOB_SECS, RUNS, SET_IN, TAGS, UPDATES, USED_BY } from "./pipelines-files.ts";
+// The pane's words as the server words them: the UI's own, so the mock and the typed text agree.
+import { triggerLines } from "../src/lib/triggers.ts";
+import { jobLine, spanWords } from "../src/lib/typed-groups.ts";
 
 type Ctx = { json: (res: http.ServerResponse, status: number, body: unknown) => void };
 
@@ -346,30 +349,6 @@ function list(q: string, ua: string): ShipPipelines {
   return { repos };
 }
 
-/** An event's words, its group in Add a trigger, and whose it is, as `kiln_ci::pipelines` says them (W29-R06). */
-const EVENTS: Record<string, [string, string, "both" | "github" | "kiln"]> = {
-  push: ["push", "Code", "both"],
-  pull_request: ["pull request", "Code", "both"],
-  diff: ["diff", "Code", "kiln"],
-  land: ["land", "Code", "kiln"],
-  merge_group: ["merge group", "Code", "both"],
-  create: ["create", "Code", "both"],
-  delete: ["delete", "Code", "both"],
-  schedule: ["schedule", "Time", "both"],
-  workflow_dispatch: ["manual", "People and agents", "both"],
-  agent: ["agent", "People and agents", "kiln"],
-  comment: ["comment", "People and agents", "kiln"],
-  review: ["review", "People and agents", "kiln"],
-  workflow_run: ["pipeline", "Other workflows", "both"],
-  pipeline: ["pipeline", "Other workflows", "kiln"],
-  workflow_call: ["called", "Other workflows", "both"],
-  deploy: ["deploy", "Deploys and releases", "kiln"],
-  release: ["release", "Deploys and releases", "both"],
-  registry_package: ["package", "Deploys and releases", "both"],
-  webhook: ["webhook", "Outside kiln", "kiln"],
-  repository_dispatch: ["dispatch", "Outside kiln", "both"],
-};
-
 type Obj = Record<string, unknown>;
 const obj = (v: unknown): Obj => (v && typeof v === "object" && !Array.isArray(v) ? (v as Obj) : {});
 /** A file's YAML as an object; what doesn't read is an empty one. */
@@ -381,43 +360,6 @@ function yamlOf(text: string): Obj {
   }
 }
 const strs = (v: unknown): string[] => (Array.isArray(v) ? v.map(String) : v === undefined || v === null ? [] : [String(v)]);
-
-/** A trigger's filters in a line, in the server's order: types, branches, tags, paths, schedules, workflows, inputs, the rest's names. */
-function filters(event: string, v: unknown): string {
-  const o = obj(v);
-  const parts: string[] = [];
-  if (o.types) parts.push(strs(o.types).join(", "));
-  for (const [k, w] of [
-    ["branches", "branches"],
-    ["branches-ignore", "not branches"],
-    ["tags", "tags"],
-    ["tags-ignore", "not tags"],
-    ["paths", "paths"],
-    ["paths-ignore", "not paths"],
-  ] as const)
-    if (strs(o[k]).length) parts.push(`${w} ${strs(o[k]).join(", ")}`);
-  if (event === "schedule") for (const s of Array.isArray(v) ? v : []) parts.push(`${String(obj(s).cron)} ${String(obj(s).timezone ?? "UTC")}`);
-  if (o.workflows || (event === "pipeline" && o.name)) parts.push(`after ${strs(o.workflows ?? o.name).join(", ")}`);
-  if (o.inputs && event !== "schedule") parts.push(`inputs: ${Object.keys(obj(o.inputs)).join(", ")}`);
-  const known = new Set(["types", "branches", "branches-ignore", "tags", "tags-ignore", "paths", "paths-ignore", "workflows", "inputs", "drafts", ...(event === "pipeline" ? ["name"] : [])]);
-  for (const k of Object.keys(o)) if (!known.has(k)) parts.push(k);
-  return parts.join(" · ");
-}
-
-function triggerLines(on: unknown, kiln: boolean): ShipPipelineLine[] {
-  const entries: [string, unknown][] = typeof on === "string" ? [[on, null]] : Array.isArray(on) ? on.map((e): [string, unknown] => [String(e), null]) : Object.entries(obj(on));
-  const out: ShipPipelineLine[] = entries
-    .filter(([e, v]) => !(kiln && e === "manual" && v === false))
-    .map(([e, v]) => {
-      const event = kiln && e === "manual" ? "workflow_dispatch" : e;
-      const [words, group, whose] = EVENTS[event] ?? [event.replace(/_/g, " "), "Repository", "github"];
-      return { key: `on.${event}`, kind: "trigger", name: words, value: filters(event, v), group, whose };
-    });
-  // kiln's dialect runs by hand unless `manual: false` says it doesn't (W02-R06).
-  if (kiln && !out.some((l) => l.key === "on.workflow_dispatch") && obj(on).manual !== false)
-    out.push({ key: "on.workflow_dispatch", kind: "trigger", name: "manual", value: "", group: "People and agents", whose: "both" });
-  return out;
-}
 
 /** Jobs by how far down their needs go (W29-R04's Stage 1, 2…). */
 function stagesOf(jobs: Obj): string[][] {
@@ -448,7 +390,7 @@ const fromWords = (u: string) =>
 function workflowGroups(key: string, text: string, kiln: boolean, runsHere: boolean): ShipPipelineGroup[] {
   const doc = yamlOf(text);
   const jobs = obj(doc.jobs);
-  const out: ShipPipelineGroup[] = [{ name: "Triggers", lines: triggerLines(doc.on, kiln) }];
+  const out: ShipPipelineGroup[] = [{ name: "Triggers", lines: triggerLines(text, kiln) ?? [] }];
   const call = obj(obj(doc.on).workflow_call);
   if (Object.keys(call).length)
     out.push({
@@ -463,13 +405,7 @@ function workflowGroups(key: string, text: string, kiln: boolean, runsHere: bool
   stagesOf(jobs).forEach((ids, i) =>
     out.push({
       name: `Stage ${i + 1}`,
-      lines: ids.map((id) => {
-        const j = obj(jobs[id]);
-        const labels = strs(j["runs-on"]).join(", ");
-        let value = j.uses ? `calls ${String(j.uses)}` : [labels, j.container ? "in a container" : "bare metal"].filter(Boolean).join(" · ");
-        if (strs(j.needs).length) value += ` · needs ${strs(j.needs).join(", ")}`;
-        return { key: `jobs.${id}`, kind: "job", name: String(j.name ?? id), value };
-      }),
+      lines: ids.map((id) => jobLine(id, obj(jobs[id]), JOB_SECS[key]?.[id])),
     }),
   );
   const seen = new Set<string>();
@@ -487,8 +423,23 @@ function workflowGroups(key: string, text: string, kiln: boolean, runsHere: bool
     for (const [u, isCall] of all) {
       if (seen.has(u)) continue;
       seen.add(u);
+      // As the server words it: a repository kiln hosts by its plain name too, and its standing against that repository's newest release.
       const ref = u.includes("@") ? u.slice(u.lastIndexOf("@") + 1) : "";
-      uses.push({ key: `uses.${u}`, kind: "use", name: u, value: `${isCall ? "a reusable workflow, " : ""}${fromWords(u)}${ref ? ` · ${ref}` : ""}` });
+      const owner = u
+        .replace(/^kiln:\/\//, "")
+        .split("/")
+        .slice(0, 2)
+        .join("/");
+      const hosted = Boolean(SEEDS[owner]);
+      const newest = hosted && /^v?\d+\.\d+\.\d+$/.test(ref) ? (TAGS[owner] ?? []).map(([t]) => t).find((t) => /^v?\d+\.\d+\.\d+$/.test(t)) : undefined;
+      const standing = newest ? (newest === ref ? "newest" : `${newest} is out`) : "";
+      uses.push({
+        key: `uses.${u}`,
+        kind: "use",
+        name: u,
+        value: `${isCall ? "a reusable workflow, " : ""}${hosted ? "a repository kiln hosts" : fromWords(u)}${standing ? ` · ${standing}` : ""}`,
+        ...(standing && standing !== "newest" ? { state: "flag" } : {}),
+      });
     }
   }
   out.push({ name: "Uses", lines: uses });
@@ -496,19 +447,24 @@ function workflowGroups(key: string, text: string, kiln: boolean, runsHere: bool
   out.push({
     name: "Secrets and variables",
     lines: [
-      ...names(/secrets\.([A-Za-z_][A-Za-z0-9_]*)/g).map((n) => ({ key: `secrets.${n}`, kind: "secret", name: n, value: "used" })),
-      ...names(/vars\.([A-Za-z_][A-Za-z0-9_]*)/g).map((n) => ({ key: `vars.${n}`, kind: "variable", name: n, value: "used" })),
+      ...names(/secrets\.([A-Za-z_][A-Za-z0-9_]*)/g).map((n) => ({ key: `secrets.${n}`, kind: "secret", name: n, value: SET_IN[n] ?? "used" })),
+      ...names(/vars\.([A-Za-z_][A-Za-z0-9_]*)/g).map((n) => ({ key: `vars.${n}`, kind: "variable", name: n, value: SET_IN[n] ?? "used" })),
     ],
   });
   out.push({
     name: "Runs",
-    lines: (RUNS[key] ?? []).map((r) => ({
-      key: `runs.${r.n}`,
-      kind: "run",
-      name: `#${r.n}`,
-      value: `${r.event} · ${r.status}`,
-      state: r.status === "passed" ? "passed" : r.status === "failed" ? "failed" : "running",
-    })),
+    // As the server words them: its commit, what came of it, how long ago; its event beside it.
+    lines: (RUNS[key] ?? []).map((r) => {
+      const status = r.status === "failed" && r.failed?.length ? `${r.failed.join(", ")} failed` : r.status;
+      return {
+        key: `runs.${r.n}`,
+        kind: "run",
+        name: r.sha ? r.sha.slice(0, 7) : `#${r.n}`,
+        value: r.ago === undefined ? status : `${status} · ${spanWords(r.ago)}`,
+        note: r.event,
+        state: r.status === "passed" ? "passed" : r.status === "failed" ? "failed" : "running",
+      };
+    }),
   });
   const used = USED_BY[key.replace(/:draft:.*$/, "")];
   if (Object.keys(call).length && used) out.push({ name: "Used by", lines: usedByLines(used) });

@@ -380,8 +380,9 @@ test("a GitHub workflow keeps working on GitHub: a schedule goes in its YAML, ki
   await add("diff");
   const diff = pane.locator('.jp-j[data-key="on.diff"]');
   await expect(pane.locator(".jp-j[data-at]")).toHaveAttribute("data-key", "on.diff");
-  await expect(diff).toContainText("branches main · in its overlay");
-  await expect(pane.locator(".ppl-dname")).toHaveText("branches main · .kiln/overlays/ci.yaml");
+  await expect(diff).toContainText("onto main");
+  await expect(diff).toContainText("in its overlay");
+  await expect(pane.locator(".ppl-dname")).toHaveText("onto main · .kiln/overlays/ci.yaml");
   const filters = pane.getByLabel("diff's filters");
   await expect(filters.locator("li[data-field] > .n")).toHaveText(["branches", "paths", "paths-ignore", "drafts", "authors"]);
   await expect(filters.locator('li[data-field="drafts"] [role=switch]')).toHaveAttribute("aria-checked", "false");

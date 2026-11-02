@@ -386,21 +386,79 @@ async fn runs_list(hub: &Hub, repo: &Repo, branch: &str, path: &str) -> anyhow::
     let (id, branch, path, stem) = (repo.id.clone(), branch.to_owned(), path.to_owned(), stem_of(path));
     hub.store
         .call(move |c| {
+            // Each with its commit, when it was made, and the jobs that failed in it (pl-2's `9e1b2c0 · rust failed`).
             let mut st = c.prepare(
-                "SELECT r.number, r.event, r.status FROM runs r LEFT JOIN ci_workflows w ON w.id = r.workflow_id
+                "SELECT r.number, r.event, r.status, r.sha, r.created_at,
+                        (SELECT group_concat(j.key, ', ') FROM jobs j WHERE j.run_id = r.id AND j.status = 'failed')
+                 FROM runs r LEFT JOIN ci_workflows w ON w.id = r.workflow_id
                  WHERE r.repo_id = ?1 AND r.branch = ?2 AND (w.path = ?3 OR (r.workflow_id IS NULL AND r.pipeline = ?4))
                  ORDER BY r.created_at DESC LIMIT 10",
             )?;
             let mut out = Vec::new();
-            for row in st.query_map(rusqlite::params![id, branch, path, stem], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?, r.get::<_, String>(2)?)))? {
-                let (number, event, status) = row?;
+            let rows = st.query_map(rusqlite::params![id, branch, path, stem], |r| {
+                Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?, r.get::<_, String>(2)?, r.get::<_, String>(3)?, r.get::<_, i64>(4)?, r.get::<_, Option<String>>(5)?))
+            })?;
+            for row in rows {
+                let (number, event, status, sha, at, failed) = row?;
                 let mut seen = (None, false);
                 fold(&mut seen, &status);
-                out.push(core::RunSeen { number, event, outcome: seen.0, running: seen.1 });
+                let failed = failed.map(|f| f.split(", ").map(str::to_owned).collect()).unwrap_or_default();
+                out.push(core::RunSeen { number, event, outcome: seen.0, running: seen.1, sha, at, failed });
             }
             Ok(out)
         })
         .await
+}
+
+/// What kiln has seen of workflow `path` beyond its text, for its lines' words as the approved
+/// stills have them (W29-R04, pl-2):
+/// - each job's time in the workflow's last finished run on `branch`;
+/// - each use of a repository kiln hosts against its newest release (`v2.4.0 is out`, `newest`);
+/// - where each secret and variable it may read is set;
+/// - and now, for the runs' ages.
+async fn seen_of(hub: &Hub, repo: &Repo, branch: &str, path: &str, w: &wf::Workflow) -> core::Seen {
+    let mut seen = core::Seen { now: crate::util::now_unix(), ..core::Seen::default() };
+    let (id, b, p, stem) = (repo.id.clone(), branch.to_owned(), path.to_owned(), stem_of(path));
+    let times = hub
+        .store
+        .call(move |c| {
+            let mut st = c.prepare(
+                "SELECT j.key, j.started_at, j.finished_at FROM jobs j WHERE j.run_id = (
+                   SELECT r.id FROM runs r LEFT JOIN ci_workflows w ON w.id = r.workflow_id
+                   WHERE r.repo_id = ?1 AND r.branch = ?2 AND (w.path = ?3 OR (r.workflow_id IS NULL AND r.pipeline = ?4)) AND r.finished_at IS NOT NULL
+                   ORDER BY r.created_at DESC LIMIT 1)",
+            )?;
+            let rows = st.query_map(rusqlite::params![id, b, p, stem], |r| Ok((r.get::<_, String>(0)?, r.get::<_, Option<i64>>(1)?, r.get::<_, Option<i64>>(2)?)))?;
+            let mut out = HashMap::new();
+            for row in rows {
+                if let (k, Some(s), Some(f)) = row? {
+                    out.insert(k, f - s);
+                }
+            }
+            Ok(out)
+        })
+        .await;
+    seen.job_secs = times.unwrap_or_default();
+    // Each use of a repository kiln hosts, by the full version it names, against that
+    // repository's newest release.
+    let hosted = hub.store.repos().await.unwrap_or_default();
+    let uses: Vec<String> = w.jobs.iter().flat_map(|j| j.uses.iter().cloned().chain(j.steps.iter().filter_map(|s| s.uses.clone()))).collect();
+    for u in uses {
+        let Some(r) = crate::ci::actions::Remote::parse(&u) else { continue };
+        let Some(other) = hosted.iter().find(|x| x.name.eq_ignore_ascii_case(&format!("{}/{}", r.owner, r.repo))) else { continue };
+        seen.hosted.insert(u.clone());
+        if !matches!(kiln_ci::releases::kind_of(&r.git_ref), kiln_ci::releases::TagKind::Full) || seen.uses.contains_key(&u) {
+            continue;
+        }
+        let dir = crate::ci::hosting::native_path(hub, other).unwrap_or_else(|| crate::gitops::mirror_path(hub, &other.name)).to_string_lossy().into_owned();
+        let tags = git(hub, &dir, &["for-each-ref", "--format=%(refname:strip=2)", "refs/tags"]).await;
+        if let Some(newest) = core::newest_release(tags.lines()) {
+            let standing = if newest == r.git_ref.as_str() { ("newest".to_owned(), false) } else { (format!("{newest} is out"), true) };
+            seen.uses.insert(u, standing);
+        }
+    }
+    seen.set_in = crate::ci::secrets::set_in(hub, repo, path).await.unwrap_or_default();
+    seen
 }
 
 /// `GET /api/ship/pipelines/:owner/:name?path=&ref=` (W29-R04): one workflow or action opened at
@@ -444,7 +502,10 @@ pub async fn get(hub: &Arc<Hub>, owner: &str, name: &str, q: &HashMap<String, St
             let runs = runs_list(hub, &repo, &branch, path).await.map_err(internal)?;
             let (access, used) = used_by(hub, &repo, path, false).await;
             let sharing = core::Sharing { repo: &repo.name, access, used_by: &used };
-            let groups = l.workflow.as_ref().map(|w| core::workflow_groups(w, &text, &runs, l.runs, &commit.github_note, Some(&sharing))).unwrap_or_default();
+            let groups = match l.workflow.as_ref() {
+                Some(w) => core::workflow_groups(w, &text, &runs, l.runs, &commit.github_note, Some(&sharing), &seen_of(hub, &repo, &branch, path, w).await),
+                None => Vec::new(),
+            };
             (row, groups)
         }
         None => {
@@ -580,7 +641,10 @@ async fn draft_pane(hub: &Hub, repo: &Repo, id: &str, path: &str, viewer: core::
     let (access, used) = used_by(hub, repo, path, loaded.is_none()).await;
     let sharing = core::Sharing { repo: &repo.name, access, used_by: &used };
     let mut groups = match &loaded {
-        Some(l) => l.workflow.as_ref().map(|w| core::workflow_groups(w, &text, &[], true, "", Some(&sharing))).unwrap_or_default(),
+        Some(l) => match l.workflow.as_ref() {
+            Some(w) => core::workflow_groups(w, &text, &[], true, "", Some(&sharing), &seen_of(hub, repo, &branch, path, w).await),
+            None => Vec::new(),
+        },
         None => {
             let (action, _) = wf::parse_action(&text);
             action.as_ref().map(|a| core::action_groups(a, row.facts.kind, &text, &head, &ctx.versions, &sharing)).unwrap_or_default()

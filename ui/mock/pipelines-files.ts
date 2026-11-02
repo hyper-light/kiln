@@ -351,16 +351,17 @@ export const FILES: Record<string, string> = {
 };
 
 /** A workflow's newest runs on its default branch, newest first: its number, what started it, how it went. */
-export const RUNS: Record<string, { n: number; event: string; status: "passed" | "failed" | "under way" }[]> = {
+/** Each workflow's runs, newest first: its commit, how long ago (seconds) and the jobs that failed, as pl-2 and pl-8 show them. */
+export const RUNS: Record<string, { n: number; event: string; status: "passed" | "failed" | "under way"; sha?: string; ago?: number; failed?: string[] }[]> = {
   "hyper-light/kiln:.kiln/ci.yaml": [
-    { n: 412, event: "push", status: "passed" },
-    { n: 411, event: "push", status: "failed" },
-    { n: 409, event: "pull_request", status: "passed" },
+    { n: 412, event: "push", status: "passed", sha: "a3f2c1d9e8b7", ago: 12 * 60 },
+    { n: 411, event: "push", status: "failed", sha: "9e1b2c0f7a6d", ago: 2 * 3600, failed: ["rust"] },
+    { n: 409, event: "push", status: "passed", sha: "15878aa3c2b1", ago: 86_400 },
   ],
   "hyper-light/kiln:.kiln/smoke.yaml": [
-    { n: 88, event: "deploy", status: "passed" },
-    { n: 87, event: "schedule", status: "passed" },
-    { n: 86, event: "comment", status: "failed" },
+    { n: 88, event: "deploy", status: "passed", sha: "a3f2c1d9e8b7", ago: 6 * 3600 },
+    { n: 87, event: "schedule", status: "passed", sha: "a3f2c1d9e8b7", ago: 14 * 3600 },
+    { n: 86, event: "comment", status: "failed", sha: "c71d0e2a9b8f", ago: 86_400 },
   ],
   "hyper-light/kiln:.kiln/e2e.yaml": [{ n: 301, event: "push", status: "failed" }],
   "hyper-light/kiln:.kiln/release.yaml": [{ n: 17, event: "push", status: "passed" }],
@@ -373,6 +374,14 @@ export const RUNS: Record<string, { n: number; event: string; status: "passed" |
 };
 
 /** Each repository's tags, newest first, with their commits. */
+/** Each job's time in its workflow's last finished run, in seconds (pl-2's `18m`). */
+export const JOB_SECS: Record<string, Record<string, number>> = {
+  "hyper-light/kiln:.kiln/ci.yaml": { rust: 18 * 60 + 40, ui: 4 * 60, vendor: 40 },
+};
+
+/** Where each secret and variable is set (pl-2's `repository`, `server`). */
+export const SET_IN: Record<string, string> = { CARGO_REGISTRY_TOKEN: "repository", KILN_BENCH_HOST: "server" };
+
 export const TAGS: Record<string, [string, string][]> = {
   "hyper-light/ci-kit": [
     ["v2.4.0", "7ac3e1d0b9a8f7e6d5c4b3a2f1e0d9c8b7a6f5e4"],

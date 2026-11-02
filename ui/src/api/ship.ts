@@ -234,6 +234,8 @@ export interface ShipPipelineLine {
   value: string;
   /** A glyph's name, where the line has a state. */
   state?: string;
+  /** What's said beside a trigger's value (`every push`, `03:00 Los Angeles`). */
+  note?: string;
   /** A trigger's group (`Code`, `Time`, …) and whose event it is (W29-R06). */
   group?: string;
   whose?: "both" | "github" | "kiln";

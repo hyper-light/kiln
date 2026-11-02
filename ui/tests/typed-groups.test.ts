@@ -34,7 +34,7 @@ test("w29_r05_a_job_and_a_use_typed_in_join_their_groups_marked_new", () => {
     ["jobs.rust", "jobs.ui", "jobs.helm-lint"],
   );
   assert.equal(stage1[0], SERVER[1]?.lines[0]);
-  assert.deepEqual(stage1[2], { key: "jobs.helm-lint", kind: "job", name: "helm-lint", value: "baremetal, linux · bare metal", state: "added" });
+  assert.deepEqual(stage1[2], { key: "jobs.helm-lint", kind: "job", name: "helm-lint", value: "bare metal · linux", state: "added" });
   // A use following a tag is new and asks to be pinned; one pinned to a commit doesn't.
   const uses = out.find((g) => g.name === "Uses")?.lines ?? [];
   assert.deepEqual(

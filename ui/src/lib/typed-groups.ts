@@ -28,13 +28,70 @@ export function stagesOf(jobs: Js): string[][] {
   return out.filter(Boolean);
 }
 
-/** A job the text adds, worded as the server words a job: its labels, where it runs, what it needs. */
-function newJob(id: string, j: Js): ShipPipelineLine {
-  const labels = strs(j["runs-on"]).join(", ");
-  let value = j.uses ? `calls ${String(j.uses)}` : [labels, j.container ? "in a container" : "bare metal"].filter(Boolean).join(" · ");
-  if (strs(j.needs).length) value += ` · needs ${strs(j.needs).join(", ")}`;
-  return { key: `jobs.${id}`, kind: "job", name: String(j.name ?? id), value, state: "added" };
+/**
+ * A job's line as the server words it (`kiln_ci::pipelines::job_line`, the approved stills'): its id;
+ * its legs where a matrix makes more than one (`3 platforms`), where it runs (bare metal unless a
+ * container is asked for) and its labels beyond that, or the workflow it calls; its time in the
+ * last finished run; and what it needs.
+ */
+export function jobLine(id: string, j: Js, secs?: number): ShipPipelineLine {
+  const parts: string[] = [];
+  if (j.uses) parts.push(`calls ${String(j.uses)}`);
+  else {
+    const m = obj(obj(j.strategy).matrix);
+    const count = (a: unknown) => (Array.isArray(a) ? Math.max(1, a.length) : 1);
+    // kiln's `platforms`, or an axis named for them (`platform`, `os`): pl-2's `3 platforms`.
+    const named = Object.entries(m).find(([k, a]) => ["platform", "platforms", "os"].includes(k) && count(a) > 1);
+    if (named) parts.push(`${count(named[1])} platforms`);
+    else {
+      const legs = Object.entries(m)
+        .filter(([k, a]) => Array.isArray(a) && !["include", "exclude", "platforms"].includes(k))
+        .reduce((n, [, a]) => n * count(a), 1);
+      if (legs > 1) parts.push(`${legs} legs`);
+    }
+    parts.push(j.container || j.image ? "in a container" : "bare metal");
+    const on = j["runs-on"];
+    if (on && typeof on === "object" && !Array.isArray(on)) {
+      const g = obj(on);
+      if (g.group) parts.push(`group ${String(g.group)}`);
+      parts.push(...strs(g.labels).filter((t) => !["baremetal", "bare-metal"].includes(t)));
+    } else parts.push(...strs(on).filter((t) => !["baremetal", "bare-metal"].includes(t)));
+  }
+  // A job only a branch runs: pl-2's `on main`.
+  const on = onBranch(j.if === undefined ? "" : String(j.if));
+  if (on) parts.push(`on ${on}`);
+  // Its time in the last finished run (pl-2's `18m`).
+  if (secs !== undefined) parts.push(spanWords(secs));
+  if (strs(j.needs).length) parts.push(`needs ${strs(j.needs).join(", ")}`);
+  return { key: `jobs.${id}`, kind: "job", name: id, value: parts.join(" · ") };
 }
+
+/** The branch a job's `if:` keeps it to, where that's all it says (`kiln_ci::pipelines::on_branch`). */
+function onBranch(cond: string): string | null {
+  const c = cond
+    .trim()
+    .replace(/^\$\{\{/, "")
+    .replace(/\}\}$/, "")
+    .trim();
+  const at = c.indexOf("==");
+  if (at < 0) return null;
+  const v = c
+    .slice(at + 2)
+    .trim()
+    .replace(/^['"]+|['"]+$/g, "");
+  const l = c.slice(0, at).trim();
+  const b = l === "github.ref" ? (v.startsWith("refs/heads/") ? v.slice("refs/heads/".length) : null) : l === "github.ref_name" ? v : null;
+  return b && !b.includes(" ") ? b : null;
+}
+
+/** A span in its largest unit, as the server says it (`kiln_ci::pipelines::span_words`): `40s`, `18m`, `2h`, `3d`, `3w`. */
+export function spanWords(secs: number): string {
+  const s = Math.max(0, Math.floor(secs));
+  return s < 60 ? `${s}s` : s < 3600 ? `${Math.floor(s / 60)}m` : s < 86_400 ? `${Math.floor(s / 3600)}h` : s < 7 * 86_400 ? `${Math.floor(s / 86_400)}d` : `${Math.floor(s / (7 * 86_400))}w`;
+}
+
+/** A job the text adds: its line, marked new. */
+const newJob = (id: string, j: Js): ShipPipelineLine => ({ ...jobLine(id, j), state: "added" });
 
 /** A use the text adds: new, and asked to be pinned unless it names a whole commit. */
 function newUse(u: string): ShipPipelineLine {
