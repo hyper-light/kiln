@@ -422,7 +422,6 @@ pub fn door_summary(s: &Settings) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use clap::Parser as _;
 
     #[derive(clap::Parser)]
     struct Cli {
