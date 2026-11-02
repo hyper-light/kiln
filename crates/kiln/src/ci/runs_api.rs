@@ -547,7 +547,12 @@ pub async fn cancel(hub: &Hub, id: &str) -> Result<Response, Fail> {
 
 /// `POST /api/ci/runs/:id/rerun`: the run again, from its saved event and the workflow as it
 /// was (a new run; `{ mode: "all" }`, the default).
-pub async fn rerun(hub: &Hub, id: &str, body: &Value, by: &str) -> Result<Response, Fail> {
+pub async fn rerun(hub: &std::sync::Arc<Hub>, id: &str, body: &Value, by: &str) -> Result<Response, Fail> {
+    rerun_as(hub, id, body, None, by).await
+}
+
+/// W29-R25: draft writes use the authenticated principal; a webhook's actor name is no grant.
+pub async fn rerun_as(hub: &std::sync::Arc<Hub>, id: &str, body: &Value, caller: Option<&crate::authz::Caller>, by: &str) -> Result<Response, Fail> {
     use super::dispatch::RerunMode;
     // Another provider's run (W23): its provider reruns it.
     if let Some((repo, provider, ext)) = super::providers::of_run(hub, id).await.map_err(internal)? {
@@ -571,6 +576,7 @@ pub async fn rerun(hub: &Hub, id: &str, body: &Value, by: &str) -> Result<Respon
     // W29-R23: the dispatcher decides this after reading the saved lock snapshot, before
     // any mutable ref or metadata is fetched.
     let fresh_actions = body.get("fresh_actions").and_then(Value::as_bool).unwrap_or(false);
+    if fresh_actions && let Some(draft) = super::locks::fresh_draft(hub, caller, id).await? { return Ok(srv::json(StatusCode::CREATED, &draft)); }
     // "Run anyway" (W08-R10): no leg takes an earlier result over. Run cold (W24-R23): nor does
     // any start from kept folders or restore a cache.
     let cold = body.get("cold").and_then(Value::as_bool).unwrap_or(false);

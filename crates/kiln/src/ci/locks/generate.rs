@@ -37,6 +37,8 @@ struct Collector<'a> {
     bytes: usize,
     items: usize,
     mode: regenerate::Mode,
+    overrides: BTreeMap<String, kiln::Dependency>,
+    moves: BTreeMap<String, (Revision, Revision)>,
 }
 
 fn diagnostics(path: &str, ds: Vec<wf::diag::Diag>) -> String { ds.iter().map(|d| d.render(path)).collect::<Vec<_>>().join("\n") }
@@ -92,6 +94,7 @@ impl Collector<'_> {
     }
 
     fn accepted(&self, context: &Context, uses: &str) -> Result<Option<kiln::Dependency>, String> {
+        if let Some(key) = kiln::canonical_key(uses) && let Some(pin) = self.overrides.get(&key) { return Ok(Some(pin.clone())); }
         let home = self.root.owner.home_host(self.hub, self.caller);
         if let Some(pin) = regenerate::accepted(self.github.as_deref(), self.native.as_deref(), &self.root_workflow, uses, &home).map_err(|ds| diagnostics(&context.workflow, ds))? { return Ok(Some(pin)); }
         for layer in &context.layers {
@@ -114,6 +117,7 @@ impl Collector<'_> {
         remote.usable_by(self.hub, &self.caller.name).await?;
         let revision = self.source.resolve(Repository { name: remote.full(), native: remote.native }, reference.into()).await.map_err(|e| format!("KCI4051 {}: {e}", remote.named()))?;
         revision.validate().map_err(|e| format!("KCI4051 {}: {e}", remote.named()))?;
+        self.revisions.insert(Capture::ref_key(remote, &revision.reference), revision.clone());
         self.revisions.insert(key, revision.clone());
         Ok(revision)
     }
@@ -130,7 +134,7 @@ impl Collector<'_> {
         let immutable = kiln_seams::dependencies::commit_valid(&reference);
         let revision = self.resolve(&remote, if immutable { "HEAD" } else { &reference }).await?;
         let seen = history::Seen::read(self.hub, self.source, &remote, &revision).await?;
-        if accepted.is_none() && self.mode == regenerate::Mode::Preserve { accepted = seen.accepted_pin()?; }
+        if accepted.is_none() { accepted = seen.accepted_pin()?; }
         let identity = match &revision.identity {
             Identity::Github { hostname, owner_id, repo_id } => kiln::Identity::Github { hostname: hostname.clone(), owner_id: *owner_id, repo_id: *repo_id },
             Identity::Native { repo_id } => kiln::Identity::Kiln { id: repo_id.clone() },
@@ -139,7 +143,10 @@ impl Collector<'_> {
             kiln::Identity::Github { hostname, owner_id, repo_id } => (format!("github:{owner_id}/{repo_id}"), Some(hostname.clone())),
             kiln::Identity::Kiln { id } => (format!("kiln:{id}"), None),
         };
-        let wanted = if immutable { reference.to_ascii_lowercase() } else { revision.commit.clone() };
+        // W29-R25: a literal commit stays literal even when its accepted entry records the
+        // branch that proves membership. Fresh actions may refresh its symbolic children.
+        let wanted = if kiln_seams::dependencies::commit_valid(&remote.git_ref) { remote.git_ref.to_ascii_lowercase() }
+            else if immutable { reference.to_ascii_lowercase() } else { revision.commit.clone() };
         let current = kiln::Git { git_ref: revision.reference.clone(), commit: format!("{}-{wanted}", if wanted.len() == 64 { "sha256" } else { "sha1" }), repo, hostname, uses: Vec::new() };
         let mut reachable = BTreeSet::new();
         for sha in accepted.as_ref().and_then(|g| github::digest(&g.commit)).into_iter().chain(std::iter::once(wanted.as_str())) {
@@ -151,6 +158,15 @@ impl Collector<'_> {
             home_host: &context.home, mode: self.mode,
         }).map_err(|ds| diagnostics(&context.workflow, ds))?;
         let commit = github::digest(&pin.commit).ok_or_else(|| format!("KCI1022 {uses}: source commit is invalid"))?.to_owned();
+        if self.mode == regenerate::Mode::Propose && let Some(old) = accepted.as_ref().and_then(|g| github::digest(&g.commit)) && !old.eq_ignore_ascii_case(&commit) {
+            let mut before = revision.clone();
+            before.requested = old.into();
+            before.reference = old.into();
+            before.commit = old.into();
+            before.fresh = false;
+            let key = kiln::canonical_key(uses).ok_or_else(|| format!("KCI4050 {uses}: invalid source key"))?;
+            self.moves.insert(key, (before, revision.clone()));
+        }
         let tree = Tree { owner: Owner { repository: remote.full(), commit, remote: Some(remote.clone()), revision: Some(revision) }, edits: Arc::new(BTreeMap::new()) };
         Ok((pin, tree, remote))
     }
@@ -159,17 +175,16 @@ impl Collector<'_> {
         let key = kiln::canonical_key(key).ok_or_else(|| format!("KCI4050 {key}: image needs a literal reference"))?;
         let reference = ["docker://", "image://", "executor://", "microvm://"].iter().find_map(|p| key.strip_prefix(p)).ok_or_else(|| format!("KCI4050 {key}: image reference is invalid"))?;
         let mut accepted = kiln_ci::lock::execution::Locks::default();
-        if self.mode == regenerate::Mode::Preserve {
-            let exact = self.accepted(context, &key)?;
-            for prefix in ["docker://", "image://", "executor://", "microvm://"] {
-                let alias = format!("{prefix}{reference}");
-                let reachable = self.native.as_ref().is_some_and(|f| f.closure(&self.root_workflow).is_some_and(|c| c.contains(&alias))) || context.layers.iter().any(|l| l.file.closure(&l.workflow).is_some_and(|c| c.contains(&alias)));
-                if exact.is_some() && alias != key || exact.is_none() && !reachable { continue; }
-                if let Some(pin) = self.accepted(context, &alias)? {
-                    let kiln::Dependency::Image(image) = pin else { return Err(format!("KCI4054 {key}: its accepted pin is not an image")); };
-                    let pin = kiln_ci::lock::execution::pin_image(reference, &image.digest)?;
-                    accepted.merge(&kiln_ci::lock::execution::Locks { images: [(reference.into(), pin)].into(), ..Default::default() })?;
-                }
+        // Fresh actions change Git pins; accepted images and runtimes remain fixed.
+        let exact = self.accepted(context, &key)?;
+        for prefix in ["docker://", "image://", "executor://", "microvm://"] {
+            let alias = format!("{prefix}{reference}");
+            let reachable = self.native.as_ref().is_some_and(|f| f.closure(&self.root_workflow).is_some_and(|c| c.contains(&alias))) || context.layers.iter().any(|l| l.file.closure(&l.workflow).is_some_and(|c| c.contains(&alias)));
+            if exact.is_some() && alias != key || exact.is_none() && !reachable { continue; }
+            if let Some(pin) = self.accepted(context, &alias)? {
+                let kiln::Dependency::Image(image) = pin else { return Err(format!("KCI4054 {key}: its accepted pin is not an image")); };
+                let pin = kiln_ci::lock::execution::pin_image(reference, &image.digest)?;
+                accepted.merge(&kiln_ci::lock::execution::Locks { images: [(reference.into(), pin)].into(), ..Default::default() })?;
             }
         }
         let old = self.image_locks.images.get(reference).cloned();
@@ -199,7 +214,7 @@ impl Collector<'_> {
     async fn runtime(&mut self, using: &str, context: &Context) -> Result<String, String> {
         let key = using.to_owned();
         let accepted = self.accepted(context, using)?.or(self.accepted(context, &format!("runtime://{using}"))?);
-        if self.mode == regenerate::Mode::Preserve && let Some(kiln::Dependency::Runtime(mut runtime)) = accepted {
+        if let Some(kiln::Dependency::Runtime(mut runtime)) = accepted {
             for (platform, expected) in &runtime.archives {
                 let mut parts = platform.split('/');
                 let (os, arch, musl) = (parts.next().unwrap_or_default(), parts.next().unwrap_or_default(), parts.next() == Some("musl"));
@@ -351,16 +366,73 @@ impl Collector<'_> {
     }
 }
 
+struct Gathered {
+    github: Option<github::File>,
+    native: Option<kiln::File>,
+    home: String,
+    workflows: Vec<regenerate::Workflow>,
+    resolutions: BTreeMap<String, kiln::Dependency>,
+    revisions: BTreeMap<String, Revision>,
+    moves: BTreeMap<String, (Revision, Revision)>,
+}
+
+impl Gathered {
+    fn files(&self, mode: regenerate::Mode) -> Result<regenerate::Files, String> {
+        let resolutions: Vec<_> = self.resolutions.iter().map(|(key, dependency)| regenerate::Resolution { key: key.clone(), dependency: dependency.clone() }).collect();
+        regenerate::regenerate(regenerate::Input { github: self.github.as_ref(), kiln: self.native.as_ref(), workflows: &self.workflows, resolutions: &resolutions, seeds: &[], home_host: &self.home, mode }).map_err(|ds| diagnostics(kiln::PATH, ds))
+    }
+}
+
+struct Gather<'a> {
+    edits: BTreeMap<String, Option<Vec<u8>>>,
+    paths: Option<&'a [String]>,
+    mode: regenerate::Mode,
+    overrides: BTreeMap<String, kiln::Dependency>,
+    revisions: BTreeMap<String, Revision>,
+}
+
 /// `paths` names touched workflows; None locks every workflow. The supplied edits overlay
 /// their base for metadata and local action reads, without creating a draft or changing a ref.
 pub(super) async fn collect(hub: &Hub, source: &dyn DependencySources, caller: &Repo, commit: &str, edits: BTreeMap<String, Option<Vec<u8>>>, paths: Option<&[String]>, mode: regenerate::Mode) -> Result<regenerate::Files, String> {
+    let gathered = gather(hub, source, caller, commit, Gather { edits, paths, mode, overrides: BTreeMap::new(), revisions: BTreeMap::new() }).await?;
+    // Complete collection prunes obsolete contextual edges, still at accepted commits.
+    gathered.files(if paths.is_none() && mode == regenerate::Mode::Preserve { regenerate::Mode::Rebuild } else { mode })
+}
+
+pub(crate) struct Proposal { pub files: regenerate::Files, pub differences: BTreeMap<String, kiln_seams::dependencies::Difference> }
+
+/// W29-R25: capture new pins only for this workflow, then inspect the complete repository
+/// with those pins as proposal seeds. Shared keys stay coherent; unrelated pins stay accepted.
+/// Neither pass records acceptance or publishes a draft. All mutable refs are captured once.
+pub(super) async fn propose(hub: &Hub, source: &dyn DependencySources, caller: &Repo, commit: &str, edits: BTreeMap<String, Option<Vec<u8>>>, path: &str) -> Result<Proposal, String> {
+    let paths = [path.to_owned()];
+    let proposed = gather(hub, source, caller, commit, Gather { edits: edits.clone(), paths: Some(&paths), mode: regenerate::Mode::Propose, overrides: BTreeMap::new(), revisions: BTreeMap::new() }).await?;
+    if proposed.workflows.first().is_none_or(|w| w.uses.is_none()) { return Err(format!("KCI4051 {path}: the requested workflow is missing")); }
+    let affected: Vec<_> = proposed.github.iter().flat_map(|f| f.workflows.keys()).chain(proposed.native.iter().flat_map(|f| f.workflows.keys())).cloned().chain(std::iter::once(path.to_owned())).collect::<BTreeSet<_>>().into_iter().collect();
+    let all = gather(hub, source, caller, commit, Gather { edits, paths: Some(&affected), mode: regenerate::Mode::Preserve, overrides: proposed.resolutions, revisions: proposed.revisions }).await?;
+    let files = all.files(regenerate::Mode::Propose)?;
+    let mut differences = BTreeMap::new();
+    let mut bytes = 0usize;
+    for (key, (before, after)) in proposed.moves {
+        let difference = source.compare(before.clone(), after.clone()).await.map_err(|e| format!("KCI4051 {key}: code review: {e}"))?;
+        difference.validate().map_err(|e| format!("KCI4051 {key}: code review: {e}"))?;
+        if difference.before != before || difference.after != after { return Err(format!("KCI4051 {key}: code difference does not match the captured source commits")); }
+        for file in &difference.files { bytes = bytes.saturating_add(file.path.len()); for content in file.before.iter().chain(&file.after) { bytes = bytes.saturating_add(content.bytes.len()); } }
+        if bytes > MAX_BYTES { return Err("KCI1022 upstream code differences exceed 16 MiB".into()); }
+        differences.insert(key, difference);
+    }
+    Ok(Proposal { files, differences })
+}
+
+async fn gather(hub: &Hub, source: &dyn DependencySources, caller: &Repo, commit: &str, ask: Gather<'_>) -> Result<Gathered, String> {
+    let Gather { edits, paths, mode, overrides, revisions } = ask;
     if edits.len() > MAX_ITEMS || edits.values().flatten().fold(0usize, |n, bytes| n.saturating_add(bytes.len())) > MAX_BYTES { return Err("KCI1022 draft inputs exceed 16 MiB or 4096 files".into()); }
     if mode == regenerate::Mode::Rebuild && paths.is_some() { return Err("KCI4050 rebuilding needs every workflow to be inspected".into()); }
     let root = Tree { owner: Owner { repository: caller.name.clone(), commit: commit.into(), remote: None, revision: None }, edits: Arc::new(edits) };
     let rules = super::super::routing::sources(hub).await.effective();
     let pools = super::super::pools::sources(hub).await.0;
     let source_mode = if mode == regenerate::Mode::Rebuild { regenerate::Mode::Preserve } else { mode };
-    let mut collector = Collector { hub, caller, source, root: root.clone(), root_workflow: String::new(), root_name: String::new(), github: None, native: None, revisions: BTreeMap::new(), resolutions: BTreeMap::new(), texts: BTreeMap::new(), rules, pools, image_locks: kiln_ci::lock::execution::Locks::default(), manifests: BTreeMap::new(), active: BTreeSet::new(), bytes: 0, items: 0, mode: source_mode };
+    let mut collector = Collector { hub, caller, source, root: root.clone(), root_workflow: String::new(), root_name: String::new(), github: None, native: None, revisions, resolutions: BTreeMap::new(), texts: BTreeMap::new(), rules, pools, image_locks: kiln_ci::lock::execution::Locks::default(), manifests: BTreeMap::new(), active: BTreeSet::new(), bytes: 0, items: 0, mode: source_mode, overrides, moves: BTreeMap::new() };
     let home = root.owner.home_host(hub, caller);
     let github = collector.file(&root, github::PATH).await?.map(|s| github::parse(&s).map_err(|ds| diagnostics(github::PATH, ds))).transpose()?;
     let native = collector.file(&root, kiln::PATH).await?.map(|s| kiln::parse(&s).map_err(|ds| diagnostics(kiln::PATH, ds))).transpose()?;
@@ -379,6 +451,7 @@ pub(super) async fn collect(hub: &Hub, source: &dyn DependencySources, caller: &
     let present: BTreeSet<_> = paths.iter().cloned().collect();
     let mut workflows = Vec::new();
     for path in paths {
+        if collector.file(&root, &path).await?.is_none() { workflows.push(regenerate::Workflow { path, uses: None }); continue; }
         collector.root_workflow = path.clone();
         collector.image_locks = kiln_ci::lock::execution::Locks::default();
         let uses = collector.workflow(&root, &path, &[], "", 0).await?;
@@ -389,9 +462,5 @@ pub(super) async fn collect(hub: &Hub, source: &dyn DependencySources, caller: &
             if !present.contains(path) { workflows.push(regenerate::Workflow { path: path.clone(), uses: None }); }
         }
     }
-    let resolutions: Vec<_> = collector.resolutions.into_iter().map(|(key, dependency)| regenerate::Resolution { key, dependency }).collect();
-    // W29-R25: complete collection can prune obsolete contextual edges. Source selection
-    // above still used Preserve; this cannot borrow a moved commit's metadata for an old pin.
-    let mode = if all && mode == regenerate::Mode::Preserve { regenerate::Mode::Rebuild } else { mode };
-    regenerate::regenerate(regenerate::Input { github: github.as_ref(), kiln: native.as_ref(), workflows: &workflows, resolutions: &resolutions, seeds: &[], home_host: &home, mode }).map_err(|ds| diagnostics(kiln::PATH, ds))
+    Ok(Gathered { github, native, home, workflows, resolutions: collector.resolutions, revisions: collector.revisions, moves: collector.moves })
 }

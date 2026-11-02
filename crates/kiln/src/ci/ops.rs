@@ -187,11 +187,12 @@ pub fn ops() -> &'static [Op] {
                         None => answer(super::runs_api::cancel(&cx.hub, &run).await).await,
                     }
                 }),
-            op!("ci.runs.rerun", "A new attempt of a finished run: every job, the failed ones and what needs them, one job, or a set of jobs (`set`, `jobs`); with debug logging, keeping failed legs to look into.", ro: false, destructive: false,
+            op!("ci.runs.rerun", "A new attempt of a finished run: every job, the failed ones and what needs them, one job, or a set of jobs (`set`, `jobs`); with debug logging, keeping failed legs to look into. Fresh actions in a locked workflow open a lock-change draft with upstream code differences.", ro: false, destructive: false,
                 input: Input::of::<input::CiRunsRerun>(),
                 route: |v| Ok((Method::POST, path(&["runs", &text(v, "run")?, "rerun"]), HashMap::new())),
                 run: |cx: Cx, v: Value| async move {
                     let run = text(&v, "run")?;
+                    if v.get("fresh_actions").and_then(Value::as_bool) == Some(true) { return answer(super::runs_api::rerun_as(&cx.hub, &run, &v, Some(&cx.caller), &cx.caller.name).await).await; }
                     if v.get("mode").and_then(Value::as_str) == Some("set") {
                         let ids: Vec<String> = v.get("jobs").and_then(Value::as_array).map(|a| a.iter().filter_map(Value::as_str).map(str::to_owned).collect()).unwrap_or_default();
                         if ids.is_empty() {
@@ -199,7 +200,7 @@ pub fn ops() -> &'static [Op] {
                         }
                         return answer(super::retry::retry_set(&cx.hub, &run, &ids, &cx.caller.name).await.map(|v| crate::http::server::json(StatusCode::CREATED, &v))).await;
                     }
-                    answer(super::runs_api::rerun(&cx.hub, &run, &v, &cx.caller.name).await).await
+                    answer(super::runs_api::rerun_as(&cx.hub, &run, &v, Some(&cx.caller), &cx.caller.name).await).await
                 }),
             op!("ci.runs.approve", "Approve or reject a run's deployments waiting on environments' reviewers.", ro: false, destructive: false,
                 input: Input::of::<input::CiRunsApprove>(),
@@ -297,7 +298,7 @@ pub fn ops() -> &'static [Op] {
                     if let Some(o) = body.as_object_mut() {
                         o.insert("mode".into(), json!("failed"));
                     }
-                    answer(super::runs_api::rerun(&cx.hub, &text(&v, "run")?, &body, &cx.caller.name).await).await
+                    answer(super::runs_api::rerun_as(&cx.hub, &text(&v, "run")?, &body, Some(&cx.caller), &cx.caller.name).await).await
                 }),
             op!("ci.runs.rerun_job", "A new attempt of a finished run with one job and the jobs that need it.", ro: false, destructive: false,
                 input: Input::of::<input::CiRunsRerunJob>(),
@@ -307,7 +308,7 @@ pub fn ops() -> &'static [Op] {
                     if let Some(o) = body.as_object_mut() {
                         o.insert("mode".into(), json!("job"));
                     }
-                    answer(super::runs_api::rerun(&cx.hub, &text(&v, "run")?, &body, &cx.caller.name).await).await
+                    answer(super::runs_api::rerun_as(&cx.hub, &text(&v, "run")?, &body, Some(&cx.caller), &cx.caller.name).await).await
                 }),
             op!("ci.artifacts.list", "A run's artifacts: names, sizes, digests, expiry.", ro: true, destructive: false,
                 input: Input::of::<input::CiArtifactsList>(),
@@ -1079,6 +1080,8 @@ pub mod input {
         pub keep_failed: Option<i64>,
         /// Run cold (W24-R23): no reuse, no kept folders, no cache restored.
         pub cold: Option<bool>,
+        /// W29-R25: propose fresh locked dependencies in a draft instead of starting an attempt.
+        pub fresh_actions: Option<bool>,
     }
 
     #[derive(Debug, Deserialize, JsonSchema)]
@@ -1337,6 +1340,7 @@ pub mod input {
         pub debug: Option<bool>,
         /// Minutes a failed leg is kept to look into (W17-R02).
         pub keep_failed: Option<i64>,
+        pub fresh_actions: Option<bool>,
     }
 
     #[derive(Debug, Deserialize, JsonSchema)]
@@ -1348,6 +1352,7 @@ pub mod input {
         pub job: String,
         pub debug: Option<bool>,
         pub keep_failed: Option<i64>,
+        pub fresh_actions: Option<bool>,
     }
 
     #[derive(Debug, Deserialize, JsonSchema)]

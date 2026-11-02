@@ -819,7 +819,9 @@ async fn draft_pane(hub: &Hub, repo: &Repo, id: &str, path: &str, viewer: core::
     let overlay = overlay_of(hub, repo, &head, path).await;
     let overlay = overlay.as_ref().map(|(p, t)| (p.as_str(), t.as_str()));
     let opened = core::Opened { repo: &repo.name, row: &row, at: &at, sha: &head, text: &text, viewer, by_hand: runs_by_hand(loaded.as_ref()), changes: None, since: None, overlay, said, lines, update, narrow: Vec::new() };
-    Ok(srv::json(StatusCode::OK, &core::pane_json(&opened, &groups)))
+    let mut pane = core::pane_json(&opened, &groups);
+    if let Some(review) = crate::ci::locks::proposal_for(hub, repo, &d.id, &head).await? && let Some(pane) = pane.as_object_mut() { pane.insert("lock_review".into(), review); }
+    Ok(srv::json(StatusCode::OK, &pane))
 }
 
 /// A draft's newest run: each job's key and status (a job's legs as one: failed, else under way,

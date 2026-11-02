@@ -13,6 +13,8 @@ pub const NAME_MAX: usize = 256;
 pub const PATH_MAX: usize = 4096;
 pub const FILE_MAX: usize = 1 << 20;
 pub const MANIFEST_MAX: usize = 4 << 20;
+pub const DIFFERENCE_MAX: usize = 4 << 20;
+pub const DIFFERENCE_FILES: usize = 4096;
 pub const SIM_REPOSITORIES: usize = 256;
 pub const SIM_COMMITS: usize = 4096;
 pub const SIM_FILES: usize = 4096;
@@ -113,6 +115,65 @@ pub trait DependencySources: Send + Sync {
     fn file(&self, revision: Revision, commit: String, path: String) -> BoxFuture<'_, Result<Vec<u8>, Refusal>>;
     fn manifest(&self, reference: String) -> BoxFuture<'_, Result<Manifest, Refusal>>;
     fn runtime(&self, runtime: Runtime) -> BoxFuture<'_, Result<Archive, Refusal>>;
+    /// W29-R25: all changed source files, including binary bytes and mode changes. This is
+    /// evidence for a review, never permission to accept either commit or run its code.
+    fn compare(&self, _before: Revision, _after: Revision) -> BoxFuture<'_, Result<Difference, Refusal>> {
+        Box::pin(async { Err(Refusal::Unsupported("code difference")) })
+    }
+}
+
+/// Complete file contents let the existing review renderer show the whole code change,
+/// including files outside action metadata. Symlinks are bytes, never followed; a gitlink's
+/// bytes are its commit id. No external diff driver or text conversion supplies these facts.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CodeFile { pub mode: u32, #[serde(rename = "base64", with = "code_bytes")] pub bytes: Vec<u8> }
+
+mod code_bytes {
+    use base64::Engine as _;
+    use serde::{Deserialize as _, Deserializer, Serializer};
+
+    pub fn serialize<S: Serializer>(bytes: &[u8], serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(&base64::engine::general_purpose::STANDARD.encode(bytes))
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Vec<u8>, D::Error> {
+        let text = String::deserialize(deserializer)?;
+        if text.len() > super::DIFFERENCE_MAX.saturating_mul(4).saturating_div(3).saturating_add(4) { return Err(serde::de::Error::custom("code difference exceeds its byte bound")); }
+        base64::engine::general_purpose::STANDARD.decode(text).map_err(|_| serde::de::Error::custom("invalid code bytes"))
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CodeChange { pub path: String, pub before: Option<CodeFile>, pub after: Option<CodeFile> }
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Difference { pub before: Revision, pub after: Revision, pub files: Vec<CodeChange> }
+
+impl CodeFile {
+    pub fn validate(&self) -> Result<(), Refusal> {
+        if !matches!(self.mode, 0o100644 | 0o100755 | 0o120000 | 0o160000)
+            || self.mode == 0o160000 && !std::str::from_utf8(&self.bytes).is_ok_and(commit_valid) { return Err(Refusal::Invalid("code file mode")); }
+        Ok(())
+    }
+}
+
+impl Difference {
+    pub fn validate(&self) -> Result<(), Refusal> {
+        self.before.validate()?;
+        self.after.validate()?;
+        if self.before.repository.canonical() != self.after.repository.canonical() { return Err(Refusal::Invalid("comparison repository")); }
+        if self.before.identity != self.after.identity { return Err(Refusal::IdentityChanged); }
+        if self.files.len() > DIFFERENCE_FILES { return Err(Refusal::Full { what: "changed files", limit: DIFFERENCE_FILES }); }
+        let mut paths = BTreeSet::new();
+        let mut size = 0usize;
+        for change in &self.files {
+            if !path_valid(&change.path) || !paths.insert(&change.path) || change.before == change.after { return Err(Refusal::Invalid("code change")); }
+            size = size.saturating_add(change.path.len());
+            for file in change.before.iter().chain(&change.after) { file.validate()?; size = size.saturating_add(file.bytes.len()); }
+            if size > DIFFERENCE_MAX { return Err(Refusal::TooLarge { what: "code difference", limit: DIFFERENCE_MAX }); }
+        }
+        Ok(())
+    }
 }
 
 fn name(s: &str) -> bool {
@@ -253,6 +314,7 @@ struct State {
     repos: BTreeMap<Repository, Upstream>,
     manifests: BTreeMap<String, Manifest>,
     runtimes: BTreeMap<Runtime, Archive>,
+    modes: BTreeMap<(Repository, String, String), u32>,
 }
 
 /// Deterministic, in memory, bounded. Mutations describe the outside world's changes, never
@@ -276,7 +338,23 @@ impl SimDependencySources {
         let bytes = state.repos.iter().filter(|(r, _)| **r != key).flat_map(|(_, r)| r.source.files.values()).chain(source.files.values())
             .fold(0usize, |n, b| n.saturating_add(b.len()));
         if bytes > SIM_BYTES { return Err(Refusal::Full { what: "repository bytes", limit: SIM_BYTES }); }
+        state.modes.retain(|(repo, _, _), _| repo != &key);
         state.repos.insert(key, Upstream { source, cached: None, online: true, denied: false });
+        Ok(())
+    }
+
+    pub fn put_code_mode(&self, repository: &Repository, commit: &str, path: &str, mode: u32) -> Result<(), Refusal> {
+        repository.validate()?;
+        if !commit_valid(commit) || !path_valid(path) { return Err(Refusal::Invalid("code file")); }
+        let mut state = self.0.lock();
+        let repository = repository.canonical();
+        let source = state.repos.get(&repository).ok_or(Refusal::Missing("repository"))?;
+        let bytes = source.source.files.get(&(commit.into(), path.into())).ok_or(Refusal::Missing("file"))?;
+        if !matches!(mode, 0o100644 | 0o100755 | 0o120000 | 0o160000)
+            || mode == 0o160000 && !std::str::from_utf8(bytes).is_ok_and(commit_valid) { return Err(Refusal::Invalid("code file mode")); }
+        let key = (repository, commit.into(), path.into());
+        if !state.modes.contains_key(&key) && state.modes.len() >= SIM_FILES { return Err(Refusal::Full { what: "file modes", limit: SIM_FILES }); }
+        state.modes.insert(key, mode);
         Ok(())
     }
 
@@ -349,6 +427,35 @@ fn contains(source: &SimRepository, head: &str, commit: &str) -> Result<bool, Re
 }
 
 impl DependencySources for SimDependencySources {
+    fn compare(&self, before: Revision, after: Revision) -> BoxFuture<'_, Result<Difference, Refusal>> {
+        Box::pin(async move {
+            Difference { before: before.clone(), after: after.clone(), files: Vec::new() }.validate()?;
+            let state = self.0.lock();
+            let old = checked(&state, &before)?;
+            let new = checked(&state, &after)?;
+            if before.repository.canonical() != after.repository.canonical() { return Err(Refusal::Invalid("comparison repository")); }
+            if before.identity != after.identity { return Err(Refusal::IdentityChanged); }
+            let repository = before.repository.canonical();
+            let paths: BTreeSet<_> = old.files.keys().filter(|(c, _)| c == &before.commit).chain(new.files.keys().filter(|(c, _)| c == &after.commit)).map(|(_, p)| p).collect();
+            let mut files = Vec::new();
+            let mut size = 0usize;
+            for path in paths {
+                let a = old.files.get(&(before.commit.clone(), path.clone()));
+                let b = new.files.get(&(after.commit.clone(), path.clone()));
+                let am = state.modes.get(&(repository.clone(), before.commit.clone(), path.clone())).copied().unwrap_or(0o100644);
+                let bm = state.modes.get(&(repository.clone(), after.commit.clone(), path.clone())).copied().unwrap_or(0o100644);
+                if a == b && am == bm { continue; }
+                if files.len() >= DIFFERENCE_FILES { return Err(Refusal::Full { what: "changed files", limit: DIFFERENCE_FILES }); }
+                size = size.saturating_add(path.len()).saturating_add(a.map_or(0, Vec::len)).saturating_add(b.map_or(0, Vec::len));
+                if size > DIFFERENCE_MAX { return Err(Refusal::TooLarge { what: "code difference", limit: DIFFERENCE_MAX }); }
+                files.push(CodeChange { path: path.clone(), before: a.map(|bytes| CodeFile { mode: am, bytes: bytes.clone() }), after: b.map(|bytes| CodeFile { mode: bm, bytes: bytes.clone() }) });
+            }
+            let difference = Difference { before, after, files };
+            difference.validate()?;
+            Ok(difference)
+        })
+    }
+
     fn resolve(&self, repository: Repository, reference: String) -> BoxFuture<'_, Result<Revision, Refusal>> {
         Box::pin(async move {
             repository.validate()?;

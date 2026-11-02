@@ -441,7 +441,7 @@ async fn commit_changes(hub: &Arc<Hub>, caller: &Caller, repo: &Repo, host: &cra
 #[allow(clippy::too_many_arguments)]
 async fn save_draft(hub: &Arc<Hub>, caller: &Caller, repo: &Repo, host: Option<&crate::githost::GitHost>, to: &str, (file, content): (&str, &str), more: &[(String, String)], title: &str, body: &Value) -> Result<Value, Fail> {
     let files: Vec<_> = std::iter::once((file, content)).chain(more.iter().map(|(p, text)| (p.as_str(), text.as_str()))).map(|(path, text)| crate::githost::Change { path: path.into(), content: Some(text.as_bytes().to_vec()) }).collect();
-    save_draft_files(hub, caller, repo, host, to, file, &files, title, body, None).await
+    save_draft_files(hub, caller, repo, host, to, file, &files, title, body, None, false).await
 }
 
 /// W29-R25: retain every companion from a native draft's last version. A host keeps those in
@@ -462,7 +462,7 @@ async fn carried_files(hub: &Hub, repo: &Repo, base: &str, head: &str) -> Result
 }
 
 #[allow(clippy::too_many_arguments)]
-async fn save_draft_files(hub: &Arc<Hub>, caller: &Caller, repo: &Repo, host: Option<&crate::githost::GitHost>, to: &str, file: &str, changed: &[crate::githost::Change], title: &str, body: &Value, reference: Option<&str>) -> Result<Value, Fail> {
+async fn save_draft_files(hub: &Arc<Hub>, caller: &Caller, repo: &Repo, host: Option<&crate::githost::GitHost>, to: &str, file: &str, changed: &[crate::githost::Change], title: &str, body: &Value, reference: Option<&str>, fresh: bool) -> Result<Value, Fail> {
     use super::pipeline_drafts::{self as drafts, Draft};
     if !caller.can("diffs.submit", &Scope::Repo { repo: repo.name.clone() }) { return Err((StatusCode::FORBIDDEN, format!("saving a draft in {} needs `diffs.submit`", repo.name))); }
     match (to, host) {
@@ -497,7 +497,10 @@ async fn save_draft_files(hub: &Arc<Hub>, caller: &Caller, repo: &Repo, host: Op
         files.insert(f.path.clone(), f.content.clone());
     }
     let all: Vec<_> = files.iter().map(|(path, content)| crate::githost::Change { path: path.clone(), content: content.clone() }).collect();
-    let locks = super::locks::draft_files(hub, repo, &base, &all, reference.is_some()).await.map_err(|why| (StatusCode::UNPROCESSABLE_ENTITY, why))?;
+    let (locks, differences) = if fresh {
+        let proposal = super::locks::proposed_files(hub, repo, &base, &all, file).await.map_err(|why| (StatusCode::UNPROCESSABLE_ENTITY, why))?;
+        (proposal.files, Some(proposal.differences))
+    } else { (super::locks::draft_files(hub, repo, &base, &all, reference.is_some()).await.map_err(|why| (StatusCode::UNPROCESSABLE_ENTITY, why))?, None) };
     for (path, text) in [(kiln_ci::lock::github::PATH, locks.github), (kiln_ci::lock::kiln::PATH, locks.kiln)] { files.insert(path.into(), text.map(String::into_bytes)); }
     let compare = if to == "diff" { &tip } else { &base };
     let dir = crate::gitops::ensure_commit(hub, repo, compare).await.map_err(|e| internal(&e))?;
@@ -569,6 +572,11 @@ async fn save_draft_files(hub: &Arc<Hub>, caller: &Caller, repo: &Repo, host: Op
     drafts::put(hub, &d).await.map_err(|e| internal(&e))?;
     hub.store.audit(caller.name.clone(), "ci.workflow.draft".into(), format!("{} {file} → {} {}", repo.name, d.name.as_deref().unwrap_or("draft"), if open.is_some() { "saved again" } else { "opened" })).await;
     let mut out = out;
+    if let Some(differences) = differences {
+        let head = drafts::head(hub, repo, &d).await.map_err(|e| internal(&e))?;
+        let evidence = super::locks::keep_proposal(hub, repo, &d, &base, &head, &differences).await?;
+        if let Some(out) = out.as_object_mut() { out.insert("lock_review".into(), evidence); }
+    }
     if let Some(o) = out.as_object_mut() {
         o.insert("draft".into(), serde_json::to_value(&d).unwrap_or(Value::Null));
     }
@@ -585,7 +593,17 @@ pub(crate) async fn lock_draft(hub: &Arc<Hub>, caller: &Caller, repo: &Repo, ref
     let anchor = loaded.workflows.first().map_or(kiln_ci::lock::github::PATH, |w| w.path.as_str());
     let host = crate::githost::for_repo(hub, repo).await;
     let to = match &host { Some(crate::githost::GitHost::Kiln) => "diff", Some(_) => "change", None => "patch" };
-    save_draft_files(hub, caller, repo, host.as_ref(), to, anchor, &[], "Lock workflow dependencies", &json!({}), Some(reference)).await
+    save_draft_files(hub, caller, repo, host.as_ref(), to, anchor, &[], "Lock workflow dependencies", &json!({}), Some(reference), false).await
+}
+
+/// W29-R25: a fresh-action request uses the same draft, author and companion-file writer.
+/// The flag is internal, never taken from the editor's JSON or a caller's display name.
+pub(crate) async fn fresh_lock_draft(hub: &Arc<Hub>, caller: &Caller, repo: &Repo, commit: &str, path: &str) -> Result<Value, Fail> {
+    let scope = Scope::Repo { repo: repo.name.clone() };
+    if !caller.can("workflows.edit", &scope) || !caller.can("diffs.submit", &scope) { return Err((StatusCode::FORBIDDEN, "fresh lock drafts need `workflows.edit` and `diffs.submit`".into())); }
+    let host = crate::githost::for_repo(hub, repo).await;
+    let to = match &host { Some(crate::githost::GitHost::Kiln) => "diff", Some(_) => "change", None => "patch" };
+    save_draft_files(hub, caller, repo, host.as_ref(), to, path, &[], "Review fresh workflow dependencies", &json!({}), Some(commit), true).await
 }
 
 /// Pipelines' New (docs/ci.md W29-R08): `kiln_ci::scaffold`'s files for a kind (`kind`), a

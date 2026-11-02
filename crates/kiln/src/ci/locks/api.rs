@@ -69,6 +69,7 @@ impl Facts {
 }
 
 impl DependencySources for Facts {
+    fn compare(&self, before: Revision, after: Revision) -> BoxFuture<'_, Result<kiln_seams::dependencies::Difference, Refusal>> { self.inner.compare(before, after) }
     fn resolve(&self, repository: Repository, reference: String) -> BoxFuture<'_, Result<Revision, Refusal>> {
         Box::pin(async move {
             let key = (repository.clone(), reference.clone());

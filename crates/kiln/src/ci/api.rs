@@ -231,6 +231,7 @@ async fn outside(hub: &Arc<Hub>, method: &Method, rest: &[&str], q: &HashMap<Str
             }
             None => super::runs_api::cancel(hub, id).await,
         },
+        (&Method::POST, ["runs", id, "rerun"]) if body.get("fresh_actions").and_then(serde_json::Value::as_bool) == Some(true) => super::runs_api::rerun_as(hub, id, &body, caller, caller.map_or("admin", |c| c.name.as_str())).await,
         (&Method::POST, ["runs", id, "rerun"]) => match (body.get("mode").and_then(serde_json::Value::as_str), body.get("jobs").and_then(serde_json::Value::as_array)) {
             // Some of its jobs (W26-R21), passed ones too.
             (Some("set"), Some(jobs)) if !jobs.is_empty() => {
@@ -238,7 +239,7 @@ async fn outside(hub: &Arc<Hub>, method: &Method, rest: &[&str], q: &HashMap<Str
                 super::retry::retry_set(hub, id, &ids, caller.map_or("admin", |c| c.name.as_str())).await.map(|v| crate::http::server::json(StatusCode::CREATED, &v))
             }
             (Some("set"), _) => Err((StatusCode::BAD_REQUEST, "mode `set` names its `jobs`".to_owned())),
-            _ => super::runs_api::rerun(hub, id, &body, caller.map_or("admin", |c| c.name.as_str())).await,
+            _ => super::runs_api::rerun_as(hub, id, &body, caller, caller.map_or("admin", |c| c.name.as_str())).await,
         },
         (&Method::POST, ["runs", id, "approve"]) => super::environments::approve(hub, id, body, caller).await,
         // W05-R28: a finished job again, here or elsewhere (another provider's, by its provider).

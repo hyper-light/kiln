@@ -172,6 +172,49 @@ fn w29_r23_real_sources_pass_the_dependency_source_contract() -> anyhow::Result<
 }
 
 #[test]
+fn w29_r25_whole_source_comparison_keeps_binary_modes_symlinks_and_bounds() -> anyhow::Result<()> {
+    use std::os::unix::fs::PermissionsExt as _;
+    crate::rt::block_on(async {
+        let live = Live::new().await?;
+        let hub = live.hub();
+        let repo = Repository { name: "acme/tools".into(), native: false };
+        let before = live.sources.resolve(repo.clone(), "main".into()).await?;
+        let work = live.root().join("work");
+        let files = work.clone();
+        crate::rt::blocking(move || -> anyhow::Result<()> {
+            std::fs::create_dir_all(files.join("src"))?;
+            std::fs::write(files.join("src/index.js"), b"runNewCode();\n")?;
+            std::fs::write(files.join("data.bin"), [0, 255, 42])?;
+            std::fs::set_permissions(files.join("action.yml"), std::fs::Permissions::from_mode(0o755))?;
+            std::os::unix::fs::symlink("src/index.js", files.join("link"))?;
+            std::fs::write(files.join(".gitattributes"), "*.js diff=hidden\n")?;
+            Ok(())
+        }).await??;
+        git(&hub, &work, &["add", "."]).await?;
+        git(&hub, &work, &["commit", "-qm", "changed code outside action metadata"]).await?;
+        git(&hub, &live.origin, &["fetch", "--quiet", &work.to_string_lossy(), "HEAD:refs/heads/main"]).await?;
+        let after = live.sources.resolve(repo.clone(), "main".into()).await?;
+        let remote = live.sources.remote(&repo, "main")?;
+        let mirror = remote.mirror(&hub);
+        git(&hub, &mirror, &["config", "diff.hidden.command", "does-not-exist"]).await?;
+        let diff = live.sources.compare(before.clone(), after).await?;
+        assert_eq!(diff.files.len(), 5);
+        assert!(diff.files.iter().any(|f| f.path == "src/index.js" && f.after.as_ref().is_some_and(|b| b.bytes == b"runNewCode();\n")));
+        assert!(diff.files.iter().any(|f| f.path == "data.bin" && f.after.as_ref().is_some_and(|b| b.bytes == [0, 255, 42])));
+        assert!(diff.files.iter().any(|f| f.path == "link" && f.after.as_ref().is_some_and(|b| b.mode == 0o120000 && b.bytes == b"src/index.js")));
+        assert!(diff.files.iter().any(|f| f.path == "action.yml" && f.before.as_ref().is_some_and(|b| b.mode == 0o100644) && f.after.as_ref().is_some_and(|b| b.mode == 0o100755)));
+        let files = work.clone();
+        crate::rt::blocking(move || std::fs::write(files.join("oversized.bin"), vec![0; dep::DIFFERENCE_MAX.saturating_add(1)])).await??;
+        git(&hub, &work, &["add", "."]).await?;
+        git(&hub, &work, &["commit", "-qm", "comparison over byte bound"]).await?;
+        git(&hub, &live.origin, &["fetch", "--quiet", &work.to_string_lossy(), "HEAD:refs/heads/main"]).await?;
+        let after = live.sources.resolve(repo, "main".into()).await?;
+        assert_eq!(live.sources.compare(before, after).await, Err(Refusal::TooLarge { what: "code difference", limit: dep::DIFFERENCE_MAX }));
+        Ok(())
+    })
+}
+
+#[test]
 fn w29_r23_sources_never_write_the_host_and_return_no_transport_credentials() -> anyhow::Result<()> {
     crate::rt::block_on(async {
         let live = Live::new().await?;

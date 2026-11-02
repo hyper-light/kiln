@@ -50,6 +50,7 @@ impl Capture<'_> {
                     revision
                 }
             };
+            super::proposals::check_pin(self.hub, self.caller, &revision.identity, &wanted).await?;
             let reachable = self.source.contains(revision.clone(), wanted.clone()).await.map_err(|e| format!("KCI4051 {uses}: {e}"))?;
             let identity = match &revision.identity {
                 Identity::Github { hostname, owner_id, repo_id } => kiln::Identity::Github { hostname: hostname.clone(), owner_id: *owner_id, repo_id: *repo_id },

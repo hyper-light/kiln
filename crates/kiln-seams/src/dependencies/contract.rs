@@ -231,6 +231,30 @@ fn c11<F: DependencySourcesFixture>(f: &F) -> BoxFuture<'_, Result<(), Failure>>
     })
 }
 
+fn c12<F: DependencySourcesFixture>(f: &F) -> BoxFuture<'_, Result<(), Failure>> {
+    Box::pin(async move {
+        let s = f.sources()?;
+        let before = fine("old source", s.resolve(f.repository(), "v1".into()).await)?;
+        let after = fine("new source", s.resolve(f.repository(), "main".into()).await)?;
+        let empty = fine("same source", s.compare(before.clone(), before.clone()).await)?;
+        ensure(empty.files.is_empty(), || "an unchanged tree has code changes".into())?;
+        let difference = fine("whole code difference", s.compare(before.clone(), after.clone()).await)?;
+        fine("bounded difference", difference.validate())?;
+        same("captured old source", difference.before, before.clone())?;
+        same("captured new source", difference.after, after.clone())?;
+        let action = difference.files.iter().find(|f| f.path == "action.yml").ok_or("the changed action is absent from the difference")?;
+        same("old code bytes", action.before.as_ref().map(|f| f.bytes.as_slice()), Some(FIXTURE_OLD))?;
+        same("new code bytes", action.after.as_ref().map(|f| f.bytes.as_slice()), Some(FIXTURE_NEW))?;
+        f.change(FixtureChange::MoveTag).await?;
+        same("a moved tag cannot change a captured comparison", fine("captured difference", s.compare(before.clone(), after.clone()).await)?, Difference { before: before.clone(), after: after.clone(), files: difference.files })?;
+        let mut changed = after.clone();
+        changed.identity = Identity::Native { repo_id: "another-source".into() };
+        same("different identities cannot be compared", s.compare(before.clone(), changed).await, Err(Refusal::IdentityChanged))?;
+        f.change(FixtureChange::Denied).await?;
+        same("comparison cannot bypass source access", s.compare(before, after).await, Err(Refusal::Denied))
+    })
+}
+
 /// The DependencySources contract, clause by clause, also run on kiln's real adapter.
 pub fn cases<F: DependencySourcesFixture>() -> Vec<Case<F>> {
     vec![
@@ -245,12 +269,39 @@ pub fn cases<F: DependencySourcesFixture>() -> Vec<Case<F>> {
         Case { id: "DEPENDENCIES-9", says: "access denial refuses cached resolutions and files as Denied", check: c9::<F> },
         Case { id: "DEPENDENCIES-10", says: "a manifest is bound to its bytes and requested digest, and runtime metadata names an immutable archive and SHA-256; credentials and unsupported runtimes are refused", check: c10::<F> },
         Case { id: "DEPENDENCIES-11", says: "repository URLs and git revision expressions are refused Invalid, and a missing ref is refused Missing", check: c11::<F> },
+        Case { id: "DEPENDENCIES-12", says: "code comparisons retain both captured identities and commits, include complete changed file bytes and modes within their bounds, and obey source access without accepting a pin", check: c12::<F> },
     ]
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn w29_r25_whole_code_comparison_includes_binary_modes_and_refuses_overflow() -> Result<(), Refusal> {
+        futures::executor::block_on(async {
+            let source = SimDependencySources::default();
+            let repo = fixture_repository();
+            let a = "a".repeat(40);
+            let b = "b".repeat(40);
+            let files = [((a.clone(), "src/run".into()), b"same code\n".to_vec()), ((b.clone(), "src/run".into()), b"same code\n".to_vec()), ((a.clone(), "data.bin".into()), vec![0, 255, 1]), ((b.clone(), "data.bin".into()), vec![0, 255, 2]), ((b.clone(), "link".into()), b"src/run".to_vec())].into();
+            let mut upstream = SimRepository { identity: Identity::Native { repo_id: "original".into() }, default_branch: "main".into(), refs: [("refs/tags/v1".into(), a.clone()), ("refs/heads/main".into(), b.clone())].into(), commits: [(a.clone(), vec![]), (b.clone(), vec![a])].into(), files };
+            source.put_repository(repo.clone(), upstream.clone())?;
+            source.put_code_mode(&repo, &b, "src/run", 0o100755)?;
+            source.put_code_mode(&repo, &b, "link", 0o120000)?;
+            let before = source.resolve(repo.clone(), "v1".into()).await?;
+            let after = source.resolve(repo.clone(), "main".into()).await?;
+            let diff = source.compare(before.clone(), after.clone()).await?;
+            assert_eq!(diff.files.len(), 3);
+            assert!(diff.files.iter().any(|f| f.path == "data.bin" && f.after.as_ref().is_some_and(|b| b.bytes == [0, 255, 2])));
+            assert!(diff.files.iter().any(|f| f.path == "link" && f.before.is_none() && f.after.as_ref().is_some_and(|b| b.mode == 0o120000 && b.bytes == b"src/run")));
+            assert!(diff.files.iter().any(|f| f.path == "src/run" && f.before.as_ref().is_some_and(|b| b.mode == 0o100644) && f.after.as_ref().is_some_and(|b| b.mode == 0o100755)));
+            upstream.files.insert((b, "too-big.bin".into()), vec![0; DIFFERENCE_MAX.saturating_add(1)]);
+            source.put_repository(repo, upstream)?;
+            assert_eq!(source.compare(before, after).await, Err(Refusal::TooLarge { what: "code difference", limit: DIFFERENCE_MAX }));
+            Ok(())
+        })
+    }
 
     #[test]
     fn w29_r23_simulated_sources_pass_the_source_contract() -> Result<(), String> {

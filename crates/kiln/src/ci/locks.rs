@@ -336,6 +336,7 @@ impl Capture<'_> {
                 r
             }
         };
+        proposals::check_pin(self.hub, self.caller, &revision.identity, &wanted).await?;
         let reachable = self.source.contains(revision.clone(), wanted.clone()).await.map_err(|e| format!("KCI4051 {uses}: {e}"))?;
         let (hostname, owner_id, repo_id) = match &revision.identity {
             Identity::Github { hostname, owner_id, repo_id } => (hostname.clone(), *owner_id, *repo_id),
@@ -628,6 +629,10 @@ async fn capture_with_policy(hub: &Hub, source: &dyn DependencySources, caller: 
 /// Old runs have no snapshot; their exact original tree still decides whether a fresh-actions
 /// request is a lock change. New unlocked runs have already captured that fact.
 pub async fn refresh_allowed(hub: &Arc<Hub>, caller: &Repo, commit: &str, path: &str, saved: Option<&Frozen>) -> Result<(), String> {
+    if is_locked(hub, caller, commit, path, saved).await? { Err("This workflow is locked. Fresh actions require a reviewed lock change (W29-R25).".into()) } else { Ok(()) }
+}
+
+async fn is_locked(hub: &Arc<Hub>, caller: &Repo, commit: &str, path: &str, saved: Option<&Frozen>) -> Result<bool, String> {
     let locked = match saved {
         Some(f) => f.root_locked,
         None => {
@@ -637,10 +642,10 @@ pub async fn refresh_allowed(hub: &Arc<Hub>, caller: &Repo, commit: &str, path: 
             if let Some(bytes) = owner.file(hub, &source, kiln_ci::lock::kiln::PATH).await? {
                 let text = String::from_utf8(bytes).map_err(|_| "KCI1022 the original kiln lock is not UTF-8".to_owned())?;
                 if kiln_ci::lock::kiln::parse(&text).map_err(|_| "KCI1022 the original kiln lock doesn't read".to_owned())?.workflows.contains_key(path) {
-                    return Err("This workflow is locked. Fresh actions require a reviewed lock change (W29-R25).".into());
+                    return Ok(true);
                 }
             }
-            if !path.starts_with(".github/workflows/") { return Ok(()); }
+            if !path.starts_with(".github/workflows/") { return Ok(false); }
             match owner.file(hub, &source, github::PATH).await? {
                 None => false,
                 Some(bytes) => {
@@ -650,7 +655,7 @@ pub async fn refresh_allowed(hub: &Arc<Hub>, caller: &Repo, commit: &str, path: 
             }
         }
     };
-    if locked { Err("This workflow is locked. Fresh actions require a reviewed lock change (W29-R25).".into()) } else { Ok(()) }
+    Ok(locked)
 }
 
 pub async fn retry_needs_preflight(hub: &Hub, run: &str) -> Result<bool, String> {
@@ -703,6 +708,9 @@ mod native;
 mod execution;
 mod history;
 mod generate;
+mod proposals;
+pub use proposals::{fresh_draft, proposal_for};
+pub(crate) use proposals::{keep_proposal, proposed_files};
 mod replay;
 pub(crate) use replay::{lock_path, regenerate_tree};
 mod api;

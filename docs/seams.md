@@ -638,7 +638,10 @@ Qualified refs are exact: a tag whose name looks like a qualified branch or tag 
 substitute its history for that requested ref (W29-R23/R24).
 A full commit SHA names that object, even if a tag has the same spelling.
 Runtime requests can name an exact version; a newer default does not replace that version's
-archive metadata (W29-R24).
+archive metadata (W29-R24). Code comparisons return complete changed file contents and modes
+between captured commits of the same repository identity, including binary files, symlinks
+and gitlinks. Diff drivers and text conversion cannot alter these facts. A comparison supplies
+evidence for a review; it never grants approval or makes either commit executable (W29-R25).
 
 - **Implementations:** `kiln_seams::dependencies::SimDependencySources`, deterministic and in
   memory; kiln's git, host, OCI and runtime adapter (`ci::dependency_sources`).
@@ -647,6 +650,8 @@ archive metadata (W29-R24).
 - **Passed by:** the simulator's shared contract. The real adapter runs the same contract on
   isolated git repositories and HTTP fixtures in its tests.
 - **Bounds:** names to 256 bytes; paths and URLs to 4096 bytes; files to 1 MiB; manifests to 4 MiB.
+  A complete code difference has at most 4096 changed files and 4 MiB of paths and file bytes;
+  overflow is refused, never truncated. Git diagnostics are drained separately and discarded.
   The simulator keeps 256 repositories, each with at most 4096 commits, 4096 files and 1024 refs,
   16 parents per commit, 64 MiB of repository file bytes across repositories; 256 manifests and
   runtime archives each, with at most 64 MiB of manifest bytes. Insertion past a table or byte
@@ -656,7 +661,7 @@ archive metadata (W29-R24).
   The real adapter keeps an identity record beside its mirror, at most 8 KiB, bound to the
   actual source's host and repository. Changing a source mapping cannot borrow that identity.
 
-Methods: `resolve`, `contains`, `file`, `manifest`, `runtime`.
+Methods: `resolve`, `contains`, `file`, `manifest`, `runtime`, `compare`.
 
 - **DEPENDENCIES-1** a ref resolves to its source identity and peeled commit, retaining the request and qualified ref; HEAD names its default branch
 - **DEPENDENCIES-2** moving a tag changes a new resolution, while a captured revision keeps its commit, history and file bytes
@@ -669,3 +674,4 @@ Methods: `resolve`, `contains`, `file`, `manifest`, `runtime`.
 - **DEPENDENCIES-9** access denial refuses cached resolutions and files as Denied
 - **DEPENDENCIES-10** a manifest is bound to its bytes and requested digest, and runtime metadata names an immutable archive and SHA-256; credentials and unsupported runtimes are refused
 - **DEPENDENCIES-11** repository URLs and git revision expressions are refused Invalid, and a missing ref is refused Missing
+- **DEPENDENCIES-12** code comparisons retain both captured identities and commits, include complete changed file bytes and modes within their bounds, and obey source access without accepting a pin

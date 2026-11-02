@@ -230,6 +230,10 @@ impl<H: Deref<Target = Hub> + Send + Sync> Sources<H> {
 }
 
 impl<H: Deref<Target = Hub> + Send + Sync> DependencySources for Sources<H> {
+    fn compare(&self, before: Revision, after: Revision) -> BoxFuture<'_, Result<dep::Difference, Refusal>> {
+        Box::pin(compare::compare(self, before, after))
+    }
+
     fn resolve(&self, repository: Repository, reference: String) -> BoxFuture<'_, Result<Revision, Refusal>> {
         Box::pin(async move {
             let remote = self.remote(&repository, &reference)?;
@@ -323,6 +327,8 @@ impl<H: Deref<Target = Hub> + Send + Sync> DependencySources for Sources<H> {
         })
     }
 }
+
+mod compare;
 
 #[cfg(all(test, unix))]
 pub(crate) mod tests;
