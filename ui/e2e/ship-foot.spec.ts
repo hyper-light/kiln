@@ -1,6 +1,6 @@
 /**
  * An opened commit's foot as f-ship draws it (plan 01a1856fe81375b1bd1d1d86f270a45b, step 11),
- * against the mock's D41: Runs, Diff and Commit ↗, each going where it says: Runs to the commit's
+ * against the mock's D41: Runs, Diff and Commit, each going where it says: Runs to the commit's
  * runs on its page, Diff to its Files here, Commit to its page.
  */
 import { expect, test, type Page } from "@playwright/test";
@@ -21,7 +21,10 @@ const openD41 = async (page: Page) => {
 test("the foot is Runs, Diff and Commit, each going where it says", async ({ page }) => {
   test.setTimeout(90_000);
   const { row, foot } = await openD41(page);
-  await expect(foot.locator(":scope > *")).toHaveText(["Runs", "Diff", "Commit ↗"]);
+  await expect(foot.locator(":scope > *")).toHaveText(["Runs", "Diff", "Commit"]);
+  // From the left, as Ada asked (2026-11-01): the first where the foot starts.
+  const [footAt, firstAt] = await Promise.all([foot.boundingBox(), foot.locator(":scope > *").first().boundingBox()]);
+  expect(Math.abs((firstAt?.x ?? Infinity) - (footAt?.x ?? 0))).toBeLessThanOrEqual(1);
   // Diff: its Files here, brought into view and focused.
   await page.evaluate(() => window.scrollTo(0, document.documentElement.scrollHeight));
   await foot.getByRole("button", { name: "Diff" }).click();
@@ -34,7 +37,7 @@ test("the foot is Runs, Diff and Commit, each going where it says", async ({ pag
   await expect(page.getByRole("region", { name: "Runs" })).toBeVisible({ timeout: 15_000 });
   // Commit: its page.
   const again = await openD41(page);
-  await again.foot.getByRole("link", { name: "Commit ↗" }).click();
+  await again.foot.getByRole("link", { name: "Commit", exact: true }).click();
   await expect(page).toHaveURL(/\/ship\/hyper-light\/kiln\/[0-9a-f]{7,40}$/);
   await expect(page.getByRole("region", { name: "Commit" })).toBeVisible({ timeout: 15_000 });
 });

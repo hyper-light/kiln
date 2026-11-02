@@ -4014,9 +4014,20 @@ async fn build_binary(hub: &Arc<Hub>, id: &str, q: &HashMap<String, String>, req
         return Err(err(StatusCode::UNAUTHORIZED, "bad build token"));
     }
     let sha256 = q.get("sha256").cloned().unwrap_or_default();
-    let bytes = srv::body_bytes(req.into_body(), crate::updates::MAX_BINARY).await.map_err(|e| err(StatusCode::PAYLOAD_TOO_LARGE, format!("{e:#}")))?;
-    crate::fleet::on_built(hub, id, &sha256, Some(bytes.to_vec())).await.map_err(|e| err(StatusCode::BAD_REQUEST, format!("{e:#}")))?;
+    let arrived = arriving_binary(hub, req).await.map_err(|e| err(StatusCode::BAD_REQUEST, format!("{e:#}")))?;
+    crate::fleet::on_built(hub, id, &sha256, Some(arrived)).await.map_err(|e| err(StatusCode::BAD_REQUEST, format!("{e:#}")))?;
     Ok(srv::status(StatusCode::NO_CONTENT))
+}
+
+/// A binary sent as a request's body, written to a file as it comes and hashed as it passes
+/// (`crate::updates::Arriving`): never held whole in memory, so none is too large but for the disk.
+async fn arriving_binary(hub: &Hub, req: Request) -> anyhow::Result<crate::updates::Arrived> {
+    let mut body = req.into_body();
+    let mut arriving = crate::updates::Arriving::new(&crate::updates::arriving_dir(hub))?;
+    while let Some(chunk) = srv::next_chunk(&mut body).await? {
+        arriving.write(&chunk)?;
+    }
+    arriving.done()
 }
 
 // ------------------------------------------------------------------ updates (System → Updates)
@@ -4297,8 +4308,8 @@ async fn upload_binary(hub: &Arc<Hub>, q: &HashMap<String, String>, req: Request
     if !crate::updates::known_target(&target) {
         return Err(err(StatusCode::BAD_REQUEST, format!("unknown platform {target:?}: one of {TARGET}, {}", RELEASE_TARGETS.join(", "))));
     }
-    let bytes = srv::body_bytes(req.into_body(), crate::updates::MAX_BINARY).await.map_err(|e| err(StatusCode::PAYLOAD_TOO_LARGE, format!("{e:#}")))?;
-    let b = crate::updates::store(hub, &target, bytes.to_vec(), "upload").await.map_err(|e| err(StatusCode::BAD_REQUEST, format!("{e:#}")))?;
+    let arrived = arriving_binary(hub, req).await.map_err(|e| err(StatusCode::BAD_REQUEST, format!("{e:#}")))?;
+    let b = crate::updates::store(hub, &target, &arrived, "upload").await.map_err(|e| err(StatusCode::BAD_REQUEST, format!("{e:#}")))?;
     hub.store.audit("admin".into(), "upgrade.binary".into(), format!("uploaded build {} for {target}", b.build)).await;
     hub.emit(&crate::wire::events::ServerEvent::Updates);
     Ok(srv::json(StatusCode::OK, &b))

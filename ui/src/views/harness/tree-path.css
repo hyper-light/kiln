@@ -1,0 +1,64 @@
+/* A subagent tree's path (tree-path.tsx): hairline lanes, the tan piece of a row that needs you,
+   and each row's mark in Mission control's stand colours (mission.css). */
+.tp {
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  left: 0;
+  height: 100%;
+  overflow: visible;
+  pointer-events: none;
+}
+.tp-line {
+  fill: none;
+  stroke: #343a45;
+  stroke-width: 1;
+}
+.tp-hot {
+  fill: none;
+  stroke: #c6b08e;
+  stroke-width: 2;
+}
+.tp-bg {
+  fill: var(--tp-bg, #08090a);
+}
+.tp-mark {
+  fill: none;
+  stroke: #7b7e88;
+  stroke-width: 1.6;
+}
+.tp-bars {
+  stroke-width: 1.2;
+  stroke-linecap: round;
+}
+.tp-outer {
+  stroke-opacity: 0.5;
+  stroke-width: 1;
+}
+.tp-dot {
+  fill: #a8c9bc;
+}
+.tp[data-stand="working"] .tp-mark {
+  stroke: #bab0e3;
+}
+.tp[data-stand="needs"] .tp-mark {
+  stroke: #d8bb95;
+}
+.tp[data-stand="paused"] .tp-mark {
+  stroke: #a6b2c6;
+}
+.tp[data-stand="done"] .tp-mark {
+  stroke: #a8c9bc;
+}
+.tp[data-stand="failed"] .tp-mark,
+.tp[data-stand="stopped"] .tp-mark {
+  stroke: #d1aaad;
+}
+
+/* A variant a person branched from another: the fork before its name. */
+.tree-fork {
+  display: inline-block;
+  margin-right: 5px;
+  vertical-align: -1px;
+  color: #b8a6d5;
+}

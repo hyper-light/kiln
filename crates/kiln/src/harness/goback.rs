@@ -105,6 +105,88 @@ pub fn branch_prompt(core: &Core, upto: Option<&str>) -> String {
     )
 }
 
+/// What one of its harness's own subagents (its thread under its spawning call `spawn`) was asked
+/// (`asked`, its brief when its thread lacks one) and did, in words, for a variant of it
+/// ([`branch_spec`]).
+pub fn thread_words(core: &Core, spawn: &str, asked: Option<&str>) -> String {
+    let mut out = String::new();
+    let thread: Vec<&super::model::Event> = core.events().filter(|e| e.parent.as_deref() == Some(spawn)).collect();
+    if let Some(a) = asked.map(str::trim).filter(|a| !a.is_empty())
+        && !thread.iter().any(|e| matches!(&e.body, Body::User { .. }))
+    {
+        out.push_str(&format!("Its agent: {a}\n\n"));
+    }
+    for e in thread {
+        match &e.body {
+            Body::User { text, origin, .. } if origin.as_deref() == Some("human") => out.push_str(&format!("You: {}\n\n", text.trim())),
+            Body::User { text, .. } => out.push_str(&format!("Its agent: {}\n\n", text.trim())),
+            Body::Assistant { text, .. } if !text.trim().is_empty() => out.push_str(&format!("It: {}\n\n", text.trim())),
+            _ => {}
+        }
+    }
+    let out = out.trim();
+    if out.is_empty() {
+        "It had nothing to show yet.".to_owned()
+    } else {
+        super::model::clip_middle(out, 32 * 1024).0
+    }
+}
+
+/// What a branch a person asks for (`Command::Branch`) is made from: session `id`, its own spec
+/// as it resumes (`own`), whether its harness forks a resumed conversation (`can_fork`), its
+/// conversation in words for when it can't ([`branch_prompt`]), and, for one of its harness's own
+/// subagents, that one's task and its thread in words ([`thread_words`]).
+pub struct BranchFrom<'a> {
+    pub id: &'a str,
+    pub own: super::session::Spec,
+    pub can_fork: bool,
+    pub conversation: String,
+    pub task: Option<(&'a str, String)>,
+}
+
+/// The new session a person's branch starts (`Command::Branch`), named by their `words`. Of the
+/// session itself: from its own spec, so beside it under the same agent, its conversation forked
+/// where its harness can (their words its first message) and said in words where it can't. Of one
+/// of its harness's own subagents: that one's thread in words, then theirs, a subagent of the
+/// session. `top`: an agent of its own (no parent, not a subagent).
+pub fn branch_spec(from: BranchFrom<'_>, words: &str, top: bool) -> super::session::Spec {
+    let words = words.trim();
+    let mut b = from.own;
+    match from.task {
+        None => {
+            if from.can_fork && b.resume.is_some() {
+                b.fork = true;
+                b.prompt = Some(words.to_owned());
+            } else {
+                b.resume = None;
+                b.fork = false;
+                b.prompt = Some(format!("{}\n\n{words}", from.conversation));
+            }
+            b.variant_of = Some(from.id.to_owned());
+        }
+        Some((task, thread)) => {
+            b.resume = None;
+            b.fork = false;
+            b.prompt = Some(format!("You are a variant of another agent's subagent. What it was asked, and did, so far:\n\n{thread}\n\nGo on from there, with this change: {words}"));
+            b.parent = Some(from.id.to_owned());
+            b.subagent = true;
+            b.variant_of = Some(format!("{}/{task}", from.id));
+        }
+    }
+    if top {
+        b.parent = None;
+        b.subagent = false;
+    }
+    b.resume_at = None;
+    b.name = Some(super::model::clip_middle(words, 80).0);
+    // Its own, not what it was branched from's: no plan step, card, or process to take over.
+    b.plan_run = None;
+    b.helper = None;
+    b.takeover_pid = None;
+    b.takeover_stop = false;
+    b
+}
+
 /// Put `cwd`'s workspace back to its state at `at`: the newest checkpoint at or before it (each
 /// prompt and pause made one — `pause::snapshot`), taken into the folder's index and worktree;
 /// what the tree doesn't know is cleaned away. Human words on what happened.
@@ -148,6 +230,49 @@ mod tests {
 
     fn said(core: &mut Core, id: &str, text: &str) {
         core.upsert(id, None, Body::Assistant { text: text.into(), streaming: false });
+    }
+
+    /// A person's branch: of a subagent kiln started, beside it with its conversation forked where
+    /// its harness can and said where it can't; of one of its harness's own, its thread said, a
+    /// subagent of the session; New agent, of its own. Each says what it was branched from.
+    #[test]
+    fn a_branch_is_a_variant_beside_it_or_an_agent_of_its_own() {
+        use super::super::session::Spec;
+        let own = Spec { kind: "claude".into(), resume: Some("cs-1".into()), parent: Some("lead".into()), subagent: true, plan_run: Some("run".into()), name: Some("Leader election".into()), ..Spec::default() };
+        let from = |can_fork: bool, task: Option<(&'static str, String)>| BranchFrom { id: "s1", own: own.clone(), can_fork, conversation: "What it was: elections.".into(), task };
+
+        let v = branch_spec(from(true, None), " Batch entries 64 at a time ", false);
+        assert!(v.fork && v.resume.as_deref() == Some("cs-1"), "forked from its own conversation");
+        assert_eq!(v.prompt.as_deref(), Some("Batch entries 64 at a time"));
+        assert_eq!((v.parent.as_deref(), v.subagent, v.variant_of.as_deref()), (Some("lead"), true, Some("s1")), "beside it, under the same agent");
+        assert_eq!((v.name.as_deref(), v.plan_run.as_deref()), (Some("Batch entries 64 at a time"), None), "named by the words; no step of a plan of its own");
+
+        let said = branch_spec(from(false, None), "Batch entries", false);
+        assert!(!said.fork && said.resume.is_none());
+        assert_eq!(said.prompt.as_deref(), Some("What it was: elections.\n\nBatch entries"));
+
+        let sub = branch_spec(from(true, Some(("t9", "It: measured two terms.".into()))), "Try five nodes", false);
+        assert!(!sub.fork && sub.resume.is_none());
+        assert!(sub.prompt.as_deref().is_some_and(|p| p.contains("It: measured two terms.") && p.ends_with("Go on from there, with this change: Try five nodes")));
+        assert_eq!((sub.parent.as_deref(), sub.subagent, sub.variant_of.as_deref()), (Some("s1"), true, Some("s1/t9")), "a subagent of the session it's in");
+
+        let top = branch_spec(from(true, None), "Its own way", true);
+        assert_eq!((top.parent, top.subagent, top.variant_of.as_deref()), (None, false, Some("s1")), "an agent of its own");
+    }
+
+    /// A harness's own subagent's thread, in words: what its agent wrote it, what the person did, and what it said.
+    #[test]
+    fn a_subagents_thread_in_words() {
+        let mut core = Core::new();
+        core.upsert("brief", Some("spawn".into()), Body::User { text: "Time ten elections.".into(), images: 0, client_id: None, origin: Some("system".into()), attachments: Vec::new(), reply_to: None });
+        core.upsert("m1", Some("spawn".into()), Body::User { text: "Use five nodes".into(), images: 0, client_id: Some("m1".into()), origin: Some("human".into()), attachments: Vec::new(), reply_to: None });
+        core.upsert("a1", Some("spawn".into()), Body::Assistant { text: "Two terms each.".into(), streaming: false });
+        prompt(&mut core, "main", "not in the thread");
+        let w = thread_words(&core, "spawn", Some("Time ten elections."));
+        assert_eq!(w, "Its agent: Time ten elections.\n\nYou: Use five nodes\n\nIt: Two terms each.");
+        // With nothing in its thread, its brief.
+        assert_eq!(thread_words(&core, "other", Some("Audit")), "Its agent: Audit");
+        assert_eq!(thread_words(&core, "other", None), "It had nothing to show yet.");
     }
 
     /// The seeding transcript takes a prompt's whole turn when bounded at it.

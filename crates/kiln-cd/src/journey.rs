@@ -91,6 +91,13 @@ pub enum Part {
 pub struct Platform {
     pub name: String,
     pub state: Part,
+    /// The kiln job that built it and that job's run, once it has run, as a leg's (its Output
+    /// streams that job's log, W26-R23).
+    pub job: Option<String>,
+    pub run: Option<String>,
+    /// When it started and finished (unix seconds), as far as it has (the lanes draw them, W26-R14).
+    pub start: Option<i64>,
+    pub end: Option<i64>,
 }
 
 /// The release pipeline's build of the commit: each platform's binary and the image.
@@ -669,7 +676,7 @@ mod tests {
 
     fn built() -> Build {
         Build {
-            platforms: ["Linux", "Windows", "macOS"].iter().map(|n| Platform { name: n.to_string(), state: Part::Passed }).collect(),
+            platforms: ["Linux", "Windows", "macOS"].iter().map(|n| Platform { name: n.to_string(), state: Part::Passed, job: None, run: None, start: None, end: None }).collect(),
             image: Part::Passed,
         }
     }
@@ -902,7 +909,7 @@ mod tests {
         j.checks = Vec::new();
         assert_eq!(standing(&j, 0).line, "Landed");
         // Its platforms built and no image: built, by its platforms.
-        j.build.platforms = vec![Platform { name: "Linux".into(), state: Part::Passed }];
+        j.build.platforms = vec![Platform { name: "Linux".into(), state: Part::Passed, job: None, run: None, start: None, end: None }];
         let s = standing(&j, 0);
         assert_eq!((pip(&s, Stage::Build), s.line.as_str()), (Some(Glyph::Passed), "Built"));
     }

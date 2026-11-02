@@ -213,6 +213,53 @@ const stacks = new Map<string, Kept>([
       ],
     },
   ],
+  // The subagent tree's lead (agents.ts, tree-*): the same plan, its steps 2 to 4 out on its own
+  // subagents (kiln's), each live under its step in the Plan tab; 3's asks you (POST /api/mock/tree-asks).
+  [
+    "tree-lead",
+    {
+      state: "running",
+      updated_at: Date.now() - 30_000,
+      items: [
+        {
+          id: "g-tree-1",
+          text: 'Step 1 of 5 of the plan "Replicated log": The log\'s schema',
+          status: "met",
+          reason: "the agent said so: the schema migrates on three nodes",
+          how: "goal",
+          part_of: "g-tree",
+          part_kind: "plan",
+          step: { plan: "pl_fan", version: 1, n: 1, run: "pr_tree" },
+          started_at: t0 + 600_000,
+          ended_at: t0 + 1_800_000,
+        },
+        ...(
+          [
+            [2, "Leader election over QUIC", "tree-s1"],
+            [3, "Follower catch-up", "tree-s2"],
+            [4, "Snapshot transfer", "tree-s3"],
+          ] as const
+        ).map(([n, title, sub]): GoalItem => ({
+          id: `g-tree-${n}`,
+          text: `Step ${n} of 5 of the plan "Replicated log": ${title}`,
+          status: "pending",
+          part_of: "g-tree",
+          part_kind: "plan",
+          step: { plan: "pl_fan", version: 1, n, run: "pr_tree" },
+          subagent: sub,
+        })),
+        {
+          id: "g-tree-5",
+          text: 'Step 5 of 5 of the plan "Replicated log": Land it, with docs',
+          status: "pending",
+          part_of: "g-tree",
+          part_kind: "plan",
+          step: { plan: "pl_fan", version: 1, n: 5, run: "pr_tree" },
+        },
+        { id: "g-tree", text: "Replicate the metadata store's log over QUIC: elect, catch up, snapshot", status: "pending", planned_as: "pl_fan" },
+      ],
+    },
+  ],
 ]);
 
 function stackOf(agent: string): Kept {

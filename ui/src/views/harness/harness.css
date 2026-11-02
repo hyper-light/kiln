@@ -612,7 +612,7 @@ textarea.hx-input {
   display: flex;
   align-items: center;
   gap: 8px;
-  /* One line, the same height whatever the subagent's description: it alone gives way. */
+  /* One line, the same height whatever the names on it: its path alone gives way. */
   min-width: 0;
   min-height: 44px;
   overflow: hidden;
@@ -626,8 +626,166 @@ textarea.hx-input {
   flex-shrink: 0;
   white-space: nowrap;
 }
-.hx-crumbs > .hx-trunc {
+/* A subagent's whole path: the earlier names give way first (each to an ellipsis, down to a few
+   letters); its own keeps up to 62% of it. */
+.hx-crumbs > .hx-path {
+  display: flex;
   flex: 1 1 0;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+  overflow: hidden;
+}
+.hx-path-sep {
+  flex: none;
+  color: var(--color-faint);
+}
+.hx-crumb {
+  flex: 0 1 auto;
+  min-width: 3em;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.hx-crumb:hover {
+  color: var(--color-bright);
+}
+.hx-here {
+  flex: 0 0 auto;
+  max-width: 62%;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--color-bright);
+}
+/* A branch of a subagent: what changes, then a Variant or a New agent, under its crumbs. */
+.hx-branch {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 16px;
+  border-bottom: 1px solid #1d1f23;
+  background: #0d0c12;
+}
+.hx-branch input {
+  flex: 1;
+  min-width: 0;
+  height: 30px;
+  padding: 0 8px;
+  border: 0;
+  border-bottom: 1px solid #3a3d45;
+  background: transparent;
+  outline: 0;
+  font-size: 13px;
+  color: var(--color-bright);
+}
+.hx-branch input:focus {
+  border-bottom-color: #cdc6ea;
+}
+.hx-branch input::placeholder {
+  color: #5b5e66;
+}
+/* What a person lets a subagent do: under its crumbs, in the thread's flow, every choice at the
+   panel's right edge. */
+.hx-perm {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr);
+  column-gap: 14px;
+  padding: 4px 16px 8px;
+  border-bottom: 1px solid #1d1f23;
+  background: #0d0c12;
+}
+.hx-perm-k {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  height: 36px;
+  font-size: 12.5px;
+  color: #c3c5cb;
+}
+.hx-perm-k > svg {
+  color: #8f929b;
+}
+.hx-perm > .hx-perm-seg,
+.hx-perm > .hx-perm-where,
+.hx-perm > .hx-perm-limits {
+  justify-self: end;
+}
+.hx-perm-seg {
+  display: flex;
+  align-items: stretch;
+  height: 36px;
+}
+.hx-perm-seg button {
+  display: inline-flex;
+  align-items: center;
+  padding: 0 10px;
+  border-bottom: 1px solid #2a2d33;
+  font-size: 12.5px;
+  color: #8f929b;
+}
+.hx-perm-seg button[aria-pressed="true"] {
+  border-bottom: 2px solid #cdc6ea;
+  color: var(--color-bright);
+}
+.hx-perm-seg button:disabled {
+  color: #44464d;
+  cursor: default;
+}
+/* Why a choice can't be made here, under its row at the panel's right edge. */
+.hx-perm-why {
+  grid-column: 1 / -1;
+  justify-self: end;
+  margin-top: -4px;
+  padding-bottom: 6px;
+  font-size: 11.5px;
+  color: #8f929b;
+}
+.hx-perm-where,
+.hx-perm-limits {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  min-width: 0;
+  height: 36px;
+}
+.hx-perm-where input,
+.hx-perm-limits input {
+  height: 26px;
+  padding: 0 6px;
+  border: 0;
+  border-bottom: 1px solid #3a3d45;
+  background: transparent;
+  outline: 0;
+  font-family: var(--font-mono);
+  font-size: 11.5px;
+  color: #c3c5cb;
+}
+.hx-perm-where input {
+  width: 220px;
+  min-width: 0;
+  text-align: right;
+}
+.hx-perm-limits input {
+  width: 74px;
+  text-align: right;
+}
+.hx-perm-where input:focus,
+.hx-perm-limits input:focus {
+  border-bottom-color: #cdc6ea;
+}
+.hx-perm-where input::placeholder,
+.hx-perm-limits input::placeholder {
+  color: #5b5e66;
+}
+@media (max-width: 520px) {
+  .hx-perm-where input {
+    width: 150px;
+  }
+  .hx-perm-seg button {
+    padding: 0 8px;
+  }
 }
 
 /* Find in the conversation: a bar over it, in its flow like the crumbs; the matches are painted in
@@ -805,6 +963,77 @@ textarea.hx-input {
   gap: 8px;
   margin-bottom: 4px;
   font-size: 11px;
+}
+/* In a subagent's thread, what its parent wrote it: under its name and mark, with the way back. */
+.hx-by {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+}
+.hx-by-mark {
+  flex: none;
+  width: 13px;
+  height: 13px;
+  color: #b8a6d5;
+}
+.hx-by-back {
+  display: inline-flex;
+  color: #c9c3d8;
+}
+.hx-by-back:hover {
+  color: var(--color-bright);
+}
+/* A finished subagent's thread ends with its word and when, and the way back to its parent's. */
+.hx-thread-end {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 10px;
+  margin-top: 12px;
+  padding: 10px 0;
+  border-top: 1px solid #1d1f23;
+  font-size: 12px;
+}
+.hx-thread-word {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  font-family: var(--font-mono);
+  font-size: 10px;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: #a1a4ad;
+}
+.hx-thread-word > i {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: #7e818a;
+  transform: translateY(-1px);
+}
+.hx-thread-end[data-stand="done"] .hx-thread-word {
+  color: #bfdccf;
+}
+.hx-thread-end[data-stand="done"] .hx-thread-word > i {
+  background: #a8c9bc;
+}
+.hx-thread-end[data-stand="failed"] .hx-thread-word,
+.hx-thread-end[data-stand="stopped"] .hx-thread-word {
+  color: #e2b9bd;
+}
+.hx-thread-end[data-stand="failed"] .hx-thread-word > i,
+.hx-thread-end[data-stand="stopped"] .hx-thread-word > i {
+  background: #d1aaad;
+}
+.hx-thread-back {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  color: #c9c3d8;
+}
+.hx-thread-back:hover {
+  color: var(--color-bright);
 }
 /* Where a message stands, each state in its own colour (the stands' tints, stands.css): sent the
    quietest, dropped the one that's seen. */

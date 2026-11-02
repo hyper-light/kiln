@@ -11,7 +11,60 @@ import * as React from "react";
 import { TitleText } from "@/views/plans/graph";
 import { headline } from "@/views/plans/graph-layout";
 import { STAND_WORDS, StandTitle, StepGlyph } from "@/views/plans/status";
-import { goalPlanRows, shortTitle, type GoalStep } from "./goal-plan-layout";
+import { goalPlanRows, shortTitle, type GoalStep, type StepLive } from "./goal-plan-layout";
+import { Link } from "@/lib/router";
+import { Button } from "@/components/ui/button";
+import { toast } from "@/components/ui/toast";
+import { errorMessage, useNow } from "@/lib/hooks";
+import { answer } from "./answered";
+import { duration } from "./derive";
+import { askWords } from "./tasks";
+
+/**
+ * The agent at a step, live under its words: who it is and for how long (its thread opens from
+ * there), then what it's doing, or what it asks you with its answers (a question in its thread).
+ */
+function StepAgent({ who, live }: { who: string; live: StepLive }) {
+  const now = useNow();
+  const ask = live.ask;
+  const decide = (decision: "allow" | "deny") => {
+    if (!ask) return;
+    void answer(live.session, { type: "approve", id: ask.id, decision }).catch((e: unknown) => toast.error("Couldn't answer", errorMessage(e)));
+  };
+  return (
+    <>
+      <Link to={live.href} className="gp-sub gp-who">
+        {who}
+        {live.started ? ` · ${duration(now - live.started)}` : ""}
+      </Link>
+      {(ask || live.line) && (
+        <span className="gp-live" data-ask={ask ? "" : undefined}>
+          {ask ? askWords(ask) : live.line}
+        </span>
+      )}
+      {ask && (
+        <span className="gp-acts">
+          {ask.tool === "question" ? (
+            <Button size="xs" asChild>
+              <Link to={live.href}>Answer</Link>
+            </Button>
+          ) : (
+            <>
+              <Button size="xs" onClick={() => decide("allow")}>
+                {ask.tool === "plan" ? "Approve" : "Allow"}
+              </Button>
+              {ask.tool !== "plan" && (
+                <Button size="xs" variant="secondary" onClick={() => decide("deny")}>
+                  Deny
+                </Button>
+              )}
+            </>
+          )}
+        </span>
+      )}
+    </>
+  );
+}
 
 /** `under`: what shows under a step, beside its words (a planner at work: its last calls). */
 export function GoalPlan({ steps, label, under }: { steps: GoalStep[]; label: string; under?: (s: GoalStep) => React.ReactNode }) {
@@ -65,7 +118,7 @@ export function GoalPlan({ steps, label, under }: { steps: GoalStep[]; label: st
                   <TitleText parts={headline(s.title)} />
                 </StandTitle>
               </span>
-              {(s.stand === "working" || s.stand === "needs_you") && s.who && <span className="gp-sub">{s.who}</span>}
+              {(s.stand === "working" || s.stand === "needs_you") && s.who && (s.live ? <StepAgent who={s.who} live={s.live} /> : <span className="gp-sub">{s.who}</span>)}
               {s.checks && (
                 <span className="gp-sub">
                   {s.checks.met} of {s.checks.of} checks met

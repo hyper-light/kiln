@@ -703,6 +703,9 @@ travels in `HarnessCmd`.
 | `MoveOnLimit` | command, refused while away | As `AutoResume`. | Fire-and-forget. |
 | `LimitHold` | command, refused while away | The server works the hold out again once the machine is back. | Fire-and-forget. |
 | `OwnEdits` | ask | Answered by a `Reply` to its client: what one who changed its files did alone (docs/agents.md, "One subagent's own edits"). | New: a session whose features have `own_edits` answers it. |
+| `Pause` | command, refused while away | A person's pause of a session (its processes, held by its machine's pacer) or of one of its harness's subagents (held at its next tool call), or its end: they press it again if it didn't apply. The server sends a session's to the subagents kiln started under it too. | New. A runner from before it can't read it, and says so. |
+| `Perms` | command, refused while away | What a person lets a session (and its harness's subagents) or one of those subagents do; they set it again if it didn't apply. The server narrows a session's to its parent's, and the subagents kiln started under it to it. | New. A runner from before it can't read it, and says so. |
+| `Branch` | command, refused while away | A person's branch of a session, or of one of its harness's subagents: a new session on its machine from the conversation so far, beside it or of its own. They branch again if it didn't go. | New. A runner from before it can't read it, and says so. |
 
 ## Updates of a session: `Update`
 

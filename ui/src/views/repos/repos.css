@@ -5,8 +5,11 @@
   margin-bottom: 20px;
 }
 
+/* Each grid's one column may be narrower than what's in it (minmax(0, 1fr), not auto's min-content),
+   so a long detail is cut short by its ellipsis instead of widening the page past a phone's width. */
 .repos-underway {
   display: grid;
+  grid-template-columns: minmax(0, 1fr);
   gap: 6px;
   margin: 0 0 20px;
   padding: 10px 14px;
@@ -18,6 +21,7 @@
 }
 .repos-underway ul {
   display: grid;
+  grid-template-columns: minmax(0, 1fr);
   gap: 2px;
   margin: 0;
   padding: 0;

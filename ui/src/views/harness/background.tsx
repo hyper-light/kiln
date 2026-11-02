@@ -5,7 +5,7 @@
  */
 import * as React from "react";
 import { Fold } from "./fold";
-import { ChevronRight, Square } from "lucide-react";
+import { ChevronRight, GitFork, Square } from "lucide-react";
 import { harnessApi, useSession, type AgentInfo, type Approval, type Command, type SessionStore, type State, type Task } from "@/api/harness";
 import { Button } from "@/components/ui/button";
 import { Confirm } from "@/components/ui/misc";
@@ -17,6 +17,10 @@ import { agentLabel, duration, tildify } from "./derive";
 import { glyphKind, KindGlyph, type GlyphKind } from "./kind-glyph";
 import { Shimmer } from "./signals";
 import { askWords, classOf, isSubagent, kilnAtWork, kilnStatus, LEFT, stopperOf, subagentAsks, subagentRunning, subagentTasksAtWork, type SubagentAsk } from "./tasks";
+import { NODE_WORD, takesMessage, type SubagentRow } from "./subagent-tree";
+import { PauseButton } from "./subagent-pause";
+import { TreePath } from "./tree-path";
+import { useNavigate } from "@/lib/router";
 
 const NO_AGENTS: readonly AgentInfo[] = [];
 const NO_APPROVALS: Approval[] = [];
@@ -260,6 +264,8 @@ export function BackgroundStrip({ state, onView }: { state: State | null; onView
  * subagent that waits on you says so on the line, and has a row under it, answered there.
  */
 const NO_TASKS: Task[] = [];
+const NO_ROWS: readonly SubagentRow[] = [];
+const NO_PICKS: ReadonlySet<string> = new Set();
 const NO_FEATURES: string[] = [];
 
 /** How long it has run, counting by itself (only this text renders each second). */
@@ -448,6 +454,131 @@ function KilnItem({ a, mixed, onOpenTask }: { a: AgentInfo; mixed: boolean; onOp
 }
 
 /**
+ * One subagent in the tree by the composer (subagent-tree.ts): its pick box (what's written next
+ * goes to those picked), its piece of the path, its name, its word, what it's at and for how long,
+ * its pause and its Stop; what it asks, answered under it. Its thread opens from its name: here, or
+ * on the page of the subagent it's under.
+ */
+function DockNode({
+  r,
+  store,
+  picked,
+  onPick,
+  onOpenTask,
+}: {
+  r: SubagentRow;
+  store: SessionStore;
+  picked: boolean;
+  onPick: (keys: string[], on: boolean) => void;
+  onOpenTask: (toolId: string) => void;
+}) {
+  const navigate = useNavigate();
+  const features = useSession(store, (s) => s.meta?.features ?? NO_FEATURES);
+  const task = useSession(store, (s) => (r.kind === "harness" && r.session === store.id ? s.state?.tasks.find((t) => t.id === r.task) : undefined));
+  const [asking, setAsking] = React.useState(false);
+  const [stopAt, setStopAt] = React.useState<number | null>(null);
+  const own = r.href.startsWith(`/agents/${store.id}?`);
+  const open = () => (own ? onOpenTask(r.task ?? r.session) : navigate(r.href));
+  const live = takesMessage(r);
+  // A session of its own ends; a harness's own is stopped by its harness, over its agent's socket or else over HTTP.
+  const stop = () => {
+    setAsking(false);
+    setStopAt(Date.now());
+    const failed = (e: unknown) => {
+      setStopAt(null);
+      toast.error("Couldn't stop it", errorMessage(e));
+    };
+    if (r.kind === "kiln") return void harnessApi.end(r.session, true).catch(failed);
+    const c: Command = { type: "stop_task", task: r.task ?? "" };
+    if (!(r.session === store.id && store.send(c))) harnessApi.command(r.session, c).catch(failed);
+  };
+  const decide = (decision: "allow" | "deny") => {
+    if (!r.ask) return;
+    void answer(r.session, { type: "approve", id: r.ask.id, decision }).catch((e: unknown) => toast.error(`Couldn't answer ${r.name}`, errorMessage(e)));
+  };
+  // Its harness can't stop it (an older server says so of every task): said, not offered.
+  const stoppable = r.kind === "kiln" || !task || stopperOf(task, features) !== null;
+  const stopButton = (
+    <button type="button" className="al-stop" disabled={!live || !stoppable} aria-expanded={asking} aria-label={`Stop ${r.name}`} onClick={() => setAsking(!asking)}>
+      Stop
+    </button>
+  );
+  return (
+    <li className="al-item dn" data-stand={r.stand} data-picked={picked || undefined}>
+      <div className="dn-row">
+        <span className="dn-pick">
+          <input type="checkbox" className="check" checked={picked} disabled={!live} onChange={(e) => onPick([r.key], e.target.checked)} aria-label={`Pick ${r.name}`} />
+        </span>
+        <TreePath path={r.path} stand={r.stand} className="dn-path" x0={9} dx={10} y={17} width={40} />
+        <button type="button" className="dn-main" onClick={open}>
+          <span className="dn-name">
+            {r.variant && <GitFork size={12} className="tree-fork" role="img" aria-label="Variant" />}
+            {r.name}
+          </span>
+          <span className="dn-line">
+            <span className="dn-word">
+              <i aria-hidden="true" />
+              {NODE_WORD[r.stand]}
+            </span>
+            <span className="dn-text" data-mono={r.mono || undefined}>
+              {r.line}
+            </span>
+            {live && r.started > 0 && (
+              <span className="dn-time">
+                <Since from={r.started} />
+              </span>
+            )}
+          </span>
+        </button>
+        <span className="dn-acts">
+          <PauseButton n={r} className="dn-pause" />
+          {stopAt !== null ? <Stopping at={stopAt}>{stopButton}</Stopping> : stopButton}
+        </span>
+      </div>
+      {r.stand === "needs" && r.ask && (
+        <div className="dn-answer" role="group" aria-label={`${r.name} needs you`}>
+          {r.ask.tool === "question" ? (
+            <Button size="xs" onClick={open}>
+              Answer
+            </Button>
+          ) : (
+            <>
+              <Button size="xs" onClick={() => decide("allow")}>
+                {r.ask.tool === "plan" ? "Approve" : "Allow"}
+              </Button>
+              {r.ask.tool !== "plan" && (
+                <Button size="xs" variant="secondary" onClick={() => decide("deny")}>
+                  Deny
+                </Button>
+              )}
+            </>
+          )}
+        </div>
+      )}
+      {asking && (
+        <Confirm
+          className="al-confirm"
+          label="Stop this subagent"
+          tone="danger"
+          actions={
+            <>
+              <Button size="xs" variant="danger" onClick={stop}>
+                Stop it
+              </Button>
+              <Button size="xs" variant="ghost" onClick={() => setAsking(false)}>
+                Keep it running
+              </Button>
+            </>
+          }
+        >
+          <p>{r.kind === "kiln" ? "Stop this subagent? Its goal comes back to the agent, which takes it itself; what it changed stays." : STOP_ASK.agent}</p>
+        </Confirm>
+      )}
+    </li>
+  );
+}
+
+/**
  * One of its subagents waiting on you, over the composer, drawn as Mission control's row that needs
  * you: its name, the word and what it asks, and the answer, which goes to that subagent. A question
  * opens its thread, where it waits at the end; the row itself and Review do too.
@@ -493,17 +624,27 @@ function NeedsRow({ ask, onOpenTask }: { ask: SubagentAsk; onOpenTask: (toolId: 
   );
 }
 
-/** `inThread`: the subagent whose thread is shown (its request is there, so it has no row here). */
+/**
+ * `inThread`: the subagent whose thread is shown (its request is there, so it has no row here).
+ * `rows`: its subagents as a tree (subagent-tree.ts), drawn when the line is open, each with a pick
+ * box; `picks` are those picked (the composer writes to them), `onPick` picks or puts some back.
+ */
 export function ActivityLine({
   store,
   onOpenTask,
   kiln = NO_AGENTS,
   inThread = null,
+  rows: tree = NO_ROWS,
+  picks = NO_PICKS,
+  onPick,
 }: {
   store: SessionStore;
   onOpenTask: (toolId: string) => void;
   kiln?: readonly AgentInfo[];
   inThread?: string | null;
+  rows?: readonly SubagentRow[];
+  picks?: ReadonlySet<string>;
+  onPick?: (keys: string[], on: boolean) => void;
 }) {
   const [open, setOpen] = React.useState(false);
   const [shown, setShown] = React.useState<string | null>(null);
@@ -514,11 +655,14 @@ export function ActivityLine({
   // The subagents kiln started for its goals or plan steps, with its harness's own.
   const others = kilnAtWork(kiln);
   const bg = tasks.filter((t) => !isSubagent(t) && isLive(t));
-  if (subs.length + others.length + bg.length === 0) return null;
+  const pickable = tree.filter(takesMessage);
+  const all = pickable.length > 0 && pickable.every((r) => picks.has(r.key));
+  const some = !all && pickable.some((r) => picks.has(r.key));
+  if (subs.length + others.length + bg.length === 0 && tree.length === 0) return null;
   // Those that wait on you: said on the line, and each (two at most) in a row of its own under it.
   const asks = subagentAsks(store.id, approvals, tasks, kiln, done);
   const needs = asks.length === 0 ? "" : subs.length + others.length === 1 ? "Needs you" : `${asks.length} need${asks.length === 1 ? "s" : ""} you`;
-  const rows = asks.filter((a) => a.thread !== inThread).slice(0, 2);
+  const rows = open ? [] : asks.filter((a) => a.thread !== inThread).slice(0, 2);
   const count = (n: number, one: string, many = `${one}s`) => (n ? `${n} ${n === 1 ? one : many}` : "");
   const of = (cls: string) => bg.filter((t) => classOf(t) === cls).length;
   const shells = of("shell");
@@ -539,44 +683,75 @@ export function ActivityLine({
   return (
     <>
       <div className="al" data-open={open || undefined}>
-        <button type="button" className="al-line" aria-expanded={open} onClick={() => setOpen(!open)}>
-          <span className="al-summary">
-            {segments.map((s, i) => (
-              <span key={s.kind} className="al-seg">
-                {i > 0 && <span className="al-sep">·</span>}
-                {s.kind === "agent" ? (
-                  <Shimmer on={s.live} className="al-mark">
-                    <KindGlyph kind="agent" />
-                    {s.text}
-                  </Shimmer>
-                ) : (
-                  <>
-                    <KindGlyph kind={s.kind} live={s.live} />
-                    {s.text}
-                  </>
-                )}
-              </span>
-            ))}
-            {needs && (
-              <span className="al-seg">
-                <span className="al-sep">·</span>
-                <span className="al-needs">
-                  <i aria-hidden="true" />
-                  {needs}
+        <div className="al-top">
+          {/* Its subagents' mark; once open, where every one that takes a message is picked at once. */}
+          {tree.length > 0 && (
+            <span className="al-slot">
+              {open ? (
+                <input
+                  type="checkbox"
+                  className="check"
+                  checked={all}
+                  ref={(el) => {
+                    if (el) el.indeterminate = some;
+                  }}
+                  disabled={pickable.length === 0}
+                  onChange={(e) =>
+                    onPick?.(
+                      pickable.map((r) => r.key),
+                      e.target.checked,
+                    )
+                  }
+                  aria-label="Pick every subagent"
+                />
+              ) : (
+                <Shimmer on={segments[0]?.kind === "agent" && segments[0].live} className="al-mark">
+                  <KindGlyph kind="agent" />
+                </Shimmer>
+              )}
+            </span>
+          )}
+          <button type="button" className="al-line" aria-expanded={open} onClick={() => setOpen(!open)}>
+            <span className="al-summary">
+              {segments.map((s, i) => (
+                <span key={s.kind} className="al-seg">
+                  {i > 0 && <span className="al-sep">·</span>}
+                  {s.kind === "agent" ? (
+                    <Shimmer on={s.live} className="al-mark">
+                      {tree.length === 0 && <KindGlyph kind="agent" />}
+                      {s.text}
+                    </Shimmer>
+                  ) : (
+                    <>
+                      <KindGlyph kind={s.kind} live={s.live} />
+                      {s.text}
+                    </>
+                  )}
                 </span>
-              </span>
-            )}
-          </span>
-          <ChevronRight size={12} className={cn("al-chev", open && "rotate-90")} aria-hidden="true" />
-        </button>
+              ))}
+              {needs && (
+                <span className="al-seg">
+                  <span className="al-sep">·</span>
+                  <span className="al-needs">
+                    <i aria-hidden="true" />
+                    {needs}
+                  </span>
+                </span>
+              )}
+            </span>
+            <ChevronRight size={12} className={cn("al-chev", open && "rotate-90")} aria-hidden="true" />
+          </button>
+        </div>
         {open && (
           <ul className="al-list">
-            {subs.map((t) => (
-              <ActivityItem key={t.id} t={t} store={store} mixed={mixed} shown={shown === t.id} onShow={() => setShown(shown === t.id ? null : t.id)} onOpenTask={onOpenTask} />
-            ))}
-            {others.map((a) => (
-              <KilnItem key={a.id} a={a} mixed={mixed} onOpenTask={onOpenTask} />
-            ))}
+            {tree.length > 0
+              ? tree.map((r) => <DockNode key={r.key} r={r} store={store} picked={picks.has(r.key)} onPick={(keys, on) => onPick?.(keys, on)} onOpenTask={onOpenTask} />)
+              : [
+                  ...subs.map((t) => (
+                    <ActivityItem key={t.id} t={t} store={store} mixed={mixed} shown={shown === t.id} onShow={() => setShown(shown === t.id ? null : t.id)} onOpenTask={onOpenTask} />
+                  )),
+                  ...others.map((a) => <KilnItem key={a.id} a={a} mixed={mixed} onOpenTask={onOpenTask} />),
+                ]}
             {bg.map((t) => (
               <ActivityItem key={t.id} t={t} store={store} mixed={mixed} shown={shown === t.id} onShow={() => setShown(shown === t.id ? null : t.id)} onOpenTask={onOpenTask} />
             ))}

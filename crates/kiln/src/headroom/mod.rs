@@ -12,7 +12,7 @@ mod pace;
 mod probes;
 pub mod settings;
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, LazyLock};
@@ -56,6 +56,8 @@ struct Shared {
     pushed: Mutex<Option<Settings>>,
     latest: Mutex<Option<String>>,
     changed: crate::rt::Notify,
+    /// Sessions a person paused ([`pause`]): their groups held stopped, paced or not.
+    paused: Mutex<HashSet<String>>,
 }
 
 static SHARED: LazyLock<Shared> = LazyLock::new(|| Shared {
@@ -68,6 +70,7 @@ static SHARED: LazyLock<Shared> = LazyLock::new(|| Shared {
     pushed: Mutex::new(None),
     latest: Mutex::new(None),
     changed: crate::rt::Notify::new(),
+    paused: Mutex::new(HashSet::new()),
 });
 
 fn kick() {
@@ -130,6 +133,34 @@ pub fn take_grant(session: &str) -> bool {
 /// Whether `session` is held now.
 pub fn held(session: &str) -> bool {
     SHARED.admit.lock().waiting.contains_key(session)
+}
+
+/// A person pauses agent session `session` (`on`), or resumes it: its processes stop where they
+/// are, held by the pacer whether or not headroom paces, and its guard starts them again should the
+/// runner end (docs/headroom.md, "Failing safe"). Why it can't be paused here, when it can't.
+pub fn pause(session: &str, on: bool) -> Result<(), String> {
+    let s = &*SHARED;
+    if on {
+        if !s.running.load(Ordering::Acquire) {
+            return Err("its machine's runner doesn't pace its work, so it can't stop an agent's processes".to_owned());
+        }
+        if pace::how() == "none" {
+            return Err("its machine gives kiln no way to stop an agent's processes (no cgroup of kiln's own there)".to_owned());
+        }
+        s.paused.lock().insert(session.to_owned());
+    } else {
+        s.paused.lock().remove(session);
+    }
+    kick();
+    Ok(())
+}
+
+/// The pacer's shares with each group a person paused ([`pause`]) held all the time: at 0 it never
+/// runs, and only while a guard runs that will start it again.
+fn with_paused(shares: &mut HashMap<PathBuf, f64>, groups: &[pace::Group], paused: &HashSet<String>) {
+    for g in groups.iter().filter(|g| g.session.as_ref().is_some_and(|s| paused.contains(s))) {
+        shares.insert(g.dir.clone(), 0.0);
+    }
 }
 
 /// What a runner's headroom works from.
@@ -394,9 +425,12 @@ fn run(ctx: Ctx, mut settings: Settings) {
             let waiting: Vec<Waiting> = a.waiting.iter().map(|(s, since)| Waiting { id: s.clone(), key: s.clone(), class: Class::Agent, since_us: *since }).collect();
             (waiting, std::mem::take(&mut a.ended))
         };
+        // What a person paused is theirs, not the engine's: it neither counts nor learns from it.
+        let paused = SHARED.paused.lock().clone();
         let running: Vec<Group> = groups
             .iter()
             .zip(&loads)
+            .filter(|(g, _)| g.session.as_ref().is_none_or(|s| !paused.contains(s)))
             .map(|(g, l)| Group {
                 id: id_of(g),
                 key: g.session.clone().unwrap_or_else(|| g.label.clone()),
@@ -418,11 +452,12 @@ fn run(ctx: Ctx, mut settings: Settings) {
         }
         // Pacing: the engine's shares, unless off or another process of this machine paces.
         let pacing = settings.enabled && !SHARED.standby.load(Ordering::Acquire);
-        let shares: HashMap<PathBuf, f64> = if pacing {
+        let mut shares: HashMap<PathBuf, f64> = if pacing {
             plan.shares.iter().filter(|p| p.share < 1.0).filter_map(|p| groups.iter().find(|g| id_of(g) == p.id).map(|g| (g.dir.clone(), p.share))).collect()
         } else {
             HashMap::new()
         };
+        with_paused(&mut shares, &groups, &paused);
         pacer.set(shares.iter().map(|(d, s)| (d.clone(), pace::step_of(*s))).collect(), Duration::from_micros(probes.fastest_us()));
         // Admission: who the engine let start.
         // A place holds until the session's turn ends (or it does): how long it was expected to
@@ -507,6 +542,30 @@ mod tests {
         if !SHARED.running.load(Ordering::Acquire) {
             assert!(admit("s1", Class::Agent));
         }
+    }
+
+    #[test]
+    fn a_session_a_person_paused_is_held_all_the_time_whatever_the_engine_gave_it() {
+        let group = |dir: &str, session: Option<&str>| pace::Group { dir: dir.into(), label: dir.into(), session: session.map(str::to_owned) };
+        let groups = [group("/a", Some("a")), group("/b", Some("b")), group("/unit", None)];
+        let mut shares: HashMap<PathBuf, f64> = [(PathBuf::from("/b"), 0.5)].into_iter().collect();
+        with_paused(&mut shares, &groups, &["a".to_owned()].into_iter().collect());
+        assert_eq!(shares.get(Path::new("/a")), Some(&0.0));
+        assert_eq!(pace::step_of(0.0), 0, "never a slice: it doesn't run");
+        // The others keep what the engine gave them, or run.
+        assert_eq!(shares.get(Path::new("/b")), Some(&0.5));
+        assert_eq!(shares.get(Path::new("/unit")), None);
+        with_paused(&mut shares, &groups, &["b".to_owned()].into_iter().collect());
+        assert_eq!(shares.get(Path::new("/b")), Some(&0.0));
+    }
+
+    #[test]
+    fn without_a_runner_pacing_its_work_nothing_is_paused_and_resuming_always_goes() {
+        if !SHARED.running.load(Ordering::Acquire) {
+            assert!(pause("s-paused", true).is_err_and(|why| why.contains("can't stop an agent's processes")));
+            assert!(!SHARED.paused.lock().contains("s-paused"));
+        }
+        assert_eq!(pause("s-paused", false), Ok(()));
     }
 
     #[test]

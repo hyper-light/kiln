@@ -17,11 +17,11 @@ use serde_json::{Value, json};
 use super::core::{Baseline, Core, Effect};
 use super::model::{
     AlwaysOption, Approval, Body, Command, Control, ControlKind, ControlOption, Decision, Delivery, ExitInfo, FileDiff, Level, ModeOption, ModelOption, QueueItem, SendMode,
-    Inventory, Known, SlashCommand, Status, StatusItem, Todo, ToolCall, ToolKind, ToolStatus, OUTPUT_MAX, clip_json, clip_middle, sort_catalog,
+    Inventory, Known, SlashCommand, Status, StatusItem, Task, Todo, ToolCall, ToolKind, ToolStatus, OUTPUT_MAX, clip_json, clip_middle, sort_catalog,
 };
 
 /// What a session of it can do, said when it starts (and again after an in-place upgrade).
-pub(super) const FEATURES: &[&str] = &["send_now", "queue", "interrupt", "set_mode", "resume", "attachments", "switch_harness", "own_edits"];
+pub(super) const FEATURES: &[&str] = &["send_now", "queue", "interrupt", "set_mode", "resume", "attachments", "switch_harness", "own_edits", "limits", "limits_asked"];
 /// What it turns on or off once it runs, as the agent says what it takes (steering; its model,
 /// effort and speed options): kept as they were across an in-place upgrade.
 pub(super) const LEARNED: &[&str] = &["steer", "queue_steer", "set_model", "set_effort", "set_speed"];
@@ -189,6 +189,10 @@ pub struct Acp {
     /// The compaction it says is under way (`compaction_update`), by its id.
     #[serde(default)]
     compaction: Option<String>,
+    /// Requests to go ahead from a subagent a person paused (the request's id and its params),
+    /// unanswered until they resume it (`hold::paused`), then asked again as they came.
+    #[serde(default)]
+    held_asks: Vec<(Value, Value)>,
 }
 
 fn ready() -> bool {
@@ -198,6 +202,11 @@ fn ready() -> bool {
 /// kiln's own permission modes, for agents whose own all keep their checks: kiln asks you, or
 /// kiln answers every request to go ahead itself.
 pub const KILN_ASK: &str = "kiln-ask";
+
+/// opencode reports its subagents (child sessions) to a client that asks for them in its
+/// capabilities' `_meta`, each by this notification (an ACP extension's, so `_` first).
+const OPENCODE_CHILDREN: &str = "opencode/child-session-updates";
+const OPENCODE_CHILD_UPDATE: &str = "opencode/session/child_update";
 pub const KILN_BYPASS: &str = "kiln-bypass";
 
 /// The config option an agent offers its speeds as (Devin's Standard and Fast, on the models that
@@ -259,6 +268,7 @@ impl Acp {
             speed_start: None,
             compact_prompt: None,
             compaction: None,
+            held_asks: Vec::new(),
         }
     }
 
@@ -355,7 +365,7 @@ impl Acp {
             "initialize",
             json!({
                 "protocolVersion": 1,
-                "clientCapabilities": {"fs": {"readTextFile": false, "writeTextFile": false}, "terminal": false, "session": {"configOptions": {"boolean": {}}, "compaction": {}}},
+                "clientCapabilities": {"fs": {"readTextFile": false, "writeTextFile": false}, "terminal": false, "session": {"configOptions": {"boolean": {}}, "compaction": {}}, "_meta": {OPENCODE_CHILDREN: true}},
                 "clientInfo": {"name": "kiln", "version": env!("CARGO_PKG_VERSION")},
             }),
         );
@@ -385,6 +395,7 @@ impl Acp {
         self.prompt_result = None;
         self.pending.clear();
         self.asks.clear();
+        self.held_asks.clear();
         self.compact_prompt = None;
         self.compaction = None;
         core.state.approvals.clear();
@@ -469,7 +480,13 @@ impl Acp {
             }
             Command::StopTask { .. } | Command::StopTasks | Command::Restart | Command::ForceStop | Command::Snapshot | Command::MoveTo { .. } | Command::Moving { .. } | Command::HandedOver { .. } | Command::OwnEdits { .. } => {}
             // A pause's commands are the session's (`harness::pause`).
-            Command::Resume | Command::AutoResume { .. } | Command::PauseAt { .. } | Command::MaxSubagents { .. } | Command::MoveOnLimit { .. } | Command::LimitHold { .. } => {}
+            Command::Resume | Command::AutoResume { .. } | Command::PauseAt { .. } | Command::MaxSubagents { .. } | Command::MoveOnLimit { .. } | Command::LimitHold { .. } | Command::Pause { task: None, .. } | Command::Perms { task: None, .. } | Command::Branch { .. } => {}
+            Command::Pause { on, task: Some(task) } => self.pause_subagent(core, &task, on),
+            Command::Perms { perms, task: Some(task) } => {
+                if !super::hold::set_perms(core, &task, perms) {
+                    self.notice(core, Level::Warn, "Not limited: it has no such subagent.");
+                }
+            }
             // An ACP agent reports no MCP servers or skills of its own (its client hands it MCP
             // servers when the session opens); its commands run as "/name args" messages.
             Command::SkillRun { name, args, id, mode } => {
@@ -847,6 +864,9 @@ impl Acp {
             core.write(&json!({"jsonrpc": "2.0", "id": ask.rpc, "result": {"outcome": {"outcome": "cancelled"}}}));
             core.take_approval(&id);
         }
+        for (rpc, _) in std::mem::take(&mut self.held_asks) {
+            core.write(&json!({"jsonrpc": "2.0", "id": rpc, "result": {"outcome": {"outcome": "cancelled"}}}));
+        }
     }
 
     fn send(&mut self, core: &mut Core, mut m: QueueItem, mode: SendMode) {
@@ -1013,6 +1033,129 @@ impl Acp {
         }
     }
 
+    /// A person pauses subagent `task` (`on`), or resumes it: what it asked meanwhile is asked
+    /// again, as it came, and goes on as its perms say.
+    fn pause_subagent(&mut self, core: &mut Core, task: &str, on: bool) {
+        if !super::hold::pause(core, task, on) {
+            self.notice(core, Level::Warn, "Not paused: it has no such subagent.");
+            return;
+        }
+        if !on {
+            for (rpc, p) in std::mem::take(&mut self.held_asks) {
+                self.agent_request(core, "session/request_permission", rpc, p);
+            }
+            self.settle(core);
+        }
+    }
+
+    /// One of opencode's subagents (a child session) started, went on or ended
+    /// (`opencode/session/child_update`): a subagent of the session, its tool calls under it.
+    fn child_update(&mut self, core: &mut Core, p: &Value) {
+        let Some(id) = p.get("childSessionId").and_then(Value::as_str).map(str::to_owned) else { return };
+        let title = p.get("title").and_then(Value::as_str).unwrap_or("").trim().to_owned();
+        if !core.state.tasks.iter().any(|t| t.id == id) {
+            // Under another of its subagents, or the agent's own.
+            let up = p.get("parentSessionId").and_then(Value::as_str).filter(|up| core.state.tasks.iter().any(|t| t.id == *up)).map(str::to_owned);
+            core.state.tasks.push(Task {
+                id: id.clone(),
+                tool_id: Some(id.clone()),
+                description: if title.is_empty() { "Subagent".to_owned() } else { title.clone() },
+                kind: "opencode".into(),
+                status: "running".into(),
+                depth: p.get("depth").and_then(Value::as_u64).and_then(|d| u32::try_from(d).ok()).unwrap_or(1),
+                parent_task: up,
+                started: Core::now(),
+                class: Some("agent".into()),
+                ..Task::default()
+            });
+        }
+        match p.get("type").and_then(Value::as_str) {
+            Some("status") => {
+                let status = match p.get("status").and_then(Value::as_str) {
+                    Some("completed") => "completed",
+                    Some("failed") => "failed",
+                    Some("interrupted") => "stopped",
+                    _ => "running",
+                };
+                if let Some(t) = core.state.tasks.iter_mut().find(|t| t.id == id) {
+                    t.status = status.to_owned();
+                    t.ended = (status != "running").then(|| t.ended.unwrap_or_else(Core::now));
+                    if !title.is_empty() {
+                        t.description = title;
+                    }
+                }
+            }
+            Some("update") => {
+                let u = p.get("update").unwrap_or(&Value::Null);
+                match u.get("sessionUpdate").and_then(Value::as_str) {
+                    Some("tool_call" | "tool_call_update") => {
+                        let Some(tid) = u.get("toolCallId").and_then(Value::as_str) else { return };
+                        let known = core.get(tid).and_then(|e| match &e.body {
+                            Body::Tool(t) => Some(t.as_ref().clone()),
+                            _ => None,
+                        });
+                        let first = known.is_none();
+                        let call = merge(known, u, &core.state.cwd);
+                        if let Some(t) = core.state.tasks.iter_mut().find(|t| t.id == id) {
+                            t.tool_uses += u64::from(first);
+                            t.last_tool = Some(call.title.clone());
+                        }
+                        core.upsert(tid, Some(id.clone()), Body::Tool(Box::new(call)));
+                    }
+                    Some("agent_message_chunk") => {
+                        let text = content_text(u.get("content"));
+                        if let Some(t) = core.state.tasks.iter_mut().find(|t| t.id == id) {
+                            let mut now = t.summary.take().unwrap_or_default();
+                            now.push_str(&text);
+                            t.summary = Some(clip_middle(now.trim_start(), 600).0);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            _ => {}
+        }
+        core.touch_state();
+    }
+
+    /// How a person's message reaches its subagent `t`: opencode takes none from kiln for one,
+    /// but its own subagent tool sends a follow-up to one by its session id, running or ended, so
+    /// the agent passes it on, once its turn is free.
+    pub fn takes(&self, core: &Core, t: &Task) -> (Vec<SendMode>, Option<&'static str>) {
+        if t.kind != "opencode" || matches!(core.state.status, Status::Exited | Status::Starting) {
+            return (Vec::new(), None);
+        }
+        (vec![SendMode::Queue], Some(super::subagent::PARENT))
+    }
+
+    /// A person's message to subagent `t`: it waits in its queue while the agent's turn runs,
+    /// else the agent is asked to pass it on.
+    pub fn send_task(&mut self, core: &mut Core, t: &Task, m: QueueItem) {
+        if self.busy(core) || !self.ready || self.session.is_none() {
+            super::subagent::hold(core, &t.id, m);
+            return;
+        }
+        let how = format!("Send it with your subagent tool, its sessionID \"{}\".", t.id);
+        let words = super::subagent::relay_words(t, &m, &how);
+        super::subagent::show(core, &t.id, &m, Delivery::Sent);
+        let id = super::subagent::relay_id(&m);
+        self.send(core, QueueItem { id: id.clone(), text: words, at: Core::now(), attachments: Vec::new(), overrides: None, reply_to: None }, SendMode::Queue);
+        super::pause::from_kiln(core, &id);
+    }
+
+    /// What waits for its subagents goes, one at a time, once the agent's turn is free.
+    pub fn drain_subagents(&mut self, core: &mut Core) {
+        for task in super::subagent::waiting(core) {
+            if self.busy(core) {
+                return;
+            }
+            let Some(t) = core.state.tasks.iter().find(|t| t.id == task).cloned() else { continue };
+            if let Some(m) = super::subagent::next(core, &task) {
+                self.send_task(core, &t, m);
+            }
+        }
+    }
+
     // ------------------------------------------------------------------ stdout
 
     pub fn line(&mut self, core: &mut Core, line: &str) {
@@ -1031,6 +1174,8 @@ impl Acp {
             (Some(m), None) => {
                 if m == "session/update" {
                     self.update(core, params.get("update").unwrap_or(&Value::Null));
+                } else if m.strip_prefix('_').unwrap_or(&m) == OPENCODE_CHILD_UPDATE {
+                    self.child_update(core, &params);
                 }
             }
             (None, Some(id)) => self.response(core, &id, &v),
@@ -1336,15 +1481,48 @@ impl Acp {
             .and_then(Value::as_array)
             .map(|o| o.iter().filter_map(|x| Some((x.get("optionId")?.as_str()?.to_owned(), x.get("kind")?.as_str()?.to_owned()))).collect())
             .unwrap_or_default();
+        // What a person holds it to (docs/agents.md, "Pausing" and "What each may do"), at each
+        // call it asks about: a paused subagent's request waits, unanswered and unshown, until
+        // they resume it; what its perms refuse is refused at once; what they say a person sees,
+        // a person sees, whatever kiln's mode.
+        let task = asker(&p);
+        if let Some(t) = task.as_deref()
+            && super::hold::paused(core, t)
+        {
+            if let Some(tid) = &tool_id {
+                let mut held = call;
+                held.status = ToolStatus::Pending;
+                core.upsert(tid, Some(t.to_owned()), Body::Tool(Box::new(held)));
+            }
+            self.held_asks.push((rpc, p));
+            return;
+        }
+        let paths: Vec<&str> = tc.get("locations").and_then(Value::as_array).into_iter().flatten().filter_map(|l| l.get("path").and_then(Value::as_str)).collect();
+        let reason = match super::hold::verdict(core, task.as_deref(), call.tool, &paths) {
+            Some(("deny", why)) => {
+                let pick = |kind: &str| options.iter().find(|(_, k)| k == kind).map(|(o, _)| o.clone());
+                let outcome = pick("reject_once").or_else(|| pick("reject_always")).map_or_else(|| json!({"outcome": "cancelled"}), |o| json!({"outcome": "selected", "optionId": o}));
+                core.write(&json!({"jsonrpc": "2.0", "id": rpc, "result": {"outcome": outcome}}));
+                if let Some(t) = &tool_id {
+                    let mut refused = call;
+                    refused.status = ToolStatus::Denied;
+                    refused.output = Some(why);
+                    core.upsert(t, task.clone(), Body::Tool(Box::new(refused)));
+                }
+                return;
+            }
+            Some((_, why)) => Some(why),
+            None => None,
+        };
         // kiln's Bypass: yes, at once (once, so the agent's own rules stay as they are).
-        if self.bypass {
+        if self.bypass && reason.is_none() {
             let pick = |kind: &str| options.iter().find(|(_, k)| k == kind).map(|(o, _)| o.clone());
             if let Some(o) = pick("allow_once").or_else(|| pick("allow_always")) {
                 core.write(&json!({"jsonrpc": "2.0", "id": rpc, "result": {"outcome": {"outcome": "selected", "optionId": o}}}));
                 if let Some(t) = &tool_id {
                     let mut running = call;
                     running.status = ToolStatus::Running;
-                    core.upsert(t, None, Body::Tool(Box::new(running)));
+                    core.upsert(t, task, Body::Tool(Box::new(running)));
                 }
                 return;
             }
@@ -1376,18 +1554,18 @@ impl Acp {
             command: (call.tool == ToolKind::Shell).then(|| call.title.clone()),
             cwd: core.state.cwd.clone(),
             diffs: call.diffs.clone(),
-            reason: None,
+            reason,
             always,
             default_to_no: false,
             questions: Vec::new(),
             plan: None,
-            agent: None,
+            agent: task.as_deref().map(|id| core.state.tasks.iter().find(|t| t.id == id).map_or_else(|| id.to_owned(), |t| t.description.clone())),
             at: Core::now(),
         };
         if let Some(t) = &tool_id {
             let mut pending = call;
             pending.status = ToolStatus::Pending;
-            core.upsert(t, None, Body::Tool(Box::new(pending)));
+            core.upsert(t, task, Body::Tool(Box::new(pending)));
         }
         core.state.doing = Some("Waiting for your approval".to_owned());
         self.asks.insert(id, Ask { rpc, options });
@@ -1457,7 +1635,12 @@ impl Acp {
                     Body::Tool(t) => Some(t.as_ref().clone()),
                     _ => None,
                 });
-                let call = merge(known, u, &core.state.cwd);
+                let mut call = merge(known, u, &core.state.cwd);
+                // opencode's subagent tool names the subagent it started (or followed up) by its
+                // session id, as its child sessions are known (`child_update`).
+                if let Some(sid) = u.pointer("/rawOutput/sessionID").or_else(|| u.pointer("/rawInput/sessionID")).and_then(Value::as_str).filter(|sid| core.state.tasks.iter().any(|t| t.id == *sid)) {
+                    call.task = Some(sid.to_owned());
+                }
                 let entries = diff_entries(u);
                 if !entries.is_empty() {
                     self.befores.insert(tid.clone(), entries);
@@ -1568,6 +1751,13 @@ impl Acp {
 }
 
 /// ACP selects are flat or grouped; kiln's existing selectors keep each group's name in its labels.
+/// The subagent a request to go ahead comes from, where its agent says (opencode's child sessions,
+/// `_meta["opencode/child-session"]`): none, the agent's own.
+fn asker(p: &Value) -> Option<String> {
+    let meta = |v: Option<&Value>| v.and_then(|v| v.pointer("/_meta/opencode~1child-session/id")).and_then(Value::as_str).map(str::to_owned);
+    meta(p.get("toolCall")).or_else(|| meta(Some(p)))
+}
+
 fn config_choices(c: &Value) -> Vec<ControlOption> {
     let mut choices = Vec::new();
     for option in c.get("options").and_then(Value::as_array).into_iter().flatten() {
@@ -1728,6 +1918,7 @@ fn merge(known: Option<ToolCall>, u: &Value, cwd: &str) -> ToolCall {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use super::super::model::{Grant, Perms};
 
     fn written(core: &mut Core) -> Vec<Value> {
         core.take_writes().iter().filter_map(|w| serde_json::from_str(w).ok()).collect()
@@ -2259,5 +2450,206 @@ mod tests {
         assert!(written(&mut core).is_empty());
         assert!(!core.meta.features.iter().any(|f| f == "steer"));
         Ok(())
+    }
+
+    // ------------------------------------------------------------------ subagents (docs/agents.md)
+
+    /// A stand-in ACP agent with its session open (`s1`), what kiln wrote to it so far read.
+    fn opened(a: &mut Acp, core: &mut Core) {
+        core.state.cwd = "/w".into();
+        a.start(core);
+        feed(a, core, &[json!({"jsonrpc": "2.0", "id": 1, "result": {"protocolVersion": 1, "agentCapabilities": {}}}), json!({"jsonrpc": "2.0", "id": 2, "result": {"sessionId": "s1"}})]);
+        let _ = written(core);
+    }
+
+    /// opencode says one of its subagents (a child session) started or ended.
+    fn child(id: &str, parent: &str, status: &str) -> Value {
+        json!({"jsonrpc": "2.0", "method": "_opencode/session/child_update", "params": {"rootSessionId": "s1", "childSessionId": id, "parentSessionId": parent, "depth": 1, "title": format!("Explore {id}"), "type": "status", "status": status}})
+    }
+
+    /// A request to go ahead with a call of `kind` at `path`, from subagent `from` (none: the agent's own).
+    fn asks(rpc: u64, tool: &str, kind: &str, path: &str, from: Option<&str>) -> Value {
+        let mut tc = json!({"toolCallId": tool, "kind": kind, "title": format!("{kind} {path}"), "locations": [{"path": path}]});
+        if let (Some(c), Some(o)) = (from, tc.as_object_mut()) {
+            o.insert("_meta".into(), json!({"opencode/child-session": {"id": c, "parentID": "s1", "depth": 1}}));
+        }
+        json!({"jsonrpc": "2.0", "id": rpc, "method": "session/request_permission", "params": {"sessionId": "s1", "toolCall": tc, "options": [{"optionId": "y", "name": "Allow", "kind": "allow_once"}, {"optionId": "n", "name": "Reject", "kind": "reject_once"}]}})
+    }
+
+    fn answer_to(w: &[Value], rpc: u64) -> Option<String> {
+        w.iter().find(|v| v.get("id") == Some(&json!(rpc)) && v.get("result").is_some()).and_then(|v| v.pointer("/result/outcome/optionId")).and_then(Value::as_str).map(str::to_owned)
+    }
+
+    fn tool(core: &Core, id: &str) -> Option<ToolCall> {
+        core.get(id).and_then(|e| match &e.body {
+            Body::Tool(t) => Some(t.as_ref().clone()),
+            _ => None,
+        })
+    }
+
+    #[test]
+    fn acp_subagent_paused_request_waits_until_resumed() {
+        let (mut a, mut core) = (Acp::new(None), Core::new());
+        opened(&mut a, &mut core);
+        feed(&mut a, &mut core, &[child("c1", "s1", "created")]);
+        a.command(&mut core, Command::Pause { on: true, task: Some("c1".into()) });
+        // Held: no answer, no card, its call waiting under it.
+        feed(&mut a, &mut core, &[asks(7, "c1:t1", "edit", "/w/a.rs", Some("c1"))]);
+        assert!(core.state.approvals.is_empty());
+        assert_eq!(answer_to(&written(&mut core), 7), None);
+        assert_eq!(core.get("c1:t1").and_then(|e| e.parent.clone()).as_deref(), Some("c1"));
+        // The agent's own request isn't held by its subagent's pause.
+        feed(&mut a, &mut core, &[asks(8, "t2", "edit", "/w/b.rs", None)]);
+        assert_eq!(core.state.approvals.len(), 1);
+        // Resumed: it's asked as it came, naming the subagent.
+        a.command(&mut core, Command::Pause { on: false, task: Some("c1".into()) });
+        assert_eq!(core.state.approvals.len(), 2);
+        assert!(core.state.approvals.iter().any(|ap| ap.agent.as_deref() == Some("Explore c1") && ap.tool_id.as_deref() == Some("c1:t1")));
+        // Paused again and the turn cancelled: what's held is answered cancelled.
+        a.command(&mut core, Command::Pause { on: true, task: Some("c1".into()) });
+        a.prompting = Some("p".into());
+        feed(&mut a, &mut core, &[asks(9, "c1:t3", "read", "/w/c.rs", Some("c1"))]);
+        let _ = written(&mut core);
+        a.command(&mut core, Command::Interrupt);
+        assert!(written(&mut core).iter().any(|v| v.get("id") == Some(&json!(9)) && v.pointer("/result/outcome/outcome") == Some(&json!("cancelled"))));
+        // No such subagent: said so.
+        a.command(&mut core, Command::Pause { on: true, task: Some("nope".into()) });
+        assert!(core.events().any(|e| matches!(&e.body, Body::Notice { text, .. } if text.contains("no such subagent"))));
+    }
+
+    #[test]
+    fn acp_off_refuses_and_ask_shows_with_reason() {
+        let (mut a, mut core) = (Acp::new(None), Core::new());
+        opened(&mut a, &mut core);
+        core.state.perms = Some(Perms { edit: Grant::Off, run: Grant::Ask, ..Perms::default() });
+        feed(&mut a, &mut core, &[asks(7, "t1", "edit", "/w/a.rs", None)]);
+        assert_eq!(answer_to(&written(&mut core), 7).as_deref(), Some("n"));
+        assert!(core.state.approvals.is_empty());
+        let t = tool(&core, "t1");
+        assert_eq!(t.as_ref().map(|t| t.status), Some(ToolStatus::Denied));
+        assert!(t.and_then(|t| t.output).is_some_and(|o| o.contains("change files")));
+        feed(&mut a, &mut core, &[asks(8, "t2", "execute", "/w", None)]);
+        assert!(core.state.approvals.iter().any(|ap| ap.id == "8" && ap.reason.as_deref().is_some_and(|r| r.contains("run commands"))));
+        // What its perms let go is asked as it always was.
+        feed(&mut a, &mut core, &[asks(9, "t3", "read", "/w/a.rs", None)]);
+        assert!(core.state.approvals.iter().any(|ap| ap.id == "9" && ap.reason.is_none()));
+        // No limits: as before.
+        let (mut a, mut core) = (Acp::new(None), Core::new());
+        opened(&mut a, &mut core);
+        feed(&mut a, &mut core, &[asks(7, "t1", "edit", "/w/a.rs", None)]);
+        assert_eq!(answer_to(&written(&mut core), 7), None);
+        assert!(core.state.approvals.iter().any(|ap| ap.id == "7" && ap.reason.is_none()));
+    }
+
+    #[test]
+    fn acp_bypass_still_held_to_limits() {
+        let (mut a, mut core) = (Acp::new(None).with_mode(Some(KILN_BYPASS)), Core::new());
+        opened(&mut a, &mut core);
+        core.state.perms = Some(Perms { edit: Grant::Off, run: Grant::Ask, folder: Some("src".into()), ..Perms::default() });
+        feed(&mut a, &mut core, &[asks(7, "t1", "read", "/w/src/a.rs", None), asks(8, "t2", "edit", "/w/src/a.rs", None), asks(9, "t3", "execute", "/w", None), asks(10, "t4", "read", "/etc/passwd", None)]);
+        let w = written(&mut core);
+        // Bypass answers what its perms let go; Off is refused; Ask is a person's; outside its folder, refused.
+        assert_eq!(answer_to(&w, 7).as_deref(), Some("y"));
+        assert_eq!(answer_to(&w, 8).as_deref(), Some("n"));
+        assert_eq!(answer_to(&w, 9), None);
+        assert_eq!(answer_to(&w, 10).as_deref(), Some("n"));
+        assert_eq!(core.state.approvals.iter().map(|ap| ap.id.as_str()).collect::<Vec<_>>(), ["9"]);
+    }
+
+    #[test]
+    fn acp_session_perms_hold_own_requests() {
+        // Every ACP agent's own requests (Devin's account adapter and the rest alike), and a named
+        // subagent's within what it's given.
+        for devin in [false, true] {
+            let (mut a, mut core) = (Acp::new(None), Core::new());
+            a.account = devin;
+            opened(&mut a, &mut core);
+            core.state.perms = Some(Perms { web: Grant::Off, ..Perms::default() });
+            feed(&mut a, &mut core, &[child("c1", "s1", "created")]);
+            a.command(&mut core, Command::Perms { perms: Some(Perms { run: Grant::Off, ..Perms::default() }), task: Some("c1".into()) });
+            feed(&mut a, &mut core, &[asks(7, "t1", "fetch", "https://x", None), asks(8, "c1:t2", "execute", "/w", Some("c1")), asks(9, "t3", "execute", "/w", None), asks(10, "c1:t4", "fetch", "https://x", Some("c1"))]);
+            let w = written(&mut core);
+            assert_eq!(answer_to(&w, 7).as_deref(), Some("n"), "session Off holds the agent's own (devin {devin})");
+            assert_eq!(answer_to(&w, 8).as_deref(), Some("n"), "the subagent's own Off");
+            assert_eq!(answer_to(&w, 9), None, "the agent may run commands: a person's, as always");
+            assert_eq!(answer_to(&w, 10).as_deref(), Some("n"), "a subagent never gets more than its session");
+            a.command(&mut core, Command::Perms { perms: None, task: Some("nope".into()) });
+            assert!(core.events().any(|e| matches!(&e.body, Body::Notice { text, .. } if text.contains("no such subagent"))));
+        }
+    }
+
+    #[test]
+    fn acp_opencode_children_are_subagents_in_the_tree() {
+        use super::super::kinds::Adapter;
+        let mut core = Core::new();
+        core.state.cwd = "/w".into();
+        let mut ad = Adapter::Acp(Box::new(Acp::new(None)));
+        ad.start(&mut core);
+        // kiln asks opencode for its subagents (other agents ignore what they don't know).
+        let w = written(&mut core);
+        assert_eq!(w.first().and_then(|v| v.pointer("/params/clientCapabilities/_meta/opencode~1child-session-updates")), Some(&json!(true)));
+        for l in [json!({"jsonrpc": "2.0", "id": 1, "result": {"protocolVersion": 1, "agentCapabilities": {}}}), json!({"jsonrpc": "2.0", "id": 2, "result": {"sessionId": "s1"}}), child("c1", "s1", "created")] {
+            ad.line(&mut core, &l.to_string());
+        }
+        let update = |u: Value| json!({"jsonrpc": "2.0", "method": "_opencode/session/child_update", "params": {"rootSessionId": "s1", "childSessionId": "c1", "parentSessionId": "s1", "depth": 1, "type": "update", "update": u}});
+        ad.line(&mut core, &update(json!({"sessionUpdate": "tool_call", "toolCallId": "c1:t1", "kind": "read", "title": "Read a.rs", "status": "in_progress"})).to_string());
+        ad.line(&mut core, &update(json!({"sessionUpdate": "agent_message_chunk", "content": {"type": "text", "text": "Found it."}})).to_string());
+        // Its spawning call names it.
+        ad.line(&mut core, &json!({"jsonrpc": "2.0", "method": "session/update", "params": {"sessionId": "s1", "update": {"sessionUpdate": "tool_call", "toolCallId": "spawn", "kind": "other", "title": "subagent", "status": "in_progress", "rawInput": {"description": "Explore c1", "sessionID": "c1"}}}}).to_string());
+        let t = core.state.tasks.iter().find(|t| t.id == "c1").cloned();
+        assert!(t.as_ref().is_some_and(|t| t.subagent() && t.status == "running" && t.pausable && t.tool_uses == 1 && t.summary.as_deref() == Some("Found it.") && t.takes == [SendMode::Queue] && t.via.as_deref() == Some("parent")), "{t:?}");
+        assert_eq!(core.get("c1:t1").and_then(|e| e.parent.clone()).as_deref(), Some("c1"));
+        assert_eq!(tool(&core, "spawn").and_then(|t| t.task).as_deref(), Some("c1"));
+        ad.line(&mut core, &child("c1", "s1", "completed").to_string());
+        let t = core.state.tasks.iter().find(|t| t.id == "c1").cloned();
+        assert!(t.as_ref().is_some_and(|t| t.status == "completed" && t.ended.is_some() && !t.pausable), "{t:?}");
+        // Something it doesn't know: ignored, as before.
+        ad.line(&mut core, &json!({"jsonrpc": "2.0", "method": "_other/thing", "params": {}}).to_string());
+        assert_eq!(core.state.tasks.len(), 1);
+    }
+
+    #[test]
+    fn acp_nested_child_under_its_parent() {
+        let (mut a, mut core) = (Acp::new(None), Core::new());
+        opened(&mut a, &mut core);
+        feed(&mut a, &mut core, &[child("c1", "s1", "created"), child("c2", "c1", "running"), child("c2", "c1", "interrupted")]);
+        let up = |id: &str| core.state.tasks.iter().find(|t| t.id == id).map(|t| (t.parent_task.clone(), t.status.clone()));
+        assert_eq!(up("c1"), Some((None, "running".into())));
+        assert_eq!(up("c2"), Some((Some("c1".into()), "stopped".into())));
+        // A pause of the one above holds the one under it.
+        a.command(&mut core, Command::Pause { on: true, task: Some("c1".into()) });
+        feed(&mut a, &mut core, &[child("c3", "c1", "running"), asks(7, "c3:t1", "read", "/w/a.rs", Some("c3"))]);
+        assert!(core.state.approvals.is_empty());
+    }
+
+    #[test]
+    fn acp_opencode_message_goes_by_its_parent() {
+        use super::super::kinds::Adapter;
+        let mut core = Core::new();
+        core.state.cwd = "/w".into();
+        let mut ad = Adapter::Acp(Box::new(Acp::new(None)));
+        ad.start(&mut core);
+        for l in [json!({"jsonrpc": "2.0", "id": 1, "result": {"protocolVersion": 1, "agentCapabilities": {}}}), json!({"jsonrpc": "2.0", "id": 2, "result": {"sessionId": "s1"}}), child("c1", "s1", "created")] {
+            ad.line(&mut core, &l.to_string());
+        }
+        let send = |id: &str, text: &str, task: Option<&str>| Command::Send { id: id.into(), text: text.into(), mode: SendMode::Queue, attachments: Vec::new(), overrides: None, reply_to: None, task: task.map(str::to_owned) };
+        ad.command(&mut core, send("m1", "Port the parser", None));
+        let w = written(&mut core);
+        let pid = w.iter().find(|v| v.get("method").and_then(Value::as_str) == Some("session/prompt")).and_then(|p| p.get("id").cloned()).unwrap_or_default();
+        // Its agent's turn runs: the message waits for it in its thread.
+        ad.command(&mut core, send("m2", "Look at lexer.rs too", Some("c1")));
+        assert!(core.state.tasks.iter().any(|t| t.id == "c1" && t.queue.iter().any(|m| m.id == "m2")));
+        assert!(!written(&mut core).iter().any(|v| v.get("method").and_then(Value::as_str) == Some("session/prompt")));
+        // The turn ends: the agent is asked to pass it on, by the subagent's session id.
+        ad.line(&mut core, &json!({"jsonrpc": "2.0", "id": pid, "result": {"stopReason": "end_turn"}}).to_string());
+        ad.tick(&mut core);
+        let w = written(&mut core);
+        let prompt = w.iter().find(|v| v.get("method").and_then(Value::as_str) == Some("session/prompt")).map(Value::to_string).unwrap_or_default();
+        assert!(prompt.contains("Look at lexer.rs too") && prompt.contains(r#"sessionID \"c1\""#), "{prompt}");
+        assert!(core.state.tasks.iter().any(|t| t.id == "c1" && t.queue.is_empty()));
+        assert_eq!(core.state.delivery.get("m2"), Some(&Delivery::Sent));
+        // One that ended still takes a follow-up (opencode resumes it).
+        ad.line(&mut core, &child("c1", "s1", "completed").to_string());
+        assert!(core.state.tasks.iter().any(|t| t.id == "c1" && t.takes == [SendMode::Queue]));
     }
 }

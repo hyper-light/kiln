@@ -136,14 +136,22 @@ test("w26_r14: Ship's stages as the Lanes' groups, every job its lane from the s
     ],
   );
   assert.equal(groups[4]?.note, "not yet");
-  // Each platform and the image, and each runner, its lane from the start.
+  // Each platform and the image, and each runner, its lane from the start: a platform that has run
+  // with its job (Output) and its times (its lane), as a leg (W26-R23).
   const later = shipGroups({
     ...detail,
-    build: { platforms: [{ name: "linux/amd64", state: "running" }], image: { state: "queued", digest: null } },
+    build: {
+      platforms: [
+        { name: "linux/amd64", state: "running", job: "j-linux", run: "r-release", start: 100 },
+        { name: "darwin/arm64", state: "queued" },
+      ],
+      image: { state: "queued", digest: null },
+    },
     replant: [{ name: "adacachy", state: "replanting", why: "a newer kiln" }],
   });
   assert.deepEqual(later[2]?.lanes, [
-    { id: "platform/linux/amd64", name: "linux/amd64", state: "running", start: null, end: null },
+    { id: "platform/linux/amd64", name: "linux/amd64", state: "running", start: 100, end: null, job: "j-linux" },
+    { id: "platform/darwin/arm64", name: "darwin/arm64", state: "queued", start: null, end: null },
     { id: "image", name: "image", state: "queued", start: null, end: null },
   ]);
   assert.deepEqual(later[5]?.lanes, [

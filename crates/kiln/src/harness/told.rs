@@ -382,7 +382,7 @@ mod tests {
     use crate::harness::queued::Queued;
 
     fn asks(title: &str) -> anyhow::Result<crate::harness::session::ApprovalBrief> {
-        Ok(crate::harness::session::ApprovalBrief { id: "r1".into(), tool: crate::harness::model::ToolKind::Shell, tool_name: "Bash".into(), title: title.into(), at: 1 })
+        Ok(crate::harness::session::ApprovalBrief { id: "r1".into(), tool: crate::harness::model::ToolKind::Shell, tool_name: "Bash".into(), title: title.into(), at: 1, agent: None })
     }
 
     fn child(id: &str, status: Status, ended_at: i64, summary: &str) -> Info {
