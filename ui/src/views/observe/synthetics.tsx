@@ -196,7 +196,7 @@ function List({ onAdd, onEdit }: { onAdd: () => void; onEdit: (t: Synthetic) => 
                     </p>
                     {failing && (
                       <p className="truncate text-[12px] text-[#e2c4c6]" title={failing.state.failed.join("\n")}>
-                        {failing.machine}: {failing.state.failed[0] ?? "failing"}
+                        {labelOf(failing.machine, labels)}: {failing.state.failed[0] ?? "failing"}
                       </p>
                     )}
                     <div className="mt-1 flex items-center justify-between gap-2 sm:hidden">
