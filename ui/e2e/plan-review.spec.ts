@@ -22,10 +22,16 @@ async function putAwayCards(page: Page) {
     .first()
     .waitFor({ timeout: 3000 })
     .catch(() => undefined);
-  await expect(async () => {
-    if ((await away.count()) > 0) await away.first().click({ timeout: 1000 });
-    await expect(away).toHaveCount(0, { timeout: 500 });
-  }).toPass({ timeout: 10_000 });
+  // A phone shows one card at a time: wait for that card to leave before the next one,
+  // rather than waiting for the whole queue to be empty after each single dismissal.
+  while ((await away.count()) > 0) {
+    const label = await away.first().getAttribute("aria-label");
+    if (!label) throw new Error("A notice's dismiss button needs its accessible name");
+    const card = page.getByRole("button", { name: label, exact: true });
+    await card.click({ timeout: 1000 });
+    await expect(card).toHaveCount(0);
+  }
+  await expect(away).toHaveCount(0);
 }
 
 test("a goal's plan is read and answered in its agent's Plan tab, and Other… brings it back changed", async ({ page }) => {
