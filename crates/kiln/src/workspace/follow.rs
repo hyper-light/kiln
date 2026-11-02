@@ -430,8 +430,8 @@ fn comment_text(r: &Record, v: &Value, p: &Place) -> String {
         Some(t) if crate::ci::ops::ops().iter().any(|o| o.name == "ci.diffs.reply") => format!(" To answer in its thread: ci.diffs.reply {{\"diff\": \"{name}\", \"thread\": \"{t}\", \"body\": …}}."),
         _ => String::new(),
     };
-    // A new version that answers its thread says so (W26-R18).
-    let answers = p.thread.as_ref().map(|t| format!(" that answers this thread: agents.change {{\"answers\": [\"{t}\"]}}")).unwrap_or_else(|| " (agents.change)".to_owned());
+    // A new version that fixes its thread says so (W26-R18).
+    let answers = p.thread.as_ref().map(|t| format!(" that fixes this thread: agents.change {{\"threads\": [\"{t}\"]}}")).unwrap_or_else(|| " (agents.change)".to_owned());
     format!(
         "{who}{} {did} on your {}change {name}{}. {who}'s words, quoted:\n\n{quoted}\nIf they ask for a change, make it in a new version{answers}.{reply} It's at {}",
         if theirs { " (your person)" } else { "" },
@@ -725,7 +725,7 @@ mod tests {
             let got = until("still one leg").await;
             let sent = got.iter().find(|t| t.contains("> still one leg")).cloned().unwrap_or_default();
             anyhow::ensure!(sent.contains("Why kiln sent you this: acme/app lets agents fix code from agents' feedback (turned on by ada, 31 Oct 2026). Agents have started 0 of 3 fixes in thread th1"), "with why: {sent}");
-            anyhow::ensure!(sent.contains("agents.change {\"answers\": [\"th1\"]}") && sent.contains("ci.diffs.reply"), "how to answer it: {sent}");
+            anyhow::ensure!(sent.contains("agents.change {\"threads\": [\"th1\"]}") && sent.contains("ci.diffs.reply"), "how to answer it: {sent}");
             let hand: (String, String, u32, String) = hub.store.call(|c| Ok(c.query_row("SELECT to_name, sha, version, why FROM ship_handoffs WHERE what = 'threads' AND by = 'kiln'", [], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))?)).await?;
             anyhow::ensure!(hand.1 == "1".repeat(40) && hand.2 == 1 && hand.3.starts_with("acme/app lets agents fix code from agents' feedback"), "kiln's hand-off at CR1's newest version: {hand:?}");
 

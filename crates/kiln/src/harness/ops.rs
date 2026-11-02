@@ -977,9 +977,9 @@ pub mod input {
         pub trunk: Option<String>,
         /// Failing checks go to the agent to fix (the default).
         pub fix_checks: Option<bool>,
-        /// The threads of its change this new version answers (kiln's own review, by their ids):
-        /// the version is an agent's fix of theirs, and each says which version fixed it.
-        pub answers: Option<Vec<String>>,
+        /// The threads of its change this new version fixes (kiln's own review, by their ids): the
+        /// version is an agent's fix of theirs, and each says which version fixed it.
+        pub threads: Option<Vec<String>>,
         /// Marks its draft ready for review, with a new version or with nothing new to push.
         pub ready: Option<bool>,
     }

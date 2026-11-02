@@ -2328,7 +2328,7 @@ fn handed_text(rec: &Records, ch: &ChangeRec, conflicts: &[kiln_ci::review::Conf
         }
         let ids: Vec<String> = threads.iter().map(|t| format!("\"{}\"", t.id)).collect();
         text.push_str(&format!(
-            "\n\nAnswer each in its thread: ci.diffs.reply {{\"diff\": \"{}\", \"thread\": <its id>, \"body\": …}}. Make what they ask in a new version that answers them: agents.change {{\"answers\": [{}]}}.",
+            "\n\nAnswer each in its thread: ci.diffs.reply {{\"diff\": \"{}\", \"thread\": <its id>, \"body\": …}}. Make what they ask in a new version that fixes them: agents.change {{\"threads\": [{}]}}.",
             ch.name,
             ids.join(", ")
         ));
@@ -3521,7 +3521,7 @@ mod tests {
                 told.contains("your change D41 (version 1, commit 4141414)")
                     && told.contains("- thread th1, crates/kiln-ci/src/plan/matrix.rs:42 on version 1 (question), kim: empty matrix meant?")
                     && told.contains("ci.diffs.reply")
-                    && told.contains("agents.change {\"answers\": [\"th1\"]}")
+                    && told.contains("agents.change {\"threads\": [\"th1\"]}")
                     && told.ends_with("/diffs/D41"),
                 "{told}"
             );
