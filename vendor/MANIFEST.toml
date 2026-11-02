@@ -167,3 +167,33 @@ take = [
   "grammars/tree-sitter-yaml",
 ]
 own = ["UPSTREAM.md"]
+
+# aws-lc-rs, kiln's (and rustls's, Mantle's) cryptography over AWS-LC, at its release v1.18.2, the
+# version kiln takes from crates.io, with Mantle's change to it (a digest's state read out and
+# resumed, which Mantle's gateway needs) so Mantle builds on kiln's one copy (kiln's CP-T10.2). The
+# crate alone: aws-lc-sys stays crates.io's (0.46.0). Its manifest is made standalone, as crates.io's
+# package states it (vendor/aws-lc-rs/UPSTREAM.md).
+[projects.aws-lc-rs]
+kind = "git"
+repository = "https://github.com/aws/aws-lc-rs"
+commit = "9df497501436596d4da77109217806b3af7f56cb"
+path = "vendor/aws-lc-rs"
+take = ["LICENSE", "aws-lc-rs"]
+# Upstream's checkouts write its NIST vectors with CRLF line ends; kiln's copy holds each file's bytes
+# as upstream's repository does, so a checkout of kiln holds them as scripts/vendor.py checks them.
+exclude = ["aws-lc-rs/third_party/NIST/.gitattributes"]
+own = ["UPSTREAM.md"]
+
+# Mantle, kiln's store of bytes (docs/mantle.md; kiln's CP-T10.2), at the head of its main: its crates,
+# built on kiln's one hyper-raft (vendor/hyper-raft) and aws-lc-rs (vendor/aws-lc-rs), so kiln's copy
+# leaves its own copies of them (its vendor/) out, and its docs and drawings, which are Mantle's and no
+# part of what kiln builds, and its CI (.github, .kiln), which runs in Mantle's repository. Its crates
+# take hyper-raft's by path: the recorded change points those paths at kiln's copy
+# (vendor/mantle/UPSTREAM.md).
+[projects.mantle]
+kind = "git"
+repository = "https://github.com/hyper-light/mantle"
+commit = "17eb8032710b8803d328a6c846a9dc1769660b98"
+path = "vendor/mantle"
+exclude = [".github", ".kiln", "vendor", "docs", "loomdoc.html", "mantle-strata.svg", "mantle-strata-dark.svg", "mantle-strata-light.svg"]
+own = ["UPSTREAM.md"]

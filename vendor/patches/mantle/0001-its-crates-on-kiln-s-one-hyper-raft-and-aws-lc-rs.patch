@@ -1,0 +1,588 @@
+Subject: Its crates on kiln's one hyper-raft and aws-lc-rs
+Why: kiln holds one copy of each hyper-light product and of aws-lc-rs (CP-M1's one revision): Mantle's crates take hyper-raft's crates by path from Mantle's own vendor/, which kiln leaves out, so each path points at kiln's vendor/hyper-raft; Mantle's [patch.crates-io] points aws-lc-rs at kiln's vendor/aws-lc-rs (1.18.2 with Mantle's changes) and leaves aws-lc-sys crates.io's (0.46.0); its Cargo.lock is resolved on them
+
+diff --git a/Cargo.lock b/Cargo.lock
+index 080e337ada1147ef3cb2536d1f69d472b46ce22e..9940c8220a3c155b68c5099a564796862a4f4521 100644
+--- a/Cargo.lock
++++ b/Cargo.lock
+@@ -2,6 +2,15 @@
+ # It is not intended for manual editing.
+ version = 4
+ 
++[[package]]
++name = "aho-corasick"
++version = "1.1.5"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "c982642fa9e8606056828ee9a8505737230110bb1099153c79efe865c59d12ba"
++dependencies = [
++ "memchr",
++]
++
+ [[package]]
+ name = "alloc-no-stdlib"
+ version = "2.0.4"
+@@ -75,7 +84,7 @@ checksum = "f2032f911046de80f0a198e0901378627c33f59ea0ac00e363d481118bd70a53"
+ 
+ [[package]]
+ name = "aws-lc-rs"
+-version = "1.18.1"
++version = "1.18.2"
+ dependencies = [
+  "aws-lc-sys",
+  "zeroize",
+@@ -83,7 +92,9 @@ dependencies = [
+ 
+ [[package]]
+ name = "aws-lc-sys"
+-version = "0.45.0"
++version = "0.46.0"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "f1622d8446a2d4b2ce0c7eefc73dd43a99779028d5ee5c2dd8073a658ba8a2bc"
+ dependencies = [
+  "cc",
+  "cmake",
+@@ -390,6 +401,21 @@ version = "1.3.0"
+ source = "registry+https://github.com/rust-lang/crates.io-index"
+ checksum = "42703706b716c37f96a77aea830392ad231f44c9e9a67872fa5548707e11b11c"
+ 
++[[package]]
++name = "generator"
++version = "0.8.11"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "1be81b31c9ce4caf7f3178eeb90662bb1864d3ad363ec6bdada3201adff19c37"
++dependencies = [
++ "cc",
++ "cfg-if",
++ "libc",
++ "log",
++ "rustversion",
++ "windows-link",
++ "windows-result",
++]
++
+ [[package]]
+ name = "generic-array"
+ version = "0.14.7"
+@@ -548,6 +574,7 @@ version = "0.1.0"
+ dependencies = [
+  "crc32c",
+  "libc",
++ "loom",
+  "pin-project-lite",
+  "rustix",
+  "windows-sys 0.61.2",
+@@ -647,6 +674,12 @@ dependencies = [
+  "libc",
+ ]
+ 
++[[package]]
++name = "lazy_static"
++version = "1.5.1"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "20870f649af7073d53e38067b2a84312175d56ea15217e1b15bc83506ec50afb"
++
+ [[package]]
+ name = "libc"
+ version = "0.2.189"
+@@ -671,6 +704,19 @@ version = "0.4.34"
+ source = "registry+https://github.com/rust-lang/crates.io-index"
+ checksum = "f9f8bd3e56ce4dfc153cf470fffbfa98c7620958b312ca5c3a4b8d5181fd13c6"
+ 
++[[package]]
++name = "loom"
++version = "0.7.2"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "419e0dc8046cb947daa77eb95ae174acfbddb7673b4151f56d1eed8e93fbfaca"
++dependencies = [
++ "cfg-if",
++ "generator",
++ "scoped-tls",
++ "tracing",
++ "tracing-subscriber",
++]
++
+ [[package]]
+ name = "lru-slab"
+ version = "0.1.3"
+@@ -926,12 +972,30 @@ dependencies = [
+  "zeroize",
+ ]
+ 
++[[package]]
++name = "matchers"
++version = "0.2.0"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "d1525a2a28c7f4fa0fc98bb91ae755d1e2d1505079e05539e35bc876b5d65ae9"
++dependencies = [
++ "regex-automata",
++]
++
+ [[package]]
+ name = "memchr"
+ version = "2.8.3"
+ source = "registry+https://github.com/rust-lang/crates.io-index"
+ checksum = "cf8baf1c55e62ffcace7a9f06f4bd9cd3f0c4beb022d3b367256b91b87513d98"
+ 
++[[package]]
++name = "nu-ansi-term"
++version = "0.50.3"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "7957b9740744892f114936ab4a57b3f487491bbeafaf8083688b16841a4240e5"
++dependencies = [
++ "windows-sys 0.61.2",
++]
++
+ [[package]]
+ name = "num-traits"
+ version = "0.2.19"
+@@ -1129,6 +1193,17 @@ dependencies = [
+  "readme-rustdocifier",
+ ]
+ 
++[[package]]
++name = "regex-automata"
++version = "0.4.18"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "ad8553b9b26413251cbf30e620595c7a41b3887f03da04579c0e6b0d6a06b4b2"
++dependencies = [
++ "aho-corasick",
++ "memchr",
++ "regex-syntax",
++]
++
+ [[package]]
+ name = "regex-syntax"
+ version = "0.8.11"
+@@ -1207,6 +1282,12 @@ dependencies = [
+  "untrusted",
+ ]
+ 
++[[package]]
++name = "rustversion"
++version = "1.0.23"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "cf54715a573b99ac80df0bc206da022bcd442c974952c7b9720069370852e21f"
++
+ [[package]]
+ name = "rusty-fork"
+ version = "0.3.1"
+@@ -1219,6 +1300,12 @@ dependencies = [
+  "wait-timeout",
+ ]
+ 
++[[package]]
++name = "scoped-tls"
++version = "1.0.1"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "e1cf6437eb19a8f4a6cc0f7dca544973b0b78843adbfeb3683d1a94a0024a294"
++
+ [[package]]
+ name = "semver"
+ version = "1.0.28"
+@@ -1292,6 +1379,15 @@ dependencies = [
+  "syn 3.0.6",
+ ]
+ 
++[[package]]
++name = "sharded-slab"
++version = "0.1.7"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "f40ca3c46823713e0d4209592e8d6e826aa57e928f09752619fc696c499637f6"
++dependencies = [
++ "lazy_static",
++]
++
+ [[package]]
+ name = "shlex"
+ version = "2.0.1"
+@@ -1366,7 +1462,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
+ checksum = "32497e9a4c7b38532efcdebeef879707aa9f794296a4f0244f6f69e9bc8574bd"
+ dependencies = [
+  "fastrand",
+- "getrandom 0.3.4",
++ "getrandom 0.4.3",
+  "once_cell",
+  "rustix",
+  "windows-sys 0.61.2",
+@@ -1392,6 +1488,15 @@ dependencies = [
+  "syn 3.0.6",
+ ]
+ 
++[[package]]
++name = "thread_local"
++version = "1.1.10"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "1ad99c4c6d32803332c548b1af0540b357b3f5fc0be8f6c6bfe8b2e6ae784070"
++dependencies = [
++ "cfg-if",
++]
++
+ [[package]]
+ name = "tinyvec"
+ version = "1.13.3"
+@@ -1415,6 +1520,36 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
+ checksum = "db97caf9d906fbde555dd62fa95ddba9eecfd14cb388e4f491a66d74cd5fb79a"
+ dependencies = [
+  "once_cell",
++ "valuable",
++]
++
++[[package]]
++name = "tracing-log"
++version = "0.2.0"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "ee855f1f400bd0e5c02d150ae5de3840039a3f54b025156404e34c23c03f47c3"
++dependencies = [
++ "log",
++ "once_cell",
++ "tracing-core",
++]
++
++[[package]]
++name = "tracing-subscriber"
++version = "0.3.23"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "cb7f578e5945fb242538965c2d0b04418d38ec25c79d160cd279bf0731c8d319"
++dependencies = [
++ "matchers",
++ "nu-ansi-term",
++ "once_cell",
++ "regex-automata",
++ "sharded-slab",
++ "smallvec",
++ "thread_local",
++ "tracing",
++ "tracing-core",
++ "tracing-log",
+ ]
+ 
+ [[package]]
+@@ -1459,6 +1594,12 @@ version = "0.2.2"
+ source = "registry+https://github.com/rust-lang/crates.io-index"
+ checksum = "06abde3611657adf66d383f00b093d7faecc7fa57071cce2578660c9f1010821"
+ 
++[[package]]
++name = "valuable"
++version = "0.1.1"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "ba73ea9cf16a25df0c8caa16c51acb937d5712a8429db78a3ee29d5dcacd3a65"
++
+ [[package]]
+ name = "version_check"
+ version = "0.9.5"
+@@ -1495,6 +1636,15 @@ version = "0.2.1"
+ source = "registry+https://github.com/rust-lang/crates.io-index"
+ checksum = "f0805222e57f7521d6a62e36fa9163bc891acd422f971defe97d64e70d0a4fe5"
+ 
++[[package]]
++name = "windows-result"
++version = "0.4.1"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "7781fa89eaf60850ac3d2da7af8e5242a5ea78d1a11c49bf2910bb5a73853eb5"
++dependencies = [
++ "windows-link",
++]
++
+ [[package]]
+ name = "windows-sys"
+ version = "0.52.0"
+diff --git a/Cargo.toml b/Cargo.toml
+index 1015a8434e1a071dc1c002437ff20336ca30699a..fa6027f993c11643331d20c58a5677b4ef773b21 100644
+--- a/Cargo.toml
++++ b/Cargo.toml
+@@ -105,5 +105,6 @@ opt-level = 3
+ # that keeps failing gives way to the operating system instead of aborting the process, and
+ # `LessSafeKey` clones.
+ [patch.crates-io]
+-aws-lc-rs = { path = "vendor/aws-lc-rs" }
+-aws-lc-sys = { path = "vendor/aws-lc-sys" }
++# kiln's copy: aws-lc-rs at kiln's one (its release 1.18.2 with these changes, vendor/aws-lc-rs), and
++# aws-lc-sys crates.io's, as kiln builds it (kiln's vendor/mantle/UPSTREAM.md).
++aws-lc-rs = { path = "../aws-lc-rs/aws-lc-rs" }
+diff --git a/crates/cert/Cargo.toml b/crates/cert/Cargo.toml
+index 0227c262380539d111d01afe831a2d196295e92a..a12687bc49897a5240672e7f164be9aa4a6d8122 100644
+--- a/crates/cert/Cargo.toml
++++ b/crates/cert/Cargo.toml
+@@ -18,7 +18,7 @@ thiserror.workspace = true
+ [dev-dependencies]
+ # rustls's verifiers, which the node's connections verify peers by (hyper-transport `Tls`), held
+ # against what this crate issues.
+-hyper-tls = { path = "../../vendor/hyper-tls" }
++hyper-tls = { path = "../../../hyper-raft/crates/hyper-tls" }
+ 
+ [lints]
+ workspace = true
+diff --git a/crates/chunk/Cargo.toml b/crates/chunk/Cargo.toml
+index dc9113cbe2ae110667150b17347b2ee4d50c100d..dbb12e20af6f98150058f8eba6420b3f48bea118 100644
+--- a/crates/chunk/Cargo.toml
++++ b/crates/chunk/Cargo.toml
+@@ -12,18 +12,18 @@ publish.workspace = true
+ [dependencies]
+ getrandom.workspace = true
+ # Block I/O and the device issuer, vendored from hyper-raft (vendor/hyper-block/SNAPSHOT).
+-hyper-block = { path = "../../vendor/hyper-block" }
++hyper-block = { path = "../../../hyper-raft/crates/hyper-block" }
+ mantle-codec = { path = "../codec" }
+ mantle-crc = { path = "../crc" }
+ mantle-disk = { path = "../disk" }
+ thiserror.workspace = true
+ 
+ [dev-dependencies]
+-hyper-block = { path = "../../vendor/hyper-block", features = ["sim"] }
++hyper-block = { path = "../../../hyper-raft/crates/hyper-block", features = ["sim"] }
+ # The index's bytes a fragment, counted by its allocator (tests/index_memory.rs).
+-hyper-measure = { path = "../../vendor/hyper-measure" }
++hyper-measure = { path = "../../../hyper-raft/crates/hyper-measure" }
+ # The runtime a `Reader`'s owner runs on, for its tests (tests/reader.rs).
+-hyper-rt = { path = "../../vendor/hyper-rt" }
++hyper-rt = { path = "../../../hyper-raft/crates/hyper-rt" }
+ proptest.workspace = true
+ tempfile.workspace = true
+ 
+diff --git a/crates/client/Cargo.toml b/crates/client/Cargo.toml
+index 9d956454f3a776fc9ac25fc766f8bc1296eeab06..7d905359cbeb9fe48cf9ccf03148524133f82199 100644
+--- a/crates/client/Cargo.toml
++++ b/crates/client/Cargo.toml
+@@ -11,9 +11,9 @@ publish.workspace = true
+ 
+ [dependencies]
+ # The runtime, the transport and its driver on it, vendored from hyper-raft (vendor/UPSTREAM.md).
+-hyper-rt = { path = "../../vendor/hyper-rt" }
+-hyper-rt-transport = { path = "../../vendor/hyper-rt-transport" }
+-hyper-transport = { path = "../../vendor/hyper-transport" }
++hyper-rt = { path = "../../../hyper-raft/crates/hyper-rt" }
++hyper-rt-transport = { path = "../../../hyper-raft/crates/hyper-rt-transport" }
++hyper-transport = { path = "../../../hyper-raft/crates/hyper-transport" }
+ # The native protocol's messages, classes and bounds, shared with the node.
+ mantle-protocol = { path = "../protocol" }
+ # S3's checksums, which a put's trailer and a get's bytes are held to.
+@@ -24,7 +24,7 @@ thiserror.workspace = true
+ 
+ [dev-dependencies]
+ # The counting allocator the client's heap is measured by (tests/heap.rs).
+-hyper-measure = { path = "../../vendor/hyper-measure" }
++hyper-measure = { path = "../../../hyper-raft/crates/hyper-measure" }
+ # The test cell's authority and the client's and node's certificates.
+ mantle-cert = { path = "../cert" }
+ 
+diff --git a/crates/disk/Cargo.toml b/crates/disk/Cargo.toml
+index 1f270b29467c87a4184c9890f37d75414d13f935..15cd3eda843b1820e2f0c7d975d5acdea4afcc5e 100644
+--- a/crates/disk/Cargo.toml
++++ b/crates/disk/Cargo.toml
+@@ -11,7 +11,7 @@ publish.workspace = true
+ 
+ [dependencies]
+ # Block I/O, vendored from hyper-raft (vendor/hyper-block/SNAPSHOT).
+-hyper-block = { path = "../../vendor/hyper-block" }
++hyper-block = { path = "../../../hyper-raft/crates/hyper-block" }
+ 
+ [target.'cfg(unix)'.dependencies]
+ rustix.workspace = true
+@@ -20,7 +20,7 @@ rustix.workspace = true
+ windows-sys.workspace = true
+ 
+ [dev-dependencies]
+-hyper-block = { path = "../../vendor/hyper-block", features = ["sim"] }
++hyper-block = { path = "../../../hyper-raft/crates/hyper-block", features = ["sim"] }
+ proptest.workspace = true
+ tempfile.workspace = true
+ 
+diff --git a/crates/ec/Cargo.toml b/crates/ec/Cargo.toml
+index 289f56facf469ecf6c83d969ad837de9c812f207..3563f4acac673db269eb73a1d301ab5b972be616 100644
+--- a/crates/ec/Cargo.toml
++++ b/crates/ec/Cargo.toml
+@@ -15,7 +15,7 @@ thiserror.workspace = true
+ 
+ [dev-dependencies]
+ # The coding work's bytes, counted by its allocator (tests/work_memory.rs).
+-hyper-measure = { path = "../../vendor/hyper-measure" }
++hyper-measure = { path = "../../../hyper-raft/crates/hyper-measure" }
+ proptest.workspace = true
+ 
+ [lints]
+diff --git a/crates/engine/Cargo.toml b/crates/engine/Cargo.toml
+index b9825dd2d8a6b3ea07f414094aff98d29f6ceb96..98dd97c4550cbd03e5e9fd3db258df88a04472d4 100644
+--- a/crates/engine/Cargo.toml
++++ b/crates/engine/Cargo.toml
+@@ -10,9 +10,9 @@ repository.workspace = true
+ publish.workspace = true
+ 
+ [dependencies]
+-hyper-block = { path = "../../vendor/hyper-block" }
++hyper-block = { path = "../../../hyper-raft/crates/hyper-block" }
+ # The shards a node runs its ranges on (docs/design/engine-structure.md §2, step E2).
+-hyper-rt = { path = "../../vendor/hyper-rt" }
++hyper-rt = { path = "../../../hyper-raft/crates/hyper-rt" }
+ mantle-crc = { path = "../crc" }
+ thiserror.workspace = true
+ 
+@@ -34,7 +34,7 @@ profile-phases = []
+ 
+ [dev-dependencies]
+ # The simulated device with power-loss semantics the store's crash tests run on.
+-hyper-block = { path = "../../vendor/hyper-block", features = ["sim"] }
++hyper-block = { path = "../../../hyper-raft/crates/hyper-block", features = ["sim"] }
+ proptest.workspace = true
+ # The oracle of the engine's own xxHash (util/xxhash.rs, tests/xxhash_test.rs).
+ twox-hash.workspace = true
+@@ -42,7 +42,7 @@ twox-hash.workspace = true
+ zstd.workspace = true
+ tempfile.workspace = true
+ # Allocation and page-fault counts of the benchmarks against RocksDB.
+-hyper-measure = { path = "../../vendor/hyper-measure" }
++hyper-measure = { path = "../../../hyper-raft/crates/hyper-measure" }
+ # The benchmarks' fixed-size latency histograms (bounded at any operation count).
+ mantle-disk = { path = "../disk" }
+ 
+diff --git a/crates/http/Cargo.toml b/crates/http/Cargo.toml
+index f687cff77229d57e03365f8928cf555b4115ac20..b9dd0cf03fd129bed8efd64d5d52039302c2ff65 100644
+--- a/crates/http/Cargo.toml
++++ b/crates/http/Cargo.toml
+@@ -17,7 +17,7 @@ thiserror.workspace = true
+ [dev-dependencies]
+ # Each allocation a request's way through the codec makes, counted by its allocator
+ # (tests/allocations.rs).
+-hyper-measure = { path = "../../vendor/hyper-measure" }
++hyper-measure = { path = "../../../hyper-raft/crates/hyper-measure" }
+ # The oracle a generated or mutated request's head is read against (tests/properties.rs).
+ httparse.workspace = true
+ proptest.workspace = true
+diff --git a/crates/mantle/Cargo.toml b/crates/mantle/Cargo.toml
+index dcb9e95507b109b82d21d5cb8fb2eb3462c729b8..589fd29c367f3dd3a653bbbc4788e3471684c86d 100644
+--- a/crates/mantle/Cargo.toml
++++ b/crates/mantle/Cargo.toml
+@@ -23,8 +23,8 @@ bytes.workspace = true
+ clap.workspace = true
+ # The OS's random numbers `mantle init` draws a cell's root key and ids from.
+ getrandom.workspace = true
+-hyper-block = { path = "../../vendor/hyper-block" }
+-hyper-log = { path = "../../vendor/hyper-log" }
++hyper-block = { path = "../../../hyper-raft/crates/hyper-block" }
++hyper-log = { path = "../../../hyper-raft/crates/hyper-log" }
+ # The cell's authority and its founders' certificates, and the S3 endpoint's, issued by
+ # `mantle init`.
+ mantle-cert = { path = "../cert" }
+@@ -39,8 +39,8 @@ mantle-gateway = { path = "../gateway" }
+ # The S3 listener's HTTP/1.1 codec, which `mantle bench http` measures; the runtime the listener
+ # runs on and the TLS its clients speak, which `mantle bench s3` measures it under.
+ mantle-http = { path = "../http" }
+-hyper-rt = { path = "../../vendor/hyper-rt" }
+-hyper-tls = { path = "../../vendor/hyper-tls" }
++hyper-rt = { path = "../../../hyper-raft/crates/hyper-rt" }
++hyper-tls = { path = "../../../hyper-raft/crates/hyper-tls" }
+ mantle-meta = { path = "../meta" }
+ mantle-node = { path = "../node" }
+ # The native protocol's client, whose command line the object commands are (src/client.rs).
+@@ -53,7 +53,7 @@ mantle-s3 = { path = "../s3" }
+ [dev-dependencies]
+ # The real-process test of `mantle node` (tests/node.rs): the client's transport, the range's
+ # settings the nodes are given, and the CRC-32C the gateway states for each chunk it puts.
+-hyper-transport = { path = "../../vendor/hyper-transport" }
++hyper-transport = { path = "../../../hyper-raft/crates/hyper-transport" }
+ mantle-range = { path = "../range" }
+ tempfile.workspace = true
+ 
+diff --git a/crates/node/Cargo.toml b/crates/node/Cargo.toml
+index 3b5b603c43ba96ad4b625d4119caf3b610f94c8d..b9e958001936c5e430ab32a05508d5c6ae5b84ae 100644
+--- a/crates/node/Cargo.toml
++++ b/crates/node/Cargo.toml
+@@ -13,16 +13,16 @@ publish.workspace = true
+ # The shared stack, vendored from hyper-raft (vendor/*/SNAPSHOT, vendor/UPSTREAM.md): the runtime
+ # and the transport driven on it, QUIC's application layer, the sealed datagram plane, the
+ # node-pair liveness stream, the durable shell and its core, the shared log and its block layer.
+-hyper-block = { path = "../../vendor/hyper-block" }
+-hyper-datagram = { path = "../../vendor/hyper-datagram" }
+-hyper-durable = { path = "../../vendor/hyper-durable" }
+-hyper-liveness = { path = "../../vendor/hyper-liveness" }
+-hyper-log = { path = "../../vendor/hyper-log" }
+-hyper-raft = { path = "../../vendor/hyper-raft" }
+-hyper-rt = { path = "../../vendor/hyper-rt" }
+-hyper-rt-transport = { path = "../../vendor/hyper-rt-transport" }
+-hyper-timing = { path = "../../vendor/hyper-timing" }
+-hyper-transport = { path = "../../vendor/hyper-transport" }
++hyper-block = { path = "../../../hyper-raft/crates/hyper-block" }
++hyper-datagram = { path = "../../../hyper-raft/crates/hyper-datagram" }
++hyper-durable = { path = "../../../hyper-raft/crates/hyper-durable" }
++hyper-liveness = { path = "../../../hyper-raft/crates/hyper-liveness" }
++hyper-log = { path = "../../../hyper-raft/crates/hyper-log" }
++hyper-raft = { path = "../../../hyper-raft/crates/hyper-raft" }
++hyper-rt = { path = "../../../hyper-raft/crates/hyper-rt" }
++hyper-rt-transport = { path = "../../../hyper-raft/crates/hyper-rt-transport" }
++hyper-timing = { path = "../../../hyper-raft/crates/hyper-timing" }
++hyper-transport = { path = "../../../hyper-raft/crates/hyper-transport" }
+ # The chunk volumes of the node's storage role (node.md §1.1), and the device each is on.
+ mantle-chunk = { path = "../chunk" }
+ mantle-codec = { path = "../codec" }
+@@ -45,7 +45,7 @@ mantle-gateway = { path = "../gateway" }
+ mantle-s3 = { path = "../s3" }
+ # The S3 listener (node.md §4.1): mantle's own HTTP/1.1 codec, and TLS with the endpoint's P-256
+ # chain away from loopback.
+-hyper-tls = { path = "../../vendor/hyper-tls" }
++hyper-tls = { path = "../../../hyper-raft/crates/hyper-tls" }
+ mantle-http = { path = "../http" }
+ bytes.workspace = true
+ # A new file's id, 128 bits from the operating system (metadata.md §1).
+@@ -65,12 +65,12 @@ windows-sys = { workspace = true, features = ["Win32_Networking_WinSock"] }
+ 
+ [dev-dependencies]
+ # The simulated device a simulated node's log runs on (tests/sim.rs).
+-hyper-block = { path = "../../vendor/hyper-block", features = ["sim"] }
++hyper-block = { path = "../../../hyper-raft/crates/hyper-block", features = ["sim"] }
+ # The waker the synchronous store a simulated node's ranges write through counts its answers by
+ # (crates/range/tests/support/store.rs).
+-hyper-measure = { path = "../../vendor/hyper-measure" }
++hyper-measure = { path = "../../../hyper-raft/crates/hyper-measure" }
+ # The simulation's draws: hyper-sim's generator and named streams (tests/sim.rs).
+-hyper-sim = { path = "../../vendor/hyper-sim" }
++hyper-sim = { path = "../../../hyper-raft/crates/hyper-sim" }
+ tempfile.workspace = true
+ 
+ [lints]
+diff --git a/crates/protocol/Cargo.toml b/crates/protocol/Cargo.toml
+index 6ccc1cb5d4c8b5476f57487015cc850a16935ab1..118b0f01e2e940df4a6960d3bf06fd13fe6e6341 100644
+--- a/crates/protocol/Cargo.toml
++++ b/crates/protocol/Cargo.toml
+@@ -12,9 +12,9 @@ publish.workspace = true
+ [dependencies]
+ # The transport the messages travel on and its driver's socket batching, vendored from hyper-raft
+ # (vendor/UPSTREAM.md); hyper-timing's draw is a backoff's jitter.
+-hyper-rt-transport = { path = "../../vendor/hyper-rt-transport" }
+-hyper-timing = { path = "../../vendor/hyper-timing" }
+-hyper-transport = { path = "../../vendor/hyper-transport" }
++hyper-rt-transport = { path = "../../../hyper-raft/crates/hyper-rt-transport" }
++hyper-timing = { path = "../../../hyper-raft/crates/hyper-timing" }
++hyper-transport = { path = "../../../hyper-raft/crates/hyper-transport" }
+ mantle-codec = { path = "../codec" }
+ # S3's semantics an object's messages carry: its checksums, a listing's start, its bounds.
+ mantle-s3 = { path = "../s3" }
+diff --git a/crates/range/Cargo.toml b/crates/range/Cargo.toml
+index f445654e716ac3577bf521326307501444f79932..e1aece8fb233e7ec7b488fa9d1ec44f440180776 100644
+--- a/crates/range/Cargo.toml
++++ b/crates/range/Cargo.toml
+@@ -12,10 +12,10 @@ publish.workspace = true
+ [dependencies]
+ # The shared Raft core, its durable shell, the shared log and its block layer, vendored from
+ # hyper-raft (vendor/*/SNAPSHOT, vendor/UPSTREAM.md).
+-hyper-block = { path = "../../vendor/hyper-block" }
+-hyper-durable = { path = "../../vendor/hyper-durable" }
+-hyper-log = { path = "../../vendor/hyper-log" }
+-hyper-raft = { path = "../../vendor/hyper-raft" }
++hyper-block = { path = "../../../hyper-raft/crates/hyper-block" }
++hyper-durable = { path = "../../../hyper-raft/crates/hyper-durable" }
++hyper-log = { path = "../../../hyper-raft/crates/hyper-log" }
++hyper-raft = { path = "../../../hyper-raft/crates/hyper-raft" }
+ mantle-codec = { path = "../codec" }
+ mantle-crc = { path = "../crc" }
+ # The engine a node keeps a range's rows in (`stored`).
+@@ -24,9 +24,9 @@ mantle-meta = { path = "../meta" }
+ thiserror.workspace = true
+ 
+ [dev-dependencies]
+-hyper-block = { path = "../../vendor/hyper-block", features = ["sim"] }
++hyper-block = { path = "../../../hyper-raft/crates/hyper-block", features = ["sim"] }
+ # A waker the log's answer wakes a test's member by, its slot leaked once a waker.
+-hyper-measure = { path = "../../vendor/hyper-measure" }
++hyper-measure = { path = "../../../hyper-raft/crates/hyper-measure" }
+ proptest.workspace = true
+ tempfile.workspace = true
+ 
