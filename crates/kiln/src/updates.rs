@@ -3320,12 +3320,13 @@ mod tests {
         if std::process::Command::new("curl").arg("--version").output().is_err() {
             return Ok(());
         }
-        // A fake `kiln` behind a file:// URL stands in for the download.
+        // A fake `kiln` behind a file:// URL stands in for the download: its path with forward
+        // slashes (`file:///C:/…` on Windows, whose backslashes the shell would take as escapes).
         let dir = tempfile::tempdir()?;
         let fake = dir.path().join("kiln");
         std::fs::write(&fake, "#!/bin/sh\necho \"fake kiln $*\"\n")?;
         let sha = hex::encode(Sha256::digest(std::fs::read(&fake)?));
-        let url = format!("file://{}", fake.display());
+        let url = format!("file:///{}", fake.display().to_string().replace('\\', "/").trim_start_matches('/'));
         let script = terminal_script("j", std::slice::from_ref(&url), &sha, "");
         let out = std::process::Command::new("sh").arg("-c").arg(&script).env("TMPDIR", dir.path()).output()?;
         let text = String::from_utf8_lossy(&out.stdout);
@@ -3333,8 +3334,9 @@ mod tests {
         assert!(text.contains("fake kiln install --agent --upgrade --service"), "{text}");
         assert!(text.contains(OK_MARK), "{text}");
         // As a runner's terminal runs it: `sh -c '<script>'` handed to the user's own shell.
+        // A shell that can't run `true` isn't there (Windows' WSL `bash.exe` with no distribution).
         for shell in ["sh", "bash", "zsh", "fish"] {
-            if std::process::Command::new(shell).arg("-c").arg("true").output().is_err() {
+            if !std::process::Command::new(shell).arg("-c").arg("true").output().is_ok_and(|o| o.status.success()) {
                 continue;
             }
             let out = std::process::Command::new(shell).arg("-c").arg(format!("sh -c '{script}'")).env("TMPDIR", dir.path()).output()?;
