@@ -327,7 +327,7 @@ function Agent({ id, store }: { id: string; store: SessionStore }) {
       {path?.here && panel === "branch" && <BranchPanel key={path.here.key} n={path.here} can={path.here.stand !== "offline"} onDone={() => setPanelFor(null)} />}
       <ThreadFromContext.Provider value={from}>
         {sub ? (
-          <React.Suspense fallback={<LoadingMark />}>
+          <React.Suspense fallback={<ConversationLoading id={sub.id} />}>
             <KilnThread key={sub.id} id={sub.id} onTerminal={openBeside} find={find} />
           </React.Suspense>
         ) : (
@@ -362,7 +362,7 @@ function Agent({ id, store }: { id: string; store: SessionStore }) {
               toMain={task !== null}
               task={task}
               kiln={kiln}
-             
+
               onView={openView}
               onTerminal={openBeside}
               onOpenTask={openTask}
@@ -870,7 +870,7 @@ function Dock({
         attachments={attachments}
         toMain={toMain}
         task={task}
-       
+
         onView={onView}
         onTerminal={onTerminal}
         replyTo={reply}
@@ -968,13 +968,10 @@ function Settings({ store, open, onOpenChange, send }: { store: SessionStore; op
 }
 
 /**
- * The page while its conversation's first snapshot comes: its frame (the head's lines, the phone's
- * tabs or the side, the composer's place) as the page will have it, and the loader where the
- * conversation goes, so nothing moves when it's in.
+ * W21-R13, W21-R14: the page and a subagent's thread share the centered conversation loader and
+ * composer placeholder, with the draft belonging to the session being opened.
  */
-function AgentLoading({ id }: { id: string }) {
-  const wide = useMediaQuery("(min-width: 1100px)");
-  const [trayCollapsed, setTrayCollapsed] = useLocalStorage(INSPECTOR_COLLAPSED, false);
+function ConversationLoading({ id }: { id: string }) {
   const draft = useDrafts((s) => s.drafts[id] ?? "");
   const sizeDraft = React.useCallback(
     (el: HTMLTextAreaElement | null) => {
@@ -985,8 +982,8 @@ function AgentLoading({ id }: { id: string }) {
     },
     [draft],
   );
-  const work = (
-    <div className="hx-main">
+  return (
+    <>
       <div className="hx-timeline ag-loading" role="status">
         <LoadingMark />
         <PrismLabel live>Loading conversation</PrismLabel>
@@ -1010,6 +1007,20 @@ function AgentLoading({ id }: { id: string }) {
           </div>
         </div>
       </div>
+    </>
+  );
+}
+
+/**
+ * The page while its conversation's first snapshot comes: its frame (the head's lines, the phone's
+ * tabs or the side) as the page will have it, and the conversation loading where it goes.
+ */
+function AgentLoading({ id }: { id: string }) {
+  const wide = useMediaQuery("(min-width: 1100px)");
+  const [trayCollapsed, setTrayCollapsed] = useLocalStorage(INSPECTOR_COLLAPSED, false);
+  const work = (
+    <div className="hx-main">
+      <ConversationLoading id={id} />
     </div>
   );
   return (
