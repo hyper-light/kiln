@@ -56,6 +56,18 @@ fn run(file: Option<&File>, facts: &BTreeMap<String, GitFacts>, uses: &[String],
 }
 
 #[test]
+fn w29_r26_editing_a_github_lock_to_a_known_moved_full_tag_requires_review() {
+    let (mut file, mut facts, uses) = fixture("v1.2.3", M, true);
+    let key = "acme/action@v1.2.3";
+    if let Some(entry) = file.dependencies.get_mut(key) { entry.commit = format!("sha1-{M}"); }
+    if let Some(fact) = facts.get_mut(key) { fact.previous = Some(A.into()); }
+    assert!(run(Some(&file), &facts, &uses, Policy::default()).is_err_and(|e| e.diagnostics.iter().any(|d| d.code == "KCI4053")));
+    let accepted = [(key.into(), M.into())].into();
+    let approved = check_github(GithubCheck { workflow: WORKFLOW, uses: &uses, file: Some(&file), facts: &facts, home_host: "github.com", policy: Policy::default(), accepted_moves: &accepted });
+    assert!(approved.is_ok_and(|v| v.pins.get(key).is_some_and(|pin| pin.commit == M)));
+}
+
+#[test]
 fn w29_r25_unused_lock_roots_are_stale_but_equivalent_sha_uses_remain_covered() {
     let (mut file, _, _) = fixture("v1", A, true);
     let extra = "acme/old@v2".to_owned();

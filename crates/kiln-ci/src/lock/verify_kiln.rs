@@ -82,6 +82,9 @@ pub fn check_git(check: Check<'_>) -> Result<Verified, verify::Refused> {
     });
     if exact && let Some(previous) = &facts.previous && !previous.eq_ignore_ascii_case(&now) {
         moved.push(verify::MovedRef { pin: key.into(), before: previous.clone(), now: now.clone() });
+        if policy.moved_tags != verify::MovedTags::Refuse && wanted == now && !accepted_moves.get(key).is_some_and(|a| a.eq_ignore_ascii_case(&now)) {
+            diagnostics.push(diag("KCI4053", workflow, format!("{key}: full-version tag moved from accepted {previous} to {now}; changing the lock needs a person's review"), false));
+        }
         if policy.moved_tags == verify::MovedTags::Refuse && !accepted_moves.get(key).is_some_and(|a| a.eq_ignore_ascii_case(&now)) {
             diagnostics.push(diag("KCI4056", workflow, format!("{key}: full-version tag moved from {previous} to {now}; it needs an explicitly reviewed lock change"), false));
         }

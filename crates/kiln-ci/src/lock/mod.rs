@@ -7,5 +7,6 @@ pub mod dockerfile;
 pub mod kiln;
 pub mod regenerate;
 pub mod replay;
+pub mod review;
 pub mod verify;
 pub mod verify_kiln;

@@ -15,6 +15,19 @@ fn check(key: &str, entry: &kiln::Git, facts: &GitFacts, policy: verify::Policy)
 }
 
 #[test]
+fn w29_r26_editing_a_native_lock_to_a_known_moved_full_tag_requires_review() {
+    let key = "kiln://acme/kit@v1.2.3";
+    let mut pin = entry("refs/tags/v1.2.3");
+    pin.commit = format!("sha1-{B}");
+    let mut observed = facts("refs/tags/v1.2.3", B);
+    observed.previous = Some(A.into());
+    assert!(check(key, &pin, &observed, verify::Policy::default()).is_err_and(|e| e.diagnostics.iter().any(|d| d.code == "KCI4053")));
+    let accepted = [(key.into(), B.into())].into();
+    let approved = check_git(Check { workflow: PATH, key, entry: &pin, facts: &observed, home_host: "github.com", policy: verify::Policy::default(), accepted_moves: &accepted });
+    assert!(approved.is_ok_and(|v| v.selection.commit == B));
+}
+
+#[test]
 fn w29_r24_native_pins_keep_a_and_full_versions_refuse_movement() -> Result<(), String> {
     let verified = check("kiln://acme/kit@v1", &entry("refs/tags/v1"), &facts("refs/tags/v1", B), verify::Policy::default()).map_err(|e| format!("{:?}", e.diagnostics))?;
     assert_eq!(verified.selection.commit, A);

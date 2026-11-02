@@ -250,6 +250,11 @@ pub fn check_github(check: GithubCheck<'_>) -> Result<Verified, Refused> {
         {
             moved.push(MovedRef { pin: key.to_owned(), before: before.to_owned(), now: now.clone() });
             let accepted = check.accepted_moves.get(key).is_some_and(|a| a.eq_ignore_ascii_case(now));
+            // W29-R26: editing the lock to M cannot erase the accepted full tag's A. Only
+            // the adapter's verified, scoped review proof can authorize that re-lock.
+            if policy.moved_tags != MovedTags::Refuse && !accepted && locked.is_some_and(|(_, entry)| format::digest(&entry.commit).is_some_and(|sha| sha.eq_ignore_ascii_case(now))) {
+                diagnostics.push(diag("KCI4053", check.workflow, format!("{key}: full-version tag moved from accepted {before} to {now}; changing the lock needs a person's review"), false));
+            }
             if policy.moved_tags == MovedTags::Refuse && !accepted {
                 diagnostics.push(diag("KCI4056", check.workflow, format!("{key}: full-version tag moved from {before} to {now}; it needs an explicitly reviewed lock change"), false));
             }
