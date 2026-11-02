@@ -294,6 +294,23 @@ async fn merge_tree(hub: &Hub, path: &str, onto: &str, v: &Version, request: boo
     }
 }
 
+async fn lock_base(hub: &Hub, path: &str, onto: &str, v: &Version, request: bool) -> Result<String, Fail> {
+    if !request { return Ok(v.parent.clone()); }
+    gitops::run_git(hub, &["-C", path, "merge-base", onto, &v.commit], LS_REMOTE_TIMEOUT).await.map(|b| String::from_utf8_lossy(&b).trim().to_owned()).map_err(fail)
+}
+
+/// W29-R25: people resolve source conflicts; both generated files follow that source tree.
+async fn replay_tree(hub: &Hub, path: &str, onto: &str, v: &Version, request: bool) -> Result<(bool, Merged), Fail> {
+    let (_, mut merged) = merge_tree(hub, path, onto, v, request).await?;
+    merged.paths.retain(|(path, _)| !super::locks::lock_path(path));
+    if merged.paths.is_empty() {
+        let base = lock_base(hub, path, onto, v, request).await?;
+        merged.tree = super::locks::regenerate_tree(hub, path, &base, onto, &v.commit, &merged.tree).await.map_err(refused)?;
+        return Ok((true, merged));
+    }
+    Ok((false, merged))
+}
+
 /// A blob's bytes, as git names it (`<tree>:<path>`, an id).
 async fn blob(hub: &Hub, path: &str, spec: &str) -> Result<Vec<u8>, Fail> {
     gitops::run_git(hub, &["-C", path, "cat-file", "blob", spec], LS_REMOTE_TIMEOUT).await.map_err(fail)
@@ -492,7 +509,7 @@ pub async fn current(hub: &Hub, d: &Diff) -> Result<Option<Replay>, Fail> {
     if there {
         return Ok(None);
     }
-    let (clean, m) = merge_tree(hub, &path, &onto.commit, &latest, request).await?;
+    let (clean, m) = replay_tree(hub, &path, &onto.commit, &latest, request).await?;
     let found = if clean { Vec::new() } else { found(hub, &path, &m).await? };
     record(hub, d, &latest, &onto, &m.tree, found).await.map(Some)
 }
@@ -783,12 +800,14 @@ pub async fn commit(hub: &Arc<Hub>, d: &Diff, caller: &Caller) -> Result<Value, 
     if onto.commit != replay.onto {
         return Err(refused(format!("{} moved: look again", onto.name)));
     }
-    let (_, m) = merge_tree(hub, &path, &onto.commit, &latest, d.kind == "change_request").await?;
+    let (_, m) = replay_tree(hub, &path, &onto.commit, &latest, d.kind == "change_request").await?;
     if m.tree != replay.tree {
         return Err(refused("the replay came out otherwise this time; look again"));
     }
     let (puts, removes) = resolutions(hub, &path, &m, &rows).await?;
     let tree = tree_with(hub, &path, &m.tree, &puts, &removes).await?;
+    let base = lock_base(hub, &path, &onto.commit, &latest, d.kind == "change_request").await?;
+    let tree = super::locks::regenerate_tree(hub, &path, &base, &onto.commit, &latest.commit, &tree).await.map_err(refused)?;
     // An agent's resolution taken makes the agent a co-author.
     let agents: Vec<&str> = rows.iter().filter(|c| c.take == Some(Take::Agent)).filter_map(|c| c.agent_by.as_deref()).collect::<BTreeSet<_>>().into_iter().collect();
     let files: BTreeSet<&str> = rows.iter().map(|c| c.file.as_str()).collect();

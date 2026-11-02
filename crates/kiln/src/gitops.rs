@@ -177,6 +177,20 @@ async fn in_mirror(hub: &Hub, path: &std::path::Path, sha: &str) -> bool {
     path.join("HEAD").exists() && run_git(hub, &["-C", &path.to_string_lossy(), "cat-file", "-e", &format!("{sha}^{{commit}}")], LS_REMOTE_TIMEOUT).await.is_ok()
 }
 
+/// W29-R25: copy an unreferenced replay commit into an initialized consumer cache. Its normal
+/// fetches and concurrent replays share this guard; no branch or accepted resolution moves.
+pub(crate) async fn cache_commit_from(hub: &Hub, repo: &Repo, source: &std::path::Path, sha: &str) -> anyhow::Result<()> {
+    anyhow::ensure!(matches!(sha.len(), 40 | 64) && sha.bytes().all(|b| b.is_ascii_hexdigit()), "invalid replay commit");
+    let path = mirror_path(hub, &repo.name);
+    let lock = mirror_lock(&repo.name);
+    let _copy = lock.write().await;
+    anyhow::ensure!(path.join("HEAD").exists(), "the workflow cache is not initialized");
+    if !in_mirror(hub, &path, sha).await {
+        run_git(hub, &["-C", &path.to_string_lossy(), "fetch", "--quiet", "--no-tags", &source.to_string_lossy(), sha], LS_REMOTE_TIMEOUT).await?;
+    }
+    Ok(())
+}
+
 /// kiln's configuration files under `.kiln/`, which aren't pipelines: deployments
 /// (docs/cd.md, docs/cd-targets.md), environments (docs/ci.md W15) and review (W14).
 fn is_config(file: &str) -> bool {

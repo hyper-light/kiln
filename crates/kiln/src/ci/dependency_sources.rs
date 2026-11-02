@@ -3,6 +3,7 @@
 //! transport errors: a git URL, authorization header or signed storage URL may contain secrets.
 
 use std::collections::BTreeMap;
+use std::ops::Deref;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -30,8 +31,8 @@ struct CachedIdentity { binding: String, identity: Identity }
 
 /// One preflight's source reader, shared while it visits dependencies. Its identity cache is
 /// bounded like the simulator's; saved run snapshots contain the plain facts, not this reader.
-pub struct Sources {
-    hub: Arc<Hub>,
+pub struct Sources<H = Arc<Hub>> {
+    hub: H,
     caller: String,
     identities: Mutex<BTreeMap<Repository, Option<Identity>>>,
     #[cfg(test)]
@@ -46,7 +47,16 @@ impl Sources {
     pub fn new(hub: Arc<Hub>, caller: String) -> Self {
         Self { hub, caller, identities: Mutex::default(), #[cfg(test)] endpoints: None }
     }
+}
 
+impl<'a> Sources<&'a Hub> {
+    /// W29-R25: a replay's reader borrows its server and keeps no task past that read.
+    pub(super) fn borrowed(hub: &'a Hub, caller: String) -> Self {
+        Self { hub, caller, identities: Mutex::default(), #[cfg(test)] endpoints: None }
+    }
+}
+
+impl<H: Deref<Target = Hub> + Send + Sync> Sources<H> {
     fn remote(&self, repository: &Repository, reference: &str) -> Result<Remote, Refusal> {
         repository.validate()?;
         if !dep::reference_valid(reference) { return Err(Refusal::Invalid("ref")); }
@@ -219,7 +229,7 @@ impl Sources {
     }
 }
 
-impl DependencySources for Sources {
+impl<H: Deref<Target = Hub> + Send + Sync> DependencySources for Sources<H> {
     fn resolve(&self, repository: Repository, reference: String) -> BoxFuture<'_, Result<Revision, Refusal>> {
         Box::pin(async move {
             let remote = self.remote(&repository, &reference)?;

@@ -703,5 +703,7 @@ mod native;
 mod execution;
 mod history;
 mod generate;
+mod replay;
+pub(crate) use replay::{lock_path, regenerate_tree};
 mod api;
 pub use api::{update, verify_repo};

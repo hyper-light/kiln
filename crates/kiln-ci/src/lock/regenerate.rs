@@ -31,6 +31,9 @@ pub enum Mode {
     Preserve,
     /// Produce a draft of new pins. This is not trusted acceptance of a moved full version.
     Propose,
+    /// All workflows were inspected at their accepted commits. Retain those commits, but
+    /// replace their contextual dependency edges with this complete metadata before pruning.
+    Rebuild,
 }
 
 pub struct Input<'a> {
@@ -194,6 +197,7 @@ impl Graph<'_> {
         let accepted = lookup(&self.accepted, key);
         let seed = lookup(&self.seeds, key);
         let fact = lookup(&self.facts, key);
+        if self.mode == Mode::Rebuild && fact.is_none() { return Err(Box::new(diag("KCI4050", kiln::PATH, format!("{key}: rebuilding needs complete metadata at the selected pin")))); }
         let old = accepted.or(seed);
         let selected = if self.mode == Mode::Propose && !preserve { fact.or(old) } else { old.or(fact) };
         let Some(selected) = selected else { return Err(Box::new(diag("KCI4050", kiln::PATH, format!("{key}: no supplied source facts or accepted lock entry")))) };
@@ -206,7 +210,9 @@ impl Graph<'_> {
             return Err(Box::new(diag("KCI4052", kiln::PATH, message)));
         }
         if let Some(fact) = fact {
-            if same_pin(&selected.pin, &fact.pin, self.home) { merge(&mut selected, fact.clone(), self.home)?; }
+            let same = same_pin(&selected.pin, &fact.pin, self.home);
+            if same { merge(&mut selected, fact.clone(), self.home)?; }
+            if self.mode == Mode::Rebuild && same && let (Dependency::Git(old), Dependency::Git(now)) = (&mut selected.pin, &fact.pin) { old.uses = now.uses.clone(); }
             // GitHub's file may have a bare recorded ref. Qualify it from honest source facts,
             // never by guessing that a version-shaped ref is a tag. New commit metadata is not
             // used as dependency edges for the old accepted commit.
@@ -308,6 +314,7 @@ pub fn regenerate(input: Input<'_>) -> Result<Files, Vec<Diag>> {
         edits.insert(edit.path.clone(), roots);
     }
     for path in edits.keys() { gh.workflows.remove(path); kl.workflows.remove(path); }
+    if input.mode == Mode::Rebuild && let Some(path) = gh.workflows.keys().chain(kl.workflows.keys()).next() { return Err(vec![diag("KCI4050", path, "rebuilding needs every retained workflow to be inspected")]); }
     let paths: BTreeSet<_> = gh.workflows.keys().chain(kl.workflows.keys()).chain(edits.iter().filter(|(_, roots)| roots.is_some()).map(|(p, _)| p)).cloned().collect();
     let (mut native, mut actions) = (BTreeMap::<String, Entry>::new(), BTreeMap::<String, Entry>::new());
     let mut seeds: Vec<_> = input.seeds.iter().collect();

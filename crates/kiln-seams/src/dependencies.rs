@@ -105,7 +105,9 @@ pub enum Refusal {
 
 /// Reads only: resolving a ref may refresh a private mirror, but never releases, updates a
 /// host, or queues an update draft. Panes use their existing cached facts instead of this seam.
-pub trait DependencySources: Send + Sync + 'static {
+/// A reader may borrow its server for one operation. Returned facts own their data; a reader
+/// kept by a background task still has to satisfy that task's lifetime.
+pub trait DependencySources: Send + Sync {
     fn resolve(&self, repository: Repository, reference: String) -> BoxFuture<'_, Result<Revision, Refusal>>;
     fn contains(&self, revision: Revision, commit: String) -> BoxFuture<'_, Result<bool, Refusal>>;
     fn file(&self, revision: Revision, commit: String, path: String) -> BoxFuture<'_, Result<Vec<u8>, Refusal>>;

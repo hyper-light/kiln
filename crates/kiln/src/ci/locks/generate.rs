@@ -355,10 +355,12 @@ impl Collector<'_> {
 /// their base for metadata and local action reads, without creating a draft or changing a ref.
 pub(super) async fn collect(hub: &Hub, source: &dyn DependencySources, caller: &Repo, commit: &str, edits: BTreeMap<String, Option<Vec<u8>>>, paths: Option<&[String]>, mode: regenerate::Mode) -> Result<regenerate::Files, String> {
     if edits.len() > MAX_ITEMS || edits.values().flatten().fold(0usize, |n, bytes| n.saturating_add(bytes.len())) > MAX_BYTES { return Err("KCI1022 draft inputs exceed 16 MiB or 4096 files".into()); }
+    if mode == regenerate::Mode::Rebuild && paths.is_some() { return Err("KCI4050 rebuilding needs every workflow to be inspected".into()); }
     let root = Tree { owner: Owner { repository: caller.name.clone(), commit: commit.into(), remote: None, revision: None }, edits: Arc::new(edits) };
     let rules = super::super::routing::sources(hub).await.effective();
     let pools = super::super::pools::sources(hub).await.0;
-    let mut collector = Collector { hub, caller, source, root: root.clone(), root_workflow: String::new(), root_name: String::new(), github: None, native: None, revisions: BTreeMap::new(), resolutions: BTreeMap::new(), texts: BTreeMap::new(), rules, pools, image_locks: kiln_ci::lock::execution::Locks::default(), manifests: BTreeMap::new(), active: BTreeSet::new(), bytes: 0, items: 0, mode };
+    let source_mode = if mode == regenerate::Mode::Rebuild { regenerate::Mode::Preserve } else { mode };
+    let mut collector = Collector { hub, caller, source, root: root.clone(), root_workflow: String::new(), root_name: String::new(), github: None, native: None, revisions: BTreeMap::new(), resolutions: BTreeMap::new(), texts: BTreeMap::new(), rules, pools, image_locks: kiln_ci::lock::execution::Locks::default(), manifests: BTreeMap::new(), active: BTreeSet::new(), bytes: 0, items: 0, mode: source_mode };
     let home = root.owner.home_host(hub, caller);
     let github = collector.file(&root, github::PATH).await?.map(|s| github::parse(&s).map_err(|ds| diagnostics(github::PATH, ds))).transpose()?;
     let native = collector.file(&root, kiln::PATH).await?.map(|s| kiln::parse(&s).map_err(|ds| diagnostics(kiln::PATH, ds))).transpose()?;
@@ -388,5 +390,8 @@ pub(super) async fn collect(hub: &Hub, source: &dyn DependencySources, caller: &
         }
     }
     let resolutions: Vec<_> = collector.resolutions.into_iter().map(|(key, dependency)| regenerate::Resolution { key, dependency }).collect();
+    // W29-R25: complete collection can prune obsolete contextual edges. Source selection
+    // above still used Preserve; this cannot borrow a moved commit's metadata for an old pin.
+    let mode = if all && mode == regenerate::Mode::Preserve { regenerate::Mode::Rebuild } else { mode };
     regenerate::regenerate(regenerate::Input { github: github.as_ref(), kiln: native.as_ref(), workflows: &workflows, resolutions: &resolutions, seeds: &[], home_host: &home, mode }).map_err(|ds| diagnostics(kiln::PATH, ds))
 }

@@ -275,3 +275,27 @@ fn w29_r24_a_legacy_runtime_checksum_can_gain_only_an_identical_archives_locatio
     assert_eq!(preserved, accepted, "another archive cannot acquire the accepted checksum");
     Ok(())
 }
+
+#[test]
+fn w29_r25_complete_metadata_prunes_old_edges_without_using_a_moved_commits_edges() -> Result<(), String> {
+    let key = "acme/build@v1";
+    let child = "acme/child@v1";
+    let original = [git(key, A, &[child]), git(child, B, &[])];
+    let files = generate(None, None, &[edit(GH, &[key])], &original, &[], Mode::Preserve).map_err(|d| format!("{d:?}"))?;
+    let (gh, kl) = parsed(&files)?;
+    let complete = [git(key, A, &[])];
+    let rebuilt = generate(Some(&gh), Some(&kl), &[edit(GH, &[key])], &complete, &[], Mode::Rebuild).map_err(|d| format!("{d:?}"))?;
+    let (rebuilt, _) = parsed(&rebuilt)?;
+    assert_eq!(rebuilt.dependencies.len(), 1);
+    assert!(rebuilt.dependencies.get(key).is_some_and(|p| p.uses.is_empty()));
+    assert!(generate(Some(&gh), Some(&kl), &[edit(GH, &[key])], &[], &[], Mode::Rebuild).is_err_and(|ds| ds.iter().any(|d| d.code == "KCI4050")));
+    let mut partial = gh.clone();
+    partial.workflows.insert(".github/workflows/other.yml".into(), vec![key.into()]);
+    assert!(generate(Some(&partial), Some(&kl), &[edit(GH, &[key])], &complete, &[], Mode::Rebuild).is_err_and(|ds| ds.iter().any(|d| d.code == "KCI4050")));
+    let moved = [git(key, C, &[]), git(child, B, &[])];
+    let rebuilt = generate(Some(&gh), Some(&kl), &[edit(GH, &[key])], &moved, &[], Mode::Rebuild).map_err(|d| format!("{d:?}"))?;
+    let (rebuilt, _) = parsed(&rebuilt)?;
+    assert_eq!(rebuilt.dependencies.get(key).map(|p| p.commit.as_str()), Some(format!("sha1-{A}").as_str()));
+    assert!(rebuilt.dependencies.contains_key(child), "M's metadata cannot remove A's dependency");
+    Ok(())
+}
