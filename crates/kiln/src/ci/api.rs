@@ -139,6 +139,8 @@ fn reaches_out(method: &Method, rest: &[&str]) -> bool {
             | (_, ["repos", _, "pulls", ..])
             | (&Method::POST, ["repos", _, "workflows", .., "dispatches" | "edit"])
             | (&Method::POST, ["repos", _, "releases"])
+            | (&Method::POST, ["repos", _, "locks"])
+            | (&Method::GET, ["repos", _, "locks", "verify"])
             | (&Method::GET, ["runs", _, "pending" | "artifacts"])
             | (&Method::GET, ["runs", _, "artifacts", _, "download"])
             | (&Method::POST, ["runs", _, "cancel" | "rerun" | "approve"])
@@ -181,6 +183,15 @@ async fn reach_out(hub: &Arc<Hub>, method: Method, rest: &[&str], q: &HashMap<St
 async fn outside(hub: &Arc<Hub>, method: &Method, rest: &[&str], q: &HashMap<String, String>, body: serde_json::Value, caller: Option<&crate::authz::Caller>) -> Result<Response, Fail> {
     let ok = |v: &serde_json::Value| crate::http::server::json(StatusCode::OK, v);
     match (method, rest) {
+        // W29-R25: update proposes a draft; verification cannot accept a changed resolution.
+        (&Method::POST, ["repos", repo, "locks"]) => {
+            let caller = caller.cloned().unwrap_or_else(crate::authz::Caller::owner);
+            Ok(ok(&super::locks::update(hub, &caller, repo, &body).await?))
+        }
+        (&Method::GET, ["repos", repo, "locks", "verify"]) => {
+            let caller = caller.cloned().unwrap_or_else(crate::authz::Caller::owner);
+            Ok(ok(&super::locks::verify_repo(hub, &caller, repo, q).await?))
+        }
         // W02-R12, W21-R06: a workflow's new text, saved as its repository takes it.
         (&Method::POST, ["repos", repo, "workflows", path @ .., "edit"]) => {
             let caller = caller.cloned().unwrap_or_else(crate::authz::Caller::owner);

@@ -257,3 +257,21 @@ fn w29_r24_head_keeps_the_recorded_branch_beside_githubs_head_spelling() -> Resu
     assert_eq!(generate(Some(&gh), Some(&kl), &[edit(GH, &[key])], &facts, &[], Mode::Preserve).map_err(|d| format!("{d:?}"))?, files);
     Ok(())
 }
+
+#[test]
+fn w29_r24_a_legacy_runtime_checksum_can_gain_only_an_identical_archives_location() -> Result<(), String> {
+    let accepted = kiln::File {
+        workflows: [(KL.into(), vec!["node24".into()])].into(),
+        dependencies: [("node24".into(), Dependency::Runtime(kiln::Runtime { sha256: Some(HASH.into()), archives: BTreeMap::new() }))].into(),
+        ..Default::default()
+    };
+    let good = [runtime("linux/amd64", HASH)];
+    let files = generate(None, Some(&accepted), &[edit(KL, &["node24"])], &good, &[], Mode::Preserve).map_err(|d| format!("{d:?}"))?;
+    let (_, promoted) = parsed(&files)?;
+    assert!(matches!(promoted.dependencies.get("node24"), Some(Dependency::Runtime(r)) if r.sha256.is_none() && r.archives.get("linux/amd64").is_some_and(|a| a.sha256 == HASH)));
+    let other = [runtime("linux/amd64", &"b".repeat(64))];
+    let files = generate(None, Some(&accepted), &[edit(KL, &["node24"])], &other, &[], Mode::Preserve).map_err(|d| format!("{d:?}"))?;
+    let (_, preserved) = parsed(&files)?;
+    assert_eq!(preserved, accepted, "another archive cannot acquire the accepted checksum");
+    Ok(())
+}

@@ -88,7 +88,14 @@ impl Capture<'_> {
 
     pub(super) async fn action_execution(&mut self, uses: &str, action: &wf::Action, owner: &Owner, base: &str, native: &[native::Layer]) -> Result<Locks, String> {
         let mut locks = Locks::default();
-        if native.is_empty() { return Ok(locks); }
+        if native.is_empty() {
+            if action.runs.using.starts_with("node") || matches!(action.runs.using.as_str(), "docker" | "firecracker" | "shards") {
+                let why = format!("KCI4055 {uses}: Require lockfile: {} needs a supplemental runtime/image lock", action.runs.using);
+                if self.lock_policy.require == verify::Require::Enforce { return Err(why); }
+                if self.lock_policy.require == verify::Require::Report { self.warnings.insert(why); }
+            }
+            return Ok(locks);
+        }
         if action.runs.using.starts_with("node") { self.runtime(&action.runs.using, native, &mut locks).await?; }
         if action.runs.using == "docker" {
             let image = action.runs.image.as_deref().ok_or_else(|| format!("KCI1022 {uses}: Docker action has no image"))?;
@@ -111,14 +118,38 @@ impl Capture<'_> {
         Ok(locks)
     }
 
-    pub(super) async fn job_execution(&mut self, workflow: &Workflow, native: &[native::Layer], assets: &BTreeMap<String, Locks>, children: &BTreeMap<String, Vec<String>>) -> Result<BTreeMap<String, Locks>, String> {
+    pub(super) async fn job_execution(&mut self, workflow: &Workflow, native: &[native::Layer], assets: &BTreeMap<String, Locks>, children: &BTreeMap<String, Vec<String>>, prefix: &str) -> Result<BTreeMap<String, Locks>, String> {
         let mut jobs = BTreeMap::new();
-        if native.is_empty() { return Ok(jobs); }
+        if native.is_empty() && self.lock_policy.require != verify::Require::Enforce {
+            if self.lock_policy.require == verify::Require::Report && workflow.jobs.iter().any(|j| j.container.is_some() || !j.services.is_empty() || j.kiln.image.is_some() || j.kiln.toolchain.is_some()) { self.warnings.insert(format!("KCI4055 {}: Require lockfile: execution images need a supplemental lock", workflow.path)); }
+            return Ok(jobs);
+        }
+        let rules = super::super::routing::sources(self.hub).await.effective();
+        let pools = super::super::pools::sources(self.hub).await.0;
         for job in &workflow.jobs {
             if job.uses.is_some() { continue; }
             let mut locks = Locks::default();
-            for image in job.container.iter().map(|c| &c.image).chain(job.services.iter().map(|(_, c)| &c.image)).chain(job.kiln.image.iter()) {
-                self.image(&image.src, native, &mut locks).await?;
+            let mut one = workflow.clone(); one.jobs = vec![job.clone()];
+            let defaults = [(job.id.clone(), crate::pipeline::toolchain_image(job.kiln.toolchain.as_deref()).to_owned())].into();
+            let settings = kiln_ci::plan::Settings { default_runs_on: vec!["k8s".into()], ..Default::default() };
+            let context = kiln_ci::lock::regenerate::ImageContext { repo: &self.caller.name, workflow: &self.root_name, job_prefix: prefix };
+            let images = kiln_ci::lock::regenerate::images(&one, context, &rules, &pools, &defaults, &settings).map_err(|ds| {
+                let mut why = ds.iter().map(|d| d.render(&workflow.path)).collect::<Vec<_>>().join("\n");
+                if self.lock_policy.require == verify::Require::Enforce { why.push_str("\nKCI4055 Require lockfile: execution inputs cannot be proven covered"); }
+                why
+            })?;
+            if native.is_empty() {
+                if !images.is_empty() {
+                    let why = format!("KCI4055 {}: Require lockfile: this job's images have no supplemental lock", job.id);
+                    if self.lock_policy.require == verify::Require::Enforce { return Err(why); }
+                    self.warnings.insert(why);
+                }
+                if self.lock_policy.require == verify::Require::Enforce { jobs.insert(job.id.clone(), locks); }
+                continue;
+            }
+            for image in images {
+                let reference = kiln::image_key(&image).ok_or_else(|| format!("KCI4050 {image}: image reference is invalid"))?;
+                self.image(reference, native, &mut locks).await?;
             }
             for layer in native {
                 for key in layer.file.closure(&layer.workflow).unwrap_or_default() {

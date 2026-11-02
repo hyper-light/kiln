@@ -261,6 +261,14 @@ pub fn ops() -> &'static [Op] {
                 input: Input::of::<input::CiWorkflowsGet>(),
                 route: |v| Ok((Method::GET, path(&["repos", &text(v, "repo")?, "workflows", &text(v, "path")?]), query(v, &["ref"]))),
                 run: |cx: Cx, v: Value| async move { answer(super::workflows::get(&cx.hub, &text(&v, "repo")?, &text(&v, "path")?, &query(&v, &["ref"])).await).await }),
+            op!("ci.locks.update", "Regenerate workflow dependency locks into one draft, preserving accepted commits. Never writes a default branch or accepts a moved tag.", ro: false, destructive: false,
+                input: Input::of::<input::CiLocksUpdate>(),
+                route: |v| Ok((Method::POST, path(&["repos", &text(v, "repo")?, "locks"]), HashMap::new())),
+                run: |cx: Cx, v: Value| async move { super::locks::update(&cx.hub, &cx.caller, &text(&v, "repo")?, &serde_json::json!({ "ref": v.get("ref") })).await }),
+            op!("ci.locks.verify", "Verify a commit's workflow locks without a draft, run, accepted-resolution change or notification. Answers fresh and stale workflow/uses/locked/now facts.", ro: true, destructive: false,
+                input: Input::of::<input::CiLocksVerify>(),
+                route: |v| Ok((Method::GET, path(&["repos", &text(v, "repo")?, "locks", "verify"]), query(v, &["sha"]))),
+                run: |cx: Cx, v: Value| async move { super::locks::verify_repo(&cx.hub, &cx.caller, &text(&v, "repo")?, &query(&v, &["sha"])).await }),
             op!("ci.images.build", "Build a runner image's definition as you have it, saved or not (W21-R08): `kiln/build-image@v1` on what `runs_on` names, from `.kiln/images/<name>/`. With `push`, pushed to kiln's registry and registered: the server owner's only. Watch the run and read its log after.", ro: false, destructive: false,
                 input: Input::of::<input::CiImagesBuild>(),
                 route: |v| Ok((Method::POST, path(&["images", "build"]), query(v, &["repo"]))),
@@ -1223,6 +1231,22 @@ pub mod input {
         pub repo: String,
         pub path: String,
         pub r#ref: Option<String>,
+    }
+
+    #[derive(Debug, Deserialize, JsonSchema)]
+    #[serde(deny_unknown_fields)]
+    pub struct CiLocksUpdate {
+        pub repo: String,
+        /// Its default branch when omitted.
+        pub r#ref: Option<String>,
+    }
+
+    #[derive(Debug, Deserialize, JsonSchema)]
+    #[serde(deny_unknown_fields)]
+    pub struct CiLocksVerify {
+        pub repo: String,
+        /// Its default branch when omitted.
+        pub sha: Option<String>,
     }
 
     #[derive(Debug, Deserialize, JsonSchema)]

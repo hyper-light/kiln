@@ -8,6 +8,11 @@ use super::{github, kiln};
 use kiln::{Dependency, Git, Identity};
 use crate::wf::diag::{Diag, Pos, Range};
 
+mod source;
+pub use source::{SourceCheck, accepted, source};
+mod images;
+pub use images::{ImageContext, images};
+
 /// The adapter expands local actions/builtins and supplies their external dependencies.
 /// None removes a workflow. Unmentioned workflows and their accepted pins are retained.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -67,7 +72,11 @@ fn same_pin(a: &Dependency, b: &Dependency, home: &str) -> bool {
         (Dependency::Git(a), Dependency::Git(b)) => a.identity(home) == b.identity(home) && a.identity(home).is_some()
             && a.commit.eq_ignore_ascii_case(&b.commit) && git_ref_equal(&a.git_ref, &b.git_ref),
         (Dependency::Image(a), Dependency::Image(b)) => a.digest.eq_ignore_ascii_case(&b.digest),
-        (Dependency::Runtime(a), Dependency::Runtime(b)) => a.sha256 == b.sha256 && a.archives.iter().all(|(p, a)| b.archives.get(p).is_none_or(|b| a == b)),
+        (Dependency::Runtime(a), Dependency::Runtime(b)) => match (&a.sha256, &b.sha256) {
+            (Some(hash), None) => !b.archives.is_empty() && b.archives.values().all(|archive| archive.sha256.eq_ignore_ascii_case(hash)),
+            (None, Some(hash)) => !a.archives.is_empty() && a.archives.values().all(|archive| archive.sha256.eq_ignore_ascii_case(hash)),
+            _ => a.sha256 == b.sha256 && a.archives.iter().all(|(p, a)| b.archives.get(p).is_none_or(|b| a == b)),
+        },
         _ => false,
     }
 }
@@ -102,7 +111,12 @@ fn merge(a: &mut Entry, b: Entry, home: &str) -> Result<(), Box<Diag>> {
             if a.hostname.is_none() { a.hostname = b.hostname; }
             a.uses = a.uses.iter().chain(&b.uses).cloned().collect::<BTreeSet<_>>().into_iter().collect();
         }
-        (Dependency::Runtime(a), Dependency::Runtime(b)) => a.archives.extend(b.archives),
+        (Dependency::Runtime(a), Dependency::Runtime(b)) => {
+            // W29-R24: a checksum can gain a versioned location only for those same bytes.
+            // The wire format deliberately uses either shorthand or archives, never both.
+            if !b.archives.is_empty() { a.sha256 = None; }
+            a.archives.extend(b.archives);
+        }
         _ => {}
     }
     Ok(())

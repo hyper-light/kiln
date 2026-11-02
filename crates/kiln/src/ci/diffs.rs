@@ -86,8 +86,8 @@ pub(crate) enum Edit<'a> {
     Apply(&'a str),
     /// A file's new content, its mode kept.
     Put { file: &'a str, mode: &'a str, content: Vec<u8> },
-    /// Several files' (W29-R08's New: an action and the files it runs): each path, mode and content.
-    PutAll(Vec<(String, String, Vec<u8>)>),
+    /// W29-R25: the generated lock pair may remove an empty file in that same commit.
+    Changes(Vec<(String, String, Option<Vec<u8>>)>),
 }
 
 /// `base`'s tree with `edit` made to it, written to the repository without a working tree;
@@ -109,9 +109,15 @@ pub(crate) async fn tree_with(hub: &Hub, path: &str, base: &str, edit: Edit<'_>)
                 }
             }
             Edit::Put { file, mode, content } => put(hub, path, &env, file, mode, content).await?,
-            Edit::PutAll(files) => {
+            Edit::Changes(files) => {
                 for (file, mode, content) in files {
-                    put(hub, path, &env, &file, &mode, content).await?;
+                    match content {
+                        Some(content) => put(hub, path, &env, &file, &mode, content).await?,
+                        None => {
+                            let r = git_run(hub, &["-C", path, "update-index", "--force-remove", "--", &file], &env, Vec::new()).await.map_err(|e| format!("{e:#}"))?;
+                            if !r.ok { return Err(String::from_utf8_lossy(&r.err).trim().to_owned()); }
+                        }
+                    }
                 }
             }
         }
@@ -231,7 +237,14 @@ pub async fn propose_file(hub: &Arc<Hub>, repo_key: &str, caller: &Caller, file:
 /// [`propose_file`] for several files at once (W29-R08's New: an action's `action.yml` and the
 /// files it runs), each made what `files` says; a script (`.sh`) new to the trunk is executable.
 pub async fn propose_files(hub: &Arc<Hub>, repo_key: &str, caller: &Caller, files: &[(String, String)], title: &str, body: &Value) -> Result<Value, Fail> {
-    for (file, _) in files {
+    let files: Vec<_> = files.iter().map(|(path, text)| crate::githost::Change { path: path.clone(), content: Some(text.as_bytes().to_vec()) }).collect();
+    propose_changes(hub, repo_key, caller, &files, title, body).await
+}
+
+/// W29-R25: a workflow and both of its lockfiles, including removal, are one proposed tree.
+pub(crate) async fn propose_changes(hub: &Arc<Hub>, repo_key: &str, caller: &Caller, files: &[crate::githost::Change], title: &str, body: &Value) -> Result<Value, Fail> {
+    for file in files {
+        let file = &file.path;
         if file.is_empty() || file.starts_with('/') || file.split('/').any(|s| s.is_empty() || s == "." || s == "..") {
             return Err((StatusCode::BAD_REQUEST, format!("`{file}` isn't a path in the repository")));
         }
@@ -239,17 +252,18 @@ pub async fn propose_files(hub: &Arc<Hub>, repo_key: &str, caller: &Caller, file
     let (repo, p, trunk, tip) = trunk_tip(hub, repo_key, caller, body).await?;
     let mut puts = Vec::new();
     let mut changes = false;
-    for (file, text) in files {
-        let old = gitops::run_git(hub, &["-C", &p, "show", &format!("{tip}:{file}")], LS_REMOTE_TIMEOUT).await.ok().map(|o| String::from_utf8_lossy(&o).into_owned());
-        changes |= old.as_deref() != Some(text.as_str());
+    for change in files {
+        let file = &change.path;
+        let old = gitops::run_git(hub, &["-C", &p, "show", &format!("{tip}:{file}")], LS_REMOTE_TIMEOUT).await.ok();
+        changes |= old.as_deref() != change.content.as_deref();
         let listing = gitops::run_git(hub, &["-C", &p, "ls-tree", &tip, "--", file], LS_REMOTE_TIMEOUT).await.map(|o| String::from_utf8_lossy(&o).into_owned()).unwrap_or_default();
         let mode = listing.split_whitespace().next().map(str::to_owned).unwrap_or_else(|| if file.ends_with(".sh") { "100755".to_owned() } else { "100644".to_owned() });
-        puts.push((file.clone(), mode, text.clone().into_bytes()));
+        puts.push((file.clone(), mode, change.content.clone()));
     }
     if !changes {
         return Err((StatusCode::CONFLICT, format!("they're already so on {trunk}: nothing to propose")));
     }
-    let tree = tree_with(hub, &p, &tip, Edit::PutAll(puts)).await.map_err(|e| (StatusCode::UNPROCESSABLE_ENTITY, e))?;
+    let tree = tree_with(hub, &p, &tip, Edit::Changes(puts)).await.map_err(|e| (StatusCode::UNPROCESSABLE_ENTITY, e))?;
     let (name, kind) = author_of(&caller.name, Some(caller.kind));
     let me = name.strip_prefix("user:").unwrap_or(&name).to_owned();
     let message = with_identity(&format!("{title}\n"));

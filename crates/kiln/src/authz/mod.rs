@@ -502,6 +502,8 @@ pub static ROUTES: &[Rule] = &[
     r("POST", "/api/ci/repos/*/hooks", "secrets.manage", At::Repo(3)),
     r("DELETE", "/api/ci/repos/*/hooks/*", "secrets.manage", At::Repo(3)),
     r("GET", "/api/ci/repos/*/**", "runs.read", At::Repo(3)),
+    // W29-R25: lock updates only propose drafts; the handler also requires diffs.submit.
+    r("POST", "/api/ci/repos/*/locks", "workflows.edit", At::Repo(3)),
     r("DELETE", "/api/ci/repos/*/caches/*", "caches.write", At::Repo(3)),
     r("POST", "/api/ci/repos/*/workflows/**/edit", "workflows.edit", At::Repo(3)),
     // Release by tag lands a tag, as pushing one does (W29-R21).

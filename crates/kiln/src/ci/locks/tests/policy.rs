@@ -9,7 +9,7 @@ const M: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
 const U: &str = "1111111111111111111111111111111111111111";
 const FULL: &str = "refs/tags/v1.2.3";
 
-fn simulated() -> anyhow::Result<(SimDependencySources, Repository)> {
+pub(super) fn simulated() -> anyhow::Result<(SimDependencySources, Repository)> {
     let source = SimDependencySources::default();
     let repository = Repository { name: "acme/tools".into(), native: false };
     source.put_repository(repository.clone(), SimRepository {

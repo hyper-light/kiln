@@ -178,6 +178,7 @@ struct Work {
     owner: Owner,
     depth: usize,
     native: Vec<native::Layer>,
+    prefix: String,
 }
 
 struct Capture<'a> {
@@ -186,6 +187,7 @@ struct Capture<'a> {
     source: &'a dyn DependencySources,
     root_commit: &'a str,
     root_path: &'a str,
+    root_name: String,
     policies: Vec<kiln_ci::policy::Policy>,
     lock_policy: verify::Policy,
     record: bool,
@@ -381,7 +383,7 @@ impl Capture<'_> {
         Ok(None)
     }
 
-    async fn action_map(&mut self, workflow: &Workflow, lock: Option<&github::File>, native: &[native::Layer], home: &str) -> Result<(Actions, BTreeMap<String, kiln_ci::lock::execution::Locks>), String> {
+    async fn action_map(&mut self, workflow: &Workflow, lock: Option<&github::File>, native: &[native::Layer], home: &str, prefix: &str) -> Result<(Actions, BTreeMap<String, kiln_ci::lock::execution::Locks>), String> {
         let locked = !native.is_empty() || lock.is_some_and(|f| f.workflows.contains_key(&workflow.path));
         let mut todo = Vec::new();
         for job in &workflow.jobs { step_uses(&job.steps, &mut todo, 0, None); }
@@ -477,7 +479,7 @@ impl Capture<'_> {
         }
         for root in docker { if let Some(a) = out.get_mut(&root) { a.docker = true; } }
         for (root, why) in beneath { if let Some(a) = out.get_mut(&root) && a.error.is_none() { a.error = Some(format!("an action it uses could not be resolved, {why}")); } }
-        let execution = self.job_execution(workflow, native, &assets, &children).await?;
+        let execution = self.job_execution(workflow, native, &assets, &children, prefix).await?;
         Ok((out, execution))
     }
 
@@ -555,20 +557,37 @@ pub async fn inspect(hub: &Arc<Hub>, caller: &Repo, commit: &str, path: &str, wo
     capture_with(hub, &source, caller, commit, path, workflow, false).await
 }
 
+/// W29-R25: generate the complete pair before the draft writer changes any branch or diff.
+pub async fn draft_files(hub: &Arc<Hub>, caller: &Repo, commit: &str, changed: &[crate::githost::Change], all: bool) -> Result<kiln_ci::lock::regenerate::Files, String> {
+    crate::gitops::ensure_commit(hub, caller, commit).await.map_err(|_| "KCI4051 the draft's exact base is unavailable".to_owned())?;
+    let source = super::dependency_sources::Sources::new(Arc::clone(hub), caller.name.clone());
+    let all = all || changed.iter().any(|f| wf::file_kind(&f.path) == Some(wf::FileKind::Action));
+    let paths: Vec<_> = changed.iter().filter(|f| matches!(wf::file_kind(&f.path), Some(wf::FileKind::GhaWorkflow | wf::FileKind::KilnWorkflow))).map(|f| f.path.clone()).collect::<BTreeSet<_>>().into_iter().collect();
+    let edits = changed.iter().map(|f| (f.path.clone(), f.content.clone())).collect();
+    generate::collect(hub, &source, caller, commit, edits, if all { None } else { Some(&paths) }, kiln_ci::lock::regenerate::Mode::Preserve).await
+}
+
 async fn prepare_with(hub: &Hub, source: &dyn DependencySources, caller: &Repo, commit: &str, path: &str, workflow: Arc<Workflow>) -> Result<Frozen, String> {
     capture_with(hub, source, caller, commit, path, workflow, true).await
 }
 
 async fn capture_with(hub: &Hub, source: &dyn DependencySources, caller: &Repo, commit: &str, path: &str, workflow: Arc<Workflow>, record: bool) -> Result<Frozen, String> {
+    capture_with_policy(hub, source, caller, commit, path, workflow, CaptureOptions { record, ..Default::default() }).await
+}
+
+#[derive(Default)]
+struct CaptureOptions { record: bool, required: verify::Policy }
+
+async fn capture_with_policy(hub: &Hub, source: &dyn DependencySources, caller: &Repo, commit: &str, path: &str, workflow: Arc<Workflow>, options: CaptureOptions) -> Result<Frozen, String> {
     if workflow.path != path { return Err("KCI1022 the workflow model's path differs from the run's path".into()); }
     let mut capture = Capture {
-        hub, caller, source, root_commit: commit, root_path: path, record, policies: actions::policies(hub, caller).await,
-        lock_policy: super::repo_config::lock_policy(hub, caller).await?,
+        hub, caller, source, root_commit: commit, root_path: path, root_name: workflow.name.clone().unwrap_or_default(), record: options.record, policies: actions::policies(hub, caller).await,
+        lock_policy: super::repo_config::lock_policy(hub, caller).await?.stricter(options.required),
         revisions: BTreeMap::new(), legacy: BTreeMap::new(), origins: BTreeMap::new(), locks: BTreeMap::new(), native_locks: BTreeMap::new(), texts: BTreeMap::new(),
         bytes: 0, items: 0, warnings: BTreeSet::new(), manifests: BTreeSet::new(), archives: BTreeMap::new(), histories: BTreeMap::new(),
     };
     let mut frozen = Frozen { version: 1, repository: caller.name.clone(), path: path.into(), commit: commit.into(), root_locked: false, scopes: BTreeMap::new(), files: Files::new(), warnings: Vec::new() };
-    let mut todo = vec![Work { workflow, owner: Owner { repository: caller.name.clone(), commit: commit.into(), remote: None, revision: None }, depth: 0, native: Vec::new() }];
+    let mut todo = vec![Work { workflow, owner: Owner { repository: caller.name.clone(), commit: commit.into(), remote: None, revision: None }, depth: 0, native: Vec::new(), prefix: String::new() }];
     while let Some(work) = todo.pop() {
         let key = scope_key(&work.owner.repository, &work.workflow.path, &work.owner.commit);
         if work.depth > 10 { return Err("reusable workflows nest at most 10 deep".into()); }
@@ -588,7 +607,7 @@ async fn capture_with(hub: &Hub, source: &dyn DependencySources, caller: &Repo, 
         }
         if work.depth == 0 { frozen.root_locked = locked; }
         let home = work.owner.home_host(hub, caller);
-        let (actions, execution) = capture.action_map(&work.workflow, lock.as_deref(), &native, &home).await?;
+        let (actions, execution) = capture.action_map(&work.workflow, lock.as_deref(), &native, &home, &work.prefix).await?;
         if let Some(before) = frozen.scopes.get(&key) {
             let pins = |actions: &Actions| actions.iter().map(|(k, a)| (k.clone(), a.sha.clone())).collect::<BTreeMap<_, _>>();
             if before.execution != execution || serde_json::to_value(&before.actions).map_err(|_| "KCI1022 action snapshot cannot be encoded")? != serde_json::to_value(&actions).map_err(|_| "KCI1022 action snapshot cannot be encoded")? {
@@ -596,9 +615,9 @@ async fn capture_with(hub: &Hub, source: &dyn DependencySources, caller: &Repo, 
             }
         }
         frozen.scopes.insert(key, Scope { repository: work.owner.repository.clone(), path: work.workflow.path.clone(), commit: work.owner.commit.clone(), locked, actions, execution });
-        for uses in work.workflow.jobs.iter().filter_map(|j| j.uses.as_ref()) {
+        for (job, uses) in work.workflow.jobs.iter().filter_map(|j| j.uses.as_ref().map(|uses| (j.id.as_str(), uses))) {
             let (workflow, owner) = capture.called(uses, &work.owner, &native, &mut frozen.files).await?;
-            todo.push(Work { workflow, owner, depth: work.depth.saturating_add(1), native: native.clone() });
+            todo.push(Work { workflow, owner, depth: work.depth.saturating_add(1), native: native.clone(), prefix: format!("{}{job}/", work.prefix) });
         }
     }
     frozen.warnings = capture.warnings.into_iter().collect();
@@ -683,3 +702,6 @@ mod tests;
 mod native;
 mod execution;
 mod history;
+mod generate;
+mod api;
+pub use api::{update, verify_repo};

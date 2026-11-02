@@ -725,6 +725,10 @@ fn w29_r21_r22_release_and_updates_in_ship() -> anyhow::Result<()> {
     let (st, body) = http(s.port, "GET", &format!("/api/ship/pipelines/acme/app?path=.github/workflows/ci.yml&draft={id}"), &s.admin, None)?;
     anyhow::ensure!(st == 200, "the update draft's pane: {st} {body}");
     let p: Value = serde_json::from_str(&body)?;
+    // W29-R25: the consumer update carries complete locks in that same draft revision.
+    let (st, body) = http(s.port, "GET", &format!("/api/ci/repos/acme%2Fapp/locks/verify?sha={}", at(&p, "/head/commit")), &s.admin, None)?;
+    let verified: Value = serde_json::from_str(&body)?;
+    assert_eq!((st, verified.get("fresh")), (200, Some(&json!(true))), "{verified}");
     // Its ordinary groups (pl-7): the use it moves in Uses, under the version it had, marked with where it goes.
     let names = group_names(&p);
     assert!(!names.iter().any(|n| n == "What changes for it" || n == "Upstream"), "{names:?}");

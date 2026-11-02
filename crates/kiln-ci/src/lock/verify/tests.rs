@@ -55,6 +55,20 @@ fn run(file: Option<&File>, facts: &BTreeMap<String, GitFacts>, uses: &[String],
     check_github(GithubCheck { workflow: WORKFLOW, uses, file, facts, home_host: "github.com", policy, accepted_moves: &BTreeMap::new() })
 }
 
+#[test]
+fn w29_r25_unused_lock_roots_are_stale_but_equivalent_sha_uses_remain_covered() {
+    let (mut file, _, _) = fixture("v1", A, true);
+    let extra = "acme/old@v2".to_owned();
+    if let Some(roots) = file.workflows.get_mut(WORKFLOW) { roots.push(extra.clone()); }
+    let uses = vec![format!("acme/action/sub@{A}")];
+    assert!(unused_github(&file, WORKFLOW, &uses, Require::Off).is_empty());
+    for require in [Require::Report, Require::Enforce] {
+        let stale = unused_github(&file, WORKFLOW, &uses, require);
+        assert_eq!(stale.len(), 1);
+        assert!(stale.iter().all(|d| d.code == "KCI4055" && d.message.starts_with(&extra) && d.is_error() == (require == Require::Enforce)));
+    }
+}
+
 fn codes(result: &Result<Verified, Refused>) -> Vec<&'static str> {
     match result { Ok(ok) => ok.warnings.iter().map(|d| d.code).collect(), Err(no) => no.diagnostics.iter().map(|d| d.code).collect() }
 }

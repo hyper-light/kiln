@@ -145,7 +145,8 @@ impl Git {
 
 fn full_sha(s: &str) -> bool { matches!(s.len(), 40 | 64) && s.bytes().all(|b| b.is_ascii_hexdigit()) }
 
-fn image_key(key: &str) -> Option<&str> {
+/// A literal image's source reference, independent of its execution role.
+pub fn image_key(key: &str) -> Option<&str> {
     ["docker://", "image://", "microvm://", "executor://"].iter().find_map(|p| key.strip_prefix(p))
 }
 

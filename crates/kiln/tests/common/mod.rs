@@ -10,6 +10,8 @@ pub mod agents;
 pub mod custody;
 #[cfg(unix)]
 pub mod lab;
+#[cfg(unix)]
+pub mod git_data;
 
 use std::collections::BTreeMap;
 use std::io::{Read as _, Write as _};

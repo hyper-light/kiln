@@ -200,6 +200,16 @@ pub fn pin_for<'a>(file: &'a format::File, workflow: &str, requested: &str) -> O
     None
 }
 
+/// W29-R25/R26: after metadata expansion, detect roots no longer used by this workflow.
+/// A symbolic entry still covers an equivalent full-SHA spelling, as in the upstream checker.
+pub fn unused_github(file: &format::File, workflow: &str, uses: &[String], require: Require) -> Vec<Diag> {
+    if require == Require::Off { return Vec::new(); }
+    let used: BTreeSet<_> = uses.iter().filter_map(|u| format::action_pin(u)).filter_map(|u| pin_for(file, workflow, &u).map(|(key, _)| key.to_owned())).collect();
+    file.workflows.get(workflow).into_iter().flatten().filter(|key| !used.contains(*key)).map(|key| {
+        diag("KCI4055", workflow, format!("{key}: lockfile root is no longer used by this workflow"), require == Require::Report)
+    }).collect()
+}
+
 /// W29-R23/R26: return executable selections only when every relevant lock check passed.
 pub fn check_github(check: GithubCheck<'_>) -> Result<Verified, Refused> {
     let policy = check.policy.stricter(Policy::default());

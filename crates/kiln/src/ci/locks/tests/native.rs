@@ -6,9 +6,9 @@ const ROOT: &str = ".kiln/ci.yaml";
 const TOP: &str = ".github/workflows/top.yml";
 const CHILD: &str = ".github/workflows/child.yml";
 
-struct Published { repo: Repo, commit: String, work: std::path::PathBuf, bare: std::path::PathBuf }
+pub(super) struct Published { pub repo: Repo, pub commit: String, pub work: std::path::PathBuf, pub bare: std::path::PathBuf }
 
-async fn publish(hub: &Arc<Hub>, root: &Path, name: &str, mut files: Vec<(String, String)>, share: &str) -> anyhow::Result<Published> {
+pub(super) async fn publish(hub: &Arc<Hub>, root: &Path, name: &str, mut files: Vec<(String, String)>, share: &str) -> anyhow::Result<Published> {
     let work = root.join(name.replace('/', "__"));
     files.push((".kiln/config.yaml".into(), format!("share: {share}\n")));
     write(&work, files).await?;
@@ -28,7 +28,7 @@ async fn publish(hub: &Arc<Hub>, root: &Path, name: &str, mut files: Vec<(String
     Ok(Published { repo, commit, work, bare })
 }
 
-async fn advance(hub: &Arc<Hub>, publisher: &Published, files: Vec<(String, String)>) -> anyhow::Result<String> {
+pub(super) async fn advance(hub: &Arc<Hub>, publisher: &Published, files: Vec<(String, String)>) -> anyhow::Result<String> {
     write(&publisher.work, files).await?;
     git(hub, &publisher.work, &["add", "."]).await?;
     git(hub, &publisher.work, &["commit", "-qm", "changed fixture"]).await?;

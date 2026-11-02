@@ -11,7 +11,6 @@ use std::net::TcpListener;
 use std::path::Path;
 use std::process::{Command, Stdio};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use base64::Engine as _;
@@ -229,25 +228,20 @@ fn on_github() -> anyhow::Result<OnGithub> {
     std::fs::write(&key, format!("-----BEGIN PRIVATE KEY-----\n{}\n-----END PRIVATE KEY-----\n", B64.encode(der.as_ref())))?;
     let secret = dir.path().join("webhook-secret");
     std::fs::write(&secret, "s3cret\n")?;
-    // Each commit the Git Data API makes is a new one.
-    let commits = Arc::new(AtomicU64::new(0));
+    let data = common::git_data::GitData::new(dir.path().join("githome"), dir.path().join("gh/acme/app.git"));
     let answer: Arc<common::Answer> = Arc::new(move |method: &str, got: &Got| {
         let path = got.path.split('?').next().unwrap_or_default();
+        if let Some(result) = data.reply(method, path, &got.json()) {
+            return match result { Ok((st, body)) => (st, if body.is_null() { String::new() } else { body.to_string() }), Err(e) => (500, json!({"message": format!("{e:#}")}).to_string()) };
+        }
         let (st, v) = match (method, path) {
             ("GET", "/repos/acme/app/installation") => (200, json!({ "id": 7 })),
             ("POST", "/app/installations/7/access_tokens") => (201, json!({ "token": "ghs_fake_drafts", "expires_at": "2099-01-01T00:00:00Z" })),
-            ("GET", p) if p.starts_with("/repos/acme/app/git/commits/") => (200, json!({ "sha": p.rsplit('/').next().unwrap_or_default(), "tree": { "sha": "tree0" } })),
-            ("POST", "/repos/acme/app/git/blobs") => (201, json!({ "sha": "blob1" })),
-            ("POST", "/repos/acme/app/git/trees") => (201, json!({ "sha": "tree1" })),
-            ("POST", "/repos/acme/app/git/commits") => (201, json!({ "sha": format!("{:040x}", 0xc0_ffee + commits.fetch_add(1, Ordering::SeqCst)) })),
-            ("POST", "/repos/acme/app/git/refs") => (201, json!({ "ref": got.json().get("ref").cloned().unwrap_or_default() })),
-            ("PATCH", p) if p.starts_with("/repos/acme/app/git/refs/heads/") => (200, json!({ "ref": p.trim_start_matches("/repos/acme/app/git/") })),
             ("POST", "/repos/acme/app/pulls") => (201, json!({ "number": 12, "html_url": "https://github.example/acme/app/pull/12" })),
             ("GET", "/repos/acme/app/pulls/12") => (200, json!({ "number": 12, "draft": true, "node_id": "PR_kwDOdraft12" })),
             ("POST", "/graphql") => (200, json!({ "data": { "markPullRequestReadyForReview": { "pullRequest": { "isDraft": false } } } })),
             ("POST", "/repos/acme/app/issues/12/comments") => (201, json!({ "id": 1 })),
             ("PATCH", "/repos/acme/app/pulls/12") => (200, json!({ "number": 12, "state": "closed" })),
-            ("DELETE", p) if p.starts_with("/repos/acme/app/git/refs/heads/") => (204, Value::Null),
             _ => (404, json!({ "message": "Not Found" })),
         };
         (st, if v.is_null() { String::new() } else { v.to_string() })
@@ -309,6 +303,36 @@ fn w29_r11_save_draft_on_a_host() -> anyhow::Result<()> {
     assert_eq!(made.iter().map(|r| r.get("ref").cloned()).collect::<Vec<_>>(), [Some(json!(format!("refs/heads/{branch}")))], "{made:?}");
     let moved = g.sent("PATCH", &format!("/repos/acme/app/git/refs/heads/{branch}"));
     assert_eq!(moved.iter().map(|r| r.get("sha").cloned()).collect::<Vec<_>>(), [Some(json!(at(&second, "/draft/head")))], "{moved:?}");
+    Ok(())
+}
+
+/// W29-R25: the same Git Data commit contains the workflow and both locks; later saves keep
+/// its branch and pull, and read-only verification does not create another.
+#[test]
+fn w29_r25_a_hosts_draft_commits_both_locks_and_keeps_its_identity() -> anyhow::Result<()> {
+    let g = on_github()?;
+    let home = g._dir.path().join("lock-home");
+    std::fs::create_dir_all(&home)?;
+    let publisher = hosted_with(&g.s, &home, g._dir.path(), "acme/tools", &[(".kiln/config.yaml", "share: owner\n"), (".github/actions/check/action.yml", "runs: {using: composite, steps: [{run: echo accepted, shell: bash}]}\n")])?;
+    let accepted = git(&home, &publisher, &["rev-parse", "HEAD"])?.trim().to_owned();
+    let uses = format!("kiln://acme/tools/.github/actions/check@{accepted}");
+    let text = format!("name: ci\non: push\njobs:\n  check:\n    runs-on: local\n    steps:\n      - uses: {uses}\n");
+    let edit = "/api/ci/repos/acme%2Fapp/workflows/.github/workflows/ci.yml/edit";
+    let first = post(&g.s, edit, &json!({"content": text, "draft": true, "title": "Lock the shared check"}))?;
+    let trees = g.sent("POST", "/repos/acme/app/git/trees");
+    let paths: Vec<&str> = trees.first().and_then(|t| t.get("tree")).and_then(Value::as_array).into_iter().flatten().filter_map(|f| f.get("path").and_then(Value::as_str)).collect();
+    for file in [".github/workflows/ci.yml", ".github/workflows/actions.lock", ".kiln/lock"] { assert!(paths.contains(&file), "{file}: {trees:?}"); }
+    assert_eq!(g.sent("POST", "/repos/acme/app/git/commits").len(), 1);
+    let check = get(&g.s, &format!("/api/ci/repos/acme%2Fapp/locks/verify?sha={}", at(&first, "/draft/head")))?;
+    assert_eq!(check.get("fresh"), Some(&json!(true)), "{check}");
+    let second = post(&g.s, edit, &json!({"content": format!("{text}# same accepted dependency\n"), "draft": true, "title": "Lock the shared check"}))?;
+    assert_eq!((at(&second, "/draft/id"), at(&second, "/draft/branch")), (at(&first, "/draft/id"), at(&first, "/draft/branch")));
+    assert_eq!(g.sent("POST", "/repos/acme/app/pulls").len(), 1);
+    assert_eq!(g.sent("POST", "/repos/acme/app/git/commits").len(), 2);
+    let (st, _) = http(g.s.port, "POST", "/api/ci/repos/acme%2Fapp/locks", &g.s.admin, Some(&json!({})))?;
+    assert_eq!(st, 409, "there is no new lock change to propose");
+    assert_eq!(g.sent("POST", "/repos/acme/app/git/commits").len(), 2, "no no-op host commit");
+    assert_eq!(g.sent("POST", "/repos/acme/app/pulls").len(), 1);
     Ok(())
 }
 
@@ -557,7 +581,8 @@ fn w29_r12_ready_asks_for_review() -> anyhow::Result<()> {
     assert_eq!((st, at(&out, "/draft/state")), (200, "review"), "{out}");
     let commits = g.sent("POST", "/repos/acme/app/git/commits");
     let last = commits.last().cloned().unwrap_or_default();
-    assert_eq!((last.get("message"), last.get("parents"), last.get("tree")), (Some(&json!("Try a matrix\n")), Some(&json!([head])), Some(&json!("tree0"))), "the same tree, asking to skip nothing: {last}");
+    let tree = git(&g._dir.path().join("githome"), &g._dir.path().join("gh/acme/app.git"), &["rev-parse", &format!("{head}^{{tree}}")])?.trim().to_owned();
+    assert_eq!((last.get("message"), last.get("parents"), last.get("tree")), (Some(&json!("Try a matrix\n")), Some(&json!([head])), Some(&json!(tree))), "the same tree, asking to skip nothing: {last}");
     let moved = g.sent("PATCH", &format!("/repos/acme/app/git/refs/heads/{}", at(&saved, "/draft/branch")));
     assert_eq!(moved.last().and_then(|m| m.get("sha")), Some(&json!(at(&out, "/draft/head"))), "{moved:?}");
     let asked = g.sent("POST", "/graphql");

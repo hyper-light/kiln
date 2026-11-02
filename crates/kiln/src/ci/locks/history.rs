@@ -40,6 +40,19 @@ impl Seen {
         if self.approved { [(key.into(), self.current.clone())].into() } else { BTreeMap::new() }
     }
 
+    /// W29-R25: generation may retain a known full version before this workflow has its own
+    /// lock. These are accepted store facts, never the latest observed commit or identity.
+    pub fn accepted_pin(&self) -> Result<Option<kiln_ci::lock::kiln::Git>, String> {
+        if !self.full() { return Ok(None); }
+        let Some(commit) = &self.previous else { return Ok(None) };
+        let identity: kiln_ci::lock::kiln::Identity = serde_json::from_str(self.old_identity.as_deref().unwrap_or(&self.identity)).map_err(|_| "KCI4051 accepted source identity is invalid")?;
+        let (repo, hostname) = match identity {
+            kiln_ci::lock::kiln::Identity::Github { hostname, owner_id, repo_id } => (format!("github:{owner_id}/{repo_id}"), Some(hostname)),
+            kiln_ci::lock::kiln::Identity::Kiln { id } => (format!("kiln:{id}"), None),
+        };
+        Ok(Some(kiln_ci::lock::kiln::Git { git_ref: self.reference.clone(), commit: format!("{}-{commit}", if commit.len() == 64 { "sha256" } else { "sha1" }), repo, hostname, uses: Vec::new() }))
+    }
+
     pub async fn read(hub: &Hub, source: &dyn DependencySources, remote: &Remote, revision: &Revision) -> Result<Self, String> {
         revision.validate().map_err(|e| format!("KCI4051 {e}"))?;
         let (name, publisher, native) = binding(hub, remote, revision);
@@ -78,7 +91,7 @@ impl Seen {
             caller.map(|c| c.id.clone()), workflow.to_owned(), self.full(), crate::util::now_unix(),
         );
         let (old_identity, recorded): (Option<String>, Option<String>) = hub.store.call(move |c| {
-            let tx = c.transaction()?;
+            let tx = crate::store::tx(c)?;
             let old_identity: Option<String> = tx.query_row("SELECT accepted_identity FROM ci_lock_sources WHERE source = ?1", [&source], |r| r.get(0)).optional()?;
             let recorded: Option<String> = tx.query_row("SELECT accepted_commit FROM ci_lock_refs WHERE source = ?1 AND git_ref = ?2", params![source, reference], |r| r.get(0)).optional()?;
             let previous = recorded.or(previous);
