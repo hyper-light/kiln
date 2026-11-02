@@ -1073,6 +1073,8 @@ pub struct ActionSeen {
     /// The inputs added since its newest release.
     pub added: Vec<String>,
     pub now: i64,
+    /// W29-R26: accepted and observed commits for a full-version tag that moved.
+    pub moved: HashMap<String, (String, String)>,
 }
 
 /// A span in its largest unit, as the stills say it: `40s`, `18m`, `2h`, `3d`, `3w`.
@@ -1471,7 +1473,10 @@ pub fn action_groups(a: &Action, kind: Kind, text: &str, head: &str, tags: &[(St
             crate::releases::TagKind::Floating => tags.iter().find(|(o, s)| o != t && s == sha && crate::releases::kind_of(o) == crate::releases::TagKind::Full).map_or_else(|| sha.get(..7).unwrap_or(sha).to_owned(), |(o, _)| format!("the newest {t}: {o}")),
             crate::releases::TagKind::Other => sha.get(..7).unwrap_or(sha).to_owned(),
         };
-        Line::new(format!("versions.{t}"), "version", t.clone(), value)
+        match seen.moved.get(t) {
+            Some((before, now)) => Line::new(format!("versions.{t}"), "version", t.clone(), if before == now { "source identity changed".to_owned() } else { format!("tag moved · {} → {}", before.get(..7).unwrap_or(before), now.get(..7).unwrap_or(now)) }).state("flag"),
+            None => Line::new(format!("versions.{t}"), "version", t.clone(), value),
+        }
     }));
     out.push(group("Versions", versions));
     out.push(group("Used by", sharing.used_by_lines(newest)));
@@ -2335,7 +2340,7 @@ mod tests {
         let consumer = |repo: &str, workflows: &[&str], r: &str| crate::catalog::Consumer { repo: repo.into(), git_ref: r.into(), workflows: workflows.iter().map(|w| (*w).to_owned()).collect(), ..crate::catalog::Consumer::default() };
         let used = [consumer("hyper-light/kiln", &["ci", "release"], "v2.3.0"), consumer("hyper-light/quiver", &["ci"], "v2.4.0")];
         let day = 86_400;
-        let seen = ActionSeen { tag_at: [("v2.4.0".to_owned(), 0), ("v2.3.0".to_owned(), -18 * day)].into(), since: Some(("v2.4.0".to_owned(), 3)), added: vec!["targets".into()], now: 3 * day };
+        let seen = ActionSeen { tag_at: [("v2.4.0".to_owned(), 0), ("v2.3.0".to_owned(), -18 * day)].into(), since: Some(("v2.4.0".to_owned(), 3)), added: vec!["targets".into()], now: 3 * day, ..Default::default() };
         let groups = action_groups(&a.unwrap_or_default(), Kind::Composite, text, "e41a9c2b7d6e", &tags, &Sharing { repo: "hyper-light/ci-kit", access: Access::Owner, used_by: &used }, &seen);
         let said = |n: &str| groups.iter().find(|g| g.name == n).map(|g| g.lines.iter().map(|l| (format!("{}: {}", l.name, l.value), l.state)).collect::<Vec<_>>()).unwrap_or_default();
         assert_eq!(said("Inputs"), [("toolchain: rust-toolchain.toml's".to_owned(), None), ("components: clippy, rustfmt".into(), None), ("targets: new since v2.4.0".into(), Some("added"))]);
@@ -2343,6 +2348,18 @@ mod tests {
         assert_eq!(said("Versions").into_iter().map(|(l, _)| l).collect::<Vec<_>>(), ["e41a9c2: 3 commits since v2.4.0", "v2.4.0: 3d · 1 repository", "v2.3.0: 3w · 1 repository", "v2: the newest v2: v2.4.0"]);
         assert_eq!(said("Used by"), [("hyper-light/kiln: ci, release · v2.3.0".to_owned(), Some("flag")), ("hyper-light/quiver: ci · v2.4.0".into(), None)]);
         assert!(groups.iter().all(|g| g.name != "Outputs"), "no Outputs group without outputs");
+    }
+
+    #[test]
+    fn w29_r26_a_moved_version_is_flagged_on_its_existing_catalog_line() {
+        let text = "runs: {using: composite, steps: []}\n";
+        let (action, _) = crate::wf::parse_action(text);
+        let action = action.unwrap_or_default();
+        let tags = [("v1.2.3".into(), "b".repeat(40))];
+        let seen = ActionSeen { moved: [("v1.2.3".into(), ("a".repeat(40), "b".repeat(40)))].into(), ..Default::default() };
+        let groups = action_groups(&action, Kind::Composite, text, "bbbbbbb", &tags, &Sharing { repo: "acme/tools", access: Access::Owner, used_by: &[] }, &seen);
+        let line = groups.iter().flat_map(|g| &g.lines).find(|l| l.name == "v1.2.3");
+        assert!(line.is_some_and(|l| l.state == Some("flag") && l.value == "tag moved · aaaaaaa → bbbbbbb"));
     }
 
     /// W29-R04: event subjects and floating releases come from the supplied records, with no

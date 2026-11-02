@@ -1308,7 +1308,7 @@ impl Dispatch {
                     let fallback = reply.clone();
                     let hub = Arc::clone(&self.hub);
                     let task = crate::rt::spawn(async move {
-                        let snapshot = super::locks::prepare(&hub, &start.repo, &start.event.sha, &start.path, Arc::clone(&start.workflow)).await.map(Box::new);
+                        let snapshot = super::locks::inspect(&hub, &start.repo, &start.event.sha, &start.path, Arc::clone(&start.workflow)).await.map(Box::new);
                         hub.ci.send(Msg::PreparedPreview { start, snapshot, reply, permit });
                     });
                     if let Some(Err(_)) = task.now_or_never() { let _ = fallback.try_send(serde_json::json!({ "error": "dependency preflight could not start: runtime is full" })); }

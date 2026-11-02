@@ -5,6 +5,38 @@ const A: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
 const M: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
 const WORKFLOW: &str = ".github/workflows/ci.yml";
 
+#[test]
+fn w29_r26_history_does_not_bless_moved_versions_or_reclaimed_identities() {
+    let identity = super::super::kiln::Identity::Github { hostname: "github.com".into(), owner_id: 41, repo_id: 42 };
+    let replacement = super::super::kiln::Identity::Github { hostname: "github.com".into(), owner_id: 99, repo_id: 100 };
+    let check = |reference, current, previous, source, locked, policy, approved| check_history(HistoryCheck {
+        workflow: WORKFLOW, uses: "acme/action@v1.2.3", reference, current, previous, identity: source, accepted_identity: Some(&identity), locked, policy, approved,
+    });
+    let warnings = check("refs/tags/v1.2.3", M, Some(A), &identity, false, Policy::default(), false);
+    assert!(warnings.is_ok_and(|warnings| warnings.iter().any(|w| w.code == "KCI4056" && !w.is_error())));
+    let refuse = Policy { moved_tags: MovedTags::Refuse, ..Default::default() };
+    for policy in [refuse, Policy { require: Require::Enforce, ..Default::default() }] {
+        assert!(check("refs/tags/v1.2.3", M, Some(A), &identity, false, policy, false).is_err_and(|e| e.diagnostics.iter().any(|d| d.code == "KCI4056")));
+    }
+    assert!(check("refs/tags/v1.2.3", M, Some(A), &identity, false, refuse, true).is_ok());
+    assert!(check("refs/heads/v1.2.3", M, Some(A), &identity, false, refuse, false).is_ok(), "a same-named branch is no full tag");
+    assert!(check("refs/tags/v1", M, Some(A), &identity, false, refuse, false).is_ok(), "partial tags retain their lock, without becoming full-tag moves");
+    assert!(check("refs/tags/v1.2.3", A, Some(A), &replacement, true, Policy::default(), false).is_err_and(|e| e.diagnostics.iter().any(|d| d.code == "KCI4052")));
+    assert!(check("refs/tags/v1.2.3", A, Some(A), &replacement, false, Policy::default(), false).is_ok_and(|w| w.iter().any(|d| d.code == "KCI4052")));
+    assert!(check("refs/tags/v1.2.3", "bad", Some(A), &identity, false, refuse, true).is_err(), "review does not excuse malformed facts");
+}
+
+#[test]
+fn w29_r26_a_stale_required_lock_has_both_coverage_and_policy_diagnostics() {
+    for require in [Require::Off, Require::Report, Require::Enforce] {
+        let diagnostics = missing_pin(WORKFLOW, "acme/tools@v1", Policy { require, ..Default::default() });
+        assert!(diagnostics.iter().any(|d| d.code == "KCI4050" && d.is_error()));
+        let required = diagnostics.iter().find(|d| d.code == "KCI4055");
+        assert_eq!(required.is_some(), require != Require::Off);
+        if let Some(required) = required { assert_eq!(required.is_error(), require == Require::Enforce); }
+    }
+}
+
 fn fixture(reference: &str, current: &str, reaches: bool) -> (File, BTreeMap<String, GitFacts>, Vec<String>) {
     let key = format!("acme/action@{reference}");
     let file = File {

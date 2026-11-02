@@ -23,7 +23,7 @@ impl Capture<'_> {
             }
             if selected.is_some() { break; }
         }
-        let pinned = selected.ok_or_else(|| format!("KCI4050 {reference}: image is missing from the workflow's lock"))?;
+        let pinned = selected.ok_or_else(|| self.missing(self.root_path, reference))?;
         self.allowed(&format!("docker://{pinned}"))?;
         if !self.manifests.contains(&pinned) {
             let manifest = self.source.manifest(pinned.clone()).await.map_err(|e| format!("KCI4051 {reference}: {e}"))?;
@@ -60,7 +60,7 @@ impl Capture<'_> {
             }
             if selected.is_some() { break; }
         }
-        let selected = selected.ok_or_else(|| format!("KCI4050 {using}: runtime is missing from the workflow's lock"))?;
+        let selected = selected.ok_or_else(|| self.missing(self.root_path, using))?;
         let mut archives = BTreeMap::new();
         for (platform, expected) in selected.archives {
             let mut parts = platform.split('/');

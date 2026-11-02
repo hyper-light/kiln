@@ -140,6 +140,7 @@ pub async fn one(hub: &Hub, owner: &str, name: &str, path: Option<&str>) -> Resu
     let path = path.map(|p| p.trim_matches('/').to_owned());
     let repos = hub.store.repos().await.map_err(internal)?;
     let hosted: Option<(&Repo, String)> = repos.iter().find_map(|r| super::hosting::native_path(hub, r).filter(|_| r.name.eq_ignore_ascii_case(&full)).map(|d| (r, d.to_string_lossy().into_owned())));
+    let moved = super::locks::moved_tags(hub, &full, hosted.is_some()).await.map_err(internal)?;
     let (dir, access, mut entries) = match &hosted {
         Some((r, d)) => {
             let access = super::sharing::access_of(hub, r).await;
@@ -163,14 +164,18 @@ pub async fn one(hub: &Hub, owner: &str, name: &str, path: Option<&str>) -> Resu
                 Some((r, _)) => checks_at(hub, &r.id, &sha).await.map_err(internal)?,
                 None => Vec::new(),
             };
-            versions.push(json!({ "ref": tag, "sha": sha, "checks": checks }));
+            let mut version = json!({ "ref": tag, "sha": sha, "checks": checks });
+            if let Some(changed) = moved.iter().rev().find(|m| m.get("ref").and_then(Value::as_str) == Some(tag.as_str()))
+                && let Some(v) = version.as_object_mut()
+            { v.insert("tag_moved".into(), changed.clone()); }
+            versions.push(version);
         }
     }
     let consumers = consumers(hub, &full, path.as_deref()).await.map_err(internal)?;
     if dir.is_none() && consumers.is_empty() {
         return Err((StatusCode::NOT_FOUND, format!("`{full}` is no repository kiln hosts or mirrors")));
     }
-    Ok(json!({
+    let mut result = json!({
         "owner": owner,
         "repo": name,
         "path": path,
@@ -179,7 +184,9 @@ pub async fn one(hub: &Hub, owner: &str, name: &str, path: Option<&str>) -> Resu
         "entries": entries,
         "versions": versions,
         "consumers": consumers,
-    }))
+    });
+    if !moved.is_empty() && let Some(fields) = result.as_object_mut() { fields.insert("moved_tags".into(), Value::Array(moved)); }
+    Ok(result)
 }
 
 /// The newest run of each of a repository's workflows at `sha`: its own checks of a version.

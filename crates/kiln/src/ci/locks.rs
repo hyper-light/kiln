@@ -122,7 +122,7 @@ impl Frozen {
 
 /// A bounded immutable blob. Absence is established by a successful tree listing; a missing
 /// object or failed lazy fetch must not turn a present lock into an unlocked workflow.
-async fn blob(hub: &Hub, dir: &Path, remote: Option<&Remote>, commit: &str, path: &str) -> Result<Option<Vec<u8>>, String> {
+pub(super) async fn blob(hub: &Hub, dir: &Path, remote: Option<&Remote>, commit: &str, path: &str) -> Result<Option<Vec<u8>>, String> {
     if !kiln_seams::dependencies::commit_valid(commit) || !kiln_seams::dependencies::path_valid(path) { return Err("KCI1022 invalid dependency file location".into()); }
     if !dir.join("HEAD").exists() { return Ok(None); }
     async fn run(hub: &Hub, dir: &Path, remote: Option<&Remote>, args: &[&str]) -> Result<Vec<u8>, String> {
@@ -185,7 +185,10 @@ struct Capture<'a> {
     caller: &'a Repo,
     source: &'a dyn DependencySources,
     root_commit: &'a str,
+    root_path: &'a str,
     policies: Vec<kiln_ci::policy::Policy>,
+    lock_policy: verify::Policy,
+    record: bool,
     revisions: BTreeMap<String, Revision>,
     legacy: BTreeMap<String, Result<(String, String), String>>,
     origins: BTreeMap<String, Remote>,
@@ -197,9 +200,11 @@ struct Capture<'a> {
     warnings: BTreeSet<String>,
     manifests: BTreeSet<String>,
     archives: BTreeMap<kiln_seams::dependencies::Runtime, kiln_seams::dependencies::Archive>,
+    histories: BTreeMap<String, history::Seen>,
 }
 
 impl Capture<'_> {
+    fn missing(&self, workflow: &str, uses: &str) -> String { verify::missing_pin(workflow, uses, self.lock_policy).iter().map(|d| d.render(workflow)).collect::<Vec<_>>().join("\n") }
     fn ref_key(remote: &Remote, reference: &str) -> String {
         format!("{}{}@{reference}", if remote.native { "kiln://" } else { "" }, remote.full().to_ascii_lowercase())
     }
@@ -256,6 +261,27 @@ impl Capture<'_> {
         let key = Self::ref_key(remote, &remote.git_ref);
         if let Some(got) = self.legacy.get(&key) { return got.clone(); }
         remote.usable_by(self.hub, &self.caller.name).await?;
+        let possible_full = remote.git_ref.strip_prefix("refs/tags/").or_else(|| (!remote.git_ref.starts_with("refs/")).then_some(remote.git_ref.as_str()))
+            .is_some_and(|tag| matches!(kiln_ci::releases::kind_of(tag), kiln_ci::releases::TagKind::Full));
+        if possible_full {
+            let revision = match self.captured(remote, &remote.git_ref) {
+                Some(revision) => Ok(revision),
+                None => self.source.resolve(Repository { name: remote.full(), native: remote.native }, remote.git_ref.clone()).await,
+            };
+            match revision {
+                Ok(revision) => {
+                    let seen = self.history(remote, &revision).await?;
+                    self.remember(&seen, &format!("{}@{}", remote.named(), remote.git_ref), self.root_path, false, true).await?;
+                    let got = (revision.commit.clone(), revision.reference.clone());
+                    self.origins.insert(key.clone(), remote.clone());
+                    self.revisions.insert(key.clone(), revision);
+                    self.legacy.insert(key, Ok(got.clone()));
+                    return Ok(got);
+                }
+                Err(error) if self.lock_policy.moved_tags == verify::MovedTags::Refuse => return Err(format!("KCI4051 {}: full-version history could not be verified: {error}", remote.named())),
+                Err(_) => { self.warnings.insert(format!("{}: full-version history could not be verified; moved_tags is flag", remote.named())); }
+            }
+        }
         let got = actions::pin_ref_readonly(self.hub, remote, true).await.map(|(sha, reference, _)| (sha, reference)).map_err(|_| {
             let why = if remote.mirror(self.hub).join("HEAD").exists() { "source is unavailable or the ref is missing" } else { "action source unreachable and not mirrored" };
             format!("{}@{}: {why}", remote.named(), remote.git_ref)
@@ -282,9 +308,9 @@ impl Capture<'_> {
             return Err(format!("KCI4052 {uses}: the source is now hosted by kiln, not the GitHub repository whose ids were locked"));
         }
         // Hosted sources belong to .kiln/lock (W29-R24), never GitHub's numeric-id file.
-        if remote.hosted(self.hub) && onboarded { return Err(format!("KCI4050 {uses}: a hosted action needs its entry in .kiln/lock")); }
+        if remote.hosted(self.hub) && onboarded { return Err(self.missing(workflow, uses)); }
         if !onboarded {
-            if !native.is_empty() { return Err(format!("KCI4050 {workflow}: {uses} is missing from its caller and workflow locks")); }
+            if !native.is_empty() { return Err(self.missing(workflow, uses)); }
             self.allowed(uses)?;
             let key = Self::ref_key(remote, &remote.git_ref);
             let (sha, _) = self.pin(remote).await?;
@@ -292,7 +318,7 @@ impl Capture<'_> {
         }
         let file = lock.ok_or_else(|| "KCI4050 the workflow's lock is missing".to_owned())?;
         let canonical = github::action_pin(uses).ok_or_else(|| format!("KCI4050 {uses} is not an action pin"))?;
-        let (key, entry) = verify::pin_for(file, workflow, &canonical).ok_or_else(|| format!("KCI4050 {workflow}: {uses} is missing from this workflow's lock closure"))?;
+        let (key, entry) = verify::pin_for(file, workflow, &canonical).ok_or_else(|| self.missing(workflow, uses))?;
         let wanted = github::digest(&entry.commit).ok_or_else(|| format!("KCI1022 {uses}: invalid locked commit"))?.to_ascii_lowercase();
         let ref_key = Self::ref_key(remote, &entry.git_ref);
         let revision = match self.captured(remote, &entry.git_ref) {
@@ -313,13 +339,17 @@ impl Capture<'_> {
             Identity::Github { hostname, owner_id, repo_id } => (hostname.clone(), *owner_id, *repo_id),
             Identity::Native { .. } => (String::new(), 0, 0),
         };
+        let seen = self.history(remote, &revision).await?;
         let facts = [(key.to_owned(), verify::GitFacts {
             hostname, owner_id, repo_id, reference: revision.reference.clone(), current: revision.commit.clone(),
-            reachable: if reachable { [wanted].into() } else { BTreeSet::new() }, previous: None, requested_ref: revision.requested.clone(),
+            reachable: if reachable { [wanted].into() } else { BTreeSet::new() }, previous: seen.previous.clone(), requested_ref: revision.requested.clone(),
         })].into();
+        let accepted_moves = seen.accepted_moves(key);
         let checked = verify::check_github(verify::GithubCheck {
-            workflow, uses: &[uses.to_owned()], file: Some(file), facts: &facts, home_host: home, policy: verify::Policy::default(), accepted_moves: &BTreeMap::new(),
-        }).map_err(|e| e.diagnostics.iter().map(|d| d.render(workflow)).collect::<Vec<_>>().join("\n"))?;
+            workflow, uses: &[uses.to_owned()], file: Some(file), facts: &facts, home_host: home, policy: self.lock_policy, accepted_moves: &accepted_moves,
+        });
+        self.remember(&seen, uses, workflow, true, checked.is_ok()).await?;
+        let checked = checked.map_err(|e| e.diagnostics.iter().map(|d| d.render(workflow)).collect::<Vec<_>>().join("\n"))?;
         self.warnings.extend(checked.warnings.iter().map(|d| d.render(workflow)));
         let selected = checked.pins.get(&canonical).ok_or_else(|| format!("KCI4050 {uses}: no verified selection"))?;
         // The action policy judges the code that will run, including require_sha_pins.
@@ -411,7 +441,7 @@ impl Capture<'_> {
                 let selected = self.select(&uses, &remote, &workflow.path, lock, native, home).await;
                 let (sha, revision, strict) = match selected {
                     Ok(s) => s,
-                    Err(why) if locked || why.starts_with("KCI402") => return Err(why),
+                    Err(why) if locked || why.starts_with("KCI402") || (self.lock_policy.moved_tags == verify::MovedTags::Refuse && ["KCI4051", "KCI4052", "KCI4056"].iter().any(|code| why.contains(code))) => return Err(why),
                     Err(why) => {
                         if let Some(root) = &root { beneath.push((root.clone(), format!("{uses}: {why}"))); }
                         out.insert(uses.clone(), ActionRef { repo: remote.full(), path: remote.path, error: Some(why), ..ActionRef::default() });
@@ -478,7 +508,7 @@ impl Capture<'_> {
             let reference = revision.as_ref().map_or_else(|| remote.git_ref.clone(), |r| r.reference.clone());
             (commit, reference, revision)
         } else {
-            if !native.is_empty() { return Err(format!("KCI4050 {uses}: reusable workflow is missing from its caller's lock")); }
+            if !native.is_empty() { return Err(self.missing(self.root_path, uses)); }
             self.allowed(uses)?;
             let (commit, reference) = self.pin(&remote).await?;
             (commit, reference, None)
@@ -518,12 +548,24 @@ pub async fn prepare(hub: &Arc<Hub>, caller: &Repo, commit: &str, path: &str, wo
     prepare_with(hub, &source, caller, commit, path, workflow).await
 }
 
+/// W29-R26: previews may refresh source facts, but cannot accept or announce an observation.
+pub async fn inspect(hub: &Arc<Hub>, caller: &Repo, commit: &str, path: &str, workflow: Arc<Workflow>) -> Result<Frozen, String> {
+    crate::gitops::ensure_commit(hub, caller, commit).await.map_err(|_| "KCI4051 the workflow's exact tree is unavailable".to_owned())?;
+    let source = super::dependency_sources::Sources::new(Arc::clone(hub), caller.name.clone());
+    capture_with(hub, &source, caller, commit, path, workflow, false).await
+}
+
 async fn prepare_with(hub: &Hub, source: &dyn DependencySources, caller: &Repo, commit: &str, path: &str, workflow: Arc<Workflow>) -> Result<Frozen, String> {
+    capture_with(hub, source, caller, commit, path, workflow, true).await
+}
+
+async fn capture_with(hub: &Hub, source: &dyn DependencySources, caller: &Repo, commit: &str, path: &str, workflow: Arc<Workflow>, record: bool) -> Result<Frozen, String> {
     if workflow.path != path { return Err("KCI1022 the workflow model's path differs from the run's path".into()); }
     let mut capture = Capture {
-        hub, caller, source, root_commit: commit, policies: actions::policies(hub, caller).await,
+        hub, caller, source, root_commit: commit, root_path: path, record, policies: actions::policies(hub, caller).await,
+        lock_policy: super::repo_config::lock_policy(hub, caller).await?,
         revisions: BTreeMap::new(), legacy: BTreeMap::new(), origins: BTreeMap::new(), locks: BTreeMap::new(), native_locks: BTreeMap::new(), texts: BTreeMap::new(),
-        bytes: 0, items: 0, warnings: BTreeSet::new(), manifests: BTreeSet::new(), archives: BTreeMap::new(),
+        bytes: 0, items: 0, warnings: BTreeSet::new(), manifests: BTreeSet::new(), archives: BTreeMap::new(), histories: BTreeMap::new(),
     };
     let mut frozen = Frozen { version: 1, repository: caller.name.clone(), path: path.into(), commit: commit.into(), root_locked: false, scopes: BTreeMap::new(), files: Files::new(), warnings: Vec::new() };
     let mut todo = vec![Work { workflow, owner: Owner { repository: caller.name.clone(), commit: commit.into(), remote: None, revision: None }, depth: 0, native: Vec::new() }];
@@ -539,6 +581,11 @@ async fn prepare_with(hub: &Hub, source: &dyn DependencySources, caller: &Repo, 
         let mut native = work.native;
         if let Some(layer) = own_native { native.push(layer); }
         let locked = !native.is_empty() || lock.as_ref().is_some_and(|f| f.workflows.contains_key(&work.workflow.path));
+        if !locked && capture.lock_policy.require != verify::Require::Off {
+            let why = format!("KCI4055 {}: Require lockfile: this workflow has no lockfile entry", work.workflow.path);
+            if capture.lock_policy.require == verify::Require::Enforce { return Err(why); }
+            capture.warnings.insert(why);
+        }
         if work.depth == 0 { frozen.root_locked = locked; }
         let home = work.owner.home_host(hub, caller);
         let (actions, execution) = capture.action_map(&work.workflow, lock.as_deref(), &native, &home).await?;
@@ -594,6 +641,21 @@ pub async fn retry_needs_preflight(hub: &Hub, run: &str) -> Result<bool, String>
     ).optional()?.unwrap_or(false))).await.map_err(|_| "the saved preflight state could not be read".into())
 }
 
+/// W29-R26: cached catalog facts, without resolving or accepting a mutable ref.
+pub async fn moved_tags(hub: &Hub, publisher: &str, native: bool) -> anyhow::Result<Vec<serde_json::Value>> { history::moved(hub, publisher, native).await }
+
+/// Pending observations survive a server restart; only declared notification rules send them.
+pub async fn notify_moves(hub: &Hub) -> anyhow::Result<()> {
+    let pending: Vec<String> = hub.store.call(|c| {
+        let mut st = c.prepare("SELECT DISTINCT consumer_repo_id FROM ci_lock_moves WHERE notified_at IS NULL")?;
+        let rows = st.query_map([], |r| r.get(0))?.collect::<rusqlite::Result<_>>()?; Ok(rows)
+    }).await?;
+    for repo in hub.store.repos().await?.into_iter().filter(|r| pending.contains(&r.id)) {
+        history::notify_pending(hub, &repo).await.map_err(anyhow::Error::msg)?;
+    }
+    Ok(())
+}
+
 pub async fn prepare_retry(hub: &Arc<Hub>, run: &str, fresh: bool) -> Result<Frozen, String> {
     let id = run.to_owned();
     let saved: Option<(String, String, String, String, String)> = hub.store.call(move |c| Ok(c.query_row(
@@ -620,3 +682,4 @@ mod tests;
 
 mod native;
 mod execution;
+mod history;

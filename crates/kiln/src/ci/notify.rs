@@ -73,6 +73,7 @@ pub const EVENTS: &[&str] = &[
     "secret.unused",
     "diff.landed",
     "test.quarantined",
+    "tag_moved",
 ];
 /// The events about an agent (`crate::push`): the server's rules take them, a repository's can't.
 pub const AGENT_EVENTS: &[&str] = &["agent.needs_you", "agent.finished", "agent.stopped", "agent.paused"];
@@ -377,6 +378,7 @@ fn message(event: &str, s: &Subject) -> (String, String) {
         "secret.unused" => return (format!("⚠ secret {} hasn't been used in {} days", s.name, UNUSED_AFTER / 86_400), format!("{} · {} · {}", s.repo, s.message, s.url)),
         "diff.landed" => return (format!("✓ {} landed on {}", s.name, s.branch), format!("{} · {} by {actor} · {}", s.repo, s.sha.get(..8).unwrap_or(&s.sha), s.url)),
         "test.quarantined" => return (format!("⊘ {} is quarantined in {}", s.name, s.repo), format!("{} · {}", s.message.lines().next().unwrap_or_default(), s.url)),
+        "tag_moved" => return (format!("⚠ {}", s.name), format!("{} · {} · {}", s.repo, s.message, s.url)),
         _ => {}
     }
     // A land queue's entry: its diffs, why, and where they are.
@@ -433,6 +435,7 @@ impl Msg {
             "quota.near" => "the cache",
             "test.quarantined" => "the tests",
             "secret.unused" => "the secrets",
+            "tag_moved" => "the pipelines",
             _ => "the run",
         };
         let people = if s.people.is_empty() { vec![s.actor.clone()] } else { s.people.clone() };

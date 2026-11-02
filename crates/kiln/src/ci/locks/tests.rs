@@ -13,12 +13,12 @@ const PATH: &str = ".github/workflows/ci.yml";
 const USES: &str = "acme/tools@v1";
 const WORKFLOW: &str = "on: push\njobs:\n  check:\n    runs-on: baremetal\n    steps:\n      - uses: acme/tools@v1\n";
 
-struct Counted {
-    inner: super::super::dependency_sources::Sources,
+struct Counted<S> {
+    inner: S,
     reads: Arc<Mutex<Vec<(String, String)>>>,
 }
 
-impl DependencySources for Counted {
+impl<S: DependencySources> DependencySources for Counted<S> {
     fn resolve(&self, repository: Repository, reference: String) -> BoxFuture<'_, Result<Revision, Refusal>> { self.inner.resolve(repository, reference) }
     fn contains(&self, revision: Revision, commit: String) -> BoxFuture<'_, Result<bool, Refusal>> { self.inner.contains(revision, commit) }
     fn file(&self, revision: Revision, commit: String, path: String) -> BoxFuture<'_, Result<Vec<u8>, Refusal>> {
@@ -233,3 +233,4 @@ fn w29_r23_lock_failure_is_a_startup_failure_with_zero_jobs() -> anyhow::Result<
 
 mod native;
 mod execution;
+mod policy;

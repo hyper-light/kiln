@@ -553,10 +553,13 @@ pub enum NoticeKind {
     CommentReply,
     #[serde(rename = "mention")]
     Mention,
+    // W29-R26: a dependency's full-version ref changed, without accepting the new commit.
+    #[serde(rename = "tag_moved")]
+    TagMoved,
 }
 
 impl NoticeKind {
-    pub const ALL: [NoticeKind; 16] = [
+    pub const ALL: [NoticeKind; 17] = [
         Self::RunSucceeded,
         Self::RunFixed,
         Self::RunCancelled,
@@ -573,6 +576,7 @@ impl NoticeKind {
         Self::ReviewRequested,
         Self::CommentReply,
         Self::Mention,
+        Self::TagMoved,
     ];
 
     /// Its name, as rules say it.
@@ -594,6 +598,7 @@ impl NoticeKind {
             Self::ReviewRequested => "review.requested",
             Self::CommentReply => "comment.reply",
             Self::Mention => "mention",
+            Self::TagMoved => "tag_moved",
         }
     }
 

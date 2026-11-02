@@ -55,10 +55,14 @@ impl Capture<'_> {
                 Identity::Github { hostname, owner_id, repo_id } => kiln::Identity::Github { hostname: hostname.clone(), owner_id: *owner_id, repo_id: *repo_id },
                 Identity::Native { repo_id } => kiln::Identity::Kiln { id: repo_id.clone() },
             };
+            let seen = self.history(remote, &revision).await?;
+            let accepted_moves = seen.accepted_moves(key);
             let checked = verify_kiln::check_git(verify_kiln::Check {
-                workflow: &layer.workflow, key, entry, facts: &verify_kiln::GitFacts { identity, reference: revision.reference.clone(), current: revision.commit.clone(), reachable: if reachable { [wanted].into() } else { BTreeSet::new() }, previous: None },
-                home_host: &layer.home, policy: verify::Policy::default(), accepted_moves: &BTreeMap::new(),
-            }).map_err(|e| e.diagnostics.iter().map(|d| format!("{}: {}", layer.repository, d.render(kiln::PATH))).collect::<Vec<_>>().join("\n"))?;
+                workflow: &layer.workflow, key, entry, facts: &verify_kiln::GitFacts { identity, reference: revision.reference.clone(), current: revision.commit.clone(), reachable: if reachable { [wanted].into() } else { BTreeSet::new() }, previous: seen.previous.clone() },
+                home_host: &layer.home, policy: self.lock_policy, accepted_moves: &accepted_moves,
+            });
+            self.remember(&seen, uses, &layer.workflow, true, checked.is_ok()).await?;
+            let checked = checked.map_err(|e| e.diagnostics.iter().map(|d| format!("{}: {}", layer.repository, d.render(kiln::PATH))).collect::<Vec<_>>().join("\n"))?;
             self.warnings.extend(checked.warnings.iter().map(|d| format!("{}: {}", layer.repository, d.render(kiln::PATH))));
             self.allowed_pinned(&format!("{}@{}", remote.named(), checked.selection.commit))?;
             return Ok(Some((checked.selection.commit, Some(revision), true)));

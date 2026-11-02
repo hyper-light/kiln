@@ -26,7 +26,7 @@ pub enum MovedTags {
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct Policy {
     pub require: Require,
     pub moved_tags: MovedTags,
@@ -105,11 +105,59 @@ pub struct GithubCheck<'a> {
     pub accepted_moves: &'a BTreeMap<String, String>,
 }
 
+/// W29-R26: persistent history supplied by the store. New observations do not accept a
+/// source identity or full-version move; that requires a reviewed acceptance supplied here.
+pub struct HistoryCheck<'a> {
+    pub workflow: &'a str,
+    pub uses: &'a str,
+    pub reference: &'a str,
+    pub current: &'a str,
+    pub previous: Option<&'a str>,
+    pub identity: &'a super::kiln::Identity,
+    pub accepted_identity: Option<&'a super::kiln::Identity>,
+    pub locked: bool,
+    pub policy: Policy,
+    pub approved: bool,
+}
+
+pub fn check_history(check: HistoryCheck<'_>) -> Result<Vec<Diag>, Refused> {
+    let policy = check.policy.stricter(Policy::default());
+    let valid_identity = |identity: &super::kiln::Identity| match identity {
+        super::kiln::Identity::Github { hostname, owner_id, repo_id } => format::hostname(hostname) && *owner_id > 0 && *repo_id > 0,
+        super::kiln::Identity::Kiln { id } => !id.is_empty() && id.len() <= 256 && id.bytes().any(|b| b != b'.') && id.bytes().all(|b| b.is_ascii_alphanumeric() || b"._-".contains(&b)),
+    };
+    let mut diagnostics = Vec::new();
+    let mut moved = Vec::new();
+    if sha(check.current).is_none() || check.previous.is_some_and(|s| sha(s).is_none()) || !super::kiln::reference(check.reference)
+        || !valid_identity(check.identity) || check.accepted_identity.is_some_and(|i| !valid_identity(i)) {
+        return Err(Refused { diagnostics: vec![diag("KCI4051", check.workflow, "persistent source history is invalid", false)], moved });
+    }
+    if check.accepted_identity.is_some_and(|old| old != check.identity) {
+        diagnostics.push(diag("KCI4052", check.workflow, format!("{}: repository identity changed from {:?} to {:?}", check.uses, check.accepted_identity, check.identity), !(check.locked || policy.moved_tags == MovedTags::Refuse)));
+    }
+    let full = check.reference.strip_prefix("refs/tags/").is_some_and(|tag| matches!(crate::releases::kind_of(tag), crate::releases::TagKind::Full));
+    if full && let Some(before) = check.previous.filter(|before| !before.eq_ignore_ascii_case(check.current)) {
+        moved.push(MovedRef { pin: check.uses.into(), before: before.into(), now: check.current.into() });
+        diagnostics.push(diag("KCI4056", check.workflow, format!("{}: full-version tag moved from {before} to {}; a refresh does not accept that change", check.uses, check.current), policy.moved_tags == MovedTags::Flag || check.approved));
+    }
+    if diagnostics.iter().any(Diag::is_error) { Err(Refused { diagnostics, moved }) } else { Ok(diagnostics) }
+}
+
 fn diag(code: &'static str, workflow: &str, message: impl Into<String>, warning: bool) -> Diag {
     let at = Pos { line: 1, col: 1, offset: 0 };
     let range = Range { start: at, end: at };
     let d = if warning { Diag::warning(code, message, range) } else { Diag::error(code, message, range) };
     d.at(workflow)
+}
+
+/// Missing reachable inputs are always a lock error. Requiring locks additionally identifies
+/// this as a stale required lock; report keeps that diagnostic a warning (W29-R26).
+pub fn missing_pin(workflow: &str, uses: &str, policy: Policy) -> Vec<Diag> {
+    let mut diagnostics = vec![diag("KCI4050", workflow, format!("{uses}: an input this locked workflow reaches is missing from its lock"), false)];
+    if policy.require != Require::Off {
+        diagnostics.push(diag("KCI4055", workflow, "Require lockfile: this workflow's dependency coverage is stale", policy.require == Require::Report));
+    }
+    diagnostics
 }
 
 fn sha(value: &str) -> Option<String> {
@@ -167,7 +215,7 @@ pub fn check_github(check: GithubCheck<'_>) -> Result<Verified, Refused> {
     for requested in requested {
         let locked = check.file.filter(|_| onboarded).and_then(|f| pin_for(f, check.workflow, &requested));
         if onboarded && locked.is_none() {
-            diagnostics.push(diag("KCI4050", check.workflow, format!("{requested}: an action this locked workflow reaches is missing from its lock"), false));
+            diagnostics.extend(missing_pin(check.workflow, &requested, policy));
             continue;
         }
         let key = locked.map_or(requested.as_str(), |(key, _)| key);

@@ -89,6 +89,7 @@ const EVENT_FRAMES = {
   "test.quarantined": true,
   "quota.near": true,
   "secret.unused": true,
+  tag_moved: true,
   "approval.waiting": true,
   "review.requested": true,
   "comment.reply": true,

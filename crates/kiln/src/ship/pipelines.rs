@@ -602,6 +602,9 @@ pub async fn get(hub: &Arc<Hub>, owner: &str, name: &str, q: &HashMap<String, St
                 since: newest.clone().map(|t| (t, commits.len())),
                 added: changes.iter().flatten().filter(|c| c.kind == "input" && c.what == "added").map(|c| c.name.clone()).collect(),
                 now: crate::util::now_unix(),
+                moved: crate::ci::locks::moved_tags(hub, &repo.name, crate::ci::hosting::native_path(hub, &repo).is_some()).await.map_err(internal)?.into_iter().filter_map(|m| {
+                    Some((m.get("ref")?.as_str()?.to_owned(), (m.get("locked")?.as_str()?.to_owned(), m.get("now")?.as_str()?.to_owned())))
+                }).collect(),
             };
             let groups = action.as_ref().map(|a| core::action_groups(a, row.facts.kind, &text, &sha, &ctx.versions, &sharing, &seen)).unwrap_or_default();
             (row, groups, Vec::new())

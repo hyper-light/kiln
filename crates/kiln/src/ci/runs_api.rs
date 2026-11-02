@@ -458,7 +458,12 @@ pub async fn part(hub: &Hub, id: &str, which: &str, q: &HashMap<String, String>)
                                    "title": r.get::<_, Option<String>>(4)?, "message": r.get::<_, String>(5)?, "file": r.get::<_, Option<String>>(6)?, "line": r.get::<_, Option<i64>>(7)?,
                                    "end_line": r.get::<_, Option<i64>>(8)?, "col": r.get::<_, Option<i64>>(9)?, "end_col": r.get::<_, Option<i64>>(10)? }))
                     })?;
-                    json!({ "annotations": rows.collect::<Result<Vec<_>, _>>()? })
+                    let mut annotations = rows.collect::<Result<Vec<_>, _>>()?;
+                    // W29-R26: preflight warnings belong to the run, before it had any legs.
+                    // Their accepted snapshot persists them across every attempt and restart.
+                    let warnings: Option<String> = c.query_row("SELECT json_extract(CASE WHEN json_valid(input) THEN input ELSE '{}' END, '$.dependency_snapshot.warnings') FROM ci_plans WHERE run_id = ?1", [&run], |r| r.get(0)).optional()?.flatten();
+                    annotations.extend(lock_annotations(warnings.as_deref()));
+                    json!({ "annotations": annotations })
                 }
                 "summary" => {
                     let mut st = c.prepare(
@@ -484,6 +489,12 @@ pub async fn part(hub: &Hub, id: &str, which: &str, q: &HashMap<String, String>)
         .await
         .map_err(internal)?;
     Ok(srv::json(StatusCode::OK, &v))
+}
+
+fn lock_annotations(warnings: Option<&str>) -> Vec<Value> {
+    warnings.and_then(|s| serde_json::from_str::<Vec<String>>(s).ok()).unwrap_or_default().into_iter().take(1000).map(|message| {
+        json!({ "leg": "", "leg_key": "Preflight", "step": null, "level": "warning", "title": "Dependency lock", "message": message, "file": null, "line": null, "end_line": null, "col": null, "end_col": null })
+    }).collect()
 }
 
 /// `GET /api/ci/runs/:id/pending`: the deployments a run waits for a review of, whichever provider.
@@ -823,6 +834,15 @@ pub async fn caches(hub: &Hub, repo: &str, delete: Option<&str>) -> Result<Respo
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn w29_r26_saved_preflight_warnings_are_run_annotations_without_a_leg() {
+        let rows = lock_annotations(Some(r#"["KCI4055 Require lockfile: no workflow entry","KCI4056 v1.2.3 moved from A to M"]"#));
+        assert_eq!(rows.len(), 2);
+        assert!(rows.iter().all(|r| r.get("leg").and_then(Value::as_str) == Some("") && r.get("level").and_then(Value::as_str) == Some("warning")));
+        assert!(lock_annotations(None).is_empty());
+        assert!(lock_annotations(Some("{}")).is_empty());
+    }
 
     /// W24-R28 on the leg API: a reused leg's report names its source, its runner and the time it
     /// saved; a leg that ran has none (yet).
