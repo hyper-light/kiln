@@ -955,13 +955,31 @@ fn journey_of(rec: &Records, runners: &[RunnerSeen], now: i64) -> Journey {
         _ => Land::Landed,
     };
     let run_pipeline: HashMap<&str, &str> = rec.runs.iter().map(|r| (r.id.as_str(), r.pipeline.as_str())).collect();
+    let run_made: HashMap<&str, i64> = rec.runs.iter().map(|r| (r.id.as_str(), r.created_at)).collect();
     let mut checks: Vec<Check> = Vec::new();
-    let mut platforms: Vec<Platform> = Vec::new();
+    // Each platform once, as the newest release run that builds it has it (a release run again
+    // replaces the one before, as a leg tried again keeps its lane), beside when that run was made.
+    let mut releases: Vec<(i64, Platform)> = Vec::new();
     let mut image_parts: Vec<Part> = Vec::new();
     for leg in &rec.legs {
         let pipeline = run_pipeline.get(leg.run_id.as_str()).copied().unwrap_or_default();
+        // A leg names its job and run once it has run (Output streams that job's log).
+        let ran = !matches!(leg.status.as_str(), "queued" | "waiting" | "pending" | "blocked" | "skipped");
         if is_release(pipeline) {
-            platforms.push(Platform { name: leg.name.clone(), state: part_of(&leg.status, leg.conclusion.as_deref()) });
+            let made = run_made.get(leg.run_id.as_str()).copied().unwrap_or_default();
+            let p = Platform {
+                name: leg.name.clone(),
+                state: part_of(&leg.status, leg.conclusion.as_deref()),
+                job: ran.then(|| leg.job.clone()),
+                run: ran.then(|| leg.run_id.clone()),
+                start: leg.started,
+                end: leg.finished,
+            };
+            match releases.iter_mut().find(|(_, q)| q.name == p.name) {
+                Some(slot) if slot.0 <= made => *slot = (made, p),
+                Some(_) => {}
+                None => releases.push((made, p)),
+            }
             continue;
         }
         if is_image(pipeline) {
@@ -975,14 +993,13 @@ fn journey_of(rec: &Records, runners: &[RunnerSeen], now: i64) -> Journey {
         } else {
             leg.attempts.iter().map(|a| attempt_of(&a.status, a.conclusion.as_deref(), a.class.as_deref())).collect()
         };
-        // A leg names its job and run once it has run (Output streams that job's log).
-        let ran = !matches!(leg.status.as_str(), "queued" | "waiting" | "pending" | "blocked" | "skipped");
         let l = Leg { name: leg.name.clone(), attempts, note: leg.error.clone().unwrap_or_default(), job: ran.then(|| leg.job.clone()), run: ran.then(|| leg.run_id.clone()), start: leg.started, end: leg.finished };
         match checks.iter_mut().find(|c| c.pipeline == pipeline) {
             Some(c) => c.legs.push(l),
             None => checks.push(Check { pipeline: pipeline.to_string(), legs: vec![l] }),
         }
     }
+    let platforms: Vec<Platform> = releases.into_iter().map(|(_, p)| p).collect();
     // The image: an image the commit's runs pushed; else what its image pipeline's job says; else
     // under way while a release (the engine's, which pushes it) builds; else nothing built it.
     let release_running = platforms.iter().any(|p| matches!(p.state, Part::Queued | Part::Running));
@@ -1326,6 +1343,27 @@ fn leg_json(l: &journey::Leg) -> Value {
     v
 }
 
+/// A platform of the build as the detail shows it, as a leg is: `job`, `run` and its times only
+/// once it has them (optional new fields; its Output and its lane, W26-R23).
+fn platform_json(p: &journey::Platform, state: &str) -> Value {
+    let mut v = json!({ "name": p.name, "state": state });
+    if let Some(o) = v.as_object_mut() {
+        if let Some(job) = &p.job {
+            o.insert("job".into(), json!(job));
+        }
+        if let Some(run) = &p.run {
+            o.insert("run".into(), json!(run));
+        }
+        if let Some(start) = p.start {
+            o.insert("start".into(), json!(start));
+        }
+        if let Some(end) = p.end {
+            o.insert("end".into(), json!(end));
+        }
+    }
+    v
+}
+
 /// What a person can do to one of a commit's jobs from its row (docs/ci.md W26-R21, R22), through
 /// `POST /api/ship/jobs`: each verb that applies now, and why each other doesn't, as that endpoint
 /// would answer. Another provider's job is that provider's: none applies here.
@@ -1405,7 +1443,7 @@ fn detail(rec: &Records, runners: &[RunnerSeen], now: i64, viewer: Option<&HashS
         Part::NotYet => "none",
     };
     let build = json!({
-        "platforms": j.build.platforms.iter().map(|p| json!({ "name": p.name, "state": part(p.state) })).collect::<Vec<_>>(),
+        "platforms": j.build.platforms.iter().map(|p| platform_json(p, part(p.state))).collect::<Vec<_>>(),
         "image": { "state": part(j.build.image), "digest": rec.images.last() },
     });
     let deployments: Vec<Value> = rec.own.iter().map(|d| json!({ "environment": d.environment, "production": d.production, "state": d.state, "description": d.description, "at": d.at })).collect();
@@ -2405,6 +2443,40 @@ mod tests {
             let two = get_in(&store, "hyper-light/kiln", C2, None, Vec::new(), &[], now).await.map_err(|(_, m)| anyhow::anyhow!(m))?;
             assert_eq!((pip(&two, "checks"), pip(&two, "build"), field(&two, &["build", "image", "state"]).and_then(Value::as_str)), ("passed".into(), "none".into(), Some("none")));
             assert_eq!((text(&two, "stand"), text(&two, "line")), ("waiting".into(), "Checks passed".into()));
+            Ok(())
+        })
+    }
+
+    /// W26-R23: a release run again (production's 4ecf691f7e had three) leaves each platform one
+    /// lane, as the newest run that builds it has it: the job and run its Output streams once it
+    /// has run, and the times its lane draws. A platform the newer run doesn't build stays as the
+    /// older run built it.
+    #[test]
+    fn w26_r23_a_platform_is_one_lane_as_its_newest_release_run_has_it() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let store = crate::store::Store::open(&dir.path().join("kiln.db"))?;
+        crate::rt::block_on(async move {
+            let mut sql = production_fixture();
+            sql += &format!(
+                "INSERT INTO runs (id, repo_id, number, pipeline, event, branch, sha, message, author, status, created_at) VALUES ('release2', 'kiln', 1430, 'release', 'push', 'main', '{C1}', 'again', 'user.email', 'running', {});",
+                NOW_S + 3000
+            );
+            sql += &format!(
+                "INSERT INTO jobs (id, run_id, key, display, status, labels, needs, spec, started_at) VALUES ('r2a', 'release2', 'linux', 'Linux (x86-64, ARM64)', 'running', '[]', '[]', '{{}}', {});",
+                NOW_S + 3100
+            );
+            sql += "INSERT INTO jobs (id, run_id, key, display, status, labels, needs, spec) VALUES ('r2b', 'release2', 'macos', 'macOS (ARM64), on a Mac', 'queued', '[]', '[]', '{}');";
+            store.call(move |c| Ok(c.execute_batch(&sql)?)).await?;
+            let one = get_in(&store, "hyper-light/kiln", C1, None, Vec::new(), &[], (NOW_S + 4000) * 1000).await.map_err(|(_, m)| anyhow::anyhow!(m))?;
+            let platforms = field(&one, &["build", "platforms"]).and_then(Value::as_array).cloned().unwrap_or_default();
+            assert_eq!(
+                platforms,
+                vec![
+                    json!({ "name": "Linux (x86-64, ARM64)", "state": "running", "job": "r2a", "run": "release2", "start": NOW_S + 3100 }),
+                    json!({ "name": "macOS (ARM64), on a Mac", "state": "queued" }),
+                    json!({ "name": "Windows (x86-64, cross-built)", "state": "passed", "job": "j9", "run": "release", "start": NOW_S + 292, "end": NOW_S + 855 }),
+                ]
+            );
             Ok(())
         })
     }
