@@ -1,0 +1,27 @@
+W29-R23 GitHub lockfile format fixture
+
+github-v003.lock uses synthetic repository IDs and commit hashes. Its exact bytes were
+compared with the unmodified marshalDeterministic function and generated header from:
+  github/gh-actions-lock 113f91d77e0af03838b6ae3bef0e038cbab4c696
+  internal/lockfile/state_marshal.go and internal/lockfile/state.go
+
+The official parser at github/actions-lockfile go/v0.0.6, peeled commit
+ac158834765237ee94c36606cfc7d87316aa49ab, also accepts those bytes.
+Both upstream projects use the MIT license. No upstream executable code is vendored here.
+
+The source graph has direct workflow root acme/build@main and nested leaves
+acme/leaf@don't and zeta/leaf@v1, plus an onboarded workflow with no actions.
+The apostrophe exercises scalar quoting; unordered input exercises key and edge sorting.
+
+Measured official parser compatibility cases in the Rust tests:
+  quoted numeric owner ID: refused
+  hexadecimal owner ID 0x1: refused
+  legacy octal owner ID 010: accepted as 8
+  unquoted ref true: accepted as string true
+  unquoted ref 1.0: accepted as string 1.0
+  numeric workflow key 123: accepted as string 123
+  null workflow dependency list: accepted as empty
+
+Evidence: kiln MCP runs r90 and r92, 2026-11-02. The offline verifier used Go,
+the pinned official parser package and exact upstream serializer, with source facts
+supplied in memory. It did not contact a forge or create a repository.
