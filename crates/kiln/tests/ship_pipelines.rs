@@ -358,9 +358,11 @@ fn w29_r04_the_pane() -> anyhow::Result<()> {
     for (path, own) in [(".github/actions/setup/action.yml", "Steps"), (".github/actions/comment/action.yml", "Runs on Node (node24)"), (".github/actions/image/action.yml", "Image"), (".kiln/actions/fuzz/action.yml", "Firecracker microVM"), (".kiln/actions/sandbox/action.yml", "Shards microVM")] {
         let (st, p) = pane(&s, &s.admin, path, None)?;
         anyhow::ensure!(st == 200, "{path}'s pane: {st} {p}");
-        assert_eq!(group_names(&p), ["Inputs", "Outputs", own, "Versions", "Used by", "Settings"], "{path}");
+        // Outputs only where it has some (pl-5); the tip by its commit.
+        let want: Vec<&str> = if path.contains("/setup/") { vec!["Inputs", "Outputs", own, "Versions", "Used by", "Settings"] } else { vec!["Inputs", own, "Versions", "Used by", "Settings"] };
+        assert_eq!(group_names(&p), want, "{path}");
         let versions: Vec<&str> = group(&p, "Versions").iter().map(|l| field(l, "name")).collect();
-        assert_eq!(versions, ["the default branch's tip", "v1.0.0"], "{path}");
+        assert_eq!(versions, [head.get(..7).unwrap_or_default(), "v1.0.0"], "{path}");
     }
     let (_, fuzz) = pane(&s, &s.admin, ".kiln/actions/fuzz/action.yml", None)?;
     let vm: Vec<String> = group(&fuzz, "Firecracker microVM").iter().map(|l| format!("{}: {}", field(l, "name"), field(l, "value"))).collect();
@@ -595,7 +597,7 @@ fn w29_r17_access_and_used_by_in_ship() -> anyhow::Result<()> {
     anyhow::ensure!(st == 200, "the action's pane: {st} {action}");
     let used: Vec<(&str, &str)> = group(&action, "Used by").iter().map(|l| (field(l, "name"), field(l, "value"))).collect();
     assert_eq!(used.len(), 1, "{action}");
-    assert!(used.first().is_some_and(|(repo, v)| *repo == "acme/app" && v.starts_with("v1.0.0 · ")), "{used:?}");
+    assert!(used.first().is_some_and(|(repo, v)| *repo == "acme/app" && v.ends_with("v1.0.0")), "{used:?}");
     let access: Vec<(&str, &str, &str)> = group(&action, "Settings").iter().filter(|l| field(l, "key") == "settings.access").map(|l| (field(l, "name"), field(l, "value"), field(l, "state"))).collect();
     assert_eq!(access, [("Access", "shared with acme's repositories", "owner")], "{action}");
 

@@ -10,7 +10,7 @@
 import type http from "node:http";
 import { parse, parseDocument } from "yaml";
 import type { ShipPipelineDraft, ShipPipelineGroup, ShipPipelineLine, ShipPipelinePane, ShipPipelineRepo, ShipPipelineRow, ShipPipelineVerb, ShipPipelines } from "../src/api/ship.ts";
-import { FILES, JOB_SECS, RUNS, SET_IN, TAGS, UPDATES, USED_BY } from "./pipelines-files.ts";
+import { ADDED, FILES, JOB_SECS, RUNS, SET_IN, TAG_AGO, TAGS, UPDATES, USED_BY } from "./pipelines-files.ts";
 // The pane's words as the server words them: the UI's own, so the mock and the typed text agree.
 import { triggerLines } from "../src/lib/triggers.ts";
 import { jobLine, spanWords } from "../src/lib/typed-groups.ts";
@@ -482,31 +482,47 @@ function workflowGroups(key: string, text: string, kiln: boolean, runsHere: bool
   return out;
 }
 
-const usedByLines = (used: { repo: string; ref: string; sha: string; runs: number }[]): ShipPipelineLine[] =>
-  used.map((c) => ({ key: `used_by.${c.repo}@${c.ref}`, kind: "consumer", name: c.repo, value: `${c.ref} · ${c.sha} · ${c.runs === 1 ? "1 run" : `${c.runs} runs`}` }));
+/** Used by's lines as the server words them (pl-5): each repository by its workflows and version, flagged where that's behind the newest. */
+const usedByLines = (used: { repo: string; ref: string; sha: string; runs: number; workflows?: string[] }[], newest?: string): ShipPipelineLine[] =>
+  used.map((c) => ({
+    key: `used_by.${c.repo}@${c.ref}`,
+    kind: "consumer",
+    name: c.repo,
+    value: c.workflows?.length ? `${c.workflows.join(", ")} · ${c.ref}` : c.ref,
+    ...(newest && c.ref !== newest && /^v?\d+\.\d+\.\d+$/.test(c.ref) ? { state: "flag" } : {}),
+  }));
 
 function actionGroups(repo: string, key: string, text: string, kind: string, head: string): ShipPipelineGroup[] {
   const doc = yamlOf(text);
+  // Its newest release, and how many commits since (pl-5's `3 commits since v2.4.0`).
+  const newest = (TAGS[repo] ?? []).map(([t]) => t).find((t) => /^v?\d+\.\d+\.\d+$/.test(t));
+  const since = SINCE[key]?.length ?? 0;
   const runs = obj(doc.runs);
   const out: ShipPipelineGroup[] = [
     {
       name: "Inputs",
+      // As the server words them (pl-5): what each takes when it isn't given, one added since the newest release saying so.
       lines: Object.entries(obj(doc.inputs)).map(([n, i]) => {
         const o = obj(i);
-        const v = o.required === true ? "required" : o.default !== undefined ? `default ${String(o.default)}` : "optional";
-        return { key: `inputs.${n}`, kind: "input", name: n, value: o.description ? `${v} · ${String(o.description)}` : v };
+        const added = (ADDED[key] ?? []).includes(n);
+        const unless = o.description ? /;\s*(.+?) when not given$/.exec(String(o.description))?.[1] : undefined;
+        const v = added && newest ? `new since ${newest}` : o.required === true ? "required" : o.default !== undefined ? String(o.default) : (unless ?? "optional");
+        return { key: `inputs.${n}`, kind: "input", name: n, value: v, ...(added ? { state: "added" } : {}) };
       }),
     },
-    { name: "Outputs", lines: Object.entries(obj(doc.outputs)).map(([n, o]) => ({ key: `outputs.${n}`, kind: "output", name: n, value: String(obj(o).description ?? "") })) },
+    ...(Object.keys(obj(doc.outputs)).length
+      ? [{ name: "Outputs", lines: Object.entries(obj(doc.outputs)).map(([n, o]) => ({ key: `outputs.${n}`, kind: "output", name: n, value: String(obj(o).description ?? "") })) }]
+      : []),
   ];
   if (kind === "composite")
     out.push({
       name: "Steps",
+      // An action by what it uses and is given, a command by its name and that it runs (pl-5).
       lines: (Array.isArray(runs.steps) ? runs.steps.map(obj) : []).map((s, i) => ({
         key: `runs.steps.${i}`,
         kind: "step",
-        name: String(s.name ?? s.id ?? `step ${i + 1}`),
-        value: String(s.uses ?? String(s.run ?? "").split("\n")[0] ?? ""),
+        name: String(s.uses ?? s.name ?? s.id ?? String(s.run ?? "").split("\n")[0] ?? `step ${i + 1}`),
+        value: s.uses ? Object.values(obj(s.with)).map(String).join(", ") : "run",
       })),
     });
   else if (kind === "javascript")
@@ -542,12 +558,24 @@ function actionGroups(repo: string, key: string, text: string, kind: string, hea
   out.push({
     name: "Versions",
     lines: [
-      { key: "versions.head", kind: "version", name: "the default branch's tip", value: head.slice(0, 12) },
-      ...(TAGS[repo] ?? []).map(([t, sha]) => ({ key: `versions.${t}`, kind: "version", name: t, value: sha.slice(0, 12) })),
+      // The tip by the commits since the newest release; each release by its age and users; a floating tag by what it stands for (pl-5).
+      { key: "versions.head", kind: "version", name: head.slice(0, 7), value: newest ? `${since} commit${since === 1 ? "" : "s"} since ${newest}` : "" },
+      ...(TAGS[repo] ?? []).map(([t, sha]) => {
+        const full = /^v?\d+\.\d+\.\d+/.test(t);
+        const users = new Set((USED_BY[key] ?? []).filter((c) => c.ref === t).map((c) => c.repo)).size;
+        const age = TAG_AGO[`${repo}:${t}`];
+        const stands = (TAGS[repo] ?? []).find(([o, s]) => o !== t && s === sha && /^v?\d+\.\d+\.\d+/.test(o))?.[0];
+        const value = full
+          ? [age === undefined ? null : spanWords(age), users ? `${users} ${users === 1 ? "repository" : "repositories"}` : null].filter(Boolean).join(" · ")
+          : stands
+            ? `the newest ${t}: ${stands}`
+            : sha.slice(0, 7);
+        return { key: `versions.${t}`, kind: "version", name: t, value };
+      }),
     ],
   });
   const used = USED_BY[key];
-  out.push({ name: "Used by", lines: used ? usedByLines(used) : [{ key: "used_by", kind: "note", name: "Who uses it", value: "no other repository's runs have used it yet", state: "none" }] });
+  out.push({ name: "Used by", lines: used ? usedByLines(used, newest) : [{ key: "used_by", kind: "note", name: "Who uses it", value: "no other repository's runs have used it yet", state: "none" }] });
   out.push({ name: "Settings", lines: [{ key: "settings.access", kind: "setting", name: "Access", value: "shared with hyper-light's repositories", state: "owner" }] });
   return out;
 }

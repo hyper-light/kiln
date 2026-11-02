@@ -615,7 +615,8 @@ function firstPick(p: ShipPipelinePane): Key | null {
 function noteOf(g: ShipPipelineGroup, p: ShipPipelinePane): string {
   // Add a trigger is the group's last line, not one of its triggers.
   const n = g.lines.filter((l) => l.kind !== "add").length;
-  const added = g.lines.filter((l) => l.state === "added").length;
+  // What's typed in says how much is new (pl-3); an action's inputs mark theirs on their lines (pl-5).
+  const added = g.name.startsWith("Stage ") || g.name === "Uses" ? g.lines.filter((l) => l.state === "added").length : 0;
   const more = added ? ` · ${added} new` : "";
   if (g.name.startsWith("Stage ")) {
     if (g.name === "Stage 1") return (n === 1 ? "1 job" : `${n} jobs at once`) + more;
@@ -632,7 +633,11 @@ function noteOf(g: ShipPipelineGroup, p: ShipPipelinePane): string {
       return "tags";
     case "Used by":
       return g.lines.some((l) => l.kind === "consumer") ? `${new Set(g.lines.map((l) => l.name)).size} repositories` : "";
+    case "Steps":
+      return `${KIND_WORD[p.head.kind]?.toLowerCase() ?? p.head.kind} · ${n}`;
     case "Settings":
+      // Access is the whole repository's (pl-5's `all of ci-kit`).
+      return g.lines.some((l) => l.key === "settings.access") ? `all of ${p.repo.split("/").pop() ?? p.repo}` : "";
     case "What changes for it":
     case "Upstream":
       return "";
@@ -678,7 +683,10 @@ function wordsOf(l: ShipPipelineLine): { kind: string | null; name: string; valu
     case "use":
       return { kind: sourceOf(l.name, l.value.split(" · ")[0]), name: shortUse(l.name), value: l.value.split(" · ").slice(1).join(" · ") };
     case "version":
-      return { kind: l.key === "versions.head" ? "main" : "tag", name: l.key === "versions.head" ? l.value.slice(0, 7) : l.name, value: l.key === "versions.head" ? "" : l.value.slice(0, 7) };
+      return { kind: l.key === "versions.head" ? "main" : "tag", name: l.name, value: l.value };
+    case "step":
+      // Numbered, as pl-5 draws them.
+      return { kind: String(Number(l.key.split(".").pop() ?? "0") + 1), name: l.name, value: l.value };
     case "run":
       // A push is what most runs are: other events say so (pl-8's DEPLOY, SCHEDULE, COMMENT).
       return { kind: l.note && l.note !== "push" ? l.note.replace(/_/g, " ") : null, name: l.name, value: l.value };
@@ -689,7 +697,6 @@ function wordsOf(l: ShipPipelineLine): { kind: string | null; name: string; valu
     case "variable":
     case "input":
     case "output":
-    case "step":
     case "image":
     case "entry":
       return { kind: l.kind, name: l.name, value: l.value };
@@ -700,7 +707,12 @@ function wordsOf(l: ShipPipelineLine): { kind: string | null; name: string; valu
 
 /** A line's glyph: its own state where it has one; a setting off or a note as not yet; the rest as there. */
 const glyphFor = (l: ShipPipelineLine): string =>
-  l.state ?? (l.kind === "version" && l.key !== "versions.head" ? "tag" : l.kind === "note" || (l.kind === "setting" && l.key !== "settings.on") ? "none" : "passed");
+  // Access shared is as it should be (pl-5's ✓); not shared, not yet.
+  l.key === "settings.access"
+    ? l.state === "none"
+      ? "none"
+      : "passed"
+    : (l.state ?? (l.kind === "version" && l.key !== "versions.head" ? "tag" : l.kind === "note" || (l.kind === "setting" && l.key !== "settings.on") ? "none" : "passed"));
 
 /** What a picked line's detail shows (W29-R04): a job's YAML · Plan · Last run, a trigger's Times or Filters, a use's own, a run's jobs; an action's Changes · YAML · Try it. */
 function viewsFor(p: ShipPipelinePane, l: ShipPipelineLine | null): string[] {
@@ -851,7 +863,14 @@ function PipelinePane({ repo, row, onChanged }: { repo: ShipPipelineRepo; row: S
     const n = (k: number, one: string, many: string) => `${k === 1 ? "its" : `its ${k}`} ${k === 1 ? one : many}`;
     return [actions ? n(actions, "action", "actions") : "", calls ? n(calls, "workflow", "workflows") : ""].filter(Boolean).join(" and ") || "its files";
   })();
-  const where = [h.path, h.dialect ? `${DIALECT_WORD[h.dialect] ?? h.dialect} dialect` : `${KIND_WORD[h.kind] ?? h.kind} action`, h.ref, h.commit.slice(0, 7)].filter(Boolean).join(" · ");
+  // Its repository and path, then a workflow's dialect, ref and commit (`from main` while it's typed in, pl-3), or an action's kind (pl-5).
+  const where = (
+    h.dialect
+      ? [repo.repo, h.path, changed && !h.draft ? null : `${DIALECT_WORD[h.dialect] ?? h.dialect} dialect`, changed && !h.draft ? `from ${h.ref}` : h.ref, h.commit.slice(0, 7)]
+      : [repo.repo, h.path, `${(KIND_WORD[h.kind] ?? h.kind).toLowerCase()} action`]
+  )
+    .filter(Boolean)
+    .join(" · ");
   const act = async (body: Omit<ShipPipelineAct, "repo" | "path">, done: React.ReactNode): Promise<boolean> => {
     setBusy(true);
     setRelease(null);

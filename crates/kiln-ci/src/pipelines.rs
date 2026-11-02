@@ -967,6 +967,21 @@ pub struct Seen {
     /// By name: `repository`, `organization`, `server`.
     pub set_in: HashMap<String, String>,
     pub now: i64,
+    /// A reusable workflow's newest release, against which its Used by marks who's behind.
+    pub newest: Option<String>,
+}
+
+/// What kiln has seen of an action beyond its text, for its lines' words as pl-5 has them: when
+/// each tag was made, its newest release and the commits since, and the inputs added since.
+#[derive(Debug, Clone, Default)]
+pub struct ActionSeen {
+    /// Seconds, by tag.
+    pub tag_at: HashMap<String, i64>,
+    /// Its newest release, and how many commits to its files came after it.
+    pub since: Option<(String, usize)>,
+    /// The inputs added since its newest release.
+    pub added: Vec<String>,
+    pub now: i64,
 }
 
 /// A span in its largest unit, as the stills say it: `40s`, `18m`, `2h`, `3d`, `3w`.
@@ -1144,7 +1159,7 @@ pub fn workflow_groups(w: &Workflow, text: &str, runs: &[RunSeen], runs_here: bo
     out.push(group("Runs", runs_lines));
     let shared = sharing.filter(|_| w.trigger("workflow_call").is_some());
     if let Some(s) = shared {
-        out.push(group("Used by", s.used_by_lines()));
+        out.push(group("Used by", s.used_by_lines(seen.newest.as_deref())));
     }
     let mut settings = vec![if runs_here { Line::new("settings.on", "setting", "Turned on", "runs on its triggers") } else { Line::new("settings.on", "setting", "Not run here", note) }];
     settings.push(Line::new("settings.machines", "setting", "Machines", "bare metal unless a job says"));
@@ -1168,15 +1183,19 @@ pub struct Sharing<'a> {
 
 impl Sharing<'_> {
     /// Used by's lines: each repository and version, newest first; a note when there's none.
-    fn used_by_lines(&self) -> Vec<Line> {
+    /// Used by's lines, as pl-5: each repository by its workflows and the version they use, marked
+    /// where that's behind `newest`; a note when there's none.
+    fn used_by_lines(&self, newest: Option<&str>) -> Vec<Line> {
         if self.used_by.is_empty() {
             return vec![Line::new("used_by", "note", "Who uses it", "no other repository's runs have used it yet").state("none")];
         }
         self.used_by
             .iter()
             .map(|c| {
-                let runs = if c.runs == 1 { "1 run".to_owned() } else { format!("{} runs", c.runs) };
-                Line::new(format!("used_by.{}@{}", c.repo, c.git_ref), "consumer", c.repo.clone(), format!("{} · {} · {runs}", c.git_ref, c.sha.get(..12).unwrap_or(&c.sha)))
+                let value = if c.workflows.is_empty() { c.git_ref.clone() } else { format!("{} · {}", c.workflows.join(", "), c.git_ref) };
+                let behind = newest.is_some_and(|n| full_version(&c.git_ref).is_some() && c.git_ref != n && newest_release([c.git_ref.as_str(), n]) == Some(n));
+                let l = Line::new(format!("used_by.{}@{}", c.repo, c.git_ref), "consumer", c.repo.clone(), value);
+                if behind { l.state("flag") } else { l }
             })
             .collect()
     }
@@ -1218,21 +1237,30 @@ fn yaml_scalar(v: &serde_yaml::Value) -> Option<String> {
 /// JavaScript action's entry points, a Docker action's image, a microVM's image, resources and
 /// egress), its Versions (`tags`: newest first, each with its commit), and what sharing says:
 /// Used by, and its Access in Settings (W29-R17, R20).
-pub fn action_groups(a: &Action, kind: Kind, text: &str, head: &str, tags: &[(String, String)], sharing: &Sharing<'_>) -> Vec<PaneGroup> {
+pub fn action_groups(a: &Action, kind: Kind, text: &str, head: &str, tags: &[(String, String)], sharing: &Sharing<'_>, seen: &ActionSeen) -> Vec<PaneGroup> {
     let mut out = Vec::new();
+    // Each input by what it takes when it isn't given (pl-5): its default, what its description
+    // says applies (`…; rust-toolchain.toml's when not given`), or that it's required; one added
+    // since the newest release says so.
     let inputs = a
         .inputs
         .iter()
         .map(|i| {
-            let mut v = if i.required { "required".to_owned() } else { i.default.as_ref().map_or_else(|| "optional".to_owned(), |d| format!("default {}", d.src)) };
-            if let Some(d) = i.description.as_deref().map(str::trim).filter(|d| !d.is_empty()) {
-                v.push_str(&format!(" · {d}"));
-            }
-            Line::new(format!("inputs.{}", i.name), "input", i.name.clone(), v)
+            let added = seen.added.iter().any(|n| n == &i.name);
+            let unless = || i.description.as_deref().and_then(|d| d.rsplit(';').next()).map(str::trim).and_then(|d| d.strip_suffix(" when not given")).map(str::to_owned);
+            let v = match (added, &seen.since) {
+                (true, Some((tag, _))) => format!("new since {tag}"),
+                _ if i.required => "required".to_owned(),
+                _ => i.default.as_ref().map(|d| d.src.clone()).or_else(unless).unwrap_or_else(|| "optional".to_owned()),
+            };
+            let l = Line::new(format!("inputs.{}", i.name), "input", i.name.clone(), v);
+            if added { l.state("added") } else { l }
         })
         .collect();
     out.push(group("Inputs", inputs));
-    out.push(group("Outputs", a.outputs.iter().map(|o| Line::new(format!("outputs.{}", o.name), "output", o.name.clone(), o.description.clone().unwrap_or_default())).collect()));
+    if !a.outputs.is_empty() {
+        out.push(group("Outputs", a.outputs.iter().map(|o| Line::new(format!("outputs.{}", o.name), "output", o.name.clone(), o.description.clone().unwrap_or_default())).collect()));
+    }
     let r = &a.runs;
     match kind {
         Kind::Composite => {
@@ -1241,8 +1269,10 @@ pub fn action_groups(a: &Action, kind: Kind, text: &str, head: &str, tags: &[(St
                 .iter()
                 .enumerate()
                 .map(|(i, st)| {
-                    let name = st.name.as_ref().map(|n| n.src.clone()).or_else(|| st.id.clone()).unwrap_or_else(|| format!("step {}", i + 1));
-                    let value = st.uses.clone().or_else(|| st.run.as_ref().map(|x| x.src.lines().next().unwrap_or_default().to_owned())).unwrap_or_default();
+                    // As pl-5: an action by what it uses and what it's given (`kiln/cache@v1 ·
+                    // ~/.cargo, target`), a command by its name and that it runs.
+                    let name = st.uses.clone().or_else(|| st.name.as_ref().map(|n| n.src.clone())).or_else(|| st.id.clone()).or_else(|| st.run.as_ref().map(|x| x.src.lines().next().unwrap_or_default().to_owned())).unwrap_or_else(|| format!("step {}", i + 1));
+                    let value = if st.uses.is_some() { st.with.iter().filter_map(|(_, v)| yval_words(v)).collect::<Vec<_>>().join(", ") } else { "run".to_owned() };
                     Line::new(format!("runs.steps.{i}"), "step", name, value)
                 })
                 .collect();
@@ -1269,10 +1299,35 @@ pub fn action_groups(a: &Action, kind: Kind, text: &str, head: &str, tags: &[(St
         }
         Kind::Workflow | Kind::Reusable | Kind::Unknown => {}
     }
-    let mut versions = vec![Line::new("versions.head", "version", "the default branch's tip", head.get(..12).unwrap_or(head))];
-    versions.extend(tags.iter().map(|(t, sha)| Line::new(format!("versions.{t}"), "version", t.clone(), sha.get(..12).unwrap_or(sha))));
+    // As pl-5: the tip by how far it's come since the newest release; each release by its age and
+    // the repositories that use it; a floating tag by the release it stands for.
+    let since = match &seen.since {
+        Some((tag, 0)) => format!("as {tag}"),
+        Some((tag, 1)) => format!("1 commit since {tag}"),
+        Some((tag, n)) => format!("{n} commits since {tag}"),
+        None => String::new(),
+    };
+    let mut versions = vec![Line::new("versions.head", "version", head.get(..7).unwrap_or(head), since)];
+    let newest = seen.since.as_ref().map(|(t, _)| t.as_str());
+    versions.extend(tags.iter().map(|(t, sha)| {
+        let value = match crate::releases::kind_of(t) {
+            crate::releases::TagKind::Full => {
+                let users = sharing.used_by.iter().filter(|c| &c.git_ref == t).map(|c| c.repo.as_str()).collect::<std::collections::HashSet<_>>().len();
+                let age = seen.tag_at.get(t).filter(|_| seen.now > 0).map(|at| span_words(seen.now - at));
+                let users = match users {
+                    0 => None,
+                    1 => Some("1 repository".to_owned()),
+                    n => Some(format!("{n} repositories")),
+                };
+                [age, users].into_iter().flatten().collect::<Vec<_>>().join(" · ")
+            }
+            crate::releases::TagKind::Floating => tags.iter().find(|(o, s)| o != t && s == sha && crate::releases::kind_of(o) == crate::releases::TagKind::Full).map_or_else(|| sha.get(..7).unwrap_or(sha).to_owned(), |(o, _)| format!("the newest {t}: {o}")),
+            crate::releases::TagKind::Other => sha.get(..7).unwrap_or(sha).to_owned(),
+        };
+        Line::new(format!("versions.{t}"), "version", t.clone(), value)
+    }));
     out.push(group("Versions", versions));
-    out.push(group("Used by", sharing.used_by_lines()));
+    out.push(group("Used by", sharing.used_by_lines(newest)));
     out.push(group("Settings", vec![sharing.access_line()]));
     out
 }
@@ -1742,7 +1797,7 @@ mod tests {
     #[test]
     fn w29_r04_an_actions_groups_by_kind() {
         let cases = [
-            ("name: setup\ninputs:\n  toolchain:\n    description: Which toolchain\n    required: true\n  cache:\n    default: 'true'\noutputs:\n  path:\n    description: Where it went\nruns:\n  using: composite\n  steps:\n    - name: Install\n      run: echo installing\n      shell: bash\n    - uses: actions/cache@v4\n", Kind::Composite, "Steps", vec!["Install: echo installing", "step 2: actions/cache@v4"]),
+            ("name: setup\ninputs:\n  toolchain:\n    description: Which toolchain\n    required: true\n  cache:\n    default: 'true'\noutputs:\n  path:\n    description: Where it went\nruns:\n  using: composite\n  steps:\n    - name: Install\n      run: echo installing\n      shell: bash\n    - uses: actions/cache@v4\n", Kind::Composite, "Steps", vec!["Install: run", "actions/cache@v4: "]),
             ("name: comment\nruns:\n  using: node24\n  main: dist/index.js\n  post: dist/post.js\n", Kind::Javascript, "Runs on Node (node24)", vec!["main: dist/index.js", "post: dist/post.js"]),
             ("name: image\nruns:\n  using: docker\n  image: Dockerfile\n  entrypoint: /entry.sh\n  args: [--fast]\n", Kind::Docker, "Image", vec!["image: Dockerfile", "entrypoint: /entry.sh", "args: --fast"]),
             ("name: fuzz\nruns:\n  using: firecracker\n  image: docker://alpine:3.20\n  resources:\n    cpus: 2\n    memory: 4g\n  egress: [crates.io, static.rust-lang.org]\n", Kind::Firecracker, "Firecracker microVM", vec!["image: docker://alpine:3.20", "resources: cpus 2, memory 4g", "egress: crates.io, static.rust-lang.org"]),
@@ -1753,18 +1808,42 @@ mod tests {
             let (a, _) = crate::wf::parse_action(text);
             let a = a.unwrap_or_default();
             assert_eq!(Kind::of_action(&a), kind, "{text}");
-            let groups = action_groups(&a, kind, text, "a3f2c1d4e5f60718", &tags, &Sharing { repo: "acme/kit", access: Access::None, used_by: &[] });
+            let groups = action_groups(&a, kind, text, "a3f2c1d4e5f60718", &tags, &Sharing { repo: "acme/kit", access: Access::None, used_by: &[] }, &ActionSeen::default());
             let names: Vec<&str> = groups.iter().map(|g| g.name.as_str()).collect();
-            assert_eq!(names, ["Inputs", "Outputs", own, "Versions", "Used by", "Settings"], "{kind:?}");
+            // Outputs only where it has some (pl-5 has none).
+            let want_names: Vec<&str> = if text.contains("outputs:") { vec!["Inputs", "Outputs", own, "Versions", "Used by", "Settings"] } else { vec!["Inputs", own, "Versions", "Used by", "Settings"] };
+            assert_eq!(names, want_names, "{kind:?}");
             let lines: Vec<String> = groups.iter().find(|g| g.name == own).map(|g| g.lines.iter().map(|l| format!("{}: {}", l.name, l.value)).collect()).unwrap_or_default();
             assert_eq!(lines, want, "{kind:?}");
             let versions: Vec<String> = groups.iter().find(|g| g.name == "Versions").map(|g| g.lines.iter().map(|l| l.name.clone()).collect()).unwrap_or_default();
-            assert_eq!(versions, ["the default branch's tip", "v2.4.0"]);
+            assert_eq!(versions, ["a3f2c1d", "v2.4.0"]);
         }
         let (a, _) = crate::wf::parse_action(cases_text());
-        let groups = action_groups(&a.unwrap_or_default(), Kind::Composite, cases_text(), "a3f2", &[], &Sharing { repo: "acme/kit", access: Access::None, used_by: &[] });
+        let groups = action_groups(&a.unwrap_or_default(), Kind::Composite, cases_text(), "a3f2", &[], &Sharing { repo: "acme/kit", access: Access::None, used_by: &[] }, &ActionSeen::default());
         let inputs: Vec<String> = groups.iter().find(|g| g.name == "Inputs").map(|g| g.lines.iter().map(|l| format!("{}: {}", l.name, l.value)).collect()).unwrap_or_default();
-        assert_eq!(inputs, ["toolchain: required · Which toolchain", "cache: default true"]);
+        assert_eq!(inputs, ["toolchain: required", "cache: true"]);
+    }
+
+    /// pl-5's lines: inputs by what they take when not given, one added since the newest release
+    /// saying so; steps by what they use and are given; the tip by the commits since the newest
+    /// release, each release by its age and users, the floating tag by what it stands for; Used by
+    /// with its workflows, marked where it's behind.
+    #[test]
+    fn w29_r04_an_actions_lines_as_pl_5_says_them() {
+        let text = "name: setup-rust\ninputs:\n  toolchain:\n    description: the toolchain; rust-toolchain.toml's when not given\n    required: false\n  components:\n    default: clippy, rustfmt\n  targets:\n    required: false\nruns:\n  using: composite\n  steps:\n    - uses: kiln/cache@v1\n      with: { path: \"~/.cargo, target\" }\n    - name: rustup toolchain install\n      run: rustup toolchain install\n      shell: bash\n";
+        let (a, _) = crate::wf::parse_action(text);
+        let tags = vec![("v2.4.0".to_owned(), "7ac3e1d".to_owned()), ("v2.3.0".to_owned(), "5b2c9e1".to_owned()), ("v2".to_owned(), "7ac3e1d".to_owned())];
+        let consumer = |repo: &str, workflows: &[&str], r: &str| crate::catalog::Consumer { repo: repo.into(), git_ref: r.into(), workflows: workflows.iter().map(|w| (*w).to_owned()).collect(), ..crate::catalog::Consumer::default() };
+        let used = [consumer("hyper-light/kiln", &["ci", "release"], "v2.3.0"), consumer("hyper-light/quiver", &["ci"], "v2.4.0")];
+        let day = 86_400;
+        let seen = ActionSeen { tag_at: [("v2.4.0".to_owned(), 0), ("v2.3.0".to_owned(), -18 * day)].into(), since: Some(("v2.4.0".to_owned(), 3)), added: vec!["targets".into()], now: 3 * day };
+        let groups = action_groups(&a.unwrap_or_default(), Kind::Composite, text, "e41a9c2b7d6e", &tags, &Sharing { repo: "hyper-light/ci-kit", access: Access::Owner, used_by: &used }, &seen);
+        let said = |n: &str| groups.iter().find(|g| g.name == n).map(|g| g.lines.iter().map(|l| (format!("{}: {}", l.name, l.value), l.state)).collect::<Vec<_>>()).unwrap_or_default();
+        assert_eq!(said("Inputs"), [("toolchain: rust-toolchain.toml's".to_owned(), None), ("components: clippy, rustfmt".into(), None), ("targets: new since v2.4.0".into(), Some("added"))]);
+        assert_eq!(said("Steps"), [("kiln/cache@v1: ~/.cargo, target".to_owned(), None), ("rustup toolchain install: run".into(), None)]);
+        assert_eq!(said("Versions").into_iter().map(|(l, _)| l).collect::<Vec<_>>(), ["e41a9c2: 3 commits since v2.4.0", "v2.4.0: 3d · 1 repository", "v2.3.0: 3w · 1 repository", "v2: the newest v2: v2.4.0"]);
+        assert_eq!(said("Used by"), [("hyper-light/kiln: ci, release · v2.3.0".to_owned(), Some("flag")), ("hyper-light/quiver: ci · v2.4.0".into(), None)]);
+        assert!(groups.iter().all(|g| g.name != "Outputs"), "no Outputs group without outputs");
     }
 
     /// W29-R17, R20: a shared repository's head says its access and its heading says shared; an
@@ -1772,17 +1851,17 @@ mod tests {
     /// workflow that isn't called has neither.
     #[test]
     fn w29_r17_access_and_used_by_in_panes() {
-        let used = [crate::catalog::Consumer { repo: "acme/app".into(), path: ".github/actions/setup".into(), kind: "action".into(), git_ref: "v1".into(), sha: "0123456789abcdef0123".into(), runs: 3, last_at: 9 }];
+        let used = [crate::catalog::Consumer { repo: "acme/app".into(), path: ".github/actions/setup".into(), kind: "action".into(), git_ref: "v1".into(), sha: "0123456789abcdef0123".into(), runs: 3, last_at: 9, workflows: vec!["ci".into()] }];
         let sharing = Sharing { repo: "acme/kit", access: Access::Owner, used_by: &used };
         let (a, _) = crate::wf::parse_action(cases_text());
-        let groups = action_groups(&a.unwrap_or_default(), Kind::Composite, cases_text(), "a3f2", &[], &sharing);
+        let groups = action_groups(&a.unwrap_or_default(), Kind::Composite, cases_text(), "a3f2", &[], &sharing, &ActionSeen::default());
         let lines = |groups: &[PaneGroup], n: &str| groups.iter().find(|g| g.name == n).map(|g| g.lines.clone()).unwrap_or_default();
         let by: Vec<(String, String)> = lines(&groups, "Used by").iter().map(|l| (l.name.clone(), l.value.clone())).collect();
-        assert_eq!(by, [("acme/app".to_owned(), "v1 · 0123456789ab · 3 runs".to_owned())]);
+        assert_eq!(by, [("acme/app".to_owned(), "ci · v1".to_owned())]);
         let access = lines(&groups, "Settings").into_iter().find(|l| l.key == "settings.access").map(|l| (l.value, l.state));
         assert_eq!(access, Some(("shared with acme's repositories".to_owned(), Some("owner"))));
         let none = Sharing { repo: "acme/kit", access: Access::None, used_by: &[] };
-        let groups = action_groups(&Action::default(), Kind::Composite, "", "a3f2", &[], &none);
+        let groups = action_groups(&Action::default(), Kind::Composite, "", "a3f2", &[], &none, &ActionSeen::default());
         assert_eq!(lines(&groups, "Used by").first().map(|l| (l.kind, l.state)), Some(("note", Some("none"))));
         assert_eq!(lines(&groups, "Settings").first().map(|l| l.state), Some(Some("none")));
 

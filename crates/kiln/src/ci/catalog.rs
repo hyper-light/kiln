@@ -208,12 +208,19 @@ pub(crate) async fn consumers(hub: &Hub, full: &str, path: Option<&str>) -> anyh
     let (publisher, path) = (full.to_ascii_lowercase(), path.map(str::to_owned));
     hub.store
         .call(move |c| {
+            // With the workflows whose runs used it, by name (Ship's Used by, W29-R20).
             let mut st = c.prepare(
-                "SELECT p.name, u.path, u.kind, u.git_ref, u.sha, COUNT(*), MAX(u.at) FROM ci_uses u JOIN repos p ON p.id = u.repo_id \
+                "SELECT p.name, u.path, u.kind, u.git_ref, u.sha, COUNT(*), MAX(u.at), group_concat(DISTINCT w.path) FROM ci_uses u JOIN repos p ON p.id = u.repo_id \
+                 LEFT JOIN runs r ON r.id = u.run_id LEFT JOIN ci_workflows w ON w.id = r.workflow_id \
                  WHERE u.publisher = ?1 AND (?2 IS NULL OR u.path = ?2) GROUP BY u.repo_id, u.path, u.git_ref, u.sha ORDER BY MAX(u.at) DESC LIMIT 200",
             )?;
+            let stem = |p: &str| p.rsplit('/').next().map(|n| n.rsplit_once('.').map_or(n, |(s, _)| s)).unwrap_or(p).to_owned();
             let rows = st.query_map(params![publisher, path], |r| {
-                Ok(Consumer { repo: r.get(0)?, path: r.get(1)?, kind: r.get(2)?, git_ref: r.get(3)?, sha: r.get(4)?, runs: r.get(5)?, last_at: r.get(6)? })
+                let workflows: Option<String> = r.get(7)?;
+                let mut workflows: Vec<String> = workflows.map(|w| w.split(',').map(stem).collect()).unwrap_or_default();
+                workflows.sort();
+                workflows.dedup();
+                Ok(Consumer { repo: r.get(0)?, path: r.get(1)?, kind: r.get(2)?, git_ref: r.get(3)?, sha: r.get(4)?, runs: r.get(5)?, last_at: r.get(6)?, workflows })
             })?;
             Ok(rows.collect::<Result<Vec<_>, _>>()?)
         })

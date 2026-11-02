@@ -496,14 +496,28 @@ pub async fn get(hub: &Arc<Hub>, owner: &str, name: &str, q: &HashMap<String, St
     }
     let text = crate::ci::load::blob(hub, &repo, &sha, path).await.map_err(|_| none_there())?;
     let env = Env::read(hub).await;
-    let (row, groups) = match commit.workflows.iter().find(|l| l.path == path) {
+    // What an action or reusable workflow has come to since its newest release: what releasing
+    // it changes, and the commits to its files Release would tag (pl-5).
+    let loaded = commit.workflows.iter().find(|l| l.path == path);
+    let released = loaded.is_none_or(|l| l.workflow.as_ref().is_some_and(|w| Kind::of_workflow(w) == Kind::Reusable));
+    let changes = if released { Some(since_release(hub, &repo, path, &text, &ctx.versions).await) } else { None };
+    let newest = kiln_ci::pipelines::newest_release(ctx.versions.iter().map(|(t, _)| t.as_str())).filter(|_| released).map(str::to_owned);
+    let commits = match &newest {
+        Some(tag) => commits_since(hub, &repo, tag, &sha, path).await,
+        None => Vec::new(),
+    };
+    let (row, groups) = match loaded {
         Some(l) => {
             let row = workflow_row(&repo, l, &ctx, &env, &commit.github_note);
             let runs = runs_list(hub, &repo, &branch, path).await.map_err(internal)?;
             let (access, used) = used_by(hub, &repo, path, false).await;
             let sharing = core::Sharing { repo: &repo.name, access, used_by: &used };
             let groups = match l.workflow.as_ref() {
-                Some(w) => core::workflow_groups(w, &text, &runs, l.runs, &commit.github_note, Some(&sharing), &seen_of(hub, &repo, &branch, path, w).await),
+                Some(w) => {
+                    let mut seen = seen_of(hub, &repo, &branch, path, w).await;
+                    seen.newest.clone_from(&newest);
+                    core::workflow_groups(w, &text, &runs, l.runs, &commit.github_note, Some(&sharing), &seen)
+                }
                 None => Vec::new(),
             };
             (row, groups)
@@ -513,24 +527,30 @@ pub async fn get(hub: &Arc<Hub>, owner: &str, name: &str, q: &HashMap<String, St
             let row = action_row(path, action.as_ref(), &diags, &ctx, &env);
             let (access, used) = used_by(hub, &repo, path, true).await;
             let sharing = core::Sharing { repo: &repo.name, access, used_by: &used };
-            let groups = action.as_ref().map(|a| core::action_groups(a, row.facts.kind, &text, &sha, &ctx.versions, &sharing)).unwrap_or_default();
+            let seen = core::ActionSeen {
+                tag_at: tag_times(hub, &repo, &sha).await,
+                since: newest.clone().map(|t| (t, commits.len())),
+                added: changes.iter().flatten().filter(|c| c.kind == "input" && c.what == "added").map(|c| c.name.clone()).collect(),
+                now: crate::util::now_unix(),
+            };
+            let groups = action.as_ref().map(|a| core::action_groups(a, row.facts.kind, &text, &sha, &ctx.versions, &sharing, &seen)).unwrap_or_default();
             (row, groups)
         }
     };
     let by_hand = runs_by_hand(commit.workflows.iter().find(|l| l.path == path));
-    let changes = if row.facts.kind.is_action() || row.facts.kind == Kind::Reusable { Some(since_release(hub, &repo, path, &text, &ctx.versions).await) } else { None };
-    // What Release would tag: the commits to its files since its newest release (pl-5).
-    let released = row.facts.kind.is_action() || row.facts.kind == Kind::Reusable;
-    let newest = kiln_ci::pipelines::newest_release(ctx.versions.iter().map(|(t, _)| t.as_str())).filter(|_| released).map(str::to_owned);
-    let commits = match &newest {
-        Some(tag) => commits_since(hub, &repo, tag, &sha, path).await,
-        None => Vec::new(),
-    };
     let since = newest.as_deref().map(|tag| core::Since { tag, commits: &commits });
     let overlay = overlay_of(hub, &repo, &sha, path).await;
     let overlay = overlay.as_ref().map(|(p, t)| (p.as_str(), t.as_str()));
     let pane = core::pane_json(&core::Opened { repo: &full, row: &row, at: &at, sha: &sha, text: &text, viewer, by_hand, changes: changes.as_deref(), since, overlay }, &groups);
     Ok(srv::json(StatusCode::OK, &pane))
+}
+
+/// When each of `repo`'s tags was made (an annotated tag's own date, else its commit's), by name:
+/// pl-5's `3d`.
+async fn tag_times(hub: &Hub, repo: &Repo, sha: &str) -> HashMap<String, i64> {
+    let Ok(dir) = crate::gitops::ensure_commit(hub, repo, sha).await else { return HashMap::new() };
+    let out = git(hub, &dir.to_string_lossy(), &["for-each-ref", "--format=%(refname:strip=2) %(creatordate:unix)", "refs/tags"]).await;
+    out.lines().filter_map(|l| l.split_once(' ').and_then(|(t, at)| at.trim().parse().ok().map(|at| (t.to_owned(), at)))).collect()
 }
 
 /// What releasing `text` (the file at `path` now) changes for the workflows that use it, since
@@ -647,7 +667,7 @@ async fn draft_pane(hub: &Hub, repo: &Repo, id: &str, path: &str, viewer: core::
         },
         None => {
             let (action, _) = wf::parse_action(&text);
-            action.as_ref().map(|a| core::action_groups(a, row.facts.kind, &text, &head, &ctx.versions, &sharing)).unwrap_or_default()
+            action.as_ref().map(|a| core::action_groups(a, row.facts.kind, &text, &head, &ctx.versions, &sharing, &core::ActionSeen::default())).unwrap_or_default()
         }
     };
     if d.author.starts_with(kiln_ci::updates::AUTHOR) {

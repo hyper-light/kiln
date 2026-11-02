@@ -374,6 +374,12 @@ export const RUNS: Record<string, { n: number; event: string; status: "passed" |
 };
 
 /** Each repository's tags, newest first, with their commits. */
+/** How long ago each tag was made, in seconds, by `repo:tag` (pl-5's `3d`). */
+export const TAG_AGO: Record<string, number> = { "hyper-light/ci-kit:v2.4.0": 3 * 86_400, "hyper-light/ci-kit:v2.3.0": 21 * 86_400, "hyper-light/ci-kit:v0.1.0": 70 * 86_400 };
+
+/** The inputs an action added since its newest release (pl-5's `new since v2.4.0`). */
+export const ADDED: Record<string, string[]> = { "hyper-light/ci-kit:.github/actions/setup-rust": ["targets"] };
+
 /** Each job's time in its workflow's last finished run, in seconds (pl-2's `18m`). */
 export const JOB_SECS: Record<string, Record<string, number>> = {
   "hyper-light/kiln:.kiln/ci.yaml": { rust: 18 * 60 + 40, ui: 4 * 60, vendor: 40 },
@@ -392,13 +398,13 @@ export const TAGS: Record<string, [string, string][]> = {
 };
 
 /** Who used which version of a shared action or reusable workflow, by `repo:path` (W29-R20). */
-export const USED_BY: Record<string, { repo: string; ref: string; sha: string; runs: number }[]> = {
+export const USED_BY: Record<string, { repo: string; ref: string; sha: string; runs: number; workflows?: string[] }[]> = {
   "hyper-light/ci-kit:.github/actions/setup-rust": [
-    { repo: "hyper-light/kiln", ref: "v2.3.0", sha: "5b2c9e1a7d6f", runs: 412 },
-    { repo: "hyper-light/quiver", ref: "v2.4.0", sha: "7ac3e1d0b9a8", runs: 54 },
-    { repo: "hyper-light/hyperlight-site", ref: "v2.4.0", sha: "7ac3e1d0b9a8", runs: 31 },
+    { repo: "hyper-light/kiln", ref: "v2.3.0", sha: "5b2c9e1a7d6f", runs: 412, workflows: ["ci", "release"] },
+    { repo: "hyper-light/quiver", ref: "v2.4.0", sha: "7ac3e1d0b9a8", runs: 54, workflows: ["ci"] },
+    { repo: "hyper-light/hyperlight-site", ref: "v2.4.0", sha: "7ac3e1d0b9a8", runs: 31, workflows: ["deploy"] },
   ],
-  "hyper-light/ci-kit:.github/workflows/rust-check.yml": [{ repo: "hyper-light/quiver", ref: "v2.3.0", sha: "5b2c9e1a7d6f", runs: 54 }],
+  "hyper-light/ci-kit:.github/workflows/rust-check.yml": [{ repo: "hyper-light/quiver", ref: "v2.3.0", sha: "5b2c9e1a7d6f", runs: 54, workflows: ["ci"] }],
 };
 
 /** What an update draft changes for its repository (W29-R22), and its upstream's files. */

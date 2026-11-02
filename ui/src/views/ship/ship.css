@@ -1589,6 +1589,10 @@
   font-size: 12.5px;
 }
 @media (max-width: 700px) {
+  /* A phone's kicker is its name alone (pl-2 at 390). */
+  .ppl-kicker > span:last-child {
+    display: none;
+  }
   .ppl-verbs,
   .ppl-verbs[data-armed] {
     grid-auto-flow: row;

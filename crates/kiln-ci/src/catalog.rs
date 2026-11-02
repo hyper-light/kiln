@@ -106,7 +106,7 @@ pub fn of_workflow(repo: &str, w: &Workflow, access: Access, uses: String) -> Op
 }
 
 /// Which repository's runs pinned which version of an action or reusable workflow (W29-R20).
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
 pub struct Consumer {
     pub repo: String,
     /// The action's directory or the workflow's file, as `uses:` named it.
@@ -119,6 +119,9 @@ pub struct Consumer {
     pub sha: String,
     pub runs: i64,
     pub last_at: i64,
+    /// The workflows of its repository whose runs used it, by their names (`ci`, `release`).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub workflows: Vec<String>,
 }
 
 /// `q=`, `kind=` and `owner=` (W29-R20): each kept when empty.

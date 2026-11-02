@@ -137,12 +137,12 @@ test("an opened workflow is the jobs pane's anatomy: the strip, its groups, the 
 
 test("an action's pane: its inputs, steps, versions, who uses it and its access; Changes · YAML · Try it; Release among its verbs", async ({ page, isMobile }) => {
   const pane = await openPane(page, isMobile, "hyper-light/ci-kit", ".github/actions/setup-rust");
-  await expect(pane.locator(".ppl-list > .jp-g > span:first-child")).toHaveText(["Inputs", "Outputs", "Steps", "Versions", "Used by", "Settings"]);
+  await expect(pane.locator(".ppl-list > .jp-g > span:first-child")).toHaveText(["Inputs", "Steps", "Versions", "Used by", "Settings"]);
   await expect(pane.locator(".jp-j[data-at]")).toHaveAttribute("data-key", "versions.head");
   await expect(pane.locator(".ppl-detail").getByRole("tab")).toHaveText(["Changes", "YAML", "Try it"]);
   await expect(pane.locator('.jp-g[data-group="Used by"] > span:last-child')).toHaveText("3 repositories");
   await expect(pane.locator(".ppl-verbs button")).toHaveText(["Run", "Save draft", "Ready", "Discard", "Release"]);
-  await expect(pane.locator(".ppl-kicker")).toContainText(".github/actions/setup-rust · Composite action · main · e41a9c2");
+  await expect(pane.locator(".ppl-kicker")).toContainText("hyper-light/ci-kit · .github/actions/setup-rust · composite action");
   expect(await sideways(page)).toBe(0);
 });
 
