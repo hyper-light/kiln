@@ -446,3 +446,14 @@ export const CHECKS: Record<string, { name: string; value: string; state: string
   "hyper-light/ci-kit:.github/actions/setup-rust": { name: "ci-kit's own checks passed on e41a9c2", value: "4 jobs", state: "passed" },
   "hyper-light/ci-kit:.github/actions/cache-cargo": { name: "ci-kit's own checks failed on e41a9c2", value: "4 jobs", state: "failed" },
 };
+
+/** W29-R02, pl-1: the commit that last changed each file (an action's folder), independent of the repository tip. */
+export const LAST_COMMIT: Record<string, string> = {
+  "hyper-light/kiln:.kiln/stress.yaml:draft:d-stress": "8d7e6f5".padEnd(40, "0"),
+  "hyper-light/kiln:.kiln/release.yaml": "72cd9e3".padEnd(40, "0"),
+  "hyper-light/kiln:.kiln/nightly.ts": "b07d1e9".padEnd(40, "0"),
+  "hyper-light/kiln:.github/workflows/ci.yml": "02bbce1".padEnd(40, "0"),
+  "hyper-light/ci-kit:.github/actions/sandbox": "d1a0c3f".padEnd(40, "0"),
+  "hyper-light/ci-kit:.github/actions/fuzz-target:draft:d-fuzz": "3be09a1".padEnd(40, "0"),
+  "hyper-light/quiver:.github/workflows/ci.yml:draft:d-update-88": "4c19e0b".padEnd(40, "0"),
+};

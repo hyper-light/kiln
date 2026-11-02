@@ -10,7 +10,7 @@
 import type http from "node:http";
 import { parse, parseDocument } from "yaml";
 import type { ShipPipelineDraft, ShipPipelineGroup, ShipPipelineLine, ShipPipelinePane, ShipPipelineRepo, ShipPipelineRow, ShipPipelineVerb, ShipPipelines } from "../src/api/ship.ts";
-import { ADDED, CHECKS, FILES, JOB_SECS, RUNS, SET_IN, TAG_AGO, TAGS, UPDATES, USED_BY } from "./pipelines-files.ts";
+import { ADDED, CHECKS, FILES, JOB_SECS, LAST_COMMIT, RUNS, SET_IN, TAG_AGO, TAGS, UPDATES, USED_BY } from "./pipelines-files.ts";
 // The pane's words as the server words them: the UI's own, so the mock and the typed text agree.
 import { triggerLines } from "../src/lib/triggers.ts";
 import { jobLine, spanWords, type JobLast } from "../src/lib/typed-groups.ts";
@@ -97,8 +97,9 @@ const SEEDS: Record<string, { access: string; rows: Seed[] }> = {
         dialect: "kiln",
         name: "release",
         path: ".kiln/release.yaml",
+        released: "v0.2.0",
         stand: "shipped",
-        word: "Passing",
+        word: "Released",
         line: "tags v* · linux, windows and macOS on bare metal · passed on v0.2.0",
         pips: ["passed", "passed", "passed"],
         who: "admin",
@@ -283,7 +284,7 @@ const SEEDS: Record<string, { access: string; rows: Seed[] }> = {
 };
 
 /** W29-R02's order: Review, Failing, Can't run; then drafts; then the rest by name, then path. */
-function rank(r: Seed): [number, number] {
+function rank(r: { word: string; draft?: ShipPipelineDraft | null }): [number, number] {
   const need = r.word === "Review" ? 0 : r.word === "Failing" ? 1 : r.word === "Can't run" ? 2 : 3;
   const draftRank = r.draft && r.draft.state !== "review" ? 1 : 2;
   return [need < 3 ? 0 : draftRank, need];
@@ -292,7 +293,7 @@ function rank(r: Seed): [number, number] {
 function rowOf(repo: string, s: Seed): ShipPipelineRow {
   const head = HEADS[repo] ?? { ref: "main", commit: "0".repeat(40) };
   const key = s.draft ? `${repo}:${s.path}:draft:${s.draft.id}` : `${repo}:${s.path}`;
-  const row: Omit<ShipPipelineRow, "v"> = { ...s, key, ref: head.ref, commit: head.commit, released: s.released ?? null, draft: s.draft ?? null };
+  const row: Omit<ShipPipelineRow, "v"> = { ...s, key, ref: head.ref, commit: LAST_COMMIT[key] ?? head.commit, released: s.released ?? null, draft: s.draft ?? null };
   return { ...row, v: JSON.stringify(row).length.toString(16) };
 }
 
@@ -345,7 +346,13 @@ function list(q: string, ua: string): ShipPipelines {
     .map((r) => repoOf(r, ua))
     .map((r) => (words && !r.repo.toLowerCase().includes(words) ? { ...r, rows: r.rows.filter((x) => [x.name, x.path, x.kind, x.word].some((v) => v.toLowerCase().includes(words))) } : r))
     .filter((r) => r.rows.length > 0 || !words);
-  repos.sort((a, b) => Number(b.needs > 0) - Number(a.needs > 0) || a.repo.localeCompare(b.repo));
+  // W29-R02, pl-1: each repository follows its most urgent row, in the same order as rows.
+  const urgency = (r: ShipPipelineRepo) =>
+    r.rows.reduce((best, row) => {
+      const [group, need] = rank(row);
+      return Math.min(best, group * 4 + need);
+    }, 11);
+  repos.sort((a, b) => urgency(a) - urgency(b) || a.repo.localeCompare(b.repo));
   return { repos };
 }
 
@@ -686,9 +693,11 @@ function narrowsOf(repo: string, path: string, text: string, kiln: boolean): Rec
 function paneOf(repo: string, row: ShipPipelineRow): ShipPipelinePane {
   const key = row.draft ? `${repo}:${row.path}:draft:${row.draft.id}` : `${repo}:${row.path}`;
   const text = FILES[key] ?? "";
+  // A row's last file change is independent of the branch tip its pane opens.
+  const tip = row.draft ? row.commit : (HEADS[repo]?.commit ?? row.commit);
   const action = !["workflow", "reusable"].includes(row.kind);
   const kiln = row.dialect === "kiln";
-  const groups = action ? actionGroups(repo, key, text, row.kind, row.commit) : workflowGroups(key, text, kiln, row.stand !== "superseded");
+  const groups = action ? actionGroups(repo, key, text, row.kind, tip) : workflowGroups(key, text, kiln, row.stand !== "superseded");
   const update = UPDATES[key];
   // kiln's update draft in its ordinary groups: the use it moves in Uses, under the version it had, marked (`kiln_ci::pipelines::mark_moved`, pl-7).
   if (update)
@@ -709,7 +718,7 @@ function paneOf(repo: string, row: ShipPipelineRow): ShipPipelinePane {
   const byHand = groups.some((g) => g.name === "Triggers" && g.lines.some((l) => l.key === "on.workflow_dispatch"));
   const narrow = !action && !row.draft ? narrowsOf(repo, row.path, text, kiln) : null;
   return {
-    head: { title: row.name, path: row.path, kind: row.kind, dialect: row.dialect, ref: row.ref, commit: row.commit, draft: row.draft, stand: row.stand, word: row.word, pips: row.pips },
+    head: { title: row.name, path: row.path, kind: row.kind, dialect: row.dialect, ref: row.ref, commit: tip, draft: row.draft, stand: row.stand, word: row.word, pips: row.pips },
     strip: {
       said: update ? update.said : [`${KIND_WORDS[row.kind] ?? row.kind} · ${row.line}`],
       strong: update?.strong ?? [],

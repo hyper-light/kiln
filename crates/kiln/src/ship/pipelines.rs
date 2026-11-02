@@ -242,7 +242,7 @@ async fn context(hub: &Hub, repo: &Repo, branch: &str, sha: &str) -> anyhow::Res
     let released = versions.first().map(|(t, _)| t.clone());
     let released_sha = versions.first().map(|(_, s)| s.clone());
     // Who changed each file last: the commit's newest ancestors, newest first.
-    let log = git(hub, &d, &["log", "-n", LOG_LOOK, "--format=%x00%an%x00%at", "--name-only", sha, "--", ".github", ".kiln", "action.yml", "action.yaml"]).await;
+    let log = git(hub, &d, &["log", "-n", LOG_LOOK, "--format=%x00%H%x00%an%x00%at", "--name-only", sha, "--", ".github", ".kiln", "action.yml", "action.yaml"]).await;
     let changes = changes_of(&log);
     let (by_path, released_outcome) = runs_of(hub, repo, branch, released_sha.as_deref()).await?;
     Ok((commit, Ctx { released, versions, changes, by_path, released_outcome }))
@@ -264,12 +264,20 @@ fn workflow_row(repo: &Repo, l: &crate::ci::load::Loaded, ctx: &Ctx, env: &Env, 
         routable,
         latest: if kind == Kind::Reusable { ctx.released_outcome.0 } else { seen.0 },
         running: if kind == Kind::Reusable { ctx.released_outcome.1 } else { seen.1 },
-        released: (kind == Kind::Reusable).then(|| ctx.released.clone()).flatten(),
+        released: (kind == Kind::Reusable || l.workflow.as_ref().is_some_and(|w| release_trigger(w, ctx.released.as_deref()))).then(|| ctx.released.clone()).flatten(),
         ..Facts::default()
     };
     let line = workflow_line(l, kind, github_note);
-    let (who, when) = ctx.changes.get(&l.path).cloned().map_or((None, None), |(w, t)| (Some(w), Some(t)));
-    Row::new(facts, Some(if l.dialect == kiln_ci::expr::Dialect::Kiln { "kiln" } else { "gha" }), line, who, when)
+    let (who, when, commit) = ctx.changes.get(&l.path).cloned().map_or((None, None, None), |(w, t, sha)| (Some(w), Some(t), Some(sha)));
+    let mut row = Row::new(facts, Some(if l.dialect == kiln_ci::expr::Dialect::Kiln { "kiln" } else { "gha" }), line, who, when);
+    row.commit = commit;
+    row
+}
+
+/// W29-R02, pl-1: a workflow that runs on the newest release's tag shows that tag in its chip.
+fn release_trigger(w: &wf::Workflow, tag: Option<&str>) -> bool {
+    let Some(tag) = tag else { return false };
+    w.trigger("push").and_then(|t| t.tags.as_ref()).and_then(|tags| kiln_ci::trigger::pattern::Patterns::new(tags).ok()).is_some_and(|tags| tags.matches(tag))
 }
 
 /// An action's row (W29-R02), from its `action.yml` as parsed.
@@ -296,8 +304,10 @@ fn action_row(path: &str, action: Option<&wf::Action>, diags: &[wf::Diag], ctx: 
     };
     let line = action_line(kind, action, errors, routable, ctx.released.as_deref());
     // An action is its folder: a change to any of its files is a change to it.
-    let (who, when) = ctx.changes.get_folder(folder).map_or((None, None), |(w, t)| (Some(w), Some(t)));
-    Row::new(facts, None, line, who, when)
+    let (who, when, commit) = ctx.changes.get_folder(folder).map_or((None, None, None), |(w, t, sha)| (Some(w), Some(t), Some(sha)));
+    let mut row = Row::new(facts, None, line, who, when);
+    row.commit = commit;
+    row
 }
 
 /// A repository's rows at its default branch's head, or `None` when the branch has no commit.
@@ -360,6 +370,7 @@ async fn draft_row(hub: &Hub, repo: &Repo, d: &crate::ci::pipeline_drafts::Draft
     row.facts.running = running;
     row.who = Some(d.author.strip_prefix("user:").unwrap_or(&d.author).to_owned());
     row.when = Some(d.updated_at);
+    row.commit = read.as_ref().map(|(head, ..)| head.clone());
     (row.drafted(mark), read)
 }
 
@@ -836,40 +847,39 @@ fn stem_of(path: &str) -> String {
     name.rsplit_once('.').map_or(name, |(s, _)| s).to_owned()
 }
 
-/// Who changed each file last, from `git log --format=%x00%an%x00%at --name-only`, newest first.
+/// Who changed each file last and at which commit (W29-R02), from `git log --format=%x00%H%x00%an%x00%at --name-only`, newest first.
 #[derive(Debug, Default)]
 struct Changes {
-    first: HashMap<String, (String, i64)>,
+    first: HashMap<String, (String, i64, String)>,
     /// Each commit's author, time and files, newest first.
-    commits: Vec<(String, i64, Vec<String>)>,
+    commits: Vec<(String, i64, String, Vec<String>)>,
 }
 
 impl Changes {
-    fn get(&self, path: &str) -> Option<&(String, i64)> {
+    fn get(&self, path: &str) -> Option<&(String, i64, String)> {
         self.first.get(path)
     }
 
     /// The newest change to any file under `folder`.
-    fn get_folder(&self, folder: &str) -> Option<(String, i64)> {
+    fn get_folder(&self, folder: &str) -> Option<(String, i64, String)> {
         let prefix = format!("{folder}/");
-        self.commits.iter().find(|(_, _, files)| files.iter().any(|f| f.starts_with(&prefix))).map(|(w, t, _)| (w.clone(), *t))
+        self.commits.iter().find(|(_, _, _, files)| files.iter().any(|f| folder.is_empty() || f.starts_with(&prefix))).map(|(w, t, sha, _)| (w.clone(), *t, sha.clone()))
     }
 }
 
 fn changes_of(log: &str) -> Changes {
     let mut out = Changes::default();
-    // Each commit is `\0name\0time\n\nfile\nfile\n`: split on NUL, after the empty first part,
-    // its name and then its time and files.
+    // Each commit is `\0sha\0name\0time\n\nfile\nfile\n`: split on NUL after the empty first part.
     let parts: Vec<&str> = log.split('\0').skip(1).collect();
-    for block in parts.chunks(2) {
-        let [who, rest] = block else { continue };
+    for block in parts.chunks(3) {
+        let [sha, who, rest] = block else { continue };
         let mut lines = rest.lines();
         let when = lines.next().and_then(|t| t.trim().parse::<i64>().ok()).unwrap_or_default();
         let files: Vec<String> = lines.map(str::trim).filter(|f| !f.is_empty()).map(str::to_owned).collect();
         for f in &files {
-            out.first.entry(f.clone()).or_insert_with(|| ((*who).to_owned(), when));
+            out.first.entry(f.clone()).or_insert_with(|| ((*who).to_owned(), when, (*sha).to_owned()));
         }
-        out.commits.push(((*who).to_owned(), when, files));
+        out.commits.push(((*who).to_owned(), when, (*sha).to_owned(), files));
     }
     out
 }
@@ -1089,13 +1099,23 @@ mod tests {
 
     #[test]
     fn w29_r02_who_changed_what_last() {
-        let log = "\0ada\x001700000300\n.kiln/ci.yaml\n.github/actions/setup/action.yml\n\n\0sam\x001700000200\n.github/actions/setup/run.sh\n.kiln/ci.yaml\n";
+        let log = "\0a3f2c1d\0ada\x001700000300\n.kiln/ci.yaml\n.github/actions/setup/action.yml\n\n\0b07d1e9\0sam\x001700000200\n.github/actions/setup/run.sh\n.kiln/ci.yaml\n";
         let c = changes_of(log);
-        assert_eq!(c.get(".kiln/ci.yaml"), Some(&("ada".to_owned(), 1_700_000_300)));
-        assert_eq!(c.get_folder(".github/actions/setup"), Some(("ada".to_owned(), 1_700_000_300)));
-        assert_eq!(c.get(".github/actions/setup/run.sh"), Some(&("sam".to_owned(), 1_700_000_200)));
+        assert_eq!(c.get(".kiln/ci.yaml"), Some(&("ada".to_owned(), 1_700_000_300, "a3f2c1d".to_owned())));
+        assert_eq!(c.get_folder(".github/actions/setup"), Some(("ada".to_owned(), 1_700_000_300, "a3f2c1d".to_owned())));
+        assert_eq!(c.get(".github/actions/setup/run.sh"), Some(&("sam".to_owned(), 1_700_000_200, "b07d1e9".to_owned())));
         assert_eq!(c.get_folder(".kiln/actions/none"), None);
         assert!(changes_of("").commits.is_empty());
+    }
+
+    #[test]
+    fn w29_r02_a_release_workflow_names_the_tag_it_runs_on() {
+        let parse = |s: &str| wf::check_model(".kiln/release.yaml", s, None).1.unwrap_or_default();
+        let tags = parse("on:\n  push:\n    tags: ['v*', '!v*-rc*']\njobs: {}\n");
+        assert!(release_trigger(&tags, Some("v0.2.0")));
+        assert!(!release_trigger(&tags, Some("v0.2.0-rc1")));
+        assert!(!release_trigger(&tags, None));
+        assert!(!release_trigger(&parse("on: push\njobs: {}\n"), Some("v0.2.0")), "an ordinary workflow keeps its branch");
     }
 
     #[test]

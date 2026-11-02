@@ -255,6 +255,20 @@ fn w29_r03_pipelines_read_model() -> anyhow::Result<()> {
     let theirs = pipelines(&s, &other, "")?;
     assert!(rows_of(&theirs, "acme/app").is_empty(), "{theirs}");
     assert!(!theirs.to_string().contains("acme/app"), "{theirs}");
+    // W29-R02, pl-1: changing one file moves its row's commit alone. A change in an action's
+    // helper file moves that action, while another workflow keeps the commit that last changed it.
+    std::fs::write(work.join(".github/workflows/ci.yml"), "name: changed\non: push\njobs:\n  a:\n    runs-on: local\n    steps: [{ run: echo changed }]\n")?;
+    std::fs::write(work.join(".github/actions/setup/run.sh"), "echo changed\n")?;
+    git(&home, &work, &["add", "."])?;
+    git(&home, &work, &["commit", "-qm", "W29-R02: two files changed"])?;
+    git(&home, &work, &["push", "-q", "origin", "main"])?;
+    let changed = git(&home, &work, &["rev-parse", "HEAD"])?.trim().to_owned();
+    let list = until_list(&s, &s.admin, "each file's commit", |v| field(row(&rows_of(v, "acme/app"), ".github/workflows/ci.yml").unwrap_or(&Value::Null), "commit") == changed)?;
+    let rows = rows_of(&list, "acme/app");
+    for path in [".github/workflows/ci.yml", ".github/actions/setup/action.yml"] {
+        assert_eq!(field(row(&rows, path).unwrap_or(&Value::Null), "commit"), changed, "{list}");
+    }
+    assert_eq!(field(row(&rows, ".kiln/ci.yaml").unwrap_or(&Value::Null), "commit"), head, "{list}");
     Ok(())
 }
 

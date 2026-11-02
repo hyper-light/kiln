@@ -43,10 +43,10 @@ test("Pipelines is Ship's third tab: repositories needing someone first, each ro
   await expect(page.getByPlaceholder("Repository, workflow, action, kind, machine…")).toBeVisible();
 
   // Repositories with rows needing someone first, then by name; each heading says what's there.
-  await expect(list(page).locator(".dp-proj > span:first-child")).toHaveText(["hyper-light/ci-kit", "hyper-light/kiln", "hyper-light/quiver"]);
+  await expect(list(page).locator(".dp-proj > span:first-child")).toHaveText(["hyper-light/kiln", "hyper-light/ci-kit", "hyper-light/quiver"]);
   await expect(list(page).locator(".dp-proj > span:last-child")).toHaveText([
-    "shared · 6 actions · 1 workflow · 1 draft",
     "7 workflows · 1 failing · 1 waits on you",
+    "shared · 6 actions · 1 workflow · 1 draft",
     "3 workflows · ci-kit v2.4.0 is out",
   ]);
   await expect(list(page).locator(".dp-proj > span[data-needs]")).toHaveCount(2);
@@ -54,13 +54,17 @@ test("Pipelines is Ship's third tab: repositories needing someone first, each ro
   // kiln's: Review, then Failing, then the rest by name.
   const kiln = rowsOf(page, "hyper-light/kiln");
   await expect(kiln.locator(".ppl-title")).toHaveText(["stress", "e2e", "ci", "GitHub CI", "nightly", "release", "smoke"]);
-  await expect(kiln.locator(".ship-stand")).toHaveText(["Review", "Failing", "Passing", "Not run here", "Passing", "Passing", "Passing"]);
+  await expect(kiln.locator(".ship-stand")).toHaveText(["Review", "Failing", "Passing", "Not run here", "Passing", "Released", "Passing"]);
   // DRAFT sits beside a draft's title, and nowhere else.
   await expect(kiln.locator(".ppl-draft")).toHaveCount(1);
   await expect(kiln.first().locator(".ppl-name")).toContainText("stressDRAFT");
   // Where each is: a draft's change, else its branch; an action's newest tag.
   await expect(kiln.first().locator(".ppl-ref[data-ref=change]")).toHaveText("#214");
   await expect(kiln.nth(2).locator(".ppl-ref")).toHaveText("main");
+  const release = kiln.filter({ has: page.locator(".ppl-title", { hasText: /^release$/ }) });
+  await expect(release.locator('.ppl-ref[data-ref="tag"]')).toHaveText("v0.2.0");
+  await expect(release.locator(".ship-sha")).toHaveText("72cd9e3");
+  await expect(kiln.nth(2).locator(".ship-sha")).toHaveText("a3f2c1d");
   await expect(rowsOf(page, "hyper-light/ci-kit").filter({ hasText: "setup-rust" }).locator(".ppl-ref[data-ref=tag]")).toHaveText("v2.4.0");
   // Three pips each: Checks, Runs on, Latest.
   await expect(kiln.nth(1).locator(".js-p")).toHaveCount(3);

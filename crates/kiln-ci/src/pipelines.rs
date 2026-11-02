@@ -567,13 +567,12 @@ pub fn newest_release<'a>(tags: impl IntoIterator<Item = &'a str>) -> Option<&'a
 /// Which of two rows comes first in W29-R02's order: what needs someone first (Review, then
 /// Failing, then Can't run), then drafts, then the rest; each by name (any case), then by path.
 fn before(fa: &Facts, sa: &Standing, fb: &Facts, sb: &Standing) -> Ordering {
-    let need = |s: &Standing| match s.word {
-        "Review" => 0,
-        "Failing" => 1,
-        "Can't run" => 2,
-        _ => 3,
-    };
-    sa.rank.cmp(&sb.rank).then_with(|| need(sa).cmp(&need(sb))).then_with(|| fa.name.to_lowercase().cmp(&fb.name.to_lowercase())).then_with(|| fa.path.cmp(&fb.path))
+    urgency(sa).cmp(&urgency(sb)).then_with(|| fa.name.to_lowercase().cmp(&fb.name.to_lowercase())).then_with(|| fa.path.cmp(&fb.path))
+}
+
+/// W29-R02, pl-1: the same urgency decides both row and repository order.
+fn urgency(s: &Standing) -> (u8, u8) {
+    (s.rank, match s.word { "Review" => 0, "Failing" => 1, "Can't run" => 2, _ => 3 })
 }
 
 /// A repository's rows in W29-R02's order.
@@ -634,13 +633,15 @@ pub struct Row {
     /// Who changed its file last, and when (seconds).
     pub who: Option<String>,
     pub when: Option<i64>,
+    /// The commit that last changed this file (or an action's folder), not its repository's tip (W29-R02, pl-1).
+    pub commit: Option<String>,
     pub draft: Option<DraftOf>,
 }
 
 impl Row {
     pub fn new(facts: Facts, dialect: Option<&'static str>, line: String, who: Option<String>, when: Option<i64>) -> Row {
         let standing = standing(&facts);
-        Row { facts, standing, dialect, line, who, when, draft: None }
+        Row { facts, standing, dialect, line, who, when, commit: None, draft: None }
     }
 
     /// The row of a draft (W29-R10): its facts take the draft's state, and its stand follows.
@@ -756,7 +757,7 @@ pub fn row_json(repo: &str, branch: &str, sha: &str, r: &Row) -> Value {
         "who": r.who,
         "when": r.when,
         "ref": branch,
-        "commit": sha,
+        "commit": r.commit.as_deref().unwrap_or(sha),
         "released": r.facts.released,
         "draft": serde_json::to_value(&r.draft).unwrap_or(Value::Null),
     });
@@ -778,21 +779,22 @@ fn row_matches(r: &Row, q: &str) -> bool {
 /// was rendered when the rows were gathered is joined as it is, but for a repository `viewer` sees
 /// otherwise ([`Repo::seen_by`]).
 pub fn list_text<'a>(repos: impl IntoIterator<Item = &'a Repo>, only: Option<&[String]>, repo: Option<&str>, q: Option<&str>, viewer: Option<&str>) -> String {
-    let mut out: Vec<(bool, &str, std::borrow::Cow<'a, str>)> = Vec::new();
+    let mut out: Vec<((u8, u8), &str, std::borrow::Cow<'a, str>)> = Vec::new();
     for r in repos.into_iter().filter(|r| only.is_none_or(|names| names.iter().any(|n| n == &r.repo))).filter(|r| repo.is_none_or(|want| want == r.repo)) {
-        let (needs, text) = match viewer.and_then(|v| r.seen_by(v)) {
+        let priority = |rows: &[Row]| rows.iter().map(|r| urgency(&r.standing)).min().unwrap_or((2, 3));
+        let (rank, text) = match viewer.and_then(|v| r.seen_by(v)) {
             Some(own) => match text_of(&own, q) {
-                Some(t) => (own.needs, std::borrow::Cow::Owned(t.into_owned())),
+                Some(t) => (priority(&own.rows), std::borrow::Cow::Owned(t.into_owned())),
                 None => continue,
             },
             None => match text_of(r, q) {
-                Some(t) => (r.needs, t),
+                Some(t) => (priority(&r.rows), t),
                 None => continue,
             },
         };
-        out.push((needs > 0, r.repo.as_str(), text));
+        out.push((rank, r.repo.as_str(), text));
     }
-    out.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.cmp(b.1)));
+    out.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(b.1)));
     let mut body = String::with_capacity(out.iter().map(|(_, _, t)| t.len() + 1).sum::<usize>() + 16);
     body.push_str("{\"repos\":[");
     for (i, (_, _, t)) in out.iter().enumerate() {
@@ -2064,6 +2066,26 @@ mod tests {
 
     fn list(repos: &[Repo], only: Option<&[String]>, repo: Option<&str>, q: Option<&str>) -> Value {
         serde_json::from_str(&list_text(repos, only, repo, q, None)).unwrap_or_default()
+    }
+
+    #[test]
+    fn w29_r02_repositories_follow_their_most_urgent_row_and_rows_keep_their_own_commit() {
+        let make = |name: &str, facts: Facts| Repo::new(name.to_owned(), "main".into(), "tip".into(), vec![Row::new(Facts { runs: true, ..facts }, None, String::new(), None, None)], Access::None);
+        let mut reviewed = make("z/review", Facts { draft: Some(Draft::Review), ..Facts::default() });
+        let mut changed = reviewed.rows.first().cloned().unwrap_or_else(|| Row::new(Facts::default(), None, String::new(), None, None));
+        changed.commit = Some("file-commit".into());
+        assert_eq!(row_json("z/review", "main", "tip", &changed).get("commit").and_then(Value::as_str), Some("file-commit"));
+        reviewed.rows.push(Row::new(Facts { routable: Some(false), ..Facts::default() }, None, String::new(), None, None));
+        let all = [
+            make("a/blocked", Facts { routable: Some(false), ..Facts::default() }),
+            make("b/passing", Facts { latest: Some(Outcome::Passed), ..Facts::default() }),
+            make("c/draft", Facts { draft: Some(Draft::Unpublished), ..Facts::default() }),
+            make("d/failing", Facts { latest: Some(Outcome::Failed), ..Facts::default() }),
+            reviewed,
+        ];
+        let v = list(&all, None, None, None);
+        let names: Vec<&str> = v.get("repos").and_then(Value::as_array).into_iter().flatten().filter_map(|r| r.get("repo").and_then(Value::as_str)).collect();
+        assert_eq!(names, ["z/review", "d/failing", "a/blocked", "c/draft", "b/passing"]);
     }
 
     #[test]
