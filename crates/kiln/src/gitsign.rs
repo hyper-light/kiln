@@ -6,9 +6,9 @@
 //! descriptor. It signs where the key is, and no key moves:
 //!
 //! - **An agent's** ([`AGENT_KEY`], as the runner sets an agent session's git): asked of the
-//!   runner process that holds the session's key, over its local socket (`KILN_HARNESS_SOCK`),
-//!   which signs only for a process of that session, told by its group of processes or its
-//!   ancestry, never by what it says.
+//!   runner process that holds the session's key, over its own socket (`KILN_KEY_SOCK`), else the
+//!   machine's (`KILN_HARNESS_SOCK`: `harness::cli::request_keys`), which signs only for a process
+//!   of that session, told by its group of processes or its ancestry, never by what it says.
 //! - **A person's** (any other key: `kiln clone` names their identity): with `kiln login`'s key on
 //!   their device (`<config>/kiln/identity.key`, 0600), under the certificate kiln issued for it.
 //!
@@ -99,7 +99,7 @@ fn sign(key: &str, payload: &[u8]) -> anyhow::Result<(String, String)> {
 /// its verdicts' and comments' (W27-R04).
 pub(crate) fn by_the_runner(message: &[u8]) -> anyhow::Result<(Vec<u8>, Vec<u8>)> {
     let b64 = base64::engine::general_purpose::STANDARD;
-    let answer = crate::harness::cli::request(&crate::harness::socket::Request::Sign { message: b64.encode(message) }).context("the runner holding this agent's key didn't sign")?;
+    let answer = crate::harness::cli::request_keys(&crate::harness::socket::Request::Sign { message: b64.encode(message) }).context("the runner holding this agent's key didn't sign")?;
     let field = |k: &str| -> anyhow::Result<Vec<u8>> {
         let s = answer.get(k).and_then(serde_json::Value::as_str).ok_or_else(|| anyhow::anyhow!("the runner's answer has no {k}"))?;
         b64.decode(s).with_context(|| format!("the runner's {k} isn't base64"))
@@ -137,7 +137,7 @@ fn credential(op: &str) -> anyhow::Result<()> {
             }
         },
         "erase" => {
-            let _ = crate::harness::cli::request(&crate::harness::socket::Request::Credential { forget: true });
+            let _ = crate::harness::cli::request_keys(&crate::harness::socket::Request::Credential { forget: true });
             Ok(())
         }
         _ => Ok(()),
@@ -149,7 +149,7 @@ fn credential(op: &str) -> anyhow::Result<()> {
 /// or its ancestry, and asks the server for the agent's own. `None`: the runner says this process
 /// is no agent's; an error: no token, so it pushes as no one rather than as anyone else.
 fn agent_credential() -> Option<anyhow::Result<String>> {
-    match crate::harness::cli::request(&crate::harness::socket::Request::Credential { forget: false }) {
+    match crate::harness::cli::request_keys(&crate::harness::socket::Request::Credential { forget: false }) {
         Ok(a) if a.get("agent").and_then(serde_json::Value::as_bool) == Some(false) => None,
         Ok(a) => Some(a.get("password").and_then(serde_json::Value::as_str).map(str::to_owned).ok_or_else(|| anyhow::anyhow!("the runner's answer has no token"))),
         Err(e) => Some(Err(e.context("this agent's runner gave it no credential for kiln"))),

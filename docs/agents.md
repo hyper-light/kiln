@@ -811,7 +811,11 @@ kiln shell acts for whoever opened the terminal, audited as `shell:<id>[@<machin
 ### From a kiln shell
 
 Every harness kiln starts has `KILN_HARNESS_SOCK`, so these work in an agent's own commands as
-in a kiln terminal (run by an agent, what they start are its children):
+in a kiln terminal (run by an agent, what they start are its children). It also has
+`KILN_KEY_SOCK`, the socket of the runner process that started it, which alone holds its key:
+`kiln-git-sign` asks that one for the session's commit signatures and its credential for kiln
+(docs/ci.md W27-R03), then the machine's socket, so an upgrade's new build signs for the sessions
+it starts while the old build still serves `KILN_HARNESS_SOCK`.
 
 | Command | |
 |---|---|

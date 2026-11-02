@@ -124,23 +124,69 @@ fn request_for(req: &Request, wait: std::time::Duration) -> anyhow::Result<Value
 /// [`request_for`], to the socket at `path`.
 #[cfg(unix)]
 fn request_at(path: &std::path::Path, req: &Request, wait: std::time::Duration) -> anyhow::Result<Value> {
-    let mut s = std::os::unix::net::UnixStream::connect(path).map_err(|e| anyhow::anyhow!("cannot reach kiln at {}: {e}", path.display()))?;
+    let s = std::os::unix::net::UnixStream::connect(path).map_err(|e| anyhow::anyhow!("cannot reach kiln at {}: {e}", path.display()))?;
+    answered(exchange(s, req, wait)?)
+}
+
+/// `req` on the connection `s`, and kiln's answer, whatever it says.
+#[cfg(unix)]
+fn exchange(mut s: std::os::unix::net::UnixStream, req: &Request, wait: std::time::Duration) -> anyhow::Result<Value> {
     s.set_read_timeout(Some(wait))?;
     let mut line = serde_json::to_vec(req)?;
     line.push(b'\n');
     s.write_all(&line)?;
     let mut answer = String::new();
     std::io::BufReader::new(s).read_line(&mut answer)?;
-    let v: Value = serde_json::from_str(&answer).map_err(|e| anyhow::anyhow!("unreadable answer from kiln: {e}"))?;
+    serde_json::from_str(&answer).map_err(|e| anyhow::anyhow!("unreadable answer from kiln: {e}"))
+}
+
+/// kiln's answer `v`, unless it refused, saying why.
+#[cfg(unix)]
+fn answered(v: Value) -> anyhow::Result<Value> {
     if v.get("ok").and_then(Value::as_bool) != Some(true) {
         anyhow::bail!("{}", v.get("error").and_then(Value::as_str).unwrap_or("kiln refused the request"));
     }
     Ok(v)
 }
 
+/// What the runner holding this agent session's key answers `req`, a signature or a credential
+/// (W27-R03): asked of the runner process that started the session first, on its own socket
+/// (`KILN_KEY_SOCK`), then of the machine's (`KILN_HARNESS_SOCK`).
+#[cfg(unix)]
+pub(crate) fn request_keys(req: &Request) -> anyhow::Result<Value> {
+    request_keys_at(std::env::var_os("KILN_KEY_SOCK").map(std::path::PathBuf::from).as_deref(), &socket()?, req)
+}
+
+/// [`request_keys`], of the runner's own socket `own` and the machine's `machine`. The machine's
+/// answers where the runner has ended (its socket's file gone, or nothing answers on it), where it
+/// no longer runs the session (an upgrade handed the session to the machine's new build: it says
+/// `elsewhere`), and where it had no socket of its own (a build from before them).
+#[cfg(unix)]
+pub(crate) fn request_keys_at(own: Option<&std::path::Path>, machine: &std::path::Path, req: &Request) -> anyhow::Result<Value> {
+    let wait = std::time::Duration::from_secs(30);
+    if let Some(own) = own {
+        match std::os::unix::net::UnixStream::connect(own) {
+            Ok(s) => {
+                let v = exchange(s, req, wait)?;
+                if v.get("elsewhere").and_then(Value::as_bool) != Some(true) {
+                    return answered(v);
+                }
+            }
+            Err(e) if matches!(e.kind(), std::io::ErrorKind::NotFound | std::io::ErrorKind::ConnectionRefused) => {}
+            Err(e) => anyhow::bail!("cannot reach kiln at {}: {e}", own.display()),
+        }
+    }
+    request_at(machine, req, wait)
+}
+
 #[cfg(not(unix))]
 pub(crate) fn request(_req: &Request) -> anyhow::Result<Value> {
     anyhow::bail!("kiln spawn is not available on Windows yet")
+}
+
+#[cfg(not(unix))]
+pub(crate) fn request_keys(_req: &Request) -> anyhow::Result<Value> {
+    anyhow::bail!("an agent session's key is asked of its runner over a Unix socket, which Windows doesn't have yet")
 }
 
 /// `kiln harness-hook`: a harness's hook before each of its tool calls (Codex's, given by kiln as
@@ -372,4 +418,66 @@ pub fn agents(a: AgentsArgs) -> anyhow::Result<()> {
         }
     }
     Ok(())
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::*;
+
+    /// A runner's socket at `path` that gives `answer` to every request, on a thread of its own:
+    /// how many it was asked.
+    fn answering(path: &std::path::Path, answer: Value) -> anyhow::Result<std::sync::Arc<std::sync::atomic::AtomicUsize>> {
+        let listener = std::os::unix::net::UnixListener::bind(path)?;
+        let asked = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counted = std::sync::Arc::clone(&asked);
+        std::thread::spawn(move || {
+            for mut s in listener.incoming().flatten() {
+                let mut line = String::new();
+                if let Ok(r) = s.try_clone() {
+                    let _ = std::io::BufReader::new(r).read_line(&mut line);
+                }
+                counted.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                let _ = s.write_all(format!("{answer}\n").as_bytes());
+            }
+        });
+        Ok(asked)
+    }
+
+    /// W27-R03, 2026-11-02: an agent session's signature and credential are asked of the runner
+    /// process that started it, on its own socket, not of whichever process serves the machine's
+    /// (an upgrade's old build, which neither knew the request nor held the key). The machine's
+    /// answers once that runner has ended, where it no longer runs the session (an upgrade handed
+    /// it over), and where it had no socket of its own; a refusal of the runner's own stands.
+    #[test]
+    fn w27_r03_a_sessions_key_is_asked_of_its_own_runner_then_the_machines() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let req = Request::Credential { forget: false };
+        let machine = dir.path().join("harness-m.sock");
+        let at_machine = answering(&machine, serde_json::json!({"ok": true, "from": "machine"}))?;
+        let from = |v: anyhow::Result<Value>| -> anyhow::Result<String> { Ok(v?.get("from").and_then(Value::as_str).unwrap_or_default().to_owned()) };
+
+        let own = dir.path().join("harness-m-p1.sock");
+        let at_own = answering(&own, serde_json::json!({"ok": true, "from": "own"}))?;
+        anyhow::ensure!(from(request_keys_at(Some(&own), &machine, &req))? == "own", "not asked of the session's own runner");
+        anyhow::ensure!(at_machine.load(std::sync::atomic::Ordering::SeqCst) == 0, "the machine's socket was asked too");
+        anyhow::ensure!(at_own.load(std::sync::atomic::Ordering::SeqCst) == 1);
+
+        let handed = dir.path().join("harness-m-p2.sock");
+        answering(&handed, serde_json::json!({"ok": false, "elsewhere": true, "error": "no agent session this kiln process runs asks"}))?;
+        anyhow::ensure!(from(request_keys_at(Some(&handed), &machine, &req))? == "machine", "a session handed over wasn't asked of the machine's");
+
+        let ended = dir.path().join("harness-m-p3.sock");
+        drop(std::os::unix::net::UnixListener::bind(&ended)?);
+        anyhow::ensure!(from(request_keys_at(Some(&ended), &machine, &req))? == "machine", "an ended runner's socket wasn't passed over");
+        anyhow::ensure!(from(request_keys_at(Some(&dir.path().join("harness-m-p4.sock")), &machine, &req))? == "machine", "a missing socket wasn't passed over");
+        anyhow::ensure!(from(request_keys_at(None, &machine, &req))? == "machine", "a session of an older runner wasn't asked of the machine's");
+
+        let refusing = dir.path().join("harness-m-p5.sock");
+        answering(&refusing, serde_json::json!({"ok": false, "error": "agent session s1 has no key at epoch 2"}))?;
+        let before = at_machine.load(std::sync::atomic::Ordering::SeqCst);
+        let refused = request_keys_at(Some(&refusing), &machine, &req);
+        anyhow::ensure!(refused.as_ref().is_err_and(|e| e.to_string().contains("no key at epoch 2")), "{refused:?}");
+        anyhow::ensure!(at_machine.load(std::sync::atomic::Ordering::SeqCst) == before, "the runner's own refusal went to the machine's");
+        Ok(())
+    }
 }
