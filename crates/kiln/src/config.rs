@@ -603,6 +603,13 @@ impl Config {
         self.local_agent.name.clone().unwrap_or_else(hostname)
     }
 
+    /// What the server's own runner (`[local_agent]`) is known by (docs/machines.md): its machine's
+    /// id ([`crate::os::machine_id`]), else its name. Its name ([`Self::local_agent_name`]) is its
+    /// label.
+    pub fn local_agent_key(&self) -> String {
+        crate::os::machine_id().unwrap_or_else(|| crate::pki::sanitize_name(&self.local_agent_name()))
+    }
+
     pub fn hostname() -> String {
         hostname()
     }

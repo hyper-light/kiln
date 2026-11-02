@@ -11,6 +11,7 @@ import { Button } from "@/components/ui/button";
 import { Dialog, DialogClose, DialogContent } from "@/components/ui/dialog";
 import { Loadable } from "@/components/ui/loading";
 import { toast } from "@/components/ui/toast";
+import { shownName } from "@/lib/data";
 import { errorMessage } from "@/lib/hooks";
 import { useSuspenseResource } from "@/lib/resource";
 import { cn } from "@/lib/utils";
@@ -40,11 +41,11 @@ function Choices({ agent, picked, onPick }: { agent: Agent; picked: string; onPi
   const { byTarget, runners } = useSuspenseResource("harness/move", askPlaces).data;
   // A runner without a reach identity runs a kiln from before agents could move.
   const here = runners.find((r) => `agent:${r.name}` === agent.target);
-  if (here && !here.fingerprint) return <p className="mv-none">{here.name} runs an older kiln that can't hand agents over: upgrade it in System → Updates.</p>;
+  if (here && !here.fingerprint) return <p className="mv-none">{shownName(here)} runs an older kiln that can't hand agents over: upgrade it in System → Updates.</p>;
   const others = runners.filter((r) => r.connected && `agent:${r.name}` !== agent.target && (byTarget[`agent:${r.name}`] ?? []).some((k) => k.id === agent.kind && k.available));
   const fit = others.filter((r) => r.reach);
-  const older = others.filter((r) => !r.fingerprint).map((r) => r.name);
-  const closed = others.filter((r) => r.fingerprint && !r.reach).map((r) => r.name);
+  const older = others.filter((r) => !r.fingerprint).map(shownName);
+  const closed = others.filter((r) => r.fingerprint && !r.reach).map(shownName);
   const why = [
     older.length > 0 && `${inWords(older)} ${older.length === 1 ? "runs an older kiln: upgrade it" : "run an older kiln: upgrade them"} in System → Updates to move agents there.`,
     closed.length > 0 && `${inWords(closed)} ${closed.length === 1 ? "is" : "are"} set not to take work from other runners.`,
@@ -59,10 +60,10 @@ function Choices({ agent, picked, onPick }: { agent: Agent; picked: string; onPi
           const t = `agent:${r.name}`;
           return (
             <button key={t} type="button" role="radio" aria-checked={picked === t} className={cn("mv-choice", picked === t && "mv-choice-on")} onClick={() => onPick(t)}>
-              <span className="mv-name">{r.name}</span>
+              <span className="mv-name">{shownName(r)}</span>
               <span className="mv-meta">
                 {r.os}/{r.arch}
-                {r.hostname && r.hostname !== r.name ? ` · ${r.hostname}` : ""}
+                {r.hostname && r.hostname !== shownName(r) ? ` · ${r.hostname}` : ""}
               </span>
             </button>
           );

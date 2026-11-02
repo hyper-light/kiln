@@ -58,6 +58,8 @@ pub fn runner_env(dir: &Path, port: u16, name: &str, chaos: Option<&str>, talk: 
     let log = std::fs::OpenOptions::new().create(true).append(true).open(&log_path)?;
     let mut cmd = super::kiln();
     cmd.args(["agent", "--server", &format!("http://127.0.0.1:{port}"), "--token", &join, "--name", name]);
+    // A machine of its own (docs/machines.md): runners a test starts share one machine.
+    cmd.env("KILN_MACHINE_ID", name);
     if let Some(c) = chaos {
         cmd.args(["--chaos", c]);
     }
@@ -100,14 +102,16 @@ pub fn path_without_harnesses(dir: &Path) -> anyhow::Result<String> {
     Ok(system.to_string_lossy().into_owned())
 }
 
-/// Waits until the server lists runner `name` connected.
+/// Waits until the server lists runner `name` connected, known by its machine id
+/// ([`super::machine`]).
 pub fn connected(port: u16, admin: &str, name: &str, log: &Path, within: Duration) -> anyhow::Result<()> {
+    let key = super::machine(name);
     let deadline = Instant::now() + within;
     loop {
         let (_, body) = super::http(port, "GET", "/api/agents", admin, None)?;
         let v: Value = serde_json::from_str(&body).unwrap_or_default();
         let list = v.as_array().cloned().or_else(|| v.get("agents").and_then(Value::as_array).cloned()).unwrap_or_default();
-        if list.iter().any(|a| a.get("name").and_then(Value::as_str) == Some(name) && a.get("connected").and_then(Value::as_bool) == Some(true)) {
+        if list.iter().any(|a| a.get("name").and_then(Value::as_str) == Some(key.as_str()) && a.get("connected").and_then(Value::as_bool) == Some(true)) {
             return Ok(());
         }
         anyhow::ensure!(Instant::now() < deadline, "runner {name} never connected: {body}\n{}", std::fs::read_to_string(log).unwrap_or_default());
@@ -148,7 +152,7 @@ pub fn just_connected(log: &Path, deadline: Instant) {
 /// Opens a stand-in Claude Code session on runner `name`, prompting it: its id. Tries again while
 /// the runner is between connections or hasn't said what it offers yet.
 pub fn open_session(port: u16, admin: &str, name: &str, cwd: &Path, within: Duration) -> anyhow::Result<String> {
-    let open = json!({"target": format!("agent:{name}"), "spec": {"kind": "claude", "cwd": cwd.display().to_string(), "prompt": "stream"}});
+    let open = json!({"target": format!("agent:{}", super::machine(name)), "spec": {"kind": "claude", "cwd": cwd.display().to_string(), "prompt": "stream"}});
     let deadline = Instant::now() + within;
     loop {
         // Waited for longer than the server waits for its runner's answer (`hub::COMMAND_WITHIN`),

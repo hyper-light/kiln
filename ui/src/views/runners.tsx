@@ -8,12 +8,12 @@ import { Button } from "@/components/ui/button";
 import { FacetBox, type Chosen, type Facet } from "@/components/ui/facet-box";
 import { Hold, TableHold } from "@/components/ui/hold";
 import { Loadable } from "@/components/ui/loading";
-import { Confirm, EmptyState, Facts, FilterBar, Meter, PageIntro, SelectField } from "@/components/ui/misc";
+import { Confirm, EmptyState, Facts, FilterBar, Meter, PageIntro, SelectField, TextField } from "@/components/ui/misc";
 import { WatchedBy } from "@/views/attach/here";
 import { Chips, StatusDot } from "@/components/ui/status";
 import { toast } from "@/components/ui/toast";
 import { Tip } from "@/components/ui/tooltip";
-import { agentsRes, historyRes, lastSamples, mergeJobs, updatesRes, useAgentsLive, useMetricsHistory, useRes, useUpdateJobs, warm } from "@/lib/data";
+import { agentsRes, historyRes, labelOf, lastSamples, mergeJobs, noteLabels, shownName, updatesRes, useAgentsLive, useLabels, useMetricsHistory, useRes, useUpdateJobs, warm } from "@/lib/data";
 import { absoluteTime, formatBytes, formatPct } from "@/lib/format";
 import { errorMessage, useNow } from "@/lib/hooks";
 import { usePref } from "@/lib/prefs";
@@ -124,10 +124,27 @@ function RunnersBody() {
     agents.setData((l) => l.map((x) => (x.name === a.name ? { ...x, draining } : x)));
     try {
       await api.drainAgent(a.name, draining);
-      toast({ title: draining ? `Draining ${a.name}` : `${a.name} accepting jobs`, tone: "info" });
+      toast({ title: draining ? `Draining ${shownName(a)}` : `${shownName(a)} accepting jobs`, tone: "info" });
     } catch (e) {
       agents.setData((l) => l.map((x) => (x.name === a.name ? { ...x, draining: !draining } : x)));
       toast.error("Drain failed", errorMessage(e));
+    }
+  };
+
+  /** The name people see for a runner (docs/machines.md); kiln goes on knowing it by its name. Whether the server took it. */
+  const rename = async (a: Agent, label: string): Promise<boolean> => {
+    agents.setData((l) => l.map((x) => (x.name === a.name ? { ...x, label } : x)));
+    try {
+      // The server keeps it as a name it can be (lowercase, `-` for what it can't hold): that one is shown.
+      const kept = await api.labelAgent(a.name, label);
+      agents.setData((l) => l.map((x) => (x.name === a.name ? { ...x, label: kept.label } : x)));
+      noteLabels([kept]);
+      toast({ title: `Renamed ${shownName(a)} to ${kept.label}`, tone: "info" });
+      return true;
+    } catch (e) {
+      agents.setData((l) => l.map((x) => (x.name === a.name ? { ...x, label: a.label } : x)));
+      toast.error("Rename failed", errorMessage(e));
+      return false;
     }
   };
 
@@ -140,8 +157,8 @@ function RunnersBody() {
   };
   const list = all
     .filter(matches)
-    .filter((a) => !ql || `${a.name} ${a.hostname} ${a.labels.join(" ")}`.toLowerCase().includes(ql))
-    .sort((a, b) => Number(b.connected) - Number(a.connected) || a.name.localeCompare(b.name));
+    .filter((a) => !ql || `${a.name} ${a.label ?? ""} ${a.hostname} ${a.labels.join(" ")}`.toLowerCase().includes(ql))
+    .sort((a, b) => Number(b.connected) - Number(a.connected) || shownName(a).localeCompare(shownName(b)));
   const facets: Facet[] = FACETS.map((f) => {
     const n = new Map<string, number>();
     for (const a of all) for (const v of facetValues(a)[f.id] ?? []) n.set(v, (n.get(v) ?? 0) + 1);
@@ -155,14 +172,21 @@ function RunnersBody() {
       await api.forgetAgent(a.name);
       agents.setData((l) => l.filter((x) => x.name !== a.name));
       if (selected === a.name) openAgent(null);
-      toast({ title: `${a.name} forgotten`, tone: "info" });
+      toast({ title: `${shownName(a)} forgotten`, tone: "info" });
     } catch (e) {
       toast.error("Forget failed", errorMessage(e));
     }
   };
   const details = (a: Agent) => (
-    <Loadable label={`${a.name} in depth`} fallback={<Hold height={560} className="runner-details" />}>
-      <AgentDetails agent={a} onClose={() => openAgent(null)} onDrain={drain} onForget={forget} onTerminal={() => navigate(`/terminal?open=${encodeURIComponent(`agent:${a.name}`)}`)} />
+    <Loadable label={`${shownName(a)} in depth`} fallback={<Hold height={560} className="runner-details" />}>
+      <AgentDetails
+        agent={a}
+        onClose={() => openAgent(null)}
+        onDrain={drain}
+        onForget={forget}
+        onRename={rename}
+        onTerminal={() => navigate(`/terminal?open=${encodeURIComponent(`agent:${a.name}`)}`)}
+      />
     </Loadable>
   );
 
@@ -177,10 +201,13 @@ function RunnersBody() {
       />
 
       <JoinNotice requests={joinRequests} discovery={discovery} />
-      <LowBattery agents={all} what={(m) => {
-        const n = all.find((a) => a.name === m)?.running.length ?? 0;
-        return n > 0 ? `its ${n} job${n === 1 ? "" : "s"}` : "";
-      }} />
+      <LowBattery
+        agents={all}
+        what={(m) => {
+          const n = all.find((a) => a.name === m)?.running.length ?? 0;
+          return n > 0 ? `its ${n} job${n === 1 ? "" : "s"}` : "";
+        }}
+      />
       <Upgrades />
 
       <RunnersTools q={q} onQ={setQ} facets={facets} chosen={chosen} onChosen={setChosen} view={view} onView={setView} />
@@ -245,7 +272,7 @@ function RunnersBody() {
                         <StatusDot status={agentStatus(a)} title={agentStateLabel(a)} />
                       </td>
                       <td className="max-w-[260px] max-sm:w-full max-sm:max-w-0">
-                        <div className="truncate text-[#e4e5e7]">{a.name}</div>
+                        <div className="truncate text-[#e4e5e7]">{shownName(a)}</div>
                         <div className="truncate font-mono text-[10px] text-[#7b7e88]">
                           {a.connected ? (
                             `${a.hostname} · ${a.os}/${a.arch} · v${a.version}`
@@ -294,7 +321,7 @@ function RunnersBody() {
                             className="icon-btn"
                             data-variant="bare"
                             data-size="sm"
-                            aria-label={`Open terminal on ${a.name}`}
+                            aria-label={`Open terminal on ${shownName(a)}`}
                             disabled={!a.connected}
                             onClick={() => navigate(`/terminal?open=${encodeURIComponent(`agent:${a.name}`)}`)}
                           >
@@ -411,11 +438,7 @@ function UpgradeNote({ agent, detailed }: { agent: Agent; detailed?: boolean }) 
   const old = inst.filter((i) => !i.newest);
   if (!detailed) {
     const held = old.reduce((n, i) => n + i.terminals + i.agents + i.jobs, 0);
-    return (
-      <div className="truncate font-mono text-[10px] text-[#cbb69a]">
-        upgrading · old runner {held ? `keeps ${old.map(holding).join("; ")}` : "is retiring"}
-      </div>
-    );
+    return <div className="truncate font-mono text-[10px] text-[#cbb69a]">upgrading · old runner {held ? `keeps ${old.map(holding).join("; ")}` : "is retiring"}</div>;
   }
   return (
     <div className="mt-5 rounded-xl border border-[#cbb69a]/30 bg-[#cbb69a]/[0.04] px-4 py-3">
@@ -443,7 +466,7 @@ function UpgradeNote({ agent, detailed }: { agent: Agent; detailed?: boolean }) 
 function DrainCheck({ agent, onChange }: { agent: Agent; onChange: (v: boolean) => void }) {
   return (
     <label className="inline-flex min-h-8 cursor-pointer items-center gap-2">
-      <input type="checkbox" className="check" checked={agent.draining} disabled={!agent.connected} onChange={(e) => onChange(e.target.checked)} aria-label={`Drain ${agent.name}`} />
+      <input type="checkbox" className="check" checked={agent.draining} disabled={!agent.connected} onChange={(e) => onChange(e.target.checked)} aria-label={`Drain ${shownName(agent)}`} />
       <span className={cn("font-mono text-[10px]", agent.draining ? "text-[#cbb69a]" : "text-[#7b7e88]")}>{agent.draining ? "draining" : "off"}</span>
     </label>
   );
@@ -475,32 +498,37 @@ function AgentDetails({
   onClose,
   onDrain,
   onForget,
+  onRename,
   onTerminal,
 }: {
   agent: Agent;
   onClose: () => void;
   onDrain: (a: Agent, v: boolean) => void;
   onForget: (a: Agent) => Promise<void>;
+  onRename: (a: Agent, label: string) => Promise<boolean>;
   onTerminal: () => void;
 }) {
   const [forgetting, setForgetting] = React.useState(false);
   const samples = useAgentHistory(agent.name);
   const jobs = useRunningJobs(agent.running);
+  const shown = shownName(agent);
   // A minute is near enough for whether any refusal came within a day.
   const now = useClock(60_000);
 
   const s = agent.sample;
   return (
-    <section className="runner-details" aria-label={`${agent.name} in depth`}>
+    <section className="runner-details" aria-label={`${shown} in depth`}>
       <div className="runner-details-head">
         <div className="min-w-0">
           <div className="runner-details-eyebrow">Runner · {agentStateLabel(agent)}</div>
-          <h3>{agent.name}</h3>
+          <h3>{shown}</h3>
+          {/* Known by its machine id: that tells it apart from a machine of the same name. */}
+          {shown !== agent.name && <p>machine id {agent.name}</p>}
           <p>
             {agent.hostname} · {agent.os}/{agent.arch} · kiln v{agent.version}
           </p>
         </div>
-        <Button size="xs" variant="ghost" onClick={onClose} aria-label={`Close ${agent.name}`}>
+        <Button size="xs" variant="ghost" onClick={onClose} aria-label={`Close ${shown}`}>
           <X /> Close
         </Button>
       </div>
@@ -527,10 +555,11 @@ function AgentDetails({
           </Button>
         )}
       </div>
+      <RunnerName agent={agent} onRename={onRename} />
       {forgetting && (
         <Confirm
           className="mt-3"
-          label={`Forget ${agent.name}`}
+          label={`Forget ${shown}`}
           tone="danger"
           actions={
             <>
@@ -544,7 +573,7 @@ function AgentDetails({
           }
         >
           <p>
-            Forget {agent.name}? {agent.connected ? "It is connected: it will be disconnected and must enroll again to come back." : "Its enrollment is removed: it must enroll again to come back."}
+            Forget {shown}? {agent.connected ? "It is connected: it will be disconnected and must enroll again to come back." : "Its enrollment is removed: it must enroll again to come back."}
           </p>
         </Confirm>
       )}
@@ -625,6 +654,8 @@ function AgentDetails({
  */
 function AgentLimit({ runner }: { runner: string }) {
   const view = useSuspenseResource(`agent-limit/${runner}`, (s) => api.agentLimit(runner, s), { on: ["agent_limit", "agent", "harness", "harness_closed"], apply: withEvent });
+  // The name people see for it (docs/machines.md); `runner` stays the key.
+  const shownRunner = labelOf(runner, useLabels());
   const v = view.data;
   const id = React.useId();
   const [draft, setDraft] = React.useState<string | null>(null);
@@ -638,7 +669,7 @@ function AgentLimit({ runner }: { runner: string }) {
       const next = await api.setAgentLimit(runner, max);
       view.setData(() => next);
       setDraft(null);
-      setMsg({ tone: "ok", text: max === null ? `Nothing set here now: ${runner} holds its config's, or kiln's default.` : `Saved: at most ${max} agents at work at once on ${runner}.` });
+      setMsg({ tone: "ok", text: max === null ? `Nothing set here now: ${shownRunner} holds its config's, or kiln's default.` : `Saved: at most ${max} agents at work at once on ${shownRunner}.` });
     } catch (e) {
       setMsg({ tone: "error", text: errorMessage(e) });
     } finally {
@@ -665,7 +696,7 @@ function AgentLimit({ runner }: { runner: string }) {
           }}
         >
           <label htmlFor={id} className="sr-only">
-            The most agents at work at once on {runner}
+            The most agents at work at once on {shownRunner}
           </label>
           <div className="field runner-limit-field">
             <input
@@ -703,6 +734,34 @@ function AgentLimit({ runner }: { runner: string }) {
   );
 }
 
+/**
+ * The name people see for a runner, changed where it shows (docs/machines.md): kiln goes on knowing
+ * it by its name, its machine id for one known by it. Saved, the field says the name the server
+ * kept; refused, what was typed stays, to be put right.
+ */
+function RunnerName({ agent, onRename }: { agent: Agent; onRename: (a: Agent, label: string) => Promise<boolean> }) {
+  const shown = shownName(agent);
+  // What's typed; untouched, the name it has now (renamed here, or elsewhere).
+  const [draft, setDraft] = React.useState<string | null>(null);
+  const [saving, setSaving] = React.useState(false);
+  const typed = (draft ?? shown).trim();
+  const save = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!typed || typed === shown) return;
+    setSaving(true);
+    if (await onRename(agent, typed)) setDraft(null);
+    setSaving(false);
+  };
+  return (
+    <form className="mt-4 flex flex-wrap items-end gap-2" aria-label={`The name of ${shown}`} onSubmit={(e) => void save(e)}>
+      <TextField label="Name" className="runner-name-field min-w-0 flex-1 sm:max-w-sm" value={draft ?? shown} onChange={(e) => setDraft(e.target.value)} spellCheck={false} autoComplete="off" />
+      <Button type="submit" size="xs" variant="secondary" disabled={saving || !typed || typed === shown}>
+        {saving ? "Saving…" : "Save"}
+      </Button>
+    </form>
+  );
+}
+
 /** What a runner's probes found and its administrator declared (docs/ci.md W13-R01, R02): what
  * routing decides over. Declared facts read as constraints name them (`custom.<name>`). */
 function RunnerFactsList({ facts }: { facts: RunnerFacts }) {
@@ -734,6 +793,7 @@ function RunnerFactsList({ facts }: { facts: RunnerFacts }) {
  * by kiln's own release pipeline first.
  */
 function Upgrades() {
+  useLabels();
   const data = useRes(updatesRes).data;
   const live = useUpdateJobs();
   const [asking, setAsking] = React.useState<string | null>(null);
@@ -754,7 +814,7 @@ function Upgrades() {
     setBusy(true);
     try {
       for (const r of runners) await api.upgradeRunner(r.name);
-      toast({ title: runners.length === 1 ? `Upgrading ${runners[0]?.name ?? ""}` : `Upgrading ${runners.length} runners`, description: "Nothing they run is stopped.", tone: "running" });
+      toast({ title: runners.length === 1 ? `Upgrading ${labelOf(runners[0]?.name ?? "")}` : `Upgrading ${runners.length} runners`, description: "Nothing they run is stopped.", tone: "running" });
     } catch (e) {
       toast.error("Couldn't upgrade", errorMessage(e));
     } finally {
@@ -803,13 +863,13 @@ function Upgrades() {
           </Button>
         )}
       </div>
-      {asking === "all" && confirm(`Upgrade ${ready.map((r) => r.name).join(", ")}? Each takes the new build without a restart; nothing they run stops.`, ready)}
+      {asking === "all" && confirm(`Upgrade ${ready.map((r) => labelOf(r.name)).join(", ")}? Each takes the new build without a restart; nothing they run stops.`, ready)}
       <ul className="runner-up-list">
         {behind.map((r) => (
           <li key={r.name}>
             <div className="runner-up-line">
               <StatusDot status={upgrading.has(r.name) ? "running" : r.target_build ? "queued" : "timed_out"} />
-              <span className="runner-up-name">{r.name}</span>
+              <span className="runner-up-name">{labelOf(r.name)}</span>
               <span className="runner-up-build">
                 {r.build ?? "older runner"} → {r.target_build ?? `no ${r.target ?? "matching"} build here yet`}
               </span>
@@ -824,7 +884,7 @@ function Upgrades() {
                 )
               )}
             </div>
-            {asking === r.name && confirm(`Upgrade ${r.name} to build ${r.target_build ?? ""}? It takes it without a restart; its terminals, agents and jobs keep running.`, [r])}
+            {asking === r.name && confirm(`Upgrade ${labelOf(r.name)} to build ${r.target_build ?? ""}? It takes it without a restart; its terminals, agents and jobs keep running.`, [r])}
           </li>
         ))}
       </ul>
@@ -833,7 +893,7 @@ function Upgrades() {
           <p>
             {building ? (
               <>
-                Building every platform · <Link to={`/runs/${last?.id ?? ""}`}>run #{last?.number}</Link>; {lacking.map((r) => r.name).join(", ")} can be upgraded when it finishes.
+                Building every platform · <Link to={`/runs/${last?.id ?? ""}`}>run #{last?.number}</Link>; {lacking.map((r) => labelOf(r.name)).join(", ")} can be upgraded when it finishes.
               </>
             ) : (
               <>

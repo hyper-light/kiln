@@ -808,9 +808,9 @@ async fn send_package(hub: &Hub, id: &str, to: &str, bytes: &[u8]) -> Result<(),
         let msg = ServerMsg::HarnessPackage { session: id.to_owned(), offset, data: piece.to_vec(), done: n + 1 == pieces.len() };
         match hub.command(to, &msg, crate::hub::COMMAND_WITHIN).await {
             Answer::Taken | Answer::Sent => {}
-            Answer::Refused { why, .. } => return Err(format!("{to} couldn't take the session: {why}")),
-            Answer::Unreachable { .. } | Answer::Parked => return Err(format!("{to} went away while the session was on its way")),
-            Answer::Unanswered { why } => return Err(format!("{to} didn't answer while the session was on its way: {why}")),
+            Answer::Refused { why, .. } => return Err(format!("{} couldn't take the session: {why}", hub.shown(to))),
+            Answer::Unreachable { .. } | Answer::Parked => return Err(format!("{} went away while the session was on its way", hub.shown(to))),
+            Answer::Unanswered { why } => return Err(format!("{} didn't answer while the session was on its way: {why}", hub.shown(to))),
         }
         offset += piece.len() as u64;
     }
@@ -926,7 +926,7 @@ impl Registry {
     pub fn restore_from(&self, hub: &Arc<Hub>, machine: &str) -> anyhow::Result<()> {
         let st = self.convo.as_ref().ok_or_else(|| anyhow::anyhow!("the conversation store is off"))?;
         anyhow::ensure!(self.feed.is_some(), "this server takes no conversation feeds");
-        let peer = hub.instances.lock().newest_with(machine, crate::proto::CAP_CONVO).ok_or_else(|| anyhow::anyhow!("{machine} isn't connected, or keeps no conversation store"))?;
+        let peer = hub.instances.lock().newest_with(machine, crate::proto::CAP_CONVO).ok_or_else(|| anyhow::anyhow!("{} isn't connected, or keeps no conversation store", hub.shown(machine)))?;
         if matches!(self.restore_view(), Restore::Asked { .. } | Restore::Copying { .. }) {
             anyhow::bail!("a restore is already under way");
         }
@@ -963,7 +963,7 @@ impl Registry {
         let state = self.restore.lock().clone();
         match state {
             Restore::Asked { from, .. } if from == machine && store.is_empty() => {
-                *self.restore.lock() = Restore::Failed { from, error: format!("{machine} keeps no copy of the conversation store"), at: crate::util::now_ms() };
+                *self.restore.lock() = Restore::Failed { from, error: format!("{} keeps no copy of the conversation store", hub.shown(machine)), at: crate::util::now_ms() };
             }
             Restore::Copying { from, store: s, .. } if from == machine && s == store => {
                 let (h, st) = (Arc::clone(hub), self.convo.clone());
@@ -1443,7 +1443,7 @@ impl Registry {
                     && info.epoch > self.epoch_of(id)
                     && hub.runner_wide_caps(machine) & crate::proto::CAP_CUSTODY == 0
                 {
-                    let why = format!("the process it went to, on {machine}, runs a kiln from before signed hand-overs: it signed no receipt");
+                    let why = format!("the process it went to, on {}, runs a kiln from before signed hand-overs: it signed no receipt", hub.shown(machine));
                     unsigned(hub, id, info.epoch, &format!("runner {machine}"), why);
                 }
                 self.raise_epoch(id, info.epoch);
@@ -1794,9 +1794,39 @@ impl Registry {
         }
     }
 
+    /// Machine `from` is known as `to` from now on (docs/machines.md): its sessions are there (and
+    /// kept so in the conversation store), and what it offers is its. Its runner, coming back as
+    /// `to`, finds them its own.
+    pub fn move_machine(&self, hub: &Hub, from: &str, to: &str) {
+        let (at, now) = (Location::Machine(from.to_owned()), Location::Machine(to.to_owned()));
+        let moved: Vec<Info> = {
+            let mut g = self.mirrors.lock();
+            g.values_mut()
+                .filter(|m| m.location == at)
+                .map(|m| {
+                    m.location = now.clone();
+                    m.info.target = now.target();
+                    m.info.clone()
+                })
+                .collect()
+        };
+        {
+            let mut k = self.kinds.lock();
+            if let Some(v) = k.remove(&at.target()) {
+                k.entry(now.target()).or_insert(v);
+            }
+        }
+        if let Some(st) = &self.convo {
+            st.put(moved.iter().map(|i| crate::convo::rows::Row::Machine { session: i.id.clone(), machine: to.to_owned() }).collect());
+        }
+        for info in moved {
+            hub.emit(&crate::wire::events::ServerEvent::Harness { info: Box::new(info) });
+        }
+    }
+
     /// The machine went away: its sessions keep running there and come back when it reconnects.
     pub fn machine_lost(&self, hub: &Hub, machine: &str) {
-        self.streams.machine_lost(machine);
+        self.streams.machine_lost(machine, &hub.shown(machine));
         self.ports.machine_lost(machine);
         let mut infos = Vec::new();
         {
@@ -1962,9 +1992,9 @@ impl Registry {
                     use crate::wire::commands::Answer;
                     match hub.command(machine, &ServerMsg::HarnessOpen { session: id.clone(), json }, crate::hub::COMMAND_WITHIN).await {
                         Answer::Taken | Answer::Sent | Answer::Parked => {}
-                        Answer::Refused { why, .. } => anyhow::bail!("{machine} refused to start it: {why}"),
-                        Answer::Unreachable { .. } => anyhow::bail!("machine {machine} is not connected"),
-                        Answer::Unanswered { why } => anyhow::bail!("{machine} may or may not have started it: {why}"),
+                        Answer::Refused { why, .. } => anyhow::bail!("{} refused to start it: {why}", hub.shown(machine)),
+                        Answer::Unreachable { .. } => anyhow::bail!("machine {} is not connected", hub.shown(machine)),
+                        Answer::Unanswered { why } => anyhow::bail!("{} may or may not have started it: {why}", hub.shown(machine)),
                     }
                     let now = crate::util::now_ms();
                     let kind = super::kinds::Kind::get(&spec.kind);
@@ -2485,16 +2515,17 @@ impl Registry {
             Location::Machine(m) => m.clone(),
         };
         if hub.agents.lock().get(&from_name).is_some_and(|a| a.connected) {
-            return Err(format!("{from_name} is online: move the session from there instead"));
+            return Err(format!("{} is online: move the session from there instead", hub.shown(&from_name)));
         }
         if !hub.agents.lock().get(to).is_some_and(|a| a.connected) {
-            return Err(format!("{to} isn't connected"));
+            return Err(format!("{} isn't connected", hub.shown(to)));
         }
         if hub.runner_caps(to) & crate::proto::CAP_CONVO == 0 {
-            return Err(format!("{to} runs a kiln too old to take a session from the server; upgrade it first"));
+            return Err(format!("{} runs a kiln too old to take a session from the server; upgrade it first", hub.shown(to)));
         }
-        let (st, i, f, t) = (store.clone(), id.to_owned(), from_name.clone(), to.to_owned());
-        let mut pkg = crate::rt::blocking(move || crate::convo::resume::package(&st, &i, &f, &t, cwd.as_deref()))
+        let (st, i, f) = (store.clone(), id.to_owned(), from_name.clone());
+        let (from_shown, to_shown) = (hub.shown(&from_name), hub.shown(to));
+        let mut pkg = crate::rt::blocking(move || crate::convo::resume::package(&st, &i, &f, cwd.as_deref(), (&from_shown, &to_shown)))
             .await
             .map_err(|e| format!("{e:#}"))?
             .map_err(|e| format!("{e:#}"))?;
@@ -2502,13 +2533,13 @@ impl Registry {
         // the take, which the receipt follows as a hand-on's (docs/ci.md W27-R08).
         let heard = hub.agents.lock().get(&from_name).map(|a| a.last_seen).unwrap_or_default();
         let when = time::OffsetDateTime::from_unix_timestamp(heard).ok().and_then(|t| t.format(&time::format_description::well_known::Rfc3339).ok()).unwrap_or_else(|| "never".to_owned());
-        let why = format!("resumed from kiln's copy: {from_name} was last heard from at {when}");
+        let why = format!("resumed from kiln's copy: {} was last heard from at {when}", hub.shown(&from_name));
         match crate::custody::take_for(&hub.store, &hub.pki, id, pkg.state.epoch, &pkg.events, &why).await {
             Ok(take) => pkg.hand_on = take,
             Err(e) => tracing::warn!(target: "kiln.custody", session = %id, error = %format!("{e:#}"), "kiln couldn't take a session it resumes from its copy: it goes on unsigned"),
         }
         if hub.runner_wide_caps(to) & crate::proto::CAP_CUSTODY == 0 {
-            let why = format!("{to} runs a kiln from before signed hand-overs: it signs no receipt of kiln's take");
+            let why = format!("{} runs a kiln from before signed hand-overs: it signs no receipt of kiln's take", hub.shown(to));
             unsigned(hub, id, pkg.state.epoch.saturating_add(1), &format!("runner {to}"), why);
         }
         let bytes = serde_json::to_vec(&pkg).map_err(|e| e.to_string())?;
@@ -2545,10 +2576,10 @@ impl Registry {
     pub async fn move_local(&self, hub: &Hub, id: &str, to: &str, cwd: &str) -> Result<(), String> {
         let s = self.local.get(id).filter(|_| self.never_started(id)).ok_or_else(|| "only an agent whose harness never started on the kiln server moves from it".to_owned())?;
         if !hub.agents.lock().get(to).is_some_and(|a| a.connected) {
-            return Err(format!("{to} isn't connected"));
+            return Err(format!("{} isn't connected", hub.shown(to)));
         }
         if hub.runner_caps(to) & crate::proto::CAP_CONVO == 0 {
-            return Err(format!("{to} runs a kiln too old to take a session from the server; upgrade it first"));
+            return Err(format!("{} runs a kiln too old to take a session from the server; upgrade it first", hub.shown(to)));
         }
         let spec = s.resume_spec();
         let (events, mut state) = {

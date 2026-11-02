@@ -33,7 +33,7 @@ fn runner(name: &str, cpus: u32, gib: u64) -> RunnerIn {
     facts.cpu.cores = cpus / 2;
     facts.cpu.threads = cpus;
     facts.mem.total = gib * GIB;
-    RunnerIn { id: name.into(), view: RunnerView { name: name.into(), labels: vec!["fleet".into()], facts, caps: 1 << 10, pool: None }, slots: cpus, capacity: None, executor: None }
+    RunnerIn { id: name.into(), view: RunnerView { name: name.into(), label: None, labels: vec!["fleet".into()], facts, caps: 1 << 10, pool: None }, slots: cpus, capacity: None, executor: None }
 }
 
 /// A seeded stream of legs, enough to keep work queued: a burst at `from`, then one every 2 to 14

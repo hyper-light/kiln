@@ -1,5 +1,6 @@
 /** Add a machine: the one-liner for its system, what it does, and a live line that says when the machine is here. */
 import * as React from "react";
+import { shownName } from "@/lib/data";
 import { Link } from "@/lib/router";
 import { ArrowDown, ArrowRight, ArrowUpRight, Check, ChevronRight, Copy, RotateCcw } from "lucide-react";
 import { api } from "@/api/client";
@@ -117,8 +118,7 @@ function Alternatives({ info, os }: { info: JoinInfo | undefined; os: InstallOs 
             <div>
               <h3 className="am-h3">Kubernetes</h3>
               <p>
-                No machine to add: with <code>[kubernetes] enabled = true</code> in the server&apos;s config, each job that <code>runs-on: [k8s]</code> gets a fresh pod in{" "}
-                <code>kiln-jobs</code>.{" "}
+                No machine to add: with <code>[kubernetes] enabled = true</code> in the server&apos;s config, each job that <code>runs-on: [k8s]</code> gets a fresh pod in <code>kiln-jobs</code>.{" "}
                 <a className="am-act am-inline-act" href={K8S_GUIDE} target="_blank" rel="noreferrer">
                   Kubernetes guide <ArrowUpRight aria-hidden="true" />
                 </a>
@@ -161,8 +161,8 @@ function OutpostLine({ os, invite, error, onRenew }: { os: InstallOs; invite: Ou
   return (
     <div className="am-alt">
       <p>
-        Run it as an outpost instead: kiln goes in a folder of its own and runs in that terminal until you stop it (Ctrl-C). Nothing is installed and nothing starts on boot. That
-        machine&apos;s terminals, its Claude Code, Codex and Gemini sessions, and agents show up here; it takes no jobs.
+        Run it as an outpost instead: kiln goes in a folder of its own and runs in that terminal until you stop it (Ctrl-C). Nothing is installed and nothing starts on boot. That machine&apos;s
+        terminals, its Claude Code, Codex and Gemini sessions, and agents show up here; it takes no jobs.
       </p>
       {error ? (
         <p className="am-warn">Couldn&apos;t make an invite: {error}</p>
@@ -225,10 +225,10 @@ function Status({ arrived, asking, rowOf }: { arrived: Arrival[]; asking: JoinRe
         <>
           <Check size={15} className="am-status-ok" aria-hidden="true" />
           <span>
-            <b>{listWords(arrived.map((a) => a.agent.name))}</b> connected
+            <b>{listWords(arrived.map((a) => shownName(a.agent)))}</b> connected
           </span>
           <Link className="am-act" to={`/runners?agent=${encodeURIComponent(last.name)}`}>
-            Open {arrived.length > 1 ? last.name : "it"} <ArrowRight aria-hidden="true" />
+            Open {arrived.length > 1 ? shownName(last) : "it"} <ArrowRight aria-hidden="true" />
           </Link>
         </>
       ) : ask ? (

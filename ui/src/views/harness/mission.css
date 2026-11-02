@@ -1368,6 +1368,7 @@ html[data-motion="paused"] .ms-pick::before {
   margin-top: 6px;
   padding: 0 4px;
 }
+/* Its words name a machine ("Continue a past session on …"): a long name breaks where it must. */
 .mc-toggle {
   display: inline-flex;
   align-items: center;
@@ -1375,6 +1376,7 @@ html[data-motion="paused"] .ms-pick::before {
   padding: 6px 0;
   color: #a1a4ad;
   font-size: 12.5px;
+  overflow-wrap: anywhere;
 }
 .mc-toggle .mc-chev {
   color: #7b7e88;

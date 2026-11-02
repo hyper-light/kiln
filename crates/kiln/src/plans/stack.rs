@@ -277,7 +277,7 @@ async fn make(hub: &Arc<Hub>, st: &mut Stack, m: &Met<'_>) -> Entry {
     let machine = crate::harness::wait::machine(&info.target).to_owned();
     if !st.machine.is_empty() && machine != st.machine {
         e.state = "elsewhere".to_owned();
-        e.error = Some(format!("its agent worked on {machine}, not {} where the stack is: its work is a change of its own (Open change request in its Changes)", st.machine));
+        e.error = Some(format!("its agent worked on {}, not {} where the stack is: its work is a change of its own (Open change request in its Changes)", hub.shown(&machine), hub.shown(&st.machine)));
         return e;
     }
     let facts = match facts_of(hub, &info).await {

@@ -23,6 +23,7 @@ import { fleetCommand, fleetInfos } from "./push.ts";
 import { familyInfos } from "./agents.ts";
 import { reviewInfos } from "./plan-review.ts";
 import { fastInfos } from "./fast.ts";
+import { MAC_MINI } from "./data.ts";
 
 const now = () => Math.floor(Date.now() / 1000);
 const EMAIL = "ada@lundhe.audio";
@@ -239,9 +240,21 @@ function demo(id: string, kind: string, target: string, title: string, model: st
     // What Claude Code lists: its aliases, then pinned versions (the session's own model among them or not).
     models:
       kind === "claude"
-        ? ["default", "opus", "fable", "sonnet", "haiku", "claude-haiku-4-5", "claude-sonnet-5", "claude-opus-5", "claude-fable-5", "claude-opus-4-8", "claude-opus-4-7", "claude-opus-4-6", "claude-sonnet-4-6"].map(
-            (id) => ({ id, label: id === "default" ? "Default (recommended)" : id, description: id === "default" ? "Opus 5.5" : "" }),
-          )
+        ? [
+            "default",
+            "opus",
+            "fable",
+            "sonnet",
+            "haiku",
+            "claude-haiku-4-5",
+            "claude-sonnet-5",
+            "claude-opus-5",
+            "claude-fable-5",
+            "claude-opus-4-8",
+            "claude-opus-4-7",
+            "claude-opus-4-6",
+            "claude-sonnet-4-6",
+          ].map((id) => ({ id, label: id === "default" ? "Default (recommended)" : id, description: id === "default" ? "Opus 5.5" : "" }))
         : [{ id: model, label: model, description: "" }],
     efforts: kind === "claude" ? ["low", "medium", "high", "xhigh", "max"].map((id) => ({ id, label: id === "xhigh" ? "XHigh" : id.charAt(0).toUpperCase() + id.slice(1) })) : [],
     // Its speeds past standard: Claude Code's fast mode on Opus, Codex's tiers on its newest models.
@@ -439,7 +452,7 @@ export async function handleAccounts(req: http.IncomingMessage, res: http.Server
       { id: "claude", name: "Claude Code", verified: true, available: true },
       { id: "codex", name: "Codex", verified: true, available: true },
     ];
-    json(res, 200, { local: kinds, "agent:metal-ryzen-01": kinds, "agent:metal-ryzen-02": kinds, "agent:metal-epyc-01": kinds, "agent:metal-mac-mini": kinds, "agent:metal-pi-04": kinds.slice(1) });
+    json(res, 200, { local: kinds, "agent:metal-ryzen-01": kinds, "agent:metal-ryzen-02": kinds, "agent:metal-epyc-01": kinds, [`agent:${MAC_MINI}`]: kinds, "agent:metal-pi-04": kinds.slice(1) });
     return true;
   }
   if (p === "/api/harness/history" && m === "GET") {

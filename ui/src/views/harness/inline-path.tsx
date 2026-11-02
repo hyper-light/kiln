@@ -11,6 +11,7 @@ import { flushSync } from "react-dom";
 import "./inline-path.css";
 import { ApiError, machineDirs } from "@/api/client";
 import type { DirEntry, DirListing } from "@/api/types";
+import { labelOf, useLabels } from "@/lib/data";
 import { relativeTime } from "@/lib/format";
 import { cn } from "@/lib/utils";
 import { useClock, useListener } from "./dom";
@@ -118,7 +119,7 @@ function matching(dirs: DirEntry[], prefix: string): DirEntry[] {
   return [...exact, ...dirs.filter((d) => !d.name.startsWith(prefix) && d.name.toLowerCase().startsWith(lower))];
 }
 
-const machineOf = (target: string) => (target === "local" ? "the kiln server" : target.replace(/^agent:/, ""));
+const machineOf = (target: string) => (target === "local" ? "the kiln server" : labelOf(target.replace(/^agent:/, "")));
 
 /* ---------------------------------------------------------------- asking machines */
 
@@ -240,6 +241,7 @@ function rove(e: React.KeyboardEvent<HTMLElement>, toField: () => void) {
 
 /** A folder on a machine, as a line of its folders that opens in place to browse, type or pick one used before. */
 export function InlinePath({ target, value, onChange, recent = [], label = "IN", className }: InlinePathProps) {
+  useLabels();
   const [open, setOpen] = React.useState(false);
   const [draft, setDraft] = React.useState("");
   /** What it was when it opened: Esc puts it back. */

@@ -14,7 +14,7 @@ use std::os::unix::fs::PermissionsExt as _;
 use std::time::{Duration, Instant};
 
 use common::agents::{self, Talk};
-use common::{Options, http, start};
+use common::{Options, http, machine, start};
 use serde_json::Value;
 
 #[test]
@@ -36,7 +36,7 @@ fn a_harness_on_its_users_path_alone_is_offered_and_runs() -> anyhow::Result<()>
     // It offers Claude Code.
     let deadline = Instant::now() + Duration::from_secs(60);
     loop {
-        let (_, body) = http(s.port, "GET", "/api/harness/kinds?target=agent:box", &s.admin, None)?;
+        let (_, body) = http(s.port, "GET", &format!("/api/harness/kinds?target=agent:{}", machine("box")), &s.admin, None)?;
         let kinds: Value = serde_json::from_str(&body).unwrap_or_default();
         let claude = kinds.as_array().into_iter().flatten().find(|k| k.get("id").and_then(Value::as_str) == Some("claude"));
         if claude.and_then(|k| k.get("available")).and_then(Value::as_bool) == Some(true) {

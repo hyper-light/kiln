@@ -62,6 +62,7 @@ pub const NOT_INHERITED: &[&str] = &[
     "KILN_INSTANCE",
     "KILN_LOG",
     "KILN_CHAOS",
+    "KILN_MACHINE_ID",
     // A gate's own git config (ci/gate.sh sets it): it overrides the HOME a test's kiln is given,
     // and actions/checkout edits a .gitconfig in the HOME it sets for git, which it then misses.
     "GIT_CONFIG_GLOBAL",
@@ -75,6 +76,14 @@ pub fn kiln() -> Command {
         cmd.env_remove(var);
     }
     cmd
+}
+
+/// The key kiln knows a runner a test started as `name` by: its machine id (docs/machines.md),
+/// made from the `KILN_MACHINE_ID` the test gives it (`name`) as `os::machine_id` makes one. It's
+/// shown by `name`, its label.
+pub fn machine(name: &str) -> String {
+    use sha2::Digest as _;
+    hex::encode(sha2::Sha256::digest(format!("kiln machine id\n{}", name.trim().to_ascii_lowercase()))).chars().take(32).collect()
 }
 
 /// A port free now.
@@ -1077,6 +1086,7 @@ fn server_command(dir: &Path, log: std::fs::File) -> anyhow::Result<Command> {
     cmd.args(["--config", &dir.join("kiln.toml").to_string_lossy(), "server"])
         .env("HOME", &home)
         .env_remove("GIT_CONFIG_GLOBAL")
+        .env("KILN_MACHINE_ID", format!("server {}", dir.display()))
         .env("NO_COLOR", "1")
         .env(WARM_FLOOR.0, WARM_FLOOR.1)
         .stdout(log.try_clone()?)
@@ -1203,12 +1213,14 @@ pub fn refused(port: u16, admin: &str, wire: &str, code: &str) -> u64 {
     metric(port, admin, &format!("kiln_wire_refused_total{{wire=\"{wire}\",code=\"{code}\"}}"))
 }
 
-/// Runner `name`'s record (`GET /api/agents`).
+/// Runner `name`'s record (`GET /api/agents`): the runner a test started as `name`, known by its
+/// machine id ([`machine`]), or one known by `name` itself.
 pub fn record(port: u16, admin: &str, name: &str) -> Value {
+    let key = machine(name);
     let (_, body) = http(port, "GET", "/api/agents", admin, None).unwrap_or_default();
     let v: Value = serde_json::from_str(&body).unwrap_or_default();
     let list = v.as_array().cloned().or_else(|| v.get("agents").and_then(Value::as_array).cloned()).unwrap_or_default();
-    list.into_iter().find(|a| a.get("name").and_then(Value::as_str) == Some(name)).unwrap_or_default()
+    list.into_iter().find(|a| a.get("name").and_then(Value::as_str).is_some_and(|n| n == key || n == name)).unwrap_or_default()
 }
 
 /// How many refusals of `wire` and `code` a page keeps (a runner's record, an agent session's info).
@@ -1222,8 +1234,8 @@ pub fn kept(rec: &Value, wire: &str, code: &str) -> u64 {
         .sum()
 }
 
-/// The audit log's `security.wire_refused` rows whose principal is `principal` (`runner:fedora`,
-/// `agent:<session>`, a person's name).
+/// The audit log's `security.wire_refused` rows whose principal is `principal` (`runner:<machine
+/// id>`, `agent:<session>`, a person's name).
 pub fn audited(port: u16, admin: &str, principal: &str) -> Vec<Value> {
     let (_, body) = http(port, "GET", &format!("/api/audit?action=security.wire_refused&principal={principal}"), admin, None).unwrap_or_default();
     serde_json::from_str::<Value>(&body).ok().and_then(|v| v.as_array().cloned()).unwrap_or_default()

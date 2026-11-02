@@ -5,6 +5,7 @@
  */
 import * as React from "react";
 import { ChevronRight } from "lucide-react";
+import { labelOf, useLabels } from "@/lib/data";
 import { Link } from "@/lib/router";
 import { harnessApi, type HEvent, type SaidHit } from "@/api/harness";
 import { relativeTime } from "@/lib/format";
@@ -77,6 +78,7 @@ const when = (at: number) => relativeTime(at / 1000);
 const searchAll = (q: string) => (): Promise<SaidHit[]> => harnessApi.said({ q, limit: 40 }).then((r) => r.hits);
 
 function Hits({ q, agents }: { q: string; agents: ReadonlySet<string> }) {
+  useLabels();
   const found = useSuspenseResource(`conversations/said:${q}`, searchAll(q)).data;
   const hits = missionSaid(found, agents);
   const [all, setAll] = React.useState(false);
@@ -93,7 +95,7 @@ function Hits({ q, agents }: { q: string; agents: ReadonlySet<string> }) {
             <>
               <span className="ms-said-head">
                 <span className="ms-said-name">{h.name ?? "An agent that ended"}</span>
-                {h.machine && <span className="ms-said-meta">{h.machine.replace(/^agent:/, "")}</span>}
+                {h.machine && <span className="ms-said-meta">{labelOf(h.machine.replace(/^agent:/, ""))}</span>}
                 <span className="ms-said-meta">
                   {WHO[h.event.kind]} · {when(h.event.at)}
                 </span>

@@ -10,7 +10,7 @@ import { Button } from "@/components/ui/button";
 import { Confirm, Optic } from "@/components/ui/misc";
 import { Chips } from "@/components/ui/status";
 import { Tip } from "@/components/ui/tooltip";
-import { agentsRes, aiSessionsRes, harnessSessionsRes, terminalSessionsRes, useAgentsLive, useRes, warm } from "@/lib/data";
+import { agentsRes, aiSessionsRes, harnessSessionsRes, labelOf, shownName, terminalSessionsRes, useAgentsLive, useRes, warm } from "@/lib/data";
 import { errorMessage, useMediaQuery } from "@/lib/hooks";
 import { usePref } from "@/lib/prefs";
 import { invalidate } from "@/lib/resource";
@@ -50,8 +50,9 @@ let tabSeq = 0;
 /** Phones and tablets: show the on-screen keyboard by default. */
 const isTouchDevice = () => typeof window !== "undefined" && (window.matchMedia?.("(pointer: coarse)").matches || (navigator.maxTouchPoints ?? 0) > 0);
 
+/** The machine a target is, as people know it (its label, as the tab is made). */
 function targetLabel(target: string) {
-  return target === "local" ? "server" : target.replace(/^agent:/, "");
+  return target === "local" ? "server" : labelOf(target.replace(/^agent:/, ""));
 }
 
 /** The harness a title shows, or the one seen before when it shows none (titles change as it works). */
@@ -411,7 +412,7 @@ export default function TerminalWorkspace({ visible }: { visible: boolean }) {
           {connected.map((a) => (
             <DropdownMenu.Item key={a.name} className="menu-item" onSelect={() => open(`agent:${a.name}`)}>
               <Server size={14} className="text-[#9a9da6]" />
-              <span className="min-w-0 flex-1 truncate">{a.name}</span>
+              <span className="min-w-0 flex-1 truncate">{shownName(a)}</span>
               <span className="truncate font-mono text-[10px] text-[#7f838d]">{a.ephemeral ? "pod" : a.hostname}</span>
             </DropdownMenu.Item>
           ))}
@@ -699,7 +700,8 @@ export default function TerminalWorkspace({ visible }: { visible: boolean }) {
 
         {tabs.length === 0 && (
           <div className="absolute inset-0 grid place-items-center overflow-y-auto px-4 py-10">
-            <div className="flex max-w-[640px] flex-col items-center text-center">
+            {/* No wider than the page: a long machine name in its list ends in …. */}
+            <div className="flex max-w-[min(640px,100%)] min-w-0 flex-col items-center text-center">
               <Optic size={200} />
               <div className="eyebrow mt-6">
                 <span className="spectrum-rule" /> 07 / Terminal
@@ -729,7 +731,7 @@ export default function TerminalWorkspace({ visible }: { visible: boolean }) {
                         className="flex min-h-11 w-full items-center gap-3 px-2 text-left text-[13px] text-[#c8cad0] transition-colors hover:bg-[#101114]"
                       >
                         <i className="dot" data-status="succeeded" aria-hidden="true" />
-                        <span className="min-w-0 flex-1 truncate">{a.name}</span>
+                        <span className="min-w-0 flex-1 truncate">{shownName(a)}</span>
                         <span className="hidden sm:inline">
                           <Chips labels={a.labels} max={3} />
                         </span>

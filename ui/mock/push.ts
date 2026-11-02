@@ -11,6 +11,7 @@ import type http from "node:http";
 import { createECDH, randomBytes } from "node:crypto";
 import type { AgentInfo } from "../src/api/harness.ts";
 import { defaultInfo } from "./defaults.ts";
+import { MAC_MINI } from "./data.ts";
 
 type Kind = "agent.needs_you" | "agent.finished" | "agent.stopped" | "agent.paused" | "machine.battery_low";
 
@@ -158,14 +159,14 @@ const fleet: AgentInfo[] = !FLEET
         approvals: [{ id: "b1", tool: "shell", tool_name: "Bash", title: "cargo test -p kiln http::client", at: t0 }],
       },
       { ...base("fleet-docs", "Docs for reach", "local", "codex", 30), status: "running", activity: "Editing docs/reach.md", doing: "Editing docs/reach.md" },
-      { ...base("fleet-ui", "Phone layout for Runs", "agent:metal-mac-mini", "claude", 25), status: "running", doing: "Running npx vite build" },
+      { ...base("fleet-ui", "Phone layout for Runs", `agent:${MAC_MINI}`, "claude", 25), status: "running", doing: "Running npx vite build" },
       {
         ...base("fleet-slates", "Slates", "agent:adas-macbook-pro-2.local", "claude", 26),
         status: "waiting",
         approvals: [{ id: "pp1", tool: "plan", tool_name: "ExitPlanMode", title: "Fix: a mount taken over by a restarted daemon dropped a store", at: t0 }],
       },
       {
-        ...base("fleet-plan", "Plan QUIC replication", "agent:metal-mac-mini", "claude", 24),
+        ...base("fleet-plan", "Plan QUIC replication", `agent:${MAC_MINI}`, "claude", 24),
         held: { why: 'Paused by the agent: plan "QUIC replication" is ready for you to look at: its steps go to the agent once you resume', plan: "pl_quic", since: t0 - 4 * 60_000 },
       },
       { ...base("fleet-crash", "Upgrade hyper-rt", "agent:metal-epyc-01", "codex", 22), status: "exited", exit: { code: 127, error: "codex: command not found" } },

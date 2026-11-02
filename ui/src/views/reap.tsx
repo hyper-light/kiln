@@ -26,7 +26,7 @@ import { Button } from "@/components/ui/button";
 import { Hold } from "@/components/ui/hold";
 import { Loadable } from "@/components/ui/loading";
 import { Facts, FoldSection, SelectField, TextField } from "@/components/ui/misc";
-import { useRes, type Res } from "@/lib/data";
+import { shownName, useRes, type Res } from "@/lib/data";
 import { invalidate } from "@/lib/resource";
 
 const viewRes = (at: ReapAt): Res<ReapView> => ({ key: `reap/${at.runner ?? ""}/${at.repo ?? ""}/${at.session ?? ""}`, fetch: (s) => reapPolicies(at, s) });
@@ -101,7 +101,7 @@ export function ReapPolicy({ scope, target, at }: { scope: ReapScope; target: st
   );
 }
 
-const runnersRes: Res<{ runners: { name: string }[] }> = { key: "reach/runners", fetch: (s) => api.reachRunners(s) };
+const runnersRes: Res<{ runners: { name: string; label?: string }[] }> = { key: "reach/runners", fetch: (s) => api.reachRunners(s) };
 
 /** The system page's section: the system's policy, and a runner's. */
 export function ReapSection({ index }: { index: string }) {
@@ -119,8 +119,8 @@ export function ReapSection({ index }: { index: string }) {
 }
 
 function ReapBody() {
-  const runners = useRes(runnersRes).data.runners.map((r) => r.name);
-  const [runner, setRunner] = React.useState(runners[0] ?? "");
+  const runners = useRes(runnersRes).data.runners;
+  const [runner, setRunner] = React.useState(runners[0]?.name ?? "");
   return (
     <div className="flex flex-col gap-6">
       <section aria-label="The system's policy">
@@ -129,7 +129,7 @@ function ReapBody() {
       </section>
       {runners.length > 0 && (
         <section aria-label="A runner's policy">
-          <SelectField label="A runner" value={runner} onChange={setRunner} options={runners.map((n) => ({ value: n, label: n }))} />
+          <SelectField label="A runner" value={runner} onChange={setRunner} options={runners.map((r) => ({ value: r.name, label: shownName(r) }))} />
           <Loadable label="the runner's cache policy" fallback={<Hold height={860} />}>
             <ReapPolicy key={runner} scope="runner" target={runner} at={{ runner }} />
           </Loadable>

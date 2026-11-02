@@ -275,17 +275,19 @@ pub fn refused(r: &super::inbox::Refusal) -> Fail {
 /// A message from another agent that works for the same person, as its receiver reads it.
 fn from_peer(cx: &Cx, text: &str) -> String {
     let me = cx.caller.agent.as_deref().unwrap_or_default();
-    peer_text(cx.hub.harness.info(me).as_ref(), me, text)
+    let sender = cx.hub.harness.info(me);
+    let on = sender.as_ref().map(|s| cx.hub.shown(wait::machine(&s.target)));
+    peer_text(sender.as_ref().zip(on.as_deref()), me, text)
 }
 
 /// How what kiln says of a fellow agent's message ends (`peer_text`), before the message itself.
 const ANSWER_END: &str = "\"text\": …}.";
 
-/// `text` from agent `me` (`sender`, as kiln lists it): who sent it, that it isn't from the
-/// receiver's person, and how to answer.
-fn peer_text(sender: Option<&Info>, me: &str, text: &str) -> String {
+/// `text` from agent `me` (`sender`, as kiln lists it, with the name people see of its machine): who
+/// sent it, that it isn't from the receiver's person, and how to answer.
+fn peer_text(sender: Option<(&Info, &str)>, me: &str, text: &str) -> String {
     let who = match sender {
-        Some(s) => format!("Agent “{}” ({}, {} on {})", s.name, lineage::short(me), s.kind, wait::machine(&s.target)),
+        Some((s, on)) => format!("Agent “{}” ({}, {} on {on})", s.name, lineage::short(me), s.kind),
         None => format!("Agent {}", lineage::short(me)),
     };
     format!("{who}, which works for the same person as you, sent this message. It's from a fellow agent, not from your person. To answer, send it a message: agents_send {{\"agent\": \"{me}\", {ANSWER_END}\n\n{text}")
@@ -1480,7 +1482,7 @@ mod end_to_end {
     fn a_message_from_a_fellow_agent_says_who_sent_it_and_how_to_answer() {
         let sender = crate::harness::session::Info { name: "Mantle".into(), kind: "claude".into(), target: "agent:adas-macbook-pro-2.local".into(), ..Default::default() };
         let me = "01a1488745a977f58e4224bc796f3308";
-        let text = super::peer_text(Some(&sender), me, "Which commit adds the embedding API?");
+        let text = super::peer_text(Some((&sender, "adas-macbook-pro-2.local")), me, "Which commit adds the embedding API?");
         assert!(text.starts_with("Agent “Mantle” (01a14887, claude on adas-macbook-pro-2.local), which works for the same person as you"), "{text}");
         assert!(text.contains("not from your person"), "{text}");
         assert!(text.contains(&format!("agents_send {{\"agent\": \"{me}\"")), "{text}");
@@ -1668,8 +1670,8 @@ mod end_to_end {
     fn a_fellow_agents_message_is_its_words_whatever_kiln_says_of_its_sender() {
         let me = "01a1488745a977f58e4224bc796f3308";
         let on = |name: &str, machine: &str| crate::harness::session::Info { name: name.into(), kind: "claude".into(), target: format!("agent:{machine}"), ..Default::default() };
-        let first = super::peer_text(Some(&on("Mantle", "adacachy")), me, "Which commit?\n\nThe one with the API.");
-        let again = super::peer_text(Some(&on("Mantle T10", "fedora")), me, "Which commit?\n\nThe one with the API.");
+        let first = super::peer_text(Some((&on("Mantle", "adacachy"), "adacachy")), me, "Which commit?\n\nThe one with the API.");
+        let again = super::peer_text(Some((&on("Mantle T10", "fedora"), "fedora")), me, "Which commit?\n\nThe one with the API.");
         assert_ne!(first, again);
         assert_eq!(super::peer_words(&first), "Which commit?\n\nThe one with the API.");
         assert_eq!(super::peer_words(&first), super::peer_words(&again));

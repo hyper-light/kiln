@@ -17,6 +17,7 @@ import { flushSync } from "react-dom";
 import { Dialog as D } from "radix-ui";
 import { ArrowLeft, ArrowRight, Check, ChevronDown, ChevronRight, FlaskConical, Minus, Plus, X } from "lucide-react";
 import { Button } from "@/components/ui/button";
+import { labelOf } from "@/lib/data";
 import { useMediaQuery } from "@/lib/hooks";
 import { cn } from "@/lib/utils";
 import type { ChoiceAnswer } from "@/api/harness";
@@ -1614,7 +1615,7 @@ function RunsPart({
       {machine && (
         <div className="ch-field">
           <span className="ch-field-label">Machine</span>
-          <span className="ch-field-value">{machine}</span>
+          <span className="ch-field-value">{labelOf(machine)}</span>
         </div>
       )}
     </div>

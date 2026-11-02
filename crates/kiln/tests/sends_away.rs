@@ -21,7 +21,9 @@ fn connected(port: u16, admin: &str, name: &str) -> anyhow::Result<bool> {
     let (_, body) = http(port, "GET", "/api/agents", admin, None)?;
     let v: Value = serde_json::from_str(&body).unwrap_or_default();
     let list = v.as_array().cloned().or_else(|| v.get("agents").and_then(Value::as_array).cloned()).unwrap_or_default();
-    Ok(list.iter().any(|a| a.get("name").and_then(Value::as_str) == Some(name) && a.get("connected").and_then(Value::as_bool) == Some(true)))
+    // Known by its machine id (docs/machines.md).
+    let key = common::machine(name);
+    Ok(list.iter().any(|a| a.get("name").and_then(Value::as_str) == Some(key.as_str()) && a.get("connected").and_then(Value::as_bool) == Some(true)))
 }
 
 /// Every stand-in harness's record of what it was handed, under `dir`.
@@ -94,7 +96,7 @@ fn a_message_for_a_runner_away_is_refused_and_reaches_one_harness_once_its_sessi
     let deadline = Instant::now() + Duration::from_secs(60);
     loop {
         let i = info(s.port, &s.admin, &id)?;
-        let on_b = i.get("target").and_then(Value::as_str) == Some("agent:b");
+        let on_b = i.get("target").and_then(Value::as_str) == Some(format!("agent:{}", common::machine("b")).as_str());
         let status = i.get("status").and_then(Value::as_str).unwrap_or_default().to_owned();
         if on_b && !status.is_empty() && !matches!(status.as_str(), "starting" | "exited") {
             if let Some(cwd) = i.get("cwd").and_then(Value::as_str) {

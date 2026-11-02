@@ -10,6 +10,7 @@ import type { Job, ReleaseBuild, Run, UpdateJob } from "@/api/types";
 import { Hold } from "@/components/ui/hold";
 import { Loadable } from "@/components/ui/loading";
 import { StatusDot } from "@/components/ui/status";
+import { labelOf, useLabels } from "@/lib/data";
 import { formatDuration, spanSeconds } from "@/lib/format";
 import { useNow } from "@/lib/hooks";
 import { useSuspenseResource } from "@/lib/resource";
@@ -24,6 +25,7 @@ const LogViewer = React.lazy(() => import("@/views/run-detail/log-viewer"));
 const PAGE = 200;
 
 export function BuildLogPanel({ id, p, build, updateJobs }: { id: string; p: PlatformView; build: ReleaseBuild | undefined; updateJobs: UpdateJob[] }) {
+  useLabels();
   const log = buildLogOf(p, build?.last ?? null, updateJobs);
   return (
     <section id={id} className="up-blog" data-kind={log.kind} aria-label={`The ${p.label} build's log`}>
@@ -59,6 +61,7 @@ function RunLog({ log, repo }: { log: Extract<BuildLog, { kind: "run" }>; repo: 
 
 /** A job of a release run: where it ran, its steps, and the log of the one picked, live while it runs. */
 function JobLog({ run, job }: { run: Run; job: Job }) {
+  useLabels();
   const now = useNow();
   // Following the job: the step running shows, until one is picked.
   const [chosen, setChosen] = React.useState<number | null>(null);
@@ -76,7 +79,7 @@ function JobLog({ run, job }: { run: Run; job: Job }) {
         </span>
         <span className="up-blog-meta">
           {run.sha.slice(0, 7)}
-          {job.agent ? ` · on ${job.agent}` : ""}
+          {job.agent ? ` · on ${labelOf(job.agent)}` : ""}
           {took !== null ? ` · ${formatDuration(took)}` : ""}
         </span>
       </header>
