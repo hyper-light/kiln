@@ -21,6 +21,7 @@ import { Link } from "@/lib/router";
 import { Tries } from "@/lib/tries";
 import { cn } from "@/lib/utils";
 import { Fold } from "@/views/harness/fold";
+import { ApproveInstead, useWaitsOn, type Approved } from "./approve";
 import { facetsOf, hasChosen, planDimensions, planMeta, planRow, useAsked } from "./browse";
 import { StepBar } from "./graph";
 import { PlanItemsEditor } from "./items";
@@ -170,9 +171,14 @@ function Found({
   );
 }
 
-/** A kept plan, opened in its row and read in full: what it does, and running it here, changing it, or its page. */
+/**
+ * A kept plan, opened in its row and read in full: what it does, and running it here, changing it, or
+ * its page. One its agent's goals wait on your review of is approved instead (approve.tsx).
+ */
 function Recall({ id, session, draft, onDraft, onSaved }: { id: string; session: string; draft: Draft | null; onDraft: (d: Draft | null) => void; onSaved: (p: Plan) => void }) {
   const p = useSuspenseResource(`plans/${id}`, (s) => plansApi.get(id, s).catch(unlessGone)).data;
+  const waits = useWaitsOn(id);
+  const [approved, setApproved] = React.useState<Approved | null>(null);
   const [mode, setMode] = React.useState<HereMode>("message");
   const [busy, setBusy] = React.useState(false);
   const [ran, setRan] = React.useState<PlanRan | null>(null);
@@ -217,11 +223,14 @@ function Recall({ id, session, draft, onDraft, onSaved }: { id: string; session:
       )}
       {p.phase === "planning" ? (
         <p className="ph-meta">Being planned: its agent is researching it and writing its steps; it runs once it says it&rsquo;s ready.</p>
+      ) : waits || approved ? (
+        // Its review is at the top of this tab when it's this agent's own.
+        <ApproveInstead plan={p} a={waits} approved={approved} onApproved={setApproved} here={waits?.id === session} />
       ) : (
         n > 0 && <SelectField label="Run as" value={mode} onChange={(v) => setMode(v as HereMode)} options={MODES} />
       )}
       <div className="plan-actions">
-        {p.phase !== "planning" && (
+        {p.phase !== "planning" && !waits && !approved && (
           <Button size="sm" variant="secondary" disabled={busy} onClick={() => void run()}>
             {busy ? "Sending…" : "Run here"}
           </Button>
@@ -234,7 +243,15 @@ function Recall({ id, session, draft, onDraft, onSaved }: { id: string; session:
         </Button>
         <span className="ph-meta">v{p.version}</span>
       </div>
-      {ran && <p className="plan-ok">{mode === "goals" && n ? `${ran.sent} goals lined up in its goal stack, below.` : `Sent ${ran.sent === 1 ? "the plan" : `${ran.sent} messages`}.`}</p>}
+      {ran && (
+        <p className="plan-ok">
+          {ran.approved
+            ? `Approved instead (its goals waited on your review of it): its ${ran.sent} step${ran.sent === 1 ? "" : "s"} go to it as its goal's parts.`
+            : mode === "goals" && n
+              ? `${ran.sent} goals lined up in its goal stack, below.`
+              : `Sent ${ran.sent === 1 ? "the plan" : `${ran.sent} messages`}.`}
+        </p>
+      )}
       {error && <p className="plan-error">{error}</p>}
     </div>
   );

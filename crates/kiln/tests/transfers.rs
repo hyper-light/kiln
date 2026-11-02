@@ -366,7 +366,7 @@ fn sent_again(port: u16, admin: &str, machine: &str) -> anyhow::Result<(u64, u64
 /// session had, the new build its receipt at the next once it's promoted, and it goes on at that
 /// epoch, with nothing the server's copy has sent to it again.
 #[test]
-#[cfg_attr(debug_assertions, ignore = "needs a release build: an upgrade downloads the server's own kiln, and a debug one is larger than kiln serves (updates::MAX_BINARY)")]
+#[cfg_attr(debug_assertions, ignore = "needs a release build: an upgrade downloads the server's own kiln, and a debug one is over a gigabyte")]
 fn w27_r08_session_hand_overs_blue_green_sends_nothing_again() -> anyhow::Result<()> {
     // The new build is this one, downloaded from the server: hundreds of MB for a debug build, so
     // under the build's own temporary folder, on disk.
@@ -440,7 +440,7 @@ fn transfers(v: &Value) -> Vec<(u64, String)> {
 /// there blue/green, taken over by a newer process of that machine, and resumed from kiln's copy
 /// once that machine is away: four hand-overs, epochs e0 to e0 + 4, each a verified transfer.
 #[test]
-#[cfg_attr(debug_assertions, ignore = "needs a release build: an upgrade downloads the server's own kiln, and a debug one is larger than kiln serves (updates::MAX_BINARY)")]
+#[cfg_attr(debug_assertions, ignore = "needs a release build: an upgrade downloads the server's own kiln, and a debug one is over a gigabyte")]
 fn w27_r08_session_hand_overs() -> anyhow::Result<()> {
     let dir = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR"))?;
     let s = start(dir.path(), &Options::default())?;
@@ -509,7 +509,7 @@ fn w27_r08_session_hand_overs() -> anyhow::Result<()> {
 /// machine's runner role, handed on by the process replaced and received by its new build, and each
 /// session, each a transfer signed by both sides; nothing moved without one.
 #[test]
-#[cfg_attr(debug_assertions, ignore = "needs a release build: an upgrade downloads the server's own kiln, and a debug one is larger than kiln serves (updates::MAX_BINARY)")]
+#[cfg_attr(debug_assertions, ignore = "needs a release build: an upgrade downloads the server's own kiln, and a debug one is over a gigabyte")]
 fn w27_r08_replant() -> anyhow::Result<()> {
     let dir = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR"))?;
     let s = start(dir.path(), &Options::default())?;
@@ -610,7 +610,7 @@ fn w27_r08_session_hand_overs_with_runners_from_before_go_unsigned() -> anyhow::
 /// is applied, and the new build holds all seven.
 #[cfg(feature = "chaos")]
 #[test]
-#[cfg_attr(debug_assertions, ignore = "needs a release build: an upgrade downloads the server's own kiln, and a debug one is larger than kiln serves (updates::MAX_BINARY)")]
+#[cfg_attr(debug_assertions, ignore = "needs a release build: an upgrade downloads the server's own kiln, and a debug one is over a gigabyte")]
 fn w27_ac05_the_1418_drop_played_again() -> anyhow::Result<()> {
     const SESSIONS: usize = 7;
     let dir = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR"))?;

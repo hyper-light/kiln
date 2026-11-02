@@ -5,4 +5,9 @@ import type { ToolKind } from "./ToolKind";
 /**
  * A pending approval, as lists show it.
  */
-export type ApprovalBrief = { id: string, tool: ToolKind, tool_name: string, title: string, at: number, };
+export type ApprovalBrief = { id: string, tool: ToolKind, tool_name: string, title: string, at: number, 
+/**
+ * The subagent that asks, as its request names it (`Approval::agent`): a list says whose it
+ * is without the agent's whole state.
+ */
+agent?: string, };

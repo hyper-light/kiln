@@ -204,17 +204,22 @@ layer.
 
 The channel makes up for what of these it carried, without waiting for a reconnect:
 - A receiver that sees an item past a gap drops it and asks for the stream again from the gap
-  (`Want`): once for the gap, and again every 64 items past it in case that want was lost, rather
-  than for each. Its sender sends what follows the gap again at once; a want for the same items soon after (an older receiver's, made before they
-  got there again) sends them again only once 250 ms have passed.
+  (`Want`): once for the gap, and again every 64 items past it in case that want or what it brought
+  was lost, rather than for each. A runner's server's commands are few in flight, so fewer than 64
+  might ever come past a gap in them. The runner asks for such a gap again on time instead: every
+  half second while it's still there, as more items past it come, and on its own clock up to 8
+  times after the last of them came, so a stream its server let go of isn't asked for for ever. Its
+  sender sends what follows the gap again at once; a want for the same items soon after (an older
+  receiver's, made before they got there again) sends them again only once 250 ms have passed.
 - A receiver behind its sender's `low` (it started again with less, and the stream went on) goes on
   from there: every item through `low` is answered.
 - An item whose answer doesn't come within the stream's patience (15 s for session updates and
   terminal output) is sent again, and the receiver takes it once.
 - A closed connection resumes as every reconnect does (`Have`).
 - What each side has (`Have`) is said again every few seconds, the runner's with its samples and
-  the server's every 5 s. A lost one doesn't hold a link's sends up: a sender's sends wait for the
-  first, and it takes the ones after as answers only.
+  the server's every 5 s, and a runner's twice more in a link's first seconds, a second apart. A
+  lost one doesn't hold a link's sends up for long: a sender's sends wait for the first, and it
+  takes the ones after as answers only.
 
 What a runner's QUIC layer drops it tells the server with its samples (`NetDrops`), once that
 changes. The runner's page shows both sides' counts, and the server exports what each runner last
@@ -698,6 +703,9 @@ travels in `HarnessCmd`.
 | `MoveOnLimit` | command, refused while away | As `AutoResume`. | Fire-and-forget. |
 | `LimitHold` | command, refused while away | The server works the hold out again once the machine is back. | Fire-and-forget. |
 | `OwnEdits` | ask | Answered by a `Reply` to its client: what one who changed its files did alone (docs/agents.md, "One subagent's own edits"). | New: a session whose features have `own_edits` answers it. |
+| `Pause` | command, refused while away | A person's pause of a session (its processes, held by its machine's pacer) or of one of its harness's subagents (held at its next tool call), or its end: they press it again if it didn't apply. The server sends a session's to the subagents kiln started under it too. | New. A runner from before it can't read it, and says so. |
+| `Perms` | command, refused while away | What a person lets a session (and its harness's subagents) or one of those subagents do; they set it again if it didn't apply. The server narrows a session's to its parent's, and the subagents kiln started under it to it. | New. A runner from before it can't read it, and says so. |
+| `Branch` | command, refused while away | A person's branch of a session, or of one of its harness's subagents: a new session on its machine from the conversation so far, beside it or of its own. They branch again if it didn't go. | New. A runner from before it can't read it, and says so. |
 
 ## Updates of a session: `Update`
 

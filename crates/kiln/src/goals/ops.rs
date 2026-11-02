@@ -808,17 +808,42 @@ mod tests {
         let person = Starter { parent: None, opener: Some("owner".into()), actor: "admin".into(), plan_run: None, asker: None };
         let ask = Ask { kind: "claude".into(), on: Some("local".into()), cwd: Some(cwd), name: Some("A".into()), count: Some(1), ..Ask::default() };
         let a = start(&hub, &person, ask).await.map_err(|(c, m)| anyhow::anyhow!("{c}: {m}"))?.into_iter().next().ok_or_else(|| anyhow::anyhow!("no agent"))?;
+        stopped(&hub, &a.id).await?;
         Ok((hub, a.id, folder))
     }
 
-    /// What agent `id`'s inbox took, once it has taken `n` (or after a while), each message then
-    /// taken out of its queue as its harness would take it, and the agent stopped again.
+    /// Waits (30 s at the most) until agent `id` is listed and stopped, as these tests start from.
+    /// A stack started before then has no agent to send its goal to, and on the tests' clock, which
+    /// only a test moves, the driver doesn't come round to send it later: the goals stay pending.
+    async fn stopped(hub: &Arc<crate::hub::Hub>, id: &str) -> anyhow::Result<()> {
+        let until = std::time::Instant::now() + Duration::from_secs(30);
+        while !hub.harness.info(id).is_some_and(|i| i.status == crate::harness::model::Status::Exited) {
+            anyhow::ensure!(std::time::Instant::now() < until, "agent {id} never stopped: {:?}", hub.harness.info(id).map(|i| i.status));
+            crate::rt::sleep(Duration::from_millis(20)).await;
+        }
+        Ok(())
+    }
+
+    /// What agent `id`'s inbox took once it took `n`, given 10 s (a loaded machine takes a while
+    /// to prompt it; a test with several still ends within its 90 s), each message then taken out
+    /// of its queue as its harness would take it, and the agent stopped again.
     async fn taken_by(hub: &Arc<crate::hub::Hub>, id: &str, n: usize) -> anyhow::Result<Vec<String>> {
+        taken_within(hub, id, n, Duration::from_secs(10)).await
+    }
+
+    /// What agent `id`'s inbox took, given 2 s for an `n`th that mustn't come: a request asked again
+    /// that would prompt it a second time.
+    async fn taken_no_more(hub: &Arc<crate::hub::Hub>, id: &str, n: usize) -> anyhow::Result<Vec<String>> {
+        taken_within(hub, id, n, Duration::from_secs(2)).await
+    }
+
+    async fn taken_within(hub: &Arc<crate::hub::Hub>, id: &str, n: usize, within: Duration) -> anyhow::Result<Vec<String>> {
         let inbox = hub.harness.local.inbox().cloned().ok_or_else(|| anyhow::anyhow!("no inbox"))?;
-        let mut taken = Vec::new();
-        for _ in 0..100 {
+        let until = std::time::Instant::now() + within;
+        let mut taken;
+        loop {
             taken = inbox.taken(id, 100).await?;
-            if taken.len() >= n {
+            if taken.len() >= n || std::time::Instant::now() >= until {
                 break;
             }
             crate::rt::sleep(Duration::from_millis(20)).await;
@@ -847,7 +872,7 @@ mod tests {
             call(me.clone(), "goals.add", input.clone()).await.map_err(|(c, m)| anyhow::anyhow!("{c}: {m}"))?;
             let once = taken_by(&hub, &id, 1).await?;
             call(me.clone(), "goals.add", input).await.map_err(|(c, m)| anyhow::anyhow!("{c}: {m}"))?;
-            let again = taken_by(&hub, &id, 2).await?;
+            let again = taken_no_more(&hub, &id, 2).await?;
             let s = crate::goals::get(&hub, &id).await?;
             anyhow::ensure!(once.len() == 1 && again == once, "goals.add asked again under its key: its inbox took {once:?}, then {again:?}; the stack {:?}", s.items.iter().map(|i| (i.status.clone(), i.text.clone())).collect::<Vec<_>>());
             Ok(())
@@ -868,7 +893,7 @@ mod tests {
             call(me.clone(), "goals.control", json!({"agent": id, "action": "resume"})).await.map_err(|(c, m)| anyhow::anyhow!("{c}: {m}"))?;
             let resumed = taken_by(&hub, &id, 2).await?;
             call(me.clone(), "goals.control", json!({"agent": id, "action": "resume"})).await.map_err(|(c, m)| anyhow::anyhow!("{c}: {m}"))?;
-            let again = taken_by(&hub, &id, 3).await?;
+            let again = taken_no_more(&hub, &id, 3).await?;
             anyhow::ensure!(again == resumed, "a resume asked again: its inbox took {first:?} for the goal, {resumed:?} once resumed, then {again:?} after the resume was asked again");
             Ok(())
         })
@@ -889,7 +914,7 @@ mod tests {
             call(me.clone(), "goals.done", done.clone()).await.map_err(|(c, m)| anyhow::anyhow!("{c}: {m}"))?;
             let after = taken_by(&hub, &id, 2).await?;
             let again = call(me.clone(), "goals.done", done).await;
-            let taken = taken_by(&hub, &id, 3).await?;
+            let taken = taken_no_more(&hub, &id, 3).await?;
             let st = |s: &crate::goals::Stack| s.items.iter().map(|i| (i.text.clone(), i.status.clone())).collect::<Vec<_>>();
             let s = crate::goals::get(&hub, &id).await?;
             anyhow::ensure!(
@@ -924,7 +949,7 @@ mod tests {
             let once = taken_by(&hub, &id, 1).await?;
             call(me.clone(), "goals.control", json!({"agent": id, "action": "pause"})).await.map_err(|(c, m)| anyhow::anyhow!("{c}: {m}"))?;
             call(me.clone(), "goals.add", input).await.map_err(|(c, m)| anyhow::anyhow!("{c}: {m}"))?;
-            let again = taken_by(&hub, &id, 2).await?;
+            let again = taken_no_more(&hub, &id, 2).await?;
             let s = crate::goals::get(&hub, &id).await?;
             anyhow::ensure!(once.len() == 1 && again == once && s.state == "paused", "goals.add asked again under its key after a pause: its inbox took {once:?}, then {again:?}; the stack is {} now", s.state);
             Ok(())
@@ -955,6 +980,7 @@ mod tests {
             let person = Starter { parent: None, opener: Some("owner".into()), actor: "admin".into(), plan_run: None, asker: None };
             let ask = Ask { kind: "claude".into(), on: Some("local".into()), cwd: Some(cwd), name: Some("A".into()), count: Some(1), ..Ask::default() };
             let id = start(&hub, &person, ask).await.map_err(|(c, m)| anyhow::anyhow!("{c}: {m}"))?.into_iter().next().ok_or_else(|| anyhow::anyhow!("no agent"))?.id;
+            stopped(&hub, &id).await?;
             let me = Cx { hub: Arc::clone(&hub), caller: crate::authz::Caller::owner() };
             let agent = Cx { hub: Arc::clone(&hub), caller: crate::mcp::session_caller(&hub, &id, None).await.map_err(anyhow::Error::msg)? };
             call(me.clone(), "goals.add", json!({"agent": id, "goals": ["one", "two", "three", "four"], "start": true})).await.map_err(|(c, m)| anyhow::anyhow!("{c}: {m}"))?;
@@ -972,7 +998,7 @@ mod tests {
             clock.advance(Duration::from_secs(3));
             // The agent's call, asked again (its answer lost), 9 s after the first.
             let again = call(agent.clone(), "goals.done", done).await;
-            let after = taken_by(&hub, &id, 4).await?;
+            let after = taken_no_more(&hub, &id, 4).await?;
             let s = crate::goals::get(&hub, &id).await?;
             let st: Vec<(String, String)> = s.items.iter().map(|i| (i.text.clone(), i.status.clone())).collect();
             anyhow::ensure!(
@@ -1007,7 +1033,7 @@ mod tests {
             let resumed = taken_by(&hub, &id, 2).await?;
             ask(json!({"agent": id, "action": "pause"})).await?;
             ask(json!({"agent": id, "action": "resume", "key": "r1"})).await?;
-            let again = taken_by(&hub, &id, 3).await?;
+            let again = taken_no_more(&hub, &id, 3).await?;
             let s = crate::goals::get(&hub, &id).await?;
             anyhow::ensure!(again == resumed && s.state == "paused", "a resume asked again under its key after a pause: its inbox took {} messages, then {}; the stack is {}", resumed.len(), again.len(), s.state);
             ask(json!({"agent": id, "action": "resume", "key": "r2"})).await?;
@@ -1021,7 +1047,7 @@ mod tests {
             ask(json!({"agent": id, "action": "skip", "id": two})).await?;
             let before = taken_by(&hub, &id, 5).await?;
             ask(json!({"agent": id, "key": "d1"})).await?;
-            let after = taken_by(&hub, &id, 6).await?;
+            let after = taken_no_more(&hub, &id, 6).await?;
             let s = crate::goals::get(&hub, &id).await?;
             let st: Vec<(String, String)> = s.items.iter().map(|i| (i.text.clone(), i.status.clone())).collect();
             anyhow::ensure!(s.items.iter().any(|i| i.text == "three" && i.status == "active") && after == before, "a done asked again under its key: the stack {st:?}; its inbox took {} messages, then {}", before.len(), after.len());
@@ -1082,6 +1108,7 @@ mod tests {
             let person = Starter { parent: None, opener: Some("owner".into()), actor: "admin".into(), plan_run: None, asker: None };
             let ask = Ask { kind: "claude".into(), on: Some("local".into()), cwd: Some(cwd), name: Some("A".into()), count: Some(1), ..Ask::default() };
             let id = start(&hub, &person, ask).await.map_err(|(c, m)| anyhow::anyhow!("{c}: {m}"))?.into_iter().next().ok_or_else(|| anyhow::anyhow!("no agent"))?.id;
+            stopped(&hub, &id).await?;
             let me = Cx { hub: Arc::clone(&hub), caller: crate::authz::Caller::owner() };
             let agent = Cx { hub: Arc::clone(&hub), caller: crate::mcp::session_caller(&hub, &id, None).await.map_err(anyhow::Error::msg)? };
             call(me.clone(), "goals.add", json!({"agent": id, "goals": ["one", "two", "three", "four"], "start": true})).await.map_err(|(c, m)| anyhow::anyhow!("{c}: {m}"))?;
@@ -1096,7 +1123,7 @@ mod tests {
             clock.advance(Duration::from_secs(3));
             // Asked again from that turn, its answer lost.
             let again = call(agent.clone(), "goals.done", done.clone()).await;
-            let after = taken_by(&hub, &id, 3).await?;
+            let after = taken_no_more(&hub, &id, 3).await?;
             let st = |s: &crate::goals::Stack| s.items.iter().map(|i| (i.text.clone(), i.status.clone())).collect::<Vec<_>>();
             let s = crate::goals::get(&hub, &id).await?;
             anyhow::ensure!(

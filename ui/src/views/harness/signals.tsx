@@ -5,7 +5,8 @@ import { ChevronRight } from "lucide-react";
 import { cn } from "@/lib/utils";
 import { useNow } from "@/lib/hooks";
 import { useMotionPreference } from "@/components/shell/motion";
-import { COMPACTING, frame, HEIGHT, newFrame, paint } from "./stands-light";
+import { condenseFrame, HEIGHT } from "./condense-light";
+import { newFrame, paint } from "./stands-light";
 import { thinkingWords } from "./thinking";
 
 export type OpticState = "idle" | "thinking" | "tool" | "compacting" | "waiting" | "done" | "ended";
@@ -232,13 +233,13 @@ export function LoadingMark({ className }: { className?: string }) {
   );
 }
 
-/** The moment a still ribbon is drawn at (motion paused or reduced): turned partly toward you. */
+/** The moment a still line is drawn at (motion paused or reduced): grains part of the way in. */
 const STILL = 1.3;
 
 /**
- * A compaction under way: Mission control's particle rule (stands-light.ts), working's light, on a
- * wider ribbon turning without end (`COMPACTING`), wired to its canvas as the rule's is: drawn each
- * frame (at most every 33 ms) while it's on screen and motion plays, still otherwise.
+ * A compaction under way: the line drawing itself together (condense-light.ts), wired to its canvas
+ * as Mission control's rule is: drawn each frame (at most every 33 ms) while it's on screen and
+ * motion plays, still otherwise.
  */
 function CondenseRibbon() {
   const { paused } = useMotionPreference();
@@ -262,7 +263,7 @@ function CondenseRibbon() {
         }
         ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
         ctx.clearRect(0, 0, width, HEIGHT);
-        paint(ctx, frame([{ stand: "working", x0: 0, x1: width, r0: 0, r1: width }], width, paused ? STILL : now / 1000, kept, COMPACTING));
+        paint(ctx, condenseFrame(width, paused ? STILL : now / 1000, kept));
       };
       const tick = (now: number) => {
         raf = 0;
@@ -300,7 +301,7 @@ function CondenseRibbon() {
 }
 
 /**
- * A compaction's rule. While it compacts (`live`), the particle ribbon turning about the line
+ * A compaction's rule. While it compacts (`live`), grains gathering into the line
  * (`CondenseRibbon`); after, the conversation's length as a hairline and the summary as the site's
  * 30 px prism bar, held still as the boundary it is, broken in the warning's tone where it didn't
  * compact (`warn`).

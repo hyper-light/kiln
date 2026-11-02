@@ -47,8 +47,6 @@ const REPORT_IN: Duration = Duration::from_secs(90);
 const RELEASE_TTL: Duration = Duration::from_secs(15 * 60);
 /// How long an image check stays good.
 const IMAGE_TTL: Duration = Duration::from_secs(10 * 60);
-/// Largest binary accepted for upload or from a release.
-pub const MAX_BINARY: usize = 256 << 20;
 /// Terminal sessions kiln opens to upgrade older runners carry this in their command: they are
 /// never listed (no one's terminal tab), also after a restart that adopts them back.
 pub const HIDDEN_MARK: &str = "# kiln-upgrade ";
@@ -448,15 +446,80 @@ fn executable(bytes: &[u8]) -> bool {
     bytes.starts_with(b"\x7fELF") || bytes.starts_with(b"MZ") || bytes.starts_with(&[0xcf, 0xfa, 0xed, 0xfe]) || bytes.starts_with(&[0xca, 0xfe, 0xba, 0xbe])
 }
 
-/// Keep `bytes` as the binary for `target` (an upload, or a release download).
-pub async fn store(hub: &Hub, target: &str, bytes: Vec<u8>, origin: &str) -> anyhow::Result<Binary> {
-    keep(hub, target, bytes, origin, None, None).await
+/// The bytes at a file's start that say which program it is: ELF, PE and Mach-O each say it in
+/// their first four ([`executable`], [`runs_on`]).
+const MAGIC: usize = 4;
+
+/// A binary on its way in (an upload, a machine's build, a release fetched from GitHub, a file of
+/// a release run's artifacts): written to a file as its bytes come, and hashed as they pass. None
+/// is held whole in memory on its way in, so none is too large for kiln: what bounds one is the
+/// disk it's written to, then the store it's kept in.
+pub struct Arriving {
+    file: std::fs::File,
+    hash: Sha256,
+    so_far: Arrived,
+}
+
+/// A binary that arrived whole ([`Arriving::done`]): its file (removed when this goes), its
+/// SHA-256 and size, and its first [`MAGIC`] bytes.
+pub struct Arrived {
+    pub path: PathBuf,
+    pub sha256: String,
+    pub size: u64,
+    head: Vec<u8>,
+}
+
+impl Arriving {
+    /// One whose file is in `dir` (the server's `<data>/updates`).
+    pub fn new(dir: &Path) -> anyhow::Result<Self> {
+        std::fs::create_dir_all(dir).with_context(|| format!("create {}", dir.display()))?;
+        let path = dir.join(format!(".arriving-{}", crate::util::new_id()));
+        let file = std::fs::File::create(&path).with_context(|| format!("create {}", path.display()))?;
+        Ok(Self { file, hash: Sha256::new(), so_far: Arrived { path, sha256: String::new(), size: 0, head: Vec::new() } })
+    }
+
+    /// Its next bytes.
+    pub fn write(&mut self, bytes: &[u8]) -> anyhow::Result<()> {
+        use std::io::Write as _;
+        let room = MAGIC.saturating_sub(self.so_far.head.len()).min(bytes.len());
+        self.so_far.head.extend_from_slice(bytes.get(..room).unwrap_or_default());
+        self.hash.update(bytes);
+        self.so_far.size = self.so_far.size.saturating_add(u64::try_from(bytes.len()).unwrap_or(u64::MAX));
+        self.file.write_all(bytes).with_context(|| format!("write {}", self.so_far.path.display()))
+    }
+
+    /// All of it: on disk, and its SHA-256 taken.
+    pub fn done(mut self) -> anyhow::Result<Arrived> {
+        self.file.sync_all().with_context(|| format!("write {}", self.so_far.path.display()))?;
+        let hash = std::mem::replace(&mut self.hash, Sha256::new());
+        let mut done = std::mem::replace(&mut self.so_far, Arrived { path: PathBuf::new(), sha256: String::new(), size: 0, head: Vec::new() });
+        done.sha256 = hex::encode(hash.finalize());
+        Ok(done)
+    }
+}
+
+impl Drop for Arrived {
+    fn drop(&mut self) {
+        if !self.path.as_os_str().is_empty() {
+            let _ = std::fs::remove_file(&self.path);
+        }
+    }
+}
+
+/// Where binaries arrive on their way to being kept: the server's `<data>/updates`.
+pub fn arriving_dir(hub: &Hub) -> PathBuf {
+    hub.cfg.data("updates")
+}
+
+/// Keep the binary that `arrived` for `target` (an upload, or a release download).
+pub async fn store(hub: &Hub, target: &str, arrived: &Arrived, origin: &str) -> anyhow::Result<Binary> {
+    keep(hub, target, arrived, origin, None, None).await
 }
 
 /// Keep the binary `machine` built of `commit` for its own platform (`crate::fleet`): what the
 /// other machines of the platform download.
-pub async fn keep_built(hub: &Hub, target: &str, bytes: Vec<u8>, machine: &str, commit: &str) -> anyhow::Result<Binary> {
-    keep(hub, target, bytes, "machine", None, Some((machine.to_owned(), commit.to_ascii_lowercase()))).await
+pub async fn keep_built(hub: &Hub, target: &str, arrived: &Arrived, machine: &str, commit: &str) -> anyhow::Result<Binary> {
+    keep(hub, target, arrived, "machine", None, Some((machine.to_owned(), commit.to_ascii_lowercase()))).await
 }
 
 /// Whether a run's binaries become what runners upgrade to: kiln's own release pipeline, built
@@ -475,18 +538,19 @@ pub fn adopts(u: &crate::config::Updates, run: &crate::store::Run, own: &str) ->
 /// build from a run of the server's commit; a run of a newer one (`crate::fleet`) brings that
 /// platform's too.
 pub async fn adopt_into(hub: &Hub, artifacts: &Path, run: &crate::store::Run) -> anyhow::Result<Vec<Binary>> {
-    let (a, r) = (artifacts.to_path_buf(), run.clone());
-    let found = crate::rt::blocking(move || binaries_in(&a, &r)).await??;
+    let (a, r, dir) = (artifacts.to_path_buf(), run.clone(), arriving_dir(hub));
+    let found = crate::rt::blocking(move || binaries_in(&a, &r, &dir)).await??;
     let mut kept = Vec::new();
-    for (target, bytes) in found {
-        kept.push(keep(hub, &target, bytes, "built", Some((run.number, run.sha.clone())), None).await?);
+    for (target, arrived) in found {
+        kept.push(keep(hub, &target, &arrived, "built", Some((run.number, run.sha.clone())), None).await?);
     }
     Ok(kept)
 }
 
 /// The binaries in a release run's artifacts, by target, as [`adopt_into`] takes them: v1's
-/// tarball, or the zip a leg of the CI engine uploaded ([`leg_artifacts`]).
-fn binaries_in(artifacts: &Path, run: &crate::store::Run) -> anyhow::Result<Vec<(String, Vec<u8>)>> {
+/// tarball, or the zip a leg of the CI engine uploaded ([`leg_artifacts`]); each written out under
+/// `dir` on its way.
+fn binaries_in(artifacts: &Path, run: &crate::store::Run, dir: &Path) -> anyhow::Result<Vec<(String, Arrived)>> {
     use std::io::Read as _;
     let open = || std::fs::File::open(artifacts).with_context(|| format!("open {}", artifacts.display()));
     let mut magic = [0u8; 4];
@@ -497,7 +561,7 @@ fn binaries_in(artifacts: &Path, run: &crate::store::Run) -> anyhow::Result<Vec<
         for i in 0..zip.len() {
             let entry = zip.by_index(i)?;
             let (name, size) = (entry.name()?.into_owned(), entry.size());
-            if !entry.is_dir() && !take_binary(&name, size, entry, run, &mut kept)? {
+            if !entry.is_dir() && !take_binary(&name, size, entry, run, dir, &mut kept)? {
                 break;
             }
         }
@@ -506,7 +570,7 @@ fn binaries_in(artifacts: &Path, run: &crate::store::Run) -> anyhow::Result<Vec<
         for entry in archive.entries()? {
             let entry = entry?;
             let (path, size) = (entry.path()?.to_string_lossy().into_owned(), entry.size());
-            if !take_binary(&path, size, entry, run, &mut kept)? {
+            if !take_binary(&path, size, entry, run, dir, &mut kept)? {
                 break;
             }
         }
@@ -515,27 +579,35 @@ fn binaries_in(artifacts: &Path, run: &crate::store::Run) -> anyhow::Result<Vec<
 }
 
 /// One file of a release run's artifacts, `size` bytes at `path`: kept in `kept` when it's a
-/// platform's binary, read whole, and that platform's program. False when it was cut short, as is
-/// everything after it.
-fn take_binary(path: &str, size: u64, mut from: impl std::io::Read, run: &crate::store::Run, kept: &mut Vec<(String, Vec<u8>)>) -> anyhow::Result<bool> {
+/// platform's binary, whole, and that platform's program, written out under `dir` as it's read.
+/// False when it was cut short, as is everything after it.
+fn take_binary(path: &str, size: u64, mut from: impl std::io::Read, run: &crate::store::Run, dir: &Path, kept: &mut Vec<(String, Arrived)>) -> anyhow::Result<bool> {
     let name = path.rsplit('/').next().unwrap_or(path);
     let Some(target) = name.strip_prefix("kiln-").map(|t| t.strip_suffix(".exe").unwrap_or(t)) else { return Ok(true) };
-    if !known_target(target) || (target == crate::api::TARGET && run.sha.eq_ignore_ascii_case(crate::api::COMMIT)) || size > MAX_BINARY as u64 {
+    if !known_target(target) || (target == crate::api::TARGET && run.sha.eq_ignore_ascii_case(crate::api::COMMIT)) {
         return Ok(true);
     }
-    let mut bytes = Vec::with_capacity(usize::try_from(size).unwrap_or(0));
-    from.read_to_end(&mut bytes)?;
+    let mut arriving = Arriving::new(dir)?;
+    let mut buf = vec![0u8; crate::blobs::io::PIECE as usize];
+    loop {
+        let n = from.read(&mut buf)?;
+        if n == 0 {
+            break;
+        }
+        arriving.write(buf.get(..n).unwrap_or_default())?;
+    }
+    let arrived = arriving.done()?;
     // An archive cut short (its upload broke off) reads as a shorter file, with no error: never
     // one runners would upgrade to. Nor what isn't its platform's program.
-    if u64::try_from(bytes.len()).unwrap_or(u64::MAX) != size {
-        tracing::warn!(target, run = run.number, got = bytes.len(), size, "a release binary cut short in its run's artifacts: not kept");
+    if arrived.size != size {
+        tracing::warn!(target, run = run.number, got = arrived.size, size, "a release binary cut short in its run's artifacts: not kept");
         return Ok(false);
     }
-    if !runs_on(target, &bytes) {
+    if !runs_on(target, &arrived.head) {
         tracing::warn!(target, run = run.number, "a release binary that isn't its platform's program: not kept");
         return Ok(true);
     }
-    kept.push((target.to_owned(), bytes));
+    kept.push((target.to_owned(), arrived));
     Ok(true)
 }
 
@@ -774,15 +846,16 @@ async fn keep_in_step(hub: &Hub, commit: &str, starts: &mut Starts) -> anyhow::R
 
 /// Keeps `bytes` as the binary for `target` in kiln's store of bytes: the binary, then what kiln
 /// knows of it; a release run's (`built`), or a machine's own build (`by`: the machine and commit).
-async fn keep(hub: &Hub, target: &str, bytes: Vec<u8>, origin: &str, built: Option<(i64, String)>, by: Option<(String, String)>) -> anyhow::Result<Binary> {
+/// Keep what `arrived` as `target`'s binary: put in the store from its file (in parts past a single
+/// put, its SHA-256 checked before anything is replaced), never read whole into memory.
+async fn keep(hub: &Hub, target: &str, arrived: &Arrived, origin: &str, built: Option<(i64, String)>, by: Option<(String, String)>) -> anyhow::Result<Binary> {
     anyhow::ensure!(known_target(target), "kiln has no platform called {target}");
-    anyhow::ensure!(bytes.len() > 1 << 20, "that file is too small to be a kiln binary");
-    anyhow::ensure!(executable(&bytes), "that file is not an executable (ELF, Mach-O or PE)");
-    let size = bytes.len() as u64;
+    anyhow::ensure!(arrived.size > 1 << 20, "that file is too small to be a kiln binary");
+    anyhow::ensure!(executable(&arrived.head), "that file is not an executable (ELF, Mach-O or PE)");
     let blobs = &hub.blobs.blobs;
-    let kept = blobs.put(&binary_key(target), bytes, kiln_seams::blobs::Put::default()).await.map_err(|e| anyhow::anyhow!("keeping the binary for {target}: {e}"))?;
+    crate::blobs::io::put_file(blobs.as_ref(), &binary_key(target), &arrived.path, Some(&arrived.sha256)).await.map_err(|e| anyhow::anyhow!("keeping the binary for {target}: {e}"))?;
     let (run, sha) = built.map_or((None, None), |(n, s)| (Some(n), Some(s)));
-    let mut meta = Binary { target: target.to_owned(), build: build_id(&kept.etag), sha256: kept.etag, size, origin: origin.to_owned(), at: crate::util::now_unix(), run, sha, by: None };
+    let mut meta = Binary { target: target.to_owned(), build: build_id(&arrived.sha256), sha256: arrived.sha256.clone(), size: arrived.size, origin: origin.to_owned(), at: crate::util::now_unix(), run, sha, by: None };
     if let Some((machine, commit)) = by {
         meta.sha = Some(commit);
         meta.by = Some(machine);
@@ -844,16 +917,20 @@ pub(crate) async fn get_following(client: &crate::http::client::Client, url: &st
     anyhow::bail!("too many redirects from {url}")
 }
 
-/// Download a release asset (`None`: the release has no such asset).
-async fn download_release(version: &str, target: &str) -> anyhow::Result<Option<Vec<u8>>> {
+/// Download a release asset into a file under `dir` (`None`: the release has no such asset).
+async fn download_release(version: &str, target: &str, dir: &Path) -> anyhow::Result<Option<Arrived>> {
     let url = release_asset_url(version, target);
     let client = crate::http::client::Client::public()?;
-    let resp = get_following(&client, &url, Duration::from_secs(300)).await.with_context(|| format!("download {url}"))?;
+    let mut resp = get_following(&client, &url, Duration::from_secs(300)).await.with_context(|| format!("download {url}"))?;
     if resp.status() == 404 {
         return Ok(None);
     }
     anyhow::ensure!(resp.is_success(), "GitHub answered {} for {url}", resp.status());
-    Ok(Some(resp.bytes(MAX_BINARY).await?.to_vec()))
+    let mut arriving = Arriving::new(dir)?;
+    while let Some(chunk) = resp.chunk().await? {
+        arriving.write(&chunk)?;
+    }
+    Ok(Some(arriving.done()?))
 }
 
 /// The binary for `target`, made available at `/dl/kiln/<target>`: this server's own, one kept
@@ -866,13 +943,13 @@ pub async fn ensure_binary(hub: &Hub, target: &str) -> anyhow::Result<(String, u
         return Ok((b.sha256, b.size));
     }
     let version = env!("CARGO_PKG_VERSION");
-    let Some(bytes) = download_release(version, target).await? else {
+    let Some(arrived) = download_release(version, target, &arriving_dir(hub)).await? else {
         anyhow::bail!(
             "kiln has no binary for {target}: this server is {}, none was uploaded for {target}, and GitHub has no v{version} release with one. Upload a kiln binary for {target} under System → Builds.",
             crate::api::TARGET
         );
     };
-    let b = store(hub, target, bytes, "release").await?;
+    let b = store(hub, target, &arrived, "release").await?;
     Ok((b.sha256, b.size))
 }
 
@@ -2287,24 +2364,32 @@ pub async fn upgrade_server(hub: &Arc<Hub>, action: &str) -> anyhow::Result<Job>
 
 async fn replace_binary(hub: &Arc<Hub>, id: &str, r: &Replacement, exe: PathBuf) -> anyhow::Result<()> {
     let u = &hub.updates;
-    let bytes = if r.origin == "upload" {
-        stored(hub, crate::api::TARGET).ok_or_else(|| anyhow::anyhow!("the uploaded binary is gone"))?;
-        crate::blobs::io::get_all(hub.blobs.blobs.as_ref(), &binary_key(crate::api::TARGET), MAX_BINARY as u64).await.map_err(|e| anyhow::anyhow!("reading the uploaded binary: {e}"))?.1
+    // Read into a file as it comes, never whole into memory.
+    let arrived = if r.origin == "upload" {
+        let b = stored(hub, crate::api::TARGET).ok_or_else(|| anyhow::anyhow!("the uploaded binary is gone"))?;
+        let mut arriving = Arriving::new(&arriving_dir(hub))?;
+        let pieces = crate::blobs::io::read_stream(Arc::clone(&hub.blobs.blobs), binary_key(crate::api::TARGET), None, 0, b.size.saturating_sub(1));
+        while let Ok(piece) = pieces.recv().await {
+            arriving.write(&piece)?;
+        }
+        let arrived = arriving.done()?;
+        anyhow::ensure!(arrived.size == b.size && arrived.sha256 == b.sha256, "the uploaded binary didn't read back whole: {} bytes, sha256 {}; kept as {} bytes, {}", arrived.size, arrived.sha256, b.size, b.sha256);
+        arrived
     } else {
         let version = r.version.clone().ok_or_else(|| anyhow::anyhow!("no release version"))?;
         let target = own_release_target().ok_or_else(|| anyhow::anyhow!("releases have no build for this platform"))?;
         u.say(hub, id, format!("downloading kiln {version} for {target} from GitHub"));
-        download_release(&version, target).await?.ok_or_else(|| anyhow::anyhow!("the v{version} release has no binary for {target}"))?
+        download_release(&version, target, &arriving_dir(hub)).await?.ok_or_else(|| anyhow::anyhow!("the v{version} release has no binary for {target}"))?
     };
-    anyhow::ensure!(executable(&bytes), "that binary is not an executable");
-    let build = build_id(&hex::encode(Sha256::digest(&bytes)));
+    anyhow::ensure!(executable(&arrived.head), "that binary is not an executable");
+    let build = build_id(&arrived.sha256);
     anyhow::ensure!(build != own_build(), "that is the build already running");
     u.update(hub, id, |j| j.to_build = Some(build.clone()));
     u.say(hub, id, format!("installing build {build} over {}", exe.display()));
     crate::rt::blocking(move || -> anyhow::Result<()> {
         let dir = exe.parent().ok_or_else(|| anyhow::anyhow!("no directory for {}", exe.display()))?;
         let tmp = dir.join(format!(".kiln.upgrade.{}", std::process::id()));
-        std::fs::write(&tmp, &bytes).with_context(|| format!("write {} (may kiln write there?)", tmp.display()))?;
+        std::fs::copy(&arrived.path, &tmp).with_context(|| format!("write {} (may kiln write there?)", tmp.display()))?;
         crate::os::make_executable(&tmp)?;
         std::fs::rename(&tmp, &exe).with_context(|| format!("replace {}", exe.display()))?;
         Ok(())
@@ -2373,7 +2458,6 @@ async fn download_verified(http: &crate::http::client::Client, server_url: &str,
     let say = |line: String| up.say(AgentMsg::UpgradeLog { job: order.job.to_owned(), line });
     let (path, sha256, size) = (order.path, order.sha256, order.size);
     anyhow::ensure!(path.starts_with("/dl/kiln/") && !path.contains(".."), "refusing to fetch {path}");
-    anyhow::ensure!(usize::try_from(size).is_ok_and(|s| s <= MAX_BINARY), "the binary is too large ({size} bytes)");
     let url = format!("{}{path}", server_url.trim_end_matches('/'));
     say(format!("downloading {url}"));
     let mut resp = http.get(&url).timeout(Duration::from_secs(600)).send().await?;
@@ -3098,7 +3182,9 @@ mod tests {
             load(&hub).await;
             assert_eq!(stored(&hub, t).map(|b| b.sha256), Some(first));
             // Replaced here: the files it was taken from go.
-            let uploaded = store(&hub, t, elf(2), "upload").await?.sha256;
+            let mut arriving = Arriving::new(&arriving_dir(&hub))?;
+            arriving.write(&elf(2))?;
+            let uploaded = store(&hub, t, &arriving.done()?, "upload").await?.sha256;
             assert!(!dir.join(format!("kiln-{t}")).exists());
             // Rolled back, the older kiln kept a newer one; started again, it's the one.
             let newer = as_files(&elf(3), now + Duration::from_secs(60))?;
@@ -3234,12 +3320,13 @@ mod tests {
         if std::process::Command::new("curl").arg("--version").output().is_err() {
             return Ok(());
         }
-        // A fake `kiln` behind a file:// URL stands in for the download.
+        // A fake `kiln` behind a file:// URL stands in for the download: its path with forward
+        // slashes (`file:///C:/…` on Windows, whose backslashes the shell would take as escapes).
         let dir = tempfile::tempdir()?;
         let fake = dir.path().join("kiln");
         std::fs::write(&fake, "#!/bin/sh\necho \"fake kiln $*\"\n")?;
         let sha = hex::encode(Sha256::digest(std::fs::read(&fake)?));
-        let url = format!("file://{}", fake.display());
+        let url = format!("file:///{}", fake.display().to_string().replace('\\', "/").trim_start_matches('/'));
         let script = terminal_script("j", std::slice::from_ref(&url), &sha, "");
         let out = std::process::Command::new("sh").arg("-c").arg(&script).env("TMPDIR", dir.path()).output()?;
         let text = String::from_utf8_lossy(&out.stdout);
@@ -3247,8 +3334,9 @@ mod tests {
         assert!(text.contains("fake kiln install --agent --upgrade --service"), "{text}");
         assert!(text.contains(OK_MARK), "{text}");
         // As a runner's terminal runs it: `sh -c '<script>'` handed to the user's own shell.
+        // A shell that can't run `true` isn't there (Windows' WSL `bash.exe` with no distribution).
         for shell in ["sh", "bash", "zsh", "fish"] {
-            if std::process::Command::new(shell).arg("-c").arg("true").output().is_err() {
+            if !std::process::Command::new(shell).arg("-c").arg("true").output().is_ok_and(|o| o.status.success()) {
                 continue;
             }
             let out = std::process::Command::new(shell).arg("-c").arg(format!("sh -c '{script}'")).env("TMPDIR", dir.path()).output()?;

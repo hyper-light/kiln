@@ -420,7 +420,7 @@ mod tests {
     }
 
     fn ask(id: &str, at: i64, tool: ToolKind, title: &str) -> ApprovalBrief {
-        ApprovalBrief { id: id.into(), tool, tool_name: if tool == ToolKind::Shell { "Bash".into() } else { String::new() }, title: title.into(), at }
+        ApprovalBrief { id: id.into(), tool, tool_name: if tool == ToolKind::Shell { "Bash".into() } else { String::new() }, title: title.into(), at, agent: None }
     }
 
     fn ended(at: i64, how: &str) -> Option<TurnEnd> {

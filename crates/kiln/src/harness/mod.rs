@@ -42,6 +42,7 @@ pub mod gitstate;
 pub mod goback;
 pub mod handing;
 pub mod handoff;
+pub mod hold;
 pub mod homes;
 pub mod host;
 pub mod inbox;

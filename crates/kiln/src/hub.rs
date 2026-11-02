@@ -1340,7 +1340,7 @@ impl Hub {
             let on_channel = stream.filter(|_| self.cmds.lock().keeps(p));
             match on_channel {
                 Some(kind) => {
-                    away &= !self.cmds.lock().is_up(p);
+                    away &= self.cmds.lock().is_away(p);
                     let mut rx = self.cmds.lock().push(p, kind, body.clone(), Instant::now());
                     match rx.try_recv() {
                         Ok(Some(a)) => given.push(a),
@@ -1875,7 +1875,7 @@ impl Hub {
         use crate::wire::channel::{Arrival, Frame, Refusal};
         match frame {
             Frame::Item { stream, seq, low, body } => {
-                let answer = match self.wire.on_item(agent, &stream, seq, low, body) {
+                let answer = match self.wire.on_item(agent, &stream, seq, low, body, Instant::now()) {
                     Arrival::Take(body) => {
                         let refusal = match proto::read_agent(&body) {
                             Ok(AgentMsg::Wire(_)) => {

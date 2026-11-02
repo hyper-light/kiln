@@ -220,7 +220,7 @@ mod tests {
             let mut back = Vec::new();
             for f in frames {
                 let Frame::Item { stream, seq, low, body } = f else { continue };
-                match self.rx.on_item(&stream, seq, low, body) {
+                match self.rx.on_item(&stream, seq, low, body, Instant::now()) {
                     Arrival::Take(body) => {
                         self.taken_bytes += body.len();
                         let session = session_of(&stream).unwrap_or_default().to_owned();

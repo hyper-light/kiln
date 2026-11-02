@@ -157,6 +157,26 @@ pub fn settle(core: &mut Core, of: impl Fn(&Core, &Task) -> (Vec<SendMode>, Opti
     }
 }
 
+/// Which of its subagents a person can pause now (`Task::pausable`), as its harness allows (`can`):
+/// one still going. One that ended keeps no pause.
+pub fn settle_pausable(core: &mut Core, can: impl Fn(&Task) -> bool) {
+    let mut changed = false;
+    for t in core.state.tasks.iter_mut().filter(|t| t.subagent()) {
+        let now = t.live() && can(t);
+        if t.pausable != now {
+            t.pausable = now;
+            changed = true;
+        }
+        if !t.live() && t.paused_at.is_some() {
+            t.paused_at = None;
+            changed = true;
+        }
+    }
+    if changed {
+        core.touch_state();
+    }
+}
+
 /// What kiln asks an agent to pass on to its subagent `t` (whose harness takes nothing from kiln
 /// itself), `how` naming its tool: the person's words as they are, with the files they attached
 /// by their paths.
@@ -190,6 +210,22 @@ mod tests {
 
     fn msg(id: &str, text: &str) -> QueueItem {
         QueueItem { id: id.into(), text: text.into(), at: 1, attachments: Vec::new(), overrides: None, reply_to: None }
+    }
+
+    #[test]
+    fn a_subagent_can_be_paused_while_it_goes_where_its_harness_holds_it_and_one_that_ended_keeps_no_pause() {
+        let mut core = Core::new();
+        let ended = Task { status: "completed".into(), paused_at: Some(5), ..sub("done", Vec::new()) };
+        let shell = Task { class: Some("shell".into()), ..sub("sh", Vec::new()) };
+        core.state.tasks = vec![sub("live", Vec::new()), ended, shell];
+        settle_pausable(&mut core, |_| true);
+        let by = |core: &Core, id: &str| core.state.tasks.iter().find(|t| t.id == id).map(|t| (t.pausable, t.paused_at));
+        assert_eq!(by(&core, "live"), Some((true, None)));
+        assert_eq!(by(&core, "done"), Some((false, None)), "ended: nothing to pause, and its pause is gone");
+        assert_eq!(by(&core, "sh"), Some((false, None)), "not a subagent");
+        // A harness that can't hold its subagents offers none.
+        settle_pausable(&mut core, |_| false);
+        assert_eq!(by(&core, "live"), Some((false, None)));
     }
 
     #[test]

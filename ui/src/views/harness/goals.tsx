@@ -35,6 +35,7 @@ import { GoalPlan } from "./goal-plan";
 import { useFold } from "./fold";
 import { cn } from "@/lib/utils";
 import { machineWord, type GoalStep } from "./goal-plan-layout";
+import { stepLive, threadHref } from "./subagent-tree";
 import { PlannerLive } from "./planner";
 import { revealReview } from "@/views/plans/reveal";
 import "./goals.css";
@@ -141,14 +142,16 @@ function usePlanned(goal: GoalItem, items: GoalItem[], paused: boolean, agent: s
     const n = i + 1;
     const r = ran?.find((x) => x.n === n);
     if (r) {
-      const who = whoOf(sessions.find((x) => x.id === r.agent_id)) ?? (r.agent ? `${r.agent.kind} · ${machineWord(r.agent.machine)}` : undefined);
-      return { n, title, needs: waits[i] ?? [], stand: r.stand, who };
+      const at = sessions.find((x) => x.id === r.agent_id);
+      const who = whoOf(at) ?? (r.agent ? `${r.agent.kind} · ${machineWord(r.agent.machine)}` : undefined);
+      // Its own agent, live under the step: what it's at, and its thread.
+      return { n, title, needs: waits[i] ?? [], stand: r.stand, who, live: at ? stepLive(at, `/agents/${at.id}`) : undefined };
     }
     const part = items.find((x) => x.part_of === goal.id && x.part_kind === "plan" && x.step?.n === n);
     // Out on a subagent, side by side with the plan's other steps: who it is, and whether it waits on you.
     const sub = part && outOn(part) ? sessions.find((x) => x.id === part.subagent) : undefined;
     const stand = sub && !paused && (sub.approvals.length > 0 || sub.status === "waiting") ? "needs_you" : (stepStand(goal, items, n, paused) ?? "waiting");
-    return { n, title, needs: waits[i] ?? [], stand, who: sub ? whoOf(sub) : own, checks: checksOf(part, items) };
+    return { n, title, needs: waits[i] ?? [], stand, who: sub ? whoOf(sub) : own, checks: checksOf(part, items), live: sub ? stepLive(sub, threadHref(agent, agent, sub.id)) : undefined };
   });
   return { plan: p, run, steps, planning };
 }
