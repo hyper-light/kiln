@@ -240,8 +240,14 @@ Joining is never automatic: a machine asks, an admin decides.
 1. `kiln join` browses for three seconds (`--server URL` skips that), lists the servers it heard
    (asking which one when there are several; `--yes` takes the only one), generates a key and a
    CSR locally (the private key never leaves the machine) and a random secret, and sends
-   `POST /api/join-requests` with its name, host name, OS, architecture, labels (default
-   `[baremetal, <os>, <arch>]`), the CSR and the SHA-256 of the secret.
+   `POST /api/join-requests` with its name, host name, machine id, OS, architecture, labels
+   (default `[baremetal, <os>, <arch>]`), the CSR and the SHA-256 of the secret. The machine id is a
+   hash of the id the OS keeps for the machine (macOS's hardware UUID, Linux's `/etc/machine-id`,
+   Windows' `MachineGuid`); the OS's id itself never leaves the machine. A container (Docker's,
+   Podman's, a Kubernetes pod's) has no machine of its own: its id is one kept with its data
+   (`machine-id` in kiln's data directory, on its volume), made the first time from its pod's UID
+   (`KILN_POD_UID`, which kiln's pods and chart give it from the Downward API) or at random. The
+   same volume is the same machine.
 2. The server keeps the request in memory for 10 minutes and answers with an id, a random nonce and
    its CA certificate. At most 20 requests wait at once and each source address may send one every
    5 seconds (HTTP 429 with `Retry-After` otherwise).
@@ -255,11 +261,24 @@ Joining is never automatic: a machine asks, an admin decides.
    make the two codes agree except by a one-in-a-million guess per (rate-limited) attempt. The admin
    approves only when the UI shows the code the machine shows. The machine also refuses to continue
    if the server reports a different code, a different CA, or a certificate for another key.
-5. **Approval** signs the CSR with the kiln CA exactly as enrollment does (365 days). The agent's
-   name is the requested one unless an agent on another host (or the server's local agent) already
-   has it; then it becomes `<name>-2`, `-3`, …, and the agent takes its name from the certificate.
-   The server's own machine asking for its local agent's name is refused (409) rather than named
-   `<name>-2`: that agent is already the machine's runner, and a machine runs one.
+5. **Approval** signs the CSR with the kiln CA exactly as enrollment does (365 days). A machine
+   that sent its machine id is known by it ([machines.md](machines.md)): the certificate carries the
+   id as the agent's name, the key every part of kiln knows it by (its connections, rows, routes,
+   sessions, its member in the cluster group), and the requested name becomes its **label**, the
+   name people see in the UI, the CLI and the metrics. The label is the requested one unless
+   another machine's agent (or the server's local agent) already has it, as its name or its label;
+   then it becomes `<name>-2`, `-3`, …. Which machine an agent is, its machine id says: one with
+   another id is another machine whatever its host name (macOS names two Macs "Ada's MacBook Pro"
+   alike until one of them notices), and the same machine joining again is the same agent. A
+   machine that doesn't send an id (a kiln from before) is named as before: its name is the
+   requested one, told apart from others by host name, and the agent takes it from the
+   certificate; once it runs a kiln that sends one, it moves to its id as it starts, what kiln
+   kept under its name with it ([machines.md](machines.md#runners-from-before)). A machine
+   enrolling with the join token (`kiln install --agent --token`), and an outpost, are named the
+   same way. The server's own machine asking for its local agent's name, or with its machine id, is
+   refused (409) rather than named `<name>-2`: that agent is already the machine's runner, and a
+   machine runs one. A runner's label is changed under Runners (its details) or by
+   `POST /api/agents/:name/label`; nothing kiln keys by its name moves.
    The answer carries the certificate, the CA and the QUIC address (the address the machine reached
    the HTTP API at, when that is an IP, else the advertised one).
 6. The machine stores the credentials in the agent state directory like enrollment

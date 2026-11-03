@@ -12,7 +12,7 @@ import { Loadable } from "@/components/ui/loading";
 import { Facts, PageIntro, Panel } from "@/components/ui/misc";
 import { StatusDot } from "@/components/ui/status";
 import { toast } from "@/components/ui/toast";
-import { useRes, warm } from "@/lib/data";
+import { labelOf, useLabels, useRes, warm } from "@/lib/data";
 import { formatBytes } from "@/lib/format";
 import { errorMessage } from "@/lib/hooks";
 import { invalidate } from "@/lib/resource";
@@ -111,6 +111,8 @@ function agreement(mine: ObserveStatus["verified_hex"], theirs: ObserveStatus["v
 
 function Store() {
   const res = useRes(statusRes);
+  // Each machine by the name people see (its label, docs/machines.md).
+  const labels = useLabels();
   const s = res.data;
   const [busy, setBusy] = React.useState(false);
   const leaderApplied = s.applied;
@@ -175,7 +177,7 @@ function Store() {
                     <tr key={m.machine}>
                       <td>
                         <StatusDot status={m.up ? "succeeded" : "skipped"} title={m.up ? "Connected" : "Away"} className="mr-2" />
-                        {m.machine}
+                        {labelOf(m.machine, labels)}
                         {m.status?.fetching && <span className="ml-2 text-[#8c8f98]">fetching a snapshot: {Math.round((100 * m.status.fetching[0]) / Math.max(1, m.status.fetching[1]))}%</span>}
                         {m.status?.error && <p className="text-[11px] text-[#e2c4c6]">{m.status.error}</p>}
                       </td>

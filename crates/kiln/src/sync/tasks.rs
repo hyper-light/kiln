@@ -433,12 +433,12 @@ pub async fn start(hub: &Arc<Hub>, ask: Ask) -> Result<Vec<Task>, String> {
             (row.origin.clone(), true, None)
         }
         Source::Machine { machine: m, path: p } => {
-            let src = place(m, p).ok_or_else(|| format!("{m} has no copy of {} at {p}", row.name))?;
+            let src = place(m, p).ok_or_else(|| format!("{} has no copy of {} at {p}", hub.shown(m), row.name))?;
             let mv = machine(m).ok_or_else(|| format!("no machine named {m}"))?;
-            anyhow_free(mv.connected, &format!("{m} is offline"))?;
+            anyhow_free(mv.connected, &format!("{} is offline", hub.shown(m)))?;
             let git = src.git.is_some();
             if git {
-                anyhow_free(mv.can_clone, &format!("{m}'s runner is too old to bundle repositories: upgrade it"))?;
+                anyhow_free(mv.can_clone, &format!("{}'s runner is too old to bundle repositories: upgrade it", hub.shown(m)))?;
             }
             let copy = src.copy.as_ref().filter(|c| !c.moving).map(|c| (c.repo.clone(), c.member));
             (src.git.as_ref().and_then(|g| g.origin.clone()), git, copy)
@@ -544,11 +544,11 @@ fn anyhow_free(ok: bool, why: &str) -> Result<(), String> {
 /// is forgotten, and with `delete` the folder goes.
 async fn remove(hub: &Arc<Hub>, row: &Row, ask: &Ask, view: &super::places::View) -> Result<Vec<Task>, String> {
     let Some(Source::Machine { machine, path }) = ask.from.clone() else { return Err("which place to give up".into()) };
-    let place = row.places.iter().find(|p| p.machine == machine && p.path == path).cloned().ok_or_else(|| format!("{machine} has no copy of {} at {path}", row.name))?;
+    let place = row.places.iter().find(|p| p.machine == machine && p.path == path).cloned().ok_or_else(|| format!("{} has no copy of {} at {path}", hub.shown(&machine), row.name))?;
     let m = view.machines.iter().find(|m| m.name == machine);
     if ask.delete || place.kind != "copy" {
-        anyhow_free(m.is_some_and(|m| m.connected), &format!("{machine} is offline"))?;
-        anyhow_free(m.is_some_and(|m| m.can_clone), &format!("{machine}'s runner is too old for that: upgrade it"))?;
+        anyhow_free(m.is_some_and(|m| m.connected), &format!("{} is offline", hub.shown(&machine)))?;
+        anyhow_free(m.is_some_and(|m| m.can_clone), &format!("{}'s runner is too old for that: upgrade it", hub.shown(&machine)))?;
     }
     anyhow_free(ask.delete || place.kind != "found", "kiln didn't make that folder: it can only delete it")?;
     let now = crate::util::now_unix();
@@ -581,12 +581,12 @@ async fn remove(hub: &Arc<Hub>, row: &Row, ask: &Ask, view: &super::places::View
     crate::rt::spawn(async move {
         let out: Result<String, String> = async {
             if let Some(c) = &copy {
-                h.tasks.set(&h, &t.id, "leaving", format!("{machine} stops syncing it"));
+                h.tasks.set(&h, &t.id, "leaving", format!("{} stops syncing it", h.shown(&machine)));
                 h.sync.ask(super::server::Ask::RemoveCopy { repo: c.repo.clone(), member: c.member }).await?;
             }
             if t.delete {
                 delete_on(&h, &t.id, &machine, &path, origin.as_deref()).await?;
-                Ok(format!("{path} deleted on {machine}"))
+                Ok(format!("{path} deleted on {}", h.shown(&machine)))
             } else {
                 h.sync.send(&machine, Msg::Forget { path: path.clone() });
                 h.sync.send(&machine, Msg::Look);
@@ -662,12 +662,12 @@ async fn drive_batch(hub: &Arc<Hub>, b: &Batch) -> Result<(), String> {
         }
         Source::Machine { machine, path } if b.source_git => {
             for id in &ids {
-                hub.tasks.set(hub, id, "bundling", format!("{machine} bundles its commits"));
+                hub.tasks.set(hub, id, "bundling", format!("{} bundles its commits", hub.shown(machine)));
             }
             hub.tasks.inner.lock().bundles.insert(b.id.clone(), Bundle { from: Some(machine.clone()), to, hash: None, size: 0 });
             hub.sync.send(machine, Msg::Bundle { task: b.id.clone(), path: path.clone() });
             wait_news(hub, &b.id, machine, &ids).await?;
-            let (hash, size) = hub.tasks.bundled(&b.id).ok_or_else(|| format!("{machine} said it sent the bundle, and none came"))?;
+            let (hash, size) = hub.tasks.bundled(&b.id).ok_or_else(|| format!("{} said it sent the bundle, and none came", hub.shown(machine)))?;
             Commits::Bundle { hash, size }
         }
         Source::Machine { .. } => Commits::Folder,
@@ -681,7 +681,7 @@ async fn drive_batch(hub: &Arc<Hub>, b: &Batch) -> Result<(), String> {
             match clone_on(hub, b, id, m, p, source).await {
                 Ok((head, _)) => {
                     hub.tasks.update(hub, id, |t| t.head.clone_from(&head));
-                    hub.tasks.done(hub, id, format!("cloned into {p} on {m}"));
+                    hub.tasks.done(hub, id, format!("cloned into {p} on {}", hub.shown(m)));
                 }
                 Err(e) => hub.tasks.fail(hub, id, e),
             }
@@ -715,7 +715,7 @@ async fn drive_batch(hub: &Arc<Hub>, b: &Batch) -> Result<(), String> {
     let (group, transient) = match (&b.from, &b.source_copy) {
         // The source is a copy: its group.
         (Source::Machine { machine, .. }, Some((repo, member))) => {
-            wait_in_step(hub, repo, *member, &ids, &format!("the copy on {machine}")).await?;
+            wait_in_step(hub, repo, *member, &ids, &format!("the copy on {}", hub.shown(machine))).await?;
             (repo.clone(), false)
         }
         // A move of a folder not synced: a group for the move alone, from it.
@@ -740,7 +740,7 @@ async fn drive_batch(hub: &Arc<Hub>, b: &Batch) -> Result<(), String> {
         if first.as_ref() == Some(id) {
             continue;
         }
-        hub.tasks.set(hub, id, "joining", format!("{m} joins the sync"));
+        hub.tasks.set(hub, id, "joining", format!("{} joins the sync", hub.shown(m)));
         let member = match member_at(hub, &group, m, p) {
             Some(member) => member,
             None => match hub.sync.ask(super::server::Ask::AddCopy { repo: group.clone(), machine: m.clone(), path: p.clone(), adopt: cloned_here }).await {
@@ -755,7 +755,7 @@ async fn drive_batch(hub: &Arc<Hub>, b: &Batch) -> Result<(), String> {
     }
     let caught = futures::future::join_all(joined.iter().map(|(id, m, _, repo, member)| async move {
         hub.tasks.update(hub, id, |t| t.synced = Some(repo.clone()));
-        wait_in_step(hub, repo, *member, std::slice::from_ref(*id), &format!("the copy on {m}")).await
+        wait_in_step(hub, repo, *member, std::slice::from_ref(*id), &format!("the copy on {}", hub.shown(m))).await
     }))
     .await;
     // 5. Synced: done. Moved: the old copy leaves, the old folder goes if asked.
@@ -765,13 +765,13 @@ async fn drive_batch(hub: &Arc<Hub>, b: &Batch) -> Result<(), String> {
             continue;
         }
         if b.kind == Kind::Sync {
-            hub.tasks.done(hub, id, format!("in step at {p} on {m}"));
+            hub.tasks.done(hub, id, format!("in step at {p} on {}", hub.shown(m)));
             continue;
         }
         let Source::Machine { machine: om, path: op } = &b.from else { continue };
         let out = leave(hub, b, id, &group, transient, om, op).await;
         match out {
-            Ok(()) => hub.tasks.done(hub, id, format!("moved to {p} on {m}")),
+            Ok(()) => hub.tasks.done(hub, id, format!("moved to {p} on {}", hub.shown(m))),
             Err(e) => hub.tasks.fail(hub, id, e),
         }
     }
@@ -782,8 +782,8 @@ async fn drive_batch(hub: &Arc<Hub>, b: &Batch) -> Result<(), String> {
 /// stops); then, if asked, its folder goes.
 async fn leave(hub: &Arc<Hub>, b: &Batch, id: &str, group: &str, transient: bool, machine: &str, path: &str) -> Result<(), String> {
     if let Some(member) = member_at(hub, group, machine, path) {
-        wait_in_step(hub, group, member, &[id.to_owned()], &format!("the old copy on {machine}")).await?;
-        hub.tasks.set(hub, id, "leaving", format!("{machine} stops syncing it"));
+        wait_in_step(hub, group, member, &[id.to_owned()], &format!("the old copy on {}", hub.shown(machine))).await?;
+        hub.tasks.set(hub, id, "leaving", format!("{} stops syncing it", hub.shown(machine)));
         if transient {
             hub.sync.ask(super::server::Ask::Delete { repo: group.to_owned() }).await?;
         } else {
@@ -799,7 +799,7 @@ async fn leave(hub: &Arc<Hub>, b: &Batch, id: &str, group: &str, transient: bool
 /// Deletes a folder on its machine: the runner checks it is the repository (`origin`) and nowhere
 /// it must not delete.
 async fn delete_on(hub: &Arc<Hub>, id: &str, machine: &str, path: &str, origin: Option<&str>) -> Result<(), String> {
-    hub.tasks.set(hub, id, "deleting", format!("{machine} deletes {path}"));
+    hub.tasks.set(hub, id, "deleting", format!("{} deletes {path}", hub.shown(machine)));
     hub.sync.send(machine, Msg::Delete { task: id.to_owned(), path: path.to_owned(), origin: origin.map(str::to_owned) });
     wait_news(hub, id, machine, &[id.to_owned()]).await.map(|_| ())
 }
@@ -807,13 +807,13 @@ async fn delete_on(hub: &Arc<Hub>, id: &str, machine: &str, path: &str, origin: 
 /// A group from a folder (`transient`: for a move alone), once that copy is in step.
 async fn seed(hub: &Arc<Hub>, b: &Batch, machine: &str, path: &str, transient: bool, ids: &[String]) -> Result<String, String> {
     for id in ids {
-        hub.tasks.set(hub, id, "joining", format!("{machine} starts syncing {path}"));
+        hub.tasks.set(hub, id, "joining", format!("{} starts syncing {path}", hub.shown(machine)));
     }
     let name = if transient { unique_name(hub, &format!("{} (moving)", b.name)) } else { unique_name(hub, &b.name) };
     let mode = if transient { super::Mode::Files } else { b.mode };
     let repo = hub.sync.ask(super::server::Ask::Create { name, copies: vec![(machine.to_owned(), path.to_owned())], exclude: Vec::new(), mode, transient: transient.then(|| b.id.clone()) }).await?;
     let member = member_at(hub, &repo, machine, path).ok_or_else(|| "the new synced repo has no copy".to_owned())?;
-    wait_in_step(hub, &repo, member, ids, &format!("the copy on {machine}")).await?;
+    wait_in_step(hub, &repo, member, ids, &format!("the copy on {}", hub.shown(machine))).await?;
     Ok(repo)
 }
 
@@ -845,7 +845,7 @@ async fn clone_on(hub: &Arc<Hub>, b: &Batch, id: &str, machine: &str, path: &str
         Commits::Bundle { hash, size } => (Some(b.id.clone()), Some(hash.clone()), *size, None),
         Commits::Url(u) => (None, None, 0, Some(u.clone())),
     };
-    hub.tasks.set(hub, id, "cloning", format!("{machine} clones into {path}"));
+    hub.tasks.set(hub, id, "cloning", format!("{} clones into {path}", hub.shown(machine)));
     let order = CloneOrder {
         task: id.to_owned(),
         key: b.key.clone(),
@@ -885,19 +885,19 @@ async fn wait_news(hub: &Arc<Hub>, id: &str, machine: &str, ids: &[String]) -> R
                 return Ok(news);
             }
             if news.state == "failed" {
-                return Err(news.error.unwrap_or_else(|| format!("{machine} failed")));
+                return Err(news.error.unwrap_or_else(|| format!("{} failed", hub.shown(machine))));
             }
             if at.elapsed() > QUIET {
-                return Err(format!("{machine} stopped saying how it goes"));
+                return Err(format!("{} stopped saying how it goes", hub.shown(machine)));
             }
         } else if start.elapsed() > QUIET {
-            return Err(format!("{machine} never started: is its runner up to date?"));
+            return Err(format!("{} never started: is its runner up to date?", hub.shown(machine)));
         }
         let online = hub.agents.lock().get(machine).is_some_and(|a| a.connected);
         if online {
             away = None;
         } else if away.get_or_insert_with(Instant::now).elapsed() > AWAY {
-            return Err(format!("{machine} went offline"));
+            return Err(format!("{} went offline", hub.shown(machine)));
         }
         let _ = crate::rt::timeout(Duration::from_secs(2), listener).await;
     }

@@ -1407,12 +1407,17 @@ async fn held_room(core: &Mutex<Core>) {
     let room = crate::headroom::room();
     let (queued, held, granted) = {
         let c = core.lock();
-        (!c.state.queue.is_empty(), crate::headroom::held(&c.session_id), crate::headroom::take_grant(&c.session_id))
+        let queued = !c.state.queue.is_empty();
+        (queued, crate::headroom::held(&c.session_id), queued && crate::headroom::take_grant(&c.session_id))
     };
     if queued && granted {
         // Let in (perhaps before this looked): its queue goes now, once.
     } else if queued && held {
         room.await;
+        let c = core.lock();
+        if !c.state.queue.is_empty() {
+            crate::headroom::take_grant(&c.session_id);
+        }
     } else {
         futures::future::pending::<()>().await;
     }
@@ -3398,7 +3403,11 @@ async fn drive(s: Arc<Session>, kind: &'static Kind, ctl_rx: async_channel::Rece
                             }
                         }
                         Ev::Ctl(Some(Ctl::Cmd(c))) => match *c {
-                            Command::Restart => {}
+                            Command::Restart => {
+                                if s.core.lock().state.status == Status::Exited {
+                                    rewind_to = Some(None);
+                                }
+                            }
                             Command::ForceStop => {
                                 // You ended the turn: a restart before it's back doesn't take it up again.
                                 s.turn_open.store(false, std::sync::atomic::Ordering::Relaxed);
@@ -3413,6 +3422,12 @@ async fn drive(s: Arc<Session>, kind: &'static Kind, ctl_rx: async_channel::Rece
                             }
                             // What one who changed its files did alone: the session keeps that, whatever its harness.
                             Command::OwnEdits { client, by } => s.core.lock().ask_own(client, &by),
+                            // A subagent of its harness's that ended, removed: the session's own, whatever its harness.
+                            Command::RemoveTask { task } => {
+                                if s.core.lock().remove_task(&task) {
+                                    on_change();
+                                }
+                            }
                             Command::Control { id, value } if id == "rename" => {
                                 if let Some(c) = name_session(&s, value.as_ref()) {
                                     adapter.command(&mut s.core.lock(), c);
@@ -3910,6 +3925,11 @@ async fn drive(s: Arc<Session>, kind: &'static Kind, ctl_rx: async_channel::Rece
                         }
                     }
                     Command::OwnEdits { client, by } => s.core.lock().ask_own(client, &by),
+                    Command::RemoveTask { task } => {
+                        if s.core.lock().remove_task(&task) {
+                            on_change();
+                        }
+                    }
                     // Another harness's model: the session goes on in it, now.
                     Command::SetModel { model, kind: Some(to) } if to != kind.id => {
                         if let Some(sw) = wanted(&s, kind, &to, model) {
@@ -4104,12 +4124,108 @@ mod tests {
     }
 
     #[test]
+    fn cp_t3_2_headroom_grants_wake_queued_work_once_and_survive_an_empty_queue() {
+        let (s, _rx) = idle("headroom-granted-before-queue");
+        s.core.lock().session_id = s.id.clone();
+        let admission = crate::headroom::tests::Admission::held(&s.id);
+        admission.grant();
+        assert!(held_room(&s.core).now_or_never().is_none(), "an empty queue never wakes for a grant");
+        s.core.lock().state.queue.push(super::super::model::QueueItem { id: "first".into(), text: "start the work".into(), at: 0, attachments: Vec::new(), overrides: None, reply_to: None });
+        assert!(held_room(&s.core).now_or_never().is_some(), "the grant stays available until there is work to wake");
+        assert!(held_room(&s.core).now_or_never().is_none(), "each grant wakes the queue once");
+
+        let (s, _rx) = idle("headroom-granted-after-listening");
+        s.core.lock().session_id = s.id.clone();
+        s.core.lock().state.queue.push(super::super::model::QueueItem { id: "second".into(), text: "continue the work".into(), at: 0, attachments: Vec::new(), overrides: None, reply_to: None });
+        let admission = crate::headroom::tests::Admission::held(&s.id);
+        let room = held_room(&s.core);
+        futures::pin_mut!(room);
+        assert!(room.as_mut().now_or_never().is_none(), "held work waits for its grant");
+        admission.grant();
+        assert!(room.as_mut().now_or_never().is_some(), "a grant wakes a listener that was already waiting");
+        assert!(held_room(&s.core).now_or_never().is_none(), "the notification also takes the grant so a second wait stays asleep");
+    }
+
+    #[test]
     fn a_first_message_its_harness_never_got_stays_in_what_resumes_it_until_it_goes() {
         let (s, _rx) = idle("never-started");
         *s.spec.lock() = Spec { kind: "claude".into(), prompt: Some("fix the flaky test".into()), ..Spec::default() };
         assert_eq!(s.resume_spec().prompt.as_deref(), Some("fix the flaky test"));
         s.prompted.store(true, std::sync::atomic::Ordering::Relaxed);
         assert_eq!(s.resume_spec().prompt, None);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cp_t3_2_a_restart_recovers_a_codex_startup_refusal_while_its_process_lives() -> anyhow::Result<()> {
+        use std::os::unix::fs::PermissionsExt as _;
+        crate::rt::block_on(async {
+            for failure in ["initialize", "thread/start"] {
+                let dir = tempfile::tempdir()?;
+                let program = dir.path().join("codex.py");
+                std::fs::write(&program, r##"#!/usr/bin/env python3
+import json, os, pathlib, sys
+mark = pathlib.Path(os.environ["RESTART_MARK"])
+first = not mark.exists()
+mark.write_text("started")
+for line in sys.stdin:
+    request = json.loads(line)
+    if "id" not in request:
+        continue
+    method = request.get("method")
+    if first and method == os.environ["RESTART_FAILURE"]:
+        response = {"error": {"message": "startup refused"}}
+    elif method == "thread/start":
+        response = {"result": {"thread": {"id": "native-thread", "turns": []}}}
+    elif method == "turn/start":
+        response = {"result": {"turn": {"id": "native-turn"}}}
+    else:
+        response = {"result": {}}
+    print(json.dumps({"id": request["id"], **response}), flush=True)
+"##)?;
+                std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o700))?;
+                let (sink, updates) = async_channel::unbounded();
+                let files = Files {
+                    dir: dir.path().to_owned(), take: Arc::new(|_| None), spawn: Arc::new(|_| {}), release: Arc::new(|_| {}),
+                    carried: Arc::new(|_| Box::pin(async { Ok(Vec::new()) })), fence: Arc::new(|_, _| Box::pin(async { Ok(()) })),
+                    settle: Arc::new(|_, _, _| Box::pin(async { Ok(None) })), room: Arc::new(|| true), work: Arc::new(|_, _| {}),
+                };
+                let s = start(crate::util::new_id(), Spec {
+                    kind: "codex".into(), cwd: Some(dir.path().to_string_lossy().into_owned()), program: Some(program.to_string_lossy().into_owned()),
+                    prompt: Some("original task".into()), reach: Some("off".into()),
+                    env: vec![("RESTART_MARK".into(), dir.path().join("started").to_string_lossy().into_owned()), ("RESTART_FAILURE".into(), failure.into())],
+                    ..Spec::default()
+                }, sink, Arc::new(|| {}), files)?;
+                let result = async {
+                    loop {
+                        if let (_, Update::State { state }) = updates.recv().await? && state.status == Status::Exited {
+                            anyhow::ensure!(state.exit.as_ref().and_then(|e| e.error.as_deref()).is_some_and(|e| e.contains("startup refused")), "unexpected startup error");
+                            break;
+                        }
+                    }
+                    anyhow::ensure!(s.pid.lock().is_some(), "the refused app-server must still be alive");
+                    let original = s.core.lock().state.queue.first().map(|q| q.id.clone()).ok_or_else(|| anyhow::anyhow!("original prompt disappeared"))?;
+                    anyhow::ensure!(s.command(Command::Restart) && s.command(Command::Snapshot), "session refused recovery commands");
+                    loop {
+                        if let (_, Update::Open { info, .. }) = updates.recv().await? {
+                            anyhow::ensure!(info.status != Status::Exited, "Restart left the refused app-server running");
+                            break;
+                        }
+                    }
+                    loop {
+                        if let (_, Update::State { state }) = updates.recv().await? && state.delivery.get(&original) == Some(&super::super::model::Delivery::Started) {
+                            anyhow::ensure!(state.queue.is_empty() && state.given.iter().filter(|m| m.id == original).count() == 1, "original prompt was lost or delivered twice");
+                            break;
+                        }
+                    }
+                    anyhow::Ok(())
+                }.await;
+                s.close();
+                while !matches!(updates.recv().await?, (_, Update::Closed)) {}
+                result?;
+            }
+            anyhow::Ok(())
+        })
     }
 
     /// CP-T3.2: a move gathers what a session was sent and hasn't taken (carried while its harness
@@ -4617,14 +4733,12 @@ mod tests {
         })
     }
 
-    /// CP-T3.2: a message sent as Codex started, held by its adapter for the thread (shown queued
-    /// by the agent), outlives Codex's process: it crashed before the thread opened, and the
-    /// message went first in kiln's queue, still shown queued. Another, sent while the agent is
-    /// down (which starts it again), goes after it; and what neither process ever got stays.
+    /// CP-T3.2: Codex crashes before opening its thread; its unsent message stays in kiln's
+    /// durable queue. A message sent while it is down starts it again, behind the first.
     #[cfg(unix)]
     #[test]
     fn what_a_crashed_harness_held_goes_first_when_its_agent_starts_again() -> anyhow::Result<()> {
-        use super::super::model::{Delivery, SendMode};
+        use super::super::model::SendMode;
         use std::os::unix::fs::PermissionsExt;
         async fn until(s: &Session, what: &str, done: impl Fn(&Core) -> bool) -> anyhow::Result<()> {
             let came = crate::rt::timeout(Duration::from_secs(10), async {
@@ -4652,7 +4766,7 @@ mod tests {
             let send = |id: &str| Command::Send { id: id.into(), text: format!("{id}'s words"), mode: SendMode::Queue, attachments: Vec::new(), overrides: None, reply_to: None, task: None };
             until(&s, "its start", |c| !c.meta.features.is_empty()).await?;
             anyhow::ensure!(s.command(send("m1")));
-            until(&s, "m1 held", |c| c.state.delivery.get("m1") == Some(&Delivery::Queued)).await?;
+            until(&s, "m1 held", |c| queue(c) == ["m1"]).await?;
             std::fs::write(&crash, "")?;
             until(&s, "the crash", |c| c.state.status == Status::Exited).await?;
             assert_eq!(queue(&s.core.lock()), ["m1"]);
@@ -4663,7 +4777,8 @@ mod tests {
             until(&s, "its second end", |c| c.state.status == Status::Exited).await?;
             let core = s.core.lock();
             assert_eq!(queue(&core), ["m1", "m2"]);
-            assert_eq!((core.state.delivery.get("m1"), core.state.delivery.get("m2")), (Some(&Delivery::Queued), None));
+            assert_eq!((core.state.delivery.get("m1"), core.state.delivery.get("m2")), (None, None));
+            assert!(core.get("m1").is_none() && core.get("m2").is_none(), "neither process received the queued messages");
             drop(core);
             host.close("held");
             Ok(())

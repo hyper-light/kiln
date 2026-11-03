@@ -10,7 +10,7 @@ import { ci, type CiImage, type CiPool, type CiPoolSpec } from "@/api/ci";
 import { Link } from "@/lib/router";
 import { Button } from "@/components/ui/button";
 import { Confirm, Panel, SelectField } from "@/components/ui/misc";
-import { useRes, type Res } from "@/lib/data";
+import { labelOf, useLabels, useRes, type Res } from "@/lib/data";
 import { relativeTime } from "@/lib/format";
 import { errorMessage } from "@/lib/hooks";
 import { Hold } from "@/components/ui/hold";
@@ -286,6 +286,7 @@ function PoolHistory({ pool }: { pool: string }) {
 }
 
 function PoolDetail({ pool, manage, onDone, reload, saved }: { pool: CiPool; manage: boolean; onDone: () => void; reload: () => void; saved: (warnings: string[]) => void }) {
+  useLabels();
   const [editing, setEditing] = React.useState(false);
   const [removing, setRemoving] = React.useState(false);
   const [busy, setBusy] = React.useState(false);
@@ -302,7 +303,7 @@ function PoolDetail({ pool, manage, onDone, reload, saved }: { pool: CiPool; man
             <li key={e.id} className="flex flex-wrap items-center gap-x-3 font-mono text-[11.5px] text-[#b0b4be]">
               <i className="dot" data-status={e.state === "busy" ? "running" : e.state === "idle" ? "succeeded" : "queued"} aria-hidden="true" />
               <span>{e.id}</span>
-              <span className="text-[#7f8a9a]">on {e.runner}</span>
+              <span className="text-[#7f8a9a]">on {labelOf(e.runner)}</span>
               <span>{e.state === "busy" && e.leg ? `running leg ${e.leg.slice(0, 8)}` : e.state}</span>
               <span className="text-[#7f8a9a]">since {relativeTime(e.since / 1000)}</span>
             </li>

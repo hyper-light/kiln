@@ -63,4 +63,9 @@ workspaces: Workspaces | null,
 /**
  * What W24's work needs to know of the machine (docs/ci.md W24, `RunnerFacts.work`).
  */
-work: WorkFacts | null, };
+work: WorkFacts | null, 
+/**
+ * The machine itself: a hash of the id its OS keeps for it (W13-R01). The server keeps it with
+ * the runner's name, so another machine joining with the same host name isn't taken for it.
+ */
+machine_id: string | null, };

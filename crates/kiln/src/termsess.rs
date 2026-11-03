@@ -529,7 +529,7 @@ fn run_agent(hub: &Arc<Hub>, machine: String, s: Arc<Session>, input: async_chan
                     _ => None,
                 }
             }
-            Some(msg) => (!h.send_to_agent(&machine, LANE_TERM, &msg).await).then(|| format!("machine {machine} is not connected")),
+            Some(msg) => (!h.send_to_agent(&machine, LANE_TERM, &msg).await).then(|| format!("machine {} is not connected", h.shown(&machine))),
             None => None,
         };
         if let Some(why) = failed {

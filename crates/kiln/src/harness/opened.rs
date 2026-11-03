@@ -77,14 +77,14 @@ impl Tunnels {
     pub async fn open(&self, hub: &Arc<Hub>, machine: &str, session: &str, port: u16) -> anyhow::Result<Conn> {
         let conn = self.next.fetch_add(1, Ordering::Relaxed) + 1;
         let msg = ServerMsg::PortOpen { conn, session: session.to_owned(), port };
-        anyhow::ensure!(hub.routed_caps(machine, &msg).await & CAP_PORTS != 0, "{machine} runs a kiln too old to open its ports: upgrade its runner");
+        anyhow::ensure!(hub.routed_caps(machine, &msg).await & CAP_PORTS != 0, "{} runs a kiln too old to open its ports: upgrade its runner", hub.shown(machine));
         let (into, from) = futures::channel::mpsc::unbounded();
         let (acked, mut acks) = futures::channel::mpsc::unbounded();
         let (tx, rx) = futures::channel::oneshot::channel();
         self.conns.lock().insert(conn, Far { machine: machine.to_owned(), into, acked, opened: Some(tx) });
         if !hub.send_to_agent(machine, LANE_PORTS, &msg).await {
             self.conns.lock().remove(&conn);
-            anyhow::bail!("{machine} isn't connected");
+            anyhow::bail!("{} isn't connected", hub.shown(machine));
         }
         match crate::rt::timeout(Duration::from_secs(10), rx).await {
             Ok(Ok(Ok(()))) => {}
@@ -94,7 +94,7 @@ impl Tunnels {
             }
             _ => {
                 self.close(hub, conn, session).await;
-                anyhow::bail!("{machine} didn't reach port {port} in time");
+                anyhow::bail!("{} didn't reach port {port} in time", hub.shown(machine));
             }
         }
         // What's written goes to the port in order, within its window; the connection ends when
@@ -381,7 +381,7 @@ pub async fn forward(hub: &Arc<Hub>, o: &Opening, req: Request) -> Response {
     let result = if upgrading(req.headers()) { forward_upgrade(hub, o, &machine, &site, req).await } else { forward_http(hub, o, &machine, &site, req).await };
     result.unwrap_or_else(|e| {
         tracing::debug!(session = %o.session, port = o.port, error = %format!("{e:#}"), "an opened app didn't answer");
-        said(StatusCode::BAD_GATEWAY, &format!("localhost:{} on {machine} didn't answer", o.port), &format!("{e:#}. Is its server still running?"))
+        said(StatusCode::BAD_GATEWAY, &format!("localhost:{} on {} didn't answer", o.port, hub.shown(&machine)), &format!("{e:#}. Is its server still running?"))
     })
 }
 

@@ -508,6 +508,7 @@ fn server_as_runner(hub: &Hub) -> Option<crate::reach::directory::RunnerInfo> {
     Some(crate::reach::directory::RunnerInfo {
         name: "local".to_owned(),
         hostname: crate::os::hostname(),
+        label: None,
         os: std::env::consts::OS.to_owned(),
         arch: std::env::consts::ARCH.to_owned(),
         connected: true,
@@ -536,7 +537,7 @@ fn candidates(hub: &Hub, want: &crate::reach::directory::Want) -> (Vec<String>, 
         }
         let why_not = w.mismatch(r).or_else(|| (!r.connected).then(|| "offline".to_owned()));
         if let Some(why) = why_not {
-            passed.push(format!("{}: {why}", r.name));
+            passed.push(format!("{}: {why}", r.shown()));
             continue;
         }
         // Its room as reach measures it (an overloaded machine only when none other suits); CI
@@ -557,19 +558,22 @@ pub fn pick(hub: &Hub, on: Option<&str>, kind: &str, default: Option<&str>) -> R
         (None, Some(d)) => return Ok(d.to_owned()),
         (None, None) => String::new(),
     };
+    // A runner kiln knows by its machine id is named by its label too (docs/machines.md).
     if let Some(m) = on.strip_prefix("agent:") {
-        return Ok(format!("agent:{m}"));
+        return Ok(format!("agent:{}", hub.machine_named(m).unwrap_or_else(|| m.to_owned())));
     }
     let mut want = crate::reach::directory::Want::parse(&on).map_err(|e| bad(format!("`on`: {e:#}")))?;
     // A machine named, and nothing else asked of it: that one (it says itself if it can't start
     // the harness), whatever its list of harnesses says yet.
     if let Some(name) = want.name.clone().filter(|_| want == crate::reach::directory::Want { name: want.name.clone(), ..Default::default() }) {
-        if matches!(name.as_str(), "local" | "server") || (name == crate::os::hostname() && !hub.agents.lock().contains_key(&name)) {
+        if matches!(name.as_str(), "local" | "server") || (name == crate::os::hostname() && hub.machine_named(&name).is_none()) {
             return Ok("local".to_owned());
         }
+        // A runner kiln knows by its machine id is named by its label too (docs/machines.md).
+        let name = hub.machine_named(&name).unwrap_or(name);
         return match hub.agents.lock().get(&name) {
             Some(a) if a.connected && !a.outpost && !a.ephemeral => Ok(format!("agent:{name}")),
-            Some(_) => Err((StatusCode::CONFLICT, format!("{name} isn't connected (or doesn't run agents): pick another machine"))),
+            Some(a) => Err((StatusCode::CONFLICT, format!("{} isn't connected (or doesn't run agents): pick another machine", a.shown()))),
             None => Err((StatusCode::CONFLICT, format!("kiln has no machine named {name}"))),
         };
     }
@@ -615,8 +619,10 @@ pub async fn placed(hub: &Hub, parent: Option<&Info>, on: Option<&str>, kind: &s
 }
 
 fn not_installed(hub: &Hub, target: &str, kind: &Kind) -> Refused {
-    let machine = target.strip_prefix("agent:").map_or_else(|| "the kiln server (`local`)".to_owned(), str::to_owned);
+    let machine = target.strip_prefix("agent:").map_or_else(|| "the kiln server (`local`)".to_owned(), |m| hub.shown(m));
     let (with, _) = candidates(hub, &crate::reach::directory::Want { harness: Some(kind.id.to_owned()), ..Default::default() });
+    // As people know them, as `on` takes them.
+    let with: Vec<String> = with.iter().map(|m| hub.shown(m)).collect();
     let why = if with.is_empty() {
         format!("{} isn't installed on {machine}, nor on any other connected machine", kind.name)
     } else {
@@ -633,11 +639,12 @@ pub async fn workspaces_on(hub: &Hub, target: &str) -> Result<(), String> {
         Some(machine) => {
             let caps = hub.instances.lock().newest_with(machine, crate::proto::CAP_WORKSPACE).is_some();
             if !caps {
-                return Err(format!("{machine}'s kiln is older than workspaces: upgrade it (System → Updates)"));
+                return Err(format!("{}'s kiln is older than workspaces: upgrade it (System → Updates)", hub.shown(machine)));
             }
-            match hub.agents.lock().get(machine).and_then(|a| a.facts.as_ref().and_then(|f| f.workspaces.clone())) {
+            let said = hub.agents.lock().get(machine).and_then(|a| a.facts.as_ref().and_then(|f| f.workspaces.clone()));
+            match said {
                 Some(f) => f,
-                None => return Err(format!("{machine} hasn't said yet whether it has Slates: try again in a minute")),
+                None => return Err(format!("{} hasn't said yet whether it has Slates: try again in a minute", hub.shown(machine))),
             }
         }
     };
@@ -1307,6 +1314,24 @@ mod tests {
             anyhow::ensure!(!hub.harness.lacks("agent:new", "devin") && !hub.harness.lacks("agent:box", "devin") && hub.harness.lacks("agent:box", "codex"));
             hub.harness.set_test_program("/nonexistent/kiln-test-no-harness");
             anyhow::ensure!(!hub.harness.lacks("agent:studio", "devin"), "tests' sessions run no harness, whatever the machine has");
+            Ok(())
+        })
+    }
+
+    /// docs/machines.md: a runner kiln knows by its machine id is picked by its label as by its id.
+    #[test]
+    fn a_runner_known_by_its_machine_id_is_picked_by_the_name_people_see() -> anyhow::Result<()> {
+        crate::rt::block_on(async move {
+            let hub = crate::hub::tests::scratch_hub_with(|c| c.terminal.enabled = true).await?;
+            let id = "5f2a9c3e0b1d4e6f8a7c9b0d1e2f3a4b";
+            let mut laptop = crate::hub::tests::live_runner(id, "macos", "aarch64");
+            laptop.label = Some("adas-macbook-pro-3.local".into());
+            hub.agents.lock().insert(id.into(), laptop);
+            let there = format!("agent:{id}");
+            for on in ["adas-macbook-pro-3.local", id] {
+                anyhow::ensure!(pick(&hub, Some(on), "claude", None).ok().as_ref() == Some(&there), "{on}");
+            }
+            anyhow::ensure!(pick(&hub, Some("adas-macbook-pro.local"), "claude", None).is_err(), "another machine's name");
             Ok(())
         })
     }

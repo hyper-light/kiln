@@ -12,7 +12,7 @@ import { attachApi, attachmentsRes, onWords, WAKES_CODE, WAKES_RUNNERS, type Att
 import { Button } from "@/components/ui/button";
 import { FacetBox } from "@/components/ui/facet-box";
 import { SelectField, TextField } from "@/components/ui/misc";
-import { useRes } from "@/lib/data";
+import { labelOf, useLabels, useRes } from "@/lib/data";
 import { errorMessage } from "@/lib/hooks";
 import { Link } from "@/lib/router";
 import { invalidate } from "@/lib/resource";
@@ -64,8 +64,7 @@ function wakesOf(on: string): readonly string[] {
 
 /** What wakes it, in words; its agent. */
 const wakeWords = (wake: string[]) => wake.map((w) => WAKE_WORDS[w] ?? w).join(", ");
-const agentWords = (r: AttachmentRow) =>
-  r.attachment.session ? "a live agent" : (HARNESSES.find((h) => h.value === r.attachment.harness?.kind)?.label ?? r.attachment.harness?.kind ?? "no agent");
+const agentWords = (r: AttachmentRow) => (r.attachment.session ? "a live agent" : (HARNESSES.find((h) => h.value === r.attachment.harness?.kind)?.label ?? r.attachment.harness?.kind ?? "no agent"));
 
 /**
  * "Watched by", where what they watch is: its own row, then each attached agent's chip (what of it
@@ -90,12 +89,13 @@ function narrower(on: string, main: string): string | null {
   if (on.startsWith("workflow:")) return on.split("/").pop() ?? on;
   if (on.startsWith("environment:")) return on.split(":").pop() ?? on;
   if (on.startsWith("pool:")) return `pool ${on.slice(5)}`;
-  if (on.startsWith("runner:")) return on.slice(7);
+  if (on.startsWith("runner:")) return labelOf(on.slice(7));
   if (on === "runners") return "all runners";
   return onWords(on);
 }
 
 function Watchers({ on, watches }: { on: string; watches: (on: string) => boolean }) {
+  useLabels();
   const rows = useRes(attachmentsRes).data.filter((r) => watches(r.attachment.on));
   const [open, setOpen] = React.useState<string | null>(null);
   const [adding, setAdding] = React.useState(false);

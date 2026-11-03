@@ -11,6 +11,7 @@ import { ChevronDown } from "lucide-react";
 import { harnessApi, type AgentInfo, type Command, type KindInfo, type MovePlan, type State } from "@/api/harness";
 import { Button } from "@/components/ui/button";
 import { toast } from "@/components/ui/toast";
+import { shownName } from "@/lib/data";
 import { errorMessage } from "@/lib/hooks";
 import { Link } from "@/lib/router";
 import { useSuspenseResource } from "@/lib/resource";
@@ -39,7 +40,8 @@ function usePlaces(agent: Agent) {
         .filter((r) => r.connected && r.reach && r.fingerprint && `agent:${r.name}` !== agent.target)
         .map((r) => ({
           target: `agent:${r.name}`,
-          name: r.name,
+          // The name people know it by (its label); `target` is its key.
+          name: shownName(r),
           kinds: (byTarget[`agent:${r.name}`] ?? []).filter(goesIn).sort((a, b) => Number(b.id === agent.kind) - Number(a.id === agent.kind)),
         }))
         .filter((p) => p.kinds.length > 0)

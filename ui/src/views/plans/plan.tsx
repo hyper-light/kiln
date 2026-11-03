@@ -19,7 +19,7 @@ import { Hold, RowsHold } from "@/components/ui/hold";
 import { Loadable } from "@/components/ui/loading";
 import { Confirm, CopyButton, EmptyState, SelectField, TextField } from "@/components/ui/misc";
 import { useAuth } from "@/lib/auth";
-import { harnessSessionsRes, useRes, warm, type Res } from "@/lib/data";
+import { harnessSessionsRes, labelOf, useLabels, useRes, warm, type Res } from "@/lib/data";
 import { relativeTime } from "@/lib/format";
 import { errorMessage } from "@/lib/hooks";
 import { invalidate, useSuspenseResource } from "@/lib/resource";
@@ -112,6 +112,7 @@ interface Base {
 const baseOf = (p: Plan): Base => ({ key: keyOf(p), title: p.title, body: p.body, items: JSON.stringify(p.items ?? []), tags: p.tags.join(", ") });
 
 function PlanEditor({ id }: { id: string }) {
+  useLabels();
   const res = useRes(planRes(id));
   const plan = res.data === "gone" ? null : res.data;
   if (plan) warm(harnessSessionsRes, kindsRes);
@@ -185,7 +186,7 @@ function PlanEditor({ id }: { id: string }) {
           )}
           v{plan.version} · changed {relativeTime(plan.updated_at)}
           {plan.runs ? ` · run ${plan.runs}×` : ""}
-          {plan.source?.agent ? ` · from ${plan.source.agent}${plan.source.machine ? ` on ${plan.source.machine}` : ""}` : ""}
+          {plan.source?.agent ? ` · from ${plan.source.agent}${plan.source.machine ? ` on ${labelOf(plan.source.machine)}` : ""}` : ""}
           {plan.source?.goal && (
             <>
               {" · made from the goal "}
@@ -334,7 +335,7 @@ const hostOf = (url: string) => {
 const keyOf = (p: Plan) => `${p.id}:${p.version}:${p.tags.join(",")}`;
 
 function machineOf(target: string) {
-  return target === "local" ? "this server" : target.replace(/^agent:/, "");
+  return target === "local" ? "this server" : labelOf(target.replace(/^agent:/, ""));
 }
 
 function RunHold() {
@@ -368,6 +369,7 @@ function RunOrApprove(props: React.ComponentProps<typeof RunPlan>) {
 
 /** Run the plan on an agent. */
 function RunPlan({ plan, dirty, picked, onPicked, onRan, focus }: { plan: Plan; dirty: boolean; picked: number[]; onPicked: (n: number[]) => void; onRan: () => void; focus?: boolean }) {
+  useLabels();
   warm(harnessSessionsRes, kindsRes);
   const agents = useRes(harnessSessionsRes).data;
   const kinds = useRes(kindsRes).data;

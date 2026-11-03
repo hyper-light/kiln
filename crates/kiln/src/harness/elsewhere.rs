@@ -88,7 +88,7 @@ async fn go(hub: &Arc<Hub>, info: &Info, since: i64, said: &str) {
                 }
                 return;
             }
-            Err(e) => format!("{} couldn't take it over ({e})", c.name),
+            Err(e) => format!("{} couldn't take it over ({e})", hub.shown(&c.name)),
         },
         Err(why) => why,
     };
@@ -143,7 +143,7 @@ async fn choose(hub: &Arc<Hub>, info: &Info) -> Result<Choice, String> {
     if let Some(m) = plan.machine() {
         others.retain(|r| r.name == m);
         if others.is_empty() {
-            return Err(if m == from { format!("it runs on {m}, where you chose it to go on") } else { format!("{m}, where you chose it to go on, isn't connected") });
+            return Err(if m == from { format!("it runs on {}, where you chose it to go on", hub.shown(m)) } else { format!("{}, where you chose it to go on, isn't connected", hub.shown(m)) });
         }
     } else if others.is_empty() {
         return Err("no other machine of yours is connected".into());
@@ -156,7 +156,7 @@ async fn choose(hub: &Arc<Hub>, info: &Info) -> Result<Choice, String> {
     if with_one.is_empty() {
         let want = plan.kind.as_deref().map_or_else(|| if carries { format!("{} or a harness it can go on in", info.kind_name) } else { info.kind_name.clone() }, named);
         return Err(match plan.machine() {
-            Some(m) => format!("{m}, where you chose it to go on, doesn't have {want} installed"),
+            Some(m) => format!("{}, where you chose it to go on, doesn't have {want} installed", hub.shown(m)),
             None => format!("no other connected machine has {want} installed"),
         });
     }
@@ -168,7 +168,7 @@ async fn choose(hub: &Arc<Hub>, info: &Info) -> Result<Choice, String> {
     // Its files must come along: a folder that isn't a repository kiln knows would be left behind,
     // and the agent would go on without its work. A person can still move it (Move to…).
     if has_repo.is_empty() {
-        return Err(format!("its folder, {}, isn't a git repository kiln knows on {from}, so its files couldn't come along", info.cwd));
+        return Err(format!("its folder, {}, isn't a git repository kiln knows on {}, so its files couldn't come along", info.cwd, hub.shown(&from)));
     }
     // As full as this, it would stop again there at once.
     let cap = info.pause_at.map_or(100.0, f64::from);
@@ -181,13 +181,13 @@ async fn choose(hub: &Arc<Hub>, info: &Info) -> Result<Choice, String> {
         let accounts = crate::accounts::status(hub, &format!("agent:{}", r.name)).await.unwrap_or_default();
         for h in r.harnesses.iter().filter(|h| fits(h)) {
             let Some(account) = accounts.iter().find(|a| a.kind == *h && a.signed_in == Some(true)) else {
-                why.push(format!("{} isn't signed in on {}", named(h), r.name));
+                why.push(format!("{} isn't signed in on {}", named(h), r.shown()));
                 continue;
             };
             let used = match account.email.as_deref() {
                 Some(who) => {
                     if *h == info.kind && info.account.as_deref().and_then(|mine| account_is(mine, h, who)) == Some(true) {
-                        why.push(format!("{} on {} is signed in to the same account", named(h), r.name));
+                        why.push(format!("{} on {} is signed in to the same account", named(h), r.shown()));
                         continue;
                     }
                     let limits: Vec<&Limit> = sessions.iter().filter(|o| o.account.as_deref().and_then(|a| account_is(a, h, who)) == Some(true)).flat_map(|o| o.limits.iter()).collect();
@@ -197,7 +197,7 @@ async fn choose(hub: &Arc<Hub>, info: &Info) -> Result<Choice, String> {
                 None => 0.0,
             };
             if used >= cap {
-                why.push(format!("the account {} uses on {} is {}% used", named(h), r.name, used.round()));
+                why.push(format!("the account {} uses on {} is {}% used", named(h), r.shown(), used.round()));
                 continue;
             }
             // Another harness: the model chosen for it, else the first it lists there (the newest

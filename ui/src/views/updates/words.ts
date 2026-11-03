@@ -21,6 +21,7 @@ import type {
   UpgradeWay,
   UpgradeWayOpen,
 } from "@/api/types";
+import { labelOf } from "@/lib/data";
 import { formatBytes, relativeTime, shortSha } from "@/lib/format";
 
 /** A state's colour: sage, amber, rose, lilac, or faint. */
@@ -227,7 +228,7 @@ export function originWords(b: KilnBinary, short = false): string {
     case "built":
       return short ? `run #${b.run ?? "?"}` : `release run #${b.run ?? "?"}`;
     case "machine":
-      return `built by ${b.by ?? "a machine"}`;
+      return `built by ${b.by == null ? "a machine" : labelOf(b.by)}`;
     case "upload":
       return short ? "uploaded" : "an upload";
     default:
@@ -417,7 +418,7 @@ export function runnerView(r: RunnerUpdate, job: UpdateJob | undefined, newest: 
   if (job?.state === "running" || (r.connected && r.how === "upgrading")) {
     const build = job?.method === "build";
     const toWords = to ?? "the new build";
-    const doing = build && job?.on ? `getting ${toWords} from ${job.on}` : build ? `building ${toWords} itself` : `upgrading to ${toWords}`;
+    const doing = build && job?.on ? `getting ${toWords} from ${labelOf(job.on)}` : build ? `building ${toWords} itself` : `upgrading to ${toWords}`;
     return {
       ...base,
       tone: "run",
@@ -526,7 +527,10 @@ export function headline(data: UpdatesOverview, fleet: Fleet, server: ServerView
   const newest = data.newest ? shortSha(data.newest.commit) : null;
   const [failed] = fleet.failed;
   if (failed)
-    return { tone: "bad", text: fleet.failed.length > 1 ? `${fleet.failed.length} upgrades failed` : `${failed.r.name}'s ${failed.view.word === "Build failed" ? "build" : "upgrade"} failed` };
+    return {
+      tone: "bad",
+      text: fleet.failed.length > 1 ? `${fleet.failed.length} upgrades failed` : `${labelOf(failed.r.name)}'s ${failed.view.word === "Build failed" ? "build" : "upgrade"} failed`,
+    };
   if (fleet.upgrading.length) return { tone: "run", text: `Upgrading ${plural(fleet.upgrading.length, "runner")}` };
   if (server.tone === "run") return { tone: "run", text: server.word === "Restarting" ? "Restarting the server" : "Upgrading the server" };
   const building = platforms.filter((p) => p.state === "building" || p.state === "queued");
@@ -549,9 +553,9 @@ export function readoutAll(data: UpdatesOverview, fleet: Fleet, platforms: Platf
   const building = platforms.filter((p) => p.state === "building" || p.state === "queued");
   const stale = platforms.filter((p) => p.state === "behind" || p.state === "missing" || (p.state === "failed" && !isBuilding(last)));
   if (fleet.failed.length) {
-    const said = fleet.failed.map((e) => `${e.r.name}'s ${e.view.word === "Build failed" ? "build" : "upgrade"} ${e.job?.timed_out ? "timed out" : "failed"}`);
-    if (fleet.offline.length) said.push(fleet.offline.length === 1 ? `${fleet.offline[0]?.r.name} is offline` : `${fleet.offline.length} runners are offline`);
-    const waiting = fleet.waiting.map((e) => e.r.name);
+    const said = fleet.failed.map((e) => `${labelOf(e.r.name)}'s ${e.view.word === "Build failed" ? "build" : "upgrade"} ${e.job?.timed_out ? "timed out" : "failed"}`);
+    if (fleet.offline.length) said.push(fleet.offline.length === 1 ? `${labelOf(fleet.offline[0]?.r.name ?? "")} is offline` : `${fleet.offline.length} runners are offline`);
+    const waiting = fleet.waiting.map((e) => labelOf(e.r.name));
     const note =
       stale.length && waiting.length
         ? `The ${listed(stale.map((p) => `${p.os}/${p.arch}`))} build ${stale.length === 1 ? "is" : "are"} behind, so ${listed(waiting)} ${waiting.length === 1 ? "waits" : "wait"} for a new one.`
@@ -566,14 +570,14 @@ export function readoutAll(data: UpdatesOverview, fleet: Fleet, platforms: Platf
     };
   }
   if (fleet.upgrading.length) {
-    const names = fleet.upgrading.map((e) => e.r.name);
+    const names = fleet.upgrading.map((e) => labelOf(e.r.name));
     return {
       title: `${listed(names)} ${names.length > 1 ? "are" : "is"} switching to ${newest ?? "the new build"}.`,
       note: "A runner starts the new build beside the old one; the old one keeps its terminals, agents and jobs until they end.",
     };
   }
   if (fleet.behind.length) {
-    const names = fleet.behind.map((e) => e.r.name);
+    const names = fleet.behind.map((e) => labelOf(e.r.name));
     const notify = fleet.behind.every((e) => e.r.policy === "notify");
     const auto = fleet.behind.every((e) => e.r.policy === "auto");
     return {
@@ -603,8 +607,10 @@ export function readoutAll(data: UpdatesOverview, fleet: Fleet, platforms: Platf
 /** What the readout says of a picked runner. */
 export function readoutRunner(e: RunnerEntry, waits: UpgradeWaits | null | undefined): Readout {
   const { r, view, job } = e;
-  const host = r.hostname.toLowerCase() !== r.name.toLowerCase() ? ` (${r.hostname})` : "";
-  const title = `${r.name}${host} · ${r.os}/${r.arch} · ${view.moving ? `${view.from} → ${view.to ?? "a newer build"}` : view.from}`;
+  // Named as people know it (its label), its host name beside that when it's another.
+  const shown = labelOf(r.name);
+  const host = r.hostname.toLowerCase() !== shown.toLowerCase() ? ` (${r.hostname})` : "";
+  const title = `${shown}${host} · ${r.os}/${r.arch} · ${view.moving ? `${view.from} → ${view.to ?? "a newer build"}` : view.from}`;
   const source = view.moving && r.from ? ` Its build: ${r.from}.` : "";
   const old = r.instances.filter((i) => !i.newest);
   let note: string;
@@ -639,7 +645,7 @@ export function readoutPlatform(p: PlatformView, build: ReleaseBuild | undefined
   const who = p.runners.length ? `Runners on ${p.os}/${p.arch} download it from the server.` : "No runner of this platform has joined.";
   let note: string;
   if (p.state === "building")
-    note = `Release run #${last?.number ?? "?"} is building it${last ? ` from ${last.sha.slice(0, 7)}` : ""}${step ? `: its ${step.name} step${p.job?.agent ? `, on ${p.job.agent}` : ""}` : ""}.`;
+    note = `Release run #${last?.number ?? "?"} is building it${last ? ` from ${last.sha.slice(0, 7)}` : ""}${step ? `: its ${step.name} step${p.job?.agent ? `, on ${labelOf(p.job.agent)}` : ""}` : ""}.`;
   else if (p.state === "queued") note = `Queued in release run #${last?.number ?? "?"}.`;
   else if (p.state === "failed") note = `The release run didn't build it${commit ? ` from ${commit}` : ""}: see its run.`;
   else if (p.state === "behind") note = `Built from an older commit: Build every platform brings it up to ${commit ?? "the newest kiln"}.`;
@@ -706,16 +712,18 @@ export function diagnosisPrompt(r: RunnerUpdate, job: UpdateJob | undefined, new
   const at = (t: number) => new Date(t * 1000).toISOString().replace(/\.\d+Z$/, "Z");
   const tail = failed ? failed.log.slice(-40) : [];
   const stuck = (r.ways ?? []).filter((w) => !w.ok);
+  // The machine as people know it; kiln reach's `on` below keeps its name, which is its key.
+  const shown = labelOf(r.name);
   const lines = [
     failed
-      ? `kiln couldn't upgrade its runner on ${r.name} (${r.hostname}, ${r.os}/${r.arch}). Find out why, and fix what's wrong on the machine so the next upgrade goes through.`
-      : `kiln can't upgrade its runner on ${r.name} (${r.hostname}, ${r.os}/${r.arch}). Find out what's in the way, and fix it if it's on the machine.`,
+      ? `kiln couldn't upgrade its runner on ${shown} (${r.hostname}, ${r.os}/${r.arch}). Find out why, and fix what's wrong on the machine so the next upgrade goes through.`
+      : `kiln can't upgrade its runner on ${shown} (${r.hostname}, ${r.os}/${r.arch}). Find out what's in the way, and fix it if it's on the machine.`,
     "",
     "What kiln knows:",
-    `- ${r.name} runs kiln ${r.version}${r.commit ? `, commit ${r.commit}` : ""}${r.build ? `, build ${r.build}` : ""}.`,
+    `- ${shown} runs kiln ${r.version}${r.commit ? `, commit ${r.commit}` : ""}${r.build ? `, build ${r.build}` : ""}.`,
     newest ? `- The newest kiln is commit ${newest.commit}.` : "",
     failed
-      ? `- Its upgrade, ${failed.method === "build" ? `a build of ${failed.commit ? shortSha(failed.commit) : "the newest kiln"} on ${failed.on ? `${failed.on}, for it to download` : "the machine"}` : `to build ${failed.to_build ?? "the new build"}`}, started ${at(failed.started_at)} and failed: ${failed.error ?? "kiln wasn't told why"}`
+      ? `- Its upgrade, ${failed.method === "build" ? `a build of ${failed.commit ? shortSha(failed.commit) : "the newest kiln"} on ${failed.on ? `${labelOf(failed.on)}, for it to download` : "the machine"}` : `to build ${failed.to_build ?? "the new build"}`}, started ${at(failed.started_at)} and failed: ${failed.error ?? "kiln wasn't told why"}`
       : "",
     ...stuck.map((w) => `- ${w.way === "build" ? "kiln can't be built for it now" : "It can't download a build now"}: ${w.why}.`),
     r.next ? `- What kiln does next: it ${r.next}.` : "",
@@ -725,14 +733,14 @@ export function diagnosisPrompt(r: RunnerUpdate, job: UpdateJob | undefined, new
       .map((f) => `- kiln's checks (${f.level}): ${f.title}${f.detail && !f.detail.includes("\n") ? `. ${f.detail}` : ""}${f.fix ? ` Kiln can repair it: ${f.fix.label}.` : ""}`),
     "",
     "Where to look:",
-    `- You should be on ${r.name}. If you aren't, run commands there with kiln reach (on: "${r.name}").`,
+    `- You should be on ${shown}. If you aren't, run commands there with kiln reach (on: "${r.name}").`,
     r.os === "linux"
       ? `- The runner's log: journalctl --user -u 'kiln-agent*'${failed ? ` --since '${at(failed.started_at).replace("T", " ").replace("Z", "")} UTC'` : ""} (without --user for a system install).`
       : r.os === "macos"
         ? "- The runner's log: kiln.log in its state directory, usually ~/.local/share/kiln/agent/kiln.log."
         : "- The runner's log, in its state directory.",
     failed?.method === "build"
-      ? `- The build's whole output: ~/.cache/kiln/self-build/build-${failed.id}.log${failed.on ? ` on ${failed.on}, where it ran` : ""} (the build works in ~/.cache/kiln/self-build).`
+      ? `- The build's whole output: ~/.cache/kiln/self-build/build-${failed.id}.log${failed.on ? ` on ${labelOf(failed.on)}, where it ran` : ""} (the build works in ~/.cache/kiln/self-build).`
       : "",
     "- Free disk and memory, and for a build the Rust toolchain (rustup show, cargo --version) and npm.",
     "",

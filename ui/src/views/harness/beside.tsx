@@ -15,11 +15,12 @@ import { api } from "@/api/client";
 import { harnessApi, type AgentInfo, type BesideTerminal } from "@/api/harness";
 import { charKey, namedKey, type NamedKey } from "@/components/terminal/keys";
 import { SelectField } from "@/components/ui/misc";
+import { useLabels } from "@/lib/data";
 import { errorMessage, useLocalStorage, useMediaQuery } from "@/lib/hooks";
 import { useSuspenseResource } from "@/lib/resource";
 import { Loading } from "@/components/ui/loading";
 import type { SessionHandle, SessionState } from "@/views/terminal/session";
-import { machineName } from "./parts";
+import { machineShown } from "./parts";
 import "./beside.css";
 
 // The terminal itself (xterm, about 500 KB) loads when a terminal beside the agent is first shown,
@@ -89,6 +90,7 @@ export function BesideTerminals(props: BesideProps) {
 }
 
 function Terminals({ agent, info, onInsert }: BesideProps) {
+  useLabels();
   // The ones already open beside it (here earlier, or on another device), and what was done here since.
   const there = useSuspenseResource(`harness/terminals/${agent}`, () => harnessApi.terminals(agent).catch((): BesideTerminal[] => []));
   const here = useHere((s) => s.by[agent] ?? NOTHING);
@@ -150,7 +152,7 @@ function Terminals({ agent, info, onInsert }: BesideProps) {
   };
 
   if (!shown && !error && !said) return null;
-  const where = info ? `${machineName(info.target)} · ${info.cwd || "~"}` : "";
+  const where = info ? `${machineShown(info.target)} · ${info.cwd || "~"}` : "";
   const labelOf = (b: BesideTerminal) => (b.what === "shell" ? "Shell" : `${harness}${b.command ? ` · ${b.command}` : ""}`);
 
   return (

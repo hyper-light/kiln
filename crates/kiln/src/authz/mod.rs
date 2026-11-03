@@ -645,6 +645,8 @@ pub static ROUTES: &[Rule] = &[
     r("GET", "/api/agents/*/diagnose", "runners.read", At::Runner(2)),
     r("POST", "/api/agents/*/repair", "runners.manage", At::Runner(2)),
     r("POST", "/api/agents/*/drain", "runners.manage", At::Runner(2)),
+    // The name people see for a runner (docs/machines.md).
+    r("POST", "/api/agents/*/label", "runners.manage", At::Runner(2)),
     r("POST", "/api/agents/*/probe", "runners.manage", At::Runner(2)),
     r("DELETE", "/api/agents/*", "runners.manage", At::Runner(2)),
     // Identities kiln's CA issued (W27-R01): revocations read by those who read runners, made by

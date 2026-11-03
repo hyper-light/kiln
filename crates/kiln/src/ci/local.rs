@@ -480,33 +480,37 @@ struct Seen {
 }
 
 /// What a leg waits for, in words, and whether that can't change on a server of this machine
-/// alone; `None` for waits that end by themselves unsaid (any busy runner, a retry's delay).
-fn waiting(w: &Value) -> Option<(String, bool)> {
+/// alone; `None` for waits that end by themselves unsaid (any busy runner, a retry's delay). Its
+/// runners by the names people see (`labels`, by the names kiln knows them by: docs/machines.md).
+fn waiting(w: &Value, labels: &HashMap<String, String>) -> Option<(String, bool)> {
     let o = match w {
         Value::String(s) if !s.is_empty() => return Some((s.clone(), false)),
         Value::Object(o) => o,
         _ => return None,
     };
+    let shown = |n: &str| labels.get(n).cloned().unwrap_or_else(|| n.to_owned());
     let list = |k: &str| o.get(k).and_then(Value::as_array).map(|a| a.iter().filter_map(Value::as_str).collect::<Vec<_>>().join(", ")).unwrap_or_default();
+    let runners = |k: &str| o.get(k).and_then(Value::as_array).map(|a| a.iter().filter_map(Value::as_str).map(shown).collect::<Vec<_>>().join(", ")).unwrap_or_default();
     let text = |k: &str| o.get(k).and_then(Value::as_str).unwrap_or_default().to_owned();
+    let runner = |k: &str| shown(o.get(k).and_then(Value::as_str).unwrap_or_default());
     Some(match o.get("reason").and_then(Value::as_str).unwrap_or_default() {
         "capacity" | "retry" | "" => return None,
         "unroutable" => (format!("no runner meets its requirements ({})", list("failing")), true),
         "oversized" => (format!("a runner with {} ({})", text("asked"), list("short")), true),
         "headroom" => {
-            let held = o.get("held").and_then(Value::as_str).map(|r| format!("; {r} is held for it")).unwrap_or_default();
+            let held = o.get("held").and_then(Value::as_str).map(|r| format!("; {} is held for it", shown(r))).unwrap_or_default();
             let place = Some(text("place")).filter(|p| !p.is_empty()).map(|p| format!(" on a {p} runner")).unwrap_or_default();
-            (format!("{} free{place}, under {}% use ({} would pass it){held}", Some(text("request")).filter(|r| !r.is_empty()).unwrap_or_else(|| "room".into()), o.get("target").and_then(Value::as_u64).unwrap_or(85), list("runners")), false)
+            (format!("{} free{place}, under {}% use ({} would pass it){held}", Some(text("request")).filter(|r| !r.is_empty()).unwrap_or_else(|| "room".into()), o.get("target").and_then(Value::as_u64).unwrap_or(85), runners("runners")), false)
         }
-        "capability" => (format!("{} can't run what it uses (Docker, or actions)", list("runners")), true),
+        "capability" => (format!("{} can't run what it uses (Docker, or actions)", runners("runners")), true),
         "no-runner" => ("no runner that can take it is connected".to_owned(), false),
-        "other-runner" if o.get("refused").and_then(Value::as_bool) == Some(true) => (format!("a runner other than {}, which refused it", text("avoided")), true),
-        "other-runner" => (format!("a runner other than {}, as its retry asks (`runner: different`)", text("avoided")), true),
-        "load" => (format!("a runner whose disk isn't under pressure or nearly full: it's heavy on I/O ({})", held(o)), false),
+        "other-runner" if o.get("refused").and_then(Value::as_bool) == Some(true) => (format!("a runner other than {}, which refused it", runner("avoided")), true),
+        "other-runner" => (format!("a runner other than {}, as its retry asks (`runner: different`)", runner("avoided")), true),
+        "load" => (format!("a runner whose disk isn't under pressure or nearly full: it's heavy on I/O ({})", held(o, &shown)), false),
         "warm" => (
             format!(
                 "{}, busy, where it runs warm: about {} s sooner, until {} at most",
-                text("runner"),
+                runner("runner"),
                 o.get("saves_s").and_then(Value::as_u64).unwrap_or(0),
                 super::cli::when(o.get("until").and_then(Value::as_i64).map(|ms| ms / 1000))
             ),
@@ -523,8 +527,8 @@ fn waiting(w: &Value) -> Option<(String, bool)> {
 }
 
 /// The runners a heavy leg is held off by their load (docs/ci.md W24-R19), each with what's past
-/// its limit.
-fn held(o: &serde_json::Map<String, Value>) -> String {
+/// its limit, by the name people see (`shown`).
+fn held(o: &serde_json::Map<String, Value>, shown: &dyn Fn(&str) -> String) -> String {
     let gib = |b: u64| format!("{:.1} GiB", b as f64 / f64::from(1u32 << 30));
     let each = o.get("held").and_then(Value::as_array).into_iter().flatten().map(|h| {
         let n = |k: &str| h.get(k).and_then(Value::as_u64);
@@ -539,9 +543,17 @@ fn held(o: &serde_json::Map<String, Value>) -> String {
         {
             why.push(format!("{} free, under {}", gib(f), gib(floor)));
         }
-        format!("{}: {}", h.get("runner").and_then(Value::as_str).unwrap_or("?"), why.join(", "))
+        format!("{}: {}", h.get("runner").and_then(Value::as_str).map_or_else(|| "?".to_owned(), shown), why.join(", "))
     });
     each.collect::<Vec<_>>().join("; ")
+}
+
+/// The names people see of the server's runners kiln knows by their machine ids, by those ids
+/// (docs/machines.md), for what a leg waits for; none when it doesn't say.
+async fn runner_labels(api: &Api) -> HashMap<String, String> {
+    let v = api.call_api(Method::Get, "/api/agents", None).await.unwrap_or_default();
+    let list = v.as_array().cloned().or_else(|| v.get("agents").and_then(Value::as_array).cloned()).unwrap_or_default();
+    list.iter().filter_map(|a| Some((a.get("name")?.as_str()?.to_owned(), a.get("label")?.as_str()?.to_owned()))).collect()
 }
 
 /// Prints the runs' logs as they come and what happens to them, until they end. The exit code:
@@ -556,6 +568,7 @@ async fn follow(api: &Api, started: &Value, here: bool, shutdown: &Shutdown) -> 
         return Ok(1);
     }
     let color = std::io::stdout().is_terminal();
+    let labels = runner_labels(api).await;
     let mut legs: HashMap<String, Seen> = HashMap::new();
     let mut ended: HashMap<String, String> = HashMap::new();
     let mut announced: HashSet<String> = HashSet::new();
@@ -590,7 +603,7 @@ async fn follow(api: &Api, started: &Value, here: bool, shutdown: &Shutdown) -> 
                 }
                 let terminal = crate::store::Status::parse(&status).is_terminal();
                 running |= matches!(status.as_str(), "running" | "assigned");
-                match waiting(l.get("wait_reason").unwrap_or(&Value::Null)).filter(|_| matches!(status.as_str(), "queued" | "pending")) {
+                match waiting(l.get("wait_reason").unwrap_or(&Value::Null), &labels).filter(|_| matches!(status.as_str(), "queued" | "pending")) {
                     Some((what, never)) => {
                         if what != seen.said {
                             say(&format!("{} waits: {what}", seen.key));
@@ -710,7 +723,7 @@ mod tests {
         let held = kiln_ci::sched::load::Held { runner: "fedora".into(), pressure: Some(5_550), limit: 4_000, free: 500 << 30, floor: 20 << 30 };
         let full = kiln_ci::sched::load::Held { runner: "jupiter".into(), pressure: None, limit: 4_000, free: 5 << 30, floor: 20 << 30 };
         let w = serde_json::to_value(kiln_ci::sched::state::WaitReason::Load { held: vec![held, full] })?;
-        let said = waiting(&w).map(|(s, _)| s).unwrap_or_default();
+        let said = waiting(&w, &HashMap::new()).map(|(s, _)| s).unwrap_or_default();
         anyhow::ensure!(said == "a runner whose disk isn't under pressure or nearly full: it's heavy on I/O (fedora: I/O pressure 55.5 %, past 40.0 %; jupiter: 5.0 GiB free, under 20.0 GiB)", "{said}");
         Ok(())
     }
@@ -719,7 +732,19 @@ mod tests {
     /// when; a wait that ends by itself, not one that stops a run here.
     #[test]
     fn w24_r18_a_warm_wait_in_words() {
-        let said = waiting(&json!({ "reason": "warm", "runner": "fedora", "saves_s": 100, "until": 1_798_761_600_000_i64 }));
+        let said = waiting(&json!({ "reason": "warm", "runner": "fedora", "saves_s": 100, "until": 1_798_761_600_000_i64 }), &HashMap::new());
         assert_eq!(said, Some(("fedora, busy, where it runs warm: about 100 s sooner, until 2027-01-01T00:00:00Z at most".to_owned(), false)));
+    }
+
+    /// docs/machines.md: a runner kiln knows by its machine id is said by its label in what a leg
+    /// waits for; one known by its name, by that name.
+    #[test]
+    fn a_wait_names_runners_by_the_names_people_see() {
+        let id = "5f2a9c3e0b1d4e6f8a7c9b0d1e2f3a4b";
+        let labels = HashMap::from([(id.to_owned(), "studio".to_owned())]);
+        let said = |w: Value| waiting(&w, &labels).map(|(s, _)| s).unwrap_or_default();
+        assert_eq!(said(json!({ "reason": "capability", "runners": [id, "fedora"] })), "studio, fedora can't run what it uses (Docker, or actions)");
+        assert_eq!(said(json!({ "reason": "other-runner", "avoided": id })), "a runner other than studio, as its retry asks (`runner: different`)");
+        assert!(said(json!({ "reason": "warm", "runner": id, "saves_s": 100, "until": 1_798_761_600_000_i64 })).starts_with("studio, busy"));
     }
 }

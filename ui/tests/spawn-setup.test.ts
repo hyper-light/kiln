@@ -1,7 +1,24 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import type { KindInfo } from "../src/api/harness.ts";
-import { carryEffort, carryMode, harnessesOf, kindOf, machinesWith, modeOf, modelOf, oneOf, reachChoices, specOf, speedsFor, targetOf, withDir } from "../src/views/harness/spawn-setup.ts";
+import type { Agent } from "../src/api/types.ts";
+import { useMachineLabels } from "../src/lib/data.ts";
+import {
+  carryEffort,
+  carryMode,
+  harnessesOf,
+  kindOf,
+  machineLabel,
+  machinesWith,
+  modeOf,
+  modelOf,
+  oneOf,
+  reachChoices,
+  specOf,
+  speedsFor,
+  targetOf,
+  withDir,
+} from "../src/views/harness/spawn-setup.ts";
 
 const claude = (over: Partial<KindInfo> = {}): KindInfo => ({ id: "claude", name: "Claude Code", verified: true, available: true, ...over });
 const codex = (over: Partial<KindInfo> = {}): KindInfo => ({ id: "codex", name: "Codex", verified: true, available: true, ...over });
@@ -157,6 +174,43 @@ test("fast mode: as the model lists it; a machine that lists no model's speeds g
   assert.deepEqual(speedsFor(listed, ""), []);
   // Another harness gets none it doesn't list.
   assert.deepEqual(speedsFor(codex({ models: [{ id: "gpt-6.1-sol", label: "GPT-6.1 Sol", default: true }] }), ""), []);
+});
+
+/** A machine kiln knows by its machine id (docs/machines.md): its name is the id, its label the name people see. */
+const ID = "5f2a9c3e0b1d4e6f8a7c9b0d1e2f3a4b";
+const machine = (over: Partial<Agent>): Agent => ({ name: "fedora", hostname: "fedora", os: "linux", arch: "x86_64", connected: true, ...over }) as Agent;
+
+test("a machine is shown by its label, its host name beside it only when that's another name", async () => {
+  const { shortMachineLabel } = await import("../src/views/harness/spawn-setup.ts");
+  useMachineLabels.setState({}, true);
+  const mbp = machine({ name: ID, label: "adas-macbook-pro-3.local", hostname: "adas-macbook-pro.local" });
+  const pi = machine({ name: "6e1b0d2c4a3f5e7d9c8b0a1f2e3d4c5b", label: "pi", hostname: "pi" });
+  const machines = [mbp, pi, machine({ name: "fedora", hostname: "fedora.lan" }), machine({ name: "gpu", hostname: "gpu" })];
+  assert.equal(machineLabel(`agent:${ID}`, machines), "adas-macbook-pro-3.local (adas-macbook-pro.local)");
+  // Its host name is the name it's shown by: said once.
+  assert.equal(machineLabel(`agent:${pi.name}`, machines), "pi");
+  // One known by its name, as before.
+  assert.equal(machineLabel("agent:fedora", machines), "fedora (fedora.lan)");
+  assert.equal(machineLabel("agent:gpu", machines), "gpu");
+  assert.equal(machineLabel("local", machines), "kiln server");
+  // Not among those listed (not connected): its label as noted, else its name.
+  useMachineLabels.setState({ "0a1b2c3d4e5f60718293a4b5c6d7e8f9": "studio" }, true);
+  assert.equal(machineLabel("agent:0a1b2c3d4e5f60718293a4b5c6d7e8f9", machines), "studio");
+  assert.equal(machineLabel("agent:gone", machines), "gone");
+  // In the composer's slot, short: no domain, its host's name only when that's another.
+  assert.equal(shortMachineLabel(`agent:${ID}`, machines), "adas-macbook-pro-3 (adas-macbook-pro)");
+  assert.equal(shortMachineLabel(`agent:${pi.name}`, machines), "pi");
+});
+
+test("a runner its commands can prefer is offered by its label, chosen by its name", () => {
+  const runners = [
+    { name: ID, label: "adas-macbook-pro-3.local", os: "macos", arch: "aarch64", connected: true, reach: true },
+    { name: "fedora", os: "linux", arch: "x86_64", connected: true, reach: true },
+  ] as Parameters<typeof reachChoices>[0];
+  assert.deepEqual(reachChoices(runners, "agent:fedora"), [
+    { value: "macos/aarch64", label: "Prefer any macos/aarch64" },
+    { value: ID, label: "Prefer adas-macbook-pro-3.local (macos/aarch64)" },
+  ]);
 });
 
 // The modes each harness offers, as their runners list them.

@@ -718,7 +718,8 @@ async fn install_objects(cluster: &Cluster, ns: &str, (image, pull): (&str, &str
     let field = |name: &str, path: &str| json!({ "name": name, "valueFrom": { "fieldRef": { "fieldPath": path } } });
     let container = json!({
         "name": APP, "image": image, "imagePullPolicy": pull, "args": ["server"],
-        "env": [{ "name": "KILN_CONFIG", "value": "/etc/kiln/kiln.toml" }, field("POD_NAME", "metadata.name"), field("POD_NAMESPACE", "metadata.namespace"), field("NODE_NAME", "spec.nodeName")],
+        // The pod's UID is its machine id the first time it starts (`crate::os::machine_id`).
+        "env": [{ "name": "KILN_CONFIG", "value": "/etc/kiln/kiln.toml" }, field("POD_NAME", "metadata.name"), field("POD_NAMESPACE", "metadata.namespace"), field("NODE_NAME", "spec.nodeName"), field("KILN_POD_UID", "metadata.uid")],
         "ports": [{ "name": "http", "containerPort": 7070, "protocol": "TCP" }, { "name": "quic", "containerPort": 7071, "protocol": "UDP" }],
         "securityContext": { "allowPrivilegeEscalation": false, "capabilities": { "drop": ["ALL"] } },
         // Kubernetes waits 1s for a probe by default: a server slowed by its disk, not dead, was

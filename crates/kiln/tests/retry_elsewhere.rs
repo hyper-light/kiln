@@ -12,7 +12,7 @@ use std::path::Path;
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
-use common::{Options, Server, http, start};
+use common::{Options, Server, http, machine, start};
 use serde_json::{Value, json};
 
 struct Runner(Child);
@@ -37,7 +37,7 @@ fn runner(s: &Server, dir: &Path, join: &str, name: &str) -> anyhow::Result<Runn
     let out = std::fs::File::create(dir.join(format!("{name}.log")))?;
     Ok(Runner(
         Command::new(env!("CARGO_BIN_EXE_kiln"))
-            .args(["agent", "--server", &format!("http://127.0.0.1:{}", s.port), "--token", join, "--name", name, "--labels", "shared", "--slots", "1", "--no-terminal"])
+            .args(["agent", "--server", &format!("http://127.0.0.1:{}", s.port), "--token", join, "--name", name, "--labels", "shared", "--slots", "1", "--no-terminal"]).env("KILN_MACHINE_ID", name)
             .arg("--work-dir")
             .arg(dir.join(format!("{name}-work")))
             .arg("--state-dir")
@@ -95,17 +95,19 @@ fn w05_ac12_a_failed_job_retried_elsewhere_and_on_a_runner_named() -> anyhow::Re
     let join = std::fs::read_to_string(dir.join("data/join.token"))?.trim().to_owned();
     let _one = runner(&s, dir, &join, "one")?;
     let _two = runner(&s, dir, &join, "two")?;
+    // Each known by its machine id (docs/machines.md).
+    let (one, two) = (machine("one"), machine("two"));
     until(&s, 120, "both runners and the repository's first poll", || {
         let agents = get(&s, "/api/agents")?;
         let list = agents.as_array().cloned().or_else(|| agents.get("agents").and_then(Value::as_array).cloned()).unwrap_or_default();
-        let up = ["one", "two"].iter().all(|n| list.iter().any(|a| text(a, "name") == *n && a.get("connected") == Some(&json!(true))));
+        let up = [&one, &two].iter().all(|n| list.iter().any(|a| text(a, "name") == n.as_str() && a.get("connected") == Some(&json!(true))));
         let (_, repos) = http(s.port, "GET", "/api/repos", &s.admin, None)?;
         Ok(if up && repos.contains("acme/retry") && !repos.contains("\"last_polled_at\":null") { Ok(()) } else { Err(format!("{agents}\n{repos}")) })
     })?;
     std::fs::write(repo.join("README.md"), "retry\n")?;
     git(&repo, &["add", "."])?;
     git(&repo, &["commit", "-qm", "go"])?;
-    let other = |r: &str| if r == "one" { "two" } else { "one" };
+    let other = |r: &str| if r == one { two.clone() } else { one.clone() };
 
     // v1: the pipeline's job fails on a runner.
     let job = until(&s, 300, "the pipeline's job to fail", || {
@@ -120,17 +122,17 @@ fn w05_ac12_a_failed_job_retried_elsewhere_and_on_a_runner_named() -> anyhow::Re
         Ok(Err(runs.to_string()))
     })?;
     let (id, first) = (text(&job, "id").to_owned(), text(&job, "agent").to_owned());
-    anyhow::ensure!(first == "one" || first == "two", "{job}");
+    anyhow::ensure!(first == one || first == two, "{job}");
     // Where it could run again: both runners, the one it ran on said.
     let options = get(&s, &format!("/api/ci/legs/{id}/runners"))?;
     assert_eq!((text(&options, "kind"), text(&options, "ran_on")), ("pipeline", first.as_str()), "{options}");
     assert_eq!((options.get("elsewhere"), options.pointer("/retry/can")), (Some(&json!(true)), Some(&json!(true))), "{options}");
     let able: Vec<&str> = options.get("runners").and_then(Value::as_array).into_iter().flatten().filter(|r| r.get("able") == Some(&json!(true))).map(|r| text(r, "name")).collect();
-    assert!(able.contains(&"one") && able.contains(&"two"), "{options}");
+    assert!(able.contains(&one.as_str()) && able.contains(&two.as_str()), "{options}");
     // What can't be asked is refused, saying why.
     let (st, body) = http(s.port, "POST", &format!("/api/ci/legs/{id}/retry"), &s.admin, Some(&json!({ "runner": "nowhere" })))?;
     assert!(st == 400 && body.contains("no runner `nowhere`"), "{st} {body}");
-    let (st, body) = http(s.port, "POST", &format!("/api/ci/legs/{id}/retry"), &s.admin, Some(&json!({ "runner": "one", "elsewhere": true })))?;
+    let (st, body) = http(s.port, "POST", &format!("/api/ci/legs/{id}/retry"), &s.admin, Some(&json!({ "runner": one, "elsewhere": true })))?;
     assert!(st == 400 && body.contains("not both"), "{st} {body}");
     // Elsewhere: on the other runner, the job's placement saying so.
     let (st, body) = http(s.port, "POST", &format!("/api/ci/legs/{id}/retry"), &s.admin, Some(&json!({ "elsewhere": true })))?;
@@ -144,7 +146,7 @@ fn w05_ac12_a_failed_job_retried_elsewhere_and_on_a_runner_named() -> anyhow::Re
         })
     };
     let j = again(attempt + 1)?;
-    assert_eq!((text(&j, "agent"), j.pointer("/placement/avoid")), (other(&first), Some(&json!(first))), "{j}");
+    assert_eq!((text(&j, "agent"), j.pointer("/placement/avoid")), (other(&first).as_str(), Some(&json!(first))), "{j}");
     // On a runner named, through the operation agents call (MCP's `ci.legs.retry`).
     let (st, body) = http(s.port, "POST", "/api/ops/ci.legs.retry", &s.admin, Some(&json!({ "leg": id, "runner": first })))?;
     assert_eq!(st, 200, "{body}");
@@ -163,11 +165,11 @@ fn w05_ac12_a_failed_job_retried_elsewhere_and_on_a_runner_named() -> anyhow::Re
         }
     })?;
     let (leg_id, first) = (text(&leg, "id").to_owned(), text(&leg, "runner").to_owned());
-    anyhow::ensure!(first == "one" || first == "two", "{leg}");
+    anyhow::ensure!(first == one || first == two, "{leg}");
     let options = get(&s, &format!("/api/ci/legs/{leg_id}/runners"))?;
     assert_eq!((text(&options, "kind"), text(&options, "ran_on")), ("ci", first.as_str()), "{options}");
     let able: Vec<&str> = options.get("runners").and_then(Value::as_array).into_iter().flatten().filter(|r| r.get("able") == Some(&json!(true))).map(|r| text(r, "name")).collect();
-    assert!(able.contains(&"one") && able.contains(&"two"), "{options}");
+    assert!(able.contains(&one.as_str()) && able.contains(&two.as_str()), "{options}");
     // Elsewhere: a new attempt of the run, its leg on the other runner.
     let attempt_of = |n: i64| {
         until(&s, 300, "the run's next attempt to finish", || {

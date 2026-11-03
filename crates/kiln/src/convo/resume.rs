@@ -93,9 +93,10 @@ fn carry(store: &Store, session: &str, kind: &Kind, harness_session: Option<&str
     }
 }
 
-/// The package for session `id`, to go on on machine `to`, in folder `cwd` (the one it worked in
-/// when None), made from what `store` kept. `from` names the machine it was on. Blocking.
-pub fn package(store: &Store, id: &str, from: &str, to: &str, cwd: Option<&str>) -> anyhow::Result<Package> {
+/// The package for session `id`, to go on on another machine, in folder `cwd` (the one it worked in
+/// when None), made from what `store` kept. `from` names the machine it was on; `shown`, the names
+/// people see of that machine and the one it goes to, for what the conversation is told. Blocking.
+pub fn package(store: &Store, id: &str, from: &str, cwd: Option<&str>, shown: (&str, &str)) -> anyhow::Result<Package> {
     let kept = store.kept(id, MAX_EVENTS)?.ok_or_else(|| anyhow::anyhow!("the server's store has nothing of this session"))?;
     let info: Info = kept.info.as_deref().and_then(|j| serde_json::from_str(j).ok()).ok_or_else(|| anyhow::anyhow!("the server's store doesn't say what this session is"))?;
     let state: State = kept.state.as_deref().and_then(|j| serde_json::from_str(j).ok()).unwrap_or_default();
@@ -104,7 +105,8 @@ pub fn package(store: &Store, id: &str, from: &str, to: &str, cwd: Option<&str>)
     let from_cwd = if state.cwd.is_empty() { info.cwd.clone() } else { state.cwd.clone() };
     let goes_on_in = cwd.map(str::trim).filter(|c| !c.is_empty()).map_or_else(|| from_cwd.clone(), str::to_owned);
     let own = state.harness_session.clone().or_else(|| info.harness_session.clone());
-    let note = format!("This conversation went on from {from} (where it worked in {from_cwd}), which is gone, to {to} (it works in {goes_on_in} now). It was kept on the kiln server.");
+    let (from_shown, to_shown) = shown;
+    let note = format!("This conversation went on from {from_shown} (where it worked in {from_cwd}), which is gone, to {to_shown} (it works in {goes_on_in} now). It was kept on the kiln server.");
     let carry = carry(store, id, kind, own.as_deref(), &events, &note)?;
     // What starts it there: its settings as last chosen. Its environment was its machine's, and
     // stays there (the machine it goes to runs it with its own).
@@ -156,7 +158,7 @@ mod tests {
         let line = |n: u64, l: &str| Row::Record(Box::new(RecordRow { session: "s1".into(), source: "cc-1".into(), n, end: (n + 1) * 10, line: l.into(), kept: None }));
         store.put(vec![line(0, "{\"a\":1}"), line(1, "{\"b\":2}")]);
         store.sync()?;
-        let pkg = package(&store, "s1", "gone-box", "here", None)?;
+        let pkg = package(&store, "s1", "gone-box", None, ("gone-box", "here"))?;
         assert_eq!(pkg.id, "s1");
         assert_eq!(pkg.spec.kind, "claude");
         assert_eq!(pkg.spec.cwd.as_deref(), Some("/work/parser"));
@@ -167,7 +169,7 @@ mod tests {
         // Its epoch as it was: the machine it goes to counts one more as it takes it.
         assert_eq!(pkg.state.epoch, 2);
         // Another folder there, if asked.
-        assert_eq!(package(&store, "s1", "gone-box", "here", Some("/elsewhere"))?.spec.cwd.as_deref(), Some("/elsewhere"));
+        assert_eq!(package(&store, "s1", "gone-box", Some("/elsewhere"), ("gone-box", "here"))?.spec.cwd.as_deref(), Some("/elsewhere"));
         Ok(())
     }
 
@@ -177,13 +179,13 @@ mod tests {
         store.send("s1", &Update::Open { info: Box::new(info("claude", Some("cc-1"))?), since: None });
         store.put(vec![Row::Record(Box::new(RecordRow { session: "s1".into(), source: "cc-1".into(), n: 1, end: 20, line: "{}".into(), kept: None }))]);
         store.sync()?;
-        let err = package(&store, "s1", "gone-box", "here", None).err().map(|e| e.to_string()).unwrap_or_default();
+        let err = package(&store, "s1", "gone-box", None, ("gone-box", "here")).err().map(|e| e.to_string()).unwrap_or_default();
         assert!(err.contains("missing line 0"), "{err}");
         // And nothing at all of it: refused too, saying why.
         let (_d2, empty) = crate::convo::store::scratch()?;
         empty.send("s2", &Update::Open { info: Box::new(info("claude", Some("cc-2"))?), since: None });
         empty.sync()?;
-        assert!(package(&empty, "s2", "gone-box", "here", None).is_err());
+        assert!(package(&empty, "s2", "gone-box", None, ("gone-box", "here")).is_err());
         Ok(())
     }
 }

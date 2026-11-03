@@ -7,6 +7,7 @@ import { retriedWords, retryBody, retryChoices } from "@/api/retry";
 import { Button } from "@/components/ui/button";
 import { SelectField } from "@/components/ui/misc";
 import { toast } from "@/components/ui/toast";
+import { labelOf, useLabels } from "@/lib/data";
 import { errorMessage } from "@/lib/hooks";
 import { invalidate, useSuspenseResource } from "@/lib/resource";
 import { useNavigate } from "@/lib/router";
@@ -15,6 +16,7 @@ import { useNavigate } from "@/lib/router";
 const RUNNERS_OPTS = { on: ["job", "agent"] } as const;
 
 export function JobRetry({ jobId, runId }: { jobId: string; runId: string }) {
+  useLabels();
   const o = useSuspenseResource(`retry/${jobId}`, (s) => ci.legRunners(jobId, s), RUNNERS_OPTS).data;
   const navigate = useNavigate();
   const [choice, setChoice] = React.useState("");
@@ -44,7 +46,7 @@ export function JobRetry({ jobId, runId }: { jobId: string; runId: string }) {
   };
   return (
     <div className="flex flex-wrap items-center gap-2 px-5 py-3">
-      <span className="mr-auto font-mono text-[11px] text-[#a6b2c6]">{o.ran_on ? `Ran on ${o.ran_on}` : "Run it again"}</span>
+      <span className="mr-auto font-mono text-[11px] text-[#a6b2c6]">{o.ran_on ? `Ran on ${labelOf(o.ran_on)}` : "Run it again"}</span>
       {choices.length > 1 && <SelectField label="Where to run it again" hideLabel value={chosen} onChange={setChoice} options={choices} className="w-72 max-w-full" />}
       <Button size="xs" variant="primary" disabled={busy} onClick={go}>
         <RotateCcw /> Retry

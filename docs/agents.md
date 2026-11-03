@@ -1167,6 +1167,7 @@ sockets").
 | `set_speed` | `speed`: `""` (standard) or one of `meta.speeds` (the model's faster speeds, slowest first) | `state.speed`, from the next turn when one is under way; `state.speed_blocked` says why it can't go faster (its account), `state.speed_cooldown` that fast mode's own rate limit is cooling down; feature `"set_speed"` (Claude Code's fast mode, Codex's service tiers, Devin's `speed` option) |
 | `stop_task` | `task` | the task's `status` (stopped) |
 | `stop_tasks` | | every live task stopped |
+| `remove_task` | `task` | a subagent of its harness's own that ended, and those under it that ended, gone from `tasks` (and its `subagents`); one still going stays. Feature `"remove_task"` |
 | `suggest` | `client, query` | `{suggestions: [{path}], cwd}` |
 | `control` | `id, value?` (a `meta.controls` entry, or one a catalog route names) | those with `client`: `{title, text, ...}` (below) |
 | `mcp_enable` | `name, enabled` | `state.mcp` |
@@ -1576,9 +1577,23 @@ an agent with subagents has a toggle (the subagent mark and a chevron) that open
 it in the row's own columns: each subagent's piece of the path (the lines of those it's under
 passing by, a curve into its own mark), its name, its word and what it's at, its machine, time and
 harness, its pause, and the way to its thread. One that needs you has its own piece of the path
-tan, and its request is answered there unless its agent's row already answers it. The line by the
-composer opens the same tree with a pick box each, a select-all where its mark was; the Plan tab
-shows each step's agent live under its step.
+tan, the whole of its row, and its request is answered there unless its agent's row already
+answers it: Allow, Deny or Approve at once, and a question under its row (the options, Other,
+Decline and Submit, as the chat draws it), so Mission control answers it without leaving. The line
+by the composer opens the same tree with a pick box each, a select-all where its mark was; the
+Plan tab shows each step's agent live under its step. The path runs on unbroken from row to row.
+
+One at work turns its open ring through the prism once every 1.4 s, as Ship's running glyph does,
+every ring on the page's clock, and its word carries the prism, as Mission control's working rows'
+do; nothing else in the tree moves, and nothing turns where motion is reduced or kiln's motion is
+paused.
+
+One that ended (Done, Failed, Stopped) is removed as kiln's Remove removes an agent that has: its
+trash where its pause was, a swipe sideways by touch, or Remove at the head of the composer's tree
+for those picked that ended (one that ended can be picked; it takes no message). One kiln started
+is its session removed (`DELETE /api/harness/sessions/:id`, as Mission control's Remove); one of its
+harness's own leaves its agent's session (`remove_task`; a machine from before it can't, and its
+trash is off). Removed, it's gone from the tree at once, and back with why if its Remove didn't go.
 
 With subagents picked, the composer's To line names them (two on a phone, four wider, then +N),
 and a message goes to each its own way: one of the agent's own harness's as a `send` with its

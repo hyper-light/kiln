@@ -57,11 +57,13 @@ pub async fn start(hub: &Arc<Hub>, id: &str, to: &str, now: bool, kind: Option<S
         return Err(format!("it's the subagent of {}, and it goes where its agent goes: move {} and it comes along", p.name, p.name));
     }
     let leaves = hub.harness.location(id);
-    let moved = start_one(hub, id, to, now, kind, model).await?;
+    // Named as people see it (its label, docs/machines.md): the runner kiln knows by its machine id.
     let to = to.strip_prefix("agent:").unwrap_or(to);
+    let to = &hub.machine_named(to).unwrap_or_else(|| to.to_owned());
+    let moved = start_one(hub, id, to, now, kind, model).await?;
     for c in all.iter().filter(|c| c.subagent && c.parent.as_deref() == Some(id) && c.status != super::model::Status::Exited && hub.harness.location(&c.id) == leaves) {
         if let Err(e) = start_one(hub, &c.id, to, now, None, None).await {
-            say(hub, &c.id, &format!("Couldn't go along with its agent to {to}: {e}")).await;
+            say(hub, &c.id, &format!("Couldn't go along with its agent to {}: {e}", hub.shown(to))).await;
         }
     }
     Ok(moved)
@@ -79,15 +81,15 @@ async fn start_one(hub: &Arc<Hub>, id: &str, to: &str, now: bool, kind: Option<S
         _ => return Err("the kiln server keeps the agents it runs once they've started: only one whose harness never started there moves".into()),
     };
     if from == to {
-        return Err(format!("it runs on {to} already"));
+        return Err(format!("it runs on {} already", hub.shown(&to)));
     }
     // Its workspace is a volume in its machine's memory: it doesn't follow yet (docs/agentic.md W7).
     if info.workspace.as_ref().is_some_and(|w| w.made.is_some()) {
-        return Err(format!("it works in a workspace of its own on {from}, which can't move with it yet: open a change request from its work (or write it to disk), then start an agent on {to}"));
+        return Err(format!("it works in a workspace of its own on {}, which can't move with it yet: open a change request from its work (or write it to disk), then start an agent on {}", hub.shown(&from), hub.shown(&to)));
     }
     let connected = hub.agents.lock().get(&to).is_some_and(|a| a.connected && !a.ephemeral);
     if !connected {
-        return Err(format!("{to} is not connected"));
+        return Err(format!("{} is not connected", hub.shown(&to)));
     }
     // The harness it goes on in there: its own, or one its conversation can be carried into.
     let kind = kind.filter(|k| *k != info.kind);
@@ -101,7 +103,7 @@ async fn start_one(hub: &Arc<Hub>, id: &str, to: &str, now: bool, kind: Option<S
     }
     let installed = hub.harness.kinds().get(&format!("agent:{to}")).is_some_and(|ks| ks.iter().any(|k| k.id == goes_on_in && k.available));
     if !installed {
-        return Err(format!("{named} is not installed on {to}"));
+        return Err(format!("{named} is not installed on {}", hub.shown(&to)));
     }
     if local {
         if kind.is_some() {
@@ -115,7 +117,7 @@ async fn start_one(hub: &Arc<Hub>, id: &str, to: &str, now: bool, kind: Option<S
     // its conversation (`docs/conversations.md`, "Resuming on another machine").
     if !hub.agents.lock().get(&from).is_some_and(|a| a.connected) {
         if kind.is_some() {
-            return Err(format!("{from} is away, so it can only go on in {} (from the server's copy of its conversation)", info.kind_name));
+            return Err(format!("{} is away, so it can only go on in {} (from the server's copy of its conversation)", hub.shown(&from), info.kind_name));
         }
         let (there, _) = folder(hub, id, &from, &to, &info.cwd, true).await?;
         hub.harness.resume_on(hub, id, &to, Some(there)).await?;
@@ -123,14 +125,14 @@ async fn start_one(hub: &Arc<Hub>, id: &str, to: &str, now: bool, kind: Option<S
     }
     for m in [&from, &to] {
         if hub.instances.lock().newest_with(m, crate::proto::CAP_REACH).is_none() {
-            return Err(format!("{m}'s runner can't hand sessions over (an older runner: upgrade it)"));
+            return Err(format!("{}'s runner can't hand sessions over (an older runner: upgrade it)", hub.shown(m)));
         }
     }
     let (hub, id) = (Arc::clone(hub), id.to_owned());
     let to2 = to.clone();
     crate::rt::spawn(async move {
         if let Err(e) = prepare_and_go(&hub, &id, &from, &to2, &info.cwd, now, kind, model).await {
-            say(&hub, &id, &format!("Couldn't move to {to2}: {e}")).await;
+            say(&hub, &id, &format!("Couldn't move to {}: {e}", hub.shown(&to2))).await;
         }
     });
     Ok(serde_json::json!({ "moving": to, "kind": goes_on_in }))
@@ -143,16 +145,17 @@ async fn start_one(hub: &Arc<Hub>, id: &str, to: &str, now: bool, kind: Option<S
 /// they were. What became of each: `{id, name, to?, error?}`.
 pub async fn recover(hub: &Arc<Hub>, from: &str, to: Option<&str>) -> Result<Vec<serde_json::Value>, String> {
     use std::collections::HashMap;
-    let from = from.strip_prefix("agent:").unwrap_or(from).to_owned();
+    let from = from.strip_prefix("agent:").unwrap_or(from);
+    let from = hub.machine_named(from).unwrap_or_else(|| from.to_owned());
     let (connected, os) = {
         let g = hub.agents.lock();
         let a = g.get(&from);
         (a.is_some_and(|a| a.connected), a.map(|a| a.os.clone()).unwrap_or_default())
     };
     if connected {
-        return Err(format!("{from} is connected: its agents move one at a time (Move to…), its runner handing each over"));
+        return Err(format!("{} is connected: its agents move one at a time (Move to…), its runner handing each over", hub.shown(&from)));
     }
-    let to = to.map(|t| t.strip_prefix("agent:").unwrap_or(t).trim().to_owned()).filter(|t| !t.is_empty());
+    let to = to.map(|t| t.strip_prefix("agent:").unwrap_or(t).trim()).filter(|t| !t.is_empty()).map(|t| hub.machine_named(t).unwrap_or_else(|| t.to_owned()));
     let all = hub.harness.list();
     let on = |id: &str| match hub.harness.location(id) {
         Some(Location::Machine(m)) => Some(m),
@@ -200,8 +203,8 @@ async fn prepare_and_go(hub: &Arc<Hub>, id: &str, from: &str, to: &str, cwd: &st
     let (there, note) = folder(hub, id, from, to, cwd, false).await?;
     match hub.harness.command(hub, id, Command::MoveTo { to: to.to_owned(), cwd: there, note, now, kind, model, local: false }).await {
         Sent::Ok | Sent::Taken => Ok(()),
-        Sent::Unreachable => Err(format!("{from} is not connected")),
-        s => Err(s.failure().map_or_else(|| format!("{from} didn't take it"), |(_, why)| why)),
+        Sent::Unreachable => Err(format!("{} is not connected", hub.shown(from))),
+        s => Err(s.failure().map_or_else(|| format!("{} didn't take it", hub.shown(from)), |(_, why)| why)),
     }
 }
 
@@ -209,23 +212,25 @@ async fn prepare_and_go(hub: &Arc<Hub>, id: &str, from: &str, to: &str, cwd: &st
 /// is away, so nothing is copied from it.
 async fn folder(hub: &Arc<Hub>, id: &str, from: &str, to: &str, cwd: &str, away: bool) -> Result<(String, Option<String>), String> {
     let view = crate::sync::places::now(hub).await.map_err(|e| format!("{e:#}"))?;
+    // The machines as what's said of them names them.
+    let (from_shown, to_shown) = (hub.shown(from), hub.shown(to));
     let home = hub.places.of(from).map(|h| h.home).filter(|h| !h.is_empty());
     // `~/…` for a path under `from`'s home: the same place under `to`'s.
     let mapped = |path: &str| homed(path, home.as_deref());
     let found: Option<(&Row, &Place)> = view.repos.iter().find_map(|r| r.places.iter().find(|p| p.machine == from && within(cwd, &p.path).is_some()).map(|p| (r, p)));
     let Some((row, place)) = found else {
-        return Ok((mapped(cwd), Some(format!("Its folder isn't a git repository kiln knows, so its files stay on {from}."))));
+        return Ok((mapped(cwd), Some(format!("Its folder isn't a git repository kiln knows, so its files stay on {from_shown}."))));
     };
     let rel = within(cwd, &place.path).unwrap_or_default();
     // A copy kept in step with this one already there: on in it.
     let group = place.copy.as_ref().map(|c| c.repo.clone());
     if let Some(there) = row.places.iter().find(|p| p.machine == to && p.copy.as_ref().map(|c| c.repo.clone()).is_some_and(|g| Some(g) == group)) {
-        return Ok((join(&there.path, &rel), Some(format!("Its repository is kept in step between {from} and {to}."))));
+        return Ok((join(&there.path, &rel), Some(format!("Its repository is kept in step between {from_shown} and {to_shown}."))));
     }
     // Else a copy is made there and kept in step from now on: beside a folder of it already
     // there (never over it). Not from a machine that's away: its files stay there.
     if away {
-        return Ok((mapped(cwd), Some(format!("{from} is away, so its repository's files stay there."))));
+        return Ok((mapped(cwd), Some(format!("{from_shown} is away, so its repository's files stay there."))));
     }
     let mut target = mapped(&place.path);
     let taken = |t: &str| {
@@ -235,7 +240,7 @@ async fn folder(hub: &Arc<Hub>, id: &str, from: &str, to: &str, cwd: &str, away:
     if taken(&target) {
         target = format!("{target}-{from}");
     }
-    say(hub, id, &format!("Moving to {to}: copying {} there, kept in step with {from}…", row.name)).await;
+    say(hub, id, &format!("Moving to {to_shown}: copying {} there, kept in step with {from_shown}…", row.name)).await;
     let ask = Ask {
         kind: TaskKind::Sync,
         key: row.key.clone(),
@@ -258,7 +263,7 @@ async fn folder(hub: &Arc<Hub>, id: &str, from: &str, to: &str, cwd: &str, away:
             _ => {
                 let now = if t.detail.is_empty() { t.state.clone() } else { t.detail.clone() };
                 if now != said {
-                    say(hub, id, &format!("Moving to {to}: copying {} there — {now}", row.name)).await;
+                    say(hub, id, &format!("Moving to {to_shown}: copying {} there — {now}", row.name)).await;
                     said = now;
                 }
             }
@@ -268,7 +273,7 @@ async fn folder(hub: &Arc<Hub>, id: &str, from: &str, to: &str, cwd: &str, away:
         }
     }
     let there = hub.places.resolve(to, &target).unwrap_or(target);
-    Ok((join(&there, &rel), Some(format!("Its repository came along, uncommitted work and all, and is kept in step between {from} and {to}."))))
+    Ok((join(&there, &rel), Some(format!("Its repository came along, uncommitted work and all, and is kept in step between {from_shown} and {to_shown}."))))
 }
 
 #[cfg(test)]

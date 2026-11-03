@@ -46,8 +46,74 @@ export function upsert<T>(list: T[] | undefined, item: T, key: (t: T) => string,
   return copy;
 }
 
+/** Name → label, for the machines that have one. */
+export type Labels = Readonly<Record<string, string>>;
+
+/**
+ * The names people see for the machines kiln knows by their machine id (docs/machines.md): name →
+ * label, from every load of the agents and from their events. Kept outside any page (as
+ * `useUpdateJobs` is), so words made outside a component (`labelOf`) can say a machine's label,
+ * where all they have is its name.
+ */
+export const useMachineLabels = create<Labels>(() => ({}));
+events.on((ev) => {
+  // A machine renamed: its event carries it whole, its label too.
+  if (ev.type === "agent") noteLabels([ev.agent]);
+});
+
+/** Keeps the labels of the agents that have one; the labels change (and what shows them re-renders) only when one did. */
+export function noteLabels(agents: readonly { name: string; label?: string | null }[]) {
+  const was = useMachineLabels.getState();
+  let now: Record<string, string> | null = null;
+  for (const a of agents) {
+    if (!a.label || labelOf(a.name, now ?? was) === a.label) continue;
+    now ??= { ...was };
+    now[a.name] = a.label;
+  }
+  if (now) useMachineLabels.setState(now, true);
+}
+
+/** The name people see for machine `name`: its label, or (one known by its name, or not known here yet) the name itself. */
+export function labelOf(name: string, labels: Labels = useMachineLabels.getState()): string {
+  return (Object.hasOwn(labels, name) ? labels[name] : undefined) ?? name;
+}
+
+/**
+ * Words a machine wrote naming another by the id kiln knows it by ("Moved here from <id>": a runner
+ * has only the ids): each runner's id in them, the name it's shown by now (docs/machines.md). Other
+ * ids (a session's, a plan's) have no label, and stay.
+ */
+export function withLabels(text: string, labels: Labels = useMachineLabels.getState()): string {
+  return text.replace(/\b[0-9a-f]{32}\b/g, (id) => labelOf(id, labels));
+}
+
+/** Machines' names in the order people read them: by the names they're shown by. */
+export const byLabel =
+  (labels: Labels = useMachineLabels.getState()) =>
+  (a: string, b: string): number =>
+    labelOf(a, labels).localeCompare(labelOf(b, labels));
+
+/** The name people see for a machine (an agent, or reach's runner): its label, else its name. Its `name` stays its key. */
+export const shownName = (m: { name: string; label?: string | null }): string => m.label || m.name;
+
+/**
+ * The labels, for a component that shows machines by name only: it re-renders as they come. They
+ * come with the agents, loaded here when no page has loaded them yet.
+ */
+export function useLabels(): Labels {
+  warm(agentsRes);
+  return useMachineLabels();
+}
+
+/** The agents, their labels noted on the way (`labelOf`). */
+const agentsNoted = (signal?: AbortSignal) =>
+  api.agents(signal).then((list) => {
+    noteLabels(list);
+    return list;
+  });
+
 export const overviewRes: Res<Overview> = { key: "overview", fetch: (s) => api.overview(s), opts: { pollMs: 30_000 } };
-export const agentsRes: Res<Agent[]> = { key: "agents", fetch: (s) => api.agents(s), opts: { pollMs: 30_000 } };
+export const agentsRes: Res<Agent[]> = { key: "agents", fetch: agentsNoted, opts: { pollMs: 30_000 } };
 export const historyRes: Res<MetricsHistory> = { key: "metrics/history", fetch: (s) => api.metricsHistory(undefined, s), opts: { pollMs: 120_000 } };
 export const reposRes: Res<Repo[]> = { key: "repos", fetch: (s) => api.repos(s), opts: { pollMs: 30_000 } };
 export const recentRunsRes = (limit: number): Res<Run[]> => ({ key: `runs/recent/${limit}`, fetch: (s) => api.runs({ limit }, s), opts: { pollMs: 60_000 } });

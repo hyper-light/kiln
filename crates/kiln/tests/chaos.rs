@@ -331,7 +331,7 @@ fn w05_r05_hellos_before_the_rebuild() -> anyhow::Result<()> {
     let out = std::fs::File::create(dir.join("keeper.log"))?;
     let _keeper = Keeper(
         common::kiln()
-            .args(["agent", "--server", &format!("http://127.0.0.1:{}", s.port), "--token", &join, "--name", "keeper", "--labels", "keep", "--slots", "1", "--no-terminal"])
+            .args(["agent", "--server", &format!("http://127.0.0.1:{}", s.port), "--token", &join, "--name", "keeper", "--labels", "keep", "--slots", "1", "--no-terminal"]).env("KILN_MACHINE_ID", "keeper")
             .arg("--work-dir")
             .arg(dir.join("keeper-work"))
             .arg("--state-dir")

@@ -2026,9 +2026,13 @@ html[data-window="short"] .hx-main:has(.ch :is(input, textarea, select):focus) >
 .al-slot + .al-line {
   padding-left: 6px;
 }
-/* A subagent: its pick box, its piece of the path, its name and what it's at, its pause and Stop. */
-.dn-row {
+/* A subagent: its pick box, its piece of the path, its name and what it's at, its pause and Stop.
+   Its piece of the path spans the whole of it, what it asks and its Stop's question too, so the
+   lanes go on unbroken from row to row. */
+.dn {
   position: relative;
+}
+.dn-row {
   display: grid;
   grid-template-columns: 22px 40px minmax(0, 1fr) auto;
   align-items: start;
@@ -2167,6 +2171,37 @@ html[data-window="short"] .hx-main:has(.ch :is(input, textarea, select):focus) >
 .dn-pause:disabled,
 .dn .al-stop:disabled {
   opacity: 0.35;
+}
+/* One that ended: its trash where its pause was (kiln's Remove), and it follows a finger sideways
+   (the list still scrolls up and down under it). */
+.dn-remove:hover:not(:disabled) {
+  color: #ecc9cc;
+}
+.dn:is([data-stand="done"], [data-stand="failed"], [data-stand="stopped"]) {
+  touch-action: pan-y;
+}
+/* While some are picked: Remove, for those of them that ended, left of the chevron. */
+.al-top {
+  position: relative;
+}
+.al-remove {
+  position: absolute;
+  top: 50%;
+  right: max(30px, calc(env(safe-area-inset-right) + 14px));
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  margin-right: 0;
+  transform: translateY(-50%);
+}
+.al-remove:hover:not(:disabled) {
+  color: #ecc9cc;
+}
+.al-remove:disabled {
+  opacity: 0.35;
+}
+.al-top[data-picking] .al-summary {
+  max-width: calc(100% - 96px);
 }
 /* What it asks, answered under its words. */
 .dn-answer {

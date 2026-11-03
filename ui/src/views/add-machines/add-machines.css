@@ -138,6 +138,13 @@
   height: 13px;
   flex: none;
 }
+/* A runner's name as the way to it: a long one ends in … rather than taking the row from the machine's. */
+.am-act-name {
+  min-width: 0;
+  max-width: min(24em, 40vw);
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
 .am-act[data-tone="ok"] {
   color: #bfdccf;
 }
