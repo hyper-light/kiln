@@ -993,10 +993,12 @@ async fn serving(h: &Handle) -> anyhow::Result<u64> {
     Ok(s.get("serving").and_then(serde_json::Value::as_array).map(|a| a.iter().filter_map(|x| x.get("runs").and_then(serde_json::Value::as_u64)).sum()).unwrap_or(0))
 }
 
-/// Shell text that waits for `go`, then writes 20 MB (past the 16 MiB a runner holds unread),
-/// then `done` into `done`.
+/// Shell text that waits for `go`, fills the node and pipe-reader queues, then writes `done`.
+/// W24 M0 step 4's gate: 20 MB fits in the node's 16 MiB plus the pipe reader's 256 x 64 KiB
+/// queue, so the command could finish before any unread output had to give way.
 fn past_the_buffer(go: &std::path::Path, done: &std::path::Path) -> String {
-    format!("until [ -e '{}' ]; do sleep 0.1; done; head -c 20000000 /dev/zero; echo done > '{}'", go.display(), done.display())
+    let bytes = node::BUFFER.saturating_mul(4);
+    format!("until [ -e '{}' ]; do sleep 0.1; done; head -c {bytes} /dev/zero; echo done > '{}'", go.display(), done.display())
 }
 
 /// `kiln run --detach` (docs/reach.md §4.2): once its client went, the run is followed on alone by
@@ -1083,17 +1085,27 @@ fn a_detached_run_whose_asker_takes_none_of_its_output_gives_way_after_a_while()
         let dir = tempfile::tempdir()?;
         let (go, done) = (dir.path().join("go"), dir.path().join("done"));
         lab.mac.connect("linux").await?;
-        // A run mac follows keeps its link to linux up meanwhile.
-        let (kept, _kept_said) = async_channel::unbounded();
-        lab.mac.run("linux", RunSpec { command: "sleep 30".into(), ..RunSpec::default() }, kept).await?;
+        // W24 M0 step 4's loaded gate: the keeper lasts for this fixture, including a slow
+        // handshake. A fixed sleep can end before this test starts measuring the unread output.
+        let keep = dir.path().join("keep");
+        std::fs::write(&keep, b"")?;
+        let (kept, kept_said) = async_channel::unbounded();
+        lab.mac.run("linux", RunSpec { command: format!("while [ -e '{}' ]; do sleep 0.1; done", keep.display()), ..RunSpec::default() }, kept).await?;
+        anyhow::ensure!(matches!(crate::rt::timeout(Duration::from_secs(60), kept_said.recv()).await??, wire::Say::Started { .. }), "the run keeping the link up did not start");
         // Asked as a runner from before asks a detached run, then let go of.
         let (says, _said) = async_channel::unbounded();
         let id = lab.mac.run("linux", RunSpec { command: past_the_buffer(&go, &done), linger_ms: Some(wire::DETACHED), ..RunSpec::default() }, says).await?;
         lab.mac.leave("linux", Some(id), None).await;
+        // leave enqueues the request. This status request follows it on the same queue: no
+        // output is released until the asker has stopped following, so none can be acknowledged.
+        anyhow::ensure!(count_of(&lab.mac, "linux", "runs").await? == 1, "the asker still followed the detached run");
         let t = std::time::Instant::now();
         std::fs::write(&go, b"")?;
         anyhow::ensure!(appears(&done, Duration::from_secs(60)).await.as_deref() == Some("done\n"), "the run waited on output its asker never takes");
         anyhow::ensure!(t.elapsed() >= Duration::from_secs(8), "it gave way with a link up before 10 s: {:?}", t.elapsed());
+        let ended = lab.ended.lock().clone();
+        anyhow::ensure!(ended.is_empty(), "the link did not stay up: {ended:?}");
+        std::fs::remove_file(&keep)?;
         Ok(())
     })
 }
