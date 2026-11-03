@@ -576,7 +576,10 @@ impl Store {
             return f(&mut g);
         }
         let inner = self.inner.clone();
-        crate::rt::blocking(move || {
+        // The pool's store share: the one connection takes a statement at a time, so its places
+        // are few, and a slow statement (a checkpoint on a busy disk, another caller's long write)
+        // holds them, not the file share's that snapshots and reads need.
+        crate::rt::blocking_in(crate::rt::SHARE_STORE, move || {
             let mut g = inner.conn.lock();
             match (&inner.watch, &inner.group) {
                 (Some(watch), Some(group)) => through_group(&mut g, watch, group, f),
@@ -593,7 +596,7 @@ impl Store {
         R: Send + 'static,
     {
         let inner = self.inner.clone();
-        crate::rt::blocking(move || {
+        crate::rt::blocking_in(crate::rt::SHARE_STORE, move || {
             let mut g = inner.conn.lock();
             f(&mut g)
         })

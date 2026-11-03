@@ -20,20 +20,30 @@ on any device (`crate::harness::live`):
   whenever nobody watches: the first frame after its last viewer leaves deletes it, and the next
   viewer makes it again, so a session nobody watches holds none of the bus's memory.
 - **Frames go out only while someone watches,** as before: the JSON a viewer's page reads (`open`,
-  `meta`, `state`, `state_patch`, `events`, `stream`, `changes`, `files`, `closed`). A state goes
-  whole and as what changed in it, and each viewer takes the form it asked for (`?patch=state`).
+  `meta`, `state`, `state_patch`, `events`, `stream`, `changes`, `changes_patch`, `files`,
+  `closed`). A state goes whole and as what changed in it, and each viewer takes the form it asked
+  for (`?patch=state`); so does a changeset (`?patch=changes`). With every viewer taking patches (a
+  page does), a state or changeset goes as its patch alone, so a long session's changeset (megabytes
+  of diffs) is never put on the bus whole; a viewer that takes them whole gets them whole again
+  from its next frame on. Each frame is written straight into its bus message, its events' JSON as
+  the copy keeps it, written out once: what a live frame, a snapshot and a digest take of an event
+  is made one time, however many viewers take it.
 - **No frame missed or seen twice.** A viewer (`GET /api/harness/sessions/:id/ws`) is sent a
   snapshot, or only what changed since the revision it says it has (`?after=`, docs/wire.md,
   "Revisions"), and reads the feed from the offset that was taken at: both are taken under the
-  mirrors' lock, which every publish takes too. The lock holds only while the parts are taken (the
-  events by reference); the frames are made after it's let go, so a viewer starting over never holds
-  up another session's frames. Each frame on the feed carries the copy's revision, and one a
-  catch-up already held is skipped.
+  mirrors' lock, which every publish takes too. The lock holds only while the parts are taken (all
+  of them by reference); the frames are written after it's let go, on the blocking pool (gzip'd
+  there too, for a page that asks `?z=gzip`), so a viewer starting over never holds up another
+  session's frames, nor the sockets on the runtime's thread it came on. Each frame on the feed
+  carries the copy's revision, and one a catch-up already held is skipped.
 - **A viewer that falls behind catches up, alone.** One further behind than the feed keeps is
   refused `Behind` by the bus (its typed lag notice), and it catches up from the last revision it
   was sent: only what changed since (`resumed`), or the session whole (`open`) when the copy can't
   tell, with `{"t":"synced"}` after it. A publish never waits for a viewer, so a stalled one holds
-  up neither the session nor any other viewer.
+  up neither the session nor any other viewer. One that has to catch up again waits first until
+  as long has gone by since its last catch-up as that one took to make and send: a viewer spends at
+  most half its time catching up, so one slower than its session (or a feed refusing frame after
+  frame) costs the server snapshots at the pace it makes them, not one a frame.
 - **Nothing dropped silently.** A frame the bus refuses (over 1 MiB, or the bus's memory full)
   marks the feed broken: its next frame goes after a resync marker, which sends every viewer reading
   it back to catch up as one that fell behind does, and the refusal is counted

@@ -686,7 +686,10 @@ impl Server {
                 }
                 let program = args.get("program").and_then(Value::as_str).unwrap_or("").to_owned();
                 let mode = if name == "code_search" { code::Mode::Search } else { code::Mode::Run { input: args.get("input").cloned().unwrap_or(Value::Null) } };
-                let result = crate::rt::blocking(move || code::run(cx, mode, &program, code::Limits::default())).await;
+                // A thread of its own, not the pool's: a program waits on its calls for up to its
+                // wall clock (a minute), and their operations need the pool themselves (programs
+                // holding every file place while their calls waited for one stalled the share).
+                let result = crate::rt::on_thread("kiln-code", move || code::run(cx, mode, &program, code::Limits::default())).await;
                 match result {
                     Ok(Ok(out)) => tool_ok(out),
                     Ok(Err(e)) => tool_error_value(json!({"error": e.message, "code": e.code, "calls": e.calls})),

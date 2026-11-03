@@ -3934,15 +3934,24 @@ fn push_update(updates: &mut crate::wire::uplink::Updates, session: &str, u: &cr
         }
         _ => harness_frames(session, u),
     };
-    let mut bytes = 0;
-    for json in frames {
-        if let Ok(b) = proto::encode(&AgentMsg::Harness { session: session.to_owned(), json }) {
-            bytes += b.len();
-            if picture {
-                updates.picture(&key, b);
-            } else {
-                updates.push(&key, b);
-            }
+    let bodies: Vec<Vec<u8>> = frames.into_iter().filter_map(|json| proto::encode(&AgentMsg::Harness { session: session.to_owned(), json }).ok()).collect();
+    let bytes = bodies.iter().map(Vec::len).sum();
+    if picture {
+        for b in bodies {
+            updates.picture(&key, b);
+        }
+    } else if matches!(u, Update::State { .. }) {
+        // The session whole as it stands: held behind its last one while that waits for its
+        // answer, a newer taking its place (`Updates::push_state`).
+        updates.push_state(&key, bodies);
+    } else if matches!(u, Update::Closed | Update::Reset { .. } | Update::Open { .. }) {
+        // What ends or starts its timeline over: no state of before it comes after it.
+        for b in bodies {
+            updates.push_after_state(&key, b);
+        }
+    } else {
+        for b in bodies {
+            updates.push(&key, b);
         }
     }
     bytes

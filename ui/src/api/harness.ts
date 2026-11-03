@@ -960,7 +960,7 @@ export class SessionStore {
   idle = () => !this.wanted && this.listeners.size === 0;
 
   /** Connect now rather than at the next try (the tab is shown again, the network is back). */
-  wake = () => this.kick(false);
+  wake = () => this.kick("wake");
 
   /**
    * Send a command; false when the session isn't connected. It goes under an id ({@link commandId}),
@@ -1078,13 +1078,13 @@ export class SessionStore {
     this.wanted = true;
     this.unhook = [
       // The server restarted, or the network came back: this socket may be gone too without having said so.
-      events.onReopen(() => this.kick(true)),
+      events.onReopen(() => this.kick("fresh")),
       // The session is on the server again (its machine came back): no need to wait for the next try.
       // And what of its messages couldn't be read, which only the server says, as it changes.
       events.on((ev) => {
         if (ev.type !== "harness" || ev.info.id !== this.id) return;
         this.refused(ev.info.refused);
-        this.kick(false);
+        this.kick("event");
       }),
     ];
     this.connect();
@@ -1247,14 +1247,32 @@ export class SessionStore {
     this.timer = window.setTimeout(() => this.connect(), delay);
   }
 
-  /** Connect now. `fresh`: even over a socket that looks open (it may have died without saying so). */
-  private kick(fresh: boolean) {
+  /**
+   * Connect now, unless connected. `wake`: asked (the tab shown again, the network back): at once.
+   * `fresh`: the server or the network is back, so even a socket that looks open goes again (it may
+   * have died without saying so), each session at a moment of its own within its first backoff
+   * ("full jitter": Brooker, "Exponential Backoff And Jitter", AWS Architecture Blog, 2015), as
+   * every page's go at once. `event`: told the session is there (an event about it, which a turn
+   * sends many of): news only to a store that took it as gone or not there yet, which goes at once;
+   * any other waits out its backoff, a socket that just died not going again at each event.
+   */
+  private kick(how: "wake" | "fresh" | "event") {
     if (!this.wanted) return;
     const ws = this.ws;
     if (ws && ws.readyState === WebSocket.CONNECTING) return;
-    if (ws && ws.readyState === WebSocket.OPEN && (!fresh || Date.now() - this.wsAt < 2000)) return;
+    if (ws && ws.readyState === WebSocket.OPEN && (how !== "fresh" || Date.now() - this.wsAt < 2000)) return;
+    if (how === "event") {
+      if (!this.ended && this.misses === 0) return;
+      this.connect();
+      return;
+    }
     this.attempt = 0;
-    this.connect();
+    if (how === "wake") {
+      this.connect();
+      return;
+    }
+    window.clearTimeout(this.timer);
+    this.timer = window.setTimeout(() => this.connect(), Math.floor(Math.random() * (BACKOFF[0] ?? 250)));
   }
 
   private apply(u: SessionDown) {
@@ -1298,7 +1316,6 @@ export class SessionStore {
         this.opened = true;
         this.ended = false;
         this.misses = 0;
-        this.attempt = 0;
         // Sent as the socket opens: the server's own snapshot, which it ends with "synced"; or
         // only what came after what's shown (resumed), taken in with it.
         this.begin(u.info, this.frames === 1, u.t === "resumed");
@@ -1384,6 +1401,9 @@ export class SessionStore {
     const inc = this.incoming;
     if (!inc) return;
     this.incoming = null;
+    // A socket that brought its snapshot whole held: its backoff starts over. One that dies before
+    // (or a server that keeps dropping it) waits longer each time, a snapshot each for the server.
+    this.attempt = 0;
     window.clearTimeout(this.quiet);
     window.clearTimeout(this.hold);
     const byId = new Map<string, HEvent>();

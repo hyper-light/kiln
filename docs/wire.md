@@ -65,7 +65,12 @@ Messages to agents ride the same channel, and their answers are T3's inbox answe
   snapshot, which holds no `Update::Inbox`. That happens when either side restarted, or the stream
   filled up. The snapshot goes whole however large it is: a stream's room (8 MiB, 64 MiB for all of
   a runner's together) bounds only what's sent after it, since a snapshot held to it could never
-  start a long session's stream again (`wire/uplink.rs`). One dropped this way leaves its send "on its way" after 10 s, as T3's registry has it.
+  start a long session's stream again (`wire/uplink.rs`). A stream that overflows again before
+  the server has answered the snapshot it started with waits for that answer
+  (`uplink::Updates::take_stale`): one that keeps overflowing its room on a server slow to answer
+  starts over at the pace the server takes its snapshots, never with two on their way at once,
+  rather than at each frame from the server, and what it takes in meanwhile is in the snapshot it
+  starts with. Gone stale while its link is down, it starts over as soon as the server is back. One dropped this way leaves its send "on its way" after 10 s, as T3's registry has it.
   One case is open. After a server restart, a stream the old server took items of but answered
   none of goes on: nothing says it lost them, since a server that never received any says the
   same. Its inbox answer then reaches the new server too. That server finds no waiter for it,
@@ -210,7 +215,11 @@ The channel makes up for what of these it carried, without waiting for a reconne
 - A receiver behind its sender's `low` (it started again with less, and the stream went on) goes on
   from there: every item through `low` is answered.
 - An item whose answer doesn't come within the stream's patience (15 s for session updates and
-  terminal output) is sent again, and the receiver takes it once.
+  terminal output) is sent again, and the receiver takes it once. Its stream waits longer while
+  its answers take longer: RFC 6298's retransmission timeout (RTO = SRTT + 4·RTTVAR, from items
+  sent once alone, Karn's algorithm), the patience at the least. An answer that's late is mostly a
+  receiver that's slow, not a frame lost, and a slow server sent a session's whole snapshot again
+  at each patience only got slower.
 - A closed connection resumes as every reconnect does (`Have`).
 - What each side has (`Have`) is said again every few seconds, the runner's with its samples and
   the server's every 5 s. A lost one doesn't hold a link's sends up: a sender's sends wait for the

@@ -204,3 +204,9 @@ harness = false
 [[bench]]
 name = "send_e2e"
 harness = false
+
+# What the server's copy of a long session costs to keep and to show its viewers: time, allocations,
+# reallocations and page faults (`cargo bench -p kiln --bench session_feed`).
+[[bench]]
+name = "session_feed"
+harness = false

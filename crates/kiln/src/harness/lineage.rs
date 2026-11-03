@@ -298,7 +298,10 @@ pub async fn access(hub: &Hub, caller: &crate::authz::Caller, id: &str) -> Acces
         None => None,
     };
     let theirs = crate::mcp::whose(hub, id).await;
-    access_of(caller, manages(caller), &hub.harness.list(), id, mine.as_deref(), theirs.as_deref())
+    // Only an agent's reach reads the lineage (whether `id` descends from it), and only `id`'s
+    // line of it: not a copy of every session, sorted, on every request.
+    let line = if caller.agent.as_deref().is_some_and(|me| me != id) { hub.harness.lineage_of(id) } else { Vec::new() };
+    access_of(caller, manages(caller), &line, id, mine.as_deref(), theirs.as_deref())
 }
 
 /// What a caller is told of an agent it doesn't reach: the same as of one kiln doesn't run.
@@ -393,10 +396,14 @@ pub async fn may_message(hub: &Hub, caller: &crate::authz::Caller, id: &str) -> 
     }
 }
 
+/// How far up an agent's line [`descends`] looks: the sessions it reads, `id` and its ancestors,
+/// at most (a line that loops ends there).
+pub const LINE_MAX: usize = 64;
+
 /// Whether agent `id` descends from agent `ancestor` (a child of it, or of one of its children…).
 pub fn descends(all: &[Info], id: &str, ancestor: &str) -> bool {
     let mut at = id;
-    for _ in 0..64 {
+    for _ in 0..LINE_MAX {
         let Some(p) = all.iter().find(|i| i.id == at).and_then(|i| i.parent.as_deref()) else { return false };
         if p == ancestor {
             return true;

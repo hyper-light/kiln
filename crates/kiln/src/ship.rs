@@ -1567,12 +1567,22 @@ impl ShipCache {
             })
             .await
             .map_err(internal)?;
+        // Each loaded commit's row drawn before the model's lock is taken (a render and its JSON
+        // each): every page that reads the model waits on its write lock, on every shard.
+        let mut loaded = Vec::with_capacity(read.loaded.len());
+        for (ctx, recs, all, drop) in read.loaded {
+            let mut rows = Vec::with_capacity(recs.len());
+            for rec in recs {
+                rows.push((rec.sha.clone(), Row::of(rec, runners, now)?));
+            }
+            loaded.push((ctx, rows, all, drop));
+        }
         let mut h = self.held.write().map_err(|_| poisoned())?;
         if read.top < h.seq {
             return Ok(());
         }
         h.repos.retain(|_, r| !read.gone_repos.contains(&r.ctx.id));
-        for (ctx, recs, all, drop) in read.loaded {
+        for (ctx, rows, all, drop) in loaded {
             // A repository renamed: its commits move with it.
             let old = h.repos.iter().find(|(name, r)| r.ctx.id == ctx.id && **name != ctx.name).map(|(name, _)| name.clone());
             if let Some(r) = old.and_then(|old| h.repos.remove(&old)) {
@@ -1585,11 +1595,14 @@ impl ShipCache {
             for sha in drop {
                 held.rows.remove(&sha);
             }
-            for rec in recs {
-                held.rows.insert(rec.sha.clone(), Row::of(rec, runners, now)?);
+            for (sha, row) in rows {
+                held.rows.insert(sha, row);
             }
             let newest: Vec<(i64, String)> = ctx.commits.iter().take(cap).map(|(s, f, _)| (*f, s.clone())).collect();
-            held.rows.retain(|sha, _| newest.iter().any(|(_, s)| s == sha));
+            {
+                let keep: std::collections::HashSet<&str> = newest.iter().map(|(_, s)| s.as_str()).collect();
+                held.rows.retain(|sha, _| keep.contains(sha.as_str()));
+            }
             held.order = newest.into_iter().filter(|(_, s)| held.rows.contains_key(s)).collect();
             held.total = ctx.commits.len();
             held.ctx = ctx;
