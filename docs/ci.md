@@ -203,7 +203,7 @@ Statuses: `ready` (can start), `blocked` (waits on what is in brackets), `in pro
 | W23 | CI providers: KilnCI, GitHub Actions, GitLab CI/CD, Bitbucket Pipelines | W03, W14, deploy-api.md §7 | in progress | the git-host interface (kiln, GitHub, GitLab, Bitbucket); the provider core; GitHub Actions, GitLab CI/CD and Bitbucket Pipelines behind one contract (runs, jobs, logs, rerun, cancel, dispatch, artifacts, approvals, environments, checks, lint, webhooks; AC01); the hosts' pull requests through one API (R06); events for agents; SSO with GitHub, GitLab and Bitbucket, and acting on the host as the person |
 | W24 | Incremental CI: fingerprints, reuse, warm state, shared caches | W04, W05, W06, W08, W13, W18 | ready | specified (2026-10-24): R01–R31, AC01–AC15; milestones M0–M7 and M1e are kiln goals with plans |
 | W26 | Review in Ship: changes as Ship items, each owning its review | W14, W23, W27, Ship (the CI/CD Integration plan) | in progress | R06–R15 built: each item's dropdown owns its review (Files and the Conversation, search on vorpal, kinds and the gate, suggestions and conflicts as revisions, the Review lanes), unsigned until W27-R03; AC06 in Chromium, not yet WebKit; R18 built (agents in review: their words signed, the switch, review agents, Hand off thread by thread, drafts on every host; AC10); specified (2026-10-25): R01–R20, AC01–AC11; plan `01a175b7d5e1772f8d3c7cb28e50ab2b` |
-| W27 | Attested end to end: identities, signatures, hand-offs, the trail | W10, W18, W26 | in progress | specified (2026-10-25): R01–R12, AC01–AC08; research `01a175c54441773fa28bf1488b82e6aa`; identities built (R01, R02, R12; AC01, AC02): plan `01a17856b1b0712babf8dfd37ce48756`; hand-offs built (R08; AC05: the 14:18 drop and the twin played again, refused and recorded, and the transfers simulation): plan `01a17856b1b477eda14a574ae312a123`; custody built there too (R08: between machines, through relays and to production's pods, walked by `kiln custody walk` and modelled by `sim::custody`; the cluster group's copies wait for Ada's word) |
+| W27 | Attested end to end: identities, signatures, hand-offs, the trail | W10, W18, W26 | in progress | specified (2026-10-25): R01–R12, AC01–AC08; research `01a175c54441773fa28bf1488b82e6aa`; identities built (R01, R02, R12; AC01, AC02): plan `01a17856b1b0712babf8dfd37ce48756`; hand-offs built (R08; AC05: the 14:18 drop and the twin played again, refused and recorded, and the transfers simulation): plan `01a17856b1b477eda14a574ae312a123`; custody built there too (R08: between machines, the cluster group's copies and log among them, through relays and to production's pods, walked by `kiln custody walk` and modelled by `sim::custody`) |
 
 ---
 
@@ -9750,11 +9750,11 @@ delegation of it.
 - *Not yet.* The environment's page doesn't show `require_chain` or `production` (an edit there
   keeps them).
 
-**Built: custody, every hand-over signed by both sides (R08; all but the cluster group's copies).**
+**Built: custody, every hand-over signed by both sides (R08).**
 Plan `01a17856b1b477eda14a574ae312a123`, its 16 steps: the records, sessions' hand-overs, acts and
 words, work, changes, review requests, carried approvals, promotions and the replant (steps 1 to
-10); a leg's inputs (11); between machines (12; its cluster group waits for Ada's word on T2's
-files); relays (13); production (14); the walk and its simulation (15); and end to end (16).
+10); a leg's inputs (11); between machines (12, the cluster group's on Ada's word of 2026-11-03);
+relays (13); production (14); the walk and its simulation (15); and end to end (16).
 Research `01a18abf2d28762d92104dca2fbfbf89`.
 
 - *Custody records* are signed statements (`kiln_ci::identity::statement`) whose body says the
@@ -9985,10 +9985,42 @@ Research `01a18abf2d28762d92104dca2fbfbf89`.
     keeps a runner's hand-on with its receipt; its hand-on to a mirror names the runner process
     keeping the copy now, and goes signed only to one that takes custody. A giver from before
     sends no hand-on, and its batches are taken as before.
-  - *The cluster group* (`store::group`, `store::learner`): the server, the group's one voter,
-    hands its learners each copy by its SHA-256 (`cluster_copy`) and, at intervals, a checkpoint of
-    its log (its sequence and the digest of the entries since); each learner receives them once it
-    has applied them.
+  - *The cluster group* (docs/p2p.md P2; `store::group`, `store::learner`, `custody::cluster`): the
+    server, the group's one voter, hands each runner's learner the copy of kiln.db it starts from,
+    then the log's entries; the learner's runner process receives each. Neither the entries, the
+    copy, hyper-raft's messages nor kiln.db's schema changed for it.
+    - *A copy.* A learner whose process signs its receipts asks for a copy saying which process it
+      is (`GET /api/cluster/copy?instance=`). kiln hashes the copy it made and signs and keeps its
+      hand-on of it to that process, by its SHA-256 (`copy of kiln.db at entry <n>`), and says so in
+      a response header (`kiln-custody`: the hand-on's digest, the SHA-256, the entry; not the whole
+      hand-on, which a proxy's cap on a response's head could cut). The learner hashes the copy as it
+      comes and, before it takes it, receives it by what it hashed to: as handed on, it's taken; else
+      it's refused, its receipt of what came is the break kiln records, and another is fetched (three
+      in all).
+    - *The log.* Each member keeps a leaf of every entry it applies (`store::group::Leaves`: the
+      SHA-256 of its place, term and what it carries), the same on the server and a learner for the
+      same entry. A learner that can sign says it checks the log's checkpoints with its ask of where
+      kiln.db stands (`Ask`'s `checks`: the entry its leaves start after). To each such learner kiln
+      sends a checkpoint of the log every 10 s while entries flow, none while none do: its hand-on,
+      signed, of the entries since the learner's period began (`entries <a> to <b> of kiln's cluster
+      log`), by the SHA-256 of their leaves (`Msg::Checkpoint`, a new JSON kind of `ServerMsg::Cluster`).
+      A period starts at the learner's copy, or where its leaves start; the first checkpoint a
+      minute or more into it closes it, and the next starts after it (Ada's cadence, 2026-11-03). The
+      learner checks each as soon as it has applied what it runs to. It signs its receipt of each
+      that closes, so of every entry of its periods, at most once a minute; kiln keeps those hand-ons
+      as it sends them, and no others, so the records its own checkpoints write have it send one more
+      at the most, never one each 10 s. One that doesn't match (an entry came changed) it records at
+      once, its receipt of what it applied sent with kiln's hand-on, and copies kiln.db again over
+      what it applied, answering no reads till the copy's in; a copy it can't take stops its group,
+      and its replica is copied as it starts again.
+    - *From before.* A learner from before asks for its copies naming no process and says it checks
+      nothing: kiln hands it the copy unsigned and sends it no checkpoint. A server from before signs
+      no copy and sends no checkpoint, reading a learner's `checks` as a field it doesn't know.
+    - *Not yet.* A learner started again on the replica it kept, or one whose server started again,
+      checks the log from where its leaves start then, and kiln's period with it: the entries it
+      applied since its last receipt before that go unchecked (leaves aren't kept across a start).
+      A member keeps the leaves of its last 65,536 entries: a period longer than that starts again
+      where the group stands.
   - *The server giving a leg to a runner* (step 11, above).
 - *Relays* (step 13; `kiln_ci::identity::relay`, `crate::relays`): every intermediary records what
   it passes on, unchanged, as ARC's handlers each add their record of a message. A relay's record
@@ -10188,7 +10220,25 @@ Research `01a18abf2d28762d92104dca2fbfbf89`.
   delegation of its own to that runner entitling it breaks as `not-entitled`), `reach::sync`'s
   `w27_r08_a_copy_knows_its_tree_by_the_askers_digest` and reach's lab
   `w27_r08_a_link_runs_at_the_version_both_speak_and_only_2_carries_custody` (new to new at 2 with
-  custody frames; either end from before at 1, with none; a synced run works every way).
+  custody frames; either end from before at 1, with none; a synced run works every way). The
+  cluster group: `custody::cluster`'s
+  `w27_r08_a_learners_copy_and_its_log_walk_from_kilns_hand_on_to_its_receipt` (a copy and a
+  stretch of the log, each walking from the runner's receipt to kiln's hand-on; other than handed
+  on, `changed` at the receipt); `store::group`'s `w27_r08_leaves_say_a_stretch_of_the_log_or_why_not`
+  and `w27_r08_a_checkpoint_holds_on_a_learner_only_as_the_server_logged_its_entries` (the server's
+  and its learner's checkpoints agree; an entry changed on its way, the message made whole again,
+  and they don't, the learner holding other than the server wrote; copied again, it holds what the
+  server wrote and the checkpoints after hold); `store::learner`'s
+  `w27_r08_checkpoints_come_every_10_s_while_entries_flow_and_close_at_most_once_a_minute` (the
+  cadence over 200 s: none while no entries flow, periods closing 60 s apart and tiling the log; a
+  copy starts one; none to a learner that hasn't said it checks) and
+  `w27_r08_asks_and_checkpoints_read_back_and_an_ask_from_before_checks_nothing`; and, with
+  `chaos`, `transfers`'s `w27_r08_custody_between_machines_the_cluster_group` (box-a's learner:
+  the server's first copy changed on its way by its `copy_changed`, refused, the break recorded and
+  walked, the next taken and walking unbroken; the first entry sent box-a changed by its
+  `entry_changed`, box-a's next checkpoint the break, recorded and walked, and box-a's copy again
+  taken; then box-a's receipts of two periods of the log, kiln's hand-ons a minute or more apart,
+  the second running on from the first, each walking unbroken).
   Simulation (the Transfers plan's step 9, W27-AC05):
   `sim::transfers::tests::w27_ac05_no_stale_act_is_ever_applied` (docs/sim.md's transfers model:
   moves, resumes from kiln's copy while a machine is cut off, take-overs with the old process still

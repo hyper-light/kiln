@@ -67,6 +67,14 @@
 //! - `sync_file_changed`: the first piece of a file this runner syncs to another (`kiln run`), `.git`
 //!   aside, has a byte changed after it hashed it, as in transit (docs/ci.md W27-R08): the other
 //!   runner refuses the copy and kiln records the break.
+//! - `copy_changed`: the server's: the first copy of kiln.db it hands on to a runner's learner has a
+//!   byte in its middle changed after kiln hashed it, once, as in transit (docs/ci.md W27-R08's
+//!   cluster group): the learner refuses it, kiln records the break, and the learner fetches another.
+//! - `entry_changed`: the server's: the first entry with a write in it that it sends a learner that
+//!   checks the log's checkpoints has its last byte changed, as has every copy of it sent again, the
+//!   message made again whole, as in transit (docs/ci.md W27-R08's cluster group): the learner's
+//!   next checkpoint doesn't match, kiln records the break, and the learner copies the database
+//!   again.
 //! - `relay_calls=<drop|swap|alter>`: the runner, a relay of its agents' calls to kiln, fails every
 //!   second act it passes on (docs/ci.md W27-R08's relays): it numbers it on its stream and passes
 //!   it on not at all; passes the act before on under its record; or changes a byte of the ask after
@@ -138,6 +146,12 @@ pub struct Chaos {
     pub feed_changed: bool,
     /// A file it syncs to another runner changes after it hashed it (`sync_file_changed`).
     pub sync_file_changed: bool,
+    /// The server's: the first copy of kiln.db it hands on to a learner changes after it hashed it
+    /// (`copy_changed`).
+    pub copy_changed: bool,
+    /// The server's: the first entry of its cluster log it sends a learner that checks the log
+    /// changes on its way (`entry_changed`).
+    pub entry_changed: bool,
     /// Its relay of its agents' calls fails every second one (`relay_calls=`).
     pub relay_calls: Option<RelayFault>,
     /// Its blue/green forwarder fails every second frame (`relay_forward=`).
@@ -247,6 +261,8 @@ pub fn parse(spec: &str) -> anyhow::Result<Chaos> {
                 c.blob_changed = Some(v.to_owned());
             }
             "sync_file_changed" => c.sync_file_changed = true,
+            "copy_changed" => c.copy_changed = true,
+            "entry_changed" => c.entry_changed = true,
             "relay_calls" | "relay_forward" | "relay_words" | "relay_frames" => {
                 let f = RelayFault::parse(v).ok_or_else(|| anyhow::anyhow!("chaos `{k}` takes drop, swap or alter, not `{v}`"))?;
                 match k {
@@ -266,7 +282,7 @@ pub fn parse(spec: &str) -> anyhow::Result<Chaos> {
                 }
             }
             "seed" => c.seed = v.parse().map_err(|_| anyhow::anyhow!("chaos `seed` takes a number, not `{v}`"))?,
-            other => anyhow::bail!("chaos has no fault `{other}`: drop, down, delay, lag, oom, disk, corrupt, fetch, platform, rebuild, shed, twice, late, unknown, garble, seed, fanout, old, unsigned, stale_words, identity_late, tarball_changed, no_git, peer_object_changed, blob_changed, feed_changed, sync_file_changed, relay_calls, relay_forward, relay_words, relay_frames, copy or keys"),
+            other => anyhow::bail!("chaos has no fault `{other}`: drop, down, delay, lag, oom, disk, corrupt, fetch, platform, rebuild, shed, twice, late, unknown, garble, seed, fanout, old, unsigned, stale_words, identity_late, tarball_changed, no_git, peer_object_changed, blob_changed, feed_changed, sync_file_changed, copy_changed, entry_changed, relay_calls, relay_forward, relay_words, relay_frames, copy or keys"),
         }
     }
     Ok(c)
@@ -505,6 +521,8 @@ mod tests {
                 blob_changed: None,
                 feed_changed: false,
                 sync_file_changed: false,
+                copy_changed: false,
+                entry_changed: false,
                 relay_calls: None,
                 relay_forward: None,
                 relay_words: None,
@@ -518,6 +536,8 @@ mod tests {
         assert!(parse("blob_changed").is_err(), "it names an object's key");
         assert!(parse("feed_changed")?.feed_changed);
         assert!(parse("sync_file_changed")?.sync_file_changed);
+        // W27-R08's cluster group: a copy, and an entry, changed on their way.
+        assert!(parse("copy_changed")?.copy_changed && parse("entry_changed")?.entry_changed);
         // W27-R08's relays, each failing every second thing it passes on.
         let c = parse("relay_calls=drop,relay_forward=swap,relay_words=alter,relay_frames=drop")?;
         assert_eq!((c.relay_calls, c.relay_forward, c.relay_words, c.relay_frames), (Some(RelayFault::Drop), Some(RelayFault::Swap), Some(RelayFault::Alter), Some(RelayFault::Drop)));

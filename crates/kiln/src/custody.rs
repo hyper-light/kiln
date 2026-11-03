@@ -20,6 +20,7 @@ use serde_json::{Value, json};
 use crate::store::Store;
 
 pub mod blobs;
+pub mod cluster;
 pub mod feeds;
 
 /// The most records a walk loads: a thing's chain, and its custodians' streams.

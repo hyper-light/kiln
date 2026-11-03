@@ -159,10 +159,13 @@ pub fn session_of_pid(pid: u32) -> Option<String> {
 /// Whether this runner's server takes custody records and checks its sessions' acts
 /// (`CAP_CUSTODY`), as it last said.
 static SERVER_CHECKS: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+/// Whether its server has said what it can do since this process started.
+static SERVER_SAID: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 /// The server says what it can do: whether it checks this runner's sessions' acts.
 pub fn server_checks(yes: bool) {
     SERVER_CHECKS.store(yes, std::sync::atomic::Ordering::Relaxed);
+    SERVER_SAID.store(true, std::sync::atomic::Ordering::Relaxed);
 }
 
 /// Whether this runner's server checks its records of the acts it passes on (`CAP_RELAYS`), as it
@@ -340,6 +343,77 @@ impl crate::convo::feed::Custodian for Feed {
             Ok(b) => queue(&b),
             Err(e) => tracing::warn!(target: "kiln.custody", error = %format!("{e:#}"), "this runner's receipt of a batch of kiln's conversation store couldn't be signed"),
         }
+    }
+}
+
+/// This runner process's instance, as kiln names it, once it signs its learner's receipts of what
+/// kiln's cluster group hands it (docs/ci.md W27-R08): its identity certified, and its server taking
+/// custody records. None till then.
+pub(crate) fn cluster_signer() -> Option<String> {
+    use kiln_ci::identity::chain::{Actor, Identity};
+    if !sends() {
+        return None;
+    }
+    match Identity::parse(&identity::uri("runner")?).ok()?.actor {
+        Actor::Runner { instance, .. } => Some(instance),
+        _ => None,
+    }
+}
+
+/// [`cluster_signer`], waited for up to `within` while it may yet come: its server hasn't said yet
+/// whether it takes custody records, or it does and this process's identity isn't certified yet. A
+/// learner starting waits for it before it fetches a copy or says it checks the log.
+pub(crate) async fn cluster_signer_within(within: std::time::Duration) -> Option<String> {
+    use std::sync::atomic::Ordering::Relaxed;
+    let until = std::time::Instant::now() + within;
+    loop {
+        if let Some(instance) = cluster_signer() {
+            return Some(instance);
+        }
+        let never = !signs() || (SERVER_SAID.load(Relaxed) && !SERVER_CHECKS.load(Relaxed));
+        if never || std::time::Instant::now() >= until {
+            return None;
+        }
+        crate::rt::sleep(std::time::Duration::from_millis(100)).await;
+    }
+}
+
+/// kiln's hand-on a learner's receipt follows: by its digest (a copy's, which kiln keeps as it signs
+/// it), or itself as it came, a Sigstore bundle as JSON (a checkpoint's, which kiln keeps only once
+/// its period closes: it goes to kiln with the receipt).
+pub(crate) enum Handed<'a> {
+    Digest(&'a str),
+    Bundle(&'a str),
+}
+
+/// This process's learner took what kiln's cluster group handed it (docs/ci.md W27-R08): its
+/// receipt of `thing` by what came (a copy's SHA-256, or the leaves' of a stretch of the log as it
+/// applied them), following kiln's `hand_on`, signed as this process and sent to kiln, the hand-on
+/// before it when it came whole. One whose digest isn't the hand-on's is the break kiln records at
+/// that hop.
+pub(crate) fn cluster_received(hand_on: Handed<'_>, thing: Subject, why: &str) {
+    if !sends() {
+        return;
+    }
+    let Some(by) = identity::uri("runner") else { return };
+    let (follows, bundle) = match hand_on {
+        Handed::Digest(d) => (d.to_owned(), None),
+        Handed::Bundle(json) => match serde_json::from_str::<Value>(json) {
+            Ok(b) => (digest_of(&b), Some(b)),
+            Err(e) => return tracing::warn!(target: "kiln.custody", error = %e, "kiln's hand-on of entries of its cluster log doesn't read: no receipt signed"),
+        },
+    };
+    // kiln's server, of the organization this process is certified in.
+    let org = by.strip_prefix("kiln://").and_then(|r| r.split('/').next()).unwrap_or_default();
+    let from = bundle.as_ref().and_then(giver_of).unwrap_or_else(|| crate::custody::server_uri(org));
+    match sign("runner", &by, &crate::custody::cluster::receipt(&by, &from, thing, &follows, why)) {
+        Ok(receipt) => {
+            if let Some(b) = &bundle {
+                queue(b);
+            }
+            queue(&receipt);
+        }
+        Err(e) => tracing::warn!(target: "kiln.custody", error = %format!("{e:#}"), "this runner's receipt of what kiln's cluster group handed it couldn't be signed"),
     }
 }
 

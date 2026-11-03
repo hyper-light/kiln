@@ -2014,9 +2014,13 @@ fn sync_machine(req: &Request) -> String {
 static CLUSTER_COPIES: async_lock::Semaphore = async_lock::Semaphore::new(1);
 
 /// A copy of kiln.db for a runner's learner, made now and streamed: for the runner's token for its
-/// machine (`?machine=`), or the admin token. The copy goes once sent.
+/// machine (`?machine=`), or the admin token. The copy goes once sent. kiln hands it on by its
+/// SHA-256 to the runner process that asks for it (`?instance=`, a learner that signs its receipt),
+/// saying so in a header (`crate::custody::cluster::COPY_HEADER`; docs/ci.md W27-R08).
 async fn cluster_copy(hub: &Hub, req: &Request) -> R {
-    let machine = srv::query(req).get("machine").cloned().unwrap_or_default();
+    let q = srv::query(req);
+    let machine = q.get("machine").cloned().unwrap_or_default();
+    let instance = q.get("instance").filter(|i| !i.is_empty()).cloned();
     let theirs = !machine.is_empty() && bearer(req.headers()).is_some_and(|t| crate::util::ct_eq(t.as_bytes(), crate::store::learner::token(&hub.admin_token, &machine).as_bytes()));
     if !theirs && !authed(hub, req.headers()) {
         return Err(err(StatusCode::UNAUTHORIZED, "bad cluster token"));
@@ -2036,10 +2040,46 @@ async fn cluster_copy(hub: &Hub, req: &Request) -> R {
         std::fs::remove_file(&path).ok();
         return Err(err(StatusCode::SERVICE_UNAVAILABLE, format!("{e:#}")));
     }
+    let handed = if theirs { crate::custody::cluster::copy_hand_on(hub, &machine, instance.as_deref(), &path).await } else { None };
+    if handed.is_some() {
+        copy_changed(&path).await;
+    }
     let (size, rx) = copy_body(path).map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, format!("reading the copy of kiln.db: {e}")))?;
-    tracing::info!(machine, bytes = size, took_ms = started.elapsed().as_millis() as u64, "a copy of kiln.db for a runner's learner");
+    tracing::info!(machine, bytes = size, took_ms = started.elapsed().as_millis() as u64, handed_on = handed.is_some(), "a copy of kiln.db for a runner's learner");
     let r = srv::response(StatusCode::OK, "application/octet-stream", srv::channel_body(rx));
-    Ok(srv::with_header(r, header::CONTENT_LENGTH, &size.to_string()))
+    let r = srv::with_header(r, header::CONTENT_LENGTH, &size.to_string());
+    Ok(match handed {
+        Some(h) => srv::with_header(r, header::HeaderName::from_static(crate::custody::cluster::COPY_HEADER), &h),
+        None => r,
+    })
+}
+
+/// A test build's `copy_changed` (the server's, docs/ci.md W27-R08): the first copy of kiln.db kiln
+/// hands on to a learner has a byte in its middle changed after kiln hashed it, once, as one changed
+/// on its way. The learner refuses it and fetches another.
+async fn copy_changed(path: &std::path::Path) {
+    static CHANGED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    if !crate::runner::chaos::get().is_some_and(|c| c.copy_changed) || CHANGED.swap(true, std::sync::atomic::Ordering::SeqCst) {
+        return;
+    }
+    let path = path.to_path_buf();
+    let changed = crate::rt::blocking(move || -> std::io::Result<()> {
+        use std::io::{Read as _, Seek as _, Write as _};
+        let mut f = std::fs::OpenOptions::new().read(true).write(true).open(&path)?;
+        let middle = f.metadata()?.len() / 2;
+        let mut b = [0u8; 1];
+        f.seek(std::io::SeekFrom::Start(middle))?;
+        f.read_exact(&mut b)?;
+        let [byte] = b;
+        f.seek(std::io::SeekFrom::Start(middle))?;
+        f.write_all(&[byte ^ 0x01])
+    })
+    .await
+    .and_then(|r| r.map_err(anyhow::Error::from));
+    match changed {
+        Ok(()) => tracing::warn!(target: "kiln.custody", "chaos: a copy of kiln.db handed on to a learner changed on its way"),
+        Err(e) => tracing::warn!(target: "kiln.custody", error = %format!("{e:#}"), "chaos: a copy of kiln.db couldn't be changed"),
+    }
 }
 
 /// Streams the copy at `path` (it goes once sent): its size, and its bytes as they're read, from

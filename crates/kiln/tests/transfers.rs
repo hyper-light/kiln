@@ -1349,6 +1349,154 @@ fn peers_objects(dir: &Path, port: u16, admin: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// W27-R08 (the Transfers plan's step 12, path f; docs/p2p.md P2): the cluster group's custody.
+/// box-a's learner takes a copy of kiln.db, then follows the log. kiln hands the copy on to box-a's
+/// runner process by its SHA-256, and box-a receives it so. Every 10 s while entries flow (a setting
+/// changed every 2 s here), kiln hands box-a a checkpoint of the log, by the SHA-256 of the leaves of
+/// the entries since box-a's period began; box-a signs its receipt of the one closing each period,
+/// a minute or more apart, the periods running on one from the other, each walking from box-a's
+/// receipt to kiln's hand-on. The server's `copy_changed`: its first copy came changed, refused, the
+/// break recorded and walked at box-a's receipt, and another fetched. Its `entry_changed`: the
+/// first entry it sent box-a came changed, box-a's next checkpoint didn't match, the break recorded
+/// and walked at box-a's receipt, and box-a copied the database again. Failing, it keeps its folder
+/// (the server's and box-a's logs among it) and says where.
+#[cfg(feature = "chaos")]
+#[test]
+fn w27_r08_custody_between_machines_the_cluster_group() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    match cluster_group(dir.path()) {
+        Ok(()) => Ok(()),
+        Err(e) => Err(e.context(format!("its folder, the server's and box-a's logs among it, is kept at {}", dir.keep().display()))),
+    }
+}
+
+/// [`w27_r08_custody_between_machines_the_cluster_group`] in `dir`.
+#[cfg(feature = "chaos")]
+fn cluster_group(dir: &Path) -> anyhow::Result<()> {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    let s = common::start_env(dir, &Options::default(), false, &[("KILN_CHAOS", "copy_changed,entry_changed")])?;
+    let (port, admin) = (s.port, s.admin.clone());
+    let (_a, log_a) = agents::runner_with(dir, port, "box-a", None, TALK, &[])?;
+    agents::connected(port, &admin, "box-a", &log_a, Duration::from_secs(60))?;
+    // Entries flow: one of kiln's settings changed every 2 s, till the test ends.
+    let writing = Arc::new(AtomicBool::new(true));
+    let writer = {
+        let (writing, admin) = (writing.clone(), admin.clone());
+        std::thread::spawn(move || {
+            let mut n = 0u32;
+            while writing.load(Ordering::SeqCst) {
+                n = n.wrapping_add(1);
+                let _ = http(port, "PUT", "/api/updates/skew", &admin, Some(&json!({ "full": 20 + n % 2, "upgrade": 40 })));
+                std::thread::sleep(Duration::from_secs(2));
+            }
+        })
+    };
+    let checked = cluster_group_custody(dir, port, &admin);
+    writing.store(false, Ordering::SeqCst);
+    writer.join().ok();
+    checked.map_err(|e| anyhow::anyhow!("{e:#}\n{}", cluster_said(dir)))
+}
+
+/// box-a's receipts of what kiln's cluster group handed it, oldest first: each record's digest, the
+/// thing's name, and the hand-on it follows with when kiln took it.
+#[cfg(feature = "chaos")]
+fn cluster_receipts(dir: &Path, like: &str) -> anyhow::Result<Vec<(String, String, String, i64)>> {
+    let db = rusqlite::Connection::open(dir.join("data/kiln.db"))?;
+    let mut q = db.prepare(
+        "SELECT c.digest, t.name, f.follows, h.taken_at FROM custody c JOIN custody_things t ON t.record = c.digest JOIN custody_follows f ON f.record = c.digest JOIN custody h ON h.digest = f.follows
+         WHERE c.kind = 'received' AND c.custodian LIKE ?1 AND t.name LIKE ?2 ORDER BY c.taken_at, c.rowid",
+    )?;
+    let rows = q.query_map([format!("%{}%", on("box-a")).as_str(), like], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))?.collect::<Result<Vec<_>, _>>()?;
+    Ok(rows)
+}
+
+/// The first and last entries a stretch of the cluster log's name says ("entries 12 to 40 of kiln's
+/// cluster log").
+#[cfg(feature = "chaos")]
+fn entries_named(name: &str) -> Option<(u64, u64)> {
+    let rest = name.strip_prefix("entries ")?;
+    let (first, rest) = rest.split_once(" to ")?;
+    let (last, _) = rest.split_once(' ')?;
+    Some((first.parse().ok()?, last.parse().ok()?))
+}
+
+/// What [`w27_r08_custody_between_machines_the_cluster_group`] checks, once box-a is connected.
+#[cfg(feature = "chaos")]
+fn cluster_group_custody(dir: &Path, port: u16, admin: &str) -> anyhow::Result<()> {
+    // Two hops, both signed: box-a's receipt, and the hand-on of kiln's server (of box-a's
+    // organization: `kiln://<org>/server`).
+    let walks_from_box_a = |record: &str| -> anyhow::Result<()> {
+        let v = chain_of_digest(port, admin, record)?;
+        anyhow::ensure!(v.get("unbroken") == Some(&json!(true)), "{record}'s chain doesn't walk: {v}");
+        let kilns = |taker: &str, giver: &str| taker.split('/').nth(2).is_some_and(|org| giver == format!("kiln://{org}/server"));
+        match hops_of(&v).as_slice() {
+            [(r, taker), (h, giver)] if r == "received" && h == "handed-on" && taker.contains(&on("box-a")) && kilns(taker, giver) => Ok(()),
+            other => anyhow::bail!("box-a's receipt of kiln's hand-on: {other:?}"),
+        }
+    };
+    let broken_at = |record: &str| -> anyhow::Result<()> {
+        let v = chain_of_digest(port, admin, record)?;
+        anyhow::ensure!(v.get("unbroken") == Some(&json!(false)) && v.pointer("/break/kind") == Some(&json!("changed")) && v.pointer("/break/record") == Some(&json!(record)), "the walk from {record} breaks there, changed: {v}");
+        Ok(())
+    };
+    // The copy that came changed: refused, the break recorded at box-a's receipt of what came, which
+    // kiln's walk finds again; then a copy taken as kiln handed it on.
+    let copy_break = until(Duration::from_secs(120), || Ok(breaks_now(port, admin)?.into_iter().find(|b| field(b, "kind") == "changed" && field(b, "detail").contains("copy of kiln.db"))))?;
+    let record = field(&copy_break, "record").to_owned();
+    anyhow::ensure!(custodian_of(dir, &record)?.contains(&on("box-a")), "the break is at box-a's receipt: {copy_break}");
+    broken_at(&record)?;
+    let taken = until(Duration::from_secs(60), || Ok(cluster_receipts(dir, "copy of kiln.db at entry %")?.into_iter().find(|r| r.0 != record).map(|r| r.0)))?;
+    walks_from_box_a(&taken)?;
+    // The entry that came changed: box-a's next checkpoint didn't match, the break recorded at its
+    // receipt of what it applied; and box-a copied the database again, taking that copy as handed on.
+    let log_break = until(Duration::from_secs(120), || Ok(breaks_now(port, admin)?.into_iter().find(|b| field(b, "kind") == "changed" && field(b, "detail").contains("of kiln's cluster log"))))?;
+    let broke = field(&log_break, "record").to_owned();
+    anyhow::ensure!(custodian_of(dir, &broke)?.contains(&on("box-a")), "the break is at box-a's receipt: {log_break}");
+    broken_at(&broke)?;
+    until(Duration::from_secs(60), || {
+        let copies = cluster_receipts(dir, "copy of kiln.db at entry %")?;
+        Ok((copies.len() >= 3 && copies.last().is_some_and(|c| c.0 != record)).then_some(()))
+    })
+    .map_err(|e| anyhow::anyhow!("box-a's third copy, over the entry that came changed: {e}"))?;
+    let last_copy = cluster_receipts(dir, "copy of kiln.db at entry %")?.last().map(|c| c.0.clone()).unwrap_or_default();
+    walks_from_box_a(&last_copy)?;
+    // The log's receipts after it: two, of periods closing a minute or more apart, the second
+    // running on from the first, each walking from box-a's receipt to kiln's hand-on.
+    let after = cluster_receipts(dir, "entries % of kiln's cluster log")?.iter().position(|r| r.0 == broke).unwrap_or_default();
+    let receipts = until(Duration::from_secs(300), || {
+        let all = cluster_receipts(dir, "entries % of kiln's cluster log")?;
+        let since: Vec<_> = all.into_iter().skip(after + 1).collect();
+        Ok((since.len() >= 2).then_some(since))
+    })
+    .map_err(|e| anyhow::anyhow!("two receipts of the log after box-a's copy: {e}"))?;
+    let [first, second, ..] = receipts.as_slice() else { anyhow::bail!("two receipts: {receipts:?}") };
+    for (record, ..) in [first, second] {
+        walks_from_box_a(record)?;
+    }
+    let (a, b) = (entries_named(&first.1).unwrap_or_default(), entries_named(&second.1).unwrap_or_default());
+    anyhow::ensure!(b.0 == a.1 + 1 && b.1 > b.0, "the second period runs on from the first: {} then {}", first.1, second.1);
+    anyhow::ensure!(second.3 - first.3 >= 59, "kiln closed the periods a minute or more apart: its hand-ons at {} and {}", first.3, second.3);
+    Ok(())
+}
+
+/// What the server and box-a logged of the cluster group and its custody: why the test of it
+/// didn't go through.
+#[cfg(feature = "chaos")]
+fn cluster_said(dir: &Path) -> String {
+    let mut names: Vec<std::path::PathBuf> = std::fs::read_dir(dir).map(|d| d.flatten().map(|e| e.path()).filter(|p| p.extension().is_some_and(|x| x == "log")).collect()).unwrap_or_default();
+    names.sort();
+    names
+        .iter()
+        .map(|n| {
+            let text = std::fs::read_to_string(n).unwrap_or_default();
+            let lines: Vec<&str> = text.lines().filter(|l| ["cluster", "replica", "copy of kiln.db", "custody", "chaos", "panicked", "ERROR"].iter().any(|w| l.contains(w))).collect();
+            format!("{}:\n{}", n.display(), lines.get(lines.len().saturating_sub(80)..).unwrap_or(&[]).join("\n"))
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
 /// What kiln has of the relays' streams (`GET /api/custody/relays`), its records no receipt
 /// answered `lapse` seconds on each recorded as a break naming its relay.
 fn relays(port: u16, admin: &str, lapse: i64) -> anyhow::Result<Value> {
