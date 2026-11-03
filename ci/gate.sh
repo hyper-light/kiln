@@ -16,13 +16,13 @@
 # HEAD, committed or not, untracked too, as docs/ci.md's affected() has it (W24-R17): each changed
 # file's crate; every crate below a changed Cargo.toml, Cargo.lock, .cargo/ or rust-toolchain that's
 # in no crate; the crates whose code reads a changed file by path, as a test reads a doc or .kiln/:
-# a string literal (in Rust; any path in other code) naming the file or a folder above it, comments
-# not counting (a `format!` path counts when it's rooted, `{root}/…`, or climbs out of its crate,
-# `../`), or naming a changed crate's manifest outside include_str!, as code that builds that crate
-# by path rather than as a Cargo dependency does; and every crate that depends on one of those
-# (cargo tree -i). It says which crates, and why. A changed file it can't place (in no crate, and
-# read by none) puts the whole workspace in scope, and it says so; so does naming no scope at all.
-# Only a change that's empty leaves nothing to check.
+# a string literal in Rust, or a path in a script a test runs, naming the file or a folder above it
+# (comments, data and prose don't read; a `format!` path counts when it's rooted, `{root}/…`, or
+# climbs out of its crate, `../`), or naming a changed crate's manifest outside include_str!, as code
+# that builds that crate by path rather than as a Cargo dependency does; and every crate that
+# depends on one of those (cargo tree -i). It says which crates, and why. A changed file it can't
+# place (in no crate, and read by none) puts the whole workspace in scope, and it says so; so does
+# naming no scope at all. Only a change that's empty leaves nothing to check.
 #
 # It holds itself to what it was asked, the CPUs and the memory: the needs `kiln run --needs` gives
 # the command (KILN_NEEDS), or --cpus and --mem. It has no size of its own: asked neither, it says
@@ -324,10 +324,12 @@ affected() {
   # What the workspace's code reads by path: one search of its crates for the names a path to a
   # changed file has in it (a Cargo input aside), then each line found read as code. A file in no
   # package: its own name and each folder's above it. A file in a package: its package's folder's
-  # name, which every path into that package from another has in it.
+  # name, which every path into that package from another has in it. A name with no dot in it can
+  # only be part of a path (below, a word with a / or a . in it) beside a /, so it's looked for so.
   while IFS= read -r p; do pats+=(-e "$p"); done < <(printf '%s\n' "$where" | awk -F'\t' '
-    $1 == "own" && $6 != "." { b = $6; sub(/.*\//, "", b); if (!seen[b]++) print b; next }
-    $1 == "own" || $1 == "none" { f = $5; while (f != "") { b = f; sub(/.*\//, "", b); if (!seen[b]++) print b; if (!sub(/\/[^\/]*$/, "", f)) f = "" } }')
+    function name(b) { sub(/.*\//, "", b); if (seen[b]++) return; if (index(b, ".")) print b; else { print b "/"; print "/" b } }
+    $1 == "own" && $6 != "." { name($6); next }
+    $1 == "own" || $1 == "none" { f = $5; while (f != "") { name(f); if (!sub(/\/[^\/]*$/, "", f)) f = "" } }')
   while IFS= read -r d; do [ -z "$d" ] || dirs+=("$d"); done < <(printf '%s\n' "$pkgs" | awk -F'\t' '$4 == "member" { print $3 }')
   hits=''
   if [ ${#pats[@]} -gt 0 ] && [ ${#dirs[@]} -gt 0 ]; then
@@ -336,12 +338,13 @@ affected() {
     # 1 is git grep finding nothing; more is git failing.
     if [ $rc -gt 1 ]; then echo "ci/gate.sh: --since: git grep failed (exit $rc), looking for the code that reads what changed" >&2; return 2; fi
   fi
-  # Each line found, as code: a string literal in Rust (comments and doc comments skipped), any word
-  # in other code (after a # comment's start, for the languages that have them), none in prose, nor
-  # in a crate's manifest (its paths are Cargo's dependencies and its own, which cargo tree has). A
-  # path in it names what it resolves to from the line's file, its crate's folder or the workspace's:
-  # a changed file, or a folder above one; or a changed crate's manifest, outside include_str! and
-  # include_bytes!, as code that builds that crate does. "R<tab>reader<tab>spec<tab>file<tab>where<tab>what it names".
+  # Each line found, read as code: a string literal in Rust (comments and doc comments skipped), any
+  # word in a script (sh, bash, Python, Ruby, Perl; after a # comment's start); nothing in any other
+  # file, data and prose (a fixture naming a path reads nothing), nor in a crate's manifest (its paths
+  # are Cargo's dependencies, which cargo tree has). A path in it names what it resolves to from the
+  # line's file, its crate's folder or the workspace's: a changed file, or a folder above one; or a
+  # changed crate's manifest, outside include_str! and include_bytes!, as code that builds that crate
+  # does. "R<tab>reader<tab>spec<tab>file<tab>where<tab>what it names".
   reads=$(printf '%s\n' "$hits" | P=$pkgs awk -F'\t' -v q="'" '
     function norm(b, t,    s, parts, n, i, k, st, out) {
       s = (b == "") ? t : b "/" t
@@ -357,7 +360,7 @@ affected() {
     }
     function emit(list, r,    m, i, a) {
       m = split(list, a, SUBSEP)
-      for (i = 2; i <= m; i++) if (owner[a[i]] != rname && !seen[rname SUBSEP a[i]]++) print "R\t" rname "\t" rspec "\t" a[i] "\t" at "\t" r
+      for (i = 2; i <= m; i++) if (owner[a[i]] != rname && !seen[rname SUBSEP a[i] SUBSEP (r == a[i])]++) print "R\t" rname "\t" rspec "\t" a[i] "\t" at "\t" r
     }
     function hit(r) {
       if (r == "") return
@@ -440,9 +443,9 @@ affected() {
       dir = path; if (!sub(/\/[^\/]*$/, "", dir)) dir = ""
       base = path; sub(/.*\//, "", base)
       embed = index(text, "include_str!") || index(text, "include_bytes!")
-      if (base ~ /\.(md|markdown|txt|rst|adoc)$/ || base == "Cargo.toml") next
       if (base ~ /\.rs$/) { if (!index(text, "\"")) next; text = rust(text) }
-      else if (base ~ /\.(toml|ya?ml|sh|bash|py|rb|pl|cfg|ini|conf|mk)$/ || base == "Makefile" || base == "Dockerfile") text = nohash(text)
+      else if (base ~ /\.(sh|bash|py|rb|pl)$/) text = nohash(text)
+      else next
       nw = split(text, words, delim)
       for (j = 1; j <= nw; j++) {
         t = words[j]; rooted = 0
@@ -457,7 +460,9 @@ affected() {
         } else { hit(norm(dir, t)); hit(norm(mdir, t)); hit(norm("", t)) }
       }
     }' <(printf '%s\n' "$where") -) || { echo "ci/gate.sh: --since: reading the paths in its crates' code failed" >&2; return 2; }
+  # Each reader once, by what it reads: a line naming a changed file itself before one naming a folder.
   printf '%s\n' "$reads" | awk -F'\t' '$1 == "R" && !c[$2]++ { first[$2] = $4 " (" $5 " names " $6 ")"; order[++k] = $2 }
+    $1 == "R" && $6 == $4 && !exact[$2]++ { first[$2] = $4 " (" $5 " names " $6 ")" }
     $1 == "R" && !d[$2 SUBSEP $4]++ { files[$2]++ }
     END { for (i = 1; i <= k; i++) { x = order[i]; print "S\t" x "\treads " first[x] (files[x] > 1 ? " and " files[x] - 1 " more" : "") } }'
   # A changed file it can't place, in no package and read by none: what it affects isn't known.
