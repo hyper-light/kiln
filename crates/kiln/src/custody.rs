@@ -1513,9 +1513,15 @@ async fn unchecked(store: &Store, root: &[u8], revocations: &[Revocation], b: Br
 /// kiln. None when kiln has no record of it.
 pub async fn walk(store: &Store, pki: &crate::pki::Pki, digest: &str, at: i64, export: bool) -> anyhow::Result<Option<Value>> {
     let Some((mut v, mut read)) = walked(store, &pki.ca_der, &pki.organization(), digest, at).await? else { return Ok(None) };
+    // Its words name a runner as people see it, kiln knowing it by its machine id (docs/machines.md).
+    let labels = store.agent_labels().await.unwrap_or_else(|e| {
+        tracing::warn!(target: "kiln.custody", error = %format!("{e:#}"), "the runners' labels couldn't be read: a walk names them by their ids");
+        Default::default()
+    });
+    let shown = |machine: &str| labels.get(machine).cloned().unwrap_or_else(|| machine.to_owned());
     if let Some(hops) = v.get_mut("hops").and_then(Value::as_array_mut) {
         for h in hops.iter_mut() {
-            let words = hop_words(h);
+            let words = hop_words(h, &shown);
             if let Some(o) = h.as_object_mut() {
                 o.insert("words".into(), Value::String(words));
             }
@@ -1558,14 +1564,14 @@ pub async fn walk(store: &Store, pki: &crate::pki::Pki, digest: &str, at: i64, e
 /// Custodian `uri` in words: "kiln", "kiln's CD", "ada", "the runner on fedora-2", "run 812's leg
 /// build on fedora-2", "agent session 01a1751c at epoch 3 (on adacachy)", "kiln's store of bytes
 /// (s3)", "node m02 (cluster e2e)", "pod shop/web-1 (cluster e2e)"; as it's written when it's none
-/// of those.
-fn custodian_words(uri: &str) -> String {
+/// of those. A machine is named as `shown` gives it.
+fn custodian_words(uri: &str, shown: &dyn Fn(&str) -> String) -> String {
     if let Ok(id) = Identity::parse(uri) {
         return match id.actor {
             Actor::Person { name } => name,
-            Actor::Agent { agent, epoch, held_by, .. } => format!("agent session {} at epoch {epoch}{}", agent.get(..8).unwrap_or(&agent), held_by.map(|h| format!(" (on {})", h.machine)).unwrap_or_default()),
-            Actor::Runner { machine, .. } => format!("the runner on {machine}"),
-            Actor::Leg { machine, run, leg, .. } => format!("run {run}'s leg {leg} on {machine}"),
+            Actor::Agent { agent, epoch, held_by, .. } => format!("agent session {} at epoch {epoch}{}", agent.get(..8).unwrap_or(&agent), held_by.map(|h| format!(" (on {})", shown(&h.machine))).unwrap_or_default()),
+            Actor::Runner { machine, .. } => format!("the runner on {}", shown(&machine)),
+            Actor::Leg { machine, run, leg, .. } => format!("run {run}'s leg {leg} on {}", shown(&machine)),
             Actor::Server => "kiln".into(),
             Actor::Cd => "kiln's CD".into(),
         };
@@ -1574,7 +1580,7 @@ fn custodian_words(uri: &str) -> String {
         return format!("kiln's store of bytes ({kind})");
     }
     if let Some(runner) = uri.strip_prefix("reach-v1:") {
-        return format!("runner {runner}, from before custody");
+        return format!("runner {}, from before custody", shown(runner));
     }
     // A deploy's cluster, its nodes and its pods (kiln_ci::identity::deployed).
     if let Some(rest) = uri.strip_prefix("kubernetes://") {
@@ -1588,8 +1594,9 @@ fn custodian_words(uri: &str) -> String {
     uri.to_owned()
 }
 
-/// A walk's hop in words: "the runner on box-b received binaries/kiln-x from kiln".
-fn hop_words(h: &Value) -> String {
+/// A walk's hop in words: "the runner on box-b received binaries/kiln-x from kiln", a machine
+/// named as `shown` gives it.
+fn hop_words(h: &Value, shown: &dyn Fn(&str) -> String) -> String {
     let s = |k: &str| h.get(k).and_then(Value::as_str).unwrap_or_default();
     let names: Vec<String> = h
         .get("subject")
@@ -1608,14 +1615,14 @@ fn hop_words(h: &Value) -> String {
         [a, b, rest @ ..] => format!("{a}, {b} and {} more", rest.len()),
     };
     // kiln's take, or its receipt, for someone who couldn't sign: "kiln for sam".
-    let by = h.get("taken_for").and_then(Value::as_str).map_or_else(|| custodian_words(s("custodian")), |who| format!("kiln for {}", custodian_words(who)));
+    let by = h.get("taken_for").and_then(Value::as_str).map_or_else(|| custodian_words(s("custodian"), shown), |who| format!("kiln for {}", custodian_words(who, shown)));
     let to = |before: &str| match s("to") {
         "" => String::new(),
-        to => format!("{before}to {}", custodian_words(to)),
+        to => format!("{before}to {}", custodian_words(to, shown)),
     };
     let made = h.get("made_from").and_then(Value::as_array).is_some_and(|m| !m.is_empty());
     match s("kind") {
-        "received" => format!("{by} received {things} from {}", custodian_words(s("from"))),
+        "received" => format!("{by} received {things} from {}", custodian_words(s("from"), shown)),
         "passed-on" => format!("{by} passed {things} on{}", to(" ")),
         "taken" => format!("{by} took {things}"),
         _ if made => format!("{by} handed on {things}, made from what it received{}", to(", ")),

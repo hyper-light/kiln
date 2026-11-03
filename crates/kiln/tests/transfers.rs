@@ -1200,10 +1200,10 @@ fn between_machines(dir: &Path) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Until each of `boxes` sees every other in its reach directory, taking reach links: the directory
-/// a runner checks a link against, which it keeps 30 s (one that announced after its last read is
-/// refused till then, kiln's bug to fix). Asked over each box's own reach socket, before the first
-/// link.
+/// Until each of `boxes` sees every other in its reach directory (by machine id: docs/machines.md),
+/// taking reach links: the directory a runner checks a link against, which it keeps 30 s (one that
+/// announced after its last read is refused till then, kiln's bug to fix). Asked over each box's
+/// own reach socket, before the first link.
 #[cfg(feature = "chaos")]
 fn reach_directories_hold(dir: &Path, boxes: &[&str], within: Duration) -> anyhow::Result<()> {
     use kiln::reach::local::{Client, Ev, Req};
@@ -1224,7 +1224,7 @@ fn reach_directories_hold(dir: &Path, boxes: &[&str], within: Duration) -> anyho
             };
             let v: Value = serde_json::from_str(&json)?;
             let seen: Vec<&str> = v.get("runners").and_then(Value::as_array).into_iter().flatten().filter_map(|r| r.pointer("/runner/name").and_then(Value::as_str)).collect();
-            let all = boxes.iter().all(|b| b == name || seen.contains(b));
+            let all = boxes.iter().all(|b| b == name || seen.contains(&machine(b).as_str()));
             last = json;
             Ok(all.then_some(()))
         })
@@ -1762,7 +1762,7 @@ fn w27_r08_relays_that_drop_swap_or_alter_an_agents_words_are_caught() -> anyhow
             assert!(second.contains("\"sent\":true"), "dropped on the way, as said sent: {second}");
         } else {
             assert!(second.contains("isn't valid") && !second.contains("\"sent\":true"), "{fault}: refused where its session would take it: {second}");
-            assert!(breaks.iter().any(|b| field(b, "kind") == kind && field(b, "refused").contains("message ") && field(b, "detail").contains("runner box-b")), "{fault}: {breaks:?}");
+            assert!(breaks.iter().any(|b| field(b, "kind") == kind && field(b, "refused").contains("message ") && field(b, "detail").contains(&format!("runner {}", machine("box-b")))), "{fault}: {breaks:?}");
         }
     }
     Ok(())
@@ -2085,9 +2085,9 @@ fn synced_runs(dir: &Path, port: u16, admin: &str) -> anyhow::Result<()> {
     let refused = until(Duration::from_secs(60), || {
         let (_, body) = http(port, "GET", "/api/transfers/refused", admin, None)?;
         let v: Value = serde_json::from_str(&body).unwrap_or_default();
-        Ok(v.get("refused").and_then(Value::as_array).cloned().unwrap_or_default().into_iter().find(|r| field(r, "act") == "a hand-over between machines" && field(r, "why").contains("box-d")))
+        Ok(v.get("refused").and_then(Value::as_array).cloned().unwrap_or_default().into_iter().find(|r| field(r, "act") == "a hand-over between machines" && field(r, "why").contains(&machine("box-d"))))
     })?;
-    assert!(field(&refused, "came_from").starts_with("runner box-b"), "box-b recorded what it refused: {refused}");
+    assert!(field(&refused, "came_from").starts_with(&format!("runner {}", machine("box-b"))), "box-b recorded what it refused: {refused}");
     Ok(())
 }
 
