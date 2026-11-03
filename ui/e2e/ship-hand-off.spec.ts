@@ -64,9 +64,10 @@ test("a browser that can't sign has kiln sign the hand-off for the person, and s
   await page.request.post("/api/mock/ship/hand-off?reset=1");
   try {
     await page.goto("/ship");
-    const row = rowOf(page, "sync: a move carries its homes");
+    // Ship's rows are repositories (W26-R29): hyper-raft's newest is a person's failure.
+    const row = rowOf(page, "hyper-light/hyper-raft");
     await row.getByRole("button", { name: "Hand off" }).click();
-    await expect(row).toContainText("ci-doctor fixing · assertion failed in sync::reconnect");
+    await expect(row).toContainText("ci-doctor fixing · assertion failed in raft::lease", { timeout: 15_000 });
     await expect(page.getByText("kiln signed the hand-off for you: this page isn't secure (https), so this browser has no key. Over https, this browser signs its own.")).toBeVisible();
     expect(await sentOf(page)).toEqual([{ unsigned: "this page isn't secure (https), so this browser has no key" }]);
   } finally {
