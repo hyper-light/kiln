@@ -424,6 +424,8 @@ export interface CiDiagnostic {
   range: CiRange;
   /** What would fix it: replacements of ranges by text, under a title (the editor's quick fix). */
   fix?: { title: string; edits: { range: CiRange; text: string }[] };
+  /** W29-R25's "lock it", beside the fix: the use it pins in the draft's locks, kept as written, or the whole file without `uses`. */
+  lock?: { uses?: string };
 }
 
 export interface CiRange {
@@ -889,7 +891,9 @@ export const ci = {
   tryAction: (repo: string, body: { path: string; content: string; ref?: string; inputs: Record<string, string>; runs_on: string }) =>
     request<{ run: string; sha: string; trusted: boolean }>("POST", `/api/ci/repos/${enc(repo)}/actions/try`, body),
   /** A file checked; with `repo`, against what its run would meet too (W02-R12: labels no runner has, actions its policies refuse). */
-  validate: (path: string, content: string, repo?: string, signal?: AbortSignal) => request<CiChecked>("POST", `/api/ci/validate`, repo ? { path, content, repo } : { path, content }, { signal }),
+  /** `sha`: the commit it's edited at (a draft's head), whose locks it's checked against (W29-R25). */
+  validate: (path: string, content: string, repo?: string, signal?: AbortSignal, sha?: string) =>
+    request<CiChecked>("POST", `/api/ci/validate`, repo ? { path, content, repo, ...(sha ? { sha } : {}) } : { path, content }, { signal }),
   /** The JSON Schema of a kind of file (W02-R09): `gha`, `kiln`, `overlay` or `action`, for the editor's key completion and hover. */
   schema: (kind: "gha" | "kiln" | "overlay" | "action") => request<Schema>("GET", `/api/ci/schema/${kind}`),
   /** A workflow's new text saved as `to` says (W21-R06, `ci.workflows.edit`), checked first. */

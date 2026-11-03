@@ -4,6 +4,8 @@
  * what its runs were, which tags its repository has, and who used which of its versions.
  */
 
+import type { ShipLockReview } from "../src/api/ship.ts";
+
 const lines = (...l: string[]) => `${l.join("\n")}\n`;
 
 /** kiln's own CI (pl-2): its jobs at the lines the stills show them. */
@@ -348,11 +350,13 @@ export const FILES: Record<string, string> = {
   "hyper-light/quiver:.github/workflows/ci.yml": quiverCi("v2.3.0"),
   "hyper-light/quiver:.github/workflows/ci.yml:draft:d-update-88": quiverCi("v2.4.0"),
   "hyper-light/quiver:.github/workflows/bench.yml": QUIVER_BENCH,
+  // Rerun with fresh actions' lock change (W29-R25): the same file, its locks moved.
+  "hyper-light/quiver:.github/workflows/bench.yml:draft:d-lock-89": QUIVER_BENCH,
 };
 
 /** A workflow's newest runs on its default branch, newest first: its number, what started it, how it went. */
 /** Each workflow's runs, newest first: its commit, how long ago (seconds) and the jobs that failed, as pl-2 and pl-8 show them. */
-export const RUNS: Record<string, { n: number; event: string; status: "passed" | "failed" | "under way"; sha?: string; ago?: number; failed?: string[]; subject?: string }[]> = {
+export const RUNS: Record<string, { n: number; event: string; status: "passed" | "failed" | "under way"; sha?: string; ago?: number; failed?: string[]; subject?: string; refused?: string }[]> = {
   "hyper-light/kiln:.kiln/ci.yaml": [
     { n: 412, event: "push", status: "passed", sha: "a3f2c1d9e8b7", ago: 12 * 60 },
     { n: 411, event: "push", status: "failed", sha: "9e1b2c0f7a6d", ago: 2 * 3600, failed: ["rust"] },
@@ -370,7 +374,10 @@ export const RUNS: Record<string, { n: number; event: string; status: "passed" |
     { n: 53, event: "push", status: "passed", sha: "8d02e7a", ago: 4 * 86_400 },
   ],
   "hyper-light/quiver:.github/workflows/ci.yml:draft:d-update-88": [{ n: 55, event: "pull_request", status: "under way" }],
-  "hyper-light/quiver:.github/workflows/bench.yml": [{ n: 30, event: "schedule", status: "passed" }],
+  "hyper-light/quiver:.github/workflows/bench.yml": [
+    { n: 31, event: "schedule", status: "failed", sha: "77a1c3e", ago: 86_400, refused: "KCI4051" },
+    { n: 30, event: "schedule", status: "passed" },
+  ],
 };
 
 /** Full releases at the floating tag's exact mirrored commit (W29-R04, pl-2). */
@@ -465,6 +472,59 @@ export const CHECKS: Record<string, { name: string; value: string; state: string
   "hyper-light/ci-kit:.github/actions/cache-cargo": { name: "ci-kit's own checks failed on e41a9c2", value: "4 jobs", state: "failed" },
 };
 
+/** W29-R23–R26, Settings: each workflow's locks and its trunk's lock policy (none: not locked, `off`). */
+export const LOCKS: Record<string, { locked: boolean; require: "off" | "report" | "enforce"; moved?: string[] }> = {
+  "hyper-light/quiver:.github/workflows/bench.yml": { locked: true, require: "report" },
+};
+
+const b64 = (text: string) => Buffer.from(text).toString("base64");
+const CHECKOUT_A = "b4ffde65f46336ab88eb53be808477a3936bae11";
+const CHECKOUT_M = "11bd71901bbe5b1630ceea73d27597364c9af683";
+
+/** A lock-change draft's upstream code (W29-R25), by the draft's key: every file changed between the commit its lock had and the one fresh actions found. */
+export const LOCK_REVIEWS: Record<string, Omit<ShipLockReview, "accepted_by">> = {
+  "hyper-light/quiver:.github/workflows/bench.yml:draft:d-lock-89": {
+    id: "lr-89",
+    base: "1f9b2c4".padEnd(40, "0"),
+    evidence_sha256: "5d1c0a7e".padEnd(64, "3"),
+    differences: {
+      "actions/checkout@v4": {
+        before: { repository: { name: "actions/checkout", native: false }, reference: "refs/tags/v4", commit: CHECKOUT_A },
+        after: { repository: { name: "actions/checkout", native: false }, reference: "refs/tags/v4", commit: CHECKOUT_M },
+        files: [
+          {
+            path: "dist/index.js",
+            before: {
+              mode: 0o100644,
+              base64: b64(lines("const core = require('@actions/core');", "async function run() {", "  const depth = core.getInput('fetch-depth');", "  await fetch(depth);", "}", "run();")),
+            },
+            after: {
+              mode: 0o100644,
+              base64: b64(
+                lines(
+                  "const core = require('@actions/core');",
+                  "async function run() {",
+                  "  const depth = core.getInput('fetch-depth');",
+                  "  await fetch(depth);",
+                  "  await report(process.env);",
+                  "}",
+                  "run();",
+                ),
+              ),
+            },
+          },
+          {
+            path: "src/git-auth-helper.ts",
+            before: { mode: 0o100644, base64: b64(lines("export function configure(token: string) {", "  return git(['config', 'http.extraheader', token]);", "}")) },
+            after: { mode: 0o100644, base64: b64(lines("export function configure(token: string) {", "  send(token);", "  return git(['config', 'http.extraheader', token]);", "}")) },
+          },
+          { path: "dist/cover.png", before: null, after: { mode: 0o100644, base64: Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x00, 0x01]).toString("base64") } },
+        ],
+      },
+    },
+  },
+};
+
 /** W29-R02, pl-1: the commit that last changed each file (an action's folder), independent of the repository tip. */
 export const LAST_COMMIT: Record<string, string> = {
   "hyper-light/kiln:.kiln/stress.yaml:draft:d-stress": "8d7e6f5".padEnd(40, "0"),
@@ -474,4 +534,5 @@ export const LAST_COMMIT: Record<string, string> = {
   "hyper-light/ci-kit:.github/actions/sandbox": "d1a0c3f".padEnd(40, "0"),
   "hyper-light/ci-kit:.github/actions/fuzz-target:draft:d-fuzz": "3be09a1".padEnd(40, "0"),
   "hyper-light/quiver:.github/workflows/ci.yml:draft:d-update-88": "4c19e0b".padEnd(40, "0"),
+  "hyper-light/quiver:.github/workflows/bench.yml:draft:d-lock-89": "6ae2d47".padEnd(40, "0"),
 };

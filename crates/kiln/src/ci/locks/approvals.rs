@@ -45,6 +45,11 @@ fn core_identity(identity: &Identity) -> kiln_ci::lock::kiln::Identity {
     }
 }
 
+/// An approval that still stands, its proposal `e` and draft `d` joined, with `r` its review and
+/// `v` that review's version (LEFT JOINs): the evidence it named is the proposal's, the draft isn't
+/// discarded, and a review's word is its reviewer's latest verdict on that exact version.
+const STANDING: &str = "(d.state != 'discarded' AND e.evidence_sha256 = a.evidence_sha256 AND (a.kind = 'dependency' OR (r.diff_id = a.diff_id AND r.version = a.version AND r.reviewer = a.approved_by AND r.reviewer_kind = 'human' AND r.action = 'accept' AND v.commit_sha = a.commit_sha AND NOT EXISTS(SELECT 1 FROM reviews newer WHERE newer.diff_id = r.diff_id AND newer.reviewer = r.reviewer AND newer.action IN ('accept', 'request_changes', 'resign') AND newer.rowid > r.rowid))))";
+
 /// A draft's head now: its diff's latest version, or what kiln saved last on its host.
 const DRAFT_HEAD: &str = "CASE WHEN d.kind = 'diff' THEN (SELECT v.commit_sha FROM diff_versions v JOIN diffs x ON x.id = v.diff_id WHERE x.kind = 'diff' AND 'D' || x.number = d.name ORDER BY v.n DESC LIMIT 1) ELSE d.head END";
 
@@ -147,7 +152,7 @@ async fn proofs(hub: &Hub, repo: &Repo, reviewed_tree: Option<&str>, source: Opt
     let change = reviewed_tree.map(str::to_owned);
     let (identity, reference, pin) = source.map_or((None, None, None), |(identity, reference, pin)| (Some(identity.to_owned()), Some(reference.to_owned()), Some(pin.to_owned())));
     let rows = hub.store.call(move |c| {
-        let mut st = c.prepare(&format!("SELECT a.id, p.uses_key, p.source_identity, p.git_ref, p.commit_sha, a.commit_sha, a.tree_sha, COALESCE({DRAFT_HEAD}, ''), d.path FROM ci_lock_approvals a JOIN ci_lock_approved_pins p ON p.approval_id = a.id JOIN ci_lock_reviews e ON e.id = a.proposal_id JOIN ci_pipeline_drafts d ON d.id = e.draft_id LEFT JOIN reviews r ON r.id = a.human_review_id LEFT JOIN diff_versions v ON v.diff_id = a.diff_id AND v.n = a.version WHERE a.consumer_repo_id = ?1 AND (?2 IS NULL OR a.tree_sha = ?2) AND (?3 IS NULL OR p.source_identity = ?3) AND (?4 IS NULL OR p.git_ref = ?4) AND (?5 IS NULL OR p.commit_sha = ?5) AND d.state != 'discarded' AND e.evidence_sha256 = a.evidence_sha256 AND (a.kind = 'dependency' OR (r.diff_id = a.diff_id AND r.version = a.version AND r.reviewer = a.approved_by AND r.reviewer_kind = 'human' AND r.action = 'accept' AND v.commit_sha = a.commit_sha AND NOT EXISTS(SELECT 1 FROM reviews newer WHERE newer.diff_id = r.diff_id AND newer.reviewer = r.reviewer AND newer.action IN ('accept', 'request_changes', 'resign') AND newer.rowid > r.rowid))) LIMIT 4097"))?;
+        let mut st = c.prepare(&format!("SELECT a.id, p.uses_key, p.source_identity, p.git_ref, p.commit_sha, a.commit_sha, a.tree_sha, COALESCE({DRAFT_HEAD}, ''), d.path FROM ci_lock_approvals a JOIN ci_lock_approved_pins p ON p.approval_id = a.id JOIN ci_lock_reviews e ON e.id = a.proposal_id JOIN ci_pipeline_drafts d ON d.id = e.draft_id LEFT JOIN reviews r ON r.id = a.human_review_id LEFT JOIN diff_versions v ON v.diff_id = a.diff_id AND v.n = a.version WHERE a.consumer_repo_id = ?1 AND (?2 IS NULL OR a.tree_sha = ?2) AND (?3 IS NULL OR p.source_identity = ?3) AND (?4 IS NULL OR p.git_ref = ?4) AND (?5 IS NULL OR p.commit_sha = ?5) AND {STANDING} LIMIT 4097"))?;
         Ok(st.query_map(params![repo, change, identity, reference, pin], |r| Ok(Proof { id: r.get(0)?, key: r.get(1)?, identity: r.get(2)?, reference: r.get(3)?, commit: r.get(4)?, reviewed: r.get(5)?, tree: r.get(6)?, latest: r.get(7)?, workflow: r.get(8)? }))?.collect::<rusqlite::Result<Vec<_>>>()?)
     }).await.map_err(|_| "KCI4051 dependency approvals could not be read")?;
     if rows.len() > MAX_ITEMS { return Err("KCI1022 too many dependency approval facts".into()); }
@@ -276,4 +281,17 @@ pub(crate) async fn landed(hub: &Hub, repo: &Repo, candidate: &str, landed: &str
 pub(crate) async fn landed_on_host(hub: &Hub, repo: &Repo, reviewed: &str, landed: &str) -> Result<(), String> {
     candidate(hub, repo, landed, &[reviewed.to_owned()]).await?;
     self::landed(hub, repo, landed, landed).await
+}
+
+/// Who accepted the draft's code as it stands at `head` (its tree, so a ready commit of the same
+/// files keeps it), if a person's word on it still stands (W29-R25).
+pub(crate) async fn accepted_by(hub: &Hub, repo: &Repo, draft: &str, head: &str) -> Option<String> {
+    let own = tree(hub, repo, head).await.ok()?;
+    let (repo, draft) = (repo.id.clone(), draft.to_owned());
+    let sql = format!(
+        "SELECT a.approved_by FROM ci_lock_approvals a JOIN ci_lock_reviews e ON e.id = a.proposal_id JOIN ci_pipeline_drafts d ON d.id = e.draft_id
+         LEFT JOIN reviews r ON r.id = a.human_review_id LEFT JOIN diff_versions v ON v.diff_id = a.diff_id AND v.n = a.version
+         WHERE a.consumer_repo_id = ?1 AND e.draft_id = ?2 AND a.tree_sha = ?3 AND {STANDING} ORDER BY a.created_at, a.id LIMIT 1"
+    );
+    hub.store.call(move |c| Ok(c.query_row(&sql, params![repo, draft, own], |r| r.get(0)).optional()?)).await.ok().flatten()
 }

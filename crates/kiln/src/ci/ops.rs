@@ -262,10 +262,10 @@ pub fn ops() -> &'static [Op] {
                 input: Input::of::<input::CiWorkflowsGet>(),
                 route: |v| Ok((Method::GET, path(&["repos", &text(v, "repo")?, "workflows", &text(v, "path")?]), query(v, &["ref"]))),
                 run: |cx: Cx, v: Value| async move { answer(super::workflows::get(&cx.hub, &text(&v, "repo")?, &text(&v, "path")?, &query(&v, &["ref"])).await).await }),
-            op!("ci.locks.update", "Regenerate workflow dependency locks into one draft, preserving accepted commits. Never writes a default branch or accepts a moved tag.", ro: false, destructive: false,
+            op!("ci.locks.update", "Regenerate workflow dependency locks into one draft, preserving accepted commits; with `path` and `content`, a workflow's new text saved with its locks, as Save draft saves it. Never writes a default branch or accepts a moved tag.", ro: false, destructive: false,
                 input: Input::of::<input::CiLocksUpdate>(),
                 route: |v| Ok((Method::POST, path(&["repos", &text(v, "repo")?, "locks"]), HashMap::new())),
-                run: |cx: Cx, v: Value| async move { super::locks::update(&cx.hub, &cx.caller, &text(&v, "repo")?, &serde_json::json!({ "ref": v.get("ref") })).await }),
+                run: |cx: Cx, v: Value| async move { super::locks::update(&cx.hub, &cx.caller, &text(&v, "repo")?, &serde_json::json!({ "ref": v.get("ref"), "path": v.get("path"), "content": v.get("content") })).await }),
             op!("ci.locks.verify", "Verify a commit's workflow locks without a draft, run, accepted-resolution change or notification. Answers fresh and stale workflow/uses/locked/now facts.", ro: true, destructive: false,
                 input: Input::of::<input::CiLocksVerify>(),
                 route: |v| Ok((Method::GET, path(&["repos", &text(v, "repo")?, "locks", "verify"]), query(v, &["sha"]))),
@@ -1246,6 +1246,10 @@ pub mod input {
         pub repo: String,
         /// Its default branch when omitted.
         pub r#ref: Option<String>,
+        /// W29-R25's "lock it": the workflow whose new text `content` is, saved with its locks in
+        /// your draft of it (no `ref`).
+        pub path: Option<String>,
+        pub content: Option<String>,
     }
 
     #[derive(Debug, Deserialize, JsonSchema)]

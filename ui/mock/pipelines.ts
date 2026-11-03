@@ -10,7 +10,7 @@
 import type http from "node:http";
 import { parse, parseDocument } from "yaml";
 import type { ShipPipelineDraft, ShipPipelineGroup, ShipPipelineLine, ShipPipelinePane, ShipPipelineRepo, ShipPipelineRow, ShipPipelineVerb, ShipPipelines } from "../src/api/ship.ts";
-import { ADDED, CALLED, CHECKS, FILES, JOB_SECS, LAST_COMMIT, RESOLVED, RUNS, SET_IN, TAG_AGO, TAGS, UPDATES, USED_BY } from "./pipelines-files.ts";
+import { ADDED, CALLED, CHECKS, FILES, JOB_SECS, LAST_COMMIT, LOCK_REVIEWS, LOCKS, RESOLVED, RUNS, SET_IN, TAG_AGO, TAGS, UPDATES, USED_BY } from "./pipelines-files.ts";
 // The pane's words as the server words them: the UI's own, so the mock and the typed text agree.
 import { triggerLines } from "../src/lib/triggers.ts";
 import { jobLine, spanWords, type JobLast } from "../src/lib/typed-groups.ts";
@@ -258,6 +258,19 @@ const SEEDS: Record<string, { access: string; rows: Seed[] }> = {
       {
         kind: "workflow",
         dialect: "gha",
+        name: "bench",
+        path: ".github/workflows/bench.yml",
+        stand: "waiting",
+        word: "Unpublished",
+        line: "actions/checkout@v4 moves to 11bd719 · it runs nowhere until a person accepts it",
+        pips: ["passed", "passed", "none"],
+        who: "ada",
+        when: ago(20 * M),
+        draft: draft("d-lock-89", "unpublished", "ada", "#89"),
+      },
+      {
+        kind: "workflow",
+        dialect: "gha",
         name: "ci",
         path: ".github/workflows/ci.yml",
         stand: "shipped",
@@ -411,7 +424,7 @@ function workflowGroups(key: string, text: string, kiln: boolean, runsHere: bool
     });
   // Each job's outcome in the last finished run, and its commit, as the server reads them (pl-2's strip).
   const finished = (RUNS[key] ?? []).find((r) => r.status !== "under way");
-  const lastOf = (id: string): JobLast | undefined => (finished?.sha ? { outcome: finished.failed?.includes(id) ? "failed" : "passed", sha: finished.sha } : undefined);
+  const lastOf = (id: string): JobLast | undefined => (finished?.sha && !finished.refused ? { outcome: finished.failed?.includes(id) ? "failed" : "passed", sha: finished.sha } : undefined);
   const stages = stagesOf(jobs);
   const calls = stages.length === 1 && Object.values(jobs).some((j) => obj(j).uses);
   stages.forEach((ids, i) =>
@@ -478,7 +491,7 @@ function workflowGroups(key: string, text: string, kiln: boolean, runsHere: bool
     name: "Runs",
     // As the server words them: its commit, what came of it, how long ago; its event beside it.
     lines: (RUNS[key.replace(/:draft:.*$/, "")] ?? []).map((r) => {
-      const status = r.status === "failed" && r.failed?.length ? `${r.failed.join(", ")} failed` : r.status;
+      const status = r.status === "failed" && r.failed?.length ? `${r.failed.join(", ")} failed` : r.status === "failed" && r.refused ? `refused (${r.refused})` : r.status;
       return {
         key: `runs.${r.n}`,
         kind: "run",
@@ -499,10 +512,44 @@ function workflowGroups(key: string, text: string, kiln: boolean, runsHere: bool
         : { key: "settings.on", kind: "setting", name: "Not run here", value: "this repository's .kiln/ workflows run instead" },
       { key: "settings.machines", kind: "setting", name: "Machines", value: "bare metal unless a job says" },
       ...(doc.concurrency ? [{ key: "settings.concurrency", kind: "setting", name: "Concurrency", value: String(doc.concurrency) }] : []),
+      ...lockLines(LOCKS[key.replace(/:draft:.*$/, "")], jobs),
       ...(Object.keys(call).length ? [{ key: "settings.access", kind: "setting", name: "Access", value: "shared with hyper-light's repositories", state: "owner" }] : []),
     ],
   });
   return out.filter((g) => g.lines.length > 0);
+}
+
+/** A use a lock can hold, as `kiln_ci::lock::editor::lockable` says: another repository's, by a ref. */
+const lockable = (u: string) => !/^(\.\/|\$\/|docker:\/\/|kiln\/)/.test(u) && u.includes("@");
+
+/** Settings' lock lines as `kiln_ci::pipelines::LockSeen` words them (W29-R23–R26): what its locks hold, what the trunk requires, moved tags. */
+function lockLines(lock: { locked: boolean; require: "off" | "report" | "enforce"; moved?: string[] } | undefined, jobs: Record<string, unknown>): ShipPipelineLine[] {
+  const facts = lock ?? { locked: false, require: "off" as const };
+  const uses = Object.values(jobs)
+    .map(obj)
+    .flatMap((j) => [...(j.uses ? [String(j.uses)] : []), ...(Array.isArray(j.steps) ? j.steps.map(obj).flatMap((st) => (st.uses ? [String(st.uses)] : [])) : [])])
+    .filter(lockable);
+  const n = new Set(uses).size;
+  const held: ShipPipelineLine = facts.locked
+    ? { key: "settings.lock", kind: "setting", name: "Locked", value: n === 0 ? "it uses nothing a lock holds" : n === 1 ? "its one use at its commit" : `${n} uses at their commits`, state: "passed" }
+    : { key: "settings.lock", kind: "setting", name: "Not locked", value: "its uses follow their tags", state: "flag" };
+  const require: ShipPipelineLine =
+    facts.require === "off"
+      ? { key: "settings.require_lock", kind: "setting", name: "Require lockfile", value: "off", state: "none" }
+      : facts.require === "report"
+        ? { key: "settings.require_lock", kind: "setting", name: "Require lockfile", value: "report: its runs say what isn't locked", state: facts.locked ? "passed" : "flag" }
+        : { key: "settings.require_lock", kind: "setting", name: "Require lockfile", value: "enforce: what isn't locked doesn't run", state: facts.locked ? "passed" : "failed" };
+  const moved = facts.moved ?? [];
+  const tags: ShipPipelineLine = {
+    key: "settings.moved_tags",
+    kind: "setting",
+    name: "Moved tags",
+    value: `${moved[0]}${moved.length > 1 ? ` and ${moved.length - 1} more` : ""} moved: flagged`,
+    state: "flag",
+  };
+  // Only what there's something to say of: Settings that says only its defaults isn't shown.
+  const required = facts.require !== "off";
+  return [...(facts.locked || required ? [held, require] : []), ...(moved.length ? [tags] : [])];
 }
 
 /** Used by's lines as the server words them (pl-5): each repository by its workflows and version, flagged where that's behind the newest. */
@@ -706,7 +753,10 @@ function narrowsOf(repo: string, path: string, text: string, kiln: boolean): Rec
 }
 
 /** A row's pane: its head, the strip, its groups as the server makes them, and its file. */
-function paneOf(repo: string, row: ShipPipelineRow): ShipPipelinePane {
+/** Who accepted which lock-change draft's code (W29-R25), by the browser that asked: each test its own. */
+const acceptedBy = new Map<string, Set<string>>();
+
+function paneOf(repo: string, row: ShipPipelineRow, ua = ""): ShipPipelinePane {
   const key = row.draft ? `${repo}:${row.path}:draft:${row.draft.id}` : `${repo}:${row.path}`;
   const text = FILES[key] ?? "";
   // A row's last file change is independent of the branch tip its pane opens.
@@ -723,6 +773,24 @@ function paneOf(repo: string, row: ShipPipelineRow): ShipPipelinePane {
         l.value = `${l.value.split(" · ")[0] ?? ""} · → ${update.update.to} in ${row.draft?.change?.name ?? "the draft"}`;
         l.state = "changes";
       }
+  // A lock-change draft (W29-R25): the use whose locked commit it changes marked in Uses, as `kiln_ci::pipelines::mark_relocked` does; its strip as `relock_said`.
+  const review = LOCK_REVIEWS[key];
+  const accepted = review && acceptedBy.get(ua)?.has(review.id) ? "user:ada" : null;
+  if (review)
+    for (const l of groups.find((g) => g.name === "Uses")?.lines ?? []) {
+      const d = review.differences[l.name];
+      if (!d) continue;
+      l.value = `${l.value.split(" · ")[0] ?? ""} · → ${d.after.commit.slice(0, 7)} in ${row.draft?.change?.name ?? "the draft"}`;
+      l.state = "changes";
+    }
+  const files = review ? Object.values(review.differences).reduce((n, d) => n + d.files.length, 0) : 0;
+  const relocked = review
+    ? [
+        ...Object.entries(review.differences).map(([u, d]) => `${u} moves to ${d.after.commit.slice(0, 7)}`),
+        files === 1 ? "its code changed in 1 file" : `its code changed in ${files} files`,
+        accepted ? `accepted by ${accepted.replace(/^user:/, "")}` : "it runs nowhere until a person accepts it",
+      ]
+    : null;
   // What releasing it changes for those who use it, in sentences, and its repository's own checks on its head (pl-5).
   const checks = CHECKS[key];
   const released: ShipPipelineLine[] = [
@@ -736,8 +804,8 @@ function paneOf(repo: string, row: ShipPipelineRow): ShipPipelinePane {
   return {
     head: { title: row.name, path: row.path, kind: row.kind, dialect: row.dialect, ref: row.ref, commit: tip, draft: row.draft, stand: row.stand, word: row.word, pips: row.pips },
     strip: {
-      said: update ? update.said : [`${KIND_WORDS[row.kind] ?? row.kind} · ${row.line}`],
-      strong: update?.strong ?? [],
+      said: update ? update.said : (relocked ?? [`${KIND_WORDS[row.kind] ?? row.kind} · ${row.line}`]),
+      strong: update?.strong ?? (review ? Object.keys(review.differences) : []),
       pick: narrow ? [...Object.keys(narrow), "all"] : ["all"],
       ...(narrow ? { narrow } : {}),
       verbs: verbsOf(row, byHand),
@@ -770,6 +838,7 @@ function paneOf(repo: string, row: ShipPipelineRow): ShipPipelinePane {
         : {}),
     },
     repo,
+    ...(review ? { lock_review: { ...review, accepted_by: accepted } } : {}),
   };
 }
 
@@ -910,6 +979,8 @@ function validate(body: Obj): unknown {
       path: body.path,
       range,
       ...(sha ? { fix: { title: `Pin it to ${sha.slice(0, 7)}`, edits: [{ range, text: sha }] } } : {}),
+      // W29-R25's "lock it", beside the fix: the use kept as written, its commit in the draft's locks.
+      lock: { uses: `${m[1]}@${m[2]}` },
     });
   });
   return { kind: String(body.path ?? "").endsWith("action.yml") ? "action" : "workflow", dialect: String(body.path ?? "").startsWith(".kiln/") ? "kiln" : "gha", diagnostics, outline: null };
@@ -978,6 +1049,7 @@ export async function handlePipelines(req: http.IncomingMessage, res: http.Serve
     if (url.searchParams.get("reset")) {
       sent.delete(ua);
       madeBy.delete(ua);
+      acceptedBy.delete(ua);
     }
     ctx.json(res, 200, { bodies: bodiesOf(ua) });
     return true;
@@ -1000,7 +1072,7 @@ export async function handlePipelines(req: http.IncomingMessage, res: http.Serve
     // A draft is opened by its id (the server's `draft_pane`); without one, the published file.
     const row = repoOf(repo, ua).rows.find((r) => r.path === path && (id ? r.draft?.id === id : !r.draft));
     if (!SEEDS[repo] || !row) ctx.json(res, 404, { error: `no workflow or action ${path} in ${repo} you may read` });
-    else ctx.json(res, 200, paneOf(repo, row));
+    else ctx.json(res, 200, paneOf(repo, row, ua));
     return true;
   }
   const labels = m === "GET" ? p.match(/^\/api\/ci\/repos\/(.+)\/labels$/) : null;
@@ -1048,6 +1120,21 @@ export async function handlePipelines(req: http.IncomingMessage, res: http.Serve
       return true;
     }
     bodiesOf(ua).push(body);
+    // Lock it of a use whose source can't be read: refused as the server refuses it, before any draft (W29-R25).
+    const missing = body.verb === "lock" ? /uses:\s*(octo-org\/[^\s#]+)/.exec(String(body.content ?? ""))?.[1] : undefined;
+    if (missing) {
+      ctx.json(res, 422, { error: `KCI4051 ${missing}: its source can't be read, so it isn't locked and nothing is saved` });
+      return true;
+    }
+    // A person's word on a lock-change draft's upstream code, as its head and evidence stand (W29-R25).
+    if (body.verb === "accept") {
+      const review = Object.entries(LOCK_REVIEWS).find(([k]) => k.endsWith(`:draft:${String(body.draft)}`))?.[1];
+      if (!review || body.evidence_sha256 !== review.evidence_sha256) {
+        ctx.json(res, 409, { error: "the upstream code evidence changed; review the current revision" });
+        return true;
+      }
+      acceptedBy.set(ua, new Set([...(acceptedBy.get(ua) ?? []), review.id]));
+    }
     // cache-cargo's checks failed at its head: Release says so, unless it's asked anyway (W29-R21).
     if (body.verb === "release" && String(body.path).endsWith("cache-cargo") && body.confirm !== true) {
       ctx.json(res, 409, { error: "ci-kit's checks failed on e41a9c2: rust-check · clippy." });

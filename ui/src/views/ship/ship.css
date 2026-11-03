@@ -1682,6 +1682,26 @@
   outline: 2px solid #a6c4ed;
   outline-offset: 2px;
 }
+/* A problem's fix and its "lock it" (W29-R25), side by side where the severity would be; on a
+   phone one over the other, so its words keep their width and its problems their height. */
+.ppl-fixes {
+  display: flex;
+  flex: none;
+  gap: 12px;
+}
+@media (max-width: 700px) {
+  .ppl-fixes {
+    flex-direction: column;
+    align-items: flex-end;
+    gap: 2px;
+  }
+}
+/* Accept once a person's word stands: dimmed in place, never hidden. */
+.ppl-fix[data-dim] {
+  cursor: default;
+  color: #6e7178;
+  text-decoration: none;
+}
 /* Add a trigger's kinds (W29-R06): each a line to pick, whose it is on its right. */
 .ppl-kind {
   all: unset;

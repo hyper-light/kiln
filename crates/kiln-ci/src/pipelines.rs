@@ -966,6 +966,14 @@ pub struct RunSeen {
     pub failed: Vec<String>,
     /// What started it, when its event names something beyond its commit (pl-8).
     pub subject: Option<String>,
+    /// W29-R23–R26: the code that refused it before any job started (`KCI4055`).
+    pub refused: Option<String>,
+}
+
+/// W29-R23–R26: the code a run's startup error opens with, when kiln refused it before any job.
+pub fn refusal_code(error: &str) -> Option<String> {
+    let code = error.split_whitespace().next()?.trim_end_matches(':');
+    code.strip_prefix("KCI").is_some_and(|n| n.len() == 4 && n.bytes().all(|b| b.is_ascii_digit())).then(|| code.to_owned())
 }
 
 /// W29-R04, pl-8: a run by what started it. Only event metadata is read, never input values or
@@ -1016,6 +1024,56 @@ pub struct Seen {
     pub now: i64,
     /// A reusable workflow's newest release, against which its Used by marks who's behind.
     pub newest: Option<String>,
+    /// Its locks and the trunk's lock policy (W29-R23–R26), where kiln read them.
+    pub lock: Option<LockSeen>,
+}
+
+/// W29-R23–R26: a workflow's locks at the pane's commit, and the trunk's trusted lock policy.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct LockSeen {
+    /// How many of the uses a lock can hold its locks hold, of how many; None when no lock has an
+    /// entry for it.
+    pub held: Option<(usize, usize)>,
+    /// A use that a lock can hold and none does: what makes an onboarded file stale.
+    pub missing: Option<String>,
+    pub require: crate::lock::verify::Require,
+    pub moved_tags: crate::lock::verify::MovedTags,
+    /// The full versions it uses whose tags now name another commit than this repository accepted.
+    pub moved: Vec<String>,
+}
+
+impl LockSeen {
+    fn complete(&self) -> bool { self.held.is_some() && self.missing.is_none() }
+
+    /// Its lines in Settings, only those with something to say (Settings that says only its
+    /// defaults isn't shown): what its locks hold, what the trunk requires of them, moved tags.
+    fn lines(&self) -> Vec<Line> {
+        use crate::lock::verify::{MovedTags, Require};
+        let held = match (&self.held, &self.missing) {
+            (Some(_), Some(u)) => Line::new("settings.lock", "setting", "Locked", format!("{u} isn't locked yet")).state("flag"),
+            (Some((1, _)), None) => Line::new("settings.lock", "setting", "Locked", "its one use at its commit").state("passed"),
+            (Some((0, _)), None) => Line::new("settings.lock", "setting", "Locked", "it uses nothing a lock holds").state("passed"),
+            (Some((n, _)), None) => Line::new("settings.lock", "setting", "Locked", format!("{n} uses at their commits")).state("passed"),
+            (None, _) => Line::new("settings.lock", "setting", "Not locked", "its uses follow their tags").state("flag"),
+        };
+        let require = match self.require {
+            Require::Off => Line::new("settings.require_lock", "setting", "Require lockfile", "off").state("none"),
+            Require::Report => Line::new("settings.require_lock", "setting", "Require lockfile", "report: its runs say what isn't locked").state(if self.complete() { "passed" } else { "flag" }),
+            Require::Enforce => Line::new("settings.require_lock", "setting", "Require lockfile", "enforce: what isn't locked doesn't run").state(if self.complete() { "passed" } else { "failed" }),
+        };
+        let (word, state) = match self.moved_tags { MovedTags::Flag => ("flagged", "flag"), MovedTags::Refuse => ("refused", "failed") };
+        let moved = match self.moved.as_slice() {
+            [] => Line::new("settings.moved_tags", "setting", "Moved tags", format!("{word} when a full version moves")).state("none"),
+            [one] => Line::new("settings.moved_tags", "setting", "Moved tags", format!("{one} moved: {word}")).state(state),
+            [first, rest @ ..] => Line::new("settings.moved_tags", "setting", "Moved tags", format!("{first} and {} more moved: {word}", rest.len())).state(state),
+        };
+        // What its locks hold and the trunk's word on them, once it has a lock or the trunk asks
+        // for one; moved tags, once one moved or the trunk refuses them.
+        let mut out = Vec::new();
+        if self.held.is_some() || self.require != Require::Off { out.extend([held, require]); }
+        if !self.moved.is_empty() || self.moved_tags == MovedTags::Refuse { out.push(moved); }
+        out
+    }
 }
 
 /// A called workflow's one job, where its jobs run when they agree, and its own references.
@@ -1290,6 +1348,7 @@ pub fn workflow_groups(w: &Workflow, text: &str, runs: &[RunSeen], runs_here: bo
                 (true, _) => "under way".to_owned(),
                 (false, Some(Outcome::Passed)) => "passed".to_owned(),
                 (false, Some(Outcome::Failed)) if !r.failed.is_empty() => format!("{} failed", r.failed.join(", ")),
+                (false, Some(Outcome::Failed)) if r.refused.is_some() => format!("refused ({})", r.refused.as_deref().unwrap_or_default()),
                 (false, Some(Outcome::Failed)) => "failed".to_owned(),
                 (false, Some(Outcome::Cancelled)) => "cancelled".to_owned(),
                 (false, None) => "queued".to_owned(),
@@ -1309,6 +1368,7 @@ pub fn workflow_groups(w: &Workflow, text: &str, runs: &[RunSeen], runs_here: bo
     if let Some(c) = &w.concurrency {
         settings.push(Line::new("settings.concurrency", "setting", "Concurrency", c.group.src.clone()));
     }
+    settings.extend(seen.lock.iter().flat_map(LockSeen::lines));
     settings.extend(shared.map(Sharing::access_line));
     out.push(group("Settings", settings));
     out
@@ -1790,6 +1850,30 @@ pub fn mark_moved(groups: &mut [PaneGroup], moved: &[Moved], draft: Option<&str>
         l.value = format!("{from} · → {}{}", m.to, draft.map(|d| format!(" in {d}")).unwrap_or_default());
         l.state = Some("changes");
     }
+}
+
+/// W29-R25: a lock-change draft's uses whose locked commit it changes (each written use and the
+/// commit it moves to), marked in Uses as an update's moved use is (pl-7); picked, its Changes
+/// show the upstream code.
+pub fn mark_relocked(groups: &mut [PaneGroup], relocked: &[(String, String)], draft: Option<&str>) {
+    for l in groups.iter_mut().filter(|g| g.name == "Uses").flat_map(|g| g.lines.iter_mut()) {
+        let Some((_, to)) = relocked.iter().find(|(u, _)| l.key == format!("uses.{u}")) else { continue };
+        let was = l.value.split(" · ").next().unwrap_or_default().to_owned();
+        l.value = format!("{was} · → {}{}", to.get(..7).unwrap_or(to), draft.map(|d| format!(" in {d}")).unwrap_or_default());
+        l.state = Some("changes");
+    }
+}
+
+/// A lock-change draft's strip before anything's picked, and its words in bold: what moves, how
+/// much of its code changed, and whose word it waits on: `acme/tools@v1 moves to e4f5a6b · its
+/// code changed in 3 files · it runs nowhere until a person accepts it`.
+pub fn relock_said(relocked: &[(String, String, usize)], accepted: Option<&str>) -> (Vec<String>, Vec<String>) {
+    let mut said: Vec<String> = relocked.iter().map(|(u, to, _)| format!("{u} moves to {}", to.get(..7).unwrap_or(to))).collect();
+    let files: usize = relocked.iter().map(|(_, _, n)| n).sum();
+    said.push(if files == 1 { "its code changed in 1 file".to_owned() } else { format!("its code changed in {files} files") });
+    said.push(accepted.map_or_else(|| "it runs nowhere until a person accepts it".to_owned(), |by| format!("accepted by {}", by.strip_prefix("user:").unwrap_or(by))));
+    let strong = relocked.iter().map(|(u, _, _)| u.clone()).collect();
+    (said, strong)
 }
 
 /// An update draft's strip before anything's picked (pl-7), and the words it sets in bold: what's
@@ -2296,6 +2380,50 @@ mod tests {
         assert_eq!(runs, [("9e1b2c0".to_owned(), "rust failed · 2h".to_owned(), Some("failed"), Some("push".to_owned())), ("#13".into(), "under way".into(), Some("running"), Some("schedule".into()))]);
         let off = workflow_groups(&w, EVERY_GITHUB_EVENT, &[], false, "GitHub workflows not run: this commit has .kiln/ workflows", None, &Seen::default());
         assert_eq!(off.iter().find(|g| g.name == "Settings").and_then(|g| g.lines.first()).map(|l| l.name.clone()), Some("Not run here".to_owned()));
+    }
+
+    #[test]
+    fn w29_r26_settings_say_the_lock_the_trunk_requires_and_moved_tags_and_refused_runs_say_why() {
+        use crate::lock::verify::{MovedTags, Require};
+        let (_, w) = crate::wf::check_model(".github/workflows/every.yml", EVERY_GITHUB_EVENT, None);
+        let w = w.unwrap_or_default();
+        let settings = |lock: LockSeen| {
+            let seen = Seen { lock: Some(lock), ..Seen::default() };
+            let groups = workflow_groups(&w, EVERY_GITHUB_EVENT, &[], true, "", None, &seen);
+            groups.into_iter().find(|g| g.name == "Settings").map(|g| g.lines.into_iter().filter(|l| l.key.contains("lock") || l.key.contains("moved")).map(|l| (l.name, l.value, l.state)).collect::<Vec<_>>()).unwrap_or_default()
+        };
+        assert_eq!(settings(LockSeen::default()), [], "Settings says nothing of locks it doesn't need to");
+        assert_eq!(settings(LockSeen { held: Some((1, 1)), ..LockSeen::default() }), [("Locked".to_owned(), "its one use at its commit".to_owned(), Some("passed")), ("Require lockfile".into(), "off".into(), Some("none"))]);
+        assert_eq!(settings(LockSeen { moved_tags: MovedTags::Refuse, ..LockSeen::default() }), [("Moved tags".to_owned(), "refused when a full version moves".to_owned(), Some("none"))]);
+        let locked = LockSeen { held: Some((3, 3)), require: Require::Enforce, ..LockSeen::default() };
+        assert_eq!(settings(locked.clone()).into_iter().take(2).collect::<Vec<_>>(), [("Locked".to_owned(), "3 uses at their commits".to_owned(), Some("passed")), ("Require lockfile".into(), "enforce: what isn't locked doesn't run".into(), Some("passed"))]);
+        let stale = LockSeen { held: Some((2, 3)), missing: Some("acme/other@v2".into()), ..locked };
+        assert_eq!(settings(stale).into_iter().take(2).collect::<Vec<_>>(), [("Locked".to_owned(), "acme/other@v2 isn't locked yet".to_owned(), Some("flag")), ("Require lockfile".into(), "enforce: what isn't locked doesn't run".into(), Some("failed"))]);
+        let report = LockSeen { require: Require::Report, moved_tags: MovedTags::Refuse, moved: vec!["acme/tools@v1.2.3".into(), "acme/kit@v2.0.1".into()], ..LockSeen::default() };
+        assert_eq!(settings(report), [
+            ("Not locked".to_owned(), "its uses follow their tags".to_owned(), Some("flag")),
+            ("Require lockfile".into(), "report: its runs say what isn't locked".into(), Some("flag")),
+            ("Moved tags".into(), "acme/tools@v1.2.3 and 1 more moved: refused".into(), Some("failed")),
+        ]);
+        assert_eq!(refusal_code("KCI4055 .github/workflows/ci.yml isn't locked"), Some("KCI4055".to_owned()));
+        assert_eq!(refusal_code("KCI4051: the source is unavailable"), Some("KCI4051".to_owned()));
+        assert_eq!(refusal_code("runner went away"), None);
+        let runs = [RunSeen { number: 7, outcome: Some(Outcome::Failed), sha: "9e1b2c0d".into(), refused: refusal_code("KCI4056 acme/tools@v1.2.3 moved"), ..RunSeen::default() }];
+        let groups = workflow_groups(&w, EVERY_GITHUB_EVENT, &runs, true, "", None, &Seen::default());
+        let run = groups.iter().find(|g| g.name == "Runs").and_then(|g| g.lines.first()).map(|l| (l.value.clone(), l.state));
+        assert_eq!(run, Some(("refused (KCI4056)".to_owned(), Some("failed"))));
+    }
+
+    #[test]
+    fn w29_r25_a_lock_change_drafts_moved_uses_and_its_strip() {
+        let mut groups = vec![group("Uses", vec![Line::new("uses.acme/tools@v1", "use", "acme/tools@v1", "fetched by name"), Line::new("uses.kiln/checkout@v1", "use", "kiln/checkout@v1", "kiln's own")])];
+        mark_relocked(&mut groups, &[("acme/tools@v1".to_owned(), "e4f5a6b7c8d9".to_owned())], Some("D12"));
+        let lines: Vec<_> = groups.iter().flat_map(|g| &g.lines).map(|l| (l.value.clone(), l.state)).collect();
+        assert_eq!(lines, [("fetched by name · → e4f5a6b in D12".to_owned(), Some("changes")), ("kiln's own".into(), None)]);
+        let (said, strong) = relock_said(&[("acme/tools@v1".to_owned(), "e4f5a6b7c8d9".to_owned(), 3)], None);
+        assert_eq!(said, ["acme/tools@v1 moves to e4f5a6b", "its code changed in 3 files", "it runs nowhere until a person accepts it"]);
+        assert_eq!(strong, ["acme/tools@v1"]);
+        assert_eq!(relock_said(&[("acme/tools@v1".to_owned(), "e4f5a6b".to_owned(), 1)], Some("user:ada")).0.last().map(String::as_str), Some("accepted by ada"));
     }
 
     #[test]

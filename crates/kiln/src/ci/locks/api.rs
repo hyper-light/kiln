@@ -20,10 +20,30 @@ async fn repository(hub: &Hub, key: &str, caller: &Caller, permission: &str) -> 
 pub async fn update(hub: &Arc<Hub>, caller: &Caller, key: &str, body: &Value) -> Result<Value, Fail> {
     let repo = repository(hub, key, caller, "workflows.edit").await?;
     if !caller.can("diffs.submit", &Scope::Repo { repo: repo.name.clone() }) { return Err((StatusCode::FORBIDDEN, "updating locks opens a draft and needs `diffs.submit`".into())); }
+    #[derive(Deserialize, Serialize)]
+    #[serde(deny_unknown_fields)]
+    struct File { path: String, text: String }
     #[derive(Deserialize)]
     #[serde(deny_unknown_fields)]
-    struct Ask { #[serde(rename = "ref")] reference: Option<String> }
+    struct Ask {
+        #[serde(rename = "ref")]
+        reference: Option<String>,
+        /// The editor's "lock it": its file as typed, and its overlay, saved with their locks.
+        path: Option<String>,
+        content: Option<String>,
+        #[serde(default)]
+        files: Vec<File>,
+    }
     let ask: Ask = serde_json::from_value(body.clone()).map_err(|e| (StatusCode::BAD_REQUEST, format!("lock update: {e}")))?;
+    if let Some(content) = ask.content {
+        let path = ask.path.ok_or_else(|| (StatusCode::BAD_REQUEST, "`content` is a workflow's as the editor has it: `path` names it".to_owned()))?;
+        if ask.reference.is_some() { return Err((StatusCode::BAD_REQUEST, "the editor's file is locked in the draft it's saved to, at no other `ref`".into())); }
+        // W29-R25: the same draft path as Save draft, whose locks take what it uses.
+        let out = super::super::workflows::edit(hub, caller, &repo.name, &path, &serde_json::json!({ "content": content, "files": ask.files, "draft": true })).await?;
+        hub.store.audit(caller.name.clone(), "ci.locks.update".into(), format!("{} {path}: locked in a draft from the editor", repo.name)).await;
+        return Ok(out);
+    }
+    if ask.path.is_some() || !ask.files.is_empty() { return Err((StatusCode::BAD_REQUEST, "`path` and `files` come with the editor's `content`".into())); }
     let reference = ask.reference.unwrap_or(super::super::events::facts(hub, &repo).await.default_branch);
     if !super::super::load::ref_ok(&reference) { return Err((StatusCode::BAD_REQUEST, "`ref` needs a branch, tag or commit".into())); }
     let out = super::super::workflows::lock_draft(hub, caller, &repo, &reference).await?;

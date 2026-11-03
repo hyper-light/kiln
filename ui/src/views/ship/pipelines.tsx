@@ -21,6 +21,8 @@ import {
   type ShipPipelineRepo,
   type ShipPipelineRow,
   type ShipPipelineVerb,
+  type ShipCodeChange,
+  type ShipLockReview,
 } from "@/api/ship";
 import type { Diagnostic } from "@/components/code/editor";
 import { Toks } from "@/components/code/highlighted";
@@ -811,7 +813,7 @@ function viewsFor(p: ShipPipelinePane, l: ShipPipelineLine | null): string[] {
       return [l.key === "on.schedule" ? "Times" : "Filters", "YAML", "Plan"];
     case "use":
       // The use kiln's update draft moves: what the update changes, its YAML, its plan (pl-7).
-      return l.state === "changes" && p.detail.update ? ["Changes", "YAML", "Plan"] : ["Use", "YAML"];
+      return l.state === "changes" && (p.detail.update || p.lock_review) ? ["Changes", "YAML", "Plan"] : ["Use", "YAML"];
     case "run":
       return ["Run"];
     case "add":
@@ -1080,32 +1082,35 @@ function PipelinePane({ repo, row, onChanged, onLine }: { repo: ShipPipelineRepo
       </>,
     );
   };
+  // Save draft, and Lock it (W29-R25): the file as typed saved as a draft, whose locks take what it uses. Refused, the text stays as typed and the strip says why.
+  const saveAs = (verb: "save_draft" | "lock", done: React.ReactNode) => {
+    // A GitHub workflow's overlay goes in the same draft where it isn't what its trunk has (W29-R06).
+    const trunkOverlay = draft ? (published?.detail.overlay?.text ?? "") : (ov?.text ?? "");
+    const files = ov && overlay !== trunkOverlay ? [{ path: ov.path, text: overlay }] : [];
+    void act({ verb, content: text, ...(files.length ? { files } : {}) }, done).then((ok) => {
+      if (!ok) return;
+      // A draft's pane holds what's saved now; a published file's reads as published again, its draft a row of its own.
+      if (!draft) {
+        setText(p.detail.text);
+        setOverlay(ov?.text ?? "");
+      }
+      unsaved.delete(row.key);
+      unsaved.delete(overlayKey(row.key));
+      onChanged(false);
+    });
+  };
   const onVerb = (v: ShipPipelineVerb) => {
     switch (v.verb) {
       case "run":
         if (runInputs.length) return setAsking(Object.fromEntries(runInputs.map((i) => [i.name, i.default ?? (i.type === "boolean" ? "false" : (i.options[0] ?? ""))])));
         return runNow({});
-      case "save_draft": {
-        // A GitHub workflow's overlay goes in the same draft where it isn't what its trunk has (W29-R06).
-        const trunkOverlay = draft ? (published?.detail.overlay?.text ?? "") : (ov?.text ?? "");
-        const files = ov && overlay !== trunkOverlay ? [{ path: ov.path, text: overlay }] : [];
-        return void act(
-          { verb: "save_draft", content: text, ...(files.length ? { files } : {}) },
+      case "save_draft":
+        return saveAs(
+          "save_draft",
           <>
             Saved <b>{h.title}</b> as a draft: unpublished until it lands.
           </>,
-        ).then((ok) => {
-          if (!ok) return;
-          // A draft's pane holds what's saved now; a published file's reads as published again, its draft a row of its own.
-          if (!draft) {
-            setText(p.detail.text);
-            setOverlay(ov?.text ?? "");
-          }
-          unsaved.delete(row.key);
-          unsaved.delete(overlayKey(row.key));
-          onChanged(false);
-        });
-      }
+        );
       case "ready":
         return void act(
           { verb: "ready", ...draftId },
@@ -1164,10 +1169,10 @@ function PipelinePane({ repo, row, onChanged, onLine }: { repo: ShipPipelineRepo
       {checks ? `${checks} · ` : ""}
       {adds.length || checks ? "not saved yet" : "Not saved yet"} · a draft runs on no trigger until it lands
     </>
-  ) : line && (picked !== null || h.draft?.state !== "update") ? (
+  ) : line && (picked !== null || (h.draft?.state !== "update" && !p.lock_review)) ? (
     <PickedSaid line={line} group={groupOf(line.key)} pane={p} text={text} ask={ask} />
   ) : (
-    // Before anything's picked, kiln's update draft says what it is (pl-7).
+    // Before anything's picked, kiln's update draft says what it is (pl-7), and so does a lock change (W29-R25).
     <Strong text={p.strip.said.join(" · ")} words={p.strip.strong ?? []} />
   );
   // A verb that doesn't apply is dimmed, never hidden; picking it says why (W29-R04).
@@ -1222,6 +1227,23 @@ function PipelinePane({ repo, row, onChanged, onLine }: { repo: ShipPipelineRepo
       onLine(lineFor(c.text, overlay, c));
     },
     pick: (k) => pick(k),
+    lock: (uses) =>
+      saveAs(
+        "lock",
+        <>
+          Locked <b>{uses ?? h.title}</b> at {uses ? "its commit" : "the commits it uses"} in a draft: unpublished until it lands.
+        </>,
+      ),
+    accept: () => {
+      const r = p.lock_review;
+      if (!r || !h.draft) return;
+      void act(
+        { verb: "accept", draft: h.draft.id, head: h.commit, evidence_sha256: r.evidence_sha256 },
+        <>
+          Accepted the new code of <b>{Object.keys(r.differences).join(", ")}</b> for {repo.repo.split("/").pop()}: it runs in this draft, and on its trunk once it lands.
+        </>,
+      );
+    },
     addKind: (k) => {
       const keys = kiln ? k.kiln : k.gha;
       try {
@@ -1398,6 +1420,10 @@ interface Tools {
   checked: (c: Checked) => void;
   /** Picks a line, as picking it in the list does. */
   pick: (k: Key) => void;
+  /** W29-R25's "lock it": the file as typed saved with its locks in a draft, `uses` the one asked for. */
+  lock: (uses: string | null) => void;
+  /** A person's word on a lock-change draft's upstream code, as its head and evidence stand (W29-R25). */
+  accept: () => void;
 }
 
 /** What the YAML view's check found of the pane's own file (pl-3): the text it checked, its problems, and its plan's jobs against what's published (none before it's typed in). */
@@ -2009,7 +2035,7 @@ function View({
           <CodeView text={own.text} path={own.path} spot={line ? spotOf(own.text, line) : null} rows={rows} />
         );
       return editable ? (
-        <YamlView pane={pane} line={line} text={text} onText={onText} ask={ask} onChecked={tools.checked} />
+        <YamlView pane={pane} line={line} text={text} onText={onText} ask={ask} onChecked={tools.checked} onLock={tools.lock} />
       ) : (
         <CodeView text={text} path={h.path} spot={line ? spotOf(text, line) : null} rows={rows} />
       );
@@ -2040,7 +2066,7 @@ function View({
     case "Use":
       return line ? <UseView line={line} /> : null;
     case "Changes":
-      return <ChangesView pane={pane} text={text} ask={ask} />;
+      return <ChangesView pane={pane} text={text} ask={ask} tools={tools} />;
     default:
       return null;
   }
@@ -2076,6 +2102,7 @@ function YamlView({
   ask,
   file,
   onChecked,
+  onLock,
 }: {
   pane: ShipPipelinePane;
   line: ShipPipelineLine | null;
@@ -2084,6 +2111,7 @@ function YamlView({
   ask: PlanAsk;
   file?: string;
   onChecked?: (c: Checked) => void;
+  onLock?: (uses: string | null) => void;
 }) {
   const h = pane.head;
   const syntax = syntaxOf(h);
@@ -2097,7 +2125,7 @@ function YamlView({
     if (syntax !== "workflow") return [];
     try {
       const [r, now, was] = await Promise.all([
-        ci.validate(file ?? fileOf(h), t, pane.repo),
+        ci.validate(file ?? fileOf(h), t, pane.repo, undefined, h.commit),
         workflow ? planOf(pane, t, ask.event, ask.overlay).catch(() => null) : null,
         workflow && ask.base !== null ? basePlanOf(pane, ask.base, ask.event, ask.baseOverlay).catch(() => null) : null,
       ]);
@@ -2165,10 +2193,19 @@ function YamlView({
                     <em>{d.code}</em>
                     line {d.range.start.line}: {d.message}
                   </span>
-                  {d.fix ? (
-                    <button type="button" className="ppl-fix" onClick={() => fix(d)}>
-                      {d.fix.title}
-                    </button>
+                  {d.fix || (d.lock && onLock) ? (
+                    <span className="ppl-fixes">
+                      {d.fix ? (
+                        <button type="button" className="ppl-fix" onClick={() => fix(d)}>
+                          {d.fix.title}
+                        </button>
+                      ) : null}
+                      {d.lock && onLock ? (
+                        <button type="button" className="ppl-fix" onClick={() => onLock(d.lock?.uses ?? null)}>
+                          Lock it
+                        </button>
+                      ) : null}
+                    </span>
                   ) : (
                     <span className="v">{d.severity}</span>
                   )}
@@ -2211,8 +2248,9 @@ function YamlView({
  * head changes for those who use it; a draft's lines against what's published, and what it changes
  * for its repository.
  */
-function ChangesView({ pane, text, ask }: { pane: ShipPipelinePane; text: string; ask: PlanAsk }) {
+function ChangesView({ pane, text, ask, tools }: { pane: ShipPipelinePane; text: string; ask: PlanAsk; tools: Tools }) {
   const d = pane.detail;
+  if (pane.lock_review) return <LockReview review={pane.lock_review} tools={tools} />;
   const next = pane.strip.verbs.find((v) => v.verb === "release")?.tags?.[0];
   if (d.since) {
     return (
@@ -2288,6 +2326,96 @@ function ChangesView({ pane, text, ask }: { pane: ShipPipelinePane; text: string
     );
   }
   return <Lines lines={pane.groups.filter((g) => g.name === "Versions").flatMap((g) => g.lines)} empty="Nothing has changed since its newest tag." />;
+}
+
+/** A changed file's side as text, or why it isn't: a link's target, a submodule's commit, or a binary's size. */
+function sideOf(f: ShipCodeChange["before"]): { text: string | null; words: string } {
+  if (!f) return { text: "", words: "" };
+  const bytes = Uint8Array.from(atob(f.base64), (c) => c.charCodeAt(0));
+  let text: string | null;
+  try {
+    text = new TextDecoder("utf-8", { fatal: true }).decode(bytes);
+  } catch {
+    text = null;
+  }
+  if (f.mode === 0o120000) return { text: null, words: `a link to ${text ?? "a path that isn't text"}` };
+  if (f.mode === 0o160000) return { text: null, words: `a submodule at ${(text ?? "").slice(0, 7)}` };
+  if (text === null || text.includes("\0")) return { text: null, words: `${bytes.length} bytes, not text` };
+  return { text, words: f.mode === 0o100755 ? "executable" : "" };
+}
+
+/** What changed of a file between the accepted and the new commit, in words. */
+function changeWords(c: ShipCodeChange, old: { words: string }, now: { words: string }): string {
+  if (!c.before) return `new${now.words ? `, ${now.words}` : ""}`;
+  if (!c.after) return "removed";
+  if (old.words !== now.words) return `${old.words || "a file"} → ${now.words || "a file"}`;
+  return now.words ? `changed, ${now.words}` : "changed";
+}
+
+/**
+ * A lock-change draft's upstream code (W29-R25): every file that changed between the commit its
+ * lock had and the one it proposes, each source under its own head, then whose word it waits on.
+ * Accept stays where it is, dimmed once a person's word stands.
+ */
+function LockReview({ review, tools }: { review: ShipLockReview; tools: Tools }) {
+  return (
+    <div className="ppl-changes">
+      {Object.entries(review.differences).map(([key, d]) => (
+        <React.Fragment key={key}>
+          <div className="jp-g">
+            <span>
+              Upstream code, {key}: {d.before.commit.slice(0, 7)} → {d.after.commit.slice(0, 7)}
+            </span>
+            <span>{d.files.length === 1 ? "1 file" : `${d.files.length} files`}</span>
+          </div>
+          {d.files.map((c) => {
+            const [old, now] = [sideOf(c.before), sideOf(c.after)];
+            return (
+              <React.Fragment key={c.path}>
+                <ul className="ppl-lines">
+                  <li>
+                    <StatusGlyph state={c.after ? "changes" : "failed"} size={12} />
+                    <span className="n ppl-sha">{c.path}</span>
+                    <span className="v">{changeWords(c, old, now)}</span>
+                  </li>
+                </ul>
+                {old.text !== null && now.text !== null ? (
+                  <ol className="ppl-code ppl-diff" aria-label={`${c.path}, its lines at each commit`}>
+                    {lineDiff(old.text, now.text, 2).map((l, i) =>
+                      l.kind === "gap" ? (
+                        <li key={i} data-kind="gap">
+                          <span className="ppl-ln" aria-hidden="true">
+                            ⋯
+                          </span>
+                          <code />
+                        </li>
+                      ) : (
+                        <li key={i} data-kind={l.kind}>
+                          <span className="ppl-ln">{l.now ?? l.old}</span>
+                          <code>{l.text || " "}</code>
+                        </li>
+                      ),
+                    )}
+                  </ol>
+                ) : null}
+              </React.Fragment>
+            );
+          })}
+        </React.Fragment>
+      ))}
+      <ul className="ppl-lines" aria-label="Its word">
+        <li>
+          <StatusGlyph state={review.accepted_by ? "passed" : "flag"} size={12} />
+          <span className="n">
+            {review.accepted_by ? `Accepted by ${byWord(review.accepted_by)}: it runs in this draft, and on its trunk once it lands` : "It runs nowhere until a person accepts this code"}
+          </span>
+          <button type="button" className="ppl-fix" disabled={Boolean(review.accepted_by)} data-dim={review.accepted_by ? true : undefined} onClick={tools.accept}>
+            Accept
+          </button>
+        </li>
+      </ul>
+    </div>
+  );
 }
 
 /** An update's lines (pl-7), its plan against the published one's for the strip's event put before its draft's run: `the plan for a push to main: the same 2 jobs, 4 legs · same`. */

@@ -401,23 +401,25 @@ async fn runs_list(hub: &Hub, repo: &Repo, branch: &str, path: &str) -> anyhow::
             let mut st = c.prepare(
                 "SELECT r.number, r.event, r.status, r.sha, r.created_at,
                         (SELECT group_concat(j.key, ', ') FROM jobs j WHERE j.run_id = r.id AND j.status = 'failed'),
-                        (SELECT e.payload FROM ci_events e WHERE e.run_id = r.id)
+                        (SELECT e.payload FROM ci_events e WHERE e.run_id = r.id), r.error
                  FROM runs r LEFT JOIN ci_workflows w ON w.id = r.workflow_id
                  WHERE r.repo_id = ?1 AND r.branch = ?2 AND (w.path = ?3 OR (r.workflow_id IS NULL AND r.pipeline = ?4))
                  ORDER BY r.created_at DESC LIMIT 10",
             )?;
             let mut out = Vec::new();
             let rows = st.query_map(rusqlite::params![id, branch, path, stem], |r| {
-                Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?, r.get::<_, String>(2)?, r.get::<_, String>(3)?, r.get::<_, i64>(4)?, r.get::<_, Option<String>>(5)?, r.get::<_, Option<String>>(6)?))
+                Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?, r.get::<_, String>(2)?, r.get::<_, String>(3)?, r.get::<_, i64>(4)?, r.get::<_, Option<String>>(5)?, r.get::<_, Option<String>>(6)?, r.get::<_, Option<String>>(7)?))
             })?;
             for row in rows {
-                let (number, event, status, sha, at, failed, payload) = row?;
+                let (number, event, status, sha, at, failed, payload, error) = row?;
                 let mut seen = (None, false);
                 fold(&mut seen, &status);
                 let failed = failed.map(|f| f.split(", ").map(str::to_owned).collect()).unwrap_or_default();
                 let payload = payload.and_then(|p| serde_json::from_str(&p).ok()).unwrap_or_default();
                 let subject = core::run_subject(&event, &payload);
-                out.push(core::RunSeen { number, event, outcome: seen.0, running: seen.1, sha, at, failed, subject });
+                // W29-R23–R26: refused before any job, by the code its startup error opens with.
+                let refused = error.as_deref().and_then(core::refusal_code);
+                out.push(core::RunSeen { number, event, outcome: seen.0, running: seen.1, sha, at, failed, subject, refused });
             }
             Ok(out)
         })
@@ -584,6 +586,7 @@ pub async fn get(hub: &Arc<Hub>, owner: &str, name: &str, q: &HashMap<String, St
                 Some(w) => {
                     let mut seen = seen_of(hub, &repo, &branch, path, w).await;
                     seen.newest.clone_from(&newest);
+                    seen.lock = Some(crate::ci::locks::pane_facts(hub, &repo, &sha, path, w).await);
                     // R04's pick words: its last run's failed jobs, and what its open drafts change (pl-2).
                     let narrow = core::narrows(w, &runs, &draft_workflows(hub, &repo, path).await);
                     (core::workflow_groups(w, &text, &runs, l.runs, &commit.github_note, Some(&sharing), &seen), narrow)
@@ -789,7 +792,11 @@ async fn draft_pane(hub: &Hub, repo: &Repo, id: &str, path: &str, viewer: core::
     let sharing = core::Sharing { repo: &repo.name, access, used_by: &used };
     let mut groups = match &loaded {
         Some(l) => match l.workflow.as_ref() {
-            Some(w) => core::workflow_groups(w, &text, &runs_list(hub, repo, &branch, path).await.map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")))?, true, "", Some(&sharing), &seen_of(hub, repo, &branch, path, w).await),
+            Some(w) => {
+                let mut seen = seen_of(hub, repo, &branch, path, w).await;
+                seen.lock = Some(crate::ci::locks::pane_facts(hub, repo, &head, path, w).await);
+                core::workflow_groups(w, &text, &runs_list(hub, repo, &branch, path).await.map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")))?, true, "", Some(&sharing), &seen)
+            }
             None => Vec::new(),
         },
         None => {
@@ -815,12 +822,36 @@ async fn draft_pane(hub: &Hub, repo: &Repo, id: &str, path: &str, viewer: core::
         said = Some(core::update_said(&moved, &changes, row.draft.as_ref().and_then(|x| x.change.as_ref())));
         update = moved.into_iter().next().map(|m| (m.name, m.from, m.to));
     }
+    // A lock-change draft (W29-R25): each use whose locked commit it changes marked in Uses, its
+    // strip saying whose word the new code waits on, its Changes the upstream code.
+    let mut review = crate::ci::locks::proposal_for(hub, repo, &d.id, &head).await?;
+    if let Some(review) = review.as_mut().and_then(Value::as_object_mut) {
+        let differences: BTreeMap<String, kiln_seams::dependencies::Difference> = review.get("differences").cloned().and_then(|v| serde_json::from_value(v).ok()).unwrap_or_default();
+        let accepted = crate::ci::locks::accepted_by(hub, repo, &d.id, &head).await;
+        if let Some(w) = loaded.as_ref().and_then(|l| l.workflow.as_ref()) && said.is_none() {
+            let relocked: Vec<(String, String, usize)> = kiln_ci::lock::editor::written(w)
+                .into_iter()
+                .filter_map(|(u, _, _)| {
+                    let keys = [kiln_ci::lock::kiln::canonical_key(&u), kiln_ci::lock::github::action_pin(&u)];
+                    let (_, diff) = differences.iter().find(|(k, _)| keys.iter().flatten().any(|key| key == *k))?;
+                    Some((u, (diff.after.commit.clone(), diff.files.len())))
+                })
+                .collect::<BTreeMap<_, _>>()
+                .into_iter()
+                .map(|(u, (to, files))| (u, to, files))
+                .collect();
+            let pairs: Vec<(String, String)> = relocked.iter().map(|(u, to, _)| (u.clone(), to.clone())).collect();
+            core::mark_relocked(&mut groups, &pairs, d.name.as_deref());
+            said = Some(core::relock_said(&relocked, accepted.as_deref()));
+        }
+        review.insert("accepted_by".into(), serde_json::json!(accepted));
+    }
     let at = d.branch.clone().or_else(|| d.name.clone()).unwrap_or_else(|| head.clone());
     let overlay = overlay_of(hub, repo, &head, path).await;
     let overlay = overlay.as_ref().map(|(p, t)| (p.as_str(), t.as_str()));
     let opened = core::Opened { repo: &repo.name, row: &row, at: &at, sha: &head, text: &text, viewer, by_hand: runs_by_hand(loaded.as_ref()), changes: None, since: None, overlay, said, lines, update, narrow: Vec::new() };
     let mut pane = core::pane_json(&opened, &groups);
-    if let Some(review) = crate::ci::locks::proposal_for(hub, repo, &d.id, &head).await? && let Some(pane) = pane.as_object_mut() { pane.insert("lock_review".into(), review); }
+    if let Some(review) = review && let Some(pane) = pane.as_object_mut() { pane.insert("lock_review".into(), review); }
     Ok(srv::json(StatusCode::OK, &pane))
 }
 
@@ -1131,6 +1162,22 @@ pub async fn act(hub: &Arc<Hub>, caller: &crate::authz::Caller, body: &Value) ->
             }
             crate::ci::releases::tag(hub, caller, &repo.name, body).await?
         }
+        // W29-R25's "lock it": the editor's file and overlay saved with their locks, in the caller's draft.
+        "lock" => {
+            let mut ask = serde_json::Map::new();
+            ask.insert("path".into(), Value::from(path));
+            for k in ["content", "files"] {
+                if let Some(v) = body.get(k) {
+                    ask.insert(k.into(), v.clone());
+                }
+            }
+            crate::ci::locks::update(hub, caller, &repo.name, &Value::Object(ask)).await?
+        }
+        // A person's word on a lock-change draft's upstream code, as its head and evidence stand (W29-R25).
+        "accept" => {
+            let ask = serde_json::json!({ "draft": need("draft")?, "head": need("head")?, "evidence_sha256": need("evidence_sha256")? });
+            crate::ci::locks::accept(hub, caller, &repo.name, &ask).await?
+        }
         // New (W29-R08): a workflow's or action's first files, saved as the caller's draft; `dry` says them.
         "new" => {
             if body.get("dry").and_then(Value::as_bool) != Some(true) && !caller.can("diffs.submit", &scope) {
@@ -1138,7 +1185,7 @@ pub async fn act(hub: &Arc<Hub>, caller: &crate::authz::Caller, body: &Value) ->
             }
             crate::ci::workflows::new_draft(hub, caller, &repo.name, body).await?
         }
-        other => return Err((StatusCode::BAD_REQUEST, format!("`verb` is save_draft, ready, discard, run, release or new, not `{other}`"))),
+        other => return Err((StatusCode::BAD_REQUEST, format!("`verb` is save_draft, ready, discard, run, release, new, lock or accept, not `{other}`"))),
     };
     heard(&repo.name);
     Ok(srv::json(StatusCode::OK, &out))

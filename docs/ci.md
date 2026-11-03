@@ -11169,7 +11169,15 @@ endpoint, for a repository kiln hosts and for one on GitHub:
   touches, in the same draft: Save draft (W29-R11), New (W29-R08) and update drafts (W29-R22). So
   nobody has to run `gh actions-lock`.
   - The editor's "pin it" warning (KCI6002) also offers "lock it". It adds the action to the
-    draft's locks through `ci.locks.update`, rather than rewriting the `uses:`.
+    draft's locks through `ci.locks.update`, rather than rewriting the `uses:`: the file as typed
+    and its overlay are saved as Save draft saves them, and a refusal leaves the text as typed and
+    says why. A use the locks hold at the commit being edited needs no hint, and the policy judges
+    it by its locked commit. Under `require_lock`, the hint is a warning, and a file no lock has an
+    entry for says so too (`KCI4055`). They stay warnings under `enforce`, so Save draft still
+    saves.
+  - The pane's Settings say what the workflow's locks hold, what the trunk requires of them and
+    which full versions it met moved, when there's something to say. A run refused before any job
+    says its code (`refused (KCI4055)`).
   - A lock never needs merging by hand. A conflict in a lock, on landing or on a replay (W26-R16),
     is resolved by regenerating it from the merged workflows, as npm and pnpm do with theirs.
   - `ci.locks.update` (new, `POST /api/ci/repos/:repo/locks { ref? }`) regenerates a repository's
@@ -11400,7 +11408,7 @@ lockfile, which pins commit A. An attacker moves `v45` and `v45.0.7` to commit M
 | verb `release` (W29-R21); `POST /api/ci/repos/:repo/releases { sha, tag, major?, confirm?, notes? }` | `ci.releases.tag`, new | the tag (and GitHub's release) |
 | `GET /api/ci/actions?q=&kind=&owner=&repo=` (W29-R20) | `ci.actions.list`, grown | actions and reusable workflows the caller (`repo`) may use |
 | `GET /api/ci/actions/:owner/:repo?path=` (W29-R20) | `ci.actions.get`, new | versions, access, consumers |
-| `POST /api/ci/repos/:repo/locks { ref? }` (W29-R25) | `ci.locks.update`, new | a draft of the regenerated locks |
+| `POST /api/ci/repos/:repo/locks { ref? }` or `{ path, content, files? }` (W29-R25) | `ci.locks.update`, new | a draft of the regenerated locks; with the editor's file, that file saved with its locks |
 | `GET /api/ci/repos/:repo/locks/verify?sha=` (W29-R25) | `ci.locks.verify`, new | `{ fresh, stale: [{ workflow, uses, locked, now }] }` |
 | `POST /api/ci/repos/:repo/locks/accept { draft, head, evidence_sha256 }` (W29-R25) | `ci.locks.accept`, new | `{ approval, draft, head, evidence_sha256, accepted }` |
 | `GET /api/ci/sdk/kiln.d.ts` (W29-R27) | | the SDK's types for the editor |

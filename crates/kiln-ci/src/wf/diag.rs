@@ -40,6 +40,14 @@ pub struct Fix {
     pub edits: Vec<Edit>,
 }
 
+/// W29-R25: what the editor's "lock it" pins in the draft's locks, beside any fix: one written
+/// use, kept as written, or (without `uses`) the whole workflow.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Lock {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub uses: Option<String>,
+}
+
 /// Serialized for the API and storage; read back as [`StoredDiag`].
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct Diag {
@@ -51,11 +59,13 @@ pub struct Diag {
     pub range: Range,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub fix: Option<Fix>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub lock: Option<Lock>,
 }
 
 impl Diag {
     pub fn new(code: &'static str, severity: Severity, message: impl Into<String>, range: Range) -> Self {
-        Self { code, severity, message: message.into(), path: String::new(), range, fix: None }
+        Self { code, severity, message: message.into(), path: String::new(), range, fix: None, lock: None }
     }
 
     pub fn error(code: &'static str, message: impl Into<String>, range: Range) -> Self {
@@ -77,6 +87,11 @@ impl Diag {
 
     pub fn with_fix(mut self, title: impl Into<String>, edits: Vec<Edit>) -> Self {
         self.fix = Some(Fix { title: title.into(), edits });
+        self
+    }
+
+    pub fn with_lock(mut self, uses: Option<String>) -> Self {
+        self.lock = Some(Lock { uses });
         self
     }
 
@@ -105,6 +120,8 @@ pub struct StoredDiag {
     pub range: Range,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub fix: Option<Fix>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lock: Option<Lock>,
 }
 
 /// The closest of `candidates` to `word` within edit distance 2 ("did you mean").

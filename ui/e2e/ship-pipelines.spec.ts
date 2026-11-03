@@ -47,7 +47,7 @@ test("Pipelines is Ship's third tab: repositories needing someone first, each ro
   await expect(list(page).locator(".dp-proj > span:last-child")).toHaveText([
     "7 workflows · 1 failing · 1 waits on you",
     "shared · 6 actions · 1 workflow · 1 draft",
-    "3 workflows · ci-kit v2.4.0 is out",
+    "4 workflows · 1 draft · ci-kit v2.4.0 is out",
   ]);
   await expect(list(page).locator(".dp-proj > span[data-needs]")).toHaveCount(2);
 
@@ -653,5 +653,102 @@ test("kiln's update draft: its lines against what's published, what it changes f
   await pane.locator(".ppl-verbs button", { hasText: "Ready" }).click();
   await expect(pane.locator(".jp-said")).toContainText("Asked for ci's review");
   expect((await sentBodies(page)).at(-1)).toEqual({ repo: "hyper-light/quiver", path: ".github/workflows/ci.yml", verb: "ready", draft: "d-update-88" });
+  expect(await sideways(page)).toBe(0);
+});
+
+test("Lock it, beside Pin it: the file as typed saved with its locks in a draft, its use as written; refused, the text stays and the strip says why (W29-R25)", async ({ page, isMobile }) => {
+  await page.request.get("/api/mock/ship/pipelines?reset=1");
+  // A job typed at the file's end, its one use following a tag.
+  const typed = async (uses: string) => {
+    const pane = await openPane(page, isMobile, "hyper-light/kiln", ".kiln/ci.yaml");
+    await expect(pane.locator(".ppl-detail .cm-content")).toBeVisible();
+    await toTheEnd(pane);
+    await pane.locator(".ppl-detail .cm-line").last().click();
+    await page.keyboard.press("End");
+    await page.keyboard.insertText(`\n  helm-lint:\n    runs-on: [baremetal, linux]\n    steps:\n      - uses: ${uses}\n`);
+    return pane;
+  };
+  let pane = await typed("azure/setup-helm@v4");
+  let problems = pane.getByLabel("Problems");
+  await expect(problems.locator("li")).toHaveCount(1);
+  // The pin's fix and Lock it side by side, where the severity would be.
+  await expect(problems.locator("li").getByRole("button")).toHaveText(["Pin it to 1a275c3", "Lock it"]);
+  await problems.getByRole("button", { name: "Lock it" }).click();
+  await expect(pane.locator(".jp-said")).toContainText("Locked azure/setup-helm@v4 at its commit in a draft: unpublished until it lands.");
+  const sent = (await sentBodies(page)).at(-1);
+  expect(sent).toMatchObject({ repo: "hyper-light/kiln", path: ".kiln/ci.yaml", verb: "lock" });
+  expect(String(sent?.content)).toContain("      - uses: azure/setup-helm@v4\n");
+  // A use whose source can't be read: Lock it alone (no commit to pin it to), refused, nothing saved, the text as typed.
+  pane = await typed("octo-org/missing@v1");
+  problems = pane.getByLabel("Problems");
+  const code = pane.locator(".ppl-detail .cm-content");
+  await expect(problems.locator("li")).toHaveCount(1);
+  await expect(problems.locator("li").getByRole("button")).toHaveText(["Lock it"]);
+  await problems.getByRole("button", { name: "Lock it" }).click();
+  await expect(pane.locator(".jp-said")).toContainText("KCI4051 octo-org/missing@v1: its source can't be read, so it isn't locked and nothing is saved");
+  await expect(code).toContainText("- uses: octo-org/missing@v1");
+  await expect(page.locator('.ppl-row[data-key="hyper-light/kiln:.kiln/ci.yaml"] .ship-r .ship-stand')).toHaveText("Not saved");
+  await expect(page.locator(".cm-tooltip, [role=dialog]")).toHaveCount(0);
+  expect(await sideways(page)).toBe(0);
+});
+
+test("Rerun with fresh actions' lock change: the use it moves marked and picked first, its upstream code file by file, and Accept, a person's word, said in place (W29-R25)", async ({
+  page,
+  isMobile,
+}) => {
+  await page.request.get("/api/mock/ship/pipelines?reset=1");
+  const pane = await openPane(page, isMobile, "hyper-light/quiver", ".github/workflows/bench.yml", "d-lock-89");
+  await expect(pane.locator(".ppl-kicker .ppl-draft")).toHaveText("DRAFT");
+  await expect(pane.locator(".jp-said")).toHaveText("actions/checkout@v4 moves to 11bd719 · its code changed in 3 files · it runs nowhere until a person accepts it");
+  await expect(pane.locator(".jp-said b")).toHaveText(["actions/checkout@v4"]);
+  const moved = pane.locator(".jp-j[data-at]");
+  await expect(moved).toHaveAttribute("data-key", "uses.actions/checkout@v4");
+  await expect(moved.locator(".v")).toHaveText(/→ 11bd719 in #89$/);
+  await expect(pane.locator(".ppl-detail").getByRole("tab")).toHaveText(["Changes", "YAML", "Plan"]);
+  // Every file that changed between the commit its lock had and the new one, under the source's head.
+  const detail = pane.locator(".ppl-detail");
+  await expect(detail.locator(".ppl-changes > .jp-g > span:first-child")).toHaveText(["Upstream code, actions/checkout@v4: b4ffde6 → 11bd719"]);
+  await expect(detail.getByLabel("dist/index.js, its lines at each commit").locator('li[data-kind="add"]')).toContainText(["await report(process.env);"]);
+  await expect(detail.getByLabel("src/git-auth-helper.ts, its lines at each commit").locator('li[data-kind="add"]')).toContainText(["send(token);"]);
+  await expect(detail.locator(".ppl-lines li", { hasText: "dist/cover.png" })).toContainText("new, 6 bytes, not text");
+  const word = detail.getByLabel("Its word");
+  await expect(word).toContainText("It runs nowhere until a person accepts this code");
+  const accept = word.getByRole("button", { name: "Accept" });
+  // Where it is on the page, not in the window: the pane's refresh may scroll its row into view.
+  const at = () =>
+    accept.evaluate((e) => {
+      const r = e.getBoundingClientRect();
+      return [Math.round(r.left + window.scrollX), Math.round(r.top + window.scrollY)];
+    });
+  const before = await at();
+  await accept.click();
+  expect((await sentBodies(page)).at(-1)).toEqual({
+    repo: "hyper-light/quiver",
+    path: ".github/workflows/bench.yml",
+    verb: "accept",
+    draft: "d-lock-89",
+    head: "6ae2d47".padEnd(40, "0"),
+    evidence_sha256: "5d1c0a7e".padEnd(64, "3"),
+  });
+  await expect(pane.locator(".jp-said")).toContainText("Accepted the new code of actions/checkout@v4 for quiver");
+  // Whose word it is, and Accept dimmed where it was: nothing moves.
+  await expect(word).toContainText("Accepted by ada: it runs in this draft, and on its trunk once it lands");
+  await expect(accept).toBeDisabled();
+  expect(await at()).toEqual(before);
+  await expect(page.locator("[role=dialog], .cm-tooltip")).toHaveCount(0);
+  expect(await sideways(page)).toBe(0);
+});
+
+test("Settings say what a workflow's locks hold and what its trunk requires, and a run refused before any job says why (W29-R23–R26)", async ({ page, isMobile }) => {
+  const pane = await openPane(page, isMobile, "hyper-light/quiver", ".github/workflows/bench.yml");
+  const line = (k: string) => pane.locator(`.jp-j[data-key="${k}"]`);
+  await expect(line("settings.lock")).toContainText("Locked");
+  await expect(line("settings.lock").locator(".v")).toHaveText("its one use at its commit");
+  await expect(line("settings.require_lock").locator(".v")).toHaveText("report: its runs say what isn't locked");
+  await expect(line("settings.moved_tags")).toHaveCount(0);
+  await expect(line("runs.31").locator(".v")).toContainText("refused (KCI4051)");
+  // A workflow with nothing to say of locks says nothing: its Settings stay as they were.
+  const ci = await openPane(page, isMobile, "hyper-light/quiver", ".github/workflows/ci.yml");
+  await expect(ci.locator('.jp-j[data-key^="settings.lock"], .jp-j[data-key^="settings.require"]')).toHaveCount(0);
   expect(await sideways(page)).toBe(0);
 });

@@ -302,6 +302,30 @@ export interface ShipPipelinePane {
   groups: ShipPipelineGroup[];
   detail: ShipPipelineDetail;
   repo: string;
+  /** A lock-change draft's upstream code (W29-R25), bound to its exact head: each changed source's whole difference, and whose word on it stands. */
+  lock_review?: ShipLockReview;
+}
+
+/** What a person reads before accepting a lock change (W29-R25): by lock key, every changed file between the accepted and the new commit. */
+export interface ShipLockReview {
+  id: string;
+  base: string;
+  evidence_sha256: string;
+  accepted_by: string | null;
+  differences: Record<string, { before: ShipLockRevision; after: ShipLockRevision; files: ShipCodeChange[] }>;
+}
+
+export interface ShipLockRevision {
+  repository: { name: string; native: boolean };
+  reference: string;
+  commit: string;
+}
+
+/** A changed file's bytes on each side (base64), with its mode: `100644`, `100755`, `120000` (a link), `160000` (a submodule). */
+export interface ShipCodeChange {
+  path: string;
+  before?: { mode: number; base64: string } | null;
+  after?: { mode: number; base64: string } | null;
 }
 
 /**
@@ -321,7 +345,7 @@ export interface ShipPipelineNew {
 export interface ShipPipelineAct {
   repo: string;
   path: string;
-  verb: "save_draft" | "ready" | "discard" | "run" | "release" | "new";
+  verb: "save_draft" | "ready" | "discard" | "run" | "release" | "new" | "lock" | "accept";
   content?: string;
   title?: string;
   event?: string;
@@ -341,8 +365,11 @@ export interface ShipPipelineAct {
   from?: string | { starter: string } | { copy: string };
   files?: { path: string; text: string }[];
   dry?: boolean;
-  /** A draft by its id: kiln's update draft, the repository's (W29-R22). */
+  /** A draft by its id: kiln's update draft, the repository's (W29-R22); Accept's lock-change draft (W29-R25). */
   draft?: string;
+  /** Accept's (W29-R25): the exact head and the hash of the evidence read. */
+  head?: string;
+  evidence_sha256?: string;
 }
 
 /** Ship's Pipelines (W29-R03): the repositories the caller may read, each with its workflows and actions as rows. */

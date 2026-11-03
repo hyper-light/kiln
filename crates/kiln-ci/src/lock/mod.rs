@@ -4,6 +4,7 @@
 pub mod github;
 pub mod execution;
 pub mod dockerfile;
+pub mod editor;
 pub mod kiln;
 pub mod regenerate;
 pub mod replay;

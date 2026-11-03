@@ -10,7 +10,6 @@ use kiln_http::Incoming;
 use kiln_ci::expr::Dialect;
 use kiln_ci::policy::Policy;
 use kiln_ci::sched::routing::{self, LegRoute};
-use kiln_ci::wf::diag::Range;
 use kiln_ci::wf::ir::RunsOn;
 use kiln_ci::wf::{self, Diag, SchemaKind, Severity};
 use serde::Deserialize;
@@ -49,6 +48,10 @@ struct Check {
     /// The repository it is for (its id or name): the checks that need one too.
     #[serde(default)]
     repo: Option<String>,
+    /// W29-R25: the commit it's edited at (a draft's head), whose locks it's checked against;
+    /// the repository's default branch when not given.
+    #[serde(default)]
+    sha: Option<String>,
 }
 
 /// `POST /api/ci/validate { path, content, dialect?, repo? }` → `{ kind, dialect, diagnostics,
@@ -72,25 +75,30 @@ pub async fn validate_value(hub: &Hub, caller: Option<&Caller>, body: Value) -> 
         }
         None => None,
     };
-    Ok(srv::json(StatusCode::OK, &checked(hub, repo.as_ref(), &path, c.content, c.dialect).await?))
+    Ok(srv::json(StatusCode::OK, &checked(hub, repo.as_ref(), &path, c.content, c.dialect, c.sha.as_deref()).await?))
 }
 
 /// The file checked as [`wf::check`] checks it, and a workflow kiln runs for `repo` against what
 /// only the server knows (W02-R12): the routing rules, runners and pools its `runs-on` may name
 /// (`KCI6007`), and the action policies its `uses:` answer to (W07-R04), as its run would; an
 /// overlay, against the workflow it overlays.
-async fn checked(hub: &Hub, repo: Option<&Repo>, path: &str, content: String, dialect: Option<Dialect>) -> Result<wf::Checked, Fail> {
+async fn checked(hub: &Hub, repo: Option<&Repo>, path: &str, content: String, dialect: Option<Dialect>, sha: Option<&str>) -> Result<wf::Checked, Fail> {
     let p = path.to_owned();
     let overlay_text = content.clone();
     let (mut checked, model) = crate::rt::blocking(move || wf::check_model(&p, &content, dialect)).await.map_err(|e| internal(&e))?;
     if let (Some(repo), Some(w)) = (repo, &model)
         && runs_here(hub, repo, path).await
     {
+        // W29-R25/R26: what its locks hold at the commit it's edited at, read without fetching: a
+        // locked use is judged by its locked commit, and the trunk's policy says what isn't locked.
+        let (locked, onboarded) = super::locks::editor_facts(hub, repo, sha, path, w).await;
         let mut more = unknown_labels(hub, repo, w).await;
-        more.extend(refused(&super::actions::policies(hub, repo).await, w));
+        more.extend(refused(&super::actions::policies(hub, repo).await, w, &locked));
         // A use the policy refuses for its pin needs no hint to pin it.
         checked.diagnostics.retain(|d| !(d.code == "KCI6002" && more.iter().any(|m| m.code == "KCI4021" && m.range == d.range)));
         checked.diagnostics.extend(more);
+        let policy = super::repo_config::lock_policy(hub, repo).await.unwrap_or_default();
+        kiln_ci::lock::editor::feedback(&mut checked.diagnostics, w, path, &kiln_ci::lock::editor::Facts { locked: &locked, onboarded, policy });
         checked.diagnostics.sort_by_key(|x| (x.range.start.line, x.range.start.col, x.code));
     }
     // An overlay against the workflow it overlays, at the repository's default branch: the keys it
@@ -228,28 +236,18 @@ pub async fn labels(hub: &Hub, repo: &str) -> Result<Response, Fail> {
 
 /// What the action policies (W07-R04) refuse of a workflow's `uses:`, where each is: what its run
 /// would refuse at the start.
-fn refused(policies: &[Policy], w: &wf::Workflow) -> Vec<Diag> {
-    fn steps(list: &[wf::Step], path: &str, check: &mut impl FnMut(&str, Range, String)) {
-        for (i, s) in list.iter().enumerate() {
-            let sp = format!("{path}[{i}]");
-            if let Some(u) = &s.uses {
-                check(u, s.range, format!("{sp}.uses"));
-            }
-            steps(&s.parallel, &format!("{sp}.parallel"), check);
-        }
-    }
+fn refused(policies: &[Policy], w: &wf::Workflow, locked: &std::collections::BTreeMap<String, String>) -> Vec<Diag> {
     let policy: Vec<&Policy> = policies.iter().collect();
     let mut out = Vec::new();
-    let mut check = |u: &str, range: Range, at: String| {
-        if let Err(r) = kiln_ci::policy::check(&policy, u) {
+    for (u, range, at) in kiln_ci::lock::editor::written(w) {
+        // A locked use runs its locked commit, and that's what the policy judges (W29-R23).
+        let judged = match (locked.get(&u), u.split_once('@')) {
+            (Some(sha), Some((name, _))) => kiln_ci::policy::check_pinned(&policy, &format!("{name}@{sha}")),
+            _ => kiln_ci::policy::check(&policy, &u),
+        };
+        if let Err(r) = judged {
             out.push(Diag::error(r.code, r.message, range).at(at));
         }
-    };
-    for j in &w.jobs {
-        if let Some(u) = &j.uses {
-            check(u, j.range, format!("jobs.{}.uses", j.id));
-        }
-        steps(&j.steps, &format!("jobs.{}.steps", j.id), &mut check);
     }
     out
 }
@@ -306,7 +304,7 @@ pub async fn edit(hub: &Arc<Hub>, caller: &Caller, repo_key: &str, path: &str, b
         return Err(bad(format!("`{path}` is not where workflows or actions are (.github/workflows/*.yml, .kiln/*.yaml, .github/actions/**/action.yml)")));
     }
     let repo = find_repo(hub, repo_key).await?;
-    let checked = checked(hub, Some(&repo), file, ask.content.clone(), None).await?;
+    let checked = checked(hub, Some(&repo), file, ask.content.clone(), None, None).await?;
     let errors: Vec<String> = checked.diagnostics.iter().filter(|d| d.is_error()).map(|d| d.render(file)).collect();
     if !errors.is_empty() {
         return Err((StatusCode::UNPROCESSABLE_ENTITY, format!("{file} has errors, so it isn't saved:\n{}", errors.join("\n"))));
@@ -318,7 +316,7 @@ pub async fn edit(hub: &Arc<Hub>, caller: &Caller, repo_key: &str, path: &str, b
         if !own || ask.draft != Some(true) {
             return Err(bad(format!("`files` carries a GitHub workflow's own overlay in its draft (.kiln/overlays/<its name>.yaml, with `draft`), not `{}`", f.path)));
         }
-        let c = self::checked(hub, Some(&repo), &f.path, f.text.clone(), None).await?;
+        let c = self::checked(hub, Some(&repo), &f.path, f.text.clone(), None, None).await?;
         let errors: Vec<String> = c.diagnostics.iter().filter(|d| d.is_error()).map(|d| d.render(&f.path)).collect();
         if !errors.is_empty() {
             return Err((StatusCode::UNPROCESSABLE_ENTITY, format!("{} has errors, so it isn't saved:\n{}", f.path, errors.join("\n"))));
@@ -690,7 +688,7 @@ pub async fn new_draft(hub: &Arc<Hub>, caller: &Caller, repo_key: &str, body: &V
         if wf::file_kind(&f.path).is_none() {
             continue;
         }
-        let c = checked(hub, Some(&repo), &f.path, f.text.clone(), None).await?;
+        let c = checked(hub, Some(&repo), &f.path, f.text.clone(), None, None).await?;
         let errors: Vec<String> = c.diagnostics.iter().filter(|d| d.is_error()).map(|d| d.render(&f.path)).collect();
         if !errors.is_empty() {
             return Err((StatusCode::UNPROCESSABLE_ENTITY, format!("{} has errors, so it isn't saved:\n{}", f.path, errors.join("\n"))));
