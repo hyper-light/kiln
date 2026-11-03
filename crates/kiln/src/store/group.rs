@@ -2196,7 +2196,9 @@ mod tests {
     /// An entry changed on its way (the message made again whole, past its checksum, as a link that
     /// changes what it carries would) leaves the learner holding other than the server wrote, and its
     /// checkpoint doesn't hold; copied again, the learner holds what the server wrote, and the
-    /// checkpoints after it hold.
+    /// checkpoints after it hold. Each stretch is checked once both have applied it, whatever the
+    /// timing: a member says the entry it applied last only once its turn of applying ends, after
+    /// it answered a flush.
     #[test]
     fn w27_r08_a_checkpoint_holds_on_a_learner_only_as_the_server_logged_its_entries() -> anyhow::Result<()> {
         let dir = tempfile::tempdir()?;
@@ -2219,10 +2221,12 @@ mod tests {
             let c = Connection::open_with_flags(&replica, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)?;
             Ok(c.query_row("SELECT v FROM kv WHERE k = ?1", [k], |r| r.get(0)).ok())
         };
-        // The links between them, the first entry with a write in it that the learner hasn't
-        // applied changed on its way, and every copy of it sent again (after a refusal). Not one it
-        // has: the leader sends the new learner messages it held for it from before its copy, and
-        // may send it entries the copy holds, which it passes over.
+        // The links between them, the first entry with a write in it past the learner's copy
+        // changed on its way, and every copy of it sent again (after a refusal). Not one the copy
+        // holds: the leader sends the new learner messages it held for it from before the copy, and
+        // may send it entries the copy holds, which it passes over. The first message with an entry
+        // past the copy is that entry's first sending.
+        let copied = learner.leaves_from();
         let done = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let picked = Arc::new(AtomicU64::new(0));
         let links = {
@@ -2230,7 +2234,7 @@ mod tests {
             thread::spawn(move || {
                 let Some(g) = server.group() else { return };
                 let (to_learner, to_server) = (g.outgoing(), learner.outgoing());
-                let changes = |e: &hyper_raft::proto::Entry, picked: u64, applied: u64| !e.data.is_empty() && if picked == 0 { e.index > applied } else { e.index == picked };
+                let changes = |e: &hyper_raft::proto::Entry, picked: u64| !e.data.is_empty() && if picked == 0 { e.index > copied } else { e.index == picked };
                 while !done.load(Ordering::SeqCst) {
                     let mut moved = false;
                     while let Ok((to, bytes)) = to_learner.try_recv() {
@@ -2238,11 +2242,10 @@ mod tests {
                         if to != member {
                             continue;
                         }
-                        let applied = learner.standing().1;
                         let bytes = match Message::decode(&bytes) {
-                            Ok(mut m) if m.entries.iter().any(|e| changes(e, picked.load(Ordering::SeqCst), applied)) => {
+                            Ok(mut m) if m.entries.iter().any(|e| changes(e, picked.load(Ordering::SeqCst))) => {
                                 for e in m.entries.iter_mut() {
-                                    if changes(e, picked.load(Ordering::SeqCst), applied)
+                                    if changes(e, picked.load(Ordering::SeqCst))
                                         && let Some(b) = e.data.last_mut()
                                     {
                                         *b ^= 0x01;
@@ -2268,26 +2271,26 @@ mod tests {
         let checked = (|| -> anyhow::Result<()> {
             set(&server, "after", "2")?;
             server.flush_group()?;
-            let applied = g.standing().1;
-            until("the learner applying what the server applied", || Ok(learner.standing().1 >= applied))?;
-            let from = learner.leaves_from();
+            // The stretch from the learner's copy to the entry the link changed, once both applied it.
+            until("the link changing an entry", || Ok(picked.load(Ordering::SeqCst) != 0))?;
             let changed = picked.load(Ordering::SeqCst);
-            anyhow::ensure!(changed > from && changed <= applied, "the link changed entry {changed}, not one of the learner's stretch from {from} to {applied}");
-            let (said, held) = (g.digest(from, applied), learner.digest(from, applied));
+            until("the server and the learner applying it", || Ok(g.standing().1 >= changed && learner.standing().1 >= changed))?;
+            anyhow::ensure!(changed > copied, "the link changed entry {changed}, which the learner's copy holds (it holds those to {copied})");
+            let (said, held) = (g.digest(copied, changed), learner.digest(copied, changed));
             anyhow::ensure!(said.is_ok() && held.is_ok() && said != held, "the changed entry changes the learner's checkpoint: kiln's {said:?}, the learner's {held:?}");
             anyhow::ensure!(read("after")?.as_deref() != Some("2"), "the learner holds what came, not what the server wrote");
-            // Copied again: what the server wrote, and the checkpoints after the copy hold.
+            // Copied again: what the server wrote; and the stretch after the changed entry, to what
+            // both applied of the writes after the copy, holds.
             learner.copy_again()?;
             anyhow::ensure!(read("after")?.as_deref() == Some("2"), "the copy holds what the server wrote");
-            let since = g.standing().1;
             for i in 0..5 {
                 set(&server, &format!("later{i}"), "x")?;
             }
             server.flush_group()?;
-            let applied = g.standing().1;
-            until("the writes after the copy on the learner", || Ok(learner.standing().1 >= applied))?;
-            anyhow::ensure!(g.digest(since, applied) == learner.digest(since, applied), "a checkpoint after the copy holds");
-            anyhow::ensure!(read("later4")?.as_deref() == Some("x"), "the learner follows the log after the copy");
+            until("the writes after the copy on the learner", || Ok(read("later4")?.as_deref() == Some("x")))?;
+            until("both saying they applied past the changed entry", || Ok(g.standing().1 > changed && learner.standing().1 > changed))?;
+            let applied = g.standing().1.min(learner.standing().1);
+            anyhow::ensure!(g.digest(changed, applied) == learner.digest(changed, applied), "a checkpoint after the changed entry holds");
             Ok(())
         })();
         done.store(true, Ordering::SeqCst);
