@@ -3065,7 +3065,7 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                                     });
                                 }
                             }
-                            m @ (Msg::Raft { .. } | Msg::At { .. }) => {
+                            m @ (Msg::Raft { .. } | Msg::At { .. } | Msg::Checkpoint { .. }) => {
                                 let learner = cluster.lock().clone();
                                 if let Some(l) = learner {
                                     l.heard(&m, raft);

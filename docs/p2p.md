@@ -315,6 +315,20 @@ reads from it (`crates/kiln/src/store/learner.rs`, `crates/kiln/src/frontdoor/re
   newest takes it ("One runner a machine", `docs/releases.md`). While it has learners, the server
   keeps up to 64 MiB of the log behind what's applied for one a little behind, and beats once a
   second.
+- **Custody of the copy and the log** (docs/ci.md W27-R08, "Between machines";
+  `crates/kiln/src/custody/cluster.rs`). A learner whose runner process signs its receipts names
+  that process as it asks for a copy (`?instance=`): the server hands the copy on to it by the
+  copy's SHA-256, signed and kept, and says so in the `kiln-custody` response header. The learner
+  hashes the copy as it comes and takes it only as handed on, signing its receipt; one that isn't
+  is refused, its receipt of what came recording the break, and another fetched. Each member keeps
+  a leaf of every entry it applies, the SHA-256 of the entry as it came. A learner that checks says
+  so as it asks where kiln.db stands, and the server sends it a checkpoint of the log every 10 s
+  while entries flow (none while none do): its hand-on of the entries since the learner's period
+  began, by the SHA-256 of their leaves. The learner checks each, signs its receipt of the one
+  closing each period (a minute or more long, starting at its copy), and on one that doesn't match
+  records the break at once and copies the database again, its front door leaving reads to the
+  server till the copy's in. A learner or server from before says or sends none of it, and copies
+  go as before.
 - **Kept following.** Each minute the runner checks its replica: one whose group stopped, or that
   stays behind the server's last write for five checks running, is stopped and started again,
   saying why (nothing else would start it again, and its front door would leave every read to the

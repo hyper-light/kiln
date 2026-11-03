@@ -615,7 +615,7 @@ mod tests {
                     while let Ok(AgentMsg::Cluster { json, raft }) = said.try_recv() {
                         moved = true;
                         match wire::decode(&json) {
-                            Some(Msg::Ask { id }) => learner.heard(&Msg::At { id, seq: g.standing().0 }, Vec::new()),
+                            Some(Msg::Ask { id, .. }) => learner.heard(&Msg::At { id, seq: g.standing().0 }, Vec::new()),
                             Some(m) => learners.heard(g, "runner-1", &m, raft),
                             None => {}
                         }

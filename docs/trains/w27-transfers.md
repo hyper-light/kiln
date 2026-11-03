@@ -61,7 +61,7 @@ reaching a process it isn't for.
 - The custody simulation (`sim::custody`, step 15): things handed on through relays that drop,
   change, swap and replay what they carry, under kiln-sim's nemesis, walked by kiln-ci's custody
   core: no chain with a break walks as unbroken, and each of three planted bugs is found.
-- Between machines (step 12, all but the cluster group): docs/ci.md W27 lists every path where one machine takes
+- Between machines (step 12): docs/ci.md W27 lists every path where one machine takes
   something from another. A runner's object from a peer's cache is handed on by the peer and
   received by the runner that fetched it, each signing; a copy changed on its way is refused, and
   the break recorded. No runner in production asks a peer yet: nothing mints its cache's tokens.
@@ -74,6 +74,12 @@ reaching a process it isn't for.
   that runner receives each for the session under it, and hands the output back, which the session
   receives. A copy changed on its way is refused before anything runs in it, and the break
   recorded; so is a run or an output that isn't what was handed on.
+  The cluster group (Ada's word, 2026-11-03): kiln hands each runner's learner its copy of kiln.db
+  by its SHA-256, and the learner's runner process receives it, refusing one that isn't what kiln
+  handed on and fetching another. Every 10 s while entries flow kiln hands each learner a
+  checkpoint of the log, by the SHA-256 of its entries' leaves since the learner's period began;
+  the learner signs its receipt of the one closing each period, at most once a minute, and on one
+  that doesn't match records the break at once and copies the database again.
 - Relays (step 13): every intermediary records what it passes on, unchanged, numbered on a stream
   of its own to its receiver: a runner relaying its agents' calls to kiln, kiln relaying an agent's
   words to the runner holding the agent they're for, kiln relaying reach links' frames, and
@@ -114,6 +120,11 @@ reaching a process it isn't for.
 - **Order.** The server first, then the runners. A runner from before signs nothing, and its
   hand-overs are recorded as unsigned, naming which side is from before. A server from before
   announces no `CAP_CUSTODY`, so runners send it nothing signed.
+- **Step 12's cluster group on the wire:** no new variants or bits. A new JSON kind of
+  `ServerMsg::Cluster` (`checkpoint`), sent only to a learner that says it checks them: a new
+  optional field of its ask (`checks`), which a server from before reads past. A copy's hand-on goes
+  in a response header (`kiln-custody`) to a learner that names its process (`instance=`); a learner
+  from before names none, and a server from before ignores it.
 - **Step 11 on the wire:** no new variants or bits. kiln's hand-ons of a leg's inputs go as
   `ServerMsg::Custody` with a new JSON shape (`{leg, hand_on}`), which a runner from before ignores;
   the tarball's comes in a response header (`Kiln-Custody-Hand-On`) and a cache's in a new field of
@@ -169,7 +180,9 @@ reaching a process it isn't for.
 
 ## Open
 
-- Step 12's cluster group (its learners' copies and log): waits on Ada's word on T2's files.
+- Step 12's cluster group: a learner started again on its kept replica, or whose server started
+  again, checks the log from where its leaves start then; what it applied since its last receipt
+  before that goes unchecked (docs/ci.md W27-R08, "Not yet").
 - The blob stores stand in for Mantle's puts and gets until CP-T10.2 vendors it (put to Ada).
 - A runner keeps its reach directory 30 s and refuses a runner that announced after its last read
   (put to Ada: re-read once before refusing).

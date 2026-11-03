@@ -732,7 +732,7 @@ impl Hub {
                 }
                 continue;
             };
-            for (msg, raft) in self.cluster.frames(bytes) {
+            for (msg, raft) in self.cluster.frames(member, bytes) {
                 if let Ok(b) = proto::encode(&ServerMsg::Cluster { json: crate::store::learner::encode(&msg), raft }) {
                     self.net.send(peer, proto::LANE_SYNC, Kind::Control, b).await;
                 }
@@ -2277,8 +2277,12 @@ impl Hub {
             }
             FromRunner::Sync { msg, raft } => self.sync_heard(agent, *msg, raft),
             FromRunner::Cluster { msg, raft } => match (self.store.group(), *msg) {
-                // Where kiln.db stands, for a read the runner answers once its replica holds it.
-                (Some(g), crate::store::learner::Msg::Ask { id }) => {
+                // Where kiln.db stands, for a read the runner answers once its replica holds it;
+                // and whether its learner checks the log's checkpoints (docs/ci.md W27-R08).
+                (Some(g), crate::store::learner::Msg::Ask { id, checks }) => {
+                    if let Some(holds) = checks {
+                        self.cluster.checks(agent, peer, holds);
+                    }
                     let at = crate::store::learner::Msg::At { id, seq: g.standing().0 };
                     if let Ok(b) = proto::encode(&ServerMsg::Cluster { json: crate::store::learner::encode(&at), raft: Vec::new() }) {
                         self.net.send(peer, proto::LANE_SYNC, Kind::Control, b).await;

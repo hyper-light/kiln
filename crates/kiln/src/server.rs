@@ -223,6 +223,9 @@ pub async fn run(cfg: Config, shutdown: Shutdown) -> anyhow::Result<()> {
         }
         child!("sync", h => h.sync_loop());
         child!("cluster", h => h.cluster_loop());
+        // Checkpoints of the cluster group's log, to the learners that check them (docs/ci.md
+        // W27-R08).
+        child!("cluster-custody", h => crate::custody::cluster::checkpoints_loop(h));
         child!("tailnet-dns", h => crate::frontdoor::tailnet::run(h));
         child!("in-step", h => crate::updates::in_step_loop(h));
         child!("ui-server", h => crate::uiserver::run(h));
