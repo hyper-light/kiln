@@ -1081,7 +1081,9 @@ fn a_detached_run_whose_asker_never_comes_back_goes_on_its_unread_output_giving_
 fn a_detached_run_whose_asker_takes_none_of_its_output_gives_way_after_a_while() -> anyhow::Result<()> {
     use super::wire::{self, RunSpec};
     crate::rt::block_on(async move {
-        let lab = lab().await?;
+        // mac speaks reach 1, as a runner from before does: a link at 2 (W27-R08) refuses a run
+        // that comes without its asker's hand-on, which this one, asked straight on the handle, lacks.
+        let lab = lab_at([None, None], [1, super::wire::VERSION]).await?;
         let dir = tempfile::tempdir()?;
         let (go, done) = (dir.path().join("go"), dir.path().join("done"));
         lab.mac.connect("linux").await?;
@@ -1091,7 +1093,15 @@ fn a_detached_run_whose_asker_takes_none_of_its_output_gives_way_after_a_while()
         std::fs::write(&keep, b"")?;
         let (kept, kept_said) = async_channel::unbounded();
         lab.mac.run("linux", RunSpec { command: format!("while [ -e '{}' ]; do sleep 0.1; done", keep.display()), ..RunSpec::default() }, kept).await?;
-        anyhow::ensure!(matches!(crate::rt::timeout(Duration::from_secs(60), kept_said.recv()).await??, wire::Say::Started { .. }), "the run keeping the link up did not start");
+        // On a link with custody (W27-R08) the run's custody record comes before it starts.
+        let started = async {
+            loop {
+                if let wire::Say::Started { .. } = kept_said.recv().await? {
+                    return anyhow::Ok(());
+                }
+            }
+        };
+        crate::rt::timeout(Duration::from_secs(60), started).await.map_err(|_| anyhow::anyhow!("the run keeping the link up did not start"))??;
         // Asked as a runner from before asks a detached run, then let go of.
         let (says, _said) = async_channel::unbounded();
         let id = lab.mac.run("linux", RunSpec { command: past_the_buffer(&go, &done), linger_ms: Some(wire::DETACHED), ..RunSpec::default() }, says).await?;
