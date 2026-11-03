@@ -1,0 +1,32 @@
+[graph]
+targets = [
+  "aarch64-apple-darwin",
+  "x86_64-apple-darwin",
+  "aarch64-unknown-linux-gnu",
+  "x86_64-unknown-linux-gnu",
+  "aarch64-pc-windows-msvc",
+  "x86_64-pc-windows-msvc",
+]
+all-features = false
+
+[advisories]
+yanked = "deny"
+unmaintained = "all"
+
+[licenses]
+allow = ["MIT", "Apache-2.0", "Apache-2.0 WITH LLVM-exception", "BSD-2-Clause", "BSD-3-Clause", "ISC", "Unicode-3.0", "Zlib", "CC0-1.0", "Unlicense"]
+confidence-threshold = 0.93
+
+[bans]
+multiple-versions = "warn"
+wildcards = "deny"
+allow-wildcard-paths = true
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+# No git source: the vendored hyper-raft core declares its own message types and wire format
+# since its step R-2 (vendor/hyper-raft/SNAPSHOT), so raft-rs's raft-proto is gone.
+allow-git = []
+required-git-spec = "rev"

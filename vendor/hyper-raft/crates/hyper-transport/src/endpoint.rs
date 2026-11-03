@@ -17,7 +17,10 @@
 //!   owner polls the peer's frames;
 //! - a peer's lifecycle waits as one event, its latest state with its epoch: a change while it
 //!   waits replaces it and moves it to the back, after the refusals of the exchanges a closed
-//!   connection carried; its entry in the peer table is held until the owner polls it.
+//!   connection carried; its entry in the peer table is held until the owner polls it;
+//! - so does the path of a peer's newest connection, degrading or progressing again
+//!   ([`Event::Degrading`], [`Event::Progressing`]): a change while it waits replaces it, one back
+//!   to what the owner was told takes it away, and the connection's close takes it away.
 //!
 //! A table at its bound refuses, typed, the stream, the connection or the dial that would need one
 //! more seat ([`Refusal::Exchanges`], [`Refusal::Events`]); no event is ever dropped, and nothing
@@ -30,6 +33,7 @@ use std::net::SocketAddr;
 use std::num::NonZeroUsize;
 use std::time::{Duration, Instant};
 
+use hyper_quic::coding::Codec;
 use hyper_quic::congestion::Congestion;
 use hyper_quic::rustls::pki_types::CertificateDer;
 use hyper_quic::{
@@ -48,15 +52,18 @@ use crate::credit::{
 use crate::deadlines;
 use crate::exchange::{End, Exchange, In, Incoming, Out, Outgoing, Pushed, abandon, pull, push};
 use crate::frame::{PREFIX_BYTES, Prefix};
-use crate::lane::{LaneIn, LaneOut, OPENER_BYTES, Reading, opened};
+use crate::lane::{LaneIn, LaneOut, NotesOut, OPENER_BYTES, Reading, VARINT_MOST, opened};
 use crate::pool::{Pool, PoolStats, Share};
 use crate::progress::{Carry, Delivered, LEAST_PROGRESS, Moved, Progress};
 use crate::receive::Receive;
+use crate::restart::RestartKey;
 use crate::state::{StateAccount, StateStats};
 use crate::tally::{Table, Tally};
 use crate::timing::PeerTiming;
 use crate::tls::Tls;
-use crate::{Authenticated, Classes, Directory, Epoch, Event, ExchangeId, PeerId, Refusal};
+use crate::{
+    Authenticated, Classes, Directory, Epoch, Event, ExchangeId, NOTES_LANE, PeerId, Refusal,
+};
 
 /// The bounds an endpoint keeps; every one is the owner's configuration, derived by its own law
 /// (CLAUDE.md §1: no arbitrary numbers).
@@ -115,7 +122,33 @@ pub struct Limits {
     /// taken: a rule that tracks a count, which an owner deriving its places from its memory
     /// would make tens of thousands, the crypto of every one done before the first Retry.
     pub retry_bytes: Option<u64>,
+    /// How the endpoint's connections ask their peers to acknowledge what they send.
+    pub acknowledgement: Acknowledgement,
+    /// The forward erasure correction of its connections' stream data, at most this many packets
+    /// wide (hyper-quic's `TransportConfig::fec_window`): `None` codes nothing. A connection codes
+    /// only while its path loses, and what its coding holds is charged to the budget as it is
+    /// held, its coding forgotten where the budget refuses ([`Stats::fec_refused`]).
+    pub fec_window: Option<u32>,
 }
+
+/// How a connection asks its peer to acknowledge its packets, through the acknowledgement
+/// frequency extension every peer takes (draft-ietf-quic-ack-frequency; docs/transport.md §4ak).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Acknowledgement {
+    /// An ACK for every 10 ack-eliciting packets or a quarter of the smoothed round trip after the
+    /// first one waiting, from the 100th packet on, as Google QUIC's receivers do (§4k): for a
+    /// stream of data whose sender's congestion control waits on its acknowledgements.
+    Decimated,
+    /// An ACK for every 10 ack-eliciting packets or within RFC 9000's default max_ack_delay
+    /// ([`REPLY_ACK_DELAY`]), whichever comes first: for requests a reply answers, the reply
+    /// carrying the request's acknowledgement where it goes sooner, so none goes alone.
+    Replies,
+}
+
+/// RFC 9000 §18.2's default max_ack_delay: "If this value is absent, a default of 25 milliseconds
+/// is assumed." What an endpoint whose packets replies answer ([`Acknowledgement::Replies`]) asks
+/// its peer to acknowledge within.
+pub const REPLY_ACK_DELAY: Duration = Duration::from_millis(25);
 
 /// How connections are given the exchanges their peers may open at once (QUIC's bidirectional
 /// stream credit, RFC 9000 §4.6; docs/transport.md §4g).
@@ -154,17 +187,19 @@ pub enum AskQueue {
 impl Limits {
     /// The most events the endpoint holds for its owner at once: [`EXCHANGE_EVENTS`] for every
     /// exchange the table holds, and, for every entry of the peer table (the larger of the
-    /// identity and connection bounds), its one lifecycle event, its lanes' windows of frames and
-    /// one [`Event::LaneRoom`] a lane.
+    /// identity and connection bounds), its one lifecycle event, its one path event
+    /// ([`Event::Degrading`] or [`Event::Progressing`]), its lanes' windows of frames and one
+    /// [`Event::LaneRoom`] a lane.
     /// The queue never holds more (the module's documentation says how).
     pub fn event_bound(&self) -> usize {
         let peers = self.admission.identities.max(self.admission.connections);
         let lanes = usize::try_from(self.lanes_per_peer).unwrap_or(usize::MAX);
         let frames = lanes.saturating_mul(self.lane_window);
-        // A peer's lifecycle event, its lanes' frames, and a room event of each lane to it.
+        // A peer's lifecycle event and its path event, its lanes' frames, and a room event of each
+        // lane to it.
         EXCHANGE_EVENTS
             .saturating_mul(self.exchanges)
-            .saturating_add(peers.saturating_mul(frames.saturating_add(lanes).saturating_add(1)))
+            .saturating_add(peers.saturating_mul(frames.saturating_add(lanes).saturating_add(2)))
     }
 
     fn validate(&self) -> Result<(), Refusal> {
@@ -203,14 +238,19 @@ impl Limits {
         };
         transport
             .max_concurrent_bidi_streams(VarInt::from_u32(handshake))
-            .max_concurrent_uni_streams(VarInt::from_u32(self.lanes_per_peer))
+            // The owner's lanes, and the endpoint's notes to the peer beside them.
+            .max_concurrent_uni_streams(VarInt::from_u32(self.lanes_per_peer.saturating_add(1)))
             .stream_receive_window(varint(stream)?)
             .receive_window(varint(window)?)
             .send_window(self.window_ceiling)
             .max_idle_timeout(Some(idle))
             .keep_alive_interval(self.keep_alive)
-            .congestion(congestion.clone())
-            .decimate_acks();
+            .fec_window(self.fec_window)
+            .congestion(congestion.clone());
+        match self.acknowledgement {
+            Acknowledgement::Decimated => transport.decimate_acks(),
+            Acknowledgement::Replies => transport.decimate_acks_within(REPLY_ACK_DELAY),
+        };
         // MTU discovery searches up to what the peer takes and the path carries, as the path's
         // socket tells it (`Endpoint::set_path_ceiling`), not to quinn's 1,452-byte default: a
         // jumbo-frame path carried 8,954-byte datagrams, and a bus node at a million messages a
@@ -252,8 +292,8 @@ pub struct PathFacts {
     pub delivery_rate: u64,
     /// The receive window this side advertises to the peer now, reserve excluded.
     pub receive_window: u64,
-    /// The rate the congestion controller paces at, bytes a second, when it states one (Copa does,
-    /// once it has a round trip; NewReno, CUBIC and BBR keep the connection's rule).
+    /// The rate the congestion controller paces at, bytes a second, when it states one (Copa and
+    /// BBR do, once they have a round trip; NewReno and CUBIC keep the connection's rule).
     pub pacing_rate: Option<u64>,
     /// The controller's slow-start threshold, bytes, when it keeps one.
     pub ssthresh: Option<u64>,
@@ -322,10 +362,24 @@ pub struct Stats {
     /// The connections' state as charged, learned from what the owner observes
     /// ([`Endpoint::observe`]).
     pub state: StateStats,
+    /// Connections whose forward erasure correction the budget could not fund as it grew, and so
+    /// forgot what it held ([`Limits::fec_window`]).
+    pub fec_refused: u64,
+    /// The bytes the connections' forward erasure correction holds now, charged as held.
+    pub fec_charged: u64,
+    /// Notes made for peers, each naming the exchanges served whose owners said since the last that
+    /// they were at work on them ([`Endpoint::working`]).
+    pub notes_made: u64,
+    /// Exchanges this side asked that a peer's note named, its owner at work on them.
+    pub notes_heard: u64,
 }
 
 /// The QUIC application error code a connection closes with when it ends without a fault.
 const CLOSE_NORMAL: u32 = 0;
+/// Notes a connection may send in a serve period: three, so that two lost to the path still leave
+/// one inside the least period an asker gives, as RFC 9000 §10.1 makes the idle timeout three
+/// probe timeouts (mantle research/77 D1, reviewed by hyper-raft's agent 2026-10-31).
+const NOTES_A_PERIOD: u32 = 3;
 /// The kinds of event an exchange can have waiting at once, each at most once: its head
 /// (`Request` or `Reply`, once in its life), `BodyReady` and `Writable` (each replaced by none
 /// while one waits), and `Refused` (once, as it ends).
@@ -424,11 +478,15 @@ struct Conn<R> {
     unread_ended: Option<Instant>,
     lanes_out: Vec<LaneOut>,
     lanes_in: Vec<LaneIn>,
+    /// Its notes to the peer, of the exchanges it serves whose owners are at work ([`NOTES_LANE`]).
+    notes: NotesOut,
     window: Window,
     /// The stream bytes read on it, by class.
     delivered: Delivered,
     /// The budget's grants for the receive window: the initial one and one per growth.
     grants: Vec<Reservation>,
+    /// The budget's grant for what its forward erasure correction holds, as it holds it.
+    fec: Reservation,
     /// When its window was set back, while its growth's grants go back as its peer's reads pay
     /// what QUIC still owes of the credit given (`Core::repay`).
     set_back: Option<Instant>,
@@ -480,6 +538,15 @@ struct PeerEntry<R> {
     reported: Option<Lifecycle>,
     /// The state of the lifecycle event waiting for the owner, if one does.
     waiting: Option<Lifecycle>,
+    /// Whether its newest connection's path is degrading (hyper-quic's `PathDegrading`): nothing
+    /// sent on it acknowledged for the path-degrading delay, until the peer acknowledges again or
+    /// the connection goes.
+    degrading: bool,
+    /// The path state of its newest connection the owner was last told, by the
+    /// [`Event::Degrading`] or [`Event::Progressing`] it polled last: degrading or not.
+    path_reported: bool,
+    /// The path state of the event waiting for the owner, if one does.
+    path_waiting: Option<bool>,
     /// Frames of its lanes waiting for the owner, on any of its connections, live or gone.
     frames: usize,
     /// Its lanes not read for want of a seat for their next frame.
@@ -504,6 +571,9 @@ impl<R> PeerEntry<R> {
             closed: None,
             reported: None,
             waiting: None,
+            degrading: false,
+            path_reported: false,
+            path_waiting: None,
             frames: 0,
             paused: 0,
         }
@@ -520,7 +590,11 @@ impl<R> PeerEntry<R> {
     }
     /// Whether the entry must stay: a connection or a dial needs it, or events wait in it.
     fn pinned(&self) -> bool {
-        self.held > 0 || self.dialing || self.waiting.is_some() || self.frames > 0
+        self.held > 0
+            || self.dialing
+            || self.waiting.is_some()
+            || self.path_waiting.is_some()
+            || self.frames > 0
     }
 }
 
@@ -538,6 +612,12 @@ impl<C: Classes> Waiting<C> {
         matches!(self.event,
             Event::Connected { peer: of, .. } | Event::Closed { peer: of, .. } | Event::Unreachable { peer: of, .. }
                 if of == peer)
+    }
+
+    /// Whether this is a path event of `peer`.
+    fn path_of(&self, peer: PeerId) -> bool {
+        matches!(self.event,
+            Event::Degrading { peer: of, .. } | Event::Progressing { peer: of, .. } if of == peer)
     }
 }
 
@@ -811,7 +891,7 @@ impl<C: Classes, B: Budget<C::Class>, D: Directory<Role = C::Role>> Endpoint<C, 
         directory: D,
         now: Instant,
     ) -> Result<Self, Refusal> {
-        Self::build(config, budget, directory, now, None)
+        Self::build(config, budget, directory, now, None, None)
     }
 
     /// [`Endpoint::new`], with the QUIC layer's own randomness drawn from `seed` where the
@@ -827,7 +907,22 @@ impl<C: Classes, B: Budget<C::Class>, D: Directory<Role = C::Role>> Endpoint<C, 
         now: Instant,
         seed: [u8; 32],
     ) -> Result<Self, Refusal> {
-        Self::build(config, budget, directory, now, Some(seed))
+        Self::build(config, budget, directory, now, Some(seed), None)
+    }
+
+    /// [`Endpoint::new`], keyed by the key the endpoint keeps across its restarts at its address
+    /// ([`RestartKey`]): a peer that sends on a connection the endpoint's last run held is answered
+    /// with a reset it verifies, and is told at once that the connection closed (docs/transport.md
+    /// §4ah). `seed`, where given, is [`Endpoint::new_seeded`]'s.
+    pub fn new_restartable(
+        config: Config<C::Role>,
+        budget: B,
+        directory: D,
+        now: Instant,
+        restart: &RestartKey,
+        seed: Option<[u8; 32]>,
+    ) -> Result<Self, Refusal> {
+        Self::build(config, budget, directory, now, seed, Some(restart))
     }
 
     fn build(
@@ -836,6 +931,7 @@ impl<C: Classes, B: Budget<C::Class>, D: Directory<Role = C::Role>> Endpoint<C, 
         directory: D,
         now: Instant,
         seed: Option<[u8; 32]>,
+        restart: Option<&RestartKey>,
     ) -> Result<Self, Refusal> {
         config.limits.validate()?;
         let transport = config.limits.transport(C::RANKS, &config.congestion)?;
@@ -848,6 +944,9 @@ impl<C: Classes, B: Budget<C::Class>, D: Directory<Role = C::Role>> Endpoint<C, 
             .max_udp_payload_size(u16::try_from(crate::RECEIVE_CHUNK).unwrap_or(u16::MAX))
             .map_err(|_| Refusal::Configuration)?;
         endpoint.config_slots(config_slots(&config.limits.admission)?);
+        if let Some(restart) = restart {
+            restart.configure(&mut endpoint);
+        }
         let mut quic =
             hyper_quic::Endpoint::new(endpoint, server, true, seed).map_err(|_| Refusal::Quic)?;
         let client = quic
@@ -986,6 +1085,8 @@ impl<C: Classes, B: Budget<C::Class>, D: Directory<Role = C::Role>> Endpoint<C, 
             let sent = conn
                 .quic
                 .poll_transmit(now, max_datagrams.max(1), out, self.quic.configs());
+            // What it sent may be sources its coding keeps
+            self.core.charge_fec(conn);
             // Sending, or finding nothing to send, moves the connection's timers.
             self.rearm_later(key);
             if let Some(transmit) = sent {
@@ -1227,10 +1328,8 @@ impl<C: Classes, B: Budget<C::Class>, D: Directory<Role = C::Role>> Endpoint<C, 
             Some(Some(conn)) => {
                 let quic = conn.quic.poll_timeout();
                 let waits = self.core.exchanges.first_due(key);
-                match (quic, waits) {
-                    (Some(a), Some(b)) => Some(a.min(b)),
-                    (a, b) => a.or(b),
-                }
+                let note = self.core.note_due(conn);
+                [quic, waits, note].into_iter().flatten().min()
             }
             _ => None,
         };
@@ -1248,11 +1347,15 @@ impl<C: Classes, B: Budget<C::Class>, D: Directory<Role = C::Role>> Endpoint<C, 
         if !self.core.oracle {
             return;
         }
+        let core = &self.core;
         let connections = self
             .conns
             .iter_mut()
             .flatten()
-            .filter_map(|conn| conn.quic.poll_timeout())
+            .filter_map(|conn| {
+                let quic = conn.quic.poll_timeout();
+                [quic, core.note_due(conn)].into_iter().flatten().min()
+            })
             .min();
         let exchanges = self
             .core
@@ -1290,6 +1393,9 @@ impl<C: Classes, B: Budget<C::Class>, D: Directory<Role = C::Role>> Endpoint<C, 
             | Event::Closed { peer, .. }
             | Event::Unreachable { peer, .. } => {
                 self.core.lifecycle_polled(peer);
+            }
+            Event::Degrading { peer, .. } | Event::Progressing { peer, .. } => {
+                self.core.path_polled(peer);
             }
             Event::Frame { peer, .. } => {
                 if let Some((key, serial, stream)) = lane {
@@ -1533,6 +1639,20 @@ impl<C: Classes, B: Budget<C::Class>, D: Directory<Role = C::Role>> Endpoint<C, 
         });
     }
 
+    /// Its owner is at work on `exchange`, a peer's: its own work for it advanced since it last said
+    /// so, an ask of its own answered or a byte of its reply made. The peer hears it in the next
+    /// note on their connection ([`NOTES_LANE`]), at most a beat apart, a third of the serve period,
+    /// and its asker judges the exchange by it rather than by its clock (mantle research/77 D1).
+    /// Said as work moves and never on a timer, a stuck owner falls silent and its asker gives it
+    /// up as before. An exchange this side asked, or one whose reply was written whole, is passed
+    /// over.
+    pub fn working(&mut self, exchange: ExchangeId) {
+        let _ = self.with_exchange(exchange, |core, conn, id| {
+            core.vouch(conn, id);
+            Ok(())
+        });
+    }
+
     /// Bytes for a message of `class`, from the endpoint's budget: what the owner reads bodies
     /// into.
     pub fn reserve(&mut self, class: C::Class, bytes: u64) -> Result<Reservation, Refusal> {
@@ -1607,6 +1727,9 @@ impl<C: Classes, B: Budget<C::Class>, D: Directory<Role = C::Role>> Endpoint<C, 
         kind: C::Kind,
         frame: &[u8],
     ) -> Result<(), Refusal> {
+        if lane == crate::NOTES_LANE {
+            return Err(Refusal::Lanes);
+        }
         let class = C::class_of(kind, self.core.role).ok_or(Refusal::Kind)?;
         if length(frame.len()) > C::frame_bound(class) {
             return Err(Refusal::FrameBound);
@@ -1760,6 +1883,11 @@ impl<C: Classes, B: Budget<C::Class>, D: Directory<Role = C::Role>> Endpoint<C, 
                 .filter(|conn| conn.room.is_some())
                 .count(),
             state: self.core.state.stats(),
+            fec_charged: self
+                .conns
+                .iter()
+                .flatten()
+                .fold(0u64, |sum, conn| sum.saturating_add(conn.fec.granted())),
             ..self.core.stats
         }
     }
@@ -1846,8 +1974,12 @@ impl<C: Classes, B: Budget<C::Class>, D: Directory<Role = C::Role>> Endpoint<C, 
     /// control holds the peer at the window this side granted (the socket's room). A consumer's
     /// backpressure: a node whose subscribers cannot take more holds the publishers that feed them,
     /// rather than queueing what they send. A lane the peer has not yet opened is held from its
-    /// opening, on this connection or a later one. Refused `Lanes` past the lanes a peer may open.
+    /// opening, on this connection or a later one. Refused `Lanes` past the lanes a peer may open,
+    /// and for its notes' lane ([`crate::NOTES_LANE`]), always read.
     pub fn hold_lane(&mut self, peer: PeerId, lane: crate::LaneId) -> Result<(), Refusal> {
+        if lane == crate::NOTES_LANE {
+            return Err(Refusal::Lanes);
+        }
         let bound = usize::try_from(self.core.limits.lanes_per_peer).unwrap_or(usize::MAX);
         let entry = self
             .core
@@ -2208,10 +2340,12 @@ impl<C: Classes, B: Budget<C::Class>, D: Directory<Role = C::Role>> Endpoint<C, 
             unread: 0,
             unread_ended: None,
             lanes_out: Vec::new(),
+            notes: NotesOut::default(),
             lanes_in: Vec::new(),
             window: Window::new(initial, limits.window_ceiling),
             delivered: Delivered::new(C::RANKS),
             grants,
+            fec: Reservation::default(),
             set_back: None,
             listed: false,
             lost: false,
@@ -2361,6 +2495,7 @@ impl<C: Classes, B: Budget<C::Class>, D: Directory<Role = C::Role>> Endpoint<C, 
             }
         }
         self.core.progress(now, &mut conn);
+        self.core.charge_fec(&mut conn);
         self.put(key, conn);
         self.endpoint_events(key);
         let drained = self
@@ -2578,6 +2713,61 @@ impl<C: Classes, B: Budget<C::Class>, D: Directory<Role = C::Role>> Core<C, B, D
         }
     }
 
+    /// The path of `peer`'s newest connection may have changed: the event of it waiting for the
+    /// owner, if any, is replaced by its state now and moved to the back, after every event queued
+    /// before the change; a state the owner was already told waits as nothing.
+    fn report_path(&mut self, peer: PeerId) {
+        let Ok(at) = self.peers.binary_search_by_key(&peer, |entry| entry.peer) else {
+            return;
+        };
+        let Some(entry) = self.peers.get_mut(at) else {
+            return;
+        };
+        let state = entry.degrading;
+        if entry.path_waiting == Some(state) {
+            return;
+        }
+        if entry.path_waiting.take().is_some()
+            && let Some(index) = self.events.iter().position(|waiting| waiting.path_of(peer))
+        {
+            let _ = self.events.remove(index);
+        }
+        if state == entry.path_reported {
+            return;
+        }
+        let epoch = entry.epoch;
+        let event = if state {
+            Event::Degrading { peer, epoch }
+        } else {
+            Event::Progressing { peer, epoch }
+        };
+        entry.path_waiting = Some(state);
+        self.events.push_back(Waiting { event, lane: None });
+    }
+
+    /// The owner polled `peer`'s path event: what it was told is the state that waited.
+    fn path_polled(&mut self, peer: PeerId) {
+        if let Some(entry) = self.peer_entry_mut(peer) {
+            entry.path_reported = entry.path_waiting.take().unwrap_or(entry.path_reported);
+        }
+    }
+
+    /// Connection `key`'s path became degrading, or made progress again: told of the peer's newest
+    /// connection only, the one its exchanges and lanes are on.
+    fn path_changed(&mut self, key: usize, conn: &Conn<C::Role>, degrading: bool) {
+        let Some((peer, _)) = conn.peer else {
+            return;
+        };
+        let Some(entry) = self.peer_entry_mut(peer) else {
+            return;
+        };
+        if entry.connection != Some(key) {
+            return;
+        }
+        entry.degrading = degrading;
+        self.report_path(peer);
+    }
+
     /// Queue an event of exchange `id`, holding its slot; nothing when `id` names no exchange.
     fn push_exchange(&mut self, id: u64, event: Event<C>) {
         if self.exchanges.hold(id) {
@@ -2614,6 +2804,8 @@ impl<C: Classes, B: Budget<C::Class>, D: Directory<Role = C::Role>> Core<C, B, D
                 self.lost_for(key, conn, refusal);
             }
             QuicEvent::Stream(event) => self.on_stream(now, key, conn, event),
+            QuicEvent::PathDegrading => self.path_changed(key, conn, true),
+            QuicEvent::ForwardProgress => self.path_changed(key, conn, false),
             QuicEvent::HandshakeDataReady
             | QuicEvent::DatagramReceived
             | QuicEvent::DatagramsUnblocked => {}
@@ -2729,7 +2921,12 @@ impl<C: Classes, B: Budget<C::Class>, D: Directory<Role = C::Role>> Core<C, B, D
                     .join(&mut conn.share, initial, conn.key, conn.serial);
                 if self
                     .pool
-                    .welcome(&mut conn.share, self.limits.streams_per_connection)
+                    .welcome(
+                        &mut conn.share,
+                        self.limits.streams_per_connection,
+                        conn.key,
+                        conn.serial,
+                    )
                     .is_some()
                 {
                     conn.quic
@@ -2752,6 +2949,9 @@ impl<C: Classes, B: Budget<C::Class>, D: Directory<Role = C::Role>> Core<C, B, D
             // A connection the peer opened leaves a dial to it in progress, and its entry held.
             entry.dialing &= !dialed;
             entry.unreachable = None;
+            // A new connection's path is told from its own acknowledgements.
+            entry.degrading = false;
+            entry.path_reported = false;
             entry.epoch
         });
         conn.epoch = epoch;
@@ -2827,8 +3027,12 @@ impl<C: Classes, B: Budget<C::Class>, D: Directory<Role = C::Role>> Core<C, B, D
                     if entry.connection == Some(key) {
                         entry.connection = None;
                         entry.closed = refusal;
+                        // Its close says more than its path did: no path event of it waits.
+                        entry.degrading = false;
+                        entry.path_reported = false;
                     }
                 }
+                self.report_path(peer);
                 self.report_lifecycle(peer);
             }
             (None, Some(peer)) => {
@@ -2860,6 +3064,10 @@ impl<C: Classes, B: Budget<C::Class>, D: Directory<Role = C::Role>> Core<C, B, D
                 self.room.release(grant.granted());
             }
             self.budget.release(grant);
+        }
+        let fec = std::mem::take(&mut conn.fec);
+        if fec.granted() > 0 {
+            self.budget.release(fec);
         }
         if let Some(share) = self.state.gone() {
             self.budget.release(share);
@@ -2942,6 +3150,8 @@ impl<C: Classes, B: Budget<C::Class>, D: Directory<Role = C::Role>> Core<C, B, D
             ended: false,
             credit_settled: false,
             parked: false,
+            vouch: false,
+            vouched: None,
         };
         match self.exchanges.insert(exchange) {
             Ok(id) => {
@@ -3339,6 +3549,8 @@ impl<C: Classes, B: Budget<C::Class>, D: Directory<Role = C::Role>> Core<C, B, D
             ended: false,
             credit_settled: false,
             parked: false,
+            vouch: false,
+            vouched: None,
         };
         let id = self.exchanges.insert(exchange)?;
         self.exchanges.place(id, conn.exchanges.len());
@@ -3934,8 +4146,112 @@ impl<C: Classes, B: Budget<C::Class>, D: Directory<Role = C::Role>> Core<C, B, D
             self.judge(now, conn, *id);
         }
         self.ids = ids;
+        self.flush_notes(now, conn);
         self.flush_lanes(conn);
         self.tune(now, conn);
+    }
+
+    /// Exchange `id`'s owner is at work on it ([`Endpoint::working`]): the next note names it, if it
+    /// is a peer's and its reply is not yet written whole.
+    fn vouch(&mut self, conn: &mut Conn<C::Role>, id: u64) {
+        let Some(exchange) = self.exchanges.get_mut(id) else {
+            return;
+        };
+        if exchange.opened
+            || exchange.ended
+            || exchange.stream.is_none()
+            || exchange.out.state == Out::Finished
+        {
+            return;
+        }
+        exchange.vouch = true;
+        conn.notes.pending = true;
+    }
+
+    /// A beat between notes on a connection: the serve period, the least any asker of this
+    /// endpoint's peers gives an exchange, over [`NOTES_A_PERIOD`].
+    fn beat(&self) -> Duration {
+        self.serve
+            .period()
+            .checked_div(NOTES_A_PERIOD)
+            .unwrap_or_default()
+    }
+
+    /// When `conn`'s next note is due: once an owner vouched since the last was made and that one
+    /// is written whole, a beat after it was made.
+    fn note_due(&self, conn: &Conn<C::Role>) -> Option<Instant> {
+        let notes = &conn.notes;
+        if !notes.pending || notes.written < notes.note.len() {
+            return None;
+        }
+        Some(notes.made.map_or(self.now, |made| {
+            made.checked_add(self.beat()).unwrap_or(made)
+        }))
+    }
+
+    /// Make `conn`'s note when it is due, naming every exchange vouched for since the last, and
+    /// write it as credit allows; the next is made only once it is written whole.
+    fn flush_notes(&mut self, now: Instant, conn: &mut Conn<C::Role>) {
+        if conn.notes.written >= conn.notes.note.len() {
+            if self.note_due(conn).is_none_or(|due| due > now) {
+                return;
+            }
+            let bound = usize::try_from(self.limits.streams_per_connection)
+                .unwrap_or(usize::MAX)
+                .saturating_mul(VARINT_MOST);
+            conn.notes.note.clear();
+            conn.notes.written = 0;
+            if conn.notes.note.try_reserve(bound).is_err() {
+                return;
+            }
+            for &id in &conn.exchanges {
+                let Some(exchange) = self.exchanges.get_mut(id) else {
+                    continue;
+                };
+                if !std::mem::replace(&mut exchange.vouch, false) {
+                    continue;
+                }
+                if let Some(stream) = exchange.stream
+                    && !exchange.ended
+                    && exchange.out.state != Out::Finished
+                {
+                    VarInt::from(stream).encode(&mut conn.notes.note);
+                }
+            }
+            conn.notes.pending = false;
+            conn.notes.made = Some(now);
+            if !conn.notes.note.is_empty() {
+                self.stats.notes_made = self.stats.notes_made.saturating_add(1);
+            }
+        }
+        if conn.notes.note.is_empty() {
+            return;
+        }
+        let stream = match conn.notes.stream {
+            Some(stream) => stream,
+            None => {
+                let Some(stream) = conn.quic.streams().open(Dir::Uni) else {
+                    return;
+                };
+                conn.notes.stream = Some(stream);
+                stream
+            }
+        };
+        let opener = crate::lane::opener(NOTES_LANE);
+        if conn.notes.opener_written < opener.len() {
+            let rest = opener.get(conn.notes.opener_written..).unwrap_or(&[]);
+            let Pushed::Took(took) = push(&mut conn.quic, stream, rest, u64::MAX) else {
+                return;
+            };
+            conn.notes.opener_written = conn.notes.opener_written.saturating_add(took);
+            if conn.notes.opener_written < opener.len() {
+                return;
+            }
+        }
+        let rest = conn.notes.note.get(conn.notes.written..).unwrap_or(&[]);
+        if let Pushed::Took(took) = push(&mut conn.quic, stream, rest, u64::MAX) {
+            conn.notes.written = conn.notes.written.saturating_add(took);
+        }
     }
 
     fn wake(&mut self, conn: &mut Conn<C::Role>, id: u64) {
@@ -4040,6 +4356,18 @@ impl<C: Classes, B: Budget<C::Class>, D: Directory<Role = C::Role>> Core<C, B, D
                 }
                 _ => {}
             }
+            // Its peer's owner said within this window that it is at work on it
+            // (`Endpoint::working`): the peer's statement, not the clock, judges it, its wait
+            // starting again from the note (mantle research/77 D1). Its notes stopping, a window
+            // with no note is judged as before.
+            if let Some(vouched) = exchange
+                .vouched
+                .filter(|&vouched| vouched > exchange.carry.started())
+            {
+                let acknowledged = exchange.out.acked;
+                exchange.carry.vouched(vouched, at, backlog, acknowledged);
+                return Ok(());
+            }
             if Self::ours_to_move(exchange, peer_takes) {
                 exchange.carry.hold(now, at, backlog);
                 return Ok(());
@@ -4073,12 +4401,17 @@ impl<C: Classes, B: Budget<C::Class>, D: Directory<Role = C::Role>> Core<C, B, D
     }
 
     /// Whether a period that moved nothing for `exchange` is this side's doing, not the peer's,
-    /// and so no evidence against the peer: its owner is not reading the body it is answered with,
-    /// or it has bytes to send that the peer's credit would take (`peer_takes`) and this side has
-    /// not sent, because its owner has not offered them or a more urgent class of this side's
-    /// took the credit first. Only a peer that stops taking or answering ends an exchange.
+    /// and so no evidence against the peer: its owner is not reading the body it is answered with
+    /// (its last read had all it asked for, or bytes arrived for it since one that wanted more), or
+    /// it has bytes to send that the peer's credit would take (`peer_takes`) and this side has not
+    /// sent, because its owner has not offered them or a more urgent class of this side's took the
+    /// credit first. Only a peer that stops taking or answering ends an exchange.
     fn ours_to_move(exchange: &Exchange<C::Class>, peer_takes: u64) -> bool {
-        let unread = exchange.incoming.state == In::Body && !exchange.starved;
+        // A read that wanted more holds the sender to account only until more arrives: then the
+        // owner is told (`ready_sent`), and a period that brings nothing is the window it holds,
+        // full (docs/transport.md §4al).
+        let unread =
+            exchange.incoming.state == In::Body && (!exchange.starved || exchange.ready_sent);
         let sending = matches!(exchange.out.state, Out::Head | Out::Body | Out::Trailer);
         let unsent = sending && exchange.stream.is_some() && peer_takes > 0;
         unread || unsent
@@ -4126,6 +4459,46 @@ impl<C: Classes, B: Budget<C::Class>, D: Directory<Role = C::Role>> Core<C, B, D
         let reserve = class_reserve(C::RANKS.saturating_sub(1));
         if let Ok(window) = VarInt::from_u64(grown.saturating_add(reserve)) {
             conn.quic.set_receive_window(window);
+        }
+    }
+
+    /// What `conn`'s forward erasure correction holds (hyper-quic's `Connection::fec_held_bytes`),
+    /// charged as it is held: grown from the budget on [`Lane::Window`], accounting only, as it
+    /// grows, and given back as it shrinks. Coding the budget refuses is forgotten
+    /// (`Connection::fec_forget`): its losses are repaired by retransmission, so nothing it held
+    /// was owed.
+    fn charge_fec(&mut self, conn: &mut Conn<C::Role>) {
+        let held = u64::try_from(conn.quic.fec_held_bytes()).unwrap_or(u64::MAX);
+        let charged = conn.fec.granted();
+        if held > charged {
+            let grown = match self
+                .budget
+                .reserve(held.saturating_sub(charged), Lane::Window)
+            {
+                Ok(grant) if charged == 0 => {
+                    conn.fec = grant;
+                    true
+                }
+                Ok(grant) => match conn.fec.absorb(grant) {
+                    Ok(()) => true,
+                    Err(grant) => {
+                        self.budget.release(grant);
+                        false
+                    }
+                },
+                Err(_) => false,
+            };
+            if !grown {
+                conn.quic.fec_forget();
+                self.stats.fec_refused = self.stats.fec_refused.saturating_add(1);
+            }
+        }
+        let held = u64::try_from(conn.quic.fec_held_bytes()).unwrap_or(u64::MAX);
+        let excess = conn.fec.granted().saturating_sub(held);
+        if excess > 0
+            && let Some(part) = conn.fec.split(excess)
+        {
+            self.budget.release(part);
         }
     }
 
@@ -4402,9 +4775,11 @@ impl<C: Classes, B: Budget<C::Class>, D: Directory<Role = C::Role>> Core<C, B, D
         }
     }
 
-    /// A peer opened a lane.
+    /// A peer opened a lane: its owner's, or its notes ([`crate::NOTES_LANE`]) beside them.
     fn lane_from(&mut self, conn: &mut Conn<C::Role>, stream: StreamId) {
-        let bound = usize::try_from(self.limits.lanes_per_peer).unwrap_or(usize::MAX);
+        let bound = usize::try_from(self.limits.lanes_per_peer)
+            .unwrap_or(usize::MAX)
+            .saturating_add(1);
         if conn.lanes_in.len() >= bound {
             self.stats.streams_refused = self.stats.streams_refused.saturating_add(1);
             let _ = conn
@@ -4457,6 +4832,7 @@ impl<C: Classes, B: Budget<C::Class>, D: Directory<Role = C::Role>> Core<C, B, D
         match state {
             Reading::Opener => {
                 let advanced = lane_opener(conn, at)?;
+                self.lane_named(conn, at)?;
                 // The lane named itself: held from now if its owner holds its peer's lane of that name.
                 let opened = conn
                     .lanes_in
@@ -4481,7 +4857,80 @@ impl<C: Classes, B: Budget<C::Class>, D: Directory<Role = C::Role>> Core<C, B, D
             Reading::Frame => self.lane_frame(conn, at),
             Reading::Skipping => self.lane_skip(conn, at),
             Reading::Reserving => self.lane_reserve(conn, at),
+            Reading::Notes => self.lane_notes(conn, at),
         }
+    }
+
+    /// One step of the peer's notes ([`NOTES_LANE`]): a stream id's first byte, or the rest its
+    /// length names, read; once whole, the exchange this side asked on that stream is vouched for,
+    /// its peer's owner at work on it. A stream with no such exchange, one given up and asked again
+    /// on a stream of its own, is passed over, so a late note revives no attempt given up.
+    fn lane_notes(&mut self, conn: &mut Conn<C::Role>, at: usize) -> Result<bool, Refusal> {
+        let lane = conn.lanes_in.get_mut(at).ok_or(Refusal::Lanes)?;
+        let whole = |first: u8| 1usize << (first >> 6);
+        let want = match lane.prefix.first() {
+            Some(&first) if lane.filled > 0 => whole(first).saturating_sub(lane.filled),
+            _ => 1,
+        };
+        let (got, end) = pull(&mut conn.quic, lane.stream, want, |bytes| {
+            let from = lane.filled;
+            if let Some(into) = lane.prefix.get_mut(from..from.saturating_add(bytes.len())) {
+                into.copy_from_slice(bytes);
+            }
+            lane.filled = from.saturating_add(bytes.len());
+        });
+        conn.window.consumed(length(got));
+        conn.delivered.add(0, length(got));
+        lane_ended(end)?;
+        if got == 0 {
+            return Ok(false);
+        }
+        let len = lane.prefix.first().map_or(1, |&first| whole(first));
+        if lane.filled < len {
+            return Ok(true);
+        }
+        lane.filled = 0;
+        let mut bytes = lane.prefix.get(..len).ok_or(Refusal::Corrupt)?;
+        let stream = StreamId::from(VarInt::decode(&mut bytes).map_err(|_| Refusal::Corrupt)?);
+        let now = self.now;
+        if let Some(id) = self.exchange_on(conn, stream)
+            && let Some(exchange) = self.exchanges.get_mut(id)
+            && exchange.opened
+            && !exchange.ended
+        {
+            exchange.vouched = Some(now);
+            self.stats.notes_heard = self.stats.notes_heard.saturating_add(1);
+        }
+        Ok(true)
+    }
+
+    /// Lane `at` of `conn`, once its opening named it, is within what a peer may open: one notes
+    /// lane ([`crate::NOTES_LANE`]), and its owner's lanes within `Limits::lanes_per_peer`.
+    fn lane_named(&self, conn: &Conn<C::Role>, at: usize) -> Result<(), Refusal> {
+        let Some(lane) = conn
+            .lanes_in
+            .get(at)
+            .filter(|lane| lane.state != Reading::Opener)
+        else {
+            return Ok(());
+        };
+        let notes = lane.lane == crate::NOTES_LANE;
+        let alike = conn
+            .lanes_in
+            .iter()
+            .filter(|other| {
+                other.state != Reading::Opener && (other.lane == crate::NOTES_LANE) == notes
+            })
+            .count();
+        let bound = if notes {
+            1
+        } else {
+            usize::try_from(self.limits.lanes_per_peer).unwrap_or(usize::MAX)
+        };
+        if alike > bound {
+            return Err(Refusal::Lanes);
+        }
+        Ok(())
     }
 
     /// Whether lane `at` of `conn` has seats for its next frame: one of its window, the core's
@@ -4723,7 +5172,11 @@ fn lane_opener<R>(conn: &mut Conn<R>, at: usize) -> Result<bool, Refusal> {
     }
     lane.lane = opened(lane.opener)?;
     lane.filled = 0;
-    lane.state = Reading::Prefix;
+    lane.state = if lane.lane == NOTES_LANE {
+        Reading::Notes
+    } else {
+        Reading::Prefix
+    };
     Ok(true)
 }
 

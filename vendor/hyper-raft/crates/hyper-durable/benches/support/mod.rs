@@ -323,6 +323,7 @@ fn settings(id: u64, apply_ahead: bool, quiet: Duration) -> Settings {
         },
         quiet,
         elections: hyper_raft::Elections::Suspicion,
+        disk: hyper_durable::Disk::Flushed,
     }
 }
 

@@ -2,8 +2,9 @@
 resolver = "3"
 members = ["crates/*"]
 # Turso (the conversation store's engine) is vendored with its own workspace: vendor/turso/UPSTREAM.md;
-# so are Quiver, Focal's bus, hyper-raft and vorpal (vendor/MANIFEST.toml), each a workspace of its own.
-exclude = ["vendor/turso", "vendor/quiver", "vendor/focal-bus", "vendor/hyper-raft", "vendor/vorpal", "bench/kilndb", "bench/http"]
+# so are Quiver, Focal's bus, hyper-raft, vorpal, aws-lc-rs and Mantle (vendor/MANIFEST.toml), each a
+# workspace of its own.
+exclude = ["vendor/turso", "vendor/quiver", "vendor/focal-bus", "vendor/hyper-raft", "vendor/vorpal", "vendor/aws-lc-rs", "vendor/mantle", "bench/kilndb", "bench/http"]
 
 [workspace.package]
 version = "0.2.0"
@@ -60,6 +61,8 @@ panic = "unwind"
 # What kiln vendors, each name pointed at its one copy (vendor/MANIFEST.toml; docs/vendoring.md,
 # "Products and [patch]"): Quiver, Focal's bus, and hyper-raft's shared crates, which kiln takes too.
 [patch.crates-io]
+# aws-lc-rs at the release kiln takes, with Mantle's changes (vendor/aws-lc-rs/UPSTREAM.md).
+aws-lc-rs = { path = "vendor/aws-lc-rs/aws-lc-rs" }
 focal-bus = { path = "vendor/focal-bus/crates/focal-bus" }
 focal-memory = { path = "vendor/focal-bus/crates/focal-memory" }
 hyper-block = { path = "vendor/hyper-raft/crates/hyper-block" }

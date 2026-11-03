@@ -426,6 +426,11 @@ pub fn limits(server: bool) -> Limits {
         keep_alive: Some(Duration::from_secs(2)),
         max_responses: 64,
         receive_chunks: usize::try_from(window).unwrap_or(usize::MAX) / RECEIVE_CHUNK + 1,
+        // As every connection asked before the choice was its owner's: decimated, as Google QUIC's
+        // receivers acknowledge (hyper-raft docs/transport.md §4k, §4ak).
+        acknowledgement: hyper_transport::Acknowledgement::Decimated,
+        // No forward erasure correction, as before it was offered (§4an).
+        fec_window: None,
     }
 }
 
@@ -1047,7 +1052,9 @@ fn on_event<B, D>(
         Event::Reply { exchange, .. } | Event::Refused { exchange, .. } => ep.end(exchange),
         // A lane that found a frame too full has room again: the loop flushes the outbox after
         // every event it handles.
-        Event::BodyReady { .. } | Event::Writable { .. } | Event::LaneRoom { .. } => {}
+        // A path's degrading and its progress again (hyper-raft docs/transport.md §4ai): kiln's
+        // links keep their own liveness, as before these were said.
+        Event::BodyReady { .. } | Event::Writable { .. } | Event::LaneRoom { .. } | Event::Degrading { .. } | Event::Progressing { .. } => {}
     }
 }
 

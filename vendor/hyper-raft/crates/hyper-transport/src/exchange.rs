@@ -291,8 +291,8 @@ pub(crate) struct Exchange<K> {
     /// out of the peer's credit, everything it sent acknowledged, and nothing written since — the
     /// peer holds its bytes and gives back no credit for them (focal's audit F38).
     pub(crate) unread_since: Option<(Instant, u64)>,
-    /// The owner's last read of the body wanted more than had arrived: only then is a period that
-    /// brought nothing evidence against the sender.
+    /// The owner's last read of the body wanted more than had arrived: only then, and until more
+    /// arrives for it (`ready_sent`), is a period that brought nothing evidence against the sender.
     pub(crate) starved: bool,
     /// The owner ended it: while only this side's trailer was left to send it stays, unseen by
     /// the owner, until the trailer is sent, and then goes; refused by its owner it goes at once.
@@ -305,4 +305,9 @@ pub(crate) struct Exchange<K> {
     /// of its own and none of the pool's, and is not one of its peer's open ones in the pool's
     /// accounts (`crate::pool`).
     pub(crate) parked: bool,
+    /// A peer's exchange whose owner said its work for it advanced since its connection's last note
+    /// ([`crate::Endpoint::working`]): the next note names it.
+    pub(crate) vouch: bool,
+    /// An exchange this side asked: when its peer last named it in a note, its owner at work on it.
+    pub(crate) vouched: Option<Instant>,
 }

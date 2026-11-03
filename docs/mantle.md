@@ -373,6 +373,29 @@ API, roadmap or trust model is Ada's to decide, marked **[Ada]** here and listed
   `try_update`), which matter to Mantle's own gate.
 - **Changes offered back** as branches are welcome, through Mantle's gates and CI like any change.
 
+As kiln vendored it (2026-11-01, CP-T10.2, on Ada's word: Mantle at the head of its main, kiln's
+one copy of hyper-raft kept, and no step back from kiln's aws-lc-rs):
+
+- **Mantle** at `17eb8032`, its main's head, at `vendor/mantle`, in `vendor/MANIFEST.toml` with
+  `vendor/mantle/UPSTREAM.md`: its crates, root manifest, `Cargo.lock`, `rust-toolchain.toml`,
+  settings and scripts. Left out: its `vendor/`, `docs/`, drawings and CI (`.github/`, `.kiln/`).
+- **hyper-raft:** the one copy is kiln's, `vendor/hyper-raft`, at `0856e05`: hyper-raft's main
+  (`22d5037`) merged with Mantle's line (`0a182ae`). Mantle's crates take it by path, the change kiln
+  records to Mantle's manifests (`vendor/patches/mantle/0001-…`), and Mantle's code states the two
+  limits main added as they were before them (`0002-…`). Quiver (`ba41732`) and Focal's bus
+  (`9aded7cd`) build on the same copy.
+- **aws-lc-rs:** 1.18.2, kiln's release, at `vendor/aws-lc-rs`, with Mantle's changes, which apply
+  unchanged on 1.18.2. kiln's root and Mantle's `[patch.crates-io]` both point at it.
+- **aws-lc-sys** stays crates.io's 0.46.0. Of Mantle's four changes to its 0.45.0, 0.46.0 holds the
+  RNDR and RDRAND retries. Mantle's jitter-entropy and system-library defaults are set as Mantle's
+  are, by `AWS_LC_SYS_NO_JITTER_ENTROPY=1` and `AWS_LC_SYS_USE_SYSTEM=0` in kiln's
+  `.cargo/config.toml` (Ada's word, 2026-11-03). Its fallback to the operating system's random
+  bytes, a change to AWS-LC's C, waits until `scripts/vendor.py` takes a crates.io package
+  (`vendor/aws-lc-rs/UPSTREAM.md`).
+- **Toolchain:** kiln builds Mantle's crates on its own (stable 1.99.1). Mantle's gate (`clippy
+  --workspace --all-targets --all-features -- -D warnings`) passes in kiln's copy on it.
+- `python3 scripts/vendor.py check` holds each copy to its upstream and its recorded changes.
+
 ### Order
 
 - R1, R2 and R3 are phase B; R4 is served with phase B. R5's keys are phase B ("the key authority
