@@ -317,8 +317,14 @@ the agent as a message with the failure excerpt (W20-R10's bundle) when its pers
 (**Auto-Fix**).
 
 **C3 Review comes back to the agent.** A comment on its change goes to it as a queued message with
-the file, the lines, the version and a link; it answers, amends and pushes a new version
-(review.md, Agents).
+the thread's id, the file, the lines, the version and commit they're on, who wrote it and their
+words quoted, and a link; it answers in the thread, amends and pushes a new version that names the
+threads it fixes (`threads`), and each thread then says which version fixed it (review.md,
+Agents; ci.md W26-R18). Another agent's comment reaches it only where the repository lets agents fix
+code from agents' feedback (off until someone who can land turns it on), saying why, at most three
+times a thread until a person speaks there; Ship's Hand off sends it every open thread at once. A
+draft stays a draft through its versions until the agent (`ready`) or its person (Ship's Ready)
+marks it ready, on kiln and on GitHub, GitLab and Bitbucket alike.
 
 **C4 Mission Control.** A finished agent with an open change shows **Review** on its row; landed
 shows as such.

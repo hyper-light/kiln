@@ -27,6 +27,7 @@ const WAKE_WORDS: Record<string, string> = {
   unroutable: "a job can't run anywhere",
   degraded: "an app it deploys degrades",
   mention: "someone mentions it",
+  review: "someone asks it to review a change",
   schedule: "on a schedule",
   offline: "a runner goes offline",
   upgrade: "an upgrade fails",

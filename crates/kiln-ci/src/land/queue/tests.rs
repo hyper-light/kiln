@@ -373,3 +373,16 @@ fn w28_r108_the_land_record() -> Result<(), serde_json::Error> {
     assert_eq!((sparse.changes, sparse.policy.queue.batch), (ids(&["D9"]), 1));
     Ok(())
 }
+
+/// docs/ci.md W26-R19: a repository on a host with no queue lands through kiln's queue, its host
+/// merging what kiln tested. Its route says so, and a tested change merges only at the head tested:
+/// a head that moved goes back to Review (where the trunk is, R102 decides, as for kiln's lands).
+#[test]
+fn w26_r19_a_host_merges_only_what_kiln_tested() {
+    assert_eq!(Route::of_host(None), Route::HostMerges);
+    assert_eq!(Route::of_host(Some("merge queue")), Route::Host { queue: "merge queue".into() });
+    assert_eq!(Route::HostMerges.name(), HOST_MERGES);
+    let head = "h".repeat(40);
+    assert_eq!(host_merge(&head, &head), HostMerge::Merge);
+    assert!(matches!(host_merge(&head, &"i".repeat(40)), HostMerge::Back { why } if why.contains("its head moved to iiiiiii") && why.contains("past what Review cleared")));
+}

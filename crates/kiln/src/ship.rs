@@ -215,7 +215,9 @@ struct Records {
     runs: Vec<RunRec>,
     legs: Vec<LegRec>,
     images: Vec<String>,
-    land: Option<(String, Option<String>)>,
+    /// The land queue's latest entry with this commit as its candidate: its state, why, and how many
+    /// entries are ahead of it in its component.
+    land: Option<(String, Option<String>, u32)>,
     own: Vec<DeployRec>,
     current: Vec<DeployRec>,
     releases: Vec<ReleaseRec>,
@@ -236,11 +238,16 @@ struct HandoffRec {
     what: String,
     to: String,
     version: Option<u32>,
+    /// Why kiln handed it, or held it (W26-R18); none for a person's.
+    why: Option<String>,
 }
 
 /// An open thread on a change: its kind, where it is, who opened it and its first words.
 #[derive(Debug, Clone, Default)]
 struct ThreadRec {
+    /// Its id, and the revision it was opened on (W26-R18: Hand off names each).
+    id: String,
+    version: u32,
     kind: String,
     file: Option<String>,
     line: Option<i64>,
@@ -292,15 +299,22 @@ struct ChangeRec {
     reviews: Vec<(String, String, i64, String, Option<u32>)>,
     /// (version, rebase only, at)
     pushes: Vec<(u32, bool, i64)>,
+    /// Its revisions that fix: an agent's fix or a suggestion applied, by why or by the thread
+    /// they answer (W26-R04, R18).
+    fixes: Vec<u32>,
     threads: Vec<ThreadRec>,
     replies: Vec<(String, i64)>,
-    /// The land queue's latest entry landing this change: its state and why.
-    queue: Option<(String, Option<String>)>,
+    /// The land queue's latest entry landing this change: its state, why, and how many entries are
+    /// ahead of it in its component (docs/ci.md W26-R19).
+    queue: Option<(String, Option<String>, u32)>,
     /// The conflicts its latest revision's replay onto where it lands left, each holding its gate
     /// until Commit resolution makes a revision of them (W26-R12).
     conflicts: Vec<kiln_ci::review::Conflict>,
     /// The Review lane group's marks, oldest first (W26-R14).
     marks: Vec<MarkRec>,
+    /// A host's pull request kiln opened for an agent (`agents.change`): that agent's session
+    /// (W26-R18 drafts). A kiln change names its agent as its author.
+    by_agent: Option<String>,
 }
 
 impl ChangeRec {
@@ -447,6 +461,9 @@ fn load_change(c: &rusqlite::Connection, repo_id: &str, sha: &str) -> anyhow::Re
             None if thread.is_some() => "fix",
             None => "push",
         };
+        if kind == "fix" {
+            ch.fixes.push(v);
+        }
         marks.push(MarkRec {
             id: format!("{id}:v{v}"),
             kind,
@@ -467,10 +484,12 @@ fn load_change(c: &rusqlite::Connection, repo_id: &str, sha: &str) -> anyhow::Re
         .collect::<Result<_, _>>()?;
     approval_marks(&mut marks, &id, &ch.reviewers, &ch.reviews);
     let mut st = c.prepare(
-        "SELECT t.kind, t.file, t.start_line, t.created_by, (SELECT c.body FROM review_comments c WHERE c.thread_id = t.id AND c.published = 1 ORDER BY c.created_at, c.rowid LIMIT 1)
+        "SELECT t.kind, t.file, t.start_line, t.created_by, (SELECT c.body FROM review_comments c WHERE c.thread_id = t.id AND c.published = 1 ORDER BY c.created_at, c.rowid LIMIT 1), t.id, t.version
          FROM review_threads t WHERE t.diff_id = ?1 AND t.state = 'open' AND EXISTS (SELECT 1 FROM review_comments c WHERE c.thread_id = t.id AND c.published = 1) ORDER BY t.created_at, t.id",
     )?;
-    ch.threads = st.query_map([&id], |r| Ok(ThreadRec { kind: r.get(0)?, file: r.get(1)?, line: r.get(2)?, by: r.get(3)?, said: r.get::<_, Option<String>>(4)?.unwrap_or_default() }))?.collect::<Result<_, _>>()?;
+    ch.threads = st
+        .query_map([&id], |r| Ok(ThreadRec { kind: r.get(0)?, file: r.get(1)?, line: r.get(2)?, by: r.get(3)?, said: r.get::<_, Option<String>>(4)?.unwrap_or_default(), id: r.get(5)?, version: r.get(6)? }))?
+        .collect::<Result<_, _>>()?;
     // Each thread's published comments, oldest first (the first is its opening one).
     let mut by_thread: HashMap<String, Vec<(String, String, i64)>> = HashMap::new();
     let mut st = c.prepare("SELECT c.thread_id, c.id, c.author, c.created_at FROM review_comments c JOIN review_threads t ON t.id = c.thread_id WHERE t.diff_id = ?1 AND c.published = 1 ORDER BY c.created_at, c.rowid")?;
@@ -561,9 +580,9 @@ fn load_change(c: &rusqlite::Connection, repo_id: &str, sha: &str) -> anyhow::Re
     ch.conflicts = st.query_map([&id], |r| Ok(kiln_ci::review::Conflict { file: r.get(0)?, line: r.get(1)?, taken: r.get(2)? }))?.collect::<Result<_, _>>()?;
     ch.queue = c
         .query_row(
-            "SELECT l.state, l.reason FROM land_queue l WHERE l.repo_id = ?1 AND EXISTS (SELECT 1 FROM json_each(CASE WHEN json_valid(l.diffs) THEN l.diffs ELSE '[]' END) j WHERE j.value = ?2) ORDER BY l.updated_at DESC, l.rowid DESC LIMIT 1",
+            "SELECT l.state, l.reason, MAX(COALESCE(l.position, 1) - 1, 0) FROM land_queue l WHERE l.repo_id = ?1 AND EXISTS (SELECT 1 FROM json_each(CASE WHEN json_valid(l.diffs) THEN l.diffs ELSE '[]' END) j WHERE j.value = ?2) ORDER BY l.updated_at DESC, l.rowid DESC LIMIT 1",
             params![repo_id, id],
-            |r| Ok((r.get(0)?, r.get(1)?)),
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
         )
         .optional()?;
     Ok(Some(ch))
@@ -621,6 +640,15 @@ fn load_pull(c: &rusqlite::Connection, repo_id: &str, host: &str, number: i64, n
     let asked: Vec<(String, i64)> = serde_json::from_str::<Vec<String>>(&requested).unwrap_or_default().into_iter().map(|r| (r, first_seen)).collect();
     approval_marks(&mut marks, &key, &asked, &reviews);
     marks.sort_by_key(|m| (m.at, mark_rank(m.kind)));
+    // The agent kiln opened it for, as its change record names it (agents.change, W26-R18).
+    let by_agent: Option<String> = c
+        .query_row(
+            "SELECT json_extract(v, '$.agent') FROM kv WHERE k LIKE 'agents/change/%' AND json_extract(v, '$.provider') = ?2 AND json_extract(v, '$.change') = ?3
+               AND json_extract(v, '$.repo') = (SELECT name FROM repos WHERE id = ?1) LIMIT 1",
+            params![repo_id, host, format!("#{number}")],
+            |r| r.get(0),
+        )
+        .optional()?;
     Ok(ChangeRec {
         name: format!("{}{number}", if host == "gitlab" { "!" } else { "#" }),
         kind: "request",
@@ -639,12 +667,24 @@ fn load_pull(c: &rusqlite::Connection, repo_id: &str, host: &str, number: i64, n
         reviewers: asked,
         reviews,
         pushes: heads.iter().map(|(k, _, t)| (*k, false, *t)).collect(),
+        // Its host keeps no why for a head, so none reads as a fix.
+        fixes: Vec::new(),
         threads,
         replies: Vec::new(),
-        queue: None,
+        // The entry that lands it, kiln's or its host's queue's (docs/ci.md W26-R19, W28-R109).
+        queue: c
+            .query_row(
+                "SELECT l.state, l.reason, MAX(COALESCE(l.position, 1) - 1, 0) FROM land_queue l WHERE l.repo_id = ?1 AND l.host IS NOT NULL
+                 AND EXISTS (SELECT 1 FROM json_each(CASE WHEN json_valid(l.host) THEN l.host ELSE '{}' END, '$.changes') j WHERE json_extract(j.value, '$.number') = ?2)
+                 ORDER BY l.updated_at DESC, l.rowid DESC LIMIT 1",
+                params![repo_id, number],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .optional()?,
         // A host's pull request is replayed on its host, not here.
         conflicts: Vec::new(),
         marks,
+        by_agent,
     })
 }
 
@@ -653,12 +693,17 @@ fn load_pull(c: &rusqlite::Connection, repo_id: &str, host: &str, number: i64, n
 /// version's head stands superseded; a change request's other commits, and an abandoned change's,
 /// carry none.
 /// The review of the change `ch` on its commit `sha`; `handed`, its threads or conflicts handed to
-/// its author's agent at this revision (W26-R18), which reads fixing while the revision is live.
-fn review_of(ch: &ChangeRec, sha: &str, handed: Option<&HandoffRec>) -> Option<Review> {
+/// its author's agent at this revision (W26-R18), which reads fixing while the revision is live;
+/// `held`, agents' feedback kiln kept from its ended agent at this revision, whose why the review
+/// says.
+fn review_of(ch: &ChangeRec, sha: &str, handed: Option<&HandoffRec>, held: Option<&HandoffRec>) -> Option<Review> {
     if !ch.head || ch.state == "abandoned" {
         return None;
     }
+    // Handed off at this revision and replaced by a fix since (W26-R18): which version fixed it.
+    let fixed_in = handed.filter(|_| sha != ch.tip()).and_then(|_| ch.fixes.iter().copied().filter(|v| *v > ch.n).min()).map(|v| format!("v{v}"));
     let handed = handed.filter(|_| sha == ch.tip());
+    let held = held.filter(|_| sha == ch.tip()).and_then(|h| h.why.clone());
     let mut ev: Vec<(i64, u8, turn::Event)> = Vec::new();
     ev.extend(ch.reviewers.iter().map(|(w, at)| (*at, 0, turn::Event::Asked(w.clone()))));
     ev.extend(ch.pushes.iter().filter(|(v, _, _)| *v > 1).map(|(_, rebase_only, at)| (*at, 1, turn::Event::Pushed { rebase_only: *rebase_only })));
@@ -710,6 +755,12 @@ fn review_of(ch: &ChangeRec, sha: &str, handed: Option<&HandoffRec>) -> Option<R
         Standing::Approved => ReviewState::Approved,
     };
     let said = |t: &ThreadRec| format!("{}: {}", shown(&t.by), first_words(&t.said));
+    // What its agent was handed: the file in conflict, or whose thread (how many, when several).
+    let handed_about = || match (handed.map(|h| h.what.as_str()), ch.threads.as_slice()) {
+        (Some("conflicts"), _) => ch.conflicts.first().map(|k| kiln_ci::review::place(Some(&k.file), k.line)).unwrap_or_else(|| "its conflicts".to_string()),
+        (_, [one]) => format!("{}'s thread", shown(&one.by)),
+        (_, many) => format!("{} threads", many.len()),
+    };
     let about = match state {
         ReviewState::Blocked => ch.threads.iter().rev().find(|t| Kind::read(&t.kind) == Kind::Blocking).map(|t| match (&t.file, t.line) {
             (Some(f), Some(l)) => format!("{}:{l}", f.rsplit('/').next().unwrap_or(f)),
@@ -719,18 +770,17 @@ fn review_of(ch: &ChangeRec, sha: &str, handed: Option<&HandoffRec>) -> Option<R
         ReviewState::Changes => ch.reviews.iter().rev().find(|r| r.1 == "request_changes").map(|r| first_words(&r.3)),
         ReviewState::Conflict => ch.conflicts.first().map(|k| kiln_ci::review::place(Some(&k.file), k.line)),
         ReviewState::Requested => ch.threads.last().map(said),
-        // What its agent was handed: the file in conflict, or whose thread (how many, when several).
-        ReviewState::Fixing => Some(match (handed.map(|h| h.what.as_str()), ch.threads.as_slice()) {
-            (Some("conflicts"), _) => ch.conflicts.first().map(|k| kiln_ci::review::place(Some(&k.file), k.line)).unwrap_or_else(|| "its conflicts".to_string()),
-            (_, [one]) => format!("{}'s thread", shown(&one.by)),
-            (_, many) => format!("{} threads", many.len()),
-        }),
+        ReviewState::Fixing => Some(handed_about()),
+        // A draft stays a draft (W26-R02), and says who is at work on it (W26-AC10).
+        ReviewState::Draft => handed.map(|h| format!("{} fixing · {}", h.to, handed_about())),
         _ => None,
     }
     .unwrap_or_default();
+    // What kiln held, and why: the fix waits for a person (W26-R18).
+    let about = held.filter(|_| state != ReviewState::Fixing).unwrap_or(about);
     let tip = ch.tip();
     let superseded_by = (sha != tip).then(|| if ch.n < ch.latest { format!("v{}", ch.latest) } else { short(tip) });
-    Some(Review { state, turn: whose, author, open, conflicts: gate.conflicts, fixing: handed.map(|h| h.to.clone()), about, superseded_by })
+    Some(Review { state, turn: whose, author, open, conflicts: gate.conflicts, fixing: handed.map(|h| h.to.clone()), about, superseded_by, fixed_in })
 }
 
 fn short(sha: &str) -> String {
@@ -901,7 +951,7 @@ fn load_with(c: &rusqlite::Connection, ctx: &RepoCtx, sha: &str, first_row: i64)
     rec.images = st.query_map(params![repo_id, sha], |r| r.get(0))?.collect::<Result<_, _>>()?;
 
     rec.land = c
-        .query_row("SELECT state, reason FROM land_queue WHERE repo_id = ?1 AND candidate = ?2 ORDER BY updated_at DESC LIMIT 1", params![repo_id, sha], |r| Ok((r.get(0)?, r.get(1)?)))
+        .query_row("SELECT state, reason, MAX(COALESCE(position, 1) - 1, 0) FROM land_queue WHERE repo_id = ?1 AND candidate = ?2 ORDER BY updated_at DESC LIMIT 1", params![repo_id, sha], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
         .optional()?;
 
     // This commit's latest deployment in each environment; what each runs now is the repository's.
@@ -929,8 +979,8 @@ fn load_with(c: &rusqlite::Connection, ctx: &RepoCtx, sha: &str, first_row: i64)
     let mut st = c.prepare("SELECT tag_name FROM ci_releases WHERE repo_id = ?1 AND target_commitish = ?2 ORDER BY id")?;
     rec.tags = st.query_map(params![repo_id, sha], |r| r.get(0))?.collect::<Result<_, _>>()?;
     rec.change = load_change(c, &repo_id, &sha)?;
-    let mut st = c.prepare("SELECT what, to_name, version FROM ship_handoffs WHERE repo_id = ?1 AND sha = ?2 ORDER BY at, id")?;
-    rec.handoffs = st.query_map(params![repo_id, sha], |r| Ok(HandoffRec { what: r.get(0)?, to: r.get(1)?, version: r.get(2)? }))?.collect::<Result<_, _>>()?;
+    let mut st = c.prepare("SELECT what, to_name, version, why FROM ship_handoffs WHERE repo_id = ?1 AND sha = ?2 ORDER BY at, id")?;
+    rec.handoffs = st.query_map(params![repo_id, sha], |r| Ok(HandoffRec { what: r.get(0)?, to: r.get(1)?, version: r.get(2)?, why: r.get(3)? }))?.collect::<Result<_, _>>()?;
     Ok(rec)
 }
 
@@ -947,10 +997,13 @@ fn journey_of(rec: &Records, runners: &[RunnerSeen], now: i64) -> Journey {
     };
     // A change's commit is in the queue when an entry lands its change, and not landed until the change is.
     let queue = rec.land.as_ref().or(change.and_then(|ch| ch.queue.as_ref()));
-    let land = match queue.map(|(s, why)| (s.as_str(), why)) {
-        Some(("testing", _)) => Land::Testing,
-        Some(("queued", _)) => Land::Queued { ahead: 0 },
-        Some(("ejected", why)) => Land::Ejected { why: why.clone().unwrap_or_default() },
+    let land = match queue.map(|(s, why, ahead)| (s.as_str(), why.clone().unwrap_or_default(), *ahead)) {
+        Some(("testing", ..)) => Land::Testing,
+        Some(("queued", _, ahead)) => Land::Queued { ahead },
+        Some(("ejected", why, _)) => Land::Ejected { why },
+        // Waiting on Review in the queue, or back with it on a conflict (docs/ci.md W26-R19, W28-R107).
+        Some(("held", why, _)) => Land::Held { why },
+        Some(("returned", why, _)) => Land::Returned { why },
         _ if change.is_some_and(|ch| !ch.is_landed()) => Land::NotYet,
         _ => Land::Landed,
     };
@@ -1081,8 +1134,13 @@ fn journey_of(rec: &Records, runners: &[RunnerSeen], now: i64) -> Journey {
 
     // Handed off (W26-R18): its failure to whoever took it; its review to its author's agent, at this revision.
     let handled_by = rec.handoffs.iter().rev().find(|h| h.what == "checks").map(|h| h.to.clone());
-    let handed = change.and_then(|ch| rec.handoffs.iter().rev().find(|h| h.what != "checks" && h.version.is_none_or(|v| v == ch.n)));
-    let review = change.and_then(|ch| review_of(ch, &rec.sha, handed));
+    // The newest at this revision counts: kiln holding agents' feedback for a person, or a hand-off.
+    let live = change.and_then(|ch| rec.handoffs.iter().rev().find(|h| h.what != "checks" && h.version.is_none_or(|v| v == ch.n)));
+    let (handed, held) = match live {
+        Some(h) if h.what == HELD => (None, Some(h)),
+        h => (h, None),
+    };
+    let review = change.and_then(|ch| review_of(ch, &rec.sha, handed, held));
     Journey { author, land, checks, build, staging, production, replant, in_production, handled_by, fixed_by: None, review }
 }
 
@@ -1140,6 +1198,15 @@ fn actions(rec: &Records, j: &Journey, yours: bool) -> Vec<Value> {
             out.push(hand());
         }
         out.push(act("review", "GET", format!("/api/diffs/{}", ch.name), Value::Null));
+    }
+    // An agent's draft, marked ready for review by its person or one who may land (W26-R18): a draft
+    // has no turn, so it's on the row for whoever looks, and the endpoint says who may.
+    if let (Some(ch), Some(r)) = (rec.change.as_ref(), j.review.as_ref())
+        && r.superseded_by.is_none()
+        && r.state == ReviewState::Draft
+        && (authors_agent(ch).is_some() || ch.by_agent.is_some())
+    {
+        out.push(act("ready", "POST", "/api/ship/ready".to_string(), json!({ "repo": rec.repo, "sha": rec.sha })));
     }
     out
 }
@@ -2124,6 +2191,47 @@ async fn jobs_in(hub: &std::sync::Arc<Hub>, caller: &crate::authz::Caller, body:
 /// Failure lines the agent a failure is handed to gets with it.
 const HANDED_LINES: usize = 40;
 
+/// `POST /api/ship/ready` `{repo, sha}`: the row's Ready (W26-R18, drafts): an agent's draft marked
+/// ready for review by its agent's person (the change's `for`) or one who may land on the
+/// repository (`diffs.land`): kiln's own as kiln does it for them, a host's through its API
+/// (`GitHost::ready_change`, docs/ci.md W29-R12). The agent's change then says it's no draft.
+pub async fn ready(hub: &std::sync::Arc<Hub>, caller: &crate::authz::Caller, body: &Value) -> Result<Response, Fail> {
+    ready_in(hub, caller, body).await.map(|v| srv::json(StatusCode::OK, &v))
+}
+
+async fn ready_in(hub: &std::sync::Arc<Hub>, caller: &crate::authz::Caller, body: &Value) -> Result<Value, Fail> {
+    let field = |k: &str| body.get(k).and_then(Value::as_str).map(str::trim).filter(|s| !s.is_empty()).map(str::to_owned);
+    let (Some(repo), Some(sha)) = (field("repo"), field("sha")) else {
+        return Err((StatusCode::BAD_REQUEST, "`repo` and `sha`: the draft to mark ready".to_string()));
+    };
+    let (r, s, deploys) = (repo.clone(), sha.clone(), cd_deploys());
+    let rec = hub.store.call(move |c| load(c, &r, &s, &deploys)).await.map_err(internal)?.ok_or_else(|| (StatusCode::NOT_FOUND, "no such commit".to_string()))?;
+    let j = journey_of(&rec, &runners_seen(hub).await, crate::util::now_ms());
+    let draft = j.review.as_ref().is_some_and(|r| r.superseded_by.is_none() && r.state == ReviewState::Draft);
+    let Some(ch) = rec.change.as_ref().filter(|_| draft) else {
+        return Err((StatusCode::CONFLICT, format!("{} isn't a draft", rec.change.as_ref().map_or_else(|| short(&rec.sha), |ch| ch.name.clone()))));
+    };
+    let Some(agent) = authors_agent(ch).map(str::to_owned).or_else(|| ch.by_agent.clone()) else {
+        return Err((StatusCode::CONFLICT, format!("{} is its author's own draft: they mark it ready", ch.name)));
+    };
+    let person = ch.author_for.clone().filter(|p| !p.is_empty());
+    let theirs = person.as_deref().is_some_and(|p| p.eq_ignore_ascii_case(&crate::ci::diffs::author_of(&caller.name, Some(caller.kind)).0));
+    if !theirs && !caller.can("diffs.land", &crate::authz::Scope::Repo { repo: repo.clone() }) {
+        let whose = person.as_deref().map(|p| format!(" ({})", shown(p))).unwrap_or_default();
+        return Err((StatusCode::FORBIDDEN, format!("marking {} ready is for its agent's person{whose} or one who can land on {repo} (diffs.land)", ch.name)));
+    }
+    let repos = hub.store.repos().await.map_err(internal)?;
+    let target = repos.iter().find(|x| x.name == repo).ok_or_else(|| (StatusCode::NOT_FOUND, format!("no repository {repo}")))?;
+    let host = match ch.host.as_str() {
+        "kiln" => crate::githost::GitHost::Kiln,
+        _ => crate::githost::for_repo(hub, target).await.ok_or_else(|| (StatusCode::CONFLICT, format!("kiln can't reach {repo}'s host to mark {} ready", ch.name)))?,
+    };
+    crate::workspace::change::ready_where_it_is(hub, target, &host, &ch.name).await?;
+    crate::workspace::change::readied(hub, &agent, &repo, &ch.name).await;
+    hub.store.audit(caller.name.clone(), "ship.ready".into(), format!("{repo} {} marked ready for review", ch.name)).await;
+    Ok(json!({ "ready": { "change": ch.name } }))
+}
+
 /// `POST /api/ship/hand-off` `{repo, sha}`: the row's Hand off, as review-ship.html draws it
 /// (W26-R18, R02). What the commit has open goes to one agent. Its change's author's agent, while
 /// it runs, gets the change's conflicts, its open threads and its failed checks in one message, the
@@ -2259,6 +2367,8 @@ fn handed_text(rec: &Records, ch: &ChangeRec, conflicts: &[kiln_ci::review::Conf
         text.push_str(&format!("\n\nIt conflicts with where it lands: {}. Resolve them in a new version (agents.change).", places.join(", ")));
     }
     if !threads.is_empty() {
+        // Thread by thread (W26-R18): each one's id, where it is and the revision it's on, and
+        // whether an agent opened it (agents' feedback a person sends on).
         text.push_str(&format!("\n\nIts open threads ({}):", threads.len()));
         for t in threads {
             let place = match (&t.file, t.line) {
@@ -2266,9 +2376,15 @@ fn handed_text(rec: &Records, ch: &ChangeRec, conflicts: &[kiln_ci::review::Conf
                 (Some(f), None) => f.clone(),
                 _ => "the conversation".to_string(),
             };
-            text.push_str(&format!("\n- {place} ({}), {}: {}", t.kind, shown(&t.by), first_words(&t.said)));
+            let agents = if t.by.starts_with("agent:") { " (an agent's)" } else { "" };
+            text.push_str(&format!("\n- thread {}, {place} on version {} ({}), {}{agents}: {}", t.id, t.version, t.kind, shown(&t.by), first_words(&t.said)));
         }
-        text.push_str(&format!("\n\nAnswer each in its thread (ci.diffs.threads {{\"diff\": \"{}\"}} lists them, ci.diffs.reply answers one) and make what they ask in a new version (agents.change).", ch.name));
+        let ids: Vec<String> = threads.iter().map(|t| format!("\"{}\"", t.id)).collect();
+        text.push_str(&format!(
+            "\n\nAnswer each in its thread: ci.diffs.reply {{\"diff\": \"{}\", \"thread\": <its id>, \"body\": …}}. Make what they ask in a new version that fixes them: agents.change {{\"threads\": [{}]}}.",
+            ch.name,
+            ids.join(", ")
+        ));
     }
     if let Some((leg, excerpt)) = failed {
         let run_of = |l: &LegRec| rec.runs.iter().find(|r| r.id == l.run_id).map(|r| r.pipeline.as_str()).unwrap_or_default();
@@ -2283,6 +2399,32 @@ fn handed_text(rec: &Records, ch: &ChangeRec, conflicts: &[kiln_ci::review::Conf
     }
     text.push_str(&format!(" It's at {base}/diffs/{}", ch.name));
     text
+}
+
+/// What kiln keeps, as a hand-off's `what`, when it holds agents' feedback for a person (W26-R18).
+pub const HELD: &str = "held";
+
+/// What kiln itself did with agents' feedback on a change (W26-R18), kept as Ship reads hand-offs:
+/// at revision `version` of the change, its commit `sha` in repository `repo` (its name or id), the change's
+/// threads handed to agent `agent` (`to`, its name; `what` `threads`), which reads fixing until the
+/// next revision, or held for a person (`what` [`HELD`]), which the item says; `why`, in words.
+/// Audited, as kiln's own doing.
+#[allow(clippy::too_many_arguments)]
+pub async fn kiln_kept(hub: &Hub, repo: &str, sha: &str, version: u32, what: &str, to: &str, agent: &str, why: &str) -> anyhow::Result<()> {
+    let (repo2, sha, what, to, agent, why2, at) = (repo.to_owned(), sha.to_owned(), what.to_owned(), to.to_owned(), agent.to_owned(), why.to_owned(), crate::util::now_unix());
+    let audit = format!("{repo}@{} {what} to {to}: {why}", short(&sha));
+    hub.store
+        .call(move |c| {
+            let repo_id: String = c.query_row("SELECT id FROM repos WHERE name = ?1 OR id = ?1", [&repo2], |r| r.get(0))?;
+            c.execute(
+                "INSERT INTO ship_handoffs (repo_id, sha, what, to_name, agent, incident, version, by, at, why) VALUES (?1, ?2, ?3, ?4, ?5, NULL, ?6, 'kiln', ?7, ?8)",
+                params![repo_id, sha, what, to, agent, version, at, why2],
+            )?;
+            Ok(())
+        })
+        .await?;
+    hub.store.audit("kiln".into(), "ship.hand_off".into(), audit).await;
+    Ok(())
 }
 
 /// Keeps a Hand off of `rec`'s commit, one row for each of `what` (W26-R18): to whom (`to`, its
@@ -3262,6 +3404,36 @@ mod tests {
         })
     }
 
+    /// W26-AC10: what kiln did with agents' feedback, as the item reads it. Held for a person (its
+    /// agent ended), the review says why at that revision, and the item doesn't read fixing; handed
+    /// by kiln after that, the newest counts and it reads the agent fixing.
+    #[test]
+    fn w26_ac10_agents_feedback_kiln_held_says_why_and_kilns_hand_off_reads_fixing() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let store = crate::store::Store::open(&dir.path().join("kiln.db"))?;
+        crate::rt::block_on(async move {
+            let sql = fixture() + &d41("agent:matrix");
+            store.call(move |c| Ok(c.execute_batch(&sql)?)).await?;
+            let now = NOW_S * 1000;
+            let sam: HashSet<String> = ["user:sam".to_string()].into();
+            let page = || {
+                let (store, sam) = (store.clone(), sam.clone());
+                async move { list_in(&store, &HashMap::new(), None, Some(&sam), runners(), &[], now).await.map_err(|(_, m)| anyhow::anyhow!(m)) }
+            };
+            let sql = format!("INSERT INTO ship_handoffs (repo_id, sha, what, to_name, agent, incident, version, by, at, why) VALUES ('kiln', '{D41}', 'held', 'Matrix agent', 'matrix', NULL, 1, 'kiln', {NOW_S}, 'The fix waits for a person to start or resume Matrix agent');");
+            store.call(move |c| Ok(c.execute_batch(&sql)?)).await?;
+            assert_eq!(stand_of(&page().await?, "4141414"), row("needs_you", "The fix waits for a person to start or resume Matrix agent · 1 thread", &["hand_off", "review"]));
+            let sql = format!("INSERT INTO ship_handoffs (repo_id, sha, what, to_name, agent, incident, version, by, at, why) VALUES ('kiln', '{D41}', 'threads', 'Matrix agent', 'matrix', NULL, 1, 'kiln', {}, 'kiln/kiln lets agents fix code from agents'' feedback');", NOW_S + 1);
+            store.call(move |c| Ok(c.execute_batch(&sql)?)).await?;
+            assert_eq!(stand_of(&page().await?, "4141414"), row("checking", "Matrix agent fixing · kim's thread", &[]));
+            // A draft stays a draft (W26-R02), naming who is at work on it.
+            store.call(|c| Ok(c.execute("UPDATE diffs SET state = 'draft' WHERE id = 'd41'", []).map(|_| ())?)).await?;
+            let (stand, line, _) = stand_of(&page().await?, "4141414");
+            assert_eq!((stand.as_str(), line.as_str()), ("waiting", "Draft · Matrix agent fixing · kim's thread"));
+            Ok(())
+        })
+    }
+
     /// Who made each commit, from the one place Ship reads it (made_by, W26-R18; Chain of Ownership
     /// fills it for every commit in time): an agent's change says its agent and the person it acts
     /// for; a person's change, its person; a lone commit, nothing yet (git's author name isn't a
@@ -3433,7 +3605,11 @@ mod tests {
             let base = hub.cfg.server.public_url.trim_end_matches('/').to_owned();
             let told = handed_text(&rec, &ch, &ch.conflicts, &ch.threads, None, &base, &owner.name);
             anyhow::ensure!(
-                told.contains("your change D41 (version 1, commit 4141414)") && told.contains("- crates/kiln-ci/src/plan/matrix.rs:42 (question), kim: empty matrix meant?") && told.contains("ci.diffs.reply") && told.ends_with("/diffs/D41"),
+                told.contains("your change D41 (version 1, commit 4141414)")
+                    && told.contains("- thread th1, crates/kiln-ci/src/plan/matrix.rs:42 on version 1 (question), kim: empty matrix meant?")
+                    && told.contains("ci.diffs.reply")
+                    && told.contains("agents.change {\"threads\": [\"th1\"]}")
+                    && told.ends_with("/diffs/D41"),
                 "{told}"
             );
             let handed = hand_off_in(&hub, &owner, &body).await.map_err(|(c, m)| anyhow::anyhow!("{c}: {m}"))?;
@@ -3447,7 +3623,7 @@ mod tests {
                 }
                 crate::rt::sleep(std::time::Duration::from_millis(20)).await;
             }
-            anyhow::ensure!(got.contains("your change D41 (version 1, commit 4141414)") && got.contains("matrix.rs:42 (question), kim: empty matrix meant?"), "it heard: {got}");
+            anyhow::ensure!(got.contains("your change D41 (version 1, commit 4141414)") && got.contains("matrix.rs:42 on version 1 (question), kim: empty matrix meant?"), "it heard: {got}");
             let page = list_in(&hub.store, &HashMap::new(), None, None, runners(), &[], NOW_S * 1000).await.map_err(|(_, m)| anyhow::anyhow!(m))?;
             let (stand, line, _) = stand_of(&page, "4141414");
             anyhow::ensure!(stand == "checking" && line.ends_with("fixing · kim's thread"), "{stand}: {line}");
@@ -3464,6 +3640,137 @@ mod tests {
             hub.store.call(|c| Ok(c.execute("DELETE FROM ship_handoffs", []).map(|_| ())?)).await?;
             let why = hand_off_in(&hub, &owner, &body).await.err().map(|(c, m)| (c.as_u16(), m)).unwrap_or_default();
             anyhow::ensure!(why.0 == 409 && why.1.contains("D41's agent isn't running now"), "{why:?}");
+            Ok(())
+        })
+    }
+
+    /// W26-R18, Hand off thread by thread, on a stacked diff (D41), a branch change request (CR13)
+    /// and a draft one (CR14), each its author's agent's and each with two open threads, kim's and
+    /// a review agent's. Handed off, its agent is told each thread's id, place and revision (oldest
+    /// first, then by id), the agent's marked as an agent's, and how to answer them; its row reads that agent fixing (a
+    /// draft stays a draft, W26-R02). Once the agent's fix comes as v2, the handed revision's row
+    /// says it was fixed in v2.
+    #[cfg(unix)]
+    #[test]
+    fn w26_r18_hand_off_names_each_thread_marks_agents_and_says_fixed_in() -> anyhow::Result<()> {
+        use std::os::unix::fs::PermissionsExt;
+        within(async {
+            let hub = crate::hub::tests::scratch_hub_with(|c| c.terminal.enabled = true).await?;
+            let h = std::sync::Arc::clone(&hub);
+            crate::rt::spawn(async move {
+                let _ = crate::harness::registry::Registry::run_local(h).await;
+            });
+            // (diff id, number, kind, state, branch, its v1 commit, its v2 commit, its name)
+            let changes = [
+                ("d41", 41, "diff", "needs-review", "NULL", "4141414aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "4242424aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "D41"),
+                ("cr13", 13, "change_request", "needs-review", "'b13'", "5151515aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "5252525aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "CR13"),
+                ("cr14", 14, "change_request", "draft", "'b14'", "6161616aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "6262626aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "CR14"),
+            ];
+            // Each change's agent, which stays up and says nothing, keeping what it's given: it never
+            // ends the turn a hand-off starts, so one agent would be sent only the first.
+            let dir = tempfile::tempdir()?;
+            let mut agents = Vec::new();
+            for (.., name) in &changes {
+                let (program, heard) = (dir.path().join(format!("quiet-claude-{name}")), dir.path().join(format!("heard-{name}.jsonl")));
+                std::fs::write(&program, format!("#!/bin/sh\nexec cat >> '{}'\n", heard.display()))?;
+                std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o755))?;
+                let spec = crate::harness::session::Spec { kind: "claude".into(), cwd: Some(dir.path().to_string_lossy().into_owned()), program: Some(program.to_string_lossy().into_owned()), ..Default::default() };
+                let agent = hub.harness.open(&hub, "local", spec, 1).await.map_err(|e| anyhow::anyhow!("{e:#}"))?.into_iter().next().map(|i| i.id).ok_or_else(|| anyhow::anyhow!("nothing opened"))?;
+                agents.push((agent, heard));
+            }
+            let t = NOW_S - 600;
+            let mut sql = fixture();
+            for ((id, n, kind, state, branch, v1, _, _), (agent, _)) in changes.iter().zip(&agents) {
+                sql.push_str(&format!(
+                    "INSERT INTO diffs (id, repo_id, number, kind, title, author, author_kind, author_for, state, trunk, branch, created_at, updated_at) VALUES ('{id}', 'kiln', {n}, '{kind}', 'legs {n}', 'agent:{agent}', 'agent', 'user:sam', '{state}', 'main', {branch}, {t}, {t});
+                     INSERT INTO diff_versions (diff_id, n, commit_sha, parent, base, message, pushed_by, created_at) VALUES ('{id}', 1, '{v1}', 'p', 'b', 'legs {n}', 'agent:{agent}', {t});
+                     INSERT INTO review_threads (id, diff_id, version, file, start_line, state, created_by, created_at, kind) VALUES ('{id}k', '{id}', 1, 'src/a.rs', 3, 'open', 'user:kim', {t}, 'question'), ('{id}a', '{id}', 1, 'src/a.rs', 9, 'open', 'agent:review@box-a', {t}, 'issue');
+                     INSERT INTO review_comments (id, thread_id, author, body, created_at, updated_at, published) VALUES ('{id}kc', '{id}k', 'user:kim', 'why three?', {t}, {t}, 1), ('{id}ac', '{id}a', 'agent:review@box-a', 'an empty matrix should mean no legs', {t}, {t}, 1);"
+                ));
+            }
+            hub.store.call(move |c| Ok(c.execute_batch(&sql)?)).await?;
+            let owner = crate::authz::Caller::owner();
+            let page = || {
+                let store = hub.store.clone();
+                async move { list_in(&store, &HashMap::new(), None, None, runners(), &[], NOW_S * 1000).await.map_err(|(_, m)| anyhow::anyhow!(m)) }
+            };
+            for ((id, _, _, state, _, v1, _, name), (_, heard)) in changes.iter().zip(&agents) {
+                let handed = hand_off_in(&hub, &owner, &json!({ "repo": "hyper-light/kiln", "sha": v1 })).await.map_err(|(c, m)| anyhow::anyhow!("{name}: {c}: {m}"))?;
+                anyhow::ensure!(handed.pointer("/handed/what") == Some(&json!(["threads"])), "{name}: {handed}");
+                let mut got = String::new();
+                for _ in 0..250 {
+                    got = std::fs::read_to_string(heard).unwrap_or_default();
+                    if got.contains(&format!("your change {name} (version 1")) {
+                        break;
+                    }
+                    crate::rt::sleep(std::time::Duration::from_millis(20)).await;
+                }
+                anyhow::ensure!(
+                    got.contains(&format!("- thread {id}k, src/a.rs:3 on version 1 (question), kim: why three?"))
+                        && got.contains(&format!("- thread {id}a, src/a.rs:9 on version 1 (issue), "))
+                        && got.contains("(an agent's): an empty matrix should mean no legs")
+                        && got.contains(&format!("agents.change {{\\\"threads\\\": [\\\"{id}a\\\", \\\"{id}k\\\"]}}")),
+                    "{name}: each thread, the agent's marked, and how to answer them: {got}"
+                );
+                let (stand, line, _) = stand_of(&page().await?, v1.get(..7).unwrap_or_default());
+                let (want, start) = if *state == "draft" { ("waiting", "Draft · ") } else { ("checking", "") };
+                anyhow::ensure!(stand == want && line.starts_with(start) && line.ends_with(" fixing · 2 threads"), "{name} reads its agent fixing: {stand}: {line}");
+            }
+            // The agents' fixes come, each v2 answering both threads.
+            let mut sql = String::new();
+            for ((id, _, _, _, _, _, v2, _), (agent, _)) in changes.iter().zip(&agents) {
+                sql.push_str(&format!(
+                    "INSERT INTO diff_versions (diff_id, n, commit_sha, parent, base, message, pushed_by, created_at, why, thread, note) VALUES ('{id}', 2, '{v2}', 'p', 'b', 'no legs', 'agent:{agent}', {}, 'agent''s fix', '{id}k', 'answers {id}k, {id}a');",
+                    t + 60
+                ));
+            }
+            hub.store.call(move |c| Ok(c.execute_batch(&sql)?)).await?;
+            let after = page().await?;
+            for (_, _, _, _, _, v1, _, name) in &changes {
+                let (stand, line, _) = stand_of(&after, v1.get(..7).unwrap_or_default());
+                anyhow::ensure!((stand.as_str(), line.as_str()) == ("superseded", "Fixed in v2"), "{name}'s handed revision says which version fixed it: {stand}: {line}");
+            }
+            Ok(())
+        })
+    }
+
+    /// W26-R18, drafts (Ada, 2026-11-01): the Matrix agent's draft change request, made for sam,
+    /// offers Ready on its row. lee, neither its person nor able to land, is refused, saying why.
+    /// sam's Ready marks it ready for review: the row reads its review state with no Ready, and the
+    /// agent's change says it's no draft. Asked again, it's no draft to mark.
+    #[test]
+    fn w26_r18_an_agents_draft_is_marked_ready_from_ship_by_its_person() -> anyhow::Result<()> {
+        within(async {
+            const CR15: &str = "5151515aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+            let hub = crate::hub::tests::scratch_hub().await?;
+            let t = NOW_S - 600;
+            let sql = fixture()
+                + &format!(
+                    "INSERT INTO diffs (id, repo_id, number, kind, title, author, author_kind, author_for, state, trunk, branch, created_at, updated_at) VALUES ('cr15', 'kiln', 15, 'change_request', 'cap a share', 'agent:matrix-session', 'agent', 'user:sam', 'draft', 'main', 'b15', {t}, {t});
+                     INSERT INTO diff_versions (diff_id, n, commit_sha, parent, base, message, pushed_by, created_at) VALUES ('cr15', 1, '{CR15}', 'p', 'b', 'cap a share', 'agent:matrix-session', {t});"
+                );
+            hub.store.call(move |c| Ok(c.execute_batch(&sql)?)).await?;
+            let record = crate::workspace::change::Record { agent: "matrix-session".into(), repo: Some("hyper-light/kiln".into()), provider: "kiln".into(), change: Some("CR15".into()), review: Some("draft".into()), draft: Some(true), ..Default::default() };
+            crate::workspace::change::save(&hub, &record).await;
+            let page = || {
+                let store = hub.store.clone();
+                async move { list_in(&store, &HashMap::new(), None, None, runners(), &[], NOW_S * 1000).await.map_err(|(_, m)| anyhow::anyhow!(m)) }
+            };
+            let (stand, line, actions) = stand_of(&page().await?, "5151515");
+            anyhow::ensure!(line.starts_with("Draft") && actions.iter().any(|a| a == "ready"), "the draft offers Ready: {stand}: {line}: {actions:?}");
+            let body = json!({ "repo": "hyper-light/kiln", "sha": CR15 });
+            let refused = |r: Result<Value, Fail>| r.err().unwrap_or((StatusCode::OK, String::new()));
+            let (code, why) = refused(ready_in(&hub, &crate::authz::Caller::peer("user:lee", "viewer"), &body).await);
+            anyhow::ensure!(code == StatusCode::FORBIDDEN && why.contains("is for its agent's person (sam) or one who can land on hyper-light/kiln"), "lee: {code}: {why}");
+            let sam = crate::authz::Caller::peer("user:sam", "viewer");
+            ready_in(&hub, &sam, &body).await.map_err(|(c, m)| anyhow::anyhow!("sam: {c}: {m}"))?;
+            let state = crate::ci::diffs::find(&hub, "CR15").await?.map(|d| d.state).unwrap_or_default();
+            let (stand, line, actions) = stand_of(&page().await?, "5151515");
+            anyhow::ensure!(state == "needs-review" && !line.starts_with("Draft") && !actions.iter().any(|a| a == "ready"), "ready for review: {state}; the row: {stand}: {line}: {actions:?}");
+            let r = crate::workspace::change::of(&hub, "matrix-session").await.ok_or_else(|| anyhow::anyhow!("the agent's change went missing"))?;
+            anyhow::ensure!((r.draft, r.review.as_deref()) == (Some(false), Some("needs-review")), "the agent's change says it's no draft: {r:?}");
+            let (code, why) = refused(ready_in(&hub, &sam, &body).await);
+            anyhow::ensure!(code == StatusCode::CONFLICT && why == "CR15 isn't a draft", "again: {code}: {why}");
             Ok(())
         })
     }

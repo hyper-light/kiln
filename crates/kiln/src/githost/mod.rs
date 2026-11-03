@@ -6,6 +6,8 @@
 //! from a template.
 
 pub mod bitbucket;
+#[cfg(test)]
+mod fake_host;
 pub mod forge;
 #[cfg(test)]
 mod forge_fake;
@@ -270,21 +272,43 @@ impl GitHost {
         push_lease(hub, local, &target, sha, branch, expected).await
     }
 
-    /// Opens a change from `head` into `base`.
-    pub async fn open_change(&self, hub: &Arc<Hub>, repo: &Repo, head: &str, base: &str, title: &str, body: &str) -> anyhow::Result<ChangeRef> {
+    /// Opens a change from `head` into `base`; as a draft with `draft` (docs/ci.md W29-R11):
+    /// GitHub's REST `draft`, GitLab's "Draft: " title, Bitbucket's `draft` (its title when it
+    /// refuses the flag), kiln's own a draft change request.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn open_change(&self, hub: &Arc<Hub>, repo: &Repo, head: &str, base: &str, title: &str, body: &str, draft: bool) -> anyhow::Result<ChangeRef> {
         match self {
             GitHost::Kiln => {
                 let path = crate::ci::hosting::native_path(hub, repo).ok_or_else(|| anyhow::anyhow!("{} isn't hosted here", repo.name))?;
                 let p = path.to_string_lossy().into_owned();
                 let sha = crate::gitops::run_git(hub, &["-C", &p, "rev-parse", "--verify", &format!("refs/heads/{head}^{{commit}}")], crate::gitops::LS_REMOTE_TIMEOUT).await.map(|o| String::from_utf8_lossy(&o).trim().to_owned())?;
                 let by = crate::ci::cr::By { pushed_by: "kiln".into(), author: ("kiln".into(), "agent"), started_by: None };
-                let options = kiln_ci::review::Options { title: Some(title.to_owned()), message: (!body.is_empty()).then(|| body.to_owned()), ..kiln_ci::review::Options::default() };
+                let options = kiln_ci::review::Options { title: Some(title.to_owned()), message: (!body.is_empty()).then(|| body.to_owned()), draft, ..kiln_ci::review::Options::default() };
                 let o = crate::ci::cr::submit(hub, repo, &p, base, head, &sha, &by, &options).await.map_err(anyhow::Error::msg)?;
                 Ok(ChangeRef { number: u64::from(o.number), url: o.url })
             }
-            GitHost::Github(app) => app.open_change(repo, head, base, title, body).await,
-            GitHost::Gitlab(g) => g.open_change(repo, head, base, title, body).await,
-            GitHost::Bitbucket(b) => b.open_change(repo, head, base, title, body).await,
+            GitHost::Github(app) => app.open_change(repo, head, base, title, body, draft).await,
+            GitHost::Gitlab(g) => g.open_change(repo, head, base, title, body, draft).await,
+            GitHost::Bitbucket(b) => b.open_change(repo, head, base, title, body, draft).await,
+        }
+    }
+
+    /// Marks draft change `number` ready for review (docs/ci.md W29-R12): GitHub's GraphQL
+    /// `markPullRequestReadyForReview`, GitLab's title without its Draft prefix, Bitbucket's
+    /// `draft: false`, kiln's own change request out of draft. One that's ready already stays so.
+    pub async fn ready_change(&self, hub: &Arc<Hub>, repo: &Repo, number: u64) -> anyhow::Result<()> {
+        match self {
+            GitHost::Kiln => {
+                let d = crate::ci::diffs::find(hub, &format!("CR{number}")).await?.filter(|d| d.repo == repo.name).ok_or_else(|| anyhow::anyhow!("no change request {number}"))?;
+                if d.state != "draft" {
+                    return Ok(());
+                }
+                // kiln opened it, so kiln readies it.
+                crate::ci::diffs::ready_as(hub, &d, &crate::authz::Caller::owner()).await.map(|_| ()).map_err(|(_, m)| anyhow::anyhow!(m))
+            }
+            GitHost::Github(app) => app.ready_change(repo, number).await,
+            GitHost::Gitlab(g) => g.ready_change(repo, number).await,
+            GitHost::Bitbucket(b) => b.ready_change(repo, number).await,
         }
     }
 
@@ -519,5 +543,34 @@ mod tests {
         assert_eq!(s("git://127.0.0.1:9418/acme/app.git"), Some(("127.0.0.1:9418".into(), "acme/app".into())));
         assert_eq!(s("nope"), None);
         assert_eq!(host_of("https://GitHub.com/"), "github.com");
+    }
+
+    /// W29-R11, R12 on kiln's own: a change request opened as a draft, then ready for review.
+    #[test]
+    fn w29_r11_r12_a_kiln_change_request_as_a_draft() -> anyhow::Result<()> {
+        crate::rt::block_on(async {
+            let hub = crate::hub::tests::scratch_hub_with(|_| {}).await?;
+            let path = crate::ci::hosting::create(&hub, "acme/app", "main", None).await?;
+            let repo = Repo { id: crate::util::new_id(), name: "acme/app".into(), clone_url: crate::ci::hosting::clone_url(&path), branches: Vec::new(), poll_seconds: 3600, enabled: true, created_at: 0, last_polled_at: None, last_error: None, mode: "native".into(), default_branch: Some("main".into()), mirror: None };
+            hub.store.upsert_repo(repo.clone()).await?;
+            // The trunk and a branch off it, pushed straight into the bare repository.
+            let work = tempfile::tempdir()?;
+            let bare = path.to_string_lossy().into_owned();
+            let script = format!("git init -q -b main && git config user.name Ada && git config user.email ada@example.com && git config commit.gpgsign false && echo a > a && git add a && git commit -qm first && git push -q '{bare}' main && git checkout -qb kiln/draft/ci-01a19f2c && echo b > b && git add b && git commit -qm 'Edit ci [skip ci]' && git push -q '{bare}' kiln/draft/ci-01a19f2c");
+            let out = std::process::Command::new("sh").arg("-c").arg(&script).current_dir(work.path()).output()?;
+            anyhow::ensure!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+            let o = GitHost::Kiln.open_change(&hub, &repo, "kiln/draft/ci-01a19f2c", "main", "Edit ci", "", true).await?;
+            let state = |n: u64| {
+                let hub = Arc::clone(&hub);
+                async move { anyhow::Ok(crate::ci::diffs::find(&hub, &format!("CR{n}")).await?.map(|d| d.state)) }
+            };
+            assert_eq!(state(o.number).await?.as_deref(), Some("draft"));
+            GitHost::Kiln.ready_change(&hub, &repo, o.number).await?;
+            assert_eq!(state(o.number).await?.as_deref(), Some("needs-review"));
+            // Ready again: it is already.
+            GitHost::Kiln.ready_change(&hub, &repo, o.number).await?;
+            assert_eq!(state(o.number).await?.as_deref(), Some("needs-review"));
+            Ok(())
+        })
     }
 }

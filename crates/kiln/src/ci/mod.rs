@@ -3,6 +3,7 @@
 //! adds one line here and one arm in [`api`].
 
 pub mod actions;
+pub mod agent_fixes;
 pub mod api;
 pub mod attach;
 pub mod attest;

@@ -196,8 +196,11 @@ impl Gitlab {
         super::remote_commit(hub, repo, &url, branch, expected, files, message, author).await
     }
 
-    pub async fn open_change(&self, repo: &Repo, head: &str, base: &str, title: &str, body: &str) -> anyhow::Result<ChangeRef> {
+    /// Opens a merge request; a draft with `draft`, by its title (GitLab's API has no draft flag,
+    /// docs/ci.md W29-R11).
+    pub async fn open_change(&self, repo: &Repo, head: &str, base: &str, title: &str, body: &str, draft: bool) -> anyhow::Result<ChangeRef> {
         let name = self.name(repo)?;
+        let title = if draft { kiln_ci::drafts::drafted_title(title) } else { title.to_owned() };
         let (st, v) = self.call(Method::Post, &format!("/projects/{}/merge_requests", id(&name)), Some(&json!({ "source_branch": head, "target_branch": base, "title": title, "description": body }))).await?;
         if st != 201 {
             bail!("GitLab opened no merge request ({st}): {}", said(&v));
@@ -224,6 +227,20 @@ impl Gitlab {
         }
         let newest = v.as_array().and_then(|l| l.iter().max_by_key(|m| m.get("iid").and_then(Value::as_u64).unwrap_or(0)));
         Ok(newest.map(|m| (ChangeRef { number: m.get("iid").and_then(Value::as_u64).unwrap_or(0), url: m.get("web_url").and_then(Value::as_str).unwrap_or_default().to_owned() }, mr_state(m))))
+    }
+
+    /// Marks draft merge request `number` ready (W29-R12): its title without the Draft prefix GitLab
+    /// reads; one that has none stays as it is.
+    pub async fn ready_change(&self, repo: &Repo, number: u64) -> anyhow::Result<()> {
+        let name = self.name(repo)?;
+        let (st, v) = self.call(Method::Get, &format!("/projects/{}/merge_requests/{number}", id(&name)), None).await?;
+        anyhow::ensure!(st == 200, "merge request !{number} ({st}): {}", said(&v));
+        let Some(title) = kiln_ci::drafts::undrafted_title(v.get("title").and_then(Value::as_str).unwrap_or_default()) else {
+            return Ok(());
+        };
+        let (st, v) = self.call(Method::Put, &format!("/projects/{}/merge_requests/{number}", id(&name)), Some(&json!({ "title": title }))).await?;
+        anyhow::ensure!(st == 200, "GitLab didn't mark merge request !{number} ready ({st}): {}", said(&v));
+        Ok(())
     }
 
     /// Closes merge request `number` unmerged, saying why (a note) first.
@@ -414,5 +431,33 @@ mod tests {
         assert_eq!(push_event(&h, body), Some(Push { repo: "acme/app".into(), refname: "refs/heads/main".into(), before: "a".into(), after: "b".into() }));
         h.insert("x-gitlab-event", http::HeaderValue::from_static("Pipeline Hook"));
         assert_eq!(push_event(&h, body), None);
+    }
+
+    /// W29-R11, R12 on GitLab: a merge request opened as a draft by its title (its API has no flag),
+    /// then made ready by the title without it; one with no Draft prefix is left as it is.
+    #[test]
+    fn w29_r11_r12_gitlab_drafts() -> anyhow::Result<()> {
+        crate::rt::block_on(async {
+            let answer: crate::githost::fake_host::Answer = Box::new(|method, path, _query, body| match (method, path) {
+                ("POST", "/api/v4/projects/acme/app/merge_requests") => (201, json!({ "iid": 5, "web_url": "https://gitlab.com/acme/app/-/merge_requests/5", "title": body.get("title").cloned().unwrap_or_default() })),
+                ("GET", "/api/v4/projects/acme/app/merge_requests/5") => (200, json!({ "iid": 5, "title": "Draft: Edit ci" })),
+                ("GET", "/api/v4/projects/acme/app/merge_requests/6") => (200, json!({ "iid": 6, "title": "Edit ci" })),
+                ("PUT", "/api/v4/projects/acme/app/merge_requests/5") => (200, json!({ "iid": 5 })),
+                _ => (404, json!({ "message": "404 Not Found" })),
+            });
+            let (base, fake) = crate::githost::fake_host::start(answer).await?;
+            let g = Gitlab { web: "https://gitlab.com".into(), api: format!("{base}/api/v4"), token: "t".into(), webhook_secret: None, groups: vec![] };
+            let r = repo("https://gitlab.com/acme/app.git");
+            let opened = g.open_change(&r, "kiln/draft/ci-01a19f2c", "main", "Edit ci", "", true).await?;
+            assert_eq!(opened.number, 5);
+            g.open_change(&r, "kiln/edit-ci-01a19f2c", "main", "Edit ci", "", false).await?;
+            let titles: Vec<Value> = fake.sent("POST", "/api/v4/projects/acme/app/merge_requests").iter().filter_map(|b| b.get("title").cloned()).collect();
+            assert_eq!(titles, [json!("Draft: Edit ci"), json!("Edit ci")]);
+            g.ready_change(&r, 5).await?;
+            assert_eq!(fake.sent("PUT", "/api/v4/projects/acme/app/merge_requests/5"), [json!({ "title": "Edit ci" })]);
+            g.ready_change(&r, 6).await?;
+            assert!(fake.sent("PUT", "/api/v4/projects/acme/app/merge_requests/6").is_empty(), "no Draft prefix: nothing to change");
+            Ok(())
+        })
     }
 }

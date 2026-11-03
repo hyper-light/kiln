@@ -405,6 +405,34 @@ pub fn blockers(land: &Land, owners: &[OwnerRule], f: &Facts) -> Vec<String> {
     why
 }
 
+/// A host's pull request as Review's gate reads it (docs/ci.md W26-R19): its state on its host
+/// (`open`, `draft`, `merged` or `closed`), its author, its reviews oldest first (who, and what they
+/// said), its open threads, and its head's checks and files.
+#[derive(Debug, Clone, Default)]
+pub struct HostPull {
+    pub state: String,
+    pub author: String,
+    pub reviews: Vec<(String, Action)>,
+    pub open_threads: usize,
+    pub checks: BTreeMap<String, Option<String>>,
+    pub paths: Vec<String>,
+}
+
+/// What keeps a host's pull request from going to a queue now (docs/ci.md W26-R19): a draft, or one
+/// merged or closed, isn't landing; else what [`blockers`] says of it by its trunk's policy, each
+/// reviewer's latest word standing for its head, as its host reads them.
+pub fn host_blockers(land: &Land, owners: &[OwnerRule], p: &HostPull) -> Vec<String> {
+    match p.state.as_str() {
+        "draft" => return vec!["it's a draft".to_owned()],
+        "merged" => return vec!["it landed".to_owned()],
+        "closed" => return vec!["it's closed".to_owned()],
+        _ => {}
+    }
+    let reviews = p.reviews.iter().map(|(reviewer, action)| Review { reviewer: reviewer.clone(), agent: false, version: 1, action: *action, holds: None }).collect();
+    let f = Facts { author: p.author.clone(), rebase_only: vec![false], reviews, open_threads: p.open_threads, checks: p.checks.clone(), paths: p.paths.clone(), signed_only: false };
+    blockers(land, owners, &f)
+}
+
 /// A landed commit's message: the diff's (or change request's) and kiln's trailers, with each
 /// landed change's `Kiln-Change` (W26-R03; a stack squashed into one commit carries each).
 pub fn landed_message(message: &str, revision: &str, reviewed_by: &[String], changes: &[String]) -> String {
@@ -430,6 +458,31 @@ pub fn next_batch(policy_batch: u32, failures_since_land: u32) -> u32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// docs/ci.md W26-R19: a host's pull request goes to a queue only once its gate is clear. A
+    /// draft, a request for changes, too few accepts and an open thread each hold it, saying so; its
+    /// author's own accept doesn't count; a reviewer's later accept answers their request; one merged
+    /// or closed isn't landing.
+    #[test]
+    fn w26_r19_a_host_pulls_gate() {
+        let land = Land::default();
+        let pull = |state: &str, reviews: &[(&str, Action)], open_threads: usize| HostPull {
+            state: state.into(),
+            author: "github:ada".into(),
+            reviews: reviews.iter().map(|(by, a)| ((*by).to_owned(), *a)).collect(),
+            open_threads,
+            ..HostPull::default()
+        };
+        let none = "0 of 1 accepts (from people other than the author)";
+        assert_eq!(host_blockers(&land, &[], &pull("draft", &[("github:kim", Action::Accept)], 0)), ["it's a draft"]);
+        assert_eq!(host_blockers(&land, &[], &pull("open", &[("github:kim", Action::RequestChanges)], 0)), [none, "github:kim asked for changes"]);
+        assert_eq!(host_blockers(&land, &[], &pull("open", &[("github:ada", Action::Accept)], 1)), [none, "1 open thread"]);
+        assert!(host_blockers(&land, &[], &pull("open", &[("github:kim", Action::RequestChanges), ("github:kim", Action::Accept)], 0)).is_empty());
+        assert_eq!(host_blockers(&land, &[], &pull("merged", &[], 0)), ["it landed"]);
+        assert_eq!(host_blockers(&land, &[], &pull("closed", &[], 0)), ["it's closed"]);
+        let lenient = Land { approvals: 0, resolve_threads: false, ..Land::default() };
+        assert!(host_blockers(&lenient, &[], &pull("open", &[], 3)).is_empty(), "a trunk asking for nothing holds nothing");
+    }
 
     fn review(reviewer: &str, version: u32, action: Action) -> Review {
         Review { reviewer: reviewer.into(), agent: reviewer.starts_with("agent:"), version, action, holds: None }
