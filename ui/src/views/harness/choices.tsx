@@ -114,6 +114,8 @@ export interface ChoicesProps {
   canDecline?: boolean;
   /** Unset: a sheet on phones, a dialog elsewhere. */
   layout?: "sheet" | "dialog" | "inline" | "flow";
+  /** Under the row of who asks (Mission control's): no head, the row says who; Decline beside Submit. */
+  headless?: boolean;
   onSubmit: (answers: ChoiceAnswer[]) => void;
   onDecline?: () => void;
   onMinimize?: () => void;
@@ -567,6 +569,7 @@ function Ask({
   busy = false,
   canDecline = false,
   layout,
+  headless = false,
   onSubmit,
   onDecline,
   onMinimize,
@@ -844,31 +847,33 @@ function Ask({
 
   const content = (
     <>
-      <header className="ch-head">
-        <div className="ch-who">
-          <Optic state="waiting" size={16} />
-          {modal ? (
-            <D.Title className="ch-title">{titleInner}</D.Title>
-          ) : (
-            <h2 className="ch-title" id={`${uid}-t`}>
-              {titleInner}
-            </h2>
-          )}
-          {agentName && kind && <span className="ch-kind">{kind}</span>}
-        </div>
-        <div className="ch-head-actions">
-          {canDecline && onDecline && (
-            <button type="button" className="ch-decline" onClick={decline} disabled={busy}>
-              Decline
-            </button>
-          )}
-          {onMinimize && (
-            <button type="button" className="ch-icon" onClick={onMinimize} aria-label="Minimize" title="Minimize: it keeps waiting for you">
-              {frame === "sheet" ? <ChevronDown size={18} /> : <Minus size={16} />}
-            </button>
-          )}
-        </div>
-      </header>
+      {!headless && (
+        <header className="ch-head">
+          <div className="ch-who">
+            <Optic state="waiting" size={16} />
+            {modal ? (
+              <D.Title className="ch-title">{titleInner}</D.Title>
+            ) : (
+              <h2 className="ch-title" id={`${uid}-t`}>
+                {titleInner}
+              </h2>
+            )}
+            {agentName && kind && <span className="ch-kind">{kind}</span>}
+          </div>
+          <div className="ch-head-actions">
+            {canDecline && onDecline && (
+              <button type="button" className="ch-decline" onClick={decline} disabled={busy}>
+                Decline
+              </button>
+            )}
+            {onMinimize && (
+              <button type="button" className="ch-icon" onClick={onMinimize} aria-label="Minimize" title="Minimize: it keeps waiting for you">
+                {frame === "sheet" ? <ChevronDown size={18} /> : <Minus size={16} />}
+              </button>
+            )}
+          </div>
+        </header>
+      )}
 
       {n > 1 && !trying && (
         <div className="ch-steps">
@@ -944,6 +949,11 @@ function Ask({
           <Keys q={q} canMinimize={Boolean(onMinimize)} label={primary} />
         )}
         <div className="ch-actions">
+          {headless && canDecline && onDecline && !trying && (
+            <button type="button" className="ch-decline" onClick={decline} disabled={busy}>
+              Decline
+            </button>
+          )}
           {!trying && canTry && (
             <Button variant="secondary" size="sm" onClick={openSetup} disabled={busy}>
               <FlaskConical /> Experiment…
@@ -981,7 +991,8 @@ function Ask({
         className={cn("ch", className)}
         data-layout={frame}
         data-wide={hasPreviews(questions) || undefined}
-        aria-labelledby={`${uid}-t`}
+        aria-labelledby={headless ? undefined : `${uid}-t`}
+        aria-label={headless ? `${title} asks you` : undefined}
         aria-describedby={describedBy}
         aria-busy={busy || undefined}
         onKeyDown={onKeyDown}
