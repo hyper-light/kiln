@@ -205,7 +205,7 @@ Statuses: `ready` (can start), `blocked` (waits on what is in brackets), `in pro
 | W24 | Incremental CI: fingerprints, reuse, warm state, shared caches | W04, W05, W06, W08, W13, W18 | ready | specified (2026-10-24): R01–R31, AC01–AC15; milestones M0–M7 and M1e are kiln goals with plans |
 | W26 | Review in Ship: changes as Ship items, each owning its review | W14, W23, W27, Ship (the CI/CD Integration plan) | in progress | R06–R15 built: each item's dropdown owns its review (Files and the Conversation, search on vorpal, kinds and the gate, suggestions and conflicts as revisions, the Review lanes), unsigned until W27-R03; AC06 in Chromium, not yet WebKit; specified (2026-10-25): R01–R20, AC01–AC11; plan `01a175b7d5e1772f8d3c7cb28e50ab2b` |
 | W27 | Attested end to end: identities, signatures, hand-offs, the trail | W10, W18, W26 | in progress | specified (2026-10-25): R01–R12, AC01–AC08; research `01a175c54441773fa28bf1488b82e6aa`; identities built (R01, R02, R12; AC01, AC02): plan `01a17856b1b0712babf8dfd37ce48756`; hand-offs built (R08; AC05: the 14:18 drop and the twin played again, refused and recorded, and the transfers simulation): plan `01a17856b1b477eda14a574ae312a123` |
-| W29 | Pipelines in Ship: author, run, share and lock workflows and actions | W02, W03, W04, W07, W13, W14, W21, W23, W26 | in progress | specified (2026-10-31): R01–R31, AC01–AC29, S01–S17; the design approved on stills `pl-1` to `pl-9`; the read model and API built (R02, R03, R04's pane, R09's reads); drafts built (R10–R14); sharing built (R17–R20: Access, one check, the catalog, Access and Used by in Ship); releases by tag and update drafts built (R21, R22); the tab built (R01, R04–R08; R14, R21 and R22 in its strip); plan `01a19474452d7084bae269952cc6c26a` |
+| W29 | Pipelines in Ship: author, run, share and lock workflows and actions | W02, W03, W04, W07, W13, W14, W21, W23, W26 | in progress | specified (2026-10-31): R01–R31, AC01–AC29, S01–S17; the design approved on stills `pl-1` to `pl-9`; the read model and API built (R02, R03, R04's pane, R09's reads); drafts built (R10–R14); sharing built (R17–R20: Access, one check, the catalog, Access and Used by in Ship); releases by tag and update drafts built (R21, R22); the tab built (R01, R04–R08; R14, R21 and R22 in its strip); locks built (R23–R26: GitHub's `actions.lock` read, written and verified as the pinned `gh actions-lock` does on its own fixture and four of F-02's repositories, `.kiln/lock` for what it leaves out, one snapshot per run kept through recovery, Require lockfile and moved tags, locks in every draft, reviewed re-locks, Lock it; W29-S04 replayed on real git); plan `01a19474452d7084bae269952cc6c26a` |
 
 ---
 
@@ -11145,8 +11145,8 @@ endpoint, for a repository kiln hosts and for one on GitHub:
   - every dependency of a `.kiln/` workflow, which GitHub's lock doesn't read.
 
   An image that only a run's own data names (a matrix from a job's outputs, an event's payload)
-  can't be locked before it runs. kiln then writes neither file, saying so (`KCI4050`), where
-  `gh actions-lock`, which locks no image, writes its own.
+  can't be locked before it runs. kiln then writes neither file, so a draft touching that workflow
+  isn't saved, saying why (`KCI4050`), where `gh actions-lock`, which locks no image, writes its own.
 
   Its format follows GitHub's, so what people know of one serves for the other:
 
@@ -11190,8 +11190,8 @@ endpoint, for a repository kiln hosts and for one on GitHub:
     is resolved by regenerating it from the merged workflows, as npm and pnpm do with theirs.
   - `ci.locks.update` (new, `POST /api/ci/repos/:repo/locks { ref? }`) regenerates a repository's
     locks into a draft. `ci.locks.verify` (new, `GET /api/ci/repos/:repo/locks/verify?sha=`)
-    answers `{ fresh, stale: [{ workflow, uses, locked, now }] }`, so a required check can verify
-    them.
+    answers `{ fresh, stale: [{ workflow, uses, locked, now, error }], warnings }`, so a required
+    check can verify them.
   - Both locks come from `kiln_ci::lock::regenerate` (new, pure): the workflows and their
     resolutions in, the two files out, the same bytes for the same inputs.
   - What `ci.locks.verify` checks is GitHub-exact: the checks `gh actions-lock --verify` makes.
@@ -11417,7 +11417,7 @@ lockfile, which pins commit A. An attacker moves `v45` and `v45.0.7` to commit M
 | `GET /api/ci/actions?q=&kind=&owner=&repo=` (W29-R20) | `ci.actions.list`, grown | actions and reusable workflows the caller (`repo`) may use |
 | `GET /api/ci/actions/:owner/:repo?path=` (W29-R20) | `ci.actions.get`, new | versions, access, consumers |
 | `POST /api/ci/repos/:repo/locks { ref? }` or `{ path, content, files? }` (W29-R25) | `ci.locks.update`, new | a draft of the regenerated locks; with the editor's file, that file saved with its locks |
-| `GET /api/ci/repos/:repo/locks/verify?sha=` (W29-R25) | `ci.locks.verify`, new | `{ fresh, stale: [{ workflow, uses, locked, now }] }` |
+| `GET /api/ci/repos/:repo/locks/verify?sha=` (W29-R25) | `ci.locks.verify`, new | `{ fresh, stale: [{ workflow, uses, locked, now, error }], warnings }` |
 | `POST /api/ci/repos/:repo/locks/accept { draft, head, evidence_sha256 }` (W29-R25) | `ci.locks.accept`, new | `{ approval, draft, head, evidence_sha256, accepted }` |
 | `GET /api/ci/sdk/kiln.d.ts` (W29-R27) | | the SDK's types for the editor |
 | notification `tag_moved` (W29-R26, W19) | | a full version that resolves to another commit |
