@@ -19,7 +19,7 @@ import { clientId, harnessApi, type GoalItem, type GoalStack, type SessionStore 
 import { Button } from "@/components/ui/button";
 import { toast } from "@/components/ui/toast";
 import { Loadable } from "@/components/ui/loading";
-import { harnessSessionsRes, useRes } from "@/lib/data";
+import { harnessSessionsRes, useLabels, useRes } from "@/lib/data";
 import { relativeTime } from "@/lib/format";
 import { ApiError } from "@/api/client";
 import { planHref, plansApi, runHref } from "@/api/plans";
@@ -119,6 +119,7 @@ const whoOf = (a: { kind_name: string; target: string } | undefined) => (a ? `${
  * yet, nor its run), its one step is the planning.
  */
 function usePlanned(goal: GoalItem, items: GoalItem[], paused: boolean, agent: string, planner?: Planner) {
+  useLabels();
   const p = usePlan(goal.planned_as ?? "");
   const run = items.find((i) => i.part_of === goal.id && i.waits_on)?.waits_on;
   const view = useRunView(run);

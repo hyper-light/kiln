@@ -351,7 +351,7 @@ fn every_socket_answers_what_it_cant_read_and_notes_it() -> anyhow::Result<()> {
     hostile_unread_only(&srv, &format!("Cookie: kiln_session={ada}"), "/api/events")?;
 
     // A terminal on the runner: a `refused` frame each; its binary frames are keystrokes.
-    hostile_terminal(&srv, &admin, "/api/terminal/ws?target=agent:box&cols=80&rows=24")?;
+    hostile_terminal(&srv, &admin, &format!("/api/terminal/ws?target=agent:{}&cols=80&rows=24", common::machine("box")))?;
 
     // A runner's tunnel: a `refused` text frame each, which runners read; an `unread` is noted,
     // and nothing goes back (the next `refused` is the empty datagram's).
@@ -445,7 +445,7 @@ fn every_socket_answers_what_it_cant_read_and_notes_it() -> anyhow::Result<()> {
         let (_, body) = http(srv.port, "GET", "/api/agents", &srv.admin, None)?;
         let v: Value = serde_json::from_str(&body).unwrap_or_default();
         let list = v.as_array().cloned().or_else(|| v.get("agents").and_then(Value::as_array).cloned()).unwrap_or_default();
-        let r = list.iter().find(|a| s(a, "name") == "box").and_then(|a| a.get("refused"));
+        let r = list.iter().find(|a| s(a, "name") == common::machine("box")).and_then(|a| a.get("refused"));
         Ok(kept(r, "terminal_up", "malformed") == 4 && kept(r, "terminal_up", "unknown") == 2 && kept(r, "terminal_down", "unknown") == 2)
     })?;
     Ok(())

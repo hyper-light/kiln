@@ -89,9 +89,9 @@ pub struct Unmet {
 pub fn agent_cannot(a: Option<&crate::hub::AgentLive>, runner: &str) -> Option<String> {
     match a {
         None => Some(format!("kiln doesn't know {runner} now")),
-        Some(a) if a.ephemeral => Some(format!("{runner} is a pod, which hosts no agent")),
-        Some(a) if !a.connected => Some(format!("{runner} is away: kiln offers an agent once it's back")),
-        Some(a) if !a.terminal => Some(format!("{runner}'s runner was started without terminals, so it hosts no agent")),
+        Some(a) if a.ephemeral => Some(format!("{} is a pod, which hosts no agent", a.shown())),
+        Some(a) if !a.connected => Some(format!("{} is away: kiln offers an agent once it's back", a.shown())),
+        Some(a) if !a.terminal => Some(format!("{}'s runner was started without terminals, so it hosts no agent", a.shown())),
         Some(_) => None,
     }
 }
@@ -292,9 +292,9 @@ pub async fn fix(hub: Arc<Hub>, caller: crate::authz::Caller, id: &str, ask: Ask
         },
         Some(r) => match m.runners.iter().find(|u| u.runner == r) {
             Some(u) if u.fixable => (r, u.tools.clone()),
-            Some(Unmet { no_agent: Some(why), .. }) => return Err((StatusCode::CONFLICT, format!("no agent can work on {r}: {why}"))),
-            Some(u) => return Err((StatusCode::BAD_REQUEST, format!("{r} needs more than tools for {id}: {}", u.unmet.join(", ")))),
-            None => return Err((StatusCode::BAD_REQUEST, format!("{id} lacks nothing kiln can name on {r}"))),
+            Some(Unmet { no_agent: Some(why), .. }) => return Err((StatusCode::CONFLICT, format!("no agent can work on {}: {why}", hub.shown(&r)))),
+            Some(u) => return Err((StatusCode::BAD_REQUEST, format!("{} needs more than tools for {id}: {}", hub.shown(&r), u.unmet.join(", ")))),
+            None => return Err((StatusCode::BAD_REQUEST, format!("{id} lacks nothing kiln can name on {}", hub.shown(&r)))),
         },
         None => match m.runners.iter().find(|u| u.fixable) {
             Some(u) => (u.runner.clone(), u.tools.clone()),
@@ -304,9 +304,10 @@ pub async fn fix(hub: Arc<Hub>, caller: crate::authz::Caller, id: &str, ask: Ask
     let run = hub.store.run(job.run_id.clone()).await.map_err(internal)?;
     let repo = run.as_ref().map(|r| r.repo_name.clone()).unwrap_or_default();
     let number = run.as_ref().map(|r| r.number).unwrap_or_default();
-    let prompt = brief(&runner, &job.display, &repo, number, &tools, m.why.as_deref(), &m.runners);
+    let shown = hub.shown(&runner);
+    let prompt = brief(&shown, &job.display, &repo, number, &tools, m.why.as_deref(), m.runners.iter().find(|u| u.runner == runner));
     let kind = ask.kind.clone().unwrap_or_else(|| "claude".to_owned());
-    let mut input = json!({ "kind": kind, "on": runner, "cwd": "~", "prompt": prompt, "name": format!("Install {} on {runner}", tools.join(", ")) });
+    let mut input = json!({ "kind": kind, "on": runner, "cwd": "~", "prompt": prompt, "name": format!("Install {} on {shown}", tools.join(", ")) });
     if let Some(mode) = &ask.mode
         && let Some(o) = input.as_object_mut()
     {
@@ -345,7 +346,7 @@ pub async fn fix(hub: Arc<Hub>, caller: crate::authz::Caller, id: &str, ask: Ask
     let agent = started.pointer("/agents/0/id").and_then(Value::as_str).unwrap_or_default().to_owned();
     if agent.is_empty() {
         undo();
-        return Err((StatusCode::BAD_GATEWAY, format!("no agent started on {runner}: {started}")));
+        return Err((StatusCode::BAD_GATEWAY, format!("no agent started on {shown}: {started}")));
     }
     let f = Fix { agent: agent.clone(), ..f };
     hub.tool_fixes.lock().insert(id.to_owned(), f.clone());
@@ -356,13 +357,13 @@ pub async fn fix(hub: Arc<Hub>, caller: crate::authz::Caller, id: &str, ask: Ask
     Ok(json!({ "fix": f }))
 }
 
-/// The agent's first message.
-fn brief(runner: &str, job: &str, repo: &str, number: i64, tools: &[String], why: Option<&str>, runners: &[Unmet]) -> String {
+/// The agent's first message, on runner `runner` (the name people see), what it lacks there `unmet`.
+fn brief(runner: &str, job: &str, repo: &str, number: i64, tools: &[String], why: Option<&str>, unmet: Option<&Unmet>) -> String {
     let what = tools.iter().map(|t| if t == XCODE_TOOLS { "Xcode's command-line tools".to_owned() } else { format!("`{t}`") }).collect::<Vec<_>>().join(", ");
     let reason = match why {
         Some(w) => format!("failed on this machine because a command wasn't there: `{w}`"),
         None => {
-            let unmet = runners.iter().find(|u| u.runner == runner).map(|u| u.unmet.join(", ")).unwrap_or_default();
+            let unmet = unmet.map(|u| u.unmet.join(", ")).unwrap_or_default();
             format!("is waiting for a runner that meets its requirements, and this one doesn't meet: {unmet}")
         }
     };
@@ -426,7 +427,7 @@ async fn check(hub: Arc<Hub>, id: &str) {
     let have = |t: &str| facts.as_ref().is_some_and(|f| f.tools.contains_key(fact_key(t)));
     let missing: Vec<String> = fix.tools.iter().filter(|t| fact_known(t) && !have(t)).cloned().collect();
     if !missing.is_empty() {
-        set(&hub, id, "still_missing", Some(format!("{} still lacks {} after the agent", fix.runner, missing.join(", ")))).await;
+        set(&hub, id, "still_missing", Some(format!("{} still lacks {} after the agent", hub.shown(&fix.runner), missing.join(", ")))).await;
         return;
     }
     match job.status {
@@ -441,7 +442,7 @@ async fn check(hub: Arc<Hub>, id: &str) {
         },
         Status::Queued | Status::Pending => {
             hub.wake.notify();
-            set(&hub, id, "waiting", Some(format!("{} meets it now: the job goes there when it has a slot", fix.runner))).await;
+            set(&hub, id, "waiting", Some(format!("{} meets it now: the job goes there when it has a slot", hub.shown(&fix.runner)))).await;
         }
         // Someone ran it again meanwhile.
         _ => set(&hub, id, "retried", Some("it ran again meanwhile".into())).await,

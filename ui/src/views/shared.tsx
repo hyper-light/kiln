@@ -1,3 +1,4 @@
+import { shownName } from "@/lib/data";
 import { Link } from "@/lib/router";
 import { Clock, GitCommitHorizontal, GitPullRequest, Hand, Tag } from "lucide-react";
 import type { Agent, Child, HostSample, Run } from "@/api/types";
@@ -28,9 +29,7 @@ export function childStatus(c: Child): string {
 export function LiveDuration({ start, end, className }: { start: number | null; end: number | null; className?: string }) {
   const now = useNow();
   const live = start !== null && end === null;
-  return (
-    <span className={cn("tabular-nums", live && "text-[#d8d0f2]", className)}>{formatDuration(spanSeconds(start, end, now))}</span>
-  );
+  return <span className={cn("tabular-nums", live && "text-[#d8d0f2]", className)}>{formatDuration(spanSeconds(start, end, now))}</span>;
 }
 
 export function RelTime({ ts, className }: { ts: number | null | undefined; className?: string }) {
@@ -44,10 +43,7 @@ export function RelTime({ ts, className }: { ts: number | null | undefined; clas
 
 export function RunActivityRow({ run }: { run: Run }) {
   return (
-    <Link
-      to={`/runs/${run.id}`}
-      className="nudge grid grid-cols-[auto_minmax(0,1fr)_auto] items-center gap-x-3 gap-y-0.5 px-1 py-2.5 transition-colors hover:bg-[#101114]"
-    >
+    <Link to={`/runs/${run.id}`} className="nudge grid grid-cols-[auto_minmax(0,1fr)_auto] items-center gap-x-3 gap-y-0.5 px-1 py-2.5 transition-colors hover:bg-[#101114]">
       <StatusDot status={run.status} className="row-span-2" />
       <span className="min-w-0 truncate text-[13px] text-[#e4e5e7]">
         {run.repo_name.split("/").pop()} <span className="text-[#8c8f98]">#{run.number}</span>
@@ -83,7 +79,7 @@ export function AgentMiniCard({ agent, history, onOpen }: { agent: Agent; histor
       <button onClick={onOpen} className="flex flex-1 flex-col p-4 text-left outline-offset-[-3px]">
         <div className="flex items-center gap-2.5">
           <StatusDot status={status} title={!agent.connected ? "disconnected" : agent.draining ? "draining" : agent.busy ? "busy" : "idle"} />
-          <h3 className="min-w-0 flex-1 truncate text-[15px] font-[480] tracking-[-0.3px]">{agent.name}</h3>
+          <h3 className="min-w-0 flex-1 truncate text-[15px] font-[480] tracking-[-0.3px]">{shownName(agent)}</h3>
           <span className="font-mono text-[10px] text-[#8c8f98] tabular-nums">
             {agent.busy}/{agent.slots}
           </span>
@@ -134,4 +130,3 @@ export function EventIcon({ event }: { event: string }) {
       return <GitCommitHorizontal {...p} />;
   }
 }
-

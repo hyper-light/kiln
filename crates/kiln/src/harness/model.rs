@@ -1697,7 +1697,8 @@ pub struct Meta {
     /// "interrupt", "set_mode", "set_model", "set_effort", "set_speed", "stop_task", "file_suggestions",
     /// "resume", "attachments", "images", "overrides", "switch_harness" (a model of another
     /// harness: `Command::SetModel::kind`), "own_edits" (`Command::OwnEdits`: the session answers
-    /// it whatever its harness), "limits" (a person's pause and what each may do hold at its own
+    /// it whatever its harness), "remove_task" (`Command::RemoveTask`: its harness's subagents that
+    /// ended are removed), "limits" (a person's pause and what each may do hold at its own
     /// subagents' tool calls: `Command::Pause`, `Command::Perms` with a task), "limits_asked" (they
     /// hold only at the calls it asks about before making them: an ACP agent's), "web_whole" (its
     /// web search is set for the whole agent, allowed or off: no call of it can be held or asked).
@@ -2068,6 +2069,10 @@ pub enum Command {
         #[cfg_attr(test, ts(optional))]
         task: Option<String>,
     },
+    /// A person removes one of its harness's own subagents that has ended (`task`), as kiln's
+    /// Remove does an agent that has: it, and those under it that ended, leave the session's tasks
+    /// for good; the call that started it stays in the conversation. One still going stays.
+    RemoveTask { task: String },
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]

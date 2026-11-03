@@ -759,7 +759,7 @@
 .ship-foot {
   display: flex;
   flex-wrap: wrap;
-  justify-content: flex-end;
+  justify-content: flex-start;
   gap: 8px;
 }
 .ship-foot__page {

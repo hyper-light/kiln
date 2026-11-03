@@ -9,6 +9,7 @@ import { parseQuery } from "../src/lib/syntax/fit.ts";
 import { grammarsOf, LANGUAGES, languageById, languageByName, languageOfFence, languageOfFile, languageOfPath, languageOfShebang } from "../src/lib/syntax/languages.ts";
 import { classOf } from "../src/lib/syntax/theme.ts";
 import { SAMPLES } from "./syntax-samples.ts";
+import { SAMPLE_PARTS } from "./syntax-sample-tests.ts";
 import { classOfWord, highlighted, highlighter } from "./syntax-node.ts";
 
 const SYNTAX = new URL("../src/lib/syntax/", import.meta.url);
@@ -106,11 +107,12 @@ test("every language loads, and its queries fit its grammars losing only what's 
   assert.deepEqual(dropped, DROPPED);
 });
 
-for (const [lang, s] of Object.entries(SAMPLES)) {
-  test(`${lang} highlights as its queries say`, async () => {
-    for (const [word, cls] of s.expect) assert.equal(await classOfWord(lang, s.code, word), cls, `${lang}: ${JSON.stringify(word)}`);
-  });
-}
+// Each sample's test runs in syntax-samples-1.test.ts and on, a share of the languages to a process
+// (syntax-sample-tests.ts): every share has its file, so every sample runs.
+test("the samples' tests are shared among a file for each share", () => {
+  const files = readdirSync(new URL(".", import.meta.url)).filter((f) => /^syntax-samples-\d+\.test\.ts$/.test(f));
+  assert.deepEqual(files.sort(), Array.from({ length: SAMPLE_PARTS }, (_, i) => `syntax-samples-${i + 1}.test.ts`).sort());
+});
 
 test("every language has a sample", () => {
   for (const l of LANGUAGES) assert.ok(SAMPLES[l.id], l.id);

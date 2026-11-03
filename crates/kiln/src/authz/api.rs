@@ -181,11 +181,25 @@ struct NewUser {
     email: Option<String>,
 }
 
-fn parse_grants(texts: &[String], custom: &HashMap<String, Vec<String>>) -> Result<Vec<Grant>, Fail> {
+/// The runners a grant names by the name people see (docs/machines.md): each label, and the runner
+/// kiln knows by its machine id it's on. A label that's another runner's name isn't one.
+async fn runner_labels(hub: &Hub) -> HashMap<String, String> {
+    let agents = hub.agent_list().await;
+    agents.iter().filter_map(|a| a.label.clone().filter(|l| !agents.iter().any(|b| b.name == *l)).map(|l| (l, a.name.clone()))).collect()
+}
+
+/// Grants as people write them: a runner named by its label is the runner kiln knows by its machine
+/// id (docs/machines.md), so the grant holds whatever it's renamed to.
+fn parse_grants(texts: &[String], custom: &HashMap<String, Vec<String>>, labels: &HashMap<String, String>) -> Result<Vec<Grant>, Fail> {
     texts
         .iter()
         .map(|t| {
-            let g = Grant::parse(t).map_err(bad)?;
+            let mut g = Grant::parse(t).map_err(bad)?;
+            if let Scope::Runner { runner } = &mut g.scope
+                && let Some(key) = labels.get(runner.as_str())
+            {
+                key.clone_into(runner);
+            }
             if super::known(&g.what, custom) { Ok(g) } else { Err(bad(format!("`{}` is neither a role nor a capability", g.what))) }
         })
         .collect()
@@ -197,7 +211,7 @@ async fn add_user(hub: &Hub, caller: &Caller, v: &Value) -> Result<Response, Fai
     if name.is_empty() || name.len() > 64 || !name.chars().all(|c| c.is_ascii_alphanumeric() || "-_.@".contains(c)) || name == "admin" || name == "owner" {
         return Err(bad("a user's name is up to 64 letters, digits, `-`, `_`, `.` and `@` (and not admin or owner)"));
     }
-    let grants = parse_grants(&b.grants, &custom(hub).await?)?;
+    let grants = parse_grants(&b.grants, &custom(hub).await?, &runner_labels(hub).await)?;
     let (id, by, n, email) = (crate::util::new_id(), caller.name.clone(), name.clone(), b.email.clone().map(|e| e.trim().to_owned()).filter(|e| e.contains('@')));
     let uid = id.clone();
     let texts: Vec<(String, String, bool)> = grants.iter().map(|g| (g.what.clone(), g.scope.text(), g.deny)).collect();
@@ -297,7 +311,7 @@ struct NewGrant {
 async fn add_grant(hub: &Hub, caller: &Caller, v: &Value) -> Result<Response, Fail> {
     let b: NewGrant = body(v)?;
     let (uid, name) = find_user(hub, &b.user).await?;
-    let g = parse_grants(std::slice::from_ref(&b.grant), &custom(hub).await?)?.into_iter().next().ok_or_else(|| bad("no grant"))?;
+    let g = parse_grants(std::slice::from_ref(&b.grant), &custom(hub).await?, &runner_labels(hub).await)?.into_iter().next().ok_or_else(|| bad("no grant"))?;
     let (what, scope, deny, by) = (g.what.clone(), g.scope.text(), g.deny, caller.name.clone());
     let id = hub
         .store
@@ -419,7 +433,7 @@ async fn mint(hub: &Hub, caller: &Caller, v: &Value) -> Result<Response, Fail> {
     if b.grants.is_empty() {
         return Err(bad("say what the token may do: grants such as `developer@repo:acme/app`, `viewer`, or `owner` for everything its user may"));
     }
-    let grants = parse_grants(&b.grants, &custom(hub).await?)?;
+    let grants = parse_grants(&b.grants, &custom(hub).await?, &runner_labels(hub).await)?;
     let now = crate::util::now_unix();
     let expires_at = if agent {
         now + AGENT_TTL
@@ -505,4 +519,20 @@ async fn rotate(hub: &Hub, caller: &Caller, id: &str) -> Result<Response, Fail> 
     }
     hub.store.audit(caller.name.clone(), "tokens.rotate".into(), id.to_owned()).await;
     Ok(srv::json(StatusCode::OK, &json!({ "id": id, "token": token, "expires_at": expires_at })))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_grant_on_a_runner_by_its_label_is_on_the_runner_kiln_knows_by_its_machine_id() -> Result<(), String> {
+        let id = "5f2a9c3e0b1d4e6f8a7c9b0d1e2f3a4b";
+        let labels = HashMap::from([("build-box".to_owned(), id.to_owned())]);
+        let texts = ["runners.terminal@runner:build-box", "runners.read@runner:fedora", "developer@repo:acme/app"].map(str::to_owned);
+        let grants = parse_grants(&texts, &HashMap::new(), &labels).map_err(|(code, why)| format!("{code}: {why}"))?;
+        // By its label: its id's. By a name that's no label (a runner known by its name): as written.
+        assert_eq!(grants.iter().map(Grant::text).collect::<Vec<_>>(), [format!("runners.terminal@runner:{id}"), "runners.read@runner:fedora".to_owned(), "developer@repo:acme/app".to_owned()]);
+        Ok(())
+    }
 }

@@ -12,7 +12,7 @@ import { Hold } from "@/components/ui/hold";
 import { Loadable } from "@/components/ui/loading";
 import { Crumbs, Facts, Panel, SelectField } from "@/components/ui/misc";
 import { toast } from "@/components/ui/toast";
-import { useRes, type Res } from "@/lib/data";
+import { labelOf, useLabels, useRes, type Res } from "@/lib/data";
 import { formatBytes, relativeTime } from "@/lib/format";
 import { errorMessage } from "@/lib/hooks";
 import { invalidate } from "@/lib/resource";
@@ -48,6 +48,8 @@ export default function HostPage() {
 
 function HostView({ name, range, onRange }: { name: string; range: Range; onRange: (r: Range) => void }) {
   const h = useRes(hostRes(name)).data;
+  // Its runner by the name people see (its label, docs/machines.md).
+  const labels = useLabels();
   const [muting, setMuting] = React.useState(false);
   const p = h.kiln.platform;
   const f = h.kiln.figures;
@@ -143,7 +145,10 @@ function HostView({ name, range, onRange }: { name: string; range: Range; onRang
               ["Kernel", p.kernel],
               ["Cloud", [p.cloud, p.region, p.instance_type].filter(Boolean).join(" · ") || null],
               ["Datadog Agent", p.agent_version],
-              ["kiln", p.kiln_version ? `${p.kiln_version}${h.kiln.runner ? ` (runner ${h.kiln.runner.name}, ${h.kiln.runner.connected ? "connected" : "not connected"})` : ""}` : null],
+              [
+                "kiln",
+                p.kiln_version ? `${p.kiln_version}${h.kiln.runner ? ` (runner ${labelOf(h.kiln.runner.name, labels)}, ${h.kiln.runner.connected ? "connected" : "not connected"})` : ""}` : null,
+              ],
               ["Reported by", h.sources.join(", ") || "its series alone"],
               ["Series", String(h.kiln.series)],
               ["Also called", h.aliases.join(", ") || null],

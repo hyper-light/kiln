@@ -5,6 +5,7 @@ import { RotateCcw, Square } from "lucide-react";
 import { ci, reviewOf, waitSentence, type CiAnnotation, type CiMetric, type CiRunDetail, type CiTest, type RerunMode } from "@/api/ci";
 import { Button } from "@/components/ui/button";
 import { Confirm, Panel, SelectField, TextField } from "@/components/ui/misc";
+import { labelOf, useLabels } from "@/lib/data";
 import { Link } from "@/lib/router";
 import { toast } from "@/components/ui/toast";
 import { formatBytes, formatDuration } from "@/lib/format";
@@ -502,6 +503,7 @@ export function Annotations({ list, title = "Annotations" }: { list: CiAnnotatio
 /** A leg's attempts when it took more than one, or its one ended with a failure class (each
  * attempt's end, why it failed, and where it ran), and its outputs (W21-R05). */
 function Attempts({ legId }: { legId: string }) {
+  useLabels();
   const d = useSuspenseResource(`ci-leg/${legId}/detail`, (s) => ci.legDetail(legId, s)).data;
   const list = d.attempts ?? [];
   const outputs = Object.entries(d.outputs ?? {});
@@ -518,7 +520,7 @@ function Attempts({ legId }: { legId: string }) {
                 <span className="font-mono text-[11px] text-[#a6b2c6]">{a.conclusion ?? a.status}</span>
                 {a.class && <span className="font-mono text-[10px] tracking-[0.06em] text-[#c9a86a] uppercase">{a.class}</span>}
                 <span className="ml-auto font-mono text-[10.5px] text-[#7f8a9a]">
-                  {[a.runner, a.executor, took, a.exit_code !== null && a.exit_code !== 0 ? `exit ${a.exit_code}` : null].filter(Boolean).join(" · ")}
+                  {[a.runner && labelOf(a.runner), a.executor, took, a.exit_code !== null && a.exit_code !== 0 ? `exit ${a.exit_code}` : null].filter(Boolean).join(" · ")}
                 </span>
                 {a.error && <span className="w-full font-mono text-[10.5px] [overflow-wrap:anywhere] text-[#d1aaad]">{a.error}</span>}
               </li>
@@ -679,7 +681,8 @@ function LegDebug({ runId, legId, running, keptUntil }: { runId: string; legId: 
 
 function WhyWaiting({ legId }: { legId: string }) {
   const r = useSuspenseResource(`ci-routing/${legId}`, (s) => ci.routing(legId, s), { on: ["job"] }).data;
-  const why = waitSentence(r.wait_reason);
+  const labels = useLabels();
+  const why = waitSentence(r.wait_reason, labels);
   return (
     <div className="px-5 py-3">
       {why && <p className="text-[13px] text-[#d4dde8]">{why}</p>}
@@ -689,7 +692,7 @@ function WhyWaiting({ legId }: { legId: string }) {
             const failing = x.checks.filter((c) => !c.pass);
             return (
               <li key={x.runner} className="font-mono text-[11px] leading-[1.6] text-[#a6b2c6]">
-                <span className={x.eligible ? "text-[#b8d9d2]" : "text-[#d1aaad]"}>{x.name}</span>
+                <span className={x.eligible ? "text-[#b8d9d2]" : "text-[#d1aaad]"}>{labelOf(x.name, labels)}</span>
                 {x.eligible ? (x.room ? " — can take it" : " — eligible, busy") : ` — ${failing.map((c) => `needs ${c.requirement}, has ${c.value || "nothing"}`).join("; ")}`}
                 {!x.connected && " (offline)"}
               </li>

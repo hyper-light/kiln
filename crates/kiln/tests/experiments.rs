@@ -252,7 +252,7 @@ fn w20_r11_measured_beside_the_agent_without_ci() -> anyhow::Result<()> {
     assert_eq!(e.get("state"), Some(&json!("done")), "{e}");
     let runs = e.get("runs").and_then(Value::as_array).cloned().unwrap_or_default();
     assert_eq!(runs.len(), 16, "eight variants, twice each: {e}");
-    assert!(runs.iter().all(|r| r.get("on") == Some(&json!("box")) && r.get("run").is_none() && r.get("conclusion").is_some_and(|c| c == "success" || c == "failure")), "each on the agent's machine, none a CI run: {e}");
+    assert!(runs.iter().all(|r| r.get("on") == Some(&json!(common::machine("box"))) && r.get("run").is_none() && r.get("conclusion").is_some_and(|c| c == "success" || c == "failure")), "each on the agent's machine, none a CI run: {e}");
     let fought = runs.iter().find(|r| r.get("variant") == Some(&json!("b+c"))).cloned().unwrap_or_default();
     assert!(fought.get("why").and_then(Value::as_str).is_some_and(|w| w.contains("exit code 1") && w.contains("b and c fight")), "a failing check says why: {fought}");
     let results = e.get("results").cloned().unwrap_or_default();

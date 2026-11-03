@@ -1008,7 +1008,7 @@ impl Sim {
             Frame::Steps(steps) => {
                 let blobs = &self.server.blobs;
                 let seqs: Vec<u64> = steps.iter().map(|s| s.seq).collect();
-                let Taking { want, again, dropped, proposed } = take_steps(r, &mut self.server.next, |h| blobs.contains_key(h), &name, &[member], steps);
+                let Taking { want, again, dropped, proposed } = take_steps(r, &mut self.server.next, |h| blobs.contains_key(h), &name, &name, &[member], steps);
                 let next = self.server.next.get(&member).copied();
                 self.counts.again += again;
                 let now = self.clock.elapsed();

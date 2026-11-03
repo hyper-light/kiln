@@ -10,6 +10,7 @@ import { Hold } from "@/components/ui/hold";
 import { Loadable } from "@/components/ui/loading";
 import { Crumbs, EmptyState, Panel } from "@/components/ui/misc";
 import { StatusDot } from "@/components/ui/status";
+import { labelOf, useLabels } from "@/lib/data";
 import { formatDuration, shortSha } from "@/lib/format";
 import { Link, useParams, useSearchParams } from "@/lib/router";
 import { useSuspenseResource } from "@/lib/resource";
@@ -93,9 +94,10 @@ function CompareBody({ run, other, leg }: { run: string; other: string; leg: str
   );
 }
 
-/** A value of a difference: an action's `ref sha` as ref and short SHA, the rest as they are. */
+/** A value of a difference: an action's `ref sha` as ref and short SHA, a runner as people know it (its label), the rest as they are. */
 function value(kind: string, v: string | null) {
   if (v === null) return <span className="text-[#6d7078]">none</span>;
+  if (kind === "runner" || kind === "machine") return labelOf(v);
   if (kind === "action") {
     const [ref, sha] = v.split(" ");
     return (
@@ -116,6 +118,7 @@ function value(kind: string, v: string | null) {
 }
 
 function Differences({ items }: { items: CiDifference[] }) {
+  useLabels();
   return (
     <div className="table-wrap">
       <table className="data-table">

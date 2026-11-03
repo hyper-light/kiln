@@ -10,6 +10,7 @@ import { StatusGlyph } from "@/components/ui/status-glyph";
 import { GLYPHS } from "@/components/ui/status-glyph-spec";
 import { glyphOf, pickCard, shipGroups, strip } from "./model";
 import { reviewGroup, type ShipLane, type ShipLaneGroup } from "./review/lanes";
+import { labelOf, useLabels } from "@/lib/data";
 import { formatDuration } from "@/lib/format";
 import { errorMessage, useMediaQuery } from "@/lib/hooks";
 import { useSuspenseResource } from "@/lib/resource";
@@ -134,6 +135,8 @@ export function JobsPane({ commit, output }: { commit: ShipCommit; output: (pick
   const stations = React.useMemo(() => stationsOf(detail.data), [detail.data]);
   const byLane = React.useMemo(() => jobsByLane(detail.data.jobs ?? []), [detail.data.jobs]);
   const phone = useMediaQuery("(max-width: 700px)");
+  // A job's runner is shown by its label (docs/machines.md).
+  useLabels();
   const [pick, setPick] = React.useState<Pick>({ at: null, sel: [], word: null });
   const [armed, setArmed] = React.useState(false);
   const [said, setSaid] = React.useState<{ text: string; refused: boolean } | null>(null);
@@ -320,7 +323,7 @@ function standOf(l: ShipLane, j: ShipJob): string {
   if (j.paused_at != null) return "paused · Resume lets it go on from where it was";
   switch (l.state) {
     case "running":
-      return j.runner ? `running on ${j.runner}` : "running";
+      return j.runner ? `running on ${labelOf(j.runner)}` : "running";
     case "failed":
     case "error":
       return "failed · Retry runs it again, and what needs it";

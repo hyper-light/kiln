@@ -402,6 +402,8 @@ async fn unsigned(hub: &Hub, job: &str) -> anyhow::Result<Option<String>> {
     // itself, or of the leg as it asked for that identity).
     let delegated = !crate::identities::delegations_of(&hub.store, job).await?.is_empty();
     let signs = hub.runner_wide_caps(&a) & crate::proto::CAP_LEG_SIGNS != 0 || leg_signs(&hub.store, job).await?;
+    // Its runner by the name people see (docs/machines.md).
+    let a = hub.shown(&a);
     Ok(Some(match (delegated, signs) {
         (true, true) => format!("its runner {a} sent none: the leg hasn't ended, or what it sent was lost on the way"),
         (true, false) => format!("its runner {a} signs no legs' records: a kiln from before them"),

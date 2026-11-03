@@ -44,6 +44,7 @@ fn info(name: &str, fp: &str) -> RunnerInfo {
     RunnerInfo {
         name: name.into(),
         hostname: format!("{name}.lan"),
+        label: None,
         os: if name == "mac" { "macos".into() } else { "linux".into() },
         arch: if name == "mac" { "aarch64".into() } else { "x86_64".into() },
         connected: true,
@@ -133,7 +134,7 @@ async fn lab_with(objects: [Option<Arc<crate::runner::work::store::Store>>; 2]) 
                         e.lock().push(link.clone());
                     }
                     let p = Arc::clone(&peers);
-                    let out = relay.forward(from, from_peer, Frame { to, link, open, data, close }, move |n| p.lock().get(n).copied()).sends(from_peer, false);
+                    let out = relay.forward(from, from_peer, Frame { to, link, open, data, close }, move |n| p.lock().get(n).copied(), str::to_owned).sends(from_peer, false);
                     for (to, sm) in out {
                         deliver(&peers, &handle_of, to, sm).await;
                     }
@@ -895,9 +896,9 @@ fn a_links_ends_are_known_open_and_lately_closed() {
     let mut r = Relay::default();
     r.announce("linux", Announce { fingerprint: "f".into(), accept: true, version: 1 });
     let peers = |n: &str| (n == "linux").then_some(20).or((n == "mac").then_some(10));
-    r.forward("mac", 10, Frame { to: "linux".into(), link: "L1".into(), open: true, data: Vec::new(), close: None }, peers);
+    r.forward("mac", 10, Frame { to: "linux".into(), link: "L1".into(), open: true, data: Vec::new(), close: None }, peers, str::to_owned);
     assert_eq!(r.ends("L1"), Some(("mac".into(), "linux".into())));
-    r.forward("mac", 10, Frame { to: "linux".into(), link: "L1".into(), open: false, data: Vec::new(), close: Some("done".into()) }, peers);
+    r.forward("mac", 10, Frame { to: "linux".into(), link: "L1".into(), open: false, data: Vec::new(), close: Some("done".into()) }, peers, str::to_owned);
     assert_eq!(r.links(), 0);
     assert_eq!(r.ends("L1"), Some(("mac".into(), "linux".into())), "kept a while after it closed");
     assert_eq!(r.ends("L2"), None);

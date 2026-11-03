@@ -124,7 +124,7 @@ export interface ShipDetail extends ShipCommit {
   /** The Review lane group's marks, oldest first; a commit with no change has the one, its push. */
   review?: ShipMark[];
   checks?: { pipeline: string; legs: { name: string; state: string; attempts: number; note: string; job?: string; run?: string; start?: number; end?: number }[] }[];
-  build?: { platforms: { name: string; state: ShipPart }[]; image: { state: ShipPart; digest: string | null } };
+  build?: { platforms: { name: string; state: ShipPart; job?: string; run?: string; start?: number; end?: number }[]; image: { state: ShipPart; digest: string | null } };
   deployments?: { environment: string; production: boolean; state: string | null; description: string | null; at: number }[];
   releases?: { state: string; message: string | null; rolled_back: boolean }[];
   replant?: { name: string; state: string; why: string }[];

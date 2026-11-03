@@ -9,7 +9,7 @@ import { ci, type CiRouteExplain, type CiRoutingRule } from "@/api/ci";
 import { Button } from "@/components/ui/button";
 import { Hold } from "@/components/ui/hold";
 import { SettingRow, SettingsGroup } from "@/components/ui/settings";
-import { reposRes, useRes } from "@/lib/data";
+import { labelOf, reposRes, useLabels, useRes } from "@/lib/data";
 import { errorMessage } from "@/lib/hooks";
 import { useSuspenseResource } from "@/lib/resource";
 
@@ -305,6 +305,7 @@ function RoutingTester() {
 }
 
 function Explained({ e }: { e: CiRouteExplain }) {
+  useLabels();
   return (
     <div className="mt-4" aria-label="Where it would go">
       <SettingRow label="Its routing" help={e.rules.length ? `From ${e.rules.length} rule${e.rules.length === 1 ? "" : "s"}: ${e.rules.map((r) => r.source).join(", ")}` : "No rule matched."}>
@@ -326,7 +327,7 @@ function Explained({ e }: { e: CiRouteExplain }) {
             <li key={r.name}>
               <div className="st-item">
                 <i className="dot" data-status={r.eligible ? (r.room === false ? "queued" : "succeeded") : "failed"} aria-hidden="true" />
-                <span className="st-item-name">{r.name}</span>
+                <span className="st-item-name">{labelOf(r.name)}</span>
                 <span className="st-item-meta">
                   {r.eligible
                     ? r.room === false

@@ -45,6 +45,7 @@ import {
   AUTOJOIN,
   DNS_SD_DOMAINS,
   INSTANCE_SEEDS,
+  MAC_MINI,
   PROBE_FIND,
   SCAN_FIND,
   SERVER_ADDR,
@@ -253,13 +254,119 @@ function addAgent(a: Omit<Agent, keyof ReturnType<typeof defaultRunner>> & Parti
   return agent;
 }
 
+/** A name a machine can be, as kiln keeps one (`pki::sanitize_name`): ASCII letters, digits, `-` and `.`, lowercase, anything else `-`; no `-` or `.` at either end; at most 63. */
+function machineName(s: string): string {
+  const n = [...s]
+    .map((c) => (/^[A-Za-z0-9.-]$/.test(c) ? c.toLowerCase() : "-"))
+    .join("")
+    .replace(/^[-.]+|[-.]+$/g, "");
+  return n ? n.slice(0, 63) : "agent";
+}
+/** The server's own name, which no machine can have (`pki::reserved`). */
+const reservedName = (n: string) => n.replace(/\.+$/, "").toLowerCase() === "kiln-server";
+/** Which runner, as the audit says it: its label and its id, else its name. */
+const shownAs = (a: Agent) => (a.label ? `${a.label} (${a.name})` : a.name);
+
 const t = now();
-addAgent({ name: "metal-ryzen-01", labels: ["baremetal", "bench", "linux", "x86_64"], slots: 2, hostname: "ryzen-01.lan", os: "linux", arch: "x86_64", version: VERSION, ephemeral: false, connected: true, last_seen: t, enrolled_at: t - 86400 * 40 }, newHost(16, 64, 2000));
-addAgent({ name: "metal-ryzen-02", labels: ["baremetal", "linux", "x86_64"], slots: 4, hostname: "ryzen-02.lan", os: "linux", arch: "x86_64", version: VERSION, ephemeral: false, connected: true, last_seen: t, enrolled_at: t - 86400 * 38 }, newHost(24, 128, 4000));
-addAgent({ name: "metal-epyc-01", labels: ["baremetal", "bench", "gpu", "linux", "x86_64"], slots: 8, hostname: "epyc-01.rack2", os: "linux", arch: "x86_64", version: VERSION, ephemeral: false, connected: true, last_seen: t, enrolled_at: t - 86400 * 12 }, newHost(64, 512, 8000));
-addAgent({ name: "metal-mac-mini", labels: ["baremetal", "macos", "arm64"], slots: 2, hostname: "mac-mini.lan", os: "macos", arch: "aarch64", version: VERSION, ephemeral: false, connected: true, last_seen: t, enrolled_at: t - 86400 * 9 }, newHost(10, 32, 1000));
-addAgent({ name: "metal-pi-04", labels: ["baremetal", "arm64", "linux"], slots: 1, hostname: "pi-04.lan", os: "linux", arch: "aarch64", version: "0.0.9", ephemeral: false, connected: true, last_seen: t, enrolled_at: t - 86400 * 60, draining: true }, newHost(4, 8, 120));
-addAgent({ name: "metal-nuc-old", labels: ["baremetal", "linux", "x86_64"], slots: 2, hostname: "nuc.lan", os: "linux", arch: "x86_64", version: "0.0.8", ephemeral: false, connected: false, last_seen: t - 86400 * 2 - 3600, enrolled_at: t - 86400 * 120 }, newHost(8, 16, 500));
+addAgent(
+  {
+    name: "metal-ryzen-01",
+    labels: ["baremetal", "bench", "linux", "x86_64"],
+    slots: 2,
+    hostname: "ryzen-01.lan",
+    os: "linux",
+    arch: "x86_64",
+    version: VERSION,
+    ephemeral: false,
+    connected: true,
+    last_seen: t,
+    enrolled_at: t - 86400 * 40,
+  },
+  newHost(16, 64, 2000),
+);
+addAgent(
+  {
+    name: "metal-ryzen-02",
+    labels: ["baremetal", "linux", "x86_64"],
+    slots: 4,
+    hostname: "ryzen-02.lan",
+    os: "linux",
+    arch: "x86_64",
+    version: VERSION,
+    ephemeral: false,
+    connected: true,
+    last_seen: t,
+    enrolled_at: t - 86400 * 38,
+  },
+  newHost(24, 128, 4000),
+);
+addAgent(
+  {
+    name: "metal-epyc-01",
+    labels: ["baremetal", "bench", "gpu", "linux", "x86_64"],
+    slots: 8,
+    hostname: "epyc-01.rack2",
+    os: "linux",
+    arch: "x86_64",
+    version: VERSION,
+    ephemeral: false,
+    connected: true,
+    last_seen: t,
+    enrolled_at: t - 86400 * 12,
+  },
+  newHost(64, 512, 8000),
+);
+// Known by its machine id, shown by its label (docs/machines.md).
+addAgent(
+  {
+    name: MAC_MINI,
+    label: "metal-mac-mini",
+    labels: ["baremetal", "macos", "arm64"],
+    slots: 2,
+    hostname: "mac-mini.lan",
+    os: "macos",
+    arch: "aarch64",
+    version: VERSION,
+    ephemeral: false,
+    connected: true,
+    last_seen: t,
+    enrolled_at: t - 86400 * 9,
+  },
+  newHost(10, 32, 1000),
+);
+addAgent(
+  {
+    name: "metal-pi-04",
+    labels: ["baremetal", "arm64", "linux"],
+    slots: 1,
+    hostname: "pi-04.lan",
+    os: "linux",
+    arch: "aarch64",
+    version: "0.0.9",
+    ephemeral: false,
+    connected: true,
+    last_seen: t,
+    enrolled_at: t - 86400 * 60,
+    draining: true,
+  },
+  newHost(4, 8, 120),
+);
+addAgent(
+  {
+    name: "metal-nuc-old",
+    labels: ["baremetal", "linux", "x86_64"],
+    slots: 2,
+    hostname: "nuc.lan",
+    os: "linux",
+    arch: "x86_64",
+    version: "0.0.8",
+    ephemeral: false,
+    connected: false,
+    last_seen: t - 86400 * 2 - 3600,
+    enrolled_at: t - 86400 * 120,
+  },
+  newHost(8, 16, 500),
+);
 // What kiln couldn't read of metal-ryzen-01, of the server's to it and of reach's, kept for its page (refused.ts).
 const refusing = agents.get("metal-ryzen-01");
 if (refusing) refusing.refused = runnerRefused();
@@ -417,7 +524,7 @@ function historicalRun(created: number, seed: number) {
     const deps = sj.tpl.needs;
     const depFailed = deps.some((d) => statusOf.get(d) !== "succeeded");
     const ready = Math.max(created + 3, ...deps.map((d) => finish.get(d) ?? created));
-    if (depFailed || runStatus === "cancelled" && i > sjobs.length / 2) {
+    if (depFailed || (runStatus === "cancelled" && i > sjobs.length / 2)) {
       sj.job.status = runStatus === "cancelled" ? "cancelled" : "skipped";
       sj.steps.forEach((s) => (s.status = sj.job.status));
       statusOf.set(sj.tpl.key, sj.job.status);
@@ -449,7 +556,15 @@ function historicalRun(created: number, seed: number) {
       }
     }
     const isK8s = sj.tpl.labels.includes("k8s");
-    const agent = isK8s ? `kiln-pod-${seed.toString(36).slice(0, 5)}${i}` : pick(r, fleet.filter((a) => sj.tpl.labels.every((l) => a.labels.includes(l))).map((a) => a.name).concat(["metal-ryzen-02"]));
+    const agent = isK8s
+      ? `kiln-pod-${seed.toString(36).slice(0, 5)}${i}`
+      : pick(
+          r,
+          fleet
+            .filter((a) => sj.tpl.labels.every((l) => a.labels.includes(l)))
+            .map((a) => a.name)
+            .concat(["metal-ryzen-02"]),
+        );
     Object.assign(sj.job, {
       status: jobStatus,
       agent,
@@ -665,7 +780,11 @@ function assign(sj: SimJob): boolean {
     if (pods >= 6) return false;
     const name = `kiln-pod-${randomBytes(3).toString("hex")}`;
     const host = newHost(4, 8, 50);
-    const a = addAgent({ name, labels: ["k8s", "linux", "x86_64"], slots: 1, hostname: name, os: "linux", arch: "x86_64", version: VERSION, ephemeral: true, connected: true, last_seen: now(), enrolled_at: now() }, host, false);
+    const a = addAgent(
+      { name, labels: ["k8s", "linux", "x86_64"], slots: 1, hostname: name, os: "linux", arch: "x86_64", version: VERSION, ephemeral: true, connected: true, last_seen: now(), enrolled_at: now() },
+      host,
+      false,
+    );
     history.set(name, []);
     sj.job.agent = name;
     sj.job.executor = "k8s";
@@ -774,7 +893,7 @@ const pastReleases: Run[] = [
       s.dur *= 12;
       Object.assign(s, { status: "succeeded", exit_code: 0, started_at: Math.floor(t), finished_at: Math.floor((t += s.dur)) });
     }
-    const agent = tpl.labels.includes("macos") ? "metal-mac-mini" : "metal-ryzen-01";
+    const agent = tpl.labels.includes("macos") ? MAC_MINI : "metal-ryzen-01";
     Object.assign(sj.job, {
       status: "succeeded",
       agent,
@@ -807,7 +926,7 @@ function finishJob(sj: SimJob, status: Status, error: string | null) {
   j.finished_at = now();
   j.exit_code = status === "succeeded" ? 0 : status === "failed" ? 101 : null;
   j.error = error;
-  j.cpu_seconds = Math.round(((j.finished_at - (j.started_at ?? j.finished_at)) * between(0.5, 5)) * 10) / 10;
+  j.cpu_seconds = Math.round((j.finished_at - (j.started_at ?? j.finished_at)) * between(0.5, 5) * 10) / 10;
   freeAgent(j.agent, j.id);
   syncJob(sj);
   emit({ type: "job", job: j });
@@ -1010,7 +1129,22 @@ function seedInstance(s: InstanceSeed, at = now()): MockInstance {
 // This server shows up too: through its own DNS-SD zone and the last scan.
 instances.set(
   SERVER_INSTANCE_ID,
-  seedInstance({ id: SERVER_INSTANCE_ID, name: HOSTNAME, role: "server", version: "", os: SERVER_OS, arch: SERVER_ARCH, port: 7070, quic: 7071, ca: SERVER_CA, enrolled: null, addresses: [SERVER_ADDR], via: ["dns-sd", "scan"], firstAgo: 86_000, lastAgo: 4 }),
+  seedInstance({
+    id: SERVER_INSTANCE_ID,
+    name: HOSTNAME,
+    role: "server",
+    version: "",
+    os: SERVER_OS,
+    arch: SERVER_ARCH,
+    port: 7070,
+    quic: 7071,
+    ca: SERVER_CA,
+    enrolled: null,
+    addresses: [SERVER_ADDR],
+    via: ["dns-sd", "scan"],
+    firstAgo: 86_000,
+    lastAgo: 4,
+  }),
 );
 if (!EMPTY_NETWORK) for (const s of INSTANCE_SEEDS) instances.set(s.id, seedInstance(s));
 
@@ -1069,8 +1203,14 @@ if (!EMPTY_NETWORK) {
   const studio = INSTANCE_SEEDS.find((s) => s.name === "studio-mbp.lan")!;
   addJoinRequest(requestFrom(instances.get(studio.id)!), { code: "482913", ago: 95, instance: studio.id });
   // Two machines that are not on this network: one over the internet, one over Tailscale.
-  addJoinRequest({ name: "ci-win-02", hostname: "CI-WIN-02", os: "windows", arch: "x86_64", labels: ["baremetal", "windows", "x86_64"], version: VERSION, address: "203.0.113.24" }, { code: "731064", ago: 40 });
-  addJoinRequest({ name: "gpu-box", hostname: "gpu-box", os: "linux", arch: "x86_64", labels: ["baremetal", "gpu", "linux", "x86_64"], version: "0.0.9", address: "100.70.3.9" }, { code: false, ago: 3, confirmMs: 9000 });
+  addJoinRequest(
+    { name: "ci-win-02", hostname: "CI-WIN-02", os: "windows", arch: "x86_64", labels: ["baremetal", "windows", "x86_64"], version: VERSION, address: "203.0.113.24" },
+    { code: "731064", ago: 40 },
+  );
+  addJoinRequest(
+    { name: "gpu-box", hostname: "gpu-box", os: "linux", arch: "x86_64", labels: ["baremetal", "gpu", "linux", "x86_64"], version: "0.0.9", address: "100.70.3.9" },
+    { code: false, ago: 3, confirmMs: 9000 },
+  );
 }
 
 // Requests live 10 minutes; a machine still waiting asks again, with a new code. Decided ones go.
@@ -1084,7 +1224,10 @@ setInterval(() => {
     if (jr.status !== "pending") continue;
     const inst = [...instances.values()].find((i) => i.request === jr.id);
     if (inst) inst.request = null;
-    addJoinRequest({ name: jr.name, hostname: jr.hostname, os: jr.os, arch: jr.arch, labels: jr.labels, version: jr.version, address: jr.address }, { code: false, instance: inst?.id, confirmMs: 2000 });
+    addJoinRequest(
+      { name: jr.name, hostname: jr.hostname, os: jr.os, arch: jr.arch, labels: jr.labels, version: jr.version, address: jr.address },
+      { code: false, instance: inst?.id, confirmMs: 2000 },
+    );
   }
   if (changed) {
     emit({ type: "join_requests" });
@@ -1124,7 +1267,7 @@ function inCidr(addr: string, c: string): boolean {
   const b = ipv4(base);
   if (a === null || b === null) return false;
   const mask = Number(bits) === 0 ? 0 : (~0 << (32 - Number(bits))) >>> 0;
-  return ((a & mask) >>> 0) === ((b & mask) >>> 0);
+  return (a & mask) >>> 0 === (b & mask) >>> 0;
 }
 
 function startScan(cidrs: string[], total: number): ScanState {
@@ -1190,14 +1333,50 @@ function joinInfo(): JoinInfo & { quic: string; manual: string } {
 function planAutojoin() {
   if (autojoinPlanned) return;
   autojoinPlanned = true;
-  setTimeout(() => {
-    if (agents.has(AUTOJOIN.name)) return;
-    const a = addAgent({ name: AUTOJOIN.name, labels: ["baremetal", "linux", "aarch64"], slots: 1, hostname: AUTOJOIN.hostname, os: AUTOJOIN.os, arch: AUTOJOIN.arch, version: VERSION, ephemeral: false, connected: true, last_seen: now(), enrolled_at: now() }, newHost(4, 8, 250));
-    instances.set(AUTOJOIN.id, seedInstance({ id: AUTOJOIN.id, name: AUTOJOIN.hostname, role: "agent", version: "", os: AUTOJOIN.os, arch: AUTOJOIN.arch, port: 0, quic: 0, ca: null, enrolled: SERVER_CA, addresses: [AUTOJOIN.address], via: ["mdns"], firstAgo: 0, lastAgo: 0 }));
-    addAudit(AUTOJOIN.name, "agent.enroll", "");
-    emit({ type: "agent", agent: a });
-    emit({ type: "discovery" });
-  }, Number(process.env.MOCK_AUTOJOIN_SECONDS ?? 30) * 1000);
+  setTimeout(
+    () => {
+      if (agents.has(AUTOJOIN.name)) return;
+      const a = addAgent(
+        {
+          name: AUTOJOIN.name,
+          labels: ["baremetal", "linux", "aarch64"],
+          slots: 1,
+          hostname: AUTOJOIN.hostname,
+          os: AUTOJOIN.os,
+          arch: AUTOJOIN.arch,
+          version: VERSION,
+          ephemeral: false,
+          connected: true,
+          last_seen: now(),
+          enrolled_at: now(),
+        },
+        newHost(4, 8, 250),
+      );
+      instances.set(
+        AUTOJOIN.id,
+        seedInstance({
+          id: AUTOJOIN.id,
+          name: AUTOJOIN.hostname,
+          role: "agent",
+          version: "",
+          os: AUTOJOIN.os,
+          arch: AUTOJOIN.arch,
+          port: 0,
+          quic: 0,
+          ca: null,
+          enrolled: SERVER_CA,
+          addresses: [AUTOJOIN.address],
+          via: ["mdns"],
+          firstAgo: 0,
+          lastAgo: 0,
+        }),
+      );
+      addAudit(AUTOJOIN.name, "agent.enroll", "");
+      emit({ type: "agent", agent: a });
+      emit({ type: "discovery" });
+    },
+    Number(process.env.MOCK_AUTOJOIN_SECONDS ?? 30) * 1000,
+  );
 }
 
 function discoveryInfo(): DiscoveryInfo {
@@ -1212,7 +1391,13 @@ function discoveryInfo(): DiscoveryInfo {
   const methods: DiscoveryMethod[] = [
     method("mdns", "Multicast DNS", "active", `${mdnsInterfaces(SERVER_OS)} · announcing kiln server on ${HOSTNAME}`, "mdns"),
     NATIVE
-      ? method("native", SERVER_OS === "macos" ? "Bonjour (macOS)" : "Windows DNS-SD", "active", SERVER_OS === "macos" ? "mDNSResponder · browsing _kiln._tcp in local." : "DnsServiceBrowse · browsing _kiln._tcp.local", "native")
+      ? method(
+          "native",
+          SERVER_OS === "macos" ? "Bonjour (macOS)" : "Windows DNS-SD",
+          "active",
+          SERVER_OS === "macos" ? "mDNSResponder · browsing _kiln._tcp in local." : "DnsServiceBrowse · browsing _kiln._tcp.local",
+          "native",
+        )
       : method("native", "Bonjour (macOS)", "unavailable", "only on macOS and Windows; multicast DNS covers Linux"),
     method("dns-sd", `DNS-SD (${DNS_SD_DOMAINS[0]})`, "active", `browsing _kiln._tcp.${DNS_SD_DOMAINS[0]} through 192.168.1.1`, "dns-sd"),
     method("dns-sd", `DNS-SD (${DNS_SD_DOMAINS[1]})`, "error", `SERVFAIL from 10.10.0.2 for _kiln._tcp.${DNS_SD_DOMAINS[1]}`),
@@ -1527,7 +1712,7 @@ const server = http.createServer(async (req, res) => {
     if (await handleShip(req, res, url, { json, liveJob, liveRun, push: () => void startRun(repos.find((r) => r.name === "hyper-light/kiln") ?? repos[0]!, { branch: "main", event: "push" }) })) return;
     if (await handleFamily(req, res, url, () => [longInfo(), ...fastInfos(), ...reviewInfos()])) return;
     // ---- harness accounts (and the demo agents to see them from) ----
-    if (await handleMachines(req, res, url, { json, body })) return;
+    if (await handleMachines(req, res, url, { json, body, label: (name) => agents.get(name)?.label })) return;
     // ---- copies runners keep of other runners' trees (docs/reach.md §5.1) ----
     if (await handleKeep(req, res, url, { json, body })) return;
     // ---- the reaper's policies (W24-R31) ----
@@ -1705,7 +1890,11 @@ const server = http.createServer(async (req, res) => {
 
     // ---- joining and discovery ----
     if (p === "/api/join-requests" && m === "GET") {
-      return json(res, 200, [...joinRequests.values()].sort((a, b) => a.created_at - b.created_at));
+      return json(
+        res,
+        200,
+        [...joinRequests.values()].sort((a, b) => a.created_at - b.created_at),
+      );
     }
     if ((mm = p.match(/^\/api\/join-requests\/([^/]+)\/(approve|deny)$/)) && m === "POST") {
       const jr = joinRequests.get(decodeURIComponent(mm[1]!));
@@ -1734,7 +1923,10 @@ const server = http.createServer(async (req, res) => {
       emit({ type: "discovery" });
       // The machine picks up its certificate on its next poll, installs its runner and connects.
       setTimeout(() => {
-        const a = addAgent({ name, labels, slots: 2, hostname: jr.hostname, os: jr.os, arch: jr.arch, version: jr.version || VERSION, ephemeral: false, connected: true, last_seen: now(), enrolled_at: now() }, newHost(8, 32, 1000));
+        const a = addAgent(
+          { name, labels, slots: 2, hostname: jr.hostname, os: jr.os, arch: jr.arch, version: jr.version || VERSION, ephemeral: false, connected: true, last_seen: now(), enrolled_at: now() },
+          newHost(8, 32, 1000),
+        );
         emit({ type: "agent", agent: a });
         emit({ type: "discovery" });
       }, 2500);
@@ -1760,7 +1952,10 @@ const server = http.createServer(async (req, res) => {
       const b = await body<{ address?: string }>(req);
       const address = (b.address ?? "").trim();
       if (!address) return err(res, 400, "address is required");
-      const host = address.replace(/^\[(.*)\](:\d+)?$/, "$1").replace(/:\d+$/, "").toLowerCase();
+      const host = address
+        .replace(/^\[(.*)\](:\d+)?$/, "$1")
+        .replace(/:\d+$/, "")
+        .toLowerCase();
       if (host.endsWith(".invalid")) return err(res, 400, `cannot resolve ${host}`);
       await sleep(600 + rnd() * 900);
       let found = [...instances.values()].filter((i) => i.addresses.includes(host) || [i.name, i.name.replace(/\.lan$/, "")].includes(host));
@@ -1814,6 +2009,24 @@ const server = http.createServer(async (req, res) => {
       emit({ type: "agent", agent: a });
       addAudit("admin", a.draining ? "agent.drain" : "agent.undrain", a.name);
       return noContent(res);
+    }
+    // The name people see for a runner, which kiln goes on knowing by its name (docs/machines.md),
+    // as the server keeps it (api.rs `label_agent`): one another runner has, as its name or its
+    // label, is refused.
+    if ((mm = p.match(/^\/api\/agents\/([^/]+)\/label$/)) && m === "POST") {
+      const b = await body<{ label?: unknown }>(req);
+      if (typeof b.label !== "string") return err(res, 400, "missing field `label`");
+      const label = machineName(b.label.trim());
+      if (!b.label.trim() || reservedName(label)) return err(res, 400, `${JSON.stringify(b.label)} can't be a runner's name`);
+      const name = decodeURIComponent(mm[1]!);
+      const a = agents.get(name);
+      if (!a) return err(res, 404, `no runner \`${name}\``);
+      const other = [...agents.values()].find((o) => o.name !== name && (o.name === label || o.label === label));
+      if (other) return err(res, 409, `${label} is another runner's name (${shownAs(other)})`);
+      addAudit("admin", "agent.label", `${shownAs(a)} is shown as ${label}`);
+      a.label = label;
+      emit({ type: "agent", agent: a });
+      return json(res, 200, { name, label });
     }
 
     // ---- folders on machines (the folder picker) ----
@@ -1871,7 +2084,14 @@ const server = http.createServer(async (req, res) => {
     if (await handleReview(req, res, url, { json, err, body, emit: (ev) => emit(ev as never) })) return;
     if (await handlePush(req, res, url, { json, err, body, emit, noContent })) return;
     if (await handleDoctor(req, res, url, { json, err, body, runners: () => [...agents.values()].map((a) => ({ name: a.name, connected: a.connected, os: a.os })) })) return;
-    if (await handleStores(req, res, url, { json, err, runners: () => [...agents.values()].filter((a) => !a.ephemeral).map((a) => ({ name: a.name, connected: a.connected, version: a.version, last_seen: a.last_seen })) })) return;
+    if (
+      await handleStores(req, res, url, {
+        json,
+        err,
+        runners: () => [...agents.values()].filter((a) => !a.ephemeral).map((a) => ({ name: a.name, connected: a.connected, version: a.version, last_seen: a.last_seen })),
+      })
+    )
+      return;
     if (await handlePlaces(req, res, url, { agents: () => [...agents.values()], repos: () => repos, emit, json, err, body })) return;
     if (await handleSettings(req, res, url, { json, err, body })) return;
     if (
@@ -2066,4 +2286,3 @@ server.listen(PORT, HOST, () => {
   console.log(`  terminal          ${ptyMod ? "node-pty (real PTY)" : "echo fallback"}`);
   console.log(`  runs              ${runs.length} historical, ${agents.size} agents, ${repos.length} repos\n`);
 });
-

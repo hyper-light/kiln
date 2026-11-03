@@ -273,7 +273,7 @@ async fn here(cfg: &crate::config::Config) -> Option<plan::Server> {
     if !up {
         return None;
     }
-    let runner = cfg.local_agent.enabled.then(|| crate::pki::sanitize_name(&cfg.local_agent_name()));
+    let runner = cfg.local_agent.enabled.then(|| cfg.local_agent_key());
     let mut server = plan::Server { url: url.clone(), runner: runner.clone(), password: crate::password::path(cfg).exists(), ..plan::Server::default() };
     if let Ok(admin) = crate::access::resolve(cfg, Some(&url), None).await {
         if let Some(r) = &runner
@@ -786,7 +786,7 @@ async fn put(path: &str, body: &Value) -> anyhow::Result<Value> {
 async fn front_door(t: Term, settings: &Settings, signals: Option<&crate::rt::Signals>) -> anyhow::Result<Value> {
     let cfg = crate::config::Config::load(&crate::config::default_config_path())?;
     anyhow::ensure!(cfg.local_agent.enabled, "this kiln runs no runner of its own (`[local_agent] enabled = false`): turn on a runner's front door in Runners → Domain & HTTPS");
-    let runner = crate::pki::sanitize_name(&cfg.local_agent_name());
+    let runner = cfg.local_agent_key();
     t.item(Mark::Todo, &format!("Turning on the front door: {}", settings.domain), "");
     let path = format!("/api/runners/{runner}/front-door");
     put(&path, &serde_json::to_value(settings)?).await?;

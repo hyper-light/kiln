@@ -1,5 +1,5 @@
 /* A subagent tree's path (tree-path.tsx): hairline lanes, the tan piece of a row that needs you,
-   and each row's mark in Mission control's stand colours (mission.css). */
+   and each row's mark in Mission control's stand colours (mission.css); one at work turns. */
 .tp {
   position: absolute;
   top: 0;
@@ -53,6 +53,29 @@
 .tp[data-stand="failed"] .tp-mark,
 .tp[data-stand="stopped"] .tp-mark {
   stroke: #d1aaad;
+}
+
+/* At work: its open ring turns through the prism once every 1.4 s, as Ship's running glyph does,
+   every one on the page's clock (phaseLock). Still under reduced motion; paused by kiln's motion
+   toggle. */
+.tp[data-stand="working"] .tp-turn {
+  stroke-width: 1.8;
+  transform-box: fill-box;
+  transform-origin: center;
+  animation: tp-turn 1.4s linear infinite;
+}
+@keyframes tp-turn {
+  to {
+    transform: rotate(360deg);
+  }
+}
+@media (prefers-reduced-motion: reduce) {
+  .tp-turn {
+    animation: none !important;
+  }
+}
+html[data-motion="paused"] .tp-turn {
+  animation-play-state: paused !important;
 }
 
 /* A variant a person branched from another: the fork before its name. */

@@ -216,6 +216,18 @@ impl Learners {
         member
     }
 
+    /// Machine `from` is known by another name from now on (docs/machines.md): its learner leaves
+    /// the group, and the machine comes back as a new one when it announces itself as it is now.
+    pub fn moved(&self, group: &Group, from: &str) {
+        let gone = super::group::member_of(from);
+        let wanted: std::collections::BTreeSet<u64> = {
+            let mut m = self.machines.lock();
+            m.remove(&gone);
+            group.point().1.learners.iter().copied().filter(|l| *l != gone).chain(m.keys().copied()).collect()
+        };
+        group.learners(wanted);
+    }
+
     /// The machine of learner `member`, if it said so since the server started.
     pub fn machine(&self, member: u64) -> Option<String> {
         self.machines.lock().get(&member).cloned()

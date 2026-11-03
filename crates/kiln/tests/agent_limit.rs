@@ -19,7 +19,7 @@ use std::path::Path;
 use std::time::{Duration, Instant};
 
 use common::agents::{self, Talk};
-use common::{Options, http, http_within};
+use common::{Options, http, http_within, machine};
 use serde_json::{Value, json};
 
 /// A turn after a session's first (none here) goes on for as long as the test does.
@@ -27,7 +27,7 @@ const TALK: Talk = Talk { lines: 100_000, every_ms: 500 };
 
 /// The runner's agent limit, as the server says it.
 fn view(port: u16, admin: &str, name: &str) -> anyhow::Result<Value> {
-    let (st, body) = http(port, "GET", &format!("/api/runners/{name}/agent-limit"), admin, None)?;
+    let (st, body) = http(port, "GET", &format!("/api/runners/{}/agent-limit", machine(name)), admin, None)?;
     anyhow::ensure!(st == 200, "GET its agent limit: {st} {body}");
     Ok(serde_json::from_str(&body)?)
 }
@@ -59,7 +59,7 @@ fn working(port: u16, admin: &str, name: &str, n: u64, log: &Path) -> anyhow::Re
 
 /// One try at a session on runner `name`: the status and the body.
 fn open(port: u16, admin: &str, name: &str, cwd: &Path) -> anyhow::Result<(u16, String)> {
-    let body = json!({"target": format!("agent:{name}"), "spec": {"kind": "claude", "cwd": cwd.display().to_string(), "prompt": "stream"}});
+    let body = json!({"target": format!("agent:{}", machine(name)), "spec": {"kind": "claude", "cwd": cwd.display().to_string(), "prompt": "stream"}});
     // Waited for longer than the server waits for its runner's answer, so it's the server's answer.
     http_within(port, "POST", "/api/harness/sessions", admin, Some(&body), Duration::from_secs(75))
 }
@@ -86,7 +86,7 @@ fn refused(port: u16, admin: &str, name: &str, cwd: &Path, full: &str) -> anyhow
 }
 
 fn put(port: u16, admin: &str, name: &str, body: &Value) -> anyhow::Result<(u16, Value)> {
-    let (st, text) = http(port, "PUT", &format!("/api/runners/{name}/agent-limit"), admin, Some(body))?;
+    let (st, text) = http(port, "PUT", &format!("/api/runners/{}/agent-limit", machine(name)), admin, Some(body))?;
     Ok((st, serde_json::from_str(&text).unwrap_or(Value::String(text))))
 }
 

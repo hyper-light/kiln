@@ -84,6 +84,9 @@ spec:
               valueFrom: { fieldRef: { fieldPath: status.podIP } }
             - name: NODE_NAME
               valueFrom: { fieldRef: { fieldPath: spec.nodeName } }
+            # The pod's UID: its machine id the first time it starts, kept on its volume after.
+            - name: KILN_POD_UID
+              valueFrom: { fieldRef: { fieldPath: metadata.uid } }
             {{- with .Values.env }}
             {{- toYaml . | nindent 12 }}
             {{- end }}

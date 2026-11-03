@@ -43,6 +43,10 @@ pub struct RunnerFacts {
     pub workspaces: Option<Workspaces>,
     /// What W24's work needs to know of the machine (docs/ci.md W24, `RunnerFacts.work`).
     pub work: Option<WorkFacts>,
+    /// The machine itself: a hash of the id its OS keeps for it (W13-R01). The server keeps it with
+    /// the runner's name, so another machine joining with the same host name isn't taken for it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub machine_id: Option<String>,
 }
 
 /// The machine as W24's work sees it: its load now (admission, W24-R19). The work volume's free

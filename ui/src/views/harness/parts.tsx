@@ -4,6 +4,7 @@ import "./harness.css";
 import "./console.css";
 import { Bot, FilePen, FileText, Globe, ListChecks, Map as MapIcon, MessageCircleQuestion, Plug, Search, Sparkles, SquareTerminal, Wrench, type LucideIcon } from "lucide-react";
 import type { Status, ToolKind } from "@/api/harness";
+import { labelOf, type Labels } from "@/lib/data";
 import { relativeTime } from "@/lib/format";
 import { useNow } from "@/lib/hooks";
 import { cn } from "@/lib/utils";
@@ -66,7 +67,10 @@ export function StatusPill({ status, activity, className }: { status: Status; ac
   );
 }
 
+/** The machine an agent runs on, by its name: a key (the server's is "server"). Shown, it's `machineShown`. */
 export const machineName = (target: string) => (target === "local" ? "server" : target.replace(/^agent:/, ""));
+/** The machine an agent runs on, as people know it: its label for one kiln knows by its machine id (docs/machines.md). */
+export const machineShown = (target: string, labels?: Labels) => labelOf(machineName(target), labels);
 
 /** Status as the site shows a project's: a dot and a word. Someone waiting on you outranks the rest.
  *  A conversation that already exists is resuming, not starting, while its harness comes up. */
@@ -105,7 +109,6 @@ export function ToolIcon({ kind, size = 14, className }: { kind: ToolKind; size?
 export { CopyBlock };
 
 /* ------------------------------------------------------------------ prose */
-
 
 /** The agent's prose: GitHub-flavored markdown (tables, lists, task lists, quotes, code), drawn the
  *  console's way. Text only: HTML in it is never injected. */

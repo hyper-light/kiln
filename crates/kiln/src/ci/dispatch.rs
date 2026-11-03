@@ -812,7 +812,7 @@ fn runner_view(hub: &Hub, a: &crate::hub::AgentLive) -> RunnerView {
         facts.executors.remove("firecracker");
     }
     facts.executors.entry("host".to_owned()).or_default();
-    RunnerView { name: a.name.clone(), labels: a.labels.clone(), pool: None, facts, caps }
+    RunnerView { name: a.name.clone(), label: a.label.clone(), labels: a.labels.clone(), pool: None, facts, caps }
 }
 
 /// A leg the scheduler has.

@@ -10,7 +10,7 @@ import { Hold } from "@/components/ui/hold";
 import { Loadable } from "@/components/ui/loading";
 import { PageIntro, Panel, SectionHeading, SelectField } from "@/components/ui/misc";
 import { Segmented } from "@/components/ui/tabs";
-import { historyRes, overviewRes, useMetricsHistory, useOverview, warm } from "@/lib/data";
+import { byLabel, historyRes, labelOf, overviewRes, useLabels, useMetricsHistory, useOverview, warm } from "@/lib/data";
 import { formatDuration } from "@/lib/format";
 import { usePref } from "@/lib/prefs";
 import { HostCharts } from "./host-charts";
@@ -66,6 +66,7 @@ export default function Metrics() {
 }
 
 function Toolbar({ range, onRange, source, onSource, sources }: { range: Range; onRange: (r: Range) => void; source: string; onSource: (s: string) => void; sources: string[] }) {
+  useLabels();
   return (
     <div className="mb-6 flex flex-wrap items-center gap-3">
       <Segmented label="Time range" value={range} onChange={onRange} options={(Object.keys(RANGES) as Range[]).map((r) => ({ value: r, label: r }))} />
@@ -75,7 +76,7 @@ function Toolbar({ range, onRange, source, onSource, sources }: { range: Range; 
         className="w-full sm:ml-auto sm:w-64"
         value={source}
         onChange={onSource}
-        options={(sources.length ? sources : ["server"]).map((s) => ({ value: s, label: s === "server" ? "server (kiln host)" : s }))}
+        options={(sources.length ? sources : ["server"]).map((s) => ({ value: s, label: s === "server" ? "server (kiln host)" : labelOf(s) }))}
       />
     </div>
   );
@@ -88,14 +89,16 @@ function MetricsBody({ range, onRange, source, onSource }: { range: Range; onRan
   const ov = useOverview().data;
 
   const cutoff = Date.now() - RANGES[range] * 1000;
-  const sources = Object.keys(hist).sort((a, b) => (a === "server" ? -1 : b === "server" ? 1 : a.localeCompare(b)));
+  // Machines are named, and put in order, by the names they're shown by (their keys stay the samples').
+  const labels = useLabels();
+  const sources = Object.keys(hist).sort((a, b) => (a === "server" ? -1 : b === "server" ? 1 : byLabel(labels)(a, b)));
   const samples: HostSample[] = React.useMemo(() => (hist[source] ?? []).filter((s) => s.ts_ms >= cutoff), [hist, source, cutoff]);
 
   // Fleet CPU comparison: align every agent to the server's timestamps (nearest prior sample).
   const fleet = React.useMemo(() => {
     const names = Object.keys(hist)
       .filter((n) => n !== "server")
-      .sort()
+      .sort(byLabel(labels))
       .slice(0, 8);
     const base = (hist.server ?? hist[names[0] ?? ""] ?? []).filter((s) => s.ts_ms >= cutoff);
     const xs = base.map((s) => s.ts_ms / 1000);
@@ -109,7 +112,7 @@ function MetricsBody({ range, onRange, source, onSource }: { range: Range; onRan
       });
     });
     return { names, data: [xs, ...ys] };
-  }, [hist, cutoff]);
+  }, [hist, cutoff, labels]);
 
   const queue = queueHistory.filter((q) => q.ts * 1000 >= cutoff);
   const queueData = [queue.map((q) => q.ts), queue.map((q) => q.queued), queue.map((q) => q.running)];
@@ -118,7 +121,7 @@ function MetricsBody({ range, onRange, source, onSource }: { range: Range; onRan
   return (
     <>
       <Toolbar range={range} onRange={onRange} source={source} onSource={onSource} sources={sources} />
-      {samples.length < 2 ? <p className="empty-line py-10 text-center">No samples for {source} in this range yet.</p> : <HostCharts samples={samples} height={170} columns={3} />}
+      {samples.length < 2 ? <p className="empty-line py-10 text-center">No samples for {labelOf(source, labels)} in this range yet.</p> : <HostCharts samples={samples} height={170} columns={3} />}
 
       <section className="mt-14">
         <SectionHeading index="02" label="Scheduler" title="Queue & throughput" />
@@ -168,7 +171,7 @@ function MetricsBody({ range, onRange, source, onSource }: { range: Range; onRan
                 height={220}
                 yRange={[0, 100]}
                 yFormat={(v) => `${Math.round(v)}%`}
-                series={fleet.names.map((n, i) => ({ label: n, color: FLEET_COLORS[i % FLEET_COLORS.length]!, width: 1.1 }))}
+                series={fleet.names.map((n, i) => ({ label: labelOf(n, labels), color: FLEET_COLORS[i % FLEET_COLORS.length]!, width: 1.1 }))}
               />
             </div>
           </Panel>

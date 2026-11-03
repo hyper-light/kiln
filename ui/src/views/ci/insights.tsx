@@ -15,6 +15,7 @@ import { Loadable } from "@/components/ui/loading";
 import { Crumbs, EmptyState, Facts, Meter, Panel, Sparkline } from "@/components/ui/misc";
 import { Segmented } from "@/components/ui/tabs";
 import { Tip } from "@/components/ui/tooltip";
+import { labelOf, useLabels } from "@/lib/data";
 import { formatBytes, formatDuration, formatNumber, relativeTime, shortSha } from "@/lib/format";
 import { Link, useSearchParams } from "@/lib/router";
 import { useSuspenseResource } from "@/lib/resource";
@@ -64,6 +65,7 @@ const insightsTo = (p: Record<string, string>) => {
 };
 
 export default function Insights() {
+  useLabels();
   const [search, setSearch] = useSearchParams();
   const repo = search.get("repo") ?? "";
   const workflow = search.get("workflow") ?? "";
@@ -80,8 +82,9 @@ export default function Insights() {
   if (repo) crumbs.push({ label: repo, to: workflow || metric ? insightsTo({ repo, days: win }) : undefined });
   if (repo && workflow) crumbs.push({ label: workflow.split("/").pop() ?? workflow });
   else if (repo && metric) crumbs.push({ label: metric });
-  if (runner) crumbs.push({ label: runner });
-  const title = runner || (workflow ? (workflow.split("/").pop() ?? workflow) : metric || repo) || "Insights";
+  // A runner is named as people know it (its label); `?runner=` keeps its name, its key.
+  if (runner) crumbs.push({ label: labelOf(runner) });
+  const title = (runner && labelOf(runner)) || (workflow ? (workflow.split("/").pop() ?? workflow) : metric || repo) || "Insights";
   return (
     <div className="container-console page">
       <title>{`${title === "Insights" ? "" : `${title} · `}Insights · kiln`}</title>
@@ -175,6 +178,7 @@ function Overview({ days }: { days: number }) {
 }
 
 function RunnersTable({ runners, currency, days }: { runners: CiRunnerInsight[]; currency: string; days: number }) {
+  useLabels();
   if (runners.length === 0) return <EmptyState title="No runner time in this window." />;
   const costs = runners.some((r) => r.cost !== null);
   return (
@@ -197,7 +201,7 @@ function RunnersTable({ runners, currency, days }: { runners: CiRunnerInsight[];
             <tr key={r.runner}>
               <td className="max-w-[220px] truncate">
                 <Link to={insightsTo({ runner: r.runner, days: String(days) })} className="text-link">
-                  {r.runner}
+                  {labelOf(r.runner)}
                 </Link>
               </td>
               <td className="cell-mono hidden md:table-cell">{r.pool}</td>
@@ -205,7 +209,7 @@ function RunnersTable({ runners, currency, days }: { runners: CiRunnerInsight[];
                 <div className="font-mono text-[11px] text-[#c8cad0] tabular-nums">{pct(r.utilization)}</div>
                 {r.utilization !== null && (
                   <div className="mt-1 w-20">
-                    <Meter value={r.utilization * 100} label={`${r.runner} utilization`} />
+                    <Meter value={r.utilization * 100} label={`${labelOf(r.runner)} utilization`} />
                   </div>
                 )}
               </td>
@@ -855,6 +859,7 @@ function SeriesTable<T extends { bucket: number }>({ points, grain, cols }: { po
 }
 
 function RunnerInsights({ runner, days }: { runner: string; days: number }) {
+  useLabels();
   const d = useSuspenseResource(`insights/runner/${runner}/${days}`, (s) => ci.insightsRunner(runner, days, s)).data;
   const { xs, timeFormat } = axis(d.since, d.grain);
   const fails = Object.entries(d.legs.failures).sort((a, b) => b[1] - a[1]);
@@ -879,7 +884,7 @@ function RunnerInsights({ runner, days }: { runner: string; days: number }) {
             timeFormat={timeFormat}
             yRange={[0, 1]}
             yFormat={(v) => pct(v)}
-            ariaLabel={`${runner} utilization`}
+            ariaLabel={`${labelOf(runner)} utilization`}
           />
           <SeriesTable
             points={d.series}

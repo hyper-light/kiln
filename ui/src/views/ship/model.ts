@@ -4,6 +4,7 @@
  */
 import type { ShipCommit, ShipDetail, ShipPip } from "@/api/ship";
 import { GLYPHS, STAGE_WORD, type GlyphState, type Pip, type Stage } from "@/components/ui/status-glyph-spec";
+import { labelOf } from "@/lib/data";
 import type { ShipLane, ShipLaneGroup } from "./review/lanes";
 
 /** Each stand's place in the needs-you-first order, and its word. */
@@ -258,7 +259,8 @@ export function shipGroups(detail: ShipDetail): ShipLaneGroup[] {
   const built = detail.build;
   const build: ShipLane[] = built
     ? [
-        ...built.platforms.map((p) => ({ id: `platform/${p.name}`, name: p.name, state: glyph(p.state), start: null, end: null })),
+        // As its newest release run has it: once it has run, its job (Output) and its times (its lane).
+        ...built.platforms.map((p) => ({ id: `platform/${p.name}`, name: p.name, state: glyph(p.state), start: p.start ?? null, end: p.end ?? null, ...(p.job ? { job: p.job } : {}) })),
         { id: "image", name: "image", state: glyph(built.image.state), start: null, end: null },
       ]
     : [];
@@ -289,7 +291,15 @@ export function shipGroups(detail: ShipDetail): ShipLaneGroup[] {
           deployed("production/deploy", "deploy", pr),
           { id: "production/guard", name: "guard", state: guard, start: pr && guard !== "none" ? pr.at : null, end: pr && guard !== "none" && guard !== "guard" ? pr.at + GUARD_S : null },
         ];
-  const runners: ShipLane[] = (detail.replant ?? []).map((r) => ({ id: `runner/${r.name}`, name: r.name, state: replantGlyph(r.state), start: null, end: null, ...(r.why ? { note: r.why } : {}) }));
+  // Each runner by the name people see (its label, docs/machines.md); its lane by its name.
+  const runners: ShipLane[] = (detail.replant ?? []).map((r) => ({
+    id: `runner/${r.name}`,
+    name: labelOf(r.name),
+    state: replantGlyph(r.state),
+    start: null,
+    end: null,
+    ...(r.why ? { note: r.why } : {}),
+  }));
   // The server restarts into the build production runs before its runners replant onto it.
   const replant: ShipLane[] = runners.length ? [{ id: "replant/server", name: "server", state: "replanted", start: null, end: null }, ...runners] : [];
   const group = (stage: Stage, lanes: ShipLane[], note: string): ShipLaneGroup => ({ group: stage, label: STAGE_WORD[stage], state: pip(stage), note, lanes });

@@ -366,9 +366,11 @@
   height: 21px;
   color: #a8c9bc;
 }
+/* Its sentences name machines: a long name breaks where it must. */
 .up-readout-text {
   flex: 1;
   min-width: 0;
+  overflow-wrap: anywhere;
 }
 .up-readout-title {
   display: block;

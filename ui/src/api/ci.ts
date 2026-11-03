@@ -1,6 +1,7 @@
 /** The CI engine (docs/ci.md §4.1): the /api/ci routes the run, leg and editor pages read. */
 import { ApiError, request } from "./client";
 import { pinnedSentence, type Retried, type RetryOptions } from "./retry";
+import { labelOf, type Labels } from "@/lib/data";
 import type { Schema } from "@/lib/yaml-spot";
 
 const enc = encodeURIComponent;
@@ -936,8 +937,8 @@ export function ciState(status: string, conclusion: string | null): string {
   return status;
 }
 
-/** A wait reason (W05-R13) as one sentence. */
-export function waitSentence(w: unknown): string | null {
+/** A wait reason (W05-R13) as one sentence, its runners named as people know them (`labels`, else those known now). */
+export function waitSentence(w: unknown, labels?: Labels): string | null {
   if (!w || typeof w !== "object") return typeof w === "string" ? w : null;
   const o = w as {
     reason?: string;
@@ -984,6 +985,9 @@ export function waitSentence(w: unknown): string | null {
     short?: string[];
   };
   const list = (xs?: string[]) => (xs && xs.length ? `: ${xs.join(", ")}` : "");
+  // Runners as people know them (their labels); `failing` and `short` are the scheduler's words.
+  const names = (xs?: string[]) => xs?.map((x) => labelOf(x, labels));
+  const avoided = o.avoided === undefined ? undefined : labelOf(o.avoided, labels);
   // A lane is a repository's workflow on a branch (W28-R60): its workflow and branch.
   const lane = (o.lane ?? "").split("\u0000").slice(1).join(" on ") || "its lane";
   const time = (ms?: number | null) => (ms ? new Date(ms).toLocaleTimeString() : "soon");
@@ -993,22 +997,22 @@ export function waitSentence(w: unknown): string | null {
     case "oversized":
       return `It asks for more than any runner that can take it has (${o.asked ?? "its request"})${list(o.short)}.`;
     case "headroom": {
-      const held = o.held ? `: ${o.held} is held for it, with room about ${time(o.room_at)}` : "";
-      return `Waiting for ${o.request || "room"} free${o.place ? ` on a ${o.place} runner` : ""}${held}. Every runner with room for it would pass ${o.target ?? 85}% use with it${list(o.runners)}.`;
+      const held = o.held ? `: ${labelOf(o.held, labels)} is held for it, with room about ${time(o.room_at)}` : "";
+      return `Waiting for ${o.request || "room"} free${o.place ? ` on a ${o.place} runner` : ""}${held}. Every runner with room for it would pass ${o.target ?? 85}% use with it${list(names(o.runners))}.`;
     }
     case "no-runner":
-      return `No runner that can take it is connected${list(o.offline)}.`;
+      return `No runner that can take it is connected${list(names(o.offline))}.`;
     case "unroutable":
       return `No runner meets its requirements${list(o.failing)}.`;
     case "capability":
-      return `The runners that match need a newer kiln${list(o.runners)}.`;
+      return `The runners that match need a newer kiln${list(names(o.runners))}.`;
     case "other-runner":
-      if (o.asked) return `Waiting for a runner other than ${o.avoided ?? "the one it ran on"}, as its retry asked.`;
+      if (o.asked) return `Waiting for a runner other than ${avoided ?? "the one it ran on"}, as its retry asked.`;
       return o.refused
-        ? `Waiting for a runner other than ${o.avoided ?? "the one"} that refused it.`
-        : `Its retry waits for a runner other than ${o.avoided ?? "the one it ran on"}, as its policy asks (runner: different).`;
+        ? `Waiting for a runner other than ${avoided ?? "the one"} that refused it.`
+        : `Its retry waits for a runner other than ${avoided ?? "the one it ran on"}, as its policy asks (runner: different).`;
     case "pinned":
-      return pinnedSentence(o.runner ?? "the runner", o.state);
+      return pinnedSentence(o.runner ?? "the runner", o.state, labels);
     case "concurrency":
       if (o.environment) return `Waiting for ${o.environment}'s other deployments (at most ${o.limit ?? 1} at once).`;
       return `Waiting for concurrency group ${o.group ?? ""}${o.holders?.length ? `, held by ${o.holders.join(", ")}` : ""}.`;
@@ -1021,7 +1025,7 @@ export function waitSentence(w: unknown): string | null {
     case "reservation":
       return `Its runners are reserved${o.reservation ? ` (${o.reservation})` : ""} until ${o.until ? new Date(o.until).toLocaleTimeString() : "the reservation ends"}.`;
     case "warm":
-      return `Waiting for ${o.runner ?? "a busy runner"}, where it runs warm: about ${o.saves_s ?? 0} s sooner${o.until ? `, until ${new Date(o.until).toLocaleTimeString()} at most` : ""}.`;
+      return `Waiting for ${o.runner ? labelOf(o.runner, labels) : "a busy runner"}, where it runs warm: about ${o.saves_s ?? 0} s sooner${o.until ? `, until ${new Date(o.until).toLocaleTimeString()} at most` : ""}.`;
     case "retry":
       return `Retrying at ${o.at ? new Date(o.at * 1000).toLocaleTimeString() : "a moment"}.`;
     case "adopted":

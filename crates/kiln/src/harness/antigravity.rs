@@ -40,7 +40,7 @@ use super::model::{
 use super::session::Spec;
 
 /// What a session of it can do, said when it starts (and again after an in-place upgrade).
-pub(super) const FEATURES: &[&str] = &["send_now", "queue", "interrupt", "set_mode", "set_model", "set_effort", "resume", "attachments", "switch_harness", "own_edits"];
+pub(super) const FEATURES: &[&str] = &["send_now", "queue", "interrupt", "set_mode", "set_model", "set_effort", "resume", "attachments", "switch_harness", "own_edits", "remove_task"];
 /// What it turns on once it runs: "limits" once kiln's hook is heard from it ([`Agy::hook`]), so
 /// a session whose hook never ran doesn't offer what it can't hold.
 pub(super) const LEARNED: &[&str] = &["limits"];
@@ -327,7 +327,7 @@ impl Agy {
             Command::Control { id, value } => {
                 super::goback::control(core, &id, value.as_ref());
             }
-            Command::StopTask { .. } | Command::StopTasks | Command::Restart | Command::ForceStop | Command::Snapshot | Command::MoveTo { .. } | Command::Moving { .. } | Command::HandedOver { .. } | Command::OwnEdits { .. } => {}
+            Command::StopTask { .. } | Command::StopTasks | Command::Restart | Command::ForceStop | Command::Snapshot | Command::MoveTo { .. } | Command::Moving { .. } | Command::HandedOver { .. } | Command::OwnEdits { .. } | Command::RemoveTask { .. } => {}
             // One of its subagents, held at its calls through kiln's hook.
             Command::Pause { on, task: Some(task) } => self.pause_subagent(core, &task, on),
             Command::Perms { perms, task: Some(task) } => self.set_task_perms(core, &task, perms),

@@ -9,6 +9,7 @@ import { api } from "@/api/client";
 import type { Place, PlaceMachine, PlaceTask, SyncMode, TaskSource } from "@/api/types";
 import { Button } from "@/components/ui/button";
 import { SelectField, TextField } from "@/components/ui/misc";
+import { byLabel, labelOf, useLabels, type Labels } from "@/lib/data";
 import { cn } from "@/lib/utils";
 import { errorMessage } from "@/lib/hooks";
 import { MODES } from "../sync";
@@ -30,7 +31,7 @@ interface Source {
  * Where it can come from, for each way of putting it on machines, the likeliest first: for a clone,
  * kiln's mirror (a clean checkout of its remote); for a sync, a folder in step (its working tree).
  */
-function sourcesOf(e: Entry, machines: Map<string, PlaceMachine>, mode: PutMode): Source[] {
+function sourcesOf(e: Entry, machines: Map<string, PlaceMachine>, mode: PutMode, labels?: Labels): Source[] {
   const out: Source[] = [];
   const kiln: Source | null = e.built ? { id: "kiln", label: "kiln's mirror of it, a clean checkout", from: { kind: "kiln", repo: e.built.id }, git: true } : null;
   if (kiln && mode === "clone") out.push(kiln);
@@ -45,7 +46,13 @@ function sourcesOf(e: Entry, machines: Map<string, PlaceMachine>, mode: PutMode)
     const where = tildeOf(p.path, m.home) ?? p.path;
     const g = p.git;
     const about = g ? [g.branch ?? "detached", g.changed > 0 && `${g.changed} changed`].filter(Boolean).join(", ") : "a folder";
-    out.push({ id: `place\n${p.machine}\n${p.path}`, label: `${p.machine} · ${where} (${about})`, from: { kind: "machine", machine: p.machine, path: p.path }, place: p, git: Boolean(g) });
+    out.push({
+      id: `place\n${p.machine}\n${p.path}`,
+      label: `${labelOf(p.machine, labels)} · ${where} (${about})`,
+      from: { kind: "machine", machine: p.machine, path: p.path },
+      place: p,
+      git: Boolean(g),
+    });
   }
   if (kiln && mode === "sync") out.push(kiln);
   if (e.origin && /^(https?|ssh|git):\/\/|^[^/\s]+@[^:\s]+:/.test(e.origin)) {
@@ -61,10 +68,24 @@ interface Pick {
   typed: boolean;
 }
 
-export function PutForm({ entry, machines, mode: initial, onStarted, onCancel }: { entry: Entry; machines: PlaceMachine[]; mode: PutMode; onStarted: (tasks: PlaceTask[]) => void; onCancel: () => void }) {
+export function PutForm({
+  entry,
+  machines,
+  mode: initial,
+  onStarted,
+  onCancel,
+}: {
+  entry: Entry;
+  machines: PlaceMachine[];
+  mode: PutMode;
+  onStarted: (tasks: PlaceTask[]) => void;
+  onCancel: () => void;
+}) {
   const byName = React.useMemo(() => new Map(machines.map((m) => [m.name, m])), [machines]);
   const [mode, setMode] = React.useState<PutMode>(initial);
-  const sources = React.useMemo(() => sourcesOf(entry, byName, mode), [entry, byName, mode]);
+  // Machines are named, and put in order, by the names they're shown by.
+  const labels = useLabels();
+  const sources = React.useMemo(() => sourcesOf(entry, byName, mode, labels), [entry, byName, mode, labels]);
   const [sourceId, setSourceId] = React.useState<string>("");
   const source = sources.find((s) => s.id === sourceId) ?? sources[0];
   const [branch, setBranch] = React.useState("");
@@ -77,8 +98,16 @@ export function PutForm({ entry, machines, mode: initial, onStarted, onCancel }:
 
   const fits = (m: PlaceMachine) => m.connected && (mode === "clone" ? m.can_clone : m.can_sync && (!source?.git || m.can_clone));
   const why = (m: PlaceMachine) =>
-    !m.connected ? "offline" : mode === "clone" && !m.can_clone ? "its runner is too old to clone: upgrade it" : mode === "sync" && !m.can_sync ? "its runner is too old to sync: upgrade it" : source?.git && !m.can_clone ? "its runner is too old to clone: upgrade it" : null;
-  const sorted = [...machines].sort((a, b) => Number(b.connected) - Number(a.connected) || a.name.localeCompare(b.name));
+    !m.connected
+      ? "offline"
+      : mode === "clone" && !m.can_clone
+        ? "its runner is too old to clone: upgrade it"
+        : mode === "sync" && !m.can_sync
+          ? "its runner is too old to sync: upgrade it"
+          : source?.git && !m.can_clone
+            ? "its runner is too old to clone: upgrade it"
+            : null;
+  const sorted = [...machines].sort((a, b) => Number(b.connected) - Number(a.connected) || byLabel(labels)(a.name, b.name));
   const fallback = defaultPath(entry, byName, source?.place);
   const pathOf = (m: string) => picks[m]?.path ?? fallback;
   const chosen = sorted.filter((m) => picks[m.name]?.on && fits(m));
@@ -109,7 +138,9 @@ export function PutForm({ entry, machines, mode: initial, onStarted, onCancel }:
     ...count((m) => [m.os]).map(([v, c]) => ({ id: `os:${v}`, label: osLabel(v), count: c, want: (m: PlaceMachine) => m.os === v })),
     ...count((m) => [m.arch]).map(([v, c]) => ({ id: `arch:${v}`, label: v, count: c, want: (m: PlaceMachine) => m.arch === v })),
     // Labels that only say a machine's OS or architecture again are left out.
-    ...count((m) => m.labels.filter((l) => ![m.os, osLabel(m.os), m.arch, m.arch === "aarch64" ? "arm64" : m.arch, m.arch === "x86_64" ? "amd64" : m.arch].some((x) => x.toLowerCase() === l.toLowerCase()))).map(([v, c]) => ({
+    ...count((m) =>
+      m.labels.filter((l) => ![m.os, osLabel(m.os), m.arch, m.arch === "aarch64" ? "arm64" : m.arch, m.arch === "x86_64" ? "amd64" : m.arch].some((x) => x.toLowerCase() === l.toLowerCase())),
+    ).map(([v, c]) => ({
       id: `label:${v}`,
       label: v,
       count: c,
@@ -209,7 +240,7 @@ export function PutForm({ entry, machines, mode: initial, onStarted, onCancel }:
               <li key={m.name} className={cn("repo-put-machine", !can && "repo-put-off")}>
                 <label className="repo-check">
                   <input type="checkbox" checked={on} disabled={!can} onChange={(e) => toggle(m.name, e.target.checked)} />
-                  <span className="repo-place-machine">{m.name}</span>
+                  <span className="repo-place-machine">{labelOf(m.name, labels)}</span>
                   <span className="repo-place-os">
                     {osLabel(m.os)} · {m.arch}
                   </span>
@@ -218,7 +249,7 @@ export function PutForm({ entry, machines, mode: initial, onStarted, onCancel }:
                 </label>
                 {on && (
                   <TextField
-                    label={`Folder on ${m.name}`}
+                    label={`Folder on ${labelOf(m.name, labels)}`}
                     value={path}
                     onChange={(e) => {
                       const v = e.target.value;
@@ -236,7 +267,7 @@ export function PutForm({ entry, machines, mode: initial, onStarted, onCancel }:
       {error && <p className="repo-error">{error}</p>}
       <div className="repo-actions">
         <Button type="submit" size="sm" disabled={busy || !source || n === 0 || chosen.some((m) => !pathOf(m.name).trim())}>
-          {busy ? "Starting…" : n === 0 ? `${verb} to machines` : `${verb} to ${n === 1 ? chosen[0]!.name : `${n} machines`}`}
+          {busy ? "Starting…" : n === 0 ? `${verb} to machines` : `${verb} to ${n === 1 ? labelOf(chosen[0]!.name, labels) : `${n} machines`}`}
         </Button>
         <Button type="button" size="sm" variant="ghost" onClick={onCancel}>
           Cancel

@@ -1097,6 +1097,28 @@ impl Core {
         self.state_dirty = true;
     }
 
+    /// A person's Remove of one of its harness's subagents that ended (`Command::RemoveTask`, by its
+    /// task's id): it and those under it that ended leave its tasks for good. One still going, or
+    /// one it doesn't have, stays as it is. Whether any went.
+    pub fn remove_task(&mut self, task: &str) -> bool {
+        if !self.state.tasks.iter().any(|t| t.id == task && !t.live()) {
+            return false;
+        }
+        let mut gone = vec![task.to_owned()];
+        let mut i = 0;
+        while let Some(p) = gone.get(i).cloned() {
+            i += 1;
+            for t in &self.state.tasks {
+                if !t.live() && t.parent_task.as_deref() == Some(p.as_str()) && !gone.contains(&t.id) {
+                    gone.push(t.id.clone());
+                }
+            }
+        }
+        self.state.tasks.retain(|t| !gone.contains(&t.id));
+        self.touch_state();
+        true
+    }
+
     pub fn touch_meta(&mut self) {
         self.meta_dirty = true;
     }
@@ -1359,6 +1381,29 @@ impl Core {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A subagent that ended is removed with those under it that ended; one still going, under it or
+    /// on its own, stays, and so does everything when what's named is still going or isn't there.
+    #[test]
+    fn removing_a_subagent_that_ended_takes_it_and_its_ended_ones_and_nothing_still_going() {
+        use super::super::model::Task;
+        let task = |id: &str, status: &str, parent: Option<&str>| Task { id: id.into(), status: status.into(), parent_task: parent.map(Into::into), class: Some("agent".into()), ..Task::default() };
+        let mut core = Core::new();
+        core.state.tasks = vec![
+            task("a", "stopped", None),
+            task("a1", "completed", Some("a")),
+            task("a2", "running", Some("a")),
+            task("a11", "failed", Some("a1")),
+            task("b", "running", None),
+            task("c", "completed", None),
+        ];
+        assert!(!core.remove_task("b"), "one still going stays");
+        assert!(!core.remove_task("nope"));
+        assert_eq!(core.state.tasks.len(), 6);
+        assert!(core.remove_task("a"));
+        let left: Vec<&str> = core.state.tasks.iter().map(|t| t.id.as_str()).collect();
+        assert_eq!(left, ["a2", "b", "c"]);
+    }
 
     fn tool(status: ToolStatus) -> Body {
         use super::super::model::{ToolCall, ToolKind};

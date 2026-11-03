@@ -144,7 +144,7 @@ pub async fn ask_machine(hub: &Hub, info: &Info, ask: &super::Ask) -> Result<Val
             .await
             .map_err(|e| fail(StatusCode::BAD_GATEWAY, format!("{e:#}")))?;
         match got {
-            None => return Err(fail(StatusCode::CONFLICT, format!("{machine}'s kiln is too old to do this: upgrade it (System → Updates)"))),
+            None => return Err(fail(StatusCode::CONFLICT, format!("{}'s kiln is too old to do this: upgrade it (System → Updates)", hub.shown(&machine)))),
             Some(answer) => answer.unwrap_or(Value::Null),
         }
     };

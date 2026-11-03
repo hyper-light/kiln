@@ -16,7 +16,7 @@ import { Crumbs, EmptyState, Panel, SelectField } from "@/components/ui/misc";
 import { StatusDot } from "@/components/ui/status";
 import { toast } from "@/components/ui/toast";
 import { useAuth } from "@/lib/auth";
-import { reposRes, useRes, type Res } from "@/lib/data";
+import { reposRes, useLabels, useRes, type Res } from "@/lib/data";
 import { shortSha } from "@/lib/format";
 import { errorMessage } from "@/lib/hooks";
 import { invalidate, useSuspenseResource } from "@/lib/resource";
@@ -116,6 +116,7 @@ export function EnvApps({ env, repo }: { env: string; repo: string }) {
 
 /** What waits to deploy to an environment, each leg with why. */
 export function Waits({ e }: { e: CiEnvironment }) {
+  const labels = useLabels();
   const waits = e.waiting ?? [];
   if (!waits.length) return <span className="env-quiet">nothing</span>;
   return (
@@ -125,7 +126,7 @@ export function Waits({ e }: { e: CiEnvironment }) {
           <Link to={`/runs/${w.run}/jobs/${w.leg}`} className="env-link">
             #{w.number} {w.name ?? w.key}
           </Link>
-          <span className="env-quiet">{waitSentence(w.wait)}</span>
+          <span className="env-quiet">{waitSentence(w.wait, labels)}</span>
         </li>
       ))}
     </ul>

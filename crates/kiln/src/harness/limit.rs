@@ -120,7 +120,7 @@ pub fn configured(path: &Path) -> Option<Option<usize>> {
 
 // ------------------------------------------------------------------------------ on the server
 
-const KEY_PREFIX: &str = "agent_limit/";
+pub(crate) const KEY_PREFIX: &str = "agent_limit/";
 /// A runner process that has said nothing past `Build`'s 32 bits this long after connecting never
 /// will: it is from before the channel, so from before agent limits.
 const CAPS_GRACE: i64 = 15;
@@ -168,6 +168,15 @@ impl AgentLimits {
         self.inner.lock().get(machine).and_then(|e| e.held)
     }
 
+    /// A machine known by another name from now on (docs/machines.md): what's set for it goes with it
+    /// (its row moves with the store's, `Store::move_runner`).
+    pub fn moved(&self, from: &str, to: &str) {
+        let mut g = self.inner.lock();
+        if let Some(e) = g.remove(from) {
+            g.entry(to.to_owned()).or_insert(e);
+        }
+    }
+
     /// A machine forgotten (its runner was): what was set for it goes.
     pub async fn forget(&self, store: &crate::store::Store, machine: &str) {
         self.inner.lock().remove(machine);
@@ -180,13 +189,13 @@ impl AgentLimits {
 /// Whether `machine` is the server's own runner (`[local_agent]`, in its process): it runs no
 /// agents, and the server's own agents are held to what's set for it.
 fn own(hub: &Hub, machine: &str) -> bool {
-    hub.cfg.local_agent.enabled && machine == crate::pki::sanitize_name(&hub.cfg.local_agent_name())
+    hub.cfg.local_agent.enabled && machine == hub.cfg.local_agent_key()
 }
 
 /// What the server's own agents hold: what's set for the server's own runner, else its config's
 /// `[agent] max_agent_sessions`, else kiln's default.
 fn local(hub: &Hub) -> Held {
-    let asked = if hub.cfg.local_agent.enabled { hub.agent_limits.asked(&crate::pki::sanitize_name(&hub.cfg.local_agent_name())) } else { Asked::default() };
+    let asked = if hub.cfg.local_agent.enabled { hub.agent_limits.asked(&hub.cfg.local_agent_key()) } else { Asked::default() };
     held(asked, hub.cfg.agent.max_agent_sessions)
 }
 

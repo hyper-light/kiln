@@ -14,7 +14,7 @@ import { Loadable } from "@/components/ui/loading";
 import { EmptyState, Facts, FoldSection, Panel, SectionHeading, Sparkline } from "@/components/ui/misc";
 import { StatusDot } from "@/components/ui/status";
 import { Segmented } from "@/components/ui/tabs";
-import { useRes, type Res } from "@/lib/data";
+import { labelOf, useLabels, useRes, type Res } from "@/lib/data";
 import { formatBytes } from "@/lib/format";
 import { useSuspenseResource } from "@/lib/resource";
 import { RelTime } from "../shared";
@@ -39,11 +39,11 @@ const perSec = (v: number | null | undefined) => (v == null ? "—" : `${v < 10 
 /** An axis's tick: whole when it is (the axis steps by 0.5 at small rates: 0, 0.5, 1, never 0, 1, 1). */
 const tick = (v: number) => (Number.isInteger(v) ? v.toLocaleString("en-US") : v < 10 ? v.toFixed(1) : Math.round(v).toLocaleString("en-US"));
 
-/** A store's name: its machine, its role, and its id where it has one. */
+/** A store's name: its machine (as people know it), its role, and its id where it has one. */
 function storeName(s: ConvoStore) {
   if (s.role === "server") return "Server";
-  if (s.role === "mirror") return `${s.machine} · copy`;
-  return s.machine;
+  if (s.role === "mirror") return `${labelOf(s.machine)} · copy`;
+  return labelOf(s.machine);
 }
 
 export function StoresSection({ index }: { index: string }) {
@@ -113,6 +113,7 @@ function StoresHead() {
 }
 
 function StoresTable({ status, selected, onSelect }: { status: ConvoStatus; selected: string | null; onSelect: (key: string) => void }) {
+  useLabels();
   return (
     <div className="table-wrap mt-6">
       <table className="data-table cv-table">
@@ -168,13 +169,14 @@ const WINDOWS: { value: Window; label: string }[] = [
 ];
 
 function StoreDashboard({ status, store }: { status: ConvoStatus; store: ConvoStore }) {
+  useLabels();
   const [win, setWin] = React.useState<Window>("3600");
   const notes = status.notes.filter((n) => n.key === store.key);
   return (
     <section className="mt-10">
       <SectionHeading
         label="Dashboard"
-        title={store.role === "server" ? "The server's store" : store.role === "mirror" ? `${store.machine}'s copy of the server's store` : `${store.machine}'s store`}
+        title={store.role === "server" ? "The server's store" : store.role === "mirror" ? `${labelOf(store.machine)}'s copy of the server's store` : `${labelOf(store.machine)}'s store`}
         aside={<Segmented label="Window" value={win} onChange={setWin} options={WINDOWS} />}
       />
       <StoreKpis status={status} store={store} />

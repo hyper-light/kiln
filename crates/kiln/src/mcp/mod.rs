@@ -257,7 +257,7 @@ pub async fn runner_ask(hub: &Arc<Hub>, runner: &str, peer: crate::instances::Pe
     let caller = if session.is_empty() && !terminal.is_empty() && matches!(ask, Question::Call { .. }) {
         terminal_caller(hub, terminal, Some(runner)).await
     } else if session.is_empty() || !hub.harness.located_on(session, runner) {
-        let why = format!("kiln knows no agent session {session:?} on {runner}: its operations are for the agents it runs");
+        let why = format!("kiln knows no agent session {session:?} on {}: its operations are for the agents it runs", hub.shown(runner));
         // A copy left behind of a session that went on elsewhere: its act refused and recorded,
         // answered with why, and it's told to let go now, at its runner's first word since
         // (W27-R08).
@@ -982,11 +982,9 @@ mod tests {
         }
     }
 
-    /// What §4.1 names that isn't built yet: W24's work operations, and W29's catalog, releases,
-    /// locks and switch (docs/ci.md W29-R15–R25), specified before they're built.
+    /// What §4.1 names that isn't built yet: W24's work operations, and W29's switch (docs/ci.md
+    /// W29-R15), specified before it's built.
     const LEFT: &[&str] = &[
-        "ci.locks.update",
-        "ci.locks.verify",
         "ci.work.gc",
         "ci.work.reap.run",
         "ci.work.status",

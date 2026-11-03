@@ -16,7 +16,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
-use common::{Options, Server, http, start};
+use common::{Options, Server, http, machine, start};
 use serde_json::{Value, json};
 
 /// F-10's platforms, and the runner posing as each.
@@ -185,7 +185,7 @@ fn w04_ac07_previews_are_runs() -> anyhow::Result<()> {
         std::fs::create_dir_all(base.join("home"))?;
         let log = std::fs::File::create(base.join("agent.log"))?;
         let child = common::kiln()
-            .args(["agent", "--server", &format!("http://127.0.0.1:{}", s.port), "--token", &join, "--name", &name, "--labels", "posing", "--slots", "3", "--no-terminal", "--chaos", &format!("platform={platform}")])
+            .args(["agent", "--server", &format!("http://127.0.0.1:{}", s.port), "--token", &join, "--name", &name, "--labels", "posing", "--slots", "3", "--no-terminal", "--chaos", &format!("platform={platform}")]).env("KILN_MACHINE_ID", &name)
             .arg("--work-dir")
             .arg(base.join("work"))
             .arg("--state-dir")
@@ -207,7 +207,7 @@ fn w04_ac07_previews_are_runs() -> anyhow::Result<()> {
         let agents = get(&s, "/api/agents")?;
         let list = agents.as_array().cloned().or_else(|| agents.get("agents").and_then(Value::as_array).cloned()).unwrap_or_default();
         let posed = PLATFORMS.iter().all(|(p, os, arch)| {
-            list.iter().any(|a| text(a, "name") == runner_name(p) && a.get("connected") == Some(&json!(true)) && a.pointer("/facts/os") == Some(&json!(os)) && a.pointer("/facts/arch") == Some(&json!(arch)))
+            list.iter().any(|a| text(a, "name") == machine(&runner_name(p)) && a.get("connected") == Some(&json!(true)) && a.pointer("/facts/os") == Some(&json!(os)) && a.pointer("/facts/arch") == Some(&json!(arch)))
         });
         Ok(if posed { Ok(()) } else { Err(format!("{agents}\n{}", agent_logs())) })
     })?;
@@ -273,7 +273,7 @@ fn w04_ac07_previews_are_runs() -> anyhow::Result<()> {
             ".kiln/cross-arch.yaml" => {
                 for l in run.get("legs").and_then(Value::as_array).into_iter().flatten().filter(|l| text(l, "job") != "collect") {
                     let platform = l.pointer("/matrix/platform").and_then(Value::as_str).unwrap_or_default();
-                    check(text(l, "runner") == runner_name(platform), format!("F-10's `{}` ran on {}", text(l, "key"), text(l, "runner")));
+                    check(text(l, "runner") == machine(&runner_name(platform)), format!("F-10's `{}` ran on {}", text(l, "key"), text(l, "runner")));
                 }
                 check((names_of(&plan, "build").len(), names_of(&plan, "test").len(), names_of(&plan, "collect").len()) == (3, 3, 1), format!("F-10's legs: {plan}"));
             }

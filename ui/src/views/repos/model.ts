@@ -7,6 +7,7 @@
  */
 import type { Chosen, Facet } from "@/components/ui/facet-box";
 import type { Place, PlaceMachine, PlaceTask, PlacesView, Repo, Run, SyncRepo, SyncView } from "@/api/types";
+import { labelOf, type Labels } from "@/lib/data";
 
 /** One repository, with everything the page shows of it. */
 export interface Entry {
@@ -65,7 +66,16 @@ export function entriesOf(places: PlacesView | undefined, repos: Repo[] | undefi
     const s = row.synced ? (synced.get(row.synced) ?? null) : null;
     if (b) seenBuilt.add(b.id);
     if (s) seenSynced.add(s.id);
-    out.push({ key: row.key, name: b?.name ?? row.name, origin: row.origin ?? b?.clone_url ?? null, built: b, synced: s, places: row.places, latest: b ? (latest.get(b.id) ?? null) : null, tasks: tasks.get(row.key) ?? [] });
+    out.push({
+      key: row.key,
+      name: b?.name ?? row.name,
+      origin: row.origin ?? b?.clone_url ?? null,
+      built: b,
+      synced: s,
+      places: row.places,
+      latest: b ? (latest.get(b.id) ?? null) : null,
+      tasks: tasks.get(row.key) ?? [],
+    });
   }
   // What the places haven't caught up with yet (or a server without them): by name, as before.
   for (const b of repos ?? []) {
@@ -150,9 +160,9 @@ export function dimsOf(e: Entry, machines: Map<string, PlaceMachine>): Dims {
   };
 }
 
-const DIMENSIONS: { id: string; label: string; name: (v: string) => string; order?: string[]; always?: boolean }[] = [
+const DIMENSIONS: { id: string; label: string; name: (v: string, labels?: Labels) => string; order?: string[]; always?: boolean }[] = [
   { id: "kind", label: "Kind", name: (v) => KINDS.find((k) => k.id === v)?.label ?? v, order: KINDS.map((k) => k.id), always: true },
-  { id: "machine", label: "Machine", name: (v) => v },
+  { id: "machine", label: "Machine", name: (v, labels) => labelOf(v, labels) },
   { id: "os", label: "OS", name: (v) => osLabel(v) },
   { id: "arch", label: "Architecture", name: (v) => v },
   { id: "label", label: "Machine labels", name: (v) => v },
@@ -173,7 +183,7 @@ export function matches(q: string, chosen: Chosen, e: Entry, dims: Dims, except?
 export const isFiltered = (q: string, chosen: Chosen) => Boolean(q.trim()) || Object.values(chosen).some((v) => v.length > 0);
 
 /** Each dimension's options with how many repositories each would show, the other choices as they are. */
-export function facetsOf(entries: Entry[], dims: Map<string, Dims>, q: string, chosen: Chosen): Facet[] {
+export function facetsOf(entries: Entry[], dims: Map<string, Dims>, q: string, chosen: Chosen, labels?: Labels): Facet[] {
   return DIMENSIONS.flatMap((d) => {
     const seen = new Map<string, number>();
     for (const e of entries) for (const v of dims.get(e.key)?.[d.id] ?? []) if (!seen.has(v)) seen.set(v, 0);
@@ -185,7 +195,7 @@ export function facetsOf(entries: Entry[], dims: Map<string, Dims>, q: string, c
     const picked = chosen[d.id] ?? [];
     // A dimension every repository shares says nothing; it shows once two differ (or one is chosen).
     if (seen.size < 2 && picked.length === 0 && !d.always) return [];
-    const options = [...seen.entries()].map(([id, count]) => ({ id, label: d.name(id), count }));
+    const options = [...seen.entries()].map(([id, count]) => ({ id, label: d.name(id, labels), count }));
     if (d.order) options.sort((x, y) => (d.order!.indexOf(x.id) + 1 || 99) - (d.order!.indexOf(y.id) + 1 || 99));
     else options.sort((x, y) => collator.compare(x.label, y.label));
     return [{ id: d.id, label: d.label, options }];
@@ -231,7 +241,11 @@ export function tildeOf(path: string, home: string | null | undefined): string |
 }
 
 /** The last part of a repository's name, as a folder is named. */
-export const folderName = (name: string) => name.split(/[/:\\]/).filter(Boolean).pop() ?? name;
+export const folderName = (name: string) =>
+  name
+    .split(/[/:\\]/)
+    .filter(Boolean)
+    .pop() ?? name;
 
 /**
  * Where a repository goes on another machine, unless told otherwise: where the source is relative

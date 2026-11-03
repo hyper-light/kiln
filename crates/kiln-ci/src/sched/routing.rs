@@ -817,6 +817,9 @@ pub fn resolve(leg: &LegRoute, rules: &[Rule]) -> Result<Requirement, String> {
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct RunnerView {
     pub name: String,
+    /// The name people see, for a runner kiln knows by its machine id (its `name`): `runs-on`
+    /// names it by this as by its name.
+    pub label: Option<String>,
     pub labels: Vec<String>,
     pub pool: Option<String>,
     pub facts: RunnerFacts,
@@ -824,6 +827,12 @@ pub struct RunnerView {
 }
 
 impl RunnerView {
+    /// The name people see: its label, else its name. What the sentences people read say of it;
+    /// what's looked up by, its name.
+    pub fn shown(&self) -> &str {
+        self.label.as_deref().unwrap_or(&self.name)
+    }
+
     /// Its labels and the ones GitHub gives every self-hosted runner.
     pub fn all_labels(&self) -> Vec<String> {
         let mut l = self.labels.clone();
@@ -848,7 +857,11 @@ pub struct Check {
 pub fn checks(req: &Requirement, r: &RunnerView) -> Vec<Check> {
     let labels = r.all_labels();
     let mut out = Vec::new();
-    let missing = missing_labels(&req.labels, &labels, &r.name);
+    let mut missing = missing_labels(&req.labels, &labels, &r.name);
+    // Named by its one label, a runner known by its machine id goes by the name people see too.
+    if !missing.is_empty() && r.label.as_deref().is_some_and(|l| missing_labels(&req.labels, &labels, l).is_empty()) {
+        missing.clear();
+    }
     if !req.labels.is_empty() {
         out.push(Check { requirement: format!("runs-on [{}]", req.labels.join(", ")), value: format!("labels [{}]", labels.join(", ")), pass: missing.is_empty() });
     }
@@ -999,6 +1012,15 @@ mod tests {
         // Named by its one label.
         assert!(missing_labels(&["mac-1".into()], &l, &r.name).is_empty());
         assert!(!missing_labels(&["mac-1".into(), "x".into()], &l, &r.name).is_empty());
+        // A runner known by its machine id is named by the name people see as by its id; with
+        // another label, that name is a label like any other.
+        let id = RunnerView { name: "5f2a9c3e0b1d4e6f8a7c9b0d1e2f3a4b".into(), label: Some("studio".into()), ..r.clone() };
+        let runs_on = |labels: &[&str]| Requirement { labels: labels.iter().map(|l| (*l).to_owned()).collect(), ..Requirement::default() };
+        for named in ["studio", "Studio", "5f2a9c3e0b1d4e6f8a7c9b0d1e2f3a4b"] {
+            assert!(checks(&runs_on(&[named]), &id).iter().all(|c| c.pass), "{named}");
+        }
+        assert!(!checks(&runs_on(&["studio", "bench"]), &id).iter().all(|c| c.pass));
+        assert!(!checks(&runs_on(&["mac-1"]), &id).iter().all(|c| c.pass), "another runner's name");
     }
 
     /// W05-R21: labels match in any case, as GitHub's do. `[baremetal, linux]` fits a Linux runner
