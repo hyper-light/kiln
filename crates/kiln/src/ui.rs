@@ -109,6 +109,30 @@ fn brotli(name: &str, data: &[u8]) -> Option<Bytes> {
     Some(out)
 }
 
+/// `name` packed (brotli or gzip, by its cache), made already; else none now, and both made on the
+/// blocking pool for the next request (once at a time for a file).
+fn packed(name: &str, data: &Bytes, cache: &'static Mutex<HashMap<String, Bytes>>) -> Option<(Bytes, &'static str)> {
+    let coding = if std::ptr::eq(cache, br_cache()) { "br" } else { "gzip" };
+    if let Some(b) = cache.lock().get(name) {
+        return Some((b.clone(), coding));
+    }
+    static MAKING: OnceLock<Mutex<std::collections::HashSet<String>>> = OnceLock::new();
+    let making = MAKING.get_or_init(Default::default);
+    if making.lock().insert(name.to_owned()) {
+        let (name, data) = (name.to_owned(), data.clone());
+        drop(crate::rt::spawn(async move {
+            let n = name.clone();
+            let _ = crate::rt::blocking(move || {
+                let _ = brotli(&n, &data);
+                let _ = gzip(&n, &data);
+            })
+            .await;
+            making.lock().remove(&name);
+        }));
+    }
+    None
+}
+
 /// Whether an Accept-Encoding header takes `coding` (and doesn't refuse it with q=0).
 fn accepts(header: Option<&str>, coding: &str) -> bool {
     header.is_some_and(|v| {
@@ -189,10 +213,13 @@ fn respond(req: &Request, name: &str, data: Bytes) -> Response {
     let cache = if name.starts_with("assets/") { "public, max-age=31536000, immutable" } else { "no-cache" };
     let asked = srv::header_str(req, &header::ACCEPT_ENCODING);
     let worth = compressible(mime.as_ref()) && data.len() > 1024;
+    // Packed as made already: one not made yet goes as it is this once, and is packed on the
+    // blocking pool for the requests after it (a large file at brotli's best takes seconds, and
+    // this request's thread serves every socket on it, a restart's first pages most of all).
     let packed = if worth && accepts(asked, "br") {
-        brotli(name, &data).map(|b| (b, "br"))
+        packed(name, &data, br_cache())
     } else if worth && accepts(asked, "gzip") {
-        gzip(name, &data).map(|b| (b, "gzip"))
+        packed(name, &data, gz_cache())
     } else {
         None
     };

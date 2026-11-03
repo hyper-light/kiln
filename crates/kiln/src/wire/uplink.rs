@@ -24,7 +24,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::time::{Duration, Instant};
 
-use super::channel::{Event, Frame, Sender};
+use super::channel::{Event, Frame, Sender, Seq};
 
 /// What one stream keeps unanswered past its picture, at the most. Past it the stream starts over
 /// with its picture once the server is back, rather than keep a backlog without end while the
@@ -35,7 +35,8 @@ pub const ROOM: usize = 8 << 20;
 /// sessions and a long outage never hold more than this (a stream starts over only while the
 /// server is there, so an outage holds no new pictures).
 pub const TOTAL_ROOM: usize = 64 << 20;
-/// How long an update sent on a live link waits for its answer before it goes again.
+/// How long an update sent on a live link waits for its answer before it goes again, at the least
+/// (longer while its answers take longer: the channel's RTO, RFC 6298).
 pub const PATIENCE: Duration = Duration::from_secs(15);
 
 /// A session's key: its updates' stream is named for it.
@@ -74,6 +75,14 @@ pub struct Updates {
     generation: BTreeMap<String, u32>,
     /// Keys whose stream starts over at the next chance (a new generation, its picture first).
     stale: BTreeSet<String>,
+    /// Each key's stream's picture: the number of its last item. Until the server has answered it,
+    /// on a live link, the stream doesn't start over ([`Updates::take_stale`]).
+    pictured: BTreeMap<String, Seq>,
+    /// Each stream's newest state not pushed yet, its frames: held while the last one pushed waits
+    /// for its answer ([`Updates::push_state`]).
+    held: BTreeMap<String, Vec<Vec<u8>>>,
+    /// Each stream's last state pushed: the number of its last frame (answered once that is).
+    in_flight: BTreeMap<String, Seq>,
     /// Keys whose stream ends once its last items (a `Closed`, a `TermExit`) are answered.
     closing: BTreeSet<String>,
 }
@@ -89,7 +98,17 @@ impl Updates {
 
     /// Streams of `room` bytes each, `total` together.
     pub fn bounded(boot: impl Into<String>, room: usize, total: usize, patience: Duration) -> Self {
-        Self { tx: Sender::new(room, patience), total, boot: boot.into(), generation: BTreeMap::new(), stale: BTreeSet::new(), closing: BTreeSet::new() }
+        Self {
+            tx: Sender::new(room, patience),
+            total,
+            boot: boot.into(),
+            generation: BTreeMap::new(),
+            stale: BTreeSet::new(),
+            pictured: BTreeMap::new(),
+            held: BTreeMap::new(),
+            in_flight: BTreeMap::new(),
+            closing: BTreeSet::new(),
+        }
     }
 
     /// The stream `key`'s items go on now.
@@ -116,23 +135,94 @@ impl Updates {
         self.generation.insert(key.to_owned(), next);
         self.stale.remove(key);
         self.closing.remove(key);
+        self.pictured.remove(key);
+        // Its picture holds the state as it is now.
+        self.held.remove(key);
+        self.in_flight.remove(key);
     }
 
     /// One item of `key` (its bytes: an encoded `AgentMsg`). False when its stream isn't taking
     /// items: not started, starting over, or full (then it starts over later, its picture first,
     /// and this item is in that picture).
     pub fn push(&mut self, key: &str, body: Vec<u8>) -> bool {
+        self.push_seq(key, body).is_some()
+    }
+
+    /// [`Updates::push`] of what ends or starts the stream's timeline over (a session closed, a
+    /// reset): a state held for it goes first, so no state of it comes after.
+    pub fn push_after_state(&mut self, key: &str, body: Vec<u8>) -> bool {
+        if let Some(frames) = self.held.remove(key)
+            && !self.push_state_now(key, frames)
+        {
+            return false;
+        }
+        self.push(key, body)
+    }
+
+    /// A state of `key`'s session (its frames, one or more): pushed now, unless the last one pushed
+    /// still waits for its answer; then held, a newer taking its place, and pushed once that's
+    /// answered ([`Updates::poll`]). A state is the session whole as it stands, so one held for a
+    /// newer is never missed; what comes in meanwhile (its events, its words) goes on before it. A
+    /// stream behind a slow server holds one state then, not one a flush, a busy session's states
+    /// being most of what it sends. False as [`Updates::push`] is.
+    pub fn push_state(&mut self, key: &str, frames: Vec<Vec<u8>>) -> bool {
         if !self.started(key) || self.stale.contains(key) {
             return false;
         }
-        let stream = self.stream(key);
-        let over = self.tx.backlog().saturating_add(body.len()) > self.total;
-        if over || self.tx.push(&stream, body).is_err() {
-            self.stale.insert(key.to_owned());
-            self.tx.drop_stream(&stream);
-            return false;
+        if self.state_waits(key) {
+            self.held.insert(key.to_owned(), frames);
+            return true;
+        }
+        self.push_state_now(key, frames)
+    }
+
+    /// Whether `key`'s last state pushed is still waiting for its answer.
+    fn state_waits(&self, key: &str) -> bool {
+        self.in_flight.get(key).is_some_and(|seq| *seq > self.tx.answered_through(&self.stream(key)))
+    }
+
+    fn push_state_now(&mut self, key: &str, frames: Vec<Vec<u8>>) -> bool {
+        let mut last = None;
+        for body in frames {
+            match self.push_seq(key, body) {
+                Some(seq) => last = Some(seq),
+                None => return false,
+            }
+        }
+        if let Some(seq) = last {
+            self.in_flight.insert(key.to_owned(), seq);
         }
         true
+    }
+
+    /// [`Updates::push`], with the item's number when it took it.
+    fn push_seq(&mut self, key: &str, body: Vec<u8>) -> Option<Seq> {
+        if !self.started(key) || self.stale.contains(key) {
+            return None;
+        }
+        let stream = self.stream(key);
+        let over = self.tx.backlog().saturating_add(body.len()) > self.total;
+        match (!over).then(|| self.tx.push(&stream, body)) {
+            Some(Ok(seq)) => Some(seq),
+            _ => {
+                self.stale.insert(key.to_owned());
+                // Kept while the server takes its picture (its answer is what lets it start over);
+                // else let go of, as nothing of it will be sent again.
+                if !self.picture_waits(key) {
+                    self.tx.drop_stream(&stream);
+                }
+                self.held.remove(key);
+                self.in_flight.remove(key);
+                None
+            }
+        }
+    }
+
+    /// Whether `key`'s stream waits for the server to answer its picture: the link is up, and the
+    /// server hasn't answered through the picture's last item yet.
+    fn picture_waits(&self, key: &str) -> bool {
+        let stream = self.stream(key);
+        self.tx.up() && self.tx.sends(&stream) && self.pictured.get(key).is_some_and(|last| *last > self.tx.answered_through(&stream))
     }
 
     /// One item of `key`'s picture, pushed after [`Updates::start`] and before its other items: it
@@ -144,7 +234,8 @@ impl Updates {
             return false;
         }
         let stream = self.stream(key);
-        self.tx.push_picture(&stream, body);
+        let seq = self.tx.push_picture(&stream, body);
+        self.pictured.insert(key.to_owned(), seq);
         true
     }
 
@@ -153,10 +244,17 @@ impl Updates {
         self.closing.insert(key.to_owned());
     }
 
-    /// Keys whose stream has to start over now, each to be started (and its picture pushed) by
-    /// the caller.
+    /// Keys whose stream has to start over now, each to be started (and its picture pushed) by the
+    /// caller. One whose picture the server hasn't answered yet, on a live link, waits for that
+    /// answer, and stays stale meanwhile: a stream that keeps overflowing its room (a server slow to
+    /// take a busy session) starts over at the pace the server takes its pictures (the session
+    /// whole, megabytes), never with two of them on their way at once, rather than at every frame
+    /// from the server, each making the server slower. What it takes in meanwhile is in the picture
+    /// it starts with.
     pub fn take_stale(&mut self) -> Vec<String> {
-        std::mem::take(&mut self.stale).into_iter().collect()
+        let (due, waiting): (Vec<String>, Vec<String>) = std::mem::take(&mut self.stale).into_iter().partition(|key| !self.picture_waits(key));
+        self.stale = waiting.into_iter().collect();
+        due
     }
 
     /// A frame from the server for this side's streams: its answers, its wants, what it has.
@@ -170,6 +268,7 @@ impl Updates {
                 && self.stream(key) == *stream
             {
                 self.stale.insert(key.to_owned());
+                self.pictured.remove(key);
             }
         }
         // A closed session's stream, an exited terminal's, all answered, is done with.
@@ -178,18 +277,31 @@ impl Updates {
             self.tx.drop_stream(&self.stream(&key));
             self.closing.remove(&key);
             self.generation.remove(&key);
+            self.pictured.remove(&key);
+            self.held.remove(&key);
+            self.in_flight.remove(&key);
         }
         events
     }
 
-    /// The frames to send now.
+    /// The frames to send now: a state held behind one answered since goes first.
     pub fn poll(&mut self, now: Instant) -> Vec<Frame> {
+        let ready: Vec<String> = self.held.keys().filter(|k| !self.state_waits(k)).cloned().collect();
+        for key in ready {
+            if let Some(frames) = self.held.remove(&key) {
+                self.push_state_now(&key, frames);
+            }
+        }
         self.tx.poll(now)
     }
 
-    /// The link went down: what was on it goes again once the server says what it has.
+    /// The link went down: what was on it goes again once the server says what it has. A stale
+    /// stream kept while its picture went lets go of it: it starts over once the server is back.
     pub fn down(&mut self) {
         self.tx.down();
+        for key in &self.stale {
+            self.tx.drop_stream(&stream_name(key, &self.boot, self.generation.get(key).copied().unwrap_or(0)));
+        }
     }
 
     /// Updates sent and not yet answered, over every stream.
@@ -355,7 +467,11 @@ mod tests {
         let mut s = Server::new();
         start(&mut u, "s:x", 1);
         u.on_frame(s.rx.have());
-        // Its backlog passes its room while the server doesn't answer: it starts over.
+        // The server has its picture; then its backlog passes its room while the server doesn't
+        // answer: it starts over.
+        for a in s.take(u.poll(base)) {
+            u.on_frame(a);
+        }
         while u.push("s:x", vec![0; 16]) {}
         assert_eq!(u.take_stale(), vec!["s:x".to_owned()]);
         // Its snapshot now is ten times the room.
@@ -399,6 +515,74 @@ mod tests {
         assert!(!u.push("s:b", vec![0; 60]));
         assert_eq!(u.take_stale(), vec!["s:b".to_owned()]);
         assert!(u.push("s:a", vec![0; 30]), "a goes on within the total");
+    }
+
+    /// A state waits behind the last one pushed until that's answered, a newer taking its place:
+    /// what comes meanwhile goes on before it, the server gets the newest state once the last is
+    /// answered, and none of those in between. What ends the stream sends the one held first.
+    #[test]
+    fn a_state_waits_behind_its_last_and_only_the_newest_goes() {
+        let base = Instant::now();
+        let mut u = Updates::with("boot1", ROOM, PATIENCE);
+        let mut s = Server::new();
+        let state = |n: u32| format!("state {n}").into_bytes();
+        start(&mut u, "s:x", 1);
+        u.on_frame(s.rx.have());
+        assert!(u.push_state("s:x", vec![state(1)]));
+        let sent = u.poll(base);
+        // While it waits for its answer: an event, two states (the second in the first's place),
+        // another event.
+        assert!(u.push("s:x", update(10)));
+        assert!(u.push_state("s:x", vec![state(2)]));
+        assert!(u.push_state("s:x", vec![state(3), state(30)]));
+        assert!(u.push("s:x", update(11)));
+        let sent: Vec<Frame> = sent.into_iter().chain(u.poll(base)).collect();
+        for a in s.take(sent) {
+            u.on_frame(a);
+        }
+        // Answered: the newest state goes, whole.
+        for a in s.take(u.poll(base)) {
+            u.on_frame(a);
+        }
+        let want = vec![b"snap 0".to_vec(), state(1), update(10), update(11), state(3), state(30)];
+        assert_eq!(s.mirror.get("x"), Some(&want));
+        // One pushed with nothing waiting goes at once; one behind it, before what ends the stream.
+        assert!(u.push_state("s:x", vec![state(4)]));
+        assert!(u.push_state("s:x", vec![state(5)]));
+        assert!(u.push_after_state("s:x", b"closed".to_vec()));
+        for a in s.take(u.poll(base)) {
+            u.on_frame(a);
+        }
+        let got = s.mirror.get("x").cloned().unwrap_or_default();
+        assert_eq!(got.get(want.len()..), Some([state(4), state(5), b"closed".to_vec()].as_slice()));
+        assert_eq!(u.unanswered(), 0);
+    }
+
+    /// A stream that goes stale again before the server has answered the picture it started with
+    /// (a server slow to take a busy session) starts over once it has: never two of a session's
+    /// pictures (the session whole, megabytes) on their way to a slow server at once. Gone stale
+    /// while its link is down, it starts over as soon as the server is back.
+    #[test]
+    fn a_stream_starts_over_again_only_once_the_server_has_its_last_picture() {
+        let base = Instant::now();
+        let mut u = Updates::with("boot1", 64, PATIENCE);
+        let mut s = Server::new();
+        start(&mut u, "s:x", 1);
+        u.on_frame(s.rx.have());
+        let picture = u.poll(base);
+        while u.push("s:x", vec![0; 16]) {}
+        assert!(u.take_stale().is_empty(), "its picture isn't answered yet");
+        assert!(u.unanswered() > 0, "it goes on taking its picture");
+        for a in s.take(picture) {
+            u.on_frame(a);
+        }
+        assert_eq!(u.take_stale(), vec!["s:x".to_owned()], "answered: it starts over");
+        start(&mut u, "s:x", 1);
+        u.down();
+        while u.push("s:x", vec![0; 16]) {}
+        assert_eq!(u.unanswered(), 0, "away, what it kept went with it");
+        u.on_frame(s.rx.have());
+        assert_eq!(u.take_stale(), vec!["s:x".to_owned()], "back: at once");
     }
 
     #[test]

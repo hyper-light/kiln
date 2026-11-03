@@ -5868,27 +5868,17 @@ fn harness_ws(hub: Arc<Hub>, id: String, req: Request) -> R {
     Ok(resp)
 }
 
-/// A snapshot's frames and the `synced` after them, gzip'd as one message: a frame a line (frames
-/// are JSON, whose strings escape their line breaks).
-fn pack_snapshot(frames: &[String]) -> std::io::Result<Vec<u8>> {
-    use std::io::Write as _;
-    let mut gz = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
-    for f in frames {
-        gz.write_all(f.as_bytes())?;
-        gz.write_all(b"\n")?;
-    }
-    gz.write_all(synced().as_bytes())?;
-    gz.finish()
-}
-
 /// Send a viewer a snapshot: its frames then `synced`, a message each; or, `packed`, all of it in
-/// one gzip'd binary message.
-async fn send_snapshot(tx: &mut ws::Sender, frames: Vec<String>, packed: bool) -> anyhow::Result<()> {
+/// one gzip'd binary message, a frame a line (frames are JSON, whose strings escape their line
+/// breaks). Written out on the blocking pool: a long session's is megabytes of JSON, and the
+/// runtime's threads serve every socket (`crate::harness::registry::Snapshot`).
+async fn send_snapshot(tx: &mut ws::Sender, snapshot: crate::harness::registry::Snapshot, packed: bool) -> anyhow::Result<()> {
     if packed {
-        let bytes = crate::rt::blocking(move || pack_snapshot(&frames)).await??;
+        let bytes = crate::rt::blocking(move || snapshot.packed(&synced())).await??;
         tx.send(ws::binary(bytes)).await?;
         return Ok(());
     }
+    let frames = crate::rt::blocking(move || snapshot.frames()).await?;
     for f in frames {
         tx.send(ws::text(f)).await?;
     }
@@ -5997,11 +5987,11 @@ async fn harness_attach(hub: Arc<Hub>, id: String, socket: ws::WebSocket, takes:
     // What it can't read of what its person sends, and what they can't read of what it sends,
     // shows on the agent's page.
     let sock = ui::Socket::of(Wire::SessionUp, Wire::SessionDown, &who, Some(Page::Session(id.clone())));
-    let Some(att) = hub.harness.attach_from(&id, takes.after) else {
+    let Some(att) = hub.harness.attach_from(&id, takes.after, takes.patches) else {
         tx.send(ws::text(SessionDown::from(SessionFrame::Closed).text())).await?;
         return Ok(());
     };
-    send_snapshot(&mut tx, att.frames, takes.packed).await?;
+    send_snapshot(&mut tx, att.snapshot, takes.packed).await?;
     // Its place among the session's viewers, given back as it goes.
     let viewer = att.viewer;
     let topic = att.topic;
@@ -6019,6 +6009,8 @@ async fn harness_attach(hub: Arc<Hub>, id: String, socket: ws::WebSocket, takes:
     let closed = || ws::text(SessionDown::from(SessionFrame::Closed).text());
     // The writer of its commands' audit rows (`audits`), from its first command.
     let mut audit: Option<async_channel::Sender<String>> = None;
+    // Its last catch-up: when it ended, and how long it took to make and send.
+    let mut caught_up: Option<(Instant, Duration)> = None;
     loop {
         let live = {
             let (bus, topic, from) = (&hub.bus, &topic, at);
@@ -6057,35 +6049,46 @@ async fn harness_attach(hub: Arc<Hub>, id: String, socket: ws::WebSocket, takes:
                         // Read now: each frame's delivery, from its publish on this process's
                         // microsecond clock (the bus's own stamps are milliseconds).
                         let now = crate::harness::live::now_us();
-                        for m in &batch.messages {
-                            match crate::harness::live::decode(&m.payload) {
-                                Some(frame) if frame.text.as_ref() == crate::harness::live::RESYNC => {
-                                    start_over = true;
-                                    break;
-                                }
-                                // The session's last frame: the viewer ends with it, and its
-                                // place, given back, lets the topic go.
-                                Some(frame) if frame.text.as_ref() == crate::harness::live::closed() => {
-                                    tx.send(ws::text(frame.for_viewer(takes.patches))).await?;
-                                    return Ok(());
-                                }
-                                // One its catch-up already held.
-                                Some(frame) if frame.rev != 0 && frame.rev <= have => {}
-                                Some(frame) => {
-                                    if let Some(at) = crate::harness::live::published_us(&m.payload) {
-                                        crate::metrics::bus().delivery_seconds.observe(now.saturating_sub(at) as f64 / 1e6);
-                                    }
-                                    have = have.max(frame.rev);
-                                    tx.send(ws::text(frame.for_viewer(takes.patches))).await?;
-                                }
-                                None => {
-                                    tracing::warn!(target: "kiln.bus", event = "feed.unreadable", topic = %topic, offset = m.offset, "a frame the feed didn't make: the viewer starts over");
-                                    start_over = true;
-                                    break;
-                                }
+                        let next = batch.next;
+                        // Each frame read where it is in its payload, and sent as the payload's own
+                        // bytes (this viewer's copy of it, moved): no other copy of it is made.
+                        for m in batch.messages {
+                            let Some(frame) = crate::harness::live::decode_ref(&m.payload) else {
+                                tracing::warn!(target: "kiln.bus", event = "feed.unreadable", topic = %topic, offset = m.offset, "a frame the feed didn't make: the viewer starts over");
+                                start_over = true;
+                                break;
+                            };
+                            if frame.text == crate::harness::live::RESYNC {
+                                start_over = true;
+                                break;
                             }
+                            // The session's last frame: the viewer ends with it, and its place,
+                            // given back, lets the topic go.
+                            if frame.text == crate::harness::live::closed() {
+                                tx.send(ws::text(frame.for_viewer(takes.patches))).await?;
+                                return Ok(());
+                            }
+                            // One its catch-up already held.
+                            if frame.rev != 0 && frame.rev <= have {
+                                continue;
+                            }
+                            let (rev, range) = (frame.rev, frame.range_for_viewer(takes.patches));
+                            let published = crate::harness::live::published_us(&m.payload);
+                            let said = crate::harness::live::into_text(m.payload, range);
+                            // A state or changeset that went as its patch alone, to a viewer that
+                            // takes it whole (none did as it went: `live::Feed::wants_whole`):
+                            // it starts over rather than take nothing.
+                            if said.is_empty() {
+                                start_over = true;
+                                break;
+                            }
+                            if let Some(at) = published {
+                                crate::metrics::bus().delivery_seconds.observe(now.saturating_sub(at) as f64 / 1e6);
+                            }
+                            have = have.max(rev);
+                            tx.send(ws::text(said)).await?;
                         }
-                        at = Some(batch.next);
+                        at = Some(next);
                     }
                     Err(Refusal::Behind { .. }) => {
                         crate::metrics::bus().lag_notices.inc();
@@ -6169,13 +6172,25 @@ async fn harness_attach(hub: Arc<Hub>, id: String, socket: ws::WebSocket, takes:
             },
         }
         if start_over {
+            // One that has to start over again (its socket slower than the session goes, or the
+            // feed refusing frame after frame) waits first until as long has gone by since its last
+            // catch-up as that one took: it spends at most half its time catching up, and a
+            // catch-up a frame can't cost the server a snapshot each, at whatever pace they cost.
+            if let Some((ended, took)) = caught_up {
+                let left = took.saturating_sub(ended.elapsed());
+                if !left.is_zero() {
+                    crate::rt::sleep(left).await;
+                }
+            }
+            let began = Instant::now();
             // What it missed since what it has (it begins with "resumed"), or all of it when the copy
             // can't tell (it begins with "open"); and the feed from where that is.
-            let Some((frames, from, now, rev)) = hub.harness.frames_since(&id, have) else {
+            let Some((snapshot, from, now, rev)) = hub.harness.frames_since(&id, have) else {
                 tx.send(closed()).await?;
                 return Ok(());
             };
-            send_snapshot(&mut tx, frames, takes.packed).await?;
+            send_snapshot(&mut tx, snapshot, takes.packed).await?;
+            caught_up = Some((Instant::now(), began.elapsed()));
             at = from;
             refusals = now;
             have = have.max(rev);
@@ -6337,19 +6352,32 @@ mod tests {
 
     #[test]
     fn a_packed_snapshot_unpacks_to_its_frames_then_synced() -> anyhow::Result<()> {
+        use crate::harness::core::Update;
+        use crate::harness::model::{Body, Event, State};
         use std::io::Read as _;
-        let long = format!(r#"{{"t":"events","events":[{{"id":"e1","text":"{}\nsecond line"}}]}}"#, "word ".repeat(4000));
-        let frames = vec![r#"{"t":"open","info":{}}"#.to_owned(), long.clone(), r#"{"t":"state","state":{}}"#.to_owned()];
-        let packed = pack_snapshot(&frames)?;
-        // A long conversation packs small.
-        assert!(packed.len() * 10 < long.len(), "{} bytes packed from {}", packed.len(), long.len());
-        let mut text = String::new();
-        flate2::read::GzDecoder::new(packed.as_slice()).read_to_string(&mut text)?;
-        let lines: Vec<&str> = text.split('\n').collect();
-        let mut want: Vec<String> = frames.clone();
-        want.push(synced());
-        assert_eq!(lines, want);
-        Ok(())
+        crate::rt::block_on(async {
+            let hub = crate::hub::tests::scratch_hub().await?;
+            let there = crate::harness::registry::Location::Machine("box".into());
+            let info = crate::harness::session::Info { id: "s".into(), kind: "claude".into(), ..crate::harness::session::Info::default() };
+            hub.harness.ingest(&hub, &there, "s", Update::Open { info: Box::new(info), since: None });
+            hub.harness.ingest(&hub, &there, "s", Update::State { state: Box::new(State::default()) });
+            let long = format!("{}\nsecond line", "word ".repeat(4000));
+            let said = |n: u64, text: &str| Event { id: format!("e{n}"), seq: n, at: 1, parent: None, by: None, body: Body::Assistant { text: text.into(), streaming: false } };
+            hub.harness.ingest(&hub, &there, "s", Update::Events { events: vec![said(1, &long), said(2, "short")] });
+            let att = hub.harness.attach("s").ok_or_else(|| anyhow::anyhow!("no session"))?;
+            let frames = att.frames();
+            let packed = att.snapshot.packed(&synced())?;
+            // A long conversation packs small.
+            assert!(packed.len() * 10 < long.len(), "{} bytes packed from {}", packed.len(), long.len());
+            let mut text = String::new();
+            flate2::read::GzDecoder::new(packed.as_slice()).read_to_string(&mut text)?;
+            let lines: Vec<&str> = text.split('\n').collect();
+            let mut want: Vec<String> = frames.clone();
+            want.push(synced());
+            assert_eq!(lines, want);
+            assert!(frames.iter().any(|f| f.contains("second line")), "{frames:?}");
+            Ok(())
+        })
     }
 
     /// A command on a session's socket doesn't wait for the store: with the store's one connection

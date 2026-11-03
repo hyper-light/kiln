@@ -41,8 +41,14 @@ fn short(h: Sha256) -> u64 {
 
 /// An event's digest: of its JSON as a copy keeps it.
 pub fn event(v: &serde_json::Value) -> u64 {
+    event_text(&serde_json::to_string(v).unwrap_or_default())
+}
+
+/// [`event`], of an event's JSON already written out (`serde_json`'s compact form of it): the same
+/// digest, without writing it out again.
+pub fn event_text(text: &str) -> u64 {
     let mut h = Sha256::new();
-    h.update(serde_json::to_vec(v).unwrap_or_default());
+    h.update(text.as_bytes());
     short(h)
 }
 

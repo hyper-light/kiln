@@ -20,7 +20,7 @@ use futures::FutureExt as _;
 use kiln_seams::Bus;
 use kiln_seams::bus::{Class, Offset, Refusal, Topic};
 
-use super::registry::Frame;
+use super::registry::{Frame, PatchOf, Patches};
 
 /// Frames a session's topic keeps: a viewer further behind starts over from a snapshot.
 pub const RETAIN: usize = 2048;
@@ -55,13 +55,67 @@ pub fn now_us() -> u64 {
     u64::try_from(BASE.get_or_init(Instant::now).elapsed().as_micros()).unwrap_or(u64::MAX)
 }
 
+/// Bytes of a frame's payload ahead of its text ([`encode`]): its publish time (a `u64`), its
+/// revision (a `u64`) and its text's length (a `u32`).
+const HEAD: usize = size_of::<u64>() + size_of::<u64>() + size_of::<u32>();
+
+/// A frame written straight into its bus payload, in [`encode`]'s form: its text, then its patch.
+/// Nothing of it is copied to send it; its publish time is said as it goes ([`Feed::publish_payload`]).
+pub struct Payload {
+    bytes: Vec<u8>,
+    /// Its text is written: what follows is its patch.
+    patching: bool,
+}
+
+impl Payload {
+    /// A frame of the copy's revision `rev`, about `room` bytes.
+    pub fn new(rev: u64, room: usize) -> Self {
+        let mut bytes = Vec::with_capacity(HEAD.saturating_add(room));
+        bytes.extend_from_slice(&0u64.to_le_bytes());
+        bytes.extend_from_slice(&rev.to_le_bytes());
+        bytes.extend_from_slice(&0u32.to_le_bytes());
+        Self { bytes, patching: false }
+    }
+
+    /// Where its text is written (before its patch).
+    pub fn text(&mut self) -> &mut Vec<u8> {
+        &mut self.bytes
+    }
+
+    /// Where its patch is written: its text is done.
+    pub fn patch(&mut self) -> &mut Vec<u8> {
+        self.done();
+        &mut self.bytes
+    }
+
+    /// Its text is done (when it has no patch): its length is said.
+    pub fn done(&mut self) {
+        if std::mem::replace(&mut self.patching, true) {
+            return;
+        }
+        let len = u32::try_from(self.bytes.len().saturating_sub(HEAD)).unwrap_or(u32::MAX).to_le_bytes();
+        if let Some(at) = self.bytes.get_mut(HEAD - size_of::<u32>()..HEAD) {
+            at.copy_from_slice(&len);
+        }
+    }
+
+    /// The payload, said published now.
+    fn stamped(mut self) -> Vec<u8> {
+        self.done();
+        if let Some(at) = self.bytes.get_mut(..8) {
+            at.copy_from_slice(&now_us().to_le_bytes());
+        }
+        self.bytes
+    }
+}
+
 /// A frame as the bus carries it: when it was published ([`now_us`], 8 bytes, little-endian), the
 /// copy's revision it carries (8 bytes, little-endian; docs/wire.md, "Revisions"), its whole text's
 /// length (4 bytes, little-endian), the text, then what changed in a state when there's a patch
 /// (the rest). The topic is this process's alone, so the form is free to change.
 pub fn encode(frame: &Frame) -> Vec<u8> {
     let patch = frame.patch.as_deref().unwrap_or_default();
-    let mut out = Vec::with_capacity(frame.text.len().saturating_add(patch.len()).saturating_add(20));
+    let mut out = Vec::with_capacity(frame.text.len().saturating_add(patch.len()).saturating_add(HEAD));
     out.extend_from_slice(&now_us().to_le_bytes());
     out.extend_from_slice(&frame.rev.to_le_bytes());
     out.extend_from_slice(&u32::try_from(frame.text.len()).unwrap_or(u32::MAX).to_le_bytes());
@@ -73,6 +127,48 @@ pub fn encode(frame: &Frame) -> Vec<u8> {
 /// When the frame in `bytes` was published ([`now_us`]); `None` for bytes [`encode`] didn't make.
 pub fn published_us(bytes: &[u8]) -> Option<u64> {
     bytes.first_chunk::<8>().map(|at| u64::from_le_bytes(*at))
+}
+
+/// A frame as [`decode_ref`] reads it: its text and patch where they are in the payload.
+pub struct FrameRef<'a> {
+    pub text: &'a str,
+    pub patch: &'a str,
+    pub rev: u64,
+}
+
+impl FrameRef<'_> {
+    /// The frame for a viewer that takes the patches `takes` says: its patch when it has one of a
+    /// kind the viewer takes, else its text (empty when it went as its patch alone, which a viewer
+    /// that takes it whole is never sent: [`Feed::wants_whole`]).
+    pub fn for_viewer(&self, takes: Patches) -> &str {
+        if !self.patch.is_empty() && takes.takes(PatchOf::of(self.patch)) { self.patch } else { self.text }
+    }
+
+    /// Where in its payload the frame for a viewer that takes `takes` is ([`FrameRef::for_viewer`]).
+    pub fn range_for_viewer(&self, takes: Patches) -> std::ops::Range<usize> {
+        let text = HEAD..HEAD + self.text.len();
+        if !self.patch.is_empty() && takes.takes(PatchOf::of(self.patch)) { text.end..text.end + self.patch.len() } else { text }
+    }
+}
+
+/// The text at `range` of `payload` (a frame [`decode_ref`] read), as a string of its own made of
+/// the payload's bytes, moved: a viewer's frame goes to its socket without another copy of it.
+pub fn into_text(mut payload: Vec<u8>, range: std::ops::Range<usize>) -> String {
+    payload.truncate(range.end);
+    payload.drain(..range.start.min(payload.len()));
+    String::from_utf8(payload).unwrap_or_default()
+}
+
+/// A frame from what [`encode`] made, read where it is (nothing copied); `None` for bytes it
+/// didn't make.
+pub fn decode_ref(bytes: &[u8]) -> Option<FrameRef<'_>> {
+    let (_, rest) = bytes.split_first_chunk::<8>()?;
+    let (rev, rest) = rest.split_first_chunk::<8>()?;
+    let (len, rest) = rest.split_first_chunk::<4>()?;
+    let len = usize::try_from(u32::from_le_bytes(*len)).ok()?;
+    let text = std::str::from_utf8(rest.get(..len)?).ok()?;
+    let patch = std::str::from_utf8(rest.get(len..)?).ok()?;
+    Some(FrameRef { text, patch, rev: u64::from_le_bytes(*rev) })
 }
 
 /// A frame from what [`encode`] made; `None` for bytes it didn't make.
@@ -103,6 +199,10 @@ struct Shared {
     topic: String,
     /// Viewers attached now, each counted by its [`Viewer`].
     viewers: AtomicUsize,
+    /// Of them, those that take a state whole, and a changeset whole (not as patches): with none, a
+    /// state or a changeset goes as its patch alone ([`Feed::wants_whole`]).
+    whole_state: AtomicUsize,
+    whole_changes: AtomicUsize,
     /// Frames and topics the bus refused the feed: a viewer whose feed was refused since it last
     /// started over starts over again, whether or not a resync marker ever reaches it (a full bus
     /// may refuse that too).
@@ -145,13 +245,20 @@ pub struct Feed {
 /// One viewer's place in a feed's count (and in `kiln_bus_viewers`); dropping it gives the place
 /// back, and the last viewer of an ended session takes its topic with it. It reads the feed's
 /// refusals, so it can tell its feed broke without a frame saying so.
-pub struct Viewer(Arc<Shared>);
+pub struct Viewer(Arc<Shared>, Patches);
 
 impl Viewer {
-    fn new(shared: &Arc<Shared>) -> Self {
+    fn new(shared: &Arc<Shared>, takes: Patches) -> Self {
+        // Counted whole before it's counted at all: a publish that sees it sees what it takes.
+        if !takes.state {
+            shared.whole_state.fetch_add(1, Ordering::AcqRel);
+        }
+        if !takes.changes {
+            shared.whole_changes.fetch_add(1, Ordering::AcqRel);
+        }
         shared.viewers.fetch_add(1, Ordering::AcqRel);
         crate::metrics::bus_gauges().viewers.add(1);
-        Self(Arc::clone(shared))
+        Self(Arc::clone(shared), takes)
     }
 
     /// The feed's refusals so far: more than when the viewer last started over means the feed
@@ -165,6 +272,12 @@ impl Drop for Viewer {
     fn drop(&mut self) {
         // Its place, taken once as it was made, given back once.
         crate::metrics::bus_gauges().viewers.add(-1);
+        if !self.1.state {
+            self.0.whole_state.fetch_sub(1, Ordering::AcqRel);
+        }
+        if !self.1.changes {
+            self.0.whole_changes.fetch_sub(1, Ordering::AcqRel);
+        }
         if self.0.viewers.fetch_sub(1, Ordering::SeqCst) == 1 && self.0.ended.load(Ordering::SeqCst) {
             self.0.delete();
         }
@@ -182,7 +295,16 @@ impl Feed {
     /// A feed for session `id`, its topic made on `bus`.
     pub fn open(bus: Arc<dyn Bus>, id: &str) -> Self {
         let topic = topic(id, FEEDS.fetch_add(1, Ordering::Relaxed));
-        let shared = Shared { bus, topic, viewers: AtomicUsize::new(0), refusals: AtomicU64::new(0), ended: AtomicBool::new(false), deleted: AtomicBool::new(false) };
+        let shared = Shared {
+            bus,
+            topic,
+            viewers: AtomicUsize::new(0),
+            whole_state: AtomicUsize::new(0),
+            whole_changes: AtomicUsize::new(0),
+            refusals: AtomicU64::new(0),
+            ended: AtomicBool::new(false),
+            deleted: AtomicBool::new(false),
+        };
         let mut feed = Self { shared: Arc::new(shared), broken: false, made: false };
         feed.make();
         feed
@@ -221,6 +343,16 @@ impl Feed {
         self.shared.viewers.load(Ordering::Acquire)
     }
 
+    /// Whether a viewer watching now takes `of` whole (one from before patches, an API client). A
+    /// viewer attaches, and frames are published, under the mirrors' lock alike: none attaches
+    /// between this and the publish it decides.
+    pub fn wants_whole(&self, of: PatchOf) -> bool {
+        match of {
+            PatchOf::State => self.shared.whole_state.load(Ordering::Acquire) > 0,
+            PatchOf::Changes => self.shared.whole_changes.load(Ordering::Acquire) > 0,
+        }
+    }
+
     /// The feed's refusals so far (what a viewer starting over now compares against later).
     pub fn refusals(&self) -> u64 {
         self.shared.refusals.load(Ordering::Acquire)
@@ -229,8 +361,8 @@ impl Feed {
     /// A viewer's place, and the offset its snapshot is taken at: where it reads on from (none
     /// while the bus can't hold the feed). Taken under the mirrors' lock, as every publish is, so
     /// no frame comes between the snapshot and the offset.
-    pub fn attach(&mut self) -> (Viewer, Option<Offset>) {
-        (Viewer::new(&self.shared), self.position())
+    pub fn attach(&mut self, takes: Patches) -> (Viewer, Option<Offset>) {
+        (Viewer::new(&self.shared, takes), self.position())
     }
 
     /// Where a viewer that starts over reads on from: the offset a snapshot taken now is at.
@@ -245,6 +377,15 @@ impl Feed {
     /// kept goes too (the next viewer starts from a snapshot, on the topic made again), so a
     /// session nobody watches holds none of the bus's memory.
     pub fn publish(&mut self, frame: &Frame) -> Published {
+        self.publish_bytes(encode(frame))
+    }
+
+    /// Publishes a frame written straight into its payload ([`Payload`]), as [`Feed::publish`] does.
+    pub fn publish_payload(&mut self, p: Payload) -> Published {
+        self.publish_bytes(p.stamped())
+    }
+
+    fn publish_bytes(&mut self, payload: Vec<u8>) -> Published {
         if self.viewers() == 0 {
             if self.made {
                 self.made = false;
@@ -266,7 +407,7 @@ impl Feed {
                 Err(e) => return self.refused(&e),
             }
         }
-        match at_once(self.shared.bus.publish(&self.shared.topic, None, encode(frame))) {
+        match at_once(self.shared.bus.publish(&self.shared.topic, None, payload)) {
             Ok(_) => {
                 m.published.inc();
                 Published::Sent
@@ -360,7 +501,7 @@ mod tests {
         let b = bus()?;
         let mut feed = Feed::open(Arc::clone(&b), "s1");
         assert_eq!(feed.publish(&Frame::text("unwatched")), Published::Unwatched);
-        let (viewer, at) = feed.attach();
+        let (viewer, at) = feed.attach(Patches::default());
         assert_eq!(at, Some(0));
         assert_eq!(feed.publish(&Frame::text("first")), Published::Sent);
         let huge = Frame::text(&"x".repeat(kiln_seams::bus::PAYLOAD_MAX + 1));
@@ -382,13 +523,13 @@ mod tests {
     fn a_feed_nobody_watches_lets_its_topic_go_and_a_viewer_makes_it_again() -> anyhow::Result<()> {
         let b = bus()?;
         let mut feed = Feed::open(Arc::clone(&b), "s1");
-        let (viewer, _) = feed.attach();
+        let (viewer, _) = feed.attach(Patches::default());
         assert_eq!(feed.publish(&Frame::text("seen")), Published::Sent);
         drop(viewer);
         assert_eq!(feed.publish(&Frame::text("unseen")), Published::Unwatched);
         let topic = feed.topic().to_owned();
         assert_eq!(futures::executor::block_on(b.bounds(&topic)), Err(Refusal::NoTopic(topic.clone())));
-        let (_viewer, at) = feed.attach();
+        let (_viewer, at) = feed.attach(Patches::default());
         assert_eq!(at, Some(0));
         assert_eq!(feed.publish(&Frame::text("again")), Published::Sent);
         let read = futures::executor::block_on(b.read(&topic, 0, 10))?;
@@ -403,7 +544,7 @@ mod tests {
     fn a_viewer_learns_its_feed_broke_without_a_frame_saying_so() -> anyhow::Result<()> {
         let b = bus()?;
         let mut feed = Feed::open(Arc::clone(&b), "s1");
-        let (viewer, _) = feed.attach();
+        let (viewer, _) = feed.attach(Patches::default());
         let before = viewer.refusals();
         assert_eq!(feed.refusals(), before);
         let huge = Frame::text(&"x".repeat(kiln_seams::bus::PAYLOAD_MAX + 1));
@@ -419,8 +560,8 @@ mod tests {
     fn an_ended_sessions_topic_stays_until_its_last_viewer_goes() -> anyhow::Result<()> {
         let b = bus()?;
         let mut feed = Feed::open(Arc::clone(&b), "s1");
-        let (first, at) = feed.attach();
-        let (second, _) = feed.attach();
+        let (first, at) = feed.attach(Patches::default());
+        let (second, _) = feed.attach(Patches::default());
         let at = at.ok_or_else(|| anyhow::anyhow!("no feed"))?;
         assert_eq!(feed.publish(&Frame::text("last words")), Published::Sent);
         assert_eq!(feed.publish(&Frame::text(closed())), Published::Sent);
@@ -446,7 +587,7 @@ mod tests {
         let mut feed = Feed::open(Arc::clone(&b), "s1");
         let mut viewers = Vec::new();
         for _ in 0..100 {
-            let (viewer, at) = feed.attach();
+            let (viewer, at) = feed.attach(Patches::default());
             viewers.push((viewer, at.ok_or_else(|| anyhow::anyhow!("no feed"))?, Vec::<String>::new()));
         }
         let frames = 3000;

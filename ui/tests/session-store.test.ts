@@ -223,3 +223,47 @@ await test("a changeset comes whole, then as what changed in it, taken in place 
     assert.equal(store.get().changes?.[0], kept, "a file that didn't change stays the same object");
   } finally { off(); }
 });
+
+await test("events about a session don't connect a socket that just died again at once, each its own snapshot", async () => {
+  const { events } = await import("../src/api/events.ts");
+  // The event stream's own listeners, as a message on it calls them.
+  const handlers = (events as unknown as { handlers: Set<(ev: unknown) => void> }).handlers;
+  const store = new SessionStore("busy");
+  const off = store.subscribe(() => {});
+  try {
+    // It dies before its snapshot is in: it goes again after its backoff, not at the next event.
+    Socket.all.at(-1)!.close();
+    const sockets = Socket.all.length;
+    for (let i = 0; i < 20; i++) handlers.forEach((h) => h({ type: "harness", info: { id: "busy", status: "running" } }));
+    await tick();
+    assert.equal(Socket.all.length, sockets, "a turn's events connected it again");
+    // Asked (the tab shown again): at once all the same.
+    store.wake();
+    assert.equal(Socket.all.length, sockets + 1);
+  } finally {
+    off();
+  }
+});
+
+await test("an event about a session taken as gone connects it at once: its machine came back", async () => {
+  const { events } = await import("../src/api/events.ts");
+  const handlers = (events as unknown as { handlers: Set<(ev: unknown) => void> }).handlers;
+  const store = new SessionStore("back");
+  const off = store.subscribe(() => {});
+  try {
+    const ws = Socket.all.at(-1)!;
+    for (const frame of snapshot("back", [event(1)])) ws.frame(frame);
+    await tick();
+    // The server says it's gone (its machine went away): it's looked for only now and then.
+    ws.frame({ t: "closed" });
+    ws.close();
+    await tick();
+    const sockets = Socket.all.length;
+    // An event says it's there again: it connects at once, not at the next look.
+    handlers.forEach((h) => h({ type: "harness", info: { id: "back", status: "running" } }));
+    await tick();
+    assert.equal(Socket.all.length, sockets + 1, "the event connected it again");
+  } finally {
+    off();
+  }
+});

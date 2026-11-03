@@ -574,12 +574,23 @@ impl Visuals {
 
     /// A conversation that's closed: its pages go (their content, at the keeper's next sweep).
     pub fn forget(&self, session: &str) {
-        for e in std::fs::read_dir(&self.dir).into_iter().flatten().flatten() {
-            if serde_json::from_slice::<Visual>(&std::fs::read(e.path()).unwrap_or_default()).is_ok_and(|v| v.session == session) {
-                let _ = std::fs::remove_file(e.path());
-            }
-        }
         self.cache.lock().retain(|_, v| v.session != session);
+        // Its pages' files go on the blocking pool: each page kept is read to find its own, and a
+        // session's close (on the loop that takes every runner's messages) needn't wait for that.
+        // Only those from before now: a session that goes on again under its id keeps new ones.
+        let (dir, session, before) = (self.dir.clone(), session.to_owned(), crate::util::now_ms());
+        drop(crate::rt::spawn(async move {
+            let _ = crate::rt::blocking(move || forget_files(&dir, &session, before)).await;
+        }));
+    }
+}
+
+/// The page files in `dir` of `session` from before `before` (unix ms), gone.
+fn forget_files(dir: &Path, session: &str, before: i64) {
+    for e in std::fs::read_dir(dir).into_iter().flatten().flatten() {
+        if serde_json::from_slice::<Visual>(&std::fs::read(e.path()).unwrap_or_default()).is_ok_and(|v| v.session == session && v.at <= before) {
+            let _ = std::fs::remove_file(e.path());
+        }
     }
 }
 
