@@ -69,21 +69,28 @@ You compose it, not kiln. `ci/gate.sh` runs one step alone (`clippy`, or `test`;
 is named), natively where it runs, on the crates you name, held to what its run asked for.
 
 - **Scope:** `--since origin/main` takes the crates your change touches (committed or not), those
-  whose sources name a file it changed (a doc a test reads), and every crate depending on them.
+  whose code reads a file it changed by path (a test reading a doc or `.kiln/`: string literals,
+  not comments) or builds a changed crate by path, and every crate depending on them. A changed
+  file in no crate that none reads puts the whole workspace in scope.
   `ci/gate.sh --since origin/main --dry-run` says which and why; `-p <crate>` adds one.
 - **Platforms:** clippy on Linux, macOS and Windows, each natively; tests on Linux, and on macOS or
   Windows too where your change has code for them.
-- **Side by side:** a run per platform, all at once, each through `kiln run --needs`:
+- **Side by side:** `ci/gates.sh` starts a run per platform at once, each through `kiln run --needs`
+  with the CPUs (`<N>`) and memory (`<M>`) its steps need, waits for each and keeps its output:
   ```sh
-  kiln run --needs linux/amd64,cpus=4,mem=16g --detach -- ci/gate.sh --since origin/main &
-  kiln run --needs macos,cpus=4,mem=12g --detach -- ci/gate.sh clippy --since origin/main &
-  kiln run --needs windows,cpus=4,mem=12g --detach -- ci/gate.sh clippy --since origin/main &
-  wait
+  ci/gates.sh --needs linux/amd64,cpus=<N>,mem=<M> --since origin/main \
+              --needs macos,cpus=<N>,mem=<M> clippy --since origin/main \
+              --needs windows,cpus=<N>,mem=<M> clippy --since origin/main
   ```
-- **Sized** by what each step needs, not by the machine: the memory it can't do without and the
-  CPUs to use (a rustc per 6 GiB). kiln's own crate takes 7 GiB and more to build, and its tests
-  about 17 GiB at `-j 4`; other crates far less. On Linux each step says its peak memory: ask that.
-- **One verdict:** each run ends `GATE: PASS`, or `GATE: FAIL` and why; the gate passes when all do.
+  Never detach a gate's run or leave it to a bare `wait`: either exits 0 whatever the run said.
+- **Sized** by measurement, never a picked number: a step runs a rustc per CPU asked, is capped at
+  the memory asked, and runs nothing without both. Each step says its peak memory (on Linux its
+  anonymous memory, page cache left out; on macOS its processes' resident memory; on Windows
+  none): ask that next time. Measured so far: kiln's own crate takes 7 GiB and more to build, and
+  the libraries' tests peaked at 16.7 GiB at `-j 4` (`.kiln/ci.yaml`).
+- **One verdict:** each run ends `GATE: PASS`; `GATE: FAIL` and why; or `GATE: YIELDED` (exit 75:
+  it stopped for a strained machine; run it later or elsewhere). `ci/gates.sh` passes only when
+  every run exited 0 and said `GATE: PASS`.
 
 ## Checks before handing over
 

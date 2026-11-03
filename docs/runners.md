@@ -168,8 +168,13 @@ needs in `KILN_NEEDS`. Reach holds nothing for it: what's idle when it's picked 
 **A change's gate** is commands like any other, composed by the agent that owns the change
 (AGENTS.md): a run per platform, side by side, each `kiln run --needs <platform>,cpus=N,mem=M --
 ci/gate.sh [clippy|test] --since origin/main`, natively on Linux, macOS or Windows, scoped to the
-crates the change touches and those that depend on them. `ci/gate.sh` holds each step to what its
-run asked (on Linux a systemd user unit: MemoryMax from the needs, a rustc per 6 GiB and as many
-test threads, CPUWeight 1, nice 19, I/O caps on the disk its build is on; elsewhere nice 19), says
-its peak memory on Linux, and stops itself when the machine's own services stall on I/O;
+crates the change touches, those whose code reads a changed file by path, and those that depend on
+them (a changed file it can't place: the whole workspace). `ci/gates.sh` starts the runs, never
+detached, waits for each and passes only when every one exited 0 and said `GATE: PASS`.
+`ci/gate.sh` holds each step to what its run asked, and runs nothing unasked (on Linux a systemd
+user unit: MemoryMax from the needs, a rustc and a test thread per CPU asked, CPUWeight 1, nice 19,
+I/O caps on the disk its build is on; elsewhere nice 19), says each step's peak memory (in its unit
+the anonymous memory, page cache left out; elsewhere its processes' resident memory), takes its
+verdict from what its steps wrote once all had ended, never from an exit code alone, and yields
+(`GATE: YIELDED`, exit 75) when the machine's own services stall on I/O;
 `ci/gate.sh --since origin/main --dry-run` prints its scope and why, its steps and its caps.

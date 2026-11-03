@@ -108,7 +108,7 @@ if [ "${1:-}" = --steps ]; then
         [ -z "$b" ] || echo "$(date +%s) $b" >> "$samples"
         sleep "$sample_every"
       done
-    ) &
+    ) > /dev/null 2>&1 &
     sampler=$!
   fi
   # The most memory a sample since $1 (in seconds since the epoch) said: ", <what> peak <n> GiB".
@@ -300,13 +300,13 @@ affected() {
       else next
       v = $2; sub(/^v/, "", v)
       if (!seen[$1 "@" v]++) print $1 "\t" v "\t" dir "\t" (($1 in member) ? "member" : "dep") }')
-  # Each changed file: "own" (in a package), "input" (one per package below a Cargo input), or "none"
-  # (in no package, or a Cargo input with no package of this build below it).
+  # Each changed file: "own" (in a package, and its folder), "input" (one per package below a Cargo
+  # input), or "none" (in no package, or a Cargo input with no package of this build below it).
   where=$(printf '%s\n' "$files" | P=$pkgs awk '
     BEGIN { n = split(ENVIRON["P"], L, "\n"); for (i = 1; i <= n; i++) { split(L[i], f, "\t"); name[i] = f[1]; spec[i] = f[1] "@" f[2]; dir[i] = f[3]; kind[i] = f[4] } }
     NF { file = $0; best = 0; bl = -1
       for (i = 1; i <= n; i++) { d = dir[i]; k = (d == ".") ? 0 : length(d); if ((d == "." || index(file, d "/") == 1) && k > bl) { best = i; bl = k } }
-      if (best) { print "own\t" spec[best] "\t" name[best] "\t" kind[best] "\t" file; next }
+      if (best) { print "own\t" spec[best] "\t" name[best] "\t" kind[best] "\t" file "\t" dir[best]; next }
       base = file; sub(/.*\//, "", base); folder = file; if (!sub(/\/[^\/]*$/, "", folder)) folder = ""
       cargo = 0
       if (index(file, ".cargo/") == 1) { cargo = 1; folder = "" }
@@ -321,9 +321,13 @@ affected() {
     $1 == "input" && $4 == "member" && !seen[$3]++ { input[++m] = $3; by[$3] = $5 }
     END { for (i = 1; i <= n; i++) { x = own[i]; print "S\t" x "\tchanged: " first[x] (more[x] ? " and " more[x] " more" : "") }
       for (i = 1; i <= m; i++) { x = input[i]; print "S\t" x "\t" by[x] " changed, a Cargo input of every crate below it" } }'
-  # What the workspace's code reads by path: one search of its crates for the name of each changed
-  # file (but Cargo inputs) and of each folder above it, then each line found read as code.
-  while IFS= read -r p; do pats+=(-e "$p"); done < <(printf '%s\n' "$where" | awk -F'\t' '$1 == "own" || $1 == "none" { f = $5; while (f != "") { b = f; sub(/.*\//, "", b); if (!seen[b]++) print b; if (!sub(/\/[^\/]*$/, "", f)) f = "" } }')
+  # What the workspace's code reads by path: one search of its crates for the names a path to a
+  # changed file has in it (a Cargo input aside), then each line found read as code. A file in no
+  # package: its own name and each folder's above it. A file in a package: its package's folder's
+  # name, which every path into that package from another has in it.
+  while IFS= read -r p; do pats+=(-e "$p"); done < <(printf '%s\n' "$where" | awk -F'\t' '
+    $1 == "own" && $6 != "." { b = $6; sub(/.*\//, "", b); if (!seen[b]++) print b; next }
+    $1 == "own" || $1 == "none" { f = $5; while (f != "") { b = f; sub(/.*\//, "", b); if (!seen[b]++) print b; if (!sub(/\/[^\/]*$/, "", f)) f = "" } }')
   while IFS= read -r d; do [ -z "$d" ] || dirs+=("$d"); done < <(printf '%s\n' "$pkgs" | awk -F'\t' '$4 == "member" { print $3 }')
   hits=''
   if [ ${#pats[@]} -gt 0 ] && [ ${#dirs[@]} -gt 0 ]; then
@@ -412,21 +416,22 @@ affected() {
     BEGIN {
       delim = "[][ \t\n\"" q "=:,;()<>|&$`]+"
       n = split(ENVIRON["P"], L, "\n")
-      for (i = 1; i <= n; i++) { split(L[i], f, "\t"); if (f[4] == "member") { k++; mn[k] = f[1]; ms[k] = f[1] "@" f[2]; md[k] = f[3] } if (f[3] != ".") pdir[f[1] "@" f[2]] = f[3] }
+      for (i = 1; i <= n; i++) { split(L[i], f, "\t"); if (f[4] == "member") { k++; mn[k] = f[1]; ms[k] = f[1] "@" f[2]; md[k] = f[3] } }
     }
-    # The change: each file in a package or in none, named by itself and each folder above it.
+    # The change: each file in a package or in none, named by itself and each folder above it (in a
+    # package, up to the package folder; its manifest names all of it, save to include_str!).
     FNR == NR {
       if ($1 != "own" && $1 != "none") next
-      F = $5; owner[F] = ($1 == "own") ? $3 : ""
+      F = $5; owner[F] = ($1 == "own") ? $3 : ""; top = ($1 == "own" && $6 != ".") ? $6 : ""
       p = F
-      while (p != "") { named[p] = named[p] SUBSEP F; if (!sub(/\/[^\/]*$/, "", p)) p = "" }
-      if ($1 == "own" && ($2 in pdir)) { m = pdir[$2] "/Cargo.toml"; manifest[m] = manifest[m] SUBSEP F }
+      while (p != "") { named[p] = named[p] SUBSEP F; if (p == top || !sub(/\/[^\/]*$/, "", p)) p = "" }
+      if (top != "") { m = top "/Cargo.toml"; manifest[m] = manifest[m] SUBSEP F }
       next
     }
     # A line found: "<path>:<line>:<text>", read by the member whose folder holds it most closely.
     {
       if (!match($0, /^[^:]+:[0-9]+:/)) next
-      at = substr($0, 1, RLENGTH - 1); text = substr($0, RLENGTH + 1)
+      at = substr($0, 1, RLENGTH - 1); text = substr($0, RLENGTH + 1); sub(/\r$/, "", text)
       path = at; sub(/:[0-9]+$/, "", path)
       best = 0; bl = -1
       for (i = 1; i <= k; i++) { d = md[i]; w = (d == ".") ? 0 : length(d); if ((d == "." || index(path, d "/") == 1) && w > bl) { best = i; bl = w } }
@@ -666,7 +671,8 @@ sweep() {
 # strained guard_runs checks running, it writes why in the run's folder and stops the unit.
 guard() {
   local bad=0 strained full who own rest took u f
-  while sleep "$guard_every"; do
+  # Its sleep holds no output open, so a guard stopped mid-sleep keeps no reader of it waiting.
+  while sleep "$guard_every" > /dev/null 2>&1; do
     kill -0 "$pid" 2> /dev/null || return 0
     strained=''
     if [ -n "$guard_containers" ]; then
