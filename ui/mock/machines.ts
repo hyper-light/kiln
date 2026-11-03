@@ -6,10 +6,13 @@
 import type http from "node:http";
 import type { KindInfo } from "../src/api/harness.ts";
 import type { ReachRunner } from "../src/api/types.ts";
+import { MAC_MINI } from "./data.ts";
 
 interface Ctx {
   json: (res: http.ServerResponse, status: number, body: unknown) => void;
   body: <T>(req: http.IncomingMessage) => Promise<T>;
+  /** The name people see for runner `name` now (POST /api/agents/:name/label): none for one shown by its name. */
+  label: (name: string) => string | undefined;
 }
 
 const runner = (name: string, os: string, arch: string, harnesses: string[], over: Partial<ReachRunner> = {}): ReachRunner => ({
@@ -32,7 +35,7 @@ const runner = (name: string, os: string, arch: string, harnesses: string[], ove
 const RUNNERS: ReachRunner[] = [
   runner("adacachy", "linux", "x86_64", ["claude", "codex", "devin", "antigravity", "gemini"]),
   runner("metal-ryzen-01", "linux", "x86_64", ["claude", "codex"]),
-  runner("metal-mac-mini", "macos", "aarch64", ["claude"]),
+  runner(MAC_MINI, "macos", "aarch64", ["claude"], { hostname: "mac-mini.lan" }),
   runner("metal-pi-04", "linux", "aarch64", ["codex"]),
   runner("metal-nuc-old", "linux", "x86_64", ["claude"], { connected: false }),
   runner("metal-old", "linux", "x86_64", ["claude"], { fingerprint: null }),
@@ -91,7 +94,7 @@ export async function handleMachines(req: http.IncomingMessage, res: http.Server
   const p = url.pathname;
   const m = req.method ?? "GET";
   let mm: RegExpMatchArray | null;
-  if (p === "/api/reach/runners" && m === "GET") return (ctx.json(res, 200, { runners: RUNNERS }), true);
+  if (p === "/api/reach/runners" && m === "GET") return (ctx.json(res, 200, { runners: RUNNERS.map((r) => ({ ...r, label: ctx.label(r.name) })) }), true);
   if (p === "/api/harness/kinds" && m === "GET") {
     const all: Record<string, KindInfo[]> = {
       local: [claude, codex, devin, antigravity, gemini],

@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import type { ShipCommit } from "../src/api/ship.ts";
+import { noteLabels } from "../src/lib/data.ts";
 import {
   buildWord,
   environmentsOf,
@@ -136,14 +137,22 @@ test("w26_r14: Ship's stages as the Lanes' groups, every job its lane from the s
     ],
   );
   assert.equal(groups[4]?.note, "not yet");
-  // Each platform and the image, and each runner, its lane from the start.
+  // Each platform and the image, and each runner, its lane from the start: a platform that has run
+  // with its job (Output) and its times (its lane), as a leg (W26-R23).
   const later = shipGroups({
     ...detail,
-    build: { platforms: [{ name: "linux/amd64", state: "running" }], image: { state: "queued", digest: null } },
+    build: {
+      platforms: [
+        { name: "linux/amd64", state: "running", job: "j-linux", run: "r-release", start: 100 },
+        { name: "darwin/arm64", state: "queued" },
+      ],
+      image: { state: "queued", digest: null },
+    },
     replant: [{ name: "adacachy", state: "replanting", why: "a newer kiln" }],
   });
   assert.deepEqual(later[2]?.lanes, [
-    { id: "platform/linux/amd64", name: "linux/amd64", state: "running", start: null, end: null },
+    { id: "platform/linux/amd64", name: "linux/amd64", state: "running", start: 100, end: null, job: "j-linux" },
+    { id: "platform/darwin/arm64", name: "darwin/arm64", state: "queued", start: null, end: null },
     { id: "image", name: "image", state: "queued", start: null, end: null },
   ]);
   assert.deepEqual(later[5]?.lanes, [
@@ -151,6 +160,14 @@ test("w26_r14: Ship's stages as the Lanes' groups, every job its lane from the s
     { id: "runner/adacachy", name: "adacachy", state: "replanting", start: null, end: null, note: "a newer kiln" },
   ]);
   assert.equal(later[5]?.note, "0/1");
+  // A runner kiln knows by its machine id: its lane by its id, named by its label (docs/machines.md).
+  const id = "5f2a9c3e0b1d4e6f8a7c9b0d1e2f3a4b";
+  noteLabels([{ name: id, label: "studio" }]);
+  const labelled = shipGroups({ ...detail, replant: [{ name: id, state: "replanted", why: "" }] });
+  assert.deepEqual(
+    labelled[5]?.lanes?.find((l) => l.id === `runner/${id}`),
+    { id: `runner/${id}`, name: "studio", state: replantGlyph("replanted"), start: null, end: null },
+  );
 });
 
 test("an open row never folds: not under the approval it rides with, nor into a run of shipped commits", () => {

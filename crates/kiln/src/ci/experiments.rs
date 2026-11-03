@@ -998,7 +998,7 @@ async fn start_beside(hub: &Hub, e: &Experiment, variant: &str, criterion: &str,
         // A runner from before measuring: it can't read the ask (`crate::wire::payload`; older,
         // `workspace::serve`), or takes no asks about agents' folders at all.
         Err((_, why)) if ["couldn't be read", "doesn't understand", "too old"].iter().any(|w| why.contains(w)) => {
-            return Err(format!("{machine}'s kiln is older than this server's and can't measure beside its agent: upgrade its runner (System → Updates), then start the experiment again ({why})"));
+            return Err(format!("{}'s kiln is older than this server's and can't measure beside its agent: upgrade its runner (System → Updates), then start the experiment again ({why})", hub.shown(&machine)));
         }
         Err((_, why)) => {
             r.conclusion = Some("untestable".into());
@@ -1059,7 +1059,7 @@ async fn finish_beside(hub: &Hub, e: &Experiment, r: &mut Run, deadline: Option<
             Err((_, why)) => {
                 if now.duration_since(heard) > UNHEARD {
                     r.conclusion = Some("untestable".into());
-                    r.why = Some(format!("{machine} went unheard for {} minutes: {why}", UNHEARD.as_secs() / 60));
+                    r.why = Some(format!("{} went unheard for {} minutes: {why}", hub.shown(&machine), UNHEARD.as_secs() / 60));
                     return 0.0;
                 }
             }

@@ -63,8 +63,10 @@ jobs:
       # (W28-R72). The PATH line is for a Mac's launchd service, whose PATH has no tools in it.
       - name: ui
         run: export PATH="$HOME/.cargo/bin:/opt/homebrew/bin:/usr/local/bin:$PATH" && npm ci --prefix ui --no-audit --no-fund && KILN_UI_SERVER=off npm run --prefix ui build
-      # Against the wire types made from Rust (ui/src/api/wire, held to the Rust by `wire::ts`).
-      - run: npm ci --prefix ui --no-audit --no-fund && npm run --prefix ui typecheck && npm run --prefix ui lint && npm --prefix ui test
+      # Against the wire types made from Rust (ui/src/api/wire, held to the Rust by `wire::ts`). The
+      # tests one file at a time (`test:ci`): each syntax samples' file compiles its grammars'
+      # WebAssembly, up to 3.3 GiB, and side by side they outgrew this job's 4 GiB (2026-11-02).
+      - run: npm ci --prefix ui --no-audit --no-fund && npm run --prefix ui typecheck && npm run --prefix ui lint && npm run --prefix ui test:ci
 
   ui-checks:
     name: ui checks (Chromium and WebKit, desktop and phone)

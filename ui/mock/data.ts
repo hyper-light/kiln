@@ -72,13 +72,7 @@ const SUBJECTS: Record<Toolchain, string[]> = {
     "deps: bump next to 16.3",
     "a11y: honour prefers-contrast in cards",
   ],
-  python: [
-    "scheduler: adaptive batch sizing",
-    "fix: race in worker heartbeat",
-    "perf: vectorise histogram merge",
-    "deps: bump numpy to 2.3",
-    "feat: graceful drain on SIGTERM",
-  ],
+  python: ["scheduler: adaptive batch sizing", "fix: race in worker heartbeat", "perf: vectorise histogram merge", "deps: bump numpy to 2.3", "feat: graceful drain on SIGTERM"],
 };
 
 export function commitMessage(rnd: () => number, tc: Toolchain): string {
@@ -115,27 +109,48 @@ export function pipelineFor(tc: Toolchain, branch: string): { name: string; jobs
   if (tc === "rust") {
     const jobs: JobTpl[] = [
       { key: "fmt", needs: [], labels: ["k8s"], toolchain: "rust", steps: [checkout, { name: "cargo fmt", run: "cargo fmt --all -- --check", dur: [3, 8], kind: "fmt" }] },
-      { key: "clippy", needs: [], labels: ["k8s"], toolchain: "rust", steps: [checkout, cache, { name: "cargo clippy", run: "cargo clippy --workspace --all-targets -- -D warnings", dur: [30, 90], kind: "clippy" }] },
+      {
+        key: "clippy",
+        needs: [],
+        labels: ["k8s"],
+        toolchain: "rust",
+        steps: [checkout, cache, { name: "cargo clippy", run: "cargo clippy --workspace --all-targets -- -D warnings", dur: [30, 90], kind: "clippy" }],
+      },
       {
         key: "test (profile=dev)",
         needs: ["fmt"],
         labels: ["k8s"],
         toolchain: "rust",
-        steps: [checkout, cache, { name: "build tests", run: "cargo build --workspace --tests", dur: [40, 120], kind: "compile" }, { name: "cargo test", run: "cargo test --workspace --profile dev", dur: [20, 80], kind: "test" }],
+        steps: [
+          checkout,
+          cache,
+          { name: "build tests", run: "cargo build --workspace --tests", dur: [40, 120], kind: "compile" },
+          { name: "cargo test", run: "cargo test --workspace --profile dev", dur: [20, 80], kind: "test" },
+        ],
       },
       {
         key: "test (profile=release)",
         needs: ["fmt"],
         labels: ["k8s"],
         toolchain: "rust",
-        steps: [checkout, cache, { name: "build tests", run: "cargo build --workspace --tests --release", dur: [60, 160], kind: "compile" }, { name: "cargo test", run: "cargo test --workspace --profile release", dur: [20, 60], kind: "test" }],
+        steps: [
+          checkout,
+          cache,
+          { name: "build tests", run: "cargo build --workspace --tests --release", dur: [60, 160], kind: "compile" },
+          { name: "cargo test", run: "cargo test --workspace --profile release", dur: [20, 60], kind: "test" },
+        ],
       },
       {
         key: "build",
         needs: ["clippy", "test (profile=dev)"],
         labels: ["k8s"],
         toolchain: "rust",
-        steps: [checkout, cache, { name: "cargo build", run: "cargo build --release --locked", dur: [60, 150], kind: "compile" }, { name: "package", run: "tar czf dist.tgz -C target/release .", dur: [3, 8], kind: "package" }],
+        steps: [
+          checkout,
+          cache,
+          { name: "cargo build", run: "cargo build --release --locked", dur: [60, 150], kind: "compile" },
+          { name: "package", run: "tar czf dist.tgz -C target/release .", dur: [3, 8], kind: "package" },
+        ],
       },
     ];
     if (branch === "main" || branch.startsWith("release/"))
@@ -144,7 +159,11 @@ export function pipelineFor(tc: Toolchain, branch: string): { name: string; jobs
         needs: ["test (profile=release)"],
         labels: ["baremetal", "bench"],
         toolchain: "rust",
-        steps: [checkout, { name: "cargo bench", run: "cargo bench -- --save-baseline $KILN_SHA", dur: [60, 180], kind: "bench" }, { name: "upload artifacts", run: "kiln artifacts upload target/criterion/**", dur: [2, 6], kind: "upload" }],
+        steps: [
+          checkout,
+          { name: "cargo bench", run: "cargo bench -- --save-baseline $KILN_SHA", dur: [60, 180], kind: "bench" },
+          { name: "upload artifacts", run: "kiln artifacts upload target/criterion/**", dur: [2, 6], kind: "upload" },
+        ],
       });
     return [{ name: "ci", jobs }];
   }
@@ -156,7 +175,8 @@ export function pipelineFor(tc: Toolchain, branch: string): { name: string; jobs
       { key: "build", needs: ["lint", "typecheck"], labels: ["k8s"], toolchain: "node", steps: [checkout, { name: "next build", run: "npm run build", dur: [25, 60], kind: "vite" }] },
       { key: "e2e", needs: ["build"], labels: ["baremetal"], toolchain: "node", steps: [checkout, { name: "playwright", run: "npx playwright test", dur: [30, 90], kind: "e2e" }] },
     ];
-    if (branch === "main") jobs.push({ key: "deploy", needs: ["e2e"], labels: ["k8s"], toolchain: null, steps: [{ name: "argocd sync", run: "argocd app sync hyperlight-site", dur: [6, 20], kind: "deploy" }] });
+    if (branch === "main")
+      jobs.push({ key: "deploy", needs: ["e2e"], labels: ["k8s"], toolchain: null, steps: [{ name: "argocd sync", run: "argocd app sync hyperlight-site", dur: [6, 20], kind: "deploy" }] });
     return [{ name: "ci", jobs }];
   }
   return [
@@ -166,7 +186,13 @@ export function pipelineFor(tc: Toolchain, branch: string): { name: string; jobs
         { key: "lint", needs: [], labels: ["k8s"], toolchain: "python", steps: [checkout, { name: "ruff", run: "ruff check . && ruff format --check .", dur: [3, 9], kind: "ruff" }] },
         { key: "test (python=3.12)", needs: ["lint"], labels: ["k8s"], toolchain: "python", steps: [checkout, { name: "pytest", run: "uv run pytest -q", dur: [20, 70], kind: "pytest" }] },
         { key: "test (python=3.13)", needs: ["lint"], labels: ["k8s"], toolchain: "python", steps: [checkout, { name: "pytest", run: "uv run pytest -q", dur: [20, 70], kind: "pytest" }] },
-        { key: "wheel", needs: ["test (python=3.12)", "test (python=3.13)"], labels: ["k8s"], toolchain: "python", steps: [checkout, { name: "build wheel", run: "uv build", dur: [8, 20], kind: "wheel" }] },
+        {
+          key: "wheel",
+          needs: ["test (python=3.12)", "test (python=3.13)"],
+          labels: ["k8s"],
+          toolchain: "python",
+          steps: [checkout, { name: "build wheel", run: "uv build", dur: [8, 20], kind: "wheel" }],
+        },
       ],
     },
   ];
@@ -188,7 +214,32 @@ const bblue = (s: string) => `${E}1;34m${s}${E}0m`;
 const cyan = (s: string) => `${E}36m${s}${E}0m`;
 const magenta = (s: string) => `${E}35m${s}${E}0m`;
 
-const CRATES = ["serde", "tokio", "bytes", "quinn", "rustls", "ring", "tracing", "futures-util", "hashbrown", "parking_lot", "smallvec", "crossbeam-channel", "prost", "mio", "socket2", "libc", "memchr", "itoa", "anyhow", "thiserror", "clap", "rand", "criterion", "proptest"];
+const CRATES = [
+  "serde",
+  "tokio",
+  "bytes",
+  "quinn",
+  "rustls",
+  "ring",
+  "tracing",
+  "futures-util",
+  "hashbrown",
+  "parking_lot",
+  "smallvec",
+  "crossbeam-channel",
+  "prost",
+  "mio",
+  "socket2",
+  "libc",
+  "memchr",
+  "itoa",
+  "anyhow",
+  "thiserror",
+  "clap",
+  "rand",
+  "criterion",
+  "proptest",
+];
 const MODS = ["raft::log", "raft::election", "raft::snapshot", "transport::quic", "codec::frame", "storage::segment", "membership", "tls::session", "net::pool", "replica::apply"];
 
 export interface LogPlan {
@@ -215,7 +266,11 @@ export function stepLog(kind: string, run: string, seed: number, ctx: { repo: st
     case "cache": {
       L.push(`${cyan("kiln")} cache key ${dim(`cargo-${ctx.sha.slice(0, 8)}-linux-x86_64`)}`);
       const hit = rnd() < 0.8;
-      L.push(hit ? `${green("✓")} restored cargo-registry ${dim(`(${(rnd() * 900 + 100).toFixed(0)} MiB in ${(rnd() * 4 + 1).toFixed(1)}s)`)}` : `${yellow("!")} cache miss for target, falling back to ${dim("cargo-main-linux-x86_64")}`);
+      L.push(
+        hit
+          ? `${green("✓")} restored cargo-registry ${dim(`(${(rnd() * 900 + 100).toFixed(0)} MiB in ${(rnd() * 4 + 1).toFixed(1)}s)`)}`
+          : `${yellow("!")} cache miss for target, falling back to ${dim("cargo-main-linux-x86_64")}`,
+      );
       L.push(`${green("✓")} restored target ${dim(`(${(rnd() * 3 + 0.5).toFixed(1)} GiB)`)}`);
       break;
     }
@@ -242,7 +297,9 @@ export function stepLog(kind: string, run: string, seed: number, ctx: { repo: st
         L.push(`${bblue(String(Math.floor(rnd() * 300)).padStart(3))}${bblue(" |")}     let n = decode(&buf[..]);`);
         L.push(`   ${bblue("|")}                    ${byellow("^^^^^^^^^ help: change this to: `buf`")}`);
       }
-      L.push(`${bgreen("    Finished")} \`${run.includes("release") ? "release" : "dev"}\` profile [${run.includes("release") ? "optimized" : "unoptimized + debuginfo"}] target(s) in ${(rnd() * 80 + 10).toFixed(2)}s`);
+      L.push(
+        `${bgreen("    Finished")} \`${run.includes("release") ? "release" : "dev"}\` profile [${run.includes("release") ? "optimized" : "unoptimized + debuginfo"}] target(s) in ${(rnd() * 80 + 10).toFixed(2)}s`,
+      );
       fail.push(`${bred("error[E0308]")}${bold(": mismatched types")}`);
       fail.push(`  ${bblue("-->")} src/raft/snapshot.rs:${Math.floor(rnd() * 400)}:${Math.floor(rnd() * 30)}`);
       fail.push(`   ${bblue("|")}     ${red("expected `u64`, found `usize`")}`);
@@ -255,7 +312,9 @@ export function stepLog(kind: string, run: string, seed: number, ctx: { repo: st
       L.push("");
       L.push(`running ${n} tests`);
       for (let i = 0; i < n; i++) {
-        L.push(`test ${pick(rnd, MODS)}::tests::${pick(rnd, ["append", "truncate", "elect_leader", "vote_split", "install_snapshot", "replay", "rejects_stale_term", "roundtrip", "handshake", "pipelining"])}_${i} ... ${green("ok")}`);
+        L.push(
+          `test ${pick(rnd, MODS)}::tests::${pick(rnd, ["append", "truncate", "elect_leader", "vote_split", "install_snapshot", "replay", "rejects_stale_term", "roundtrip", "handshake", "pipelining"])}_${i} ... ${green("ok")}`,
+        );
       }
       L.push("");
       L.push(`test result: ${green("ok")}. ${n} passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in ${(rnd() * 9 + 0.3).toFixed(2)}s`);
@@ -318,7 +377,10 @@ export function stepLog(kind: string, run: string, seed: number, ctx: { repo: st
     }
     case "e2e": {
       L.push(`Running ${Math.floor(rnd() * 40 + 20)} tests using 4 workers`);
-      for (let i = 0; i < 12; i++) L.push(`  ${green("✓")}  ${i + 1} [chromium] › ${pick(rnd, ["home.spec.ts", "nav.spec.ts", "blog.spec.ts", "a11y.spec.ts"])}:${Math.floor(rnd() * 90)} › ${pick(rnd, ["renders hero", "motion toggle pauses", "mobile nav opens", "focus visible", "search filters"])} ${dim(`(${Math.floor(rnd() * 900 + 100)}ms)`)}`);
+      for (let i = 0; i < 12; i++)
+        L.push(
+          `  ${green("✓")}  ${i + 1} [chromium] › ${pick(rnd, ["home.spec.ts", "nav.spec.ts", "blog.spec.ts", "a11y.spec.ts"])}:${Math.floor(rnd() * 90)} › ${pick(rnd, ["renders hero", "motion toggle pauses", "mobile nav opens", "focus visible", "search filters"])} ${dim(`(${Math.floor(rnd() * 900 + 100)}ms)`)}`,
+        );
       L.push(`\n  ${green(`${Math.floor(rnd() * 40 + 20)} passed`)} ${dim(`(${(rnd() * 40 + 10).toFixed(1)}s)`)}`);
       break;
     }
@@ -326,7 +388,8 @@ export function stepLog(kind: string, run: string, seed: number, ctx: { repo: st
       L.push(`${bold("============================= test session starts ==============================")}`);
       L.push(`platform linux -- Python 3.1${Math.floor(rnd() * 2) + 2}.4, pytest-8.4.1`);
       L.push(`collected ${Math.floor(rnd() * 300 + 50)} items\n`);
-      for (const f of ["tests/test_scheduler.py", "tests/test_worker.py", "tests/test_histogram.py", "tests/test_api.py"]) L.push(`${f} ${green(".".repeat(Math.floor(rnd() * 40 + 10)))} ${dim(`[${Math.floor(rnd() * 100)}%]`)}`);
+      for (const f of ["tests/test_scheduler.py", "tests/test_worker.py", "tests/test_histogram.py", "tests/test_api.py"])
+        L.push(`${f} ${green(".".repeat(Math.floor(rnd() * 40 + 10)))} ${dim(`[${Math.floor(rnd() * 100)}%]`)}`);
       L.push(`${bgreen(`========================= ${Math.floor(rnd() * 300 + 50)} passed in ${(rnd() * 30 + 2).toFixed(2)}s =========================`)}`);
       break;
     }
@@ -346,6 +409,15 @@ export function stepLog(kind: string, run: string, seed: number, ctx: { repo: st
   if (fail.length === 0) fail.push(bred("error: step failed"));
   return { lines: L, failLines: fail };
 }
+
+/* ---------------------------- runners known by their machine ids ---------------------------- */
+
+/**
+ * The Mac mini's machine id. The Mac joined with its id, so kiln knows it by that (its `name`: the
+ * key of its routes, `agent:` targets and data) and shows it by its label, `metal-mac-mini`
+ * (docs/machines.md). The mock's other runners joined before machine ids, known by their names.
+ */
+export const MAC_MINI = "9c4e2f7a1b8d43c6a0e5f2b7d1c8a4e3";
 
 /* ---------------------------- discovery (Add machines) ---------------------------- */
 
@@ -384,20 +456,186 @@ export interface InstanceSeed {
 /** What the network holds besides this server: runners already here, machines not set up yet,
  * another kiln server and one of its runners. `version` "" means this server's version. */
 export const INSTANCE_SEEDS: InstanceSeed[] = [
-  { id: "4b1d9e0c7a2f45e8b6c3d1a0f9e8d7c6", name: "ryzen-01.lan", role: "agent", version: "", os: "linux", arch: "x86_64", port: 0, quic: 0, ca: null, enrolled: SERVER_CA, addresses: ["192.168.1.21"], via: ["mdns", "native"], firstAgo: 86400 * 3, lastAgo: 9 },
-  { id: "7e2a6c1f9b0d4e3a8c5b2f1e0d9c8b7a", name: "mac-mini.lan", role: "agent", version: "", os: "macos", arch: "aarch64", port: 0, quic: 0, ca: null, enrolled: SERVER_CA, addresses: ["192.168.1.27", "100.88.12.4"], via: ["mdns", "native", "tailscale"], firstAgo: 86400 * 3, lastAgo: 14 },
-  { id: "1a9f3e7d2c6b4a5f8e0d1c2b3a4f5e6d", name: "pi-04.lan", role: "agent", version: "0.0.9", os: "linux", arch: "aarch64", port: 0, quic: 0, ca: null, enrolled: SERVER_CA, addresses: ["192.168.1.44"], via: ["mdns"], firstAgo: 86400 * 3, lastAgo: 21 },
-  { id: "d3c8b2a19f0e4d7c6b5a4f3e2d1c0b9a", name: "studio-mbp.lan", role: "agent", version: "", os: "macos", arch: "aarch64", port: 0, quic: 0, ca: null, enrolled: null, addresses: ["192.168.1.34", "fe80::14d2:7cff:fe0a:3b91"], via: ["mdns", "native"], firstAgo: 640, lastAgo: 6 },
-  { id: "5f0e9d8c7b6a4f3e2d1c0b9a8f7e6d5c", name: "ryzen-03.lan", role: "agent", version: "", os: "linux", arch: "x86_64", port: 0, quic: 0, ca: null, enrolled: null, addresses: ["192.168.1.23"], via: ["mdns", "scan"], firstAgo: 2400, lastAgo: 11 },
-  { id: "9a8b7c6d5e4f43a2b1c0d9e8f7a6b5c4", name: "pi-05.lan", role: "agent", version: "0.0.9", os: "linux", arch: "aarch64", port: 0, quic: 0, ca: null, enrolled: null, addresses: ["192.168.1.38"], via: ["scan"], firstAgo: 760, lastAgo: 731, invited: true },
-  { id: "2c3d4e5f6a7b48c9d0e1f2a3b4c5d6e7", name: "win-build-01", role: "agent", version: "", os: "windows", arch: "x86_64", port: 0, quic: 0, ca: null, enrolled: null, addresses: ["10.0.8.31"], via: ["probe"], firstAgo: 5400, lastAgo: 5400 },
-  { id: "e6f5a4b3c2d14e0f9a8b7c6d5e4f3a2b", name: "nas.lan", role: "server", version: "0.0.9", os: "linux", arch: "x86_64", port: 7070, quic: 7071, ca: OTHER_CA, enrolled: null, addresses: ["192.168.1.40"], via: ["mdns", "dns-sd"], firstAgo: 86400 * 3, lastAgo: 17 },
-  { id: "0f1e2d3c4b5a46978a9b0c1d2e3f4a5b", name: "lab-runner-7", role: "agent", version: "0.0.9", os: "linux", arch: "x86_64", port: 0, quic: 0, ca: null, enrolled: OTHER_CA, addresses: ["100.101.12.7"], via: ["tailscale"], firstAgo: 86400, lastAgo: 48 },
+  {
+    id: "4b1d9e0c7a2f45e8b6c3d1a0f9e8d7c6",
+    name: "ryzen-01.lan",
+    role: "agent",
+    version: "",
+    os: "linux",
+    arch: "x86_64",
+    port: 0,
+    quic: 0,
+    ca: null,
+    enrolled: SERVER_CA,
+    addresses: ["192.168.1.21"],
+    via: ["mdns", "native"],
+    firstAgo: 86400 * 3,
+    lastAgo: 9,
+  },
+  {
+    id: "7e2a6c1f9b0d4e3a8c5b2f1e0d9c8b7a",
+    name: "mac-mini.lan",
+    role: "agent",
+    version: "",
+    os: "macos",
+    arch: "aarch64",
+    port: 0,
+    quic: 0,
+    ca: null,
+    enrolled: SERVER_CA,
+    addresses: ["192.168.1.27", "100.88.12.4"],
+    via: ["mdns", "native", "tailscale"],
+    firstAgo: 86400 * 3,
+    lastAgo: 14,
+  },
+  {
+    id: "1a9f3e7d2c6b4a5f8e0d1c2b3a4f5e6d",
+    name: "pi-04.lan",
+    role: "agent",
+    version: "0.0.9",
+    os: "linux",
+    arch: "aarch64",
+    port: 0,
+    quic: 0,
+    ca: null,
+    enrolled: SERVER_CA,
+    addresses: ["192.168.1.44"],
+    via: ["mdns"],
+    firstAgo: 86400 * 3,
+    lastAgo: 21,
+  },
+  {
+    id: "d3c8b2a19f0e4d7c6b5a4f3e2d1c0b9a",
+    name: "studio-mbp.lan",
+    role: "agent",
+    version: "",
+    os: "macos",
+    arch: "aarch64",
+    port: 0,
+    quic: 0,
+    ca: null,
+    enrolled: null,
+    addresses: ["192.168.1.34", "fe80::14d2:7cff:fe0a:3b91"],
+    via: ["mdns", "native"],
+    firstAgo: 640,
+    lastAgo: 6,
+  },
+  {
+    id: "5f0e9d8c7b6a4f3e2d1c0b9a8f7e6d5c",
+    name: "ryzen-03.lan",
+    role: "agent",
+    version: "",
+    os: "linux",
+    arch: "x86_64",
+    port: 0,
+    quic: 0,
+    ca: null,
+    enrolled: null,
+    addresses: ["192.168.1.23"],
+    via: ["mdns", "scan"],
+    firstAgo: 2400,
+    lastAgo: 11,
+  },
+  {
+    id: "9a8b7c6d5e4f43a2b1c0d9e8f7a6b5c4",
+    name: "pi-05.lan",
+    role: "agent",
+    version: "0.0.9",
+    os: "linux",
+    arch: "aarch64",
+    port: 0,
+    quic: 0,
+    ca: null,
+    enrolled: null,
+    addresses: ["192.168.1.38"],
+    via: ["scan"],
+    firstAgo: 760,
+    lastAgo: 731,
+    invited: true,
+  },
+  {
+    id: "2c3d4e5f6a7b48c9d0e1f2a3b4c5d6e7",
+    name: "win-build-01",
+    role: "agent",
+    version: "",
+    os: "windows",
+    arch: "x86_64",
+    port: 0,
+    quic: 0,
+    ca: null,
+    enrolled: null,
+    addresses: ["10.0.8.31"],
+    via: ["probe"],
+    firstAgo: 5400,
+    lastAgo: 5400,
+  },
+  {
+    id: "e6f5a4b3c2d14e0f9a8b7c6d5e4f3a2b",
+    name: "nas.lan",
+    role: "server",
+    version: "0.0.9",
+    os: "linux",
+    arch: "x86_64",
+    port: 7070,
+    quic: 7071,
+    ca: OTHER_CA,
+    enrolled: null,
+    addresses: ["192.168.1.40"],
+    via: ["mdns", "dns-sd"],
+    firstAgo: 86400 * 3,
+    lastAgo: 17,
+  },
+  {
+    id: "0f1e2d3c4b5a46978a9b0c1d2e3f4a5b",
+    name: "lab-runner-7",
+    role: "agent",
+    version: "0.0.9",
+    os: "linux",
+    arch: "x86_64",
+    port: 0,
+    quic: 0,
+    ca: null,
+    enrolled: OTHER_CA,
+    addresses: ["100.101.12.7"],
+    via: ["tailscale"],
+    firstAgo: 86400,
+    lastAgo: 48,
+  },
 ];
 
 /** Machines the mock "finds" when asked: on a scan of 192.168.1.0/24, and by address. */
-export const SCAN_FIND: InstanceSeed = { id: "8c7d6e5f4a3b42c1d0e9f8a7b6c5d4e3", name: "nuc-lab.lan", role: "agent", version: "", os: "linux", arch: "x86_64", port: 0, quic: 0, ca: null, enrolled: null, addresses: ["192.168.1.61"], via: ["scan"], firstAgo: 0, lastAgo: 0 };
-export const PROBE_FIND: InstanceSeed = { id: "3e4f5a6b7c8d49e0f1a2b3c4d5e6f7a8", name: "build-box", role: "agent", version: "", os: "linux", arch: "aarch64", port: 0, quic: 0, ca: null, enrolled: null, addresses: ["10.0.4.12"], via: ["probe"], firstAgo: 0, lastAgo: 0 };
+export const SCAN_FIND: InstanceSeed = {
+  id: "8c7d6e5f4a3b42c1d0e9f8a7b6c5d4e3",
+  name: "nuc-lab.lan",
+  role: "agent",
+  version: "",
+  os: "linux",
+  arch: "x86_64",
+  port: 0,
+  quic: 0,
+  ca: null,
+  enrolled: null,
+  addresses: ["192.168.1.61"],
+  via: ["scan"],
+  firstAgo: 0,
+  lastAgo: 0,
+};
+export const PROBE_FIND: InstanceSeed = {
+  id: "3e4f5a6b7c8d49e0f1a2b3c4d5e6f7a8",
+  name: "build-box",
+  role: "agent",
+  version: "",
+  os: "linux",
+  arch: "aarch64",
+  port: 0,
+  quic: 0,
+  ca: null,
+  enrolled: null,
+  addresses: ["10.0.4.12"],
+  via: ["probe"],
+  firstAgo: 0,
+  lastAgo: 0,
+};
 /** The machine that "runs the one-liner" a while after the Add machines page asked for it. */
 export const AUTOJOIN = { name: "metal-pi-06", hostname: "pi-06.lan", id: "6a5b4c3d2e1f40a9b8c7d6e5f4a3b2c1", address: "192.168.1.46", os: "linux", arch: "aarch64" };
 
@@ -425,8 +663,16 @@ export function dnsSdRecords(host: string, version: string, os: string, arch: st
 export const SILENT_NETWORK_FIXES = [
   { os: "linux" as const, text: "On each Linux machine with ufw:", command: "sudo ufw allow from 192.168.1.0/24 to any port 5353 proto udp" },
   { os: "linux" as const, text: "With firewalld:", command: "sudo firewall-cmd --permanent --add-service=mdns && sudo firewall-cmd --reload" },
-  { os: "macos" as const, text: "On each Mac, let kiln take incoming connections:", command: "sudo /usr/libexec/ApplicationFirewall/socketfilterfw --add ~/.local/bin/kiln && sudo /usr/libexec/ApplicationFirewall/socketfilterfw --unblockapp ~/.local/bin/kiln" },
-  { os: "windows" as const, text: "On each Windows machine, in an elevated PowerShell:", command: 'New-NetFirewallRule -DisplayName "kiln mDNS" -Direction Inbound -Protocol UDP -LocalPort 5353 -Action Allow' },
+  {
+    os: "macos" as const,
+    text: "On each Mac, let kiln take incoming connections:",
+    command: "sudo /usr/libexec/ApplicationFirewall/socketfilterfw --add ~/.local/bin/kiln && sudo /usr/libexec/ApplicationFirewall/socketfilterfw --unblockapp ~/.local/bin/kiln",
+  },
+  {
+    os: "windows" as const,
+    text: "On each Windows machine, in an elevated PowerShell:",
+    command: 'New-NetFirewallRule -DisplayName "kiln mDNS" -Direction Inbound -Protocol UDP -LocalPort 5353 -Action Allow',
+  },
   { text: "On Wi-Fi, turn off client (AP) isolation for this network in the router." },
 ];
 

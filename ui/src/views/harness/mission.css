@@ -1368,6 +1368,7 @@ html[data-motion="paused"] .ms-pick::before {
   margin-top: 6px;
   padding: 0 4px;
 }
+/* Its words name a machine ("Continue a past session on …"): a long name breaks where it must. */
 .mc-toggle {
   display: inline-flex;
   align-items: center;
@@ -1375,6 +1376,7 @@ html[data-motion="paused"] .ms-pick::before {
   padding: 6px 0;
   color: #a1a4ad;
   font-size: 12.5px;
+  overflow-wrap: anywhere;
 }
 .mc-toggle .mc-chev {
   color: #7b7e88;
@@ -1792,4 +1794,37 @@ button.mc-pick[aria-expanded="true"] .mc-chev {
       grid-area: actions;
     }
   }
+}
+
+/* ---------------------------------------------------------------- a question answered in place */
+/* Under its row (or its subagent's, in the tree), drawn as the chat draws it, the row's edge its
+   own: its options, Other, Decline and Submit (mission-answer.tsx). */
+.ms-answer {
+  grid-column: main-start / actions-end;
+  min-width: 0;
+}
+.ms-answer .ms-slide-clip > * {
+  margin-top: 14px;
+}
+.ms-answer .ch[data-layout="flow"] {
+  padding: 0;
+  border-left: 0;
+}
+.ms-answer .ch-keys {
+  display: none;
+}
+.ms-answer .ch-foot {
+  justify-content: flex-end;
+}
+.ms-answer-wait {
+  height: 120px;
+}
+
+/* A subagent that ended: its trash where its pause was (kiln's Remove), and it follows a finger
+   sideways (the list still scrolls up and down under it). */
+.ms-remove:hover {
+  color: #ecc9cc;
+}
+.ms-node:is([data-stand="done"], [data-stand="failed"], [data-stand="stopped"]) {
+  touch-action: pan-y;
 }

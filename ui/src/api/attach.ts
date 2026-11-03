@@ -3,7 +3,7 @@
  * repository, a workflow, an environment, a runner pool or the runners; kiln wakes the one
  * attached when something happens there, and it reports back on the incident.
  */
-import type { Res } from "@/lib/data";
+import { labelOf, type Res } from "@/lib/data";
 import { request } from "./client";
 import type { AgentAttachment, IncidentBrief } from "./wire";
 export type { AgentAttachment, AttachHarness, AttachLimits, IncidentBrief, IncidentSeen } from "./wire";
@@ -61,7 +61,7 @@ export function onWords(on: string): string {
     case "pool":
       return `the ${rest} pool`;
     case "runner":
-      return rest;
+      return labelOf(rest);
     default:
       return on;
   }

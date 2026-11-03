@@ -264,8 +264,35 @@ fn scoped_key(cx: &Cx, v: &Value) -> Result<Option<String>, crate::ops::Fail> {
     Ok(crate::harness::ops::key_of(v)?.map(|k| format!("{}\u{0}{k}", crate::harness::ops::key_scope(&cx.caller))))
 }
 
+/// Plan `id` run while its agent's goals wait on a person's review of it: approved, as `plans.review`
+/// approves it (the stack resumes, its steps go to that agent as the goal's parts), and not run a
+/// second way beside them. A person's to do: an agent's run of it is refused.
+async fn approve_by_running(cx: &Cx, id: &str, key: Option<String>) -> Out {
+    if cx.caller.agent.is_some() {
+        return Err((StatusCode::FORBIDDEN, "this plan waits on a person's review: running it approves it, and that's a person's to do, in its agent's Plan tab".into()));
+    }
+    let p = super::get(&cx.hub, id).await.map_err(fail)?;
+    let goal = p.source.as_ref().and_then(|s| s.goal.clone()).unwrap_or_default();
+    let by = crate::goals::By::of(&cx.hub, &cx.caller, &goal.agent);
+    let asked = super::review::Asked { answer: Some(super::review::Answer::Approve), key, ..super::review::Asked::default() };
+    let (plan, stack) = super::review::answer(&cx.hub, id, asked, &cx.caller.name, &by).await.map_err(fail)?;
+    // Its steps still to go, as the goal's parts.
+    let sent = stack
+        .items
+        .iter()
+        .filter(|i| i.part_of.as_deref() == Some(goal.id.as_str()) && i.part_kind.as_deref() == Some("plan") && i.step.as_ref().is_some_and(|s| s.plan == plan.id) && matches!(i.status.as_str(), "pending" | "active"))
+        .count();
+    cx.hub.store.audit(cx.caller.name.clone(), "plan.review".into(), format!("{} (v{}): approve (run)", p.title, p.version)).await;
+    json_of(&json!({"approved": true, "session": goal.agent, "sent": sent, "plan": plan, "stack": stack}))
+}
+
 async fn run(cx: Cx, v: Value) -> Out {
     let id = id_of(&v)?;
+    let key = scoped_key(&cx, &v)?;
+    // A plan its agent's goals wait on a person's review of goes one way: running it approves it.
+    if super::review::run_approves(&cx.hub, &id, key.as_deref()).await.map_err(fail)? {
+        return approve_by_running(&cx, &id, key).await;
+    }
     let mode: Mode = v.get("mode").cloned().map(serde_json::from_value).transpose().map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))?.unwrap_or_default();
     if mode == Mode::Agents {
         let p = super::get(&cx.hub, &id).await.map_err(fail)?;
@@ -286,7 +313,6 @@ async fn run(cx: Cx, v: Value) -> Out {
         {
             cfg.place.kind = Some(me.kind);
         }
-        let key = scoped_key(&cx, &v)?;
         let started = super::agents::start(&cx.hub, &p, cfg, key.as_deref()).await.map_err(fail)?;
         cx.hub.store.audit(cx.caller.name.clone(), "plan.run".into(), format!("{id}: one agent per step ({} steps), run {}", started.steps, started.run)).await;
         return json_of(&started);
@@ -308,7 +334,6 @@ async fn run(cx: Cx, v: Value) -> Out {
             None => return Err((StatusCode::BAD_REQUEST, "say where to run it: `session`, or `new` {target, kind, cwd}".into())),
         },
     };
-    let key = scoped_key(&cx, &v)?;
     let pick = super::Pick { only: only_of(&v)?, split: v.get("split").and_then(Value::as_bool).unwrap_or(false) };
     let ran = super::run(&cx.hub, &id, target, mode, &pick, &crate::harness::ops::starter(&cx)?, key.as_deref()).await.map_err(fail)?;
     cx.hub.store.audit(cx.caller.name.clone(), "plan.run".into(), format!("{id} on {} ({} messages)", ran.session, ran.sent)).await;
@@ -383,7 +408,7 @@ pub fn list_ops() -> Vec<Op> {
         },
         Op {
             name: "plans.run",
-            summary: "Run a plan, or some of its steps (`only`), on an agent: `session` (one that runs) or `new` {target: local|agent:<machine>, kind, cwd}; `mode` message (the whole plan), steps (each step a queued message), goals (its steps become goals on that agent's goal stack; `split`: each step a goal stack of its acceptance criteria and tests), or agents (each step held to as a goal by an agent of its own, or by the main agent, as its steps' `needs` say: steps that don't wait for each other run side by side; plans.runs.get follows it). An agent that gives neither `session` nor `new` runs it itself; one agent per step, its steps' agents start in its harness, on its machine and in its folder unless it says otherwise, and a step given to `main` (in `steps`, {agent: \"main\"}) goes on its own goal stack instead.",
+            summary: "Run a plan, or some of its steps (`only`), on an agent: `session` (one that runs) or `new` {target: local|agent:<machine>, kind, cwd}; `mode` message (the whole plan), steps (each step a queued message), goals (its steps become goals on that agent's goal stack; `split`: each step a goal stack of its acceptance criteria and tests), or agents (each step held to as a goal by an agent of its own, or by the main agent, as its steps' `needs` say: steps that don't wait for each other run side by side; plans.runs.get follows it). An agent that gives neither `session` nor `new` runs it itself; one agent per step, its steps' agents start in its harness, on its machine and in its folder unless it says otherwise, and a step given to `main` (in `steps`, {agent: \"main\"}) goes on its own goal stack instead. A plan its agent's goals wait on a person's review of (said ready with `then: review`) isn't run a second way: a person's run approves it (as plans.review does: its steps go to that agent as the goal's parts; answers `approved`), and an agent's is refused.",
             read_only: false,
             destructive: false,
             input: Input::of::<input::PlansRun>(),

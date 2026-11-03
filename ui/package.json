@@ -11,6 +11,7 @@
     "preview": "vite preview",
     "typecheck": "tsc -b --noEmit",
     "test": "tsx --tsconfig tsconfig.app.json --test tests/*.test.ts",
+    "test:ci": "tsx --tsconfig tsconfig.app.json --test --test-concurrency=1 tests/*.test.ts",
     "lint": "eslint .",
     "mock": "tsx mock/server.ts",
     "e2e": "playwright test"

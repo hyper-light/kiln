@@ -315,7 +315,7 @@ async fn battery(hub: Arc<Hub>, machine: String, text: String) {
         people.insert(opener_of(&hub, a).await);
     }
     let tag = format!("battery:{machine}");
-    let payload = json!({ "title": format!("{machine} is low on battery"), "body": text, "tag": tag, "url": "/runners", "kind": "machine.battery_low", "at": crate::util::now_ms() });
+    let payload = json!({ "title": format!("{} is low on battery", hub.shown(&machine)), "body": text, "tag": tag, "url": "/runners", "kind": "machine.battery_low", "at": crate::util::now_ms() });
     for p in people {
         push_to(&hub, &p, "machine.battery_low", None, &payload, "normal", &watch::topic(&tag), TTL_OTHER).await;
     }

@@ -19,8 +19,8 @@ test("Commit on an opened row leads to the commit's own page", async ({ page }) 
   const row = page.locator(".ship-row").filter({ hasText: "D41" }).first();
   await expect(row).toBeVisible({ timeout: 15_000 });
   await row.locator(".ship-go").click();
-  // The foot's Commit ↗ (plan 01a1856fe81375b1bd1d1d86f270a45b, step 11).
-  const link = row.getByRole("navigation", { name: /'s pages$/ }).getByRole("link", { name: "Commit ↗" });
+  // The foot's Commit (plan 01a1856fe81375b1bd1d1d86f270a45b, step 11).
+  const link = row.getByRole("navigation", { name: /'s pages$/ }).getByRole("link", { name: "Commit", exact: true });
   await expect(link).toBeVisible({ timeout: 15_000 });
   const short = ((await row.locator(".ship-sha").first().textContent()) ?? "").trim();
   await link.click();

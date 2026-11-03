@@ -139,7 +139,7 @@ fn scheduler_once() -> (f64, f64, f64) {
     for i in 0..1_000 {
         let r = RunnerIn {
             id: format!("r{i}"),
-            view: RunnerView { name: format!("r{i}"), labels: vec![format!("pool-{}", i % 50)], facts: facts.clone(), caps: 0, pool: None },
+            view: RunnerView { name: format!("r{i}"), label: None, labels: vec![format!("pool-{}", i % 50)], facts: facts.clone(), caps: 0, pool: None },
             slots: 4,
             capacity: None,
             executor: None,

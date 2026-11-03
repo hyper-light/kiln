@@ -261,7 +261,14 @@ for a while. An answer being written is kept in this browser until it's sent.
 
 A plan its goals wait on is answered by a person (`plans.review`, `POST /api/plans/:id/review`),
 for the version they looked at: one that changed since, or that nothing waits on any more, is
-refused. Each answer is kept, the last with the plan (`reviewed`).
+refused. Each answer is kept, the last with the plan (`reviewed`). The moment it's answered (or
+its goals resumed), its agent needs you no longer: Mission control's row, the card and the Plan
+tab's mark go at once, not on the goal stacks' next round.
+
+It goes one way, as the goal's parts: wherever a plan is run, one its goals wait on is approved
+instead. Its page has **Approve it** in **Run it**'s place (its steps picked are shown, not run on
+their own), and its row among an agent's saved plans has **Approve** in **Run here**'s. A person's
+`plans.run` of it approves it too, and an agent's is refused: approving is a person's.
 
 ## Sharing one
 
@@ -288,7 +295,7 @@ A plan's written steps are `items` in the API: `[{title, description, examples, 
 | POST | `/api/plans/:id/restore` | `{version}`: made current again, as a new version |
 | POST | `/api/plans/:id/review` | `{answer: approve \| reject \| revise, words?, version?, key?}`: a person's answer to the plan its agent's goal stack waits on, for `version` (none: as it is now); `words` with `revise`; answers `{plan, stack}`; refused (409) when nothing waits on its review or it changed since; asked again under `key` (or `Idempotency-Key`), answered as things stand (CP-T3.2) |
 | POST | `/api/plans/:id/ready` | `{then?: goals \| review \| agents, skipped?: {internal?, external?}}`: its planning phase ended (a plan made from a goal goes on as `then` says); answers `{plan, warnings, research?, say?, then?, goal?, run?, stack?}` (`research`: its research's markdown, for the agent to show) |
-| POST | `/api/plans/:id/run` | `{session}` or `{new: {target, kind, cwd?}}`, `mode`: `message`, `steps`, `goals` or `agents`; `agents` takes `new` `{on, kind, cwd, model?, effort?, mode?}` for every step, `steps` `[{on?, kind?, cwd?, model?, effort?, mode?, agent?}]` for each (`agent`: `main` or an agent's id), `session` (the main agent), `parallel` and `max_parallel`, and answers `{run, steps, note}`; any mode but `message` takes `only` (step numbers from 1: just those, each keeping its number, the steps they wait for outside them taken as done), and `goals` takes `split` (each step a goal stack of its acceptance criteria and tests; answers `split`: how many were) |
+| POST | `/api/plans/:id/run` | `{session}` or `{new: {target, kind, cwd?}}`, `mode`: `message`, `steps`, `goals` or `agents`; `agents` takes `new` `{on, kind, cwd, model?, effort?, mode?}` for every step, `steps` `[{on?, kind?, cwd?, model?, effort?, mode?, agent?}]` for each (`agent`: `main` or an agent's id), `session` (the main agent), `parallel` and `max_parallel`, and answers `{run, steps, note}`; any mode but `message` takes `only` (step numbers from 1: just those, each keeping its number, the steps they wait for outside them taken as done), and `goals` takes `split` (each step a goal stack of its acceptance criteria and tests; answers `split`: how many were); while its agent's goals wait on a person's review of it, a person's run approves it instead, however it's asked (as `/review`'s `approve`; answers `{approved: true, session, sent, plan, stack}`, `sent`: its steps going to that agent as the goal's parts; asked again under the same `key`, the same) and an agent's is refused (403) |
 | GET | `/api/plans/:id/runs` | runs, newest first |
 | GET | `/api/plans/runs` | runs of one agent per step (`?active=1`: those under way) |
 | GET | `/api/plans/runs/:run` | a run: each step's `{n, title, goal, stand, needs, given, agent, agent_id, reason, tries}`, its `state`, `reason`, `note` and stack |

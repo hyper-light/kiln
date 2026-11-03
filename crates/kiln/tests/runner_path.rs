@@ -16,7 +16,7 @@ use std::process::Command;
 use std::time::{Duration, Instant};
 
 use common::agents::{self, Talk};
-use common::{Options, http, start};
+use common::{Options, http, machine, start};
 use serde_json::{Value, json};
 
 /// The runner's own PATH: a service's, with none of its user's toolchains on it.
@@ -103,7 +103,7 @@ fn w13_r01_a_tool_on_its_users_path_alone_is_in_the_runners_facts() -> anyhow::R
     loop {
         // The probe has the runner run its fact probes again before it answers (a login shell, each
         // tool's version), past http's 30 s on a loaded machine: then it's asked again.
-        let Some((_, body)) = common::polled(http(s.port, "POST", "/api/agents/box/probe", &s.admin, Some(&json!({}))), deadline, "the probe")? else {
+        let Some((_, body)) = common::polled(http(s.port, "POST", &format!("/api/agents/{}/probe", machine("box")), &s.admin, Some(&json!({}))), deadline, "the probe")? else {
             std::thread::sleep(Duration::from_millis(500));
             continue;
         };

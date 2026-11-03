@@ -873,13 +873,14 @@ async fn trigger_of(hub: &Hub, v: &Value) -> Vec<Trigger> {
             let name = s(v, "/runner/name").unwrap_or_default().to_owned();
             let gone = v.pointer("/runner/gone_for").and_then(Value::as_u64).unwrap_or_default();
             let labels: Vec<String> = v.pointer("/runner/labels").and_then(Value::as_array).into_iter().flatten().filter_map(Value::as_str).map(str::to_owned).collect();
+            let shown = hub.shown(&name);
             vec![Trigger {
                 wake: "offline",
                 about: About { runner: Some(name.clone()), labels: labels.clone(), ..About::default() },
                 signature: format!("offline:{name}"),
-                title: format!("Runner {name} is offline"),
+                title: format!("Runner {shown} is offline"),
                 seen: Seen { at: crate::util::now_unix(), what: format!("gone {} min", gone / 60), url: None, run: None },
-                detail: format!("Runner {name} ({}) went away {} minutes ago and hasn't come back.", if labels.is_empty() { "no labels".to_owned() } else { labels.join(", ") }, gone / 60),
+                detail: format!("Runner {shown} ({}) went away {} minutes ago and hasn't come back.", if labels.is_empty() { "no labels".to_owned() } else { labels.join(", ") }, gone / 60),
             }]
         }
         "updates" => {
@@ -910,21 +911,21 @@ async fn upgrades_through(hub: &Hub) {
     if through.is_empty() {
         return;
     }
-    for (agent, text) in through_news(&through, &incidents(hub).await) {
+    for (agent, text) in through_news(&through, &incidents(hub).await, |m| hub.shown(m)) {
         crate::workspace::follow::deliver(hub, &agent, text).await;
     }
 }
 
 /// Whom upgrades `through` are news to, and what they hear: each agent of an incident about that
-/// runner's upgrading that is open or reported on.
-fn through_news(through: &[crate::updates::Job], all: &[Incident]) -> Vec<(String, String)> {
+/// runner's upgrading that is open or reported on, the runner by the name people see (`shown`).
+fn through_news(through: &[crate::updates::Job], all: &[Incident], shown: impl Fn(&str) -> String) -> Vec<(String, String)> {
     let mut out = Vec::new();
     for j in through {
         for i in all.iter().filter(|i| i.wake == "upgrade" && i.runner.as_deref() == Some(j.target.as_str()) && matches!(i.state.as_str(), "open" | "reported")) {
             let Some(agent) = i.agent.clone() else { continue };
             let text = format!(
                 "Upgrading runner {} went through: upgrade {} ({}) brought it to build {}. If that's what incident {} is about, check it and report it resolved.",
-                j.target,
+                shown(&j.target),
                 j.id,
                 j.method,
                 j.to_build.as_deref().unwrap_or("?"),
@@ -955,11 +956,11 @@ async fn upgrades_failed(hub: &Hub) -> Vec<Trigger> {
             wake: "upgrade",
             about: About { runner: Some(j.target.clone()), labels, ..About::default() },
             signature: format!("upgrade:{}:{}", j.target, normalized(&error)),
-            title: format!("Upgrading {} failed: {}", j.target, error.chars().take(140).collect::<String>()),
+            title: format!("Upgrading {} failed: {}", hub.shown(&j.target), error.chars().take(140).collect::<String>()),
             seen: Seen { at: crate::util::now_unix(), what: format!("upgrade {} ({})", j.id, j.method), url: None, run: None },
             detail: format!(
                 "Upgrading runner {} ({} to {}, {}) failed: {error}\n\nThe upgrade's last lines:\n{}",
-                j.target,
+                hub.shown(&j.target),
                 j.from_build.as_deref().unwrap_or("?"),
                 j.to_build.as_deref().unwrap_or("?"),
                 j.method,
@@ -1287,14 +1288,15 @@ async fn ticks(hub: Arc<Hub>) {
                     let id = f.get("id").and_then(Value::as_str).unwrap_or("?");
                     let title = f.get("title").and_then(Value::as_str).unwrap_or_default();
                     let labels = hub.agents.lock().get(&r).map(|x| x.labels.clone()).unwrap_or_default();
+                    let shown = hub.shown(&r);
                     let t = Trigger {
                         wake: "check",
                         about: About { runner: Some(r.clone()), labels, ..About::default() },
                         signature: format!("check:{r}:{id}"),
-                        title: format!("{r}: {title}"),
+                        title: format!("{shown}: {title}"),
                         seen: Seen { at: now_s, what: format!("check {id}"), url: None, run: None },
                         detail: format!(
-                            "kiln's checks of runner {r} found this failing: {title}\n\n{}\n\nAll its findings: {}",
+                            "kiln's checks of runner {shown} found this failing: {title}\n\n{}\n\nAll its findings: {}",
                             f.get("detail").and_then(Value::as_str).unwrap_or_default(),
                             v.get("findings").cloned().unwrap_or(Value::Null)
                         ),
@@ -2108,7 +2110,7 @@ agents:
             incident("i4", "upgrade", "metal-1", "resolved"),
             incident("i5", "upgrade", "metal-1", "open"),
         ];
-        let news = through_news(std::slice::from_ref(&job), &all);
+        let news = through_news(std::slice::from_ref(&job), &all, str::to_owned);
         assert_eq!(news.iter().map(|(a, _)| a.as_str()).collect::<Vec<_>>(), ["agent-i1", "agent-i5"]);
         let first = news.first().map(|(_, text)| text.as_str()).unwrap_or_default();
         assert!(first.contains("brought it to build 669cb1ae027a") && first.contains("incident i1") && first.contains("report it resolved"), "{first}");

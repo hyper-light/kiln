@@ -319,6 +319,14 @@ pub fn runners(a: RunnersArgs) -> anyhow::Result<()> {
     if list.is_empty() {
         println!("No runner suits {}.", v.get("want").and_then(serde_json::Value::as_str).unwrap_or("that"));
     }
+    // A runner kiln knows by its machine id is shown by the name people see (docs/machines.md).
+    let mut shown: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+    for r in v.get("runners").and_then(serde_json::Value::as_array).into_iter().flatten().chain(list.iter().filter_map(|c| c.get("runner"))) {
+        if let (Some(n), Some(l)) = (r.get("name").and_then(serde_json::Value::as_str), r.get("label").and_then(serde_json::Value::as_str)) {
+            shown.insert(n.to_owned(), l.to_owned());
+        }
+    }
+    let show = |n: &str| shown.get(n).cloned().unwrap_or_else(|| n.to_owned());
     for c in &list {
         let r = c.get("runner").cloned().unwrap_or_default();
         let name = r.get("name").and_then(serde_json::Value::as_str).unwrap_or("?");
@@ -326,14 +334,14 @@ pub fn runners(a: RunnersArgs) -> anyhow::Result<()> {
         let h: Vec<String> = r.get("harnesses").and_then(serde_json::Value::as_array).map(|a| a.iter().filter_map(|x| x.as_str().map(str::to_owned)).collect()).unwrap_or_default();
         let mark = if name == me { " (this machine)" } else { "" };
         let harnesses = if h.is_empty() { String::new() } else { format!(" · {}", h.join(", ")) };
-        println!("{name}{mark}  {why}{harnesses}");
+        println!("{}{mark}  {why}{harnesses}", show(name));
     }
     let passed = v.get("passed").and_then(serde_json::Value::as_array).cloned().unwrap_or_default();
     if !passed.is_empty() {
         println!();
         for p in passed {
             let (n, w) = (p.get(0).and_then(serde_json::Value::as_str).unwrap_or("?"), p.get(1).and_then(serde_json::Value::as_str).unwrap_or(""));
-            println!("\x1b[2m{n}: {w}\x1b[0m");
+            println!("\x1b[2m{}: {w}\x1b[0m", show(n));
         }
     }
     Ok(())

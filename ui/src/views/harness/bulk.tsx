@@ -22,7 +22,7 @@ import { cn } from "@/lib/utils";
 import { actsOf, count, outcomeLine, placesFor, resumable, startedBy, topmost, whyNot, type Outcome, type Place, type Places, type Stacks } from "./bulk-acts";
 import { agentLabel } from "./derive";
 import { askPlaces, inWords } from "./move";
-import { machineName } from "./parts";
+import { machineShown } from "./parts";
 import { reachChoices } from "./spawn-setup";
 
 /** What came of an action: its line, each agent's outcome. */
@@ -33,7 +33,8 @@ interface Result {
 /** Does an action, saying what it's at meanwhile (`doing`), then how it went. */
 type Acting = (doing: string, go: () => Promise<Result>) => void;
 
-const outcome = (a: AgentInfo, result: Outcome["result"], reason?: string): Outcome => ({ id: a.id, name: agentLabel(a), machine: machineName(a.target), result, reason });
+// Its machine as people see it (its label, docs/machines.md): what the outcome's line says.
+const outcome = (a: AgentInfo, result: Outcome["result"], reason?: string): Outcome => ({ id: a.id, name: agentLabel(a), machine: machineShown(a.target), result, reason });
 /** The outcomes, with their line: `done` says what was done to how many. */
 const told = (done: (agents: string) => string, outcomes: Outcome[]): Result => ({ line: outcomeLine(done, outcomes), outcomes });
 const busyWith = (a: AgentInfo) => a.status === "running" || a.status === "waiting";

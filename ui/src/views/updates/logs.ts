@@ -5,6 +5,7 @@
  * which log and which step, and finding a run by its number; the page reads them.
  */
 import type { Job, Run, Step, UpdateJob } from "@/api/types";
+import { labelOf } from "@/lib/data";
 import { platformJob, type PlatformView } from "./words";
 
 export type BuildLog =
@@ -32,7 +33,7 @@ export function buildLogOf(p: PlatformView, last: Run | null, jobs: UpdateJob[])
       const by = jobs
         .filter((j) => j.kind === "runner" && j.method === "build" && j.target === b.by && j.state !== "failed" && (!b.sha || !j.commit || j.commit.toLowerCase() === b.sha.toLowerCase()))
         .sort((x, y) => y.started_at - x.started_at)[0];
-      return by ? { kind: "upgrade", job: by } : { kind: "none", why: `${b.by ?? "A machine"} built it of itself; kiln no longer keeps that build's output.` };
+      return by ? { kind: "upgrade", job: by } : { kind: "none", why: `${b.by == null ? "A machine" : labelOf(b.by)} built it of itself; kiln no longer keeps that build's output.` };
     }
     case "server":
       return { kind: "none", why: "The server's own binary: kiln didn't build it here, so there's no build log." };

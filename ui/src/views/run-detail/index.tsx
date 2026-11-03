@@ -14,7 +14,7 @@ import { Confirm, Crumbs, EmptyState, ErrorState, Facts, Panel } from "@/compone
 import { Chips, StatusBadge, StatusDot } from "@/components/ui/status";
 import { toast } from "@/components/ui/toast";
 import { Tip } from "@/components/ui/tooltip";
-import { upsert } from "@/lib/data";
+import { labelOf, upsert, useLabels } from "@/lib/data";
 import { placementWords } from "@/api/retry";
 import { absoluteTime, firstLine, formatBytes, formatDuration, isActive, isTerminal, shortSha, spanSeconds } from "@/lib/format";
 import { errorMessage, useNow } from "@/lib/hooks";
@@ -336,7 +336,9 @@ function CiDag({
 }) {
   const graph = useSuspenseResource(`ci-run/${detail.run.id}/graph/${attempt ?? ""}`, (s) => ci.graph(detail.run.id, attempt, s)).data;
   const critical = React.useMemo(() => criticalKeys(detail, graph.critical_path), [detail, graph]);
-  const notes = React.useMemo(() => new Map(detail.legs.map((l) => [l.id, { wait: l.status === "queued" ? waitSentence(l.wait_reason) : null, reused: !!l.reused_from }])), [detail]);
+  // Runners in the waits are named by their labels: the notes change as those do.
+  const labels = useLabels();
+  const notes = React.useMemo(() => new Map(detail.legs.map((l) => [l.id, { wait: l.status === "queued" ? waitSentence(l.wait_reason, labels) : null, reused: !!l.reused_from }])), [detail, labels]);
   return <JobDag jobs={jobs} selected={selected} onSelect={onSelect} critical={critical} notes={notes} plan={graph.jobs} finished={finished} />;
 }
 
@@ -390,6 +392,7 @@ function defaultOpen(job: Job): Set<number> {
 }
 
 function JobPanel({ job, ciDetail, attempt, onJobPatch }: { job: Job; ciDetail: CiRunDetail | null; attempt: number | undefined; onJobPatch: (j: Job) => void }) {
+  useLabels();
   const now = useNow();
   // The job as planned (its steps' commands), read once.
   const planned = useSuspenseResource(`job/${job.id}`, (s) => api.job(job.id, s)).data;
@@ -432,7 +435,7 @@ function JobPanel({ job, ciDetail, attempt, onJobPatch }: { job: Job; ciDetail: 
         {(job.status === "failed" || job.status === "queued" || job.status === "pending") && <MissingTools job={job} />}
         <Facts
           items={[
-            { label: "Agent", value: job.agent ?? "—" },
+            { label: "Agent", value: job.agent == null ? "—" : labelOf(job.agent) },
             { label: "Executor", value: job.executor ?? "—" },
             { label: "Attempt", value: job.attempt, tone: job.attempt > 1 ? "error" : undefined },
             { label: "Queue wait", value: wait === null ? "—" : formatDuration(wait), tone: job.status === "queued" ? "pending" : undefined },

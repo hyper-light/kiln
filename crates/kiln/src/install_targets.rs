@@ -314,10 +314,7 @@ async fn fetch_linux_kiln(a: &InstallArgs, arch: &str, dir: &Path) -> anyhow::Re
         anyhow::ensure!(resp.is_success(), "{url} answered {}: give --image, or --server (a kiln that has its {target} build)", resp.status());
         let path = dir.join("kiln");
         let mut file = std::fs::File::create(&path)?;
-        let mut got = 0usize;
         while let Some(chunk) = resp.chunk().await? {
-            got += chunk.len();
-            anyhow::ensure!(got <= crate::updates::MAX_BINARY, "{url} sent more than a kiln binary's {} MiB", crate::updates::MAX_BINARY >> 20);
             file.write_all(&chunk)?;
         }
         file.sync_all()?;
@@ -721,7 +718,8 @@ async fn install_objects(cluster: &Cluster, ns: &str, (image, pull): (&str, &str
     let field = |name: &str, path: &str| json!({ "name": name, "valueFrom": { "fieldRef": { "fieldPath": path } } });
     let container = json!({
         "name": APP, "image": image, "imagePullPolicy": pull, "args": ["server"],
-        "env": [{ "name": "KILN_CONFIG", "value": "/etc/kiln/kiln.toml" }, field("POD_NAME", "metadata.name"), field("POD_NAMESPACE", "metadata.namespace"), field("NODE_NAME", "spec.nodeName")],
+        // The pod's UID is its machine id the first time it starts (`crate::os::machine_id`).
+        "env": [{ "name": "KILN_CONFIG", "value": "/etc/kiln/kiln.toml" }, field("POD_NAME", "metadata.name"), field("POD_NAMESPACE", "metadata.namespace"), field("NODE_NAME", "spec.nodeName"), field("KILN_POD_UID", "metadata.uid")],
         "ports": [{ "name": "http", "containerPort": 7070, "protocol": "TCP" }, { "name": "quic", "containerPort": 7071, "protocol": "UDP" }],
         "securityContext": { "allowPrivilegeEscalation": false, "capabilities": { "drop": ["ALL"] } },
         // Kubernetes waits 1s for a probe by default: a server slowed by its disk, not dead, was
@@ -890,8 +888,14 @@ mod tests {
 
     #[test]
     fn this_binary_is_read_as_static_or_dynamic() -> anyhow::Result<()> {
-        // The test binary is linked as the build is: whichever it is, it reads.
-        dynamic(&std::env::current_exe()?)?;
+        // The test binary is linked as the build is: on Linux, whichever it is, it reads; elsewhere
+        // it's no ELF file (Mach-O, PE), and is refused as one.
+        let this = dynamic(&std::env::current_exe()?);
+        if cfg!(target_os = "linux") {
+            this?;
+        } else {
+            assert!(this.is_err());
+        }
         let dir = tempfile::tempdir()?;
         std::fs::write(dir.path().join("x"), b"not an elf file")?;
         assert!(dynamic(&dir.path().join("x")).is_err());

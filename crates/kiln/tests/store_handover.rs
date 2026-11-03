@@ -71,14 +71,14 @@ fn taken_over_from_a_stand_in(dir: &Path, handed: Option<(PathBuf, Vec<u8>)>) ->
 }
 
 /// The id of the store runner `NAME` feeds the server from, once the server's board shows it
-/// connected (failing past `within`, saying what the board and `log` say).
+/// connected, by its machine id (failing past `within`, saying what the board and `log` say).
 fn fed_store(s: &Server, log: &Path, within: Duration) -> anyhow::Result<String> {
     let deadline = Instant::now() + within;
     loop {
         let (_, body) = common::http(s.port, "GET", "/api/conversations/status", &s.admin, None)?;
         let board: Value = serde_json::from_str(&body).unwrap_or_default();
         let fed = board.get("stores").and_then(Value::as_array).into_iter().flatten().find(|st| {
-            st.get("role").and_then(Value::as_str) == Some("runner") && st.get("machine").and_then(Value::as_str) == Some(NAME) && st.get("connected").and_then(Value::as_bool) == Some(true) && st.get("id").is_some_and(Value::is_string)
+            st.get("role").and_then(Value::as_str) == Some("runner") && st.get("machine").and_then(Value::as_str) == Some(common::machine(NAME).as_str()) && st.get("connected").and_then(Value::as_bool) == Some(true) && st.get("id").is_some_and(Value::is_string)
         });
         if let Some(id) = fed.and_then(|st| st.get("id")).and_then(Value::as_str) {
             return Ok(id.to_owned());

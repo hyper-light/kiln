@@ -65,7 +65,7 @@ fn frames_that_cant_be_read_are_refused_typed_and_noted_and_made_up_for() -> any
     let (_runner, log_path) = agents::runner(dir.path(), s.port, "unread-runner", Some("unknown=term/46:7,garble=control/2:1"), Talk { lines: LINES, every_ms: 100 })?;
     let runner_log = || std::fs::read_to_string(&log_path).unwrap_or_default();
     agents::connected(s.port, &s.admin, "unread-runner", &log_path, Duration::from_secs(120))?;
-    let open = json!({"target": "agent:unread-runner", "spec": {"kind": "claude", "cwd": work.display().to_string(), "prompt": "stream"}});
+    let open = json!({"target": format!("agent:{}", common::machine("unread-runner")), "spec": {"kind": "claude", "cwd": work.display().to_string(), "prompt": "stream"}});
     let deadline = Instant::now() + Duration::from_secs(90);
     let id = loop {
         let (code, body) = http(s.port, "POST", "/api/harness/sessions", &s.admin, Some(&open))?;
@@ -121,7 +121,7 @@ fn frames_that_cant_be_read_are_refused_typed_and_noted_and_made_up_for() -> any
         let after = plain(&runner_log());
         let counted = [refused(s.port, &s.admin, "runner", "unknown"), refused(s.port, &s.admin, "runner", "malformed"), refused(s.port, &s.admin, "server", "unknown")];
         let on_page = [kept(&rec, "runner", "unknown"), kept(&rec, "runner", "malformed"), kept(&rec, "server", "unknown")];
-        let rows = audited(s.port, &s.admin, "runner:unread-runner");
+        let rows = audited(s.port, &s.admin, &format!("runner:{}", common::machine("unread-runner")));
         let (runners, answered) = (kept(&rec, "runner", "unknown") + kept(&rec, "runner", "malformed"), told(&before));
         let (heard, servers) = (kept(&rec, "server", "unknown") + kept(&rec, "server", "malformed"), after.matches("a frame from the server couldn't be read").count() as u64);
         assert!(answered <= runners && heard <= servers, "an answer without a refusal: the server told the runner of {answered} of its {runners}, and heard of {heard} of the {servers} of its own the runner couldn't read");
@@ -155,7 +155,7 @@ fn a_runner_from_before_is_told_nothing_new_and_its_unreadable_frames_are_noted(
     let deadline = Instant::now() + Duration::from_secs(60);
     loop {
         let rec = record(s.port, &s.admin, "old-unread");
-        let (counted, on_page, rows) = (refused(s.port, &s.admin, "runner", "unknown"), kept(&rec, "runner", "unknown"), audited(s.port, &s.admin, "runner:old-unread"));
+        let (counted, on_page, rows) = (refused(s.port, &s.admin, "runner", "unknown"), kept(&rec, "runner", "unknown"), audited(s.port, &s.admin, &format!("runner:{}", common::machine("old-unread"))));
         if counted > 1 && on_page > 1 && !rows.is_empty() {
             break;
         }

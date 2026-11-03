@@ -11,6 +11,7 @@ import { Button } from "@/components/ui/button";
 import { Dialog, DialogClose, DialogContent } from "@/components/ui/dialog";
 import { Loadable } from "@/components/ui/loading";
 import { toast } from "@/components/ui/toast";
+import { labelOf, shownName, useLabels } from "@/lib/data";
 import { errorMessage } from "@/lib/hooks";
 import { useSuspenseResource } from "@/lib/resource";
 import { cn } from "@/lib/utils";
@@ -25,15 +26,16 @@ const askRunners = (signal: AbortSignal): Promise<ReachRunner[]> =>
   );
 
 function Choices({ agent, value, onPick }: { agent: Agent; value: string; onPick: (v: string) => void }) {
+  useLabels();
   const runners = useSuspenseResource("harness/reach", askRunners).data;
   // A runner without a reach identity runs a kiln from before commands could run elsewhere.
   const here = runners.find((r) => `agent:${r.name}` === agent.target);
-  if (here && !here.fingerprint) return <p className="mv-none">{here.name} runs an older kiln, without commands on other runners: upgrade it in System → Updates.</p>;
+  if (here && !here.fingerprint) return <p className="mv-none">{shownName(here)} runs an older kiln, without commands on other runners: upgrade it in System → Updates.</p>;
   const others = runners.filter((r) => r.connected && r.reach);
   const choices = [{ value: "", label: "Any runner it needs" }, ...reachChoices(others, agent.target), { value: "off", label: "Only its own machine" }];
   // The one it has stays a choice, whether or not that runner is around now.
   const now = agent.reach ?? "";
-  if (!choices.some((c) => c.value === now)) choices.splice(1, 0, { value: now, label: `Prefer ${now}` });
+  if (!choices.some((c) => c.value === now)) choices.splice(1, 0, { value: now, label: `Prefer ${labelOf(now)}` });
   return (
     <div className="mv-list" role="radiogroup" aria-label="Where its commands run">
       {choices.map((c) => (

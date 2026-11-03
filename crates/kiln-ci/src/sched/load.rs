@@ -137,7 +137,7 @@ mod tests {
     }
 
     fn runner(name: &str, pressure: Option<f64>, free: u64) -> RunnerIn {
-        RunnerIn { id: name.into(), view: RunnerView { name: name.into(), labels: vec!["k8s".into()], facts: facts(pressure, free), caps: 1 << 10, pool: None }, slots: 4, capacity: None, executor: None }
+        RunnerIn { id: name.into(), view: RunnerView { name: name.into(), label: None, labels: vec!["k8s".into()], facts: facts(pressure, free), caps: 1 << 10, pool: None }, slots: 4, capacity: None, executor: None }
     }
 
     fn leg(id: &str, load: Load, cost: Option<f64>) -> LegIn {

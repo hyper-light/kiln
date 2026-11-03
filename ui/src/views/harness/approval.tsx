@@ -32,8 +32,11 @@ const VERB: Partial<Record<Approval["tool"], string>> = {
   plan: "start on its plan",
 };
 
-/** A question, answered where it was asked: in the conversation, drawn like the agent's own words. */
-function Questions({ a, onDecide, agentName, kind, agentId }: { a: Approval; onDecide: Decide; agentName?: string; kind?: string; agentId?: string }) {
+/**
+ * A question, answered where it was asked: in the conversation, drawn like the agent's own words;
+ * or under its row in Mission control (`headless`: the row says who asks).
+ */
+export function Questions({ a, onDecide, agentName, kind, agentId, headless }: { a: Approval; onDecide: Decide; agentName?: string; kind?: string; agentId?: string; headless?: boolean }) {
   const [busy, setBusy] = React.useState(false);
   const questions: ChoiceQuestion[] = (a.questions ?? []).map((q) => ({
     id: q.id,
@@ -52,6 +55,7 @@ function Questions({ a, onDecide, agentName, kind, agentId }: { a: Approval; onD
   const choices = (more: Partial<ChoicesProps>) => (
     <Choices
       layout="flow"
+      headless={headless}
       questions={questions}
       agentName={agentName}
       kind={kind}

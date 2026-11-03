@@ -2,7 +2,7 @@
  * A plan's steps as you read and run them: their graph, as they'll run (what waits for what), each
  * step its number and title. Pick steps by tapping them: what each picked step is shows under the
  * graph (what to do, examples, acceptance criteria, tests; a plain step's own words), and Run takes
- * just those.
+ * just those (with `onRun`: a plan its agent's goals wait on your review of is approved whole).
  */
 import type { Plan } from "@/api/plans";
 import { Button } from "@/components/ui/button";
@@ -16,7 +16,7 @@ export function stepsWords(n: readonly number[]): string {
   return `steps ${n.slice(0, -1).join(", ")} and ${n[n.length - 1]}`;
 }
 
-export function PlanSteps({ plan, picked, onPick, onRun }: { plan: Plan; picked: readonly number[]; onPick: (n: number[]) => void; onRun: () => void }) {
+export function PlanSteps({ plan, picked, onPick, onRun }: { plan: Plan; picked: readonly number[]; onPick: (n: number[]) => void; onRun?: () => void }) {
   const items = plan.items ?? [];
   const titles = items.length ? items.map((it) => it.title || "Untitled step") : plan.steps;
   if (titles.length === 0) return null;
@@ -36,7 +36,7 @@ export function PlanSteps({ plan, picked, onPick, onRun }: { plan: Plan; picked:
             </button>
           </span>
         ) : (
-          <span className="plan-dim sv-hint">Pick steps to see what they are and run just those</span>
+          <span className="plan-dim sv-hint">{onRun ? "Pick steps to see what they are and run just those" : "Pick steps to see what they are"}</span>
         )}
       </div>
       <PlanGraph label="Its steps, as they'll run" steps={steps} picked={picked} onPick={pick} />
@@ -63,9 +63,11 @@ export function PlanSteps({ plan, picked, onPick, onRun }: { plan: Plan; picked:
               );
             })}
           </ol>
-          <Button size="sm" className="sv-run" onClick={onRun}>
-            Run {stepsWords(picked)}
-          </Button>
+          {onRun && (
+            <Button size="sm" className="sv-run" onClick={onRun}>
+              Run {stepsWords(picked)}
+            </Button>
+          )}
         </div>
       )}
     </section>

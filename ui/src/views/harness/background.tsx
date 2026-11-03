@@ -5,7 +5,7 @@
  */
 import * as React from "react";
 import { Fold } from "./fold";
-import { ChevronRight, GitFork, Square } from "lucide-react";
+import { ChevronRight, GitFork, Square, Trash } from "lucide-react";
 import { harnessApi, useSession, type AgentInfo, type Approval, type Command, type SessionStore, type State, type Task } from "@/api/harness";
 import { Button } from "@/components/ui/button";
 import { Confirm } from "@/components/ui/misc";
@@ -17,8 +17,10 @@ import { agentLabel, duration, tildify } from "./derive";
 import { glyphKind, KindGlyph, type GlyphKind } from "./kind-glyph";
 import { Shimmer } from "./signals";
 import { askWords, classOf, isSubagent, kilnAtWork, kilnStatus, LEFT, stopperOf, subagentAsks, subagentRunning, subagentTasksAtWork, type SubagentAsk } from "./tasks";
-import { NODE_WORD, takesMessage, type SubagentRow } from "./subagent-tree";
+import { NODE_WORD, takesMessage, treePaths, type SubagentRow } from "./subagent-tree";
 import { PauseButton } from "./subagent-pause";
+import { ENDED, RemoveButton, useRemoving } from "./subagent-remove";
+import { swipeRow } from "./swipe-away";
 import { TreePath } from "./tree-path";
 import { useNavigate } from "@/lib/router";
 
@@ -455,9 +457,10 @@ function KilnItem({ a, mixed, onOpenTask }: { a: AgentInfo; mixed: boolean; onOp
 
 /**
  * One subagent in the tree by the composer (subagent-tree.ts): its pick box (what's written next
- * goes to those picked), its piece of the path, its name, its word, what it's at and for how long,
- * its pause and its Stop; what it asks, answered under it. Its thread opens from its name: here, or
- * on the page of the subagent it's under.
+ * goes to those picked that take it; one that ended is picked to be removed), its piece of the path,
+ * its name, its word (the prism through it at work), what it's at and for how long, its pause (its
+ * trash once it has ended, or a swipe) and its Stop; what it asks, answered under it. Its thread
+ * opens from its name: here, or on the page of the subagent it's under.
  */
 function DockNode({
   r,
@@ -465,12 +468,14 @@ function DockNode({
   picked,
   onPick,
   onOpenTask,
+  onRemove,
 }: {
   r: SubagentRow;
   store: SessionStore;
   picked: boolean;
   onPick: (keys: string[], on: boolean) => void;
   onOpenTask: (toolId: string) => void;
+  onRemove: (el: HTMLElement | null) => void;
 }) {
   const navigate = useNavigate();
   const features = useSession(store, (s) => s.meta?.features ?? NO_FEATURES);
@@ -498,16 +503,19 @@ function DockNode({
   };
   // Its harness can't stop it (an older server says so of every task): said, not offered.
   const stoppable = r.kind === "kiln" || !task || stopperOf(task, features) !== null;
+  const ended = ENDED.has(r.stand);
+  // A machine from before Remove can't take it for one of its harness's own.
+  const removable = ended && (r.kind === "kiln" || r.session !== store.id || features.includes("remove_task"));
   const stopButton = (
     <button type="button" className="al-stop" disabled={!live || !stoppable} aria-expanded={asking} aria-label={`Stop ${r.name}`} onClick={() => setAsking(!asking)}>
       Stop
     </button>
   );
   return (
-    <li className="al-item dn" data-stand={r.stand} data-picked={picked || undefined}>
+    <li className="al-item dn" data-stand={r.stand} data-key={r.key} data-picked={picked || undefined} {...(removable ? swipeRow<HTMLLIElement>(() => onRemove(null), ".dn-main") : {})}>
       <div className="dn-row">
         <span className="dn-pick">
-          <input type="checkbox" className="check" checked={picked} disabled={!live} onChange={(e) => onPick([r.key], e.target.checked)} aria-label={`Pick ${r.name}`} />
+          <input type="checkbox" className="check" checked={picked} disabled={!live && !removable} onChange={(e) => onPick([r.key], e.target.checked)} aria-label={`Pick ${r.name}`} />
         </span>
         <TreePath path={r.path} stand={r.stand} className="dn-path" x0={9} dx={10} y={17} width={40} />
         <button type="button" className="dn-main" onClick={open}>
@@ -516,10 +524,10 @@ function DockNode({
             {r.name}
           </span>
           <span className="dn-line">
-            <span className="dn-word">
+            <Shimmer on={r.stand === "working"} flow={r.key} className="dn-word">
               <i aria-hidden="true" />
               {NODE_WORD[r.stand]}
-            </span>
+            </Shimmer>
             <span className="dn-text" data-mono={r.mono || undefined}>
               {r.line}
             </span>
@@ -531,7 +539,7 @@ function DockNode({
           </span>
         </button>
         <span className="dn-acts">
-          <PauseButton n={r} className="dn-pause" />
+          {ended ? <RemoveButton n={r} className="dn-pause dn-remove" disabled={!removable} onRemove={onRemove} /> : <PauseButton n={r} className="dn-pause" />}
           {stopAt !== null ? <Stopping at={stopAt}>{stopButton}</Stopping> : stopButton}
         </span>
       </div>
@@ -634,7 +642,7 @@ export function ActivityLine({
   onOpenTask,
   kiln = NO_AGENTS,
   inThread = null,
-  rows: tree = NO_ROWS,
+  rows = NO_ROWS,
   picks = NO_PICKS,
   onPick,
 }: {
@@ -648,6 +656,14 @@ export function ActivityLine({
 }) {
   const [open, setOpen] = React.useState(false);
   const [shown, setShown] = React.useState<string | null>(null);
+  const { going, remove } = useRemoving();
+  const tree = React.useMemo(() => {
+    if (going.size === 0) return rows;
+    const left = rows.filter((r) => !going.has(r.key));
+    const paths = treePaths(left);
+    return left.map((r, i) => ({ ...r, path: paths[i] ?? r.path }));
+  }, [rows, going]);
+  const features = useSession(store, (s) => s.meta?.features ?? NO_FEATURES);
   const tasks = useSession(store, (s) => s.state?.tasks ?? NO_TASKS);
   const approvals = useSession(store, (s) => s.state?.approvals ?? NO_APPROVALS);
   const done = useAnswered();
@@ -655,14 +671,25 @@ export function ActivityLine({
   // The subagents kiln started for its goals or plan steps, with its harness's own.
   const others = kilnAtWork(kiln);
   const bg = tasks.filter((t) => !isSubagent(t) && isLive(t));
-  const pickable = tree.filter(takesMessage);
+  // Those that take a message, and those that ended to be removed (a machine from before Remove can't for its harness's own).
+  const removable = (r: SubagentRow) => ENDED.has(r.stand) && (r.kind === "kiln" || r.session !== store.id || features.includes("remove_task"));
+  const pickable = tree.filter((r) => takesMessage(r) || removable(r));
   const all = pickable.length > 0 && pickable.every((r) => picks.has(r.key));
   const some = !all && pickable.some((r) => picks.has(r.key));
+  const picking = open && pickable.some((r) => picks.has(r.key));
+  const toRemove = tree.filter((r) => picks.has(r.key) && removable(r));
+  const removeRows = (rs: readonly SubagentRow[], els: readonly (HTMLElement | null)[]) => {
+    onPick?.(
+      rs.map((r) => r.key),
+      false,
+    );
+    remove(rs, els);
+  };
   if (subs.length + others.length + bg.length === 0 && tree.length === 0) return null;
   // Those that wait on you: said on the line, and each (two at most) in a row of its own under it.
   const asks = subagentAsks(store.id, approvals, tasks, kiln, done);
   const needs = asks.length === 0 ? "" : subs.length + others.length === 1 ? "Needs you" : `${asks.length} need${asks.length === 1 ? "s" : ""} you`;
-  const rows = open ? [] : asks.filter((a) => a.thread !== inThread).slice(0, 2);
+  const needRows = open ? [] : asks.filter((a) => a.thread !== inThread).slice(0, 2);
   const count = (n: number, one: string, many = `${one}s`) => (n ? `${n} ${n === 1 ? one : many}` : "");
   const of = (cls: string) => bg.filter((t) => classOf(t) === cls).length;
   const shells = of("shell");
@@ -683,7 +710,7 @@ export function ActivityLine({
   return (
     <>
       <div className="al" data-open={open || undefined}>
-        <div className="al-top">
+        <div className="al-top" data-picking={picking || undefined}>
           {/* Its subagents' mark; once open, where every one that takes a message is picked at once. */}
           {tree.length > 0 && (
             <span className="al-slot">
@@ -741,11 +768,30 @@ export function ActivityLine({
             </span>
             <ChevronRight size={12} className={cn("al-chev", open && "rotate-90")} aria-hidden="true" />
           </button>
+          {/* While some are picked: Remove, for those of them that ended. */}
+          {picking && (
+            <button
+              type="button"
+              className="al-stop al-remove"
+              disabled={toRemove.length === 0}
+              onClick={(e) =>
+                removeRows(
+                  toRemove,
+                  toRemove.map((r) => e.currentTarget.closest(".al")?.querySelector<HTMLElement>(`li[data-key="${CSS.escape(r.key)}"]`) ?? null),
+                )
+              }
+            >
+              <Trash size={12} aria-hidden="true" />
+              Remove
+            </button>
+          )}
         </div>
         {open && (
           <ul className="al-list">
             {tree.length > 0
-              ? tree.map((r) => <DockNode key={r.key} r={r} store={store} picked={picks.has(r.key)} onPick={(keys, on) => onPick?.(keys, on)} onOpenTask={onOpenTask} />)
+              ? tree.map((r) => (
+                  <DockNode key={r.key} r={r} store={store} picked={picks.has(r.key)} onPick={(keys, on) => onPick?.(keys, on)} onOpenTask={onOpenTask} onRemove={(el) => removeRows([r], [el])} />
+                ))
               : [
                   ...subs.map((t) => (
                     <ActivityItem key={t.id} t={t} store={store} mixed={mixed} shown={shown === t.id} onShow={() => setShown(shown === t.id ? null : t.id)} onOpenTask={onOpenTask} />
@@ -758,9 +804,9 @@ export function ActivityLine({
           </ul>
         )}
       </div>
-      {rows.length > 0 && (
+      {needRows.length > 0 && (
         <div className="sa">
-          {rows.map((a) => (
+          {needRows.map((a) => (
             <NeedsRow key={a.ap.id} ask={a} onOpenTask={onOpenTask} />
           ))}
         </div>
