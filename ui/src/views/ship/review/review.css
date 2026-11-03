@@ -455,8 +455,10 @@
   letter-spacing: 0;
   color: #e4e5e7;
 }
+/* At a phone's narrowest (320 px) Land goes under Approve rather than past the page's edge. */
 .rv-bar {
   display: flex;
+  flex-wrap: wrap;
   align-items: center;
   justify-content: space-between;
   gap: 10px;
