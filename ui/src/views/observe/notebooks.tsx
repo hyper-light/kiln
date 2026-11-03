@@ -12,10 +12,9 @@ import { TableHold } from "@/components/ui/hold";
 import { Loadable } from "@/components/ui/loading";
 import { PageIntro, SearchField, SelectField } from "@/components/ui/misc";
 import { Segmented } from "@/components/ui/tabs";
-import { toast } from "@/components/ui/toast";
+import { useAction } from "@/lib/action";
 import { useRes, type Res } from "@/lib/data";
 import { relativeTime } from "@/lib/format";
-import { errorMessage } from "@/lib/hooks";
 import { invalidate } from "@/lib/resource";
 import { Link, useNavigate } from "@/lib/router";
 import { ObserveNav, useParam, useParams } from "./parts";
@@ -39,23 +38,16 @@ export default function Notebooks() {
   const [filter, setFilter] = React.useState("");
   const templates = show === "templates";
   const navigate = useNavigate();
-  const [busy, setBusy] = React.useState(false);
-  const make = async () => {
-    setBusy(true);
-    try {
-      const n = await observeApi.createNotebook({
-        name: templates ? "Untitled template" : "Untitled notebook",
-        cells: [{ type: "notebook_cells", attributes: { definition: { type: "markdown", text: "" } } }],
-        time: { live_span: "1h" },
-        metadata: { is_template: templates, type: (type || null) as NotebookType | null },
-      });
-      invalidate("observe/notebooks");
-      navigate(`/observe/notebooks/${n.id}?edit=1`);
-    } catch (e) {
-      toast({ title: "Couldn't make it", description: errorMessage(e), tone: "failed" });
-      setBusy(false);
-    }
-  };
+  const [make, making] = useAction(async () => {
+    const n = await observeApi.createNotebook({
+      name: templates ? "Untitled template" : "Untitled notebook",
+      cells: [{ type: "notebook_cells", attributes: { definition: { type: "markdown", text: "" } } }],
+      time: { live_span: "1h" },
+      metadata: { is_template: templates, type: (type || null) as NotebookType | null },
+    });
+    invalidate("observe/notebooks");
+    await navigate(`/observe/notebooks/${n.id}?edit=1`);
+  }, "Couldn't make it");
   return (
     <div className="container-console page">
       <title>Notebooks · Observe · kiln</title>
@@ -65,7 +57,7 @@ export default function Notebooks() {
         title="Notebooks"
         lead="Documents of text and graphs over a time: investigations, runbooks, postmortems, reports. A postmortem is written from an incident's page, of a template kept here."
         actions={
-          <Button onClick={() => void make()} disabled={busy}>
+          <Button onClick={make} pending={making}>
             <Plus /> {templates ? "New template" : "New notebook"}
           </Button>
         }

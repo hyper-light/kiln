@@ -23,7 +23,8 @@ web UI embedded. Read this before you change it, then the documents it points to
 - **General hardware.** Pick machines by what they can do, never by name.
 - **The UI** (`ui/`): the hyperlight-site style; one primary surface per page; no popups
   (modals, sheets, floating panels); no effects (`useEffect` is a lint error; data comes through
-  Suspense); static by default; checked in Chromium and WebKit at desktop and phone widths.
+  Suspense); static by default; a press never waits on the server to show it was taken (W21-R15:
+  `ui/src/lib/action.ts`); checked in Chromium and WebKit at desktop and phone widths.
 - **Opt-in automation.** What kiln decides on its own is off until declared, and says why it did
   what it did.
 - **Seams.** kiln reaches other products only through `crates/kiln-seams` (`docs/seams.md`):

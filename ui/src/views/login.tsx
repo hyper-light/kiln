@@ -6,6 +6,8 @@ import { Brand } from "@/components/shell/brand";
 import { Button } from "@/components/ui/button";
 import { Loadable } from "@/components/ui/loading";
 import { ErrorState, Optic } from "@/components/ui/misc";
+import { useAction } from "@/lib/action";
+import { checkAuth } from "@/lib/auth";
 import { errorMessage } from "@/lib/hooks";
 import { invalidate, useSuspenseResource } from "@/lib/resource";
 import { MotionToggle } from "@/components/shell/motion";
@@ -35,11 +37,11 @@ const readMethods = async (signal: AbortSignal): Promise<Methods> => {
   return { passkey: false, people: false, ...m, sso };
 };
 
-export function Login({ error, onRetry }: { error?: string; onRetry: () => void }) {
-  const retry = () => {
+export function Login({ error, onRetry }: { error?: string; onRetry: () => Promise<void> }) {
+  const [retry, retrying] = useAction(() => {
     invalidate("auth/signin");
-    onRetry();
-  };
+    return onRetry();
+  });
   return (
     <div className="flex min-h-dvh flex-col">
       <title>Sign in · kiln</title>
@@ -49,8 +51,8 @@ export function Login({ error, onRetry }: { error?: string; onRetry: () => void 
         </div>
       </header>
       <main id="main" className="container-console grid flex-1 items-center gap-10 py-10 md:grid-cols-[1.05fr_1fr] md:py-16">
-        <Loadable label="how this server signs you in" fallback={<SignIn methods={null} error={error} onRetry={retry} />}>
-          <SignInLoaded error={error} onRetry={retry} />
+        <Loadable label="how this server signs you in" fallback={<SignIn methods={null} error={error} onRetry={retry} retrying={retrying} />}>
+          <SignInLoaded error={error} onRetry={retry} retrying={retrying} />
         </Loadable>
         {/* Beside the form on wide screens; below it on phones, as on hyperlight-site's hero. */}
         <div className="login-art" aria-hidden="true">
@@ -70,13 +72,13 @@ export function Login({ error, onRetry }: { error?: string; onRetry: () => void 
   );
 }
 
-function SignInLoaded({ error, onRetry }: { error?: string; onRetry: () => void }) {
+function SignInLoaded({ error, onRetry, retrying }: { error?: string; onRetry: () => void; retrying: boolean }) {
   const methods = useSuspenseResource("auth/signin", readMethods).data;
-  return <SignIn methods={methods} error={error} onRetry={onRetry} />;
+  return <SignIn methods={methods} error={error} onRetry={onRetry} retrying={retrying} />;
 }
 
 /** The sign-in form; `methods` null while the server is asked how it signs people in. */
-function SignIn({ methods, error, onRetry }: { methods: Methods | null; error?: string; onRetry: () => void }) {
+function SignIn({ methods, error, onRetry, retrying }: { methods: Methods | null; error?: string; onRetry: () => void; retrying: boolean }) {
   const loading = methods === null;
   const hasPassword = methods?.password ?? null;
   // A password signs in when the owner keeps one or any person does (with their name).
@@ -84,7 +86,6 @@ function SignIn({ methods, error, onRetry }: { methods: Methods | null; error?: 
   const [mode, setMode] = React.useState<Mode>(methods && !anyPassword ? "token" : "password");
   const [secret, setSecret] = React.useState("");
   const [name, setName] = React.useState("");
-  const [busy, setBusy] = React.useState(false);
   const [err, setErr] = React.useState<string | null>(null);
   const [notice] = React.useState(linkProblem);
   const inputRef = React.useRef<HTMLInputElement>(null);
@@ -100,38 +101,35 @@ function SignIn({ methods, error, onRetry }: { methods: Methods | null; error?: 
     requestAnimationFrame(() => inputRef.current?.focus());
   };
 
-  const submit = async (e: React.FormEvent) => {
-    e.preventDefault();
+  // Signing in waits for the answer, its button saying so (W21-R15), until the console knows who
+  // this is and shows; a refusal is said here, with what was typed still there.
+  const [submit, signingIn] = useAction(async () => {
     const value = mode === "password" ? secret : secret.trim();
     if (!value) return;
-    setBusy(true);
     setErr(null);
     try {
       if (people && name.trim()) await signin.withName(name.trim(), value);
       else if (mode === "password") await api.loginPassword(value);
       else await api.login(value);
       clearLinkProblem();
+      await checkAuth();
     } catch (e2) {
       const status = e2 instanceof ApiError ? e2.status : (e2 as { status?: number }).status;
       if (status === 401) setErr(mode === "password" ? (people && name.trim() ? "Wrong name or password." : "Wrong password.") : "That token was not accepted.");
       else setErr(errorMessage(e2));
-    } finally {
-      setBusy(false);
     }
-  };
+  });
 
-  const withPasskey = async () => {
-    setBusy(true);
+  const [withPasskey, passkeying] = useAction(async () => {
     setErr(null);
     try {
       await signin.withPasskey();
       clearLinkProblem();
+      await checkAuth();
     } catch (e2) {
       setErr(e2 instanceof DOMException && e2.name === "NotAllowedError" ? "No passkey was used: it was cancelled, or this device has none of this server's." : errorMessage(e2));
-    } finally {
-      setBusy(false);
     }
-  };
+  });
 
   return (
     <div>
@@ -159,7 +157,14 @@ function SignIn({ methods, error, onRetry }: { methods: Methods | null; error?: 
         </div>
       )}
 
-      <form onSubmit={submit} className="mt-9 max-w-[440px]" autoComplete="on">
+      <form
+        onSubmit={(e) => {
+          e.preventDefault();
+          if (!passkeying) submit();
+        }}
+        className="mt-9 max-w-[440px]"
+        autoComplete="on"
+      >
         {people ? (
           <div className="mb-4">
             <label htmlFor="who" className="field-label">
@@ -207,8 +212,8 @@ function SignIn({ methods, error, onRetry }: { methods: Methods | null; error?: 
           />
         </div>
         <div className="mt-5 flex flex-wrap items-center gap-3">
-          <Button type="submit" disabled={busy || loading || !secret.trim() || (people && !hasPassword && !name.trim())}>
-            {busy ? "Signing in…" : "Sign in"} <ArrowRight size={16} />
+          <Button type="submit" pending={signingIn} disabled={passkeying || loading || !secret.trim() || (people && !hasPassword && !name.trim())}>
+            {signingIn ? "Signing in…" : "Sign in"} <ArrowRight size={16} />
           </Button>
           {anyPassword && (
             <Button type="button" variant="ghost" onClick={() => switchMode(mode === "password" ? "token" : "password")}>
@@ -216,7 +221,7 @@ function SignIn({ methods, error, onRetry }: { methods: Methods | null; error?: 
             </Button>
           )}
           {error && (
-            <Button type="button" variant="ghost" onClick={onRetry}>
+            <Button type="button" variant="ghost" pending={retrying} onClick={onRetry}>
               Retry connection
             </Button>
           )}
@@ -233,7 +238,7 @@ function SignIn({ methods, error, onRetry }: { methods: Methods | null; error?: 
           <div className="font-mono text-[10px] tracking-[0.14em] text-[#858891] uppercase">Or</div>
           <div className="mt-3 flex flex-wrap gap-3">
             {byPasskey && (
-              <Button type="button" variant="secondary" disabled={busy} onClick={() => void withPasskey()}>
+              <Button type="button" variant="secondary" pending={passkeying} disabled={signingIn} onClick={withPasskey}>
                 <Fingerprint size={16} aria-hidden="true" /> Sign in with a passkey
               </Button>
             )}

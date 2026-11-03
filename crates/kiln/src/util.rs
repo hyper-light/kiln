@@ -19,6 +19,12 @@ pub fn new_id() -> String {
     uuid::Uuid::now_v7().simple().to_string()
 }
 
+/// An id written as [`new_id`] writes them, 32 lowercase hex digits: what a client may make one of
+/// its own as (the agents a page starts, `POST /api/harness/sessions`' `ids`).
+pub fn is_id(s: &str) -> bool {
+    s.len() == 32 && s.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+}
+
 /// An id made from `parts` (a namespace, then what it names), the same every time they're the same
 /// and as unlikely to meet another as a random one (a UUIDv8 of their SHA-256): how a retry finds
 /// the id its first try made, from the key its sender gave (CP-T3.2, an idempotency key).

@@ -15,11 +15,12 @@ import { Loadable } from "@/components/ui/loading";
 import { PageIntro, Panel, SelectField } from "@/components/ui/misc";
 import { Segmented } from "@/components/ui/tabs";
 import { toast } from "@/components/ui/toast";
+import { useActions } from "@/lib/action";
 import { useRes, type Res } from "@/lib/data";
 import { absoluteDate, formatDuration, relativeTime } from "@/lib/format";
 import { errorMessage } from "@/lib/hooks";
 import { invalidate } from "@/lib/resource";
-import { ObserveNav, useParam } from "./parts";
+import { ObserveNav, useOpening, useParam } from "./parts";
 
 const DAY = 86_400_000;
 const RANGES = { "7d": 7 * DAY, "30d": 30 * DAY, "90d": 90 * DAY } as const;
@@ -308,14 +309,19 @@ function Deployments({ n }: { n: Narrowed }) {
   const all = useRes(deploymentsRes(n)).data;
   const [marking, setMarking] = React.useState<DoraDeployment | null>(null);
   const byId = new Map(all.map((d) => [d.id, d]));
-  const unmark = async (d: DoraDeployment) => {
+  // A deployment's mark changes once the server has it, as the four keys above, which it counts,
+  // change with it. One change to each at a time, whichever is pressed (Not failed, or Mark it failed
+  // in its dialog): the row's control says meanwhile that it's on its way, also after the dialog's
+  // Cancel (W21-R15).
+  const [markAs, changing] = useActions(async (_id: string, d: DoraDeployment, body: DeployMark, what: string, then?: () => void) => {
     try {
-      await observeApi.markDeployment(d.id, { change_failure: false });
+      await observeApi.markDeployment(d.id, body);
       invalidate("observe/dora");
+      then?.();
     } catch (e) {
-      toast({ title: "Couldn't change it", description: errorMessage(e), tone: "failed" });
+      toast({ title: `Couldn't ${what}`, description: errorMessage(e), tone: "failed" });
     }
-  };
+  });
   if (all.length === 0)
     return (
       <p className="empty-line py-12 text-center">
@@ -335,11 +341,11 @@ function Deployments({ n }: { n: Narrowed }) {
               const a = d.attributes;
               const what = a.version || (a.git ? a.git.commit_sha.slice(0, 12) : "");
               const control = a.change_failure ? (
-                <Button variant="ghost" size="xs" onClick={() => void unmark(d)}>
+                <Button variant="ghost" size="xs" pending={changing(d.id)} onClick={() => markAs(d.id, d, { change_failure: false }, "change it")}>
                   Not failed<span className="sr-only"> {d.id}</span>
                 </Button>
               ) : (
-                <Button variant="ghost" size="xs" onClick={() => setMarking(d)}>
+                <Button variant="ghost" size="xs" pending={changing(d.id)} onClick={() => setMarking(d)}>
                   Mark failed<span className="sr-only"> {d.id}</span>
                 </Button>
               );
@@ -388,6 +394,8 @@ function Deployments({ n }: { n: Narrowed }) {
         <MarkDialog
           d={marking}
           later={all.filter((x) => x.attributes.service === marking.attributes.service && x.attributes.env === marking.attributes.env && x.attributes.finished_at > marking.attributes.finished_at)}
+          pending={changing(marking.id)}
+          onMark={(body, then) => markAs(marking.id, marking, body, "mark it", then)}
           onClose={() => setMarking(null)}
         />
       )}
@@ -395,29 +403,36 @@ function Deployments({ n }: { n: Narrowed }) {
   );
 }
 
+type DeployMark = Parameters<typeof observeApi.markDeployment>[1];
+
 /** A deployment marked failed by hand, and what put it right (a later one of its service and environment), when one did. */
-function MarkDialog({ d, later, onClose }: { d: DoraDeployment; later: DoraDeployment[]; onClose: () => void }) {
+function MarkDialog({
+  d,
+  later,
+  pending,
+  onMark,
+  onClose,
+}: {
+  d: DoraDeployment;
+  later: DoraDeployment[];
+  pending: boolean;
+  onMark: (body: DeployMark, then: () => void) => void;
+  onClose: () => void;
+}) {
   const [by, setBy] = React.useState("");
   const [kind, setKind] = React.useState<DoraRemedyKind>("rollback");
-  const [busy, setBusy] = React.useState(false);
+  const form = [by, kind];
+  const opening = useOpening(form);
   const a = d.attributes;
-  const save = async () => {
-    setBusy(true);
-    try {
-      await observeApi.markDeployment(d.id, { change_failure: true, ...(by ? { remediation: { id: by, type: kind } } : {}) });
-      invalidate("observe/dora");
-      onClose();
-    } catch (e) {
-      toast({ title: "Couldn't mark it", description: errorMessage(e), tone: "failed" });
-    } finally {
-      setBusy(false);
-    }
-  };
+  const save = () =>
+    onMark({ change_failure: true, ...(by ? { remediation: { id: by, type: kind } } : {}) }, () => {
+      if (opening.still(form)) onClose();
+    });
   const name = (x: DoraDeployment) => `${x.attributes.version || x.attributes.git?.commit_sha.slice(0, 12) || x.id}, ${relativeTime(x.attributes.finished_at / 1000)}`;
   return (
     <Dialog open onOpenChange={(o) => !o && onClose()}>
       <DialogContent title={`Mark ${a.service} ${a.version || ""} failed`} description="It caused a failure in production. What put it right, when one did, gives its recovery time.">
-        <div className="space-y-4">
+        <div ref={opening.ref} className="space-y-4">
           <SelectField
             label="Put right by"
             value={by}
@@ -445,7 +460,7 @@ function MarkDialog({ d, later, onClose }: { d: DoraDeployment; later: DoraDeplo
             <Button variant="ghost" onClick={onClose}>
               Cancel
             </Button>
-            <Button disabled={busy} onClick={() => void save()}>
+            <Button pending={pending} onClick={save}>
               Mark it failed
             </Button>
           </div>

@@ -2956,6 +2956,10 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                         // How it fared, as its answer says it (a command on the channel).
                         let opened: Result<(), (Refusal, anyhow::Error)> = match (&harness, *spec) {
                             (None, _) => Err((Refusal::Unsupported, anyhow::anyhow!("agent sessions are not enabled on this runner"))),
+                            // Asked again for a session it has (the answer to the first ask lost on its
+                            // way back, the start asked again under its id): it's there, and nothing is
+                            // made or started again, its workspace included.
+                            (Some(h), _) if h.get(&session).is_some() => Ok(()),
                             (Some(h), mut spec) => {
                                 // Started on a shell: in that shell's directory and environment.
                                 if let Some(pid) = spec.shell.as_ref().and_then(|t| terms.get(t)).and_then(|(pty, _)| pty.pid()) {
@@ -2972,7 +2976,18 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                                     let (h, up, session, asked) = (Arc::clone(h), uplink.0.clone(), session.clone(), asked.clone());
                                     crate::rt::spawn(async move {
                                         let opened = match crate::workspace::prepare(&mut spec, &session).await {
-                                            Ok(()) => h.open(Some(session.clone()), spec).map(|_| ()),
+                                            Ok(()) => {
+                                                let made = spec.workspace.as_ref().and_then(|w| w.made.clone());
+                                                let opened = h.open(Some(session.clone()), spec).map(|_| ());
+                                                // What was made for it goes with it: asked again under its id, it's made anew.
+                                                if opened.is_err()
+                                                    && let Some(m) = made
+                                                    && let Err(gone) = crate::workspace::slates::remove(&m).await
+                                                {
+                                                    tracing::warn!(volume = %m.volume, error = %format!("{gone:#}"), "the workspace of an agent that couldn't start stayed");
+                                                }
+                                                opened
+                                            }
                                             Err(e) => Err(e.context("its workspace")),
                                         };
                                         if let Err(e) = opened {

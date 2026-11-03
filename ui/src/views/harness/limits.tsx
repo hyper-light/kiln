@@ -124,6 +124,8 @@ function UsageRow({ limit, now }: { limit: Limit; now: number }) {
 }
 
 const STOP_POINTS = [80, 90, 95];
+/** A stop point picked shows as picked this long at most before the agent says it back (most do at once), as `AtLimit`'s choice does. */
+const SAID_BACK_MS = 3500;
 
 /**
  * The plan's limits, opened in place from the head's usage badge (no popup): a row a window, and
@@ -149,7 +151,11 @@ export function UsagePanel({
   /** What it does at a limit: waits for the reset, or goes on elsewhere (`AtLimit`). */
   elsewhere?: React.ReactNode;
 }) {
-  const now = useClock(30_000);
+  const [picked, setPicked] = React.useState<{ at: number; percent: number | null } | null>(null);
+  const now = useClock(picked ? 1000 : 30_000);
+  // Picked: shown so at once (W21-R15), until the agent says it back, or doesn't in a while (then as it has it).
+  if (picked && (picked.percent === (stopAt ?? null) || now - picked.at > SAID_BACK_MS)) setPicked(null);
+  const shownStop = picked ? picked.percent : stopAt;
   return (
     <section id={id} className="hx-usage-panel" aria-label="Plan usage">
       <ul className="hx-usage-rows">
@@ -162,7 +168,14 @@ export function UsagePanel({
           <label className="hx-usage-stop">
             <span>Pause at</span>
             <span className="select hx-pick">
-              <select value={stopAt ? String(stopAt) : ""} onChange={(e) => onStopAt(e.target.value ? Number(e.target.value) : null)}>
+              <select
+                value={shownStop ? String(shownStop) : ""}
+                onChange={(e) => {
+                  const percent = e.target.value ? Number(e.target.value) : null;
+                  setPicked({ at: Date.now(), percent });
+                  onStopAt(percent);
+                }}
+              >
                 <option value="">the limit</option>
                 {STOP_POINTS.map((p) => (
                   <option key={p} value={String(p)}>
@@ -212,7 +225,9 @@ export function LimitBadge({ limits, onClick, open, controls, className }: { lim
       aria-controls={open ? controls : undefined}
       title={(limits ?? []).map((l) => `${l.label}: ${l.used_percent ?? "?"}%`).join(" · ")}
     >
-      <span>{top.label} {Math.round(top.used_percent)}%</span>
+      <span>
+        {top.label} {Math.round(top.used_percent)}%
+      </span>
     </button>
   );
 }

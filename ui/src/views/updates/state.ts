@@ -1,7 +1,7 @@
 /**
  * What System → Updates and Builds share, outside any one of their parts: the server upgrade this
  * tab started and waits for across the restart, the machine or build picked in the figure (its row
- * or tile lights below), the upload under way, and a clock that ticks once a minute.
+ * or tile lights below), the uploads under way, and a clock that ticks once a minute.
  */
 import * as React from "react";
 import { create } from "zustand";
@@ -82,11 +82,11 @@ export function pick(key: string | null) {
 
 /* ---------------------------- uploads ---------------------------- */
 
-/** The platform a binary is being uploaded for. */
-export const useUploading = create<{ target: string | null }>(() => ({ target: null }));
+/** The platforms binaries are being uploaded for: each one's Upload says so, and the others' stay free (W21-R15). */
+export const useUploading = create<{ targets: string[] }>(() => ({ targets: [] }));
 
 async function upload(target: string, file: File) {
-  useUploading.setState({ target });
+  useUploading.setState((s) => ({ targets: [...s.targets, target] }));
   try {
     const b = await api.uploadBinary(target, file);
     toast.success("Binary uploaded", `build ${b.build} for ${target}`);
@@ -94,7 +94,7 @@ async function upload(target: string, file: File) {
   } catch (e) {
     toast.error("Upload failed", errorMessage(e));
   } finally {
-    useUploading.setState({ target: null });
+    useUploading.setState((s) => ({ targets: s.targets.filter((t) => t !== target) }));
   }
 }
 

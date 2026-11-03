@@ -1,12 +1,13 @@
 /**
  * A comment's suggestion (docs/ci.md W26-R10): a change against the file's own line numbers, the old
- * lines (−) and the new (+), with copy and Apply. Applying is a React Action calling kiln's endpoint
- * (the caller's): the block says so while it goes, then which revision applied it.
+ * lines (−) and the new (+), with copy and Apply. Applying calls kiln's endpoint (the caller's): the
+ * block says so while it goes (W21-R15), then which revision applied it.
  */
 import * as React from "react";
 import { Check } from "lucide-react";
 import type { Suggestion } from "@/api/review";
 import { CopyIcon } from "@/components/ui/copy-block";
+import { sendingProps, useAction } from "@/lib/action";
 import { CommentCode } from "@/lib/markdown";
 
 /** Lines of a file by its own numbers: the first one's number, and their text. */
@@ -42,22 +43,18 @@ export function SuggestionBlock({
   /** Apply it, answering the revision it made. None: it doesn't apply here (a draft, a preview). */
   onApply?: () => Promise<{ version: number }>;
 }) {
-  const [applying, startApply] = React.useTransition();
   const [made, setMade] = React.useState<number | null>(null);
   const [error, setError] = React.useState<string | null>(null);
+  const [apply, applying] = useAction(
+    async () => {
+      if (!onApply) return;
+      setError(null);
+      setMade((await onApply()).version);
+    },
+    (e) => setError(said(e)),
+  );
   if (!old) return <CommentCode body={lines.join("\n")} lang="suggestion" />;
   const applied = state?.applied?.version ?? made;
-  const apply = () => {
-    if (!onApply) return;
-    setError(null);
-    startApply(async () => {
-      try {
-        setMade((await onApply()).version);
-      } catch (e) {
-        setError(said(e));
-      }
-    });
-  };
   return (
     <div className="md-code md-sug" data-state={applied != null ? "applied" : state?.outdated ? "outdated" : undefined}>
       <div className="md-code-head">
@@ -74,7 +71,7 @@ export function SuggestionBlock({
             </span>
           ) : (
             onApply && (
-              <button type="button" className="md-apply" disabled={applying} onClick={apply}>
+              <button type="button" className="md-apply" {...sendingProps(applying)} onClick={apply}>
                 <Check size={13} aria-hidden="true" />
                 {applying ? "Applying…" : "Apply"}
               </button>

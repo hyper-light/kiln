@@ -62,19 +62,19 @@ function QueueBody() {
 }
 
 function Entries({ repo }: { repo: string }) {
-  const entries: QueueEntry[] = useRes({ key: `review/queue/${repo}`, fetch: (s) => reviewApi.queue(repo, s), opts: { on: ["queue", "landed"] } }).data;
-  const [busy, setBusy] = React.useState<string | null>(null);
+  const queue = useRes({ key: `review/queue/${repo}`, fetch: (s) => reviewApi.queue(repo, s), opts: { on: ["queue", "landed"] } });
+  const entries: QueueEntry[] = queue.data;
   if (entries.length === 0) return <p className="rv-sub">Nothing is waiting to land on {repo}.</p>;
-  const out = async (id: string) => {
-    setBusy(id);
-    try {
-      await reviewApi.dequeue(id);
-      invalidate(`review/queue/${repo}`);
-    } catch (e) {
-      toast.error("It stays in the queue", errorMessage(e));
-    } finally {
-      setBusy(null);
-    }
+  // Taken out at once, as the server marks it (W21-R15), and back as it was if that doesn't go.
+  const out = (id: string) => {
+    queue.change((l) => l.map((x) => (x.id === id ? { ...x, state: "cancelled", reason: "cancelled" } : x)));
+    reviewApi.dequeue(id).then(
+      () => invalidate(`review/queue/${repo}`),
+      (e: unknown) => {
+        toast.error("It stays in the queue", errorMessage(e));
+        invalidate(`review/queue/${repo}`);
+      },
+    );
   };
   return (
     <ul className="rv-inbox-list">
@@ -104,7 +104,7 @@ function Entries({ repo }: { repo: string }) {
               {gates.length > 0 && <Gates gates={gates} />}
             </div>
             {(e.state === "queued" || e.state === "testing") && (
-              <Button size="xs" variant="ghost" disabled={busy !== null} onClick={() => void out(e.id)}>
+              <Button size="xs" variant="ghost" onClick={() => out(e.id)}>
                 Take it out
               </Button>
             )}

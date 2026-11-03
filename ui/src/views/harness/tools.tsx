@@ -8,7 +8,11 @@ import { ChevronRight, ExternalLink, Plus, RefreshCw, Trash2 } from "lucide-reac
 import { clientId, type McpServer, type SessionStore, type Skill, type State } from "@/api/harness";
 import { Button } from "@/components/ui/button";
 import { Dialog, DialogContent } from "@/components/ui/dialog";
+import { Loadable } from "@/components/ui/loading";
 import { SearchField } from "@/components/ui/misc";
+import { toast } from "@/components/ui/toast";
+import { useAction } from "@/lib/action";
+import { useSuspenseResource } from "@/lib/resource";
 import { cn } from "@/lib/utils";
 import { Prose } from "./parts";
 
@@ -119,13 +123,17 @@ function ServerRow({ s, store }: { s: McpServer; store: SessionStore }) {
   const [open, setOpen] = React.useState(false);
   const [confirm, setConfirm] = React.useState(false);
   const [authUrl, setAuthUrl] = React.useState<string | null>(null);
-  const signIn = async () => {
-    const v = (await store.request((client) => ({ type: "mcp_auth", name: s.name, client }), 15000)) as { url?: string } | null;
+  // Sign in says it's on its way while its harness is asked for the page (W21-R15). It answers with
+  // the page, or that none is needed (what it says is said), or why it couldn't; no answer says so.
+  const [signIn, signingIn] = useAction(async () => {
+    const v = (await store.request((client) => ({ type: "mcp_auth", name: s.name, client }), 15000)) as { url?: string; ok?: boolean; message?: string; error?: string } | null;
     if (v?.url) {
       setAuthUrl(v.url);
       window.open(v.url, "_blank", "noopener,noreferrer");
-    }
-  };
+    } else if (v && !v.error && v.ok !== false) {
+      if (v.message) toast({ title: v.message, tone: "info" });
+    } else throw new Error(v?.error ?? "Its harness didn't answer.");
+  }, "Couldn't sign in");
   return (
     <li className="hx-mcp" data-status={s.status}>
       <div className="hx-mcp-head">
@@ -142,7 +150,7 @@ function ServerRow({ s, store }: { s: McpServer; store: SessionStore }) {
         </span>
         <span className="hx-mcp-actions">
           {s.status === "needs_auth" && (
-            <Button size="xs" onClick={() => void signIn()}>
+            <Button size="xs" pending={signingIn} onClick={signIn}>
               Sign in
             </Button>
           )}
@@ -253,21 +261,26 @@ export function McpPanel({ state, store }: { state: State | null; store: Session
   );
 }
 
+/** A skill's words, asked of its harness: read through Suspense (kept, and asked again when shown again). */
+function SkillText({ k, store }: { k: Skill; store: SessionStore }) {
+  const text = useSuspenseResource(`harness/skill/${store.id}/${k.source}:${k.name}`, () =>
+    store.request((client) => ({ type: "skill_view", name: k.name, client }), 8000).then((v) => (v as { content?: string } | null)?.content ?? "Couldn't read this skill."),
+  ).data;
+  return <Prose text={text} />;
+}
+
 function SkillRow({ k, store }: { k: Skill; store: SessionStore }) {
-  const [view, setView] = React.useState<string | null>(null);
+  // Read opens at once, the skill's words loading in it (W21-R15).
+  const [reading, setReading] = React.useState(false);
   const [running, setRunning] = React.useState(false);
   const [args, setArgs] = React.useState("");
-  const show = async () => {
-    const v = (await store.request((client) => ({ type: "skill_view", name: k.name, client }), 8000)) as { content?: string } | null;
-    setView(v?.content ?? "Couldn't read this skill.");
-  };
   return (
     <li className="hx-skill">
       <div className="hx-skill-head">
         <code className="hx-skill-name">/{k.name}</code>
         <span className="hx-tag">{k.source}</span>
         <span className="hx-mcp-actions">
-          <button type="button" className="hx-link" onClick={() => void show()}>
+          <button type="button" className="hx-link" onClick={() => setReading(true)}>
             Read
           </button>
           {k.user_invocable && (
@@ -294,11 +307,13 @@ function SkillRow({ k, store }: { k: Skill; store: SessionStore }) {
           </Button>
         </form>
       )}
-      <Dialog open={view !== null} onOpenChange={(o) => !o && setView(null)}>
-        {view !== null && (
+      <Dialog open={reading} onOpenChange={setReading}>
+        {reading && (
           <DialogContent title={`/${k.name}`} eyebrow={`Skill · ${k.source}`} description={k.description}>
             <div className="hx-skill-view">
-              <Prose text={view} />
+              <Loadable label="Loading the skill">
+                <SkillText k={k} store={store} />
+              </Loadable>
             </div>
           </DialogContent>
         )}

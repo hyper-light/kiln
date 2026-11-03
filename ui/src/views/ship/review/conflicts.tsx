@@ -3,12 +3,14 @@
  * conflict's three sides (main's, this change's, and the agent's own resolution marked as the
  * agent's for a person to take), resolved by taking a side — main, this, both, the agent's — or an
  * edit; binary, modify/delete and the rest named and resolved by taking a side, never markers.
- * Taking a side is a React Action on the conflicts endpoints; once each is taken, the gate row's
- * Approve place holds "Commit resolution", which makes the revision.
+ * Taking a side goes to the conflicts endpoints, the side taken saying meanwhile that it's on its way
+ * and the others held (W21-R15); once each is taken, the gate row's Approve place holds "Commit
+ * resolution", which makes the revision.
  */
 import * as React from "react";
 import { BadgeCheck, Check, GitMerge, Pencil, RotateCcw, X } from "lucide-react";
 import { conflictsApi, type Conflict, type ConflictTake } from "@/api/review";
+import { sendingProps, useHold } from "@/lib/action";
 import { invalidate } from "@/lib/resource";
 import "./review.css";
 
@@ -47,20 +49,19 @@ export function ConflictBlock({ cf, n, diffKey, onDone }: { cf: Conflict; n: num
   const [edit, setEdit] = React.useState(false);
   const [text, setText] = React.useState("");
   const [err, setErr] = React.useState<string | null>(null);
-  const [busy, start] = React.useTransition();
-  const run = (f: () => Promise<unknown>) =>
-    start(async () => {
+  // One answer at a time for a conflict: the press that sent it says so, and the rest are held
+  // until it's back.
+  const hold = useHold((e) => setErr(said(e)));
+  const run = (what: string, f: () => Promise<unknown>) =>
+    hold.change(what, async () => {
       setErr(null);
-      try {
-        await f();
-        invalidate("review/");
-        invalidate("ship/");
-        onDone?.();
-      } catch (e) {
-        setErr(said(e));
-      }
+      await f();
+      invalidate("review/");
+      invalidate("ship/");
+      onDone?.();
     });
-  const take = (t: ConflictTake) => run(() => conflictsApi.resolve(diffKey, cf.id, { take: t }));
+  const sending = (what: string) => ({ disabled: hold.held(what), ...sendingProps(hold.doing(what)) });
+  const take = (t: ConflictTake) => run(t, () => conflictsApi.resolve(diffKey, cf.id, { take: t }));
   const text_ = cf.kind === "text";
   const res = cf.resolution;
 
@@ -78,7 +79,7 @@ export function ConflictBlock({ cf, n, diffKey, onDone }: { cf: Conflict; n: num
             {TOOK[res.take]}
             {res.by ? ` · ${res.by.replace(/^user:/, "")}` : ""}
           </span>
-          <button type="button" className="rv-ib" aria-label="Undo" title="Undo" disabled={busy} onClick={() => run(() => conflictsApi.undo(diffKey, cf.id))}>
+          <button type="button" className="rv-ib" aria-label="Undo" title="Undo" {...sending("undo")} onClick={() => run("undo", () => conflictsApi.undo(diffKey, cf.id))}>
             <RotateCcw size={13} aria-hidden="true" />
           </button>
         </div>
@@ -121,7 +122,7 @@ export function ConflictBlock({ cf, n, diffKey, onDone }: { cf: Conflict; n: num
         <div className="rv-edit">
           <textarea className="rv-ta rv-cta" rows={Math.max(4, sideLines(cf.this).length + 1)} value={text} onChange={(e) => setText(e.target.value)} aria-label="The resolution" />
           <div className="rv-btns">
-            <button type="button" className="rv-btn rv-btn-go" disabled={busy} onClick={() => run(() => conflictsApi.resolve(diffKey, cf.id, { take: "edit", text }))}>
+            <button type="button" className="rv-btn rv-btn-go" {...sending("edit")} onClick={() => run("edit", () => conflictsApi.resolve(diffKey, cf.id, { take: "edit", text }))}>
               <Check size={13} aria-hidden="true" />
               <span>Use</span>
             </button>
@@ -140,7 +141,7 @@ export function ConflictBlock({ cf, n, diffKey, onDone }: { cf: Conflict; n: num
                   key={t}
                   type="button"
                   data-rec={t === "agent" || undefined}
-                  disabled={busy}
+                  {...sending(t)}
                   title={t === "agent" ? "the agent's resolution — a person takes it" : undefined}
                   onClick={() => take(t)}
                 >
@@ -154,7 +155,6 @@ export function ConflictBlock({ cf, n, diffKey, onDone }: { cf: Conflict; n: num
               className="rv-ib"
               aria-label="Edit"
               title="Edit"
-              disabled={busy}
               onClick={() => {
                 setText(sideLines(cf.this).join("\n"));
                 setEdit(true);

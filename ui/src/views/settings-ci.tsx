@@ -12,6 +12,7 @@ import { Hold } from "@/components/ui/hold";
 import { Loadable } from "@/components/ui/loading";
 import { Confirm, SelectField } from "@/components/ui/misc";
 import { SettingRow, SettingsGroup } from "@/components/ui/settings";
+import { useAction, useActions } from "@/lib/action";
 import { reposRes, useRes } from "@/lib/data";
 import { relativeTime } from "@/lib/format";
 import { errorMessage } from "@/lib/hooks";
@@ -112,25 +113,31 @@ function SecretsList({ scope, title }: { scope: string; title?: string }) {
   const list: CiSecretMeta[] = res.data.secrets;
   const [name, setName] = React.useState("");
   const [value, setValue] = React.useState("");
-  const [busy, setBusy] = React.useState(false);
   const [problem, setProblem] = React.useState<string | null>(null);
   const [removing, setRemoving] = React.useState<string | null>(null);
-  const act = async (f: () => Promise<unknown>) => {
-    setBusy(true);
-    setProblem(null);
-    try {
-      await f();
-      res.reload();
-      return true;
-    } catch (e) {
-      setProblem(errorMessage(e));
-      return false;
-    } finally {
-      setBusy(false);
-    }
-  };
   const upper = name.trim().toUpperCase();
   const ready = NAME.test(name.trim()) && value.length > 0;
+  // Its answer empties the form, so the form is held as it is until then (W21-R15).
+  const [save, saving] = useAction(
+    async () => {
+      setProblem(null);
+      await ci.setSecret(scope, upper, value);
+      res.reload();
+      setName("");
+      setValue("");
+    },
+    (e) => setProblem(errorMessage(e)),
+  );
+  // Gone at once (W21-R15), and back, saying why, if the server keeps it.
+  const remove = (secret: string) => {
+    setProblem(null);
+    setRemoving(null);
+    res.change((d) => ({ ...d, secrets: d.secrets.filter((x) => x.name !== secret) }));
+    ci.deleteSecret(scope, secret).catch((e: unknown) => {
+      setProblem(errorMessage(e));
+      res.reload();
+    });
+  };
   return (
     <SettingsGroup id="ci.secrets.list" title={title ?? `Secrets in ${scope}`} words="secret value set remove">
       {list.length === 0 ? (
@@ -145,7 +152,7 @@ function SecretsList({ scope, title }: { scope: string; title?: string }) {
                   {x.from ? `from ${x.from}` : `set ${relativeTime(x.updated_at)}`} · {x.last_used_at ? `last used ${relativeTime(x.last_used_at)}` : "never used"}
                 </span>
                 <span className="st-item-acts">
-                  <Button size="xs" variant="ghost" disabled={busy} aria-expanded={removing === x.name} onClick={() => setRemoving(removing === x.name ? null : x.name)}>
+                  <Button size="xs" variant="ghost" aria-expanded={removing === x.name} onClick={() => setRemoving(removing === x.name ? null : x.name)}>
                     Remove
                   </Button>
                 </span>
@@ -157,10 +164,10 @@ function SecretsList({ scope, title }: { scope: string; title?: string }) {
                   className="mt-3"
                   actions={
                     <>
-                      <Button size="xs" variant="primary" disabled={busy} onClick={() => void act(() => ci.deleteSecret(scope, x.name)).then((ok) => ok && setRemoving(null))}>
+                      <Button size="xs" variant="primary" onClick={() => remove(x.name)}>
                         Remove {x.name}
                       </Button>
-                      <Button size="xs" variant="ghost" disabled={busy} onClick={() => setRemoving(null)}>
+                      <Button size="xs" variant="ghost" onClick={() => setRemoving(null)}>
                         Keep it
                       </Button>
                     </>
@@ -177,12 +184,9 @@ function SecretsList({ scope, title }: { scope: string; title?: string }) {
         noValidate
         className="mt-4"
         autoComplete="off"
-        onSubmit={async (e) => {
+        onSubmit={(e) => {
           e.preventDefault();
-          if (ready && (await act(() => ci.setSecret(scope, upper, value)))) {
-            setName("");
-            setValue("");
-          }
+          if (ready) save();
         }}
       >
         <div className="st-fields">
@@ -191,7 +195,7 @@ function SecretsList({ scope, title }: { scope: string; title?: string }) {
               Name
             </label>
             <div className="field">
-              <input id="st-secret-name" type="text" spellCheck={false} autoCapitalize="characters" placeholder="DEPLOY_KEY" value={name} disabled={busy} onChange={(e) => setName(e.target.value)} />
+              <input id="st-secret-name" type="text" spellCheck={false} autoCapitalize="characters" placeholder="DEPLOY_KEY" value={name} disabled={saving} onChange={(e) => setName(e.target.value)} />
             </div>
           </div>
           <div>
@@ -199,13 +203,13 @@ function SecretsList({ scope, title }: { scope: string; title?: string }) {
               Value
             </label>
             <div className="field">
-              <input id="st-secret-value" type="password" autoComplete="new-password" value={value} disabled={busy} onChange={(e) => setValue(e.target.value)} />
+              <input id="st-secret-value" type="password" autoComplete="new-password" value={value} disabled={saving} onChange={(e) => setValue(e.target.value)} />
             </div>
           </div>
         </div>
         <div className="mt-3 flex items-center justify-end gap-3">
           {list.some((x) => x.name === upper) && <span className="st-note mt-0">Saving replaces {upper}&rsquo;s value.</span>}
-          <Button type="submit" size="xs" variant="secondary" disabled={busy || !ready}>
+          <Button type="submit" size="xs" variant="secondary" pending={saving} disabled={!ready}>
             Save the secret
           </Button>
         </div>
@@ -224,24 +228,30 @@ function VariablesList({ scope, title }: { scope: string; title?: string }) {
   const list: CiVariable[] = res.data.variables;
   const [name, setName] = React.useState("");
   const [value, setValue] = React.useState("");
-  const [busy, setBusy] = React.useState(false);
   const [problem, setProblem] = React.useState<string | null>(null);
-  const act = async (f: () => Promise<unknown>) => {
-    setBusy(true);
-    setProblem(null);
-    try {
-      await f();
-      res.reload();
-      return true;
-    } catch (e) {
-      setProblem(errorMessage(e));
-      return false;
-    } finally {
-      setBusy(false);
-    }
-  };
   const upper = name.trim().toUpperCase();
   const ready = NAME.test(name.trim());
+  // Its answer empties the form, so the form is held as it is until then (W21-R15).
+  const [save, saving] = useAction(
+    async () => {
+      setProblem(null);
+      await ci.setVariable(scope, upper, value);
+      res.reload();
+      setName("");
+      setValue("");
+    },
+    (e) => setProblem(errorMessage(e)),
+  );
+  // A Remove says it's on its way and its row goes with the answer (W21-R15): gone at once, the
+  // next row would slide under a second click and be removed too.
+  const [remove, removing] = useActions(
+    async (variable: string) => {
+      setProblem(null);
+      await ci.deleteVariable(scope, variable);
+      res.change((d) => ({ ...d, variables: d.variables.filter((x) => x.name !== variable) }));
+    },
+    (e) => setProblem(errorMessage(e)),
+  );
   return (
     <SettingsGroup id="ci.variables.list" title={title ?? `Variables in ${scope}`} words="variable vars value set edit remove">
       {list.length === 0 ? (
@@ -257,7 +267,7 @@ function VariablesList({ scope, title }: { scope: string; title?: string }) {
                   <Button
                     size="xs"
                     variant="ghost"
-                    disabled={busy}
+                    disabled={saving}
                     onClick={() => {
                       setName(x.name);
                       setValue(x.value);
@@ -265,7 +275,7 @@ function VariablesList({ scope, title }: { scope: string; title?: string }) {
                   >
                     Edit
                   </Button>
-                  <Button size="xs" variant="ghost" disabled={busy} onClick={() => void act(() => ci.deleteVariable(scope, x.name))}>
+                  <Button size="xs" variant="ghost" pending={removing(x.name)} disabled={saving && upper === x.name} onClick={() => remove(x.name)}>
                     Remove
                   </Button>
                 </span>
@@ -277,12 +287,9 @@ function VariablesList({ scope, title }: { scope: string; title?: string }) {
       <form
         noValidate
         className="mt-4"
-        onSubmit={async (e) => {
+        onSubmit={(e) => {
           e.preventDefault();
-          if (ready && (await act(() => ci.setVariable(scope, upper, value)))) {
-            setName("");
-            setValue("");
-          }
+          if (ready) save();
         }}
       >
         <div className="st-fields">
@@ -291,7 +298,7 @@ function VariablesList({ scope, title }: { scope: string; title?: string }) {
               Name
             </label>
             <div className="field">
-              <input id="st-var-name" type="text" spellCheck={false} autoCapitalize="characters" placeholder="REGION" value={name} disabled={busy} onChange={(e) => setName(e.target.value)} />
+              <input id="st-var-name" type="text" spellCheck={false} autoCapitalize="characters" placeholder="REGION" value={name} disabled={saving} onChange={(e) => setName(e.target.value)} />
             </div>
           </div>
           <div>
@@ -299,12 +306,12 @@ function VariablesList({ scope, title }: { scope: string; title?: string }) {
               Value
             </label>
             <div className="field">
-              <input id="st-var-value" type="text" spellCheck={false} value={value} disabled={busy} onChange={(e) => setValue(e.target.value)} />
+              <input id="st-var-value" type="text" spellCheck={false} value={value} disabled={saving} onChange={(e) => setValue(e.target.value)} />
             </div>
           </div>
         </div>
         <div className="mt-3 flex justify-end">
-          <Button type="submit" size="xs" variant="secondary" disabled={busy || !ready}>
+          <Button type="submit" size="xs" variant="secondary" pending={saving} disabled={!ready || removing(upper)}>
             Save the variable
           </Button>
         </div>

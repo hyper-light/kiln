@@ -15,10 +15,11 @@ import { Loadable } from "@/components/ui/loading";
 import { PageIntro, SelectField, TextField } from "@/components/ui/misc";
 import { Segmented } from "@/components/ui/tabs";
 import { toast } from "@/components/ui/toast";
+import { useAction } from "@/lib/action";
 import { useRes } from "@/lib/data";
 import { errorMessage } from "@/lib/hooks";
 import { invalidate } from "@/lib/resource";
-import { downtimesRes, monitorsRes, ObserveNav } from "./parts";
+import { downtimesRes, HeldFields, monitorsRes, ObserveNav, useOpening } from "./parts";
 
 const TONE: Record<DowntimeStatus, string> = { active: "paused", scheduled: "pending", ended: "skipped", canceled: "cancelled" };
 const STATUS: Record<DowntimeStatus, string> = { active: "Holding", scheduled: "Scheduled", ended: "Ended", canceled: "Canceled" };
@@ -301,146 +302,142 @@ function Check({ label, checked, onChange }: { label: string; checked: boolean; 
 function DowntimeDialog({ downtime, onClose }: { downtime: Downtime | null; onClose: () => void }) {
   const monitors = useRes(monitorsRes).data;
   const [f, setF] = React.useState<Form>(() => formOf(downtime, monitors[0]?.id ?? ""));
-  const [busy, setBusy] = React.useState(false);
+  const opening = useOpening(f);
   const set = (patch: Partial<Form>) => setF((old) => ({ ...old, ...patch }));
   const whoOk = f.by === "monitor" ? f.monitor !== "" : list(f.tags).length > 0;
   const onceOk = f.kind !== "once" || !f.start || !f.end || new Date(f.end) > new Date(f.start);
   const recurringOk = f.kind !== "recurring" || (ruleOf(f) !== "" && /^\d+[wdhms](\d+[wdhms])*$/.test(f.duration.trim()) && f.at.length >= 16 && (f.freq !== "WEEKLY" || f.days.length > 0));
   const ok = whoOk && onceOk && recurringOk;
-  const save = async () => {
-    setBusy(true);
-    try {
-      if (downtime) await observeApi.updateDowntime(downtime.id, bodyOf(f));
-      else await observeApi.createDowntime(bodyOf(f));
-      invalidate("observe/downtimes");
-      invalidate("observe/monitors");
-      onClose();
-    } catch (err) {
-      toast({ title: "Couldn't save it", description: errorMessage(err), tone: "failed" });
-    } finally {
-      setBusy(false);
-    }
-  };
+  const [save, saving] = useAction(async () => {
+    if (downtime) await observeApi.updateDowntime(downtime.id, bodyOf(f));
+    else await observeApi.createDowntime(bodyOf(f));
+    invalidate("observe/downtimes");
+    invalidate("observe/monitors");
+    if (opening.still(f)) onClose();
+  }, "Couldn't save it");
   return (
     <Dialog open onOpenChange={(o) => !o && onClose()}>
       <DialogContent title={downtime ? "Edit the downtime" : "New downtime"} description="While it holds, the groups it names say nothing; their changes are still events.">
         <form
+          ref={opening.ref}
           className="space-y-4"
           onSubmit={(e) => {
             e.preventDefault();
-            if (ok) void save();
+            if (ok) save();
           }}
         >
-          <div className="space-y-2">
-            <div className="field-label">Holds</div>
-            <Segmented
-              label="Which monitors"
-              value={f.by}
-              onChange={(v) => set({ by: v as Form["by"] })}
-              options={[
-                { value: "monitor", label: "A monitor" },
-                { value: "tags", label: "Monitors tagged" },
-              ]}
-            />
-            {f.by === "monitor" ? (
-              <SelectField label="Monitor" hideLabel value={f.monitor} onChange={(v) => set({ monitor: v })} options={monitors.map((m) => ({ value: m.id, label: m.name }))} />
-            ) : (
-              <TextField
-                label="Tags"
-                value={f.tags}
-                onChange={(e) => set({ tags: e.target.value })}
-                placeholder="team:pay, env:prod"
-                hint="Every monitor that carries all of them."
-                spellCheck={false}
+          <HeldFields held={saving && !downtime}>
+            <div className="space-y-2">
+              <div className="field-label">Holds</div>
+              <Segmented
+                label="Which monitors"
+                value={f.by}
+                onChange={(v) => set({ by: v as Form["by"] })}
+                options={[
+                  { value: "monitor", label: "A monitor" },
+                  { value: "tags", label: "Monitors tagged" },
+                ]}
               />
-            )}
-          </div>
-          <TextField
-            label="Scope (optional)"
-            value={f.scope}
-            onChange={(e) => set({ scope: e.target.value })}
-            placeholder="host:(web-1 OR web-2) -env:dev"
-            hint="The groups held; every one when none."
-            spellCheck={false}
-          />
-          <div className="space-y-3">
-            <div className="field-label">When</div>
-            <Segmented
-              label="When"
-              value={f.kind}
-              onChange={(v) => set({ kind: v as Form["kind"] })}
-              options={[
-                { value: "once", label: "Once" },
-                { value: "recurring", label: "Recurring" },
-              ]}
-            />
-            {f.kind === "once" ? (
-              <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
-                <TextField label="From" type="datetime-local" value={f.start} onChange={(e) => set({ start: e.target.value })} hint="Now when empty." />
-                <TextField label="To" type="datetime-local" value={f.end} onChange={(e) => set({ end: e.target.value })} hint={!onceOk ? "After it starts" : "Until canceled when empty."} />
-              </div>
-            ) : (
-              <>
-                <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
-                  <SelectField
-                    label="Repeats"
-                    value={f.freq}
-                    onChange={(v) => set({ freq: v as Form["freq"], rrule: v === "custom" && !f.rrule ? ruleOf(f) : f.rrule })}
-                    options={[
-                      { value: "DAILY", label: "Daily" },
-                      { value: "WEEKLY", label: "Weekly" },
-                      { value: "MONTHLY", label: "Monthly, on the day it starts" },
-                      { value: "custom", label: "A rule of my own (RFC 5545)" },
-                    ]}
-                  />
-                  <TextField label="Starting" type="datetime-local" value={f.at} onChange={(e) => set({ at: e.target.value })} hint="Its first, in the timezone." />
-                </div>
-                {f.freq === "WEEKLY" && (
-                  <div className="flex flex-wrap gap-1" role="group" aria-label="On">
-                    {DAYS.map((d) => (
-                      <Button
-                        key={d}
-                        variant={f.days.includes(d) ? "secondary" : "ghost"}
-                        size="xs"
-                        aria-pressed={f.days.includes(d)}
-                        onClick={() => set({ days: f.days.includes(d) ? f.days.filter((x) => x !== d) : [...f.days, d] })}
-                      >
-                        {DAY_NAME[d]}
-                      </Button>
-                    ))}
-                  </div>
-                )}
-                {f.freq === "custom" && <TextField label="Rule" value={f.rrule} onChange={(e) => set({ rrule: e.target.value })} placeholder="FREQ=MONTHLY;BYDAY=2TU" spellCheck={false} />}
-                <div className="grid grid-cols-1 gap-3 sm:grid-cols-3">
-                  <TextField label="For" value={f.duration} onChange={(e) => set({ duration: e.target.value })} placeholder="2h" hint="1h30m, 4h, 1d" spellCheck={false} />
-                  <TextField label="Timezone" value={f.timezone} onChange={(e) => set({ timezone: e.target.value })} placeholder="UTC" spellCheck={false} />
-                  {f.freq !== "custom" && <TextField label="Until (optional)" type="date" value={f.until} onChange={(e) => set({ until: e.target.value })} />}
-                </div>
-              </>
-            )}
-          </div>
-          <TextField label="Message (optional)" value={f.message} onChange={(e) => set({ message: e.target.value })} placeholder="Patching the web hosts" />
-          <div className="space-y-2">
-            <div className="field-label">As it ends, tell what is</div>
-            <div className="flex flex-wrap gap-4">
-              {(
-                [
-                  ["alert", "Alert"],
-                  ["warn", "Warn"],
-                  ["no data", "No data"],
-                ] as const
-              ).map(([s, label]) => (
-                <Check key={s} label={label} checked={f.endStates.includes(s)} onChange={(v) => set({ endStates: v ? [...f.endStates, s] : f.endStates.filter((x) => x !== s) })} />
-              ))}
+              {f.by === "monitor" ? (
+                <SelectField label="Monitor" hideLabel value={f.monitor} onChange={(v) => set({ monitor: v })} options={monitors.map((m) => ({ value: m.id, label: m.name }))} />
+              ) : (
+                <TextField
+                  label="Tags"
+                  value={f.tags}
+                  onChange={(e) => set({ tags: e.target.value })}
+                  placeholder="team:pay, env:prod"
+                  hint="Every monitor that carries all of them."
+                  spellCheck={false}
+                />
+              )}
             </div>
-            <Check label="Tell it when canceled too" checked={f.onCancel} onChange={(v) => set({ onCancel: v })} />
-            <Check label="Keep each group's first recovery after quiet" checked={f.quietRecovery} onChange={(v) => set({ quietRecovery: v })} />
-          </div>
+            <TextField
+              label="Scope (optional)"
+              value={f.scope}
+              onChange={(e) => set({ scope: e.target.value })}
+              placeholder="host:(web-1 OR web-2) -env:dev"
+              hint="The groups held; every one when none."
+              spellCheck={false}
+            />
+            <div className="space-y-3">
+              <div className="field-label">When</div>
+              <Segmented
+                label="When"
+                value={f.kind}
+                onChange={(v) => set({ kind: v as Form["kind"] })}
+                options={[
+                  { value: "once", label: "Once" },
+                  { value: "recurring", label: "Recurring" },
+                ]}
+              />
+              {f.kind === "once" ? (
+                <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
+                  <TextField label="From" type="datetime-local" value={f.start} onChange={(e) => set({ start: e.target.value })} hint="Now when empty." />
+                  <TextField label="To" type="datetime-local" value={f.end} onChange={(e) => set({ end: e.target.value })} hint={!onceOk ? "After it starts" : "Until canceled when empty."} />
+                </div>
+              ) : (
+                <>
+                  <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
+                    <SelectField
+                      label="Repeats"
+                      value={f.freq}
+                      onChange={(v) => set({ freq: v as Form["freq"], rrule: v === "custom" && !f.rrule ? ruleOf(f) : f.rrule })}
+                      options={[
+                        { value: "DAILY", label: "Daily" },
+                        { value: "WEEKLY", label: "Weekly" },
+                        { value: "MONTHLY", label: "Monthly, on the day it starts" },
+                        { value: "custom", label: "A rule of my own (RFC 5545)" },
+                      ]}
+                    />
+                    <TextField label="Starting" type="datetime-local" value={f.at} onChange={(e) => set({ at: e.target.value })} hint="Its first, in the timezone." />
+                  </div>
+                  {f.freq === "WEEKLY" && (
+                    <div className="flex flex-wrap gap-1" role="group" aria-label="On">
+                      {DAYS.map((d) => (
+                        <Button
+                          key={d}
+                          variant={f.days.includes(d) ? "secondary" : "ghost"}
+                          size="xs"
+                          aria-pressed={f.days.includes(d)}
+                          onClick={() => set({ days: f.days.includes(d) ? f.days.filter((x) => x !== d) : [...f.days, d] })}
+                        >
+                          {DAY_NAME[d]}
+                        </Button>
+                      ))}
+                    </div>
+                  )}
+                  {f.freq === "custom" && <TextField label="Rule" value={f.rrule} onChange={(e) => set({ rrule: e.target.value })} placeholder="FREQ=MONTHLY;BYDAY=2TU" spellCheck={false} />}
+                  <div className="grid grid-cols-1 gap-3 sm:grid-cols-3">
+                    <TextField label="For" value={f.duration} onChange={(e) => set({ duration: e.target.value })} placeholder="2h" hint="1h30m, 4h, 1d" spellCheck={false} />
+                    <TextField label="Timezone" value={f.timezone} onChange={(e) => set({ timezone: e.target.value })} placeholder="UTC" spellCheck={false} />
+                    {f.freq !== "custom" && <TextField label="Until (optional)" type="date" value={f.until} onChange={(e) => set({ until: e.target.value })} />}
+                  </div>
+                </>
+              )}
+            </div>
+            <TextField label="Message (optional)" value={f.message} onChange={(e) => set({ message: e.target.value })} placeholder="Patching the web hosts" />
+            <div className="space-y-2">
+              <div className="field-label">As it ends, tell what is</div>
+              <div className="flex flex-wrap gap-4">
+                {(
+                  [
+                    ["alert", "Alert"],
+                    ["warn", "Warn"],
+                    ["no data", "No data"],
+                  ] as const
+                ).map(([s, label]) => (
+                  <Check key={s} label={label} checked={f.endStates.includes(s)} onChange={(v) => set({ endStates: v ? [...f.endStates, s] : f.endStates.filter((x) => x !== s) })} />
+                ))}
+              </div>
+              <Check label="Tell it when canceled too" checked={f.onCancel} onChange={(v) => set({ onCancel: v })} />
+              <Check label="Keep each group's first recovery after quiet" checked={f.quietRecovery} onChange={(v) => set({ quietRecovery: v })} />
+            </div>
+          </HeldFields>
           <div className="flex justify-end gap-2">
             <Button variant="ghost" onClick={onClose}>
               Cancel
             </Button>
-            <Button type="submit" disabled={!ok || busy}>
+            <Button type="submit" disabled={!ok} pending={saving}>
               {downtime ? "Save" : "Make it"}
             </Button>
           </div>

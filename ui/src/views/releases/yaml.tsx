@@ -32,9 +32,10 @@ export function yamlMap(text: string): { value?: Record<string, unknown>; error?
 /** A value as YAML, as people write it. */
 export const toYaml = (v: unknown) => (v === undefined || v === null || (typeof v === "object" && Object.keys(v).length === 0) ? "" : stringify(v, { lineWidth: 0 }));
 
-export function YamlEditor({ value, onChange, label }: { value: string; onChange: (text: string) => void; label: string }) {
+/** `held`: what it's saved to is on its way, and the answer starts it again: it takes nothing typed meanwhile (W21-R15). */
+export function YamlEditor({ value, onChange, label, held = false }: { value: string; onChange: (text: string) => void; label: string; held?: boolean }) {
   return (
-    <div className="rel-yaml">
+    <div className="rel-yaml" inert={held} data-held={held || undefined}>
       <React.Suspense fallback={<pre className="rel-pre">{value}</pre>}>
         <CodeEditor value={value} onChange={onChange} lint={yamlLint} label={label} />
       </React.Suspense>

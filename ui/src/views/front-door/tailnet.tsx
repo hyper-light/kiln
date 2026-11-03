@@ -10,6 +10,7 @@ import { Check, Copy } from "lucide-react";
 import { tailscaleApi } from "@/api/client";
 import type { FrontDoorFix, FrontDoorSettings, FrontDoorState, FrontDoorStatus, TailnetStatus } from "@/api/types";
 import { Button } from "@/components/ui/button";
+import { useAction } from "@/lib/action";
 import { errorMessage } from "@/lib/hooks";
 import { invalidate, useSuspenseResource } from "@/lib/resource";
 import { copyText } from "@/views/terminal/clipboard";
@@ -125,9 +126,7 @@ export function TailnetDetails({ settings, status, dnsOn }: { settings: FrontDoo
                 <li key={n} className="tn-route" data-state={state}>
                   <i className="fd-dot" data-state={state} aria-hidden="true" />
                   <code className="tn-name">{n}</code>
-                  <span className="tn-to">
-                    {r?.here ? `→ this runner${r.exit_node ? ", with exit nodes too" : ""}` : r?.to.length ? `→ ${r.to.join(", ")} (not this runner)` : "→ nowhere yet"}
-                  </span>
+                  <span className="tn-to">{r?.here ? `→ this runner${r.exit_node ? ", with exit nodes too" : ""}` : r?.to.length ? `→ ${r.to.join(", ")} (not this runner)` : "→ nowhere yet"}</span>
                 </li>
               );
             })}
@@ -162,22 +161,9 @@ export function TailnetDetails({ settings, status, dnsOn }: { settings: FrontDoo
 }
 
 function Forget({ onDone }: { onDone: () => void }) {
-  const [busy, setBusy] = React.useState(false);
+  const [forget, forgetting] = useAction(() => tailscaleApi.forget().then(onDone), "Couldn't forget the key");
   return (
-    <Button
-      type="button"
-      size="xs"
-      variant="ghost"
-      className="fd-btn"
-      disabled={busy}
-      onClick={() => {
-        setBusy(true);
-        void tailscaleApi
-          .forget()
-          .then(onDone)
-          .finally(() => setBusy(false));
-      }}
-    >
+    <Button type="button" size="xs" variant="ghost" className="fd-btn" pending={forgetting} onClick={forget}>
       Forget the key
     </Button>
   );
@@ -187,48 +173,36 @@ function Forget({ onDone }: { onDone: () => void }) {
 function Setup({ names, nameserver, onConnected }: { names: string[]; nameserver: string | null; onConnected: () => void }) {
   const [secret, setSecret] = React.useState("");
   const [clientId, setClientId] = React.useState("");
-  const [busy, setBusy] = React.useState(false);
   const [note, setNote] = React.useState<{ tone: "ok" | "error"; text: string } | null>(null);
   const secretId = React.useId();
   const idId = React.useId();
-  const connect = async () => {
-    setBusy(true);
-    setNote(null);
-    try {
-      const v = await tailscaleApi.connect(secret, clientId);
-      setSecret("");
-      setClientId("");
+  const [connect, checking] = useAction(
+    async () => {
+      setNote(null);
+      const [sentSecret, sentId] = [secret, clientId];
+      const v = await tailscaleApi.connect(sentSecret, sentId);
+      // Cleared only if they still hold what was sent: what's typed after the press stays (W21-R15).
+      setSecret((t) => (t === sentSecret ? "" : t));
+      setClientId((t) => (t === sentId ? "" : t));
       setNote({ tone: v.error ? "error" : "ok", text: v.error ?? "Connected: kiln sets the tailnet's DNS now." });
       onConnected();
-    } catch (e) {
-      setNote({ tone: "error", text: errorMessage(e) });
-    } finally {
-      setBusy(false);
-    }
-  };
+    },
+    (e) => setNote({ tone: "error", text: errorMessage(e) }),
+  );
   return (
     <div className="tn-setup">
       <div className="tn-way">
         <h4 className="fd-key">Let kiln set it</h4>
         <p className="fd-hint">
-          One key covers every runner: in Tailscale&apos;s admin console, Settings → Trust credentials, make an OAuth client with the <b>DNS</b> write scope and paste its secret
-          here (an API access token works too, until it expires).
+          One key covers every runner: in Tailscale&apos;s admin console, Settings → Trust credentials, make an OAuth client with the <b>DNS</b> write scope and paste its secret here (an API access
+          token works too, until it expires).
         </p>
         <div className="fd-grid">
           <div className="fd-field">
             <label className="fd-key" htmlFor={secretId}>
               Client secret
             </label>
-            <input
-              id={secretId}
-              className="fd-input"
-              type="password"
-              value={secret}
-              placeholder="tskey-client-…"
-              autoComplete="off"
-              spellCheck={false}
-              onChange={(e) => setSecret(e.target.value)}
-            />
+            <input id={secretId} className="fd-input" type="password" value={secret} placeholder="tskey-client-…" autoComplete="off" spellCheck={false} onChange={(e) => setSecret(e.target.value)} />
           </div>
           <div className="fd-field">
             <label className="fd-key" htmlFor={idId}>
@@ -238,8 +212,8 @@ function Setup({ names, nameserver, onConnected }: { names: string[]; nameserver
           </div>
         </div>
         <div className="fd-actions">
-          <Button type="button" size="xs" variant="secondary" className="fd-btn" disabled={busy || !secret.trim()} onClick={() => void connect()}>
-            {busy ? "Checking…" : "Connect"}
+          <Button type="button" size="xs" variant="secondary" className="fd-btn" pending={checking} disabled={!secret.trim()} onClick={connect}>
+            {checking ? "Checking…" : "Connect"}
           </Button>
           <span className="fd-msg" role="status" data-tone={note?.tone ?? "quiet"}>
             {note?.text ?? "Tried with Tailscale before it is kept; never shown again."}

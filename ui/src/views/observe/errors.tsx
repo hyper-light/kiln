@@ -11,6 +11,7 @@ import { Loadable } from "@/components/ui/loading";
 import { Crumbs, Facts, PageIntro, Panel } from "@/components/ui/misc";
 import { Segmented } from "@/components/ui/tabs";
 import { toast } from "@/components/ui/toast";
+import { useAction } from "@/lib/action";
 import { useRes, type Res } from "@/lib/data";
 import { relativeTime } from "@/lib/format";
 import { errorMessage } from "@/lib/hooks";
@@ -165,15 +166,19 @@ function IssueView({ id, range, onRange }: { id: string; range: Range; onRange: 
   const res = useRes(issueRes(id, range));
   const d = res.data;
   const i = d.issue;
-  const setStatus = async (status: IssueStatus) => {
+  // Its status shown at once (W21-R15), and put back if the server refuses. The next change waits
+  // for this one's answer, so an answer never undoes a later change.
+  const [setStatus, changing] = useAction(async (status: IssueStatus) => {
+    res.change((prev) => ({ ...prev, issue: { ...prev.issue, status } }));
     try {
       const after = await observeApi.setIssueStatus(i.id, status);
       res.setData((prev) => ({ ...prev, issue: { ...after, errors: prev.issue.errors } }));
       invalidate("observe/errors");
     } catch (e) {
       toast({ title: "Couldn't change the issue's status", description: errorMessage(e), tone: "failed" });
+      invalidate(issueRes(id, range).key);
     }
-  };
+  });
   const stack = d.latest?.attributes["error.stack"] ?? d.latest?.attributes["exception.stacktrace"] ?? "";
   const filter = `issue.id:${i.id}`;
   return (
@@ -193,7 +198,13 @@ function IssueView({ id, range, onRange }: { id: string; range: Range; onRange: 
       </header>
       <div className="mb-5 flex flex-wrap items-center gap-3">
         <RangePicker value={range} onChange={onRange} />
-        <Segmented label="Its status" value={i.status} onChange={(s) => void setStatus(s)} options={FILTERS.filter((f): f is { value: IssueStatus; label: string } => f.value !== "all")} />
+        <Segmented
+          label="Its status"
+          value={i.status}
+          onChange={setStatus}
+          pending={changing ? i.status : null}
+          options={FILTERS.filter((f): f is { value: IssueStatus; label: string } => f.value !== "all")}
+        />
       </div>
       <div className="space-y-6">
         <Facts

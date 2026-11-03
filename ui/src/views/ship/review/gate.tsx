@@ -11,6 +11,7 @@
 import * as React from "react";
 import { BadgeCheck, Check, CircleQuestionMark, Feather, GitMerge, OctagonMinus, TriangleAlert, X } from "lucide-react";
 import { conflictsApi, reviewApi, verdictsRes, type Readiness, type ReviewGate } from "@/api/review";
+import { sendingProps, useAction } from "@/lib/action";
 import { useRes } from "@/lib/data";
 import { invalidate } from "@/lib/resource";
 import "./review.css";
@@ -71,7 +72,6 @@ export function GateRow({
   const [ask, setAsk] = React.useState(false);
   const [note, setNote] = React.useState<{ k: string; t: string } | null>(null);
   const carried = useRes(verdictsRes(diffKey)).data.verdicts.filter((v) => v.action === "accept" && v.standing === "carried" && v.carried?.said);
-  const [busy, start] = React.useTransition();
   const [err, setErr] = React.useState<string | null>(null);
 
   const chips = (
@@ -101,34 +101,30 @@ export function GateRow({
     </span>
   );
 
-  const commit = () =>
-    start(async () => {
+  const [commit, committing] = useAction(
+    async () => {
       setErr(null);
-      try {
-        const done = await conflictsApi.commit(diffKey);
-        invalidate("review/");
-        invalidate("ship/");
-        setNote({ k: "ok", t: `v${done.version} · conflicts resolved` });
-        onApprove?.();
-      } catch (e) {
-        setErr(said(e));
-      }
-    });
+      const done = await conflictsApi.commit(diffKey);
+      invalidate("review/");
+      invalidate("ship/");
+      setNote({ k: "ok", t: `v${done.version} · conflicts resolved` });
+      onApprove?.();
+    },
+    (e) => setErr(said(e)),
+  );
 
-  const approve = (force: boolean) =>
-    start(async () => {
+  const [approve, approving] = useAction(
+    async (force: boolean) => {
       setErr(null);
-      try {
-        const r = await reviewApi.review(diffKey, "accept", "", force);
-        invalidate("review/");
-        invalidate("ship/");
-        setAsk(false);
-        setNote({ k: gate?.note ? "nit" : "ok", t: r.note ?? "Approved" });
-        onApprove?.();
-      } catch (e) {
-        setErr(said(e));
-      }
-    });
+      const r = await reviewApi.review(diffKey, "accept", "", force);
+      invalidate("review/");
+      invalidate("ship/");
+      setAsk(false);
+      setNote({ k: gate?.note ? "nit" : "ok", t: r.note ?? "Approved" });
+      onApprove?.();
+    },
+    (e) => setErr(said(e)),
+  );
 
   const held = gate?.verdict === "hold" || conflicts.unresolved > 0;
   const holdWhy =
@@ -139,7 +135,7 @@ export function GateRow({
   let action: React.ReactNode;
   if (conflicts.total > 0 && conflicts.unresolved === 0 && conflicts.ready)
     action = (
-      <button type="button" className="rv-btn rv-btn-go" disabled={busy} onClick={commit}>
+      <button type="button" className="rv-btn rv-btn-go" {...sendingProps(committing)} onClick={commit}>
         <Check size={13} aria-hidden="true" />
         <span>Commit resolution</span>
       </button>
@@ -149,7 +145,8 @@ export function GateRow({
       <button
         type="button"
         className="rv-btn rv-btn-go"
-        disabled={busy || held || !!superseded}
+        disabled={held || !!superseded}
+        {...sendingProps(approving)}
         title={superseded ? `Superseded by ${superseded}` : held ? holdWhy : undefined}
         onClick={() => (gate?.verdict === "warn" && !ask ? setAsk(true) : approve(gate?.verdict === "warn"))}
       >
@@ -189,7 +186,7 @@ export function GateRow({
         <div className="rv-note" data-k="issue">
           <TriangleAlert size={13} aria-hidden="true" />
           <span>{gate.warning}</span>
-          <button type="button" className="rv-btn rv-btn-go" disabled={busy} onClick={() => approve(true)}>
+          <button type="button" className="rv-btn rv-btn-go" {...sendingProps(approving)} onClick={() => approve(true)}>
             Approve anyway
           </button>
           <button type="button" className="rv-ib" aria-label="Cancel" onClick={() => setAsk(false)}>
@@ -220,7 +217,16 @@ export function GateRow({
 export function HostGateRow({ approved, onApprove, busy, land }: { approved: boolean; onApprove: () => Promise<void>; busy?: boolean; land?: { state: string; onLand: () => Promise<unknown> } }) {
   const [err, setErr] = React.useState<string | null>(null);
   const [done, setDone] = React.useState(approved);
-  const [go, start] = React.useTransition();
+  const [approve, approving] = useAction(
+    async () => {
+      setErr(null);
+      await onApprove();
+      invalidate("review/");
+      invalidate("ship/");
+      setDone(true);
+    },
+    (e) => setErr(said(e)),
+  );
   return (
     <>
       <div className="rv-bar">
@@ -231,24 +237,7 @@ export function HostGateRow({ approved, onApprove, busy, land }: { approved: boo
             <b>approved</b>
           </span>
         ) : (
-          <button
-            type="button"
-            className="rv-btn rv-btn-go"
-            disabled={busy || go}
-            onClick={() =>
-              start(async () => {
-                setErr(null);
-                try {
-                  await onApprove();
-                  invalidate("review/");
-                  invalidate("ship/");
-                  setDone(true);
-                } catch (e) {
-                  setErr(said(e));
-                }
-              })
-            }
-          >
+          <button type="button" className="rv-btn rv-btn-go" disabled={busy} {...sendingProps(approving)} onClick={approve}>
             <Check size={13} aria-hidden="true" />
             <span>Approve</span>
           </button>

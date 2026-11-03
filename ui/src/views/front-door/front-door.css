@@ -359,7 +359,9 @@
   font-family: var(--font-mono);
   font-size: 12px;
 }
-/* Phones zoom into fields under 16px. On touch, the buttons' targets reach past their edges. */
+/* Phones zoom into fields under 16px. On touch, the buttons' targets reach past their edges; not a
+   button whose request is on its way, whose ::after is the rule that says so (index.css,
+   [data-sending]), and which takes no press meanwhile. */
 @media (pointer: coarse) {
   .fd .fd-btn,
   .fd .fd-download,
@@ -367,7 +369,7 @@
   .fd-disclose {
     position: relative;
   }
-  .fd .fd-btn::after,
+  .fd .fd-btn:not([data-sending])::after,
   .fd .fd-download::after,
   .fd-file::after {
     position: absolute;

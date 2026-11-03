@@ -16,6 +16,7 @@ import { TableHold } from "@/components/ui/hold";
 import { Loadable } from "@/components/ui/loading";
 import { CopyButton, PageIntro, SectionHeading, SelectField, TextField } from "@/components/ui/misc";
 import { toast } from "@/components/ui/toast";
+import { useAction, useActions } from "@/lib/action";
 import { useRes } from "@/lib/data";
 import { errorMessage } from "@/lib/hooks";
 import { invalidate } from "@/lib/resource";
@@ -23,7 +24,7 @@ import { Clouds } from "./clouds";
 import { LogSources } from "./logsources";
 import { Scrapes } from "./scrapes";
 import { StatsdListeners } from "./statsd";
-import { ObserveNav, integrationsRes } from "./parts";
+import { HeldFields, ObserveNav, integrationsRes, useOpening } from "./parts";
 
 const KINDS: { value: IntegrationKind; label: string; url: string }[] = [
   { value: "slack", label: "Slack", url: "An incoming webhook's URL (hooks.slack.com/services/…)" },
@@ -113,6 +114,14 @@ function Head() {
 function List({ onAdd }: { onAdd: () => void }) {
   const all = useRes(integrationsRes).data;
   const [removing, setRemoving] = React.useState<Integration | null>(null);
+  const [test, testing] = useActions(async (name: string) => {
+    try {
+      await observeApi.testIntegration(name);
+      toast({ title: `A test went to ${name}`, tone: "info" });
+    } catch (e) {
+      toast({ title: `Couldn't test ${name}`, description: errorMessage(e), tone: "failed" });
+    }
+  });
   if (all.length === 0)
     return (
       <p className="empty-line py-16 text-center">
@@ -143,18 +152,7 @@ function List({ onAdd }: { onAdd: () => void }) {
                   @{i.kind}-{i.name} <CopyButton text={`@${i.kind}-${i.name}`} label="Copy the mention" />
                 </td>
                 <td className="w-1 whitespace-nowrap">
-                  <Button
-                    variant="ghost"
-                    size="xs"
-                    onClick={async () => {
-                      try {
-                        await observeApi.testIntegration(i.name);
-                        toast({ title: `A test went to ${i.name}`, tone: "info" });
-                      } catch (e) {
-                        toast({ title: `Couldn't test ${i.name}`, description: errorMessage(e), tone: "failed" });
-                      }
-                    }}
-                  >
+                  <Button variant="ghost" size="xs" pending={testing(i.name)} onClick={() => test(i.name)}>
                     <Send /> Test
                   </Button>
                   <Button variant="ghost-danger" size="xs" aria-label={`Remove ${i.name}`} onClick={() => setRemoving(i)}>
@@ -212,7 +210,12 @@ function AddDialog({ onClose }: { onClose: () => void }) {
   const [caller, setCaller] = React.useState("");
   const [closeCode, setCloseCode] = React.useState("");
   const [close, setClose] = React.useState(true);
-  const [busy, setBusy] = React.useState(false);
+  const opening = useOpening();
+  const [add, adding] = useAction(async (body: IntegrationIn) => {
+    await observeApi.putIntegration(name, body);
+    invalidate("observe/integrations");
+    if (opening.still()) onClose();
+  }, "Couldn't add it");
   const hint = KINDS.find((k) => k.value === kind)?.url;
   // A mention ends at a trailing '.' (the end of a sentence): a name may not.
   const validName = /^[a-z0-9_.-]*[a-z0-9_-]$/.test(name);
@@ -234,8 +237,9 @@ function AddDialog({ onClose }: { onClose: () => void }) {
     <Dialog open onOpenChange={(o) => !o && onClose()}>
       <DialogContent title="Add an integration" description="Its secrets stay on the server: they are sent once, here, and never shown again.">
         <form
+          ref={opening.ref}
           className="space-y-4"
-          onSubmit={async (e) => {
+          onSubmit={(e) => {
             e.preventDefault();
             if (!ok) return;
             const body: IntegrationIn =
@@ -278,152 +282,145 @@ function AddDialog({ onClose }: { onClose: () => void }) {
                               ...(closeCode.trim() ? { close_code: closeCode.trim() } : {}),
                             }
                           : { kind, url };
-            setBusy(true);
-            try {
-              await observeApi.putIntegration(name, body);
-              invalidate("observe/integrations");
-              onClose();
-            } catch (err) {
-              toast({ title: "Couldn't add it", description: errorMessage(err), tone: "failed" });
-            } finally {
-              setBusy(false);
-            }
+            add(body);
           }}
         >
-          <div className="grid gap-3 sm:grid-cols-2">
-            <SelectField label="Kind" value={kind} onChange={(k) => setKind(k as IntegrationKind)} options={KINDS} />
-            <TextField
-              label="Name"
-              value={name}
-              onChange={(e) => setName(e.target.value.toLowerCase())}
-              placeholder="oncall"
-              hint={name && !validName ? "Letters, digits, - _ and . only, not ending in ." : name ? `Mentioned as @${kind}-${name}` : undefined}
-            />
-          </div>
-          {kind === "pagerduty" && <TextField label="Routing key" value={key} onChange={(e) => setKey(e.target.value)} autoComplete="off" />}
-          {kind === "opsgenie" && <TextField label="API key" value={key} onChange={(e) => setKey(e.target.value)} hint="An API integration's key." autoComplete="off" />}
-          {kind === "email" ? (
-            <>
+          <HeldFields held={adding}>
+            <div className="grid gap-3 sm:grid-cols-2">
+              <SelectField label="Kind" value={kind} onChange={(k) => setKind(k as IntegrationKind)} options={KINDS} />
               <TextField
-                label="To"
-                value={to}
-                onChange={(e) => setTo(e.target.value)}
-                placeholder="oncall@example.com, sre@example.com"
-                hint={to && !recipients.every(address) ? "Addresses as local@domain, separated by commas" : "Up to 50 addresses."}
-                autoComplete="off"
-                spellCheck={false}
+                label="Name"
+                value={name}
+                onChange={(e) => setName(e.target.value.toLowerCase())}
+                placeholder="oncall"
+                hint={name && !validName ? "Letters, digits, - _ and . only, not ending in ." : name ? `Mentioned as @${kind}-${name}` : undefined}
               />
-              <div className="grid gap-3 sm:grid-cols-2">
-                <TextField label="From" value={from} onChange={(e) => setFrom(e.target.value)} placeholder="kiln@example.com" autoComplete="off" spellCheck={false} />
-                <TextField label="SMTP relay" value={host} onChange={(e) => setHost(e.target.value)} placeholder="smtp.example.com" autoComplete="off" spellCheck={false} />
-              </div>
-              <div className="grid gap-3 sm:grid-cols-2">
-                <SelectField label="Security" value={security} onChange={(v) => setSecurity(v as SmtpSecurity)} options={SECURITY} />
+            </div>
+            {kind === "pagerduty" && <TextField label="Routing key" value={key} onChange={(e) => setKey(e.target.value)} autoComplete="off" />}
+            {kind === "opsgenie" && <TextField label="API key" value={key} onChange={(e) => setKey(e.target.value)} hint="An API integration's key." autoComplete="off" />}
+            {kind === "email" ? (
+              <>
                 <TextField
-                  label="Port (optional)"
-                  inputMode="numeric"
-                  value={port}
-                  onChange={(e) => setPort(e.target.value)}
-                  placeholder={security === "starttls" ? "587" : security === "tls" ? "465" : "25"}
-                />
-              </div>
-              <div className="grid gap-3 sm:grid-cols-2">
-                <TextField label="Username (optional)" value={user} onChange={(e) => setUser(e.target.value)} autoComplete="off" spellCheck={false} />
-                <TextField label="Password" type="password" value={password} onChange={(e) => setPassword(e.target.value)} autoComplete="new-password" disabled={user.trim() === ""} />
-              </div>
-              <div>
-                <label htmlFor="integration-ca" className="field-label">
-                  The relay&apos;s CA (optional)
-                </label>
-                <div className="field">
-                  <textarea id="integration-ca" rows={3} className="font-mono" value={ca} onChange={(e) => setCa(e.target.value)} placeholder="-----BEGIN CERTIFICATE-----" spellCheck={false} />
-                </div>
-                <div className="field-hint">When its certificate is not a public one.</div>
-              </div>
-            </>
-          ) : (
-            <TextField
-              label={kind === "pagerduty" ? "Events URL (optional)" : kind === "opsgenie" ? "API URL (optional)" : kind === "jira" ? "Site" : kind === "servicenow" ? "Instance" : "URL"}
-              value={url}
-              onChange={(e) => setUrl(e.target.value)}
-              placeholder="https://"
-              hint={hint}
-              autoComplete="off"
-            />
-          )}
-          {kind === "webhook" && (
-            <TextField
-              label="Signing secret (optional)"
-              value={secret}
-              onChange={(e) => setSecret(e.target.value)}
-              hint="Each request is signed with it as GitHub signs: X-Kiln-Signature: sha256=<HMAC of the body>."
-              autoComplete="off"
-            />
-          )}
-          {kind === "jira" && (
-            <>
-              <div className="grid gap-3 sm:grid-cols-2">
-                <SelectField label="Edition" value={edition} onChange={(v) => setEdition(v as JiraEdition)} options={EDITIONS} />
-                <TextField
-                  label="Project"
-                  value={project}
-                  onChange={(e) => setProject(e.target.value.toUpperCase())}
-                  placeholder="OPS"
-                  hint={project && !projectKey(project) ? "A project key: a letter, then letters, digits or _" : undefined}
+                  label="To"
+                  value={to}
+                  onChange={(e) => setTo(e.target.value)}
+                  placeholder="oncall@example.com, sre@example.com"
+                  hint={to && !recipients.every(address) ? "Addresses as local@domain, separated by commas" : "Up to 50 addresses."}
                   autoComplete="off"
                   spellCheck={false}
                 />
-              </div>
-              <div className="grid gap-3 sm:grid-cols-2">
-                <TextField label="Issue type (optional)" value={issueType} onChange={(e) => setIssueType(e.target.value)} placeholder="Task" autoComplete="off" />
-                <TextField label={edition === "cloud" ? "Account email" : "Username (optional)"} value={user} onChange={(e) => setUser(e.target.value)} autoComplete="off" spellCheck={false} />
-              </div>
-              <TextField
-                label={edition === "cloud" ? "API token" : user.trim() ? "Password" : "Personal access token"}
-                type="password"
-                value={key}
-                onChange={(e) => setKey(e.target.value)}
-                hint={edition === "cloud" ? "An API token of the account's, made at id.atlassian.com under Security." : undefined}
-                autoComplete="new-password"
-              />
-            </>
-          )}
-          {kind === "servicenow" && (
-            <>
-              <SelectField label="Signs in with" value={signIn} onChange={(v) => setSignIn(v as SignIn)} options={SIGN_IN} />
-              {signIn === "password" ? (
                 <div className="grid gap-3 sm:grid-cols-2">
-                  <TextField label="User" value={user} onChange={(e) => setUser(e.target.value)} autoComplete="off" spellCheck={false} />
-                  <TextField label="Password" type="password" value={password} onChange={(e) => setPassword(e.target.value)} autoComplete="new-password" />
+                  <TextField label="From" value={from} onChange={(e) => setFrom(e.target.value)} placeholder="kiln@example.com" autoComplete="off" spellCheck={false} />
+                  <TextField label="SMTP relay" value={host} onChange={(e) => setHost(e.target.value)} placeholder="smtp.example.com" autoComplete="off" spellCheck={false} />
                 </div>
-              ) : (
-                <TextField label="OAuth token" type="password" value={key} onChange={(e) => setKey(e.target.value)} autoComplete="new-password" />
-              )}
-              <div className="grid gap-3 sm:grid-cols-2">
-                <TextField label="Assignment group (optional)" value={group} onChange={(e) => setGroup(e.target.value)} placeholder="sys_id" autoComplete="off" spellCheck={false} />
-                <TextField label="Caller (optional)" value={caller} onChange={(e) => setCaller(e.target.value)} placeholder="sys_id" autoComplete="off" spellCheck={false} />
-              </div>
+                <div className="grid gap-3 sm:grid-cols-2">
+                  <SelectField label="Security" value={security} onChange={(v) => setSecurity(v as SmtpSecurity)} options={SECURITY} />
+                  <TextField
+                    label="Port (optional)"
+                    inputMode="numeric"
+                    value={port}
+                    onChange={(e) => setPort(e.target.value)}
+                    placeholder={security === "starttls" ? "587" : security === "tls" ? "465" : "25"}
+                  />
+                </div>
+                <div className="grid gap-3 sm:grid-cols-2">
+                  <TextField label="Username (optional)" value={user} onChange={(e) => setUser(e.target.value)} autoComplete="off" spellCheck={false} />
+                  <TextField label="Password" type="password" value={password} onChange={(e) => setPassword(e.target.value)} autoComplete="new-password" disabled={user.trim() === ""} />
+                </div>
+                <div>
+                  <label htmlFor="integration-ca" className="field-label">
+                    The relay&apos;s CA (optional)
+                  </label>
+                  <div className="field">
+                    <textarea id="integration-ca" rows={3} className="font-mono" value={ca} onChange={(e) => setCa(e.target.value)} placeholder="-----BEGIN CERTIFICATE-----" spellCheck={false} />
+                  </div>
+                  <div className="field-hint">When its certificate is not a public one.</div>
+                </div>
+              </>
+            ) : (
               <TextField
-                label="Close code (optional)"
-                value={closeCode}
-                onChange={(e) => setCloseCode(e.target.value)}
-                placeholder="Resolved by caller"
-                hint="One of the instance's close codes, set as an incident is resolved."
+                label={kind === "pagerduty" ? "Events URL (optional)" : kind === "opsgenie" ? "API URL (optional)" : kind === "jira" ? "Site" : kind === "servicenow" ? "Instance" : "URL"}
+                value={url}
+                onChange={(e) => setUrl(e.target.value)}
+                placeholder="https://"
+                hint={hint}
                 autoComplete="off"
               />
-            </>
-          )}
-          {(kind === "jira" || kind === "servicenow") && (
-            <label className="flex items-center gap-2 text-[13px] text-[#c8cad0]">
-              <input type="checkbox" className="check" checked={close} onChange={(e) => setClose(e.target.checked)} />{" "}
-              {kind === "jira" ? "Move the issue to done when the monitor recovers" : "Resolve the incident when the monitor recovers"}
-            </label>
-          )}
+            )}
+            {kind === "webhook" && (
+              <TextField
+                label="Signing secret (optional)"
+                value={secret}
+                onChange={(e) => setSecret(e.target.value)}
+                hint="Each request is signed with it as GitHub signs: X-Kiln-Signature: sha256=<HMAC of the body>."
+                autoComplete="off"
+              />
+            )}
+            {kind === "jira" && (
+              <>
+                <div className="grid gap-3 sm:grid-cols-2">
+                  <SelectField label="Edition" value={edition} onChange={(v) => setEdition(v as JiraEdition)} options={EDITIONS} />
+                  <TextField
+                    label="Project"
+                    value={project}
+                    onChange={(e) => setProject(e.target.value.toUpperCase())}
+                    placeholder="OPS"
+                    hint={project && !projectKey(project) ? "A project key: a letter, then letters, digits or _" : undefined}
+                    autoComplete="off"
+                    spellCheck={false}
+                  />
+                </div>
+                <div className="grid gap-3 sm:grid-cols-2">
+                  <TextField label="Issue type (optional)" value={issueType} onChange={(e) => setIssueType(e.target.value)} placeholder="Task" autoComplete="off" />
+                  <TextField label={edition === "cloud" ? "Account email" : "Username (optional)"} value={user} onChange={(e) => setUser(e.target.value)} autoComplete="off" spellCheck={false} />
+                </div>
+                <TextField
+                  label={edition === "cloud" ? "API token" : user.trim() ? "Password" : "Personal access token"}
+                  type="password"
+                  value={key}
+                  onChange={(e) => setKey(e.target.value)}
+                  hint={edition === "cloud" ? "An API token of the account's, made at id.atlassian.com under Security." : undefined}
+                  autoComplete="new-password"
+                />
+              </>
+            )}
+            {kind === "servicenow" && (
+              <>
+                <SelectField label="Signs in with" value={signIn} onChange={(v) => setSignIn(v as SignIn)} options={SIGN_IN} />
+                {signIn === "password" ? (
+                  <div className="grid gap-3 sm:grid-cols-2">
+                    <TextField label="User" value={user} onChange={(e) => setUser(e.target.value)} autoComplete="off" spellCheck={false} />
+                    <TextField label="Password" type="password" value={password} onChange={(e) => setPassword(e.target.value)} autoComplete="new-password" />
+                  </div>
+                ) : (
+                  <TextField label="OAuth token" type="password" value={key} onChange={(e) => setKey(e.target.value)} autoComplete="new-password" />
+                )}
+                <div className="grid gap-3 sm:grid-cols-2">
+                  <TextField label="Assignment group (optional)" value={group} onChange={(e) => setGroup(e.target.value)} placeholder="sys_id" autoComplete="off" spellCheck={false} />
+                  <TextField label="Caller (optional)" value={caller} onChange={(e) => setCaller(e.target.value)} placeholder="sys_id" autoComplete="off" spellCheck={false} />
+                </div>
+                <TextField
+                  label="Close code (optional)"
+                  value={closeCode}
+                  onChange={(e) => setCloseCode(e.target.value)}
+                  placeholder="Resolved by caller"
+                  hint="One of the instance's close codes, set as an incident is resolved."
+                  autoComplete="off"
+                />
+              </>
+            )}
+            {(kind === "jira" || kind === "servicenow") && (
+              <label className="flex items-center gap-2 text-[13px] text-[#c8cad0]">
+                <input type="checkbox" className="check" checked={close} onChange={(e) => setClose(e.target.checked)} />{" "}
+                {kind === "jira" ? "Move the issue to done when the monitor recovers" : "Resolve the incident when the monitor recovers"}
+              </label>
+            )}
+          </HeldFields>
           <div className="flex justify-end gap-2">
             <Button variant="ghost" onClick={onClose}>
               Cancel
             </Button>
-            <Button type="submit" disabled={!ok || busy}>
+            <Button type="submit" disabled={!ok} pending={adding}>
               Add
             </Button>
           </div>

@@ -21,6 +21,7 @@ import { Loadable } from "@/components/ui/loading";
 import { Crumbs, Panel, SelectField, TextField } from "@/components/ui/misc";
 import { Segmented } from "@/components/ui/tabs";
 import { toast } from "@/components/ui/toast";
+import { useAction } from "@/lib/action";
 import { reposRes, useRes, warm } from "@/lib/data";
 import { errorMessage } from "@/lib/hooks";
 import { invalidate, useSuspenseResource } from "@/lib/resource";
@@ -76,7 +77,6 @@ function Builder() {
   const [version, setVersion] = React.useState("");
   // The environments its first release goes to: each it's registered in, unless left out.
   const [held, setHeld] = React.useState<string[]>([]);
-  const [busy, setBusy] = React.useState(false);
 
   const t = templates.find((x) => x.name === templateName);
   const makes = t?.repository;
@@ -132,10 +132,11 @@ function Builder() {
   const promoted = chosen.filter((e) => gated(e).length && promotes(e) && gated(e).every((a) => releasing.includes(a)));
   const later = chosen.filter((e) => !releasing.includes(e) && !promoted.includes(e));
 
-  const make = async () => {
+  // Made, it opens the app's page; until it's answered nothing moves, so a refusal is said with what
+  // was asked still there (W21-R15).
+  const [make, making] = useAction(async () => {
     const a = ask();
     if (!a) return;
-    setBusy(true);
     try {
       const app = await deployApi.createApp(a);
       const failed: string[] = [];
@@ -173,17 +174,15 @@ function Builder() {
       });
       invalidate("deploy/");
       invalidate("repos");
-      navigate(releaseAppHref(app.name));
+      await navigate(releaseAppHref(app.name));
     } catch (e) {
       toast({
         title: "Not made",
         description: errorMessage(e),
         tone: "failed",
       });
-    } finally {
-      setBusy(false);
     }
-  };
+  });
 
   const sourceOptions: { value: Source; label: string }[] = [
     ...(makes ? [{ value: "template" as Source, label: "The template's" }] : []),
@@ -371,7 +370,7 @@ function Builder() {
       </Panel>
 
       <div className="rel-new-actions">
-        <Button disabled={busy || !ask()} onClick={() => void make()}>
+        <Button disabled={!ask()} pending={making} onClick={make}>
           <Rocket /> {releasing.length ? `Make ${clean || "the app"} and release it` : `Make ${clean || "the app"}`}
         </Button>
       </div>

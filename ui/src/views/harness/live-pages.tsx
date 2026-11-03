@@ -7,10 +7,13 @@
  */
 import * as React from "react";
 import { ChevronDown } from "lucide-react";
+import { ApiError } from "@/api/client";
 import { harnessApi, type Listening, type Opened, type PreviewLook, type StreamView } from "@/api/harness";
 import { Button } from "@/components/ui/button";
 import { Loadable } from "@/components/ui/loading";
 import { SelectField } from "@/components/ui/misc";
+import { toast } from "@/components/ui/toast";
+import { useActions } from "@/lib/action";
 import { errorMessage } from "@/lib/hooks";
 import { useSuspenseResource } from "@/lib/resource";
 import { copyLater } from "@/views/terminal/clipboard";
@@ -98,15 +101,20 @@ function Pages({ session }: { session: string }) {
   );
   const listed = useSuspenseResource(`harness/streams/${session}`, () => harnessApi.streams(session).catch((): StreamView[] => []), { pollMs: 15_000 });
   const openings = useSuspenseResource(`harness/opened/${session}`, () => harnessApi.opened(session).catch((): Opened[] => []), { pollMs: 30_000 });
-  const [deviceBusy, setDeviceBusy] = React.useState(false);
   const [note, setNote] = React.useState<string | null>(null);
   const [pick, setPick] = React.useState("");
   const [address, setAddress] = React.useState("");
   const [profile, setProfile] = React.useState<Profile>("conversation");
   const [engine, setEngine] = React.useState("chromium");
   const [layout, setLayout] = React.useState("");
-  const [busy, setBusy] = React.useState<"" | "open" | "start" | "stop">("");
   const [error, setError] = React.useState<string | null>(null);
+  // Each press says its own request is on its way, by what it does ("open", "start", "stop", "here",
+  // "copy"), while the form and the other buttons go on working (W21-R15); the app's start and its
+  // stop, one thing, wait for each other.
+  const [act, acting] = useActions(
+    (_what: string, go: () => Promise<void>) => go(),
+    (e) => setError(errorMessage(e)),
+  );
   // Opened here: shown until closed, ended or not (what it said when it ended stays to read).
   const [here, setHere] = React.useState<StreamView[]>([]);
   const [closed, setClosed] = React.useState<string[]>([]);
@@ -127,11 +135,7 @@ function Pages({ session }: { session: string }) {
   const port = ports.find((p) => `port:${p.port}` === chosen);
   // The engines its machine has, and the devices a page can be laid out as.
   const has = look.data.look.engines ?? { chromium: true };
-  const engines = [
-    { value: "chromium", label: "Chromium" },
-    ...(has.firefox ? [{ value: "firefox", label: "Firefox" }] : []),
-    ...(has.webkit ? [{ value: "webkit", label: "WebKit (Safari)" }] : []),
-  ];
+  const engines = [{ value: "chromium", label: "Chromium" }, ...(has.firefox ? [{ value: "firefox", label: "Firefox" }] : []), ...(has.webkit ? [{ value: "webkit", label: "WebKit (Safari)" }] : [])];
   const devices = [{ value: "", label: "This screen" }, ...(look.data.look.devices ?? []).map((d) => ({ value: d.name, label: `${d.name} · ${d.width}×${d.height}` }))];
   const runIn = engines.some((e) => e.value === engine) ? engine : "chromium";
   // What WebKit is there: an iPhone or iPad a Mac's iOS Simulator (the real Mobile Safari), else
@@ -157,26 +161,25 @@ function Pages({ session }: { session: string }) {
   // Yours: the ones opened here, then any you opened elsewhere (the agent's are in the conversation).
   const yours = [...here, ...listed.data.filter((v) => !v.by.startsWith("agent:") && !here.some((h) => h.id === v.id))].filter((v) => !closed.includes(v.id));
 
+  const starting = chosen === "app";
   const open = async () => {
-    const starting = chosen === "app";
     const url = port ? addressOf(port) : typedUrl(address);
     if (!starting && !port && !address.trim()) {
       setError("Which address? Type one, like localhost:3000.");
       return;
     }
-    setBusy(starting ? "start" : "open");
     setError(null);
-    try {
-      const v = await harnessApi.openStream(session, { ...(starting ? { start: true } : { url }), profile: profileNow, engine: runIn === "chromium" ? undefined : runIn, device: layout || undefined, title: starting ? "The app" : port ? `localhost:${port.port}` : undefined });
-      setHere((h) => [v, ...h]);
-      setOpened(v.id);
-      listed.setData((l) => [v, ...l.filter((x) => x.id !== v.id)]);
-      if (starting) look.reload();
-    } catch (e) {
-      setError(errorMessage(e));
-    } finally {
-      setBusy("");
-    }
+    const v = await harnessApi.openStream(session, {
+      ...(starting ? { start: true } : { url }),
+      profile: profileNow,
+      engine: runIn === "chromium" ? undefined : runIn,
+      device: layout || undefined,
+      title: starting ? "The app" : port ? `localhost:${port.port}` : undefined,
+    });
+    setHere((h) => [v, ...h]);
+    setOpened(v.id);
+    listed.change((l) => [v, ...l.filter((x) => x.id !== v.id)]);
+    if (starting) look.reload();
   };
   // On the person's own device: a link made by kiln, followed in a window opened now (in the tap's
   // own gesture, which a phone wants for one) or copied for another device.
@@ -186,12 +189,11 @@ function Pages({ session }: { session: string }) {
     let made: (url: string) => void = () => undefined;
     const link = new Promise<string>((r) => (made = r));
     const copied = how === "copy" ? copyLater(link) : null;
-    setDeviceBusy(true);
     setError(null);
     setNote(null);
     try {
       const o = await harnessApi.openOnDevice(session, device);
-      openings.setData((l) => [o, ...l.filter((x) => x.id !== o.id)]);
+      openings.change((l) => [o, ...l.filter((x) => x.id !== o.id)]);
       made(o.url ?? "");
       if (w && o.url) {
         w.opener = null;
@@ -202,32 +204,28 @@ function Pages({ session }: { session: string }) {
       made("");
       w?.close();
       setError(errorMessage(e));
-    } finally {
-      setDeviceBusy(false);
     }
   };
+  // Gone at once (W21-R15); one that didn't end is back, saying why (one already over is gone either way).
   const endOpened = (id: string) => {
-    openings.setData((l) => l.filter((o) => o.id !== id));
-    void harnessApi.endOpened(session, id).catch(() => undefined);
+    openings.change((l) => l.filter((o) => o.id !== id));
+    void harnessApi.endOpened(session, id).catch((e: unknown) => {
+      if (e instanceof ApiError && e.status === 404) return;
+      openings.reload();
+      toast.error("Couldn't end it", errorMessage(e));
+    });
   };
   const close = (id: string) => {
     setClosed((c) => [...c, id]);
     setHere((h) => h.filter((v) => v.id !== id));
-    listed.setData((l) => l.filter((v) => v.id !== id));
+    listed.change((l) => l.filter((v) => v.id !== id));
     // Ended already, it's gone there too.
     void harnessApi.closeStream(session, id).catch(() => undefined);
   };
   const stopApp = async () => {
-    setBusy("stop");
     setError(null);
-    try {
-      await harnessApi.stopApp(session);
-      look.reload();
-    } catch (e) {
-      setError(errorMessage(e));
-    } finally {
-      setBusy("");
-    }
+    await harnessApi.stopApp(session);
+    look.reload();
   };
 
   return (
@@ -236,7 +234,7 @@ function Pages({ session }: { session: string }) {
         className="lp-open"
         onSubmit={(e) => {
           e.preventDefault();
-          void open();
+          act(starting ? "start" : "open", open);
         }}
       >
         <div className="lp-what">
@@ -275,15 +273,24 @@ function Pages({ session }: { session: string }) {
               Address
             </label>
             <div className="field">
-              <input id={`lp-address-${session}`} value={address} placeholder="localhost:3000" spellCheck={false} autoCapitalize="off" autoCorrect="off" inputMode="url" onChange={(e) => setAddress(e.target.value)} />
+              <input
+                id={`lp-address-${session}`}
+                value={address}
+                placeholder="localhost:3000"
+                spellCheck={false}
+                autoCapitalize="off"
+                autoCorrect="off"
+                inputMode="url"
+                onChange={(e) => setAddress(e.target.value)}
+              />
             </div>
           </div>
         )}
         <SelectField label="Engine" value={runIn} onChange={setEngine} options={engines} className="lp-half" />
         <SelectField label="Device" value={layout} onChange={setLayout} options={devices} className="lp-half" />
         <SelectField label="Browser profile" value={profileNow} onChange={(v) => setProfile(v as Profile)} options={profiles} className="lp-profile" />
-        <Button size="sm" type="submit" className="lp-go" disabled={busy !== ""}>
-          {busy === "start" ? "Starting the app" : busy === "open" ? "Opening" : chosen === "app" ? "Start and open" : "Open"}
+        <Button size="sm" type="submit" className="lp-go" disabled={starting && acting("stop")} pending={acting("start") || acting("open")}>
+          {acting("start") ? "Starting the app" : acting("open") ? "Opening" : chosen === "app" ? "Start and open" : "Open"}
         </Button>
       </form>
       <p className="field-hint lp-says">
@@ -293,10 +300,10 @@ function Pages({ session }: { session: string }) {
       {!personal.ok && personal.why && <p className="field-hint lp-says">{personal.why}</p>}
       <div className="lp-device">
         <span className="lp-device-what">On your device</span>
-        <Button size="sm" variant="secondary" disabled={!device || deviceBusy} onClick={() => void onDevice("here")}>
+        <Button size="sm" variant="secondary" disabled={!device} pending={acting("here")} onClick={() => act("here", () => onDevice("here"))}>
           Open on this device
         </Button>
-        <Button size="sm" variant="ghost" disabled={!device || deviceBusy} onClick={() => void onDevice("copy")}>
+        <Button size="sm" variant="ghost" disabled={!device} pending={acting("copy")} onClick={() => act("copy", () => onDevice("copy"))}>
           Copy a link
         </Button>
       </div>
@@ -326,12 +333,14 @@ function Pages({ session }: { session: string }) {
             <span>
               The app is running at <code>{app.running}</code>
             </span>
-            <Button size="sm" variant="ghost" disabled={busy !== ""} onClick={() => void stopApp()}>
-              {busy === "stop" ? "Stopping" : "Stop the app"}
+            <Button size="sm" variant="ghost" disabled={acting("start")} pending={acting("stop")} onClick={() => act("stop", stopApp)}>
+              {acting("stop") ? "Stopping" : "Stop the app"}
             </Button>
           </div>
         ) : null)}
-      {!app.configured && ports.length === 0 && <p className="field-hint lp-says">Nothing is serving on its machine yet. A project&rsquo;s .kiln/preview.yaml says how its app starts, so it can be started from here.</p>}
+      {!app.configured && ports.length === 0 && (
+        <p className="field-hint lp-says">Nothing is serving on its machine yet. A project&rsquo;s .kiln/preview.yaml says how its app starts, so it can be started from here.</p>
+      )}
       {error && (
         <p className="lp-error" role="alert">
           {error}

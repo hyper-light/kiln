@@ -11,10 +11,11 @@ import { Button } from "@/components/ui/button";
 import { Dialog, DialogClose, DialogContent } from "@/components/ui/dialog";
 import { Loadable } from "@/components/ui/loading";
 import { toast } from "@/components/ui/toast";
+import { useAction } from "@/lib/action";
 import { shownName } from "@/lib/data";
-import { errorMessage } from "@/lib/hooks";
 import { useSuspenseResource } from "@/lib/resource";
 import { cn } from "@/lib/utils";
+import { useShown } from "./dom";
 
 export interface Places {
   byTarget: Record<string, KindInfo[]>;
@@ -76,21 +77,20 @@ function Choices({ agent, picked, onPick }: { agent: Agent; picked: string; onPi
 
 export function MoveDialog({ agent, onClose }: { agent: Agent; onClose: () => void }) {
   const [picked, setPicked] = React.useState("");
-  const [busy, setBusy] = React.useState<"" | "now" | "after">("");
   const running = agent.status === "running" || agent.status === "waiting";
-  const go = async (now: boolean) => {
+  const [shown, showing] = useShown();
+  // One move at a time (W21-R15): the way pressed says it's on its way and the other waits for it;
+  // Cancel still closes the dialog meanwhile.
+  const [way, setWay] = React.useState<"now" | "after">("after");
+  const [move, moving] = useAction(async (now: boolean) => {
     if (!picked) return;
-    setBusy(now ? "now" : "after");
-    try {
-      await harnessApi.move(agent.id, picked, now);
-      toast.success(`Moving ${agent.name}`, !running ? "It goes on there in a moment." : now ? "This turn stops here and goes on there." : "It goes on there once this turn is over.");
-      onClose();
-    } catch (e) {
-      toast.error("Couldn't move it", errorMessage(e));
-    } finally {
-      setBusy("");
-    }
-  };
+    setWay(now ? "now" : "after");
+    await harnessApi.move(agent.id, picked, now);
+    toast.success(`Moving ${agent.name}`, !running ? "It goes on there in a moment." : now ? "This turn stops here and goes on there." : "It goes on there once this turn is over.");
+    if (shown.current) onClose();
+  }, "Couldn't move it");
+  const movingNow = moving && way === "now";
+  const movingAfter = moving && way === "after";
   return (
     <Dialog open onOpenChange={(o) => !o && onClose()}>
       <DialogContent
@@ -107,17 +107,17 @@ export function MoveDialog({ agent, onClose }: { agent: Agent; onClose: () => vo
           <Choices agent={agent} picked={picked} onPick={setPicked} />
         </Loadable>
         {/* On a phone, stacked: the move first, then the other way to move, then Cancel. */}
-        <div className="mt-5 flex flex-col-reverse gap-2 sm:flex-row sm:flex-wrap sm:justify-end">
+        <div ref={showing} className="mt-5 flex flex-col-reverse gap-2 sm:flex-row sm:flex-wrap sm:justify-end">
           <DialogClose asChild>
             <Button variant="ghost">Cancel</Button>
           </DialogClose>
           {running && (
-            <Button variant="secondary" disabled={busy !== "" || !picked} onClick={() => void go(true)}>
-              {busy === "now" ? "Moving…" : "Move now"}
+            <Button variant="secondary" disabled={!picked || movingAfter} pending={movingNow} onClick={() => move(true)}>
+              {movingNow ? "Moving…" : "Move now"}
             </Button>
           )}
-          <Button disabled={busy !== "" || !picked} onClick={() => void go(false)}>
-            {busy === "after" ? "Moving…" : running ? "Move after this turn" : "Move"}
+          <Button disabled={!picked || movingNow} pending={movingAfter} onClick={() => move(false)}>
+            {movingAfter ? "Moving…" : running ? "Move after this turn" : "Move"}
           </Button>
         </div>
       </DialogContent>

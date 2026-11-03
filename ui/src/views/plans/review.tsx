@@ -21,6 +21,7 @@ import { researchApi, SOURCE_WORDS, type CheckState, type Finding, type Grade, t
 import { Button } from "@/components/ui/button";
 import { Loadable } from "@/components/ui/loading";
 import { toast } from "@/components/ui/toast";
+import { useAction } from "@/lib/action";
 import { harnessSessionsRes, useRes } from "@/lib/data";
 import { errorMessage } from "@/lib/hooks";
 import { invalidate, useSuspenseResource } from "@/lib/resource";
@@ -309,16 +310,16 @@ function ReviewBody(b: BodyProps) {
   // One finding open at a time, wherever it's listed ("step:2:f5", "rs:f5").
   const [finding, setFinding] = React.useState<string | null>(null);
   const [from, setFrom] = React.useState(false);
-  const [busy, setBusy] = React.useState(false);
+  // Once it went, it stands as sent until its review goes; one that didn't (`onAnswer` says why) can be sent again.
+  const [went, setWent] = React.useState(false);
+  const [answer, answering] = useAction(async (pick: Answer) => setWent(await b.onAnswer(pick, draft.words, from)));
+  const busy = answering || went;
   const words = React.useRef<HTMLTextAreaElement>(null);
   const rests = React.useMemo(() => restsOn(b.items), [b.items]);
   const toggle = (n: number) => setOpen(open.includes(n) ? open.filter((x) => x !== n) : [...open, n]);
-  const can = !busy && draft.pick !== null && (draft.pick !== "other" || draft.words.trim().length > 0);
-  const send = async () => {
-    if (!can || !draft.pick) return;
-    setBusy(true);
-    const went = await b.onAnswer(draft.pick, draft.words, from);
-    if (!went) setBusy(false);
+  const ready = draft.pick !== null && (draft.pick !== "other" || draft.words.trim().length > 0);
+  const send = () => {
+    if (!busy && ready && draft.pick) answer(draft.pick);
   };
   const pick = (v: Answer, d: Draft = draft) => {
     setDraft({ ...d, pick: v });
@@ -338,7 +339,7 @@ function ReviewBody(b: BodyProps) {
   const onKeyDown = (e: React.KeyboardEvent) => {
     if ((e.metaKey || e.ctrlKey) && e.key === "Enter") {
       e.preventDefault();
-      void send();
+      send();
       return;
     }
     const t = e.target as HTMLElement;
@@ -417,7 +418,7 @@ function ReviewBody(b: BodyProps) {
               <kbd>↵</kbd> send
             </span>
           </p>
-          <Button size="sm" variant={draft.pick === "reject" ? "danger" : "primary"} className="pr-send" disabled={!can} onClick={() => void send()}>
+          <Button size="sm" variant={draft.pick === "reject" ? "danger" : "primary"} className="pr-send" disabled={!busy && !ready} pending={busy} onClick={send}>
             {busy ? "Sending…" : label}
           </Button>
         </div>

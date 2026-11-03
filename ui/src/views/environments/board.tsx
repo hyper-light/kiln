@@ -15,6 +15,7 @@ import { Loadable } from "@/components/ui/loading";
 import { Crumbs, EmptyState, Panel, SelectField } from "@/components/ui/misc";
 import { StatusDot } from "@/components/ui/status";
 import { toast } from "@/components/ui/toast";
+import { useAction } from "@/lib/action";
 import { useAuth } from "@/lib/auth";
 import { reposRes, useLabels, useRes, type Res } from "@/lib/data";
 import { shortSha } from "@/lib/format";
@@ -170,24 +171,20 @@ function Row({ e }: { e: CiEnvironment }) {
 /** A repository's dev, staging and production in one step, for those who may make them. */
 function Starter({ repos }: { repos: string[] }) {
   const [repo, setRepo] = React.useState(repos[0] ?? "");
-  const [busy, setBusy] = React.useState(false);
-  if (!repos.length) return null;
-  const make = async () => {
-    setBusy(true);
+  const [make, making] = useAction(async () => {
     try {
       const r = await ci.starterEnvironments(repo);
       toast.success(r.made.length ? `Made ${r.made.join(", ")} in ${r.repo}` : `${r.repo} has them all already`);
       invalidate("ci/environment");
     } catch (err) {
       toast.error(errorMessage(err));
-    } finally {
-      setBusy(false);
     }
-  };
+  });
+  if (!repos.length) return null;
   return (
     <div className="env-starter">
       <SelectField label="Repository" value={repo} onChange={setRepo} options={repos.map((r) => ({ value: r, label: r }))} className="env-starter-repo" />
-      <Button size="sm" variant="secondary" disabled={busy || !repo} onClick={() => void make()}>
+      <Button size="sm" variant="secondary" disabled={!repo} pending={making} onClick={make}>
         Make dev, staging and production
       </Button>
     </div>
