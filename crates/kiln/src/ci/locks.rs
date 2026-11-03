@@ -336,7 +336,7 @@ impl Capture<'_> {
                 r
             }
         };
-        proposals::check_pin(self.hub, self.caller, &revision.identity, &wanted).await?;
+        proposals::check_pin(self.hub, self.caller, self.root_commit, &revision, &wanted).await?;
         let reachable = self.source.contains(revision.clone(), wanted.clone()).await.map_err(|e| format!("KCI4051 {uses}: {e}"))?;
         let (hostname, owner_id, repo_id) = match &revision.identity {
             Identity::Github { hostname, owner_id, repo_id } => (hostname.clone(), *owner_id, *repo_id),
@@ -709,6 +709,10 @@ mod execution;
 mod history;
 mod generate;
 mod proposals;
+mod approvals;
+pub use approvals::accept;
+pub(crate) use approvals::reviewed as record_review;
+pub(crate) use approvals::{candidate as lock_candidate, carry_ready as carry_ready_locks, landed as lock_landed, landed_on_host as lock_landed_on_host, ready as ready_locks};
 pub use proposals::{fresh_draft, proposal_for};
 pub(crate) use proposals::{keep_proposal, proposed_files};
 mod replay;

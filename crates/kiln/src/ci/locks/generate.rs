@@ -133,7 +133,7 @@ impl Collector<'_> {
         let reference = accepted.as_ref().map_or(remote.git_ref.as_str(), |g| g.git_ref.as_str()).to_owned();
         let immutable = kiln_seams::dependencies::commit_valid(&reference);
         let revision = self.resolve(&remote, if immutable { "HEAD" } else { &reference }).await?;
-        let seen = history::Seen::read(self.hub, self.source, &remote, &revision).await?;
+        let seen = history::Seen::read_for(self.hub, self.source, &remote, &revision, self.caller, &self.root.owner.commit).await?;
         if accepted.is_none() { accepted = seen.accepted_pin()?; }
         let identity = match &revision.identity {
             Identity::Github { hostname, owner_id, repo_id } => kiln::Identity::Github { hostname: hostname.clone(), owner_id: *owner_id, repo_id: *repo_id },

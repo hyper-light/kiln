@@ -52,29 +52,37 @@ fn w29_r25_fresh_proposals_refresh_shared_pins_but_keep_unrelated_and_literal_pi
     })
 }
 
+/// A locked native consumer's finished run, after its action's partial tag moved to new code.
+struct Fresh { app: native::Published, model: Arc<Workflow>, source: crate::ci::dependency_sources::Sources<Arc<Hub>>, frozen: Frozen, saved: String, moved: String }
+
+async fn fresh(hub: &Arc<Hub>, root: &Path) -> anyhow::Result<Fresh> {
+    let publisher = native::publish(hub, root, "acme/tools", vec![("action.yml".into(), "runs: {using: composite, steps: []}\n".into()), ("src/run.sh".into(), "echo accepted\n".into())], "owner").await?;
+    let text = WORKFLOW.replace(USES, "kiln://acme/tools@v1");
+    let mut app = native::publish(hub, root, "acme/app", vec![(PATH.into(), text.clone())], "none").await?;
+    crate::gitops::sync_mirror(hub, &app.repo).await?;
+    let source = crate::ci::dependency_sources::Sources::new(Arc::clone(hub), app.repo.name.clone());
+    let files = super::super::generate::collect(hub, &source, &app.repo, &app.commit, BTreeMap::new(), None, regenerate::Mode::Preserve).await.map_err(anyhow::Error::msg)?;
+    app.commit = native::advance(hub, &app, vec![(github::PATH.into(), files.github.unwrap_or_default()), (kiln::PATH.into(), files.kiln.unwrap_or_default())]).await?;
+    crate::gitops::sync_mirror(hub, &app.repo).await?;
+    let model = model(PATH, &text)?;
+    let frozen = capture_with(hub, &source, &app.repo, &app.commit, PATH, Arc::clone(&model), false).await.map_err(anyhow::Error::msg)?;
+    let saved = serde_json::to_string(&serde_json::json!({"dependency_snapshot": frozen}))?;
+    let (repo, sha, model_json, input_json) = (app.repo.id.clone(), app.commit.clone(), serde_json::to_string(&*model)?, saved.clone());
+    hub.store.call(move |c| {
+        c.execute("INSERT INTO runs (id, repo_id, number, pipeline, event, branch, sha, status, created_at, finished_at, workflow_id) VALUES ('fresh-run', ?1, 1, 'ci', 'push', 'main', ?2, 'succeeded', 1, 2, 'ci')", rusqlite::params![repo, sha])?;
+        c.execute("INSERT INTO ci_plans (run_id, workflow, input, done) VALUES ('fresh-run', ?1, ?2, 1)", rusqlite::params![model_json, input_json])?;
+        Ok(())
+    }).await?;
+    let moved = native::advance(hub, &publisher, vec![("src/run.sh".into(), "echo changed code\n".into())]).await?;
+    Ok(Fresh { app, model, source, frozen, saved, moved })
+}
+
 #[test]
 fn w29_r25_a_fresh_rerun_opens_a_draft_with_code_evidence_and_preserves_the_old_run() -> anyhow::Result<()> {
     crate::rt::block_on(async {
         let root = tempfile::tempdir()?;
         let hub = crate::hub::tests::scratch_hub().await?;
-        let publisher = native::publish(&hub, root.path(), "acme/tools", vec![("action.yml".into(), "runs: {using: composite, steps: []}\n".into()), ("src/run.sh".into(), "echo accepted\n".into())], "owner").await?;
-        let text = WORKFLOW.replace(USES, "kiln://acme/tools@v1");
-        let mut app = native::publish(&hub, root.path(), "acme/app", vec![(PATH.into(), text.clone())], "none").await?;
-        crate::gitops::sync_mirror(&hub, &app.repo).await?;
-        let source = crate::ci::dependency_sources::Sources::new(Arc::clone(&hub), app.repo.name.clone());
-        let files = super::super::generate::collect(&hub, &source, &app.repo, &app.commit, BTreeMap::new(), None, regenerate::Mode::Preserve).await.map_err(anyhow::Error::msg)?;
-        app.commit = native::advance(&hub, &app, vec![(github::PATH.into(), files.github.unwrap_or_default()), (kiln::PATH.into(), files.kiln.unwrap_or_default())]).await?;
-        crate::gitops::sync_mirror(&hub, &app.repo).await?;
-        let model = model(PATH, &text)?;
-        let frozen = capture_with(&hub, &source, &app.repo, &app.commit, PATH, Arc::clone(&model), false).await.map_err(anyhow::Error::msg)?;
-        let saved = serde_json::to_string(&serde_json::json!({"dependency_snapshot": frozen}))?;
-        let (repo, sha, model_json, input_json) = (app.repo.id.clone(), app.commit.clone(), serde_json::to_string(&*model)?, saved.clone());
-        hub.store.call(move |c| {
-            c.execute("INSERT INTO runs (id, repo_id, number, pipeline, event, branch, sha, status, created_at, finished_at, workflow_id) VALUES ('fresh-run', ?1, 1, 'ci', 'push', 'main', ?2, 'succeeded', 1, 2, 'ci')", rusqlite::params![repo, sha])?;
-            c.execute("INSERT INTO ci_plans (run_id, workflow, input, done) VALUES ('fresh-run', ?1, ?2, 1)", rusqlite::params![model_json, input_json])?;
-            Ok(())
-        }).await?;
-        let moved = native::advance(&hub, &publisher, vec![("src/run.sh".into(), "echo changed code\n".into())]).await?;
+        let Fresh { app, model, source, frozen, saved, moved } = fresh(&hub, root.path()).await?;
         let denied = crate::authz::Caller::with(crate::authz::gate::Kind::Pat, "admin", Some(crate::authz::gate::Rights { grants: vec![crate::authz::Grant { what: "runs.rerun".into(), scope: crate::authz::Scope::Repo { repo: app.repo.name.clone() }, deny: false }], ..Default::default() }), None);
         assert!(fresh_draft(&hub, Some(&denied), "fresh-run").await.is_err_and(|e| e.0 == http::StatusCode::FORBIDDEN));
         assert!(fresh_draft(&hub, None, "fresh-run").await.is_err_and(|e| e.0 == http::StatusCode::FORBIDDEN));
@@ -99,6 +107,115 @@ fn w29_r25_a_fresh_rerun_opens_a_draft_with_code_evidence_and_preserves_the_old_
         let (attempt, input, jobs, runs, accepted): (i64, String, i64, i64, i64) = hub.store.call(|c| Ok((c.query_row("SELECT attempt FROM runs WHERE id = 'fresh-run'", [], |r| r.get(0))?, c.query_row("SELECT input FROM ci_plans WHERE run_id = 'fresh-run'", [], |r| r.get(0))?, c.query_row("SELECT COUNT(*) FROM jobs", [], |r| r.get(0))?, c.query_row("SELECT COUNT(*) FROM runs", [], |r| r.get(0))?, c.query_row("SELECT COUNT(*) FROM ci_lock_refs", [], |r| r.get(0))?))).await?;
         assert_eq!((attempt, input, jobs, runs, accepted), (1, saved, 0, 1, 0));
         assert_eq!(git(&hub, &app.bare, &["rev-parse", "main"]).await?, app.commit);
+        Ok(())
+    })
+}
+
+/// The fresh rerun's lock-change draft: its id, exact head and evidence hash.
+async fn open(hub: &Arc<Hub>, app: &native::Published) -> anyhow::Result<(String, String, String)> {
+    let result = crate::ops::call(crate::ops::Cx { hub: Arc::clone(hub), caller: crate::authz::Caller::owner() }, "ci.runs.rerun", serde_json::json!({"run": "fresh-run", "mode": "all", "fresh_actions": true})).await.map_err(failure)?;
+    let draft = result.pointer("/draft/id").and_then(serde_json::Value::as_str).ok_or_else(|| anyhow::anyhow!("no draft: {result}"))?.to_owned();
+    let saved = crate::ci::pipeline_drafts::get(hub, &draft).await?.ok_or_else(|| anyhow::anyhow!("no saved draft"))?;
+    let head = crate::ci::pipeline_drafts::head(hub, &app.repo, &saved).await?;
+    let review = proposal_for(hub, &app.repo, &draft, &head).await.map_err(failure)?.ok_or_else(|| anyhow::anyhow!("no revision-bound evidence"))?;
+    let hash = review.get("evidence_sha256").and_then(serde_json::Value::as_str).ok_or_else(|| anyhow::anyhow!("no evidence hash: {review}"))?.to_owned();
+    Ok((draft, head, hash))
+}
+
+/// A consumer commit with `files` and the draft's lock files, on the trunk.
+async fn with_locks(hub: &Arc<Hub>, app: &native::Published, head: &str, mut files: Vec<(String, String)>) -> anyhow::Result<String> {
+    for path in [github::PATH, kiln::PATH] { files.push((path.into(), crate::ci::load::blob(hub, &app.repo, head, path).await?)); }
+    let commit = native::advance(hub, app, files).await?;
+    crate::gitops::sync_mirror(hub, &app.repo).await?;
+    Ok(commit)
+}
+
+fn with_rights(name: &str, repo: &str, what: &[&str]) -> crate::authz::Caller {
+    let grants = what.iter().map(|w| crate::authz::Grant { what: (*w).into(), scope: crate::authz::Scope::Repo { repo: repo.into() }, deny: false }).collect();
+    crate::authz::Caller::with(crate::authz::gate::Kind::User, name, Some(crate::authz::gate::Rights { grants, ..Default::default() }), None)
+}
+
+#[test]
+fn w29_r25_a_persons_word_on_the_exact_evidence_lets_only_that_code_run_in_this_consumer() -> anyhow::Result<()> {
+    crate::rt::block_on(async {
+        let root = tempfile::tempdir()?;
+        let hub = crate::hub::tests::scratch_hub().await?;
+        let Fresh { app, model, source, moved, .. } = fresh(&hub, root.path()).await?;
+        let (draft_id, head, hash) = open(&hub, &app).await?;
+        let owner = crate::authz::Caller::owner();
+        let name = app.repo.name.clone();
+        let mut draft = crate::ci::pipeline_drafts::get(&hub, &draft_id).await?.ok_or_else(|| anyhow::anyhow!("no saved draft"))?;
+        let early = crate::ci::pipeline_drafts::ready(&hub, &owner, &app.repo, &mut draft).await;
+        assert!(early.is_err_and(|e| e.0 == http::StatusCode::CONFLICT && e.1.contains("accept")), "Ready waits for the person's word on the upstream code");
+        let ask = |head: &str, hash: &str| serde_json::json!({"draft": draft_id, "head": head, "evidence_sha256": hash});
+        // Agents and tokens are not a person, whatever rights they hold.
+        let mut agent = crate::authz::Caller::owner();
+        agent.agent = Some("agent-session".into());
+        let mut token = crate::authz::Caller::owner();
+        token.token = Some("pat-1".into());
+        for caller in [&agent, &token] {
+            assert!(crate::ci::locks::accept(&hub, caller, &name, &ask(&head, &hash)).await.is_err_and(|e| e.0 == http::StatusCode::FORBIDDEN));
+        }
+        let unrighted = with_rights("user:kim", &name, &["workflows.edit", "diffs.submit"]);
+        assert!(crate::ci::locks::accept(&hub, &unrighted, &name, &ask(&head, &hash)).await.is_err_and(|e| e.0 == http::StatusCode::FORBIDDEN));
+        // Words about another revision or other evidence are no acceptance of this one.
+        assert!(crate::ci::locks::accept(&hub, &owner, &name, &ask(&app.commit, &hash)).await.is_err_and(|e| e.0 == http::StatusCode::CONFLICT));
+        assert!(crate::ci::locks::accept(&hub, &owner, &name, &ask(&head, &"0".repeat(64))).await.is_err_and(|e| e.0 == http::StatusCode::CONFLICT));
+        let refused = capture_with(&hub, &source, &app.repo, &head, PATH, Arc::clone(&model), false).await;
+        assert!(refused.is_err_and(|e| e.contains("KCI4055")));
+        let accepted = crate::ops::call(crate::ops::Cx { hub: Arc::clone(&hub), caller: owner.clone() }, "ci.locks.accept", serde_json::json!({"repo": name, "draft": draft_id, "head": head, "evidence_sha256": hash})).await.map_err(failure)?;
+        assert_eq!(accepted.get("accepted"), Some(&serde_json::json!(true)), "{accepted}");
+        let runs = capture_with(&hub, &source, &app.repo, &head, PATH, Arc::clone(&model), true).await.map_err(anyhow::Error::msg)?;
+        assert_eq!(runs.root_actions().map_err(anyhow::Error::msg)?.get("kiln://acme/tools@v1").map(|a| &a.sha), Some(&moved));
+        crate::ci::pipeline_drafts::ready(&hub, &owner, &app.repo, &mut draft).await.map_err(failure)?;
+        // Another tree of this consumer still waits, until the land queue registers its candidate.
+        let candidate = with_locks(&hub, &app, &head, vec![("README.md".into(), "landed with others\n".into())]).await?;
+        assert!(capture_with(&hub, &source, &app.repo, &candidate, PATH, Arc::clone(&model), false).await.is_err_and(|e| e.contains("KCI4055")));
+        crate::ci::locks::lock_candidate(&hub, &app.repo, &candidate, std::slice::from_ref(&head)).await.map_err(anyhow::Error::msg)?;
+        let tested = capture_with(&hub, &source, &app.repo, &candidate, PATH, Arc::clone(&model), false).await.map_err(anyhow::Error::msg)?;
+        assert_eq!(tested.root_actions().map_err(anyhow::Error::msg)?.get("kiln://acme/tools@v1").map(|a| &a.sha), Some(&moved));
+        // Landed, the pin is this consumer's: later trunk commits run it.
+        crate::ci::locks::lock_landed(&hub, &app.repo, &candidate, &candidate).await.map_err(anyhow::Error::msg)?;
+        let later = with_locks(&hub, &app, &head, vec![("README.md".into(), "and after\n".into())]).await?;
+        let after = capture_with(&hub, &source, &app.repo, &later, PATH, Arc::clone(&model), false).await.map_err(anyhow::Error::msg)?;
+        assert_eq!(after.root_actions().map_err(anyhow::Error::msg)?.get("kiln://acme/tools@v1").map(|a| &a.sha), Some(&moved));
+        // Nothing of it became a global acceptance another consumer could borrow.
+        let global: i64 = hub.store.call(|c| Ok(c.query_row("SELECT COUNT(*) FROM ci_lock_refs", [], |r| r.get(0))?)).await?;
+        assert_eq!(global, 0);
+        Ok(())
+    })
+}
+
+#[test]
+fn w29_r25_a_reviewers_accept_of_the_exact_version_counts_until_withdrawn_and_a_discard_ends_it() -> anyhow::Result<()> {
+    crate::rt::block_on(async {
+        let root = tempfile::tempdir()?;
+        let hub = crate::hub::tests::scratch_hub().await?;
+        let Fresh { app, model, source, moved, .. } = fresh(&hub, root.path()).await?;
+        let (draft_id, head, hash) = open(&hub, &app).await?;
+        let name = app.repo.name.clone();
+        let mut draft = crate::ci::pipeline_drafts::get(&hub, &draft_id).await?.ok_or_else(|| anyhow::anyhow!("no saved draft"))?;
+        let diff = crate::ci::diffs::find(&hub, draft.name.as_deref().unwrap_or_default()).await?.ok_or_else(|| anyhow::anyhow!("no diff"))?;
+        let run_at_head = || capture_with(&hub, &source, &app.repo, &head, PATH, Arc::clone(&model), false);
+        // An agent session's accept is no person's word, though the review itself stands.
+        let mut bot = with_rights("user:bot", &name, &["diffs.review"]);
+        bot.agent = Some("agent-session".into());
+        crate::ci::review::review(&hub, &diff, &bot, &serde_json::json!({"action": "accept"})).await.map_err(failure)?;
+        assert!(run_at_head().await.is_err_and(|e| e.contains("KCI4055")));
+        let kim = with_rights("user:kim", &name, &["diffs.review"]);
+        crate::ci::review::review(&hub, &diff, &kim, &serde_json::json!({"action": "accept"})).await.map_err(failure)?;
+        let runs = run_at_head().await.map_err(anyhow::Error::msg)?;
+        assert_eq!(runs.root_actions().map_err(anyhow::Error::msg)?.get("kiln://acme/tools@v1").map(|a| &a.sha), Some(&moved));
+        // A comment keeps it; asking for changes withdraws it.
+        crate::ci::review::review(&hub, &diff, &kim, &serde_json::json!({"action": "comment", "body": "reading the rest"})).await.map_err(failure)?;
+        assert!(run_at_head().await.is_ok());
+        crate::ci::review::review(&hub, &diff, &kim, &serde_json::json!({"action": "request_changes", "body": "not this code"})).await.map_err(failure)?;
+        assert!(run_at_head().await.is_err_and(|e| e.contains("KCI4055")));
+        // The owner's own word holds until the draft is discarded.
+        crate::ci::locks::accept(&hub, &crate::authz::Caller::owner(), &name, &serde_json::json!({"draft": draft_id, "head": head, "evidence_sha256": hash})).await.map_err(failure)?;
+        assert!(run_at_head().await.is_ok());
+        crate::ci::pipeline_drafts::discard(&hub, &crate::authz::Caller::owner(), &app.repo, &mut draft).await.map_err(failure)?;
+        assert!(run_at_head().await.is_err_and(|e| e.contains("KCI4055")));
         Ok(())
     })
 }

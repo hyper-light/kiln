@@ -11177,7 +11177,18 @@ endpoint, for a repository kiln hosts and for one on GitHub:
   - What `ci.locks.verify` checks is GitHub-exact: the checks `gh actions-lock --verify` makes.
   - A locked action's own update arrives only as a draft (W29-R22).
   - "Rerun with fresh actions" (W07-R02) in a locked repository proposes a lock change rather than
-    going round the lock.
+    going round the lock: a draft of the regenerated locks, with each changed source's whole code
+    difference between its accepted commit and the new one (every changed file, binary ones too).
+    The old run, its snapshot and its attempts don't change.
+  - The new commit runs nowhere before a person accepts it. Until then, a run that locks it is
+    refused (`KCI4055`) and the draft can't be marked ready. `ci.locks.accept` (new,
+    `POST /api/ci/repos/:repo/locks/accept { draft, head, evidence_sha256 }`) is a person's word
+    on it, naming the draft's exact head and the code difference they read. A reviewer's accept of
+    that exact version counts too. An agent's or a token's doesn't. A later request for changes,
+    a version with other files, or discarding the draft takes it back.
+  - The acceptance is the repository's alone: the new commit runs in the draft's exact files, in
+    the land queue's candidate of it, and on the trunk once it lands. Every other repository, and
+    kiln's record of what each tag resolved to (W29-R26), keep the old commit. kiln's addition.
   - kiln's addition: on GitHub, Dependabot regenerates the lockfile only for its own version updates.
 - **W29-R26 Requiring locks, and moved tags.** Opt-in, at the server (`[ci.locks] require`) and in a
   repository's `.kiln/config.yaml` (`require_lock`). Each is `off` (the default), `report` or
@@ -11337,7 +11348,7 @@ lockfile, which pins commit A. An attacker moves `v45` and `v45.0.7` to commit M
 | R22 Update drafts | `.kiln/config.yaml`'s `updates`; `ci::updates`; `kiln_ci::wf::action_diff`; `ShipPipelineDetail` | Dependabot's shape: a cooldown, groups, the lock regenerated in the same change | drafts for what kiln hosts, and what each update changes |
 | R23 GitHub's lockfile | `.github/workflows/actions.lock`; `kiln_ci::lock::github`; `KCI1022`, `KCI4050` to `KCI4053`, `KCI4057` | all of it: the file and its checks | none |
 | R24 kiln's lock | `.kiln/lock`; `kiln_ci::lock::kiln`; `KCI4054` | W29-R23's checks, for each entry of the same kind | reusable workflows, images, runtimes, `.kiln/` workflows and sources kiln hosts |
-| R25 kiln writes the locks | `ci.locks.update` (`POST /api/ci/repos/:repo/locks`); `ci.locks.verify` (`GET /api/ci/repos/:repo/locks/verify`); `kiln_ci::lock::regenerate` | `gh actions-lock --verify`'s checks | locks in every draft; a conflict resolved by regenerating |
+| R25 kiln writes the locks | `ci.locks.update` (`POST /api/ci/repos/:repo/locks`); `ci.locks.verify` (`GET /api/ci/repos/:repo/locks/verify`); `ci.locks.accept` (`POST /api/ci/repos/:repo/locks/accept`); `kiln_ci::lock::regenerate`, `kiln_ci::lock::review` | `gh actions-lock --verify`'s checks | locks in every draft; a conflict resolved by regenerating |
 | R26 Requiring locks | `[ci.locks]`'s `require` and `moved_tags`; `.kiln/config.yaml`'s `require_lock` and `moved_tags`; `KCI4055`, `KCI4056`; `tag_moved` (W19) | "Require lockfile", report first as GitHub's evaluate mode | moved tags flagged, and refused without a lock |
 | R27 TypeScript | `.kiln/<name>.ts` and `.js`; `@kiln/sdk`; `GET /api/ci/sdk/kiln.d.ts`; `mcp::code`'s limits; `POST /api/ci/plan-preview`; `KCI1030` to `KCI1033` | the GitHub workflow it can emit | all of it |
 | R28 Other languages | `.kiln/<name>.<ext>`; `program:`; the plan leg (`SOURCE_DATE_EPOCH`, `KILN_EVENT_PATH`); a new SQLite table; `KCI1030` to `KCI1032` | none | all of it |
@@ -11387,6 +11398,7 @@ lockfile, which pins commit A. An attacker moves `v45` and `v45.0.7` to commit M
 | `GET /api/ci/actions/:owner/:repo?path=` (W29-R20) | `ci.actions.get`, new | versions, access, consumers |
 | `POST /api/ci/repos/:repo/locks { ref? }` (W29-R25) | `ci.locks.update`, new | a draft of the regenerated locks |
 | `GET /api/ci/repos/:repo/locks/verify?sha=` (W29-R25) | `ci.locks.verify`, new | `{ fresh, stale: [{ workflow, uses, locked, now }] }` |
+| `POST /api/ci/repos/:repo/locks/accept { draft, head, evidence_sha256 }` (W29-R25) | `ci.locks.accept`, new | `{ approval, draft, head, evidence_sha256, accepted }` |
 | `GET /api/ci/sdk/kiln.d.ts` (W29-R27) | | the SDK's types for the editor |
 | notification `tag_moved` (W29-R26, W19) | | a full version that resolves to another commit |
 | event `pipelines { repo }` | | pages ask again |
@@ -11825,6 +11837,7 @@ errors as `{ error, code, details? }`. Today's routes (`/api/runs`, `/api/jobs/.
 | GET | `/api/ci/actions/:owner/:repo?path=` | `ci.actions.get` (versions, access, consumers) | runs.read | W29 |
 | POST | `/api/ci/repos/:repo/releases` | `ci.releases.tag` (`{ sha, tag, major? }`) | diffs.land | W29 |
 | POST · GET | `/api/ci/repos/:repo/locks` · `/api/ci/repos/:repo/locks/verify?sha=` | `ci.locks.update`, `ci.locks.verify` | workflows.edit · runs.read | W29 |
+| POST | `/api/ci/repos/:repo/locks/accept` | `ci.locks.accept` (`{ draft, head, evidence_sha256 }`) | a person, with workflows.edit, diffs.submit and diffs.review | W29 |
 | POST | `/api/ci/repos/:repo/workflows/:path/disable` · `/enable` | `ci.workflows.disable`, `.enable` (`{ why? }`) | workflows.edit | W29 |
 | GET | `/api/ci/sdk/kiln.d.ts` | the TypeScript SDK's types | none (public within the API) | W29 |
 
@@ -11871,7 +11884,7 @@ kiln gocacheprog                        kiln rustc   (W24: the runner's cache he
 W24's operations: `ci.work.why`, `ci.work.status`, `ci.work.warm`, `ci.work.verify`, `ci.work.gc` and `ci.work.reap.*` (`kiln.ci.work.*` in code mode).
 
 W29's operations: `ship.pipelines.list`, `.get` and `.act`; `ci.actions.get`; `ci.releases.tag`;
-`ci.locks.update` and `ci.locks.verify`; `ci.workflows.disable` and `.enable`.
+`ci.locks.update`, `ci.locks.verify` and `ci.locks.accept`; `ci.workflows.disable` and `.enable`.
 
 Code mode: `kiln.ci.<area>.<verb>(input)` (e.g. `kiln.ci.runs.rerun({ run, mode: "failed" })`),
 diffs and review among them (`kiln.ci.diffs.*`), the hosts' pull requests (`kiln.host.pulls.*`),

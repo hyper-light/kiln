@@ -42,11 +42,11 @@ pub(crate) async fn keep_proposal(hub: &Hub, repo: &Repo, draft: &Draft, base: &
 
 /// W29-R25: marking a draft Ready cannot make its proposed code an executable pin. This
 /// guard is scoped to the consumer; the old run and other consumers keep their accepted pins.
-pub(super) async fn check_pin(hub: &Hub, repo: &Repo, identity: &Identity, commit: &str) -> Result<(), String> {
-    let identity = serde_json::to_string(identity).map_err(|_| "KCI4051 source identity could not be encoded")?;
-    let (repo, commit) = (repo.id.clone(), commit.to_ascii_lowercase());
-    let pending: bool = hub.store.call(move |c| Ok(c.query_row("SELECT EXISTS(SELECT 1 FROM ci_lock_review_pins WHERE consumer_repo_id = ?1 AND source_identity = ?2 AND commit_sha = ?3)", params![repo, identity, commit], |r| r.get(0))?)).await.map_err(|_| "KCI4051 lock review state could not be read")?;
-    if pending { Err("KCI4055 this dependency pin is proposed in a lock draft; its exact code change needs a person's review".into()) } else { Ok(()) }
+pub(super) async fn check_pin(hub: &Hub, repo: &Repo, root: &str, revision: &Revision, commit: &str) -> Result<(), String> {
+    let identity = serde_json::to_string(&revision.identity).map_err(|_| "KCI4051 source identity could not be encoded")?;
+    let (repo_id, wanted) = (repo.id.clone(), commit.to_ascii_lowercase());
+    let pending: bool = hub.store.call(move |c| Ok(c.query_row("SELECT EXISTS(SELECT 1 FROM ci_lock_review_pins WHERE consumer_repo_id = ?1 AND source_identity = ?2 AND commit_sha = ?3)", params![repo_id, identity, wanted], |r| r.get(0))?)).await.map_err(|_| "KCI4051 lock review state could not be read")?;
+    if pending && !super::approvals::allowed(hub, repo, root, &revision.identity, &revision.reference, commit).await? { Err("KCI4055 this dependency pin is proposed in a lock draft; its exact code change needs a person's review".into()) } else { Ok(()) }
 }
 
 /// Panes read saved facts only. Opening one never fetches a source or establishes trust.
@@ -57,7 +57,7 @@ pub async fn proposal_for(hub: &Hub, repo: &Repo, draft: &str, head: &str) -> Re
         if evidence.len() > 24 << 20 || kiln_seams::sha256_hex(evidence.as_bytes()) != hash { return Err(refused("KCI4051 saved lock review evidence failed its integrity check")); }
         let differences: BTreeMap<String, kiln_seams::dependencies::Difference> = serde_json::from_str(&evidence).map_err(|_| refused("KCI1022 saved lock review evidence does not read"))?;
         for difference in differences.values() { difference.validate().map_err(|e| refused(format!("KCI4051 {e}")))?; }
-        Ok(json!({"id": id, "base": base, "differences": differences}))
+        Ok(json!({"id": id, "base": base, "evidence_sha256": hash, "differences": differences}))
     }).transpose()
 }
 

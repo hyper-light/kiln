@@ -1949,6 +1949,12 @@ async fn build_step(hub: &Arc<Hub>, repo: &Repo, path: &str, trunk: &str, policy
     // A candidate is held to each of its landers: a secret only every one of them may use.
     let landers: Vec<Value> = built.iter().filter_map(|(e, _)| e.started_by.clone()).collect();
     let started_by = (!landers.is_empty()).then(|| json!({ "name": "the batch's landers", "all": landers }));
+    // W29-R25: the candidate may use a dependency pin a person accepted in one of its cleared
+    // revisions. Unregistered, its checks refuse that pin (KCI4055) rather than run it.
+    let reviewed: Vec<_> = built.iter().flat_map(|(entry, _)| entry.pinned.iter().map(|pin| pin.commit.clone())).collect();
+    if let Err(why) = super::locks::lock_candidate(hub, repo, &tip, &reviewed).await {
+        tracing::warn!(repo = %repo.name, candidate = %tip, error = %why, "the candidate's accepted dependency pins weren't registered");
+    }
     let events = candidate_events(&ctx, repo, trunk, &base, &head, &batch, &names, started_by);
     let started = start_checks(hub, repo, &events).await.unwrap_or_else(|e| {
         tracing::warn!(repo = %repo.name, error = %format!("{e:#}"), "the candidate's workflows didn't start");
@@ -2039,6 +2045,10 @@ async fn keep(hub: &Hub, standings: &BTreeMap<String, queue::Standing>) -> anyho
 /// The trunk moved (`mv`): the entries' diffs landed, each by its commit, each entry's land kept
 /// (docs/ci.md W28-R108); the open diffs above them restacked.
 async fn landed(hub: &Arc<Hub>, repo: &Repo, path: &str, trunk: &str, batch: &[(Entry, BTreeMap<String, String>)], mv: &Move, policy: &land::Policy) -> anyhow::Result<()> {
+    // The trunk has moved: what it landed is recorded however the dependency record goes.
+    if let Err(why) = super::locks::lock_landed(hub, repo, &mv.candidate, &mv.to).await {
+        tracing::warn!(repo = %repo.name, %trunk, landed = %mv.to, error = %why, "the landed dependency acceptances weren't recorded");
+    }
     // Signed as the queue that tested it, as it moved the trunk (W27-R07): a land kiln can't sign
     // stands, unsigned, and says so.
     let carried: Vec<(String, String)> = batch.iter().flat_map(|(e, commits)| e.diffs.iter().filter_map(|d| commits.get(d).map(|c| (d.clone(), c.clone())))).collect();
@@ -2507,6 +2517,14 @@ async fn follow_host(hub: &Arc<Hub>, repo: &Repo, trunk: &str, forge: &dyn Forge
     match queue::on_host(&ons) {
         queue::HostVerdict::Landed { commits } => {
             let landed: BTreeMap<String, String> = commits.into_iter().map(|(n, c)| (format!("#{n}"), c)).collect();
+            // W29-R25: its host merged each change; a pin a person accepted in its cleared head
+            // becomes this consumer's, never another's.
+            for pin in &e.pinned {
+                let Some(commit) = landed.get(&pin.diff) else { continue };
+                if let Err(why) = super::locks::lock_landed_on_host(hub, repo, &pin.commit, commit).await {
+                    tracing::warn!(entry = %e.id, change = %pin.diff, error = %why, "the landed dependency acceptances weren't recorded");
+                }
+            }
             let (id, list) = (e.id.clone(), serde_json::to_string(&landed)?);
             hub.store.call(move |c| Ok(c.execute("UPDATE land_queue SET state = 'landed', commits = ?2, updated_at = ?3 WHERE id = ?1", params![id, list, crate::util::now_unix()]).map(|_| ())?)).await?;
             let via = e.route.clone().unwrap_or_default();

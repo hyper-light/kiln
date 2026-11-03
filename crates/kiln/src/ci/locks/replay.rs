@@ -33,12 +33,14 @@ impl Parsed {
 /// The workflow/source merge has succeeded, or only the two generated lockfiles conflict.
 /// `base`, `onto` and `change` are clean commits, so conflict markers never become source facts.
 pub(crate) async fn regenerate_tree(hub: &Hub, path: &str, base: &str, onto: &str, change: &str, tree: &str) -> Result<String, String> {
+    let changed_commit = change.to_owned();
     let (base, onto_locks, change) = (Raw::read(hub, Path::new(path), base).await?, Raw::read(hub, Path::new(path), onto).await?, Raw::read(hub, Path::new(path), change).await?);
     if !base.any() && !onto_locks.any() && !change.any() { return Ok(tree.to_owned()); }
     let repo = hub.store.repos().await.map_err(|_| "KCI4051 replay repository could not be read")?.into_iter().find(|r| crate::gitops::git_dir(hub, r) == Path::new(path)).ok_or("KCI4051 replay lock owner could not be identified")?;
     let (base, onto_locks, change) = (base.parse()?, onto_locks.parse()?, change.parse()?);
     let home = Owner { repository: repo.name.clone(), commit: onto.into(), remote: None, revision: None }.home_host(hub, &repo);
-    let seed = replay::accepted(replay::Input { base: base.pair(), onto: onto_locks.pair(), change: change.pair(), reviewed: replay::Pair::default(), home_host: &home }).map_err(|ds| ds.iter().map(|d| d.render(kiln::PATH)).collect::<Vec<_>>().join("\n"))?;
+    let reviewed = super::approvals::seeds(hub, &repo, &changed_commit).await?;
+    let seed = replay::accepted(replay::Input { base: base.pair(), onto: onto_locks.pair(), change: change.pair(), reviewed: replay::Pair { github: reviewed.github.as_ref(), kiln: reviewed.kiln.as_ref() }, home_host: &home }).map_err(|ds| ds.iter().map(|d| d.render(kiln::PATH)).collect::<Vec<_>>().join("\n"))?;
     let github = seed.github.map(|f| f.write(&home).map(String::into_bytes)).transpose().map_err(|ds| ds.iter().map(|d| d.render(github::PATH)).collect::<Vec<_>>().join("\n"))?;
     let native = seed.kiln.map(|f| f.write().map(String::into_bytes)).transpose().map_err(|ds| ds.iter().map(|d| d.render(kiln::PATH)).collect::<Vec<_>>().join("\n"))?;
     let edits = [(github::PATH.into(), github), (kiln::PATH.into(), native)].into();

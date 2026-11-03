@@ -140,6 +140,7 @@ fn reaches_out(method: &Method, rest: &[&str]) -> bool {
             | (&Method::POST, ["repos", _, "workflows", .., "dispatches" | "edit"])
             | (&Method::POST, ["repos", _, "releases"])
             | (&Method::POST, ["repos", _, "locks"])
+            | (&Method::POST, ["repos", _, "locks", "accept"])
             | (&Method::GET, ["repos", _, "locks", "verify"])
             | (&Method::GET, ["runs", _, "pending" | "artifacts"])
             | (&Method::GET, ["runs", _, "artifacts", _, "download"])
@@ -187,6 +188,10 @@ async fn outside(hub: &Arc<Hub>, method: &Method, rest: &[&str], q: &HashMap<Str
         (&Method::POST, ["repos", repo, "locks"]) => {
             let caller = caller.cloned().unwrap_or_else(crate::authz::Caller::owner);
             Ok(ok(&super::locks::update(hub, &caller, repo, &body).await?))
+        }
+        (&Method::POST, ["repos", repo, "locks", "accept"]) => {
+            let caller = caller.ok_or_else(|| (StatusCode::FORBIDDEN, "accepting dependency code needs a person's signed-in session".to_owned()))?;
+            Ok(ok(&super::locks::accept(hub, caller, repo, &body).await?))
         }
         (&Method::GET, ["repos", repo, "locks", "verify"]) => {
             let caller = caller.cloned().unwrap_or_else(crate::authz::Caller::owner);

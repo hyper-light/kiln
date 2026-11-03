@@ -164,6 +164,8 @@ pub async fn ready(hub: &Arc<Hub>, caller: &Caller, repo: &Repo, d: &mut Draft) 
     if d.state != "draft" {
         return Err((StatusCode::CONFLICT, format!("{} is in review already (W29-R12)", d.name.as_deref().unwrap_or(&d.path))));
     }
+    let before = head(hub, repo, d).await.map_err(|e| (StatusCode::CONFLICT, format!("the draft's exact head is unavailable: {e:#}")))?;
+    super::locks::ready_locks(hub, repo, d, &before).await?;
     if d.kind == "diff" {
         let diff = diff_of(hub, d).await?;
         crate::ci::diffs::ready_as(hub, &diff, caller).await?;
@@ -176,6 +178,11 @@ pub async fn ready(hub: &Arc<Hub>, caller: &Caller, repo: &Repo, d: &mut Draft) 
             crate::githost::CommitError::Other(e) => (StatusCode::BAD_GATEWAY, format!("{}'s host refused the draft's ready commit: {e:#}", repo.name)),
         })?;
         d.head = Some(sha);
+        // The ready commit has the reviewed tree; its proof follows it. The host has the commit
+        // already, so a failure here only leaves the evidence on the earlier head.
+        if let Err((_, why)) = super::locks::carry_ready_locks(hub, repo, d, &before, d.head.as_deref().unwrap_or_default()).await {
+            tracing::warn!(draft = %d.id, error = %why, "the dependency review evidence didn't follow the ready commit");
+        }
         host.ready_change(hub, repo, number).await.map_err(|e| (StatusCode::BAD_GATEWAY, format!("the draft's head is ready, but its change isn't marked so: {e:#}")))?;
     }
     moved(hub, caller, d, "review", "ready").await

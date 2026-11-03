@@ -270,6 +270,10 @@ pub fn ops() -> &'static [Op] {
                 input: Input::of::<input::CiLocksVerify>(),
                 route: |v| Ok((Method::GET, path(&["repos", &text(v, "repo")?, "locks", "verify"]), query(v, &["sha"]))),
                 run: |cx: Cx, v: Value| async move { super::locks::verify_repo(&cx.hub, &cx.caller, &text(&v, "repo")?, &query(&v, &["sha"])).await }),
+            op!("ci.locks.accept", "A person's explicit acceptance of an exact draft head and upstream code evidence hash. Scoped to this consumer; starts no run and grants no merge approval. Agent and token principals cannot accept it.", ro: false, destructive: false,
+                input: Input::of::<input::CiLocksAccept>(),
+                route: |v| Ok((Method::POST, path(&["repos", &text(v, "repo")?, "locks", "accept"]), HashMap::new())),
+                run: |cx: Cx, v: Value| async move { let repo = text(&v, "repo")?; let body = json!({ "draft": text(&v, "draft")?, "head": text(&v, "head")?, "evidence_sha256": text(&v, "evidence_sha256")? }); super::locks::accept(&cx.hub, &cx.caller, &repo, &body).await }),
             op!("ci.images.build", "Build a runner image's definition as you have it, saved or not (W21-R08): `kiln/build-image@v1` on what `runs_on` names, from `.kiln/images/<name>/`. With `push`, pushed to kiln's registry and registered: the server owner's only. Watch the run and read its log after.", ro: false, destructive: false,
                 input: Input::of::<input::CiImagesBuild>(),
                 route: |v| Ok((Method::POST, path(&["images", "build"]), query(v, &["repo"]))),
@@ -1250,6 +1254,15 @@ pub mod input {
         pub repo: String,
         /// Its default branch when omitted.
         pub sha: Option<String>,
+    }
+
+    #[derive(Debug, Deserialize, JsonSchema)]
+    #[serde(deny_unknown_fields)]
+    pub struct CiLocksAccept {
+        pub repo: String,
+        pub draft: String,
+        pub head: String,
+        pub evidence_sha256: String,
     }
 
     #[derive(Debug, Deserialize, JsonSchema)]

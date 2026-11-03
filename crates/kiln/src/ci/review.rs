@@ -810,6 +810,7 @@ pub async fn review(hub: &std::sync::Arc<Hub>, d: &Diff, caller: &Caller, body: 
         None => None,
     };
     let (id, me2, text2, rid) = (d.id.clone(), me.clone(), text.clone(), crate::util::new_id());
+    let lock_review = rid.clone();
     let (published, drafts) = hub
         .store
         .call(move |c| {
@@ -849,6 +850,11 @@ pub async fn review(hub: &std::sync::Arc<Hub>, d: &Diff, caller: &Caller, body: 
         })
         .await
         .map_err(fail)?;
+    // W29-R25: a person's accept of a lock-change draft's exact version is also their word on
+    // its upstream code. The review stands whether or not that proof can be kept.
+    if action == Action::Accept && let Some(version) = versions.last() && let Err((_, why)) = super::locks::record_review(hub, d, version, caller, &lock_review).await {
+        tracing::warn!(diff = %d.name, error = %why, "the review's dependency acceptance wasn't recorded");
+    }
     tell(hub, d, &me, drafts);
     if !text.is_empty() {
         let named = kiln_ci::trigger::context::mentions(&text);

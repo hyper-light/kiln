@@ -16,6 +16,8 @@ pub(super) struct Seen {
     current: String,
     pub previous: Option<String>,
     pub approved: bool,
+    global_previous: Option<String>,
+    scoped: bool,
 }
 
 fn binding(hub: &Hub, remote: &Remote, revision: &Revision) -> (String, String, bool) {
@@ -69,7 +71,8 @@ impl Seen {
             Ok((identity, recorded))
         }).await.map_err(|_| "KCI4051 dependency history could not be read")?;
         let approved = recorded.as_ref().is_some_and(|(sha, change, by)| sha == &revision.commit && change.as_ref().is_some_and(|s| !s.is_empty()) && by.as_ref().is_some_and(|s| !s.is_empty()));
-        let mut got = Self { source: name, publisher, native, identity, old_identity, reference: revision.reference.clone(), current: revision.commit.to_ascii_lowercase(), previous: recorded.map(|r| r.0), approved };
+        let previous = recorded.map(|r| r.0);
+        let mut got = Self { source: name, publisher, native, identity, old_identity, reference: revision.reference.clone(), current: revision.commit.to_ascii_lowercase(), global_previous: previous.clone(), previous, approved, scoped: false };
         // Old ci_uses rows did not record numeric identities. Seed only with an old accepted
         // commit proved in this same source's captured history, never from a name alone.
         if got.previous.is_none() && got.full() && got.publisher.eq_ignore_ascii_case(&remote.full()) {
@@ -79,15 +82,34 @@ impl Seen {
                 && source.contains(revision.clone(), old.clone()).await.unwrap_or(false)
             { got.previous = Some(old.to_ascii_lowercase()); }
         }
+        got.global_previous = got.previous.clone();
         Ok(got)
+    }
+
+    pub async fn read_for(hub: &Hub, source: &dyn DependencySources, remote: &Remote, revision: &Revision, consumer: &Repo, commit: &str) -> Result<Self, String> {
+        let mut seen = Self::read(hub, source, remote, revision).await?;
+        if super::approvals::allowed(hub, consumer, commit, &revision.identity, &revision.reference, &revision.commit).await? {
+            seen.previous = Some(revision.commit.clone());
+            seen.approved = true;
+            seen.scoped = true;
+        } else if let Some(previous) = super::approvals::previous(hub, consumer, &revision.identity, &revision.reference).await? {
+            seen.previous = Some(previous);
+            seen.approved = false;
+            seen.scoped = true;
+        }
+        Ok(seen)
     }
 
     /// Record a successfully verified first resolution, or an observation about an existing
     /// acceptance. A refused first lookup cannot bless its current commit for the next run.
     pub async fn record(&self, hub: &Hub, caller: Option<&Repo>, workflow: &str, accepted: bool) -> Result<Self, String> {
-        if !accepted && self.previous.is_none() && self.old_identity.is_none() { return Ok(self.clone()); }
+        // W29-R26: a scoped acceptance cannot become a global first acceptance. Observations
+        // still retain the global A; this consumer alone may have reviewed M.
+        let accepted = accepted && !self.scoped;
+        let previous = if self.scoped { self.global_previous.clone() } else { self.previous.clone() };
+        if !accepted && previous.is_none() && self.old_identity.is_none() { return Ok(self.clone()); }
         let (source, publisher, native, identity, reference, current, previous, repo, workflow, full, at) = (
-            self.source.clone(), self.publisher.clone(), self.native, self.identity.clone(), self.reference.clone(), self.current.clone(), self.previous.clone(),
+            self.source.clone(), self.publisher.clone(), self.native, self.identity.clone(), self.reference.clone(), self.current.clone(), previous,
             caller.map(|c| c.id.clone()), workflow.to_owned(), self.full(), crate::util::now_unix(),
         );
         let (old_identity, recorded): (Option<String>, Option<String>) = hub.store.call(move |c| {
@@ -110,7 +132,8 @@ impl Seen {
         }).await.map_err(|_| "KCI4051 dependency history could not be recorded")?;
         let mut effective = self.clone();
         effective.old_identity = old_identity;
-        effective.previous = recorded;
+        effective.global_previous = recorded.clone();
+        effective.previous = if self.scoped { self.previous.clone() } else { recorded };
         Ok(effective)
     }
 }
@@ -119,7 +142,7 @@ impl Capture<'_> {
     pub(super) async fn history(&mut self, remote: &Remote, revision: &Revision) -> Result<Seen, String> {
         let key = Self::ref_key(remote, &revision.reference);
         if let Some(seen) = self.histories.get(&key) { return Ok(seen.clone()); }
-        let seen = Seen::read(self.hub, self.source, remote, revision).await?;
+        let seen = Seen::read_for(self.hub, self.source, remote, revision, self.caller, self.root_commit).await?;
         self.histories.insert(key, seen.clone());
         Ok(seen)
     }
