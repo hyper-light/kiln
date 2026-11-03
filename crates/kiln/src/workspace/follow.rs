@@ -511,6 +511,7 @@ mod tests {
         assert_eq!(place_words(&Place { commit: None, ..at(Some("a.rs"), Some(3), Some(9)) }), ", on a.rs lines 3–9 (version 5)");
     }
 
+    #[cfg(unix)]
     fn within(f: impl std::future::Future<Output = anyhow::Result<()>> + Send + 'static) -> anyhow::Result<()> {
         let (tx, rx) = std::sync::mpsc::channel();
         std::thread::spawn(move || {
@@ -520,6 +521,7 @@ mod tests {
     }
 
     /// What kiln's fake harness in `dir` was sent, each message's text.
+    #[cfg(unix)]
     fn heard(dir: &std::path::Path) -> Vec<String> {
         std::fs::read_to_string(dir.join(".fake-claude-messages"))
             .unwrap_or_default()
