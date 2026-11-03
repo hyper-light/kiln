@@ -115,6 +115,8 @@ pub async fn run(cfg: Config, shutdown: Shutdown) -> anyhow::Result<()> {
     if let Err(e) = crate::identities::own_identities(&hub.store, &pki).await {
         tracing::warn!(error = %format!("{e:#}"), "the server's and CD's identities weren't issued");
     }
+    // The conversation feeds' batches signed for at the server's ends (docs/ci.md W27-R08).
+    crate::custody::feeds::install(&hub);
     hub.runners_before.store(runners_before, std::sync::atomic::Ordering::Relaxed);
     // The names people see of the runners kiln knows by their machine ids, for the sentences that
     // name them (docs/machines.md).
@@ -213,6 +215,9 @@ pub async fn run(cfg: Config, shutdown: Shutdown) -> anyhow::Result<()> {
         child!("identities", h => crate::identities::own_identities_loop(h));
         // The trail's checkpoints, signed as they come due (docs/ci.md W27-R09).
         child!("trail", h => crate::trail::checkpoints_loop(h));
+        // Relays' records no receipt answered, once they lapse: each a break naming its relay
+        // (docs/ci.md W27-R08's relays).
+        child!("relays", h => crate::relays::relays_loop(h));
         // kiln's base chart in its own registry, for apps' charts to depend on (docs/deploy-api.md §3.4).
         child!("kiln-base", h => crate::deploy::init::publish_base(h));
         if cfg.cd.enabled {
@@ -221,6 +226,9 @@ pub async fn run(cfg: Config, shutdown: Shutdown) -> anyhow::Result<()> {
         }
         child!("sync", h => h.sync_loop());
         child!("cluster", h => h.cluster_loop());
+        // Checkpoints of the cluster group's log, to the learners that check them (docs/ci.md
+        // W27-R08).
+        child!("cluster-custody", h => crate::custody::cluster::checkpoints_loop(h));
         child!("tailnet-dns", h => crate::frontdoor::tailnet::run(h));
         child!("in-step", h => crate::updates::in_step_loop(h));
         child!("ui-server", h => crate::uiserver::run(h));

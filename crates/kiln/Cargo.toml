@@ -28,6 +28,10 @@ kiln-http = { path = "../kiln-http" }
 # The seams kiln reaches every product through, with their simulators (docs/seams.md).
 kiln-seams = { path = "../kiln-seams" }
 kiln-obs = { path = "../kiln-obs" }
+# CP-T10.2: the Blobs adapter speaks Mantle's native QUIC object protocol.
+mantle-client = { path = "../../vendor/mantle/crates/client" }
+mantle-protocol = { path = "../../vendor/mantle/crates/protocol" }
+mantle-s3 = { path = "../../vendor/mantle/crates/s3" }
 # Seeded fast hashing for maps of what the store holds (the containers' list): already built for
 # hashbrown and serde_json.
 foldhash = "0.2.0"

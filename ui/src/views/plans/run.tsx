@@ -18,6 +18,7 @@ import { labelOf, useLabels, useRes } from "@/lib/data";
 import { relativeTime } from "@/lib/format";
 import { errorMessage } from "@/lib/hooks";
 import { useSuspenseResource } from "@/lib/resource";
+import { browserSigns } from "@/lib/signing";
 import { ChangeLink, Quiet } from "@/views/harness/change-bar";
 import { PlanGraph, StepBar } from "./graph";
 import { StepGlyph } from "./status";
@@ -126,7 +127,7 @@ function Run({ v, onChange }: { v: PlanRunView; onChange: (v: PlanRunView) => vo
       {v.state !== "running" && error && <span className="plan-error">{error}</span>}
       <ol className="run-steps">
         {v.steps.map((s) => (
-          <Step key={s.n} run={v.id} s={s} stack={v.stack} busy={busy} onAct={(a) => void act(`${s.n}:${a}`, () => plansApi.step(v.id, s.n, a, s.tries))} />
+          <Step key={s.n} run={v.id} s={s} stack={v.stack} busy={busy} onAct={(a) => void act(`${s.n}:${a}`, () => (a === "take" ? plansApi.take(v.id, s.n) : plansApi.step(v.id, s.n, a, s.tries)))} />
         ))}
       </ol>
     </>
@@ -244,7 +245,14 @@ function Step({ run, s, stack, busy, onAct }: { run: string; s: RunStep; stack: 
       )}
       {(live || s.stand === "unmet" || s.stand === "stopped") && (
         <p className="plan-dim run-what">
-          Taken over here, kiln signs your receipt of it for you: this browser has no key. To sign it yourself, <code>kiln login</code>, then <code>{`kiln plans take ${run} ${s.n}`}</code>.
+          {browserSigns() ? (
+            "Taken over here, you sign your receipt of it in this browser, with its own key."
+          ) : (
+            <>
+              Taken over here, kiln signs your receipt of it for you: this page isn't secure (https), so this browser has no key. To sign it yourself, <code>kiln login</code>, then{" "}
+              <code>{`kiln plans take ${run} ${s.n}`}</code>.
+            </>
+          )}
         </p>
       )}
     </li>

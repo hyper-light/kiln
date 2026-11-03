@@ -14,7 +14,10 @@
 //!   its signer, from whom it says, about the same things with the same digests (in-toto's digest
 //!   sets: two records agree on every algorithm they share, and share one). A hand-on hands on
 //!   what its signer received, or what it made from what it received. A take is kiln's server's.
-//!   No custodian's numbering of its streams has a gap. The first hop that doesn't hold is named.
+//!   A relay's pass, or a receipt, may follow its originator's own signed statement (an agent's
+//!   act), of that very statement, where its thing began; a relay's pass of what its sender signs
+//!   nothing of (a frame) follows nothing, its chain beginning there ([`super::relay`]). No
+//!   custodian's numbering of its streams has a gap. The first hop that doesn't hold is named.
 //! - **Entitlement** ([`entitled`]): a signer acting under delegations may do what the nearest one
 //!   gives it, if each gives no more and lasts no longer than the one it acts under, and none has
 //!   ended or been revoked.
@@ -357,6 +360,11 @@ pub enum Break {
     TakenNotByServer { record: String, signer: String, server: String },
     #[error("{0}")]
     Gap(Gap),
+    /// A record that holds its things for someone (its body's `for`) without a delegation from
+    /// them that entitles its signer to (docs/ci.md W27-R08: a machine taking custody for someone
+    /// else does it under a delegation that names them and only narrows). Appended last.
+    #[error("{record} holds them for {held_for}, but not under a delegation from them that entitles it: {why}")]
+    NotEntitled { record: String, held_for: String, why: String },
 }
 
 impl Break {
@@ -377,6 +385,7 @@ impl Break {
             Self::OutOfOrder { .. } => "out-of-order",
             Self::TakenNotByServer { .. } => "taken-not-by-server",
             Self::Gap(_) => "gap",
+            Self::NotEntitled { .. } => "not-entitled",
         }
     }
 }
@@ -404,14 +413,17 @@ fn shared<'a>(a: &'a Subject, b: &'a Subject) -> Vec<(&'a String, &'a String, &'
     a.digest.iter().filter_map(|(alg, hex)| b.digest.get(alg).map(|other| (alg, hex, other))).collect()
 }
 
-/// `here`'s things against `there`'s: a thing is the same thing by its name, else by a digest the
-/// two agree on; the same thing must agree on every algorithm both name, and both must name one.
+/// `here`'s things against `there`'s: a thing is the same thing by its name and a digest the two
+/// agree on (an image's index and its platforms' manifests go by one name), else by its name, else
+/// by a digest the two agree on, one not matched yet first; the same thing must agree on every
+/// algorithm both name, and both must name one.
 fn compare(here: &[Subject], there: &[Subject]) -> Compared {
     let mut matched: BTreeSet<usize> = BTreeSet::new();
     let mut only_here = Vec::new();
     for h in here {
-        let by_name = there.iter().position(|t| t.name == h.name);
-        let found = by_name.or_else(|| there.iter().position(|t| shared(h, t).iter().any(|(_, a, b)| a == b)));
+        let agrees = |t: &Subject| shared(h, t).iter().any(|(_, a, b)| a == b);
+        let first = |is: &dyn Fn(&Subject) -> bool| there.iter().enumerate().position(|(i, t)| is(t) && !matched.contains(&i)).or_else(|| there.iter().position(is));
+        let found = first(&|t| t.name == h.name && agrees(t)).or_else(|| first(&|t| t.name == h.name)).or_else(|| first(&agrees));
         let Some(i) = found else {
             only_here.push(h.name.clone());
             continue;
@@ -514,15 +526,55 @@ fn edge(r: &Checked, rb: &Body, p: &Checked, pb: &Body, server: &str) -> Result<
     Ok(if same.0 > 0 { Edge::Holding } else { Edge::MadeFrom })
 }
 
+/// Whether `c` is an originator's own signed statement (an agent session's act, kiln's server's
+/// word), not a custody record or a delegation: what a relay passes on, which a relay's record or a
+/// receipt may follow ([`crate::identity::relay`]).
+fn originator(c: &Checked) -> bool {
+    c.payload_type != PAYLOAD_CUSTODY && c.payload_type != PAYLOAD_DELEGATION
+}
+
+/// Whether record `r` is about statement `p` itself: one of its things is `p`, by its digest.
+fn about(r: &Checked, p: &Checked) -> bool {
+    let hex = p.digest.strip_prefix("sha256:").unwrap_or(&p.digest);
+    r.statement.subject.iter().any(|t| t.digest.get("sha256").is_some_and(|d| d.eq_ignore_ascii_case(hex)))
+}
+
+/// Whether record `r` (body `rb`) takes `p`, its originator's own signed statement: only a relay's
+/// pass or a receipt may, of that very statement (one of its things, by the statement's digest),
+/// saying it came from the statement's signer.
+fn from_originator(r: &Checked, rb: &Body, p: &Checked) -> Result<(), Break> {
+    if !rb.kind.takes() {
+        return Err(Break::NotCustody { record: p.digest.clone(), payload_type: p.payload_type.clone() });
+    }
+    if !about(r, p) {
+        let thing = r.statement.subject.first().map(|t| t.name.clone()).unwrap_or_default();
+        return Err(Break::NotHandedOn { record: r.digest.clone(), from: p.digest.clone(), thing });
+    }
+    let says = rb.from.clone().unwrap_or_default();
+    if !names(&says, &p.custodian) && !names(&p.custodian, &says) {
+        return Err(Break::NotTheGiver { record: r.digest.clone(), from: p.digest.clone(), says, giver: p.custodian.clone() });
+    }
+    Ok(())
+}
+
 /// Checks record `record`'s own hop: each record it follows, which `records` must hold, followed as
 /// [`walk`] says it may be, and a receipt or a pass following a hand-on. Not the records before
 /// those, nor its custodian's numbering: that's [`walk`]'s. What kiln checks as it takes a record.
 pub fn hop(record: &str, records: &BTreeMap<String, Checked>, server: &str) -> Result<Hop, Break> {
     let r = records.get(record).ok_or_else(|| Break::NoRecord { record: record.to_owned(), followed_by: None })?;
     let rb = body(r)?;
-    let (mut gave, mut held, mut made_from) = (false, false, Vec::new());
+    held_under(r, &rb, records)?;
+    let (mut gave, mut held, mut made_from, mut originated) = (false, false, Vec::new(), false);
     for f in &r.statement.follows {
         let p = records.get(f).ok_or_else(|| Break::NoRecord { record: f.clone(), followed_by: Some(record.to_owned()) })?;
+        // Its originator's own signed statement (an agent's act, kiln's word, or a custody record
+        // of another's, which this record is about by its digest), which a relay passes on: the
+        // thing began there, signed by its originator (docs/ci.md W27-R08's relays).
+        if originator(p) || (about(r, p) && rb.kind.takes()) {
+            from_originator(r, &rb, p)?;
+            (gave, originated) = (true, true);
+            continue;
+        }
         let pb = body(p)?;
         match edge(r, &rb, p, &pb, server)? {
             Edge::Transfer => gave = true,
@@ -530,12 +582,41 @@ pub fn hop(record: &str, records: &BTreeMap<String, Checked>, server: &str) -> R
             Edge::MadeFrom => made_from.push(f.clone()),
         }
     }
-    if rb.kind.takes() && !gave {
+    // A receipt of what came from where kiln has no identity (a registry outside it,
+    // `docker://alpine:3.20`), following nothing: its chain begins there, as its taker received it.
+    let from_outside = rb.kind == Kind::Received && r.statement.follows.is_empty() && rb.from.as_deref().is_some_and(|f| !f.is_empty() && !f.starts_with("kiln://"));
+    // A relay's pass of what its sender signs nothing of (a frame of kiln's server, a reach link's
+    // ciphertext), following nothing: its chain begins at the relay, as the relay records it.
+    let unsigned = rb.kind == Kind::PassedOn && r.statement.follows.is_empty();
+    if rb.kind.takes() && !gave && !from_outside && !unsigned {
         return Err(Break::NoHandOn { record: record.to_owned(), kind: rb.kind });
     }
-    let began = !rb.kind.takes() && !held;
+    let began = (!rb.kind.takes() && !held) || from_outside || originated || unsigned;
     let taken_for = rb.taken_for.clone().filter(|_| r.custodian == server);
     Ok(Hop { record: record.to_owned(), kind: rb.kind, custodian: r.custodian.clone(), taken_for, at: r.at, subject: r.statement.subject.clone(), made_from, began })
+}
+
+/// Whether record `r` (body `b`), when it takes its things for someone (its `for`: an agent
+/// session whose run another machine does), does so under a delegation from them among `records`,
+/// the one its `under` names: one naming its signer as delegate and entitling it to receive each of
+/// its things ([`receive_scope`]), as of when kiln took it.
+fn held_under(r: &Checked, b: &Body, records: &BTreeMap<String, Checked>) -> Result<(), Break> {
+    let Some(whom) = b.held_for.as_deref().filter(|w| !w.is_empty() && b.kind.takes()) else { return Ok(()) };
+    let refuse = |why: String| Break::NotEntitled { record: r.digest.clone(), held_for: whom.to_owned(), why };
+    let Some(under) = r.statement.under.as_deref() else { return Err(refuse("it names no delegation it acts under".into())) };
+    let d = records.get(under).ok_or_else(|| Break::NoRecord { record: under.to_owned(), followed_by: Some(r.digest.clone()) })?;
+    let g = grant(d).map_err(|why| refuse(format!("{under} isn't a delegation kiln reads: {why}")))?;
+    if !names(&g.delegate, &r.custodian) {
+        return Err(refuse(format!("{under} delegates to {}, not to {}, who signed it", g.delegate, r.custodian)));
+    }
+    if !names(whom, &d.custodian) && !names(&d.custodian, whom) {
+        return Err(refuse(format!("{under} is signed by {}", d.custodian)));
+    }
+    let u = Under { statement: r.clone(), through: vec![d.clone()] };
+    for t in &r.statement.subject {
+        entitled(&u, &receive_scope(t), r.at, &[]).map_err(|e| refuse(e.to_string()))?;
+    }
+    Ok(())
 }
 
 /// Walks a thing's chain of custody back from record `from` (by its digest), where it's used,
@@ -553,7 +634,8 @@ pub fn walk(from: &str, records: &BTreeMap<String, Checked>, server: &str) -> Re
         }
         let h = hop(&d, records, server)?;
         if let Some(r) = records.get(&d) {
-            next.extend(r.statement.follows.iter().cloned());
+            // An originator's own statement is where its thing began, not a hop of its own.
+            next.extend(r.statement.follows.iter().filter(|f| records.get(*f).is_none_or(|p| !originator(p))).cloned());
         }
         if h.began {
             walked.began.push(d);
@@ -654,6 +736,91 @@ pub fn fence(held: &Held, signer: &Identity) -> Result<(), Fenced> {
 /// A custody body as JSON, for a [`statement::Statement`]'s body.
 pub fn to_value(b: &Body) -> Value {
     serde_json::to_value(b).unwrap_or(Value::Null)
+}
+
+/// A peer runner's hand-on of an object of its cache to the runner that asked for it (docs/ci.md
+/// W24-R27; the Transfers plan's step 12): `by` the holder, `to` the taker, the object of `repo` by
+/// its SHA-256. Both sides build it alike, and a statement's digest leaves its signer out, so the
+/// taker's receipt follows its digest without its bytes ever crossing to the taker.
+pub fn peer_object_hand_on(by: &str, to: &str, repo: &str, sha256: &str) -> statement::Statement {
+    let body = Body { to: Some(to.to_owned()), why: "an object of its cache, to the peer that asked for it".into(), ..Body::new(Kind::HandedOn, by) };
+    statement::Statement { subject: vec![peer_object(repo, sha256)], ..statement::Statement::new(to_value(&body)) }
+}
+
+/// The taker's receipt of [`peer_object_hand_on`] (its digest `hand_on`), of the object by the
+/// SHA-256 it hashed to (`got`): a copy that isn't what its name says breaks at that hop, naming
+/// the peer (`from`).
+pub fn peer_object_receipt(by: &str, from: &str, repo: &str, got: &str, hand_on: &str) -> statement::Statement {
+    let body = Body { from: Some(from.to_owned()), why: "an object of a peer's cache".into(), ..Body::new(Kind::Received, by) };
+    statement::Statement { subject: vec![peer_object(repo, got)], follows: vec![hand_on.to_owned()], ..statement::Statement::new(to_value(&body)) }
+}
+
+/// An object of `repo`'s cache by its SHA-256 (`sha256:<hex>` or the hex).
+fn peer_object(repo: &str, sha256: &str) -> Subject {
+    by_sha256(&format!("object of {repo}"), sha256)
+}
+
+/// `name`, by its SHA-256 (`sha256:<hex>` or the hex).
+fn by_sha256(name: &str, sha256: &str) -> Subject {
+    let hex = sha256.strip_prefix("sha256:").unwrap_or(sha256).to_ascii_lowercase();
+    Subject { name: name.to_owned(), digest: BTreeMap::from([("sha256".to_owned(), hex)]), ..Subject::default() }
+}
+
+/// What a delegation entitles the runner that runs an agent session's run on another machine to:
+/// its workspace, as the sync left it (docs/ci.md W27-R08; the Transfers plan's step 12).
+pub const RECEIVE_WORKSPACE: &str = "receive:workspace";
+/// ... and the run itself.
+pub const RECEIVE_RUN: &str = "receive:run";
+
+/// What receiving `thing` for someone takes: `receive:` and its kind, its name's first word
+/// (`receive:workspace` for "workspace kiln-…", `receive:run` for "run 3").
+pub fn receive_scope(thing: &Subject) -> String {
+    format!("receive:{}", thing.name.split_whitespace().next().unwrap_or_default())
+}
+
+/// What one runner hands another over a reach link (docs/ci.md W27-R08; the Transfers plan's step
+/// 12), by its SHA-256: the workspace a sync left as copy `key` (its tree's digest, as `kiln run
+/// --reuse` reads one), ...
+pub fn reach_workspace(key: &str, sha256: &str) -> Subject {
+    by_sha256(&format!("workspace {key}"), sha256)
+}
+
+/// ... run `id` of the asker's reach session (the digest of what it runs, where, with what and on
+/// which workspace), ...
+pub fn reach_run(id: u64, sha256: &str) -> Subject {
+    by_sha256(&format!("run {id}"), sha256)
+}
+
+/// ... and run `id`'s output (the SHA-256 of its bytes, in the order the run said them).
+pub fn reach_output(id: u64, sha256: &str) -> Subject {
+    by_sha256(&format!("output of run {id}"), sha256)
+}
+
+/// `by`'s hand-on of `thing` to `to` across a reach link, held for `held_for` (the agent session
+/// whose it is, when `by` isn't it), following `follows` (the receipt of what it was made from), for
+/// `why`. Both sides build it alike: a statement's digest leaves its signer out, and it says no
+/// time, so the taker's receipt follows it by a digest the taker works out too.
+pub fn reach_hand_on(by: &str, to: &str, held_for: Option<&str>, thing: Subject, follows: Vec<String>, why: &str) -> statement::Statement {
+    let body = Body { to: Some(to.to_owned()), held_for: held_for.map(str::to_owned), why: why.to_owned(), ..Body::new(Kind::HandedOn, by) };
+    statement::Statement { subject: vec![thing], follows, ..statement::Statement::new(to_value(&body)) }
+}
+
+/// `by`'s receipt across a reach link of `hand_on` (its digest) from `from`, of `thing` by what it
+/// got, held for `held_for` under delegation `under` (by its digest) when it takes custody for
+/// someone else. A digest that changed on the way breaks the chain at this hop.
+pub fn reach_receipt(by: &str, from: &str, held_for: Option<&str>, thing: Subject, hand_on: &str, under: Option<&str>, why: &str) -> statement::Statement {
+    let body = Body { from: Some(from.to_owned()), held_for: held_for.map(str::to_owned), why: why.to_owned(), ..Body::new(Kind::Received, by) };
+    statement::Statement { subject: vec![thing], follows: vec![hand_on.to_owned()], under: under.map(str::to_owned), ..statement::Statement::new(to_value(&body)) }
+}
+
+/// The delegation agent session `by` (its identity at its epoch) gives runner process `delegate`,
+/// which runs a run of the session's on another machine ([`PAYLOAD_DELEGATION`]): to receive the
+/// run and its workspace for the session, nothing more ([`RECEIVE_WORKSPACE`], [`RECEIVE_RUN`]).
+/// It says no end and no time: it lasts as long as the session's epoch (its signer's certificate),
+/// and the same session, epoch and runner give the same delegation, which kiln keeps once.
+pub fn reach_delegation(by: &str, delegate: &str) -> statement::Statement {
+    let grant = Grant { v: VERSION, by: by.to_owned(), delegate: delegate.to_owned(), may: vec![RECEIVE_WORKSPACE.to_owned(), RECEIVE_RUN.to_owned()], until: None };
+    statement::Statement::new(serde_json::to_value(&grant).unwrap_or(Value::Null))
 }
 
 /// An act's payload type ([`Act`]).
@@ -834,6 +1001,15 @@ mod tests {
             let key = KeyPair::generate()?;
             let serial: Vec<u8> = std::iter::once(0x42).chain(Sha256::digest(key.der_bytes()).iter().take(8).copied()).collect();
             p.serial_number = Some(SerialNumber::from_slice(&serial));
+            // A leg's names the facts its kind needs: its commit and its workflow.
+            if uri.contains("/leg/") {
+                use crate::identity::chain::fulcio;
+                for (member, value) in [(fulcio::SOURCE_REPOSITORY_DIGEST, "4c1e2a90d1f3b5a7c9e1f3a5b7c9d1e3f5a7b9c1"), (fulcio::BUILD_SIGNER_URI, "https://kiln.home/hyper-light/kiln/.kiln/ci.yml@refs/heads/main")] {
+                    let mut oid = fulcio::ARC.to_vec();
+                    oid.push(member);
+                    p.custom_extensions.push(rcgen::CustomExtension::from_oid_content(&oid, crate::identity::chain::der_utf8_string(value).ok_or_else(|| anyhow::anyhow!("too long"))?));
+                }
+            }
             Ok(Self { uri: uri.to_owned(), der: p.signed_by(&key, &ca.issuer)?.der().to_vec(), key })
         }
 
@@ -890,7 +1066,12 @@ mod tests {
     impl Kept {
         /// `s`, signed by `by`, taken by kiln at `at`: its digest.
         fn take(&mut self, ca: &Ca, by: &Signer, s: &Statement, at: i64) -> anyhow::Result<String> {
-            let c = verify(&by.sign(PAYLOAD_CUSTODY, s)?, &ca.der, &[], at)?;
+            self.take_as(ca, by, PAYLOAD_CUSTODY, s, at)
+        }
+
+        /// [`Kept::take`], as `payload_type` (a delegation).
+        fn take_as(&mut self, ca: &Ca, by: &Signer, payload_type: &str, s: &Statement, at: i64) -> anyhow::Result<String> {
+            let c = verify(&by.sign(payload_type, s)?, &ca.der, &[], at)?;
             let d = c.digest.clone();
             self.records.insert(d.clone(), c);
             Ok(d)
@@ -1083,6 +1264,237 @@ mod tests {
         let r = walk(&l.deployed, &kept.records, SERVER);
         assert!(matches!(&r, Err(Break::NoRecord { record, followed_by: Some(by) }) if record == &l.built && by == &l.stored), "{r:?}");
         assert!(r.is_err_and(|e| e.to_string().contains("which")));
+        Ok(())
+    }
+
+    /// W27-R08 (the Transfers plan's step 11): a leg's receipt of an image from a registry kiln has
+    /// no identity of begins its chain there, as the leg received it; a receipt from one of kiln's
+    /// identities with no hand-on before it is still a break.
+    #[test]
+    fn w27_r08_a_receipt_from_outside_kiln_begins_its_chain() -> anyhow::Result<()> {
+        let ca = ca()?;
+        let fedora = Signer::new(&ca, FEDORA)?;
+        let image = thing("image docker.io/library/alpine:3.20", 'c');
+        let mut kept = Kept::default();
+        let got = kept.take(&ca, &fedora, &record(Kind::Received, std::slice::from_ref(&image), None, Some("docker://alpine:3.20"), &[], "custody", 1), AT - 1)?;
+        let w = walk(&got, &kept.records, SERVER)?;
+        assert_eq!(w.began, vec![got.clone()]);
+        assert!(w.hops.iter().all(|h| h.kind == Kind::Received && h.began));
+        let mut kept = Kept::default();
+        let from_kiln = kept.take(&ca, &fedora, &record(Kind::Received, std::slice::from_ref(&image), None, Some(SERVER), &[], "custody", 1), AT - 1)?;
+        let r = walk(&from_kiln, &kept.records, SERVER);
+        assert!(matches!(&r, Err(Break::NoHandOn { record, .. }) if record == &from_kiln), "{r:?}");
+        Ok(())
+    }
+
+    /// W27-R08 (the Transfers plan's step 11): a leg's inputs, from the land to what it made. kiln
+    /// hands fedora-2's runner the leg's assignment, its commit and the tarball it served it; the
+    /// runner receives each and hands each the leg's executor needs to it ([`crate::attest::leg::
+    /// runner_custody`]); the leg receives them, builds, and hands the image it made to kiln, which
+    /// receives it. Walked back from kiln's receipt: every hop a hand-on and its receipt, begun only
+    /// where kiln handed the leg's inputs on, none left unanswered. The tarball changed in transit:
+    /// the runner's receipt of what it got breaks at that hop.
+    #[test]
+    fn w27_r08_a_legs_inputs_walk_from_kiln_to_what_it_made() -> anyhow::Result<()> {
+        use crate::attest::leg::{self, Handed, Receipt};
+        let leg_uri = format!("{FEDORA}/run/812/attempt/1/leg/build");
+        assert_eq!(leg::runner_of(&leg_uri).map_err(anyhow::Error::msg)?, FEDORA);
+        let ca = ca()?;
+        let (server, runner, built) = (Signer::new(&ca, SERVER)?, Signer::new(&ca, FEDORA)?, Signer::new(&ca, &leg_uri)?);
+        let commit = Subject { name: "commit".into(), digest: BTreeMap::from([("gitCommit".to_owned(), "4c1e2a".repeat(7).get(..40).unwrap_or_default().to_owned())]), ..Subject::default() };
+        let (assignment, tarball) = (thing("assignment", 'a'), thing("checkout", 'b'));
+        let mut kept = Kept::default();
+        let mut handed = Vec::new();
+        for (n, t) in [&assignment, &commit, &tarball].into_iter().enumerate() {
+            let d = kept.take(&ca, &server, &record(Kind::HandedOn, std::slice::from_ref(t), Some(FEDORA), None, &[], "inputs", n as u64 + 1), AT - 10)?;
+            handed.push(Handed { subject: t.clone(), hand_on: d, from: SERVER.into() });
+        }
+        let to_leg = vec![assignment.clone(), tarball.clone()];
+        let (records, hand_ons) = leg::runner_custody(FEDORA, &leg_uri, &handed, &to_leg, "for the leg")?;
+        assert_eq!(hand_ons.len(), to_leg.len());
+        for (st, _) in &records {
+            kept.take(&ca, &runner, st, AT - 8)?;
+        }
+        let receipts: Vec<Receipt> = to_leg.iter().zip(&hand_ons).map(|(t, h)| Receipt { subject: t.clone(), from: FEDORA.into(), why: "from its runner".into(), follows: vec![h.clone()] }).collect();
+        let image = thing("image registry/app", 'e');
+        let mut made = String::new();
+        for (st, d) in leg::custody(&leg_uri, &receipts, vec![image.clone()], SERVER, None)? {
+            kept.take(&ca, &built, &st, AT - 5)?;
+            made = d;
+        }
+        let kilns = kept.take(&ca, &server, &record(Kind::Received, std::slice::from_ref(&image), None, Some(&leg_uri), &[made.as_str()], "leg", 1), AT - 1)?;
+        let w = walk(&kilns, &kept.records, SERVER)?;
+        assert_eq!(w.hops.len(), 3 + records.len() + receipts.len() + 2, "{:#?}", w.hops);
+        // Begun where kiln handed the leg's inputs on, and where the leg made the image from them.
+        let began: Vec<&str> = w.began.iter().filter_map(|b| kept.records.get(b)).map(|c| c.custodian.as_str()).collect();
+        assert_eq!(began.iter().filter(|c| **c == SERVER).count(), 3, "{began:?}");
+        assert_eq!(began.iter().filter(|c| **c == leg_uri).count(), 1, "{began:?}");
+        assert!(w.hops.iter().any(|h| h.custodian == leg_uri && h.kind == Kind::HandedOn && h.began && h.made_from.len() == receipts.len()), "{:#?}", w.hops);
+        assert!(unanswered(&kept.records).is_empty(), "{:?}", unanswered(&kept.records));
+        // The tarball changed in transit: what the runner got isn't what kiln handed on.
+        let got = record(Kind::Received, &[thing("checkout", 'f')], None, Some(SERVER), &[handed.get(2).map(|h| h.hand_on.as_str()).unwrap_or_default()], "refused", 1);
+        let refused = kept.take(&ca, &runner, &got, AT)?;
+        let r = hop(&refused, &kept.records, SERVER);
+        assert!(matches!(&r, Err(Break::Changed { .. })), "{r:?}");
+        Ok(())
+    }
+
+    /// W27-R08 (the Transfers plan's step 12, W24-R27): an object a peer hands on. The holder signs
+    /// its hand-on and sends it to kiln; the taker builds the same hand-on itself, whose digest is
+    /// the same whoever builds it, and its receipt follows it: unbroken. A copy that hashed to
+    /// something else breaks at that hop, naming the peer.
+    #[test]
+    fn w27_r08_a_peers_object_changes_hands_signed_by_both() -> anyhow::Result<()> {
+        let ca = ca()?;
+        let (fedora, jupiter) = (Signer::new(&ca, FEDORA)?, Signer::new(&ca, JUPITER)?);
+        let want = format!("sha256:{}", sha('a'));
+        let mut kept = Kept::default();
+        let handed = kept.take(&ca, &fedora, &peer_object_hand_on(FEDORA, JUPITER, "acme/app", &want), AT - 2)?;
+        let built = digest(PAYLOAD_CUSTODY, &payload(&peer_object_hand_on(FEDORA, JUPITER, "acme/app", &want))?);
+        assert_eq!(built, handed, "the taker's build of the hand-on has the holder's digest");
+        let got = kept.take(&ca, &jupiter, &peer_object_receipt(JUPITER, FEDORA, "acme/app", &want, &built), AT - 1)?;
+        let w = walk(&got, &kept.records, SERVER)?;
+        assert_eq!(w.hops.iter().map(|h| (h.kind, h.custodian.as_str())).collect::<Vec<_>>(), vec![(Kind::Received, JUPITER), (Kind::HandedOn, FEDORA)]);
+        let wrong = kept.take(&ca, &jupiter, &peer_object_receipt(JUPITER, FEDORA, "acme/app", &sha('f'), &built), AT)?;
+        let r = hop(&wrong, &kept.records, SERVER);
+        assert!(matches!(&r, Err(Break::Changed { from, .. }) if from == &handed), "{r:?}");
+        Ok(())
+    }
+
+    /// W27-R08 (the Transfers plan's step 12, its example): kiln run on jupiter for an agent session
+    /// at epoch 1, held by fedora-2's runner. The session hands its workspace and its run to
+    /// jupiter's runner, with a delegation to receive both for it; jupiter receives each for the
+    /// session under that delegation and hands the run's output back, which the session receives:
+    /// unbroken, every hop signed by both sides. A workspace changed on its way breaks at that hop;
+    /// a receipt for the session under no delegation of the session's to that runner entitling it
+    /// to receive the thing doesn't hold.
+    #[test]
+    fn w27_r08_a_reach_run_changes_hands_under_the_sessions_delegation() -> anyhow::Result<()> {
+        const SESSION: &str = "kiln://hyper-light/person/ada/agent/01a1751c/epoch/1";
+        const HELD: &str = "kiln://hyper-light/person/ada/agent/01a1751c/epoch/1/machine/fedora-2/instance/01a174ed";
+        let ca = ca()?;
+        let (session, jupiter, fedora) = (Signer::new(&ca, HELD)?, Signer::new(&ca, JUPITER)?, Signer::new(&ca, FEDORA)?);
+        let mut kept = Kept::default();
+        let g = kept.take_as(&ca, &session, PAYLOAD_DELEGATION, &reach_delegation(HELD, JUPITER), AT - 20)?;
+        assert_eq!(digest(PAYLOAD_DELEGATION, &payload(&session.says(&reach_delegation(HELD, JUPITER)))?), g, "the same session, epoch and runner: the same delegation");
+        let ws = reach_workspace("kiln-1b2c3d4e5f", &sha('1'));
+        let h_ws = kept.take(&ca, &session, &reach_hand_on(HELD, JUPITER, None, ws.clone(), Vec::new(), "the workspace of a run"), AT - 19)?;
+        let r_ws = kept.take(&ca, &jupiter, &reach_receipt(JUPITER, HELD, Some(SESSION), ws.clone(), &h_ws, Some(&g), "a workspace to run in"), AT - 18)?;
+        let run = reach_run(1, &sha('2'));
+        let h_run = kept.take(&ca, &session, &reach_hand_on(HELD, JUPITER, None, run.clone(), Vec::new(), "a run"), AT - 17)?;
+        let r_run = kept.take(&ca, &jupiter, &reach_receipt(JUPITER, HELD, Some(SESSION), run.clone(), &h_run, Some(&g), "a run to do"), AT - 16)?;
+        let out = reach_output(1, &sha('3'));
+        let h_out = kept.take(&ca, &jupiter, &reach_hand_on(JUPITER, SESSION, None, out.clone(), vec![r_run.clone()], "the run's output"), AT - 15)?;
+        let r_out = kept.take(&ca, &session, &reach_receipt(HELD, JUPITER, None, out.clone(), &h_out, None, "its run's output"), AT - 14)?;
+        let hops = |from: &str| -> anyhow::Result<Vec<(Kind, String)>> { Ok(walk(from, &kept.records, SERVER)?.hops.into_iter().map(|h| (h.kind, h.custodian)).collect()) };
+        assert_eq!(hops(&r_out)?, vec![(Kind::Received, HELD.to_owned()), (Kind::HandedOn, JUPITER.to_owned()), (Kind::Received, JUPITER.to_owned()), (Kind::HandedOn, HELD.to_owned())]);
+        assert_eq!(hops(&r_ws)?, vec![(Kind::Received, JUPITER.to_owned()), (Kind::HandedOn, HELD.to_owned())]);
+        assert_eq!((receive_scope(&ws), receive_scope(&run)), (RECEIVE_WORKSPACE.to_owned(), RECEIVE_RUN.to_owned()));
+        // Changed on its way: jupiter's receipt of what it got breaks at that hop.
+        let changed = kept.take(&ca, &jupiter, &reach_receipt(JUPITER, HELD, Some(SESSION), reach_workspace("kiln-1b2c3d4e5f", &sha('f')), &h_ws, Some(&g), "a workspace to run in"), AT - 13)?;
+        let r = hop(&changed, &kept.records, SERVER);
+        assert!(matches!(&r, Err(Break::Changed { from, .. }) if from == &h_ws), "{r:?}");
+        // Taken for the session: under no delegation, one to another runner, one another signed,
+        // and one that doesn't entitle receiving the thing.
+        let not_entitled = |kept: &Kept, d: &str, why: &str| {
+            let r = hop(d, &kept.records, SERVER);
+            assert!(matches!(&r, Err(Break::NotEntitled { held_for, why: w, .. }) if held_for == SESSION && w.contains(why)), "{why}: {r:?}");
+        };
+        let none = kept.take(&ca, &jupiter, &reach_receipt(JUPITER, HELD, Some(SESSION), run.clone(), &h_run, None, "a run to do"), AT - 12)?;
+        not_entitled(&kept, &none, "no delegation");
+        let to_fedora = kept.take_as(&ca, &session, PAYLOAD_DELEGATION, &reach_delegation(HELD, FEDORA), AT - 12)?;
+        let other_runner = kept.take(&ca, &jupiter, &reach_receipt(JUPITER, HELD, Some(SESSION), run.clone(), &h_run, Some(&to_fedora), "a run to do"), AT - 11)?;
+        not_entitled(&kept, &other_runner, &format!("delegates to {FEDORA}"));
+        let by_fedora = kept.take_as(&ca, &fedora, PAYLOAD_DELEGATION, &reach_delegation(FEDORA, JUPITER), AT - 11)?;
+        let others = kept.take(&ca, &jupiter, &reach_receipt(JUPITER, HELD, Some(SESSION), run.clone(), &h_run, Some(&by_fedora), "a run to do"), AT - 10)?;
+        not_entitled(&kept, &others, &format!("signed by {FEDORA}"));
+        let object = peer_object("acme/app", &sha('4'));
+        let h_obj = kept.take(&ca, &session, &reach_hand_on(HELD, JUPITER, None, object.clone(), Vec::new(), "an object"), AT - 9)?;
+        let wider = kept.take(&ca, &jupiter, &reach_receipt(JUPITER, HELD, Some(SESSION), object, &h_obj, Some(&g), "an object"), AT - 8)?;
+        not_entitled(&kept, &wider, "receive:object");
+        Ok(())
+    }
+
+    /// W27-R08 (the Transfers plan's step 14): an image's index and its platforms' manifests, pushed
+    /// by one leg, go by one name; each is the same thing as the one of its name with its digest. One
+    /// of them changed still breaks as changed, naming the digest it was.
+    #[test]
+    fn w27_r08_an_index_and_its_manifests_go_by_one_name() -> anyhow::Result<()> {
+        let ca = ca()?;
+        let (fedora, server) = (Signer::new(&ca, FEDORA)?, Signer::new(&ca, SERVER)?);
+        let pushed = [thing("image acme/web", '2'), thing("image acme/web", '3'), thing("image acme/web", '1')];
+        let mut kept = Kept::default();
+        let built = kept.take(&ca, &fedora, &record(Kind::HandedOn, &pushed, Some(SERVER), None, &[], "legs", 1), AT - 3)?;
+        let stored = kept.take(&ca, &server, &record(Kind::Received, &pushed, None, Some(FEDORA), &[&built], "registry", 1), AT - 2)?;
+        assert_eq!(walk(&stored, &kept.records, SERVER)?.hops.len(), 2);
+        let swapped = [thing("image acme/web", '2'), thing("image acme/web", '9'), thing("image acme/web", '1')];
+        let other = kept.take(&ca, &server, &record(Kind::Received, &swapped, None, Some(FEDORA), &[&built], "registry", 2), AT - 1)?;
+        let r = hop(&other, &kept.records, SERVER);
+        assert!(matches!(&r, Err(Break::Changed { digest, .. }) if digest.was == sha('3') && digest.now == sha('9')), "{r:?}");
+        Ok(())
+    }
+
+    /// W27-R08 (the Transfers plan's step 14): a deploy's chain, from the land to each pod. The leg
+    /// builds a multi-platform image (an index and its amd64 and arm64 manifests, one name) and hands
+    /// it to kiln's registry; kiln hands it on to CD for the app's deploys; CD hands the sync's
+    /// manifests and the image to cluster e2e, as the deploy names it; kiln receives them for the
+    /// cluster; the cluster hands it to node m02 (amd64) and node m03 (arm64); each node hands its pod
+    /// its platform's manifest, the index's resolution; each pod runs it, Docker reporting the index.
+    /// Walked back from either pod's receipt: unbroken through the resolution, to the land. A pod
+    /// whose image was swapped runs another: its receipt breaks the chain there.
+    #[test]
+    fn w27_r08_a_deploy_walks_from_the_land_to_its_pods() -> anyhow::Result<()> {
+        use crate::identity::deployed::{self as d, Resolution, Runs};
+        let ca = ca()?;
+        let (server, fedora, cd) = (Signer::new(&ca, SERVER)?, Signer::new(&ca, FEDORA)?, Signer::new(&ca, CD)?);
+        let mut kept = Kept::default();
+        let c = thing("commit 4c1e2a", 'c');
+        let (index, amd, arm) = (sha('1'), sha('2'), sha('3'));
+        let pushed: Vec<Subject> = [&amd, &arm, &index].into_iter().map(|h| d::image("acme/web", h)).collect();
+        let landed = kept.take(&ca, &server, &record(Kind::HandedOn, std::slice::from_ref(&c), Some(FEDORA), None, &[], "land", 1), AT - 90)?;
+        let checkout = kept.take(&ca, &fedora, &record(Kind::Received, std::slice::from_ref(&c), None, Some(SERVER), &[&landed], "legs", 1), AT - 80)?;
+        let built = kept.take(&ca, &fedora, &record(Kind::HandedOn, &pushed, Some(SERVER), None, &[&checkout], "legs", 2), AT - 70)?;
+        let stored = kept.take(&ca, &server, &record(Kind::Received, &pushed, None, Some(FEDORA), &[&built], "registry", 1), AT - 60)?;
+        let app = "shop/web-production";
+        let to_cd = kept.take(&ca, &server, &d::registry_hand_on(SERVER, CD, d::image("acme/web", &index), &stored, app), AT - 50)?;
+        let holding = kept.take(&ca, &cd, &d::cd_receipt(CD, SERVER, d::image("acme/web", &index), Some(&to_cd), app), AT - 49)?;
+        let (name, image) = ("localhost:5000/acme/web", d::image("localhost:5000/acme/web", &index));
+        let deployed = vec![d::manifests(app, "9598c1e546", &sha('a'), 3), image.clone()];
+        let handed = kept.take(&ca, &cd, &d::hand_on(CD, "e2e", deployed.clone(), vec![holding.clone()], "sync 1 of shop/web-production", AT - 40), AT - 40)?;
+        let applied = kept.take(&ca, &server, &d::cluster_receipt(SERVER, "e2e", CD, deployed, &handed, "as its API server answered"), AT - 39)?;
+        let reported = format!("docker-pullable://{name}@sha256:{index}");
+        let mut pods = Vec::new();
+        for (node, platform, manifest, config) in [("m02", "linux/amd64", &amd, 'x'), ("m03", "linux/arm64", &arm, 'y')] {
+            let given = kept.take(&ca, &server, &d::to_node(SERVER, "e2e", node, vec![image.clone()], &applied, "the pods of shop/web-production it scheduled there"), AT - 30)?;
+            let got = kept.take(&ca, &server, &d::node_receipt(SERVER, "e2e", node, vec![image.clone()], &given, "its pods' image"), AT - 29)?;
+            let r = Resolution { image: index.clone(), platform: platform.into(), manifest: manifest.clone(), config: sha(config) };
+            let pod = d::pod_uri("e2e", "shop", &format!("web-{node}"));
+            let to_pod = kept.take(&ca, &server, &d::to_pod(SERVER, "e2e", node, &pod, name, &r, &got, "its container web"), AT - 20)?;
+            assert_eq!(d::runs(&r, &reported), Runs::Follows, "Docker reports the index the deploy named");
+            let runs = kept.take(&ca, &server, &d::pod_receipt(SERVER, "e2e", node, &pod, name, &r, manifest, &reported, &to_pod, "its container web"), AT - 10)?;
+            pods.push((runs, to_pod, got, r, pod, node));
+        }
+        for (runs, to_pod, got, r, pod, node) in &pods {
+            let w = walk(runs, &kept.records, SERVER)?;
+            let custodians: Vec<(Kind, &str, Option<&str>)> = w.hops.iter().map(|h| (h.kind, h.custodian.as_str(), h.taken_for.as_deref())).collect();
+            let (cluster, node_uri) = (d::cluster_uri("e2e"), d::node_uri("e2e", node));
+            for want in [(Kind::Received, SERVER, Some(pod.as_str())), (Kind::Taken, SERVER, Some(node_uri.as_str())), (Kind::Received, SERVER, Some(node_uri.as_str())), (Kind::Taken, SERVER, Some(cluster.as_str())), (Kind::Received, SERVER, Some(cluster.as_str())), (Kind::HandedOn, CD, None), (Kind::Received, CD, None), (Kind::HandedOn, SERVER, None), (Kind::Received, SERVER, None), (Kind::HandedOn, FEDORA, None), (Kind::Received, FEDORA, None)] {
+                assert!(custodians.contains(&want), "{want:?} in {custodians:?}");
+            }
+            // Through the index's resolution: the node's hand-on of its platform's manifest is made
+            // from its receipt of the index.
+            let resolved = w.hops.iter().find(|h| &h.record == to_pod).ok_or_else(|| anyhow::anyhow!("no resolution in {:#?}", w.hops))?;
+            assert_eq!((resolved.made_from.clone(), resolved.subject.first().and_then(|t| t.digest.get("sha256")).cloned()), (vec![got.clone()], Some(r.manifest.clone())));
+            assert!(w.began.contains(&landed), "back to the land: {:?}", w.began);
+            assert!(unanswered(&kept.records).is_empty(), "{:?}", unanswered(&kept.records));
+        }
+        // A pod whose image was swapped after the deploy reports another: it breaks the chain there.
+        let (_, to_pod, _, r, pod, node) = pods.first().ok_or_else(|| anyhow::anyhow!("no pods"))?;
+        let other = sha('9');
+        assert_eq!(d::runs(r, &format!("docker-pullable://registry.k8s.io/pause@sha256:{other}")), Runs::Other(other.clone()));
+        let swapped = kept.take(&ca, &server, &d::pod_receipt(SERVER, "e2e", node, pod, name, r, &other, "docker-pullable://registry.k8s.io/pause", to_pod, "its container web"), AT)?;
+        let b = walk(&swapped, &kept.records, SERVER);
+        assert!(matches!(&b, Err(Break::Changed { record, thing, digest, .. }) if record == &swapped && thing == "image localhost:5000/acme/web for linux/amd64" && digest.was == amd && digest.now == other), "{b:?}");
         Ok(())
     }
 

@@ -4,6 +4,7 @@
 
 pub mod cli;
 pub mod copies;
+pub mod custody;
 pub mod directory;
 pub mod e2e;
 pub mod keep;
@@ -107,6 +108,12 @@ pub enum Question {
         code: crate::wire::unread::Code,
         #[serde(default)]
         why: String,
+    },
+    /// A runner's process that takes reach, as kiln names it (its identity's URI), for a custody
+    /// record of what passes between two runners (docs/ci.md W27-R08).
+    Custody {
+        #[serde(default)]
+        runner: String,
     },
 }
 

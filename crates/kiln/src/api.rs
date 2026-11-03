@@ -561,6 +561,11 @@ async fn authorized(hub: Arc<Hub>, caller: crate::authz::Caller, req: Request) -
             let body: serde_json::Value = boxed(|| srv::body_json(req.into_body(), JSON_LIMIT)).await.map_err(|e| err(StatusCode::BAD_REQUEST, e.to_string()))?;
             boxed(|| crate::ship::hand_off(&hub, &caller, &body)).await.map_err(|(c, m)| err(c, m))
         }
+        // What a person signs to hand it off from a browser, with the browser's own key (W27-R08).
+        (&Method::POST, ["api", "ship", "hand-off", "statement"]) => {
+            let body: serde_json::Value = boxed(|| srv::body_json(req.into_body(), JSON_LIMIT)).await.map_err(|e| err(StatusCode::BAD_REQUEST, e.to_string()))?;
+            boxed(|| crate::ship::hand_off_statement(&hub, &caller, &body)).await.map_err(|(c, m)| err(c, m))
+        }
         // A row's Ready: an agent's draft marked ready for review, by its person (W26-R18).
         (&Method::POST, ["api", "ship", "ready"]) => {
             let body: serde_json::Value = boxed(|| srv::body_json(req.into_body(), JSON_LIMIT)).await.map_err(|e| err(StatusCode::BAD_REQUEST, e.to_string()))?;
@@ -813,11 +818,43 @@ async fn authorized(hub: Arc<Hub>, caller: crate::authz::Caller, req: Request) -
             let by = caller_of(&hub, req.headers()).await.map_or_else(|| "admin".to_owned(), |c| c.name);
             boxed(|| custody_take(&hub, req, &by)).await
         }
+        // Walked for whoever audits it: each hop in words; `export=true`, every record it read as
+        // signed, kiln's CA certificate and its revocations (the Transfers plan's step 15).
+        (&Method::GET, ["api", "custody", "walk"]) => {
+            let mut q = srv::query(&req);
+            let (digest, name, export) = (q.remove("digest").unwrap_or_default(), q.remove("name"), q.remove("export").is_some_and(|e| e == "true" || e == "1"));
+            boxed(|| async {
+                let digest = match name {
+                    Some(n) => crate::custody::head_named(&hub.store, &n).await.map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")))?.unwrap_or(n),
+                    None => digest,
+                };
+                let walked = crate::custody::walk(&hub.store, &hub.pki, &digest, crate::util::now_unix(), export).await.map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")))?;
+                walked.map(|v| srv::json(StatusCode::OK, &v)).ok_or_else(|| err(StatusCode::NOT_FOUND, format!("kiln has no custody record of {digest:?}")))
+            })
+            .await
+        }
         (&Method::GET, ["api", "custody", "breaks"]) => boxed(|| async {
             let breaks = crate::custody::breaks(&hub.store, crate::custody::LIST_MAX).await.map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")))?;
             Ok(srv::json(StatusCode::OK, &json!({ "breaks": breaks })))
         })
         .await,
+        // The relays' streams (W27-R08's relays), and their records no receipt answered `lapse`
+        // seconds on (kiln's own lapse unless said); posted, those are recorded as breaks naming
+        // their relays now, as kiln does once they lapse.
+        (&Method::GET | &Method::POST, ["api", "custody", "relays"]) => {
+            let lapse = srv::query(&req).remove("lapse").and_then(|l| l.parse::<i64>().ok()).unwrap_or(crate::custody::LAPSE_AFTER);
+            let post = req.method() == Method::POST;
+            boxed(|| async {
+                let at = crate::util::now_unix();
+                let v = if post {
+                    json!({ "recorded": crate::relays::unanswered(&hub.store, lapse, at, true).await.map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")))? })
+                } else {
+                    crate::relays::view(&hub.store, lapse, at).await.map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")))?
+                };
+                Ok(srv::json(StatusCode::OK, &v))
+            })
+            .await
+        }
         (&Method::GET, ["api", "custody"]) => {
             let mut q = srv::query(&req);
             let (digest, name) = (q.remove("digest").unwrap_or_default(), q.remove("name"));
@@ -1035,8 +1072,20 @@ async fn authorized(hub: Arc<Hub>, caller: crate::authz::Caller, req: Request) -
             let n: usize = n.parse().map_err(|_| err(StatusCode::BAD_REQUEST, "a step's number, from 1"))?;
             let person = crate::identities::person_identity(&hub.store, &hub.pki.organization(), &caller).await.map_err(|e| err(StatusCode::FORBIDDEN, e.to_string()))?;
             let body = boxed(|| body_value(req)).await?;
+            // A browser that can't sign says why (`unsigned`): kiln's receipt for them, saying so.
+            if let Some(missing) = body.get("unsigned").and_then(serde_json::Value::as_str) {
+                let missing = missing.chars().take(300).collect::<String>();
+                return boxed(|| crate::plans::agents::receipt_for(&hub, run, n, &person, &missing)).await.map(|v| srv::json(StatusCode::OK, &v)).map_err(plan_err);
+            }
             let receipt = body.get("receipt").cloned().ok_or_else(|| err(StatusCode::BAD_REQUEST, "send your receipt: `receipt`, a Sigstore bundle signed on your device"))?;
             boxed(|| crate::plans::agents::receipt(&hub, run, n, &person, &receipt)).await.map(|v| srv::json(StatusCode::OK, &v)).map_err(plan_err)
+        }
+        // What a person signs to receive a step they took over, said as a verdict's is, so a
+        // browser signs it with its own key (docs/ci.md W27-R08; ui/src/lib/signing.ts).
+        (&Method::POST, ["api", "plans", "runs", run, "steps", n, "statement"]) => {
+            let n: usize = n.parse().map_err(|_| err(StatusCode::BAD_REQUEST, "a step's number, from 1"))?;
+            let person = crate::identities::person_identity(&hub.store, &hub.pki.organization(), &caller).await.map_err(|e| err(StatusCode::FORBIDDEN, e.to_string()))?;
+            boxed(|| crate::plans::agents::receipt_statement(&hub, run, n, &person)).await.map(|v| srv::json(StatusCode::OK, &v)).map_err(plan_err)
         }
         (&Method::GET, ["api", "programs"]) => boxed(|| own_op(&hub, &caller, "programs.list", json!({}))).await,
         (&Method::GET, ["api", "programs", id]) => boxed(|| own_op(&hub, &caller, "programs.get", json!({"program": id}))).await,
@@ -1965,9 +2014,13 @@ fn sync_machine(req: &Request) -> String {
 static CLUSTER_COPIES: async_lock::Semaphore = async_lock::Semaphore::new(1);
 
 /// A copy of kiln.db for a runner's learner, made now and streamed: for the runner's token for its
-/// machine (`?machine=`), or the admin token. The copy goes once sent.
+/// machine (`?machine=`), or the admin token. The copy goes once sent. kiln hands it on by its
+/// SHA-256 to the runner process that asks for it (`?instance=`, a learner that signs its receipt),
+/// saying so in a header (`crate::custody::cluster::COPY_HEADER`; docs/ci.md W27-R08).
 async fn cluster_copy(hub: &Hub, req: &Request) -> R {
-    let machine = srv::query(req).get("machine").cloned().unwrap_or_default();
+    let q = srv::query(req);
+    let machine = q.get("machine").cloned().unwrap_or_default();
+    let instance = q.get("instance").filter(|i| !i.is_empty()).cloned();
     let theirs = !machine.is_empty() && bearer(req.headers()).is_some_and(|t| crate::util::ct_eq(t.as_bytes(), crate::store::learner::token(&hub.admin_token, &machine).as_bytes()));
     if !theirs && !authed(hub, req.headers()) {
         return Err(err(StatusCode::UNAUTHORIZED, "bad cluster token"));
@@ -1987,10 +2040,46 @@ async fn cluster_copy(hub: &Hub, req: &Request) -> R {
         std::fs::remove_file(&path).ok();
         return Err(err(StatusCode::SERVICE_UNAVAILABLE, format!("{e:#}")));
     }
+    let handed = if theirs { crate::custody::cluster::copy_hand_on(hub, &machine, instance.as_deref(), &path).await } else { None };
+    if handed.is_some() {
+        copy_changed(&path).await;
+    }
     let (size, rx) = copy_body(path).map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, format!("reading the copy of kiln.db: {e}")))?;
-    tracing::info!(machine, bytes = size, took_ms = started.elapsed().as_millis() as u64, "a copy of kiln.db for a runner's learner");
+    tracing::info!(machine, bytes = size, took_ms = started.elapsed().as_millis() as u64, handed_on = handed.is_some(), "a copy of kiln.db for a runner's learner");
     let r = srv::response(StatusCode::OK, "application/octet-stream", srv::channel_body(rx));
-    Ok(srv::with_header(r, header::CONTENT_LENGTH, &size.to_string()))
+    let r = srv::with_header(r, header::CONTENT_LENGTH, &size.to_string());
+    Ok(match handed {
+        Some(h) => srv::with_header(r, header::HeaderName::from_static(crate::custody::cluster::COPY_HEADER), &h),
+        None => r,
+    })
+}
+
+/// A test build's `copy_changed` (the server's, docs/ci.md W27-R08): the first copy of kiln.db kiln
+/// hands on to a learner has a byte in its middle changed after kiln hashed it, once, as one changed
+/// on its way. The learner refuses it and fetches another.
+async fn copy_changed(path: &std::path::Path) {
+    static CHANGED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    if !crate::runner::chaos::get().is_some_and(|c| c.copy_changed) || CHANGED.swap(true, std::sync::atomic::Ordering::SeqCst) {
+        return;
+    }
+    let path = path.to_path_buf();
+    let changed = crate::rt::blocking(move || -> std::io::Result<()> {
+        use std::io::{Read as _, Seek as _, Write as _};
+        let mut f = std::fs::OpenOptions::new().read(true).write(true).open(&path)?;
+        let middle = f.metadata()?.len() / 2;
+        let mut b = [0u8; 1];
+        f.seek(std::io::SeekFrom::Start(middle))?;
+        f.read_exact(&mut b)?;
+        let [byte] = b;
+        f.seek(std::io::SeekFrom::Start(middle))?;
+        f.write_all(&[byte ^ 0x01])
+    })
+    .await
+    .and_then(|r| r.map_err(anyhow::Error::from));
+    match changed {
+        Ok(()) => tracing::warn!(target: "kiln.custody", "chaos: a copy of kiln.db handed on to a learner changed on its way"),
+        Err(e) => tracing::warn!(target: "kiln.custody", error = %format!("{e:#}"), "chaos: a copy of kiln.db couldn't be changed"),
+    }
 }
 
 /// Streams the copy at `path` (it goes once sent): its size, and its bytes as they're read, from
@@ -2047,19 +2136,20 @@ fn not_granted() -> ApiError {
     err(StatusCode::FORBIDDEN, "this URL grants nothing here")
 }
 
-/// `/api/blobs/<key>?expires=&sig=` (and `&length=` for a put): one of the local store's presigned
-/// URLs (docs/blobs.md, `crate::blobs::local`). The URL is the only credential: its signature covers
-/// the method, the exact key, the expiry (at most an hour) and a put's length, and is checked in
-/// constant time before anything is read or written. A get streams the one object it names, in a
-/// range when one is asked; a put keeps a body of exactly the length declared, or nothing. No
-/// listing, no prefixes, and keys with `.` or `..` segments are refused as any bad key is. An S3
-/// store's presigned URLs lead to the S3, not here.
+/// `/api/blobs/<key>?expires=&sig=` (and `&length=` for a put): one of the local or the Mantle
+/// store's presigned URLs (docs/blobs.md, `crate::blobs::local`). The URL is the only credential:
+/// its signature covers the method, the exact key, the expiry (at most an hour) and a put's
+/// length, and is checked in constant time before anything is read or written. A get streams the
+/// one object it names, in a range when one is asked; a put keeps a body of exactly the length
+/// declared, or nothing. No listing, no prefixes, and keys with `.` or `..` segments are refused as
+/// any bad key is. An S3 store's presigned URLs lead to the S3, not here.
 async fn presigned(hub: &Arc<Hub>, encoded: &str, req: Request) -> R {
     use kiln_seams::blobs::{Access, Method as Signed, Refusal};
-    let local = hub.blobs.local.clone().ok_or_else(not_granted)?;
     let signed = if req.method() == Method::PUT { Signed::Put } else { Signed::Get };
     let query = req.uri().query().unwrap_or_default().to_owned();
-    let (key, access) = local.check_presigned(encoded, &query, signed).map_err(|_| not_granted())?;
+    let grant = hub.blobs.local.as_ref().map(|l| l.check_presigned(encoded, &query, signed))
+        .or_else(|| hub.blobs.mantle.as_ref().map(|m| m.check_presigned(encoded, &query, signed))).ok_or_else(not_granted)?;
+    let (key, access) = grant.map_err(|_| not_granted())?;
     let blobs = Arc::clone(&hub.blobs.blobs);
     let failed = |e: Refusal| match e {
         Refusal::Unavailable(_) => err(StatusCode::SERVICE_UNAVAILABLE, e.to_string()),

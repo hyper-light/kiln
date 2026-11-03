@@ -85,6 +85,8 @@ pub fn ops() -> &'static [Op] {
                 run: tree),
             op!("cd.apps.manifests", "The manifests an app renders now, as kiln applies them (Secrets masked).", ro: true, destructive: false,
                 input: crate::ops::Input::of::<input::CdAppsManifests>(), run: manifests),
+            op!("cd.apps.custody", "An app's custody to production (docs/ci.md W27-R08): its last sync's records (CD's hand-on of the manifests it applied and the images they name, by digest, and kiln's receipt for the cluster as its API server answered), each running pod's container (its node, platform, the image its status reports, what its deploy handed on for that platform, what it runs, its receipt) and the verdict: verified, waiting, broken (a pod runs what its deploy didn't hand on) or unverifiable. Each record walks back with `GET /api/custody?digest=`. Looks at the pods now.", ro: true, destructive: false,
+                input: crate::ops::Input::of::<input::CdAppsCustody>(), run: custody),
             op!("cd.apps.resource", "One object of an app's tree in depth: its node, live manifest, desired manifest and diff (managed objects), labels, annotations, conditions and owners. Secrets are masked.", ro: true, destructive: false,
                 input: crate::ops::Input::of::<input::CdAppsResource>(), run: resource),
             op!("cd.apps.resource_events", "An object's Kubernetes events, newest first.", ro: true, destructive: false,
@@ -270,6 +272,13 @@ pub mod input {
     #[derive(Debug, Deserialize, JsonSchema)]
     #[serde(deny_unknown_fields)]
     pub struct CdAppsManifests {
+        /// The app's id, `project/name` (a bare name means the default project).
+        pub app: String,
+    }
+
+    #[derive(Debug, Deserialize, JsonSchema)]
+    #[serde(deny_unknown_fields)]
+    pub struct CdAppsCustody {
         /// The app's id, `project/name` (a bare name means the default project).
         pub app: String,
     }
@@ -1050,6 +1059,12 @@ async fn tree(cx: Cx, v: Value) -> Out {
     let def = cx.cd.apps.read().get(&id).map(|e| e.def.clone()).ok_or_else(|| missing(format!("no app {id}")))?;
     let t = cx.cd.live.tree(&cx.cd, &id, v.get("fresh").and_then(Value::as_bool).unwrap_or(false)).await?;
     Ok(t.to_json(&def))
+}
+
+async fn custody(cx: Cx, v: Value) -> Out {
+    let id = app_id(&v)?;
+    exists(&cx.cd, &id)?;
+    super::custody::view(&cx.cd, &id).await.map_err(|e| (StatusCode::SERVICE_UNAVAILABLE, format!("{e:#}")))
 }
 
 async fn manifests(cx: Cx, v: Value) -> Out {

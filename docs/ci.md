@@ -203,7 +203,7 @@ Statuses: `ready` (can start), `blocked` (waits on what is in brackets), `in pro
 | W23 | CI providers: KilnCI, GitHub Actions, GitLab CI/CD, Bitbucket Pipelines | W03, W14, deploy-api.md §7 | in progress | the git-host interface (kiln, GitHub, GitLab, Bitbucket); the provider core; GitHub Actions, GitLab CI/CD and Bitbucket Pipelines behind one contract (runs, jobs, logs, rerun, cancel, dispatch, artifacts, approvals, environments, checks, lint, webhooks; AC01); the hosts' pull requests through one API (R06); events for agents; SSO with GitHub, GitLab and Bitbucket, and acting on the host as the person |
 | W24 | Incremental CI: fingerprints, reuse, warm state, shared caches | W04, W05, W06, W08, W13, W18 | ready | specified (2026-10-24): R01–R31, AC01–AC15; milestones M0–M7 and M1e are kiln goals with plans |
 | W26 | Review in Ship: changes as Ship items, each owning its review | W14, W23, W27, Ship (the CI/CD Integration plan) | in progress | R06–R15 built: each item's dropdown owns its review (Files and the Conversation, search on vorpal, kinds and the gate, suggestions and conflicts as revisions, the Review lanes), unsigned until W27-R03; AC06 in Chromium, not yet WebKit; R18 built (agents in review: their words signed, the switch, review agents, Hand off thread by thread, drafts on every host; AC10); specified (2026-10-25): R01–R20, AC01–AC11; plan `01a175b7d5e1772f8d3c7cb28e50ab2b` |
-| W27 | Attested end to end: identities, signatures, hand-offs, the trail | W10, W18, W26 | in progress | specified (2026-10-25): R01–R12, AC01–AC08; research `01a175c54441773fa28bf1488b82e6aa`; identities built (R01, R02, R12; AC01, AC02): plan `01a17856b1b0712babf8dfd37ce48756`; hand-offs built (R08; AC05: the 14:18 drop and the twin played again, refused and recorded, and the transfers simulation): plan `01a17856b1b477eda14a574ae312a123` |
+| W27 | Attested end to end: identities, signatures, hand-offs, the trail | W10, W18, W26 | in progress | specified (2026-10-25): R01–R12, AC01–AC08; research `01a175c54441773fa28bf1488b82e6aa`; identities built (R01, R02, R12; AC01, AC02): plan `01a17856b1b0712babf8dfd37ce48756`; hand-offs built (R08; AC05: the 14:18 drop and the twin played again, refused and recorded, and the transfers simulation): plan `01a17856b1b477eda14a574ae312a123`; custody built there too (R08: between machines, the cluster group's copies and log among them, through relays and to production's pods, walked by `kiln custody walk` and modelled by `sim::custody`) |
 
 ---
 
@@ -9583,6 +9583,14 @@ delegation of it.
 - *Its results* (`application/vnd.kiln.ci.results+json`): one statement, numbered 1 on its
   `results` stream. Its body is each step's end and the leg's conclusion; its subjects are its logs
   and reports.
+- *Its identity first*: the runner asks for the leg's identity as it takes the leg, and holds the
+  leg's first step until kiln has answered, certifying it or saying why not, 2 s at most
+  (`runner::signed::identity_first`, for a server announcing `CAP_LEG_SIGNS`): a leg of one quick
+  step ended before kiln's answer otherwise, its records unsigned. kiln answers once it has signed
+  the leg's delegation, and hands the leg's inputs on right after, in a task of their own
+  (`identities::answer`). With no answer by then, the leg runs, its runner saying so, and its
+  records are signed only if the identity comes before its end. Else they go unsigned, and
+  `GET /api/ci/legs/:id/signed` says kiln certified its identity only after the leg had ended.
 - *Signed at its end*, in `Ev::Done`, with the leg's key before letting go of it. What the leg
   sent before it ended goes first, however far its runner is behind: an end that comes while its
   last log chunks or step ends still wait on the runner's uplink waits behind them, so its records
@@ -9626,14 +9634,20 @@ delegation of it.
     `w27_r05_a_legs_records_verify_under_the_servers_delegation`;
   - `runner::signed`'s `w27_r05_a_legs_results_are_signed_as_the_leg`,
     `w27_r05_a_legs_receipts_and_hand_ons_are_signed_as_the_leg`,
-    `w27_r05_a_legs_custody_is_judged_whole` and
+    `w27_r05_a_legs_custody_is_judged_whole`,
+    `w27_r05_a_legs_first_step_waits_for_its_identity` and
     `w27_r06_provenance_is_signed_as_the_leg_only_when_its_subjects_are_the_legs`;
+  - `runner::identity`'s `w27_r05_a_key_is_awaited_from_its_ask_until_kiln_answers_it`;
   - `proto`'s `w27_r05_leg_signing_is_appended_after_every_older_variant`;
   - integration: `identities`'s `w27_r05_a_legs_results_verify_as_the_leg`,
     `w27_r05_a_v1_jobs_results_verify_as_the_leg`,
+    `w27_r05_a_leg_of_one_trivial_step_signs_its_records`,
     `w27_r06_provenance_verifies_as_the_leg_that_built_it` and (with `chaos`)
-    `w27_r05_a_leg_on_an_older_runner_reads_unsigned_with_why` and
-    `w27_r05_a_runner_behind_its_legs_signs_all_they_sent`; `k8s_pool`'s
+    `w27_r05_a_leg_on_an_older_runner_reads_unsigned_with_why`,
+    `w27_r05_a_runner_behind_its_legs_signs_all_they_sent`,
+    `w27_r05_a_legs_identity_comes_before_its_first_step` and
+    `w27_r05_a_leg_whose_identity_is_held_back_runs_unsigned_saying_why` (the server's
+    `identity_late`, 500 ms and 6 s); `k8s_pool`'s
     `w27_r05_a_pods_leg_signs_its_records_as_the_leg`; `memo`'s `w24_r07` (a leg with reused steps).
 - *v1 jobs too*: a `.kiln/` workflow on v1, as production runs them, signs as the leg on its
   runner. Its runner asks for the job's identity as it takes it (`ServerMsg::Assign`), as a v2
@@ -9736,9 +9750,12 @@ delegation of it.
 - *Not yet.* The environment's page doesn't show `require_chain` or `production` (an edit there
   keeps them).
 
-**Built: custody, and agent sessions handed over signed (R08, in part).** Plan
-`01a17856b1b477eda14a574ae312a123`, its steps 1 to 6 and step 7's changes and review requests;
-research `01a18abf2d28762d92104dca2fbfbf89`.
+**Built: custody, every hand-over signed by both sides (R08).**
+Plan `01a17856b1b477eda14a574ae312a123`, its 16 steps: the records, sessions' hand-overs, acts and
+words, work, changes, review requests, carried approvals, promotions and the replant (steps 1 to
+10); a leg's inputs (11); between machines (12, the cluster group's on Ada's word of 2026-11-03);
+relays (13); production (14); the walk and its simulation (15); and end to end (16).
+Research `01a18abf2d28762d92104dca2fbfbf89`.
 
 - *Custody records* are signed statements (`kiln_ci::identity::statement`) whose body says the
   things they're about were handed on, received, passed on unchanged by a relay, or taken by kiln's
@@ -9760,8 +9777,9 @@ research `01a18abf2d28762d92104dca2fbfbf89`.
   can't take (its signer's identity revoked, as a copy left behind's is) is refused and recorded
   with its signer and envelope; both are audited (what an API caller sent, once, as their request). `POST /api/custody`, `GET /api/custody?digest=`
   or `?name=` (a thing's newest chain: who holds it, an offer no one took lapsing after 10
-  minutes), `/api/custody/breaks`, `/api/transfers/refused` and `/api/transfers/unsigned`;
-  `kiln custody show|breaks`, `kiln transfers refused|unsigned`.
+  minutes), `/api/custody/walk?digest=` (below), `/api/custody/breaks`, `/api/custody/relays`,
+  `/api/transfers/refused` and `/api/transfers/unsigned`; `kiln custody show|walk|breaks`,
+  `kiln transfers refused|unsigned`.
 - *Sessions handed over.* What a session's hand-over is about is its timeline at the epoch it
   leaves ("session <id> at epoch <n>", `kiln-timeline-v1`: its id, the epoch and each event's
   digest), which both sides work out alike. The runner process handing it on (to another
@@ -9828,12 +9846,20 @@ research `01a18abf2d28762d92104dca2fbfbf89`.
   `agents.start` ask, to kiln's server, which passes it on unchanged to each subagent it starts (a
   relay's record). The agent given work signs its receipt as it takes it up, at its next turn: kiln
   asks its runner (`ServerMsg::Custody`), again when it opens or its runner says what it holds, and
-  the receipt waits there for the session's identity if it isn't certified yet. A person's side is
+  the receipt waits there for the session's identity if it isn't certified yet. An agent's first
+  work (a subagent's task, or the step an agent was started for) is what its first turn takes up:
+  kiln's ask says so (`first`), and asked after that turn began, the runner signs the receipt at
+  once, as no other turn may come. A person's side is
   theirs when they sign it on their device: `kiln plans take <run> <n>` takes a step over and signs
   the receipt with the key `kiln login` made (`POST /api/plans/runs/<run>/steps/<n>/take` with
-  `signs`, then `…/receipt`); Ship's Hand off takes the person's own signed hand-on beside it. Without
-  a key, kiln's server signs for them on their signed-in session (a take, or a receipt, `taken_for`
-  the person), saying their own signature is missing and why; a walk reads that link as kiln's for
+  `signs`, then `…/receipt`); a browser signs it with its own key (the signing plan's WebCrypto key,
+  `ui/src/lib/signing.ts`), kiln saying what to sign (`POST …/statement`, as for a verdict); Ship's
+  Hand off takes the person's own signed hand-on beside it, to the agent or, from a browser, which
+  signs it before kiln knows who takes it (`POST /api/ship/hand-off/statement`), to kiln's server,
+  which passes it on unchanged to the agent (a relay's record). Without a key (a browser on a page
+  that isn't secure, so with no WebCrypto, says so: `…/receipt` or the hand-off with `unsigned`), kiln's server signs
+  for them on their signed-in session (a take, or a receipt, `taken_for` the person), saying their
+  own signature is missing and why; a walk reads that link as kiln's for
   them, never as theirs (`taken_for` on its hop), and the page says in place how to get a key. Once a
   step changes hands, what its former agent says of it is refused and recorded with the transfer
   that superseded it: a goal met for a step tried again or taken over, and, from an agent kiln ended
@@ -9869,6 +9895,227 @@ research `01a18abf2d28762d92104dca2fbfbf89`.
   new build its receipt as its own once that identity is certified, both to the server; the
   upgrade's job is the replant's record of the machine, listing each transfer (the runner role and
   each session the machine held as it began) and what moved without one.
+- *A leg's custody, from the land to what it made* (step 11): kiln's server hands each leg's
+  inputs to the runner process it gives the leg to, a hand-on of each by digest, signed as the
+  server and kept: its assignment and its commit as it certifies the leg (`ci::signed::give_inputs`,
+  sent to that process as `ServerMsg::Custody` `{leg, hand_on}`), the commit naming the land that
+  put it at its trunk's head when kiln's queue landed it (`land`: "landed (kiln)"); the tarball and
+  each action it serves, with the bytes (`Kiln-Custody-Hand-On`); each cache it finds, in the
+  lookup's answer; each artifact the leg downloads, in the signed URL's answer when kiln's runner
+  asks (`kiln_custody`: GitHub's toolkit reads that answer only as it knows it). The
+  runner process signs, as itself, its receipt of each and its hand-on of each thing it gives the
+  leg's executor (`kiln_ci::attest::leg::runner_custody`), sent ahead of the leg's records, and the
+  leg's receipts follow those hand-ons; what came from where kiln has no identity (an image from a
+  registry outside it) begins its chain at the leg's receipt. The leg's hand-on of what it made
+  names each image its token pushed to kiln's registry (`ci_leg_pushed`, asked at the leg's end as
+  `/_kiln/pushed`), and kiln's receipt of it, as the artifact store and the registry, takes custody
+  of them all. The leg's records and kiln's receipt are kept in kiln's custody too, so a walk from
+  an artifact or an image (`GET /api/custody?digest=`) goes back through every hop to where kiln
+  handed the leg's inputs on. A tarball, an action or an artifact whose bytes aren't the ones kiln
+  handed on isn't used (a checkout's is refused before the leg's first step runs), and the runner's
+  receipt of what it got is the break kiln records at that hop. A leg's provenance (W27-R06) is
+  signed only of what its hand-on names and of materials among what it received.
+- *Between machines* (step 12): every path where one machine takes something from another, or acts
+  on another for someone, with its custodians and what each signs. Each record is a custody record
+  by digest, both sides signed; a machine taking custody for someone else does it under a
+  delegation that names them and only narrows; a digest that changes across a hop, or a hop
+  missing its receipt, is a break, refused where it would be used and recorded.
+  - *kiln run's sync of a workspace* (`reach::local::sync_tree` → `reach::node::on_sync_ask`,
+    `reach::sync::Mirror`; `reach::custody`): the asking side hands on the tree by its digest
+    (`reach::reuse::digest_of`, as `--reuse` reads a tree, `.git` aside, of the bytes it sent) to the
+    runner process that runs it, ahead of the sync's commit over the link (reach version 2's
+    `Ask::Custody`). That runner receives it once its copy is committed, by the digest of what the
+    copy holds (`Mirror::tree_digest`), for the session whose run it is under that session's
+    delegation, and says its receipt back ahead of `Done`. A copy whose digest isn't the one handed
+    on, or with no hand-on, is refused before anything runs in it (the files the sync wrote are
+    sent again next time); a receipt that doesn't come, or isn't of the hand-on, fails the sync at
+    the asker. Who hands it on: the agent session that asked (`RunReq.asker`), when its runner
+    process holds the session's key at its epoch, signing as the session, with a delegation
+    (`kiln_ci::identity::custody::reach_delegation`) to the other runner's process to receive the
+    workspace and the run for it (`receive:workspace`, `receive:run`, no more: kiln judges a record
+    taken for someone by it, `Break::NotEntitled`); else the asking runner process, as itself.
+  - *A reach run* (`Ask::Run`, `reach::node::start_run`): the asking side hands on the run
+    (`reach::custody::run_digest`: its number in the asker's reach session, command, folder, copy,
+    shell, whether it reads input, its environment by name, never its values, and the workspace's
+    digest) ahead of its `Run`; the runner that runs it checks it against what came, receives it for
+    the session under its delegation, and says its receipt back before the run starts, or refuses
+    the run, saying why. At the run's exit it hands the output back by the SHA-256 of its bytes in
+    the order the run said them, following its receipt of the run, ahead of `Say::Exit`; the asking
+    side receives it by what it got, and refuses the run's result (an error with its exit, never
+    recorded by `--reuse`) when no hand-on came, or it isn't of what came. A link at reach version 1
+    (a runner from before at either end) carries none of it: the asker signs its hand-ons anyway,
+    saying the other speaks 1 and no receipt comes, and a doer from after takes what a runner from
+    before hands it as from outside kiln (`reach-v1:<runner>`), so the hop is named, never missing.
+    Whatever either side refuses it tells kiln (`refused_hop`, kept with kiln's refusals).
+  - *A runner's objects from peers* (W24-R27: `runner::work::peers::fetch` ← `reach::node::
+    object_window`): the peer holding the object hands it on by its SHA-256, and the runner that
+    fetched it receives it once it hashes to that digest (checked today, now recorded); a wrong copy
+    is refused and recorded as a break, naming the peer. A runner asks its peers only when its
+    cache service is asked for an object it lacks, with a token its runner minted, and nothing
+    mints one yet (`harness::builds::cache_env` isn't called, W24-R24), so no runner in production
+    asks a peer today: the records are there for when one does.
+  - *The blob stores' puts and gets* (`kiln_seams::blobs`; `custody::blobs::Attested`, the
+    server's store as `Hub::new_on` opens it): the store has no identity of kiln's, so kiln's
+    server signs for it, as for a person with no key. A put is kiln's hand-on to the store, by the
+    SHA-256 of what it sent, and its receipt for the store, by the etag the store answered. A whole
+    read (a get of all of it, or one reader's ranges from its first byte to its last, as
+    `blobs::io::read_stream` asks them) is kiln's take for the store, by the etag the store says,
+    following kiln's receipt of the put that left it so, and kiln's receipt of what it read. An
+    object that came into the store another way (kept before kiln recorded custody, taken in where
+    it lay, put back by a rollback's reconcile, adopted by an S3 store, copied by `kiln blobs copy`)
+    begins its chain at that take, with no break. A digest that changes across a hop breaks there,
+    recorded; a whole get whose bytes aren't what the store says is refused (`BadChecksum`, the
+    seam's refusal of a checksum that doesn't hold, used here for a read; `blobs::Metered`, inside
+    the wrapper, counts the store's answer as it came, and the refusal is logged on `kiln.custody`).
+    A reader followed range by range is let go, with no receipt, after 10 minutes without a range
+    or past 64 readers at once. Objects whose key names their content (`cas/`, `sync/`) get no
+    records: every read checks them by name, and a whole get that fails is refused and audited
+    (`blobs.read`). An S3's presigned URLs carry bytes kiln never sees. Mantle's store
+    (`blobs::mantle::MantleBlobs`, CP-T10.2, over Mantle's native protocol; docs/blobs.md) is
+    wrapped the same way, its records naming `kiln://<org>/blobs/mantle`. It hashes a whole read
+    against the SHA-256 kiln handed on and refuses bytes changed in the cell before the wrapper
+    sees them; the wrapper records the break all the same (`tests/mantle_blobs.rs`, on a cell of
+    three). A cell holds no key of kiln's either, so kiln's server signs its receipt for it; a cell
+    that signs its own is Mantle's to give.
+  - *The conversation feed* (`convo::feed`: a runner's `Shipper` → the server's `Intake`, the
+    server to its mirrors, and a mirror's copy back for a restore): each end has a
+    `convo::feed::Custodian` (`runner::custody::Feed` on a runner, `custody::feeds` on the server).
+    The giver signs its hand-on of each batch, by the SHA-256 of its rows as JSON, and it goes with
+    the batch's first part (`Msg::Batch`'s optional `hand_on`; a taker from before ignores it).
+    The taker hashes what came before its store takes any of it. As signed for, it's taken and the
+    taker signs its receipt; otherwise it's refused (the giver is told to go on from where the
+    taker stands, and sends it again), and the receipt of what came records the break. The server
+    keeps a runner's hand-on with its receipt; its hand-on to a mirror names the runner process
+    keeping the copy now, and goes signed only to one that takes custody. A giver from before
+    sends no hand-on, and its batches are taken as before.
+  - *The cluster group* (docs/p2p.md P2; `store::group`, `store::learner`, `custody::cluster`): the
+    server, the group's one voter, hands each runner's learner the copy of kiln.db it starts from,
+    then the log's entries; the learner's runner process receives each. Neither the entries, the
+    copy, hyper-raft's messages nor kiln.db's schema changed for it.
+    - *A copy.* A learner whose process signs its receipts asks for a copy saying which process it
+      is (`GET /api/cluster/copy?instance=`). kiln hashes the copy it made and signs and keeps its
+      hand-on of it to that process, by its SHA-256 (`copy of kiln.db at entry <n>`), and says so in
+      a response header (`kiln-custody`: the hand-on's digest, the SHA-256, the entry; not the whole
+      hand-on, which a proxy's cap on a response's head could cut). The learner hashes the copy as it
+      comes and, before it takes it, receives it by what it hashed to: as handed on, it's taken; else
+      it's refused, its receipt of what came is the break kiln records, and another is fetched (three
+      in all).
+    - *The log.* Each member keeps a leaf of every entry it applies (`store::group::Leaves`: the
+      SHA-256 of its place, term and what it carries), the same on the server and a learner for the
+      same entry. A learner that can sign says it checks the log's checkpoints with its ask of where
+      kiln.db stands (`Ask`'s `checks`: the entry its leaves start after). To each such learner kiln
+      sends a checkpoint of the log every 10 s while entries flow, none while none do: its hand-on,
+      signed, of the entries since the learner's period began (`entries <a> to <b> of kiln's cluster
+      log`), by the SHA-256 of their leaves (`Msg::Checkpoint`, a new JSON kind of `ServerMsg::Cluster`).
+      A period starts at the learner's copy, or where its leaves start; the first checkpoint a
+      minute or more into it closes it, and the next starts after it (Ada's cadence, 2026-11-03). The
+      learner checks each as soon as it has applied what it runs to. It signs its receipt of each
+      that closes, so of every entry of its periods, at most once a minute; kiln keeps those hand-ons
+      as it sends them, and no others, so the records its own checkpoints write have it send one more
+      at the most, never one each 10 s. One that doesn't match (an entry came changed) it records at
+      once, its receipt of what it applied sent with kiln's hand-on, and copies kiln.db again over
+      what it applied, answering no reads till the copy's in; a copy it can't take stops its group,
+      and its replica is copied as it starts again.
+    - *From before.* A learner from before asks for its copies naming no process and says it checks
+      nothing: kiln hands it the copy unsigned and sends it no checkpoint. A server from before signs
+      no copy and sends no checkpoint, reading a learner's `checks` as a field it doesn't know.
+    - *Not yet.* A learner started again on the replica it kept, or one whose server started again,
+      checks the log from where its leaves start then, and kiln's period with it: the entries it
+      applied since its last receipt before that go unchecked (leaves aren't kept across a start).
+      A member keeps the leaves of its last 65,536 entries: a period longer than that starts again
+      where the group stands.
+  - *The server giving a leg to a runner* (step 11, above).
+- *Relays* (step 13; `kiln_ci::identity::relay`, `crate::relays`): every intermediary records what
+  it passes on, unchanged, as ARC's handlers each add their record of a message. A relay's record
+  is a passed-on of the thing by its digest, from whom it took it, to whom it passes it, numbered on
+  a stream of its own to that receiver, one per run of its process or connection, so the receiver
+  sees each number in turn. Whoever it reaches checks that record before using the thing, and signs
+  its receipt, which follows it.
+  - *A runner relaying its agents' calls to kiln.* Beside each signed act goes the runner's record
+    (`passed_on`), numbered on its stream for that connection as asks go out. kiln places the
+    numbers in the order the runner's messages come. It then checks the record against the act:
+    signed by that runner process, to kiln, of the very act that came, which signs the very ask. It
+    keeps the act, the record and its own receipt, and only then judges the act itself (the fence,
+    step 5). In the plan's example, Kiln PRs' `goals.done` goes from adacachy's runner as
+    "passed-on #5521" of its act's digest, from the agent at epoch 1, to kiln, and kiln's receipt
+    follows it.
+  - *kiln relaying an agent's words (`agents.send`) to the runner holding the agent they're for.*
+    The sender's act, its runner's record and kiln's (numbered on kiln's stream to that runner
+    process) go with the message (`relayed`). That runner checks the act end to end: its signature,
+    the ask it signs, and that it's an `agents.send` of these very words to this session. It checks
+    each record, the nearest first, so a relay that passed on another than it took is the one named.
+    Only then does the session take the words, and the runner signs its receipt.
+  - *kiln relaying reach links' frames.* It can't read them, so it chains each way's frames by
+    their ciphertext's digests (`kiln-frames-v1`) into runs, cut at 1,024 frames or 10 seconds
+    from the first, whichever comes first, whether or not more frames come, and the last at the
+    link's close. Each run is a record numbered on its stream to the link's far end (in
+    `ServerMsg::Custody`), which answers with its receipt of the frames as they came. The frames
+    come another way than the record, so a record that comes first waits for them, up to 20
+    seconds. Frames that came with no record a minute after the link ended are told to kiln as a
+    break too.
+  - *Blue/green's old build forwarding kiln's frames to the new one.* A frame carrying a signed
+    statement goes with the old build's record of it (`Frame::Forward`'s `passed_on`), numbered on
+    its stream to the new build: a hand-over's word, a custody record kiln hands on (work, a leg's
+    inputs, a reach link's run), or an agent's words, whose record is of the sender's act,
+    following kiln's record. The new build checks it and signs its receipt; a hand-over's word for
+    the old build stays refused there (step 4), and the refusal is recorded. A frame with no signed
+    statement (a person's message, a close, an interrupt) goes on unrecorded. kiln keeps the words
+    it signs, so a walk through the old build's record reaches them.
+  A relay can't forge the originator's statement (its signature). It can't alter or swap what it
+  carries: the digest differs, or a genuine other names another. It can't drop it silently: a
+  number is skipped, or a record no receipt follows. Each is refused where it's used (the call, the
+  message, the frame, the link its end can't read) and recorded as a break naming the relay
+  (`custody_breaks.relay`, migration `w27_relays`). A dropped item never arrives, so what's refused
+  is a walk through the relay's stream, whose gap breaks it. kiln looks for relays' records no
+  receipt answers once they lapse (10 minutes). `GET /api/custody/relays` lists each relay's
+  streams (records, numbers missing) and the records unanswered; `POST` records those as breaks at
+  once. Test builds' faults `relay_calls`, `relay_forward`, `relay_words` and `relay_frames` drop,
+  swap or alter every second item. A walk reads a relay's record of an originator's statement as
+  where that thing began (its originator signed it), and a frame's record, whose sender signs
+  nothing, as where its chain begins. Words kiln recorded passing on and couldn't deliver (the
+  runner away, the session gone) are recorded so at once. Each side says `CAP_RELAYS` (bit 47):
+  with a peer from before, things go as before, and kiln's records of what it passes to such a
+  runner go on a stream saying no receipt is waited for.
+- *To production* (step 14; `kiln_ci::identity::deployed`, `crate::cd::custody`, migration
+  `w27_cd_custody`): a KilnCD sync of an app to a Kubernetes cluster that succeeded leaves CD's
+  hand-on to the cluster (`kubernetes://<cluster>`) of the manifests it applied, by the SHA-256 of
+  the objects as it sent them, and of each image their pod templates name by digest, following
+  CD's receipt of the image: from kiln's registry, which hands on what a leg pushed (its receipt of
+  the leg's hand-on), or from outside kiln, where the image's chain begins. kiln's server receives
+  them for the cluster, which holds no identity of kiln's, on the strength of its API server's
+  answers: the manifests by the digest of what the answers hold of what CD sent (`kiln_cd::diff`'s
+  comparison), so an apply a webhook changed breaks the chain there, saying where. As the rollout
+  goes on, every minute after and whenever a release asks, kiln looks at the app's pods: for each
+  container the manifests name, of each running pod, the cluster hands its image to the pod's node
+  (`…/node/<name>`) and the node receives it, its receipt naming the manifest it pulls for its
+  platform; the node hands the pod (`…/<namespace>/pod/<name>`)
+  its platform's manifest, made from the image (the index's resolution, by its node's
+  `nodeInfo`, the index read from kiln's registry by digest when kiln holds it, else from its
+  own registry); and the pod's receipt is of what its status's image ID says it runs, read
+  through that resolution (Docker and containerd report the index, CRI-O the manifest, an image
+  loaded without a registry its config). A pod running anything else breaks the chain at its
+  receipt, recorded as kiln takes it. `GET /api/cd/apps/:app/custody` (`cd.apps.custody`) shows the
+  last sync's records, each pod's container (its node, platform, reported image, what its deploy
+  handed on for that platform, what it runs, its receipt) and the verdict: verified, waiting,
+  broken or unverifiable (an image named by tag alone). An environment requiring a verified chain
+  (`gates.require_chain`, W27-R11) counts a release synced and healthy only once its pods are
+  verified (waiting holds it; broken or unverifiable is Degraded, saying why), and once a release
+  runs there a pod that breaks its chain makes the registration need a person, so nothing promotes
+  into it by itself; an `after` of such an environment refuses an upstream whose pods break their
+  chain there. A promotion's hand-on (step 8) follows CD's receipt of its images for the upstream
+  environment's deploy, so its chain walks back through what was deployed there. kiln-ci's custody
+  takes a thing by its name and a digest both records agree on first: a leg's hand-on names an
+  image's index and each platform's manifest by one name.
+- *Walking a chain* (step 15): `kiln custody walk <digest>` (`GET /api/custody/walk?digest=`, or
+  `?name=`) walks a thing's chain back from where it's used (a record's digest, or a thing's: an
+  image, an artifact, a commit) to where it was made, hop by hop: each record signed by a custodian
+  entitled to it, each digest the last one's, no gap in a custodian's numbers. It says each hop in
+  words ("the runner on fedora-2 received commit 4c1e2a from kiln"), or names the first break: the
+  record it's at, its kind and why. A record kiln keeps that no longer checks as kiln took it
+  (changed where it's kept, or another record's envelope in its place) is a break at that record
+  (`unreadable`), not one missing. `--export <file>` (`&export=true`) writes the walk with every
+  record it read as signed, kiln's CA certificate and its revocations: what an auditor checks each
+  signature with, and walks again, without kiln. kiln verify (W27-R10) builds on it.
 - *A resume from the server's store* is kiln's take: signed with the server's own key for the
   identity kiln last certified the session as at that epoch (`identities::holder_at`), to the next,
   saying when kiln last heard from the machine; kiln keeps it at once, the package carries it, and
@@ -9879,7 +10126,15 @@ research `01a18abf2d28762d92104dca2fbfbf89`.
   announced at a later epoch by a runner without `CAP_CUSTODY`, or resumed to one ("… signed no
   receipt"). A test build's `unsigned` fault stands in for such a runner.
 - *Tests.* `kiln-ci` `w27_r08_*` (bodies, chains and each break, relays, takes, gaps, delegations,
-  a session's next epoch whoever holds it, the fence); `custody::w27_r08_*` (records kept, breaks
+  a session's next epoch whoever holds it, the fence); relays: kiln-ci's `w27_r08_relays_*` (a
+  call passed on and received, one statement through two relays, a forged, misaddressed, altered,
+  swapped, dropped or repeated item each caught naming its relay, frames named by their chain, a
+  forwarded frame), `runner::custody::w27_r08_relays_a_runner_records_what_it_passes_on_and_checks_what_is_passed_to_it`,
+  `reach::relay::tests::w27_r08_relays_a_links_frames_are_recorded_in_runs`, and `transfers.rs`'
+  `w27_r08_relays_*`: a runner's relay of an agent's calls, kiln's of an agent's words and of a
+  reach link's frames, and (release) blue/green's forwarder, each with no item relayed without
+  its record, and, with `chaos`, each relay dropping, swapping or altering, refused where used and
+  recorded naming the relay; `custody::w27_r08_*` (records kept, breaks
   and refusals; a transfer kept before its epoch rises; the timeline);
   `store::migrations::w27_r08_custody_tables`; `proto::w27_r08_custody_is_appended_after_headroom`;
   `crates/kiln/tests/custody.rs`: records through the API and the CLI; `crates/kiln/tests/transfers.rs`
@@ -9903,13 +10158,18 @@ research `01a18abf2d28762d92104dca2fbfbf89`.
   to let go once its machine is back, the session at its next epoch untouched). Work: kiln-ci's
   `w27_r08_kiln_takes_for_a_person_with_no_key`, `custody::w27_r08_work_changes_hands_signed_by_both_sides`,
   `runner::custody::w27_r08_work_handed_is_received_at_the_sessions_next_turn`,
+  `runner::custody::w27_r08_first_work_handed_after_the_first_turn_began_is_received_at_once`,
   `ship::w27_r08_a_hand_off_changes_hands_signed` (a failure handed off from a device with no key:
-  kiln's take for the person, answered by the agent's receipt), and `w27_r08_work_handed` (a plan run with an agent per step: each step signed for at its agent's
+  kiln's take for the person, answered by the agent's receipt),
+  `ship::w27_r08_a_hand_off_from_a_browser_is_its_persons_own` (signed in a browser: the person's
+  hand-on to kiln, passed on to the agent, its chain walking back to their own signature; from a
+  browser that can't sign, kiln's take giving the browser's reason), and `w27_r08_work_handed` (a plan run with an agent per step: each step signed for at its agent's
   first turn; one tried again, the agent before refused and recorded as it says it's met; one taken
   over without a key, kiln's receipt for the person, one with a key, the person's own; a subagent's
   task handed on, passed on and received; every chain unbroken, none open); in the UI,
-  `e2e/plan-run-take.spec.ts` and `ship-hand-off.spec.ts` (the line saying how a take-over or a
-  hand-off from a browser is signed, in Chromium and WebKit at desktop and phone widths);
+  `e2e/plan-run-take.spec.ts` and `ship-hand-off.spec.ts` (a take-over or a hand-off from a browser
+  signed with its own key, and one from a browser that can't sign, saying why, in Chromium and
+  WebKit at desktop and phone widths);
   `w27_r08_change_hands` (D1 given by kim, taken by sam, commandeered by lee: two transfers, each
   with both sides; sam's version pushed afterwards, and his abandon, refused and recorded with the
   transfer) and `w27_r08_review_passed_on` (passed on and taken, the request moves with both sides;
@@ -9922,8 +10182,67 @@ research `01a18abf2d28762d92104dca2fbfbf89`.
   neither, saying why) and, in the UI, `e2e/ship-carried.spec.ts` (the carried line under Approve,
   in Chromium and WebKit at desktop and phone widths); and, in a release build, `w27_r08_replant` (box-a
   upgraded blue/green with two sessions: its job lists the runner role, from the process replaced to
-  its new build, and both sessions, each a verified transfer, nothing without one). Simulation (the
-  Transfers plan's step 9, W27-AC05):
+  its new build, and both sessions, each a verified transfer, nothing without one). A leg's custody
+  (step 11): kiln-ci's `w27_r08_a_legs_inputs_walk_from_kiln_to_what_it_made` (kiln's hand-ons of a
+  leg's assignment, commit and tarball, its runner's receipts and hand-ons, the leg's receipts and
+  hand-on of the image it made, kiln's receipt: unbroken, begun only where kiln handed the inputs
+  on and where the leg made the image, nothing unanswered; the tarball changed, broken at its hop)
+  and `w27_r08_a_receipt_from_outside_kiln_begins_its_chain`; and, with `chaos`, `identities`'s
+  `w27_r08_custody_build` (D1 landed by main's queue; main's run on fedora-2, with no git, checks it
+  out from kiln's tarball, stores an artifact and pushes and attests an image: each walked back from
+  kiln's receipt with both records at every hop, kiln's hand-on of the commit naming D1's land; the
+  image's provenance, signed as the leg, of that image from that commit; then, with the server's
+  `tarball_changed`, the leg refused before any step and the break recorded where fedora-2's runner
+  received other bytes than kiln handed on). Between machines (step 12): kiln-ci's
+  `w27_r08_a_peers_object_changes_hands_signed_by_both` (the taker's build of the holder's hand-on
+  has its digest; a copy that hashed to something else breaks at that hop);
+  `custody::blobs::w27_r08_kilns_store_of_bytes_is_signed_for_at_each_put_and_whole_read` (a put,
+  a whole get, a stream of ranges and a file put in parts each walk unbroken; read again, kept
+  once; nothing for keys named by their content) and
+  `w27_r08_an_object_read_back_changed_is_refused_and_its_break_recorded` (bytes the store changed
+  under kiln: refused, a break; an object that came in past kiln's puts: its chain begins at kiln's
+  take, no break; one named by its content refused and audited); `convo::feed::w27_r08_a_feeds_batch_is_taken_only_as_its_giver_signed_for_it`
+  (changed on its way: refused, nothing taken, the receipt of what came; as signed for, taken and
+  received; from a giver from before, taken as before) and
+  `w27_r08_a_shipper_hands_on_each_batch_it_sends`; and, with `chaos`,
+  `transfers`'s `w27_r08_custody_between_machines`, a helper for each path: peers' objects (box-b's
+  cache fetches box-a's object over their link: box-a's hand-on and box-b's receipt, unbroken;
+  box-b's copy changed on its way to box-a by its `peer_object_changed`: never served, nothing of
+  it kept, the break recorded between box-b's hand-on and box-a's receipt); kiln's store of bytes
+  (two binaries uploaded and downloaded: one walks unbroken through kiln's records for the store,
+  the other changed as it's read by the server's `blob_changed`: its download ends short, the break
+  recorded at the take); the feed (box-a's and box-b's sessions' batches each received as handed
+  on; box-b's first, changed on its way by its `feed_changed`, refused and recorded, then taken as
+  it was); kiln run's sync and a reach run (kiln run on box-b for an agent session on box-c: the
+  session's hand-ons of its workspace and its run, box-b's receipts of each for the session under
+  its delegation, box-b's hand-on of the output and the session's receipt of it, every hop signed
+  by both sides; box-d's sync changed on its way by its `sync_file_changed`: refused on box-b
+  before anything ran, the break recorded between box-d's hand-on and box-b's receipt, and box-b's
+  refusal). kiln-ci's `w27_r08_a_reach_run_changes_hands_under_the_sessions_delegation` (the
+  example's chain, unbroken; a changed workspace breaks; a receipt for the session under no
+  delegation of its own to that runner entitling it breaks as `not-entitled`), `reach::sync`'s
+  `w27_r08_a_copy_knows_its_tree_by_the_askers_digest` and reach's lab
+  `w27_r08_a_link_runs_at_the_version_both_speak_and_only_2_carries_custody` (new to new at 2 with
+  custody frames; either end from before at 1, with none; a synced run works every way). The
+  cluster group: `custody::cluster`'s
+  `w27_r08_a_learners_copy_and_its_log_walk_from_kilns_hand_on_to_its_receipt` (a copy and a
+  stretch of the log, each walking from the runner's receipt to kiln's hand-on; other than handed
+  on, `changed` at the receipt); `store::group`'s `w27_r08_leaves_say_a_stretch_of_the_log_or_why_not`
+  and `w27_r08_a_checkpoint_holds_on_a_learner_only_as_the_server_logged_its_entries` (the server's
+  and its learner's checkpoints agree; an entry changed on its way, the message made whole again,
+  and they don't, the learner holding other than the server wrote; copied again, it holds what the
+  server wrote and the checkpoints after hold); `store::learner`'s
+  `w27_r08_checkpoints_come_every_10_s_while_entries_flow_and_close_at_most_once_a_minute` (the
+  cadence over 200 s: none while no entries flow, periods closing 60 s apart and tiling the log; a
+  copy starts one; none to a learner that hasn't said it checks) and
+  `w27_r08_asks_and_checkpoints_read_back_and_an_ask_from_before_checks_nothing`; and, with
+  `chaos`, `transfers`'s `w27_r08_custody_between_machines_the_cluster_group` (box-a's learner:
+  the server's first copy changed on its way by its `copy_changed`, refused, the break recorded and
+  walked, the next taken and walking unbroken; the first entry sent box-a changed by its
+  `entry_changed`, box-a's next checkpoint the break, recorded and walked, and box-a's copy again
+  taken; then box-a's receipts of two periods of the log, kiln's hand-ons a minute or more apart,
+  the second running on from the first, each walking unbroken).
+  Simulation (the Transfers plan's step 9, W27-AC05):
   `sim::transfers::tests::w27_ac05_no_stale_act_is_ever_applied` (docs/sim.md's transfers model:
   moves, resumes from kiln's copy while a machine is cut off, take-overs with the old process still
   acting, blue/green upgrades and their rollbacks, the server restarting with its count stale, under
@@ -9934,20 +10253,71 @@ research `01a18abf2d28762d92104dca2fbfbf89`.
   `w27_ac05_the_transfers_model_finds_each_planted_bug` (an act check by machine, a word passed on
   applied unchecked, a resume that keeps the epoch it leaves, a release only on the copy's own
   announcement, no addressee check: each found by a seed that passes without it) and
-  `w27_ac05_a_transfers_seed_replays_exactly`. Nightly: `.kiln/custody-lab.yaml`, and the transfers
-  model's 20,000 seeds in `.kiln/sim.yaml`.
+  `w27_ac05_a_transfers_seed_replays_exactly`. The walk (step 15):
+  `custody::w27_r08_a_walk_says_each_hop_and_exports_what_it_read` (from an image back to kiln's
+  hand-on of the commit it was made from, each hop in words; exported, each record checking
+  against kiln's CA certificate alone; a hop's record removed, its payload changed, or another
+  record's envelope in its place where kiln keeps it: each a break named at that hop) and, with
+  `chaos`, `identities`'s `w27_r08_custody_walk` (steps 11 and 12's chains, an image a leg made
+  back to the landed commit and a binary through kiln's store of bytes: each unbroken and said hop
+  by hop, its export checking against kiln's CA certificate alone, and each with one hop's record
+  removed, then changed where kiln keeps it, naming its break at that hop), `transfers`'s
+  `w27_r08_relays_a_runners_relay_of_its_agents_calls` and `w27_r08_relays_kilns_relay_of_an_agents_words`
+  walk step 13's chains (an agent's call through its runner; an agent's words through its runner and
+  kiln) the same way, and on a test cluster `custody_production`'s `w27_r08_custody_to_production`
+  walks a pod's chain back to the commit the same way. End to end (step 16): on a test cluster,
+  `custody`'s `w27_r08_custody_end_to_end` (`#[ignore]`d without `KILN_CUSTODY_KUBECONFIG`, the
+  scenario `common::production`'s, shared with `custody_production`): `kiln custody walk` from a
+  running pod's receipt names each hop back to the commit, each signed; then a hop's record
+  removed, then changed where kiln keeps it, a receipt of CD's hand-on to the cluster signed by
+  someone else than its taker (`not-the-taker`), and a pod's image swapped, each refused where it
+  would be used and recorded. The other kinds of break, on other paths, are the tests above. Simulation
+  (the Transfers plan's step 15, W27-R08):
+  `sim::custody::tests::w27_r08_no_broken_chain_walks_as_unbroken` (docs/sim.md's custody model:
+  things handed on directly and through one or two relays, under kiln-sim's nemesis, the relays
+  dropping, changing, swapping and replaying what they carry and losing their own records, each
+  taker checking what came against its giver's hand-on, through kiln-ci's hop, walk and gaps: over
+  its 200 seeds, no chain with a break walked as unbroken, nothing used other than what its giver
+  handed on, nothing a relay passed on unseen, and once the world calms every thing handed on used
+  and walking unbroken), `w27_r08_the_custody_model_finds_each_planted_bug` (a relay that doesn't
+  number its records, a hop that doesn't check the digest, a walk that skips a hop: each found by a
+  seed that passes without it) and `w27_r08_a_custody_seed_replays_exactly`. Nightly:
+  `.kiln/custody-lab.yaml`, and the transfers and custody models' 20,000 seeds in `.kiln/sim.yaml`. To production (step 14): kiln-ci's
+  `w27_r08_a_deploy_walks_from_the_land_to_its_pods` (a multi-platform image built from the land,
+  through kiln's registry, CD, the cluster and two nodes, amd64 and arm64, each pod its platform's
+  manifest: unbroken through the resolution; a pod swapped to another image broken at its receipt),
+  `w27_r08_an_index_and_its_manifests_go_by_one_name`, `deployed`'s `w27_r08_*` (pinned images,
+  each runtime's image IDs, the resolution, a sync's manifests), `cd::custody`'s `w27_r08_*`; and,
+  on a test cluster (`#[ignore]`d: `KILN_CUSTODY_KUBECONFIG`), `custody_production`'s
+  `w27_r08_custody_to_production` (pause 3.10's amd64 and arm64 as one index, built and pushed by a
+  leg, released to production through KilnCD: both pods verified, each walking back through its
+  node's resolution to the commit; then production requiring a verified chain and one pod's image
+  swapped by `kubectl set image`: the break recorded at its receipt, the registration needing a
+  person).
 - *Not yet.* A session's package isn't yet addressed to the process it goes to (its hand-on is to
   the session at its next epoch); a runner's Open at a later epoch still raises the epoch the
   registry keeps (what its inbox and updates are fenced by) before its transfer is recorded, though
   acts are held to the epoch kiln certified; what a copy left behind does on its own machine
-  without kiln goes on until its runner hears from kiln (docs/agents.md, "A copy left behind"); a
-  person signs on their device only through the CLI until the browser has a key of its own (the
-  signing plan's step 4); an agent kiln's server runs itself (`local`) signs no receipt of work
+  without kiln goes on until its runner hears from kiln (docs/agents.md, "A copy left behind"); an
+  agent kiln's server runs itself (`local`) signs no receipt of work
   handed to it yet, so its hand-on stays unanswered; an agent's give or pass is kiln's take for it
   (its signed act verified), not yet a hand-on its runner signs; a promotion
   from a linked server's environment, which this server's CD doesn't sign for, nor KilnCD's apps'
   syncs, which take no `after`; Ship's journey listing a replant's transfers beside its runners
-  (its job does); artifacts, machines and intermediaries (steps 11 to 16).
+  (its job does); a pod's leg, its own runner, whose inputs aren't a runner process's to hand on;
+  images a leg pushes to a registry outside kiln, which signs no receipt; machines (steps 12, 15,
+  16). To production: a registry an image is copied through to a cluster (a mirror) isn't a
+  custodian of its own (the digests agreeing stand for it); a sync to a provider's target (ECS,
+  Lambda, Fly…) records no custody; the manifests' own chain begins at CD's hand-on (its render from
+  git isn't recorded); a pod's container its manifests don't name (a webhook's sidecar) isn't
+  judged; Argo CD's syncs, which aren't kiln's. Of the relays (step 13): a person's words to an
+  agent aren't relayed with a record (a person signs no act, so kiln speaks for them), nor an
+  agent's other commands to its subagents (`agents.interrupt`, `agents.stop`); words for an agent
+  kiln's server runs itself (`local`) reach no runner to check them; a runner from before relays
+  acts with no record, and kiln can't tell its drops (its records are numbered only where the relay
+  records them); a receiver doesn't number-check kiln's own streams (a drop there is kiln's record
+  no receipt follows); and each relayed call adds two records to custody and the trail (the runner's
+  and kiln's receipt) and keeps its act, each message a third.
 
 ### W28 Demand-driven CI: adopt, cover, stagger, land by conflict graph
 

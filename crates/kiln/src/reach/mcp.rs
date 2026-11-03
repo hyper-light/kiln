@@ -1857,7 +1857,7 @@ mod tests {
                     let asked: Value = serde_json::from_str(&json).unwrap_or_default();
                     let raw = asked.clone();
                     let answer = match serde_json::from_value::<crate::reach::Question>(asked.clone()) {
-                        Ok(q) => crate::rt::block_on(async move { Ok(crate::mcp::runner_ask(&hub, "box", 0, &q, &raw).await) }).unwrap_or_default(),
+                        Ok(q) => crate::rt::block_on(async move { Ok(crate::mcp::runner_ask(&hub, "box", 0, &q, &raw, None).await) }).unwrap_or_default(),
                         Err(e) => json!({"error": format!("unknown reach question: {e}")}),
                     };
                     if let Ok(b) = crate::reach::wire::frame(&Ev::Answer(answer.to_string())) {

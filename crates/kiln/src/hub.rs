@@ -535,6 +535,9 @@ pub struct Hub {
     pub sync: crate::sync::server::Sync,
     /// Reach: the links between runners this server relays, and their identities (`crate::reach`).
     pub reach: Mutex<crate::reach::relay::Relay>,
+    /// What kiln takes from relays and relays itself, checked and numbered (docs/ci.md W27-R08's
+    /// relays: `crate::relays`).
+    pub(crate) relays: crate::relays::Relays,
     /// The copies of runners' trees other runners keep: the rules for them, and what each runner
     /// said it holds and let go (`crate::reach::copies`, docs/reach.md §5.1).
     pub copies: crate::reach::copies::Copies,
@@ -588,7 +591,9 @@ impl Hub {
         join_token: String,
         shutdown: Shutdown,
     ) -> anyhow::Result<Arc<Self>> {
-        let blobs = crate::blobs::open(&cfg, &store, Arc::clone(&clock))?;
+        let mut blobs = crate::blobs::open(&cfg, &store, Arc::clone(&clock))?;
+        // What it keeps there and reads back, recorded as it changes hands (docs/ci.md W27-R08).
+        blobs.blobs = Arc::new(crate::custody::blobs::Attested::new(Arc::clone(&blobs.blobs), blobs.kind.as_str(), store.clone(), Arc::clone(&pki)));
         let generation =
             std::env::var("KILN_GENERATION").ok().and_then(|g| g.parse().ok()).unwrap_or(1);
         let discovery = Arc::new(crate::discovery::Discovery::for_server(&cfg, &pki.ca_der));
@@ -668,7 +673,8 @@ impl Hub {
             peered: crate::peers::Peers::default(),
             tailnet: crate::frontdoor::tailnet::TailnetDns::default(),
             sync,
-            reach: Mutex::new(crate::reach::relay::Relay::default()),
+            reach: Mutex::new(crate::reach::relay::Relay::recording()),
+            relays: crate::relays::Relays::default(),
             copies,
             places,
             tasks,
@@ -752,7 +758,7 @@ impl Hub {
                 }
                 continue;
             };
-            for (msg, raft) in self.cluster.frames(bytes) {
+            for (msg, raft) in self.cluster.frames(member, bytes) {
                 if let Ok(b) = proto::encode(&ServerMsg::Cluster { json: crate::store::learner::encode(&msg), raft }) {
                     self.net.send(peer, proto::LANE_SYNC, Kind::Control, b).await;
                 }
@@ -1567,6 +1573,16 @@ impl Hub {
         sent
     }
 
+    /// Runs of reach links' frames the relay passed on, recorded (docs/ci.md W27-R08's relays): signed,
+    /// kept and sent to the runners they went to, on their own (`crate::relays::frames`).
+    pub(crate) fn reach_passed(self: &Arc<Self>, passed: Vec<crate::reach::relay::Passed>) {
+        if passed.is_empty() {
+            return;
+        }
+        let hub = Arc::clone(self);
+        crate::rt::spawn(async move { crate::relays::frames(&hub, passed).await });
+    }
+
     /// `msg` to runner process `peer` on reach's lane.
     async fn send_reach(&self, peer: PeerId, msg: &ServerMsg) {
         #[cfg(test)]
@@ -1683,6 +1699,7 @@ impl Hub {
                     connected: a.connected,
                     reach: a.connected && ann.is_some_and(|x| x.accept),
                     fingerprint: ann.map(|x| x.fingerprint.clone()),
+                    reach_version: ann.map(|x| x.version).filter(|v| *v > 0),
                     cpus: s.map_or(0, |s| s.cpus),
                     cpu_pct: s.map_or(0.0, |s| s.cpu_pct),
                     load1: s.map_or(0.0, |s| s.load1),
@@ -1734,14 +1751,19 @@ impl Hub {
                 // Its live commands not yet answered end; its parked ones wait for it.
                 self.cmds.lock().down(peer);
                 // Its reach links end; the runners at their other ends hear so (and resume later).
-                let closes = self.reach.lock().lost(peer, "disconnected from the kiln server");
+                let (closes, passed) = {
+                    let mut r = self.reach.lock();
+                    (r.lost(peer, "disconnected from the kiln server"), r.take_passed())
+                };
                 for (p, m) in closes {
                     if let Ok(b) = proto::encode(&m) {
                         self.net.send(p, proto::LANE_REACH, Kind::Term, b).await;
                     }
                 }
+                self.reach_passed(passed);
                 self.pending_peers.lock().remove(&peer);
                 let name = self.peers.lock().remove(&peer);
+                self.relays.lost(peer);
                 self.handovers_lost(peer).await;
                 let lost = self.instances.lock().lost(peer);
                 if let (Some(name), Some(m)) = (&name, &self.harness.copies) {
@@ -2253,14 +2275,16 @@ impl Hub {
                     self.unreadable(peer, Wire::Relay, "Reach".to_owned(), Code::Malformed, why, true).await;
                     return Ok(());
                 }
-                let forwarded = {
+                let (forwarded, passed) = {
                     let (agents, instances) = (&self.agents, &self.instances);
-                    self.reach.lock().forward(&agent, peer, crate::reach::relay::Frame { to, link, open, data, close }, |n| {
+                    let mut r = self.reach.lock();
+                    let out = r.forward(&agent, peer, crate::reach::relay::Frame { to, link, open, data, close }, |n| {
                         if agents.lock().get(n).is_none_or(|a| a.ephemeral || !a.connected) {
                             return None;
                         }
                         instances.lock().newest_with(n, proto::CAP_REACH)
-                    }, |n| self.shown(n))
+                    }, |n| self.shown(n));
+                    (out, r.take_passed())
                 };
                 // One from a runner that isn't an end of the link it names goes nowhere: refused to
                 // it, and noted naming the link's ends.
@@ -2272,6 +2296,7 @@ impl Hub {
                 for (p, m) in forwarded.sends(peer, typed) {
                     self.send_reach(p, &m).await;
                 }
+                self.reach_passed(passed);
             }
             AgentMsg::NetDrops { dropped } => {
                 let series = dropped.iter().map(|d| (vec![agent.clone(), d.lane.clone(), d.reason.clone()], i64::try_from(d.frames).unwrap_or(i64::MAX)));
@@ -2378,8 +2403,12 @@ impl Hub {
             }
             FromRunner::Sync { msg, raft } => self.sync_heard(agent, *msg, raft),
             FromRunner::Cluster { msg, raft } => match (self.store.group(), *msg) {
-                // Where kiln.db stands, for a read the runner answers once its replica holds it.
-                (Some(g), crate::store::learner::Msg::Ask { id }) => {
+                // Where kiln.db stands, for a read the runner answers once its replica holds it;
+                // and whether its learner checks the log's checkpoints (docs/ci.md W27-R08).
+                (Some(g), crate::store::learner::Msg::Ask { id, checks }) => {
+                    if let Some(holds) = checks {
+                        self.cluster.checks(g, agent, peer, holds);
+                    }
                     let at = crate::store::learner::Msg::At { id, seq: g.standing().0 };
                     if let Ok(b) = proto::encode(&ServerMsg::Cluster { json: crate::store::learner::encode(&at), raft: Vec::new() }) {
                         self.net.send(peer, proto::LANE_SYNC, Kind::Control, b).await;
@@ -2489,12 +2518,31 @@ impl Hub {
                     let up: Vec<String> = crate::reach::directory::holders(&repo, &digest, agent).into_iter().filter(|r| self.agents.lock().get(r).is_some_and(|a| a.connected)).collect();
                     self.send_peer(peer, &ServerMsg::ReachAnswer { req, json: serde_json::json!({ "runners": up }).to_string() }).await;
                 }
+                // A runner's process that takes reach, as kiln names it (its identity's URI), for
+                // a custody record of what passes between two runners (docs/ci.md W27-R08).
+                crate::reach::Question::Custody { runner } => {
+                    let instance = {
+                        let inst = self.instances.lock();
+                        inst.newest_with(&runner, proto::CAP_REACH).and_then(|p| inst.get(p).map(|i| i.label()))
+                    };
+                    let hub = Arc::clone(self);
+                    crate::rt::spawn(async move {
+                        let uri = match instance {
+                            Some(instance) => crate::identities::runner_identity(&hub, &runner, &instance).await.ok().and_then(|i| i.uri().ok()),
+                            None => None,
+                        };
+                        hub.send_peer(peer, &ServerMsg::ReachAnswer { req, json: serde_json::json!({ "uri": uri }).to_string() }).await;
+                    });
+                }
                 // An agent's MCP server on the runner asks for kiln's operations: answered on
-                // their own, so a slow one holds up nothing else the runner says.
+                // their own, so a slow one holds up nothing else the runner says. The runner's
+                // record of passing an act on is placed on its stream here, as its messages come in
+                // order (docs/ci.md W27-R08's relays).
                 ask => {
+                    let placed = self.relays.placed(peer, &raw);
                     let (hub, runner) = (Arc::clone(self), agent.to_owned());
                     crate::rt::spawn(async move {
-                        let answer = crate::mcp::runner_ask(&hub, &runner, peer, &ask, &raw).await;
+                        let answer = crate::mcp::runner_ask(&hub, &runner, peer, &ask, &raw, placed).await;
                         hub.send_peer(peer, &ServerMsg::ReachAnswer { req, json: answer.to_string() }).await;
                     });
                 }
@@ -2839,7 +2887,7 @@ impl Hub {
         }
         // It keeps the channel (docs/wire.md): said first, so a runner that keeps it too knows on
         // Welcome not to send its sessions whole. An older runner skips the frame.
-        self.send_peer(peer, &ServerMsg::Caps { caps: proto::CAP_WIRE | proto::CAP_NET_DROPS | proto::CAP_HANDOVER | proto::CAP_WORK | proto::CAP_AGENT_LIMIT | proto::CAP_IDENTITY | proto::CAP_HEADROOM | proto::CAP_CHANGES_PATCH | proto::CAP_UNREAD | proto::CAP_AGENT_GIT | proto::CAP_LEG_SIGNS | proto::CAP_CUSTODY }).await;
+        self.send_peer(peer, &ServerMsg::Caps { caps: proto::CAP_WIRE | proto::CAP_NET_DROPS | proto::CAP_HANDOVER | proto::CAP_WORK | proto::CAP_AGENT_LIMIT | proto::CAP_IDENTITY | proto::CAP_HEADROOM | proto::CAP_CHANGES_PATCH | proto::CAP_UNREAD | proto::CAP_AGENT_GIT | proto::CAP_LEG_SIGNS | proto::CAP_CUSTODY | proto::CAP_RELAYS }).await;
         // What its sessions' copies have here, so a stream it starts sends only what they lack
         // (`crate::wire::sums`): a few dozen sessions a frame, each about a kilobyte.
         for part in self.harness.kept_on(&name).chunks(KEPT_A_FRAME) {

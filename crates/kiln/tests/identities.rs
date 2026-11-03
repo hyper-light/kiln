@@ -1122,7 +1122,13 @@ fn leg_on_a_test_runner(dir: &Path, workflow: &str, env: &[(&str, &str)]) -> any
 /// [`leg_on_a_test_runner`], the runner a test build with `chaos`'s faults (`old`: a runner from
 /// before what it can do past `Build`'s 32 bits).
 fn leg_on_a_test_runner_with(dir: &Path, workflow: &str, env: &[(&str, &str)], chaos: Option<&str>) -> anyhow::Result<LegRun> {
-    let s = start(dir, &Options { agent: false, ci: "kiln_workflows = true", extra: "" })?;
+    leg_on_a_test_runner_of(dir, workflow, env, chaos, &[])
+}
+
+/// [`leg_on_a_test_runner_with`], `server` in the server's environment (`KILN_CHAOS`: a test build's
+/// faults of the server's own).
+fn leg_on_a_test_runner_of(dir: &Path, workflow: &str, env: &[(&str, &str)], chaos: Option<&str>, server: &[(&str, &str)]) -> anyhow::Result<LegRun> {
+    let s = common::start_env(dir, &Options { agent: false, ci: "kiln_workflows = true", extra: "" }, false, server)?;
     let (runner, log) = agents::runner_with(dir, s.port, "fedora-2", chaos, TALK, env)?;
     agents::connected(s.port, &s.admin, "fedora-2", &log, Duration::from_secs(60))?;
     let sha = push_e2e(dir, &s, workflow)?;
@@ -1735,6 +1741,72 @@ fn w27_r05_a_leg_on_an_older_runner_reads_unsigned_with_why() -> anyhow::Result<
     Ok(())
 }
 
+/// The test run's leg's signed records as kiln judges them (`GET /api/ci/legs/:id/signed`).
+fn signed_records(run: &LegRun, leg: &str) -> anyhow::Result<Value> {
+    let (st, body) = http(run.s.port, "GET", &format!("/api/ci/legs/{leg}/signed"), &run.s.admin, None)?;
+    anyhow::ensure!(st == 200, "{st} {body}\n{}", run.s.log());
+    Ok(serde_json::from_str(&body)?)
+}
+
+/// W27-R05: a leg of one trivial step signs its records. kiln answers a leg's identity once it has
+/// signed the leg's delegation, and such a leg ended before the answer came, its records unsigned
+/// (`w27_r07_a_land_is_signed_by_its_queue`'s gate, alone): its first step waits for it now.
+#[test]
+fn w27_r05_a_leg_of_one_trivial_step_signs_its_records() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let run = leg_on_a_test_runner(dir.path(), &legs_steps_workflow("      - run: 'true'\n"), &[])?;
+    let v = signed_records(&run, &the_leg(dir.path())?)?;
+    assert_eq!(field(&v, "state"), "verified", "{v:#}");
+    Ok(())
+}
+
+/// W27-R05: a leg's identity comes before its first step. kiln answers it 500 ms late (the
+/// server's `identity_late`, a test build's), and the leg's one step finds the leg's certificate
+/// already where its runner writes it, public; its records verify, and its runner says it waited.
+/// `cargo test -p kiln --features chaos --test identities w27_r05_a_legs_identity_comes_before_its_first_step`
+#[cfg(feature = "chaos")]
+#[test]
+fn w27_r05_a_legs_identity_comes_before_its_first_step() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let certificates = dir.path().join("fedora-2-state/identities");
+    let step = format!("      - run: ls '{}' | grep -q -- '-leg_'\n", certificates.display());
+    let run = leg_on_a_test_runner_of(dir.path(), &legs_steps_workflow(&step), &[], None, &[("KILN_CHAOS", "identity_late=500ms")])?;
+    let v = signed_records(&run, &the_leg(dir.path())?)?;
+    assert_eq!(field(&v, "state"), "verified", "{v:#}");
+    let said = std::fs::read_to_string(dir.path().join("fedora-2.log"))?;
+    assert!(said.contains("the leg's first step waited for kiln to answer its identity"), "{said}");
+    Ok(())
+}
+
+/// W27-R05: a leg whose identity kiln holds back past its first step's wait (6 s late, the server's
+/// `identity_late`) runs all the same, its runner saying why, and its records go unsigned: once
+/// kiln has answered, after the leg's end, the API says it certified the leg's identity only then.
+/// `cargo test -p kiln --features chaos --test identities w27_r05_a_leg_whose_identity_is_held_back_runs_unsigned_saying_why`
+#[cfg(feature = "chaos")]
+#[test]
+fn w27_r05_a_leg_whose_identity_is_held_back_runs_unsigned_saying_why() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    // Its output alone says "it ran": its command doesn't.
+    let run = leg_on_a_test_runner_of(dir.path(), &legs_steps_workflow("      - run: printf 'it %s\\n' ran\n"), &[], None, &[("KILN_CHAOS", "identity_late=6s")])?;
+    let leg = the_leg(dir.path())?;
+    let (_, logs) = http(run.s.port, "GET", &format!("/api/ci/legs/{leg}/logs"), &run.s.admin, None)?;
+    assert!(logs.contains("it ran"), "the leg ran: {logs}");
+    let said = std::fs::read_to_string(dir.path().join("fedora-2.log"))?;
+    assert!(said.contains("kiln hadn't answered the leg's identity in time"), "its runner says it ran without it: {said}");
+    let deadline = Instant::now() + Duration::from_secs(60);
+    loop {
+        let v = signed_records(&run, &leg)?;
+        assert_eq!(field(&v, "state"), "unsigned", "{v:#}");
+        if field(&v, "why").starts_with("kiln certified") {
+            assert_eq!(field(&v, "why"), "kiln certified its identity only after the leg had ended: its runner fedora-2 had none to sign its records with", "{v:#}");
+            break;
+        }
+        anyhow::ensure!(Instant::now() < deadline, "kiln never said its identity came late: {v:#}\n{}", run.s.log());
+        std::thread::sleep(Duration::from_millis(500));
+    }
+    Ok(())
+}
+
 /// W27-R06: an artifact's provenance, written by kiln from its own records, is signed as the leg
 /// that built it, on its runner. Kept beside kiln's own, it verifies as the leg over the very
 /// statement kiln wrote, naming its runner.
@@ -2114,5 +2186,273 @@ fn w27_r07_a_land_is_signed_by_its_queue() -> anyhow::Result<()> {
     let gate = land.checks.iter().find(|c| c.name == "gate").ok_or_else(|| anyhow::anyhow!("no gate run: {land:?}"))?;
     assert_eq!(gate.conclusion, "success", "{land:?}");
     assert!(!gate.results.is_empty(), "the gate's legs' signed results: {land:?}");
+    Ok(())
+}
+
+/// The workflow W27-R08's custody test runs on main's push: leg `build`, on the test runner, makes
+/// a file, stores it as artifact `app` (`kiln/upload@v1`), pushes an image of one config blob to
+/// kiln's registry with the job's token (`packages: write`), by the OCI API, and attests the image
+/// (`kiln/attest@v1`: kiln's provenance of it, which the leg signs).
+#[cfg(feature = "chaos")]
+const CUSTODY_BUILD: &str = r#"on: push
+jobs:
+  build:
+    runs-on: self-hosted
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - run: printf 'built\n' > app.txt
+      - uses: kiln/upload@v1
+        with:
+          name: app
+          path: app.txt
+      - id: push
+        run: |
+          set -eu
+          host="http://${KILN_REGISTRY_HOST}"
+          reg="$host/v2/acme/app/app"
+          printf '{"architecture":"amd64","os":"linux","rootfs":{"type":"layers","diff_ids":[]},"config":{}}' > config.json
+          cfg=$(sha256sum config.json | cut -d' ' -f1)
+          loc=$(curl -fsS -u "x:${KILN_TOKEN}" -X POST -D - -o /dev/null "$reg/blobs/uploads/" | tr -d '\r' | awk 'tolower($1)=="location:" {print $2}')
+          case "$loc" in http*) ;; *) loc="$host$loc" ;; esac
+          case "$loc" in *\?*) sep='&' ;; *) sep='?' ;; esac
+          curl -fsS -u "x:${KILN_TOKEN}" -X PUT -H 'Content-Type: application/octet-stream' --data-binary @config.json "$loc${sep}digest=sha256:$cfg"
+          printf '{"schemaVersion":2,"mediaType":"application/vnd.oci.image.manifest.v1+json","config":{"mediaType":"application/vnd.oci.image.config.v1+json","digest":"sha256:%s","size":%s},"layers":[]}' "$cfg" "$(wc -c < config.json)" > manifest.json
+          curl -fsS -u "x:${KILN_TOKEN}" -X PUT -H 'Content-Type: application/vnd.oci.image.manifest.v1+json' --data-binary @manifest.json "$reg/manifests/v1"
+          echo "pushed sha256:$(sha256sum manifest.json | cut -d' ' -f1)"
+          echo "digest=sha256:$(sha256sum manifest.json | cut -d' ' -f1)" >> "$GITHUB_OUTPUT"
+      - uses: kiln/attest@v1
+        with:
+          subject-name: acme/app/app
+          subject-digest: ${{ steps.push.outputs.digest }}
+"#;
+
+/// A server (`env` in its environment: a test build's faults) whose one runner is `fedora-2`, as on
+/// a machine without git (`no_git`: legs check out from the server's tarball), and its repository
+/// acme/app, with [`CUSTODY_BUILD`] on main and no approvals or checks to land: change D1 pushed for
+/// review and landed by main's queue. The server, its runner, and the commit main moved to.
+#[cfg(feature = "chaos")]
+fn landed_build(dir: &Path, env: &[(&str, &str)]) -> anyhow::Result<(Server, agents::Runner, String)> {
+    let s = common::start_env(dir, &Options { agent: false, ci: "kiln_workflows = true", extra: "" }, false, env)?;
+    let (runner, log) = agents::runner_with(dir, s.port, "fedora-2", Some("no_git"), TALK, &[])?;
+    agents::connected(s.port, &s.admin, "fedora-2", &log, Duration::from_secs(60))?;
+    let (st, body) = http(s.port, "POST", "/api/repos", &s.admin, Some(&serde_json::json!({ "name": "acme/app", "mode": "native" })))?;
+    anyhow::ensure!(st == 200, "{st} {body}");
+    let (home, work) = (dir.join("githome"), dir.join("tree"));
+    std::fs::create_dir_all(&home)?;
+    std::fs::create_dir_all(work.join(".kiln"))?;
+    let push = format!("http://x:{}@127.0.0.1:{}/git/acme/app.git", s.admin, s.port);
+    git(&home, &work, &["init", "-q", "-b", "main"])?;
+    std::fs::write(work.join("README.md"), "an app\n")?;
+    std::fs::write(work.join(".kiln/review.yaml"), "land:\n  approvals: 0\n")?;
+    std::fs::write(work.join(".kiln/build.yaml"), CUSTODY_BUILD)?;
+    git(&home, &work, &["add", "."])?;
+    git(&home, &work, &["commit", "-qm", "first"])?;
+    git(&home, &work, &["push", "-q", &push, "HEAD:main"])?;
+    std::fs::write(work.join("README.md"), "an app, built\n")?;
+    git(&home, &work, &["commit", "-qam", "built\n\nChange-Id: I8888888888888888888888888888888888888888\n"])?;
+    let said = git(&home, &work, &["push", &push, "HEAD:refs/for/main"])?;
+    anyhow::ensure!(said.contains("D1"), "D1: {said}");
+    let get = |path: &str| -> anyhow::Result<Value> {
+        let (st, body) = http(s.port, "GET", path, &s.admin, None)?;
+        anyhow::ensure!(st == 200, "{path}: {st} {body}");
+        Ok(serde_json::from_str(&body)?)
+    };
+    let deadline = Instant::now() + Duration::from_secs(240);
+    while get("/api/diffs/D1/land")?.get("blockers") != Some(&serde_json::json!([])) {
+        anyhow::ensure!(Instant::now() < deadline, "D1 can't land: {}", get("/api/diffs/D1/land")?);
+        std::thread::sleep(Duration::from_millis(500));
+    }
+    let (st, body) = http(s.port, "POST", "/api/diffs/D1/land", &s.admin, Some(&serde_json::json!({})))?;
+    anyhow::ensure!(st == 200, "land: {st} {body}");
+    while field(&get("/api/diffs/D1")?, "state") != "landed" {
+        anyhow::ensure!(Instant::now() < deadline, "D1 never landed: {}", get("/api/repos/acme%2Fapp/queue")?);
+        std::thread::sleep(Duration::from_millis(500));
+    }
+    let tip = git(&home, &work, &["ls-remote", &push, "refs/heads/main"])?.split_whitespace().next().unwrap_or_default().to_owned();
+    Ok((s, runner, tip))
+}
+
+/// The run of acme/app at commit `sha` on `s`, once it's ended: its JSON.
+#[cfg(feature = "chaos")]
+fn ended_run_at(s: &Server, sha: &str) -> anyhow::Result<Value> {
+    let deadline = Instant::now() + Duration::from_secs(300);
+    loop {
+        let (_, body) = http(s.port, "GET", "/api/ci/runs?repo=acme/app&limit=20", &s.admin, None)?;
+        let runs: Vec<Value> = serde_json::from_str::<Value>(&body)?.get("runs").and_then(Value::as_array).cloned().unwrap_or_default();
+        if let Some(r) = runs.iter().find(|r| field(r, "sha") == sha && r.get("finished_at").is_some_and(|f| !f.is_null())) {
+            return Ok(r.clone());
+        }
+        anyhow::ensure!(Instant::now() < deadline, "no finished run at {sha}: {body}\n{}", s.log());
+        std::thread::sleep(Duration::from_millis(500));
+    }
+}
+
+/// The chain of custody of the thing of digest `digest` on `s` (`GET /api/custody`), once kiln has
+/// one whose head is kiln's receipt of it.
+#[cfg(feature = "chaos")]
+fn kilns_chain(s: &Server, digest: &str) -> anyhow::Result<Value> {
+    let deadline = Instant::now() + Duration::from_secs(60);
+    loop {
+        let (st, body) = http(s.port, "GET", &format!("/api/custody?digest={digest}"), &s.admin, None)?;
+        if st == 200 {
+            let v: Value = serde_json::from_str(&body)?;
+            let head = v.get("hops").and_then(Value::as_array).and_then(|h| h.first()).cloned().unwrap_or_default();
+            if field(&head, "custodian") == "kiln://hyper-light/server" && field(&head, "kind") == "received" {
+                return Ok(v);
+            }
+        }
+        anyhow::ensure!(Instant::now() < deadline, "kiln holds no receipt of {digest}: {st} {body}\n{}", s.log());
+        std::thread::sleep(Duration::from_millis(500));
+    }
+}
+
+/// W27-R08 (the Transfers plan's step 15): the chains of steps 11 and 12 walked by `kiln custody
+/// walk`. An image a leg made (D1 landed, main's run on fedora-2 pushing it to kiln's registry),
+/// from kiln's receipt of it back to kiln's hand-on of the landed commit; and a binary put in
+/// kiln's store of bytes and read back, from kiln's receipt of what it read back to the put. Each
+/// is unbroken, said hop by hop, its export checking against kiln's CA certificate alone; and each
+/// with one hop's record removed, then changed where kiln keeps it, names its break at that hop.
+#[cfg(feature = "chaos")]
+#[test]
+fn w27_r08_custody_walk() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let (s, _fedora, tip) = landed_build(dir.path(), &[])?;
+    let run = ended_run_at(&s, &tip)?;
+    anyhow::ensure!(field(&run, "conclusion") == "success", "the build failed: {run}\n{}", s.log());
+    let db = dir.path().join("data/kiln.db");
+    let image: String = rusqlite::Connection::open(&db)?.query_row("SELECT digest FROM ci_leg_pushed WHERE repo = 'acme/app/app' ORDER BY pushed_at DESC LIMIT 1", [], |r| r.get(0))?;
+    kilns_chain(&s, &image)?;
+    let v = common::custody::walked_and_broken(s.port, &s.admin, &db, &image)?;
+    let words: Vec<&str> = v.get("hops").and_then(Value::as_array).into_iter().flatten().map(|h| field(h, "words")).collect();
+    // From kiln's receipt of what the leg made, through fedora-2's runner, to kiln's hand-on of the
+    // leg's inputs, where the chain begins.
+    assert!(words.first().is_some_and(|w| w.starts_with("kiln received ") && w.ends_with("'s leg build on fedora-2")), "{words:#?}");
+    assert!(words.iter().any(|w| w.starts_with("the runner on fedora-2 received ") && w.ends_with(" from kiln")), "{words:#?}");
+    assert!(words.iter().any(|w| w.starts_with("kiln handed on ") && w.contains("commit") && w.ends_with(" to the runner on fedora-2, where the chain begins")), "{words:#?}");
+    // kiln's store of bytes (step 12): a binary put and read back whole.
+    let mut binary = b"\x7fELF".to_vec();
+    binary.extend((0..(1u32 << 20)).map(|i| (i.wrapping_mul(2_654_435_761) >> 24) as u8));
+    let headers = format!("Authorization: Bearer {}\r\nContent-Type: application/octet-stream\r\n", s.admin);
+    let (st, body) = common::raw(s.port, "POST", "/api/updates/binaries?target=aarch64-apple-darwin", &headers, &binary)?;
+    anyhow::ensure!(st == 200, "the upload: {st} {}", String::from_utf8_lossy(&body));
+    let (st, got) = common::raw(s.port, "GET", "/dl/kiln/aarch64-apple-darwin", "", b"")?;
+    anyhow::ensure!(st == 200 && got == binary, "the download: {st}, {} bytes", got.len());
+    let kept = format!("sha256:{}", kiln::util::sha256_hex(&binary));
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while http(s.port, "GET", &format!("/api/custody/walk?digest={kept}"), &s.admin, None).ok().and_then(|(_, b)| serde_json::from_str::<Value>(&b).ok()).and_then(|v| v.get("hops").and_then(Value::as_array).map(Vec::len)) != Some(4) {
+        anyhow::ensure!(Instant::now() < deadline, "no chain of four hops for the binary: {:?}", http(s.port, "GET", &format!("/api/custody/walk?digest={kept}"), &s.admin, None));
+        std::thread::sleep(Duration::from_millis(500));
+    }
+    let v = common::custody::walked_and_broken(s.port, &s.admin, &db, &kept)?;
+    let words: Vec<&str> = v.get("hops").and_then(Value::as_array).into_iter().flatten().map(|h| field(h, "words")).collect();
+    assert!(words.iter().all(|w| w.contains("binaries/kiln-aarch64-apple-darwin")) && words.iter().any(|w| w.contains("kiln's store of bytes")), "{words:#?}");
+    Ok(())
+}
+
+/// W27-R08 (the Transfers plan's step 11): custody from the land to what a leg made. D1 lands
+/// through main's queue, and main's push runs leg `build` on fedora-2, which checks the landed
+/// commit out from kiln's tarball (as with no git), stores artifact `app` and pushes an image to
+/// kiln's registry. Walked back from kiln's receipt of each, every hop has both its records, a
+/// hand-on and its receipt by digest, signed by their custodians: kiln's server, fedora-2's runner
+/// process and the leg. The chain begins where kiln handed the leg's inputs on (its assignment,
+/// the landed commit naming D1's land, the tarball it served) and where the leg made them. Then
+/// the same with the tarball changed in transit (the server's `tarball_changed`): the leg is
+/// refused before any step runs, and the break is recorded at that hop.
+#[cfg(feature = "chaos")]
+#[test]
+fn w27_r08_custody_build() -> anyhow::Result<()> {
+    // fedora-2's runner process, as kiln knows its machine: by its machine id (docs/machines.md).
+    let runner = format!("kiln://hyper-light/person/admin/machine/{}/instance/main", machine("fedora-2"));
+    let (server, runner, leg) = ("kiln://hyper-light/server", runner.as_str(), "/leg/build");
+    let dir = tempfile::tempdir()?;
+    let (s, _fedora, tip) = landed_build(dir.path(), &[])?;
+    let run = ended_run_at(&s, &tip)?;
+    anyhow::ensure!(field(&run, "conclusion") == "success", "the build failed: {run}\n{}", s.log());
+    let (st, body) = http(s.port, "GET", &format!("/api/repos/acme%2Fapp/lands/{tip}"), &s.admin, None)?;
+    anyhow::ensure!(st == 200, "D1's land: {st} {body}");
+    let land = field(&serde_json::from_str::<Value>(&body)?, "digest").to_owned();
+    let db = rusqlite::Connection::open(dir.path().join("data/kiln.db"))?;
+    let artifact: String = db.query_row("SELECT digest FROM ci_artifacts WHERE name = 'app' ORDER BY rowid DESC LIMIT 1", [], |r| r.get(0))?;
+    let image: String = db.query_row("SELECT digest FROM ci_leg_pushed WHERE repo = 'acme/app/app' ORDER BY pushed_at DESC LIMIT 1", [], |r| r.get(0))?;
+    for thing in [&artifact, &image] {
+        let v = kilns_chain(&s, thing)?;
+        assert_eq!(v.get("unbroken"), Some(&serde_json::json!(true)), "{thing}: {v:#}");
+        let hops = v.get("hops").and_then(Value::as_array).cloned().unwrap_or_default();
+        // Walked back from a receipt, unbroken: each receipt follows a hand-on, and each hand-on on
+        // the way is answered by the receipt the walk came from. No hop lacks either record.
+        let kinds: Vec<&str> = hops.iter().map(|h| field(h, "kind")).collect();
+        assert!(kinds.iter().all(|k| *k == "received" || *k == "handed-on"), "{kinds:?}");
+        assert!(kinds.contains(&"received") && kinds.contains(&"handed-on"), "{kinds:?}");
+        // Signed by their custodians: kiln's server, fedora-2's runner process, the leg.
+        for c in hops.iter().map(|h| field(h, "custodian")) {
+            assert!(c == server || c == runner || c.ends_with(leg), "{c}: {v:#}");
+        }
+        assert!(hops.iter().any(|h| field(h, "custodian") == runner && field(h, "kind") == "received"), "fedora-2's runner received the leg's inputs: {v:#}");
+        assert!(hops.iter().any(|h| field(h, "custodian") == runner && field(h, "kind") == "handed-on"), "and handed them to the leg: {v:#}");
+        // Begun where kiln handed the leg's inputs on, and where the leg made what it handed kiln.
+        let began: Vec<&Value> = hops.iter().filter(|h| h.get("began") == Some(&serde_json::json!(true))).collect();
+        let subjects = |h: &Value| h.get("subject").and_then(Value::as_array).cloned().unwrap_or_default();
+        let named = |n: &str| began.iter().filter(|h| field(h, "custodian") == server).flat_map(|h| subjects(h)).find(|t| field(t, "name") == n);
+        let commit = named("commit").ok_or_else(|| anyhow::anyhow!("no hand-on of the landed commit: {v:#}"))?;
+        assert_eq!(commit.pointer("/digest/gitCommit").and_then(Value::as_str), Some(tip.as_str()), "{commit}");
+        assert_eq!(commit.pointer("/annotations/land").and_then(Value::as_str), Some(land.as_str()), "landed (kiln), naming D1's land: {commit}");
+        let tarball = named("checkout").ok_or_else(|| anyhow::anyhow!("no hand-on of the tarball kiln served: {v:#}"))?;
+        assert_eq!(tarball.pointer("/annotations/commit").and_then(Value::as_str), Some(tip.as_str()), "{tarball}");
+        assert!(named("assignment").is_some(), "no hand-on of the leg's assignment: {v:#}");
+        assert!(began.iter().any(|h| field(h, "custodian").ends_with(leg) && field(h, "kind") == "handed-on"), "made by the leg: {v:#}");
+        let head = hops.first().map(subjects).unwrap_or_default();
+        assert!(head.iter().any(|t| t.pointer("/digest/sha256").and_then(Value::as_str) == thing.strip_prefix("sha256:")), "kiln's receipt is of {thing}: {head:?}");
+    }
+    // The image's provenance, signed as the leg, follows those records: of the image kiln took
+    // custody of, from the commit kiln handed the leg (W27-R06's subjects and materials).
+    let job: String = db.query_row("SELECT j.id FROM jobs j JOIN runs r ON r.id = j.run_id WHERE r.sha = ?1 AND j.key = 'build' ORDER BY j.rowid DESC LIMIT 1", [&tip], |r| r.get(0))?;
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let legs: Value = loop {
+        let got: Option<String> = db
+            .query_row("SELECT bundle FROM ci_attestations WHERE leg_id = ?1 AND origin = 'leg' AND predicate_type = ?2 ORDER BY id DESC LIMIT 1", rusqlite::params![job, kiln_ci::attest::PROVENANCE], |r| r.get(0))
+            .ok();
+        if let Some(b) = got {
+            break serde_json::from_str(&b)?;
+        }
+        anyhow::ensure!(Instant::now() < deadline, "no provenance signed as the leg\n{}", s.log());
+        std::thread::sleep(Duration::from_millis(300));
+    };
+    let body = {
+        use base64::Engine as _;
+        base64::engine::general_purpose::STANDARD.decode(legs.pointer("/dsseEnvelope/payload").and_then(Value::as_str).unwrap_or_default())?
+    };
+    let st: Value = serde_json::from_slice(&body)?;
+    assert_eq!(st.pointer("/subject/0/digest/sha256").and_then(Value::as_str), image.strip_prefix("sha256:"), "of the image kiln took custody of: {st}");
+    let materials = st.pointer("/predicate/buildDefinition/resolvedDependencies").and_then(Value::as_array).cloned().unwrap_or_default();
+    assert!(materials.iter().any(|m| m.pointer("/digest/gitCommit").and_then(Value::as_str) == Some(tip.as_str())), "from the landed commit kiln handed the leg: {st}");
+    // The tarball changed in transit: the leg is refused before any step runs, and the break is
+    // recorded where fedora-2's runner received other bytes than kiln handed on.
+    let dir = tempfile::tempdir()?;
+    let (s, _fedora, tip) = landed_build(dir.path(), &[("KILN_CHAOS", "tarball_changed")])?;
+    let run = ended_run_at(&s, &tip)?;
+    assert_eq!(field(&run, "conclusion"), "failure", "{run}");
+    let db = rusqlite::Connection::open(dir.path().join("data/kiln.db"))?;
+    let job: String = db.query_row("SELECT j.id FROM jobs j JOIN runs r ON r.id = j.run_id WHERE r.sha = ?1 AND j.key = 'build' ORDER BY j.rowid DESC LIMIT 1", [&tip], |r| r.get(0))?;
+    let (st, body) = http(s.port, "GET", &format!("/api/ci/legs/{job}"), &s.admin, None)?;
+    anyhow::ensure!(st == 200, "{st} {body}");
+    assert!(body.contains("the commit's tarball isn't what kiln handed on"), "refused before it starts: {body}");
+    let (_, logs) = http(s.port, "GET", &format!("/api/ci/legs/{job}/logs"), &s.admin, None)?;
+    assert!(!logs.contains("pushed sha256:"), "no step ran on it: {logs}");
+    let deadline = Instant::now() + Duration::from_secs(60);
+    loop {
+        let (_, body) = http(s.port, "GET", "/api/custody/breaks", &s.admin, None)?;
+        let breaks: Vec<Value> = serde_json::from_str::<Value>(&body)?.get("breaks").and_then(Value::as_array).cloned().unwrap_or_default();
+        let at_hop = breaks.iter().find(|b| field(b, "kind") == "changed" && field(b, "detail").contains("checkout"));
+        if let Some(b) = at_hop {
+            let (record, follows) = (field(b, "record").to_owned(), b.pointer("/around/1").and_then(Value::as_str).unwrap_or_default().to_owned());
+            let custodian = |d: &str| -> anyhow::Result<String> { Ok(db.query_row("SELECT custodian FROM custody WHERE digest = ?1", [d], |r| r.get(0))?) };
+            assert_eq!((custodian(&record)?.as_str(), custodian(&follows)?.as_str()), (runner, server), "fedora-2's runner's receipt of kiln's hand-on of the tarball: {b}");
+            break;
+        }
+        anyhow::ensure!(Instant::now() < deadline, "no break recorded at the tarball's hop: {body}\n{}", s.log());
+        std::thread::sleep(Duration::from_millis(500));
+    }
     Ok(())
 }

@@ -291,6 +291,9 @@ pub struct Found {
     pub local_bytes: u64,
     /// Its content's SHA-256 (hex), as checked whole; none when only looked up.
     pub digest: Option<String>,
+    /// kiln's hand-on of it to this runner process (docs/ci.md W27-R08), when it came whole by
+    /// the digest kiln handed it on by.
+    pub hand_on: Option<Value>,
 }
 
 /// The first entry `keys` name (the first key, then each restore key, as GitHub looks), its
@@ -304,7 +307,7 @@ pub async fn restore(svc: &Service<'_>, keys: &[String], version: &str, scope: &
     let id = v.get("id").and_then(Value::as_i64).unwrap_or_default();
     let key = v.get("key").and_then(Value::as_str).unwrap_or_default().to_owned();
     if look_only {
-        return Ok(Some(Found { key, downloaded: 0, local_bytes: 0, digest: None }));
+        return Ok(Some(Found { key, downloaded: 0, local_bytes: 0, digest: None, hand_on: None }));
     }
     let want = v.pointer("/object/digest").and_then(Value::as_str).unwrap_or_default().to_owned();
     let list: Vec<(String, u64)> = v.pointer("/object/chunks").cloned().map(serde_json::from_value).transpose()?.unwrap_or_default();
@@ -337,7 +340,8 @@ pub async fn restore(svc: &Service<'_>, keys: &[String], version: &str, scope: &
     f.flush()?;
     let got = hex::encode(whole.finalize());
     anyhow::ensure!(got == want, "the cache's content hashes to sha256:{got}, not sha256:{want}");
-    Ok(Some(Found { key, downloaded, local_bytes, digest: Some(got) }))
+    let hand_on = v.get("hand_on").filter(|h| !h.is_null()).cloned();
+    Ok(Some(Found { key, downloaded, local_bytes, digest: Some(got), hand_on }))
 }
 
 /// What a save sent.

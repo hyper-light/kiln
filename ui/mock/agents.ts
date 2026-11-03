@@ -1265,6 +1265,8 @@ const run = {
     },
   ] as MockStep[],
 };
+/** The run as it starts (`POST /api/mock/plans/reset` puts it back). */
+const runAtStart = JSON.stringify(run);
 
 function runView() {
   const steps = run.steps.map((s, i) => {
@@ -1322,16 +1324,37 @@ function runView() {
 }
 
 /** The run's routes (before the plans' own, whose `:id` would take "runs"). */
+/** The person signed in, as kiln names them (MOCK_NO_AUTH's owner). */
+export const ME_URI = "kiln://hyper-light/person/admin";
+/** The hand-on a step taken over answers with. */
+const HAND_ON = "sha256:" + "aa".repeat(32);
+/** Receipts of steps taken over, as the browser sent them (`GET /api/mock/plans/receipts`). */
+const takeReceipts: object[] = [];
+
 async function handleRun(req: http.IncomingMessage, res: http.ServerResponse, url: URL): Promise<boolean> {
   const p = url.pathname;
   const m = req.method ?? "GET";
+  // A browser's key certified as the person signed in (docs/ci.md W27-R01): the mock's certificate
+  // is a stand-in the browser only carries in what it signs (lib/signing.ts), as kiln checks it.
+  if (p === "/api/mock/plans/receipts" && m === "GET") return (json(res, 200, { receipts: takeReceipts }), true);
+  // The run as it started, and no receipts: each browser's test takes the same step over.
+  if (p === "/api/mock/plans/reset" && m === "POST") {
+    Object.assign(run, JSON.parse(runAtStart));
+    takeReceipts.length = 0;
+    return (json(res, 200, {}), true);
+  }
+  if (p === "/api/me/identity" && m === "POST") {
+    const now = Math.floor(Date.now() / 1000);
+    json(res, 200, { uri: ME_URI, cert_pem: "-----BEGIN CERTIFICATE-----\nbW9jaw==\n-----END CERTIFICATE-----\n", not_before: now, not_after: now + 3600 });
+    return true;
+  }
   if (p === "/api/plans/runs" && m === "GET") {
     const v = runView();
     const runs = [{ id: RUN, plan: RUN_PLAN, title: RUN_TITLE, state: v.state, met: v.met, total: v.total, at: v.at }];
     json(res, 200, { runs: url.searchParams.get("active") ? runs.filter((r) => r.state === "running") : runs });
     return true;
   }
-  const rm = p.match(/^\/api\/plans\/runs\/([^/]+)(?:\/stop|\/steps\/(\d+)\/(retry|take|met))?$/);
+  const rm = p.match(/^\/api\/plans\/runs\/([^/]+)(?:\/stop|\/steps\/(\d+)\/(retry|take|met|statement|receipt))?$/);
   if (!rm) return false;
   if (decodeURIComponent(rm[1] ?? "") !== RUN) {
     json(res, 404, { error: `no plan run ${rm[1]}` });
@@ -1351,9 +1374,43 @@ async function handleRun(req: http.IncomingMessage, res: http.ServerResponse, ur
   } else {
     const s = run.steps[Number(rm[2]) - 1];
     if (!s) return (json(res, 400, { error: "no such step" }), true);
+    if (rm[3] === "statement" || rm[3] === "receipt") {
+      // The receipt of a step taken over, signed in the browser (docs/ci.md W27-R08): what to sign,
+      // then the receipt, kept as it came (kiln's for the person when it says why it's unsigned).
+      const b = await body<{ receipt?: object; unsigned?: string }>(req);
+      if (rm[3] === "statement") {
+        const statement = { v: 1, subject: [{ name: `plan run ${RUN} step ${rm[2]}`, digest: { "kiln-work-v1": "ab".repeat(32) } }], follows: [HAND_ON], body: { v: 1, kind: "received", by: ME_URI } };
+        const payload = Buffer.from(JSON.stringify(statement)).toString("base64");
+        const pae = Buffer.from(`DSSEv1 28 application/vnd.kiln.custody+json ${JSON.stringify(statement).length} ${JSON.stringify(statement)}`).toString("base64");
+        return (json(res, 200, { payload_type: "application/vnd.kiln.custody+json", statement, payload, pae, required: false }), true);
+      }
+      takeReceipts.push(b);
+      return (
+        json(
+          res,
+          200,
+          b.unsigned ? { receipt: "sha256:" + "cd".repeat(32), hand_on: HAND_ON, kiln_signed_for_you: "sha256:" + "cd".repeat(32) } : { receipt: "sha256:" + "ef".repeat(32), hand_on: HAND_ON },
+        ),
+        true
+      );
+    }
     if (rm[3] === "take") {
+      const b = await body<{ signs?: boolean }>(req);
       s.status = "taken";
       s.reason = "taken over by admin";
+      // Handed to the person taking it over: what they sign their receipt from, or kiln's receipt for them.
+      const custody = {
+        hand_on: HAND_ON,
+        subject: { name: `plan run ${RUN} step ${rm[2]}` },
+        from: "kiln://hyper-light/server",
+        to: ME_URI,
+        kiln_signed_for_you: b.signs ? null : "sha256:" + "cd".repeat(32),
+      };
+      run.state = "running";
+      run.reason = null;
+      emitEvent({ type: "harness", info: family.get("run-bench")?.info });
+      json(res, 200, { ...runView(), custody });
+      return true;
     } else if (rm[3] === "met") {
       s.status = "met";
       s.reason = "met, said admin";

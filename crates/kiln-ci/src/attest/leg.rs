@@ -342,20 +342,78 @@ pub fn canonical(v: &Value) -> Vec<u8> {
 }
 
 /// A thing a leg received, as it signs its receipt: by its digests (`subject`), from whom (an
-/// identity's URI, or where it came from when that has none), and why.
+/// identity's URI, or where it came from when that has none), why, and the records it follows: the
+/// hand-on its giver signed of it (its runner's, [`runner_custody`]), else kiln's delegation of the
+/// leg, else none (what came from where kiln has no identity begins its chain there).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Receipt {
     pub subject: statement::Subject,
     pub from: String,
     pub why: String,
+    pub follows: Vec<String>,
+}
+
+/// A thing kiln's server handed a leg's runner process for the leg (the Transfers plan's step 11):
+/// its assignment, its commit, the tarball it served it, by digest (`subject`), with the hand-on's
+/// digest (`hand_on`) and its signer (`from`).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Handed {
+    pub subject: statement::Subject,
+    pub hand_on: String,
+    pub from: String,
+}
+
+/// The runner process a leg's identity (`leg`, its URI) runs on, as its own identity's URI: the
+/// same machine and instance, enrolled by the same person.
+pub fn runner_of(leg: &str) -> Result<String, String> {
+    use crate::identity::chain::{Actor, Identity};
+    let me = Identity::parse(leg).map_err(|e| e.to_string())?;
+    let Actor::Leg { enrolled_by, machine, instance, .. } = me.actor else { return Err(format!("{leg} isn't a leg's identity")) };
+    Identity::new(me.org, Actor::Runner { enrolled_by, machine, instance }).uri().map_err(|e| e.to_string())
+}
+
+/// The custody records of runner process `by` for the leg it runs (its identity's URI `leg`), the
+/// Transfers plan's step 11, unsigned, numbered on its `stream` for that leg, each with its digest:
+/// a receipt of each thing kiln's server handed it for the leg (`handed`, each following its
+/// hand-on); then a hand-on of each thing it hands the leg's executor (`to_leg`), following the
+/// receipts of what it was made from: those sharing a digest with it and, for a checkout, the
+/// commit's. What it held from before (a cache kept from an earlier leg) follows nothing. And, for
+/// each of `to_leg` in turn, the hand-on the leg's receipt of it follows.
+pub fn runner_custody(by: &str, leg: &str, handed: &[Handed], to_leg: &[statement::Subject], stream: &str) -> Result<(Vec<(Statement, String)>, Vec<String>), statement::Refusal> {
+    let mut out: Vec<(Statement, String)> = Vec::new();
+    let mut seq = 0;
+    let mut record = |body: Value, subject: Vec<statement::Subject>, follows: Vec<String>| -> Result<String, statement::Refusal> {
+        seq += 1;
+        let mut st = Statement::new(body);
+        st.subject = subject;
+        st.follows = follows;
+        st.stream = Some(stream.to_owned());
+        st.seq = Some(seq);
+        let digest = statement::digest(statement::PAYLOAD_CUSTODY, &statement::payload(&st)?);
+        out.push((st, digest.clone()));
+        Ok(digest)
+    };
+    let mut receipts: Vec<(&statement::Subject, String)> = Vec::new();
+    for h in handed {
+        let body = serde_json::json!({ "v": 1, "kind": "received", "by": by, "from": h.from, "why": format!("kiln handed it the leg's {}", h.subject.name) });
+        receipts.push((&h.subject, record(body, vec![h.subject.clone()], vec![h.hand_on.clone()])?));
+    }
+    let shares = |a: &statement::Subject, b: &statement::Subject| a.digest.iter().any(|(alg, hex)| b.digest.get(alg) == Some(hex));
+    let mut hand_ons = Vec::new();
+    for t in to_leg {
+        let follows: Vec<String> = receipts.iter().filter(|(s, _)| shares(s, t) || (t.name.starts_with("checkout") && s.name == "commit")).map(|(_, d)| d.clone()).collect();
+        let body = serde_json::json!({ "v": 1, "kind": "handed-on", "by": by, "to": leg, "why": format!("the leg's {}, to its executor", t.name) });
+        hand_ons.push(record(body, vec![t.clone()], follows)?);
+    }
+    Ok((out, hand_ons))
 }
 
 /// A leg's custody records, unsigned, in their order on its [`CUSTODY`] stream, each with its
 /// digest ([`statement::digest`]), each naming the leg (`by`, its identity's URI) as its signer,
 /// since a statement's digest is the same whoever signs it, all acting `under` the server's
 /// delegation of the leg:
-/// - a receipt (`received`) of each thing it `received`, following that delegation, the server's
-///   words that gave it the leg;
+/// - a receipt (`received`) of each thing it `received`, following what its [`Receipt`] says: its
+///   runner's hand-on of it, else that delegation, the server's words that gave it the leg;
 /// - then its hand-on (`handed-on`) to kiln's `server` of what it made (`outputs`, its logs and
 ///   reports, its artifacts and caches, its results), following each receipt: the inputs it made
 ///   them from, which are its provenance's materials.
@@ -377,7 +435,7 @@ pub fn custody(by: &str, received: &[Receipt], outputs: Vec<statement::Subject>,
     let mut receipts = Vec::new();
     for r in received {
         let body = serde_json::json!({ "v": 1, "kind": "received", "by": by, "from": r.from, "why": r.why });
-        receipts.push(record(body, vec![r.subject.clone()], under.map(str::to_owned).into_iter().collect())?);
+        receipts.push(record(body, vec![r.subject.clone()], r.follows.clone())?);
     }
     record(serde_json::json!({ "v": 1, "kind": "handed-on", "by": by, "to": server, "why": "what it made" }), outputs, receipts)?;
     Ok(out)

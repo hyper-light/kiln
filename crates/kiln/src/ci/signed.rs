@@ -20,7 +20,8 @@
 //! - `GET /api/ci/legs/:id/signed` says who signed and when kiln took it, the delegation they acted
 //!   under, each record (its bundle, to check apart from kiln) and each break (none: they hold). A
 //!   leg that sent none is `unsigned`, saying why: its runner signs no legs' records (a kiln from
-//!   before them), kiln gave it no identity (a v1 job's), or what it sent hasn't come.
+//!   before them), kiln gave it no identity (a v1 job's) or gave it only after the leg had ended,
+//!   or what it sent hasn't come.
 
 use http::StatusCode;
 use kiln_ci::attest::leg;
@@ -93,6 +94,166 @@ async fn served_of(hub: &Hub, job: &str, attempt: i64) -> anyhow::Result<Vec<sta
         .collect())
 }
 
+/// The header kiln's hand-on of what it serves a leg comes in (a tarball's), its bundle in base64.
+pub const HAND_ON_HEADER: &str = "kiln-custody-hand-on";
+
+/// A thing named `name` by one digest (`algorithm`, its hex).
+fn named(name: &str, algorithm: &str, hex: &str) -> statement::Subject {
+    statement::Subject { name: name.to_owned(), digest: [(algorithm.to_owned(), hex.to_ascii_lowercase())].into_iter().collect(), ..statement::Subject::default() }
+}
+
+/// The leg kiln's server last delegated `job` to: its identity's URI, the delegation's delegate.
+async fn leg_of(store: &crate::store::Store, job: &str) -> anyhow::Result<Option<String>> {
+    let j = job.to_owned();
+    let bundle: Option<String> = store.call(move |c| Ok(c.query_row("SELECT bundle FROM ci_leg_delegations WHERE job_id = ?1 ORDER BY taken_at DESC, rowid DESC LIMIT 1", [&j], |r| r.get(0)).optional()?)).await?;
+    Ok(bundle.and_then(|b| crate::custody::statement_in(&b)).and_then(|s| s.body.get("delegate").and_then(Value::as_str).map(str::to_owned)))
+}
+
+/// The land that put `commit` at the head of the trunk of leg `job`'s repository, by its digest,
+/// when kiln's queue landed it (`land_signatures`).
+async fn land_of(hub: &Hub, job: &str, commit: &str) -> anyhow::Result<Option<String>> {
+    let (j, c) = (job.to_owned(), commit.to_owned());
+    hub.store
+        .call(move |db| {
+            Ok(db
+                .query_row(
+                    "SELECT l.digest FROM land_signatures l JOIN runs r ON r.repo_id = l.repo_id JOIN jobs j ON j.run_id = r.id WHERE j.id = ?1 AND l.head = ?2 ORDER BY l.signed_at DESC LIMIT 1",
+                    params![j, c],
+                    |r| r.get(0),
+                )
+                .optional()?)
+        })
+        .await
+}
+
+/// kiln's server hands `things` of leg `job` to the runner process running it, its leg identity's
+/// (`leg`) machine and instance (docs/ci.md W27-R08; the Transfers plan's step 11): a hand-on of
+/// each, signed as the server and kept, which that process's receipt follows. The bundles.
+async fn hand_to_runner(hub: &Hub, job: &str, leg: &str, things: Vec<statement::Subject>, why: &str) -> anyhow::Result<Vec<Value>> {
+    use kiln_ci::identity::custody::{Body, Kind, to_value};
+    let runner = leg::runner_of(leg).map_err(|e| anyhow::anyhow!("{e}"))?;
+    let (server, org, at) = (server_uri(hub)?, hub.pki.organization(), crate::util::now_unix());
+    let mut out = Vec::new();
+    for t in things {
+        let body = Body { to: Some(runner.clone()), why: format!("leg {job}'s {}, {why}", t.name), ..Body::new(Kind::HandedOn, &server) };
+        let s = statement::Statement { subject: vec![t], ..statement::Statement::new(to_value(&body)) };
+        let bundle = crate::custody::server_signed(&hub.pki, &s)?;
+        match crate::custody::take(&hub.store, &hub.pki.ca_der, &org, &bundle, "kiln's server", at).await? {
+            Ok(_) => out.push(bundle),
+            Err(why) => tracing::warn!(target: "kiln.custody", job, %why, "kiln refused its own hand-on of a leg's input"),
+        }
+    }
+    Ok(out)
+}
+
+/// kiln's server hands attempt `attempt` of leg `job`, certified as `leg`, its inputs (docs/ci.md
+/// W27-R08; the Transfers plan's step 11), to the runner process `peer` running it: its
+/// assignment as kiln sent it, and its commit, naming the land that put it at its trunk's head
+/// when kiln's queue landed it ("landed (kiln)"). Each hand-on kept, and sent to that process
+/// (`ServerMsg::Custody`) when it signs custody, which signs its receipts of them at the leg's end.
+pub async fn give_inputs(hub: &Hub, peer: crate::instances::PeerId, job: &str, attempt: u32, leg: &str, commit: Option<&str>) {
+    let mut things = Vec::new();
+    match handed_digest(&hub.store, job, attempt).await {
+        Ok(Some(a)) => things.push(named("assignment", "sha256", &a)),
+        Ok(None) => {}
+        Err(e) => tracing::warn!(target: "kiln.custody", job, error = %format!("{e:#}"), "a leg's assignment wasn't found to hand on"),
+    }
+    if let Some(c) = commit {
+        let mut t = named("commit", "gitCommit", c);
+        match land_of(hub, job, c).await {
+            Ok(Some(land)) => {
+                t.annotations.insert("land".into(), land.into());
+            }
+            Ok(None) => {}
+            Err(e) => tracing::warn!(target: "kiln.custody", job, error = %format!("{e:#}"), "a leg's commit's land wasn't found"),
+        }
+        things.push(t);
+    }
+    let bundles = match hand_to_runner(hub, job, leg, things, "as kiln gave it the leg").await {
+        Ok(b) => b,
+        Err(e) => return tracing::warn!(target: "kiln.custody", job, error = %format!("{e:#}"), "a leg's inputs weren't handed on signed"),
+    };
+    let signs = hub.instances.lock().get(peer).is_some_and(|i| (u64::from(i.caps) | i.wide) & crate::proto::CAP_CUSTODY != 0);
+    if signs && !bundles.is_empty() {
+        hub.send_peer(peer, &crate::proto::ServerMsg::Custody { json: json!({ "leg": job, "hand_on": bundles }).to_string() }).await;
+    }
+}
+
+/// The tarball of commit `sha` kiln serves leg `job` (by its bytes' SHA-256), handed on to the
+/// runner process running it (docs/ci.md W27-R08): kiln's hand-on, kept, to send with the bytes,
+/// which that process checks them against before the leg runs on them. None for a leg kiln
+/// delegated to no one (a v1 job's).
+pub async fn served_hand_on(hub: &Hub, job: &str, sha: &str, sha256: &str) -> anyhow::Result<Option<Value>> {
+    let mut t = named("checkout", "sha256", sha256);
+    t.annotations.insert("commit".into(), sha.into());
+    hand_leg(hub, job, t, "as kiln served it").await
+}
+
+/// kiln's server hands `thing`, which it serves leg `job` (a tarball, a cache, an artifact, an
+/// action), to the runner process running it (docs/ci.md W27-R08): its hand-on, kept, to say with
+/// what it serves. None for a leg kiln delegated to no one (a v1 job's).
+async fn hand_leg(hub: &Hub, job: &str, thing: statement::Subject, why: &str) -> anyhow::Result<Option<Value>> {
+    let Some(leg) = leg_of(&hub.store, job).await? else { return Ok(None) };
+    Ok(hand_to_runner(hub, job, &leg, vec![thing], why).await?.into_iter().next())
+}
+
+/// Action `repo` (`owner/name`) at commit `sha`, its tarball's SHA-256 `sha256`, which kiln serves
+/// leg `job`, handed on to the runner process running it ([`hand_leg`]).
+pub async fn action_hand_on(hub: &Hub, job: &str, repo: &str, sha: &str, sha256: &str) -> anyhow::Result<Option<Value>> {
+    let mut t = named(&format!("action/{repo}"), "gitCommit", sha);
+    t.digest.insert("sha256".into(), sha256.to_ascii_lowercase());
+    hand_leg(hub, job, t, "as kiln served it").await
+}
+
+/// Artifact `name` of leg `job`'s run (its zip's SHA-256), which kiln serves the leg, handed on to
+/// the runner process running it ([`hand_leg`]).
+pub async fn artifact_hand_on(hub: &Hub, job: &str, name: &str, sha256: &str) -> anyhow::Result<Option<Value>> {
+    hand_leg(hub, job, named(&format!("artifact/{name}"), "sha256", sha256), "as kiln served it").await
+}
+
+/// The cache of `key` kiln found leg `job` (its content's SHA-256, hex), handed on to the runner
+/// process running it (docs/ci.md W27-R08): kiln's hand-on, kept, to send with what it found,
+/// which that process keeps once the cache has come whole by that digest. None for a leg kiln
+/// delegated to no one.
+pub async fn found_hand_on(hub: &Hub, job: &str, key: &str, sha256: &str) -> anyhow::Result<Option<Value>> {
+    hand_leg(hub, job, named(&format!("cache/{key}"), "sha256", sha256), "as kiln found it for the leg").await
+}
+
+/// Leg `job`'s token pushed manifest `digest` to repository `repo` of kiln's registry (docs/ci.md
+/// W27-R08; the Transfers plan's step 11): kept as its current attempt's, so the leg's hand-on of
+/// what it made names the image, and kiln's receipt of that takes custody of it.
+pub async fn pushed(hub: &Hub, job: &str, repo: &str, digest: &str) {
+    let (j, r, d, at) = (job.to_owned(), repo.to_owned(), digest.to_owned(), crate::util::now_unix());
+    let kept = hub
+        .store
+        .call(move |c| {
+            c.execute("INSERT OR IGNORE INTO ci_leg_pushed (job_id, attempt, repo, digest, pushed_at) SELECT ?1, attempt, ?2, ?3, ?4 FROM jobs WHERE id = ?1", params![j, r, d, at])?;
+            Ok(())
+        })
+        .await;
+    if let Err(e) = kept {
+        tracing::warn!(target: "kiln.custody", job, error = %format!("{e:#}"), "an image a leg pushed wasn't recorded");
+    }
+}
+
+/// `GET /_kiln/pushed`, for a leg's runtime token: the images its token pushed to kiln's registry
+/// this attempt ([`pushed`]), each by its repository and digest, which its runner names in the
+/// leg's hand-on of what it made (docs/ci.md W27-R08).
+pub async fn pushed_by_leg(hub: &Hub, req: &crate::http::server::Request) -> Result<Response, Fail> {
+    let Some(claims) = super::token::of_request(hub, req.headers()) else { return Err((StatusCode::UNAUTHORIZED, "a leg's runtime token is needed".into())) };
+    let j = claims.sub.clone();
+    let rows: Vec<(String, String)> = hub
+        .store
+        .call(move |c| {
+            let mut q = c.prepare("SELECT p.repo, p.digest FROM ci_leg_pushed p JOIN jobs j ON j.id = p.job_id AND j.attempt = p.attempt WHERE p.job_id = ?1 ORDER BY p.pushed_at, p.repo, p.digest")?;
+            let rows = q.query_map([&j], |r| Ok((r.get(0)?, r.get(1)?)))?.collect::<Result<Vec<_>, _>>()?;
+            Ok(rows)
+        })
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")))?;
+    Ok(srv::json(StatusCode::OK, &json!({ "pushed": rows.iter().map(|(repo, digest)| json!({ "repo": repo, "digest": digest })).collect::<Vec<_>>() })))
+}
+
 /// A leg's record as kiln keeps it.
 struct Row {
     attempt: i64,
@@ -121,6 +282,10 @@ async fn take(hub: &Hub, machine: &str, job: &str, all: Vec<Value>) -> anyhow::R
     let against = Against::of(hub, job).await?;
     let mut rows = Vec::new();
     let mut hand_on = None;
+    // Its custody records, kept in kiln's custody too when its receipts follow its runner's
+    // hand-ons (docs/ci.md W27-R08), so a walk from what it made goes back through it to what kiln
+    // handed its runner; a runner from before them signs receipts following only the delegation.
+    let (mut custody, mut follows_runner) = (Vec::new(), true);
     for b in all {
         let (row, checked) = match against.check(hub, &b, at) {
             Ok(u) => {
@@ -144,8 +309,14 @@ async fn take(hub: &Hub, machine: &str, job: &str, all: Vec<Value>) -> anyhow::R
         };
         if let Some(why) = &row.refused {
             tracing::warn!(job, machine, why = %why, "a leg's signed record was refused");
-        } else if let Some(c) = checked.filter(|c| c.payload_type == statement::PAYLOAD_CUSTODY && leg::kind(c) == "handed-on") {
-            hand_on = Some((row.attempt, c));
+        } else if let Some(c) = checked.filter(|c| c.payload_type == statement::PAYLOAD_CUSTODY) {
+            if leg::kind(&c) == "received" && c.statement.follows.iter().any(|f| against.delegations.contains_key(f)) {
+                follows_runner = false;
+            }
+            custody.push(b.clone());
+            if leg::kind(&c) == "handed-on" {
+                hand_on = Some((row.attempt, c));
+            }
         }
         rows.push(row);
     }
@@ -168,23 +339,34 @@ async fn take(hub: &Hub, machine: &str, job: &str, all: Vec<Value>) -> anyhow::R
             Ok(())
         })
         .await?;
-    if let Some((attempt, h)) = hand_on {
-        receipt(hub, job, attempt, &h, &server).await?;
+    if let Some((attempt, h)) = hand_on
+        && let Some(kilns) = receipt(hub, job, attempt, &h, &server).await?
+    {
+        custody.push(kilns);
+    }
+    if follows_runner {
+        let (org, came_from) = (hub.pki.organization(), format!("runner {machine}"));
+        for b in &custody {
+            if let Err(e) = crate::custody::take(&hub.store, &hub.pki.ca_der, &org, b, &came_from, at).await {
+                tracing::warn!(target: "kiln.custody", job, error = %format!("{e:#}"), "a leg's custody record wasn't kept in kiln's custody");
+            }
+        }
     }
     Ok(())
 }
 
 /// kiln's receipt of the leg's hand-on `h` of what it made ([`leg::receipt`]), signed as the server
-/// and kept as taken now, once.
-async fn receipt(hub: &Hub, job: &str, attempt: i64, h: &statement::Checked, server: &str) -> anyhow::Result<()> {
+/// and kept as taken now, once: its bundle, the first time.
+async fn receipt(hub: &Hub, job: &str, attempt: i64, h: &statement::Checked, server: &str) -> anyhow::Result<Option<Value>> {
     let payload = statement::payload(&leg::receipt(server, h, &format!("leg/{job}/{attempt}")))?;
     let digest = statement::digest(statement::PAYLOAD_CUSTODY, &payload);
     let (j, d) = (job.to_owned(), digest.clone());
     let had: bool = hub.store.call(move |c| Ok(c.query_row("SELECT 1 FROM ci_leg_records WHERE job_id = ?1 AND attempt = ?2 AND digest = ?3", params![j, attempt, d], |_| Ok(())).optional()?.is_some())).await?;
     if had {
-        return Ok(());
+        return Ok(None);
     }
-    let bundle = crate::identities::sign_as(&hub.pki, "server", statement::PAYLOAD_CUSTODY, &payload)?.to_string();
+    let signed = crate::identities::sign_as(&hub.pki, "server", statement::PAYLOAD_CUSTODY, &payload)?;
+    let bundle = signed.to_string();
     let words = Identity::parse(server).map(|i| i.to_string()).unwrap_or_else(|_| server.to_owned());
     let (j, s, at) = (job.to_owned(), server.to_owned(), crate::util::now_unix());
     hub.store
@@ -200,7 +382,8 @@ async fn receipt(hub: &Hub, job: &str, attempt: i64, h: &statement::Checked, ser
             tx.commit()?;
             Ok(())
         })
-        .await
+        .await?;
+    Ok(Some(signed))
 }
 
 /// What a leg's records are checked against: the revocations as they stand, and the delegations
@@ -402,14 +585,29 @@ async fn unsigned(hub: &Hub, job: &str) -> anyhow::Result<Option<String>> {
     // itself, or of the leg as it asked for that identity).
     let delegated = !crate::identities::delegations_of(&hub.store, job).await?.is_empty();
     let signs = hub.runner_wide_caps(&a) & crate::proto::CAP_LEG_SIGNS != 0 || leg_signs(&hub.store, job).await?;
+    // Its first step waits for its identity a while, then runs without it (W27-R05).
+    let late = delegated && signs && certified_after_its_end(&hub.store, job).await?;
     // Its runner by the name people see (docs/machines.md).
     let a = hub.shown(&a);
     Ok(Some(match (delegated, signs) {
+        (true, true) if late => format!("kiln certified its identity only after the leg had ended: its runner {a} had none to sign its records with"),
         (true, true) => format!("its runner {a} sent none: the leg hasn't ended, or what it sent was lost on the way"),
         (true, false) => format!("its runner {a} signs no legs' records: a kiln from before them"),
         (false, true) => format!("kiln gave it no identity: its runner {a} asked for none for it (a kiln from before v1 jobs signed theirs), or kiln couldn't give one"),
         (false, false) => format!("kiln gave it no identity: its runner {a} asked for none (a kiln from before them)"),
     }))
+}
+
+/// Whether kiln's latest delegation of leg `job` (as it certified its identity) came after the leg
+/// had ended: kiln answered too late for the leg to sign with it (docs/ci.md W27-R05).
+async fn certified_after_its_end(store: &crate::store::Store, job: &str) -> anyhow::Result<bool> {
+    let j = job.to_owned();
+    store
+        .call(move |c| {
+            let sql = "SELECT j.finished_at IS NOT NULL AND (SELECT MAX(d.taken_at) FROM ci_leg_delegations d WHERE d.job_id = j.id) > j.finished_at FROM jobs j WHERE j.id = ?1";
+            Ok(c.query_row(sql, [&j], |r| r.get::<_, Option<bool>>(0)).optional()?.flatten().unwrap_or(false))
+        })
+        .await
 }
 
 /// `GET /api/ci/legs/:id/signed`.

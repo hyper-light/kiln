@@ -63,6 +63,8 @@ pub async fn open(hub: &Arc<Hub>, seg: &[&str], req: Request) -> Option<Result<R
         }
         // W19-R03: what a leg runs on, for comparing runs.
         ["_kiln", "facts"] => Some(super::compare::facts_from_leg(hub, req).await),
+        // W27-R08: the images a leg's token pushed to kiln's registry, for its hand-on of them.
+        ["_kiln", "pushed"] => Some(super::signed::pushed_by_leg(hub, &req).await),
         // W18: an attest step's SBOM and bundles, for its runner; the key that signs them.
         ["_kiln", "attestations", "sbom"] if req.method() == Method::POST => Some(super::attest::upload(hub, req).await),
         ["_kiln", "attestations"] => Some(super::attest::for_leg(hub, &req).await),

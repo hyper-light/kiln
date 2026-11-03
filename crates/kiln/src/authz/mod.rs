@@ -609,6 +609,8 @@ pub static ROUTES: &[Rule] = &[
     r("GET", "/api/ship/**", "runs.read", At::Anywhere),
     // A row's Hand off: the handler checks `runs.rerun` on the repository its body names (W26-R18).
     r("POST", "/api/ship/hand-off", "runs.rerun", At::Anywhere),
+    // What a browser signs to hand it off, asked as Hand off is (W27-R08).
+    r("POST", "/api/ship/hand-off/statement", "runs.rerun", At::Anywhere),
     // A row's Ready: the handler lets an agent's draft be marked ready by its person, or one with
     // `diffs.land` on the repository its body names (W26-R18).
     r("POST", "/api/ship/ready", "diffs.submit", At::Anywhere),
@@ -673,6 +675,9 @@ pub static ROUTES: &[Rule] = &[
     r("POST", "/api/verify/vsa", "audit.read", At::Server),
     r("POST", "/api/custody", SIGNED_IN, At::Server),
     r("GET", "/api/custody/breaks", "audit.read", At::Server),
+    r("GET", "/api/custody/walk", "audit.read", At::Server),
+    r("GET", "/api/custody/relays", "audit.read", At::Server),
+    r("POST", "/api/custody/relays", "settings.manage", At::Server),
     r("GET", "/api/custody", "audit.read", At::Server),
     r("GET", "/api/transfers/refused", "audit.read", At::Server),
     r("GET", "/api/transfers/unsigned", "audit.read", At::Server),

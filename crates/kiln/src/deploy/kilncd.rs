@@ -197,6 +197,54 @@ pub async fn answers(cd: &Cd, id: &str) -> Result<(), String> {
     }
 }
 
+/// What an environment requiring a verified chain (docs/ci.md W27-R11) makes of what KilnCD says of
+/// a release that's synced and healthy: healthy only once each of its pods runs what its deploy
+/// handed on (W27-R08, the Transfers plan's step 14); not yet while its pods are looked at; Degraded,
+/// saying why, once one runs something else or can't be followed by digest.
+pub async fn custody_says(cd: &Arc<Cd>, id: &str, mut view: Value) -> (Landed, Value) {
+    let verdict = crate::cd::custody::verdict(cd, id, false).await;
+    if let Some(m) = view.as_object_mut() {
+        m.insert("custody".into(), serde_json::to_value(&verdict).unwrap_or(Value::Null));
+    }
+    let landed = match verdict {
+        crate::cd::custody::Verdict::Verified { .. } => Landed::Yes,
+        crate::cd::custody::Verdict::Waiting { .. } => Landed::No,
+        crate::cd::custody::Verdict::Broken { why } => Landed::Degraded(format!("its chain doesn't reach its pods: {why}")),
+        crate::cd::custody::Verdict::Unverifiable { why } => Landed::Degraded(format!("its chain can't be followed to its pods: {why}")),
+    };
+    (landed, view)
+}
+
+/// A pod of KilnCD app `id` runs what its deploy didn't hand on (docs/ci.md W27-R08, R11): where
+/// the app is a release's registration in an environment requiring a verified chain, and a release
+/// runs there, the registration needs a person, saying why; nothing promotes into it by itself until
+/// a release lands there again.
+pub async fn custody_broke(id: &str, why: &str) {
+    let Some(d) = super::get() else { return };
+    let st = &*d.records;
+    let marked: anyhow::Result<()> = async {
+        for mut reg in super::store::registrations(st, None, None).await? {
+            if reg.running.is_none() || reg.degraded.is_some() {
+                continue;
+            }
+            let Some(a) = super::store::app(st, &reg.app).await? else { continue };
+            if app_id(&a, &reg.environment) != id {
+                continue;
+            }
+            if super::store::environment(st, &reg.environment).await?.is_some_and(|e| e.gates.require_chain == Some(true)) {
+                tracing::warn!(target: "kiln.custody", app = %reg.app, environment = %reg.environment, %why, "a release's pods don't run what it deployed");
+                reg.degraded = Some(format!("{} requires a verified chain, and its deploy's doesn't reach its pods: {why}", reg.environment));
+                super::store::put_registration(st, &reg).await?;
+            }
+        }
+        Ok(())
+    }
+    .await;
+    if let Err(e) = marked {
+        tracing::warn!(target: "kiln.custody", app = %id, error = %format!("{e:#}"), "a break in a deploy's custody wasn't marked on its registration");
+    }
+}
+
 /// Whether a sync failed because its cluster didn't answer: what it did there is unknown.
 pub fn unanswered(message: &str) -> bool {
     message.contains(crate::cd::kube::NO_ANSWER)

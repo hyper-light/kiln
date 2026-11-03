@@ -26,6 +26,12 @@ pub trait Peers: Send + Sync + 'static {
 
     /// `digest`'s bytes for `repo` from `peer`, written to `into`: whether it sent them.
     fn get<'a>(&'a self, peer: &'a str, repo: &'a str, digest: &'a str, into: &'a Path) -> BoxFuture<'a, anyhow::Result<bool>>;
+
+    /// `peer`'s runner process as kiln names it (its identity's URI), for this runner's receipt
+    /// of what it sends (docs/ci.md W27-R08). None where kiln doesn't say.
+    fn custodian<'a>(&'a self, _peer: &'a str) -> BoxFuture<'a, Option<String>> {
+        Box::pin(async { None })
+    }
 }
 
 /// What a fetch did.
@@ -56,21 +62,29 @@ pub async fn fetch(store: &Arc<Store>, peers: &dyn Peers, repo: &str, digest: &s
         }
         // Checked before it's kept: a wrong copy never enters the store, under any name.
         let (s, t, want) = (Arc::clone(store), tmp.clone(), digest.to_owned());
-        let kept = crate::rt::blocking(move || -> anyhow::Result<bool> {
-            if crate::sync::blobs::hash_file(&t)? != want {
-                return Ok(false);
+        let kept = crate::rt::blocking(move || -> anyhow::Result<(bool, String)> {
+            let got = crate::sync::blobs::hash_file(&t)?;
+            if got != want {
+                return Ok((false, got));
             }
             s.put_file(&t)?;
-            Ok(true)
+            Ok((true, got))
         })
         .await;
         let _ = std::fs::remove_file(&tmp);
+        // This runner's receipt of what the peer sent, by what it hashed to (W27-R08): a wrong
+        // copy is the break kiln records at that hop, naming the peer.
+        if let Ok(Ok((_, got))) = &kept
+            && let Some(from) = peers.custodian(&peer).await
+        {
+            crate::runner::custody::peer_object_taken(&from, repo, digest, got);
+        }
         match kept {
-            Ok(Ok(true)) => {
+            Ok(Ok((true, _))) => {
                 done.from = Some(peer);
                 return Ok(done);
             }
-            Ok(Ok(false)) => {
+            Ok(Ok((false, _))) => {
                 tracing::warn!(target: "kiln.work", %peer, object = %digest, "a peer's copy of an object wasn't what its name says: refused");
                 done.refused.push(peer);
             }
@@ -100,6 +114,17 @@ impl Peers for Reach {
             node.object(peer, repo, digest, into).await
         })
     }
+
+    fn custodian<'a>(&'a self, peer: &'a str) -> BoxFuture<'a, Option<String>> {
+        Box::pin(custodian_of(peer))
+    }
+}
+
+/// Runner `peer`'s process that takes reach as kiln names it, asked of the server (`custody`).
+pub async fn custodian_of(peer: &str) -> Option<String> {
+    let node = crate::reach::node::global()?;
+    let answer: serde_json::Value = node.query(serde_json::json!({ "op": "custody", "runner": peer }).to_string()).await.ok().and_then(|a| serde_json::from_str(&a).ok())?;
+    answer.get("uri").and_then(serde_json::Value::as_str).map(str::to_owned)
 }
 
 /// Tells the server's directory this runner holds `digest` for `repo`, for its peers (W24-R27).
