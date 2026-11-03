@@ -2136,19 +2136,20 @@ fn not_granted() -> ApiError {
     err(StatusCode::FORBIDDEN, "this URL grants nothing here")
 }
 
-/// `/api/blobs/<key>?expires=&sig=` (and `&length=` for a put): one of the local store's presigned
-/// URLs (docs/blobs.md, `crate::blobs::local`). The URL is the only credential: its signature covers
-/// the method, the exact key, the expiry (at most an hour) and a put's length, and is checked in
-/// constant time before anything is read or written. A get streams the one object it names, in a
-/// range when one is asked; a put keeps a body of exactly the length declared, or nothing. No
-/// listing, no prefixes, and keys with `.` or `..` segments are refused as any bad key is. An S3
-/// store's presigned URLs lead to the S3, not here.
+/// `/api/blobs/<key>?expires=&sig=` (and `&length=` for a put): one of the local or the Mantle
+/// store's presigned URLs (docs/blobs.md, `crate::blobs::local`). The URL is the only credential:
+/// its signature covers the method, the exact key, the expiry (at most an hour) and a put's
+/// length, and is checked in constant time before anything is read or written. A get streams the
+/// one object it names, in a range when one is asked; a put keeps a body of exactly the length
+/// declared, or nothing. No listing, no prefixes, and keys with `.` or `..` segments are refused as
+/// any bad key is. An S3 store's presigned URLs lead to the S3, not here.
 async fn presigned(hub: &Arc<Hub>, encoded: &str, req: Request) -> R {
     use kiln_seams::blobs::{Access, Method as Signed, Refusal};
-    let local = hub.blobs.local.clone().ok_or_else(not_granted)?;
     let signed = if req.method() == Method::PUT { Signed::Put } else { Signed::Get };
     let query = req.uri().query().unwrap_or_default().to_owned();
-    let (key, access) = local.check_presigned(encoded, &query, signed).map_err(|_| not_granted())?;
+    let grant = hub.blobs.local.as_ref().map(|l| l.check_presigned(encoded, &query, signed))
+        .or_else(|| hub.blobs.mantle.as_ref().map(|m| m.check_presigned(encoded, &query, signed))).ok_or_else(not_granted)?;
+    let (key, access) = grant.map_err(|_| not_granted())?;
     let blobs = Arc::clone(&hub.blobs.blobs);
     let failed = |e: Refusal| match e {
         Refusal::Unavailable(_) => err(StatusCode::SERVICE_UNAVAILABLE, e.to_string()),

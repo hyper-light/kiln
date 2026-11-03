@@ -9970,10 +9970,13 @@ Research `01a18abf2d28762d92104dca2fbfbf89`.
     A reader followed range by range is let go, with no receipt, after 10 minutes without a range
     or past 64 readers at once. Objects whose key names their content (`cas/`, `sync/`) get no
     records: every read checks them by name, and a whole get that fails is refused and audited
-    (`blobs.read`). An S3's presigned URLs carry bytes kiln never sees. The blob stores stand in for
-    Mantle here, which isn't in kiln yet: Mantle's puts and gets take the same hand-on and receipt
-    once CP-T10.2 vendors it (docs/mantle.md), and a Mantle cell can then sign its own receipt of a
-    put where kiln's server signs for the store today.
+    (`blobs.read`). An S3's presigned URLs carry bytes kiln never sees. Mantle's store
+    (`blobs::mantle::MantleBlobs`, CP-T10.2, over Mantle's native protocol; docs/blobs.md) is
+    wrapped the same way, its records naming `kiln://<org>/blobs/mantle`. It hashes a whole read
+    against the SHA-256 kiln handed on and refuses bytes changed in the cell before the wrapper
+    sees them; the wrapper records the break all the same (`tests/mantle_blobs.rs`, on a cell of
+    three). A cell holds no key of kiln's either, so kiln's server signs its receipt for it; a cell
+    that signs its own is Mantle's to give.
   - *The conversation feed* (`convo::feed`: a runner's `Shipper` → the server's `Intake`, the
     server to its mirrors, and a mirror's copy back for a restore): each end has a
     `convo::feed::Custodian` (`runner::custody::Feed` on a runner, `custody::feeds` on the server).

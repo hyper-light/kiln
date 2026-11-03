@@ -183,7 +183,8 @@ reaching a process it isn't for.
 - Step 12's cluster group: a learner started again on its kept replica, or whose server started
   again, checks the log from where its leaves start then; what it applied since its last receipt
   before that goes unchecked (docs/ci.md W27-R08, "Not yet").
-- The blob stores stand in for Mantle's puts and gets until CP-T10.2 vendors it (put to Ada).
+- Mantle's store carries custody on `cp/t10.2-mantle-custody` (Mantle vendored at 17eb8032,
+  `[blobs] store = "mantle"`, opt-in); production stays on its store. It lands on Ada's word.
 - A runner keeps its reach directory 30 s and refuses a runner that announced after its last read
   (put to Ada: re-read once before refusing).
 - Step 16's end to end runs on the test cluster, then the gate on this branch.

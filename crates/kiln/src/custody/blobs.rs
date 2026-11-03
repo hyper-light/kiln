@@ -50,7 +50,7 @@ pub struct Attested {
     inner: Arc<dyn Blobs>,
     store: Store,
     pki: Arc<crate::pki::Pki>,
-    /// The store, as kiln's records name it: `kiln://<org>/blobs/<local|s3>`.
+    /// The store, as kiln's records name it: `kiln://<org>/blobs/<local|s3|mantle>`.
     uri: String,
     /// Uploads under way of objects kiln records, by their id: the key, the SHA-256 of their parts
     /// so far, and the part that comes next. A part out of order (sent again, say) lets the hash
@@ -272,7 +272,15 @@ impl Blobs for Attested {
     fn get<'a>(&'a self, key: &'a str, range: Option<Range>) -> BoxFuture<'a, Result<(Meta, Vec<u8>), Refusal>> {
         Box::pin(async move {
             let start = range.map_or(0, |r| r.start);
-            let (meta, mut bytes) = self.inner.get(key, range).await?;
+            let (meta, mut bytes) = match self.inner.get(key, range).await {
+                // A store that checks its bytes itself (Mantle's, CP-T10.2) refuses changed ones
+                // before they reach here: the break is recorded all the same (W27-R08).
+                Err(Refusal::BadChecksum { want, got }) => {
+                    self.read_broke(key, &want, &got).await;
+                    return Err(Refusal::BadChecksum { want, got });
+                }
+                other => other?,
+            };
             changed(key, start, &mut bytes);
             let whole = start == 0 && u64::try_from(bytes.len()).is_ok_and(|n| n == meta.size);
             if whole {

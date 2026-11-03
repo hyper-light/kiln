@@ -61,6 +61,9 @@
 //! - `blob_changed=<key>`: the server's: the object at `key` reads back from its store of bytes
 //!   with its first byte changed, as a store whose bytes changed under kiln (docs/ci.md W27-R08):
 //!   the read is refused and kiln records the break.
+//! - `mantle_lost`: the server's: the first answer a Mantle cell gives each of kiln's mutations is
+//!   lost on its way back, after the cell applied it (CP-T10.2, docs/blobs.md "The Mantle store"):
+//!   kiln asks again with its identity, and a native upload is resumed.
 //! - `feed_changed`: the first batch of a conversation store's feed this process signs for has a
 //!   byte changed after it signed its hand-on, once (docs/ci.md W27-R08): the taker refuses it,
 //!   kiln records the break, and the batch goes again as it was.
@@ -142,6 +145,9 @@ pub struct Chaos {
     /// The server's: the object at this key reads back changed from its store of bytes
     /// (`blob_changed=`).
     pub blob_changed: Option<String>,
+    /// The server's: a Mantle cell's first answer to each of kiln's mutations is lost after the
+    /// cell applied it (`mantle_lost`).
+    pub mantle_lost: bool,
     /// The first batch of a feed it signs for changes after its hand-on, once (`feed_changed`).
     pub feed_changed: bool,
     /// A file it syncs to another runner changes after it hashed it (`sync_file_changed`).
@@ -263,6 +269,7 @@ pub fn parse(spec: &str) -> anyhow::Result<Chaos> {
             "sync_file_changed" => c.sync_file_changed = true,
             "copy_changed" => c.copy_changed = true,
             "entry_changed" => c.entry_changed = true,
+            "mantle_lost" => c.mantle_lost = true,
             "relay_calls" | "relay_forward" | "relay_words" | "relay_frames" => {
                 let f = RelayFault::parse(v).ok_or_else(|| anyhow::anyhow!("chaos `{k}` takes drop, swap or alter, not `{v}`"))?;
                 match k {
@@ -282,7 +289,7 @@ pub fn parse(spec: &str) -> anyhow::Result<Chaos> {
                 }
             }
             "seed" => c.seed = v.parse().map_err(|_| anyhow::anyhow!("chaos `seed` takes a number, not `{v}`"))?,
-            other => anyhow::bail!("chaos has no fault `{other}`: drop, down, delay, lag, oom, disk, corrupt, fetch, platform, rebuild, shed, twice, late, unknown, garble, seed, fanout, old, unsigned, stale_words, identity_late, tarball_changed, no_git, peer_object_changed, blob_changed, feed_changed, sync_file_changed, copy_changed, entry_changed, relay_calls, relay_forward, relay_words, relay_frames, copy or keys"),
+            other => anyhow::bail!("chaos has no fault `{other}`: drop, down, delay, lag, oom, disk, corrupt, fetch, platform, rebuild, shed, twice, late, unknown, garble, seed, fanout, old, unsigned, stale_words, identity_late, tarball_changed, no_git, peer_object_changed, blob_changed, mantle_lost, feed_changed, sync_file_changed, copy_changed, entry_changed, relay_calls, relay_forward, relay_words, relay_frames, copy or keys"),
         }
     }
     Ok(c)
@@ -519,6 +526,7 @@ mod tests {
                 no_git: false,
                 peer_object_changed: false,
                 blob_changed: None,
+                mantle_lost: false,
                 feed_changed: false,
                 sync_file_changed: false,
                 copy_changed: false,
@@ -535,6 +543,7 @@ mod tests {
         assert_eq!(parse("blob_changed=artifacts/7/app")?.blob_changed.as_deref(), Some("artifacts/7/app"));
         assert!(parse("blob_changed").is_err(), "it names an object's key");
         assert!(parse("feed_changed")?.feed_changed);
+        assert!(parse("mantle_lost")?.mantle_lost);
         assert!(parse("sync_file_changed")?.sync_file_changed);
         // W27-R08's cluster group: a copy, and an entry, changed on their way.
         assert!(parse("copy_changed")?.copy_changed && parse("entry_changed")?.entry_changed);

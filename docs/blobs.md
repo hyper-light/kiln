@@ -2,7 +2,7 @@
 
 kiln keeps its records (runs, sessions, settings) in its stores of records, and its bytes in one
 store of bytes: kiln-seams' `Blobs` (docs/seams.md, "Blobs"), S3's semantics with a content's
-SHA-256 as its etag. Two stores implement it, and every byte kiln keeps on its server goes through
+SHA-256 as its etag. Three stores implement it, and every byte kiln keeps on its server goes through
 the one `[blobs]` names:
 
 - **local** (the default): the server's data directory. What kiln kept before it had this store
@@ -10,15 +10,14 @@ the one `[blobs]` names:
 - **s3**: any S3-compatible store (AWS S3, MinIO and the rest), so a lost server disk loses
   nothing kiln keeps there.
 
-Mantle comes next (critical path CP-T10.2): its chunk store inside kiln's process on one
-machine, then its cluster across kiln's fleet. docs/mantle.md has what kiln asked of Mantle and
-what Mantle's agent answered.
+- **mantle** (CP-T10.2): the vendored `mantle-client` over native QUIC to a Mantle cell, using a
+  client certificate issued by that cell. docs/mantle.md has the integration and its boundaries.
 
 ## Configuring it
 
 ```toml
 [blobs]
-# "local" (the server's data directory) or "s3".
+# "local" (the server's data directory), "s3" or "mantle".
 store = "local"
 # The largest object kept, in bytes (64 GiB).
 object_max = 68719476736
@@ -40,6 +39,20 @@ secret_access_key_file = "/etc/kiln/s3-secret"
 # ca_file = "/etc/kiln/s3-ca.pem"
 # Make the bucket at start when it isn't there.
 create_bucket = false
+
+[blobs.mantle]
+# The directory `mantle init client <dir> --cell <the cell's directory>` made: its config, the
+# client's certificate and key, and the cell authority's certificate.
+client = "/etc/kiln/mantle-client"
+# Where the first node of that config listens now (host:port), if it moved; the others stay.
+endpoint = ""
+bucket = "kiln"
+# kiln's keys go under it: at most 60 bytes.
+prefix = "kiln"
+# Make the bucket at start when it isn't there.
+create_bucket = false
+# How long a request has, every exchange it needs included: 1 to 3600 seconds.
+timeout_s = 120
 ```
 
 Without `access_key_id` and `secret_access_key_file`, the S3 store takes `AWS_ACCESS_KEY_ID`,
@@ -91,8 +104,9 @@ on every store.
 
 ### Presigned URLs
 
-The local store's presigned URLs lead to the server's `/api/blobs/<key>?expires=…&sig=…` (and
-`&length=…` for a put). The URL is the only credential, so it's held to what it says:
+The local and Mantle stores' presigned URLs lead to the server's
+`/api/blobs/<key>?expires=…&sig=…` (and `&length=…` for a put). The URL is the only credential, so
+it's held to what it says:
 
 - **What it signs:** its method, its exact key, its expiry and, for a put, the length of the body
   it takes. HMAC-SHA256 under the server's own key (`<data>/blobs.key`, made once, readable by the
@@ -133,6 +147,77 @@ client.
 - **Retries:** `503 SlowDown` is sent again, three times at most, a backoff apart, as is a
   conditional write S3 answers `409`; anything else is `Unavailable`, never guessed.
 - **Upkeep:** uploads begun two days ago, and what a crash left joined, go every hour.
+
+## The Mantle store
+
+`kiln::blobs::mantle::MantleBlobs` (CP-T10.2): Mantle's native object protocol over QUIC, through
+the vendored `mantle-client`, on hyper-rt. kiln presents the client certificate the cell's
+authority issued it (`mantle init client`) and takes only nodes that authority certified.
+
+- **Where:** an object at key `k` is a pointer at `<prefix>/o/<k>`: a small JSON document naming
+  its content's SHA-256, its size and the native ETag of its bytes, which are kept once, at
+  `<prefix>/d/<sha256>`, written only where nothing is. Mantle keeps no metadata kiln could set
+  and has no CopyObject or UploadPartCopy (docs/mantle.md), so the SHA-256 lives in the pointer.
+- **Etags:** the seam's etag is the SHA-256 the pointer names. `If-None-Match` writes the pointer
+  only where there's none; `If-Match` is judged against the pointer's SHA-256, and the pointer is
+  then written on Mantle's `If-Match` of the native ETag read, so a write between the two is
+  refused, not lost.
+- **Writes:** up to 5 MiB in memory goes in one put, its SHA-256 stated for Mantle to check before
+  anything commits. More, and a completion's parts (read from the cell as they go), go as Mantle's
+  native upload, held to a CRC-64/NVME: each run (8 MiB at the most) read whole before it's sent,
+  so no exchange waits on its source. Bytes kept under their SHA-256 already are read back and
+  hashed before a pointer is made to them.
+- **Reads:** a whole get is hashed against the pointer's SHA-256; a range is given as it is while
+  the bytes' native ETag is the pointer's, else only once the whole object hashes to it. Bytes
+  that don't are refused `BadChecksum`.
+- **Asked again:** mantle-client asks again only what no node can have taken, and what's slowed
+  a few times; the rest is the caller's. Mantle judges a put asked again afresh (at 17eb8032 it
+  knows a write again by the file its gateway wrote, not by the client's identity), so a put whose
+  answer was lost on the way is checked against its key before it's sent again: a document (a
+  pointer, an upload's record) carries its write's own id, bytes their SHA-256, and a write the
+  cell applied isn't sent again, so it leaves no second version. One it didn't apply is sent again,
+  at once the first time; a write refused for its condition was still done where the key holds
+  it. A read, a delete (`NotFound` counts as done) or a request the client's transport had no room
+  for, or the cell slowed, is asked again after a pause that doubles from a quarter of a second to
+  eight, until its deadline. A native upload given up is resumed by its identity from where the
+  cell holds it, and a Finish asked again once the upload is gone is answered with the version it
+  made; where the cell has no such upload, the key's bytes say whether it finished, else it begins
+  again as a new one. Bytes kept under their SHA-256 already aren't sent again, and an upload the
+  cell refused (its condition, say) is aborted, so none is left open. A test build's `mantle_lost`
+  (chaos) loses the cell's first answer to each mutation after the cell applied it.
+- **Uploads in parts** are kept in Mantle at `<prefix>/u/<id>/` (the upload, and each part's bytes
+  and SHA-256), so they outlive kiln's restart. Completing writes the parts it names into the
+  upload first, checks each part's bytes against its SHA-256 as it takes the whole's, then streams
+  the parts, 8 MiB at a time, into the content's place before the pointer is written: nothing is
+  spooled on kiln's disk. Completing or aborting removes the upload's keys.
+- **At once:** requests go on one shard, through one client a node of the cell (two at least, four
+  at the most), each first asking a node of its own. Those that come together are asked at once,
+  one through each client (a caller waits for each answer before it asks again, so they're
+  concurrent ones); a completion, one writing as the next reads its parts, and a listing, its keys'
+  pointers read through all of them (Mantle's listing says each pointer's own size, not its
+  object's), go alone. A node at 17eb8032 admits two native clients at once and runs two
+  operations at once, so one a node takes half of each.
+  64 requests more wait at most, and one past them is refused `Full`. Each is answered within
+  `timeout_s`, every exchange it needs included. A cell that doesn't answer is `Unavailable`, with
+  Mantle's status, and never keeps the server from listening.
+- **Time:** head, get and list say the pointer's Last-Modified, to the second.
+- **Not yet:** bytes no pointer names any more (deleted or replaced), and uploads never completed
+  or aborted, stay in the cell: nothing collects them yet (T10's).
+- **Custody (W27-R08):** the server's store is wrapped as every store is
+  (`custody::blobs::Attested`), its records naming `kiln://<organization>/blobs/mantle`. Bytes
+  changed in the cell are refused by the adapter's own hash before the wrapper sees them, and the
+  wrapper still records the break (or audits the refusal, for a key that names its content).
+
+`[blobs.mantle] client` names the directory `mantle init client` made: it holds the client's key,
+so it's the server user's alone. A missing or malformed one refuses kiln's configuration at start,
+its keys never printed. `endpoint` replaces where the first node is, not who the nodes are.
+
+`crates/kiln/tests/mantle_blobs.rs` makes a cell of three founders on loopback, each its own
+failure domain with its own volume, from the `mantle` executable `KILN_TEST_MANTLE_BIN` names
+(Mantle's release build: `cargo build --release -p mantle` in `vendor/mantle`), and runs
+kiln-seams' Blobs suite against this store there, then W27-R08's put, read and changed object:
+`cargo test -p kiln --test mantle_blobs -- --ignored` (its cell under `TMPDIR`). With
+`--features chaos` it also runs the suite with each mutation's first answer lost.
 
 ## Moving a server to S3
 
