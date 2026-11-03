@@ -274,38 +274,76 @@ async fn commit(hub: &Hub, path: &str, o: &Open, onto: &str, tree: &str, tip_nam
 }
 
 /// An open pull request of a host, as a round reads it: its host, number, latest head (its `n`
-/// among the heads kiln has seen, and that commit).
+/// An open pull request of a host, as a round reads it: its host, number, latest head (its `n`
+/// among the heads kiln has seen, and that commit), the branch it goes onto and its own branch.
 struct Pull {
     host: String,
     number: i64,
     n: i64,
     head: String,
+    base: String,
+    head_ref: String,
 }
 
-/// The open pull requests on `trunk` of `repo` (mirrored from its host, W26-R20), each at its
-/// latest head.
-async fn open_pulls(hub: &Hub, repo: &Repo, trunk: &str) -> anyhow::Result<Vec<Pull>> {
-    let (rid, t) = (repo.id.clone(), trunk.to_owned());
+impl Pull {
+    fn id(&self) -> String {
+        format!("pull:{}:{}", self.host, self.number)
+    }
+}
+
+/// The open pull requests of `repo` (mirrored from its host, W26-R20), each at its latest head.
+async fn open_pulls(hub: &Hub, repo: &Repo) -> anyhow::Result<Vec<Pull>> {
+    let rid = repo.id.clone();
     hub.store
         .call(move |c| {
             let mut st = c.prepare(
-                "SELECT p.host, p.number, h.n, h.sha FROM host_pulls p JOIN host_pull_heads h ON h.repo_id = p.repo_id AND h.host = p.host AND h.number = p.number
-                  WHERE p.repo_id = ?1 AND p.base = ?2 AND p.state IN ('open', 'draft')
+                "SELECT p.host, p.number, h.n, h.sha, p.base, COALESCE(p.head_ref, '') FROM host_pulls p JOIN host_pull_heads h ON h.repo_id = p.repo_id AND h.host = p.host AND h.number = p.number
+                  WHERE p.repo_id = ?1 AND p.state IN ('open', 'draft')
                     AND h.n = (SELECT MAX(x.n) FROM host_pull_heads x WHERE x.repo_id = p.repo_id AND x.host = p.host AND x.number = p.number)
                   ORDER BY p.host, p.number",
             )?;
-            let rows = st.query_map([&rid, &t], |r| Ok(Pull { host: r.get(0)?, number: r.get(1)?, n: r.get(2)?, head: r.get(3)? }))?.filter_map(Result::ok).collect();
+            let rows = st.query_map([&rid], |r| Ok(Pull { host: r.get(0)?, number: r.get(1)?, n: r.get(2)?, head: r.get(3)?, base: r.get(4)?, head_ref: r.get(5)? }))?.filter_map(Result::ok).collect();
             Ok(rows)
         })
         .await
 }
 
-/// A mirrored repository's pull requests on `trunk`, replayed onto `tip` in kiln's mirror, as a
-/// change request's are (its base merged into its head, by `git merge-tree`); each replay kept
-/// (`review_pull_replays`), a clean one's commit made by kiln through `revision::commit` and kept at
-/// `refs/kiln/pulls/<host>/<n>/replays/<k>` for Update to push. Nothing moves on the host.
+/// The pull requests of `trunk`'s stacks: those on `trunk`, and those on another's branch (a stack,
+/// as GitHub's and GitLab's are), each with the one below it (by id), bottom ones first.
+fn pull_stacks(all: Vec<Pull>, trunk: &str) -> Vec<(Pull, Option<String>)> {
+    let by_branch: HashMap<(String, String), String> = all.iter().filter(|p| !p.head_ref.is_empty()).map(|p| ((p.host.clone(), p.head_ref.clone()), p.id())).collect();
+    let mut on: Vec<(Pull, Option<String>)> = Vec::new();
+    let mut ids: BTreeSet<String> = BTreeSet::new();
+    let mut rest = all;
+    // Those on the trunk, then each on one already taken, until none is left to take.
+    loop {
+        let before = on.len();
+        let (take, keep): (Vec<Pull>, Vec<Pull>) = rest.into_iter().partition(|p| p.base == trunk || by_branch.get(&(p.host.clone(), p.base.clone())).is_some_and(|b| ids.contains(b)));
+        for p in take {
+            let below = (p.base != trunk).then(|| by_branch.get(&(p.host.clone(), p.base.clone())).cloned()).flatten();
+            ids.insert(p.id());
+            on.push((p, below));
+        }
+        rest = keep;
+        if on.len() == before || rest.is_empty() || on.len() > 10_000 {
+            break;
+        }
+    }
+    on
+}
+
+/// A mirrored repository's pull requests of `trunk`, replayed in kiln's mirror as a change
+/// request's are (the base merged into the head, by `git merge-tree`), stack by stack as
+/// `kiln_ci::fresh::plan` says: one on the trunk onto its new tip, one on another's branch (a
+/// stack's upper one) onto that one's replay. Each replay is committed by kiln through
+/// `revision::commit` (a conflicting one with its markers in, so the ones above still move) and
+/// kept (`review_pull_replays`, `refs/kiln/pulls/<host>/<n>/replays/<k>`) for Update to push.
+/// Nothing moves on the host.
 async fn pulls(hub: &Arc<Hub>, repo: &Repo, trunk: &str, tip: &str) -> anyhow::Result<Round> {
-    let found = open_pulls(hub, repo, trunk).await?;
+    let all = open_pulls(hub, repo).await?;
+    let seen = all.len();
+    let found = pull_stacks(all, trunk);
+    tracing::info!(repo = %repo.name, %trunk, open = seen, on_trunk = found.len(), pulls = ?found.iter().map(|(p, b)| format!("{}<-{}", p.id(), b.as_deref().unwrap_or(trunk))).collect::<Vec<_>>(), "a host's open pull requests, as fresh sees them");
     if found.is_empty() {
         return Ok(Round::default());
     }
@@ -316,19 +354,48 @@ async fn pulls(hub: &Arc<Hub>, repo: &Repo, trunk: &str, tip: &str) -> anyhow::R
     }
     let tip_name = format!("{trunk}@{}", tip.get(..7).unwrap_or(tip));
     let mut out = Round::default();
-    let mut refs = String::from("start\n");
-    let mut clean_pulls: Vec<i64> = Vec::new();
-    for p in &found {
+    let mut there: Vec<(Pull, Option<String>)> = Vec::new();
+    for (p, below) in found {
         if gitops::ensure_commit(hub, repo, &p.head).await.is_err() {
             tracing::warn!(repo = %repo.name, host = %p.host, number = p.number, head = %p.head, "a pull request's head isn't in the mirror: it isn't replayed");
             out.waiting += 1;
             continue;
         }
-        if contains(hub, &path, tip, &p.head).await || replayed_pull(hub, repo, p, tip).await? {
+        there.push((p, below));
+    }
+    let heads: HashMap<String, String> = there.iter().map(|(p, _)| (p.id(), p.head.clone())).collect();
+    let mut changes = Vec::with_capacity(there.len());
+    for (p, below) in &there {
+        let on = if contains(hub, &path, tip, &p.head).await { tip.to_owned() } else { String::new() };
+        let on_below = match below.as_ref().and_then(|b| heads.get(b)) {
+            Some(b) => contains(hub, &path, b, &p.head).await,
+            None => true,
+        };
+        changes.push(Change { id: p.id(), kind: Kind::Pull, trunk: trunk.to_owned(), below: below.clone(), on, on_below });
+    }
+    let planned = plan::plan(&BTreeMap::from([(trunk.to_owned(), tip.to_owned())]), &changes);
+    let by_id: HashMap<String, &Pull> = there.iter().map(|(p, _)| (p.id(), p)).collect();
+    let mut refs = String::from("start\n");
+    // Each pull request replayed this round: its replay's commit, for the ones above it.
+    let mut replayed: HashMap<String, String> = HashMap::new();
+    let mut clean_pulls: Vec<i64> = Vec::new();
+    for r in &planned.replays {
+        let Some(p) = by_id.get(&r.id) else { continue };
+        let (onto, onto_name) = match &r.onto {
+            Onto::Tip(t) => (t.clone(), tip_name.clone()),
+            Onto::Below(b) => match replayed.get(b).or_else(|| heads.get(b)) {
+                Some(c) => (c.clone(), format!("#{}", b.rsplit(':').next().unwrap_or(b))),
+                None => {
+                    out.waiting += 1;
+                    continue;
+                }
+            },
+        };
+        if replayed_pull(hub, repo, p, &onto).await? {
             continue;
         }
         let v = Version { n: 0, commit: p.head.clone(), parent: String::new(), base: String::new(), rebase_only: false, pushed_by: String::new(), note: None, created_at: 0, git_ref: String::new(), started_by: None, why: None, thread: None, checks_from: None, same_patch: None };
-        let (clean, merged) = match conflicts::merge_tree(hub, &path, tip, &v, true).await {
+        let (clean, merged) = match conflicts::merge_tree(hub, &path, &onto, &v, true).await {
             Ok(x) => x,
             Err((_, why)) => {
                 tracing::warn!(repo = %repo.name, host = %p.host, number = p.number, %why, "a pull request's replay didn't run");
@@ -336,41 +403,35 @@ async fn pulls(hub: &Arc<Hub>, repo: &Repo, trunk: &str, tip: &str) -> anyhow::R
                 continue;
             }
         };
-        let commit = if clean {
-            let message = format!("Merge {tip_name} into #{}\n\nReplayed by kiln as {trunk} moved.\n", p.number);
-            match revision::commit(hub, &path, &revision::Commit { tree: &merged.tree, parents: &[p.head.as_str(), tip], author: ("kiln", None), by: "kiln", co_authors: &[], message: &message }).await {
-                Ok(m) => Some(m.sha),
-                Err(e) => {
-                    tracing::warn!(repo = %repo.name, host = %p.host, number = p.number, error = %e, "a pull request's replay couldn't be committed");
-                    out.waiting += 1;
-                    continue;
-                }
+        let with = if clean { "" } else { ", with conflicts to resolve" };
+        let message = format!("Merge {onto_name} into #{}\n\nReplayed by kiln as {trunk} moved{with}.\n", p.number);
+        let commit = match revision::commit(hub, &path, &revision::Commit { tree: &merged.tree, parents: &[p.head.as_str(), onto.as_str()], author: ("kiln", None), by: "kiln", co_authors: &[], message: &message }).await {
+            Ok(m) => m.sha,
+            Err(e) => {
+                tracing::warn!(repo = %repo.name, host = %p.host, number = p.number, error = %e, "a pull request's replay couldn't be committed");
+                out.waiting += 1;
+                continue;
             }
-        } else {
-            None
         };
-        let k = keep_pull_replay(hub, repo, p, tip, &tip_name, &merged.tree, commit.as_deref()).await?;
-        if commit.is_some() {
+        let k = keep_pull_replay(hub, repo, p, &onto, &onto_name, &merged.tree, &commit, clean).await?;
+        refs.push_str(&format!("update refs/kiln/pulls/{}/{}/replays/{k} {commit}\n", p.host, p.number));
+        replayed.insert(p.id(), commit);
+        if clean {
             clean_pulls.push(p.number);
-        }
-        if let Some(c) = &commit {
-            refs.push_str(&format!("update refs/kiln/pulls/{}/{}/replays/{k} {c}\n", p.host, p.number));
             out.replayed += 1;
         } else {
             out.conflicted += 1;
         }
     }
-    if out.replayed > 0 {
+    if out.replayed + out.conflicted > 0 {
         refs.push_str("prepare\ncommit\n");
         diffs::git_with_input(hub, &["-C", &path, "update-ref", "--stdin"], refs.into_bytes()).await?;
+        hub.store.audit("kiln".into(), "review.fresh".into(), format!("{} {tip_name}: {} pull requests replayed clean, {} with conflicts", repo.name, out.replayed, out.conflicted)).await;
     }
-    // Pushed to the host now only where the repository turned automatic pushes on.
+    // Pushed to the host now only where the repository turned automatic pushes on: bottom first.
     if policy.fresh.push == plan::Push::Auto && !clean_pulls.is_empty() {
         let (hub2, repo2) = (Arc::clone(hub), repo.clone());
         crate::rt::spawn(async move { auto_push_pulls(&hub2, &repo2, &clean_pulls).await });
-    }
-    if out.replayed + out.conflicted > 0 {
-        hub.store.audit("kiln".into(), "review.fresh".into(), format!("{} {tip_name}: {} pull requests replayed, {} conflicted", repo.name, out.replayed, out.conflicted)).await;
     }
     Ok(out)
 }
@@ -391,14 +452,15 @@ async fn replayed_pull(hub: &Hub, repo: &Repo, p: &Pull, tip: &str) -> anyhow::R
 }
 
 /// Keeps pull request `p`'s replay onto `tip`: its number among the pull request's replays.
-async fn keep_pull_replay(hub: &Hub, repo: &Repo, p: &Pull, tip: &str, tip_name: &str, tree: &str, commit: Option<&str>) -> anyhow::Result<i64> {
+#[allow(clippy::too_many_arguments)]
+async fn keep_pull_replay(hub: &Hub, repo: &Repo, p: &Pull, onto: &str, onto_name: &str, tree: &str, commit: &str, clean: bool) -> anyhow::Result<i64> {
     let (rid, host, number, n, head) = (repo.id.clone(), p.host.clone(), p.number, p.n, p.head.clone());
-    let (onto, onto_name, tree, commit) = (tip.to_owned(), tip_name.to_owned(), tree.to_owned(), commit.map(str::to_owned));
+    let (onto, onto_name, tree, commit) = (onto.to_owned(), onto_name.to_owned(), tree.to_owned(), commit.to_owned());
     hub.store
         .call(move |c| {
             let tx = crate::store::tx(c)?;
             let k: i64 = tx.query_row("SELECT COALESCE(MAX(k), 0) + 1 FROM review_pull_replays WHERE repo_id = ?1 AND host = ?2 AND number = ?3", rusqlite::params![rid, host, number], |r| r.get(0))?;
-            let state = if commit.is_some() { "clean" } else { "conflicted" };
+            let state = if clean { "clean" } else { "conflicted" };
             tx.execute(
                 "INSERT OR IGNORE INTO review_pull_replays (id, repo_id, host, number, head_n, head_sha, onto, onto_name, tree, state, commit_sha, k, created_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
                 rusqlite::params![crate::util::new_id(), rid, host, number, n, head, onto, onto_name, tree, state, commit, k, crate::util::now_unix()],
@@ -506,11 +568,27 @@ pub async fn radar(hub: &Arc<Hub>, repo: &Repo, trunk: &str) -> anyhow::Result<u
                 })
                 .await?
         };
-        for p in open_pulls(hub, repo, trunk).await? {
-            let Some(f) = fork(hub, &path, &tip, &p.head).await else { continue };
-            let name = format!("pull:{}:{}", p.host, p.number);
+        let stacked = pull_stacks(open_pulls(hub, repo).await?, trunk);
+        let below: HashMap<String, String> = stacked.iter().filter_map(|(p, b)| b.clone().map(|b| (p.id(), b))).collect();
+        let heads: HashMap<String, String> = stacked.iter().map(|(p, _)| (p.id(), p.head.clone())).collect();
+        for (p, under) in &stacked {
+            // A stacked pull request's own lines are from the one below's head; a bottom one's from
+            // where it left the trunk.
+            let from = match under.as_ref().and_then(|b| heads.get(b)) {
+                Some(b) => Some(b.clone()),
+                None => fork(hub, &path, &tip, &p.head).await,
+            };
+            let Some(f) = from else { continue };
+            let name = p.id();
+            let mut bottom = name.clone();
+            for _ in 0..1000 {
+                match below.get(&bottom) {
+                    Some(b) => bottom = b.clone(),
+                    None => break,
+                }
+            }
             let author = authors.get(&(p.host.clone(), p.number)).map(|a| format!("{}:{a}", p.host)).unwrap_or_default();
-            changes.push((name.clone(), author, name, unified(hub, &path, &f, &p.head).await));
+            changes.push((name, author, bottom, unified(hub, &path, &f, &p.head).await));
         }
     }
     let touches: Vec<plan::Touch> = changes
@@ -641,6 +719,8 @@ struct PullReplay {
     host: String,
     head: String,
     commit: Option<String>,
+    /// `clean`, or `conflicted` (its commit has git's markers in: Update won't push it).
+    state: String,
 }
 
 /// Pull request `number` of `repo`: its latest replay of its latest head, if it has one.
@@ -650,12 +730,12 @@ async fn pull_replay(hub: &Hub, repo: &Repo, number: i64) -> anyhow::Result<Opti
         .call(move |c| {
             use rusqlite::OptionalExtension as _;
             Ok(c.query_row(
-                "SELECT r.host, r.head_sha, r.commit_sha FROM review_pull_replays r
+                "SELECT r.host, r.head_sha, r.commit_sha, r.state FROM review_pull_replays r
                   WHERE r.repo_id = ?1 AND r.number = ?2
                     AND r.head_sha = (SELECT h.sha FROM host_pull_heads h WHERE h.repo_id = r.repo_id AND h.host = r.host AND h.number = r.number ORDER BY h.n DESC LIMIT 1)
                   ORDER BY r.k DESC LIMIT 1",
                 rusqlite::params![rid, number],
-                |r| Ok(PullReplay { host: r.get(0)?, head: r.get(1)?, commit: r.get(2)? }),
+                |r| Ok(PullReplay { host: r.get(0)?, head: r.get(1)?, commit: r.get(2)?, state: r.get(3)? }),
             )
             .optional()?)
         })
@@ -671,7 +751,7 @@ async fn push_pull(hub: &Arc<Hub>, repo: &Repo, number: i64, by: &str) -> Result
     use kiln_seams::forge::{Forge as _, Refusal, Update, Updated};
     let fail = |e: anyhow::Error| (StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}"));
     let r = pull_replay(hub, repo, number).await.map_err(fail)?.ok_or((StatusCode::CONFLICT, format!("#{number} hasn't been replayed onto its base: nothing to update")))?;
-    let Some(commit) = r.commit else { return Err((StatusCode::CONFLICT, format!("#{number} conflicts with its base: resolve its conflicts first"))) };
+    let Some(commit) = r.commit.filter(|_| r.state == "clean") else { return Err((StatusCode::CONFLICT, format!("#{number} conflicts with its base: resolve its conflicts first"))) };
     let (forge, name) = crate::githost::forge::for_repo(hub, repo).await.ok_or((StatusCode::CONFLICT, format!("{} isn't on a host kiln reaches", repo.name)))?;
     let n = u64::try_from(number).unwrap_or_default();
     // GitHub and GitLab update a branch themselves; elsewhere kiln's replay is pushed with a lease.
@@ -730,4 +810,42 @@ async fn auto_push_pulls(hub: &Arc<Hub>, repo: &Repo, numbers: &[i64]) {
             Err((_, why)) => tracing::info!(repo = %repo.name, pull = n, %why, "a pull request's replay wasn't pushed automatically"),
         }
     }
+}
+
+/// `GET /api/ci/repos/:repo/pulls/:n/fresh` (W26-R16): how fresh a host's pull request is, as its
+/// page says it: its latest head's latest replay onto its base, in words, and whether Update can
+/// go (a clean replay) or why not. `null` before kiln has replayed it.
+pub async fn pull_state(hub: &Arc<Hub>, repo: &str, n: &str) -> Result<serde_json::Value, (http::StatusCode, String)> {
+    use http::StatusCode;
+    use serde_json::json;
+    let number: i64 = n.trim_start_matches('#').parse().map_err(|_| (StatusCode::BAD_REQUEST, format!("`{n}` isn't a pull request's number")))?;
+    let r = hub.store.repos().await.map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")))?.into_iter().find(|r| r.name == repo).ok_or((StatusCode::NOT_FOUND, format!("no repository {repo}")))?;
+    let rid = r.id.clone();
+    let found: Option<(String, String, String, String)> = hub
+        .store
+        .call(move |c| {
+            use rusqlite::OptionalExtension as _;
+            Ok(c.query_row(
+                "SELECT r.state, r.onto, r.onto_name, p.base FROM review_pull_replays r JOIN host_pulls p ON p.repo_id = r.repo_id AND p.host = r.host AND p.number = r.number
+                  WHERE r.repo_id = ?1 AND r.number = ?2
+                    AND r.head_sha = (SELECT h.sha FROM host_pull_heads h WHERE h.repo_id = r.repo_id AND h.host = r.host AND h.number = r.number ORDER BY h.n DESC LIMIT 1)
+                  ORDER BY r.k DESC LIMIT 1",
+                rusqlite::params![rid, number],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+            )
+            .optional()?)
+        })
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")))?;
+    let Some((state, onto, onto_name, base)) = found else { return Ok(serde_json::Value::Null) };
+    let clean = state == "clean";
+    // On the trunk, the planner's words; on another's branch (a stack), that one's replay.
+    let words = match (onto_name.starts_with('#'), clean) {
+        (true, true) => format!("replays clean on {onto_name}'s replay"),
+        (true, false) => format!("conflicts on {onto_name}'s replay"),
+        (false, true) => plan::Freshness::Clean { tip: onto.clone() }.words(&base),
+        (false, false) => plan::Freshness::Conflicted { tip: onto.clone() }.words(&base),
+    };
+    let why_not = (!clean).then(|| "resolve its conflicts first".to_owned());
+    Ok(json!({ "words": words, "tip": onto, "update": { "can": clean, "why_not": why_not }, "checks_from": null }))
 }

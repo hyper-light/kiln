@@ -220,3 +220,62 @@ test("Files says how fresh the change is, and Update stays in place, disabled wi
   const [bar, sec] = await Promise.all([fresh.boundingBox(), row.locator(".rv-s").first().boundingBox()]);
   expect(bar && sec && bar.x >= sec.x - 1 && bar.x + bar.width <= sec.x + sec.width + 1).toBeTruthy();
 });
+
+test("a change's row ends its line with how fresh it is, and keeps one row's height (W26-R16)", async ({ page }) => {
+  await page.goto("/ship");
+  const row = page.locator(".ship-row", { hasText: "sched: fair shares" }).first();
+  await expect(row.locator(".ship-text").first()).toHaveText(/ · replays clean on main@4c1e2a$/);
+  const heights = await page.locator(".ship-row:not(.ship-open) .ship-main").evaluateAll((els) => els.slice(0, 6).map((e) => Math.round(e.getBoundingClientRect().height)));
+  expect(new Set(heights).size).toBe(1);
+});
+
+test("a host's pull request says how fresh it is, and Update goes: it says it's updating on GitHub and no box moves (W26-R16)", async ({ page }, info) => {
+  // Stills for the person, when asked for (E2E_STILLS: a folder): before and after Update.
+  const still = async (what: string) => {
+    if (process.env.E2E_STILLS) await page.screenshot({ path: `${process.env.E2E_STILLS}/w26-r16-${info.project.name}-${what}.png` });
+  };
+  // The mock is shared across projects: a press before this one has finished updating first.
+  await expect.poll(async () => (await (await page.request.get("/api/ci/repos/hyper-light%2Fkiln/pulls/5/fresh")).json())?.update?.can, { timeout: 15_000 }).toBe(true);
+  const row = await open(page, "Faster builds");
+  const fresh = row.locator(".rv-bar[data-fresh]");
+  const words = fresh.locator(".rv-k[data-k='fresh'] b");
+  await expect(words).toHaveText("replays clean on main@4c1e2a");
+  const update = fresh.getByRole("button", { name: /^Update/ });
+  await expect(update).toBeEnabled();
+  // Every box of the open item, frame by frame: left, top, width, height (a text's width may change).
+  const boxes = () =>
+    row.evaluate(
+      (el) =>
+        new Promise<string[][]>((done) => {
+          const frames: string[][] = [];
+          const parts = [...el.querySelectorAll(".rv-bar, .rv-bar button, .rv-k, .rv-s > *")];
+          const one = () => {
+            frames.push(
+              parts.map((p) => {
+                const b = p.getBoundingClientRect();
+                const r = { left: b.left + scrollX, top: b.top + scrollY, width: b.width, height: b.height };
+                const fixed = p.matches(".rv-k[data-k='fresh']")
+                  ? `${Math.round(r.left)},${Math.round(r.top)},-,${Math.round(r.height)}`
+                  : `${Math.round(r.left)},${Math.round(r.top)},${Math.round(r.width)},${Math.round(r.height)}`;
+                return fixed;
+              }),
+            );
+            if (frames.length < 20) requestAnimationFrame(one);
+            else done(frames);
+          };
+          requestAnimationFrame(one);
+        }),
+    );
+  // Centred, so the phone's still shows the row clear of the waiting-agent dock at the bottom.
+  await fresh.evaluate((e) => e.scrollIntoView({ block: "center" }));
+  const before = await boxes();
+  await still("1-before-update");
+  await update.click();
+  await expect(words).toHaveText("updating on GitHub");
+  await expect(update).toBeDisabled();
+  await expect(update).toHaveAttribute("title", "updating on GitHub");
+  const after = await boxes();
+  await still("2-updating");
+  const first = before[0];
+  for (const f of [...before, ...after]) expect(f).toEqual(first);
+});

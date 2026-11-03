@@ -840,6 +840,8 @@ const hostPullOf = (number: number) => ({
 const hostPulls = [
   hostPullOf(3),
   hostPullOf(4),
+  // Ship's GitHub row (#5): kiln replayed it onto main, and Update pushes it there (W26-R16).
+  { ...hostPullOf(5), host: "github", title: "Faster builds", author: "ada", head: "faster-builds", url: "https://github.com/hyper-light/kiln/pull/5" },
   {
     ...hostPullOf(6),
     title: "ci: a landed change",
@@ -851,6 +853,14 @@ const hostPulls = [
   },
 ];
 
+/** Host pull requests whose Update was pressed, and when: GitHub is updating them for a few seconds (W26-R16). */
+const updatingPulls = new Map<number, number>();
+const UPDATING_MS = 4000;
+const updating = (n: number) => {
+  const at = updatingPulls.get(n);
+  return at != null && Date.now() - at < UPDATING_MS;
+};
+
 async function handleHostPulls(req: http.IncomingMessage, res: http.ServerResponse, rest: string[], ctx: Ctx): Promise<boolean> {
   const m = req.method ?? "GET";
   const [n, what] = rest;
@@ -859,6 +869,17 @@ async function handleHostPulls(req: http.IncomingMessage, res: http.ServerRespon
   const hp = hostPulls.find((x) => x.number === Number(n));
   if (!hp) return (ctx.err(res, 502, `merge request !${n} (404): 404 Not found`), true);
   if (!what && m === "GET") return (ctx.json(res, 200, hp), true);
+  // How fresh it is (W26-R16): GitHub's #5 replays clean on main until Update is pressed.
+  if (what === "fresh" && m === "GET") {
+    if (hp.host !== "github") return (ctx.json(res, 200, null), true);
+    const busy = updating(hp.number);
+    return (ctx.json(res, 200, { words: "replays clean on main@4c1e2a", tip: sha("main"), update: { can: !busy, why_not: busy ? "updating on GitHub" : null }, checks_from: null }), true);
+  }
+  if (what === "update" && m === "POST") {
+    if (updating(hp.number)) return (ctx.err(res, 409, `#${hp.number}'s head moved since its replay: it replays again first`), true);
+    updatingPulls.set(hp.number, Date.now());
+    return (ctx.json(res, 200, { change: `#${hp.number}`, host: hp.host, head: hp.sha, state: "updating" }), true);
+  }
   if (what === "comments" && m === "POST") {
     const body = await ctx.body<{ body: string; path?: string; line?: number; side?: string; reply_to?: string }>(req);
     const c = { id: `n${now()}${Math.random().toString(36).slice(2, 6)}`, author: "ada", body: body.body, at: now() };

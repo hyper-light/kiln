@@ -198,6 +198,7 @@ async fn outside(hub: &Arc<Hub>, method: &Method, rest: &[&str], q: &HashMap<Str
         (&Method::GET, ["repos", repo, "pulls", n, "search"]) => Ok(ok(&super::search::pull(hub, repo, n, q, caller).await?)),
         // W26-R16: Update pushes a host's pull request's replay through the forge seam.
         (&Method::POST, ["repos", repo, "pulls", n, "update"]) => Ok(ok(&super::fresh::update_pull(hub, repo, n, caller).await?)),
+        (&Method::GET, ["repos", repo, "pulls", n, "fresh"]) => Ok(ok(&super::fresh::pull_state(hub, repo, n).await?)),
         // W23-R06: the host's pull requests (merge requests).
         (_, ["repos", repo, "pulls", tail @ ..]) => crate::githost::pulls::route(hub, method, repo, tail, body, caller).await,
         // W03-R11: dispatches (another provider's, W23-R01).

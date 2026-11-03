@@ -385,10 +385,15 @@ export const hostPullsApi = {
     request<Acted>("POST", `/api/ci/repos/${enc(repo)}/pulls/${n}/comments`, body),
   review: (repo: string, n: number, verdict: "approve" | "request_changes" | "comment", body: string) => request<Acted>("POST", `/api/ci/repos/${enc(repo)}/pulls/${n}/reviews`, { verdict, body }),
   merge: (repo: string, n: number, method: string) => request<Acted & { merged: boolean; commit: string | null }>("POST", `/api/ci/repos/${enc(repo)}/pulls/${n}/merge`, { method }),
+  /** How fresh it is on its base (W26-R16); null before kiln has replayed it. */
+  fresh: (repo: string, n: number, signal?: AbortSignal) => request<Freshness | null>("GET", `/api/ci/repos/${enc(repo)}/pulls/${n}/fresh`, undefined, { signal }),
+  /** Update (W26-R16): GitHub's update-branch, GitLab's rebase, else kiln's replay pushed with a lease. */
+  update: (repo: string, n: number) => request<{ change: string; host: HostName; head: string; state: "updated" | "updating" }>("POST", `/api/ci/repos/${enc(repo)}/pulls/${n}/update`, {}),
 };
 
 export const hostPullsRes = (repo: string): Res<HostPull[]> => ({ key: `review/host/${repo}`, fetch: (s) => hostPullsApi.list(repo, s) });
 export const hostPullRes = (repo: string, n: number): Res<HostPullDetail> => ({ key: `review/host/${repo}/${n}`, fetch: (s) => hostPullsApi.get(repo, n, s) });
+export const hostPullFreshRes = (repo: string, n: number): Res<Freshness | null> => ({ key: `review/host/${repo}/${n}/fresh`, fetch: (s) => hostPullsApi.fresh(repo, n, s) });
 
 export const HOST_WORD: Record<HostName, string> = { github: "GitHub", gitlab: "GitLab", bitbucket: "Bitbucket" };
 /** How each host writes a change's number. */

@@ -8583,8 +8583,13 @@ a time. The design was agreed on a live mock built on Ship's own prototype
       is the page's or `gh stack`'s, and unsigned), so a GitHub stack updates pull request by pull
       request. Automatic pushes to a host go a second apart and stop, saying so, below a fifth of
       its hourly limit left or on a rate refusal.
-    - **Not yet.** A host's pull request whose base is another pull request's branch (a GitHub
-      stack's upper ones) isn't replayed: only those on the trunk are.
+    - **A host's stacks.** A pull request whose base is another open one's branch (a GitHub or
+      GitLab stack's upper ones; the mirror keeps each one's own branch, `host_pulls.head_ref`) is
+      replayed onto that one's replay, bottom first, through the same planner; a conflicting replay
+      is committed with its markers so the ones above still move, and Update refuses it. What a
+      host can do with them: GitHub's update-branch merges an upper pull request's base *as GitHub
+      has it* (the lower one's branch), never kiln's replay, so a stack is updated bottom first,
+      each once the one below has moved on GitHub; automatic pushes go in that order.
     - **The same patch?** Each clean replay of a diff records `same_patch`: whether its verbatim
       patch-id (context lines and whitespace included) is the replayed revision's. That's Gerrit's
       trivial rebase, and where a signed verdict (W27-R04) carries.
