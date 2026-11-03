@@ -9188,7 +9188,7 @@ research `01a17947fdad71e5a4f15866e3541c41`.
     git so);
   - an agent's as the agent, for its person: the program asks the runner process that started the
     session, which holds its key, over the socket that process serves for its own sessions
-    (`KILN_KEY_SOCK`), else the machine's (`KILN_HARNESS_SOCK`: for a session an upgrade handed to
+    (`KILN_RUNNER_SOCK`), else the machine's (`KILN_HARNESS_SOCK`: for a session an upgrade handed to
     the new build, or one an older build started). An upgrade's new build runs beside the old one,
     which keeps the machine's socket until it ends, so its sessions' commits would otherwise go to
     a process that holds none of their keys. The runner tells the session by the asking process's

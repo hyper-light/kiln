@@ -141,9 +141,10 @@ impl Kind {
                     p.args(crate::reach::mcp::codex_config(&kiln, sock, prefer, session));
                 }
                 // kiln's hook before each tool call, trusted for this session alone: what holds a
-                // subagent (a pause, what it may do) holds its calls (docs/agents.md).
+                // subagent (a pause, what it may do) holds its calls (docs/agents.md). It asks this
+                // runner process, which runs the session, else the machine's socket.
                 #[cfg(unix)]
-                if let (Some(sock), Ok(kiln)) = (super::socket::served(), crate::os::this_kiln()) {
+                if let (Some(sock), Ok(kiln)) = (super::socket::own_served().or_else(super::socket::served), crate::os::this_kiln()) {
                     p.args(super::codex::hook_args(&kiln, sock));
                 }
             }
@@ -341,7 +342,7 @@ fn set_env(p: &mut Process, spec: &Spec) {
         p.env("KILN_REACH_SOCK", sock);
     }
     for (k, v) in &spec.env {
-        if !matches!(k.as_str(), "KILN_TERM_SESSION" | "KILN_HARNESS_SOCK" | "KILN_KEY_SOCK" | "KILN_REACH_SOCK" | "TERM" | "COLUMNS" | "LINES") {
+        if !matches!(k.as_str(), "KILN_TERM_SESSION" | "KILN_HARNESS_SOCK" | "KILN_RUNNER_SOCK" | "KILN_REACH_SOCK" | "TERM" | "COLUMNS" | "LINES") {
             p.env(k, v);
         }
     }
@@ -350,11 +351,11 @@ fn set_env(p: &mut Process, spec: &Spec) {
     if let Some(sock) = super::socket::served() {
         p.env("KILN_HARNESS_SOCK", sock);
     }
-    // Its commits' signatures and its credential for kiln, from this process, which holds its key
-    // (W27-R03), whichever process of the machine serves the machine's socket.
-    match super::socket::keys_served() {
-        Some(sock) => p.env("KILN_KEY_SOCK", sock),
-        None => p.env_remove("KILN_KEY_SOCK"),
+    // What it asks goes to this process, which runs it and holds its key (W27-R03), whichever
+    // process of the machine serves the machine's socket.
+    match super::socket::own_served() {
+        Some(sock) => p.env("KILN_RUNNER_SOCK", sock),
+        None => p.env_remove("KILN_RUNNER_SOCK"),
     };
     for k in super::claude::SCRUB_ENV {
         p.env_remove(k);

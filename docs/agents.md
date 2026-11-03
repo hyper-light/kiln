@@ -85,8 +85,9 @@ hooks.json, so kiln puts one entry, `kiln`, in `~/.gemini/config/hooks.json` as 
 (its answer awaited up to 7 days; past that agy fails the call), `PreInvocation` and `Stop`, each
 `kiln harness-hook --agy <event>` behind a shell guard: the entry stays in the person's hooks.json,
 and once that kiln binary is gone (its version pruned, kiln uninstalled) it answers agy's pass
-itself, as agy fails a call whose hook fails. It hands each to the runner's harness socket (`KILN_HARNESS_SOCK`,
-which agy hands on), with its conversation's tokens so far from its transcript; agy run outside kiln
+itself, as agy fails a call whose hook fails. It hands each to the socket of the runner process
+that started the session (`KILN_RUNNER_SOCK`), else the machine's harness socket (`KILN_HARNESS_SOCK`;
+agy hands both on), with its conversation's tokens so far from its transcript; agy run outside kiln
 gets the answer that changes nothing (`allow`). A subagent's `Stop` ends its task (completed); its
 agent's `manage_subagents` kill, stopped. A subagent's own subagents are named nowhere kiln reads
 (not in the stream, and a hook names only the conversation it's in), so they aren't in the tree;
@@ -812,10 +813,13 @@ kiln shell acts for whoever opened the terminal, audited as `shell:<id>[@<machin
 
 Every harness kiln starts has `KILN_HARNESS_SOCK`, so these work in an agent's own commands as
 in a kiln terminal (run by an agent, what they start are its children). It also has
-`KILN_KEY_SOCK`, the socket of the runner process that started it, which alone holds its key:
-`kiln-git-sign` asks that one for the session's commit signatures and its credential for kiln
-(docs/ci.md W27-R03), then the machine's socket, so an upgrade's new build signs for the sessions
-it starts while the old build still serves `KILN_HARNESS_SOCK`.
+`KILN_RUNNER_SOCK`, the socket of the runner process that started it, which alone knows it as an
+agent and holds its key. These commands, its hooks and `kiln-git-sign` (its commit signatures and
+its credential for kiln, docs/ci.md W27-R03) ask that one first, then the machine's socket: while
+an upgrade's new build runs beside the old one, the old one serves `KILN_HARNESS_SOCK`, and the
+sessions the new build starts are still known as agents there (what they start are their
+children, their hooks hold them) and sign with their own keys. The runner's own socket answers
+only the processes of its own sessions; anyone else is sent to the machine's.
 
 | Command | |
 |---|---|
