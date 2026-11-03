@@ -165,6 +165,8 @@ fn file(r: &mut Lcg, n: usize, at: i64) -> FileChange {
         hunks: (0..3).map(|h| hunk(r, 10 + h * 60, 20)).collect(),
         truncated: false,
         at,
+        by: Vec::new(),
+        place: None,
     }
 }
 
