@@ -13,8 +13,8 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use k8s_openapi::api::core::v1::{
-    Affinity, Container, ContainerPort, EnvVar, ExecAction, HostAlias, HostPathVolumeSource, NodeAffinity, NodeSelector, NodeSelectorRequirement, NodeSelectorTerm, PersistentVolumeClaimVolumeSource,
-    Pod, PodSpec, PreferredSchedulingTerm, Probe, ResourceRequirements, SecurityContext, Volume, VolumeMount,
+    Affinity, Container, ContainerPort, EnvVar, EnvVarSource, ExecAction, HostAlias, HostPathVolumeSource, NodeAffinity, NodeSelector, NodeSelectorRequirement, NodeSelectorTerm,
+    ObjectFieldSelector, PersistentVolumeClaimVolumeSource, Pod, PodSpec, PreferredSchedulingTerm, Probe, ResourceRequirements, SecurityContext, Volume, VolumeMount,
 };
 use k8s_openapi::apimachinery::pkg::api::resource::Quantity;
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::ObjectMeta;
@@ -268,22 +268,21 @@ const CACHE_ENV: &[(&str, &str)] = &[
     ("KILN_GIT_CACHE", "/cache/git"),
 ];
 
-/// Prefer worker nodes: the control-plane node keeps room for the platform (kiln, ArgoCD,
-/// Prometheus), so restarting those rarely needs to preempt a build.
-fn worker_affinity() -> Affinity {
-    Affinity {
-        node_affinity: Some(NodeAffinity {
-            preferred_during_scheduling_ignored_during_execution: Some(vec![PreferredSchedulingTerm {
-                weight: 100,
-                preference: NodeSelectorTerm {
-                    match_expressions: Some(vec![NodeSelectorRequirement { key: "node-role.kubernetes.io/control-plane".into(), operator: "DoesNotExist".into(), values: None }]),
-                    ..Default::default()
-                },
-            }]),
-            ..Default::default()
-        }),
+/// Worker nodes: preferred, so the control-plane node keeps room for the platform (kiln, ArgoCD,
+/// Prometheus) and restarting those rarely needs to preempt a build; required with
+/// `[kubernetes] workers_only`, so a job never squeezes the control plane's etcd and API server,
+/// whose use runs past what they ask for (W13-R07).
+fn worker_affinity(required: bool) -> Affinity {
+    let worker = NodeSelectorTerm {
+        match_expressions: Some(vec![NodeSelectorRequirement { key: "node-role.kubernetes.io/control-plane".into(), operator: "DoesNotExist".into(), values: None }]),
         ..Default::default()
-    }
+    };
+    let nodes = if required {
+        NodeAffinity { required_during_scheduling_ignored_during_execution: Some(NodeSelector { node_selector_terms: vec![worker] }), ..Default::default() }
+    } else {
+        NodeAffinity { preferred_during_scheduling_ignored_during_execution: Some(vec![PreferredSchedulingTerm { weight: 100, preference: worker }]), ..Default::default() }
+    };
+    Affinity { node_affinity: Some(nodes), ..Default::default() }
 }
 
 /// The init container that copies the static `kiln` into the pod. Explicit requests: a namespace
@@ -316,7 +315,8 @@ fn cache_volume(cfg: &KCfg) -> Option<Volume> {
 fn job_pod(cfg: &KCfg, job: &Job, spec: &crate::pipeline::PlannedJob, run: &Run, name: &str, token: &str, (server_url, server_quic): (&str, &str)) -> Pod {
     let image = spec.image.clone().unwrap_or_else(|| crate::pipeline::toolchain_image(spec.toolchain.as_deref()).to_owned());
     let labels: Vec<String> = spec.labels.iter().cloned().chain(["k8s".to_owned()]).collect();
-    let mut env = vec![env_var("KILN_JOIN_TOKEN", token), env_var("KILN_SERVER", server_url), env_var("KILN_QUIC", server_quic)];
+    // Its pod's UID is its machine id (`crate::os::machine_id`).
+    let mut env = vec![env_var("KILN_JOIN_TOKEN", token), env_var("KILN_SERVER", server_url), env_var("KILN_QUIC", server_quic), field_env("KILN_POD_UID", "metadata.uid")];
     let mut mounts = vec![mount("kiln-bin", "/kiln-bin"), mount("work", "/work")];
     let mut volumes = vec![empty_dir("kiln-bin"), empty_dir("work")];
     if let Some(v) = cache_volume(cfg) {
@@ -348,7 +348,7 @@ fn job_pod(cfg: &KCfg, job: &Job, spec: &crate::pipeline::PlannedJob, run: &Run,
         spec: Some(PodSpec {
             restart_policy: Some("Never".into()),
             priority_class_name: cfg.priority_class.clone(),
-            affinity: Some(worker_affinity()),
+            affinity: Some(worker_affinity(cfg.workers_only)),
             service_account_name: Some(cfg.service_account.clone()),
             automount_service_account_token: Some(false),
             active_deadline_seconds: Some(i64::from(spec.timeout_minutes) * 60 + 900),
@@ -402,7 +402,14 @@ fn job_pod(cfg: &KCfg, job: &Job, spec: &crate::pipeline::PlannedJob, run: &Run,
 /// CPU and memory over the pool's, the toolchains' caches and v1's deadline.
 pub(crate) fn pool_pod(cfg: &KCfg, executor: &str, name: &str, token: &str, (server_url, server_quic): (&str, &str), pool: &kiln_ci::sched::pools::PoolSpec, pod: Option<&crate::ci::pools::LegPod>) -> Pod {
     let image = pod.and_then(|p| p.image.clone()).or_else(|| pool.image.clone().filter(|i| !i.trim().is_empty())).unwrap_or_else(|| crate::pipeline::toolchain_image(None).to_owned());
-    let mut env = vec![env_var("KILN_JOIN_TOKEN", token), env_var("KILN_SERVER", server_url), env_var("KILN_QUIC", server_quic), env_var("KILN_POD", "1")];
+    let mut env = vec![
+        env_var("KILN_JOIN_TOKEN", token),
+        env_var("KILN_SERVER", server_url),
+        env_var("KILN_QUIC", server_quic),
+        env_var("KILN_POD", "1"),
+        // Its pod's UID is its machine id (`crate::os::machine_id`).
+        field_env("KILN_POD_UID", "metadata.uid"),
+    ];
     // The leg's containers are the pod's.
     let services = pod.map(|p| p.services.clone()).unwrap_or_default();
     if let Some(p) = pod {
@@ -474,7 +481,7 @@ pub(crate) fn pool_pod(cfg: &KCfg, executor: &str, name: &str, token: &str, (ser
         spec: Some(PodSpec {
             restart_policy: Some("Never".into()),
             priority_class_name: cfg.priority_class.clone(),
-            affinity: Some(worker_affinity()),
+            affinity: Some(worker_affinity(cfg.workers_only)),
             service_account_name: Some(cfg.service_account.clone()),
             automount_service_account_token: Some(false),
             active_deadline_seconds: pod.and_then(|p| p.deadline_s),
@@ -635,6 +642,12 @@ fn remember(nodes: &mut HashMap<String, Vec<String>>, pool: &str, node: &str) {
 
 fn env_var(k: &str, v: &str) -> EnvVar {
     EnvVar { name: k.to_owned(), value: Some(v.to_owned()), ..Default::default() }
+}
+
+/// A variable Kubernetes fills from the pod itself (`path`, the Downward API).
+fn field_env(k: &str, path: &str) -> EnvVar {
+    let field_ref = ObjectFieldSelector { field_path: path.to_owned(), ..Default::default() };
+    EnvVar { name: k.to_owned(), value_from: Some(EnvVarSource { field_ref: Some(field_ref), ..Default::default() }), ..Default::default() }
 }
 
 fn mount(name: &str, path: &str) -> VolumeMount {
@@ -921,6 +934,38 @@ mod tests {
             "{v}"
         );
         assert_eq!(warm(&PodWarm::default(), "..", &[]).volume.host_path.map(|h| h.path).as_deref(), Some("/var/lib/kiln/warm/__"));
+        Ok(())
+    }
+
+    /// W13-R07: a job's pod prefers a worker node; with `[kubernetes] workers_only` it goes only to
+    /// one, and a warm pool's label joins that term rather than taking its place.
+    #[test]
+    fn w13_r07_workers_only_keeps_job_pods_off_the_control_plane() -> anyhow::Result<()> {
+        let worker = json!({ "matchExpressions": [{ "key": "node-role.kubernetes.io/control-plane", "operator": "DoesNotExist" }] });
+        let preferred = serde_json::to_value(worker_affinity(false))?;
+        assert_eq!(preferred.pointer("/nodeAffinity/preferredDuringSchedulingIgnoredDuringExecution"), Some(&json!([{ "weight": 100, "preference": worker }])), "{preferred}");
+        assert!(preferred.pointer("/nodeAffinity/requiredDuringSchedulingIgnoredDuringExecution").is_none(), "{preferred}");
+        let required = serde_json::to_value(worker_affinity(true))?;
+        assert_eq!(required.pointer("/nodeAffinity/requiredDuringSchedulingIgnoredDuringExecution/nodeSelectorTerms"), Some(&json!([worker])), "{required}");
+        assert!(required.pointer("/nodeAffinity/preferredDuringSchedulingIgnoredDuringExecution").is_none(), "{required}");
+        // As the pods kiln makes carry it: off by default, on as the configuration says.
+        let pool = PoolSpec { name: "rust".into(), executor: "k8s".into(), labels: vec!["rust".into()], ..PoolSpec::default() };
+        let made = |c: &KCfg| serde_json::to_value(pool_pod(c, "x1", "kiln-x-1", "t", ("http://kiln:7070", "kiln:7071"), &pool, None));
+        let v = made(&cfg())?;
+        assert!(v.pointer("/spec/affinity/nodeAffinity/requiredDuringSchedulingIgnoredDuringExecution").is_none(), "{v}");
+        let v = made(&KCfg { workers_only: true, ..cfg() })?;
+        assert_eq!(v.pointer("/spec/affinity/nodeAffinity/requiredDuringSchedulingIgnoredDuringExecution/nodeSelectorTerms"), Some(&json!([worker])), "{v}");
+        let mut pod = executor();
+        if let Some(spec) = pod.spec.as_mut() {
+            spec.affinity = Some(worker_affinity(true));
+        }
+        apply_warm(&mut pod, &warm(&PodWarm { node_label: Some("nvme".into()), ..PodWarm::default() }, "pods", &[]));
+        let v = serde_json::to_value(&pod)?;
+        assert_eq!(
+            v.pointer("/spec/affinity/nodeAffinity/requiredDuringSchedulingIgnoredDuringExecution/nodeSelectorTerms"),
+            Some(&json!([{ "matchExpressions": [{ "key": "node-role.kubernetes.io/control-plane", "operator": "DoesNotExist" }, { "key": "nvme", "operator": "Exists" }] }])),
+            "{v}"
+        );
         Ok(())
     }
 

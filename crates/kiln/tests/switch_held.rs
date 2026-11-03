@@ -47,7 +47,7 @@ fn a_message_held_for_codex_goes_to_claude_code_when_the_agent_switches() -> any
     std::fs::create_dir_all(&work)?;
     let said = work.join(".fake-claude-messages");
     std::fs::write(&said, "")?;
-    let open = json!({"target": "agent:box", "spec": {"kind": "codex", "cwd": work.display().to_string()}});
+    let open = json!({"target": format!("agent:{}", common::machine("box")), "spec": {"kind": "codex", "cwd": work.display().to_string()}});
     let (code, body) = http(s.port, "POST", "/api/harness/sessions", &s.admin, Some(&open))?;
     anyhow::ensure!(code == 200, "couldn't open it: {code} {body}");
     let id = serde_json::from_str::<Value>(&body)?.pointer("/0/id").and_then(Value::as_str).unwrap_or_default().to_owned();

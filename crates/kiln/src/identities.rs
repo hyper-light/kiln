@@ -928,7 +928,7 @@ async fn issue(hub: &Hub, peer: PeerId, machine: &str, ask: &IdentityAsk) -> any
         let gave = holder_at(&hub.store, session, epoch - 1).await?.unwrap_or_default();
         let takes = hub.instances.lock().get(peer).is_some_and(|i| (u64::from(i.caps) | i.wide) & crate::proto::CAP_CUSTODY != 0);
         let why = if !takes {
-            format!("the process it went to, on {machine}, runs a kiln from before signed hand-overs: it signed no receipt")
+            format!("the process it went to, on {}, runs a kiln from before signed hand-overs: it signed no receipt", hub.shown(machine))
         } else if gave.is_empty() {
             "the process it came from was never certified: it runs a kiln from before identities, or the session went on before kiln had them".to_owned()
         } else {

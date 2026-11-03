@@ -11,7 +11,7 @@ import type { Job } from "@/api/types";
 import { Hold } from "@/components/ui/hold";
 import { Loadable } from "@/components/ui/loading";
 import { FoldSection } from "@/components/ui/misc";
-import { mergeJobs, updatesRes, upsert, useRes, useUpdateJobs } from "@/lib/data";
+import { labelOf, mergeJobs, updatesRes, upsert, useLabels, useRes, useUpdateJobs } from "@/lib/data";
 import { relativeTime, shortSha } from "@/lib/format";
 import { useSuspenseResource } from "@/lib/resource";
 import { PlatformsPanel } from "./builds";
@@ -85,6 +85,7 @@ function useReleaseJobs(id: string | null): Job[] | null {
 }
 
 function UpdatesBody() {
+  useLabels();
   const resource = useRes(updatesRes);
   const data = resource.data;
   const live = useUpdateJobs();
@@ -133,7 +134,7 @@ function UpdatesBody() {
           server: { line: server.scene, tone: server.tone },
           runners: fleet.runners.map(({ r, view }) => ({
             key: `runner:${r.name}`,
-            name: r.name,
+            name: labelOf(r.name),
             line: view.scene,
             tone: view.tone,
             cable: view.cable,

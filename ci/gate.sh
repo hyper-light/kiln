@@ -9,7 +9,7 @@
 # It holds itself to what it was asked: the needs `kiln run --needs` gives the command (KILN_NEEDS),
 # or --cpus and --mem. As a systemd user unit, its memory is capped at what it asked (MemoryMax),
 # and it yields to everything else on the machine: CPUWeight 1, nice 19, and I/O bandwidth caps on
-# the disk its build is on (--io-read, --io-write; --io off drops them). Its CPUs are what it runs
+# each disk its build is on (--io-read, --io-write; --io off drops them). Its CPUs are what it runs
 # at once: a rustc per 6 GiB asked, at most one per CPU (--jobs), and as many test threads
 # (--test-threads). No CPU quota: one changes what the tests see of the machine (the CPUs a runner
 # reports, W13), as a runner never does. Without a systemd user manager (macOS, a container) it
@@ -129,25 +129,33 @@ unit=kiln-gate-$key-$(date +%s)
 systemd=false
 if command -v systemd-run > /dev/null && systemctl --user show-environment > /dev/null 2>&1; then systemd=true; fi
 props=(-p "MemoryMax=$mem_cap" -p CPUWeight=1 -p Nice=19)
-# The disk its build is on, as systemd's I/O caps want it: a path on btrfs (a subvolume, as
-# adacachy's /home is) has an anonymous st_dev that systemd maps to no disk ("Failed to set
-# 'io.max' … to '0:0 …': No such device", and no cap at all), so it's the block device under the
-# mount, a partition's own disk; the path where that can't be found (no findmnt or lsblk).
-io_disk() {
-  local p=$1 dev parent
+# The disks its build is on, one a line, as systemd's I/O caps want them: a path on btrfs (a
+# subvolume, as adacachy's /home is) has an anonymous st_dev that systemd maps to no disk ("Failed
+# to set 'io.max' … to '0:0 …': No such device", and no cap at all), so they're the disks under the
+# mount's block device (lsblk's inverse tree: a partition's disk, a RAID's or a mapped device's
+# disks), and under each device of a btrfs, which can spread over several disks and put its chunks
+# on any of them (adacachy's /home, over four; findmnt names one); the path where none can be found
+# (no findmnt or lsblk).
+io_disks() {
+  local p=$1 src='' fs='' uuid='' d devs=() disks=''
   while [ ! -e "$p" ] && [ "$p" != / ]; do p=$(dirname "$p"); done
-  dev=$(findmnt -no SOURCE -T "$p" 2> /dev/null | sed 's/\[.*\]$//' || true)
-  if [ ! -b "$dev" ]; then echo "$1"; return; fi
-  for _ in 1 2 3; do
-    parent=$(lsblk -no PKNAME "$dev" 2> /dev/null | head -1 || true)
-    if [ -z "$parent" ] || [ ! -b "/dev/$parent" ]; then break; fi
-    dev=/dev/$parent
-  done
-  echo "$dev"
+  read -r src fs uuid < <(findmnt -no SOURCE,FSTYPE,UUID -T "$p" 2> /dev/null || true) || true
+  if [ "$fs" = btrfs ] && [ -n "$uuid" ]; then
+    for d in "/sys/fs/btrfs/$uuid/devices"/*; do
+      if [ -b "/dev/${d##*/}" ]; then devs+=("/dev/${d##*/}"); fi
+    done
+  fi
+  src=${src%%\[*}
+  if [ ${#devs[@]} -eq 0 ] && [ -b "$src" ]; then devs=("$src"); fi
+  if [ ${#devs[@]} -gt 0 ]; then
+    disks=$(lsblk -snro KNAME,TYPE "${devs[@]}" 2> /dev/null | awk '$2 == "disk" { print "/dev/" $1 }' | sort -u || true)
+  fi
+  echo "${disks:-$1}"
 }
 if [ "$io" != off ]; then
-  io_dev=$(io_disk "$base")
-  props+=(-p "IOReadBandwidthMax=$io_dev $io_read" -p "IOWriteBandwidthMax=$io_dev $io_write")
+  while read -r io_dev; do
+    props+=(-p "IOReadBandwidthMax=$io_dev $io_read" -p "IOWriteBandwidthMax=$io_dev $io_write")
+  done < <(io_disks "$base")
 fi
 
 steps=("clippy-linux: cargo clippy --locked --workspace --all-targets -j $jobs -- -D warnings"

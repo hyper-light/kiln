@@ -33,6 +33,9 @@ const AWAY_MS: i64 = 24 * 3600 * 1000;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Candidate {
     pub machine: String,
+    /// The name people see, for a runner kiln knows by its machine id (`machine`): `mirror_on`
+    /// names it by this too (docs/machines.md).
+    pub label: Option<String>,
     pub peer: PeerId,
     /// Unix ms its connection began.
     pub connected_at: i64,
@@ -160,6 +163,9 @@ impl Mirrors {
         if self.want == 0 {
             return;
         }
+        // The runners named first, by what kiln knows them by: a name that is a runner's label is that
+        // runner.
+        let first: Vec<String> = self.first.iter().map(|n| all.iter().find(|a| a.label.as_deref() == Some(n.as_str())).map_or_else(|| n.clone(), |a| a.machine.clone())).collect();
         let now = crate::util::now_ms();
         let picked = {
             let mut chosen = self.chosen.lock().unwrap_or_else(PoisonError::into_inner);
@@ -172,17 +178,17 @@ impl Mirrors {
             // Away too long: another keeps the copy from now on.
             chosen.retain(|c| now - c.last_seen < AWAY_MS || all.iter().any(|a| a.machine == c.machine));
             // A runner named first, here now, takes the place of one that wasn't named.
-            let missing: Vec<String> = self.first.iter().filter(|n| all.iter().any(|a| &a.machine == *n) && !chosen.iter().any(|c| &c.machine == *n)).cloned().collect();
+            let missing: Vec<String> = first.iter().filter(|n| all.iter().any(|a| &a.machine == *n) && !chosen.iter().any(|c| &c.machine == *n)).cloned().collect();
             for named in missing {
                 if chosen.len() < self.want {
                     break;
                 }
-                if let Some(i) = chosen.iter().rposition(|c| !self.first.contains(&c.machine)) {
+                if let Some(i) = chosen.iter().rposition(|c| !first.contains(&c.machine)) {
                     let was = chosen.remove(i);
                     tracing::info!(machine = %named, instead_of = %was.machine, "a runner named to keep a copy of the conversation store takes the place of another");
                 }
             }
-            for c in ranked(all.clone(), &self.first) {
+            for c in ranked(all.clone(), &first) {
                 if chosen.len() >= self.want {
                     break;
                 }
@@ -275,7 +281,7 @@ mod tests {
     use super::*;
 
     fn cand(machine: &str, connected_at: i64, disk_free: u64) -> Candidate {
-        Candidate { machine: machine.into(), peer: 1, connected_at, disk_free }
+        Candidate { machine: machine.into(), label: None, peer: 1, connected_at, disk_free }
     }
 
     #[test]

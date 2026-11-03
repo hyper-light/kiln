@@ -3,6 +3,7 @@ import { AlertCircle, ArrowDown, Check, ChevronDown, Copy, Download, Maximize2, 
 import { events, useConnection } from "@/api/events";
 import type { UpdateJob } from "@/api/types";
 import { toast } from "@/components/ui/toast";
+import { labelOf, useLabels } from "@/lib/data";
 import { formatDuration, shortSha } from "@/lib/format";
 import { errorMessage, useNow } from "@/lib/hooks";
 import { copyText } from "@/views/terminal/clipboard";
@@ -21,6 +22,7 @@ export function UpgradeLog(props: UpgradeLogProps) {
 }
 
 function UpgradeLogView({ job, onChangeWaits, defaultOpen = false }: UpgradeLogProps) {
+  useLabels();
   const running = job.state === "running";
   const [open, setOpen] = React.useState(running || defaultOpen);
   const [expanded, setExpanded] = React.useState(false);
@@ -110,17 +112,26 @@ function UpgradeLogView({ job, onChangeWaits, defaultOpen = false }: UpgradeLogP
   };
 
   return (
-    <section className="upgrade-log" data-state={job.state} data-expanded={expanded || undefined} aria-label={`${title} for ${job.target}`}>
+    <section className="upgrade-log" data-state={job.state} data-expanded={expanded || undefined} aria-label={`${title} for ${labelOf(job.target)}`}>
       <div className="upgrade-log-head">
         <button type="button" className="upgrade-log-toggle" aria-expanded={open} aria-controls={outputId} onClick={() => setOpen((value) => !value)}>
           <Terminal size={15} aria-hidden="true" className="upgrade-log-icon" />
           <span className="upgrade-log-heading">
             <span className="upgrade-log-title">{title}</span>
             <span className="upgrade-log-meta">
-              <span className="upgrade-log-state"><i aria-hidden="true" />{state}</span>
+              <span className="upgrade-log-state">
+                <i aria-hidden="true" />
+                {state}
+              </span>
               <span aria-hidden="true">·</span>
-              <span className="upgrade-log-duration" title="Elapsed time">{duration}</span>
-              {target && <span className="upgrade-log-target" title={job.commit ?? job.to_build ?? undefined}>{target}</span>}
+              <span className="upgrade-log-duration" title="Elapsed time">
+                {duration}
+              </span>
+              {target && (
+                <span className="upgrade-log-target" title={job.commit ?? job.to_build ?? undefined}>
+                  {target}
+                </span>
+              )}
             </span>
           </span>
           <ChevronDown size={14} aria-hidden="true" className="upgrade-log-chevron" data-open={open || undefined} />
@@ -130,15 +141,25 @@ function UpgradeLogView({ job, onChangeWaits, defaultOpen = false }: UpgradeLogP
             <button type="button" onClick={() => void copy()} disabled={!text} aria-label={copied ? "Output copied" : "Copy output"} title={copied ? "Copied" : "Copy output"}>
               {copied ? <Check size={14} aria-hidden="true" /> : <Copy size={14} aria-hidden="true" />}
             </button>
-            <button type="button" onClick={download} disabled={!text} aria-label="Download output" title="Download output"><Download size={14} aria-hidden="true" /></button>
-            <button type="button" onClick={() => setExpanded((value) => !value)} aria-label={expanded ? "Reduce output height" : "Expand output height"} title={expanded ? "Reduce height" : "Expand height"} aria-pressed={expanded}>
+            <button type="button" onClick={download} disabled={!text} aria-label="Download output" title="Download output">
+              <Download size={14} aria-hidden="true" />
+            </button>
+            <button
+              type="button"
+              onClick={() => setExpanded((value) => !value)}
+              aria-label={expanded ? "Reduce output height" : "Expand output height"}
+              title={expanded ? "Reduce height" : "Expand height"}
+              aria-pressed={expanded}
+            >
               {expanded ? <Minimize2 size={14} aria-hidden="true" /> : <Maximize2 size={14} aria-hidden="true" />}
             </button>
           </div>
         )}
       </div>
       <span className="sr-only" role="status">{`${title}: ${state}${reconnecting ? ". Reconnecting to live output." : "."}`}</span>
-      <span className="sr-only" role="status">{feedback}</span>
+      <span className="sr-only" role="status">
+        {feedback}
+      </span>
       <div id={outputId} hidden={!open}>
         {open && (
           <>
@@ -162,11 +183,18 @@ function UpgradeLogView({ job, onChangeWaits, defaultOpen = false }: UpgradeLogP
                 if (["ArrowUp", "PageUp", "Home"].includes(event.key) && event.currentTarget.scrollHeight > event.currentTarget.clientHeight) setFollow(false);
               }}
             >
-              <pre className="upgrade-log-output" data-empty={!text || undefined}>{text || (running ? "Waiting for the first output…" : "No output was recorded.")}</pre>
+              <pre className="upgrade-log-output" data-empty={!text || undefined}>
+                {text || (running ? "Waiting for the first output…" : "No output was recorded.")}
+              </pre>
             </div>
             <div className="upgrade-log-foot">
-              <span>{following ? running ? "Following output" : `${job.log.length} ${job.log.length === 1 ? "line" : "lines"}` : "Scroll paused"}</span>
-              {!following && <button type="button" onClick={jumpToLatest}><ArrowDown size={12} aria-hidden="true" />Jump to latest</button>}
+              <span>{following ? (running ? "Following output" : `${job.log.length} ${job.log.length === 1 ? "line" : "lines"}`) : "Scroll paused"}</span>
+              {!following && (
+                <button type="button" onClick={jumpToLatest}>
+                  <ArrowDown size={12} aria-hidden="true" />
+                  Jump to latest
+                </button>
+              )}
             </div>
           </>
         )}
@@ -174,14 +202,25 @@ function UpgradeLogView({ job, onChangeWaits, defaultOpen = false }: UpgradeLogP
       {reconnecting && (
         <div className="upgrade-log-notice" data-tone="reconnecting">
           <span>Reconnecting to live output…</span>
-          <button type="button" onClick={() => events.retryNow()} disabled={connection.state === "connecting"}>Reconnect</button>
+          <button type="button" onClick={() => events.retryNow()} disabled={connection.state === "connecting"}>
+            Reconnect
+          </button>
         </div>
       )}
-      {job.error && <p className="upgrade-log-error" role="alert"><AlertCircle size={14} aria-hidden="true" /><span>{job.error}</span></p>}
+      {job.error && (
+        <p className="upgrade-log-error" role="alert">
+          <AlertCircle size={14} aria-hidden="true" />
+          <span>{job.error}</span>
+        </p>
+      )}
       {job.state === "failed" && job.timed_out && (
         <p className="upgrade-log-timeout">
           Kiln stopped waiting. The runner may still finish; its status will update when it reports back.
-          {onChangeWaits && <button type="button" onClick={onChangeWaits}>Change wait time</button>}
+          {onChangeWaits && (
+            <button type="button" onClick={onChangeWaits}>
+              Change wait time
+            </button>
+          )}
         </p>
       )}
     </section>

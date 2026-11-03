@@ -8,9 +8,10 @@
  * composer and nothing else; how a message goes is kept until you change it.
  */
 import * as React from "react";
-import { ArrowDown, ArrowUp, ChevronDown, CornerDownLeft, Navigation, Paperclip, Pencil, Square, X, Zap } from "lucide-react";
+import { ArrowDown, ArrowUp, Check, ChevronDown, Clock, CornerDownLeft, Navigation, Paperclip, Pencil, Square, X, Zap } from "lucide-react";
 import { clientId, FORCE_STOP_AFTER_MS, useSession, useStopAt, type Attachment, type QueueItem, type SendMode, type SessionStore, type SlashCommand } from "@/api/harness";
-import { useNow } from "@/lib/hooks";
+import { labelOf, useLabels } from "@/lib/data";
+import { useMediaQuery, useNow } from "@/lib/hooks";
 import { Tip } from "@/components/ui/tooltip";
 import { Button } from "@/components/ui/button";
 import { cn } from "@/lib/utils";
@@ -25,6 +26,8 @@ import { modelLabel } from "./derive";
 import { useDraft, useHeld, useSendMode, type Held } from "./state";
 import { stopperOf, subagentPlaceholder, takesMessages } from "./tasks";
 import { notShown } from "./queue-shown";
+import { KindGlyph } from "./kind-glyph";
+import type { SubagentRow } from "./subagent-tree";
 
 export const MODES: { id: SendMode; label: string; hint: string; feature?: string }[] = [
   { id: "queue", label: "Queue", hint: "Sent when it finishes what it's doing" },
@@ -379,6 +382,43 @@ const NO_FEATURES: string[] = [];
 const NO_COMMANDS: SlashCommand[] = [];
 const NO_MODES: SendMode[] = [];
 
+/** Where a message to one of the subagents picked stands: delivered, waiting to be taken, or not sent. */
+export type ToMark = "ok" | "wait" | "fail";
+
+const NO_TO: readonly SubagentRow[] = [];
+
+/**
+ * Who what's written goes to: the subagents picked, each its last message's mark before its name
+ * (so a name cut short never hides it), as many as the width shows (+N for the rest), and Clear.
+ */
+function ToLine({ to, marks, onClear }: { to: readonly SubagentRow[]; marks?: ReadonlyMap<string, ToMark>; onClear?: () => void }) {
+  // Two names on a phone, four wider; the rest counted.
+  const many = useMediaQuery("(min-width: 720px)") ? 4 : 2;
+  const more = to.length - many;
+  return (
+    <div className="hx-to" role="group" aria-label="To">
+      <KindGlyph kind="agent" className="hx-to-mark" />
+      <ul className="hx-to-names">
+        {to.slice(0, many).map((r) => {
+          const m = marks?.get(r.key);
+          return (
+            <li key={r.key} className="hx-to-name" data-mark={m}>
+              {m === "ok" && <Check size={11} aria-label="Delivered" />}
+              {m === "wait" && <Clock size={11} aria-label="Waiting" />}
+              {m === "fail" && <X size={11} aria-label="Not sent" />}
+              <span>{r.name}</span>
+            </li>
+          );
+        })}
+      </ul>
+      {more > 0 && <span className="hx-to-more">+{more}</span>}
+      <button type="button" className="hx-to-clear" aria-label="Clear who it's to" onClick={onClear}>
+        <X size={12} />
+      </button>
+    </div>
+  );
+}
+
 export function Composer({
   store,
   agent,
@@ -389,6 +429,10 @@ export function Composer({
   onTerminal,
   replyTo,
   onClearReply,
+  to: picked = NO_TO,
+  toMarks,
+  onSendTo,
+  onClearTo,
 }: {
   store: SessionStore;
   /** The agent's id: what's written to it is kept under it until it's sent. */
@@ -405,6 +449,12 @@ export function Composer({
   /** What the next message answers (a messenger-style reply, from a message's ⋯ menu). */
   replyTo?: ReplyTarget | null;
   onClearReply?: () => void;
+  /** Its subagents picked by the line above (background.tsx): what's written goes to each, its own way (`onSendTo`), not to the agent. */
+  to?: readonly SubagentRow[];
+  /** Where the last message to them stands, each by its row's key: delivered, waiting, or not sent. */
+  toMarks?: ReadonlyMap<string, ToMark>;
+  onSendTo?: (m: { text: string; attachments?: Attachment[] }) => void;
+  onClearTo?: () => void;
 }) {
   const [text, setText] = useDraft(agent);
   const chosen = useSendMode((s) => s.mode);
@@ -415,8 +465,10 @@ export function Composer({
   // The agent can't take a message now (its machine away, or the connection down): what you
   // send is kept here, and goes once it can. Typing never stops.
   const reachable = !disabled && status !== "disconnected";
-  // The machine it runs on, by name (none for one on the kiln server itself).
-  const machine = useSession(store, (s) => (s.info?.target?.startsWith("agent:") ? s.info.target.slice(6) : ""));
+  // The machine it runs on, as people know it (none for one on the kiln server itself).
+  const on = useSession(store, (s) => (s.info?.target?.startsWith("agent:") ? s.info.target.slice(6) : ""));
+  const labels = useLabels();
+  const machine = on && labelOf(on, labels);
   const paused = useSession(store, (s) => (s.state?.pause ? (s.state.pause.auto ? "auto" : "manual") : null));
   const held = useHeld((s) => s.held[agent] ?? NO_HELD);
   const queue = useSession(store, (s) => s.state?.queue ?? NO_QUEUE);
@@ -450,7 +502,8 @@ export function Composer({
   const pressTimer = React.useRef(0);
   const longPressed = React.useRef(false);
   const shellLine = Boolean(onTerminal) && text.trimStart().startsWith("!");
-  const sendLabel = shellLine ? "Run" : !reachable || paused ? "Queue" : running ? (mode === "queue" ? "Queue" : mode === "steer" ? "Steer" : "Send now") : "Send";
+  // To subagents picked, each takes it its own way (steered at work, else queued): it's sent, whatever the agent is doing.
+  const sendLabel = shellLine ? "Run" : !toSub && picked.length > 0 ? "Send" : !reachable || paused ? "Queue" : running ? (mode === "queue" ? "Queue" : mode === "steer" ? "Steer" : "Send now") : "Send";
   const away = machine ? `${machine} is back` : "it's back";
 
   // What was kept here goes, in order, once the agent can take it: whenever the session or what's
@@ -603,6 +656,16 @@ export function Composer({
 
   const sendText = (body: string) => {
     if ((!body && files.length === 0) || pending > 0) return;
+    // To the subagents picked: one message each, sent by the page (agent.tsx), none to the agent.
+    if (!toSub && picked.length > 0 && onSendTo) {
+      onSendTo({ text: body, attachments: files.length ? attachments.payload() : undefined });
+      write("");
+      clear();
+      setOverride({});
+      setWithOpen(false);
+      onClearReply?.();
+      return;
+    }
     const m = { id: clientId(), text: body, attachments: files.length ? attachments.payload() : undefined, overrides: override.model || override.effort ? override : undefined, reply_to: replyTo?.id };
     // It can't take it now (or what was kept here hasn't all gone yet): kept here, sent once it
     // can, in order — never lost, never blocked. "Now" and "steer" don't wait behind what's kept:
@@ -762,6 +825,7 @@ export function Composer({
       {/* Files dropped or pasted here are the agent page's to attach (it takes them anywhere on
           the page); taking them here as well attached each one twice. */}
       <div className="hx-compose-box">
+        {!toSub && picked.length > 0 && <ToLine to={picked} marks={toMarks} onClear={onClearTo} />}
         {chips}
         {canOverride && (withOpen || override.model || override.effort) && (
           <SendWith className="cp-with" models={meta?.models ?? []} model={model} modelLabel={modelLabel} efforts={meta?.efforts ?? []} effort={effort} value={override} onChange={setOverride} />
@@ -775,7 +839,9 @@ export function Composer({
               ? `${disabled ? "Not connected" : `${machine || "Its machine"} is offline`}: what you send waits here and goes once ${away}`
               : paused
                 ? `Queue a message: it goes once ${paused === "auto" ? "the limit resets" : "you resume it"}`
-                : toSub
+                : !toSub && picked.length > 0
+                  ? "Message them"
+                  : toSub
                   ? subagentPlaceholder(running ? mode : null, toSub.via === "parent")
                   : toMain
                     ? "Message the main agent"

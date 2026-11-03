@@ -118,6 +118,9 @@ pub async fn run(cfg: Config, shutdown: Shutdown) -> anyhow::Result<()> {
     // The conversation feeds' batches signed for at the server's ends (docs/ci.md W27-R08).
     crate::custody::feeds::install(&hub);
     hub.runners_before.store(runners_before, std::sync::atomic::Ordering::Relaxed);
+    // The names people see of the runners kiln knows by their machine ids, for the sentences that
+    // name them (docs/machines.md).
+    hub.load_labels().await;
     // Where kiln keeps its bytes (docs/blobs.md): what was kept before taken in, what's kept read.
     crate::blobs::start(&hub).await;
     // The CI engine (docs/ci.md), when turned on.
@@ -549,7 +552,15 @@ pub async fn run(cfg: Config, shutdown: Shutdown) -> anyhow::Result<()> {
 
     // In-process bare-metal agent, connected over loopback QUIC like any other agent.
     if cfg.local_agent.enabled {
-        let name = crate::pki::sanitize_name(&cfg.local_agent_name());
+        // Known by its machine's id and shown by its name (docs/machines.md): what kiln kept under
+        // its name moves to the id (the first time; after that there's nothing left to move).
+        let shown = crate::pki::sanitize_name(&cfg.local_agent_name());
+        let name = cfg.local_agent_key();
+        if name != shown
+            && let Err(e) = hub.move_runner(&shown, &name, &shown, &crate::os::hostname()).await
+        {
+            tracing::warn!(from = %shown, to = %name, error = %format!("{e:#}"), "the server's own runner didn't move to its machine id");
+        }
         let creds = (pki.ca_der.clone(), pki.issue_local(&name)?);
         let http_port = cfg.server.http_addr.rsplit_once(':').map_or("7070", |(_, p)| p).to_owned();
         let opts = crate::agent::Opts {

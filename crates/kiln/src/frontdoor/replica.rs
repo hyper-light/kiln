@@ -511,14 +511,22 @@ mod tests {
         // Each connection's second request is read and the connection closed unanswered.
         let (url, conns) = kept_upstream(true)?;
         let at = serve(door_to(&url, dir.path())?)?;
+        // Which connection each went on. Not always the first, second and third: on a loaded
+        // machine a connection the server didn't take in time is tried again first (as
+        // p2_a_connection_the_server_did_not_take_is_tried_again holds).
+        let on = |status: u16, body: &str, path: &str| -> anyhow::Result<usize> {
+            body.strip_prefix(&format!("upstream {path} on ")).and_then(|n| n.parse().ok()).filter(|_| status == 200).ok_or_else(|| anyhow::anyhow!("{path}: {status} {body}"))
+        };
         let (status, _, body) = get(at, "/api/a", None)?;
-        assert_eq!((status, body.as_str()), (200, "upstream /api/a on 1"));
+        let a = on(status, &body, "/api/a")?;
         let (status, _, body) = get(at, "/api/b", None)?;
-        assert_eq!((status, body.as_str()), (200, "upstream /api/b on 2"), "sent again, on a new connection");
+        let b = on(status, &body, "/api/b")?;
+        assert!(b > a, "sent again, on a new connection: /api/a on {a}, /api/b on {b}");
         // Not on the second connection, kept, which would drop it.
         let (status, body) = post(at, "/api/c", "{}")?;
-        assert_eq!((status, body.as_str()), (200, "upstream /api/c on 3"));
-        assert_eq!(conns.load(Ordering::SeqCst), 3);
+        let c = on(status, &body, "/api/c")?;
+        assert!(c > b, "a write on a new connection: /api/b on {b}, /api/c on {c}");
+        assert_eq!(conns.load(Ordering::SeqCst), c, "none after the write's");
         Ok(())
     }
 

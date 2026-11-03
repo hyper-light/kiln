@@ -107,8 +107,8 @@ person can ask for the same with the goal's **Make a plan**). Then, in this orde
    resting on nothing, or on findings graded D or F): **show the person the research in your
    reply, as it is** (every claim with its grade, score and sources), and the warnings. `then`:
    `goals` (the default: its steps become this goal's parts, here), `review` (the same, the stack
-   paused for the person to look first), `agents` (it runs with an agent per step; the goal waits
-   for the run).
+   paused for the person to look first: theirs to approve, and `plans_run` of it is refused
+   meanwhile), `agents` (it runs with an agent per step; the goal waits for the run).
 
 Once every step is met, so is the goal: you don't say it's met yourself.
 

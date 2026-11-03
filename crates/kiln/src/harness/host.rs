@@ -946,14 +946,15 @@ impl Host {
             return Err(Refused::NotTaken(format!("a session packed as version {} (this runner takes up to {})", pkg.version, super::moving::VERSION)));
         }
         let kind = Kind::get(&pkg.spec.kind).ok_or_else(|| Refused::NotTaken(format!("this runner doesn't know {}", pkg.spec.kind)))?;
+        // A copy of it from before this hand-over (left behind here), whatever this machine has
+        // installed: a sender trying again takes this answer as the session being here.
+        if self.get(&pkg.id).is_some() {
+            return Err(Refused::NotTaken(RUNS_HERE.into()));
+        }
         // Its harness: the program the session names (a local hand-over keeps its own), else its
         // kind's.
         if !pkg.spec.program.as_deref().map_or_else(|| kind.available(), |p| crate::os::which(p).is_some()) {
             return Err(Refused::NotTaken(format!("{} is not installed on this machine", kind.name)));
-        }
-        // A copy of it from before this hand-over (left behind here).
-        if self.get(&pkg.id).is_some() {
-            return Err(Refused::NotTaken(RUNS_HERE.into()));
         }
         let mut pkg = pkg;
         let mut cwd = session::resolve_cwd(pkg.spec.cwd.as_deref());
@@ -2246,6 +2247,8 @@ pub fn refusal(id: &str, spec: &Spec, error: &str) -> Vec<super::core::Update> {
         left_behind: 0,
         reach: spec.reach.clone(),
         pause: None,
+        frozen: None,
+        perms: None,
         room_wait: None,
         last_turn: None,
         keep_off: false,
@@ -2259,6 +2262,7 @@ pub fn refusal(id: &str, spec: &Spec, error: &str) -> Vec<super::core::Update> {
         plan_run: spec.plan_run.clone(),
         helper: spec.helper.clone(),
         subagent: spec.subagent,
+        variant_of: spec.variant_of.clone(),
         no_bypass: !spec.allow_bypass,
         workspace: spec.workspace.clone(),
     };

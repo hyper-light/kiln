@@ -1,6 +1,7 @@
 /** Retrying a finished job, here or elsewhere (docs/ci.md W05-R28): what the run page's retry
  * control offers and says, apart from the requests (`ci.legRunners`, `ci.retryLeg`) so it's
  * tested as it is. */
+import { labelOf, type Labels } from "@/lib/data";
 import type { Placement } from "./wire";
 
 /** A runner a finished job could run on again, able to or not and why. */
@@ -41,14 +42,15 @@ export interface Retried {
 }
 
 /** The choices of where to run it again: any runner that can, any but the one it ran on, or each
- * runner able to, those with something to say about them saying it. */
+ * runner able to, those with something to say about them saying it. Runners are named as people
+ * know them (`labelOf`); the choices' values keep their names. */
 export function retryChoices(o: RetryOptions): { value: string; label: string }[] {
   const out = [{ value: "", label: "Any runner that can run it" }];
-  if (o.elsewhere && o.ran_on) out.push({ value: "elsewhere", label: `Any runner but ${o.ran_on}` });
+  if (o.elsewhere && o.ran_on) out.push({ value: "elsewhere", label: `Any runner but ${labelOf(o.ran_on)}` });
   for (const r of o.runners.filter((x) => x.able)) {
     const state = !r.connected ? "offline" : r.draining ? "draining" : r.busy >= r.slots ? "busy" : "";
     const notes = [r.name === o.ran_on ? "ran here" : "", state].filter(Boolean);
-    out.push({ value: `runner:${r.name}`, label: `On ${r.name}${notes.length ? ` (${notes.join(", ")})` : ""}` });
+    out.push({ value: `runner:${r.name}`, label: `On ${labelOf(r.name)}${notes.length ? ` (${notes.join(", ")})` : ""}` });
   }
   return out;
 }
@@ -62,8 +64,8 @@ export function retryBody(choice: string): { runner?: string; elsewhere?: boolea
 
 /** Where a placement asks a job to run: `on X`, `anywhere but X`; null for anywhere. */
 export function placementWords(p: Placement | null | undefined): string | null {
-  if (p?.runner) return `on ${p.runner}`;
-  if (p?.avoid) return `anywhere but ${p.avoid}`;
+  if (p?.runner) return `on ${labelOf(p.runner)}`;
+  if (p?.avoid) return `anywhere but ${labelOf(p.avoid)}`;
   return null;
 }
 
@@ -75,7 +77,8 @@ export function retriedWords(r: Retried): string {
 }
 
 /** Why a leg waits for the runner its retry asked for (wait reason `pinned`). */
-export function pinnedSentence(runner: string, state: string | undefined): string {
+export function pinnedSentence(name: string, state: string | undefined, labels?: Labels): string {
+  const runner = labelOf(name, labels);
   switch (state) {
     case "offline":
       return `Waiting for ${runner}, where its retry asked it to run, to connect.`;

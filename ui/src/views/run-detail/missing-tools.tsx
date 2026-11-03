@@ -11,6 +11,7 @@ import type { Job, ToolFix } from "@/api/types";
 import { Button } from "@/components/ui/button";
 import { Confirm } from "@/components/ui/misc";
 import { toast } from "@/components/ui/toast";
+import { labelOf, useLabels } from "@/lib/data";
 import { errorMessage } from "@/lib/hooks";
 import { useSuspenseResource } from "@/lib/resource";
 import { Link } from "@/lib/router";
@@ -41,23 +42,25 @@ const UNDER_WAY: ToolFix["state"][] = ["working", "needs_you", "checking"];
 
 function said(fix: ToolFix, waiting: boolean): string {
   const what = and(fix.tools);
+  const runner = labelOf(fix.runner);
   switch (fix.state) {
     case "working":
       return fix.note
-        ? `An agent is installing ${what} on ${fix.runner}: ${fix.note}.`
-        : `An agent is installing ${what} on ${fix.runner}. When it's done, kiln checks the runner again and ${waiting ? "the job goes there once it meets it" : "runs the job again"}.`;
+        ? `An agent is installing ${what} on ${runner}: ${fix.note}.`
+        : `An agent is installing ${what} on ${runner}. When it's done, kiln checks the runner again and ${waiting ? "the job goes there once it meets it" : "runs the job again"}.`;
     case "needs_you":
-      return `The agent installing ${what} on ${fix.runner} waits for you: open it to answer.`;
+      return `The agent installing ${what} on ${runner} waits for you: open it to answer.`;
     case "checking":
-      return `The agent is done: kiln is asking ${fix.runner} what it has now.`;
+      return `The agent is done: kiln is asking ${runner} what it has now.`;
     case "retried":
-      return `${fix.runner} has ${what} now: ${fix.note ?? "kiln ran the job again"}.`;
+      return `${runner} has ${what} now: ${fix.note ?? "kiln ran the job again"}.`;
     default:
       return fix.note ? `${fix.note}.` : "";
   }
 }
 
 function Lacks({ job }: { job: Job }) {
+  useLabels();
   const res = useSuspenseResource(`job-tools/${job.id}`, (s) => api.jobTools(job.id, s).catch(() => null), {
     on: ["job"],
     // Another job's event changes nothing here; this one's loads it again.
@@ -78,11 +81,11 @@ function Lacks({ job }: { job: Job }) {
   const waiting = job.status === "queued" || job.status === "pending";
   // What it lacks, or once it lacks nothing, what its agent installed where.
   const title = failed
-    ? `${and(failed.tools)} wasn't there on ${failed.runner}`
+    ? `${and(failed.tools)} wasn't there on ${labelOf(failed.runner)}`
     : missing.runners.length > 0
       ? "No runner meets this job's requirements"
       : fix
-        ? `${and(fix.tools)} on ${fix.runner}`
+        ? `${and(fix.tools)} on ${labelOf(fix.runner)}`
         : "";
 
   const start = async () => {
@@ -91,7 +94,7 @@ function Lacks({ job }: { job: Job }) {
     try {
       const r = await api.fixJobTools(job.id, { runner: pick.runner });
       res.setData((d) => (d ? { ...d, fix: r.fix } : d));
-      toast({ title: `An agent is installing ${and(r.fix.tools)} on ${r.fix.runner}`, tone: "info" });
+      toast({ title: `An agent is installing ${and(r.fix.tools)} on ${labelOf(r.fix.runner)}`, tone: "info" });
       setAsking(false);
     } catch (e) {
       toast.error("No agent started", errorMessage(e));
@@ -112,7 +115,7 @@ function Lacks({ job }: { job: Job }) {
         <ul className="lacks-runners">
           {missing.runners.map((r) => (
             <li key={r.runner}>
-              <span className="lacks-runner">{r.runner}</span> doesn't meet <code>{r.unmet.join(", ")}</code>
+              <span className="lacks-runner">{labelOf(r.runner)}</span> doesn't meet <code>{r.unmet.join(", ")}</code>
               {!r.fixable && `: ${r.no_agent ?? "more than an install can change"}`}
             </li>
           ))}
@@ -139,7 +142,7 @@ function Lacks({ job }: { job: Job }) {
       )}
       {!underWay && pick && asking && (
         <Confirm
-          label={`Install ${and(pick.tools)} on ${pick.runner}?`}
+          label={`Install ${and(pick.tools)} on ${labelOf(pick.runner)}?`}
           actions={
             <>
               <Button size="xs" disabled={busy} onClick={() => void start()}>
@@ -151,21 +154,21 @@ function Lacks({ job }: { job: Job }) {
             </>
           }
         >
-          <p className="font-medium text-[#e4e5e7]">{`Install ${and(pick.tools)} on ${pick.runner}?`}</p>
+          <p className="font-medium text-[#e4e5e7]">{`Install ${and(pick.tools)} on ${labelOf(pick.runner)}?`}</p>
           {!failed && fixable.length > 1 && (
             <div className="select">
               <select aria-label="The runner to install them on" value={pick.runner} onChange={(e) => setChosen(e.target.value)}>
                 {fixable.map((r) => (
                   <option key={r.runner} value={r.runner}>
-                    {r.runner}
+                    {labelOf(r.runner)}
                   </option>
                 ))}
               </select>
             </div>
           )}
           <p>
-            kiln starts a Claude agent on {pick.runner}, as you, to install only what's missing. A step that needs a person there (a password, an installer's dialog) waits for you in the agent. When
-            it's done, kiln checks the runner's tools and {failed ? "runs this run's failed jobs again" : "the job goes there once the runner meets it"}.
+            kiln starts a Claude agent on {labelOf(pick.runner)}, as you, to install only what's missing. A step that needs a person there (a password, an installer's dialog) waits for you in the
+            agent. When it's done, kiln checks the runner's tools and {failed ? "runs this run's failed jobs again" : "the job goes there once the runner meets it"}.
           </p>
         </Confirm>
       )}

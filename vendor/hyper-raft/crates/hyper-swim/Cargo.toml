@@ -1,0 +1,24 @@
+[package]
+name = "hyper-swim"
+description = "SWIM membership and failure detection with Lifeguard, sans-io: slates' detector, shared by mantle, focal and slates"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+hyper-timing = { path = "../hyper-timing" }
+
+[dev-dependencies]
+hyper-datagram = { path = "../hyper-datagram" }
+hyper-measure = { path = "../hyper-measure" }
+# The simulation's world and network (`tests/sim.rs`, `docs/sim.md` §9, S-2).
+hyper-sim = { path = "../hyper-sim" }
+
+[[bench]]
+name = "allocs"
+harness = false

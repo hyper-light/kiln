@@ -120,6 +120,9 @@ impl Store {
             // Driven by events: a commit nobody wrote yet is written at the first lull.
             quiet: Duration::ZERO,
             elections: Elections::Suspicion,
+            // Today's: a member's heartbeats wait on its flush proof, and a leader applies only
+            // what a majority's disks hold, its own among them (hyper-durable's `Disk`).
+            disk: hyper_durable::Disk::Flushed,
         };
         let (tx, rx) = mpsc::channel();
         let (ctx, crx) = mpsc::channel();

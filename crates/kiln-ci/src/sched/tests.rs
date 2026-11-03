@@ -14,7 +14,7 @@ const MIN: i64 = 60_000;
 fn linux(name: &str, slots: u32) -> RunnerIn {
     RunnerIn {
         id: name.into(),
-        view: RunnerView { name: name.into(), labels: vec!["k8s".into()], facts: RunnerFacts { os: "linux".into(), arch: "x86_64".into(), ..RunnerFacts::default() }, caps: 1 << 10, pool: None },
+        view: RunnerView { name: name.into(), label: None, labels: vec!["k8s".into()], facts: RunnerFacts { os: "linux".into(), arch: "x86_64".into(), ..RunnerFacts::default() }, caps: 1 << 10, pool: None },
         slots,
         capacity: None,
         executor: None,
@@ -717,6 +717,38 @@ fn w05_r28_a_placed_retry() {
     assert!(matches!(s.reason("e1"), Some(WaitReason::OtherRunner { asked: true, .. })), "{:?}", s.reason("e1"));
     let c = s.handle(Input::RunnerUp(Box::new(linux("c", 2))), 4);
     assert!(assigned(&c, "e1", "c") && assigned(&c, "e2", "c"), "{c:?}");
+}
+
+/// A runner kiln knows by its machine id (docs/machines.md) is named by its label in what the
+/// scheduler says to people: what it has of what a leg too big asks (W05-R03), and a placed
+/// retry's check (W05-R28). What's looked up by, the reasons' runners and the explanation's names,
+/// stays its id.
+#[test]
+fn a_runner_known_by_its_machine_id_is_named_by_its_label_in_sentences() -> Result<(), String> {
+    use super::state::{PinnedState, Placement};
+    const GIB: u64 = 1 << 30;
+    const ID: &str = "5f2a9c3e0b1d4e6f8a7c9b0d1e2f3a4b";
+    let studio = |slots: u32, capacity: Option<Resources>| RunnerIn { view: RunnerView { label: Some("studio".into()), ..linux(ID, slots).view }, capacity, ..linux(ID, slots) };
+    let mut s = Scheduler::new(Config { resources: true, ..Config::default() });
+    s.handle(Input::RunnerUp(Box::new(studio(99, Some(Resources { cpu: 8.0, mem: 16 * GIB, disk: 500 * GIB, gpu: 0 })))), 0);
+    let n = super::needs::parse("mem=128g")?;
+    s.handle(Input::LegQueued(Box::new(LegIn { request: n.request, route: LegRoute { labels: vec!["k8s".into()], requires: n.requires, ..LegRoute::default() }, ..leg("huge", "acme/x", 60) })), 1);
+    assert_eq!(s.reason("huge"), Some(&WaitReason::Oversized { asked: "128 GiB of memory".into(), short: vec!["studio has 16 GiB of memory".into()] }));
+
+    // A retry placed on it while it's busy: it waits for it, the other runner's check naming it.
+    let mut s = Scheduler::new(Config::default());
+    s.handle(Input::RunnerUp(Box::new(studio(1, None))), 0);
+    s.handle(Input::RunnerUp(Box::new(linux("other", 1))), 0);
+    let on = || Placement { runner: Some(ID.into()), avoid: None };
+    s.handle(Input::LegQueued(Box::new(LegIn { placement: on(), ..leg("busy", "acme/x", 60) })), 1);
+    s.handle(Input::LegQueued(Box::new(LegIn { placement: on(), ..leg("x", "acme/x", 60) })), 2);
+    assert_eq!(s.reason("x"), Some(&WaitReason::Pinned { runner: ID.into(), state: PinnedState::Busy }));
+    let explained = s.explain("x");
+    let other = explained.iter().find(|e| e.runner == "other");
+    assert!(other.is_some_and(|e| e.checks.iter().any(|c| !c.pass && c.requirement == "runner == studio (asked by its retry)" && c.value == "runner = other")), "{other:?}");
+    let mine = explained.iter().find(|e| e.runner == ID);
+    assert!(mine.is_some_and(|e| e.name == ID && e.checks.iter().any(|c| c.pass && c.value == "runner = studio")), "{mine:?}");
+    Ok(())
 }
 
 // ------------------------------------------------------------------ pools (W13-R09, W05-R27)

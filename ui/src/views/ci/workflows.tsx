@@ -15,6 +15,7 @@ import { Hold } from "@/components/ui/hold";
 import { Segmented } from "@/components/ui/tabs";
 import { Loadable } from "@/components/ui/loading";
 import { CopyButton, Crumbs, EmptyState, Panel, SelectField, TextField } from "@/components/ui/misc";
+import { labelOf, useLabels } from "@/lib/data";
 import { Link, useSearchParams } from "@/lib/router";
 import { unifiedPatch } from "@/lib/patch";
 import { describe, keysAt, siblingValue, yamlSpot, type Schema } from "@/lib/yaml-spot";
@@ -505,6 +506,7 @@ function MatrixView({ m }: { m: CiMatrix }) {
 }
 
 function PreviewPane({ preview, error, event, onEvent }: { preview: CiPreview | null; error: string | null; event: string; onEvent: (e: string) => void }) {
+  useLabels();
   const plan = preview?.plan;
   const byJob = new Map<string, NonNullable<typeof plan>["legs"]>();
   for (const l of plan?.legs ?? []) byJob.set(l.job, [...(byJob.get(l.job) ?? []), l]);
@@ -543,7 +545,7 @@ function PreviewPane({ preview, error, event, onEvent }: { preview: CiPreview | 
                 {legs.map((l) => {
                   const fits = l.routing?.runners.filter((r) => r.eligible) ?? [];
                   const where = fits.length
-                    ? `runs on ${fits.map((r) => r.name).join(", ")}`
+                    ? `runs on ${fits.map((r) => labelOf(r.name)).join(", ")}`
                     : l.routing
                       ? `no runner can take it now${l.routing.labels.length ? ` (needs ${l.routing.labels.join(", ")})` : ""}`
                       : "";

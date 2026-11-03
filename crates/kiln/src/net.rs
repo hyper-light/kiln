@@ -426,6 +426,11 @@ pub fn limits(server: bool) -> Limits {
         keep_alive: Some(Duration::from_secs(2)),
         max_responses: 64,
         receive_chunks: usize::try_from(window).unwrap_or(usize::MAX) / RECEIVE_CHUNK + 1,
+        // As every connection asked before the choice was its owner's: decimated, as Google QUIC's
+        // receivers acknowledge (hyper-raft docs/transport.md §4k, §4ak).
+        acknowledgement: hyper_transport::Acknowledgement::Decimated,
+        // No forward erasure correction, as before it was offered (§4an).
+        fec_window: None,
     }
 }
 
@@ -1047,7 +1052,9 @@ fn on_event<B, D>(
         Event::Reply { exchange, .. } | Event::Refused { exchange, .. } => ep.end(exchange),
         // A lane that found a frame too full has room again: the loop flushes the outbox after
         // every event it handles.
-        Event::BodyReady { .. } | Event::Writable { .. } | Event::LaneRoom { .. } => {}
+        // A path's degrading and its progress again (hyper-raft docs/transport.md §4ai): kiln's
+        // links keep their own liveness, as before these were said.
+        Event::BodyReady { .. } | Event::Writable { .. } | Event::LaneRoom { .. } | Event::Degrading { .. } | Event::Progressing { .. } => {}
     }
 }
 
@@ -1287,7 +1294,8 @@ mod tests {
             let patience = Duration::from_millis(300);
             // Updates up (the runner's sender, the server's receiver); commands down.
             let (mut up, mut up_in) = (Sender::new(1 << 20, patience), Receiver::new());
-            let (mut down, mut down_in) = (Sender::new(1 << 20, patience), Receiver::new());
+            // The runner's of the server's commands asks for a gap again on time, as a runner does.
+            let (mut down, mut down_in) = (Sender::new(1 << 20, patience), Receiver::timed());
             for n in 0..N {
                 up.push("s:x", n.to_be_bytes().to_vec()).map_err(|_| anyhow::anyhow!("full"))?;
                 down.push("cmd", n.to_be_bytes().to_vec()).map_err(|_| anyhow::anyhow!("full"))?;
@@ -1349,7 +1357,7 @@ mod tests {
                             };
                             let (rx, took, tx, answered) = if server { (&mut up_in, &mut took_up, &mut down, &mut answered_down) } else { (&mut down_in, &mut took_down, &mut up, &mut answered_up) };
                             match frame {
-                                Frame::Item { stream, seq, low, body } => match rx.on_item(&stream, seq, low, body) {
+                                Frame::Item { stream, seq, low, body } => match rx.on_item(&stream, seq, low, body, Instant::now()) {
                                     Arrival::Take(body) => {
                                         if let Some(i) = index(&body) {
                                             if let Some(t) = took.get_mut(i) {
@@ -1374,6 +1382,9 @@ mod tests {
                         }
                     }
                 }
+                // The gaps the runner still lacks of the server's commands, asked for again on its
+                // own clock.
+                answers.extend(down_in.wants(Instant::now()).into_iter().map(|f| (false, f)));
                 for (server, f) in answers {
                     match (server, peer) {
                         (true, Some(p)) => {

@@ -6,6 +6,7 @@
 //! starts each one over, whole, once (`crate::wire::uplink`).
 
 use std::collections::HashMap;
+use std::time::Instant;
 
 use parking_lot::Mutex;
 
@@ -31,9 +32,9 @@ impl Links {
         self.by_runner.lock().entry(runner.to_owned()).or_default().have()
     }
 
-    /// An item came from `runner`. A stream's first item starts its key over: the server lets go
-    /// of what it had of that session's (or terminal's) earlier streams.
-    pub fn on_item(&self, runner: &str, stream: &str, seq: Seq, low: Seq, body: Vec<u8>) -> Arrival {
+    /// An item came from `runner`, at `now`. A stream's first item starts its key over: the server
+    /// lets go of what it had of that session's (or terminal's) earlier streams.
+    pub fn on_item(&self, runner: &str, stream: &str, seq: Seq, low: Seq, body: Vec<u8>, now: Instant) -> Arrival {
         let mut g = self.by_runner.lock();
         let rx = g.entry(runner.to_owned()).or_default();
         if seq == 1
@@ -42,7 +43,7 @@ impl Links {
             let prefix = format!("{key}#");
             rx.forget_where(|s| s != stream && s.starts_with(&prefix));
         }
-        rx.on_item(stream, seq, low, body)
+        rx.on_item(stream, seq, low, body, now)
     }
 
     /// The item being applied from `runner` was taken (`None`) or refused: the answer to send it.
@@ -83,13 +84,14 @@ mod tests {
 
     #[test]
     fn a_sessions_new_stream_replaces_its_old_one() {
+        let now = Instant::now();
         let links = Links::new();
-        assert!(matches!(links.on_item("a", "s:x#b1.0", 1, 0, vec![1]), Arrival::Take(_)));
+        assert!(matches!(links.on_item("a", "s:x#b1.0", 1, 0, vec![1], now), Arrival::Take(_)));
         links.answer("a", "s:x#b1.0", 1, None);
-        assert!(matches!(links.on_item("a", "s:y#b1.0", 1, 0, vec![1]), Arrival::Take(_)));
+        assert!(matches!(links.on_item("a", "s:y#b1.0", 1, 0, vec![1], now), Arrival::Take(_)));
         links.answer("a", "s:y#b1.0", 1, None);
         // x starts over under its next generation: its old stream goes; y's stays.
-        assert!(matches!(links.on_item("a", "s:x#b1.1", 1, 0, vec![2]), Arrival::Take(_)));
+        assert!(matches!(links.on_item("a", "s:x#b1.1", 1, 0, vec![2], now), Arrival::Take(_)));
         links.answer("a", "s:x#b1.1", 1, Some((Refusal::Refused, "no".into())));
         let Frame::Have(has) = links.have("a") else { return };
         let mut names: Vec<&str> = has.iter().map(|h| h.stream.as_str()).collect();

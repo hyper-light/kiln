@@ -347,12 +347,49 @@ function inScope(state: string, scope: ShipScope): boolean {
  * agent wrote it, else ci-doctor, the agent the mock's repository has attached. */
 const takerOf = (row: ShipCommit) => (row.author.startsWith("agent:") ? row.author.slice("agent:".length) : "ci-doctor");
 
+/** The rows whose handed-off threads each browser's agent answered in a new version
+ * (`POST /api/mock/ship/fixed?sha=`), by its user agent as `handedBy` is. */
+const fixedBy = new Map<string, Set<string>>();
+
+/** The new version an agent's fix makes of a handed-off change (W26-R18): on top, its checks running. */
+const fixShaOf = (s: string) => `f${s.slice(1)}`;
+function fixOf(row: ShipCommit): ShipCommit {
+  const ch = row.change!;
+  const v = ch.latest + 1;
+  const s = fixShaOf(row.sha);
+  return {
+    ...row,
+    sha: s,
+    short: s.slice(0, 7),
+    at: now(),
+    stand: "checking",
+    line: "Checks running",
+    cursor: row.cursor + 1,
+    pips: pips("requested", "none", "running"),
+    change: { ...ch, revision: v, latest: v, open: { question: 0, nit: 0, issue: 0, blocking: 0 } },
+    actions: [],
+  };
+}
+
 /** A fixed row once this browser handed it off, as the server reads it: a change at work under
- * its agent (no Hand off and Review pair), or a failure on whoever took it (Retry alone). */
+ * its agent (no Hand off and Review pair), its line naming the one thread it has or how many; or a
+ * failure on whoever took it (Retry alone). Once the agent's fix is in, the handed revision is
+ * superseded as any replaced one is, its line saying which version fixed it, folded under that version. */
 function handedRow(row: ShipCommit, ua: string): ShipCommit {
   if (!handedBy.get(ua)?.has(row.sha)) return row;
   const by = takerOf(row);
-  if (row.change) return { ...row, stand: "checking", line: `${by} fixing · kim's thread`, pips: row.pips.map((p) => (p.stage === "review" ? { ...p, state: "fixing" } : p)), actions: [] };
+  if (row.change && fixedBy.get(ua)?.has(row.sha))
+    return { ...row, stand: "superseded", line: `Fixed in v${row.change.latest + 1}`, pips: pips("none", "none", "superseded"), fold_under: fixShaOf(row.sha), actions: [] };
+  const open = row.change?.open;
+  const threads = open ? open.question + open.nit + open.issue + open.blocking : 0;
+  if (row.change)
+    return {
+      ...row,
+      stand: "checking",
+      line: `${by} fixing · ${threads > 1 ? `${threads} threads` : "kim's thread"}`,
+      pips: row.pips.map((p) => (p.stage === "review" ? { ...p, state: "fixing" } : p)),
+      actions: [],
+    };
   const why = row.line.split(" · ").slice(1).join(" · ") || "checks failed";
   return { ...row, stand: "failing", line: `${by} fixing · ${why}`, actions: (row.actions ?? []).filter((a) => a.name !== "hand_off") };
 }
@@ -388,6 +425,70 @@ const arrival = (n: number): ShipCommit => ({
   fold_under: null,
   actions: [],
 });
+
+/** An agent's change a test adds on top (`POST /api/mock/ship/arrive?agent=diff|request`), at its
+ * first version, with two open threads: a question of kim's and an issue of an agent's (W26-R18). */
+const agentChange = (kind: ShipChange["kind"]): ShipCommit => {
+  const [name, s, title] = kind === "diff" ? (["D45", sha("d5"), "matrix: cap the expansion"] as const) : (["CR15", sha("c5"), "sched: cap a share"] as const);
+  return {
+    repo: REPO,
+    sha: s,
+    short: s.slice(0, 7),
+    message: title,
+    author: "agent:matrix",
+    branch: "main",
+    at: now(),
+    stand: "needs_you",
+    line: "kim: what caps it? · 2 threads",
+    pips: pips("requested", "none", "passed"),
+    environments: [],
+    tags: [],
+    runs: [],
+    cursor: 200,
+    kind,
+    host: "kiln",
+    change: { name, kind, host: "kiln", title, revision: 1, latest: 1, state: "requested", turn: ["user:ada"], open: { question: 1, nit: 0, issue: 1, blocking: 0 }, superseded_by: null },
+    fold_under: null,
+    actions: [{ name: "hand_off", method: "POST", path: "/api/ship/hand-off", body: { repo: REPO, sha: s } }],
+  };
+};
+
+/** An agent's draft a test adds on top (`POST /api/mock/ship/arrive?draft=kiln|github`, W26-R18):
+ * a change request on kiln or a pull request on GitHub, not yet asked for review, with Ready. */
+const agentDraft = (host: "kiln" | "github"): ShipCommit => {
+  const [name, s, title] = host === "kiln" ? (["CR16", sha("ad"), "matrix: draft a share"] as const) : (["#22", sha("ae"), "matrix: draft on GitHub"] as const);
+  return {
+    repo: REPO,
+    sha: s,
+    short: s.slice(0, 7),
+    message: title,
+    author: "agent:matrix",
+    branch: "main",
+    at: now(),
+    stand: "waiting",
+    line: "Draft · not asked for review yet",
+    pips: pips("none", "none", "passed"),
+    environments: [],
+    tags: [],
+    runs: [],
+    cursor: 210,
+    kind: "request",
+    host,
+    change: { name, kind: "request", host, title, revision: 1, latest: 1, state: "draft", turn: [], open: { question: 0, nit: 0, issue: 0, blocking: 0 }, superseded_by: null },
+    made_by: { agent: "demo-long", person: "user:sam" },
+    fold_under: null,
+    actions: [{ name: "ready", method: "POST", path: "/api/ship/ready", body: { repo: REPO, sha: s } }],
+  };
+};
+
+/** The drafts each browser marked ready (`POST /api/ship/ready`), by its user agent as `handedBy` is. */
+const readyBy = new Map<string, Set<string>>();
+
+/** A draft once this browser marked it ready, as the server reads it: asked for review, no Ready. */
+const readyRow = (row: ShipCommit, ua: string): ShipCommit =>
+  readyBy.get(ua)?.has(row.sha) && row.change
+    ? { ...row, line: "Waiting on review", pips: row.pips.map((p) => (p.stage === "review" ? { ...p, state: "requested" } : p)), change: { ...row.change, state: "requested" }, actions: [] }
+    : row;
 
 /**
  * A burst of agents' commits (`POST /api/mock/ship/agents?n=14&over=10`; Agent pace and checks,
@@ -640,21 +741,24 @@ export async function handleShip(req: http.IncomingMessage, res: http.ServerResp
       (c) => (!repo || c.repo === repo) && (!q.get("host") || c.host === q.get("host")) && (!q.get("kind") || c.kind === q.get("kind")) && (q.get("lens") !== "review" || c.kind !== "commit"),
     );
     const pace = paceOf(all().filter((c) => !repo || c.repo === repo));
+    // An agent's fix of a change this browser handed off (W26-R18): its new version, on top.
+    const rows = [...list.filter((c) => c.change && handedBy.get(ua)?.has(c.sha) && fixedBy.get(ua)?.has(c.sha)).map(fixOf), ...list];
+    const shown = (c: ShipCommit) => withRan(readyRow(handedRow(c, ua), ua));
     // Ship's rows (docs/ci.md W26-R29): each repository's newest commit, the first of its own list.
     if (q.get("by") === "repo") {
       const seen = new Set<string>();
-      const heads = list.filter((c) => !seen.has(c.repo) && !!seen.add(c.repo));
-      const page: ShipPage = { commits: heads.map((c) => withRan(handedRow(c, ua))), next_cursor: null, pace };
+      const heads = rows.filter((c) => !seen.has(c.repo) && !!seen.add(c.repo));
+      const page: ShipPage = { commits: heads.map(shown), next_cursor: null, pace };
       ctx.json(res, 200, page);
       return true;
     }
     // A page: `limit` of them from where the last page's last (`cursor`) left off, as the server pages.
-    const limit = Number(q.get("limit") ?? "") || list.length;
+    const limit = Number(q.get("limit") ?? "") || rows.length;
     const after = q.get("cursor");
-    const from = after === null ? 0 : list.findIndex((c) => String(c.cursor) === after) + 1;
-    const slice = list.slice(from, from + limit);
-    const next = from + limit < list.length ? (slice.at(-1)?.cursor ?? null) : null;
-    const page: ShipPage = { commits: slice.map((c) => withRan(handedRow(c, ua))), next_cursor: next, pace };
+    const from = after === null ? 0 : rows.findIndex((c) => String(c.cursor) === after) + 1;
+    const slice = rows.slice(from, from + limit);
+    const next = from + limit < rows.length ? (slice.at(-1)?.cursor ?? null) : null;
+    const page: ShipPage = { commits: slice.map(shown), next_cursor: next, pace };
     ctx.json(res, 200, page);
     return true;
   }
@@ -863,11 +967,46 @@ export async function handleShip(req: http.IncomingMessage, res: http.ServerResp
     ctx.json(res, 200, { hand_offs: sentBy.get(ua) ?? [] });
     return true;
   }
+  // A row's Ready (W26-R18): an agent's draft marked ready for review, as the server answers.
+  if (p === "/api/ship/ready" && m === "POST") {
+    let body: { repo?: unknown; sha?: unknown } = {};
+    try {
+      body = JSON.parse((await readBody(req)) || "{}") as typeof body;
+    } catch {
+      body = {};
+    }
+    const row = all().find((c) => c.repo === body.repo && c.sha === body.sha);
+    const mine = readyBy.get(ua) ?? new Set<string>();
+    if (!row?.change || mine.has(row.sha) || !(row.actions ?? []).some((a) => a.name === "ready")) {
+      ctx.json(res, row ? 409 : 404, { error: row ? `${row.change?.name ?? row.short} isn't a draft` : "no such commit" });
+      return true;
+    }
+    readyBy.set(ua, mine.add(row.sha));
+    ctx.json(res, 200, { ready: { change: row.change.name } });
+    return true;
+  }
+  if (p === "/api/mock/ship/ready" && m === "POST") {
+    if (q.get("reset")) readyBy.delete(ua);
+    ctx.json(res, 200, { ok: true });
+    return true;
+  }
   if (p === "/api/mock/ship/hand-off" && m === "POST") {
     if (q.get("reset")) {
       handedBy.delete(ua);
       sentBy.delete(ua);
+      fixedBy.delete(ua);
     }
+    ctx.json(res, 200, { ok: true });
+    return true;
+  }
+  // The author's agent's fix of a handed-off change is in: a new version answering its threads.
+  if (p === "/api/mock/ship/fixed" && m === "POST") {
+    const sha = q.get("sha") ?? "";
+    if (!handedBy.get(ua)?.has(sha)) {
+      ctx.json(res, 409, { error: "not handed off from this browser" });
+      return true;
+    }
+    fixedBy.set(ua, (fixedBy.get(ua) ?? new Set<string>()).add(sha));
     ctx.json(res, 200, { ok: true });
     return true;
   }
@@ -898,7 +1037,9 @@ export async function handleShip(req: http.IncomingMessage, res: http.ServerResp
       for (const t of burstTimers) clearTimeout(t);
       burstTimers.clear();
       arrived.length = 0;
-    } else arrived.unshift(arrival(arrived.length + 1));
+    } else if (q.get("agent") === "diff" || q.get("agent") === "request") arrived.unshift(agentChange(q.get("agent") as ShipChange["kind"]));
+    else if (q.get("draft") === "kiln" || q.get("draft") === "github") arrived.unshift(agentDraft(q.get("draft") as "kiln" | "github"));
+    else arrived.unshift(arrival(arrived.length + 1));
     ctx.json(res, 200, { ok: true });
     return true;
   }

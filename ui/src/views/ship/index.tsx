@@ -508,7 +508,7 @@ function Dropdown({ commit, reveal, commits }: { commit: ShipCommit; reveal: num
             Diff
           </Button>
           <Link className={`${buttonVariants({ variant: "secondary", size: "xs" })} ship-foot__page`} to={`/ship/${commit.repo}/${commit.sha}`}>
-            Commit ↗
+            Commit
           </Link>
         </nav>
       </Loadable>

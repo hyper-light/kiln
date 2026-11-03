@@ -411,6 +411,9 @@ pub static ROUTES: &[Rule] = &[
     r("GET", "/api/repos/*/lands/*", "diffs.read", At::Repo(2)),
     // A host's changes into its host's own queue (docs/ci.md W28-R109): landing them.
     r("POST", "/api/repos/*/queue", "diffs.land", At::Repo(2)),
+    // Whether agents fix code from agents' feedback (docs/ci.md W26-R18): the land queue's capability changes it.
+    r("GET", "/api/repos/*/agent-fixes", "diffs.read", At::Repo(2)),
+    r("PUT", "/api/repos/*/agent-fixes", "diffs.land", At::Repo(2)),
     r("DELETE", "/api/queue/*", "queue.manage", At::Entry(2)),
     // Review holds, lets go of or withdraws a land queue entry (docs/ci.md W28-R104).
     r("POST", "/api/queue/*/hold", "diffs.review", At::Entry(2)),
@@ -608,6 +611,9 @@ pub static ROUTES: &[Rule] = &[
     r("POST", "/api/ship/hand-off", "runs.rerun", At::Anywhere),
     // What a browser signs to hand it off, asked as Hand off is (W27-R08).
     r("POST", "/api/ship/hand-off/statement", "runs.rerun", At::Anywhere),
+    // A row's Ready: the handler lets an agent's draft be marked ready by its person, or one with
+    // `diffs.land` on the repository its body names (W26-R18).
+    r("POST", "/api/ship/ready", "diffs.submit", At::Anywhere),
     // Each verb's own right on the repository is asked inside (`ship::jobs`): retry, cancel, pause.
     r("POST", "/api/ship/jobs", "runs.read", At::Anywhere),
     // Each verb is its CD operation, asked inside as `/api/cd`'s route asks it (`ship::deploys::act`):
@@ -647,6 +653,8 @@ pub static ROUTES: &[Rule] = &[
     r("GET", "/api/agents/*/diagnose", "runners.read", At::Runner(2)),
     r("POST", "/api/agents/*/repair", "runners.manage", At::Runner(2)),
     r("POST", "/api/agents/*/drain", "runners.manage", At::Runner(2)),
+    // The name people see for a runner (docs/machines.md).
+    r("POST", "/api/agents/*/label", "runners.manage", At::Runner(2)),
     r("POST", "/api/agents/*/probe", "runners.manage", At::Runner(2)),
     r("DELETE", "/api/agents/*", "runners.manage", At::Runner(2)),
     // Identities kiln's CA issued (W27-R01): revocations read by those who read runners, made by

@@ -1,0 +1,34 @@
+[package]
+name = "mantle-range"
+description = "A range replica: hyper-raft's durable shell, its core inside, over the shared log and a state engine"
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[dependencies]
+# The shared Raft core, its durable shell, the shared log and its block layer, vendored from
+# hyper-raft (vendor/*/SNAPSHOT, vendor/UPSTREAM.md).
+hyper-block = { path = "../../../hyper-raft/crates/hyper-block" }
+hyper-durable = { path = "../../../hyper-raft/crates/hyper-durable" }
+hyper-log = { path = "../../../hyper-raft/crates/hyper-log" }
+hyper-raft = { path = "../../../hyper-raft/crates/hyper-raft" }
+mantle-codec = { path = "../codec" }
+mantle-crc = { path = "../crc" }
+# The engine a node keeps a range's rows in (`stored`).
+mantle-engine = { path = "../engine" }
+mantle-meta = { path = "../meta" }
+thiserror.workspace = true
+
+[dev-dependencies]
+hyper-block = { path = "../../../hyper-raft/crates/hyper-block", features = ["sim"] }
+# A waker the log's answer wakes a test's member by, its slot leaked once a waker.
+hyper-measure = { path = "../../../hyper-raft/crates/hyper-measure" }
+proptest.workspace = true
+tempfile.workspace = true
+
+[lints]
+workspace = true

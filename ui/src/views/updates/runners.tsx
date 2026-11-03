@@ -15,7 +15,7 @@ import { Button } from "@/components/ui/button";
 import { Confirm } from "@/components/ui/misc";
 import { StatusDot } from "@/components/ui/status";
 import { toast } from "@/components/ui/toast";
-import { fuller, useUpdateJobs } from "@/lib/data";
+import { fuller, labelOf, useLabels, useUpdateJobs } from "@/lib/data";
 import { formatDuration, shortSha } from "@/lib/format";
 import { errorMessage, useNow } from "@/lib/hooks";
 import { invalidate, useSuspenseResource, type SuspenseResource } from "@/lib/resource";
@@ -72,6 +72,7 @@ export interface MachinesProps {
 }
 
 export function MachinesPanel({ resource, fleet, server, serverJob, serverPending, summary, picked }: MachinesProps) {
+  useLabels();
   const data = resource.data;
   const newest = data.newest ?? null;
   const [confirm, setConfirm] = React.useState<Confirming | null>(null);
@@ -134,12 +135,12 @@ export function MachinesPanel({ resource, fleet, server, serverJob, serverPendin
       if (job.state === "failed") throw new Error(job.error ?? "The upgrade couldn't start.");
       toggleOutput(r.name, true);
       toast({
-        title: way === "build" ? (job.on ? `Building kiln for ${r.name} on ${job.on}` : `Building kiln on ${r.name}`) : `Upgrading ${r.name}`,
+        title: way === "build" ? (job.on ? `Building kiln for ${labelOf(r.name)} on ${labelOf(job.on)}` : `Building kiln on ${labelOf(r.name)}`) : `Upgrading ${labelOf(r.name)}`,
         description: "Its terminals, agents and jobs keep running.",
         tone: "running",
       });
     } catch (e) {
-      toast.error(`Couldn't upgrade ${r.name}`, errorMessage(e));
+      toast.error(`Couldn't upgrade ${labelOf(r.name)}`, errorMessage(e));
       throw e;
     } finally {
       readAgainSoon();
@@ -160,7 +161,7 @@ export function MachinesPanel({ resource, fleet, server, serverJob, serverPendin
       resource.setData((prev) => ({ ...prev, runners: prev.runners.map((r) => (names.includes(r.name) ? { ...r, policy } : r)) }));
       setPolicyErrors((prev) => Object.fromEntries(Object.entries(prev).filter(([key]) => key !== scope && !names.some((name) => key === `runner:${name}`))));
       if (isBulk) setSelected((prev) => new Set([...prev].filter((name) => !names.includes(name))));
-      toast.success("Update policy saved", `${names.length === 1 ? one : plural(names.length, "runner")}: ${POLICIES.find((p) => p.value === policy)?.label}`);
+      toast.success("Update policy saved", `${names.length === 1 ? labelOf(one ?? "") : plural(names.length, "runner")}: ${POLICIES.find((p) => p.value === policy)?.label}`);
     } catch (e) {
       setPolicyErrors((prev) => ({ ...prev, [scope]: `Couldn't save the update policy. ${errorMessage(e)}` }));
     } finally {
@@ -210,10 +211,11 @@ export function MachinesPanel({ resource, fleet, server, serverJob, serverPendin
     const build = way === "build";
     const failedWay = offer.failed ? wayOf(offer.failed) : null;
     const chosen = offer.open.find((w) => w.way === way);
-    const where = build && chosen?.on ? `for ${r.name} on ${chosen.on}` : `on ${r.name}`;
+    const shown = labelOf(r.name);
+    const where = build && chosen?.on ? `for ${shown} on ${labelOf(chosen.on)}` : `on ${shown}`;
     setConfirm({
       scope: `runner:${r.name}`,
-      title: again ? (build ? `Try building kiln ${where} again?` : `Try upgrading ${r.name} again?`) : build ? `Build the newest kiln ${where}?` : `Upgrade ${r.name}?`,
+      title: again ? (build ? `Try building kiln ${where} again?` : `Try upgrading ${shown} again?`) : build ? `Build the newest kiln ${where}?` : `Upgrade ${shown}?`,
       lead: "What will happen:",
       plan: <RunnerPlan r={r} newest={newest} build={build} on={build ? chosen?.on : undefined} why={chosen?.why} />,
       confirmLabel: again ? "Try again" : build ? "Build and upgrade" : "Upgrade",
@@ -337,7 +339,12 @@ export function MachinesPanel({ resource, fleet, server, serverJob, serverPendin
             onOutput={() => toggleOutput(e.r.name)}
             onUpload={() => e.r.target && uploads.choose(e.r.target)}
             onAskAgent={(findings) =>
-              startFrom(navigate, { from: `From System → Updates: ${e.r.name}`, target: `agent:${e.r.name}`, cwd: e.r.checkout ?? undefined, prompt: diagnosisPrompt(e.r, e.job, newest, findings) })
+              startFrom(navigate, {
+                from: `From System → Updates: ${labelOf(e.r.name)}`,
+                target: `agent:${e.r.name}`,
+                cwd: e.r.checkout ?? undefined,
+                prompt: diagnosisPrompt(e.r, e.job, newest, findings),
+              })
             }
             onChangeWaits={(w) => setWaitsEditing({ focus: w ?? "upgrade" })}
           />
@@ -594,8 +601,9 @@ function PolicySelect({ label, value, onChange, disabled }: { label: string; val
 /** "Waits for the release build of 31c0bba: run #232, its build step, on adacachy, 11m 04s in",
  * the run a link and its time ticking. */
 function ReleaseWaitWords({ w, newest }: { w: ReleaseWait; newest: FleetTarget | null }) {
+  useLabels();
   const nowS = useNow() / 1000;
-  const parts = [w.step ? `its ${w.step} step` : null, w.on ? `on ${w.on}` : null, w.since ? `${formatDuration(nowS - w.since)} in` : null].filter(Boolean);
+  const parts = [w.step ? `its ${w.step} step` : null, w.on ? `on ${labelOf(w.on)}` : null, w.since ? `${formatDuration(nowS - w.since)} in` : null].filter(Boolean);
   return (
     <>
       Waits for the release build{newest ? ` of ${shortSha(newest.commit)}` : ""}: <Link to={`/runs/${w.run}`}>run #{w.number}</Link>
@@ -644,12 +652,15 @@ function RunnerRows({
   onAskAgent: (findings: RunnerFinding[]) => void;
   onChangeWaits: (which: UpdateJob["timed_out"]) => void;
 }) {
+  useLabels();
   const { r, job, view } = e;
   const offer = upgradeOffer(r, job);
   const failedWay = offer.failed ? wayOf(offer.failed) : null;
   const primary = offer.actionable && !plan ? offer.open[0] : undefined;
   const saving = policyPending !== undefined;
-  const hostDiffers = r.hostname.toLowerCase() !== r.name.toLowerCase();
+  // Named as people know it (its label; its name, the machine id, on hover), its host name beside that when it's another.
+  const shown = labelOf(r.name);
+  const hostDiffers = r.hostname.toLowerCase() !== shown.toLowerCase();
   const builds = [`installed build ${r.build ?? "not reported"}`, r.target_build ? `available build ${r.target_build}` : null, r.from ? `source: ${r.from}` : null].filter(Boolean).join(" · ");
   const [diag, setDiag] = React.useState<Diagnosing | null>(null);
   const look = async () => {
@@ -685,13 +696,13 @@ function RunnerRows({
             checked={selected}
             disabled={selectionDisabled || r.locked}
             onChange={(ev) => onSelect(ev.target.checked)}
-            aria-label={`Select ${r.name}`}
+            aria-label={`Select ${shown}`}
             title={r.locked ? "Update policy is locked on this machine" : undefined}
           />
         </td>
         <td className="up-c-name">
           <span className="up-name" title={r.name}>
-            {r.name}
+            {shown}
           </span>
           <span className="up-sub" title={hostDiffers ? `hostname ${r.hostname}` : undefined}>
             {r.os} · {r.arch}
@@ -719,7 +730,7 @@ function RunnerRows({
           {r.locked ? (
             <span className="up-sub up-policy-words">Locked on its machine</span>
           ) : (
-            <PolicySelect label={`Updates for ${r.name}`} value={policyPending ?? r.policy} onChange={onPolicy} disabled={saving || selectionDisabled} />
+            <PolicySelect label={`Updates for ${shown}`} value={policyPending ?? r.policy} onChange={onPolicy} disabled={saving || selectionDisabled} />
           )}
           {saving && (
             <span className="up-saving" role="status">
@@ -790,7 +801,7 @@ function RunnerRows({
               <DoctorLine runner={r.name} />
             </React.Suspense>
             {plan}
-            {diag && <DiagnosisPanel name={r.name} s={diag} onRepair={(f) => void repair(f)} onAgain={() => void look()} onAskAgent={onAskAgent} />}
+            {diag && <DiagnosisPanel name={shown} s={diag} onRepair={(f) => void repair(f)} onAgain={() => void look()} onAskAgent={onAskAgent} />}
             {job && output && <UpgradeLog key={job.id} job={job} onChangeWaits={() => onChangeWaits(job.timed_out)} />}
           </div>
         </td>
@@ -800,21 +811,24 @@ function RunnerRows({
 }
 
 function RunnerPlan({ r, newest: target, build, on, why }: { r: RunnerUpdate; newest: FleetTarget | null; build: boolean; on?: string; why?: string }) {
+  useLabels();
   const newest = r.instances.find((i) => i.newest);
   const inPlace = r.method === "native" && newest !== undefined && newest.id !== "main" && !newest.legacy;
   const of = target ? ` (${shortSha(target.commit)})` : "";
   const to = r.target_build ? `build ${r.target_build}${of}` : `the ${r.target ?? ""} build (this version's GitHub release, if one is published)`;
+  const shown = labelOf(r.name);
+  const builder = on ? labelOf(on) : undefined;
   return (
     <ul className="up-plan">
       {build && on ? (
         <>
           <li>
-            {why ?? `${on} builds ${target ? shortSha(target.commit) : "the newest kiln"} for ${r.target ?? "its platform"}`}. The build runs in a terminal kiln opens on {on} (it won&rsquo;t appear
-            among your terminals): it fetches the source from this server, builds it in <code>~/.cache/kiln/self-build</code> and hands the binary back to this server. Neither machine needs a checkout
-            of kiln.
+            {why ?? `${builder} builds ${target ? shortSha(target.commit) : "the newest kiln"} for ${r.target ?? "its platform"}`}. The build runs in a terminal kiln opens on {builder} (it won&rsquo;t
+            appear among your terminals): it fetches the source from this server, builds it in <code>~/.cache/kiln/self-build</code> and hands the binary back to this server. Neither machine needs a
+            checkout of kiln.
           </li>
           <li>
-            Then {r.name} downloads it from this server, checks its SHA-256 and runs <code>kiln install --agent --upgrade</code>. The other machines of its platform download the same build.
+            Then {shown} downloads it from this server, checks its SHA-256 and runs <code>kiln install --agent --upgrade</code>. The other machines of its platform download the same build.
           </li>
         </>
       ) : build ? (
@@ -822,11 +836,11 @@ function RunnerPlan({ r, newest: target, build, on, why }: { r: RunnerUpdate; ne
           <li>
             {r.how === "build" ? (
               <>
-                No binary of {target ? shortSha(target.commit) : "the newest kiln"} exists for {r.target ?? "its platform"} yet, so {r.name} builds it
+                No binary of {target ? shortSha(target.commit) : "the newest kiln"} exists for {r.target ?? "its platform"} yet, so {shown} builds it
               </>
             ) : (
               <>
-                {r.name} builds {target ? shortSha(target.commit) : "the newest kiln"} itself rather than downloading it
+                {shown} builds {target ? shortSha(target.commit) : "the newest kiln"} itself rather than downloading it
               </>
             )}
             : kiln opens a terminal on it (it won&rsquo;t appear among your terminals) that fetches the source from this server, builds it in <code>~/.cache/kiln/self-build</code> and runs{" "}
@@ -837,11 +851,11 @@ function RunnerPlan({ r, newest: target, build, on, why }: { r: RunnerUpdate; ne
         </>
       ) : r.method === "native" ? (
         <li>
-          {r.name} downloads {to} from this server, checks its SHA-256 and runs <code>kiln install --agent --upgrade</code>.
+          {shown} downloads {to} from this server, checks its SHA-256 and runs <code>kiln install --agent --upgrade</code>.
         </li>
       ) : (
         <li>
-          {r.name}&rsquo;s runner predates upgrade commands, so kiln opens a terminal on it (it won&rsquo;t appear among your terminals), downloads {to} from this server, checks its SHA-256 and runs{" "}
+          {shown}&rsquo;s runner predates upgrade commands, so kiln opens a terminal on it (it won&rsquo;t appear among your terminals), downloads {to} from this server, checks its SHA-256 and runs{" "}
           <code>kiln install --agent --upgrade</code> there.
         </li>
       )}
@@ -853,18 +867,19 @@ function RunnerPlan({ r, newest: target, build, on, why }: { r: RunnerUpdate; ne
           retires.
         </li>
       )}
-      <li>Nothing running on {r.name} is stopped or restarted.</li>
+      <li>Nothing running on {shown} is stopped or restarted.</li>
     </ul>
   );
 }
 
 function AllPlan({ runners }: { runners: RunnerUpdate[] }) {
+  useLabels();
   return (
     <div>
       <ul className="up-plan">
         {runners.map((r) => (
           <li key={r.name}>
-            <strong className="font-medium text-[#d6dbe2]">{r.name}</strong>:{" "}
+            <strong className="font-medium text-[#d6dbe2]">{labelOf(r.name)}</strong>:{" "}
             {r.next ?? (
               <>
                 {r.target_build ? `to build ${r.target_build}` : `to the ${r.target ?? ""} build`},{" "}

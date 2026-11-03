@@ -131,6 +131,9 @@ enum Cmd {
     Spawn(kiln::harness::cli::SpawnArgs),
     /// List, stop, interrupt or message this kiln shell's agents.
     Agents(kiln::harness::cli::AgentsArgs),
+    /// A harness's hook before each of its tool calls (Codex's): kiln answers for the session.
+    #[command(hide = true)]
+    HarnessHook(kiln::harness::cli::HarnessHookArgs),
     /// Run a command on a runner that has what it needs (`--needs cpus=8,mem=32g,linux/amd64`), or
     /// on one by name (`--on <name>`): this repo is synced over first, output streams back, and the
     /// exit code is the command's.
@@ -917,6 +920,7 @@ async fn real_main(cli: Cli) -> anyhow::Result<()> {
         }
         Cmd::Spawn(a) => kiln::harness::cli::spawn(a),
         Cmd::Agents(a) => kiln::harness::cli::agents(a),
+        Cmd::HarnessHook(a) => kiln::harness::cli::harness_hook(a),
         Cmd::Run(a) => {
             shutdown_on_signals(shutdown.clone());
             boxed(|| kiln::reach::cli::run(a, shutdown)).await

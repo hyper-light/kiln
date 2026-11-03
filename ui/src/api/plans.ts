@@ -248,9 +248,12 @@ export interface PlanRunBrief {
 export interface PlanRan {
   session: string;
   sent: number;
-  run: string;
+  /** None when it was approved instead (`approved`). */
+  run?: string;
   /** As goals, split into its acceptance criteria and tests: how many steps were. */
   split?: number;
+  /** Approved instead of run: its agent's goals waited on your review of it, and its `sent` steps go to that agent (`session`) as its goal's parts (docs/plans.md, "Reviewing a plan"). */
+  approved?: boolean;
 }
 
 /** Which of a plan's steps a run takes (`only`, by number), and as goals, each split into its acceptance criteria and tests (`split`). */

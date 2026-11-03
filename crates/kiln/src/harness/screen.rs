@@ -108,9 +108,12 @@ pub async fn open(hub: &Arc<Hub>, agent: &str, o: Open) -> anyhow::Result<Beside
         None => cfg!(windows),
         Some(m) => {
             let agents = hub.agents.lock();
-            let a = agents.get(m).filter(|a| a.connected).ok_or_else(|| anyhow::anyhow!("{m} is not connected"))?;
+            let Some(a) = agents.get(m).filter(|a| a.connected) else {
+                drop(agents);
+                anyhow::bail!("{} is not connected", hub.shown(m));
+            };
             if !a.terminal {
-                anyhow::bail!("{m} doesn't open terminals (its runner was started without them)");
+                anyhow::bail!("{} doesn't open terminals (its runner was started without them)", a.shown());
             }
             a.os == "windows"
         }

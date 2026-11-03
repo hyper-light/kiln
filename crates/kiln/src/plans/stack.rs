@@ -277,7 +277,7 @@ async fn make(hub: &Arc<Hub>, st: &mut Stack, m: &Met<'_>) -> Entry {
     let machine = crate::harness::wait::machine(&info.target).to_owned();
     if !st.machine.is_empty() && machine != st.machine {
         e.state = "elsewhere".to_owned();
-        e.error = Some(format!("its agent worked on {machine}, not {} where the stack is: its work is a change of its own (Open change request in its Changes)", st.machine));
+        e.error = Some(format!("its agent worked on {}, not {} where the stack is: its work is a change of its own (Open change request in its Changes)", hub.shown(&machine), hub.shown(&st.machine)));
         return e;
     }
     let facts = match facts_of(hub, &info).await {
@@ -446,7 +446,7 @@ async fn opened(hub: &Arc<Hub>, st: &mut Stack) {
                 let base = below.clone().unwrap_or_else(|| st.trunk.clone());
                 let branch = e.branch.clone().unwrap_or_default();
                 let opened = match (&host, &repo) {
-                    (Some(h), Some(r)) => match h.open_change(hub, r, &branch, &base, &e.title, &format!("Step {} of a plan run, on {base}.", e.n)).await {
+                    (Some(h), Some(r)) => match h.open_change(hub, r, &branch, &base, &e.title, &format!("Step {} of a plan run, on {base}.", e.n), false).await {
                         Ok(c) => Some((format!("#{}", c.number), c.url)),
                         Err(err) => {
                             tracing::info!(run = %st.run, step = e.n, error = %format!("{err:#}"), "a step's pull request didn't open: its branch is pushed");
@@ -473,6 +473,9 @@ async fn opened(hub: &Arc<Hub>, st: &mut Stack) {
         // The step's agent's own record of it.
         let now = crate::util::now_unix();
         let previous = change::of(hub, &e.agent).await;
+        let review = review.or_else(|| previous.as_ref().and_then(|p| p.review.clone()));
+        // A draft by its diff's state on kiln (W26-R18); a host's as it was.
+        let draft = review.as_deref().map(|s| s == "draft").or_else(|| previous.as_ref().and_then(|p| p.draft));
         let mut record = Record {
             agent: e.agent.clone(),
             repo: st.repo.clone(),
@@ -486,7 +489,8 @@ async fn opened(hub: &Arc<Hub>, st: &mut Stack) {
             files: e.files.clone(),
             title: e.title.clone(),
             state: previous.as_ref().map_or_else(|| "open".to_owned(), |p| p.state.clone()),
-            review: review.or_else(|| previous.as_ref().and_then(|p| p.review.clone())),
+            review,
+            draft,
             checks: previous.as_ref().and_then(|p| p.checks.clone()),
             fix_checks: previous.as_ref().is_none_or(|p| p.fix_checks),
             opened_at: previous.as_ref().map_or(now, |p| p.opened_at),
@@ -595,6 +599,13 @@ pub async fn amend(hub: &Arc<Hub>, actor: &str, info: &Info, want: &Want, run: &
             _ => None,
         })
         .collect();
+    // The threads it answers (W26-R18) ride on the push of the stack's top: kiln marks the version
+    // of the diff each is on. So does `ready`, its draft marked ready.
+    let answers = Want { draft: false, ..want.clone() }.ref_options()?;
+    let refs: Vec<Option<String>> = match (st.provider.as_str(), answers.strip_prefix('%')) {
+        ("kiln", Some(more)) => refs.into_iter().map(|r| r.map(|r| if r.contains('%') { format!("{r},{more}") } else { format!("{r}%{more}") })).collect(),
+        _ => refs,
+    };
     let opener = hub.store.kv_get(crate::mcp::opener_key(&info.id)).await.ok().flatten().unwrap_or_else(|| "owner".to_owned());
     let minted = if st.provider == "kiln" { Some(token(hub, &st, &info.id, &opener).await.map_err(|m| (StatusCode::FORBIDDEN, m))?) } else { None };
     let ask = Ask::Restack(Restack {

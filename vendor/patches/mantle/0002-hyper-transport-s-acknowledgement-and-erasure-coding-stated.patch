@@ -1,0 +1,20 @@
+Subject: hyper-transport's acknowledgement and erasure coding stated as before
+Why: hyper-raft's main, merged with Mantle's line for kiln's one copy, adds Limits::acknowledgement (its docs/transport.md §4ak) and Limits::fec_window (§4an); a node's transport states them as every connection had them before: decimated acknowledgements, for its streams of data, and no erasure coding
+
+diff --git a/crates/protocol/src/bounds.rs b/crates/protocol/src/bounds.rs
+index e17157ddc24eca133a19a96e4b5ea846a7ebcc96..d9e359828c58fbc754b82c0f18f0c01d4b72b869 100644
+--- a/crates/protocol/src/bounds.rs
++++ b/crates/protocol/src/bounds.rs
+@@ -220,6 +220,12 @@ pub fn limits(stated: &Stated) -> Result<Limits, Unfit> {
+         // pending places are taken (RFC 9000 §8.1.2), as before hyper-transport could count
+         // the handshakes' bytes instead.
+         retry_bytes: None,
++        // As every connection asked before hyper-transport let an endpoint choose (its
++        // docs/transport.md §4ak): a node's replication and a volume's chunks are streams of data
++        // whose congestion control waits on their acknowledgements.
++        acknowledgement: hyper_transport::Acknowledgement::Decimated,
++        // No forward erasure correction (§4an), as before it came.
++        fec_window: None,
+     })
+ }
+ 

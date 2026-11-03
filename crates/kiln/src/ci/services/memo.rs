@@ -399,10 +399,12 @@ async fn turn(hub: &Arc<Hub>, leg: &LegOf, unit: &Unit, step: u32) -> Result<Res
     Ok(match answer {
         flight::Answer::Execute { lease } => srv::json(StatusCode::CREATED, &json!({ "lease": lease })),
         flight::Answer::Alone => srv::status(StatusCode::NO_CONTENT),
-        flight::Answer::Wait { holder, domain, since, ahead, turn } => srv::json(
-            StatusCode::ACCEPTED,
-            &json!({ "in_flight": { "holder": holder, "said": holder.said(), "domain": domain, "since": since, "ahead": ahead, "turn": turn } }),
-        ),
+        flight::Answer::Wait { holder, domain, since, ahead, turn } => {
+            // What the waiter's log says of it: its runner by the name people see (`holder` keeps the
+            // name it's known by).
+            let said = flight::Holder { runner: hub.shown(&holder.runner), ..holder.clone() }.said();
+            srv::json(StatusCode::ACCEPTED, &json!({ "in_flight": { "holder": holder, "said": said, "domain": domain, "since": since, "ahead": ahead, "turn": turn } }))
+        }
     })
 }
 

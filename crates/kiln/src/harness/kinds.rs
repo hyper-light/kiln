@@ -140,6 +140,13 @@ impl Kind {
                 if let Some((kiln, sock, prefer)) = local_tools(spec) {
                     p.args(crate::reach::mcp::codex_config(&kiln, sock, prefer, session));
                 }
+                // kiln's hook before each tool call, trusted for this session alone: what holds a
+                // subagent (a pause, what it may do) holds its calls (docs/agents.md). It asks this
+                // runner process, which runs the session, else the machine's socket.
+                #[cfg(unix)]
+                if let (Some(sock), Ok(kiln)) = (super::socket::own_served().or_else(super::socket::served), crate::os::this_kiln()) {
+                    p.args(super::codex::hook_args(&kiln, sock));
+                }
             }
             Protocol::Acp(args) => {
                 p.args(args);
@@ -215,6 +222,18 @@ impl Kind {
                 tracing::warn!(error = %format!("{e:#}"), "kiln's page tools couldn't be allowed in Antigravity's settings: agy decides on them as on its other tools");
             }
         }
+        // kiln's hook in agy's own hooks.json, the only place agy reads hooks from: every
+        // conversation's tool calls, model calls and stops come to kiln, so a person's pause and
+        // what each subagent may do hold them (docs/agents.md). One agy runs outside kiln passes.
+        #[cfg(unix)]
+        if self.protocol == Protocol::AgyStreamJson
+            && let Ok(kiln) = crate::os::this_kiln()
+        {
+            let hooks = crate::os::home_dir().join(".gemini/config/hooks.json");
+            if let Err(e) = crate::rt::blocking(move || agy_hooks_in(&hooks, &kiln.to_string_lossy())).await.and_then(|r| r) {
+                tracing::warn!(error = %format!("{e:#}"), "kiln's hook couldn't be put in Antigravity's hooks.json: its subagents can't be paused or limited");
+            }
+        }
     }
 }
 
@@ -233,6 +252,24 @@ fn agy_allow_in(path: &std::path::Path) -> anyhow::Result<bool> {
         Err(e) => return Err(e.into()),
     };
     let Some(next) = crate::reach::mcp::agy_allow(&settings) else { return Ok(false) };
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir)?;
+    }
+    crate::runner::auth::write_private(path, &serde_json::to_vec_pretty(&next)?)?;
+    Ok(true)
+}
+
+/// kiln's hook entry for this kiln binary (`kiln`) in agy's hooks.json at `path`
+/// (`antigravity::hooks_with`): its other hooks kept, written whole and readable by its user alone,
+/// only when it differs; a file it can't read is left as it is. Whether it wrote.
+#[cfg(unix)]
+fn agy_hooks_in(path: &std::path::Path, kiln: &str) -> anyhow::Result<bool> {
+    let config = match std::fs::read(path) {
+        Ok(b) => serde_json::from_slice::<serde_json::Value>(&b)?,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => serde_json::json!({}),
+        Err(e) => return Err(e.into()),
+    };
+    let Some(next) = super::antigravity::hooks_with(&config, kiln) else { return Ok(false) };
     if let Some(dir) = path.parent() {
         std::fs::create_dir_all(dir)?;
     }
@@ -305,7 +342,7 @@ fn set_env(p: &mut Process, spec: &Spec) {
         p.env("KILN_REACH_SOCK", sock);
     }
     for (k, v) in &spec.env {
-        if !matches!(k.as_str(), "KILN_TERM_SESSION" | "KILN_HARNESS_SOCK" | "KILN_REACH_SOCK" | "TERM" | "COLUMNS" | "LINES") {
+        if !matches!(k.as_str(), "KILN_TERM_SESSION" | "KILN_HARNESS_SOCK" | "KILN_RUNNER_SOCK" | "KILN_REACH_SOCK" | "TERM" | "COLUMNS" | "LINES") {
             p.env(k, v);
         }
     }
@@ -314,6 +351,12 @@ fn set_env(p: &mut Process, spec: &Spec) {
     if let Some(sock) = super::socket::served() {
         p.env("KILN_HARNESS_SOCK", sock);
     }
+    // What it asks goes to this process, which runs it and holds its key (W27-R03), whichever
+    // process of the machine serves the machine's socket.
+    match super::socket::own_served() {
+        Some(sock) => p.env("KILN_RUNNER_SOCK", sock),
+        None => p.env_remove("KILN_RUNNER_SOCK"),
+    };
     for k in super::claude::SCRUB_ENV {
         p.env_remove(k);
     }
@@ -441,7 +484,8 @@ impl Adapter {
         match self {
             Self::Claude(a) => a.send_task(core, &t, m, mode),
             Self::Codex(a) => a.send_task(core, &t, m, mode),
-            Self::Acp(_) | Self::Agy(_) => super::subagent::refuse(core, task, &m, "its harness takes no message for it from kiln."),
+            Self::Acp(a) => a.send_task(core, &t, m),
+            Self::Agy(a) => a.send_task(core, &t, m, mode),
         }
     }
 
@@ -451,8 +495,20 @@ impl Adapter {
         match self {
             Self::Claude(a) => super::subagent::settle(core, |core, t| a.takes(core, t)),
             Self::Codex(a) => super::subagent::settle(core, |core, t| a.takes(core, t)),
-            Self::Acp(_) | Self::Agy(_) => super::subagent::settle(core, |_, _| (Vec::new(), None)),
+            Self::Acp(a) => super::subagent::settle(core, |core, t| a.takes(core, t)),
+            Self::Agy(a) => super::subagent::settle(core, |core, t| a.takes(core, t)),
         }
+        // Held at its next tool call: Claude Code asks kiln before each (`claude::HOLD_HOOK`), and so
+        // does Codex once it trusts kiln's hook (`codex::hook_args`).
+        let can = match self {
+            Self::Claude(_) => true,
+            Self::Codex(a) => a.holds_calls(),
+            // At each call an ACP agent asks about, where it names its subagent (opencode's).
+            Self::Acp(_) => true,
+            // And Antigravity, once kiln's hook in its hooks.json is heard (`antigravity::hooks_with`).
+            Self::Agy(a) => a.holds_calls(),
+        };
+        super::subagent::settle_pausable(core, |t| can && t.tool_id.is_some());
     }
 
     /// What waits for its subagents goes to each that can take it now (one at a time each).
@@ -460,7 +516,8 @@ impl Adapter {
         match self {
             Self::Claude(a) => a.drain_subagents(core),
             Self::Codex(a) => a.drain_subagents(core),
-            Self::Acp(_) | Self::Agy(_) => {}
+            Self::Acp(a) => a.drain_subagents(core),
+            Self::Agy(_) => {}
         }
         self.settle_subagents(core);
     }
@@ -589,6 +646,29 @@ impl Adapter {
             Self::Agy(a) => a.room(core),
         }
         self.drain_subagents(core);
+    }
+
+    /// What the person lets the session do changed (`Command::Perms` for the whole session): what
+    /// only its harness's own settings hold follows (Codex's web search).
+    pub fn perms_changed(&mut self, core: &mut Core) {
+        if let Self::Codex(a) = self {
+            a.perms_changed(core);
+        }
+    }
+
+    /// Its harness's hook asks before a tool call (`input`): the answer goes to `reply`, at once or
+    /// once a person lets the call go (`hold`). Codex's and Antigravity's hooks ask this way; Claude
+    /// Code's comes over its own control protocol.
+    pub fn hook(&mut self, core: &mut Core, input: serde_json::Value, reply: futures::channel::oneshot::Sender<serde_json::Value>) {
+        match self {
+            Self::Codex(a) => a.hook(core, input, reply),
+            Self::Agy(a) => a.hook(core, input, reply),
+            Self::Claude(_) | Self::Acp(_) => {
+                let _ = reply.send(serde_json::json!({}));
+            }
+        }
+        // What the hook told of its subagents (Antigravity's: one ended, its hook heard).
+        self.settle_subagents(core);
     }
 
     /// Something waits to go to its harness: kiln's queue, what its adapter holds till its harness
@@ -907,6 +987,55 @@ mod tests {
         Ok(())
     }
 
+    /// kiln's hook goes into agy's hooks.json beside the person's own, once, for this kiln binary
+    /// (another rewrites it); hooks it can't read are left as they are. Run as agy runs it (a
+    /// shell), it hands each event to this kiln, and where the binary is gone (a version pruned,
+    /// kiln uninstalled) it passes, so the person's own agy goes on as without kiln.
+    #[cfg(unix)]
+    #[test]
+    fn antigravitys_hooks_get_kilns_hook_once() -> anyhow::Result<()> {
+        use std::os::unix::fs::PermissionsExt as _;
+        let dir = tempfile::tempdir()?;
+        let path = dir.path().join("config/hooks.json");
+        let read = |p: &std::path::Path| -> anyhow::Result<serde_json::Value> { Ok(serde_json::from_slice(&std::fs::read(p)?)?) };
+        let command = |v: &serde_json::Value, ev: &str| v.pointer(&format!("/kiln/{ev}/0/hooks/0/command")).or_else(|| v.pointer(&format!("/kiln/{ev}/0/command"))).and_then(serde_json::Value::as_str).map(str::to_owned).unwrap_or_default();
+        let run = |command: &str| -> anyhow::Result<String> { Ok(String::from_utf8(std::process::Command::new("sh").arg("-c").arg(command).output()?.stdout)?.trim().to_owned()) };
+        let gone = dir.path().join("versions/old/kiln");
+        let gone = gone.to_string_lossy();
+        assert!(agy_hooks_in(&path, &gone)?);
+        let made = read(&path)?;
+        assert_eq!(made.pointer("/kiln/PreToolUse/0/matcher"), Some(&serde_json::json!("*")));
+        assert_eq!(made.pointer("/kiln/PreToolUse/0/hooks/0/timeout"), Some(&serde_json::json!(super::super::antigravity::HOOK_FOR_S)));
+        // Its binary gone: each event passes.
+        assert_eq!(run(&command(&made, "PreToolUse"))?, r#"{"decision":"allow"}"#);
+        assert_eq!(run(&command(&made, "PreInvocation"))?, "{}");
+        assert_eq!(run(&command(&made, "Stop"))?, r#"{"decision":""}"#);
+        // There: the event goes to it (a stand-in that says what it was asked), a path with a
+        // space and a quote in it too.
+        let bin = dir.path().join("it's kiln/kiln");
+        std::fs::create_dir_all(bin.parent().ok_or_else(|| anyhow::anyhow!("no parent"))?)?;
+        std::fs::write(&bin, "#!/bin/sh\necho \"$@\"\n")?;
+        std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755))?;
+        assert!(agy_hooks_in(&path, &bin.to_string_lossy())?);
+        let there = read(&path)?;
+        assert_eq!(run(&command(&there, "PreToolUse"))?, "harness-hook --agy PreToolUse");
+        assert_eq!(run(&command(&there, "Stop"))?, "harness-hook --agy Stop");
+        // The person's own: kept; once there, left alone; another kiln, rewritten.
+        std::fs::write(&path, r#"{"lint":{"PostToolUse":[{"matcher":"write_to_file","hooks":[{"command":"./lint.sh"}]}]}}"#)?;
+        assert!(agy_hooks_in(&path, "/k/kiln")?);
+        let kept = read(&path)?;
+        assert_eq!(kept.pointer("/lint/PostToolUse/0/hooks/0/command"), Some(&serde_json::json!("./lint.sh")));
+        assert!(command(&kept, "PreInvocation").contains("k='/k/kiln';"));
+        assert_eq!(std::fs::metadata(&path)?.permissions().mode() & 0o777, 0o600);
+        assert!(!agy_hooks_in(&path, "/k/kiln")?);
+        assert!(agy_hooks_in(&path, "/k2/kiln")?);
+        assert!(read(&path)?.get("lint").is_some());
+        std::fs::write(&path, "{not json")?;
+        assert!(agy_hooks_in(&path, "/k/kiln").is_err());
+        assert_eq!(std::fs::read(&path)?, b"{not json");
+        Ok(())
+    }
+
     #[test]
     fn devin_runs_its_acp_protocol_and_keeps_its_terminal_interface() -> anyhow::Result<()> {
         let kind = Kind::get("devin").ok_or_else(|| anyhow::anyhow!("no Devin harness"))?;
@@ -1082,12 +1211,8 @@ mod tests {
         core.state.queue.iter().map(|q| q.id.as_str()).collect()
     }
 
-    /// The "Tabs UI" agent's first message (2026-10-31), sent as Codex started: Codex's adapter held
-    /// it for the thread to open, shown queued by the agent. The switch to Claude Code went at once
-    /// (nothing was under way) and ended Codex's process, its adapter with it: the message was
-    /// never sent anywhere, and said queued for good. Now a harness's process ending lets go of what
-    /// its adapter held: first in kiln's queue, still shown queued where it was said, the harness
-    /// after it takes it once it's up, and the rest after it in order (CP-T3.2).
+    /// CP-T3.2: a switch out of Codex before its thread opens leaves its messages in kiln's
+    /// durable queue, in order. Claude Code takes them once ready, each shown sent only then.
     #[test]
     fn a_message_held_for_a_harness_that_ends_goes_to_the_one_after_it() {
         use super::super::model::{Delivery, Status};
@@ -1096,13 +1221,13 @@ mod tests {
         codex.start(&mut core);
         codex.command(&mut core, message("m1", "Plans and Research, one tab each"));
         codex.command(&mut core, message("m2", "Research searchable, its results as cards"));
-        assert_eq!([core.state.delivery.get("m1"), core.state.delivery.get("m2")], [Some(&Delivery::Queued); 2]);
-        let said = core.get("m1").map(|e| e.seq);
-        assert!(said.is_some() && core.state.queue.is_empty(), "held by Codex's adapter, shown");
+        assert_eq!(queue(&core), ["m1", "m2"]);
+        assert_eq!([core.state.delivery.get("m1"), core.state.delivery.get("m2")], [None; 2]);
+        assert!(core.get("m1").is_none() && core.get("m2").is_none(), "unsent messages stay in the durable queue");
         // The switch: Codex's process ends.
         codex.exited(&mut core, None, None);
         assert_eq!(queue(&core), ["m1", "m2"]);
-        assert_eq!([core.state.delivery.get("m1"), core.state.delivery.get("m2")], [Some(&Delivery::Queued); 2], "still shown queued");
+        assert_eq!([core.state.delivery.get("m1"), core.state.delivery.get("m2")], [None; 2]);
         // Claude Code, once up, takes the first; the next once that's done.
         core.state.exit = None;
         core.set_status(Status::Starting);
@@ -1112,7 +1237,7 @@ mod tests {
         claude.line(&mut core, &serde_json::json!({"type": "control_response", "response": {"subtype": "success", "request_id": init, "response": {}}}).to_string());
         assert_eq!(wrote(&mut core, "").0, ["m1"]);
         assert_eq!(core.state.delivery.get("m1"), Some(&Delivery::Sent));
-        assert_eq!(core.get("m1").map(|e| e.seq), said, "where it was said");
+        assert!(core.get("m1").is_some() && core.get("m2").is_none(), "only the message handed to Claude is shown sent");
         assert_eq!(queue(&core), ["m2"]);
         for line in [
             r#"{"type":"command_lifecycle","command_uuid":"m1","state":"started","uuid":"x","session_id":"s"}"#,
@@ -1126,9 +1251,8 @@ mod tests {
         assert!(core.state.queue.is_empty());
     }
 
-    /// An ACP agent (Devin, Gemini) holds a message till its session opens, as Codex does till its
-    /// thread does: one that ends first (it can't sign in, and is switched out of) lets go of it
-    /// the same way.
+    /// An ACP agent (Devin, Gemini) holds a message till its session opens: one that ends first
+    /// (it can't sign in, and is switched out of) lets go of it for the next harness.
     #[test]
     fn an_acp_agent_that_ends_before_its_session_opens_lets_go_of_what_it_held() {
         use super::super::model::Delivery;
@@ -1190,30 +1314,35 @@ mod tests {
         assert_eq!(wrote(&mut core, "").0, ["m2"]);
     }
 
-    /// A message held for a harness that ended waits in kiln's queue, shown queued where it was
-    /// said, and that's where its Edit and Unsend reach it: changed, the conversation says its new
-    /// words before it goes; taken back, it says it was dropped, never queued for good. One its
-    /// harness's adapter still holds is out of their reach, as before (`unsend.ts`).
+    /// CP-T3.2: Edit and Unsend reach Codex's startup queue before and after a crash. A legacy
+    /// message already shown in the conversation is changed or dropped there too.
     #[test]
     fn a_message_shown_waiting_in_kiln_s_queue_is_changed_and_taken_back_there() {
         use super::super::model::{Body, Delivery};
-        let mut core = Core::new();
-        let mut codex = Adapter::Codex(Box::new(Codex::new(None, None, None, false)));
-        codex.start(&mut core);
-        codex.command(&mut core, message("m1", "Plans"));
-        codex.command(&mut core, message("m2", "Research"));
-        codex.command(&mut core, Command::QueueRemove { id: "m2".into() });
-        assert_eq!(core.state.delivery.get("m2"), Some(&Delivery::Queued), "its adapter's: out of reach");
-        codex.exited(&mut core, None, None);
-        codex.command(&mut core, Command::QueueEdit { id: "m1".into(), text: "Plans, one tab".into(), attachments: None });
         let shown = |core: &Core, id: &str| match core.get(id).map(|e| &e.body) {
             Some(Body::User { text, .. }) => text.clone(),
             _ => String::new(),
         };
-        assert_eq!((shown(&core, "m1").as_str(), core.state.queue.first().map(|q| q.text.as_str())), ("Plans, one tab", Some("Plans, one tab")));
-        codex.command(&mut core, Command::QueueRemove { id: "m2".into() });
-        assert_eq!(queue(&core), ["m1"]);
-        assert_eq!(core.state.delivery.get("m2"), Some(&Delivery::Cancelled));
-        assert_eq!(shown(&core, "m2"), "Research", "still where it was said");
+        for legacy in [false, true] {
+            let mut core = Core::new();
+            let mut codex = Adapter::Codex(Box::new(Codex::new(None, None, None, false)));
+            codex.start(&mut core);
+            codex.command(&mut core, message("m1", "Plans"));
+            codex.command(&mut core, message("m2", "Research"));
+            if legacy {
+                for (id, text) in [("m1", "Plans"), ("m2", "Research")] {
+                    core.state.delivery.insert(id.into(), Delivery::Queued);
+                    core.upsert(id, None, Body::User { text: text.into(), images: 0, client_id: Some(id.into()), origin: None, attachments: Vec::new(), reply_to: None });
+                }
+            }
+            codex.command(&mut core, Command::QueueRemove { id: "m2".into() });
+            assert_eq!(queue(&core), ["m1"], "Unsend reaches startup work");
+            assert_eq!(core.state.delivery.get("m2"), legacy.then_some(&Delivery::Cancelled));
+            codex.exited(&mut core, None, None);
+            codex.command(&mut core, Command::QueueEdit { id: "m1".into(), text: "Plans, one tab".into(), attachments: None });
+            assert_eq!(core.state.queue.first().map(|q| q.text.as_str()), Some("Plans, one tab"));
+            assert_eq!(shown(&core, "m1"), if legacy { "Plans, one tab" } else { "" });
+            assert_eq!(shown(&core, "m2"), if legacy { "Research" } else { "" });
+        }
     }
 }

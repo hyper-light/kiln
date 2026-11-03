@@ -47,8 +47,6 @@ const REPORT_IN: Duration = Duration::from_secs(90);
 const RELEASE_TTL: Duration = Duration::from_secs(15 * 60);
 /// How long an image check stays good.
 const IMAGE_TTL: Duration = Duration::from_secs(10 * 60);
-/// Largest binary accepted for upload or from a release.
-pub const MAX_BINARY: usize = 256 << 20;
 /// Terminal sessions kiln opens to upgrade older runners carry this in their command: they are
 /// never listed (no one's terminal tab), also after a restart that adopts them back.
 pub const HIDDEN_MARK: &str = "# kiln-upgrade ";
@@ -448,15 +446,80 @@ fn executable(bytes: &[u8]) -> bool {
     bytes.starts_with(b"\x7fELF") || bytes.starts_with(b"MZ") || bytes.starts_with(&[0xcf, 0xfa, 0xed, 0xfe]) || bytes.starts_with(&[0xca, 0xfe, 0xba, 0xbe])
 }
 
-/// Keep `bytes` as the binary for `target` (an upload, or a release download).
-pub async fn store(hub: &Hub, target: &str, bytes: Vec<u8>, origin: &str) -> anyhow::Result<Binary> {
-    keep(hub, target, bytes, origin, None, None).await
+/// The bytes at a file's start that say which program it is: ELF, PE and Mach-O each say it in
+/// their first four ([`executable`], [`runs_on`]).
+const MAGIC: usize = 4;
+
+/// A binary on its way in (an upload, a machine's build, a release fetched from GitHub, a file of
+/// a release run's artifacts): written to a file as its bytes come, and hashed as they pass. None
+/// is held whole in memory on its way in, so none is too large for kiln: what bounds one is the
+/// disk it's written to, then the store it's kept in.
+pub struct Arriving {
+    file: std::fs::File,
+    hash: Sha256,
+    so_far: Arrived,
+}
+
+/// A binary that arrived whole ([`Arriving::done`]): its file (removed when this goes), its
+/// SHA-256 and size, and its first [`MAGIC`] bytes.
+pub struct Arrived {
+    pub path: PathBuf,
+    pub sha256: String,
+    pub size: u64,
+    head: Vec<u8>,
+}
+
+impl Arriving {
+    /// One whose file is in `dir` (the server's `<data>/updates`).
+    pub fn new(dir: &Path) -> anyhow::Result<Self> {
+        std::fs::create_dir_all(dir).with_context(|| format!("create {}", dir.display()))?;
+        let path = dir.join(format!(".arriving-{}", crate::util::new_id()));
+        let file = std::fs::File::create(&path).with_context(|| format!("create {}", path.display()))?;
+        Ok(Self { file, hash: Sha256::new(), so_far: Arrived { path, sha256: String::new(), size: 0, head: Vec::new() } })
+    }
+
+    /// Its next bytes.
+    pub fn write(&mut self, bytes: &[u8]) -> anyhow::Result<()> {
+        use std::io::Write as _;
+        let room = MAGIC.saturating_sub(self.so_far.head.len()).min(bytes.len());
+        self.so_far.head.extend_from_slice(bytes.get(..room).unwrap_or_default());
+        self.hash.update(bytes);
+        self.so_far.size = self.so_far.size.saturating_add(u64::try_from(bytes.len()).unwrap_or(u64::MAX));
+        self.file.write_all(bytes).with_context(|| format!("write {}", self.so_far.path.display()))
+    }
+
+    /// All of it: on disk, and its SHA-256 taken.
+    pub fn done(mut self) -> anyhow::Result<Arrived> {
+        self.file.sync_all().with_context(|| format!("write {}", self.so_far.path.display()))?;
+        let hash = std::mem::replace(&mut self.hash, Sha256::new());
+        let mut done = std::mem::replace(&mut self.so_far, Arrived { path: PathBuf::new(), sha256: String::new(), size: 0, head: Vec::new() });
+        done.sha256 = hex::encode(hash.finalize());
+        Ok(done)
+    }
+}
+
+impl Drop for Arrived {
+    fn drop(&mut self) {
+        if !self.path.as_os_str().is_empty() {
+            let _ = std::fs::remove_file(&self.path);
+        }
+    }
+}
+
+/// Where binaries arrive on their way to being kept: the server's `<data>/updates`.
+pub fn arriving_dir(hub: &Hub) -> PathBuf {
+    hub.cfg.data("updates")
+}
+
+/// Keep the binary that `arrived` for `target` (an upload, or a release download).
+pub async fn store(hub: &Hub, target: &str, arrived: &Arrived, origin: &str) -> anyhow::Result<Binary> {
+    keep(hub, target, arrived, origin, None, None).await
 }
 
 /// Keep the binary `machine` built of `commit` for its own platform (`crate::fleet`): what the
 /// other machines of the platform download.
-pub async fn keep_built(hub: &Hub, target: &str, bytes: Vec<u8>, machine: &str, commit: &str) -> anyhow::Result<Binary> {
-    keep(hub, target, bytes, "machine", None, Some((machine.to_owned(), commit.to_ascii_lowercase()))).await
+pub async fn keep_built(hub: &Hub, target: &str, arrived: &Arrived, machine: &str, commit: &str) -> anyhow::Result<Binary> {
+    keep(hub, target, arrived, "machine", None, Some((machine.to_owned(), commit.to_ascii_lowercase()))).await
 }
 
 /// Whether a run's binaries become what runners upgrade to: kiln's own release pipeline, built
@@ -475,18 +538,19 @@ pub fn adopts(u: &crate::config::Updates, run: &crate::store::Run, own: &str) ->
 /// build from a run of the server's commit; a run of a newer one (`crate::fleet`) brings that
 /// platform's too.
 pub async fn adopt_into(hub: &Hub, artifacts: &Path, run: &crate::store::Run) -> anyhow::Result<Vec<Binary>> {
-    let (a, r) = (artifacts.to_path_buf(), run.clone());
-    let found = crate::rt::blocking(move || binaries_in(&a, &r)).await??;
+    let (a, r, dir) = (artifacts.to_path_buf(), run.clone(), arriving_dir(hub));
+    let found = crate::rt::blocking(move || binaries_in(&a, &r, &dir)).await??;
     let mut kept = Vec::new();
-    for (target, bytes) in found {
-        kept.push(keep(hub, &target, bytes, "built", Some((run.number, run.sha.clone())), None).await?);
+    for (target, arrived) in found {
+        kept.push(keep(hub, &target, &arrived, "built", Some((run.number, run.sha.clone())), None).await?);
     }
     Ok(kept)
 }
 
 /// The binaries in a release run's artifacts, by target, as [`adopt_into`] takes them: v1's
-/// tarball, or the zip a leg of the CI engine uploaded ([`leg_artifacts`]).
-fn binaries_in(artifacts: &Path, run: &crate::store::Run) -> anyhow::Result<Vec<(String, Vec<u8>)>> {
+/// tarball, or the zip a leg of the CI engine uploaded ([`leg_artifacts`]); each written out under
+/// `dir` on its way.
+fn binaries_in(artifacts: &Path, run: &crate::store::Run, dir: &Path) -> anyhow::Result<Vec<(String, Arrived)>> {
     use std::io::Read as _;
     let open = || std::fs::File::open(artifacts).with_context(|| format!("open {}", artifacts.display()));
     let mut magic = [0u8; 4];
@@ -497,7 +561,7 @@ fn binaries_in(artifacts: &Path, run: &crate::store::Run) -> anyhow::Result<Vec<
         for i in 0..zip.len() {
             let entry = zip.by_index(i)?;
             let (name, size) = (entry.name()?.into_owned(), entry.size());
-            if !entry.is_dir() && !take_binary(&name, size, entry, run, &mut kept)? {
+            if !entry.is_dir() && !take_binary(&name, size, entry, run, dir, &mut kept)? {
                 break;
             }
         }
@@ -506,7 +570,7 @@ fn binaries_in(artifacts: &Path, run: &crate::store::Run) -> anyhow::Result<Vec<
         for entry in archive.entries()? {
             let entry = entry?;
             let (path, size) = (entry.path()?.to_string_lossy().into_owned(), entry.size());
-            if !take_binary(&path, size, entry, run, &mut kept)? {
+            if !take_binary(&path, size, entry, run, dir, &mut kept)? {
                 break;
             }
         }
@@ -515,27 +579,35 @@ fn binaries_in(artifacts: &Path, run: &crate::store::Run) -> anyhow::Result<Vec<
 }
 
 /// One file of a release run's artifacts, `size` bytes at `path`: kept in `kept` when it's a
-/// platform's binary, read whole, and that platform's program. False when it was cut short, as is
-/// everything after it.
-fn take_binary(path: &str, size: u64, mut from: impl std::io::Read, run: &crate::store::Run, kept: &mut Vec<(String, Vec<u8>)>) -> anyhow::Result<bool> {
+/// platform's binary, whole, and that platform's program, written out under `dir` as it's read.
+/// False when it was cut short, as is everything after it.
+fn take_binary(path: &str, size: u64, mut from: impl std::io::Read, run: &crate::store::Run, dir: &Path, kept: &mut Vec<(String, Arrived)>) -> anyhow::Result<bool> {
     let name = path.rsplit('/').next().unwrap_or(path);
     let Some(target) = name.strip_prefix("kiln-").map(|t| t.strip_suffix(".exe").unwrap_or(t)) else { return Ok(true) };
-    if !known_target(target) || (target == crate::api::TARGET && run.sha.eq_ignore_ascii_case(crate::api::COMMIT)) || size > MAX_BINARY as u64 {
+    if !known_target(target) || (target == crate::api::TARGET && run.sha.eq_ignore_ascii_case(crate::api::COMMIT)) {
         return Ok(true);
     }
-    let mut bytes = Vec::with_capacity(usize::try_from(size).unwrap_or(0));
-    from.read_to_end(&mut bytes)?;
+    let mut arriving = Arriving::new(dir)?;
+    let mut buf = vec![0u8; crate::blobs::io::PIECE as usize];
+    loop {
+        let n = from.read(&mut buf)?;
+        if n == 0 {
+            break;
+        }
+        arriving.write(buf.get(..n).unwrap_or_default())?;
+    }
+    let arrived = arriving.done()?;
     // An archive cut short (its upload broke off) reads as a shorter file, with no error: never
     // one runners would upgrade to. Nor what isn't its platform's program.
-    if u64::try_from(bytes.len()).unwrap_or(u64::MAX) != size {
-        tracing::warn!(target, run = run.number, got = bytes.len(), size, "a release binary cut short in its run's artifacts: not kept");
+    if arrived.size != size {
+        tracing::warn!(target, run = run.number, got = arrived.size, size, "a release binary cut short in its run's artifacts: not kept");
         return Ok(false);
     }
-    if !runs_on(target, &bytes) {
+    if !runs_on(target, &arrived.head) {
         tracing::warn!(target, run = run.number, "a release binary that isn't its platform's program: not kept");
         return Ok(true);
     }
-    kept.push((target.to_owned(), bytes));
+    kept.push((target.to_owned(), arrived));
     Ok(true)
 }
 
@@ -774,15 +846,16 @@ async fn keep_in_step(hub: &Hub, commit: &str, starts: &mut Starts) -> anyhow::R
 
 /// Keeps `bytes` as the binary for `target` in kiln's store of bytes: the binary, then what kiln
 /// knows of it; a release run's (`built`), or a machine's own build (`by`: the machine and commit).
-async fn keep(hub: &Hub, target: &str, bytes: Vec<u8>, origin: &str, built: Option<(i64, String)>, by: Option<(String, String)>) -> anyhow::Result<Binary> {
+/// Keep what `arrived` as `target`'s binary: put in the store from its file (in parts past a single
+/// put, its SHA-256 checked before anything is replaced), never read whole into memory.
+async fn keep(hub: &Hub, target: &str, arrived: &Arrived, origin: &str, built: Option<(i64, String)>, by: Option<(String, String)>) -> anyhow::Result<Binary> {
     anyhow::ensure!(known_target(target), "kiln has no platform called {target}");
-    anyhow::ensure!(bytes.len() > 1 << 20, "that file is too small to be a kiln binary");
-    anyhow::ensure!(executable(&bytes), "that file is not an executable (ELF, Mach-O or PE)");
-    let size = bytes.len() as u64;
+    anyhow::ensure!(arrived.size > 1 << 20, "that file is too small to be a kiln binary");
+    anyhow::ensure!(executable(&arrived.head), "that file is not an executable (ELF, Mach-O or PE)");
     let blobs = &hub.blobs.blobs;
-    let kept = blobs.put(&binary_key(target), bytes, kiln_seams::blobs::Put::default()).await.map_err(|e| anyhow::anyhow!("keeping the binary for {target}: {e}"))?;
+    crate::blobs::io::put_file(blobs.as_ref(), &binary_key(target), &arrived.path, Some(&arrived.sha256)).await.map_err(|e| anyhow::anyhow!("keeping the binary for {target}: {e}"))?;
     let (run, sha) = built.map_or((None, None), |(n, s)| (Some(n), Some(s)));
-    let mut meta = Binary { target: target.to_owned(), build: build_id(&kept.etag), sha256: kept.etag, size, origin: origin.to_owned(), at: crate::util::now_unix(), run, sha, by: None };
+    let mut meta = Binary { target: target.to_owned(), build: build_id(&arrived.sha256), sha256: arrived.sha256.clone(), size: arrived.size, origin: origin.to_owned(), at: crate::util::now_unix(), run, sha, by: None };
     if let Some((machine, commit)) = by {
         meta.sha = Some(commit);
         meta.by = Some(machine);
@@ -844,16 +917,20 @@ pub(crate) async fn get_following(client: &crate::http::client::Client, url: &st
     anyhow::bail!("too many redirects from {url}")
 }
 
-/// Download a release asset (`None`: the release has no such asset).
-async fn download_release(version: &str, target: &str) -> anyhow::Result<Option<Vec<u8>>> {
+/// Download a release asset into a file under `dir` (`None`: the release has no such asset).
+async fn download_release(version: &str, target: &str, dir: &Path) -> anyhow::Result<Option<Arrived>> {
     let url = release_asset_url(version, target);
     let client = crate::http::client::Client::public()?;
-    let resp = get_following(&client, &url, Duration::from_secs(300)).await.with_context(|| format!("download {url}"))?;
+    let mut resp = get_following(&client, &url, Duration::from_secs(300)).await.with_context(|| format!("download {url}"))?;
     if resp.status() == 404 {
         return Ok(None);
     }
     anyhow::ensure!(resp.is_success(), "GitHub answered {} for {url}", resp.status());
-    Ok(Some(resp.bytes(MAX_BINARY).await?.to_vec()))
+    let mut arriving = Arriving::new(dir)?;
+    while let Some(chunk) = resp.chunk().await? {
+        arriving.write(&chunk)?;
+    }
+    Ok(Some(arriving.done()?))
 }
 
 /// The binary for `target`, made available at `/dl/kiln/<target>`: this server's own, one kept
@@ -866,13 +943,13 @@ pub async fn ensure_binary(hub: &Hub, target: &str) -> anyhow::Result<(String, u
         return Ok((b.sha256, b.size));
     }
     let version = env!("CARGO_PKG_VERSION");
-    let Some(bytes) = download_release(version, target).await? else {
+    let Some(arrived) = download_release(version, target, &arriving_dir(hub)).await? else {
         anyhow::bail!(
             "kiln has no binary for {target}: this server is {}, none was uploaded for {target}, and GitHub has no v{version} release with one. Upload a kiln binary for {target} under System → Builds.",
             crate::api::TARGET
         );
     };
-    let b = store(hub, target, bytes, "release").await?;
+    let b = store(hub, target, &arrived, "release").await?;
     Ok((b.sha256, b.size))
 }
 
@@ -1085,9 +1162,10 @@ impl Updates {
         let build = crate::fleet::newest_build(hub, machine);
         let commit = build.as_deref().and_then(|b| crate::fleet::runner_commit(hub, machine, Some(b)));
         if let (true, Some(build), Some(commit)) = (arrived_by_commit(&j, build.as_deref(), commit.as_deref()), build, commit) {
+            let shown = hub.shown(machine);
             self.update(hub, id, |j| {
                 j.reached = true;
-                push_line(j, format!("{machine} is running {} (build {build}, signed again on the machine)", crate::fleet::short(&commit)));
+                push_line(j, format!("{shown} is running {} (build {build}, signed again on the machine)", crate::fleet::short(&commit)));
             });
         }
     }
@@ -1208,10 +1286,11 @@ impl Updates {
             .filter(|j| j.awaits(machine, build))
             .map(|j| j.id.clone())
             .collect();
+        let shown = if ids.is_empty() { String::new() } else { hub.shown(machine) };
         for id in ids {
             self.update(hub, &id, |j| {
                 j.reached = true;
-                push_line(j, format!("{machine} is running build {build}"));
+                push_line(j, format!("{shown} is running build {build}"));
             });
             self.late(hub, &id);
         }
@@ -1421,8 +1500,11 @@ impl Policy {
 }
 
 /// Where a runner's policy is kept (none: the default).
+/// Where a machine's upgrade policy is kept, its name after it.
+pub(crate) const POLICY_PREFIX: &str = "updates/policy/";
+
 fn policy_key(machine: &str) -> String {
-    format!("updates/policy/{machine}")
+    format!("{POLICY_PREFIX}{machine}")
 }
 
 /// `machine`'s update policy: Notify unless someone chose otherwise.
@@ -1556,11 +1638,11 @@ pub async fn measure(hub: &Arc<Hub>) {
 }
 
 /// Where a build kiln hands out comes from, said for a person.
-pub fn from_words(b: &Binary) -> String {
+pub fn from_words(hub: &Hub, b: &Binary) -> String {
     match b.origin.as_str() {
         "server" => "this server's own build".to_owned(),
         "built" => b.run.map_or_else(|| "built by kiln's release pipeline".to_owned(), |n| format!("built by release run #{n}")),
-        "machine" => b.by.as_ref().map_or_else(|| "built by one of its machines".to_owned(), |m| format!("built by {m}")),
+        "machine" => b.by.as_ref().map_or_else(|| "built by one of its machines".to_owned(), |m| format!("built by {}", hub.shown(m))),
         "upload" => "uploaded here".to_owned(),
         "release" => "a GitHub release".to_owned(),
         other => other.to_owned(),
@@ -1618,7 +1700,7 @@ pub async fn runners(hub: &Arc<Hub>) -> Vec<RunnerInfo> {
         r.checkout = crate::fleet::reported(hub, &r.name).and_then(|k| k.checkout);
         let Some(t) = &newest else { continue };
         let b = r.target.as_deref().and_then(|target| crate::fleet::binary_for(hub, target, &t.commit));
-        r.from = b.as_ref().map(from_words);
+        r.from = b.as_ref().map(|b| from_words(hub, b));
         r.target_build = b.map(|b| b.build);
         let s = crate::fleet::standing(hub, r, t).await;
         r.up_to_date = s == crate::fleet::Standing::Current;
@@ -1649,17 +1731,18 @@ pub async fn upgrade_runner(hub: &Arc<Hub>, machine: &str, way: Option<Way>) -> 
         return Ok(j);
     }
     let r = runners(hub).await.into_iter().find(|r| r.name == machine).ok_or_else(|| anyhow::anyhow!("there is no runner called {machine}"))?;
-    anyhow::ensure!(r.policy != Policy::Off, "updates are off for {machine}: turn them on to upgrade it");
-    anyhow::ensure!(!r.locked, "{machine} refuses upgrades: its own kiln config says [updates] accept = false");
-    anyhow::ensure!(r.connected, "{machine} is not connected");
+    let shown = hub.shown(machine);
+    anyhow::ensure!(r.policy != Policy::Off, "updates are off for {shown}: turn them on to upgrade it");
+    anyhow::ensure!(!r.locked, "{shown} refuses upgrades: its own kiln config says [updates] accept = false");
+    anyhow::ensure!(r.connected, "{shown} is not connected");
     if let Some(t) = hub.updates.fleet.target() {
-        anyhow::ensure!(!r.up_to_date, "{machine} already runs the newest kiln ({})", crate::fleet::short(&t.commit));
+        anyhow::ensure!(!r.up_to_date, "{shown} already runs the newest kiln ({})", crate::fleet::short(&t.commit));
         let plan = match way {
             None => crate::fleet::plan(hub, &r, &t).await,
             Some(w) => {
                 let open = crate::fleet::ways(hub, &r, &t).await.into_iter().find(|o| o.way == w);
                 match open {
-                    Some(o) if !o.ok => anyhow::bail!("{machine} can't be upgraded that way: {}", o.why),
+                    Some(o) if !o.ok => anyhow::bail!("{shown} can't be upgraded that way: {}", o.why),
                     _ => crate::fleet::plan_by(hub, &r, &t, w)?,
                 }
             }
@@ -1668,10 +1751,10 @@ pub async fn upgrade_runner(hub: &Arc<Hub>, machine: &str, way: Option<Way>) -> 
             crate::fleet::Plan::Download(b) => upgrade_with(hub, &r, &b, "admin").await,
             crate::fleet::Plan::Build(b) => crate::fleet::build(hub, &r, &t.commit, &b, "admin").await,
             crate::fleet::Plan::Join { job, on } => crate::fleet::join(hub, &r, &t.commit, &job, &on, "admin").await,
-            crate::fleet::Plan::Wait(why) => anyhow::bail!("{machine} can't be upgraded yet: it {why}"),
+            crate::fleet::Plan::Wait(why) => anyhow::bail!("{shown} can't be upgraded yet: it {why}"),
         };
     }
-    anyhow::ensure!(way != Some(Way::Build), "{machine} can't build kiln itself while kiln knows no newest commit to build");
+    anyhow::ensure!(way != Some(Way::Build), "{shown} can't build kiln itself while kiln knows no newest commit to build");
     let target = r.target.clone().ok_or_else(|| anyhow::anyhow!("kiln has no build for {} on {}", r.os, r.arch))?;
     let (sha256, size) = ensure_binary(hub, &target).await?;
     let b = binaries(hub).into_iter().find(|b| b.target == target && b.sha256 == sha256).unwrap_or_else(|| Binary {
@@ -1702,17 +1785,18 @@ pub(crate) fn instance8(r: &RunnerInfo) -> String {
 /// stopped.
 pub async fn upgrade_with(hub: &Arc<Hub>, r: &RunnerInfo, b: &Binary, by: &str) -> anyhow::Result<Job> {
     let machine = &r.name;
+    let shown = hub.shown(machine);
     anyhow::ensure!(
         r.method == "native" || r.terminal,
-        "{machine} runs a kiln too old to upgrade itself and has terminals turned off: run `kiln install --agent --upgrade` with a new kiln binary on it"
+        "{shown} runs a kiln too old to upgrade itself and has terminals turned off: run `kiln install --agent --upgrade` with a new kiln binary on it"
     );
-    anyhow::ensure!(r.build.as_deref() != Some(b.build.as_str()), "{machine} already runs build {}", b.build);
+    anyhow::ensure!(r.build.as_deref() != Some(b.build.as_str()), "{shown} already runs build {}", b.build);
     let mut job = new_job("runner", machine, r.method, r.build.clone(), Some(b.build.clone()));
     job.commit.clone_from(&b.sha);
     let id = job.id.clone();
     hub.updates.insert(job.clone());
     hub.store.audit(by.into(), "upgrade.runner".into(), format!("{machine} to build {} ({}, {})", b.build, b.target, r.method)).await;
-    hub.updates.say(hub, &id, format!("upgrading {machine} to build {} ({}); nothing it runs is stopped", b.build, b.target));
+    hub.updates.say(hub, &id, format!("upgrading {shown} to build {} ({}); nothing it runs is stopped", b.build, b.target));
     let (h, machine, b) = (Arc::clone(hub), machine.clone(), b.clone());
     if r.method == "native" {
         crate::rt::spawn(async move { native(&h, &id, &machine, &b).await });
@@ -1732,10 +1816,11 @@ pub(crate) async fn upgrade_into(hub: &Arc<Hub>, id: &str, machine: &str, b: &Bi
         u.finish(hub, id, Err(format!("there is no runner called {machine}")));
         return;
     };
+    let shown = hub.shown(machine);
     let cant = if !r.connected {
-        Some(format!("{machine} is not connected"))
+        Some(format!("{shown} is not connected"))
     } else if r.method != "native" && !r.terminal {
-        Some(format!("{machine} runs a kiln too old to upgrade itself and has terminals turned off: run `kiln install --agent --upgrade` with a new kiln binary on it"))
+        Some(format!("{shown} runs a kiln too old to upgrade itself and has terminals turned off: run `kiln install --agent --upgrade` with a new kiln binary on it"))
     } else {
         None
     };
@@ -1744,7 +1829,7 @@ pub(crate) async fn upgrade_into(hub: &Arc<Hub>, id: &str, machine: &str, b: &Bi
         return;
     }
     if r.build.as_deref() == Some(b.build.as_str()) {
-        u.finish(hub, id, Ok(format!("{machine} runs build {} already", b.build)));
+        u.finish(hub, id, Ok(format!("{shown} runs build {} already", b.build)));
         return;
     }
     u.update(hub, id, |j| {
@@ -1752,7 +1837,7 @@ pub(crate) async fn upgrade_into(hub: &Arc<Hub>, id: &str, machine: &str, b: &Bi
         j.to_build = Some(b.build.clone());
     });
     hub.store.audit("kiln".into(), "upgrade.runner".into(), format!("{machine} to build {} ({}, {}), built by {}", b.build, b.target, r.method, b.by.as_deref().unwrap_or("another machine"))).await;
-    u.say(hub, id, format!("upgrading {machine} to build {} ({}); nothing it runs is stopped", b.build, b.target));
+    u.say(hub, id, format!("upgrading {shown} to build {} ({}); nothing it runs is stopped", b.build, b.target));
     if r.method == "native" {
         native(hub, id, machine, b).await;
     } else {
@@ -1773,7 +1858,7 @@ async fn native(hub: &Arc<Hub>, id: &str, machine: &str, b: &Binary) {
     match hub.command_start(machine, &msg).await.answer(crate::hub::COMMAND_WITHIN).await {
         crate::wire::commands::Answer::Taken | crate::wire::commands::Answer::Sent | crate::wire::commands::Answer::Unanswered { .. } | crate::wire::commands::Answer::Parked => {}
         other => {
-            u.finish(hub, id, Err(format!("{machine}: {}", other.words())));
+            u.finish(hub, id, Err(format!("{}: {}", hub.shown(machine), other.words())));
             return;
         }
     }
@@ -1807,14 +1892,14 @@ async fn native(hub: &Arc<Hub>, id: &str, machine: &str, b: &Binary) {
         let busy: usize = hub.runner_processes(machine).iter().map(|i| i.jobs).sum();
         if busy > 0 {
             if since.elapsed() > w.jobs() {
-                let e = format!("{machine} kept running jobs for {}, so it never switched; it does once it is idle", said(w.jobs()));
+                let e = format!("{} kept running jobs for {}, so it never switched; it does once it is idle", hub.shown(machine), said(w.jobs()));
                 u.time_out(hub, id, "jobs", e);
                 return;
             }
             idle_since = Instant::now();
             waited = true;
             if busy != waiting_on {
-                u.say(hub, id, format!("{machine} waits for {} before it switches", if busy == 1 { "its running job".to_owned() } else { format!("its {busy} running jobs") }));
+                u.say(hub, id, format!("{} waits for {} before it switches", hub.shown(machine), if busy == 1 { "its running job".to_owned() } else { format!("its {busy} running jobs") }));
             }
         } else if idle_since.elapsed() > w.upgrade() {
             let after = if waited { " of its last job ending" } else { "" };
@@ -2046,7 +2131,7 @@ async fn terminal(hub: &Arc<Hub>, id: &str, machine: &str, b: &Binary, inst8: &s
                 feed("\n");
                 break match (code, error) {
                     (Some(0), _) => Ok(()),
-                    (_, Some(e)) if e == "__reconnect__" => Err(format!("{machine} disconnected during the upgrade")),
+                    (_, Some(e)) if e == "__reconnect__" => Err(format!("{} disconnected during the upgrade", hub.shown(machine))),
                     (_, Some(e)) => Err(e),
                     (c, None) => Err(format!("the upgrade exited with {}", c.map_or_else(|| "a signal".to_owned(), |c| c.to_string()))),
                 };
@@ -2089,7 +2174,7 @@ pub async fn upgrade_all(hub: &Arc<Hub>) -> Vec<Result<Job, String>> {
     for r in runners(hub).await {
         // Runners whose updates are off are left alone, with the others too.
         if r.policy != Policy::Off && !r.locked && r.connected && !r.up_to_date && !matches!(r.standing, Some(crate::fleet::Standing::Branch | crate::fleet::Standing::Local)) {
-            out.push(upgrade_runner(hub, &r.name, None).await.map_err(|e| format!("{}: {e:#}", r.name)));
+            out.push(upgrade_runner(hub, &r.name, None).await.map_err(|e| format!("{}: {e:#}", hub.shown(&r.name))));
         }
     }
     out
@@ -2287,24 +2372,32 @@ pub async fn upgrade_server(hub: &Arc<Hub>, action: &str) -> anyhow::Result<Job>
 
 async fn replace_binary(hub: &Arc<Hub>, id: &str, r: &Replacement, exe: PathBuf) -> anyhow::Result<()> {
     let u = &hub.updates;
-    let bytes = if r.origin == "upload" {
-        stored(hub, crate::api::TARGET).ok_or_else(|| anyhow::anyhow!("the uploaded binary is gone"))?;
-        crate::blobs::io::get_all(hub.blobs.blobs.as_ref(), &binary_key(crate::api::TARGET), MAX_BINARY as u64).await.map_err(|e| anyhow::anyhow!("reading the uploaded binary: {e}"))?.1
+    // Read into a file as it comes, never whole into memory.
+    let arrived = if r.origin == "upload" {
+        let b = stored(hub, crate::api::TARGET).ok_or_else(|| anyhow::anyhow!("the uploaded binary is gone"))?;
+        let mut arriving = Arriving::new(&arriving_dir(hub))?;
+        let pieces = crate::blobs::io::read_stream(Arc::clone(&hub.blobs.blobs), binary_key(crate::api::TARGET), None, 0, b.size.saturating_sub(1));
+        while let Ok(piece) = pieces.recv().await {
+            arriving.write(&piece)?;
+        }
+        let arrived = arriving.done()?;
+        anyhow::ensure!(arrived.size == b.size && arrived.sha256 == b.sha256, "the uploaded binary didn't read back whole: {} bytes, sha256 {}; kept as {} bytes, {}", arrived.size, arrived.sha256, b.size, b.sha256);
+        arrived
     } else {
         let version = r.version.clone().ok_or_else(|| anyhow::anyhow!("no release version"))?;
         let target = own_release_target().ok_or_else(|| anyhow::anyhow!("releases have no build for this platform"))?;
         u.say(hub, id, format!("downloading kiln {version} for {target} from GitHub"));
-        download_release(&version, target).await?.ok_or_else(|| anyhow::anyhow!("the v{version} release has no binary for {target}"))?
+        download_release(&version, target, &arriving_dir(hub)).await?.ok_or_else(|| anyhow::anyhow!("the v{version} release has no binary for {target}"))?
     };
-    anyhow::ensure!(executable(&bytes), "that binary is not an executable");
-    let build = build_id(&hex::encode(Sha256::digest(&bytes)));
+    anyhow::ensure!(executable(&arrived.head), "that binary is not an executable");
+    let build = build_id(&arrived.sha256);
     anyhow::ensure!(build != own_build(), "that is the build already running");
     u.update(hub, id, |j| j.to_build = Some(build.clone()));
     u.say(hub, id, format!("installing build {build} over {}", exe.display()));
     crate::rt::blocking(move || -> anyhow::Result<()> {
         let dir = exe.parent().ok_or_else(|| anyhow::anyhow!("no directory for {}", exe.display()))?;
         let tmp = dir.join(format!(".kiln.upgrade.{}", std::process::id()));
-        std::fs::write(&tmp, &bytes).with_context(|| format!("write {} (may kiln write there?)", tmp.display()))?;
+        std::fs::copy(&arrived.path, &tmp).with_context(|| format!("write {} (may kiln write there?)", tmp.display()))?;
         crate::os::make_executable(&tmp)?;
         std::fs::rename(&tmp, &exe).with_context(|| format!("replace {}", exe.display()))?;
         Ok(())
@@ -2373,7 +2466,6 @@ async fn download_verified(http: &crate::http::client::Client, server_url: &str,
     let say = |line: String| up.say(AgentMsg::UpgradeLog { job: order.job.to_owned(), line });
     let (path, sha256, size) = (order.path, order.sha256, order.size);
     anyhow::ensure!(path.starts_with("/dl/kiln/") && !path.contains(".."), "refusing to fetch {path}");
-    anyhow::ensure!(usize::try_from(size).is_ok_and(|s| s <= MAX_BINARY), "the binary is too large ({size} bytes)");
     let url = format!("{}{path}", server_url.trim_end_matches('/'));
     say(format!("downloading {url}"));
     let mut resp = http.get(&url).timeout(Duration::from_secs(600)).send().await?;
@@ -3098,7 +3190,9 @@ mod tests {
             load(&hub).await;
             assert_eq!(stored(&hub, t).map(|b| b.sha256), Some(first));
             // Replaced here: the files it was taken from go.
-            let uploaded = store(&hub, t, elf(2), "upload").await?.sha256;
+            let mut arriving = Arriving::new(&arriving_dir(&hub))?;
+            arriving.write(&elf(2))?;
+            let uploaded = store(&hub, t, &arriving.done()?, "upload").await?.sha256;
             assert!(!dir.join(format!("kiln-{t}")).exists());
             // Rolled back, the older kiln kept a newer one; started again, it's the one.
             let newer = as_files(&elf(3), now + Duration::from_secs(60))?;
@@ -3234,12 +3328,13 @@ mod tests {
         if std::process::Command::new("curl").arg("--version").output().is_err() {
             return Ok(());
         }
-        // A fake `kiln` behind a file:// URL stands in for the download.
+        // A fake `kiln` behind a file:// URL stands in for the download: its path with forward
+        // slashes (`file:///C:/…` on Windows, whose backslashes the shell would take as escapes).
         let dir = tempfile::tempdir()?;
         let fake = dir.path().join("kiln");
         std::fs::write(&fake, "#!/bin/sh\necho \"fake kiln $*\"\n")?;
         let sha = hex::encode(Sha256::digest(std::fs::read(&fake)?));
-        let url = format!("file://{}", fake.display());
+        let url = format!("file:///{}", fake.display().to_string().replace('\\', "/").trim_start_matches('/'));
         let script = terminal_script("j", std::slice::from_ref(&url), &sha, "");
         let out = std::process::Command::new("sh").arg("-c").arg(&script).env("TMPDIR", dir.path()).output()?;
         let text = String::from_utf8_lossy(&out.stdout);
@@ -3247,8 +3342,9 @@ mod tests {
         assert!(text.contains("fake kiln install --agent --upgrade --service"), "{text}");
         assert!(text.contains(OK_MARK), "{text}");
         // As a runner's terminal runs it: `sh -c '<script>'` handed to the user's own shell.
+        // A shell that can't run `true` isn't there (Windows' WSL `bash.exe` with no distribution).
         for shell in ["sh", "bash", "zsh", "fish"] {
-            if std::process::Command::new(shell).arg("-c").arg("true").output().is_err() {
+            if !std::process::Command::new(shell).arg("-c").arg("true").output().is_ok_and(|o| o.status.success()) {
                 continue;
             }
             let out = std::process::Command::new(shell).arg("-c").arg(format!("sh -c '{script}'")).env("TMPDIR", dir.path()).output()?;

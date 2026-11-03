@@ -32,6 +32,30 @@ test("Files and the Conversation are the dropdown's first sections after its rep
   await expect(row.locator(".rv-thread .rv-m", { hasText: "can fail on a bad expression" })).toBeVisible();
 });
 
+test("an agent's reply reads as the agent for its person, and each seal says who signed it (W26-R18, W27-R04)", async ({ page }) => {
+  const row = await open(page, "pipeline: dynamic matrices");
+  const thread = row.locator(".rv-thread").first();
+  const agent = thread.locator(".rv-m", { hasText: "keeps the leg's name" });
+  await expect(agent.locator(".rv-by")).toContainText("Review agent");
+  await expect(agent.locator(".rv-for")).toHaveText("for kim");
+  await expect(agent.locator(".rv-seal")).toHaveAttribute("title", "signed by Review agent for kim");
+  await expect(thread.locator(".rv-m", { hasText: "can fail on a bad expression" }).locator(".rv-seal")).toHaveAttribute("title", "signed by kim");
+  const sam = thread.locator(".rv-m", { hasText: "It names the axis already" });
+  await expect(sam.locator(".rv-seal")).toHaveAttribute("title", "unsigned");
+  await expect(sam.locator(".rv-for")).toHaveCount(0);
+  // One shape: the agent's reply's line stands as a person's reply's does.
+  const [a, s] = [await agent.locator(".rv-meta").boundingBox(), await sam.locator(".rv-meta").boundingBox()];
+  expect(a?.height).toBe(s?.height);
+});
+
+test("a thread a version answered says which version fixed it, as a suggestion says it was applied (W26-R18)", async ({ page }) => {
+  const row = await open(page, "pipeline: dynamic matrices");
+  // kim's thread on the whole change, resolved once v2 answered it (the mock's t4).
+  const done = row.locator(".rv-thread[data-done='1']", { hasText: "fixed in v2" });
+  await expect(done).toHaveCount(1);
+  await expect(done.locator(".rv-done")).toHaveText(/^\d+ · resolved.* · fixed in v2$/);
+});
+
 test("nothing in Files or the Conversation scrolls sideways but a comment's code, which keeps each line on one line, at every width (W21-AC01)", async ({ page }) => {
   const row = await open(page, "pipeline: dynamic matrices");
   await expect(row.locator(".md-code-body").first()).toBeVisible();
@@ -86,8 +110,9 @@ test("reply, resolve, change a kind, delete", async ({ page }) => {
 });
 
 test("apply a suggestion makes a revision", async ({ page }) => {
-  // The mock keeps what each project writes, so the suggestion this applies is its own.
-  const tag = test.info().project.name;
+  // The mock keeps what each run writes, so the suggestion this applies is its own: its tag names the project and the run (a --repeat-each pass, a retry).
+  const { project, repeatEachIndex, retry } = test.info();
+  const tag = `${project.name} ${repeatEachIndex}.${retry}`;
   const row = await open(page, "pipeline: dynamic matrices");
   const thread = row.locator(".rv-thread").first();
   await thread.locator(".rv-btn", { hasText: "Reply" }).click();

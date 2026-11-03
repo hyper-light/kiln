@@ -587,6 +587,8 @@ async fn unsigned(hub: &Hub, job: &str) -> anyhow::Result<Option<String>> {
     let signs = hub.runner_wide_caps(&a) & crate::proto::CAP_LEG_SIGNS != 0 || leg_signs(&hub.store, job).await?;
     // Its first step waits for its identity a while, then runs without it (W27-R05).
     let late = delegated && signs && certified_after_its_end(&hub.store, job).await?;
+    // Its runner by the name people see (docs/machines.md).
+    let a = hub.shown(&a);
     Ok(Some(match (delegated, signs) {
         (true, true) if late => format!("kiln certified its identity only after the leg had ended: its runner {a} had none to sign its records with"),
         (true, true) => format!("its runner {a} sent none: the leg hasn't ended, or what it sent was lost on the way"),

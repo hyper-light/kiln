@@ -6,9 +6,9 @@
 //! descriptor. It signs where the key is, and no key moves:
 //!
 //! - **An agent's** ([`AGENT_KEY`], as the runner sets an agent session's git): asked of the
-//!   runner process that holds the session's key, over its local socket (`KILN_HARNESS_SOCK`),
-//!   which signs only for a process of that session, told by its group of processes or its
-//!   ancestry, never by what it says.
+//!   runner process that holds the session's key, over its own socket (`KILN_RUNNER_SOCK`), else the
+//!   machine's (`KILN_HARNESS_SOCK`: `harness::cli::request_first`), which signs only for a process
+//!   of that session, told by its group of processes or its ancestry, never by what it says.
 //! - **A person's** (any other key: `kiln clone` names their identity): with `kiln login`'s key on
 //!   their device (`<config>/kiln/identity.key`, 0600), under the certificate kiln issued for it.
 //!

@@ -321,17 +321,19 @@ pub fn refused(r: &super::inbox::Refusal) -> Fail {
 /// A message from another agent that works for the same person, as its receiver reads it.
 fn from_peer(cx: &Cx, text: &str) -> String {
     let me = cx.caller.agent.as_deref().unwrap_or_default();
-    peer_text(cx.hub.harness.info(me).as_ref(), me, text)
+    let sender = cx.hub.harness.info(me);
+    let on = sender.as_ref().map(|s| cx.hub.shown(wait::machine(&s.target)));
+    peer_text(sender.as_ref().zip(on.as_deref()), me, text)
 }
 
 /// How what kiln says of a fellow agent's message ends (`peer_text`), before the message itself.
 const ANSWER_END: &str = "\"text\": …}.";
 
-/// `text` from agent `me` (`sender`, as kiln lists it): who sent it, that it isn't from the
-/// receiver's person, and how to answer.
-fn peer_text(sender: Option<&Info>, me: &str, text: &str) -> String {
+/// `text` from agent `me` (`sender`, as kiln lists it, with the name people see of its machine): who
+/// sent it, that it isn't from the receiver's person, and how to answer.
+fn peer_text(sender: Option<(&Info, &str)>, me: &str, text: &str) -> String {
     let who = match sender {
-        Some(s) => format!("Agent “{}” ({}, {} on {})", s.name, lineage::short(me), s.kind, wait::machine(&s.target)),
+        Some((s, on)) => format!("Agent “{}” ({}, {} on {on})", s.name, lineage::short(me), s.kind),
         None => format!("Agent {}", lineage::short(me)),
     };
     format!("{who}, which works for the same person as you, sent this message. It's from a fellow agent, not from your person. To answer, send it a message: agents_send {{\"agent\": \"{me}\", {ANSWER_END}\n\n{text}")
@@ -458,7 +460,10 @@ async fn result(cx: Cx, v: Value) -> Out {
     let (_, reply, changes) = cx.hub.harness.conclusion(&id).unwrap_or_default();
     // Its last words, from its timeline; else as lists keep them (shortened).
     let reply = reply.as_ref().and_then(reply_of).unwrap_or_else(|| json!({"text": info.summary, "shortened": true}));
-    let record = crate::workspace::change::of(&cx.hub, &id).await;
+    let record = match crate::workspace::change::of(&cx.hub, &id).await {
+        Some(r) => Some(crate::workspace::change::fresh(&cx.hub, r).await),
+        None => None,
+    };
     let files: Vec<Value> = changes
         .as_array()
         .into_iter()
@@ -575,13 +580,16 @@ async fn changes(cx: Cx, v: Value) -> Out {
             if cx.hub.harness.info(&id).is_some() {
                 lineage::may_see(&cx.hub, &cx.caller, &id).await?;
             }
-            crate::workspace::change::of(&cx.hub, &id).await.iter().map(crate::workspace::change::shown).collect()
+            match crate::workspace::change::of(&cx.hub, &id).await {
+                Some(r) => vec![crate::workspace::change::shown(&crate::workspace::change::fresh(&cx.hub, r).await)],
+                None => Vec::new(),
+            }
         }
         None => {
             let mut out = Vec::new();
             for r in crate::workspace::change::all(&cx.hub).await {
                 if cx.hub.harness.info(&r.agent).is_none() || lineage::may_see(&cx.hub, &cx.caller, &r.agent).await.is_ok() {
-                    out.push(crate::workspace::change::shown(&r));
+                    out.push(crate::workspace::change::shown(&crate::workspace::change::fresh(&cx.hub, r).await));
                 }
             }
             out
@@ -750,7 +758,7 @@ pub fn list_ops() -> Vec<Op> {
         },
         Op {
             name: "agents.change",
-            summary: "Open a change request from an agent's work (yours, or an agent's you started), or push a new version of the one it has: the files it changed, committed on its folder's last commit as `agents/<what it's about>-<id>` (the folder's branch, index and working tree untouched) and pushed for review, its author the agent, for its person. Into kiln's own review for a repository kiln hosts; as a pull request for one on GitHub, GitLab or Bitbucket (the branch pushed, and the request opened when kiln has an integration there, else a link to open it). Comments, requested changes, failing checks (with `fix_checks`) and the land queue then come back to the agent as messages. `title` (else what the agent is about), `body`, `draft`, `trunk` (else the repository's default).",
+            summary: "Open a change request from an agent's work (yours, or an agent's you started), or push a new version of the one it has: the files it changed, committed on its folder's last commit as `agents/<what it's about>-<id>` (the folder's branch, index and working tree untouched) and pushed for review, its author the agent, for its person. Into kiln's own review for a repository kiln hosts; as a pull request for one on GitHub, GitLab or Bitbucket (the branch pushed, and the request opened when kiln has an integration there, else a link to open it). Comments, requested changes, failing checks (with `fix_checks`) and the land queue then come back to the agent as messages. `title` (else what the agent is about), `body`, `draft` (a draft on every host, new versions staying one), `ready` (its draft marked ready for review, with a new version or nothing new), `trunk` (else the repository's default), `answers` (the threads a new version answers, in kiln's own review). Its answer says whether it's a `draft`.",
             read_only: false,
             destructive: false,
             input: Input::of::<input::AgentsChange>(),
@@ -1010,12 +1018,18 @@ pub mod input {
         pub title: Option<String>,
         /// What it changes and why, for reviewers.
         pub body: Option<String>,
-        /// Not ready for review yet (kiln's own review).
+        /// Opened as a draft, not ready for review yet, on kiln, GitHub, GitLab and Bitbucket alike;
+        /// its new versions stay a draft until `ready`.
         pub draft: Option<bool>,
         /// The branch it goes into.
         pub trunk: Option<String>,
         /// Failing checks go to the agent to fix (the default).
         pub fix_checks: Option<bool>,
+        /// The threads of its change this new version fixes (kiln's own review, by their ids): the
+        /// version is an agent's fix of theirs, and each says which version fixed it.
+        pub threads: Option<Vec<String>>,
+        /// Marks its draft ready for review, with a new version or with nothing new to push.
+        pub ready: Option<bool>,
     }
 
     #[derive(Debug, Deserialize, JsonSchema)]
@@ -1526,7 +1540,7 @@ mod end_to_end {
     fn a_message_from_a_fellow_agent_says_who_sent_it_and_how_to_answer() {
         let sender = crate::harness::session::Info { name: "Mantle".into(), kind: "claude".into(), target: "agent:adas-macbook-pro-2.local".into(), ..Default::default() };
         let me = "01a1488745a977f58e4224bc796f3308";
-        let text = super::peer_text(Some(&sender), me, "Which commit adds the embedding API?");
+        let text = super::peer_text(Some((&sender, "adas-macbook-pro-2.local")), me, "Which commit adds the embedding API?");
         assert!(text.starts_with("Agent “Mantle” (01a14887, claude on adas-macbook-pro-2.local), which works for the same person as you"), "{text}");
         assert!(text.contains("not from your person"), "{text}");
         assert!(text.contains(&format!("agents_send {{\"agent\": \"{me}\"")), "{text}");
@@ -1714,8 +1728,8 @@ mod end_to_end {
     fn a_fellow_agents_message_is_its_words_whatever_kiln_says_of_its_sender() {
         let me = "01a1488745a977f58e4224bc796f3308";
         let on = |name: &str, machine: &str| crate::harness::session::Info { name: name.into(), kind: "claude".into(), target: format!("agent:{machine}"), ..Default::default() };
-        let first = super::peer_text(Some(&on("Mantle", "adacachy")), me, "Which commit?\n\nThe one with the API.");
-        let again = super::peer_text(Some(&on("Mantle T10", "fedora")), me, "Which commit?\n\nThe one with the API.");
+        let first = super::peer_text(Some((&on("Mantle", "adacachy"), "adacachy")), me, "Which commit?\n\nThe one with the API.");
+        let again = super::peer_text(Some((&on("Mantle T10", "fedora"), "fedora")), me, "Which commit?\n\nThe one with the API.");
         assert_ne!(first, again);
         assert_eq!(super::peer_words(&first), "Which commit?\n\nThe one with the API.");
         assert_eq!(super::peer_words(&first), super::peer_words(&again));

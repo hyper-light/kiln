@@ -47,6 +47,9 @@ pub fn settings(id: u64, depth: usize) -> anyhow::Result<Settings> {
         elections: Elections::Ticks,
         // Woken by events: the commit is written alone at the first moment no write is out.
         quiet: Duration::ZERO,
+        // Today's: a member's heartbeats wait on its flush proof, and a leader applies only what a
+        // majority's disks hold, its own among them (hyper-durable's `Disk`).
+        disk: hyper_durable::Disk::Flushed,
     })
 }
 

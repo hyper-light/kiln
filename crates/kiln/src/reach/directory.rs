@@ -15,6 +15,10 @@ pub struct RunnerInfo {
     pub name: String,
     #[serde(default)]
     pub hostname: String,
+    /// The name people see, for a runner kiln knows by its machine id (docs/machines.md): `--on`
+    /// finds it by this as well as by its name and host name.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub label: Option<String>,
     /// `linux`, `macos`, `windows` (Rust's names).
     pub os: String,
     /// `x86_64`, `aarch64` (Rust's names).
@@ -99,6 +103,12 @@ pub fn room(s: Strain, busy: u32, slots: u32) -> f32 {
 }
 
 impl RunnerInfo {
+    /// The name people see: its label, else its name. What sentences say of it; what's looked up
+    /// by, its name.
+    pub fn shown(&self) -> &str {
+        self.label.as_deref().unwrap_or(&self.name)
+    }
+
     /// How hard it is pressed, by its last sample.
     pub fn strain(&self) -> Strain {
         strain(self.cpus, self.cpu_pct, self.load1, self.mem_total, self.mem_used)
@@ -197,6 +207,7 @@ impl Want {
         if let Some(n) = &self.name
             && n != &r.name
             && n != &r.hostname
+            && r.label.as_deref() != Some(n.as_str())
         {
             return Some(format!("not {n}"));
         }
@@ -407,7 +418,8 @@ pub fn pick(runners: &[RunnerInfo], want: &Want, me: &str) -> anyhow::Result<Cho
     if passed.is_empty() {
         anyhow::bail!("no runners are known yet");
     }
-    let detail: Vec<String> = passed.iter().map(|(n, w)| format!("{n}: {w}")).collect();
+    let shown = |n: &str| runners.iter().find(|r| r.name == n).map_or_else(|| n.to_owned(), |r| r.shown().to_owned());
+    let detail: Vec<String> = passed.iter().map(|(n, w)| format!("{}: {w}", shown(n))).collect();
     anyhow::bail!("no runner suits {}: {}", want.describe(), detail.join("; "))
 }
 
@@ -457,6 +469,7 @@ mod tests {
         RunnerInfo {
             name: name.into(),
             hostname: format!("{name}.lan"),
+            label: None,
             os: os.into(),
             arch: arch.into(),
             connected: true,
@@ -656,6 +669,19 @@ mod tests {
         assert_eq!(pick(&runners, &want, "mac")?.runner.name, "idle");
         let none = pick(&runners, &Want::parse("windows")?, "mac");
         assert!(none.is_err_and(|e| e.to_string().contains("no runner suits os == windows: mac: macos is not windows")));
+        Ok(())
+    }
+
+    #[test]
+    fn on_finds_a_runner_known_by_its_machine_id_by_the_name_people_see() -> anyhow::Result<()> {
+        let mut laptop = runner("5f2a9c3e0b1d4e6f8a7c9b0d1e2f3a4b", "macos", "aarch64", 12, 5.0, 20);
+        laptop.label = Some("adas-macbook-pro-3.local".into());
+        let runners = vec![laptop, runner("adas-macbook-pro.local", "macos", "aarch64", 12, 5.0, 20)];
+        // By its label, its id or its host name; another machine's name finds that one.
+        for on in ["adas-macbook-pro-3.local", "5f2a9c3e0b1d4e6f8a7c9b0d1e2f3a4b", "5f2a9c3e0b1d4e6f8a7c9b0d1e2f3a4b.lan"] {
+            assert_eq!(pick(&runners, &Want::parse(on)?, "elsewhere")?.runner.name, "5f2a9c3e0b1d4e6f8a7c9b0d1e2f3a4b", "{on}");
+        }
+        assert_eq!(pick(&runners, &Want::parse("adas-macbook-pro.local")?, "elsewhere")?.runner.name, "adas-macbook-pro.local");
         Ok(())
     }
 

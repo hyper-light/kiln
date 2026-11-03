@@ -94,6 +94,12 @@ pub enum Request {
         #[serde(default)]
         forget: bool,
     },
+    /// A harness's hook asking before a tool call (`kiln harness-hook`, `codex::hook_args`): the
+    /// session it's for is the one whose process asks; its answer (`answer`) may wait for a person.
+    Hook {
+        #[serde(default)]
+        input: Value,
+    },
 }
 
 /// Who asks the server, as the socket tells them apart.
@@ -191,6 +197,11 @@ pub async fn answer(host: &Host, req: Request, peer: Option<u32>, forward: Optio
         Request::Stop { id: None, .. } | Request::Interrupt { id: None, .. } if agent.is_some() => json!({"ok": false, "error": "say which agent (its id): an agent stops only the agents it started"}),
         Request::Sign { message } => sign_for(host, peer, &message).await,
         Request::Credential { forget } => credential_for(host, peer, forward, forget).await,
+        // Its harness's hook, told by its process: what holds the call answers, maybe later.
+        Request::Hook { input } => match agent.as_deref().and_then(|a| host.get(a)) {
+            Some(s) => json!({"ok": true, "answer": s.hook(input).await}),
+            None => json!({"ok": true, "answer": {}}),
+        },
         other => handle(host, other),
     }
 }
@@ -381,6 +392,8 @@ pub fn handle(host: &Host, req: Request) -> Value {
         // Signing and an agent's credential are told by the asking process, which only `answer` knows.
         Request::Sign { .. } => json!({"ok": false, "error": "signing asks the process's own runner (its socket's answer)"}),
         Request::Credential { .. } => json!({"ok": false, "error": "an agent's credential asks the process's own runner (its socket's answer)"}),
+        // Not an agent kiln runs here: nothing of kiln's holds the call.
+        Request::Hook { .. } => json!({"ok": true, "answer": {}}),
     }
 }
 
@@ -595,6 +608,7 @@ impl Kept {
 }
 
 static SERVED: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+static OWN: std::sync::OnceLock<String> = std::sync::OnceLock::new();
 
 /// The socket this process serves, once it does: every harness it starts gets it as
 /// `KILN_HARNESS_SOCK`, so `kiln spawn` and `kiln agents` work in an agent's own commands too
@@ -603,13 +617,29 @@ pub fn served() -> Option<&'static str> {
     SERVED.get().map(String::as_str)
 }
 
+/// This process's own socket, once it serves one ([`serve_own`]): every harness it starts gets it
+/// as `KILN_RUNNER_SOCK`, and Codex's hook names it.
+pub fn own_served() -> Option<&'static str> {
+    OWN.get().map(String::as_str)
+}
+
+/// Where this process's own socket ([`serve_own`]) lives: beside the machine's, `path`, named for
+/// this process. `None` where that's too long for a socket's path.
+#[cfg(unix)]
+pub(crate) fn own_path(path: &std::path::Path) -> Option<PathBuf> {
+    let stem = path.file_stem()?.to_string_lossy().into_owned();
+    let own = path.with_file_name(format!("{stem}-p{}.sock", std::process::id()));
+    (own.as_os_str().len() < 100).then_some(own)
+}
+
 /// The same, kiln's operations answered by `forward` (the server's own socket).
 #[cfg(unix)]
 pub fn serve_with(host: &Arc<Host>, path: PathBuf, forward: Option<Forward>, take: bool) -> anyhow::Result<PathBuf> {
-    use std::os::fd::{AsRawFd as _, OwnedFd};
+    use std::os::fd::AsRawFd as _;
 
     let mut kept = Kept::new(path.clone(), take, "`kiln spawn`")?;
     let _ = SERVED.set(path.to_string_lossy().into_owned());
+    serve_own(host, &path, forward.clone());
     let host = Arc::clone(host);
     crate::rt::spawn(async move {
         loop {
@@ -621,33 +651,7 @@ pub fn serve_with(host: &Arc<Host>, path: PathBuf, forward: Option<Forward>, tak
             };
             let fd = listener.as_raw_fd();
             match listener.accept() {
-                Ok((stream, _)) => {
-                    let (host, forward) = (Arc::clone(&host), forward.clone());
-                    // Who asks: the process at the other end.
-                    let peer = peer_pid(&stream);
-                    crate::rt::spawn(async move {
-                        if stream.set_nonblocking(true).is_err() {
-                            return;
-                        }
-                        let fd = OwnedFd::from(stream);
-                        let mut buf = Vec::new();
-                        let mut chunk = vec![0u8; 16 * 1024];
-                        // One line, at most 1 MiB (an environment can be large, not larger).
-                        while !buf.contains(&b'\n') && buf.len() < (1 << 20) {
-                            match crate::rt::timeout(std::time::Duration::from_secs(10), crate::os::proc::read_chunk(&fd, &mut chunk)).await {
-                                Ok(Ok(Some(n))) => buf.extend_from_slice(chunk.get(..n).unwrap_or_default()),
-                                _ => break,
-                            }
-                        }
-                        let answer = match serde_json::from_slice::<Request>(buf.split(|b| *b == b'\n').next().unwrap_or_default()) {
-                            Ok(req) => answer(&host, req, peer, forward.as_ref()).await,
-                            Err(e) => json!({"ok": false, "error": format!("bad request: {e}")}),
-                        };
-                        let mut out = answer.to_string().into_bytes();
-                        out.push(b'\n');
-                        let _ = crate::os::proc::write_all(&fd, &out).await;
-                    });
-                }
+                Ok((stream, _)) => answer_connection(stream, Arc::clone(&host), forward.clone(), false),
                 Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
                     // Woken when a connection waits, and looked at again each second regardless:
                     // a wakeup missed costs a second, never an asker left waiting. Quiet, it
@@ -666,6 +670,98 @@ pub fn serve_with(host: &Arc<Host>, path: PathBuf, forward: Option<Forward>, tak
         }
     });
     Ok(path)
+}
+
+/// The socket of this process's own, beside the machine's `path`: what a session asks reaches the
+/// runner that started it, which alone knows it as an agent and holds its key, even while another
+/// kiln process of the machine serves the machine's socket. An upgrade's new build runs beside the
+/// old one, which keeps the machine's socket until it ends: on 2026-11-02 every commit of a session
+/// adacachy's new build had started went to the old one, which neither knew the request nor held
+/// the key (W27-R03); its hooks went there too, held by nothing, and its `kiln spawn` and `kiln
+/// agents stop` were taken as its person's. Its harnesses get it as `KILN_RUNNER_SOCK`
+/// ([`own_served`]); once this process has ended, the sweep takes it.
+#[cfg(unix)]
+fn serve_own(host: &Arc<Host>, path: &std::path::Path, forward: Option<Forward>) {
+    use std::os::fd::AsRawFd as _;
+
+    let Some(own) = own_path(path) else {
+        tracing::warn!(path = %path.display(), "no room beside the machine's socket for this process's own: its sessions ask the machine's");
+        return;
+    };
+    let listener = match bind(&own, true) {
+        Ok(Some((l, _))) => l,
+        Ok(None) => return,
+        Err(e) => {
+            tracing::warn!(path = %own.display(), error = %format!("{e:#}"), "this process's own socket couldn't be bound: its sessions ask the machine's");
+            return;
+        }
+    };
+    let _ = OWN.set(own.to_string_lossy().into_owned());
+    let host = Arc::clone(host);
+    crate::rt::spawn(async move {
+        let fd = listener.as_raw_fd();
+        loop {
+            match listener.accept() {
+                Ok((stream, _)) => answer_connection(stream, Arc::clone(&host), forward.clone(), true),
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                    if let Ok(Err(_)) = crate::rt::timeout(std::time::Duration::from_secs(1), hyper_rt::readiness::readable(fd)).await {
+                        crate::rt::sleep(std::time::Duration::from_millis(200)).await;
+                    }
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+                Err(e) => {
+                    tracing::warn!(error = %e, "accept on this process's own socket failed");
+                    crate::rt::sleep(std::time::Duration::from_millis(500)).await;
+                }
+            }
+        }
+    });
+}
+
+/// One connection on a socket this process serves, answered on a task of its own: one request
+/// line, its answer. `own`: on this process's own socket ([`answer_own`]).
+#[cfg(unix)]
+fn answer_connection(stream: std::os::unix::net::UnixStream, host: Arc<Host>, forward: Option<Forward>, own: bool) {
+    use std::os::fd::OwnedFd;
+
+    // Who asks: the process at the other end.
+    let peer = peer_pid(&stream);
+    crate::rt::spawn(async move {
+        if stream.set_nonblocking(true).is_err() {
+            return;
+        }
+        let fd = OwnedFd::from(stream);
+        let mut buf = Vec::new();
+        let mut chunk = vec![0u8; 16 * 1024];
+        // One line, at most 1 MiB (an environment can be large, not larger).
+        while !buf.contains(&b'\n') && buf.len() < (1 << 20) {
+            match crate::rt::timeout(std::time::Duration::from_secs(10), crate::os::proc::read_chunk(&fd, &mut chunk)).await {
+                Ok(Ok(Some(n))) => buf.extend_from_slice(chunk.get(..n).unwrap_or_default()),
+                _ => break,
+            }
+        }
+        let answer = match serde_json::from_slice::<Request>(buf.split(|b| *b == b'\n').next().unwrap_or_default()) {
+            Ok(req) if own => answer_own(&host, req, peer, forward.as_ref()).await,
+            Ok(req) => answer(&host, req, peer, forward.as_ref()).await,
+            Err(e) => json!({"ok": false, "error": format!("bad request: {e}")}),
+        };
+        let mut out = answer.to_string().into_bytes();
+        out.push(b'\n');
+        let _ = crate::os::proc::write_all(&fd, &out).await;
+    });
+}
+
+/// A request on this process's own socket ([`serve_own`]), from a process of a session this
+/// process runs: answered as on the machine's socket (its `kiln spawn` and `kiln agents`, its
+/// hooks, its signature and its credential). Asked by a process of no session here (one an upgrade
+/// handed to the machine's new build, or anything else), it says so (`elsewhere`), and the asker
+/// asks the machine's socket instead (`cli::request_first`).
+#[cfg(unix)]
+async fn answer_own(host: &Host, req: Request, peer: Option<u32>, forward: Option<&Forward>) -> Value {
+    if session_by_peer(host, peer).await.is_none() {
+        return json!({"ok": false, "elsewhere": true, "error": "no agent session this kiln process runs asks: the machine's socket answers it"});
+    }
+    answer(host, req, peer, forward).await
 }
 
 /// No local socket on Windows yet: `kiln spawn` is not available there.
@@ -761,6 +857,78 @@ mod tests {
                 anyhow::ensure!(other.get("ok") == Some(&json!(false)), "{other}");
                 let ended = ask(path, json!({"op": "stop", "id": child})).await?;
                 anyhow::ensure!(ended.get("ok") == Some(&json!(true)) && hub.harness.info(&child).is_none(), "{ended}");
+                Ok(())
+            });
+            let _ = tx.send(r);
+        });
+        match rx.recv_timeout(std::time::Duration::from_secs(180)) {
+            Ok(r) => r,
+            Err(_) => anyhow::bail!("the socket hung"),
+        }
+    }
+
+    /// W27-R03, as on adacachy on 2026-11-02: an upgrade's old build keeps the machine's socket and
+    /// knows neither a request for a key nor the new build's sessions. The new build's own socket
+    /// answers for the sessions it runs (here this test's process, as a session's harness): its
+    /// credential, and its `kiln spawn` as the agent (its child), not as its person. Its sessions get
+    /// it as `KILN_RUNNER_SOCK`.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn w27_r03_a_runner_beside_the_one_serving_the_machines_socket_answers_its_own_sessions() -> anyhow::Result<()> {
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let r = crate::rt::block_on(async {
+                let hub = crate::hub::tests::scratch_hub_with(|c| c.terminal.enabled = true).await?;
+                let dir = tempfile::tempdir()?.keep();
+                let spec = Spec { kind: "claude".into(), cwd: Some(dir.to_string_lossy().into_owned()), mode: Some("default".into()), program: Some(dir.join("no-claude").to_string_lossy().into_owned()), ..Spec::default() };
+                let session = hub.harness.open(&hub, "local", spec, 1).await?.first().map(|i| i.id.clone()).ok_or_else(|| anyhow::anyhow!("no session"))?;
+                let s = hub.harness.local.get(&session).ok_or_else(|| anyhow::anyhow!("not on the host"))?;
+                for _ in 0..200 {
+                    if s.info().status == crate::harness::model::Status::Exited {
+                        break;
+                    }
+                    crate::rt::sleep(std::time::Duration::from_millis(20)).await;
+                }
+                *s.pid.lock() = Some(std::process::id());
+                // The old build, serving the machine's socket.
+                let path = dir.join("h.sock");
+                let old = std::os::unix::net::UnixListener::bind(&path)?;
+                std::thread::spawn(move || {
+                    use std::io::{BufRead as _, Write as _};
+                    for mut c in old.incoming().flatten() {
+                        let mut line = String::new();
+                        if let Ok(r) = c.try_clone() {
+                            let _ = std::io::BufReader::new(r).read_line(&mut line);
+                        }
+                        let _ = c.write_all(b"{\"ok\":false,\"error\":\"bad request: unknown variant `credential`, expected one of `spawn`, `list`, `stop`, `interrupt`, `send`, `op`\"}\n");
+                    }
+                });
+                serve_with(&hub.harness.local, path.clone(), Some(crate::harness::ops::forward(Arc::clone(&hub))), false)?;
+                let own = own_path(&path).ok_or_else(|| anyhow::anyhow!("no path for this process's own socket"))?;
+                anyhow::ensure!(own_served().is_some_and(|k| k.ends_with(&format!("-p{}.sock", std::process::id()))), "its sessions aren't given a socket of its own");
+                // Its session's credential, asked as kiln-git-sign asks it: by this process, of its own socket.
+                let mut answered = serde_json::Value::Null;
+                for _ in 0..100 {
+                    let (own, machine) = (own.clone(), path.clone());
+                    match crate::rt::blocking(move || crate::harness::cli::request_first(Some(&own), &machine, &Request::Credential { forget: false }, std::time::Duration::from_secs(60))).await? {
+                        Ok(v) => answered = v,
+                        Err(e) => answered = json!({"refused": format!("{e:#}")}),
+                    }
+                    if !answered.to_string().contains("cannot reach kiln") {
+                        break;
+                    }
+                    crate::rt::sleep(std::time::Duration::from_millis(50)).await;
+                }
+                let said = answered.to_string();
+                anyhow::ensure!(!said.contains("unknown variant"), "asked of the old build: {said}");
+                anyhow::ensure!(answered.get("agent") == Some(&json!(true)) || said.contains(&session), "not answered for its session: {said}");
+                // Its `kiln spawn`, as the agent: what it starts is its child.
+                let nowhere = "/nonexistent/kiln-socket-test";
+                let started = ask(own.clone(), json!({"op": "spawn", "kind": "claude", "mode": "plan", "cwd": nowhere})).await?;
+                let child = started.pointer("/sessions/0/id").and_then(Value::as_str).unwrap_or("").to_owned();
+                anyhow::ensure!(hub.harness.info(&child).is_some_and(|i| i.parent.as_deref() == Some(session.as_str())), "not started as the agent's child: {started}");
+                let ended = ask(own, json!({"op": "stop", "id": child})).await?;
+                anyhow::ensure!(ended.get("ok") == Some(&json!(true)), "{ended}");
                 Ok(())
             });
             let _ = tx.send(r);

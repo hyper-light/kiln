@@ -173,6 +173,10 @@ pub struct Kubernetes {
     /// Seconds to wait for a launched pod's agent to connect before retrying.
     pub start_timeout_seconds: u32,
     pub node_selector: BTreeMap<String, String>,
+    /// Job and executor pods only on worker nodes (no `node-role.kubernetes.io/control-plane`
+    /// label), not just preferring them: the control plane's etcd and API server keep their room
+    /// (W13-R07). Off by default, as a cluster of control-plane nodes alone would run no job.
+    pub workers_only: bool,
     pub image_pull_policy: String,
     /// Default requests when a job doesn't specify resources.
     pub default_cpu: String,
@@ -453,6 +457,7 @@ impl Default for Kubernetes {
             max_pods: 64,
             start_timeout_seconds: 300,
             node_selector: BTreeMap::new(),
+            workers_only: false,
             image_pull_policy: "IfNotPresent".into(),
             default_cpu: "1".into(),
             default_memory: "2Gi".into(),
@@ -596,6 +601,13 @@ impl Config {
 
     pub fn local_agent_name(&self) -> String {
         self.local_agent.name.clone().unwrap_or_else(hostname)
+    }
+
+    /// What the server's own runner (`[local_agent]`) is known by (docs/machines.md): its machine's
+    /// id ([`crate::os::machine_id`]), else its name. Its name ([`Self::local_agent_name`]) is its
+    /// label.
+    pub fn local_agent_key(&self) -> String {
+        crate::os::machine_id().unwrap_or_else(|| crate::pki::sanitize_name(&self.local_agent_name()))
     }
 
     pub fn hostname() -> String {

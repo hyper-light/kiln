@@ -96,9 +96,13 @@ pub struct EnrollRequest {
     pub token: String,
     pub name: String,
     pub csr: String,
-    /// The machine's hostname: an outpost enrolling again keeps its name ([`crate::api`]).
+    /// The machine's hostname: a machine enrolling again keeps its name ([`crate::api`]).
     #[serde(default)]
     pub hostname: String,
+    /// The machine's id ([`crate::os::machine_id`]): another machine with the same host name isn't
+    /// taken for this one. None from a kiln from before.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub machine_id: Option<String>,
 }
 
 /// `POST /api/agents/instance`: see `api::enroll_instance`.
@@ -108,18 +112,78 @@ pub struct InstanceRequest {
     pub csr: String,
 }
 
+/// `POST /api/agents/rekey` (docs/machines.md): a runner known by its name asks to be known by its
+/// machine id, proving itself as a second runner process does; see `api::rekey_agent`.
+#[derive(Serialize, Deserialize)]
+pub struct RekeyRequest {
+    pub cert_pem: String,
+    pub csr: String,
+    /// The machine's id ([`crate::os::machine_id`]): what it asks to be known by.
+    pub machine_id: String,
+}
+
 #[derive(Serialize, Deserialize)]
 pub struct EnrollResponse {
     pub cert_pem: String,
     pub ca_pem: String,
     pub quic: String,
+    /// The name the certificate carries: the machine's id when it sent one (docs/machines.md).
     pub name: String,
+    /// The name people see, when `name` is the machine's id.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub label: Option<String>,
 }
 
 fn ca_der(pem: &str) -> anyhow::Result<Vec<u8>> {
     use hyper_quic::rustls::pki_types::CertificateDer;
     use hyper_quic::rustls::pki_types::pem::PemObject as _;
     Ok(CertificateDer::from_pem_slice(pem.as_bytes()).map_err(|e| anyhow::anyhow!("ca pem: {e:?}"))?.to_vec())
+}
+
+/// The certificate of a runner known by its name, for its machine id instead (docs/machines.md):
+/// asked for as the runner starts, before it connects or holds anything, proving itself as a
+/// second runner process does (`/api/agents/rekey`), and kept in place of the one it had. What the
+/// server kept under its name goes to the id, and its name becomes its label. None when it's known
+/// by its id already, has no id, is a job's pod or an outpost, or the server can't move it now (a
+/// server from before, a process of it still connected): it goes on by its name, and asks again as
+/// it starts next.
+async fn moved_to_its_id(o: &Opts, cert: &str, key: &str, ca: &str, cert_p: &std::path::Path) -> Option<String> {
+    use crate::http::client::{Client, Roots};
+    if o.ephemeral || o.outpost {
+        return None;
+    }
+    let id = crate::rt::blocking(crate::os::machine_id).await.ok().flatten()?;
+    let to = crate::join::machine_key(Some(&id))?;
+    let name = crate::pki::leaf_name(&Leaf { cert_pem: cert.to_owned(), key_pem: String::new() })?;
+    // Known by a machine id already (its own, or the one of a machine it was copied from): it stays.
+    if name == to || crate::join::is_machine_key(&name) {
+        return None;
+    }
+    let csr = crate::pki::make_csr_with_key(&to, key).ok()?;
+    let http = Client::new(Roots::WebPkiPlusDer(crate::join::pem_der(ca).ok()?), None).ok()?;
+    let url = format!("{}/api/agents/rekey", o.server_url.trim_end_matches('/'));
+    let asked = http.post(&url).json(&RekeyRequest { cert_pem: cert.to_owned(), csr, machine_id: id }).timeout(Duration::from_secs(20)).send().await;
+    match asked {
+        Ok(resp) if resp.is_success() => {
+            let e: EnrollResponse = resp.json(1 << 20).await.ok()?;
+            if let Err(err) = crate::util::write_secret(cert_p, e.cert_pem.as_bytes(), 0o644) {
+                tracing::warn!(error = %err, "couldn't keep the certificate for this runner's machine id; it goes on by its name");
+                return None;
+            }
+            tracing::info!(was = %name, now = %e.name, label = e.label.as_deref().unwrap_or(""), "this runner is known by its machine id now");
+            Some(e.cert_pem)
+        }
+        Ok(resp) => {
+            let status = resp.status();
+            let why = String::from_utf8_lossy(&resp.bytes(1 << 12).await.unwrap_or_default()).trim().to_owned();
+            tracing::info!(status, why = %why, "the server didn't move this runner to its machine id now; it goes on by its name");
+            None
+        }
+        Err(e) => {
+            tracing::debug!(error = %format!("{e:#}"), "couldn't ask to move this runner to its machine id");
+            None
+        }
+    }
 }
 
 /// Load stored credentials, enrolling (or renewing) when needed. Retries until it succeeds.
@@ -151,6 +215,8 @@ async fn credentials(o: &Opts, shutdown: &Shutdown) -> anyhow::Result<(Vec<u8>, 
     )
         && (!crate::pki::needs_renewal(&c) || o.join_token.is_none()) {
             let quic = std::fs::read_to_string(&quic_p).ok().map(|s| s.trim().to_owned());
+            // Known by its name: it moves to its machine id now, as it starts, holding nothing yet.
+            let c = moved_to_its_id(o, &c, &k, &ca, &cert_p).await.unwrap_or(c);
             return Ok((ca_der(&ca)?, Leaf { cert_pem: c, key_pem: k }, quic));
         }
     let token = o
@@ -161,11 +227,13 @@ async fn credentials(o: &Opts, shutdown: &Shutdown) -> anyhow::Result<(Vec<u8>, 
     // Enrollment happens before kiln's CA is known: plain http, or https with a public cert.
     let http = Client::public()?;
     let url = format!("{}/api/agents/enroll", o.server_url.trim_end_matches('/'));
+    // Read off the runtime's threads: it may run a program (macOS's `ioreg`).
+    let machine_id = crate::rt::blocking(crate::os::machine_id).await.ok().flatten();
     let mut backoff = Duration::from_secs(1);
     loop {
         let r = http
             .post(&url)
-            .json(&EnrollRequest { token: token.clone(), name: o.name.clone(), csr: csr.clone(), hostname: crate::config::Config::hostname() })
+            .json(&EnrollRequest { token: token.clone(), name: o.name.clone(), csr: csr.clone(), hostname: crate::config::Config::hostname(), machine_id: machine_id.clone() })
             .send()
             .await;
         match r {
@@ -200,6 +268,12 @@ async fn instance_credentials(o: &Opts, id: &str, shutdown: &Shutdown) -> anyhow
     let dir = crate::upgrade::instance_dir(&o.state_dir, id);
     let ca = std::fs::read_to_string(o.state_dir.join("ca.pem")).context("this machine is not enrolled (no ca.pem)")?;
     let (machine_cert, key) = crate::upgrade::machine_credentials(&o.state_dir)?;
+    // Known by its name: the machine moves to its machine id as this process starts too, an
+    // upgrade's runner process being its runner since (docs/machines.md). While another process of
+    // it is connected (the one an upgrade takes over from) the server refuses, and it asks again
+    // as it starts next.
+    let machine_cert = moved_to_its_id(o, &machine_cert, &key, &ca, &o.state_dir.join("agent.pem")).await.unwrap_or(machine_cert);
+    let machine = crate::pki::leaf_name(&Leaf { cert_pem: machine_cert.clone(), key_pem: String::new() });
     let quic = std::fs::read_to_string(o.state_dir.join("quic")).ok().map(|s| s.trim().to_owned());
     let cert_p = dir.join("agent.pem");
     let own = std::fs::read_to_string(&cert_p).ok().filter(|c| {
@@ -207,7 +281,13 @@ async fn instance_credentials(o: &Opts, id: &str, shutdown: &Shutdown) -> anyhow
         if !mine {
             tracing::warn!(instance = %id, "this runner process's certificate is for a key the machine no longer has (it enrolled again): asking for a new one");
         }
-        mine
+        // Its certificate names the machine as it was: one known by its machine id since gets one
+        // for that id.
+        let same = crate::pki::leaf_name(&Leaf { cert_pem: c.clone(), key_pem: String::new() }) == machine;
+        if mine && !same {
+            tracing::info!(instance = %id, "the machine is known by its machine id now: asking for this runner process's certificate for it");
+        }
+        mine && same
     });
     if let Some(c) = &own
         && !crate::pki::needs_renewal(c)
@@ -295,6 +375,14 @@ fn admits(slots: u32, size: Option<kiln_ci::sched::state::Resources>, jobs: impl
 /// How long a cancelled job has to end before the runner reports it over and lets it go.
 const CANCEL_GRACE: Duration = Duration::from_secs(120);
 
+/// How long after a link comes up a runner says again what it has of the server's commands
+/// (`Have`), and then again as long after: its server sends its commands on a link only once it
+/// has heard one, so one lost below the channel would hold them up until its next sample.
+const HAVE_SOON: Duration = Duration::from_secs(1);
+
+/// How many times a runner says what it has again so ([`HAVE_SOON`]), beside its samples'.
+const HAVES_SOON: u32 = 2;
+
 /// One turn of the agent's event loop (computed inside `select!`, handled after it).
 enum Ev {
     Shutdown,
@@ -319,6 +407,10 @@ enum Ev {
     Forwarded(Vec<u8>),
     /// A test build's fault: the connection drops (W22-AC04).
     ChaosDrop,
+    /// A gap in the server's commands it asked for is still there: it asks again.
+    Wants,
+    /// It says again what it has of the server's commands, soon after a link came up.
+    HaveSoon,
     /// A test build's fault: a frame held back, due now (W22-AC04).
     Delayed(crate::runner::chaos::Due),
 }
@@ -760,18 +852,19 @@ mod replica_tests {
     }
 }
 
-/// Serve the machine's local sockets (`kiln run`, `kiln spawn`) from this runner process: the new
-/// build once it has taken over, or the old one again after a rollback (the paths are the same).
+/// Serve the machine's local sockets (`kiln run`, `kiln spawn`) from this runner process (runner
+/// `name`, its sockets named by `sock`): the new build once it has taken over, or the old one again
+/// after a rollback (the paths are the same).
 #[cfg(unix)]
-fn serve_sockets(reach: Option<&crate::reach::node::Handle>, harness: Option<&Arc<crate::harness::host::Host>>, name: &str, state_dir: &std::path::Path) {
+fn serve_sockets(reach: Option<&crate::reach::node::Handle>, harness: Option<&Arc<crate::harness::host::Host>>, name: &str, sock: &str, state_dir: &std::path::Path) {
     crate::browser::set_home(state_dir);
     if let Some(r) = reach
-        && let Err(e) = crate::reach::local::serve(r.clone(), name.to_owned(), crate::reach::local::path(name, state_dir), true)
+        && let Err(e) = crate::reach::local::serve(r.clone(), name.to_owned(), crate::reach::local::path(sock, state_dir), true)
     {
         tracing::warn!(error = %format!("{e:#}"), "`kiln run` will not be available on this machine");
     }
     if let Some(h) = harness
-        && let Err(e) = crate::harness::socket::serve(h, crate::harness::socket::path(name, state_dir), true)
+        && let Err(e) = crate::harness::socket::serve(h, crate::harness::socket::path(sock, state_dir), true)
     {
         tracing::warn!(error = %format!("{e:#}"), "`kiln spawn` will not be available in this machine's terminals");
     }
@@ -1309,6 +1402,10 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
     if name != crate::pki::sanitize_name(&o.name) {
         tracing::info!(certificate = %name, requested = %o.name, "using the agent name from this agent's certificate");
     }
+    // Its sockets (`kiln run`'s, `kiln spawn`'s) are named by the name it was started with, never by
+    // its machine id: their paths stay the ones its sessions were given before it moved, and a Mac's
+    // temporary folder leaves a socket's path no room for an id (docs/machines.md).
+    let sock = crate::pki::sanitize_name(&o.name);
     let quic_addr = o
         .quic
         .clone()
@@ -1449,7 +1546,7 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                     }
                 }
             });
-            let path = crate::reach::local::path(&name, &o.state_dir);
+            let path = crate::reach::local::path(&sock, &o.state_dir);
             crate::browser::set_home(&o.state_dir);
             if take_over_pending.is_some() {
                 crate::reach::local::set_socket(path.to_string_lossy().into_owned());
@@ -1607,10 +1704,12 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
     // The server's commands on the channel (`crate::wire::commands`): what this runner has of
     // each stream; and the one being applied, answered at the top of the next turn of the loop
     // (however its arm ended), taken unless its arm refused it.
-    let mut wire_in = crate::wire::channel::Receiver::new();
+    let mut wire_in = crate::wire::channel::Receiver::timed();
     // Which of the server's command streams are current: an item of one let go of is dropped.
     let mut wire_current = crate::wire::commands::Current::new();
     let mut answer_after: Option<(String, u64, Option<(crate::wire::channel::Refusal, String)>)> = None;
+    // When it says what it has of them again soon after a link came up, and how many more times.
+    let mut have_soon: Option<(Instant, u32)> = None;
     // What the server's copy of each session here has, said in digests on this connection: a
     // stream that starts sends only what the copy lacks (`crate::wire::sums`).
     let mut server_kept: HashMap<String, proto::KeptSession> = HashMap::new();
@@ -1718,7 +1817,7 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
     let mut shipper = convo.as_ref().map(|st| start_feed(st, harness.as_ref(), &uplink.0));
     // What `kiln spawn` in this machine's terminals talks to.
     let harness_sock = harness.as_ref().and_then(|h| {
-        let path = crate::harness::socket::path(&name, &o.state_dir);
+        let path = crate::harness::socket::path(&sock, &o.state_dir);
         if take_over_pending.is_some() {
             return Some(path.to_string_lossy().into_owned());
         }
@@ -1840,6 +1939,8 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
             () = watchdog.tick().fuse() => Ev::Watchdog,
             () = sleep_until_opt(redial).fuse() => Ev::Redial,
             () = sleep_until_opt(chaos_drop).fuse() => Ev::ChaosDrop,
+            () = sleep_until_opt(wire_in.want_due().filter(|_| connected && server_wire)).fuse() => Ev::Wants,
+            () = sleep_until_opt(have_soon.map(|(at, _)| at)).fuse() => Ev::HaveSoon,
             d = recv_opt(delayed.as_ref()).fuse() => match d { Some(due) => Ev::Delayed(due), None => Ev::Watchdog },
             t = term_rx.recv().fuse() => match t { Ok((s, out)) => Ev::Term(s, out), Err(_) => Ev::Watchdog },
             up = up_rx.recv().fuse() => match up { Ok(u) => Ev::Up(u), Err(_) => Ev::Watchdog },
@@ -1890,6 +1991,21 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                     buffered += data.len();
                     buffer.push_back((lane, kind, data));
                 }
+            }
+            Ev::Wants => {
+                // Never waiting for the uplink's room: this loop is what drains it, and a want it
+                // has no room for now is asked again on the gap's clock.
+                for f in wire_in.wants(Instant::now()) {
+                    let _ = uplink.0.try_send(Up::Term(AgentMsg::Wire(f)));
+                }
+            }
+            Ev::HaveSoon => {
+                // Never waiting for the uplink's room (this loop drains it): one with no room now
+                // is said again soon, or with the next sample.
+                if connected && server_wire {
+                    let _ = uplink.0.try_send(Up::Term(AgentMsg::Wire(wire_in.have())));
+                }
+                have_soon = have_soon.filter(|(_, left)| *left > 1).map(|(_, left)| (Instant::now() + HAVE_SOON, left - 1));
             }
             Ev::ChaosDrop => {
                 chaos_drop = None;
@@ -2228,7 +2344,7 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                                 }
                                 moved.clear();
                                 draining = false;
-                                serve_sockets(reach.as_ref(), harness.as_ref(), &name, &o.state_dir);
+                                serve_sockets(reach.as_ref(), harness.as_ref(), &name, &sock, &o.state_dir);
                                 announce(term_list(&terms), harness.as_ref(), &uplink).await;
                                 for d in held_back.drain(..) {
                                     let _ = bg_tx.try_send(Bg::Forwarded(d));
@@ -2257,7 +2373,7 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                                 }
                                 (convo, shipper) = (Some(st), Some(ship));
                             }
-                            serve_sockets(reach.as_ref(), harness.as_ref(), &name, &o.state_dir);
+                            serve_sockets(reach.as_ref(), harness.as_ref(), &name, &sock, &o.state_dir);
                             for d in held_back {
                                 let _ = bg_tx.try_send(Bg::Forwarded(d));
                             }
@@ -2347,12 +2463,12 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                         // The server learns they run here now.
                         announce(term_list(&terms), harness.as_ref(), &uplink).await;
                         if !std::mem::replace(&mut sockets_served, true) {
-                            serve_sockets(reach.as_ref(), harness.as_ref(), &name, &o.state_dir);
+                            serve_sockets(reach.as_ref(), harness.as_ref(), &name, &sock, &o.state_dir);
                         }
                     }
                     Bg::TakeOverEnded => {
                         if !std::mem::replace(&mut sockets_served, true) {
-                            serve_sockets(reach.as_ref(), harness.as_ref(), &name, &o.state_dir);
+                            serve_sockets(reach.as_ref(), harness.as_ref(), &name, &sock, &o.state_dir);
                         }
                         // It ended before the runner it upgraded said which conversation store this
                         // one goes on with (that one died, or their link broke, before its first
@@ -2699,8 +2815,11 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                 }
                 connected = false;
                 welcomed = false;
-                // The channel's items in flight go again once the server says what it has.
+                // The channel's items in flight go again once the server says what it has, and
+                // the server's from what this side says it has.
                 updates.down();
+                wire_in.down();
+                have_soon = None;
                 server_wire = false;
                 server_drops = false;
                 server_unread = false;
@@ -2760,7 +2879,7 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                                 crate::wire::commands::Stand::Newer(prefix) => wire_in.forget_where(|s| s != stream && crate::wire::commands::prefix_of(s) == Some(prefix)),
                                 crate::wire::commands::Stand::Current => {}
                             }
-                            let answer = match wire_in.on_item(&stream, seq, low, body) {
+                            let answer = match wire_in.on_item(&stream, seq, low, body, Instant::now()) {
                                 Arrival::Take(body) => match proto::read_server(&body) {
                                     Ok(ServerMsg::Wire(_)) => {
                                         let why = "a channel frame inside a command";
@@ -2888,7 +3007,7 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                         // kiln told.
                         let json = raw.as_deref().unwrap_or_default();
                         let epoch_here = harness.as_ref().and_then(|h| h.get(&session)).map(|s| s.epoch());
-                        let for_me = crate::runner::custody::word_for_me(&session, json, server_custody, &root, &o.name, &instance_id, epoch_here);
+                        let for_me = crate::runner::custody::word_for_me(&session, json, server_custody, &root, &name, &instance_id, epoch_here);
                         // One about a session this runner handed to its new build (blue/green): that
                         // build's now, whoever kiln still counts.
                         #[cfg(unix)]
@@ -2903,7 +3022,7 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                         });
                         // Another agent's words kiln passed on, checked end to end before the session
                         // takes them (docs/ci.md W27-R08's relays).
-                        let relayed = if known { crate::runner::custody::relayed_words(&session, json, &root, &o.name, &instance_id) } else { Ok(()) };
+                        let relayed = if known { crate::runner::custody::relayed_words(&session, json, &root, &name, &instance_id) } else { Ok(()) };
                         match *command {
                             _ if for_me.is_err() => {
                                 let why = for_me.as_ref().err().map(String::as_str).unwrap_or_default();
@@ -2948,7 +3067,7 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                         // Another agent's words kiln passed on, checked end to end before the session
                         // takes them: refused, its inbox's answer saying why (docs/ci.md W27-R08's
                         // relays).
-                        let relayed = if known { crate::runner::custody::relayed_words(&session, raw.as_deref().unwrap_or_default(), &root, &o.name, &instance_id) } else { Ok(()) };
+                        let relayed = if known { crate::runner::custody::relayed_words(&session, raw.as_deref().unwrap_or_default(), &root, &name, &instance_id) } else { Ok(()) };
                         match *command {
                             c if relayed.is_err() => {
                                 let why = relayed.err().unwrap_or_default();
@@ -3428,6 +3547,7 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                         }
                         if server_wire {
                             uplink.0.send(Up::Term(AgentMsg::Wire(wire_in.have()))).await.ok();
+                            have_soon = Some((Instant::now() + HAVE_SOON, HAVES_SOON));
                         }
                     }
                     // The relay refused a frame of this runner's reach links: as a close, its code
@@ -3562,7 +3682,7 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                         // connected and welcomed, it says it's ready, and takes everything.
                         #[cfg(unix)]
                         if let Some(path) = take_over.take() {
-                            let (h, tx, me, takes) = (harness.clone(), bg_tx.clone(), Me { machine: o.name.clone(), instance: instance_id.clone(), root: root.clone() }, stores_wait);
+                            let (h, tx, me, takes) = (harness.clone(), bg_tx.clone(), Me { machine: name.clone(), instance: instance_id.clone(), root: root.clone() }, stores_wait);
                             crate::rt::spawn(async move {
                                 if let Err(e) = take_over_from(path, h, tx.clone(), me, takes).await {
                                     tracing::warn!(error = %format!("{e:#}"), "couldn't take over from the runner being upgraded");

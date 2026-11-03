@@ -1,0 +1,102 @@
+[package]
+name = "mantle-engine"
+description = "mantle's Rust conversion of RocksDB 11.8.1, byte-compatible with its files"
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[dependencies]
+hyper-block = { path = "../../../hyper-raft/crates/hyper-block" }
+# The shards a node runs its ranges on (docs/design/engine-structure.md §2, step E2).
+hyper-rt = { path = "../../../hyper-raft/crates/hyper-rt" }
+mantle-crc = { path = "../crc" }
+thiserror.workspace = true
+
+# The OS interface of port/mmap.rs: anonymous mappings for the memtable arena's blocks.
+[target.'cfg(unix)'.dependencies]
+rustix.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+windows-sys.workspace = true
+
+[features]
+# The ranges bench's count of every allocation, hyper-measure's counting allocator installed as the
+# global allocator: a diagnostic, off by default and never in a performance build. Off, the bench
+# runs on the system allocator and reports its allocation counts as unavailable.
+count-allocs = []
+# The ranges bench's phase bounds on CLOCK_MONOTONIC ("phasemono" lines), for checking a profile's
+# samples against its phases: a diagnostic, off by default and never in a performance build.
+profile-phases = []
+
+[dev-dependencies]
+# The simulated device with power-loss semantics the store's crash tests run on.
+hyper-block = { path = "../../../hyper-raft/crates/hyper-block", features = ["sim"] }
+proptest.workspace = true
+# The oracle of the engine's own xxHash (util/xxhash.rs, tests/xxhash_test.rs).
+twox-hash.workspace = true
+# The oracle of the engine's own Zstandard (codec/zstd, tests/zstd_test.rs).
+zstd.workspace = true
+tempfile.workspace = true
+# Allocation and page-fault counts of the benchmarks against RocksDB.
+hyper-measure = { path = "../../../hyper-raft/crates/hyper-measure" }
+# The benchmarks' fixed-size latency histograms (bounded at any operation count).
+mantle-disk = { path = "../disk" }
+
+[[bench]]
+name = "memtable"
+harness = false
+
+[[bench]]
+name = "block_read"
+harness = false
+
+[[bench]]
+name = "codec"
+harness = false
+
+[lints]
+workspace = true
+
+[[bench]]
+name = "shard_db"
+harness = false
+
+[[bench]]
+name = "incmap"
+harness = false
+
+[[bench]]
+name = "ranges"
+harness = false
+
+[[bench]]
+name = "surf"
+harness = false
+
+[[bench]]
+name = "seek_cursor"
+harness = false
+
+[[bench]]
+name = "leaf_index"
+harness = false
+
+[[bench]]
+name = "compaction"
+harness = false
+
+[[bench]]
+name = "point_read"
+harness = false
+
+[[bench]]
+name = "active_order"
+harness = false
+
+[[bench]]
+name = "surf_build"
+harness = false

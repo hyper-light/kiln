@@ -7,6 +7,10 @@ use std::collections::{BTreeMap, HashSet};
 
 use serde::{Deserialize, Serialize};
 
+use crate::identity::chain::{Actor, Holder, Identity};
+
+pub mod agents;
+
 /// A diff's state (review.md): `draft` and `needs-review` to `landed`, or `abandoned`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
@@ -122,7 +126,8 @@ pub fn title_and_summary(message: &str) -> (String, String) {
 /// A push's options (`git push -o …`): `draft`, `ready`, `reviewer=ada,agent:review`
 /// (repeatable), `message=…` (a note on the new versions), `topic=…`, `title=…` (a change
 /// request's), `change=<sha>:<D41|new>` (repeatable: which change a commit is, when kiln asked,
-/// W26-R03); unknown ones are said back.
+/// W26-R03), `answer=<thread>` (repeatable: a thread the new version answers, W26-R18); unknown ones
+/// are said back.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Options {
     pub draft: bool,
@@ -134,6 +139,8 @@ pub struct Options {
     pub title: Option<String>,
     /// Answers to kiln's questions of which change a commit is.
     pub answers: Vec<crate::identity::Answer>,
+    /// The threads the new version answers: a fix of theirs, an agent's when an agent pushed it.
+    pub threads: Vec<String>,
     pub unknown: Vec<String>,
 }
 
@@ -150,6 +157,13 @@ pub fn options<S: AsRef<str>>(given: &[S]) -> Options {
             ("topic", Some(v)) if !v.is_empty() => o.topic = Some(v.to_owned()),
             ("title", Some(v)) if !v.is_empty() => o.title = Some(v.to_owned()),
             ("change", Some(v)) if crate::identity::answer(v).is_some() => o.answers.extend(crate::identity::answer(v)),
+            ("answer", Some(v)) if !v.is_empty() => {
+                for t in v.split(',').map(str::trim).filter(|t| !t.is_empty()) {
+                    if !o.threads.iter().any(|x| x == t) {
+                        o.threads.push(t.to_owned());
+                    }
+                }
+            }
             _ => o.unknown.push(opt.to_owned()),
         }
     }
@@ -595,6 +609,74 @@ pub fn named(principal: &str) -> &str {
     p.rsplit(':').next().unwrap_or(p)
 }
 
+/// Who wrote a comment, as its line names them (W26-R18): a person by name, an agent by its
+/// session's name for the person it acts for, a CI job by its leg.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct Byline {
+    /// `person`, `agent` or `job`.
+    pub kind: &'static str,
+    pub name: String,
+    /// The person an agent acts for, when kiln knows it.
+    #[serde(rename = "for", skip_serializing_if = "Option::is_none")]
+    pub for_person: Option<String>,
+}
+
+impl Byline {
+    /// In words: `kim`, `Matrix agent for kim`.
+    pub fn words(&self) -> String {
+        match &self.for_person {
+            Some(p) => format!("{} for {p}", self.name),
+            None => self.name.clone(),
+        }
+    }
+
+    /// The line an agent's words end with on a host's pull request, where the host shows them as
+    /// the account they went through, the person's or kiln's (W26-R18): `— Matrix agent (an agent
+    /// for kim), through kiln`, its name cut to 60 characters. None for anyone else's.
+    pub fn on_a_host(&self) -> Option<String> {
+        if self.kind != "agent" {
+            return None;
+        }
+        let name = match self.name.char_indices().nth(HOST_NAME_CHARS) {
+            Some((at, _)) => format!("{}…", self.name.get(..at).unwrap_or(&self.name).trim_end()),
+            None => self.name.clone(),
+        };
+        let whose = self.for_person.as_ref().map_or_else(|| "an agent".to_owned(), |p| format!("an agent for {p}"));
+        Some(format!("— {name} ({whose}), through kiln"))
+    }
+}
+
+/// The most of an agent's name its line on a host carries.
+const HOST_NAME_CHARS: usize = 60;
+
+/// The byline of `author`, a principal as review records it (`user:kim`, `agent:<session>`, an
+/// agent session as `agent:<its id's start>@<its runner>`, `job:<leg>`, `admin`). An agent is
+/// named `name` (its session's, when kiln has it), else by the start of its session's id; the
+/// person it acts for is the one its signature's identity (`signer`) names, else its session's
+/// newest identity (`newest`), else none: an identity of that session, on that runner.
+pub fn byline(author: &str, name: Option<&str>, signer: Option<&Identity>, newest: Option<&Identity>) -> Byline {
+    let p = author.split(" for ").next().unwrap_or(author).trim();
+    if let Some(rest) = p.strip_prefix("agent:") {
+        let (session, machine) = rest.split_once('@').map_or((rest, None), |(s, m)| (s, Some(m)));
+        let its = |agent: &str, held: Option<&Holder>| (agent == session || (session.len() >= 8 && agent.starts_with(session))) && machine.zip(held).is_none_or(|(m, h)| h.machine == m);
+        let person = [signer, newest].into_iter().flatten().find_map(|id| match &id.actor {
+            Actor::Agent { person, agent, held_by, .. } if its(agent, held_by.as_ref()) => Some(person.clone()),
+            _ => None,
+        });
+        let name = name.map(str::trim).filter(|n| !n.is_empty()).map_or_else(|| format!("agent {}", session.get(..8).unwrap_or(session)), str::to_owned);
+        return Byline { kind: "agent", name, for_person: person };
+    }
+    if let Some(leg) = p.strip_prefix("job:") {
+        return Byline { kind: "job", name: format!("job {leg}"), for_person: None };
+    }
+    let name = match p.strip_prefix("user:") {
+        Some(n) => n.to_owned(),
+        None if p == "admin" => "the owner".to_owned(),
+        None => p.to_owned(),
+    };
+    Byline { kind: "person", name, for_person: None }
+}
+
 fn open_count(n: u32, kind: &str) -> String {
     format!("{n} {kind}{} open", if n == 1 { "" } else { "s" })
 }
@@ -708,6 +790,15 @@ mod tests {
         // W26-R03: answers to which change a commit is.
         use crate::identity::{Answer, Choice};
         assert_eq!(o.answers, [Answer { commit: "abc1234".into(), choice: Choice::Change("D41".into()) }, Answer { commit: "def5678".into(), choice: Choice::New }]);
+    }
+
+    /// W26-R18: a push names the threads its new version answers, each once, in the order given.
+    #[test]
+    fn w26_r18_a_push_names_the_threads_it_answers() {
+        let o = options(&["answer=th1", "answer=th2, th3", "answer=th1", "answer="]);
+        assert_eq!(o.threads, ["th1", "th2", "th3"]);
+        assert_eq!(o.unknown, ["answer="]);
+        assert!(options(&["draft"]).threads.is_empty());
     }
 
     fn commit(sha: &str, parent: &str, id: &str, title: &str, patch: &str) -> Commit {
@@ -917,5 +1008,38 @@ mod tests {
         assert_eq!(Kind::Blocking.as_str(), "blocking");
         assert_eq!((named("user:kim"), named("agent:review for user:kim"), named("admin")), ("kim", "review", "admin"));
         assert_eq!((place(Some(EXPAND), Some(22)), place(None, Some(3))), ("expand.rs:22".to_owned(), "the conversation".to_owned()));
+    }
+
+    /// A comment's line names its author (W26-R18): a person by name; an agent by its session's
+    /// name for the person its identity names (its signature's first, else its session's newest);
+    /// a job by its leg.
+    #[test]
+    fn w26_r18_a_byline_names_an_agent_for_its_person() {
+        const S: &str = "01a19c0ffee0000000000000000000ab";
+        let agent = |person: &str, session: &str| Identity::new("acme", Actor::Agent { person: person.into(), agent: session.into(), epoch: 1, held_by: None });
+        let kim = byline("user:kim", None, None, None);
+        assert_eq!((kim.kind, kim.words()), ("person", "kim".to_owned()));
+        let signed = byline(&format!("agent:{S}"), Some("Matrix agent"), Some(&agent("kim", S)), None);
+        assert_eq!((signed.kind, signed.for_person.as_deref(), signed.words()), ("agent", Some("kim"), "Matrix agent for kim".to_owned()));
+        let unsigned = byline(&format!("agent:{S} for user:kim"), Some("Matrix agent"), None, Some(&agent("kim", S)));
+        assert_eq!(unsigned.words(), "Matrix agent for kim", "an unsigned comment's agent, by its session's newest identity");
+        assert_eq!(byline(&format!("agent:{S}"), Some("Matrix agent"), None, None).words(), "Matrix agent", "no identity: no person");
+        assert_eq!(byline(&format!("agent:{S}"), None, Some(&agent("kim", "01a19another")), None).words(), "agent 01a19c0f", "another session's identity names no one here; no name: its id's start");
+        // An agent session comments as `agent:<its id's start>@<its runner>`; its identity names its
+        // whole id and the runner holding its key.
+        let held = |machine: &str| Identity::new("acme", Actor::Agent { person: "kim".into(), agent: S.into(), epoch: 0, held_by: Some(Holder { machine: machine.into(), instance: "main".into() }) });
+        let start = S.get(..8).unwrap_or(S);
+        assert_eq!(byline(&format!("agent:{start}@box-a"), Some("Matrix agent"), Some(&held("box-a")), None).words(), "Matrix agent for kim", "its session, on its runner");
+        assert_eq!(byline(&format!("agent:{start}@box-b"), None, Some(&held("box-a")), None).for_person, None, "a session of the same start on another runner isn't it");
+        assert_eq!(byline(&format!("agent:{start}@box-a for user:kim"), None, None, None).words(), "agent 01a19c0f", "no name, no identity: its id's start");
+        assert_eq!(byline("job:build-3", None, None, None), Byline { kind: "job", name: "job build-3".into(), for_person: None });
+        assert_eq!(byline("admin", None, None, None).words(), "the owner");
+        assert_eq!(serde_json::to_value(&signed).ok(), Some(serde_json::json!({ "kind": "agent", "name": "Matrix agent", "for": "kim" })));
+        // On a host, where the words go as the person's account or kiln's, an agent's name them.
+        assert_eq!(signed.on_a_host().as_deref(), Some("— Matrix agent (an agent for kim), through kiln"));
+        assert_eq!(byline(&format!("agent:{S}"), Some("Matrix agent"), None, None).on_a_host().as_deref(), Some("— Matrix agent (an agent), through kiln"));
+        assert_eq!(kim.on_a_host(), None, "a person's words are theirs");
+        let long = byline(&format!("agent:{S}"), Some(&"x".repeat(80)), Some(&agent("kim", S)), None).on_a_host().unwrap_or_default();
+        assert!(long.starts_with(&format!("— {}…", "x".repeat(60))) && long.ends_with("(an agent for kim), through kiln"), "{long}");
     }
 }

@@ -17,13 +17,14 @@ use serde_json::{Value, json};
 use super::core::{Baseline, Core, Effect};
 use super::model::{
     AlwaysOption, Approval, Body, Command, Control, ControlKind, ControlOption, ControlScope, Decision, Delivery, ExitInfo, FileDiff, HookInfo, Known, Level, Limit, McpServer,
-    McpStatus, McpTool, ModeOption, ModelOption, Objective, Plugin, Question, QuestionOption, QueueItem, SendMode, Skill, SlashCommand, Status, StatusItem, Task, Todo, Tone, ToolCall,
+    McpStatus, McpTool, ModeOption, ModelOption, Objective, Perms, Plugin, Question, QuestionOption, QueueItem, SendMode, Skill, SlashCommand, Status, StatusItem, Task, Todo, Tone, ToolCall,
     ChoiceAnswer, ToolKind, ToolStatus, OUTPUT_MAX, Route, account_id, choices_of, clip_json, clip_middle, mask_emails, plan_label, safe_url, sort_catalog, window_words,
 };
 use super::claude::{McpAdd, mcp_status_words, safe_command, valid_server_name};
 
-/// What a session of it can do, said when it starts (and again after an in-place upgrade).
-pub(super) const FEATURES: &[&str] = &["steer", "send_now", "queue", "queue_steer", "interrupt", "set_mode", "permissions_live", "set_model", "set_effort", "set_speed", "file_suggestions", "resume", "attachments", "images", "overrides", "switch_harness", "own_edits"];
+/// What a session of it can do, said when it starts (and again after an in-place upgrade);
+/// `limits` joins them once Codex trusts kiln's hook (`set_hook_trusted`).
+pub(super) const FEATURES: &[&str] = &["steer", "send_now", "queue", "queue_steer", "interrupt", "set_mode", "permissions_live", "set_model", "set_effort", "set_speed", "file_suggestions", "resume", "attachments", "images", "overrides", "switch_harness", "own_edits", "remove_task", "web_whole"];
 /// It turns nothing on or off once it runs.
 pub(super) const LEARNED: &[&str] = &[];
 
@@ -313,8 +314,13 @@ pub struct Codex {
     children: HashMap<String, Child>,
     /// The message that started (or was steered into) the turn under way.
     turn_messages: Vec<String>,
-    /// Messages to send once the thread exists or the turn under way has been interrupted.
+    /// Legacy buffered messages from an image predating the durable queue.
+    #[serde(default)]
     waiting: Vec<QueueItem>,
+    #[serde(default)]
+    now: Option<String>,
+    #[serde(default)]
+    interrupt_on_start: bool,
     /// The reasoning effort for turns (None: the model's default).
     effort: Option<String>,
     /// The service tier for the thread and its turns, as kiln set it ("" standard, else a tier's
@@ -432,6 +438,25 @@ pub struct Codex {
     /// to pass on with its own agent tools: by subagent (its thread), their ids, oldest first.
     #[serde(default)]
     relays: HashMap<String, std::collections::VecDeque<String>>,
+    /// Codex lists kiln's hook ([`hook_args`]) as trusted: each of its local tool calls comes to
+    /// kiln first ([`Codex::hook`]), so a person's pause and what each may do hold it.
+    #[serde(default)]
+    hook_trusted: bool,
+    /// Calls held for a person's pause: the subagent each is in, and the hook's answer, given
+    /// when it's resumed (`release_held`). Not kept over an in-place upgrade: the hook's link to
+    /// this process goes with it, and the call goes on.
+    #[serde(skip)]
+    held_hooks: Vec<(String, futures::channel::oneshot::Sender<Value>)>,
+    /// Calls a person sees first (Ask), by the id of the approval kiln shows them: the hook's
+    /// answer, given as they answer it.
+    #[serde(skip)]
+    hook_asks: HashMap<String, futures::channel::oneshot::Sender<Value>>,
+    /// The person was told once why its subagents can't be held (`set_hook_trusted`).
+    #[serde(default)]
+    hook_warned: bool,
+    /// Its thread runs with web search off: what the person lets it do turned it off (`web_off`).
+    #[serde(default)]
+    web_off: bool,
 }
 
 impl Codex {
@@ -457,6 +482,8 @@ impl Codex {
             children: HashMap::new(),
             turn_messages: Vec::new(),
             waiting: Vec::new(),
+            now: None,
+            interrupt_on_start: false,
             effort: None,
             speed: None,
             resume,
@@ -510,6 +537,11 @@ impl Codex {
             injecting: false,
             goal: None,
             relays: HashMap::new(),
+            hook_trusted: false,
+            held_hooks: Vec::new(),
+            hook_asks: HashMap::new(),
+            hook_warned: false,
+            web_off: false,
         }
     }
 
@@ -1254,6 +1286,28 @@ impl Codex {
         self.injecting || self.turn.is_some() || matches!(self.thread_status, Some(Status::Running | Status::Waiting)) || own_approval || self.pending.values().any(|p| matches!(p, Pending::Turn(_)))
     }
 
+    fn accepting(&self, core: &Core) -> bool {
+        self.thread.is_some() && !self.reopen && !self.injecting
+            && core.state.status != Status::Exited
+            && !matches!(self.thread_status, Some(Status::Starting | Status::Exited))
+            && !self.pending.values().any(|p| matches!(p, Pending::Initialize | Pending::Thread | Pending::History | Pending::Inject))
+    }
+
+    fn restore_waiting(&mut self, core: &mut Core) -> bool {
+        if self.waiting.is_empty() {
+            return false;
+        }
+        for m in std::mem::take(&mut self.waiting).into_iter().rev() {
+            let m = match core.state.queue.iter().position(|q| q.id == m.id) {
+                Some(pos) => core.state.queue.remove(pos),
+                None => m,
+            };
+            core.state.queue.insert(0, m);
+        }
+        core.touch_state();
+        true
+    }
+
     /// Start again with the changed settings (resuming the thread), unless a turn is under way or
     /// it left background terminals running: then once it's idle and they've ended.
     fn reload_when_idle(&mut self, core: &mut Core) {
@@ -1279,6 +1333,7 @@ impl Codex {
     }
 
     pub fn start(&mut self, core: &mut Core) {
+        self.restore_waiting(core);
         // Codex's commands (skills join when they are listed).
         if core.meta.commands.is_empty() {
             core.meta.commands = sort_catalog(codex_catalog());
@@ -1324,6 +1379,12 @@ impl Codex {
     }
 
     pub fn exited(&mut self, core: &mut Core, code: Option<i32>, error: Option<String>) {
+        self.restore_waiting(core);
+        // Calls kiln held went with its process.
+        self.held_hooks.clear();
+        for id in std::mem::take(&mut self.hook_asks).into_keys() {
+            core.take_approval(&id);
+        }
         // What kiln took back over runs apart from it (`survivors`).
         for t in core.state.tasks.iter_mut().filter(|t| t.live() && !t.id.starts_with(super::survivors::LEFT)) {
             t.status = "stopped".into();
@@ -1334,6 +1395,7 @@ impl Codex {
         self.pending.clear();
         self.asks.clear();
         self.permissions_changing = false;
+        self.interrupt_on_start = false;
         self.turn_permissions = None;
         self.withheld.clear();
         self.stopped.clear();
@@ -1362,6 +1424,7 @@ impl Codex {
     // ------------------------------------------------------------------ commands
 
     pub fn command(&mut self, core: &mut Core, cmd: Command) {
+        self.restore_waiting(core);
         match cmd {
             Command::Send { id, text, mode, attachments, overrides, reply_to, .. } => {
                 // A checkpoint anchors the prompt's moment: kiln's go-back file restore
@@ -1464,7 +1527,7 @@ impl Codex {
             Command::SetSpeed { speed } => self.notice(core, Level::Warn, format!("{speed}: not a speed Codex lists for its models")),
             Command::Control { id, value } => self.control(core, &id, value),
             // The session itself does these (a move is not the harness's business).
-            Command::Restart | Command::ForceStop | Command::Snapshot | Command::MoveTo { .. } | Command::Moving { .. } | Command::HandedOver { .. } | Command::OwnEdits { .. } => {}
+            Command::Restart | Command::ForceStop | Command::Snapshot | Command::MoveTo { .. } | Command::Moving { .. } | Command::HandedOver { .. } | Command::OwnEdits { .. } | Command::RemoveTask { .. } => {}
             // A terminal Codex left running: Codex has no way to stop it from outside, so kiln stops
             // the process itself (the newest one under Codex running that command).
             // A subagent: its turn under way is interrupted, as a person asked.
@@ -1482,6 +1545,11 @@ impl Codex {
             }
             // A pause's commands are the session's (`harness::pause`).
             Command::Resume | Command::AutoResume { .. } | Command::PauseAt { .. } | Command::MaxSubagents { .. } | Command::MoveOnLimit { .. } | Command::LimitHold { .. } => {}
+            // A person's pause of one of its subagents, and what each may do: held at its calls
+            // through kiln's hook. The whole session's are its session's (`session::pause_session`).
+            Command::Pause { on, task: Some(task) } => self.pause_subagent(core, &task, on),
+            Command::Perms { perms, task: Some(task) } => self.set_task_perms(core, &task, perms),
+            Command::Pause { .. } | Command::Perms { .. } | Command::Branch { .. } => {}
             Command::McpEnable { name, enabled } => {
                 if !valid_server_name(&name) {
                     self.notice(core, Level::Warn, format!("{name}: not a server kiln can change"));
@@ -1652,6 +1720,9 @@ impl Codex {
     /// Every few seconds: a thread open to send again; servers still starting; the plan's rate
     /// limits now and then.
     pub fn tick(&mut self, core: &mut Core) {
+        if self.restore_waiting(core) {
+            self.next(core);
+        }
         // A hot upgrade adopts the adapter without start(); reconcile legacy override labels.
         self.permission_controls(core);
         self.reload_when_idle(core);
@@ -1862,7 +1933,10 @@ impl Codex {
 
     fn interrupt(&mut self, core: &mut Core) {
         if let (Some(thread), Some(turn)) = (self.thread.clone(), self.turn.clone()) {
+            self.interrupt_on_start = false;
             self.request(core, Pending::Interrupt, "turn/interrupt", json!({"threadId": thread, "turnId": turn}));
+        } else if self.pending.values().any(|p| matches!(p, Pending::Turn(_))) {
+            self.interrupt_on_start = true;
         }
     }
 
@@ -1873,16 +1947,21 @@ impl Codex {
         }
         if mode == SendMode::Now {
             self.permissions_changing = false;
+            self.now = Some(m.id.clone());
         }
         if core.state.goal.is_empty() {
             core.state.goal = clip_middle(&m.text, 600).0;
         }
-        let Some(thread) = self.thread.clone() else {
-            // Not ready yet: goes out once the thread exists.
-            self.show_sent(core, &m, Delivery::Queued);
-            self.waiting.push(m);
+        if !self.accepting(core) {
+            if mode == SendMode::Now {
+                core.state.queue.insert(0, m);
+            } else {
+                core.state.queue.push(m);
+            }
+            core.touch_state();
             return;
-        };
+        }
+        let Some(thread) = self.thread.clone() else { return };
         let busy = self.busy(core);
         match (busy, mode, self.turn.clone()) {
             (true, SendMode::Steer, Some(turn)) => {
@@ -1891,15 +1970,20 @@ impl Codex {
                 self.turn_messages.push(m.id.clone());
                 self.show_sent(core, &m, Delivery::Sent);
             }
-            (true, SendMode::Now, Some(_)) => {
+            (true, SendMode::Now, _) => {
                 // Stop the turn; this message starts the next one.
-                self.show_sent(core, &m, Delivery::Queued);
-                self.waiting.insert(0, m);
+                core.state.queue.insert(0, m);
+                core.touch_state();
                 self.interrupt(core);
             }
             (true, _, _) => {
                 core.state.queue.push(m);
                 core.touch_state();
+            }
+            (false, SendMode::Queue, _) => {
+                core.state.queue.push(m);
+                core.touch_state();
+                self.next(core);
             }
             (false, _, _) => self.start_turn(core, &thread, m),
         }
@@ -1924,6 +2008,9 @@ impl Codex {
     }
 
     fn start_turn(&mut self, core: &mut Core, thread: &str, m: QueueItem) {
+        if self.now.as_deref() == Some(&m.id) {
+            self.now = None;
+        }
         self.thread_status = None;
         let (approval, sandbox_mode, sandbox) = self.policies(core);
         self.turn_permissions = Some((approval.clone(), sandbox_mode));
@@ -2021,23 +2108,24 @@ impl Codex {
         }
     }
 
-    /// Between turns: the next waiting message, then kiln's queue.
+    /// Between turns: the next message in kiln's queue.
     pub(crate) fn next(&mut self, core: &mut Core) {
-        if self.busy(core) || core.state.status == Status::Exited {
+        self.restore_waiting(core);
+        if !self.accepting(core) || self.busy(core) || core.state.queue.is_empty() {
             return;
         }
         // A pause (or a switch) holds what waits, and the stop point may start one here.
-        if (!self.waiting.is_empty() || !core.state.queue.is_empty()) && !super::pause::open(core) {
+        let class = if core.state.queue.first().is_some_and(|m| self.now.as_deref() == Some(&m.id)) {
+            crate::headroom::Class::Person
+        } else {
+            crate::headroom::Class::Agent
+        };
+        if !super::pause::open_for(core, class) {
             return;
         }
         // No turn to steer into: what was to be steered goes out in order.
         self.steer_on_start.clear();
         let Some(thread) = self.thread.clone() else { return };
-        if !self.waiting.is_empty() {
-            let m = self.waiting.remove(0);
-            self.start_turn(core, &thread, m);
-            return;
-        }
         if !core.state.queue.is_empty() {
             let item = core.state.queue.remove(0);
             core.touch_state();
@@ -2084,19 +2172,166 @@ impl Codex {
 
     /// A pause ended: the turn it cut off goes on first, then kiln's queue.
     pub fn go_on(&mut self, core: &mut Core, p: super::model::Pause) {
-        if p.cut.is_some() && !self.busy(core) && core.state.status != Status::Exited {
-            let id = crate::util::new_id();
-            self.send(core, QueueItem { id: id.clone(), text: super::pause::CONTINUE.to_owned(), at: Core::now(), attachments: Vec::new(), overrides: None, reply_to: None }, SendMode::Queue);
-            super::pause::from_kiln(core, &id);
-            return;
-        }
         if p.cut.is_some() {
             super::pause::continue_later(core, super::pause::CONTINUE);
         }
         self.next(core);
     }
 
+    // ------------------------------------------------------------------ kiln's hook
+
+    /// Whether Codex lists kiln's hook as trusted, so its calls come to kiln first.
+    pub fn holds_calls(&self) -> bool {
+        self.hook_trusted
+    }
+
+    /// Codex's hook asks before a tool call (`input`: its PreToolUse input, as `kiln
+    /// harness-hook` hands it on): a paused subagent's call waits until it's resumed; what a person
+    /// lets the subagent do (or the agent, for its own) refuses it, asks them first, or lets it go.
+    /// The answer goes to `reply`; nothing (`{}`) lets the call go.
+    pub fn hook(&mut self, core: &mut Core, input: Value, reply: futures::channel::oneshot::Sender<Value>) {
+        if input.get("hook_event_name").and_then(Value::as_str) != Some("PreToolUse") {
+            let _ = reply.send(json!({}));
+            return;
+        }
+        // The subagent: the one whose turn the call is in (Codex names the parent's session alone).
+        let task = input.get("turn_id").and_then(Value::as_str).and_then(|turn| self.turn_task(core, turn));
+        if let Some(t) = task.as_ref().filter(|t| super::hold::paused(core, t)) {
+            self.held_hooks.push((t.clone(), reply));
+            return;
+        }
+        let name = input.get("tool_name").and_then(Value::as_str).unwrap_or("");
+        let args = input.get("tool_input").cloned().unwrap_or(Value::Null);
+        let (kind, paths) = hook_call(name, &args);
+        let paths: Vec<&str> = paths.iter().map(String::as_str).collect();
+        match super::hold::verdict(core, task.as_deref(), kind, &paths) {
+            None => {
+                let _ = reply.send(json!({}));
+            }
+            Some(("ask", why)) => self.ask_hook(core, task.as_deref(), &input, kind, why, reply),
+            Some((_, why)) => {
+                let _ = reply.send(hook_deny(&why));
+            }
+        }
+    }
+
+    /// The subagent whose turn `turn` is (its thread), None for the agent's own.
+    fn turn_task(&self, core: &Core, turn: &str) -> Option<String> {
+        let (thread, _) = self.children.iter().find(|(_, c)| c.turn.as_deref() == Some(turn))?;
+        core.state.tasks.iter().find(|t| t.id == *thread && t.subagent()).map(|t| t.id.clone())
+    }
+
+    /// A call a person sees first: kiln's own approval, which Codex's hook can't raise (its "ask"
+    /// isn't supported), held until they answer it (`answer`).
+    fn ask_hook(&mut self, core: &mut Core, task: Option<&str>, input: &Value, tool: ToolKind, why: String, reply: futures::channel::oneshot::Sender<Value>) {
+        self.next_id += 1;
+        let id = format!("kiln-ask-{}", self.next_id);
+        let name = input.get("tool_name").and_then(Value::as_str).unwrap_or("").to_owned();
+        let args = input.get("tool_input").cloned().unwrap_or(Value::Null);
+        let command = args.get("command").and_then(Value::as_str).map(str::to_owned);
+        let title = match (name.as_str(), command.as_deref()) {
+            ("apply_patch", Some(patch)) => format!("Change {}", patch_paths(patch).join(", ")),
+            (_, Some(c)) => c.lines().next().unwrap_or(c).to_owned(),
+            _ => name.clone(),
+        };
+        let approval = Approval {
+            id: id.clone(),
+            tool_id: input.get("tool_use_id").and_then(Value::as_str).map(str::to_owned),
+            tool_name: name,
+            tool,
+            title,
+            detail: None,
+            input: clip_json(&args, 64 * 1024),
+            command,
+            cwd: input.get("cwd").and_then(Value::as_str).unwrap_or(core.state.cwd.as_str()).to_owned(),
+            diffs: Vec::new(),
+            reason: Some(why),
+            always: Vec::new(),
+            default_to_no: false,
+            questions: Vec::new(),
+            plan: None,
+            agent: task.map(|id| core.state.tasks.iter().find(|t| t.id == id).map_or_else(|| id.to_owned(), |t| t.description.clone())),
+            at: Core::now(),
+        };
+        self.hook_asks.insert(id, reply);
+        core.state.doing = Some("Waiting for your approval".to_owned());
+        core.add_approval(approval);
+        self.settle(core);
+    }
+
+    /// A person pauses subagent `task` (its next tool call, and those of the subagents under it,
+    /// wait for their answer), or resumes it: what waited goes on, unless a pause above it holds it.
+    fn pause_subagent(&mut self, core: &mut Core, task: &str, on: bool) {
+        if on && !self.hook_trusted {
+            self.notice(core, Level::Warn, "Not paused: Codex didn't take kiln's hook, so its calls can't be held.");
+            return;
+        }
+        if !super::hold::pause(core, task, on) {
+            self.notice(core, Level::Warn, "Not paused: it has no such subagent.");
+            return;
+        }
+        if !on {
+            self.release_held(core);
+        }
+    }
+
+    /// What a person lets subagent `task` do (none: no limits of its own), within what it's under.
+    fn set_task_perms(&mut self, core: &mut Core, task: &str, perms: Option<Perms>) {
+        if !super::hold::set_perms(core, task, perms) {
+            self.notice(core, Level::Warn, "Not limited: it has no such subagent.");
+        }
+    }
+
+    /// The calls held for a pause that no longer holds them get their answer, and go on.
+    fn release_held(&mut self, core: &mut Core) {
+        let (still, free): (Vec<_>, Vec<_>) = std::mem::take(&mut self.held_hooks).into_iter().partition(|(task, _)| super::hold::paused(core, task));
+        self.held_hooks = still;
+        for (_, reply) in free {
+            let _ = reply.send(json!({}));
+        }
+    }
+
+    /// What the person lets the session do changed: its web search, which only its thread's settings
+    /// hold, changes as it starts again (the conversation continues) once it's idle.
+    pub fn perms_changed(&mut self, core: &mut Core) {
+        let off = web_off(core);
+        if off != self.web_off {
+            self.reload = Some(if off { "The web turned off for it" } else { "The web turned on for it" }.to_owned());
+            self.reload_when_idle(core);
+        }
+    }
+
+    /// What Codex lists of kiln's hook: trusted, its calls come to kiln, and the session can hold
+    /// its subagents (its `limits` feature); given but not trusted, the person is told why not.
+    fn set_hook_trusted(&mut self, core: &mut Core, own: Option<&Value>) {
+        let status = own.and_then(|h| h.get("trustStatus")).and_then(Value::as_str);
+        let trusted = status == Some("trusted") && own.and_then(|h| h.get("enabled")).and_then(Value::as_bool) != Some(false);
+        let was = self.hook_trusted;
+        self.hook_trusted = trusted;
+        let has = core.meta.features.iter().any(|f| f == "limits");
+        if trusted && !has {
+            core.meta.features.push("limits".into());
+        } else if !trusted && has {
+            core.meta.features.retain(|f| f != "limits");
+        }
+        if let Some(status) = status.filter(|_| !trusted && (was || !self.hook_warned)) {
+            self.hook_warned = true;
+            self.notice(core, Level::Warn, format!("Its subagents can't be paused or limited: Codex lists kiln's hook before each tool call as {status}, so it doesn't run it."));
+        }
+    }
+
     fn answer(&mut self, core: &mut Core, id: &str, decision: Decision, message: Option<String>, always: Option<usize>, choices: Option<Vec<ChoiceAnswer>>) {
+        // A call kiln held for the person to see first (Ask): its hook's answer.
+        if let Some(reply) = self.hook_asks.remove(id) {
+            core.take_approval(id);
+            let why = message.filter(|m| !m.trim().is_empty()).unwrap_or_else(|| "A person said no to this call.".to_owned());
+            let _ = reply.send(if decision == Decision::Deny { hook_deny(&why) } else { json!({}) });
+            if core.state.approvals.is_empty() && self.turn.is_some() {
+                core.state.doing = Some("Working".to_owned());
+            }
+            self.settle(core);
+            return;
+        }
         let Some(approval) = core.take_approval(id) else { return };
         let Some(ask) = self.asks.remove(id) else { return };
         let feedback = message.filter(|m| !m.trim().is_empty());
@@ -2166,8 +2401,8 @@ impl Codex {
                 }
                 // Cancelled: the feedback starts the next turn.
                 _ => {
-                    self.note(core, &mid, &f, Delivery::Queued);
-                    self.waiting.insert(0, QueueItem { id: mid, text: f, at: Core::now(), attachments: Vec::new(), overrides: None, reply_to: None });
+                    core.state.queue.insert(0, QueueItem { id: mid, text: f, at: Core::now(), attachments: Vec::new(), overrides: None, reply_to: None });
+                    core.touch_state();
                 }
             }
         }
@@ -2203,18 +2438,25 @@ impl Codex {
         if let Some(err) = v.get("error") {
             let msg = err.get("message").and_then(Value::as_str).unwrap_or("request failed").to_owned();
             let wait = not_yet(&msg).filter(|_| self.open_tries < OPEN_TRIES);
+            let refused_turn = matches!(&kind, Pending::Turn(_));
             match kind {
                 Pending::Suggest(client) => core.reply(client, json!({"error": msg})),
                 // The turn ended before the steer reached it: the message starts the next one.
                 Pending::Steer(id, Some(m)) if self.turn.is_none() => {
                     self.turn_messages.retain(|x| *x != id);
-                    self.show_sent(core, &m, Delivery::Queued);
-                    self.waiting.insert(0, m);
+                    core.state.queue.insert(0, m);
+                    core.touch_state();
                     self.next(core);
                 }
                 Pending::Turn(id) => {
                     self.permissions_changing = false;
+                    self.interrupt_on_start = false;
                     self.turn_permissions = None;
+                    self.turn_messages.retain(|m| m != &id);
+                    if self.turn.is_none() {
+                        core.state.turn_started = None;
+                        core.state.doing = None;
+                    }
                     core.state.delivery.insert(id, Delivery::Cancelled);
                     self.notice(core, Level::Error, format!("Codex refused the message: {msg}"));
                     core.touch_state();
@@ -2249,8 +2491,12 @@ impl Codex {
                     core.touch_state();
                 }
                 Pending::Thread => {
-                    self.notice(core, Level::Error, format!("Codex could not open the conversation: {msg}"));
-                    core.set_status(Status::Idle);
+                    let text = format!("Codex could not open the conversation: {msg}");
+                    self.notice(core, Level::Error, text.clone());
+                    self.thread_status = Some(Status::Exited);
+                    core.state.exit = Some(ExitInfo::now(None, Some(text)));
+                    core.state.doing = None;
+                    core.touch_state();
                 }
                 Pending::History => {
                     self.notice(core, Level::Warn, format!("Codex could not list the conversation's history: {msg}"));
@@ -2336,9 +2582,19 @@ impl Codex {
                     self.ready(core);
                 }
                 Pending::Plain(what) => self.notice(core, Level::Warn, format!("{what}: {msg}")),
-                Pending::Initialize => self.notice(core, Level::Error, format!("Codex did not start: {msg}")),
+                Pending::Initialize => {
+                    let text = format!("Codex did not start: {msg}");
+                    self.notice(core, Level::Error, text.clone());
+                    self.thread_status = Some(Status::Exited);
+                    core.state.exit = Some(ExitInfo::now(None, Some(text)));
+                    core.state.doing = None;
+                    core.touch_state();
+                }
             }
             self.settle(core);
+            if refused_turn {
+                self.next(core);
+            }
             return;
         }
         match kind {
@@ -2352,6 +2608,12 @@ impl Codex {
                 }
                 if let (Some(s), Some(o)) = (&self.speed, params.as_object_mut()) {
                     o.insert("serviceTier".into(), json!(service_tier(s)));
+                }
+                // Its web search is hosted, out of any hook's reach: off for the whole thread when the
+                // person turned the web off.
+                self.web_off = web_off(core);
+                if let (true, Some(o)) = (self.web_off, params.as_object_mut()) {
+                    o.insert("config".into(), json!({"web_search": "disabled"}));
                 }
                 match (self.resume.clone(), self.fork_at.take()) {
                     // A branch: a new thread with that one's turns up to `at`.
@@ -2503,6 +2765,9 @@ impl Codex {
                 }
                 core.state.delivery.insert(id, Delivery::Started);
                 core.touch_state();
+                if self.interrupt_on_start {
+                    self.interrupt(core);
+                }
                 self.interrupt_for_permissions(core);
                 self.steer_waiting(core);
             }
@@ -2748,23 +3013,22 @@ impl Codex {
                 }
             },
             Pending::Hooks => {
-                core.meta.hooks = result
-                    .get("data")
-                    .and_then(Value::as_array)
-                    .map(|d| {
-                        d.iter()
-                            .flat_map(|e| e.get("hooks").and_then(Value::as_array).cloned().unwrap_or_default())
-                            .filter_map(|h| {
-                                Some(HookInfo {
-                                    event: h.get("eventName").and_then(Value::as_str)?.to_owned(),
-                                    matcher: h.get("matcher").and_then(Value::as_str).unwrap_or("").to_owned(),
-                                    command: h.get("statusMessage").or_else(|| h.get("key")).and_then(Value::as_str).unwrap_or("").to_owned(),
-                                    source: h.get("source").and_then(Value::as_str).unwrap_or("").to_owned(),
-                                })
-                            })
-                            .collect()
+                let hooks: Vec<Value> = result.get("data").and_then(Value::as_array).into_iter().flatten().flat_map(|e| e.get("hooks").and_then(Value::as_array).cloned().unwrap_or_default()).collect();
+                // kiln's own hook: whether Codex runs it, and not among the person's.
+                let own = |h: &Value| h.get("key").and_then(Value::as_str) == Some(HOOK_KEY);
+                self.set_hook_trusted(core, hooks.iter().find(|h| own(h)));
+                core.meta.hooks = hooks
+                    .iter()
+                    .filter(|h| !own(h))
+                    .filter_map(|h| {
+                        Some(HookInfo {
+                            event: h.get("eventName").and_then(Value::as_str)?.to_owned(),
+                            matcher: h.get("matcher").and_then(Value::as_str).unwrap_or("").to_owned(),
+                            command: h.get("statusMessage").or_else(|| h.get("key")).and_then(Value::as_str).unwrap_or("").to_owned(),
+                            source: h.get("source").and_then(Value::as_str).unwrap_or("").to_owned(),
+                        })
                     })
-                    .unwrap_or_default();
+                    .collect();
                 core.touch_meta();
             }
             Pending::Mcp => {
@@ -3210,7 +3474,14 @@ impl Codex {
             return;
         }
         match method {
-            "thread/status/changed" => self.thread_status(core, p.get("status").unwrap_or(&Value::Null)),
+            "thread/status/changed" => {
+                let loading = self.thread_status == Some(Status::Starting) && self.turn.is_none()
+                    && !self.pending.values().any(|p| matches!(p, Pending::Turn(_)));
+                self.thread_status(core, p.get("status").unwrap_or(&Value::Null));
+                if loading && self.thread_status == Some(Status::Idle) {
+                    self.next(core);
+                }
+            }
             "turn/started" => {
                 if p.pointer("/turn/id").and_then(Value::as_str).is_some_and(|id| self.completed_turn.as_deref() == Some(id)) {
                     return;
@@ -3218,6 +3489,9 @@ impl Codex {
                 self.thread_status = Some(Status::Running);
                 if let Some(t) = p.get("turn").and_then(|t| t.get("id")).and_then(Value::as_str) {
                     self.turn = Some(t.to_owned());
+                }
+                if self.interrupt_on_start {
+                    self.interrupt(core);
                 }
                 self.steer_waiting(core);
                 self.interrupt_for_permissions(core);
@@ -3296,6 +3570,7 @@ impl Codex {
                     core.take_approval(&id);
                 }
                 self.turn = None;
+                self.interrupt_on_start = false;
                 self.turn_permissions = None;
                 if !matches!(self.thread_status, Some(Status::Starting | Status::Exited)) {
                     self.thread_status = Some(Status::Idle);
@@ -4274,6 +4549,71 @@ fn item_times(core: &Core, id: &str, item: &Value, done: bool) -> (i64, Option<i
     (started, ended)
 }
 
+
+/// kiln's hook before each tool call as Codex keys it: the first handler of the first PreToolUse
+/// group in a session's flags (codex-rs hooks: `hook_key`, `synthetic_layer_path`).
+pub const HOOK_KEY: &str = "/<session-flags>/config.toml:pre_tool_use:0:0";
+
+/// How long Codex waits for kiln's hook (seconds): a pause longer than this lets the call go.
+const HOOK_FOR_S: u64 = 7 * 24 * 3600;
+
+/// Codex's flags giving a session kiln's hook before each tool call (`kiln harness-hook`, asking
+/// this runner's harness socket `sock` for the session the call is in), and its trust for that
+/// session alone: the person's own hooks keep theirs, and nothing skips Codex's review of them.
+pub fn hook_args(kiln: &std::path::Path, sock: &str) -> Vec<String> {
+    let command = format!("{} harness-hook --sock {}", sh_quote(&kiln.to_string_lossy()), sh_quote(sock));
+    let quote = |v: &str| serde_json::to_string(v).unwrap_or_default();
+    vec![
+        "-c".into(),
+        format!("hooks.PreToolUse=[{{hooks=[{{type=\"command\",command={},timeout={HOOK_FOR_S}}}]}}]", quote(&command)),
+        "-c".into(),
+        format!("hooks.state={{{}={{trusted_hash={}}}}}", quote(HOOK_KEY), quote(&hook_hash(&command, HOOK_FOR_S))),
+    ]
+}
+
+/// The hash Codex trusts a command hook by (codex-rs hooks `hook_hash`, config `version_for_toml`):
+/// its event and handler as JSON, keys sorted, its SHA-256.
+fn hook_hash(command: &str, timeout: u64) -> String {
+    use sha2::Digest as _;
+    let identity = json!({"event_name": "pre_tool_use", "hooks": [{"async": false, "command": command, "timeout": timeout, "type": "command"}]});
+    format!("sha256:{}", hex::encode(sha2::Sha256::digest(serde_json::to_vec(&identity).unwrap_or_default()).as_slice()))
+}
+
+/// `s` as one word for a POSIX shell (Codex runs a command hook with `sh -lc`).
+fn sh_quote(s: &str) -> String {
+    format!("'{}'", s.replace('\'', "'\\''"))
+}
+
+/// What kind of call a hooked tool call is, by Codex's name for it, and the files it names:
+/// commands (`Bash`, unified exec too) run; `apply_patch` changes the files in its patch; MCP
+/// tools run; its read tools read.
+fn hook_call(name: &str, args: &Value) -> (ToolKind, Vec<String>) {
+    let path = || ["path", "file_path"].iter().find_map(|k| args.get(*k).and_then(Value::as_str)).map(str::to_owned).into_iter().collect();
+    match name {
+        "Bash" => (ToolKind::Shell, Vec::new()),
+        "apply_patch" => (ToolKind::Edit, args.get("command").and_then(Value::as_str).map(patch_paths).unwrap_or_default()),
+        "view_image" | "read_file" | "list_dir" | "grep_files" => (ToolKind::Read, path()),
+        n if n.starts_with("mcp__") => (ToolKind::Mcp, Vec::new()),
+        _ => (ToolKind::Other, Vec::new()),
+    }
+}
+
+/// The files a patch in Codex's apply_patch form adds, changes, deletes or moves to.
+fn patch_paths(patch: &str) -> Vec<String> {
+    let heads = ["*** Add File: ", "*** Update File: ", "*** Delete File: ", "*** Move to: "];
+    patch.lines().filter_map(|l| heads.iter().find_map(|h| l.strip_prefix(h)).map(|p| p.trim().to_owned())).filter(|p| !p.is_empty()).collect()
+}
+
+/// The person turned the web off for the session (Ask too: Codex can't ask before a web search,
+/// so it searches only where it's allowed to).
+fn web_off(core: &Core) -> bool {
+    core.state.perms.as_ref().is_some_and(|p| p.web != super::model::Grant::Allow)
+}
+
+/// The hook's answer refusing a call, with the words the agent reads.
+fn hook_deny(why: &str) -> Value {
+    json!({"hookSpecificOutput": {"hookEventName": "PreToolUse", "permissionDecision": "deny", "permissionDecisionReason": why}})
+}
 fn child_event_id(thread: &str, item: &str) -> String {
     format!("child:{thread}:{item}")
 }
@@ -4648,6 +4988,149 @@ mod tests {
 
     fn written(core: &mut Core) -> Vec<Value> {
         core.take_writes().iter().filter_map(|w| serde_json::from_str(w).ok()).collect()
+    }
+
+    #[test]
+    fn startup_messages_survive_a_process_restart_in_delivery_order() -> anyhow::Result<()> {
+        let mut core = Core::new();
+        let mut c = Codex::new(None, None, None, false);
+        c.start(&mut core);
+        let attachments = vec![super::super::model::Attachment { name: "picture.png".into(), mime: "image/png".into(), data_base64: "aW1hZ2U=".into(), file_id: None, path: Some("/work/picture.png".into()) }];
+        let overrides = Some(super::super::model::Overrides { model: Some("chosen-model".into()), effort: Some("high".into()) });
+        c.command(&mut core, Command::Send { id: "first".into(), text: "original task".into(), mode: SendMode::Queue, attachments: attachments.clone(), overrides: overrides.clone(), reply_to: Some("earlier".into()), task: None });
+        assert_eq!(core.state.queue.iter().map(|m| m.id.as_str()).collect::<Vec<_>>(), ["first"]);
+        assert!(!core.state.given.iter().any(|m| m.id == "first"));
+        c.exited(&mut core, Some(1), None);
+        let state = serde_json::from_value(serde_json::to_value(&core.state)?)?;
+        let mut restored = Core::new();
+        restored.restore(core.events().cloned().collect(), state);
+        let mut c = Codex::new(None, None, None, false);
+        c.start(&mut restored);
+        c.command(&mut restored, Command::Send { id: "second".into(), text: "And?".into(), mode: SendMode::Queue, attachments: vec![], overrides: None, reply_to: None, task: None });
+        let first = restored.state.queue.first().ok_or_else(|| anyhow::anyhow!("initial prompt lost"))?;
+        assert_eq!((&first.attachments, &first.overrides, first.reply_to.as_deref()), (&attachments, &overrides, Some("earlier")));
+        feed(&mut c, &mut restored, &[json!({"id": 1, "result": {}}), json!({"id": 2, "result": {"thread": {"id": "th1", "turns": []}}})]);
+        let writes = written(&mut restored);
+        let starts: Vec<_> = writes.iter().filter(|v| v.get("method") == Some(&json!("turn/start"))).collect();
+        assert_eq!(starts.len(), 1);
+        let start = starts.first().ok_or_else(|| anyhow::anyhow!("no initial turn"))?;
+        assert_eq!(start.pointer("/params/clientUserMessageId"), Some(&json!("first")));
+        assert_eq!(start.pointer("/params/model"), Some(&json!("chosen-model")));
+        assert_eq!(start.pointer("/params/effort"), Some(&json!("high")));
+        assert!(start.pointer("/params/input").and_then(Value::as_array).is_some_and(|items| items.contains(&json!({"type": "localImage", "path": "/work/picture.png"}))));
+        assert_eq!(restored.state.queue.iter().map(|m| m.id.as_str()).collect::<Vec<_>>(), ["second"]);
+        c.room(&mut restored);
+        assert!(!written(&mut restored).iter().any(|v| v.get("method") == Some(&json!("turn/start"))));
+        Ok(())
+    }
+
+    #[test]
+    fn startup_queue_controls_apply_before_the_thread_opens() {
+        let mut core = Core::new();
+        let mut c = Codex::new(None, None, None, false);
+        c.start(&mut core);
+        for id in ["first", "removed"] {
+            c.command(&mut core, Command::Send { id: id.into(), text: id.into(), mode: SendMode::Queue, attachments: vec![], overrides: None, reply_to: None, task: None });
+        }
+        c.command(&mut core, Command::QueueEdit { id: "first".into(), text: "edited".into(), attachments: None });
+        c.command(&mut core, Command::QueueRemove { id: "removed".into() });
+        feed(&mut c, &mut core, &[json!({"id": 1, "result": {}}), json!({"id": 2, "result": {"thread": {"id": "th1", "turns": []}}})]);
+        let writes = written(&mut core);
+        let starts: Vec<_> = writes.iter().filter(|v| v.get("method") == Some(&json!("turn/start"))).collect();
+        assert_eq!(starts.len(), 1);
+        assert_eq!(starts.first().and_then(|v| v.pointer("/params/input/0/text")), Some(&json!("edited")));
+        assert!(core.state.queue.is_empty());
+    }
+
+    #[test]
+    fn ordinary_messages_do_not_bypass_a_held_initial_prompt() {
+        let (mut c, mut core, _) = opened();
+        core.hold = true;
+        for id in ["first", "second"] {
+            c.command(&mut core, Command::Send { id: id.into(), text: id.into(), mode: SendMode::Queue, attachments: vec![], overrides: None, reply_to: None, task: None });
+        }
+        assert!(!written(&mut core).iter().any(|v| v.get("method") == Some(&json!("turn/start"))));
+        assert_eq!(core.state.queue.iter().map(|m| m.id.as_str()).collect::<Vec<_>>(), ["first", "second"]);
+        core.hold = false;
+        c.room(&mut core);
+        let writes = written(&mut core);
+        assert_eq!(writes.iter().find(|v| v.get("method") == Some(&json!("turn/start"))).and_then(|v| v.pointer("/params/clientUserMessageId")), Some(&json!("first")));
+    }
+
+    #[test]
+    fn startup_failures_keep_the_prompt_and_report_a_restartable_error() {
+        for initialize in [true, false] {
+            let mut core = Core::new();
+            let mut c = Codex::new(None, None, None, false);
+            c.start(&mut core);
+            c.command(&mut core, Command::Send { id: "first".into(), text: "original task".into(), mode: SendMode::Queue, attachments: vec![], overrides: None, reply_to: None, task: None });
+            if !initialize {
+                feed(&mut c, &mut core, &[json!({"id": 1, "result": {}})]);
+            }
+            feed(&mut c, &mut core, &[json!({"id": if initialize { 1 } else { 2 }, "error": {"message": "invalid configuration"}})]);
+            assert_eq!(core.state.status, Status::Exited);
+            assert!(core.state.exit.as_ref().is_some_and(|e| e.error.as_deref().is_some_and(|s| s.contains("invalid configuration"))));
+            assert_eq!(core.state.queue.iter().map(|m| m.id.as_str()).collect::<Vec<_>>(), ["first"]);
+            c.room(&mut core);
+            assert!(!written(&mut core).iter().any(|v| v.get("method") == Some(&json!("turn/start"))));
+        }
+    }
+
+    #[test]
+    fn a_hot_upgrade_recovers_legacy_buffered_prompts_once() -> anyhow::Result<()> {
+        let (c, mut core, _) = opened();
+        let mut image = serde_json::to_value(&c)?;
+        let legacy = QueueItem { id: "legacy".into(), text: "original".into(), at: 1, attachments: vec![], overrides: None, reply_to: None };
+        if let Some(obj) = image.as_object_mut() {
+            obj.insert("waiting".into(), serde_json::to_value(std::slice::from_ref(&legacy))?);
+            obj.remove("now");
+            obj.remove("interrupt_on_start");
+        }
+        let mut c: Codex = serde_json::from_value(image)?;
+        core.state.queue.push(QueueItem { text: "edited".into(), ..legacy });
+        c.tick(&mut core);
+        let writes = written(&mut core);
+        let starts: Vec<_> = writes.iter().filter(|v| v.get("method") == Some(&json!("turn/start"))).collect();
+        assert_eq!(starts.len(), 1);
+        assert_eq!(starts.first().and_then(|v| v.pointer("/params/input/0/text")), Some(&json!("edited")));
+        assert!(c.waiting.is_empty() && core.state.queue.is_empty());
+        c.tick(&mut core);
+        c.room(&mut core);
+        assert!(!written(&mut core).iter().any(|v| v.get("method") == Some(&json!("turn/start"))));
+        Ok(())
+    }
+
+    #[test]
+    fn send_now_interrupts_a_turn_whose_id_has_not_arrived() {
+        for outcome in ["notification_first", "response_first", "refused"] {
+            let (mut c, mut core, _) = opened();
+            c.command(&mut core, Command::Send { id: "first".into(), text: "original".into(), mode: SendMode::Queue, attachments: vec![], overrides: None, reply_to: None, task: None });
+            let starts = written(&mut core);
+            for (id, mode) in [("queued", SendMode::Queue), ("now", SendMode::Now)] {
+                c.command(&mut core, Command::Send { id: id.into(), text: id.into(), mode, attachments: vec![], overrides: None, reply_to: None, task: None });
+            }
+            assert_eq!(core.state.queue.iter().map(|m| m.id.as_str()).collect::<Vec<_>>(), ["now", "queued"]);
+            assert!(written(&mut core).is_empty());
+            if outcome == "refused" {
+                let id = starts.iter().find(|v| v.get("method") == Some(&json!("turn/start"))).and_then(|v| v.get("id")).cloned().unwrap_or_default();
+                feed(&mut c, &mut core, &[json!({"id": id, "error": {"message": "turn refused"}})]);
+                let writes = written(&mut core);
+                assert_eq!(writes.iter().find(|v| v.get("method") == Some(&json!("turn/start"))).and_then(|v| v.pointer("/params/clientUserMessageId")), Some(&json!("now")));
+                respond(&mut c, &mut core, &writes, "turn/start", json!({"turn": {"id": "t2", "status": "inProgress"}}));
+                assert!(!written(&mut core).iter().any(|v| v.get("method") == Some(&json!("turn/interrupt"))));
+                assert_eq!(core.state.delivery.get("first"), Some(&Delivery::Cancelled));
+                continue;
+            }
+            let notification = json!({"method": "turn/started", "params": {"threadId": "th1", "turn": {"id": "t1", "status": "inProgress"}}});
+            if outcome == "notification_first" { feed(&mut c, &mut core, std::slice::from_ref(&notification)); }
+            respond(&mut c, &mut core, &starts, "turn/start", json!({"turn": {"id": "t1", "status": "inProgress"}}));
+            if outcome == "response_first" { feed(&mut c, &mut core, &[notification]); }
+            assert_eq!(written(&mut core).iter().filter(|v| v.get("method") == Some(&json!("turn/interrupt"))).count(), 1);
+            feed(&mut c, &mut core, &[json!({"method": "turn/completed", "params": {"threadId": "th1", "turn": {"id": "t1", "status": "interrupted", "items": []}}})]);
+            let writes = written(&mut core);
+            assert_eq!(writes.iter().find(|v| v.get("method") == Some(&json!("turn/start"))).and_then(|v| v.pointer("/params/clientUserMessageId")), Some(&json!("now")));
+            assert_eq!(core.state.queue.iter().map(|m| m.id.as_str()).collect::<Vec<_>>(), ["queued"]);
+        }
     }
 
     #[test]
@@ -5236,7 +5719,7 @@ mod tests {
         let w = written(&mut core);
         let id = w.iter().find(|v| v.get("method") == Some(&json!("thread/fork"))).and_then(|v| v.get("id")).cloned().unwrap_or_default();
         feed(&mut c, &mut core, &[json!({"id": id, "error": {"code": -32600, "message": "no such thread"}})]);
-        assert!(core.events().any(|e| matches!(&e.body, Body::Notice { text, .. } if text.contains("no such thread"))) && core.state.status == Status::Idle);
+        assert!(core.events().any(|e| matches!(&e.body, Body::Notice { text, .. } if text.contains("no such thread"))) && core.state.status == Status::Exited);
         Ok(())
     }
 
@@ -6281,6 +6764,7 @@ mod tests {
         for (status, expected) in [
             (json!({"type": "active", "activeFlags": []}), Status::Running),
             (json!({"type": "active", "activeFlags": ["waitingOnUserInput"]}), Status::Waiting),
+            (json!({"type": "notLoaded"}), Status::Starting),
             (json!({"type": "systemError"}), Status::Exited),
         ] {
             let (mut c, mut core, _) = opened();
@@ -6289,8 +6773,15 @@ mod tests {
             let requests = written(&mut core);
             respond(&mut c, &mut core, &requests, "thread/resume", json!({"thread": {"id": "th1", "turns": [], "status": status}, "model": "gpt-5", "cwd": "/work"}));
             assert_eq!(core.state.status, expected);
-            assert_eq!(c.waiting.len(), 1);
+            assert!(c.waiting.is_empty());
+            assert_eq!(core.state.queue.len(), 1);
             assert!(!written(&mut core).iter().any(|v| v.get("method").and_then(Value::as_str) == Some("turn/start")));
+            if expected == Status::Starting {
+                feed(&mut c, &mut core, &[json!({"method": "thread/status/changed", "params": {"threadId": "th1", "status": {"type": "idle"}}})]);
+                let writes = written(&mut core);
+                assert_eq!(writes.iter().filter(|v| v.get("method") == Some(&json!("turn/start"))).count(), 1);
+                assert_eq!(core.state.queue.len(), 0);
+            }
         }
     }
 
@@ -6862,5 +7353,130 @@ mod tests {
         c.tick(&mut core);
         assert!(!written(&mut core).iter().any(|v| v.get("method").and_then(Value::as_str) == Some("thread/backgroundTerminals/list")));
         Ok(())
+    }
+
+
+    /// kiln's hook is trusted for its session alone: the hash it gives is the hash Codex computes
+    /// for the same definition (Codex 0.162.1's hooks/list listed "sha256:c704bd83…" for this hook,
+    /// trusted, from session flags: ~/.cache/kiln-subagents-build/codex-hook-probe.py).
+    #[test]
+    fn kilns_hook_is_trusted_for_its_session_by_the_hash_codex_computes() {
+        assert_eq!(hook_hash("/usr/bin/true", 604_800), "sha256:c704bd83f2fe55c618ad044eeb72225daa512555128cd9a71fdf5175fcfd345f");
+        let args = hook_args(std::path::Path::new("/opt/it's kiln/kiln"), "/run/user/1000/kiln/harness.sock");
+        assert_eq!(args.len(), 4);
+        let command = "'/opt/it'\\''s kiln/kiln' harness-hook --sock '/run/user/1000/kiln/harness.sock'";
+        assert_eq!(args.get(1).map(String::as_str), Some(format!("hooks.PreToolUse=[{{hooks=[{{type=\"command\",command={},timeout=604800}}]}}]", serde_json::to_string(command).unwrap_or_default()).as_str()));
+        assert_eq!(args.get(3).map(String::as_str), Some(format!("hooks.state={{\"{HOOK_KEY}\"={{trusted_hash=\"{}\"}}}}", hook_hash(command, 604_800)).as_str()));
+    }
+
+    /// Codex's list of hooks says whether it runs kiln's: trusted, the session's subagents can be
+    /// paused and limited (`limits`), and kiln's hook isn't among the person's; not trusted, they
+    /// can't, and the person is told why.
+    #[test]
+    fn codex_listing_kilns_hook_trusted_turns_its_pause_and_permissions_on() {
+        let hooks = |status: &str| json!({"data": [{"cwd": "/work", "errors": [], "warnings": [], "hooks": [
+            {"key": HOOK_KEY, "eventName": "preToolUse", "source": "sessionFlags", "trustStatus": status, "enabled": true},
+            {"key": "/home/a/.codex/hooks.json:pre_tool_use:0:0", "eventName": "preToolUse", "source": "user", "trustStatus": "trusted", "enabled": true},
+        ]}]});
+        let mut core = Core::new();
+        core.state.cwd = "/work".into();
+        let mut c = Codex::new(None, None, None, false);
+        c.start(&mut core);
+        feed(&mut c, &mut core, &[json!({"id": 1, "result": {"userAgent": "codex_cli_rs/0.162.1"}})]);
+        let w = written(&mut core);
+        respond(&mut c, &mut core, &w, "hooks/list", hooks("trusted"));
+        assert!(c.holds_calls());
+        assert!(core.meta.features.iter().any(|f| f == "limits"));
+        assert_eq!(core.meta.hooks.iter().map(|h| h.source.as_str()).collect::<Vec<_>>(), vec!["user"]);
+
+        let mut core = Core::new();
+        let mut c = Codex::new(None, None, None, false);
+        c.start(&mut core);
+        feed(&mut c, &mut core, &[json!({"id": 1, "result": {"userAgent": "codex_cli_rs/0.162.1"}})]);
+        let w = written(&mut core);
+        respond(&mut c, &mut core, &w, "hooks/list", hooks("untrusted"));
+        assert!(!c.holds_calls());
+        assert!(!core.meta.features.iter().any(|f| f == "limits"));
+        assert!(core.events().any(|e| matches!(&e.body, Body::Notice { text, .. } if text.contains("can't be paused or limited") && text.contains("untrusted"))), "the person is told why");
+    }
+
+    /// A Codex session whose hook Codex runs, with a subagent working on thread `th-kid` (its turn
+    /// `t-kid`) beside the agent's own turn `t-main`.
+    fn hooked() -> (Codex, Core) {
+        let mut core = Core::new();
+        core.state.cwd = "/work".into();
+        let mut c = Codex::new(None, None, None, false);
+        c.hook_trusted = true;
+        c.turn = Some("t-main".into());
+        c.children.insert("th-kid".into(), Child { turn: Some("t-kid".into()), ..Child::default() });
+        core.state.tasks.push(Task { id: "th-kid".into(), tool_id: Some("call_spawn".into()), description: "Port the lexer".into(), class: Some("agent".into()), status: "running".into(), ..Task::default() });
+        (c, core)
+    }
+
+    /// The hook's input for a call of `tool` in turn `turn`.
+    fn pre(turn: &str, tool: &str, args: Value) -> Value {
+        json!({"hook_event_name": "PreToolUse", "session_id": "s1", "turn_id": turn, "tool_name": tool, "tool_use_id": "call_1", "tool_input": args, "cwd": "/work"})
+    }
+
+    /// What the hook answers `input` with now: None while kiln holds the call.
+    fn ask(c: &mut Codex, core: &mut Core, input: Value) -> (Option<Value>, futures::channel::oneshot::Receiver<Value>) {
+        let (tx, mut rx) = futures::channel::oneshot::channel();
+        c.hook(core, input, tx);
+        (rx.try_recv().ok().flatten(), rx)
+    }
+
+    /// A person's pause holds a Codex subagent at its next tool call, until they resume it; the
+    /// agent's own calls go on meanwhile.
+    #[test]
+    fn a_paused_codex_subagents_next_call_waits_until_its_resumed_and_the_agent_goes_on() {
+        let (mut c, mut core) = hooked();
+        c.command(&mut core, Command::Pause { on: true, task: Some("th-kid".into()) });
+        let (now, mut held) = ask(&mut c, &mut core, pre("t-kid", "Bash", json!({"command": "cargo test"})));
+        assert_eq!(now, None, "the subagent's call waits");
+        let (now, _) = ask(&mut c, &mut core, pre("t-main", "Bash", json!({"command": "ls"})));
+        assert_eq!(now, Some(json!({})), "the agent's own call goes on");
+        assert_eq!(held.try_recv().ok().flatten(), None);
+        c.command(&mut core, Command::Pause { on: false, task: Some("th-kid".into()) });
+        assert_eq!(held.try_recv().ok().flatten(), Some(json!({})), "resumed, its call goes on");
+    }
+
+    /// What a person lets a Codex subagent do holds at each of its calls: a file outside its folder
+    /// is refused, one inside goes; a command it runs only asking waits for the person's answer.
+    #[test]
+    fn what_a_codex_subagent_may_do_holds_at_each_of_its_calls() {
+        use super::super::model::Grant;
+        let (mut c, mut core) = hooked();
+        let perms = Perms { run: Grant::Ask, folder: Some("src".into()), ..Perms::default() };
+        c.command(&mut core, Command::Perms { perms: Some(perms), task: Some("th-kid".into()) });
+        let patch = |path: &str| pre("t-kid", "apply_patch", json!({"command": format!("*** Begin Patch\n*** Update File: {path}\n@@\n-a\n+b\n*** End Patch\n")}));
+        let (now, _) = ask(&mut c, &mut core, patch("docs/x.md"));
+        let why = now.as_ref().and_then(|v| v.pointer("/hookSpecificOutput/permissionDecisionReason")).and_then(Value::as_str).unwrap_or("");
+        assert_eq!(now.as_ref().and_then(|v| v.pointer("/hookSpecificOutput/permissionDecision")), Some(&json!("deny")));
+        assert!(why.contains("docs/x.md is outside your folder"), "{why}");
+        assert_eq!(ask(&mut c, &mut core, patch("src/lexer.rs")).0, Some(json!({})));
+        // Running a command: asked, and the person says no.
+        let (now, mut held) = ask(&mut c, &mut core, pre("t-kid", "Bash", json!({"command": "cargo build"})));
+        assert_eq!(now, None);
+        let a = core.state.approvals.first().cloned();
+        assert_eq!(a.as_ref().map(|a| (a.title.as_str(), a.agent.as_deref(), a.tool)), Some(("cargo build", Some("Port the lexer"), ToolKind::Shell)));
+        let id = a.map(|a| a.id).unwrap_or_default();
+        c.command(&mut core, Command::Approve { id, decision: Decision::Deny, message: None, always: None, answers: None, choices: None });
+        let answer = held.try_recv().ok().flatten().unwrap_or_default();
+        assert_eq!(answer.pointer("/hookSpecificOutput/permissionDecision"), Some(&json!("deny")));
+        assert!(core.state.approvals.is_empty());
+        // The agent's own calls aren't the subagent's to limit.
+        assert_eq!(ask(&mut c, &mut core, pre("t-main", "apply_patch", json!({"command": "*** Begin Patch\n*** Add File: docs/y.md\n+y\n*** End Patch\n"}))).0, Some(json!({})));
+    }
+
+    /// Codex's calls by its names for them, and the files a patch names.
+    #[test]
+    fn codex_calls_are_told_apart_by_their_tool_and_a_patch_by_its_files() {
+        let patch = "*** Begin Patch\n*** Add File: a.rs\n+x\n*** Update File: b.rs\n*** Move to: c.rs\n*** Delete File: d.rs\n*** End Patch\n";
+        assert_eq!(patch_paths(patch), vec!["a.rs", "b.rs", "c.rs", "d.rs"]);
+        assert_eq!(hook_call("apply_patch", &json!({"command": patch})).0, ToolKind::Edit);
+        assert_eq!(hook_call("Bash", &json!({"command": "ls"})).0, ToolKind::Shell);
+        assert_eq!(hook_call("mcp__kiln__run", &json!({})).0, ToolKind::Mcp);
+        assert_eq!(hook_call("view_image", &json!({"path": "x.png"})), (ToolKind::Read, vec!["x.png".to_owned()]));
+        assert_eq!(hook_call("update_plan", &json!({})).0, ToolKind::Other);
     }
 }

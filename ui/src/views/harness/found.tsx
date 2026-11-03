@@ -6,6 +6,7 @@
  * transcript, to read in place.
  */
 import * as React from "react";
+import { labelOf, useLabels } from "@/lib/data";
 import { Link, Navigate, useLocation, useNavigate, useSearchParams } from "@/lib/router";
 import { ChevronRight, SquareTerminal } from "lucide-react";
 import { api } from "@/api/client";
@@ -46,15 +47,16 @@ function abilities(s: AiSession): { take: boolean; fork: boolean; why: string; u
   const fork = s.fork === true;
   if (take && fork) return { take, fork, why: "", update: false };
   if (t === "no_id") return { take, fork, why: "Starting: nothing to continue yet", update: false };
-  if (t === "upgrade") return { take, fork, why: `Update ${s.machine} to take over${fork ? "" : " or fork"}`, update: true };
+  if (t === "upgrade") return { take, fork, why: `Update ${labelOf(s.machine)} to take over${fork ? "" : " or fork"}`, update: true };
   if (t === "outside") return { take, fork, why: "Quit it there to take it over", update: false };
   if (t === "unsupported") return { take, fork, why: "kiln can't continue this tool's sessions", update: false };
-  if (take && !fork && s.fork === false) return { take, fork, why: `Update ${s.machine} to fork`, update: true };
+  if (take && !fork && s.fork === false) return { take, fork, why: `Update ${labelOf(s.machine)} to fork`, update: true };
   return { take, fork, why: "", update: false };
 }
 
 /** Take over, confirmed in the row: what happens to it where it runs now, then go. */
 function Confirm({ s, onCancel }: { s: AiSession; onCancel: () => void }) {
+  useLabels();
   const navigate = useNavigate();
   const [busy, setBusy] = React.useState(false);
   const go = async () => {
@@ -69,10 +71,7 @@ function Confirm({ s, onCancel }: { s: AiSession; onCancel: () => void }) {
   };
   return (
     <div className="ms-confirm" role="group" aria-label="Take over">
-      <p>
-        {s.takeover === "stop" ? `Stops it on ${s.machine}` : `Ends its terminal on ${s.machine}`} and continues here as an agent: same folder, conversation
-        and model.
-      </p>
+      <p>{s.takeover === "stop" ? `Stops it on ${labelOf(s.machine)}` : `Ends its terminal on ${labelOf(s.machine)}`} and continues here as an agent: same folder, conversation and model.</p>
       <span className="ms-confirm-actions">
         <Button size="xs" disabled={busy} onClick={go}>
           Take over
@@ -150,6 +149,7 @@ function Log({ machine, pid }: { machine: string; pid: number }) {
 
 /** Re-renders only when its session changes; its clock counts by itself. */
 const Row = React.memo(function Row({ s, focused }: { s: AiSession; focused: boolean }) {
+  useLabels();
   const navigate = useNavigate();
   const [reading, setReading] = React.useState(focused);
   const [confirming, setConfirming] = React.useState(false);
@@ -195,7 +195,7 @@ const Row = React.memo(function Row({ s, focused }: { s: AiSession; focused: boo
       <span className="ms-meta">
         <span>
           <span className="ms-tool">{toolLabel(s.tool)} · </span>
-          {s.machine} · <Ago className="ms-time" ts={s.last_activity} />
+          {labelOf(s.machine)} · <Ago className="ms-time" ts={s.last_activity} />
         </span>
         <span title={s.cwd}>{s.terminal ? tildify(s.cwd) : "outside kiln"}</span>
       </span>
@@ -235,6 +235,7 @@ const Row = React.memo(function Row({ s, focused }: { s: AiSession; focused: boo
 
 /** Mission control's section of found sessions; folds like Ended. */
 export function FoundSessions({ sessions, quiet }: { sessions: AiSession[]; quiet: string[] }) {
+  useLabels();
   const [params] = useSearchParams();
   const { hash } = useLocation();
   const focus = params.get("session");
@@ -273,7 +274,7 @@ export function FoundSessions({ sessions, quiet }: { sessions: AiSession[]; quie
           )}
           {quiet.length > 0 && (
             <p className="ms-found-quiet">
-              {quiet.join(", ")} {quiet.length === 1 ? "runs" : "run"} an older kiln and {quiet.length === 1 ? "doesn't" : "don't"} report sessions yet.
+              {quiet.map((m) => labelOf(m)).join(", ")} {quiet.length === 1 ? "runs" : "run"} an older kiln and {quiet.length === 1 ? "doesn't" : "don't"} report sessions yet.
             </p>
           )}
         </>

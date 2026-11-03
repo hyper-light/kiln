@@ -13,7 +13,7 @@ import { TableHold } from "@/components/ui/hold";
 import { Loadable } from "@/components/ui/loading";
 import { PageIntro, SelectField, TextField } from "@/components/ui/misc";
 import { toast } from "@/components/ui/toast";
-import { useRes } from "@/lib/data";
+import { labelOf, useLabels, useRes } from "@/lib/data";
 import { relativeTime } from "@/lib/format";
 import { errorMessage } from "@/lib/hooks";
 import { invalidate } from "@/lib/resource";
@@ -119,6 +119,8 @@ function Head() {
 
 function List({ onAdd, onEdit }: { onAdd: () => void; onEdit: (t: Synthetic) => void }) {
   const all = useRes(syntheticsRes).data;
+  // Each machine by the name people see (its label, docs/machines.md).
+  const labels = useLabels();
   const [removing, setRemoving] = React.useState<Synthetic | null>(null);
   if (all.length === 0)
     return (
@@ -194,7 +196,7 @@ function List({ onAdd, onEdit }: { onAdd: () => void; onEdit: (t: Synthetic) => 
                     </p>
                     {failing && (
                       <p className="truncate text-[12px] text-[#e2c4c6]" title={failing.state.failed.join("\n")}>
-                        {failing.machine}: {failing.state.failed[0] ?? "failing"}
+                        {labelOf(failing.machine, labels)}: {failing.state.failed[0] ?? "failing"}
                       </p>
                     )}
                     <div className="mt-1 flex items-center justify-between gap-2 sm:hidden">
@@ -207,7 +209,7 @@ function List({ onAdd, onEdit }: { onAdd: () => void; onEdit: (t: Synthetic) => 
                       {t.machines.map((m) => (
                         <span key={m.machine} className="status" title={m.state.failed.join("\n") || undefined}>
                           <i className="dot" data-status={m.state.passed === false ? "failed" : m.state.passed ? "succeeded" : "pending"} aria-hidden="true" />
-                          <span className="text-[12px]">{m.machine}</span>
+                          <span className="text-[12px]">{labelOf(m.machine, labels)}</span>
                         </span>
                       ))}
                       {t.machines.length === 0 && <span className="text-[12px] text-[#8c8f98]">{(t.locations ?? []).join(", ")}</span>}

@@ -133,6 +133,37 @@ export interface ThreadComment {
   deleted?: boolean;
   /** Its suggestions (W26-R10): its body's ```suggestion blocks, then its old `suggestion` field as one more. */
   suggestions?: Suggestion[];
+  /** Who wrote it, in words (W26-R18); a server from before sends `author` alone. */
+  by?: Byline;
+  /** Who signed it, or null while it's unsigned (W27-R04); a server from before sends neither. */
+  signed?: Signed | null;
+}
+
+/** Who wrote a comment, in words (W26-R18): a person by name, an agent by its session's name for the person it acts for, a CI job by its leg. */
+export interface Byline {
+  kind: "person" | "agent" | "job";
+  name: string;
+  /** The person an agent acts for, when kiln knows it. */
+  for?: string;
+}
+
+/** A comment's signature as kiln took it (W27-R04): its signer's identity, in words, and when. */
+export interface Signed {
+  /** The signer's identity (`kiln://<org>/person/kim/agent/<session>/epoch/<n>`). */
+  by: string;
+  who: string;
+  at: number;
+}
+
+/** A comment's author in words: its byline ("Matrix agent for kim"), else its principal's. */
+export function bylineOf(c: Pick<ThreadComment, "author" | "by">): string {
+  if (!c.by) return whoSaid(c.author);
+  return c.by.for ? `${c.by.name} for ${c.by.for}` : c.by.name;
+}
+
+/** What a comment's seal says: who signed it, or that it isn't signed. */
+export function sealOf(c: Pick<ThreadComment, "signed">): string {
+  return c.signed ? `signed by ${c.signed.who}` : "unsigned";
 }
 
 /** A comment's suggestion (W26-R10): the lines it puts where its thread's lines are (none: they go), and which revision applied it. */
@@ -171,6 +202,10 @@ export interface Thread {
   resolved_by?: string | null;
   resolved_at?: number | null;
   resolution?: string | null;
+  /** The version that fixed it (W26-R18): the first that answers it. */
+  fixed_in?: number | null;
+  /** Open, after agents started their fixes in it since a person spoke there: it waits for a person, and says why. */
+  waits?: string | null;
 }
 
 /** The gate (W26-R11) as it stands for you approving: a blocking thread or a conflict holds it, open issues warn, open nits inform. */
@@ -196,6 +231,10 @@ export interface Readiness {
   required: string[];
   strategies: string[];
   default: string | null;
+  /** The land queue's entry that holds it, and where the queue has it (docs/ci.md W26-R19). */
+  queue?: { entry: string; state: string; reason: string | null } | null;
+  /** Asked to land once its gate is clear. */
+  when_ready?: boolean;
 }
 
 export interface InboxThread {
@@ -265,6 +304,25 @@ export interface QueueEntry {
 
 export type ReviewAction = "accept" | "request_changes" | "comment" | "resign";
 
+/** A repository's switch that lets agents fix code from agents' feedback (W26-R18): off until
+ * someone who can land its changes turns it on, who set it and when, and what it does in words. */
+export interface AgentFixes {
+  repo: string;
+  agents_fix: boolean;
+  set_by: string | null;
+  set_at: number | null;
+  says: string;
+  /** The caller may turn it on or off (`diffs.land` on the repository). */
+  may_change: boolean;
+}
+
+/** Who set a repository's agent fixes switch and when, in words: "Turned on by ada, 31 Oct 2026." */
+export function fixesSetBy(v: Pick<AgentFixes, "agents_fix" | "set_by" | "set_at">): string {
+  if (!v.set_by) return "No one has turned it on.";
+  const day = v.set_at == null ? "" : `, ${new Date(v.set_at * 1000).toLocaleDateString("en-GB", { day: "numeric", month: "short", year: "numeric" })}`;
+  return `Turned ${v.agents_fix ? "on" : "off"} by ${whoSaid(v.set_by)}${day}.`;
+}
+
 const enc = encodeURIComponent;
 
 export const reviewApi = {
@@ -309,11 +367,16 @@ export const reviewApi = {
   },
   viewed: (key: string, file: string, viewed: boolean) => request<{ file: string; viewed: boolean; version: number }>("POST", `/api/diffs/${enc(key)}/viewed`, { file, viewed }),
   readiness: (key: string, signal?: AbortSignal) => request<Readiness>("GET", `/api/diffs/${enc(key)}/land`, undefined, { signal }),
-  land: (key: string, strategy?: string) => request<unknown>("POST", `/api/diffs/${enc(key)}/land`, strategy ? { strategy } : {}),
+  land: (key: string, strategy?: string, whenReady?: boolean) =>
+    request<unknown>("POST", `/api/diffs/${enc(key)}/land`, { ...(strategy ? { strategy } : {}), ...(whenReady ? { when_ready: true } : {}) }),
+  /** A host's changes into its host's own queue, each at the head Review cleared (docs/ci.md W26-R19, W28-R109). */
+  enqueue: (repo: string, changes: { number: number; head: string }[]) => request<{ entry: string; route: string; state: string }>("POST", `/api/repos/${enc(repo)}/queue`, { changes }),
   act: (key: string, action: "ready" | "abandon" | "reclaim" | "commandeer") => request<unknown>("POST", `/api/diffs/${enc(key)}/${action}`, {}),
   stack: (id: string, signal?: AbortSignal) => request<Stack>("GET", `/api/stacks/${enc(id)}`, undefined, { signal }),
   queue: (repo: string, signal?: AbortSignal) => request<{ entries: QueueEntry[] }>("GET", `/api/repos/${enc(repo)}/queue`, undefined, { signal }).then((r) => r.entries),
   dequeue: (entry: string) => request<unknown>("DELETE", `/api/queue/${enc(entry)}`),
+  agentFixes: (repo: string, signal?: AbortSignal) => request<AgentFixes>("GET", `/api/repos/${enc(repo)}/agent-fixes`, undefined, { signal }),
+  setAgentFixes: (repo: string, on: boolean) => request<AgentFixes>("PUT", `/api/repos/${enc(repo)}/agent-fixes`, { agents_fix: on }),
   /** A file's bytes at a version, old or new side (images). */
   blobUrl: (key: string, version: number, path: string, side: "old" | "new") => apiPath(`/api/diffs/${enc(key)}/versions/${version}/blob?path=${enc(path)}&side=${side}`),
 };
@@ -430,6 +493,7 @@ export const dependenciesRes = (key: string, to: number, from: number | null): R
   key: `review/dependencies/${key}/${from ?? "base"}/${to}`,
   fetch: (s) => reviewApi.dependencies(key, to, from, s),
 });
+export const agentFixesRes = (repo: string): Res<AgentFixes> => ({ key: `review/agent-fixes/${repo}`, fetch: (s) => reviewApi.agentFixes(repo, s) });
 export const readinessRes = (key: string): Res<Readiness> => ({ key: `review/land/${key}`, fetch: (s) => reviewApi.readiness(key, s), opts: { on: REVIEW_EVENTS } });
 
 /** Who someone is, in words: `agent:a1b2` → "agent a1b2", `user:ada` → "ada". */

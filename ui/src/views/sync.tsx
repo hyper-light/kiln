@@ -9,6 +9,7 @@ import type { SyncConflict, SyncCopy, SyncKeep, SyncMode, SyncRepo } from "@/api
 import { Button } from "@/components/ui/button";
 import { Confirm, SelectField, TextField } from "@/components/ui/misc";
 import { StatusDot } from "@/components/ui/status";
+import { labelOf, useLabels } from "@/lib/data";
 import { errorMessage } from "@/lib/hooks";
 import "./sync.css";
 
@@ -99,7 +100,11 @@ export function NewRepo({ machines, onDone, onCancel }: { machines: string[]; on
       <div>
         <SelectField label="Keeps the same" value={mode} onChange={(v) => setMode(v as SyncMode)} options={MODES} />
         <div className="field-hint">
-          {mode === "files" ? "Uncommitted work too, both ways, within seconds." : mode === "git" ? "Each machine's working tree stays its own. For a git repository." : "Uncommitted work too, and the branch checked out. For a git repository."}
+          {mode === "files"
+            ? "Uncommitted work too, both ways, within seconds."
+            : mode === "git"
+              ? "Each machine's working tree stays its own. For a git repository."
+              : "Uncommitted work too, and the branch checked out. For a git repository."}
         </div>
       </div>
       <TextField
@@ -134,13 +139,14 @@ function CopyFields({
   onChange: (v: { machine: string; path: string }) => void;
   onRemove?: () => void;
 }) {
+  useLabels();
   return (
     <div className="sync-copy-fields">
       <SelectField
         label="Machine"
         value={value.machine}
         onChange={(machine) => onChange({ ...value, machine })}
-        options={[{ value: "", label: "Choose a machine" }, ...machines.map((m) => ({ value: m, label: m }))]}
+        options={[{ value: "", label: "Choose a machine" }, ...machines.map((m) => ({ value: m, label: labelOf(m) }))]}
       />
       <TextField label="Folder" value={value.path} onChange={(e) => onChange({ ...value, path: e.target.value })} placeholder="/home/you/src/kiln" spellCheck={false} />
       {onRemove && (
@@ -254,9 +260,7 @@ export function RepoBlock({ repo, machines, onChange, title, copies = true }: { 
       )}
       {repo.conflicts.length > 0 && (
         <div className="sync-conflicts">
-          <h3 className="field-label">
-            {repo.conflicts.length === 1 ? "1 conflict" : `${repo.conflicts.length} conflicts`}
-          </h3>
+          <h3 className="field-label">{repo.conflicts.length === 1 ? "1 conflict" : `${repo.conflicts.length} conflicts`}</h3>
           <ul>
             {repo.conflicts.map((c) => (
               <ConflictRow key={c.path} conflict={c} onResolve={(keep) => act(() => api.syncResolve(repo.id, c.path, keep))} />
@@ -269,6 +273,7 @@ export function RepoBlock({ repo, machines, onChange, title, copies = true }: { 
 }
 
 function CopyRow({ copy, onRemove }: { copy: SyncCopy; onRemove: () => Promise<boolean> }) {
+  useLabels();
   const [removing, setRemoving] = React.useState(false);
   const s = copy.status;
   const details = copyDetails(copy);
@@ -276,7 +281,7 @@ function CopyRow({ copy, onRemove }: { copy: SyncCopy; onRemove: () => Promise<b
     <li className="sync-copy">
       <div className="sync-copy-line">
         <StatusDot status={DOT[copy.state]} title={copy.state} />
-        <span className="sync-machine">{copy.machine}</span>
+        <span className="sync-machine">{labelOf(copy.machine)}</span>
         <span className="sync-state">{copy.state}</span>
         {!removing && (
           <Button size="xs" variant="ghost" className="sync-remove" onClick={() => setRemoving(true)}>
@@ -301,7 +306,7 @@ function CopyRow({ copy, onRemove }: { copy: SyncCopy; onRemove: () => Promise<b
       )}
       {removing && (
         <Confirm
-          label={`Remove the copy on ${copy.machine}`}
+          label={`Remove the copy on ${labelOf(copy.machine)}`}
           tone="danger"
           actions={
             <>
@@ -315,7 +320,7 @@ function CopyRow({ copy, onRemove }: { copy: SyncCopy; onRemove: () => Promise<b
           }
         >
           <p>
-            Stop syncing the copy on {copy.machine}? Its files stay in <code>{copy.path}</code>.
+            Stop syncing the copy on {labelOf(copy.machine)}? Its files stay in <code>{copy.path}</code>.
           </p>
         </Confirm>
       )}

@@ -23,11 +23,15 @@
  *   /agents/ask-perm   "Figure audit" (Claude Code), its step 1's subagent asks to run a command
  *   /agents/ask-own    "Docs check" (Claude Code), its harness's own subagent asks to run a command
  *
+ * And /agents/relay-lead "Parser rewrite" (Claude Code), whose subagent the person wrote twice: what
+ * kiln asked the agent to pass each on is in its history, as the server keeps it, not in its chat.
+ *
  * The `agents.*` routes answer as the server's do, from these and nothing else.
  */
 import type http from "node:http";
 import type { WebSocket } from "ws";
 import type { AgentInfo, Approval, HEvent, Meta, State, SubagentBrief, Task, Todo } from "../src/api/harness.ts";
+import type { Perms } from "../src/api/wire/Perms.ts";
 import { defaultInfo, defaultMeta, defaultState, defaultTask } from "./defaults.ts";
 import { PROPOSED } from "./pages.ts";
 import { forgetMarks } from "./push.ts";
@@ -536,7 +540,7 @@ function leaves(m: Member) {
   const live = tasks.filter((t) => t.status === "running" || t.status === "pending" || t.status === "paused");
   m.info.subagents = tasks
     .filter((t) => t.class === "agent")
-    .map((t): SubagentBrief => ({ id: t.id, tool_id: t.tool_id, description: t.description, status: t.status, started: t.started, ended: t.ended }));
+    .map((t): SubagentBrief => ({ id: t.id, tool_id: t.tool_id, description: t.description, status: t.status, parent_task: t.parent_task, started: t.started, ended: t.ended, last_tool: t.last_tool, pausable: t.pausable, paused_at: t.paused_at, perms: t.perms }));
   m.info.tasks_running = live.length;
   m.info.left_behind = live.length;
 }
@@ -761,6 +765,181 @@ for (const m of [
   if (m.tasks) leaves(m);
   family.set(m.info.id, m);
 }
+
+// /agents/relay-lead "Parser rewrite" (Claude Code): two messages the person wrote its subagent,
+// each passed on by the agent as kiln asked it (harness/subagent.rs `relay_words`): one in a turn
+// of its own, the agent idle; one steered into its work. Neither shows in its conversation with
+// you: both are in the subagent's thread.
+{
+  const SUB = "a575c1d3e5f7a9b1c";
+  const SPAWN = "toolu_relay_tests";
+  const t = Date.now() - 30 * 60_000;
+  const m = member("relay-lead", "claude", "local", "Parser rewrite", "idle", "auto", "Rewrite the parser; send a subagent through its tests.", "A subagent is on the tests.");
+  const relay = (id: string, text: string, at: number): HEvent =>
+    ({
+      id: `kiln-relay-${id}`,
+      seq: at,
+      at,
+      kind: "user",
+      text: `The person wrote a message to your subagent “Run the parser tests” (agent id ${SUB}), which you started, through kiln, which can't reach it directly. Send it with your SendMessage tool (to: "${SUB}"). Pass it on exactly as written and don't act on it yourself; if it can't be sent, say why.\n\n<message>\n${text}\n</message>`,
+      client_id: `kiln-relay-${id}`,
+      origin: "kiln",
+    }) as HEvent;
+  const tool = (id: string, at: number, name: string, kind: string, title: string, input: unknown, extra: Record<string, unknown> = {}): HEvent =>
+    ({ id, seq: at, at, kind: "tool", tool_id: id, name, tool: kind, title, input, status: "done", started: at, ended: at + 1500, ...extra }) as unknown as HEvent;
+  const said = (id: string, text: string, at: number, parent?: string): HEvent => ({ id, seq: at, at, kind: "assistant", text, streaming: false, ...(parent ? { parent } : {}) }) as HEvent;
+  const theirs = (id: string, text: string, at: number): HEvent => ({ id, seq: at, at, parent: SPAWN, kind: "user", text, client_id: id, origin: "human" }) as HEvent;
+  m.events = [
+    { id: "relay-lead-u1", seq: t, at: t, kind: "user", text: "Rewrite the parser; send a subagent through its tests.", client_id: "relay-lead-u1", origin: "human" } as HEvent,
+    tool(SPAWN, t + 1_000, "Agent", "agent", "Run the parser tests", { description: "Run the parser tests", prompt: "Run the parser's tests and report what fails." }, { task: SUB }),
+    // Its brief in its thread, as Claude Code's transcript has it: the agent's words, not the person's (no client id, "system").
+    { id: "relay-brief", seq: t + 1_100, at: t + 1_100, parent: SPAWN, kind: "user", text: "Run the parser's tests and report what fails.", origin: "system" } as HEvent,
+    said("relay-lead-a1", "A subagent is on the tests.", t + 2_000),
+    // Passed on in a turn of its own, the agent idle.
+    theirs("relay-m1", "Use the v2 parser", t + 60_000),
+    relay("relay-m1", "Use the v2 parser", t + 61_000),
+    said("relay-lead-a2", "Passing that on to the subagent.", t + 62_000),
+    tool("toolu_relay_send1", t + 63_000, "SendMessage", "other", "SendMessage", { to: SUB, message: "Use the v2 parser" }),
+    said("relay-lead-a3", "Sent.", t + 64_000),
+    said("relay-sub-a1", "Switched to the v2 parser; 3 of 41 tests fail.", t + 90_000, SPAWN),
+    // Steered into its work on what you asked next.
+    { id: "relay-lead-u2", seq: t + 120_000, at: t + 120_000, kind: "user", text: "Also bump the version.", client_id: "relay-lead-u2", origin: "human" } as HEvent,
+    tool("toolu_relay_bash", t + 121_000, "Bash", "shell", "cargo test -p parser", { command: "cargo test -p parser" }),
+    theirs("relay-m2", "Then run the figure tests", t + 122_000),
+    relay("relay-m2", "Then run the figure tests", t + 123_000),
+    tool("toolu_relay_send2", t + 124_000, "SendMessage", "other", "SendMessage", { to: SUB, message: "Then run the figure tests" }),
+    tool("toolu_relay_edit", t + 125_000, "Edit", "edit", "crates/parser/Cargo.toml", { file_path: "crates/parser/Cargo.toml" }),
+    said("relay-lead-a4", "Version bumped to 0.3.0.", t + 126_000),
+  ];
+  m.tasks = [
+    {
+      ...defaultTask(),
+      id: SUB,
+      tool_id: SPAWN,
+      description: "Run the parser tests",
+      class: "agent",
+      kind: "local_agent",
+      status: "running",
+      background: true,
+      started: t + 1_000,
+      last_tool: "Bash",
+      stoppable: true,
+      via: "parent",
+    },
+  ];
+  leaves(m);
+  family.set(m.info.id, m);
+}
+// /agents/tree-lead "Storage lead" (Claude Code): its plan's steps out on subagents kiln started for
+// it (sessions of their own: `subagent`, with it as `parent`), their harness's own subagents under
+// them, one of kiln's under one of those (and its own under it), one of its own harness's, and one
+// that asks you something (`ASKS`): every kind of row Mission control's tree and the composer's draw.
+const treeAsk: Approval = {
+  id: "tree-s2-ap1",
+  tool_id: null,
+  tool_name: "Bash",
+  tool: "shell",
+  title: "kiln run --on linux/amd64 -- cargo test -p hyper-raft catch_up",
+  command: "kiln run --on linux/amd64 -- cargo test -p hyper-raft catch_up",
+  input: { command: "kiln run --on linux/amd64 -- cargo test -p hyper-raft catch_up" },
+  cwd: CWD,
+  at: Date.now() - 75_000,
+};
+// And the lead's own harness's subagent asks too, through the lead (`Approval.agent`): its row answers that one; the tree, the other.
+const treeLeadAsk: Approval = {
+  id: "tree-lead-ap1",
+  tool_id: null,
+  tool_name: "Bash",
+  tool: "shell",
+  title: "gpg --detach-sign dist/kiln-x86_64-linux",
+  command: "gpg --detach-sign dist/kiln-x86_64-linux",
+  input: { command: "gpg --detach-sign dist/kiln-x86_64-linux" },
+  cwd: CWD,
+  agent: "toolu_tl-h0",
+  at: Date.now() - 50_000,
+};
+{
+  const t = Date.now() - 40 * 60_000;
+  // Background subagents, as Claude Code runs them: they take a message queued, or steered into their work.
+  const sub = (id: string, description: string, started: number, rest: Partial<Task> = {}): Task => ({ ...defaultTask(), id, tool_id: `toolu_${id}`, description, class: "agent", kind: "local_agent", status: "running", background: true, started, stoppable: true, takes: ["queue", "steer"], pausable: true, ...rest });
+  const lead = member("tree-lead", "claude", "local", "Storage lead", "idle", "default", "Replicate the metadata store's log over QUIC, then rotate the release signing key.", "Its steps are out on subagents; I'll check each as it comes back.");
+  lead.tasks = [
+    sub("tl-h0", "Rotate the signing key", t + 30 * 60_000, { summary: "Signing kiln-x86_64-linux" }),
+    sub("tl-h1", "Port the lexer", t + 31 * 60_000, { status: "stopped", ended: t + 33 * 60_000, pausable: false, stoppable: false }),
+    sub("tl-h2", "Bench the follower", t + 32 * 60_000, { status: "failed", ended: t + 34 * 60_000, summary: "cargo bench exited 101", pausable: false, stoppable: false }),
+  ];
+  const s1 = member("tree-s1", "claude", "agent:metal-ryzen-01", "Leader election over QUIC", "running", "default", "Step 2 of 5 of the plan \u201cReplicated log\u201d: Leader election over QUIC", "Electing a leader across three nodes.", {
+    parent: "tree-lead",
+    subagent: true,
+    doing: "Running cargo test -p hyper-raft election",
+    perms: { read: "allow", edit: "allow", run: "ask", web: "allow" },
+  });
+  s1.info.created_at = t + 60_000;
+  s1.tasks = [
+    sub("ts1-a", "Check vote timeouts", t + 25 * 60_000, { summary: "Reading src/raft/vote.rs", last_tool: "Read" }),
+    sub("ts1-b", "Measure election time", t + 26 * 60_000, { status: "completed", ended: t + 30 * 60_000, summary: "Elections settle within two terms.", pausable: false }),
+  ];
+  const spawned = (task: string, n: number, title: string, brief: string, at: number, ended?: number): HEvent[] => [
+    {
+      id: `toolu_${task}`,
+      seq: n,
+      at,
+      kind: "tool",
+      tool_id: `toolu_${task}`,
+      name: "Agent",
+      tool: "agent",
+      title,
+      input: { description: title, prompt: brief },
+      status: ended ? "done" : "running",
+      started: at,
+      ended,
+      task,
+    } as unknown as HEvent,
+    { id: `${task}-brief`, seq: n + 1, at: at + 500, parent: `toolu_${task}`, kind: "user", text: brief, origin: "system" } as HEvent,
+  ];
+  s1.events.push(
+    ...spawned("ts1-a", 10, "Check vote timeouts", "Check each vote timeout in src/raft/vote.rs against the spec.", t + 25 * 60_000),
+    ...spawned("ts1-b", 20, "Measure election time", "Time ten elections across three nodes and say how many terms each took.", t + 26 * 60_000, t + 30 * 60_000),
+    { id: "ts1-b-a1", seq: 22, at: t + 30 * 60_000, parent: "toolu_ts1-b", kind: "assistant", text: "Elections settle within two terms." } as HEvent,
+  );
+  const s2 = member("tree-s2", "codex", "agent:metal-epyc-01", "Follower catch-up", "waiting", "untrusted", "Step 3 of 5 of the plan \u201cReplicated log\u201d: Follower catch-up", "I'll partition a follower and let it catch up.", { parent: "tree-lead", subagent: true });
+  s2.info.created_at = t + 120_000;
+  const s3 = member("tree-s3", "claude", "agent:metal-ryzen-02", "Snapshot transfer", "running", "default", "Step 4 of 5 of the plan \u201cReplicated log\u201d: Snapshot transfer", "Streaming a snapshot to a lagging follower.", {
+    parent: "tree-lead",
+    subagent: true,
+    doing: "Streaming a 10 GB snapshot",
+  });
+  s3.info.created_at = t + 180_000;
+  // Waiting for its usage limit to reset: what's sent it waits.
+  const s3a = member("tree-s3a", "claude", "agent:metal-ryzen-02", "Verify the checksum", "idle", "default", "Check the snapshot's checksum against the manifest.", "Hashing the snapshot.", {
+    parent: "tree-s3",
+    subagent: true,
+    doing: "Hashing snapshot-0042.bin",
+    pause: { reason: "limit", label: "Session", said: "", since: t, auto: true, by: "harness", tries: 0 },
+  });
+  s3a.info.created_at = t + 28 * 60_000;
+  s3a.tasks = [sub("ts3a-a", "Re-read the manifest", t + 29 * 60_000, { last_tool: "Read" })];
+  // One kiln started that has finished: its session ended (removed as Mission control's Remove removes an agent).
+  const s5 = member(
+    "tree-s5",
+    "claude",
+    "agent:metal-ryzen-01",
+    "Docs pass",
+    "exited",
+    "default",
+    "Step 5 of 5 of the plan \u201cReplicated log\u201d: Docs pass",
+    "docs/raft.md says how a follower catches up.",
+    {
+      parent: "tree-lead",
+      subagent: true,
+    },
+  );
+  s5.info.created_at = t + 200_000;
+  for (const m of [lead, s1, s2, s3, s3a, s5]) {
+    leaves(m);
+    family.set(m.info.id, m);
+  }
+}
 /** What each of them asks, and what it does meanwhile: asked again by `POST /api/mock/asks` (so each browser test starts from it). */
 const ASKS: [string, Approval, string][] = [
   ["ask-s2", askS2, "Asking you a question"],
@@ -768,14 +947,36 @@ const ASKS: [string, Approval, string][] = [
   ["ask-own", askDocs, "Waiting for your approval"],
 ];
 function askAll(told = true) {
+  treeAsks(false, told);
   forgetMarks(ASKS.map(([, ap]) => ap.id));
   for (const [id, ap, doing] of ASKS) {
     const m = family.get(id);
     if (!m) continue;
     m.approval = ap;
-    m.info.approvals = [{ id: ap.id, tool: ap.tool, tool_name: ap.tool_name, title: ap.title, at: ap.at }];
+    m.info.approvals = [{ id: ap.id, tool: ap.tool, tool_name: ap.tool_name, title: ap.title, at: ap.at, agent: ap.agent ?? undefined }];
     m.info.status = "waiting";
     m.info.doing = doing;
+    if (told) tell(m);
+  }
+}
+/**
+ * The tree's own requests (tree-lead's subagent's and tree-s2's): asked by `POST /api/mock/tree-asks`
+ * for the tests of the subagent tree, and taken back by `POST /api/mock/asks`, so no other test has
+ * their cards over its page.
+ */
+const TREE_ASKS: [string, Approval, string, AgentInfo["status"], string][] = [
+  ["tree-s2", treeAsk, "Waiting for your approval", "running", "Partitioning a follower at index 2,000"],
+  ["tree-lead", treeLeadAsk, "Waiting for your approval", "idle", ""],
+];
+function treeAsks(on: boolean, told = true) {
+  forgetMarks(TREE_ASKS.map(([, ap]) => ap.id));
+  for (const [id, ap, asking, status, doing] of TREE_ASKS) {
+    const m = family.get(id);
+    if (!m) continue;
+    m.approval = on ? ap : undefined;
+    m.info.approvals = on ? [{ id: ap.id, tool: ap.tool, tool_name: ap.tool_name, title: ap.title, at: ap.at, agent: ap.agent ?? undefined }] : [];
+    m.info.status = on ? "waiting" : status;
+    m.info.doing = on ? asking : doing;
     if (told) tell(m);
   }
 }
@@ -787,6 +988,171 @@ function tell(m: Member) {
   const state = JSON.stringify({ t: "state", state: stateOf(m) });
   for (const ws of viewers.get(m.info.id) ?? []) if (ws.readyState === ws.OPEN) ws.send(state);
   emitEvent({ type: "harness", info: m.info });
+}
+
+/** The subagents kiln started under one of them, and theirs. */
+const subagentsUnder = (id: string): string[] => [...family.values()].filter((x) => x.info.subagent && x.info.parent === id).flatMap((x) => [x.info.id, ...subagentsUnder(x.info.id)]);
+
+/**
+ * A person's pause (`Command::Pause`), or its end, as kiln takes it: one of its harness's own held
+ * at its next tool call (`paused_at`); else it, its processes held where they are (`frozen`), and
+ * the subagents kiln started under it.
+ */
+function pauseMember(m: Member, on: boolean, task?: string) {
+  if (task) {
+    const t = m.tasks?.find((x) => x.id === task || x.tool_id === task);
+    if (!t) return;
+    t.paused_at = on ? Date.now() : undefined;
+    leaves(m);
+    tell(m);
+    return;
+  }
+  for (const id of [m.info.id, ...subagentsUnder(m.info.id)]) {
+    const x = family.get(id);
+    if (!x) continue;
+    x.info.frozen = on ? Date.now() : undefined;
+    tell(x);
+  }
+}
+
+/** The variants made here (`branchMember`, `treeVariant`): taken back by `POST /api/mock/variants`. */
+const madeVariants: string[] = [];
+
+/** A variant joins the list, or leaves it. */
+function variantIn(v: Member) {
+  family.set(v.info.id, v);
+  madeVariants.push(v.info.id);
+  tell(v);
+}
+
+/**
+ * A person's branch (`Command::Branch`), as kiln makes it: a session beside it under the same
+ * agent (or, of one of its harness's own, a subagent of it), or of its own (`top`), named by their
+ * words and saying what it was branched from.
+ */
+function branchMember(m: Member, words: string, top: boolean, task?: string) {
+  const id = `${m.info.id}-v${madeVariants.length + 1}`;
+  const v = member(id, m.info.kind === "codex" ? "codex" : "claude", m.info.target, words, "running", m.info.mode, words, "Starting from where it was.", {
+    parent: top ? undefined : task ? m.info.id : m.info.parent,
+    subagent: top ? false : task ? true : m.info.subagent,
+    variant_of: task ? `${m.info.id}/${task}` : m.info.id,
+    doing: "Starting from where it was",
+  });
+  v.info.created_at = Date.now();
+  variantIn(v);
+}
+
+/** A finished variant of Follower catch-up (`POST /api/mock/tree-variant`), for Keep's tests only. */
+function treeVariant() {
+  const v = member("tree-s2v", "codex", "agent:metal-epyc-01", "Catch up in 64-entry batches", "idle", "untrusted", "Catch up in 64-entry batches.", "Caught up in 3.1 s, batching 64 entries at a time.", {
+    parent: "tree-lead",
+    subagent: true,
+    variant_of: "tree-s2",
+  });
+  v.info.created_at = (family.get("tree-s2")?.info.created_at ?? Date.now()) + 1;
+  variantIn(v);
+}
+
+/**
+ * A Codex agent working through two subagents of its own (`POST /api/mock/codex-kids`), for the tests
+ * of holding a Codex subagent (kiln's hook before each of its tool calls): taken back with the
+ * variants.
+ */
+function codexKids() {
+  const t = Date.now() - 10 * 60_000;
+  const m = member("codex-kids", "codex", "local", "Parser port", "running", "untrusted", "Port the parser to the new grammar.", "Its two parts are out on subagents.", {
+    doing: "Waiting for its subagents",
+  });
+  m.info.created_at = t;
+  const kid = (id: string, description: string, started: number): Task => ({
+    ...defaultTask(),
+    id,
+    tool_id: `call_${id}`,
+    description,
+    class: "agent",
+    kind: "spawn_agent",
+    status: "running",
+    started,
+    last_tool: "Bash",
+    pausable: true,
+  });
+  m.tasks = [kid("ck-a", "Port the lexer", t + 60_000), kid("ck-b", "Port the parser tests", t + 120_000)];
+  leaves(m);
+  variantIn(m);
+}
+
+/**
+ * An opencode agent (over ACP) working through two subagents of its own (`POST /api/mock/acp-kids`), for
+ * the tests of holding an ACP agent's subagents (at each call it asks about, `limits_asked`): taken
+ * back with the variants.
+ */
+function acpKids() {
+  const t = Date.now() - 10 * 60_000;
+  const m = member("acp-kids", "codex", "local", "Lexer audit", "running", "build", "Audit the lexer for unicode bugs.", "Its two parts are out on subagents.", {
+    doing: "Waiting for its subagents",
+  });
+  m.info.kind = "opencode";
+  m.info.kind_name = "opencode";
+  m.info.model = "anthropic/claude-sonnet-5-5";
+  m.info.created_at = t;
+  const kid = (id: string, description: string, started: number): Task => ({
+    ...defaultTask(),
+    id,
+    tool_id: id,
+    description,
+    class: "agent",
+    kind: "opencode",
+    status: "running",
+    started,
+    last_tool: "Read src/lexer.rs",
+    pausable: true,
+  });
+  m.tasks = [kid("ses_ak1", "Explore the lexer", t + 60_000), kid("ses_ak2", "Write unicode tests", t + 120_000)];
+  leaves(m);
+  variantIn(m);
+}
+
+/**
+ * An Antigravity agent working through two subagents of its own (`POST /api/mock/agy-kids`), for the
+ * tests of holding an Antigravity subagent (kiln's hook in agy's hooks.json): its web search is held
+ * call by call, as its other tools are. Taken back with the variants.
+ */
+function agyKids() {
+  const t = Date.now() - 10 * 60_000;
+  const m = member("agy-kids", "codex", "local", "Cache audit", "running", "accept-edits", "Audit the cache layer.", "Two subagents are looking into it.", {
+    doing: "Waiting for its subagents",
+  });
+  m.info.kind = "antigravity";
+  m.info.kind_name = "Antigravity CLI";
+  m.info.created_at = t;
+  const kid = (id: string, description: string, started: number): Task => ({
+    ...defaultTask(),
+    id,
+    tool_id: `agy-cb7d060c-${id.slice(-1) === "a" ? 2 : 5}`,
+    description,
+    class: "agent",
+    kind: "self",
+    status: "running",
+    background: true,
+    started,
+    last_tool: "read_file",
+    pausable: true,
+    takes: ["steer"],
+  });
+  m.tasks = [kid("ag-a", "Codebase Researcher", t + 60_000), kid("ag-b", "Cache Inspector", t + 120_000)];
+  leaves(m);
+  variantIn(m);
+}
+
+/** What a person lets one of them do (`Command::Perms`), or one of its harness's own (`task`), as kiln keeps it. */
+function permsMember(m: Member, perms: Perms | undefined, task?: string) {
+  if (task) {
+    const t = m.tasks?.find((x) => x.id === task || x.tool_id === task);
+    if (!t) return;
+    t.perms = perms;
+    leaves(m);
+  } else m.info.perms = perms;
+  tell(m);
 }
 
 /** What a person answered one of them (`approve`), as its harness takes it: the request goes, and it works on. */
@@ -836,6 +1202,25 @@ function stopTask(m: Member, id: string) {
   const state = JSON.stringify({ t: "state", state: stateOf(m) });
   for (const ws of viewers.get(m.info.id) ?? []) if (ws.readyState === ws.OPEN) ws.send(state);
   emitEvent({ type: "harness", info: m.info });
+}
+
+/** One of its harness's subagents that ended, removed (`remove_task`): it and those under it that ended leave its tasks, as the session's core does. */
+function removeTask(m: Member, id: string) {
+  const live = (t: Task) => t.status === "running" || t.status === "pending" || t.status === "paused";
+  const t = m.tasks?.find((x) => x.id === id);
+  if (!t || live(t)) return;
+  const gone = new Set([id]);
+  for (let more = true; more;) {
+    more = false;
+    for (const x of m.tasks ?? [])
+      if (!gone.has(x.id) && !live(x) && x.parent_task && gone.has(x.parent_task)) {
+        gone.add(x.id);
+        more = true;
+      }
+  }
+  m.tasks = (m.tasks ?? []).filter((x) => !gone.has(x.id));
+  leaves(m);
+  tell(m);
 }
 
 interface MockStep {
@@ -1114,7 +1499,7 @@ const META: Meta = {
   models: [],
   commands: [{ name: "btw", description: "Ask a side question without interrupting", hint: "<question>", group: "Session", args: "required", route: { kind: "prompt" } }],
   agents: [],
-  features: ["interrupt", "set_mode", "steer", "own_edits"],
+  features: ["interrupt", "set_mode", "steer", "limits", "own_edits", "remove_task"],
 };
 
 /** How a person's message reaches one of its subagents, as its harness lets one in (harness/subagent.rs): a Codex one on its own thread, a Claude Code one by way of its agent (not once stopped). */
@@ -1175,6 +1560,8 @@ function stateOf(m: Member): State {
     todos: m.info.id === "fam-orch" ? ORCH_TODOS : [],
     usage: { cost_usd: m.info.cost_usd, input_tokens: 0, output_tokens: 0, cache_read_tokens: 0, turns: 1 },
     dropped: 0,
+    frozen: m.info.frozen,
+    perms: m.info.perms,
   };
 }
 
@@ -1200,6 +1587,7 @@ export function handleFamilySession(ws: WebSocket, id: string): boolean {
     const c: Cmd = (under ? frame.c : frame) ?? {};
     if (c.type === "approve") takeAnswer(m, c);
     if (c.type === "stop_task" && c.task) setTimeout(() => stopTask(m, c.task ?? ""), 700);
+    if (c.type === "remove_task" && c.task) removeTask(m, c.task);
     if (c.type === "send" && c.task && c.text) tellSubagent(m, c.task, c.id ?? `sub-${Date.now()}`, c.text, c.mode ?? "queue");
     if (c.type?.startsWith("queue_")) subagentQueue(m, c);
     // What one who changed its files did alone, as its session keeps it (docs/agents.md, "One subagent's own edits").
@@ -1209,7 +1597,9 @@ export function handleFamilySession(ws: WebSocket, id: string): boolean {
     if (under) send({ t: "ack", id: under, outcome: "taken" });
   });
   send({ t: "open", info: m.info });
-  send({ t: "meta", meta: { ...META, version: m.info.kind === "claude" ? "2.3.1" : "0.46.0" } });
+  // Codex sets its web search for the whole agent alone (`web_whole`); an ACP agent is held only at the calls it asks about (`limits_asked`).
+  const features = m.info.kind === "codex" ? [...META.features, "web_whole"] : m.info.kind === "opencode" ? [...META.features, "limits_asked"] : META.features;
+  send({ t: "meta", meta: { ...META, version: m.info.kind === "claude" ? "2.3.1" : "0.46.0", features } });
   send({ t: "state", state: stateOf(m) });
   send({ t: "events", events: m.events });
   const files = CHANGESETS[id];
@@ -1965,11 +2355,65 @@ export async function handleFamily(req: http.IncomingMessage, res: http.ServerRe
     json(res, 200, {});
     return true;
   }
+  if (p === "/api/mock/tree-asks" && m === "POST") {
+    treeAsks(true);
+    json(res, 200, {});
+    return true;
+  }
+  if (p === "/api/mock/tree-variant" && m === "POST") {
+    treeVariant();
+    json(res, 200, {});
+    return true;
+  }
+  if (p === "/api/mock/codex-kids" && m === "POST") {
+    codexKids();
+    json(res, 200, {});
+    return true;
+  }
+  if (p === "/api/mock/acp-kids" && m === "POST") {
+    acpKids();
+    json(res, 200, {});
+    return true;
+  }
+  if (p === "/api/mock/agy-kids" && m === "POST") {
+    agyKids();
+    json(res, 200, {});
+    return true;
+  }
+  // The variants made here taken back, for the next tests.
+  if (p === "/api/mock/variants" && m === "POST") {
+    for (const id of madeVariants.splice(0)) {
+      family.delete(id);
+      emitEvent({ type: "harness_closed", id });
+    }
+    json(res, 200, {});
+    return true;
+  }
+  // Removed (Mission control's Remove, a subagent's trash): gone, as its server forgets it.
+  const dm = p.match(/^\/api\/harness\/sessions\/([^/]+)$/);
+  if (dm && m === "DELETE" && end(decodeURIComponent(dm[1] ?? ""))) {
+    json(res, 200, {});
+    return true;
+  }
   // A command without its socket (a request answered from Mission control's row or a card): taken as its harness would.
   const cm = p.match(/^\/api\/harness\/sessions\/([^/]+)\/command$/);
   const told = cm ? family.get(decodeURIComponent(cm[1] ?? "")) : undefined;
   if (cm && told && m === "POST") {
-    takeAnswer(told, await body<{ type?: string; id?: string; decision?: string }>(req));
+    const c = await body<{ type?: string; id?: string; decision?: string; text?: string; task?: string; mode?: string; on?: boolean; perms?: Perms; words?: string; top?: boolean }>(req);
+    takeAnswer(told, c);
+    if (c.type === "pause") pauseMember(told, c.on === true, c.task);
+    if (c.type === "perms") permsMember(told, c.perms, c.task);
+    if (c.type === "branch" && c.words) branchMember(told, c.words, c.top === true, c.task);
+    if (c.type === "remove_task" && c.task) removeTask(told, c.task);
+    // A message sent without its socket (to one of a lead's subagents, from its page): to a subagent of its harness's own, or to it.
+    if (c.type === "send" && c.text) {
+      if (c.task) tellSubagent(told, c.task, c.id ?? `sub-${Date.now()}`, c.text, c.mode ?? "queue");
+      else {
+        const e = { id: c.id ?? `u-${Date.now()}`, seq: Math.max(0, ...told.events.map((x) => x.seq)) + 1, at: Date.now(), kind: "user", text: c.text, client_id: c.id, origin: "human" } as HEvent;
+        told.events.push(e);
+        for (const ws of viewers.get(told.info.id) ?? []) if (ws.readyState === ws.OPEN) ws.send(JSON.stringify({ t: "events", events: [e] }));
+      }
+    }
     json(res, 200, {});
     return true;
   }

@@ -19,7 +19,7 @@ import { clientId, harnessApi, sessionStore, type AgentInfo, type KindInfo, type
 import type { Agent, ReachRunner, TerminalSessionInfo } from "@/api/types";
 import { Loadable } from "@/components/ui/loading";
 import { Tip } from "@/components/ui/tooltip";
-import { useRes, type Res } from "@/lib/data";
+import { labelOf, noteLabels, shownName, useLabels, useRes, type Res } from "@/lib/data";
 import { relativeTime } from "@/lib/format";
 import { errorMessage, readLocal, useLocalStorage, useNow } from "@/lib/hooks";
 import { invalidate, useSuspenseResource } from "@/lib/resource";
@@ -30,7 +30,7 @@ import { useAttachments } from "./controls";
 import { agentLabel, modelLabel, tildify } from "./derive";
 import { InlinePath } from "./inline-path";
 import { usePrefill, type Prefill } from "./new-agent-draft";
-import { machineName } from "./parts";
+import { machineShown } from "./parts";
 import { RunSettings, WordRow } from "./run-settings";
 import { effortsFor, resumeEffort } from "./spawn-efforts";
 import {
@@ -70,7 +70,10 @@ const askMachines = (signal: AbortSignal): Promise<Machines> =>
   Promise.all([
     harnessApi.kindsAll().catch((): Record<string, KindInfo[]> => ({})),
     api.agents(signal).then(
-      (a) => a.filter((m) => m.connected && !m.ephemeral),
+      (a) => {
+        noteLabels(a);
+        return a.filter((m) => m.connected && !m.ephemeral);
+      },
       (): Agent[] => [],
     ),
     api.terminalSessions(signal).catch((): TerminalSessionInfo[] => []),
@@ -256,6 +259,8 @@ function resolve(c: Choices, m: Machines) {
 type Setup = ReturnType<typeof resolve>;
 
 function useSetup(c: Choices): Setup {
+  // Machines are shown by their labels: their words change as those do.
+  useLabels();
   return resolve(c, useRes(machinesRes).data);
 }
 
@@ -534,7 +539,7 @@ function Under({
 }) {
   const s = useSetup(c);
   // What More options holds that isn't as it starts out, said while it's closed.
-  const summary = [c.name.trim() && `“${c.name.trim()}”`, s.volume && "Own volume", c.reach && (c.reach === "off" ? "Only its machine" : `Prefers ${c.reach}`)].filter(Boolean).join(" · ");
+  const summary = [c.name.trim() && `“${c.name.trim()}”`, s.volume && "Own volume", c.reach && (c.reach === "off" ? "Only its machine" : `Prefers ${labelOf(c.reach)}`)].filter(Boolean).join(" · ");
   return (
     <>
       <div className="mc-under">
@@ -565,12 +570,14 @@ function Under({
  */
 export function MachinesNote() {
   const m = useRes(machinesRes).data;
+  // Machines are shown by their labels (docs/machines.md).
+  useLabels();
   // Connected machines whose runner never reported its harnesses: too old to run agents.
   const stale = m.machines.filter((x) => !(`agent:${x.name}` in m.byTarget));
   if (stale.length > 0)
     return (
       <p className="mc-note">
-        <b>{stale.map((x) => x.name).join(", ")}</b> {stale.length === 1 ? "is" : "are"} connected, but {stale.length === 1 ? "its kiln runner is" : "their kiln runners are"} too old to run agents.
+        <b>{stale.map(shownName).join(", ")}</b> {stale.length === 1 ? "is" : "are"} connected, but {stale.length === 1 ? "its kiln runner is" : "their kiln runners are"} too old to run agents.
         Upgrade without a restart (shells keep running) by running this on {stale.length === 1 ? "that machine" : "each machine"} with the new kiln binary: <code>kiln install --agent --upgrade</code>
       </p>
     );
@@ -645,6 +652,7 @@ export function NewAgent({
   autoFocus?: boolean;
 }) {
   const c = useChoices();
+  useLabels();
   const navigate = useNavigate();
   const [params, setParams] = useSearchParams();
   // ?new=1 (the command palette, an entry point that filled this in): the field takes the focus once.
@@ -878,7 +886,7 @@ export function NewAgent({
                       <span className="pl-note">{doingOf(a)}</span>
                     </span>
                     <span className="pl-desc">
-                      {machineName(a.target)} · {a.kind_name}
+                      {machineShown(a.target)} · {a.kind_name}
                     </span>
                   </button>
                 </li>

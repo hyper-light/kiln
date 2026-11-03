@@ -489,6 +489,17 @@ interface MockComment {
   created_at: number;
   published: boolean;
   deleted?: boolean;
+  /** Who wrote it, in words, where it's an agent's (W26-R18); a person's is said from `author`. */
+  by?: { kind: "person" | "agent" | "job"; name: string; for?: string };
+  /** Its signature as kiln took it (W27-R04). */
+  signed?: { by: string; who: string; at: number };
+}
+
+/** A comment's author in words, as the server's byline says it (kiln_ci::review::byline). */
+function bylineOf(c: MockComment) {
+  if (c.by) return c.by;
+  if (c.author.startsWith("agent:")) return { kind: "agent" as const, name: `agent ${c.author.slice(6, 14)}` };
+  return { kind: "person" as const, name: c.author.startsWith("user:") ? c.author.slice(5) : c.author };
 }
 interface MockThread {
   id: string;
@@ -504,6 +515,9 @@ interface MockThread {
   kind?: "question" | "nit" | "issue" | "blocking";
   resolved_by?: string | null;
   resolved_at?: number | null;
+  /** The version that fixed it, and whether it waits for a person (W26-R18). */
+  fixed_in?: number | null;
+  waits?: string | null;
   comments: MockComment[];
 }
 
@@ -553,8 +567,19 @@ const threads: MockThread[] = [
         suggestion: null,
         created_at: now() - 3000,
         published: true,
+        signed: { by: "kiln://acme/person/kim", who: "kim", at: now() - 3000 },
       },
       { id: "c2", author: "user:sam", body: "It names the axis already; I'll add the job too.", suggestion: null, created_at: now() - 2400, published: true },
+      {
+        id: "c2a",
+        author: "agent:7c41aa02e9",
+        body: "`legged()` keeps the leg's name, so the job comes with it.",
+        suggestion: null,
+        created_at: now() - 2350,
+        published: true,
+        by: { kind: "agent", name: "Review agent", for: "kim" },
+        signed: { by: "kiln://acme/person/kim/agent/7c41aa02e9/epoch/1", who: "Review agent for kim", at: now() - 2350 },
+      },
       {
         id: "c2b",
         author: "user:kim",
@@ -602,6 +627,7 @@ const threads: MockThread[] = [
     state: "resolved",
     created_by: "user:kim",
     created_at: now() - 90000,
+    fixed_in: 2,
     comments: [{ id: "c5", author: "user:kim", body: "Could this land after D40's outputs? It reads them.", suggestion: null, created_at: now() - 90000, published: true }],
   },
   {
@@ -629,6 +655,8 @@ const threads: MockThread[] = [
 ];
 
 const viewed = new Map<string, Set<string>>();
+/** Diffs asked to land once their gate is clear (docs/ci.md W26-R19). */
+const whenReady = new Set<string>();
 const queue: {
   id: string;
   trunk: string;
@@ -732,11 +760,15 @@ function threadsOf(d: MockDiff) {
       resolved_by: t.resolved_by ?? null,
       resolved_at: t.resolved_at ?? null,
       resolution: null,
+      fixed_in: t.fixed_in ?? null,
+      waits: t.waits ?? null,
       comments: t.comments
         .filter((c) => c.published || c.author === ME)
         .map((c) => ({
           id: c.id,
           author: c.author,
+          by: bylineOf(c),
+          signed: c.signed ?? null,
           body: c.deleted ? "deleted" : c.body,
           suggestion: c.suggestion,
           created_at: c.created_at,
@@ -930,6 +962,9 @@ function verdictsOf(d: MockDiff) {
 
 /** D41's conflicts with main when a test turns them on (`POST /api/mock/review/conflicts`). */
 const conflictState = { on: false };
+/** Where the queue has a diff when a test says so (`POST /api/mock/review`, `{ queue: { diff, state } }`): it moves on
+ * with no one at the page (docs/ci.md W26-R19). */
+const queueState = new Map<string, string>();
 const takenResolutions = new Map<string, { take: string; lines: string[] | null; by: string; at: number }>();
 function conflictsOf(d: MockDiff): { diff: string; version: number; replay: unknown; conflicts: MockConflict[]; unresolved: number; ready: boolean } {
   const list: MockConflict[] =
@@ -1011,6 +1046,11 @@ function textOf(patch: string, path: string): string | null {
 /** A small PNG (32×32, a check of kiln's grey and green), for the image diff. */
 const PNG = Buffer.from("iVBORw0KGgoAAAANSUhEUgAAACAAAAAgCAIAAAD8GO2jAAAAO0lEQVR42mPQ1rPEilac3IMVkaqeYdSCUQuGgAXUMgiX+lELRi0YChaMFhWjFoxaMFofjFowaoG2niUAm6N+TBJRp68AAAAASUVORK5CYII=", "base64");
 
+/** Each repository's agent fixes switch (W26-R18), as `ci/agent_fixes.rs` keeps it: off until set. */
+const agentFixes = new Map<string, { agents_fix: boolean; set_by: string; set_at: number }>();
+const AGENT_FIXES_SAYS =
+  "On: an agent's comment on an agent's change goes to that change's agent, which pushes a fix and answers in the thread. Expect more versions and CI runs. Off: agents' comments wait for a person, who can Hand off.";
+
 export async function handleReview(req: http.IncomingMessage, res: http.ServerResponse, url: URL, ctx: Ctx): Promise<boolean> {
   const p = url.pathname;
   const m = req.method ?? "GET";
@@ -1024,14 +1064,29 @@ export async function handleReview(req: http.IncomingMessage, res: http.ServerRe
     return (ctx.json(res, 200, { id: b, trunk: "main", repo: REPO, diffs: list }), true);
   }
   if (a === "repos" && c === "queue" && m === "GET") return (ctx.json(res, 200, { entries: decodeURIComponent(b ?? "") === REPO ? queue : [] }), true);
+  if (a === "repos" && c === "agent-fixes" && (m === "GET" || m === "PUT")) {
+    const repo = decodeURIComponent(b ?? "");
+    if (m === "PUT") {
+      const body = await ctx.body<{ agents_fix?: unknown }>(req);
+      if (typeof body.agents_fix !== "boolean") return (ctx.err(res, 400, "`agents_fix`: true or false"), true);
+      agentFixes.set(repo, { agents_fix: body.agents_fix, set_by: "admin", set_at: Math.floor(Date.now() / 1000) });
+    }
+    const set = agentFixes.get(repo);
+    return (ctx.json(res, 200, { repo, agents_fix: set?.agents_fix ?? false, set_by: set?.set_by ?? null, set_at: set?.set_at ?? null, says: AGENT_FIXES_SAYS, may_change: true }), true);
+  }
   if (a === "queue" && b && m === "DELETE") {
     const q = queue.find((x) => x.id === b);
     if (q) q.state = "cancelled";
     return (ctx.json(res, 200, { ok: true }), true);
   }
   if (a === "mock" && b === "review" && m === "POST") {
-    const body = await ctx.body<{ conflicts?: boolean; emit?: { type: string; diff?: string } }>(req);
+    const body = await ctx.body<{ conflicts?: boolean; queue?: { diff: string; state: string | null }; emit?: { type: string; diff?: string } }>(req);
     if (body.conflicts !== undefined) conflictState.on = body.conflicts;
+    if (body.queue) {
+      if (body.queue.state) queueState.set(body.queue.diff, body.queue.state);
+      else queueState.delete(body.queue.diff);
+      ctx.emit({ type: "diff", diff: body.queue.diff });
+    }
     if (body.emit) ctx.emit(body.emit);
     return (ctx.json(res, 200, { ok: true }), true);
   }
@@ -1243,11 +1298,29 @@ export async function handleReview(req: http.IncomingMessage, res: http.ServerRe
         required: ["ci"],
         strategies: d.stack ? ["stack", "stack-squash"] : ["squash", "merge", "rebase"],
         default: d.stack ? "stack" : "squash",
+        queue: queueState.has(d.name)
+          ? { entry: "q-mock", state: queueState.get(d.name), reason: null }
+          : d.state === "landing"
+            ? { entry: queue.find((q) => q.diffs.includes(d.name))?.id ?? "", state: "queued", reason: null }
+            : null,
+        when_ready: whenReady.has(d.name),
       }),
       true
     );
   }
   if (c === "land" && m === "POST") {
+    // Asked to land once its gate is clear: Review hands it over then (W26-R19).
+    const body = await ctx.body<{ when_ready?: boolean }>(req);
+    if (body.when_ready === false) {
+      const was = whenReady.delete(d.name);
+      ctx.emit({ type: "diff", diff: d.name });
+      return (ctx.json(res, 200, { when_ready: false, was }), true);
+    }
+    if (body.when_ready === true && d.state !== "accepted") {
+      whenReady.add(d.name);
+      ctx.emit({ type: "diff", diff: d.name });
+      return (ctx.json(res, 200, { when_ready: true, entered: false }), true);
+    }
     if (d.state !== "accepted") return (ctx.err(res, 409, `${d.name} needs an accept first`), true);
     d.state = "landing";
     queue.unshift({

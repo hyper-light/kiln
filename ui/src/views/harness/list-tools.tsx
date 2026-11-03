@@ -8,8 +8,9 @@ import * as React from "react";
 import type { AgentInfo } from "@/api/harness";
 import { FacetBox, type Chosen, type Facet } from "@/components/ui/facet-box";
 import { FilterBar, SelectField } from "@/components/ui/misc";
+import { labelOf, useLabels, type Labels } from "@/lib/data";
 import { modelLabel, tildify } from "./derive";
-import { machineName } from "./parts";
+import { machineName, machineShown } from "./parts";
 
 export type SortId = "priority" | "newest" | "oldest" | "active" | "name" | "name-desc" | "runner" | "harness" | "cost";
 
@@ -71,7 +72,7 @@ const DIMENSIONS: {
   id: string;
   label: string;
   of: (r: ViewRow) => string;
-  name: (v: string, rows: ViewRow[]) => string;
+  name: (v: string, rows: ViewRow[], labels: Labels) => string;
   title?: (v: string) => string;
   always?: boolean;
 }[] = [
@@ -86,7 +87,7 @@ const DIMENSIONS: {
     id: "runner",
     label: "Runner",
     of: (r) => machineName(r.a.target),
-    name: (v) => v,
+    name: (v, _rows, labels) => labelOf(v, labels),
   },
   {
     id: "harness",
@@ -115,7 +116,7 @@ const DIMENSIONS: {
   },
 ];
 
-function sortBy(sort: SortId): (x: ViewRow, y: ViewRow) => number {
+function sortBy(sort: SortId, labels?: Labels): (x: ViewRow, y: ViewRow) => number {
   switch (sort) {
     case "priority":
       return (x, y) => {
@@ -138,7 +139,7 @@ function sortBy(sort: SortId): (x: ViewRow, y: ViewRow) => number {
     case "name-desc":
       return (x, y) => collator.compare(y.a.name, x.a.name);
     case "runner":
-      return (x, y) => collator.compare(machineName(x.a.target), machineName(y.a.target));
+      return (x, y) => collator.compare(machineShown(x.a.target, labels), machineShown(y.a.target, labels));
     case "harness":
       return (x, y) => collator.compare(x.a.kind_name, y.a.kind_name);
     case "cost":
@@ -149,9 +150,9 @@ function sortBy(sort: SortId): (x: ViewRow, y: ViewRow) => number {
 /** A sort kept from before (one since gone, like "state") is the default. */
 export const sortOf = (sort: string): SortId => (SORTS.some((s) => s.value === sort) ? (sort as SortId) : DEFAULT_VIEW.sort);
 
-/** In the sort's order; a sort chosen on purpose (by name, by age…) is followed as it is. */
-export function sortRows<T extends ViewRow>(rows: T[], sort: SortId): T[] {
-  const by = sortBy(sortOf(sort));
+/** In the sort's order; a sort chosen on purpose (by name, by age…) is followed as it is (by runner: by the names they're shown by). */
+export function sortRows<T extends ViewRow>(rows: T[], sort: SortId, labels?: Labels): T[] {
+  const by = sortBy(sortOf(sort), labels);
   return [...rows].sort((x, y) => by(x, y) || y.a.created_at - x.a.created_at || x.a.id.localeCompare(y.a.id));
 }
 
@@ -165,7 +166,7 @@ export function matches(q: string, facets: Chosen, r: ViewRow, except?: string):
 export const isFiltered = (q: string, facets: Chosen) => Boolean(q.trim()) || Object.values(facets).some((v) => v.length > 0);
 
 /** Each dimension's options with how many agents each would show, the other choices as they are. */
-function facetsOf(rows: ViewRow[], q: string, chosen: Chosen): Facet[] {
+function facetsOf(rows: ViewRow[], q: string, chosen: Chosen, labels: Labels): Facet[] {
   return DIMENSIONS.flatMap((d) => {
     const seen = new Map<string, number>();
     for (const r of rows) {
@@ -181,7 +182,7 @@ function facetsOf(rows: ViewRow[], q: string, chosen: Chosen): Facet[] {
     if (seen.size < 2 && picked.length === 0 && !d.always) return [];
     const options = [...seen.entries()].map(([id, count]) => ({
       id,
-      label: d.name(id, rows),
+      label: d.name(id, rows, labels),
       count,
       title: d.title?.(id),
     }));
@@ -193,7 +194,9 @@ function facetsOf(rows: ViewRow[], q: string, chosen: Chosen): Facet[] {
 
 /** The filter field and the sort, side by side (on a phone too). */
 export function ListBar({ rows, q, onQuery, view, onView }: { rows: ViewRow[]; q: string; onQuery: (q: string) => void; view: ListView; onView: (v: ListView) => void }) {
-  const facets = React.useMemo(() => facetsOf(rows, q, view.facets), [rows, q, view.facets]);
+  // Runners are named by their labels: the options change as those do.
+  const labels = useLabels();
+  const facets = React.useMemo(() => facetsOf(rows, q, view.facets, labels), [rows, q, view.facets, labels]);
   return (
     <FilterBar className="ms-bar">
       <FacetBox
@@ -223,13 +226,16 @@ interface Kept {
  * it follows again.
  */
 export function useShownList<T extends ViewRow>(all: T[], q: string, view: ListView, held: boolean) {
+  // By runner is by the names they're shown by.
+  const labels = useLabels();
   const now = React.useMemo(
     () =>
       sortRows(
         all.filter((r) => matches(q, view.facets, r)),
         view.sort,
+        labels,
       ),
-    [all, q, view],
+    [all, q, view, labels],
   );
   // Choosing another filter or sort is using the list too, but it asks for that order at once.
   const chosen = `${JSON.stringify(view)}|${q}`;

@@ -22,15 +22,15 @@ use std::time::Duration;
 
 use common::agents::{self, Talk};
 use common::custody::{Auth, ask, certified, field, half_named, person};
-use common::{Options, http, start};
+use common::{Options, http, machine, start};
 use kiln_ci::identity::custody::{Body, Kind, to_value};
 use kiln_ci::identity::statement::{Statement, Subject};
 use serde_json::{Value, json};
 
 const TALK: Talk = Talk { lines: 1, every_ms: 10 };
 
-/// A newer runner process `id` of machine `name` (its first one's state folder): a session is
-/// handed to it, an epoch up.
+/// A newer runner process `id` of machine `name` (its first one's state folder, and its machine id,
+/// as [`agents::runner`] gives it): a session is handed to it, an epoch up.
 fn instance(dir: &Path, port: u16, name: &str, id: &str) -> anyhow::Result<agents::Runner> {
     instance_with(dir, port, name, id, None, &[])
 }
@@ -50,6 +50,7 @@ fn instance_with(dir: &Path, port: u16, name: &str, id: &str, chaos: Option<&str
         .arg("--state-dir")
         .arg(dir.join(format!("{name}-state")))
         .env("HOME", dir.join("home"))
+        .env("KILN_MACHINE_ID", name)
         .env("NO_COLOR", "1")
         .env("PATH", format!("{}:{}", dir.join("bin").display(), std::env::var("PATH").unwrap_or_default()))
         .env("FAKE_CLAUDE_LINES", TALK.lines.to_string())
@@ -75,12 +76,12 @@ fn first_epoch(port: u16, admin: &str, id: &str) -> anyhow::Result<u64> {
     })
 }
 
-/// Once kiln keeps runner `machine`'s copy of the stand-in harness's own record of a session
+/// Once kiln keeps runner `name`'s copy of the stand-in harness's own record of a session
 /// (Claude Code's, under `<dir>/home/.claude`), which a resume from kiln's copy carries: the record
 /// written, then the runner's store said to be in step with the server's after its follower can
 /// have found the record (`convo::record` looks for one every 15 s) and the runner said so (every
 /// 5 s).
-fn record_kept(dir: &Path, port: u16, admin: &str, machine: &str) -> anyhow::Result<()> {
+fn record_kept(dir: &Path, port: u16, admin: &str, name: &str) -> anyhow::Result<()> {
     record_written(dir)?;
     let after = kiln::util::now_ms() + 25_000;
     until(Duration::from_secs(120), || {
@@ -88,7 +89,7 @@ fn record_kept(dir: &Path, port: u16, admin: &str, machine: &str) -> anyhow::Res
         anyhow::ensure!(st == 200, "{st} {body}");
         let v: Value = serde_json::from_str(&body)?;
         let stores = v.get("stores").and_then(Value::as_array).cloned().unwrap_or_default();
-        Ok(stores.iter().any(|s| field(s, "machine") == machine && field(s, "role") == "runner" && field(s, "state") == "in_sync" && s.get("heard").and_then(Value::as_i64).is_some_and(|h| h >= after)).then_some(()))
+        Ok(stores.iter().any(|s| field(s, "machine") == machine(name) && field(s, "role") == "runner" && field(s, "state") == "in_sync" && s.get("heard").and_then(Value::as_i64).is_some_and(|h| h >= after)).then_some(()))
     })
 }
 
@@ -100,12 +101,12 @@ fn record_written(dir: &Path) -> anyhow::Result<()> {
     until(Duration::from_secs(60), || Ok(std::fs::read_dir(&projects).ok().and_then(|d| d.flatten().find(|e| written(&e.path()))).map(|_| ())))
 }
 
-/// Whether runner `name` is connected, as the server says.
+/// Whether runner `name` is connected, as the server says (by its machine id).
 fn connected(port: u16, admin: &str, name: &str) -> anyhow::Result<bool> {
     let (_, body) = http(port, "GET", "/api/agents", admin, None)?;
     let v: Value = serde_json::from_str(&body).unwrap_or_default();
     let list = v.as_array().cloned().or_else(|| v.get("agents").and_then(Value::as_array).cloned()).unwrap_or_default();
-    Ok(list.iter().any(|a| field(a, "name") == name && a.get("connected") == Some(&json!(true))))
+    Ok(list.iter().any(|a| field(a, "name") == machine(name) && a.get("connected") == Some(&json!(true))))
 }
 
 /// The stand-in harnesses the sessions a test opens in `cwd` run in, stopped when it's dropped:
@@ -207,7 +208,8 @@ fn w27_r08_session_hand_overs_signed_by_both_processes() -> anyhow::Result<()> {
     let held = |v: &Value| -> Vec<(String, String)> {
         v.get("hops").and_then(Value::as_array).map(|h| h.iter().map(|h| (field(h, "kind").to_owned(), field(h, "custodian").to_owned())).collect()).unwrap_or_default()
     };
-    let at = |e: u64, inst: &str| format!("/agent/{id}/epoch/{e}/machine/box-a/instance/{inst}");
+    let box_a = machine("box-a");
+    let at = |e: u64, inst: &str| format!("/agent/{id}/epoch/{e}/machine/{box_a}/instance/{inst}");
     let first = held(&one);
     assert!(first.first().is_some_and(|(k, c)| k == "received" && c.ends_with(&at(e0 + 1, "z1"))), "{one}");
     assert!(first.get(1).is_some_and(|(k, c)| k == "handed-on" && c.ends_with(&at(e0, "main"))), "{one}");
@@ -257,7 +259,7 @@ fn w27_r08_a_session_resumed_from_kilns_copy_is_kilns_take() -> anyhow::Result<(
     let v = session_chain(dir.path(), port, admin, &id, 2)?;
     let hops = v.get("hops").and_then(Value::as_array).cloned().unwrap_or_default();
     let (got, took) = (hops.first().cloned().unwrap_or_default(), hops.get(1).cloned().unwrap_or_default());
-    assert!(field(&got, "kind") == "received" && field(&got, "custodian").contains(&format!("/agent/{id}/epoch/{}/machine/box-b/", e0 + 1)), "{v}");
+    assert!(field(&got, "kind") == "received" && field(&got, "custodian").contains(&format!("/agent/{id}/epoch/{}/machine/{}/", e0 + 1, machine("box-b"))), "{v}");
     let server = format!("kiln://{}/server", field(&got, "custodian").trim_start_matches("kiln://").split('/').next().unwrap_or_default());
     assert!(field(&took, "kind") == "taken" && field(&took, "custodian") == server, "{v}");
     assert!(field(&took, "why").contains("box-a was last heard from at"), "{v}");
@@ -293,8 +295,8 @@ fn w27_r08_session_hand_overs_a_move_signed_by_both_machines() -> anyhow::Result
     let v = session_chain(dir.path(), port, admin, &id, 2)?;
     let hops = v.get("hops").and_then(Value::as_array).cloned().unwrap_or_default();
     let (got, gave) = (hops.first().cloned().unwrap_or_default(), hops.get(1).cloned().unwrap_or_default());
-    assert!(field(&got, "kind") == "received" && field(&got, "custodian").contains(&format!("/agent/{id}/epoch/{}/machine/box-b/", e0 + 1)), "{v}");
-    assert!(field(&gave, "kind") == "handed-on" && field(&gave, "custodian").ends_with(&format!("/agent/{id}/epoch/{e0}/machine/box-a/instance/main")), "{v}");
+    assert!(field(&got, "kind") == "received" && field(&got, "custodian").contains(&format!("/agent/{id}/epoch/{}/machine/{}/", e0 + 1, machine("box-b"))), "{v}");
+    assert!(field(&gave, "kind") == "handed-on" && field(&gave, "custodian").ends_with(&format!("/agent/{id}/epoch/{e0}/machine/{}/instance/main", machine("box-a"))), "{v}");
     assert_eq!(half_named(&v), 0, "every hop names both its sides and who signed it");
     Ok(())
 }
@@ -314,7 +316,8 @@ impl Drop for Supervised {
     }
 }
 
-/// Runner `name` under `kiln supervise`, as [`agents::runner`] starts one otherwise, writing to
+/// Runner `name` under `kiln supervise`, as [`agents::runner`] starts one otherwise (a machine of its
+/// own, by that name), writing to
 /// `<dir>/<name>.log` (the new build an upgrade starts beside it too). It runs `exe`, a build other
 /// than the server's, so the server has one to upgrade it to.
 fn supervised(dir: &Path, port: u16, name: &str, exe: &Path, env: &[(&str, &str)]) -> anyhow::Result<(Supervised, std::path::PathBuf)> {
@@ -339,6 +342,7 @@ fn supervised(dir: &Path, port: u16, name: &str, exe: &Path, env: &[(&str, &str)
         .arg(dir.join(format!("{name}-state")))
         .env("HOME", &home)
         .env_remove("GIT_CONFIG_GLOBAL")
+        .env("KILN_MACHINE_ID", name)
         .env("NO_COLOR", "1")
         .env("FAKE_CLAUDE_LINES", TALK.lines.to_string())
         .env("FAKE_CLAUDE_EVERY_MS", TALK.every_ms.to_string())
@@ -350,15 +354,15 @@ fn supervised(dir: &Path, port: u16, name: &str, exe: &Path, env: &[(&str, &str)
     Ok((Supervised(cmd.spawn()?), log_path))
 }
 
-/// What the server took again from runner `machine`'s store as it had it already, and what it left
+/// What the server took again from runner `name`'s store as it had it already, and what it left
 /// out as a former writer's (rows sent twice, or lost to an epoch that rose too soon), since it
 /// started: the board's feed intake.
-fn sent_again(port: u16, admin: &str, machine: &str) -> anyhow::Result<(u64, u64)> {
+fn sent_again(port: u16, admin: &str, name: &str) -> anyhow::Result<(u64, u64)> {
     let (st, body) = http(port, "GET", "/api/conversations/status", admin, None)?;
     anyhow::ensure!(st == 200, "{st} {body}");
     let v: Value = serde_json::from_str(&body)?;
     let stores = v.get("stores").and_then(Value::as_array).cloned().unwrap_or_default();
-    let n = |k: &str| stores.iter().filter(|s| field(s, "machine") == machine && field(s, "role") == "runner").filter_map(|s| s.pointer(&format!("/feed/intake/{k}")).and_then(Value::as_u64)).sum();
+    let n = |k: &str| stores.iter().filter(|s| field(s, "machine") == machine(name) && field(s, "role") == "runner").filter_map(|s| s.pointer(&format!("/feed/intake/{k}")).and_then(Value::as_u64)).sum();
     Ok((n("same"), n("fenced")))
 }
 
@@ -367,7 +371,7 @@ fn sent_again(port: u16, admin: &str, machine: &str) -> anyhow::Result<(u64, u64
 /// session had, the new build its receipt at the next once it's promoted, and it goes on at that
 /// epoch, with nothing the server's copy has sent to it again.
 #[test]
-#[cfg_attr(debug_assertions, ignore = "needs a release build: an upgrade downloads the server's own kiln, and a debug one is larger than kiln serves (updates::MAX_BINARY)")]
+#[cfg_attr(debug_assertions, ignore = "needs a release build: an upgrade downloads the server's own kiln, and a debug one is over a gigabyte")]
 fn w27_r08_session_hand_overs_blue_green_sends_nothing_again() -> anyhow::Result<()> {
     // The new build is this one, downloaded from the server: hundreds of MB for a debug build, so
     // under the build's own temporary folder, on disk.
@@ -388,7 +392,7 @@ fn w27_r08_session_hand_overs_blue_green_sends_nothing_again() -> anyhow::Result
     let id = agents::open_session(port, admin, "box-a", &cwd, Duration::from_secs(60))?;
     let e0 = first_epoch(port, admin, &id)?;
     let before = sent_again(port, admin, "box-a")?;
-    let (st, body) = http(port, "POST", "/api/updates/runners/box-a", admin, None)?;
+    let (st, body) = http(port, "POST", &format!("/api/updates/runners/{}", machine("box-a")), admin, None)?;
     anyhow::ensure!(st == 202, "{st} {body}");
     let job = serde_json::from_str::<Value>(&body)?.get("id").and_then(Value::as_str).unwrap_or_default().to_owned();
     // What the upgrade, the runner and the server said of it, when it doesn't go through.
@@ -410,9 +414,9 @@ fn w27_r08_session_hand_overs_blue_green_sends_nothing_again() -> anyhow::Result
     .map_err(said)?;
     let hops = v.get("hops").and_then(Value::as_array).cloned().unwrap_or_default();
     let (got, gave) = (hops.first().cloned().unwrap_or_default(), hops.get(1).cloned().unwrap_or_default());
-    let green = format!("/agent/{id}/epoch/{}/machine/box-a/instance/", e0 + 1);
+    let green = format!("/agent/{id}/epoch/{}/machine/{}/instance/", e0 + 1, machine("box-a"));
     assert!(field(&got, "kind") == "received" && field(&got, "custodian").contains(&green) && !field(&got, "custodian").ends_with("/instance/main"), "{v}");
-    assert!(field(&gave, "kind") == "handed-on" && field(&gave, "custodian").ends_with(&format!("/agent/{id}/epoch/{e0}/machine/box-a/instance/main")), "{v}");
+    assert!(field(&gave, "kind") == "handed-on" && field(&gave, "custodian").ends_with(&format!("/agent/{id}/epoch/{e0}/machine/{}/instance/main", machine("box-a"))), "{v}");
     assert_eq!(half_named(&v), 0, "every hop names both its sides and who signed it");
     // It goes on at the next epoch, its state saying so, with nothing sent again.
     until(Duration::from_secs(60), || {
@@ -441,7 +445,7 @@ fn transfers(v: &Value) -> Vec<(u64, String)> {
 /// there blue/green, taken over by a newer process of that machine, and resumed from kiln's copy
 /// once that machine is away: four hand-overs, epochs e0 to e0 + 4, each a verified transfer.
 #[test]
-#[cfg_attr(debug_assertions, ignore = "needs a release build: an upgrade downloads the server's own kiln, and a debug one is larger than kiln serves (updates::MAX_BINARY)")]
+#[cfg_attr(debug_assertions, ignore = "needs a release build: an upgrade downloads the server's own kiln, and a debug one is over a gigabyte")]
 fn w27_r08_session_hand_overs() -> anyhow::Result<()> {
     let dir = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR"))?;
     let s = start(dir.path(), &Options::default())?;
@@ -478,7 +482,7 @@ fn w27_r08_session_hand_overs() -> anyhow::Result<()> {
     })?;
     chain_through(1, "moved")?;
     // box-b upgraded blue/green.
-    let (st, body) = http(port, "POST", "/api/updates/runners/box-b", admin, None)?;
+    let (st, body) = http(port, "POST", &format!("/api/updates/runners/{}", machine("box-b")), admin, None)?;
     anyhow::ensure!(st == 202, "{st} {body}");
     chain_through(2, "upgraded blue/green")?;
     // Taken over by a newer process of box-b: newer than the build the upgrade started, as its
@@ -500,7 +504,7 @@ fn w27_r08_session_hand_overs() -> anyhow::Result<()> {
     let v = chain_through(4, "resumed")?;
     let got = transfers(&v);
     assert_eq!(got.iter().map(|(e, _)| *e).collect::<Vec<_>>(), vec![e0 + 4, e0 + 3, e0 + 2, e0 + 1], "verified transfers, newest first: {v}");
-    assert!(got.first().is_some_and(|(_, c)| c.contains("/machine/box-a/")) && got.get(1).is_some_and(|(_, c)| c.ends_with("/instance/z1")), "{v}");
+    assert!(got.first().is_some_and(|(_, c)| c.contains(&format!("/machine/{}/", machine("box-a")))) && got.get(1).is_some_and(|(_, c)| c.ends_with("/instance/z1")), "{v}");
     assert_eq!(half_named(&v), 0, "every hop names both its sides and who signed it");
     Ok(())
 }
@@ -510,7 +514,7 @@ fn w27_r08_session_hand_overs() -> anyhow::Result<()> {
 /// machine's runner role, handed on by the process replaced and received by its new build, and each
 /// session, each a transfer signed by both sides; nothing moved without one.
 #[test]
-#[cfg_attr(debug_assertions, ignore = "needs a release build: an upgrade downloads the server's own kiln, and a debug one is larger than kiln serves (updates::MAX_BINARY)")]
+#[cfg_attr(debug_assertions, ignore = "needs a release build: an upgrade downloads the server's own kiln, and a debug one is over a gigabyte")]
 fn w27_r08_replant() -> anyhow::Result<()> {
     let dir = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR"))?;
     let s = start(dir.path(), &Options::default())?;
@@ -528,7 +532,7 @@ fn w27_r08_replant() -> anyhow::Result<()> {
     std::fs::create_dir_all(&cwd)?;
     let ids = [agents::open_session(port, admin, "box-a", &cwd, Duration::from_secs(60))?, agents::open_session(port, admin, "box-a", &cwd, Duration::from_secs(60))?];
     // The replant: box-a moved onto the server's build.
-    let (st, body) = http(port, "POST", "/api/updates/runners/box-a", admin, None)?;
+    let (st, body) = http(port, "POST", &format!("/api/updates/runners/{}", machine("box-a")), admin, None)?;
     anyhow::ensure!(st == 202, "{st} {body}");
     let job = serde_json::from_str::<Value>(&body)?.get("id").and_then(Value::as_str).unwrap_or_default().to_owned();
     let mut seen = Value::Null;
@@ -547,12 +551,13 @@ fn w27_r08_replant() -> anyhow::Result<()> {
     assert_eq!(v.get("moved_without_a_transfer"), Some(&json!([])), "{v}");
     let transfers = v.get("transfers").and_then(Value::as_array).cloned().unwrap_or_default();
     let of = |what: &str| transfers.iter().find(|t| field(t, "what") == what).cloned().unwrap_or_default();
-    let role = of("runner role of box-a");
-    assert!(field(&role, "from").ends_with("/machine/box-a/instance/main"), "the process replaced hands the role on: {v}");
-    assert!(field(&role, "to").contains("/machine/box-a/instance/") && !field(&role, "to").ends_with("/instance/main"), "its new build holds it: {v}");
+    let box_a = machine("box-a");
+    let role = of(&format!("runner role of {box_a}"));
+    assert!(field(&role, "from").ends_with(&format!("/machine/{box_a}/instance/main")), "the process replaced hands the role on: {v}");
+    assert!(field(&role, "to").contains(&format!("/machine/{box_a}/instance/")) && !field(&role, "to").ends_with("/instance/main"), "its new build holds it: {v}");
     for id in &ids {
         let t = of(&format!("session {id}"));
-        assert!(field(&t, "from").contains(&format!("/agent/{id}/epoch/")) && field(&t, "from").ends_with("/machine/box-a/instance/main"), "{id} handed on by the process replaced: {v}");
+        assert!(field(&t, "from").contains(&format!("/agent/{id}/epoch/")) && field(&t, "from").ends_with(&format!("/machine/{box_a}/instance/main")), "{id} handed on by the process replaced: {v}");
         assert!(field(&t, "to").contains(&format!("/agent/{id}/epoch/")) && !field(&t, "to").ends_with("/instance/main"), "{id} received by its new build: {v}");
     }
     Ok(())
@@ -594,12 +599,12 @@ fn w27_r08_session_hand_overs_with_runners_from_before_go_unsigned() -> anyhow::
     let _z1 = instance(dir.path(), port, "box-a", "z1")?;
     let one = unsigned_of(dir.path(), port, admin, &id, 1)?;
     let first = one.iter().find(|u| u.get("epoch") == Some(&json!(e0 + 1))).cloned().unwrap_or_default();
-    assert!(field(&first, "gave").ends_with(&format!("/agent/{id}/epoch/{e0}/machine/box-a/instance/main")) && field(&first, "why").contains("signed no hand-on"), "{one:?}");
+    assert!(field(&first, "gave").ends_with(&format!("/agent/{id}/epoch/{e0}/machine/{}/instance/main", machine("box-a"))) && field(&first, "why").contains("signed no hand-on"), "{one:?}");
     // From the newer runner to another from before: it signed no receipt.
     let _z2 = instance_with(dir.path(), port, "box-a", "z2", Some("unsigned"), &[])?;
     let two = unsigned_of(dir.path(), port, admin, &id, 2)?;
     let second = two.iter().find(|u| u.get("epoch") == Some(&json!(e0 + 2))).cloned().unwrap_or_default();
-    assert!(field(&second, "gave").ends_with(&format!("/agent/{id}/epoch/{}/machine/box-a/instance/z1", e0 + 1)) && field(&second, "why").contains("signed no receipt"), "{two:?}");
+    assert!(field(&second, "gave").ends_with(&format!("/agent/{id}/epoch/{}/machine/{}/instance/z1", e0 + 1, machine("box-a"))) && field(&second, "why").contains("signed no receipt"), "{two:?}");
     Ok(())
 }
 
@@ -611,7 +616,7 @@ fn w27_r08_session_hand_overs_with_runners_from_before_go_unsigned() -> anyhow::
 /// is applied, and the new build holds all seven.
 #[cfg(feature = "chaos")]
 #[test]
-#[cfg_attr(debug_assertions, ignore = "needs a release build: an upgrade downloads the server's own kiln, and a debug one is larger than kiln serves (updates::MAX_BINARY)")]
+#[cfg_attr(debug_assertions, ignore = "needs a release build: an upgrade downloads the server's own kiln, and a debug one is over a gigabyte")]
 fn w27_ac05_the_1418_drop_played_again() -> anyhow::Result<()> {
     const SESSIONS: usize = 7;
     let dir = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR"))?;
@@ -632,14 +637,14 @@ fn w27_ac05_the_1418_drop_played_again() -> anyhow::Result<()> {
         let e0 = first_epoch(port, admin, &id)?;
         sessions.push((id, e0));
     }
-    let (st, body) = http(port, "POST", "/api/updates/runners/box-a", admin, None)?;
+    let (st, body) = http(port, "POST", &format!("/api/updates/runners/{}", machine("box-a")), admin, None)?;
     anyhow::ensure!(st == 202, "{st} {body}");
     // Each goes on at its next epoch in the new build, which received it.
     for (id, e0) in &sessions {
         let v = until(Duration::from_secs(300), || {
             let (st, body) = http(port, "GET", &format!("/api/custody?name=session%20{id}%20at%20epoch%20*"), admin, None)?;
             let v: Value = if st == 200 { serde_json::from_str(&body)? } else { Value::Null };
-            Ok((v.get("unbroken") == Some(&json!(true)) && field(&v, "held_by").contains(&format!("/agent/{id}/epoch/{}/machine/box-a/", e0 + 1))).then_some(v))
+            Ok((v.get("unbroken") == Some(&json!(true)) && field(&v, "held_by").contains(&format!("/agent/{id}/epoch/{}/machine/{}/", e0 + 1, machine("box-a")))).then_some(v))
         })
         .map_err(|e| anyhow::anyhow!("session {id}: {e}: {}", said_of(dir.path(), port, admin, id)))?;
         assert!(!field(&v, "held_by").ends_with("/instance/main"), "held by the new build: {v}");
@@ -656,7 +661,7 @@ fn w27_ac05_the_1418_drop_played_again() -> anyhow::Result<()> {
     for (id, _) in &sessions {
         let of: Vec<&Value> = refused.iter().filter(|r| field(r, "why").contains(id.as_str())).collect();
         assert_eq!(of.len(), 2, "both stale words about session {id} refused: {refused:?}");
-        assert!(of.iter().all(|r| field(r, "came_from") == "runner box-a (instance main)" && field(r, "why").contains("handed to its machine's new build")), "{of:?}");
+        assert!(of.iter().all(|r| field(r, "came_from") == format!("runner {} (instance main)", machine("box-a")) && field(r, "why").contains("handed to its machine's new build")), "{of:?}");
     }
     // None applied: every session still runs, held by the new build.
     std::thread::sleep(Duration::from_secs(5));
@@ -668,7 +673,7 @@ fn w27_ac05_the_1418_drop_played_again() -> anyhow::Result<()> {
         assert!(!matches!(status, "exited" | "closed"), "session {id} went on: {i}");
         let (_, chain) = http(port, "GET", &format!("/api/custody?name=session%20{id}%20at%20epoch%20*"), admin, None)?;
         let v: Value = serde_json::from_str(&chain).unwrap_or_default();
-        assert!(field(&v, "held_by").contains(&format!("/agent/{id}/epoch/{}/machine/box-a/", e0 + 1)) && !field(&v, "held_by").ends_with("/instance/main"), "{v}");
+        assert!(field(&v, "held_by").contains(&format!("/agent/{id}/epoch/{}/machine/{}/", e0 + 1, machine("box-a"))) && !field(&v, "held_by").ends_with("/instance/main"), "{v}");
     }
     Ok(())
 }
@@ -743,7 +748,7 @@ fn w27_ac05_the_twin_played_again() -> anyhow::Result<()> {
     let refused = until(Duration::from_secs(90), || {
         let (_, body) = http(port, "GET", "/api/transfers/refused", admin, None)?;
         let v: Value = serde_json::from_str(&body).unwrap_or_default();
-        let of: Vec<Value> = v.get("refused").and_then(Value::as_array).cloned().unwrap_or_default().into_iter().filter(|r| field(r, "act").contains(&id) && field(r, "came_from").starts_with("runner box-a")).collect();
+        let of: Vec<Value> = v.get("refused").and_then(Value::as_array).cloned().unwrap_or_default().into_iter().filter(|r| field(r, "act").contains(&id) && field(r, "came_from").starts_with(&format!("runner {}", machine("box-a")))).collect();
         Ok((of.len() >= 3).then_some(of))
     })
     .map_err(|e| anyhow::anyhow!("{e}: goals.done said {met}; ci said {ci}; the run said {acted}: {}", said_of(dir.path(), port, admin, &id)))?;
@@ -758,11 +763,11 @@ fn w27_ac05_the_twin_played_again() -> anyhow::Result<()> {
     assert!(!ran.exists(), "nothing ran on box-c: {acted}");
     assert!(refused.iter().any(|r| field(r, "act").contains("goals.done")) && refused.iter().any(|r| field(r, "act").contains("ci.runs.trigger")) && refused.iter().any(|r| field(r, "act").contains("a run on box-c")), "{refused:?}");
     // Each recorded with who signed it, the epoch it's from and the transfer that superseded it.
-    let from_e0 = |r: &Value| r.get("epoch").and_then(Value::as_u64) == Some(e0) && field(r, "signer").contains(&format!("/agent/{id}/epoch/{e0}/machine/box-a/")) && !field(r, "superseded_by").is_empty() && !field(r, "digest").is_empty();
+    let from_e0 = |r: &Value| r.get("epoch").and_then(Value::as_u64) == Some(e0) && field(r, "signer").contains(&format!("/agent/{id}/epoch/{e0}/machine/{}/", machine("box-a"))) && !field(r, "superseded_by").is_empty() && !field(r, "digest").is_empty();
     assert!(refused.iter().all(from_e0), "{refused:?}");
     // The session at its next epoch goes on untouched, on box-b.
     let v = session_chain(dir.path(), port, admin, &id, 2)?;
-    assert!(field(&v, "held_by").contains(&format!("/agent/{id}/epoch/{}/machine/box-b/", e0 + 1)), "{v}");
+    assert!(field(&v, "held_by").contains(&format!("/agent/{id}/epoch/{}/machine/{}/", e0 + 1, machine("box-b"))), "{v}");
     Ok(())
 }
 
@@ -844,7 +849,7 @@ fn w27_r08_work_handed() -> anyhow::Result<()> {
     assert!(said.contains("refused") && said.contains("no longer holds"), "{said}");
     let refused = json_of("the refusals", http(port, "GET", "/api/transfers/refused", admin, None)?)?;
     let of_first: Vec<Value> = refused.get("refused").and_then(Value::as_array).into_iter().flatten().filter(|r| field(r, "act").contains(&first)).cloned().collect();
-    assert!(of_first.iter().any(|r| field(r, "superseded_by") == take && field(r, "came_from").starts_with("runner box-a")), "{of_first:?}");
+    assert!(of_first.iter().any(|r| field(r, "superseded_by") == take && field(r, "came_from").starts_with(&format!("runner {}", machine("box-a")))), "{of_first:?}");
     // Step 2 taken over by the owner, from a device with no key: kiln's receipt for them.
     let took = json_of("step 2 taken over", http(port, "POST", &format!("/api/plans/runs/{run}/steps/2/take"), admin, None)?)?;
     assert!(took.pointer("/custody/kiln_signed_for_you").is_some_and(Value::is_string), "{took}");
@@ -1233,6 +1238,12 @@ fn reach_directories_hold(dir: &Path, boxes: &[&str], within: Duration) -> anyho
 #[cfg(feature = "chaos")]
 const CHANGED_BINARY: &str = "aarch64-pc-windows-msvc";
 
+/// How a record names runner `name`'s process, `/machine/<its machine id>/`: kiln knows a runner
+/// by its machine id (docs/machines.md), a test's made from its name (`common::machine`).
+fn on(name: &str) -> String {
+    format!("/machine/{}/", machine(name))
+}
+
 /// The custody of record `record` (its digest) as kiln took it: its signer.
 #[cfg(feature = "chaos")]
 fn custodian_of(dir: &Path, record: &str) -> anyhow::Result<String> {
@@ -1310,7 +1321,7 @@ fn peers_objects(dir: &Path, port: u16, admin: &str) -> anyhow::Result<()> {
     })
     .map_err(|e| anyhow::anyhow!("{e}: {}\n{}", chain_of(&x).unwrap_or_default(), said_of(dir, port, admin, &x)))?;
     let (b_uri, a_uri) = match hops(&v).as_slice() {
-        [(r, taker), (h, giver)] if r == "received" && h == "handed-on" && taker.contains("/machine/box-b/") && giver.contains("/machine/box-a/") => (taker.clone(), giver.clone()),
+        [(r, taker), (h, giver)] if r == "received" && h == "handed-on" && taker.contains(&on("box-b")) && giver.contains(&on("box-a")) => (taker.clone(), giver.clone()),
         other => anyhow::bail!("box-b's receipt of box-a's hand-on: {other:?}"),
     };
     assert!(half_named(&v) == 0, "each hop names both sides, signed: {v}");
@@ -1441,7 +1452,7 @@ fn signing_session(dir: &Path, port: u16, admin: &str, name: &str, chaos: Option
         let (st, body) = http(port, "GET", "/api/identities?kind=runner", admin, None)?;
         anyhow::ensure!(st == 200, "{st} {body}");
         let v: Value = serde_json::from_str(&body)?;
-        let mark = format!("/machine/{name}/");
+        let mark = on(name);
         Ok(v.get("identities").and_then(Value::as_array).is_some_and(|l| l.iter().any(|i| field(i, "subject").contains(&mark) && !field(i, "verified").is_empty())).then_some(()))
     })?;
     let id = agents::open_session(port, admin, name, &dir.join("work-here"), Duration::from_secs(60))?;
@@ -1468,17 +1479,17 @@ fn w27_r08_relays_a_runners_relay_of_its_agents_calls() -> anyhow::Result<()> {
     }
     let v = until(Duration::from_secs(60), || {
         let v = relays(port, admin, 0)?;
-        Ok((stream_counts(&v, "/machine/box-a/", "calls to kiln") == (CALLS, 0) && v.get("unanswered").and_then(Value::as_array).is_some_and(Vec::is_empty)).then_some(v))
+        Ok((stream_counts(&v, &on("box-a"), "calls to kiln") == (CALLS, 0) && v.get("unanswered").and_then(Value::as_array).is_some_and(Vec::is_empty)).then_some(v))
     })
     .map_err(|e| anyhow::anyhow!("{e}: {}", relays(port, admin, 0).unwrap_or_default()))?;
     assert!(v.get("unanswered").and_then(Value::as_array).is_some_and(Vec::is_empty), "each answered by kiln's receipt: {v}");
     let receipts = receipts_by(dir.path(), "/server")?;
     assert_eq!(u64::try_from(receipts.len())?, CALLS, "a receipt of kiln's for each call");
     let hops = walked_hops(port, admin, receipts.first().map(String::as_str).unwrap_or_default())?;
-    assert!(matches!(hops.as_slice(), [(r, server), (p, runner)] if r == "received" && server.ends_with("/server") && p == "passed-on" && runner.contains("/machine/box-a/")), "{hops:?}");
+    assert!(matches!(hops.as_slice(), [(r, server), (p, runner)] if r == "received" && server.ends_with("/server") && p == "passed-on" && runner.contains(&on("box-a"))), "{hops:?}");
     let (server, runner) = (std::fs::read_to_string(dir.path().join("server.log")).unwrap_or_default(), std::fs::read_to_string(dir.path().join("box-a.log")).unwrap_or_default());
     assert!(!server.contains("passed this act on with no record") && !runner.contains("passed on to kiln unrecorded"), "no act relayed without its record");
-    assert_eq!(relay_breaks(port, admin, "/machine/box-a/")?, Vec::<Value>::new(), "each passed on unchanged");
+    assert_eq!(relay_breaks(port, admin, &on("box-a"))?, Vec::<Value>::new(), "each passed on unchanged");
     // Walked as `kiln custody walk` walks it (the Transfers plan's step 15): a call's chain, and with
     // one hop's record removed, then changed where kiln keeps it, the break named at that hop.
     common::custody::walked_and_broken(port, admin, &dir.path().join("data/kiln.db"), receipts.first().map(String::as_str).unwrap_or_default())?;
@@ -1504,7 +1515,7 @@ fn w27_r08_relays_that_drop_swap_or_alter_an_agents_call_are_caught() -> anyhow:
         let op = |i: usize| if i.is_multiple_of(2) { "goals.get" } else { "agents.get" };
         let answers: Vec<String> = (0..5).map(|i| ask_as(dir.path(), &name, &id, op(i), json!({"agent": id}))).collect::<anyhow::Result<_>>()?;
         let refused: Vec<&String> = answers.iter().filter(|a| a.contains("refused")).collect();
-        let relay = format!("/machine/{name}/");
+        let relay = on(&name);
         let breaks = until(Duration::from_secs(60), || {
             let b = relay_breaks(port, admin, &relay)?;
             Ok((b.len() >= 2).then_some(b))
@@ -1548,11 +1559,11 @@ fn w27_r08_relays_kilns_relay_of_an_agents_words() -> anyhow::Result<()> {
     let (_b, b) = signing_session(dir.path(), port, admin, "box-b", None)?;
     let said = ask_as(dir.path(), "box-a", &a, "agents.send", json!({"agent": b, "text": "the build is green"}))?;
     anyhow::ensure!(said.contains("\"sent\":true"), "{said}");
-    let receipt = until(Duration::from_secs(60), || Ok(receipts_by(dir.path(), "/machine/box-b/")?.into_iter().next()))?;
+    let receipt = until(Duration::from_secs(60), || Ok(receipts_by(dir.path(), &on("box-b"))?.into_iter().next()))?;
     let hops = walked_hops(port, admin, &receipt)?;
     let kinds: Vec<(&str, bool)> = hops.iter().map(|(k, c)| (k.as_str(), c.ends_with("/server"))).collect();
     assert_eq!(kinds, vec![("received", false), ("passed-on", true), ("passed-on", false)], "box-b's receipt, kiln's record, box-a's: {hops:?}");
-    assert!(hops.first().is_some_and(|(_, c)| c.contains("/machine/box-b/")) && hops.get(2).is_some_and(|(_, c)| c.contains("/machine/box-a/")), "{hops:?}");
+    assert!(hops.first().is_some_and(|(_, c)| c.contains(&on("box-b"))) && hops.get(2).is_some_and(|(_, c)| c.contains(&on("box-a"))), "{hops:?}");
     let v = relays(port, admin, 0)?;
     assert_eq!(stream_counts(&v, "/server", "words to "), (1, 0), "kiln's record of the words, numbered: {v}");
     assert!(v.get("unanswered").and_then(Value::as_array).is_some_and(Vec::is_empty), "{v}");
@@ -1581,7 +1592,7 @@ fn w27_r08_relays_that_drop_swap_or_alter_an_agents_words_are_caught() -> anyhow
         let (_b, b) = signing_session(dir.path(), port, admin, "box-b", None)?;
         let first = ask_as(dir.path(), "box-a", &a, "agents.send", json!({"agent": b, "text": "the build is green"}))?;
         anyhow::ensure!(first.contains("\"sent\":true"), "{fault}: {first}");
-        until(Duration::from_secs(60), || Ok(receipts_by(dir.path(), "/machine/box-b/")?.into_iter().next()))?;
+        until(Duration::from_secs(60), || Ok(receipts_by(dir.path(), &on("box-b"))?.into_iter().next()))?;
         let second = ask_as(dir.path(), "box-a", &a, "agents.send", json!({"agent": b, "text": "the deploy is done"}))?;
         // A while for the recipient's receipt or its word of a break; then kiln's records no
         // receipt answers are recorded as breaks, as kiln does once they lapse.
@@ -1641,7 +1652,7 @@ fn w27_r08_relays_kilns_relay_of_a_reach_links_frames() -> anyhow::Result<()> {
     assert!(ran.contains("relayed by kiln"), "{ran}");
     // kiln records a run within 10 s of its first frame; each end's receipt comes at its next beat.
     // A run recorded since may be a beat ahead of its receipt: those 20 s old or more are answered.
-    until(Duration::from_secs(90), || Ok((!receipts_by(dir.path(), "/machine/box-b/")?.is_empty() && !receipts_by(dir.path(), "/machine/box-a/")?.is_empty()).then_some(())))
+    until(Duration::from_secs(90), || Ok((!receipts_by(dir.path(), &on("box-b"))?.is_empty() && !receipts_by(dir.path(), &on("box-a"))?.is_empty()).then_some(())))
         .map_err(|e| anyhow::anyhow!("{e}: each end's receipt: {}", relays(port, admin, 20).unwrap_or_default()))?;
     let v = until(Duration::from_secs(90), || {
         let v = relays(port, admin, 20)?;
@@ -1650,10 +1661,10 @@ fn w27_r08_relays_kilns_relay_of_a_reach_links_frames() -> anyhow::Result<()> {
     })
     .map_err(|e| anyhow::anyhow!("{e}: {}", relays(port, admin, 20).unwrap_or_default()))?;
     let streams: Vec<&str> = v.get("streams").and_then(Value::as_array).into_iter().flatten().map(|s| field(s, "stream")).filter(|s| s.starts_with("reach link ")).collect();
-    assert!(streams.iter().any(|s| s.contains("/machine/box-a/")) && streams.iter().any(|s| s.contains("/machine/box-b/")), "a stream to each end: {streams:?}");
-    let receipt = receipts_by(dir.path(), "/machine/box-b/")?.into_iter().next().ok_or_else(|| anyhow::anyhow!("no receipt by box-b"))?;
+    assert!(streams.iter().any(|s| s.contains(&on("box-a"))) && streams.iter().any(|s| s.contains(&on("box-b"))), "a stream to each end: {streams:?}");
+    let receipt = receipts_by(dir.path(), &on("box-b"))?.into_iter().next().ok_or_else(|| anyhow::anyhow!("no receipt by box-b"))?;
     let hops = walked_hops(port, admin, &receipt).map_err(|e| anyhow::anyhow!("{e}: {}", reach_said(dir.path())))?;
-    assert!(matches!(hops.as_slice(), [(r, b), (p, server)] if r == "received" && b.contains("/machine/box-b/") && p == "passed-on" && server.ends_with("/server")), "{hops:?}");
+    assert!(matches!(hops.as_slice(), [(r, b), (p, server)] if r == "received" && b.contains(&on("box-b")) && p == "passed-on" && server.ends_with("/server")), "{hops:?}");
     // Each run's receipt names the frames as kiln's relay passed them on: no break.
     assert_eq!(relay_breaks(port, admin, "/server")?, Vec::<Value>::new(), "each passed on unchanged");
     Ok(())
@@ -1782,7 +1793,7 @@ fn w27_r08_relays_blue_greens_forwarder() -> anyhow::Result<()> {
             let _ = w.join();
         }
         done.map_err(|e| anyhow::anyhow!("{fault:?}: the upgrade: {e}"))?;
-        let blue = "/machine/box-a/instance/main";
+        let blue = format!("{}instance/main", on("box-a"));
         let v = until(Duration::from_secs(90), || {
             let v = relays(port, admin, 20)?;
             let (n, missing) = stream_counts(&v, blue, "frames forwarded to ");
@@ -1795,7 +1806,7 @@ fn w27_r08_relays_blue_greens_forwarder() -> anyhow::Result<()> {
         let (forwarded, _) = stream_counts(&v, blue, "frames forwarded to ");
         match fault {
             None => {
-                let receipts = receipts_by(dir.path(), "/machine/box-a/")?.into_iter().filter(|r| walked_hops(port, admin, r).is_ok_and(|h| h.get(1).is_some_and(|(_, c)| c.ends_with(blue)))).count();
+                let receipts = receipts_by(dir.path(), &on("box-a"))?.into_iter().filter(|r| walked_hops(port, admin, r).is_ok_and(|h| h.get(1).is_some_and(|(_, c)| c.ends_with(&blue)))).count();
                 assert_eq!(u64::try_from(receipts)?, forwarded, "the new build's receipt of each frame of words forwarded: {v}");
                 assert_eq!(relay_breaks(port, admin, blue)?, Vec::<Value>::new(), "each passed on unchanged");
             }
@@ -1870,7 +1881,7 @@ fn synced_runs(dir: &Path, port: u16, admin: &str) -> anyhow::Result<()> {
         .map_err(|e| anyhow::anyhow!("{e}: {}\n{}", chain_of(d).unwrap_or_default(), said_of(dir, port, admin, &id)))
     };
     let session = format!("/agent/{id}/epoch/{epoch}");
-    let (on_c, on_b) = (format!("{session}/machine/box-c/"), "/machine/box-b/".to_owned());
+    let (on_c, on_b) = (format!("{session}{}", on("box-c")), on("box-b"));
     // The workspace: the session's hand-on on box-c, box-b's receipt for it under its delegation.
     let ws = unbroken(&tree, 2)?;
     match hops_held(&ws).as_slice() {
@@ -1921,7 +1932,7 @@ fn synced_runs(dir: &Path, port: u16, admin: &str) -> anyhow::Result<()> {
     let custodian = |d: &str| -> anyhow::Result<String> { Ok(db.query_row("SELECT custodian FROM custody WHERE digest = ?1", [d], |r| r.get(0))?) };
     let (record, follows) = (field(&broke, "record"), broke.pointer("/around/1").and_then(Value::as_str).unwrap_or_default());
     let (took, gave) = (custodian(record)?, custodian(follows)?);
-    assert!(took.contains(&on_b) && gave.contains("/machine/box-d/"), "box-b's receipt of what came, box-d's hand-on of what it sent: {broke}");
+    assert!(took.contains(&on_b) && gave.contains(&on("box-d")), "box-b's receipt of what came, box-d's hand-on of what it sent: {broke}");
     let refused = until(Duration::from_secs(60), || {
         let (_, body) = http(port, "GET", "/api/transfers/refused", admin, None)?;
         let v: Value = serde_json::from_str(&body).unwrap_or_default();
@@ -1988,7 +1999,7 @@ fn feed_batches(dir: &Path, port: u16, admin: &str, cwd: &Path) -> anyhow::Resul
     // Each runner's batch, received as handed on: one of its chains walks unbroken.
     let unbroken = |m: &str| -> anyhow::Result<Option<Value>> {
         for (record, giver) in receipts()? {
-            if giver.contains(&format!("/machine/{m}/")) {
+            if giver.contains(&on(m)) {
                 let v = chain_of_digest(port, admin, &record)?;
                 if v.get("unbroken") == Some(&json!(true)) && half_named(&v) == 0 && hops_of(&v).into_iter().map(|h| h.0).collect::<Vec<_>>() == ["received", "handed-on"] {
                     return Ok(Some(v));
@@ -2002,6 +2013,6 @@ fn feed_batches(dir: &Path, port: u16, admin: &str, cwd: &Path) -> anyhow::Resul
     let broke = breaks_now(port, admin)?.into_iter().find(|x| field(x, "kind") == "changed" && field(x, "detail").contains("conversation store"));
     let broke = broke.ok_or_else(|| anyhow::anyhow!("no break recorded for box-b's changed batch"))?;
     let follows = broke.pointer("/around/1").and_then(Value::as_str).unwrap_or_default();
-    assert!(custodian_of(dir, follows)?.contains("/machine/box-b/"), "box-b's hand-on: {broke}");
+    assert!(custodian_of(dir, follows)?.contains(&on("box-b")), "box-b's hand-on: {broke}");
     Ok(())
 }

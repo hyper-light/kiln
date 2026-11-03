@@ -233,7 +233,7 @@ pub async fn run(hub: &Arc<Hub>, b: &Broadcast, by: &str, among: &[Info]) -> any
                     Sent::Refused(r) => return outcome("failed", Some(r.to_string())),
                     s @ (Sent::Rejected { .. } | Sent::Unanswered(_)) => return outcome("failed", s.failure().map(|(_, why)| why)),
                     Sent::NoSession => return outcome("failed", Some("it has gone".to_owned())),
-                    Sent::Unreachable => return outcome("failed", Some(format!("{} is not connected", machine(&info.target)))),
+                    Sent::Unreachable => return outcome("failed", Some(format!("{} is not connected", hub.shown(machine(&info.target))))),
                 }
             }
             outcome("sent", None)

@@ -601,10 +601,12 @@ pub async fn submit(hub: &Arc<Hub>, s: Submission<'_>) -> Result<Vec<Outcome>, S
                     (_, None) => anyhow::bail!("a diff that was there isn't"),
                 };
                 if kind != "unchanged" {
+                    // The threads of its own it answers (`-o answer=`, W26-R18).
+                    let (why, thread, note) = answering(&tx, &diff_id, &opts.threads, author_kind == "agent", opts.message.clone())?;
                     tx.execute(
-                        "INSERT INTO diff_versions (diff_id, n, commit_sha, parent, base, patch_id, message, note, rebase_only, pushed_by, created_at, started_by)
-                         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
-                        params![diff_id, n, p.sha, p.parent, base, patch_id, message, opts.message, rebase_only, pushed_by, now, by_text],
+                        "INSERT INTO diff_versions (diff_id, n, commit_sha, parent, base, patch_id, message, note, rebase_only, pushed_by, created_at, started_by, why, thread)
+                         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
+                        params![diff_id, n, p.sha, p.parent, base, patch_id, message, note, rebase_only, pushed_by, now, by_text, why, thread],
                     )?;
                     let draft: String = tx.query_row("SELECT state FROM diffs WHERE id = ?1", [&diff_id], |r| r.get(0))?;
                     let labels = label_names(&tx, &diff_id)?;
@@ -1082,6 +1084,32 @@ pub async fn find(hub: &Hub, key: &str) -> anyhow::Result<Option<Diff>> {
         .await
 }
 
+/// What a new version of diff `diff_id` answers (W26-R18), of the threads its push named (`-o
+/// answer=`): those that are `diff_id`'s own. With any, it names the first (`thread`), its why is an
+/// agent's fix when an agent pushed it, and its note lists them all (`answers th1, th2`) after the
+/// push's own note: `(why, thread, note)`.
+pub(crate) fn answering(c: &rusqlite::Connection, diff_id: &str, threads: &[String], by_agent: bool, note: Option<String>) -> rusqlite::Result<(Option<&'static str>, Option<String>, Option<String>)> {
+    let mut mine: Vec<&str> = Vec::new();
+    for t in threads {
+        if c.query_row("SELECT EXISTS (SELECT 1 FROM review_threads WHERE id = ?1 AND diff_id = ?2)", params![t, diff_id], |r| r.get::<_, bool>(0))? {
+            mine.push(t);
+        }
+    }
+    let Some(first) = mine.first().map(|t| (*t).to_owned()) else { return Ok((None, None, note)) };
+    let listed = format!("answers {}", mine.join(", "));
+    let note = match note.filter(|n| !n.trim().is_empty()) {
+        Some(n) => format!("{n}\n{listed}"),
+        None => listed,
+    };
+    Ok((by_agent.then_some(kiln_ci::review::agents::AGENT_FIX), Some(first), Some(note)))
+}
+
+/// Whether a version answers thread `thread` (W26-R18), by its `first` thread and its `note`: it
+/// names it first, or its note lists it.
+pub(crate) fn answers(first: Option<&str>, note: Option<&str>, thread: &str) -> bool {
+    first == Some(thread) || note.is_some_and(|n| n.lines().filter_map(|l| l.strip_prefix("answers ")).any(|ts| ts.split(", ").any(|t| t == thread)))
+}
+
 pub(crate) async fn versions(hub: &Hub, d: &Diff) -> anyhow::Result<Vec<Version>> {
     let (id, name) = (d.id.clone(), d.name.clone());
     hub.store
@@ -1354,14 +1382,19 @@ pub async fn ship_commit_blob(hub: &std::sync::Arc<Hub>, repo_key: &str, sha: &s
 }
 
 /// The bare repository of `repo_key` (name or id) when `sha` exists in it and the caller may read
-/// the repository, else the API's "not found".
+/// the repository, else the API's "not found": the one kiln hosts, or else kiln's mirror of the
+/// one it builds, with the commit in it whole (fetched when it isn't yet). Ship's Files said "the
+/// repository isn't hosted here" of kiln's own commits, which its mirror holds (Ada, 2026-11-01).
 async fn commit_repo(hub: &std::sync::Arc<Hub>, repo_key: &str, sha: &str, caller: &crate::authz::Caller) -> Result<(String, String), Fail> {
     let repos = hub.store.repos().await.map_err(fail)?;
     let repo = repos.into_iter().find(|r| r.name == repo_key || r.id == repo_key).ok_or((StatusCode::NOT_FOUND, "no such repository".to_owned()))?;
     if !caller.can("runs.read", &Scope::Repo { repo: repo.name.clone() }) {
         return Err((StatusCode::NOT_FOUND, "no such commit".to_owned()));
     }
-    let path = super::hosting::native_path(hub, &repo).ok_or((StatusCode::NOT_FOUND, "the repository isn't hosted here".to_owned()))?;
+    let path = match super::hosting::native_path(hub, &repo) {
+        Some(path) => path,
+        None => gitops::ensure_commit(hub, &repo, sha).await.map_err(|_| (StatusCode::NOT_FOUND, "no such commit".to_owned()))?,
+    };
     let path = path.to_string_lossy().into_owned();
     gitops::run_git(hub, &["-C", &path, "cat-file", "-e", &format!("{sha}^{{commit}}")], LS_REMOTE_TIMEOUT)
         .await
@@ -1653,6 +1686,12 @@ async fn take(hub: &Hub, d: &Diff, caller: &Caller, body: &Value) -> Result<Valu
     Ok(json!({ "author": who, "hand_on": hand_on }))
 }
 
+/// Marks draft `d` ready for review as `caller` would through `ci.diffs.ready` (a host's draft
+/// change kiln opened, docs/ci.md W29-R12).
+pub(crate) async fn ready_as(hub: &Hub, d: &Diff, caller: &Caller) -> Result<Value, Fail> {
+    act(hub, d, "ready", caller).await
+}
+
 /// The author's actions (and commandeering): `ready`, `abandon`, `reclaim`, `commandeer`.
 async fn act(hub: &Hub, d: &Diff, action: &str, caller: &Caller) -> Result<Value, Fail> {
     let who = author_of(&caller.name, Some(caller.kind)).0;
@@ -1808,6 +1847,9 @@ pub async fn route(hub: &Arc<Hub>, method: &Method, segs: &[&str], q: &HashMap<S
         (&Method::POST, ["comments", id, "apply"]) => ok(super::review::apply_suggestion(hub, id, caller, body).await?),
         (&Method::GET, ["repos", repo, "queue"]) => ok(super::land::list(hub, repo).await?),
         (&Method::GET, ["repos", repo, "lands", commit]) => ok(super::lands::get(hub, repo, commit).await?),
+        // W26-R18: whether agents fix code from agents' feedback, on the repository's page in Repos.
+        (&Method::GET, ["repos", repo, "agent-fixes"]) => ok(super::agent_fixes::route(hub, repo, caller, None).await?),
+        (&Method::PUT, ["repos", repo, "agent-fixes"]) => ok(super::agent_fixes::route(hub, repo, caller, Some(body)).await?),
         // W28-R109: a host's changes into its host's own queue, each at the head Review cleared.
         (&Method::POST, ["repos", repo, "queue"]) => ok(super::land::enqueue_route(hub, repo, body, &caller.name).await?),
         (&Method::GET, ["stacks", id]) => ok(stack(hub, id).await?),
@@ -1908,6 +1950,21 @@ pub async fn route(hub: &Arc<Hub>, method: &Method, segs: &[&str], q: &HashMap<S
                 (&Method::POST, ["land"]) => {
                     if !caller.can("diffs.land", &Scope::Repo { repo: d.repo.clone() }) {
                         return Err((StatusCode::FORBIDDEN, "landing needs `diffs.land`".into()));
+                    }
+                    // `when_ready`: Review hands it to the queue once its gate is clear (docs/ci.md
+                    // W26-R19, W14's land when ready), at once if it's clear now; `false` takes the
+                    // ask back.
+                    match body.get("when_ready").and_then(Value::as_bool) {
+                        Some(true) => {
+                            let strategy = body.get("strategy").and_then(Value::as_str);
+                            let entered = Box::pin(super::land::land_when_ready(hub, &d, &caller.name, caller.started_by(), strategy, None, None)).await?;
+                            return ok(json!({ "when_ready": true, "entered": entered }));
+                        }
+                        Some(false) => {
+                            let was = super::land::not_when_ready(hub, &d, &caller.name).await?;
+                            return ok(json!({ "when_ready": false, "was": was }));
+                        }
+                        None => {}
                     }
                     ok(super::land::enqueue(hub, &d, caller, body).await?)
                 }

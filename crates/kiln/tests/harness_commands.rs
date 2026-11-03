@@ -29,7 +29,7 @@ use std::path::Path;
 use std::time::{Duration, Instant};
 
 use common::agents::{self, Talk};
-use common::{Options, http};
+use common::{Options, http, machine};
 use serde_json::{Value, json};
 
 /// Whether runner `name` is connected now.
@@ -37,7 +37,8 @@ fn connected(port: u16, admin: &str, name: &str) -> anyhow::Result<bool> {
     let (_, body) = http(port, "GET", "/api/agents", admin, None)?;
     let v: Value = serde_json::from_str(&body).unwrap_or_default();
     let list = v.as_array().cloned().or_else(|| v.get("agents").and_then(Value::as_array).cloned()).unwrap_or_default();
-    Ok(list.iter().any(|a| a.get("name").and_then(Value::as_str) == Some(name) && a.get("connected").and_then(Value::as_bool) == Some(true)))
+    let key = machine(name);
+    Ok(list.iter().any(|a| a.get("name").and_then(Value::as_str) == Some(key.as_str()) && a.get("connected").and_then(Value::as_bool) == Some(true)))
 }
 
 /// How many times the runner has cut its link so far.
@@ -61,6 +62,9 @@ fn a_sessions_commands_are_answered_by_its_runner_through_cuts_and_lost_frames()
     // (`AgentMsg::Wire`, variant 46, on the terminal lane) lost.
     let (_runner, log) = agents::runner(dir.path(), s.port, "box", Some("drop=6s,down=2s,shed=term/46:3"), Talk { lines: 1, every_ms: 10 })?;
     agents::connected(s.port, &s.admin, "box", &log, Duration::from_secs(120))?;
+    // Its headroom off: on a busy machine it would freeze the session's harness, and messages the
+    // runner took would wait past the test.
+    agents::headroom_off(s.port, &s.admin, "box", Duration::from_secs(60))?;
     let work = dir.path().join("work");
     std::fs::create_dir_all(&work)?;
     let (controls, messages) = (work.join(".fake-claude-controls"), work.join(".fake-claude-messages"));

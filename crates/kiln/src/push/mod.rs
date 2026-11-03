@@ -315,7 +315,7 @@ async fn battery(hub: Arc<Hub>, machine: String, text: String) {
         people.insert(opener_of(&hub, a).await);
     }
     let tag = format!("battery:{machine}");
-    let payload = json!({ "title": format!("{machine} is low on battery"), "body": text, "tag": tag, "url": "/runners", "kind": "machine.battery_low", "at": crate::util::now_ms() });
+    let payload = json!({ "title": format!("{} is low on battery", hub.shown(&machine)), "body": text, "tag": tag, "url": "/runners", "kind": "machine.battery_low", "at": crate::util::now_ms() });
     for p in people {
         push_to(&hub, &p, "machine.battery_low", None, &payload, "normal", &watch::topic(&tag), TTL_OTHER).await;
     }
@@ -397,7 +397,7 @@ mod tests {
                 let mut said = 0;
                 for i in 0..400u64 {
                     let id = format!("ag{}", i % 5);
-                    let approvals = if i % 3 == 0 { vec![ApprovalBrief { id: format!("a{t}-{i}"), tool: ToolKind::Shell, tool_name: "Bash".into(), title: "ls".into(), at: i64::try_from(i).unwrap_or(0) }] } else { Vec::new() };
+                    let approvals = if i % 3 == 0 { vec![ApprovalBrief { id: format!("a{t}-{i}"), tool: ToolKind::Shell, tool_name: "Bash".into(), title: "ls".into(), at: i64::try_from(i).unwrap_or(0), agent: None }] } else { Vec::new() };
                     let status = if approvals.is_empty() { Status::Running } else { Status::Waiting };
                     let due = svc.watch.lock().heard(Info { id: id.clone(), status, approvals, ..Info::default() });
                     if let Some(d) = due

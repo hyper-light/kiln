@@ -97,6 +97,12 @@ learned is kept in `<state>/headroom/learned.json`. Headroom runs on its own thr
 settings it kept, with the server away. How many agent sessions a machine has at work at once is
 the agent limit's (`docs/agents.md`), not headroom's.
 
+**A person's pause.** A session a person paused (`Command::Pause`, `docs/agents.md`, "What a
+person does with an agent's subagents") has its group held at share 0 on every pass, paced or not:
+it never runs, and only while a guard runs, as any stop here. The engine neither counts it nor
+learns from it. A runner where headroom doesn't run, or whose machine gives it no way to stop a
+session's processes, refuses the pause and says why.
+
 ## Settings
 
 Per runner, in the UI (Runners → Headroom) or the API:
