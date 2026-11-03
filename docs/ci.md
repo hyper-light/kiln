@@ -11129,6 +11129,10 @@ endpoint, for a repository kiln hosts and for one on GitHub:
   action from a repository kiln hosts is never written in GitHub's file, whose ids are GitHub's.
   Its entry is in `.kiln/lock` (W29-R24), which satisfies the check above. `gh actions-lock` stays
   usable. GitHub-exact: nothing in this requirement is kiln's own, and what kiln adds is W29-R24's.
+  So kiln writes as the CLI does: a full commit's entry records the first tag at that commit, else
+  a branch holding it; a local reusable workflow's actions are under its own entry, not its
+  callers'. Where they differ is kiln's: the CLI narrows a partial version it pins for the first
+  time (`v4` to `v4.6.2`) and rewrites the workflow, and kiln never rewrites a `uses:` line.
 - **W29-R24 kiln's lock, for what GitHub's leaves out.** `.kiln/lock`: machine-written, sorted, never
   edited by hand, and best under CODEOWNERS. It covers:
   - cross-repository reusable workflows, with their own dependencies, seeded from the callee's lock
@@ -11139,6 +11143,10 @@ endpoint, for a repository kiln hosts and for one on GitHub:
   - actions and workflows from repositories kiln hosts, for every workflow, in `.github/` and
     `.kiln/` alike;
   - every dependency of a `.kiln/` workflow, which GitHub's lock doesn't read.
+
+  An image that only a run's own data names (a matrix from a job's outputs, an event's payload)
+  can't be locked before it runs. kiln then writes neither file, saying so (`KCI4050`), where
+  `gh actions-lock`, which locks no image, writes its own.
 
   Its format follows GitHub's, so what people know of one serves for the other:
 
@@ -11555,7 +11563,8 @@ Each names the requirements it holds and how it's checked. UI checks run in Chro
   for the same tree: for `gh actions-lock`'s own fixtures and for three of F-02's repositories. Each
   of `KCI4050` to `KCI4053`, and the `KCI4057` warning, comes from the case GitHub's documentation
   gives for it, before any job starts. *Unit tests (`kiln_ci::lock::github`) and an integration
-  test.*
+  test against the pinned CLI's own output for the same trees and facts
+  (`crates/kiln/tests/fixtures/locks-interop`).*
 - **W29-AC21 kiln's lock** (R24). `.kiln/lock` locks a cross-repository reusable workflow (seeded
   from the callee's lock), every kind of image by digest, a Dockerfile's base image, and Node's
   build. An image whose digest changed under its tag is refused. When the two locks disagree, the

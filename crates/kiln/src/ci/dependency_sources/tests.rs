@@ -32,6 +32,8 @@ impl srv::Handler for Host {
             if self.redirected.load(Ordering::SeqCst) { return srv::text(http::StatusCode::MOVED_PERMANENTLY, "moved"); }
             return srv::json(http::StatusCode::OK, &serde_json::json!({ "owner": { "id": 41 }, "id": self.repo_id.load(Ordering::SeqCst) }));
         }
+        // W29-S04's fixture changed-files, a repository of its own.
+        if path == "/repos/acme/changed-files" { return srv::json(http::StatusCode::OK, &serde_json::json!({ "owner": { "id": 41 }, "id": 43 })); }
         if matches!(path, "/SHASUMS256.txt" | "/v20.19.5/SHASUMS256.txt" | "/v20.19.6/SHASUMS256.txt") {
             let a = if path.starts_with("/v20.19.6/") || path == "/SHASUMS256.txt" && self.runtime_moved.load(Ordering::SeqCst) { contract::fixture_new_archive() } else { fixture_archive() };
             return srv::text(http::StatusCode::OK, &format!("{}  {}\n", a.sha256, a.file));
@@ -77,9 +79,19 @@ impl Live {
     pub(crate) fn root(&self) -> &Path { self._dir.path() }
 
     pub(crate) async fn for_locks() -> anyhow::Result<Self> {
-        let mut live = Self::new().await?;
+        Self::for_locks_with(|_| {}).await
+    }
+
+    /// As [`Live::for_locks`], with more of the server's configuration (a notification rule).
+    pub(crate) async fn for_locks_with(more: impl FnOnce(&mut crate::config::Config) + Send + 'static) -> anyhow::Result<Self> {
+        let mut live = Self::with(false, more).await?;
         if let Some(e) = &mut live.sources.endpoints { e.host = "github.com".into(); }
         Ok(live)
+    }
+
+    /// The fixture's hosts for every reader the server makes for itself, as its draft writer does.
+    pub(crate) fn share(&self) {
+        if let Some(e) = &self.sources.endpoints { super::SHARED.lock().push((Arc::downgrade(&self.sources.hub), e.clone())); }
     }
 
     async fn new() -> anyhow::Result<Self> {
@@ -87,6 +99,10 @@ impl Live {
     }
 
     async fn with_token(credential: bool) -> anyhow::Result<Self> {
+        Self::with(credential, |_| {}).await
+    }
+
+    async fn with(credential: bool, more: impl FnOnce(&mut crate::config::Config) + Send + 'static) -> anyhow::Result<Self> {
         let dir = tempfile::tempdir()?;
         let root = dir.path().to_path_buf();
         let pattern = root.join("{repo}.git").to_string_lossy().into_owned();
@@ -97,6 +113,7 @@ impl Live {
             cfg.ci.enabled = true;
             cfg.ci.actions.sources.push(crate::config::ci::ActionSource { owners: vec!["acme".into()], url: Some(pattern), native: false });
             cfg.gitops.github_token_file = credential.then_some(token_file);
+            more(cfg);
         }).await?;
         let work = root.join("work");
         let work_copy = work.clone();

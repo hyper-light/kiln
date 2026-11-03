@@ -21,6 +21,8 @@ pub const SIM_FILES: usize = 4096;
 pub const SIM_REFS: usize = 1024;
 pub const SIM_BYTES: usize = 64 << 20;
 pub const SIM_METADATA: usize = 256;
+/// The tags at one commit `tags_at` gives, the first in byte order (W29-R23).
+pub const TAGS_MAX: usize = 1024;
 
 /// An action source, using the same source mapping as `uses:`. Native sources are separate
 /// from GitHub repositories of the same name. No URL or credential is accepted here.
@@ -119,6 +121,12 @@ pub trait DependencySources: Send + Sync {
     /// evidence for a review, never permission to accept either commit or run its code.
     fn compare(&self, _before: Revision, _after: Revision) -> BoxFuture<'_, Result<Difference, Refusal>> {
         Box::pin(async { Err(Refusal::Unsupported("code difference")) })
+    }
+    /// W29-R23: the qualified tags of the revision's source that point at `commit`, in byte order,
+    /// from the view that answered the revision: what a full-commit pin came from, which GitHub's
+    /// lock records as the first of them. A source that can't list them says Unsupported.
+    fn tags_at(&self, _revision: Revision, _commit: String) -> BoxFuture<'_, Result<Vec<String>, Refusal>> {
+        Box::pin(async { Err(Refusal::Unsupported("tags at a commit")) })
     }
 }
 
@@ -479,6 +487,19 @@ impl DependencySources for SimDependencySources {
 
     fn contains(&self, revision: Revision, commit: String) -> BoxFuture<'_, Result<bool, Refusal>> {
         Box::pin(async move { contains(checked(&self.0.lock(), &revision)?, &revision.commit, &commit) })
+    }
+
+    fn tags_at(&self, revision: Revision, commit: String) -> BoxFuture<'_, Result<Vec<String>, Refusal>> {
+        Box::pin(async move {
+            if !commit_valid(&commit) { return Err(Refusal::Invalid("commit")); }
+            let state = self.0.lock();
+            let source = checked(&state, &revision)?;
+            let commit = commit.to_ascii_lowercase();
+            if !source.commits.contains_key(&commit) { return Err(Refusal::Missing("commit")); }
+            let r = state.repos.get(&revision.repository.canonical()).ok_or(Refusal::Missing("repository"))?;
+            let refs = if r.online { &r.source.refs } else { &r.cached.as_ref().ok_or(Refusal::Unavailable("mirror"))?.1 };
+            Ok(refs.iter().filter(|(name, at)| name.starts_with("refs/tags/") && **at == commit).map(|(name, _)| name.clone()).take(TAGS_MAX).collect())
+        })
     }
 
     fn file(&self, revision: Revision, commit: String, path: String) -> BoxFuture<'_, Result<Vec<u8>, Refusal>> {

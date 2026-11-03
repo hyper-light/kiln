@@ -257,6 +257,7 @@ fn seams() -> Vec<Seam> {
                 format!("{} repositories", count(dependencies::SIM_REPOSITORIES as u64)), format!("{} commits", count(dependencies::SIM_COMMITS as u64)),
                 format!("{} files", count(dependencies::SIM_FILES as u64)), format!("{} refs", count(dependencies::SIM_REFS as u64)),
                 format!("{} of repository file bytes", size(dependencies::SIM_BYTES as u64)), format!("{} manifests and runtime archives", count(dependencies::SIM_METADATA as u64)),
+                format!("{} tags at a commit", count(dependencies::TAGS_MAX as u64)),
             ],
         },
     ]

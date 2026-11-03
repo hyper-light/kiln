@@ -15,8 +15,10 @@ pub use images::{ImageContext, images};
 
 /// The adapter expands local actions/builtins and supplies their external dependencies.
 /// None removes a workflow. Unmentioned workflows and their accepted pins are retained.
+/// `local` names the roots it reaches only through a local reusable workflow: GitHub's lock
+/// keeps those under that workflow's own entry, as `gh actions-lock` writes it (W29-AC20).
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Workflow { pub path: String, pub uses: Option<Vec<String>> }
+pub struct Workflow { pub path: String, pub uses: Option<Vec<String>>, pub local: Vec<String> }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Resolution { pub key: String, pub dependency: Dependency }
@@ -302,7 +304,7 @@ pub fn regenerate(input: Input<'_>) -> Result<Files, Vec<Diag>> {
         pin.validate(&key, input.home_host).map_err(|m| vec![diag("KCI4051", &key, m)])?;
         add(&mut facts, key, Entry { pin, source: format!("supplied facts: {}", resolution.key) }, input.home_host).map_err(|d| vec![*d])?;
     }
-    let mut edits = BTreeMap::new();
+    let (mut edits, mut locals) = (BTreeMap::new(), BTreeMap::new());
     for edit in input.workflows {
         if !workflow_path(&edit.path) { return Err(vec![diag("KCI1022", &edit.path, "workflow needs a safe repository-relative path")]); }
         let roots = edit.uses.as_ref().map(|uses| {
@@ -312,6 +314,9 @@ pub fn regenerate(input: Input<'_>) -> Result<Files, Vec<Diag>> {
         }).transpose().map_err(|d| vec![(*d).at(&edit.path)])?;
         if edits.get(&edit.path).is_some_and(|old| old != &roots) { return Err(vec![diag("KCI4054", &edit.path, "two different workflow edits were supplied")]); }
         edits.insert(edit.path.clone(), roots);
+        let mut local = BTreeSet::new();
+        for key in &edit.local { if let Some(key) = normalized(key).map_err(|d| vec![(*d).at(&edit.path)])? { local.insert(key); } }
+        locals.insert(edit.path.clone(), local);
     }
     for path in edits.keys() { gh.workflows.remove(path); kl.workflows.remove(path); }
     if input.mode == Mode::Rebuild && let Some(path) = gh.workflows.keys().chain(kl.workflows.keys()).next() { return Err(vec![diag("KCI4050", path, "rebuilding needs every retained workflow to be inspected")]); }
@@ -347,7 +352,8 @@ pub fn regenerate(input: Input<'_>) -> Result<Files, Vec<Diag>> {
         if let Some(key) = graph.cycle() { return Err(vec![diag("KCI1022", &path, format!("dependency graph has a cycle at {key}"))]); }
         if edited.is_some() {
             if is_github {
-                gh.workflows.insert(path.clone(), roots.iter().filter_map(|key| graph.github_action(key)).collect::<BTreeSet<_>>().into_iter().collect());
+                let local = locals.get(&path);
+                gh.workflows.insert(path.clone(), roots.iter().filter(|key| local.is_none_or(|l| !l.contains(*key))).filter_map(|key| graph.github_action(key)).collect::<BTreeSet<_>>().into_iter().collect());
                 let supplemental: Vec<_> = roots.into_iter().filter(|key| graph.needs_supplement(key)).collect();
                 if !supplemental.is_empty() || input.kiln.is_some_and(|f| f.workflows.contains_key(&path)) { kl.workflows.insert(path.clone(), supplemental); }
             } else { kl.workflows.insert(path.clone(), roots); }
@@ -376,7 +382,10 @@ pub fn regenerate(input: Input<'_>) -> Result<Files, Vec<Diag>> {
                 let Dependency::Git(g) = entry else { continue };
                 let Some(Identity::Github { hostname, owner_id, repo_id }) = g.identity(input.home_host) else { continue };
                 let reference = key.split_once('@').map(|(_, r)| r).unwrap_or_default();
-                let git_ref = if matches!(reference.len(), 40 | 64) && reference.bytes().all(|b| b.is_ascii_hexdigit()) { g.git_ref.clone() } else { reference.into() };
+                // A full commit's entry names the tag or branch it came from, short, as the CLI writes it.
+                let git_ref = if matches!(reference.len(), 40 | 64) && reference.bytes().all(|b| b.is_ascii_hexdigit()) {
+                    ["refs/tags/", "refs/heads/"].iter().find_map(|p| g.git_ref.strip_prefix(p)).unwrap_or(&g.git_ref).to_owned()
+                } else { reference.into() };
                 let uses: Vec<_> = g.uses.iter().filter_map(|k| graph.github_action(k)).filter(|k| k != &key).collect::<BTreeSet<_>>().into_iter().collect();
                 todo.extend(uses.iter().cloned());
                 let action = github::Action { hostname: Some(hostname), git_ref, commit: g.commit.clone(), owner_id, repo_id, uses };

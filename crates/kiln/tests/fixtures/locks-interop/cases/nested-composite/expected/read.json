@@ -1,0 +1,57 @@
+{
+  "closure": {
+    ".github/workflows/ci.yml": [
+      "actions/checkout@v5",
+      "octo/inner@v2",
+      "octo/monorepo@v1",
+      "octo/outer@v1"
+    ]
+  },
+  "dependencies": {
+    "actions/checkout@v5": {
+      "commit": "sha1-21e9a541a53979f5f3d2f0e7476040d9d7b2d11c",
+      "hostname": "",
+      "owner_id": 101,
+      "ref": "v5",
+      "repo_id": 2004,
+      "uses": []
+    },
+    "octo/inner@v2": {
+      "commit": "sha1-c322ecfe26a448b3cbedde48311575a8b4669b35",
+      "hostname": "",
+      "owner_id": 106,
+      "ref": "v2",
+      "repo_id": 2102,
+      "uses": [
+        "actions/checkout@v5",
+        "octo/monorepo@v1"
+      ]
+    },
+    "octo/monorepo@v1": {
+      "commit": "sha1-f9546ec87717090ae90d9338335fc37dd7ff66f7",
+      "hostname": "",
+      "owner_id": 106,
+      "ref": "v1",
+      "repo_id": 2103,
+      "uses": []
+    },
+    "octo/outer@v1": {
+      "commit": "sha1-c71ab6f9799498ac97ba6448beab06d5091c1c41",
+      "hostname": "",
+      "owner_id": 106,
+      "ref": "v1",
+      "repo_id": 2101,
+      "uses": [
+        "actions/checkout@v5",
+        "octo/inner@v2"
+      ]
+    }
+  },
+  "version": "v0.0.3",
+  "workflows": {
+    ".github/workflows/ci.yml": [
+      "octo/monorepo@v1",
+      "octo/outer@v1"
+    ]
+  }
+}

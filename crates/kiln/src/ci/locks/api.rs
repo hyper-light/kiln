@@ -105,6 +105,7 @@ impl DependencySources for Facts {
         })
     }
     fn contains(&self, revision: Revision, commit: String) -> BoxFuture<'_, Result<bool, Refusal>> { self.inner.contains(revision, commit) }
+    fn tags_at(&self, revision: Revision, commit: String) -> BoxFuture<'_, Result<Vec<String>, Refusal>> { self.inner.tags_at(revision, commit) }
     fn file(&self, revision: Revision, commit: String, path: String) -> BoxFuture<'_, Result<Vec<u8>, Refusal>> {
         Box::pin(async move {
             let bytes = self.inner.file(revision.clone(), commit.clone(), path.clone()).await?;

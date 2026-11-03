@@ -256,6 +256,21 @@ fn c12<F: DependencySourcesFixture>(f: &F) -> BoxFuture<'_, Result<(), Failure>>
 }
 
 /// The DependencySources contract, clause by clause, also run on kiln's real adapter.
+fn c13<F: DependencySourcesFixture>(f: &F) -> BoxFuture<'_, Result<(), Failure>> {
+    Box::pin(async move {
+        let s = f.sources()?;
+        let c = f.commits()?;
+        let head = fine("resolve HEAD", s.resolve(f.repository(), "HEAD".into()).await)?;
+        same("the tagged commit's tags", fine("tags at old", s.tags_at(head.clone(), c.old.clone()).await)?, vec!["refs/tags/v1".to_owned()])?;
+        same("an untagged commit has none", fine("tags at new", s.tags_at(head.clone(), c.new.clone()).await)?, Vec::<String>::new())?;
+        let unknown = s.tags_at(head, "d".repeat(40)).await;
+        ensure(matches!(unknown, Err(Refusal::Missing(_))), || format!("an unknown commit is refused Missing, not {unknown:?}"))?;
+        f.change(FixtureChange::MoveTag).await?;
+        let moved = fine("resolve HEAD after the move", s.resolve(f.repository(), "HEAD".into()).await)?;
+        same("a moved tag is at its new commit", fine("tags at new after the move", s.tags_at(moved, c.new).await)?, vec!["refs/tags/v1".to_owned()])
+    })
+}
+
 pub fn cases<F: DependencySourcesFixture>() -> Vec<Case<F>> {
     vec![
         Case { id: "DEPENDENCIES-1", says: "a ref resolves to its source identity and peeled commit, retaining the request and qualified ref; HEAD names its default branch", check: c1::<F> },
@@ -270,6 +285,7 @@ pub fn cases<F: DependencySourcesFixture>() -> Vec<Case<F>> {
         Case { id: "DEPENDENCIES-10", says: "a manifest is bound to its bytes and requested digest, and runtime metadata names an immutable archive and SHA-256; credentials and unsupported runtimes are refused", check: c10::<F> },
         Case { id: "DEPENDENCIES-11", says: "repository URLs and git revision expressions are refused Invalid, and a missing ref is refused Missing", check: c11::<F> },
         Case { id: "DEPENDENCIES-12", says: "code comparisons retain both captured identities and commits, include complete changed file bytes and modes within their bounds, and obey source access without accepting a pin", check: c12::<F> },
+        Case { id: "DEPENDENCIES-13", says: "the tags at a commit are its source's qualified tags pointing at it, in byte order; an untagged commit has none, a moved tag is found at its new commit, and an unknown commit is refused Missing", check: c13::<F> },
     ]
 }
 

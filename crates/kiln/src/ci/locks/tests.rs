@@ -21,6 +21,7 @@ struct Counted<S> {
 impl<S: DependencySources> DependencySources for Counted<S> {
     fn resolve(&self, repository: Repository, reference: String) -> BoxFuture<'_, Result<Revision, Refusal>> { self.inner.resolve(repository, reference) }
     fn contains(&self, revision: Revision, commit: String) -> BoxFuture<'_, Result<bool, Refusal>> { self.inner.contains(revision, commit) }
+    fn tags_at(&self, revision: Revision, commit: String) -> BoxFuture<'_, Result<Vec<String>, Refusal>> { self.inner.tags_at(revision, commit) }
     fn file(&self, revision: Revision, commit: String, path: String) -> BoxFuture<'_, Result<Vec<u8>, Refusal>> {
         self.reads.lock().push((commit.clone(), path.clone()));
         self.inner.file(revision, commit, path)
@@ -237,3 +238,5 @@ mod policy;
 mod generation;
 mod replay;
 mod proposals;
+mod s04;
+mod interop;

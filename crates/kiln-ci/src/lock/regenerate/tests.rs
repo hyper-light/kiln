@@ -7,7 +7,7 @@ const HASH: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
 const GH: &str = ".github/workflows/ci.yml";
 const KL: &str = ".kiln/ci.yaml";
 
-fn edit(path: &str, uses: &[&str]) -> Workflow { Workflow { path: path.into(), uses: Some(uses.iter().map(|s| (*s).into()).collect()) } }
+fn edit(path: &str, uses: &[&str]) -> Workflow { Workflow { path: path.into(), uses: Some(uses.iter().map(|s| (*s).into()).collect()), local: Vec::new() } }
 
 fn git(key: &str, commit: &str, uses: &[&str]) -> Resolution {
     let reference = key.rsplit_once('@').map(|(_, r)| r).unwrap_or("v1");
@@ -42,6 +42,24 @@ fn w29_r25_github_only_generation_matches_the_cli_and_omits_an_unneeded_kiln_fil
     let expected = format!("{header}version: 'v0.0.3'\nworkflows:\n    '{GH}':\n        - 'acme/build@v1'\ndependencies:\n    'acme/build@v1':\n        ref: 'v1'\n        commit: 'sha1-{A}'\n        owner_id: 1\n        repo_id: 2\n        uses:\n            - 'acme/leaf@v2'\n    'acme/leaf@v2':\n        ref: 'v2'\n        commit: 'sha1-{B}'\n        owner_id: 1\n        repo_id: 2\n");
     assert_eq!(files.github, Some(expected));
     assert_eq!(files.kiln, None);
+    Ok(())
+}
+
+#[test]
+fn w29_ac20_what_only_a_local_reusable_workflow_uses_stays_under_its_own_entry() -> Result<(), String> {
+    const CALLEE: &str = ".github/workflows/guard.yml";
+    let facts = [git("acme/build@v1", A, &[]), git("acme/guard@v2", B, &[])];
+    let mut caller = edit(GH, &["acme/build@v1", "acme/guard@v2"]);
+    caller.local = vec!["acme/guard@v2".into()];
+    let files = generate(None, None, &[caller, edit(CALLEE, &["acme/guard@v2"])], &facts, &[], Mode::Preserve).map_err(|d| format!("{d:?}"))?;
+    let (gh, _) = parsed(&files)?;
+    assert_eq!(gh.workflows.get(GH), Some(&vec!["acme/build@v1".into()]), "as gh actions-lock writes the caller");
+    assert_eq!(gh.workflows.get(CALLEE), Some(&vec!["acme/guard@v2".into()]));
+    // A caller whose every action comes from its local workflows is onboarded with none of its own.
+    let mut caller = edit(GH, &["acme/build@v1", "acme/guard@v2"]);
+    caller.local = vec!["acme/build@v1".into(), "acme/guard@v2".into()];
+    let files = generate(None, None, &[caller, edit(CALLEE, &["acme/guard@v2"])], &facts, &[], Mode::Preserve).map_err(|d| format!("{d:?}"))?;
+    assert_eq!(parsed(&files)?.0.workflows.get(GH), Some(&Vec::new()));
     Ok(())
 }
 
@@ -99,11 +117,11 @@ fn w29_r25_untouched_workflows_and_shared_pins_survive_pruning_and_proposals() -
     let (proposed_gh, untouched_kl) = parsed(&output)?;
     assert_eq!(untouched_kl, kl);
     assert_eq!(proposed_gh.dependencies.get("acme/build@v1").map(|a| a.commit.as_str()), Some(format!("sha1-{B}").as_str()));
-    let output = generate(Some(&gh), Some(&kl), &[Workflow { path: GH.into(), uses: None }], &[], &[], Mode::Preserve).map_err(|d| format!("{d:?}"))?;
+    let output = generate(Some(&gh), Some(&kl), &[Workflow { path: GH.into(), uses: None, local: Vec::new() }], &[], &[], Mode::Preserve).map_err(|d| format!("{d:?}"))?;
     let (new_gh, new_kl) = parsed(&output)?;
     assert!(new_gh.workflows.is_empty());
     assert_eq!(new_kl, kl);
-    let output = generate(Some(&gh), Some(&kl), &[Workflow { path: GH.into(), uses: None }, Workflow { path: KL.into(), uses: None }], &[], &[], Mode::Preserve).map_err(|d| format!("{d:?}"))?;
+    let output = generate(Some(&gh), Some(&kl), &[Workflow { path: GH.into(), uses: None, local: Vec::new() }, Workflow { path: KL.into(), uses: None, local: Vec::new() }], &[], &[], Mode::Preserve).map_err(|d| format!("{d:?}"))?;
     assert_eq!(output, Files { github: None, kiln: None });
     Ok(())
 }

@@ -43,16 +43,30 @@ pub struct Sources<H = Arc<Hub>> {
 #[derive(Clone)]
 struct TestEndpoints { host: String, api: String, registry: String, node: String }
 
+/// A test's fake hosts, shared with the readers its server makes for itself (a draft's, the
+/// dispatcher's): only for the hub they were shared for, while it lives.
+#[cfg(test)]
+static SHARED: Mutex<Vec<(std::sync::Weak<Hub>, TestEndpoints)>> = Mutex::new(Vec::new());
+
+#[cfg(test)]
+fn shared(hub: &Hub) -> Option<TestEndpoints> {
+    let mut all = SHARED.lock();
+    all.retain(|(h, _)| h.strong_count() > 0);
+    all.iter().find(|(h, _)| std::ptr::eq(h.as_ptr(), hub)).map(|(_, e)| e.clone())
+}
+
 impl Sources {
     pub fn new(hub: Arc<Hub>, caller: String) -> Self {
-        Self { hub, caller, identities: Mutex::default(), #[cfg(test)] endpoints: None }
+        #[cfg(test)]
+        let endpoints = shared(&hub);
+        Self { hub, caller, identities: Mutex::default(), #[cfg(test)] endpoints }
     }
 }
 
 impl<'a> Sources<&'a Hub> {
     /// W29-R25: a replay's reader borrows its server and keeps no task past that read.
     pub(super) fn borrowed(hub: &'a Hub, caller: String) -> Self {
-        Self { hub, caller, identities: Mutex::default(), #[cfg(test)] endpoints: None }
+        Self { hub, caller, identities: Mutex::default(), #[cfg(test)] endpoints: shared(hub) }
     }
 }
 
@@ -253,6 +267,21 @@ impl<H: Deref<Target = Hub> + Send + Sync> DependencySources for Sources<H> {
             let remote = self.checked(&revision).await?;
             let _guard = actions::source_lock(&remote).map_err(|_| Refusal::Unavailable("mirror lock"))?.read().await;
             self.contains_at(&remote, &revision, &commit).await
+        })
+    }
+
+    fn tags_at(&self, revision: Revision, commit: String) -> BoxFuture<'_, Result<Vec<String>, Refusal>> {
+        Box::pin(async move {
+            if !dep::commit_valid(&commit) { return Err(Refusal::Invalid("commit")); }
+            let remote = self.checked(&revision).await?;
+            let _guard = actions::source_lock(&remote).map_err(|_| Refusal::Unavailable("mirror lock"))?.read().await;
+            self.bytes(&remote, &["cat-file", "-e", &format!("{commit}^{{commit}}")], "commit").await?;
+            // An annotated tag points at the commit it tags, as `git tag --points-at` reads it.
+            let refs = self.bytes(&remote, &["for-each-ref", "--points-at", &commit, "--format=%(refname)", "refs/tags"], "tags").await?;
+            let mut tags: Vec<String> = String::from_utf8_lossy(&refs).lines().filter(|r| r.starts_with("refs/tags/") && dep::reference_valid(r)).map(str::to_owned).collect();
+            tags.sort();
+            tags.truncate(dep::TAGS_MAX);
+            Ok(tags)
         })
     }
 

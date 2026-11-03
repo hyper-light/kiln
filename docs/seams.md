@@ -642,6 +642,8 @@ archive metadata (W29-R24). Code comparisons return complete changed file conten
 between captured commits of the same repository identity, including binary files, symlinks
 and gitlinks. Diff drivers and text conversion cannot alter these facts. A comparison supplies
 evidence for a review; it never grants approval or makes either commit executable (W29-R25).
+The tags at a commit come from the same view as the revision they're asked of, in byte order:
+a full-commit pin records the first of them as `gh actions-lock` does (W29-R23).
 
 - **Implementations:** `kiln_seams::dependencies::SimDependencySources`, deterministic and in
   memory; kiln's git, host, OCI and runtime adapter (`ci::dependency_sources`).
@@ -656,12 +658,13 @@ evidence for a review; it never grants approval or makes either commit executabl
   16 parents per commit, 64 MiB of repository file bytes across repositories; 256 manifests and
   runtime archives each, with at most 64 MiB of manifest bytes. Insertion past a table or byte
   bound is refused atomically as `Full`. A read past its byte bound is refused `TooLarge`.
+  `tags_at` gives the first 1024 tags at a commit, in byte order.
   Runtime metadata is read with the existing downloader's bounds (at most 16 MiB); archive
   bytes are downloaded and checked later by the runner. No archive bytes cross this seam.
   The real adapter keeps an identity record beside its mirror, at most 8 KiB, bound to the
   actual source's host and repository. Changing a source mapping cannot borrow that identity.
 
-Methods: `resolve`, `contains`, `file`, `manifest`, `runtime`, `compare`.
+Methods: `resolve`, `contains`, `file`, `manifest`, `runtime`, `compare`, `tags_at`.
 
 - **DEPENDENCIES-1** a ref resolves to its source identity and peeled commit, retaining the request and qualified ref; HEAD names its default branch
 - **DEPENDENCIES-2** moving a tag changes a new resolution, while a captured revision keeps its commit, history and file bytes
@@ -675,3 +678,4 @@ Methods: `resolve`, `contains`, `file`, `manifest`, `runtime`, `compare`.
 - **DEPENDENCIES-10** a manifest is bound to its bytes and requested digest, and runtime metadata names an immutable archive and SHA-256; credentials and unsupported runtimes are refused
 - **DEPENDENCIES-11** repository URLs and git revision expressions are refused Invalid, and a missing ref is refused Missing
 - **DEPENDENCIES-12** code comparisons retain both captured identities and commits, include complete changed file bytes and modes within their bounds, and obey source access without accepting a pin
+- **DEPENDENCIES-13** the tags at a commit are its source's qualified tags pointing at it, in byte order; an untagged commit has none, a moved tag is found at its new commit, and an unknown commit is refused Missing

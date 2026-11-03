@@ -39,6 +39,8 @@ struct Collector<'a> {
     mode: regenerate::Mode,
     overrides: BTreeMap<String, kiln::Dependency>,
     moves: BTreeMap<String, (Revision, Revision)>,
+    /// What the root workflow reaches only through a local reusable workflow (W29-AC20).
+    local: BTreeSet<String>,
 }
 
 fn diagnostics(path: &str, ds: Vec<wf::diag::Diag>) -> String { ds.iter().map(|d| d.render(path)).collect::<Vec<_>>().join("\n") }
@@ -132,7 +134,21 @@ impl Collector<'_> {
         };
         let reference = accepted.as_ref().map_or(remote.git_ref.as_str(), |g| g.git_ref.as_str()).to_owned();
         let immutable = kiln_seams::dependencies::commit_valid(&reference);
-        let revision = self.resolve(&remote, if immutable { "HEAD" } else { &reference }).await?;
+        let mut revision = self.resolve(&remote, if immutable { "HEAD" } else { &reference }).await?;
+        // W29-R23: a full commit locked for the first time records the first tag at it, else the
+        // branch holding it, as gh actions-lock does. A source that can't list tags keeps the branch.
+        if immutable && accepted.is_none() {
+            let commit = reference.to_ascii_lowercase();
+            let tags = match self.source.tags_at(revision.clone(), commit.clone()).await {
+                Ok(tags) => tags,
+                Err(Refusal::Unsupported(_)) => Vec::new(),
+                Err(e) => return Err(format!("KCI4051 {uses}: {e}")),
+            };
+            if let Some(tag) = tags.first() {
+                let tagged = self.resolve(&remote, tag).await?;
+                if tagged.commit == commit { revision = tagged; }
+            }
+        }
         let seen = history::Seen::read_for(self.hub, self.source, &remote, &revision, self.caller, &self.root.owner.commit).await?;
         if accepted.is_none() { accepted = seen.accepted_pin()?; }
         let identity = match &revision.identity {
@@ -340,7 +356,7 @@ impl Collector<'_> {
         let model = self.model(tree, path).await?;
         if depth == 0 { self.root_name = model.name.clone().unwrap_or_default(); }
         let context = self.context(tree, path, inherited).await?;
-        let mut roots = BTreeSet::new();
+        let (mut roots, mut called) = (BTreeSet::new(), BTreeSet::new());
         let defaults = model.jobs.iter().map(|j| (j.id.clone(), crate::pipeline::toolchain_image(j.kiln.toolchain.as_deref()).to_owned())).collect();
         let settings = kiln_ci::plan::Settings { default_runs_on: vec!["k8s".into()], ..Default::default() };
         let route = regenerate::ImageContext { repo: &self.caller.name, workflow: &self.root_name, job_prefix: prefix };
@@ -352,7 +368,7 @@ impl Collector<'_> {
             if let Some(uses) = &job.uses {
                 let prefix = format!("{prefix}{}/", job.id);
                 if let Some(path) = uses.strip_prefix("./").or_else(|| uses.strip_prefix("$/")) {
-                    roots.extend(Box::pin(self.workflow(tree, path, &context.layers, &prefix, depth.saturating_add(1))).await?);
+                    called.extend(Box::pin(self.workflow(tree, path, &context.layers, &prefix, depth.saturating_add(1))).await?);
                 } else {
                     let (mut pin, callee, remote) = self.git(uses, &context).await?;
                     pin.uses = Box::pin(self.workflow(&callee, &remote.path, &context.layers, &prefix, depth.saturating_add(1))).await?;
@@ -362,6 +378,8 @@ impl Collector<'_> {
             }
         }
         self.active.remove(&marker);
+        if depth == 0 { self.local = called.difference(&roots).cloned().collect(); }
+        roots.extend(called);
         Ok(roots.into_iter().collect())
     }
 }
@@ -432,7 +450,7 @@ async fn gather(hub: &Hub, source: &dyn DependencySources, caller: &Repo, commit
     let rules = super::super::routing::sources(hub).await.effective();
     let pools = super::super::pools::sources(hub).await.0;
     let source_mode = if mode == regenerate::Mode::Rebuild { regenerate::Mode::Preserve } else { mode };
-    let mut collector = Collector { hub, caller, source, root: root.clone(), root_workflow: String::new(), root_name: String::new(), github: None, native: None, revisions, resolutions: BTreeMap::new(), texts: BTreeMap::new(), rules, pools, image_locks: kiln_ci::lock::execution::Locks::default(), manifests: BTreeMap::new(), active: BTreeSet::new(), bytes: 0, items: 0, mode: source_mode, overrides, moves: BTreeMap::new() };
+    let mut collector = Collector { hub, caller, source, root: root.clone(), root_workflow: String::new(), root_name: String::new(), github: None, native: None, revisions, resolutions: BTreeMap::new(), texts: BTreeMap::new(), rules, pools, image_locks: kiln_ci::lock::execution::Locks::default(), manifests: BTreeMap::new(), active: BTreeSet::new(), bytes: 0, items: 0, mode: source_mode, overrides, moves: BTreeMap::new(), local: BTreeSet::new() };
     let home = root.owner.home_host(hub, caller);
     let github = collector.file(&root, github::PATH).await?.map(|s| github::parse(&s).map_err(|ds| diagnostics(github::PATH, ds))).transpose()?;
     let native = collector.file(&root, kiln::PATH).await?.map(|s| kiln::parse(&s).map_err(|ds| diagnostics(kiln::PATH, ds))).transpose()?;
@@ -451,15 +469,16 @@ async fn gather(hub: &Hub, source: &dyn DependencySources, caller: &Repo, commit
     let present: BTreeSet<_> = paths.iter().cloned().collect();
     let mut workflows = Vec::new();
     for path in paths {
-        if collector.file(&root, &path).await?.is_none() { workflows.push(regenerate::Workflow { path, uses: None }); continue; }
+        if collector.file(&root, &path).await?.is_none() { workflows.push(regenerate::Workflow { path, uses: None, local: Vec::new() }); continue; }
         collector.root_workflow = path.clone();
         collector.image_locks = kiln_ci::lock::execution::Locks::default();
         let uses = collector.workflow(&root, &path, &[], "", 0).await?;
-        workflows.push(regenerate::Workflow { path, uses: Some(uses) });
+        let local = std::mem::take(&mut collector.local).into_iter().collect();
+        workflows.push(regenerate::Workflow { path, uses: Some(uses), local });
     }
     if all {
         for path in github.iter().flat_map(|f| f.workflows.keys()).chain(native.iter().flat_map(|f| f.workflows.keys())).collect::<BTreeSet<_>>() {
-            if !present.contains(path) { workflows.push(regenerate::Workflow { path: path.clone(), uses: None }); }
+            if !present.contains(path) { workflows.push(regenerate::Workflow { path: path.clone(), uses: None, local: Vec::new() }); }
         }
     }
     Ok(Gathered { github, native, home, workflows, resolutions: collector.resolutions, revisions: collector.revisions, moves: collector.moves })

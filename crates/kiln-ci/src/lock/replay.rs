@@ -107,7 +107,7 @@ mod tests {
         let onto = file(first, "acme/first@v2", 'a');
         let change = file(second, "acme/second@v3", 'b');
         let seed = accepted(Input { base: Pair::default(), onto: pair(&onto), change: pair(&change), reviewed: Pair::default(), home_host: "github.com" })?;
-        let workflows = [regenerate::Workflow { path: first.into(), uses: Some(vec!["acme/first@v2".into()]) }, regenerate::Workflow { path: second.into(), uses: Some(vec!["acme/second@v3".into()]) }];
+        let workflows = [regenerate::Workflow { path: first.into(), uses: Some(vec!["acme/first@v2".into()]), local: Vec::new() }, regenerate::Workflow { path: second.into(), uses: Some(vec!["acme/second@v3".into()]), local: Vec::new() }];
         let result = regenerate::regenerate(regenerate::Input { github: seed.github.as_ref(), kiln: seed.kiln.as_ref(), workflows: &workflows, resolutions: &[], seeds: &[], home_host: "github.com", mode: regenerate::Mode::Preserve })?;
         let parsed = github::parse(result.github.as_deref().unwrap_or_default())?;
         assert_eq!(parsed.workflows.len(), 2);
