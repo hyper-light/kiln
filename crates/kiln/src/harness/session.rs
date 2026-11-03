@@ -4158,11 +4158,13 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn cp_t3_2_a_restart_recovers_a_codex_startup_refusal_while_its_process_lives() -> anyhow::Result<()> {
+        use serde_json::Value;
         use std::os::unix::fs::PermissionsExt as _;
         crate::rt::block_on(async {
             for failure in ["initialize", "thread/start"] {
                 let dir = tempfile::tempdir()?;
                 let program = dir.path().join("codex.py");
+                let requests = dir.path().join("requests.jsonl");
                 std::fs::write(&program, r##"#!/usr/bin/env python3
 import json, os, pathlib, sys
 mark = pathlib.Path(os.environ["RESTART_MARK"])
@@ -4170,6 +4172,8 @@ first = not mark.exists()
 mark.write_text("started")
 for line in sys.stdin:
     request = json.loads(line)
+    with pathlib.Path(os.environ["RESTART_REQUESTS"]).open("a") as log:
+        log.write(json.dumps(request) + "\n")
     if "id" not in request:
         continue
     method = request.get("method")
@@ -4193,7 +4197,7 @@ for line in sys.stdin:
                 let s = start(crate::util::new_id(), Spec {
                     kind: "codex".into(), cwd: Some(dir.path().to_string_lossy().into_owned()), program: Some(program.to_string_lossy().into_owned()),
                     prompt: Some("original task".into()), reach: Some("off".into()),
-                    env: vec![("RESTART_MARK".into(), dir.path().join("started").to_string_lossy().into_owned()), ("RESTART_FAILURE".into(), failure.into())],
+                    env: vec![("RESTART_MARK".into(), dir.path().join("started").to_string_lossy().into_owned()), ("RESTART_FAILURE".into(), failure.into()), ("RESTART_REQUESTS".into(), requests.to_string_lossy().into_owned())],
                     ..Spec::default()
                 }, sink, Arc::new(|| {}), files)?;
                 let result = async {
@@ -4214,15 +4218,26 @@ for line in sys.stdin:
                     }
                     loop {
                         if let (_, Update::State { state }) = updates.recv().await? && state.delivery.get(&original) == Some(&super::super::model::Delivery::Started) {
-                            anyhow::ensure!(state.queue.is_empty() && state.given.iter().filter(|m| m.id == original).count() == 1, "original prompt was lost or delivered twice");
+                            anyhow::ensure!(state.queue.is_empty(), "{failure}: original prompt stayed queued after delivery started");
                             break;
                         }
                     }
-                    anyhow::Ok(())
+                    anyhow::Ok(original)
                 }.await;
                 s.close();
                 while !matches!(updates.recv().await?, (_, Update::Closed)) {}
-                result?;
+                let original = result?;
+                // `State::given` names only kiln's own messages (a goal's word, a parent's news), so
+                // this prompt's delivery once is read where it went: the app-server's requests,
+                // across both its processes.
+                let calls: Vec<Value> = std::fs::read_to_string(&requests)?.lines().map(serde_json::from_str).collect::<Result<_, _>>()?;
+                let turns: Vec<&Value> = calls.iter().filter(|v| v.get("method").and_then(Value::as_str) == Some("turn/start")).collect();
+                anyhow::ensure!(turns.len() == 1, "{failure}: expected one turn/start across recovery, got {}", turns.len());
+                let turn = turns.first().ok_or_else(|| anyhow::anyhow!("{failure}: original prompt never reached the app-server"))?;
+                anyhow::ensure!(turn.pointer("/params/clientUserMessageId").and_then(Value::as_str) == Some(original.as_str()), "{failure}: the recovered turn lost the original prompt id");
+                let originals = turn.pointer("/params/input").and_then(Value::as_array).into_iter().flatten()
+                    .filter(|item| item.get("type").and_then(Value::as_str) == Some("text") && item.get("text").and_then(Value::as_str) == Some("original task")).count();
+                anyhow::ensure!(originals == 1, "{failure}: the original task reached the app-server {originals} times");
             }
             anyhow::Ok(())
         })
