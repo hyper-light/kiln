@@ -387,9 +387,11 @@ one copy of hyper-raft kept, and no step back from kiln's aws-lc-rs):
 - **aws-lc-rs:** 1.18.2, kiln's release, at `vendor/aws-lc-rs`, with Mantle's changes, which apply
   unchanged on 1.18.2. kiln's root and Mantle's `[patch.crates-io]` both point at it.
 - **aws-lc-sys** stays crates.io's 0.46.0. Of Mantle's four changes to its 0.45.0, 0.46.0 holds the
-  RNDR and RDRAND retries. Mantle's jitter-entropy and system-library defaults, and its fallback to
-  the operating system's random bytes, aren't carried (`vendor/aws-lc-rs/UPSTREAM.md`). **[Ada]**:
-  whether kiln vendors aws-lc-sys to carry them.
+  RNDR and RDRAND retries. Mantle's jitter-entropy and system-library defaults are set as Mantle's
+  are, by `AWS_LC_SYS_NO_JITTER_ENTROPY=1` and `AWS_LC_SYS_USE_SYSTEM=0` in kiln's
+  `.cargo/config.toml` (Ada's word, 2026-11-03). Its fallback to the operating system's random
+  bytes, a change to AWS-LC's C, waits until `scripts/vendor.py` takes a crates.io package
+  (`vendor/aws-lc-rs/UPSTREAM.md`).
 - **Toolchain:** kiln builds Mantle's crates on its own (stable 1.99.1). Mantle's gate (`clippy
   --workspace --all-targets --all-features -- -D warnings`) passes in kiln's copy on it.
 - `python3 scripts/vendor.py check` holds each copy to its upstream and its recorded changes.

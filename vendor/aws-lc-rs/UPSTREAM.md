@@ -28,19 +28,20 @@ Each change is recorded in `vendor/patches/aws-lc-rs/`, applied in this order on
 
 Mantle's changes are Mantle's to offer upstream; once aws-lc-rs carries one, the re-vendor drops it.
 
-Mantle's other three changes to aws-lc-sys (its `vendor/UPSTREAM.md`) aren't carried: kiln builds
-aws-lc-sys 0.46.0 as crates.io's package does, so in kiln's tree Mantle's crates build without them:
+Mantle's other three changes to aws-lc-sys (its `vendor/UPSTREAM.md`) aren't carried as changes:
+kiln builds aws-lc-sys 0.46.0 as crates.io's package does. The first two are defaults that
+variables set, and kiln's `.cargo/config.toml` sets them as Mantle's builds have them (Ada's word,
+2026-11-03); the third waits:
 
-- CPU jitter entropy built in unless `AWS_LC_SYS_NO_JITTER_ENTROPY=1` (Mantle's: left out unless
-  asked for; it costs a process 17.6 ms before its first random bytes);
-- a system AWS-LC used when one is found (`OPENSSL_DIR`, `OPENSSL_INCLUDE_DIR` and `OPENSSL_LIB_DIR`,
-  or pkg-config) unless `AWS_LC_SYS_USE_SYSTEM=0` (Mantle's: only when `AWS_LC_SYS_USE_SYSTEM=1`
-  asks);
+- CPU jitter entropy is built in unless `AWS_LC_SYS_NO_JITTER_ENTROPY=1` (Mantle's: left out unless
+  asked for; it costs a process 17.6 ms before its first random bytes): kiln sets it;
+- a system AWS-LC is used when one is found (`OPENSSL_DIR`, `OPENSSL_INCLUDE_DIR` and
+  `OPENSSL_LIB_DIR`, or pkg-config) unless `AWS_LC_SYS_USE_SYSTEM=0` (Mantle's: only when
+  `AWS_LC_SYS_USE_SYSTEM=1` asks): kiln sets it;
 - a hardware random-number read that fails all its ten attempts fails the CPU entropy method, and
-  AWS-LC aborts the process (Mantle's: read from the operating system instead).
-
-The first two are defaults those variables set; the third is a change to AWS-LC's C, carried only by
-vendoring aws-lc-sys.
+  AWS-LC aborts the process (Mantle's: read from the operating system instead). That's a change to
+  AWS-LC's C, carried only by vendoring aws-lc-sys, which waits until `scripts/vendor.py` takes a
+  crates.io package.
 
 ## Taking a newer upstream
 
