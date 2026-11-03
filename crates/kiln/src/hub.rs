@@ -2397,7 +2397,7 @@ impl Hub {
                 // and whether its learner checks the log's checkpoints (docs/ci.md W27-R08).
                 (Some(g), crate::store::learner::Msg::Ask { id, checks }) => {
                     if let Some(holds) = checks {
-                        self.cluster.checks(agent, peer, holds);
+                        self.cluster.checks(g, agent, peer, holds);
                     }
                     let at = crate::store::learner::Msg::At { id, seq: g.standing().0 };
                     if let Ok(b) = proto::encode(&ServerMsg::Cluster { json: crate::store::learner::encode(&at), raft: Vec::new() }) {

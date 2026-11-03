@@ -450,6 +450,10 @@ pub struct Learners {
     next: std::sync::atomic::AtomicU64,
     /// The checkpoints of the log owed to the learners that check them (docs/ci.md W27-R08).
     periods: parking_lot::Mutex<Periods>,
+    /// A test build's `entry_changed`: for each learner that said it checks the log, the entry the
+    /// group had applied as it first said so. The fault changes one past it, never one the learner
+    /// may hold already (a leader catching a learner up sends it entries its copy holds).
+    changes_after: parking_lot::Mutex<HashMap<u64, u64>>,
 }
 
 impl Learners {
@@ -495,14 +499,22 @@ impl Learners {
 
     /// A message to learner `member`, in its frames.
     pub fn frames(&self, member: u64, bytes: Vec<u8>) -> Vec<(Msg, Vec<u8>)> {
-        let bytes = if crate::runner::chaos::get().is_some_and(|c| c.entry_changed) && self.checking(member) { changed_in_transit(bytes) } else { bytes };
+        let after = if crate::runner::chaos::get().is_some_and(|c| c.entry_changed) { self.changes_after.lock().get(&member).copied() } else { None };
+        let bytes = match after {
+            Some(after) => changed_in_transit(bytes, after),
+            None => bytes,
+        };
         frames(self.next.fetch_add(1, std::sync::atomic::Ordering::Relaxed), bytes)
     }
 
     /// `machine`'s learner, held by runner process `peer`, checks the log's checkpoints, holding the
-    /// leaves of the entries after `holds` ([`Periods::checks`]).
-    pub fn checks(&self, machine: &str, peer: PeerId, holds: u64) {
-        self.periods.lock().checks(super::group::member_of(machine), machine, peer, holds, Instant::now());
+    /// leaves of the entries after `holds` ([`Periods::checks`]); `group` is where the log stands.
+    pub fn checks(&self, group: &Group, machine: &str, peer: PeerId, holds: u64) {
+        let member = super::group::member_of(machine);
+        if crate::runner::chaos::get().is_some_and(|c| c.entry_changed) {
+            self.changes_after.lock().entry(member).or_insert_with(|| group.standing().1);
+        }
+        self.periods.lock().checks(member, machine, peer, holds, Instant::now());
     }
 
     /// A copy of kiln.db made for `machine`'s learner, at entry `at` ([`Periods::copied`]).
@@ -530,24 +542,21 @@ impl Learners {
         self.periods.lock().away(member);
     }
 
-    /// Whether `member`'s learner checks the log's checkpoints.
-    pub fn checking(&self, member: u64) -> bool {
-        self.periods.lock().checking(member)
-    }
 }
 
 /// A test build's `entry_changed` (the server's, docs/ci.md W27-R08), for a message to a learner
-/// that checks the log: the first entry with a write in it the server sends one has its last byte
-/// changed after kiln logged it, and so has every copy of that entry sent again (an append the
-/// learner refused, sent again), as a link or a relay that changes what it carries would (the
-/// message made again whole). The learner's next checkpoint doesn't match.
-fn changed_in_transit(bytes: Vec<u8>) -> Vec<u8> {
+/// that checks the log: the first entry with a write in it past `after` (what the group had applied
+/// as the learner said it checks) that the server sends one has its last byte changed after kiln
+/// logged it, and so has every copy of that entry sent again (an append the learner refused, sent
+/// again), as a link or a relay that changes what it carries would (the message made again whole).
+/// The learner's next checkpoint doesn't match.
+fn changed_in_transit(bytes: Vec<u8>, after: u64) -> Vec<u8> {
     use hyper_raft::wire::Record as _;
     // The entry it changes, once picked (0: none yet).
     static CHANGED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let Ok(mut m) = hyper_raft::proto::Message::decode(&bytes) else { return bytes };
     let mut changed = false;
-    for e in m.entries.iter_mut().filter(|e| !e.data.is_empty()) {
+    for e in m.entries.iter_mut().filter(|e| !e.data.is_empty() && e.index > after) {
         let picked = match CHANGED.compare_exchange(0, e.index, Ordering::SeqCst, Ordering::SeqCst) {
             Ok(_) => e.index,
             Err(picked) => picked,

@@ -2219,15 +2219,18 @@ mod tests {
             let c = Connection::open_with_flags(&replica, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)?;
             Ok(c.query_row("SELECT v FROM kv WHERE k = ?1", [k], |r| r.get(0)).ok())
         };
-        // The links between them, the first entry with a write in it changed on its way.
+        // The links between them, the first entry with a write in it that the learner hasn't
+        // applied changed on its way, and every copy of it sent again (after a refusal). Not one it
+        // has: the leader sends the new learner messages it held for it from before its copy, and
+        // may send it entries the copy holds, which it passes over.
         let done = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let picked = Arc::new(AtomicU64::new(0));
         let links = {
-            let (server, learner, done) = (server.clone(), learner.clone(), done.clone());
+            let (server, learner, done, picked) = (server.clone(), learner.clone(), done.clone(), picked.clone());
             thread::spawn(move || {
                 let Some(g) = server.group() else { return };
                 let (to_learner, to_server) = (g.outgoing(), learner.outgoing());
-                // The entry changed, once picked: every copy of it sent (again, after a refusal).
-                let mut changed: Option<u64> = None;
+                let changes = |e: &hyper_raft::proto::Entry, picked: u64, applied: u64| !e.data.is_empty() && if picked == 0 { e.index > applied } else { e.index == picked };
                 while !done.load(Ordering::SeqCst) {
                     let mut moved = false;
                     while let Ok((to, bytes)) = to_learner.try_recv() {
@@ -2235,12 +2238,15 @@ mod tests {
                         if to != member {
                             continue;
                         }
+                        let applied = learner.standing().1;
                         let bytes = match Message::decode(&bytes) {
-                            Ok(mut m) if m.entries.iter().any(|e| !e.data.is_empty() && changed.is_none_or(|i| i == e.index)) => {
-                                for e in m.entries.iter_mut().filter(|e| !e.data.is_empty()) {
-                                    let picked = *changed.get_or_insert(e.index);
-                                    if let Some(b) = e.data.last_mut().filter(|_| e.index == picked) {
+                            Ok(mut m) if m.entries.iter().any(|e| changes(e, picked.load(Ordering::SeqCst), applied)) => {
+                                for e in m.entries.iter_mut() {
+                                    if changes(e, picked.load(Ordering::SeqCst), applied)
+                                        && let Some(b) = e.data.last_mut()
+                                    {
                                         *b ^= 0x01;
+                                        picked.store(e.index, Ordering::SeqCst);
                                     }
                                 }
                                 m.encode_to_vec()
@@ -2265,6 +2271,8 @@ mod tests {
             let applied = g.standing().1;
             until("the learner applying what the server applied", || Ok(learner.standing().1 >= applied))?;
             let from = learner.leaves_from();
+            let changed = picked.load(Ordering::SeqCst);
+            anyhow::ensure!(changed > from && changed <= applied, "the link changed entry {changed}, not one of the learner's stretch from {from} to {applied}");
             let (said, held) = (g.digest(from, applied), learner.digest(from, applied));
             anyhow::ensure!(said.is_ok() && held.is_ok() && said != held, "the changed entry changes the learner's checkpoint: kiln's {said:?}, the learner's {held:?}");
             anyhow::ensure!(read("after")?.as_deref() != Some("2"), "the learner holds what came, not what the server wrote");

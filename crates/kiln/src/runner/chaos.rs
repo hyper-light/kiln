@@ -71,10 +71,10 @@
 //!   byte in its middle changed after kiln hashed it, once, as in transit (docs/ci.md W27-R08's
 //!   cluster group): the learner refuses it, kiln records the break, and the learner fetches another.
 //! - `entry_changed`: the server's: the first entry with a write in it that it sends a learner that
-//!   checks the log's checkpoints has its last byte changed, as has every copy of it sent again, the
-//!   message made again whole, as in transit (docs/ci.md W27-R08's cluster group): the learner's
-//!   next checkpoint doesn't match, kiln records the break, and the learner copies the database
-//!   again.
+//!   checks the log's checkpoints, of those after the learner said so, has its last byte changed,
+//!   as has every copy of it sent again, the message made again whole, as in transit (docs/ci.md
+//!   W27-R08's cluster group): the learner's next checkpoint doesn't match, kiln records the break,
+//!   and the learner copies the database again.
 //! - `relay_calls=<drop|swap|alter>`: the runner, a relay of its agents' calls to kiln, fails every
 //!   second act it passes on (docs/ci.md W27-R08's relays): it numbers it on its stream and passes
 //!   it on not at all; passes the act before on under its record; or changes a byte of the ask after
