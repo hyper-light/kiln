@@ -290,6 +290,7 @@ fn machine(work_dir: &Path) -> RunnerFacts {
         binfmt: binfmt(),
         // Its load, for admission (W24-R19).
         work: Some(kiln_ci::facts::WorkFacts { io_full: io_pressure() }),
+        machine_id: crate::os::machine_id(),
         ..RunnerFacts::default()
     }
 }

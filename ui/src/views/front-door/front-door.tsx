@@ -17,7 +17,7 @@ import { Button } from "@/components/ui/button";
 import { Hold } from "@/components/ui/hold";
 import { Loadable } from "@/components/ui/loading";
 import { SectionHeading } from "@/components/ui/misc";
-import type { Res } from "@/lib/data";
+import { labelOf, shownName, useLabels, type Res } from "@/lib/data";
 import { errorMessage } from "@/lib/hooks";
 import { getPref, setPref } from "@/lib/prefs";
 import { invalidate, useSuspenseResource } from "@/lib/resource";
@@ -35,7 +35,7 @@ const PICKED = "kiln.frontdoor.runner";
 /* ------------------------------------------------------------------ the section */
 
 export function FrontDoorSection({ agents, index }: { agents: Agent[]; index: string }) {
-  const runners = React.useMemo(() => agents.filter((a) => !a.ephemeral).sort((a, b) => a.name.localeCompare(b.name)), [agents]);
+  const runners = React.useMemo(() => agents.filter((a) => !a.ephemeral).sort((a, b) => shownName(a).localeCompare(shownName(b))), [agents]);
   const doors = useSuspenseResource(frontDoorsRes.key, frontDoorsRes.fetch, frontDoorsRes.opts).data;
   // The runner chosen last (kept per browser); else the one whose front door is on; else the first connected one.
   const [picked, setPicked] = React.useState(() => getPref(PICKED, ""));
@@ -79,7 +79,7 @@ export function FrontDoorSection({ agents, index }: { agents: Agent[]; index: st
             >
               {runners.map((a) => (
                 <option key={a.name} value={a.name}>
-                  {a.name}
+                  {shownName(a)}
                   {a.connected ? "" : " (offline)"}
                 </option>
               ))}
@@ -92,7 +92,7 @@ export function FrontDoorSection({ agents, index }: { agents: Agent[]; index: st
             )}
           </div>
           {runner && (
-            <Loadable label={`${runner}'s front door`} fallback={<Hold height={420} className="fd-body" />}>
+            <Loadable label={`${agent ? shownName(agent) : runner}'s front door`} fallback={<Hold height={420} className="fd-body" />}>
               <FrontDoorPanel key={runner} runner={runner} />
             </Loadable>
           )}
@@ -174,6 +174,7 @@ function settingsOf(d: Draft, base: FrontDoorSettings): FrontDoorSettings | stri
 }
 
 function FrontDoorPanel({ runner }: { runner: string }) {
+  useLabels();
   const view = useSuspenseResource(`front-door/${runner}`, (s) => frontDoorApi.get(runner, s));
   useServerEvents((ev) => {
     if ((ev.type === "front_door" && ev.runner === runner) || (ev.type === "agent" && ev.agent.name === runner && ev.agent.connected !== view.data.connected)) view.reload();
@@ -202,7 +203,7 @@ function FrontDoorPanel({ runner }: { runner: string }) {
       const next = await frontDoorApi.save(runner, s);
       view.setData(() => next);
       setDraft(null);
-      setMsg({ tone: "ok", text: next.connected ? `Saved. ${runner} applies it now.` : `Saved. ${runner} applies it when it connects.` });
+      setMsg({ tone: "ok", text: next.connected ? `Saved. ${labelOf(runner)} applies it now.` : `Saved. ${labelOf(runner)} applies it when it connects.` });
       invalidate("front-door");
     } catch (e) {
       setMsg({ tone: "error", text: errorMessage(e) });
@@ -243,10 +244,11 @@ function FrontDoorPanel({ runner }: { runner: string }) {
 }
 
 function appliedWords(v: FrontDoorView): string {
-  if (!v.connected) return `${v.runner} is offline: it applies these when it connects.`;
-  if (v.supported === false) return `${v.runner} runs a kiln too old for a front door: upgrade it in System → Updates.`;
-  if (v.applied === false) return `${v.runner} is applying these…`;
-  if (v.applied) return `In use on ${v.runner}.`;
+  const runner = labelOf(v.runner);
+  if (!v.connected) return `${runner} is offline: it applies these when it connects.`;
+  if (v.supported === false) return `${runner} runs a kiln too old for a front door: upgrade it in System → Updates.`;
+  if (v.applied === false) return `${runner} is applying these…`;
+  if (v.applied) return `In use on ${runner}.`;
   return "";
 }
 
@@ -277,7 +279,9 @@ function linesOf(v: FrontDoorView | undefined): Line[] {
   const s = v?.settings;
   const st = v?.status ?? null;
   const offline = (name: string, on: boolean, detail: string): Line =>
-    on ? { name, state: "waiting", text: !v ? "…" : !v.connected ? "runner offline" : v.supported === false ? "this runner's kiln is too old" : "waiting for the runner", detail } : { name, state: "off", text: "off", muted: true };
+    on
+      ? { name, state: "waiting", text: !v ? "…" : !v.connected ? "runner offline" : v.supported === false ? "this runner's kiln is too old" : "waiting for the runner", detail }
+      : { name, state: "off", text: "off", muted: true };
   const dnsOn = Boolean(s?.dns.enabled);
   const httpsOn = Boolean(s?.https.enabled);
   const httpOn = httpsOn && (s?.https.http_port ?? 0) !== 0;
@@ -296,7 +300,7 @@ function linesOf(v: FrontDoorView | undefined): Line[] {
     name,
     state: "error",
     text: l.error ?? fallback,
-    detail: l.fix ? undefined : l.error ?? undefined,
+    detail: l.fix ? undefined : (l.error ?? undefined),
     fix: l.fix,
   });
 
@@ -349,7 +353,8 @@ function linesOf(v: FrontDoorView | undefined): Line[] {
     else httpsLine = { name: "HTTPS", state: "on", text: `${at} ✓ · ${kind}${cert.info ? `, until ${date(cert.info.not_after)}` : ""}`, detail: usual };
   } else if (h.state === "waiting" || cert.state === "waiting")
     httpsLine = { name: "HTTPS", state: "waiting", text: cert.state === "waiting" ? "waiting for its self-signed certificate" : (h.error ?? "waiting"), detail: cert.error ?? names };
-  else if (cert.state === "error") httpsLine = { name: "HTTPS", state: "error", text: cert.error ?? "no certificate", detail: cert.mode === "custom" ? "upload a certificate and its key below" : undefined };
+  else if (cert.state === "error")
+    httpsLine = { name: "HTTPS", state: "error", text: cert.error ?? "no certificate", detail: cert.mode === "custom" ? "upload a certificate and its key below" : undefined };
   else httpsLine = failed("HTTPS", h, "not listening");
 
   const lines = [dnsLine, httpsLine];
@@ -375,7 +380,17 @@ function StatusLines({ v }: { v: FrontDoorView | undefined }) {
     <div className="fd-live">
       <div className="fd-live-head">
         <span className="fd-key">Live</span>
-        <span className="fd-when">{v?.status_at ? <>reported <RelTime ts={v.status_at} /></> : v && !v.connected ? "runner offline" : " "}</span>
+        <span className="fd-when">
+          {v?.status_at ? (
+            <>
+              reported <RelTime ts={v.status_at} />
+            </>
+          ) : v && !v.connected ? (
+            "runner offline"
+          ) : (
+            " "
+          )}
+        </span>
       </div>
       <ul className="fd-lines" aria-label="How the front door is doing">
         {lines.map((l) => (
@@ -468,7 +483,9 @@ function NamesGroup({ d, set }: GroupProps) {
           )}
         </Field>
         <Field label="Aliases" hint="More names for the same door, separated by commas.">
-          {(id) => <input id={id} className="fd-input" value={d.aliases} placeholder="ci.home" autoCapitalize="off" autoCorrect="off" spellCheck={false} onChange={(e) => set({ aliases: e.target.value })} />}
+          {(id) => (
+            <input id={id} className="fd-input" value={d.aliases} placeholder="ci.home" autoCapitalize="off" autoCorrect="off" spellCheck={false} onChange={(e) => set({ aliases: e.target.value })} />
+          )}
         </Field>
       </div>
       {/* A .local name: an extra for networks whose DNS you can't set, quieter than the names. */}
@@ -512,18 +529,34 @@ function DnsGroup({ d, set, v }: GroupProps & { v: FrontDoorView }) {
                 </select>
               )}
             </Field>
-            <Field label="Port">
-              {(id) => <input id={id} className="fd-input fd-port" inputMode="numeric" value={d.dnsPort} onChange={(e) => set({ dnsPort: e.target.value })} />}
-            </Field>
+            <Field label="Port">{(id) => <input id={id} className="fd-input fd-port" inputMode="numeric" value={d.dnsPort} onChange={(e) => set({ dnsPort: e.target.value })} />}</Field>
             {d.dnsMode === "resolver" && (
               <Field label="Upstream resolvers" hint="Empty: the runner's own resolvers.">
                 {(id) => (
-                  <input id={id} className="fd-input" value={d.upstream} placeholder={system ?? "the system's"} autoCapitalize="off" spellCheck={false} onChange={(e) => set({ upstream: e.target.value })} />
+                  <input
+                    id={id}
+                    className="fd-input"
+                    value={d.upstream}
+                    placeholder={system ?? "the system's"}
+                    autoCapitalize="off"
+                    spellCheck={false}
+                    onChange={(e) => set({ upstream: e.target.value })}
+                  />
                 )}
               </Field>
             )}
             <Field label="Answer with" hint="Empty: the runner's address on the network that asks.">
-              {(id) => <input id={id} className="fd-input" value={d.addresses} placeholder={lan ?? "192.168.1.77"} autoCapitalize="off" spellCheck={false} onChange={(e) => set({ addresses: e.target.value })} />}
+              {(id) => (
+                <input
+                  id={id}
+                  className="fd-input"
+                  value={d.addresses}
+                  placeholder={lan ?? "192.168.1.77"}
+                  autoCapitalize="off"
+                  spellCheck={false}
+                  onChange={(e) => set({ addresses: e.target.value })}
+                />
+              )}
             </Field>
           </div>
           <p className="fd-hint">
@@ -582,9 +615,7 @@ function HttpsGroup({ d, set, v, onView }: GroupProps & { v: FrontDoorView; onVi
       {d.httpsEnabled && (
         <>
           <div className="fd-grid">
-            <Field label="Port">
-              {(id) => <input id={id} className="fd-input fd-port" inputMode="numeric" value={d.httpsPort} onChange={(e) => set({ httpsPort: e.target.value })} />}
-            </Field>
+            <Field label="Port">{(id) => <input id={id} className="fd-input fd-port" inputMode="numeric" value={d.httpsPort} onChange={(e) => set({ httpsPort: e.target.value })} />}</Field>
             <Field label="HTTP redirect port" hint="0: no plain-HTTP redirect.">
               {(id) => <input id={id} className="fd-input fd-port" inputMode="numeric" value={d.httpPort} onChange={(e) => set({ httpPort: e.target.value })} />}
             </Field>
@@ -636,13 +667,14 @@ function Fingerprint({ sha256 }: { sha256: string }) {
 /** The certificate installed on the runner now (what it reports), the same four rows whether
  * there is one or not, so nothing moves when it arrives. */
 function CertFacts({ cert, runner }: { cert: FrontDoorStatus["cert"] | null; runner: string }) {
+  useLabels();
   const id = React.useId();
   const info = cert?.info ?? null;
   const left = info ? daysLeft(info.not_after) : 0;
   return (
     <div className="fd-facts">
       <span id={`${id}-in-use`} className="fd-key">
-        In use on {runner}
+        In use on {labelOf(runner)}
       </span>
       <dl aria-labelledby={`${id}-in-use`}>
         <div className="fd-fact">
@@ -687,6 +719,7 @@ function CertFacts({ cert, runner }: { cert: FrontDoorStatus["cert"] | null; run
 /** HTTPS's certificate, managed where it is shown: which kind (self-signed or your own), the one
  * installed now, and what can be done with it in place: renew, download, upload, trust. */
 function CertPart({ d, set, v, onView }: GroupProps & { v: FrontDoorView; onView: (v: FrontDoorView) => void }) {
+  useLabels();
   const cert = v.status?.cert ?? null;
   const info = cert?.info ?? null;
   const self = d.certMode === "kiln";
@@ -710,18 +743,19 @@ function CertPart({ d, set, v, onView }: GroupProps & { v: FrontDoorView; onView
       setRenew({ from, error: errorMessage(e) });
     }
   };
+  const runner = labelOf(v.runner);
   const note: { tone: "ok" | "error" | "quiet"; text: string } | null = renew?.error
     ? { tone: "error", text: renew.error }
     : renewed
       ? { tone: "ok", text: `Renewed: a new key and certificate, until ${date(renewed.not_after)}.` }
       : renewing
-        ? { tone: "quiet", text: `Renewing: ${v.runner} makes a new key and kiln's root signs it.` }
+        ? { tone: "quiet", text: `Renewing: ${runner} makes a new key and kiln's root signs it.` }
         : self && !savedSelf
           ? { tone: "quiet", text: "Save first; then it can be renewed here." }
           : !v.connected
-            ? { tone: "quiet", text: `${v.runner} is offline.` }
+            ? { tone: "quiet", text: `${runner} is offline.` }
             : !online
-              ? { tone: "quiet", text: `${v.runner} runs a kiln too old to renew it.` }
+              ? { tone: "quiet", text: `${runner} runs a kiln too old to renew it.` }
               : null;
 
   return (
@@ -731,11 +765,11 @@ function CertPart({ d, set, v, onView }: GroupProps & { v: FrontDoorView; onView
         hint={
           self ? (
             <>
-              kiln makes it from its own root, installs it on {v.runner} and renews it before it ends. Trust that root once on a device and the device trusts every runner&apos;s certificate, renewals
+              kiln makes it from its own root, installs it on {runner} and renews it before it ends. Trust that root once on a device and the device trusts every runner&apos;s certificate, renewals
               too.
             </>
           ) : (
-            <>A certificate for these names and its key, from your own CA or a public one. The key goes to {v.runner} once and stays there; kiln never shows it again.</>
+            <>A certificate for these names and its key, from your own CA or a public one. The key goes to {runner} once and stays there; kiln never shows it again.</>
           )
         }
       >
@@ -763,7 +797,7 @@ function CertPart({ d, set, v, onView }: GroupProps & { v: FrontDoorView; onView
         )}
         {info ? (
           <a className="fd-download" href={frontDoorApi.certUrl(v.runner)} download title="The certificate chain it serves (PEM), never its key">
-            <Download size={13} aria-hidden="true" /> {pemName(info, v.runner)}
+            <Download size={13} aria-hidden="true" /> {pemName(info, runner)}
           </a>
         ) : (
           <span className="fd-download" aria-disabled="true">
@@ -794,6 +828,7 @@ function CertPart({ d, set, v, onView }: GroupProps & { v: FrontDoorView; onView
 
 /** Your own certificate: its chain and key, pasted or read from files, sent to the runner. */
 function Upload({ v, onView, onDone }: { v: FrontDoorView; onView: (v: FrontDoorView) => void; onDone: () => void }) {
+  useLabels();
   const [certPem, setCertPem] = React.useState("");
   const [keyPem, setKeyPem] = React.useState("");
   const [busy, setBusy] = React.useState(false);
@@ -807,7 +842,7 @@ function Upload({ v, onView, onDone }: { v: FrontDoorView; onView: (v: FrontDoor
       onView(r.front_door);
       setCertPem("");
       setKeyPem("");
-      setNote({ tone: "ok", text: `Sent to ${v.runner}: ${r.cert.names.join(", ")}, until ${date(r.cert.not_after)}. The key stays on the runner.` });
+      setNote({ tone: "ok", text: `Sent to ${labelOf(v.runner)}: ${r.cert.names.join(", ")}, until ${date(r.cert.not_after)}. The key stays on the runner.` });
       onDone();
     } catch (e) {
       setNote({ tone: "error", text: errorMessage(e) });
@@ -849,7 +884,7 @@ function Upload({ v, onView, onDone }: { v: FrontDoorView; onView: (v: FrontDoor
           {busy ? "Uploading…" : "Upload certificate"}
         </Button>
         <span className="fd-msg" role="status" data-tone={note?.tone ?? "quiet"}>
-          {note?.text ?? (v.connected ? "" : `${v.runner} must be online to take it.`)}
+          {note?.text ?? (v.connected ? "" : `${labelOf(v.runner)} must be online to take it.`)}
         </span>
       </div>
     </div>
@@ -1001,9 +1036,10 @@ function TrustDevices({ v }: { v: FrontDoorView }) {
 }
 
 function Setup({ runner, fixes }: { runner: string; fixes: FrontDoorFix[] }) {
+  useLabels();
   return (
     <div className="fd-setup">
-      <h3 className="fd-key">One-time setup on {runner}</h3>
+      <h3 className="fd-key">One-time setup on {labelOf(runner)}</h3>
       {fixes.map((f) => (
         <div key={f.commands.join("\n")} className="fd-fix">
           <p className="fd-hint">{f.why}</p>

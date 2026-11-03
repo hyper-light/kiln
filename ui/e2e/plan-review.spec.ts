@@ -4,8 +4,8 @@
  * light research ("CI/CD Integration"), one with heavy research ("Planner audit": 46 findings), and
  * one proposed in plan mode ("Slates"). Read step by step, research a few lines however much there
  * is, answered Approve, Reject or Other…; Other… brings it back changed, saying what changed; every
- * Review lands there; picking an answer moves nothing; nothing scrolls sideways. On a desktop and a
- * phone (and in WebKit, with E2E_WEBKIT=1).
+ * Review lands there; on its own page it's approved where it would be run; picking an answer moves
+ * nothing; nothing scrolls sideways. On a desktop and a phone (and in WebKit, with E2E_WEBKIT=1).
  */
 import { expect, test, type Page } from "@playwright/test";
 
@@ -22,10 +22,16 @@ async function putAwayCards(page: Page) {
     .first()
     .waitFor({ timeout: 3000 })
     .catch(() => undefined);
-  await expect(async () => {
-    if ((await away.count()) > 0) await away.first().click({ timeout: 1000 });
-    await expect(away).toHaveCount(0, { timeout: 500 });
-  }).toPass({ timeout: 10_000 });
+  // A phone shows one card at a time: wait for that card to leave before the next one,
+  // rather than waiting for the whole queue to be empty after each single dismissal.
+  while ((await away.count()) > 0) {
+    const label = await away.first().getAttribute("aria-label");
+    if (!label) throw new Error("A notice's dismiss button needs its accessible name");
+    const card = page.getByRole("button", { name: label, exact: true });
+    await card.click({ timeout: 1000 });
+    await expect(card).toHaveCount(0);
+  }
+  await expect(away).toHaveCount(0);
 }
 
 test("a goal's plan is read and answered in its agent's Plan tab, and Other… brings it back changed", async ({ page }) => {
@@ -157,6 +163,26 @@ test("every Review lands in the agent's Plan tab: Mission control's row, and the
   await expect(page.locator(".gs-review")).toHaveText("waits for your review");
   await goal.click();
   await expect(page.locator(".pr-top")).toBeInViewport({ timeout: 5_000 });
+});
+
+test("a plan its goals wait on is approved on its page, where it would be run, and its agent needs you no longer", async ({ page }, info) => {
+  await page.goto("/agents/plans/pl_cicd");
+  // On a phone the cards sit over the page's foot.
+  if (info.project.name.startsWith("phone")) await putAwayCards(page);
+  // Approve in Run's place: it runs no other way, and its steps aren't run on their own.
+  const approve = page.getByRole("region", { name: "Approve the plan" });
+  await expect(approve).toContainText("CI/CD Integration’s goals wait on your review of this plan. Approved, its 5 steps go to CI/CD Integration as its goal’s parts: it runs no other way.");
+  await expect(approve.getByRole("link", { name: "review it in its Plan tab" })).toHaveAttribute("href", "/agents/rev-cicd?tab=plan");
+  await expect(page.getByRole("region", { name: "Run the plan" })).toHaveCount(0);
+  await expect(page.locator(".sv-hint")).toHaveText("Pick steps to see what they are");
+  await approve.getByRole("button", { name: "Approve" }).click();
+  await expect(approve).toContainText("Approved: its 5 steps go to CI/CD Integration as its goal’s parts");
+  expect(await wide(page)).toBe(false);
+  // Its row in Mission control goes on, nothing waiting on you.
+  await page.goto("/agents");
+  const row = page.locator(".ms-row[data-agent='rev-cicd']");
+  await expect(row.locator(".ms-word")).toHaveText("Working");
+  await expect(row.getByRole("button", { name: "Approve" })).toHaveCount(0);
 });
 
 test("picking an answer moves nothing above it, and its button keeps its width", async ({ page }) => {

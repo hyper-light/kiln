@@ -8,7 +8,7 @@
  */
 import type http from "node:http";
 import type { ConvoLog, ConvoLogLine, ConvoNote, ConvoSeries, ConvoShip, ConvoStatus, ConvoStore, ConvoUpkeep } from "../src/api/types.ts";
-import { hashStr, mulberry32 } from "./data.ts";
+import { MAC_MINI, hashStr, mulberry32 } from "./data.ts";
 
 interface Ctx {
   json: (res: http.ServerResponse, status: number, body: unknown) => void;
@@ -149,7 +149,7 @@ function start() {
   const runners = ctxRunners();
   let total = 0;
   for (const r of runners) {
-    if (r.name === "metal-mac-mini") continue;
+    if (r.name === MAC_MINI) continue;
     const big = hashStr(r.name) % 5;
     const s = sim(
       `${r.name}/${idOf(r.name + "runner")}`,

@@ -4,6 +4,7 @@
  * out sleeps, and its runner, agents and jobs with it.
  */
 import type { Agent, Battery } from "@/api/types";
+import { shownName } from "@/lib/data";
 import { cn } from "@/lib/utils";
 
 /** On battery at this or less, a machine is low: the server's `os::battery::LOW`. */
@@ -44,7 +45,7 @@ export function LowBattery({ agents, what }: { agents: Agent[]; what?: (machine:
         const stops = what?.(a.name) ?? "";
         return (
           <p key={a.name} role="status" className="mb-3 rounded-lg border border-[#3a3326] bg-[#1b1915] px-3 py-2.5 text-[13px] text-[#e0c98f]">
-            {a.name} is on battery at {b.percent}%{b.minutes ? `, about ${left(b.minutes)} left` : ""}. Plug it in, or it sleeps and its runner with it
+            {shownName(a)} is on battery at {b.percent}%{b.minutes ? `, about ${left(b.minutes)} left` : ""}. Plug it in, or it sleeps and its runner with it
             {stops ? `: ${stops} stop` : ""}.
           </p>
         );

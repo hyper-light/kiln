@@ -14,6 +14,7 @@ import { Button } from "@/components/ui/button";
 import { Hold } from "@/components/ui/hold";
 import { Loadable } from "@/components/ui/loading";
 import { SectionHeading } from "@/components/ui/misc";
+import { labelOf, shownName } from "@/lib/data";
 import { errorMessage } from "@/lib/hooks";
 import { getPref, setPref } from "@/lib/prefs";
 import { useSuspenseResource } from "@/lib/resource";
@@ -24,7 +25,8 @@ import "../front-door/front-door.css";
 const PICKED = "kiln.headroom.runner";
 
 export function HeadroomSection({ agents, index }: { agents: Agent[]; index: string }) {
-  const runners = React.useMemo(() => agents.filter((a) => !a.ephemeral).sort((a, b) => a.name.localeCompare(b.name)), [agents]);
+  // Shown and put in order by the names people see (docs/machines.md), picked by their names.
+  const runners = React.useMemo(() => agents.filter((a) => !a.ephemeral).sort((a, b) => shownName(a).localeCompare(shownName(b))), [agents]);
   const [picked, setPicked] = React.useState(() => getPref(PICKED, ""));
   const runner = runners.some((a) => a.name === picked) ? picked : (runners.find((a) => a.connected)?.name ?? runners[0]?.name ?? "");
   const selectId = React.useId();
@@ -56,14 +58,14 @@ export function HeadroomSection({ agents, index }: { agents: Agent[]; index: str
             >
               {runners.map((a) => (
                 <option key={a.name} value={a.name}>
-                  {a.name}
+                  {shownName(a)}
                   {a.connected ? "" : " (offline)"}
                 </option>
               ))}
             </select>
           </div>
           {runner && (
-            <Loadable label={`${runner}'s headroom`} fallback={<Hold height={420} className="fd-body" />}>
+            <Loadable label={`${labelOf(runner)}'s headroom`} fallback={<Hold height={420} className="fd-body" />}>
               <HeadroomPanel key={runner} runner={runner} />
             </Loadable>
           )}
@@ -94,7 +96,7 @@ function HeadroomPanel({ runner }: { runner: string }) {
       const next = await headroomApi.save(runner, d);
       view.setData(() => next);
       setDraft(null);
-      setMsg({ tone: "ok", text: next.connected ? `Saved. ${runner} applies it now.` : `Saved. ${runner} applies it when it connects.` });
+      setMsg({ tone: "ok", text: next.connected ? `Saved. ${labelOf(runner)} applies it now.` : `Saved. ${labelOf(runner)} applies it when it connects.` });
     } catch (e) {
       setMsg({ tone: "error", text: errorMessage(e) });
     } finally {

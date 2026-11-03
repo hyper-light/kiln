@@ -18,10 +18,11 @@ import { ArrowUpRight, Check, ChevronRight, Copy, TriangleAlert, X } from "lucid
 import { Dialog as D } from "radix-ui";
 import { accountsApi, type Account, type AccountFlow, type AccountMethod } from "@/api/harness";
 import { Button, buttonVariants } from "@/components/ui/button";
+import { useLabels } from "@/lib/data";
 import { errorMessage } from "@/lib/hooks";
 import { cn } from "@/lib/utils";
 import { copyText } from "@/views/terminal/clipboard";
-import { machineName } from "./parts";
+import { machineShown } from "./parts";
 import { Optic } from "./signals";
 import "./account-card.css";
 
@@ -270,8 +271,8 @@ function useMachine(target: string): MachineView {
 const NAMES: Record<string, string> = { claude: "Claude Code", codex: "Codex" };
 const capital = (s: string) => s.charAt(0).toUpperCase() + s.slice(1);
 const nameOf = (kind: string) => NAMES[kind] ?? capital(kind);
-/** For sentences: "the server", or the machine's name. */
-const whereIn = (target: string) => (target === "local" ? "the server" : machineName(target));
+/** For sentences: "the server", or the machine's name (as people know it). */
+const whereIn = (target: string) => (target === "local" ? "the server" : machineShown(target));
 const planName = (plan: string) => capital(plan.replace(/[_-]+/g, " "));
 
 /** A sign-in page kiln will link to: http(s) only, whatever the CLI printed. */
@@ -804,6 +805,7 @@ function AccountRow({
   target: string;
   onOpen: (what: Open | null) => void;
 }) {
+  useLabels();
   const where = whereIn(target);
   const flow = entry?.flow;
   const running = flow?.state === "running";
@@ -961,6 +963,7 @@ export interface AccountCardHandle {
  *  out in it they crowded a phone's screen. Dismissing it closes the card as its own close does
  *  (a sign-in still under way stops); Escape closes an open step first. */
 export function AccountDialog({ target, kind, intent, onClose }: { target: string; kind: string; intent?: AccountIntent; onClose: () => void }) {
+  useLabels();
   const card = React.useRef<AccountCardHandle | null>(null);
   return (
     <D.Root
@@ -978,7 +981,7 @@ export function AccountDialog({ target, kind, intent, onClose }: { target: strin
             if (card.current?.stepOpen()) e.preventDefault();
           }}
         >
-          <D.Title className="sr-only">Accounts on {machineName(target)}</D.Title>
+          <D.Title className="sr-only">Accounts on {machineShown(target)}</D.Title>
           <AccountCard ref={card} target={target} kind={kind} intent={intent} onClose={onClose} />
         </D.Content>
       </D.Portal>
@@ -987,6 +990,7 @@ export function AccountDialog({ target, kind, intent, onClose }: { target: strin
 }
 
 export function AccountCard({ target, kind, intent, compact = false, onClose, className, ref }: AccountCardProps) {
+  useLabels();
   const view = useMachine(target);
   const shown = React.useCallback(
     (el: HTMLElement | null) => {

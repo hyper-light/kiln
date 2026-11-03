@@ -581,13 +581,13 @@ pub async fn repair(hub: &Arc<Hub>, name: &str, ask: &Ask) -> Result<Value, Fail
         return Err((StatusCode::BAD_REQUEST, format!("{action:?} isn't a repair: they are {}", RUNNER_ACTIONS.iter().chain(SERVER_ACTIONS).copied().collect::<Vec<_>>().join(", "))));
     }
     if !live_of(hub, name).is_some_and(|l| l.connected) {
-        return Err((StatusCode::CONFLICT, format!("{name} isn't connected")));
+        return Err((StatusCode::CONFLICT, format!("{} isn't connected", hub.shown(name))));
     }
     if action == "clear-self-build-cache" && hub.updates.jobs().iter().any(|j| j.kind == "runner" && j.target == name && j.state == crate::updates::JobState::Running) {
-        return Err((StatusCode::CONFLICT, format!("{name} is being upgraded: its build may be using the cache, so it stays until that's done")));
+        return Err((StatusCode::CONFLICT, format!("{} is being upgraded: its build may be using the cache, so it stays until that's done", hub.shown(name))));
     }
     if action == "clear-self-build-cache" && crate::fleet::builds_on(hub, name) {
-        return Err((StatusCode::CONFLICT, format!("{name} is building kiln for another machine with the cache, so it stays until that's done")));
+        return Err((StatusCode::CONFLICT, format!("{} is building kiln for another machine with the cache, so it stays until that's done", hub.shown(name))));
     }
     let a = action.to_owned();
     match hub.ask_runner::<Value>(name, proto::CAP_DOCTOR, REPAIR_WAIT, move |req| ServerMsg::Repair { req, action: a }).await {
@@ -597,8 +597,8 @@ pub async fn repair(hub: &Arc<Hub>, name: &str, ask: &Ask) -> Result<Value, Fail
                 None => Ok(json!({"ok": true, "action": action, "message": v.get("message").cloned().unwrap_or(Value::Null)})),
             }
         }
-        Ok(Some(None)) => Err((StatusCode::BAD_GATEWAY, format!("{name} didn't say how the repair went"))),
-        Ok(None) => Err((StatusCode::CONFLICT, format!("{name}'s kiln is too old to repair itself: upgrade it first"))),
+        Ok(Some(None)) => Err((StatusCode::BAD_GATEWAY, format!("{} didn't say how the repair went", hub.shown(name)))),
+        Ok(None) => Err((StatusCode::CONFLICT, format!("{}'s kiln is too old to repair itself: upgrade it first", hub.shown(name)))),
         Err(e) => Err((StatusCode::BAD_GATEWAY, format!("{e:#}"))),
     }
 }

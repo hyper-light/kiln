@@ -68,7 +68,7 @@ fn a_message_sent_twice_under_one_key_through_a_runner_reaches_its_agent_once() 
     }
     let log = std::fs::File::create(dir.path().join("runner.log"))?;
     let mut cmd = common::kiln();
-    cmd.args(["agent", "--server", &format!("http://127.0.0.1:{}", server.port), "--token", &join, "--name", "t3-runner", "--labels", "t3"])
+    cmd.args(["agent", "--server", &format!("http://127.0.0.1:{}", server.port), "--token", &join, "--name", "t3-runner", "--labels", "t3"]).env("KILN_MACHINE_ID", "t3-runner")
         .arg("--state-dir")
         .arg(&state)
         .arg("--work-dir")
@@ -99,7 +99,7 @@ fn a_message_sent_twice_under_one_key_through_a_runner_reaches_its_agent_once() 
     };
     wait("the runner connected", &mut || {
         let (_, runners) = api("GET", "/api/agents", None)?;
-        Ok(runners.as_array().into_iter().flatten().any(|r| r.get("name") == Some(&json!("t3-runner")) && r.get("connected") == Some(&json!(true))))
+        Ok(runners.as_array().into_iter().flatten().any(|r| r.get("name") == Some(&json!(common::machine("t3-runner"))) && r.get("connected") == Some(&json!(true))))
     })?;
     // An agent on it, its harness running there.
     let cwd = dir.path().join("agent");

@@ -12,6 +12,7 @@ import type { Job, KilnBinary, Run, UpdateJob, UpdatesOverview } from "@/api/typ
 import { Button } from "@/components/ui/button";
 import { Confirm } from "@/components/ui/misc";
 import { toast } from "@/components/ui/toast";
+import { useLabels } from "@/lib/data";
 import { formatBytes, relativeTime, shortSha } from "@/lib/format";
 import { errorMessage } from "@/lib/hooks";
 import { PEER_BASE } from "@/lib/peer-base";
@@ -218,6 +219,7 @@ function PlatformTile({
   onRemoved: () => void;
   onChoose: (target: string) => void;
 }) {
+  useLabels();
   const b = p.binary;
   const run = last ? `release run #${last.number}` : "the release run";
   const toward = p.state === "building" || p.state === "queued";

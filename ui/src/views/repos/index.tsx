@@ -23,7 +23,7 @@ import { EmptyState, FilterBar, PageIntro, SelectField } from "@/components/ui/m
 import { StatusDot } from "@/components/ui/status";
 import { toast } from "@/components/ui/toast";
 import { Tip } from "@/components/ui/tooltip";
-import { recentRunsRes, reposRes, useRecentRuns, useRepos, useRes, warm, type Res } from "@/lib/data";
+import { byLabel, labelOf, recentRunsRes, reposRes, useLabels, useRecentRuns, useRepos, useRes, warm, type Res } from "@/lib/data";
 import { errorMessage, useLocalStorage } from "@/lib/hooks";
 import { invalidate } from "@/lib/resource";
 import { RelTime } from "../shared";
@@ -152,9 +152,11 @@ function ReposBody() {
   const asked = repo ? (entries.find((e) => e.key === repo) ?? entries.find((e) => e.built?.name === repo) ?? entries.find((e) => e.name === repo))?.key : undefined;
   const open: Panel | null = opened ?? (repo ? { key: asked ?? repo, what: "details" } : null);
   const machines = React.useMemo(() => new Map(places.data.machines.map((m) => [m.name, m])), [places.data]);
-  const machineNames = React.useMemo(() => [...machines.keys()].sort(), [machines]);
+  // Machines are named, and put in order, by the names they're shown by.
+  const labels = useLabels();
+  const machineNames = React.useMemo(() => [...machines.keys()].sort(byLabel(labels)), [machines, labels]);
   const dims = React.useMemo(() => new Map(entries.map((e) => [e.key, dimsOf(e, machines)])), [entries, machines]);
-  const facets = React.useMemo(() => facetsOf(entries, dims, q, view.facets), [entries, dims, q, view.facets]);
+  const facets = React.useMemo(() => facetsOf(entries, dims, q, view.facets, labels), [entries, dims, q, view.facets, labels]);
   const list = sortEntries(
     entries.filter((e) => matches(q, view.facets, e, dims.get(e.key) ?? {})),
     view.sort,
@@ -428,6 +430,7 @@ function Row({
   onPoll: () => void;
   children: React.ReactNode;
 }) {
+  useLabels();
   const r = e.built;
   const dot = entryDot(e);
   const [owner, ...rest] = e.name.split("/");
@@ -462,7 +465,7 @@ function Row({
               <AlertTriangle size={11} className="mt-px" /> <span className="line-clamp-2 break-all">{r.last_error}</span>
             </div>
           )}
-          <div className="repo-row-machines md:hidden">{on.length ? `on ${on.join(", ")}` : "on no machine"}</div>
+          <div className="repo-row-machines md:hidden">{on.length ? `on ${on.map((m) => labelOf(m)).join(", ")}` : "on no machine"}</div>
         </td>
         <td className="hidden md:table-cell">
           {on.length === 0 ? (
@@ -477,7 +480,7 @@ function Row({
                 return (
                   <span key={name} className="chip repo-machine" title={where}>
                     <StatusDot status={status} />
-                    {name}
+                    {labelOf(name)}
                     {ps.length > 1 && <span className="repo-machine-n">×{ps.length}</span>}
                   </span>
                 );

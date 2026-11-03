@@ -1,6 +1,7 @@
 import * as React from "react";
 import type { CiPlanJob } from "@/api/ci";
 import type { Job } from "@/api/types";
+import { labelOf, useLabels } from "@/lib/data";
 import { formatDuration, spanSeconds } from "@/lib/format";
 import { useElementWidth, useNow } from "@/lib/hooks";
 import { StatusDot } from "@/components/ui/status";
@@ -256,6 +257,7 @@ export function JobDag({
   plan?: CiPlanJob[];
   finished?: boolean;
 }) {
+  useLabels();
   const now = useNow();
   const [ref, avail] = useElementWidth<HTMLDivElement>();
   const { nodes, groups, grids, waiting, planned } = React.useMemo(() => {
@@ -363,7 +365,7 @@ export function JobDag({
               · {note.wait}
             </span>
           ) : (
-            job.agent && <span className="min-w-0 truncate">· {job.agent}</span>
+            job.agent && <span className="min-w-0 truncate">· {labelOf(job.agent)}</span>
           )}
           {job.executor && (
             <span className="ml-auto shrink-0 rounded-full border border-white/10 px-1.5 text-[8.5px] tracking-[0.06em] text-[#a9acb5] uppercase">

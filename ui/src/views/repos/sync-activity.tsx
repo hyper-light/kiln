@@ -12,6 +12,7 @@ import { api } from "@/api/client";
 import type { SyncCopy, SyncEvent, SyncFileEvent, SyncRepo, SyncTone, SyncView } from "@/api/types";
 import { SelectField } from "@/components/ui/misc";
 import { StatusDot } from "@/components/ui/status";
+import { byLabel, labelOf, useLabels } from "@/lib/data";
 import { clockTime, formatBytes, formatNumber, relativeTime } from "@/lib/format";
 import { useLocalStorage, useNow } from "@/lib/hooks";
 import { useSearchParams } from "@/lib/router";
@@ -220,7 +221,9 @@ function Opened({ repos, focus }: { repos: SyncRepo[]; focus: string }) {
   const [machine, setMachine] = React.useState("");
   const [show, setShow] = React.useState<Show>("all");
   const [more, setMore] = React.useState(0);
-  const machines = React.useMemo(() => [...new Set(repos.flatMap((r) => r.copies.map((c) => c.machine)))].sort(), [repos]);
+  // Machines by the names they're shown by.
+  const labels = useLabels();
+  const machines = React.useMemo(() => [...new Set(repos.flatMap((r) => r.copies.map((c) => c.machine)))].sort(byLabel(labels)), [repos, labels]);
   const byId = React.useMemo(() => new Map(repos.map((r) => [r.id, r])), [repos]);
   const picked = repo ? repos.filter((r) => r.id === repo) : repos;
   const list = events.filter((e) => byId.has(e.repo) && (!repo || e.repo === repo) && shown(e, show, machine));
@@ -228,15 +231,33 @@ function Opened({ repos, focus }: { repos: SyncRepo[]; focus: string }) {
   return (
     <>
       <div className="sact-tools">
-        <SelectField className="sact-select" label="Repository" hideLabel value={repo} onChange={setRepo} options={[{ value: "", label: "Every synced repo" }, ...repos.map((r) => ({ value: r.id, label: r.name }))]} />
-        <SelectField className="sact-select" label="Machine" hideLabel value={machine} onChange={setMachine} options={[{ value: "", label: "Every machine" }, ...machines.map((m) => ({ value: m, label: m }))]} />
+        <SelectField
+          className="sact-select"
+          label="Repository"
+          hideLabel
+          value={repo}
+          onChange={setRepo}
+          options={[{ value: "", label: "Every synced repo" }, ...repos.map((r) => ({ value: r.id, label: r.name }))]}
+        />
+        <SelectField
+          className="sact-select"
+          label="Machine"
+          hideLabel
+          value={machine}
+          onChange={setMachine}
+          options={[{ value: "", label: "Every machine" }, ...machines.map((m) => ({ value: m, label: labelOf(m, labels) }))]}
+        />
         <SelectField className="sact-select" label="Show" hideLabel value={show} onChange={(v) => setShow(v as Show)} options={SHOWS} />
       </div>
       {picked.map((r) => (
         <RepoCopies key={r.id} repo={r} events={events.filter((e) => e.repo === r.id)} machine={machine} />
       ))}
       <h3 className="field-label sact-feed-title">What happened</h3>
-      {error && <p className="notice" data-tone="fail">Reading what happened failed: {error}</p>}
+      {error && (
+        <p className="notice" data-tone="fail">
+          Reading what happened failed: {error}
+        </p>
+      )}
       {visible.length === 0 ? (
         <p className="sact-empty">{events.length === 0 ? "Nothing yet: every change a copy makes shows here as its machine sends it." : "Nothing matches."}</p>
       ) : (
@@ -282,8 +303,8 @@ function RepoCopies({ repo, events, machine }: { repo: SyncRepo; events: SyncEve
           {s && (
             <>
               {" "}
-              · since kiln started {ago(s.since, now)}: {formatNumber(s.steps)} {s.steps === 1 ? "change" : "changes"} of {formatNumber(s.files)} {s.files === 1 ? "file" : "files"} ({formatBytes(s.bytes)})
-              {s.conflicts > 0 && <span className="sact-warn"> · {s.conflicts} conflicting</span>}
+              · since kiln started {ago(s.since, now)}: {formatNumber(s.steps)} {s.steps === 1 ? "change" : "changes"} of {formatNumber(s.files)} {s.files === 1 ? "file" : "files"} (
+              {formatBytes(s.bytes)}){s.conflicts > 0 && <span className="sact-warn"> · {s.conflicts} conflicting</span>}
               {s.dropped > 0 && <span className="sact-warn"> · {s.dropped} let go</span>}
               {s.retries > 0 && <> · {formatNumber(s.retries)} tried again</>}
               {s.errors > 0 && <span className="sact-fail"> · {s.errors} errors</span>}
@@ -296,7 +317,11 @@ function RepoCopies({ repo, events, machine }: { repo: SyncRepo; events: SyncEve
           ))}
         </span>
       </div>
-      {repo.error && <p className="notice" data-tone="fail">{repo.error}</p>}
+      {repo.error && (
+        <p className="notice" data-tone="fail">
+          {repo.error}
+        </p>
+      )}
       <table className="data-table sact-copies">
         <thead>
           <tr>
@@ -322,13 +347,14 @@ function RepoCopies({ repo, events, machine }: { repo: SyncRepo; events: SyncEve
 }
 
 function CopyRow({ copy: c, now }: { copy: SyncCopy; now: number }) {
+  useLabels();
   const st = c.status;
   const t = st?.traffic;
   const lag = c.lag ?? 0;
   return (
     <tr>
       <td className="sact-copy">
-        <span className="sact-machine">{c.machine}</span>
+        <span className="sact-machine">{labelOf(c.machine)}</span>
         <code className="sact-path" title={c.path}>
           {c.path}
         </code>
@@ -382,7 +408,9 @@ function EventRow({ event: e, repo, named }: { event: SyncEvent; repo: SyncRepo 
         {now - e.at < 3_600_000 ? ago(e.at, now) : clockTime(e.at)}
       </time>
       <div className="sact-what">
-        {e.step ? <StepLine event={e} repo={repo} named={named} /> : (
+        {e.step ? (
+          <StepLine event={e} repo={repo} named={named} />
+        ) : (
           <p className="sact-text">
             <StatusDot status={TONE_DOT[e.tone]} />
             {named && repo && <span className="sact-repo-name">{repo.name}</span>}
@@ -397,6 +425,7 @@ function EventRow({ event: e, repo, named }: { event: SyncEvent; repo: SyncRepo 
 const SIGN: Record<SyncFileEvent["kind"], string> = { added: "+", changed: "~", deleted: "−" };
 
 function StepLine({ event: e, repo, named }: { event: SyncEvent; repo: SyncRepo | undefined; named: boolean }) {
+  useLabels();
   const s = e.step;
   if (!s) return null;
   const n = s.added + s.changed + s.deleted;
@@ -412,23 +441,27 @@ function StepLine({ event: e, repo, named }: { event: SyncEvent; repo: SyncRepo 
     <>
       <p className="sact-step">
         {named && repo && <span className="sact-repo-name">{repo.name}</span>}
-        <span className="sact-machine">{e.machine}</span>
+        <span className="sact-machine">{labelOf(e.machine)}</span>
         <span>
           {n} {n === 1 ? "file" : "files"}
           {counts && <span className="sact-dim"> ({counts})</span>}
           {s.bytes > 0 && <span className="sact-dim"> · {formatBytes(s.bytes)}</span>}
         </span>
-        {s.conflicts > 0 && <span className="sact-warn">{s.conflicts} conflict{s.conflicts === 1 ? "" : "s"}</span>}
-        <span className="sact-delivery" title={inLog !== null ? `In the log ${took(inLog)} after ${e.machine} saw it (commit ${took(s.commit_ms)})` : undefined}>
+        {s.conflicts > 0 && (
+          <span className="sact-warn">
+            {s.conflicts} conflict{s.conflicts === 1 ? "" : "s"}
+          </span>
+        )}
+        <span className="sact-delivery" title={inLog !== null ? `In the log ${took(inLog)} after ${labelOf(e.machine)} saw it (commit ${took(s.commit_ms)})` : undefined}>
           {others.length === 0 ? (
             <span className="sact-dim">no other copy</span>
           ) : (
             others.map((c) => {
               const got = (c.status?.applied ?? 0) >= s.index;
               return (
-                <span key={c.member} className="sact-to" data-got={got || undefined} title={got ? `${c.machine} has it` : `${c.machine}: on its way`}>
+                <span key={c.member} className="sact-to" data-got={got || undefined} title={got ? `${labelOf(c.machine)} has it` : `${labelOf(c.machine)}: on its way`}>
                   <i aria-hidden="true" />
-                  {c.machine}
+                  {labelOf(c.machine)}
                 </span>
               );
             })

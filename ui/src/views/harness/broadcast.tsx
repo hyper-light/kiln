@@ -19,6 +19,7 @@ import { foldChips, sameFold, UNFOLDED, type Fold } from "@/components/ui/facet-
 import { Loadable } from "@/components/ui/loading";
 import { toast } from "@/components/ui/toast";
 import { Tip } from "@/components/ui/tooltip";
+import { labelOf, useLabels } from "@/lib/data";
 import { errorMessage, useMediaQuery } from "@/lib/hooks";
 import { useSuspenseResource } from "@/lib/resource";
 import { cn } from "@/lib/utils";
@@ -28,14 +29,14 @@ import { ComposeField } from "./compose-field";
 import { commandNames } from "./marks";
 import { useAttachments } from "./controls";
 import { agentLabel } from "./derive";
-import { machineName } from "./parts";
+import { machineName, machineShown } from "./parts";
 import { MicButton } from "./voice";
 import { RunSettings } from "./run-settings";
 import { markAnswered, unmark } from "./answered";
 import { Slide } from "./bulk";
 import { throughSubagents } from "./tasks";
 
-const machineLabel = (m: string) => (m === "local" ? "server" : m);
+const machineLabel = (m: string) => (m === "local" ? "server" : labelOf(m));
 /** Enter sends with a keyboard and pointer; on a touch screen it is a new line (as in the composer). */
 const fine = () => window.matchMedia?.("(pointer: fine)").matches;
 const count = (n: number, one: string, many = `${one}s`) => `${n} ${n === 1 ? one : many}`;
@@ -143,7 +144,7 @@ export function findAgents(all: AgentInfo[], q: string, not: ReadonlySet<string>
     if (name.startsWith(w)) return 0;
     if (name.split(/[\s\-_/:]+/).some((p) => p.startsWith(w))) return 1;
     if (name.includes(w)) return 2;
-    if ([machineName(a.target), a.kind_name, a.goal ?? "", a.cwd].some((x) => x.toLowerCase().includes(w))) return 4;
+    if ([machineShown(a.target), machineName(a.target), a.kind_name, a.goal ?? "", a.cwd].some((x) => x.toLowerCase().includes(w))) return 4;
     return -1;
   };
   return all
@@ -214,6 +215,7 @@ function Bar({
   autoFocus,
   under,
 }: BarProps & { preview: BroadcastPreview | null; previewing?: boolean }) {
+  useLabels();
   const [tune, setTune] = React.useState<Tune>(ANY);
   // Who gets what's sent from here: those the selectors leave (all of them while each is Any).
   const agents = tuned(everyone, tune, preview);
@@ -601,7 +603,7 @@ function Bar({
                       <span className="pl-note">{doingOf(a)}</span>
                     </span>
                     <span className="pl-desc">
-                      {machineName(a.target)} · {a.kind_name}
+                      {machineShown(a.target)} · {a.kind_name}
                     </span>
                   </button>
                 </li>

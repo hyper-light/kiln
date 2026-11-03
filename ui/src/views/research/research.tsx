@@ -13,6 +13,7 @@
 import * as React from "react";
 import { ChevronRight } from "lucide-react";
 import { Fold } from "@/views/harness/fold";
+import { labelOf, useLabels } from "@/lib/data";
 import { useParams, Link } from "@/lib/router";
 import { ApiError } from "@/api/client";
 import { planHref } from "@/api/plans";
@@ -184,6 +185,8 @@ export function ResearchView({ r, live }: { r: Research; live?: boolean }) {
 
 /** What research found: each finding with its grade and quotes, what had no sources, the sources. */
 function ResearchBody({ r }: { r: Research }) {
+  // Where a source was found, by the name people see (docs/machines.md).
+  useLabels();
   const s = r.summary;
   return (
     <>
@@ -221,7 +224,7 @@ function ResearchBody({ r }: { r: Research }) {
                   {src.title !== src.locator && <span className="rs-title">{src.title}</span>} <Locator s={src} />
                   {src.published && <span className="rs-dim"> · {src.published}</span>}
                   {src.dated && <span className="rs-bad"> · out of date</span>}
-                  {src.machine && <span className="rs-dim"> · on {src.machine}</span>}
+                  {src.machine && <span className="rs-dim"> · on {labelOf(src.machine)}</span>}
                 </span>
               </li>
             ))}

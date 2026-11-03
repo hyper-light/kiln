@@ -39,6 +39,9 @@ pub struct Machine {
     pub name: String,
     pub connected: bool,
     pub version: String,
+    /// The name people see, for one kiln knows by its machine id (its `name`, docs/machines.md):
+    /// what the board's notes call it.
+    pub label: Option<String>,
 }
 
 /// A store whose feed the server's store has taken, as it keeps it (`peers`): its name
@@ -65,6 +68,13 @@ pub struct Seen {
     pub peers: Vec<PeerRow>,
     /// Where restoring its store from a mirror's copy stands (`Registry::restore_view`).
     pub restore: serde_json::Value,
+}
+
+impl Seen {
+    /// The name people see of `machine`: its label, else its name.
+    fn shown<'a>(&'a self, machine: &'a str) -> &'a str {
+        self.machines.iter().find(|m| m.name == machine).and_then(|m| m.label.as_deref()).unwrap_or(machine)
+    }
 }
 
 /// One store, as the board shows it.
@@ -423,16 +433,16 @@ impl Board {
             Some((before, restore)) => {
                 for s in &stores {
                     if let Some(now_b) = briefs.get(&s.key) {
-                        notes_of(s, before.get(&s.key), now_b, seen.now, &mut new);
+                        notes_of(s, before.get(&s.key), now_b, seen.now, seen.shown(&s.machine), &mut new);
                     }
                 }
                 for (key, b) in before {
                     if !briefs.contains_key(key) && key.starts_with(MIRROR) && b.state != "no_store" {
-                        new.push(Note { at: seen.now, key: key.clone(), level: "info", text: format!("{} no longer keeps a copy of the server's store", key.strip_prefix(MIRROR).unwrap_or(key)) });
+                        new.push(Note { at: seen.now, key: key.clone(), level: "info", text: format!("{} no longer keeps a copy of the server's store", seen.shown(key.strip_prefix(MIRROR).unwrap_or(key))) });
                     }
                 }
                 if *restore != seen.restore {
-                    new.push(restore_note(&seen.restore, seen.now));
+                    new.push(restore_note(seen));
                 }
             }
         }
@@ -482,14 +492,14 @@ impl Board {
         for v in &seen.intake {
             let key = peer_name(&v.machine, &v.store);
             let Some(m) = moved(&mut counts, &key, (v.batches, v.rows, v.bytes)) else { continue };
-            let (kind, from) = if v.copy { ("restore", format!("{}'s copy", v.machine)) } else { ("batch", v.machine.clone()) };
+            let (kind, from) = if v.copy { ("restore", format!("{}'s copy", seen.shown(&v.machine))) } else { ("batch", seen.shown(&v.machine).to_owned()) };
             out.push(LogLine { at: seen.now, key, kind, level: "info", text: format!("{from} → server: {} · through {}", said(m), v.rev), moved: Some(Moved { rev: Some(v.rev), ..m }) });
         }
         for (mirror, ship) in &seen.mirrors {
             let key = format!("{MIRROR}{}", mirror.machine);
             let Some(m) = moved(&mut counts, &key, (ship.batches, ship.rows, ship.bytes)) else { continue };
             let acked = ship.acked.map_or_else(|| "not acknowledged yet".to_owned(), |a| format!("acknowledged through {a}"));
-            out.push(LogLine { at: seen.now, key, kind: "ship", level: "info", text: format!("server → {}: {} · {acked}", mirror.machine, said(m)), moved: Some(Moved { rev: ship.acked, ..m }) });
+            out.push(LogLine { at: seen.now, key, kind: "ship", level: "info", text: format!("server → {}: {} · {acked}", seen.shown(&mirror.machine), said(m)), moved: Some(Moved { rev: ship.acked, ..m }) });
         }
         out
     }
@@ -729,11 +739,12 @@ fn brief(s: &StoreStatus, was: Option<&Brief>) -> Brief {
 }
 
 /// How a store is named in a note.
-fn named(s: &StoreStatus) -> String {
+/// What notes call store `s`, its machine by `shown`, the name people see.
+fn named(s: &StoreStatus, shown: &str) -> String {
     match s.role {
         "server" => "the server's store".to_owned(),
-        "mirror" => format!("{}'s copy", s.machine),
-        _ => format!("{}'s store", s.machine),
+        "mirror" => format!("{shown}'s copy"),
+        _ => format!("{shown}'s store"),
     }
 }
 
@@ -768,20 +779,21 @@ fn size(bytes: u64) -> String {
     }
 }
 
-/// What changed of store `s` since the last sample (`was`; None: it wasn't on the board then).
-fn notes_of(s: &StoreStatus, was: Option<&Brief>, now_b: &Brief, at: i64, out: &mut Vec<Note>) {
+/// What changed of store `s` since the last sample (`was`; None: it wasn't on the board then), its
+/// machine by `shown`, the name people see.
+fn notes_of(s: &StoreStatus, was: Option<&Brief>, now_b: &Brief, at: i64, shown: &str, out: &mut Vec<Note>) {
     let mut note = |level: &'static str, text: String| out.push(Note { at, key: s.key.clone(), level, text });
-    let name = named(s);
+    let name = named(s, shown);
     let Some(was) = was else {
         match s.role {
-            "mirror" => note("info", format!("{} keeps a copy of the server's store", s.machine)),
+            "mirror" => note("info", format!("{shown} keeps a copy of the server's store")),
             "runner" if s.id.is_some() => note("info", format!("{name} reached the server")),
             _ => {}
         }
         return;
     };
     if was.connected != now_b.connected && s.id.is_some() {
-        if now_b.connected { note("info", format!("{} is back", s.machine)) } else { note("warn", format!("{name} is offline")) }
+        if now_b.connected { note("info", format!("{shown} is back")) } else { note("warn", format!("{name} is offline")) }
     }
     if now_b.connected && was.connected {
         let behind = now_b.behind.unwrap_or(0);
@@ -826,13 +838,17 @@ fn notes_of(s: &StoreStatus, was: Option<&Brief>, now_b: &Brief, at: i64, out: &
     }
 }
 
-fn restore_note(restore: &serde_json::Value, at: i64) -> Note {
+/// What the board notes of where restoring the server's store stands, the mirror by the name people
+/// see.
+fn restore_note(seen: &Seen) -> Note {
+    let (restore, at) = (&seen.restore, seen.now);
     let s = |k: &str| restore.get(k).and_then(serde_json::Value::as_str).unwrap_or_default().to_owned();
+    let from = seen.shown(&s("from")).to_owned();
     let (level, text) = match s("state").as_str() {
-        "asked" => ("info", format!("asked {} for its copy, to restore the server's store from", s("from"))),
-        "copying" => ("info", format!("restoring the server's store from {}'s copy", s("from"))),
-        "done" => ("info", format!("the server's store was restored from {}'s copy: {} sessions came back", s("from"), restore.get("sessions").and_then(serde_json::Value::as_u64).unwrap_or(0))),
-        "failed" => ("error", format!("restoring the server's store from {}'s copy failed: {}", s("from"), s("error"))),
+        "asked" => ("info", format!("asked {from} for its copy, to restore the server's store from")),
+        "copying" => ("info", format!("restoring the server's store from {from}'s copy")),
+        "done" => ("info", format!("the server's store was restored from {from}'s copy: {} sessions came back", restore.get("sessions").and_then(serde_json::Value::as_u64).unwrap_or(0))),
+        "failed" => ("error", format!("restoring the server's store from {from}'s copy failed: {}", s("error"))),
         _ => ("info", "no restore under way".to_owned()),
     };
     Note { at, key: SERVER.into(), level, text }
@@ -852,7 +868,7 @@ mod tests {
             now,
             server: Some(report("srv", 500)),
             version: "test".into(),
-            machines: vec![Machine { name: "fedora".into(), connected: true, version: "test".into() }, Machine { name: "jupiter".into(), connected: false, version: "old".into() }],
+            machines: vec![Machine { name: "fedora".into(), connected: true, version: "test".into(), label: None }, Machine { name: "jupiter".into(), connected: false, version: "old".into(), label: None }],
             peers: vec![PeerRow { name: "fedora/abc".into(), rev: 90, at: 1 }],
             restore: serde_json::json!({ "state": "idle" }),
             ..Seen::default()

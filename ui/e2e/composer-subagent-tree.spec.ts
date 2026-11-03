@@ -10,7 +10,7 @@ import { expect, test, type Page } from "@playwright/test";
 /** Against a real kiln server (playwright.config.ts): these drive the mock's agents. */
 const REAL = !!process.env.E2E_BASE_URL;
 
-const ORDER = ["Leader election over QUIC", "Check vote timeouts", "Measure election time", "Follower catch-up", "Snapshot transfer", "Verify the checksum", "Re-read the manifest", "Rotate the signing key"];
+const ORDER = ["Leader election over QUIC", "Check vote timeouts", "Measure election time", "Follower catch-up", "Snapshot transfer", "Verify the checksum", "Re-read the manifest", "Docs pass", "Rotate the signing key", "Port the lexer", "Bench the follower"];
 
 /** The commands the page sends `agent`'s session over its socket. */
 function sentOnSocket(page: Page, agent: string): Record<string, unknown>[] {
@@ -51,7 +51,7 @@ test.afterAll(async ({ request }) => {
   if (!REAL) await request.post("/api/mock/asks");
 });
 
-test("the line opens to its subagents' tree, a pick box each, every live one picked at once where its mark was", async ({ page }) => {
+test("the line opens to its subagents' tree, a pick box each, every one picked at once where its mark was", async ({ page }) => {
   await page.goto("/agents/tree-lead");
   await putAwayCards(page);
   const line = page.locator(".al");
@@ -61,9 +61,9 @@ test("the line opens to its subagents' tree, a pick box each, every live one pic
   await expect(rows.locator(".dn-name")).toHaveText(ORDER);
   const all = page.getByRole("checkbox", { name: "Pick every subagent" });
   await all.check();
-  // Every one that takes a message, not the one that's done.
-  await expect(line.locator(".dn[data-picked]")).toHaveCount(7);
-  await expect(page.getByRole("checkbox", { name: "Pick Measure election time" })).toBeDisabled();
+  // Every one: those that take a message, and those that ended (picked to be removed).
+  await expect(line.locator(".dn[data-picked]")).toHaveCount(ORDER.length);
+  await expect(page.getByRole("checkbox", { name: "Pick Measure election time" })).toBeChecked();
   await all.uncheck();
   await expect(line.locator(".dn[data-picked]")).toHaveCount(0);
 });

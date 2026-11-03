@@ -755,11 +755,11 @@ pub async fn ways(hub: &Hub, r: &RunnerInfo, t: &Target) -> Vec<crate::updates::
         ),
     };
     let build = match build_plan(hub, r, target, &t.commit) {
-        Ok(BuildPlan::Join { on, .. }) => way(Way::Build, true, format!("{on} is building {s} for {target} now: it downloads that build"), Some(on)),
+        Ok(BuildPlan::Join { on, .. }) => way(Way::Build, true, format!("{} is building {s} for {target} now: it downloads that build", hub.shown(&on)), Some(on)),
         Ok(BuildPlan::Build(b)) if b.itself => way(Way::Build, true, format!("builds {s} on the machine, from the server's source"), None),
         Ok(BuildPlan::Build(b)) => {
             let how = if b.cross { "cross-builds" } else { "builds" };
-            way(Way::Build, true, format!("{} {how} {s} for {target} from the server's source, and it downloads that build", b.machine), Some(b.machine))
+            way(Way::Build, true, format!("{} {how} {s} for {target} from the server's source, and it downloads that build", hub.shown(&b.machine)), Some(b.machine))
         }
         Err(why) => way(Way::Build, false, why, None),
     };
@@ -773,7 +773,7 @@ pub fn plan_by(hub: &Hub, r: &RunnerInfo, t: &Target, way: crate::updates::Way) 
         crate::updates::Way::Download => {
             Plan::Download(binary_for(hub, target, &t.commit).ok_or_else(|| anyhow::anyhow!("no binary of {} for {target} yet", short(&t.commit)))?)
         }
-        crate::updates::Way::Build => build_plan(hub, r, target, &t.commit).map_err(|why| anyhow::anyhow!("kiln can't be built for {} now: {why}", r.name))?.into(),
+        crate::updates::Way::Build => build_plan(hub, r, target, &t.commit).map_err(|why| anyhow::anyhow!("kiln can't be built for {} now: {why}", hub.shown(&r.name)))?.into(),
     })
 }
 
@@ -792,7 +792,7 @@ pub async fn next(hub: &Hub, r: &RunnerInfo, t: &Target, standing: Standing) -> 
         return Some((
             "upgrading",
             match (j.method, j.on) {
-                ("build", Some(on)) => format!("is upgrading to {s}, built by {on}"),
+                ("build", Some(on)) => format!("is upgrading to {s}, built by {}", hub.shown(&on)),
                 ("build", None) => format!("is building {s} itself"),
                 _ => format!("is upgrading to {s}"),
             },
@@ -813,9 +813,9 @@ pub async fn next(hub: &Hub, r: &RunnerInfo, t: &Target, standing: Standing) -> 
     Some(match plan(hub, r, t).await {
         Plan::Download(b) => ("download", format!("downloads build {} ({s}){when}", b.build)),
         Plan::Build(b) if b.itself => ("build", format!("builds {s} itself{when}")),
-        Plan::Build(b) => ("build", format!("gets {s} {} by {}{when}", if b.cross { "cross-built" } else { "built" }, b.machine)),
-        Plan::Join { on, .. } if auto => ("wait", format!("waits for the build of {s} {on} is making, then downloads it")),
-        Plan::Join { on, .. } => ("build", format!("gets the build of {s} {on} is making{when}")),
+        Plan::Build(b) => ("build", format!("gets {s} {} by {}{when}", if b.cross { "cross-built" } else { "built" }, hub.shown(&b.machine))),
+        Plan::Join { on, .. } if auto => ("wait", format!("waits for the build of {s} {} is making, then downloads it", hub.shown(&on))),
+        Plan::Join { on, .. } => ("build", format!("gets the build of {s} {} is making{when}", hub.shown(&on))),
         Plan::Wait(why) => ("wait", why),
     })
 }
@@ -1145,14 +1145,14 @@ pub async fn build(hub: &Arc<Hub>, r: &RunnerInfo, commit: &str, b: &Builder, by
     hub.updates.fleet.building.lock().insert(id.clone(), Building { machine: b.machine.clone(), target: target.clone(), commit: commit.to_owned(), keep });
     if b.itself {
         hub.store.audit(by.into(), "upgrade.runner".into(), format!("{} builds {s} itself ({target})", r.name)).await;
-        hub.updates.say(hub, &id, format!("{} builds kiln {s} itself: no binary of it for {target} yet; nothing it runs is stopped", r.name));
+        hub.updates.say(hub, &id, format!("{} builds kiln {s} itself: no binary of it for {target} yet; nothing it runs is stopped", hub.shown(&r.name)));
     } else {
         let how = if b.cross { "cross-builds" } else { "builds" };
         hub.store.audit(by.into(), "upgrade.runner".into(), format!("{} {how} {s} for {} ({target})", b.machine, r.name)).await;
         hub.updates.say(
             hub,
             &id,
-            format!("{} {how} kiln {s} for {target}: no binary of it yet, and {} can't build it itself ({}). It downloads the build once it's back here; nothing either machine runs is stopped", b.machine, r.name, b.why),
+            format!("{} {how} kiln {s} for {target}: no binary of it yet, and {} can't build it itself ({}). It downloads the build once it's back here; nothing either machine runs is stopped", hub.shown(&b.machine), hub.shown(&r.name), b.why),
         );
     }
     let inst8 = crate::updates::instance8(r);
@@ -1174,7 +1174,7 @@ pub async fn join(hub: &Arc<Hub>, r: &RunnerInfo, commit: &str, building: &str, 
     let id = job.id.clone();
     hub.updates.insert(job.clone());
     hub.store.audit(by.into(), "upgrade.runner".into(), format!("{} gets the build of {s} {on} is making ({target})", r.name)).await;
-    hub.updates.say(hub, &id, format!("{on} is building kiln {s} for {target} already: {} downloads that build once it's back here; nothing it runs is stopped", r.name));
+    hub.updates.say(hub, &id, format!("{} is building kiln {s} for {target} already: {} downloads that build once it's back here; nothing it runs is stopped", hub.shown(on), hub.shown(&r.name)));
     let (h, machine, commit, building) = (Arc::clone(hub), r.name.clone(), commit.to_owned(), building.to_owned());
     crate::rt::spawn(async move { await_build(&h, &id, &machine, &target, &commit, &building).await });
     Ok(job)
@@ -1277,7 +1277,7 @@ async fn run_build(hub: &Arc<Hub>, id: &str, machine: &str, script: &str, then: 
                 feed("\n");
                 break match (code, error) {
                     (Some(0), _) => Ok(()),
-                    (_, Some(e)) if e == "__reconnect__" => Err(format!("{machine} disconnected during the build")),
+                    (_, Some(e)) if e == "__reconnect__" => Err(format!("{} disconnected during the build", hub.shown(machine))),
                     (_, Some(e)) => Err(e),
                     (c, None) => Err(format!("the build exited with {}", c.map_or_else(|| "a signal".to_owned(), |c| c.to_string()))),
                 };
@@ -1311,7 +1311,7 @@ async fn run_build(hub: &Arc<Hub>, id: &str, machine: &str, script: &str, then: 
         let built = hub.updates.fleet.building.lock().remove(id);
         match built.and_then(|b| binary_for(hub, &b.target, &b.commit)) {
             Some(bin) => crate::updates::upgrade_into(hub, id, runner, &bin).await,
-            None => u.finish(hub, id, Err(format!("{machine} built it, but its binary didn't reach this server"))),
+            None => u.finish(hub, id, Err(format!("{} built it, but its binary didn't reach this server", hub.shown(machine)))),
         }
         return;
     }
@@ -1434,6 +1434,7 @@ mod tests {
 
     fn live(name: &str, os: &str, arch: &str, tools: &[&str]) -> crate::hub::AgentLive {
         crate::hub::AgentLive {
+            label: None,
             name: name.into(),
             peer: None,
             labels: Vec::new(),

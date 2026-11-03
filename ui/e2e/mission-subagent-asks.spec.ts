@@ -1,44 +1,14 @@
 /**
  * A subagent's request, answered from its agent's row in Mission control, goes to that subagent,
  * in the production build against the mock (mock/agents.ts, the ask-* agents): Allow goes to it
- * there; Answer and Review open its thread in its agent's chat, its request waiting at the end,
- * and what's answered there goes to it. So does its card on any other page, and its own address
+ * there, and Answer opens its question under the row, answered there to it; Review opens its thread
+ * in its agent's chat, its request waiting at the end, and what's answered there goes to it. So does its card on any other page, and its own address
  * (a notification's link): each lands on its thread.
  */
-import { expect, test, type Page } from "@playwright/test";
+import { expect, test } from "@playwright/test";
 
 /** Against a real kiln server (playwright.config.ts): these drive the mock's agents. */
 const REAL = !!process.env.E2E_BASE_URL;
-
-/** The commands the page sends `agent`'s session over its socket, as it sends them. */
-function sentOnSocket(page: Page, agent: string): Record<string, unknown>[] {
-  const sent: Record<string, unknown>[] = [];
-  page.on("websocket", (ws) => {
-    if (!ws.url().includes(`/api/harness/sessions/${agent}/`)) return;
-    ws.on("framesent", (f) => {
-      try {
-        const v = JSON.parse(String(f.payload)) as { c?: Record<string, unknown> } & Record<string, unknown>;
-        sent.push(v.c ?? v);
-      } catch {
-        // Not a command.
-      }
-    });
-  });
-  return sent;
-}
-
-/** The shell's cards for what other agents wait on put away, as a person would: on a phone they sit over the conversation's end. */
-async function putAwayCards(page: Page) {
-  const away = page.getByRole("list", { name: "Waiting on you" }).getByRole("button", { name: /^Put away/ });
-  await away
-    .first()
-    .waitFor({ timeout: 3000 })
-    .catch(() => undefined);
-  await expect(async () => {
-    if ((await away.count()) > 0) await away.first().click({ timeout: 1000 });
-    await expect(away).toHaveCount(0, { timeout: 500 });
-  }).toPass({ timeout: 10_000 });
-}
 
 test.beforeEach(async ({ page }) => {
   test.skip(REAL, "the mock's agents");
@@ -46,19 +16,18 @@ test.beforeEach(async ({ page }) => {
   await page.request.post("/api/mock/asks");
 });
 
-test("Answer on a subagent's question opens that subagent's thread, and the answer goes to it", async ({ page }) => {
-  const sent = sentOnSocket(page, "ask-s2");
+test("Answer on a subagent's question opens it under its row, and the answer goes to that subagent", async ({ page }) => {
   await page.goto("/agents");
   const row = page.locator('.ms-row[data-agent="ask-lead"]');
   await expect(row.locator(".ms-text")).toHaveText("Its subagent “Step 2: Exec through a seed”: Asks: Which goes first, observe's gate or mine?");
-  await row.getByRole("link", { name: "Answer" }).click();
-  // Its thread, in its agent's chat, its question at the end.
-  await expect(page).toHaveURL(/\/agents\/ask-lead\?task=ask-s2$/);
-  await expect(page.locator(".hx-crumbs")).toContainText("Step 2: Exec through a seed");
-  await putAwayCards(page);
-  await page.getByRole("radio", { name: "Observe's first" }).click();
-  await page.getByRole("button", { name: "Submit" }).click();
-  await expect.poll(() => sent).toContainEqual(expect.objectContaining({ type: "approve", id: "ask-s2-q1", decision: "allow" }));
+  const sent = page.waitForRequest((r) => r.method() === "POST" && new URL(r.url()).pathname === "/api/harness/sessions/ask-s2/command");
+  await row.getByRole("button", { name: "Answer" }).click();
+  // Right under its row: Mission control stays where it is.
+  await expect(page).toHaveURL(/\/agents$/);
+  await row.getByRole("radio", { name: "Observe's first" }).click();
+  await row.getByRole("button", { name: "Submit" }).click();
+  expect((await sent).postDataJSON()).toMatchObject({ type: "approve", id: "ask-s2-q1", decision: "allow" });
+  await expect(row).not.toHaveAttribute("data-stand", "needs");
 });
 
 test("Allow on a subagent's request goes to that subagent, and Review opens its thread", async ({ page }) => {

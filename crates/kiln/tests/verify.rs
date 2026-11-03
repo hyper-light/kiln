@@ -248,7 +248,7 @@ fn w27_ac07_a_deploy_verifies_end_to_end() -> anyhow::Result<()> {
     let count = |f: &dyn Fn(&str) -> bool| l.iter().filter(|x| f(x)).count();
     assert!(l.first().is_some_and(|x| x.starts_with("deploy prod/app@1.0.0")), "{l:#?}");
     assert!(l.iter().any(|x| x.starts_with(&format!("artifact app sha256:{}", shop.digest.trim_start_matches("sha256:").get(..12).unwrap_or_default()))), "{l:#?}");
-    assert!(l.iter().any(|x| x.starts_with("build leg 'image' of run") && x.ends_with("on fedora-2")), "{l:#?}");
+    assert!(l.iter().any(|x| x.starts_with("build leg 'image' of run") && x.ends_with(&format!("on {}", common::machine("fedora-2")))), "{l:#?}");
     assert!(l.iter().any(|x| x.starts_with(&format!("{} on main", shop.tip.get(..7).unwrap_or_default()))), "main's head first: {l:#?}");
     assert_eq!(count(&|x| x.contains(" on main, ")), 10, "each commit on main, signed: {l:#?}");
     assert_eq!(count(&|x| x.contains(" landed on main by its queue")), 10, "{l:#?}");

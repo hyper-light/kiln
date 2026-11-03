@@ -6,6 +6,7 @@
  * come waits at its start; a cable whose store is away is faint. Pure: what to draw, not how.
  */
 import type { ConvoStatus, ConvoStore } from "@/api/types";
+import { labelOf } from "@/lib/data";
 import { agoText, countText, moving, plateName, sizeText, storesOf } from "./scene";
 
 export type P = [number, number];
@@ -193,10 +194,10 @@ export function replicationScene(status: ConvoStatus, portrait: boolean): Replic
         key: s.key,
         plate,
         big: false,
-        name: { text: s.machine, at: [30, ys[i]! - 2] as P, anchor: "start" as const },
+        name: { text: labelOf(s.machine), at: [30, ys[i]! - 2] as P, anchor: "start" as const },
         sub: { text: sub.text, at: [30, ys[i]! + 16] as P, anchor: "start" as const, tone: sub.tone },
         hit: { x: 22, y: ys[i]! - 25, w: 262, h: 54 },
-        title: `${s.machine}: its store, ${sub.text.toLowerCase()}`,
+        title: `${labelOf(s.machine)}: its store, ${sub.text.toLowerCase()}`,
         cable: curve(port(plate, "right"), port(sp, "left", level(i)), 76, 66, behind, paceOf(s, now), tone),
       };
     });
@@ -228,10 +229,10 @@ export function replicationScene(status: ConvoStatus, portrait: boolean): Replic
               key: mirror.key,
               plate: mp,
               big: true,
-              name: { text: mirror.machine, at: [mp.x, mp.y + 91] as P, anchor: "middle" as const },
+              name: { text: labelOf(mirror.machine), at: [mp.x, mp.y + 91] as P, anchor: "middle" as const },
               sub: { text: sub.text, at: [mp.x, mp.y + 113] as P, anchor: "middle" as const, tone: sub.tone },
               hit: { x: mp.x - 93, y: mp.y - 71, w: 186, h: 201 },
-              title: `The mirror's copy on ${mirror.machine}: ${sub.text}`,
+              title: `The mirror's copy on ${labelOf(mirror.machine)}: ${sub.text}`,
               cable: curve(
                 port(sp, "right"),
                 port(mp, "left"),
@@ -265,7 +266,7 @@ export function replicationScene(status: ConvoStatus, portrait: boolean): Replic
       name: { text: plateName(s.machine, 14), at: [20, ys[i]! - 2] as P, anchor: "start" as const },
       sub: { text: short(sub.text), at: [20, ys[i]! + 16] as P, anchor: "start" as const, tone: sub.tone },
       hit: { x: 13, y: ys[i]! - 25, w: 160, h: 54 },
-      title: `${s.machine}: its store, ${sub.text.toLowerCase()}`,
+      title: `${labelOf(s.machine)}: its store, ${sub.text.toLowerCase()}`,
       cable: curve(port(plate, "right"), port(sp, "left", level(i)), 28, 32, behind, paceOf(s, now), tone),
     };
   });
@@ -285,7 +286,7 @@ export function replicationScene(status: ConvoStatus, portrait: boolean): Replic
       name: { text: plateName(mirror.machine, 24), at: [20, mp.y + 8], anchor: "start" },
       sub: { text: sub.text, at: [20, mp.y + 29], anchor: "start", tone: sub.tone },
       hit: { x: 13, y: mp.y - 30, w: 300, h: 77 },
-      title: `The mirror's copy on ${mirror.machine}: ${sub.text}`,
+      title: `The mirror's copy on ${labelOf(mirror.machine)}: ${sub.text}`,
       cable: {
         d: `M${at(a)} C${f(x - 4)} ${f(a[1])} ${f(x)} ${f(a[1] + 14)} ${f(x)} ${f(a[1] + 39)} L${f(x)} ${f(b[1] - 49)} C${f(x)} ${f(b[1] - 16)} ${f(x - 19)} ${f(b[1])} ${at(b)}`,
         arrow: chevron({ p: [x, midY], d: [0, 1] }),
@@ -324,11 +325,11 @@ export function healthOf(status: ConvoStatus): { text: string; tone: Tone } {
   const stalled = stores.find((s) => s.connected && s.state === "behind");
   const catching = stores.find((s) => s.connected && s.state === "catching_up" && (s.feed?.behind ?? 0) > 0);
   const mirror = mirrors[0];
-  if (stalled) return { text: `${stalled.machine} is stalled`, tone: "warn" };
-  if (catching) return { text: `${catching.machine} is catching up`, tone: "warn" };
+  if (stalled) return { text: `${labelOf(stalled.machine)} is stalled`, tone: "warn" };
+  if (catching) return { text: `${labelOf(catching.machine)} is catching up`, tone: "warn" };
   if (mirror && (!mirror.connected || (mirror.mirror?.behind ?? 0) > 0)) return { text: mirror.connected ? "The mirror is catching up" : "The mirror is offline", tone: "warn" };
   if (!mirror && status.mirrors_wanted > 0) return { text: "No mirror yet", tone: "warn" };
-  if (off) return { text: `${off.machine} is offline`, tone: "off" };
+  if (off) return { text: `${labelOf(off.machine)} is offline`, tone: "off" };
   return { text: "All stores current", tone: "ok" };
 }
 

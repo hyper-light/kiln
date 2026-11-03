@@ -16,7 +16,7 @@ use std::net::TcpStream;
 use std::time::{Duration, Instant};
 
 use common::agents::{self, Talk};
-use common::{Options, Server, http, start};
+use common::{Options, Server, http, machine, start};
 use serde_json::{Value, json};
 
 /// One request, as the person whose session cookie is `cookie` (none: nobody): the status and the
@@ -70,7 +70,7 @@ fn person(s: &Server, name: &'static str, grants: &[&str]) -> anyhow::Result<Per
 /// Opens a stand-in Claude Code session on runner `box` as `p`: its id. Tries again while the
 /// runner hasn't said what it offers yet.
 fn open(s: &Server, p: &Person, cwd: &std::path::Path) -> anyhow::Result<String> {
-    let ask = json!({"target": "agent:box", "spec": {"kind": "claude", "cwd": cwd.display().to_string(), "prompt": "stream"}});
+    let ask = json!({"target": format!("agent:{}", machine("box")), "spec": {"kind": "claude", "cwd": cwd.display().to_string(), "prompt": "stream"}});
     let deadline = Instant::now() + Duration::from_secs(90);
     loop {
         let (st, body) = p.call(s, "POST", "/api/harness/sessions", Some(&ask))?;
@@ -142,8 +142,9 @@ fn a_person_reaches_the_agents_they_opened() -> anyhow::Result<()> {
     agents::connected(s.port, &s.admin, "box", &log, Duration::from_secs(120))?;
     let work = dir.path().join("work");
     std::fs::create_dir_all(&work)?;
-    let dev1 = person(&s, "dev1", &["developer", "runners.terminal@runner:box"])?;
-    let dev2 = person(&s, "dev2", &["developer", "runners.terminal@runner:box"])?;
+    let on_box = format!("runners.terminal@runner:{}", machine("box"));
+    let dev1 = person(&s, "dev1", &["developer", on_box.as_str()])?;
+    let dev2 = person(&s, "dev2", &["developer", on_box.as_str()])?;
     let mia = person(&s, "mia", &["maintainer"])?;
     let mine = open(&s, &dev1, &work)?;
     let theirs = open(&s, &dev2, &work)?;
@@ -224,26 +225,27 @@ fn opening_and_reading_a_machines_agents_need_its_terminal() -> anyhow::Result<(
 
     // Without runners.terminal there: no agent opened, none of what it keeps read, none of what
     // runs on it listed.
-    let ask = json!({"target": "agent:box", "spec": {"kind": "claude", "cwd": work.display().to_string(), "prompt": "stream"}});
+    let on_box = format!("agent:{}", machine("box"));
+    let ask = json!({"target": on_box, "spec": {"kind": "claude", "cwd": work.display().to_string(), "prompt": "stream"}});
     let (st, said) = dan.call(&s, "POST", "/api/harness/sessions", Some(&ask))?;
     assert!(st == 403 && said.contains("runners.terminal"), "dan opens an agent on box: {st} {said}");
-    for target in ["agent:box", "local"] {
+    for target in [on_box.as_str(), "local"] {
         let (st, said) = dan.call(&s, "GET", &format!("/api/harness/history?target={target}"), None)?;
         assert!(st == 403 && said.contains("runners.terminal"), "dan reads {target}'s history: {st} {said}");
     }
     let (st, found) = dan.call(&s, "GET", "/api/ai-sessions", None)?;
     let found: Value = serde_json::from_str(&found).unwrap_or_default();
-    assert!(st == 200 && !found.as_array().into_iter().flatten().any(|f| f.get("machine") == Some(&json!("box"))), "dan's found sessions: {found}");
+    assert!(st == 200 && !found.as_array().into_iter().flatten().any(|f| f.get("machine") == Some(&json!(machine("box")))), "dan's found sessions: {found}");
 
     // With it, granted on box (and on the server, for its own): each works.
-    for grant in ["runners.terminal@runner:box", "runners.terminal"] {
+    for grant in [format!("runners.terminal@runner:{}", machine("box")), "runners.terminal".to_owned()] {
         let (st, body) = http(s.port, "POST", "/api/grants", &s.admin, Some(&json!({ "user": "dan", "grant": grant })))?;
         anyhow::ensure!((200..300).contains(&st), "granting {grant}: {st} {body}");
     }
     let id = open(&s, &dan, &work)?;
     let (st, said) = dan.call(&s, "GET", &format!("/api/harness/sessions/{id}"), None)?;
     assert_eq!(st, 200, "dan reads the agent he opened: {said}");
-    for target in ["agent:box", "local"] {
+    for target in [on_box.as_str(), "local"] {
         let (st, said) = dan.call(&s, "GET", &format!("/api/harness/history?target={target}"), None)?;
         assert!(st != 403, "dan reads {target}'s history: {st} {said}");
     }

@@ -1204,12 +1204,8 @@ mod tests {
         core.state.queue.iter().map(|q| q.id.as_str()).collect()
     }
 
-    /// The "Tabs UI" agent's first message (2026-10-31), sent as Codex started: Codex's adapter held
-    /// it for the thread to open, shown queued by the agent. The switch to Claude Code went at once
-    /// (nothing was under way) and ended Codex's process, its adapter with it: the message was
-    /// never sent anywhere, and said queued for good. Now a harness's process ending lets go of what
-    /// its adapter held: first in kiln's queue, still shown queued where it was said, the harness
-    /// after it takes it once it's up, and the rest after it in order (CP-T3.2).
+    /// CP-T3.2: a switch out of Codex before its thread opens leaves its messages in kiln's
+    /// durable queue, in order. Claude Code takes them once ready, each shown sent only then.
     #[test]
     fn a_message_held_for_a_harness_that_ends_goes_to_the_one_after_it() {
         use super::super::model::{Delivery, Status};
@@ -1218,13 +1214,13 @@ mod tests {
         codex.start(&mut core);
         codex.command(&mut core, message("m1", "Plans and Research, one tab each"));
         codex.command(&mut core, message("m2", "Research searchable, its results as cards"));
-        assert_eq!([core.state.delivery.get("m1"), core.state.delivery.get("m2")], [Some(&Delivery::Queued); 2]);
-        let said = core.get("m1").map(|e| e.seq);
-        assert!(said.is_some() && core.state.queue.is_empty(), "held by Codex's adapter, shown");
+        assert_eq!(queue(&core), ["m1", "m2"]);
+        assert_eq!([core.state.delivery.get("m1"), core.state.delivery.get("m2")], [None; 2]);
+        assert!(core.get("m1").is_none() && core.get("m2").is_none(), "unsent messages stay in the durable queue");
         // The switch: Codex's process ends.
         codex.exited(&mut core, None, None);
         assert_eq!(queue(&core), ["m1", "m2"]);
-        assert_eq!([core.state.delivery.get("m1"), core.state.delivery.get("m2")], [Some(&Delivery::Queued); 2], "still shown queued");
+        assert_eq!([core.state.delivery.get("m1"), core.state.delivery.get("m2")], [None; 2]);
         // Claude Code, once up, takes the first; the next once that's done.
         core.state.exit = None;
         core.set_status(Status::Starting);
@@ -1234,7 +1230,7 @@ mod tests {
         claude.line(&mut core, &serde_json::json!({"type": "control_response", "response": {"subtype": "success", "request_id": init, "response": {}}}).to_string());
         assert_eq!(wrote(&mut core, "").0, ["m1"]);
         assert_eq!(core.state.delivery.get("m1"), Some(&Delivery::Sent));
-        assert_eq!(core.get("m1").map(|e| e.seq), said, "where it was said");
+        assert!(core.get("m1").is_some() && core.get("m2").is_none(), "only the message handed to Claude is shown sent");
         assert_eq!(queue(&core), ["m2"]);
         for line in [
             r#"{"type":"command_lifecycle","command_uuid":"m1","state":"started","uuid":"x","session_id":"s"}"#,
@@ -1248,9 +1244,8 @@ mod tests {
         assert!(core.state.queue.is_empty());
     }
 
-    /// An ACP agent (Devin, Gemini) holds a message till its session opens, as Codex does till its
-    /// thread does: one that ends first (it can't sign in, and is switched out of) lets go of it
-    /// the same way.
+    /// An ACP agent (Devin, Gemini) holds a message till its session opens: one that ends first
+    /// (it can't sign in, and is switched out of) lets go of it for the next harness.
     #[test]
     fn an_acp_agent_that_ends_before_its_session_opens_lets_go_of_what_it_held() {
         use super::super::model::Delivery;
@@ -1312,30 +1307,35 @@ mod tests {
         assert_eq!(wrote(&mut core, "").0, ["m2"]);
     }
 
-    /// A message held for a harness that ended waits in kiln's queue, shown queued where it was
-    /// said, and that's where its Edit and Unsend reach it: changed, the conversation says its new
-    /// words before it goes; taken back, it says it was dropped, never queued for good. One its
-    /// harness's adapter still holds is out of their reach, as before (`unsend.ts`).
+    /// CP-T3.2: Edit and Unsend reach Codex's startup queue before and after a crash. A legacy
+    /// message already shown in the conversation is changed or dropped there too.
     #[test]
     fn a_message_shown_waiting_in_kiln_s_queue_is_changed_and_taken_back_there() {
         use super::super::model::{Body, Delivery};
-        let mut core = Core::new();
-        let mut codex = Adapter::Codex(Box::new(Codex::new(None, None, None, false)));
-        codex.start(&mut core);
-        codex.command(&mut core, message("m1", "Plans"));
-        codex.command(&mut core, message("m2", "Research"));
-        codex.command(&mut core, Command::QueueRemove { id: "m2".into() });
-        assert_eq!(core.state.delivery.get("m2"), Some(&Delivery::Queued), "its adapter's: out of reach");
-        codex.exited(&mut core, None, None);
-        codex.command(&mut core, Command::QueueEdit { id: "m1".into(), text: "Plans, one tab".into(), attachments: None });
         let shown = |core: &Core, id: &str| match core.get(id).map(|e| &e.body) {
             Some(Body::User { text, .. }) => text.clone(),
             _ => String::new(),
         };
-        assert_eq!((shown(&core, "m1").as_str(), core.state.queue.first().map(|q| q.text.as_str())), ("Plans, one tab", Some("Plans, one tab")));
-        codex.command(&mut core, Command::QueueRemove { id: "m2".into() });
-        assert_eq!(queue(&core), ["m1"]);
-        assert_eq!(core.state.delivery.get("m2"), Some(&Delivery::Cancelled));
-        assert_eq!(shown(&core, "m2"), "Research", "still where it was said");
+        for legacy in [false, true] {
+            let mut core = Core::new();
+            let mut codex = Adapter::Codex(Box::new(Codex::new(None, None, None, false)));
+            codex.start(&mut core);
+            codex.command(&mut core, message("m1", "Plans"));
+            codex.command(&mut core, message("m2", "Research"));
+            if legacy {
+                for (id, text) in [("m1", "Plans"), ("m2", "Research")] {
+                    core.state.delivery.insert(id.into(), Delivery::Queued);
+                    core.upsert(id, None, Body::User { text: text.into(), images: 0, client_id: Some(id.into()), origin: None, attachments: Vec::new(), reply_to: None });
+                }
+            }
+            codex.command(&mut core, Command::QueueRemove { id: "m2".into() });
+            assert_eq!(queue(&core), ["m1"], "Unsend reaches startup work");
+            assert_eq!(core.state.delivery.get("m2"), legacy.then_some(&Delivery::Cancelled));
+            codex.exited(&mut core, None, None);
+            codex.command(&mut core, Command::QueueEdit { id: "m1".into(), text: "Plans, one tab".into(), attachments: None });
+            assert_eq!(core.state.queue.first().map(|q| q.text.as_str()), Some("Plans, one tab"));
+            assert_eq!(shown(&core, "m1"), if legacy { "Plans, one tab" } else { "" });
+            assert_eq!(shown(&core, "m2"), if legacy { "Research" } else { "" });
+        }
     }
 }

@@ -4,6 +4,7 @@
  * done in place under it; and the tasks under way or done lately that put it there.
  */
 import * as React from "react";
+import { labelOf, useLabels } from "@/lib/data";
 import { Link } from "@/lib/router";
 import { ArrowRightLeft, RotateCcw, SquareTerminal, Trash2, X } from "lucide-react";
 import { api } from "@/api/client";
@@ -39,8 +40,8 @@ function gitWords(p: Place): string[] {
     !g.upstream && g.head && "no upstream",
     // The same branch on the other machines (`kiln/<machine>/<branch>` here).
     ...(g.peers ?? []).flatMap((o) => [
-      o.ahead > 0 && o.behind > 0 ? `diverged from ${o.machine}` : o.behind > 0 ? `${o.machine} ${o.behind} ahead` : o.ahead > 0 ? `${o.machine} ${o.ahead} behind` : null,
-      o.wip ? `work in progress on ${o.machine}` : null,
+      o.ahead > 0 && o.behind > 0 ? `diverged from ${labelOf(o.machine)}` : o.behind > 0 ? `${labelOf(o.machine)} ${o.behind} ahead` : o.ahead > 0 ? `${labelOf(o.machine)} ${o.ahead} behind` : null,
+      o.wip ? `work in progress on ${labelOf(o.machine)}` : null,
     ]),
   ].filter((x): x is string => Boolean(x));
 }
@@ -57,6 +58,7 @@ export function PlaceList({
   synced: SyncRepo | null;
   onStarted: (tasks: PlaceTask[]) => void;
 }) {
+  useLabels();
   const [open, setOpen] = React.useState<{ at: string; what: "move" | "remove" } | null>(null);
   if (entry.places.length === 0) {
     return <p className="empty-line">It is on no machine yet: clone it to some, or sync it, from above.</p>;
@@ -74,7 +76,7 @@ export function PlaceList({
           <li key={at} className="repo-place">
             <div className="repo-place-line">
               <StatusDot status={placeDot(p)} title={p.copy ? p.copy.state : p.online ? "online" : "offline"} />
-              <span className="repo-place-machine">{p.machine}</span>
+              <span className="repo-place-machine">{labelOf(p.machine)}</span>
               {m && (
                 <span className="repo-place-os">
                   {osLabel(m.os)} · {m.arch}
@@ -86,7 +88,13 @@ export function PlaceList({
               <span className="repo-place-acts">
                 <Tip content={p.online ? "Open a terminal there" : "Offline"}>
                   {p.online ? (
-                    <Link className="icon-btn" data-variant="bare" data-size="sm" aria-label={`Open a terminal on ${p.machine}`} to={`/terminal?open=${encodeURIComponent(`agent:${p.machine}`)}`}>
+                    <Link
+                      className="icon-btn"
+                      data-variant="bare"
+                      data-size="sm"
+                      aria-label={`Open a terminal on ${labelOf(p.machine)}`}
+                      to={`/terminal?open=${encodeURIComponent(`agent:${p.machine}`)}`}
+                    >
                       <SquareTerminal size={14} />
                     </Link>
                   ) : (
@@ -101,7 +109,7 @@ export function PlaceList({
                     className="icon-btn"
                     data-variant="bare"
                     data-size="sm"
-                    aria-label={`Move ${entry.name} from ${p.machine}`}
+                    aria-label={`Move ${entry.name} from ${labelOf(p.machine)}`}
                     aria-expanded={what === "move"}
                     disabled={busy || !p.online || p.copy?.moving}
                     onClick={() => setOpen(what === "move" ? null : { at, what: "move" })}
@@ -115,7 +123,7 @@ export function PlaceList({
                     className="icon-btn"
                     data-variant="bare"
                     data-size="sm"
-                    aria-label={`Give up ${entry.name} on ${p.machine}`}
+                    aria-label={`Give up ${entry.name} on ${labelOf(p.machine)}`}
                     aria-expanded={what === "remove"}
                     disabled={busy || p.copy?.moving}
                     onClick={() => setOpen(what === "remove" ? null : { at, what: "remove" })}
@@ -139,14 +147,29 @@ export function PlaceList({
               </p>
             )}
             {copy?.status?.error && <p className="repo-error">{copy.status.error}</p>}
-            {what === "move" && <MoveForm entry={entry} place={p} machines={machines} onCancel={() => setOpen(null)} onStarted={(t) => {
+            {what === "move" && (
+              <MoveForm
+                entry={entry}
+                place={p}
+                machines={machines}
+                onCancel={() => setOpen(null)}
+                onStarted={(t) => {
                   setOpen(null);
                   onStarted(t);
-                }} />}
-            {what === "remove" && <RemoveForm entry={entry} place={p} onCancel={() => setOpen(null)} onStarted={(t) => {
+                }}
+              />
+            )}
+            {what === "remove" && (
+              <RemoveForm
+                entry={entry}
+                place={p}
+                onCancel={() => setOpen(null)}
+                onStarted={(t) => {
                   setOpen(null);
                   onStarted(t);
-                }} />}
+                }}
+              />
+            )}
           </li>
         );
       })}
@@ -156,11 +179,13 @@ export function PlaceList({
 
 /** Moving a place to another machine (or folder): it syncs there, then leaves here. */
 function MoveForm({ entry, place, machines, onCancel, onStarted }: { entry: Entry; place: Place; machines: Map<string, PlaceMachine>; onCancel: () => void; onStarted: (t: PlaceTask[]) => void }) {
+  useLabels();
   const git = place.git !== null;
   const has = (m: string) => entry.places.some((p) => p.machine === m);
   // Machines it isn't on yet first, then the ones it is (another folder there), its own last.
   const rank = (m: PlaceMachine) => (m.name === place.machine ? 2 : has(m.name) ? 1 : 0);
-  const eligible = [...machines.values()].filter((m) => m.connected && m.can_sync && (!git || m.can_clone)).sort((a, b) => rank(a) - rank(b) || a.name.localeCompare(b.name));
+  const eligible = [...machines.values()].filter((m) => m.connected && m.can_sync && (!git || m.can_clone)).sort((a, b) => rank(a) - rank(b) || labelOf(a.name).localeCompare(labelOf(b.name)));
+  const from = labelOf(place.machine);
   const [to, setTo] = React.useState(eligible[0]?.name ?? "");
   const [path, setPath] = React.useState(() => defaultPath(entry, machines, place));
   const [del, setDel] = React.useState(false);
@@ -186,7 +211,7 @@ function MoveForm({ entry, place, machines, onCancel, onStarted }: { entry: Entr
   if (eligible.length === 0) {
     return (
       <Confirm
-        label={`Move ${entry.name} from ${place.machine}`}
+        label={`Move ${entry.name} from ${from}`}
         className="repo-inline"
         actions={
           <Button size="xs" variant="ghost" onClick={onCancel}>
@@ -199,36 +224,36 @@ function MoveForm({ entry, place, machines, onCancel, onStarted }: { entry: Entr
     );
   }
   return (
-    <form className="confirm repo-inline repo-move" onSubmit={submit} aria-label={`Move ${entry.name} from ${place.machine}`}>
+    <form className="confirm repo-inline repo-move" onSubmit={submit} aria-label={`Move ${entry.name} from ${from}`}>
       <p>
-        {git ? "Its commits go as a git bundle and its working tree through sync, uncommitted work included" : "Its files go through sync"}, over kiln's own links. Once the new folder is in step, the one on {place.machine}{" "}
-        {entry.synced && place.copy ? "stops syncing" : "is let go"}.
+        {git ? "Its commits go as a git bundle and its working tree through sync, uncommitted work included" : "Its files go through sync"}, over kiln's own links. Once the new folder is in step, the
+        one on {from} {entry.synced && place.copy ? "stops syncing" : "is let go"}.
       </p>
       <div className="repo-move-fields">
         <SelectField
           label="To"
           value={to}
           onChange={setTo}
-          options={eligible.map((m) => ({ value: m.name, label: `${m.name} · ${osLabel(m.os)} ${m.arch}${m.name === place.machine ? " · another folder here" : has(m.name) ? " · has it already" : ""}` }))}
+          options={eligible.map((m) => ({
+            value: m.name,
+            label: `${labelOf(m.name)} · ${osLabel(m.os)} ${m.arch}${m.name === place.machine ? " · another folder here" : has(m.name) ? " · has it already" : ""}`,
+          }))}
         />
         <TextField label="Folder" value={path} onChange={(e) => setPath(e.target.value)} spellCheck={false} hint={resolved ? `→ ${resolved}` : "A whole path, or ~/… on that machine"} />
       </div>
       <label className="repo-check">
         <input type="checkbox" checked={del} onChange={(e) => setDel(e.target.checked)} />
         <span>
-          Delete the old folder on {place.machine} once it has moved
+          Delete the old folder on {from} once it has moved
           {(changed > 0 || ahead > 0) && (
-            <em>
-              {" "}
-              (it has {[changed > 0 && `${changed} changes not committed`, ahead > 0 && `${ahead} commits not pushed`].filter(Boolean).join(" and ")}: they move too)
-            </em>
+            <em> (it has {[changed > 0 && `${changed} changes not committed`, ahead > 0 && `${ahead} commits not pushed`].filter(Boolean).join(" and ")}: they move too)</em>
           )}
         </span>
       </label>
       {error && <p className="repo-error">{error}</p>}
       <div className="repo-actions">
         <Button type="submit" size="xs" disabled={busy || !to || !path.trim()}>
-          {busy ? "Starting…" : `Move to ${to}`}
+          {busy ? "Starting…" : `Move to ${labelOf(to)}`}
         </Button>
         <Button type="button" size="xs" variant="ghost" onClick={onCancel}>
           Cancel
@@ -240,6 +265,7 @@ function MoveForm({ entry, place, machines, onCancel, onStarted }: { entry: Entr
 
 /** Giving a place up: a copy stops syncing there, kiln forgets its clone, and the folder goes if asked. */
 function RemoveForm({ entry, place, onCancel, onStarted }: { entry: Entry; place: Place; onCancel: () => void; onStarted: (t: PlaceTask[]) => void }) {
+  useLabels();
   const found = place.kind === "found";
   const [del, setDel] = React.useState(found);
   const [busy, setBusy] = React.useState(false);
@@ -258,15 +284,16 @@ function RemoveForm({ entry, place, onCancel, onStarted }: { entry: Entry; place
     }
   };
   const keep = place.kind === "copy" ? "Stop syncing it here" : "Forget kiln's clone";
+  const on = labelOf(place.machine);
   return (
     <Confirm
-      label={`Give up ${entry.name} on ${place.machine}`}
+      label={`Give up ${entry.name} on ${on}`}
       tone="danger"
       className="repo-inline"
       actions={
         <>
           <Button size="xs" variant="danger" disabled={busy} onClick={() => void go()}>
-            {busy ? "Starting…" : del ? `Delete it on ${place.machine}` : keep}
+            {busy ? "Starting…" : del ? `Delete it on ${on}` : keep}
           </Button>
           <Button size="xs" variant="ghost" onClick={onCancel}>
             Keep it
@@ -276,15 +303,12 @@ function RemoveForm({ entry, place, onCancel, onStarted }: { entry: Entry; place
     >
       <p>
         {found
-          ? `kiln didn't make this folder; it can delete it on ${place.machine}.`
+          ? `kiln didn't make this folder; it can delete it on ${on}.`
           : place.kind === "copy"
-            ? `${place.machine} stops syncing ${entry.name}. Its files stay unless you delete them.`
-            : `kiln stops keeping its clone on ${place.machine}. Its files stay unless you delete them.`}
+            ? `${on} stops syncing ${entry.name}. Its files stay unless you delete them.`
+            : `kiln stops keeping its clone on ${on}. Its files stay unless you delete them.`}
         {(changed > 0 || ahead > 0) && (
-          <strong className="repo-warn">
-            {" "}
-            It has {[changed > 0 && `${changed} changes not committed`, ahead > 0 && `${ahead} commits not pushed`].filter(Boolean).join(" and ")}.
-          </strong>
+          <strong className="repo-warn"> It has {[changed > 0 && `${changed} changes not committed`, ahead > 0 && `${ahead} commits not pushed`].filter(Boolean).join(" and ")}.</strong>
         )}
       </p>
       {!found && (
@@ -302,13 +326,14 @@ const VERB: Record<PlaceTask["kind"], string> = { clone: "Clone", sync: "Sync", 
 
 /** A task's words: what, and where to (or from). */
 export function taskLine(t: PlaceTask): string {
-  return `${VERB[t.kind]} ${t.kind === "remove" ? "from" : "to"} ${t.machine}`;
+  return `${VERB[t.kind]} ${t.kind === "remove" ? "from" : "to"} ${labelOf(t.machine)}`;
 }
 
 const TASK_DOT: Record<string, string> = { done: "succeeded", failed: "failed", queued: "queued" };
 
 /** The tasks under way and done lately for a repository, newest first. */
 export function TaskList({ tasks, machines, onChange }: { tasks: PlaceTask[]; machines: Map<string, PlaceMachine>; onChange: () => void }) {
+  useLabels();
   const [error, setError] = React.useState<string | null>(null);
   const shown = [...tasks.filter(isActive), ...tasks.filter((t) => !isActive(t)).slice(0, 4)];
   if (shown.length === 0) return null;

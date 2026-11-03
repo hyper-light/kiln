@@ -243,7 +243,9 @@ pub async fn run_with(svc: Option<&std::sync::Arc<Service>>, handle: &Handle, me
         Ok(Some((found, pieces))) => {
             let _ = ev.send(Ev::Picked { runner: keyed.runner.name.clone(), why: keyed.why.clone() }).await;
             let took = found.provenance.ms as f64 / 1000.0;
-            let note = format!("reused: an identical run on {} {} (it took {took:.1}s); nothing ran", found.provenance.runner, ago(crate::util::now_unix() - found.provenance.finished_at));
+            // The runner it ran on, by the name people see (its label, docs/machines.md).
+            let on = handle.directory().await.ok().and_then(|all| all.into_iter().find(|r| r.name == found.provenance.runner).map(|r| r.shown().to_owned()));
+            let note = format!("reused: an identical run on {} {} (it took {took:.1}s); nothing ran", on.as_deref().unwrap_or(&found.provenance.runner), ago(crate::util::now_unix() - found.provenance.finished_at));
             let _ = ev.send(Ev::Note(note)).await;
             for (err, data) in pieces {
                 let _ = ev.send(Ev::Output { err, data }).await;

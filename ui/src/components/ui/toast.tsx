@@ -163,7 +163,7 @@ export function Toaster() {
             <StatusDot status={t.tone === "info" || !t.tone ? "skipped" : t.tone} />
           </span>
           <div className="min-w-0 flex-1">
-            <div className="text-[13px] font-[450] leading-snug text-[#eceef2]">
+            <div className="break-words text-[13px] font-[450] leading-snug text-[#eceef2]">
               {t.href ? (
                 <button
                   type="button"

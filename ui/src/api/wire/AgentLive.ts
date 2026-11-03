@@ -9,7 +9,12 @@ import type { RunnerFacts } from "./RunnerFacts";
 import type { Skew } from "./Skew";
 import type { Transport } from "./Transport";
 
-export type AgentLive = { name: string, labels: Array<string>, slots: number, hostname: string, os: string, arch: string, version: string, ephemeral: boolean, connected: boolean, last_seen: number, enrolled_at: number, running: Array<string>, busy: number, draining: boolean, sample: HostSample | null, 
+export type AgentLive = { name: string, 
+/**
+ * The name people see, for an agent kiln knows by its machine id (its `name`,
+ * docs/machines.md); none for one known by its name.
+ */
+label?: string, labels: Array<string>, slots: number, hostname: string, os: string, arch: string, version: string, ephemeral: boolean, connected: boolean, last_seen: number, enrolled_at: number, running: Array<string>, busy: number, draining: boolean, sample: HostSample | null, 
 /**
  * Its battery, when it has one and its runner says ([`AgentMsg::Power`]).
  */

@@ -1162,9 +1162,10 @@ impl Updates {
         let build = crate::fleet::newest_build(hub, machine);
         let commit = build.as_deref().and_then(|b| crate::fleet::runner_commit(hub, machine, Some(b)));
         if let (true, Some(build), Some(commit)) = (arrived_by_commit(&j, build.as_deref(), commit.as_deref()), build, commit) {
+            let shown = hub.shown(machine);
             self.update(hub, id, |j| {
                 j.reached = true;
-                push_line(j, format!("{machine} is running {} (build {build}, signed again on the machine)", crate::fleet::short(&commit)));
+                push_line(j, format!("{shown} is running {} (build {build}, signed again on the machine)", crate::fleet::short(&commit)));
             });
         }
     }
@@ -1285,10 +1286,11 @@ impl Updates {
             .filter(|j| j.awaits(machine, build))
             .map(|j| j.id.clone())
             .collect();
+        let shown = if ids.is_empty() { String::new() } else { hub.shown(machine) };
         for id in ids {
             self.update(hub, &id, |j| {
                 j.reached = true;
-                push_line(j, format!("{machine} is running build {build}"));
+                push_line(j, format!("{shown} is running build {build}"));
             });
             self.late(hub, &id);
         }
@@ -1498,8 +1500,11 @@ impl Policy {
 }
 
 /// Where a runner's policy is kept (none: the default).
+/// Where a machine's upgrade policy is kept, its name after it.
+pub(crate) const POLICY_PREFIX: &str = "updates/policy/";
+
 fn policy_key(machine: &str) -> String {
-    format!("updates/policy/{machine}")
+    format!("{POLICY_PREFIX}{machine}")
 }
 
 /// `machine`'s update policy: Notify unless someone chose otherwise.
@@ -1633,11 +1638,11 @@ pub async fn measure(hub: &Arc<Hub>) {
 }
 
 /// Where a build kiln hands out comes from, said for a person.
-pub fn from_words(b: &Binary) -> String {
+pub fn from_words(hub: &Hub, b: &Binary) -> String {
     match b.origin.as_str() {
         "server" => "this server's own build".to_owned(),
         "built" => b.run.map_or_else(|| "built by kiln's release pipeline".to_owned(), |n| format!("built by release run #{n}")),
-        "machine" => b.by.as_ref().map_or_else(|| "built by one of its machines".to_owned(), |m| format!("built by {m}")),
+        "machine" => b.by.as_ref().map_or_else(|| "built by one of its machines".to_owned(), |m| format!("built by {}", hub.shown(m))),
         "upload" => "uploaded here".to_owned(),
         "release" => "a GitHub release".to_owned(),
         other => other.to_owned(),
@@ -1695,7 +1700,7 @@ pub async fn runners(hub: &Arc<Hub>) -> Vec<RunnerInfo> {
         r.checkout = crate::fleet::reported(hub, &r.name).and_then(|k| k.checkout);
         let Some(t) = &newest else { continue };
         let b = r.target.as_deref().and_then(|target| crate::fleet::binary_for(hub, target, &t.commit));
-        r.from = b.as_ref().map(from_words);
+        r.from = b.as_ref().map(|b| from_words(hub, b));
         r.target_build = b.map(|b| b.build);
         let s = crate::fleet::standing(hub, r, t).await;
         r.up_to_date = s == crate::fleet::Standing::Current;
@@ -1726,17 +1731,18 @@ pub async fn upgrade_runner(hub: &Arc<Hub>, machine: &str, way: Option<Way>) -> 
         return Ok(j);
     }
     let r = runners(hub).await.into_iter().find(|r| r.name == machine).ok_or_else(|| anyhow::anyhow!("there is no runner called {machine}"))?;
-    anyhow::ensure!(r.policy != Policy::Off, "updates are off for {machine}: turn them on to upgrade it");
-    anyhow::ensure!(!r.locked, "{machine} refuses upgrades: its own kiln config says [updates] accept = false");
-    anyhow::ensure!(r.connected, "{machine} is not connected");
+    let shown = hub.shown(machine);
+    anyhow::ensure!(r.policy != Policy::Off, "updates are off for {shown}: turn them on to upgrade it");
+    anyhow::ensure!(!r.locked, "{shown} refuses upgrades: its own kiln config says [updates] accept = false");
+    anyhow::ensure!(r.connected, "{shown} is not connected");
     if let Some(t) = hub.updates.fleet.target() {
-        anyhow::ensure!(!r.up_to_date, "{machine} already runs the newest kiln ({})", crate::fleet::short(&t.commit));
+        anyhow::ensure!(!r.up_to_date, "{shown} already runs the newest kiln ({})", crate::fleet::short(&t.commit));
         let plan = match way {
             None => crate::fleet::plan(hub, &r, &t).await,
             Some(w) => {
                 let open = crate::fleet::ways(hub, &r, &t).await.into_iter().find(|o| o.way == w);
                 match open {
-                    Some(o) if !o.ok => anyhow::bail!("{machine} can't be upgraded that way: {}", o.why),
+                    Some(o) if !o.ok => anyhow::bail!("{shown} can't be upgraded that way: {}", o.why),
                     _ => crate::fleet::plan_by(hub, &r, &t, w)?,
                 }
             }
@@ -1745,10 +1751,10 @@ pub async fn upgrade_runner(hub: &Arc<Hub>, machine: &str, way: Option<Way>) -> 
             crate::fleet::Plan::Download(b) => upgrade_with(hub, &r, &b, "admin").await,
             crate::fleet::Plan::Build(b) => crate::fleet::build(hub, &r, &t.commit, &b, "admin").await,
             crate::fleet::Plan::Join { job, on } => crate::fleet::join(hub, &r, &t.commit, &job, &on, "admin").await,
-            crate::fleet::Plan::Wait(why) => anyhow::bail!("{machine} can't be upgraded yet: it {why}"),
+            crate::fleet::Plan::Wait(why) => anyhow::bail!("{shown} can't be upgraded yet: it {why}"),
         };
     }
-    anyhow::ensure!(way != Some(Way::Build), "{machine} can't build kiln itself while kiln knows no newest commit to build");
+    anyhow::ensure!(way != Some(Way::Build), "{shown} can't build kiln itself while kiln knows no newest commit to build");
     let target = r.target.clone().ok_or_else(|| anyhow::anyhow!("kiln has no build for {} on {}", r.os, r.arch))?;
     let (sha256, size) = ensure_binary(hub, &target).await?;
     let b = binaries(hub).into_iter().find(|b| b.target == target && b.sha256 == sha256).unwrap_or_else(|| Binary {
@@ -1779,17 +1785,18 @@ pub(crate) fn instance8(r: &RunnerInfo) -> String {
 /// stopped.
 pub async fn upgrade_with(hub: &Arc<Hub>, r: &RunnerInfo, b: &Binary, by: &str) -> anyhow::Result<Job> {
     let machine = &r.name;
+    let shown = hub.shown(machine);
     anyhow::ensure!(
         r.method == "native" || r.terminal,
-        "{machine} runs a kiln too old to upgrade itself and has terminals turned off: run `kiln install --agent --upgrade` with a new kiln binary on it"
+        "{shown} runs a kiln too old to upgrade itself and has terminals turned off: run `kiln install --agent --upgrade` with a new kiln binary on it"
     );
-    anyhow::ensure!(r.build.as_deref() != Some(b.build.as_str()), "{machine} already runs build {}", b.build);
+    anyhow::ensure!(r.build.as_deref() != Some(b.build.as_str()), "{shown} already runs build {}", b.build);
     let mut job = new_job("runner", machine, r.method, r.build.clone(), Some(b.build.clone()));
     job.commit.clone_from(&b.sha);
     let id = job.id.clone();
     hub.updates.insert(job.clone());
     hub.store.audit(by.into(), "upgrade.runner".into(), format!("{machine} to build {} ({}, {})", b.build, b.target, r.method)).await;
-    hub.updates.say(hub, &id, format!("upgrading {machine} to build {} ({}); nothing it runs is stopped", b.build, b.target));
+    hub.updates.say(hub, &id, format!("upgrading {shown} to build {} ({}); nothing it runs is stopped", b.build, b.target));
     let (h, machine, b) = (Arc::clone(hub), machine.clone(), b.clone());
     if r.method == "native" {
         crate::rt::spawn(async move { native(&h, &id, &machine, &b).await });
@@ -1809,10 +1816,11 @@ pub(crate) async fn upgrade_into(hub: &Arc<Hub>, id: &str, machine: &str, b: &Bi
         u.finish(hub, id, Err(format!("there is no runner called {machine}")));
         return;
     };
+    let shown = hub.shown(machine);
     let cant = if !r.connected {
-        Some(format!("{machine} is not connected"))
+        Some(format!("{shown} is not connected"))
     } else if r.method != "native" && !r.terminal {
-        Some(format!("{machine} runs a kiln too old to upgrade itself and has terminals turned off: run `kiln install --agent --upgrade` with a new kiln binary on it"))
+        Some(format!("{shown} runs a kiln too old to upgrade itself and has terminals turned off: run `kiln install --agent --upgrade` with a new kiln binary on it"))
     } else {
         None
     };
@@ -1821,7 +1829,7 @@ pub(crate) async fn upgrade_into(hub: &Arc<Hub>, id: &str, machine: &str, b: &Bi
         return;
     }
     if r.build.as_deref() == Some(b.build.as_str()) {
-        u.finish(hub, id, Ok(format!("{machine} runs build {} already", b.build)));
+        u.finish(hub, id, Ok(format!("{shown} runs build {} already", b.build)));
         return;
     }
     u.update(hub, id, |j| {
@@ -1829,7 +1837,7 @@ pub(crate) async fn upgrade_into(hub: &Arc<Hub>, id: &str, machine: &str, b: &Bi
         j.to_build = Some(b.build.clone());
     });
     hub.store.audit("kiln".into(), "upgrade.runner".into(), format!("{machine} to build {} ({}, {}), built by {}", b.build, b.target, r.method, b.by.as_deref().unwrap_or("another machine"))).await;
-    u.say(hub, id, format!("upgrading {machine} to build {} ({}); nothing it runs is stopped", b.build, b.target));
+    u.say(hub, id, format!("upgrading {shown} to build {} ({}); nothing it runs is stopped", b.build, b.target));
     if r.method == "native" {
         native(hub, id, machine, b).await;
     } else {
@@ -1850,7 +1858,7 @@ async fn native(hub: &Arc<Hub>, id: &str, machine: &str, b: &Binary) {
     match hub.command_start(machine, &msg).await.answer(crate::hub::COMMAND_WITHIN).await {
         crate::wire::commands::Answer::Taken | crate::wire::commands::Answer::Sent | crate::wire::commands::Answer::Unanswered { .. } | crate::wire::commands::Answer::Parked => {}
         other => {
-            u.finish(hub, id, Err(format!("{machine}: {}", other.words())));
+            u.finish(hub, id, Err(format!("{}: {}", hub.shown(machine), other.words())));
             return;
         }
     }
@@ -1884,14 +1892,14 @@ async fn native(hub: &Arc<Hub>, id: &str, machine: &str, b: &Binary) {
         let busy: usize = hub.runner_processes(machine).iter().map(|i| i.jobs).sum();
         if busy > 0 {
             if since.elapsed() > w.jobs() {
-                let e = format!("{machine} kept running jobs for {}, so it never switched; it does once it is idle", said(w.jobs()));
+                let e = format!("{} kept running jobs for {}, so it never switched; it does once it is idle", hub.shown(machine), said(w.jobs()));
                 u.time_out(hub, id, "jobs", e);
                 return;
             }
             idle_since = Instant::now();
             waited = true;
             if busy != waiting_on {
-                u.say(hub, id, format!("{machine} waits for {} before it switches", if busy == 1 { "its running job".to_owned() } else { format!("its {busy} running jobs") }));
+                u.say(hub, id, format!("{} waits for {} before it switches", hub.shown(machine), if busy == 1 { "its running job".to_owned() } else { format!("its {busy} running jobs") }));
             }
         } else if idle_since.elapsed() > w.upgrade() {
             let after = if waited { " of its last job ending" } else { "" };
@@ -2123,7 +2131,7 @@ async fn terminal(hub: &Arc<Hub>, id: &str, machine: &str, b: &Binary, inst8: &s
                 feed("\n");
                 break match (code, error) {
                     (Some(0), _) => Ok(()),
-                    (_, Some(e)) if e == "__reconnect__" => Err(format!("{machine} disconnected during the upgrade")),
+                    (_, Some(e)) if e == "__reconnect__" => Err(format!("{} disconnected during the upgrade", hub.shown(machine))),
                     (_, Some(e)) => Err(e),
                     (c, None) => Err(format!("the upgrade exited with {}", c.map_or_else(|| "a signal".to_owned(), |c| c.to_string()))),
                 };
@@ -2166,7 +2174,7 @@ pub async fn upgrade_all(hub: &Arc<Hub>) -> Vec<Result<Job, String>> {
     for r in runners(hub).await {
         // Runners whose updates are off are left alone, with the others too.
         if r.policy != Policy::Off && !r.locked && r.connected && !r.up_to_date && !matches!(r.standing, Some(crate::fleet::Standing::Branch | crate::fleet::Standing::Local)) {
-            out.push(upgrade_runner(hub, &r.name, None).await.map_err(|e| format!("{}: {e:#}", r.name)));
+            out.push(upgrade_runner(hub, &r.name, None).await.map_err(|e| format!("{}: {e:#}", hub.shown(&r.name))));
         }
     }
     out

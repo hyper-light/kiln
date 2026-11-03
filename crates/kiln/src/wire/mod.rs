@@ -332,6 +332,7 @@ classes! {
         Command::Pause { .. } => REFUSED,
         Command::Perms { .. } => REFUSED,
         Command::Branch { .. } => REFUSED,
+        Command::RemoveTask { .. } => REFUSED,
     }
 }
 

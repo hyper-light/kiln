@@ -8,6 +8,7 @@
  * (crates/kiln/src/ship.rs), typed by ui/src/api/ship.ts.
  */
 import type { ShipAction, ShipCommit, ShipDetail, ShipPart, ShipPip, ShipStand } from "../src/api/ship.ts";
+import { MAC_MINI } from "./data.ts";
 
 // ---- randomness, the same on every start ----
 function mulberry32(seed: number) {
@@ -75,7 +76,8 @@ const FAILS = [
 const FLAKES = ["tests/restart.rs w05_r05 failed, then passed on retry", "playwright: login rings settle failed once (WebKit)", "kiln-sim seed 4079 timed out once, passed on retry"];
 const ERRS = ["metal-ryzen-02 lost the leg (OOM killer); retried on metal-epyc-01", "the k8s pod was evicted; retried on a worker node"];
 const GUARD_FAILS = ["server restarted (OOM)", "memory over 80% for 2m", "2 of 6 runners came back"];
-const RUNNERS = ["metal-ryzen-01", "metal-ryzen-02", "metal-epyc-01", "metal-mac-mini", "metal-pi-04", "metal-nuc-old"];
+// The Mac mini is known by its machine id (docs/machines.md), as the mock's agents have it.
+const RUNNERS = ["metal-ryzen-01", "metal-ryzen-02", "metal-epyc-01", MAC_MINI, "metal-pi-04", "metal-nuc-old"];
 const PLATS = [
   { id: "linux", name: "Linux", dur: [180, 260] as const },
   { id: "windows", name: "Windows", dur: [200, 280] as const },
@@ -543,7 +545,7 @@ class Sim {
       r.start = this.t + R(5, 50);
       let dur = R(40, 100);
       r.why = "";
-      if (r.name === "metal-mac-mini" && !macBuilt) {
+      if (r.name === MAC_MINI && !macBuilt) {
         dur = R(200, 300);
         r.why = "builds kiln itself: no macOS build of this commit";
       }

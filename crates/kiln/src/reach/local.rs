@@ -583,7 +583,9 @@ async fn connection(handle: Handle, me: String, fd: std::sync::Arc<std::os::fd::
             }
         },
         Req::Forget { runner } => {
-            let ok = handle.forget(&runner).await.unwrap_or(false);
+            // Named as people see it (its label, docs/machines.md): the runner kiln knows by its machine id.
+            let named = handle.directory().await.ok().and_then(|all| all.into_iter().find(|r| r.label.as_deref() == Some(runner.as_str())).map(|r| r.name));
+            let ok = handle.forget(named.as_deref().unwrap_or(&runner)).await.unwrap_or(false);
             let _ = ev_tx.send(Ev::Forgot(ok)).await;
         }
         Req::Ask { json } => {

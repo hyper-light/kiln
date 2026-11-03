@@ -4,6 +4,7 @@
  * cable lately; how long its reads waited.
  */
 import type { ConvoStatus, ConvoStore } from "@/api/types";
+import { labelOf } from "@/lib/data";
 
 /** A cable moved data, or a store wrote, this recently (ms): its light runs. */
 export const ACTIVE_MS = 6_000;
@@ -61,17 +62,19 @@ export function moving(s: ConvoStore, now: number): boolean {
 export function storesOf(status: ConvoStatus) {
   const server = status.stores.find((s) => s.role === "server") ?? null;
   const rank = (s: ConvoStore) => (s.id ? (s.connected ? 0 : 1) : 2);
-  const runners = status.stores.filter((s) => s.role === "runner").sort((a, b) => rank(a) - rank(b) || a.machine.localeCompare(b.machine) || a.key.localeCompare(b.key));
+  const runners = status.stores.filter((s) => s.role === "runner").sort((a, b) => rank(a) - rank(b) || labelOf(a.machine).localeCompare(labelOf(b.machine)) || a.key.localeCompare(b.key));
   const mirrors = status.stores.filter((s) => s.role === "mirror");
   return { server, runners, mirrors };
 }
 
 /**
- * A machine's name as its header can hold it: its host without its domain (an address stays whole),
- * cut to fit, keeping a short last part (the -01 of build-farm-01) that tells machines of a kind apart.
+ * A machine's name as its header can hold it: the name it's shown by (its label, for one known by
+ * its machine id), its host without its domain (an address stays whole), cut to fit, keeping a
+ * short last part (the -01 of build-farm-01) that tells machines of a kind apart.
  */
 export function plateName(machine: string, room: number): string {
-  const host = /^[^.]*[a-z][^.]*\./i.test(machine) ? machine.slice(0, machine.indexOf(".")) : machine;
+  const shown = labelOf(machine);
+  const host = /^[^.]*[a-z][^.]*\./i.test(shown) ? shown.slice(0, shown.indexOf(".")) : shown;
   if (host.length <= room) return host;
   const last = /-[^-]{1,4}$/.exec(host)?.[0] ?? "";
   const head = room - 1 - last.length;

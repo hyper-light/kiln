@@ -301,7 +301,7 @@ impl Hub {
 
     /// Why machine `agent` takes no new work now, when it doesn't (its kiln is to be upgraded).
     pub fn skew_holds(&self, agent: &str) -> Option<String> {
-        self.agents.lock().get(agent).and_then(|a| a.skew.holds().map(|w| format!("{agent}: {w}")))
+        self.agents.lock().get(agent).and_then(|a| a.skew.holds().map(|w| format!("{}: {w}", a.shown())))
     }
 }
 
