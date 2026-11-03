@@ -99,8 +99,15 @@ pub async fn threads(hub: &Hub, d: &Diff, viewer: &str) -> Result<Vec<Value>, Fa
     let latest = versions.last().cloned();
     let path = super::diffs::home(hub, d).await.ok().map(|(_, p)| p);
     let applied = applied(hub, d).await?;
+    let signed = signatures(hub, d).await?;
+    let agents = agents_of(hub, comments.iter().map(|c| c.2.as_str())).await;
     let mut by: HashMap<String, Vec<Value>> = HashMap::new();
+    // Who spoke in each thread and when, of what's published: what agents' fixes there count from.
+    let mut said: HashMap<String, Vec<(String, i64)>> = HashMap::new();
     for (cid, tid, author, body, suggestion, at, published, deleted) in comments {
+        if published {
+            said.entry(tid.clone()).or_default().push((author.clone(), at));
+        }
         // Its suggestions (W26-R10): its body's blocks, then the old field, each saying which
         // revision applied it.
         let made = applied.get(&cid);
@@ -108,7 +115,21 @@ pub async fn threads(hub: &Hub, d: &Diff, viewer: &str) -> Result<Vec<Value>, Fa
             .into_iter()
             .map(|s| json!({ "index": s.index, "lines": s.lines, "field": s.field, "applied": made.filter(|a| a.0 == s.index).map(|(_, n, by, at)| json!({ "version": n, "by": by, "at": at })) }))
             .collect();
-        by.entry(tid).or_default().push(json!({ "id": cid, "author": author, "body": body, "suggestion": suggestion, "created_at": at, "draft": !published, "deleted": deleted, "suggestions": suggests }));
+        // Who wrote it, in words, and who signed it (W26-R18, W27-R04): a comment is signed by
+        // whoever gave it, an agent as the agent for its person.
+        let signer = signed.get(&cid);
+        let identity = signer.and_then(|(uri, _)| kiln_ci::identity::chain::Identity::parse(uri).ok());
+        let (found, newest) = agents.get(author.split(' ').next().unwrap_or(&author)).cloned().unwrap_or_default();
+        // A signed agent's identity names its whole session: its name first, as a principal names
+        // only its id's start, which agents begun within a minute on one runner share.
+        let signed_name = match identity.as_ref().map(|i| &i.actor) {
+            Some(kiln_ci::identity::chain::Actor::Agent { agent, .. }) => hub.harness.info(agent).map(|i| i.name).filter(|n| !n.trim().is_empty()),
+            _ => None,
+        };
+        let name = signed_name.or(found);
+        let line = kiln_ci::review::byline(&author, name.as_deref(), identity.as_ref(), newest.as_ref());
+        let seal = signer.map(|(uri, taken)| json!({ "by": uri, "who": line.words(), "at": taken }));
+        by.entry(tid).or_default().push(json!({ "id": cid, "author": author, "by": line, "signed": seal, "body": body, "suggestion": suggestion, "created_at": at, "draft": !published, "deleted": deleted, "suggestions": suggests }));
     }
     let mut out = Vec::new();
     for ((tid, version, file, side, start, end, state, created_by, at), (kind, resolved_by, resolved_at, resolution)) in rows {
@@ -127,10 +148,17 @@ pub async fn threads(hub: &Hub, d: &Diff, viewer: &str) -> Result<Vec<Value>, Fa
                 o.insert("outdated".into(), json!(outdated));
             }
         }
+        // The version that fixed it (W26-R18): the first that answers it. While it's open, it waits
+        // for a person once agents have started their fixes in it since a person spoke there.
+        let fixed_in = versions.iter().find(|v| super::diffs::answers(v.thread.as_deref(), v.note.as_deref(), &tid)).map(|v| v.n);
+        let fixes: Vec<i64> = versions.iter().filter(|v| v.why.as_deref() == Some(kiln_ci::review::agents::AGENT_FIX) && super::diffs::answers(v.thread.as_deref(), v.note.as_deref(), &tid)).map(|v| v.created_at).collect();
+        let spoke: Vec<(&str, i64)> = said.get(&tid).into_iter().flatten().map(|(p, at)| (p.as_str(), *at)).collect();
+        let waits = (state == "open" && kiln_ci::review::agents::fixes_since_a_person(&spoke, &fixes) >= kiln_ci::review::agents::FIXES_PER_THREAD).then(|| kiln_ci::review::agents::Why::Bound.words());
         out.push(json!({
             "id": tid, "version": version, "file": file, "side": side, "start_line": start, "end_line": end, "state": state, "created_by": created_by, "created_at": at,
             "outdated": now.is_none(), "now": now.unwrap_or(Value::Null), "comments": list,
             "kind": Kind::read(&kind).as_str(), "resolved_by": resolved_by, "resolved_at": resolved_at, "resolution": resolution,
+            "fixed_in": fixed_in, "waits": waits,
         }));
     }
     Ok(out)
@@ -148,6 +176,61 @@ async fn applied(hub: &Hub, d: &Diff) -> Result<HashMap<String, (u32, u32, Strin
         })
         .await
         .map_err(fail)
+}
+
+/// The signatures kiln took for `d`'s comments (W27-R04), by comment: its signer's URI and when
+/// kiln took it. A comment edited unsigned has none.
+async fn signatures(hub: &Hub, d: &Diff) -> Result<HashMap<String, (String, i64)>, Fail> {
+    let id = d.id.clone();
+    hub.store
+        .call(move |c| {
+            let mut st = c.prepare("SELECT id, signer, taken_at FROM review_signatures WHERE kind = 'comment' AND diff_id = ?1")?;
+            let rows = st.query_map([&id], |r| Ok((r.get::<_, String>(0)?, (r.get(1)?, r.get(2)?))))?;
+            Ok(rows.collect::<Result<HashMap<_, _>, _>>()?)
+        })
+        .await
+        .map_err(fail)
+}
+
+/// The agents among `authors`, by principal (`agent:<session>`, or an agent session's
+/// `agent:<its id's start>@<its runner>`, as `mcp::session_caller` names it): each one's session's
+/// name while kiln has the session (the newest of that start on that runner), and its newest
+/// identity, whose path names the person it acts for (W27-R01).
+async fn agents_of<'a>(hub: &Hub, authors: impl Iterator<Item = &'a str>) -> HashMap<String, (Option<String>, Option<kiln_ci::identity::chain::Identity>)> {
+    let sessions = hub.harness.list();
+    let mut out = HashMap::new();
+    for author in authors {
+        let principal = author.split(' ').next().unwrap_or(author);
+        let Some(rest) = principal.strip_prefix("agent:") else { continue };
+        if out.contains_key(principal) {
+            continue;
+        }
+        let (start, runner) = rest.split_once('@').map_or((rest, None), |(s, r)| (s, Some(r)));
+        let session = sessions
+            .iter()
+            .filter(|i| i.id == start || (start.len() >= 8 && i.id.starts_with(start)))
+            .filter(|i| runner.is_none_or(|r| i.target.strip_prefix("agent:").unwrap_or(&i.target) == r))
+            .max_by_key(|i| i.created_at);
+        let name = session.map(|i| i.name.clone()).filter(|n| !n.trim().is_empty());
+        let uri = match session {
+            Some(i) => crate::identities::agent_uri(&hub.store, &i.id).await.ok().flatten(),
+            None => newest_identity(hub, start, runner).await,
+        };
+        out.insert(principal.to_owned(), (name, uri.and_then(|u| kiln_ci::identity::chain::Identity::parse(&u).ok())));
+    }
+    out
+}
+
+/// The newest identity kiln issued an agent session whose id starts `start`, on `runner` when
+/// it's named: for a session kiln no longer has.
+async fn newest_identity(hub: &Hub, start: &str, runner: Option<&str>) -> Option<String> {
+    let like = |s: &str| s.replace(['%', '_'], "");
+    let pattern = format!("%/agent/{}%/epoch/%{}", like(start), runner.map(|r| format!("/machine/{}/%", like(r))).unwrap_or_default());
+    hub.store
+        .call(move |c| Ok(c.query_row("SELECT subject FROM identities WHERE kind = 'agent' AND subject LIKE ?1 ORDER BY issued_at DESC, rowid DESC LIMIT 1", [pattern], |r| r.get::<_, String>(0)).optional()?))
+        .await
+        .ok()
+        .flatten()
 }
 
 /// A diff's threads as the gate reads them (W26-R11): each one's kind and reviewer, where it
@@ -609,6 +692,58 @@ pub async fn gates_on(hub: &Hub, repo: &str, shas: Vec<String>) -> anyhow::Resul
         .await
 }
 
+/// What keeps each of a host's changes from its queue now (docs/ci.md W26-R19): Review's gate on a
+/// host's pull request, as `kiln_ci::land::host_blockers` reads what kiln mirrors of it (its state,
+/// reviews and open threads, its head's checks) by its trunk's policy. Each change held is
+/// `#n: why`; none, each is clear. One kiln hasn't mirrored, or at a head other than the one asked
+/// for, is held: Review hasn't cleared that head.
+pub async fn host_held(hub: &Hub, repo: &crate::store::Repo, trunk: &str, changes: &[(u64, String)]) -> Result<Vec<String>, Fail> {
+    let mirror = gitops::mirror_path(hub, &repo.name).to_string_lossy().into_owned();
+    let (policy, owners) = policy(hub, &mirror, trunk).await;
+    let mut held = Vec::new();
+    for (n, head) in changes {
+        let (id, number) = (repo.id.clone(), i64::try_from(*n).unwrap_or(i64::MAX));
+        type Row = (String, String, String, i64, Option<String>);
+        let row: Option<Row> = hub
+            .store
+            .call(move |c| {
+                let sql = "SELECT p.state, p.author, p.reviews, p.threads,
+                           (SELECT h.sha FROM host_pull_heads h WHERE h.repo_id = p.repo_id AND h.host = p.host AND h.number = p.number ORDER BY h.n DESC LIMIT 1)
+                           FROM host_pulls p WHERE p.repo_id = ?1 AND p.number = ?2";
+                Ok(c.query_row(sql, params![id, number], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?))).optional()?)
+            })
+            .await
+            .map_err(fail)?;
+        let Some((state, author, reviews, threads, seen)) = row else {
+            held.push(format!("#{n}: Review hasn't seen it"));
+            continue;
+        };
+        if seen.as_deref() != Some(head.as_str()) {
+            held.push(format!("#{n}: Review has {}, not {head}", seen.unwrap_or_default()));
+            continue;
+        }
+        let said: Vec<Value> = serde_json::from_str(&reviews).unwrap_or_default();
+        let reviews = said
+            .iter()
+            .filter_map(|r| {
+                let action = match r.get("verdict").and_then(Value::as_str)? {
+                    "approve" | "accept" => Action::Accept,
+                    "request_changes" => Action::RequestChanges,
+                    _ => Action::Comment,
+                };
+                Some((r.get("by").and_then(Value::as_str)?.to_owned(), action))
+            })
+            .collect();
+        let checks = checks_on(hub, &repo.name, head).await.map_err(fail)?;
+        let pull = land::HostPull { state, author, reviews, open_threads: usize::try_from(threads).unwrap_or(0), checks, paths: Vec::new() };
+        let why = land::host_blockers(&policy.land, &owners, &pull);
+        if !why.is_empty() {
+            held.push(format!("#{n}: {}", why.join("; ")));
+        }
+    }
+    Ok(held)
+}
+
 /// What Review says of a diff for landing now (docs/ci.md W28-R104): the single gate `land`,
 /// `land_when_ready` and the land queue's re-check just before a move ask.
 #[derive(Debug, Clone)]
@@ -673,6 +808,8 @@ pub async fn readiness_of(hub: &Hub, chain: &[Diff]) -> Result<Vec<Readiness>, F
         let json = json!({
             "blockers": shown, "accepting": f.accepting(&policy.land), "requesting": f.requesting(), "checks": f.checks, "required": policy.land.checks,
             "strategies": policy.land.strategies, "default": policy.strategy(None, d.kind != "diff").ok(), "gate": gate, "queue": queue,
+            // Asked to land once its gate is clear (docs/ci.md W26-R19).
+            "when_ready": super::land::when_ready_of(hub, d).await.is_some(),
         });
         out.push(Readiness { gate, json });
     }

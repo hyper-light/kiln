@@ -384,13 +384,36 @@ impl App {
         }
     }
 
-    pub async fn open_change(&self, repo: &Repo, head: &str, base: &str, title: &str, body: &str) -> anyhow::Result<ChangeRef> {
+    /// Opens a pull request, a draft with `draft` (REST's own flag, docs/ci.md W29-R11).
+    pub async fn open_change(&self, repo: &Repo, head: &str, base: &str, title: &str, body: &str, draft: bool) -> anyhow::Result<ChangeRef> {
         let (name, t) = self.token_for(repo, &[("pull_requests", "write"), ("contents", "read"), ("metadata", "read")]).await?;
-        let (st, v) = self.call(Method::Post, &format!("/repos/{name}/pulls"), Auth::Token(&t), Some(&json!({ "title": title, "head": head, "base": base, "body": body }))).await?;
+        let mut ask = json!({ "title": title, "head": head, "base": base, "body": body });
+        if let (true, Some(o)) = (draft, ask.as_object_mut()) {
+            o.insert("draft".into(), json!(true));
+        }
+        let (st, v) = self.call(Method::Post, &format!("/repos/{name}/pulls"), Auth::Token(&t), Some(&ask)).await?;
         if st != 201 {
             bail!("GitHub opened no pull request ({st}): {}", said(&v));
         }
         Ok(ChangeRef { number: v.get("number").and_then(Value::as_u64).unwrap_or(0), url: v.get("html_url").and_then(Value::as_str).unwrap_or_default().to_owned() })
+    }
+
+    /// Marks draft pull request `number` ready for review (W29-R12). REST can't, so it's GraphQL's
+    /// `markPullRequestReadyForReview`, by the pull request's node id; one that's ready already
+    /// stays so.
+    pub async fn ready_change(&self, repo: &Repo, number: u64) -> anyhow::Result<()> {
+        let (name, t) = self.token_for(repo, &[("pull_requests", "write"), ("contents", "read"), ("metadata", "read")]).await?;
+        let (st, v) = self.call(Method::Get, &format!("/repos/{name}/pulls/{number}"), Auth::Token(&t), None).await?;
+        anyhow::ensure!(st == 200, "pull request {number} ({st}): {}", said(&v));
+        if v.get("draft").and_then(Value::as_bool) != Some(true) {
+            return Ok(());
+        }
+        let node = v.get("node_id").and_then(Value::as_str).filter(|n| !n.is_empty()).ok_or_else(|| anyhow!("pull request {number} has no node id"))?;
+        let ask = json!({ "query": kiln_ci::drafts::GITHUB_READY, "variables": { "id": node } });
+        let (st, v) = self.call(Method::Post, &self.graphql_url(), Auth::Token(&t), Some(&ask)).await?;
+        let errors = v.get("errors").and_then(Value::as_array).filter(|e| !e.is_empty());
+        anyhow::ensure!(st == 200 && errors.is_none(), "GitHub didn't mark pull request {number} ready ({st}): {}", errors.map_or_else(|| said(&v), |e| Value::Array(e.clone()).to_string()));
+        Ok(())
     }
 
     pub async fn change(&self, repo: &Repo, number: u64) -> anyhow::Result<ChangeState> {
@@ -747,5 +770,41 @@ mod tests {
         assert_eq!(check_state("failed", Some("failure")), ("completed", Some("failure".into())));
         assert_eq!(check_state("running", None), ("in_progress", None));
         Ok(())
+    }
+
+    /// W29-R11, R12 on GitHub: a pull request opened as a draft (REST's flag; none for the rest),
+    /// then marked ready through GraphQL by its node id, and one ready already left so.
+    #[test]
+    fn w29_r11_r12_github_drafts() -> anyhow::Result<()> {
+        crate::rt::block_on(async {
+            let kp = KeyPair::generate(aws_lc_rs::rsa::KeySize::Rsa2048).map_err(|_| anyhow!("keygen"))?;
+            let der = aws_lc_rs::encoding::AsDer::<aws_lc_rs::encoding::Pkcs8V1Der>::as_der(&kp).map_err(|_| anyhow!("der"))?;
+            let pem = format!("-----BEGIN PRIVATE KEY-----\n{}\n-----END PRIVATE KEY-----\n", B64.encode(der.as_ref()));
+            let answer: crate::githost::fake_host::Answer = Box::new(|method, path, _query, _body| match (method, path) {
+                ("GET", "/repos/acme/drafts/installation") => (200, json!({ "id": 7 })),
+                ("POST", "/app/installations/7/access_tokens") => (201, json!({ "token": "ghs_drafts", "expires_at": "2099-01-01T00:00:00Z" })),
+                ("POST", "/repos/acme/drafts/pulls") => (201, json!({ "number": 12, "html_url": "https://github.com/acme/drafts/pull/12" })),
+                ("GET", "/repos/acme/drafts/pulls/12") => (200, json!({ "number": 12, "draft": true, "node_id": "PR_kwDOdraft12" })),
+                ("GET", "/repos/acme/drafts/pulls/13") => (200, json!({ "number": 13, "draft": false, "node_id": "PR_kwDOready13" })),
+                ("POST", "/graphql") => (200, json!({ "data": { "markPullRequestReadyForReview": { "pullRequest": { "isDraft": false } } } })),
+                _ => (404, json!({ "message": "Not Found" })),
+            });
+            let (base, fake) = crate::githost::fake_host::start(answer).await?;
+            let app = App { id: 42, key: key_from_pem(&pem)?, api: base, web: "https://github.com".into(), webhook_secret: None, slug: None, html_url: None };
+            let repo = Repo { id: "r".into(), name: "acme/drafts".into(), clone_url: "https://github.com/acme/drafts.git".into(), branches: vec![], poll_seconds: 60, enabled: true, created_at: 0, last_polled_at: None, last_error: None, mode: "upstream".into(), default_branch: None, mirror: None };
+            let opened = app.open_change(&repo, "kiln/draft/ci-01a19f2c", "main", "Edit ci", "Saved in kiln", true).await?;
+            assert_eq!((opened.number, opened.url.as_str()), (12, "https://github.com/acme/drafts/pull/12"));
+            app.open_change(&repo, "kiln/edit-ci-01a19f2c", "main", "Edit ci", "Saved in kiln", false).await?;
+            let sent = fake.sent("POST", "/repos/acme/drafts/pulls");
+            assert_eq!(sent.first().and_then(|b| b.get("draft")), Some(&json!(true)), "{sent:?}");
+            assert_eq!(sent.get(1).map(|b| b.get("draft").is_none()), Some(true), "nothing new for a change that isn't a draft: {sent:?}");
+            app.ready_change(&repo, 12).await?;
+            let asked = fake.sent("POST", "/graphql");
+            assert_eq!(asked.first().and_then(|b| b.pointer("/variables/id")), Some(&json!("PR_kwDOdraft12")), "{asked:?}");
+            assert_eq!(asked.first().and_then(|b| b.get("query")).and_then(Value::as_str), Some(kiln_ci::drafts::GITHUB_READY));
+            app.ready_change(&repo, 13).await?;
+            assert_eq!(fake.sent("POST", "/graphql").len(), 1, "one ready already is left as it is");
+            Ok(())
+        })
     }
 }

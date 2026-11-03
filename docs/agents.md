@@ -635,7 +635,7 @@ code-mode function (`kiln.agents.start`) and, from a kiln shell, a CLI command.
 | `agents.children` | `GET /api/harness/agents/:id/children` | → `{children: [{id, name, kind, status, parent}]}`: the ones still running, and theirs |
 | `agents.interrupt` | `POST /api/harness/agents/:id/interrupt` | → `{interrupted}` |
 | `agents.stop` | `POST /api/harness/agents/:id/stop` | `{children?}` → `{ended: [id]}`: with `children`, what it started (and theirs) end first |
-| `agents.change` | `POST /api/harness/agents/:id/change` | `{title?, body?, draft?, trunk?, fix_checks?}` → `{change_request: Change}`: opens its change request from its work, or pushes a new version ("Change requests from agents", below) |
+| `agents.change` | `POST /api/harness/agents/:id/change` | `{title?, body?, draft?, ready?, trunk?, fix_checks?, threads?}` → `{change_request: Change}`: opens its change request from its work, or pushes a new version; `draft` opens it a draft on every host, `ready` marks its draft ready, and `threads` names the threads a new version fixes ("Change requests from agents", below) |
 | `agents.changes` | `GET /api/harness/changes` | `agent?` → `{changes: [Change]}`, newest first |
 | `agents.workspace` | `GET /api/harness/agents/:id/workspace` | → `{workspace: {kind, over, sub, volume, mount} \| null, drift: [path]}` ("Workspaces of their own", below) |
 | `agents.commits` | `GET /api/harness/agents/:id/commits?picks=&branch=&trunk=` | → `{log: {top, head, branch, trunk, base, dirty: {files, added, removed} \| null, commits: [{sha, parents, subject, author, at, files, added, removed, session}], more, told, branches, listed}, picked: {from, files: [FileChange], needs: {pick, commit, subject}} \| null}` ("Commits", below) |
@@ -1013,6 +1013,13 @@ itself (`agents.change`; an agent may open one for its own work and for the agen
   - A folder whose repository kiln doesn't know: the branch goes to its `origin`.
 - **Each push is a version.** Pushing again (**Push update**, or `agents.change` again)
   makes the commit anew from the agent's files as they are then.
+- **Drafts** (docs/ci.md W26-R18). `draft` opens it a draft wherever it goes: in kiln's own review
+  (the push's `draft` option), as a GitHub pull request (its flag), a GitLab merge request
+  ("Draft: " in its title) or a Bitbucket pull request (its flag). Its new versions stay a draft.
+  `ready` marks it ready for review: with new work, along with the new version; with no edit since
+  its last version, nothing is pushed and the draft is marked ready where it is. On a change that
+  isn't a draft, `ready` says it's ready already. A person marks an agent's draft ready from Ship
+  (**Ready** on its row), as the agent's person or one who can land on the repository.
 - **Where it stands**, in a word above its files: **Pending** (not up for review yet), **Pushed**
   (its branch is pushed, its pull request not opened yet), **Checking**, **Failed** or **Fixing**
   (its checks failed; with **Auto-Fix** on, the agent fixes them), **Changes requested**,
@@ -1025,6 +1032,12 @@ itself (`agents.change`; an agent may open one for its own work and for the agen
   only when **Auto-Fix** is on, which it is unless you turn it off when
   opening it), and the land queue taking it out (with the reason). Approvals and landing only
   update where it stands. An agent that has ended is sent nothing.
+- **Agents' feedback** (docs/ci.md W26-R18): another agent's comment on its change reaches it only
+  where the repository lets agents fix code from agents' feedback (the switch in its Review section
+  in Repos, off until turned on), saying why kiln sent it, and at most three times in a thread until
+  a person speaks there. A new version that names the threads it fixes (`threads`) is the agent's
+  fix of them, and each thread says which version fixed it. Ship's **Hand off** sends it every open
+  thread at once, each with its id, place and version.
 - **A plan run's steps** (`plans.run` with `mode: "agents"`, steps in order; docs/agentic.md P4)
   go up by themselves, as each step is met: the files the step's agent changed, as one commit on
   the step before's. On a repository kiln hosts that is one diff per step (`D12`), pushed to
@@ -1040,10 +1053,11 @@ itself (`agents.change`; an agent may open one for its own work and for the agen
   each step's diff and where it stands.
 
 A `Change` is `{agent, repo?, provider, change?, url, branch, trunk, sha, version, files,
-title, state, review?, checks?, fix_checks, opened_at, updated_at, stack?}`: `provider` is `kiln`,
+title, state, review?, draft?, checks?, fix_checks, opened_at, updated_at, stack?}`: `provider` is `kiln`,
 `github`, `gitlab`, `bitbucket` or `git`; `change` is `CR12`, `D12` or `#34` (none until a pull
-request is opened); `state` is `open`, `landed` or `closed`; `stack` (`{run, step}`) says it is a
-step of a plan run's stack. Mission Control shows each agent's change
+request is opened); `state` is `open`, `landed` or `closed`; `draft` says whether it's a draft,
+read again from kiln's own review or the host's pull request as kiln last read it; `stack`
+(`{run, step}`) says it is a step of a plan run's stack. Mission Control shows each agent's change
 on its row, with **Review** on a finished agent's open one; the Changes tab shows where it
 stands, linked, and pushes new versions. Where kiln has W14's review operations, a comment's
 message tells the agent how to answer in its thread (`ci.diffs.reply` with the thread's id);
@@ -1069,7 +1083,9 @@ environments' too) and on a runner's details (every runner's too), lists them an
   path took longer than the median of its workflow's last green runs on its branch by more than
   `limits.slow_percent`), `unroutable` (a job no runner meets what it asks for, a minute on),
   `degraded` (an app kiln CD deploys to its environment turned degraded), `mention` (`@name` in a
-  comment), `schedule` (`schedule`, five-field cron, UTC); on runners, `offline` (gone two
+  comment), `review` (a push asks it to review a change, `reviewer=agent:<name>`: it reviews
+  read-only, its words signed as itself, and joins the change's turn, a draft's once it's marked
+  ready; docs/ci.md W26-R18), `schedule` (`schedule`, five-field cron, UTC); on runners, `offline` (gone two
   minutes), `upgrade` (an upgrade failed) and `check` (kiln's checks of the machine, every half
   hour, found something failing).
 - **What it may do** (`can`, W20-R09): it always reads what it looks after; beyond that `rerun`,

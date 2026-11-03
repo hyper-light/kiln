@@ -7,6 +7,7 @@
  */
 import * as React from "react";
 import {
+  agentFixesRes,
   blobTextRes,
   commitBlobTextRes,
   commitFilesRes,
@@ -14,10 +15,12 @@ import {
   conflictsRes,
   diffRes,
   filesRes,
+  fixesSetBy,
   hostPullRes,
   hostPullsApi,
   inboxRes,
   pullSearchRes,
+  readinessRes,
   reviewApi,
   searchRes,
   verdictsRes,
@@ -31,6 +34,7 @@ import { toast } from "@/components/ui/toast";
 import { useRes, warm } from "@/lib/data";
 import { errorMessage } from "@/lib/hooks";
 import { invalidate, setData } from "@/lib/resource";
+import { Link } from "@/lib/router";
 import { parsePatch, type PatchFile } from "@/views/review/patch";
 import { Conversation, ConvoBox, Description } from "./convo";
 import { FileDiff, makeLinesOf, useThreadMap, WholeFile, type FilesCtx } from "./diffs";
@@ -68,9 +72,9 @@ const pullNumber = (name: string) => Number(name.replace(/\D/g, ""));
  */
 export function warmReview(item: ShipCommit) {
   const ch = item.change;
-  if (ch && ch.host === "kiln") warm(inboxRes, diffRes(ch.name), commentsRes(ch.name), filesRes(ch.name, ch.revision), conflictsRes(ch.name), verdictsRes(ch.name));
-  else if (ch && ch.host) warm(inboxRes, hostPullRes(item.repo, pullNumber(ch.name)));
-  else warm(inboxRes, commitFilesRes(item.repo, item.sha));
+  if (ch && ch.host === "kiln") warm(inboxRes, diffRes(ch.name), commentsRes(ch.name), filesRes(ch.name, ch.revision), conflictsRes(ch.name), verdictsRes(ch.name), agentFixesRes(item.repo));
+  else if (ch && ch.host) warm(inboxRes, hostPullRes(item.repo, pullNumber(ch.name)), agentFixesRes(item.repo));
+  else warm(inboxRes, commitFilesRes(item.repo, item.sha), agentFixesRes(item.repo));
 }
 
 /** A change the server doesn't keep (a mock's, a pruned one): the section says so, nothing else breaks. */
@@ -129,6 +133,8 @@ function aboutOf(agent: string | null | undefined, name?: string): AboutAgent | 
 const noop = () => {};
 
 interface FrameP {
+  /** The item's repository, whose agent fixes the Conversation's head shows. */
+  repo: string;
   sum: string;
   search?: { res: Parameters<typeof SearchBox>[0]["hits"]; q: string; onQ: (q: string) => void };
   onJump?: (j: Jump) => void;
@@ -138,17 +144,46 @@ interface FrameP {
 }
 
 /**
- * The Conversation head's agent fixes switch, where the mockup draws it (Ship's mockups plan, step
- * 13): a repository's setting that lets agents fix code from agents' feedback. Nothing acts on it
- * until Agents in review builds that, so it shows off and can't be turned on yet, and says why.
+ * The Conversation head's agent fixes, where the mockup draws it (Ship's mockups plan, step 13): the
+ * repository's setting that lets agents fix code from agents' feedback (W26-R18), read here and set
+ * in one place, the repository's Review section in Repos (W26 decision 5), which it links to. Its
+ * knob says on or off; its title and name say who set it and when. It loads with the review (Ship's
+ * Dropdown waits for both), and a setting it can't read keeps the same box, saying why.
  */
-function AgentFixes() {
+function AgentFixes({ repo }: { repo: string }) {
   return (
-    <button type="button" className="rv-switch" role="switch" aria-checked={false} disabled title="Agents fix code from agents' feedback · repository setting. Not yet: Agents in review builds it.">
+    <FixesBoundary repo={repo}>
+      <AgentFixesRead repo={repo} />
+    </FixesBoundary>
+  );
+}
+
+function AgentFixesRead({ repo }: { repo: string }) {
+  const v = useRes(agentFixesRes(repo)).data;
+  return <FixesLink repo={repo} on={v.agents_fix} words={`agent fixes: ${v.agents_fix ? "on" : "off"}. ${fixesSetBy(v)} It's set in the repository's Review section in Repos.`} />;
+}
+
+/** The control's one box: a link to the repository's Review section in Repos. */
+function FixesLink({ repo, on, words, unread }: { repo: string; on: boolean; words: string; unread?: boolean }) {
+  return (
+    <Link className="rv-switch" data-on={on ? "" : undefined} data-unread={unread ? "" : undefined} to={`/repos?repo=${encodeURIComponent(repo)}&section=review`} title={words} aria-label={words}>
       <i aria-hidden="true" />
       <span>agent fixes</span>
-    </button>
+    </Link>
   );
+}
+
+/** A setting the server won't give (no such repository here, no `diffs.read` on it). */
+class FixesBoundary extends React.Component<{ repo: string; children: React.ReactNode }, { err: unknown }> {
+  state = { err: null as unknown };
+  static getDerivedStateFromError(err: unknown) {
+    return { err };
+  }
+  render() {
+    if (this.state.err)
+      return <FixesLink repo={this.props.repo} on={false} unread words={`agent fixes: can't be read here: ${errorMessage(this.state.err)}. It's set in the repository's Review section in Repos.`} />;
+    return this.props.children;
+  }
 }
 
 /** The two sections the Dropdown mounts, in their order: Files, then the Conversation. */
@@ -165,7 +200,7 @@ function Frame(p: FrameP) {
       </section>
       <section className="rv-s rv-s-convo" aria-label="Conversation">
         <h3 className="rv-h">Conversation</h3>
-        <AgentFixes />
+        <AgentFixes repo={p.repo} />
         {p.convo}
       </section>
     </>
@@ -184,6 +219,7 @@ function KilnFiles({ item }: { item: ShipCommit }) {
   const comments = useRes(commentsRes(key)).data;
   const files = useRes(filesRes(key, version)).data;
   const cf = useRes(conflictsRes(key)).data;
+  const ready = useRes(readinessRes(key)).data;
   const [q, setQ] = React.useState("");
   const [draft, setDraft] = React.useState<DraftPlace | null>(null);
   const [whole, setWhole] = React.useState<string | null>(null);
@@ -326,8 +362,9 @@ function KilnFiles({ item }: { item: ShipCommit }) {
 
   return (
     <Frame
+      repo={item.repo}
       sum={`${list.length} file${list.length === 1 ? "" : "s"} · +${adds} −${dels} · v${version}${ch.latest > version ? ` of ${ch.latest}` : ""}`}
-      bar={<GateRow gate={comments.gate} conflicts={{ unresolved, ready: cf.ready, total: cf.conflicts.length }} diffKey={key} superseded={ch.superseded_by} />}
+      bar={<GateRow gate={comments.gate} conflicts={{ unresolved, ready: cf.ready, total: cf.conflicts.length }} diffKey={key} superseded={ch.superseded_by} ready={ready} />}
       search={{ res: q.trim() ? searchRes(key, version, q) : null, q, onQ: setQ }}
       onJump={jump}
       convo={
@@ -414,8 +451,15 @@ function HostFiles({ item }: { item: ShipCommit }) {
 
   return (
     <Frame
+      repo={item.repo}
       sum={`${pull.files.length} file${pull.files.length === 1 ? "" : "s"} · +${adds} −${dels} · ${ch.name}`}
-      bar={<HostGateRow approved={approved} onApprove={() => hostPullsApi.review(item.repo, n, "approve", "").then(() => {})} />}
+      bar={
+        <HostGateRow
+          approved={approved}
+          onApprove={() => hostPullsApi.review(item.repo, n, "approve", "").then(() => {})}
+          land={{ state: item.pips.find((p) => p.stage === "land")?.state ?? "none", onLand: () => reviewApi.enqueue(item.repo, [{ number: n, head: pull.sha }]) }}
+        />
+      }
       search={{ res: q.trim() ? pullSearchRes(item.repo, n, q) : null, q, onQ: setQ }}
       convo={
         <Conversation
@@ -516,6 +560,7 @@ function CommitFiles({ item }: { item: ShipCommit }) {
   const dels = list.reduce((a, f) => a + f.hunks.reduce((n, h) => n + h.lines.filter((l) => l.startsWith("-")).length, 0), 0);
   return (
     <Frame
+      repo={item.repo}
       sum={`${list.length} file${list.length === 1 ? "" : "s"} · +${adds} −${dels} · ${item.short}`}
       convo={
         <ul className="rv-convo">
