@@ -198,6 +198,7 @@ fn w27_r08_session_hand_overs_signed_by_both_processes() -> anyhow::Result<()> {
     let _harnesses = Harnesses::new(&dir.path().join("work-here"), &dir.path().join("home"))?;
     let (_main, log) = agents::runner(dir.path(), port, "box-a", None, TALK)?;
     agents::connected(port, admin, "box-a", &log, Duration::from_secs(60))?;
+    agents::headroom_off(port, admin, "box-a", Duration::from_secs(60))?;
     let cwd = dir.path().join("work-here");
     std::fs::create_dir_all(&cwd)?;
     let id = agents::open_session(port, admin, "box-a", &cwd, Duration::from_secs(60))?;
@@ -245,7 +246,9 @@ fn w27_r08_a_session_resumed_from_kilns_copy_is_kilns_take() -> anyhow::Result<(
     let (a, log_a) = agents::runner_with(dir.path(), port, "box-a", None, TALK, &env)?;
     let (_b, log_b) = agents::runner_with(dir.path(), port, "box-b", None, TALK, &env)?;
     agents::connected(port, admin, "box-a", &log_a, Duration::from_secs(60))?;
+    agents::headroom_off(port, admin, "box-a", Duration::from_secs(60))?;
     agents::connected(port, admin, "box-b", &log_b, Duration::from_secs(60))?;
+    agents::headroom_off(port, admin, "box-b", Duration::from_secs(60))?;
     let cwd = dir.path().join("work-here");
     std::fs::create_dir_all(&cwd)?;
     let id = agents::open_session(port, admin, "box-a", &cwd, Duration::from_secs(60))?;
@@ -281,7 +284,9 @@ fn w27_r08_session_hand_overs_a_move_signed_by_both_machines() -> anyhow::Result
     let (_a, log_a) = agents::runner_with(dir.path(), port, "box-a", None, TALK, &env)?;
     let (_b, log_b) = agents::runner_with(dir.path(), port, "box-b", None, TALK, &env)?;
     agents::connected(port, admin, "box-a", &log_a, Duration::from_secs(60))?;
+    agents::headroom_off(port, admin, "box-a", Duration::from_secs(60))?;
     agents::connected(port, admin, "box-b", &log_b, Duration::from_secs(60))?;
+    agents::headroom_off(port, admin, "box-b", Duration::from_secs(60))?;
     let cwd = dir.path().join("work-here");
     std::fs::create_dir_all(&cwd)?;
     let id = agents::open_session(port, admin, "box-a", &cwd, Duration::from_secs(60))?;
@@ -387,6 +392,7 @@ fn w27_r08_session_hand_overs_blue_green_sends_nothing_again() -> anyhow::Result
     std::fs::set_permissions(&before_build, std::os::unix::fs::PermissionsExt::from_mode(0o755))?;
     let (_box_a, log) = supervised(dir.path(), port, "box-a", &before_build, &[])?;
     agents::connected(port, admin, "box-a", &log, Duration::from_secs(60))?;
+    agents::headroom_off(port, admin, "box-a", Duration::from_secs(60))?;
     let cwd = dir.path().join("work-here");
     std::fs::create_dir_all(&cwd)?;
     let id = agents::open_session(port, admin, "box-a", &cwd, Duration::from_secs(60))?;
@@ -461,7 +467,9 @@ fn w27_r08_session_hand_overs() -> anyhow::Result<()> {
     std::fs::set_permissions(&before_build, std::os::unix::fs::PermissionsExt::from_mode(0o755))?;
     let (box_b, log_b) = supervised(dir.path(), port, "box-b", &before_build, &env)?;
     agents::connected(port, admin, "box-a", &log_a, Duration::from_secs(60))?;
+    agents::headroom_off(port, admin, "box-a", Duration::from_secs(60))?;
     agents::connected(port, admin, "box-b", &log_b, Duration::from_secs(60))?;
+    agents::headroom_off(port, admin, "box-b", Duration::from_secs(60))?;
     let cwd = dir.path().join("work-here");
     std::fs::create_dir_all(&cwd)?;
     let id = agents::open_session(port, admin, "box-a", &cwd, Duration::from_secs(60))?;
@@ -528,6 +536,7 @@ fn w27_r08_replant() -> anyhow::Result<()> {
     std::fs::set_permissions(&before_build, std::os::unix::fs::PermissionsExt::from_mode(0o755))?;
     let (_box_a, log) = supervised(dir.path(), port, "box-a", &before_build, &[])?;
     agents::connected(port, admin, "box-a", &log, Duration::from_secs(60))?;
+    agents::headroom_off(port, admin, "box-a", Duration::from_secs(60))?;
     let cwd = dir.path().join("work-here");
     std::fs::create_dir_all(&cwd)?;
     let ids = [agents::open_session(port, admin, "box-a", &cwd, Duration::from_secs(60))?, agents::open_session(port, admin, "box-a", &cwd, Duration::from_secs(60))?];
@@ -591,6 +600,7 @@ fn w27_r08_session_hand_overs_with_runners_from_before_go_unsigned() -> anyhow::
     let _harnesses = Harnesses::new(&dir.path().join("work-here"), &dir.path().join("home"))?;
     let (_main, log) = agents::runner(dir.path(), port, "box-a", Some("unsigned"), TALK)?;
     agents::connected(port, admin, "box-a", &log, Duration::from_secs(60))?;
+    agents::headroom_off(port, admin, "box-a", Duration::from_secs(60))?;
     let cwd = dir.path().join("work-here");
     std::fs::create_dir_all(&cwd)?;
     let id = agents::open_session(port, admin, "box-a", &cwd, Duration::from_secs(60))?;
@@ -630,6 +640,7 @@ fn w27_ac05_the_1418_drop_played_again() -> anyhow::Result<()> {
     std::fs::set_permissions(&before_build, std::os::unix::fs::PermissionsExt::from_mode(0o755))?;
     let (_box_a, log) = supervised(dir.path(), port, "box-a", &before_build, &[])?;
     agents::connected(port, admin, "box-a", &log, Duration::from_secs(60))?;
+    agents::headroom_off(port, admin, "box-a", Duration::from_secs(60))?;
     let cwd = dir.path().join("work-here");
     let mut sessions = Vec::new();
     for _ in 0..SESSIONS {
@@ -709,6 +720,7 @@ fn w27_ac05_the_twin_played_again() -> anyhow::Result<()> {
     let (_c, log_c) = agents::runner_with(dir.path(), port, "box-c", None, TALK, &env)?;
     for (name, log) in [("box-a", &log_a), ("box-b", &log_b), ("box-c", &log_c)] {
         agents::connected(port, admin, name, log, Duration::from_secs(60))?;
+        agents::headroom_off(port, admin, name, Duration::from_secs(60))?;
     }
     let id = agents::open_session(port, admin, "box-a", &cwd, Duration::from_secs(60))?;
     let e0 = first_epoch(port, admin, &id)?;
@@ -792,6 +804,7 @@ fn w27_r08_work_handed() -> anyhow::Result<()> {
     let env = [("FAKE_CLAUDE_RECORD", "1"), ("CLAUDE_CONFIG_DIR", claude.as_str())];
     let (_a, log_a) = agents::runner_with(dir.path(), port, "box-a", None, TALK, &env)?;
     agents::connected(port, admin, "box-a", &log_a, Duration::from_secs(60))?;
+    agents::headroom_off(port, admin, "box-a", Duration::from_secs(60))?;
     let json_of = |what: &str, (st, body): (u16, String)| -> anyhow::Result<Value> {
         anyhow::ensure!((200..300).contains(&st), "{what}: {st} {body}");
         Ok(serde_json::from_str(&body)?)
@@ -1191,6 +1204,7 @@ fn between_machines(dir: &Path) -> anyhow::Result<()> {
     let boxes = [("box-a", &log_a), ("box-b", &log_b), ("box-c", &log_c), ("box-d", &log_d)];
     for (name, log) in boxes {
         agents::connected(port, admin, name, log, Duration::from_secs(60))?;
+        agents::headroom_off(port, admin, name, Duration::from_secs(60))?;
     }
     reach_directories_hold(dir, &boxes.map(|(name, _)| name), Duration::from_secs(90))?;
     peers_objects(dir, port, admin)?;
@@ -1379,6 +1393,7 @@ fn cluster_group(dir: &Path) -> anyhow::Result<()> {
     let (port, admin) = (s.port, s.admin.clone());
     let (_a, log_a) = agents::runner_with(dir, port, "box-a", None, TALK, &[])?;
     agents::connected(port, &admin, "box-a", &log_a, Duration::from_secs(60))?;
+    agents::headroom_off(port, &admin, "box-a", Duration::from_secs(60))?;
     // Entries flow: one of kiln's settings changed every 2 s, till the test ends.
     let writing = Arc::new(AtomicBool::new(true));
     let writer = {
@@ -1596,6 +1611,7 @@ fn ask_as(dir: &Path, runner: &str, id: &str, name: &str, input: Value) -> anyho
 fn signing_session(dir: &Path, port: u16, admin: &str, name: &str, chaos: Option<&str>) -> anyhow::Result<(agents::Runner, String)> {
     let (r, log) = agents::runner_with(dir, port, name, chaos, TALK, &[])?;
     agents::connected(port, admin, name, &log, Duration::from_secs(120))?;
+    agents::headroom_off(port, admin, name, Duration::from_secs(60))?;
     until(Duration::from_secs(60), || {
         let (st, body) = http(port, "GET", "/api/identities?kind=runner", admin, None)?;
         anyhow::ensure!(st == 200, "{st} {body}");
@@ -1782,6 +1798,7 @@ fn w27_r08_relays_kilns_relay_of_a_reach_links_frames() -> anyhow::Result<()> {
     let (_b, log_b) = agents::runner_with(dir.path(), port, "box-b", None, TALK, &[])?;
     for (name, log) in [("box-a", &log_a), ("box-b", &log_b)] {
         agents::connected(port, admin, name, log, Duration::from_secs(120))?;
+        agents::headroom_off(port, admin, name, Duration::from_secs(60))?;
     }
     reach_ready(dir.path(), "box-a", "box-b")?;
     let ran = until(Duration::from_secs(90), || {
@@ -1835,6 +1852,7 @@ fn w27_r08_relays_that_drop_swap_or_alter_a_reach_links_frames_are_caught() -> a
         let (_b, log_b) = agents::runner_with(dir.path(), port, "box-b", None, TALK, &[])?;
         for (name, log) in [("box-a", &log_a), ("box-b", &log_b)] {
             agents::connected(port, admin, name, log, Duration::from_secs(120))?;
+            agents::headroom_off(port, admin, name, Duration::from_secs(60))?;
         }
         reach_ready(dir.path(), "box-a", "box-b")?;
         // A run whose link failed before kiln's relay passed a frame of it on (refused on the way)
@@ -1908,6 +1926,7 @@ fn w27_r08_relays_blue_greens_forwarder() -> anyhow::Result<()> {
         let env: Vec<(&str, &str)> = (!spec.is_empty()).then_some(("KILN_CHAOS", spec.as_str())).into_iter().collect();
         let (_box_a, log) = supervised(dir.path(), port, "box-a", &before_build, &env)?;
         agents::connected(port, admin, "box-a", &log, Duration::from_secs(60))?;
+        agents::headroom_off(port, admin, "box-a", Duration::from_secs(60))?;
         let a = agents::open_session(port, admin, "box-a", &dir.path().join("work-here"), Duration::from_secs(60))?;
         first_epoch(port, admin, &a)?;
         let (_box_b, b) = signing_session(dir.path(), port, admin, "box-b", None)?;
