@@ -46,12 +46,36 @@ pub fn find() -> Option<String> {
             None => crate::os::which(bin),
         };
         let Some(full) = found else { continue };
-        let ok = std::process::Command::new(&full).args(["version", "--format", "{{.Server.Version}}"]).stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null()).status().is_ok_and(|s| s.success());
-        if ok {
+        if answers(&full, FIND_WAIT) {
             return Some(full.to_string_lossy().into_owned());
         }
     }
     None
+}
+
+/// How long `find` waits for the engine to answer `version`. A daemon that's stuck never does, and
+/// a runner's start (its sweep, before it dials the server) waited on it for good: the runner
+/// never connected (2026-11-02, a Mac whose Docker Desktop hung).
+const FIND_WAIT: Duration = SWEEP;
+
+/// Whether the CLI at `bin` reaches its daemon (`version` succeeds) within `wait`; one still
+/// waiting then is killed.
+fn answers(bin: &Path, wait: Duration) -> bool {
+    let Ok(mut child) = std::process::Command::new(bin).args(["version", "--format", "{{.Server.Version}}"]).stdin(std::process::Stdio::null()).stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null()).spawn() else {
+        return false;
+    };
+    let until = Instant::now() + wait;
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => return status.success(),
+            Ok(None) if Instant::now() < until => std::thread::sleep(Duration::from_millis(50)),
+            _ => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return false;
+            }
+        }
+    }
 }
 
 /// How long a probe of the container engine is waited for: a runner's report of what it can do
