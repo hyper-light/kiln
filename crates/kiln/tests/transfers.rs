@@ -1942,6 +1942,7 @@ fn w27_r08_relays_blue_greens_forwarder() -> anyhow::Result<()> {
         }
         done.map_err(|e| anyhow::anyhow!("{fault:?}: the upgrade: {e}"))?;
         let blue = format!("{}instance/main", on("box-a"));
+        let blue = blue.as_str();
         let v = until(Duration::from_secs(90), || {
             let v = relays(port, admin, 20)?;
             let (n, missing) = stream_counts(&v, blue, "frames forwarded to ");
@@ -1954,7 +1955,7 @@ fn w27_r08_relays_blue_greens_forwarder() -> anyhow::Result<()> {
         let (forwarded, _) = stream_counts(&v, blue, "frames forwarded to ");
         match fault {
             None => {
-                let receipts = receipts_by(dir.path(), &on("box-a"))?.into_iter().filter(|r| walked_hops(port, admin, r).is_ok_and(|h| h.get(1).is_some_and(|(_, c)| c.ends_with(&blue)))).count();
+                let receipts = receipts_by(dir.path(), &on("box-a"))?.into_iter().filter(|r| walked_hops(port, admin, r).is_ok_and(|h| h.get(1).is_some_and(|(_, c)| c.ends_with(blue)))).count();
                 assert_eq!(u64::try_from(receipts)?, forwarded, "the new build's receipt of each frame of words forwarded: {v}");
                 assert_eq!(relay_breaks(port, admin, blue)?, Vec::<Value>::new(), "each passed on unchanged");
             }

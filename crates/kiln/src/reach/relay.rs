@@ -434,11 +434,11 @@ mod tests {
             _ => None,
         };
         let sent: Vec<Vec<u8>> = (0..RUN + 3).map(|i| i.to_be_bytes().to_vec()).collect();
-        r.forward("mac", 10, frame("linux", "L1", true, b"hello"), peers);
+        r.forward("mac", 10, frame("linux", "L1", true, b"hello"), peers, str::to_owned);
         for d in &sent {
-            r.forward("mac", 10, frame("linux", "L1", false, d), peers);
+            r.forward("mac", 10, frame("linux", "L1", false, d), peers, str::to_owned);
         }
-        r.forward("linux", 20, frame("mac", "L1", false, b"hi"), peers);
+        r.forward("linux", 20, frame("mac", "L1", false, b"hi"), peers, str::to_owned);
         let passed = r.take_passed();
         let mut want = Frames::new(1);
         want.push(b"hello");
@@ -452,30 +452,30 @@ mod tests {
         // Its close: what's left each way; the goodbye itself carries nothing.
         let mut bye = frame("linux", "L1", false, b"");
         bye.close = Some("done".into());
-        r.forward("mac", 10, bye, peers);
+        r.forward("mac", 10, bye, peers, str::to_owned);
         let left: Vec<(String, u64, u64, u64)> = r.take_passed().into_iter().map(|p| (p.from, p.seq, p.frames.first(), p.frames.count())).collect();
         assert_eq!(left, vec![("mac".to_owned(), 2, RUN + 1, 4), ("linux".to_owned(), 1, 1, 1)]);
         // A quiet link: its run is cut by the first frame past RUN_FOR, as frames flow.
-        r.forward("mac", 10, frame("linux", "L2", true, b"again"), peers);
-        r.forward("mac", 10, frame("linux", "L2", false, b"a while"), peers);
+        r.forward("mac", 10, frame("linux", "L2", true, b"again"), peers, str::to_owned);
+        r.forward("mac", 10, frame("linux", "L2", false, b"a while"), peers, str::to_owned);
         assert!(r.take_passed().is_empty(), "two frames, just now: no run yet");
         r.age("L2", RUN_FOR);
-        r.forward("mac", 10, frame("linux", "L2", false, b"later"), peers);
+        r.forward("mac", 10, frame("linux", "L2", false, b"later"), peers, str::to_owned);
         assert_eq!(r.take_passed().into_iter().map(|p| (p.seq, p.frames.first(), p.frames.count())).collect::<Vec<_>>(), vec![(1, 1, 3)]);
         // A run whose frames stopped coming, cut once RUN_FOR has gone by: not before.
-        r.forward("mac", 10, frame("linux", "L2", false, b"then quiet"), peers);
+        r.forward("mac", 10, frame("linux", "L2", false, b"then quiet"), peers, str::to_owned);
         assert!(r.due().is_empty(), "just now");
         r.age("L2", RUN_FOR);
         assert_eq!(r.due().into_iter().map(|p| (p.seq, p.frames.first(), p.frames.count())).collect::<Vec<_>>(), vec![(2, 4, 1)]);
         assert!(r.due().is_empty(), "cut once");
         // A connection lost: what's left.
-        r.forward("mac", 10, frame("linux", "L2", false, b"last"), peers);
+        r.forward("mac", 10, frame("linux", "L2", false, b"last"), peers, str::to_owned);
         r.lost(20, "disconnected");
         assert_eq!(r.take_passed().into_iter().map(|p| (p.link, p.seq, p.frames.first(), p.frames.count())).collect::<Vec<_>>(), vec![("L2".to_owned(), 3, 5, 1)]);
         // Not recording: nothing.
         let mut quiet = Relay::default();
         quiet.announce("linux", Announce { fingerprint: "f".into(), accept: true, version: 1 });
-        quiet.forward("mac", 10, frame("linux", "L3", true, b"hello"), peers);
+        quiet.forward("mac", 10, frame("linux", "L3", true, b"hello"), peers, str::to_owned);
         assert!(quiet.take_passed().is_empty() && quiet.links() == 1);
         Ok(())
     }
