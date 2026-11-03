@@ -44,6 +44,8 @@ const-oid = { version = "0.9", features = ["db"] }
 anyhow = "1.0.104"
 proptest = "1"
 rcgen = { version = "0.14", default-features = false, features = ["aws_lc_rs", "pem", "x509-parser"] }
+# Placement's model under kiln-sim's nemesis (docs/sim.md): `place::model`.
+kiln-sim = { path = "../kiln-sim" }
 
 [[bench]]
 name = "expr"
@@ -55,6 +57,11 @@ harness = false
 
 [[bench]]
 name = "sched_mixed"
+harness = false
+
+# Placement's decisions, timed against Envoy's, HAProxy's and nginx's picks (docs/needs.md §11, E5).
+[[bench]]
+name = "place"
 harness = false
 
 [lints]
