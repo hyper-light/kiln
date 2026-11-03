@@ -308,6 +308,58 @@ where
     blocking_in(SHARE_FS, f).await
 }
 
+/// Run `f` on a thread of its own, not the pool's: for a job that mostly waits on other work, for
+/// seconds to a minute (an MCP program waiting on its calls), so it holds none of the pool's few
+/// places while it waits (the work it waits on may need them).
+pub async fn on_thread<R, F>(name: &str, f: F) -> anyhow::Result<R>
+where
+    F: FnOnce() -> R + Send + 'static,
+    R: Send + 'static,
+{
+    let (tx, rx) = futures::channel::oneshot::channel::<R>();
+    std::thread::Builder::new()
+        .name(name.to_owned())
+        .spawn(move || {
+            let _ = tx.send(f());
+        })
+        .context("spawn a thread")?;
+    rx.await.map_err(|_| anyhow::anyhow!("the job's thread ended without a result (it panicked)"))
+}
+
+/// Gives the shard to its other tasks once, where any of them want it (hyper-rt's `maybe_yield`,
+/// after Seastar's): a loop whose waits are all ready at once (a channel that always has the next
+/// item) otherwise holds its shard for as long as they are, and every socket and timer on it waits,
+/// the HTTP listener among them. Where nothing else wants the shard it goes on at once.
+pub async fn maybe_yield() {
+    hyper_rt::futures::maybe_yield().await;
+}
+
+/// A loop's turns on its shard: it works on for as long as one of the shard's steps may (its step
+/// quantum: hyper-rt's online estimate of what a wake costs, else its configured step budget), then
+/// gives the shard to its other tasks where they want it ([`maybe_yield`]).
+pub struct Turns(Instant);
+
+impl Turns {
+    pub fn new() -> Self {
+        Self(Instant::now())
+    }
+
+    /// After a piece of the loop's work: its turn given up once it has had a step's quantum.
+    pub async fn after(&mut self) {
+        let quantum = hyper_rt::futures::step_budget_ns().map(Duration::from_nanos);
+        if quantum.is_some_and(|q| self.0.elapsed() >= q) {
+            maybe_yield().await;
+            self.0 = Instant::now();
+        }
+    }
+}
+
+impl Default for Turns {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 /// Run `f` on a named share of the blocking pool. Waits (instead of failing) while the share's
 /// queue is full; if the pool is unavailable the job gets a thread of its own.
 pub async fn blocking_in<R, F>(share: &'static str, f: F) -> anyhow::Result<R>

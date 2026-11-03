@@ -1705,12 +1705,16 @@ impl Hub {
 
     /// Consume transport events forever (supervised).
     pub async fn net_loop(self: Arc<Self>, rx: async_channel::Receiver<NetEvent>) -> anyhow::Result<()> {
+        // Runners keep its channel full: its turns are bounded, or it holds its shard (the HTTP
+        // listener's) for as long as they send.
+        let mut turns = crate::rt::Turns::new();
         while let Ok(ev) = rx.recv().await {
             // What can't be read is refused and noted where it's read (`unreadable`); what's left is
             // a message read whole that couldn't be applied.
             if let Err(e) = self.on_net(ev).await {
                 tracing::warn!(error = %format!("{e:#}"), "a runner's message couldn't be applied");
             }
+            turns.after().await;
         }
         anyhow::bail!("transport event stream ended")
     }
@@ -1767,7 +1771,13 @@ impl Hub {
             NetEvent::Frame { peer, kind: Kind::Log, lane, data } if lane != proto::LANE_CONVO && lane != proto::LANE_FILES => match proto::read_whole::<proto::LogChunk>(&data) {
                 Ok(chunk) => {
                     if self.owns_job(peer, &chunk.job) {
-                        self.logs.append(&chunk.job, chunk.idx, &chunk.data);
+                        // Written on the blocking pool, in order (each waited for): a busy disk
+                        // holds up the next of this loop's messages, never the shard and its
+                        // sockets (the HTTP listener among them).
+                        let logs = self.logs.clone();
+                        if let Err(e) = crate::rt::blocking(move || logs.append(&chunk.job, chunk.idx, &chunk.data)).await {
+                            tracing::warn!(error = %format!("{e:#}"), "a job's log chunk couldn't be written");
+                        }
                     }
                 }
                 Err(e) => self.unreadable(peer, Wire::Runner, "a log chunk".to_owned(), e.code(), e.why("LogChunk"), true).await,
@@ -2617,9 +2627,7 @@ impl Hub {
                     (inst.get(peer).map(crate::instances::Instance::label), present, others)
                 };
                 if let Some(me) = &me {
-                    for id in &inv.sessions {
-                        self.harness.held_by(id, me);
-                    }
+                    self.harness.held_by_all(&inv.sessions, me);
                 }
                 let own = inv.sessions.clone();
                 inv.sessions.extend(others);

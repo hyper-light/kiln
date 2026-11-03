@@ -39,7 +39,9 @@ struct Live {
 pub struct Logs {
     dir: PathBuf,
     max_bytes: u64,
-    live: Arc<Mutex<HashMap<String, Live>>>,
+    /// Each live job's, under a lock of its own: what writes a job's files holds its own lock alone,
+    /// so a slow disk holds up that job's writer, never a viewer of another (or the list).
+    live: Arc<Mutex<HashMap<String, Arc<Mutex<Live>>>>>,
 }
 
 fn safe(id: &str) -> String {
@@ -70,16 +72,17 @@ impl Logs {
     }
 
     fn with_live<R>(&self, job: &str, f: impl FnOnce(&mut Live) -> R) -> R {
-        let mut g = self.live.lock();
-        let live = g.entry(job.to_owned()).or_insert_with(|| {
+        // The list's lock for the job's own, held as long as that takes; then the job's alone.
+        let live = Arc::clone(self.live.lock().entry(job.to_owned()).or_insert_with(|| {
             let (mut tx, rx) = async_broadcast::broadcast(1024);
             // Slow viewers lose the oldest chunks (and are told so) instead of stalling writers.
             tx.set_overflow(true);
             tx.set_await_active(false);
             let idle = rx.deactivate();
-            Live { tx, _idle: idle, files: HashMap::new(), times: HashMap::new(), digests: HashMap::new(), bytes: 0, truncated: false }
-        });
-        f(live)
+            Arc::new(Mutex::new(Live { tx, _idle: idle, files: HashMap::new(), times: HashMap::new(), digests: HashMap::new(), bytes: 0, truncated: false }))
+        }));
+        let mut g = live.lock();
+        f(&mut g)
     }
 
     /// Append output for a step. Never fails the caller: disk errors are logged and the data still
@@ -191,8 +194,10 @@ impl Logs {
 
     /// The job is over: close files, tell viewers, drop the channel.
     pub fn finish(&self, job: &str) {
-        if let Some(live) = self.live.lock().remove(job) {
-            let _ = live.tx.try_broadcast(LogEvent::End);
+        let live = self.live.lock().remove(job);
+        if let Some(live) = live {
+            // After its last piece is written (a writer holding its lock writes first).
+            let _ = live.lock().tx.try_broadcast(LogEvent::End);
         }
     }
 

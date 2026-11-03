@@ -112,6 +112,16 @@ pub struct Full;
 /// receiver had it again (each item past a gap brings one): until then it doesn't send it again.
 pub const WANT_AGAIN: Duration = Duration::from_millis(250);
 
+/// How long an item waits for its answer before it goes again: its stream's retransmission timeout
+/// as RFC 6298 §2 has it, RTO = SRTT + K·RTTVAR (K = 4), from how long its answers take (smoothed
+/// with the RFC's gains, α = 1/8 for SRTT and β = 1/4 for RTTVAR) and from items sent once alone
+/// (Karn's algorithm, §3), never less than the stream's patience (as §2.4 bounds RTO from below).
+/// An answer that's late is mostly a receiver that's slow, not a frame lost: sent again at each
+/// patience, a slow receiver's whole backlog (a session's snapshot, megabytes) made it slower.
+fn rto(srtt: Option<Duration>, rttvar: Duration, patience: Duration) -> Duration {
+    srtt.map_or(patience, |srtt| srtt.saturating_add(rttvar.saturating_mul(4))).max(patience)
+}
+
 /// Whether an item was wanted since it last went.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Wanted {
@@ -132,15 +142,18 @@ struct Pending {
     wanted: Wanted,
     /// When it last went again for a want, on this link.
     went_for_want: Option<Instant>,
+    /// It went more than once: its answer can't say how long one takes (Karn's algorithm).
+    resent: bool,
 }
 
 impl Pending {
     fn new(seq: Seq, body: Vec<u8>, picture: bool) -> Self {
-        Self { seq, body, picture, sent: None, wanted: Wanted::No, went_for_want: None }
+        Self { seq, body, picture, sent: None, wanted: Wanted::No, went_for_want: None, resent: false }
     }
 
     /// Not sent on this link yet: it goes as if new.
     fn unsent(&mut self) {
+        self.resent |= self.sent.is_some();
         self.sent = None;
         self.wanted = Wanted::No;
         self.went_for_want = None;
@@ -156,15 +169,38 @@ struct Out {
     bytes: usize,
     /// Of `bytes`, its picture's: the room bounds only the rest, its backlog.
     picture: usize,
+    /// How long its answers take, smoothed, and how much that varies (RFC 6298 §2): none before its
+    /// first answer to an item sent once.
+    srtt: Option<Duration>,
+    rttvar: Duration,
+    /// When each item answered since the last poll went, of those sent once: what its answer took
+    /// is measured at the next poll (this side reads no clock but `poll`'s).
+    answered_sent: Vec<Instant>,
 }
 
 impl Default for Out {
     fn default() -> Self {
-        Self { next: 1, answered: 0, pending: VecDeque::new(), bytes: 0, picture: 0 }
+        Self { next: 1, answered: 0, pending: VecDeque::new(), bytes: 0, picture: 0, srtt: None, rttvar: Duration::ZERO, answered_sent: Vec::new() }
     }
 }
 
 impl Out {
+    /// What an answer that came `r` after its item went says (RFC 6298 §2.2 for the first, §2.3
+    /// after it).
+    fn sample(&mut self, r: Duration) {
+        match self.srtt {
+            None => {
+                self.srtt = Some(r);
+                self.rttvar = r / 2;
+            }
+            Some(srtt) => {
+                let off = if srtt > r { srtt.saturating_sub(r) } else { r.saturating_sub(srtt) };
+                self.rttvar = self.rttvar.saturating_sub(self.rttvar / 4).saturating_add(off / 4);
+                self.srtt = Some(srtt.saturating_sub(srtt / 8).saturating_add(r / 8));
+            }
+        }
+    }
+
     /// What it keeps unanswered past its picture.
     fn backlog(&self) -> usize {
         self.bytes.saturating_sub(self.picture)
@@ -237,11 +273,15 @@ impl Sender {
             return out;
         }
         for (stream, o) in &mut self.streams {
+            for at in std::mem::take(&mut o.answered_sent) {
+                o.sample(now.saturating_duration_since(at));
+            }
+            let wait = rto(o.srtt, o.rttvar, self.patience);
             let low = o.answered;
             for p in &mut o.pending {
                 let due = match p.sent {
                     None => true,
-                    Some(at) if now.saturating_duration_since(at) >= self.patience => true,
+                    Some(at) if now.saturating_duration_since(at) >= wait => true,
                     Some(_) => match p.wanted {
                         Wanted::No => false,
                         Wanted::Now => true,
@@ -252,6 +292,7 @@ impl Sender {
                     if p.wanted != Wanted::No {
                         p.went_for_want = Some(now);
                     }
+                    p.resent |= p.sent.is_some();
                     p.wanted = Wanted::No;
                     p.sent = Some(now);
                     out.push(Frame::Item { stream: stream.clone(), seq: p.seq, low, body: p.body.clone() });
@@ -330,6 +371,11 @@ impl Sender {
                 if p.picture {
                     o.picture = o.picture.saturating_sub(p.body.len());
                 }
+                if !p.resent
+                    && let Some(at) = p.sent
+                {
+                    o.answered_sent.push(at);
+                }
             }
             events.push(Event::Answered { stream: has.stream.clone(), seq, outcome });
         }
@@ -351,6 +397,21 @@ impl Sender {
     /// What `stream` keeps unanswered, oldest first (what a durable stream keeps on disk).
     pub fn pending(&self, stream: &str) -> Vec<Seq> {
         self.streams.get(stream).map(|o| o.pending.iter().map(|p| p.seq).collect()).unwrap_or_default()
+    }
+
+    /// Whether the link is up and the peer has said what it has.
+    pub fn up(&self) -> bool {
+        self.up
+    }
+
+    /// Whether this side sends `stream` (it has items of it, or had).
+    pub fn sends(&self, stream: &str) -> bool {
+        self.streams.contains_key(stream)
+    }
+
+    /// Through which item `stream` is answered (0: none yet).
+    pub fn answered_through(&self, stream: &str) -> Seq {
+        self.streams.get(stream).map_or(0, |o| o.answered)
     }
 
     /// Every stream's unanswered items, counted.
@@ -646,6 +707,33 @@ mod tests {
         }
         let events = tx.on_frame(stale);
         assert!(!events.iter().any(|e| matches!(e, Event::Regressed { .. })), "{events:?}");
+    }
+
+    /// A stream whose answers take long (a receiver behind) waits about as long again for each
+    /// before it sends it again, not its patience: RFC 6298 §2's RTO from what its answers took.
+    /// A slow receiver isn't sent again and again what it has yet to take.
+    #[test]
+    fn a_stream_whose_answers_take_long_waits_as_long_for_them() {
+        let base = Instant::now();
+        let mut tx = Sender::new(1 << 20, Duration::from_secs(10));
+        let mut rx = Receiver::new();
+        tx.on_frame(rx.have());
+        let _ = tx.push("s", vec![1]);
+        let first = tx.poll(base);
+        // Its answer comes 30 s after it went (SRTT 30 s, RTTVAR 15 s: RTO 90 s).
+        for a in deliver(&mut rx, first) {
+            tx.on_frame(a);
+        }
+        let _ = tx.push("s", vec![2]);
+        assert_eq!(items(&tx.poll(t(base, 30_000))), vec![2]);
+        assert!(tx.poll(t(base, 40_001)).is_empty(), "not again at its patience");
+        assert!(tx.poll(t(base, 119_999)).is_empty(), "nor before its answers' RTO");
+        let again = tx.poll(t(base, 120_000));
+        assert_eq!(items(&again), vec![2], "again once an answer that long is overdue");
+        for a in deliver(&mut rx, again) {
+            tx.on_frame(a);
+        }
+        assert_eq!(tx.unanswered(), 0);
     }
 
     /// A sender's frames, applied by a receiver that takes everything: its answers.
