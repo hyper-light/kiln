@@ -298,10 +298,13 @@ fn e5_an_offer_gives_way_to_a_runner_sure_to_finish_sooner() -> Result<(), Strin
     let _ = o.heard("lin-b", fast, 1);
     let slow = ToOwner::Offer { run: "r1".into(), fence: Fence { epoch: 1, n: 1 }, got: res(0, 0), free: res(8, 8), predicted: Some(3_600_000), disk: Default::default() };
     let acts = o.heard("lin-a", slow, 2);
-    assert_eq!(told(&acts), vec![("lin-a".to_owned(), "decline"), ("lin-a".to_owned(), "probe")], "{acts:?}");
+    assert_eq!(told(&acts), vec![("lin-a".to_owned(), "decline")], "{acts:?}");
     assert_eq!(o.stage("r1"), Some(("waiting", None)));
+    // lin-b's news (it slipped): lin-a is probed again, with no timer.
+    let slipped = ToOwner::Waiting { run: "r1".into(), reason: Reason::Line, place: Place::of(4), start: Estimate { soonest: Some(30_000), latest: Some(9_000_000) }, predicted: Some(600_000), free: res(0, 0) };
+    assert_eq!(told(&o.heard("lin-b", slipped, 3)), vec![("lin-a".to_owned(), "probe")]);
     let unknown = ToOwner::Offer { run: "r1".into(), fence: Fence { epoch: 1, n: 2 }, got: res(0, 0), free: res(8, 8), predicted: None, disk: Default::default() };
-    assert!(told(&o.heard("lin-a", unknown, 3)).contains(&("lin-a".to_owned(), "take")));
+    assert!(told(&o.heard("lin-a", unknown, 4)).contains(&("lin-a".to_owned(), "take")));
     Ok(())
 }
 

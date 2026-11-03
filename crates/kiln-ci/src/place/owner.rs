@@ -112,6 +112,9 @@ enum Word {
     Never(String),
     /// Its link is down: probed again when it's back.
     Away,
+    /// It offered, and the offer was declined for a runner sure to finish sooner: probed again
+    /// when what's known of the others changes.
+    Passed,
 }
 
 /// Where a ticket stands.
@@ -357,6 +360,17 @@ impl Owner {
         }
     }
 
+    /// Probes again each runner passed over for one sure to finish sooner (what's known of the
+    /// others changed): news, never a timer, decides when.
+    fn unpass(&mut self, run: &str, out: &mut Vec<Act>) {
+        let passed: Vec<String> = self.tickets.get(run).map(|t| t.words.iter().filter(|(_, w)| **w == Word::Passed).map(|(r, _)| r.clone()).collect()).unwrap_or_default();
+        for r in passed {
+            if self.machines.get(&r).is_some_and(|m| m.connected) {
+                self.probe_at(run, &r, out);
+            }
+        }
+    }
+
     /// The queued answer, from every runner's word, its times in this node's clock.
     fn queued(&self, t: &Ticket) -> Answer {
         let mut counts: BTreeMap<String, u32> = BTreeMap::new();
@@ -368,6 +382,7 @@ impl Owner {
                 Word::Asked => "haven't answered".to_owned(),
                 Word::Offered => "offered it".to_owned(),
                 Word::Away => "link down".to_owned(),
+                Word::Passed => "offered it, another sure to finish sooner".to_owned(),
                 Word::Never(why) => why.clone(),
                 Word::Waiting { reason, place: p, start, free, .. } => {
                     if p.lo > 0 && place.as_ref().is_none_or(|b| p.lo < b.lo) {
@@ -602,6 +617,7 @@ impl Owner {
                     if let Some(t) = self.tickets.get_mut(&run) {
                         t.passed.insert(runner.to_owned(), "gone".into());
                     }
+                    self.unpass(&run, out);
                     self.heard_of(&run, out);
                 }
             }
@@ -655,6 +671,7 @@ impl Owner {
             match stage {
                 Stage::Waiting if !matches!(word, Some(Word::Never(_))) => {
                     self.set_word(&run, runner, Word::Away);
+                    self.unpass(&run, out);
                     self.heard_of(&run, out);
                 }
                 #[cfg(test)]
@@ -680,7 +697,7 @@ impl Owner {
         for run in self.runs_at(runner) {
             let Some((stage, here, word)) = self.where_is(&run, runner) else { continue };
             match stage {
-                Stage::Waiting if matches!(word, Some(Word::Away | Word::Asked)) => {
+                Stage::Waiting if matches!(word, Some(Word::Away | Word::Asked | Word::Passed)) => {
                     self.probe_at(&run, runner, out);
                     self.heard_of(&run, out);
                 }
@@ -809,9 +826,10 @@ impl Owner {
             ToOwner::Offer { fence, got: g, free, predicted, .. } => match stage {
                 Stage::Waiting => {
                     if self.sooner_elsewhere(&run, runner, predicted, now) {
-                        // Another runner is sure to finish it sooner: this one keeps it in line.
+                        // Another runner is sure to finish it sooner: this one's room goes back, and
+                        // it's probed again when what's known of the others changes.
                         out.push(Act::Tell { runner: r, msg: ToRunner::Decline { run: run.clone(), fence } });
-                        self.probe_at(&run, runner, &mut out);
+                        self.set_word(&run, runner, Word::Passed);
                         self.heard_of(&run, &mut out);
                         return out;
                     }
@@ -908,6 +926,7 @@ impl Owner {
             ToOwner::Waiting { reason, place, start, predicted, free, .. } => {
                 if stage == Stage::Waiting && probed {
                     self.set_word(&run, runner, Word::Waiting { reason, place, start, predicted, free });
+                    self.unpass(&run, &mut out);
                     self.heard_of(&run, &mut out);
                 }
             }
@@ -933,6 +952,7 @@ impl Owner {
                     };
                     out.push(Act::Answer { run, answer: Answer::Never { need: format!("takes it as asked ({need})"), nearest } });
                 } else {
+                    self.unpass(&run, &mut out);
                     self.heard_of(&run, &mut out);
                 }
             }
