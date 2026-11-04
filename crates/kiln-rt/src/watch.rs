@@ -42,7 +42,10 @@
 //!   shard. Spawns addressed to one shard ([`crate::runtime::submit_to_holder`], a shard's own spawns) stay.
 
 use std::panic::Location;
-use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicU8, AtomicU64, Ordering};
+#[cfg(loom)]
+use loom::sync::atomic::{AtomicBool, AtomicPtr, AtomicU8, AtomicU64, Ordering, fence};
+#[cfg(not(loom))]
+use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicU8, AtomicU64, Ordering, fence};
 use std::sync::mpsc::{Receiver, RecvTimeoutError, SyncSender, sync_channel};
 use std::thread::JoinHandle;
 use std::time::Duration;
@@ -225,7 +228,7 @@ impl Board {
     fn write(&self, report: &StallReport) {
         let seq = self.seq.load(Ordering::Relaxed);
         self.seq.store(seq.wrapping_add(1), Ordering::Relaxed);
-        std::sync::atomic::fence(Ordering::Release);
+        fence(Ordering::Release);
         self.task.store(report.task.0.word(), Ordering::Relaxed);
         let at = report
             .spawned_at
@@ -248,7 +251,7 @@ impl Board {
                 return None;
             }
             if before & 1 == 1 {
-                std::hint::spin_loop();
+                spin();
                 continue;
             }
             let task = self.task.load(Ordering::Relaxed);
@@ -257,7 +260,7 @@ impl Board {
             let cpu_ns = self.cpu_ns.load(Ordering::Relaxed);
             let whose = self.whose.load(Ordering::Relaxed);
             let number = self.reports.load(Ordering::Relaxed);
-            std::sync::atomic::fence(Ordering::Acquire);
+            fence(Ordering::Acquire);
             if self.seq.load(Ordering::Relaxed) != before {
                 continue;
             }
@@ -271,6 +274,18 @@ impl Board {
             });
         }
     }
+}
+
+/// A wait for a writer mid-report: a spin, or under loom a yield, which loom needs to schedule the writer.
+#[cfg(not(loom))]
+fn spin() {
+    std::hint::spin_loop();
+}
+
+/// A wait for a writer mid-report: a spin, or under loom a yield, which loom needs to schedule the writer.
+#[cfg(loom)]
+fn spin() {
+    loom::thread::yield_now();
 }
 
 /// Whether the watchdog sees the shard `holder` names held in one poll past its limit now: placement sends no
@@ -623,4 +638,63 @@ fn place(
         }
     }
     Err(request)
+}
+
+#[cfg(test)]
+#[cfg(loom)]
+mod loom_tests {
+    use super::*;
+    use crate::mem::loom_bounds;
+
+    /// The shard begins a poll, ends it and begins the next while the watchdog reads which poll runs: a read whole
+    /// names the task of the poll its count is, never the next poll's task under the last one's count. Without the
+    /// count read again after the word, an interleaving pairs the first poll's count with the second's task.
+    #[test]
+    fn a_poll_read_whole_names_its_own_task() {
+        loom_bounds::explore("watch: a poll's count and its task", || {
+            let watch: &'static Watch = Box::leak(Box::new(Watch::default()));
+            let shard = loom::thread::spawn(move || {
+                watch.begin(11);
+                watch.end();
+                watch.begin(22);
+            });
+            let watchdog = loom::thread::spawn(move || watch.running());
+            shard.join().unwrap();
+            let seen = watchdog.join().unwrap();
+            if let Some((polls, task)) = seen {
+                assert!(
+                    (polls == 1 && task == 11) || (polls == 3 && task == 22),
+                    "poll {polls} read with task {task}"
+                );
+            }
+        });
+    }
+
+    /// The watchdog writes one report and then another while a reader reads: what the reader takes is one report
+    /// whole, every field of the same one.
+    #[test]
+    fn a_report_read_whole_is_one_report() {
+        loom_bounds::explore("watch: a report read whole", || {
+            let board: &'static Board = Box::leak(Box::new(Board::default()));
+            let report = |n: u64| StallReport {
+                number: n,
+                task: TaskId(Encoded::from_word(n)),
+                spawned_at: None,
+                held_ns: n,
+                cpu_ns: Some(n),
+                whose: Whose::Task,
+            };
+            let writer = loom::thread::spawn(move || {
+                board.write(&report(1));
+                board.write(&report(2));
+            });
+            let reader = loom::thread::spawn(move || board.read());
+            writer.join().unwrap();
+            let read = reader.join().unwrap();
+            if let Some(r) = read {
+                assert!(r.number == 1 || r.number == 2, "{r:?}");
+                assert_eq!(r, report(r.number), "a report read whole");
+            }
+        });
+    }
 }

@@ -592,7 +592,7 @@ mod tests {
             let mut now_us = 0;
             for i in 0..2_000u64 {
                 now_us += 10_000;
-                let wait = [20, 1_000, 40_000, 125_000, 300_000, 3, 600][(i % 7) as usize];
+                let wait = [20, 1_000, 40_000, 125_000, 300_000, 3, 600].get((i % 7) as usize).copied().unwrap_or(0);
                 assert!(!matches!(feed(&mut d, Some(wait), QUANTUM_NS, now_us), Event::Alarm(_)), "calm, sample {i}");
             }
             for _ in 0..500u64 {
