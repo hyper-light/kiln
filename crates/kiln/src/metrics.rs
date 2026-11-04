@@ -1182,6 +1182,7 @@ pub fn render() -> String {
     render_bus(&mut o);
     render_net(&mut o);
     render_wire(&mut o);
+    crate::overload::render(&mut o);
 
     let samples = agent_samples().read();
     if !samples.is_empty() {

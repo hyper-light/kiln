@@ -61,6 +61,8 @@ pub struct SpawnRequest {
     /// Where it was made (`#[track_caller]`): what the watchdog names for its task should it hold its shard
     /// (`crate::watch`).
     pub(crate) at: &'static std::panic::Location<'static>,
+    /// The class its task starts in (`crate::coop::Class`); `None`: Normal.
+    pub(crate) class: Option<crate::coop::Class>,
 }
 
 impl SpawnRequest {
@@ -75,6 +77,7 @@ impl SpawnRequest {
             parent,
             receipt: ReceiptSlot::none(),
             at: std::panic::Location::caller(),
+            class: None,
         }
     }
 
@@ -91,9 +94,19 @@ impl SpawnRequest {
                 parent,
                 receipt: slot,
                 at: std::panic::Location::caller(),
+                class: None,
             },
             receipt,
         )
+    }
+}
+
+impl SpawnRequest {
+    /// The request with its task starting in `class` (kiln's goal 6, `crate::coop::Class`): a connection's task
+    /// reads its first request at the class that reads requests promptly, before it knows the request's own.
+    pub fn in_class(mut self, class: crate::coop::Class) -> Self {
+        self.class = Some(class);
+        self
     }
 }
 

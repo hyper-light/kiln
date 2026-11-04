@@ -154,6 +154,11 @@ pub struct Api {
 
 impl srv::Handler for Api {
     async fn handle(self: Arc<Self>, req: Request) -> Response {
+        // A shard behind its calm answers what it sheds at once, before the body is read (goal 6, plan
+        // 01a1a59c2abe step 4).
+        if let Some(shed) = crate::overload::shed_request(&req) {
+            return shed;
+        }
         let hub = self.hub.clone();
         match route(hub, req).await {
             Ok(r) => r,
@@ -6261,6 +6266,12 @@ fn metrics_handler(hub: &Hub, headers: &HeaderMap) -> Response {
 }
 
 async fn readyz(hub: &Hub) -> Response {
+    // Overload (goal 6, step 4): not ready while every shard sheds the API; else ready, saying what is shed.
+    let overload = crate::overload::readiness();
+    if let Some((true, why)) = &overload {
+        return srv::text(StatusCode::SERVICE_UNAVAILABLE, why);
+    }
+    let note = overload.map(|(_, why)| format!(" ({why})")).unwrap_or_default();
     // Observe's store, open but replaying its log after a start, answers part of what it holds:
     // not ready until it has applied it all (seconds). A store that didn't open doesn't hold the
     // server back: the rest of kiln answers without it.
@@ -6272,7 +6283,7 @@ async fn readyz(hub: &Hub) -> Response {
         return srv::text(StatusCode::SERVICE_UNAVAILABLE, &format!("observe's store is replaying its log ({} of {} entries applied)", v.applied, v.replay_to));
     }
     match hub.store.call(|c| Ok(c.query_row("SELECT 1", [], |r| r.get::<_, i64>(0))?)).await {
-        Ok(_) => srv::text(StatusCode::OK, "ready"),
+        Ok(_) => srv::text(StatusCode::OK, &format!("ready{note}")),
         Err(e) => srv::text(StatusCode::SERVICE_UNAVAILABLE, &format!("store: {e:#}")),
     }
 }

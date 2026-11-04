@@ -650,6 +650,7 @@ impl Shard {
             parent,
             receipt,
             at,
+            class,
         } = request;
         if self.core.shutting_down {
             count(&self.desk.live.refused_at_shutdown, 1);
@@ -668,6 +669,7 @@ impl Shard {
             joinable: false,
             service,
             at,
+            class,
         });
         if let Ok(task) = &admitted {
             self.install_listed(task.0.slot());
@@ -823,6 +825,7 @@ impl Shard {
             joinable,
             service,
             at: _,
+            class: _,
         } = incoming;
         let parent = parent.filter(|p| self.live(*p));
         let (generation, cancelled) = self.desk.task(slot).map_or((0, false), |cell| {

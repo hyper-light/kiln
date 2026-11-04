@@ -188,6 +188,12 @@ fn submit(slot: &Arc<Mutex<Option<Boxed>>>) -> bool {
 /// watchdog (kiln's goal 6, plan 01a1a59c2abe step 2). Admitted tasks stay where they are.
 #[track_caller]
 fn submit_spread(slot: &Arc<Mutex<Option<Boxed>>>) -> bool {
+    submit_spread_as(slot, hyper_rt::coop::Class::Normal)
+}
+
+/// [`submit_spread`], the task starting in `class` (`hyper_rt::coop::Class`).
+#[track_caller]
+fn submit_spread_as(slot: &Arc<Mutex<Option<Boxed>>>, class: hyper_rt::coop::Class) -> bool {
     let Ok(rt) = rt() else { return false };
     let n = rt.holders.len();
     let start = rt.next.fetch_add(1, Ordering::Relaxed);
@@ -196,7 +202,7 @@ fn submit_spread(slot: &Arc<Mutex<Option<Boxed>>>) -> bool {
         for i in 0..n {
             if let Some(holder) = rt.holders.get(start.wrapping_add(i) % n)
                 && hyper_rt::watch::stalled(*holder) == held
-                && hyper_rt::runtime::submit_movable(*holder, bootstrap(slot)).is_ok()
+                && hyper_rt::runtime::submit_movable_as(*holder, class, bootstrap(slot)).is_ok()
             {
                 return true;
             }
@@ -287,6 +293,18 @@ impl kiln_seams::Spawn for RtSpawn {
 pub fn spawn_spread<F: Future<Output = ()> + Send + 'static>(fut: F) {
     let slot = handoff(Box::pin(fut));
     if submit_spread(&slot) || submit(&slot) {
+        return;
+    }
+    tracing::error!("hyper-rt refused a connection task on every shard; connection dropped");
+}
+
+/// Run an accepted connection on the next shard round-robin, as [`spawn_spread`] does, its task starting
+/// Critical: its first request's head must be read before the request's class is known, and reading a
+/// head costs little (`crate::overload::Connection`, goal 6, plan 01a1a59c2abe step 3).
+#[track_caller]
+pub fn spawn_connection<F: Future<Output = ()> + Send + 'static>(fut: F) {
+    let slot = handoff(Box::pin(fut));
+    if submit_spread_as(&slot, hyper_rt::coop::Class::Critical) || submit(&slot) {
         return;
     }
     tracing::error!("hyper-rt refused a connection task on every shard; connection dropped");
@@ -1186,6 +1204,37 @@ mod tests {
             for r in got.lock().unwrap_or_else(PoisonError::into_inner).iter() {
                 assert!(r.as_ref().err().is_none_or(|e| !e.contains("not on a shard thread")), "{r:?}");
             }
+            Ok(())
+        })
+    }
+
+    /// Goal 6, plan 01a1a59c2abe step 1: kiln's own primitives charge the shard's budget, so a loop draining an
+    /// async-channel that always holds its next item (`recv`) yields at its share, and a timer due on its shard
+    /// fires while it loops, where a loop on async-channel's own receive would hold the shard until it ended.
+    #[test]
+    fn g6_s1_a_loop_on_kiln_s_charged_receive_lets_its_shard_s_timer_fire() -> anyhow::Result<()> {
+        block_on(async {
+            let (tx, rx) = async_channel::unbounded::<u64>();
+            let fired = Arc::new(AtomicBool::new(false));
+            let flag = Arc::clone(&fired);
+            // Spawned from a task: on this shard.
+            let _timer = spawn(async move {
+                sleep(Duration::from_millis(5)).await;
+                flag.store(true, Ordering::SeqCst);
+            });
+            let started = Instant::now();
+            let mut items = 0u64;
+            while !fired.load(Ordering::SeqCst) && started.elapsed() < Duration::from_secs(5) {
+                // The channel always holds the next item: the receive never waits.
+                let _ = tx.try_send(items);
+                let _ = recv(&rx).await;
+                items += 1;
+                let until = Instant::now() + Duration::from_micros(10);
+                while Instant::now() < until {
+                    std::hint::spin_loop();
+                }
+            }
+            anyhow::ensure!(fired.load(Ordering::SeqCst), "the timer fired while the loop ran ({items} items, {:?})", started.elapsed());
             Ok(())
         })
     }

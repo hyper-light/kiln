@@ -61,6 +61,27 @@ pub fn submit_movable<F: Future<Output = ()> + Send + 'static>(
     future: F,
 ) -> Result<AdmissionReceipt, RtError> {
     let (request, receipt) = SpawnRequest::with_receipt(Box::pin(future), None);
+    push_movable(holder, request, receipt)
+}
+
+/// [`submit_movable`], its task starting in `class` (kiln's goal 6, `crate::coop::Class`): a server's accepted
+/// connection, whose first request must be read before its own class is known, starts Critical.
+#[track_caller]
+pub fn submit_movable_as<F: Future<Output = ()> + Send + 'static>(
+    holder: registry::SlotHolder,
+    class: crate::coop::Class,
+    future: F,
+) -> Result<AdmissionReceipt, RtError> {
+    let (request, receipt) = SpawnRequest::with_receipt(Box::pin(future), None);
+    push_movable(holder, request.in_class(class), receipt)
+}
+
+/// Queues a movable request, its receipt back when the shard took it.
+fn push_movable(
+    holder: registry::SlotHolder,
+    request: SpawnRequest,
+    receipt: AdmissionReceipt,
+) -> Result<AdmissionReceipt, RtError> {
     match registry::push_movable(holder, Box::new(request)) {
         Ok(()) => Ok(receipt),
         // Handed back: the shard is gone or stopping, or its queue full; the request drops with its receipt answered.

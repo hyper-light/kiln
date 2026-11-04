@@ -88,6 +88,9 @@ pub(crate) struct Incoming {
     /// Where it was spawned (`#[track_caller]`): what the watchdog names for a task that holds its shard
     /// (`crate::watch`).
     pub(crate) at: &'static std::panic::Location<'static>,
+    /// The class it starts in, when its spawner said (`crate::task::SpawnRequest::in_class`); else its spawning
+    /// task's, or Normal.
+    pub(crate) class: Option<crate::coop::Class>,
 }
 
 /// A poller's readiness question: a task that owns a ring the loop cannot see (a client's command ring in
@@ -763,6 +766,7 @@ impl ShardContext {
             joinable: true,
             service: false,
             at: std::panic::Location::caller(),
+            class: None,
         })
     }
 
@@ -775,6 +779,7 @@ impl ShardContext {
             joinable: false,
             service: false,
             at: std::panic::Location::caller(),
+            class: None,
         })
     }
 
@@ -792,6 +797,7 @@ impl ShardContext {
             joinable: true,
             service: true,
             at: std::panic::Location::caller(),
+            class: None,
         })
     }
 
@@ -813,6 +819,7 @@ impl ShardContext {
             joinable,
             service,
             at,
+            class: None,
         })
     }
 
@@ -854,12 +861,13 @@ impl ShardContext {
         cell.joiner.set(None);
         let parented = incoming.parent.is_some();
         cell.parented.set(parented);
+        // The class its spawner gave it; else a task spawned by a task takes its spawner's (`crate::coop::Class`): a
+        // request's helpers share its urgency. Anything else starts Normal.
+        let class = incoming.class.unwrap_or_else(|| {
+            self.current_slot()
+                .map_or(crate::coop::Class::Normal, |spawner| self.local.class_of(spawner))
+        });
         cell.incoming.set(Some(incoming));
-        // A task spawned by a task takes its spawner's class (`crate::coop::Class`): a request's helpers share
-        // its urgency. Anything else starts Normal.
-        let class = self
-            .current_slot()
-            .map_or(crate::coop::Class::Normal, |spawner| self.local.class_of(spawner));
         let _ = self.local.set_class(slot, class);
         if parented {
             self.ask(slot, ask::INSTALL);

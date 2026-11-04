@@ -109,6 +109,11 @@ pub struct Server {
     /// itself: a forwarded or NATed port, a host's Tailscale address. Empty: `webrtc_addr`, or (on
     /// every address) each LAN address of this machine at its port.
     pub webrtc_advertise: Vec<String>,
+    /// A shard whose queueing delay leaves its calm answers Background requests 503 with `Retry-After`,
+    /// and Normal ones too while the API's own delay does; Critical ones (health, sign-in, a person's
+    /// pages and actions) never (`crate::overload`, kiln's goal 6). Off: the delays and alarms are
+    /// still measured and shown on `/metrics` and `/readyz`, and nothing is refused.
+    pub shed: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -413,6 +418,7 @@ impl Default for Server {
             pages_url: None,
             webrtc_addr: None,
             webrtc_advertise: Vec::new(),
+            shed: true,
         }
     }
 }

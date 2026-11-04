@@ -3,7 +3,7 @@
 //! artifacts). One connection per request: the volumes are small and it keeps failure handling
 //! trivial (no pool to poison).
 
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use bytes::Bytes;
 use http::{HeaderName, HeaderValue, header};
@@ -180,10 +180,44 @@ impl RequestBuilder<'_> {
 
     pub async fn send(self) -> anyhow::Result<Response> {
         let timeout = self.timeout;
-        match crate::rt::timeout(timeout, self.send_inner()).await {
-            Ok(r) => r,
-            Err(_) => anyhow::bail!("request timed out after {timeout:?}"),
+        let deadline = Instant::now().checked_add(timeout);
+        let mut request = self;
+        loop {
+            let again = request.again();
+            let left = deadline.map_or(timeout, |d| d.saturating_duration_since(Instant::now()));
+            let resp = match crate::rt::timeout(left, request.send_inner()).await {
+                Ok(r) => r?,
+                Err(_) => anyhow::bail!("request timed out after {timeout:?}"),
+            };
+            // A kiln server that shed the request did nothing with it (goal 6, plan 01a1a59c2abe step 4):
+            // it is sent again after the server's `Retry-After`, while that leaves time before the deadline.
+            match (again, shed_wait(&resp)) {
+                (Some(again), Some(wait)) if Instant::now().checked_add(wait).zip(deadline).is_some_and(|(next, end)| next < end) => {
+                    tracing::debug!(url = %again.url, wait_s = wait.as_secs(), "the server shed the request; sending it again after its Retry-After");
+                    crate::rt::sleep(wait).await;
+                    request = again;
+                }
+                _ => return Ok(resp),
+            }
         }
+    }
+
+    /// The same request again, when its body can be sent again (none, or bytes held; a stream can't).
+    fn again(&self) -> Option<Self> {
+        let body = match &self.body {
+            Payload::None => Payload::None,
+            Payload::Bytes(b) => Payload::Bytes(b.clone()),
+            Payload::Stream(_) => return None,
+        };
+        Some(Self {
+            client: self.client,
+            method: self.method,
+            url: self.url.clone(),
+            headers: self.headers.clone(),
+            body,
+            timeout: self.timeout,
+            reach: self.reach.clone(),
+        })
     }
 
     async fn send_inner(self) -> anyhow::Result<Response> {
@@ -223,6 +257,15 @@ impl RequestBuilder<'_> {
 
 pub struct Response {
     inner: http::Response<Incoming>,
+}
+
+/// How long a kiln server asked a request it shed to wait (`x-kiln-shed`, `Retry-After` in seconds:
+/// `crate::overload`); `None` for any other answer.
+fn shed_wait(resp: &Response) -> Option<Duration> {
+    if resp.status() != 503 || resp.header("x-kiln-shed").is_none() {
+        return None;
+    }
+    resp.header("retry-after")?.trim().parse::<u64>().ok().map(Duration::from_secs)
 }
 
 impl Response {
@@ -266,6 +309,53 @@ impl Response {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Goal 6, plan 01a1a59c2abe step 4: a request a kiln server shed (503, `x-kiln-shed`, `Retry-After`) is sent
+    /// again after the wait it was given, its body with it, and the answer that follows is the one returned; a 503
+    /// without the mark is returned as it is, and a shed answer whose wait would pass the deadline is returned too.
+    #[test]
+    fn g6_s4_a_shed_request_is_sent_again_after_its_retry_after() -> anyhow::Result<()> {
+        use std::io::{Read as _, Write as _};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0")?;
+        let addr = listener.local_addr()?;
+        // Answers, one connection each: shed, then served (echoing the body it read), then a plain 503.
+        let server = std::thread::spawn(move || -> anyhow::Result<Vec<String>> {
+            let mut bodies = Vec::new();
+            for answer in [
+                "HTTP/1.1 503 Service Unavailable\r\nretry-after: 1\r\nx-kiln-shed: background\r\ncontent-length: 0\r\nconnection: close\r\n\r\n",
+                "HTTP/1.1 200 OK\r\ncontent-length: 2\r\nconnection: close\r\n\r\nok",
+                "HTTP/1.1 503 Service Unavailable\r\nretry-after: 1\r\ncontent-length: 0\r\nconnection: close\r\n\r\n",
+            ] {
+                let (mut s, _) = listener.accept()?;
+                s.set_read_timeout(Some(std::time::Duration::from_secs(10)))?;
+                let mut got = Vec::new();
+                let mut buf = [0u8; 4096];
+                while !got.windows(4).any(|w| w == b"\r\n\r\n") || !got.ends_with(b"hello") {
+                    let n = s.read(&mut buf)?;
+                    if n == 0 {
+                        break;
+                    }
+                    got.extend_from_slice(buf.get(..n).unwrap_or_default());
+                }
+                bodies.push(String::from_utf8_lossy(&got).into_owned());
+                s.write_all(answer.as_bytes())?;
+            }
+            Ok(bodies)
+        });
+        crate::rt::block_on(async move {
+            let c = Client::public()?;
+            let started = Instant::now();
+            let r = c.post(&format!("http://{addr}/api/sync/blobs/x")).body("hello").send().await?;
+            anyhow::ensure!(r.status() == 200, "served on the second send: {}", r.status());
+            anyhow::ensure!(started.elapsed() >= Duration::from_secs(1), "after the Retry-After: {:?}", started.elapsed());
+            let r = c.post(&format!("http://{addr}/api/sync/blobs/x")).body("hello").send().await?;
+            anyhow::ensure!(r.status() == 503, "a 503 without kiln's mark is returned: {}", r.status());
+            Ok(())
+        })?;
+        let bodies = server.join().map_err(|_| anyhow::anyhow!("the server thread panicked"))??;
+        anyhow::ensure!(bodies.iter().take(2).all(|b| b.ends_with("hello")), "the body went again: {bodies:?}");
+        Ok(())
+    }
 
     /// HTTPS to real public endpoints through hyper-tls on hyper-rt (needs network; run with
     /// `cargo test -- --ignored https_public`).

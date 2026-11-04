@@ -47,6 +47,7 @@ pub mod mcp;
 pub mod metrics;
 pub mod net;
 pub mod observe;
+pub mod overload;
 pub mod ops;
 pub mod os;
 pub mod password;
