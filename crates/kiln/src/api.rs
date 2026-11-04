@@ -3605,8 +3605,8 @@ async fn enroll(hub: &Hub, req: Request) -> R {
     let persistent = crate::util::ct_eq(r.token.as_bytes(), hub.join_token.as_bytes());
     // A `k8s` pool's executor pod (docs/ci.md W13-R07): its runner is the pod's name and that
     // executor's, whatever it asks to be.
-    let pod = if persistent { None } else { hub.executor_tokens.lock().remove(&r.token).filter(|(_, _, exp)| *exp > std::time::Instant::now()) };
-    let ephemeral = pod.is_some() || (!persistent && hub.ephemeral_tokens.lock().remove(&r.token).is_some());
+    let pod = if persistent { None } else { hub.executor_tokens.update(|t| t.remove(&r.token)).filter(|(_, _, exp)| *exp > std::time::Instant::now()) };
+    let ephemeral = pod.is_some() || (!persistent && hub.ephemeral_tokens.update(|t| t.remove(&r.token)).is_some());
     let outpost = !persistent && !ephemeral && hub.outpost_invites.take(&r.token);
     if !persistent && !ephemeral && !outpost {
         crate::rt::sleep(Duration::from_millis(500)).await;
@@ -3614,7 +3614,7 @@ async fn enroll(hub: &Hub, req: Request) -> R {
     }
     let name = match &pod {
         Some((executor, pod_name, _)) => {
-            hub.pod_executors.lock().insert(pod_name.clone(), executor.clone());
+            hub.pod_executors.update(|p| p.insert(pod_name.clone(), executor.clone()));
             pod_name.clone()
         }
         None => crate::pki::sanitize_name(&r.name),

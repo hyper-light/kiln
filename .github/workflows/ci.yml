@@ -60,6 +60,20 @@ jobs:
           if-no-files-found: error
           retention-days: 7
 
+  locks:
+    # Goal 5 of the API runtime program (plan 01a1a59c2aae step 3): no Mutex, RwLock or Condvar in the
+    # modules scripts/locks/hot.toml names but those it lists with why; the check's own tests plant one.
+    name: no new lock on the API's hot path
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: The hot path's locks are those hot.toml lists
+        run: python3 scripts/locks.py check
+      - name: The check fails on a planted lock
+        run: python3 scripts/test_locks.py
+
   linux:
     name: linux (clippy, tests)
     needs: ui

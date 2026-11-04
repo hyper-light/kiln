@@ -9,9 +9,11 @@
 //! series a metric has). What's written often stays with one owner (a task, a thread) and goes to it
 //! as messages.
 
+use std::collections::HashMap;
+use std::hash::Hash;
 use std::sync::Arc;
 
-use arc_swap::ArcSwap;
+use arc_swap::{ArcSwap, ArcSwapOption};
 
 /// A value read without a lock and written by swapping a new copy in whole.
 pub struct Rcu<T>(ArcSwap<T>);
@@ -68,6 +70,50 @@ impl<T: std::fmt::Debug> std::fmt::Debug for Rcu<T> {
     }
 }
 
+/// Values waiting to be taken once, by key, without a lock (questions put to runners, waiting for their
+/// answers): each in a take-once cell of its own, the cells' map an [`Rcu`]. Whoever takes a value first
+/// (the answer, or its asker giving up) has it; the other finds none.
+pub struct Pending<K, V> {
+    cells: Rcu<HashMap<K, Arc<ArcSwapOption<V>>>>,
+}
+
+impl<K: Clone + Eq + Hash, V> Pending<K, V> {
+    /// `value` waits under `key` (in place of one there, which goes).
+    pub fn put(&self, key: K, value: V) {
+        let cell = Arc::new(ArcSwapOption::from_pointee(value));
+        self.cells.update(|m| m.insert(key.clone(), Arc::clone(&cell)));
+    }
+
+    /// The value under `key`, taken: none when there's none, or it's been taken.
+    pub fn take(&self, key: &K) -> Option<V> {
+        let cell = self.cells.load().get(key).cloned()?;
+        let taken = cell.swap(None);
+        // Its cell goes with it, unless another came under the key meanwhile.
+        self.cells.update(|m| {
+            if m.get(key).is_some_and(|c| Arc::ptr_eq(c, &cell)) {
+                m.remove(key);
+            }
+        });
+        // The cell held the value's one reference, which the swap gave here.
+        Arc::try_unwrap(taken?).ok()
+    }
+
+    /// How many wait.
+    pub fn len(&self) -> usize {
+        self.cells.load().len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+}
+
+impl<K, V> Default for Pending<K, V> {
+    fn default() -> Self {
+        Self { cells: Rcu::new(HashMap::new()) }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -85,6 +131,30 @@ mod tests {
         assert_eq!(len, 3);
         assert_eq!(*held, vec![1, 2]);
         assert_eq!(*r.get(), vec![1, 2, 3]);
+    }
+
+    /// A value waiting is taken once, by whoever asks first: of threads taking it at once, one has it.
+    #[test]
+    fn g5_a_pending_value_is_taken_once() -> anyhow::Result<()> {
+        let p: Arc<Pending<u64, String>> = Arc::default();
+        p.put(1, "one".into());
+        anyhow::ensure!(p.take(&1).as_deref() == Some("one") && p.take(&1).is_none() && p.is_empty());
+        for round in 0..50u64 {
+            p.put(round, format!("answer {round}"));
+            let takers: Vec<_> = (0..4)
+                .map(|_| {
+                    let p = Arc::clone(&p);
+                    std::thread::spawn(move || p.take(&round).is_some())
+                })
+                .collect();
+            let mut got = 0;
+            for t in takers {
+                got += usize::from(t.join().map_err(|_| anyhow::anyhow!("a taker panicked"))?);
+            }
+            anyhow::ensure!(got == 1, "round {round}: {got} took it");
+        }
+        anyhow::ensure!(p.is_empty());
+        Ok(())
     }
 
     /// Writers on many threads at once: none is lost, as a lock would have kept them.

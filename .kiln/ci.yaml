@@ -98,6 +98,20 @@ jobs:
       - run: ci/ui/run-all.sh target/debug/kiln
     artifacts: [ci/ui/shots/*/*]
 
+  locks:
+    name: no new lock on the API's hot path
+    # Goal 5 of the API runtime program (plan 01a1a59c2aae step 3): no Mutex, RwLock or Condvar in the
+    # modules scripts/locks/hot.toml names but those it lists with why; the check's own tests plant one.
+    runs-on: [k8s]
+    toolchain: python
+    resources: { cpu: "1", memory: 1Gi }
+    timeout-minutes: 10
+    steps:
+      - name: the hot path's locks are those hot.toml lists
+        run: python3 scripts/locks.py check
+      - name: the check fails on a planted lock
+        run: TMPDIR=$(mktemp -d -p "$PWD") python3 scripts/test_locks.py
+
   vendor:
     name: vendored projects (upstream plus kiln's recorded changes)
     runs-on: [k8s]

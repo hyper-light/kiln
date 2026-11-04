@@ -938,10 +938,10 @@ mod tests {
                 let want = if code == Code::Unknown { Refusal::Unsupported } else { Refusal::Malformed };
                 anyhow::ensure!(nack == Some(want), "{json}: NACKed {nack:?}");
             }
-            let kept = hub.refusals.lock().kept(&Page::Runner("fedora".into())).cloned().unwrap_or_default();
+            let kept = hub.refusals.load().kept(&Page::Runner("fedora".into())).cloned().unwrap_or_default();
             anyhow::ensure!(kept.total() == noted, "kept for the runner's page: {} of {noted}", kept.total());
             let harness = runner_cases().into_iter().find(|c| c.of == "Harness").map(|c| c.bad().len()).unwrap_or_default();
-            let session = hub.refusals.lock().kept(&Page::Session("s1".into())).map(crate::wire::unread::Kept::total);
+            let session = hub.refusals.load().kept(&Page::Session("s1".into())).map(crate::wire::unread::Kept::total);
             anyhow::ensure!(session == Some(2 * u64::try_from(harness)?), "kept for the session's page too: {session:?}");
             // One row a minute for each code (the rest coalesced into the next).
             let rows = refused_rows(&hub, "runner:fedora").await?;
@@ -963,7 +963,7 @@ mod tests {
             hear(&hub, 1, LANE_CONTROL, &AgentMsg::StreamEvent { stream: "st1".into(), json: r#"{"hologram":{}}"#.into() }).await?;
             let told = hub.sent.lock().iter().any(|(p, m)| matches!(m, ServerMsg::Unread { wire: Wire::RunnerPayload, what, code: Code::Unknown, .. } if *p == 1 && what == "StreamEvent hologram"));
             anyhow::ensure!(told, "the runner is told: {:?}", hub.sent.lock());
-            let kept = hub.refusals.lock().kept(&Page::Runner("fedora".into())).map(crate::wire::unread::Kept::total);
+            let kept = hub.refusals.load().kept(&Page::Runner("fedora".into())).map(crate::wire::unread::Kept::total);
             anyhow::ensure!(kept == Some(1), "kept for the runner's page: {kept:?}");
             Ok(())
         })

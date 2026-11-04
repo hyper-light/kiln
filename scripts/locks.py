@@ -439,7 +439,7 @@ def name_of(line: str) -> str:
         r"\bfn\s+(\w+)",
         r"^(?:pub(?:\([^)]*\))?\s+)?(\w+)\s*:(?!:)",
         r"\b([A-Z_][A-Z0-9_]+)\s*\.\s*get_or_init\b",
-        r"\b(\w+)\s*:(?!:)\s*[\w:]*\b(?:Mutex|RwLock|Condvar)\b",
+        r"\b(\w+)\s*:(?!:)\s*[\w:<(&' ]*?\b(?:Mutex|RwLock|Condvar)\b",
     ]:
         m = re.search(pat, s)
         if m:
