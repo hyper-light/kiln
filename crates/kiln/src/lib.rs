@@ -64,12 +64,14 @@ pub mod reads;
 pub mod records;
 pub mod relays;
 pub mod research;
+pub mod route_latency;
 pub mod runner;
 pub mod rt;
 pub mod ship;
 pub mod secrets;
 pub mod server;
 pub mod setup;
+pub mod shard_health;
 #[cfg(test)]
 mod sim;
 pub mod skew;

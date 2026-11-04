@@ -366,7 +366,9 @@ pub enum NetEvent {
     Connected { peer: PeerId, name: Option<String>, binding: Option<[u8; 32]> },
     Closed { peer: PeerId, reason: String },
     Unreachable { peer: PeerId, reason: String },
-    Frame { peer: PeerId, lane: u32, kind: Kind, data: Vec<u8> },
+    /// `at`: when the network thread took it off the link, so the hub can say how long it waited
+    /// before it was handled (`kiln_route_wait_seconds{class="runner"}`, `crate::route_latency`).
+    Frame { peer: PeerId, lane: u32, kind: Kind, data: Vec<u8>, at: std::time::Instant },
 }
 
 #[derive(Clone)]
@@ -1134,7 +1136,7 @@ fn on_event<B, D>(
         }
         Event::Frame { peer, lane, kind, frame } => {
             crate::metrics::global().quic_streams.inc();
-            out.push(NetEvent::Frame { peer, lane, kind, data: frame.bytes().to_vec() });
+            out.push(NetEvent::Frame { peer, lane, kind, data: frame.bytes().to_vec(), at: std::time::Instant::now() });
             ep.release(frame);
         }
         Event::Closed { peer, refusal, .. } => {

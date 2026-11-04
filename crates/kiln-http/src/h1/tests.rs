@@ -52,6 +52,8 @@ async fn handle(req: Request<Incoming>) -> Response<Boxed> {
             });
             Response::builder().status(StatusCode::SWITCHING_PROTOCOLS).header("upgrade", "echo").header("connection", "upgrade").body(full("")).unwrap_or_default()
         }
+        // How long ago the request arrived, as its `Received` says (microseconds; `none` without one).
+        "/received" => Response::new(full(req.extensions().get::<crate::Received>().map_or_else(|| "none".to_owned(), |r| r.0.elapsed().as_micros().to_string()))),
         path => Response::new(full(format!("{} {path}", req.method()))),
     }
 }
@@ -140,6 +142,28 @@ fn requests_on_one_connection_are_answered_in_order_pipelined_or_not() -> Result
         let three = text(&three);
         let (b, c, h) = (three.find("GET /b"), three.find("GET /c"), three.find("hello"));
         assert!(b < c && c < h && b.is_some(), "{three}");
+        Ok(())
+    })?
+}
+
+/// Goal 1, plan 01a1a59c2a68 step 2: a request says when it arrived, from the read that brought its
+/// head's first bytes: a head that came in two parts 30 ms apart arrived with the first.
+#[test]
+fn g1_s2_a_request_arrived_with_its_heads_first_bytes() -> Result<(), String> {
+    block_on(async {
+        let addr = serve(crate::server::http1::Builder::new())?;
+        let mut io = connect(addr).await?;
+        io.write_all(b"GET /received HTTP/1.1\r\nHo").await.map_err(|e| e.to_string())?;
+        hyper_rt::futures::sleep(30_000_000).await.map_err(|e| e.to_string())?;
+        io.write_all(b"st: t\r\n\r\n").await.map_err(|e| e.to_string())?;
+        let got = text(&read_until(&mut io, |g| g.windows(4).any(|w| w == b"\r\n\r\n") && !g.ends_with(b"\r\n\r\n")).await?);
+        let waited: u64 = got.rsplit("\r\n\r\n").next().and_then(|b| b.trim().parse().ok()).ok_or_else(|| format!("no wait in {got}"))?;
+        assert!(waited >= 30_000, "it arrived {waited} us before its handler, not with its first bytes: {got}");
+        // One whole in a read arrived with that read, a moment before its handler: under the 30 ms.
+        io.write_all(b"GET /received HTTP/1.1\r\nHost: t\r\n\r\n").await.map_err(|e| e.to_string())?;
+        let got = text(&read_until(&mut io, |g| g.windows(4).any(|w| w == b"\r\n\r\n") && !g.ends_with(b"\r\n\r\n")).await?);
+        let waited: u64 = got.rsplit("\r\n\r\n").next().and_then(|b| b.trim().parse().ok()).ok_or_else(|| format!("no wait in {got}"))?;
+        assert!(waited < 30_000, "a request read whole waited {waited} us: {got}");
         Ok(())
     })?
 }
