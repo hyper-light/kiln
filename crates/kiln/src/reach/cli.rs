@@ -143,9 +143,9 @@ pub async fn run(a: RunArgs, shutdown: crate::rt::Shutdown) -> anyhow::Result<()
         .map(|kv| kv.split_once('=').map(|(k, v)| (k.to_owned(), v.to_owned())).ok_or_else(|| anyhow::anyhow!("--env takes KEY=VALUE, not {kv:?}")))
         .collect::<anyhow::Result<Vec<_>>>()?;
     // Run by an agent kiln started (its processes carry `KILN_AGENT`): the copy of the tree over
-    // there is that agent's, for the rules that keep copies (docs/reach.md §5.1).
-    if sync
-        && !env.iter().any(|(k, _)| k == super::keeper::AGENT_ENV)
+    // there is that agent's, for the rules that keep copies (docs/reach.md §5.1), and the run is
+    // the agent's work, at its priority, synced or not (docs/priority.md).
+    if !env.iter().any(|(k, _)| k == super::keeper::AGENT_ENV)
         && let Some(agent) = std::env::var("KILN_AGENT").ok().filter(|a| !a.trim().is_empty())
     {
         env.push((super::keeper::AGENT_ENV.to_owned(), agent));

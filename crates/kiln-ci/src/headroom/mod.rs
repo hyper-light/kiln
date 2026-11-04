@@ -627,6 +627,39 @@ mod tests {
         Ok(())
     }
 
+    /// Goal 8 (plan 01a1a59c2b29 step 5, kiln's docs/priority.md): the kiln server's own delay as a
+    /// target. Calm near 100 µs with a CI leg and an agent busy on the CPU beside it, it rises toward
+    /// its 1 s tolerance: the engine alarms, cuts kiln's CPU budget below what they use, and paces
+    /// the leg and the agent alike; once the delay comes back down with them slowed, it's calm
+    /// again, and the cut stays until the level holds.
+    #[test]
+    fn g8_s5_the_servers_delay_rising_slows_legs_and_agents() -> anyhow::Result<()> {
+        let delay = "kiln server delay";
+        let mut e = Engine::new(Policy { false_alarms_per_day: 1.0, probe_load_share: 0.1 }, vec![Target { name: delay.into(), tolerance_us: 1e6 }], Learned::default(), 0);
+        let running = |share: f64| vec![Group { cpu_cores: 8.0 * share, ..group("job 01a1", 0.0, share) }, Group { cpu_cores: 4.0 * share, ..group("01a1agent", 0.0, share) }];
+        let at = |t: u64, us: f64, share: f64| Observation { now_us: t, answers: vec![(delay.into(), Answer::Took(us))], mem_free: 1e11, running: running(share), cores: Some(32.0), ..Observation::default() };
+        for i in 0..200u64 {
+            e.step(&at(i * 100_000, 100.0 + (i % 7) as f64, 1.0));
+        }
+        let p = e.step(&at(200 * 100_000, 30_000.0, 1.0));
+        anyhow::ensure!(p.events.iter().any(|ev| ev.starts_with(delay)), "no alarm on the server's delay: {:?}", p.events);
+        anyhow::ensure!(p.status.cpu_budget.is_some_and(|b| b < 12.0), "kiln's CPU not cut below the 12 cores its work uses: {:?}", p.status);
+        anyhow::ensure!(p.shares.len() == 2 && p.shares.iter().all(|s| s.share < 1.0), "the leg and the agent aren't both paced: {:?}", p.shares);
+        let paced = p.shares.iter().map(|s| s.share).fold(1.0, f64::min);
+        // Slowed, the server's delay comes back down.
+        let mut calm = false;
+        for i in 201..260u64 {
+            let p = e.step(&at(i * 100_000, 100.0, paced));
+            calm |= p.events.iter().any(|ev| ev.starts_with(delay) && ev.contains("back to calm"));
+            anyhow::ensure!(p.status.cpu_budget.is_some_and(|b| b < 12.0), "the cut went before the level held: {:?}", p.status);
+            if calm {
+                break;
+            }
+        }
+        anyhow::ensure!(calm, "the server's delay came back down and the alarm stayed");
+        Ok(())
+    }
+
     #[test]
     fn harm_cuts_the_budget_paces_writers_and_says_why_and_learning_round_trips() -> anyhow::Result<()> {
         let mut e = engine();

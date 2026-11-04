@@ -105,7 +105,10 @@ mod imp {
     }
 
     pub fn memory() -> Option<super::Memory> {
-        if let Some(dir) = v2_dir().filter(|d| d.join("memory.current").exists()) {
+        // Its own cgroup's, or, where that counts no memory (kiln's processes in their delegated
+        // unit's leaf, docs/priority.md), the nearest above it that does: its unit's.
+        let counted = v2_dir().and_then(|d| d.ancestors().take_while(|a| a.starts_with("/sys/fs/cgroup")).find(|a| a.join("memory.current").exists()).map(Path::to_path_buf));
+        if let Some(dir) = counted {
             let f = |n: &str| read_to_string(dir.join(n)).ok();
             return super::from_v2(&f("memory.current")?, &f("memory.max").unwrap_or_default(), &f("memory.stat").unwrap_or_default(), &f("memory.events").unwrap_or_default(), f("memory.peak").as_deref());
         }
@@ -115,7 +118,8 @@ mod imp {
     }
 
     pub fn memory_limit() -> Option<u64> {
-        if let Some(dir) = v2_dir().filter(|d| d.join("memory.current").exists()) {
+        // As [`memory`]: a leaf that counts no memory is held by what's above it.
+        if let Some(dir) = v2_dir().filter(|d| d.ancestors().take_while(|a| a.starts_with("/sys/fs/cgroup")).any(|a| a.join("memory.current").exists())) {
             return super::least_limit(Path::new("/sys/fs/cgroup"), &dir);
         }
         super::limit(&read_to_string("/sys/fs/cgroup/memory/memory.limit_in_bytes").ok()?)
