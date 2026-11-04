@@ -41,27 +41,63 @@ pub struct Profile {
     /// Places in the blocking pool's shares: (dns, store, fs). The blocking pool is for calls that block a
     /// thread; CPU work goes to the compute pool ([`compute`]; goal 3, plan 01a1a59c2a8e step 4), which the
     /// pool's `fs` share carried before (the UI's compression, password hashing, digests of bytes in
-    /// memory). What each share's size rests on:
-    /// - `dns`: `getaddrinfo` calls at once, hyper-rt's resolver's;
-    /// - `store`: the store's statements, which its one connection takes one at a time (`crate::store`): a
-    ///   place running and one waiting its turn, so a slow statement holds these, not the `fs` share's;
-    /// - `fs`: everything else that blocks: files, `/proc`, archives, a child's wait.
+    /// memory). The server's come from what the lab measured of each share (goal 3, step 4; the series
+    /// `kiln_blocking_*` on /metrics, `crate::pool_health`; docs/runtime-lab.md, "Goal 3"), by Little's law
+    /// as hyper-rt sizes a shard's tasks (`hyper_rt::runtime::admission_limit`): the jobs a share holds at
+    /// once are the rate they come at times the time each runs, here its p99 ([`AtOnce`]):
+    /// - `fs` (files, `/proc`, archives, a child's wait): [`SERVER_FS`];
+    /// - `store` (kiln.db's statements): its one connection takes one at a time (`crate::store`), so places
+    ///   past the connection's and one waiting its turn at it would only wait on its lock: two
+    ///   ([`SERVER_STORE`]). The lab's rate times p99 run asks far more, 24 places calm: what its statements
+    ///   wait for is the connection, not the share (`blocking.store.wait_p99_ms`, 440 ms calm);
+    /// - `dns` (`getaddrinfo`): the lab's kiln resolves no name (every address it dials is a literal), so
+    ///   the lab can't size it: four, kiln's count from its move onto hyper-rt (f202896cb2d), until
+    ///   production's `kiln_blocking_run_seconds{share="dns"}` says how many it holds at once.
     ///
-    /// The counts are kiln's from when it moved onto hyper-rt (f202896cb2d), not yet measured: each
-    /// share's size from what its calls wait under realistic load is the lab's to say (goal 1's
-    /// `kiln-lab`, not yet on main).
+    /// A runner's and a command's are kiln's counts from that move: the lab reads only its server's
+    /// /metrics.
     pub pool: (usize, usize, usize),
     /// Whether the runtime says how it was sized at `info` (a server's and a runner's logs), or only at
     /// `debug` (a command's, whose output is the person's).
     pub announce: bool,
 }
 
+/// What the lab measured of one of the server's blocking pool shares where it held the most (goal 3, plan
+/// 01a1a59c2a8e step 4; docs/runtime-lab.md, "Goal 3"): its jobs at once by Little's law, each round's jobs a
+/// second times their p99 run (kiln-lab's `blocking.<share>.little_p99`), the median of a run's rounds.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct AtOnce(pub f64);
+
+impl AtOnce {
+    /// The places that is: rounded up to whole places, at least one.
+    pub fn places(self) -> usize {
+        if self.0.is_finite() && self.0 > 1.0 { self.0.ceil() as usize } else { 1 }
+    }
+}
+
+/// The server's `fs` share where its jobs ran longest, with as many CPU hogs as the lab's CPUs: 24.9 jobs a
+/// second at a p99 run of 1,056 ms, 25.5 at once (four rounds, 2026-11-04; calm, 47.8 a second at a p99 of
+/// 82 ms, 3.8 at once). Against the 8 places it had, 26 made no difference beyond noise in any of the lab's
+/// 94 numbers there (six rounds each, interleaved): its jobs waited 4.7 and 4.8 ms at p99 for a place, the
+/// pool's threads' own wait for a CPU beside the hogs, not a share that's full.
+pub const SERVER_FS: AtOnce = AtOnce(25.54);
+
+/// The connections `crate::store` holds (its one `conn`), each taking a statement at a time.
+pub const STORE_CONNECTIONS: usize = 1;
+
+/// The server's `store` share: a place for each connection's statement, and one waiting its turn at it.
+pub const SERVER_STORE: usize = STORE_CONNECTIONS + 1;
+
+/// The server's `dns` share: kiln's count from its move onto hyper-rt, which the lab can't measure
+/// ([`Profile::pool`]).
+pub const SERVER_DNS: usize = 4;
+
 impl Profile {
     /// The server: HTTP connections, websockets, the scheduler and GitOps loops.
     pub fn server() -> Self {
         let cpus = std::thread::available_parallelism().map_or(4, std::num::NonZero::get);
         let shards = u16::try_from((cpus / 4).clamp(2, 4)).unwrap_or(2);
-        Self { shards, tasks_per_shard: 8192, pool: (4, 2, 8), announce: true }
+        Self { shards, tasks_per_shard: 8192, pool: (SERVER_DNS, SERVER_STORE, SERVER_FS.places()), announce: true }
     }
 
     /// An agent: a few jobs, their output pumps, terminals.
@@ -81,8 +117,19 @@ impl Profile {
         if let Some(n) = std::env::var("KILN_RT_TASKS").ok().and_then(|v| v.parse::<usize>().ok()) {
             self.tasks_per_shard = n.clamp(256, 1 << 20);
         }
+        // The blocking pool's places, `dns,store,fs` (the lab's A/B of share sizes on one build).
+        if let Some(pool) = std::env::var("KILN_RT_BLOCKING").ok().as_deref().and_then(places) {
+            self.pool = pool;
+        }
         self
     }
+}
+
+/// `dns,store,fs` as three counts of places, each at least one.
+fn places(v: &str) -> Option<(usize, usize, usize)> {
+    let mut it = v.split(',').map(|n| n.trim().parse::<usize>().ok().filter(|n| *n > 0));
+    let pool = (it.next()??, it.next()??, it.next()??);
+    it.next().is_none().then_some(pool)
 }
 
 static PROFILE: OnceLock<Profile> = OnceLock::new();
@@ -90,6 +137,11 @@ static PROFILE: OnceLock<Profile> = OnceLock::new();
 /// Choose the runtime's size. Only the first call before the runtime starts has any effect.
 pub fn configure(profile: Profile) {
     let _ = PROFILE.set(profile);
+}
+
+/// The runtime's size as it starts (or started): the profile chosen, with the environment's overrides.
+pub fn profile() -> Profile {
+    PROFILE.get().copied().unwrap_or_else(Profile::tool).with_env_overrides()
 }
 
 /// hyper-rt configuration (see the sizing rules in hyper-rt's docs): timers at twice the tasks so the
@@ -127,8 +179,11 @@ struct Rt {
 static RT: OnceLock<Result<Rt, String>> = OnceLock::new();
 
 fn start() -> Result<Rt, String> {
-    let p = PROFILE.get().copied().unwrap_or_else(Profile::tool).with_env_overrides();
+    let p = profile();
     let (dns, store, fs) = p.pool;
+    // Each job's wait and run, by share, on /metrics: what the shares' sizes are derived from (goal 3, plan
+    // 01a1a59c2a8e step 4; `crate::pool_health`).
+    let _ = hyper_rt::blocking::observe(crate::pool_health::blocking_job);
     let pool = hyper_rt::blocking::Config {
         workers: dns + store + fs,
         shares: vec![
@@ -177,6 +232,8 @@ fn start_compute(p: &Profile, config: &RuntimeConfig) {
     let shards = usize::from(p.shards);
     let workers = hyper_rt::compute::workers_for(&grant, shards);
     let pool = hyper_rt::compute::Config { workers, queued: shards.saturating_mul(p.tasks_per_shard), piece_ns: config.step_budget_ns, rank: hyper_rt::compute::Rank::Below };
+    // Each job's wait for a thread and each piece's time, on /metrics (step 3; `crate::pool_health`).
+    let _ = hyper_rt::compute::observe(crate::pool_health::compute_job);
     match hyper_rt::compute::start(pool) {
         Ok(started) => {
             let priority = match started.priority {
@@ -451,6 +508,49 @@ where
         Step::Done(std::mem::take(out))
     })
     .await
+}
+
+/// [`compute_pieces`] for a thread of its own, which may block (never a shard): the job runs on the compute
+/// pool, in pieces, and this thread waits for its result. At the pool's bound it waits and asks again, as
+/// [`to_compute`] does; with no pool running the job runs here. For a thread that works through what comes
+/// to it in order (the conversation feed's intake: `crate::convo::feed`), which keeps its order by waiting.
+pub fn compute_pieces_blocking<S, T, F>(state: S, mut step: F) -> anyhow::Result<T>
+where
+    S: Send + 'static,
+    T: Send + 'static,
+    F: FnMut(&mut S, &Turn<'_>) -> Step<T> + Send + 'static,
+{
+    // The pool starts with the runtime; where neither can, the job is refused and runs here.
+    let _ = rt();
+    let (tx, rx) = std::sync::mpsc::sync_channel::<T>(1);
+    let piece = move |(state, tx): &mut (S, Option<std::sync::mpsc::SyncSender<T>>), turn: &Turn<'_>| match step(state, turn) {
+        Step::Done(value) => {
+            if let Some(tx) = tx.take() {
+                let _ = tx.send(value);
+            }
+            Step::Done(())
+        }
+        Step::More => Step::More,
+    };
+    let mut job = ((state, Some(tx)), piece);
+    let mut delay = Duration::from_millis(1);
+    loop {
+        match hyper_rt::compute::run_pieces(job.0, job.1) {
+            Ok(_) => break,
+            Err(refused) if matches!(refused.error, RtError::Capacity { .. }) => {
+                job = refused.job;
+                std::thread::sleep(delay);
+                delay = (delay * 2).min(Duration::from_millis(100));
+            }
+            Err(refused) => {
+                // Here, inside an unwind boundary as the pool's are: one that unwinds drops its sender.
+                let (state, piece) = refused.job;
+                let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || hyper_rt::compute::run_here(state, piece)));
+                break;
+            }
+        }
+    }
+    rx.recv().map_err(|_| anyhow::anyhow!("compute job failed (it panicked)"))
 }
 
 /// Hands `job` to the compute pool by `submit`. At the pool's bound it waits, as [`blocking_in`] does
@@ -1344,6 +1444,53 @@ mod tests {
             anyhow::ensure!(sum == 499_999_500_000, "{sum}");
             Ok(())
         })
+    }
+
+    /// Goal 3, plan 01a1a59c2a8e step 3: a thread of its own (the conversation feed's intake) hands a job
+    /// in pieces to the compute pool and waits there for its result: the job runs on a pool thread, below
+    /// the caller, a piece at a time to its end; and its result comes back however many pieces it took.
+    #[test]
+    fn g3_s3_a_thread_of_its_own_waits_for_a_compute_job_in_pieces() -> anyhow::Result<()> {
+        let here = hyper_rt::compute::thread_priority();
+        // Three pieces, the last saying where it ran.
+        let (thread, there, pieces) = compute_pieces_blocking(0u32, |pieces, _turn| {
+            *pieces += 1;
+            if *pieces < 3 { Step::More } else { Step::Done((std::thread::current().name().map(str::to_owned), hyper_rt::compute::thread_priority(), *pieces)) }
+        })?;
+        anyhow::ensure!(hyper_rt::compute::running(), "the compute pool started with the runtime");
+        anyhow::ensure!(pieces == 3, "{pieces} pieces");
+        anyhow::ensure!(thread.as_deref().is_some_and(|t| t.starts_with("kiln-compute-")), "the job ran on {thread:?}");
+        #[cfg(any(target_os = "linux", target_os = "macos", windows))]
+        anyhow::ensure!(there.is_below(here), "the pool's thread at {there}, the caller's at {here}");
+        #[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
+        let _ = (here, there);
+        Ok(())
+    }
+
+    /// Goal 3, plan 01a1a59c2a8e step 4: the blocking pool's places from `KILN_RT_BLOCKING`, `dns,store,fs`
+    /// (the lab's A/B of share sizes on one build): three counts of at least one, or nothing taken.
+    #[test]
+    fn g3_s4_the_blocking_pools_places_from_the_environment() {
+        assert_eq!(places("4,2,8"), Some((4, 2, 8)));
+        assert_eq!(places(" 1, 3 ,12"), Some((1, 3, 12)));
+        for refused in ["", "4,2", "4,2,8,1", "0,2,8", "a,2,8", "4,,8", "-1,2,8"] {
+            assert_eq!(places(refused), None, "{refused:?}");
+        }
+    }
+
+    /// Goal 3, plan 01a1a59c2a8e step 4: the server's shares from what the lab measured: the jobs a share
+    /// holds at once by Little's law, rounded up to whole places, at least one; the store's by its one
+    /// connection.
+    #[test]
+    fn g3_s4_the_servers_shares_are_derived() {
+        assert_eq!(AtOnce(25.54).places(), 26);
+        assert_eq!(AtOnce(3.0).places(), 3);
+        assert_eq!(AtOnce(1.01).places(), 2);
+        for none in [0.0, 0.4, 1.0, -3.0, f64::NAN, f64::INFINITY] {
+            assert_eq!(AtOnce(none).places(), 1, "{none}");
+        }
+        let (dns, store, fs) = Profile::server().pool;
+        assert_eq!((dns, store, fs), (SERVER_DNS, STORE_CONNECTIONS + 1, SERVER_FS.places()));
     }
 
     /// kiln's runtime passes kiln-seams' Clock suite on real time (CP-M2, AC-M2.2): the clock the

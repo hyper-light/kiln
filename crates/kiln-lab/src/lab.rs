@@ -527,7 +527,11 @@ pub fn round(build: &Build, p: &Profile, hogs: usize, dir: &Path, bin: &Path, in
     }
     fleet.runners_ready(Duration::from_secs(180))?;
 
-    // The fill: each session opened on its runner, its conversation written as fast as it's taken.
+    // The fill: each session opened on its runner, its conversation written as fast as it's taken. The
+    // server's /metrics either side of it too: the conversation feed at its busiest, every session's
+    // conversation through its runner's shipper and the server's intake at once (goal 3's heavy path).
+    let scrape = |fleet: &Fleet| -> anyhow::Result<Scrape> { Ok(Scrape::parse(&String::from_utf8_lossy(&Http::new(fleet.port, &fleet.admin).send("GET", "/metrics", None)?.body))) };
+    let fill_before = scrape(&fleet)?;
     let filled = Instant::now();
     let mut opened: Vec<(String, u64)> = Vec::new();
     std::thread::scope(|scope| -> anyhow::Result<()> {
@@ -571,6 +575,7 @@ pub fn round(build: &Build, p: &Profile, hogs: usize, dir: &Path, bin: &Path, in
         std::thread::sleep(Duration::from_millis(250));
     }
     let fill_s = filled.elapsed().as_secs_f64();
+    let fill_after = scrape(&fleet)?;
 
     // The MCP tools agents call, where this build has them.
     let tools: Vec<String> = {
@@ -640,7 +645,9 @@ pub fn round(build: &Build, p: &Profile, hogs: usize, dir: &Path, bin: &Path, in
     #[allow(clippy::cast_precision_loss)]
     let secs = (window.1.saturating_sub(window.0)) as f64 / 1e6;
     let seen = measure::seen(&in_window);
-    let (numbers, shards) = numbers(&seen, &before, &after, secs);
+    let (mut numbers, shards) = numbers(&seen, &before, &after, secs);
+    numbers.insert("fill.s".into(), fill_s);
+    server_numbers(&mut numbers, "fill.", &fill_before, &fill_after, fill_s);
     drop(fleet);
     Ok(Round { build: build.label.clone(), index, hogs, machine: m, fill_s, shards, numbers, seen: seen.into_iter().map(|(c, s)| (c.name().to_owned(), s)).collect() })
 }
@@ -665,50 +672,16 @@ fn numbers(seen: &BTreeMap<Class, measure::Seen>, before: &Scrape, after: &Scrap
         }
     }
     let diff = |name: &str, want: &[(&str, &str)]| Some(after.get(name, want)? - before.get(name, want)?);
-    if let Some(cpu) = diff("process_cpu_seconds_total", &[]) {
-        n.insert("server.cpu_share".into(), cpu / secs.max(1e-9));
-        if requests > 0 {
-            #[allow(clippy::cast_precision_loss)]
-            n.insert("server.cpu_ms_per_request".into(), cpu * 1000.0 / requests as f64);
-        }
+    if let Some(cpu) = diff("process_cpu_seconds_total", &[])
+        && requests > 0
+    {
+        #[allow(clippy::cast_precision_loss)]
+        n.insert("server.cpu_ms_per_request".into(), cpu * 1000.0 / requests as f64);
     }
     if let Some(rss) = after.get("process_resident_memory_bytes", &[]) {
         n.insert("server.rss_mb".into(), rss / 1e6);
     }
-    // The shards': their delays together, their busy share on average, their slow polls.
-    let shards = after.values_of("kiln_shard_polls_total", "shard");
-    if !shards.is_empty() {
-        let mut delay: Vec<(f64, f64)> = Vec::new();
-        let (mut busy, mut slow) = (0.0, 0.0);
-        for sh in &shards {
-            let want = [("shard", sh.as_str())];
-            let d = measure::delta(&before.buckets("kiln_shard_delay_seconds", &want), &after.buckets("kiln_shard_delay_seconds", &want));
-            if delay.is_empty() {
-                delay = d;
-            } else {
-                for ((_, total), (_, add)) in delay.iter_mut().zip(d) {
-                    *total += add;
-                }
-            }
-            busy += diff("kiln_shard_busy_seconds_total", &want).unwrap_or(0.0);
-            for cause in ["task", "blocking", "host", "unknown"] {
-                slow += diff("kiln_shard_slow_polls_total", &[("shard", sh.as_str()), ("cause", cause)]).unwrap_or(0.0);
-            }
-        }
-        if let Some(v) = measure::histogram_quantile(0.99, &delay) {
-            n.insert("shards.delay_p99_ms".into(), v * 1000.0);
-        }
-        if let Some(v) = measure::histogram_quantile(0.999, &delay) {
-            n.insert("shards.delay_p999_ms".into(), v * 1000.0);
-        }
-        if let Some(v) = measure::histogram_top(&delay) {
-            n.insert("shards.delay_top_ms".into(), v * 1000.0);
-        }
-        #[allow(clippy::cast_precision_loss)]
-        let count = shards.len() as f64;
-        n.insert("shards.busy_share".into(), busy / secs.max(1e-9) / count);
-        n.insert("shards.slow_polls_per_s".into(), slow / secs.max(1e-9));
-    }
+    let shards = server_numbers(&mut n, "", before, after, secs);
     // The routes': how long each class took and waited at the server.
     for class in ["page", "api_read", "api_write", "websocket", "runner"] {
         let want = [("class", class)];
@@ -719,12 +692,89 @@ fn numbers(seen: &BTreeMap<Class, measure::Seen>, before: &Scrape, after: &Scrap
             }
         }
     }
-    (n, shards.len())
+    (n, shards)
 }
 
-/// Which way each number is better: throughput up, everything else (latency, CPU, delay) down.
+/// The server's own numbers between two scrapes `secs` apart, each named after `prefix` (the window's, or
+/// the fill's: `fill.`), where the build has their series: its CPU share; the shards' delays together, their
+/// busy share on average and their slow polls a second, all and by cause (`task`, `blocking`, `host`,
+/// `unknown`); the compute pool's jobs and pieces a second, how long its jobs waited for a thread and its
+/// pieces ran, and its threads busy on average; and, for each of the blocking pool's shares, its jobs a
+/// second, how long they waited for a place and ran, the places they held on average (their runs' time over
+/// the window's), and the places Little's law asks of the rate and the p99 run (as hyper-rt sizes a shard's
+/// tasks: `admission_limit`). How many shards there were.
+fn server_numbers(n: &mut BTreeMap<String, f64>, prefix: &str, before: &Scrape, after: &Scrape, secs: f64) -> usize {
+    let diff = |name: &str, want: &[(&str, &str)]| Some(after.get(name, want)? - before.get(name, want)?);
+    let per_s = |v: f64| v / secs.max(1e-9);
+    let histogram = |name: &str, want: &[(&str, &str)]| measure::delta(&before.buckets(name, want), &after.buckets(name, want));
+    let mut put = |name: String, v: Option<f64>| {
+        if let Some(v) = v {
+            n.insert(format!("{prefix}{name}"), v);
+        }
+    };
+    put("server.cpu_share".into(), diff("process_cpu_seconds_total", &[]).map(per_s));
+    // The shards': their delays together, their busy share on average, their slow polls.
+    let shards = after.values_of("kiln_shard_polls_total", "shard");
+    if !shards.is_empty() {
+        let mut delay: Vec<(f64, f64)> = Vec::new();
+        let mut busy = 0.0;
+        let mut slow = [("task", 0.0), ("blocking", 0.0), ("host", 0.0), ("unknown", 0.0)];
+        for sh in &shards {
+            let want = [("shard", sh.as_str())];
+            let d = histogram("kiln_shard_delay_seconds", &want);
+            if delay.is_empty() {
+                delay = d;
+            } else {
+                for ((_, total), (_, add)) in delay.iter_mut().zip(d) {
+                    *total += add;
+                }
+            }
+            busy += diff("kiln_shard_busy_seconds_total", &want).unwrap_or(0.0);
+            for (cause, total) in &mut slow {
+                *total += diff("kiln_shard_slow_polls_total", &[("shard", sh.as_str()), ("cause", *cause)]).unwrap_or(0.0);
+            }
+        }
+        put("shards.delay_p99_ms".into(), measure::histogram_quantile(0.99, &delay).map(|v| v * 1000.0));
+        put("shards.delay_p999_ms".into(), measure::histogram_quantile(0.999, &delay).map(|v| v * 1000.0));
+        put("shards.delay_top_ms".into(), measure::histogram_top(&delay).map(|v| v * 1000.0));
+        #[allow(clippy::cast_precision_loss)]
+        let count = shards.len() as f64;
+        put("shards.busy_share".into(), Some(per_s(busy) / count));
+        put("shards.slow_polls_per_s".into(), Some(per_s(slow.iter().map(|(_, v)| v).sum())));
+        for (cause, v) in slow {
+            put(format!("shards.slow_polls_{cause}_per_s"), Some(per_s(v)));
+        }
+    }
+    // The compute pool's (goal 3): where the heavy work went, how long it waited and how long a piece held a
+    // pool thread.
+    if let Some(jobs) = diff("kiln_compute_jobs_total", &[]) {
+        put("compute.jobs_per_s".into(), Some(per_s(jobs)));
+        put("compute.pieces_per_s".into(), diff("kiln_compute_pieces_total", &[]).map(per_s));
+        let (wait, piece) = (histogram("kiln_compute_wait_seconds", &[]), histogram("kiln_compute_piece_seconds", &[]));
+        put("compute.wait_p99_ms".into(), measure::histogram_quantile(0.99, &wait).map(|v| v * 1000.0));
+        put("compute.piece_p99_ms".into(), measure::histogram_quantile(0.99, &piece).map(|v| v * 1000.0));
+        put("compute.piece_top_ms".into(), measure::histogram_top(&piece).map(|v| v * 1000.0));
+        put("compute.busy".into(), diff("kiln_compute_piece_seconds_sum", &[]).map(per_s));
+    }
+    // The blocking pool's shares (goal 3, step 4: what their sizes are derived from).
+    for share in after.values_of("kiln_blocking_run_seconds_count", "share") {
+        let want = [("share", share.as_str())];
+        let Some(jobs) = diff("kiln_blocking_run_seconds_count", &want) else { continue };
+        let run_p99 = measure::histogram_quantile(0.99, &histogram("kiln_blocking_run_seconds", &want));
+        put(format!("blocking.{share}.per_s"), Some(per_s(jobs)));
+        put(format!("blocking.{share}.run_p99_ms"), run_p99.map(|v| v * 1000.0));
+        put(format!("blocking.{share}.wait_p99_ms"), measure::histogram_quantile(0.99, &histogram("kiln_blocking_wait_seconds", &want)).map(|v| v * 1000.0));
+        put(format!("blocking.{share}.busy"), diff("kiln_blocking_run_seconds_sum", &want).map(per_s));
+        put(format!("blocking.{share}.little_p99"), run_p99.map(|w| per_s(jobs) * w));
+    }
+    shards.len()
+}
+
+/// Which way each number is better: each class's throughput up, everything else (latency, CPU, delay,
+/// slow polls, the pools' work) down.
 pub fn better(name: &str) -> crate::stats::Better {
-    if name.ends_with(".per_s") && !name.starts_with("shards.") {
+    let classes = ["page.", "api_read.", "api_write.", "websocket.", "attach."];
+    if name.ends_with(".per_s") && classes.iter().any(|c| name.starts_with(c)) {
         crate::stats::Better::Higher
     } else {
         crate::stats::Better::Lower
