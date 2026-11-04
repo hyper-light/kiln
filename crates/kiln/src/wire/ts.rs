@@ -70,6 +70,10 @@ fn roots(c: &mut Collect<'_>) {
     c.visit::<super::ui::StreamDown>();
     c.visit::<super::ui::StreamUp>();
     c.visit::<super::ui::CdLogDown>();
+    // An agent session's older pages, and what its lean events held back (docs/wire.md, "Windows").
+    c.visit::<super::ui::TimelinePage>();
+    c.visit::<super::ui::HeldBack>();
+    c.visit::<super::ui::HeldLines>();
     c.visit::<super::events::ServerEvent>();
     // The Changes tab's Commits (`agents.commits`).
     c.visit::<crate::workspace::git::Log>();

@@ -391,6 +391,47 @@ agreed with T2's Quiver agent on 2026-10-24:
   second structure to keep.
 - **(born, rev) stays the server's**: a viewer's resume token, never a Quiver offset.
 
+## Windows
+
+A long session's whole is megabytes: up to 4,000 events (`MAX_EVENTS`), a command's up to 24 KB of
+output (`OUTPUT_MAX`), an edit's input and hunks. A viewer that asks for a window (`?window=1`) is
+sent its newest events alone, and one that asks for lean events (`?lean=1`) is sent settled tool
+calls without their bodies (`crate::harness::window`). The UI asks for both; a viewer that asks for
+neither (an older tab) is sent every event, whole, as before.
+
+- **The window.** From the newest back, at most 10 of a person's turns (a message to the main
+  thread begins one), 500 events and about 1 MiB of them as sent. A bound reached inside a turn
+  cuts the window back to where the oldest whole turn it holds begins; only a turn longer than the
+  bounds is cut at them, and a window holds one event at least, however large. The bounds are T3
+  Code's (its `docs/internals/performance-regressions.md`): its timeline is the same thing,
+  parsed whole by a browser the same way, and kiln's sessions hold about ten calls a turn
+  (38,570 over 3,910 turns of twelve long Claude Code transcripts), so ten turns stay well inside
+  500 events. `open` says where it begins: `window: {before, more}`, `before` the number of its
+  first event and `more` whether there are events before it (in the server's copy, or in its
+  conversation store past what the copy holds, back to where the timeline begins, `State::cleared`).
+- **Older pages.** `GET /api/harness/sessions/:id/timeline?before=<seq>[&lean=1]` is the page just
+  before `before`: oldest first, at most 20 turns (T3 Code's older pages), 500 events and about 1
+  MiB, whole turns where they fit, `{events, before, more}`. From the server's copy, and before what
+  it holds, the conversation store. Each page is the events numbered from where it begins up to
+  where the last began, and new events are numbered after them all, so pages asked for one after
+  another meet with no gap and nothing twice while the session goes on. A viewer holding a window
+  takes no live event from before it that it doesn't hold: that one comes with its page.
+- **Lean events.** A settled tool call of kind shell, read, search, web or edit goes without its
+  output and input (`null`) and with its diffs' hunks empty, each diff saying its lines added and
+  taken out (`add`, `del`), and `held: {output, input, lines}` saying what was held back. What the
+  timeline shows of a folded call (its title, status, exit code, files and counts) is all there.
+  What it shows open as it comes goes whole: a call running or waiting, one that failed (an error,
+  a non-zero exit), and the kinds whose answers kiln reads (a question's, a page shown, research, a
+  subagent's result, a plan). Opening one asks for it whole:
+  `GET /api/harness/sessions/:id/events/:event?seq=<seq>`, from the copy, else the store.
+- **Live frames go whole.** The feed's frames are written once and shared by every viewer
+  (`live::Payload`); a lean copy of each would write every event twice for every watched session.
+  What's live is what's being watched, and a running call goes whole anyway; the window bounds the
+  first load, which is where the bytes were.
+- **Resumes stay bounded.** A viewer of a window that resumes (`after=`) gets what changed since,
+  lean as it takes them; one that missed more than a window holds (500 events or about 1 MiB) is
+  sent a window again instead, never every event.
+
 ## Restarts
 
 A runner that starts again starts each session's stream anew (its streams' names carry its boot).
@@ -807,7 +848,7 @@ CIs typecheck the UI against them.
 | `/api/harness/sessions/:id/ws` | up | `unread` | ack | A frame that came down that the page couldn't read: its tag (`of`) and why. | Noted on the agent's page (`session_down`); nothing goes back. |
 | `/api/harness/sessions/:id/ws` | down | `ack` | ack | A command under its id was taken. | Sent once to each socket that sent it, once its runner (or the server) answered. |
 | `/api/harness/sessions/:id/ws` | down | `nack` | ack | A command under its id was refused, saying how and why. | As `ack`. |
-| `/api/harness/sessions/:id/ws` | down | `open` | stream | Starts what a viewer is sent: the whole session, its revision and the server's incarnation (`rev`, `born`). | Sent on an attach without `after=`, or when the copy can't resume it. |
+| `/api/harness/sessions/:id/ws` | down | `open` | stream | Starts what a viewer is sent: the whole session, its revision and the server's incarnation (`rev`, `born`); to a viewer that asks for a window (`?window=1`), its newest events alone and where they begin (`window`, "Windows"). | Sent on an attach without `after=`, or when the copy can't resume it. |
 | `/api/harness/sessions/:id/ws` | down | `resumed` | stream | Starts a resume (`?after=<born>.<rev>`): the newest meta, state, changes and files, then only the events changed since. | Sent when the copy can resume the viewer. |
 | `/api/harness/sessions/:id/ws` | down | `meta` | state | The newest wins. | Sent whole on every attach. |
 | `/api/harness/sessions/:id/ws` | down | `state` | state | The newest wins. | Sent whole on every attach. |
@@ -815,7 +856,7 @@ CIs typecheck the UI against them.
 | `/api/harness/sessions/:id/ws` | down | `changes` | state | The whole changeset. | Sent whole on every attach. |
 | `/api/harness/sessions/:id/ws` | down | `changes_patch` | state | What changed since the last changeset (`?patch=changes`): the files set and those gone, taken in place. | As its class says. |
 | `/api/harness/sessions/:id/ws` | down | `files` | state | Files its messages mention. | Sent on attach. |
-| `/api/harness/sessions/:id/ws` | down | `events` | stream | Timeline events. | Every attach, and a viewer that falls behind, gets them all again. |
+| `/api/harness/sessions/:id/ws` | down | `events` | stream | Timeline events; settled tool calls lean to a viewer that asks (`?lean=1`, "Windows"). | Every attach gets them all again, or a window of them (`?window=1`); a viewer that falls behind, what it missed. |
 | `/api/harness/sessions/:id/ws` | down | `synced` | stream | Follows a snapshot. | As its class says. |
 | `/api/harness/sessions/:id/ws` | down | `closed` | stream | The session is gone. | As its class says. |
 | `/api/harness/sessions/:id/ws` | down | `error` | answer | A command's refusal. | Says a bare command's refusals, to clients from before ids. |
