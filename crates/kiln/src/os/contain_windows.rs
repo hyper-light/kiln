@@ -165,9 +165,15 @@ unsafe extern "system" {
     fn LoadLibraryExW(name: *const u16, file: *mut c_void, flags: u32) -> *mut c_void;
     fn GetProcAddress(module: *mut c_void, name: *const std::ffi::c_char) -> *mut c_void;
     fn SetPriorityClass(process: Handle, class: u32) -> i32;
-    fn GetPriorityClass(process: Handle) -> u32;
     fn GetCurrentProcess() -> Handle;
     fn SetProcessInformation(process: Handle, class: i32, info: *const c_void, len: u32) -> i32;
+}
+
+// What tests read back.
+#[cfg(test)]
+#[link(name = "kernel32")]
+unsafe extern "system" {
+    fn GetPriorityClass(process: Handle) -> u32;
     fn GetProcessInformation(process: Handle, class: i32, info: *mut c_void, len: u32) -> i32;
 }
 

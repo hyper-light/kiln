@@ -3,8 +3,9 @@
 On a machine where kiln's server runs beside its own work, the server comes first. CI legs and
 agents run at idle priority, each in a group of its own; headroom slows them when the server's own
 delay rises; and the server can be given cores of its own. This is plan 01a1a59c2b29 (goal 8) and
-the CPU-priority part of plan 01a19617's step 10. It joins [baremetal.md](baremetal.md) when that
-lands: its §5 writes the server's services, and this is how they rank.
+the CPU-priority part of plan 01a19617's step 10. It joins `docs/baremetal.md` (the bare-metal
+design, on its own branch until it lands) as that lands: its §5 writes the server's services, and
+this is how they rank.
 
 ## Why
 
@@ -73,9 +74,9 @@ it starts (f26). A step on a pty is put there as it starts.
 ## Windows
 
 The server's process runs `ABOVE_NORMAL_PRIORITY_CLASS`; it sets that itself as it starts, whatever
-started it. An agent's job object and each CI step's run every process in them below normal
-(`JOB_OBJECT_LIMIT_PRIORITY_CLASS` with `BELOW_NORMAL_PRIORITY_CLASS`, which what they start
-inherits) at the least share of weight-based CPU rate control, 1 of 9 (f23). Background mode,
+started it. An agent's job object and each CI step's run every process in them, what they start
+included, at `BELOW_NORMAL_PRIORITY_CLASS` (the job's `JOB_OBJECT_LIMIT_PRIORITY_CLASS`), at the least
+share of weight-based CPU rate control, 1 of 9 (f23). Background mode,
 `PROCESS_MODE_BACKGROUND_BEGIN`, lowers a process's I/O and memory priority too, which a CPU
 priority alone doesn't (f24), but only a process can put itself in it. So kiln gives the process it
 puts in each job what background mode would: very low memory priority and very low I/O priority,
@@ -111,21 +112,36 @@ place.
 ## Needs root, or a person
 
 - A system install (root, once) for the top-level `kiln.slice`, the partition, and the server's
-  memory protection in baremetal.md §5.
+  memory protection the bare-metal design's §5 adds.
 - Runners installed before this run legs and agents at normal priority until they're reinstalled
   or upgraded with a delegated unit. Upgrading a runner is a person's call: it ends the agents it
   runs.
-- The user manager must give its units the `cpu` controller (systemd's `user@.service` does from
-  v252: `Delegate=pids memory cpu`).
+- The user manager must give its units the `cpu` controller: systemd's own `user@.service`
+  delegates `pids memory cpu`, and a runner's unit's `cgroup.controllers` says what it got.
 
-## Checked
+## Tests
 
-- Linux: `os::contain` tests make a delegated scope of the user's own, arrange it as a runner does,
-  and read `cpu.idle` 1 on an agent's group with what it starts inside, a person's at 0; the
-  installer's units and slice; a server's delay as its probe reads it.
-- macOS: a step and an agent's harness under background policy, read back with
-  `getpriority(PRIO_DARWIN_PROCESS)`.
-- Windows: an agent's job, its priority class, CPU rate and its processes' priorities read back;
-  the server above normal.
-- The lab (CPU hogs beside the server, the API's tail against calm) is goal 1's; its report goes
-  here once it has run.
+- `os::contain::tests::g8_s2_a_delegated_units_groups_run_at_idle_priority` (Linux): makes a scope
+  of the user's own delegated to it, arranges it as a runner does (its process into the leaf, `+cpu`
+  for its children), and reads `cpu.idle` 1 on an agent's group with what it starts inside it, not
+  on a person's run's. `g8_s2_the_unit_whose_leaf_kiln_runs_in_is_its_home` reads the home.
+- `install::tests::g8_units_are_delegated_and_the_server_comes_first` and
+  `g8_systemd_reads_the_units_kiln_writes`: the runner's and the server's units, `kiln.slice` with
+  its weights and cores, `ProcessType` `Interactive` for the server's launchd job, and
+  `systemd-analyze verify` finding nothing against them.
+- `os::contain::tests::g8_s3_an_agents_processes_run_under_background_policy` (macOS): an agent's
+  harness and what it starts under background policy, read back with `getpriority`; a person's run
+  not; a running process put there.
+- `os::contain::tests::g8_s4_an_agents_job_runs_below_normal_at_the_least_weight` and
+  `g8_s4_the_server_runs_above_normal` (Windows): an agent's job's priority class and CPU rate
+  control read back, cmd and its child below normal, the first process's memory and I/O priority;
+  a person's job without a priority class; the server above normal.
+- `headroom::probes::tests::g8_s5_a_servers_delay_is_what_it_says_its_shards_wait` and
+  kiln-ci's `headroom::tests::g8_s5_the_servers_delay_rising_slows_legs_and_agents`: the probe reads
+  the delay a server says; the engine, the delay rising from calm, cuts kiln's CPU and paces a leg
+  and an agent alike, then sees it back to calm.
+- `rt::tests::g8_s6_shards_are_fixed_to_cores_of_the_servers_own` and
+  `os::tests::g8_s6_a_cpu_list_reads_as_linux_writes_one`: cores of the server's own.
+
+The lab (CPU hogs beside the server, the API's tail against calm) is goal 1's; its report goes here
+once it has run.

@@ -254,7 +254,8 @@ a copy a sync or a run is at, nor one used in the last ten minutes, whatever the
 
 **On the runner.** The node holds a copy in use while a sync is at it and while a run in it goes on,
 and notes the agent that asked: `kiln run` and the agents' `run` tool pass the agent's session as
-`KILN_REACH_AGENT` in the run's environment (the command sees it too). Every 20 seconds the runner
+`KILN_REACH_AGENT` in the run's environment (the command sees it too), synced or not: an agent's
+run is the agent's work, at its idle priority ([priority.md](priority.md)). Every 20 seconds the runner
 looks at its copies (`~/.kiln/reach/<runner>/<folder>`), measures those that changed, reads the
 room on their disk, and lets go of what the rules and their triggers say, oldest first: each copy
 is moved aside (`.letting-go`) under the lock a new sync or run takes, so none starts on it halfway

@@ -23,8 +23,9 @@ pub struct Settings {
     pub enabled: bool,
     /// What must stay healthy beyond what kiln adds itself (`automatic`).
     pub targets: Vec<Target>,
-    /// kiln adds its own targets: a small sync in the runner's data folder, and the health of the
-    /// server it reports to.
+    /// kiln adds its own targets: a small sync in the runner's data folder, the health of the
+    /// server it reports to, and, where that server runs on this machine, how late its shards run
+    /// ready work (docs/priority.md).
     pub automatic: bool,
     /// How many times a day headroom may hold or slow work when nothing would have gone wrong.
     pub false_alarms_per_day: f64,

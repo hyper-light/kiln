@@ -1931,6 +1931,39 @@ mod tests {
         Ok(())
     }
 
+    /// Goal 8 (plan 01a1a59c2b29 steps 2 and 6): systemd itself reads the units kiln writes (a
+    /// runner's, a server's with cores of its own, its slice) without a word against them, on a
+    /// machine that has `systemd-analyze`.
+    #[test]
+    fn g8_systemd_reads_the_units_kiln_writes() -> anyhow::Result<()> {
+        if !have("systemd-analyze") {
+            eprintln!("no systemd-analyze here: skipped");
+            return Ok(());
+        }
+        let dir = tempfile::tempdir()?;
+        let agent = ["supervise", "--", "agent"].map(str::to_owned);
+        let server = ["supervise", "--", "server"].map(str::to_owned);
+        let i = Install { system: false, unit: "kiln-g8-agent", bin: Path::new("/bin/true"), args: &agent, config: Path::new("/tmp/kiln.toml"), state_dir: dir.path(), env: None, ask: false };
+        let s = Install { unit: "kiln-g8-server", args: &server, ..i };
+        let units = [
+            ("kiln-g8-agent.service", systemd_unit(&i, "", "/bin/true supervise -- agent", systemd_version(), false)),
+            ("kiln-g8-server.service", systemd_unit(&s, "", "/bin/true supervise -- server", systemd_version(), true)),
+            ("kiln.slice", kiln_slice(Some("0-1"))),
+        ];
+        let mut paths = Vec::new();
+        for (name, body) in &units {
+            let path = dir.path().join(name);
+            std::fs::write(&path, body)?;
+            paths.push(path);
+        }
+        let out = Command::new("systemd-analyze").arg("--user").arg("verify").args(&paths).output()?;
+        let said = format!("{}{}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
+        // What it says of the units' own lines, not of the machine's other units.
+        let ours: Vec<&str> = said.lines().filter(|l| l.contains("kiln-g8-") || l.contains("kiln.slice")).collect();
+        anyhow::ensure!(out.status.success() && ours.is_empty(), "systemd-analyze: {said}");
+        Ok(())
+    }
+
     #[test]
     fn boot_definitions() -> anyhow::Result<()> {
         let args = vec!["supervise".to_owned(), "--".to_owned(), "agent".to_owned(), "--name".to_owned(), "box <1> & co".to_owned()];
