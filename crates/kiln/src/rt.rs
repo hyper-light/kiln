@@ -38,7 +38,18 @@ pub struct Profile {
     pub shards: u16,
     /// Task slots per shard (about 650 B of RSS each with timers and interests at 2x).
     pub tasks_per_shard: usize,
-    /// Places in the blocking pool's shares: (dns, store, fs).
+    /// Places in the blocking pool's shares: (dns, store, fs). The blocking pool is for calls that block a
+    /// thread; CPU work goes to the compute pool ([`compute`]; goal 3, plan 01a1a59c2a8e step 4), which the
+    /// pool's `fs` share carried before (the UI's compression, password hashing, digests of bytes in
+    /// memory). What each share's size rests on:
+    /// - `dns`: `getaddrinfo` calls at once, hyper-rt's resolver's;
+    /// - `store`: the store's statements, which its one connection takes one at a time (`crate::store`): a
+    ///   place running and one waiting its turn, so a slow statement holds these, not the `fs` share's;
+    /// - `fs`: everything else that blocks: files, `/proc`, archives, a child's wait.
+    ///
+    /// The counts are kiln's from when it moved onto hyper-rt (f202896cb2d), not yet measured: each
+    /// share's size from what its calls wait under realistic load is the lab's to say (goal 1's
+    /// `kiln-lab`, not yet on main).
     pub pool: (usize, usize, usize),
     /// Whether the runtime says how it was sized at `info` (a server's and a runner's logs), or only at
     /// `debug` (a command's, whose output is the person's).
@@ -160,15 +171,27 @@ fn start() -> Result<Rt, String> {
     if holders.is_empty() {
         return Err("runtime started without shards".to_owned());
     }
+    // Each shard asks for a slice of its step (goal 3, plan 01a1a59c2a8e step 1): waking on a CPU a compute
+    // pool thread holds, it takes the CPU at once (`hyper_rt::compute::prefer_current_thread`; Linux).
+    for holder in &holders {
+        let slice = config.step_budget_ns;
+        let _ = hyper_rt::runtime::submit_to_holder(*holder, async move {
+            if let Err(refusal) = hyper_rt::compute::prefer_current_thread(slice) {
+                tracing::debug!(%refusal, "a shard kept the OS's slice");
+            }
+        });
+    }
     tracing::debug!(shards = p.shards, tasks = p.tasks_per_shard, "hyper-rt runtime started");
     Ok(Rt { _runtime: runtime, holders, next: AtomicUsize::new(0) })
 }
 
 /// The compute pool (goal 3 of the API runtime program, plan 01a1a59c2a8e step 1; `hyper_rt::compute`): as
 /// many threads as the CPU the process is granted (its cgroup's quota or its cpuset, else the OS's count)
-/// less its shards, at a lower OS priority than the shards; a piece of a job as long as a shard's step, so a
-/// long job gives its thread to a waiting one as a task gives its shard; room for a job for every task the
-/// shards can hold, each of which awaits its own. Said with how its size was derived.
+/// less its shards, at a lower OS priority than the shards that still has its share of the CPU against
+/// other work in the process's cgroup, as requests wait on its jobs (`Rank::Below`); a piece of a job as
+/// long as a shard's step, so a long job gives its thread to a waiting one as a task gives its shard; room
+/// for a job for every task the shards can hold, each of which awaits its own. Said with how its size was
+/// derived.
 fn start_compute(p: &Profile, config: &RuntimeConfig) {
     if hyper_rt::compute::running() {
         return;
@@ -176,7 +199,7 @@ fn start_compute(p: &Profile, config: &RuntimeConfig) {
     let grant = hyper_rt::compute::Grant::of_process();
     let shards = usize::from(p.shards);
     let workers = hyper_rt::compute::workers_for(&grant, shards);
-    let pool = hyper_rt::compute::Config { workers, queued: shards.saturating_mul(p.tasks_per_shard), piece_ns: config.step_budget_ns };
+    let pool = hyper_rt::compute::Config { workers, queued: shards.saturating_mul(p.tasks_per_shard), piece_ns: config.step_budget_ns, rank: hyper_rt::compute::Rank::Below };
     match hyper_rt::compute::start(pool) {
         Ok(started) => {
             let priority = match started.priority {
@@ -359,7 +382,8 @@ where
 
 // ------------------------------------------------------------------------------- blocking pool
 
-/// Run `f` on the blocking pool's `fs` share (files, `/proc`, archives, anything that blocks).
+/// Run `f` on the blocking pool's `fs` share: files, `/proc`, archives, anything that blocks. Work that
+/// only computes goes to [`compute`].
 pub async fn blocking<R, F>(f: F) -> anyhow::Result<R>
 where
     F: FnOnce() -> R + Send + 'static,
