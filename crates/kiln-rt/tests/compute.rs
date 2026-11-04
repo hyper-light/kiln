@@ -22,7 +22,7 @@ use std::sync::mpsc::sync_channel;
 use std::time::{Duration, Instant};
 
 use hyper_rt::RtError;
-use hyper_rt::compute::{self, Config, Step};
+use hyper_rt::compute::{self, Config, Rank, Step};
 use hyper_rt::runtime::{LocalRuntime, RuntimeConfig};
 use hyper_rt::sync::OneshotReceiver;
 
@@ -77,12 +77,13 @@ fn the_pool_runs_lowers_refuses_yields_and_stops() {
         workers: 1,
         queued: 4,
         piece_ns: u64::try_from(PIECE.as_nanos()).unwrap(),
+        rank: Rank::Below,
     })
     .unwrap();
     assert_eq!(started.workers, 1);
     assert!(
         matches!(
-            compute::start(Config { workers: 1, queued: 1, piece_ns: 1 }),
+            compute::start(Config { workers: 1, queued: 1, piece_ns: 1, rank: Rank::Below }),
             Err(RtError::BadConfig { .. })
         ),
         "one pool per process"

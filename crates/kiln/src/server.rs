@@ -65,6 +65,7 @@ pub async fn run(cfg: Config, shutdown: Shutdown) -> anyhow::Result<()> {
         let dir = cfg.server.data_dir.clone();
         crate::rt::spawn_spread(async move {
             let _ = crate::rt::blocking(move || crate::ui::keep_assets(&dir)).await;
+            crate::ui::warm().await;
         });
     }
     crate::password::seed_from_env(&crate::password::path(&cfg));

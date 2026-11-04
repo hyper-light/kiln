@@ -526,8 +526,31 @@ where
 enum Exit {
     /// The command channel closed: the owner is gone.
     Closed,
-    /// Start over on a fresh endpoint; `redial`: an agent dials its last address at once.
-    Rebuild { redial: bool },
+    /// Start over on a fresh endpoint; `redial`: an agent dials its last address at once. `carry`:
+    /// what the owner hasn't taken yet, for the next incarnation to hand it.
+    Rebuild { redial: bool, carry: Carry },
+}
+
+/// What one incarnation of the loop hands the next (goal 3, plan 01a1a59c2a8e step 5): the events
+/// the owner had no room for yet, in order, and the one being handed to it. A rebuild used to drop
+/// them, and the dial's deadline waited for room to say it went unanswered: the loop took no command
+/// while it waited (perf/api-pass's deadlock, in its last place).
+#[derive(Default)]
+struct Carry {
+    held: VecDeque<NetEvent>,
+    held_bytes: usize,
+    handing: Option<Handing>,
+}
+
+impl Carry {
+    /// `held` and `handing` as they stand, with `events` (this turn's, not yet held) after them.
+    fn of(mut held: VecDeque<NetEvent>, mut held_bytes: usize, handing: Option<Handing>, events: &mut Vec<NetEvent>) -> Carry {
+        for ev in events.drain(..) {
+            held_bytes = held_bytes.saturating_add(weight(&ev));
+            held.push_back(ev);
+        }
+        Carry { held, held_bytes, handing }
+    }
 }
 
 fn thread_main(spec: Spec, rx: async_channel::Receiver<Out>, etx: async_channel::Sender<NetEvent>) {
@@ -536,18 +559,21 @@ fn thread_main(spec: Spec, rx: async_channel::Receiver<Out>, etx: async_channel:
     // One shard: the loop, plus helpers for any wait polled under a foreign waker.
     let config = crate::rt::runtime_config(1, 1024);
     let mut backoff = Duration::from_millis(200);
+    // What the last incarnation hadn't handed the owner yet: the next hands it first.
+    let mut carry = Carry::default();
     loop {
         let started = Instant::now();
         // A fresh runtime per incarnation: whatever a failed loop left behind goes with it.
         let outcome = match LocalRuntime::new(&config) {
             Ok(mut local) => local
-                .block_on(run_loop(Arc::clone(&spec), rx.clone(), etx.clone(), Arc::clone(&last_dial)))
+                .block_on(run_loop(Arc::clone(&spec), rx.clone(), etx.clone(), Arc::clone(&last_dial), std::mem::take(&mut carry)))
                 .map_err(|e| format!("{e}")),
             Err(e) => Err(format!("cannot start the net runtime: {e}")),
         };
         match outcome {
             Ok(Ok(Exit::Closed)) => return,
-            Ok(Ok(Exit::Rebuild { redial })) => {
+            Ok(Ok(Exit::Rebuild { redial, carry: next })) => {
+                carry = next;
                 if !redial {
                     *last_dial.lock().unwrap_or_else(PoisonError::into_inner) = None;
                 }
@@ -815,6 +841,7 @@ async fn run_loop(
     rx: async_channel::Receiver<Out>,
     etx: async_channel::Sender<NetEvent>,
     last_dial: Arc<Mutex<Option<SocketAddr>>>,
+    carry: Carry,
 ) -> anyhow::Result<Exit> {
     let mut driver = build(&spec)?;
     if let AnyDriver::Server(d) = &driver {
@@ -844,9 +871,8 @@ async fn run_loop(
     // it holds as much for the owner as it lets any one peer have unread (a connection's receive
     // window, `Limits::window_ceiling`), it holds its peers' lanes: what they send waits in QUIC,
     // whose flow control holds them back (RFC 9000 §4.1), until the owner has taken all of it.
-    let mut held: VecDeque<NetEvent> = VecDeque::new();
-    let mut held_bytes = 0usize;
-    let mut handing: Option<Handing> = None;
+    // An incarnation after a rebuild starts with what the last hadn't handed over.
+    let Carry { mut held, mut held_bytes, mut handing } = carry;
     let (held_most, lanes) = {
         let l = limits(spec.server);
         (usize::try_from(l.window_ceiling).unwrap_or(usize::MAX), l.lanes_per_peer)
@@ -1010,7 +1036,7 @@ async fn run_loop(
                                     Dial::Dialing { addr: pending, .. } if pending == addr => {}
                                     // Dialing elsewhere, or the owner believes the connection is
                                     // gone: a fresh endpoint dials the new address at once.
-                                    Dial::Dialing { .. } | Dial::Connected => return Ok(Exit::Rebuild { redial: true }),
+                                    Dial::Dialing { .. } | Dial::Connected => return Ok(Exit::Rebuild { redial: true, carry: Carry::of(held, held_bytes, handing, &mut events) }),
                                     Dial::Idle => {
                                         let now = clock!(d);
                                         match d.endpoint().connect(now, SERVER_PEER, addr) {
@@ -1021,7 +1047,7 @@ async fn run_loop(
                                 }
                             }
                         }
-                        Out::Rebuild => return Ok(Exit::Rebuild { redial: true }),
+                        Out::Rebuild => return Ok(Exit::Rebuild { redial: true, carry: Carry::of(held, held_bytes, handing, &mut events) }),
                     }
                 }
                 with_driver!(&mut driver, d => {
@@ -1049,14 +1075,15 @@ async fn run_loop(
             Ev::DialDeadline => {
                 if let Dial::Dialing { addr, .. } = dial {
                     tracing::warn!(%addr, after = ?spec.dial_deadline, "no answer to the dial; abandoning it");
-                    // Report first, then start over clean: the owner re-dials with its backoff.
-                    let _ = etx
-                        .send(NetEvent::Unreachable {
-                            peer: SERVER_PEER,
-                            reason: format!("no answer from {addr} in {}s", spec.dial_deadline.as_secs()),
-                        })
-                        .await;
-                    return Ok(Exit::Rebuild { redial: false });
+                    // Said after what the owner hasn't taken yet, and carried: the next incarnation
+                    // hands it over as the owner makes room, going on meanwhile (it used to wait here
+                    // for room, taking no command). Then start over clean: the owner re-dials with
+                    // its backoff.
+                    events.push(NetEvent::Unreachable {
+                        peer: SERVER_PEER,
+                        reason: format!("no answer from {addr} in {}s", spec.dial_deadline.as_secs()),
+                    });
+                    return Ok(Exit::Rebuild { redial: false, carry: Carry::of(held, held_bytes, handing, &mut events) });
                 }
             }
             Ev::Retry => {
@@ -1616,6 +1643,73 @@ mod tests {
                     taken += 1;
                 }
             }
+            Ok(())
+        })
+    }
+
+    /// Goal 3, plan 01a1a59c2a8e step 5 (perf/api-pass's leftover): an agent's dial that goes
+    /// unanswered while its owner has no room for what came in waits on nothing and loses nothing.
+    /// The owner takes none of what the server sends it (more than its queue holds), then asks for a
+    /// dial to an address that never answers: past the dial's deadline the loop still takes commands
+    /// (a sample is answered), and once the owner takes what came in, every frame is there in order,
+    /// then the dial's `Unreachable`. The loop used to wait at the deadline for room to say so, taking
+    /// no command meanwhile, and a rebuild dropped what it held for the owner.
+    #[test]
+    fn g3_s5_a_dial_unanswered_while_the_owner_has_no_room_waits_on_nothing_and_loses_nothing() -> anyhow::Result<()> {
+        crate::rt::block_on(async {
+            let dir = tempfile::tempdir()?;
+            let pki = crate::pki::Pki::open(dir.path())?;
+            let probe = std::net::UdpSocket::bind("127.0.0.1:0")?;
+            let addr = probe.local_addr()?;
+            drop(probe);
+            let (srv, srv_ev) = start(Spec { bind: addr, ca_der: pki.ca_der.clone(), leaf: pki.server_leaf(&[])?, server: true, dial_deadline: DIAL_DEADLINE, revoked_keys: Vec::new() })?;
+            let (agent, agent_ev) = start(Spec { bind: "127.0.0.1:0".parse()?, ca_der: pki.ca_der.clone(), leaf: pki.issue_local("full-owner")?, server: false, dial_deadline: Duration::from_secs(1), revoked_keys: Vec::new() })?;
+            agent.command(Out::Connect { addr }).await;
+            let deadline = Instant::now() + Duration::from_secs(60);
+            let peer = connected_within(&srv_ev, Duration::from_secs(15)).await.ok_or_else(|| anyhow::anyhow!("the agent didn't connect"))?;
+            loop {
+                if let NetEvent::Connected { .. } = next_event(&agent_ev, deadline).await? {
+                    break;
+                }
+            }
+            // More than the owner's queue holds, the owner taking none of it, over four lanes (no
+            // lane's queue past its bound).
+            const N: u32 = 17_000;
+            const LANES: u32 = 4;
+            for i in 0..N {
+                srv.send(peer, i % LANES, Kind::Control, [(i % LANES).to_le_bytes(), i.to_le_bytes()].concat()).await;
+            }
+            let full = Instant::now() + Duration::from_secs(30);
+            while !agent_ev.is_full() && Instant::now() < full {
+                crate::rt::sleep(Duration::from_millis(10)).await;
+            }
+            anyhow::ensure!(agent_ev.is_full(), "the owner's queue never filled: {} of {:?}", agent_ev.len(), agent_ev.capacity());
+            // A dial to an address that takes the handshake and never answers, past its deadline.
+            let silent = std::net::UdpSocket::bind("127.0.0.1:0")?;
+            agent.command(Out::Connect { addr: silent.local_addr()? }).await;
+            crate::rt::sleep(Duration::from_millis(2500)).await;
+            let asking = agent.clone();
+            let sampled = crate::rt::on_thread("sample", move || asking.sample(Duration::from_secs(10))).await?;
+            anyhow::ensure!(sampled.is_some(), "the net thread took no command past the dial's deadline: it waited for the owner");
+            // Then what came in, each lane's frames in order, and after them the dial's Unreachable.
+            let mut next = [0u32; LANES as usize];
+            loop {
+                match next_event(&agent_ev, deadline).await? {
+                    NetEvent::Frame { lane, data, .. } => {
+                        let at = next.get_mut(lane as usize).ok_or_else(|| anyhow::anyhow!("a frame on lane {lane}"))?;
+                        let i = data.get(4..8).and_then(|b| <[u8; 4]>::try_from(b).ok()).map(u32::from_le_bytes).ok_or_else(|| anyhow::anyhow!("a frame of {} bytes", data.len()))?;
+                        anyhow::ensure!(i == *at * LANES + lane, "lane {lane}: {i} where {} was next", *at * LANES + lane);
+                        *at += 1;
+                    }
+                    NetEvent::Unreachable { peer, reason } if peer == SERVER_PEER => {
+                        let taken: u32 = next.iter().sum();
+                        anyhow::ensure!(taken >= 16_384, "the Unreachable came after {taken} frames, fewer than the owner's queue held: {reason}");
+                        break;
+                    }
+                    _ => {}
+                }
+            }
+            drop(silent);
             Ok(())
         })
     }

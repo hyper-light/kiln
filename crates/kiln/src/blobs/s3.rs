@@ -907,7 +907,8 @@ impl Blobs for S3Blobs {
             let (_, place, s3id) = parse_upload(upload).ok_or_else(|| Refusal::NoSuchUpload(upload.to_owned()))?;
             let bytes = Arc::new(bytes);
             let b = Arc::clone(&bytes);
-            let sha = crate::rt::blocking(move || hex::encode(Sha256::digest(b.as_slice()))).await.map_err(|e| unavailable(format!("{e:#}")))?;
+            // A digest of bytes in memory is CPU alone: the compute pool's (goal 3, plan 01a1a59c2a8e step 4).
+            let sha = crate::rt::compute(move || hex::encode(Sha256::digest(b.as_slice()))).await.map_err(|e| unavailable(format!("{e:#}")))?;
             let body = Bytes::from(bytes.as_ref().clone());
             let a = self.send(Http::Put, Some(&self.joined(&place)), &[("partNumber", part.to_string()), ("uploadId", s3id)], &[], Payload { bytes: body, sha: &sha, limit: DOCUMENT_MAX }).await?;
             if !a.ok() {
