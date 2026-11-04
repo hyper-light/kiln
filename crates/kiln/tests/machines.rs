@@ -20,6 +20,11 @@ use serde_json::{Value, json};
 /// (its machine id made from it), with `more` (`--instance <id>`: a runner process an upgrade
 /// started): its log.
 fn agent(dir: &Path, port: u16, state: &Path, name: &str, log: &str, more: &[&str]) -> anyhow::Result<(Runner, PathBuf)> {
+    agent_on(dir, port, state, name, name, log, more)
+}
+
+/// [`agent`], on machine `machine` (its machine id made from it): two names of one machine.
+fn agent_on(dir: &Path, port: u16, state: &Path, name: &str, machine: &str, log: &str, more: &[&str]) -> anyhow::Result<(Runner, PathBuf)> {
     let home = dir.join("home");
     std::fs::create_dir_all(&home)?;
     let log_path = dir.join(log);
@@ -27,7 +32,7 @@ fn agent(dir: &Path, port: u16, state: &Path, name: &str, log: &str, more: &[&st
     let child = common::kiln()
         .args(["agent", "--server", &format!("http://127.0.0.1:{port}"), "--name", name, "--no-terminal"])
         .args(more)
-        .env("KILN_MACHINE_ID", name)
+        .env("KILN_MACHINE_ID", machine)
         .arg("--work-dir")
         .arg(dir.join(format!("{log}-work")))
         .arg("--state-dir")
@@ -195,5 +200,68 @@ fn the_servers_own_runner_is_known_by_its_machines_id_and_shown_by_its_name() ->
     let me = list.iter().find(|a| text(a, "name") == id).cloned().unwrap_or_default();
     assert_eq!(text(&me, "label"), kiln::pki::sanitize_name(&kiln::config::Config::hostname()), "shown by its configured name: {me}");
     assert_eq!(list.len(), 1, "one runner: {list:?}");
+    Ok(())
+}
+
+/// Whether runner `a` said it is machine `id` (its facts, W13-R01).
+fn says(a: &Value, id: &str) -> bool {
+    a.get("facts").and_then(|f| f.get("machine_id")).and_then(Value::as_str) == Some(id)
+}
+
+/// The machine's record `name` connects by its name once (it had nothing to move), says it is
+/// machine `machine`, and stops: a record of that machine from before.
+fn once_by_name(dir: &Path, port: u16, admin: &str, join: &str, name: &str, machine: &str) -> anyhow::Result<()> {
+    let state = dir.join(name);
+    enrolled_by_name(port, admin, join, &state, name)?;
+    let (r, log) = agent_on(dir, port, &state, name, machine, &format!("{name}.log"), &[])?;
+    let id = common::machine(machine);
+    until(port, admin, &format!("{name} connected by its name, saying its machine"), &log, |l| l.iter().any(|a| text(a, "name") == name && connected(a) && says(a, &id)))?;
+    stop(r)?;
+    until(port, admin, &format!("{name} gone away"), &log, |l| l.iter().any(|a| text(a, "name") == name && !connected(a)))?;
+    Ok(())
+}
+
+/// docs/machines.md, "Duplicates fold into the machine's id": one machine with two records from
+/// before (it joined by two names, as fedora.attlocal.net and kiln-a094a12d.attlocal.net did).
+/// As one moves to the machine's id, the other folds into it, what was set for it with it. A
+/// third that says it is the machine stays while it's connected, and folds once it isn't, the next
+/// time the machine says which it is.
+#[test]
+fn machines_a_duplicate_of_a_machine_folds_into_its_id() -> anyhow::Result<()> {
+    let tmp = tempfile::tempdir()?;
+    let dir = tmp.path();
+    let s = start(dir, &Options::default())?;
+    let join = std::fs::read_to_string(dir.join("data/join.token"))?.trim().to_owned();
+    let id = machine("one-box");
+    once_by_name(dir, s.port, &s.admin, &join, "fedora", "one-box")?;
+    let (st, body) = http(s.port, "PUT", "/api/runners/fedora/agent-limit", &s.admin, Some(&json!({ "max_sessions": 3 })))?;
+    anyhow::ensure!(st == 200, "fedora's agent limit: {st} {body}");
+    once_by_name(dir, s.port, &s.admin, &join, "kiln-a094", "one-box")?;
+
+    // kiln-a094 starts again and moves to the machine's id; fedora, the same machine, folds in.
+    let (_runner, log) = agent_on(dir, s.port, &dir.join("kiln-a094"), "kiln-a094", "one-box", "moved.log", &[])?;
+    let list = until(s.port, &s.admin, "the machine connected by its id, one record of it", &log, |l| {
+        l.iter().any(|a| text(a, "name") == id && connected(a)) && !l.iter().any(|a| ["fedora", "kiln-a094"].contains(&text(a, "name")))
+    })?;
+    let me = list.iter().find(|a| text(a, "name") == id).cloned().unwrap_or_default();
+    assert_eq!(text(&me, "label"), "kiln-a094", "shown by the name it moved from: {me}");
+    let (st, body) = http(s.port, "GET", &format!("/api/runners/{id}/agent-limit"), &s.admin, None)?;
+    let limit: Value = serde_json::from_str(&body).unwrap_or_default();
+    assert!(st == 200 && limit.get("max_sessions") == Some(&json!(3)), "fedora's agent limit folded in: {st} {body}");
+
+    // A third record of the machine, connected by its name while the machine is: it stays.
+    let state = dir.join("third");
+    enrolled_by_name(s.port, &s.admin, &join, &state, "third")?;
+    let (third, third_log) = agent_on(dir, s.port, &state, "third", "one-box", "third.log", &[])?;
+    until(s.port, &s.admin, "third connected, saying the machine", &third_log, |l| l.iter().any(|a| text(a, "name") == "third" && connected(a) && says(a, &id)))?;
+    let (st, body) = http(s.port, "POST", &format!("/api/agents/{id}/probe"), &s.admin, None)?;
+    anyhow::ensure!(st == 200, "probing the machine: {st} {body}");
+    until(s.port, &s.admin, "third still known while connected", &third_log, |l| l.iter().any(|a| text(a, "name") == "third"))?;
+    stop(third)?;
+    until(s.port, &s.admin, "third gone away", &third_log, |l| l.iter().any(|a| text(a, "name") == "third" && !connected(a)))?;
+    // The machine says which it is again: third folds in.
+    let (st, body) = http(s.port, "POST", &format!("/api/agents/{id}/probe"), &s.admin, None)?;
+    anyhow::ensure!(st == 200, "probing the machine again: {st} {body}");
+    until(s.port, &s.admin, "third folded into the machine", &log, |l| !l.iter().any(|a| text(a, "name") == "third") && l.iter().any(|a| text(a, "name") == id && connected(a)))?;
     Ok(())
 }

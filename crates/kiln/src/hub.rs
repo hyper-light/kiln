@@ -390,6 +390,12 @@ pub struct AgentLive {
     /// How far its (newest process's) kiln is behind the server's (`crate::skew`): to be upgraded,
     /// it takes no new work.
     pub skew: crate::skew::Skew,
+    /// A record that can't be proven to be any machine (docs/machines.md, "Runners from before"):
+    /// not connected, known by a name, and its runner never said its machine id. kiln neither
+    /// folds nor forgets it on its own; it's shown as stale, for a person to forget.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    #[cfg_attr(test, ts(as = "Option<bool>", optional))]
+    pub stale: bool,
 }
 
 impl AgentLive {
@@ -1101,6 +1107,7 @@ impl Hub {
     pub async fn agent_list(&self) -> Vec<AgentLive> {
         let rows = self.store.agents().await.unwrap_or_default();
         let labels = self.store.agent_labels().await.unwrap_or_default();
+        let machines = self.store.agent_machines().await.unwrap_or_default();
         let live = self.agents.lock().clone();
         let mut out: Vec<AgentLive> = rows
             .into_iter()
@@ -1138,6 +1145,7 @@ impl Hub {
                     instances: vec![],
                     transport: None,
                     skew: crate::skew::Skew::default(),
+                    stale: false,
                 },
             })
             .collect();
@@ -1153,6 +1161,9 @@ impl Hub {
             a.transport = a.peer.filter(|_| a.connected).map(|p| self.tunnels.transport(p));
             a.dropped_toward = a.peer.map(|p| metrics::net().toward(p)).unwrap_or_default();
             a.refused = self.refusals.lock().kept(&crate::wire::unread::Page::Runner(a.name.clone())).cloned();
+            // docs/machines.md, "Runners from before": no machine id, so no machine it's proven to be.
+            let said = machines.contains_key(&a.name) || a.facts.as_ref().is_some_and(|f| f.machine_id.is_some());
+            a.stale = !a.connected && !a.ephemeral && !crate::join::is_machine_key(&a.name) && !said;
         }
         out.sort_by(|a, b| b.connected.cmp(&a.connected).then(a.name.cmp(&b.name)));
         out
@@ -1650,16 +1661,24 @@ impl Hub {
     /// by its name moving to its machine id): its rows and what's set for it, its agent sessions, its
     /// synced copies and places, and its member in the cluster group go with it. Refused while a
     /// process of it is connected: what it holds would move from under it.
-    pub async fn move_runner(&self, from: &str, to: &str, label: &str, hostname: &str) -> anyhow::Result<()> {
+    ///
+    /// `to` may be known already (a second record of the machine folding into its id,
+    /// [`Hub::fold_duplicates`]): what it has wins over `from`'s, its label included. The label
+    /// `to` is shown by now.
+    pub async fn move_runner(&self, from: &str, to: &str, label: &str, hostname: &str) -> anyhow::Result<String> {
         anyhow::ensure!(from != to, "{from} is known by that name already");
-        let connected = !self.instances.lock().of(from).is_empty() || self.agents.lock().get(from).is_some_and(|a| a.connected);
-        anyhow::ensure!(!connected, "{from} has a runner process connected: it moves to its machine id once none is");
+        anyhow::ensure!(!self.is_connected(from), "{from} has a runner process connected: it moves to its machine id once none is");
         let prefixes = vec![crate::frontdoor::control::KEY_PREFIX, crate::harness::limit::KEY_PREFIX, crate::updates::POLICY_PREFIX];
         self.store.move_runner(from.to_owned(), to.to_owned(), label.to_owned(), hostname.to_owned(), prefixes).await?;
+        // What the store kept: `to`'s own label when it had one.
+        let label = self.store.agent_label(to.to_owned()).await.ok().flatten().unwrap_or_else(|| label.to_owned());
         {
             let mut labels = self.labels.lock();
             labels.remove(from);
-            labels.insert(to.to_owned(), label.to_owned());
+            labels.insert(to.to_owned(), label.clone());
+        }
+        if let Some(a) = self.agents.lock().get_mut(to) {
+            a.label = Some(label.clone());
         }
         self.agents.lock().remove(from);
         self.away_peers.lock().remove(from);
@@ -1674,7 +1693,113 @@ impl Hub {
             self.cluster.moved(group, from);
         }
         self.update_slot_gauges();
-        Ok(())
+        Ok(label)
+    }
+
+    /// Whether runner `name` has a process connected.
+    fn is_connected(&self, name: &str) -> bool {
+        !self.instances.lock().of(name).is_empty() || self.agents.lock().get(name).is_some_and(|a| a.connected)
+    }
+
+    /// The other records of machine `id` (docs/machines.md, "Duplicates fold into the machine's
+    /// id"): each runner known by a name whose runner said it is machine `id`, and whether a
+    /// process of it is connected. Never one known by another machine id (that one is its own
+    /// machine, or a copy caught as one), never one by its host name alone.
+    pub async fn duplicates_of(&self, id: &str) -> anyhow::Result<Vec<(String, bool)>> {
+        if !crate::join::is_machine_key(id) {
+            return Ok(Vec::new());
+        }
+        let machines = self.store.agent_machines().await?;
+        let mut out: Vec<(String, bool)> = machines
+            .into_iter()
+            .filter(|(name, said)| name != id && !crate::join::is_machine_key(name) && crate::join::machine_key(Some(said)).as_deref() == Some(id))
+            .map(|(name, _)| {
+                let up = self.is_connected(&name);
+                (name, up)
+            })
+            .collect();
+        out.sort();
+        Ok(out)
+    }
+
+    /// Every other record of machine `id` that isn't connected folds into `id`
+    /// (docs/machines.md, "Duplicates fold into the machine's id"): what kiln kept under its name
+    /// moves to the id as a runner from before's does ([`Hub::move_runner`]), merged with what
+    /// the id has, and its record is gone, audited (`agent.merged`). A connected one stays, said
+    /// in the log: it folds once it isn't. The names folded.
+    pub async fn fold_duplicates(&self, id: &str) -> anyhow::Result<Vec<String>> {
+        let dups = self.duplicates_of(id).await?;
+        if dups.is_empty() {
+            return Ok(Vec::new());
+        }
+        let rows = self.store.agents().await?;
+        let mut folded = Vec::new();
+        for (dup, up) in dups {
+            let shown = self.shown(&dup);
+            if up {
+                tracing::warn!(machine = %id, runner = %shown, "a second record of this machine is connected: it folds into the machine's id once it isn't");
+                continue;
+            }
+            let hostname = rows.iter().find(|r| r.name == dup).map(|r| r.hostname.clone()).unwrap_or_default();
+            // The id's own label wins; one without takes the duplicate's (it's gone, so its name is free).
+            let label = match self.move_runner(&dup, id, &shown, &hostname).await {
+                Ok(l) => l,
+                Err(e) => {
+                    tracing::warn!(machine = %id, runner = %shown, error = %format!("{e:#}"), "a second record of this machine didn't fold");
+                    continue;
+                }
+            };
+            self.store.audit("kiln".into(), "agent.merged".into(), format!("{shown} was machine {id}: folded into {label}")).await;
+            tracing::info!(machine = %id, runner = %shown, into = %label, "a second record of a machine folded into its id");
+            folded.push(dup);
+        }
+        Ok(folded)
+    }
+
+    /// Job pods' records that are done with (docs/machines.md, "Finished job pods are forgotten"):
+    /// an ephemeral runner not connected, past its reconnect grace, whose jobs have all ended, is
+    /// forgotten. Its jobs and their history keep its name. Nothing while the server is younger
+    /// than the grace, as pods connected before it started may still come back.
+    pub async fn forget_finished_pods(&self) -> Vec<String> {
+        if self.started.elapsed() <= AGENT_GRACE {
+            return Vec::new();
+        }
+        self.forget_pods_but_waiting().await
+    }
+
+    /// [`Hub::forget_finished_pods`], whatever the server's age.
+    async fn forget_pods_but_waiting(&self) -> Vec<String> {
+        // Those connected, or gone less than the grace ago: they may come back for their jobs.
+        let keep: Vec<String> = self
+            .agents
+            .lock()
+            .values()
+            .filter(|a| a.ephemeral && (a.connected || a.lost_at.is_none_or(|t| t.elapsed() <= AGENT_GRACE)))
+            .map(|a| a.name.clone())
+            .collect();
+        let gone = match self.store.forget_finished_pods(keep).await {
+            Ok(g) => g,
+            Err(e) => {
+                tracing::warn!(error = %format!("{e:#}"), "finished job pods' records weren't forgotten");
+                return Vec::new();
+            }
+        };
+        if !gone.is_empty() {
+            {
+                let mut live = self.agents.lock();
+                for name in &gone {
+                    if live.get(name).is_some_and(|a| a.ephemeral && !a.connected) {
+                        live.remove(name);
+                    }
+                }
+            }
+            for name in &gone {
+                metrics::agent_samples().write().remove(name);
+            }
+            tracing::info!(pods = gone.len(), "finished job pods' records forgotten");
+            self.update_slot_gauges();
+        }
+        gone
     }
 
     // ------------------------------------------------------------ reach
@@ -2495,10 +2620,17 @@ impl Hub {
                         a.facts = Some(f);
                         self.ci.send(crate::ci::dispatch::Msg::RunnerFacts { agent: agent.to_owned() });
                     }
-                    if let Some(m) = machine.filter(|_| kept)
-                        && let Err(e) = self.store.set_agent_machine(agent.to_owned(), m).await
-                    {
-                        tracing::warn!(agent = %agent, error = %format!("{e:#}"), "couldn't keep the runner's machine id");
+                    if let Some(m) = machine.filter(|_| kept) {
+                        if let Err(e) = self.store.set_agent_machine(agent.to_owned(), m.clone()).await {
+                            tracing::warn!(agent = %agent, error = %format!("{e:#}"), "couldn't keep the runner's machine id");
+                        }
+                        // A machine known by its id saying so: its other records fold into it
+                        // (docs/machines.md, "Duplicates fold into the machine's id").
+                        if crate::join::machine_key(Some(&m)).as_deref() == Some(agent)
+                            && let Err(e) = self.fold_duplicates(agent).await
+                        {
+                            tracing::warn!(agent = %agent, error = %format!("{e:#}"), "couldn't fold this machine's other records");
+                        }
                     }
                     self.note_machine(agent);
                 }
@@ -2850,6 +2982,7 @@ impl Hub {
             instances: Vec::new(),
             transport: None,
             skew: crate::skew::Skew::default(),
+            stale: false,
         };
         let prev = self.agents.lock().get(&name).cloned();
         // Its facts stay until its new connection's probe reports.
@@ -2897,6 +3030,12 @@ impl Hub {
         self.pending_peers.lock().remove(&peer);
         self.agents.lock().insert(name.clone(), live.clone());
         self.note_machine(&name);
+        // A machine known by its id connecting: its other records fold into it (docs/machines.md).
+        if !live.ephemeral
+            && let Err(e) = self.fold_duplicates(&name).await
+        {
+            tracing::warn!(agent = %name, error = %format!("{e:#}"), "couldn't fold this machine's other records");
+        }
         if let Some(j) = &h.dedicated_job {
             self.launching.lock().remove(j);
         }
@@ -3316,6 +3455,7 @@ impl Hub {
     pub async fn scheduler_loop(self: Arc<Self>) -> anyhow::Result<()> {
         let mut tick = Interval::new(Duration::from_secs(1));
         let mut slow = Instant::now();
+        let mut pods = Instant::now();
         loop {
             futures::select_biased! {
                 () = self.shutdown.cancelled().fuse() => return Ok(()),
@@ -3330,6 +3470,11 @@ impl Hub {
                 crate::ci::notify::runners_gone(&self);
                 crate::ci::notify::secrets_unused(&self);
                 crate::ci::notify::quarantined(&self);
+            }
+            // Finished job pods' records (docs/machines.md), once a minute.
+            if pods.elapsed() >= Duration::from_secs(60) {
+                pods = Instant::now();
+                self.forget_finished_pods().await;
             }
         }
     }
@@ -4227,6 +4372,7 @@ pub(crate) mod tests {
             instances: Vec::new(),
             transport: None,
             skew: crate::skew::Skew::default(),
+            stale: false,
         }
     }
 
@@ -4397,6 +4543,119 @@ pub(crate) mod tests {
             let by_id = format!("agent:{STUDIO}");
             let targets = ["agent:studio", by_id.as_str(), "agent:fedora"].map(|on| crate::harness::lineage::pick(&hub, Some(on), "claude", None).ok());
             anyhow::ensure!(targets == [Some(by_id.clone()), Some(by_id.clone()), Some("agent:fedora".to_owned())], "{targets:?}");
+            Ok(())
+        })
+    }
+
+    /// A runner record for a test's store: `name`, not connected, on `hostname`.
+    fn record(name: &str, hostname: &str, ephemeral: bool) -> crate::store::AgentRow {
+        crate::store::AgentRow {
+            name: name.into(),
+            labels: vec![],
+            slots: 1,
+            hostname: hostname.into(),
+            os: "linux".into(),
+            arch: "x86_64".into(),
+            version: "1".into(),
+            ephemeral,
+            connected: false,
+            last_seen: 5,
+            enrolled_at: 1,
+        }
+    }
+
+    /// docs/machines.md, "Duplicates fold into the machine's id": the machine known by its id
+    /// connected, every other record whose runner said it is that machine, not connected, folds
+    /// into it, audited; the id keeps its label. A connected one stays until it isn't; one known by
+    /// another machine id, and one sharing only its host name, never fold.
+    #[test]
+    fn machines_a_duplicate_of_a_machine_folds_into_its_id() -> anyhow::Result<()> {
+        const ID: &str = "5f2a9c3e0b1d4e6f8a7c9b0d1e2f3a4b";
+        const OTHER: &str = "0b1d4e6f8a7c9b0d1e2f3a4b5f2a9c3e";
+        crate::rt::block_on(async {
+            let hub = scratch_hub().await?;
+            for name in [ID, "fedora.attlocal.net", "attic", OTHER, "same-host-name"] {
+                hub.store.upsert_agent(record(name, "fedora.attlocal.net", false)).await?;
+            }
+            hub.set_label(ID, "kiln-a094a12d.attlocal.net", "fedora.attlocal.net").await?;
+            for name in ["fedora.attlocal.net", "attic", OTHER] {
+                hub.store.set_agent_machine(name.into(), ID.into()).await?;
+            }
+            hub.store.kv_set(format!("{}fedora.attlocal.net", crate::harness::limit::KEY_PREFIX), "{}".into()).await?;
+            join_runner(&hub, 1, ID, 0);
+            join_runner(&hub, 2, "attic", 0);
+            let folded = hub.fold_duplicates(ID).await?;
+            anyhow::ensure!(folded == ["fedora.attlocal.net"], "{folded:?}");
+            let left: Vec<String> = hub.store.agents().await?.into_iter().map(|a| a.name).collect();
+            anyhow::ensure!(!left.iter().any(|n| n == "fedora.attlocal.net"), "the duplicate's record is gone: {left:?}");
+            for name in [ID, "attic", OTHER, "same-host-name"] {
+                anyhow::ensure!(left.iter().any(|n| n == name), "{name} stays: {left:?}");
+            }
+            anyhow::ensure!(hub.shown(ID) == "kiln-a094a12d.attlocal.net", "the id keeps its label: {}", hub.shown(ID));
+            anyhow::ensure!(hub.store.kv_get(format!("{}{ID}", crate::harness::limit::KEY_PREFIX)).await?.is_some(), "what was set for the duplicate moved");
+            let said = hub.store.call(|c| Ok(c.query_row("SELECT detail FROM audit2 WHERE action = 'agent.merged'", [], |r| r.get::<_, String>(0))?)).await?;
+            anyhow::ensure!(said == format!("fedora.attlocal.net was machine {ID}: folded into kiln-a094a12d.attlocal.net"), "{said}");
+            // The connected one goes away: it folds the next time the machine says which it is.
+            hub.instances.lock().lost(2);
+            if let Some(a) = hub.agents.lock().get_mut("attic") {
+                a.connected = false;
+            }
+            anyhow::ensure!(hub.fold_duplicates(ID).await? == ["attic"]);
+            anyhow::ensure!(hub.fold_duplicates(ID).await?.is_empty(), "nothing left to fold");
+            anyhow::ensure!(hub.fold_duplicates("fedora.attlocal.net").await?.is_empty(), "a name isn't a machine's id");
+            Ok(())
+        })
+    }
+
+    /// docs/machines.md, "Finished job pods are forgotten": a job pod's record goes once it's gone
+    /// past its grace and its job ended; one gone within the grace stays.
+    #[test]
+    fn machines_a_finished_job_pod_is_forgotten_past_its_grace() -> anyhow::Result<()> {
+        crate::rt::block_on(async {
+            let hub = scratch_hub().await?;
+            for name in ["kiln-abc-1", "kiln-def-1", "box"] {
+                hub.store.upsert_agent(record(name, name, name != "box")).await?;
+            }
+            let lost = |name: &str, ago: Duration| AgentLive {
+                ephemeral: true,
+                connected: false,
+                lost_at: Instant::now().checked_sub(ago),
+                running: Vec::new(),
+                ..live_runner(name, "linux", "x86_64")
+            };
+            hub.agents.lock().insert("kiln-abc-1".into(), lost("kiln-abc-1", AGENT_GRACE * 2));
+            hub.agents.lock().insert("kiln-def-1".into(), lost("kiln-def-1", Duration::from_secs(1)));
+            // A server younger than the grace forgets none: pods may be coming back to it.
+            anyhow::ensure!(hub.forget_finished_pods().await.is_empty());
+            anyhow::ensure!(hub.forget_pods_but_waiting().await == ["kiln-abc-1"]);
+            anyhow::ensure!(!hub.agents.lock().contains_key("kiln-abc-1"));
+            let names: Vec<String> = hub.agent_list().await.into_iter().map(|a| a.name).collect();
+            anyhow::ensure!(names.contains(&"kiln-def-1".to_owned()) && names.contains(&"box".to_owned()) && !names.contains(&"kiln-abc-1".to_owned()), "{names:?}");
+            Ok(())
+        })
+    }
+
+    /// docs/machines.md, "Runners from before": a record not connected, known by a name, whose
+    /// runner never said its machine id, is stale (the API says `stale: true`); one that said it,
+    /// one known by its id, a connected one and a job pod aren't, and say nothing of it.
+    #[test]
+    fn machines_a_record_that_never_said_its_machine_is_stale() -> anyhow::Result<()> {
+        const ID: &str = "5f2a9c3e0b1d4e6f8a7c9b0d1e2f3a4b";
+        crate::rt::block_on(async {
+            let hub = scratch_hub().await?;
+            for name in ["old-box", "said-box", ID, "live-box"] {
+                hub.store.upsert_agent(record(name, name, false)).await?;
+            }
+            hub.store.upsert_agent(record("kiln-abc-1", "kiln-abc-1", true)).await?;
+            hub.store.set_agent_machine("said-box".into(), ID.into()).await?;
+            join_runner(&hub, 1, "live-box", 0);
+            let list = hub.agent_list().await;
+            let stale: Vec<&str> = list.iter().filter(|a| a.stale).map(|a| a.name.as_str()).collect();
+            anyhow::ensure!(stale == ["old-box"], "{stale:?}");
+            for a in &list {
+                let v = serde_json::to_value(a)?;
+                anyhow::ensure!(v.get("stale") == a.stale.then_some(&serde_json::Value::Bool(true)), "{}: {v}", a.name);
+            }
             Ok(())
         })
     }

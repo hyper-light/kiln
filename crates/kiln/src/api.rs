@@ -3716,8 +3716,10 @@ async fn enroll_instance(hub: &Hub, req: Request) -> R {
 /// key, as `/api/agents/instance`'s does ([`crate::pki::Pki::sign_moved`]). What kiln kept under its
 /// name goes to the id ([`Hub::move_runner`]), its name becomes its label, and the answer carries
 /// its certificate for the id. Refused for a machine this server doesn't know, for an id other than
-/// the one its facts said, for an id another runner is known by, and while a process of it is
-/// connected (what it holds would move from under it).
+/// the one its facts said, for an id a connected runner is known by or a connected record of the
+/// machine says it is, and while a process of it is connected (what it holds would move from under
+/// it). An id known already, not connected, is the same machine's second record: the two merge,
+/// and every other record of the machine not connected folds in with them ([`Hub::fold_duplicates`]).
 async fn rekey_agent(hub: &Hub, req: Request) -> R {
     let r: crate::agent::RekeyRequest = srv::body_json(req.into_body(), JSON_LIMIT).await.map_err(|e| err(StatusCode::BAD_REQUEST, e.to_string()))?;
     let Some(to) = crate::join::machine_key(Some(&r.machine_id)) else {
@@ -3747,21 +3749,33 @@ async fn rekey_agent(hub: &Hub, req: Request) -> R {
     if let Some(said) = hub.store.agent_machines().await.ok().and_then(|m| m.get(&from).cloned()).filter(|s| *s != to) {
         return Err(err(StatusCode::FORBIDDEN, format!("{from} said it is machine {said}, not {to}")));
     }
-    if agents.iter().any(|a| a.name == to) {
-        return Err(err(StatusCode::CONFLICT, format!("a runner is known by {to} already")));
+    // The id known already and connected: a copy of that machine, or the machine itself (docs/machines.md).
+    if let Some(known) = agents.iter().find(|a| a.name == to && a.connected) {
+        return Err(err(StatusCode::CONFLICT, format!("a runner is known by {to} already and is connected ({})", known.shown())));
+    }
+    // Another record of the machine still connected: what it holds would move from under it.
+    let dups = hub.duplicates_of(&to).await.map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")))?;
+    if let Some((dup, _)) = dups.iter().find(|(n, up)| *up && *n != from) {
+        return Err(err(StatusCode::CONFLICT, format!("{} says it is machine {to} too and is connected: this runner moves once it isn't", hub.shown(dup))));
     }
     // Its certificate for the id, recorded first as every one kiln issues is (W27-R01): forgetting
     // the runner then revokes its key, its certificate for its name with it.
     crate::identities::record(&hub.store, "machine", &to, &cert).await.map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")))?;
     // Its name, as its label, unless another machine shows by it.
     let label = free_agent_name(hub, &from, &me.hostname, Some(&to)).await?;
-    if let Err(e) = hub.move_runner(&from, &to, &label, &me.hostname).await {
-        return Err(err(StatusCode::CONFLICT, format!("{e:#}")));
-    }
+    // The id's own label, when it's known already and has one.
+    let label = match hub.move_runner(&from, &to, &label, &me.hostname).await {
+        Ok(kept) => kept,
+        Err(e) => return Err(err(StatusCode::CONFLICT, format!("{e:#}"))),
+    };
     // The id may connect, as a machine enrolled under it may: a revoked key stays refused.
     hub.net.command(crate::net::Out::Unrevoke { name: to.clone() }).await;
     hub.store.audit("kiln".into(), "agent.moved".into(), format!("{from} is known by its machine id {to}, shown as {label}")).await;
     tracing::info!(from = %from, to = %to, label = %label, "a runner moved to its machine id");
+    // The machine's other records, not connected, fold in too.
+    if let Err(e) = hub.fold_duplicates(&to).await {
+        tracing::warn!(machine = %to, error = %format!("{e:#}"), "couldn't fold this machine's other records");
+    }
     Ok(srv::json(
         StatusCode::OK,
         &crate::agent::EnrollResponse { cert_pem: cert, ca_pem: hub.pki.ca_pem.clone(), quic: hub.cfg.server.quic_advertise.clone(), name: to, label: Some(label) },

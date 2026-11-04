@@ -51,4 +51,10 @@ transport?: Transport,
  * How far its (newest process's) kiln is behind the server's (`crate::skew`): to be upgraded,
  * it takes no new work.
  */
-skew: Skew, };
+skew: Skew, 
+/**
+ * A record that can't be proven to be any machine (docs/machines.md, "Runners from before"):
+ * not connected, known by a name, and its runner never said its machine id. kiln neither
+ * folds nor forgets it on its own; it's shown as stale, for a person to forget.
+ */
+stale?: boolean, };

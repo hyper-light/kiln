@@ -98,10 +98,54 @@ moves the next time it starts with none of it connected (a restart, a reboot). T
 - its member in the cluster group, which it joins again as it is now.
 
 The runner keeps its new certificate in place of the old one. It's refused while a process of it
-is connected, for an id other than the one its facts said, for an id another runner is known by,
-and for a runner the server doesn't know (one that never connected, or one forgotten); it then goes
-on by its name and asks again as it starts next. One known by a machine id already never moves to
-another (a VM copied with its runner's state is caught as a copy instead).
+is connected, for an id other than the one its facts said, for an id a connected runner is known
+by, while another record of the machine is connected (below), and for a runner the server doesn't
+know (one that never connected, or one forgotten); it then goes on by its name and asks again as
+it starts next. One known by a machine id already never moves to another (a VM copied with its
+runner's state is caught as a copy instead).
+
+### Duplicates fold into the machine's id
+
+A machine can have more than one record from before: it joined by one name, then again by another
+(its host name changed, as `fedora.attlocal.net` became `kiln-a094a12d.attlocal.net`), and each
+record's runner said the same machine id (`agents.machine_id`). Only one of them can move to the id;
+the others fold into it (`Hub::fold_duplicates`):
+
+- **When.** As a runner moves to its machine id, as a runner known by its id connects, and as one
+  reports facts saying that id (`POST /api/agents/:name/probe` asks it to).
+- **What folds.** Every other record whose runner said it is that machine and that isn't
+  connected. Never a connected one: it stays (the log says so), and a runner moving to the id is
+  refused while one is, saying which. Never one known by another machine id (that's its own
+  machine, or a copy caught as one), and never one that only shares a host name, since macOS
+  renumbers host names.
+- **How.** What kiln kept under the duplicate's name moves to the id as a runner from before's does
+  (`Hub::move_runner`, `Store::move_runner`), and merges with what the id has: the id's row, label,
+  settings (front door, agent limit, upgrade policy), reap policy and enrollment win; what only the
+  duplicate had moves; the insights both kept for one hour add up (the legs' rollups merged, the
+  runner's connected, slot and busy seconds summed); a grant both had is kept once. Its jobs,
+  attempts, agent sessions, synced copies and places move as well. Then its record is gone,
+  audited as `agent.merged` ("fedora.attlocal.net was machine <id>: folded into
+  kiln-a094a12d.attlocal.net"). A runner moving to an id kiln knows already, not connected, merges
+  into it the same way: the same machine's second record.
+
+### Finished job pods are forgotten
+
+A Kubernetes job's pod runs an ephemeral runner (`kiln agent --ephemeral`), named after the pod
+(`kiln-<job>-<attempt>`), each with a machine id of its own. Its record was forgotten when it
+disconnected, but not when the server stopped first (a deploy, a crash): those records stayed,
+offline, for good. Once a minute the server forgets every pod's record that isn't connected, is
+past its reconnect grace (and the server past its own, so pods connected before it started can come
+back), and whose jobs have all ended (`Hub::forget_finished_pods`). Its jobs, attempts and insights
+keep its name, so a job's page still says which pod ran it. There's no switch: these are kiln's own
+records of its own pods, not a person's machines (AGENTS.md, opt-in automation).
+
+### Records that are stale
+
+A record that never said its machine id (known by a name, `agents.machine_id` empty) and isn't
+connected can't be proven to be any machine: kiln neither folds nor forgets it. The runners' API
+says `stale: true` of it (`GET /api/agents`, MCP's `runners.list`), and the Runners page shows it as
+stale, with what it means, beside its Forget. Forgetting it is the person's call. A runner of it
+that connects again says its machine id and is a record like any other.
 
 Its certificate for the id is one of kiln's identities (docs/ci.md W27-R01), recorded before
 anything moves, and who enrolled it moves with it: forgetting the runner revokes its key, and so
@@ -127,7 +171,8 @@ first time the server starts.
 
 ## What's next
 
-Nothing planned. A runner on a kiln from before moves once it's upgraded.
+Nothing planned. A runner on a kiln from before moves once it's upgraded; a machine's other records
+fold into its id as it does.
 
 ## Decisions
 
@@ -139,3 +184,13 @@ Taken on 2026-10-27:
    label it has now.
 3. **Metrics carry both labels**, the machine's name and its id, so they group by either.
 4. **Every way in is named by id:** joining, the join token and outposts alike.
+
+Taken on 2026-11-04 ("everything runners related should be de-duplicated and identified throughout
+the system via machine id; we use machine names in the UI by default"):
+
+5. **A machine's records are one:** every record that said the machine's id folds into it, unless
+   it's connected ([Duplicates fold into the machine's id](#duplicates-fold-into-the-machines-id)).
+6. **Job pods' records go** once they've disconnected and their jobs ended
+   ([Finished job pods are forgotten](#finished-job-pods-are-forgotten)).
+7. **Mark stale, you forget:** a record that never said its machine id is shown as stale, never
+   merged or forgotten by kiln ([Records that are stale](#records-that-are-stale)).
