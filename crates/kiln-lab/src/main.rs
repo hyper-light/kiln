@@ -103,6 +103,11 @@ enum Cmd {
     },
     /// A run's report, in Markdown.
     Report { run: PathBuf },
+    /// Runs side by side: each number's median and noise in each (a baseline's table).
+    Table {
+        /// `label=path/run.json`, or a path (labelled by its folder).
+        runs: Vec<String>,
+    },
     /// A CPU hog (the lab starts these itself).
     #[command(hide = true)]
     Hog,
@@ -180,7 +185,7 @@ fn measure(builds: &[Build], c: &Common) -> anyhow::Result<Run> {
                 }
             }
             if !c.keep {
-                let _ = std::fs::remove_dir_all(&dir);
+                lab::remove_paced(&dir);
             }
             std::fs::write(out.join("run.json"), serde_json::to_vec_pretty(&run)?)?;
         }
@@ -227,10 +232,22 @@ fn main() -> anyhow::Result<()> {
             let (one, two) = (load(&first)?, load(&second)?);
             let pick = |r: &Run| build.clone().or_else(|| r.builds().first().cloned()).ok_or_else(|| anyhow::anyhow!("a run without rounds"));
             let (a, b) = (pick(&one)?, pick(&two)?);
-            let c = Comparison::of(&format!("{a} (first)"), &one.numbers(&a), &format!("{b} (second)"), &two.numbers(&b));
+            let c = Comparison::of(&format!("{a} (first)"), &one.numbers(&a), &format!("{b} (second)"), &two.numbers(&b))
+                .on(report::machine_line(one.rounds.iter().filter(|r| r.build == a)), report::machine_line(two.rounds.iter().filter(|r| r.build == b)));
             print!("{}", report::comparison_markdown(&c));
         }
         Cmd::Report { run } => print!("{}", report::markdown(&load(&run)?)),
+        Cmd::Table { runs } => {
+            let mut loaded = Vec::new();
+            for r in &runs {
+                let (label, path) = match r.split_once('=') {
+                    Some((l, p)) => (l.to_owned(), PathBuf::from(p)),
+                    None => (Path::new(r).parent().and_then(Path::file_name).map_or_else(|| r.clone(), |n| n.to_string_lossy().into_owned()), PathBuf::from(r)),
+                };
+                loaded.push((label, load(&path)?));
+            }
+            print!("{}", report::table(&loaded));
+        }
         Cmd::Hog => lab::hog(),
     }
     Ok(())

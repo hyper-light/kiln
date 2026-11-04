@@ -121,6 +121,12 @@ pub struct Machine {
     pub load_after: Option<[f64; 3]>,
     pub cpu_pressure_before: Option<f64>,
     pub cpu_pressure_after: Option<f64>,
+    /// The lab's CPUs' mean clock (Linux, `/proc/cpuinfo`) before and after the window: a machine
+    /// whose clocks moved (another's work on it, its power limits) runs everything at another pace.
+    #[serde(default)]
+    pub mhz_before: Option<f64>,
+    #[serde(default)]
+    pub mhz_after: Option<f64>,
 }
 
 fn loadavg() -> Option<[f64; 3]> {
@@ -132,6 +138,41 @@ fn loadavg() -> Option<[f64; 3]> {
     };
     let mut it = text.split_whitespace().filter_map(|w| w.parse::<f64>().ok());
     Some([it.next()?, it.next()?, it.next()?])
+}
+
+/// The CPUs `list` names (`0-3,8,10-11`, as Linux writes an affinity).
+fn cpus_in(list: &str) -> Vec<usize> {
+    list.split(',')
+        .filter_map(|part| {
+            let part = part.trim();
+            let (a, b) = part.split_once('-').unwrap_or((part, part));
+            Some(a.parse::<usize>().ok()?..=b.parse::<usize>().ok()?)
+        })
+        .flatten()
+        .collect()
+}
+
+/// The mean clock of the CPUs the lab may run on, in MHz (Linux).
+fn cpu_mhz(affinity: Option<&str>) -> Option<f64> {
+    let text = std::fs::read_to_string("/proc/cpuinfo").ok()?;
+    let mine = affinity.map(cpus_in);
+    let (mut cpu, mut sum, mut n) = (None::<usize>, 0.0, 0u32);
+    for line in text.lines() {
+        let Some((k, v)) = line.split_once(':') else { continue };
+        match k.trim() {
+            "processor" => cpu = v.trim().parse().ok(),
+            "cpu MHz" => {
+                if let (Some(c), Ok(mhz)) = (cpu, v.trim().parse::<f64>())
+                    && mine.as_ref().is_none_or(|m| m.contains(&c))
+                {
+                    sum += mhz;
+                    n += 1;
+                }
+            }
+            _ => {}
+        }
+    }
+    (n > 0).then(|| sum / f64::from(n))
 }
 
 fn cpu_pressure() -> Option<f64> {
@@ -249,6 +290,10 @@ fn viewer(s: &Shared, i: usize) -> Vec<Sample> {
                 _ => break false,
             }
         };
+        // One the round's end cut short is no sample.
+        if s.stop.load(Ordering::Relaxed) {
+            break;
+        }
         out.push(Sample { class: Class::Attach, at_us, took_us: u64::try_from(t.elapsed().as_micros()).unwrap_or(u64::MAX), ok: opened });
         if !opened {
             continue;
@@ -415,6 +460,44 @@ pub fn hog() {
     }
 }
 
+/// How much the machine's IO is held back now (Linux PSI, `full avg10`, percent), where the OS says.
+fn io_full() -> Option<f64> {
+    let text = std::fs::read_to_string("/proc/pressure/io").ok()?;
+    text.lines().find(|l| l.starts_with("full"))?.split_whitespace().find_map(|w| w.strip_prefix("avg10="))?.parse().ok()
+}
+
+/// Removes a round's kiln (gigabytes of stores) a file at a time, each file waiting while the
+/// machine's IO is held back a quarter of the time or more (`full avg10` 25%: the pace kiln's agents
+/// keep big deletes to since 2026-11-04, when deletes at once on one btrfs volume took production
+/// down), so it never goes in one burst that stalls the filesystem for everything else on it.
+pub fn remove_paced(dir: &Path) {
+    let (mut files, mut dirs, mut stack) = (Vec::new(), Vec::new(), vec![dir.to_path_buf()]);
+    while let Some(d) = stack.pop() {
+        let Ok(rd) = std::fs::read_dir(&d) else { continue };
+        dirs.push(d);
+        for e in rd.flatten() {
+            match e.file_type() {
+                Ok(t) if t.is_dir() => stack.push(e.path()),
+                Ok(_) => files.push(e.path()),
+                Err(_) => {}
+            }
+        }
+    }
+    for f in files {
+        // Ten minutes at the most, then on.
+        for _ in 0..600 {
+            if io_full().is_none_or(|p| p < 25.0) {
+                break;
+            }
+            std::thread::sleep(Duration::from_secs(1));
+        }
+        let _ = std::fs::remove_file(&f);
+    }
+    for d in dirs.into_iter().rev() {
+        let _ = std::fs::remove_dir(&d);
+    }
+}
+
 /// The stand-in, where the runners find it: the lab's own binary as `claude`, in `dir/bin`.
 pub fn stand_in(dir: &Path) -> anyhow::Result<PathBuf> {
     let bin = dir.join("bin");
@@ -536,6 +619,7 @@ pub fn round(build: &Build, p: &Profile, hogs: usize, dir: &Path, bin: &Path, in
         let mut scraper = Http::new(s.port, &s.admin);
         m.load_before = loadavg();
         m.cpu_pressure_before = cpu_pressure();
+        m.mhz_before = cpu_mhz(m.affinity.as_deref());
         let before = Scrape::parse(&String::from_utf8_lossy(&scraper.send("GET", "/metrics", None)?.body));
         let start = now_us();
         std::thread::sleep(Duration::from_secs(p.window_s));
@@ -543,6 +627,7 @@ pub fn round(build: &Build, p: &Profile, hogs: usize, dir: &Path, bin: &Path, in
         let after = Scrape::parse(&String::from_utf8_lossy(&scraper.send("GET", "/metrics", None)?.body));
         m.load_after = loadavg();
         m.cpu_pressure_after = cpu_pressure();
+        m.mhz_after = cpu_mhz(m.affinity.as_deref());
         s.stop.store(true, Ordering::Relaxed);
         let mut samples = Vec::new();
         for h in handles {
@@ -649,6 +734,13 @@ pub fn better(name: &str) -> crate::stats::Better {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_affinity_list_names_its_cpus() {
+        assert_eq!(cpus_in("0-3,8,10-11"), vec![0, 1, 2, 3, 8, 10, 11]);
+        assert_eq!(cpus_in("16-31").len(), 16);
+        assert!(cpus_in("").is_empty());
+    }
 
     #[test]
     fn stamps_are_read_wherever_a_frame_has_them() {
