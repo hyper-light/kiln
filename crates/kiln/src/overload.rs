@@ -1,6 +1,6 @@
 //! Shards that protect themselves, kiln's side (goal 6, plan 01a1a59c2abe): the class of every request (step
-//! 3), shedding by class when a shard's queueing delay leaves its calm (step 4), and what kiln-rt's watchdog
-//! sees, on `/metrics` and in the log (step 2).
+//! 3), shedding by class when a shard's queueing delay or a pool's leaves its calm (step 4), and what kiln-rt's
+//! watchdog sees, on `/metrics` and in the log (step 2).
 //!
 //! **Classes** (`hyper_rt::coop::Class`). Each request is Critical (health, sign-in, a person's pages and
 //! actions), Normal (the API) or Background (agents' and CI's polling, catch-ups, sync, telemetry), read from
@@ -36,6 +36,19 @@
 //! reference point is about 16 ms (the geometric mean of the floor and the tolerance), and a delay that stays at
 //! 100 ms sheds at the third probe, at 50 ms the fourth, at 20 ms the eighteenth. While a detector alarms,
 //! nothing is learned as calm.
+//!
+//! **The pools.** What a request waits on off its shard waits in kiln-rt's pools (goal 3): the compute pool for a
+//! thread, each of the blocking pool's shares (`dns`, `store`, `fs`) for one of its places. No shard's delay shows
+//! it, and that is where the lab's overload sat (research 01a1a59c2abf, f28: API reads at a 2 to 3 s p99 while the
+//! one shard's delay stayed under 2 ms). So the first shard's probe also ticks a detector for each pool
+//! ([`tick_pools`]): the same CUSUM against the calm it learns, on the mean wait of the pool's jobs over the
+//! period, as the pools tell of each (`crate::pool_health`), floored at the quantum. A pool whose waits leave its
+//! calm sheds Background requests on every shard; once its waits reach the tolerance, the API's (Normal) too,
+//! since its requests waiting there now fail a probe of that timeout; Critical never; and nothing while none of
+//! its jobs waits, since a queue that has drained holds no request up. A pool's queue is first come, first served
+//! whatever a job's class, so its waits can't say which class to shed first as a shard's classes' waits do: the
+//! order is the classes'. The pools serve every shard, so one detector each, kept by the first shard's thread.
+//!
 //! Shedding is off until `[server] shed = true` declares it, as what kiln decides on its own is (docs/ci.md
 //! §0.3, "Opt-in automation"); every shed says why (its body, `x-kiln-shed`, the log, `/metrics`). The
 //! classes and the detectors run either way, on `/metrics` and `/readyz`.
@@ -54,6 +67,7 @@ pub use hyper_rt::coop::Class;
 use kiln_ci::headroom::detect::{Detector, Event};
 
 use crate::http::server::{self as srv, Request, Response};
+use crate::pool_health::{self, QUEUES};
 
 /// The session cookie a person's browser carries (`crate::api`'s).
 const SESSION_COOKIE: &str = "kiln_session=";
@@ -253,6 +267,39 @@ static SHED: [AtomicU64; 3] = [AtomicU64::new(0), AtomicU64::new(0), AtomicU64::
 /// `[server] shed`: whether alarms shed (they are counted and shown either way).
 static ENABLED: AtomicBool = AtomicBool::new(false);
 
+/// What work waiting in the pools sheds, and why, by `pool_health::QUEUES`' order: written by the first shard's
+/// probe, which ticks the pools' detectors ([`tick_pools`]), and read by every request and by `/metrics`.
+struct PoolStates {
+    /// As [`ShardState::level`]: 0, nothing; 1, Background requests; 2, Normal and Background.
+    level: [AtomicU8; QUEUES.len()],
+    /// Each pool's mean wait over the last period its detector read, and its calm (0: not known), nanoseconds.
+    delay_ns: [AtomicU64; QUEUES.len()],
+    calm_ns: [AtomicU64; QUEUES.len()],
+}
+
+static POOLS: PoolStates = PoolStates {
+    level: [const { AtomicU8::new(0) }; QUEUES.len()],
+    delay_ns: [const { AtomicU64::new(0) }; QUEUES.len()],
+    calm_ns: [const { AtomicU64::new(0) }; QUEUES.len()],
+};
+
+fn pool_level(i: usize) -> u8 {
+    POOLS.level.get(i).map_or(0, |l| l.load(Ordering::Relaxed))
+}
+
+fn pool_delay_ns(i: usize) -> u64 {
+    POOLS.delay_ns.get(i).map_or(0, |d| d.load(Ordering::Relaxed))
+}
+
+/// How the log and the answers name pool `i` of `pool_health::QUEUES`.
+fn pool_name(i: usize) -> String {
+    match QUEUES.get(i) {
+        Some(_) if i == 0 => "the compute pool".to_owned(),
+        Some(share) => format!("the blocking pool's {share} share"),
+        None => "a pool".to_owned(),
+    }
+}
+
 fn shards() -> &'static [ShardState] {
     SHARDS.get().map_or(&[], Vec::as_slice)
 }
@@ -312,6 +359,15 @@ struct Detectors {
     last: hyper_rt::shard_loop::Counters,
     /// The watchdog's newest report of the shard already logged.
     reported: u64,
+    /// The pools' detectors: the first shard's alone.
+    pools: Option<PoolDetectors>,
+}
+
+/// A detector for each of `pool_health::QUEUES`, and what they last read. The pools serve every shard, so the first
+/// shard's probe ticks them for all, and its thread alone keeps them.
+struct PoolDetectors {
+    detectors: [Detector; QUEUES.len()],
+    last: [pool_health::Queue; QUEUES.len()],
 }
 
 thread_local! {
@@ -339,7 +395,14 @@ pub fn tick(index: usize, late: Duration) {
     let floor_ns = hyper_rt::futures::step_budget_ns().unwrap_or(0);
     DETECTORS.with(|cell| {
         let mut held = cell.borrow_mut();
-        let d = held.get_or_insert_with(|| Detectors { base: Instant::now(), normal: detector(0), background: detector(0), last: now, reported: 0 });
+        let d = held.get_or_insert_with(|| Detectors {
+            base: Instant::now(),
+            normal: detector(0),
+            background: detector(0),
+            last: now,
+            reported: 0,
+            pools: (index == 0).then(|| PoolDetectors { detectors: std::array::from_fn(|_| detector(0)), last: pool_health::queues() }),
+        });
         let now_us = micros_since(d.base);
         let last = d.last;
         let waits = [
@@ -364,7 +427,58 @@ pub fn tick(index: usize, late: Duration) {
         state.coop_yields.store(now.coop_yields, Ordering::Relaxed);
         d.reported = log_stall(index, state.holder, d.reported);
         d.last = now;
+        if let Some(pools) = d.pools.as_mut() {
+            tick_pools(pools, floor_ns, now_us);
+        }
     });
+}
+
+/// The pools' tick, on the first shard, from its probe: each pool's period to its detector ([`pool_sample`]), and
+/// what each sheds published for every shard.
+fn tick_pools(p: &mut PoolDetectors, floor_ns: u64, now_us: u64) {
+    let now = pool_health::queues();
+    for (i, ((d, queue), last)) in p.detectors.iter_mut().zip(now).zip(p.last).enumerate() {
+        if let Some(ns) = pool_sample(queue, last) {
+            feed(d, Some(ns), floor_ns, now_us);
+            if let Some(slot) = POOLS.delay_ns.get(i) {
+                slot.store(ns.max(floor_ns), Ordering::Relaxed);
+            }
+        }
+        if let Some(calm) = POOLS.calm_ns.get(i) {
+            calm.store(d.calm_us().map_or(0, |us| (us * 1e3) as u64), Ordering::Relaxed);
+        }
+        let level = pool_sheds(d, queue.waiting);
+        if POOLS.level.get(i).is_some_and(|slot| slot.swap(level, Ordering::Relaxed) != level) {
+            note_pool_level(i, level, d);
+        }
+    }
+    p.last = now;
+}
+
+/// What a pool's period, from `last` to `now`, gives its detector, in nanoseconds before the floor: the mean wait
+/// of the jobs whose waits were told over it (the compute pool's as each job's first piece starts, a share's as
+/// each job ends); none told and none waiting, nothing queued, `0` (the floor); none told while some wait, no
+/// sample (`None`), since their waits are told only once they start or end: the detector holds what it had.
+fn pool_sample(now: pool_health::Queue, last: pool_health::Queue) -> Option<u64> {
+    let told = now.waits.saturating_sub(last.waits);
+    match now.waited_us.saturating_sub(last.waited_us).checked_div(told) {
+        Some(us) => Some(us.saturating_mul(1_000)),
+        None if now.waiting => None,
+        None => Some(0),
+    }
+}
+
+/// What a pool's detector `d` sheds now, as [`ShardState::level`] counts: nothing while none of the pool's jobs
+/// waits, since a queue that has drained holds no request up, whatever its waits were; Normal and Background once
+/// its waits reached the tolerance in this alarm (harm: what waits there now fails a probe of that timeout, the
+/// API's requests among it); Background alone once its evidence of a shift is past one reference ([`sheds_now`]).
+fn pool_sheds(d: &Detector, waiting: bool) -> u8 {
+    match d.alarm.as_ref() {
+        _ if !waiting => 0,
+        Some(alarm) if alarm.harm => 2,
+        Some(_) if sheds_now(d) => 1,
+        _ => 0,
+    }
 }
 
 /// The delays and calms a tick read, for answers, `/metrics` and `/readyz`: each class's mean wait from the
@@ -427,6 +541,11 @@ fn why(name: &str, d: &Detector) -> Option<String> {
     })
 }
 
+/// What a level sheds, in words.
+fn what(level: u8) -> &'static str {
+    if level >= 2 { "normal and background" } else { "background" }
+}
+
 /// The log of a change of what a shard sheds, with why.
 fn note_level(index: usize, state: &ShardState, level: u8, d: &Detectors) {
     let reasons: Vec<String> = [why("normal", &d.normal), why("background", &d.background)].into_iter().flatten().collect();
@@ -435,12 +554,28 @@ fn note_level(index: usize, state: &ShardState, level: u8, d: &Detectors) {
         0 => tracing::info!(shard = index, "shard no longer sheds requests: its queueing delay came back toward its calm"),
         _ => tracing::warn!(
             shard = index,
-            sheds = if level >= 2 { "normal and background" } else { "background" },
+            sheds = what(level),
             normal_delay_us = delay(Class::Normal) / 1_000,
             background_delay_us = delay(Class::Background) / 1_000,
             why = %reasons.join("; "),
             shedding = ENABLED.load(Ordering::Relaxed),
             "shard overloaded: its queueing delay left its calm"
+        ),
+    }
+}
+
+/// The log of a change of what work waiting in pool `i` sheds, with why.
+fn note_pool_level(i: usize, level: u8, d: &Detector) {
+    let pool = pool_name(i);
+    match level {
+        0 => tracing::info!(pool = %pool, "work waiting in a pool no longer sheds requests: its waits came back toward their calm, or nothing waits there"),
+        _ => tracing::warn!(
+            pool = %pool,
+            sheds = what(level),
+            delay_us = pool_delay_ns(i) / 1_000,
+            why = %why(&pool, d).unwrap_or_default(),
+            shedding = ENABLED.load(Ordering::Relaxed),
+            "work waiting in a pool left its calm: every shard sheds requests"
         ),
     }
 }
@@ -465,21 +600,29 @@ fn log_stall(index: usize, holder: hyper_rt::SlotHolder, reported: u64) -> u64 {
 }
 
 /// The answer for a request of `class` the shard serving it sheds now, or `None` to serve it: 503 at once,
-/// `Retry-After` the class's queueing delay in whole seconds (at least one, HTTP's unit), `x-kiln-shed` its class.
+/// `Retry-After` the queueing delay that sheds it in whole seconds (at least one, HTTP's unit; the shard's class's,
+/// else the pool's whose waits shed it), `x-kiln-shed` its class.
 pub fn shed(class: Class) -> Option<Response> {
     if !ENABLED.load(Ordering::Relaxed) {
         return None;
     }
     let state = here()?;
-    if !sheds(state.level.load(Ordering::Relaxed), class) {
-        return None;
-    }
+    let (delay_ns, calm_ns, pool) = if sheds(state.level.load(Ordering::Relaxed), class) {
+        let delay_ns = state.delay_ns.get(class as usize).map_or(0, |d| d.load(Ordering::Relaxed));
+        (delay_ns, state.calm_ns.get(class as usize).map_or(0, |d| d.load(Ordering::Relaxed)), None)
+    } else {
+        let i = pool_shedding(class)?;
+        (pool_delay_ns(i), POOLS.calm_ns.get(i).map_or(0, |d| d.load(Ordering::Relaxed)), Some(i))
+    };
     if let Some(n) = SHED.get(class as usize) {
         n.fetch_add(1, Ordering::Relaxed);
     }
-    let delay_ns = state.delay_ns.get(class as usize).map_or(0, |d| d.load(Ordering::Relaxed));
-    let calm_ns = state.calm_ns.get(class as usize).map_or(0, |d| d.load(Ordering::Relaxed));
-    Some(answer(class, delay_ns, calm_ns))
+    Some(answer(class, delay_ns, calm_ns, pool))
+}
+
+/// The pool whose waits shed `class` now, the one that waited longest when several do: `None` when none does.
+fn pool_shedding(class: Class) -> Option<usize> {
+    (0..QUEUES.len()).filter(|i| sheds(pool_level(*i), class)).max_by_key(|i| pool_delay_ns(*i))
 }
 
 /// Whether a shard at `level` sheds a request of `class`: Background from level 1, Normal from 2, Critical never.
@@ -491,11 +634,16 @@ fn sheds(level: u8, class: Class) -> bool {
     }
 }
 
-/// The answer to a request of `class` shed at a queueing delay of `delay_ns` against a calm of `calm_ns`.
-fn answer(class: Class, delay_ns: u64, calm_ns: u64) -> Response {
+/// The answer to a request of `class` shed at a queueing delay of `delay_ns` against a calm of `calm_ns`: the
+/// shard's, or pool `pool`'s (of `pool_health::QUEUES`).
+fn answer(class: Class, delay_ns: u64, calm_ns: u64, pool: Option<usize>) -> Response {
     let retry = delay_ns.div_ceil(1_000_000_000).max(1);
+    let (who, queue) = match pool {
+        None => ("this server's shard", "its queueing delay".to_owned()),
+        Some(i) => ("this server", format!("{}'s wait", pool_name(i))),
+    };
     let why = format!(
-        "overloaded: this server's shard sheds {} requests now (its queueing delay {:.1} ms, calm {:.2} ms); try again in {retry} s",
+        "overloaded: {who} sheds {} requests now ({queue} {:.1} ms, calm {:.2} ms); try again in {retry} s",
         class.as_str(),
         delay_ns as f64 / 1e6,
         calm_ns as f64 / 1e6
@@ -511,20 +659,24 @@ pub fn shed_request(req: &Request) -> Option<Response> {
     shed(class)
 }
 
-/// What `/readyz` says of overload: `None` when no shard sheds; else whether every shard sheds the API (Normal),
-/// and a line saying what each sheds.
+/// What `/readyz` says of overload: `None` when nothing sheds; else whether every shard sheds the API (Normal), by
+/// its own delay or the pools', and a line saying what each shard and each pool sheds.
 pub fn readiness() -> Option<(bool, String)> {
     let all = shards();
     let levels: Vec<u8> = all.iter().map(|s| s.level.load(Ordering::Relaxed)).collect();
-    if levels.iter().all(|l| *l == 0) {
+    let pools: Vec<u8> = (0..QUEUES.len()).map(pool_level).collect();
+    let pooled = pools.iter().copied().max().unwrap_or(0);
+    if levels.iter().all(|l| *l == 0) && pooled == 0 {
         return None;
     }
     // Not ready only while every shard refuses the API; with shedding off, nothing is refused.
-    let every = ENABLED.load(Ordering::Relaxed) && !levels.is_empty() && levels.iter().all(|l| *l >= 2);
+    let every = ENABLED.load(Ordering::Relaxed) && !levels.is_empty() && levels.iter().all(|l| (*l).max(pooled) >= 2);
     let mut line = String::from("overloaded:");
     for (index, level) in levels.iter().enumerate().filter(|(_, l)| **l > 0) {
-        let what = if *level >= 2 { "normal and background" } else { "background" };
-        let _ = write!(line, " shard {index} sheds {what} requests;");
+        let _ = write!(line, " shard {index} sheds {} requests;", what(*level));
+    }
+    for (i, level) in pools.iter().enumerate().filter(|(_, l)| **l > 0) {
+        let _ = write!(line, " work waiting in {} sheds {} requests;", pool_name(i), what(*level));
     }
     if !ENABLED.load(Ordering::Relaxed) {
         line.push_str(" (shedding is off: [server] shed = true turns it on)");
@@ -569,7 +721,7 @@ pub fn render(o: &mut String) {
         }
     }
     let _ = writeln!(o, "# HELP kiln_shard_queue_delay_seconds Each class's mean wait from ready to run on the shard, over the last 10 ms.\n# TYPE kiln_shard_queue_delay_seconds gauge");
-    let _ = writeln!(o, "# HELP kiln_shard_shedding 1 while the shard sheds the class's requests.\n# TYPE kiln_shard_shedding gauge");
+    let _ = writeln!(o, "# HELP kiln_shard_shedding 1 while the shard's own queueing delay sheds the class's requests (the pools': kiln_pool_shedding).\n# TYPE kiln_shard_shedding gauge");
     for (index, state) in shards().iter().enumerate() {
         for class in [Class::Critical, Class::Normal, Class::Background] {
             let delay = state.delay_ns.get(class as usize).map_or(0, |d| d.load(Ordering::Relaxed));
@@ -579,7 +731,20 @@ pub fn render(o: &mut String) {
         let _ = writeln!(o, "kiln_shard_shedding{{shard=\"{index}\",class=\"background\"}} {}", u8::from(level >= 1));
         let _ = writeln!(o, "kiln_shard_shedding{{shard=\"{index}\",class=\"normal\"}} {}", u8::from(level >= 2));
     }
-    let _ = writeln!(o, "# HELP kiln_shed_total Requests answered 503 at once because their shard was overloaded, by class.\n# TYPE kiln_shed_total counter");
+    let _ = writeln!(
+        o,
+        "# HELP kiln_pool_queue_delay_seconds Each pool's mean wait for a place over the shards' probe period, as the overload detector last read it: the compute pool's jobs for a thread, each of the blocking pool's shares' for one of its places.\n# TYPE kiln_pool_queue_delay_seconds gauge"
+    );
+    for (i, pool) in QUEUES.iter().enumerate() {
+        let _ = writeln!(o, "kiln_pool_queue_delay_seconds{{pool=\"{pool}\"}} {:.6}", pool_delay_ns(i) as f64 / 1e9);
+    }
+    let _ = writeln!(o, "# HELP kiln_pool_shedding 1 while work waiting in the pool past its calm sheds the class's requests on every shard.\n# TYPE kiln_pool_shedding gauge");
+    for (i, pool) in QUEUES.iter().enumerate() {
+        let level = pool_level(i);
+        let _ = writeln!(o, "kiln_pool_shedding{{pool=\"{pool}\",class=\"background\"}} {}", u8::from(level >= 1));
+        let _ = writeln!(o, "kiln_pool_shedding{{pool=\"{pool}\",class=\"normal\"}} {}", u8::from(level >= 2));
+    }
+    let _ = writeln!(o, "# HELP kiln_shed_total Requests answered 503 at once because their shard, or work waiting in a pool, was overloaded, by class.\n# TYPE kiln_shed_total counter");
     for class in [Class::Background, Class::Normal] {
         let _ = writeln!(o, "kiln_shed_total{{class=\"{}\"}} {}", class.as_str(), SHED.get(class as usize).map_or(0, |n| n.load(Ordering::Relaxed)));
     }
@@ -705,6 +870,45 @@ mod tests {
         assert!(step(&mut d, 1_000_000_000), "a wait at the tolerance sheds at once");
     }
 
+    /// Step 4, the pools: a pool's period is the mean of the waits told over it; with none told, the floor while
+    /// none of its jobs waits, and no sample while some wait untold (their waits come once they start or end).
+    #[test]
+    fn g6_s4_a_pools_period_is_its_told_waits_mean_the_floor_when_idle_and_nothing_while_untold() {
+        let q = |waits, waited_us, waiting| pool_health::Queue { waits, waited_us, waiting };
+        assert_eq!(pool_sample(q(13, 3_500, true), q(10, 500, false)), Some(1_000_000), "three waits of a millisecond on average");
+        assert_eq!(pool_sample(q(10, 500, false), q(10, 500, true)), Some(0), "none told and none waiting: the floor");
+        assert_eq!(pool_sample(q(10, 500, true), q(10, 500, false)), None, "none told while some wait: no sample");
+    }
+
+    /// Step 4, the pools: work waiting in a pool past its calm sheds Background requests within a few periods, and
+    /// Normal ones too once a wait reaches the tolerance; nothing while none of its jobs waits, whatever its waits
+    /// were; and nothing once its waits are back at their calm. The calm is a busy store's: waits of a few hundred
+    /// microseconds to tens of milliseconds.
+    #[test]
+    fn g6_s4_a_pools_backlog_sheds_background_then_normal_and_nothing_once_drained() {
+        const QUANTUM_NS: u64 = 250_000;
+        let mut d = detector(0);
+        let mut now_us = 0;
+        let mut step = |d: &mut Detector, ns: u64| {
+            now_us += 10_000;
+            feed(d, Some(ns), QUANTUM_NS, now_us);
+            pool_sheds(d, true)
+        };
+        for i in 0..2_000u64 {
+            let wait = [300_000, 2_000_000, 600_000, 20_000_000, 400_000].get((i % 5) as usize).copied().unwrap_or(0);
+            assert_eq!(step(&mut d, wait), 0, "calm, sample {i}");
+        }
+        let background_after = (1..=20u64).find(|_| step(&mut d, 200_000_000) == 1);
+        assert!(background_after.is_some_and(|n| n <= 4), "a backlog of 200 ms waits sheds Background within a few periods: {background_after:?}");
+        assert_eq!(pool_sheds(&d, false), 0, "nothing while none of its jobs waits");
+        assert_eq!(step(&mut d, 1_200_000_000), 2, "Normal and Background once a wait reached the tolerance");
+        for _ in 0..50 {
+            step(&mut d, 300_000);
+        }
+        assert!(d.alarm.is_none(), "its alarm ends with its calm");
+        assert_eq!(pool_sheds(&d, true), 0, "nothing once its waits are back at their calm");
+    }
+
     /// Step 4: Background requests are shed first, then Normal ones, Critical never; the answer is 503 with
     /// `Retry-After` (the class's delay in whole seconds, at least one) and `x-kiln-shed` naming the class.
     #[test]
@@ -714,11 +918,16 @@ mod tests {
             assert_eq!(sheds(level, Class::Background), background, "background at level {level}");
             assert_eq!(sheds(level, Class::Normal), normal, "normal at level {level}");
         }
-        let r = answer(Class::Background, 30_000_000, 40_000);
+        let r = answer(Class::Background, 30_000_000, 40_000, None);
         assert_eq!(r.status(), StatusCode::SERVICE_UNAVAILABLE);
         assert_eq!(r.headers().get(header::RETRY_AFTER).and_then(|v| v.to_str().ok()), Some("1"));
         assert_eq!(r.headers().get("x-kiln-shed").and_then(|v| v.to_str().ok()), Some("background"));
-        let r = answer(Class::Normal, 2_500_000_000, 40_000);
+        let r = answer(Class::Normal, 2_500_000_000, 40_000, None);
         assert_eq!(r.headers().get(header::RETRY_AFTER).and_then(|v| v.to_str().ok()), Some("3"), "a delay of 2.5 s: three");
+        // Shed for work waiting in a pool: its wait says when to come back.
+        let r = answer(Class::Normal, 1_500_000_000, 2_000_000, Some(2));
+        assert_eq!(r.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(r.headers().get(header::RETRY_AFTER).and_then(|v| v.to_str().ok()), Some("2"), "a pool's wait of 1.5 s: two");
+        assert_eq!(r.headers().get("x-kiln-shed").and_then(|v| v.to_str().ok()), Some("normal"));
     }
 }
