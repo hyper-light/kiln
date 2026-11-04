@@ -168,3 +168,37 @@ fn g6_s3_without_classes_the_order_is_arrival() {
     assert_eq!(rt.counters().queue_polls_critical, 0);
     assert_eq!(rt.counters().queue_polls_background, 0);
 }
+
+/// A poll is charged to its class at most the watchdog's limit (`batch` quanta, `hyper_rt::watch`): past it the poll
+/// is a stall, reported as one, and charged in full it would leave its class owing all of it, its other tasks
+/// waiting as long again while the other classes caught up. Do: Background tasks keep the shard busy; a Normal task
+/// holds it in one poll for ten limits, then sleeps a quarter quantum. Expect: it runs again within two limits of
+/// its timer (a limit of catch-up, where the whole wedge would be ten).
+#[test]
+fn g6_s3_a_stall_is_charged_to_its_class_at_most_the_watchdogs_limit() {
+    let limit_ns = QUANTUM_NS * config().batch as u64;
+    let mut rt = LocalRuntime::new(&config()).unwrap();
+    let done = Arc::new(AtomicBool::new(false));
+    let background = Arc::new(AtomicU64::new(0));
+    let (done_in, background_in) = (Arc::clone(&done), Arc::clone(&background));
+    let late = rt
+        .block_on(async move {
+            for _ in 0..BUSY {
+                spawn(busy(Class::Background, Arc::clone(&done_in), Arc::clone(&background_in))).unwrap();
+            }
+            // Their first polls, which take their class.
+            yield_now().await;
+            let until = monotonic_ns() + 10 * limit_ns;
+            while monotonic_ns() < until {
+                std::hint::spin_loop();
+            }
+            let due = now_ns() + QUANTUM_NS / 4;
+            sleep(QUANTUM_NS / 4).await.unwrap();
+            let late = now_ns().saturating_sub(due);
+            done_in.store(true, Ordering::Release);
+            late
+        })
+        .unwrap();
+    eprintln!("after a wedge of ten limits: late {late} ns; background worked {} quanta", background.load(Ordering::Relaxed));
+    assert!(late <= 2 * limit_ns, "late {late} ns against a limit of {limit_ns} ns");
+}

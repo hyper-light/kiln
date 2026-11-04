@@ -1903,8 +1903,12 @@ impl Shard {
         // finished in one poll has them installed, linked and so cancelled with it.
         self.apply();
         let elapsed = ended.saturating_sub(start);
-        // Its class's share of the shard (`crate::queue`, kiln's goal 6).
-        self.desk.local.charge(slot, elapsed);
+        // Its class's share of the shard (`crate::queue`, kiln's goal 6), up to the watchdog's limit (`crate::watch`:
+        // a step's worth of polls that use their shares): a poll past it is a stall, reported as one whoever's time
+        // it was (the task's, a blocking call's, the host's), and charged in full it would make the class's other
+        // tasks wait as long again while the others caught up.
+        let stall_ns = quantum_ns.saturating_mul(u64::try_from(self.core.batch.max(1)).unwrap_or(u64::MAX));
+        self.desk.local.charge(slot, elapsed.min(stall_ns));
         // How long the poll held the shard unasked (docs/runtime.md §3.11): from its start, or from the last
         // time it asked `wanted` and was let go on; long past twice the quantum, which a task that asks once a
         // quantum and yields when told to never reaches.
