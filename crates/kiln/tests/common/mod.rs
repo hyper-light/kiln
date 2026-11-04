@@ -64,6 +64,19 @@ pub const NOT_INHERITED: &[&str] = &[
     "KILN_INSTANCE",
     "KILN_LOG",
     "KILN_CHAOS",
+    // What a CI leg runs with in a pod kiln made (k8s.rs): its server's QUIC address (production's,
+    // which a test's runner then tried before its own server's), and the pod's kind; what a step is
+    // given to reach its server (W13), and an agent's session; a descriptor its traces go to.
+    "KILN_QUIC",
+    "KILN_POD",
+    "KILN_POD_CONTAINERS",
+    "KILN_POD_SERVICES",
+    "KILN_POD_DOCKER",
+    "KILN_TOKEN",
+    "KILN_AGENT",
+    "KILN_SESSION",
+    "KILN_TERM_SESSION",
+    "KILN_TRACE_FD",
     "KILN_MACHINE_ID",
     // A gate's own git config (ci/gate.sh sets it): it overrides the HOME a test's kiln is given,
     // and actions/checkout edits a .gitconfig in the HOME it sets for git, which it then misses.
