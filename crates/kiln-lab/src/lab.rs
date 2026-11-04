@@ -84,6 +84,18 @@ impl Profile {
         Self { dwell_s: 0, read_think_ms: 0, ..Self::realistic() }
     }
 
+    /// The realistic profile at production's whole shape rather than its busy hour's share: its ten
+    /// runners and all 134 of its live feeds (2 of 20,000 events, 6 of 4,000, the rest of 400), every
+    /// one at work, at the same pace. What many sessions changing at once cost a server that kept them
+    /// under one lock, and don't cost one that gives each its own shard (goal 4, plan 01a1a59c2a9c
+    /// step 5).
+    pub fn many() -> Self {
+        let mut sessions = vec![20_000, 20_000];
+        sessions.extend(std::iter::repeat_n(4_000, 6));
+        sessions.extend(std::iter::repeat_n(400, 134 - 8));
+        Self { runners: 10, active: sessions.len(), sessions, ..Self::realistic() }
+    }
+
     /// A small one, to try the lab out (and for its own test).
     pub fn small() -> Self {
         Self {
@@ -911,6 +923,17 @@ mod tests {
         assert_eq!(pause(ms(50), None), ms(50), "no Retry-After: its think time");
         assert_eq!(pause(Duration::ZERO, Some(s(2))), s(2), "no think time: the Retry-After");
         assert_eq!(pause(s(3), Some(s(1))), s(3), "its think time when longer");
+    }
+
+    /// Goal 4, plan 01a1a59c2a9c step 5: the many-sessions profile is production's whole shape, every
+    /// session at work, at the realistic profile's sizes and pace.
+    #[test]
+    fn g4_s5_many_is_productions_whole_shape() {
+        let (many, realistic) = (Profile::many(), Profile::realistic());
+        assert_eq!((many.runners, many.sessions.len(), many.active), (10, 134, 134));
+        assert!(realistic.sessions.iter().all(|n| many.sessions.contains(n)), "the realistic profile's sizes");
+        assert_eq!(many.sessions.iter().filter(|n| **n == 400).count(), 126);
+        assert_eq!((many.turn_every_ms, many.turn_think_ms, many.viewers, many.window_s), (realistic.turn_every_ms, realistic.turn_think_ms, realistic.viewers, realistic.window_s));
     }
 
     #[test]
