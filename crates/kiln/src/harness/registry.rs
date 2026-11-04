@@ -1204,9 +1204,12 @@ impl Registry {
         }
     }
 
-    /// `value` as `file` in the registry's folder, whole or not at all.
+    /// `value` as `file` in the registry's folder, whole or not at all: written off the calling
+    /// thread, soon after, in the order kept (goal 3, plan 01a1a59c2a8e step 5: `crate::keep`).
+    /// Written here, renaming an agent or raising its epoch waited on the disk, on a shard.
     fn keep_json(&self, file: &str, value: &impl serde::Serialize) -> anyhow::Result<()> {
-        keep_json_in(&self.dir, file, value)
+        crate::keep::later(self.dir.join(file), serde_json::to_vec(value)?);
+        Ok(())
     }
 
     /// Whether kiln keeps a session going when it stops part-way (the "keep_going" control, from
@@ -4190,8 +4193,43 @@ mod tests {
         let r = Registry::new(dir.path().to_owned());
         r.names.lock().insert("s1".into(), "Mantle".into());
         r.save_names();
-        let again = Registry::new(dir.path().to_owned());
-        assert_eq!(again.names.lock().get("s1").map(String::as_str), Some("Mantle"));
+        // Written off the calling thread, soon after (goal 3, plan 01a1a59c2a8e step 5).
+        let kept = || Registry::new(dir.path().to_owned()).names.lock().get("s1").cloned();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+        while kept().is_none() && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert_eq!(kept().as_deref(), Some("Mantle"));
+        Ok(())
+    }
+
+    /// Goal 3, plan 01a1a59c2a8e step 5 (perf/api-pass's leftover): an agent's name and its epoch
+    /// are kept without the caller waiting on the disk. Here their files' writes wait (each `.part`
+    /// a named pipe nobody reads yet): keeping a name and raising an epoch return at once all the
+    /// same, where they used to wait on the write; read, each pipe then holds what was kept.
+    #[cfg(unix)]
+    #[test]
+    fn g3_s5_names_and_epochs_are_kept_without_waiting_on_the_disk() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        for file in ["names.json.part", "epochs.json.part"] {
+            let made = std::process::Command::new("mkfifo").arg(dir.path().join(file)).status()?;
+            anyhow::ensure!(made.success(), "mkfifo {file}");
+        }
+        let r = Arc::new(Registry::new(dir.path().to_owned()));
+        let (done, kept) = std::sync::mpsc::channel();
+        let keeper = Arc::clone(&r);
+        std::thread::spawn(move || {
+            keeper.names.lock().insert("s1".into(), "Mantle".into());
+            keeper.save_names();
+            keeper.raise_epoch("s1", 7);
+            let _ = done.send(());
+        });
+        anyhow::ensure!(kept.recv_timeout(std::time::Duration::from_secs(10)).is_ok(), "keeping a name and an epoch waited on the disk");
+        // Each pipe read: what the writer, waiting on it, was handed.
+        let names: HashMap<String, String> = serde_json::from_slice(&std::fs::read(dir.path().join("names.json.part"))?)?;
+        anyhow::ensure!(names.get("s1").map(String::as_str) == Some("Mantle"), "{names:?}");
+        let epochs: HashMap<String, u64> = serde_json::from_slice(&std::fs::read(dir.path().join("epochs.json.part"))?)?;
+        anyhow::ensure!(epochs.get("s1") == Some(&7), "{epochs:?}");
         Ok(())
     }
 }

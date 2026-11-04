@@ -12,10 +12,13 @@
 //! normal ones for the same reason: "If the amount of dirty CPU schedulers was allowed to be unlimited, dirty
 //! CPU bound jobs would potentially starve normal jobs."
 //!
-//! **Its threads run below the shards** (`crate::prioritysys`, with the measurements that chose each): Linux's
-//! idle policy, macOS's background QoS class, Windows' below-normal level. Where the machine has room the pool runs at full speed; where its threads and the
-//! shards want the same CPU, the OS gives it to the shards first. A job holds no lock a shard may wait on:
-//! its thread may be kept off the CPU while it holds it.
+//! **Its threads run below the shards** (`crate::prioritysys`, with the measurements that chose it), at a rank
+//! that keeps a share of the CPU against other work at the process's priority ([`Rank::Below`]: Linux's batch
+//! policy at nice +10, macOS's utility QoS class, Windows' below-normal level), as requests wait on its jobs and
+//! the OS's idle rank would leave them waiting on whatever else busies the process's cgroup. On Linux a shard
+//! asks for a slice of its step ([`prefer_current_thread`]), so where it wakes on a CPU a pool thread holds, it
+//! takes the CPU at once. Where the machine has room the pool runs at full speed. A job holds no lock a shard
+//! may wait on: its thread may be kept off the CPU while it holds it.
 //!
 //! **Work-stealing** [Blumofe and Leiserson; rayon]: jobs from the shards and other threads go into one
 //! injector queue; each worker keeps a queue of its own, where a job in pieces goes on after a piece, and a
@@ -259,15 +262,44 @@ impl fmt::Display for Refusal {
     }
 }
 
+/// How far below the shards the pool's threads go.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Rank {
+    /// Below the shards, with a share of the CPU against any thread at the process's priority all the same, so
+    /// a job a request waits on never waits on other work for good: Linux's `SCHED_BATCH` at a nice value 10
+    /// above (a weight of 110 against 1024: beside one thread spinning on its core, a 5 ms job took 48 ms at
+    /// the median, `benches/compute_wait.rs`), macOS's utility QoS class, Windows' below-normal level. A shard
+    /// that asks for a slice of its step ([`prefer_current_thread`]) takes the CPU from it at once on Linux.
+    Below,
+    /// The OS's lowest that still runs a thread whenever its CPU has nothing else: Linux's `SCHED_IDLE`, macOS's
+    /// background QoS class. A waking shard takes the CPU from it at once, but any thread at the process's
+    /// priority that shares its CPU budget holds it off almost entirely (a weight of 3 against 1024: beside
+    /// one spinning thread, a 5 ms job took 6.1 s), and a thread can't leave Linux's idle policy without
+    /// `RLIMIT_NICE`'s room: for a process that knows it stays alone in its cgroup, which kiln doesn't (its
+    /// UI server and its agents' processes join its cgroup as it runs).
+    Idle,
+}
+
+/// Asks the OS to let the calling thread, a shard, take its CPU from threads whose slices are longer as it
+/// wakes: on Linux an EEVDF slice of `slice_ns` (`sched_attr`'s `sched_runtime` on the normal policy, Linux
+/// 6.12 and later; the kernel holds it between 0.1 ms and 100 ms), so a shard whose slice is its step quantum
+/// preempts a pool thread at [`Rank::Below`] where the two share a CPU. Measured on one core shared with four
+/// such threads, a shard's p99 wake lateness was 1.1 ms without it and 0.21 ms with a 250 µs slice, its calm
+/// rounds 0.20 to 0.28 ms (`benches/compute_priority.rs`, `SHARD_SLICE_NS`, 2026-11-04). Its nice value and
+/// policy stay as they are. Elsewhere there is no such call: refused, and nothing changes.
+pub fn prefer_current_thread(slice_ns: u64) -> Result<(), Refusal> {
+    crate::prioritysys::prefer_current_thread(slice_ns)
+}
+
 /// The calling thread's priority as its OS reports it (a pool thread's is lowered; a shard's is not).
 pub fn thread_priority() -> Priority {
     crate::prioritysys::of_current_thread()
 }
 
-/// Lowers the calling thread's priority as the pool's threads lower theirs (the module's notes): for a thread
-/// that does the pool's kind of work outside it (a consumer's fallback where no pool runs).
-pub fn lower_current_thread() -> Result<Priority, Refusal> {
-    crate::prioritysys::lower_current_thread()
+/// Lowers the calling thread's priority to `rank` as the pool's threads lower theirs (the module's notes):
+/// for a thread that does the pool's kind of work outside it (a consumer's fallback where no pool runs).
+pub fn lower_current_thread(rank: Rank) -> Result<Priority, Refusal> {
+    crate::prioritysys::lower_current_thread(rank)
 }
 
 // --------------------------------------------------------------------------------------------- jobs
@@ -328,6 +360,8 @@ pub struct Config {
     pub queued: usize,
     /// A piece's time in nanoseconds: how long a job in pieces goes on while another waits.
     pub piece_ns: u64,
+    /// How far below the shards its threads go ([`Rank`]; kiln's is [`Rank::Below`]).
+    pub rank: Rank,
 }
 
 /// What [`start`] started.
@@ -445,7 +479,7 @@ pub fn start(config: Config) -> Result<Started, RtError> {
         });
     }
     let (report, reports) = sync_channel(config.workers);
-    let (stealers, slots) = spawn_workers(config.workers, &report);
+    let (stealers, slots) = spawn_workers(config.workers, config.rank, &report);
     drop(report);
     let workers = slots.len();
     if workers == 0 {
@@ -484,6 +518,7 @@ pub fn start(config: Config) -> Result<Started, RtError> {
 /// Starts up to `count` workers, each with its own queue; stops at the first thread the OS refuses.
 fn spawn_workers(
     count: usize,
+    rank: Rank,
     report: &SyncSender<Result<Priority, Refusal>>,
 ) -> (Vec<Stealer<Job>>, Vec<Slot>) {
     let mut stealers = Vec::new();
@@ -498,7 +533,7 @@ fn spawn_workers(
         )]
         let spawned = std::thread::Builder::new()
             .name(format!("kiln-compute-{index}"))
-            .spawn(move || work(index, &local, &report));
+            .spawn(move || work(index, rank, &local, &report));
         let Ok(handle) = spawned else {
             break;
         };
@@ -511,10 +546,15 @@ fn spawn_workers(
     (stealers, slots)
 }
 
-/// A worker: lowers its own priority and says what the OS took, waits for the pool, then serves it until it
-/// stops.
-fn work(index: usize, local: &Worker<Job>, report: &SyncSender<Result<Priority, Refusal>>) {
-    let _ = report.send(crate::prioritysys::lower_current_thread());
+/// A worker: lowers its own priority to `rank` and says what the OS took, waits for the pool, then serves it
+/// until it stops.
+fn work(
+    index: usize,
+    rank: Rank,
+    local: &Worker<Job>,
+    report: &SyncSender<Result<Priority, Refusal>>,
+) {
+    let _ = report.send(crate::prioritysys::lower_current_thread(rank));
     let pool = loop {
         match POOL.get() {
             Some(pool) => break pool,

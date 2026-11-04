@@ -2657,9 +2657,12 @@ async fn login_password(hub: &Hub, req: Request) -> R {
         return Ok(srv::with_header(r, header::RETRY_AFTER, &secs.to_string()));
     }
     let path = crate::password::path(&hub.cfg);
-    let outcome = crate::rt::blocking(move || crate::password::load(&path).map(|phc| crate::password::verify(&l.password, &phc)))
-        .await
-        .unwrap_or(Some(false));
+    // The file read on the blocking pool, Argon2's check on the compute pool (goal 3, plan 01a1a59c2a8e step 4).
+    let outcome = match crate::rt::blocking(move || crate::password::load(&path)).await {
+        Ok(Some(phc)) => Some(crate::rt::compute(move || crate::password::verify(&l.password, &phc)).await.unwrap_or(false)),
+        Ok(None) => None,
+        Err(_) => Some(false),
+    };
     match outcome {
         Some(true) => {
             PASSWORD_THROTTLE.succeeded();
@@ -2707,7 +2710,10 @@ async fn set_password(hub: &Hub, req: Request) -> R {
         srv::body_json(req.into_body(), JSON_LIMIT).await.map_err(|e| err(StatusCode::BAD_REQUEST, e.to_string()))?;
     crate::password::validate(&p.password).map_err(|why| err(StatusCode::BAD_REQUEST, format!("Password not accepted: {why}.")))?;
     let path = crate::password::path(&hub.cfg);
-    crate::rt::blocking(move || crate::password::hash(&p.password).and_then(|h| crate::password::store(&path, &h))).await??;
+    // Argon2 on the compute pool, then the file on the blocking pool (goal 3, plan 01a1a59c2a8e step 4: the
+    // blocking pool's places are for calls that block, and a password's hashing is CPU alone).
+    let hash = crate::rt::compute(move || crate::password::hash(&p.password)).await??;
+    crate::rt::blocking(move || crate::password::store(&path, &hash)).await??;
     PASSWORD_THROTTLE.succeeded();
     hub.store.audit("admin".into(), "password".into(), "set".into()).await;
     Ok(srv::status(StatusCode::NO_CONTENT))

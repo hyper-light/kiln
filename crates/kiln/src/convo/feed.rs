@@ -395,9 +395,18 @@ async fn ship(store: Store, rx: async_channel::Receiver<Link>, out: async_channe
             if let Some(skip) = &skip {
                 batch.rows.retain(|c| !skip(c.rev));
             }
-            let mut json = match serde_json::to_vec(&batch) {
-                Ok(j) => j,
-                Err(e) => {
+            // Its JSON and the SHA-256 of it made on the compute pool (goal 3, plan 01a1a59c2a8e step 3): a
+            // batch of up to two MiB, written out and hashed on the shard, held it all the while.
+            let (upto, rows) = (batch.upto, batch.rows.len());
+            let encoded = crate::rt::compute(move || -> anyhow::Result<(Vec<u8>, String)> {
+                let json = serde_json::to_vec(&batch)?;
+                let digest = crate::util::sha256_hex(&json);
+                Ok((json, digest))
+            })
+            .await;
+            let (mut json, digest) = match encoded {
+                Ok(Ok(e)) => e,
+                Ok(Err(e)) | Err(e) => {
                     tracing::warn!(error = %format!("{e:#}"), "conversation feed: a batch couldn't be encoded");
                     break;
                 }
@@ -405,7 +414,7 @@ async fn ship(store: Store, rx: async_channel::Receiver<Link>, out: async_channe
             // Its hand-on, by the SHA-256 of what goes (docs/ci.md W27-R08).
             let signer = signs.read().clone();
             let hand_on = match signer {
-                Some(c) => c.hand_on(batch_thing(&me, from, batch.upto, &crate::util::sha256_hex(&json))).await,
+                Some(c) => c.hand_on(batch_thing(&me, from, upto, &digest)).await,
                 None => None,
             };
             // A test build's `feed_changed`: the first batch signed for changes on its way, once.
@@ -416,9 +425,11 @@ async fn ship(store: Store, rx: async_channel::Receiver<Link>, out: async_channe
             {
                 *b ^= 0x20;
             }
-            let msgs = match parts_of(&me, from, batch.upto, json, st.zipped, st.told, hand_on) {
-                Ok(m) => m,
-                Err(e) => {
+            // Compressed and cut into its parts on the compute pool too.
+            let (store_id, zipped, told) = (me.clone(), st.zipped, st.told);
+            let msgs = match crate::rt::compute(move || parts_of(&store_id, from, upto, json, zipped, told, hand_on)).await {
+                Ok(Ok(m)) => m,
+                Ok(Err(e)) | Err(e) => {
                     tracing::warn!(error = %format!("{e:#}"), "conversation feed: a batch couldn't be encoded");
                     break;
                 }
@@ -432,9 +443,9 @@ async fn ship(store: Store, rx: async_channel::Receiver<Link>, out: async_channe
             if st.flight.is_empty() {
                 st.heard = Instant::now();
             }
-            st.sent = batch.upto;
-            st.flight.push_back((from, batch.upto));
-            stats.sent(batch.upto, batch.rows.len(), bytes, st.flight.len());
+            st.sent = upto;
+            st.flight.push_back((from, upto));
+            stats.sent(upto, rows, bytes, st.flight.len());
         }
     }
 }
