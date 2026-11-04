@@ -114,6 +114,7 @@ pub struct Server {
     /// pages and actions) never (`crate::overload`, kiln's goal 6). Off until declared, as what kiln
     /// decides on its own is (docs/ci.md §0.3, "Opt-in automation"): the delays and alarms are
     /// measured and shown on `/metrics` and `/readyz` either way, and off, nothing is refused.
+    /// `KILN_SHED` overrides it.
     pub shed: bool,
 }
 
@@ -598,6 +599,10 @@ impl Config {
         }
         if let Ok(v) = std::env::var("KILN_WEBRTC_ADVERTISE") {
             cfg.server.webrtc_advertise = v.split(',').map(str::trim).filter(|a| !a.is_empty()).map(str::to_owned).collect();
+        }
+        // `[server] shed`, as a lab's server takes its settings (`kiln-lab ab --env-b KILN_SHED=1`).
+        if let Ok(v) = std::env::var("KILN_SHED") {
+            cfg.server.shed = !matches!(v.trim(), "0" | "false" | "off" | "no");
         }
         Ok(cfg)
     }
