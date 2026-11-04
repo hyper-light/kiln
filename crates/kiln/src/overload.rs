@@ -24,10 +24,17 @@
 //!   that timeout (research f18: starvation that fails health checks cascades);
 //! - the false alarms a day: headroom's default (`Settings::false_alarms_per_day`, 1), a person's choice there.
 //!
+//! - the floor of a period's mean, the shard's step quantum: a shorter wait is no queue (a task waits that long
+//!   behind the poll running as it woke, whatever the load).
+//!
 //! A detector alarms when a class's delay leaves its calm toward the tolerance by more than its calm ever did
 //! (CUSUM's reference is half the log-distance from calm to the tolerance), so the limit is learned from the
-//! shard's own calm. While it sheds, nothing is learned as calm: shedding ends the excursions it starts on.
-//! `[server] shed = false` turns shedding off; the classes and the detectors stay, on `/metrics`.
+//! shard's own calm: from a calm at the floor, kiln's 250 µs quantum, a class whose mean wait passes about
+//! 16 ms (the geometric mean of the floor and the tolerance) is shed within a few periods. While it sheds,
+//! nothing is learned as calm: shedding ends the excursions it starts on.
+//! Shedding is off until `[server] shed = true` declares it, as what kiln decides on its own is (docs/ci.md
+//! §0.3, "Opt-in automation"); every shed says why (its body, `x-kiln-shed`, the log, `/metrics`). The
+//! classes and the detectors run either way, on `/metrics` and `/readyz`.
 //!
 //! **What kiln's clients do**: a shed answer did nothing (the handler never ran), so kiln's HTTP client sends
 //! the request again after `Retry-After`, within its deadline, when the body can be sent again
@@ -244,7 +251,7 @@ static SHARDS: OnceLock<Vec<ShardState>> = OnceLock::new();
 /// Requests shed, by `Class as usize`.
 static SHED: [AtomicU64; 3] = [AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0)];
 /// `[server] shed`: whether alarms shed (they are counted and shown either way).
-static ENABLED: AtomicBool = AtomicBool::new(true);
+static ENABLED: AtomicBool = AtomicBool::new(false);
 
 fn shards() -> &'static [ShardState] {
     SHARDS.get().map_or(&[], Vec::as_slice)
@@ -460,14 +467,15 @@ pub fn readiness() -> Option<(bool, String)> {
     if levels.iter().all(|l| *l == 0) {
         return None;
     }
-    let every = !levels.is_empty() && levels.iter().all(|l| *l >= 2);
+    // Not ready only while every shard refuses the API; with shedding off, nothing is refused.
+    let every = ENABLED.load(Ordering::Relaxed) && !levels.is_empty() && levels.iter().all(|l| *l >= 2);
     let mut line = String::from("overloaded:");
     for (index, level) in levels.iter().enumerate().filter(|(_, l)| **l > 0) {
         let what = if *level >= 2 { "normal and background" } else { "background" };
         let _ = write!(line, " shard {index} sheds {what} requests;");
     }
     if !ENABLED.load(Ordering::Relaxed) {
-        line.push_str(" (shedding is off: [server] shed = false)");
+        line.push_str(" (shedding is off: [server] shed = true turns it on)");
     }
     Some((every, line.trim_end_matches(';').to_owned()))
 }
@@ -503,7 +511,8 @@ pub fn render(o: &mut String) {
     let _ = writeln!(o, "# HELP kiln_shard_last_stall_seconds How long the latest reported stall had held its shard, with its task, spawn site and whose the time was.\n# TYPE kiln_shard_last_stall_seconds gauge");
     for (index, holder) in holders.iter().enumerate() {
         if let Some(r) = hyper_rt::watch::report(*holder) {
-            let at = r.spawned_at.map_or_else(|| "unknown".to_owned(), ToString::to_string).replace('"', "'");
+            // A label value: quotes and backslashes (a Windows path's) kept out of the exposition format.
+            let at = r.spawned_at.map_or_else(|| "unknown".to_owned(), ToString::to_string).replace('"', "'").replace('\\', "/");
             let _ = writeln!(o, "kiln_shard_last_stall_seconds{{shard=\"{index}\",task=\"{}\",spawned_at=\"{at}\",whose=\"{}\"}} {:.6}", r.task.0.slot(), r.whose.as_str(), r.held_ns as f64 / 1e9);
         }
     }

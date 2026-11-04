@@ -286,3 +286,33 @@ fn g6_s1_a_simulated_shard_never_yields_by_budget() {
     let counters = sim.counters(shard).unwrap();
     assert_eq!(counters.coop_yields, 0, "{counters:?}");
 }
+
+/// What a charge costs (a measurement, run on demand: `cargo test -p hyper-rt --release --test coop_budget --
+/// --ignored --nocapture`): with nothing that could want the shard (no clock read), and with a timer armed far
+/// ahead (each charge reads the shard's clock and compares it).
+#[test]
+#[ignore = "a measurement, run on demand"]
+fn g6_s1_what_a_charge_costs() {
+    const CHARGES: u64 = 1_000_000;
+    let mut rt = LocalRuntime::new(&config()).unwrap();
+    for armed in [false, true] {
+        let ns = rt
+            .block_on(async move {
+                if armed {
+                    // A timer an hour out: something could want the shard, so each charge reads the clock.
+                    spawn(async {
+                        let _ = sleep(3_600_000_000_000).await;
+                    })
+                    .unwrap();
+                    hyper_rt::futures::yield_now().await;
+                }
+                let started = monotonic_ns();
+                for _ in 0..CHARGES {
+                    consume_budget().await;
+                }
+                (monotonic_ns() - started) / CHARGES
+            })
+            .unwrap();
+        eprintln!("a charge, {}: {ns} ns", if armed { "a timer armed (the clock read)" } else { "nothing armed (no clock read)" });
+    }
+}

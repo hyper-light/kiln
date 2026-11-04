@@ -111,8 +111,9 @@ pub struct Server {
     pub webrtc_advertise: Vec<String>,
     /// A shard whose queueing delay leaves its calm answers Background requests 503 with `Retry-After`,
     /// and Normal ones too while the API's own delay does; Critical ones (health, sign-in, a person's
-    /// pages and actions) never (`crate::overload`, kiln's goal 6). Off: the delays and alarms are
-    /// still measured and shown on `/metrics` and `/readyz`, and nothing is refused.
+    /// pages and actions) never (`crate::overload`, kiln's goal 6). Off until declared, as what kiln
+    /// decides on its own is (docs/ci.md §0.3, "Opt-in automation"): the delays and alarms are
+    /// measured and shown on `/metrics` and `/readyz` either way, and off, nothing is refused.
     pub shed: bool,
 }
 
@@ -418,7 +419,7 @@ impl Default for Server {
             pages_url: None,
             webrtc_addr: None,
             webrtc_advertise: Vec::new(),
-            shed: true,
+            shed: false,
         }
     }
 }
