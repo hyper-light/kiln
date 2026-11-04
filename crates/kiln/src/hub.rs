@@ -2903,7 +2903,11 @@ impl Hub {
         // Welcome not to send its sessions whole. An older runner skips the frame.
         self.send_peer(peer, &ServerMsg::Caps { caps: proto::CAP_WIRE | proto::CAP_NET_DROPS | proto::CAP_HANDOVER | proto::CAP_WORK | proto::CAP_AGENT_LIMIT | proto::CAP_IDENTITY | proto::CAP_HEADROOM | proto::CAP_CHANGES_PATCH | proto::CAP_UNREAD | proto::CAP_AGENT_GIT | proto::CAP_LEG_SIGNS | proto::CAP_CUSTODY | proto::CAP_RELAYS }).await;
         // What its sessions' copies have here, so a stream it starts sends only what they lack
-        // (`crate::wire::sums`): a few dozen sessions a frame, each about a kilobyte.
+        // (`crate::wire::sums`): a few dozen sessions a frame, each about a kilobyte. Once each
+        // copy's owner has applied what this loop handed it before (`crate::harness::copies`): a
+        // copy said to have less than it has would let go of the rest when the runner's Open
+        // comes, sending its viewers back to the session whole.
+        self.harness.settled().await;
         for part in self.harness.kept_on(&name).chunks(KEPT_A_FRAME) {
             self.send_peer(peer, &ServerMsg::Kept { sessions: part.to_vec() }).await;
         }
