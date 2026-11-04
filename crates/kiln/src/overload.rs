@@ -192,6 +192,13 @@ pub struct Serving {
     class: Class,
 }
 
+impl Serving {
+    /// The request's class: what its handler's task starts in where it is placed apart (goal 7, `crate::placement`).
+    pub fn class(&self) -> Class {
+        self.class
+    }
+}
+
 /// A response's body that keeps its request's [`Serving`] until it ends: a body streamed after the handler
 /// returned (a download, a log) goes on at its request's class, not at the class of a connection between
 /// requests.

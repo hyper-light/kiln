@@ -168,6 +168,25 @@ fn base() -> Instant {
 
 static SHARDS: OnceLock<Box<[Shard]>> = OnceLock::new();
 
+/// The probes' period, nanoseconds, once [`start`] has run (0 before).
+static PERIOD_NS: AtomicU64 = AtomicU64::new(0);
+
+/// Shard `i`'s delay now, for placing work on the less delayed of two shards (goal 7, plan 01a1a59c2aea step 1):
+/// how late its latest probe ran, or, when its next probe is overdue, how long overdue it is, so a shard held
+/// right now shows it before its probe runs again. `None` with no probe noted (none started, or none ran yet).
+/// Reads two atomics and the clock, no shard.
+pub fn delay_now(i: usize) -> Option<Duration> {
+    let s = shards().get(i)?;
+    let last = s.last_ns.load(Ordering::Relaxed);
+    if last == 0 {
+        return None;
+    }
+    let late = s.late_ns.load(Ordering::Relaxed);
+    let due = last.saturating_add(PERIOD_NS.load(Ordering::Relaxed));
+    let overdue = nanos(base().elapsed()).saturating_sub(due);
+    Some(Duration::from_nanos(late.max(overdue)))
+}
+
 /// Every shard's figures, in the runtime's order (empty before [`start`]).
 pub fn shards() -> &'static [Shard] {
     SHARDS.get().map_or(&[], |s| &s[..])
@@ -195,6 +214,7 @@ pub fn start(period: Duration) -> usize {
     }
     let _ = base();
     let period = period.max(Duration::from_millis(1));
+    PERIOD_NS.store(nanos(period), Ordering::Relaxed);
     let mut started = 0;
     for i in 0..shards.len() {
         if crate::rt::spawn_on(i, probe(i, period)) {
