@@ -19,6 +19,8 @@ pub struct Answer {
 /// One HTTP/1.1 connection to the server, kept open between requests and opened again when the
 /// server closes it.
 pub struct Http {
+    /// Where the server is: 127.0.0.1, or the browser lab's server namespace (`browser::link`).
+    host: std::net::Ipv4Addr,
     port: u16,
     token: String,
     conn: Option<TcpStream>,
@@ -31,7 +33,12 @@ pub struct Http {
 
 impl Http {
     pub fn new(port: u16, token: &str) -> Self {
-        Self { port, token: token.to_owned(), conn: None, buf: Vec::new(), accept: "identity", wants: "*/*" }
+        Self { host: std::net::Ipv4Addr::LOCALHOST, port, token: token.to_owned(), conn: None, buf: Vec::new(), accept: "identity", wants: "*/*" }
+    }
+
+    /// One to a server at `host` (the browser lab reaches its kiln in the server's namespace).
+    pub fn at(host: std::net::Ipv4Addr, port: u16, token: &str) -> Self {
+        Self { host, ..Self::new(port, token) }
     }
 
     /// One that asks as a browser loading pages does: a page, packed (Chromium's `Accept` for a
@@ -42,7 +49,7 @@ impl Http {
 
     fn open(&mut self) -> anyhow::Result<()> {
         if self.conn.is_none() {
-            let s = TcpStream::connect(("127.0.0.1", self.port))?;
+            let s = TcpStream::connect((self.host, self.port))?;
             s.set_nodelay(true)?;
             s.set_read_timeout(Some(PATIENCE))?;
             self.buf.clear();
@@ -54,7 +61,7 @@ impl Http {
     /// `method path` with `body` (JSON) when there is one: the answer. A connection the server had
     /// closed is opened again once.
     pub fn send(&mut self, method: &str, path: &str, body: Option<&[u8]>) -> anyhow::Result<Answer> {
-        let mut head = format!("{method} {path} HTTP/1.1\r\nHost: 127.0.0.1:{}\r\nAuthorization: Bearer {}\r\nAccept: {}\r\nAccept-Encoding: {}\r\n", self.port, self.token, self.wants, self.accept);
+        let mut head = format!("{method} {path} HTTP/1.1\r\nHost: {}:{}\r\nAuthorization: Bearer {}\r\nAccept: {}\r\nAccept-Encoding: {}\r\n", self.host, self.port, self.token, self.wants, self.accept);
         if let Some(b) = body {
             head.push_str(&format!("Content-Type: application/json\r\nContent-Length: {}\r\n", b.len()));
         }
