@@ -32,7 +32,7 @@ use crate::body::{Feed, Incoming, Want};
 use crate::buf::{SCRATCH, WriteBuf, poll_read_into};
 use crate::rt::Sleep;
 use crate::service::{SendBody, Service};
-use crate::{Error, date};
+use crate::{Error, Received, date};
 
 /// The write buffer this full stops the connection taking more frames until it drains.
 const HIGH_WATER: usize = 256 << 10;
@@ -581,6 +581,8 @@ struct Conn<I, S: Service> {
     heard: Instant,
     keep_alive: Option<Sleep>,
     ping_sent: Option<Instant>,
+    /// When the latest read brought bytes: a request decoded from them arrived then ([`Received`]).
+    read_at: Instant,
 }
 
 impl<I: AsyncRead + AsyncWrite + Unpin, S: Service<Body: Unpin>> Conn<I, S> {
@@ -952,6 +954,8 @@ impl<I: AsyncRead + AsyncWrite + Unpin, S: Service<Body: Unpin>> Conn<I, S> {
             }
         };
         s.head = req.method() == Method::HEAD;
+        let mut req = req;
+        req.extensions_mut().insert(Received(self.read_at));
         let fut = self.service.call(req);
         let mut slot = self.slot(fut);
         let polled = slot.as_mut().as_pin_mut().map(|f| f.poll(cx));
@@ -1150,7 +1154,7 @@ impl<I: AsyncRead + AsyncWrite + Unpin, S: Service<Body: Unpin>> Conn<I, S> {
             }
             match poll_read_into(&mut self.wire.io, cx, &mut self.wire.rbuf, SCRATCH) {
                 Poll::Ready(Ok(0)) => self.wire.eof = true,
-                Poll::Ready(Ok(_)) => {}
+                Poll::Ready(Ok(_)) => self.read_at = Instant::now(),
                 Poll::Ready(Err(e)) => return Poll::Ready(Err(Error::io(e))),
                 Poll::Pending if busy => {}
                 Poll::Pending => return Poll::Pending,
@@ -1244,6 +1248,7 @@ where
         heard: Instant::now(),
         keep_alive: None,
         ping_sent: None,
+        read_at: Instant::now(),
     };
     let out = poll_fn(|cx| conn.poll_drive(cx)).await;
     let _ = poll_fn(|cx| conn.wire.poll_flush(cx)).await;

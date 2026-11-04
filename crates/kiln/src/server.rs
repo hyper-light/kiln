@@ -56,6 +56,11 @@ pub fn token_path(cfg: &Config) -> PathBuf {
 
 pub async fn run(cfg: Config, shutdown: Shutdown) -> anyhow::Result<()> {
     crate::os::start_reaper();
+    // Each shard's health on /metrics: its delay, busy share and slow polls (goal 1, plan
+    // 01a1a59c2a68 step 1).
+    if let Some(period) = crate::shard_health::period_from_env() {
+        crate::shard_health::start(period);
+    }
     crate::updates::warm_own_binary().await;
     let cfg = Arc::new(cfg);
     std::fs::create_dir_all(&cfg.server.data_dir)

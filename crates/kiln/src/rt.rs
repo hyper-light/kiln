@@ -327,17 +327,25 @@ pub fn spawn_spread<F: Future<Output = ()> + Send + 'static>(fut: F) {
     tracing::error!("hyper-rt refused a connection task on every shard; connection dropped");
 }
 
-/// The runtime's shards: how many there are (one at least).
-pub fn shards() -> usize {
-    rt().map_or(1, |r| r.holders.len().max(1))
+/// The runtime's shards (it's started if it hasn't been): 0 when it couldn't start.
+pub fn shard_count() -> usize {
+    rt().map_or(0, |rt| rt.holders.len())
 }
 
-/// Run `fut` as its own task on shard `shard` (of [`shards`]), wherever the caller is: a task that
-/// owns what belongs to that shard (each agent session's copy, `crate::harness::copies`) lives
-/// there for its whole life. Refused there (its arena or control queue full), it waits as
+/// Run `fut` on shard `i` (of [`shard_count`]) and no other, for a task whose work is that shard's
+/// own: a probe of its health (`crate::shard_health`), or a test holding one shard and not the
+/// rest. Whether the shard took it.
+pub fn spawn_on<F: Future<Output = ()> + Send + 'static>(i: usize, fut: F) -> bool {
+    let Ok(rt) = rt() else { return false };
+    rt.holders.get(i).is_some_and(|holder| hyper_rt::runtime::submit_to_holder(*holder, fut).is_ok())
+}
+
+/// Run `fut` as its own task on shard `shard` (of [`shard_count`]) for its whole life, wherever the
+/// caller is: a task that owns what belongs to that shard (each agent session's copy,
+/// `crate::harness::copies`). Refused there (its arena or control queue full), it waits as
 /// [`spawn`] does off the runtime, then runs on whichever shard takes it, said, rather than not at
-/// all. Goal 4, plan 01a1a59c2a9c step 2.
-pub fn spawn_on<F: Future<Output = ()> + Send + 'static>(shard: usize, fut: F) {
+/// all, where [`spawn_on`] gives up. Goal 4, plan 01a1a59c2a9c step 2.
+pub fn spawn_owner<F: Future<Output = ()> + Send + 'static>(shard: usize, fut: F) {
     let slot = handoff(Box::pin(fut));
     let there = |slot: &Arc<Mutex<Option<Boxed>>>| {
         let holder = rt().ok().and_then(|rt| rt.holders.get(shard % rt.holders.len().max(1)).copied());

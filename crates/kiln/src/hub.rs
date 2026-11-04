@@ -1733,10 +1733,20 @@ impl Hub {
         // listener's) for as long as they send.
         let mut turns = crate::rt::Turns::new();
         while let Ok(ev) = rx.recv().await {
+            // A runner's message: how long it waited for this loop, and how long applying it took
+            // (goal 1, plan 01a1a59c2a68 step 2).
+            let arrived = match &ev {
+                NetEvent::Frame { at, .. } => Some(*at),
+                _ => None,
+            };
+            let began = Instant::now();
             // What can't be read is refused and noted where it's read (`unreadable`); what's left is
             // a message read whole that couldn't be applied.
             if let Err(e) = self.on_net(ev).await {
                 tracing::warn!(error = %format!("{e:#}"), "a runner's message couldn't be applied");
+            }
+            if let Some(at) = arrived {
+                crate::route_latency::observe(crate::route_latency::Class::Runner, Some(began.saturating_duration_since(at)), began.elapsed());
             }
             turns.after().await;
         }
@@ -1797,7 +1807,7 @@ impl Hub {
             }
             // Bulk frames are job output, but on the conversation feed's and the files' lanes
             // (messages, in bulk).
-            NetEvent::Frame { peer, kind: Kind::Log, lane, data } if lane != proto::LANE_CONVO && lane != proto::LANE_FILES => match proto::read_whole::<proto::LogChunk>(&data) {
+            NetEvent::Frame { peer, kind: Kind::Log, lane, data, .. } if lane != proto::LANE_CONVO && lane != proto::LANE_FILES => match proto::read_whole::<proto::LogChunk>(&data) {
                 Ok(chunk) => {
                     if self.owns_job(peer, &chunk.job) {
                         // Written on the blocking pool, in order (each waited for): a busy disk
@@ -3832,7 +3842,7 @@ pub(crate) mod tests {
             let hub = scratch_hub().await?;
             hub.peers.lock().insert(1, "fedora".into());
             hub.agents.lock().insert("fedora".into(), live_runner("fedora", "linux", "x86_64"));
-            let frame = |data: Vec<u8>, lane: u32| NetEvent::Frame { peer: 1, lane, kind: Kind::Control, data };
+            let frame = |data: Vec<u8>, lane: u32| NetEvent::Frame { peer: 1, lane, kind: Kind::Control, data, at: Instant::now() };
             // A newer runner's variant, and a known one cut short.
             hub.on_net(frame(vec![0xc8, 0x01, 7], proto::LANE_CONTROL)).await?;
             let adopted = proto::encode(&AgentMsg::HarnessAdopted { session: "s1".into(), error: None })?;
@@ -3848,8 +3858,8 @@ pub(crate) mod tests {
             // go as before (it may come before the Hello does).
             hub.pending_peers.lock().insert(2, "newbox".into());
             let facts = proto::encode(&AgentMsg::NetDrops { dropped: Vec::new() })?;
-            hub.on_net(NetEvent::Frame { peer: 2, lane: proto::LANE_TERM, kind: Kind::Term, data: facts.clone() }).await.ok();
-            hub.on_net(NetEvent::Frame { peer: 2, lane: proto::LANE_CONTROL, kind: Kind::Control, data: facts }).await?;
+            hub.on_net(NetEvent::Frame { peer: 2, lane: proto::LANE_TERM, kind: Kind::Term, data: facts.clone(), at: Instant::now() }).await.ok();
+            hub.on_net(NetEvent::Frame { peer: 2, lane: proto::LANE_CONTROL, kind: Kind::Control, data: facts, at: Instant::now() }).await?;
             let early: Vec<(String, String, String)> = hub
                 .store
                 .call(|c| {
@@ -4160,7 +4170,7 @@ pub(crate) mod tests {
 
     /// `msg`, from runner process `peer` on `lane`, as the net loop hears it.
     pub(crate) async fn hear(hub: &Arc<Hub>, peer: PeerId, lane: u32, msg: &AgentMsg) -> anyhow::Result<()> {
-        hub.on_net(NetEvent::Frame { peer, lane, kind: Kind::Control, data: proto::encode(msg)? }).await
+        hub.on_net(NetEvent::Frame { peer, lane, kind: Kind::Control, data: proto::encode(msg)?, at: Instant::now() }).await
     }
 
     /// `msg`, item `seq` of runner process `peer`'s channel stream `stream`, as the hub hears it.

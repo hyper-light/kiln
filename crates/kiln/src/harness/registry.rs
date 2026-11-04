@@ -4098,7 +4098,7 @@ mod tests {
             // Every shard kept busy: tasks that hold it a step at a time, giving it up only to
             // what wants it.
             let (busy, done) = (Arc::new(AtomicBool::new(true)), Arc::new(AtomicBool::new(false)));
-            for _ in 0..crate::rt::shards() * 2 {
+            for _ in 0..crate::rt::shard_count().max(1) * 2 {
                 let busy = Arc::clone(&busy);
                 crate::rt::spawn_spread(async move {
                     while busy.load(Ordering::Acquire) {

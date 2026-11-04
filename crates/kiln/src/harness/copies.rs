@@ -730,7 +730,7 @@ pub struct Copies {
 impl Copies {
     /// An owner on each of the runtime's shards, its sessions' feeds on `bus`.
     pub fn start(bus: Arc<dyn kiln_seams::Bus>) -> Self {
-        Self::start_with(bus, crate::rt::shards(), crate::net::EVENTS)
+        Self::start_with(bus, crate::rt::shard_count().max(1), crate::net::EVENTS)
     }
 
     /// `shards` owners (one a shard), each inbox holding `inbox` messages.
@@ -742,7 +742,7 @@ impl Copies {
         for me in 0..shards {
             let (tx, rx) = async_channel::bounded(inbox.max(1));
             let shard = Shard { me, mirrors: HashMap::new(), boards: Arc::clone(&boards), bus: Arc::clone(&bus), board_changed: false };
-            crate::rt::spawn_on(me, own(shard, rx, Arc::clone(&hub)));
+            crate::rt::spawn_owner(me, own(shard, rx, Arc::clone(&hub)));
             inboxes.push(tx);
         }
         Self { inboxes, boards, hub }
@@ -1088,7 +1088,7 @@ mod tests {
     #[test]
     fn a_reader_never_waits_on_a_busy_owner() -> anyhow::Result<()> {
         crate::rt::block_on(async {
-            let copies = Arc::new(Copies::start_with(sim_bus(), crate::rt::shards(), 8));
+            let copies = Arc::new(Copies::start_with(sim_bus(), crate::rt::shard_count().max(1), 8));
             let (bus, id) = (sim_bus(), "s1".to_owned());
             let info = Info { id: id.clone(), kind: "claude".into(), ..Info::default() };
             let i = id.clone();
@@ -1134,7 +1134,7 @@ mod tests {
     #[test]
     fn changes_keep_their_order_and_none_is_lost_when_shards_are_busy() -> anyhow::Result<()> {
         crate::rt::block_on(async {
-            let shards = crate::rt::shards();
+            let shards = crate::rt::shard_count().max(1);
             let copies = Arc::new(Copies::start_with(sim_bus(), shards, 2));
             let sessions: Vec<String> = (0..24).map(|n| format!("s{n}")).collect();
             for id in &sessions {
@@ -1197,7 +1197,7 @@ mod tests {
     #[test]
     fn readers_see_whole_views_and_never_go_back() -> anyhow::Result<()> {
         crate::rt::block_on(async {
-            let copies = Arc::new(Copies::start_with(sim_bus(), crate::rt::shards(), 64));
+            let copies = Arc::new(Copies::start_with(sim_bus(), crate::rt::shard_count().max(1), 64));
             let (id, bus) = ("s1".to_owned(), sim_bus());
             let info = Info { id: id.clone(), kind: "claude".into(), ..Info::default() };
             let i = id.clone();
