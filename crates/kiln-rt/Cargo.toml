@@ -18,6 +18,9 @@ repository.workspace = true
 crc32c = "0.6"
 # The combinators and `within` are named futures that hold what they are given in place (docs/runtime.md §3.8).
 pin-project-lite = "0.2.17"
+# The compute pool's queues (src/compute.rs, kiln's departure, ORIGIN.md): Chase and Lev's work-stealing deque
+# and a lock-free injector, no lock on any path; already in kiln's lock file through rayon.
+crossbeam-deque = "0.8"
 
 [target.'cfg(unix)'.dependencies]
 # sysctl, mach and the per-thread CPU clocks that rustix does not cover (the OS-interface files of
@@ -127,4 +130,8 @@ harness = false
 
 [[bench]]
 name = "stamped_receive"
+harness = false
+
+[[bench]]
+name = "compute_priority"
 harness = false
