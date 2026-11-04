@@ -47,6 +47,9 @@ pub struct LossCheck {
     pub same_as_first: Option<bool>,
     /// How many dropped indices it shares with seed one's first run (another seed only).
     pub shared_with_first: Option<u64>,
+    /// Runs before it that the lab's own receiver dropped packets in (run again).
+    #[serde(default)]
+    pub retried: u64,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -236,14 +239,25 @@ fn loss_checks(lab: &mut Lab, good: Profile, seed: u64) -> anyhow::Result<Vec<Lo
             let mut first: Option<Vec<u64>> = None;
             for (run, sd) in [(0, seed), (1, seed), (2, other)] {
                 eprintln!("kiln-lab: loss {pct}% {direction}, seed {sd}");
-                lab.shape(0, &Condition { profile: good.clone(), loss: Loss::Random { pct }, seed: sd })?;
-                let tools = Tools { lab, exe: exe.clone() };
-                let (sink_ns, sink_ip, blast_ns) = if direction == "down" { (Ns::Client(0), link::client_ip(0), Ns::Server) } else { (Ns::Server, link::server_ip().to_owned(), Ns::Client(0)) };
-                let sink = tools.spawn(sink_ns, &[s("udp-sink"), s("--bind"), format!("{sink_ip}:5004"), s("--count"), s(N), s("--quiet-ms"), s(3000)])?;
-                std::thread::sleep(Duration::from_millis(300));
-                let blast = tools.spawn(blast_ns, &[s("udp-blast"), s("--to"), format!("{sink_ip}:5004"), s("--count"), s(N), s("--pps"), s(20_000)])?;
-                let _: serde_json::Value = Tools::done(blast)?;
-                let sunk: Sunk = Tools::done(sink)?;
+                // A run the lab's own receiver dropped packets in is run again (a loaded machine
+                // can starve the sink); its count says how often.
+                let mut retried = 0;
+                let sunk = loop {
+                    // The qdisc made again: its random state starts from the seed.
+                    lab.shape(0, &Condition { profile: good.clone(), loss: Loss::Random { pct }, seed: sd })?;
+                    let tools = Tools { lab, exe: exe.clone() };
+                    let (sink_ns, sink_ip, blast_ns) = if direction == "down" { (Ns::Client(0), link::client_ip(0), Ns::Server) } else { (Ns::Server, link::server_ip().to_owned(), Ns::Client(0)) };
+                    let sink = tools.spawn(sink_ns, &[s("udp-sink"), s("--bind"), format!("{sink_ip}:5004"), s("--count"), s(N), s("--quiet-ms"), s(3000)])?;
+                    std::thread::sleep(Duration::from_millis(300));
+                    let blast = tools.spawn(blast_ns, &[s("udp-blast"), s("--to"), format!("{sink_ip}:5004"), s("--count"), s(N), s("--pps"), s(5_000)])?;
+                    let _: serde_json::Value = Tools::done(blast)?;
+                    let sunk: Sunk = Tools::done(sink)?;
+                    if sunk.rcvbuf_errors == 0 || retried >= 3 {
+                        break sunk;
+                    }
+                    retried += 1;
+                };
+                anyhow::ensure!(sunk.rcvbuf_errors == 0, "the lab's receiver kept dropping packets ({} in the last run): the machine is too loaded to measure loss", sunk.rcvbuf_errors);
                 let lost = sunk.missing.len() as u64;
                 let band = band99(N, pct / 100.0);
                 let (same_as_first, shared_with_first) = match (&first, run) {
@@ -257,7 +271,7 @@ fn loss_checks(lab: &mut Lab, good: Profile, seed: u64) -> anyhow::Result<Vec<Lo
                 if first.is_none() {
                     first = Some(sunk.missing.clone());
                 }
-                out.push(LossCheck { direction: direction.to_owned(), pct, seed: sd, sent: N, lost, band, inside: (band.0..=band.1).contains(&lost), same_as_first, shared_with_first });
+                out.push(LossCheck { direction: direction.to_owned(), pct, seed: sd, sent: N, lost, band, inside: (band.0..=band.1).contains(&lost), same_as_first, shared_with_first, retried });
             }
         }
     }
@@ -284,11 +298,11 @@ pub fn markdown(c: &Checks) -> String {
             p.reordered
         );
     }
-    let _ = writeln!(o, "\n| loss | way | seed | lost of 100,000 | 99% band | same indices as seed's first run | shared with the first seed's |\n| --- | --- | --- | --- | --- | --- | --- |");
+    let _ = writeln!(o, "\n| loss | way | seed | lost of 100,000 | 99% band | same indices as seed's first run | shared with the first seed's | runs again (lab-side drops) |\n| --- | --- | --- | --- | --- | --- | --- | --- |");
     for l in &c.losses {
         let same = l.same_as_first.map_or_else(|| "-".to_owned(), |s| if s { "yes".to_owned() } else { "**no**".to_owned() });
         let shared = l.shared_with_first.map_or_else(|| "-".to_owned(), |n| n.to_string());
-        let _ = writeln!(o, "| {}% | {} | {} | {}{} | {} to {} | {same} | {shared} |", l.pct, l.direction, l.seed, l.lost, if l.inside { "" } else { " (outside)" }, l.band.0, l.band.1);
+        let _ = writeln!(o, "| {}% | {} | {} | {}{} | {} to {} | {same} | {shared} | {} |", l.pct, l.direction, l.seed, l.lost, if l.inside { "" } else { " (outside)" }, l.band.0, l.band.1, l.retried);
     }
     let _ = writeln!(o, "\n{}", if c.pass { "Every check passed." } else { "**Not every check passed.**" });
     o

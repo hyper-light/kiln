@@ -62,7 +62,7 @@ pub fn outside() -> Vec<Check> {
 
 /// What the lab checks inside its namespaces, given the web driver's folder.
 #[cfg(target_os = "linux")]
-pub fn inside(web: &Path) -> Vec<Check> {
+pub fn inside(web: &Path, browsers: &[String]) -> Vec<Check> {
     let mut out = Vec::new();
     let outer = std::env::var(topo::OUTER_UID).unwrap_or_default();
     out.push(check("started without root", true, if outer.is_empty() || outer == "0" { Err(anyhow::anyhow!("started by uid {outer:?}")) } else { Ok(format!("uid {outer} outside, root only inside its own user namespace")) }));
@@ -101,8 +101,8 @@ pub fn inside(web: &Path) -> Vec<Check> {
     }
     // The browsers, started in the client's namespace as the lab starts them.
     let argv = vec!["node".to_owned(), web.join("driver.mjs").to_string_lossy().into_owned(), "probe".to_owned()];
-    let browsers = lab.command(Ns::Client(0), &argv).and_then(|mut c| Ok(c.stdin(Stdio::null()).output()?));
-    match browsers {
+    let started = lab.command(Ns::Client(0), &argv).and_then(|mut c| Ok(c.stdin(Stdio::null()).output()?));
+    match started {
         Ok(o) => {
             let text = String::from_utf8_lossy(&o.stdout);
             for line in text.lines() {
@@ -110,7 +110,8 @@ pub fn inside(web: &Path) -> Vec<Check> {
                 let name = v.get("browser").and_then(serde_json::Value::as_str).unwrap_or("?").to_owned();
                 let ok = v.get("ok").and_then(serde_json::Value::as_bool) == Some(true);
                 let detail = if ok { v.get("version").and_then(serde_json::Value::as_str).unwrap_or("").to_owned() } else { v.get("error").and_then(serde_json::Value::as_str).unwrap_or("").chars().take(300).collect() };
-                out.push(Check { name: format!("{name} starts"), ok, detail, required: name != "firefox" });
+                let required = browsers.contains(&name);
+                out.push(Check { name: format!("{name} starts"), ok, detail, required });
             }
             if !o.status.success() && out.iter().all(|c| !c.name.ends_with("starts")) {
                 out.push(Check { name: "browsers start".into(), ok: false, detail: String::from_utf8_lossy(&o.stderr).chars().take(400).collect(), required: true });

@@ -77,6 +77,18 @@ pub struct Sunk {
     /// One-way delay of each packet as it came (µs), when asked.
     #[serde(default)]
     pub delays_us: Vec<u64>,
+    /// Packets the sink's own socket dropped (its namespace's `Udp: RcvbufErrors` over the run):
+    /// lost on the lab's side, not the link's, so a run with any is no measure of the link.
+    #[serde(default)]
+    pub rcvbuf_errors: u64,
+}
+
+/// `Udp: RcvbufErrors` in this namespace's `/proc/net/snmp`.
+pub fn rcvbuf_errors() -> u64 {
+    let text = std::fs::read_to_string("/proc/self/net/snmp").unwrap_or_default();
+    let mut udp = text.lines().filter(|l| l.starts_with("Udp:"));
+    let (Some(names), Some(values)) = (udp.next(), udp.next()) else { return 0 };
+    names.split_whitespace().zip(values.split_whitespace()).find(|(n, _)| *n == "RcvbufErrors").and_then(|(_, v)| v.parse().ok()).unwrap_or(0)
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
@@ -118,6 +130,7 @@ pub fn run(t: Tool) -> anyhow::Result<()> {
         Tool::UdpSink { bind, count, quiet_ms, delays } => {
             let s = UdpSocket::bind(bind)?;
             s.set_read_timeout(Some(Duration::from_millis(quiet_ms.max(1))))?;
+            let dropped_before = rcvbuf_errors();
             let mut seen = vec![false; usize::try_from(count).unwrap_or(0)];
             let mut out = Sunk::default();
             let mut top: Option<u64> = None;
@@ -149,6 +162,7 @@ pub fn run(t: Tool) -> anyhow::Result<()> {
                     Err(e) => return Err(e.into()),
                 }
             }
+            out.rcvbuf_errors = rcvbuf_errors().saturating_sub(dropped_before);
             out.missing = seen.iter().enumerate().filter(|(_, s)| !**s).map(|(i, _)| i as u64).collect();
             println!("{}", serde_json::to_string(&out)?);
         }

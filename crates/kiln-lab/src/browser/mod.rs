@@ -48,6 +48,9 @@ pub enum Cmd {
         /// The lab's web driver (its `node_modules` installed).
         #[arg(long)]
         web: Option<PathBuf>,
+        /// The browsers the lab will run, each required to start (Firefox is checked either way).
+        #[arg(long, default_value = "chromium,webkit")]
+        browsers: String,
     },
     /// The network profiles, and for one condition the commands that make it.
     Profiles {
@@ -203,7 +206,7 @@ pub fn run(cmd: Cmd) -> anyhow::Result<()> {
             }
             Ok(())
         }
-        Cmd::Probe { web: w } => probe_cmd(&web(w)),
+        Cmd::Probe { web: w, browsers } => probe_cmd(&web(w), &list(&browsers)),
         Cmd::Plan { k, targets: t, browsers, cases, background_s, budget_h } => {
             let ts = target_list(&t)?;
             let p = plan::plan(k, &ts, &list(&browsers), &list(&cases), background_s, budget_h);
@@ -272,7 +275,7 @@ pub fn run(cmd: Cmd) -> anyhow::Result<()> {
 }
 
 #[cfg(target_os = "linux")]
-fn probe_cmd(web: &std::path::Path) -> anyhow::Result<()> {
+fn probe_cmd(web: &std::path::Path, browsers: &[String]) -> anyhow::Result<()> {
     if !topo::inside() {
         let checks = probe::outside();
         let (table, missing) = probe::say(&checks);
@@ -282,7 +285,7 @@ fn probe_cmd(web: &std::path::Path) -> anyhow::Result<()> {
         }
         return topo::reenter(&again());
     }
-    let checks = probe::inside(web);
+    let checks = probe::inside(web, browsers);
     let (table, missing) = probe::say(&checks);
     print!("{table}");
     if let Some(m) = missing {
@@ -293,7 +296,7 @@ fn probe_cmd(web: &std::path::Path) -> anyhow::Result<()> {
 }
 
 #[cfg(not(target_os = "linux"))]
-fn probe_cmd(_web: &std::path::Path) -> anyhow::Result<()> {
+fn probe_cmd(_web: &std::path::Path, _browsers: &[String]) -> anyhow::Result<()> {
     let (table, _) = probe::say(&probe::outside());
     print!("{table}");
     refuse()
