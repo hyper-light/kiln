@@ -2604,7 +2604,7 @@ pub async fn held_stacks(store: &crate::store::Store) -> HashMap<String, Held> {
 /// round of the driver later. With the stacks held (`CHANGING`), so a read from before a change
 /// can't put back what it let go.
 async fn say_held(hub: &Hub) {
-    hub.harness.set_held(hub, &held_stacks(&hub.store).await);
+    hub.harness.set_held(hub, &held_stacks(&hub.store).await).await;
 }
 
 async fn paused_for_usage(store: &crate::store::Store) -> Vec<String> {
@@ -4690,7 +4690,7 @@ mod stack_tests {
             assert_eq!(s.held_for.as_deref(), Some("pl_1"));
             assert_eq!(held().and_then(|h| h.plan).as_deref(), Some("pl_1"));
             // As each tick of the driver says it, the same.
-            hub.harness.set_held(&hub, &held_stacks(&hub.store).await);
+            hub.harness.set_held(&hub, &held_stacks(&hub.store).await).await;
             assert_eq!(held().and_then(|h| h.plan).as_deref(), Some("pl_1"));
             Ok(())
         })
@@ -5272,7 +5272,7 @@ mod stack_tests {
         let port = RegistryPort { hub: Arc::clone(&hub), sent: parking_lot::Mutex::new(Vec::new()) };
         let there = Location::Machine("box".into());
         let info = Info { id: id.into(), kind: "claude".into(), status: Status::Running, epoch: 1, ..Info::default() };
-        hub.harness.ingest(&hub, &there, id, Update::Open { info: Box::new(info.clone()), since: None });
+        hub.harness.ingest(&hub, &there, id, Update::Open { info: Box::new(info.clone()), since: None }).await;
         let state = |items: &[(&str, &str)], given: &[(&str, &str)]| Update::State {
             state: Box::new(State {
                 status: Status::Running,
@@ -5282,13 +5282,13 @@ mod stack_tests {
                 ..State::default()
             }),
         };
-        hub.harness.ingest(&hub, &there, id, state(&[], &[]));
+        hub.harness.ingest(&hub, &there, id, state(&[], &[])).await;
         let now = 1_000_000;
         // The stack's word goes, and waits behind the agent's turn; the driver looks and sees it.
         let (went, word) = say(&port, id, Some("g1"), send("/goal tests pass".into()), now).await;
         let word = word.ok_or_else(|| anyhow::anyhow!("no word"))?;
         anyhow::ensure!(went == Sent::Delivered);
-        hub.harness.ingest(&hub, &there, id, state(&[(word.as_str(), "/goal tests pass")], &[]));
+        hub.harness.ingest(&hub, &there, id, state(&[(word.as_str(), "/goal tests pass")], &[])).await;
         resay(&port, now + 1_500).await;
         // The goal reworded: an edit of the word waiting. Applied there, and the turn ends: the
         // harness is handed the word, edited.
@@ -5299,19 +5299,19 @@ mod stack_tests {
         let handed: &[(&str, &str)] = if given { &handed_now } else { &[] };
         match then {
             Then::Says | Then::Reconnects => {
-                hub.harness.ingest(&hub, &there, id, Update::Events { events: vec![user.clone()] });
-                hub.harness.ingest(&hub, &there, id, state(&[], handed));
+                hub.harness.ingest(&hub, &there, id, Update::Events { events: vec![user.clone()] }).await;
+                hub.harness.ingest(&hub, &there, id, state(&[], handed)).await;
                 if then == Then::Reconnects {
-                    hub.harness.ingest(&hub, &there, id, Update::Open { info: Box::new(info.clone()), since: Some(1) });
-                    hub.harness.ingest(&hub, &there, id, state(&[], handed));
+                    hub.harness.ingest(&hub, &there, id, Update::Open { info: Box::new(info.clone()), since: Some(1) }).await;
+                    hub.harness.ingest(&hub, &there, id, state(&[], handed)).await;
                 }
                 resay(&port, now + 3_000).await;
             }
             Then::ResumesStateFirst => {
-                hub.harness.ingest(&hub, &there, id, Update::Open { info: Box::new(info.clone()), since: Some(0) });
-                hub.harness.ingest(&hub, &there, id, state(&[], handed));
+                hub.harness.ingest(&hub, &there, id, Update::Open { info: Box::new(info.clone()), since: Some(0) }).await;
+                hub.harness.ingest(&hub, &there, id, state(&[], handed)).await;
                 resay(&port, now + 3_000).await;
-                hub.harness.ingest(&hub, &there, id, Update::Events { events: vec![user] });
+                hub.harness.ingest(&hub, &there, id, Update::Events { events: vec![user] }).await;
                 resay(&port, now + 4_500).await;
             }
         }

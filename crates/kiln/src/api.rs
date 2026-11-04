@@ -5915,7 +5915,10 @@ fn harness_ws(hub: Arc<Hub>, id: String, req: Request) -> R {
 /// Send a viewer a snapshot: its frames then `synced`, a message each; or, `packed`, all of it in
 /// one gzip'd binary message, a frame a line (frames are JSON, whose strings escape their line
 /// breaks). Written out on the blocking pool: a long session's is megabytes of JSON, and the
-/// runtime's threads serve every socket (`crate::harness::registry::Snapshot`).
+/// runtime's threads serve every socket (`crate::harness::registry::Snapshot`). Not on the compute
+/// pool, below the shards: there a snapshot took 2.4 times as long with a busy process beside the
+/// server for each of its CPUs, and the frames its viewer waits on with it 4.7 times (goal 4's lab,
+/// plan 01a1a59c2a9c step 5).
 async fn send_snapshot(tx: &mut ws::Sender, snapshot: crate::harness::registry::Snapshot, packed: bool) -> anyhow::Result<()> {
     if packed {
         let bytes = crate::rt::blocking(move || snapshot.packed(&synced())).await??;
@@ -6234,7 +6237,7 @@ async fn harness_attach(hub: Arc<Hub>, id: String, socket: ws::WebSocket, takes:
             let began = Instant::now();
             // What it missed since what it has (it begins with "resumed"), or all of it when the copy
             // can't tell (it begins with "open"); and the feed from where that is.
-            let Some((snapshot, from, now, rev)) = hub.harness.frames_since(&id, have) else {
+            let Some((snapshot, from, now, rev)) = hub.harness.frames_since(&id, &viewer, have) else {
                 tx.send(closed()).await?;
                 return Ok(());
             };
@@ -6487,11 +6490,11 @@ mod tests {
             let hub = crate::hub::tests::scratch_hub().await?;
             let there = crate::harness::registry::Location::Machine("box".into());
             let info = crate::harness::session::Info { id: "s".into(), kind: "claude".into(), ..crate::harness::session::Info::default() };
-            hub.harness.ingest(&hub, &there, "s", Update::Open { info: Box::new(info), since: None });
-            hub.harness.ingest(&hub, &there, "s", Update::State { state: Box::new(State::default()) });
+            hub.harness.ingest(&hub, &there, "s", Update::Open { info: Box::new(info), since: None }).await;
+            hub.harness.ingest(&hub, &there, "s", Update::State { state: Box::new(State::default()) }).await;
             let long = format!("{}\nsecond line", "word ".repeat(4000));
             let said = |n: u64, text: &str| Event { id: format!("e{n}"), seq: n, at: 1, parent: None, by: None, body: Body::Assistant { text: text.into(), streaming: false } };
-            hub.harness.ingest(&hub, &there, "s", Update::Events { events: vec![said(1, &long), said(2, "short")] });
+            hub.harness.ingest(&hub, &there, "s", Update::Events { events: vec![said(1, &long), said(2, "short")] }).await;
             let att = hub.harness.attach("s").ok_or_else(|| anyhow::anyhow!("no session"))?;
             let frames = att.frames();
             let packed = att.snapshot.packed(&synced())?;

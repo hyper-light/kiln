@@ -406,6 +406,64 @@ B alone at the old sizes (4, 2, 8), four rounds calm and four with 16 hogs, from
 - **The server's RSS is 16% higher** (977 to 1132 MB calm, 989 to 1149 with hogs): goal 3's, not the
   share sizes' (26 against 8 places: 1146 against 1130 MB).
 
+## Goal 4: each agent session's copy on a shard of its own
+
+Goal 4 of the API runtime program (plan `01a1a59c2a9c`, research `01a1a59c2a9d71a2878c4d9beae87c30`)
+took the server's copies of agent sessions from under one lock: each copy has an owner shard
+(`crate::harness::copies`) that alone changes it, as messages come to it, and publishes an immutable
+view of it that every reader loads without waiting (docs/bus.md).
+
+### The A/B against main
+
+On the baseline's machine and its efficient cores (`taskset -c 16-31`; the server sized itself to 4
+shards), the `realistic` profile, eight rounds of each, interleaved, on 2026-11-04. A: main at
+`01aba3ff882`. B: goal 4 at `7cda56472b8`, which wrote a viewer's snapshot and catch-up on the
+compute pool, in pieces, and the agents list there too. The machine was busy with other work (load
+26 to 38 before each window).
+
+Calm (15:05 to 15:29 UTC), 1 of 43 numbers differs beyond noise:
+
+| number | A | B | difference | verdict |
+| --- | --- | --- | --- | --- |
+| server RSS MB | 1086 | 1175 | +8.2% | worse |
+| (within noise) websocket p99 ms | 872 | 915 | +4.9% | same |
+| (within noise) server: websocket waited p99 ms | 861 | 902 | +4.8% | same |
+| (within noise) server: runner waited p99 ms | 192 | 201 | +4.8% | same |
+| (within noise) server: runner took p99 ms | 0.240 | 0.237 | -1.4% | same |
+| (within noise) attach p50 ms | 1074 | 1092 | +1.7% | same |
+
+With 16 CPU hogs in the lab's own cgroup (15:47 to 16:09 UTC), 13 of 43 differ beyond noise, among
+them:
+
+| number | A | B | difference | verdict |
+| --- | --- | --- | --- | --- |
+| attach p50 ms | 1550 | 3745 | +141.6% | worse |
+| attach most ms | 2432 | 9415 | +287.1% | worse |
+| websocket p99 ms | 1514 | 6701 | +342.7% | worse |
+| server: websocket waited p99 ms | 1811 | 8607 | +375.4% | worse |
+| api_read p50 ms | 1.20 | 2.02 | +69.0% | worse |
+| server: runner waited p99 ms | 110 | 199 | +81.6% | worse |
+| server RSS MB | 1064 | 1158 | +8.8% | worse |
+| (within noise) server: runner took p99 ms | 0.676 | 0.430 | -36.4% | same |
+
+### What it says
+
+- **The snapshots' move to the compute pool cost the most.** The pool's threads run below the shards
+  (SCHED_BATCH at nice 10), so beside busy processes at the server's own priority in its cgroup a
+  snapshot got a small share of a CPU: attaches took 2.4 times as long at the median, and the frames
+  their viewers waited on with them 4.7 times at p99. Snapshots, catch-ups and the agents list are
+  written where main writes them again (`88f421838fb`: the blocking pool, and the shard that asked).
+- **One owner shard per session moves neither of the baseline's two tails: neither is the lock's.**
+  The live feed's p99 wait is each viewer's own snapshot: a viewer takes its place on the feed, then
+  writes its whole snapshot before it reads a frame, so what's published meanwhile waits for it; that
+  wait rises with the attach time in every condition measured (above and in main's baseline). Runner
+  messages wait for the hub's loop, not for a lock: applying one took 0.24 ms at p99 on both builds,
+  the old lock included; the loop is kept off its shard, the HTTP listener's, by that shard's other
+  work.
+- **Not measured yet: production's layout.** There the server runs at `CPUWeight=1000` and legs and
+  agents at `cpu.weight` 1 (docs/priority.md), so its compute pool competes with kiln's own shards
+  alone. Which pool should write snapshots there, and the tails against main, wait for that A/B.
+
 ## Goal 6: shards that protect themselves
 
 Goal 6 of the API runtime program (plan `01a1a59c2abe`, research `01a1a59c2abf76c79f9f50edffd98867`):
