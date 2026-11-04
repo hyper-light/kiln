@@ -76,6 +76,14 @@ impl Profile {
         }
     }
 
+    /// The realistic profile with no think time for its people and readers: each viewer opens the next
+    /// conversation as soon as the last one is open, each reader asks again as soon as it is answered, a closed
+    /// loop at the most its clients can ask. A server of one shard falls behind it on purpose (goal 6, plan
+    /// 01a1a59c2abe step 4: what it sheds, by class, and what it still serves).
+    pub fn overload() -> Self {
+        Self { dwell_s: 0, read_think_ms: 0, ..Self::realistic() }
+    }
+
     /// A small one, to try the lab out (and for its own test).
     pub fn small() -> Self {
         Self {
@@ -569,7 +577,7 @@ pub fn stand_in(dir: &Path) -> anyhow::Result<PathBuf> {
 
 /// The session ids and their status, from the server's list.
 fn statuses(http: &mut Http) -> anyhow::Result<BTreeMap<String, String>> {
-    let a = http.send("GET", "/api/harness/sessions", None)?;
+    let a = http.send_settled("GET", "/api/harness/sessions", None)?;
     let v: Value = serde_json::from_slice(&a.body)?;
     let list = v.as_array().cloned().or_else(|| v.get("sessions").and_then(Value::as_array).cloned()).unwrap_or_default();
     Ok(list.iter().filter_map(|i| Some((i.get("id")?.as_str()?.to_owned(), i.get("status")?.as_str()?.to_owned()))).collect())
@@ -620,7 +628,7 @@ pub fn round(build: &Build, p: &Profile, hogs: usize, dir: &Path, bin: &Path, in
             if filled_ids.contains(id) || st.get(id).is_none_or(|s| s != "idle") {
                 continue;
             }
-            let newest = http.send("GET", &format!("/api/harness/sessions/{id}/events?limit=1"), None)?;
+            let newest = http.send_settled("GET", &format!("/api/harness/sessions/{id}/events?limit=1"), None)?;
             let seq = serde_json::from_slice::<Value>(&newest.body).ok().and_then(|v| v.pointer("/events/0/seq").and_then(Value::as_u64));
             if newest.status != 200 || seq.is_none_or(|s| s >= *n) {
                 filled_ids.insert(id.clone());
@@ -637,7 +645,7 @@ pub fn round(build: &Build, p: &Profile, hogs: usize, dir: &Path, bin: &Path, in
 
     // The MCP tools agents call, where this build has them.
     let tools: Vec<String> = {
-        let a = http.send("POST", "/api/mcp", Some(json!({"jsonrpc": "2.0", "id": 1, "method": "tools/list", "params": {}}).to_string().as_bytes()))?;
+        let a = http.send_settled("POST", "/api/mcp", Some(json!({"jsonrpc": "2.0", "id": 1, "method": "tools/list", "params": {}}).to_string().as_bytes()))?;
         let v: Value = serde_json::from_slice(&a.body).unwrap_or_default();
         let have: HashSet<String> = v.pointer("/result/tools").and_then(Value::as_array).map(|t| t.iter().filter_map(|t| t.get("name")?.as_str().map(str::to_owned)).collect()).unwrap_or_default();
         ["agents_list", "runners"].iter().filter(|t| have.contains(**t)).map(|t| (*t).to_owned()).collect()
@@ -726,6 +734,9 @@ fn numbers(seen: &BTreeMap<Class, measure::Seen>, before: &Scrape, after: &Scrap
         }
         #[allow(clippy::cast_precision_loss)]
         n.insert(format!("{name}.per_s"), s.n as f64 / secs.max(1e-9));
+        // What failed (a status of 400 or more, or no answer): an overloaded server's sheds among them.
+        #[allow(clippy::cast_precision_loss)]
+        n.insert(format!("{name}.errors"), s.errors as f64);
         if *c != Class::Websocket {
             requests += s.n;
         }
@@ -749,6 +760,12 @@ fn numbers(seen: &BTreeMap<Class, measure::Seen>, before: &Scrape, after: &Scrap
             if let Some(v) = measure::histogram_quantile(0.99, &d) {
                 n.insert(format!("server.{class}.{key}_p99_ms"), v * 1000.0);
             }
+        }
+    }
+    // The requests the server shed, by class (`kiln_shed_total`, goal 6), where the build counts them.
+    for class in ["background", "normal"] {
+        if let Some(v) = diff("kiln_shed_total", &[("class", class)]) {
+            n.insert(format!("server.shed.{class}"), v);
         }
     }
     (n, shards)

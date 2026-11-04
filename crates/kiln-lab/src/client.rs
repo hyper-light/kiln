@@ -73,6 +73,21 @@ impl Http {
         }
     }
 
+    /// [`Http::send`], asked again a second later while the server answers 503 (a kiln overloaded on purpose
+    /// shedding it: goal 6, `crate::overload`, whose answers ask a second at least), for up to [`PATIENCE`]: what
+    /// sets a round up must be answered, where the window's own requests are measured as they come, a shed one an
+    /// error.
+    pub fn send_settled(&mut self, method: &str, path: &str, body: Option<&[u8]>) -> anyhow::Result<Answer> {
+        let until = std::time::Instant::now() + PATIENCE;
+        loop {
+            let a = self.send(method, path, body)?;
+            if a.status != 503 || std::time::Instant::now() >= until {
+                return Ok(a);
+            }
+            std::thread::sleep(Duration::from_secs(1));
+        }
+    }
+
     fn once(&mut self, head: &str, body: Option<&[u8]>) -> anyhow::Result<Answer> {
         self.open()?;
         let Http { conn, buf, .. } = self;

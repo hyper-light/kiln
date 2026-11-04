@@ -20,7 +20,7 @@
 
 use std::cell::Cell;
 use std::sync::OnceLock;
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicU32, AtomicU64, Ordering};
 use std::thread::Thread;
 
 use crate::mem::Encoded;
@@ -108,6 +108,23 @@ pub struct Entry {
     pub(crate) abandoned_summary: Box<[AtomicU64]>,
     /// Set with a mark; the shard sweeps the marks when it takes this.
     pub(crate) abandons_marked: AtomicBool,
+    /// Which poll the shard runs and its task, written as each poll begins and ends, for the watchdog
+    /// (`crate::watch`, kiln's goal 6).
+    pub(crate) watch: crate::watch::Watch,
+    /// What the watchdog found of the shard: whether a poll holds it past its limit now, its stalls, the latest
+    /// report (`crate::watch`).
+    pub(crate) board: crate::watch::Board,
+    /// Spawns submitted as movable (`crate::runtime::submit_movable`), waiting for the shard as control messages
+    /// wait, any thread pushing and the shard taking, and the watchdog taking those that wait for a held shard to
+    /// hand them to another (`crate::watch`). A queue of their own, so a spawn addressed to this shard, a
+    /// cancellation and a stop never move.
+    movable: Queue<Box<crate::task::SpawnRequest>>,
+    /// Where each task slot's task was spawned (`#[track_caller]`), written by the shard as it admits the task and
+    /// read by the watchdog for the task that holds a stalled shard: each a `&'static Location`, or null.
+    spawned_at: Box<[AtomicPtr<std::panic::Location<'static>>]>,
+    /// The shard thread's id in the kernel (Linux: its `gettid`), recorded as it starts, for the watchdog to read
+    /// its state (`/proc/self/task/<tid>/stat`): zero until then and on other platforms.
+    os_thread: AtomicU64,
 }
 
 impl Entry {
@@ -117,9 +134,34 @@ impl Entry {
     }
 
     /// Closes the control queue and drops what it holds: the shard's, at its exit, its driver's loss and
-    /// its drop.
+    /// its drop. The movable spawns' queue closes with it.
     pub(crate) fn close_control(&self) {
         self.control.close();
+        self.movable.close();
+    }
+
+    /// The next movable spawn while its queue is open: the shard's drain, and the watchdog's for a held shard.
+    pub(crate) fn take_movable(&self) -> Option<Box<crate::task::SpawnRequest>> {
+        self.movable.take()
+    }
+
+    /// Records where the task now in `slot` was spawned (the shard, as it admits it).
+    pub(crate) fn note_spawned_at(&self, slot: u32, at: &'static std::panic::Location<'static>) {
+        if let Some(place) = usize::try_from(slot)
+            .ok()
+            .and_then(|slot| self.spawned_at.get(slot))
+        {
+            place.store(std::ptr::from_ref(at).cast_mut(), Ordering::Release);
+        }
+    }
+
+    /// Where the task in `slot` was spawned, as its admission recorded it.
+    pub(crate) fn spawned_at(&self, slot: u32) -> Option<&'static std::panic::Location<'static>> {
+        let at = usize::try_from(slot)
+            .ok()
+            .and_then(|slot| self.spawned_at.get(slot))?
+            .load(Ordering::Acquire);
+        location(at)
     }
 
     /// Called inside the existing parking fence protocol, after payload publication.
@@ -437,6 +479,8 @@ pub(crate) fn register_runtime_slot(
     // The queue before the slot: a refusal leaves no slot claimed, and a registration that finds no slot
     // drops it.
     let mut control = Some(Queue::new(control_bound.max(1))?);
+    // The movable spawns' queue, bounded as the control queue is: by the shard's admission limit.
+    let mut movable = Some(Queue::new(control_bound.max(1))?);
     for (index, slot) in SLOTS.iter().enumerate() {
         let free = slot.generation.load(Ordering::Acquire);
         if free & 1 == 0 {
@@ -460,7 +504,7 @@ pub(crate) fn register_runtime_slot(
             continue;
         }
         let id = u16::try_from(index).unwrap_or(u16::MAX);
-        let Some(control) = control.take() else {
+        let (Some(control), Some(movable)) = (control.take(), movable.take()) else {
             return Err(RtError::BadConfig {
                 what: "a registration's control queue taken twice",
             });
@@ -493,6 +537,13 @@ pub(crate) fn register_runtime_slot(
             abandoned: (0..waits).map(|_| AtomicU64::new(0)).collect(),
             abandoned_summary: (0..waits.div_ceil(64)).map(|_| AtomicU64::new(0)).collect(),
             abandons_marked: AtomicBool::new(false),
+            watch: crate::watch::Watch::default(),
+            board: crate::watch::Board::default(),
+            movable,
+            spawned_at: (0..wake_slots)
+                .map(|_| AtomicPtr::new(std::ptr::null_mut()))
+                .collect(),
+            os_thread: AtomicU64::new(0),
         });
         entry.kick = match kick {
             RegisterKick::Kick(kick) => kick,
@@ -621,13 +672,81 @@ pub fn with_entry<R>(shard: u16, f: impl FnOnce(&Entry) -> R) -> Option<R> {
     slot.entry.read(f, |entry| slot.free(entry))
 }
 
-/// Records the calling thread's CPU clock on shard `shard`'s entry (the shard's own thread, as it starts).
+/// Records the calling thread's CPU clock on shard `shard`'s entry (the shard's own thread, as it starts), and
+/// its id in the kernel where the watchdog reads its state by it (Linux).
 pub fn record_cpu_clock(shard: u16) {
     if let Some(handle) = crate::thread_clock::current() {
         let _ = with_entry(shard, |entry| {
             entry.cpu_clock.store(handle, Ordering::Release)
         });
     }
+    if let Some(id) = crate::thread_clock::os_thread() {
+        let _ = with_entry(shard, |entry| entry.os_thread.store(id, Ordering::Release));
+    }
+}
+
+/// Whether the shard `holder` names is runnable now (running, or waiting for a CPU) rather than waiting inside a
+/// call, as its thread's state tells where the platform tells it (Linux, macOS): what the watchdog reads of a
+/// stalled shard off the CPU (`crate::watch`). `None` where it cannot tell, and for a shard gone.
+pub(crate) fn shard_runnable(holder: SlotHolder) -> Option<bool> {
+    let (clock, os_thread) = with_holder(holder, |entry| {
+        (
+            entry.cpu_clock.load(Ordering::Acquire),
+            entry.os_thread.load(Ordering::Acquire),
+        )
+    })?;
+    crate::thread_clock::runnable(clock, os_thread)
+}
+
+/// Queues a movable spawn on the shard `holder` names and kicks it (`crate::runtime::submit_movable`, the
+/// watchdog's moves); the request back when the shard is gone, stopping, or its queue full.
+pub(crate) fn push_movable(
+    holder: SlotHolder,
+    request: Box<crate::task::SpawnRequest>,
+) -> Result<(), Box<crate::task::SpawnRequest>> {
+    let mut request = Some(request);
+    let pushed = with_holder(holder, |entry| match request.take() {
+        Some(request) => push_movable_onto(entry, request),
+        None => Ok(()),
+    });
+    match (pushed, request) {
+        (Some(result), _) => result,
+        (None, Some(request)) => Err(request),
+        (None, None) => Ok(()),
+    }
+}
+
+/// The push itself, on a pinned entry (see [`push_movable`]).
+fn push_movable_onto(
+    entry: &Entry,
+    request: Box<crate::task::SpawnRequest>,
+) -> Result<(), Box<crate::task::SpawnRequest>> {
+    if !entry.accepting.load(Ordering::Acquire)
+        || entry.stop.load(Ordering::Acquire)
+        || entry.exited.load(Ordering::Acquire)
+    {
+        return Err(request);
+    }
+    match entry.movable.push(request) {
+        Pushed::Queued => {
+            entry.control_pending.publish();
+            entry.kick_parked();
+            Ok(())
+        }
+        Pushed::Full(request) | Pushed::Closed(request) => Err(request),
+        // Taken as one queued before a close is: the shard ran it, or its drop answered its receipt.
+        Pushed::Dropped => Ok(()),
+    }
+}
+
+/// A spawn site as a slot recorded it: the `&'static Location` a pointer names, or `None` for null.
+pub(crate) fn location(
+    at: *mut std::panic::Location<'static>,
+) -> Option<&'static std::panic::Location<'static>> {
+    // SAFETY: every pointer the slots and the watchdog's board hold is null or was made from a
+    // `&'static Location<'static>` (`Location::caller`, `note_spawned_at`, `watch::Board::write`): a value the
+    // compiler places in the binary, valid and unchanged for the program's life, and never written through.
+    unsafe { at.cast_const().as_ref() }
 }
 
 /// The CPU clock of the shard `holder` names: `None` when that registration no longer holds its slot, its thread
