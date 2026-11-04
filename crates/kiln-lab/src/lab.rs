@@ -299,6 +299,13 @@ fn nap(s: &Shared, d: Duration) -> bool {
     !s.stop.load(Ordering::Relaxed)
 }
 
+/// How long a worker waits before its next request: its think time, or longer where its last answer said to come
+/// back later (`Retry-After`): a shed request's client waits that out before asking again, as kiln's own do
+/// (`crate::http::client` in kiln; goal 6, plan 01a1a59c2abe step 4), rather than asking again at once.
+fn pause(think: Duration, retry_after: Option<Duration>) -> Duration {
+    retry_after.map_or(think, |r| r.max(think))
+}
+
 fn timed(class: Class, f: impl FnOnce() -> anyhow::Result<u16>) -> Sample {
     let at_us = now_us();
     let t = Instant::now();
@@ -400,8 +407,14 @@ fn driver(s: &Shared, id: &str, p: &Profile, i: usize) -> Vec<Sample> {
     while !s.stop.load(Ordering::Relaxed) {
         let n = s.next.fetch_add(1, Ordering::Relaxed);
         let body = json!({"type": "send", "id": format!("lab-{n}"), "text": format!("lab:turn:{}:{}", p.turn_events, p.turn_every_ms)}).to_string();
-        out.push(timed(Class::ApiWrite, || http.send("POST", &path, Some(body.as_bytes())).map(|a| a.status)));
-        if !nap(s, turn + jitter(&mut r, Duration::from_millis(p.turn_think_ms))) {
+        let mut retry_after = None;
+        out.push(timed(Class::ApiWrite, || {
+            http.send("POST", &path, Some(body.as_bytes())).map(|a| {
+                retry_after = a.retry_after;
+                a.status
+            })
+        }));
+        if !nap(s, pause(turn + jitter(&mut r, Duration::from_millis(p.turn_think_ms)), retry_after)) {
             break;
         }
     }
@@ -426,8 +439,14 @@ fn reader(s: &Shared, p: &Profile, i: usize) -> Vec<Sample> {
             18 => format!("/api/plans?session={id}"),
             _ => format!("/api/harness/sessions/{id}/goals"),
         };
-        out.push(timed(Class::ApiRead, || http.send("GET", &path, None).map(|a| a.status)));
-        if !nap(s, jitter(&mut r, Duration::from_millis(p.read_think_ms))) {
+        let mut retry_after = None;
+        out.push(timed(Class::ApiRead, || {
+            http.send("GET", &path, None).map(|a| {
+                retry_after = a.retry_after;
+                a.status
+            })
+        }));
+        if !nap(s, pause(jitter(&mut r, Duration::from_millis(p.read_think_ms)), retry_after)) {
             break;
         }
     }
@@ -447,8 +466,14 @@ fn mcp(s: &Shared, p: &Profile, i: usize, tools: &[String]) -> Vec<Sample> {
             None => json!({"jsonrpc": "2.0", "id": n, "method": "tools/list", "params": {}}),
         }
         .to_string();
-        out.push(timed(Class::ApiWrite, || http.send("POST", "/api/mcp", Some(body.as_bytes())).map(|a| a.status)));
-        if !nap(s, jitter(&mut r, Duration::from_millis(p.mcp_think_ms))) {
+        let mut retry_after = None;
+        out.push(timed(Class::ApiWrite, || {
+            http.send("POST", "/api/mcp", Some(body.as_bytes())).map(|a| {
+                retry_after = a.retry_after;
+                a.status
+            })
+        }));
+        if !nap(s, pause(jitter(&mut r, Duration::from_millis(p.mcp_think_ms)), retry_after)) {
             break;
         }
     }
@@ -866,6 +891,16 @@ mod tests {
         assert_eq!(cpus_in("0-3,8,10-11"), vec![0, 1, 2, 3, 8, 10, 11]);
         assert_eq!(cpus_in("16-31").len(), 16);
         assert!(cpus_in("").is_empty());
+    }
+
+    /// Goal 6, plan 01a1a59c2abe step 4: a worker waits out a shed answer's `Retry-After` before asking again,
+    /// and its own think time when that is longer.
+    #[test]
+    fn g6_s4_a_worker_waits_out_a_sheds_retry_after() {
+        let (s, ms) = (Duration::from_secs, Duration::from_millis);
+        assert_eq!(pause(ms(50), None), ms(50), "no Retry-After: its think time");
+        assert_eq!(pause(Duration::ZERO, Some(s(2))), s(2), "no think time: the Retry-After");
+        assert_eq!(pause(s(3), Some(s(1))), s(3), "its think time when longer");
     }
 
     #[test]

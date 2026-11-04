@@ -80,6 +80,35 @@ pub fn blocking_job(share: &'static str, waited_ns: u64, ran_ns: u64) {
     }
 }
 
+/// What the overload detector reads of one pool (goal 6, plan 01a1a59c2abe step 4; `crate::overload`): the waits
+/// told so far, and whether any of its jobs waits now. The waits are the histograms' own count and sum; whether
+/// one waits is kiln-rt's count of the jobs a pool holds against its places (`hyper_rt::compute::occupancy`,
+/// `hyper_rt::blocking::occupancy`), since a wait is told only once its job starts (the compute pool) or ends
+/// (the blocking pool's shares).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Queue {
+    /// Jobs whose wait has been told, and their waits' sum in microseconds.
+    pub waits: u64,
+    pub waited_us: u64,
+    /// Whether a job waits for a place now.
+    pub waiting: bool,
+}
+
+/// The pools [`queues`] reads, by name, in its order: the compute pool, then the blocking pool's shares.
+pub const QUEUES: [&str; 1 + SHARES.len()] = ["compute", SHARES[0], SHARES[1], SHARES[2]];
+
+/// Each pool of [`QUEUES`] as it stands: lock-free reads of atomics the pools' threads write as they go.
+pub fn queues() -> [Queue; QUEUES.len()] {
+    let p = pools();
+    let waiting = |o: Option<hyper_rt::blocking::Occupancy>| o.is_some_and(|o| o.waiting() > 0);
+    let compute = Queue { waits: p.compute_wait.count(), waited_us: p.compute_wait.sum_us(), waiting: waiting(hyper_rt::compute::occupancy()) };
+    let mut out = [compute; QUEUES.len()];
+    for ((slot, share), wait) in out.iter_mut().skip(1).zip(SHARES).zip(&p.blocking_wait) {
+        *slot = Queue { waits: wait.count(), waited_us: wait.sum_us(), waiting: waiting(hyper_rt::blocking::occupancy(share)) };
+    }
+    out
+}
+
 /// The `kiln_compute_*` and `kiln_blocking_*` families, in the exposition.
 pub fn render(o: &mut String) {
     let help = |o: &mut String, name: &str, kind: &str, h: &str| {
