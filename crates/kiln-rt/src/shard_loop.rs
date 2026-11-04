@@ -1878,6 +1878,7 @@ impl Shard {
         self.desk.now_ns.set(start);
         // Each poll starts within its share (`crate::coop`).
         self.desk.coop_spent.set(false);
+        self.desk.coop_charged.set(false);
         // Which poll runs, and its task, for the watchdog (`crate::watch`).
         if let Some(entry) = self.desk.entry {
             entry.watch.begin(word.word());

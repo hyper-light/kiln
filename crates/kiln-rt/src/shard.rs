@@ -375,6 +375,10 @@ pub struct ShardContext {
     /// ([`crate::coop`]): every leaf it polls answers `Pending` until its poll ends. The loop clears it as each
     /// poll begins.
     pub(crate) coop_spent: Cell<bool>,
+    /// Whether the task being polled has made a charge under its own waker this poll ([`crate::coop`]): its first
+    /// goes on whatever its time, so each poll makes at least one operation. The loop clears it as each poll
+    /// begins.
+    pub(crate) coop_charged: Cell<bool>,
     // The second: the run queue, and the counters a poll counts (`LiveCounters` leads with them).
     /// The local run queue.
     pub(crate) local: LocalQueue,
@@ -516,6 +520,7 @@ impl ShardContext {
             current: Cell::new(NO_TASK),
             accepting: Cell::new(true),
             coop_spent: Cell::new(false),
+            coop_charged: Cell::new(false),
             now_ns: Cell::new(0),
             activity_ns: Cell::new(None),
             activity_noted: Cell::new(false),
@@ -664,15 +669,23 @@ impl ShardContext {
     /// has held the shard past its share (the quantum) since its poll began or the shard last let it go on,
     /// while anything else wants the shard: it then yields at this await, and every later charge of its poll
     /// answers no. Past its share with nothing wanting the shard, it is let go on, as `wanted`'s no lets it,
-    /// and its hold counts from here. Yes between polls, off a task, and on a simulated shard.
-    pub(crate) fn charge(&self) -> bool {
+    /// and its hold counts from here. Yes between polls, off a task, and on a simulated shard. `own`: the leaf
+    /// is polled under the task's own waker; under another the charge counts, but is never refused. Nor is a
+    /// poll's first charge under its own waker: each poll makes at least one operation.
+    pub(crate) fn charge(&self, own: bool) -> bool {
         if self.current.get() == NO_TASK || self.is_sim {
             return true;
         }
-        if self.coop_spent.get() {
-            return false;
-        }
         crate::shard_loop::count(&self.live.coop_charges, 1);
+        // A poll's first operation goes on whatever the time: a poll whose own work before it outlasted the share
+        // would otherwise redo that work at every poll and get no further (as futures' `read_to_end`, which zeroes
+        // its buffer's spare room again each poll, did in kiln's proxy test, spinning its shard).
+        if own && !self.coop_charged.replace(true) {
+            return true;
+        }
+        if self.coop_spent.get() {
+            return !own;
+        }
         let untimed = self.wanted_untimed();
         let due = self.due_ns.get();
         // Nothing could want the shard: no time is needed to say go on.
@@ -688,7 +701,7 @@ impl ShardContext {
         if untimed || now >= due {
             self.coop_spent.set(true);
             crate::shard_loop::count(&self.live.coop_yields, 1);
-            return false;
+            return !own;
         }
         self.checked_ns.set(now);
         true

@@ -268,8 +268,7 @@ fn g6_s1_a_long_computation_yields_through_consume_budget() {
 /// Only the task's own waker is refused. Past its share, with a competitor's timer due, a charge under another
 /// waker (an executor nested in the task's poll, as `futures::executor::block_on` is, or a `now_or_never`) goes
 /// on at its first poll, where a refusal would only be polled again at once for as long as the task's poll
-/// lasted (a nested `block_on` spun a shard of kiln's tests so); the time still counts, and the task yields at
-/// its next charge under its own waker.
+/// lasted; the time still counts, and the task yields at its own waker's charges past the poll's first.
 #[test]
 fn g6_s1_a_charge_under_another_waker_goes_on_and_the_task_yields_at_its_own() {
     let mut rt = LocalRuntime::new(&config()).unwrap();
@@ -294,6 +293,8 @@ fn g6_s1_a_charge_under_another_waker_goes_on_and_the_task_yields_at_its_own() {
             }
             let spent = hyper_rt::coop::spent();
             let polls = hyper_rt::futures::shard_counters().unwrap().polls;
+            // The poll's first charge under its own waker goes on (each poll makes one operation); the next yields.
+            consume_budget().await;
             consume_budget().await;
             let yielded = hyper_rt::futures::shard_counters().unwrap().polls != polls;
             done.store(true, Ordering::Release);
@@ -303,6 +304,42 @@ fn g6_s1_a_charge_under_another_waker_goes_on_and_the_task_yields_at_its_own() {
     assert_eq!(nested_polls, 0, "ready at its first poll under another waker");
     assert!(spent, "the time counted: the task has used its share");
     assert!(yielded, "the task yielded at its next charge under its own waker");
+}
+
+/// Each poll makes at least one operation. A task whose every poll does twice its share of its own work before
+/// its first leaf, and does it again when that leaf answers `Pending` (as futures' `read_to_end` zeroes its
+/// buffer's spare room again at every poll), beside a competitor whose timer is due by then: its first charge
+/// of each poll goes on, so each step takes one poll. Refused there, it redid the work at every poll and got no
+/// further, spinning its shard (kiln's proxy test did, beside the rest of kiln's tests).
+#[test]
+fn g6_s1_each_poll_makes_at_least_one_operation() {
+    const STEPS: u32 = 8;
+    let mut rt = LocalRuntime::new(&config()).unwrap();
+    let seen = Arc::new(Seen::default());
+    let seen_in = Arc::clone(&seen);
+    let polls = rt
+        .block_on(async move {
+            let done = Arc::new(AtomicBool::new(false));
+            spawn(compete(Arc::clone(&seen_in), Arc::clone(&done))).unwrap();
+            hyper_rt::futures::yield_now().await;
+            let mut polls = 0u32;
+            for _ in 0..STEPS {
+                std::future::poll_fn(|cx| {
+                    polls += 1;
+                    assert!(polls <= 4 * STEPS, "a step's work redone poll after poll: {polls} polls");
+                    work(2 * QUANTUM_NS);
+                    let mut leaf = consume_budget();
+                    Pin::new(&mut leaf).poll(cx)
+                })
+                .await;
+            }
+            done.store(true, Ordering::Release);
+            polls
+        })
+        .unwrap();
+    // Each step's first poll is its task's first charge of that poll, or the second after a step ended within
+    // the poll: at most two polls a step.
+    assert!(polls <= 2 * STEPS, "{polls} polls for {STEPS} steps");
 }
 
 /// A simulated shard keeps a step a yield (docs/runtime.md §11): its clock does not move within a poll, so a

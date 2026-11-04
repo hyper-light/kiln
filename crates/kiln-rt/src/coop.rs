@@ -31,6 +31,11 @@
 //!   long as the task's poll lasts (a nested `block_on` spun its shard so in kiln's tests), and what comes at
 //!   once (a bus that answers at once, a sleep already due) must still come at once. The task yields at its
 //!   next leaf under its own waker.
+//! - **Each poll makes at least one operation**: its first charge under its own waker goes on whatever the
+//!   time, as Tokio's budget gives each poll its 128. A poll whose own work before its first leaf outlasts the
+//!   share (futures' `read_to_end` zeroes its buffer's spare room again at every poll) would otherwise be
+//!   refused there at every poll, redoing that work and getting no further: a livelock that spun a shard of
+//!   kiln's tests.
 //!
 //! Tokio's budget counts operations, 128 a poll, and reads no clock; Seastar's task quota is a time (0.5 ms
 //! by default) that a timer ends, checked between tasks with two loads (`need_preempt`). Here the count is
@@ -66,10 +71,10 @@ pub(crate) fn proceed_in(here: &ShardContext, cx: &mut Context<'_>) -> Poll<()> 
     Poll::Pending
 }
 
-/// The charge, and whether the leaf goes on: it does within the task's share, and under a waker other than the
-/// polling task's own, which no refusal would make yield.
+/// The charge, and whether the leaf goes on: it does within the task's share, at the poll's first charge, and
+/// under a waker other than the polling task's own, which no refusal would make yield.
 fn proceeds(here: &ShardContext, cx: &Context<'_>) -> bool {
-    here.charge() || crate::waker::polling_task_in(here, cx.waker()).is_none()
+    here.charge(crate::waker::polling_task_in(here, cx.waker()).is_some())
 }
 
 /// The yield point of a long computation: one charge with no other operation (Tokio's `consume_budget`).
