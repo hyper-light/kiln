@@ -213,6 +213,45 @@ What it says:
   within noise of the lab alone; only the live feed's p99.9 (1.19 s to 1.38) and attaches' tail (1.32
   s to 1.51) were worse.
 
+**Block 5: the same lab on current main.** Block 4 measured main before kiln's own runtime
+(`crates/kiln-rt`) and its compute pool. Block 5 is the same lab on main at `82ca3c74d03`, which has
+them: block 4's five configurations, four rounds each, on 2026-11-04 from 17:51 to 18:24 UTC. Other
+agents' kiln builds (and this goal's own, on every CPU) loaded the machine throughout: a load of 20
+to 54 before each window, CPU pressure 2% calm and 22-31% with legs. The rounds:
+`docs/priority/2026-11-04/b5-*.json`.
+
+| number | calm | even weights | kiln.slice's weight | and idle groups | and an idle unit |
+| --- | --- | --- | --- | --- | --- |
+| page p50 ms | 0.152 (0.127 to 0.178) | 0.594 (0.201 to 0.678) | 0.197 (0.156 to 0.567) | 0.966 (0.776 to 1.23) | 1.07 (0.939 to 1.19) |
+| page p99 ms | 0.303 (0.250 to 0.333) | 61.2 (3.02 to 84.6) | 2.34 (1.96 to 57.3) | 2.35 (2.10 to 2.47) | 11.4 (2.05 to 71.3) |
+| page p99.9 ms | 0.649 (0.309 to 1.21) | 142 (20.8 to 226) | 3.65 (2.52 to 137) | 4.30 (3.03 to 13.5) | 23.9 (2.90 to 122) |
+| api_read p50 ms | 0.417 (0.353 to 0.514) | 1.64 (1.56 to 1.75) | 1.82 (1.67 to 1.93) | 3.16 (2.53 to 3.80) | 3.15 (2.61 to 3.85) |
+| api_read p99 ms | 66.7 (56.7 to 100) | 158 (125 to 179) | 133 (103 to 176) | 238 (209 to 272) | 237 (201 to 273) |
+| api_read p99.9 ms | 678 (305 to 775) | 1074 (563 to 2608) | 811 (708 to 1066) | 1167 (944 to 4377) | 1053 (995 to 2192) |
+| api_write p50 ms | 0.931 (0.785 to 1.05) | 1.76 (1.57 to 2.24) | 1.89 (1.54 to 1.93) | 1.94 (1.93 to 1.99) | 1.94 (1.94 to 2.00) |
+| api_write p99 ms | 415 (97.5 to 536) | 701 (366 to 1248) | 591 (514 to 668) | 921 (795 to 3386) | 742 (697 to 879) |
+| websocket p50 ms | 0.693 (0.587 to 0.819) | 2.77 (2.55 to 3.18) | 2.68 (2.63 to 2.75) | 3.80 (3.30 to 4.40) | 3.77 (3.27 to 4.28) |
+| websocket p99 ms | 883 (812 to 1147) | 1294 (1141 to 1426) | 1097 (695 to 1309) | 1062 (1012 to 1140) | 1102 (978 to 1191) |
+| websocket p99.9 ms | 1191 (965 to 1564) | 1808 (1550 to 1982) | 1502 (1282 to 1757) | 1347 (1218 to 1388) | 1327 (1261 to 1411) |
+| attach p50 ms | 1075 (965 to 1188) | 1350 (1232 to 1552) | 1398 (1222 to 1449) | 1312 (1102 to 1466) | 1270 (1174 to 1360) |
+| server: api_read took p99 ms | 46.6 (45.7 to 56.8) | 95.7 (87.0 to 186) | 89.5 (63.3 to 96.8) | 204 (197 to 221) | 204 (165 to 220) |
+| server: websocket waited p99 ms | 873 (805 to 1485) | 1664 (1513 to 1935) | 1299 (752 to 1839) | 1287 (995 to 1644) | 1309 (966 to 1638) |
+| shards' delay p99 ms | 0.748 (0.618 to 0.911) | 3.33 (2.10 to 4.72) | 2.76 (1.77 to 3.55) | 2.60 (2.29 to 3.06) | 2.33 (2.27 to 3.55) |
+| shards' delay p99.9 ms | 23.9 (14.1 to 26.8) | 23.5 (21.9 to 29.7) | 24.5 (18.9 to 28.2) | 10.5 (2.49 to 23.4) | 11.8 (2.50 to 22.1) |
+
+On current main:
+
+- **Idle stays turned down.** Against kiln.slice's weight, idle groups were worse in 11 numbers and
+  better in 2 (pages 0.197 ms at the median against 0.966, API reads 133 ms at p99 against 238,
+  writes 591 against 921, the server's own API reads 89.5 ms against 204), and an idle unit worse in
+  9 and better in none.
+- **kiln.slice's weight and even weights didn't differ beyond noise** in any of the 43 numbers (block
+  4: 8 better). Both left the machine's CPUs as contended (22-23% CPU pressure).
+- **Against calm, kiln.slice's weight was worse in 17 numbers, better in none,** API reads' p99
+  among them (66.7 ms to 133) and pages' (0.303 ms to 2.34), with every median (API reads 0.417 ms to
+  1.82, the live feed 0.693 to 2.68) and the shards' delay (0.748 ms to 2.76 at p99). The live
+  feed's and API writes' p99s stayed within noise.
+
 Step 7 asked for the API's p99 with CPU hogs held within noise of calm, legs and agents at idle
 priority. Idle, it wasn't: against calm, API reads' p99 (126 ms to 186) and the live feed's (0.90 s
 to 1.09) were worse beyond noise. With what lands, kiln.slice's weight and legs at the least weight,
@@ -220,7 +259,11 @@ the p99s of pages, API reads and writes and the live feed were within noise of c
 weren't (API reads 0.366 ms to 1.49, the live feed 0.638 to 2.54), nor the shards' delay (0.955 ms
 to 3.41 at p99), and calm's own page tail was wide on this busy machine: in quieter blocks pages
 took 0.33 to 0.46 ms at p99 calm, against 2 ms with legs. Cores of its own held pages and the API
-whole.
+whole. On current main (block 5), with a quieter calm, weights didn't hold the API's p99 either:
+API reads' and pages' p99s were worse beyond noise (66.7 ms to 133, 0.303 to 2.34), only the live
+feed's and writes' held. So weights put the server first, but only cores of its own (block 3, not run
+again) kept the API whole; headroom ("headroom's lab", below) is what slows the legs when the
+server's delay rises toward harm.
 
 ### headroom's lab (step 5)
 
