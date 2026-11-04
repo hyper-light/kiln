@@ -32,11 +32,21 @@ runner runs), not against `system.slice`: only root can place a slice at the top
 
 **Legs and agents.** Each agent session (`kiln-agents/<session>`), each reach run an agent asked for
 (`kiln-agents/run-<id>`), each CI job (`kiln-jobs-<pid>/<job>`) and each leg's microVM
-(`kiln-jobs-<pid>/vm-<id>`) runs in a cgroup of its own with `cpu.idle` 1 (`cpu.weight` 1 on a
-kernel before 5.15, which has no `cpu.idle`). Its threads keep their order among themselves; the
-group gets the CPU when nothing else on the machine wants it, and a CPU running only idle work is
-taken as free when the server's threads wake (the scheduler's `sched_idle_cpu`). A person's own reach
-run (`kiln run` from their terminal) runs as they'd run it.
+(`kiln-jobs-<pid>/vm-<id>`) runs at idle priority twice over:
+
+- **its processes run SCHED_IDLE,** set between fork and exec and inherited by everything they
+  start (a step on a pty from the moment it's adopted). Any task that isn't idle preempts one as it
+  wakes, whatever cgroup either is in, and a CPU running only idle tasks counts as free when the
+  server's threads wake (`sched_idle_cpu`). This needs no controller and no delegation;
+- **its cgroup has `cpu.idle` 1** (`cpu.weight` 1 on a kernel before 5.15, which has no
+  `cpu.idle`), where the runner's unit is delegated to it: ranked against its siblings, it gets
+  the CPU only when they don't want it, and headroom paces it whole.
+
+The cgroup alone isn't enough: `cpu.idle` ranks a group only against its siblings, and the server's
+threads are never a leg's siblings, so a leg's CPU still counted as free for the server's waking
+threads, which then waited out the leg's slice there. In the lab that made the API slower than with
+legs at normal priority ("The lab", below). A person's own reach run (`kiln run` from their
+terminal) runs as they'd run it.
 
 cgroup v2 lets a cgroup share a controller among its children only while it holds no process
 itself, and systemd owns a unit's cgroups unless it delegates them. So:
@@ -49,18 +59,22 @@ itself, and systemd owns a unit's cgroups unless it delegates them. So:
   of groups, and marks each group idle as it makes it. The folders stay where they were, under the
   unit, so sessions that outlive a runner process are found by the next.
 - A runner whose unit isn't delegated (one installed before this), one in a container, or one a
-  test or a person started runs legs and agents at normal priority, and says why: the runner's
-  facts (`executors.host.priority`) and its log at start. Reinstalling or upgrading the runner
-  (`kiln install --agent --upgrade`) writes the delegated unit.
+  test or a person started still runs legs' and agents' processes SCHED_IDLE; their cgroups aren't
+  marked idle, and it says why: the runner's facts (`executors.host.priority`) and its log at start.
+  Reinstalling or upgrading the runner (`kiln install --agent --upgrade`) writes the delegated
+  unit.
 
 **Docker legs.** Docker's API has no `cpu.idle`: a leg's job container, its services, its Docker
 actions, its egress relay and the containers its steps make through its Docker socket get the least
-weight Docker gives a container, `--cpu-shares 2` (`cpu.weight` 1). A leg's own `options:` win.
+weight Docker gives a container, `--cpu-shares 2` (`cpu.weight` 1). A leg's own `options:` win. Their
+processes are the engine's children, not kiln's, so they don't run SCHED_IDLE: a container leg ranks
+below the server by weight alone, which is less (see the lab); host and microVM legs run fully idle.
 
 **Firecracker legs.** Firecracker's jailer needs root, so kiln confines each VMM in a jail of its
 own (`kiln vmm-jail`, docs/ci.md W13-R05). A leg's VMM, jailed or not, joins an idle cgroup the
 runner made beforehand, the way the jailer places a VMM given a parent cgroup and no settings of
-its own under cgroup v2 (f22). A microVM deployment's VMM runs as the service it is.
+its own under cgroup v2 (f22), and runs SCHED_IDLE, its vCPUs' threads too. A microVM deployment's
+VMM runs as the service it is.
 
 ## macOS
 
@@ -87,8 +101,9 @@ the same.
 
 Where the server runs on the runner's own machine (its address is loopback or one this machine
 binds), headroom adds a target of its own, `kiln server delay`: `GET /healthz/delay`, the server's
-own measure of how late its shards run ready work (goal 1's shard delay), or how long the probe
-took where that's longer. Its tolerance is the platform's (1 s) unless a person sets another, and
+own measure of how late its shards run ready work, from the probes behind `kiln_shard_delay_seconds`
+([runtime-lab.md](runtime-lab.md)): its worst shard's latest probe, or a hold under way past the
+probes' period; or how long the probe took where that's longer. Its tolerance is the platform's (1 s) unless a person sets another, and
 it's detected as every target is ([headroom.md](headroom.md)): a shift of its delay from calm toward
 the tolerance cuts kiln's CPU and write budgets, and the pacer slows what runs. CI jobs' cgroups are
 paced now, as agents' sessions are, so the legs and agents beside the server are what's slowed
@@ -136,6 +151,7 @@ place.
   `g8_s4_the_server_runs_above_normal` (Windows): an agent's job's priority class and CPU rate
   control read back, cmd and its child below normal, the first process's memory and I/O priority;
   a person's job without a priority class; the server above normal.
+- `api::tests::g8_s5_the_delay_is_the_worst_shards_now`: the server's answer, its worst shard's.
 - `headroom::probes::tests::g8_s5_a_servers_delay_is_what_it_says_its_shards_wait` and
   kiln-ci's `headroom::tests::g8_s5_the_servers_delay_rising_slows_legs_and_agents`: the probe reads
   the delay a server says; the engine, the delay rising from calm, cuts kiln's CPU and paces a leg

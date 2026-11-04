@@ -16,8 +16,11 @@
 //! Priority (docs/priority.md; goal 8, plan 01a1a59c2b29 step 2): where the machine's installed
 //! runner runs in a unit its service manager delegated to it (systemd's `Delegate=yes`, which
 //! `kiln install` sets), the CPU is shared among what it starts, and each agent's and each CI
-//! job's group runs at idle priority (`cpu.idle` 1, the cgroup's SCHED_IDLE): it gets the CPU only
-//! when nothing else on the machine wants it. cgroup v2 gives a cgroup's children a controller only
+//! job's group runs at idle priority (`cpu.idle` 1, the cgroup's SCHED_IDLE). Whatever the unit,
+//! the processes in those groups run SCHED_IDLE themselves too ([`sched_idle`]), which needs no
+//! controller: a group's idleness ranks it only against its siblings, and the server's threads are
+//! never its siblings, while a SCHED_IDLE task gives way at once to any task that isn't, in any
+//! cgroup (the lab, docs/priority.md). cgroup v2 gives a cgroup's children a controller only
 //! while it holds no process itself, so kiln's own processes run in the unit's leaf [`LEAF`]
 //! (systemd's `DelegateSubgroup=`, or moved there by the runner) and the folders of groups sit
 //! beside it, under the unit.
@@ -109,12 +112,12 @@ impl Base {
                 return None;
             }
             if idle && self.cpu {
-                let _ = mark_idle(&dir).inspect_err(|why| tracing::warn!(session, why = %why, "an agent's group runs at normal priority"));
+                let _ = mark_idle(&dir).inspect_err(|why| tracing::warn!(session, why = %why, "an agent's group isn't marked idle"));
             }
         } else if !dir.is_dir() {
             return None;
         }
-        Some(Group { dir })
+        Some(Group { dir, idle })
     }
 
     /// The agent session `pid` belongs to by its cgroup.
@@ -258,14 +261,26 @@ fn mark_idle(dir: &Path) -> Result<(), String> {
     }
 }
 
+/// Process `pid` (0: the calling one) SCHED_IDLE (docs/priority.md): any task that isn't preempts
+/// it as it wakes, whatever cgroup either is in, and what it starts inherits it. Through the system
+/// call itself, as musl's libc answers ENOSYS for `sched_setscheduler`; nothing allocated or locked,
+/// so it may run between fork and exec. Whether it took.
+#[allow(unsafe_code)]
+fn sched_idle(pid: nix::libc::pid_t) -> bool {
+    // SAFETY: an all-zero sched_param is a valid one: priority 0, the only one SCHED_IDLE takes.
+    let param: nix::libc::sched_param = unsafe { std::mem::zeroed() };
+    // SAFETY: one system call, given a pointer to a sched_param that outlives it.
+    unsafe { nix::libc::syscall(nix::libc::SYS_sched_setscheduler, pid, nix::libc::SCHED_IDLE, &raw const param) == 0 }
+}
+
 /// How legs and agents run here (docs/priority.md), for the runner's facts and its log.
 pub fn priority() -> String {
-    let shared = base().or_else(jobs_base).filter(|b| b.cpu);
-    match (&arranged().cpu, shared) {
-        (Ok(()), Some(b)) if b.dir.join("cpu.idle").is_file() => "idle: each leg's and agent's cgroup has cpu.idle 1".to_owned(),
-        (Ok(()), Some(_)) => "the least CPU weight: each leg's and agent's cgroup has cpu.weight 1 (this kernel has no cpu.idle)".to_owned(),
-        (Ok(()), None) => "normal: the CPU isn't shared among kiln's groups here".to_owned(),
-        (Err(why), _) => format!("normal: {why}"),
+    let Some(held) = base().or_else(jobs_base) else { return "normal: kiln holds no cgroups of its own here".to_owned() };
+    match &arranged().cpu {
+        Ok(()) if held.cpu && held.dir.join("cpu.idle").is_file() => "idle: each leg's and agent's processes run SCHED_IDLE, in a cgroup with cpu.idle 1".to_owned(),
+        Ok(()) if held.cpu => "idle: each leg's and agent's processes run SCHED_IDLE, in a cgroup with cpu.weight 1 (this kernel has no cpu.idle)".to_owned(),
+        Ok(()) => "idle: each leg's and agent's processes run SCHED_IDLE (the CPU isn't shared among their cgroups here)".to_owned(),
+        Err(why) => format!("idle: each leg's and agent's processes run SCHED_IDLE (their cgroups aren't marked idle: {why})"),
     }
 }
 
@@ -348,6 +363,8 @@ fn name_of(session: &str) -> Option<&str> {
 #[derive(Debug, Clone)]
 pub struct Group {
     dir: PathBuf,
+    /// An agent's or a leg's: what it starts runs SCHED_IDLE ([`sched_idle`]).
+    idle: bool,
 }
 
 impl Group {
@@ -374,12 +391,17 @@ impl Group {
     /// process still starts, outside it, and is found by its mark.
     pub fn enter(&self, cmd: &mut Command) {
         let Ok(mut procs) = fs::OpenOptions::new().write(true).open(self.dir.join("cgroup.procs")) else { return };
+        let idle = self.idle;
         #[allow(unsafe_code)]
         // SAFETY: the closure runs in the child between fork and exec, and only writes to a
-        // descriptor opened beforehand (one write(2) call; nothing allocated, nothing locked).
+        // descriptor opened beforehand (one write(2) call) and, for an agent's or a leg's, makes one
+        // more system call ([`sched_idle`]): nothing allocated, nothing locked.
         unsafe {
             cmd.pre_exec(move || {
                 let _ = procs.write_all(b"0");
+                if idle {
+                    let _ = sched_idle(0);
+                }
                 Ok(())
             });
         }
@@ -477,7 +499,7 @@ impl Job {
 
     /// Makes `cmd`'s process join the group before it runs anything, as [`Group::enter`] does.
     pub fn enter(&self, cmd: &mut Command) {
-        Group { dir: self.dir.clone() }.enter(cmd);
+        Group { dir: self.dir.clone(), idle: true }.enter(cmd);
     }
 
     /// Its folder.
@@ -488,6 +510,10 @@ impl Job {
     /// Moves process `pid` into it, started some other way (a step on a pty): what it started
     /// before it moved stays where it was.
     pub fn adopt(&self, pid: u32) -> bool {
+        // A leg's, SCHED_IDLE from now on, as one started in it is (docs/priority.md).
+        if let Ok(p) = nix::libc::pid_t::try_from(pid) {
+            let _ = sched_idle(p);
+        }
         fs::write(self.dir.join("cgroup.procs"), pid.to_string()).is_ok()
     }
 
@@ -665,6 +691,15 @@ mod tests {
         assert!(is_unit(unit) && is_unit("/system.slice/run-1.scope") && !is_unit("/kiln.slice"));
     }
 
+    /// Process `pid`'s scheduling policy, as the kernel says.
+    #[allow(unsafe_code)]
+    fn policy(pid: u32) -> Option<i32> {
+        let pid = nix::libc::pid_t::try_from(pid).ok()?;
+        // SAFETY: one system call on a process id.
+        let p = unsafe { nix::libc::syscall(nix::libc::SYS_sched_getscheduler, pid) };
+        i32::try_from(p).ok().filter(|p| *p >= 0)
+    }
+
     /// Goal 8 (plan 01a1a59c2b29 step 2, docs/priority.md): in a unit delegated to kiln (a scope of
     /// the user's own here, its process standing in for kiln's supervisor), kiln's own processes
     /// move into the unit's leaf, the CPU is shared among the unit's children, and an agent's group
@@ -713,17 +748,25 @@ mod tests {
             cmd.arg("30").stdin(Stdio::null());
             agent.enter(&mut cmd);
             let mut child = cmd.spawn()?;
+            let mut cmd = Command::new("sleep");
+            cmd.arg("31").stdin(Stdio::null());
+            person.enter(&mut cmd);
+            let mut theirs = cmd.spawn()?;
             let inside = agent.started(child.id());
             let idle = fs::read_to_string(agent.dir.join("cpu.idle")).or_else(|_| fs::read_to_string(agent.dir.join("cpu.weight")))?;
             let persons = fs::read_to_string(person.dir.join("cpu.idle")).unwrap_or_default();
-            let _ = child.kill();
-            let _ = child.wait();
+            let policies = (policy(child.id()), policy(theirs.id()));
+            for c in [&mut child, &mut theirs] {
+                let _ = c.kill();
+                let _ = c.wait();
+            }
             agent.remove();
             person.remove();
             let _ = fs::remove_dir(&folder.dir);
             anyhow::ensure!(inside, "what an agent starts doesn't run in its group");
             anyhow::ensure!(idle.trim() == "1", "an agent's group isn't at idle priority: {idle}");
             anyhow::ensure!(persons.trim() != "1", "a person's run's group is at idle priority: {persons}");
+            anyhow::ensure!(policies == (Some(nix::libc::SCHED_IDLE), Some(nix::libc::SCHED_OTHER)), "the agent's process SCHED_IDLE, the person's not: {policies:?}");
             Ok(())
         })();
         let _ = held.kill();
