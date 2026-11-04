@@ -52,11 +52,21 @@ pub struct Target {
     /// Slower than this harms it (none: the platform's default, 1 s).
     #[serde(default, alias = "goal_ms")]
     pub tolerance_ms: Option<u32>,
+    /// How soon trouble with it must be caught, where that isn't its tolerance (none: its
+    /// tolerance): kiln's own, for a target that answers with a level it measured, never in settings
+    /// sent or kept (the server's delay: docs/priority.md).
+    #[serde(skip)]
+    pub window_ms: Option<u32>,
 }
 
 impl Target {
     pub fn tolerance_ms(&self) -> u32 {
         self.tolerance_ms.unwrap_or(PLATFORM_TOLERANCE_MS)
+    }
+
+    /// How soon trouble with it must be caught.
+    pub fn window_ms(&self) -> u32 {
+        self.window_ms.unwrap_or_else(|| self.tolerance_ms())
     }
 }
 
@@ -74,8 +84,9 @@ pub enum Probe {
     Tcp { addr: String },
     /// `GET` a kiln server's own measure of how late its shards run ready work (`/healthz/delay`):
     /// what kiln adds itself for a server on this machine (docs/priority.md; goal 8, plan
-    /// 01a1a59c2b29 step 5), answered with that delay, or with how long the probe took where that's
-    /// longer. kiln's own: never in settings sent or kept.
+    /// 01a1a59c2b29 step 5), answered with how late its ready work ran on average since the last
+    /// read (a hold under way only when no probe ran at all). kiln's own: never in settings sent or
+    /// kept.
     #[serde(skip)]
     Delay { url: String },
 }
@@ -144,7 +155,7 @@ mod tests {
         assert!(s.validated().err().unwrap_or_default().contains("false_alarms_per_day"));
         let s = Settings { probe_load_share: 2.0, ..Settings::default() };
         assert!(s.validated().is_err());
-        let s = Settings { targets: vec![Target { name: "web".into(), probe: Probe::Http { url: "https://x".into() }, tolerance_ms: None }], ..Settings::default() };
+        let s = Settings { targets: vec![Target { name: "web".into(), probe: Probe::Http { url: "https://x".into() }, tolerance_ms: None, window_ms: None }], ..Settings::default() };
         assert!(s.validated().err().unwrap_or_default().contains("http://"));
     }
 

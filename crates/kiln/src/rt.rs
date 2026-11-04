@@ -482,6 +482,36 @@ pub fn spawn_on<F: Future<Output = ()> + Send + 'static>(i: usize, fut: F) -> bo
     rt.holders.get(i).is_some_and(|holder| hyper_rt::runtime::submit_to_holder(*holder, fut).is_ok())
 }
 
+/// Run `fut` as its own task on shard `shard` (of [`shard_count`]) for its whole life, wherever the
+/// caller is: a task that owns what belongs to that shard (each agent session's copy,
+/// `crate::harness::copies`). Refused there (its arena or control queue full), it waits as
+/// [`spawn`] does off the runtime, then runs on whichever shard takes it, said, rather than not at
+/// all, where [`spawn_on`] gives up. Goal 4, plan 01a1a59c2a9c step 2.
+pub fn spawn_owner<F: Future<Output = ()> + Send + 'static>(shard: usize, fut: F) {
+    let slot = handoff(Box::pin(fut));
+    let there = |slot: &Arc<Mutex<Option<Boxed>>>| {
+        let holder = rt().ok().and_then(|rt| rt.holders.get(shard % rt.holders.len().max(1)).copied());
+        holder.is_some_and(|h| hyper_rt::runtime::submit_to_holder(h, bootstrap(slot)).is_ok())
+    };
+    if there(&slot) {
+        return;
+    }
+    if !on_shard() {
+        for _ in 0..2000 {
+            std::thread::sleep(Duration::from_millis(2));
+            if there(&slot) {
+                return;
+            }
+        }
+    }
+    tracing::warn!(shard, "a shard refused a task that belongs on it: it runs on another shard");
+    if submit(&slot) {
+        return;
+    }
+    crate::metrics::global().panics_caught.inc();
+    tracing::error!("hyper-rt refused a task on every shard (arenas or control queues full); task dropped");
+}
+
 /// Run a `!Send` future as a task on the current shard. Refused off the runtime.
 #[track_caller]
 pub fn spawn_local<F: Future<Output = ()> + 'static>(fut: F) -> Result<TaskId, RtError> {
@@ -708,11 +738,16 @@ impl Turns {
 
     /// After a piece of the loop's work: its turn given up once it has had a step's quantum.
     pub async fn after(&mut self) {
-        let quantum = hyper_rt::futures::step_budget_ns().map(Duration::from_nanos);
-        if quantum.is_some_and(|q| self.0.elapsed() >= q) {
+        if self.over() {
             maybe_yield().await;
             self.0 = Instant::now();
         }
+    }
+
+    /// Whether the loop has had its step's quantum: what it does next waits for [`Turns::after`].
+    pub fn over(&self) -> bool {
+        let quantum = hyper_rt::futures::step_budget_ns().map(Duration::from_nanos);
+        quantum.is_some_and(|q| self.0.elapsed() >= q)
     }
 }
 
