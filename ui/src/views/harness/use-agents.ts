@@ -30,7 +30,7 @@ export function useAgents() {
   const res = useSuspenseResource(KEY, list);
   // The latest word from each agent since the last batch (null: it closed).
   const [batch] = React.useState(() => ({ pending: new Map<string, AgentInfo | null>(), timer: 0 }));
-  useServerEvents((ev) => {
+  useServerEvents(["harness", "harness_closed"], (ev) => {
     if (ev.type === "harness") batch.pending.set(ev.info.id, listed(ev.info) ? ev.info : null);
     else if (ev.type === "harness_closed") batch.pending.set(ev.id, null);
     else return;

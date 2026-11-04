@@ -953,7 +953,7 @@ async fn authorized(hub: Arc<Hub>, caller: crate::authz::Caller, req: Request) -
             // And of agents, the ones it sees (docs/agents.md, "Whose agents").
             let everyone = caller.agent.is_none() && (caller.is_owner() || caller.can("agents.manage", &crate::authz::Scope::Server));
             let agents = (!everyone).then(|| AgentsSeen { caller: caller.clone(), seen: HashMap::new() });
-            events_ws(hub.clone(), req, narrow, agents)
+            events_ws(hub.clone(), req, Asked::of(&q), narrow, agents)
         }
         (&Method::GET, ["api", "ai-sessions"]) => Ok(ai_sessions(&hub, &caller)),
         (&Method::GET, ["api", "ai-sessions", "silent"]) => Ok(ai_silent(&hub, &caller)),
@@ -4684,18 +4684,15 @@ struct AgentsSeen {
 }
 
 impl AgentsSeen {
-    async fn lets(&mut self, hub: &Hub, text: &str) -> bool {
-        if !(text.contains("\"type\":\"harness") || text.contains("\"type\":\"agent_change\"")) {
-            return true;
-        }
-        let Ok(v) = serde_json::from_str::<serde_json::Value>(text) else { return false };
-        let id = match v.get("type").and_then(serde_json::Value::as_str) {
-            Some("harness") => v.pointer("/info/id"),
-            Some("harness_closed") => v.get("id"),
-            Some("agent_change") => v.get("agent"),
-            _ => return true,
+    /// Read from what the feed read of the frame once for every socket (`feed::Meta`), not from
+    /// its text again.
+    async fn lets(&mut self, hub: &Hub, m: &crate::wire::events::feed::Meta) -> bool {
+        use crate::wire::events::feed::Agent;
+        let id = match &m.agent {
+            Agent::Free => return true,
+            Agent::Of(None) => return false,
+            Agent::Of(Some(id)) => id,
         };
-        let Some(id) = id.and_then(serde_json::Value::as_str) else { return false };
         if let Some(&ok) = self.seen.get(id) {
             return ok;
         }
@@ -4709,41 +4706,54 @@ impl AgentsSeen {
 }
 
 impl Narrow {
-    async fn lets(&mut self, hub: &Hub, text: &str) -> bool {
-        let Ok(v) = serde_json::from_str::<serde_json::Value>(text) else { return false };
-        let kind = v.get("type").and_then(serde_json::Value::as_str).unwrap_or_default();
-        match kind {
+    async fn lets(&mut self, hub: &Hub, m: &crate::wire::events::feed::Meta) -> bool {
+        if !m.parsed {
+            return false;
+        }
+        match m.kind.as_str() {
             "resync" => return true,
-            "inbox" => return v.get("person").and_then(serde_json::Value::as_str) == Some(self.person.as_str()),
+            "inbox" => return m.person.as_deref() == Some(self.person.as_str()),
             _ => {}
         }
-        let named = v
-            .get("repo")
-            .and_then(|r| r.as_str().map(str::to_owned).or_else(|| r.get("name").and_then(serde_json::Value::as_str).map(str::to_owned)))
-            .or_else(|| v.pointer("/run/repo_name").and_then(serde_json::Value::as_str).map(str::to_owned));
-        if let Some(r) = named {
-            return self.repos.contains(&r);
+        if let Some(r) = &m.repo {
+            return self.repos.contains(r);
         }
-        let Some(run) = v.pointer("/job/run_id").and_then(serde_json::Value::as_str).map(str::to_owned) else { return false };
-        if !self.runs.contains_key(&run) {
+        let Some(run) = &m.job_run else { return false };
+        if !self.runs.contains_key(run) {
             if self.runs.len() > 10_000 {
                 self.runs.clear();
             }
             let repo = hub.store.run(run.clone()).await.ok().flatten().map(|r| r.repo_name);
             self.runs.insert(run.clone(), repo);
         }
-        self.runs.get(&run).cloned().flatten().is_some_and(|r| self.repos.contains(&r))
+        self.runs.get(run).cloned().flatten().is_some_and(|r| self.repos.contains(&r))
     }
 }
 
-fn events_ws(hub: Arc<Hub>, req: Request, narrow: Option<Narrow>, agents: Option<AgentsSeen>) -> R {
+/// How an events socket's page asked to be sent (docs/wire.md, "The events socket"): batched
+/// (`?batch=1`, or `?after=`), only some types (`?topics=a,b`), from where it was (`?after=<at>`).
+/// A page that asks for none of it is sent every frame as it comes, as before.
+struct Asked {
+    batch: bool,
+    topics: Option<std::collections::HashSet<String>>,
+    after: Option<String>,
+}
+
+impl Asked {
+    fn of(q: &HashMap<String, String>) -> Asked {
+        let after = q.get("after").filter(|a| !a.is_empty()).cloned();
+        Asked { batch: after.is_some() || q.get("batch").is_some_and(|b| b == "1"), topics: q.get("topics").map(|t| crate::wire::events::feed::topics(t)), after }
+    }
+}
+
+fn events_ws(hub: Arc<Hub>, req: Request, asked: Asked, narrow: Option<Narrow>, agents: Option<AgentsSeen>) -> R {
     let sock = ui::Socket::of(Wire::EventsUp, Wire::EventsDown, &caller_name(&req), None);
     let (resp, upgrade) = ws::accept(req).map_err(|r| ApiError(r.status, r.reason.into()))?;
     crate::rt::spawn(async move {
         let Ok(socket) = upgrade.await else { return };
         let m = crate::metrics::global();
         m.ws_clients.add(1);
-        if let Err(e) = pump_events(&hub, socket, &sock, narrow, agents).await {
+        if let Err(e) = pump_events(&hub, socket, &sock, asked, narrow, agents).await {
             tracing::debug!(error = %e, "events stream ended");
         }
         m.ws_clients.add(-1);
@@ -4756,38 +4766,137 @@ fn caller_name(req: &Request) -> String {
     req.extensions().get::<crate::authz::Caller>().map_or_else(|| "admin".to_owned(), |c| c.name.clone())
 }
 
-async fn pump_events(hub: &Hub, socket: ws::WebSocket, sock: &ui::Socket, mut narrow: Option<Narrow>, mut agents: Option<AgentsSeen>) -> anyhow::Result<()> {
+/// Whether frame `f` goes to this socket: a type it asked for, about what its caller may see.
+async fn events_let(hub: &Hub, out: &crate::wire::events::feed::Outbox, narrow: &mut Option<Narrow>, agents: &mut Option<AgentsSeen>, f: &crate::wire::events::feed::Frame) -> bool {
+    let m = f.meta();
+    if !out.wants(&m.kind) {
+        return false;
+    }
+    (match narrow.as_mut() {
+        Some(n) => n.lets(hub, m).await,
+        None => true,
+    }) && match agents.as_mut() {
+        Some(a) => a.lets(hub, m).await,
+        None => true,
+    }
+}
+
+/// The events socket (docs/wire.md, "The events socket"): what the feed has after where the page
+/// is, as it comes. A page that asked for batches gets them a window at a time ([`feed::WINDOW`]),
+/// coalesced, each saying where the feed is; one that didn't gets each frame as it comes. Either
+/// that falls further behind than the feed keeps is told `resync`.
+///
+/// [`feed::WINDOW`]: crate::wire::events::feed::WINDOW
+async fn pump_events(hub: &Hub, socket: ws::WebSocket, sock: &ui::Socket, asked: Asked, mut narrow: Option<Narrow>, mut agents: Option<AgentsSeen>) -> anyhow::Result<()> {
+    use crate::wire::events::feed::{self, At, Since};
     use futures::FutureExt as _;
     let (mut tx, mut rx_ws) = socket.split();
-    let mut rx = hub.events.subscribe();
+    let fd = &hub.feed;
+    let batch = asked.batch;
+    let (mut cursor, missed) = if batch { fd.resume(asked.after.as_deref()) } else { (fd.head(), false) };
+    let mut out = feed::Outbox::new(asked.topics);
+    if missed {
+        out.resync();
+    }
+    // Lets the filters pass a frame without reading it when there are none.
+    let everything = out.wants("") && narrow.is_none() && agents.is_none() && !batch;
     hub.emit_queue();
+    // The first batch goes at once, saying where the feed is.
+    let mut first = batch;
+    let mut sent_at: Option<Instant> = None;
+    let mut due: Option<Instant> = None;
     loop {
-        futures::select_biased! {
-            ev = rx.recv().fuse() => match ev {
-                Ok(text) => {
-                    let keep = match narrow.as_mut() {
-                        Some(n) => n.lets(hub, text.as_ref()).await,
-                        None => true,
-                    } && match agents.as_mut() {
-                        Some(a) => a.lets(hub, text.as_ref()).await,
-                        None => true,
-                    };
-                    if keep {
-                        tx.send(ws::text(text.as_ref())).await?;
+        let woke = fd.listen();
+        if fd.head() > cursor {
+            match fd.since(cursor) {
+                Since::Gap => {
+                    cursor = fd.head();
+                    if batch {
+                        out.resync();
+                    } else {
+                        tx.send(ws::text(crate::wire::events::ServerEvent::Resync.text())).await?;
                     }
                 }
-                Err(async_broadcast::RecvError::Overflowed(_)) => {
-                    tx.send(ws::text(crate::wire::events::ServerEvent::Resync.text())).await?;
+                Since::Frames(frames) => {
+                    for f in frames {
+                        cursor = f.seq;
+                        if !everything && !events_let(hub, &out, &mut narrow, &mut agents, &f).await {
+                            continue;
+                        }
+                        if batch {
+                            out.add(f);
+                        } else {
+                            tx.send(ws::text(f.text.as_ref())).await?;
+                        }
+                    }
                 }
-                Err(async_broadcast::RecvError::Closed) => return Ok(()),
-            },
+            }
+        }
+        if batch && (first || !out.is_empty()) {
+            let now = Instant::now();
+            let when = if first || out.len() >= feed::MAX_BATCH { now } else { due.unwrap_or_else(|| sent_at.map_or(now, |s| (s + feed::WINDOW).max(now))) };
+            if when <= now {
+                if let Some(text) = out.flush(At { epoch: fd.epoch(), seq: cursor }, first) {
+                    tx.send(ws::text(text)).await?;
+                }
+                first = false;
+                sent_at = Some(now);
+                due = None;
+                continue;
+            }
+            due = Some(when);
+        }
+        let window = async move {
+            match due {
+                Some(d) => crate::rt::sleep_until(d).await,
+                None => futures::future::pending::<()>().await,
+            }
+        };
+        futures::select_biased! {
+            _ = woke.fuse() => {}
+            _ = window.fuse() => {}
             msg = rx_ws.next().fuse() => {
-                if hub.unread_only(sock, &mut tx, ui::came(msg), |r| crate::wire::events::ServerEvent::Refused(r).text()).await? {
+                let came = ui::came(msg);
+                if let Came::Text(t) = &came
+                    && let Some(up) = events_topics(t.as_str())
+                {
+                    match up {
+                        Ok(crate::wire::events::EventsUp::Topics { topics, since }) => {
+                            let added = out.set_topics(topics.map(|t| t.into_iter().collect()));
+                            // Of the types new to it, what came since the page last heard: what it
+                            // loaded as it asked for them misses none of their changes.
+                            if let Some(s) = since.as_deref().and_then(At::parse).filter(|s| s.epoch == fd.epoch() && !added.is_empty()) {
+                                let kept = match fd.since(s.seq) {
+                                    Since::Frames(f) => f,
+                                    Since::Gap => fd.kept(),
+                                };
+                                let mut earlier = Vec::new();
+                                for f in kept {
+                                    if f.seq <= cursor && added.contains(&f.meta().kind) && events_let(hub, &out, &mut narrow, &mut agents, &f).await {
+                                        earlier.push(f);
+                                    }
+                                }
+                                out.add_earlier(earlier);
+                            }
+                        }
+                        Err(r) => {
+                            hub.note_refused(sock, &r).await;
+                            tx.send(ws::text(crate::wire::events::ServerEvent::Refused(r).text())).await?;
+                        }
+                    }
+                } else if hub.unread_only(sock, &mut tx, came, |r| crate::wire::events::ServerEvent::Refused(r).text()).await? {
                     return Ok(());
                 }
             }
         }
     }
+}
+
+/// `text`, when it's a `topics` frame (`crate::wire::events::EventsUp`), read; or why it
+/// couldn't be. Anything else is every socket's (`unread`).
+fn events_topics(text: &str) -> Option<Result<crate::wire::events::EventsUp, ui::Refused>> {
+    let v = serde_json::from_str::<serde_json::Value>(text).ok()?;
+    (v.get("t").and_then(serde_json::Value::as_str) == Some("topics")).then(|| serde_json::from_value(v).map_err(|e| ui::Refused::malformed("topics", e.to_string())))
 }
 
 // ------------------------------------------------------------------ terminal ws

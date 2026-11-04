@@ -6,9 +6,46 @@
 //!
 //! The socket's frames are also what kiln's own listeners read (attachments, notifications,
 //! webhooks' subscribers), as the JSON they serialize to.
+//!
+//! A page that asks for it (`?batch=1`, or `?after=` to resume) gets them numbered and gathered
+//! ([`EventsDown`], [`feed`]), and says which types it wants ([`EventsUp`], `?topics=`).
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
+
+pub mod feed;
+
+/// What goes down the events socket to a page that asked for batches (`?batch=1`, or `?after=`),
+/// besides `refused`: the events of a window, each a [`ServerEvent`], and where the feed is.
+#[derive(Debug, Clone, Serialize)]
+#[cfg_attr(test, derive(ts_rs::TS))]
+#[serde(tag = "t", rename_all = "snake_case")]
+pub enum EventsDown {
+    /// The events since the last batch: only the newest of each thing they carry whole, none that
+    /// says again what this socket was last sent, `resync` first when some were missed. `at`
+    /// (`<epoch>.<seq>`) is where the feed is: a page that reconnects with `?after=<at>` is sent
+    /// what it missed. Every socket's first frame is one, its events perhaps none.
+    Batch { at: String, events: Vec<ServerEvent> },
+}
+
+/// What a page sends up the events socket, besides `unread`.
+#[derive(Debug, Clone, Deserialize, PartialEq)]
+#[cfg_attr(test, derive(ts_rs::TS))]
+#[serde(tag = "t", rename_all = "snake_case")]
+pub enum EventsUp {
+    /// The event types it wants from now on (the tags of [`ServerEvent`]; `resync` it always
+    /// gets), all of them when `topics` is left out. `since` (a batch's `at`): of the types new
+    /// to it, it's sent what came after that too, so what it loaded just before it asked misses
+    /// nothing.
+    Topics {
+        #[serde(default)]
+        #[cfg_attr(test, ts(optional))]
+        topics: Option<Vec<String>>,
+        #[serde(default)]
+        #[cfg_attr(test, ts(optional))]
+        since: Option<String>,
+    },
+}
 
 /// A frame of the events socket.
 #[derive(Debug, Clone, Serialize)]

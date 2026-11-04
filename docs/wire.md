@@ -820,7 +820,9 @@ CIs typecheck the UI against them.
 | `/api/harness/sessions/:id/ws` | down | `closed` | stream | The session is gone. | As its class says. |
 | `/api/harness/sessions/:id/ws` | down | `error` | answer | A command's refusal. | Says a bare command's refusals, to clients from before ids. |
 | `/api/events` | up | `unread` | ack | As the session socket's. | Noted (`events_down`). |
-| `/api/events` | down | `event` | stream | Kiln's events for the UI. | Not resumed after a reconnect. |
+| `/api/events` | up | `topics` | state | The event types the page wants from now on, and where it was when it asked for more. | The newest wins; of the types new to it, what came since is sent too. |
+| `/api/events` | down | `event` | stream | Kiln's events for the UI, each its own frame. | To a page that didn't ask for batches: not resumed after a reconnect. |
+| `/api/events` | down | `batch` | stream | A window's events, coalesced, and where the feed is (`at`). | A reconnect with `?after=<at>` is sent what it missed, or `resync` when the feed no longer has it. |
 | `/api/events` | down | `refused` | ack | What the page sent up that couldn't be read. | To that socket alone. |
 | `/api/terminal/ws` | up | `input` | command, refused while away | Keystrokes, never replayed later. | Not answered. |
 | `/api/terminal/ws` | up | `resize` | state | The newest wins. | Not answered. |
@@ -847,3 +849,33 @@ CIs typecheck the UI against them.
 | `/api/agents/tunnel` | up | `unread` | ack | A frame that came down that the runner couldn't read: its tag (`of`) and why. | Noted from the tunnel's address (`tunnel_down`); nothing goes back. |
 | `/api/agents/tunnel` | down | `datagram` | carried (tunnel) | The tunnel's own protocol. | As its class says. |
 | `/api/agents/tunnel` | down | `refused` | ack | What the runner sent that couldn't be read. | Read and logged by the runner. |
+
+### The events socket
+
+`/api/events` carries `crate::wire::events::ServerEvent`s, every frame `Hub::emit` sends, to every
+tab, narrowed to what its caller may see (W10's repositories, "Whose agents"). A page that asks
+for nothing more is sent each frame as it comes, as before. The UI asks for three things
+(`crate::wire::events::feed`, `ui/src/api/events.ts`), each opt-in, so an older page or server
+goes on as it did:
+
+- **Batches** (`?batch=1`, or `?after=`): the socket's first frame, and every one after it but
+  `refused`, is a `batch` (`EventsDown`): `{"t": "batch", "at": "<epoch>.<seq>", "events": [...]}`.
+  It gathers what came for 50 ms after its last send (T3 Code's `groupedWithin(512, 50 ms)`;
+  a frame after a quiet window goes at once, 512 at most go together). Of the frames that carry a
+  thing whole (`run`, `job`, `agent`, `harness` and `harness_closed` of one agent, `update_job`, a
+  land queue's entry), only each thing's newest goes, where the newest was, and none identical to
+  what that socket was last sent of it. "Fetch it again" frames (`updates`, `places`, `front_door`
+  ...) and the queue's counts go once a batch. Notices (`run.failed`, `mention` ...), samples,
+  `cd_apps` and every other frame all go, in their order.
+- **Topics** (`?topics=run,job`, then a `topics` frame up, `EventsUp`): only frames of those
+  types, and `resync`. A `topics` frame with a `since` (a batch's `at`) is also sent, of the types
+  new to it, what came after `since`: the page asks as it starts to load what needs them, so what
+  changes as it loads isn't missed. The page asks for the types its listeners name
+  (`events.on(types, fn)`, `useServerEvents(types, fn)`, the `on:` of the resources it shows or is
+  loading); a listener that names none has it ask for all.
+- **Resume** (`?after=<epoch>.<seq>`, a batch's `at`): every frame is numbered in a ring of the
+  newest 4,096, the size of the broadcast behind it, under an epoch drawn as the server starts.
+  A page that reconnects is sent what it missed, coalesced; when the epoch isn't this server's, or
+  the ring no longer has it, its first batch starts with `resync`, and the page loads what it shows
+  again. A socket that falls more than the ring behind is told `resync` too, as before.
+

@@ -56,9 +56,9 @@ export type Labels = Readonly<Record<string, string>>;
  * where all they have is its name.
  */
 export const useMachineLabels = create<Labels>(() => ({}));
-events.on((ev) => {
+events.on(["agent"], (ev) => {
   // A machine renamed: its event carries it whole, its label too.
-  if (ev.type === "agent") noteLabels([ev.agent]);
+  noteLabels([ev.agent]);
 });
 
 /** Keeps the labels of the agents that have one; the labels change (and what shows them re-renders) only when one did. */
@@ -121,7 +121,7 @@ export const recentRunsRes = (limit: number): Res<Run[]> => ({ key: `runs/recent
 /** The overview: counts, the queue, the server's subsystems and its latest sample. */
 export function useOverview() {
   const ov = useRes(overviewRes);
-  useServerEvents((ev) => {
+  useServerEvents(["queue", "sample"], (ev) => {
     // `queue` also says where a land queue's entry is: the counts are the scheduler's.
     if (ev.type === "queue" && "queued" in ev) ov.setData((d) => ({ ...d, queue: { queued: ev.queued, running: ev.running } }));
     else if (ev.type === "sample" && ev.agent === "server") ov.setData((d) => ({ ...d, system: { ...d.system, sample: ev.sample } }));
@@ -132,7 +132,7 @@ export function useOverview() {
 /** Every machine that has joined (Kubernetes job pods included: callers leave them out). */
 export function useAgentsLive() {
   const agents = useRes(agentsRes);
-  useServerEvents((ev) => {
+  useServerEvents(["agent", "sample"], (ev) => {
     if (ev.type === "agent") agents.setData((l) => upsert<Agent>(l, ev.agent, (a) => a.name, false));
     else if (ev.type === "sample" && ev.agent !== "server") agents.setData((l) => (l.some((a) => a.name === ev.agent) ? l.map((a) => (a.name === ev.agent ? { ...a, sample: ev.sample } : a)) : l));
   });
@@ -145,8 +145,8 @@ const HISTORY_CAP = 800;
 /** Every machine's last hour of samples (the server's under "server"), growing as they arrive. */
 export function useMetricsHistory() {
   const hist = useRes(historyRes);
-  useServerEvents((ev) => {
-    if (ev.type === "sample") hist.setData((h) => ({ ...h, [ev.agent]: [...(h[ev.agent] ?? []), ev.sample].slice(-HISTORY_CAP) }));
+  useServerEvents(["sample"], (ev) => {
+    hist.setData((h) => ({ ...h, [ev.agent]: [...(h[ev.agent] ?? []), ev.sample].slice(-HISTORY_CAP) }));
   });
   return hist;
 }
@@ -154,9 +154,8 @@ export function useMetricsHistory() {
 /** The newest `limit` runs, newest first, kept current by run events. */
 export function useRecentRuns(limit: number) {
   const runs = useRes(recentRunsRes(limit));
-  useServerEvents((ev) => {
-    if (ev.type === "run")
-      runs.setData((list) =>
+  useServerEvents(["run"], (ev) => {
+    runs.setData((list) =>
         upsert<Run>(list, ev.run, (r) => r.id)
           .sort((a, b) => b.created_at - a.created_at)
           .slice(0, limit),
@@ -192,8 +191,8 @@ export function fuller(a: UpdateJob | undefined, b: UpdateJob): UpdateJob {
  * System → Updates again.
  */
 export const useUpdateJobs = create<Record<string, UpdateJob>>(() => ({}));
-events.on((ev) => {
-  if (ev.type === "update_job") useUpdateJobs.setState((m) => ({ ...m, [ev.job.id]: fuller(m[ev.job.id], ev.job) }), true);
+events.on(["update_job"], (ev) => {
+  useUpdateJobs.setState((m) => ({ ...m, [ev.job.id]: fuller(m[ev.job.id], ev.job) }), true);
 });
 
 /** Upgrade jobs: the overview's and the live ones merged, newest first. */
