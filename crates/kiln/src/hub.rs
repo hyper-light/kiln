@@ -612,7 +612,7 @@ impl Hub {
         let tasks = crate::sync::tasks::Tasks::open(&cfg.data("sync"));
         let copies = crate::reach::copies::Copies::open(cfg.data("reach").join("copies.json"));
         let records: Arc<dyn kiln_seams::Records> = Arc::new(crate::records::StoreRecords::open(store.clone())?);
-        Ok(Arc::new(Self {
+        let hub = Arc::new(Self {
             cfg,
             store,
             records,
@@ -688,7 +688,11 @@ impl Hub {
             bus,
             search,
             flight: Default::default(),
-        }))
+        });
+        // What each agent session's owner shard tells the rest of kiln goes through the hub
+        // (`crate::harness::copies`).
+        hub.harness.bind(&hub);
+        Ok(hub)
     }
 
     /// A job of kiln's own release pipeline succeeded (`[updates]`), a v1 job or a leg of the CI
@@ -988,7 +992,7 @@ impl Hub {
     async fn noted_unread(&self, noted: crate::wire::unread::Noted) {
         self.audit_unread(noted.rows).await;
         for page in &noted.changed {
-            self.emit_refused(page);
+            self.emit_refused(page).await;
         }
     }
 
@@ -1055,7 +1059,7 @@ impl Hub {
 
     /// `page`'s refusals changed: its viewers are told, a runner's in its record, an agent
     /// session's in its info.
-    fn emit_refused(&self, page: &crate::wire::unread::Page) {
+    async fn emit_refused(&self, page: &crate::wire::unread::Page) {
         match page {
             crate::wire::unread::Page::Runner(name) => {
                 let a = self.agents.lock().get(name).cloned();
@@ -1065,7 +1069,7 @@ impl Hub {
             }
             crate::wire::unread::Page::Session(id) => {
                 let kept = self.refusals.lock().kept(page).cloned();
-                self.harness.set_refused(self, id, kept);
+                self.harness.set_refused(self, id, kept).await;
             }
         }
     }
@@ -1669,7 +1673,7 @@ impl Hub {
         self.agent_limits.moved(from, to);
         self.places.moved(from, to);
         self.sync.moved(from, to);
-        self.harness.move_machine(self, from, to);
+        self.harness.move_machine(self, from, to).await;
         if let Some(group) = self.store.group() {
             self.cluster.moved(group, from);
         }
@@ -1980,7 +1984,7 @@ impl Hub {
         }
         metrics::agent_samples().write().remove(name);
         // Its agent sessions keep running there too; they are announced again on reconnect.
-        self.harness.machine_lost(self, name);
+        self.harness.machine_lost(self, name).await;
         if self.ai_sessions.lock().remove(name).is_some() {
             self.emit(&ServerEvent::AiSessions { machine: name.to_owned() });
         }
@@ -2600,7 +2604,7 @@ impl Hub {
                 // and says nothing of where the session runs: whoever waits for it is told, and
                 // the session's messages still go where it runs.
                 u @ crate::harness::core::Update::Inbox { .. } => {
-                    self.harness.ingest_from(self, &crate::harness::registry::Location::Machine(agent.to_owned()), &session, u, false);
+                    self.harness.ingest_from(self, &crate::harness::registry::Location::Machine(agent.to_owned()), &session, u, false).await;
                 }
                 // The rest of what a copy left behind says (its machine was told to let go of it):
                 // none of it counts, and it doesn't take the session's messages from where it runs.
@@ -2642,12 +2646,19 @@ impl Hub {
                     // Opened: the work kiln handed it as it started is asked to be signed for, as
                     // it takes it up (docs/ci.md W27-R08).
                     let opened = matches!(u, crate::harness::core::Update::Open { .. });
-                    self.harness.ingest_from(self, &crate::harness::registry::Location::Machine(agent.to_owned()), &session, u, shipped);
+                    // To the shard that owns its copy (`crate::harness::copies`): this loop goes on
+                    // with the next as soon as it's handed over.
+                    self.harness.ingest_from(self, &crate::harness::registry::Location::Machine(agent.to_owned()), &session, u, shipped).await;
                     if opened {
+                        // An Open says where the session runs now: its copy takes it before this
+                        // loop checks the runner's next word against where it runs (`runs_on`).
+                        self.harness.applied(&session).await;
                         let (hub, id) = (Arc::clone(self), session.clone());
                         crate::rt::spawn(async move { crate::custody::ask_open(&hub, &id).await });
                     }
                     if closed {
+                        // Once its copy let it go: what's held is read from the copies.
+                        self.harness.applied(&session).await;
                         self.check_retire().await;
                         self.check_handover().await;
                     }
@@ -2694,7 +2705,7 @@ impl Hub {
                 }
                 let own = inv.sessions.clone();
                 inv.sessions.extend(others);
-                self.harness.inventory(self, agent, me.as_deref(), &present, inv);
+                self.harness.inventory(self, agent, me.as_deref(), &present, inv).await;
                 // Those it holds that still read disconnected a little later: its link dropped and
                 // came back, and they've had nothing to say since. Their snapshots bring them back
                 // as they are. Not at once: after a server restart every session reads disconnected
@@ -2904,7 +2915,11 @@ impl Hub {
         // Welcome not to send its sessions whole. An older runner skips the frame.
         self.send_peer(peer, &ServerMsg::Caps { caps: proto::CAP_WIRE | proto::CAP_NET_DROPS | proto::CAP_HANDOVER | proto::CAP_WORK | proto::CAP_AGENT_LIMIT | proto::CAP_IDENTITY | proto::CAP_HEADROOM | proto::CAP_CHANGES_PATCH | proto::CAP_UNREAD | proto::CAP_AGENT_GIT | proto::CAP_LEG_SIGNS | proto::CAP_CUSTODY | proto::CAP_RELAYS }).await;
         // What its sessions' copies have here, so a stream it starts sends only what they lack
-        // (`crate::wire::sums`): a few dozen sessions a frame, each about a kilobyte.
+        // (`crate::wire::sums`): a few dozen sessions a frame, each about a kilobyte. Once each
+        // copy's owner has applied what this loop handed it before (`crate::harness::copies`): a
+        // copy said to have less than it has would let go of the rest when the runner's Open
+        // comes, sending its viewers back to the session whole.
+        self.harness.settled().await;
         for part in self.harness.kept_on(&name).chunks(KEPT_A_FRAME) {
             self.send_peer(peer, &ServerMsg::Kept { sessions: part.to_vec() }).await;
         }
@@ -2949,7 +2964,7 @@ impl Hub {
             }
         }
         if !agents.is_empty() {
-            self.harness.sessions_lost(self, &agents);
+            self.harness.sessions_lost(self, &agents).await;
         }
         if !jobs.is_empty() {
             self.lost_instances.lock().insert(peer, (name.to_owned(), Instant::now(), jobs));
@@ -3895,13 +3910,13 @@ pub(crate) mod tests {
             let hub = scratch_hub().await?;
             let there = Location::Machine("box".into());
             let open = || Update::Open { info: Box::new(crate::harness::session::Info { id: "s1".into(), kind: "claude".into(), ..Default::default() }), since: None };
-            hub.harness.ingest(&hub, &there, "s1", open());
+            hub.harness.ingest(&hub, &there, "s1", open()).await;
             let mut events = hub.events.subscribe();
             let from = crate::wire::unread::Sender::Runner { name: "box".into(), instance: "main".into() };
             hub.note_unread(unread(crate::wire::unread::Wire::RunnerPayload, from), Some(crate::wire::unread::Page::Session("s1".into()))).await;
             let told: serde_json::Value = serde_json::from_str(&crate::rt::timeout(Duration::from_secs(5), events.recv()).await??)?;
             anyhow::ensure!(told.pointer("/type") == Some(&serde_json::json!("harness")) && told.pointer("/info/refused/counts/0/wire") == Some(&serde_json::json!("runner_payload")), "{told}");
-            hub.harness.ingest(&hub, &there, "s1", open());
+            hub.harness.ingest(&hub, &there, "s1", open()).await;
             let kept = hub.harness.list().into_iter().find(|i| i.id == "s1").and_then(|i| i.refused);
             anyhow::ensure!(kept.as_ref().map(crate::wire::unread::Kept::total) == Some(1), "kept across its runner's Open: {kept:?}");
             Ok(())

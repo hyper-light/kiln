@@ -764,7 +764,7 @@ mod end_to_end {
                 let early = crate::ops::call(cx.clone(), "agents.change", json!({"agent": agent})).await.err().map(|(_, m)| m).unwrap_or_default();
                 anyhow::ensure!(early.contains("still going"), "{early}");
                 std::fs::write(work.path().join(file), text)?;
-                anyhow::ensure!(hub.harness.set_changes(&agent, json!([{"path": format!("{cwd}/{file}"), "added": 1, "removed": 0}])), "no agent to set the changes of");
+                anyhow::ensure!(hub.harness.set_changes(&agent, json!([{"path": format!("{cwd}/{file}"), "added": 1, "removed": 0}])).await, "no agent to set the changes of");
                 let a = agent.clone();
                 hub.store.call(move |c| Ok(c.execute("UPDATE goal_items SET status = 'met' WHERE agent = ?1", rusqlite::params![a])?)).await?;
                 agents::advance(&hub, &run).await?;

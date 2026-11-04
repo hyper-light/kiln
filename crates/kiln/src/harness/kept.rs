@@ -280,7 +280,7 @@ async fn keep(hub: &Arc<Hub>, job: Job) {
         Ok(Ok(())) => {}
         Ok(Err(e)) | Err(e) => tracing::warn!(error = %format!("{e:#}"), "couldn't keep a conversation's list of files"),
     }
-    hub.harness.files_added(&job.session, &added);
+    hub.harness.files_added(&job.session, &added).await;
 }
 
 /// One mention: the file as it is now, copied when it fits. `None` when there's nothing to say
