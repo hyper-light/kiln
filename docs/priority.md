@@ -306,6 +306,29 @@ What headroom reads now ("headroom listens to the server", above) is every probe
 between two reads, against the shards' 10 ms period: calm's mean stayed within 0.21-0.44 ms over 2 s,
 kiln.slice's weight's 0.31-0.85, and the shared cgroup's reached 2.8 (4.5 at p90).
 
+**With the fix (`e4219270345`, server and runner).** Research 01a1a59c2b2a, f50 and f51:
+
+- **Where the weights hold the server, it holds still.** With 32 hog threads at kiln.slice's
+  weight, the server's mean delay between reads stayed at 0.23-0.27 ms (calm 0.22), and the target's
+  CUSUM at 0 (18:35 to 18:39 UTC). Its one cut came from the runner-disk target (an fsync of 0.5 s),
+  raised back within 6 s, as on main.
+- **Where they don't, it slows the legs before harm.** With the server sharing the runner's cgroup,
+  32 hog threads raised the mean to 0.5-0.8 ms (calm 0.2-0.3), short of trouble. 64 more raised it to
+  4.6 ms, and 23 s after they started headroom alarmed on the server's delay ("typical 0.4 ms, now
+  4.6 ms (CUSUM 1.49 past 1.17)") and cut kiln's CPU from 15.3 cores to 7.6, pacing the legs and
+  agents (18:52:39 UTC). On main the same load went four minutes with no alarm.
+
+What the lab couldn't show is the delay coming back down with the legs paced: within a minute of that
+cut, other agents' work restarting after a reset took fedora from 57 GB available to 1 GB (a load of
+280), every reading stalled, and the lab was stopped so as not to add to it. Twice before, fedora
+had reset under the same pressure (16:48 and 18:45 UTC), and once more after (18:58). In run 5, the
+same machine-wide stall came minutes after the server joined the runner's cgroup: headroom cut
+kiln's CPU to nothing and froze its groups 94-100% of the time, and the readings stayed at seconds,
+since the stall wasn't kiln's. The engine's test with the lab's numbers
+(`headroom::tests::g8_s5_the_servers_delay_rising_slows_legs_and_agents`) shows the rest: the cut
+paces the leg and the agent alike, and the delay back down clears the alarm, the cut held until the
+level holds.
+
 ## Needs root, or a person
 
 - A system install (root, once) for the top-level `kiln.slice`, the partition, and the server's
