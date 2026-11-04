@@ -25,6 +25,9 @@
 //!
 //! **One per process.** The pool's channels and shares are a process-wide static set once by [`start`];
 //! [`stop`] runs the jobs admitted and joins every thread, after which a second start is refused.
+//!
+//! **Observed** (kiln's departure, ORIGIN.md): a consumer may be told of each job as it ends, its share, its
+//! wait for a place and its run ([`observe`]), to derive each share's size from what its calls do.
 
 use std::collections::VecDeque;
 use std::sync::OnceLock;
@@ -82,6 +85,21 @@ pub struct Stats {
     pub finished: u64,
     /// Of those, jobs that panicked: their receivers see the sender gone; the worker and the share live on.
     pub panicked: u64,
+}
+
+/// What the pool tells its consumer of each job as it ends ([`observe`]): the job's share, how long it waited
+/// for one of the share's places (from its submission to its start) and how long it ran, in nanoseconds.
+pub type Observer = fn(share: &'static str, waited_ns: u64, ran_ns: u64);
+
+/// The consumer's observer, once set.
+static OBSERVER: OnceLock<Observer> = OnceLock::new();
+
+/// Has the pool tell `observer` of each job it runs, as the job ends: its share, how long it waited for one of
+/// its share's places and how long it ran. These are the consumer's measurements to size its shares from
+/// (Little's law: the jobs a share holds at once are the rate they come at times the time each takes); a
+/// pool no one observes reads no clock. Once per process: false when an observer was set already.
+pub fn observe(observer: Observer) -> bool {
+    OBSERVER.set(observer).is_ok()
 }
 
 type Job = Box<dyn FnOnce() + Send>;
@@ -350,8 +368,21 @@ where
     let (sender, receiver) = oneshot().inspect_err(|_| {
         state.held.fetch_sub(1, Ordering::AcqRel);
     })?;
+    // Only an observed pool reads the clock: as the job is submitted, as it starts and as it ends.
+    let observer = OBSERVER.get().copied();
+    let submitted_ns = observer.map(|_| crate::machine::clock::monotonic_ns());
+    let name = state.share.name;
     let wrapped: Job = Box::new(move || {
+        let started_ns = submitted_ns.map(|_| crate::machine::clock::monotonic_ns());
         let outcome = crate::unwind::contained(job);
+        if let (Some(observer), Some(submitted_ns), Some(started_ns)) =
+            (observer, submitted_ns, started_ns)
+        {
+            let ran_ns = crate::machine::clock::monotonic_ns().saturating_sub(started_ns);
+            let waited_ns = started_ns.saturating_sub(submitted_ns);
+            // The consumer's code: inside an unwind boundary of its own.
+            let _ = crate::unwind::contained(|| observer(name, waited_ns, ran_ns));
+        }
         if outcome.is_none() {
             PANICKED.fetch_add(1, Ordering::Relaxed);
         }

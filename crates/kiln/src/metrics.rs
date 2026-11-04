@@ -1200,6 +1200,7 @@ pub fn render() -> String {
     render_wire(&mut o);
     crate::shard_health::render(&mut o);
     crate::route_latency::render(&mut o);
+    crate::pool_health::render(&mut o);
 
     let samples = agent_samples().read();
     if !samples.is_empty() {

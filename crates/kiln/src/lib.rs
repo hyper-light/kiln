@@ -59,6 +59,7 @@ pub mod programs;
 pub mod proc;
 pub mod proto;
 pub mod peers;
+pub mod pool_health;
 pub mod push;
 pub mod reach;
 pub mod reads;
