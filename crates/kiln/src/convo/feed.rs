@@ -24,7 +24,7 @@ use futures::future::BoxFuture;
 use kiln_ci::identity::statement::Subject;
 use serde::{Deserialize, Serialize};
 
-use super::store::{Changes, Store};
+use super::store::{Change, Changes, Store};
 use super::telemetry::{PeerView, Report, ShipStats, ShipView};
 use crate::proto;
 
@@ -147,22 +147,18 @@ pub fn decode(json: &str) -> Option<Msg> {
 /// Compression quality for a batch on the wire: fast, and most of the gain.
 const ZIP_QUALITY: u32 = 4;
 
+/// brotli's buffer, both ways; and so a unit of a batch's decoding on the compute pool ([`decode_batch`]): one read
+/// of the decompressor's, or hashing as much, a few microseconds, well inside a piece.
+const ZIP_BUFFER: usize = 4096;
+
 fn zip(bytes: &[u8]) -> anyhow::Result<Vec<u8>> {
     use std::io::Write as _;
     let mut out = Vec::with_capacity(bytes.len() / 4 + 16);
     {
-        let mut w = brotli::CompressorWriter::new(&mut out, 4096, ZIP_QUALITY, 22);
+        let mut w = brotli::CompressorWriter::new(&mut out, ZIP_BUFFER, ZIP_QUALITY, 22);
         w.write_all(bytes)?;
         w.flush()?;
     }
-    Ok(out)
-}
-
-fn unzip(bytes: &[u8]) -> anyhow::Result<Vec<u8>> {
-    use std::io::Read as _;
-    let mut out = Vec::new();
-    brotli::Decompressor::new(bytes, 4096).take(BATCH_MAX as u64 + 1).read_to_end(&mut out)?;
-    anyhow::ensure!(out.len() <= BATCH_MAX, "a batch too large to take");
     Ok(out)
 }
 
@@ -681,27 +677,23 @@ fn take(feed: &Feed<'_>, taking: &mut HashMap<(hyper_transport::PeerId, String),
             }
             let Some(done) = t.batch.take() else { return Vec::new() };
             let wire = done.bytes.len() as u64;
-            let read = if done.zip { unzip(&done.bytes) } else { Ok(done.bytes) };
             // What came, checked against its giver's hand-on before anything of it is taken
             // (docs/ci.md W27-R08): a batch that isn't what its giver signed for is refused, and
-            // the receipt of what came records the break.
-            let signed = match (&read, feed.custodian, done.hand_on.as_deref()) {
-                (Ok(b), Some(c), Some(h)) => {
-                    let got = batch_thing(&s, from, upto, &crate::util::sha256_hex(b));
-                    if got.digest.get("sha256") != handed(h).as_ref() {
-                        tracing::warn!(%machine, store = %s, from, upto, "conversation feed: a batch isn't what its giver's hand-on says: refused");
-                        c.received(machine, h, got);
-                        feed.note(machine, &s, |v| v.errors += 1);
-                        let rev = stands_now(taking);
-                        return tell(taking, rev);
+            // the receipt of what came records the break. Unzipped, checked and parsed on the
+            // compute pool, this thread waiting for it ([`decode_batch`]).
+            let signer = feed.custodian.zip(done.hand_on.as_deref());
+            let (batch, signed) = match decode_batch(done.bytes, done.zip, signer.map(|(_, h)| handed(h))) {
+                Decoded::Read(batch, sha256) => (batch, signer.zip(sha256).map(|((c, h), sha256)| (c, h.to_owned(), batch_thing(&s, from, upto, &sha256)))),
+                Decoded::NotAsHanded(sha256) => {
+                    tracing::warn!(%machine, store = %s, from, upto, "conversation feed: a batch isn't what its giver's hand-on says: refused");
+                    if let Some((c, h)) = signer {
+                        c.received(machine, h, batch_thing(&s, from, upto, &sha256));
                     }
-                    Some((c, h.to_owned(), got))
+                    feed.note(machine, &s, |v| v.errors += 1);
+                    let rev = stands_now(taking);
+                    return tell(taking, rev);
                 }
-                _ => None,
-            };
-            let batch: Changes = match read.and_then(|b| serde_json::from_slice(&b).map_err(anyhow::Error::from)) {
-                Ok(b) => b,
-                Err(e) => {
+                Decoded::Unreadable(e) => {
                     tracing::warn!(%machine, error = %format!("{e:#}"), "conversation feed: an unreadable batch");
                     feed.note(machine, &s, |v| v.errors += 1);
                     let rev = stands_now(taking);
@@ -754,6 +746,217 @@ fn take(feed: &Feed<'_>, taking: &mut HashMap<(hyper_transport::PeerId, String),
         }
         Msg::From { .. } | Msg::Ack { .. } | Msg::Restore { .. } | Msg::Restored { .. } | Msg::Stats { .. } => Vec::new(),
     }
+}
+
+// ----------------------------------------------------------------------- a whole batch, decoded
+
+/// What a whole batch's bytes came to ([`decode_batch`]).
+enum Decoded {
+    /// Its rows, with the SHA-256 of their JSON where it was checked.
+    Read(Changes, Option<String>),
+    /// Its JSON isn't what its giver's hand-on says (this is its SHA-256): refused before it's parsed.
+    NotAsHanded(String),
+    /// It couldn't be unzipped or parsed.
+    Unreadable(anyhow::Error),
+}
+
+/// A whole batch's `bytes` (brotli-compressed when `zip`) unzipped, checked and parsed on the compute pool, in
+/// pieces (goal 3, plan 01a1a59c2a8e step 3): unzipped and hashed a buffer at a time and parsed a row at a
+/// time, the piece given up where another job waits for its thread ([`Decoding`]). The intake's thread did
+/// all three at once, a batch of two MiB at a time, at the shards' own priority. `check`, where the batch is
+/// checked against its giver's hand-on: the SHA-256 the hand-on says it has (none where it says none that
+/// can be read); checked before the batch is parsed. The intake's thread waits for it, so the batches it
+/// takes are taken in the order they came.
+fn decode_batch(bytes: Vec<u8>, zip: bool, check: Option<Option<String>>) -> Decoded {
+    crate::rt::compute_pieces_blocking(Decoding::new(bytes, zip, check), |d, turn| d.piece(turn)).unwrap_or_else(Decoded::Unreadable)
+}
+
+/// A whole batch being decoded ([`decode_batch`]): where it stands.
+struct Decoding {
+    /// Its JSON so far: as it came, or as far as it's unzipped.
+    json: Vec<u8>,
+    /// What's left to unzip, when it came compressed.
+    unzip: Option<brotli::Decompressor<std::io::Cursor<Vec<u8>>>>,
+    /// Where it's checked: its SHA-256 so far, how much of `json` that has taken, and what its hand-on says.
+    check: Option<(sha2::Sha256, usize, Option<String>)>,
+    /// Its JSON's SHA-256, once checked.
+    sha256: Option<String>,
+    /// Its rows, as far as they're read.
+    reading: Reading,
+}
+
+impl Decoding {
+    fn new(bytes: Vec<u8>, zip: bool, check: Option<Option<String>>) -> Self {
+        use sha2::Digest as _;
+        let (json, unzip) = if zip { (Vec::new(), Some(brotli::Decompressor::new(std::io::Cursor::new(bytes), ZIP_BUFFER))) } else { (bytes, None) };
+        Self { json, unzip, check: check.map(|says| (sha2::Sha256::new(), 0, says)), sha256: None, reading: Reading::default() }
+    }
+
+    /// A piece: units of the work until it's done, or until its turn says another job waits for the thread.
+    fn piece(&mut self, turn: &crate::rt::Turn<'_>) -> crate::rt::Step<Decoded> {
+        loop {
+            match self.unit() {
+                Ok(Some(done)) => return crate::rt::Step::Done(done),
+                Ok(None) if turn.over() => return crate::rt::Step::More,
+                Ok(None) => {}
+                Err(e) => return crate::rt::Step::Done(Decoded::Unreadable(e)),
+            }
+        }
+    }
+
+    /// One unit, in order: a buffer of what's come and isn't hashed yet, hashed; a buffer unzipped; the check,
+    /// once all of it is in; a step of reading its rows. What it came to, once it's done.
+    fn unit(&mut self) -> anyhow::Result<Option<Decoded>> {
+        use sha2::Digest as _;
+        use std::io::Read as _;
+        if let Some((sha256, hashed, _)) = &mut self.check
+            && *hashed < self.json.len()
+        {
+            let to = hashed.saturating_add(ZIP_BUFFER).min(self.json.len());
+            sha256.update(self.json.get(*hashed..to).unwrap_or_default());
+            *hashed = to;
+            return Ok(None);
+        }
+        if let Some(unzip) = &mut self.unzip {
+            let at = self.json.len();
+            self.json.resize(at.saturating_add(ZIP_BUFFER), 0);
+            let (n, ended) = match unzip.read(self.json.get_mut(at..).unwrap_or_default()) {
+                Ok(n) => (n, n == 0),
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => (0, false),
+                Err(e) => return Err(e.into()),
+            };
+            self.json.truncate(at.saturating_add(n));
+            anyhow::ensure!(self.json.len() <= BATCH_MAX, "a batch too large to take");
+            if ended {
+                self.unzip = None;
+            }
+            return Ok(None);
+        }
+        if let Some((sha256, _, says)) = self.check.take() {
+            let sha256 = hex::encode(sha256.finalize());
+            if says.as_deref() != Some(sha256.as_str()) {
+                return Ok(Some(Decoded::NotAsHanded(sha256)));
+            }
+            self.sha256 = Some(sha256);
+            return Ok(None);
+        }
+        Ok(self.reading.step(&self.json)?.map(|batch| Decoded::Read(batch, self.sha256.take())))
+    }
+}
+
+/// A batch's [`Changes`] read from its JSON a step at a time ([`Decoding`]): a member's name and value, or
+/// one of its rows. Where its JSON isn't as a feed writes it (a member missing or repeated, rows that aren't
+/// an array, anything after the object), it's read whole instead, as it was before, so what's read, or why
+/// it can't be, is serde's own.
+#[derive(Default)]
+struct Reading {
+    /// Where the next thing starts in the JSON.
+    at: usize,
+    within: Within,
+    rows: Option<Vec<Change>>,
+    upto: Option<u64>,
+}
+
+/// Where a [`Reading`] stands in a batch's object.
+#[derive(Default, Clone, Copy, PartialEq, Eq)]
+enum Within {
+    /// Before the object.
+    #[default]
+    Start,
+    /// Before a member's name.
+    Name,
+    /// Before one of the rows.
+    Row,
+    /// After a member's value: a comma, or the object's end.
+    After,
+}
+
+impl Reading {
+    /// A step: the batch, once it's all read.
+    fn step(&mut self, json: &[u8]) -> anyhow::Result<Option<Changes>> {
+        match self.as_written(json) {
+            Some(read) => Ok(read),
+            None => Ok(Some(serde_json::from_slice(json)?)),
+        }
+    }
+
+    /// A step of a batch as a feed writes it: none where the JSON isn't.
+    fn as_written(&mut self, json: &[u8]) -> Option<Option<Changes>> {
+        self.at = past_space(json, self.at);
+        match self.within {
+            Within::Start => {
+                self.at = past(json, self.at, b'{')?;
+                self.within = Within::Name;
+            }
+            Within::Name => {
+                let name: String = self.value(json)?;
+                self.at = past(json, past_space(json, self.at), b':')?;
+                self.at = past_space(json, self.at);
+                match name.as_str() {
+                    "rows" if self.rows.is_none() => {
+                        self.at = past_space(json, past(json, self.at, b'[')?);
+                        self.rows = Some(Vec::new());
+                        self.within = match past(json, self.at, b']') {
+                            Some(at) => {
+                                self.at = at;
+                                Within::After
+                            }
+                            None => Within::Row,
+                        };
+                    }
+                    "upto" if self.upto.is_none() => {
+                        self.upto = Some(self.value(json)?);
+                        self.within = Within::After;
+                    }
+                    "rows" | "upto" => return None,
+                    _ => {
+                        let _: serde::de::IgnoredAny = self.value(json)?;
+                        self.within = Within::After;
+                    }
+                }
+            }
+            Within::Row => {
+                let row: Change = self.value(json)?;
+                self.rows.as_mut()?.push(row);
+                let at = past_space(json, self.at);
+                match json.get(at) {
+                    Some(b',') => self.at = at + 1,
+                    Some(b']') => {
+                        self.at = at + 1;
+                        self.within = Within::After;
+                    }
+                    _ => return None,
+                }
+            }
+            Within::After => match json.get(self.at) {
+                Some(b',') => {
+                    self.at += 1;
+                    self.within = Within::Name;
+                }
+                Some(b'}') if past_space(json, self.at + 1) == json.len() => return Some(Some(Changes { rows: self.rows.take()?, upto: self.upto.take()? })),
+                _ => return None,
+            },
+        }
+        Some(None)
+    }
+
+    /// The JSON value where the reading stands, as a `T`, and the reading moved past it.
+    fn value<'a, T: serde::Deserialize<'a>>(&mut self, json: &'a [u8]) -> Option<T> {
+        let mut values = serde_json::Deserializer::from_slice(json.get(self.at..)?).into_iter::<T>();
+        let value = values.next()?.ok()?;
+        self.at = self.at.checked_add(values.byte_offset())?;
+        Some(value)
+    }
+}
+
+/// Past the JSON whitespace at `at`.
+fn past_space(json: &[u8], at: usize) -> usize {
+    at + json.get(at..).map_or(0, |rest| rest.iter().take_while(|b| matches!(b, b' ' | b'\n' | b'\r' | b'\t')).count())
+}
+
+/// Past `byte`, where it's at `at`.
+fn past(json: &[u8], at: usize, byte: u8) -> Option<usize> {
+    (json.get(at) == Some(&byte)).then_some(at + 1)
 }
 
 #[cfg(test)]
@@ -1227,5 +1430,110 @@ mod tests {
             assert_eq!(ids, vec!["m1".to_owned(), "m3".to_owned()]);
             Ok(())
         })
+    }
+
+    /// A batch of a few hundred rows (events and a long record line), as a feed reads it from a store.
+    fn a_batch() -> anyhow::Result<Changes> {
+        let (_r, runner) = super::super::store::scratch()?;
+        runner.send("a1", &Update::State { state: Box::new(State { title: "parser".into(), ..State::default() }) });
+        for i in 1..=300u64 {
+            runner.send("a1", &said(&format!("m{i}"), i, &format!("reply {i} {}", "x".repeat(700))));
+        }
+        runner.put(vec![line("a1", "s-1", 0, &format!("{{\"type\":\"user\",\"blob\":\"{}\"}}", "y".repeat(100_000)))]);
+        runner.sync()?;
+        runner.changes(0, 64 << 20)
+    }
+
+    /// What [`decode_batch`] makes of `json`, sent as it is and compressed: the same both ways.
+    fn decoded(json: &[u8], check: Option<Option<String>>) -> anyhow::Result<Result<(Changes, Option<String>), String>> {
+        let as_is = decode_batch(json.to_vec(), false, check.clone());
+        let zipped = decode_batch(zip(json)?, true, check);
+        let read = |d: Decoded| match d {
+            Decoded::Read(b, sha) => Ok((b, sha)),
+            Decoded::NotAsHanded(sha) => Err(format!("not as handed on: {sha}")),
+            Decoded::Unreadable(e) => Err(format!("unreadable: {e:#}")),
+        };
+        let (as_is, zipped) = (read(as_is), read(zipped));
+        anyhow::ensure!(format!("{as_is:?}") == format!("{zipped:?}"), "as it is {as_is:?}, compressed {zipped:?}");
+        Ok(as_is)
+    }
+
+    /// Goal 3, plan 01a1a59c2a8e step 3: a whole batch decoded on the compute pool, a row at a time, reads
+    /// as serde read it whole, sent as it is or compressed: as a feed writes it, its members the other way
+    /// round or with one kiln doesn't know, spaced out; and where it can't be read, its error is serde's.
+    #[test]
+    fn g3_s3_a_batch_decoded_in_pieces_reads_as_it_did_whole() -> anyhow::Result<()> {
+        let batch = a_batch()?;
+        anyhow::ensure!(batch.rows.len() > 300, "{} rows", batch.rows.len());
+        let json = serde_json::to_vec(&batch)?;
+        anyhow::ensure!(decoded(&json, None)? == Ok((batch.clone(), None)));
+        let rows = serde_json::to_string(&batch.rows)?;
+        for shape in [
+            format!("{{\"upto\":{},\"rows\":{rows}}}", batch.upto),
+            format!(" {{ \"rows\" :\n {rows} ,\t\"later\": [1, {{\"x\": \"]\"}}], \"upto\" : {} }} \n", batch.upto),
+            format!("{{\"rows\":[],\"upto\":{}}}", batch.upto),
+        ] {
+            let whole: Changes = serde_json::from_slice(shape.as_bytes())?;
+            anyhow::ensure!(decoded(shape.as_bytes(), None)? == Ok((whole, None)), "{}", shape.chars().take(80).collect::<String>());
+        }
+        // Not as a feed writes it: read whole, so the outcome is serde's, error and all.
+        for odd in [
+            format!("{{\"rows\":{rows}}}"),
+            format!("{{\"rows\":{rows},\"rows\":[],\"upto\":1}}"),
+            format!("{{\"rows\":{rows},\"upto\":1}} trailing"),
+            "{\"rows\":{},\"upto\":1}".to_owned(),
+            "{\"rows\":[{\"rev\":1}],\"upto\":1}".to_owned(),
+            format!("[{rows},{}]", batch.upto),
+            "{\"rows\":[".to_owned(),
+            String::new(),
+        ] {
+            let whole = serde_json::from_slice::<Changes>(odd.as_bytes()).map(|b| (b, None)).map_err(|e| format!("unreadable: {e}"));
+            anyhow::ensure!(decoded(odd.as_bytes(), None)? == whole, "{}", odd.chars().take(80).collect::<String>());
+        }
+        Ok(())
+    }
+
+    /// Goal 3, plan 01a1a59c2a8e step 3, and W27-R08: a batch is checked against its giver's hand-on before
+    /// it's parsed, by the SHA-256 of its JSON as it came unzipped: as handed on, read, its digest kept; not,
+    /// refused, with the digest of what came; a hand-on that says nothing readable refuses it too.
+    #[test]
+    fn g3_s3_a_batch_is_checked_against_its_hand_on_before_it_is_parsed() -> anyhow::Result<()> {
+        let batch = a_batch()?;
+        let json = serde_json::to_vec(&batch)?;
+        let sha = crate::util::sha256_hex(&json);
+        anyhow::ensure!(decoded(&json, Some(Some(sha.clone())))? == Ok((batch, Some(sha.clone()))));
+        anyhow::ensure!(decoded(&json, Some(Some("0".repeat(64))))? == Err(format!("not as handed on: {sha}")));
+        anyhow::ensure!(decoded(&json, Some(None))? == Err(format!("not as handed on: {sha}")));
+        // Checked before it's parsed: what isn't JSON at all, and isn't as handed on, is refused, not unreadable.
+        let junk = b"not json".to_vec();
+        anyhow::ensure!(decoded(&junk, Some(None))? == Err(format!("not as handed on: {}", crate::util::sha256_hex(&junk))));
+        Ok(())
+    }
+
+    /// Goal 3, plan 01a1a59c2a8e step 3: a batch's decoding is many small units, so its piece can end at
+    /// any of them (where another job waits for the pool's thread): a buffer unzipped or hashed at a time,
+    /// a row at a time; none of them larger than a buffer of the JSON or one row.
+    #[test]
+    fn g3_s3_a_batchs_decoding_is_small_units() -> anyhow::Result<()> {
+        let batch = a_batch()?;
+        let json = serde_json::to_vec(&batch)?;
+        let mut d = Decoding::new(zip(&json)?, true, Some(Some(crate::util::sha256_hex(&json))));
+        let (mut units, mut biggest) = (0usize, 0usize);
+        let read = loop {
+            let (at, json_before) = (d.reading.at, d.json.len());
+            let done = d.unit()?;
+            units += 1;
+            biggest = biggest.max((d.reading.at - at).max(d.json.len() - json_before));
+            if let Some(done) = done {
+                break done;
+            }
+            anyhow::ensure!(units < 10 * json.len(), "no end");
+        };
+        anyhow::ensure!(matches!(&read, Decoded::Read(b, Some(_)) if *b == batch), "{}", match read { Decoded::Read(..) => "read, but not the batch".to_owned(), Decoded::NotAsHanded(s) => s, Decoded::Unreadable(e) => format!("{e:#}") });
+        // Unzipped and hashed a buffer at a time, then read a row at a time.
+        let longest_row = batch.rows.iter().map(|c| serde_json::to_vec(c).map_or(0, |v| v.len())).max().unwrap_or(0);
+        anyhow::ensure!(units >= 2 * json.len() / ZIP_BUFFER + batch.rows.len(), "{units} units for {} bytes and {} rows", json.len(), batch.rows.len());
+        anyhow::ensure!(biggest <= ZIP_BUFFER.max(longest_row + 2), "a unit of {biggest} bytes");
+        Ok(())
     }
 }
