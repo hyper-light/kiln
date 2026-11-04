@@ -1,0 +1,221 @@
+//! How long each class of the server's work waits and takes, on `/metrics` (goal 1, plan
+//! 01a1a59c2a68 step 2): a histogram for each route class of how long its work waited before its
+//! handler started (`kiln_route_wait_seconds`) and how long the handler then took
+//! (`kiln_route_seconds`).
+//!
+//! The classes, and where each is timed:
+//! - `page`: the UI's pages and files (a GET or HEAD outside `/api`), and `api_read` and `api_write`:
+//!   the API's reads (GET, HEAD) and changes (the rest, the MCP endpoint's calls among them). From the
+//!   request's head arriving off its socket (kiln-http's [`kiln_http::Received`]) to its handler's
+//!   start, then to its response's head. A WebSocket's opening isn't one: its frames are.
+//! - `websocket`: the frames of an agent session's live feed going out to a viewer's socket. From the
+//!   frame's publish on the bus to the viewer's task reading it, then to its write on the socket.
+//! - `runner`: what runners send. A message off a runner's link, from the network thread handing it
+//!   over to the hub starting on it, then to the hub having applied it; and runners' and their jobs'
+//!   own HTTP routes (enrolling, sync's contents, artifacts, CI's runtime services), as requests are.
+//!
+//! Every histogram is atomics only ([`Histogram`]): no lock on any path that times or reads one.
+//! Time a request waited in its socket while its shard was busy shows in `kiln_shard_delay_seconds`
+//! (`crate::shard_health`): the runtime doesn't say when a task was woken.
+
+use std::fmt::Write as _;
+use std::sync::OnceLock;
+use std::time::Duration;
+
+use http::Method;
+
+use crate::metrics::{Histogram, STALL_BUCKETS};
+
+/// What the server's work is, as timed here.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Class {
+    Page,
+    ApiRead,
+    ApiWrite,
+    Websocket,
+    Runner,
+}
+
+impl Class {
+    pub const ALL: [Class; 5] = [Class::Page, Class::ApiRead, Class::ApiWrite, Class::Websocket, Class::Runner];
+
+    pub fn name(self) -> &'static str {
+        match self {
+            Class::Page => "page",
+            Class::ApiRead => "api_read",
+            Class::ApiWrite => "api_write",
+            Class::Websocket => "websocket",
+            Class::Runner => "runner",
+        }
+    }
+
+    fn index(self) -> usize {
+        match self {
+            Class::Page => 0,
+            Class::ApiRead => 1,
+            Class::ApiWrite => 2,
+            Class::Websocket => 3,
+            Class::Runner => 4,
+        }
+    }
+}
+
+/// Each class's histograms, in [`Class::ALL`]'s order.
+pub struct Routes {
+    wait: [Histogram; 5],
+    took: [Histogram; 5],
+}
+
+impl Routes {
+    fn new() -> Self {
+        Self { wait: std::array::from_fn(|_| Histogram::new(STALL_BUCKETS)), took: std::array::from_fn(|_| Histogram::new(STALL_BUCKETS)) }
+    }
+
+    /// Work of `class` that waited `wait` (where it's known) and took `took`.
+    pub fn observe(&self, class: Class, wait: Option<Duration>, took: Duration) {
+        let i = class.index();
+        if let (Some(w), Some(h)) = (wait, self.wait.get(i)) {
+            h.observe(w.as_secs_f64());
+        }
+        if let Some(h) = self.took.get(i) {
+            h.observe(took.as_secs_f64());
+        }
+    }
+
+    /// `class`'s histograms: how long its work waited, and took.
+    pub fn of(&self, class: Class) -> Option<(&Histogram, &Histogram)> {
+        Some((self.wait.get(class.index())?, self.took.get(class.index())?))
+    }
+}
+
+/// The server's.
+pub fn routes() -> &'static Routes {
+    static R: OnceLock<Routes> = OnceLock::new();
+    R.get_or_init(Routes::new)
+}
+
+/// Work of `class` that waited `wait` and took `took`, on the server's histograms.
+pub fn observe(class: Class, wait: Option<Duration>, took: Duration) {
+    routes().observe(class, wait, took);
+}
+
+/// A request's class, by its method and path; `None` for a WebSocket's opening (`upgrade`), whose
+/// frames are timed instead.
+pub fn class_of(method: &Method, path: &str, upgrade: bool) -> Option<Class> {
+    if upgrade {
+        return None;
+    }
+    let read = *method == Method::GET || *method == Method::HEAD;
+    let api = if read { Class::ApiRead } else { Class::ApiWrite };
+    let segs: Vec<&str> = path.split('/').filter(|s| !s.is_empty()).collect();
+    if runners(&segs) {
+        return Some(Class::Runner);
+    }
+    let kiln_s_own = match segs.first().copied() {
+        Some("api" | "metrics" | "healthz" | "readyz" | "livez" | "v1" | "v2" | "dl" | "install.sh" | "install.ps1" | "ca.pem" | "ca.crt" | "ca.mobileconfig") => true,
+        // Git, CI's GitHub-shaped routes and the OIDC issuer, at the root as their clients ask.
+        _ => crate::ci::api::is_open(&segs),
+    };
+    Some(if kiln_s_own || !read { api } else { Class::Page })
+}
+
+/// Routes runners and their jobs call: enrolling and their link's tunnel, a job's source and
+/// artifacts, sync's contents and bundles, a learner's copy of the store, Observe's snapshots, a
+/// fleet build's own routes, the binaries runners fetch, and CI's runtime services (the cache and
+/// artifacts actions ask of `_apis` and `twirp`, kiln's `_kiln`).
+fn runners(segs: &[&str]) -> bool {
+    matches!(
+        segs,
+        ["api", "agents", "enroll" | "instance" | "rekey" | "tunnel"]
+            | ["api", "jobs", _, "source"]
+            | ["api", "jobs", _, "artifacts", ..]
+            | ["api", "sync", ..]
+            | ["api", "cluster", "copy"]
+            | ["api", "observe", "v1", "snapshot", ..]
+            | ["api", "updates", "jobs", _, "source" | "binary"]
+            | ["dl", ..]
+            | ["_apis" | "twirp" | "_kiln", ..]
+    )
+}
+
+/// The `kiln_route_*` families, in the exposition.
+pub fn render(o: &mut String) {
+    let r = routes();
+    let _ = writeln!(
+        o,
+        "# HELP kiln_route_wait_seconds How long the server's work waited before its handler started, by class (page, api_read, api_write, websocket, runner).\n# TYPE kiln_route_wait_seconds histogram"
+    );
+    for c in Class::ALL {
+        if let Some((wait, _)) = r.of(c) {
+            wait.render(o, "kiln_route_wait_seconds", &format!("class=\"{}\"", c.name()));
+        }
+    }
+    let _ = writeln!(o, "# HELP kiln_route_seconds How long the server's work took once its handler started, by class.\n# TYPE kiln_route_seconds histogram");
+    for c in Class::ALL {
+        if let Some((_, took)) = r.of(c) {
+            took.render(o, "kiln_route_seconds", &format!("class=\"{}\"", c.name()));
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Goal 1, plan 01a1a59c2a68 step 2: each request is its own class's.
+    #[test]
+    fn g1_s2_each_request_is_its_own_class() {
+        let get = Method::GET;
+        let post = Method::POST;
+        let class = |m: &Method, p: &str| class_of(m, p, false);
+        // Pages: the UI's paths and files, and pages agents show.
+        assert_eq!(class(&get, "/"), Some(Class::Page));
+        assert_eq!(class(&get, "/agents/01a19ff6"), Some(Class::Page));
+        assert_eq!(class(&Method::HEAD, "/assets/index-3f2a.js"), Some(Class::Page));
+        assert_eq!(class(&get, "/v/abc/index.html"), Some(Class::Page));
+        // The API's reads and changes; kiln's own reads at the root.
+        assert_eq!(class(&get, "/api/harness/sessions"), Some(Class::ApiRead));
+        assert_eq!(class(&get, "/metrics"), Some(Class::ApiRead));
+        assert_eq!(class(&get, "/healthz"), Some(Class::ApiRead));
+        assert_eq!(class(&post, "/api/harness/sessions/s1/command"), Some(Class::ApiWrite));
+        assert_eq!(class(&post, "/api/mcp"), Some(Class::ApiWrite));
+        assert_eq!(class(&Method::DELETE, "/api/harness/sessions/s1"), Some(Class::ApiWrite));
+        // A change outside the API is a change, never a page.
+        assert_eq!(class(&post, "/agents"), Some(Class::ApiWrite));
+        // Git at the root reads as the API.
+        assert_eq!(class(&get, "/ada/kiln.git/info/refs"), Some(Class::ApiRead));
+        // Runners and their jobs.
+        assert_eq!(class(&post, "/api/agents/enroll"), Some(Class::Runner));
+        assert_eq!(class(&get, "/api/sync/blobs/ab12"), Some(Class::Runner));
+        assert_eq!(class(&Method::PUT, "/api/jobs/j1/artifacts/upload"), Some(Class::Runner));
+        assert_eq!(class(&post, "/twirp/github.actions.results.api.v1.ArtifactService/CreateArtifact"), Some(Class::Runner));
+        assert_eq!(class(&get, "/_apis/artifactcache/cache"), Some(Class::Runner));
+        assert_eq!(class(&get, "/dl/kiln/linux-x86_64"), Some(Class::Runner));
+        // A WebSocket's opening is none: its frames are timed.
+        assert_eq!(class_of(&get, "/api/harness/sessions/s1/ws", true), None);
+    }
+
+    /// Goal 1, plan 01a1a59c2a68 step 2: what's observed moves its own class's histograms alone.
+    #[test]
+    fn g1_s2_an_observation_moves_its_own_class_alone() {
+        let r = Routes::new();
+        r.observe(Class::ApiWrite, Some(Duration::from_micros(80)), Duration::from_millis(3));
+        r.observe(Class::Websocket, None, Duration::from_millis(1));
+        for c in Class::ALL {
+            let (wait, took) = r.of(c).map(|(w, t)| (w.count(), t.count())).unwrap_or_default();
+            match c {
+                Class::ApiWrite => assert_eq!((wait, took), (1, 1)),
+                // A wait not known isn't one.
+                Class::Websocket => assert_eq!((wait, took), (0, 1)),
+                _ => assert_eq!((wait, took), (0, 0), "{}", c.name()),
+            }
+        }
+        let mut o = String::new();
+        routes().observe(Class::Page, Some(Duration::ZERO), Duration::from_micros(400));
+        render(&mut o);
+        for c in Class::ALL {
+            assert!(o.contains(&format!("kiln_route_seconds_count{{class=\"{}\"}}", c.name())), "{} rendered", c.name());
+            assert!(o.contains(&format!("kiln_route_wait_seconds_bucket{{class=\"{}\",le=\"0.00005\"}}", c.name())), "{} rendered", c.name());
+        }
+    }
+}

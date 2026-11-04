@@ -14,7 +14,7 @@
 use std::future::{Future, poll_fn};
 use std::pin::{Pin, pin};
 use std::task::{Context, Poll};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use bytes::{Bytes, BytesMut};
 use futures_io::{AsyncRead, AsyncWrite};
@@ -28,7 +28,7 @@ use crate::h1::head::{self, Framing, RequestHead};
 use crate::rt::Sleep;
 use crate::service::{SendBody, Service};
 use crate::upgrade::{self, Upgraded};
-use crate::{Error, date};
+use crate::{Error, Received, date};
 
 /// A large response body goes out once this much of it gathered.
 const FLUSH_AT: usize = 64 << 10;
@@ -166,17 +166,31 @@ struct Conn<I> {
     cfg: Builder,
     /// The last response's header map, emptied, for the next request's headers to take.
     spare: Option<Box<HeaderMap>>,
+    /// When the latest read brought bytes, and when the next request's head began arriving: what
+    /// its [`Received`] says.
+    read_at: Option<Instant>,
+    head_at: Option<Instant>,
 }
 
 impl<I> Conn<I> {
     fn new(cfg: Builder, io: I, read: Bytes) -> Conn<I> {
-        Conn { io, rbuf: BytesMut::from(&read[..]), wbuf: WriteBuf::default(), eof: false, cfg, spare: None }
+        let read_at = (!read.is_empty()).then(Instant::now);
+        Conn { io, rbuf: BytesMut::from(&read[..]), wbuf: WriteBuf::default(), eof: false, cfg, spare: None, read_at, head_at: None }
+    }
+
+    /// When the request whose head was just taken arrived.
+    fn received(&self) -> Received {
+        Received(self.head_at.or(self.read_at).unwrap_or_else(Instant::now))
     }
 }
 
 impl<I: AsyncRead + AsyncWrite + Unpin> Conn<I> {
     fn poll_read(&mut self, cx: &mut Context<'_>) -> Poll<Result<usize, Error>> {
-        poll_read_into(&mut self.io, cx, &mut self.rbuf, SCRATCH).map_err(Error::io)
+        let read = poll_read_into(&mut self.io, cx, &mut self.rbuf, SCRATCH).map_err(Error::io);
+        if matches!(read, Poll::Ready(Ok(n)) if n > 0) {
+            self.read_at = Some(Instant::now());
+        }
+        read
     }
 
     fn poll_flush(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), Error>> {
@@ -201,7 +215,8 @@ impl<I: AsyncRead + AsyncWrite + Unpin> Conn<I> {
             }
             match self.poll_read(cx) {
                 Poll::Ready(Ok(0)) => self.eof = true,
-                Poll::Ready(Ok(_)) => {}
+                // The head's first bytes, when none were waiting.
+                Poll::Ready(Ok(_)) => self.head_at = self.head_at.or(self.read_at),
                 Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
                 Poll::Pending => {
                     if let Some(t) = self.cfg.header_read_timeout {
@@ -414,6 +429,7 @@ fn begin<I: AsyncRead + AsyncWrite + Unpin>(c: &mut Conn<I>, h: RequestHead) -> 
     *req.uri_mut() = uri;
     *req.version_mut() = version;
     *req.headers_mut() = headers;
+    req.extensions_mut().insert(c.received());
     let mut ex = ex;
     if upgrading {
         let (pending, on) = upgrade::pair();
@@ -451,6 +467,9 @@ where
     // The handler's future, kept between requests of a burst and let go when the connection idles.
     let mut slot: Option<Pin<Box<Option<S::Future>>>> = None;
     let outcome = loop {
+        // A head already waiting (pipelined, or what the connection's opener read) came with the
+        // latest read; one still to come, with the read that brings its first bytes.
+        c.head_at = if c.rbuf.is_empty() { None } else { c.read_at };
         let head = {
             let mut timer = None;
             let head = poll_fn(|cx| c.poll_head(cx, &mut timer)).await;

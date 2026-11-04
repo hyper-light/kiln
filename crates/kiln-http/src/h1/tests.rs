@@ -52,6 +52,8 @@ async fn handle(req: Request<Incoming>) -> Response<Boxed> {
             });
             Response::builder().status(StatusCode::SWITCHING_PROTOCOLS).header("upgrade", "echo").header("connection", "upgrade").body(full("")).unwrap_or_default()
         }
+        // How long ago the request arrived, as its `Received` says (microseconds; `none` without one).
+        "/received" => Response::new(full(req.extensions().get::<crate::Received>().map_or_else(|| "none".to_owned(), |r| r.0.elapsed().as_micros().to_string()))),
         path => Response::new(full(format!("{} {path}", req.method()))),
     }
 }
@@ -141,6 +143,36 @@ fn requests_on_one_connection_are_answered_in_order_pipelined_or_not() -> Result
         let (b, c, h) = (three.find("GET /b"), three.find("GET /c"), three.find("hello"));
         assert!(b < c && c < h && b.is_some(), "{three}");
         Ok(())
+    })?
+}
+
+/// Goal 1, plan 01a1a59c2a68 step 2: a request says when it arrived, from the read that brought its
+/// head's first bytes: a head that came in two parts 30 ms apart arrived with the first. A server
+/// whose shard was busy until both parts were in reads them at once, and so says the second's time:
+/// a few connections are tried, and one of them shows it.
+#[test]
+fn g1_s2_a_request_arrived_with_its_heads_first_bytes() -> Result<(), String> {
+    block_on(async {
+        let addr = serve(crate::server::http1::Builder::new())?;
+        let waited = |got: &str| -> Result<u64, String> { got.rsplit("\r\n\r\n").next().and_then(|b| b.trim().parse().ok()).ok_or_else(|| format!("no wait in {got}")) };
+        let answered = |g: &[u8]| g.windows(4).any(|w| w == b"\r\n\r\n") && !g.ends_with(b"\r\n\r\n");
+        let mut seen = Vec::new();
+        for _ in 0..5 {
+            let mut io = connect(addr).await?;
+            io.write_all(b"GET /received HTTP/1.1\r\nHo").await.map_err(|e| e.to_string())?;
+            hyper_rt::futures::sleep(30_000_000).await.map_err(|e| e.to_string())?;
+            io.write_all(b"st: t\r\n\r\n").await.map_err(|e| e.to_string())?;
+            let w = waited(&text(&read_until(&mut io, answered).await?))?;
+            seen.push(w);
+            if w >= 30_000 {
+                // One whole in a read arrived with that read, a moment before its handler: under the 30 ms.
+                io.write_all(b"GET /received HTTP/1.1\r\nHost: t\r\n\r\n").await.map_err(|e| e.to_string())?;
+                let whole = waited(&text(&read_until(&mut io, answered).await?))?;
+                assert!(whole < 30_000, "a request read whole waited {whole} us");
+                return Ok(());
+            }
+        }
+        Err(format!("no head that came in two parts said it arrived with its first: {seen:?} us"))
     })?
 }
 

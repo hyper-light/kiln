@@ -350,6 +350,19 @@ pub fn spawn_spread<F: Future<Output = ()> + Send + 'static>(fut: F) {
     tracing::error!("hyper-rt refused a connection task on every shard; connection dropped");
 }
 
+/// The runtime's shards (it's started if it hasn't been): 0 when it couldn't start.
+pub fn shard_count() -> usize {
+    rt().map_or(0, |rt| rt.holders.len())
+}
+
+/// Run `fut` on shard `i` (of [`shard_count`]) and no other, for a task whose work is that shard's
+/// own: a probe of its health (`crate::shard_health`), or a test holding one shard and not the
+/// rest. Whether the shard took it.
+pub fn spawn_on<F: Future<Output = ()> + Send + 'static>(i: usize, fut: F) -> bool {
+    let Ok(rt) = rt() else { return false };
+    rt.holders.get(i).is_some_and(|holder| hyper_rt::runtime::submit_to_holder(*holder, fut).is_ok())
+}
+
 /// Run a `!Send` future as a task on the current shard. Refused off the runtime.
 pub fn spawn_local<F: Future<Output = ()> + 'static>(fut: F) -> Result<TaskId, RtError> {
     hyper_rt::futures::spawn_detached(fut)
