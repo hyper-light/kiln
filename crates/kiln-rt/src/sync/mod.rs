@@ -123,6 +123,10 @@ impl Future for Notified<'_> {
         let Some(word) = polling_task(cx.waker()) else {
             return Poll::Ready(Err(RtError::NotOnShardThread));
         };
+        // A charge of the task's turn (`crate::coop`), before anything is taken.
+        if crate::coop::poll_proceed(cx).is_pending() {
+            return Poll::Pending;
+        }
         let Some(cell) = self.notify.cell.cell() else {
             return Poll::Ready(Err(RtError::ShardGone { shard: 0 }));
         };
@@ -269,6 +273,10 @@ impl<T> Future for OneshotReceiver<T> {
         let Some(word) = polling_task(cx.waker()) else {
             return Poll::Ready(Err(SyncError::NotOnShardThread(())));
         };
+        // A charge of the task's turn (`crate::coop`), before anything is taken.
+        if crate::coop::poll_proceed(cx).is_pending() {
+            return Poll::Pending;
+        }
         if let Some(ready) = poll_value(&mut self.as_mut().try_recv()) {
             return Poll::Ready(ready);
         }
@@ -531,6 +539,11 @@ impl<T> Send<'_, T> {
             self.leave(false);
             return Poll::Ready(Err(SyncError::NotOnShardThread(value)));
         };
+        // A charge of the task's turn (`crate::coop`), before the value goes: past its share, it waits here.
+        if crate::coop::proceed_in(here, cx).is_pending() {
+            self.value = Some(value);
+            return Poll::Pending;
+        }
         let sender = self.sender;
         let room = &sender.shared.get().room;
         // A grant seen before the try is used by a send that follows it.
@@ -641,6 +654,10 @@ impl<T> Future for Recv<'_, T> {
         let Some(word) = polling_task(cx.waker()) else {
             return Poll::Ready(Err(SyncError::NotOnShardThread(())));
         };
+        // A charge of the task's turn (`crate::coop`), before anything is taken.
+        if crate::coop::poll_proceed(cx).is_pending() {
+            return Poll::Pending;
+        }
         if let Some(ready) = poll_value(&mut self.receiver.try_recv()) {
             return Poll::Ready(ready);
         }
@@ -952,6 +969,10 @@ impl Future for Changed<'_> {
         let Some(word) = polling_task(cx.waker()) else {
             return Poll::Ready(Err(SyncError::NotOnShardThread(())));
         };
+        // A charge of the task's turn (`crate::coop`), before anything is taken.
+        if crate::coop::poll_proceed(cx).is_pending() {
+            return Poll::Pending;
+        }
         if let Some(ready) = self.receiver.check() {
             return Poll::Ready(ready);
         }
@@ -1097,6 +1118,10 @@ impl<'a> Future for Acquire<'a> {
         let Some(word) = polling_task(cx.waker()) else {
             return Poll::Ready(Err(SyncError::NotOnShardThread(())));
         };
+        // A charge of the task's turn (`crate::coop`), before anything is taken.
+        if crate::coop::poll_proceed(cx).is_pending() {
+            return Poll::Pending;
+        }
         let semaphore = self.semaphore;
         if let Some(own) = self.waiting {
             let granted = own

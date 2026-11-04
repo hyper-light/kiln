@@ -61,6 +61,9 @@ pub async fn run(cfg: Config, shutdown: Shutdown) -> anyhow::Result<()> {
     if let Some(period) = crate::shard_health::period_from_env() {
         crate::shard_health::start(period);
     }
+    // Each shard's queueing delay by class, and what it sheds when it leaves its calm (goal 6, plan
+    // 01a1a59c2abe step 4).
+    crate::overload::start(cfg.server.shed);
     crate::updates::warm_own_binary().await;
     let cfg = Arc::new(cfg);
     std::fs::create_dir_all(&cfg.server.data_dir)
@@ -449,6 +452,9 @@ pub async fn run(cfg: Config, shutdown: Shutdown) -> anyhow::Result<()> {
                     .map_err(|e| anyhow::anyhow!("adopt listener {addr}: {e}"))?;
                 tracing::info!(%addr, url = %hub.cfg.server.public_url, https = tls.is_some(), "HTTP listening (hyper-rt)");
                 let api = Arc::new(crate::api::Api { hub });
+                // Every request comes in through here: accepting is Critical, and costs little (goal 6,
+                // plan 01a1a59c2abe step 3).
+                let _ = hyper_rt::coop::set_class(crate::overload::Class::Critical);
                 loop {
                     let accepted = futures::select_biased! {
                         () = sd.cancelled().fuse() => return Ok(()),
@@ -456,12 +462,13 @@ pub async fn run(cfg: Config, shutdown: Shutdown) -> anyhow::Result<()> {
                     };
                     match accepted {
                         Ok(stream) => {
-                            // Connections are spread over every shard; a fresh stream has no armed
-                            // waits, so it can move.
+                            // Connections are spread over every shard (past one the watchdog sees held);
+                            // a fresh stream has no armed waits, so it can move. Each starts Critical, to
+                            // read its first request's head before its class is known.
                             let api = api.clone();
                             let remote = stream.peer_addr().ok();
                             let tls = tls.clone();
-                            crate::rt::spawn_spread(async move {
+                            crate::rt::spawn_connection(async move {
                                 crate::http::server::serve_accepted(stream, api, remote, tls.as_ref()).await;
                             });
                         }

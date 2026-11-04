@@ -252,7 +252,7 @@ enabled = false
         }
         for k in &keys {
             let path = format!("/api/runners/{k}/headroom");
-            let a = http.send("PUT", &path, Some(json!({"enabled": false}).to_string().as_bytes()))?;
+            let a = http.send_settled("PUT", &path, Some(json!({"enabled": false}).to_string().as_bytes()))?;
             if a.status == 404 {
                 continue;
             }

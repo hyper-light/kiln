@@ -44,7 +44,8 @@ struct Common {
     /// CPU hogs beside the server: a count, or a multiple of the lab's CPUs (`1x`, `2x`).
     #[arg(long, default_value = "0")]
     hogs: String,
-    /// `realistic` (production's shape at a busy hour) or `small` (to try the lab out).
+    /// `realistic` (production's shape at a busy hour), `overload` (that, with no think time) or `small` (to try
+    /// the lab out).
     #[arg(long, default_value = "realistic")]
     profile: String,
     /// Seconds each round measures (the profile's own otherwise).
@@ -159,7 +160,8 @@ fn measure(builds: &[Build], c: &Common) -> anyhow::Result<Run> {
     let mut profile = match c.profile.as_str() {
         "small" => Profile::small(),
         "realistic" => Profile::realistic(),
-        p => anyhow::bail!("no profile {p}: realistic or small"),
+        "overload" => Profile::overload(),
+        p => anyhow::bail!("no profile {p}: realistic, overload or small"),
     };
     if let Some(w) = c.window {
         profile.window_s = w;

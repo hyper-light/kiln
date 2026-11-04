@@ -146,9 +146,14 @@ where
     I: AsyncRead + AsyncWrite + Unpin + Send + 'static,
     H: Handler,
 {
+    // What the connection serves now, by class: its task runs at the most urgent (goal 6, plan
+    // 01a1a59c2abe step 3).
+    let serving = crate::overload::Connection::new();
     let service = service_fn(move |mut req: Request| {
         mark(&mut req, remote, secure);
-        handler.clone().handle(req)
+        let request = serving.begin(&mut req);
+        let handler = handler.clone();
+        async move { crate::overload::while_sent(handler.handle(req).await, request) }
     });
     let conn = http1::Builder::new()
         // Slow or idle clients cannot pin a connection: headers must arrive within the timeout
@@ -171,10 +176,13 @@ where
     I: AsyncRead + AsyncWrite + Unpin + Send + 'static,
     H: Handler,
 {
+    let serving = crate::overload::Connection::new();
     let service = service_fn(move |mut req: Request| {
         as_http1(&mut req);
         mark(&mut req, remote, secure);
-        handler.clone().handle(req)
+        let request = serving.begin(&mut req);
+        let handler = handler.clone();
+        async move { crate::overload::while_sent(handler.handle(req).await, request) }
     });
     let conn = http2::Builder::new()
         // A connection whose client has gone quiet without closing is found and ended.
