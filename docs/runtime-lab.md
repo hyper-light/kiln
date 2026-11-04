@@ -130,7 +130,10 @@ for its viewers and readers (each asks again as soon as it is answered): with on
 (`--env KILN_RT_SHARDS=1`) it overloads the server on purpose, as goal 6's shedding is measured
 (`--env-b KILN_SHED=1` against the same build without). A request the server sheds counts as an
 error, and its worker waits out the answer's `Retry-After` before asking again, as kiln's own clients
-do, rather than asking again at once.
+do, rather than asking again at once. `--profile many` is production's whole shape rather than its
+busy hour's share: its ten runners and all 134 live feeds (the realistic profile's sizes, the rest of
+400 events), every one at work at the realistic pace, as goal 4 measures many sessions changing at
+once.
 
 ### What it reports
 
