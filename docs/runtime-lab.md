@@ -153,14 +153,14 @@ process alone leaves running.
 Measured on 2026-11-04 (10:00 to 11:56 UTC) on a Linux machine with an Intel Core i9-14900HX (32
 threads: 8 performance cores of two threads each, then 16 efficient cores), the lab and everything it
 started held to the 16 efficient cores (`taskset -c 16-31`), where the server's own sizing for 16
-CPUs gave it 4 shards. The build: main at `2a2d93f6df5` with this goal's metrics, in release, the
-UI's client built in (`KILN_UI_SERVER=off`; this branch's `d3c2cb7b599`). The `realistic` profile,
-eight rounds each: calm, with
-16 CPU hogs (as many as the lab's CPUs) and with 32. Each cell is the median of the rounds and, after
-it, its noise (the 95% interval of that median). In each 60 s window the lab timed about 5,200 live
-deliveries, 4,000 API reads, 630 API writes, 600 page loads and 20 attaches, so a p99.9 is the
-window's most for pages, API writes and attaches, and so is an attach's p99. The rounds themselves,
-as `kiln-lab` writes them (`kiln-lab report` and `compare` read each):
+CPUs gave it 4 shards. The build: main at `2a2d93f6df5` (before kiln's own runtime, `crates/kiln-rt`,
+and its compute pool landed) with this goal's metrics, in release, the UI's client built in
+(`KILN_UI_SERVER=off`; this branch's `d3c2cb7b599`). The `realistic` profile, eight rounds each:
+calm, with 16 CPU hogs (as many as the lab's CPUs) and with 32. Each cell is the median of the
+rounds and, after it, its noise (the 95% interval of that median). In each 60 s window the lab timed
+about 5,200 live deliveries, 4,000 API reads, 630 API writes, 600 page loads and 20 attaches, so a
+p99.9 is the window's most for pages, API writes and attaches, and so is an attach's p99. The rounds
+themselves, as `kiln-lab` writes them (`kiln-lab report` and `compare` read each):
 `docs/runtime-lab/2026-11-04/calm.json`, `hogs-1x.json`, `hogs-2x.json`.
 
 | number | calm | 16 hogs (1x) | 32 hogs (2x) |
