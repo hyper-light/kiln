@@ -2,7 +2,8 @@
  * The Files section's one row (docs/ci.md W26-R07, R08, f22): the open comments by kind (each
  * icon with its count) and Approve, its words the gate's — a blocking thread or a conflict holds
  * it disabled saying whose to resolve, open issues ask "Approve anyway", open nits are said on
- * approval; while conflicts remain, "Commit resolution" stands in Approve's place (W26-R12).
+ * approval; while conflicts remain, "Commit resolution" stands in Approve's place (W26-R12), and
+ * "Accept resolutions" while the conflict ladder offers its tested resolutions (W26-R17).
  * A host's pull request approves through the forge seam; a commit with no change shows no row.
  * Each approval carried to this version from an earlier one, a rebase-only version with its verbatim
  * patch-id, is said under the row in kiln's words: "kim's approval carried from v2: rebase only, …"
@@ -63,7 +64,7 @@ export function GateRow({
   /** What Review says of it for landing now, and where the queue has it. */
   ready?: Readiness | null;
   /** Unresolved conflicts left, and whether every one is taken (commit may go). */
-  conflicts: { unresolved: number; ready: boolean; total: number };
+  conflicts: { unresolved: number; ready: boolean; total: number; offered?: boolean };
   diffKey: string;
   /** The revision that replaced this one: Approve is off, naming it. */
   superseded?: string | null;
@@ -113,6 +114,18 @@ export function GateRow({
     (e) => setErr(said(e)),
   );
 
+  const [accept, accepting] = useAction(
+    async () => {
+      setErr(null);
+      const done = await conflictsApi.accept(diffKey);
+      invalidate("review/");
+      invalidate("ship/");
+      setNote({ k: "ok", t: `v${done.version} · conflicts resolved` });
+      onApprove?.();
+    },
+    (e) => setErr(said(e)),
+  );
+
   const [approve, approving] = useAction(
     async (force: boolean) => {
       setErr(null);
@@ -133,7 +146,20 @@ export function GateRow({
       : (gate?.holds.map((h) => (h.by ? `${h.at}: ${h.by.replace(/^user:/, "")} resolves ${h.reason}` : `${h.at}: ${h.reason}`)).join(" · ") ?? "held");
 
   let action: React.ReactNode;
-  if (conflicts.total > 0 && conflicts.unresolved === 0 && conflicts.ready)
+  if (conflicts.offered && conflicts.unresolved > 0)
+    action = (
+      <button
+        type="button"
+        className="rv-btn rv-btn-go"
+        {...sendingProps(accepting)}
+        title="The conflict ladder's resolutions, tested together: accepting them makes the change's new version"
+        onClick={accept}
+      >
+        <Check size={13} aria-hidden="true" />
+        <span>Accept resolutions</span>
+      </button>
+    );
+  else if (conflicts.total > 0 && conflicts.unresolved === 0 && conflicts.ready)
     action = (
       <button type="button" className="rv-btn rv-btn-go" {...sendingProps(committing)} onClick={commit}>
         <Check size={13} aria-hidden="true" />

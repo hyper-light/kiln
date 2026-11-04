@@ -45,6 +45,7 @@ pub const EVENTS: &[(&str, &str)] = &[
     ("review.requested", "a diff or change request asks someone for a review"),
     ("comment.reply", "a comment published in a thread, or on someone's diff"),
     ("mention", "a comment or review names someone (@ada)"),
+    ("change.collision", "two open changes change the same lines of a file, each author told once"),
     ("quota.near", "a repository's cache is past 90 % of its quota"),
     ("secret.unused", "a secret no run has read in 90 days"),
     ("machine.battery_low", "a machine on battery is low (20% or less): it sleeps soon, and its runner with it"),

@@ -17,6 +17,9 @@ import {
   diffRes,
   filesRes,
   fixesSetBy,
+  freshApi,
+  HOST_WORD,
+  hostPullFreshRes,
   hostPullRes,
   hostPullsApi,
   inboxRes,
@@ -41,6 +44,7 @@ import { Conversation, ConvoBox, Description } from "./convo";
 import { FileDiff, makeLinesOf, useThreadMap, WholeFile, type FilesCtx } from "./diffs";
 import { rowsOf } from "./fold";
 import { GateRow, HostGateRow } from "./gate";
+import { FreshRow } from "./fresh";
 import type { DraftPlace, Ops } from "./ops";
 import { applyThreadPatch, pendingComment, pendingThread, type ThreadPatch } from "./ops";
 import { counted, useStable } from "./perf";
@@ -74,7 +78,7 @@ const pullNumber = (name: string) => Number(name.replace(/\D/g, ""));
 export function warmReview(item: ShipCommit) {
   const ch = item.change;
   if (ch && ch.host === "kiln") warm(inboxRes, diffRes(ch.name), commentsRes(ch.name), filesRes(ch.name, ch.revision), conflictsRes(ch.name), verdictsRes(ch.name), agentFixesRes(item.repo));
-  else if (ch && ch.host) warm(inboxRes, hostPullRes(item.repo, pullNumber(ch.name)), agentFixesRes(item.repo));
+  else if (ch && ch.host) warm(inboxRes, hostPullRes(item.repo, pullNumber(ch.name)), hostPullFreshRes(item.repo, pullNumber(ch.name)), agentFixesRes(item.repo));
   else warm(inboxRes, commitFilesRes(item.repo, item.sha), agentFixesRes(item.repo));
 }
 
@@ -371,7 +375,18 @@ function KilnFiles({ item }: { item: ShipCommit }) {
     <Frame
       repo={item.repo}
       sum={`${list.length} file${list.length === 1 ? "" : "s"} · +${adds} −${dels} · v${version}${ch.latest > version ? ` of ${ch.latest}` : ""}`}
-      bar={<GateRow gate={comments.gate} conflicts={{ unresolved, ready: cf.ready, total: cf.conflicts.length }} diffKey={key} superseded={ch.superseded_by} ready={ready} />}
+      bar={
+        <>
+          <GateRow
+            gate={comments.gate}
+            conflicts={{ unresolved, ready: cf.ready, total: cf.conflicts.length, offered: cf.ladder?.state === "offered" }}
+            diffKey={key}
+            superseded={ch.superseded_by}
+            ready={ready}
+          />
+          {d.fresh && <FreshRow fresh={d.fresh} update={() => freshApi.update(key).then((r) => `${r.branch} moved to v${r.version}`)} />}
+        </>
+      }
       search={{ res: q.trim() ? searchRes(key, version, q) : null, q, onQ: setQ }}
       onJump={jump}
       convo={
@@ -411,6 +426,7 @@ function HostFiles({ item }: { item: ShipCommit }) {
   const n = pullNumber(ch.name);
   const { me, ops } = useOps(item);
   const pull = useRes(hostPullRes(item.repo, n)).data;
+  const fresh = useRes(hostPullFreshRes(item.repo, n)).data;
   const [q, setQ] = React.useState("");
   const [draft, setDraft] = React.useState<DraftPlace | null>(null);
   const list = React.useMemo(() => pull.files.map((f) => hostFile(f)).filter((f): f is PatchFile => f != null), [pull.files]);
@@ -461,11 +477,14 @@ function HostFiles({ item }: { item: ShipCommit }) {
       repo={item.repo}
       sum={`${pull.files.length} file${pull.files.length === 1 ? "" : "s"} · +${adds} −${dels} · ${ch.name}`}
       bar={
-        <HostGateRow
-          approved={approved}
-          onApprove={() => hostPullsApi.review(item.repo, n, "approve", "").then(() => {})}
-          land={{ state: item.pips.find((p) => p.stage === "land")?.state ?? "none", onLand: () => reviewApi.enqueue(item.repo, [{ number: n, head: pull.sha }]) }}
-        />
+        <>
+          <HostGateRow
+            approved={approved}
+            onApprove={() => hostPullsApi.review(item.repo, n, "approve", "").then(() => {})}
+            land={{ state: item.pips.find((p) => p.stage === "land")?.state ?? "none", onLand: () => reviewApi.enqueue(item.repo, [{ number: n, head: pull.sha }]) }}
+          />
+          {fresh && <FreshRow fresh={fresh} update={() => hostPullsApi.update(item.repo, n).then((r) => `${r.state} on ${HOST_WORD[r.host]}`)} />}
+        </>
       }
       search={{ res: q.trim() ? pullSearchRes(item.repo, n, q) : null, q, onQ: setQ }}
       convo={

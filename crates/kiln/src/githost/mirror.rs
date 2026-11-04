@@ -107,6 +107,8 @@ struct Pull {
     state: String,
     url: String,
     base: String,
+    /// Its own branch: a pull request on another's branch sits on it in a stack (W26-R16).
+    head_ref: String,
     head: String,
     requested: Vec<String>,
     merged_sha: String,
@@ -137,6 +139,7 @@ fn pull_of(host: Host, v: &Value) -> Pull {
         state: state.to_owned(),
         url: text(&shaped, "/url"),
         base: text(&shaped, "/base"),
+        head_ref: text(&shaped, "/head"),
         head: text(&shaped, "/sha"),
         requested: shaped.get("reviewers").and_then(Value::as_array).into_iter().flatten().filter_map(Value::as_str).map(|l| host.principal(l)).collect(),
         merged_sha,
@@ -420,10 +423,10 @@ async fn refresh<F: Fetch>(store: &Store, r: &Mirrored, fetch: &F, st: &mut Stat
             let tx = c.savepoint()?;
             if let Some(p) = &p {
                 tx.execute(
-                    "INSERT INTO host_pulls (repo_id, host, number, title, author, state, url, base, requested, merged_sha, host_updated, first_seen) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)
+                    "INSERT INTO host_pulls (repo_id, host, number, title, author, state, url, base, requested, merged_sha, host_updated, first_seen, head_ref) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)
                      ON CONFLICT (repo_id, host, number) DO UPDATE SET title = excluded.title, author = excluded.author, state = excluded.state, url = excluded.url, base = excluded.base,
-                       requested = excluded.requested, merged_sha = excluded.merged_sha, host_updated = excluded.host_updated",
-                    params![repo, host, num, p.title, p.author, p.state, p.url, p.base, serde_json::to_string(&p.requested)?, p.merged_sha, p.updated, seen],
+                       requested = excluded.requested, merged_sha = excluded.merged_sha, host_updated = excluded.host_updated, head_ref = excluded.head_ref",
+                    params![repo, host, num, p.title, p.author, p.state, p.url, p.base, serde_json::to_string(&p.requested)?, p.merged_sha, p.updated, seen, p.head_ref],
                 )?;
             }
             let known: bool = tx.query_row("SELECT EXISTS (SELECT 1 FROM host_pulls WHERE repo_id = ?1 AND host = ?2 AND number = ?3)", params![repo, host, num], |r| r.get(0))?;

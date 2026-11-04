@@ -73,6 +73,7 @@ pub const EVENTS: &[&str] = &[
     "secret.unused",
     "diff.landed",
     "test.quarantined",
+    "change.collision",
 ];
 /// The events about an agent (`crate::push`): the server's rules take them, a repository's can't.
 pub const AGENT_EVENTS: &[&str] = &["agent.needs_you", "agent.finished", "agent.stopped", "agent.paused"];
@@ -376,6 +377,7 @@ fn message(event: &str, s: &Subject) -> (String, String) {
         "quota.near" => return (format!("⚠ {}'s cache is near its quota", s.repo), format!("{} · {}", s.message, s.url)),
         "secret.unused" => return (format!("⚠ secret {} hasn't been used in {} days", s.name, UNUSED_AFTER / 86_400), format!("{} · {} · {}", s.repo, s.message, s.url)),
         "diff.landed" => return (format!("✓ {} landed on {}", s.name, s.branch), format!("{} · {} by {actor} · {}", s.repo, s.sha.get(..8).unwrap_or(&s.sha), s.url)),
+        "change.collision" => return (format!("⇄ {} changes the same lines as another open change", s.name), format!("{} · {} · {}", s.repo, s.message.lines().next().unwrap_or_default(), s.url)),
         "test.quarantined" => return (format!("⊘ {} is quarantined in {}", s.name, s.repo), format!("{} · {}", s.message.lines().next().unwrap_or_default(), s.url)),
         _ => {}
     }
@@ -429,7 +431,7 @@ impl Msg {
         // A deployment's incident is the environment's; a run's, its workflow's on its branch.
         let dedup = if event.starts_with("deploy.") { format!("kiln:{}:deploy:{}", s.repo, s.environments.join(",")) } else { format!("kiln:{}:{}:{}", s.repo, s.workflow, s.branch) };
         let what = match event {
-            "land.ejected" | "review.requested" | "comment.reply" | "mention" | "diff.landed" => "the diff",
+            "land.ejected" | "review.requested" | "comment.reply" | "mention" | "diff.landed" | "change.collision" => "the diff",
             "quota.near" => "the cache",
             "test.quarantined" => "the tests",
             "secret.unused" => "the secrets",

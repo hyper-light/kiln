@@ -8618,6 +8618,68 @@ a time. The design was agreed on a live mock built on Ship's own prototype
   open change's branch is then pushed each time main moves, with heavy API use and many more CI runs
   on GitHub, GitLab and Bitbucket, and that everyone must pull or rebase before pushing. The planner
   is pure: `kiln_ci::fresh`.
+  - *Built* (plan `01a17856b1b9705cbaa54ae45a51a50c`, branch `w26-fresh`).
+    - **When it runs.** On every move of a trunk, whoever runs the repository's CI: a push the
+      poller sees (ahead of the CI engine's `enabled` check) and the land queue's own moves, whose
+      restack is now this same path. A burst of moves is one round (`crates/kiln/src/ci/fresh.rs`,
+      a queue on the hub).
+    - **The order.** Stack by stack, bottom first. A bottom goes onto the tip; a change above goes
+      onto the revision below it, this round's or the latest, and moves when that one did.
+    - **A replay.** `git merge-tree --write-tree` in kiln's own copy, not `git replay`, which is
+      experimental, makes its own unsigned commits and keeps nothing on a conflict. A diff is
+      cherry-picked onto where it goes; a change request or a host's pull request has the trunk
+      merged in.
+    - **Clean.** Committed by kiln through `revision::commit`, its author and message (and
+      `Kiln-Change`) kept: the path W27-R03 signs, so a replay is signed as kiln when the signing
+      plan's step 2 lands, and reads "unsigned" until then. It's kept as a rebase-only revision, why
+      `replayed`, so approvals carry under `sticky-approvals: rebase`.
+    - **No runs of its own.** A replay starts no checks (a run per open change on every move is the
+      cost Kodiak's `update.always` warns of, and the land candidate tests it on the trunk anyway).
+      Its checks are carried from the version it replays, and the page and row say so ("checks
+      from v4", the version's `checks_from`).
+    - **Conflicted.** Kept as a revision too: git's merge with its markers in, why `replayed with
+      conflicts`, not rebase-only. Its conflicts are kept as R12's are, and the version names its
+      replay (`review_replays.kept_version`) in the same transaction, so the gate holds on it until
+      a resolution is committed. The changes above it replay onto it and keep moving, as jj's do.
+      A resolution is rebuilt from the version that was replayed, and the changes above then move
+      onto it. The conflict ladder (R17) takes it from `conflicts::current`.
+    - **Refs.** A round's versions go in in one transaction, and their `refs/kiln/diffs/<D>/v<n>`
+      move in one `git update-ref --stdin` transaction. A host's pull request is replayed in kiln's
+      mirror and kept at `refs/kiln/pulls/<host>/<n>/replays/<k>` (`review_pull_replays`).
+    - **Update.** `POST /api/change-requests/:id/update` moves a change request's branch to its
+      replay with a lease, refusing, with the reason, when the branch moved since. A diff has no
+      branch. A host's pull request (`POST /api/ci/repos/:repo/pulls/:n/update`) goes through the
+      forge seam's `update`, by `githost::forge::for_repo`: GitHub's update-branch against the head
+      the replay was made from (kiln never pushes its own commit to GitHub), GitLab's rebase, else
+      the replay pushed with a lease. GitHub has no REST call for Rebase stack (its cascading rebase
+      is the page's or `gh stack`'s, and unsigned), so a GitHub stack updates pull request by pull
+      request. Automatic pushes to a host go a second apart and stop, saying so, below a fifth of
+      its hourly limit left or on a rate refusal.
+    - **A host's stacks.** A pull request whose base is another open one's branch (a GitHub or
+      GitLab stack's upper ones; the mirror keeps each one's own branch, `host_pulls.head_ref`) is
+      replayed onto that one's replay, bottom first, through the same planner; a conflicting replay
+      is committed with its markers so the ones above still move, and Update refuses it. What a
+      host can do with them: GitHub's update-branch merges an upper pull request's base *as GitHub
+      has it* (the lower one's branch), never kiln's replay, so a stack is updated bottom first,
+      each once the one below has moved on GitHub; automatic pushes go in that order.
+    - **The same patch?** Each clean replay of a diff records `same_patch`: whether its verbatim
+      patch-id (context lines and whitespace included) is the replayed revision's. That's Gerrit's
+      trivial rebase, and where a signed verdict (W27-R04) carries.
+    - **`.kiln/review.yaml`'s `fresh:`.** `replay` (on by default: a repository can keep its
+      changes where their authors put them), `push: manual | auto` and `conflict-agents` (both
+      off). A change turning `push: auto` on warns on approval, through R11's gate, in the words
+      above.
+    - **The collision radar.** After every round, and whenever a kiln diff or change request gets
+      a revision, kiln reads each open change's own lines (a diff's patch; a branch's from where
+      it left the trunk; a mirrored repository's pull requests too). Two changes from different
+      stacks changing the same lines of a file are told to both authors once a pair and file
+      (`change.collision`), listed at `GET /api/diffs/:id/collisions`, and marked gone once they
+      no longer overlap. A host pull request's new head is read on the trunk's next move.
+    - **Freshness.** `GET /api/diffs/:id`'s `fresh`: its words ("replays clean on main@4c1e2a"),
+      whether Update can go and why not, and `checks_from`.
+    - **Open, for the signing plan.** A clean replay is rebase-only, so approvals carry by policy.
+      A signed verdict (W27-R04) carries only to the same verbatim patch-id, so it doesn't verify
+      on a clean replay whose surrounding lines changed.
 - **W26-R17 The conflict ladder.** A conflicted replay is kept as a conflicted revision, so the stack
   above it still moves, and goes up a ladder, each rung checked by the affected tests: a structural
   merge, a resolution remembered from the same hunk, the author's agent (or, where a repository turns
@@ -8966,6 +9028,54 @@ resolution makes, a comment, a resolution, an approval and each mark of the Revi
   references. Drafts live in the browser's drafts store, which live updates never touch;
   mutations are React Actions with optimistic state; there are no effects; an open item holds
   still and is patched in place.
+- *R17*, the conflict ladder (`kiln_ci::ladder`, pure; `crates/kiln/src/ci/ladder.rs`;
+  `kiln_search::merge`; migration `20261029-2300_w26_ladder`). A conflicted replay climbs, a
+  conflict at a time, until each has a resolution whose tests passed:
+  - **kiln's structural merge** (`kiln_search::merge`): the hunk in its file, its other
+    conflicts taking main's side, merged on the tree-sitter grammars kiln vendors through vorpal.
+    Siblings are matched by name or text, and only disjoint changes merge. The markers stay, with
+    why, where both sides changed the same node or added in the same place, a name is defined
+    twice (ambiguous, or would be after the merge), text outside a node's children changed, or a
+    version or the merge doesn't parse. Mergiraf's approach, not its code (it's GPL-3.0-only):
+    replayed against kiln's own 204 conflicted merges, it never dropped a side's change.
+  - **a remembered resolution**: whatever a person accepted or committed, kept by its hunk's key
+    (`ladder::key`, rerere's normalisation, sides in a fixed order, with the file's language) in
+    `review_remembered`, and offered to the next replay of any change in the repository with
+    that hunk.
+  - **an agent**: the change's author's agent while it runs, or, where the trunk's
+    `.kiln/review.yaml` turns sending on (`fresh: conflict-agents: true`, W26-R16's setting, off by
+    default), one kiln starts on a machine with the harness. Ship's row then says the agent is fixing
+    it (W26-R18's hand-off). Its brief names a workspace of its
+    own (`~/.cache/kiln/resolve/<diff>/<replay>`), the conflicted revision to check out there
+    (`refs/kiln/resolve/<diff>/<replay>/conflicted`, git's markers in place) and how to answer:
+    `ci.diffs.conflicts.resolve` with its lines and an explanation, with the tests it ran.
+  - **the person**, who takes a side or edits where every rung is spent.
+
+  Each rung's resolution is a revision of whoever made it (kiln for the first two, the agent for
+  the third), committed through `revision::commit` and kept at `refs/kiln/resolve/<diff>/<id>`,
+  the other conflicts taking main's side. It's tested by the workflows the land queue runs on a
+  candidate (`on: merge_group` or `land`) before it counts; one that fails is said and the next
+  rung tried. Once each conflict has one they're committed and tested together
+  (`…/<replay>/whole`), then offered: `GET /api/diffs/:id/conflicts/ladder` says where each is
+  and why. A person accepts them (`POST /api/diffs/:id/conflicts/accept`; an agent can't), and
+  they're the change's new version, why `conflict resolved`, and the changes above it move onto
+  it. Where the repository turned automatic resolution on, on its page in Repos (`GET` and `PUT
+  /api/repos/:repo/ladder`, `automatic`, off by default; changing it takes `diffs.land`), a tested
+  whole goes on by itself, saying so. A conflicted replay kiln makes as main moves (W26-R16) is
+  kept as a revision with its markers (why `replayed with conflicts`), and the changes above it
+  move onto it at once; the ladder climbs it like any other. Files (`review/conflicts.tsx`) shows
+  each conflict's rung on one line at one height, its tested resolution with its explanation, and
+  Take main, Take <the change>, Both, Use the agent's (or kiln's) and Edit, in a grid of fixed rows;
+  the gate row's place holds Accept resolutions while the ladder offers them (`GET
+  /api/diffs/:id/conflicts` carries each conflict's `offered` and the replay's `ladder`). An entry
+  the land queue returns to Review for a conflict with its trunk (W28-R107) starts its diffs'
+  ladders, and joins the queue again once Review's gate clears the resolution a person accepted.
+
+  Signatures: the resolutions' revisions go through `revision::commit`, which W27-R03 signs, so
+  kiln's structural merge and a remembered resolution verify as kiln's server, and an agent's work
+  as the agent. Not yet: the person's acceptance is kept on the ladder's record
+  (`review_ladders.accepted_statement`, a statement's JSON bundle) for W27-R04 to sign; until then
+  it reads unsigned.
 - *R18*, agents in review (the Review plan's step 12, kiln plan `01a17856b1df75a7aa92eb3e452fcfa2`):
   - **Words, signed and read.** An agent's comment, suggestion, reply and verdict are taken as a
     person's are, signed as the agent for its person (W27). Each comment reads back with `by`
@@ -9165,8 +9275,23 @@ resolution makes, a comment, a resolution, an approval and each mark of the Revi
     ms at 1280 and at 390, and a keystroke takes 1 ms. WebKit's is 46 ms and 49 ms: every line of
     the whole file is in the page, and WebKit lays them out more slowly. AC06 isn't met in WebKit
     until the whole file draws only the lines in view.
+  - R17: kiln-ci `ladder.rs` (`w26_r17_*`: the rungs' order, what counts, who decides, the
+    remembered key); kiln-search `merge` (`w26_r17_structural_*`,
+    each resolved and kept case per grammar, a property test, and three real merges from kiln's
+    history; the whole replay is the ignored `w26_r17_structural_against_real_merges`, reading
+    `KILN_MERGE_CASES`); kiln `tests/ladder.rs` on real git (a remembered resolution offered again,
+    one whose tests fail handing on, the goal's D42 with one hunk merged structurally) and
+    `tests/ladder_agents.rs` with the fake harness acting (`FAKE_CLAUDE_ACT`): no agent while
+    `fresh.conflict-agents` is unset, saying why, and one on a runner once it's on
+    (`w26_r16_conflict_agent_only_when_on`); the author's agent
+    resolving in its own workspace and waiting for a person (Ship's row reading fixing), a sent
+    agent with automatic resolution on, and the land queue sending a conflict back to Review until its resolution is accepted and cleared;
+    `tests/ladder.rs`' `w26_r17_a_conflicted_replay_keeps_the_stack_moving` (with W26-R16's
+    replays). UI: `e2e/ship-review.spec.ts`'s conflict ladder test and `e2e/ship-ladder-320.spec.ts`,
+    in Chromium and WebKit at desktop and phone.
 
-**Sources.** Plan `01a175b7d5e1772f8d3c7cb28e50ab2b`; research `01a174af7d0476b896d3b236098ddded`;
+**Sources.** Plan `01a175b7d5e1772f8d3c7cb28e50ab2b`; the ladder's plan
+`01a17856b1bb75d29fdefaf1bc53a04b` and research `01a18b45a79570939238c7a8229eb3a7`; research `01a174af7d0476b896d3b236098ddded`;
 the mock `~/.cache/kiln-review-design/ship/review-ship.html` (Ship's prototype, from the CI/CD
 Integration agent's `~/.cache/kiln-cicd-design/proto/f-ship.html`).
 

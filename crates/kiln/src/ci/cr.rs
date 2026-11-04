@@ -205,6 +205,8 @@ pub async fn submit(hub: &Arc<Hub>, repo: &Repo, path: &str, trunk: &str, branch
     hub.store.audit(by.pushed_by.clone(), "change_requests.submit".into(), format!("{} CR{number} v{n} {kind} ({branch} into {trunk})", repo.name)).await;
     let _ = id;
     let found = if kind == "new" { "new" } else { "branch" };
+    // The collision radar looks again (W26-R16).
+    super::fresh::changed(hub, repo, trunk);
     Ok(Outcome { name: format!("CR{number}"), number, version: n, kind, title, url: format!("{base_url}/diffs/CR{number}"), change, found, split_from: None, absorbed: Vec::new() })
 }
 

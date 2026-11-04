@@ -78,9 +78,12 @@ pub struct Replay {
     pub resolved_version: Option<u32>,
     pub resolved_by: Option<String>,
     pub resolved_at: Option<i64>,
+    /// The version that keeps it as a revision (its conflict markers in), when kiln replayed it as
+    /// its trunk moved (W26-R16): the changes above it are on that version.
+    pub kept_version: Option<u32>,
 }
 
-const REPLAY_COLUMNS: &str = "id, version, commit_sha, onto, onto_name, tree, state, created_by, created_at, resolved_version, resolved_by, resolved_at";
+const REPLAY_COLUMNS: &str = "id, version, commit_sha, onto, onto_name, tree, state, created_by, created_at, resolved_version, resolved_by, resolved_at, kept_version";
 
 fn replay_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<Replay> {
     Ok(Replay {
@@ -96,6 +99,7 @@ fn replay_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<Replay> {
         resolved_version: r.get(9)?,
         resolved_by: r.get(10)?,
         resolved_at: r.get(11)?,
+        kept_version: r.get(12)?,
     })
 }
 
@@ -231,7 +235,7 @@ struct Carry {
 
 /// Whether `d` may have its conflicts resolved by `caller`: it's open and not landing, and they may
 /// submit to its repository (a resolution changes its code, as Apply does).
-fn may_change(caller: &Caller, d: &Diff) -> Result<(), Fail> {
+pub(crate) fn may_change(caller: &Caller, d: &Diff) -> Result<(), Fail> {
     if !caller.can("diffs.submit", &Scope::Repo { repo: d.repo.clone() }) {
         return Err((StatusCode::FORBIDDEN, "resolving conflicts needs `diffs.submit`".into()));
     }
@@ -271,7 +275,7 @@ async fn onto_of(hub: &Hub, d: &Diff, path: &str) -> Result<Onto, Fail> {
 /// `v` replayed onto `onto` by `git merge-tree --write-tree` (zdiff3 markers, so they carry the
 /// base): a diff as a cherry-pick of its commit (its parent the merge base), a change request as a
 /// merge of its branch. Whether it went cleanly, and what git printed.
-async fn merge_tree(hub: &Hub, path: &str, onto: &str, v: &Version, request: bool) -> Result<(bool, Merged), Fail> {
+pub(crate) async fn merge_tree(hub: &Hub, path: &str, onto: &str, v: &Version, request: bool) -> Result<(bool, Merged), Fail> {
     let base = format!("--merge-base={}", v.parent);
     let mut args = vec!["-C", path, "-c", "merge.conflictStyle=zdiff3", "merge-tree", "--write-tree", "-z"];
     if !request {
@@ -471,17 +475,57 @@ async fn record(hub: &Hub, d: &Diff, v: &Version, onto: &Onto, tree: &str, found
         .map_err(fail)?;
     if replay.state == "conflicted" {
         hub.emit(&ServerEvent::Conflict(Box::new(ConflictChange { version: Some(replay.version), state: Some(replay.state.clone()), ..changed(d, &replay.id) })));
+        // Up the ladder (W26-R17).
+        super::ladder::kick(&d.id);
     }
     Ok(replay)
 }
 
+/// The replay a kept conflicted revision (version `n` of `diff_id`) keeps.
+async fn kept_by(hub: &Hub, diff_id: &str, n: u32) -> Result<Option<Replay>, Fail> {
+    let id = diff_id.to_owned();
+    hub.store
+        .call(move |c| Ok(c.query_row(&format!("SELECT {REPLAY_COLUMNS} FROM review_replays WHERE diff_id = ?1 AND kept_version = ?2 ORDER BY created_at DESC, rowid DESC LIMIT 1"), params![id, n], replay_row).optional()?))
+        .await
+        .map_err(fail)
+}
+
+/// The version of `d` a replay starts from: its latest, or, when that's a conflicted replay kept as a
+/// revision (W26-R16), the version that replay is of (its markers are never replayed again).
+pub(crate) async fn source(hub: &Hub, d: &Diff, versions: &[Version]) -> Result<Option<Version>, Fail> {
+    let Some(latest) = versions.last() else { return Ok(None) };
+    if latest.why.as_deref() != Some(kiln_ci::fresh::WHY_CONFLICTED) {
+        return Ok(Some(latest.clone()));
+    }
+    let Some(r) = kept_by(hub, &d.id, latest.n).await? else { return Ok(Some(latest.clone())) };
+    Ok(versions.iter().find(|v| v.n == r.version).cloned().or_else(|| Some(latest.clone())))
+}
+
+/// A conflicted replay kiln made as `d`'s trunk moved (W26-R16): `v` replayed onto `onto` (named
+/// `onto_name`; on trunk commit `base`; onto the open diff `below`), as git merged it (`m`), kept with
+/// each conflict where it falls, as W26-R12's are; the version that keeps it names it as it goes in
+/// (`diffs::NewVersion::keeps`).
+pub(crate) async fn keep(hub: &Hub, path: &str, d: &Diff, v: &Version, onto: (&str, &str, &str, Option<String>), m: &Merged) -> Result<Replay, Fail> {
+    let found = found(hub, path, m).await?;
+    let (commit, name, base, below) = onto;
+    let onto = Onto { name: name.to_owned(), commit: commit.to_owned(), base: base.to_owned(), below };
+    record(hub, d, v, &onto, &m.tree, found).await
+}
+
 /// The replay of `d`'s latest revision onto where it goes now, made and kept when it's new. `None`
-/// when there's nothing to replay: the revision is on it already, or `d` is closed or landing.
+/// when there's nothing to replay: the revision is on it already, or `d` is closed or landing. A
+/// latest revision that keeps a conflicted replay (W26-R16) is that replay, which holds the gate
+/// until a resolution is committed.
 pub async fn current(hub: &Hub, d: &Diff) -> Result<Option<Replay>, Fail> {
     if !State::parse(&d.state).is_some_and(|s| s.is_open() && s != State::Landing) {
         return Ok(None);
     }
     let Some(latest) = diffs::versions(hub, d).await.map_err(fail)?.pop() else { return Ok(None) };
+    if latest.why.as_deref() == Some(kiln_ci::fresh::WHY_CONFLICTED)
+        && let Some(r) = kept_by(hub, &d.id, latest.n).await?
+    {
+        return Ok(Some(r));
+    }
     let (_, path) = diffs::home(hub, d).await?;
     let onto = onto_of(hub, d, &path).await?;
     if let Some(r) = kept_replay(hub, &d.id, latest.n, &onto.commit).await? {
@@ -546,11 +590,16 @@ pub async fn list(hub: &Hub, d: &Diff) -> Result<Value, Fail> {
         Some(r) => kept(hub, &r.id).await?,
         None => Vec::new(),
     };
-    Ok(view(d, latest, replay.as_ref(), &rows))
+    let mut v = view(d, latest, replay.as_ref(), &rows);
+    // Where the conflict ladder is with each (W26-R17).
+    if let Some(r) = replay.as_ref().filter(|r| r.state == "conflicted") {
+        super::ladder::annotate(hub, &r.id, &mut v).await;
+    }
+    Ok(v)
 }
 
 /// The event saying `d`'s conflicts in `replay` changed (W26-R12), its other parts to fill in.
-fn changed(d: &Diff, replay: &str) -> ConflictChange {
+pub(crate) fn changed(d: &Diff, replay: &str) -> ConflictChange {
     ConflictChange { repo: d.repo.clone(), diff: d.name.clone(), replay: replay.to_owned(), version: None, state: None, conflict: None, take: None, by: None, agent: None }
 }
 
@@ -627,6 +676,14 @@ pub async fn resolve(hub: &Hub, d: &Diff, id: &str, caller: &Caller, body: &Valu
     let whose = if agent { "an agent's resolution" } else { "resolved" };
     hub.store.audit(caller.name.clone(), "diffs.conflict.resolve".into(), format!("{} {} v{} ({place}): {whose}, taking {taken}", d.repo, d.name, replay.version)).await;
     hub.emit(&ServerEvent::Conflict(Box::new(ConflictChange { conflict: Some(c.id.clone()), take: Some(taken.to_owned()), by: Some(me.clone()), agent: Some(agent), ..changed(d, &replay.id) })));
+    // An agent's resolution goes up the ladder as its rung's candidate (W26-R17).
+    if agent && let Some(lines) = lines.as_deref() {
+        let explanation = body.get("explanation").and_then(Value::as_str).map(str::trim).filter(|e| !e.is_empty());
+        if let Err((_, why)) = super::ladder::answered(hub, d, &replay, &c.id, &caller.name, lines, explanation).await {
+            tracing::info!(diff = %d.name, %why, "an agent's resolution couldn't be tried");
+        }
+    }
+    super::ladder::kick(&d.id);
     let rows = kept(hub, &replay.id).await?;
     Ok(view(d, Some(replay.version), Some(&replay), &rows))
 }
@@ -652,6 +709,7 @@ pub async fn undo(hub: &Hub, d: &Diff, id: &str, caller: &Caller) -> Result<Valu
         .map_err(fail)?;
     hub.store.audit(caller.name.clone(), "diffs.conflict.undo".into(), format!("{} {} v{} ({})", d.repo, d.name, replay.version, c.place())).await;
     hub.emit(&ServerEvent::Conflict(Box::new(ConflictChange { conflict: Some(c.id.clone()), by: Some(me.clone()), agent: Some(agent), ..changed(d, &replay.id) })));
+    super::ladder::kick(&d.id);
     let rows = kept(hub, &replay.id).await?;
     Ok(view(d, Some(replay.version), Some(&replay), &rows))
 }
@@ -777,56 +835,209 @@ pub async fn commit(hub: &Arc<Hub>, d: &Diff, caller: &Caller) -> Result<Value, 
     if !open.is_empty() {
         return Err(refused(open.join("; ")));
     }
+    let at = again(hub, d, &replay).await?;
+    let (puts, removes) = resolutions(hub, &at.path, &at.merged, &rows).await?;
+    let tree = tree_with(hub, &at.path, &at.merged.tree, &puts, &removes).await?;
+    // An agent's resolution taken makes the agent a co-author.
+    let agents: Vec<&str> = rows.iter().filter(|c| c.take == Some(Take::Agent)).filter_map(|c| c.agent_by.as_deref()).collect::<BTreeSet<_>>().into_iter().collect();
+    let made = make(hub, d, &at, &tree, &me, &caller.name, &agents, rows.iter().map(|c| c.file.as_str()).collect()).await?;
+    let by = super::cr::By { pushed_by: caller.name.clone(), author: diffs::author_of(&caller.name, Some(caller.kind)), started_by: caller.started_by() };
+    let n = adopt(hub, d, &replay, &at, &made, &me, by).await?;
+    // What a person resolved is remembered for the next time the same conflict comes (W26-R17).
+    for c in rows.iter().filter(|c| c.kind.by_lines()) {
+        if let Some(lines) = c.lines.clone().or_else(|| match c.take {
+            Some(Take::Main) => Some(side_lines(&c.main)),
+            Some(Take::This) => Some(side_lines(&c.this)),
+            _ => None,
+        }) {
+            super::ladder::remember(hub, &at.repo_id, &c.file, &side_lines(&c.main), &side_lines(&c.this), &lines, &me, None).await;
+        }
+    }
+    hub.store.audit(caller.name.clone(), "diffs.conflicts.commit".into(), format!("{} {} v{n}: {} conflicts resolved onto {} ({})", d.repo, d.name, rows.len(), at.onto.name, made.sha)).await;
+    Ok(json!({ "diff": d.name, "version": n, "why": WHY, "commit": made.sha, "by": me, "signer": made.signer, "replay": replay.id, "conflicts": rows.len() }))
+}
+
+/// A conflicted replay made again, to resolve: its revision still `d`'s latest, where it goes
+/// still where it went, and git's result the same.
+struct Again {
+    path: String,
+    repo_id: String,
+    latest: Version,
+    onto: Onto,
+    merged: Merged,
+    /// A conflicted replay kiln kept as a revision (W26-R16): the changes above it are on it.
+    kept: bool,
+}
+
+async fn again(hub: &Hub, d: &Diff, replay: &Replay) -> Result<Again, Fail> {
     let (repo, path) = diffs::home(hub, d).await?;
-    let latest = diffs::versions(hub, d).await.map_err(fail)?.pop().filter(|v| v.n == replay.version).ok_or_else(|| refused(format!("{} has a newer revision: look again", d.name)))?;
-    let onto = onto_of(hub, d, &path).await?;
+    let all = diffs::versions(hub, d).await.map_err(fail)?;
+    // A conflicted replay kiln kept as a revision (W26-R16) resolves from the version it replayed,
+    // onto what it was replayed onto.
+    let kept = all.last().is_some_and(|v| replay.kept_version == Some(v.n));
+    let latest = match kept {
+        true => all.iter().find(|v| v.n == replay.version).cloned(),
+        false => all.last().cloned().filter(|v| v.n == replay.version),
+    }
+    .ok_or_else(|| refused(format!("{} has a newer revision: look again", d.name)))?;
+    let onto = match kept {
+        true => Onto { name: replay.onto_name.clone(), commit: replay.onto.clone(), base: all.iter().find(|v| Some(v.n) == replay.kept_version).map(|v| v.base.clone()).unwrap_or_default(), below: onto_of(hub, d, &path).await?.below },
+        false => onto_of(hub, d, &path).await?,
+    };
     if onto.commit != replay.onto {
         return Err(refused(format!("{} moved: look again", onto.name)));
     }
-    let (_, m) = merge_tree(hub, &path, &onto.commit, &latest, d.kind == "change_request").await?;
-    if m.tree != replay.tree {
+    let (_, merged) = merge_tree(hub, &path, &onto.commit, &latest, d.kind == "change_request").await?;
+    if merged.tree != replay.tree {
         return Err(refused("the replay came out otherwise this time; look again"));
     }
-    let (puts, removes) = resolutions(hub, &path, &m, &rows).await?;
-    let tree = tree_with(hub, &path, &m.tree, &puts, &removes).await?;
-    // An agent's resolution taken makes the agent a co-author.
-    let agents: Vec<&str> = rows.iter().filter(|c| c.take == Some(Take::Agent)).filter_map(|c| c.agent_by.as_deref()).collect::<BTreeSet<_>>().into_iter().collect();
-    let files: BTreeSet<&str> = rows.iter().map(|c| c.file.as_str()).collect();
-    let (n, made) = match &d.branch {
-        // A change request: where it goes merged into its branch, the merge resolved.
+    Ok(Again { path, repo_id: repo.id, latest, onto, merged, kept })
+}
+
+/// The commit of a resolution's `tree`, made by `by` (a principal) through `revision::commit`, the
+/// path W27-R03 signs: a diff's onto where it goes, its author and message kept; a change
+/// request's a merge of where it goes into its branch, its author `author`.
+#[allow(clippy::too_many_arguments)]
+async fn make(hub: &Hub, d: &Diff, at: &Again, tree: &str, author: &str, by: &str, co_authors: &[&str], files: BTreeSet<&str>) -> Result<revision::Made, Fail> {
+    let path = at.path.as_str();
+    match &d.branch {
         Some(branch) => {
             let listed: Vec<String> = files.iter().map(|f| format!("\t{f}")).collect();
-            let message = format!("Merge {} into {branch}\n\nConflicts resolved:\n{}\n", onto.name, listed.join("\n"));
-            let made = revision::commit(hub, &path, &revision::Commit { tree: &tree, parents: &[latest.commit.as_str(), onto.commit.as_str()], author: (me.as_str(), None), by: &caller.name, co_authors: &agents, message: &message })
-                .await
-                .map_err(internal)?;
-            gitops::run_git(hub, &["-C", &path, "update-ref", &format!("refs/heads/{branch}"), &made.sha, &latest.commit], LS_REMOTE_TIMEOUT).await.map_err(|_| refused(format!("{branch} moved: push or pull, then try again")))?;
-            let by = super::cr::By { pushed_by: caller.name.clone(), author: diffs::author_of(&caller.name, Some(caller.kind)), started_by: caller.started_by() };
-            let out = super::cr::submit(hub, &repo, &path, &d.trunk, branch, &made.sha, &by, &kiln_ci::review::Options::default()).await.map_err(|e| (StatusCode::UNPROCESSABLE_ENTITY, e))?;
-            (out.version, made)
+            let message = format!("Merge {} into {branch}\n\nConflicts resolved:\n{}\n", at.onto.name, listed.join("\n"));
+            revision::commit(hub, path, &revision::Commit { tree, parents: &[at.latest.commit.as_str(), at.onto.commit.as_str()], author: (author, None), by, co_authors, message: &message }).await.map_err(internal)
         }
-        // A diff: its commit onto where it goes, its author and message kept.
         None => {
-            let message = gitops::run_git(hub, &["-C", &path, "log", "-1", "--format=%B", &latest.commit], LS_REMOTE_TIMEOUT).await.map(|o| String::from_utf8_lossy(&o).into_owned()).unwrap_or_default();
-            let who_wrote = gitops::run_git(hub, &["-C", &path, "log", "-1", "--format=%an <%ae>%x00%ad", "--date=raw", &latest.commit], LS_REMOTE_TIMEOUT).await.map(|o| String::from_utf8_lossy(&o).trim().to_owned()).unwrap_or_default();
+            let message = gitops::run_git(hub, &["-C", path, "log", "-1", "--format=%B", &at.latest.commit], LS_REMOTE_TIMEOUT).await.map(|o| String::from_utf8_lossy(&o).into_owned()).unwrap_or_default();
+            let who_wrote = gitops::run_git(hub, &["-C", path, "log", "-1", "--format=%an <%ae>%x00%ad", "--date=raw", &at.latest.commit], LS_REMOTE_TIMEOUT).await.map(|o| String::from_utf8_lossy(&o).trim().to_owned()).unwrap_or_default();
             let (author, date) = who_wrote.split_once('\0').unwrap_or((&who_wrote, ""));
-            let made = revision::commit(hub, &path, &revision::Commit { tree: &tree, parents: &[onto.commit.as_str()], author: (author, Some(date)), by: &caller.name, co_authors: &agents, message: &message }).await.map_err(internal)?;
-            let patch = diffs::git_run(hub, &["-C", &path, "show", "--no-color", &made.sha], &[], Vec::new()).await.ok().map(|r| r.out).unwrap_or_default();
-            let patch_id = diffs::git_with_input(hub, &["-C", &path, "patch-id", "--stable"], patch).await.ok().and_then(|o| String::from_utf8_lossy(&o).split_whitespace().next().map(str::to_owned)).unwrap_or_default();
-            let nv = diffs::NewVersion { commit: made.sha.clone(), parent: onto.commit.clone(), base: onto.base.clone(), patch_id, message: made.message.clone(), note: None, rebase_only: false, pushed_by: caller.name.clone(), parent_diff: onto.below.clone() };
-            (diffs::add_version(hub, &repo, &path, d, nv).await.map_err(fail)?, made)
+            revision::commit(hub, path, &revision::Commit { tree, parents: &[at.onto.commit.as_str()], author: (author, Some(date)), by, co_authors, message: &message }).await.map_err(internal)
+        }
+    }
+}
+
+/// `made`, a resolution of `replay`, as `d`'s new version, its why `conflict resolved`: a change
+/// request's branch moved to it, a diff's version added. The replay is resolved by `me`; what
+/// waits on the gate asks it again.
+async fn adopt(hub: &Arc<Hub>, d: &Diff, replay: &Replay, at: &Again, made: &revision::Made, me: &str, by: super::cr::By) -> Result<u32, Fail> {
+    let path = at.path.as_str();
+    let repo = diffs::home(hub, d).await?.0;
+    let n = match &d.branch {
+        Some(branch) => {
+            gitops::run_git(hub, &["-C", path, "update-ref", &format!("refs/heads/{branch}"), &made.sha, &at.latest.commit], LS_REMOTE_TIMEOUT).await.map_err(|_| refused(format!("{branch} moved: push or pull, then try again")))?;
+            super::cr::submit(hub, &repo, path, &d.trunk, branch, &made.sha, &by, &kiln_ci::review::Options::default()).await.map_err(|e| (StatusCode::UNPROCESSABLE_ENTITY, e))?.version
+        }
+        None => {
+            let patch = diffs::git_run(hub, &["-C", path, "show", "--no-color", &made.sha], &[], Vec::new()).await.ok().map(|r| r.out).unwrap_or_default();
+            let patch_id = diffs::git_with_input(hub, &["-C", path, "patch-id", "--stable"], patch).await.ok().and_then(|o| String::from_utf8_lossy(&o).split_whitespace().next().map(str::to_owned)).unwrap_or_default();
+            let nv = diffs::NewVersion { commit: made.sha.clone(), parent: at.onto.commit.clone(), base: at.onto.base.clone(), patch_id, message: made.message.clone(), note: None, rebase_only: false, pushed_by: by.pushed_by.clone(), parent_diff: at.onto.below.clone(), why: None, keeps: None, same_patch: None };
+            diffs::add_version(hub, &repo, path, d, nv).await.map_err(fail)?
         }
     };
     // Why the revision exists (W26-R04).
     revision::record(hub, &d.id, n, &made.sha, &revision::Why { why: WHY, thread: None, comment: None, note: Some(WHY) }).await.map_err(fail)?;
-    let (rid, me2) = (replay.id.clone(), me.clone());
+    let (rid, me2) = (replay.id.clone(), me.to_owned());
     hub.store
         .call(move |c| Ok(c.execute("UPDATE review_replays SET state = 'resolved', resolved_version = ?2, resolved_by = ?3, resolved_at = ?4 WHERE id = ?1", params![rid, n, me2, crate::util::now_unix()]).map(|_| ())?))
         .await
         .map_err(fail)?;
-    hub.store.audit(caller.name.clone(), "diffs.conflicts.commit".into(), format!("{} {} v{n}: {} conflicts resolved onto {} ({})", d.repo, d.name, rows.len(), onto.name, made.sha)).await;
-    // What waits on the gate asks it again: an automatic merge goes once it clears.
     super::land::kick();
-    hub.emit(&ServerEvent::Conflict(Box::new(ConflictChange { version: Some(n), state: Some("resolved".to_owned()), by: Some(me.clone()), ..changed(d, &replay.id) })));
-    Ok(json!({ "diff": d.name, "version": n, "why": WHY, "commit": made.sha, "by": me, "signer": made.signer, "replay": replay.id, "conflicts": rows.len() }))
+    // The changes above it, on its conflicted revision, are replayed onto the resolution (W26-R16).
+    if at.kept {
+        super::fresh::moved(hub, &repo, &d.trunk, "", &at.onto.base);
+    }
+    hub.emit(&ServerEvent::Conflict(Box::new(ConflictChange { version: Some(n), state: Some("resolved".to_owned()), by: Some(me.to_owned()), ..changed(d, &replay.id) })));
+    Ok(n)
+}
+
+// ------------------------------------------------------------------ the ladder's (W26-R17)
+
+/// A conflict as the ladder reads it.
+#[derive(Debug, Clone)]
+pub(crate) struct ForLadder {
+    pub id: String,
+    pub file: String,
+    pub place: String,
+    /// A text conflict, resolved by its lines.
+    pub text: bool,
+    pub main: Vec<String>,
+    pub this: Vec<String>,
+    /// A person resolved it where it falls (took a side, edited, or took an agent's lines).
+    pub taken: bool,
+}
+
+/// A replay's conflicts, in order, as the ladder reads them.
+pub(crate) async fn for_ladder(hub: &Hub, replay: &str) -> Result<Vec<ForLadder>, Fail> {
+    Ok(kept(hub, replay)
+        .await?
+        .into_iter()
+        .map(|c| ForLadder { place: c.place(), text: c.kind.by_lines(), main: side_lines(&c.main), this: side_lines(&c.this), taken: c.take.is_some(), id: c.id, file: c.file })
+        .collect())
+}
+
+/// A candidate resolution of `replay` (W26-R17): each conflict `picks` names resolved to its lines,
+/// each a person resolved as they did, every other taking main's side; committed by `by` (kiln, or
+/// an agent's principal), signed as them once W27-R03 signs `revision::commit`. Its SHA.
+pub(crate) async fn candidate(hub: &Hub, d: &Diff, replay: &Replay, picks: &HashMap<String, Vec<String>>, by: &str, co_authors: &[&str]) -> Result<String, Fail> {
+    let at = again(hub, d, replay).await?;
+    let mut rows = kept(hub, &replay.id).await?;
+    for c in &mut rows {
+        if let Some(lines) = picks.get(&c.id) {
+            (c.take, c.lines) = (Some(Take::Edit), Some(lines.clone()));
+        } else if c.take.is_none() {
+            (c.take, c.lines) = (Some(Take::Main), None);
+        }
+    }
+    let (puts, removes) = resolutions(hub, &at.path, &at.merged, &rows).await?;
+    let tree = tree_with(hub, &at.path, &at.merged.tree, &puts, &removes).await?;
+    let made = make(hub, d, &at, &tree, by, by, co_authors, rows.iter().map(|c| c.file.as_str()).collect()).await?;
+    Ok(made.sha)
+}
+
+/// The candidate `sha` of `replay`, accepted (or going on by itself): `d`'s new version, its why
+/// `conflict resolved`, resolved by `me`. The version.
+pub(crate) async fn accept(hub: &Arc<Hub>, d: &Diff, replay: &Replay, sha: &str, me: &str, by: super::cr::By) -> Result<u32, Fail> {
+    let at = again(hub, d, replay).await?;
+    let message = gitops::run_git(hub, &["-C", &at.path, "log", "-1", "--format=%B", sha], LS_REMOTE_TIMEOUT).await.map(|o| String::from_utf8_lossy(&o).into_owned()).map_err(fail)?;
+    let made = revision::Made { sha: sha.to_owned(), message, signer: None };
+    adopt(hub, d, replay, &at, &made, me, by).await
+}
+
+/// A text conflict of `replay` in its file, for the structural merge: the file before it and
+/// after it (its other conflicts taking main's side), and its base's, main's and this side's
+/// lines, each with its newline. `None` for a conflict that isn't text, or whose base git didn't
+/// carry.
+pub(crate) struct Around {
+    pub file: String,
+    pub before: String,
+    pub base: String,
+    pub main: String,
+    pub this: String,
+    pub after: String,
+}
+
+pub(crate) async fn around(hub: &Hub, d: &Diff, replay: &Replay, conflict: &str) -> Result<Option<Around>, Fail> {
+    let rows = kept(hub, &replay.id).await?;
+    let Some(c) = rows.iter().find(|c| c.id == conflict) else { return Ok(None) };
+    let Some(index) = c.hunk.filter(|_| c.kind.by_lines()).and_then(|h| usize::try_from(h).ok()) else { return Ok(None) };
+    let at = again(hub, d, replay).await?;
+    let text = Text::parse(&String::from_utf8_lossy(&blob(hub, &at.path, &format!("{}:{}", at.merged.tree, c.file)).await?)).map_err(internal)?;
+    let (Some((before, after)), Some(h)) = (text.around(index), text.hunks().get(index).copied()) else { return Ok(None) };
+    let Some(base) = h.base.as_deref() else { return Ok(None) };
+    let lines = |ls: &[String]| ls.iter().map(|l| format!("{l}\n")).collect::<String>();
+    Ok(Some(Around { file: c.file.clone(), before, base: lines(base), main: lines(&h.main), this: lines(&h.this), after }))
+}
+
+/// `replay` as a commit of kiln's, git's markers where each conflict is (its tree as git wrote it),
+/// onto where it goes: what an agent resolving it checks out.
+pub(crate) async fn conflicted(hub: &Hub, d: &Diff, replay: &Replay) -> Result<String, Fail> {
+    let at = again(hub, d, replay).await?;
+    let message = format!("{} v{} replayed onto {}, conflicted\n", d.name, replay.version, at.onto.name);
+    let made = revision::commit(hub, &at.path, &revision::Commit { tree: &at.merged.tree, parents: &[at.onto.commit.as_str()], author: ("kiln", None), by: "kiln", co_authors: &[], message: &message }).await.map_err(internal)?;
+    Ok(made.sha)
+}
+
+/// Where a replay's repository lives here, and its id.
+pub(crate) async fn home(hub: &Hub, d: &Diff) -> Result<(String, String), Fail> {
+    let (repo, path) = diffs::home(hub, d).await?;
+    Ok((repo.id, path))
 }

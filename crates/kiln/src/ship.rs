@@ -315,6 +315,9 @@ struct ChangeRec {
     /// A host's pull request kiln opened for an agent (`agents.change`): that agent's session
     /// (W26-R18 drafts). A kiln change names its agent as its author.
     by_agent: Option<String>,
+    /// How fresh it is on its trunk, from its latest version (W26-R16): a replay of kiln's says what
+    /// it went onto. None when its latest isn't a replay.
+    fresh: Option<String>,
 }
 
 impl ChangeRec {
@@ -434,7 +437,9 @@ fn load_change(c: &rusqlite::Connection, repo_id: &str, sha: &str) -> anyhow::Re
         })
     })?;
     let mut marks: Vec<MarkRec> = Vec::new();
-    let mut st = c.prepare("SELECT n, commit_sha, rebase_only, created_at, message, pushed_by, why, thread FROM diff_versions WHERE diff_id = ?1 ORDER BY n")?;
+    let trunk: String = c.query_row("SELECT trunk FROM diffs WHERE id = ?1", [&id], |r| r.get(0)).unwrap_or_default();
+    let mut latest_replay: Option<(Option<String>, String)> = None;
+    let mut st = c.prepare("SELECT n, commit_sha, rebase_only, created_at, message, pushed_by, why, thread, base FROM diff_versions WHERE diff_id = ?1 ORDER BY n")?;
     for row in st.query_map([&id], |r| {
         Ok((
             r.get::<_, u32>(0)?,
@@ -445,18 +450,24 @@ fn load_change(c: &rusqlite::Connection, repo_id: &str, sha: &str) -> anyhow::Re
             r.get::<_, String>(5)?,
             r.get::<_, Option<String>>(6)?,
             r.get::<_, Option<String>>(7)?,
+            r.get::<_, String>(8)?,
         ))
     })? {
-        let (v, commit, rebase_only, at, message, pushed_by, why, thread) = row?;
+        let (v, commit, rebase_only, at, message, pushed_by, why, thread, base) = row?;
+        latest_replay = Some((why.clone(), base));
         if v == ch.n {
             (ch.message, ch.at) = (message, at);
         }
         ch.pushes.push((v, rebase_only, at));
         (ch.latest, ch.latest_sha) = (v, commit);
         // A revision is the lane's push, the fix answering a thread (an agent's fix, a suggestion
-        // applied) or the resolution of a replay's conflicts, by which `why` it was made (W26-R14).
+        // applied), the resolution of a replay's conflicts, or kiln's replay as its trunk moved
+        // (W26-R16), by which `why` it was made (W26-R14). A replay kept with its conflicts is its
+        // replay's mark, below.
         let kind = match why.as_deref() {
             Some("conflict resolved") => "resolution",
+            Some(w) if w == kiln_ci::fresh::WHY => "replay",
+            Some(w) if w == kiln_ci::fresh::WHY_CONFLICTED => "",
             Some(_) => "fix",
             None if thread.is_some() => "fix",
             None => "push",
@@ -464,18 +475,28 @@ fn load_change(c: &rusqlite::Connection, repo_id: &str, sha: &str) -> anyhow::Re
         if kind == "fix" {
             ch.fixes.push(v);
         }
-        marks.push(MarkRec {
-            id: format!("{id}:v{v}"),
-            kind,
-            at,
-            end: Some(at),
-            by: pushed_by,
-            revision: Some(v),
-            state: "passed",
-            thread,
-            note: why.or_else(|| rebase_only.then(|| "rebase only".to_string())),
-        });
+        if !kind.is_empty() {
+            marks.push(MarkRec {
+                id: format!("{id}:v{v}"),
+                kind,
+                at,
+                end: Some(at),
+                by: pushed_by,
+                revision: Some(v),
+                state: "passed",
+                thread,
+                note: why.or_else(|| rebase_only.then(|| "rebase only".to_string())),
+            });
+        }
     }
+    // How fresh it is (W26-R16), as the change page says it, from what the store has: a replay of
+    // kiln's names the trunk tip it went onto (its base).
+    let on = |base: &str| format!("{trunk}@{}", base.get(..6).unwrap_or(base));
+    ch.fresh = match latest_replay {
+        Some((Some(w), base)) if w == kiln_ci::fresh::WHY => Some(format!("replays clean on {}", on(&base))),
+        Some((Some(w), base)) if w == kiln_ci::fresh::WHY_CONFLICTED => Some(format!("conflicts on {}", on(&base))),
+        _ => None,
+    };
     let mut st = c.prepare("SELECT reviewer, added_at FROM diff_reviewers WHERE diff_id = ?1 ORDER BY added_at, reviewer")?;
     ch.reviewers = st.query_map([&id], |r| Ok((r.get(0)?, r.get(1)?)))?.collect::<Result<_, _>>()?;
     let mut st = c.prepare("SELECT reviewer, action, created_at, body, version FROM reviews WHERE diff_id = ?1 ORDER BY created_at, rowid")?;
@@ -649,7 +670,21 @@ fn load_pull(c: &rusqlite::Connection, repo_id: &str, host: &str, number: i64, n
             |r| r.get(0),
         )
         .optional()?;
+    // How fresh it is (W26-R16): its latest head's latest replay onto its base, in kiln's mirror.
+    let fresh = c
+        .query_row(
+            "SELECT r.state, r.onto, p.base FROM review_pull_replays r JOIN host_pulls p ON p.repo_id = r.repo_id AND p.host = r.host AND p.number = r.number
+              WHERE r.repo_id = ?1 AND r.host = ?2 AND r.number = ?3 AND r.head_sha = ?4 ORDER BY r.k DESC LIMIT 1",
+            params![repo_id, host, number, latest_sha],
+            |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get::<_, String>(2)?)),
+        )
+        .optional()?
+        .map(|(state, onto, base)| {
+            let at = format!("{base}@{}", onto.get(..6).unwrap_or(&onto));
+            if state == "clean" { format!("replays clean on {at}") } else { format!("conflicts on {at}") }
+        });
     Ok(ChangeRec {
+        fresh,
         name: format!("{}{number}", if host == "gitlab" { "!" } else { "#" }),
         kind: "request",
         host: host.to_string(),
@@ -780,7 +815,7 @@ fn review_of(ch: &ChangeRec, sha: &str, handed: Option<&HandoffRec>, held: Optio
     let about = held.filter(|_| state != ReviewState::Fixing).unwrap_or(about);
     let tip = ch.tip();
     let superseded_by = (sha != tip).then(|| if ch.n < ch.latest { format!("v{}", ch.latest) } else { short(tip) });
-    Some(Review { state, turn: whose, author, open, conflicts: gate.conflicts, fixing: handed.map(|h| h.to.clone()), about, superseded_by, fixed_in })
+    Some(Review { state, turn: whose, author, open, conflicts: gate.conflicts, fixing: handed.map(|h| h.to.clone()), about, superseded_by, fixed_in, fresh: ch.fresh.clone() })
 }
 
 fn short(sha: &str) -> String {
@@ -1245,6 +1280,27 @@ fn made_by(rec: &Records) -> MadeBy {
 }
 
 impl MadeBy {
+    /// Who made one of the conflict ladder's tries (docs/ci.md W26-R17), from its actor's
+    /// principal: an agent's (`agent:<id> for user:kim`) names the agent and the person it acts for;
+    /// a person's (`user:kim`) the person; kiln's own (its structural merge, a remembered resolution)
+    /// neither, its rung saying who. A try isn't a commit until it's accepted; the revision it
+    /// becomes then reads its maker through [`made_by`], as every commit does.
+    fn of_actor(principal: &str) -> MadeBy {
+        if let Some(rest) = principal.strip_prefix("agent:") {
+            let mut words = rest.split(' ');
+            let agent = words.next().filter(|a| !a.is_empty()).map(str::to_owned);
+            let person = match (words.next(), words.next()) {
+                (Some("for"), Some(p)) if !p.is_empty() => Some(p.to_owned()),
+                _ => None,
+            };
+            return MadeBy { agent, person };
+        }
+        if principal.starts_with("user:") {
+            return MadeBy { agent: None, person: Some(principal.to_owned()) };
+        }
+        MadeBy::default()
+    }
+
     /// `{agent?, person?}` (optional fields, W26-R18), or null when kiln knows neither.
     fn json(&self) -> Value {
         if self.agent.is_none() && self.person.is_none() {
@@ -1259,6 +1315,11 @@ impl MadeBy {
         }
         Value::Object(v)
     }
+}
+
+/// [`MadeBy::of_actor`] as the API shows it: `{agent?, person?}`, or null.
+pub(crate) fn made_by_actor(principal: &str) -> Value {
+    MadeBy::of_actor(principal).json()
 }
 
 /// A commit's kind for the facets: its change's (`diff`, `request`), else `commit`.
@@ -2542,6 +2603,20 @@ pub async fn kiln_kept(hub: &Hub, repo: &str, sha: &str, version: u32, what: &st
 
 /// Keeps a Hand off of `rec`'s commit, one row for each of `what` (W26-R18): to whom (`to`, its
 /// agent and the incident it opened), the change's revision for its review, by whom, now.
+/// A change's conflicts the conflict ladder handed to an agent (docs/ci.md W26-R17), kept as Hand
+/// off keeps them (W26-R18), so its row reads "<to> fixing" until a new revision replaces it.
+pub(crate) async fn conflicts_handed(hub: &Hub, repo: &str, sha: &str, to: &str, agent: &str, version: u32) -> Result<(), Fail> {
+    let (repo, sha, to, agent, at) = (repo.to_owned(), sha.to_owned(), to.to_owned(), agent.to_owned(), crate::util::now_unix());
+    hub.store
+        .call(move |c| {
+            let repo_id: String = c.query_row("SELECT id FROM repos WHERE name = ?1 OR id = ?1", [&repo], |r| r.get(0))?;
+            c.execute("INSERT INTO ship_handoffs (repo_id, sha, what, to_name, agent, incident, version, by, at) VALUES (?1, ?2, 'conflicts', ?3, ?4, NULL, ?5, 'kiln', ?6)", params![repo_id, sha, to, agent, version, at])?;
+            Ok(())
+        })
+        .await
+        .map_err(internal)
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn keep(hub: &Hub, rec: &Records, what: &[&str], to: &str, agent: Option<&str>, incident: Option<&str>, version: Option<u32>, by: &str) -> Result<(), Fail> {
     let (repo, sha, what) = (rec.repo.clone(), rec.sha.clone(), what.iter().map(|w| (*w).to_owned()).collect::<Vec<String>>());
@@ -2565,6 +2640,16 @@ async fn keep(hub: &Hub, rec: &Records, what: &[&str], to: &str, agent: Option<&
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// W26-R17: who made each of the conflict ladder's tries reads back in MadeBy's shape: an agent's
+    /// offer names the agent and its person, a person's edit the person, kiln's own merge neither.
+    #[test]
+    fn w26_r17_a_ladder_trys_made_by() {
+        assert_eq!(made_by_actor("agent:01a18b4228f7 for user:kim"), json!({ "agent": "01a18b4228f7", "person": "user:kim" }));
+        assert_eq!(made_by_actor("agent:resolver"), json!({ "agent": "resolver" }));
+        assert_eq!(made_by_actor("user:kim"), json!({ "person": "user:kim" }));
+        assert_eq!(made_by_actor("kiln"), Value::Null);
+    }
 
     const C1: &str = "1111111aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
     const C2: &str = "2222222bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
@@ -3567,6 +3652,37 @@ mod tests {
             let page = list_in(&store, &HashMap::new(), None, None, runners(), &[], NOW_S * 1000).await.map_err(|(_, m)| anyhow::anyhow!(m))?;
             let lee = page.get("commits").and_then(Value::as_array).into_iter().flatten().find(|c| c.get("short") == Some(&json!("5151515"))).and_then(|c| c.get("made_by").cloned());
             assert_eq!(lee, Some(json!({ "person": "user:lee" })), "a person's change: its person, and no agent");
+            Ok(())
+        })
+    }
+
+    /// W26-R16 on Ship's row: a change kiln replayed as its trunk moved says so at the end of its
+    /// line, the replay's base naming the tip it went onto; before the replay, the line says nothing
+    /// of it. The row's line changes, so its cache must take the new version (diff_versions'
+    /// triggers note the change).
+    #[test]
+    fn w26_r16_a_replay_ends_the_rows_line_with_how_fresh_it_is() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let store = crate::store::Store::open(&dir.path().join("kiln.db"))?;
+        crate::rt::block_on(async move {
+            let sql = fixture() + &fixture_person_change();
+            store.call(move |c| Ok(c.execute_batch(&sql)?)).await?;
+            let line = |page: &Value, short: &str| page.get("commits").and_then(Value::as_array).into_iter().flatten().find(|c| c.get("short") == Some(&json!(short))).and_then(|c| c.get("line").and_then(Value::as_str).map(str::to_owned)).unwrap_or_default();
+            let page = list_in(&store, &HashMap::new(), None, None, runners(), &[], NOW_S * 1000).await.map_err(|(_, m)| anyhow::anyhow!(m))?;
+            let before = line(&page, "5151515");
+            assert!(!before.contains("replays clean"), "{before}");
+            let seq = |store: crate::store::Store| async move { store.call(|c| Ok(c.query_row("SELECT n FROM ship_seq", [], |r| r.get::<_, i64>(0))?)).await };
+            let was = seq(store.clone()).await?;
+            let t = NOW_S - 60;
+            let replay = "5252525aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+            let sql = format!(
+                "INSERT INTO diff_versions (diff_id, n, commit_sha, parent, base, message, pushed_by, created_at, rebase_only, why) VALUES ('d51', 2, '{replay}', '4c1e2a9f00', '4c1e2a9f00', 'sched: lee', 'kiln', {t}, 1, 'replayed');"
+            );
+            store.call(move |c| Ok(c.execute_batch(&sql)?)).await?;
+            assert!(seq(store.clone()).await? > was, "the replay notes the change for Ship's cache");
+            let page = list_in(&store, &HashMap::new(), None, None, runners(), &[], NOW_S * 1000).await.map_err(|(_, m)| anyhow::anyhow!(m))?;
+            let after = line(&page, "5252525");
+            assert!(after.ends_with(" · replays clean on main@4c1e2a") || after == "replays clean on main@4c1e2a", "{after}");
             Ok(())
         })
     }

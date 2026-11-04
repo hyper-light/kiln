@@ -255,7 +255,26 @@ async fn gate_threads(hub: &Hub, d: &Diff) -> Result<Vec<kiln_ci::review::Thread
 /// replay onto where it lands holds it until Commit resolution makes a revision of it (W26-R12).
 pub async fn gate_of(hub: &Hub, d: &Diff, asking: Option<&str>) -> Result<Gate, Fail> {
     let conflicts = super::conflicts::for_gate(hub, d).await;
-    Ok(kiln_ci::review::gate(&gate_threads(hub, d).await?, &conflicts, asking))
+    let gate = kiln_ci::review::gate(&gate_threads(hub, d).await?, &conflicts, asking);
+    // A change that turns automatic pushes on warns, in plain words, before it's approved (W26-R16).
+    Ok(match turns_auto_push_on(hub, d).await {
+        true => kiln_ci::fresh::warn(gate, &kiln_ci::fresh::auto_push_warning(&d.trunk)),
+        false => gate,
+    })
+}
+
+/// Whether `d`'s latest revision turns automatic pushes on: its `.kiln/review.yaml` says
+/// `fresh.push: auto` where its trunk's doesn't (W26-R16).
+async fn turns_auto_push_on(hub: &Hub, d: &Diff) -> bool {
+    let Ok((_, path)) = super::diffs::home(hub, d).await else { return false };
+    let Some(latest) = super::diffs::versions(hub, d).await.ok().and_then(|mut v| v.pop()) else { return false };
+    let read = |rev: String| {
+        let path = path.clone();
+        async move { gitops::run_git(hub, &["-C", &path, "show", &format!("{rev}:.kiln/review.yaml")], LS_REMOTE_TIMEOUT).await.map(|b| String::from_utf8_lossy(&b).into_owned()).unwrap_or_default() }
+    };
+    let ours = Policy::parse(&read(latest.commit.clone()).await).unwrap_or_default();
+    let theirs = Policy::parse(&read(format!("refs/heads/{}", d.trunk)).await).unwrap_or_default();
+    kiln_ci::fresh::turns_auto_push_on(&theirs.fresh, &ours.fresh)
 }
 
 /// A new comment: on a thread (`thread`), or a new thread on a version's `file`, `side` and
@@ -613,7 +632,10 @@ pub async fn facts(hub: &Hub, d: &Diff, versions: &[Version]) -> Result<Facts, F
         .await
         .map_err(fail)?;
     let latest = versions.last();
-    let checks = match latest {
+    // A revision kiln replayed as the trunk moved (W26-R16) starts no runs: the checks are those of
+    // the revision it replays, the latest one that isn't a replay.
+    let tested = versions.iter().rev().find(|v| v.why.as_deref() != Some(kiln_ci::fresh::WHY)).or(latest);
+    let checks = match tested {
         Some(v) => checks_on(hub, &d.repo, &v.commit).await.map_err(fail)?,
         None => BTreeMap::new(),
     };
@@ -1262,6 +1284,9 @@ pub async fn apply_suggestion(hub: &std::sync::Arc<Hub>, id: &str, caller: &Call
                 rebase_only: false,
                 pushed_by: caller.name.clone(),
                 parent_diff: below,
+                why: None,
+                keeps: None,
+                same_patch: None,
             };
             let n = super::diffs::add_version(hub, &repo, &path, &d, nv).await.map_err(fail)?;
             (made, n)

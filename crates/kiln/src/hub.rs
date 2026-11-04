@@ -485,6 +485,8 @@ pub struct Hub {
     pub gitops_kick: Notify,
     /// Repositories (by id) asked to be polled now: a push, a webhook, a new repository.
     pub gitops_wanted: Mutex<HashSet<String>>,
+    /// Trunk moves whose open changes are to be replayed onto them (W26-R16, [`crate::ci::fresh`]).
+    pub fresh: crate::ci::fresh::Queue,
     /// Agents installing what jobs lack, by job ([`crate::toolfix`]).
     pub tool_fixes: Mutex<HashMap<String, crate::toolfix::Fix>>,
     pub shutdown: Shutdown,
@@ -652,6 +654,7 @@ impl Hub {
             k8s: std::sync::OnceLock::new(),
             gitops_kick: Notify::new(),
             gitops_wanted: Mutex::new(HashSet::new()),
+            fresh: crate::ci::fresh::Queue::default(),
             tool_fixes: Mutex::new(HashMap::new()),
             shutdown,
             refusals: Mutex::new(crate::wire::unread::Refusals::new(Arc::clone(&clock))),

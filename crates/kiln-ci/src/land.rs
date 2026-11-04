@@ -118,6 +118,9 @@ pub struct Policy {
     pub protected: Vec<String>,
     /// Whose signatures a push's commits must carry (docs/ci.md W27-R03).
     pub signatures: Signatures,
+    /// Keeping open changes fresh as the trunk moves (W26-R16): automatic pushes and conflict
+    /// agents, both off until declared.
+    pub fresh: crate::fresh::Settings,
 }
 
 impl Policy {

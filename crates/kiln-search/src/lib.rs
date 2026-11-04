@@ -37,6 +37,8 @@ use vorpal_outline::DEFAULT_OUTLINE_RULES;
 use vorpal_outline::combined_extractor::CombinedExtractors;
 use vorpal_outline::extractor::{SerializableOutlineRule, parse_outline_rules};
 
+pub mod merge;
+
 /// The index's format: an index of another is built again.
 const FORMAT: u32 = 1;
 /// Indexes kept open between searches (their tables read, their trigrams mapped).

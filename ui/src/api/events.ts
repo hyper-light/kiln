@@ -92,6 +92,7 @@ const EVENT_FRAMES = {
   "review.requested": true,
   "comment.reply": true,
   mention: true,
+  "change.collision": true,
   "deploy.held": true,
   "deploy.rolled_back": true,
   "deploy.rollback_failed": true,

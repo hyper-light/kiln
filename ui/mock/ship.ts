@@ -129,7 +129,8 @@ function commits(): ShipCommit[] {
       author: "user:lee",
       at: t - 900,
       stand: "waiting",
-      line: "Waiting on review",
+      // How fresh it is, the line's last clause (W26-R16).
+      line: "Waiting on review · replays clean on main@4c1e2a",
       cursor: 10,
       pips: pips("requested", "none", "running"),
       kind: "request",
