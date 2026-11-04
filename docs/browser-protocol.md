@@ -119,7 +119,7 @@ merged or dropped.
 | `Probe` | 16 | both | `nonce: u32` | ask | control, ahead of all | never | never | yes | datagram |
 | `ProbeAck` | 17 | both | `nonce: u32, got: u53` | answer | control | never | never | yes | datagram |
 | `Unread` | 18 | both | `kind: u32, code: Code, why: Why` | ack | control | never | never | no | control |
-| `Compressed` | 19 | down | `ctx: u8, data: bytes` | carried | its frames' | never | (is compression) | no | its frames' |
+| `Compressed` | 19 | down | `ctx: u8, len: u32, data: bytes` | carried | its frames' | never | (is compression) | no | its frames' |
 | `Close` | 20 | both | `code: CloseCode, why: str, build: str` | handshake | control | never | never | yes | control |
 | `Input` | 21 | up | `sub: u32, data: bytes` | command, refused while away | interactive | never | never | yes | control |
 | `SecretAnswer` | 22 | down | `id: u53, outcome: Outcome, at: opt<Mark>` | answer | control | never | never (a secret) | yes | control |
@@ -136,7 +136,7 @@ The types inside them:
 | `Call` | `0 Http { method: Method, path: str, body: bytes }`, `1 Command { session: str, command: bytes }` |
 | `Method` | `0 Get`, `1 Post`, `2 Put`, `3 Patch`, `4 Delete` |
 | `Outcome` | `0 Taken`, `1 Accepted { epoch: u53, seq: u53, at: i53, repeat: bool }`, `2 Unchecked`, `3 Pending`, `4 Parked`, `5 Nack { code: str, why: str, again: bool }`, `6 Reply { status: u16, body: bytes }` |
-| `Delta` | `0 Set { mask: bits, fields: bytes }`, `1 Put { key: Key, value: bytes }`, `2 Patch { key: Key, mask: bits, fields: bytes }`, `3 Remove { key: Key }`, `4 Append { at: u53, data: bytes }`, `5 Extend { key: Key, field: u32, at: u53, data: bytes }` |
+| `Delta` | `0 Set { mask: bits, fields: vec<bytes> }`, `1 Put { key: Key, fields: vec<bytes> }`, `2 Patch { key: Key, mask: bits, fields: vec<bytes> }`, `3 Remove { key: Key }`, `4 Append { at: u53, data: bytes }`, `5 Extend { key: Key, field: u32, at: u53, data: bytes }` |
 | `Key` | `0 Num(u53)`, `1 Str(str)`, `2 Ref(u32)` |
 | `OpenRefusal` | `0 BadTicket`, `1 Expired`, `2 Reused`, `3 TooOld`, `4 TooNew`, `5 Schema`, `6 Busy`, `7 Malformed` |
 | `EndCode` | `0 Done`, `1 Gone`, `2 Denied`, `3 Unknown`, `4 Limit` |
@@ -144,9 +144,10 @@ The types inside them:
 | `Code` | `0 Unknown`, `1 Malformed` |
 | `Why` | the refusals above, by index |
 
-A body that carries a whole record or item (`Put`'s `value`, `Set` and `Patch`'s `fields`) holds
-that record's own fields, encoded as their topic's record type says (below), so the generic core
-moves, merges and keeps them without knowing the type, and the page's typed code reads them.
+A delta that carries a record's fields (`Set`, `Put`, `Patch`) holds each field as its own
+`bytes`, encoded as the topic's record type says, so the generic core moves, merges and keeps them
+field by field without knowing the type, and the page's typed code reads them. A field's own
+length costs a byte; it buys coalescing that needs no type.
 
 ## Opening
 
@@ -251,7 +252,7 @@ dropped. So a page can move to another carrier, or reconnect, without losing or 
 
 - `Set { mask, fields }`: the topic is one record; `mask` has a bit for each field present, and
   `fields` holds them in field order.
-- `Put { key, value }`, `Patch { key, mask, fields }`, `Remove { key }`: the topic is a collection
+- `Put { key, fields }` (every field), `Patch { key, mask, fields }`, `Remove { key }`: the topic is a collection
   of records by key.
 - `Append { at, data }`: the topic is text or bytes; `data` goes at offset `at`.
 - `Extend { key, field, at, data }`: text appended to one field (a `str` or `bytes`) of one item,
@@ -327,8 +328,10 @@ without the page being brought back to the topic's state (f41).
 Off unless the page offers it (`CAP_DEFLATE_RAW`) and the server's settings allow it (they do by
 default). The one format is deflate-raw with a sync flush after each batch, which every browser can
 inflate through one long-lived `DecompressionStream("deflate-raw")` (f31, f32; brotli is missing in
-Chrome, zstd in every shipping browser). A `Compressed { ctx, data }` frame holds a batch of whole
-frames, compressed in context `ctx`, which lives as long as the connection. The carriers add none:
+Chrome, zstd in every shipping browser). A `Compressed { ctx, len, data }` frame holds a batch of whole
+frames, `len` bytes of them, compressed in context `ctx`, which lives as long as the connection;
+the browser's stream inflater reads until it has `len` bytes, so each batch is whole before the
+next comes. The carriers add none:
 goal 3 leaves permessage-deflate off (RFC 7692's own warning).
 
 Contexts are per trust class (f34): attacker-influenced data never shares a history with a secret.

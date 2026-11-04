@@ -2324,6 +2324,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "kiln-bp"
+version = "0.2.0"
+dependencies = [
+ "flate2",
+]
+
+[[package]]
 name = "kiln-cd"
 version = "0.2.0"
 dependencies = [
