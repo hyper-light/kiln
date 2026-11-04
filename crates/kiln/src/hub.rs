@@ -432,8 +432,10 @@ pub struct Hub {
     labels: Labels,
     /// The CI engine's dispatcher (docs/ci.md W05): its runs, legs and their messages.
     pub ci: crate::ci::dispatch::Handle,
-    peers: Mutex<HashMap<PeerId, String>>,
-    pending_peers: Mutex<HashMap<PeerId, String>>,
+    /// Each connected runner process's machine, by its link (read on every message a runner sends:
+    /// a copy swapped in whole as runners come and go, `crate::rcu`).
+    peers: crate::rcu::Rcu<HashMap<PeerId, String>>,
+    pending_peers: crate::rcu::Rcu<HashMap<PeerId, String>>,
     /// Runners' HTTP tunnels, and which QUIC connections they carry (see `crate::tunnel`).
     pub tunnels: Arc<crate::tunnel::Registry>,
     pub events: Broadcast<Arc<str>>,
@@ -448,7 +450,7 @@ pub struct Hub {
     /// "Commands").
     pub cmds: Mutex<crate::wire::commands::Commands>,
     /// The process each machine that's away last had: its parked commands wait for it there.
-    away_peers: Mutex<HashMap<String, PeerId>>,
+    away_peers: crate::rcu::Rcu<HashMap<String, PeerId>>,
     /// Commands queued where nothing could wait to send them ([`Hub::command_soon`]): the commands
     /// loop sends them now rather than on its next tick.
     commands_due: Notify,
@@ -622,8 +624,8 @@ impl Hub {
             agents: Mutex::new(HashMap::new()),
             labels,
             ci: crate::ci::dispatch::Handle::default(),
-            peers: Mutex::new(HashMap::new()),
-            pending_peers: Mutex::new(HashMap::new()),
+            peers: Default::default(),
+            pending_peers: Default::default(),
             tunnels: Arc::default(),
             events: Broadcast::new(4096),
             terms: Mutex::new(HashMap::new()),
@@ -633,7 +635,7 @@ impl Hub {
             // Named for this server process (53 bits, as JSON carries a number exactly), so a runner
             // never mistakes another's commands for these.
             cmds: Mutex::new(crate::wire::commands::Commands::new(rand::random::<u64>() >> 11)),
-            away_peers: Mutex::new(HashMap::new()),
+            away_peers: Default::default(),
             commands_due: Notify::new(),
             ai_sessions: Mutex::new(HashMap::new()),
             ai_requests: Mutex::new(HashMap::new()),
@@ -864,7 +866,7 @@ impl Hub {
     /// Close every runner's connection (server shutdown): runners see the close at once and
     /// reconnect to the next server process, instead of waiting out the QUIC idle timeout.
     pub async fn disconnect_all(&self) {
-        let peers: Vec<PeerId> = self.peers.lock().keys().chain(self.pending_peers.lock().keys()).copied().collect();
+        let peers: Vec<PeerId> = self.peers.load().keys().chain(self.pending_peers.load().keys()).copied().collect();
         for peer in peers {
             let _ = self.net.command(crate::net::Out::Disconnect { peer }).await;
         }
@@ -1085,7 +1087,7 @@ impl Hub {
             q.push_back(s.clone());
         }
         if agent != "server" {
-            metrics::agent_samples().write().insert(agent.to_owned(), s.clone());
+            metrics::agent_samples().update(|m| m.insert(agent.to_owned(), s.clone()));
             // A runner too old to report its own figures (`crate::observe::host`): its samples, as
             // metrics. The server's own machine reports itself.
             if self.instances.lock().newest_with(agent, proto::CAP_OBSERVE).is_none() {
@@ -1377,7 +1379,7 @@ impl Hub {
     fn command_targets(&self, agent: &str, msg: &ServerMsg) -> Vec<PeerId> {
         let mut peers = self.peers_for(agent, msg);
         if peers.is_empty() && stream_of(msg) == Some(crate::wire::commands::Kind::Parked) {
-            let last = self.away_peers.lock().get(agent).copied();
+            let last = self.away_peers.load().get(agent).copied();
             peers.extend(last.filter(|p| self.cmds.lock().keeps(*p)));
         }
         peers
@@ -1633,9 +1635,9 @@ impl Hub {
             self.net.command(crate::net::Out::Disconnect { peer: p }).await;
         }
         self.net.command(crate::net::Out::Revoke { name: agent.to_owned() }).await;
-        self.away_peers.lock().remove(agent);
+        self.away_peers.update(|m| m.remove(agent));
         self.reach.lock().forget(agent);
-        metrics::agent_samples().write().remove(agent);
+        metrics::agent_samples().update(|m| m.remove(agent));
         self.store.delete_agent(agent.to_owned()).await?;
         self.front_doors.forget(&self.store, agent).await;
         self.agent_limits.forget(&self.store, agent).await;
@@ -1662,9 +1664,9 @@ impl Hub {
             labels.insert(to.to_owned(), label.to_owned());
         }
         self.agents.lock().remove(from);
-        self.away_peers.lock().remove(from);
+        self.away_peers.update(|m| m.remove(from));
         self.reach.lock().forget(from);
-        metrics::agent_samples().write().remove(from);
+        metrics::agent_samples().update(|m| m.remove(from));
         self.front_doors.moved(from, to);
         self.agent_limits.moved(from, to);
         self.places.moved(from, to);
@@ -1756,7 +1758,7 @@ impl Hub {
                 // A runner connecting again comes back under the peer id it joined with.
                 self.instances.lock().connected(peer);
                 if let Some(n) = name {
-                    self.pending_peers.lock().insert(peer, n);
+                    self.pending_peers.update(|m| m.insert(peer, n.clone()));
                 }
             }
             NetEvent::Closed { peer, reason } | NetEvent::Unreachable { peer, reason } => {
@@ -1774,8 +1776,8 @@ impl Hub {
                     }
                 }
                 self.reach_passed(passed);
-                self.pending_peers.lock().remove(&peer);
-                let name = self.peers.lock().remove(&peer);
+                self.pending_peers.update(|m| m.remove(&peer));
+                let name = self.peers.update(|m| m.remove(&peer));
                 self.relays.lost(peer);
                 self.handovers_lost(peer).await;
                 let lost = self.instances.lock().lost(peer);
@@ -1855,7 +1857,7 @@ impl Hub {
         let instance = self.instances.lock().get(peer).and_then(|i| i.id.clone()).unwrap_or_default();
         match self.agent_of(peer) {
             Some(name) => crate::wire::unread::Sender::Runner { name, instance },
-            None => crate::wire::unread::Sender::Peer { cert: self.pending_peers.lock().get(&peer).cloned().unwrap_or_default(), addr: String::new() },
+            None => crate::wire::unread::Sender::Peer { cert: self.pending_peers.load().get(&peer).cloned().unwrap_or_default(), addr: String::new() },
         }
     }
 
@@ -1929,7 +1931,7 @@ impl Hub {
     }
 
     fn agent_of(&self, peer: PeerId) -> Option<String> {
-        self.peers.lock().get(&peer).cloned()
+        self.peers.load().get(&peer).cloned()
     }
 
     /// Whether `job` is one of the CI engine's legs: one it knows, or, while it rebuilds its runs
@@ -1956,7 +1958,7 @@ impl Hub {
             let Some(a) = g.get_mut(name) else { return };
             a.connected = false;
             if let Some(p) = a.peer {
-                self.away_peers.lock().insert(name.to_owned(), p);
+                self.away_peers.update(|m| m.insert(name.to_owned(), p));
             }
             a.peer = None;
             a.lost_at = Some(Instant::now());
@@ -1978,7 +1980,7 @@ impl Hub {
                 crate::termsess::forward(&tx, None, TermOut::Gone);
             }
         }
-        metrics::agent_samples().write().remove(name);
+        metrics::agent_samples().update(|m| m.remove(name));
         // Its agent sessions keep running there too; they are announced again on reconnect.
         self.harness.machine_lost(self, name);
         if self.ai_sessions.lock().remove(name).is_some() {
@@ -2727,7 +2729,7 @@ impl Hub {
     }
 
     async fn on_hello(&self, peer: PeerId, h: Hello) -> anyhow::Result<()> {
-        let cert_name = self.pending_peers.lock().get(&peer).cloned();
+        let cert_name = self.pending_peers.load().get(&peer).cloned();
         let refuse = |reason: String| async move {
             tracing::warn!(peer, %reason, "agent refused");
             self.send_peer(peer, &ServerMsg::Refused { reason }).await;
@@ -2753,7 +2755,7 @@ impl Hub {
         // replaces its stale one.
         let joined = self.instances.lock().join(peer, &name, h.clone(), now);
         for p in &joined.stale {
-            self.peers.lock().remove(p);
+            self.peers.update(|m| m.remove(p));
             self.lost_instances.lock().remove(p);
             self.net.command(crate::net::Out::Disconnect { peer: *p }).await;
         }
@@ -2893,8 +2895,8 @@ impl Hub {
                 enrolled_at: now,
             })
             .await?;
-        self.peers.lock().insert(peer, name.clone());
-        self.pending_peers.lock().remove(&peer);
+        self.peers.update(|m| m.insert(peer, name.clone()));
+        self.pending_peers.update(|m| m.remove(&peer));
         self.agents.lock().insert(name.clone(), live.clone());
         self.note_machine(&name);
         if let Some(j) = &h.dedicated_job {
@@ -3825,7 +3827,7 @@ pub(crate) mod tests {
         use crate::wire::unread::{Code as C, Page, Wire as W};
         crate::rt::block_on(async {
             let hub = scratch_hub().await?;
-            hub.peers.lock().insert(1, "fedora".into());
+            hub.peers.update(|m| m.insert(1, "fedora".into()));
             hub.agents.lock().insert("fedora".into(), live_runner("fedora", "linux", "x86_64"));
             let frame = |data: Vec<u8>, lane: u32| NetEvent::Frame { peer: 1, lane, kind: Kind::Control, data, at: Instant::now() };
             // A newer runner's variant, and a known one cut short.
@@ -3841,7 +3843,7 @@ pub(crate) mod tests {
             anyhow::ensure!(rows == 2, "{rows} rows");
             // Before its Hello, a peer's control frame is out of order; one on another lane is let
             // go as before (it may come before the Hello does).
-            hub.pending_peers.lock().insert(2, "newbox".into());
+            hub.pending_peers.update(|m| m.insert(2, "newbox".into()));
             let facts = proto::encode(&AgentMsg::NetDrops { dropped: Vec::new() })?;
             hub.on_net(NetEvent::Frame { peer: 2, lane: proto::LANE_TERM, kind: Kind::Term, data: facts.clone(), at: Instant::now() }).await.ok();
             hub.on_net(NetEvent::Frame { peer: 2, lane: proto::LANE_CONTROL, kind: Kind::Control, data: facts, at: Instant::now() }).await?;
@@ -4131,7 +4133,7 @@ pub(crate) mod tests {
     /// Runner `name` connected to a test's hub as process `peer`, its Hello taken, its record
     /// live; it takes reach links, and `wide` is what it says it can do past Build's 32 bits.
     pub(crate) fn join_runner(hub: &Hub, peer: PeerId, name: &str, wide: u64) {
-        hub.peers.lock().insert(peer, name.to_owned());
+        hub.peers.update(|m| m.insert(peer, name.to_owned()));
         hub.agents.lock().insert(name.to_owned(), live_runner(name, "linux", "x86_64"));
         let hello = Hello {
             protocol: proto::VERSION,
@@ -4277,7 +4279,7 @@ pub(crate) mod tests {
     fn g3_s5_a_terminal_relay_with_no_room_holds_up_no_runners_message() -> anyhow::Result<()> {
         crate::rt::block_on(async {
             let hub = scratch_hub().await?;
-            hub.peers.lock().insert(1, "box".into());
+            hub.peers.update(|m| m.insert(1, "box".into()));
             let session = crate::termsess::Session::detached("t1".into(), "agent:box".into(), None, 80, 24);
             hub.terminals.insert(&session);
             // Its relay's queue full, nobody taking from it.
@@ -4305,8 +4307,8 @@ pub(crate) mod tests {
     fn an_inbox_answer_from_another_machine_leaves_the_session_where_it_runs() -> anyhow::Result<()> {
         crate::rt::block_on(async {
             let hub = scratch_hub().await?;
-            hub.peers.lock().insert(1, "box-a".into());
-            hub.peers.lock().insert(2, "box-b".into());
+            hub.peers.update(|m| m.insert(1, "box-a".into()));
+            hub.peers.update(|m| m.insert(2, "box-b".into()));
             let say = |u: &crate::harness::core::Update| serde_json::to_string(u).map(|json| AgentMsg::Harness { session: "s1".into(), json });
             let spec = crate::harness::session::Spec { kind: "claude".into(), cwd: Some("/w".into()), ..Default::default() };
             let open = crate::harness::host::refusal("s1", &spec, "").into_iter().find(|u| matches!(u, crate::harness::core::Update::Open { .. })).ok_or_else(|| anyhow::anyhow!("no announcement"))?;
@@ -4328,8 +4330,8 @@ pub(crate) mod tests {
         use crate::wire::commands::{Answer, COMING_FOR, Kind};
         crate::rt::block_on(async {
             let hub = scratch_hub().await?;
-            hub.peers.lock().insert(1, "box-a".into());
-            hub.peers.lock().insert(2, "box-b".into());
+            hub.peers.update(|m| m.insert(1, "box-a".into()));
+            hub.peers.update(|m| m.insert(2, "box-b".into()));
             let now = Instant::now();
             for peer in [1, 2] {
                 hub.cmds.lock().coming(peer, now);

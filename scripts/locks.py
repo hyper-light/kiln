@@ -14,6 +14,10 @@
       the store's calls by caller.
   scripts/locks.py list
       Every Mutex and RwLock the instrumented crates declare, with where it's taken.
+  scripts/locks.py check [--root DIR]
+      The API's hot path stays lockless (plan 01a1a59c2aae step 3): no Mutex, RwLock or Condvar in
+      the modules scripts/locks/hot.toml names, outside a test build's code, but those it lists with
+      why each is off the hot path. Fails on any other, and on a listed one that's gone.
 
 Exit status: 0 done, 1 failed (the message says why), 2 usage.
 """
@@ -318,6 +322,180 @@ def markdown(rows: list[dict], store: list[dict], rounds: int) -> str:
     return "\n".join(out)
 
 
+# ------------------------------------------------------------------------------------------ the check
+
+HOT = "scripts/locks/hot.toml"
+LOCK_WORD = re.compile(r"\b(Mutex|RwLock|Condvar|ReentrantMutex|FairMutex)\b")
+
+
+def blank(text: str) -> str:
+    """`text` with its comments and its string and character literals' contents blanked (newlines
+    kept, so lines keep their numbers): what's left is code."""
+    out = []
+    i, n = 0, len(text)
+
+    def keep_lines(s: str) -> str:
+        return "".join("\n" if c == "\n" else " " for c in s)
+
+    while i < n:
+        c = text[i]
+        two = text[i : i + 2]
+        if two == "//":
+            j = text.find("\n", i)
+            j = n if j < 0 else j
+            out.append(" " * (j - i))
+            i = j
+        elif two == "/*":
+            depth, j = 1, i + 2
+            while j < n and depth:
+                if text[j : j + 2] == "/*":
+                    depth, j = depth + 1, j + 2
+                elif text[j : j + 2] == "*/":
+                    depth, j = depth - 1, j + 2
+                else:
+                    j += 1
+            out.append(keep_lines(text[i:j]))
+            i = j
+        elif (m := re.match(r'b?r(#*)"', text[i : i + 64])) and (i == 0 or not (text[i - 1].isalnum() or text[i - 1] == "_")):
+            end = '"' + m.group(1)
+            j = text.find(end, i + m.end())
+            j = n if j < 0 else j + len(end)
+            out.append(keep_lines(text[i:j]))
+            i = j
+        elif c == '"':
+            j = i + 1
+            while j < n and text[j] != '"':
+                j += 2 if text[j] == "\\" else 1
+            out.append('"' + keep_lines(text[i + 1 : j]) + '"')
+            i = j + 1
+        elif c == "'":
+            # A character literal ('x', '\n', '\u{..}'), else a lifetime ('a).
+            m = re.match(r"'(\\u\{[0-9a-fA-F]+\}|\\.|[^\\'\n])'", text[i : i + 16])
+            if m:
+                out.append(" " * m.end())
+                i += m.end()
+            else:
+                out.append(c)
+                i += 1
+        else:
+            out.append(c)
+            i += 1
+    return "".join(out)
+
+
+def item_end(code: str, i: int) -> int:
+    """Where the item starting at `i` ends: past its block, or its `;` or `,` at its own depth."""
+    depth = 0
+    while i < len(code):
+        c = code[i]
+        if c in "([<":
+            depth += 1
+        elif c in ")]>":
+            depth = max(0, depth - 1)
+        elif c == "{":
+            b, j = 1, i + 1
+            while j < len(code) and b:
+                b += {"{": 1, "}": -1}.get(code[j], 0)
+                j += 1
+            return j
+        elif c in ";," and depth == 0:
+            return i + 1
+        i += 1
+    return i
+
+
+def outside_tests(code: str) -> str:
+    """`code` without what only a test build compiles: each item `#[cfg(test)]` marks, blanked."""
+    out = list(code)
+    for m in re.finditer(r"#\[cfg\(test\)\]", code):
+        i = m.end()
+        # Past the item's other attributes.
+        while True:
+            a = re.match(r"\s*#\[", code[i:])
+            if not a:
+                break
+            i += a.end()
+            depth = 1
+            while i < len(code) and depth:
+                depth += {"[": 1, "]": -1}.get(code[i], 0)
+                i += 1
+        end = item_end(code, i)
+        for j in range(m.start(), end):
+            if out[j] != "\n":
+                out[j] = " "
+    return "".join(out)
+
+
+def name_of(line: str) -> str:
+    """What a line that names a lock declares: a field, static, binding, type or function, an import."""
+    s = line.strip()
+    if s.startswith("use ") or re.match(r"pub(\([^)]*\))?\s+use ", s):
+        return "use"
+    for pat in [
+        r"(?<!')\bstatic\s+(?:mut\s+)?(\w+)",
+        r"\b(?:struct|enum)\s+(\w+)",
+        r"\btype\s+(\w+)",
+        r"\blet\s+(?:mut\s+)?(\w+)",
+        r"\bfn\s+(\w+)",
+        r"^(?:pub(?:\([^)]*\))?\s+)?(\w+)\s*:(?!:)",
+        r"\b([A-Z_][A-Z0-9_]+)\s*\.\s*get_or_init\b",
+        r"\b(\w+)\s*:(?!:)\s*[\w:]*\b(?:Mutex|RwLock|Condvar)\b",
+    ]:
+        m = re.search(pat, s)
+        if m:
+            return m.group(1)
+    return s
+
+
+def hot_files(root: Path, spec: dict) -> list[Path]:
+    files: list[Path] = []
+    for p in spec.get("hot", []):
+        at = root / p
+        if at.is_dir():
+            files.extend(sorted(at.rglob("*.rs")))
+        elif at.is_file():
+            files.append(at)
+        else:
+            fail(f"{HOT} names {p}, which isn't there")
+    return files
+
+
+def check(root: Path) -> int:
+    import tomllib
+
+    spec = tomllib.loads((root / HOT).read_text())
+    allowed = {(a["at"], a["name"]): a.get("why", "") for a in spec.get("allowed", [])}
+    for (at, name), why in allowed.items():
+        if not why.strip():
+            fail(f"{HOT}: {at} {name} says no why")
+    seen: set[tuple[str, str]] = set()
+    found = []
+    for f in hot_files(root, spec):
+        rel = f.relative_to(root).as_posix()
+        code = outside_tests(blank(f.read_text()))
+        lines = code.split("\n")
+        source = f.read_text().split("\n")
+        for i, line in enumerate(lines, 1):
+            if not LOCK_WORD.search(line):
+                continue
+            name = name_of(line)
+            if (rel, name) in allowed:
+                seen.add((rel, name))
+                continue
+            found.append(f"{rel}:{i}: {name}: {source[i - 1].strip()}")
+    stale = sorted(f"{at} {name}" for (at, name) in allowed if (at, name) not in seen)
+    if found:
+        print("A lock on the API's hot path (goal 5, plan 01a1a59c2aae): make it an owner with messages, an immutable copy swapped in whole (crate::rcu), or a copy per shard; or, if it's off the hot path, list it in " + HOT + " with why.\n")
+        print("\n".join(found))
+    if stale:
+        print(f"\n{HOT} lists locks that aren't there any more: take them out.\n")
+        print("\n".join(stale))
+    if found or stale:
+        return 1
+    print(f"locks: no lock on the hot path but the {len(allowed)} {HOT} lists, each with why")
+    return 0
+
+
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = ap.add_subparsers(dest="cmd", required=True)
@@ -330,7 +508,11 @@ def main() -> None:
     r.add_argument("--tree", type=Path, default=ROOT)
     r.add_argument("--json", action="store_true")
     sub.add_parser("list")
+    c = sub.add_parser("check")
+    c.add_argument("--root", type=Path, default=ROOT)
     a = ap.parse_args()
+    if a.cmd == "check":
+        sys.exit(check(a.root.resolve()))
     if a.cmd == "census-tree":
         census_tree(a.src.resolve(), a.to.resolve(), a.ui)
     elif a.cmd == "rank":

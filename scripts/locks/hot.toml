@@ -1,0 +1,30 @@
+# The API's hot path (goal 5 of the API runtime program, plan 01a1a59c2aae): the modules every request,
+# websocket and runner message runs through. No Mutex, RwLock or Condvar is declared in them outside a
+# test build's code, but those `allowed` lists, each with why it's off the hot path; shared state there is
+# an owner with messages, an immutable copy swapped in whole (`crate::rcu`), or a copy per shard.
+# `python3 scripts/locks.py check` holds the tree to this (CI: .kiln/ci.yaml and .github/workflows/ci.yml),
+# and `python3 scripts/test_locks.py` proves it fails on a planted lock.
+hot = [
+  # HTTP: every request and websocket, kiln's own server and its handlers' entry.
+  "crates/kiln-http/src",
+  "crates/kiln/src/http/server.rs",
+  "crates/kiln/src/http/ws.rs",
+  "crates/kiln/src/http/io.rs",
+  "crates/kiln/src/api.rs",
+  "crates/kiln/src/ui.rs",
+  "crates/kiln/src/authz",
+  "crates/kiln/src/route_latency.rs",
+  "crates/kiln/src/metrics.rs",
+  # Runner ingest: the hub, its link to the runners, and the processes each machine has.
+  "crates/kiln/src/hub.rs",
+  "crates/kiln/src/net.rs",
+  "crates/kiln/src/instances.rs",
+  # The bus the live feeds ride, and the logs.
+  "crates/kiln/src/bus.rs",
+  "crates/kiln/src/logs.rs",
+  # The ship model, and the CI state the API reads.
+  "crates/kiln/src/ship.rs",
+  "crates/kiln/src/store.rs",
+  # What makes them lockless.
+  "crates/kiln/src/rcu.rs",
+]

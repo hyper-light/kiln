@@ -25,11 +25,17 @@ use crate::metrics::{Histogram, STALL_BUCKETS};
 /// The blocking pool's shares, as `crate::rt` names them, in the order of their histograms.
 const SHARES: [&str; 3] = [hyper_rt::dns::SHARE, crate::rt::SHARE_STORE, crate::rt::SHARE_FS];
 
+/// kiln.db's writer (`crate::store`), as its series name it beside the blocking pool's shares: a thread
+/// of its own, one place, its calls taken in turn (goal 5 of the API runtime program, plan 01a1a59c2aae).
+pub const STORE_WRITE: &str = "store_write";
+
 struct Pools {
     compute_wait: Histogram,
     compute_piece: Histogram,
     blocking_wait: [Histogram; SHARES.len()],
     blocking_run: [Histogram; SHARES.len()],
+    store_write_wait: Histogram,
+    store_write_run: Histogram,
 }
 
 fn pools() -> &'static Pools {
@@ -39,7 +45,16 @@ fn pools() -> &'static Pools {
         compute_piece: Histogram::new(STALL_BUCKETS),
         blocking_wait: std::array::from_fn(|_| Histogram::new(STALL_BUCKETS)),
         blocking_run: std::array::from_fn(|_| Histogram::new(STALL_BUCKETS)),
+        store_write_wait: Histogram::new(STALL_BUCKETS),
+        store_write_run: Histogram::new(STALL_BUCKETS),
     })
+}
+
+/// A call kiln.db's writer ran: how long it waited for its turn, from being sent, and how long it ran.
+pub fn store_write(waited: std::time::Duration, ran: std::time::Duration) {
+    let p = pools();
+    p.store_write_wait.observe(waited.as_secs_f64());
+    p.store_write_run.observe(ran.as_secs_f64());
 }
 
 #[allow(clippy::cast_precision_loss)]
@@ -87,17 +102,19 @@ pub fn render(o: &mut String) {
     p.compute_wait.render(o, "kiln_compute_wait_seconds", "");
     help(o, "kiln_compute_piece_seconds", "histogram", "How long each piece of a compute job held its pool thread.");
     p.compute_piece.render(o, "kiln_compute_piece_seconds", "");
-    help(o, "kiln_blocking_wait_seconds", "histogram", "How long each blocking pool job waited for one of its share's places.");
+    help(o, "kiln_blocking_wait_seconds", "histogram", "How long each blocking pool job waited for one of its share's places (store_write: kiln.db's writer, a thread of its own).");
     for (share, h) in SHARES.iter().zip(&p.blocking_wait) {
         h.render(o, "kiln_blocking_wait_seconds", &format!("share=\"{share}\""));
     }
-    help(o, "kiln_blocking_run_seconds", "histogram", "How long each blocking pool job ran, by share.");
+    p.store_write_wait.render(o, "kiln_blocking_wait_seconds", &format!("share=\"{STORE_WRITE}\""));
+    help(o, "kiln_blocking_run_seconds", "histogram", "How long each blocking pool job ran, by share (store_write: kiln.db's writer, a thread of its own).");
     for (share, h) in SHARES.iter().zip(&p.blocking_run) {
         h.render(o, "kiln_blocking_run_seconds", &format!("share=\"{share}\""));
     }
-    help(o, "kiln_blocking_places", "gauge", "Each of the blocking pool's shares: the most of its jobs that run at once (crate::rt::Profile).");
+    p.store_write_run.render(o, "kiln_blocking_run_seconds", &format!("share=\"{STORE_WRITE}\""));
+    help(o, "kiln_blocking_places", "gauge", "Each of the blocking pool's shares: the most of its jobs that run at once (crate::rt::Profile); store_write, kiln.db's writer: one.");
     let (dns, store, fs) = crate::rt::profile().pool;
-    for (share, places) in SHARES.iter().zip([dns, store, fs]) {
+    for (share, places) in SHARES.iter().zip([dns, store, fs]).chain([(&STORE_WRITE, 1)]) {
         let _ = writeln!(o, "kiln_blocking_places{{share=\"{share}\"}} {places}");
     }
 }

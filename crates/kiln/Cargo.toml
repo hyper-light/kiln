@@ -107,6 +107,12 @@ http-body-util = "0.1.5"
 async-channel = "2.5.0"
 async-broadcast = "0.7.2"
 event-listener = "5.4.2"
+# Shared state without locks on the API's hot path (goal 5 of the API runtime program, plan
+# 01a1a59c2aae): read-mostly data as an immutable copy swapped in whole (`crate::rcu`), and the store's
+# read connections handed out from a lock-free queue (`crate::store`). Both already in the tree
+# (Turso takes arc-swap, async-channel concurrent-queue).
+arc-swap = "1.9.3"
+concurrent-queue = "2.5.0"
 webpki-roots = "1.0.9"
 flate2 = "1.1.10"
 # cosign's encrypted key files (docs/ci.md W18-R02): scrypt, then NaCl's secretbox.
