@@ -16,7 +16,7 @@ sim = ["dep:hyper-sim"]
 # A kept record's checksum (`record`), the log's CRC-32C.
 crc32c.workspace = true
 getrandom.workspace = true
-hyper-rt = { path = "../hyper-rt" }
+hyper-rt = { path = "../../../../crates/kiln-rt" }
 # The simulated device's model (`sim`, test support only): hyper-sim's block device.
 hyper-sim = { path = "../hyper-sim", optional = true }
 thiserror.workspace = true

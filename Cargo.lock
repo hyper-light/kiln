@@ -1835,6 +1835,8 @@ name = "hyper-rt"
 version = "0.1.0"
 dependencies = [
  "crc32c",
+ "crossbeam-deque",
+ "hyper-measure",
  "libc",
  "loom",
  "pin-project-lite",

@@ -39,7 +39,7 @@ mantle-gateway = { path = "../gateway" }
 # The S3 listener's HTTP/1.1 codec, which `mantle bench http` measures; the runtime the listener
 # runs on and the TLS its clients speak, which `mantle bench s3` measures it under.
 mantle-http = { path = "../http" }
-hyper-rt = { path = "../../../hyper-raft/crates/hyper-rt" }
+hyper-rt = { path = "../../../../crates/kiln-rt" }
 hyper-tls = { path = "../../../hyper-raft/crates/hyper-tls" }
 mantle-meta = { path = "../meta" }
 mantle-node = { path = "../node" }
