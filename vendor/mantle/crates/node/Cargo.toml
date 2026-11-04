@@ -19,7 +19,7 @@ hyper-durable = { path = "../../../hyper-raft/crates/hyper-durable" }
 hyper-liveness = { path = "../../../hyper-raft/crates/hyper-liveness" }
 hyper-log = { path = "../../../hyper-raft/crates/hyper-log" }
 hyper-raft = { path = "../../../hyper-raft/crates/hyper-raft" }
-hyper-rt = { path = "../../../hyper-raft/crates/hyper-rt" }
+hyper-rt = { path = "../../../../crates/kiln-rt" }
 hyper-rt-transport = { path = "../../../hyper-raft/crates/hyper-rt-transport" }
 hyper-timing = { path = "../../../hyper-raft/crates/hyper-timing" }
 hyper-transport = { path = "../../../hyper-raft/crates/hyper-transport" }
