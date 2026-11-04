@@ -424,6 +424,8 @@ mod props {
         running: BTreeSet<(u8, u64, String)>,
         /// What each owner was told last of each waiting run's place and reason.
         told: BTreeMap<(String, String), (Place, (u8, Option<i64>))>,
+        /// Each live claim, as the runner's words have it: its fence, and whether it was taken.
+        claims: BTreeMap<(u8, u64, String), (Fence, bool)>,
     }
 
     fn name(o: u8) -> String {
@@ -433,7 +435,7 @@ mod props {
     impl World {
         fn new() -> World {
             let a = Admission::new(Init { me: "r".into(), epoch: 1, facts: linux(), labels: vec![], sample: machine(16, 32, 0, 0), records: Records::new(), settings: settings(true) }, 0);
-            World { a, now: 0, epochs: [1; 3], away: [false; 3], fences: BTreeMap::new(), started: BTreeMap::new(), running: BTreeSet::new(), told: BTreeMap::new() }
+            World { a, now: 0, epochs: [1; 3], away: [false; 3], fences: BTreeMap::new(), started: BTreeMap::new(), running: BTreeSet::new(), told: BTreeMap::new(), claims: BTreeMap::new() }
         }
 
         fn epoch(&self, o: u8) -> u64 {
@@ -448,14 +450,24 @@ mod props {
                 match m {
                     ToOwner::Offer { run, fence, .. } => {
                         self.told.remove(&(o.clone(), run.clone()));
+                        self.claims.insert((i, e, run.clone()), (fence, false));
                         self.fences.insert((i, e, run), fence);
+                    }
+                    ToOwner::Held { run, fence } => {
+                        self.told.remove(&(o.clone(), run.clone()));
+                        self.claims.insert((i, e, run), (fence, true));
                     }
                     ToOwner::Waiting { run, reason, place, .. } => {
                         self.told.insert((o.clone(), run), (place, reason.kind()));
                     }
                     // A take or start under a claim that lapsed: news of the claim, not of the
                     // run's place or reason (a lapse puts it back where it was, and says so).
-                    ToOwner::Lapsed { .. } => {}
+                    ToOwner::Lapsed { run, fence, .. } => {
+                        let key = (i, e, run);
+                        if self.claims.get(&key).is_some_and(|(f, _)| *f == fence) {
+                            self.claims.remove(&key);
+                        }
+                    }
                     other => {
                         self.told.remove(&(o.clone(), other.run().to_owned()));
                     }
@@ -491,9 +503,16 @@ mod props {
                     if let Some(f) = self.fences.get(&key).copied() {
                         match op {
                             Op::Take { .. } => self.a.take(from, &key.2, f, now, &mut out),
-                            Op::Decline { .. } => self.a.decline(from, &key.2, f, now, &mut out),
+                            Op::Decline { .. } => {
+                                if self.claims.get(&key).is_some_and(|(live, _)| *live == f) {
+                                    self.claims.remove(&key);
+                                }
+                                self.a.decline(from, &key.2, f, now, &mut out);
+                            }
                             _ => {
                                 if self.a.start(from, &key.2, f, now, &mut out) == Some(Start::New) {
+                                    // Only under the claim the runner's words say is live.
+                                    prop_assert_eq!(self.claims.remove(&key).map(|(live, _)| live), Some(f), "{:?} started under {:?}, not its live claim", key, f);
                                     let count = self.started.entry(key.clone()).or_default();
                                     *count += 1;
                                     prop_assert!(*count <= 1, "{key:?} started twice");
@@ -506,6 +525,7 @@ mod props {
                 }
                 Op::Withdraw { owner, run } => {
                     let n = name(owner);
+                    self.claims.remove(&(owner, self.epoch(owner), format!("r{run}")));
                     self.a.withdraw(Peer { name: &n, epoch: self.epoch(owner) }, &format!("r{run}"), now, &mut out);
                 }
                 Op::End { owner, run } => {
@@ -525,6 +545,8 @@ mod props {
                         *a = true;
                     }
                     self.told.retain(|(o, _), _| *o != name(owner));
+                    // Offers it hadn't taken lapse at once; what it took stays.
+                    self.claims.retain(|(o, _, _), (_, taken)| *o != owner || *taken);
                     self.a.away(&name(owner), now, &mut out);
                 }
                 Op::Back { owner } => {
@@ -534,7 +556,10 @@ mod props {
                     let n = name(owner);
                     self.a.back(Peer { name: &n, epoch: self.epoch(owner) }, now, &mut out);
                 }
-                Op::Forget { owner } => self.a.forget(&name(owner), now, &mut out),
+                Op::Forget { owner } => {
+                    self.claims.retain(|(o, _, _), _| *o != owner);
+                    self.a.forget(&name(owner), now, &mut out);
+                }
                 Op::Restart { owner } => {
                     // A new process of the owner, its epoch one past: it speaks first by coming back.
                     if let Some(e) = self.epochs.get_mut(usize::from(owner)) {
@@ -605,5 +630,15 @@ mod props {
         let mut runner = proptest::test_runner::TestRunner::new(ProptestConfig { cases: 3_000, failure_persistence: None, ..ProptestConfig::default() });
         let found = planted(Some(Mutant::QuietPlace), || runner.run(&proptest::collection::vec(op(), 1..80), drive));
         assert!(found.is_err(), "QuietPlace wasn't caught");
+    }
+
+    /// A runner that starts a run under a claim that isn't live (one that lapsed, or another
+    /// fence) is caught by the property that a start happens only under the live claim. The model
+    /// meets it too rarely to count on: in this design a taken claim never lapses by time.
+    #[test]
+    fn e5_a_runner_starting_on_a_lapsed_claim_is_caught() {
+        let mut runner = proptest::test_runner::TestRunner::new(ProptestConfig { cases: 3_000, failure_persistence: None, ..ProptestConfig::default() });
+        let found = planted(Some(Mutant::StartLapsed), || runner.run(&proptest::collection::vec(op(), 1..80), drive));
+        assert!(found.is_err(), "StartLapsed wasn't caught");
     }
 }

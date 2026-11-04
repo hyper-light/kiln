@@ -558,11 +558,13 @@ impl Owner {
                 Change::Same => {}
             }
         }
-        let fresh: Vec<String> = self.machines.values().filter(|m| m.places && m.connected && old.get(&m.name).is_none_or(|o| !o.places || o.epoch != m.epoch)).map(|m| m.name.clone()).collect();
+        // Runners new to the directory, or newly placing (a runner started again is `restarted`'s):
+        // each waiting run it could take is probed there, or, its link down, waits for it.
+        let fresh: Vec<(String, bool)> = self.machines.values().filter(|m| m.places && old.get(&m.name).is_none_or(|o| !o.places)).map(|m| (m.name.clone(), m.connected)).collect();
         if !fresh.is_empty() {
             let waiting: Vec<String> = self.tickets.iter().filter(|(_, t)| t.stage == Stage::Waiting).map(|(r, _)| r.clone()).collect();
             for run in waiting {
-                for r in &fresh {
+                for (r, connected) in &fresh {
                     let probe = match (self.tickets.get(&run), self.machines.get(r)) {
                         (Some(t), Some(m)) => !matches!(t.words.get(r), Some(Word::Asked | Word::Waiting { .. } | Word::Offered | Word::Never(_))) && unsuited(m, &t.ask).is_none(),
                         _ => false,
@@ -571,20 +573,30 @@ impl Owner {
                         if let Some(t) = self.tickets.get_mut(&run) {
                             t.passed.remove(r);
                         }
-                        self.probe_at(&run, r, &mut out);
+                        if *connected {
+                            self.probe_at(&run, r, &mut out);
+                        } else {
+                            self.set_word(&run, r, Word::Away);
+                        }
                         self.heard_of(&run, &mut out);
                     }
                 }
             }
         }
-        let idler = self.machines.values().any(|m| !m.places && m.idle.is_some() && old.get(&m.name).is_none_or(|o| o.idle != m.idle));
-        if idler {
-            let waiting: Vec<String> = self.tickets.iter().filter(|(_, t)| t.stage == Stage::Waiting && t.due.is_none()).map(|(r, _)| r.clone()).collect();
-            for run in waiting {
-                self.try_older_for(&run, &mut out);
-            }
+        // An older runner new, back, or idle otherwise than it was: waiting runs are tried there.
+        let older = self.machines.values().any(|m| !m.places && old.get(&m.name).is_none_or(|o| o.places || o.idle != m.idle || o.connected != m.connected));
+        if older {
+            self.retry_older(&mut out);
         }
         out
+    }
+
+    /// Each waiting run no runner that places has offered, tried on the older runners again.
+    fn retry_older(&mut self, out: &mut Vec<Act>) {
+        let waiting: Vec<String> = self.tickets.iter().filter(|(_, t)| t.stage == Stage::Waiting && t.due.is_none()).map(|(r, _)| r.clone()).collect();
+        for run in waiting {
+            self.try_older_for(&run, out);
+        }
     }
 
     /// A ticket's stage, whether `runner` holds its claim, and that runner's word on it.
@@ -650,8 +662,13 @@ impl Owner {
                     self.probe_afresh(&run, out);
                     self.answer(&run, out);
                 }
-                Stage::Waiting if connected && !matches!(word, Some(Word::Never(_))) => {
-                    self.probe_at(&run, runner, out);
+                // Its probe went with the old process: made again, or, its link down, when it's back.
+                Stage::Waiting if !matches!(word, Some(Word::Never(_))) => {
+                    if connected {
+                        self.probe_at(&run, runner, out);
+                    } else {
+                        self.set_word(&run, runner, Word::Away);
+                    }
                     self.heard_of(&run, out);
                 }
                 _ => {}
@@ -727,7 +744,11 @@ impl Owner {
             && !m.connected
         {
             m.connected = true;
+            let older = !m.places;
             self.came_back(runner, &mut out);
+            if older {
+                self.retry_older(&mut out);
+            }
         }
         out
     }

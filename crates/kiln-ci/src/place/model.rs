@@ -633,6 +633,7 @@ impl Sim {
         let ask = self.asked.get(&key).map(|a| a.ask.clone()).unwrap_or_default();
         let q = super::ask::amounts(&ask.needs.request);
         let pick = runners.iter().filter_map(|r| runner_of(r.as_str())).find(|j| self.machine(i, *j).and_then(|m| m.idle).is_some_and(|idle| super::ask::fits(&q, &super::ask::amounts(&idle))));
+        self.note(|| format!("o{i}.{life} falls back {run} to {runners:?}: {pick:?}"));
         let acts = match pick {
             Some(j) => {
                 self.spawn_count(&key, j);
@@ -657,6 +658,10 @@ impl Sim {
             },
         };
         self.owner_acts(i, acts);
+        // The directory shows an older runner's room as it changes (docs/needs.md §6).
+        if pick.is_some() {
+            self.directory();
+        }
     }
 
     fn spawn_count(&mut self, key: &(usize, u64, String), j: usize) {
@@ -1022,6 +1027,16 @@ impl Sim {
                 }
                 if let Some(j) = runner {
                     self.note(|| format!("r{j} dies"));
+                    // What an older runner ran goes with it: the shell's own pick, as before
+                    // placement, says so (placement's runs are told lost by their owners).
+                    let older: Vec<(usize, u64, String)> = self.runners.get(j).filter(|r| !r.places).map(|r| r.procs.keys().cloned().collect()).unwrap_or_default();
+                    for key in older {
+                        if let Some(a) = self.asked.get_mut(&key)
+                            && a.end.is_none()
+                        {
+                            a.end = Some("lost");
+                        }
+                    }
                     if let Some(r) = self.runners.get_mut(j) {
                         r.alive = false;
                         r.core = None;
@@ -1273,11 +1288,6 @@ mod tests {
     #[test]
     fn e5_an_owner_placing_again_on_silence_is_caught() -> Result<(), String> {
         caught(Mutant::ReplaceOnSilence)
-    }
-
-    #[test]
-    fn e5_a_runner_starting_on_a_lapsed_claim_is_caught() -> Result<(), String> {
-        caught(Mutant::StartLapsed)
     }
 
     /// Defect a: a runner whose link is down is still there.

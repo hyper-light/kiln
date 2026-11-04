@@ -107,7 +107,7 @@ fn admission(n: u32, d: usize, steps: u32) {
     let (mut now, mut next_run, mut decisions, mut refused, mut oversubscribed) = (0i64, 0u64, 0u64, 0u64, 0u64);
     let mut running: VecDeque<(usize, String)> = VecDeque::new();
     let mut out: Vec<Said> = Vec::with_capacity(64);
-    let (mut ends, mut arrivals): (Vec<u128>, Vec<u128>) = (Vec::new(), Vec::new());
+    let (mut ends, mut arrivals, mut per): (Vec<u128>, Vec<u128>, Vec<u128>) = (Vec::new(), Vec::new(), Vec::new());
     let mut fill = |a: &mut Admission, now: i64, timed: Option<&mut Vec<u128>>, running: &mut VecDeque<(usize, String)>, decisions: &mut u64, refused: &mut u64, next_run: &mut u64| {
         let mut timed = timed;
         while a.queued() < n {
@@ -138,6 +138,7 @@ fn admission(n: u32, d: usize, steps: u32) {
         carry_out(&mut a, &out, now, &mut running, &mut decisions, &mut refused);
         if decisions > before {
             decided_in += dt;
+            per.push(dt / u128::from(decisions - before));
         }
         fill(&mut a, now, Some(&mut arrivals), &mut running, &mut decisions, &mut refused, &mut next_run);
         let (_, held) = a.room();
@@ -146,13 +147,16 @@ fn admission(n: u32, d: usize, steps: u32) {
     let made = decisions.saturating_sub(warm);
     ends.sort_unstable();
     arrivals.sort_unstable();
+    per.sort_unstable();
     let total: u128 = ends.iter().sum();
     let per_decision = if made > 0 { decided_in / u128::from(made) } else { 0 };
     let rate = if total > 0 { (made as f64) / (total as f64 / 1e9) } else { 0.0 };
     let checked = a.check().map_or_else(|e| format!(", check failed: {e}"), |()| String::new());
     println!(
-        "admission N={n:>5} d={d}: {made} decisions over {} ends; per end p50 {} ns p99 {} ns; {per_decision} ns per decision; {rate:.0} decisions/s per core; per arrival p50 {} ns p99 {} ns; oversubscribed steps {oversubscribed}; refused {refused}{checked}",
+        "admission N={n:>5} d={d}: {made} decisions over {} ends; per decision p50 {} ns p99 {} ns, mean {per_decision} ns; {rate:.0} decisions/s per core; per end p50 {} ns p99 {} ns; per arrival p50 {} ns p99 {} ns; oversubscribed steps {oversubscribed}; refused {refused}{checked}",
         ends.len(),
+        percentile(&per, 50),
+        percentile(&per, 99),
         percentile(&ends, 50),
         percentile(&ends, 99),
         percentile(&arrivals, 50),

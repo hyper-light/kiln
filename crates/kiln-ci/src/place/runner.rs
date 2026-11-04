@@ -636,7 +636,8 @@ impl Admission {
         }
         let n = self.line.len();
         let mut k: u32 = 1;
-        while k <= n {
+        // Up to the boundary just past the line's end: a line of 3 has its 3rd at 4 - 1.
+        while k.saturating_sub(1) <= n {
             for r in [k.saturating_sub(1), k] {
                 if (1..=n).contains(&r)
                     && let Some((_, s)) = self.line.select(r.saturating_sub(1))
