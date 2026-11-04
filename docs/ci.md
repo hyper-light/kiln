@@ -8583,7 +8583,11 @@ a time. The design was agreed on a live mock built on Ship's own prototype
 - **W26-R07 Files.** The open comments by kind (icons with counts) and Approve, on one row; a search
   across the change backed by vorpal; per-file diffs that fold like the agent chat's Changes, each
   with an icon opening the whole file in a full-screen view; a diff over 100 lines folded to its
-  first lines and the lines with comments.
+  first lines and the lines with comments. A name or a line tapped opens the card asking about it
+  right under that line, as the agent chat's diffs do (components/code/about.tsx): the change's
+  agent answers where an agent made it; anywhere else (a person's change, a lone commit, a host's
+  pull request) a helper kiln starts for the person, reading the repository at that commit
+  (`ci.repos.about`).
 - **W26-R08 Threads.** Comments sit inline on the lines they're about, flat like the agent chat's
   turns: a lighter band, top and bottom borders, no inset cards. Each comment's line: who, the
   signature seal, its kind's icon, when, and ⋯ (edit, delete, copy, quote, change the kind); a long

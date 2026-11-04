@@ -2480,6 +2480,19 @@ export async function handleFamily(req: http.IncomingMessage, res: http.ServerRe
     }
     return true;
   }
+  // ci.repos.about (W26-R07): code no agent made, in Ship, asked of a helper kiln starts for the person; read as an agent's helper is.
+  const rab = p.match(/^\/api\/repos\/([^/]+)\/about$/);
+  if (rab && m === "POST") {
+    const q = await body<AboutQ & { commit?: string }>(req);
+    if (!q.commit) json(res, 400, { error: "`commit`: the commit the code is at" });
+    else {
+      const id = `about-${++aboutSeq}`;
+      const name = `About ${q.selection ?? q.path.split("/").pop() ?? "this"}`;
+      helpers.set(id, { at: Date.now(), q, name });
+      json(res, 200, { agents: [{ id, name, kind: "claude", status: "running", stand: "working" }], itself: false });
+    }
+    return true;
+  }
   const hr = p.match(/^\/api\/harness\/agents\/(about-\d+)\/(result|stop)$/);
   if (hr) {
     const id = hr[1] ?? "";
