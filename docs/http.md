@@ -59,6 +59,29 @@ types and bodies are `http-body`'s, so handlers are written as they were on hype
   within 20 (kiln's settings).
 - No server push, and no extended CONNECT: browsers open HTTP/1.1 connections for WebSockets.
 
+## What the browser receives, compressed
+
+kiln's API answers (`crates/kiln/src/http/compress.rs`, after every route in one place) and its
+WebSockets (`crates/kiln/src/http/deflate.rs`, under tungstenite) go compressed when the client can
+take it, and exactly as before when it can't:
+
+- **Answers.** A whole body of a textual type (JSON, text, JavaScript, SVG, XML) of 1 KiB or more goes
+  brotli-compressed to a client that takes `br`, else gzipped, with `Vary: Accept-Encoding`. Bodies
+  already encoded, ranges, streams (event streams, log tails, downloads: no length known whole),
+  answers with an `ETag` of their own (files: strong, for that body), `no-transform` and `HEAD` are
+  left alone, as is every request without `Accept-Encoding` (kiln's
+  own clients send none).
+- **Validators.** A `GET` answered `200` gets a weak `ETag` from its body's SHA-256 and, unless the
+  handler set one, `Cache-Control: private, no-cache`: the browser asks again every time with
+  `If-None-Match`, and an unchanged answer is a `304` without a body.
+- **WebSockets.** A client that offers `permessage-deflate` (RFC 7692; browsers do) gets it, with
+  the compressor's window carried from message to message (unless it asks
+  `server_no_context_takeover`); offers asking for a window under 15 bits are declined. Messages it
+  sends compressed are inflated as they arrive, bounded by the socket's message limit after
+  inflating (past it: closed 1009, as an oversized message always was). A client offering nothing
+  (runners, kiln's own client) gets the same frames as before.
+- Compression runs on the shard when it fits a step's quantum, else on the compute pool.
+
 ## Clients
 
 `kiln_http::client::http1` sends one request at a time over a kept-alive connection, mirroring
