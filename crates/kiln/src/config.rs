@@ -116,6 +116,12 @@ pub struct Server {
     /// measured and shown on `/metrics` and `/readyz` either way, and off, nothing is refused.
     /// `KILN_SHED` overrides it.
     pub shed: bool,
+    /// Cores of the server's own (docs/priority.md, "Cores of its own"; goal 8, plan 01a1a59c2b29
+    /// step 6), as a CPU list (`8-15`, `2,4-7`): on Linux `kiln install` gives its `kiln.slice`
+    /// these alone (`AllowedCPUs=`) and, installed system-wide, makes them a cpuset partition that
+    /// nothing outside the slice runs on; the server fixes its shards to them. Unset (the default),
+    /// the server shares every core with what runs beside it, first by its weight.
+    pub cores: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -421,6 +427,7 @@ impl Default for Server {
             webrtc_addr: None,
             webrtc_advertise: Vec::new(),
             shed: false,
+            cores: None,
         }
     }
 }

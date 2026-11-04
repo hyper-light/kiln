@@ -33,9 +33,10 @@ touching the copy Focal, Mantle and Quiver share.
 
 ## What differs from upstream
 
-Behavior: upstream's, and kiln's own additions: the compute pool (goal 3), and turns by time, a watchdog and
-task classes (goal 6, plan `01a1a59c2abe`, "Shards that protect themselves"). `src/`, `tests/` and `benches/`
-are upstream's but for the rows below; `diff -r vendor/hyper-raft/crates/hyper-rt crates/kiln-rt` shows each row.
+Behavior: upstream's, and kiln's own additions: the compute pool and an observer of each pool's jobs (goal 3), and
+turns by time, a watchdog and task classes (goal 6, plan `01a1a59c2abe`, "Shards that protect themselves"). `src/`,
+`tests/` and `benches/` are upstream's but for the rows below; `diff -r vendor/hyper-raft/crates/hyper-rt
+crates/kiln-rt` shows each row.
 
 | File | Change | Why |
 |---|---|---|
@@ -43,6 +44,7 @@ are upstream's but for the rows below; `diff -r vendor/hyper-raft/crates/hyper-r
 | `clippy.toml` | new: hyper-raft's root `clippy.toml`, less raft-proto's accessors and the no-`Arc` entry, with parking_lot's locks refused | clippy reads the `clippy.toml` nearest a crate's manifest, and hyper-raft's root isn't in kiln; the lockless rule below |
 | `src/sync/mod.rs` | `Semaphore::try_acquire` and `Acquire::poll` call `AtomicU64::try_update` where upstream calls `fetch_update` | Rust 1.99 deprecates `fetch_update`, renamed `try_update`, and kiln's clippy runs `-D warnings` on stable (1.99.1); upstream pins 1.98.1, which has both names (Mantle builds kiln-rt on it). The same function under its new name: no behavior changes. Upstream's to take when it moves past 1.98 |
 | `src/compute.rs`, `src/prioritysys.rs`, `tests/compute.rs`, `tests/compute_beside.rs`, `tests/compute_wait.rs`, `benches/compute_priority.rs`, `benches/compute_wait.rs` | new: the compute pool, a small work-stealing pool for CPU-heavy jobs (snapshots, serialization, compression, diffs, hashing), as many threads as the CPU the process is granted less its shards, below the shards at a rank that keeps a share of the CPU against other work in the cgroup (Linux `SCHED_BATCH` at nice +10, macOS utility QoS, Windows below normal), jobs in pieces of a configured time that give their thread to a waiting job, results by one-shot; and `compute::prefer_current_thread`, a shard's request for an EEVDF slice of its step (Linux 6.12+), so it preempts a pool thread it shares a CPU with. Each chosen by A/B in the benches: `SCHED_IDLE` and background QoS keep a shard calm but left jobs a request waits on waiting seconds beside other work; nice and batch alone left a shard waiting up to a slice. `prioritysys.rs` is the OS-interface file, every `unsafe` block with its `SAFETY` line | kiln's departure (goal 3 of the API runtime program, plan `01a1a59c2a8e`): heavy work off the shards, without taking the blocking pool's places. Stays here |
+| `src/blocking.rs`, `src/compute.rs` (`observe`), `tests/pools_observed.rs` | each pool tells an observer its consumer sets once: the blocking pool, each job's share, its wait for one of the share's places and its run, as the job ends (reading the clock only when observed); the compute pool, each job's wait for a thread and each piece's time | kiln's departure (goal 3 of the API runtime program, plan `01a1a59c2a8e` steps 3 and 4): kiln shows on `/metrics` where its heavy work went and how long its pieces held a thread, and sizes the blocking pool's shares from what their calls do (Little's law). Stays here |
 | `src/machine/facts.rs` | new `cpu_grant()`, with each platform's `allowed_count` | the compute pool's size: the cores the process may run on and its cgroup's CPU budget, without `Facts::query`'s reads of every core's class and caches. Stays here |
 | `src/lib.rs` | `pub mod compute;`, `mod prioritysys;`, and a line of the module list | the compute pool |
 | `Cargo.toml` (dependencies, benches) | `crossbeam-deque`; the `compute_priority` bench | the compute pool's queues: Chase and Lev's deque and a lock-free injector, no lock on any path, already in kiln's lock file through rayon |

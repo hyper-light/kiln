@@ -46,6 +46,24 @@ A WebSocket's opening isn't timed as a request: its frames are. An HTTP request'
 the same poll that read it, so its wait is mostly parsing; time a request's bytes sat in its socket
 while its shard was busy is the shard's delay, since the runtime doesn't say when a task was woken.
 
+### The pools' work (`kiln_compute_*`, `kiln_blocking_*`, `crate::pool_health`)
+
+kiln-rt tells kiln of each job its two pools run (goal 3 of the API runtime program, plan
+`01a1a59c2a8e`; `hyper_rt::compute::observe`, `hyper_rt::blocking::observe`): the compute pool, where
+CPU-heavy work goes off the shards (snapshots, serializing, compressing, hashing), each job's wait for a
+thread and each piece's time; the blocking pool, each job's share, its wait for one of the share's
+places and its run. The histograms are atomics the pools' threads write as they go.
+
+| series | what it says |
+| --- | --- |
+| `kiln_compute_jobs_total`, `kiln_compute_refused_total` | Jobs the compute pool took, and those it refused at its bound (each asked again). |
+| `kiln_compute_pieces_total`, `kiln_compute_yielded_total` | Pieces its jobs ran, and those after which their job gave its thread to a waiting one. |
+| `kiln_compute_wait_seconds` (histogram) | How long each job waited for a thread: from its submission to its first piece. |
+| `kiln_compute_piece_seconds` (histogram) | How long each piece held its thread. A piece ends once its job has run a shard's step (250 µs) and another job waits, at the next unit of its work. |
+| `kiln_compute_longest_piece_seconds` | The longest piece yet. |
+| `kiln_blocking_wait_seconds{share}`, `kiln_blocking_run_seconds{share}` (histograms) | How long each job of the blocking pool waited for one of its share's places, and ran: `dns` (`getaddrinfo`), `store` (kiln.db's statements), `fs` (files, `/proc`, archives, a child's wait). |
+| `kiln_blocking_places{share}` | Each share's places: the most of its jobs that run at once (`crate::rt::Profile`). |
+
 ## The lab (`kiln-lab`)
 
 ### A round
@@ -96,9 +114,20 @@ event from its harness writing it to a viewer's socket bringing it, `attach`: a 
 whole conversation), its median, p99, p99.9 and most (the stall tail), its rate and its errors (a
 status of 400 or more, or no answer); the server's CPU for each request and its share of a CPU; and,
 where the build has them, from `/metrics`: the shards' delay (p99, p99.9 and the top bucket reached,
-all shards together), their busy share and slow polls a second, each route class's server-side p99
-took and waited, and the requests the server shed by class (`kiln_shed_total`: goal 6's shedding,
-`crate::overload`, on with `KILN_SHED=1`).
+all shards together), their busy share and slow polls a second, all and by cause
+(`shards.slow_polls_task_per_s` and the others), each route class's server-side p99 took and waited,
+and the requests the server shed by class (`kiln_shed_total`: goal 6's shedding, `crate::overload`,
+on with `KILN_SHED=1`). Where the build has the pools' series: the compute pool's jobs and
+pieces a second, its jobs' wait for a thread at p99, its pieces' p99 and the top bucket one reached,
+and its threads busy on average (`compute.*`); and for each of the blocking pool's shares, its jobs a
+second, their run and wait at p99, the places they held on average (`busy`: their runs' time over the
+window's) and the places Little's law asks of their rate and p99 run (`little_p99`, as hyper-rt sizes
+a shard's tasks: `admission_limit`) (`blocking.<share>.*`).
+
+The fill is reported too (`fill.*`): how long it took (`fill.s`) and the server's own numbers over it
+(its CPU share, the shards', the pools'). It is the conversation feed at its busiest: every session's
+conversation written at once and sent by each runner's shipper to the server's intake, a batch of up to
+2 MiB at a time unzipped, hashed and parsed.
 
 A run's number is the median of its rounds'. Its noise is the interval that median moves in when the
 rounds are drawn again (a bootstrap of the rounds, 95%). `ab` runs two builds interleaved and in
@@ -130,8 +159,9 @@ taskset -c 16-31 target/release/kiln-lab run --kiln target/release/kiln --label 
 # two builds, interleaved: is B better than A beyond noise?
 taskset -c 16-31 target/release/kiln-lab ab --a main/kiln --b branch/kiln --label-a main --label-b branch --rounds 8
 
-# one build, two settings of its server
+# one build, two settings of its server: its shards, or its blocking pool's places (dns,store,fs)
 kiln-lab ab --a kiln --b kiln --label-a 2-shards --label-b 4-shards --env-a KILN_RT_SHARDS=2 --env-b KILN_RT_SHARDS=4
+kiln-lab ab --a kiln --b kiln --label-a fs-8 --label-b fs-26 --env-a KILN_RT_BLOCKING=4,2,8 --env-b KILN_RT_BLOCKING=4,2,26 --hogs 1x
 
 # a second run against a first; a run's report again; runs side by side
 kiln-lab compare first/run.json second/run.json
@@ -243,6 +273,113 @@ goal's series (so no `server.*` or `shards.*` numbers): the `small` profile in 2
 `realistic` one in 1 of 2 (the other couldn't open a session in 120 s). Its runner's headroom held
 the run, and so the lab, to 0.1 to 0.8 cores while production's server answered it slowly, so those
 numbers are the pacing's, not kiln's.
+
+## Goal 3: heavy work off the shards
+
+Goal 3 of the API runtime program (plan `01a1a59c2a8e`, research `01a1a59c2a8e7225ace75b13eaae5c6e`)
+moved CPU-heavy work off the shards to kiln-rt's compute pool, below them in the OS's priority and in
+pieces: Ship's rows; the conversation feed's batches on runners (serialized, hashed, compressed) and its
+intake on the server (each whole batch unzipped, hashed and parsed, which a thread of its own did at the
+shards' priority: now a buffer or a row at a time on the pool, the intake's thread waiting for each so
+batches are taken in order); the UI's compression, password hashing and an S3 part's digest. The
+terminal relay gives up its shard by the step quantum. The blocking pool's shares are sized from this
+lab's measurement (below), and both pools show their work on `/metrics` (above).
+
+### The A/B against main before goal 3
+
+Measured on 2026-11-04 from 15:02 to 15:46 UTC on the baseline's machine, but on its performance cores
+(`taskset -c 0-15`: 8 cores of two threads each), as two other labs held its efficient cores: the
+machine's load averages were 25 to 33 before each window. So these numbers are this A/B's own, not
+comparable with the baseline's table above. A: goal 1's baseline build (main at `2a2d93f6df5` with goal
+1's metrics; goal 2's kiln-rt is hyper-rt copied, two calls renamed, so this is main before goal 3). B:
+main at `01aba3ff882` with this change (`g3b-9d599a5892`), its server's blocking pool at the sizes
+derived below (`KILN_RT_BLOCKING=4,2,26`, its defaults since). The `realistic` profile, eight rounds of
+each, interleaved, calm and with 16 CPU hogs; the server sized itself to 4 shards and a compute pool of
+12 threads (16 CPUs less the shards). The rounds: `docs/runtime-lab/2026-11-04/goal3-ab-calm.json` and
+`goal3-ab-hogs-1x.json`.
+
+Calm, 4 of 58 numbers differ beyond noise:
+
+| number | A | B | difference | verdict |
+| --- | --- | --- | --- | --- |
+| fill: shards' delay p99 ms | 21.8 | 3.66 | -83.2% | better |
+| fill: shards' delay p99.9 ms | 41.4 | 10.6 | -74.3% | better |
+| fill: shards' busy share | 0.191 | 0.110 | -42.3% | better |
+| server RSS MB | 977 | 1132 | +15.9% | worse |
+| (within noise) shards' delay p99 ms | 0.888 | 0.525 | -40.8% | same |
+| (within noise) shards' task slow polls a second | 9.62 | 2.17 | -77.4% | same |
+| (within noise) websocket p99 ms | 575 | 488 | -15.1% | same |
+| (within noise) fill seconds | 14.8 | 13.9 | -6.0% | same |
+
+With 16 hogs, 11 of 58 differ beyond noise:
+
+| number | A | B | difference | verdict |
+| --- | --- | --- | --- | --- |
+| api_read p99 ms | 123 | 83.3 | -32.4% | better |
+| api_read p99.9 ms | 795 | 533 | -32.9% | better |
+| api_read a second | 65.6 | 69.5 | +5.9% | better |
+| server: api_read took p99 ms | 98.5 | 86.3 | -12.4% | better |
+| websocket p50 ms | 2.98 | 2.30 | -22.8% | better |
+| shards' delay p99.9 ms | 83.0 | 22.3 | -73.1% | better |
+| shards' busy share | 0.069 | 0.056 | -19.1% | better |
+| fill: shards' delay p99 ms | 23.8 | 2.70 | -88.7% | better |
+| fill: shards' delay p99.9 ms | 47.0 | 9.72 | -79.3% | better |
+| fill: shards' busy share | 0.201 | 0.104 | -48.1% | better |
+| server RSS MB | 989 | 1149 | +16.2% | worse |
+| (within noise) shards' delay p99 ms | 5.65 | 2.08 | -63.3% | same |
+| (within noise) shards' task slow polls a second | 15.0 | 5.18 | -65.5% | same |
+| (within noise) api_write p99 ms | 605 | 379 | -37.4% | same |
+
+What B's pools did (B alone has their series): in the calm window the compute pool took 142 jobs a
+second, its pieces 2.3 ms at p99 and its jobs' wait for a thread 0.09 ms at p99, 0.06 of a thread busy on
+average; over the fill, 40 jobs a second, pieces 48 ms at p99, waits 0.2 ms, 0.9 of a thread busy. The
+fill's longest piece reached the 10 s bucket: the UI's files compressed at brotli's quality 11 as the
+server starts, a file a unit, which goes on in one piece while no other job waits for a thread (none
+did: 0.2 ms at p99).
+
+### The blocking pool's shares, sized
+
+B alone at the old sizes (4, 2, 8), four rounds calm and four with 16 hogs, from 14:31 to 14:43 UTC
+(`blocking.<share>.*`, the median of the rounds; `goal3-measure-calm.json`,
+`goal3-measure-hogs-1x.json`); "at once" is Little's law, each round's jobs a second times its p99 run:
+
+| share | calm: jobs/s | run p99 | wait p99 | at once | hogs: jobs/s | run p99 | wait p99 | at once |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| `fs` | 47.8 | 81.5 ms | 0.25 ms | 3.8 | 24.9 | 1,056 ms | 6.3 ms | 25.5 |
+| `store` | 982 | 24.9 ms | 441 ms | 23.9 | 532 | 20.1 ms | 294 ms | 10.8 |
+| `dns` | 0 | | | | 0 | | | |
+
+- **`fs`: 26**, its jobs at once where it held the most (with hogs, `crate::rt::SERVER_FS`). An A/B of
+  26 against 8 with 16 hogs (six rounds each, `goal3-fs-sizes-hogs-1x.json`) found no difference beyond
+  noise in any of 94 numbers: its jobs waited 4.7 and 4.8 ms at p99 for a place, the pool's threads'
+  own wait for a CPU beside the hogs, not a full share.
+- **`store`: 2**: its one connection takes a statement at a time (`crate::store`), so places past the
+  connection's and one at its door would only wait on its lock. What its statements wait for, 441 ms at
+  p99 calm, is that connection: Little's law asks 24 places of it. A follow-up, outside this goal: the
+  API's tail (reads 82 ms and writes 441 ms at p99 calm, above) waits there.
+- **`dns`: 4**, kiln's count from its move onto hyper-rt: the lab's kiln resolves no name (every
+  address it dials is a literal), so the lab can't size it. Production's `kiln_blocking_*{share="dns"}`
+  can.
+
+### What it says
+
+- **No shard is held up by goal 3's heavy paths in the lab.** None of them runs on a server shard now:
+  their work is the compute pool's jobs above. The shards' task slow polls in the window (B 2.2 a second
+  calm and 5.2 with hogs, A 9.6 and 15.0) are within noise of each other. Over the fill, when the
+  conversation feed is at its busiest, the shards ran their ready work 3.7 ms (calm) and 2.7 ms (hogs)
+  late at p99 where main before goal 3 ran it 21.8 and 23.8 ms late, their busy share 42% and 48%
+  lower; with hogs, in the window too, 22.3 ms late at p99.9 against 83.0, and API reads 33% faster at
+  p99 and p99.9.
+- **The pool's rank costs its jobs a wait beside the hogs, as step 1 chose:** with 16 hogs in its cgroup
+  the compute pool's jobs waited 9.0 ms at p99 for a thread (calm, 0.09 ms), its pieces 55 ms at p99.
+- **What the lab can't say** is which code held a slow poll: kiln-rt counts them by cause, not by task.
+  The fill's task slow polls (B 92 a second, A 106: within noise) are the shards' own work on what the
+  runners send, which goal 3 didn't move: the hub's loop and the registry's ingest of each event (the
+  registry is goal 4's).
+- **The intake's move costs the feed nothing the lab sees:** the fill took 13.9 s against 14.8 s calm,
+  13.3 against 13.7 with hogs.
+- **The server's RSS is 16% higher** (977 to 1132 MB calm, 989 to 1149 with hogs): goal 3's, not the
+  share sizes' (26 against 8 places: 1146 against 1130 MB).
 
 ## What the lab doesn't do yet
 

@@ -40,6 +40,9 @@
 //! **Bounded by admission:** at most [`Config::queued`] jobs are admitted at once, running or waiting; past it a
 //! job is refused `Capacity` and handed back ([`Refused`]), before anything is queued.
 //!
+//! **Observed:** a consumer may be told how long each job waited for a thread and how long each piece ran
+//! ([`observe`]), to show where its heavy work went and that no piece held a thread long.
+//!
 //! **No locks** (ORIGIN.md's rule 1): the queues are crossbeam's; an idle worker parks on its own thread after
 //! saying so in its slot's state word, and a submitter wakes one idle worker by claiming that word with a
 //! compare-and-swap, one wake to one worker. One pool per process, set once by [`start`].
@@ -396,6 +399,36 @@ pub struct Stats {
     pub longest_piece_ns: u64,
 }
 
+/// What the pool tells its consumer ([`observe`]), in nanoseconds on the pool's clock.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Observed {
+    /// A job's first piece started, this long after the job was submitted.
+    Waited(u64),
+    /// A piece ran this long.
+    Ran(u64),
+}
+
+/// The consumer's observer of the pool's jobs ([`observe`]).
+pub type Observer = fn(Observed);
+
+/// The consumer's observer, once set.
+static OBSERVER: OnceLock<Observer> = OnceLock::new();
+
+/// Has the pool tell `observer` how long each job waited for a thread, as its first piece starts, and how long
+/// each piece ran: the consumer's measurements of how the pool serves the work it sends, beside [`stats`]'
+/// counts. The pieces' times are read already; a job's submission reads the clock only when observed. Once per
+/// process: false when an observer was set already.
+pub fn observe(observer: Observer) -> bool {
+    OBSERVER.set(observer).is_ok()
+}
+
+/// Tells the consumer's observer, if any, inside an unwind boundary (its code).
+fn tell(observed: Observed) {
+    if let Some(observer) = OBSERVER.get() {
+        let _ = contained(|| observer(observed));
+    }
+}
+
 static ACCEPTED: AtomicU64 = AtomicU64::new(0);
 static REFUSED: AtomicU64 = AtomicU64::new(0);
 static FINISHED: AtomicU64 = AtomicU64::new(0);
@@ -620,10 +653,9 @@ impl Pool {
         };
         let done = job(&turn);
         PIECES.fetch_add(1, Ordering::Relaxed);
-        LONGEST_PIECE_NS.fetch_max(
-            shard_clock_ns().saturating_sub(started_ns),
-            Ordering::Relaxed,
-        );
+        let ran_ns = shard_clock_ns().saturating_sub(started_ns);
+        LONGEST_PIECE_NS.fetch_max(ran_ns, Ordering::Relaxed);
+        tell(Observed::Ran(ran_ns));
         if !done {
             YIELDED.fetch_add(1, Ordering::Relaxed);
             local.push(job);
@@ -833,6 +865,18 @@ pub fn running() -> bool {
         .is_some_and(|pool| !pool.stopping.load(Ordering::Acquire))
 }
 
+/// When a job was submitted, where the pool is observed ([`observe`]): its first piece tells how long it waited.
+fn submitted() -> Option<u64> {
+    OBSERVER.get().map(|_| shard_clock_ns())
+}
+
+/// A job's first piece, starting on `turn`: how long the job waited for it, told once.
+fn first_piece(submitted_ns: &mut Option<u64>, turn: &Turn<'_>) {
+    if let Some(at) = submitted_ns.take() {
+        tell(Observed::Waited(turn.started_ns.saturating_sub(at)));
+    }
+}
+
 /// A closure as a job of one piece.
 fn once<T, F>(job: F, sender: OneshotSender<T>, held: Held) -> Job
 where
@@ -840,7 +884,9 @@ where
     F: FnOnce() -> T + Send + 'static,
 {
     let mut parts = Some((job, sender, held));
-    Box::new(move |_turn: &Turn<'_>| {
+    let mut submitted_ns = submitted();
+    Box::new(move |turn: &Turn<'_>| {
+        first_piece(&mut submitted_ns, turn);
         if let Some((job, sender, held)) = parts.take() {
             finish(contained(job), sender, held);
         }
@@ -856,7 +902,9 @@ where
     F: FnMut(&mut S, &Turn<'_>) -> Step<T> + Send + 'static,
 {
     let mut parts = Some((state, step, sender, held));
+    let mut submitted_ns = submitted();
     Box::new(move |turn: &Turn<'_>| {
+        first_piece(&mut submitted_ns, turn);
         let outcome = match parts.as_mut() {
             Some((state, step, _, _)) => contained(|| step(state, turn)),
             None => return true,

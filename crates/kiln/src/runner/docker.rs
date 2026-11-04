@@ -1062,6 +1062,17 @@ pub fn proxy_env<'a>(services: impl Iterator<Item = &'a str>) -> Vec<(String, St
     ["HTTP_PROXY", "HTTPS_PROXY", "http_proxy", "https_proxy"].iter().map(|k| ((*k).to_owned(), url.clone())).chain(["NO_PROXY", "no_proxy"].iter().map(|k| ((*k).to_owned(), none.clone()))).collect()
 }
 
+/// What a leg's containers are given of the CPU (docs/priority.md; goal 8, plan 01a1a59c2b29 step
+/// 2): the least weight Docker gives a container, as a leg's group on the host has,
+/// `--cpu-shares 2`, `cpu.weight` 1 on cgroup v2 (runc's and crun's conversion). A leg's own
+/// `options:` come after it, and so win.
+pub const LEG_CPU_SHARES: u32 = 2;
+
+/// `--cpu-shares` for a leg's container ([`LEG_CPU_SHARES`]).
+fn leg_cpu() -> [String; 2] {
+    [s("--cpu-shares"), LEG_CPU_SHARES.to_string()]
+}
+
 fn s(x: &str) -> String {
     x.to_owned()
 }
@@ -1154,6 +1165,7 @@ impl Containers {
                 if let Some(cpus) = &spec.cpuset {
                     args.extend([s("--cpuset-cpus"), cpus.clone()]);
                 }
+                args.extend(leg_cpu());
                 args.extend(spec.options.as_deref().map(split_options).unwrap_or_default());
                 args.push(image);
                 let id = c.cli.run(&args, &env, CALL).await?;
@@ -1227,6 +1239,7 @@ impl Containers {
                 for v in &spec.volumes {
                     args.extend([s("-v"), v.clone()]);
                 }
+                args.extend(leg_cpu());
                 args.extend(spec.options.as_deref().map(split_options).unwrap_or_default());
                 args.extend([s("--entrypoint"), s("tail"), image.clone(), s("-f"), s("/dev/null")]);
                 let id = c.cli.run(&args, &env, CALL).await?;
@@ -1390,8 +1403,10 @@ impl Containers {
             s("-v"), format!("{}:/kiln-egress:ro", e.binary.display()), s("--entrypoint"), s("/kiln-egress"),
             // Nothing it needs but its two ports.
             s("--user"), s("65534:65534"), s("--read-only"), s("--cap-drop"), s("ALL"), s("--security-opt"), s("no-new-privileges"),
-            image.to_owned(), s("egress-relay"),
         ]);
+        // The leg's, at a leg's weight.
+        args.extend(leg_cpu());
+        args.extend([image.to_owned(), s("egress-relay")]);
         let env: BTreeMap<String, String> = [(s("KILN_EGRESS_TOKEN"), e.token.clone())].into();
         let id = self.cli.run(&args, &env, CALL).await?;
         self.cli.run(&[s("network"), s("connect"), s("--alias"), s(super::egress::ALIAS), self.network.clone(), id.clone()], &none, CALL).await?;
@@ -1503,6 +1518,7 @@ pub fn action_run_args(
     if let Some(e) = entrypoint.filter(|e| !e.is_empty()) {
         a.extend([s("--entrypoint"), e.to_owned()]);
     }
+    a.extend(leg_cpu());
     a.push(image.to_owned());
     a.extend(args.iter().cloned());
     a

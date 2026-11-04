@@ -58,7 +58,9 @@ impl Probes {
                     let at = Instant::now();
                     let answer = match once(&probe, tolerance, &mut seq) {
                         // Out its tolerance is an answer too: that long.
-                        Ok(()) | Err(Failed::Slow) => Answer::Took(at.elapsed().as_micros() as f64),
+                        Ok(None) | Err(Failed::Slow) => Answer::Took(at.elapsed().as_micros() as f64),
+                        // What the target says it took, or what the probe did where that's longer.
+                        Ok(Some(us)) => Answer::Took((at.elapsed().as_micros() as f64).max(us)),
                         Err(Failed::Down) => Answer::Unavailable,
                     };
                     slot.inflight.store(0, Ordering::Release);
@@ -119,12 +121,42 @@ enum Failed {
     Down,
 }
 
-fn once(probe: &Probe, tolerance: Duration, seq: &mut u64) -> Result<(), Failed> {
+/// One probe of `probe`: what the target says it took (µs), where it says.
+fn once(probe: &Probe, tolerance: Duration, seq: &mut u64) -> Result<Option<f64>, Failed> {
     match probe {
-        Probe::Fsync { path } => fsync(path, seq).map_err(|_| Failed::Down),
-        Probe::Http { url } => http(url, tolerance),
-        Probe::Tcp { addr } => connect(addr, tolerance).map(drop),
+        Probe::Fsync { path } => fsync(path, seq).map(|()| None).map_err(|_| Failed::Down),
+        Probe::Http { url } => http(url, tolerance).map(|()| None),
+        Probe::Tcp { addr } => connect(addr, tolerance).map(|_| None),
+        Probe::Delay { url } => delay(url, tolerance).map(Some),
     }
+}
+
+/// `GET` a kiln server's `/healthz/delay`: how late its shards run ready work now, in seconds (its
+/// body), as µs. A server without it (older), or one that fails, is down, not slow.
+fn delay(url: &str, tolerance: Duration) -> Result<f64, Failed> {
+    /// More than the few bytes the answer is: past this it isn't one.
+    const MOST: u64 = 4096;
+    let rest = url.strip_prefix("http://").ok_or(Failed::Down)?;
+    let (host, path) = rest.split_once('/').map_or((rest, "/".to_owned()), |(h, p)| (h, format!("/{p}")));
+    let addr = if host.contains(':') && !host.ends_with(']') { host.to_owned() } else { format!("{host}:80") };
+    let mut s = connect(&addr, tolerance)?;
+    // In one write: a request in pieces is a packet each.
+    let ask = format!("GET {path} HTTP/1.1\r\nHost: {host}\r\nUser-Agent: kiln-headroom\r\nConnection: close\r\n\r\n");
+    s.write_all(ask.as_bytes()).map_err(|_| Failed::Down)?;
+    let mut answer = Vec::new();
+    match s.take(MOST).read_to_end(&mut answer) {
+        Ok(_) => {}
+        Err(e) if matches!(e.kind(), std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut) => return Err(Failed::Slow),
+        Err(_) => return Err(Failed::Down),
+    }
+    let text = String::from_utf8_lossy(&answer);
+    let (head, body) = text.split_once("\r\n\r\n").ok_or(Failed::Down)?;
+    let code: u16 = head.split_whitespace().nth(1).and_then(|c| c.parse().ok()).ok_or(Failed::Down)?;
+    if code != 200 {
+        return Err(Failed::Down);
+    }
+    let secs: f64 = body.trim().parse().map_err(|_| Failed::Down)?;
+    if secs.is_finite() && secs >= 0.0 { Ok(secs * 1e6) } else { Err(Failed::Down) }
 }
 
 /// A few bytes written to a file of kiln's own in `dir`, then made durable.
@@ -198,6 +230,43 @@ mod tests {
         let (a, _) = wait_for(&p, |a, _| a.iter().any(|(n, _)| n == "disk") && a.iter().any(|(n, _)| n == "gone"));
         anyhow::ensure!(a.iter().any(|(n, x)| n == "disk" && matches!(x, Answer::Took(_))), "{a:?}");
         anyhow::ensure!(a.iter().any(|(n, x)| n == "gone" && *x == Answer::Unavailable), "{a:?}");
+        Ok(())
+    }
+
+    /// Goal 8 (plan 01a1a59c2b29 step 5): a server's delay probe answers with the delay the server
+    /// says its shards run ready work at, when that's longer than the probe took; a server without
+    /// the endpoint is down, not slow.
+    #[test]
+    fn g8_s5_a_servers_delay_is_what_it_says_its_shards_wait() -> anyhow::Result<()> {
+        use std::io::{Read as _, Write as _};
+        let serve = |status: &'static str, body: &'static str| -> anyhow::Result<String> {
+            let l = std::net::TcpListener::bind("127.0.0.1:0")?;
+            let url = format!("http://{}/healthz/delay", l.local_addr()?);
+            std::thread::spawn(move || {
+                for mut c in l.incoming().flatten().take(4) {
+                    // The whole request, so closing doesn't reset the connection.
+                    let mut asked = Vec::new();
+                    let mut chunk = [0u8; 1024];
+                    while !asked.windows(4).any(|w| w == b"\r\n\r\n") {
+                        match c.read(&mut chunk) {
+                            Ok(0) | Err(_) => break,
+                            Ok(n) => asked.extend_from_slice(chunk.get(..n).unwrap_or_default()),
+                        }
+                    }
+                    let _ = write!(c, "HTTP/1.1 {status}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len());
+                }
+            });
+            Ok(url)
+        };
+        let slow = serve("200 OK", "0.25\n")?;
+        let p = Probes::start(vec![Spec { name: "delay".into(), probe: Probe::Delay { url: slow }, tolerance: Duration::from_secs(2) }], Arc::new(|| {}));
+        let (a, _) = wait_for(&p, |a, _| !a.is_empty());
+        anyhow::ensure!(matches!(a.first(), Some((_, Answer::Took(us))) if (250_000.0..400_000.0).contains(us)), "{a:?}");
+        drop(p);
+        let missing = serve("404 Not Found", "")?;
+        let p = Probes::start(vec![Spec { name: "delay".into(), probe: Probe::Delay { url: missing }, tolerance: Duration::from_secs(2) }], Arc::new(|| {}));
+        let (a, _) = wait_for(&p, |a, _| !a.is_empty());
+        anyhow::ensure!(matches!(a.first(), Some((_, Answer::Unavailable))), "{a:?}");
         Ok(())
     }
 

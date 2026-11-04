@@ -433,6 +433,7 @@ async fn route(hub: Arc<Hub>, req: Request) -> R {
         (&Method::GET, ["healthz"]) => return Ok(srv::text(StatusCode::OK, "ok")),
         (&Method::GET, ["readyz"]) => return Ok(boxed(|| readyz(&hub)).await),
         (&Method::GET, ["healthz", "server"]) => return Ok(server_health(&hub)),
+        (&Method::GET, ["healthz", "delay"]) => return Ok(shard_delay()),
         (&Method::GET, ["dl", "kiln"]) => return boxed(download_binary).await,
         (&Method::GET, ["dl", "kiln", target]) => return boxed(|| download_for(&hub, target)).await,
         (&Method::GET, ["dl", "kiln", target, build]) => return boxed(|| download_build(&hub, target, build)).await,
@@ -6309,6 +6310,27 @@ async fn readyz(hub: &Hub) -> Response {
     }
 }
 
+/// `/healthz/delay`: how late this server's shards run ready work now, in seconds: the target
+/// headroom probes on a runner beside it (docs/priority.md; goal 8, plan 01a1a59c2b29 step 5). From
+/// the shards' own figures (`crate::shard_health`): no shard is asked. Open, as `/healthz` is; 503
+/// where the shards aren't probed (`KILN_SHARD_PROBE_MS=0`) or haven't been yet.
+fn shard_delay() -> Response {
+    let Some(period) = crate::shard_health::period_from_env() else {
+        return srv::text(StatusCode::SERVICE_UNAVAILABLE, "this server doesn't probe its shards (KILN_SHARD_PROBE_MS=0)");
+    };
+    match worst_delay(crate::shard_health::shards().iter().map(crate::shard_health::Shard::snapshot), period) {
+        Some(d) => srv::text(StatusCode::OK, &format!("{:.6}", d.as_secs_f64())),
+        None => srv::text(StatusCode::SERVICE_UNAVAILABLE, "this server's shards haven't been probed yet"),
+    }
+}
+
+/// The worst of the shards' delay now: each one's latest probe, how late it ran, or, for a shard held
+/// now, how long past its `period` it has gone without one (a hold shows there before its probe can
+/// say how late it ran).
+fn worst_delay(shards: impl Iterator<Item = crate::shard_health::Snapshot>, period: Duration) -> Option<Duration> {
+    shards.filter(|s| s.probes > 0 || s.since_probe.is_some()).map(|s| s.late.max(s.since_probe.map_or(Duration::ZERO, |d| d.saturating_sub(period)))).max()
+}
+
 /// `/healthz/server`: how this server is, for the checks that watch a deploy of kiln
 /// (docs/cd-targets.md §10). The commit it runs; how long it has been up; how many times kiln's
 /// supervisor started it again (a crash, or the kernel's OOM killer: neither shows in its pod's
@@ -6356,6 +6378,29 @@ fn back(connected: u64, before: u64) -> f64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Goal 8 (plan 01a1a59c2b29 step 5, docs/priority.md): the server's delay is its worst shard's,
+    /// the latest probe's lateness, or a hold under way past the probes' period; a shard not probed
+    /// yet says nothing.
+    #[test]
+    fn g8_s5_the_delay_is_the_worst_shards_now() {
+        let period = Duration::from_millis(10);
+        let shard = |probes: u64, late_us: u64, since_ms: Option<u64>| crate::shard_health::Snapshot {
+            probes,
+            late: Duration::from_micros(late_us),
+            most_late: Duration::from_micros(late_us),
+            since_probe: since_ms.map(Duration::from_millis),
+            busy: None,
+            polls: 0,
+            slow: crate::shard_health::Slow::default(),
+            longest_poll: Duration::ZERO,
+            overrun: Duration::ZERO,
+        };
+        assert_eq!(worst_delay([shard(9, 80, Some(4)), shard(9, 2_000, Some(7))].into_iter(), period), Some(Duration::from_micros(2_000)));
+        // Held now: 1.5 s since its probe, past its 10 ms period.
+        assert_eq!(worst_delay([shard(9, 80, Some(4)), shard(9, 100, Some(1_500))].into_iter(), period), Some(Duration::from_millis(1_490)));
+        assert_eq!(worst_delay([shard(0, 0, None)].into_iter(), period), None);
+    }
 
     /// P2: a learner's copy streams whole though the next copy, made once this one is handed over,
     /// clears its name (what a stop left behind) before this one's reader has run.
