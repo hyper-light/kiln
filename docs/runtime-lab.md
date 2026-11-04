@@ -406,6 +406,59 @@ B alone at the old sizes (4, 2, 8), four rounds calm and four with 16 hogs, from
 - **The server's RSS is 16% higher** (977 to 1132 MB calm, 989 to 1149 with hogs): goal 3's, not the
   share sizes' (26 against 8 places: 1146 against 1130 MB).
 
+## Goal 6: shards that protect themselves
+
+Goal 6 of the API runtime program (plan `01a1a59c2abe`, research `01a1a59c2abf76c79f9f50edffd98867`):
+tasks give up their shard on time, kiln-rt's watchdog moves work off a stuck shard and says why, every
+request has a class, and overload sheds Background requests first ("What overload sheds", above).
+
+### Priorities: Critical's p99, calm and with CPU hogs (step 3)
+
+In the lab the Critical class is its pages and their files (`page`): its API calls carry a token, so
+they are Normal, and its catch-ups of a conversation (`/events` with a token) Background.
+`scripts/overload_lab/driver.sh` measures them in two layouts, the configurations taking turns round by
+round as goal 8's driver does (docs/priority.md, "The lab"):
+
+- **production's:** the server alone in a scope of its own at `CPUWeight=1000`, as `kiln.slice` gives
+  it on bare metal (`scripts/overload_lab/kiln-scoped`, which the lab starts its server through), the
+  lab's runners and clients in the lab's unit at the default weight, and the hogs in a scope of their
+  own at `cpu.weight` 1, as CI legs and agents run (configurations `calm` and `hogs`);
+- **shared:** the server, the lab's runners and clients and the lab's own hogs in one cgroup
+  (`shared-calm`, `shared-hogs`).
+
+```sh
+# Linux with systemd's user manager; as many hogs as the lab's CPUs, all of it on those CPUs
+ROUNDS=8 N=16 CPUS=16-31 scripts/overload_lab/driver.sh target/release/kiln target/release/kiln-lab ~/.cache/kiln-lab/g6-priorities
+kiln-lab table calm=~/.cache/kiln-lab/g6-priorities/runs/calm/run.json hogs=~/.cache/kiln-lab/g6-priorities/runs/hogs/run.json
+kiln-lab compare ~/.cache/kiln-lab/g6-priorities/runs/calm/run.json ~/.cache/kiln-lab/g6-priorities/runs/hogs/run.json
+```
+
+The step holds when `page.p99_ms` with hogs is within noise of calm in production's layout.
+
+### Shedding by priority, overloaded on purpose (step 4)
+
+The lab's overload sits in kiln-rt's pools, not on a shard (research `01a1a59c2abf`, f28: with one
+shard and no think time, API reads took 2 to 3 s at p99 and attaches 7 to 8 s while the shard's delay
+stayed at 1.8 ms at p99), so the pools' waits shed too: the compute pool's and each of the blocking
+pool's shares' (`kiln_pool_*`). `scripts/overload_lab/overload.sh` runs the `overload` profile with one
+shard, shedding off against on, interleaved (`kiln-lab ab`, the server in its scope as above); with
+`PROFILE=realistic SHARDS=default` it asks what shedding costs a calm server.
+
+```sh
+ROUNDS=6 CPUS=16-31 scripts/overload_lab/overload.sh target/release/kiln target/release/kiln-lab ~/.cache/kiln-lab/g6-overload
+ROUNDS=6 CPUS=16-31 PROFILE=realistic SHARDS=default scripts/overload_lab/overload.sh target/release/kiln target/release/kiln-lab ~/.cache/kiln-lab/g6-calm-shedding
+```
+
+Each round's `server.shed.background` and `server.shed.normal` are the sheds by class
+(`kiln_shed_total`), and `page.errors` and `page.p99_ms` whether Critical requests were served.
+
+In process, `crates/kiln/tests/overload.rs` shows both detectors at work on kiln's own HTTP server with
+shedding on: busy tasks of each class flooding every shard shed Background requests, then Normal ones,
+while Critical ones are served (at a 0.56 ms median); and a backlog in the blocking pool's `store` share
+while every shard is calm (its jobs held about 200 ms each, then 1.5 s) sheds Background requests at the
+first, Normal ones only past the tolerance, never Critical ones (served at a 0.08 ms median), and
+`/readyz` says not ready, naming the share, while the API is shed. Sheds are counted by class in both.
+
 ## What the lab doesn't do yet
 
 - **CI.** A lab kiln has no repositories, so its "CI pages" are the run lists and overview, empty;
