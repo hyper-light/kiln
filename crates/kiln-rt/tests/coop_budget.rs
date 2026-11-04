@@ -265,6 +265,46 @@ fn g6_s1_a_long_computation_yields_through_consume_budget() {
     );
 }
 
+/// Only the task's own waker is refused. Past its share, with a competitor's timer due, a charge under another
+/// waker (an executor nested in the task's poll, as `futures::executor::block_on` is, or a `now_or_never`) goes
+/// on at its first poll, where a refusal would only be polled again at once for as long as the task's poll
+/// lasted (a nested `block_on` spun a shard of kiln's tests so); the time still counts, and the task yields at
+/// its next charge under its own waker.
+#[test]
+fn g6_s1_a_charge_under_another_waker_goes_on_and_the_task_yields_at_its_own() {
+    let mut rt = LocalRuntime::new(&config()).unwrap();
+    let seen = Arc::new(Seen::default());
+    let seen_in = Arc::clone(&seen);
+    let (nested_polls, spent, yielded) = rt
+        .block_on(async move {
+            let done = Arc::new(AtomicBool::new(false));
+            spawn(compete(Arc::clone(&seen_in), Arc::clone(&done))).unwrap();
+            hyper_rt::futures::yield_now().await;
+            // Past the share, the competitor's timer (a quarter share) due.
+            work(3 * QUANTUM_NS);
+            let mut charge = std::pin::pin!(consume_budget());
+            let mut nested_polls = 0u32;
+            while charge
+                .as_mut()
+                .poll(&mut Context::from_waker(std::task::Waker::noop()))
+                .is_pending()
+            {
+                nested_polls += 1;
+                assert!(nested_polls < 1_000, "a poll under another waker refused over and over");
+            }
+            let spent = hyper_rt::coop::spent();
+            let polls = hyper_rt::futures::shard_counters().unwrap().polls;
+            consume_budget().await;
+            let yielded = hyper_rt::futures::shard_counters().unwrap().polls != polls;
+            done.store(true, Ordering::Release);
+            (nested_polls, spent, yielded)
+        })
+        .unwrap();
+    assert_eq!(nested_polls, 0, "ready at its first poll under another waker");
+    assert!(spent, "the time counted: the task has used its share");
+    assert!(yielded, "the task yielded at its next charge under its own waker");
+}
+
 /// A simulated shard keeps a step a yield (docs/runtime.md §11): its clock does not move within a poll, so a
 /// charge never ends one, and a loop of due timers is one poll.
 #[test]

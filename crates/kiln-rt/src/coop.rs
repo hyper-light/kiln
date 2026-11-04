@@ -25,6 +25,12 @@
 //! - **Long computations** call [`consume_budget`] between their pieces: the same charge, alone.
 //! - **A simulated shard never yields by budget**: its clock does not move within a poll, and its schedules
 //!   stay a step a yield as they were (docs/runtime.md §11).
+//! - **Only the task's own waker is refused.** A leaf polled under another waker (an executor nested in the
+//!   task's poll, `now_or_never`'s, a combinator's own) is charged, so the time counts, but always goes on: a
+//!   refusal there can't make the task yield, since what polls it would only poll it again at once, for as
+//!   long as the task's poll lasts (a nested `block_on` spun its shard so in kiln's tests), and what comes at
+//!   once (a bus that answers at once, a sleep already due) must still come at once. The task yields at its
+//!   next leaf under its own waker.
 //!
 //! Tokio's budget counts operations, 128 a poll, and reads no clock; Seastar's task quota is a time (0.5 ms
 //! by default) that a timer ends, checked between tasks with two loads (`need_preempt`). Here the count is
@@ -40,9 +46,10 @@ use crate::shard::ShardContext;
 /// Charges the polling task one operation of a leaf future: `Ready` to go on with it, or `Pending` once the
 /// task has held its shard past its share while anything else wants the shard, with the waker woken, so the
 /// task is polled again after the loop has read its inputs. A leaf calls it first, so an answer of `Pending`
-/// leaves its operation undone. `Ready` off a shard's thread and between polls (an owner's code).
+/// leaves its operation undone. `Ready` off a shard's thread, between polls (an owner's code) and under any
+/// waker but the polling task's own (the module's notes).
 pub fn poll_proceed(cx: &mut Context<'_>) -> Poll<()> {
-    if registry::with_current(ShardContext::charge).unwrap_or(true) {
+    if registry::with_current(|here| proceeds(here, cx)).unwrap_or(true) {
         return Poll::Ready(());
     }
     cx.waker().wake_by_ref();
@@ -52,11 +59,17 @@ pub fn poll_proceed(cx: &mut Context<'_>) -> Poll<()> {
 /// [`poll_proceed`] on the shard `here` a leaf has looked up already: one lookup of the thread's shard
 /// serves both.
 pub(crate) fn proceed_in(here: &ShardContext, cx: &mut Context<'_>) -> Poll<()> {
-    if here.charge() {
+    if proceeds(here, cx) {
         return Poll::Ready(());
     }
     cx.waker().wake_by_ref();
     Poll::Pending
+}
+
+/// The charge, and whether the leaf goes on: it does within the task's share, and under a waker other than the
+/// polling task's own, which no refusal would make yield.
+fn proceeds(here: &ShardContext, cx: &Context<'_>) -> bool {
+    here.charge() || crate::waker::polling_task_in(here, cx.waker()).is_none()
 }
 
 /// The yield point of a long computation: one charge with no other operation (Tokio's `consume_budget`).
