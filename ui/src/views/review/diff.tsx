@@ -541,9 +541,10 @@ function CtxRow({ l, tok, c }: { l: Line; tok: Toks; c: RowCtx }) {
     return (
       <>
         <div className="rv-row" data-kind="ctx" data-sel={sel || undefined}>
-          <div className="rv-half" data-asked={asking(c, "old", l.o) || undefined} style={{ "--hang": l.hang } as React.CSSProperties}>
+          {/* An unchanged line is the same on both sides: either half asks about it as the new side's, its card under the row as unified. */}
+          <div className="rv-half" data-asked={asking(c, "new", l.n) || undefined} style={{ "--hang": l.hang } as React.CSSProperties}>
             <Num side="old" line={l.o} c={c} />
-            <Code text={l.text} toks={tok.old.get(l.o ?? -1)} onClick={tap(c, "old", l.o, l.text)} />
+            <Code text={l.text} toks={tok.old.get(l.o ?? -1)} onClick={tap(c, "new", l.n, l.text)} />
           </div>
           <div className="rv-half" data-asked={asking(c, "new", l.n) || undefined} style={{ "--hang": l.hang } as React.CSSProperties}>
             <Num side="new" line={l.n} c={c} />

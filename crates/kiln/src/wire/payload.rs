@@ -397,6 +397,7 @@ impl Carries for AgentMsg {
             | AgentMsg::TermList { .. }
             | AgentMsg::TermReplay { .. }
             | AgentMsg::Instance(_)
+            | AgentMsg::Machine { .. }
             | AgentMsg::Build { .. }
             | AgentMsg::UpgradeLog { .. }
             | AgentMsg::UpgradeDone { .. }

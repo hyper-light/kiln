@@ -377,6 +377,10 @@ pub fn clean_machine_id(id: Option<&str>) -> Option<String> {
     (!id.is_empty()).then_some(id)
 }
 
+/// Why a machine that sent no machine id kiln makes isn't registered (docs/machines.md, "One
+/// record a machine"), and how it gets one.
+pub const NO_MACHINE_ID: &str = "this machine sent no machine id, and kiln registers machines by their ids: on Linux run `systemd-machine-id-setup` (or give the VM or container its own /etc/machine-id), on Windows a copy needs sysprep, in a container keep kiln's data directory on a volume; or set KILN_MACHINE_ID to an id of the machine's own, then join again";
+
 /// What kiln knows a machine by when it sent its machine id ([`crate::os::machine_id`], 32 hex
 /// digits): that id, the name its certificate carries, with the name it asked for as its label
 /// (docs/machines.md). None otherwise: it is known by its name, as before.
@@ -449,6 +453,10 @@ impl Requests {
         }
         let hostname = text(&req.hostname, 64);
         let machine_id = clean_machine_id(req.machine_id.as_deref());
+        // Registered by its machine id, or not at all (docs/machines.md, "One record a machine").
+        if machine_key(machine_id.as_deref()).is_none() {
+            return Err(Refusal::Invalid(NO_MACHINE_ID.to_owned()));
+        }
         let wanted = if req.name.trim().is_empty() { hostname.as_str() } else { req.name.as_str() };
         let name = crate::pki::sanitize_name(wanted);
         let os = word(&req.os, 32);
@@ -1156,7 +1164,7 @@ mod tests {
             version: "0.1.0".into(),
             csr: csr.into(),
             commitment: crate::util::sha256_hex(secret.as_bytes()),
-            machine_id: Some(" 0123ABCD-ef; ".into()),
+            machine_id: Some(" 0123456789ABCDEF0123456789abcdef; ".into()),
         }
     }
 
@@ -1249,7 +1257,7 @@ mod tests {
         assert!(!again);
         // Approval: the admin signs the CSR; the machine receives the certificate.
         let c = r.candidate(&id, now).map_err(|e| anyhow::anyhow!("{e:?}"))?;
-        assert_eq!(c.machine_id.as_deref(), Some("0123abcd-ef"), "the machine's id, cleaned, goes to the approval");
+        assert_eq!(c.machine_id.as_deref(), Some("0123456789abcdef0123456789abcdef"), "the machine's id, cleaned, goes to the approval");
         let dir = tempfile::tempdir()?;
         let pki = crate::pki::Pki::open(dir.path())?;
         let cert = pki.sign_csr(&c.csr, &c.name, 365)?;
@@ -1317,6 +1325,12 @@ mod tests {
         let mut bad = new_request(&csr, "e");
         bad.commitment = "abc".into();
         assert!(matches!(r.create(bad, ip(42), now), Err(Refusal::Invalid(_))));
+        // docs/machines.md, "One record a machine": no machine id (or one kiln doesn't make), no join.
+        for (n, id) in [(90, None), (91, Some("0123abcd-ef".to_owned()))] {
+            let mut bad = new_request(&csr, "e");
+            bad.machine_id = id;
+            assert!(matches!(r.create(bad, ip(n), now), Err(Refusal::Invalid(why)) if why == NO_MACHINE_ID));
+        }
         // Hostile names and labels are cleaned.
         let mut odd = new_request(&csr, "f");
         odd.name = "  ".into();

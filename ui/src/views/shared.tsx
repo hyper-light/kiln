@@ -78,7 +78,7 @@ export function AgentMiniCard({ agent, history, onOpen }: { agent: Agent; histor
     <article className="card flex flex-col" data-interactive="true" data-live={agent.busy > 0 ? "true" : undefined}>
       <button onClick={onOpen} className="flex flex-1 flex-col p-4 text-left outline-offset-[-3px]">
         <div className="flex items-center gap-2.5">
-          <StatusDot status={status} title={!agent.connected ? "disconnected" : agent.draining ? "draining" : agent.busy ? "busy" : "idle"} />
+          <StatusDot status={status} title={!agent.connected ? (agent.stale ? "stale: no machine id" : "disconnected") : agent.draining ? "draining" : agent.busy ? "busy" : "idle"} />
           <h3 className="min-w-0 flex-1 truncate text-[15px] font-[480] tracking-[-0.3px]">{shownName(agent)}</h3>
           <span className="font-mono text-[10px] text-[#8c8f98] tabular-nums">
             {agent.busy}/{agent.slots}

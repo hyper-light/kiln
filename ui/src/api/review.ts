@@ -4,6 +4,7 @@
  */
 import type { Res } from "@/lib/data";
 import { apiPath } from "@/lib/peer-base";
+import type { AboutAsk, AgentBrief } from "./harness";
 import { request } from "./client";
 import { signed } from "@/lib/signing";
 
@@ -339,6 +340,9 @@ export function fixesSetBy(v: Pick<AgentFixes, "agents_fix" | "set_by" | "set_at
 const enc = encodeURIComponent;
 
 export const reviewApi = {
+  /** Ask about code no agent made (components/code/about.tsx): a helper kiln starts for the person reads `repo` at `commit` (`ci.repos.about`). */
+  about: (repo: string, commit: string, ask: AboutAsk) =>
+    request<{ agents: AgentBrief[]; itself: boolean; sent?: { sent: boolean; message?: string } }>("POST", `/api/repos/${enc(repo)}/about`, { commit, ...ask }),
   inbox: (signal?: AbortSignal) => request<Inbox>("GET", "/api/review/inbox", undefined, { signal }),
   readAll: () => request<{ read: number }>("POST", "/api/review/inbox/read", { all: true }),
   diff: (key: string, signal?: AbortSignal) => request<DiffDetail>("GET", `/api/diffs/${enc(key)}`, undefined, { signal }),
