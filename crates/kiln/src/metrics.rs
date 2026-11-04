@@ -93,7 +93,7 @@ impl Histogram {
         self.count.load(Ordering::Relaxed)
     }
 
-    /// What the observations add up to so far, in microseconds.
+    /// The observations' sum so far, in microseconds.
     pub fn sum_us(&self) -> u64 {
         self.sum_us.load(Ordering::Relaxed)
     }
