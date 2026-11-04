@@ -656,7 +656,7 @@ fn w21_r15_agent_page_cold_open_budget() -> anyhow::Result<()> {
     hold("agent page cold open", &budgets)
 }
 
-// The budgets. Each is the most of four runs on adacachy (2026-11-04, origin/main 01d3ff1c99b) times
+// The budgets. Each is the most of four to seven runs on adacachy (2026-11-04, origin/main 01d3ff1c99b) times
 // one plus the runs' spread ((max - min) / min) plus 7%: the noise seen, and T3 Code's tightest
 // margin over observed (`TransferBudgetReport.integration.ts`, LONG_TURN_BUDGET "about 7% above the
 // observed"), so a run's noise passes and a regression of a tenth fails. Each says its value today
@@ -679,28 +679,28 @@ const COLD_FRAMES: &[(&str, &str, usize)] = &[("median", "UI (z=gzip)", 10), ("m
 /// spread (the first run counted only `run` and `job`: 10,250). The events and compress tracks'.
 const EVENTS_CI_PER_JOB: usize = 11_992;
 /// Events: `harness` frames per agent-hour (one an agent's record, about: [`RECORD_EVERY_MS`]).
-/// Today 1,161 (spread 1.8%). The events track's (coalescing per entity, server-side batching).
-const EVENTS_HARNESS_FRAMES_PER_AGENT_HOUR: usize = 1_264;
+/// Today 1,161 (seven runs, spread 3.8%). The events track's (coalescing per entity, batching).
+const EVENTS_HARNESS_FRAMES_PER_AGENT_HOUR: usize = 1_286;
 /// Events: `harness` wire bytes per agent-minute (each frame the agent's whole entry, about 990 B).
-/// Today 19,177 (spread 2.7%). The events track's (deltas) and the compress track's.
-const EVENTS_HARNESS_WIRE_PER_AGENT_MIN: usize = 21_048;
+/// Today 19,177 (seven runs, spread 3.7%). The events track's (deltas) and the compress track's.
+const EVENTS_HARNESS_WIRE_PER_AGENT_MIN: usize = 21_230;
 /// Events: `headroom` frames (about 65 B each) per runner-minute: a runner reports its headroom's
-/// state whenever it changes, which a loaded machine's readings do often. Today 326 to 523 over
-/// five runs (spread 61%: it follows the host's load, so this budget is loose by need). The events
+/// state whenever it changes, which a loaded machine's readings do often. Today 326 to 583 over
+/// seven runs (spread 79%: it follows the host's load, so this budget is loose by need). The events
 /// track's: only a page that shows headroom needs them.
-const EVENTS_HEADROOM_FRAMES_PER_RUNNER_MIN: usize = 877;
-/// Events: every other frame (`sample`, `keep` ...) a minute. Today 37.8 (spread 8%).
-const EVENTS_REST_FRAMES_PER_MIN: usize = 44;
-/// Events: those frames' wire bytes a minute. Today 10,539 (spread 3.7%).
-const EVENTS_REST_WIRE_PER_MIN: usize = 11_667;
+const EVENTS_HEADROOM_FRAMES_PER_RUNNER_MIN: usize = 1_084;
+/// Events: every other frame (`sample`, `keep` ...) a minute. Today 35 to 40 (spread 14%).
+const EVENTS_REST_FRAMES_PER_MIN: usize = 49;
+/// Events: those frames' wire bytes a minute. Today 10,165 to 10,807 (spread 6.3%).
+const EVENTS_REST_WIRE_PER_MIN: usize = 12_245;
 /// Ship: wire bytes per load, by key. Today the list 1,151 (one row; spread 2.0%), the opened row
 /// 5,740 (12 jobs; 2.3%). The compress track's; the ship track's to load them less (its loads a
 /// minute are held to what `resource.ts` allows, 128 for two keys, and were 87 to 111 today).
 const SHIP_WIRE_PER_LOAD: &[(&str, usize)] = &[("Ship list", 1_256), ("opened row", 6_274)];
-/// The pages' GETs, wire bytes. Today: agents list 6,364 (6 agents; spread 6.9%, what each is
+/// The pages' GETs, wire bytes. Today: agents list 6,374 (6 agents; spread 7.1%, what each is
 /// doing), runs 1,965 (4 runs), a run 2,960 (5 jobs), Ship rows 1,159 (1 row), a Ship row 6,552,
-/// runners 4,333 (2), overview 6,758 (0.4%); the rest no spread. The compress track's.
-const API_WIRE: &[(&str, usize)] = &[("agents list", 7_249), ("runs", 2_103), ("a run", 3_168), ("Ship rows", 1_241), ("Ship row", 7_011), ("runners", 4_638), ("overview", 7_258)];
+/// runners 4,334 (2), overview 6,761 (0.4%); the rest no spread. The compress track's.
+const API_WIRE: &[(&str, usize)] = &[("agents list", 7_271), ("runs", 2_103), ("a run", 3_168), ("Ship rows", 1_241), ("Ship row", 7_011), ("runners", 4_638), ("overview", 7_264)];
 
 /// A key of Ship's that the simulated tab keeps loaded: what it GETs, the events it reloads on, how
 /// often it polls (`ui/src/views/ship/index.tsx`, `jobs.tsx`), and what its loads came to.
