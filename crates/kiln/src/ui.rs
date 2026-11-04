@@ -3,12 +3,15 @@
 //! components come from the UI server (`crate::uiserver`); without it, every page gets the app's
 //! shell (`_shell.html`) and the app runs in the browser. Compressible files go out brotli-compressed
 //! (or gzipped, to a browser that doesn't take brotli), each compressed once and kept in memory:
-//! the embedded ones in the background as the server starts (`keep_assets`), so no request waits.
+//! the embedded ones in the background as the server starts (`warm`), so no request waits. Only this
+//! build's files are kept so, which bounds what they take (`crate::memory::UI_ASSETS`; goal 11, plan
+//! 01a1a87b2e56 step 3); an earlier build's goes as it is.
 //!
 //! Earlier builds' assets are kept on disk (`keep_assets`), so a page loaded before a deploy can
 //! still load the parts it hasn't yet. An asset no build has is a 404, never `index.html`: a
 //! browser handed HTML for a script fails in a way only a reload fixes.
 
+use std::borrow::Cow;
 use std::collections::HashMap;
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
@@ -92,6 +95,34 @@ fn br_cache() -> &'static Mutex<HashMap<String, Bytes>> {
     C.get_or_init(Default::default)
 }
 
+/// An embedded file's bytes: the binary's own where they're in it (a release build's), never copied for a
+/// request; read from disk where rust-embed reads them so (a debug build's).
+fn embedded(data: Cow<'static, [u8]>) -> Bytes {
+    match data {
+        Cow::Borrowed(b) => Bytes::from_static(b),
+        Cow::Owned(v) => Bytes::from(v),
+    }
+}
+
+/// `packed` kept for `name` in `cache`, counted as the UI's assets' memory (`crate::memory::UI_ASSETS`).
+fn keep(cache: &Mutex<HashMap<String, Bytes>>, name: &str, packed: &Bytes) {
+    let before = cache.lock().insert(name.to_owned(), packed.clone());
+    crate::memory::UI_ASSETS.add(packed.len());
+    if let Some(b) = before {
+        crate::memory::UI_ASSETS.sub(b.len());
+    }
+}
+
+/// The brotli window for `len` bytes, as bits: the smallest that holds the whole file, between brotli's
+/// least (10 bits) and the 22 bits (4 MiB) kiln took for every file before. A window past the file finds no
+/// match the file's own doesn't, and the encoder's memory at quality 11 grows with the window, eight bytes
+/// a place of it: 22 bits took 34 MB for each file, a 20 KB file's took 256 KB (goal 11, plan
+/// 01a1a87b2e56 step 3).
+fn window_bits(len: usize) -> u32 {
+    // A window of `bits` holds (1 << bits) - 16 bytes.
+    (10..22).find(|bits| (1usize << bits).saturating_sub(16) >= len).unwrap_or(22)
+}
+
 /// `data` brotli-compressed at the highest quality, once per file.
 fn brotli(name: &str, data: &[u8]) -> Option<Bytes> {
     if let Some(b) = br_cache().lock().get(name) {
@@ -99,22 +130,27 @@ fn brotli(name: &str, data: &[u8]) -> Option<Bytes> {
     }
     let mut out = Vec::with_capacity(data.len() / 3);
     {
-        let mut w = brotli::CompressorWriter::new(&mut out, 4096, 11, 22);
+        let mut w = brotli::CompressorWriter::new(&mut out, 4096, 11, window_bits(data.len()));
         w.write_all(data).ok()?;
         w.flush().ok()?;
     }
     let out = Bytes::from(out);
-    br_cache().lock().insert(name.to_owned(), out.clone());
+    keep(br_cache(), name, &out);
     Some(out)
 }
 
 /// `name` packed (brotli or gzip, by its cache), made already; else none now, and both made on the
 /// compute pool for the next request (once at a time for a file): CPU work, which held a place of the
-/// blocking pool's, meant for calls that block (goal 3, plan 01a1a59c2a8e step 4).
-fn packed(name: &str, data: &Bytes, cache: &'static Mutex<HashMap<String, Bytes>>) -> Option<(Bytes, &'static str)> {
+/// blocking pool's, meant for calls that block (goal 3, plan 01a1a59c2a8e step 4). Only this build's
+/// files (`ours`) are packed and kept: an earlier build's goes as it is, so what's kept is bounded by the
+/// build (goal 11, plan 01a1a87b2e56 step 3).
+fn packed(name: &str, data: &Bytes, cache: &'static Mutex<HashMap<String, Bytes>>, ours: bool) -> Option<(Bytes, &'static str)> {
     let coding = if std::ptr::eq(cache, br_cache()) { "br" } else { "gzip" };
     if let Some(b) = cache.lock().get(name) {
         return Some((b.clone(), coding));
+    }
+    if !ours {
+        return None;
     }
     static MAKING: OnceLock<Mutex<std::collections::HashSet<String>>> = OnceLock::new();
     let making = MAKING.get_or_init(Default::default);
@@ -145,20 +181,23 @@ fn accepts(header: Option<&str>, coding: &str) -> bool {
 
 /// Compresses every embedded file that's worth it, both ways, so no request has to wait for it: on the
 /// compute pool, a file at a time (goal 3, plan 01a1a59c2a8e step 4: CPU work, which held one of the
-/// blocking pool's places for as long as every file took, written out with the assets' files).
+/// blocking pool's places for as long as every file took, written out with the assets' files). What
+/// they take so is the bound of what the UI's files keep in memory (`crate::memory::UI_ASSETS`).
 pub async fn warm() {
     let names: Vec<String> = Assets::iter().map(|n| n.into_owned()).collect();
     let made = crate::rt::compute_map(names, |name| {
-        let Some(f) = Assets::get(&name) else { return };
+        let Some(f) = Assets::get(&name) else { return 0 };
         let mime = mime_guess::from_path(&name).first_or_octet_stream();
         if compressible(mime.as_ref()) && f.data.len() > 1024 {
-            let _ = brotli(&name, &f.data);
-            let _ = gzip(&name, &f.data);
+            brotli(&name, &f.data).map_or(0, |b| b.len()) + gzip(&name, &f.data).map_or(0, |b| b.len())
+        } else {
+            0
         }
     })
     .await;
-    if let Err(e) = made {
-        tracing::warn!(error = %format!("{e:#}"), "the UI's files weren't compressed ahead: each is as it's first asked for");
+    match made {
+        Ok(sizes) => crate::memory::UI_ASSETS.bound_at(sizes.iter().sum()),
+        Err(e) => tracing::warn!(error = %format!("{e:#}"), "the UI's files weren't compressed ahead: each is as it's first asked for"),
     }
 }
 
@@ -173,7 +212,7 @@ fn gzip(name: &str, data: &[u8]) -> Option<Bytes> {
     let mut enc = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::best());
     enc.write_all(data).ok()?;
     let out = Bytes::from(enc.finish().ok()?);
-    gz_cache().lock().insert(name.to_owned(), out.clone());
+    keep(gz_cache(), name, &out);
     Some(out)
 }
 
@@ -184,15 +223,15 @@ pub fn static_file(req: &Request) -> Option<Response> {
     if path.is_empty() || path.starts_with('_') {
         return None;
     }
-    let data = match Assets::get(path) {
-        Some(f) => Bytes::from(f.data.into_owned()),
+    let (data, ours) = match Assets::get(path) {
+        Some(f) => (embedded(f.data), true),
         None if path.starts_with("assets/") => match kept(path) {
-            Some(b) => Bytes::from(b),
+            Some(b) => (Bytes::from(b), false),
             None => return Some(srv::response(StatusCode::NOT_FOUND, "text/plain; charset=utf-8", srv::full("no such asset in any build kiln keeps\n"))),
         },
         None => return None,
     };
-    Some(respond(req, path, data))
+    Some(respond(req, path, data, ours))
 }
 
 /// One of the fonts the console reads in, for pages agents show (`crate::harness::visuals`):
@@ -204,18 +243,19 @@ pub fn font(name: &str) -> Option<Bytes> {
         _ => return None,
     };
     let file = Assets::iter().find(|n| n.starts_with(prefix) && n.ends_with(".woff2"))?;
-    Assets::get(&file).map(|f| Bytes::from(f.data.into_owned()))
+    Assets::get(&file).map(|f| embedded(f.data))
 }
 
 /// The app's shell (any page, rendered in the browser): for when the UI server isn't there.
 pub fn shell(req: &Request) -> Response {
     match Assets::get("_shell.html") {
-        Some(f) => respond(req, "_shell.html", Bytes::from(f.data.into_owned())),
+        Some(f) => respond(req, "_shell.html", embedded(f.data), true),
         None => srv::response(StatusCode::OK, "text/html; charset=utf-8", srv::full(PLACEHOLDER)),
     }
 }
 
-fn respond(req: &Request, name: &str, data: Bytes) -> Response {
+/// `data`, `name`'s, packed as the request takes it where it's worth it; `ours`: this build's file.
+fn respond(req: &Request, name: &str, data: Bytes, ours: bool) -> Response {
     let mime = mime_guess::from_path(name).first_or_octet_stream();
     let cache = if name.starts_with("assets/") { "public, max-age=31536000, immutable" } else { "no-cache" };
     let asked = srv::header_str(req, &header::ACCEPT_ENCODING);
@@ -224,9 +264,9 @@ fn respond(req: &Request, name: &str, data: Bytes) -> Response {
     // blocking pool for the requests after it (a large file at brotli's best takes seconds, and
     // this request's thread serves every socket on it, a restart's first pages most of all).
     let packed = if worth && accepts(asked, "br") {
-        packed(name, &data, br_cache())
+        packed(name, &data, br_cache(), ours)
     } else if worth && accepts(asked, "gzip") {
-        packed(name, &data, gz_cache())
+        packed(name, &data, gz_cache(), ours)
     } else {
         None
     };
@@ -268,5 +308,39 @@ mod tests {
         for bad in ["assets/", "assets/../kiln.db", "assets/a/b.js", "assets/.hidden", "assets/a%2Fb.js", "index.html", "assets/a b.js"] {
             assert_eq!(asset_file(bad), None, "{bad}");
         }
+    }
+
+    /// Goal 11, plan 01a1a87b2e56 step 3: brotli's window is the smallest that holds the file, never past the
+    /// 22 bits kiln took for every file, and a file packed in its own window comes back whole.
+    #[test]
+    fn g11_s3_brotlis_window_holds_the_file_and_no_more() {
+        assert_eq!(window_bits(0), 10);
+        assert_eq!(window_bits(1008), 10);
+        assert_eq!(window_bits(1009), 11);
+        assert_eq!(window_bits(20_000), 15);
+        assert_eq!(window_bits(510_000), 19);
+        assert_eq!(window_bits((1 << 22) - 16), 22);
+        assert_eq!(window_bits(64 << 20), 22);
+        let data: String = (0..40_000).map(|i| format!("line {i} of kiln's ui ")).collect();
+        assert_eq!(window_bits(data.len()), 20);
+        let packed = brotli("test-window", data.as_bytes()).unwrap_or_default();
+        let mut back = Vec::new();
+        let _ = brotli::BrotliDecompress(&mut packed.as_ref(), &mut back);
+        assert_eq!(back, data.as_bytes());
+    }
+
+    /// Goal 11, plan 01a1a87b2e56 step 3: only this build's files are kept packed (and counted), so what the
+    /// UI's files keep is bounded by the build; an earlier build's goes as it is.
+    #[test]
+    fn g11_s3_only_this_builds_files_are_kept_packed() {
+        let data = Bytes::from("an earlier build's script ".repeat(200));
+        assert!(packed("assets/earlier-g11test.js", &data, br_cache(), false).is_none());
+        assert!(packed("assets/earlier-g11test.js", &data, gz_cache(), false).is_none());
+        assert!(!br_cache().lock().contains_key("assets/earlier-g11test.js"));
+        assert!(!gz_cache().lock().contains_key("assets/earlier-g11test.js"));
+        let before = crate::memory::UI_ASSETS.bytes();
+        let made = gzip("assets/ours-g11test.js", data.as_ref()).map_or(0, |b| b.len());
+        assert!(made > 0);
+        assert!(crate::memory::UI_ASSETS.bytes() >= before + made);
     }
 }
