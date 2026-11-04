@@ -5,7 +5,7 @@
 # reported (ci/ui/page_bytes.mjs --since) and held to their budgets. ui/dist is the first build
 # (built here if it isn't there) and is put back as it was.
 #
-#   ci/ui/two_builds.sh            MAX_RENAMED (2)
+#   ci/ui/two_builds.sh            MAX_RENAMED (2), TWO_BUILDS_KEEP
 set -euo pipefail
 ROOT=$(git -C "$(dirname "$0")" rev-parse --show-toplevel)
 UI=$ROOT/ui
@@ -20,13 +20,15 @@ restore() {
 }
 trap restore EXIT
 build() { (builtin cd "$UI" && KILN_UI_SERVER=off npm run build >"$WORK/build.log" 2>&1) || { tail -40 "$WORK/build.log"; exit 1; }; }
-names() { (builtin cd "$1/client/assets" && ls | grep -v -E '\.(br|gz)$' | sort); }
+names() { (builtin cd "$1/client/assets" && ls | sort); }
 
 [ -f "$UI/dist/client/_shell.html" ] || build
 cp -a "$UI/dist" "$WORK/a"
 grep -q 'aria-label="Path"' "$VIEW" || { echo "two_builds: the line it changes isn't in $VIEW any more" >&2; exit 1; }
 sed -i.bak 's/aria-label="Path"/aria-label="Path here"/' "$VIEW" && rm -f "$VIEW.bak"
 build
+# TWO_BUILDS_KEEP=<dir>: the two builds kept there (a/, b/), for ci/ui/serve_check.sh.
+if [ -n "${TWO_BUILDS_KEEP:-}" ]; then rm -rf "$TWO_BUILDS_KEEP" && mkdir -p "$TWO_BUILDS_KEEP" && cp -a "$WORK/a" "$TWO_BUILDS_KEEP/a" && cp -a "$UI/dist" "$TWO_BUILDS_KEEP/b"; fi
 names "$WORK/a" >"$WORK/a.txt"
 names "$UI/dist" >"$WORK/b.txt"
 renamed=$(comm -13 "$WORK/a.txt" "$WORK/b.txt")
