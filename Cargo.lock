@@ -2245,6 +2245,7 @@ dependencies = [
  "bytes",
  "clap",
  "command-group",
+ "crc32fast",
  "crypto_secretbox",
  "event-listener",
  "filedescriptor",
