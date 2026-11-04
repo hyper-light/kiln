@@ -5602,7 +5602,7 @@ mod tests {
             // The copy: the session's first 150 events, as they went over the wire.
             for u in [Update::Open { info: Box::new(info.clone()), since: None }, Update::Events { events: timeline.iter().take(150).cloned().collect() }] {
                 for json in harness_frames("s", &u) {
-                    hub.harness.ingest(&hub, &there, "s", serde_json::from_str(&json)?);
+                    hub.harness.ingest(&hub, &there, "s", serde_json::from_str(&json)?).await;
                 }
             }
             let kept = hub.harness.kept_on("box");
@@ -5787,13 +5787,13 @@ mod tests {
             let hub = crate::hub::tests::scratch_hub().await?;
             let there = crate::harness::registry::Location::Machine("box".into());
             let info = crate::harness::session::Info { id: "s".into(), kind: "codex".into(), ..Default::default() };
-            hub.harness.ingest(&hub, &there, "s", Update::Open { info: Box::new(info.clone()), since: None });
+            hub.harness.ingest(&hub, &there, "s", Update::Open { info: Box::new(info.clone()), since: None }).await;
             let mut sent = SentChanges::default();
             sent.server(true);
-            let take = |frames: &[String]| -> anyhow::Result<()> {
+            let take = async |frames: &[String]| -> anyhow::Result<()> {
                 for f in frames {
                     anyhow::ensure!(f.len() <= HARNESS_FRAME, "a frame of {} bytes", f.len());
-                    hub.harness.ingest(&hub, &there, "s", serde_json::from_str(f)?);
+                    hub.harness.ingest(&hub, &there, "s", serde_json::from_str(f)?).await;
                 }
                 Ok(())
             };
@@ -5801,7 +5801,7 @@ mod tests {
             let mut files = long_changeset();
             let frames = sent.frames("s", &files, true);
             anyhow::ensure!(frames.len() > 1 && frames.first().is_some_and(|f| f.starts_with(r#"{"t":"changes""#)));
-            take(&frames)?;
+            take(&frames).await?;
             anyhow::ensure!(copy() == serde_json::to_value(&files)?, "the picture, whole, every diff kept");
             // The agent edits one file of 43: one small frame, that file.
             if let Some(f) = files.get_mut(20) {
@@ -5810,13 +5810,13 @@ mod tests {
             let frames = sent.frames("s", &files, false);
             let [edit] = frames.as_slice() else { anyhow::bail!("{} frames", frames.len()) };
             anyhow::ensure!(edit.starts_with(r#"{"t":"changes_patch""#) && edit.len() < 32 << 10, "{} bytes", edit.len());
-            take(&frames)?;
+            take(&frames).await?;
             anyhow::ensure!(copy() == serde_json::to_value(&files)?, "the edit taken in place");
             // It puts one back: that file's key alone.
             let back = files.remove(5);
             let frames = sent.frames("s", &files, false);
             anyhow::ensure!(frames == vec![serde_json::to_string(&Update::ChangesPatch { set: Vec::new(), gone: vec![back.key()] })?]);
-            take(&frames)?;
+            take(&frames).await?;
             anyhow::ensure!(copy() == serde_json::to_value(&files)?, "the file put back gone");
             anyhow::ensure!(sent.frames("s", &files, false).is_empty(), "nothing changed, nothing sent");
             // The copy starts over (an Open on the stream): every file again.

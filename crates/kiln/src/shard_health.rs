@@ -106,6 +106,7 @@ impl Shard {
         let last = self.last_ns.load(Ordering::Relaxed);
         Snapshot {
             probes: self.delay.count(),
+            late_sum: Duration::from_micros(self.delay.sum_us()),
             late: Duration::from_nanos(self.late_ns.load(Ordering::Relaxed)),
             most_late: Duration::from_nanos(self.most_late_ns.load(Ordering::Relaxed)),
             since_probe: (last > 0).then(|| Duration::from_nanos(nanos(base().elapsed()).saturating_sub(last))),
@@ -143,6 +144,9 @@ impl Slow {
 pub struct Snapshot {
     /// Probes noted.
     pub probes: u64,
+    /// How late they ran, added up: with `probes`, how late its ready work ran on average between
+    /// two reads (what headroom watches: docs/priority.md).
+    pub late_sum: Duration,
     /// How late the latest probe ran, and the most late of any.
     pub late: Duration,
     pub most_late: Duration,
@@ -213,7 +217,10 @@ async fn probe(i: usize, period: Duration) {
     loop {
         crate::rt::sleep_until(due).await;
         let now = Instant::now();
-        me.note(now.saturating_duration_since(due), now);
+        let late = now.saturating_duration_since(due);
+        me.note(late, now);
+        // What the shard sheds, from its delay (goal 6, plan 01a1a59c2abe step 4).
+        crate::overload::tick(i, late);
         // The next one a period from now: a shard that was held doesn't then run a burst of probes
         // to catch up, each noting the same hold again.
         due = now + period;

@@ -93,6 +93,11 @@ impl Histogram {
         self.count.load(Ordering::Relaxed)
     }
 
+    /// The observations' sum so far, in microseconds.
+    pub fn sum_us(&self) -> u64 {
+        self.sum_us.load(Ordering::Relaxed)
+    }
+
     /// Observations so far at or under each bound, in the bounds' order (cumulative, as rendered).
     pub fn cumulative(&self) -> Vec<(f64, u64)> {
         self.bounds.iter().zip(&self.buckets).map(|(b, c)| (*b, c.load(Ordering::Relaxed))).collect()
@@ -1200,6 +1205,7 @@ pub fn render() -> String {
     render_wire(&mut o);
     crate::shard_health::render(&mut o);
     crate::route_latency::render(&mut o);
+    crate::overload::render(&mut o);
     crate::pool_health::render(&mut o);
 
     let samples = agent_samples().read();

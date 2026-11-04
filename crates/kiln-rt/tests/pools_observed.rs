@@ -95,9 +95,15 @@ fn the_blocking_pool_tells_each_jobs_wait_and_run() {
     .unwrap();
     started.recv().unwrap();
     let mut second = blocking::run("held", || ()).unwrap();
+    // Goal 6, plan 01a1a59c2abe step 4: the one place taken and a job waiting for it, told before either ends.
+    assert_eq!(blocking::occupancy("held"), Some(blocking::Occupancy { places: 1, held: 2 }));
+    assert_eq!(blocking::occupancy("held").map(|o| o.waiting()), Some(1));
+    assert_eq!(blocking::occupancy("no such share"), None);
     std::thread::sleep(HOLD);
     release.send(()).unwrap();
     assert!(within(&mut first).is_some() && within(&mut second).is_some());
+    // Each job gives its place back before its result is sent: nothing held once both are in.
+    assert_eq!(blocking::occupancy("held").map(|o| (o.held, o.waiting())), Some((0, 0)));
     // Told as each job ends, before its result is sent: both are in by now.
     assert_eq!(HELD_JOBS.load(Ordering::Relaxed), 2);
     assert!(HELD_MOST_RAN_NS.load(Ordering::Relaxed) >= nanos(HOLD), "the held job ran at least as long as it was held");
@@ -120,9 +126,14 @@ fn the_compute_pool_tells_each_jobs_wait_and_each_piece() {
     .unwrap();
     started.recv().unwrap();
     let mut second = compute::run(|| ()).unwrap();
+    // Goal 6, plan 01a1a59c2abe step 4: the one thread taken and a job waiting for it, before the second's wait
+    // is told (as its first piece starts).
+    assert_eq!(compute::occupancy(), Some(blocking::Occupancy { places: 1, held: 2 }));
     std::thread::sleep(HOLD);
     release.send(()).unwrap();
     assert!(within(&mut first).is_some() && within(&mut second).is_some());
+    // Each job gives its place back before its result is sent.
+    assert_eq!(compute::occupancy().map(|o| (o.held, o.waiting())), Some((0, 0)), "nothing held once both are done");
     // Three pieces of one job: each is told.
     let pieces_before = PIECES.load(Ordering::Relaxed);
     let mut third = compute::run_pieces(0u32, |n, _turn| {

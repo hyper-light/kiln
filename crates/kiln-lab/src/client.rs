@@ -9,10 +9,11 @@ use std::time::Duration;
 /// means to see (a minute: `kiln_route_seconds`' last bucket), so a stall is measured, not cut.
 pub const PATIENCE: Duration = Duration::from_secs(90);
 
-/// An answer: its status and body.
+/// An answer: its status and body, and its `Retry-After` (whole seconds) where it has one.
 pub struct Answer {
     pub status: u16,
     pub body: Vec<u8>,
+    pub retry_after: Option<Duration>,
 }
 
 /// One HTTP/1.1 connection to the server, kept open between requests and opened again when the
@@ -73,6 +74,21 @@ impl Http {
         }
     }
 
+    /// [`Http::send`], asked again a second later while the server answers 503 (a kiln overloaded on purpose
+    /// shedding it: goal 6, `crate::overload`, whose answers ask a second at least), for up to [`PATIENCE`]: what
+    /// sets a round up must be answered, where the window's own requests are measured as they come, a shed one an
+    /// error.
+    pub fn send_settled(&mut self, method: &str, path: &str, body: Option<&[u8]>) -> anyhow::Result<Answer> {
+        let until = std::time::Instant::now() + PATIENCE;
+        loop {
+            let a = self.send(method, path, body)?;
+            if a.status != 503 || std::time::Instant::now() >= until {
+                return Ok(a);
+            }
+            std::thread::sleep(Duration::from_secs(1));
+        }
+    }
+
     fn once(&mut self, head: &str, body: Option<&[u8]>) -> anyhow::Result<Answer> {
         self.open()?;
         let Http { conn, buf, .. } = self;
@@ -81,11 +97,11 @@ impl Http {
         if let Some(b) = body {
             s.write_all(b).map_err(|_| Closed)?;
         }
-        let (status, close, body) = read_response(s, buf)?;
+        let (status, close, body, retry_after) = read_response(s, buf)?;
         if close {
             *conn = None;
         }
-        Ok(Answer { status, body })
+        Ok(Answer { status, body, retry_after })
     }
 }
 
@@ -114,8 +130,8 @@ fn find(hay: &[u8], needle: &[u8]) -> Option<usize> {
 }
 
 /// One response off `s` (what's left over stays in `buf`): its status, whether the server closes
-/// the connection after it, and its body (chunks joined).
-fn read_response(s: &mut TcpStream, buf: &mut Vec<u8>) -> anyhow::Result<(u16, bool, Vec<u8>)> {
+/// the connection after it, its body (chunks joined) and its `Retry-After` in whole seconds.
+fn read_response(s: &mut TcpStream, buf: &mut Vec<u8>) -> anyhow::Result<(u16, bool, Vec<u8>, Option<Duration>)> {
     let head_end = loop {
         if let Some(i) = find(buf, b"\r\n\r\n") {
             break i;
@@ -127,7 +143,7 @@ fn read_response(s: &mut TcpStream, buf: &mut Vec<u8>) -> anyhow::Result<(u16, b
     let head = String::from_utf8_lossy(buf.get(..head_end).unwrap_or_default()).into_owned();
     buf.drain(..head_end + 4);
     let status: u16 = head.split_whitespace().nth(1).and_then(|c| c.parse().ok()).ok_or_else(|| anyhow::anyhow!("no status in {head:?}"))?;
-    let mut length = None;
+    let (mut length, mut retry_after) = (None, None);
     let (mut chunked, mut close) = (false, false);
     for line in head.lines().skip(1) {
         let Some((k, v)) = line.split_once(':') else { continue };
@@ -136,6 +152,7 @@ fn read_response(s: &mut TcpStream, buf: &mut Vec<u8>) -> anyhow::Result<(u16, b
             "content-length" => length = v.parse::<usize>().ok(),
             "transfer-encoding" => chunked = v.contains("chunked"),
             "connection" => close = v.contains("close"),
+            "retry-after" => retry_after = v.parse::<u64>().ok().map(Duration::from_secs),
             _ => {}
         }
     }
@@ -174,7 +191,7 @@ fn read_response(s: &mut TcpStream, buf: &mut Vec<u8>) -> anyhow::Result<(u16, b
         close = true;
         std::mem::take(buf)
     };
-    Ok((status, close, body))
+    Ok((status, close, body, retry_after))
 }
 
 /// A WebSocket to the server (RFC 6455): frames out masked, as a client's are.

@@ -95,16 +95,31 @@ the same.
 ## headroom listens to the server
 
 Where the server runs on the runner's own machine (its address is loopback or one this machine
-binds), headroom adds a target of its own, `kiln server delay`: `GET /healthz/delay`, the server's
-own measure of how late its shards run ready work, from the probes behind `kiln_shard_delay_seconds`
-([runtime-lab.md](runtime-lab.md)): its worst shard's latest probe, or a hold under way past the
-probes' period; or how long the probe took where that's longer. A server without the route, or
-with its probes off, is no reading, never a breach. Its tolerance is the platform's (1 s) unless a
-person sets another, and it's detected as every target is ([headroom.md](headroom.md)): a shift of
-its delay from calm toward the tolerance cuts kiln's CPU and write budgets, and the pacer slows
-what runs. CI jobs' cgroups are paced now, as agents' sessions are, so the legs and agents beside
-the server are what's slowed first. A job a person paused is the pause's alone: the pacer neither
-stops it nor lets it go on.
+binds), headroom adds a target of its own, `kiln server delay`, read from `GET /healthz/delay`: the
+server's own figures from the probes behind `kiln_shard_delay_seconds`
+([runtime-lab.md](runtime-lab.md)), as JSON. `delay_s` is its worst shard's now, for a person;
+`late_s` and `probes` are every probe's lateness added up and how many ran; `held_s` is a hold under
+way past the probes' period; `period_s` is that period. A server without them (older), or with its
+probes off, is no reading, never a breach.
+
+- **What headroom reads:** how late the server's ready work ran on average since headroom last
+  looked, every probe of every shard counted (the change in `late_s` over the change in
+  `probes`). Not one probe of one shard at an instant: in the lab that missed nearly everything
+  between two reads. A shard held by one long request (opening a long conversation) counts once
+  its probe runs, its lateness in the total; the hold itself is the answer only when no probe ran
+  at all since the last look. In the lab such holds reached 10 to 38 ms calm, the server's own
+  work, which slowing kiln's can't shorten.
+- **Its tolerance:** the shards' own clock, their probes' period (10 ms, `KILN_SHARD_PROBE_MS`):
+  ready work a whole period late on average is a server behind its own work. A server probed at
+  another period is measured against its own.
+- **Its window:** trouble is caught within the platform's time (1 s), as every other target's is, so
+  its probes keep that pace, and a probe still out is harm only once it's out that long (what it
+  answers is what the server measured, not how long asking took).
+
+It's detected as every target is ([headroom.md](headroom.md)): a shift of the delay from calm toward
+the tolerance cuts kiln's CPU and write budgets, and the pacer slows what runs. CI jobs' cgroups are
+paced, as agents' sessions are, so the legs and agents beside the server are what's slowed first. A
+job a person paused is the pause's alone: the pacer neither stops it nor lets it go on.
 
 ## Cores of its own
 
@@ -198,6 +213,45 @@ What it says:
   within noise of the lab alone; only the live feed's p99.9 (1.19 s to 1.38) and attaches' tail (1.32
   s to 1.51) were worse.
 
+**Block 5: the same lab on current main.** Block 4 measured main before kiln's own runtime
+(`crates/kiln-rt`) and its compute pool. Block 5 is the same lab on main at `82ca3c74d03`, which has
+them: block 4's five configurations, four rounds each, on 2026-11-04 from 17:51 to 18:24 UTC. Other
+agents' kiln builds (and this goal's own, on every CPU) loaded the machine throughout: a load of 20
+to 54 before each window, CPU pressure 2% calm and 22-31% with legs. The rounds:
+`docs/priority/2026-11-04/b5-*.json`.
+
+| number | calm | even weights | kiln.slice's weight | and idle groups | and an idle unit |
+| --- | --- | --- | --- | --- | --- |
+| page p50 ms | 0.152 (0.127 to 0.178) | 0.594 (0.201 to 0.678) | 0.197 (0.156 to 0.567) | 0.966 (0.776 to 1.23) | 1.07 (0.939 to 1.19) |
+| page p99 ms | 0.303 (0.250 to 0.333) | 61.2 (3.02 to 84.6) | 2.34 (1.96 to 57.3) | 2.35 (2.10 to 2.47) | 11.4 (2.05 to 71.3) |
+| page p99.9 ms | 0.649 (0.309 to 1.21) | 142 (20.8 to 226) | 3.65 (2.52 to 137) | 4.30 (3.03 to 13.5) | 23.9 (2.90 to 122) |
+| api_read p50 ms | 0.417 (0.353 to 0.514) | 1.64 (1.56 to 1.75) | 1.82 (1.67 to 1.93) | 3.16 (2.53 to 3.80) | 3.15 (2.61 to 3.85) |
+| api_read p99 ms | 66.7 (56.7 to 100) | 158 (125 to 179) | 133 (103 to 176) | 238 (209 to 272) | 237 (201 to 273) |
+| api_read p99.9 ms | 678 (305 to 775) | 1074 (563 to 2608) | 811 (708 to 1066) | 1167 (944 to 4377) | 1053 (995 to 2192) |
+| api_write p50 ms | 0.931 (0.785 to 1.05) | 1.76 (1.57 to 2.24) | 1.89 (1.54 to 1.93) | 1.94 (1.93 to 1.99) | 1.94 (1.94 to 2.00) |
+| api_write p99 ms | 415 (97.5 to 536) | 701 (366 to 1248) | 591 (514 to 668) | 921 (795 to 3386) | 742 (697 to 879) |
+| websocket p50 ms | 0.693 (0.587 to 0.819) | 2.77 (2.55 to 3.18) | 2.68 (2.63 to 2.75) | 3.80 (3.30 to 4.40) | 3.77 (3.27 to 4.28) |
+| websocket p99 ms | 883 (812 to 1147) | 1294 (1141 to 1426) | 1097 (695 to 1309) | 1062 (1012 to 1140) | 1102 (978 to 1191) |
+| websocket p99.9 ms | 1191 (965 to 1564) | 1808 (1550 to 1982) | 1502 (1282 to 1757) | 1347 (1218 to 1388) | 1327 (1261 to 1411) |
+| attach p50 ms | 1075 (965 to 1188) | 1350 (1232 to 1552) | 1398 (1222 to 1449) | 1312 (1102 to 1466) | 1270 (1174 to 1360) |
+| server: api_read took p99 ms | 46.6 (45.7 to 56.8) | 95.7 (87.0 to 186) | 89.5 (63.3 to 96.8) | 204 (197 to 221) | 204 (165 to 220) |
+| server: websocket waited p99 ms | 873 (805 to 1485) | 1664 (1513 to 1935) | 1299 (752 to 1839) | 1287 (995 to 1644) | 1309 (966 to 1638) |
+| shards' delay p99 ms | 0.748 (0.618 to 0.911) | 3.33 (2.10 to 4.72) | 2.76 (1.77 to 3.55) | 2.60 (2.29 to 3.06) | 2.33 (2.27 to 3.55) |
+| shards' delay p99.9 ms | 23.9 (14.1 to 26.8) | 23.5 (21.9 to 29.7) | 24.5 (18.9 to 28.2) | 10.5 (2.49 to 23.4) | 11.8 (2.50 to 22.1) |
+
+On current main:
+
+- **Idle stays turned down.** Against kiln.slice's weight, idle groups were worse in 11 numbers and
+  better in 2 (pages 0.197 ms at the median against 0.966, API reads 133 ms at p99 against 238,
+  writes 591 against 921, the server's own API reads 89.5 ms against 204), and an idle unit worse in
+  9 and better in none.
+- **kiln.slice's weight and even weights didn't differ beyond noise** in any of the 43 numbers (block
+  4: 8 better). Both left the machine's CPUs as contended (22-23% CPU pressure).
+- **Against calm, kiln.slice's weight was worse in 17 numbers, better in none,** API reads' p99
+  among them (66.7 ms to 133) and pages' (0.303 ms to 2.34), with every median (API reads 0.417 ms to
+  1.82, the live feed 0.693 to 2.68) and the shards' delay (0.748 ms to 2.76 at p99). The live
+  feed's and API writes' p99s stayed within noise.
+
 Step 7 asked for the API's p99 with CPU hogs held within noise of calm, legs and agents at idle
 priority. Idle, it wasn't: against calm, API reads' p99 (126 ms to 186) and the live feed's (0.90 s
 to 1.09) were worse beyond noise. With what lands, kiln.slice's weight and legs at the least weight,
@@ -205,7 +259,75 @@ the p99s of pages, API reads and writes and the live feed were within noise of c
 weren't (API reads 0.366 ms to 1.49, the live feed 0.638 to 2.54), nor the shards' delay (0.955 ms
 to 3.41 at p99), and calm's own page tail was wide on this busy machine: in quieter blocks pages
 took 0.33 to 0.46 ms at p99 calm, against 2 ms with legs. Cores of its own held pages and the API
-whole.
+whole. On current main (block 5), with a quieter calm, weights didn't hold the API's p99 either:
+API reads' and pages' p99s were worse beyond noise (66.7 ms to 133, 0.303 to 2.34), only the live
+feed's and writes' held. So weights put the server first, but only cores of its own (block 3, not run
+again) kept the API whole; headroom ("headroom's lab", below) is what slows the legs when the
+server's delay rises toward harm.
+
+### headroom's lab (step 5)
+
+`scripts/priority_lab/headroom.sh` runs one long round of the `realistic` profile on fedora's CPUs
+0-15 (other agents' labs held 16-31), the lab's unit standing in for `kiln.slice` at
+`CPUWeight=1000`. Beside it, a runner of the same build with headroom on, its settings' defaults
+(`escapes` off), in a delegated scope of its own at 100. Its legs and agents are CPU hogs it started:
+CI jobs of a pipeline run by hand (`legs.yaml`, four jobs of four busy loops) and agents' turns of
+the lab's stand-in (`lab:hog:<threads>:<secs>`), each in a cgroup of its own that headroom paces.
+`hogs.sh` starts and raises them, moves the server's process into the runner's cgroup (`join`), and
+turns headroom off and on. `record.py` notes `/healthz/delay` four times a second, the shards'
+histogram, headroom's status as the server has it, and each group's freezer and CPU. `timeline.py`
+reads that back. Other agents' kiln builds loaded fedora throughout (a load of 15 to 80), and it
+reset three times (16:48, 18:45 and 18:58 UTC); the lab's raw recordings stay in its folder on that
+machine, not here.
+
+**What main (`82ca3c74d03`) did.** Research 01a1a59c2b2a, f44 to f47:
+
+- **Weights held the server.** With 16, then 32 hog threads at kiln.slice's weight, the server's
+  delay rose in its body, not toward harm: `/healthz/delay`'s median from 0.21 ms to 0.3-0.8, the
+  shards' p99 from 0.5-0.9 ms to 2-5, the shards' mean over 2 s from 0.23 ms to 0.31-0.85. At even
+  weights, with 48 more threads, the same. headroom's delay target never moved: its CUSUM stayed at
+  0.
+- **Sharing the server's cgroup, they didn't, and headroom didn't see it.** With 96 hog threads in
+  the server's own cgroup (as a server's own runner holds its agents where the server isn't a
+  delegated unit), its shards ran ready work 40 to 100 times later than calm for four minutes
+  (median 8 to 28 ms, the shards' p99 25 to 97 ms, their mean over 2 s 2.8 ms). The delay target
+  never alarmed: its CUSUM peaked at 6.5 against a threshold of 12.2, while its calm rose with the
+  hogs from 1.3 ms to 4.6.
+- **It caught harm, not trouble.** It alarmed only when probes took a second: a machine-wide stall
+  under the other agents' compiles (the shards' probes every 2 s fell from about 775 to 347), where
+  headroom cut kiln's CPU from 10.9 cores to 5.5 and froze its 16 groups 50-75% of the time. That
+  stall wasn't kiln's, and slowing kiln didn't end it.
+
+Why: it read one probe of the worst shard at an instant, which calm's own spikes (30 to 223 ms at
+most in each 30 s, from other load and long requests) dwarf and which misses everything between two
+reads; and against the platform's 1 s, the CUSUM counts a reading only past about 40 ms (half way
+from calm to 1 s, in its logarithm). Below that every reading pulled the CUSUM down and joined calm.
+What headroom reads now ("headroom listens to the server", above) is every probe of every shard
+between two reads, against the shards' 10 ms period: calm's mean stayed within 0.21-0.44 ms over 2 s,
+kiln.slice's weight's 0.31-0.85, and the shared cgroup's reached 2.8 (4.5 at p90).
+
+**With the fix (`e4219270345`, server and runner).** Research 01a1a59c2b2a, f50 and f51:
+
+- **Where the weights hold the server, it holds still.** With 32 hog threads at kiln.slice's
+  weight, the server's mean delay between reads stayed at 0.23-0.27 ms (calm 0.22), and the target's
+  CUSUM at 0 (18:35 to 18:39 UTC). Its one cut came from the runner-disk target (a slow fsync), and
+  was raised back within seconds, as on main.
+- **Where they don't, it slows the legs before harm.** With the server sharing the runner's cgroup,
+  32 hog threads raised the mean to 0.5-0.8 ms (calm 0.2-0.3), short of trouble. 64 more raised it to
+  4.6 ms, and 23 s after they started headroom alarmed on the server's delay ("typical 0.4 ms, now
+  4.6 ms (CUSUM 1.49 past 1.17)") and cut kiln's CPU from 15.3 cores to 7.6, pacing the legs and
+  agents (18:52:39 UTC). On main the same load went four minutes with no alarm.
+
+What the lab couldn't show is the delay coming back down with the legs paced: within a minute of that
+cut, other agents' work restarting after a reset took fedora from 57 GB available to 1 GB (a load of
+280), every reading stalled, and the lab was stopped so as not to add to it. Twice before, fedora
+had reset under the same pressure (16:48 and 18:45 UTC), and once more after (18:58). In run 5, the
+same machine-wide stall came minutes after the server joined the runner's cgroup: headroom cut
+kiln's CPU to nothing and froze its groups 94-100% of the time, and the readings stayed at seconds,
+since the stall wasn't kiln's. The engine's test with the lab's numbers
+(`headroom::tests::g8_s5_the_servers_delay_rising_slows_legs_and_agents`) shows the rest: the cut
+paces the leg and the agent alike, and the delay back down clears the alarm, the cut held until the
+level holds.
 
 ## Needs root, or a person
 
@@ -235,10 +357,18 @@ whole.
   `g8_s4_the_server_runs_above_normal` (Windows): an agent's job's priority class and CPU rate
   control read back, cmd and its child below normal, the first process's memory and I/O priority;
   a person's job without a priority class; the server above normal.
-- `api::tests::g8_s5_the_delay_is_the_worst_shards_now`: the server's answer, its worst shard's.
-- `headroom::probes::tests::g8_s5_a_servers_delay_is_what_it_says_its_shards_wait` and
-  kiln-ci's `headroom::tests::g8_s5_the_servers_delay_rising_slows_legs_and_agents`: the probe reads
-  the delay a server says; the engine, the delay rising from calm, cuts kiln's CPU and paces a leg
-  and an agent alike, then sees it back to calm.
+- `api::tests::g8_s5_the_delay_is_the_worst_shards_now`: the server's answer, its worst shard's
+  now, its probes' lateness added up and counted, the hold and the period.
+- `headroom::probes::tests::g8_s5_a_servers_delay_is_how_late_its_work_ran_since_the_last_read`: the
+  probe answers with the mean since its last read, or the hold, and gives no answer from a first
+  read or a server without the figures.
+- kiln-ci's `headroom::tests::g8_s5_the_servers_delay_rising_slows_legs_and_agents`, with the lab's
+  numbers: calm near 0.43 ms with a stall every two minutes, then legs and agents raising it to
+  1.9 to 4.5 ms: the engine alarms within seconds, cuts kiln's CPU, paces a leg and an agent alike,
+  sees it back to calm, and probes at the window's pace, not the tolerance's.
+  `g8_s5_a_windowed_targets_probe_out_past_its_tolerance_is_no_harm_until_its_window`: a rise the
+  weights held (1.4 to 1.8 times calm) is no trouble, and a probe out is harm only at the window.
+- kiln-lab's `standin::tests::g8_s5_a_hog_turn_burns_for_its_time_and_no_longer`: the stand-in's CPU
+  hog turn, the lab's agents.
 - `rt::tests::g8_s6_shards_are_fixed_to_cores_of_the_servers_own` and
   `os::tests::g8_s6_a_cpu_list_reads_as_linux_writes_one`: cores of the server's own.

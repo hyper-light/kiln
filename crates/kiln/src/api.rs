@@ -154,6 +154,11 @@ pub struct Api {
 
 impl srv::Handler for Api {
     async fn handle(self: Arc<Self>, req: Request) -> Response {
+        // A shard behind its calm answers what it sheds at once, before the body is read (goal 6, plan
+        // 01a1a59c2abe step 4).
+        if let Some(shed) = crate::overload::shed_request(&req) {
+            return shed;
+        }
         let hub = self.hub.clone();
         // How long it waited before this handler started, from its head's arrival off its socket,
         // and how long it then took, by its class (goal 1, plan 01a1a59c2a68 step 2).
@@ -5910,7 +5915,10 @@ fn harness_ws(hub: Arc<Hub>, id: String, req: Request) -> R {
 /// Send a viewer a snapshot: its frames then `synced`, a message each; or, `packed`, all of it in
 /// one gzip'd binary message, a frame a line (frames are JSON, whose strings escape their line
 /// breaks). Written out on the blocking pool: a long session's is megabytes of JSON, and the
-/// runtime's threads serve every socket (`crate::harness::registry::Snapshot`).
+/// runtime's threads serve every socket (`crate::harness::registry::Snapshot`). Not on the compute
+/// pool, below the shards: there a snapshot took 2.4 times as long with a busy process beside the
+/// server for each of its CPUs, and the frames its viewer waits on with it 4.7 times (goal 4's lab,
+/// plan 01a1a59c2a9c step 5).
 async fn send_snapshot(tx: &mut ws::Sender, snapshot: crate::harness::registry::Snapshot, packed: bool) -> anyhow::Result<()> {
     if packed {
         let bytes = crate::rt::blocking(move || snapshot.packed(&synced())).await??;
@@ -6229,7 +6237,7 @@ async fn harness_attach(hub: Arc<Hub>, id: String, socket: ws::WebSocket, takes:
             let began = Instant::now();
             // What it missed since what it has (it begins with "resumed"), or all of it when the copy
             // can't tell (it begins with "open"); and the feed from where that is.
-            let Some((snapshot, from, now, rev)) = hub.harness.frames_since(&id, have) else {
+            let Some((snapshot, from, now, rev)) = hub.harness.frames_since(&id, &viewer, have) else {
                 tx.send(closed()).await?;
                 return Ok(());
             };
@@ -6283,6 +6291,12 @@ fn metrics_handler(hub: &Hub, headers: &HeaderMap) -> Response {
 }
 
 async fn readyz(hub: &Hub) -> Response {
+    // Overload (goal 6, step 4): not ready while every shard sheds the API; else ready, saying what is shed.
+    let overload = crate::overload::readiness();
+    if let Some((true, why)) = &overload {
+        return srv::text(StatusCode::SERVICE_UNAVAILABLE, why);
+    }
+    let note = overload.map(|(_, why)| format!(" ({why})")).unwrap_or_default();
     // Observe's store, open but replaying its log after a start, answers part of what it holds:
     // not ready until it has applied it all (seconds). A store that didn't open doesn't hold the
     // server back: the rest of kiln answers without it.
@@ -6294,23 +6308,42 @@ async fn readyz(hub: &Hub) -> Response {
         return srv::text(StatusCode::SERVICE_UNAVAILABLE, &format!("observe's store is replaying its log ({} of {} entries applied)", v.applied, v.replay_to));
     }
     match hub.store.call(|c| Ok(c.query_row("SELECT 1", [], |r| r.get::<_, i64>(0))?)).await {
-        Ok(_) => srv::text(StatusCode::OK, "ready"),
+        Ok(_) => srv::text(StatusCode::OK, &format!("ready{note}")),
         Err(e) => srv::text(StatusCode::SERVICE_UNAVAILABLE, &format!("store: {e:#}")),
     }
 }
 
-/// `/healthz/delay`: how late this server's shards run ready work now, in seconds: the target
-/// headroom probes on a runner beside it (docs/priority.md; goal 8, plan 01a1a59c2b29 step 5). From
-/// the shards' own figures (`crate::shard_health`): no shard is asked. Open, as `/healthz` is; 503
-/// where the shards aren't probed (`KILN_SHARD_PROBE_MS=0`) or haven't been yet.
+/// `/healthz/delay`: how late this server's shards run ready work, from the shards' own figures
+/// (`crate::shard_health`; no shard is asked), the target headroom probes on a runner beside it
+/// (docs/priority.md; goal 8, plan 01a1a59c2b29 step 5). JSON, every time in seconds:
+/// - `delay_s`: the worst shard's now ([`worst_delay`]), for a person to read;
+/// - `late_s` and `probes`: every probe's lateness added up, and how many probes ran, all shards
+///   together and since the server started, so a reader's two reads say how late ready work ran on
+///   average between them, every probe counted;
+/// - `held_s`: how long past its period a shard held now has gone without a probe (a hold shows
+///   there before any probe can say how late it ran);
+/// - `period_s`: the probes' period.
+///
+/// Open, as `/healthz` is; 503 where the shards aren't probed (`KILN_SHARD_PROBE_MS=0`) or haven't
+/// been yet.
 fn shard_delay() -> Response {
     let Some(period) = crate::shard_health::period_from_env() else {
         return srv::text(StatusCode::SERVICE_UNAVAILABLE, "this server doesn't probe its shards (KILN_SHARD_PROBE_MS=0)");
     };
-    match worst_delay(crate::shard_health::shards().iter().map(crate::shard_health::Shard::snapshot), period) {
-        Some(d) => srv::text(StatusCode::OK, &format!("{:.6}", d.as_secs_f64())),
+    let shards: Vec<crate::shard_health::Snapshot> = crate::shard_health::shards().iter().map(crate::shard_health::Shard::snapshot).collect();
+    match delay_answer(&shards, period) {
+        Some(v) => srv::json(StatusCode::OK, &v),
         None => srv::text(StatusCode::SERVICE_UNAVAILABLE, "this server's shards haven't been probed yet"),
     }
+}
+
+/// [`shard_delay`]'s answer from the shards' figures, once any shard has been probed.
+fn delay_answer(shards: &[crate::shard_health::Snapshot], period: Duration) -> Option<serde_json::Value> {
+    let worst = worst_delay(shards.iter().copied(), period)?;
+    let late: Duration = shards.iter().map(|s| s.late_sum).sum();
+    let probes: u64 = shards.iter().map(|s| s.probes).sum();
+    let held = shards.iter().filter_map(|s| s.since_probe).map(|d| d.saturating_sub(period)).max().unwrap_or_default();
+    Some(json!({ "delay_s": worst.as_secs_f64(), "late_s": late.as_secs_f64(), "probes": probes, "held_s": held.as_secs_f64(), "period_s": period.as_secs_f64() }))
 }
 
 /// The worst of the shards' delay now: each one's latest probe, how late it ran, or, for a shard held
@@ -6376,6 +6409,7 @@ mod tests {
         let period = Duration::from_millis(10);
         let shard = |probes: u64, late_us: u64, since_ms: Option<u64>| crate::shard_health::Snapshot {
             probes,
+            late_sum: Duration::from_micros(late_us * probes),
             late: Duration::from_micros(late_us),
             most_late: Duration::from_micros(late_us),
             since_probe: since_ms.map(Duration::from_millis),
@@ -6389,6 +6423,15 @@ mod tests {
         // Held now: 1.5 s since its probe, past its 10 ms period.
         assert_eq!(worst_delay([shard(9, 80, Some(4)), shard(9, 100, Some(1_500))].into_iter(), period), Some(Duration::from_millis(1_490)));
         assert_eq!(worst_delay([shard(0, 0, None)].into_iter(), period), None);
+        // The answer: that, and what a reader works out how late ready work ran from between two reads
+        // (every probe's lateness added up, and how many), the hold, and the period.
+        let v = delay_answer(&[shard(9, 80, Some(4)), shard(3, 2_000, Some(1_500))], period).unwrap_or_default();
+        let s = |k: &str| v.get(k).and_then(serde_json::Value::as_f64).unwrap_or(-1.0);
+        assert!((s("delay_s") - 1.49).abs() < 1e-9, "{v}");
+        assert!((s("late_s") - (9.0 * 80e-6 + 3.0 * 2e-3)).abs() < 1e-9, "{v}");
+        assert_eq!(v.get("probes").and_then(serde_json::Value::as_u64), Some(12), "{v}");
+        assert!((s("held_s") - 1.49).abs() < 1e-9 && (s("period_s") - 0.01).abs() < 1e-12, "{v}");
+        assert_eq!(delay_answer(&[shard(0, 0, None)], period), None);
     }
 
     /// P2: a learner's copy streams whole though the next copy, made once this one is handed over,
@@ -6447,11 +6490,11 @@ mod tests {
             let hub = crate::hub::tests::scratch_hub().await?;
             let there = crate::harness::registry::Location::Machine("box".into());
             let info = crate::harness::session::Info { id: "s".into(), kind: "claude".into(), ..crate::harness::session::Info::default() };
-            hub.harness.ingest(&hub, &there, "s", Update::Open { info: Box::new(info), since: None });
-            hub.harness.ingest(&hub, &there, "s", Update::State { state: Box::new(State::default()) });
+            hub.harness.ingest(&hub, &there, "s", Update::Open { info: Box::new(info), since: None }).await;
+            hub.harness.ingest(&hub, &there, "s", Update::State { state: Box::new(State::default()) }).await;
             let long = format!("{}\nsecond line", "word ".repeat(4000));
             let said = |n: u64, text: &str| Event { id: format!("e{n}"), seq: n, at: 1, parent: None, by: None, body: Body::Assistant { text: text.into(), streaming: false } };
-            hub.harness.ingest(&hub, &there, "s", Update::Events { events: vec![said(1, &long), said(2, "short")] });
+            hub.harness.ingest(&hub, &there, "s", Update::Events { events: vec![said(1, &long), said(2, "short")] }).await;
             let att = hub.harness.attach("s").ok_or_else(|| anyhow::anyhow!("no session"))?;
             let frames = att.frames();
             let packed = att.snapshot.packed(&synced())?;
