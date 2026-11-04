@@ -6207,7 +6207,7 @@ async fn harness_attach(hub: Arc<Hub>, id: String, socket: ws::WebSocket, takes:
             let began = Instant::now();
             // What it missed since what it has (it begins with "resumed"), or all of it when the copy
             // can't tell (it begins with "open"); and the feed from where that is.
-            let Some((snapshot, from, now, rev)) = hub.harness.frames_since(&id, have) else {
+            let Some((snapshot, from, now, rev)) = hub.harness.frames_since(&id, &viewer, have) else {
                 tx.send(closed()).await?;
                 return Ok(());
             };
@@ -6381,11 +6381,11 @@ mod tests {
             let hub = crate::hub::tests::scratch_hub().await?;
             let there = crate::harness::registry::Location::Machine("box".into());
             let info = crate::harness::session::Info { id: "s".into(), kind: "claude".into(), ..crate::harness::session::Info::default() };
-            hub.harness.ingest(&hub, &there, "s", Update::Open { info: Box::new(info), since: None });
-            hub.harness.ingest(&hub, &there, "s", Update::State { state: Box::new(State::default()) });
+            hub.harness.ingest(&hub, &there, "s", Update::Open { info: Box::new(info), since: None }).await;
+            hub.harness.ingest(&hub, &there, "s", Update::State { state: Box::new(State::default()) }).await;
             let long = format!("{}\nsecond line", "word ".repeat(4000));
             let said = |n: u64, text: &str| Event { id: format!("e{n}"), seq: n, at: 1, parent: None, by: None, body: Body::Assistant { text: text.into(), streaming: false } };
-            hub.harness.ingest(&hub, &there, "s", Update::Events { events: vec![said(1, &long), said(2, "short")] });
+            hub.harness.ingest(&hub, &there, "s", Update::Events { events: vec![said(1, &long), said(2, "short")] }).await;
             let att = hub.harness.attach("s").ok_or_else(|| anyhow::anyhow!("no session"))?;
             let frames = att.frames();
             let packed = att.snapshot.packed(&synced())?;

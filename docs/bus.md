@@ -13,12 +13,21 @@ come next, on the persisted class (CP-T2.2).
 What the server learns of a session, from the machine it runs on, goes to every viewer watching it
 on any device (`crate::harness::live`):
 
-- **A topic for each session's mirror.** The server's view of a session (`crate::harness::registry`)
-  has a feed: a topic of its own, `sessions/<id>/<n>` (`<n>` the feed's number in this process, so a
-  mirror made again never shares a topic it could delete; an id outside a topic name's alphabet is
-  its SHA-256 in its place), keeping its last 2048 frames. It's made with the mirror, and let go
-  whenever nobody watches: the first frame after its last viewer leaves deletes it, and the next
-  viewer makes it again, so a session nobody watches holds none of the bus's memory.
+- **A topic for each session's copy.** The server's copy of a session (`crate::harness::copies`)
+  has a feed: a topic of its own for each generation of it, `sessions/<id>/<n>.<g>` (`<n>` the
+  feed's number in this process, so a copy made again never shares a topic it could delete; `<g>`
+  its generation; an id outside a topic name's alphabet, or too long for the name, is its SHA-256
+  in its place), keeping its last 2048 frames. The first viewer makes it, and it's let go whenever
+  nobody watches: the first frame after its last viewer leaves deletes it and starts the next
+  generation, whose topic the next viewer makes, so a session nobody watches holds none of the
+  bus's memory and no viewer ever reads a topic that was let go.
+- **One shard owns each copy.** A session's copy belongs to the shard its id hashes to: only that
+  shard's owner changes it, taking runners' updates and people's commands as messages, in order,
+  from a bounded inbox (as many as the hub's queue of runner events; a sender it has no room for
+  waits, never dropping one, and never holding its own shard). After each change the owner
+  publishes the copy as an immutable view, swapped in whole: viewers, snapshots, catch-ups and
+  every read of a session load it without a lock and never wait on the owner. No lock guards a
+  session's copy (goal 4, plan 01a1a59c2a9c; plan 01a17197 step 9).
 - **Frames go out only while someone watches,** as before: the JSON a viewer's page reads (`open`,
   `meta`, `state`, `state_patch`, `events`, `stream`, `changes`, `changes_patch`, `files`,
   `closed`). A state goes whole and as what changed in it, and each viewer takes the form it asked
@@ -30,12 +39,16 @@ on any device (`crate::harness::live`):
   is made one time, however many viewers take it.
 - **No frame missed or seen twice.** A viewer (`GET /api/harness/sessions/:id/ws`) is sent a
   snapshot, or only what changed since the revision it says it has (`?after=`, docs/wire.md,
-  "Revisions"), and reads the feed from the offset that was taken at: both are taken under the
-  mirrors' lock, which every publish takes too. The lock holds only while the parts are taken (all
-  of them by reference); the frames are written after it's let go, on the blocking pool (gzip'd
-  there too, for a page that asks `?z=gzip`), so a viewer starting over never holds up another
-  session's frames, nor the sockets on the runtime's thread it came on. Each frame on the feed
-  carries the copy's revision, and one a catch-up already held is skipped.
+  "Revisions"), and reads the feed from the offset taken just before the view it was made of. It
+  joins without asking the copy's owner: counted among the viewers first, then the feed's end, then
+  the view. The owner publishes each view, then asks whether anyone watches, and sends the change's
+  frame only then: of the two, one sees the other (a Dekker handshake on the viewers' count and the
+  view, both sequentially consistent), so every change is in a viewer's view or in a frame past
+  where it reads from. The frames of a snapshot are written by whoever asked for it, on the blocking
+  pool (gzip'd there too, for a page that asks `?z=gzip`), so a viewer starting over never holds up
+  the copy's owner, another session's frames, or the sockets on the runtime's thread it came on.
+  Each frame on the feed carries the copy's revision, and one a snapshot or catch-up already held
+  is skipped.
 - **A viewer that falls behind catches up, alone.** One further behind than the feed keeps is
   refused `Behind` by the bus (its typed lag notice), and it catches up from the last revision it
   was sent: only what changed since (`resumed`), or the session whole (`open`) when the copy can't

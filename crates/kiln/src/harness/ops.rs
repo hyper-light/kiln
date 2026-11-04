@@ -1606,11 +1606,11 @@ mod end_to_end {
             let kids: Vec<String> = (0..3).map(|_| crate::util::new_id()).collect();
             for (n, k) in kids.iter().enumerate() {
                 let info = Info { id: k.clone(), kind: "claude".into(), name: format!("Helper {}", n + 1), parent: Some(p.clone()), status: Status::Running, ..Info::default() };
-                hub.harness.ingest(&hub, &there, k, Update::Open { info: Box::new(info), since: None });
+                hub.harness.ingest(&hub, &there, k, Update::Open { info: Box::new(info), since: None }).await;
             }
-            let report = |k: &str, status: Status, said: String, at: i64| {
+            let report = async |k: &str, status: Status, said: String, at: i64| {
                 let state = State { status, summary: said, last_turn: (at > 0).then(|| TurnEnd { at, how: "done".into(), ..TurnEnd::default() }), ..State::default() };
-                hub.harness.ingest(&hub, &there, k, Update::State { state: Box::new(state) });
+                hub.harness.ingest(&hub, &there, k, Update::State { state: Box::new(state) }).await;
             };
             let queue = || hub.harness.queue(&p);
             let news = || queue().into_iter().filter(|q| q.text.contains("which you started")).collect::<Vec<_>>();
@@ -1623,12 +1623,12 @@ mod end_to_end {
             for round in 0..6 {
                 // Each helper goes to work and ends a turn, and stands so a while.
                 for k in &kids {
-                    report(k, Status::Running, String::new(), 0);
+                    report(k, Status::Running, String::new(), 0).await;
                 }
                 now += 1_000;
                 crate::harness::told::tick(&hub, &hub.harness.list(), now, &[], &[]).await;
                 for (n, k) in kids.iter().enumerate() {
-                    report(k, Status::Idle, format!("Helper {} finished round {round}.", n + 1), now + i64::try_from(n).unwrap_or(0));
+                    report(k, Status::Idle, format!("Helper {} finished round {round}.", n + 1), now + i64::try_from(n).unwrap_or(0)).await;
                 }
                 now += 1_000;
                 crate::harness::told::tick(&hub, &hub.harness.list(), now, &[], &[]).await;
@@ -1666,7 +1666,7 @@ mod end_to_end {
             until(|| queue().iter().filter(|q| crate::harness::queued::sender_of(&q.id).is_some()).count() == 2, "the fellow agents' messages, waiting").await?;
             // The third helper goes back to work; it waits for it, and the wait returns at once with its mail.
             if let Some(k) = kids.get(2) {
-                report(k, Status::Running, String::new(), 0);
+                report(k, Status::Running, String::new(), 0).await;
             }
             // (A wait that says not to, as a program's in code mode does, hands nothing over.)
             let program = call(me.clone(), "agents.wait", json!({"agent": kids.get(2), "timeout_s": 1, "hand_over": false})).await.map_err(|(s, m)| anyhow::anyhow!("{s} {m}"))?;

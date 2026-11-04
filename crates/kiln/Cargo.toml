@@ -104,6 +104,9 @@ http = "1.5.0"
 http-body = "1.1.0"
 http-body-util = "0.1.5"
 async-channel = "2.5.0"
+# What each agent session's owner shard publishes for its readers, swapped in whole and loaded
+# without a lock (`harness::copies`); already in the tree through turso_core.
+arc-swap = "1.9.3"
 async-broadcast = "0.7.2"
 event-listener = "5.4.2"
 webpki-roots = "1.0.9"
