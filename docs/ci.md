@@ -4605,7 +4605,7 @@ enforcement points to W18, agent isolation to W20.
 - *Left.*
   - Firecracker's own jailer where the runner is root (kiln's jail needs no root, and confines as
     it does but for its cgroups' limits: a leg's VMM joins a cgroup of its own made beforehand, at
-    idle priority, docs/priority.md).
+    a leg's weight, docs/priority.md).
   - The `shards` executor (R06) and its pool kind.
   - R11's other parts: checking Agentfiles by shards' own parser (its `agentfile` crate isn't
     one kiln can build against yet), kiln's shipped definitions beyond the runner image, and

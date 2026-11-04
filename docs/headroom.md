@@ -72,8 +72,8 @@ A runner a test or a person started paces its own sessions and jobs only. Units 
 the desktop starts for a person (`app-…`, `dbus-…`, `xdg-…`) and kiln's guards
 (`kiln-headroom-guard-…`) are never paced, and neither is anything someone else froze: a cgroup
 already frozen when headroom would stop it is left as it is, and never thawed by headroom. Legs
-and agents also run at idle priority where the machine lets kiln say so
-([priority.md](priority.md)): the scheduler gives way to everything else before the pacer has to.
+and agents also run below the server where the machine lets kiln say so
+([priority.md](priority.md)): the scheduler puts the server first before the pacer has to.
 
 On macOS and Windows a group is each agent session's processes as kiln holds them (followed fork
 by fork on macOS, its job object on Windows), metered process by process (CPU time, bytes

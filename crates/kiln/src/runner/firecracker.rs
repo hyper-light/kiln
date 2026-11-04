@@ -147,8 +147,8 @@ pub fn boot(m: &Machine, dir: &Path, socks: &Socks, drives: &[Drive<'_>], mode: 
 }
 
 /// Whose a microVM's VMM is, for its priority (docs/priority.md; goal 8, plan 01a1a59c2b29 step 2):
-/// a leg's (a pool's, a template's, an image's builder: CI's work) runs at idle priority, as a leg
-/// on the host does; a deployment's runs as the service it is.
+/// a leg's (a pool's, a template's, an image's builder: CI's work) runs at the least CPU weight, as
+/// a leg on the host does; a deployment's runs as the service it is.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Whose {
     Leg,
@@ -156,7 +156,7 @@ enum Whose {
 }
 
 /// A leg's VMM's cgroup (docs/priority.md): one of its own beside the jobs' (`kiln-jobs-<pid>/vm-…`),
-/// at a leg's idle priority, made before the VMM starts and joined as it starts, jailed or not.
+/// at a leg's weight, made before the VMM starts and joined as it starts, jailed or not.
 /// kiln's jail stands in for Firecracker's jailer here (that one needs root), and this is how the
 /// jailer places a VMM given a parent cgroup and no settings under cgroup v2 (docs/jailer.md:
 /// "configure a cgroup beforehand ... and move the process to the configured cgroup").

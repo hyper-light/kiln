@@ -121,7 +121,7 @@ async fn executors() -> BTreeMap<String, Executor> {
         }
     }
     let rootless = crate::rt::blocking(super::docker::rootless_engine).await.unwrap_or(false);
-    let priority = format!("the least CPU weight: --cpu-shares {} (cpu.weight 1); Docker has no cpu.idle", super::docker::LEG_CPU_SHARES);
+    let priority = format!("the least CPU weight: --cpu-shares {} (cpu.weight 1)", super::docker::LEG_CPU_SHARES);
     let details = [("engine".to_owned(), engine.to_owned()), ("rootless".to_owned(), rootless.to_string()), ("priority".to_owned(), priority)].into();
     out.insert("docker".to_owned(), Executor { version, details });
     out

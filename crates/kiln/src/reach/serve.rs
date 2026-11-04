@@ -402,8 +402,8 @@ pub fn start(spec: RunSpec, cwd: PathBuf, shell_state: Option<PathBuf>, extra_en
         }
         // A group of its own where this machine holds processes together (`crate::os::contain`):
         // what it leaves running ends with it, however that's parented (a daemon, `setsid`). An
-        // agent's run is the agent's work, at idle priority as the agent is; a person's runs as
-        // they'd run it (docs/priority.md).
+        // agent's run is the agent's work, at the agent's priority; a person's runs as they'd run
+        // it (docs/priority.md).
         let name = format!("{}{}", crate::os::RUN_GROUP, uuid::Uuid::now_v7().simple());
         let agents = spec.env.iter().any(|(k, _)| k == super::keeper::AGENT_ENV);
         let group = if agents { crate::os::contain::Group::of(&name) } else { crate::os::contain::Group::of_person(&name) };

@@ -140,8 +140,8 @@ pub fn of(job: &str) -> Option<Arc<Job>> {
 
 /// Makes step `cmd` of job `job` join the job's cgroup before it runs anything (Linux; elsewhere
 /// nothing: its process group is stopped instead, [`Job::group`]). It runs at a leg's priority
-/// (docs/priority.md): its cgroup's idle one on Linux, under background policy on macOS, below
-/// normal in its step's job on Windows (`crate::os::contain::Tree`).
+/// (docs/priority.md): its cgroup's least CPU weight on Linux, under background policy on macOS,
+/// below normal in its step's job on Windows (`crate::os::contain::Tree`).
 pub fn enter(job: &str, cmd: &mut std::process::Command) {
     #[cfg(target_os = "macos")]
     crate::os::contain::background(cmd);

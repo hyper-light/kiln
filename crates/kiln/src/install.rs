@@ -642,8 +642,8 @@ fn systemd_version() -> Option<u32> {
 
 /// The systemd service that runs `i`: `exec` with `env`, restarted when its supervisor exits.
 /// Each is delegated to kiln (docs/priority.md; goal 8, plan 01a1a59c2b29 step 2), so its runner
-/// can share the CPU among the legs and agents it starts, each at idle priority in a cgroup of
-/// its own, with kiln's own processes in the unit's leaf (`DelegateSubgroup=`, on a systemd that
+/// can share the CPU among the legs and agents it starts, each in a cgroup of its own at the least
+/// CPU weight, with kiln's own processes in the unit's leaf (`DelegateSubgroup=`, on a systemd that
 /// has it). A server's goes in `kiln.slice` ([`kiln_slice`]) with the slice's weights, and, when it
 /// has cores of its own system-wide (`partition`), makes them a cpuset partition as it starts.
 fn systemd_unit(i: &Install<'_>, env: &str, exec: &str, systemd: Option<u32>, partition: bool) -> String {
@@ -666,7 +666,7 @@ fn systemd_unit(i: &Install<'_>, env: &str, exec: &str, systemd: Option<u32>, pa
          [Service]\nType=simple\n{env}ExecStart={exec}\n\
          # kiln supervises and restarts its own server; this only covers the supervisor itself.\n\
          Restart=always\nRestartSec=5\nKillMode=mixed\nTimeoutStopSec=30\nLimitNOFILE=1048576\n\
-         # The legs and agents it starts run at idle priority, each in a cgroup of its own under it (docs/priority.md).\n\
+         # The legs and agents it starts run each in a cgroup of its own under it, below kiln's own processes (docs/priority.md).\n\
          Delegate=yes\n{subgroup}{server}\n\
          [Install]\nWantedBy={target}\n"
     )

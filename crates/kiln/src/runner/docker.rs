@@ -1063,7 +1063,7 @@ pub fn proxy_env<'a>(services: impl Iterator<Item = &'a str>) -> Vec<(String, St
 }
 
 /// What a leg's containers are given of the CPU (docs/priority.md; goal 8, plan 01a1a59c2b29 step
-/// 2): Docker's API has no `cpu.idle`, so the least weight it gives a container stands in for it,
+/// 2): the least weight Docker gives a container, as a leg's group on the host has,
 /// `--cpu-shares 2`, `cpu.weight` 1 on cgroup v2 (runc's and crun's conversion). A leg's own
 /// `options:` come after it, and so win.
 pub const LEG_CPU_SHARES: u32 = 2;
