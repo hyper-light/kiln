@@ -1024,16 +1024,13 @@ impl Semaphore {
     }
 
     /// A permit if one is free and nobody waits for one.
-    // `fetch_update` is deprecated from Rust 1.99, renamed `try_update`: kept as upstream calls it, so the
-    // code builds on hyper-raft's toolchain (1.98.1) as on kiln's stable (ORIGIN.md, "What differs").
-    #[allow(deprecated)]
     pub fn try_acquire(&self) -> Option<Permit<'_>> {
         let cell = self.cell.cell()?;
         if cell.aux.load(Ordering::Acquire) != 0 {
             return None;
         }
         cell.state
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |free| {
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |free| {
                 free.checked_sub(1)
             })
             .ok()
@@ -1096,9 +1093,6 @@ pub struct Acquire<'a> {
 impl<'a> Future for Acquire<'a> {
     type Output = Result<Permit<'a>, SyncError<()>>;
 
-    // `fetch_update` is deprecated from Rust 1.99, renamed `try_update`: kept as upstream calls it, so the
-    // code builds on hyper-raft's toolchain (1.98.1) as on kiln's stable (ORIGIN.md, "What differs").
-    #[allow(deprecated)]
     fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         let Some(word) = polling_task(cx.waker()) else {
             return Poll::Ready(Err(SyncError::NotOnShardThread(())));
@@ -1139,7 +1133,7 @@ impl<'a> Future for Acquire<'a> {
         if let Some(cell) = semaphore.cell.cell()
             && cell
                 .state
-                .fetch_update(Ordering::AcqRel, Ordering::Acquire, |free| {
+                .try_update(Ordering::AcqRel, Ordering::Acquire, |free| {
                     free.checked_sub(1)
                 })
                 .is_ok()

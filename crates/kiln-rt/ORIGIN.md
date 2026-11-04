@@ -26,20 +26,21 @@ touching the copy Focal, Mantle and Quiver share.
 - A crate that takes it by path can't be patched, and two path packages named `hyper-rt` 0.1.0 can't
   share a lock file, so kiln's recorded changes point those paths here: hyper-raft's `hyper-block` and
   `hyper-rt-transport` (`vendor/patches/hyper-raft/0002-*`) and Mantle's crates
-  (`vendor/patches/mantle/0003-*`); `bench/http` and `bench/kilndb` patch the name here too.
+  (`vendor/patches/mantle/0003-*`), each marked `Kiln-only:`, as no product's tree holds this crate
+  (`docs/vendoring.md`, "Taken as kiln's own"); `bench/http` and `bench/kilndb` patch the name here too.
 - `cargo tree -i hyper-rt` shows one `hyper-rt`, from `crates/kiln-rt`. `vendor/hyper-raft/crates/hyper-rt`
   stays upstream's, which no crate kiln builds takes: the base a diff against upstream starts from.
 
 ## What differs from upstream
 
-Behavior: nothing. `src/`, `tests/` and `benches/` are upstream's but for the two attributes below;
+Behavior: nothing. `src/`, `tests/` and `benches/` are upstream's but for the two calls below;
 `diff -r vendor/hyper-raft/crates/hyper-rt crates/kiln-rt` shows each row.
 
 | File | Change | Why |
 |---|---|---|
 | `Cargo.toml` | hyper-raft's workspace values written out as inheriting them gave (version 0.1.0, edition 2024, rust-version 1.98.1, each dependency's version and features, the lint table); license and repository from kiln's workspace; `hyper-measure` by name, which kiln's `[patch.crates-io]` points at `vendor/hyper-raft/crates/hyper-measure` | a member of kiln's workspace inherits kiln's values: version 0.2.0, kiln's lint table, no `cfg(loom)` among the expected cfgs |
 | `clippy.toml` | new: hyper-raft's root `clippy.toml`, less raft-proto's accessors and the no-`Arc` entry, with parking_lot's locks refused | clippy reads the `clippy.toml` nearest a crate's manifest, and hyper-raft's root isn't in kiln; the lockless rule below |
-| `src/sync/mod.rs` | `Semaphore::try_acquire` and `Acquire::poll` under `#[allow(deprecated)]`, their `fetch_update` calls as upstream has them | Rust 1.99 deprecates `fetch_update` (renamed `try_update`), and kiln's clippy runs `-D warnings` on stable (1.99.1); upstream pins 1.98.1. Calling it under its new name would change no behavior but would leave 1.98.1, Mantle's toolchain |
+| `src/sync/mod.rs` | `Semaphore::try_acquire` and `Acquire::poll` call `AtomicU64::try_update` where upstream calls `fetch_update` | Rust 1.99 deprecates `fetch_update`, renamed `try_update`, and kiln's clippy runs `-D warnings` on stable (1.99.1); upstream pins 1.98.1, which has both names (Mantle builds kiln-rt on it). The same function under its new name: no behavior changes. Upstream's to take when it moves past 1.98 |
 | `ORIGIN.md` | this file, upstream's below | |
 
 ## The rules
