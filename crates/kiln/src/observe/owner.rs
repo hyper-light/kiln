@@ -322,7 +322,7 @@ pub struct Observe {
     /// Whether the open replica has applied what its log held as it opened.
     replayed: Arc<AtomicBool>,
     view: Arc<Mutex<View>>,
-    out: async_channel::Receiver<Out>,
+    out: async_channel::Receiver<Box<Out>>,
     snaps: PathBuf,
     key: Option<String>,
     feed: Arc<Feed>,
@@ -340,6 +340,8 @@ impl Observe {
         // The node's receivers begin now (`super::otlp::keys`).
         let _ = super::otlp::keys();
         let (tx, rx) = std::sync::mpsc::channel();
+        // Each message boxed: the queue makes all its places as it's made, and a message in place took 320
+        // bytes, 5.2 MB for the queue's 16,384 though it's all but empty (goal 11, plan 01a1a87b2e56 step 3).
         let (out_tx, out_rx) = async_channel::bounded(16_384);
         let store = Arc::new(Mutex::new(None));
         // Its role said from the start: a status asked before the group opens says what it is.
@@ -370,7 +372,7 @@ impl Observe {
     }
 
     /// What to send, as it comes.
-    pub fn outgoing(&self) -> async_channel::Receiver<Out> {
+    pub fn outgoing(&self) -> async_channel::Receiver<Box<Out>> {
         self.out.clone()
     }
 
@@ -873,7 +875,7 @@ struct Owner {
     /// they were last counted.
     dir_bytes: u64,
     sized: Option<Instant>,
-    out: async_channel::Sender<Out>,
+    out: async_channel::Sender<Box<Out>>,
     wakeup: Arc<Wakeup>,
     waker: Waker,
     input: Sender<Input>,
@@ -944,7 +946,7 @@ fn now_ns(start: Instant) -> u64 {
 
 impl Owner {
     #[allow(clippy::too_many_arguments)]
-    fn new(settings: Settings, store: Arc<Mutex<Option<Shared>>>, replayed: Arc<AtomicBool>, view: Arc<Mutex<View>>, out: async_channel::Sender<Out>, input: Sender<Input>, admission: Arc<Admission>, feed: Arc<Feed>, touched: Option<(Arc<Touched>, Arc<Touched>)>) -> Self {
+    fn new(settings: Settings, store: Arc<Mutex<Option<Shared>>>, replayed: Arc<AtomicBool>, view: Arc<Mutex<View>>, out: async_channel::Sender<Box<Out>>, input: Sender<Input>, admission: Arc<Admission>, feed: Arc<Feed>, touched: Option<(Arc<Touched>, Arc<Touched>)>) -> Self {
         let wakeup = Arc::new(Wakeup { tx: input.clone(), pending: AtomicBool::new(false) });
         let waker = Waker::from(wakeup.clone());
         let mut o = Self {
@@ -1675,7 +1677,7 @@ impl Owner {
     // ------------------------------------------------------------------------------ both
 
     fn send(&self, machine: &str, msg: Msg, bytes: Vec<u8>) {
-        let _ = self.out.try_send(Out { machine: machine.to_owned(), msg, bytes });
+        let _ = self.out.try_send(Box::new(Out { machine: machine.to_owned(), msg, bytes }));
     }
 
     /// A profiler's upload sent on to the server (kept here, on the server): one the server is not
