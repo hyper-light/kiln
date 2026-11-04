@@ -381,6 +381,72 @@ B alone at the old sizes (4, 2, 8), four rounds calm and four with 16 hogs, from
 - **The server's RSS is 16% higher** (977 to 1132 MB calm, 989 to 1149 with hogs): goal 3's, not the
   share sizes' (26 against 8 places: 1146 against 1130 MB).
 
+## Goal 5: no lock on the hot path
+
+Goal 5 of the API runtime program (plan `01a1a59c2aae`, research `01a1a59c2aaf77dfa0fe35f461a3d75f`):
+no request, websocket or runner path takes a lock two shards share, since a shard the OS preempts while
+it holds one stalls every shard that needs it (research f2), and spinning before parking doesn't change
+that (f5, f6).
+
+### Counting the locks the lab's load takes
+
+`scripts/locks.py` counts them. `census-tree` copies the tree and routes kiln's, kiln-http's and Quiver's
+`parking_lot` and `std` locks through `scripts/locks/census.rs`, whose wrappers count each acquisition at
+its call site (`#[track_caller]`), whether it found the lock held and how long it then waited, and the
+first few addresses of the locks taken there; it counts the store's calls at their callers too
+(`store_call`), with how long each took. Built in release, that kiln says it all on `/metrics`
+(`kiln_lock_*`), which kiln-lab keeps for each round's window and fill (`Round::locks`, apart from the
+numbers an A/B compares), and `rank` ranks the locks (the sites that took one lock, by its address,
+together) by how often the window took each:
+
+```sh
+python3 scripts/locks.py census-tree --to ~/.cache/census --ui ui/dist
+(cd ~/.cache/census && CARGO_PROFILE_RELEASE_LTO=off cargo build --release -p kiln -p kiln-lab --bin kiln --bin kiln-lab)
+taskset -c 16-31 ~/.cache/census/target/release/kiln-lab run --kiln ~/.cache/census/target/release/kiln --label census --rounds 3 --out census
+python3 scripts/locks.py rank census/run.json
+```
+
+### What each became
+
+- **The store** (`crate::store`). Its one connection behind a lock took every statement in turn: the
+  lab's API reads waited 82 ms at p99 there, its writes 441 ms (goal 3, above). Now what may write goes
+  as a message to the one connection that writes, owned by a thread of its own (`kiln-store`), which
+  runs the calls in turn (SQLite takes one writer at a time); and what only reads (`Store::read`) takes a
+  read-only connection of its own on the blocking pool's `store` share, from a lock-free queue of those
+  not in use, in one read transaction, so reads run side by side, with each other and with the writer
+  (WAL), and see every write committed before them. The API's reads on the lab's paths (the runners,
+  the overview, runs, plans, goals, sign-in and access checks) and the store's own read methods read so.
+  The share's places are goal 3's Little's-law measure of the store's calls (24); the writer's waits and
+  runs are `kiln_blocking_*{share="store_write"}`.
+- **Read-mostly state** is an immutable copy swapped in whole (`crate::rcu::Rcu`, on arc-swap; f7, f9):
+  readers take the current copy without waiting on anyone, a writer copies, changes and swaps it in (a
+  compare-and-swap, tried again on a race). The hub's runner processes' links, the runners' labels and
+  samples, the terminals' outputs, the AI sessions each machine reported, the refusals of what the wires
+  couldn't read, the pods it launches and the tokens they enroll with, paused jobs, cancels, declines,
+  lost processes, tool fixes and repositories asked to be polled; the metrics' labelled families (their
+  series' values atomics); the UI's compressed files; Ship's model (its repositories' rows shared between
+  copies); the logs' live jobs.
+- **Questions put to runners** waiting for their answers (`crate::rcu::Pending`): each in a take-once
+  cell of its own, the cells' map an `Rcu`, so an answer and its asker's giving up take it at most once.
+- **The runners' commands** (`crate::wire::commands::Owner`): one task owns their state machine and takes
+  every change and question as a message, in order; a sync path's command (`Hub::command_soon`) is queued
+  in its turn and its answer comes on its one wait.
+
+### Keeping them out
+
+`python3 scripts/locks.py check` fails when a Mutex, RwLock or Condvar appears in the modules
+`scripts/locks/hot.toml` names (the HTTP server and the API, sign-in, the hub, the runners' link and
+processes, the websockets' feeds, the bus, the logs, Ship, the store) outside a test build's code, but
+those the file lists, each with why it's off the hot path, or (`todo`) what replaces it. Both CIs run it
+(`.kiln/ci.yaml`'s `locks` job, `.github/workflows/ci.yml`'s), with `scripts/test_locks.py`, which plants
+a lock in a copy of the hub and holds the check to failing on it.
+
+Still on the hot path, listed so (`todo`): the hub's runners (`agents`) and runner processes
+(`instances`), which `harness/registry.rs` takes too and wait on goal 4's rewrite of it; reach's relay
+(`reach`), each relayed frame's in the hub's loop; and a live job's files (`logs.rs`'s `files`), one per
+job, its writers' alone. Inside Quiver (vendored, the bus's node): its topics' map and each topic's tail,
+for Quiver's own change.
+
 ## What the lab doesn't do yet
 
 - **CI.** A lab kiln has no repositories, so its "CI pages" are the run lists and overview, empty;
