@@ -13,7 +13,7 @@ repository.workspace = true
 oracle = ["hyper-transport/oracle"]
 
 [dependencies]
-hyper-rt = { path = "../hyper-rt" }
+hyper-rt = { path = "../../../../crates/kiln-rt" }
 hyper-transport = { path = "../hyper-transport" }
 hyper-datagram = { path = "../hyper-datagram" }
 
