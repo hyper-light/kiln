@@ -141,11 +141,15 @@ pub struct Detector {
     /// outlasts it under an alarm with kiln working may have been ended by kiln, so isn't noise.
     #[serde(skip)]
     pub lag_us: Option<f64>,
+    /// Its target's window ([`super::Target::window_us`], the engine's to set): a probe out this
+    /// long is harm, and how long one has been out says nothing of its answer.
+    #[serde(skip)]
+    pub window_us: Option<f64>,
 }
 
 impl Detector {
     pub fn new(tolerance_us: f64, now_us: u64) -> Self {
-        Self { tolerance_us, regime_since_us: now_us, last_us: now_us, n: 0, sum: 0.0, up: Side::default(), down: Side::default(), alarm: None, lag_us: None }
+        Self { tolerance_us, regime_since_us: now_us, last_us: now_us, n: 0, sum: 0.0, up: Side::default(), down: Side::default(), alarm: None, lag_us: None, window_us: None }
     }
 
     /// The calm mean of log-latency, once there's a sample.
@@ -206,16 +210,20 @@ impl Detector {
         *self = Detector::new(tolerance, now_us);
     }
 
-    /// A probe still out after `age_us`: harm once it's out as long as the tolerance.
+    /// A probe still out after `age_us`: harm once it's out as long as the tolerance (or the window,
+    /// for a target that has one).
     pub fn inflight(&mut self, now_us: u64, age_us: f64, quiet: bool, budget_per_day: f64) -> Event {
         self.last_us = self.last_us.max(now_us);
-        if age_us >= self.tolerance_us && self.alarm.is_none() {
+        let (limit, of) = self.window_us.map_or((self.tolerance_us, "tolerance"), |w| (w, "window"));
+        if age_us >= limit && self.alarm.is_none() {
             self.alarm = Some(Alarm { since_us: now_us, harm: true, quiet });
-            return Event::Alarm(format!("a probe has been out {:.0} ms, its tolerance {:.0} ms", age_us / 1e3, self.tolerance_us / 1e3));
+            return Event::Alarm(format!("a probe has been out {:.0} ms, its {of} {:.0} ms", age_us / 1e3, limit / 1e3));
         }
         // Out this long, it answers at least this slow: were that its answer, would the CUSUM cross
-        // the threshold? Then trouble is already here (nothing is recorded until it answers).
+        // the threshold? Then trouble is already here (nothing is recorded until it answers). Not
+        // for a target with a window: its answer is what it measured, not how long it took.
         if self.alarm.is_none()
+            && self.window_us.is_none()
             && let (Some(mean), Some(k)) = (self.mean(), self.reference())
             && k > 0.0
         {

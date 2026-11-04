@@ -33,9 +33,12 @@ harmed. A target that declares none takes the platform's default, Kubernetes' 1 
 - `tcp`: connect to `host:port`.
 
 kiln adds its own unless `automatic` is off: a sync in the runner's data folder, the health of the
-server the runner reports to, and, where that server runs on this machine, how late its shards run
-ready work (`kiln server delay`, [priority.md](priority.md)). Each target is probed on a thread of
-its own, at an interval the engine derives; a probe still out counts while it hangs.
+server the runner reports to, and, where that server runs on this machine, how late its shards ran
+ready work on average since the last look (`kiln server delay`, [priority.md](priority.md)): its
+tolerance is the shards' own probe period, and, as it answers with a level it measured rather than
+with how long the probe took, its window (how soon trouble must be caught) is the platform's 1 s.
+Each target is probed on a thread of its own, at an interval the engine derives; a probe still out
+counts while it hangs.
 
 **Detection.** A CUSUM on each target's log-latency against its calm, looking for a shift toward
 its tolerance, calibrated on the machine's own record against the false-alarm budget. A sample at
@@ -150,9 +153,9 @@ decides.
 | A target's calm latency | the exact mean of its log-latency in the current regime |
 | CUSUM's reference | half the distance from the calm mean to the tolerance (the shift that matters) |
 | The alarm threshold | the higher of: the (allowed + 1)-th largest harmless excursion recorded, where allowed = budget x days recorded; and the height the record's own exponential tail (count and sum of its excursions, CUSUM's near-exponential excursions per Siegmund) puts at the budget's rate |
-| Harm | a sample, or a probe still out, at the tolerance |
+| Harm | a sample at the tolerance, or a probe still out at the window (the tolerance, but for a target that answers with a level it measured: the server's delay's is the platform's 1 s) |
 | A new regime | a fall below the calm the lower CUSUM detects with the same calibration |
-| The probe interval | (tolerance - longest measured lag) / (expected samples to alarm + 1), leaving the lag out once it reaches the tolerance (no probe rate wins that time back); never under the probe's own measured cost / load share, for a disk as for a server |
+| The probe interval | (window - longest measured lag) / (expected samples to alarm + 1), leaving the lag out once it reaches the window (no probe rate wins that time back); never under the probe's own measured cost / load share, for a disk as for a server |
 | The write and CPU budgets | each, for kiln's own work: bisection between the highest level held calm and the lowest level trouble began at; doubling while there is no unsafe level; halving the gap is the only step. Trouble cuts both (either may be the cause) unless the disks are delivering all they were measured to take, when only writes are cut; each is raised on its own where it limits (what runs wants more, or work waiting would take it past) |
 | A level held | the mean kiln's work used over the hold (its integral over time), not its peak: a burst a buffer took isn't a rate the machine sustains |
 | A bound tried | once the bisection's gap is finer than the pacer applies (a share is whole percent: what's wanted / 100), the bound itself; held calm there, it was wrong and the next bound up (any higher level trouble began at) takes its place |

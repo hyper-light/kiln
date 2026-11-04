@@ -10,6 +10,9 @@
 //! - `lab:prefill:<n>`: `n` events as fast as the runner takes them (a session that has run for
 //!   days, before the lab measures);
 //! - `lab:turn:<n>:<ms>`: `n` events, `ms` apart (an agent at work while people watch);
+//! - `lab:hog:<threads>:<secs>`: `threads` threads busy on the CPU for `secs` seconds, an event a
+//!   second meanwhile (an agent's build or test run beside the server: goal 8's headroom lab,
+//!   docs/priority.md);
 //! - anything else: a short turn.
 //!
 //! Every event carries `@lab:<µs since the epoch>` from when it was written, so a viewer can tell how
@@ -17,7 +20,7 @@
 
 use std::io::BufRead as _;
 use std::sync::mpsc;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use serde_json::{Value, json};
 
@@ -137,8 +140,34 @@ fn plan(text: &str) -> (u64, Duration) {
     match (it.next(), it.next(), it.next()) {
         (Some("prefill"), Some(n), _) => (n.parse().unwrap_or(0), Duration::ZERO),
         (Some("turn"), Some(n), Some(ms)) => (n.parse().unwrap_or(0), Duration::from_millis(ms.parse().unwrap_or(0))),
+        // Its events come as it burns ([`hog_plan`]).
+        (Some("hog"), _, _) => (0, Duration::ZERO),
         _ => (5, Duration::from_millis(100)),
     }
+}
+
+/// A hog turn's words (`lab:hog:<threads>:<secs>`): how many threads, and for how long.
+fn hog_plan(text: &str) -> Option<(u64, Duration)> {
+    let mut it = text.split_whitespace().find_map(|w| w.strip_prefix("lab:hog:"))?.split(':');
+    Some((it.next()?.parse().ok()?, Duration::from_secs(it.next()?.parse().ok()?)))
+}
+
+/// `threads` threads busy on the CPU until `until`, as the lab's own hogs are (`crate::lab::hog`).
+fn burn(threads: u64, until: Instant) -> Vec<std::thread::JoinHandle<()>> {
+    (0..threads)
+        .filter_map(|_| {
+            std::thread::Builder::new()
+                .spawn(move || {
+                    let mut x = 0u64;
+                    while Instant::now() < until {
+                        for _ in 0..100_000 {
+                            x = std::hint::black_box(x.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1));
+                        }
+                    }
+                })
+                .ok()
+        })
+        .collect()
 }
 
 /// The words of a user message as stream-json sends it (a string, or text blocks).
@@ -219,6 +248,23 @@ pub fn main(args: &[String]) -> anyhow::Result<()> {
             say(json!({"type": "command_lifecycle", "command_uuid": c, "state": "started", "uuid": format!("{short}-{turn}-s"), "session_id": session}), false)?;
         }
         say(json!({"type": "system", "subtype": "init", "cwd": std::env::current_dir().map(|d| d.display().to_string()).unwrap_or_default(), "session_id": session, "tools": [], "mcp_servers": [], "model": "claude-opus-5-5", "permissionMode": "default", "claude_code_version": VERSION}), true)?;
+        // A hog turn: its threads busy until the clock says it's over (time its group is stopped
+        // counts), an event a second meanwhile.
+        if let Some((threads, secs)) = hog_plan(&text_of(&m)) {
+            let until = Instant::now() + secs;
+            let burners = burn(threads, until);
+            let mut k = 0;
+            while Instant::now() < until {
+                for l in event(&mut r, &short, turn, k) {
+                    say(l, true)?;
+                }
+                k += 1;
+                std::thread::sleep(Duration::from_secs(1).min(until.saturating_duration_since(Instant::now())));
+            }
+            for b in burners {
+                let _ = b.join();
+            }
+        }
         for k in 0..n {
             let lines = event(&mut r, &short, turn, k);
             let paced = !every.is_zero();
@@ -236,4 +282,25 @@ pub fn main(args: &[String]) -> anyhow::Result<()> {
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Goal 8 (plan 01a1a59c2b29 step 5): a hog turn is read from its words, and burns the CPU only
+    /// until its time is up.
+    #[test]
+    fn g8_s5_a_hog_turn_burns_for_its_time_and_no_longer() {
+        assert_eq!(hog_plan("lab:hog:4:30"), Some((4, Duration::from_secs(30))));
+        assert_eq!(hog_plan("please lab:hog:2:1 now"), Some((2, Duration::from_secs(1))));
+        assert_eq!(hog_plan("lab:turn:40:25"), None);
+        assert_eq!(hog_plan("lab:hog:x:1"), None);
+        assert_eq!(plan("lab:hog:4:30"), (0, Duration::ZERO));
+        let t = Instant::now();
+        for b in burn(2, t + Duration::from_millis(50)) {
+            let _ = b.join();
+        }
+        assert!(t.elapsed() < Duration::from_secs(5), "burned {:?}", t.elapsed());
+    }
 }

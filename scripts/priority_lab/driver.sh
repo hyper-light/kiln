@@ -16,6 +16,9 @@ D=$(cd "$(dirname "$0")" && pwd)
 ROUNDS=${ROUNDS:-4} N=${N:-16} CPUS=${CPUS:-16-31} CONFIGS=${CONFIGS:-calm normal weight idle idle-unit}
 RUNS=${RUNS:-runs}
 mkdir -p "$D/$RUNS"
+# Temporary files under the lab's own folder, never a shared /tmp (a RAM disk on kiln's machines).
+export TMPDIR=${TMPDIR:-$D/$RUNS/tmp}
+mkdir -p "$TMPDIR"
 say() { echo "$(date -u +%H:%M:%S) $*" | tee -a "$D/$RUNS/driver.log"; }
 one() {
   cfg=$1 i=$2
@@ -31,7 +34,7 @@ one() {
   fi
   say "round $i $cfg: lab at CPUWeight=$weight $(head -1 "$out/legs.log" 2>/dev/null); load $(cut -d' ' -f1-3 /proc/loadavg)"
   systemd-run --user --quiet --collect --wait --unit="g8-lab-$cfg-$i" -p CPUWeight=$weight -p MemoryMax=20G \
-    --working-directory="$D" -E HOME="$HOME" -E PATH="$PATH" \
+    --working-directory="$D" -E HOME="$HOME" -E PATH="$PATH" -E TMPDIR="$TMPDIR" \
     taskset -c "$CPUS" "$D/bin/kiln-lab" run --kiln "$D/bin/kiln" --label "$cfg" --rounds 1 --out "$out" > "$out/lab.log" 2>&1
   say "round $i $cfg: lab exited $?"
   if [ "$cfg" != calm ]; then
