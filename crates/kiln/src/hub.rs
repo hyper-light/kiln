@@ -1975,7 +1975,7 @@ impl Hub {
         };
         for s in sessions {
             if let Some(tx) = self.terms.lock().remove(&s) {
-                let _ = tx.try_send(TermOut::Gone);
+                crate::termsess::forward(&tx, None, TermOut::Gone);
             }
         }
         metrics::agent_samples().write().remove(name);
@@ -2198,11 +2198,13 @@ impl Hub {
                     self.wake.notify();
                 }
             }
+            // Handed to the terminal's relay without waiting: no room is a gap the relay repairs
+            // (goal 3, plan 01a1a59c2a8e step 5; `crate::termsess::forward`).
             AgentMsg::TermOutput { session, data } => {
                 let key = format!("{agent}/{session}");
                 let tx = self.terms.lock().get(&key).cloned();
                 if let Some(tx) = tx {
-                    let _ = tx.send(TermOut::Data(data)).await;
+                    crate::termsess::forward(&tx, self.terminals.get(&session).as_deref(), TermOut::Data(data));
                 }
             }
             AgentMsg::TermList { sessions } => {
@@ -2351,14 +2353,14 @@ impl Hub {
                 let key = format!("{agent}/{session}");
                 let tx = self.terms.lock().get(&key).cloned();
                 if let Some(tx) = tx {
-                    let _ = tx.send(TermOut::Replay(data)).await;
+                    crate::termsess::forward(&tx, self.terminals.get(&session).as_deref(), TermOut::Replay(data));
                 }
             }
             AgentMsg::TermExit { session, code, error } => {
                 let key = format!("{agent}/{session}");
                 let tx = self.terms.lock().remove(&key);
                 if let Some(tx) = tx {
-                    let _ = tx.send(TermOut::Exit { code, error }).await;
+                    crate::termsess::forward(&tx, None, TermOut::Exit { code, error });
                 }
                 self.instances.lock().disown(&crate::instances::Owned::Terminal(session));
                 self.check_retire().await;
@@ -2939,7 +2941,7 @@ impl Hub {
             match o {
                 Owned::Terminal(s) => {
                     if let Some(tx) = self.terms.lock().remove(&format!("{name}/{s}")) {
-                        let _ = tx.try_send(TermOut::Gone);
+                        crate::termsess::forward(&tx, None, TermOut::Gone);
                     }
                 }
                 Owned::Agent(id) => agents.push(id),
@@ -4264,6 +4266,36 @@ pub(crate) mod tests {
         let (net, _events) = crate::net::start(crate::net::Spec { bind: "127.0.0.1:0".parse()?, ca_der: pki.ca_der.clone(), leaf, server: true, dial_deadline: crate::net::DIAL_DEADLINE, revoked_keys: Vec::new() })?;
         let logs = Logs::new(dir.join("logs"), 1 << 20);
         Hub::new_on(clock, Arc::new(cfg), store, logs, net, pki, "test-admin-token".into(), "test-join-token".into(), Shutdown::new())
+    }
+
+    /// Goal 3, plan 01a1a59c2a8e step 5 (perf/api-pass's leftover): a terminal whose relay has no
+    /// room holds up none of the runners' messages, and loses nothing for good: its output that finds
+    /// no room is a gap its relay repairs from the machine's replay, and its end waits for room on its
+    /// own, after what came before it. The hub's loop used to wait for room, every runner's messages
+    /// behind it.
+    #[test]
+    fn g3_s5_a_terminal_relay_with_no_room_holds_up_no_runners_message() -> anyhow::Result<()> {
+        crate::rt::block_on(async {
+            let hub = scratch_hub().await?;
+            hub.peers.lock().insert(1, "box".into());
+            let session = crate::termsess::Session::detached("t1".into(), "agent:box".into(), None, 80, 24);
+            hub.terminals.insert(&session);
+            // Its relay's queue full, nobody taking from it.
+            let (tx, rx) = async_channel::bounded::<TermOut>(1);
+            tx.try_send(TermOut::Data(b"first".to_vec())).map_err(|_| anyhow::anyhow!("the relay's queue had no room for its first"))?;
+            hub.terms.lock().insert("box/t1".into(), tx);
+            let heard = crate::rt::timeout(Duration::from_secs(5), hub.on_runner_msg(1, AgentMsg::TermOutput { session: "t1".into(), data: b"second".to_vec() })).await;
+            anyhow::ensure!(heard.is_ok(), "the runners' messages waited on a terminal's relay with no room");
+            anyhow::ensure!(session.gaps() == 1, "output with no room is a gap to repair: {}", session.gaps());
+            let ended = crate::rt::timeout(Duration::from_secs(5), hub.on_runner_msg(1, AgentMsg::TermExit { session: "t1".into(), code: Some(0), error: None })).await;
+            anyhow::ensure!(ended.is_ok(), "the runners' messages waited to hand a terminal its end");
+            // What the relay takes: what it had, then its end, which waited for room.
+            let first = crate::rt::timeout(Duration::from_secs(5), rx.recv()).await;
+            anyhow::ensure!(matches!(&first, Ok(Ok(TermOut::Data(d))) if d == b"first"), "{first:?}");
+            let end = crate::rt::timeout(Duration::from_secs(5), rx.recv()).await;
+            anyhow::ensure!(matches!(end, Ok(Ok(TermOut::Exit { code: Some(0), .. }))), "{end:?}");
+            Ok(())
+        })
     }
 
     /// CP-T3.2: an inbox's answer from a runner that no longer holds the session (a copy left
