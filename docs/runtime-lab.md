@@ -381,6 +381,78 @@ B alone at the old sizes (4, 2, 8), four rounds calm and four with 16 hogs, from
 - **The server's RSS is 16% higher** (977 to 1132 MB calm, 989 to 1149 with hogs): goal 3's, not the
   share sizes' (26 against 8 places: 1146 against 1130 MB).
 
+## Goal 7: placement
+
+Goal 7 of the API runtime program (plan `01a1a59c2aea73e487fb6fcfe90c5fcc`, research
+`01a1a59c2aeb70e9824606865d6762ca`) built three more ways for the server to place its work on kiln-rt's
+shards beside today's. `[server] placement` picks one, and `KILN_RT_PLACEMENT` overrides it, so each runs
+from the setting alone, with no rebuild (`crate::placement`):
+
+| placement | a new connection | a request on a connection | a held shard's queued work |
+| --- | --- | --- | --- |
+| `round-robin` (main before goal 7) | the next shard in turn, past one the watchdog sees held | in its connection's task | spawns not yet admitted go to another shard (goal 6) |
+| `steer` | the less delayed of two shards drawn at random, held ones passed over | on its connection's shard, unless one other drawn at random is less delayed by more than a step quantum (250 µs), or its own shard is held | as `round-robin` |
+| `steal` | as `round-robin` | a movable task (`hyper_rt::movable`) queued on its connection's shard, which an idle shard takes half of a busy one's queue of | the watchdog hands it to the shared queues and kicks a parked shard |
+| `both` | as `steer` | as `steal` | as `steal` |
+
+- **A shard's delay** is goal 1's probe's: how late its latest probe ran, or how overdue its next one is
+  (`crate::shard_health::delay_now`), so a shard held right now shows before its probe runs again.
+- **A request is weighed against its own shard** and one other drawn at random, not two drawn afresh: moving
+  it costs a hop each way between threads, worth paying only for a wait longer than the step quantum, the
+  least wait goal 6 takes as a queue (`crate::overload`). Drawing at random, rather than taking the least
+  delayed of all, keeps placers acting on the same stale reading from piling onto one shard (research f10).
+- **Movable tasks** (kiln-rt's `movable.rs`, ORIGIN.md) are reference-counted headers beside the arena's
+  pinned tasks, their waker the header itself. Each shard keeps a first-in, first-out queue of its own per
+  class (crossbeam-deque), bounded at its poll batch, the older half moving to a shared queue when full; an
+  idle shard takes from the shared queues and then half a sibling's queue, at most half the shards looking at
+  once; a push behind another task kicks a parked sibling while none looks (Tokio's layout, f14 to f16). A
+  carrier task per class polls a shard's movable tasks, each once a turn until its share is used, so a
+  movable task's yield is one turn of a round, as hyper-rt's is (f13). Sockets and timers stay on their
+  shard: a movable task's waits go through a helper task on the shard each began on (`crate::rt::Bridge`,
+  `crate::rt::native`).
+- **WebSockets** are placed with their upgrade request: a socket's task is spawned where that request's
+  handler ran. A viewer's heavy messages, its catch-ups, are made off the shards (the blocking pool, goal 3)
+  from state its session's owner keeps (goal 4), so none is heavy on the socket's shard.
+- `/metrics` says what was placed how (`kiln_placement_total{how}`: `steered`, `local`, `moved`, `movable`,
+  `refused`) and what the movable tasks did (`kiln_rt_movable_*`: spawned, polls, stolen, taken from the
+  shared queues, overflowed, handed off by the watchdog, parked shards kicked).
+
+### The rule, written before the runs (2026-11-04)
+
+The default is the placement that gives people's requests the best p99 under CPU hogs in the production-like
+layout, without losing throughput or CPU per request beyond noise:
+
+1. **The deciding run** is the production-like layout with hogs: the server alone in a cgroup of its own at
+   `cpu.weight` 1000 (`kiln.slice`'s, docs/priority.md), as many busy loops as the lab's CPUs in another at
+   `cpu.weight` 1, the lab and its runners in a third at the default weight, all on the lab's CPUs.
+2. **People's requests** are the lab's `page` (a person's pages: kiln's Critical class) and `api_write`
+   (messages to agents and agents' MCP calls: what stands in for a person's actions; the lab sends them with
+   a token, so kiln serves them as Normal).
+3. **A placement qualifies** when, against `round-robin` in the deciding run (`kiln-lab compare` of the two
+   placements' rounds, every number held together at 95%, Bonferroni):
+   - `page.p99_ms` or `api_write.p99_ms` is better beyond noise, and neither is worse beyond noise;
+   - no throughput (`page`, `api_read`, `api_write`, `websocket` and `attach` `.per_s`) and not
+     `server.cpu_ms_per_request` is worse beyond noise.
+4. **The winner** is the qualifying placement whose two p99s improved most against `round-robin`, by the
+   mean of their relative changes. When none qualifies, `round-robin` stays the default.
+5. The shared layout and calm are run and reported beside it; a placement worse beyond noise there in
+   people's p99s is named, but they don't change the pick: production runs the production-like layout.
+
+### Running it
+
+On a Linux machine with systemd (fedora, as goal 8's lab), release builds of one commit beside the scripts:
+
+```sh
+mkdir -p ~/.cache/g7-lab/bin && cp scripts/placement_lab/*.sh scripts/placement_lab/merge.py ~/.cache/g7-lab/
+cp target/release/kiln target/release/kiln-lab ~/.cache/g7-lab/bin/
+systemd-run --user --unit=g7-lab --collect -E HOME="$HOME" -E PATH="$PATH" \
+  env ROUNDS=6 N=16 CPUS=16-31 ~/.cache/g7-lab/driver.sh
+~/.cache/g7-lab/report.sh      # once runs/DONE is there: the tables and the comparisons
+```
+
+`driver.sh` runs every condition (`prod`, `shared`, `calm`) and placement in turn, one `kiln-lab run` round
+each, each round starting the turn one further on, so a machine's drift falls on every placement alike.
+
 ## What the lab doesn't do yet
 
 - **CI.** A lab kiln has no repositories, so its "CI pages" are the run lists and overview, empty;
