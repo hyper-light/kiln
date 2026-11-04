@@ -102,6 +102,35 @@ pub fn observe(observer: Observer) -> bool {
     OBSERVER.set(observer).is_ok()
 }
 
+/// How full a share (or the compute pool, `crate::compute::occupancy`) is now: its places and the jobs it holds,
+/// running or waiting. Past its places, the rest wait. Kiln's departure (ORIGIN.md; goal 6, plan `01a1a59c2abe`
+/// step 4): an observer is told of a job's wait only once it starts or ends, so a share whose jobs are all
+/// waiting tells nothing; this says whether anything waits now.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Occupancy {
+    /// The most of its jobs that run at once.
+    pub places: usize,
+    /// Its jobs admitted and not yet ended.
+    pub held: usize,
+}
+
+impl Occupancy {
+    /// The jobs waiting for a place now.
+    #[must_use]
+    pub const fn waiting(&self) -> usize {
+        self.held.saturating_sub(self.places)
+    }
+}
+
+/// How full share `share` is now: `None` with no pool running or no such share. One atomic read; no lock.
+pub fn occupancy(share: &str) -> Option<Occupancy> {
+    let state = POOL.get()?.shares.iter().find(|state| state.share.name == share)?;
+    Some(Occupancy {
+        places: state.share.limit,
+        held: state.held.load(Ordering::Acquire),
+    })
+}
+
 type Job = Box<dyn FnOnce() + Send>;
 
 /// What the dispatcher receives.

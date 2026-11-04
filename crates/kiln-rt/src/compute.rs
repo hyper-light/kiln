@@ -865,6 +865,18 @@ pub fn running() -> bool {
         .is_some_and(|pool| !pool.stopping.load(Ordering::Acquire))
 }
 
+/// How full the pool is now: its threads, and the jobs it holds, running or waiting for a thread (a job between
+/// its pieces among them). `None` with no pool started. Kiln's departure (ORIGIN.md; goal 6, plan
+/// `01a1a59c2abe` step 4): a job's wait is told as its first piece starts, so a pool whose jobs all wait tells
+/// nothing; this says whether anything waits now. One atomic read; no lock.
+pub fn occupancy() -> Option<crate::blocking::Occupancy> {
+    let pool = POOL.get()?;
+    Some(crate::blocking::Occupancy {
+        places: pool.slots.len(),
+        held: pool.held.load(Ordering::Acquire),
+    })
+}
+
 /// When a job was submitted, where the pool is observed ([`observe`]): its first piece tells how long it waited.
 fn submitted() -> Option<u64> {
     OBSERVER.get().map(|_| shard_clock_ns())
