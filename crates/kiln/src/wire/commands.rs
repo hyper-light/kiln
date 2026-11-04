@@ -147,6 +147,46 @@ struct Peer {
 /// its hello: the clock is for a runner that says nothing, not a short wait.
 pub const COMING_FOR: Duration = Duration::from_secs(60);
 
+/// A call on the commands, run by their [`Owner`].
+type Call = Box<dyn FnOnce(&mut Commands) + Send>;
+
+/// The server's [`Commands`] without a lock (goal 5 of the API runtime program, plan 01a1a59c2aae):
+/// a task of their own owns them and takes every change and question as a message, in the order they
+/// come. A caller waits for its turn, not on a lock, and no shard stalls another holding them.
+pub struct Owner {
+    tx: async_channel::Sender<Call>,
+}
+
+impl Owner {
+    /// `commands`, owned by a task started for them now.
+    pub fn start(commands: Commands) -> Self {
+        let (tx, rx) = async_channel::unbounded::<Call>();
+        drop(crate::rt::spawn(async move {
+            let mut commands = commands;
+            while let Ok(call) = rx.recv().await {
+                call(&mut commands);
+            }
+        }));
+        Self { tx }
+    }
+
+    /// `f` run on the commands in its turn, not waited for.
+    pub fn tell(&self, f: impl FnOnce(&mut Commands) + Send + 'static) {
+        // Unbounded: refused only once the owner has stopped (the server's going).
+        let _ = self.tx.try_send(Box::new(f));
+    }
+
+    /// `f` run on the commands in its turn, after what was sent before it; its answer. None once the
+    /// owner has stopped.
+    pub async fn ask<R: Send + 'static>(&self, f: impl FnOnce(&mut Commands) -> R + Send + 'static) -> Option<R> {
+        let (tx, rx) = oneshot::channel();
+        self.tell(move |c| {
+            let _ = tx.send(f(c));
+        });
+        rx.await.ok()
+    }
+}
+
 /// Every runner process's command streams, on the server.
 pub struct Commands {
     born: u64,
