@@ -511,7 +511,7 @@ pub fn stand_in(dir: &Path) -> anyhow::Result<PathBuf> {
 
 /// The session ids and their status, from the server's list.
 fn statuses(http: &mut Http) -> anyhow::Result<BTreeMap<String, String>> {
-    let a = http.send("GET", "/api/harness/sessions", None)?;
+    let a = http.send_settled("GET", "/api/harness/sessions", None)?;
     let v: Value = serde_json::from_slice(&a.body)?;
     let list = v.as_array().cloned().or_else(|| v.get("sessions").and_then(Value::as_array).cloned()).unwrap_or_default();
     Ok(list.iter().filter_map(|i| Some((i.get("id")?.as_str()?.to_owned(), i.get("status")?.as_str()?.to_owned()))).collect())
@@ -558,7 +558,7 @@ pub fn round(build: &Build, p: &Profile, hogs: usize, dir: &Path, bin: &Path, in
             if filled_ids.contains(id) || st.get(id).is_none_or(|s| s != "idle") {
                 continue;
             }
-            let newest = http.send("GET", &format!("/api/harness/sessions/{id}/events?limit=1"), None)?;
+            let newest = http.send_settled("GET", &format!("/api/harness/sessions/{id}/events?limit=1"), None)?;
             let seq = serde_json::from_slice::<Value>(&newest.body).ok().and_then(|v| v.pointer("/events/0/seq").and_then(Value::as_u64));
             if newest.status != 200 || seq.is_none_or(|s| s >= *n) {
                 filled_ids.insert(id.clone());
@@ -574,7 +574,7 @@ pub fn round(build: &Build, p: &Profile, hogs: usize, dir: &Path, bin: &Path, in
 
     // The MCP tools agents call, where this build has them.
     let tools: Vec<String> = {
-        let a = http.send("POST", "/api/mcp", Some(json!({"jsonrpc": "2.0", "id": 1, "method": "tools/list", "params": {}}).to_string().as_bytes()))?;
+        let a = http.send_settled("POST", "/api/mcp", Some(json!({"jsonrpc": "2.0", "id": 1, "method": "tools/list", "params": {}}).to_string().as_bytes()))?;
         let v: Value = serde_json::from_slice(&a.body).unwrap_or_default();
         let have: HashSet<String> = v.pointer("/result/tools").and_then(Value::as_array).map(|t| t.iter().filter_map(|t| t.get("name")?.as_str().map(str::to_owned)).collect()).unwrap_or_default();
         ["agents_list", "runners"].iter().filter(|t| have.contains(**t)).map(|t| (*t).to_owned()).collect()
