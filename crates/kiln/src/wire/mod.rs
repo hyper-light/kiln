@@ -210,6 +210,7 @@ classes! {
         AgentMsg::LegResults { .. } => Class::Stream,
         AgentMsg::LegSignature { .. } => Class::Answer,
         AgentMsg::Custody { .. } => Class::Stream,
+        AgentMsg::Machine { .. } => Class::Handshake,
     }
 }
 

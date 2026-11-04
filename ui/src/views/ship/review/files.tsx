@@ -130,10 +130,12 @@ const EMPTY_THREADS: Thread[] = [];
 
 /** Who asking about code goes to (components/code/about.tsx): the agent that made the commit, as
  * Ship's read model says it (`made_by`, ship.rs: one place, which Chain of Ownership fills for every
- * commit in time). Code no agent of kiln's made stays inert, as on the review page: today a person's
- * change, a lone commit and a host's pull request. `name`: how the card names it. */
-function aboutOf(agent: string | null | undefined, name?: string): AboutAgent | null {
-  return agent ? { id: agent, name: name ?? agent, subagents: true, busy: false } : null;
+ * commit in time). Code no agent of kiln's made (a person's change, a lone commit, a host's pull
+ * request) is asked of a helper kiln starts for the person, reading `repo` at `commit`
+ * (`ci.repos.about`). `name`: how the card names the agent. */
+function aboutOf(agent: string | null | undefined, repo: string, commit: string | undefined, name?: string): AboutAgent | null {
+  if (agent) return { id: agent, name: name ?? agent, subagents: true, busy: false };
+  return commit ? { id: "", name: "kiln", subagents: true, busy: false, start: (ask) => reviewApi.about(repo, commit, ask) } : null;
 }
 const noop = () => {};
 
@@ -357,7 +359,9 @@ function KilnFiles({ item }: { item: ShipCommit }) {
     [key],
   );
   const maker = item.made_by?.agent;
-  const about = React.useMemo(() => aboutOf(maker, whoSaid(d.author)), [maker, d.author]);
+  // The commit of the version shown: what a helper kiln starts reads.
+  const commit = d.versions.find((v) => v.n === version)?.commit ?? item.sha;
+  const about = React.useMemo(() => aboutOf(maker, item.repo, commit, whoSaid(d.author)), [maker, item.repo, commit, d.author]);
   const ctx: FilesCtx = React.useMemo(
     () => ({ ops: fullOps, threads: shown, conflicts, rowsByFile, version, draft, setDraft, open: setWhole, q, linesOf, viewed }),
     [fullOps, shown, conflicts, rowsByFile, version, draft, q, linesOf, viewed],
@@ -436,6 +440,8 @@ function HostFiles({ item }: { item: ShipCommit }) {
   const threads = React.useMemo(() => host, [host]);
   const map = useThreadMap(threads, 1);
   const linesOf = React.useMemo(() => makeLinesOf(rowsByFile), [rowsByFile]);
+  const maker = item.made_by?.agent;
+  const about = React.useMemo(() => aboutOf(maker, item.repo, pull.sha), [maker, item.repo, pull.sha]);
 
   const fullOps: Ops = React.useMemo(
     () => ({
@@ -500,9 +506,11 @@ function HostFiles({ item }: { item: ShipCommit }) {
         </Conversation>
       }
     >
-      {list.map((f) => (
-        <FileDiff key={f.path} file={f} ctx={ctx} map={map} meta={{ status: pull.files.find((x) => x.path === f.path)?.status }} />
-      ))}
+      <AboutContext.Provider value={about}>
+        {list.map((f) => (
+          <FileDiff key={f.path} file={f} ctx={ctx} map={map} meta={{ status: pull.files.find((x) => x.path === f.path)?.status }} />
+        ))}
+      </AboutContext.Provider>
     </Frame>
   );
 }
@@ -577,7 +585,7 @@ function CommitFiles({ item }: { item: ShipCommit }) {
     [ops],
   );
   const maker = item.made_by?.agent;
-  const about = React.useMemo(() => aboutOf(maker), [maker]);
+  const about = React.useMemo(() => aboutOf(maker, item.repo, item.sha), [maker, item.repo, item.sha]);
   const ctx: FilesCtx = React.useMemo(
     () => ({ ops: fullOps, threads: EMPTY_THREADS, conflicts: [], rowsByFile, version: 1, draft, setDraft, open: setWhole, q: "", linesOf }),
     [fullOps, rowsByFile, draft, linesOf],

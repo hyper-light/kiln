@@ -112,13 +112,17 @@ impl Places {
         self.held.lock().iter().map(|(m, h)| (m.clone(), h.repos.iter().filter_map(|f| f.origin.as_deref().and_then(key_of)).collect())).collect()
     }
 
-    /// A machine known by another name from now on (docs/machines.md): its places go with it.
+    /// A machine known by another name from now on (docs/machines.md): its places go with it. Both
+    /// said what the machine holds: the newest word is the machine's.
     pub fn moved(&self, from: &str, to: &str) {
         let moved = {
             let mut g = self.held.lock();
             match g.remove(from) {
                 Some(h) => {
-                    g.entry(to.to_owned()).or_insert(h);
+                    let newer = g.get(to).is_none_or(|kept| h.at > kept.at);
+                    if newer {
+                        g.insert(to.to_owned(), h);
+                    }
                     true
                 }
                 None => false,
