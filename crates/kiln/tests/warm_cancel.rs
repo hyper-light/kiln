@@ -47,10 +47,13 @@ fn fixture(root: &Path) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// `cargo <verb> --release` on the fixture, in `target`, its units listed (`-v`).
+/// `cargo <verb> --release` on the fixture, in `target`, its units listed (`-v`), in plain words: a
+/// CI step runs with `CARGO_TERM_COLOR=always` (exec.rs), which put a colour's codes between "Fresh"
+/// and its unit (runs #1689, #1739).
 fn cargo(root: &Path, target: &Path, verb: &str) -> Command {
     let mut c = Command::new(option_env!("CARGO").unwrap_or("cargo"));
     c.args([verb, "--release", "--offline", "-v", "-j", "2", "--target-dir"]).arg(target).current_dir(root).env_remove("CARGO_TARGET_DIR").env_remove("RUSTFLAGS").env_remove("CARGO_ENCODED_RUSTFLAGS");
+    c.env("CARGO_TERM_COLOR", "never");
     c
 }
 
