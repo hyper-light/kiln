@@ -90,10 +90,12 @@ calling MCP (250 ms apart) and a page loader (100 ms apart), with a 5 s warm-up 
 
 Each round reports, for each class the lab times (`page`, `api_read`, `api_write`, `websocket`: an
 event from its harness writing it to a viewer's socket bringing it, `attach`: a viewer opening a
-whole conversation), its median, p99, p99.9 and most (the stall tail) and its rate; the server's CPU
-for each request and its share of a CPU; and, where the build has them, from `/metrics`: the shards'
-delay (p99, p99.9 and the top bucket reached, all shards together), their busy share and slow polls
-a second, and each route class's server-side p99 took and waited.
+whole conversation), its median, p99, p99.9 and most (the stall tail), its rate and its errors (a
+status of 400 or more, or no answer); the server's CPU for each request and its share of a CPU; and,
+where the build has them, from `/metrics`: the shards' delay (p99, p99.9 and the top bucket reached,
+all shards together), their busy share and slow polls a second, each route class's server-side p99
+took and waited, and the requests the server shed by class (`kiln_shed_total`: goal 6's shedding,
+`crate::overload`, on with `KILN_SHED=1`).
 
 A run's number is the median of its rounds'. Its noise is the interval that median moves in when the
 rounds are drawn again (a bootstrap of the rounds, 95%). `ab` runs two builds interleaved and in

@@ -660,6 +660,9 @@ fn numbers(seen: &BTreeMap<Class, measure::Seen>, before: &Scrape, after: &Scrap
         }
         #[allow(clippy::cast_precision_loss)]
         n.insert(format!("{name}.per_s"), s.n as f64 / secs.max(1e-9));
+        // What failed (a status of 400 or more, or no answer): an overloaded server's sheds among them.
+        #[allow(clippy::cast_precision_loss)]
+        n.insert(format!("{name}.errors"), s.errors as f64);
         if *c != Class::Websocket {
             requests += s.n;
         }
@@ -717,6 +720,12 @@ fn numbers(seen: &BTreeMap<Class, measure::Seen>, before: &Scrape, after: &Scrap
             if let Some(v) = measure::histogram_quantile(0.99, &d) {
                 n.insert(format!("server.{class}.{key}_p99_ms"), v * 1000.0);
             }
+        }
+    }
+    // The requests the server shed, by class (`kiln_shed_total`, goal 6), where the build counts them.
+    for class in ["background", "normal"] {
+        if let Some(v) = diff("kiln_shed_total", &[("class", class)]) {
+            n.insert(format!("server.shed.{class}"), v);
         }
     }
     (n, shards.len())
