@@ -11,6 +11,7 @@ hot = [
   "crates/kiln/src/http/ws.rs",
   "crates/kiln/src/http/io.rs",
   "crates/kiln/src/api.rs",
+  "crates/kiln/src/overload.rs",
   "crates/kiln/src/ui.rs",
   "crates/kiln/src/authz",
   "crates/kiln/src/mcp/mod.rs",
