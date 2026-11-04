@@ -64,6 +64,29 @@ places and its run. The histograms are atomics the pools' threads write as they 
 | `kiln_blocking_wait_seconds{share}`, `kiln_blocking_run_seconds{share}` (histograms) | How long each job of the blocking pool waited for one of its share's places, and ran: `dns` (`getaddrinfo`), `store` (kiln.db's statements), `fs` (files, `/proc`, archives, a child's wait). |
 | `kiln_blocking_places{share}` | Each share's places: the most of its jobs that run at once (`crate::rt::Profile`). |
 
+### What overload sheds (`crate::overload`)
+
+Goal 6 of the API runtime program (plan `01a1a59c2abe`): each request is Critical (health, sign-in, a
+person's pages and actions), Normal (the API) or Background (agents' and CI's polling, catch-ups, sync,
+telemetry). Goal 1's probe on each shard ticks detectors that learn the shard's calm (headroom's CUSUM,
+`kiln_ci::headroom::detect`): the shard's delay for Normal, its Background tasks' waits for Background.
+The first shard's probe also ticks one for the compute pool and one for each of the blocking pool's
+shares, on the mean wait of the jobs whose waits the pool told over the period, since what a request
+waits on off its shard waits there, where no shard's delay sees it. A pool whose waits leave their calm
+sheds Background requests on every shard, and once its waits reach the tolerance (1 s), Normal ones
+too, while any of its jobs waits; Critical never. A shed request is answered 503 at once, before its
+body is read, with `Retry-After` (the delay that shed it, in whole seconds) and `x-kiln-shed` (its
+class). Shedding is off until `[server] shed = true` or `KILN_SHED=1`; the detectors run either way.
+
+| series | what it says |
+| --- | --- |
+| `kiln_shard_queue_delay_seconds{shard,class}` | Each class's mean wait from ready to run on the shard, over the probe's last period. |
+| `kiln_shard_shedding{shard,class}` | 1 while the shard's own queueing delay sheds the class's requests. |
+| `kiln_pool_queue_delay_seconds{pool}` | Each pool's mean wait for a place over the probe's last period, as its detector read it: `compute` (a thread), `dns`, `store`, `fs` (the blocking pool's shares). |
+| `kiln_pool_shedding{pool,class}` | 1 while work waiting in the pool past its calm sheds the class's requests on every shard. |
+| `kiln_shed_total{class}` | Requests answered 503 at once, by class (`background`, `normal`; Critical is never shed). |
+| `kiln_shard_stalled`, `kiln_shard_stalls_total`, `kiln_shard_stall_moved_total` and the others | kiln-rt's watchdog: a shard held in one poll past its limit, and the spawns it moved to other shards. |
+
 ## The lab (`kiln-lab`)
 
 ### A round
@@ -105,7 +128,9 @@ calling MCP (250 ms apart) and a page loader (100 ms apart), with a 5 s warm-up 
 `--profile small` is a minute's try. `--profile overload` is the realistic one with no think time
 for its viewers and readers (each asks again as soon as it is answered): with one shard
 (`--env KILN_RT_SHARDS=1`) it overloads the server on purpose, as goal 6's shedding is measured
-(`--env-b KILN_SHED=1` against the same build without).
+(`--env-b KILN_SHED=1` against the same build without). A request the server sheds counts as an
+error, and its worker waits out the answer's `Retry-After` before asking again, as kiln's own clients
+do, rather than asking again at once.
 
 ### What it reports
 

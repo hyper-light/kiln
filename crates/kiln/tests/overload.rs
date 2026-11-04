@@ -213,6 +213,8 @@ fn g6_s2_spread_work_passes_over_a_held_shard() -> anyhow::Result<()> {
 fn g6_s4_an_overloaded_server_stays_up_serves_critical_and_sheds_background_first() -> anyhow::Result<()> {
     let _one = ONE_AT_A_TIME.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
     let (addr, probe) = server()?;
+    // Another test's wedge or flood of the process's shards sheds until its alarm ends: from calm.
+    until("nothing shed before the test", || Ok(kiln::overload::readiness().is_none()))?;
     let before = kiln::overload::shed_counts();
 
     // Calm: everything is served, and the monitors learn each class's calm.
@@ -312,6 +314,7 @@ fn backlog(wait: Arc<AtomicU64>) -> std::thread::JoinHandle<anyhow::Result<()>> 
 fn g6_s4_work_waiting_in_a_pool_sheds_background_then_normal_and_never_critical() -> anyhow::Result<()> {
     let _one = ONE_AT_A_TIME.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
     let (addr, _probe) = server()?;
+    until("nothing shed before the test", || Ok(kiln::overload::readiness().is_none()))?;
     let before = kiln::overload::shed_counts();
     let calm_until = Instant::now() + Duration::from_secs(2);
     while Instant::now() < calm_until {

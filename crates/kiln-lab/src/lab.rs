@@ -834,6 +834,16 @@ mod tests {
         assert!(cpus_in("").is_empty());
     }
 
+    /// Goal 6, plan 01a1a59c2abe step 4: a worker waits out a shed answer's `Retry-After` before asking again,
+    /// and its own think time when that is longer.
+    #[test]
+    fn g6_s4_a_worker_waits_out_a_sheds_retry_after() {
+        let (s, ms) = (Duration::from_secs, Duration::from_millis);
+        assert_eq!(pause(ms(50), None), ms(50), "no Retry-After: its think time");
+        assert_eq!(pause(Duration::ZERO, Some(s(2))), s(2), "no think time: the Retry-After");
+        assert_eq!(pause(s(3), Some(s(1))), s(3), "its think time when longer");
+    }
+
     #[test]
     fn stamps_are_read_wherever_a_frame_has_them() {
         let f = br#"{"t":"events","events":[{"text":"@lab:1730000000123456 the retry"},{"text":"no stamp"},{"output":"@lab:42 x @lab:"}]}"#;
