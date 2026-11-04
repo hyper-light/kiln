@@ -732,6 +732,39 @@ mod tests {
         Ok(())
     }
 
+    /// Goal 8 (plan 01a1a59c2b29 step 4, docs/priority.md): a CI step's job ([`Tree`]) runs
+    /// everything in it below normal at the least weight of weight-based CPU rate control, as an
+    /// agent's does, and the process kiln put in it has background mode's very low memory and I/O
+    /// priority: each read back from Windows.
+    #[test]
+    fn g8_s4_a_steps_job_runs_below_normal_at_the_least_weight() -> anyhow::Result<()> {
+        let tree = Tree::new().ok_or_else(|| anyhow::anyhow!("no job"))?;
+        let mut cmd = std::process::Command::new("cmd");
+        cmd.args(["/C", "ping -n 30 127.0.0.1 >NUL"]).creation_flags(0x0000_0004);
+        let mut child = cmd.spawn()?;
+        anyhow::ensure!(tree.assign(child.as_raw_handle()), "a suspended process goes in its job");
+        resume(child.id());
+        let mut pids = Vec::new();
+        for _ in 0..50 {
+            pids = tree.pids();
+            if pids.len() >= 2 {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+        let limits = limits_of(&tree.job).map(|l| (l.basic.limit_flags & JOB_OBJECT_LIMIT_PRIORITY_CLASS != 0, l.basic.priority_class));
+        let rate = rate_of(&tree.job);
+        let classes: Vec<Option<u32>> = pids.iter().map(|p| class_of(*p)).collect();
+        let (memory, io) = background_of(child.as_raw_handle());
+        tree.kill();
+        let _ = child.wait();
+        anyhow::ensure!(limits == Some((true, BELOW_NORMAL_PRIORITY_CLASS)), "the job's priority class: {limits:?}");
+        anyhow::ensure!(rate == Some((JOB_OBJECT_CPU_RATE_CONTROL_ENABLE | JOB_OBJECT_CPU_RATE_CONTROL_WEIGHT_BASED, LEAST_WEIGHT)), "the job's CPU rate control: {rate:?}");
+        anyhow::ensure!(pids.len() >= 2 && classes.iter().all(|c| *c == Some(BELOW_NORMAL_PRIORITY_CLASS)), "cmd and its ping, each below normal: {pids:?} {classes:?}");
+        anyhow::ensure!(memory == Some(MEMORY_PRIORITY_VERY_LOW) && io == Some(IO_PRIORITY_VERY_LOW), "background mode's memory and I/O priority: {memory:?} {io:?}");
+        Ok(())
+    }
+
     /// Goal 8 (plan 01a1a59c2b29 step 4): the server runs above normal.
     #[test]
     fn g8_s4_the_server_runs_above_normal() -> anyhow::Result<()> {
