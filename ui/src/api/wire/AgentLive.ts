@@ -53,7 +53,7 @@ transport?: Transport,
  */
 skew: Skew, 
 /**
- * A record that can't be proven to be any machine (docs/machines.md, "Runners from before"):
+ * A record that can't be proven to be any machine (docs/machines.md, "Records that are stale"):
  * not connected, known by a name, and its runner never said its machine id. kiln neither
  * folds nor forgets it on its own; it's shown as stale, for a person to forget.
  */

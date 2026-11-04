@@ -1399,6 +1399,8 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
     // The certificate names this agent (the server checks Hello against it); an approved join may
     // have given a variant of the requested name.
     let name = crate::pki::leaf_name(&leaf).unwrap_or_else(|| o.name.clone());
+    // The machine it is, said to the server as it connects (`AgentMsg::Machine`).
+    let machine = crate::rt::blocking(crate::os::machine_id).await.ok().flatten().and_then(|id| crate::join::machine_key(Some(&id)));
     if name != crate::pki::sanitize_name(&o.name) {
         tracing::info!(certificate = %name, requested = %o.name, "using the agent name from this agent's certificate");
     }
@@ -2690,7 +2692,14 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                 paths.connected(binding, Instant::now());
                 dialing_since = None;
                 dial_backoff = Duration::from_millis(500);
-                // Which process of this machine this is, then Hello (an older server skips the first).
+                // The machine it is (docs/machines.md, "One record a machine"), which process of it
+                // this is, then Hello (an older server skips the first two).
+                if !o.ephemeral
+                    && let Some(id) = &machine
+                    && let Ok(b) = proto::encode(&AgentMsg::Machine { id: id.clone() })
+                {
+                    net.send(SERVER_PEER, LANE_CONTROL, Kind::Control, b).await;
+                }
                 if !o.ephemeral
                     && let Ok(b) = proto::encode(&AgentMsg::Instance(instance_hello.clone()))
                 {

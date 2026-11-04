@@ -2371,7 +2371,7 @@ impl Registry {
     /// Machine `from` is known as `to` from now on (docs/machines.md): its sessions are there (and
     /// kept so in the conversation store), and what it offers is its. Its runner, coming back as
     /// `to`, finds them its own.
-    pub fn move_machine(&self, hub: &Hub, from: &str, to: &str) {
+    pub fn move_machine(&self, hub: &Hub, from: &str, to: &str) -> Vec<String> {
         let (at, now) = (Location::Machine(from.to_owned()), Location::Machine(to.to_owned()));
         let moved: Vec<Info> = {
             let mut g = self.mirrors.lock();
@@ -2393,9 +2393,36 @@ impl Registry {
         if let Some(st) = &self.convo {
             st.put(moved.iter().map(|i| crate::convo::rows::Row::Machine { session: i.id.clone(), machine: to.to_owned() }).collect());
         }
+        let ids: Vec<String> = moved.iter().map(|i| i.id.clone()).collect();
         for info in moved {
             hub.emit(&crate::wire::events::ServerEvent::Harness { info: Box::new(info) });
         }
+        ids
+    }
+
+    /// Sessions `moved` onto `machine`, connected now (docs/machines.md, "One record a machine"):
+    /// those its runner processes hold (`held`) and that read disconnected come back as they are
+    /// (their snapshots are asked for, the ids returned); those none of them holds aren't on the
+    /// machine, and are gone, as its next inventory would say.
+    pub fn moved_onto_connected(&self, hub: &Hub, machine: &str, moved: &[String], held: &[String]) -> Vec<String> {
+        let at = Location::Machine(machine.to_owned());
+        let (ask, gone): (Vec<String>, Vec<String>) = {
+            let mut g = self.mirrors.lock();
+            let ask = moved.iter().filter(|id| held.contains(*id) && g.get(*id).is_some_and(|m| m.location == at && m.info.status == Status::Disconnected)).cloned().collect();
+            let gone: Vec<String> = moved.iter().filter(|id| !held.contains(*id) && g.get(*id).is_some_and(|m| m.location == at)).cloned().collect();
+            for id in &gone {
+                if let Some(mut m) = g.remove(id) {
+                    m.feed.publish(&Frame::of(crate::wire::ui::SessionFrame::Closed.into()));
+                }
+            }
+            (ask, gone)
+        };
+        self.forget_holders(&gone);
+        for id in gone {
+            super::archive::closed(hub, &id);
+            hub.emit(&crate::wire::events::ServerEvent::HarnessClosed { id: id.to_string() });
+        }
+        ask
     }
 
     /// The machine went away: its sessions keep running there and come back when it reconnects.

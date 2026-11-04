@@ -19,6 +19,14 @@ pub struct RunnerInfo {
     /// finds it by this as well as by its name and host name.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub label: Option<String>,
+    /// The names its certificates carried before kiln knew it by its machine id (docs/machines.md,
+    /// "One record a machine"): `--on` finds it by these too.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub was: Vec<String>,
+    /// A record no machine is proven to be (docs/machines.md, "Records that are stale"): never
+    /// connected since, and its runner never said its machine id. A person forgets it.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub stale: bool,
     /// `linux`, `macos`, `windows` (Rust's names).
     pub os: String,
     /// `x86_64`, `aarch64` (Rust's names).
@@ -208,6 +216,7 @@ impl Want {
             && n != &r.name
             && n != &r.hostname
             && r.label.as_deref() != Some(n.as_str())
+            && !r.was.contains(n)
         {
             return Some(format!("not {n}"));
         }
@@ -349,6 +358,9 @@ pub struct Choice {
     pub why: String,
 }
 
+/// Why a stale record is passed over: what it is, and what a person does about it.
+pub const STALE: &str = "stale: it never said its machine id, so kiln can't tell which machine it is; forget it under Runners if no machine runs it";
+
 /// Every runner that suits `want` and can be reached from `me`, best first, and why each other one
 /// was passed over. `me` comes first whenever it suits and has memory to spare ([`ROOM`], beyond
 /// what the work asks): work goes to another machine only for what this one isn't or hasn't
@@ -358,7 +370,9 @@ pub fn rank(runners: &[RunnerInfo], want: &Want, me: &str) -> (Vec<Choice>, Vec<
     let mut passed = Vec::new();
     for r in runners {
         let why_not = want.mismatch(r).or_else(|| {
-            if !r.connected {
+            if r.stale {
+                Some(STALE.into())
+            } else if !r.connected {
                 Some("offline".into())
             } else if !r.reach && r.name != me {
                 Some("does not take reach links (an older runner, or it turned them off)".into())

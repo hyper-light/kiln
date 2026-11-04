@@ -390,7 +390,7 @@ pub struct AgentLive {
     /// How far its (newest process's) kiln is behind the server's (`crate::skew`): to be upgraded,
     /// it takes no new work.
     pub skew: crate::skew::Skew,
-    /// A record that can't be proven to be any machine (docs/machines.md, "Runners from before"):
+    /// A record that can't be proven to be any machine (docs/machines.md, "Records that are stale"):
     /// not connected, known by a name, and its runner never said its machine id. kiln neither
     /// folds nor forgets it on its own; it's shown as stale, for a person to forget.
     #[serde(skip_serializing_if = "std::ops::Not::not")]
@@ -436,6 +436,17 @@ pub struct Hub {
     /// started, and repo sync of the machines its activity names. Loaded as it starts
     /// ([`Hub::load_labels`]), kept as runners are renamed or move.
     labels: Labels,
+    /// The names machines' certificates carried before kiln knew them by their ids, each to its
+    /// machine id (docs/machines.md, "One record a machine"): resolved where a runner names itself
+    /// ([`Hub::machine_of`]), so nothing in the server keys a runner by one. Loaded as it starts
+    /// ([`Hub::one_record_a_machine`]), kept as runners move.
+    machine_names: Mutex<HashMap<String, String>>,
+    /// The machine id each connection's runner said before its Hello ([`AgentMsg::Machine`]).
+    said_machine: Mutex<HashMap<PeerId, String>>,
+    /// The name each connection's certificate carries, where it isn't the machine's id it's keyed
+    /// by (a runner process from before its certificate for the id): what that process signs and
+    /// checks its custody words as, until it restarts with its certificate for the id.
+    pub(crate) peer_certs: Mutex<HashMap<PeerId, String>>,
     /// The CI engine's dispatcher (docs/ci.md W05): its runs, legs and their messages.
     pub ci: crate::ci::dispatch::Handle,
     peers: Mutex<HashMap<PeerId, String>>,
@@ -627,6 +638,9 @@ impl Hub {
             pki,
             agents: Mutex::new(HashMap::new()),
             labels,
+            machine_names: Mutex::new(HashMap::new()),
+            said_machine: Mutex::new(HashMap::new()),
+            peer_certs: Mutex::new(HashMap::new()),
             ci: crate::ci::dispatch::Handle::default(),
             peers: Mutex::new(HashMap::new()),
             pending_peers: Mutex::new(HashMap::new()),
@@ -925,14 +939,21 @@ impl Hub {
         Ok(())
     }
 
-    /// The runner people mean by `typed`: the one kiln knows by that name, else the one shown by it
-    /// (its label, docs/machines.md).
+    /// The runner people mean by `typed`: the one kiln knows by that name, else the machine a
+    /// name its certificate carried from before is, else the one shown by it (its label,
+    /// docs/machines.md).
     pub fn machine_named(&self, typed: &str) -> Option<String> {
-        let g = self.agents.lock();
-        if g.contains_key(typed) {
-            return Some(typed.to_owned());
+        {
+            let g = self.agents.lock();
+            if g.contains_key(typed) {
+                return Some(typed.to_owned());
+            }
         }
-        g.values().find(|a| a.label.as_deref() == Some(typed)).map(|a| a.name.clone())
+        if let Some(id) = self.machine_names.lock().get(typed) {
+            return Some(id.clone());
+        }
+        let live = self.agents.lock().values().find(|a| a.label.as_deref() == Some(typed)).map(|a| a.name.clone());
+        live.or_else(|| self.labels.lock().iter().find(|(_, l)| l.as_str() == typed).map(|(n, _)| n.clone()))
     }
 
     /// The name people see for runner `name` (docs/machines.md): its label, for one kiln knows by
@@ -942,6 +963,20 @@ impl Hub {
     pub fn shown(&self, name: &str) -> String {
         let live = self.agents.lock().get(name).and_then(|a| a.label.clone());
         live.or_else(|| self.labels.lock().get(name).cloned()).unwrap_or_else(|| name.to_owned())
+    }
+
+    /// The machine a runner that names itself `name` is (docs/machines.md, "One record a machine"):
+    /// the id a name its certificate carried from before maps to, else `name` itself. Where a
+    /// runner says who it is (its connection, its requests' `?machine=`), this is what it's keyed by.
+    pub fn machine_of(&self, name: &str) -> String {
+        self.machine_names.lock().get(name).cloned().unwrap_or_else(|| name.to_owned())
+    }
+
+    /// The names machine `id`'s certificates carried from before.
+    pub fn names_of(&self, id: &str) -> Vec<String> {
+        let mut v: Vec<String> = self.machine_names.lock().iter().filter(|(_, m)| *m == id).map(|(n, _)| n.clone()).collect();
+        v.sort();
+        v
     }
 
     /// The runners' labels as the store keeps them, for [`Hub::shown`]: as this server starts.
@@ -1161,7 +1196,7 @@ impl Hub {
             a.transport = a.peer.filter(|_| a.connected).map(|p| self.tunnels.transport(p));
             a.dropped_toward = a.peer.map(|p| metrics::net().toward(p)).unwrap_or_default();
             a.refused = self.refusals.lock().kept(&crate::wire::unread::Page::Runner(a.name.clone())).cloned();
-            // docs/machines.md, "Runners from before": no machine id, so no machine it's proven to be.
+            // docs/machines.md, "Records that are stale": no machine id, so no machine it's proven to be.
             let said = machines.contains_key(&a.name) || a.facts.as_ref().is_some_and(|f| f.machine_id.is_some());
             a.stale = !a.connected && !a.ephemeral && !crate::join::is_machine_key(&a.name) && !said;
         }
@@ -1630,7 +1665,15 @@ impl Hub {
         // Its certificates are revoked for good, recorded so a restart keeps it, and refused at
         // once (W27-R01); enrolling again under the name brings a new key.
         let at = crate::util::now_unix();
-        let keys = crate::identities::revoke(&self.store, crate::identities::Target::Subject(agent.to_owned()), "runner forgotten", by, at).await?;
+        // The names its certificates carried from before go with it, and their keys are revoked
+        // too (docs/machines.md, "One record a machine").
+        let names = self.store.forget_machine_names(agent.to_owned()).await?;
+        self.machine_names.lock().retain(|_, m| m != agent);
+        let mut keys = crate::identities::revoke(&self.store, crate::identities::Target::Subject(agent.to_owned()), "runner forgotten", by, at).await?;
+        for n in &names {
+            keys.extend(crate::identities::revoke(&self.store, crate::identities::Target::Subject(n.clone()), "runner forgotten", by, at).await?);
+            self.net.command(crate::net::Out::Revoke { name: n.clone() }).await;
+        }
         if !keys.is_empty() {
             self.net.command(crate::net::Out::RevokeKeys { keys, why: crate::identities::refusal(at, "runner forgotten", by) }).await;
         }
@@ -1680,6 +1723,15 @@ impl Hub {
         if let Some(a) = self.agents.lock().get_mut(to) {
             a.label = Some(label.clone());
         }
+        {
+            let mut names = self.machine_names.lock();
+            for m in names.values_mut().filter(|m| m.as_str() == from) {
+                *m = to.to_owned();
+            }
+            if crate::join::is_machine_key(to) && !crate::join::is_machine_key(from) {
+                names.insert(from.to_owned(), to.to_owned());
+            }
+        }
         self.agents.lock().remove(from);
         self.away_peers.lock().remove(from);
         self.reach.lock().forget(from);
@@ -1688,12 +1740,133 @@ impl Hub {
         self.agent_limits.moved(from, to);
         self.places.moved(from, to);
         self.sync.moved(from, to);
-        self.harness.move_machine(self, from, to);
+        let moved = self.harness.move_machine(self, from, to);
+        // Onto a machine connected now: what it holds reads as it is at once, what it doesn't
+        // hold is gone, as its reconnect would say (docs/machines.md, "One record a machine").
+        if !moved.is_empty() {
+            self.reconcile_moved(to, &moved).await;
+        }
         if let Some(group) = self.store.group() {
             self.cluster.moved(group, from);
         }
         self.update_slot_gauges();
         Ok(label)
+    }
+
+    /// One record a machine (docs/machines.md), as the server starts and before any runner
+    /// connects: the names machines' certificates carried are loaded, and every record kept under
+    /// a name whose runner said its machine id folds into that id ([`Hub::move_runner`]), merged
+    /// with what the id has. Records of job pods (each its own, forgotten when done) and records
+    /// that never said an id (stale, a person's to forget) stay. The names folded.
+    pub async fn one_record_a_machine(&self) -> Vec<String> {
+        match self.store.machine_names().await {
+            Ok(n) => *self.machine_names.lock() = n,
+            Err(e) => tracing::warn!(error = %format!("{e:#}"), "the names machines' certificates carried couldn't be read"),
+        }
+        let (rows, machines) = match (self.store.agents().await, self.store.agent_machines().await) {
+            (Ok(r), Ok(m)) => (r, m),
+            (Err(e), _) | (_, Err(e)) => {
+                tracing::warn!(error = %format!("{e:#}"), "the runners' records couldn't be read: none folded into its machine id");
+                return Vec::new();
+            }
+        };
+        let mut folded = Vec::new();
+        let mut ids: std::collections::HashSet<String> = rows.iter().map(|r| r.name.clone()).collect();
+        for r in rows.iter().filter(|r| !r.ephemeral && !crate::join::is_machine_key(&r.name)) {
+            let Some(id) = machines.get(&r.name).and_then(|m| crate::join::machine_key(Some(m))) else { continue };
+            let shown = self.shown(&r.name);
+            let known = !ids.insert(id.clone());
+            match self.move_runner(&r.name, &id, &shown, &r.hostname).await {
+                Ok(label) => {
+                    let (action, said) = if known {
+                        ("agent.merged", format!("{shown} was machine {id}: folded into {label}"))
+                    } else {
+                        ("agent.moved", format!("{shown} is known by its machine id {id}, shown as {label}"))
+                    };
+                    self.store.audit("kiln".into(), action.into(), said).await;
+                    folded.push(r.name.clone());
+                }
+                Err(e) => tracing::warn!(runner = %shown, machine = %id, error = %format!("{e:#}"), "a runner's record didn't fold into its machine id"),
+            }
+        }
+        if !folded.is_empty() {
+            tracing::info!(records = folded.len(), "runners' records kept under names folded into their machine ids");
+        }
+        folded
+    }
+
+    /// Sessions `moved` onto machine `id`: when every connected process of it has said what it
+    /// holds, those it holds that read disconnected are asked for their snapshots (as its
+    /// reconnect asks, `still_disconnected`) and those it doesn't hold are gone. A machine not
+    /// connected, or one whose process hasn't said yet, says on its own as it does.
+    async fn reconcile_moved(&self, id: &str, moved: &[String]) {
+        let held: Option<Vec<String>> = {
+            let inst = self.instances.lock();
+            let peers = inst.of(id);
+            (!peers.is_empty() && peers.iter().all(|p| inst.get(*p).is_some_and(|i| i.reported))).then(|| {
+                peers
+                    .iter()
+                    .flat_map(|p| inst.owned_by(*p))
+                    .filter_map(|o| match o {
+                        crate::instances::Owned::Agent(s) => Some(s),
+                        _ => None,
+                    })
+                    .collect()
+            })
+        };
+        let Some(held) = held else { return };
+        let ask = self.harness.moved_onto_connected(self, id, moved, &held);
+        // Sent, not waited for: each snapshot comes back on its session's stream.
+        for s in ask {
+            drop(self.harness.dispatch(self, &s, crate::harness::model::Command::Snapshot).await);
+            tracing::debug!(session = %s, "asked a session moved onto its connected machine for its snapshot");
+        }
+    }
+
+    /// The machine a connecting runner is (docs/machines.md, "One record a machine"), whose
+    /// certificate names it `cert`: the id itself for a certificate that names one, and for a job's
+    /// pod its pod; else the id it said before its Hello ([`AgentMsg::Machine`]), else the one kiln
+    /// knows for that name (one its certificate carried from before, or its record's). One known by
+    /// a name it never said an id for stays by it (stale once it's away). What kiln kept under the
+    /// name moves to the id now, merged with what the id has, and the name is the id's label:
+    /// nothing is keyed by it from then on. Refused, saying why, when it says another machine than
+    /// the one kiln knows for its name (a copy of that machine, or one whose id changed).
+    async fn machine_of_connection(&self, peer: PeerId, cert: &str, h: &Hello) -> Result<String, String> {
+        if h.ephemeral || crate::join::is_machine_key(cert) {
+            return Ok(cert.to_owned());
+        }
+        let said = self.said_machine.lock().get(&peer).cloned();
+        let known = self.machine_names.lock().get(cert).cloned();
+        let stored = match &known {
+            Some(_) => None,
+            None => self.store.agent_machines().await.ok().and_then(|m| m.get(cert).and_then(|s| crate::join::machine_key(Some(s)))),
+        };
+        let kept = known.clone().or(stored);
+        let id = match (said, kept) {
+            (Some(s), Some(k)) if s != k => {
+                return Err(format!("{} is machine {k}, and this runner says it is machine {s}: a copy of it, or a machine whose id changed. Forget it and join this machine again", self.shown(cert)));
+            }
+            (Some(id), _) | (None, Some(id)) => id,
+            (None, None) => return Ok(cert.to_owned()),
+        };
+        // Another process of it already connected by its name (it said no id then): this one joins
+        // it there, and the machine moves to its id once none is connected.
+        if self.is_connected(cert) {
+            tracing::info!(certificate = %cert, machine = %id, "a process of this runner is connected by its name: this one joins it, the machine moves to its id once none is");
+            return Ok(cert.to_owned());
+        }
+        let has_record = self.store.agents().await.map(|rows| rows.iter().any(|r| r.name == cert)).unwrap_or(false);
+        if known.is_none() || has_record {
+            let shown = self.shown(cert);
+            match self.move_runner(cert, &id, &shown, &h.hostname).await {
+                Ok(label) => {
+                    self.store.audit("kiln".into(), "agent.moved".into(), format!("{shown} connected as machine {id}: known by its id, shown as {label}")).await;
+                    tracing::info!(certificate = %cert, machine = %id, label = %label, "a runner whose certificate carries a name from before is known by its machine id");
+                }
+                Err(e) => return Err(format!("{shown} couldn't be known by its machine id {id} now: {e:#}")),
+            }
+        }
+        Ok(id)
     }
 
     /// Whether runner `name` has a process connected.
@@ -1804,11 +1977,31 @@ impl Hub {
 
     // ------------------------------------------------------------ reach
 
+    /// Reach's directory as runners and tools read it (`kiln runners`, MCP): [`Hub::reach_directory`],
+    /// and the records that are stale (docs/machines.md), so they're shown for a person to forget.
+    pub async fn directory(&self) -> Vec<crate::reach::directory::RunnerInfo> {
+        let mut out = self.reach_directory();
+        for a in self.agent_list().await.into_iter().filter(|a| a.stale) {
+            match out.iter_mut().find(|r| r.name == a.name) {
+                Some(r) => r.stale = true,
+                None => out.push(crate::reach::directory::RunnerInfo { name: a.name, hostname: a.hostname, label: a.label, os: a.os, arch: a.arch, stale: true, ..crate::reach::directory::RunnerInfo::default() }),
+            }
+        }
+        out
+    }
+
     /// Reach's directory (`crate::reach::directory`): every runner that is not a job pod — what it
     /// is, how busy it is, its harnesses, its reach identity and whether it takes links, and the
     /// facts it reported (what `kiln run --needs` checks).
     pub fn reach_directory(&self) -> Vec<crate::reach::directory::RunnerInfo> {
         let kinds = self.harness.kinds();
+        let was: HashMap<String, Vec<String>> = {
+            let mut m: HashMap<String, Vec<String>> = HashMap::new();
+            for (n, id) in self.machine_names.lock().iter() {
+                m.entry(id.clone()).or_default().push(n.clone());
+            }
+            m
+        };
         let relay = self.reach.lock();
         let agents = self.agents.lock();
         let mut out: Vec<crate::reach::directory::RunnerInfo> = agents
@@ -1821,6 +2014,8 @@ impl Hub {
                     name: a.name.clone(),
                     hostname: a.hostname.clone(),
                     label: a.label.clone(),
+                    was: was.get(&a.name).cloned().unwrap_or_default(),
+                    stale: false,
                     os: a.os.clone(),
                     arch: a.arch.clone(),
                     labels: a.labels.clone(),
@@ -1900,6 +2095,8 @@ impl Hub {
                 }
                 self.reach_passed(passed);
                 self.pending_peers.lock().remove(&peer);
+                self.said_machine.lock().remove(&peer);
+                self.peer_certs.lock().remove(&peer);
                 let name = self.peers.lock().remove(&peer);
                 self.relays.lost(peer);
                 self.handovers_lost(peer).await;
@@ -1946,7 +2143,7 @@ impl Hub {
                 // Anything on its control lane before its Hello is out of order: Hello comes first
                 // there. On its other lanes a frame may come before its Hello is read (it sends them
                 // once it's connected): it's let go, as it was.
-                Ok(msg) if self.agent_of(peer).is_none() && !matches!(msg, AgentMsg::Hello(_) | AgentMsg::Instance(_)) => {
+                Ok(msg) if self.agent_of(peer).is_none() && !matches!(msg, AgentMsg::Hello(_) | AgentMsg::Instance(_) | AgentMsg::Machine { .. }) => {
                     let what = crate::wire::agent_name(&msg).to_owned();
                     if lane == proto::LANE_CONTROL {
                         self.unreadable(peer, Wire::Runner, what, Code::Malformed, "out of order: before its Hello".to_owned(), true).await;
@@ -2210,6 +2407,16 @@ impl Hub {
         }
         // Says which runner process of its machine this is; precedes Hello. Again later: a new
         // build that has taken over (blue/green) says it's the newest now.
+        // The machine it is, said before its Hello (docs/machines.md, "One record a machine"): what
+        // its Hello is keyed by when its certificate carries a name from before.
+        if let Carried::Nothing(AgentMsg::Machine { id }) = msg {
+            if self.agent_of(peer).is_none()
+                && let Some(id) = crate::join::machine_key(Some(&id))
+            {
+                self.said_machine.lock().insert(peer, id);
+            }
+            return Ok(());
+        }
         if let Carried::Nothing(AgentMsg::Instance(ih)) = msg {
             let again = self.instances.lock().reannounce(peer, &ih);
             match again {
@@ -2238,7 +2445,7 @@ impl Hub {
             Carried::Read(read) => return self.on_read(peer, &agent, read).await,
         };
         match msg {
-            AgentMsg::Hello(_) | AgentMsg::Instance(_) => {}
+            AgentMsg::Hello(_) | AgentMsg::Instance(_) | AgentMsg::Machine { .. } => {}
             // What carries JSON came read (`wire::payload_of`), to `on_read`.
             AgentMsg::AiSessions { .. }
             | AgentMsg::LegResults { .. }
@@ -2644,7 +2851,7 @@ impl Hub {
             }
             FromRunner::ReachAsk { req, ask, raw } => match *ask {
                 crate::reach::Question::Directory => {
-                    let answer = serde_json::json!({ "runners": self.reach_directory() });
+                    let answer = serde_json::json!({ "runners": self.directory().await });
                     self.send_peer(peer, &ServerMsg::ReachAnswer { req, json: answer.to_string() }).await;
                 }
                 // What the runner holds of other runners' trees and let go: kept, and answered
@@ -2873,6 +3080,20 @@ impl Hub {
             refuse(format!("hello name {name} does not match certificate {cert_name:?}")).await;
             return Ok(());
         }
+        // Keyed by its machine id from here on, whatever name its certificate carries
+        // (docs/machines.md, "One record a machine").
+        let name = match self.machine_of_connection(peer, &name, &h).await {
+            Ok(id) => id,
+            Err(why) => {
+                refuse(why).await;
+                return Ok(());
+            }
+        };
+        if h.name != name {
+            self.peer_certs.lock().insert(peer, crate::pki::sanitize_name(&h.name));
+        }
+        let mut h = h;
+        h.name = name.clone();
         let now = crate::util::now_unix();
         // It says in a moment whether it keeps the channel (its Caps follow its hello and Build):
         // until then its commands wait for that (docs/wire.md, "Commands"), from before it can be
@@ -4607,6 +4828,130 @@ pub(crate) mod tests {
         })
     }
 
+    /// A Hello of runner `name`, as a runner from before on linux says it.
+    fn hello_of(name: &str) -> Hello {
+        Hello {
+            protocol: proto::VERSION,
+            name: name.to_owned(),
+            labels: Vec::new(),
+            slots: 1,
+            hostname: "fedora.attlocal.net".into(),
+            os: "linux".into(),
+            arch: "x86_64".into(),
+            version: "test".into(),
+            ephemeral: false,
+            dedicated_job: None,
+            running: Vec::new(),
+            terminal: true,
+        }
+    }
+
+    /// docs/machines.md, "One record a machine": a runner whose certificate carries a name from
+    /// before is keyed by its machine id the moment it connects, without a restart: by the id it
+    /// says before its Hello, or by the one kiln knows for the name (an older runner that says
+    /// none). What was kept under the name is the id's, the name is its label and resolves to it,
+    /// and nothing is kept under it. One saying another machine than kiln knows for its name is
+    /// refused.
+    #[test]
+    fn machines_a_runner_connecting_by_a_name_from_before_is_keyed_by_its_id_at_once() -> anyhow::Result<()> {
+        const ID: &str = "5f2a9c3e0b1d4e6f8a7c9b0d1e2f3a4b";
+        const OTHER: &str = "0b1d4e6f8a7c9b0d1e2f3a4b5f2a9c3e";
+        crate::rt::block_on(async {
+            let hub = scratch_hub().await?;
+            hub.store.upsert_agent(record("fedora", "fedora.attlocal.net", false)).await?;
+            hub.store.set_agent_machine("fedora".into(), ID.into()).await?;
+            hub.store.kv_set(format!("{}fedora", crate::harness::limit::KEY_PREFIX), "{}".into()).await?;
+            hub.pending_peers.lock().insert(1, "fedora".into());
+            hear(&hub, 1, proto::LANE_CONTROL, &AgentMsg::Machine { id: ID.into() }).await?;
+            hear(&hub, 1, proto::LANE_CONTROL, &AgentMsg::Hello(hello_of("fedora"))).await?;
+            anyhow::ensure!(hub.agent_of(1).as_deref() == Some(ID), "keyed by its id: {:?}", hub.agent_of(1));
+            anyhow::ensure!(hub.agents.lock().get(ID).is_some_and(|a| a.connected) && !hub.agents.lock().contains_key("fedora"));
+            let names: Vec<String> = hub.store.agents().await?.into_iter().map(|a| a.name).collect();
+            anyhow::ensure!(names == [ID], "one record, by its id: {names:?}");
+            anyhow::ensure!(hub.shown(ID) == "fedora", "shown by the name it had: {}", hub.shown(ID));
+            anyhow::ensure!(hub.machine_of("fedora") == ID && hub.machine_named("fedora").as_deref() == Some(ID), "the name resolves to the id");
+            anyhow::ensure!(hub.store.kv_get(format!("{}{ID}", crate::harness::limit::KEY_PREFIX)).await?.is_some(), "what was set for it is the id's");
+            anyhow::ensure!(hub.store.machine_names().await?.get("fedora").map(String::as_str) == Some(ID), "the name kept as the machine's");
+            // Another process of it, from before machine ids were said (no `Machine`): the same.
+            hub.pending_peers.lock().insert(2, "fedora".into());
+            hear(&hub, 2, proto::LANE_CONTROL, &AgentMsg::Instance(proto::InstanceHello { id: "u1".into(), created_at: 5, pid: 2 })).await?;
+            hear(&hub, 2, proto::LANE_CONTROL, &AgentMsg::Hello(hello_of("fedora"))).await?;
+            anyhow::ensure!(hub.agent_of(2).as_deref() == Some(ID), "{:?}", hub.agent_of(2));
+            // One saying it's another machine: refused, keyed by nothing.
+            hub.pending_peers.lock().insert(3, "fedora".into());
+            hear(&hub, 3, proto::LANE_CONTROL, &AgentMsg::Machine { id: OTHER.into() }).await?;
+            hear(&hub, 3, proto::LANE_CONTROL, &AgentMsg::Hello(hello_of("fedora"))).await?;
+            anyhow::ensure!(hub.agent_of(3).is_none(), "refused: {:?}", hub.agent_of(3));
+            Ok(())
+        })
+    }
+
+    /// docs/machines.md, "One record a machine": as the server starts, two records of one machine
+    /// kept under names (it joined twice, by two host names) end as one record by its id, shown by
+    /// the first's name, both names resolving to it; a record that never said its id, and a job's
+    /// pod, stay as they are.
+    #[test]
+    fn machines_two_records_of_one_machine_end_as_one_as_the_server_starts() -> anyhow::Result<()> {
+        const ID: &str = "5f2a9c3e0b1d4e6f8a7c9b0d1e2f3a4b";
+        crate::rt::block_on(async {
+            let hub = scratch_hub().await?;
+            for (name, ephemeral) in [("fedora.attlocal.net", false), ("kiln-a094a12d.attlocal.net", false), ("old-box", false), ("kiln-abc-1", true)] {
+                hub.store.upsert_agent(record(name, name, ephemeral)).await?;
+            }
+            for name in ["fedora.attlocal.net", "kiln-a094a12d.attlocal.net"] {
+                hub.store.set_agent_machine(name.into(), ID.into()).await?;
+            }
+            let folded = hub.one_record_a_machine().await;
+            anyhow::ensure!(folded == ["fedora.attlocal.net", "kiln-a094a12d.attlocal.net"], "{folded:?}");
+            let mut names: Vec<String> = hub.store.agents().await?.into_iter().map(|a| a.name).collect();
+            names.sort();
+            anyhow::ensure!(names == [ID, "kiln-abc-1", "old-box"], "{names:?}");
+            anyhow::ensure!(hub.shown(ID) == "fedora.attlocal.net", "{}", hub.shown(ID));
+            anyhow::ensure!(hub.machine_of("kiln-a094a12d.attlocal.net") == ID && hub.machine_of("fedora.attlocal.net") == ID);
+            let said = hub.store.call(|c| Ok(c.query_row("SELECT detail FROM audit2 WHERE action = 'agent.merged'", [], |r| r.get::<_, String>(0))?)).await?;
+            anyhow::ensure!(said == format!("kiln-a094a12d.attlocal.net was machine {ID}: folded into fedora.attlocal.net"), "{said}");
+            anyhow::ensure!(hub.one_record_a_machine().await.is_empty(), "once");
+            Ok(())
+        })
+    }
+
+    /// docs/machines.md, "One record a machine": sessions a record held fold onto its machine
+    /// connected now: one the machine's runner holds is asked for its snapshot at once (it reads as
+    /// it is, not disconnected), one it doesn't hold is gone, as its next inventory would say.
+    #[test]
+    fn machines_sessions_folded_onto_a_connected_machine_read_as_they_are() -> anyhow::Result<()> {
+        use crate::harness::core::Update;
+        use crate::harness::model::Status;
+        use crate::harness::registry::Location;
+        use crate::harness::session::Info;
+        const ID: &str = "5f2a9c3e0b1d4e6f8a7c9b0d1e2f3a4b";
+        crate::rt::block_on(async {
+            let hub = scratch_hub().await?;
+            let at = Location::Machine("fedora".into());
+            for s in ["held", "gone"] {
+                hub.harness.ingest(&hub, &at, s, Update::Open { info: Box::new(Info { id: s.into(), kind: "claude".into(), ..Info::default() }), since: None });
+            }
+            hub.harness.machine_lost(&hub, "fedora");
+            hub.store.upsert_agent(record("fedora", "fedora", false)).await?;
+            hub.store.set_agent_machine("fedora".into(), ID.into()).await?;
+            join_runner(&hub, 1, ID, 0);
+            {
+                let mut inst = hub.instances.lock();
+                inst.own(crate::instances::Owned::Agent("held".into()), 1);
+                inst.reported(1);
+            }
+            anyhow::ensure!(hub.harness.info("held").is_some_and(|i| i.status == Status::Disconnected));
+            anyhow::ensure!(hub.fold_duplicates(ID).await? == ["fedora"]);
+            anyhow::ensure!(hub.harness.location("held") == Some(Location::Machine(ID.into())), "{:?}", hub.harness.location("held"));
+            anyhow::ensure!(hub.harness.info("gone").is_none(), "one the machine doesn't hold is gone");
+            // What the fold asked: the snapshot of the one it holds that reads disconnected.
+            hub.harness.machine_lost(&hub, ID);
+            let asked = hub.harness.moved_onto_connected(&hub, ID, &["held".to_owned()], &["held".to_owned()]);
+            anyhow::ensure!(asked == ["held"], "its snapshot is asked for: {asked:?}");
+            Ok(())
+        })
+    }
+
     /// docs/machines.md, "Finished job pods are forgotten": a job pod's record goes once it's gone
     /// past its grace and its job ended; one gone within the grace stays.
     #[test]
@@ -4635,7 +4980,7 @@ pub(crate) mod tests {
         })
     }
 
-    /// docs/machines.md, "Runners from before": a record not connected, known by a name, whose
+    /// docs/machines.md, "Records that are stale": a record not connected, known by a name, whose
     /// runner never said its machine id, is stale (the API says `stale: true`); one that said it,
     /// one known by its id, a connected one and a job pod aren't, and say nothing of it.
     #[test]

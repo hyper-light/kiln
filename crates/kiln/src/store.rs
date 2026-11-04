@@ -1681,6 +1681,33 @@ impl Store {
         .await
     }
 
+    /// The names machines' certificates carried before kiln knew them by their ids, each with its
+    /// machine id (docs/machines.md, "One record a machine").
+    pub async fn machine_names(&self) -> anyhow::Result<std::collections::HashMap<String, String>> {
+        self.call(|c| {
+            let mut st = c.prepare("SELECT name, machine_id FROM machine_names")?;
+            let rows = st.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?;
+            Ok(rows.collect::<Result<_, _>>()?)
+        })
+        .await
+    }
+
+    /// Machine `id` forgotten: the names its certificates carried go with it. Those names.
+    pub async fn forget_machine_names(&self, id: String) -> anyhow::Result<Vec<String>> {
+        self.call(move |c| {
+            let t = tx(c)?;
+            let names: Vec<String> = {
+                let mut st = t.prepare("SELECT name FROM machine_names WHERE machine_id = ?1 ORDER BY name")?;
+                let rows = st.query_map([&id], |r| r.get::<_, String>(0))?;
+                rows.collect::<Result<_, _>>()?
+            };
+            t.execute("DELETE FROM machine_names WHERE machine_id = ?1", [&id])?;
+            t.commit()?;
+            Ok(names)
+        })
+        .await
+    }
+
     /// The machine agent `name` is, as its runner says ([`crate::os::machine_id`]): kept with the
     /// name, so a machine joining with the same host name isn't taken for it
     /// ([`crate::join::free_name`]). Unchanged, nothing is written.
@@ -1737,6 +1764,15 @@ impl Store {
                  ON CONFLICT(name) DO UPDATE SET label = COALESCE(agents.label, excluded.label), machine_id = excluded.machine_id",
                 params![to, label, hostname, crate::util::now_unix()],
             )?;
+            // The name it went by is the machine's from now on: a runner whose certificate says it
+            // is keyed by the id as it connects (docs/machines.md, "One record a machine").
+            if crate::join::is_machine_key(&to) && !crate::join::is_machine_key(&from) {
+                t.execute(
+                    "INSERT INTO machine_names (name, machine_id, at) VALUES (?1, ?2, ?3) ON CONFLICT(name) DO UPDATE SET machine_id = excluded.machine_id",
+                    params![from, to, crate::util::now_unix()],
+                )?;
+            }
+            t.execute("UPDATE machine_names SET machine_id = ?2 WHERE machine_id = ?1", params![from, to])?;
             t.execute("UPDATE jobs SET agent = ?2 WHERE agent = ?1", params![from, to])?;
             for at in ["$.runner", "$.avoid"] {
                 t.execute(&format!("UPDATE jobs SET placement = json_set(placement, '{at}', ?2) WHERE json_extract(placement, '{at}') = ?1"), params![from, to])?;

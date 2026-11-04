@@ -428,7 +428,7 @@ async fn route(hub: Arc<Hub>, req: Request) -> R {
             return Ok(crate::observe::cloud::push::pubsub(req, ok).await);
         }
         // A snapshot's file for a runner's replica, with that machine's token (`crate::observe`).
-        (&Method::GET, ["api", "observe", "v1", "snapshot", snap, file]) => return crate::observe::api::snapshot(snap, file, &req).map_err(|(c, m)| err(c, m)),
+        (&Method::GET, ["api", "observe", "v1", "snapshot", snap, file]) => return crate::observe::api::snapshot(snap, file, &req, |m| hub.machine_of(m)).map_err(|(c, m)| err(c, m)),
         (&Method::GET, ["metrics"]) => return Ok(metrics_handler(&hub, req.headers())),
         (&Method::GET, ["healthz"]) => return Ok(srv::text(StatusCode::OK, "ok")),
         (&Method::GET, ["readyz"]) => return Ok(boxed(|| readyz(&hub)).await),
@@ -499,7 +499,17 @@ pub(crate) fn boxed<'a, F: Future + Send + 'a>(make: impl FnOnce() -> F) -> Pin<
 async fn authorized(hub: Arc<Hub>, caller: crate::authz::Caller, req: Request) -> R {
     let method = req.method().clone();
     let path = req.uri().path().to_owned();
-    let seg = segments(&path);
+    let mut seg = segments(&path);
+    // A runner the path names by a name people see (its label, a name its certificate carried
+    // from before) is the machine id kiln keys it by (docs/machines.md, "One record a machine").
+    if let [api, kind, name, ..] = seg.as_mut_slice()
+        && api == "api"
+        && (kind == "runners" || kind == "agents")
+        && !["enroll", "instance", "rekey", "tunnel", "join"].contains(&name.as_str())
+        && let Some(id) = hub.machine_named(name)
+    {
+        *name = id;
+    }
     let s: Vec<&str> = seg.iter().map(String::as_str).collect();
     let q = srv::query(&req);
     if !caller.is_owner() {
@@ -1994,9 +2004,8 @@ async fn accounts_input(id: &str, req: Request) -> R {
 
 /// Whether a blob request carries the token of the machine it names (`?machine=`), or an admin's.
 fn sync_token_ok(hub: &Hub, req: &Request) -> bool {
-    let q = srv::query(req);
-    let machine = q.get("machine").map_or("", String::as_str);
-    (!machine.is_empty() && bearer(req.headers()).is_some_and(|t| crate::util::ct_eq(t.as_bytes(), hub.sync.token(machine).as_bytes())))
+    let machine = sync_machine(hub, req);
+    (!machine.is_empty() && bearer(req.headers()).is_some_and(|t| crate::util::ct_eq(t.as_bytes(), hub.sync.token(&machine).as_bytes())))
         || authed(hub, req.headers())
 }
 
@@ -2021,9 +2030,10 @@ fn sync_blob_counted(machine: &str, direction: &str, result: &str, bytes: u64) {
     }
 }
 
-/// The machine a blob request names.
-fn sync_machine(req: &Request) -> String {
-    srv::query(req).get("machine").cloned().unwrap_or_default()
+/// The machine a blob request names: by its id, whatever name the runner's certificate carries
+/// (docs/machines.md, "One record a machine").
+fn sync_machine(hub: &Hub, req: &Request) -> String {
+    srv::query(req).get("machine").filter(|m| !m.is_empty()).map(|m| hub.machine_of(m)).unwrap_or_default()
 }
 
 /// Copies of kiln.db for learners are made one at a time (each reads the whole database).
@@ -2035,7 +2045,7 @@ static CLUSTER_COPIES: async_lock::Semaphore = async_lock::Semaphore::new(1);
 /// saying so in a header (`crate::custody::cluster::COPY_HEADER`; docs/ci.md W27-R08).
 async fn cluster_copy(hub: &Hub, req: &Request) -> R {
     let q = srv::query(req);
-    let machine = q.get("machine").cloned().unwrap_or_default();
+    let machine = q.get("machine").map(|m| hub.machine_of(m)).unwrap_or_default();
     let instance = q.get("instance").filter(|i| !i.is_empty()).cloned();
     let theirs = !machine.is_empty() && bearer(req.headers()).is_some_and(|t| crate::util::ct_eq(t.as_bytes(), crate::store::learner::token(&hub.admin_token, &machine).as_bytes()));
     if !theirs && !authed(hub, req.headers()) {
@@ -2129,7 +2139,7 @@ fn sync_blob_get(hub: &Hub, hash: &str, req: &Request) -> R {
         sync_blob_counted("", direction, "unauthorized", 0);
         return Err(err(StatusCode::UNAUTHORIZED, "bad sync token"));
     }
-    let machine = sync_machine(req);
+    let machine = sync_machine(hub, req);
     let contents = hub.sync.contents();
     if req.method() == Method::HEAD {
         let held = contents.has(hash);
@@ -2232,7 +2242,7 @@ async fn sync_blob_put(hub: &Hub, hash: &str, req: Request) -> R {
         sync_blob_counted("", "up", "unauthorized", 0);
         return Err(err(StatusCode::UNAUTHORIZED, "bad sync token"));
     }
-    let machine = sync_machine(&req);
+    let machine = sync_machine(hub, &req);
     let counted = |result: &str, bytes: u64| sync_blob_counted(&machine, "up", result, bytes);
     let contents = hub.sync.contents();
     if !crate::sync::blobs::valid_hash(hash) {
@@ -2384,7 +2394,7 @@ const SYNC_BUNDLE_MAX: u64 = 64 << 30;
 /// A bundle's request: the machine it names (`?machine=`), when it carries that machine's token.
 fn bundle_machine(hub: &Hub, req: &Request) -> Option<String> {
     let q = srv::query(req);
-    let machine = q.get("machine").filter(|m| !m.is_empty())?.clone();
+    let machine = hub.machine_of(q.get("machine").filter(|m| !m.is_empty())?);
     bearer(req.headers()).is_some_and(|t| crate::util::ct_eq(t.as_bytes(), hub.sync.token(&machine).as_bytes())).then_some(machine)
 }
 
@@ -3366,6 +3376,7 @@ async fn get_artifacts(hub: &Hub, id: &str) -> R {
 // ------------------------------------------------------------------ agents
 
 async fn forget_agent(hub: &Hub, name: &str, by: &str) -> R {
+    let name = &hub.machine_of(name);
     hub.forget_agent(name, by).await?;
     hub.store.audit(by.to_owned(), "agent.forget".into(), name.to_owned()).await;
     Ok(srv::status(StatusCode::NO_CONTENT))
@@ -3628,6 +3639,10 @@ async fn enroll(hub: &Hub, req: Request) -> R {
     // by its machine id when it sent one, shown by the name it asked for unless another machine
     // has it. A job's pod has its pod's name.
     let (name, label) = if persistent || outpost {
+        // Registered by its machine id, or not at all (docs/machines.md, "One record a machine").
+        if crate::join::machine_key(r.machine_id.as_deref()).is_none() {
+            return Err(err(StatusCode::BAD_REQUEST, crate::join::NO_MACHINE_ID));
+        }
         let (name, label) = name_and_label(hub, &name, &r.hostname, crate::join::clean_machine_id(r.machine_id.as_deref()).as_deref()).await?;
         if let Some(why) = a_copy_of_a_connected_machine(hub, &name) {
             return Err(err(StatusCode::CONFLICT, why));
@@ -3697,6 +3712,20 @@ async fn enroll_instance(hub: &Hub, req: Request) -> R {
             return Err(err(StatusCode::FORBIDDEN, format!("{e:#}")));
         }
     };
+    // A process of a machine is the machine's, by its id (docs/machines.md, "One record a
+    // machine"): one whose certificate carries a name from before gets its certificate for the id.
+    let id = hub.machine_of(&name);
+    if !crate::join::is_machine_key(&id) {
+        return Err(err(StatusCode::FORBIDDEN, format!("{name} never said its machine id, so kiln can't tell which machine this process is of: start its runner once so it says, or {}", crate::join::NO_MACHINE_ID)));
+    }
+    let (name, cert) = if id == name {
+        (name, cert)
+    } else {
+        match hub.pki.sign_moved(&r.cert_pem, &r.csr, &id) {
+            Ok((_, cert)) => (id, cert),
+            Err(e) => return Err(err(StatusCode::FORBIDDEN, format!("{e:#}"))),
+        }
+    };
     // Only machines this server still knows: a forgotten (revoked) one must enroll again.
     let known = hub.store.agents().await.map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")))?.iter().any(|a| a.name == name);
     if !known {
@@ -3741,6 +3770,18 @@ async fn rekey_agent(hub: &Hub, req: Request) -> R {
     if let Some((_, why)) = revoked.iter().find(|(k, _)| *k == key) {
         crate::rt::sleep(Duration::from_millis(500)).await;
         return Err(err(StatusCode::FORBIDDEN, format!("{from}'s key was {why}")));
+    }
+    // Known by the id already (its name is one its certificate carried from before, moved as it
+    // connected): its certificate for the id is a refresh of its credentials, nothing moves, and
+    // its process being connected doesn't matter (docs/machines.md, "One record a machine").
+    if hub.machine_of(&from) == to {
+        crate::identities::record(&hub.store, "machine", &to, &cert).await.map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")))?;
+        hub.net.command(crate::net::Out::Unrevoke { name: to.clone() }).await;
+        hub.store.audit("kiln".into(), "agent.certificate".into(), format!("{} has its certificate for its machine id {to}", hub.shown(&to))).await;
+        return Ok(srv::json(
+            StatusCode::OK,
+            &crate::agent::EnrollResponse { cert_pem: cert, ca_pem: hub.pki.ca_pem.clone(), quic: hub.cfg.server.quic_advertise.clone(), name: to.clone(), label: Some(hub.shown(&to)) },
+        ));
     }
     let agents = hub.agent_list().await;
     let Some(me) = agents.iter().find(|a| a.name == from) else {
