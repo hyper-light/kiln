@@ -248,15 +248,24 @@ fn apply_shared(s: &Settings) {
 fn targets(s: &Settings, ctx: &Ctx) -> Vec<settings::Target> {
     let mut out = Vec::new();
     if s.automatic {
-        out.push(settings::Target { name: "runner disk".into(), probe: settings::Probe::Fsync { path: ctx.data_dir.display().to_string() }, tolerance_ms: None });
+        out.push(settings::Target { name: "runner disk".into(), probe: settings::Probe::Fsync { path: ctx.data_dir.display().to_string() }, tolerance_ms: None, window_ms: None });
         if ctx.server_url.starts_with("http://") {
             let server = ctx.server_url.trim_end_matches('/');
-            out.push(settings::Target { name: "kiln server".into(), probe: settings::Probe::Http { url: format!("{server}/healthz") }, tolerance_ms: None });
+            out.push(settings::Target { name: "kiln server".into(), probe: settings::Probe::Http { url: format!("{server}/healthz") }, tolerance_ms: None, window_ms: None });
             // The server's own delay, where it runs on this machine (docs/priority.md; goal 8, plan
             // 01a1a59c2b29 step 5): when its shards run ready work late, the legs and agents beside
-            // it are what's slowed first.
+            // it are what's slowed first. What it answers is how late, on average, its ready work
+            // ran since the last look, so its tolerance is its shards' own clock, their probes'
+            // period (ready work a whole period late on average is a server behind), and trouble
+            // is caught within the platform's time, as every other target's is.
             if server_here(server) {
-                out.push(settings::Target { name: SERVER_DELAY.into(), probe: settings::Probe::Delay { url: format!("{server}/healthz/delay") }, tolerance_ms: None });
+                let period = u32::try_from(crate::shard_health::PERIOD.as_millis()).unwrap_or(u32::MAX);
+                out.push(settings::Target {
+                    name: SERVER_DELAY.into(),
+                    probe: settings::Probe::Delay { url: format!("{server}/healthz/delay") },
+                    tolerance_ms: Some(period),
+                    window_ms: Some(settings::PLATFORM_TOLERANCE_MS),
+                });
             }
         }
     }
@@ -389,8 +398,10 @@ fn ran_share(stopped: Option<&Duration>, before: Option<&Duration>, span: Option
 fn run(ctx: Ctx, mut settings: Settings) {
     let _ = std::fs::create_dir_all(&ctx.dir);
     let wake: Arc<dyn Fn() + Send + Sync> = Arc::new(kick);
-    let specs = |s: &Settings| -> Vec<probes::Spec> { targets(s, &ctx).into_iter().map(|t| probes::Spec { tolerance: Duration::from_millis(u64::from(t.tolerance_ms())), name: t.name, probe: t.probe }).collect() };
-    let engine_targets = |s: &Settings| -> Vec<Target> { targets(s, &ctx).into_iter().map(|t| Target { tolerance_us: f64::from(t.tolerance_ms()) * 1e3, name: t.name }).collect() };
+    let specs = |s: &Settings| -> Vec<probes::Spec> { targets(s, &ctx).into_iter().map(|t| probes::Spec { window: Duration::from_millis(u64::from(t.window_ms())), name: t.name, probe: t.probe }).collect() };
+    let engine_targets = |s: &Settings| -> Vec<Target> {
+        targets(s, &ctx).into_iter().map(|t| Target { tolerance_us: f64::from(t.tolerance_ms()) * 1e3, window_us: t.window_ms.map(|w| f64::from(w) * 1e3), name: t.name }).collect()
+    };
     let learned_path = ctx.dir.join(LEARNED);
     let learned: Learned = read_json(&learned_path).unwrap_or_default();
     let mut engine = Engine::new(settings.policy(), engine_targets(&settings), learned, now_us());

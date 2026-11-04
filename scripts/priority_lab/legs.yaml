@@ -1,0 +1,28 @@
+# Goal 8's headroom lab (plan 01a1a59c2b29 step 5; scripts/priority_lab/headroom.sh): CI legs that
+# are CPU hogs. Each run is four jobs on the lab's runner beside the server (`hogs`), each job four
+# busy loops for ten minutes on the lab's CPUs (headroom.sh writes them in for @CPUS@): sixteen
+# threads as long as the run lasts, each job in a cgroup of its own that headroom paces.
+name: legs
+on:
+  manual: true
+jobs:
+  leg-1:
+    runs-on: [hogs]
+    timeout-minutes: 30
+    steps:
+      - run: 'for i in 1 2 3 4; do taskset -c @CPUS@ bash -c ''end=$((SECONDS + 600)); while [ $SECONDS -lt $end ]; do :; done'' & done; wait'
+  leg-2:
+    runs-on: [hogs]
+    timeout-minutes: 30
+    steps:
+      - run: 'for i in 1 2 3 4; do taskset -c @CPUS@ bash -c ''end=$((SECONDS + 600)); while [ $SECONDS -lt $end ]; do :; done'' & done; wait'
+  leg-3:
+    runs-on: [hogs]
+    timeout-minutes: 30
+    steps:
+      - run: 'for i in 1 2 3 4; do taskset -c @CPUS@ bash -c ''end=$((SECONDS + 600)); while [ $SECONDS -lt $end ]; do :; done'' & done; wait'
+  leg-4:
+    runs-on: [hogs]
+    timeout-minutes: 30
+    steps:
+      - run: 'for i in 1 2 3 4; do taskset -c @CPUS@ bash -c ''end=$((SECONDS + 600)); while [ $SECONDS -lt $end ]; do :; done'' & done; wait'

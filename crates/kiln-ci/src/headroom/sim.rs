@@ -419,7 +419,7 @@ fn run(trace: &Trace, mut control: Control, seed: u64) -> Report {
 fn v2() -> Control {
     Control::V2(Box::new(Engine::new(
         Policy { false_alarms_per_day: 1.0, probe_load_share: 0.1 },
-        vec![Target { name: "disk".into(), tolerance_us: TOLERANCE_US }],
+        vec![Target { name: "disk".into(), tolerance_us: TOLERANCE_US, window_us: None }],
         Learned::default(),
         0,
     )))

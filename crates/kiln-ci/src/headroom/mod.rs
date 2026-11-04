@@ -39,6 +39,12 @@ pub struct Policy {
 pub struct Target {
     pub name: String,
     pub tolerance_us: f64,
+    /// How soon trouble with it must be caught (µs), where that isn't its tolerance: a target that
+    /// answers with a level it measured over time, not with how long the probe took (the kiln
+    /// server's delay, kiln's docs/priority.md). Its probes are paced to this, and a probe still out
+    /// this long is harm. None: its tolerance.
+    #[serde(default)]
+    pub window_us: Option<f64>,
 }
 
 /// What the engine learned, kept between runs.
@@ -224,7 +230,8 @@ impl Engine {
         // Each target's detector: kept, or new; a changed tolerance starts it again.
         let mut detectors = BTreeMap::new();
         for t in &targets {
-            let d = learned.detectors.remove(&t.name).filter(|d| d.tolerance_us == t.tolerance_us).unwrap_or_else(|| detect::Detector::new(t.tolerance_us, now_us));
+            let mut d = learned.detectors.remove(&t.name).filter(|d| d.tolerance_us == t.tolerance_us).unwrap_or_else(|| detect::Detector::new(t.tolerance_us, now_us));
+            d.window_us = t.window_us;
             detectors.insert(t.name.clone(), d);
         }
         learned.detectors = detectors;
@@ -269,7 +276,7 @@ impl Engine {
         let d = self.learned.detectors.get(&t.name);
         let cost = d.and_then(detect::Detector::calm_us).unwrap_or(0.0);
         let delay = d.map_or(1.0, |d| d.delay_samples(self.policy.false_alarms_per_day));
-        detect::interval_us(t.tolerance_us, self.learned.knee.lag_us.unwrap_or(0.0), delay, cost, self.policy.probe_load_share)
+        detect::interval_us(t.window_us.unwrap_or(t.tolerance_us), self.learned.knee.lag_us.unwrap_or(0.0), delay, cost, self.policy.probe_load_share)
     }
 
     pub fn step(&mut self, o: &Observation) -> Plan {
@@ -589,7 +596,7 @@ mod tests {
     fn engine() -> Engine {
         Engine::new(
             Policy { false_alarms_per_day: 1.0, probe_load_share: 0.1 },
-            vec![Target { name: "disk".into(), tolerance_us: 1e6 }],
+            vec![Target { name: "disk".into(), tolerance_us: 1e6, window_us: None }],
             Learned::default(),
             0,
         )
@@ -604,7 +611,7 @@ mod tests {
     /// past the tolerance no longer speeds probing, and the disk is held to the load share too.
     #[test]
     fn a_lag_past_the_tolerance_leaves_probing_at_its_calm_pace() -> anyhow::Result<()> {
-        let targets = vec![Target { name: "disk".into(), tolerance_us: 1e6 }, Target { name: "server".into(), tolerance_us: 1e6 }];
+        let targets = vec![Target { name: "disk".into(), tolerance_us: 1e6, window_us: None }, Target { name: "server".into(), tolerance_us: 1e6, window_us: None }];
         let run = |lag: Option<f64>| {
             let mut learned = Learned::default();
             learned.knee.lag_us = lag;
@@ -628,35 +635,90 @@ mod tests {
     }
 
     /// Goal 8 (plan 01a1a59c2b29 step 5, kiln's docs/priority.md): the kiln server's own delay as a
-    /// target. Calm near 100 µs with a CI leg and an agent busy on the CPU beside it, it rises toward
-    /// its 1 s tolerance: the engine alarms, cuts kiln's CPU budget below what they use, and paces
-    /// the leg and the agent alike; once the delay comes back down with them slowed, it's calm
-    /// again, and the cut stays until the level holds.
+    /// target, as the lab measured it (2026-11-04, run 3): the mean lateness of its shards' probes
+    /// between two reads, calm near 0.43 ms, its tolerance the shards' 10 ms period, caught within the
+    /// platform's 1 s. With CI legs and agents busy on the CPU in its cgroup it rose to about 2.8 ms
+    /// (1.9 to 4.5): the engine alarms within seconds, cuts kiln's CPU budget below what they use, and
+    /// paces the leg and the agent alike; once the delay comes back down with them slowed, it's calm
+    /// again, and the cut stays until the level holds. Its probes keep the window's pace, not the
+    /// tolerance's.
     #[test]
     fn g8_s5_the_servers_delay_rising_slows_legs_and_agents() -> anyhow::Result<()> {
         let delay = "kiln server delay";
-        let mut e = Engine::new(Policy { false_alarms_per_day: 1.0, probe_load_share: 0.1 }, vec![Target { name: delay.into(), tolerance_us: 1e6 }], Learned::default(), 0);
-        let running = |share: f64| vec![Group { cpu_cores: 8.0 * share, ..group("job 01a1", 0.0, share) }, Group { cpu_cores: 4.0 * share, ..group("01a1agent", 0.0, share) }];
-        let at = |t: u64, us: f64, share: f64| Observation { now_us: t, answers: vec![(delay.into(), Answer::Took(us))], mem_free: 1e11, running: running(share), cores: Some(32.0), ..Observation::default() };
-        for i in 0..200u64 {
-            e.step(&at(i * 100_000, 100.0 + (i % 7) as f64, 1.0));
+        let target = Target { name: delay.into(), tolerance_us: 10_000.0, window_us: Some(1e6) };
+        let mut e = Engine::new(Policy { false_alarms_per_day: 1.0, probe_load_share: 0.1 }, vec![target], Learned::default(), 0);
+        let running = |cores: f64, share: f64| vec![Group { cpu_cores: 8.0 * cores * share, ..group("job 01a1", 0.0, share) }, Group { cpu_cores: 4.0 * cores * share, ..group("01a1agent", 0.0, share) }];
+        let at = |t: u64, us: f64, cores: f64, share: f64| Observation { now_us: t, answers: vec![(delay.into(), Answer::Took(us))], mem_free: 1e11, running: running(cores, share), cores: Some(32.0), ..Observation::default() };
+        // Ten minutes calm, a read every 150 ms, the legs and agents idle: the run's spread, and every
+        // two minutes a shard held 200 ms (a read's mean of 4 ms), which calibrates the threshold.
+        let calm = [300.0, 410.0, 430.0, 380.0, 520.0, 680.0, 350.0, 450.0, 400.0, 1_020.0];
+        let mut t = 0;
+        let mut every = 0.0;
+        for i in 0..4_000usize {
+            t += 150_000;
+            let us = if i % 800 == 799 { 4_000.0 } else { calm.get(i % calm.len()).copied().unwrap_or(430.0) };
+            every = e.step(&at(t, us, 0.0, 1.0)).probe_every_us.get(delay).copied().unwrap_or(0.0);
         }
-        let p = e.step(&at(200 * 100_000, 30_000.0, 1.0));
-        anyhow::ensure!(p.events.iter().any(|ev| ev.starts_with(delay)), "no alarm on the server's delay: {:?}", p.events);
+        anyhow::ensure!(e.learned.detectors.get(delay).is_some_and(|d| d.threshold(1.0) > 0.0), "calm's stalls calibrated nothing");
+        anyhow::ensure!(every > 10_000.0, "probed every {every} µs: at its tolerance's pace, not its window's");
+        // The legs and agents busy: the delay at the run's 1.9 to 4.5 ms.
+        let busy = [2_600.0, 1_900.0, 4_500.0, 2_200.0, 3_100.0, 2_500.0, 2_900.0, 1_950.0];
+        let mut alarmed = None;
+        for i in 0..400usize {
+            t += 150_000;
+            let p = e.step(&at(t, busy.get(i % busy.len()).copied().unwrap_or(2_800.0), 1.0, 1.0));
+            if p.events.iter().any(|ev| ev.starts_with(delay)) {
+                alarmed = Some((i, p));
+                break;
+            }
+        }
+        let (n, p) = alarmed.ok_or_else(|| anyhow::anyhow!("no alarm on the server's delay in a minute of it at 2.8 ms"))?;
+        anyhow::ensure!(n < 100, "the alarm took {n} reads ({} s)", n * 150 / 1000);
         anyhow::ensure!(p.status.cpu_budget.is_some_and(|b| b < 12.0), "kiln's CPU not cut below the 12 cores its work uses: {:?}", p.status);
         anyhow::ensure!(p.shares.len() == 2 && p.shares.iter().all(|s| s.share < 1.0), "the leg and the agent aren't both paced: {:?}", p.shares);
         let paced = p.shares.iter().map(|s| s.share).fold(1.0, f64::min);
         // Slowed, the server's delay comes back down.
-        let mut calm = false;
-        for i in 201..260u64 {
-            let p = e.step(&at(i * 100_000, 100.0, paced));
-            calm |= p.events.iter().any(|ev| ev.starts_with(delay) && ev.contains("back to calm"));
+        let mut back = false;
+        for i in 0..400usize {
+            t += 150_000;
+            let p = e.step(&at(t, calm.get(i % calm.len()).copied().unwrap_or(430.0), 1.0, paced));
+            back |= p.events.iter().any(|ev| ev.starts_with(delay) && ev.contains("back to calm"));
             anyhow::ensure!(p.status.cpu_budget.is_some_and(|b| b < 12.0), "the cut went before the level held: {:?}", p.status);
-            if calm {
+            if back {
                 break;
             }
         }
-        anyhow::ensure!(calm, "the server's delay came back down and the alarm stayed");
+        anyhow::ensure!(back, "the server's delay came back down and the alarm stayed");
+        Ok(())
+    }
+
+    /// Goal 8 (plan 01a1a59c2b29 step 5): a probe of a target with a window is harm only once it's
+    /// out the window, not at the tolerance (what it answers is what it measured), and the lab's
+    /// milder rises, kiln.slice's weight's 1.4 to 1.8 times calm, aren't trouble.
+    #[test]
+    fn g8_s5_a_windowed_targets_probe_out_past_its_tolerance_is_no_harm_until_its_window() -> anyhow::Result<()> {
+        let delay = "kiln server delay";
+        let mut e = Engine::new(Policy { false_alarms_per_day: 1.0, probe_load_share: 0.1 }, vec![Target { name: delay.into(), tolerance_us: 10_000.0, window_us: Some(1e6) }], Learned::default(), 0);
+        let legs = |cores: f64| vec![Group { cpu_cores: cores, ..group("job 01a1", 0.0, 1.0) }];
+        let mut t = 0;
+        for i in 0..2_000u64 {
+            t += 150_000;
+            e.step(&Observation { now_us: t, answers: vec![(delay.into(), Answer::Took(230.0 + (i % 9) as f64 * 25.0))], mem_free: 1e11, cores: Some(32.0), ..Observation::default() });
+        }
+        // The run's kiln.slice weight: the delay at 0.31 to 0.85 ms with 16 cores of legs beside it.
+        for i in 0..400u64 {
+            t += 150_000;
+            let p = e.step(&Observation { now_us: t, answers: vec![(delay.into(), Answer::Took(310.0 + (i % 11) as f64 * 50.0))], mem_free: 1e11, running: legs(16.0), cores: Some(32.0), ..Observation::default() });
+            anyhow::ensure!(p.events.is_empty() && p.status.cpu_budget.is_none(), "a rise the weights held made trouble: {:?}", p.events);
+        }
+        // A probe out twice the tolerance: no answer yet, and no harm.
+        t += 150_000;
+        let p = e.step(&Observation { now_us: t, inflight: vec![(delay.into(), 20_000.0)], mem_free: 1e11, running: legs(16.0), cores: Some(32.0), ..Observation::default() });
+        anyhow::ensure!(p.events.is_empty(), "{:?}", p.events);
+        // Out the whole window: harm.
+        t += 150_000;
+        let p = e.step(&Observation { now_us: t, inflight: vec![(delay.into(), 1e6)], mem_free: 1e11, running: legs(16.0), cores: Some(32.0), ..Observation::default() });
+        anyhow::ensure!(p.events.iter().any(|ev| ev.contains("its window 1000 ms")), "{:?}", p.events);
         Ok(())
     }
 
