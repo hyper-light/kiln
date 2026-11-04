@@ -7,6 +7,9 @@ license.workspace = true
 [features]
 # Fault injection for tests (docs/ci.md W22-AC04): `kiln agent --chaos`, `KILN_CHAOS`.
 chaos = []
+# The binary allocates through mimalloc rather than the platform's allocator: the A/B of goal 11 (plan
+# 01a1a87b2e56 step 4) measures it, by resident memory and latency, before any build takes it by default.
+mimalloc = ["dep:mimalloc"]
 
 # The wire lab drives faults only a build with `chaos` has: asked for without it, cargo says so
 # rather than running nothing (docs/wire.md, "The lab").
@@ -69,6 +72,8 @@ regex-syntax = "0.8"
 hex = "0.4.3"
 httparse = "1.10.1"
 mime_guess = "2.0.5"
+# The `mimalloc` feature's allocator (the lock's, kiln-cd's benchmarks take it too).
+mimalloc = { version = "0.1", optional = true, default-features = false }
 parking_lot = "0.12.5"
 portable-pty = "0.9.0"
 rand = "0.10.3"
