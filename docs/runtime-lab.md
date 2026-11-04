@@ -61,8 +61,8 @@ places and its run. The histograms are atomics the pools' threads write as they 
 | `kiln_compute_wait_seconds` (histogram) | How long each job waited for a thread: from its submission to its first piece. |
 | `kiln_compute_piece_seconds` (histogram) | How long each piece held its thread. A piece ends once its job has run a shard's step (250 µs) and another job waits, at the next unit of its work. |
 | `kiln_compute_longest_piece_seconds` | The longest piece yet. |
-| `kiln_blocking_wait_seconds{share}`, `kiln_blocking_run_seconds{share}` (histograms) | How long each job of the blocking pool waited for one of its share's places, and ran: `dns` (`getaddrinfo`), `store` (kiln.db's statements), `fs` (files, `/proc`, archives, a child's wait). |
-| `kiln_blocking_places{share}` | Each share's places: the most of its jobs that run at once (`crate::rt::Profile`). |
+| `kiln_blocking_wait_seconds{share}`, `kiln_blocking_run_seconds{share}` (histograms) | How long each job of the blocking pool waited for one of its share's places, and ran: `dns` (`getaddrinfo`), `store` (kiln.db's reads, each on a read-only connection of its own), `fs` (files, `/proc`, archives, a child's wait); and `store_write`, kiln.db's writer, a thread of its own that takes every call that may write in turn (goal 5). |
+| `kiln_blocking_places{share}` | Each share's places: the most of its jobs that run at once (`crate::rt::Profile`); `store_write`'s one. |
 
 ## The lab (`kiln-lab`)
 

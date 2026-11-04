@@ -13,8 +13,15 @@ hot = [
   "crates/kiln/src/api.rs",
   "crates/kiln/src/ui.rs",
   "crates/kiln/src/authz",
+  "crates/kiln/src/mcp/mod.rs",
   "crates/kiln/src/route_latency.rs",
+  "crates/kiln/src/shard_health.rs",
+  "crates/kiln/src/pool_health.rs",
   "crates/kiln/src/metrics.rs",
+  # Websockets: an agent session's live feed to its viewers, and the pages' sockets.
+  "crates/kiln/src/harness/live.rs",
+  "crates/kiln/src/harness/broadcast.rs",
+  "crates/kiln/src/wire/ui.rs",
   # Runner ingest: the hub, its link to the runners, and the processes each machine has.
   "crates/kiln/src/hub.rs",
   "crates/kiln/src/net.rs",
