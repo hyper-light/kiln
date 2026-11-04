@@ -182,6 +182,41 @@ fn labels_of(s: &str) -> Vec<(String, String)> {
     out
 }
 
+/// What held the shards past 100 µs between two scrapes, by spawn site and label (`kiln_shard_held_*`, goal 9,
+/// plan 01a1a87b2cec step 2), every shard's together: how many polls, how long they held their shards in all
+/// and a second, and the longest any had held one by the second scrape (since the server started).
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct Held {
+    pub site: String,
+    pub label: String,
+    pub polls: f64,
+    pub ms: f64,
+    pub polls_per_s: f64,
+    pub ms_per_s: f64,
+    pub longest_ms: f64,
+}
+
+/// What held the shards between `before` and `after`, `secs` apart, the most time first.
+pub fn held(before: &Scrape, after: &Scrape, secs: f64) -> Vec<Held> {
+    let mut by: BTreeMap<(String, String), Held> = BTreeMap::new();
+    for (name, labels, value) in &after.series {
+        let field = |k: &str| labels.iter().find(|(lk, _)| lk == k).map(|(_, v)| v.as_str());
+        let (Some(shard), Some(site), Some(label)) = (field("shard"), field("site"), field("label")) else { continue };
+        let want = [("shard", shard), ("site", site), ("label", label)];
+        let added = value - before.get(name, &want).unwrap_or(0.0);
+        let row = by.entry((site.to_owned(), label.to_owned())).or_insert_with(|| Held { site: site.to_owned(), label: label.to_owned(), ..Held::default() });
+        match name.as_str() {
+            "kiln_shard_held_polls_total" => row.polls += added,
+            "kiln_shard_held_seconds_total" => row.ms += added * 1000.0,
+            "kiln_shard_held_longest_seconds" => row.longest_ms = row.longest_ms.max(value * 1000.0),
+            _ => {}
+        }
+    }
+    let mut out: Vec<Held> = by.into_values().filter(|h| h.polls > 0.0).map(|h| Held { polls_per_s: h.polls / secs.max(1e-9), ms_per_s: h.ms / secs.max(1e-9), ..h }).collect();
+    out.sort_by(|a, b| b.ms.total_cmp(&a.ms));
+    out
+}
+
 /// Two scrapes' histogram buckets, the second less the first: what the window added.
 pub fn delta(before: &[(f64, f64)], after: &[(f64, f64)]) -> Vec<(f64, f64)> {
     after.iter().map(|(b, n)| (*b, n - before.iter().find(|(bb, _)| bb == b).map_or(0.0, |(_, m)| *m))).collect()
@@ -231,6 +266,22 @@ mod tests {
         assert_eq!(quantile(&v, 0.999), Some(999));
         assert_eq!(quantile(&[7], 0.999), Some(7));
         assert_eq!(quantile(&[], 0.5), None);
+    }
+
+    /// Goal 9, plan 01a1a87b2cec step 2: what held the shards in a window is each site and label's polls and
+    /// time added between the scrapes, every shard's together, the most time first; one that held nothing in
+    /// the window isn't listed.
+    #[test]
+    fn g9_s2_what_held_the_shards_is_the_window_s_own() {
+        let before = Scrape::parse("kiln_shard_held_polls_total{shard=\"0\",site=\"a.rs:1:1\",label=\"page\"} 5\nkiln_shard_held_seconds_total{shard=\"0\",site=\"a.rs:1:1\",label=\"page\"} 0.001\nkiln_shard_held_polls_total{shard=\"0\",site=\"b.rs:2:1\",label=\"\"} 1\nkiln_shard_held_seconds_total{shard=\"0\",site=\"b.rs:2:1\",label=\"\"} 0.5\n");
+        let after = Scrape::parse(
+            "kiln_shard_held_polls_total{shard=\"0\",site=\"a.rs:1:1\",label=\"page\"} 7\nkiln_shard_held_seconds_total{shard=\"0\",site=\"a.rs:1:1\",label=\"page\"} 0.003\nkiln_shard_held_polls_total{shard=\"1\",site=\"a.rs:1:1\",label=\"page\"} 1\nkiln_shard_held_seconds_total{shard=\"1\",site=\"a.rs:1:1\",label=\"page\"} 0.004\nkiln_shard_held_longest_seconds{shard=\"1\",site=\"a.rs:1:1\",label=\"page\"} 0.004\nkiln_shard_held_polls_total{shard=\"0\",site=\"b.rs:2:1\",label=\"\"} 1\nkiln_shard_held_seconds_total{shard=\"0\",site=\"b.rs:2:1\",label=\"\"} 0.5\n",
+        );
+        let h = held(&before, &after, 2.0);
+        assert_eq!(h.len(), 1, "{h:?}");
+        let page = h.first().cloned().unwrap_or_default();
+        assert_eq!((page.site.as_str(), page.label.as_str()), ("a.rs:1:1", "page"));
+        assert!((page.polls - 3.0).abs() < 1e-9 && (page.ms - 6.0).abs() < 1e-9 && (page.ms_per_s - 3.0).abs() < 1e-9 && (page.longest_ms - 4.0).abs() < 1e-9, "{page:?}");
     }
 
     #[test]

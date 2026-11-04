@@ -20,13 +20,14 @@ of its own; `/metrics` reads only those, so reading never touches a shard.
 
 | series | what it says |
 | --- | --- |
-| `kiln_shard_delay_seconds{shard}` (histogram) | How late the shard ran its ready work: a probe's timer against when the probe ran. Up to a tick of the timer wheel (100 µs) is by design. |
+| `kiln_shard_delay_seconds{shard}` (histogram) | How late the shard ran its ready work: a probe's timer against when the probe ran. Up to a tick of the timer wheel (100 µs) and the thread's timer slack (the tick again) is by design. Its buckets are 25 µs apart to 250 µs and 50 µs apart to 1 ms (`shard_health::DELAY_BUCKETS`, goal 9), so its quantiles read to tens of microseconds below a millisecond. |
 | `kiln_shard_stalled_seconds{shard}` | How long since the shard's probe last ran. A shard held in one poll shows here at once; its delay only once it's let go. |
 | `kiln_shard_busy_seconds_total{shard}` | CPU time the shard's thread has run: its rate is the share of the time the shard was busy on the CPU. Linux and macOS (Windows keeps a thread's times at its scheduler's tick). Time the host held a ready shard off the CPU isn't busy: it shows as delay, and as `host` slow polls. |
 | `kiln_shard_polls_total{shard}` | Task polls. |
 | `kiln_shard_slow_polls_total{shard,cause}` | Polls that held the shard past twice its step quantum (250 µs here, so past 500 µs), by who held it, as hyper-rt attributes them: `task` (it ran on the CPU), `blocking` (it waited inside a call), `host` (runnable, off the CPU: preempted), `unknown` (the OS couldn't tell: off the CPU on macOS, every one on Windows, and a shard's first long poll after a calm spell, since hyper-rt reads the thread's account only once a long poll has armed it). |
 | `kiln_shard_longest_poll_seconds{shard}` | The longest single poll the shard has run. |
 | `kiln_shard_scheduler_overrun_seconds{shard}` | How late the shard's steps ran after its waits, as the shard measured it: the host descheduling it, decaying as it recovers. |
+| `kiln_shard_held_polls_total{shard,site,label}`, `kiln_shard_held_seconds_total{...}`, `kiln_shard_held_longest_seconds{...}` | What held the shard: every poll past 100 µs (`hyper_rt::slow::SLOW_POLL_NS`, a tenth of goal 9's bar), counted against the spawn site of its task (`#[track_caller]`, `file:line:column`) and the label its code set (`label`: an HTTP request's route, as `read /api/harness/sessions`; `crate::route_latency::label_of`), with their holds added up and the longest. Each shard keeps its own table (`hyper_rt::slow`), which only it writes; `/metrics` reads it without a lock. |
 
 ### Each route class's latency (`kiln_route_*`, `crate::route_latency`)
 
@@ -149,6 +150,14 @@ second, their run and wait at p99, the places they held on average (`busy`: thei
 window's) and the places Little's law asks of their rate and p99 run (`little_p99`, as hyper-rt sizes
 a shard's tasks: `admission_limit`) (`blocking.<share>.*`).
 
+The shards' delay is reported to the microsecond (goal 9): all shards together and each shard
+(`shards.delay_p50_us`, `_p99_us`, `_p999_us`, `_max_us`, and `shard<N>.delay_*_us`), the max being
+the top bucket the window reached; each shard's busy share (`shard<N>.busy_share`) beside their
+mean; and the worst shard's p99.9 and busy share (`shards.worst_delay_p999_us`,
+`shards.worst_busy_share`). What held the shards past 100 µs (`kiln_shard_held_*`) is each round's
+too, in the window and over the fill (`held`, `fill_held` in `run.json`), and the report lists it by
+spawn site and label: polls and milliseconds held a second, the mean hold and the longest.
+
 The fill is reported too (`fill.*`): how long it took (`fill.s`) and the server's own numbers over it
 (its CPU share, the shards', the pools'). It is the conversation feed at its busiest: every session's
 conversation written at once and sent by each runner's shipper to the server's intake, a batch of up to
@@ -193,6 +202,11 @@ kiln-lab compare first/run.json second/run.json
 kiln-lab report run/run.json
 kiln-lab table calm=calm/run.json "16 hogs=hogs/run.json"
 ```
+
+`KILN_LAB_HOOK` names a command the lab runs as each part of a round begins and ends
+(`<hook> <event> <server's pid> <folder>`: `fill-start`, `fill-end`, `window-start`, `window-end`; the
+folder `<round>.hook`, kept when the round's kiln is removed): `scripts/shard_lab/hook.sh` has perf
+record the server over the window.
 
 A new build against main's baseline is an `ab` of the two on one machine, not a `compare` with the
 files below: they hold the baseline's numbers and machine, which another machine (or this one under

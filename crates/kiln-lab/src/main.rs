@@ -202,11 +202,13 @@ fn measure(builds: &[Build], c: &Common) -> anyhow::Result<Run> {
 fn summary_line(r: &lab::Round) -> String {
     let get = |k: &str| r.numbers.get(k).map_or_else(|| "-".to_owned(), |v| format!("{v:.2}"));
     format!(
-        "api_read p99 {} ms, websocket p99 {} ms, attach p99 {} ms, shards' delay p99 {} ms, server CPU {} ms a request",
+        "api_read p99 {} ms, websocket p99 {} ms, attach p99 {} ms, shards' delay p99.9 {} µs (worst shard {} µs), shards' busy share {}, server CPU {} ms a request",
         get("api_read.p99_ms"),
         get("websocket.p99_ms"),
         get("attach.p99_ms"),
-        get("shards.delay_p99_ms"),
+        get("shards.delay_p999_us"),
+        get("shards.worst_delay_p999_us"),
+        get("shards.busy_share"),
         get("server.cpu_ms_per_request")
     )
 }

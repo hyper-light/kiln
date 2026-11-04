@@ -379,6 +379,9 @@ pub struct ShardContext {
     /// goes on whatever its time, so each poll makes at least one operation. The loop clears it as each poll
     /// begins.
     pub(crate) coop_charged: Cell<bool>,
+    /// What the task being polled says it is doing ([`crate::futures::label`]), for the shard's table of slow
+    /// polls (`crate::slow`, kiln's goal 9). The loop clears it as each poll begins.
+    pub(crate) label: Cell<Option<&'static crate::slow::Label>>,
     // The second: the run queue, and the counters a poll counts (`LiveCounters` leads with them).
     /// The local run queue.
     pub(crate) local: LocalQueue,
@@ -521,6 +524,7 @@ impl ShardContext {
             accepting: Cell::new(true),
             coop_spent: Cell::new(false),
             coop_charged: Cell::new(false),
+            label: Cell::new(None),
             now_ns: Cell::new(0),
             activity_ns: Cell::new(None),
             activity_noted: Cell::new(false),

@@ -8,6 +8,7 @@ use std::fmt::Write as _;
 use serde::{Deserialize, Serialize};
 
 use crate::lab::{Profile, Round};
+use crate::measure::Held;
 use crate::stats::{self, Diff, Summary, Verdict};
 
 /// Every number's noise is its median's interval at this level, for one run alone.
@@ -141,6 +142,10 @@ pub fn markdown(run: &Run) -> String {
         for (k, v) in s {
             let _ = writeln!(o, "| {k} | {} | {} to {} |", fmt(v.median), fmt(v.lo), fmt(v.hi));
         }
+        let (window, fill): (fn(&Round) -> &[Held], fn(&Round) -> &[Held]) = (|r| &r.held, |r| &r.fill_held);
+        for (when, of) in [("the window", window), ("the fill", fill)] {
+            o.push_str(&held_markdown(run.rounds.iter().filter(|r| r.build == build), when, of));
+        }
         let _ = writeln!(o, "\nRounds (machine load before and after each window):\n");
         for r in run.rounds.iter().filter(|r| r.build == build) {
             let load = |l: Option<[f64; 3]>| l.map_or_else(|| "?".to_owned(), |[one, five, fifteen]| format!("{one:.1} {five:.1} {fifteen:.1}"));
@@ -172,6 +177,38 @@ pub fn markdown(run: &Run) -> String {
     if let (Some(a), Some(b)) = (builds.first(), builds.get(1)) {
         let c = Comparison::of(a, &run.numbers(a), b, &run.numbers(b)).on(machine_line(run.rounds.iter().filter(|r| &r.build == a)), machine_line(run.rounds.iter().filter(|r| &r.build == b)));
         o.push_str(&comparison_markdown(&c));
+    }
+    o
+}
+
+/// Format: the sites and labels a report lists of what held the shards, the most time first.
+const HELD_ROWS: usize = 25;
+
+/// What held a build's shards past 100 µs in `when` (the window or the fill; goal 9, plan 01a1a87b2cec step 2),
+/// in Markdown: each spawn site and label, its polls a second and the time they held a shard a second, each the
+/// mean over the rounds (a round it held nothing in counts as none), the mean hold and the longest seen.
+fn held_markdown<'a>(rounds: impl Iterator<Item = &'a Round>, when: &str, of: fn(&Round) -> &[Held]) -> String {
+    let rounds: Vec<&Round> = rounds.collect();
+    let mut by: BTreeMap<(String, String), (f64, f64, f64, f64, f64)> = BTreeMap::new();
+    for r in &rounds {
+        for h in of(r) {
+            let row = by.entry((h.site.clone(), h.label.clone())).or_default();
+            *row = (row.0 + h.polls_per_s, row.1 + h.ms_per_s, row.2 + h.polls, row.3 + h.ms, row.4.max(h.longest_ms));
+        }
+    }
+    let mut o = String::new();
+    if by.is_empty() {
+        return o;
+    }
+    #[allow(clippy::cast_precision_loss)]
+    let n = rounds.len().max(1) as f64;
+    let mut rows: Vec<((String, String), (f64, f64, f64, f64, f64))> = by.into_iter().collect();
+    rows.sort_by(|a, b| (b.1).1.total_cmp(&(a.1).1));
+    let _ = writeln!(o, "\nWhat held the shards past 100 µs in {when} (spawn site and label; each a second, the mean of {} rounds):\n", rounds.len());
+    let _ = writeln!(o, "| site | label | polls a second | ms held a second | mean hold ms | longest ms |\n| --- | --- | --- | --- | --- | --- |");
+    for ((site, label), (polls_s, ms_s, polls, ms, longest)) in rows.into_iter().take(HELD_ROWS) {
+        let mean = if polls > 0.0 { ms / polls } else { 0.0 };
+        let _ = writeln!(o, "| {site} | {label} | {} | {} | {} | {} |", fmt(polls_s / n), fmt(ms_s / n), fmt(mean), fmt(longest));
     }
     o
 }

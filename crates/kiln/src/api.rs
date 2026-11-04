@@ -166,7 +166,9 @@ impl srv::Handler for Api {
         let upgrade = req.headers().get(header::UPGRADE).is_some_and(|v| v.as_bytes().eq_ignore_ascii_case(b"websocket"));
         let class = crate::route_latency::class_of(req.method(), req.uri().path(), upgrade);
         let waited = req.extensions().get::<kiln_http::Received>().map(|r| began.saturating_duration_since(r.0));
-        let resp = match route(hub, req).await {
+        // Its polls labeled by its route, should one hold its shard (goal 9, plan 01a1a87b2cec step 2).
+        let label = crate::route_latency::label_of(req.method(), req.uri().path(), upgrade);
+        let resp = match crate::rt::labeled(label, route(hub, req)).await {
             Ok(r) => r,
             Err(e) => e.into_response(),
         };

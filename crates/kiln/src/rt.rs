@@ -457,30 +457,30 @@ pub fn shard_count() -> usize {
 
 /// Run `fut` on shard `i` (of [`shard_count`]) and no other, for a task whose work is that shard's
 /// own: a probe of its health (`crate::shard_health`), or a test holding one shard and not the
-/// rest. Whether the shard took it.
+/// rest. Whether the shard took it. The caller's place is the task's spawn site.
+#[track_caller]
 pub fn spawn_on<F: Future<Output = ()> + Send + 'static>(i: usize, fut: F) -> bool {
     let Ok(rt) = rt() else { return false };
-    rt.holders.get(i).is_some_and(|holder| hyper_rt::runtime::submit_to_holder(*holder, fut).is_ok())
+    let Some(holder) = rt.holders.get(i) else { return false };
+    hyper_rt::runtime::submit_to_holder(*holder, fut).is_ok()
 }
 
 /// Run `fut` as its own task on shard `shard` (of [`shard_count`]) for its whole life, wherever the
 /// caller is: a task that owns what belongs to that shard (each agent session's copy,
 /// `crate::harness::copies`). Refused there (its arena or control queue full), it waits as
 /// [`spawn`] does off the runtime, then runs on whichever shard takes it, said, rather than not at
-/// all, where [`spawn_on`] gives up. Goal 4, plan 01a1a59c2a9c step 2.
+/// all, where [`spawn_on`] gives up. Goal 4, plan 01a1a59c2a9c step 2. The caller's place is the
+/// task's spawn site.
+#[track_caller]
 pub fn spawn_owner<F: Future<Output = ()> + Send + 'static>(shard: usize, fut: F) {
     let slot = handoff(Box::pin(fut));
-    let there = |slot: &Arc<Mutex<Option<Boxed>>>| {
-        let holder = rt().ok().and_then(|rt| rt.holders.get(shard % rt.holders.len().max(1)).copied());
-        holder.is_some_and(|h| hyper_rt::runtime::submit_to_holder(h, bootstrap(slot)).is_ok())
-    };
-    if there(&slot) {
+    if owner_takes(shard, &slot) {
         return;
     }
     if !on_shard() {
         for _ in 0..2000 {
             std::thread::sleep(Duration::from_millis(2));
-            if there(&slot) {
+            if owner_takes(shard, &slot) {
                 return;
             }
         }
@@ -491,6 +491,26 @@ pub fn spawn_owner<F: Future<Output = ()> + Send + 'static>(shard: usize, fut: F
     }
     crate::metrics::global().panics_caught.inc();
     tracing::error!("hyper-rt refused a task on every shard (arenas or control queues full); task dropped");
+}
+
+/// Whether shard `shard` (of [`shard_count`], around again past the last) took the task in `slot`.
+#[track_caller]
+fn owner_takes(shard: usize, slot: &Arc<Mutex<Option<Boxed>>>) -> bool {
+    let Some(holder) = rt().ok().and_then(|rt| rt.holders.get(shard.checked_rem(rt.holders.len())?).copied()) else { return false };
+    hyper_rt::runtime::submit_to_holder(holder, bootstrap(slot)).is_ok()
+}
+
+/// `fut`, each of its polls labeled `label` for the shards' table of slow polls: should a poll of it hold
+/// its shard past 100 µs, the shard counts it against `label` as well as its task's spawn site
+/// (`hyper_rt::slow`; goal 9, plan 01a1a87b2cec step 2). A request's route, say
+/// (`crate::route_latency::label_of`).
+pub async fn labeled<F: Future>(label: &'static hyper_rt::slow::Label, fut: F) -> F::Output {
+    let mut fut = pin!(fut);
+    std::future::poll_fn(move |cx| {
+        hyper_rt::futures::label(label);
+        fut.as_mut().poll(cx)
+    })
+    .await
 }
 
 /// Run a `!Send` future as a task on the current shard. Refused off the runtime.
