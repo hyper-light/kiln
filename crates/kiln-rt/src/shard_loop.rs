@@ -181,6 +181,25 @@ counters! {
     /// Marks of waits dropped away from this shard that its sweeps visited: one per marked slot, never a
     /// pass over every slot.
     abandons_swept,
+    /// Operations of leaf futures charged to the tasks that polled them ([`crate::coop`]): each a reading of
+    /// the shard's clock, unless nothing could want the shard.
+    coop_charges,
+    /// Polls a charge ended: the task had held the shard past its share while something else wanted it, and
+    /// yielded at its next await ([`crate::coop`]).
+    coop_yields,
+    /// The time Critical tasks waited from joining a ready list to their polls, nanoseconds, summed: the shard's
+    /// queueing delay for that class (kiln's goal 6, `crate::coop::Class`), over [`Counters::queue_polls_critical`].
+    queue_ns_critical,
+    /// Polls of Critical tasks.
+    queue_polls_critical,
+    /// As [`Counters::queue_ns_critical`], for Normal tasks.
+    queue_ns_normal,
+    /// Polls of Normal tasks.
+    queue_polls_normal,
+    /// As [`Counters::queue_ns_critical`], for Background tasks.
+    queue_ns_background,
+    /// Polls of Background tasks.
+    queue_polls_background,
 }
 
 /// Shape: the exponential-forgetting shift of the measured scheduler overrun — an overrun not renewed
@@ -630,6 +649,7 @@ impl Shard {
             future,
             parent,
             receipt,
+            at,
         } = request;
         if self.core.shutting_down {
             count(&self.desk.live.refused_at_shutdown, 1);
@@ -647,6 +667,7 @@ impl Shard {
             parent,
             joinable: false,
             service,
+            at,
         });
         if let Ok(task) = &admitted {
             self.install_listed(task.0.slot());
@@ -660,6 +681,7 @@ impl Shard {
     }
 
     /// Spawns a joinable local task from the shard's owner (between runs).
+    #[track_caller]
     pub fn spawn_local(&mut self, future: BoxedFuture) -> Result<TaskId, RtError> {
         if self.core.shutting_down || self.core.exited {
             return Err(RtError::ShardGone {
@@ -673,6 +695,7 @@ impl Shard {
     }
 
     /// Owner-side service admission, before the future can first be polled.
+    #[track_caller]
     pub(crate) fn spawn_service_local(&mut self, future: BoxedFuture) -> Result<TaskId, RtError> {
         if self.core.shutting_down || self.core.exited {
             return Err(RtError::ShardGone {
@@ -799,6 +822,7 @@ impl Shard {
             parent,
             joinable,
             service,
+            at: _,
         } = incoming;
         let parent = parent.filter(|p| self.live(*p));
         let (generation, cancelled) = self.desk.task(slot).map_or((0, false), |cell| {
@@ -1241,9 +1265,11 @@ impl Shard {
             let ended = self.poll_slot(slot, start, quantum_ns, carried, current);
             at.mark = Some(ended);
             self.apply();
+            // With classes kept (kiln's goal 6), what arrives may go ahead of what is listed: a Critical task's
+            // timer or socket waits no longer than the budget to be seen, whether or not the polls listed any.
             if polled < batch
                 && ended.saturating_sub(since) >= budget_ns
-                && self.desk.local.listed() != at.listed_at_read
+                && (self.desk.local.listed() != at.listed_at_read || self.desk.local.has_classes())
             {
                 self.read_inputs_within(&mut at, ended);
             }
@@ -1285,7 +1311,7 @@ impl Shard {
     /// Whether any input did work.
     fn read_inputs(&mut self) -> bool {
         if !self.inputs_pending() {
-            self.desk.local.release_yielded();
+            self.desk.local.release_yielded(self.desk.now_ns.get());
             return false;
         }
         let mut did_work = self.drain_control();
@@ -1294,7 +1320,7 @@ impl Shard {
         did_work |= self.wake_ready_pollers();
         self.apply();
         did_work |= self.harvest_turn();
-        self.desk.local.release_yielded();
+        self.desk.local.release_yielded(self.desk.now_ns.get());
         self.refresh_due();
         did_work
     }
@@ -1689,6 +1715,16 @@ impl Shard {
             count(&self.desk.live.controls, 1);
             self.handle_control(message);
         }
+        // Movable spawns (`crate::runtime::submit_movable`) within what is left of the batch: those the watchdog
+        // did not move off this shard while it was held (`crate::watch`).
+        while drained < batch {
+            let Some(request) = entry.take_movable() else {
+                break;
+            };
+            drained = drained.saturating_add(1);
+            count(&self.desk.live.controls, 1);
+            self.handle_control(Control::Spawn(request));
+        }
         if drained == batch {
             // A whole batch drained may have left messages behind it: re-arm the flag (slates'
             // docs/bugs/2026-09-17-control-drain-forgets-a-burst-past-one-batch.md).
@@ -1829,17 +1865,28 @@ impl Shard {
         let Some((mut future, service, word)) = self.take_to_poll(slot, current) else {
             return start;
         };
+        // How long it waited from joining a ready list (kiln's goal 6).
+        self.count_wait(slot, start);
         // Never dropped: the vtable's drop does nothing (`crate::waker`), and an indirect call to it a poll is
         // all a drop would add.
         let waker = std::mem::ManuallyDrop::new(waker_for(word));
         let mut cx = Context::from_waker(&waker);
         self.desk.current.set(word.word());
         self.desk.now_ns.set(start);
+        // Each poll starts within its share (`crate::coop`).
+        self.desk.coop_spent.set(false);
+        // Which poll runs, and its task, for the watchdog (`crate::watch`).
+        if let Some(entry) = self.desk.entry {
+            entry.watch.begin(word.word());
+        }
         let entered = registry::enter_in(current, &self.desk);
         // The poll is the task's code: inside an unwind boundary of the shard's own, so a task that
         // panics ends there, typed, and costs the shard and its other tasks nothing (CLAUDE.md §1).
         let poll = crate::unwind::contained(|| future.poll(&mut cx));
         drop(entered);
+        if let Some(entry) = self.desk.entry {
+            entry.watch.end();
+        }
         let ended = self.carried_from(carried).max(start);
         self.desk.current.set(crate::shard::NO_TASK);
         // A request served in this poll opens the idle window from where the poll ended, not where it began:
@@ -1852,6 +1899,8 @@ impl Shard {
         // finished in one poll has them installed, linked and so cancelled with it.
         self.apply();
         let elapsed = ended.saturating_sub(start);
+        // Its class's share of the shard (`crate::queue`, kiln's goal 6).
+        self.desk.local.charge(slot, elapsed);
         // How long the poll held the shard unasked (docs/runtime.md §3.11): from its start, or from the last
         // time it asked `wanted` and was let go on; long past twice the quantum, which a task that asks once a
         // quantum and yields when told to never reaches.
@@ -1915,6 +1964,20 @@ impl Shard {
         }
         task.state = State::Running;
         Some((future, service, word))
+    }
+
+    /// Counts the wait of the task in `slot`, from joining a ready list to its poll at `start`, to its class.
+    #[inline(always)]
+    fn count_wait(&self, slot: u32, start: u64) {
+        let waited = start.saturating_sub(self.desk.local.listed_ns(slot));
+        let live = &self.desk.live;
+        let (sum, polls) = match self.desk.local.class_of(slot) {
+            crate::coop::Class::Critical => (&live.queue_ns_critical, &live.queue_polls_critical),
+            crate::coop::Class::Normal => (&live.queue_ns_normal, &live.queue_polls_normal),
+            crate::coop::Class::Background => (&live.queue_ns_background, &live.queue_polls_background),
+        };
+        count(sum, waited);
+        count(polls, 1);
     }
 
     /// Counts a poll that ran `elapsed` and was `attributed`.
@@ -2230,7 +2293,7 @@ fn count_long_poll(counters: &LiveCounters, attributed: Attribution) {
 }
 
 /// Adds `by` to a counter, saturating: a counter never wraps back to small.
-fn count(counter: &std::cell::Cell<u64>, by: u64) {
+pub(crate) fn count(counter: &std::cell::Cell<u64>, by: u64) {
     counter.set(counter.get().saturating_add(by));
 }
 

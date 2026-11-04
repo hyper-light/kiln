@@ -58,10 +58,14 @@ pub struct SpawnRequest {
     pub parent: Option<Encoded>,
     /// The receipt to answer at admission; none for a fire-and-forget submission.
     pub receipt: ReceiptSlot,
+    /// Where it was made (`#[track_caller]`): what the watchdog names for its task should it hold its shard
+    /// (`crate::watch`).
+    pub(crate) at: &'static std::panic::Location<'static>,
 }
 
 impl SpawnRequest {
     /// A request whose admission nobody reads.
+    #[track_caller]
     pub fn new(
         future: Pin<Box<dyn Future<Output = ()> + Send + 'static>>,
         parent: Option<Encoded>,
@@ -70,10 +74,12 @@ impl SpawnRequest {
             future,
             parent,
             receipt: ReceiptSlot::none(),
+            at: std::panic::Location::caller(),
         }
     }
 
     /// A request whose admission the submitter reads: the request, and the receipt it answers.
+    #[track_caller]
     pub fn with_receipt(
         future: Pin<Box<dyn Future<Output = ()> + Send + 'static>>,
         parent: Option<Encoded>,
@@ -84,6 +90,7 @@ impl SpawnRequest {
                 future,
                 parent,
                 receipt: slot,
+                at: std::panic::Location::caller(),
             },
             receipt,
         )

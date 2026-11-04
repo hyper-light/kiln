@@ -33,8 +33,9 @@ touching the copy Focal, Mantle and Quiver share.
 
 ## What differs from upstream
 
-Behavior: nothing. `src/`, `tests/` and `benches/` are upstream's but for the two calls below;
-`diff -r vendor/hyper-raft/crates/hyper-rt crates/kiln-rt` shows each row.
+Behavior: what kiln's goal 6 (plan `01a1a59c2abe`, "Shards that protect themselves") added, in the rows
+from `src/coop.rs` on; else nothing. `src/`, `tests/` and `benches/` are upstream's but for those and the two
+calls below; `diff -r vendor/hyper-raft/crates/hyper-rt crates/kiln-rt` shows each row.
 
 | File | Change | Why |
 |---|---|---|
@@ -42,6 +43,9 @@ Behavior: nothing. `src/`, `tests/` and `benches/` are upstream's but for the tw
 | `clippy.toml` | new: hyper-raft's root `clippy.toml`, less raft-proto's accessors and the no-`Arc` entry, with parking_lot's locks refused | clippy reads the `clippy.toml` nearest a crate's manifest, and hyper-raft's root isn't in kiln; the lockless rule below |
 | `src/sync/mod.rs` | `Semaphore::try_acquire` and `Acquire::poll` call `AtomicU64::try_update` where upstream calls `fetch_update` | Rust 1.99 deprecates `fetch_update`, renamed `try_update`, and kiln's clippy runs `-D warnings` on stable (1.99.1); upstream pins 1.98.1, which has both names (Mantle builds kiln-rt on it). The same function under its new name: no behavior changes. Upstream's to take when it moves past 1.98 |
 | `ORIGIN.md` | this file, upstream's below | |
+| `src/coop.rs` (new), `src/shard.rs` (`charge`, `wanted_untimed`, `coop_spent`), the leaves' polls (`futures.rs`'s `Sleep` and `Join`, `sync/mod.rs`'s receives, sends, notifications, watches and permits, `readiness.rs`'s `Ready`, `tcp/mod.rs`'s and `local.rs`'s accepts, reads and writes, `udp/mod.rs`'s send and receive, `signal.rs`'s `Recv`), `shard_loop.rs` (`coop_spent` cleared as each poll begins; `Counters::coop_charges`, `coop_yields`) | a task's turn by time with no hand-placed yields: each operation of a leaf charges the polling task, and past its share (the step quantum) with anything else wanting the shard the leaf answers `Pending`, its task woken, so the task yields at its next await; `consume_budget` for a long computation. A simulated shard never yields by budget | kiln's goal 6, step 1: upstream yields only where code asks (`maybe_yield`), five places in kiln; Tokio's leaves yield on a budget (research `01a1a59c2abf`, f2), Seastar's tasks on a time quota (f7). `tests/coop_budget.rs` |
+| `src/watch.rs` (new), `src/registry.rs` (`Entry::watch`, `board`, `movable`, `spawned_at`, `os_thread`; `push_movable`, `shard_runnable`, `location`), `src/runtime.rs` (the `Watchdog` a `Runtime` starts and stops; `submit_movable`), `src/thread_clock.rs` (`os_thread`, `runnable`), `src/shard_loop.rs` (`Watch::begin` and `end` around each poll; the movable spawns drained with control), `src/shard.rs`, `src/task.rs`, `src/futures.rs`, `src/sim.rs` (`#[track_caller]` at every spawn, the site recorded in the slot) | a watchdog thread per runtime: a shard held in one poll past `batch` × its quantum is marked (`watch::stalled`) and reported, rate-limited to 5 a minute a shard, with its task, its spawn site and whose the time was; movable spawns waiting for it go to another shard | kiln's goal 6, step 2: Seastar's stall detector and Go's sysmon (f8, f13); no backtrace, as `watch.rs` says why. `tests/watchdog.rs` |
+| `src/queue.rs` (classes' lists, `listed_ns`), `src/shard.rs` (a spawn takes its spawner's class; listings stamped), `src/shard_loop.rs` (each poll's time charged to its class and its wait counted, `Counters::queue_ns_*`, `queue_polls_*`; inputs read once a budget while classes are kept), `src/coop.rs` (`Class`, `set_class`, `class`) | task classes: Critical, Normal (the default) and Background, each with work given an equal share of the shard's time and the most urgent first where they have run alike; a shard whose tasks take no class runs Normal's lists alone, as before. Each class's queueing delay counted | kiln's goal 6, steps 3 and 4: Seastar's scheduling groups and Google's criticalities (f10, f16). `tests/classes.rs`, `queue.rs`'s tests |
 
 ## The rules
 

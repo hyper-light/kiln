@@ -208,6 +208,79 @@ pub(crate) fn read(_handle: u64) -> Option<CpuReading> {
 #[cfg(all(any(target_os = "linux", target_os = "macos", windows), not(miri)))]
 const TAG: u64 = 1 << 63;
 
+/// The calling thread's id in the kernel (Linux: `gettid`), which `/proc/self/task/<tid>` names, for an observer
+/// that reads the thread's state ([`runnable`]); `None` elsewhere, where the clock's handle names the thread.
+#[cfg(all(target_os = "linux", not(miri)))]
+pub(crate) fn os_thread() -> Option<u64> {
+    u64::try_from(rustix::thread::gettid().as_raw_nonzero().get()).ok()
+}
+
+/// No kernel id beside the clock's handle here.
+#[cfg(any(miri, not(target_os = "linux")))]
+pub(crate) fn os_thread() -> Option<u64> {
+    None
+}
+
+/// Whether the thread `os_thread` names (its kernel id, [`os_thread`]) is runnable now, running or waiting for a
+/// CPU, rather than waiting inside a call: its state in `/proc/self/task/<tid>/stat`, the field after the
+/// command's closing parenthesis (`proc(5)`: `R` running, `S` sleeping in an interruptible wait, `D` waiting
+/// uninterruptibly, usually for a disk). `None` for any other state or a read refused.
+#[cfg(all(target_os = "linux", not(miri)))]
+pub(crate) fn runnable(_clock: u64, os_thread: u64) -> Option<bool> {
+    if os_thread == 0 {
+        return None;
+    }
+    let stat = std::fs::read_to_string(format!("/proc/self/task/{os_thread}/stat")).ok()?;
+    let (_, after) = stat.rsplit_once(')')?;
+    match after.trim_start().chars().next()? {
+        'R' => Some(true),
+        'S' | 'D' => Some(false),
+        _ => None,
+    }
+}
+
+/// Whether the thread whose clock handle is `clock` (its Mach port, tagged) is runnable now rather than waiting:
+/// its `run_state` in `thread_basic_info` (`osfmk/mach/thread_info.h`: `TH_STATE_RUNNING` 1, `TH_STATE_WAITING` 3,
+/// `TH_STATE_UNINTERRUPTIBLE` 4). `None` for any other state or a read refused.
+#[cfg(all(target_os = "macos", not(miri)))]
+pub(crate) fn runnable(clock: u64, _os_thread: u64) -> Option<bool> {
+    /// Format: `TH_STATE_RUNNING`, `TH_STATE_WAITING` and `TH_STATE_UNINTERRUPTIBLE` (`osfmk/mach/thread_info.h`).
+    const RUNNING: i32 = 1;
+    const WAITING: i32 = 3;
+    const UNINTERRUPTIBLE: i32 = 4;
+    if clock & TAG == 0 {
+        return None;
+    }
+    let port = libc::mach_port_t::try_from(clock & !TAG).ok()?;
+    // SAFETY: an all-zero `thread_basic_info` is a valid value of the C struct (integers and `time_value_t`s).
+    let mut info: libc::thread_basic_info = unsafe { std::mem::zeroed() };
+    let mut count = libc::THREAD_BASIC_INFO_COUNT;
+    // SAFETY: as in `read`: `info` is this frame's own value, `count` words long as `THREAD_BASIC_INFO` requires; a
+    // port of a thread that has exited is refused, which the status check turns into `None`.
+    let status = unsafe {
+        libc::thread_info(
+            port,
+            libc::THREAD_BASIC_INFO as libc::thread_flavor_t,
+            (&raw mut info).cast(),
+            &mut count,
+        )
+    };
+    if status != libc::KERN_SUCCESS {
+        return None;
+    }
+    match info.run_state {
+        RUNNING => Some(true),
+        WAITING | UNINTERRUPTIBLE => Some(false),
+        _ => None,
+    }
+}
+
+/// No thread state an observer can read here (Windows, Miri).
+#[cfg(any(miri, not(any(target_os = "linux", target_os = "macos"))))]
+pub(crate) fn runnable(_clock: u64, _os_thread: u64) -> Option<bool> {
+    None
+}
+
 /// Seconds and nanoseconds as nanoseconds.
 #[cfg(all(target_os = "linux", not(miri)))]
 fn nanos(seconds: u64, nanos: u64) -> Option<u64> {

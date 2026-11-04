@@ -85,6 +85,9 @@ pub(crate) struct Incoming {
     pub(crate) parent: Option<u32>,
     pub(crate) joinable: bool,
     pub(crate) service: bool,
+    /// Where it was spawned (`#[track_caller]`): what the watchdog names for a task that holds its shard
+    /// (`crate::watch`).
+    pub(crate) at: &'static std::panic::Location<'static>,
 }
 
 /// A poller's readiness question: a task that owns a ring the loop cannot see (a client's command ring in
@@ -365,6 +368,10 @@ pub struct ShardContext {
     pub(crate) is_sim: bool,
     /// Admission is paused while owned futures are cancelled, and closed at shutdown.
     pub(crate) accepting: Cell<bool>,
+    /// Whether the task being polled has used its share while something else wants the shard
+    /// ([`crate::coop`]): every leaf it polls answers `Pending` until its poll ends. The loop clears it as each
+    /// poll begins.
+    pub(crate) coop_spent: Cell<bool>,
     // The second: the run queue, and the counters a poll counts (`LiveCounters` leads with them).
     /// The local run queue.
     pub(crate) local: LocalQueue,
@@ -505,6 +512,7 @@ impl ShardContext {
             asked: Cell::new(false),
             current: Cell::new(NO_TASK),
             accepting: Cell::new(true),
+            coop_spent: Cell::new(false),
             now_ns: Cell::new(0),
             activity_ns: Cell::new(None),
             activity_noted: Cell::new(false),
@@ -627,13 +635,7 @@ impl ShardContext {
     /// step a yield. An answer of no is the shard letting the task go on: the loop judges the poll's hold
     /// from the last one (`checked_ns`).
     pub fn wanted(&self) -> bool {
-        if self.is_sim
-            || !self.local.is_empty()
-            || self.asked.get()
-            || self
-                .entry
-                .is_some_and(|entry| entry.wakes.is_pending() || entry.control_pending.is_pending())
-        {
+        if self.is_sim || self.wanted_untimed() {
             return true;
         }
         let now = self.now_ns();
@@ -643,6 +645,50 @@ impl ShardContext {
         // Told no: the task may go on, and the loop judges its hold from here (`checked_ns`).
         self.checked_ns.set(now);
         false
+    }
+
+    /// What of [`ShardContext::wanted`] needs no time: a task listed or yielded, an intent unapplied, a wake or
+    /// control message from another thread.
+    fn wanted_untimed(&self) -> bool {
+        !self.local.is_empty()
+            || self.asked.get()
+            || self
+                .entry
+                .is_some_and(|entry| entry.wakes.is_pending() || entry.control_pending.is_pending())
+    }
+
+    /// One charge of the task being polled ([`crate::coop`]): whether it goes on with its operation. No once it
+    /// has held the shard past its share (the quantum) since its poll began or the shard last let it go on,
+    /// while anything else wants the shard: it then yields at this await, and every later charge of its poll
+    /// answers no. Past its share with nothing wanting the shard, it is let go on, as `wanted`'s no lets it,
+    /// and its hold counts from here. Yes between polls, off a task, and on a simulated shard.
+    pub(crate) fn charge(&self) -> bool {
+        if self.current.get() == NO_TASK || self.is_sim {
+            return true;
+        }
+        if self.coop_spent.get() {
+            return false;
+        }
+        crate::shard_loop::count(&self.live.coop_charges, 1);
+        let untimed = self.wanted_untimed();
+        let due = self.due_ns.get();
+        // Nothing could want the shard: no time is needed to say go on.
+        if !untimed && due == u64::MAX {
+            return true;
+        }
+        let now = self.now_ns();
+        // The poll's start (published as it began) or the shard's last let-go, whichever is later.
+        let from = self.now_ns.get().max(self.checked_ns.get());
+        if now.saturating_sub(from) < self.quantum_ns.get() {
+            return true;
+        }
+        if untimed || now >= due {
+            self.coop_spent.set(true);
+            crate::shard_loop::count(&self.live.coop_yields, 1);
+            return false;
+        }
+        self.checked_ns.set(now);
+        true
     }
 
     /// The online wake estimate, nanoseconds (the quantum).
@@ -709,27 +755,32 @@ impl ShardContext {
 
     /// Spawns a joinable task under `parent` (a slot of this shard), answered at once with its id; the loop
     /// installs it before the next poll. Refused `TooManyTasks` when no slot is free.
+    #[track_caller]
     pub fn spawn_local(&self, future: BoxedFuture, parent: Option<u32>) -> Result<TaskId, RtError> {
         self.claim(Incoming {
             future: TaskFuture::Boxed(future),
             parent,
             joinable: true,
             service: false,
+            at: std::panic::Location::caller(),
         })
     }
 
     /// Spawns a detached task on this shard: nobody joins it, and its slot is freed when it ends.
+    #[track_caller]
     pub fn spawn_detached(&self, future: BoxedFuture) -> Result<TaskId, RtError> {
         self.claim(Incoming {
             future: TaskFuture::Boxed(future),
             parent: None,
             joinable: false,
             service: false,
+            at: std::panic::Location::caller(),
         })
     }
 
     /// Spawns a joinable service. Cancellation wakes the future; it must await
     /// `futures::cancelled`, retire its external ownership, and return Ready.
+    #[track_caller]
     pub(crate) fn spawn_service_local(
         &self,
         future: BoxedFuture,
@@ -740,6 +791,7 @@ impl ShardContext {
             parent,
             joinable: true,
             service: true,
+            at: std::panic::Location::caller(),
         })
     }
 
@@ -752,6 +804,7 @@ impl ShardContext {
         parent: Option<u32>,
         joinable: bool,
         service: bool,
+        at: &'static std::panic::Location<'static>,
     ) -> Result<TaskId, RtError> {
         let future = TaskFuture::Framed(self.frames.put(future)?);
         self.claim(Incoming {
@@ -759,6 +812,7 @@ impl ShardContext {
             parent,
             joinable,
             service,
+            at,
         })
     }
 
@@ -789,6 +843,10 @@ impl ShardContext {
             return Err(RtError::TooManyTasks { capacity });
         };
         cell.phase.set(Phase::Live);
+        // Where it was spawned, for the watchdog to name it should it hold the shard (`crate::watch`).
+        if let Some(entry) = self.entry {
+            entry.note_spawned_at(slot, incoming.at);
+        }
         cell.service.set(incoming.service);
         cell.cancelled.set(false);
         cell.cancel_children.set(false);
@@ -797,10 +855,16 @@ impl ShardContext {
         let parented = incoming.parent.is_some();
         cell.parented.set(parented);
         cell.incoming.set(Some(incoming));
+        // A task spawned by a task takes its spawner's class (`crate::coop::Class`): a request's helpers share
+        // its urgency. Anything else starts Normal.
+        let class = self
+            .current_slot()
+            .map_or(crate::coop::Class::Normal, |spawner| self.local.class_of(spawner));
+        let _ = self.local.set_class(slot, class);
         if parented {
             self.ask(slot, ask::INSTALL);
         } else {
-            self.local.push(slot);
+            self.local.push(slot, self.listing_ns());
         }
         // Counted at its admission, here, whenever the loop installs it (`Counters::spawns`).
         self.live
@@ -840,7 +904,7 @@ impl ShardContext {
             cell.cancelled.set(true);
         }
         self.ask(slot, ask::CANCEL);
-        self.local.push(slot);
+        self.local.push(slot, self.listing_ns());
         Ok(())
     }
 
@@ -1440,8 +1504,16 @@ impl ShardContext {
         if current != NO_TASK && Encoded::from_word(current).slot() == slot {
             self.local.defer(slot);
         } else {
-            self.local.push(slot);
+            self.local.push(slot, self.listing_ns());
         }
+    }
+
+    /// The time a slot listed now waits from: the latest the shard knows with no reading of its own, the loop's
+    /// published time or a later live reading handed out (a charge's, `crate::coop`), so a wake within a long
+    /// poll is not stamped at that poll's start.
+    #[inline]
+    fn listing_ns(&self) -> u64 {
+        self.now_ns.get().max(self.latest_ns.get())
     }
 
     // ------------------------------------------------------------------ helpers

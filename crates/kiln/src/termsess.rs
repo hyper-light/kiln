@@ -113,7 +113,7 @@ pub struct Attachment {
     /// Bytes that bring a fresh terminal to the session's current state.
     pub replay: Vec<u8>,
     /// Everything after the replay.
-    pub live: async_broadcast::Receiver<Frame>,
+    pub live: crate::rt::Subscription<Frame>,
     /// Set when the session had already ended.
     pub ended: Option<(Option<i32>, Option<String>)>,
 }
