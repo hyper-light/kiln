@@ -109,6 +109,13 @@ pub struct Server {
     /// itself: a forwarded or NATed port, a host's Tailscale address. Empty: `webrtc_addr`, or (on
     /// every address) each LAN address of this machine at its port.
     pub webrtc_advertise: Vec<String>,
+    /// A shard whose queueing delay leaves its calm answers Background requests 503 with `Retry-After`,
+    /// and Normal ones too while the API's own delay does; Critical ones (health, sign-in, a person's
+    /// pages and actions) never (`crate::overload`, kiln's goal 6). Off until declared, as what kiln
+    /// decides on its own is (docs/ci.md §0.3, "Opt-in automation"): the delays and alarms are
+    /// measured and shown on `/metrics` and `/readyz` either way, and off, nothing is refused.
+    /// `KILN_SHED` overrides it.
+    pub shed: bool,
     /// Cores of the server's own (docs/priority.md, "Cores of its own"; goal 8, plan 01a1a59c2b29
     /// step 6), as a CPU list (`8-15`, `2,4-7`): on Linux `kiln install` gives its `kiln.slice`
     /// these alone (`AllowedCPUs=`) and, installed system-wide, makes them a cpuset partition that
@@ -419,6 +426,7 @@ impl Default for Server {
             pages_url: None,
             webrtc_addr: None,
             webrtc_advertise: Vec::new(),
+            shed: false,
             cores: None,
         }
     }
@@ -598,6 +606,10 @@ impl Config {
         }
         if let Ok(v) = std::env::var("KILN_WEBRTC_ADVERTISE") {
             cfg.server.webrtc_advertise = v.split(',').map(str::trim).filter(|a| !a.is_empty()).map(str::to_owned).collect();
+        }
+        // `[server] shed`, as a lab's server takes its settings (`kiln-lab ab --env-b KILN_SHED=1`).
+        if let Ok(v) = std::env::var("KILN_SHED") {
+            cfg.server.shed = !matches!(v.trim(), "0" | "false" | "off" | "no");
         }
         Ok(cfg)
     }

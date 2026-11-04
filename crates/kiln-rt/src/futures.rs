@@ -70,8 +70,10 @@ pub fn current_task() -> Option<TaskId> {
 }
 
 /// Spawns a joinable task on the current shard with no parent.
+#[track_caller]
 pub fn spawn<F: Future<Output = ()> + 'static>(future: F) -> Result<TaskId, RtError> {
-    registry::with_current(|ctx| ctx.spawn_framed(future, None, true, false))
+    let at = std::panic::Location::caller();
+    registry::with_current(|ctx| ctx.spawn_framed(future, None, true, false, at))
         .ok_or(RtError::NotOnShardThread)?
 }
 
@@ -80,8 +82,10 @@ pub fn spawn<F: Future<Output = ()> + 'static>(future: F) -> Result<TaskId, RtEr
 /// Cleanup after driver loss must use channel completions, not new native readiness waits.
 /// A service must turn typed failures into cleanup. A panicked future cannot be safely
 /// resumed; this opt-in does not promise recovery from panic or a blocking destructor.
+#[track_caller]
 pub fn spawn_service<F: Future<Output = ()> + 'static>(future: F) -> Result<TaskId, RtError> {
-    registry::with_current(|ctx| ctx.spawn_framed(future, None, true, true))
+    let at = std::panic::Location::caller();
+    registry::with_current(|ctx| ctx.spawn_framed(future, None, true, true, at))
         .ok_or(RtError::NotOnShardThread)?
 }
 
@@ -142,16 +146,20 @@ impl Future for Cancelled {
 
 /// Spawns a detached task on the current shard: nobody joins it, and its slot is freed when it ends (a
 /// server's per-connection task).
+#[track_caller]
 pub fn spawn_detached<F: Future<Output = ()> + 'static>(future: F) -> Result<TaskId, RtError> {
-    registry::with_current(|ctx| ctx.spawn_framed(future, None, false, false))
+    let at = std::panic::Location::caller();
+    registry::with_current(|ctx| ctx.spawn_framed(future, None, false, false, at))
         .ok_or(RtError::NotOnShardThread)?
 }
 
 /// Spawns a joinable child of the current task; a parent's completion cancels and joins it.
+#[track_caller]
 pub fn spawn_child<F: Future<Output = ()> + 'static>(future: F) -> Result<TaskId, RtError> {
+    let at = std::panic::Location::caller();
     registry::with_current(|ctx| {
         let parent = ctx.current_task().map(|t| t.0.slot());
-        ctx.spawn_framed(future, parent, true, false)
+        ctx.spawn_framed(future, parent, true, false, at)
     })
     .ok_or(RtError::NotOnShardThread)?
 }
@@ -183,6 +191,10 @@ impl Future for Join {
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         let id = self.id;
         registry::with_current(|ctx| {
+            // A join is a charge of its task's turn (`crate::coop`), taken before the outcome is.
+            if crate::coop::proceed_in(ctx, cx).is_pending() {
+                return Poll::Pending;
+            }
             ctx.poll_join(id, crate::waker::polling_task_in(ctx, cx.waker()))
         })
         .unwrap_or(Poll::Ready(Err(RtError::NotOnShardThread)))
@@ -298,6 +310,11 @@ impl Future for Sleep {
         let Some(word) = polling_task(cx.waker()) else {
             return Poll::Ready(Err(RtError::NotOnShardThread));
         };
+        // A timer is a charge of its task's turn (`crate::coop`): past its share, the task yields here, its
+        // timer kept as it was.
+        if crate::coop::poll_proceed(cx).is_pending() {
+            return Poll::Pending;
+        }
         if registry::with_current(|ctx| ctx.driver_lost()) == Some(true) {
             if let Some(id) = self.timer.take() {
                 let _ = registry::with_current(|ctx| ctx.disarm_timer(id));

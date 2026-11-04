@@ -120,6 +120,11 @@ impl TcpIo {
 
 impl AsyncRead for TcpIo {
     fn poll_read(self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &mut [u8]) -> Poll<io::Result<usize>> {
+        // A read is a charge of the connection task's turn on its shard (hyper_rt::coop, kiln's goal 6): a
+        // socket that always has bytes yields past the task's share, as one that waits does at its wait.
+        if hyper_rt::coop::poll_proceed(cx).is_pending() {
+            return Poll::Pending;
+        }
         let this = self.get_mut();
         if std::mem::take(&mut this.drained) && this.read_wait.is_none() && is_native(cx) {
             let mut ready = this.stream.readable();
@@ -143,11 +148,19 @@ impl AsyncRead for TcpIo {
 
 impl AsyncWrite for TcpIo {
     fn poll_write(self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &[u8]) -> Poll<io::Result<usize>> {
+        // A write is a charge of the connection task's turn (hyper_rt::coop): a socket that always has room
+        // yields past the task's share.
+        if hyper_rt::coop::poll_proceed(cx).is_pending() {
+            return Poll::Pending;
+        }
         let this = self.get_mut();
         poll_io(&mut this.write_wait, &this.stream, true, cx, |s| s.try_write(buf))
     }
 
     fn poll_write_vectored(self: Pin<&mut Self>, cx: &mut Context<'_>, bufs: &[IoSlice<'_>]) -> Poll<io::Result<usize>> {
+        if hyper_rt::coop::poll_proceed(cx).is_pending() {
+            return Poll::Pending;
+        }
         let this = self.get_mut();
         match bufs {
             [] => Poll::Ready(Ok(0)),

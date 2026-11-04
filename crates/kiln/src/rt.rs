@@ -8,6 +8,10 @@
 //!   them in the OS's priority) and calls that block go to the blocking pool ([`blocking`]).
 //! * [`spawn`] keeps a task on the calling shard (locality: sockets and timers stay where they were
 //!   registered); spawns from outside the runtime are spread round-robin over the shards.
+//! * A task gives up its shard on time with no hand-placed yields: hyper-rt charges its leaf futures
+//!   (sockets, timers, its channels) to the polling task, and the cross-task primitives here charge
+//!   the same budget (`hyper_rt::coop`, kiln's goal 6), so a loop whose waits are always ready yields
+//!   at its share; a long computation calls [`consume_budget`] between pieces.
 //! * hyper-rt's leaf futures (timers, socket readiness, its sync channels) accept only the polling
 //!   task's own waker. Everything exported here works under any waker: timers fall back to a
 //!   helper task ([`Bridge`]) when polled through a combinator or library that substitutes its own
@@ -278,6 +282,12 @@ fn rt() -> anyhow::Result<&'static Rt> {
     RT.get_or_init(start).as_ref().map_err(|e| anyhow::anyhow!("hyper-rt failed to start: {e}"))
 }
 
+/// The runtime's shards' registrations, in order (it's started if it hasn't been): what work is placed on
+/// and what kiln-rt's watchdog reports by (`crate::overload`).
+pub fn shard_holders() -> Vec<SlotHolder> {
+    rt().map_or_else(|_| Vec::new(), |rt| rt.holders.clone())
+}
+
 /// Whether the caller runs on a hyper-rt shard (inside a task).
 pub fn on_shard() -> bool {
     hyper_rt::futures::shard_id().is_some()
@@ -303,6 +313,7 @@ fn bootstrap(slot: &Arc<Mutex<Option<Boxed>>>) -> impl Future<Output = ()> + Sen
     }
 }
 
+#[track_caller]
 fn submit(slot: &Arc<Mutex<Option<Boxed>>>) -> bool {
     // On a shard: keep the task here (no cross-thread hop; its sockets and timers stay local).
     if on_shard() && hyper_rt::futures::spawn_detached(bootstrap(slot)).is_ok() {
@@ -311,21 +322,37 @@ fn submit(slot: &Arc<Mutex<Option<Boxed>>>) -> bool {
     submit_spread(slot)
 }
 
+/// Round-robin over the shards, as work that may move (`hyper_rt::runtime::submit_movable`): a shard the
+/// watchdog sees held in one poll past its limit (`hyper_rt::watch::stalled`) is passed over while any
+/// other takes the task, and a task waiting for a shard that becomes held is handed to another by the
+/// watchdog (kiln's goal 6, plan 01a1a59c2abe step 2). Admitted tasks stay where they are.
+#[track_caller]
 fn submit_spread(slot: &Arc<Mutex<Option<Boxed>>>) -> bool {
+    submit_spread_as(slot, hyper_rt::coop::Class::Normal)
+}
+
+/// [`submit_spread`], the task starting in `class` (`hyper_rt::coop::Class`).
+#[track_caller]
+fn submit_spread_as(slot: &Arc<Mutex<Option<Boxed>>>, class: hyper_rt::coop::Class) -> bool {
     let Ok(rt) = rt() else { return false };
     let n = rt.holders.len();
     let start = rt.next.fetch_add(1, Ordering::Relaxed);
-    for i in 0..n {
-        if let Some(holder) = rt.holders.get(start.wrapping_add(i) % n)
-            && hyper_rt::runtime::submit_to_holder(*holder, bootstrap(slot)).is_ok()
-        {
-            return true;
+    // Shards not held first; only when every one is held do the held ones take it.
+    for held in [false, true] {
+        for i in 0..n {
+            if let Some(holder) = rt.holders.get(start.wrapping_add(i) % n)
+                && hyper_rt::watch::stalled(*holder) == held
+                && hyper_rt::runtime::submit_movable_as(*holder, class, bootstrap(slot)).is_ok()
+            {
+                return true;
+            }
         }
     }
     false
 }
 
 /// Whether the runtime took the task (refused on every shard: dropped, and said so).
+#[track_caller]
 fn spawn_boxed(fut: Boxed) -> bool {
     let slot = handoff(fut);
     if submit(&slot) {
@@ -368,6 +395,8 @@ impl<T> Future for JoinHandle<T> {
 
 /// Run `fut` as its own task: on the current shard when called from one, otherwise on the next
 /// shard round-robin. A panic ends only that task (hyper-rt catches it; the handle reports `Err`).
+/// The caller's place is the task's spawn site, which the watchdog names should it hold its shard.
+#[track_caller]
 pub fn spawn<F>(fut: F) -> JoinHandle<F::Output>
 where
     F: Future + Send + 'static,
@@ -398,10 +427,24 @@ impl kiln_seams::Spawn for RtSpawn {
 }
 
 /// Run `fut` on the next shard round-robin wherever the caller is: spreads accepted connections
-/// over every shard. Falls back to the current shard when the others refuse.
+/// over every shard, passing over one the watchdog sees held ([`submit_spread`]). Falls back to the
+/// current shard when the others refuse.
+#[track_caller]
 pub fn spawn_spread<F: Future<Output = ()> + Send + 'static>(fut: F) {
     let slot = handoff(Box::pin(fut));
     if submit_spread(&slot) || submit(&slot) {
+        return;
+    }
+    tracing::error!("hyper-rt refused a connection task on every shard; connection dropped");
+}
+
+/// Run an accepted connection on the next shard round-robin, as [`spawn_spread`] does, its task starting
+/// Critical: its first request's head must be read before the request's class is known, and reading a
+/// head costs little (`crate::overload::Connection`, goal 6, plan 01a1a59c2abe step 3).
+#[track_caller]
+pub fn spawn_connection<F: Future<Output = ()> + Send + 'static>(fut: F) {
+    let slot = handoff(Box::pin(fut));
+    if submit_spread_as(&slot, hyper_rt::coop::Class::Critical) || submit(&slot) {
         return;
     }
     tracing::error!("hyper-rt refused a connection task on every shard; connection dropped");
@@ -451,6 +494,7 @@ pub fn spawn_owner<F: Future<Output = ()> + Send + 'static>(shard: usize, fut: F
 }
 
 /// Run a `!Send` future as a task on the current shard. Refused off the runtime.
+#[track_caller]
 pub fn spawn_local<F: Future<Output = ()> + 'static>(fut: F) -> Result<TaskId, RtError> {
     hyper_rt::futures::spawn_detached(fut)
 }
@@ -655,6 +699,14 @@ pub async fn maybe_yield() {
     hyper_rt::futures::maybe_yield().await;
 }
 
+/// The yield point of a long computation on a shard, between its pieces: past the task's share of
+/// its shard (its step quantum) with other work waiting, the task yields once and goes on at its next
+/// turn; otherwise it goes on at once (`hyper_rt::coop::consume_budget`, kiln's goal 6). Loops whose
+/// waits are hyper-rt's or this module's need no call: those charge the same budget.
+pub async fn consume_budget() {
+    hyper_rt::coop::consume_budget().await;
+}
+
 /// A loop's turns on its shard: it works on for as long as one of the shard's steps may (its step
 /// quantum: hyper-rt's online estimate of what a wake costs, else its configured step budget), then
 /// gives the shard to its other tasks where they want it ([`maybe_yield`]).
@@ -831,6 +883,9 @@ impl Future for Sleep {
     type Output = ();
     fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
         if Instant::now() >= self.deadline {
+            // A deadline already passed completes at once, as kiln's Clock seam holds every clock to
+            // (`kiln_seams::clock`, "a sleep until now"), so it is no charge that may refuse: a sleep that
+            // waits is charged by hyper-rt's timer (`hyper_rt::coop`, goal 6, plan 01a1a59c2abe step 1).
             self.native = None;
             self.bridged = None;
             return Poll::Ready(());
@@ -1055,8 +1110,11 @@ impl Shutdown {
         self.0.cancelled.load(Ordering::SeqCst)
     }
 
-    /// Completes once [`Self::cancel`] has been called (at once if it already was).
+    /// Completes once [`Self::cancel`] has been called: if it already was, at once, or a turn later
+    /// when the task has used its share of a shard other work wants (a charge of its turn,
+    /// `hyper_rt::coop`).
     pub async fn cancelled(&self) {
+        hyper_rt::coop::consume_budget().await;
         loop {
             if self.is_cancelled() {
                 return;
@@ -1099,7 +1157,10 @@ impl Notify {
         self.event.notify(1);
     }
 
+    /// A notification, taken; a charge of the task's turn on its shard (`hyper_rt::coop`), so a loop on a
+    /// notifier that is always set yields at its share.
     pub async fn notified(&self) {
+        hyper_rt::coop::consume_budget().await;
         loop {
             if self.permit.swap(false, Ordering::SeqCst) {
                 return;
@@ -1135,8 +1196,8 @@ impl<T: Clone> Broadcast<T> {
         let _ = self.tx.try_broadcast(value);
     }
 
-    pub fn subscribe(&self) -> async_broadcast::Receiver<T> {
-        self.tx.new_receiver()
+    pub fn subscribe(&self) -> Subscription<T> {
+        Subscription(self.tx.new_receiver())
     }
 
     pub fn receiver_count(&self) -> usize {
@@ -1144,7 +1205,53 @@ impl<T: Clone> Broadcast<T> {
     }
 }
 
+/// A subscriber of a [`Broadcast`]: async-broadcast's receiver, whose receive charges the task's turn on
+/// its shard (`hyper_rt::coop`, kiln's goal 6), so a subscriber whose channel is always full yields at
+/// its share. Everything else is the receiver's own.
+pub struct Subscription<T>(async_broadcast::Receiver<T>);
+
+impl<T: Clone> Subscription<T> {
+    /// The next message (as async-broadcast's `recv`), after a charge of the task's turn.
+    pub async fn recv(&mut self) -> Result<T, async_broadcast::RecvError> {
+        hyper_rt::coop::consume_budget().await;
+        self.0.recv().await
+    }
+}
+
+/// As a stream (what `select`s and `map`s over subscriptions take), each item a charge of the task's turn too.
+impl<T: Clone> futures::Stream for Subscription<T> {
+    type Item = T;
+
+    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<T>> {
+        if hyper_rt::coop::poll_proceed(cx).is_pending() {
+            return Poll::Pending;
+        }
+        futures::StreamExt::poll_next_unpin(&mut self.0, cx)
+    }
+}
+
+impl<T> std::ops::Deref for Subscription<T> {
+    type Target = async_broadcast::Receiver<T>;
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl<T> std::ops::DerefMut for Subscription<T> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.0
+    }
+}
+
 // --------------------------------------------------------------------------------------- files
+
+/// The next value of an async-channel receiver, after a charge of the task's turn on its shard
+/// (`hyper_rt::coop`, kiln's goal 6): a loop that drains a channel that is always full yields at its
+/// share, as one over hyper-rt's own channels does.
+pub async fn recv<T>(rx: &async_channel::Receiver<T>) -> Result<T, async_channel::RecvError> {
+    hyper_rt::coop::consume_budget().await;
+    rx.recv().await
+}
 
 /// Read size for file streams.
 const FILE_CHUNK: usize = 256 * 1024;
@@ -1173,6 +1280,8 @@ pub fn file_source(path: impl Into<PathBuf>) -> anyhow::Result<async_channel::Re
                 Ok(Ok(buf)) if buf.is_empty() => return,
                 Ok(Ok(buf)) => {
                     offset = offset.saturating_add(u64::try_from(buf.len()).unwrap_or(u64::MAX));
+                    // A send is a charge of the task's turn (`hyper_rt::coop`).
+                    consume_budget().await;
                     if tx.send(Bytes::from(buf)).await.is_err() {
                         return;
                     }
@@ -1206,7 +1315,8 @@ pub fn file_sink(
     let (tx, rx) = async_channel::bounded::<Bytes>(16);
     let writer = spawn(async move {
         let mut total = 0u64;
-        while let Ok(first) = rx.recv().await {
+        // Each receive a charge of the task's turn (`hyper_rt::coop`).
+        while let Ok(first) = recv(&rx).await {
             let mut batch = vec![first];
             let mut size: usize = batch.iter().map(Bytes::len).sum();
             while size < SINK_BATCH {
@@ -1318,7 +1428,7 @@ impl Signals {
 
     /// The next signal (`None` once the subscription is gone).
     pub async fn next(&self) -> Option<i32> {
-        self.rx.recv().await.ok()
+        recv(&self.rx).await.ok()
     }
 }
 
@@ -1430,6 +1540,37 @@ mod tests {
             for r in got.lock().unwrap_or_else(PoisonError::into_inner).iter() {
                 assert!(r.as_ref().err().is_none_or(|e| !e.contains("not on a shard thread")), "{r:?}");
             }
+            Ok(())
+        })
+    }
+
+    /// Goal 6, plan 01a1a59c2abe step 1: kiln's own primitives charge the shard's budget, so a loop draining an
+    /// async-channel that always holds its next item (`recv`) yields at its share, and a timer due on its shard
+    /// fires while it loops, where a loop on async-channel's own receive would hold the shard until it ended.
+    #[test]
+    fn g6_s1_a_loop_on_kiln_s_charged_receive_lets_its_shard_s_timer_fire() -> anyhow::Result<()> {
+        block_on(async {
+            let (tx, rx) = async_channel::unbounded::<u64>();
+            let fired = Arc::new(AtomicBool::new(false));
+            let flag = Arc::clone(&fired);
+            // Spawned from a task: on this shard.
+            let _timer = spawn(async move {
+                sleep(Duration::from_millis(5)).await;
+                flag.store(true, Ordering::SeqCst);
+            });
+            let started = Instant::now();
+            let mut items = 0u64;
+            while !fired.load(Ordering::SeqCst) && started.elapsed() < Duration::from_secs(5) {
+                // The channel always holds the next item: the receive never waits.
+                let _ = tx.try_send(items);
+                let _ = recv(&rx).await;
+                items += 1;
+                let until = Instant::now() + Duration::from_micros(10);
+                while Instant::now() < until {
+                    std::hint::spin_loop();
+                }
+            }
+            anyhow::ensure!(fired.load(Ordering::SeqCst), "the timer fired while the loop ran ({items} items, {:?})", started.elapsed());
             Ok(())
         })
     }
