@@ -133,6 +133,103 @@ pub fn own_cores(list: &str) -> Result<Vec<u32>, String> {
     }
 }
 
+/// Keeps the calling thread, and every thread it starts from here on, off `cores`: its affinity less
+/// them (Linux's `sched_setaffinity`). What a server with cores of its own does before its runtime
+/// starts, so its shards alone run on theirs (goal 9, plan 01a1a87b2cec step 4): its pools' and
+/// other threads, started after, inherit the rest. Why not, where it can't: another OS, or `cores`
+/// all the thread may run on.
+pub fn keep_threads_off(cores: &[u32]) -> Result<(), String> {
+    #[cfg(target_os = "linux")]
+    {
+        let mut set = rustix::thread::sched_getaffinity(None).map_err(|e| format!("this thread's CPUs can't be read: {e}"))?;
+        for c in cores.iter().filter_map(|c| usize::try_from(*c).ok()) {
+            set.unset(c);
+        }
+        if set.count() == 0 {
+            return Err("those are all the CPUs it may run on".to_owned());
+        }
+        rustix::thread::sched_setaffinity(None, &set).map_err(|e| format!("this thread's CPUs can't be set: {e}"))?;
+        let _ = APART.set((cores.to_vec(), set));
+        Ok(())
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = cores;
+        Err("cores of the server's own are Linux's alone (a slice's cpuset)".to_owned())
+    }
+}
+
+/// The shards' cores [`keep_threads_off`] kept the process's other threads off, and the CPUs it left
+/// them: what [`keep_off_shards`] moves a thread to.
+#[cfg(target_os = "linux")]
+static APART: std::sync::OnceLock<(Vec<u32>, rustix::thread::CpuSet)> = std::sync::OnceLock::new();
+
+/// The calling thread's id in the kernel (Linux's `gettid`), for [`keep_off_shards`] to tell a
+/// shard's own thread from the rest; none on other platforms.
+pub fn thread_id() -> Option<u32> {
+    #[cfg(target_os = "linux")]
+    {
+        u32::try_from(rustix::thread::gettid().as_raw_nonzero().get()).ok()
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        None
+    }
+}
+
+/// Moves to the CPUs [`keep_threads_off`] left the process's other threads each of its threads not
+/// in `seen` that may run on its shards' cores, but for the shards' own (`shards`, their kernel ids,
+/// [`thread_id`]), and notes each it looked at in `seen`, which keeps only threads still running:
+/// how many it moved (goal 9, plan 01a1a87b2cec step 4). A thread starts with the CPUs of the thread
+/// that started it, so one that a task on a shard starts (the server starts most of its threads from
+/// tasks) would run on that shard's core beside it. A thread is looked at once, as it is first seen:
+/// one that later fixes itself to a CPU of its own choosing keeps it. Nothing where nothing was kept
+/// apart, and on other platforms.
+pub fn keep_off_shards(shards: &[u32], seen: &mut std::collections::HashSet<u32>) -> usize {
+    #[cfg(target_os = "linux")]
+    {
+        let Some((cores, rest)) = APART.get() else { return 0 };
+        let Ok(entries) = std::fs::read_dir("/proc/self/task") else { return 0 };
+        let now: std::collections::HashSet<u32> = entries.filter_map(|e| e.ok()?.file_name().to_str()?.parse::<u32>().ok()).collect();
+        let moved = now.iter().filter(|tid| !seen.contains(*tid) && !shards.contains(*tid)).filter(|tid| move_off(**tid, cores, rest)).count();
+        *seen = now;
+        moved
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = (shards, seen);
+        0
+    }
+}
+
+/// Moves the child `pid` the calling thread just started off the shards' cores, as
+/// [`keep_off_shards`] moves the process's threads: a child started from a shard's thread runs on
+/// that shard's core (goal 9, plan 01a1a87b2cec step 4). Whether it moved it: not where nothing was
+/// kept apart, nor a child that started off them.
+pub fn keep_child_off_shards(pid: u32) -> bool {
+    #[cfg(target_os = "linux")]
+    {
+        let Some((cores, rest)) = APART.get() else { return false };
+        // Its threads: just started, it has one, unless it started more already.
+        let Ok(entries) = std::fs::read_dir(format!("/proc/{pid}/task")) else { return false };
+        entries.filter_map(|e| e.ok()?.file_name().to_str()?.parse::<u32>().ok()).filter(|tid| move_off(*tid, cores, rest)).count() > 0
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = pid;
+        false
+    }
+}
+
+/// Moves the thread `tid` to `rest` if it may run on any of `cores`: whether it did. A thread that
+/// ended, or one confined where none of `rest` is, stays as it was.
+#[cfg(target_os = "linux")]
+fn move_off(tid: u32, cores: &[u32], rest: &rustix::thread::CpuSet) -> bool {
+    let Some(pid) = i32::try_from(tid).ok().and_then(rustix::process::Pid::from_raw) else { return false };
+    let on_shards = |set: &rustix::thread::CpuSet| cores.iter().filter_map(|c| usize::try_from(*c).ok()).any(|c| set.is_set(c));
+    rustix::thread::sched_getaffinity(Some(pid)).is_ok_and(|set| on_shards(&set)) && rustix::thread::sched_setaffinity(Some(pid), rest).is_ok()
+}
+
 /// The server first (docs/priority.md; goal 8, plan 01a1a59c2b29 steps 2 to 4): on Windows its
 /// process runs above normal priority; on Linux and macOS its service says how it runs (the
 /// weight of its `kiln.slice`, launchd's `ProcessType`), as `kiln install` writes it.
@@ -508,6 +605,27 @@ mod tests {
         for bad in ["", "x", "3-1", "8192", "0-99999"] {
             assert!(cpu_list(bad).is_err(), "{bad:?} read");
         }
+    }
+
+    /// Goal 9, plan 01a1a87b2cec step 4: a server with cores of its own keeps its other threads off its
+    /// shards' cores: the thread that starts the runtime, and every thread it starts after, run on the
+    /// rest; asked to keep off every CPU it has, it says why not and changes nothing.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn g9_s4_other_threads_keep_off_the_shards_cores() -> anyhow::Result<()> {
+        std::thread::spawn(|| -> anyhow::Result<()> {
+            let before = rustix::thread::sched_getaffinity(None)?;
+            let mine: Vec<u32> = (0..rustix::thread::CpuSet::MAX_CPU).filter(|c| before.is_set(*c)).filter_map(|c| u32::try_from(c).ok()).collect();
+            anyhow::ensure!(keep_threads_off(&mine).is_err(), "kept off every CPU it has");
+            anyhow::ensure!(rustix::thread::sched_getaffinity(None)? == before, "a refusal changed its CPUs");
+            let Some(off) = mine.first().copied().filter(|_| mine.len() > 1) else { return Ok(()) };
+            keep_threads_off(&[off]).map_err(|e| anyhow::anyhow!(e))?;
+            let child = std::thread::spawn(move || rustix::thread::sched_getaffinity(None).map(|s| s.is_set(off as usize))).join().map_err(|_| anyhow::anyhow!("the child panicked"))??;
+            anyhow::ensure!(!rustix::thread::sched_getaffinity(None)?.is_set(off as usize) && !child, "CPU {off} still taken");
+            Ok(())
+        })
+        .join()
+        .map_err(|_| anyhow::anyhow!("the test's thread panicked"))?
     }
 
     #[test]
