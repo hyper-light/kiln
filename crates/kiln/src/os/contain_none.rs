@@ -14,6 +14,10 @@ impl Group {
         None
     }
 
+    pub fn of_person(_name: &str) -> Option<Group> {
+        None
+    }
+
     pub fn existing(_session: &str) -> Option<Group> {
         None
     }
@@ -46,4 +50,9 @@ pub fn session_of(_pid: u32) -> Option<String> {
 
 pub fn how() -> String {
     "none (processes are found by their mark)".to_owned()
+}
+
+/// How legs and agents run here (docs/priority.md): as anything else does.
+pub fn priority() -> String {
+    "normal: kiln has no way to lower its own work's priority on this system".to_owned()
 }

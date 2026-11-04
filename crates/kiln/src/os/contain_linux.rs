@@ -8,11 +8,19 @@
 //! is, one read of `/proc/<pid>/cgroup`; ending them all, one write to `cgroup.kill`. Nothing is
 //! scanned.
 //!
-//! Only membership is asked of the cgroups (no controllers), so the runner's own cgroup needs no
-//! delegation: any cgroup v2 it may write will do (a systemd user unit, a container with its own
-//! cgroup namespace). Where there is none (cgroup v1, a read-only cgroup filesystem, a cgroup
-//! another user owns), agents have no group and their processes are found by their mark
-//! (`crate::harness::survivors`), as before.
+//! Membership alone needs no delegation: any cgroup v2 the runner may write will do (a systemd
+//! user unit, a container with its own cgroup namespace). Where there is none (cgroup v1, a
+//! read-only cgroup filesystem, a cgroup another user owns), agents have no group and their
+//! processes are found by their mark (`crate::harness::survivors`), as before.
+//!
+//! Priority (docs/priority.md; goal 8, plan 01a1a59c2b29 step 2): where the machine's installed
+//! runner runs in a unit its service manager delegated to it (systemd's `Delegate=yes`, which
+//! `kiln install` sets), the CPU is shared among what it starts, and each agent's and each CI
+//! job's group runs at idle priority (`cpu.idle` 1, the cgroup's SCHED_IDLE): it gets the CPU only
+//! when nothing else on the machine wants it. cgroup v2 gives a cgroup's children a controller only
+//! while it holds no process itself, so kiln's own processes run in the unit's leaf [`LEAF`]
+//! (systemd's `DelegateSubgroup=`, or moved there by the runner) and the folders of groups sit
+//! beside it, under the unit.
 
 use std::fs;
 use std::io::Write as _;
@@ -24,31 +32,49 @@ use std::time::Duration;
 
 /// Where cgroup v2 is mounted.
 const ROOT: &str = "/sys/fs/cgroup";
+/// The leaf of a delegated unit's cgroup that kiln's own processes run in ([`super::UNIT_LEAF`]).
+const LEAF: &str = super::UNIT_LEAF;
 /// The folder under the runner's own cgroup that holds agents' groups (in tests, one of their own:
 /// tests often run in a live runner's cgroup).
 const AGENTS: &str = if cfg!(test) { "kiln-agents-test" } else { "kiln-agents" };
 /// The folder under the runner's own cgroup that holds its CI jobs' groups, one a runner process
-/// (`kiln-jobs-<pid>`): a job ends with the process that runs it. Headroom never paces them.
+/// (`kiln-jobs-<pid>`): a job ends with the process that runs it. Headroom paces each as it does an
+/// agent's (docs/priority.md).
 const JOBS: &str = if cfg!(test) { "kiln-jobs-test" } else { "kiln-jobs" };
 /// How deep cgroups an agent's processes made of their own are followed.
 const DEPTH: usize = 8;
 
-/// A folder of agents' groups: where it is, and its path as `/proc/<pid>/cgroup` names it.
+/// A folder of agents' groups: where it is, its path as `/proc/<pid>/cgroup` names it, and whether
+/// the CPU is shared among the groups in it (`cpu` in its `cgroup.subtree_control`), so each can
+/// run at idle priority.
 #[derive(Debug)]
 struct Base {
     dir: PathBuf,
     rel: String,
+    cpu: bool,
+}
+
+/// This process's own cgroup, as `/proc/self/cgroup` names it (cgroup v2's `0::` line).
+fn own_rel() -> Option<String> {
+    fs::read_to_string("/proc/self/cgroup").ok()?.lines().find_map(|l| l.strip_prefix("0::")).map(|p| p.trim().trim_end_matches('/').to_owned())
 }
 
 impl Base {
     /// `name` under this process's own cgroup, made if it isn't there: `None` without a cgroup v2
     /// this process may move processes into.
     fn under_own(name: &str) -> Option<Base> {
+        Self::under(&own_rel()?, name, false)
+    }
+
+    /// `name` under the cgroup `home` (this process's own, or the unit whose [`LEAF`] it runs in),
+    /// made if it isn't there, with the CPU shared among its groups when `cpu` (the home shares it
+    /// with its children): `None` without a cgroup v2 this process may move processes into.
+    fn under(home: &str, name: &str, cpu: bool) -> Option<Base> {
         if !Path::new(ROOT).join("cgroup.controllers").is_file() {
             return None;
         }
-        let own = fs::read_to_string("/proc/self/cgroup").ok()?.lines().find_map(|l| l.strip_prefix("0::")).map(|p| p.trim().trim_end_matches('/').to_owned())?;
-        let rel = format!("{own}/{name}");
+        let own = own_rel()?;
+        let rel = format!("{home}/{name}");
         let dir = Path::new(ROOT).join(rel.trim_start_matches('/'));
         if let Err(e) = fs::create_dir(&dir)
             && e.kind() != std::io::ErrorKind::AlreadyExists
@@ -64,10 +90,16 @@ impl Base {
             tracing::info!(dir = %dir.display(), "agents' processes have no cgroups of their own here (not this process's to write): they're found by their mark");
             return None;
         }
-        Some(Base { dir, rel })
+        let cpu = cpu
+            && share_cpu(&dir)
+                .inspect_err(|why| tracing::warn!(dir = %dir.display(), why = %why, "the CPU isn't shared among kiln's groups here: they run at normal priority"))
+                .is_ok();
+        Some(Base { dir, rel, cpu })
     }
 
-    fn group(&self, session: &str, make: bool) -> Option<Group> {
+    /// Group `session` (made when `make`): at idle priority when `idle` and the CPU is shared here
+    /// (docs/priority.md).
+    fn group(&self, session: &str, make: bool, idle: bool) -> Option<Group> {
         let dir = self.dir.join(name_of(session)?);
         if make {
             if let Err(e) = fs::create_dir(&dir)
@@ -75,6 +107,9 @@ impl Base {
             {
                 tracing::warn!(session, error = %e, "an agent's processes get no cgroup of their own: they're found by their mark");
                 return None;
+            }
+            if idle && self.cpu {
+                let _ = mark_idle(&dir).inspect_err(|why| tracing::warn!(session, why = %why, "an agent's group runs at normal priority"));
             }
         } else if !dir.is_dir() {
             return None;
@@ -107,6 +142,133 @@ fn holds() -> bool {
     HOLDS.load(std::sync::atomic::Ordering::Relaxed)
 }
 
+/// Where this process keeps its folders of groups, and whether the CPU is shared among them there
+/// (docs/priority.md), worked out once: the machine's installed runner arranges its unit for that
+/// where the unit is delegated to it; any other process keeps them under its own cgroup, as ever.
+struct Arranged {
+    /// The cgroup the folders go under, as `/proc/<pid>/cgroup` names it: the unit's, where kiln's
+    /// own processes run in its [`LEAF`]; else this process's own.
+    home: String,
+    /// The home shares the CPU among its children, or why not.
+    cpu: Result<(), String>,
+}
+
+fn arranged() -> &'static Arranged {
+    static A: OnceLock<Arranged> = OnceLock::new();
+    A.get_or_init(arrange_installed)
+}
+
+/// Passes over a unit's processes, each moving every one there into its leaf, before kiln gives up
+/// sharing the CPU among the unit's children: only something forking all the while outlasts them.
+const PASSES: usize = 10;
+
+fn arrange_installed() -> Arranged {
+    let own = own_rel().unwrap_or_default();
+    if cfg!(test) || !holds() || !crate::os::supervise::started_by_supervisor() {
+        return Arranged { home: own, cpu: Err("only the machine's installed runner arranges the cgroups it runs in".to_owned()) };
+    }
+    let (home, delegated) = match unit_of_leaf(&own) {
+        // In its unit's leaf: put there by systemd (`DelegateSubgroup=`) or by a runner before this
+        // one, and only a delegated unit has one.
+        Some(unit) => (unit.to_owned(), Ok(())),
+        None => (own.clone(), delegated(&own)),
+    };
+    let cpu = delegated.and_then(|()| arrange(&Path::new(ROOT).join(home.trim_start_matches('/'))));
+    match &cpu {
+        Ok(()) => tracing::info!(unit = %home, "legs and agents run at idle priority here: each in a cgroup of its own with cpu.idle"),
+        Err(why) => tracing::info!(why = %why, "legs and agents run at normal priority here"),
+    }
+    Arranged { home, cpu }
+}
+
+/// The unit whose [`LEAF`] the cgroup `own` is, when it's one.
+fn unit_of_leaf(own: &str) -> Option<&str> {
+    own.rsplit_once('/').filter(|(unit, leaf)| *leaf == LEAF && is_unit(unit)).map(|(unit, _)| unit)
+}
+
+/// Whether `rel` names a systemd unit's cgroup (a service or a scope).
+fn is_unit(rel: &str) -> bool {
+    rel.rsplit('/').next().is_some_and(|u| u.ends_with(".service") || u.ends_with(".scope"))
+}
+
+/// Whether the service manager delegated the unit this process runs in (the last part of `rel`) to
+/// it (systemd's `Delegate=yes`), asked of the user's manager for a unit under one and of the
+/// system's otherwise: why not, when it didn't.
+fn delegated(rel: &str) -> Result<(), String> {
+    let unit = rel.rsplit('/').next().filter(|_| is_unit(rel)).ok_or_else(|| "kiln's runner doesn't run as a systemd unit of its own here".to_owned())?;
+    let mut c = Command::new("systemctl");
+    if rel.contains("/user@") {
+        c.arg("--user");
+    }
+    c.args(["show", "--property=Delegate", "--value", unit]).stdin(std::process::Stdio::null()).stderr(std::process::Stdio::null());
+    // systemctl gives up on its service manager after its own timeout.
+    let said = c.output().map_err(|e| format!("systemctl couldn't say whether its unit {unit} is delegated to it: {e}"))?;
+    if String::from_utf8_lossy(&said.stdout).trim() == "yes" {
+        Ok(())
+    } else {
+        Err(format!("its unit {unit} isn't delegated to it (systemd's Delegate=yes, which `kiln install` sets)"))
+    }
+}
+
+/// Moves every process in the unit's cgroup `unit` (kiln's supervisor and runners, and what they
+/// started outside any group) into its [`LEAF`], then shares the CPU among the unit's children:
+/// cgroup v2 gives a cgroup's children a controller only while it holds no process itself. One that
+/// forked as they moved is moved on the next pass.
+fn arrange(unit: &Path) -> Result<(), String> {
+    let controllers = fs::read_to_string(unit.join("cgroup.controllers")).map_err(|e| format!("its unit's cgroup can't be read: {e}"))?;
+    if !controllers.split_whitespace().any(|c| c == "cpu") {
+        return Err("its service manager gives its unit no cpu controller to share".to_owned());
+    }
+    let leaf = unit.join(LEAF);
+    if let Err(e) = fs::create_dir(&leaf)
+        && e.kind() != std::io::ErrorKind::AlreadyExists
+    {
+        return Err(format!("its unit's leaf for kiln's own processes couldn't be made: {e}"));
+    }
+    let mut last = String::new();
+    for _ in 0..PASSES {
+        for pid in fs::read_to_string(unit.join("cgroup.procs")).unwrap_or_default().split_whitespace() {
+            // One that ended meanwhile is no matter.
+            let _ = write_file(&leaf.join("cgroup.procs"), pid);
+        }
+        match share_cpu(unit) {
+            Ok(()) => return Ok(()),
+            Err(e) => last = e,
+        }
+    }
+    Err(format!("its unit's cgroup kept gaining processes, so the CPU couldn't be shared among its children ({last})"))
+}
+
+/// Writes `text` to the cgroup file `path`, which must be there (cgroupfs makes no files).
+fn write_file(path: &Path, text: &str) -> std::io::Result<()> {
+    fs::OpenOptions::new().write(true).open(path)?.write_all(text.as_bytes())
+}
+
+/// Shares the CPU among the children of the cgroup at `dir` (`+cpu` in its `cgroup.subtree_control`).
+fn share_cpu(dir: &Path) -> Result<(), String> {
+    write_file(&dir.join("cgroup.subtree_control"), "+cpu").map_err(|e| format!("its cgroup.subtree_control: {e}"))
+}
+
+/// The group at `dir` at idle priority (docs/priority.md): its `cpu.idle` (the cgroup's SCHED_IDLE,
+/// Linux 5.15 and later), else the least weight a cgroup can have (`cpu.weight` 1).
+fn mark_idle(dir: &Path) -> Result<(), String> {
+    match write_file(&dir.join("cpu.idle"), "1") {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => write_file(&dir.join("cpu.weight"), "1").map_err(|e| format!("its cpu.weight: {e}")),
+        r => r.map_err(|e| format!("its cpu.idle: {e}")),
+    }
+}
+
+/// How legs and agents run here (docs/priority.md), for the runner's facts and its log.
+pub fn priority() -> String {
+    let shared = base().or_else(jobs_base).filter(|b| b.cpu);
+    match (&arranged().cpu, shared) {
+        (Ok(()), Some(b)) if b.dir.join("cpu.idle").is_file() => "idle: each leg's and agent's cgroup has cpu.idle 1".to_owned(),
+        (Ok(()), Some(_)) => "the least CPU weight: each leg's and agent's cgroup has cpu.weight 1 (this kernel has no cpu.idle)".to_owned(),
+        (Ok(()), None) => "normal: the CPU isn't shared among kiln's groups here".to_owned(),
+        (Err(why), _) => format!("normal: {why}"),
+    }
+}
+
 /// This runner's folder of agents' groups, worked out once (none in a process that doesn't start
 /// agents for kiln).
 fn base() -> Option<&'static Base> {
@@ -115,8 +277,22 @@ fn base() -> Option<&'static Base> {
     }
     static B: OnceLock<Option<Base>> = OnceLock::new();
     B.get_or_init(|| {
-        if cfg!(test) || crate::os::supervise::started_by_supervisor() {
+        if cfg!(test) {
             return Base::under_own(AGENTS);
+        }
+        if crate::os::supervise::started_by_supervisor() {
+            let a = arranged();
+            let b = Base::under(&a.home, AGENTS, a.cpu.is_ok())?;
+            if b.cpu {
+                // Agents' groups a runner made before the CPU was shared here, at idle priority now
+                // (a run's may be a person's: it ends soon).
+                for e in fs::read_dir(&b.dir).into_iter().flatten().flatten() {
+                    if e.file_type().is_ok_and(|t| t.is_dir()) && !e.file_name().to_string_lossy().starts_with(super::RUN_GROUP) {
+                        let _ = mark_idle(&e.path());
+                    }
+                }
+            }
+            return Some(b);
         }
         let b = Base::under_own(&format!("{AGENTS}-{}", std::process::id()))?;
         if let Some(own) = b.dir.parent() {
@@ -178,12 +354,19 @@ impl Group {
     /// Agent session `session`'s group: the one it has (it outlives the harness, and the runner
     /// process too), else a new one. `None` where this machine can't hold processes together.
     pub fn of(session: &str) -> Option<Group> {
-        base()?.group(session, true)
+        base()?.group(session, true, true)
+    }
+
+    /// A group `name` for work a person asked for (their own reach run): held together as an
+    /// agent's is, at the priority of what the person runs rather than an agent's idle one
+    /// (docs/priority.md).
+    pub fn of_person(name: &str) -> Option<Group> {
+        base()?.group(name, true, false)
     }
 
     /// The group `session` has already (after a restart), without making one.
     pub fn existing(session: &str) -> Option<Group> {
-        base()?.group(session, false)
+        base()?.group(session, false, false)
     }
 
     /// Makes `cmd`'s process join the group before it runs anything: it writes itself into the
@@ -263,9 +446,11 @@ pub fn agents_dir() -> Option<PathBuf> {
 ///   started, however that's parented (docs/ci.md W26-R22).
 /// - A kiln one of its steps starts (a test's or a lab's runner) takes the cgroup it runs in as its
 ///   own, so it holds and paces its agents in this job's group, never in the runner's
-///   `kiln-agents`, whatever build it is (the 2026-10-29 outage). Headroom never paces it.
+///   `kiln-agents`, whatever build it is (the 2026-10-29 outage).
+/// - Headroom paces it as it paces an agent's group, unless it's paused (docs/priority.md).
 ///
-/// Only membership is asked of it (no controllers): nothing it holds is counted or limited by it.
+/// Where the CPU is shared among the jobs' groups, it runs at idle priority (`cpu.idle`); nothing
+/// else it holds is counted or limited by it.
 #[derive(Debug, Clone)]
 pub struct Job {
     dir: PathBuf,
@@ -275,12 +460,17 @@ impl Job {
     /// Job `job`'s group, made now. `None` where this process may move no process into a cgroup
     /// v2: its steps' process groups are stopped instead (`crate::runner::freeze`).
     pub fn of(job: &str) -> Option<Job> {
-        let dir = jobs_base()?.dir.join(name_of(job)?);
+        let base = jobs_base()?;
+        let dir = base.dir.join(name_of(job)?);
         if let Err(e) = fs::create_dir(&dir)
             && e.kind() != std::io::ErrorKind::AlreadyExists
         {
             tracing::info!(job, error = %e, "a job's processes get no cgroup of their own: its steps' process groups are stopped to freeze it");
             return None;
+        }
+        // A leg runs at idle priority where the CPU is shared among the jobs' groups (docs/priority.md).
+        if base.cpu {
+            let _ = mark_idle(&dir).inspect_err(|why| tracing::warn!(job, why = %why, "a job's group runs at normal priority"));
         }
         Some(Job { dir })
     }
@@ -288,6 +478,11 @@ impl Job {
     /// Makes `cmd`'s process join the group before it runs anything, as [`Group::enter`] does.
     pub fn enter(&self, cmd: &mut Command) {
         Group { dir: self.dir.clone() }.enter(cmd);
+    }
+
+    /// Its folder.
+    pub fn dir(&self) -> &Path {
+        &self.dir
     }
 
     /// Moves process `pid` into it, started some other way (a step on a pty): what it started
@@ -343,7 +538,8 @@ impl Job {
 fn jobs_base() -> Option<&'static Base> {
     static B: OnceLock<Option<Base>> = OnceLock::new();
     B.get_or_init(|| {
-        let b = Base::under_own(&format!("{JOBS}-{}", std::process::id()))?;
+        let a = arranged();
+        let b = Base::under(&a.home, &format!("{JOBS}-{}", std::process::id()), a.cpu.is_ok())?;
         if let Some(own) = b.dir.parent() {
             thaw_ended(own, JOBS);
             prune_ended_of(own, JOBS);
@@ -353,6 +549,14 @@ fn jobs_base() -> Option<&'static Base> {
         Some(b)
     })
     .as_ref()
+}
+
+/// The folders of CI jobs' groups beside this runner's (`kiln-jobs-<pid>`, each of its unit's runner
+/// processes'), for headroom to pace each job in them as it paces agents (docs/priority.md).
+pub fn jobs_dirs() -> Vec<PathBuf> {
+    let Some(home) = jobs_base().and_then(|b| b.dir.parent()) else { return Vec::new() };
+    let prefix = format!("{JOBS}-");
+    fs::read_dir(home).into_iter().flatten().flatten().filter(|e| e.file_name().to_string_lossy().starts_with(&prefix) && e.file_type().is_ok_and(|t| t.is_dir())).map(|e| e.path()).collect()
 }
 
 /// At a runner process's start: the jobs runner processes before it left frozen as they ended go
@@ -449,6 +653,85 @@ fn remove_tree(dir: &Path, depth: usize) {
 mod tests {
     use super::*;
 
+    /// Goal 8 (plan 01a1a59c2b29 step 2): kiln's own processes in a unit's leaf make the unit the
+    /// home of its folders; anywhere else, they stay where the process runs.
+    #[test]
+    fn g8_s2_the_unit_whose_leaf_kiln_runs_in_is_its_home() {
+        let unit = "/user.slice/user-1000.slice/user@1000.service/app.slice/kiln-agent.service";
+        assert_eq!(unit_of_leaf(&format!("{unit}/kiln")), Some(unit));
+        assert_eq!(unit_of_leaf(unit), None);
+        assert_eq!(unit_of_leaf("/user.slice/kiln"), None, "a leaf of something that isn't a unit");
+        assert_eq!(unit_of_leaf(&format!("{unit}/kiln-agents/kiln")), None);
+        assert!(is_unit(unit) && is_unit("/system.slice/run-1.scope") && !is_unit("/kiln.slice"));
+    }
+
+    /// Goal 8 (plan 01a1a59c2b29 step 2, docs/priority.md): in a unit delegated to kiln (a scope of
+    /// the user's own here, its process standing in for kiln's supervisor), kiln's own processes
+    /// move into the unit's leaf, the CPU is shared among the unit's children, and an agent's group
+    /// in a folder there runs at idle priority with what it starts in it (`cpu.idle` 1), a person's
+    /// run's at normal priority.
+    #[test]
+    fn g8_s2_a_delegated_units_groups_run_at_idle_priority() -> anyhow::Result<()> {
+        use std::process::Stdio;
+        let unit = format!("kiln-g8-test-{}.scope", std::process::id());
+        let spawned = Command::new("systemd-run")
+            .args(["--user", "--scope", "--quiet", "--collect", "-p", "Delegate=yes", &format!("--unit={unit}"), "--", "sleep", "300"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn();
+        let Ok(mut held) = spawned else {
+            eprintln!("no systemd-run here: skipped");
+            return Ok(());
+        };
+        // Its cgroup, once systemd has put it there.
+        let mut rel = None;
+        for _ in 0..100 {
+            rel = fs::read_to_string(format!("/proc/{}/cgroup", held.id())).ok().and_then(|t| t.lines().find_map(|l| l.strip_prefix("0::")).map(|p| p.trim().to_owned())).filter(|r| r.ends_with(&unit));
+            if rel.is_some() || held.try_wait()?.is_some() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        let Some(rel) = rel else {
+            let _ = held.kill();
+            let _ = held.wait();
+            eprintln!("no delegated scope of the user's own here: skipped");
+            return Ok(());
+        };
+        let dir = Path::new(ROOT).join(rel.trim_start_matches('/'));
+        let checked = (|| {
+            arrange(&dir).map_err(anyhow::Error::msg)?;
+            anyhow::ensure!(fs::read_to_string(dir.join("cgroup.procs"))?.trim().is_empty(), "the unit's cgroup still holds a process");
+            anyhow::ensure!(fs::read_to_string(dir.join(LEAF).join("cgroup.procs"))?.lines().any(|p| p.trim() == held.id().to_string()), "its process isn't in its leaf");
+            anyhow::ensure!(fs::read_to_string(dir.join("cgroup.subtree_control"))?.split_whitespace().any(|c| c == "cpu"), "the CPU isn't shared among its children");
+            let folder = Base::under(&rel, AGENTS, true).ok_or_else(|| anyhow::anyhow!("no folder under {}", dir.display()))?;
+            anyhow::ensure!(folder.cpu, "the folder doesn't share the CPU among its groups");
+            let agent = folder.group("01a1g8", true, true).ok_or_else(|| anyhow::anyhow!("no agent's group"))?;
+            let person = folder.group("run-01a1g8", true, false).ok_or_else(|| anyhow::anyhow!("no person's group"))?;
+            let mut cmd = Command::new("sleep");
+            cmd.arg("30").stdin(Stdio::null());
+            agent.enter(&mut cmd);
+            let mut child = cmd.spawn()?;
+            let inside = agent.started(child.id());
+            let idle = fs::read_to_string(agent.dir.join("cpu.idle")).or_else(|_| fs::read_to_string(agent.dir.join("cpu.weight")))?;
+            let persons = fs::read_to_string(person.dir.join("cpu.idle")).unwrap_or_default();
+            let _ = child.kill();
+            let _ = child.wait();
+            agent.remove();
+            person.remove();
+            let _ = fs::remove_dir(&folder.dir);
+            anyhow::ensure!(inside, "what an agent starts doesn't run in its group");
+            anyhow::ensure!(idle.trim() == "1", "an agent's group isn't at idle priority: {idle}");
+            anyhow::ensure!(persons.trim() != "1", "a person's run's group is at idle priority: {persons}");
+            Ok(())
+        })();
+        let _ = held.kill();
+        let _ = held.wait();
+        let _ = fs::remove_dir(dir.join(LEAF));
+        checked
+    }
+
     /// W26-R22: a job its runner process left frozen as it ended goes on once another starts: its
     /// group is let go of, and the folder goes once nothing runs in it.
     #[test]
@@ -527,7 +810,7 @@ mod tests {
             eprintln!("no cgroup v2 this test may write: skipped");
             return Ok(());
         };
-        let job = base.group("01a1job", true).ok_or_else(|| anyhow::anyhow!("no group under {}", base.dir.display()))?;
+        let job = base.group("01a1job", true, true).ok_or_else(|| anyhow::anyhow!("no group under {}", base.dir.display()))?;
         // The step: a shell that makes `kiln-agents` under its own cgroup, as any kiln does.
         let mut cmd = Command::new("sh");
         cmd.args(["-c", "own=$(sed -n 's/^0:://p' /proc/self/cgroup); mkdir /sys/fs/cgroup$own/kiln-agents && echo $own; sleep 30"]).stdout(std::process::Stdio::piped()).stdin(std::process::Stdio::null());
@@ -564,7 +847,7 @@ mod tests {
             eprintln!("no cgroup v2 this test may write: skipped");
             return Ok(());
         };
-        let group = base.group("01a1test", true).ok_or_else(|| anyhow::anyhow!("no group under {}", base.dir.display()))?;
+        let group = base.group("01a1test", true, true).ok_or_else(|| anyhow::anyhow!("no group under {}", base.dir.display()))?;
         // A harness that starts a command, and one that leaves its session and its parent (a
         // daemon), then waits.
         let mut cmd = Command::new("sh");

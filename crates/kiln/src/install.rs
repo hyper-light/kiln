@@ -617,6 +617,69 @@ impl Install<'_> {
     fn detach_command_line(&self) -> String {
         self.detach_args().iter().map(|a| win_quote(a)).collect::<Vec<_>>().join(" ")
     }
+
+    /// Whether it's a server's (`supervise -- server`): first among what the machine runs
+    /// (docs/priority.md).
+    fn server(&self) -> bool {
+        self.args.iter().skip_while(|a| *a != "--").nth(1).is_some_and(|a| a == "server")
+    }
+}
+
+/// The systemd release that has `DelegateSubgroup=` (its NEWS, v254); before it a runner moves
+/// kiln's own processes into its unit's leaf itself (`crate::os::contain`).
+const DELEGATE_SUBGROUP_SINCE: u32 = 254;
+
+/// The server's CPU and I/O weight, its slice's and its service's (the bare-metal design's §5,
+/// docs/baremetal.md): beside slices at the kernel's default weight of 100, about 1000 of every
+/// 1,200 parts of the CPU they all want (docs/priority.md).
+const SERVER_WEIGHT: u32 = 1000;
+
+/// This machine's systemd release (`systemctl --version`'s first line: `systemd 262 (…)`).
+fn systemd_version() -> Option<u32> {
+    let out = Command::new("systemctl").arg("--version").stdin(Stdio::null()).stderr(Stdio::null()).output().ok()?;
+    String::from_utf8_lossy(&out.stdout).split_whitespace().nth(1)?.parse().ok()
+}
+
+/// The systemd service that runs `i`: `exec` with `env`, restarted when its supervisor exits.
+/// Each is delegated to kiln (docs/priority.md; goal 8, plan 01a1a59c2b29 step 2), so its runner
+/// can share the CPU among the legs and agents it starts, each at idle priority in a cgroup of
+/// its own, with kiln's own processes in the unit's leaf (`DelegateSubgroup=`, on a systemd that
+/// has it). A server's goes in `kiln.slice` ([`kiln_slice`]) with the slice's weights, and, when it
+/// has cores of its own system-wide (`partition`), makes them a cpuset partition as it starts.
+fn systemd_unit(i: &Install<'_>, env: &str, exec: &str, systemd: Option<u32>, partition: bool) -> String {
+    let unit = i.unit;
+    let target = if i.system { "multi-user.target" } else { "default.target" };
+    let subgroup = if systemd.is_some_and(|v| v >= DELEGATE_SUBGROUP_SINCE) { format!("DelegateSubgroup={}\n", crate::os::UNIT_LEAF) } else { String::new() };
+    let server = if i.server() {
+        let partition = if partition {
+            // As root, before it starts: nothing outside the slice runs on its cores from then on.
+            "ExecStartPre=+-/bin/sh -c 'echo root > /sys/fs/cgroup/kiln.slice/cpuset.cpus.partition'\n"
+        } else {
+            ""
+        };
+        format!("# First among what this machine runs: in kiln.slice, with its weights (docs/priority.md).\nSlice=kiln.slice\nCPUWeight={SERVER_WEIGHT}\nIOWeight={SERVER_WEIGHT}\n{partition}")
+    } else {
+        String::new()
+    };
+    format!(
+        "[Unit]\nDescription=kiln {unit} (self-supervising CI/CD job server)\nAfter=network-online.target\nWants=network-online.target\n\n\
+         [Service]\nType=simple\n{env}ExecStart={exec}\n\
+         # kiln supervises and restarts its own server; this only covers the supervisor itself.\n\
+         Restart=always\nRestartSec=5\nKillMode=mixed\nTimeoutStopSec=30\nLimitNOFILE=1048576\n\
+         # The legs and agents it starts run at idle priority, each in a cgroup of its own under it (docs/priority.md).\n\
+         Delegate=yes\n{subgroup}{server}\n\
+         [Install]\nWantedBy={target}\n"
+    )
+}
+
+/// The server's slice (docs/priority.md; the bare-metal design's §5, docs/baremetal.md): a slice of
+/// its own, which its weights rank against the slices beside it (on the service, the slice's one
+/// child, they'd rank nothing): user.slice and system.slice, where CI and agents run, for a system
+/// install; the user's app.slice, where their runner runs, for a user's. No dash in its name:
+/// systemd reads `a-b.slice` as a child of `a.slice`. With `cores`, those alone (`AllowedCPUs=`).
+fn kiln_slice(cores: Option<&str>) -> String {
+    let allowed = cores.map(|c| format!("AllowedCPUs={c}\n")).unwrap_or_default();
+    format!("[Unit]\nDescription=kiln's server, first among what this machine runs (docs/priority.md)\n\n[Slice]\nCPUWeight={SERVER_WEIGHT}\nIOWeight={SERVER_WEIGHT}\n{allowed}")
 }
 
 /// Returns true when the boot mechanism also started the service now.
@@ -649,19 +712,27 @@ fn setup_boot(boot: Boot, i: &Install<'_>) -> anyhow::Result<bool> {
                     path = std::env::var("PATH").unwrap_or_default().replace('%', "%%").replace('"', ""),
                 ),
             };
-            let body = format!(
-                "[Unit]\nDescription=kiln {unit} (self-supervising CI/CD job server)\nAfter=network-online.target\nWants=network-online.target\n\n\
-                 [Service]\nType=simple\n{env}ExecStart={exec}\n\
-                 # kiln supervises and restarts its own server; this only covers the supervisor itself.\n\
-                 Restart=always\nRestartSec=5\nKillMode=mixed\nTimeoutStopSec=30\nLimitNOFILE=1048576\n\n\
-                 [Install]\nWantedBy={target}\n",
-                target = if system { "multi-user.target" } else { "default.target" },
-            );
+            // Cores of the server's own (docs/priority.md, "Cores of its own"), read as Linux will.
+            let cores = if i.server() { crate::config::Config::load(config).ok().and_then(|c| c.server.cores) } else { None };
+            if let Some(c) = &cores {
+                crate::os::cpu_list(c).map_err(|e| anyhow::anyhow!("[server] cores in {}: {e}", config.display()))?;
+            }
+            let body = systemd_unit(i, &env, &exec, systemd_version(), system && cores.is_some());
             let (path, user_flag): (PathBuf, &[&str]) = if system {
                 (PathBuf::from(format!("/etc/systemd/system/{unit}.service")), &[])
             } else {
                 (home().join(format!(".config/systemd/user/{unit}.service")), &["--user"])
             };
+            if i.server() {
+                let slice = path.with_file_name("kiln.slice");
+                crate::util::write_secret(&slice, kiln_slice(cores.as_deref()).as_bytes(), 0o644)?;
+                let own = match (&cores, system) {
+                    (Some(c), true) => format!(", cores {c} its own"),
+                    (Some(c), false) => format!(", cores {c} (its own only installed system-wide: --system)"),
+                    (None, _) => String::new(),
+                };
+                say(format!("priority    {} (CPU and I/O weight {SERVER_WEIGHT}{own})", slice.display()));
+            }
             crate::util::write_secret(&path, body.as_bytes(), 0o644)?;
             run(Command::new("systemctl").args(user_flag).arg("daemon-reload"))?;
             run(Command::new("systemctl").args(user_flag).args(["enable", unit]))?;
@@ -951,7 +1022,7 @@ fn launchd_body(i: &Install<'_>, log: &Path, launcher: Option<&Path>) -> String 
   <dict>
     <key>SuccessfulExit</key>
     <false/>
-  </dict>
+  </dict>{process_type}
   <key>SoftResourceLimits</key>
   <dict>
     <key>NumberOfFiles</key>
@@ -966,6 +1037,9 @@ fn launchd_body(i: &Install<'_>, log: &Path, launcher: Option<&Path>) -> String 
 "#,
         label = xml_escape(&launchd_label(i.unit)),
         log = xml_escape(&log.display().to_string()),
+        // The server runs as an app does, with no limits launchd puts on a job by its purpose
+        // (left unset, it throttles its CPU and I/O): docs/priority.md, launchd.plist(5).
+        process_type = if i.server() { "\n  <key>ProcessType</key>\n  <string>Interactive</string>" } else { "" },
     )
 }
 
@@ -1560,6 +1634,10 @@ fn remove_service(agent: bool) {
         home().join(format!(".config/autostart/{unit}.desktop")),
         PathBuf::from(format!("/etc/systemd/system/{unit}.service")),
     ];
+    // The server's slice (docs/priority.md) goes with it.
+    if !agent {
+        paths.extend([home().join(".config/systemd/user/kiln.slice"), PathBuf::from("/etc/systemd/system/kiln.slice")]);
+    }
     if cfg!(target_os = "macos") {
         let label = launchd_label(unit);
         for system in [false, true] {
@@ -1823,6 +1901,34 @@ mod tests {
         let _ = launchctl(&["bootout", &format!("{domain}/{label}")]);
         let _ = launchctl(&["bootout", &format!("{domain}/{label}.reload")]);
         result
+    }
+
+    /// Goal 8 (plan 01a1a59c2b29 steps 2 and 6, docs/priority.md): every unit kiln writes is
+    /// delegated to it, kiln's own processes in its leaf where systemd has `DelegateSubgroup=`; the
+    /// server's goes in kiln.slice with its weights, and with cores of its own system-wide makes
+    /// them a partition as it starts. On a Mac the server runs as an app does.
+    #[test]
+    fn g8_units_are_delegated_and_the_server_comes_first() -> anyhow::Result<()> {
+        let agent = ["supervise", "--", "agent"].map(str::to_owned);
+        let server = ["supervise", "--", "server"].map(str::to_owned);
+        let i = Install { system: true, unit: "kiln-agent", bin: Path::new("/usr/local/bin/kiln"), args: &agent, config: Path::new("/etc/kiln/kiln.toml"), state_dir: Path::new("/var/lib/kiln"), env: None, ask: false };
+        let runner = systemd_unit(&i, "", "/usr/local/bin/kiln supervise -- agent", Some(262), false);
+        anyhow::ensure!(runner.contains("\nDelegate=yes\nDelegateSubgroup=kiln\n"), "{runner}");
+        anyhow::ensure!(!runner.contains("Slice=") && !runner.contains("CPUWeight") && !runner.contains("ProcessType"), "{runner}");
+        // kiln's upgrades still read what it runs.
+        anyhow::ensure!(crate::upgrade::parse_unit(&runner, "kiln-agent", true).is_some_and(|e| e.args == ["agent"]), "{runner}");
+        let old = systemd_unit(&i, "", "x", Some(252), false);
+        anyhow::ensure!(old.contains("\nDelegate=yes\n") && !old.contains("DelegateSubgroup"), "{old}");
+        let s = Install { unit: "kiln", args: &server, ..i };
+        let first = systemd_unit(&s, "", "/usr/local/bin/kiln supervise -- server", Some(262), true);
+        anyhow::ensure!(first.contains("\nSlice=kiln.slice\nCPUWeight=1000\nIOWeight=1000\n") && first.contains("cpuset.cpus.partition"), "{first}");
+        anyhow::ensure!(!systemd_unit(&s, "", "x", Some(262), false).contains("partition"));
+        anyhow::ensure!(kiln_slice(None).contains("\n[Slice]\nCPUWeight=1000\nIOWeight=1000\n") && !kiln_slice(None).contains("AllowedCPUs"));
+        anyhow::ensure!(kiln_slice(Some("8-15")).ends_with("\nAllowedCPUs=8-15\n"));
+        let plist = launchd_body(&s, Path::new("/tmp/kiln.log"), None);
+        anyhow::ensure!(plist.contains("<key>ProcessType</key>\n  <string>Interactive</string>"), "{plist}");
+        anyhow::ensure!(!launchd_body(&i, Path::new("/tmp/kiln.log"), None).contains("ProcessType"), "a runner's job stays as it was");
+        Ok(())
     }
 
     #[test]

@@ -126,6 +126,8 @@ impl Drop for Started {
             if st.since.is_some() {
                 let _ = cg.freeze(false, Duration::ZERO);
             }
+            #[cfg(target_os = "linux")]
+            crate::headroom::paused_elsewhere(cg.dir(), false);
             cg.remove();
         }
     }
@@ -137,16 +139,25 @@ pub fn of(job: &str) -> Option<Arc<Job>> {
 }
 
 /// Makes step `cmd` of job `job` join the job's cgroup before it runs anything (Linux; elsewhere
-/// nothing: its process group is stopped instead, [`Job::group`]).
+/// nothing: its process group is stopped instead, [`Job::group`]). It runs at a leg's priority
+/// (docs/priority.md): its cgroup's idle one on Linux, under background policy on macOS, below
+/// normal in its step's job on Windows (`crate::os::contain::Tree`).
 pub fn enter(job: &str, cmd: &mut std::process::Command) {
+    #[cfg(target_os = "macos")]
+    crate::os::contain::background(cmd);
     if let Some(cg) = of(job).and_then(|j| j.0.lock().cgroup.clone()) {
         cg.enter(cmd);
     }
 }
 
 /// A step of job `job` started some other way (on a pty), moved into the job's cgroup as it starts
-/// (Linux).
+/// (Linux); elsewhere put at a leg's priority (docs/priority.md) where it is: under background
+/// policy on macOS, below normal on Windows (a ConPTY starts it outside any job).
 pub fn adopt(job: &str, pid: u32) {
+    #[cfg(any(target_os = "macos", windows))]
+    if !crate::os::contain::background_pid(pid) {
+        tracing::info!(job, pid, "a step on a pty runs at normal priority: its priority couldn't be lowered");
+    }
     if let Some(cg) = of(job).and_then(|j| j.0.lock().cgroup.clone())
         && !cg.adopt(pid)
     {
@@ -284,7 +295,19 @@ impl Job {
     #[cfg(unix)]
     async fn processes(&self, cgroup: Option<Cgroup>, groups: &[i32], frozen: bool) -> Result<(), String> {
         if let Some(cg) = cgroup {
-            return crate::rt::blocking(move || cg.freeze(frozen, CGROUP_WITHIN)).await.map_err(|e| format!("{e:#}"))?;
+            // The resource guard leaves a paused job be: what pacing was doing can't thaw it.
+            #[cfg(target_os = "linux")]
+            let dir = cg.dir().to_path_buf();
+            #[cfg(target_os = "linux")]
+            if frozen {
+                crate::headroom::paused_elsewhere(&dir, true);
+            }
+            let r = crate::rt::blocking(move || cg.freeze(frozen, CGROUP_WITHIN)).await.map_err(|e| format!("{e:#}")).and_then(|r| r);
+            #[cfg(target_os = "linux")]
+            if !frozen || r.is_err() {
+                crate::headroom::paused_elsewhere(&dir, false);
+            }
+            return r;
         }
         let failed: Vec<String> = groups.iter().filter_map(|g| signal_group(*g, frozen).err()).collect();
         if failed.is_empty() { Ok(()) } else { Err(failed.join("; ")) }

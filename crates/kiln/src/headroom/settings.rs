@@ -71,6 +71,12 @@ pub enum Probe {
     Http { url: String },
     /// Open a TCP connection to `host:port`.
     Tcp { addr: String },
+    /// `GET` a kiln server's own measure of how late its shards run ready work (`/healthz/delay`):
+    /// what kiln adds itself for a server on this machine (docs/priority.md; goal 8, plan
+    /// 01a1a59c2b29 step 5), answered with that delay, or with how long the probe took where that's
+    /// longer. kiln's own: never in settings sent or kept.
+    #[serde(skip)]
+    Delay { url: String },
 }
 
 impl Settings {

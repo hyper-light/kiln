@@ -143,7 +143,26 @@ pub struct Drive<'a> {
 /// when this machine allows one (`jail.rs`), which has only these: there, each is where the jail
 /// puts it.
 pub fn boot(m: &Machine, dir: &Path, socks: &Socks, drives: &[Drive<'_>], mode: &str, vcpus: u32, memory_mib: u64) -> anyhow::Result<Vm> {
-    vmm(m, dir, socks, drives, Run::Boot { mode, vcpus, memory_mib, api: false, snapshot_to: None })
+    vmm(m, dir, socks, drives, Run::Boot { mode, vcpus, memory_mib, api: false, snapshot_to: None }, Whose::Leg)
+}
+
+/// Whose a microVM's VMM is, for its priority (docs/priority.md; goal 8, plan 01a1a59c2b29 step 2):
+/// a leg's (a pool's, a template's, an image's builder: CI's work) runs at idle priority, as a leg
+/// on the host does; a deployment's runs as the service it is.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Whose {
+    Leg,
+    Deployment,
+}
+
+/// A leg's VMM's cgroup (docs/priority.md): one of its own beside the jobs' (`kiln-jobs-<pid>/vm-…`),
+/// at a leg's idle priority, made before the VMM starts and joined as it starts, jailed or not.
+/// kiln's jail stands in for Firecracker's jailer here (that one needs root), and this is how the
+/// jailer places a VMM given a parent cgroup and no settings under cgroup v2 (docs/jailer.md:
+/// "configure a cgroup beforehand ... and move the process to the configured cgroup").
+fn vmm_group(dir: &Path) -> Option<crate::os::contain::Job> {
+    let key = crate::util::sha256_hex(dir.as_os_str().as_encoded_bytes());
+    crate::os::contain::Job::of(&format!("vm-{}", key.get(..12).unwrap_or(&key)))
 }
 
 /// What a VMM does as it starts.
@@ -159,7 +178,7 @@ enum Run<'a> {
 /// A VMM in `dir`, its console written to `console.log` there, its vsock in `socks`. It runs in a
 /// jail of its own when this machine allows one (`jail.rs`), which has only these: there, each is
 /// where the jail puts it.
-fn vmm(m: &Machine, dir: &Path, socks: &Socks, drives: &[Drive<'_>], run: Run<'_>) -> anyhow::Result<Vm> {
+fn vmm(m: &Machine, dir: &Path, socks: &Socks, drives: &[Drive<'_>], run: Run<'_>, whose: Whose) -> anyhow::Result<Vm> {
     let at = |host: &Path, jailed: String| if m.jail { jailed } else { host.to_string_lossy().into_owned() };
     let path = dir.join("vm.json");
     let mut args: Vec<String> = Vec::new();
@@ -218,8 +237,12 @@ fn vmm(m: &Machine, dir: &Path, socks: &Socks, drives: &[Drive<'_>], run: Run<'_
         c.args(args);
         c
     };
+    let group = if whose == Whose::Leg { vmm_group(dir) } else { None };
+    if let Some(g) = &group {
+        g.enter(&mut cmd);
+    }
     let child = cmd.current_dir(dir).stdin(Stdio::null()).stdout(out.try_clone()?).stderr(out).spawn().with_context(|| format!("starting {}", m.firecracker.display()))?;
-    Ok(Vm { child: Some(child), console })
+    Ok(Vm { child: Some(child), console, group })
 }
 
 /// A call to a VMM's API (Firecracker's: HTTP over its Unix socket, there once the VMM is up),
@@ -265,6 +288,8 @@ fn api(sock: &Path, method: &str, path: &str, body: &serde_json::Value, within: 
 pub struct Vm {
     child: Option<Child>,
     pub console: PathBuf,
+    /// A leg's VMM's cgroup ([`vmm_group`]), gone with it.
+    group: Option<crate::os::contain::Job>,
 }
 
 impl Vm {
@@ -308,6 +333,9 @@ impl Drop for Vm {
         if let Some(mut c) = self.child.take() {
             let _ = c.kill();
             let _ = c.wait();
+        }
+        if let Some(g) = self.group.take() {
+            g.remove();
         }
     }
 }
@@ -662,7 +690,7 @@ fn make_template(m: &Machine, image_dir: &Path, dir: &Path, kiln: &Path, root: &
     let scratch = dir.join("scratch.ext4");
     mkfs(m, &scratch, SCRATCH, "scratch", None)?;
     let drives = [Drive { id: "kiln", path: kiln, read_only: true }, Drive { id: "image", path: root, read_only: true }, Drive { id: "scratch", path: &scratch, read_only: false }];
-    let mut vm = vmm(m, dir, &socks, &drives, Run::Boot { mode: "init", vcpus: pool_vcpus(), memory_mib: POOL_MEMORY_MIB, api: true, snapshot_to: Some(dir) })?;
+    let mut vm = vmm(m, dir, &socks, &drives, Run::Boot { mode: "init", vcpus: pool_vcpus(), memory_mib: POOL_MEMORY_MIB, api: true, snapshot_to: Some(dir) }, Whose::Leg)?;
     // Up once its guest says it waits.
     let deadline = Instant::now() + BOOT;
     while !std::fs::read_to_string(&vm.console).is_ok_and(|c| c.contains(guest::WAITING)) {
@@ -707,7 +735,7 @@ async fn restore_from(m: &Machine, cache: &Path, key: &str, t: Template, image: 
     relay(&socks, guest::SERVER_PORT, Arc::clone(&server_to), Arc::clone(&stop))?;
     let control = UnixListener::bind(socks.port(guest::CONTROL_PORT))?;
     let drives = [Drive { id: "kiln", path: &t.kiln, read_only: true }, Drive { id: "image", path: &t.root, read_only: true }, Drive { id: "scratch", path: &scratch, read_only: false }];
-    let vm = vmm(m, &dir, &socks, &drives, Run::Restore { from: &t.dir })?;
+    let vm = vmm(m, &dir, &socks, &drives, Run::Restore { from: &t.dir }, Whose::Leg)?;
     let sock = socks.api();
     let (vm, conn) = crate::rt::blocking(move || {
         let mut vm = vm;
@@ -1388,14 +1416,13 @@ async fn boot_deployment(m: &Machine, cache: &Path, kiln: &Path, kept: &Kept) ->
     relay(&socks, guest::PROXY_PORT, Arc::new(AtomicU16::new(proxy)), Arc::clone(&stop))?;
     let control = UnixListener::bind(socks.port(guest::CONTROL_PORT))?;
     let d = &kept.deployment;
-    let vm = boot(
+    let vm = vmm(
         m,
         &dir,
         &socks,
         &[Drive { id: "kiln", path: kiln, read_only: true }, Drive { id: "image", path: &kept.root, read_only: true }, Drive { id: "scratch", path: &scratch, read_only: false }],
-        "serve",
-        d.vcpus.max(1),
-        d.memory_mib.max(128),
+        Run::Boot { mode: "serve", vcpus: d.vcpus.max(1), memory_mib: d.memory_mib.max(128), api: false, snapshot_to: None },
+        Whose::Deployment,
     )?;
     let service = kept.service.clone();
     let (vm, conn) = crate::rt::blocking(move || {

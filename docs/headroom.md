@@ -32,9 +32,10 @@ harmed. A target that declares none takes the platform's default, Kubernetes' 1 
   own reasons, not slow, and isn't counted.
 - `tcp`: connect to `host:port`.
 
-kiln adds its own unless `automatic` is off: a sync in the runner's data folder and the health of
-the server the runner reports to. Each target is probed on a thread of its own, at an interval the
-engine derives; a probe still out counts while it hangs.
+kiln adds its own unless `automatic` is off: a sync in the runner's data folder, the health of the
+server the runner reports to, and, where that server runs on this machine, how late its shards run
+ready work (`kiln server delay`, [priority.md](priority.md)). Each target is probed on a thread of
+its own, at an interval the engine derives; a probe still out counts while it hangs.
 
 **Detection.** A CUSUM on each target's log-latency against its calm, looking for a shift toward
 its tolerance, calibrated on the machine's own record against the false-alarm budget. A sample at
@@ -61,15 +62,18 @@ it has earned one (its share of a period, and at least a tick) and runs until th
 share above zero always runs and over time gets exactly its share (a 5 ms period, which a fast
 disk's probe asks for, once gave every share under a fifth no time at all). A group's CPU and
 writes are measured over at least a period too, and the engine is told the part of that time the
-group was let run, not the share it was given. Groups are each agent session's cgroup
-and, with `escapes` on, the user's transient units (`systemd-run --user`: agents' builds). Those
-are paced only by the machine's installed runner: the one its supervisor started (its parent is
+group was let run, not the share it was given. Groups are each agent session's cgroup, each CI
+job's (a leg's microVM's among them; a job a person paused is the pause's alone, neither stopped nor
+let go on by the pacer), and, with `escapes` on, the user's transient units (`systemd-run --user`:
+agents' builds). Those units are paced only by the machine's installed runner: the one its supervisor started (its parent is
 the process serving the supervisor's control socket it was given), holding `$XDG_RUNTIME_DIR/kiln-headroom-escapes.lock`
 (tried again until held, so a runner that took over from another takes it once that one is gone).
-A runner a test or a person started paces its own sessions only. Units kiln itself runs in, units
+A runner a test or a person started paces its own sessions and jobs only. Units kiln itself runs in, units
 the desktop starts for a person (`app-…`, `dbus-…`, `xdg-…`) and kiln's guards
 (`kiln-headroom-guard-…`) are never paced, and neither is anything someone else froze: a cgroup
-already frozen when headroom would stop it is left as it is, and never thawed by headroom.
+already frozen when headroom would stop it is left as it is, and never thawed by headroom. Legs
+and agents also run at idle priority where the machine lets kiln say so
+([priority.md](priority.md)): the scheduler gives way to everything else before the pacer has to.
 
 On macOS and Windows a group is each agent session's processes as kiln holds them (followed fork
 by fork on macOS, its job object on Windows), metered process by process (CPU time, bytes

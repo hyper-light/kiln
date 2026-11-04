@@ -580,6 +580,19 @@ fn main() -> ExitCode {
         Cmd::Agent(_) | Cmd::Join(_) | Cmd::Outpost(_) => kiln::rt::Profile::agent(),
         _ => kiln::rt::Profile::tool(),
     });
+    // Cores of the server's own (docs/priority.md, "Cores of its own"): its shards fixed to them,
+    // before the runtime starts.
+    if matches!(cli.cmd, Cmd::Server)
+        && let Some(cores) = config::Config::load(&cli.config.clone().unwrap_or_else(config::default_config_path)).ok().and_then(|c| c.server.cores)
+    {
+        match kiln::os::own_cores(&cores) {
+            Ok(own) => {
+                tracing::info!(cores = %cores, "the server's shards are fixed to cores of its own");
+                kiln::rt::pin(own);
+            }
+            Err(why) => tracing::warn!(why = %why, "the server's shards aren't fixed to cores of its own"),
+        }
+    }
     match kiln::rt::block_on(real_main(cli)) {
         Ok(()) => ExitCode::SUCCESS,
         // `kiln run`: the command's own exit status, nothing more to say.
@@ -618,6 +631,8 @@ async fn real_main(cli: Cli) -> anyhow::Result<()> {
         Cmd::Server => {
             let cfg = config::Config::load(&config_path)?;
             shutdown_on_signals(shutdown.clone());
+            // Above what runs beside it (docs/priority.md): its own process on Windows.
+            kiln::os::server_first();
             // The agents it starts have their processes held together (`os::contain`).
             kiln::os::contain::hold_agents();
             // Jobs that ended frozen with a runner process before this one go on (W26-R22).
