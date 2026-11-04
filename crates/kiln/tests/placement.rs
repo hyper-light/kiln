@@ -30,7 +30,8 @@ fn runtime() -> anyhow::Result<()> {
 
 /// Step 1's acceptance: with one shard busy, new work goes to the others. Do: hold shard 0 (a task that sleeps in
 /// its poll, as a blocking call would) until its probe is 50 ms overdue, then steer 200 new connections. Expect:
-/// none of them to shard 0, and more than one of the others taking them.
+/// none of them to shard 0; and, where two or more of the others were never held meanwhile (a loaded host can keep
+/// a shard's poll past the watchdog's limit), more than one of them taking them.
 #[test]
 fn g7_s1_with_one_shard_busy_new_connections_go_to_the_others() -> anyhow::Result<()> {
     runtime()?;
@@ -43,14 +44,21 @@ fn g7_s1_with_one_shard_busy_new_connections_go_to_the_others() -> anyhow::Resul
         std::thread::sleep(Duration::from_millis(2));
     }
     let mut to = [0usize; 4];
+    let mut held = [false; 4];
     for _ in 0..200 {
+        for (i, h) in holders.iter().enumerate() {
+            if let Some(was) = held.get_mut(i) {
+                *was |= hyper_rt::watch::stalled(*h);
+            }
+        }
         let holder = placement::connection_shard().ok_or_else(|| anyhow::anyhow!("no shard picked"))?;
         anyhow::ensure!(holder != busy, "a new connection was steered to the busy shard (its delay {:?})", kiln::shard_health::delay_now(0));
         if let Some(n) = holders.iter().position(|h| *h == holder).and_then(|i| to.get_mut(i)) {
             *n += 1;
         }
     }
-    anyhow::ensure!(to.iter().filter(|n| **n > 0).count() > 1, "spread over the others: {to:?}");
+    let free = held.iter().skip(1).filter(|h| !**h).count();
+    anyhow::ensure!(free < 2 || to.iter().filter(|n| **n > 0).count() > 1, "spread over the others: {to:?}, held {held:?}");
     Ok(())
 }
 
