@@ -7,6 +7,9 @@
 //! are looked at for the agent's mark (`crate::harness::survivors::MARK`), and what carries it is
 //! followed from then on. After a runner restart nothing is followed until the agent's harness
 //! starts again; until then its processes are found by their mark, as before.
+//!
+//! Priority (docs/priority.md; goal 8, plan 01a1a59c2b29 step 3): an agent's harness, and each CI
+//! step, starts under background policy ([`background`]), and so does all they start.
 
 #![allow(unsafe_code)]
 
@@ -177,21 +180,34 @@ fn alive(pid: i32) -> bool {
     nix::sys::signal::kill(nix::unistd::Pid::from_raw(pid), None).is_ok()
 }
 
-/// An agent session's group of processes: those followed as its.
+/// An agent session's group of processes: those followed as its, and whether they start under
+/// background policy.
 #[derive(Debug, Clone)]
 pub struct Group {
     session: String,
+    idle: bool,
 }
 
 impl Group {
-    /// Agent session `session`'s group: its processes are followed once its harness has started.
+    /// Agent session `session`'s group: its processes are followed once its harness has started,
+    /// which starts under background policy.
     pub fn of(session: &str) -> Option<Group> {
+        Self::made(session, true)
+    }
+
+    /// A group `name` for work a person asked for (their own reach run): followed as an agent's
+    /// is, at the priority of what the person runs rather than under background policy.
+    pub fn of_person(name: &str) -> Option<Group> {
+        Self::made(name, false)
+    }
+
+    fn made(session: &str, idle: bool) -> Option<Group> {
         if !holds() {
             return None;
         }
         let t = tracker()?;
         t.sessions.lock().insert(session.to_owned());
-        Some(Group { session: session.to_owned() })
+        Some(Group { session: session.to_owned(), idle })
     }
 
     /// The group `session` has, while any of its processes is followed.
@@ -201,11 +217,16 @@ impl Group {
         }
         let t = tracker()?;
         let followed = t.members.lock().values().any(|s| s == session);
-        followed.then(|| Group { session: session.to_owned() })
+        followed.then(|| Group { session: session.to_owned(), idle: false })
     }
 
-    /// Nothing to do before it starts: macOS can't hold it anywhere.
-    pub fn enter(&self, _cmd: &mut Command) {}
+    /// Before it starts: macOS can't hold it anywhere, but an agent's starts under background
+    /// policy ([`background`]).
+    pub fn enter(&self, cmd: &mut Command) {
+        if self.idle {
+            background(cmd);
+        }
+    }
 
     /// Its harness started: followed from now on, and what it started already.
     pub fn started(&self, pid: u32) -> bool {
@@ -260,6 +281,33 @@ pub fn session_of(pid: u32) -> Option<String> {
     tracker()?.members.lock().get(&pid).cloned()
 }
 
+/// Makes `cmd`'s process run under background policy (docs/priority.md), as `taskpolicy -b` runs a
+/// program: Darwin's background priority (`setpriority(PRIO_DARWIN_PROCESS, 0, PRIO_DARWIN_BG)`,
+/// set between fork and exec), which lowers its CPU priority and throttles its disk and network
+/// I/O; everything it starts inherits it (taskpolicy(8)).
+pub fn background(cmd: &mut Command) {
+    use std::os::unix::process::CommandExt as _;
+    // SAFETY: the closure runs in the child between fork and exec, and makes one system call.
+    unsafe {
+        cmd.pre_exec(|| {
+            let _ = libc::setpriority(libc::PRIO_DARWIN_PROCESS, 0, libc::PRIO_DARWIN_BG);
+            Ok(())
+        });
+    }
+}
+
+/// Process `pid`, started some other way (a CI step on a pty), under background policy from now on,
+/// as `taskpolicy -b -p` puts one: whether it was.
+pub fn background_pid(pid: u32) -> bool {
+    // SAFETY: one system call on a process id.
+    unsafe { libc::setpriority(libc::PRIO_DARWIN_PROCESS, pid, libc::PRIO_DARWIN_BG) == 0 }
+}
+
+/// How legs and agents run here (docs/priority.md), for the runner's facts and its log.
+pub fn priority() -> String {
+    "background: each leg's and agent's processes run under Darwin background policy (taskpolicy -b)".to_owned()
+}
+
 /// How this machine holds an agent's processes together.
 pub fn how() -> String {
     match tracker() {
@@ -301,6 +349,61 @@ mod tests {
         anyhow::ensure!(mine.as_deref() == Some(session.as_str()), "whose it is: {mine:?}");
         anyhow::ensure!(after.is_empty(), "ending the group ends all of it: {after:?}");
         anyhow::ensure!(session_of(std::process::id()).is_none(), "the runner isn't an agent's");
+        Ok(())
+    }
+
+    /// A process's scheduling priority as `ps` says it (`pri`), which background policy lowers
+    /// (`getpriority(PRIO_DARWIN_PROCESS)` asked of another process says only what was set from
+    /// outside it, so it misses a process that put itself there).
+    fn pri(pid: u32) -> Option<i32> {
+        let out = Command::new("ps").args(["-o", "pri=", "-p", &pid.to_string()]).output().ok()?;
+        String::from_utf8_lossy(&out.stdout).trim().parse().ok()
+    }
+
+    /// Goal 8 (plan 01a1a59c2b29 step 3, docs/priority.md): an agent's harness, and what it starts,
+    /// run under background policy, below a process started plainly; a person's run doesn't; a
+    /// process started some other way (a step on a pty) is put there as it runs.
+    #[test]
+    fn g8_s3_an_agents_processes_run_under_background_policy() -> anyhow::Result<()> {
+        let session = format!("g8agent{}", std::process::id());
+        hold_agents();
+        let mut plain = Command::new("sleep").arg("30").stdin(std::process::Stdio::null()).spawn()?;
+        let group = Group::of(&session).ok_or_else(|| anyhow::anyhow!("no kqueue"))?;
+        let mut cmd = Command::new("sh");
+        cmd.args(["-c", "sleep 31 & wait"]).stdin(std::process::Stdio::null());
+        group.enter(&mut cmd);
+        let mut child = cmd.spawn()?;
+        group.started(child.id());
+        let mut pids = Vec::new();
+        for _ in 0..50 {
+            pids = group.pids();
+            if pids.len() >= 2 {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        let normal = pri(plain.id());
+        let agents: Vec<Option<i32>> = pids.iter().map(|p| pri(*p)).collect();
+        let person = Group::of_person(&format!("run-g8{}", std::process::id())).ok_or_else(|| anyhow::anyhow!("no kqueue"))?;
+        let mut cmd = Command::new("sleep");
+        cmd.arg("32").stdin(std::process::Stdio::null());
+        person.enter(&mut cmd);
+        let mut persons = cmd.spawn()?;
+        let persons_before = pri(persons.id());
+        let put = background_pid(persons.id());
+        let persons_after = pri(persons.id());
+        group.kill();
+        let _ = child.wait();
+        group.remove();
+        for c in [&mut persons, &mut plain] {
+            let _ = c.kill();
+            let _ = c.wait();
+        }
+        person.remove();
+        let normal = normal.ok_or_else(|| anyhow::anyhow!("ps said nothing of a plain process"))?;
+        anyhow::ensure!(pids.len() >= 2 && agents.iter().all(|p| p.is_some_and(|p| p < normal)), "the harness and its sleep, each below a plain process's {normal}: {pids:?} {agents:?}");
+        anyhow::ensure!(persons_before == Some(normal), "a person's run lowered: {persons_before:?}, a plain process {normal}");
+        anyhow::ensure!(put && persons_after.is_some_and(|p| p < normal), "a running process not put under background policy: {persons_after:?}");
         Ok(())
     }
 }

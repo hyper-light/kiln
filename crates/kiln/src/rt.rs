@@ -144,6 +144,25 @@ pub fn profile() -> Profile {
     PROFILE.get().copied().unwrap_or_else(Profile::tool).with_env_overrides()
 }
 
+/// The cores of the process's own its shards are fixed to (docs/priority.md, "Cores of its own";
+/// goal 8, plan 01a1a59c2b29 step 6), as [`pin`] chose them.
+static CORES: OnceLock<Vec<u32>> = OnceLock::new();
+
+/// Fix the runtime's shards to `cores`, cores of the process's own (the server's `[server] cores`),
+/// in their order: only the first call before the runtime starts has any effect.
+pub fn pin(cores: Vec<u32>) {
+    let _ = CORES.set(cores);
+}
+
+/// The core each of `shards` shards is fixed to, from cores of the process's own: the first kept
+/// for its threads that aren't shards (its blocking pool, its timers' helpers), as hyper-rt's
+/// placement keeps one, and each shard on the next, around again when there are more shards than
+/// cores; with a single core, every shard on it.
+fn shard_cores(cores: &[u32], shards: u16) -> Vec<u32> {
+    let rest = cores.get(1..).filter(|r| !r.is_empty()).unwrap_or(cores);
+    (0..usize::from(shards)).filter_map(|i| rest.get(i.checked_rem(rest.len())?).copied()).collect()
+}
+
 /// hyper-rt configuration (see the sizing rules in hyper-rt's docs): timers at twice the tasks so the
 /// wheel never runs dry, a 250 µs step budget so sockets stay responsive on a busy shard, no spin.
 pub fn runtime_config(shards: u16, tasks: usize) -> RuntimeConfig {
@@ -196,7 +215,11 @@ fn start() -> Result<Rt, String> {
         Ok(()) | Err(RtError::BadConfig { .. }) => {}
         Err(e) => return Err(format!("blocking pool: {e}")),
     }
-    let config = runtime_config(p.shards, p.tasks_per_shard);
+    let mut config = runtime_config(p.shards, p.tasks_per_shard);
+    if let Some(cores) = CORES.get() {
+        config.cores = shard_cores(cores, p.shards);
+        config.pin = !config.cores.is_empty();
+    }
     start_compute(&p, &config);
     let runtime = Runtime::start(&config).map_err(|e| format!("runtime: {e}"))?;
     let holders: Vec<SlotHolder> = runtime.shard_ids().iter().filter_map(|id| runtime.holder_of(*id)).collect();
@@ -1267,6 +1290,17 @@ impl Signals {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Goal 8 (plan 01a1a59c2b29 step 6): with cores of its own the server's shards each get one,
+    /// the first core kept for its other threads; more shards than cores go around again, and a
+    /// single core takes them all.
+    #[test]
+    fn g8_s6_shards_are_fixed_to_cores_of_the_servers_own() {
+        assert_eq!(shard_cores(&[8, 9, 10, 11], 2), vec![9, 10]);
+        assert_eq!(shard_cores(&[8, 9, 10], 4), vec![9, 10, 9, 10]);
+        assert_eq!(shard_cores(&[5], 2), vec![5, 5]);
+        assert!(shard_cores(&[], 2).is_empty());
+    }
 
     /// `each` keeps the items' order, runs no more than `n` at once, runs them at once (four
     /// 50 ms waits take ~one), and polls them under the task's own waker: a hyper-rt connect inside

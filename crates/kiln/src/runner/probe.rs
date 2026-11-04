@@ -96,14 +96,17 @@ async fn tools() -> BTreeMap<String, String> {
 /// has no place for (a job's own containers still run there).
 async fn executors() -> BTreeMap<String, Executor> {
     let mut out = BTreeMap::new();
-    out.insert("host".to_owned(), Executor::default());
+    // How each runs its legs beside what matters on the machine, and why not idle where they
+    // can't be (docs/priority.md).
+    let priority = crate::rt::blocking(crate::os::contain::priority).await.unwrap_or_default();
+    out.insert("host".to_owned(), Executor { version: None, details: [("priority".to_owned(), priority.clone())].into() });
     #[cfg(target_os = "linux")]
     if let Ok(Some(m)) = crate::rt::blocking(super::firecracker::Machine::find).await {
         let kernel = m.kernel.to_string_lossy().into_owned();
         // How its VMMs are confined (W13-R05): a jail of namespaces each, or none here.
         let jail = if m.jail { "namespaces" } else { "none" }.to_owned();
         let version = crate::rt::blocking(move || m.version()).await.ok().flatten();
-        out.insert("firecracker".to_owned(), Executor { version, details: [("kernel".to_owned(), kernel), ("jail".to_owned(), jail)].into() });
+        out.insert("firecracker".to_owned(), Executor { version, details: [("kernel".to_owned(), kernel), ("jail".to_owned(), jail), ("priority".to_owned(), priority)].into() });
     }
     if cfg!(windows) {
         return out;
@@ -118,7 +121,8 @@ async fn executors() -> BTreeMap<String, Executor> {
         }
     }
     let rootless = crate::rt::blocking(super::docker::rootless_engine).await.unwrap_or(false);
-    let details = [("engine".to_owned(), engine.to_owned()), ("rootless".to_owned(), rootless.to_string())].into();
+    let priority = format!("the least CPU weight: --cpu-shares {} (cpu.weight 1)", super::docker::LEG_CPU_SHARES);
+    let details = [("engine".to_owned(), engine.to_owned()), ("rootless".to_owned(), rootless.to_string()), ("priority".to_owned(), priority)].into();
     out.insert("docker".to_owned(), Executor { version, details });
     out
 }
