@@ -305,8 +305,8 @@ fn backlog(wait: Arc<AtomicU64>) -> std::thread::JoinHandle<anyhow::Result<()>> 
 }
 
 /// Step 4, the pools: work waiting in a pool sheds requests even while every shard is calm. With a backlog in the
-/// blocking pool's `store` share that holds each of its jobs about 200 ms (past the calm it learned, short of the
-/// tolerance), Background requests are shed and Normal and Critical ones served; at about 1.5 s a job, past the
+/// blocking pool's `store` share that keeps each of its jobs waiting about 200 ms for a place (past the calm it
+/// learned, short of the tolerance), Background requests are shed and Normal and Critical ones served; at about 1.5 s a job, past the
 /// tolerance, Normal ones are shed too, every shard sheds the API (/readyz: not ready, naming the share), and
 /// Critical ones are served and promptly; once it drains, everything is served again. The shards' own detectors
 /// never shed: what sheds is the pool's.
