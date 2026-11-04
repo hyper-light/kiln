@@ -216,6 +216,8 @@ struct Sim {
     predicted: BTreeMap<String, Option<u64>>,
     /// Processes started, by (owner, life, run): never more than one.
     spawns: BTreeMap<(usize, u64, String), u32>,
+    /// Each runner's claims offered so far: one offered again as it stands was checked when made.
+    offered: BTreeSet<(usize, Fence)>,
     /// The runners the directory last showed owners.
     shown: Vec<bool>,
     /// Each link's round trip as the shells measure it: the longest a frame takes, there and back.
@@ -317,6 +319,7 @@ impl Sim {
             plans,
             predicted,
             spawns: BTreeMap::new(),
+            offered: BTreeSet::new(),
             shown: Vec::new(),
             rtt,
             counts: Counts::default(),
@@ -405,7 +408,7 @@ impl Sim {
         let Some(r) = self.runners.get_mut(j) else { return };
         r.epoch = r.epoch.saturating_add(1);
         // What ran when it went down ended with it.
-        for rec in r.records.values_mut() {
+        for rec in r.records.values_mut().flat_map(|m| m.values_mut()).flat_map(|m| m.values_mut()) {
             if rec.ended.is_none() {
                 rec.ended = Some(false);
             }
@@ -671,9 +674,9 @@ impl Sim {
     fn runner_said(&mut self, j: usize, said: Vec<Said>) {
         for (owner, m) in said {
             match &m {
-                ToOwner::Offer { got, .. } => {
+                ToOwner::Offer { got, fence, .. } => {
                     self.counts.offers += 1;
-                    if got.mem > 0 {
+                    if self.offered.insert((j, *fence)) && got.mem > 0 {
                         self.check_room(j);
                     }
                 }
@@ -728,10 +731,8 @@ impl Sim {
                     // A runner starts a run only under its live claim for it.
                     let live = core.probes().iter().any(|v| v.owner == name && v.epoch == life && v.run == run && (v.state == "offered" || v.state == "taken") && v.fence == Some(fence));
                     if core.start(peer, &run, fence, now, &mut out) == Some(Start::New) {
-                        if !live {
-                            if self.failed.is_none() {
-                                self.failed = Some(format!("r{j} started {run} under claim {fence:?}, not live there"));
-                            }
+                        if !live && self.failed.is_none() {
+                            self.failed = Some(format!("r{j} started {run} under claim {fence:?}, not live there"));
                         }
                         spawned = Some(run);
                     }

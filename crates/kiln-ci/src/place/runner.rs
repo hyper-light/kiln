@@ -63,8 +63,9 @@ pub struct Record {
     pub ended: Option<bool>,
 }
 
-/// The record of runs started here, by owner, the owner's epoch and run.
-pub type Records = BTreeMap<(String, u64, String), Record>;
+/// The record of runs started here, by owner, the owner's epoch and run: nested, so that looking
+/// one up borrows its names rather than building a key.
+pub type Records = BTreeMap<String, BTreeMap<u64, BTreeMap<String, Record>>>;
 
 /// What a start under a live claim comes to.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -267,11 +268,11 @@ impl Admission {
 
     /// What's free for another run now: the room less what's held.
     fn free_now(&self) -> Amounts {
-        let mut free = ask::less(&self.avail, &self.held);
+        let free = ask::less(&self.avail, &self.held);
         #[cfg(test)]
         if super::mutant() == Some(super::Mutant::OfferPastRoom) {
             let [cpu, mem, disk, gpu] = free;
-            free = [cpu, mem.saturating_mul(2), disk, gpu];
+            return [cpu, mem.saturating_mul(2), disk, gpu];
         }
         free
     }
@@ -338,7 +339,12 @@ impl Admission {
         if super::mutant() == Some(super::Mutant::ReusedIdRan) {
             return;
         }
-        self.records.retain(|(n, e, _), _| !(n == name && *e < epoch));
+        if let Some(by_epoch) = self.records.get_mut(name) {
+            by_epoch.retain(|e, _| *e >= epoch);
+            if by_epoch.is_empty() {
+                self.records.remove(name);
+            }
+        }
     }
 
     /// A probe's claim starts holding room, from `from`.
@@ -437,17 +443,28 @@ impl Admission {
         let cap = self.cap();
         let Some(p) = self.get(s) else { return };
         let (class, had) = (p.ask.class, p.key);
-        let cost = u128::from(ask::dominant_ppm(&p.amounts, &cap)).saturating_mul(u128::from(p.predicted.unwrap_or(0))).saturating_mul(1000) / u128::from(self.weight(&p.ask.repo));
-        let tenant = p.tenant.clone();
         let key = match had {
             Some(k) => k,
             None => {
+                let cost = u128::from(ask::dominant_ppm(&p.amounts, &cap)).saturating_mul(u128::from(p.predicted.unwrap_or(0))).saturating_mul(1000) / u128::from(self.weight(&p.ask.repo));
                 self.seq = self.seq.saturating_add(1);
                 let seq = self.seq;
+                // The slot and the fair share borrowed apart, so the tenant's name is copied only
+                // the first time it's seen.
+                let Some(Some(p)) = self.slots.get(ix(s)) else { return };
                 let Some(f) = self.fair.get_mut(class.index()) else { return };
-                let last = f.finish.get(&tenant).copied().unwrap_or(0);
-                let tag = f.vtime.max(last);
-                f.finish.insert(tenant, tag.saturating_add(cost));
+                let tag = match f.finish.get_mut(p.tenant.as_str()) {
+                    Some(last) => {
+                        let tag = f.vtime.max(*last);
+                        *last = tag.saturating_add(cost);
+                        tag
+                    }
+                    None => {
+                        let tag = f.vtime;
+                        f.finish.insert(p.tenant.clone(), tag.saturating_add(cost));
+                        tag
+                    }
+                };
                 if let Some(p) = self.get_mut(s) {
                     p.charged = cost;
                 }
@@ -468,14 +485,20 @@ impl Admission {
         let cap = self.cap();
         let Some(p) = self.get(s) else { return };
         let cost = u128::from(ask::dominant_ppm(&p.amounts, &cap)).saturating_mul(u128::from(ran)).saturating_mul(1000) / u128::from(self.weight(&p.ask.repo));
-        let (charged, tenant, class) = (p.charged, p.tenant.clone(), p.ask.class);
+        let (charged, class) = (p.charged, p.ask.class);
+        // The slot and the fair share borrowed apart, so the tenant's name isn't copied.
+        let Some(Some(p)) = self.slots.get(ix(s)) else { return };
         let Some(f) = self.fair.get_mut(class.index()) else { return };
         let vtime = f.vtime;
-        if let Some(last) = f.finish.get_mut(&tenant) {
-            *last = last.saturating_add(cost).saturating_sub(charged);
-            if *last <= vtime {
-                f.finish.remove(&tenant);
+        let caught_up = match f.finish.get_mut(p.tenant.as_str()) {
+            Some(last) => {
+                *last = last.saturating_add(cost).saturating_sub(charged);
+                *last <= vtime
             }
+            None => false,
+        };
+        if caught_up {
+            f.finish.remove(p.tenant.as_str());
         }
     }
 }
@@ -810,11 +833,16 @@ impl Admission {
     }
 
     fn record(&self, name: &str, epoch: u64, run: &str) -> Option<Record> {
+        let by_epoch = self.records.get(name)?;
         #[cfg(test)]
         if super::mutant() == Some(super::Mutant::ReusedIdRan) {
-            return self.records.iter().find(|((n, _, r), _)| n == name && r == run).map(|(_, v)| *v);
+            return by_epoch.values().find_map(|runs| runs.get(run)).copied();
         }
-        self.records.get(&(name.to_owned(), epoch, run.to_owned())).copied()
+        by_epoch.get(&epoch).and_then(|runs| runs.get(run)).copied()
+    }
+
+    fn record_mut(&mut self, name: &str, epoch: u64, run: &str) -> Option<&mut Record> {
+        self.records.get_mut(name).and_then(|m| m.get_mut(&epoch)).and_then(|m| m.get_mut(run))
     }
 
     /// If the record has the run, tells its owner it ran (or how it ended): true.
@@ -1034,7 +1062,7 @@ impl Admission {
         if let Some(p) = self.get_mut(s) {
             p.state = State::Running { fence, from: now };
         }
-        self.records.insert((from.name.to_owned(), from.epoch, run.to_owned()), Record { fence, ended: None });
+        self.records.entry(from.name.to_owned()).or_default().entry(from.epoch).or_default().insert(run.to_owned(), Record { fence, ended: None });
         Some(Start::New)
     }
 
@@ -1054,7 +1082,7 @@ impl Admission {
         let Some(s) = self.find(from, run) else { return };
         let Some(State::Running { fence, from: t0 }) = self.state(s) else { return };
         self.settle(s, u64::try_from(now.saturating_sub(t0)).unwrap_or(0));
-        if let Some(r) = self.records.get_mut(&(from.name.to_owned(), from.epoch, run.to_owned())) {
+        if let Some(r) = self.record_mut(from.name, from.epoch, run) {
             r.ended = Some(ok);
         }
         let away = self.get(s).and_then(|p| self.owner(p.owner)).is_none_or(|w| w.away);
@@ -1069,9 +1097,18 @@ impl Admission {
     /// The owner heard how its run ended (or that it ran here before): its record goes. The record
     /// of a run still running stays.
     pub fn ack(&mut self, from: Peer<'_>, run: &str) {
-        let key = (from.name.to_owned(), from.epoch, run.to_owned());
-        if self.records.get(&key).is_some_and(|r| r.ended.is_some()) {
-            self.records.remove(&key);
+        if self.record(from.name, from.epoch, run).is_none_or(|r| r.ended.is_none()) {
+            return;
+        }
+        let Some(by_epoch) = self.records.get_mut(from.name) else { return };
+        if let Some(runs) = by_epoch.get_mut(&from.epoch) {
+            runs.remove(run);
+            if runs.is_empty() {
+                by_epoch.remove(&from.epoch);
+            }
+        }
+        if by_epoch.is_empty() {
+            self.records.remove(from.name);
         }
     }
 
@@ -1149,12 +1186,13 @@ impl Admission {
             }
         }
         self.admit(now, out);
+        self.boundaries(now, out);
         for s in slots {
             if !matches!(self.state(s), Some(State::Offered { .. })) {
                 self.standing(s, now, out);
             }
         }
-        let ended: Vec<(String, Record)> = self.records.iter().filter(|((n, e, _), r)| n == from.name && *e == from.epoch && r.ended.is_some()).map(|((_, _, run), r)| (run.clone(), *r)).collect();
+        let ended: Vec<(String, Record)> = self.records.get(from.name).and_then(|m| m.get(&from.epoch)).map(|runs| runs.iter().filter(|(_, r)| r.ended.is_some()).map(|(run, r)| (run.clone(), *r)).collect()).unwrap_or_default();
         for (run, r) in ended {
             out.push((from.name.to_owned(), ToOwner::Ended { run, fence: r.fence, ok: r.ended == Some(true) }));
         }

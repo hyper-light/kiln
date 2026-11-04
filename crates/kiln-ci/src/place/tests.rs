@@ -188,7 +188,7 @@ fn e5_a_run_started_here_is_never_started_again_and_a_reused_id_is_another_run()
     let o1_again = Peer { name: "o1", epoch: 2 };
     let said = probe(&mut b, o1_again, ask("a", "cpus=4")?, None, 23);
     assert!(offer(&said, "o1", "a").is_some(), "{said:?}");
-    assert!(b.records().keys().all(|(_, e, _)| *e == 2), "{:?}", b.records());
+    assert!(b.records().values().all(|m| m.keys().all(|e| *e == 2)), "{:?}", b.records());
     b.check()
 }
 
@@ -453,6 +453,9 @@ mod props {
                     ToOwner::Waiting { run, reason, place, .. } => {
                         self.told.insert((o.clone(), run), (place, reason.kind()));
                     }
+                    // A take or start under a claim that lapsed: news of the claim, not of the
+                    // run's place or reason (a lapse puts it back where it was, and says so).
+                    ToOwner::Lapsed { .. } => {}
                     other => {
                         self.told.remove(&(o.clone(), other.run().to_owned()));
                     }
