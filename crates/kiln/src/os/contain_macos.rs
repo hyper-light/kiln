@@ -303,13 +303,6 @@ pub fn background_pid(pid: u32) -> bool {
     unsafe { libc::setpriority(libc::PRIO_DARWIN_PROCESS, pid, libc::PRIO_DARWIN_BG) == 0 }
 }
 
-/// Whether process `pid` runs under background policy (`getpriority(PRIO_DARWIN_PROCESS)` says so
-/// by a value other than 0).
-pub fn in_background(pid: u32) -> bool {
-    // SAFETY: one system call on a process id.
-    unsafe { libc::getpriority(libc::PRIO_DARWIN_PROCESS, pid) > 0 }
-}
-
 /// How legs and agents run here (docs/priority.md), for the runner's facts and its log.
 pub fn priority() -> String {
     "background: each leg's and agent's processes run under Darwin background policy (taskpolicy -b)".to_owned()
@@ -359,13 +352,22 @@ mod tests {
         Ok(())
     }
 
+    /// A process's scheduling priority as `ps` says it (`pri`), which background policy lowers
+    /// (`getpriority(PRIO_DARWIN_PROCESS)` asked of another process says only what was set from
+    /// outside it, so it misses a process that put itself there).
+    fn pri(pid: u32) -> Option<i32> {
+        let out = Command::new("ps").args(["-o", "pri=", "-p", &pid.to_string()]).output().ok()?;
+        String::from_utf8_lossy(&out.stdout).trim().parse().ok()
+    }
+
     /// Goal 8 (plan 01a1a59c2b29 step 3, docs/priority.md): an agent's harness, and what it starts,
-    /// run under background policy; a person's run doesn't; a process started some other way (a
-    /// step on a pty) is put there as it runs.
+    /// run under background policy, below a process started plainly; a person's run doesn't; a
+    /// process started some other way (a step on a pty) is put there as it runs.
     #[test]
     fn g8_s3_an_agents_processes_run_under_background_policy() -> anyhow::Result<()> {
         let session = format!("g8agent{}", std::process::id());
         hold_agents();
+        let mut plain = Command::new("sleep").arg("30").stdin(std::process::Stdio::null()).spawn()?;
         let group = Group::of(&session).ok_or_else(|| anyhow::anyhow!("no kqueue"))?;
         let mut cmd = Command::new("sh");
         cmd.args(["-c", "sleep 31 & wait"]).stdin(std::process::Stdio::null());
@@ -380,23 +382,28 @@ mod tests {
             }
             std::thread::sleep(Duration::from_millis(100));
         }
-        let agents: Vec<bool> = pids.iter().map(|p| in_background(*p)).collect();
+        let normal = pri(plain.id());
+        let agents: Vec<Option<i32>> = pids.iter().map(|p| pri(*p)).collect();
         let person = Group::of_person(&format!("run-g8{}", std::process::id())).ok_or_else(|| anyhow::anyhow!("no kqueue"))?;
         let mut cmd = Command::new("sleep");
         cmd.arg("32").stdin(std::process::Stdio::null());
         person.enter(&mut cmd);
         let mut persons = cmd.spawn()?;
-        let persons_bg = in_background(persons.id());
-        let lowered = background_pid(persons.id()) && in_background(persons.id());
+        let persons_before = pri(persons.id());
+        let put = background_pid(persons.id());
+        let persons_after = pri(persons.id());
         group.kill();
         let _ = child.wait();
         group.remove();
-        let _ = persons.kill();
-        let _ = persons.wait();
+        for c in [&mut persons, &mut plain] {
+            let _ = c.kill();
+            let _ = c.wait();
+        }
         person.remove();
-        anyhow::ensure!(pids.len() >= 2 && agents.iter().all(|b| *b), "the harness and its sleep, each under background policy: {pids:?} {agents:?}");
-        anyhow::ensure!(!persons_bg, "a person's run under background policy");
-        anyhow::ensure!(lowered, "a running process put under background policy");
+        let normal = normal.ok_or_else(|| anyhow::anyhow!("ps said nothing of a plain process"))?;
+        anyhow::ensure!(pids.len() >= 2 && agents.iter().all(|p| p.is_some_and(|p| p < normal)), "the harness and its sleep, each below a plain process's {normal}: {pids:?} {agents:?}");
+        anyhow::ensure!(persons_before == Some(normal), "a person's run lowered: {persons_before:?}, a plain process {normal}");
+        anyhow::ensure!(put && persons_after.is_some_and(|p| p < normal), "a running process not put under background policy: {persons_after:?}");
         Ok(())
     }
 }

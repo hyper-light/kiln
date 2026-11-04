@@ -130,8 +130,8 @@ place.
   its weights and cores, `ProcessType` `Interactive` for the server's launchd job, and
   `systemd-analyze verify` finding nothing against them.
 - `os::contain::tests::g8_s3_an_agents_processes_run_under_background_policy` (macOS): an agent's
-  harness and what it starts under background policy, read back with `getpriority`; a person's run
-  not; a running process put there.
+  harness and what it starts under background policy, their scheduling priority (`ps`) below a
+  plain process's; a person's run not; a running process put there.
 - `os::contain::tests::g8_s4_an_agents_job_runs_below_normal_at_the_least_weight` and
   `g8_s4_the_server_runs_above_normal` (Windows): an agent's job's priority class and CPU rate
   control read back, cmd and its child below normal, the first process's memory and I/O priority;
