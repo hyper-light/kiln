@@ -84,7 +84,10 @@ conversations to about 20,000 events. The lab runs 4 runners and 32 live session
 events, 6 of 4,000, 24 of 400), 8 of them at work (a 40-event turn, 25 ms apart, then about 2 s
 before the next message), 8 viewers (20 s on each agent), 4 API readers (50 ms apart), 2 agents
 calling MCP (250 ms apart) and a page loader (100 ms apart), with a 5 s warm-up and a 60 s window.
-`--profile small` is a minute's try.
+`--profile small` is a minute's try. `--profile overload` is the realistic one with no think time
+for its viewers and readers (each asks again as soon as it is answered): with one shard
+(`--env KILN_RT_SHARDS=1`) it overloads the server on purpose, as goal 6's shedding is measured
+(`--env-b KILN_SHED=1` against the same build without).
 
 ### What it reports
 

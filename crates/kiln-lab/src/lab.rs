@@ -76,6 +76,14 @@ impl Profile {
         }
     }
 
+    /// The realistic profile with no think time for its people and readers: each viewer opens the next
+    /// conversation as soon as the last one is open, each reader asks again as soon as it is answered, a closed
+    /// loop at the most its clients can ask. A server of one shard falls behind it on purpose (goal 6, plan
+    /// 01a1a59c2abe step 4: what it sheds, by class, and what it still serves).
+    pub fn overload() -> Self {
+        Self { dwell_s: 0, read_think_ms: 0, ..Self::realistic() }
+    }
+
     /// A small one, to try the lab out (and for its own test).
     pub fn small() -> Self {
         Self {
