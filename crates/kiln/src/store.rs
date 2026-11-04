@@ -1681,6 +1681,33 @@ impl Store {
         .await
     }
 
+    /// The names machines' certificates carried before kiln knew them by their ids, each with its
+    /// machine id (docs/machines.md, "One record a machine").
+    pub async fn machine_names(&self) -> anyhow::Result<std::collections::HashMap<String, String>> {
+        self.call(|c| {
+            let mut st = c.prepare("SELECT name, machine_id FROM machine_names")?;
+            let rows = st.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?;
+            Ok(rows.collect::<Result<_, _>>()?)
+        })
+        .await
+    }
+
+    /// Machine `id` forgotten: the names its certificates carried go with it. Those names.
+    pub async fn forget_machine_names(&self, id: String) -> anyhow::Result<Vec<String>> {
+        self.call(move |c| {
+            let t = tx(c)?;
+            let names: Vec<String> = {
+                let mut st = t.prepare("SELECT name FROM machine_names WHERE machine_id = ?1 ORDER BY name")?;
+                let rows = st.query_map([&id], |r| r.get::<_, String>(0))?;
+                rows.collect::<Result<_, _>>()?
+            };
+            t.execute("DELETE FROM machine_names WHERE machine_id = ?1", [&id])?;
+            t.commit()?;
+            Ok(names)
+        })
+        .await
+    }
+
     /// The machine agent `name` is, as its runner says ([`crate::os::machine_id`]): kept with the
     /// name, so a machine joining with the same host name isn't taken for it
     /// ([`crate::join::free_name`]). Unchanged, nothing is written.
@@ -1714,9 +1741,21 @@ impl Store {
     /// attempts, its insights, its preview removals, its reap policy, its grants, who enrolled it,
     /// and what kiln keeps for it under `prefixes` and its name (`front_door/`, …). What `to` has already wins over
     /// `from`'s; `to` ends with a row, one of its own (with `hostname`) when neither had one.
+    ///
+    /// `to` may have a row already: a second record of the same machine folding into its id
+    /// (docs/machines.md, "Duplicates fold into the machine's id"). Then the two merge: `to`'s row,
+    /// label, settings, policy and enrollment stay; the insights both kept for one hour add up
+    /// (kiln_ci's `Rollup::merge`, the runner's time summed); a grant both had is kept once.
     pub async fn move_runner(&self, from: String, to: String, label: String, hostname: String, prefixes: Vec<&'static str>) -> anyhow::Result<()> {
         self.call(move |c| {
             let t = tx(c)?;
+            merge_runner_insights(&t, &from, &to)?;
+            // A grant `to` has already isn't kept twice.
+            t.execute(
+                "DELETE FROM grants WHERE scope = 'runner:' || ?1 AND EXISTS (SELECT 1 FROM grants g WHERE g.scope = 'runner:' || ?2
+                   AND g.principal = grants.principal AND g.what = grants.what AND g.deny = grants.deny)",
+                params![from, to],
+            )?;
             t.execute("UPDATE OR IGNORE agents SET name = ?2 WHERE name = ?1", params![from, to])?;
             t.execute("DELETE FROM agents WHERE name = ?1", [&from])?;
             t.execute(
@@ -1725,6 +1764,15 @@ impl Store {
                  ON CONFLICT(name) DO UPDATE SET label = COALESCE(agents.label, excluded.label), machine_id = excluded.machine_id",
                 params![to, label, hostname, crate::util::now_unix()],
             )?;
+            // The name it went by is the machine's from now on: a runner whose certificate says it
+            // is keyed by the id as it connects (docs/machines.md, "One record a machine").
+            if crate::join::is_machine_key(&to) && !crate::join::is_machine_key(&from) {
+                t.execute(
+                    "INSERT INTO machine_names (name, machine_id, at) VALUES (?1, ?2, ?3) ON CONFLICT(name) DO UPDATE SET machine_id = excluded.machine_id",
+                    params![from, to, crate::util::now_unix()],
+                )?;
+            }
+            t.execute("UPDATE machine_names SET machine_id = ?2 WHERE machine_id = ?1", params![from, to])?;
             t.execute("UPDATE jobs SET agent = ?2 WHERE agent = ?1", params![from, to])?;
             for at in ["$.runner", "$.avoid"] {
                 t.execute(&format!("UPDATE jobs SET placement = json_set(placement, '{at}', ?2) WHERE json_extract(placement, '{at}') = ?1"), params![from, to])?;
@@ -1747,6 +1795,31 @@ impl Store {
             }
             t.commit()?;
             Ok(())
+        })
+        .await
+    }
+
+    /// Job pods' records (ephemeral runners, `kiln agent --ephemeral`) kiln forgets: not
+    /// connected, not in `keep` (connected again, or still inside their reconnect grace), with no
+    /// job of theirs still pending, queued or running (docs/machines.md, "Finished job pods are
+    /// forgotten"). Their jobs, attempts and insights keep their names. The ones forgotten.
+    pub async fn forget_finished_pods(&self, keep: Vec<String>) -> anyhow::Result<Vec<String>> {
+        self.call(move |c| {
+            let t = tx(c)?;
+            let done: Vec<String> = {
+                let mut st = t.prepare(
+                    "SELECT name FROM agents WHERE ephemeral = 1 AND connected = 0
+                       AND NOT EXISTS (SELECT 1 FROM jobs WHERE jobs.status IN ('pending', 'queued', 'running') AND jobs.agent = agents.name)
+                     ORDER BY name",
+                )?;
+                let rows = st.query_map([], |r| r.get::<_, String>(0))?;
+                rows.collect::<Result<Vec<_>, _>>()?.into_iter().filter(|n| !keep.contains(n)).collect()
+            };
+            for name in &done {
+                t.execute("DELETE FROM agents WHERE name = ?1 AND ephemeral = 1 AND connected = 0", [name])?;
+            }
+            t.commit()?;
+            Ok(done)
         })
         .await
     }
@@ -1852,6 +1925,41 @@ impl Store {
         })
         .await
     }
+}
+
+/// Runner `from`'s insights that `to` has for the same hour too, merged into `to`'s
+/// ([`Store::move_runner`] folding a second record of a machine into its id): its legs' rollups
+/// by kiln_ci's `Rollup::merge`, its connected, slot and busy seconds summed. What's left of
+/// `from`'s moves as before.
+fn merge_runner_insights(t: &Connection, from: &str, to: &str) -> anyhow::Result<()> {
+    let both: Vec<(i64, i64, String, String)> = {
+        let mut st = t.prepare(
+            "SELECT f.rowid, k.rowid, f.data, k.data FROM ci_rollups f JOIN ci_rollups k
+               ON k.grain = f.grain AND k.bucket = f.bucket AND k.repo_id = f.repo_id AND k.workflow = f.workflow
+              AND k.job = f.job AND k.step = f.step AND k.executor = f.executor AND k.runner = ?2
+             WHERE f.runner = ?1",
+        )?;
+        let rows = st.query_map(params![from, to], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))?;
+        rows.collect::<Result<Vec<_>, _>>()?
+    };
+    for (was, kept, theirs, ours) in both {
+        // One that doesn't read stays `to`'s as it is.
+        if let (Ok(theirs), Ok(mut ours)) = (serde_json::from_str::<kiln_ci::insights::Rollup>(&theirs), serde_json::from_str::<kiln_ci::insights::Rollup>(&ours)) {
+            ours.merge(&theirs);
+            t.execute("UPDATE ci_rollups SET data = ?2 WHERE rowid = ?1", params![kept, serde_json::to_string(&ours)?])?;
+        }
+        t.execute("DELETE FROM ci_rollups WHERE rowid = ?1", [was])?;
+    }
+    t.execute(
+        "UPDATE ci_runner_time SET
+           connected = connected + (SELECT f.connected FROM ci_runner_time f WHERE f.runner = ?1 AND f.bucket = ci_runner_time.bucket),
+           slot_seconds = slot_seconds + (SELECT f.slot_seconds FROM ci_runner_time f WHERE f.runner = ?1 AND f.bucket = ci_runner_time.bucket),
+           busy_seconds = busy_seconds + (SELECT f.busy_seconds FROM ci_runner_time f WHERE f.runner = ?1 AND f.bucket = ci_runner_time.bucket)
+         WHERE runner = ?2 AND bucket IN (SELECT bucket FROM ci_runner_time WHERE runner = ?1)",
+        params![from, to],
+    )?;
+    t.execute("DELETE FROM ci_runner_time WHERE runner = ?1 AND bucket IN (SELECT bucket FROM ci_runner_time WHERE runner = ?2)", params![from, to])?;
+    Ok(())
 }
 
 const JOB_SELECT: &str = "SELECT id, run_id, key, display, status, labels, needs, agent, executor,
@@ -2279,6 +2387,124 @@ mod tests {
             s.set_agent_label(id.into(), "studio".into(), String::new()).await?;
             s.move_runner("adas-macbook-pro.local".into(), id.into(), "adas-macbook-pro.local".into(), String::new(), vec!["front_door/"]).await?;
             anyhow::ensure!(s.agent_label(id.into()).await?.as_deref() == Some("studio"));
+            anyhow::Ok(())
+        })
+    }
+
+    /// docs/machines.md, "Duplicates fold into the machine's id": a second record of a machine
+    /// moves into the id it already has a row under, and the two merge: the id's row, label,
+    /// settings and enrollment stay; the insights both kept for one hour add up; a grant both had
+    /// is kept once; the rest of the duplicate's moves; its row is gone.
+    #[test]
+    fn machines_a_second_record_merges_into_the_id_it_folds_into() -> anyhow::Result<()> {
+        crate::rt::block_on(async move {
+            let s = Store::in_memory()?;
+            let id = "5f2a9c3e0b1d4e6f8a7c9b0d1e2f3a4b";
+            let row = |name: &str, slots: u32| AgentRow {
+                name: name.into(),
+                labels: vec![],
+                slots,
+                hostname: "fedora.attlocal.net".into(),
+                os: "linux".into(),
+                arch: "x86_64".into(),
+                version: "1".into(),
+                ephemeral: false,
+                connected: false,
+                last_seen: 5,
+                enrolled_at: 1,
+            };
+            s.upsert_agent(row(id, 32)).await?;
+            s.set_agent_label(id.into(), "kiln-a094a12d.attlocal.net".into(), String::new()).await?;
+            s.upsert_agent(row("fedora.attlocal.net", 4)).await?;
+            let rollup = |count: u64| serde_json::to_string(&kiln_ci::insights::Rollup { count, success: count, ..Default::default() });
+            let (two, three, five) = (rollup(2)?, rollup(3)?, rollup(5)?);
+            s.call(move |c| {
+                c.execute_batch(&format!(
+                    "INSERT INTO ci_runner_time (bucket, runner, connected, slot_seconds, busy_seconds) VALUES (1, 'fedora.attlocal.net', 10, 40, 4), (1, '{id}', 20, 640, 8), (2, 'fedora.attlocal.net', 7, 28, 0);
+                     INSERT INTO ci_rollups (grain, bucket, repo_id, workflow, job, step, executor, runner, data) VALUES
+                       ('hour', 1, 'r', 'ci', 'build', '', 'baremetal', 'fedora.attlocal.net', '{two}'),
+                       ('hour', 1, 'r', 'ci', 'build', '', 'baremetal', '{id}', '{three}'),
+                       ('hour', 2, 'r', 'ci', 'build', '', 'baremetal', 'fedora.attlocal.net', '{five}');
+                     INSERT INTO grants (principal, what, scope, created_at, created_by) VALUES
+                       ('user:1', 'viewer', 'runner:fedora.attlocal.net', 1, 'ada'), ('user:1', 'viewer', 'runner:{id}', 1, 'ada'),
+                       ('user:2', 'viewer', 'runner:fedora.attlocal.net', 1, 'ada');
+                     INSERT INTO enrollments (machine, enrolled_by, at) VALUES ('fedora.attlocal.net', 'bob', 1), ('{id}', 'ada', 1);
+                     INSERT INTO kv (k, v) VALUES ('front_door/fedora.attlocal.net', 'theirs'), ('front_door/{id}', 'ours'), ('agent_limit/fedora.attlocal.net', '2');"
+                ))?;
+                Ok(())
+            })
+            .await?;
+            s.move_runner("fedora.attlocal.net".into(), id.into(), "fedora.attlocal.net".into(), String::new(), vec!["front_door/", "agent_limit/"]).await?;
+            let agents = s.agents().await?;
+            anyhow::ensure!(agents.len() == 1 && agents.iter().any(|a| a.name == id && a.slots == 32), "the id's row stays, the duplicate's is gone: {agents:?}");
+            anyhow::ensure!(s.agent_label(id.into()).await?.as_deref() == Some("kiln-a094a12d.attlocal.net"), "the id's label stays");
+            let read = |sql: String| s.call(move |c| Ok(c.query_row(&sql, [], |r| r.get::<_, String>(0))?));
+            let count = |sql: String| s.call(move |c| Ok(c.query_row(&sql, [], |r| r.get::<_, i64>(0))?));
+            // The hour both had adds up; the hour only the duplicate had moves.
+            anyhow::ensure!(read(format!("SELECT connected || ',' || slot_seconds || ',' || busy_seconds FROM ci_runner_time WHERE runner = '{id}' AND bucket = 1")).await? == "30.0,680.0,12.0");
+            anyhow::ensure!(count(format!("SELECT COUNT(*) FROM ci_runner_time WHERE runner = '{id}' AND bucket = 2")).await? == 1);
+            let merged: kiln_ci::insights::Rollup = serde_json::from_str(&read(format!("SELECT data FROM ci_rollups WHERE runner = '{id}' AND bucket = 1")).await?)?;
+            anyhow::ensure!(merged.count == 5 && merged.success == 5, "rolled up as one: {merged:?}");
+            anyhow::ensure!(count(format!("SELECT COUNT(*) FROM ci_rollups WHERE runner = '{id}'")).await? == 2);
+            for table in ["ci_runner_time", "ci_rollups"] {
+                anyhow::ensure!(count(format!("SELECT COUNT(*) FROM {table} WHERE runner = 'fedora.attlocal.net'")).await? == 0, "{table}: none left");
+            }
+            // A grant both had is kept once; one only the duplicate had moves.
+            anyhow::ensure!(count(format!("SELECT COUNT(*) FROM grants WHERE scope = 'runner:{id}' AND principal = 'user:1'")).await? == 1);
+            anyhow::ensure!(count(format!("SELECT COUNT(*) FROM grants WHERE scope = 'runner:{id}' AND principal = 'user:2'")).await? == 1);
+            anyhow::ensure!(count("SELECT COUNT(*) FROM grants WHERE scope = 'runner:fedora.attlocal.net'".into()).await? == 0);
+            // The id's settings and enrollment win; what only the duplicate had set moves.
+            anyhow::ensure!(read(format!("SELECT enrolled_by FROM enrollments WHERE machine = '{id}'")).await? == "ada");
+            anyhow::ensure!(s.kv_get(format!("front_door/{id}")).await?.as_deref() == Some("ours"));
+            anyhow::ensure!(s.kv_get(format!("agent_limit/{id}")).await?.as_deref() == Some("2"));
+            anyhow::ensure!(s.kv_prefix("front_door/fedora".into()).await?.is_empty() && s.kv_get("agent_limit/fedora.attlocal.net".into()).await?.is_none());
+            anyhow::Ok(())
+        })
+    }
+
+    /// docs/machines.md, "Finished job pods are forgotten": a job pod's record goes once it's not
+    /// connected and its jobs have ended; one whose job still runs, one connected, one the hub
+    /// keeps (inside its grace) and a machine's record stay. The pod's finished job keeps its name.
+    #[test]
+    fn machines_a_finished_job_pods_record_is_forgotten() -> anyhow::Result<()> {
+        crate::rt::block_on(async move {
+            let s = Store::in_memory()?;
+            let row = |name: &str, ephemeral: bool, connected: bool| AgentRow {
+                name: name.into(),
+                labels: vec![],
+                slots: 1,
+                hostname: name.into(),
+                os: "linux".into(),
+                arch: "x86_64".into(),
+                version: "1".into(),
+                ephemeral,
+                connected,
+                last_seen: 5,
+                enrolled_at: 1,
+            };
+            for (name, ephemeral, connected) in [("kiln-done-1", true, false), ("kiln-busy-1", true, false), ("kiln-live-1", true, true), ("kiln-grace-1", true, false), ("box", false, false)] {
+                s.upsert_agent(row(name, ephemeral, connected)).await?;
+            }
+            s.call(|c| {
+                c.execute_batch(
+                    "PRAGMA foreign_keys = OFF;
+                     INSERT INTO jobs (id, run_id, key, display, status, labels, needs, spec, agent) VALUES
+                       ('j1', 'r', 'build', 'build', 'succeeded', '[]', '[]', '{}', 'kiln-done-1'),
+                       ('j2', 'r', 'test', 'test', 'running', '[]', '[]', '{}', 'kiln-busy-1');
+                     PRAGMA foreign_keys = ON;",
+                )?;
+                Ok(())
+            })
+            .await?;
+            let gone = s.forget_finished_pods(vec!["kiln-grace-1".into()]).await?;
+            anyhow::ensure!(gone == ["kiln-done-1"], "{gone:?}");
+            let left: Vec<String> = s.agents().await?.into_iter().map(|a| a.name).collect();
+            for name in ["kiln-busy-1", "kiln-live-1", "kiln-grace-1", "box"] {
+                anyhow::ensure!(left.iter().any(|n| n == name), "{name} stays: {left:?}");
+            }
+            let agent = s.call(|c| Ok(c.query_row("SELECT agent FROM jobs WHERE id = 'j1'", [], |r| r.get::<_, String>(0))?)).await?;
+            anyhow::ensure!(agent == "kiln-done-1", "its job's history keeps its name");
+            anyhow::ensure!(s.forget_finished_pods(Vec::new()).await? == ["kiln-grace-1"], "once the hub keeps it no more");
             anyhow::Ok(())
         })
     }

@@ -168,7 +168,9 @@ pub async fn ranked(handle: &Handle, me: &str, want: Option<&str>) -> anyhow::Re
     let runners: Vec<RunnerInfo> = handle.directory().await?;
     let want = want.map(Want::parse).transpose()?.unwrap_or_default();
     let (ok, passed) = directory::rank(&runners, &want, me);
-    Ok(serde_json::json!({ "me": me, "want": want.describe(), "runners": ok, "passed": passed }))
+    // The name people see of each, passed over too (docs/machines.md: a label, never an id, where there's one).
+    let labels: serde_json::Map<String, serde_json::Value> = runners.iter().filter_map(|r| r.label.clone().map(|l| (r.name.clone(), serde_json::Value::String(l)))).collect();
+    Ok(serde_json::json!({ "me": me, "want": want.describe(), "runners": ok, "passed": passed, "labels": labels }))
 }
 
 /// What a sync did: where the copy is over there, what it wrote and removed, and the tree it
