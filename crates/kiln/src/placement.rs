@@ -23,8 +23,10 @@
 //! serves its frames there. Its heavy messages, a viewer's catch-ups, are made off the shards (the blocking
 //! pool, goal 3) from state its session's owner keeps (goal 4), so no message of one is heavy on its shard.
 //!
-//! Each placement is counted on `/metrics` (`kiln_placement_total`), with what the movable tasks did
-//! (`kiln_rt_movable_*`).
+//! `round-robin` is the default: the lab's A/B under CPU hogs in the production-like layout found no other
+//! placement better for people's p99 beyond noise (docs/runtime-lab.md, "Goal 7: placement"), and the others
+//! stay behind the setting for later A/B tests. Each placement is counted on `/metrics`
+//! (`kiln_placement_total`), with what the movable tasks did (`kiln_rt_movable_*`).
 
 use std::cell::Cell;
 use std::fmt::Write as _;
@@ -38,7 +40,9 @@ use serde::{Deserialize, Serialize};
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum Placement {
-    /// Connections dealt round-robin, requests served in their connection's task.
+    /// Connections dealt round-robin, requests served in their connection's task. The default, as the lab's
+    /// A/B picked it (step 5): under CPU hogs in the production-like layout no other placement gave people's
+    /// requests a better p99 beyond noise (docs/runtime-lab.md, "Goal 7: placement").
     #[default]
     RoundRobin,
     /// Connections and requests steered to the less delayed shard.
@@ -416,6 +420,14 @@ mod tests {
         assert_eq!(pick([9_000_000, 0], [false, true]), 0, "the other held: stays");
         assert_eq!(pick_from(0, 1, margin, |_| Seen::default(), &mut draw), 0, "one shard");
         assert_eq!(pick_from(5, 2, margin, |_| Seen::default(), &mut draw), 5, "a shard past the runtime's");
+    }
+
+    /// Step 5: the default is the placement the lab's A/B picked (docs/runtime-lab.md, "Goal 7: placement"):
+    /// round-robin, the server's own default too.
+    #[test]
+    fn g7_s5_the_default_is_the_ab_s_pick() {
+        assert_eq!(Placement::default(), Placement::RoundRobin);
+        assert_eq!(crate::config::Config::default().server.placement, Placement::RoundRobin);
     }
 
     /// Step 3: the setting from `[server] placement`, round-robin when it isn't given, and a word that names no

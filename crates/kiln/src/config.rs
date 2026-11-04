@@ -119,9 +119,9 @@ pub struct Server {
     /// How the server places its work on its runtime's shards (goal 7 of the API runtime program,
     /// `crate::placement`): `round-robin` (connections dealt in turn, requests served in their
     /// connection's task), `steer` (connections and requests to the less delayed of two shards), `steal`
-    /// (requests as tasks an idle shard takes from a busy one) or `both`. The lab's A/B chose the default
-    /// (docs/runtime-lab.md, "Goal 7: placement"); the others stay for later A/B tests. `KILN_RT_PLACEMENT`
-    /// overrides it.
+    /// (requests as tasks an idle shard takes from a busy one) or `both`. `round-robin` by default, as the
+    /// lab's A/B picked it (docs/runtime-lab.md, "Goal 7: placement"); the others stay for later A/B tests.
+    /// `KILN_RT_PLACEMENT` overrides it.
     pub placement: crate::placement::Placement,
     /// Cores of the server's own (docs/priority.md, "Cores of its own"; goal 8, plan 01a1a59c2b29
     /// step 6), as a CPU list (`8-15`, `2,4-7`): on Linux `kiln install` gives its `kiln.slice`

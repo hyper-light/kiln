@@ -589,6 +589,83 @@ systemd-run --user --unit=g7-lab --collect -E HOME="$HOME" -E PATH="$PATH" \
 
 `driver.sh` runs every condition (`prod`, `shared`, `calm`) and placement in turn, one `kiln-lab run` round
 each, each round starting the turn one further on, so a machine's drift falls on every placement alike.
+Run again, it measures only the rounds not measured yet; with `HOLD_FILE` set, each round waits while another
+lab keeps that file fresh, so two labs never measure at once.
+
+### The A/B (2026-11-04)
+
+On fedora (an Intel Core i9-14900HX, 32 threads; Fedora's Linux 6.19 with lazy preemption), the lab and
+everything it started held to the 16 efficient cores (`taskset -c 16-31`), where the server sized itself to 4
+shards. One build, this goal at `8cbb752a586` (main at `b3a00b70cff` with goal 7), in release with the UI's
+client built in; each placement set by `KILN_RT_PLACEMENT` alone. The `realistic` profile, six rounds of each
+placement, the placements taking turns round by round (`scripts/placement_lab/driver.sh`). Other agents'
+builds loaded the machine throughout (a load of 42 to 48 before each window, its CPU pressure 18% to 23%), so
+the noise is wide; the turns spread it over every placement alike. The rounds, as `kiln-lab` wrote them:
+`docs/runtime-lab/2026-11-04/goal7-prod-<placement>.json`.
+
+**The deciding run: the production-like layout, 16 hogs at `cpu.weight` 1** (21:28 to 22:09 UTC). Each cell
+is the median of the six rounds and its noise (the 95% interval of that median):
+
+| number | round-robin | steer | steal | both |
+| --- | --- | --- | --- | --- |
+| page p50 ms | 0.217 (0.189 to 0.303) | 0.211 (0.156 to 0.349) | 0.224 (0.191 to 0.285) | 0.231 (0.200 to 0.396) |
+| page p99 ms | 3.42 (2.75 to 7.15) | 2.75 (2.16 to 8.64) | 2.65 (1.95 to 4.14) | 2.27 (1.97 to 11.5) |
+| page p99.9 ms | 32.2 (7.79 to 57.8) | 13.1 (3.47 to 42.2) | 19.7 (4.37 to 49.8) | 14.0 (3.15 to 53.9) |
+| api_read p50 ms | 1.94 (1.79 to 2.02) | 2.14 (1.79 to 2.23) | 2.05 (1.97 to 2.33) | 2.16 (2.04 to 2.27) |
+| api_read p99 ms | 165 (119 to 194) | 168 (160 to 195) | 179 (148 to 207) | 188 (186 to 196) |
+| api_read p99.9 ms | 823 (723 to 1147) | 750 (623 to 1398) | 984 (748 to 1498) | 1112 (839 to 1365) |
+| api_write p50 ms | 1.66 (1.50 to 1.89) | 1.56 (1.38 to 1.95) | 1.57 (1.31 to 1.74) | 1.58 (1.20 to 1.72) |
+| api_write p99 ms | 593 (529 to 890) | 618 (526 to 925) | 626 (479 to 825) | 631 (550 to 878) |
+| api_write p99.9 ms | 1025 (917 to 1463) | 800 (755 to 1387) | 1040 (774 to 1963) | 1359 (917 to 1695) |
+| websocket p50 ms | 2.71 (2.58 to 2.77) | 2.59 (2.50 to 2.69) | 2.62 (2.58 to 2.75) | 2.63 (2.57 to 2.73) |
+| websocket p99 ms | 1118 (1068 to 1300) | 1068 (952 to 1181) | 1080 (1035 to 1202) | 1021 (921 to 1140) |
+| websocket p99.9 ms | 1442 (1331 to 1639) | 1304 (1205 to 1463) | 1352 (1288 to 1672) | 1314 (1235 to 1502) |
+| attach p50 ms | 1334 (1250 to 1384) | 1254 (1156 to 1296) | 1281 (1203 to 1354) | 1312 (1235 to 1336) |
+| attach p99 ms | 1940 (1465 to 2224) | 1841 (1416 to 2355) | 1543 (1466 to 2196) | 1743 (1677 to 1917) |
+| throughput: API reads a second | 65.2 (64.2 to 66.5) | 65.7 (63.1 to 67.5) | 65.3 (64.6 to 67.2) | 65.7 (64.7 to 66.9) |
+| throughput: live deliveries a second | 86.8 (85.7 to 87.5) | 87.1 (86.1 to 88.4) | 86.8 (85.4 to 87.7) | 86.3 (85.4 to 87.7) |
+| server CPU ms a request | 13.1 (12.1 to 14.6) | 12.7 (11.2 to 13.5) | 13.0 (12.3 to 14.1) | 13.1 (12.2 to 13.4) |
+| shards' delay p99 ms | 2.37 (2.08 to 2.57) | 2.23 (1.49 to 2.48) | 2.17 (1.89 to 2.74) | 2.18 (1.86 to 2.22) |
+| server: page waited p99 ms | 0.058 (0.050 to 0.091) | 0.795 (0.504 to 1.28) | 0.166 (0.111 to 0.587) | 0.166 (0.114 to 0.959) |
+| server: api_read waited p99 ms | 0.055 (0.050 to 0.091) | 0.823 (0.482 to 0.890) | 0.779 (0.512 to 0.838) | 0.517 (0.230 to 1.04) |
+| server: api_write waited p99 ms | 0.060 (0.050 to 0.091) | 0.921 (0.761 to 0.995) | 0.717 (0.269 to 1.19) | 0.660 (0.220 to 0.986) |
+| server: websocket waited p99 ms | 1514 (1342 to 1752) | 1297 (927 to 1738) | 1361 (1111 to 1562) | 1093 (875 to 1554) |
+| server: runner waited p99 ms | 159 (84.0 to 214) | 97.6 (53.3 to 141) | 131 (69.4 to 163) | 128 (70.9 to 151) |
+
+Pages (10 a second) and API writes (10.4 a second) ran at the same rate under every placement. Against
+`round-robin` (`kiln-lab compare`, 101 numbers held together at 95%), each placement differs beyond noise in 3
+numbers, the same three: the server's wait from a request's head to its handler's start at p99, for pages,
+API reads and writes, worse, from 0.06 ms to between 0.17 and 0.92 ms: the hop each placement adds (a task on
+another shard, or a movable task and its carrier). Nothing the lab's clients timed, no throughput and no CPU
+per request differs beyond noise.
+
+**By the rule, `round-robin` stays the default.** No placement's people's p99 is better beyond noise: `page`
+p99 and `api_write` p99 went -19.7% and +4.2% under `steer`, -22.3% and +5.6% under `steal`, -33.7% and
++6.3% under `both`, each inside its noise (±91% to ±281%). The other placements stay behind the setting for
+later A/B tests.
+
+**The shared layout and calm** (from 22:10 UTC) were stopped after one or two rounds of each placement, when
+another lab took the machine (its `HOLD_FILE`); they don't change the pick (rule 5). Their driver goes on where
+it stopped once the machine is free again, into fedora's `~/.cache/kiln-g7-placement-ab/lab/runs`
+(`report.sh` gives their tables).
+
+What it says:
+
+- **On this load no placement beat today's.** The tails people see (pages' p99 of 2 to 3 ms, API writes'
+  p99 of about 0.6 s) are not a shard's queue that placement can shorten: the shards ran their ready work
+  2.2 to 2.4 ms late at p99 under every placement, and an API write's p99 is its handler's own time at the
+  server (0.67 to 0.72 s), which waits on kiln.db's one connection (goal 3's `store` share, 0.5 s at p99
+  here). The live feed's and runners' waits moved the most (a viewer's frames 1.51 s at p99 under
+  `round-robin` against 1.09 to 1.36 s, runners' messages 159 ms against 98 to 131 ms), within noise.
+- **What placing costs is a sub-millisecond hop** before each handler, the one difference beyond noise; it
+  bought nothing measurable here.
+- **Production's load may differ.** These rounds, as goal 8's, ran with the machine shared with other agents'
+  builds; a quieter machine narrows the noise, and the setting lets the A/B be run again on one build
+  (`scripts/placement_lab/driver.sh`).
+- **Not built: per-shard `SO_REUSEPORT` listeners with a BPF picker** (step 1's option). Per-worker accept
+  queues leave a clogged worker's connections waiting for it (research f3, f21), the picker would need the
+  shards' delays in a BPF map, and the portable acceptor's two choices, the option's own aim, didn't win.
+
 
 ## What the lab doesn't do yet
 
