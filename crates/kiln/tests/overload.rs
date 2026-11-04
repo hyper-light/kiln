@@ -81,6 +81,11 @@ fn header<'a>(headers: &'a [(String, String)], name: &str) -> Option<&'a str> {
     headers.iter().find(|(k, _)| k == name).map(|(_, v)| v.as_str())
 }
 
+/// What /metrics says of the shards' queueing delays and shedding, for a failure's message.
+fn shedding() -> String {
+    kiln::metrics::render().lines().filter(|l| l.starts_with("kiln_shard_queue_delay_seconds") || l.starts_with("kiln_shard_shedding") || l.starts_with("kiln_shard_coop")).collect::<Vec<_>>().join("\n")
+}
+
 /// A Background request (sync's), a Normal one (the API with a token) and a Critical one (health).
 const BACKGROUND: (&str, &str, &str) = ("PUT", "/api/sync/blobs/abc", "authorization: Bearer kiln_pat_test\r\n");
 const NORMAL: (&str, &str, &str) = ("GET", "/api/runs", "authorization: Bearer kiln_pat_test\r\n");
@@ -97,8 +102,8 @@ fn load(class: Class, per_shard: usize, stop: &Arc<AtomicBool>) -> anyhow::Resul
     for holder in kiln::rt::shard_holders() {
         for _ in 0..per_shard {
             let stop = Arc::clone(stop);
-            hyper_rt::runtime::submit_to_holder(holder, async move {
-                let _ = hyper_rt::coop::set_class(class);
+            // In its class from its first poll, as the server's connections start in theirs.
+            hyper_rt::runtime::submit_movable_as(holder, class, async move {
                 while !stop.load(Ordering::Acquire) {
                     let until = Instant::now() + quantum;
                     while Instant::now() < until {
@@ -204,7 +209,7 @@ fn g6_s4_an_overloaded_server_stays_up_serves_critical_and_sheds_background_firs
     // Normal work floods them too: Normal requests are shed as well; Critical ones are served, and promptly.
     let normal_load = Arc::new(AtomicBool::new(false));
     load(Class::Normal, 200, &normal_load)?;
-    until("Normal requests shed", || Ok(status_of(addr, NORMAL)? == 503))?;
+    until("Normal requests shed", || Ok(status_of(addr, NORMAL)? == 503)).map_err(|e| anyhow::anyhow!("{e}: {}", shedding()))?;
     let mut critical = Vec::new();
     for _ in 0..20 {
         let (status, _, took) = ask(addr, CRITICAL.0, CRITICAL.1, CRITICAL.2, 0, b"")?;
@@ -220,7 +225,7 @@ fn g6_s4_an_overloaded_server_stays_up_serves_critical_and_sheds_background_firs
     anyhow::ensure!(background > 0 && normal > 0 && critical_shed == 0, "sheds counted by class: {background}, {normal}, {critical_shed}");
     // /readyz says so: not ready while every shard sheds the API.
     let ready = kiln::overload::readiness();
-    anyhow::ensure!(ready.as_ref().is_some_and(|(every, why)| *every && why.contains("sheds normal")), "{ready:?}");
+    anyhow::ensure!(ready.as_ref().is_some_and(|(every, why)| *every && why.contains("sheds normal")), "{ready:?}: {}", shedding());
     let metrics = kiln::metrics::render();
     anyhow::ensure!(metrics.contains("kiln_shed_total{class=\"background\"}") && metrics.contains("kiln_shard_shedding{shard=\"0\",class=\"normal\"}"), "sheds on /metrics");
 

@@ -310,12 +310,15 @@ async fn monitor(index: usize) {
         crate::rt::sleep(PERIOD).await;
         let (Some(state), Some(now)) = (shards().get(index), hyper_rt::futures::shard_counters()) else { return };
         let now_us = micros_since(base);
+        // A wait no longer than the shard's quantum is no queue: a task waits that long behind the poll running as
+        // it woke whatever the load, and a share is that long (`hyper_rt::coop`).
+        let floor_ns = hyper_rt::futures::step_budget_ns().unwrap_or(0);
         let means = [
             mean_ns(now.queue_ns_background, last.queue_ns_background, now.queue_polls_background, last.queue_polls_background),
             mean_ns(now.queue_ns_normal, last.queue_ns_normal, now.queue_polls_normal, last.queue_polls_normal),
             mean_ns(now.queue_ns_critical, last.queue_ns_critical, now.queue_polls_critical, last.queue_polls_critical),
         ];
-        let events = [feed(&mut background, means[0], now_us), feed(&mut normal, means[1], now_us)];
+        let events = [feed(&mut background, means[0], floor_ns, now_us), feed(&mut normal, means[1], floor_ns, now_us)];
         for (class, mean) in [Class::Background, Class::Normal, Class::Critical].into_iter().zip(means) {
             if let (Some(mean), Some(delay)) = (mean, state.delay_ns.get(class as usize)) {
                 delay.store(mean, Ordering::Relaxed);
@@ -348,15 +351,15 @@ fn mean_ns(sum: u64, sum_before: u64, polls: u64, polls_before: u64) -> Option<u
     sum.saturating_sub(sum_before).checked_div(polls.saturating_sub(polls_before))
 }
 
-/// One period's mean wait, in microseconds, to a class's detector. A class with no poll in the period had nothing
-/// waiting: as calm as its calm (so an alarm ends once its work is gone, as when shedding sent it away).
-fn feed(d: &mut Detector, mean_ns: Option<u64>, now_us: u64) -> Event {
-    let us = match (mean_ns, d.calm_us()) {
-        (Some(ns), _) => ns as f64 / 1e3,
-        (None, Some(calm)) => calm,
-        (None, None) => return Event::Same,
-    };
-    d.sample(now_us, us, false, budget_per_day())
+/// One period's mean wait to a class's detector, in microseconds, never under `floor_ns` (the shard's quantum: a
+/// shorter wait is no queue). A class with no poll in the period had nothing waiting: the floor, so an alarm ends
+/// once its work is gone, as when shedding sent it away. The floor also keeps the scheduler's sub-quantum noise
+/// (a task polled at once, a wait of nanoseconds) out of the calm: without it, a calm learned above it by a few
+/// hundred microseconds read a wait of nanoseconds as a shift down, a new regime, whose first sample, whatever it
+/// was, became the calm.
+fn feed(d: &mut Detector, mean_ns: Option<u64>, floor_ns: u64, now_us: u64) -> Event {
+    let ns = mean_ns.unwrap_or(0).max(floor_ns).max(1);
+    d.sample(now_us, ns as f64 / 1e3, false, budget_per_day())
 }
 
 /// The log of a change of what a shard sheds, with why.
@@ -573,6 +576,45 @@ mod tests {
             (Method::GET, "/api/harness/sessions/s1/events", &cookie[..], Class::Normal),
         ] {
             assert_eq!(req(method.clone(), path, headers), class, "{method} {path} {headers:?}");
+        }
+    }
+
+    /// Step 4: a detector fed a class's mean waits alarms within a few periods of the waits leaving the calm it
+    /// learned (waits of nanoseconds to a few hundred microseconds under a quantum of 250, then 50 ms and 100 ms: a
+    /// busy shard's round of tasks), stays quiet through the calm with its noise, also after a load that only
+    /// doubled the calm (Background's busy, Normal's waits a poll), and clears once the waits are back, or once the
+    /// class has nothing waiting at all.
+    #[test]
+    fn g6_s4_a_detector_alarms_soon_after_the_waits_leave_their_calm_and_clears_after() {
+        const QUANTUM_NS: u64 = 250_000;
+        for overload_ns in [50_000_000u64, 100_000_000] {
+            let mut d = detector(0);
+            let mut now_us = 0;
+            for i in 0..2_000u64 {
+                now_us += 10_000;
+                let wait = [20, 1_000, 40_000, 125_000, 300_000, 3, 600][(i % 7) as usize];
+                assert!(!matches!(feed(&mut d, Some(wait), QUANTUM_NS, now_us), Event::Alarm(_)), "calm, sample {i}");
+            }
+            for _ in 0..500u64 {
+                now_us += 10_000;
+                feed(&mut d, Some(2 * QUANTUM_NS), QUANTUM_NS, now_us);
+            }
+            assert!(d.alarm.is_none(), "a doubled calm is no overload");
+            let mut alarmed_after = None;
+            for i in 0..20u64 {
+                now_us += 10_000;
+                feed(&mut d, Some(overload_ns), QUANTUM_NS, now_us);
+                if d.alarm.is_some() {
+                    alarmed_after = Some(i + 1);
+                    break;
+                }
+            }
+            assert!(alarmed_after.is_some_and(|n| n <= 5), "alarmed after {alarmed_after:?} periods at {overload_ns} ns");
+            for _ in 0..50 {
+                now_us += 10_000;
+                feed(&mut d, None, QUANTUM_NS, now_us);
+            }
+            assert!(d.alarm.is_none(), "cleared once nothing waits");
         }
     }
 
