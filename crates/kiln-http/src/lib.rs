@@ -29,6 +29,13 @@ mod testing;
 
 pub use body::Incoming;
 pub use error::{Error, Kind, Parse};
+
+/// When a request arrived: the read that brought its head's first bytes off the connection (an
+/// HTTP/2 request's, its headers' read). Every request a server connection hands its service carries
+/// it (an extension), so a handler can tell how long the request waited before it started (kiln's
+/// `kiln_route_wait_seconds`, goal 1 of the API runtime program, plan 01a1a59c2a68 step 2).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Received(pub std::time::Instant);
 pub use io::TcpIo;
 pub use service::{Service, service_fn};
 

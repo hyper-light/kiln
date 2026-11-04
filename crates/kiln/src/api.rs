@@ -160,10 +160,20 @@ impl srv::Handler for Api {
             return shed;
         }
         let hub = self.hub.clone();
-        match route(hub, req).await {
+        // How long it waited before this handler started, from its head's arrival off its socket,
+        // and how long it then took, by its class (goal 1, plan 01a1a59c2a68 step 2).
+        let began = Instant::now();
+        let upgrade = req.headers().get(header::UPGRADE).is_some_and(|v| v.as_bytes().eq_ignore_ascii_case(b"websocket"));
+        let class = crate::route_latency::class_of(req.method(), req.uri().path(), upgrade);
+        let waited = req.extensions().get::<kiln_http::Received>().map(|r| began.saturating_duration_since(r.0));
+        let resp = match route(hub, req).await {
             Ok(r) => r,
             Err(e) => e.into_response(),
+        };
+        if let Some(class) = class {
+            crate::route_latency::observe(class, waited, began.elapsed());
         }
+        resp
     }
 }
 
@@ -6082,6 +6092,7 @@ async fn harness_attach(hub: Arc<Hub>, id: String, socket: ws::WebSocket, takes:
                         // Read now: each frame's delivery, from its publish on this process's
                         // microsecond clock (the bus's own stamps are milliseconds).
                         let now = crate::harness::live::now_us();
+                        let read_at = Instant::now();
                         let next = batch.next;
                         // Each frame read where it is in its payload, and sent as the payload's own
                         // bytes (this viewer's copy of it, moved): no other copy of it is made.
@@ -6115,11 +6126,15 @@ async fn harness_attach(hub: Arc<Hub>, id: String, socket: ws::WebSocket, takes:
                                 start_over = true;
                                 break;
                             }
-                            if let Some(at) = published {
-                                crate::metrics::bus().delivery_seconds.observe(now.saturating_sub(at) as f64 / 1e6);
+                            let waited = published.map(|at| Duration::from_micros(now.saturating_sub(at)));
+                            if let Some(w) = waited {
+                                crate::metrics::bus().delivery_seconds.observe(w.as_secs_f64());
                             }
                             have = have.max(rev);
                             tx.send(ws::text(said)).await?;
+                            // From its publish to this viewer's read, then to its write on the socket
+                            // (goal 1, plan 01a1a59c2a68 step 2).
+                            crate::route_latency::observe(crate::route_latency::Class::Websocket, waited, read_at.elapsed());
                         }
                         at = Some(next);
                     }

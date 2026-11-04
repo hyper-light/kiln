@@ -60,6 +60,12 @@ pub const DELIVERY_BUCKETS: &[f64] =
     &[0.00005, 0.0001, 0.00025, 0.0005, 0.001, 0.0025, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0];
 pub const LATENCY_BUCKETS: &[f64] =
     &[0.001, 0.0025, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0, 25.0, 60.0, 150.0, 300.0, 600.0];
+/// 50 µs to a minute: [`DELIVERY_BUCKETS`]' steps from where in-process work sits, carried on as
+/// [`LATENCY_BUCKETS`]' are to 60 s, so a stall of seconds (production's live feed showed deliveries
+/// of 2.5 to 5 s) lands in a bucket of its own rather than past the last: how late a shard ran its
+/// ready work, and how long a request waited and took (goal 1, plan 01a1a59c2a68 steps 1 and 2).
+pub const STALL_BUCKETS: &[f64] =
+    &[0.00005, 0.0001, 0.00025, 0.0005, 0.001, 0.0025, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0, 25.0, 60.0];
 
 impl Histogram {
     pub fn new(bounds: &'static [f64]) -> Self {
@@ -82,7 +88,17 @@ impl Histogram {
         self.sum_us.fetch_add((secs.max(0.0) * 1_000_000.0) as u64, Ordering::Relaxed);
     }
 
-    fn render(&self, out: &mut String, name: &str, labels: &str) {
+    /// Observations so far.
+    pub fn count(&self) -> u64 {
+        self.count.load(Ordering::Relaxed)
+    }
+
+    /// Observations so far at or under each bound, in the bounds' order (cumulative, as rendered).
+    pub fn cumulative(&self) -> Vec<(f64, u64)> {
+        self.bounds.iter().zip(&self.buckets).map(|(b, c)| (*b, c.load(Ordering::Relaxed))).collect()
+    }
+
+    pub(crate) fn render(&self, out: &mut String, name: &str, labels: &str) {
         let sep = if labels.is_empty() { "" } else { "," };
         for (b, c) in self.bounds.iter().zip(&self.buckets) {
             let _ = writeln!(
@@ -1182,6 +1198,8 @@ pub fn render() -> String {
     render_bus(&mut o);
     render_net(&mut o);
     render_wire(&mut o);
+    crate::shard_health::render(&mut o);
+    crate::route_latency::render(&mut o);
     crate::overload::render(&mut o);
 
     let samples = agent_samples().read();

@@ -81,9 +81,19 @@ fn header<'a>(headers: &'a [(String, String)], name: &str) -> Option<&'a str> {
     headers.iter().find(|(k, _)| k == name).map(|(_, v)| v.as_str())
 }
 
-/// What /metrics says of the shards' queueing delays and shedding, for a failure's message.
+/// What /metrics says of the shards' queueing delays and shedding, and what each shard counted and its watchdog
+/// saw, for a failure's message.
 fn shedding() -> String {
-    kiln::metrics::render().lines().filter(|l| l.starts_with("kiln_shard_queue_delay_seconds") || l.starts_with("kiln_shard_shedding") || l.starts_with("kiln_shard_coop")).collect::<Vec<_>>().join("\n")
+    let mut out = kiln::metrics::render().lines().filter(|l| l.starts_with("kiln_shard_queue_delay_seconds") || l.starts_with("kiln_shard_shedding") || l.starts_with("kiln_shard_coop") || l.starts_with("kiln_shard_stall")).collect::<Vec<_>>().join("\n");
+    for holder in kiln::rt::shard_holders() {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let asked = hyper_rt::runtime::submit_movable_as(holder, Class::Critical, async move {
+            let _ = tx.send((hyper_rt::futures::shard_id(), hyper_rt::futures::shard_counters()));
+        });
+        let counted = asked.ok().and_then(|_| rx.recv_timeout(Duration::from_secs(5)).ok());
+        out.push_str(&format!("\nshard {}: {:?}; counted {counted:?}", holder.shard(), hyper_rt::watch::stalls(holder)));
+    }
+    out
 }
 
 /// A Background request (sync's), a Normal one (the API with a token) and a Critical one (health).
@@ -180,7 +190,9 @@ fn g6_s4_an_overloaded_server_stays_up_serves_critical_and_sheds_background_firs
     runtime();
     let probe = Arc::new(Probe { reached: AtomicU64::new(0) });
     let addr = listen(Arc::clone(&probe))?;
-    anyhow::ensure!(kiln::overload::start(true) == 2, "a shard refused its monitor");
+    anyhow::ensure!(kiln::overload::start(true) == 2, "two shards");
+    // Goal 1's probes tick each shard's detectors, as the server starts them.
+    anyhow::ensure!(kiln::shard_health::start(kiln::shard_health::PERIOD) == 2, "a shard refused its probe");
 
     // Calm: everything is served, and the monitors learn each class's calm.
     let calm_until = Instant::now() + Duration::from_secs(2);
@@ -203,13 +215,14 @@ fn g6_s4_an_overloaded_server_stays_up_serves_critical_and_sheds_background_firs
     anyhow::ensure!(header(&headers, "retry-after").and_then(|v| v.parse::<u64>().ok()).is_some_and(|s| s >= 1), "{headers:?}");
     anyhow::ensure!(took < Duration::from_secs(5), "answered at once, without the body: {took:?}");
     anyhow::ensure!(probe.reached.load(Ordering::Relaxed) == reached, "the handler never ran for a shed request");
-    anyhow::ensure!(status_of(addr, NORMAL)? == 200, "Normal still served while Background is shed");
+    anyhow::ensure!(status_of(addr, NORMAL)? == 200, "Normal still served while Background is shed: {}", shedding());
     anyhow::ensure!(status_of(addr, CRITICAL)? == 200, "Critical served");
 
-    // Normal work floods them too: Normal requests are shed as well; Critical ones are served, and promptly.
+    // Normal work floods them too: every shard sheds Normal requests as well; Critical ones are served, and promptly.
     let normal_load = Arc::new(AtomicBool::new(false));
     load(Class::Normal, 200, &normal_load)?;
-    until("Normal requests shed", || Ok(status_of(addr, NORMAL)? == 503)).map_err(|e| anyhow::anyhow!("{e}: {}", shedding()))?;
+    until("every shard to shed Normal requests", || Ok(kiln::overload::readiness().is_some_and(|(every, _)| every))).map_err(|e| anyhow::anyhow!("{e}: {}", shedding()))?;
+    anyhow::ensure!(status_of(addr, NORMAL)? == 503, "Normal requests shed");
     let mut critical = Vec::new();
     for _ in 0..20 {
         let (status, _, took) = ask(addr, CRITICAL.0, CRITICAL.1, CRITICAL.2, 0, b"")?;

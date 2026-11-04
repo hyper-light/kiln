@@ -9,16 +9,16 @@
 //! shard gives it its class's share and urgency. The credentials are read, not checked: a forged cookie buys
 //! a request a place ahead and nothing past its own authentication, which it meets as ever.
 //!
-//! **Shedding.** A monitor on each shard ([`start`]) reads, every period, what the shard counted of each
-//! class's queueing delay (each task's wait from joining a ready list to its poll: `Counters::queue_ns_*`) and
-//! hands each period's mean to a detector per class: headroom's CUSUM on log-latency against the calm the
-//! detector learns (`kiln_ci::headroom::detect`), its threshold calibrated on the calm excursions that ended
-//! without harm against a false-alarm budget. Background requests on a shard whose Background or Normal
-//! detector alarms are answered 503 at once, before their bodies are read, with `Retry-After` and
-//! `x-kiln-shed` saying which class was shed; Normal ones too while the Normal detector alarms; Critical never
-//! ([`shed`]). Every number is the platform's or a person's, not picked here:
-//! - the period, 10 ms: Node's `monitorEventLoopDelay` default (research 01a1a59c2abf, f20), which goal 1's
-//!   shard probes take too;
+//! **Shedding.** Goal 1's probe on each shard (`crate::shard_health`) ticks the shard's detectors every period
+//! ([`tick`]), with no probe of this module's own: the API's (Normal) detector reads the shard's delay, how late
+//! the probe, a Normal task, ran; Background's reads what the shard's Background tasks waited from joining a
+//! ready list to their polls (`Counters::queue_ns_background`). Each detector is headroom's CUSUM on
+//! log-latency against the calm it learns (`kiln_ci::headroom::detect`), its threshold calibrated on the calm
+//! excursions that ended without harm against a false-alarm budget. Background requests on a shard whose
+//! Background or Normal detector alarms are answered 503 at once, before their bodies are read, with
+//! `Retry-After` and `x-kiln-shed` saying which class was shed; Normal ones too while the Normal detector
+//! alarms; Critical never ([`shed`]). Every number is the platform's or a person's, not picked here:
+//! - the period, 10 ms: goal 1's probes', Node's `monitorEventLoopDelay` default (research 01a1a59c2abf, f20);
 //! - the tolerance, a queueing delay that is harm at once: Kubernetes' default probe timeout, 1 s
 //!   (`crate::headroom::settings::PLATFORM_TOLERANCE_MS`), past which a request waiting fails a health probe of
 //!   that timeout (research f18: starvation that fails health checks cascades);
@@ -50,10 +50,6 @@ pub use hyper_rt::coop::Class;
 use kiln_ci::headroom::detect::{Detector, Event};
 
 use crate::http::server::{self as srv, Request, Response};
-
-/// How often each shard's monitor reads its counts: Node's `monitorEventLoopDelay` default (research
-/// 01a1a59c2abf, f20).
-pub const PERIOD: Duration = Duration::from_millis(10);
 
 /// The session cookie a person's browser carries (`crate::api`'s).
 const SESSION_COOKIE: &str = "kiln_session=";
@@ -263,7 +259,8 @@ fn here() -> Option<&'static ShardState> {
     shards().iter().find(|s| s.holder.shard() == id.0)
 }
 
-/// Starts each shard's monitor (the server's; `enabled` is `[server] shed`); how many shards took one.
+/// Sets up each shard's shedding (the server's; `enabled` is `[server] shed`): goal 1's probe on each shard
+/// ticks it (`crate::shard_health`, [`tick`]). How many shards there are.
 pub fn start(enabled: bool) -> usize {
     ENABLED.store(enabled, Ordering::Relaxed);
     let holders = crate::rt::shard_holders();
@@ -277,14 +274,11 @@ pub fn start(enabled: bool) -> usize {
             coop_yields: AtomicU64::new(0),
         })
         .collect();
+    let count = states.len();
     if SHARDS.set(states).is_err() {
         return 0;
     }
-    holders
-        .iter()
-        .enumerate()
-        .filter(|(index, holder)| hyper_rt::runtime::submit_to_holder(**holder, monitor(*index)).is_ok())
-        .count()
+    count
 }
 
 /// The detectors' settings: the platform's tolerance and headroom's false-alarm budget (the module's notes).
@@ -303,53 +297,84 @@ fn micros_since(base: Instant) -> u64 {
     u64::try_from(base.elapsed().as_micros()).unwrap_or(u64::MAX)
 }
 
-/// One shard's monitor: every [`PERIOD`] it reads the shard's counts and feeds each class's mean queueing delay
-/// to its detector, publishing what to shed; it logs what the watchdog reported of its shard. Critical itself,
-/// so it runs promptly however busy its shard.
-async fn monitor(index: usize) {
-    let _ = hyper_rt::coop::set_class(Class::Critical);
-    let base = Instant::now();
-    let mut normal = detector(0);
-    let mut background = detector(0);
-    let mut last = hyper_rt::futures::shard_counters().unwrap_or_default();
-    let mut reported = 0u64;
-    loop {
-        crate::rt::sleep(PERIOD).await;
-        let (Some(state), Some(now)) = (shards().get(index), hyper_rt::futures::shard_counters()) else { return };
-        let now_us = micros_since(base);
-        // A wait no longer than the shard's quantum is no queue: a task waits that long behind the poll running as
-        // it woke whatever the load, and a share is that long (`hyper_rt::coop`).
-        let floor_ns = hyper_rt::futures::step_budget_ns().unwrap_or(0);
-        let means = [
+/// One shard's detectors and what they last read, kept by the shard's own thread: the probe that ticks them runs
+/// there alone, so nothing else ever reaches them.
+struct Detectors {
+    base: Instant,
+    /// The API's: on the shard's delay (goal 1's probe, a Normal task, late against its timer).
+    normal: Detector,
+    /// Background work's: on the Background tasks' waits, from the runtime's counts.
+    background: Detector,
+    last: hyper_rt::shard_loop::Counters,
+    /// The watchdog's newest report of the shard already logged.
+    reported: u64,
+}
+
+thread_local! {
+    static DETECTORS: std::cell::RefCell<Option<Detectors>> = const { std::cell::RefCell::new(None) };
+}
+
+/// Shard `index`'s tick, on the shard, from goal 1's probe (`crate::shard_health`, every `shard_health::PERIOD`): `late` is
+/// how late the probe ran against its timer, the shard's delay. Feeds the detectors, publishes what to shed, and
+/// logs what the watchdog reported of the shard.
+///
+/// - **Normal** (the API) sheds on the shard's delay: the probe is a Normal task, so its lateness is what the
+///   API's own work waits on the shard, the classes ahead of it and its own share counted.
+/// - **Background** sheds on what the shard's Background tasks waited, from joining a ready list to their polls,
+///   over the period (`Counters::queue_ns_background`): Background work waits behind its own kind alone and a
+///   share of the others', so its own flood shows there and not in the API's delay.
+///
+/// Each floored at the shard's quantum (a shorter wait is no queue). The route waits goal 1 counts
+/// (`crate::route_latency`) are no signal here: they run from a request's head read off its socket, which its
+/// connection's task reads at Critical (`Connection`) and serves at once, so they do not carry the waits a class
+/// makes.
+pub fn tick(index: usize, late: Duration) {
+    let (Some(state), Some(now)) = (shards().get(index), hyper_rt::futures::shard_counters()) else {
+        return;
+    };
+    let floor_ns = hyper_rt::futures::step_budget_ns().unwrap_or(0);
+    DETECTORS.with(|cell| {
+        let mut held = cell.borrow_mut();
+        let d = held.get_or_insert_with(|| Detectors { base: Instant::now(), normal: detector(0), background: detector(0), last: now, reported: 0 });
+        let now_us = micros_since(d.base);
+        let last = d.last;
+        let waits = [
             mean_ns(now.queue_ns_background, last.queue_ns_background, now.queue_polls_background, last.queue_polls_background),
             mean_ns(now.queue_ns_normal, last.queue_ns_normal, now.queue_polls_normal, last.queue_polls_normal),
             mean_ns(now.queue_ns_critical, last.queue_ns_critical, now.queue_polls_critical, last.queue_polls_critical),
         ];
-        let events = [feed(&mut background, means[0], floor_ns, now_us), feed(&mut normal, means[1], floor_ns, now_us)];
-        for (class, mean) in [Class::Background, Class::Normal, Class::Critical].into_iter().zip(means) {
-            if let (Some(mean), Some(delay)) = (mean, state.delay_ns.get(class as usize)) {
-                delay.store(mean, Ordering::Relaxed);
-            }
-        }
-        for (class, d) in [(Class::Background, &background), (Class::Normal, &normal)] {
-            if let Some(calm) = state.calm_ns.get(class as usize) {
-                calm.store(d.calm_us().map_or(0, |us| (us * 1e3) as u64), Ordering::Relaxed);
-            }
-        }
-        let level = if normal.alarm.is_some() {
+        let late_ns = u64::try_from(late.as_nanos()).unwrap_or(u64::MAX);
+        let events = [feed(&mut d.background, waits[0], floor_ns, now_us), feed(&mut d.normal, Some(late_ns), floor_ns, now_us)];
+        publish(state, waits, late_ns, d);
+        let level = if d.normal.alarm.is_some() {
             2
-        } else if background.alarm.is_some() {
+        } else if d.background.alarm.is_some() {
             1
         } else {
             0
         };
-        let was = state.level.swap(level, Ordering::Relaxed);
-        if was != level {
+        if state.level.swap(level, Ordering::Relaxed) != level {
             note_level(index, state, level, &events);
         }
         state.coop_yields.store(now.coop_yields, Ordering::Relaxed);
-        reported = log_stall(index, state.holder, reported);
-        last = now;
+        d.reported = log_stall(index, state.holder, d.reported);
+        d.last = now;
+    });
+}
+
+/// The delays and calms a tick read, for answers, `/metrics` and `/readyz`: each class's mean wait from the
+/// runtime's counts, but Normal's, which is the shard's delay its detector reads.
+fn publish(state: &ShardState, waits: [Option<u64>; 3], late_ns: u64, d: &Detectors) {
+    let delays = [waits[0], Some(late_ns), waits[2]];
+    for (class, delay) in [Class::Background, Class::Normal, Class::Critical].into_iter().zip(delays) {
+        if let (Some(delay), Some(slot)) = (delay, state.delay_ns.get(class as usize)) {
+            slot.store(delay, Ordering::Relaxed);
+        }
+    }
+    for (class, detector) in [(Class::Background, &d.background), (Class::Normal, &d.normal)] {
+        if let Some(calm) = state.calm_ns.get(class as usize) {
+            calm.store(detector.calm_us().map_or(0, |us| (us * 1e3) as u64), Ordering::Relaxed);
+        }
     }
 }
 
