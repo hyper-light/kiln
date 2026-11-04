@@ -5892,15 +5892,16 @@ fn harness_ws(hub: Arc<Hub>, id: String, req: Request) -> R {
 
 /// Send a viewer a snapshot: its frames then `synced`, a message each; or, `packed`, all of it in
 /// one gzip'd binary message, a frame a line (frames are JSON, whose strings escape their line
-/// breaks). Written out on the blocking pool: a long session's is megabytes of JSON, and the
-/// runtime's threads serve every socket (`crate::harness::registry::Snapshot`).
+/// breaks). Written out (and gzip'd) on the compute pool, a frame at a time: a long session's is
+/// megabytes of JSON, and the shards serve every socket (`crate::harness::registry::Snapshot`; goal
+/// 4, plan 01a1a59c2a9c step 3).
 async fn send_snapshot(tx: &mut ws::Sender, snapshot: crate::harness::registry::Snapshot, packed: bool) -> anyhow::Result<()> {
     if packed {
-        let bytes = crate::rt::blocking(move || snapshot.packed(&synced())).await??;
+        let bytes = snapshot.packed_off(synced()).await??;
         tx.send(ws::binary(bytes)).await?;
         return Ok(());
     }
-    let frames = crate::rt::blocking(move || snapshot.frames()).await?;
+    let frames = snapshot.frames_off().await?;
     for f in frames {
         tx.send(ws::text(f)).await?;
     }

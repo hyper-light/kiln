@@ -295,80 +295,132 @@ pub struct Parts {
 /// A snapshot's events go in frames of about this many bytes.
 const EVENTS_FRAME: usize = 256 * 1024;
 
-/// A viewer's snapshot (or catch-up), taken but not written out: written on the blocking pool, off
-/// the runtime's threads, a long session's being megabytes of JSON (`crate::rt::blocking`). Its
-/// frames say the copy as of when it was taken, whatever comes in meanwhile.
+/// A viewer's snapshot (or catch-up), taken but not written out: written on the compute pool, off
+/// the shards and below them, a frame a unit of its pieces, a long session's being megabytes of JSON
+/// (`crate::rt::compute_pieces`; goal 4, plan 01a1a59c2a9c step 3). Its frames say the copy as of
+/// when it was taken, whatever comes in meanwhile.
 pub struct Snapshot {
     pub(super) parts: Parts,
     /// What's kept of the files its messages mention (`Keeper::frame`): ahead of the events.
     pub(super) files: Option<String>,
 }
 
-impl Snapshot {
-    /// The events it brings: all of them, or those changed since its revision.
-    fn events(&self) -> Vec<&Entry> {
-        let since = self.parts.since;
-        self.parts.events.iter().filter(|e| since.is_none_or(|s| e.at > s)).map(|e| &*e.entry).collect()
-    }
+/// One of a snapshot's frames, in the order they go: its head (`open` or `resumed`), its meta,
+/// state, changes and kept files, then its events a batch at a time (where they are among those it
+/// brings).
+enum Part {
+    Head,
+    Meta,
+    State,
+    Changes,
+    Files,
+    Events(std::ops::Range<usize>),
+}
 
-    /// The events' frames: where each begins and ends in `all`, about [`EVENTS_FRAME`] bytes each
-    /// (one alone when it's larger).
-    fn batches(all: &[&Entry]) -> Vec<std::ops::Range<usize>> {
-        let mut out = Vec::new();
+/// What a snapshot written out holds of its frames: where the events it brings are in its parts',
+/// and its frames in order.
+struct Plan {
+    brought: Vec<usize>,
+    parts: Vec<Part>,
+}
+
+impl Snapshot {
+    /// Its frames, in order. The events it brings are all of them, or those changed since its
+    /// revision, in batches of about [`EVENTS_FRAME`] bytes each (one alone when it's larger).
+    fn plan(&self) -> Plan {
+        let p = &self.parts;
+        let brought: Vec<usize> = p.events.iter().enumerate().filter(|(_, e)| p.since.is_none_or(|s| e.at > s)).map(|(i, _)| i).collect();
+        let mut parts = vec![Part::Head];
+        if !p.meta.is_null() {
+            parts.push(Part::Meta);
+        }
+        if !p.state.is_null() {
+            parts.push(Part::State);
+        }
+        if p.changes.is_some() {
+            parts.push(Part::Changes);
+        }
+        if self.files.is_some() {
+            parts.push(Part::Files);
+        }
         let (mut from, mut size) = (0usize, 0usize);
-        for (i, e) in all.iter().enumerate() {
-            let n = e.text().len();
+        for (i, at) in brought.iter().enumerate() {
+            let n = p.events.get(*at).map_or(0, |e| e.entry.text().len());
             if size + n > EVENTS_FRAME && i > from {
-                out.push(from..i);
+                parts.push(Part::Events(from..i));
                 from = i;
                 size = 0;
             }
             size += n;
         }
-        if from < all.len() {
-            out.push(from..all.len());
+        if from < brought.len() {
+            parts.push(Part::Events(from..brought.len()));
         }
-        out
+        Plan { brought, parts }
     }
 
-    /// Writes each frame in turn with `each`, which is given the frame's own bytes to write and
-    /// how many there are about to be.
-    fn write_each(&self, mut each: impl FnMut(usize, &dyn Fn(&mut dyn std::io::Write) -> std::io::Result<()>) -> std::io::Result<()>) -> std::io::Result<()> {
+    /// The events of `batch` (where they are among those `plan` brings).
+    fn batch<'a>(&'a self, plan: &'a Plan, batch: &std::ops::Range<usize>) -> impl Iterator<Item = &'a Entry> + Clone + 'a {
+        plan.brought.get(batch.clone()).unwrap_or_default().iter().filter_map(|at| self.parts.events.get(*at)).map(|e| &*e.entry)
+    }
+
+    /// About the bytes `part` takes: the room it's written into.
+    fn room(&self, plan: &Plan, part: &Part) -> usize {
+        let p = &self.parts;
+        match part {
+            // Its info, written as it's made (a few hundred bytes).
+            Part::Head => 0,
+            Part::Meta => p.meta_bytes,
+            Part::State => p.state_bytes,
+            Part::Changes => p.changes.as_ref().map_or(0, |files| write::envelope("changes", Some("files"), None) + write::texts_len(files.iter().map(|f| &**f))),
+            Part::Files => self.files.as_ref().map_or(0, String::len),
+            Part::Events(batch) => write::envelope("events", Some("events"), None) + write::texts_len(self.batch(plan, batch)),
+        }
+    }
+
+    /// Writes `part` to `w`.
+    fn write(&self, plan: &Plan, part: &Part, w: &mut impl std::io::Write) -> std::io::Result<()> {
         use crate::wire::ui::{SessionDown, SessionFrame};
         let p = &self.parts;
-        let (info, born) = (p.info.clone(), Some(born()));
-        let head = SessionDown { frame: if p.since.is_some() { SessionFrame::Resumed { info, born } } else { SessionFrame::Open { info, born } }, rev: Some(p.rev) }.text();
-        each(head.len(), &|w| w.write_all(head.as_bytes()))?;
-        if !p.meta.is_null() {
-            each(p.meta_bytes, &|mut w| write::value(&mut w, "meta", "meta", &p.meta, None))?;
+        match part {
+            Part::Head => {
+                let (info, born) = (p.info.clone(), Some(born()));
+                let head = SessionDown { frame: if p.since.is_some() { SessionFrame::Resumed { info, born } } else { SessionFrame::Open { info, born } }, rev: Some(p.rev) }.text();
+                w.write_all(head.as_bytes())
+            }
+            Part::Meta => write::value(w, "meta", "meta", &p.meta, None),
+            Part::State => write::value(w, "state", "state", &p.state, None),
+            Part::Changes => match &p.changes {
+                Some(files) => write::changes(w, files.iter().map(|f| &**f), None),
+                None => Ok(()),
+            },
+            Part::Files => w.write_all(self.files.as_deref().unwrap_or_default().as_bytes()),
+            Part::Events(batch) => write::events(w, self.batch(plan, batch), None),
         }
-        if !p.state.is_null() {
-            each(p.state_bytes, &|mut w| write::value(&mut w, "state", "state", &p.state, None))?;
-        }
-        if let Some(files) = &p.changes {
-            let room = write::envelope("changes", Some("files"), None) + write::texts_len(files.iter().map(|f| &**f));
-            each(room, &|mut w| write::changes(&mut w, files.iter().map(|f| &**f), None))?;
-        }
-        if let Some(f) = &self.files {
-            each(f.len(), &|w| w.write_all(f.as_bytes()))?;
-        }
-        let all = self.events();
-        for range in Self::batches(&all) {
-            let batch = all.get(range).unwrap_or_default();
-            let room = write::envelope("events", Some("events"), None) + write::texts_len(batch.iter().copied());
-            each(room, &|mut w| write::events(&mut w, batch.iter().copied(), None))?;
-        }
-        Ok(())
     }
 
-    /// The frames that bring a viewer to the copy as it was when this was taken, a message each.
+    /// The frames that bring a viewer to the copy as it was when this was taken, a message each,
+    /// written here and now (tests, and what isn't on a shard).
     pub fn frames(&self) -> Vec<String> {
-        let mut out = Vec::new();
-        let _ = self.write_each(|room, write| {
-            out.push(write::string(room, |b| write(b)));
-            Ok(())
-        });
-        out
+        let plan = self.plan();
+        plan.parts.iter().map(|part| write::string(self.room(&plan, part), |b| self.write(&plan, part, b))).collect()
+    }
+
+    /// [`Snapshot::frames`], written on the compute pool a frame at a time: a piece gives its
+    /// thread to a job waiting for one once it has had a shard's step.
+    pub async fn frames_off(self) -> anyhow::Result<Vec<String>> {
+        crate::rt::compute_pieces((self, None::<Plan>, 0usize, Vec::new()), |(s, plan, next, out), turn| {
+            let plan = plan.get_or_insert_with(|| s.plan());
+            while let Some(part) = plan.parts.get(*next) {
+                out.push(write::string(s.room(plan, part), |b| s.write(plan, part, b)));
+                *next += 1;
+                if turn.over() {
+                    return crate::rt::Step::More;
+                }
+            }
+            crate::rt::Step::Done(std::mem::take(out))
+        })
+        .await
     }
 
     /// Its frames and then `last` (the socket's `synced`), a frame a line, gzip'd as one message.
@@ -376,17 +428,48 @@ impl Snapshot {
     /// written straight into the encoder, a frame's many small writes cost it more than the frame.
     pub fn packed(&self, last: &str) -> std::io::Result<Vec<u8>> {
         use std::io::Write as _;
+        let plan = self.plan();
         let mut gz = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
         let mut frame: Vec<u8> = Vec::new();
-        self.write_each(|room, write| {
-            frame.clear();
-            frame.reserve(room);
-            write(&mut frame)?;
-            frame.push(b'\n');
-            gz.write_all(&frame)
-        })?;
+        for part in &plan.parts {
+            self.pack(&plan, part, &mut frame, &mut gz)?;
+        }
         gz.write_all(last.as_bytes())?;
         gz.finish()
+    }
+
+    /// [`Snapshot::packed`], written and gzip'd on the compute pool a frame at a time.
+    pub async fn packed_off(self, last: String) -> anyhow::Result<std::io::Result<Vec<u8>>> {
+        use std::io::Write as _;
+        let gz = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+        crate::rt::compute_pieces((self, None::<Plan>, 0usize, Vec::new(), Some(gz)), move |(s, plan, next, frame, gz), turn| {
+            let plan = plan.get_or_insert_with(|| s.plan());
+            let Some(enc) = gz.as_mut() else { return crate::rt::Step::Done(Err(std::io::Error::other("a snapshot packed twice"))) };
+            while let Some(part) = plan.parts.get(*next) {
+                if let Err(e) = s.pack(plan, part, frame, enc) {
+                    return crate::rt::Step::Done(Err(e));
+                }
+                *next += 1;
+                if turn.over() {
+                    return crate::rt::Step::More;
+                }
+            }
+            match gz.take() {
+                Some(mut enc) => crate::rt::Step::Done(enc.write_all(last.as_bytes()).and_then(|()| enc.finish())),
+                None => crate::rt::Step::Done(Err(std::io::Error::other("a snapshot packed twice"))),
+            }
+        })
+        .await
+    }
+
+    /// `part` written into `frame` (cleared first), a line, then to `gz` whole.
+    fn pack(&self, plan: &Plan, part: &Part, frame: &mut Vec<u8>, gz: &mut flate2::write::GzEncoder<Vec<u8>>) -> std::io::Result<()> {
+        use std::io::Write as _;
+        frame.clear();
+        frame.reserve(self.room(plan, part));
+        self.write(plan, part, frame)?;
+        frame.push(b'\n');
+        gz.write_all(frame)
     }
 }
 
@@ -4070,6 +4153,33 @@ mod tests {
             }
             // Most joined while the updates came, and took the rest of them live.
             anyhow::ensure!(lively * 2 > count, "{lively} of {count} viewers took live frames");
+            Ok(())
+        })
+    }
+
+    /// Goal 4, plan 01a1a59c2a9c step 3: a snapshot (and a catch-up) written on the compute pool, a
+    /// frame at a time, is the one written here, frames and gzip alike.
+    #[test]
+    fn a_snapshot_written_in_pieces_on_the_compute_pool_is_the_one_written_here() -> anyhow::Result<()> {
+        crate::rt::block_on(async {
+            let mut m = Mirror::new(Info { id: "s".into(), ..Info::default() }, Location::Local, sim_bus());
+            for n in 1..=3000u64 {
+                took(&mut m, |m| m.upsert(Arc::new(Entry::new(json!({"id": format!("e{n}"), "seq": n, "kind": "assistant", "text": "x".repeat(300)})))));
+            }
+            set_state(&mut m, json!({"status": "running"}));
+            m.take_changes(vec![file("a.rs", None, 40)], Vec::new(), true);
+            let files = Some(r#"{"t":"files","files":[]}"#.to_owned());
+            let whole = || Snapshot { parts: m.view().parts(), files: files.clone() };
+            let here = whole().frames();
+            anyhow::ensure!(here.len() > 6, "a snapshot of several frames, its events in some: {}", here.len());
+            anyhow::ensure!(whole().frames_off().await? == here, "its frames");
+            let synced = r#"{"t":"synced"}"#;
+            anyhow::ensure!(whole().packed_off(synced.to_owned()).await?? == whole().packed(synced)?, "packed");
+            let since = || m.view().parts_since(m.rev - 10).map(|parts| Snapshot { parts, files: None });
+            let resumed = since().ok_or_else(|| anyhow::anyhow!("not resumed"))?;
+            let frames = resumed.frames_off().await?;
+            anyhow::ensure!(frames.first().is_some_and(|f| f.contains(r#""t":"resumed""#)) && ids(&frames).len() == 10, "{} frames", frames.len());
+            anyhow::ensure!(Some(frames) == since().map(|s| s.frames()));
             Ok(())
         })
     }
