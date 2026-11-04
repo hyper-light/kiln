@@ -318,6 +318,23 @@ class GitProjects(VendorTestCase):
         self.assertEqual(code, 1, err)
         self.assertIn("nothing to record", err)
 
+    def test_a_change_recorded_as_kilns_layout_alone_says_so_in_its_header(self) -> None:
+        lab = self.lab
+        lab.manifest(lab.c1)
+        code, err = lab.vendor("demo", lab.c1, "--no-gate")
+        self.assertEqual(code, 0, err)
+        lib = lab.kiln / "vendor/demo/src/lib.rs"
+        lib.write_text(lib.read_text().replace("f2() -> u32 { 2 }", "f2() -> u32 { 2 + 0 } // kiln"))
+        code, err = lab.vendor("record", "demo", "f2 says kiln", "--why", "a test", "--kiln-only", "kiln's own crate, which no product holds")
+        self.assertEqual(code, 0, err)
+        patch = (lab.kiln / "vendor/patches/demo/0001-f2-says-kiln.patch").read_text()
+        self.assertTrue(patch.startswith("Subject: f2 says kiln\nWhy: a test\nKiln-only: kiln's own crate, which no product holds\n\ndiff --git "), patch)
+        (change,) = vendor.load_changes(lab.kiln, vendor.load_manifest(lab.kiln).projects["demo"])
+        self.assertTrue(change.kiln_only)
+        write(lab.kiln, {"vendor/demo/UPSTREAM.md": "| src/lib.rs | f2 | a test | 0001-f2-says-kiln.patch |\n"})
+        code, err = lab.vendor("check", "demo")
+        self.assertEqual(code, 0, err)
+
     def test_an_abbreviated_commit_is_refused(self) -> None:
         lab = self.lab
         lab.manifest(lab.c1)
@@ -398,6 +415,23 @@ class Pins(VendorTestCase):
         code, err = lab.vendor("demo", c, "--no-gate")
         self.assertEqual(code, 1, err)
         self.assertIn("records other changes to other than kiln does (0001-x.patch)", err)
+
+    def test_a_change_of_kilns_layout_alone_is_not_one_a_product_must_record(self) -> None:
+        """As hyper-raft's crates pointed at crates/kiln-rt, kiln's own copy of hyper-rt: Quiver's tree
+        holds no such crate, so Quiver records no such change, and its pins still agree with kiln's."""
+        lab = self.lab
+        pin = "a" * 40
+        c = self.product_pinning(pin)
+        lab.manifest(c, extra=self.kiln_vendors_other(pin))
+        own = lab.kiln / "vendor/patches/other/0001-kilns-own.patch"
+        own.parent.mkdir(parents=True, exist_ok=True)
+        own.write_bytes(b"Subject: k\nWhy: kiln's layout\n\ndiff --git a/x b/x\n")
+        code, err = lab.vendor("demo", c, "--no-gate")
+        self.assertEqual(code, 1, err)
+        self.assertIn("records other changes to other than kiln does (0001-kilns-own.patch)", err)
+        own.write_bytes(b"Subject: k\nWhy: kiln's layout\nKiln-only: kiln's own crate, which no product holds\n\ndiff --git a/x b/x\n")
+        code, err = lab.vendor("demo", c, "--no-gate")
+        self.assertEqual(code, 0, err)
 
     def test_kilns_copy_of_a_product_must_leave_its_copy_of_a_shared_project_out(self) -> None:
         lab = self.lab

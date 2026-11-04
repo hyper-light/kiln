@@ -36,7 +36,8 @@ mantle-s3 = { path = "../../vendor/mantle/crates/s3" }
 # hashbrown and serde_json.
 foldhash = "0.2.0"
 # hyper-raft's shared crates, vendored at vendor/hyper-raft at the revision Focal's bus takes (the
-# root manifest's [patch.crates-io] points each name there; docs/vendoring.md). Every vendored name
+# root manifest's [patch.crates-io] points each name there, and hyper-rt at crates/kiln-rt, kiln's own
+# copy of it; docs/vendoring.md). Every vendored name
 # is pinned exactly: crates.io has unrelated crates under some of them (`quiver`, `hyper-rt`), and
 # a newer compatible version there would be chosen over the patch.
 hyper-transport = "=0.1.0"

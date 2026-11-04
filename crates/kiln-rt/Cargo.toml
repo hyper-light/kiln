@@ -1,0 +1,130 @@
+# kiln's runtime: its own copy of hyper-raft's hyper-rt, taken at the revision kiln vendors and kept under
+# hyper-rt's name, so every crate kiln builds that names hyper-rt (kiln's own and the vendored ones) builds
+# on it (ORIGIN.md). This manifest is upstream's with hyper-raft's workspace values written out: kiln's
+# workspace is not hyper-raft's, so nothing here inherits from it but the license and the repository.
+[package]
+name = "hyper-rt"
+description = "The shared thread-per-core runtime: shards with arena tasks and Copy wakers, a hierarchical timing wheel, readiness drivers per OS behind one seam, sockets, signals, stdio, synchronization without shared ownership, and a deterministic simulation driver (docs/runtime.md)"
+# hyper-raft's, which kiln's crates and the vendored ones name exactly (`=0.1.0`).
+version = "0.1.0"
+edition = "2024"
+# hyper-raft's toolchain at the revision taken (its rust-toolchain.toml).
+rust-version = "1.98.1"
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+# The calibration record's checksum (docs/runtime.md §10.2), the workspace's CRC-32C.
+crc32c = "0.6"
+# The combinators and `within` are named futures that hold what they are given in place (docs/runtime.md §3.8).
+pin-project-lite = "0.2.17"
+
+[target.'cfg(unix)'.dependencies]
+# sysctl, mach and the per-thread CPU clocks that rustix does not cover (the OS-interface files of
+# scripts/check-contracts.py).
+libc = "0.2.189"
+rustix = { version = "1.1", features = ["event", "net", "pipe", "thread", "process", "param", "system", "time", "fs"] }
+
+# The features are hyper-raft's workspace entry's and this crate's own, together, as inheriting them gave.
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = [
+  "Win32_Foundation",
+  "Win32_Networking_WinSock",
+  "Win32_Security",
+  "Win32_Storage_FileSystem",
+  "Win32_System_Console",
+  "Win32_System_Diagnostics_Debug",
+  "Win32_System_Diagnostics_ToolHelp",
+  "Win32_System_IO",
+  "Win32_System_Ioctl",
+  "Win32_System_Kernel",
+  "Win32_System_LibraryLoader",
+  "Win32_System_Memory",
+  "Win32_System_Performance",
+  "Win32_System_Power",
+  "Win32_System_ProcessStatus",
+  "Win32_System_SystemInformation",
+  "Win32_System_Threading",
+  "Win32_System_WindowsProgramming",
+] }
+
+[dev-dependencies]
+# By name, as kiln's crates take hyper-raft's: the root manifest's [patch.crates-io] points it at
+# vendor/hyper-raft/crates/hyper-measure.
+hyper-measure = "=0.1.0"
+
+# tests/console_close.rs: the pipes of the pseudoconsole a console close is delivered through.
+[target.'cfg(windows)'.dev-dependencies]
+windows-sys = { version = "0.61", features = ["Win32_System_Pipes"] }
+
+# loom builds only under `RUSTFLAGS="--cfg loom"`, for the park and kick protocol's interleavings.
+[target.'cfg(loom)'.dependencies]
+loom = "0.7"
+
+# hyper-raft's lint wall, as its workspace sets it (kiln's is a subset of it), with clippy.toml beside
+# this manifest: kiln-rt keeps its upstream's bar, and adds the lockless rule (ORIGIN.md).
+[lints.rust]
+# Allowed only in the OS-interface files scripts/check-contracts.py lists, each block commented.
+unsafe_code = "deny"
+unsafe_op_in_unsafe_fn = "deny"
+missing_docs = "deny"
+unused_must_use = "deny"
+unreachable_pub = "warn"
+# `--cfg loom` and `--cfg shuttle` select the interleaving and randomized-schedule tests.
+unexpected_cfgs = { level = "deny", check-cfg = ["cfg(loom)", "cfg(shuttle)", "cfg(fuzzing)"] }
+
+[lints.clippy]
+all = { level = "deny", priority = -1 }
+# No shared ownership or locks, and no disk writes: the disallowed types and methods are listed in
+# clippy.toml with reasons.
+disallowed_types = "deny"
+disallowed_methods = "deny"
+# Every unsafe block carries a `// SAFETY:` line stating the invariant that makes it sound.
+undocumented_unsafe_blocks = "deny"
+# The no-panic law: typed refusals, never panics, outside tests (clippy.toml allows tests).
+unwrap_used = "deny"
+expect_used = "deny"
+panic = "deny"
+todo = "deny"
+unimplemented = "deny"
+unreachable = "deny"
+dbg_macro = "deny"
+exit = "deny"
+# Indexing, slicing and arithmetic that can go out of bounds, overflow or divide by zero unwind:
+# use `.get()`, `checked_*` (`saturating_*` only where saturation is the stated meaning).
+indexing_slicing = "deny"
+string_slice = "deny"
+arithmetic_side_effects = "deny"
+# The assert family and print macros are listed in clippy.toml.
+disallowed_macros = "deny"
+panic_in_result_fn = "deny"
+unwrap_in_result = "deny"
+# Integers are checked: a narrowing `as` is a review failure; use `try_from`.
+cast_possible_truncation = "deny"
+cast_sign_loss = "deny"
+cast_possible_wrap = "deny"
+# Bounded functions: the threshold is a ratified shape constant in clippy.toml.
+cognitive_complexity = "deny"
+mem_forget = "deny"
+missing_safety_doc = "deny"
+missing_panics_doc = "deny"
+
+[[bench]]
+name = "echo"
+harness = false
+
+[[bench]]
+name = "calibration_drift"
+harness = false
+
+[[bench]]
+name = "wake_lines"
+harness = false
+
+[[bench]]
+name = "rearm"
+harness = false
+
+[[bench]]
+name = "stamped_receive"
+harness = false

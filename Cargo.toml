@@ -72,7 +72,11 @@ hyper-log = { path = "vendor/hyper-raft/crates/hyper-log" }
 hyper-measure = { path = "vendor/hyper-raft/crates/hyper-measure" }
 hyper-quic = { path = "vendor/hyper-raft/crates/hyper-quic" }
 hyper-raft = { path = "vendor/hyper-raft/crates/hyper-raft" }
-hyper-rt = { path = "vendor/hyper-raft/crates/hyper-rt" }
+# hyper-rt is kiln's own code: its runtime, crates/kiln-rt, taken from hyper-raft's crate at the
+# revision vendored here (crates/kiln-rt/ORIGIN.md). Every crate kiln builds that names hyper-rt builds
+# on it: kiln's by this patch; the vendored ones that take it by path, by their recorded changes
+# (vendor/hyper-raft/UPSTREAM.md, vendor/mantle/UPSTREAM.md).
+hyper-rt = { path = "crates/kiln-rt" }
 hyper-rt-transport = { path = "vendor/hyper-raft/crates/hyper-rt-transport" }
 hyper-seal = { path = "vendor/hyper-raft/crates/hyper-seal" }
 hyper-timing = { path = "vendor/hyper-raft/crates/hyper-timing" }
