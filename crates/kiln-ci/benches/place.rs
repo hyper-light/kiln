@@ -18,7 +18,7 @@ use std::time::Instant;
 
 use kiln_ci::facts::RunnerFacts;
 use kiln_ci::place::ask::{Ask, Peer, Sample};
-use kiln_ci::place::msg::{Estimate, Place, Reason, ToOwner};
+use kiln_ci::place::msg::ToOwner;
 use kiln_ci::place::owner::{Machine, Owner, Size};
 use kiln_ci::place::runner::{Admission, Init, Records, Said, Settings, Start};
 use kiln_ci::sched::needs::Needs;
@@ -164,24 +164,22 @@ fn admission(n: u32, d: usize, steps: u32) {
     );
 }
 
-/// The owner's pick among `n` runners: the first offer taken, the other probes withdrawn.
+/// The owner's pick among `n` runners: an ask probed at all of them, then the first offer taken
+/// and the other probes withdrawn. Only the offer is timed.
 fn pick(n: u32, rounds: u32) {
     let machines: Vec<Machine> = (0..n)
         .map(|j| Machine { name: format!("r{j}"), facts: RunnerFacts { os: "linux".into(), arch: "x86_64".into(), ..RunnerFacts::default() }, labels: Vec::new(), size: Size::known(&Resources { cpu: Cpus::whole(64), ..Resources::default() }), epoch: 1, connected: true, places: true, idle: None })
         .collect();
+    let mut o = Owner::new("bench", 1);
+    let _ = o.machines(machines);
     let mut times = Vec::new();
     let mut withdrawals = 0usize;
     for round in 0..rounds {
-        let mut o = Owner::new("bench", 1);
-        let _ = o.machines(machines.clone());
         let run = format!("r{round}");
         let _ = o.ask(Ask { run: run.clone(), ..Ask::default() }, 0);
-        for j in 0..n {
-            let _ = o.heard(&format!("r{j}"), ToOwner::Waiting { run: run.clone(), reason: Reason::Line, place: Place::of(2), start: Estimate::default(), predicted: None, free: Resources::default() }, 1);
-        }
-        let offer = ToOwner::Offer { run: run.clone(), fence: Fence { epoch: 1, n: 1 }, got: Resources::default(), free: Resources::default(), predicted: None, disk: Default::default() };
+        let offer = ToOwner::Offer { run, fence: Fence { epoch: 1, n: u64::from(round) + 1 }, got: Resources::default(), free: Resources::default(), predicted: None, disk: Default::default() };
         let t = Instant::now();
-        let acts = o.heard("r0", offer, 2);
+        let acts = o.heard("r0", offer, 1);
         times.push(t.elapsed().as_nanos());
         withdrawals = acts.len().saturating_sub(1);
     }
