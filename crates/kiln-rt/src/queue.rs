@@ -177,6 +177,10 @@ struct Others {
     background: Lists,
     /// The poll time each class has run while it had tasks listed, nanoseconds, by `Class as usize`.
     ran_ns: [Cell<u64>; 3],
+    /// The shard's virtual time: after each poll, the least time run of the class polled and the classes listed,
+    /// never falling (the minimum virtual runtime a fair scheduler keeps, Linux's CFS `min_vruntime`). A class
+    /// starting to list with no other listed is raised to it ([`LocalQueue::activate`]).
+    vtime_ns: Cell<u64>,
 }
 
 impl Others {
@@ -185,6 +189,7 @@ impl Others {
             critical: Lists::new(capacity),
             background: Lists::new(capacity),
             ran_ns: [Cell::new(0), Cell::new(0), Cell::new(0)],
+            vtime_ns: Cell::new(0),
         }
     }
 
@@ -286,8 +291,10 @@ impl LocalQueue {
     }
 
     /// A class with nothing listed starts listing: its time run is raised to the least of the classes with tasks
-    /// listed, so time it spent idle is no credit against them (a class's share is of the time it wants the shard,
-    /// as a weighted fair queue's virtual time is).
+    /// listed, or with none listed to the shard's virtual time, so time it spent idle is no credit against them (a
+    /// class's share is of the time it wants the shard, as a weighted fair queue's virtual time is). Without the
+    /// virtual time, a class that ran alone (a quiet shard's every class, in turn) kept all that time against the
+    /// next class to list while it rested, and was shut out for as long once it listed again.
     fn activate(&self, class: Class) {
         let Some(others) = self.others.get() else {
             return;
@@ -297,10 +304,11 @@ impl LocalQueue {
             .filter(|other| *other != class && !self.lists(*other).is_empty())
             .map(|other| others.ran(other).get())
             .min();
-        if let Some(least) = least {
-            let ran = others.ran(class);
-            ran.set(ran.get().max(least));
-        }
+        // A listed class has run at least the virtual time (it was in the least that set it, or raised to it), so
+        // this is the least listed's where one is listed.
+        let floor = least.unwrap_or(0).max(others.vtime_ns.get());
+        let ran = others.ran(class);
+        ran.set(ran.get().max(floor));
     }
 
     /// Marks a slot ready at `now_ns` (the shard's clock as the loop last read it); a slot already pending is not
@@ -445,12 +453,21 @@ impl LocalQueue {
         best.map(|(_, lists)| lists)
     }
 
-    /// Counts `ns` of poll time to the class of the task in `slot`, while classes are kept.
+    /// Counts `ns` of poll time to the class of the task in `slot`, while classes are kept, and moves the shard's
+    /// virtual time on to the least time run of that class and the classes listed.
     #[inline]
     pub fn charge(&self, slot: u32, ns: u64) {
         if let Some(others) = self.others.get() {
-            let ran = others.ran(self.class_of(slot));
+            let class = self.class_of(slot);
+            let ran = others.ran(class);
             ran.set(ran.get().saturating_add(ns));
+            let least = [Class::Critical, Class::Normal, Class::Background]
+                .into_iter()
+                .filter(|other| *other == class || !self.lists(*other).is_empty())
+                .map(|other| others.ran(other).get())
+                .min()
+                .unwrap_or(0);
+            others.vtime_ns.set(others.vtime_ns.get().max(least));
         }
     }
 
@@ -612,6 +629,31 @@ mod tests {
         assert_eq!(q.pop(), Some(2));
         q.charge(2, 10);
         assert_eq!(q.pop(), Some(5));
+    }
+
+    /// A class that ran alone owes nothing once it rests: Normal runs a long while alone and its work ends; a
+    /// Background slot lists with nothing else listed, then Normal's lists again. Expect: the two level (Background
+    /// was raised to the shard's virtual time, Normal's run), so Normal goes first and is not shut out while
+    /// Background makes up the time Normal ran alone. Without the virtual time Background started at nothing and
+    /// took the shard for that long.
+    #[test]
+    fn g6_s3_a_class_that_ran_alone_owes_nothing_once_it_rests() {
+        let q = LocalQueue::new(8);
+        q.set_class(5, Class::Background);
+        q.push(2, 0);
+        assert_eq!(q.pop(), Some(2));
+        q.charge(2, 1_000_000);
+        assert!(q.is_empty(), "Normal's work ended");
+        q.push(5, 0);
+        q.push(2, 0);
+        assert_eq!(q.pop(), Some(2), "level: Normal first, by urgency");
+        q.charge(2, 10);
+        assert_eq!(q.pop(), Some(5));
+        q.charge(5, 10);
+        // Both ran 1,000,010 ns: Normal's next wake goes ahead again rather than behind a million of Background's.
+        q.push(5, 0);
+        q.push(2, 0);
+        assert_eq!(q.pop(), Some(2));
     }
 
     /// A slot's wait is stamped as it joins a ready FIFO: at its push, and for one that yielded, at its release.

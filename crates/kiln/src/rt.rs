@@ -725,11 +725,9 @@ impl Future for Sleep {
     type Output = ();
     fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
         if Instant::now() >= self.deadline {
-            // A deadline already passed is a charge of the task's turn on its shard, as hyper-rt's own
-            // timer is (`hyper_rt::coop`): a loop of passed deadlines yields at its share.
-            if hyper_rt::coop::poll_proceed(cx).is_pending() {
-                return Poll::Pending;
-            }
+            // A deadline already passed completes at once, as kiln's Clock seam holds every clock to
+            // (`kiln_seams::clock`, "a sleep until now"), so it is no charge that may refuse: a sleep that
+            // waits is charged by hyper-rt's timer (`hyper_rt::coop`, goal 6, plan 01a1a59c2abe step 1).
             self.native = None;
             self.bridged = None;
             return Poll::Ready(());
@@ -954,8 +952,9 @@ impl Shutdown {
         self.0.cancelled.load(Ordering::SeqCst)
     }
 
-    /// Completes once [`Self::cancel`] has been called (at once if it already was). A charge of the
-    /// task's turn on its shard (`hyper_rt::coop`).
+    /// Completes once [`Self::cancel`] has been called: if it already was, at once, or a turn later
+    /// when the task has used its share of a shard other work wants (a charge of its turn,
+    /// `hyper_rt::coop`).
     pub async fn cancelled(&self) {
         hyper_rt::coop::consume_budget().await;
         loop {
