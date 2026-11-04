@@ -176,7 +176,7 @@ fn events_identical_frames_are_dropped() -> anyhow::Result<()> {
     out.resync();
     out.add(frame(10, run("running")));
     let (_, e) = read(&out.flush(AT, false).unwrap_or_default())?;
-    assert_eq!(kinds(&e), ["run"], "a resync forgets too (what was gathered before it went with it)");
+    assert_eq!(kinds(&e), ["resync", "run"], "a resync forgets what was sent too: the same frame goes, after it");
     Ok(())
 }
 
@@ -424,7 +424,34 @@ fn events_burst_costs_fewer_frames_and_bytes() -> anyhow::Result<()> {
         ci.push((end + 2, the_run(if i == 199 { "succeeded" } else { "running" })?));
     }
     ci.sort_by_key(|(t, _)| *t);
+    // The mix the budgets track measured on a busy server (perf/wire-budgets,
+    // `w21_r15_events_ship_and_api_budgets`): headroom 11-19 frames/s from 2 runners (65 B), legs
+    // 2.6-3.5/s (843 B), agents 1.9/s (~990 B), samples 0.6/s; here 15, 3, 2 and 0.6 a second for
+    // 60 s. Most tabs show no headroom: they're asked for every other type.
+    let mut mix = Vec::new();
+    for k in 0..900_u64 {
+        let runner = format!("runner-{}", k % 2);
+        mix.push((k * 1000 / 15, Arc::from(ServerEvent::Headroom { runner }.text())));
+    }
+    for k in 0..180_usize {
+        mix.push(((k as u64) * 1000 / 3, leg(k % 24, "running", k % 4)?));
+    }
+    for k in 0..120_usize {
+        mix.push(((k as u64) * 500 + 7, agent_entry(k % 6, k)?));
+    }
+    for k in 0..36_u64 {
+        let sample = json!({ "type": "sample", "agent": format!("runner-{}", k % 2), "sample": { "ts": 1_793_000_000 + k, "cpu_pct": 41.5, "load1": 7.2, "mem_used": 34_436_644_864_u64, "mem_total": 68_719_476_736_u64, "disk_used": 900_000_000_000_u64, "net_rx": 12_345_678, "net_tx": 2_345_678 } });
+        mix.push((k * 1667 + 3, Arc::from(sample.to_string())));
+    }
+    mix.sort_by_key(|(t, _)| *t);
+    let before = sends(&mix, None, false);
+    let after = sends(&mix, None, true);
+    let elsewhere = sends(&mix, Some("job,harness,harness_closed,sample,run,agent,queue"), true);
+    println!("the measured mix, 60 s: {} events; before {} frames, {} bytes; after {} frames, {} bytes; on a tab without headroom {} frames, {} bytes", mix.len(), before.0, before.1, after.0, after.1, elsewhere.0, elsewhere.1);
     let mut wrong = Vec::new();
+    if !(after.0 < before.0 && elsewhere.0 < after.0 && elsewhere.1 < before.1) {
+        wrong.push(format!("the measured mix: before {before:?}, after {after:?}, elsewhere {elsewhere:?}"));
+    }
     for (name, burst, other) in [("50 agents, 10 s", &agents, "run,job,agent,queue"), ("CI, 200 legs on 8 runners", &ci, "harness,harness_closed,queue")] {
         let before = sends(burst, None, false);
         let after = sends(burst, None, true);

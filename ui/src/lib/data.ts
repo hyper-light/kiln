@@ -156,10 +156,10 @@ export function useRecentRuns(limit: number) {
   const runs = useRes(recentRunsRes(limit));
   useServerEvents(["run"], (ev) => {
     runs.setData((list) =>
-        upsert<Run>(list, ev.run, (r) => r.id)
-          .sort((a, b) => b.created_at - a.created_at)
-          .slice(0, limit),
-      );
+      upsert<Run>(list, ev.run, (r) => r.id)
+        .sort((a, b) => b.created_at - a.created_at)
+        .slice(0, limit),
+    );
   });
   return runs;
 }

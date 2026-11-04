@@ -55,7 +55,12 @@ const emit = (ev: unknown) => (events as unknown as { handlers: Set<(e: unknown)
 // W21-R15: a page is sent only what it uses. events.ts's own (the queue's history) is always heard.
 await test("the events asked of the server follow what's shown and what listens", async () => {
   assert.deepEqual(events.topics(), ["queue"]);
-  const off = watch("topics/runs", async () => [], { on: ["run", "job"] }, () => {});
+  const off = watch(
+    "topics/runs",
+    async () => [],
+    { on: ["run", "job"] },
+    () => {},
+  );
   assert.deepEqual(events.topics(), ["job", "queue", "run"], "a shown key's types");
   const offH = events.on(["harness", "harness_closed"], () => {});
   assert.deepEqual(events.topics(), ["harness", "harness_closed", "job", "queue", "run"]);
@@ -259,7 +264,7 @@ function wrong(file: string, text: string): string[] {
 
 await test("every listener of the events socket names its types, and handles none it doesn't ask for", () => {
   // The check itself catches one that would silently lose an event.
-  assert.deepEqual(wrong("x.ts", `useServerEvents(["run"], (ev) => {\n  if (ev.type === "job") reload();\n});`), ['x.ts:1 handles "job", which it doesn't ask for']);
+  assert.deepEqual(wrong("x.ts", `useServerEvents(["run"], (ev) => {\n  if (ev.type === "job") reload();\n});`), ['x.ts:1 handles "job", which it doesn\'t ask for']);
   assert.deepEqual(wrong("x.ts", `  events.on((ev) => {});`), ["x.ts:1 listens to every event: name its types"]);
   const src = join(import.meta.dirname, "../src");
   const found: string[] = [];

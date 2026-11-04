@@ -242,7 +242,10 @@ class EventStream {
     const now = this.topics();
     const key = now === null ? null : now.join(",");
     if (key === this.told) return;
-    const frame: EventsUp = now === null ? { t: "topics" } : since ? { t: "topics", topics: now, since } : { t: "topics", topics: now };
+    // `since` only when there's a type new to it: of those, what came after it is sent too.
+    const had = new Set(this.told === null ? [] : this.told.split(","));
+    const grew = this.told !== null && now !== null && now.some((t) => !had.has(t));
+    const frame: EventsUp = now === null ? { t: "topics" } : since && grew ? { t: "topics", topics: now, since } : { t: "topics", topics: now };
     ws.send(JSON.stringify(frame));
     this.told = key;
   }
