@@ -1872,6 +1872,8 @@ async fn ai_takeover(hub: &Hub, caller: &crate::authz::Caller, machine: &str, pi
     let Some(found) = found else {
         return Err(err(StatusCode::NOT_FOUND, "no such session on that machine (it may have ended: resume it with spec.resume)"));
     };
+    // Before anything of it is ended: refused here, it goes on running where it is.
+    let target = found_target(hub, caller, machine, "take over a session found on that machine")?;
     let held = found.terminal.as_deref().is_some_and(|t| hub.terminals.get(t).is_some());
     let spec = match (takeover_on(hub, machine, found.takeover(held)), found.takeover_spec(held)) {
         (TakeOver::Ready, Some(spec)) => spec,
@@ -1894,7 +1896,7 @@ async fn ai_takeover(hub: &Hub, caller: &crate::authz::Caller, machine: &str, pi
     }
     let how = if spec.takeover_stop { ", ended there" } else { "" };
     hub.store.audit("admin".into(), "agent.takeover".into(), format!("{} (process {pid}) on {machine}{how}", found.tool)).await;
-    let infos = hub.harness.open(hub, &format!("agent:{machine}"), spec, 1).await.map_err(|e| err(StatusCode::BAD_REQUEST, format!("{e:#}")))?;
+    let infos = hub.harness.open(hub, &target, spec, 1).await.map_err(|e| err(StatusCode::BAD_REQUEST, format!("{e:#}")))?;
     opened_by(hub, caller, &infos).await;
     Ok(srv::json(StatusCode::OK, &infos))
 }
@@ -1912,6 +1914,20 @@ async fn opened_by(hub: &Hub, caller: &crate::authz::Caller, infos: &[crate::har
             let _ = hub.store.kv_set(crate::mcp::opened_by_key(&i.id), p.clone()).await;
         }
     }
+}
+
+/// Where a session found on `machine` continues as an agent: on that machine's runner, except the
+/// server's own, which runs no agents (`crate::harness::limit`): they're the server's (`local`), on
+/// the same machine, under the server's right to run them.
+fn found_target(hub: &Hub, caller: &crate::authz::Caller, machine: &str, what: &str) -> Result<String, ApiError> {
+    if !crate::harness::limit::own(hub, machine) {
+        return Ok(format!("agent:{machine}"));
+    }
+    may_run_on(caller, "local", what)?;
+    if !hub.cfg.terminal.enabled {
+        return Err(err(StatusCode::FORBIDDEN, "terminals (and so agents) are disabled on this server"));
+    }
+    Ok("local".to_owned())
 }
 
 /// [`crate::harness::lineage::may_run_on`], as the API answers it.
@@ -1937,8 +1953,9 @@ async fn ai_fork(hub: &Hub, caller: &crate::authz::Caller, machine: &str, pid: &
             err(StatusCode::BAD_REQUEST, format!("kiln cannot branch a {} session", found.tool))
         });
     };
+    let target = found_target(hub, caller, machine, "branch a session found on that machine")?;
     hub.store.audit("admin".into(), "agent.fork".into(), format!("{} (process {pid}) on {machine}", found.tool)).await;
-    let infos = hub.harness.open(hub, &format!("agent:{machine}"), spec, 1).await.map_err(|e| err(StatusCode::BAD_REQUEST, format!("{e:#}")))?;
+    let infos = hub.harness.open(hub, &target, spec, 1).await.map_err(|e| err(StatusCode::BAD_REQUEST, format!("{e:#}")))?;
     opened_by(hub, caller, &infos).await;
     Ok(srv::json(StatusCode::OK, &infos))
 }
