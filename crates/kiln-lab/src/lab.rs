@@ -1,0 +1,659 @@
+//! A round: a fresh kiln of the build under test, filled as production's is (agents' long
+//! conversations on several runners), then the window it's measured in, while people view agents
+//! over the UI's sockets, agents work and stream, agents call the API and MCP, and pages load,
+//! with CPU hogs beside it when asked.
+
+use std::collections::{BTreeMap, HashSet};
+use std::path::{Path, PathBuf};
+use std::process::{Child, Command, Stdio};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::time::{Duration, Instant};
+
+use serde::{Deserialize, Serialize};
+use serde_json::{Value, json};
+
+use crate::client::{Frame, Http, PATIENCE, Socket};
+use crate::fleet::Fleet;
+use crate::measure::{self, Class, Sample, Scrape};
+use crate::standin::{Lcg, STAMP, now_us};
+
+/// What a round does. The defaults are production's shape at a busy hour (`docs/runtime-lab.md`
+/// says where each comes from).
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct Profile {
+    /// Runners, each its own `kiln agent`.
+    pub runners: usize,
+    /// Each live session's conversation before the window, in events.
+    pub sessions: Vec<u64>,
+    /// Sessions that work through the window: a message, then a turn of `turn_events` events
+    /// `turn_every_ms` apart, then `turn_think_ms` before the next.
+    pub active: usize,
+    pub turn_events: u64,
+    pub turn_every_ms: u64,
+    pub turn_think_ms: u64,
+    /// People viewing agents: each opens one, watches it `dwell_s`, then opens another.
+    pub viewers: usize,
+    pub dwell_s: u64,
+    /// The UI's and agents' API reads, `read_think_ms` apart for each reader.
+    pub readers: usize,
+    pub read_think_ms: u64,
+    /// Agents' MCP calls, `mcp_think_ms` apart for each.
+    pub mcp: usize,
+    pub mcp_think_ms: u64,
+    /// Pages and their files loading, `page_think_ms` apart.
+    pub pages: usize,
+    pub page_think_ms: u64,
+    /// Seconds of load before the window, and of the window.
+    pub warmup_s: u64,
+    pub window_s: u64,
+}
+
+impl Profile {
+    /// Production's shape (its `/metrics`, 2026-11-03: ten runners, 134 live feeds, 4 to 8 people
+    /// watching, conversations to about 20,000 events), at a busy hour's pace.
+    pub fn realistic() -> Self {
+        let mut sessions = vec![20_000, 20_000];
+        sessions.extend(std::iter::repeat_n(4_000, 6));
+        sessions.extend(std::iter::repeat_n(400, 24));
+        Self {
+            runners: 4,
+            sessions,
+            active: 8,
+            turn_events: 40,
+            turn_every_ms: 25,
+            turn_think_ms: 2_000,
+            viewers: 8,
+            dwell_s: 20,
+            readers: 4,
+            read_think_ms: 50,
+            mcp: 2,
+            mcp_think_ms: 250,
+            pages: 1,
+            page_think_ms: 100,
+            warmup_s: 5,
+            window_s: 60,
+        }
+    }
+
+    /// A small one, to try the lab out (and for its own test).
+    pub fn small() -> Self {
+        Self {
+            runners: 1,
+            sessions: vec![300, 100, 100],
+            active: 2,
+            turn_events: 10,
+            turn_every_ms: 50,
+            turn_think_ms: 1_000,
+            viewers: 2,
+            dwell_s: 5,
+            readers: 1,
+            read_think_ms: 100,
+            mcp: 1,
+            mcp_think_ms: 500,
+            pages: 1,
+            page_think_ms: 500,
+            warmup_s: 2,
+            window_s: 10,
+        }
+    }
+}
+
+/// A build under test: a label, its `kiln` binary, and what its server's environment has besides.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct Build {
+    pub label: String,
+    pub kiln: PathBuf,
+    pub env: Vec<(String, String)>,
+}
+
+/// The machine around a round.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct Machine {
+    pub host: String,
+    pub os: String,
+    /// CPUs the lab may use (its affinity, its cgroup's quota): what hogs are counted against.
+    pub cpus: usize,
+    /// The CPUs it may run on (Linux: its affinity, `Cpus_allowed_list`).
+    pub affinity: Option<String>,
+    /// The load averages and CPU pressure (Linux, `some avg10`) before and after the window.
+    pub load_before: Option<[f64; 3]>,
+    pub load_after: Option<[f64; 3]>,
+    pub cpu_pressure_before: Option<f64>,
+    pub cpu_pressure_after: Option<f64>,
+}
+
+fn loadavg() -> Option<[f64; 3]> {
+    let text = if cfg!(target_os = "linux") {
+        std::fs::read_to_string("/proc/loadavg").ok()?
+    } else {
+        let out = Command::new("sysctl").args(["-n", "vm.loadavg"]).output().ok()?;
+        String::from_utf8_lossy(&out.stdout).replace(['{', '}'], "")
+    };
+    let mut it = text.split_whitespace().filter_map(|w| w.parse::<f64>().ok());
+    Some([it.next()?, it.next()?, it.next()?])
+}
+
+fn cpu_pressure() -> Option<f64> {
+    let text = std::fs::read_to_string("/proc/pressure/cpu").ok()?;
+    text.lines().find(|l| l.starts_with("some"))?.split_whitespace().find_map(|w| w.strip_prefix("avg10="))?.parse().ok()
+}
+
+pub fn machine() -> Machine {
+    let host = Command::new("hostname").output().map(|o| String::from_utf8_lossy(&o.stdout).trim().to_owned()).unwrap_or_default();
+    let affinity = std::fs::read_to_string("/proc/self/status").ok().and_then(|s| s.lines().find_map(|l| l.strip_prefix("Cpus_allowed_list:").map(|v| v.trim().to_owned())));
+    Machine { host, os: std::env::consts::OS.to_owned(), cpus: std::thread::available_parallelism().map_or(1, std::num::NonZero::get), affinity, ..Machine::default() }
+}
+
+/// A round's result: each number it reports, and what it saw by class.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct Round {
+    pub build: String,
+    pub index: usize,
+    pub hogs: usize,
+    pub machine: Machine,
+    /// Seconds the fill took (every session's conversation in), not measured beyond that.
+    pub fill_s: f64,
+    pub shards: usize,
+    pub numbers: BTreeMap<String, f64>,
+    pub seen: BTreeMap<String, measure::Seen>,
+}
+
+// ------------------------------------------------------------------------------------- the load
+
+/// What every worker shares: where the server is, the sessions, and when to stop.
+struct Shared {
+    port: u16,
+    admin: String,
+    sessions: Vec<(String, u64)>,
+    active: Vec<String>,
+    stop: AtomicBool,
+    /// Ids for the messages the lab sends.
+    next: AtomicU64,
+    /// How long a viewer watches one agent.
+    dwell: Duration,
+}
+
+fn jitter(r: &mut Lcg, d: Duration) -> Duration {
+    // ±25%, so workers don't fall into step.
+    let ms = u64::try_from(d.as_millis()).unwrap_or(u64::MAX);
+    Duration::from_millis(ms.saturating_mul(75) / 100 + r.below(ms / 2 + 1))
+}
+
+/// Sleeps `d`, waking early when the round stops: whether it's still on.
+fn nap(s: &Shared, d: Duration) -> bool {
+    let until = Instant::now() + d;
+    while Instant::now() < until {
+        if s.stop.load(Ordering::Relaxed) {
+            return false;
+        }
+        std::thread::sleep((until - Instant::now()).min(Duration::from_millis(100)));
+    }
+    !s.stop.load(Ordering::Relaxed)
+}
+
+fn timed(class: Class, f: impl FnOnce() -> anyhow::Result<u16>) -> Sample {
+    let at_us = now_us();
+    let t = Instant::now();
+    let ok = matches!(f(), Ok(status) if status < 400);
+    Sample { class, at_us, took_us: u64::try_from(t.elapsed().as_micros()).unwrap_or(u64::MAX), ok }
+}
+
+/// The stamps (`@lab:<µs>`) in a frame.
+fn stamps(text: &[u8]) -> impl Iterator<Item = u64> + '_ {
+    let marker = STAMP.as_bytes();
+    let mut at = 0;
+    std::iter::from_fn(move || {
+        while let Some(i) = text.get(at..).and_then(|rest| rest.windows(marker.len()).position(|w| w == marker)) {
+            let start = at + i + marker.len();
+            let digits = text.get(start..).map_or(0, |r| r.iter().take_while(|b| b.is_ascii_digit()).count());
+            at = start + digits;
+            if let Some(n) = text.get(start..start + digits).and_then(|d| std::str::from_utf8(d).ok()).and_then(|d| d.parse().ok()) {
+                return Some(n);
+            }
+        }
+        None
+    })
+}
+
+/// A person viewing agents: opens one's conversation (its whole, packed, as the UI asks), watches
+/// its live frames, then another.
+fn viewer(s: &Shared, i: usize) -> Vec<Sample> {
+    let mut out = Vec::new();
+    let mut r = Lcg(0x9e37_79b9 ^ (i as u64));
+    let dwell = s.dwell;
+    while !s.stop.load(Ordering::Relaxed) {
+        // Most watch an agent at work; one in four opens any (the long ones among them).
+        let pick = if r.below(4) > 0 && !s.active.is_empty() {
+            s.active.get(usize::try_from(r.below(s.active.len() as u64)).unwrap_or(0)).cloned()
+        } else {
+            s.sessions.get(usize::try_from(r.below(s.sessions.len() as u64)).unwrap_or(0)).map(|(id, _)| id.clone())
+        };
+        let Some(id) = pick else { break };
+        let at_us = now_us();
+        let t = Instant::now();
+        let path = format!("/api/harness/sessions/{id}/ws?z=gzip&patch=state&patch=changes");
+        let mut sock = match Socket::open(s.port, &s.admin, &path, Duration::from_millis(200)) {
+            Ok(sock) => sock,
+            Err(_) => {
+                out.push(Sample { class: Class::Attach, at_us, took_us: 0, ok: false });
+                nap(s, Duration::from_secs(1));
+                continue;
+            }
+        };
+        // Opened: its packed snapshot came.
+        let opened = loop {
+            match sock.next() {
+                Ok(Frame::Binary) => break true,
+                Ok(Frame::Nothing | Frame::Text(_)) if t.elapsed() < PATIENCE && !s.stop.load(Ordering::Relaxed) => {}
+                _ => break false,
+            }
+        };
+        out.push(Sample { class: Class::Attach, at_us, took_us: u64::try_from(t.elapsed().as_micros()).unwrap_or(u64::MAX), ok: opened });
+        if !opened {
+            continue;
+        }
+        let until = Instant::now() + jitter(&mut r, dwell);
+        let mut seen = HashSet::new();
+        while Instant::now() < until && !s.stop.load(Ordering::Relaxed) {
+            match sock.next() {
+                Ok(Frame::Text(text)) => {
+                    let now = now_us();
+                    for stamp in stamps(&text) {
+                        if seen.insert(stamp) {
+                            out.push(Sample { class: Class::Websocket, at_us: stamp, took_us: now.saturating_sub(stamp), ok: true });
+                        }
+                    }
+                }
+                // A catch-up (a whole again), or nothing yet.
+                Ok(Frame::Binary | Frame::Nothing) => {}
+                Ok(Frame::Closed) | Err(_) => break,
+            }
+        }
+        sock.close();
+    }
+    out
+}
+
+/// An agent at work on `id`: a message, its turn, a pause, again.
+fn driver(s: &Shared, id: &str, p: &Profile, i: usize) -> Vec<Sample> {
+    let mut out = Vec::new();
+    let mut r = Lcg(0x5eed ^ ((i as u64) << 8));
+    let mut http = Http::new(s.port, &s.admin);
+    let turn = Duration::from_millis(p.turn_events.saturating_mul(p.turn_every_ms));
+    let path = format!("/api/harness/sessions/{id}/command");
+    // Not all at once.
+    if !nap(s, jitter(&mut r, Duration::from_millis(p.turn_think_ms))) {
+        return out;
+    }
+    while !s.stop.load(Ordering::Relaxed) {
+        let n = s.next.fetch_add(1, Ordering::Relaxed);
+        let body = json!({"type": "send", "id": format!("lab-{n}"), "text": format!("lab:turn:{}:{}", p.turn_events, p.turn_every_ms)}).to_string();
+        out.push(timed(Class::ApiWrite, || http.send("POST", &path, Some(body.as_bytes())).map(|a| a.status)));
+        if !nap(s, turn + jitter(&mut r, Duration::from_millis(p.turn_think_ms))) {
+            break;
+        }
+    }
+    out
+}
+
+/// The UI's reads as people move about (lists, an agent's page, its history, runs), and agents'.
+fn reader(s: &Shared, p: &Profile, i: usize) -> Vec<Sample> {
+    let mut out = Vec::new();
+    let mut r = Lcg(0xa11ce ^ ((i as u64) << 16));
+    let mut http = Http::new(s.port, &s.admin);
+    while !s.stop.load(Ordering::Relaxed) {
+        let id = s.sessions.get(usize::try_from(r.below(s.sessions.len() as u64)).unwrap_or(0)).map_or("", |(id, _)| id.as_str());
+        let path = match r.below(20) {
+            0..=5 => "/api/harness/sessions".to_owned(),
+            6..=9 => format!("/api/harness/sessions/{id}"),
+            10..=12 => format!("/api/harness/sessions/{id}/events?limit=50"),
+            13 | 14 => "/api/agents".to_owned(),
+            15 => "/api/me".to_owned(),
+            16 => "/api/overview".to_owned(),
+            17 => "/api/runs".to_owned(),
+            18 => format!("/api/plans?session={id}"),
+            _ => format!("/api/harness/sessions/{id}/goals"),
+        };
+        out.push(timed(Class::ApiRead, || http.send("GET", &path, None).map(|a| a.status)));
+        if !nap(s, jitter(&mut r, Duration::from_millis(p.read_think_ms))) {
+            break;
+        }
+    }
+    out
+}
+
+/// An agent's MCP calls: who else is working, the machines.
+fn mcp(s: &Shared, p: &Profile, i: usize, tools: &[String]) -> Vec<Sample> {
+    let mut out = Vec::new();
+    let mut r = Lcg(0x3c9 ^ ((i as u64) << 24));
+    let mut http = Http::new(s.port, &s.admin);
+    let mut n = 0u64;
+    while !s.stop.load(Ordering::Relaxed) {
+        n += 1;
+        let body = match tools.get(usize::try_from(r.below(tools.len().max(1) as u64)).unwrap_or(0)) {
+            Some(tool) => json!({"jsonrpc": "2.0", "id": n, "method": "tools/call", "params": {"name": tool, "arguments": {}}}),
+            None => json!({"jsonrpc": "2.0", "id": n, "method": "tools/list", "params": {}}),
+        }
+        .to_string();
+        out.push(timed(Class::ApiWrite, || http.send("POST", "/api/mcp", Some(body.as_bytes())).map(|a| a.status)));
+        if !nap(s, jitter(&mut r, Duration::from_millis(p.mcp_think_ms))) {
+            break;
+        }
+    }
+    out
+}
+
+/// A page and the files it names, as a browser loads them.
+fn pages(s: &Shared, p: &Profile, i: usize) -> Vec<Sample> {
+    let mut out = Vec::new();
+    let mut r = Lcg(0xbead ^ ((i as u64) << 32));
+    let mut http = Http::browser(s.port, &s.admin);
+    let mut files: Vec<String> = Vec::new();
+    while !s.stop.load(Ordering::Relaxed) {
+        let id = s.sessions.get(usize::try_from(r.below(s.sessions.len() as u64)).unwrap_or(0)).map_or("", |(id, _)| id.as_str());
+        let mut body = Vec::new();
+        out.push(timed(Class::Page, || {
+            let a = http.send("GET", &format!("/agents/{id}"), None)?;
+            body = a.body;
+            Ok(a.status)
+        }));
+        if files.is_empty() {
+            let text = String::from_utf8_lossy(&body);
+            files = text.split('"').filter(|w| w.starts_with("/assets/") && !w.contains(' ')).map(str::to_owned).take(4).collect();
+        }
+        for f in &files {
+            out.push(timed(Class::Page, || http.send("GET", f, None).map(|a| a.status)));
+        }
+        if !nap(s, jitter(&mut r, Duration::from_millis(p.page_think_ms))) {
+            break;
+        }
+    }
+    out
+}
+
+// ------------------------------------------------------------------------------------- the round
+
+/// CPU hogs: `n` processes of the lab's own, each spinning until its stdin closes (the lab ends
+/// them, or its end does).
+pub struct Hogs(Vec<Child>);
+
+impl Hogs {
+    pub fn start(n: usize) -> anyhow::Result<Self> {
+        let me = std::env::current_exe()?;
+        let mut v = Vec::with_capacity(n);
+        for _ in 0..n {
+            v.push(Command::new(&me).arg("hog").stdin(Stdio::piped()).stdout(Stdio::null()).stderr(Stdio::null()).spawn()?);
+        }
+        Ok(Self(v))
+    }
+}
+
+impl Drop for Hogs {
+    fn drop(&mut self) {
+        for c in &mut self.0 {
+            let _ = c.kill();
+            let _ = c.wait();
+        }
+    }
+}
+
+/// A hog: spins until its stdin closes.
+pub fn hog() {
+    let stop = Arc::new(AtomicBool::new(false));
+    let s = Arc::clone(&stop);
+    std::thread::spawn(move || {
+        let mut sink = Vec::new();
+        let _ = std::io::Read::read_to_end(&mut std::io::stdin(), &mut sink);
+        s.store(true, Ordering::Relaxed);
+    });
+    let mut x = 0u64;
+    while !stop.load(Ordering::Relaxed) {
+        for _ in 0..100_000 {
+            x = std::hint::black_box(x.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1));
+        }
+    }
+}
+
+/// The stand-in, where the runners find it: the lab's own binary as `claude`, in `dir/bin`.
+pub fn stand_in(dir: &Path) -> anyhow::Result<PathBuf> {
+    let bin = dir.join("bin");
+    std::fs::create_dir_all(&bin)?;
+    let to = bin.join(if cfg!(windows) { "claude.exe" } else { "claude" });
+    if !to.exists() {
+        std::fs::copy(std::env::current_exe()?, &to)?;
+    }
+    Ok(bin)
+}
+
+/// The session ids and their status, from the server's list.
+fn statuses(http: &mut Http) -> anyhow::Result<BTreeMap<String, String>> {
+    let a = http.send("GET", "/api/harness/sessions", None)?;
+    let v: Value = serde_json::from_slice(&a.body)?;
+    let list = v.as_array().cloned().or_else(|| v.get("sessions").and_then(Value::as_array).cloned()).unwrap_or_default();
+    Ok(list.iter().filter_map(|i| Some((i.get("id")?.as_str()?.to_owned(), i.get("status")?.as_str()?.to_owned()))).collect())
+}
+
+/// One round of `build` with `hogs`, in `dir` (left for the next round's: the caller removes it).
+pub fn round(build: &Build, p: &Profile, hogs: usize, dir: &Path, bin: &Path, index: usize) -> anyhow::Result<Round> {
+    std::fs::create_dir_all(dir)?;
+    let mut fleet = Fleet::server(&build.kiln, dir, &build.env)?;
+    let names: Vec<String> = (0..p.runners.max(1)).map(|r| format!("lab-runner-{r}")).collect();
+    for n in &names {
+        fleet.runner(&build.kiln, n, bin)?;
+    }
+    fleet.runners_ready(Duration::from_secs(180))?;
+
+    // The fill: each session opened on its runner, its conversation written as fast as it's taken.
+    let filled = Instant::now();
+    let mut opened: Vec<(String, u64)> = Vec::new();
+    std::thread::scope(|scope| -> anyhow::Result<()> {
+        let (port, admin, dir) = (fleet.port, fleet.admin.as_str(), fleet.dir.as_path());
+        let handles: Vec<_> = names
+            .iter()
+            .enumerate()
+            .map(|(r, name)| {
+                let mine: Vec<(usize, u64)> = p.sessions.iter().copied().enumerate().filter(|(i, _)| i % names.len() == r).collect();
+                scope.spawn(move || -> anyhow::Result<Vec<(String, u64)>> {
+                    mine.iter().map(|(i, n)| Ok((crate::fleet::open(port, admin, name, &dir.join(format!("w/s{i}")), &format!("lab:prefill:{n}"), Duration::from_secs(120))?, *n))).collect()
+                })
+            })
+            .collect();
+        for h in handles {
+            opened.extend(h.join().map_err(|_| anyhow::anyhow!("a session opener panicked"))??);
+        }
+        Ok(())
+    })?;
+    let mut http = Http::new(fleet.port, &fleet.admin);
+    let deadline = Instant::now() + Duration::from_secs(1800);
+    let mut filled_ids: HashSet<String> = HashSet::new();
+    loop {
+        let st = statuses(&mut http)?;
+        for (id, n) in &opened {
+            // Idle once its first turn ended, with its conversation in the server's store (where
+            // this build keeps one: its newest event's place).
+            if filled_ids.contains(id) || st.get(id).is_none_or(|s| s != "idle") {
+                continue;
+            }
+            let newest = http.send("GET", &format!("/api/harness/sessions/{id}/events?limit=1"), None)?;
+            let seq = serde_json::from_slice::<Value>(&newest.body).ok().and_then(|v| v.pointer("/events/0/seq").and_then(Value::as_u64));
+            if newest.status != 200 || seq.is_none_or(|s| s >= *n) {
+                filled_ids.insert(id.clone());
+            }
+        }
+        if filled_ids.len() == opened.len() {
+            break;
+        }
+        anyhow::ensure!(Instant::now() < deadline, "the fill didn't finish: {} of {} sessions in", filled_ids.len(), opened.len());
+        std::thread::sleep(Duration::from_millis(250));
+    }
+    let fill_s = filled.elapsed().as_secs_f64();
+
+    // The MCP tools agents call, where this build has them.
+    let tools: Vec<String> = {
+        let a = http.send("POST", "/api/mcp", Some(json!({"jsonrpc": "2.0", "id": 1, "method": "tools/list", "params": {}}).to_string().as_bytes()))?;
+        let v: Value = serde_json::from_slice(&a.body).unwrap_or_default();
+        let have: HashSet<String> = v.pointer("/result/tools").and_then(Value::as_array).map(|t| t.iter().filter_map(|t| t.get("name")?.as_str().map(str::to_owned)).collect()).unwrap_or_default();
+        ["agents_list", "runners"].iter().filter(|t| have.contains(**t)).map(|t| (*t).to_owned()).collect()
+    };
+
+    // The biggest sessions work while people watch: those are the agents that run for days.
+    let mut by_size = opened.clone();
+    by_size.sort_by_key(|s| std::cmp::Reverse(s.1));
+    let active: Vec<String> = by_size.iter().take(p.active).map(|(id, _)| id.clone()).collect();
+    let shared = Shared {
+        port: fleet.port,
+        admin: fleet.admin.clone(),
+        sessions: opened.clone(),
+        active: active.clone(),
+        stop: AtomicBool::new(false),
+        next: AtomicU64::new(0),
+        dwell: Duration::from_secs(p.dwell_s),
+    };
+
+    let mut m = machine();
+    let hogs_run = if hogs > 0 { Some(Hogs::start(hogs)?) } else { None };
+    let (samples, before, after, window) = std::thread::scope(|scope| -> anyhow::Result<(Vec<Sample>, Scrape, Scrape, (u64, u64))> {
+        let s = &shared;
+        let mut handles = Vec::new();
+        for i in 0..p.viewers {
+            handles.push(scope.spawn(move || viewer(s, i)));
+        }
+        for (i, id) in active.iter().enumerate() {
+            handles.push(scope.spawn(move || driver(s, id, p, i)));
+        }
+        for i in 0..p.readers {
+            handles.push(scope.spawn(move || reader(s, p, i)));
+        }
+        let tools = &tools;
+        for i in 0..p.mcp {
+            handles.push(scope.spawn(move || mcp(s, p, i, tools)));
+        }
+        for i in 0..p.pages {
+            handles.push(scope.spawn(move || pages(s, p, i)));
+        }
+        std::thread::sleep(Duration::from_secs(p.warmup_s));
+        let mut scraper = Http::new(s.port, &s.admin);
+        m.load_before = loadavg();
+        m.cpu_pressure_before = cpu_pressure();
+        let before = Scrape::parse(&String::from_utf8_lossy(&scraper.send("GET", "/metrics", None)?.body));
+        let start = now_us();
+        std::thread::sleep(Duration::from_secs(p.window_s));
+        let end = now_us();
+        let after = Scrape::parse(&String::from_utf8_lossy(&scraper.send("GET", "/metrics", None)?.body));
+        m.load_after = loadavg();
+        m.cpu_pressure_after = cpu_pressure();
+        s.stop.store(true, Ordering::Relaxed);
+        let mut samples = Vec::new();
+        for h in handles {
+            samples.extend(h.join().map_err(|_| anyhow::anyhow!("a worker panicked"))?);
+        }
+        Ok((samples, before, after, (start, end)))
+    })?;
+    drop(hogs_run);
+    let in_window: Vec<Sample> = samples.into_iter().filter(|s| s.at_us >= window.0 && s.at_us < window.1).collect();
+    #[allow(clippy::cast_precision_loss)]
+    let secs = (window.1.saturating_sub(window.0)) as f64 / 1e6;
+    let seen = measure::seen(&in_window);
+    let (numbers, shards) = numbers(&seen, &before, &after, secs);
+    drop(fleet);
+    Ok(Round { build: build.label.clone(), index, hogs, machine: m, fill_s, shards, numbers, seen: seen.into_iter().map(|(c, s)| (c.name().to_owned(), s)).collect() })
+}
+
+/// The numbers a round reports, from what the lab saw and the server's `/metrics` either side of
+/// the window: each class's median, p99 and p99.9 and its most (the stall tail), throughput, the
+/// server's CPU for each request, and the shards' and routes' own figures where the build has them.
+fn numbers(seen: &BTreeMap<Class, measure::Seen>, before: &Scrape, after: &Scrape, secs: f64) -> (BTreeMap<String, f64>, usize) {
+    let mut n = BTreeMap::new();
+    let mut requests = 0u64;
+    for (c, s) in seen {
+        let name = c.name();
+        for (k, v) in [("p50_ms", s.p50_ms), ("p99_ms", s.p99_ms), ("p999_ms", s.p999_ms), ("max_ms", s.max_ms)] {
+            if let Some(v) = v {
+                n.insert(format!("{name}.{k}"), v);
+            }
+        }
+        #[allow(clippy::cast_precision_loss)]
+        n.insert(format!("{name}.per_s"), s.n as f64 / secs.max(1e-9));
+        if *c != Class::Websocket {
+            requests += s.n;
+        }
+    }
+    let diff = |name: &str, want: &[(&str, &str)]| Some(after.get(name, want)? - before.get(name, want)?);
+    if let Some(cpu) = diff("process_cpu_seconds_total", &[]) {
+        n.insert("server.cpu_share".into(), cpu / secs.max(1e-9));
+        if requests > 0 {
+            #[allow(clippy::cast_precision_loss)]
+            n.insert("server.cpu_ms_per_request".into(), cpu * 1000.0 / requests as f64);
+        }
+    }
+    if let Some(rss) = after.get("process_resident_memory_bytes", &[]) {
+        n.insert("server.rss_mb".into(), rss / 1e6);
+    }
+    // The shards': their delays together, their busy share on average, their slow polls.
+    let shards = after.values_of("kiln_shard_polls_total", "shard");
+    if !shards.is_empty() {
+        let mut delay: Vec<(f64, f64)> = Vec::new();
+        let (mut busy, mut slow) = (0.0, 0.0);
+        for sh in &shards {
+            let want = [("shard", sh.as_str())];
+            let d = measure::delta(&before.buckets("kiln_shard_delay_seconds", &want), &after.buckets("kiln_shard_delay_seconds", &want));
+            if delay.is_empty() {
+                delay = d;
+            } else {
+                for ((_, total), (_, add)) in delay.iter_mut().zip(d) {
+                    *total += add;
+                }
+            }
+            busy += diff("kiln_shard_busy_seconds_total", &want).unwrap_or(0.0);
+            for cause in ["task", "blocking", "host", "unknown"] {
+                slow += diff("kiln_shard_slow_polls_total", &[("shard", sh.as_str()), ("cause", cause)]).unwrap_or(0.0);
+            }
+        }
+        if let Some(v) = measure::histogram_quantile(0.99, &delay) {
+            n.insert("shards.delay_p99_ms".into(), v * 1000.0);
+        }
+        if let Some(v) = measure::histogram_quantile(0.999, &delay) {
+            n.insert("shards.delay_p999_ms".into(), v * 1000.0);
+        }
+        if let Some(v) = measure::histogram_top(&delay) {
+            n.insert("shards.delay_top_ms".into(), v * 1000.0);
+        }
+        #[allow(clippy::cast_precision_loss)]
+        let count = shards.len() as f64;
+        n.insert("shards.busy_share".into(), busy / secs.max(1e-9) / count);
+        n.insert("shards.slow_polls_per_s".into(), slow / secs.max(1e-9));
+    }
+    // The routes': how long each class took and waited at the server.
+    for class in ["page", "api_read", "api_write", "websocket", "runner"] {
+        let want = [("class", class)];
+        for (family, key) in [("kiln_route_seconds", "took"), ("kiln_route_wait_seconds", "wait")] {
+            let d = measure::delta(&before.buckets(family, &want), &after.buckets(family, &want));
+            if let Some(v) = measure::histogram_quantile(0.99, &d) {
+                n.insert(format!("server.{class}.{key}_p99_ms"), v * 1000.0);
+            }
+        }
+    }
+    (n, shards.len())
+}
+
+/// Which way each number is better: throughput up, everything else (latency, CPU, delay) down.
+pub fn better(name: &str) -> crate::stats::Better {
+    if name.ends_with(".per_s") && !name.starts_with("shards.") {
+        crate::stats::Better::Higher
+    } else {
+        crate::stats::Better::Lower
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn stamps_are_read_wherever_a_frame_has_them() {
+        let f = br#"{"t":"events","events":[{"text":"@lab:1730000000123456 the retry"},{"text":"no stamp"},{"output":"@lab:42 x @lab:"}]}"#;
+        assert_eq!(stamps(f).collect::<Vec<_>>(), vec![1_730_000_000_123_456, 42]);
+        assert_eq!(stamps(b"nothing").count(), 0);
+    }
+}
