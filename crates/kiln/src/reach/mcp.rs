@@ -496,8 +496,9 @@ impl Server {
         let sync = args.get("sync").and_then(Value::as_bool).unwrap_or(in_repo);
         let mut env: Vec<(String, String)> = args.get("env").and_then(Value::as_object).map(|m| m.iter().filter_map(|(k, v)| v.as_str().map(|v| (k.clone(), v.to_owned()))).collect()).unwrap_or_default();
         // The copy of its tree over there is this agent's, for the rules that keep copies
-        // (docs/reach.md §5.1).
-        if sync && !self.session.is_empty() && !env.iter().any(|(k, _)| k == super::keeper::AGENT_ENV) {
+        // (docs/reach.md §5.1); and the run is the agent's work, at its priority, synced or not
+        // (docs/priority.md).
+        if !self.session.is_empty() && !env.iter().any(|(k, _)| k == super::keeper::AGENT_ENV) {
             env.push((super::keeper::AGENT_ENV.to_owned(), self.session.clone()));
         }
         let req = RunReq {

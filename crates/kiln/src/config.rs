@@ -109,6 +109,12 @@ pub struct Server {
     /// itself: a forwarded or NATed port, a host's Tailscale address. Empty: `webrtc_addr`, or (on
     /// every address) each LAN address of this machine at its port.
     pub webrtc_advertise: Vec<String>,
+    /// Cores of the server's own (docs/priority.md, "Cores of its own"; goal 8, plan 01a1a59c2b29
+    /// step 6), as a CPU list (`8-15`, `2,4-7`): on Linux `kiln install` gives its `kiln.slice`
+    /// these alone (`AllowedCPUs=`) and, installed system-wide, makes them a cpuset partition that
+    /// nothing outside the slice runs on; the server fixes its shards to them. Unset (the default),
+    /// the server shares every core with what runs beside it, first by its weight.
+    pub cores: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -413,6 +419,7 @@ impl Default for Server {
             pages_url: None,
             webrtc_addr: None,
             webrtc_advertise: Vec::new(),
+            cores: None,
         }
     }
 }
