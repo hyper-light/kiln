@@ -5,13 +5,19 @@
 //! loaded rounds' median p99 must stay within the calm rounds' noise: their worst p99, plus the timer
 //! wheel's tick (a sleep ends up to a tick late by design, so the tick is the reading's resolution).
 //!
-//! On Linux the shard and four pool threads share one core (the test's thread is pinned to the core it is
-//! on, and the pool's threads, started from it, inherit that): the pool can only stay out of the shard's
-//! way by its lower priority, and the host's other work falls on calm and loaded rounds alike. Elsewhere
-//! (macOS keeps no affinity) the pool is sized as a server sizes it, the CPU granted less the shard.
+//! On Linux the test's thread is pinned to the core it is on, so the process is granted that one core and the
+//! pool is sized as a server sizes it, one thread less the shard and so one, which the pool's thread, started
+//! from it, shares with the shard: the pool can only stay out of the shard's way by its rank, `Rank::Below`, and the shard's slice of its step (`compute::prefer_current_thread`, as
+//! kiln's shards ask for); the host's other work falls on calm and loaded rounds alike. The rank below keeps
+//! the pool's share of the CPU against other work in the cgroup: `compute_wait.rs` holds a job a request waits
+//! on beside such work to what that share derives.
 //!
-//! The same load as plain threads at the process's own priority is measured beside it and reported, not
-//! held to: it is what the pool's lower priority buys.
+//! On macOS (which keeps no affinity and has no slice a shard can ask for) the pool is sized as a server sizes
+//! it and its lateness is reported, not held to: there no QoS class both keeps a shard at its calm lateness
+//! beside a busy pool and keeps the pool's jobs from waiting on other work (`prioritysys.rs`'s measurements).
+//!
+//! The same load as plain threads at the process's own priority is measured beside it and reported: it is what
+//! the pool's lower priority buys.
 
 #![allow(
     clippy::unwrap_used,
@@ -30,9 +36,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
-#[cfg(not(target_os = "linux"))]
-use hyper_rt::compute::Grant;
-use hyper_rt::compute::{self, Config, Step};
+use hyper_rt::compute::{self, Config, Grant, Rank, Step};
 use hyper_rt::runtime::{LocalRuntime, RuntimeConfig};
 
 /// The timer wheel's tick here, and so the lateness reading's resolution.
@@ -42,7 +46,7 @@ const PERIOD: Duration = Duration::from_millis(1);
 /// Samples a round: a p99 of 250 is its third-largest.
 const SAMPLES: usize = 250;
 /// Rounds of each arm.
-const ROUNDS: usize = 3;
+const ROUNDS: usize = 5;
 
 fn config() -> RuntimeConfig {
     RuntimeConfig {
@@ -149,7 +153,7 @@ fn median(mut values: Vec<u64>) -> u64 {
     values[values.len() / 2]
 }
 
-/// Where the load runs: on Linux one core shared with the shard, four pool threads on it; elsewhere the
+/// Where the load runs: on Linux one core shared with the shard, the pool sized for that grant; elsewhere the
 /// process's grant, a pool thread for each CPU but the shard's. Said for the report.
 fn placement() -> (usize, String) {
     #[cfg(target_os = "linux")]
@@ -158,7 +162,8 @@ fn placement() -> (usize, String) {
         let mut one = rustix::thread::CpuSet::new();
         one.set(here);
         rustix::thread::sched_setaffinity(None, &one).unwrap();
-        (4, format!("one core, CPU {here}, shared by the shard and the load"))
+        let grant = Grant::of_process();
+        (compute::workers_for(&grant, 1), format!("grant {grant} (CPU {here}), shared by the shard and the load"))
     }
     #[cfg(not(target_os = "linux"))]
     {
@@ -174,9 +179,13 @@ fn cpu_heavy_jobs_on_the_pool_leave_a_shards_request_loop_as_prompt_as_calm() {
         workers,
         queued: workers * 2,
         piece_ns: 250_000,
+        rank: Rank::Below,
     })
     .unwrap();
     let mut rt = LocalRuntime::new(&config()).unwrap();
+    // The shard (this thread) asks for a slice of its step, as kiln's shards do.
+    #[cfg(target_os = "linux")]
+    compute::prefer_current_thread(config().step_budget_ns).unwrap();
     let arms = [Load::Calm, Load::Pool(started.workers), Load::Threads(started.workers)];
     let mut p99s: Vec<Vec<u64>> = vec![Vec::new(); arms.len()];
     for round in 0..ROUNDS {
@@ -193,9 +202,12 @@ fn cpu_heavy_jobs_on_the_pool_leave_a_shards_request_loop_as_prompt_as_calm() {
         started.priority,
         compute::thread_priority()
     );
+    #[cfg(target_os = "linux")]
     assert!(
         median(pool.clone()) <= noise,
         "the shard's p99 lateness with the pool busy, {pool:?} ns, past the calm rounds' noise, {calm:?} ns plus a tick"
     );
+    #[cfg(not(target_os = "linux"))]
+    eprintln!("the pool's median p99 {} ns, against the calm rounds' noise of {noise} ns: reported, not held to here", median(pool.clone()));
     compute::stop().unwrap();
 }

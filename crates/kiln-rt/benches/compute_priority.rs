@@ -5,8 +5,8 @@
 //! alternate within each round, in reverse order every other round, so drift on the host falls on all.
 //!
 //! Arms: `calm` (no load), `plain` (the threads at the process's priority), and per OS the policies the pool
-//! could take: Linux `nice+10`, `batch`, `batch+nice+10` (the pool's, `compute::lower_current_thread`) and
-//! `idle` (`SCHED_IDLE`); macOS `utility` (the pool's) and `background`. Each arm's line: the medians over
+//! could take: Linux `nice+10`, `batch`, `Pool` (the pool's idle rank, `compute::lower_current_thread`) and
+//! `idle` (`SCHED_IDLE`); macOS `Pool` (its idle rank, background) and `background`. Each arm's line: the medians over
 //! rounds of each round's p50, p99 and p99.9 lateness, and the range of its p99s.
 //!
 //! `cargo bench -p hyper-rt --bench compute_priority -- [rounds] [samples]` (defaults 7 and 500). With
@@ -33,7 +33,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
-use hyper_rt::compute::{self, Grant};
+use hyper_rt::compute::{self, Grant, Rank};
 use hyper_rt::runtime::{LocalRuntime, RuntimeConfig};
 
 const PERIOD: Duration = Duration::from_millis(1);
@@ -93,12 +93,58 @@ fn set_policy(policy: libc::c_int) {
     assert_eq!(done, 0, "sched_setscheduler refused");
 }
 
+/// A load thread started by a shard given a short slice inherits it: its own goes back to the default.
+#[cfg(target_os = "linux")]
+fn default_slice() {
+    if std::env::var("SHARD_SLICE_NS").is_err() {
+        return;
+    }
+    let me = rustix::thread::gettid();
+    let nice = rustix::process::getpriority_process(Some(me)).unwrap();
+    let attr = libc::sched_attr {
+        size: std::mem::size_of::<libc::sched_attr>() as u32,
+        sched_policy: libc::SCHED_OTHER as u32,
+        sched_flags: 0,
+        sched_nice: nice,
+        sched_priority: 0,
+        sched_runtime: 0,
+        sched_deadline: 0,
+        sched_period: 0,
+    };
+    // SAFETY: a live sched_attr of its stated size, read for the call; pid 0 is the calling thread.
+    let _ = unsafe { libc::syscall(libc::SYS_sched_setattr, 0, &raw const attr, 0) };
+}
+
 /// Puts the calling (load) thread at the arm's priority.
 fn take_priority(arm: Arm) {
+    #[cfg(target_os = "linux")]
+    default_slice();
     match arm {
         Arm::Calm | Arm::Plain => {}
         Arm::Pool => {
-            compute::lower_current_thread().unwrap();
+            // `POOL_RANK=below`: the pool's rank below the shards that keeps a share of the CPU.
+            let rank = if std::env::var("POOL_RANK").is_ok_and(|r| r == "below") { Rank::Below } else { Rank::Idle };
+            compute::lower_current_thread(rank).unwrap();
+            // `POOL_SLICE_NS=n` (Linux): the pool's threads ask for an `n` ns slice too.
+            #[cfg(target_os = "linux")]
+            if let Some(slice) = std::env::var("POOL_SLICE_NS").ok().and_then(|n| n.parse::<u64>().ok()) {
+                let me = rustix::thread::gettid();
+                let nice = rustix::process::getpriority_process(Some(me)).unwrap();
+                // SAFETY: pid 0 is the calling thread; no pointer passes.
+                let policy = unsafe { libc::sched_getscheduler(0) };
+                let attr = libc::sched_attr {
+                    size: std::mem::size_of::<libc::sched_attr>() as u32,
+                    sched_policy: policy as u32,
+                    sched_flags: 0,
+                    sched_nice: nice,
+                    sched_priority: 0,
+                    sched_runtime: slice,
+                    sched_deadline: 0,
+                    sched_period: 0,
+                };
+                // SAFETY: a live sched_attr of its stated size, read for the call; pid 0 is the calling thread.
+                assert_eq!(unsafe { libc::syscall(libc::SYS_sched_setattr, 0, &raw const attr, 0) }, 0);
+            }
         }
         #[cfg(target_os = "linux")]
         Arm::Nice => {
@@ -193,10 +239,31 @@ fn main() {
     // macOS: `SHARD_QOS=default` puts the shard (this thread, and the load threads it starts) at the default
     // class, as a server runs, where a runner starts its commands at utility.
     #[cfg(target_os = "macos")]
-    if std::env::var("SHARD_QOS").is_ok_and(|q| q == "default") {
+    if let Ok(q) = std::env::var("SHARD_QOS") {
+        let class = if q == "interactive" { libc::qos_class_t::QOS_CLASS_USER_INTERACTIVE } else { libc::qos_class_t::QOS_CLASS_DEFAULT };
         // SAFETY: no pointer passes; only the calling thread's class changes.
-        let done = unsafe { libc::pthread_set_qos_class_self_np(libc::qos_class_t::QOS_CLASS_DEFAULT, 0) };
-        println!("the shard asked for the default class: {done}");
+        let done = unsafe { libc::pthread_set_qos_class_self_np(class, 0) };
+        println!("the shard asked for the {q} class: {done}");
+    }
+    // Linux: `SHARD_SLICE_NS=n` asks EEVDF for an `n` ns slice for the shard (sched_attr's sched_runtime on
+    // SCHED_OTHER, Linux 6.12+): a waking task with a shorter slice than the running one's preempts it.
+    #[cfg(target_os = "linux")]
+    if let Some(slice) = std::env::var("SHARD_SLICE_NS").ok().and_then(|n| n.parse::<u64>().ok()) {
+        let me = rustix::thread::gettid();
+        let nice = rustix::process::getpriority_process(Some(me)).unwrap();
+        let attr = libc::sched_attr {
+            size: std::mem::size_of::<libc::sched_attr>() as u32,
+            sched_policy: libc::SCHED_OTHER as u32,
+            sched_flags: 0,
+            sched_nice: nice,
+            sched_priority: 0,
+            sched_runtime: slice,
+            sched_deadline: 0,
+            sched_period: 0,
+        };
+        // SAFETY: a live sched_attr of its stated size, read for the call; pid 0 is the calling thread.
+        let done = unsafe { libc::syscall(libc::SYS_sched_setattr, 0, &raw const attr, 0) };
+        println!("the shard asked for a {slice} ns slice: {done}");
     }
     println!("grant: {grant}; {threads} load threads; the shard at {}", compute::thread_priority());
     let mut rt = LocalRuntime::new(&config()).unwrap();

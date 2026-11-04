@@ -67,7 +67,6 @@ pub fn keep_assets(data_dir: &Path) {
         }
     }
     let _ = KEPT.set(dir);
-    warm();
 }
 
 /// The file an asset path names (`assets/<name>`): a plain file name, nothing that leaves the
@@ -110,7 +109,8 @@ fn brotli(name: &str, data: &[u8]) -> Option<Bytes> {
 }
 
 /// `name` packed (brotli or gzip, by its cache), made already; else none now, and both made on the
-/// blocking pool for the next request (once at a time for a file).
+/// compute pool for the next request (once at a time for a file): CPU work, which held a place of the
+/// blocking pool's, meant for calls that block (goal 3, plan 01a1a59c2a8e step 4).
 fn packed(name: &str, data: &Bytes, cache: &'static Mutex<HashMap<String, Bytes>>) -> Option<(Bytes, &'static str)> {
     let coding = if std::ptr::eq(cache, br_cache()) { "br" } else { "gzip" };
     if let Some(b) = cache.lock().get(name) {
@@ -122,7 +122,7 @@ fn packed(name: &str, data: &Bytes, cache: &'static Mutex<HashMap<String, Bytes>
         let (name, data) = (name.to_owned(), data.clone());
         drop(crate::rt::spawn(async move {
             let n = name.clone();
-            let _ = crate::rt::blocking(move || {
+            let _ = crate::rt::compute(move || {
                 let _ = brotli(&n, &data);
                 let _ = gzip(&n, &data);
             })
@@ -143,15 +143,22 @@ fn accepts(header: Option<&str>, coding: &str) -> bool {
     })
 }
 
-/// Compresses every embedded file that's worth it, both ways, so no request has to wait for it.
-fn warm() {
-    for name in Assets::iter() {
-        let Some(f) = Assets::get(&name) else { continue };
-        let mime = mime_guess::from_path(name.as_ref()).first_or_octet_stream();
+/// Compresses every embedded file that's worth it, both ways, so no request has to wait for it: on the
+/// compute pool, a file at a time (goal 3, plan 01a1a59c2a8e step 4: CPU work, which held one of the
+/// blocking pool's places for as long as every file took, written out with the assets' files).
+pub async fn warm() {
+    let names: Vec<String> = Assets::iter().map(|n| n.into_owned()).collect();
+    let made = crate::rt::compute_map(names, |name| {
+        let Some(f) = Assets::get(&name) else { return };
+        let mime = mime_guess::from_path(&name).first_or_octet_stream();
         if compressible(mime.as_ref()) && f.data.len() > 1024 {
             let _ = brotli(&name, &f.data);
             let _ = gzip(&name, &f.data);
         }
+    })
+    .await;
+    if let Err(e) = made {
+        tracing::warn!(error = %format!("{e:#}"), "the UI's files weren't compressed ahead: each is as it's first asked for");
     }
 }
 

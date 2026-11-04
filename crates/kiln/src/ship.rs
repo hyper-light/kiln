@@ -1625,14 +1625,15 @@ pub async fn list_in(store: &crate::store::Store, q: &HashMap<String, String>, o
         .await
         .map_err(internal)?;
     let more = recs.len() > usize::try_from(limit).unwrap_or(usize::MAX);
-    let page: Vec<Value> = recs
-        .iter()
-        .take(usize::try_from(limit).unwrap_or(30))
-        .map(|r| {
-            let x = render(r, &runners, now);
-            if holds(&x.whose, viewer) { x.yours.unwrap_or(x.others) } else { x.others }
-        })
-        .collect();
+    // The page's rows drawn on the compute pool, a commit a unit (goal 3, plan 01a1a59c2a8e step 5),
+    // not on the request's shard.
+    let viewer = viewer.cloned();
+    let page: Vec<Value> = crate::rt::compute_map(recs.into_iter().take(usize::try_from(limit).unwrap_or(30)).collect(), move |r| {
+        let x = render(&r, &runners, now);
+        if holds(&x.whose, viewer.as_ref()) { x.yours.unwrap_or(x.others) } else { x.others }
+    })
+    .await
+    .map_err(internal)?;
     let next = if more { page.last().and_then(|c| c.get("cursor")).cloned() } else { None };
     Ok(json!({ "commits": page, "next_cursor": next }))
 }
@@ -1717,6 +1718,9 @@ struct Row {
     host: Option<String>,
     stand: journey::Stand,
     agent: Option<String>,
+    /// What time moves without a record changing: its guard or its soak runs down. Drawn again at
+    /// each refresh, as production's commit is.
+    moves: bool,
 }
 
 impl Row {
@@ -1725,7 +1729,16 @@ impl Row {
         let text = |v: &Value| serde_json::to_string(v).map_err(|e| internal(e.into()));
         let (others, yours) = (text(&x.others)?, x.yours.as_ref().map(text).transpose()?);
         let (kind, host) = (kind_of(&rec), rec.change.as_ref().map(|c| c.host.clone()));
-        Ok(Self { rec, others, yours, whose: x.whose, kind, host, stand: x.stand, agent: x.agent })
+        let moves = others.contains("\"guard\"") || others.contains("\"soaking\"");
+        Ok(Self { rec, others, yours, whose: x.whose, kind, host, stand: x.stand, agent: x.agent, moves })
+    }
+
+    /// Each commit's row of `items`, drawn on the compute pool, a commit a unit of each piece (goal 3,
+    /// plan 01a1a59c2a8e step 5): a render and its JSON each, which drawn on the request's shard held
+    /// every other request on that shard for as long as the drawing took.
+    async fn draw<K: Send + 'static>(items: Vec<(K, Records)>, runners: &[RunnerSeen], now: i64) -> Result<Vec<(K, Row)>, Fail> {
+        let runners = runners.to_vec();
+        crate::rt::compute_map(items, move |(key, rec)| Row::of(rec, &runners, now).map(|row| (key, row))).await.map_err(internal)?.into_iter().collect()
     }
 
     fn json(&self, viewer: Option<&HashSet<String>>) -> &str {
@@ -1880,16 +1893,45 @@ impl ShipCache {
             })
             .await
             .map_err(internal)?;
-        // Each loaded commit's row drawn before the model's lock is taken (a render and its JSON
-        // each): every page that reads the model waits on its write lock, on every shard.
+        // Each loaded commit's row drawn on the compute pool, before the model's lock is taken (a
+        // render and its JSON each): every page that reads the model waits on its write lock, on
+        // every shard, and the drawing on the request's shard held up every request on it.
+        let mut items = Vec::new();
         let mut loaded = Vec::with_capacity(read.loaded.len());
-        for (ctx, recs, all, drop) in read.loaded {
-            let mut rows = Vec::with_capacity(recs.len());
-            for rec in recs {
-                rows.push((rec.sha.clone(), Row::of(rec, runners, now)?));
-            }
-            loaded.push((ctx, rows, all, drop));
+        for (i, (ctx, recs, all, drop)) in read.loaded.into_iter().enumerate() {
+            items.extend(recs.into_iter().map(|rec| (i, rec)));
+            loaded.push((ctx, Vec::new(), all, drop));
         }
+        for (i, row) in Row::draw(items, runners, now).await? {
+            if let Some((_, rows, _, _)) = loaded.get_mut(i) {
+                rows.push((row.rec.sha.clone(), row));
+            }
+        }
+        // What time and the runners move without a record changing: the guard and the soak run
+        // down, and the commit production runs replants. Those few are drawn again, on the pool too,
+        // from their records as held: the rows a repository's reload doesn't draw afresh.
+        let again = {
+            let h = self.held.read().map_err(|_| poisoned())?;
+            let mut again: Vec<((String, String), Records)> = Vec::new();
+            for held in h.repos.values() {
+                let fresh = loaded.iter().find(|(ctx, _, _, _)| ctx.id == held.ctx.id);
+                if fresh.is_some_and(|(_, _, all, _)| *all) {
+                    continue;
+                }
+                let ctx = fresh.map_or(&held.ctx, |(ctx, _, _, _)| ctx);
+                let prod = ctx.current.iter().find(|d| d.production).map(|d| d.sha.as_str());
+                for (sha, row) in &held.rows {
+                    if fresh.is_some_and(|(_, rows, _, _)| rows.iter().any(|(s, _)| s == sha)) {
+                        continue;
+                    }
+                    if prod == Some(sha.as_str()) || row.moves {
+                        again.push(((held.ctx.id.clone(), sha.clone()), row.rec.clone()));
+                    }
+                }
+            }
+            again
+        };
+        let again = Row::draw(again, runners, now).await?;
         let mut h = self.held.write().map_err(|_| poisoned())?;
         if read.top < h.seq {
             return Ok(());
@@ -1920,14 +1962,10 @@ impl ShipCache {
             held.total = ctx.commits.len();
             held.ctx = ctx;
         }
-        // What time and the runners move without a record changing: the guard and the soak run
-        // down, and the commit production runs replants. Those few are drawn again.
-        for held in h.repos.values_mut() {
-            let prod = held.ctx.current.iter().find(|d| d.production).map(|d| d.sha.clone());
-            for (sha, row) in held.rows.iter_mut() {
-                if prod.as_deref() == Some(sha.as_str()) || row.others.contains("\"guard\"") || row.others.contains("\"soaking\"") {
-                    *row = Row::of(std::mem::take(&mut row.rec), runners, now)?;
-                }
+        // The rows drawn again, where their commit is still held.
+        for ((id, sha), row) in again {
+            if let Some(slot) = h.repos.values_mut().find(|r| r.ctx.id == id).and_then(|r| r.rows.get_mut(&sha)) {
+                *slot = row;
             }
         }
         h.seq = read.top;
@@ -3503,6 +3541,71 @@ mod tests {
                 assert!(p100.2 < 200.0, "limit=100 p99 {:.1} µs is 0.2 ms or more", p100.2);
                 assert!(one.2 < 200.0, "detail p99 {:.1} µs is 0.2 ms or more", one.2);
             }
+            Ok(())
+        })
+    }
+
+    /// A future's longest poll: how long one of its polls held its thread at the most.
+    struct Longest<F> {
+        inner: std::pin::Pin<Box<F>>,
+        most: std::time::Duration,
+    }
+
+    impl<F: std::future::Future> std::future::Future for Longest<F> {
+        type Output = (F::Output, std::time::Duration);
+        fn poll(mut self: std::pin::Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> std::task::Poll<Self::Output> {
+            let t = std::time::Instant::now();
+            let polled = self.inner.as_mut().poll(cx);
+            self.most = self.most.max(t.elapsed());
+            polled.map(|v| (v, self.most))
+        }
+    }
+
+    /// Goal 3, plan 01a1a59c2a8e step 5 (perf/api-pass's leftover): the ship page's rows are drawn on
+    /// the compute pool, not on the shard of the request that brings the model up to date. Building
+    /// the model of 1,000 commits (4 runs of 2 legs each), no poll of the refresh holds its thread
+    /// for a fifth of what drawing the rows takes; drawn on the shard, the drawing was one poll.
+    #[test]
+    fn g3_s5_the_ship_pages_rows_are_drawn_off_the_requests_shard() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let store = crate::store::Store::open(&dir.path().join("kiln.db"))?;
+        crate::rt::block_on(async move {
+            store
+                .call(|c| {
+                    let tx = c.savepoint()?;
+                    tx.execute("INSERT INTO repos (id, name, clone_url, created_at) VALUES ('kiln', 'hyper-light/kiln', 'https://example.invalid/kiln.git', 1)", [])?;
+                    let mut run = tx.prepare("INSERT INTO runs (id, repo_id, number, pipeline, event, branch, sha, message, author, status, created_at, attempt) VALUES (?1, 'kiln', ?2, ?3, 'push', 'main', ?4, 'a change', 'ada', 'completed', ?5, 1)")?;
+                    let mut leg = tx.prepare("INSERT INTO jobs (id, run_id, key, display, status, conclusion, labels, needs, spec, job_id, run_attempt) VALUES (?1, ?2, ?3, ?3, 'completed', 'success', '[]', '[]', '{}', ?3, 1)")?;
+                    let mut n = 0i64;
+                    for commit in 0..1000i64 {
+                        let sha = format!("{commit:07x}{}", "a".repeat(33));
+                        for pipeline in ["ci", "e2e", "sim", "release"] {
+                            n += 1;
+                            let id = format!("r{n}");
+                            run.execute(params![id, n, pipeline, sha, NOW_S + n])?;
+                            for k in 0..2 {
+                                leg.execute(params![format!("{id}l{k}"), id, format!("{pipeline} leg {k}")])?;
+                            }
+                        }
+                    }
+                    drop((run, leg));
+                    tx.commit()?;
+                    Ok(())
+                })
+                .await?;
+            let cache = ShipCache::new();
+            let now = NOW_S * 1000;
+            let (built, longest) = Longest { inner: Box::pin(cache.refresh(&store, &runners(), &[], now)), most: std::time::Duration::ZERO }.await;
+            built.map_err(|(_, m)| anyhow::anyhow!(m))?;
+            // What drawing every row takes, on this thread.
+            let recs: Vec<Records> = cache.held.read().map_err(|_| anyhow::anyhow!("the model's lock was poisoned"))?.repos.values().flat_map(|r| r.rows.values().map(|row| row.rec.clone())).collect();
+            anyhow::ensure!(recs.len() == 1000, "{} commits held", recs.len());
+            let t = std::time::Instant::now();
+            for rec in recs {
+                Row::of(rec, &runners(), now).map_err(|(_, m)| anyhow::anyhow!(m))?;
+            }
+            let draw = t.elapsed();
+            anyhow::ensure!(longest * 5 < draw, "the refresh held its thread {longest:?} in one poll; drawing the rows takes {draw:?}");
             Ok(())
         })
     }
