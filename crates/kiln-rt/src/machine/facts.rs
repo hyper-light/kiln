@@ -328,6 +328,18 @@ impl Facts {
     }
 }
 
+/// The count of the cores this process may run on ([`Facts::cores`]) and the CPU budget a cgroup grants it
+/// ([`Facts::cpu_budget`]), without the rest of the facts: a handful of queries where [`Facts::query`] reads
+/// every core's class and caches. The compute pool's size (`crate::compute::Grant`; kiln's departure,
+/// ORIGIN.md).
+pub fn cpu_grant() -> (usize, Option<CpuBudget>) {
+    let mut notes = Vec::new();
+    (
+        platform::allowed_count(&mut notes),
+        platform::cpu_budget(&mut notes),
+    )
+}
+
 /// What the OS reports as locked (wired) for this process, for cross-checking a locking
 /// sequence against the OS (AC-0.5): Linux `VmLck` from `/proc/self/status`, macOS `ri_wired_size`
 /// from `proc_pid_rusage`; `None` where the OS has no such report.
@@ -526,6 +538,11 @@ mod platform {
             address_bits: usize::BITS,
             limit: None,
         }
+    }
+
+    /// The cores the process may run on: every logical CPU, as macOS keeps no affinity mask.
+    pub(super) fn allowed_count(_notes: &mut Vec<String>) -> usize {
+        usize::try_from(parallelism()).unwrap_or(usize::MAX)
     }
 
     /// macOS has no cgroups; the process's memory bound is its rlimits alone.
@@ -767,6 +784,11 @@ mod platform {
             ));
         }
         cores
+    }
+
+    /// How many CPUs the calling thread may run on ([`allowed_cores`]).
+    pub(super) fn allowed_count(notes: &mut Vec<String>) -> usize {
+        allowed_cores(notes).len()
     }
 
     /// The CPUs the calling thread may run on, by the kernel's ids: its affinity mask, which a cpuset
@@ -1209,6 +1231,12 @@ mod platform {
             GetProcessAffinityMask(GetCurrentProcess(), &raw mut process, &raw mut system)
         };
         (ok != 0 && process != 0).then_some(process)
+    }
+
+    /// How many logical processors the process's affinity mask holds ([`process_affinity_mask`]); none when
+    /// the query is refused.
+    pub(super) fn allowed_count(_notes: &mut Vec<String>) -> usize {
+        process_affinity_mask().map_or(0, |mask| usize::try_from(mask.count_ones()).unwrap_or(0))
     }
 
     /// Windows has no cgroups; a job object's CPU rate limit is the counterpart, owed with its memory limit.

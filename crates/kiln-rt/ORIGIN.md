@@ -33,14 +33,18 @@ touching the copy Focal, Mantle and Quiver share.
 
 ## What differs from upstream
 
-Behavior: nothing. `src/`, `tests/` and `benches/` are upstream's but for the two calls below;
-`diff -r vendor/hyper-raft/crates/hyper-rt crates/kiln-rt` shows each row.
+Behavior: upstream's, and one addition of kiln's own, the compute pool. `src/`, `tests/` and `benches/` are
+upstream's but for the rows below; `diff -r vendor/hyper-raft/crates/hyper-rt crates/kiln-rt` shows each row.
 
 | File | Change | Why |
 |---|---|---|
 | `Cargo.toml` | hyper-raft's workspace values written out as inheriting them gave (version 0.1.0, edition 2024, rust-version 1.98.1, each dependency's version and features, the lint table); license and repository from kiln's workspace; `hyper-measure` by name, which kiln's `[patch.crates-io]` points at `vendor/hyper-raft/crates/hyper-measure` | a member of kiln's workspace inherits kiln's values: version 0.2.0, kiln's lint table, no `cfg(loom)` among the expected cfgs |
 | `clippy.toml` | new: hyper-raft's root `clippy.toml`, less raft-proto's accessors and the no-`Arc` entry, with parking_lot's locks refused | clippy reads the `clippy.toml` nearest a crate's manifest, and hyper-raft's root isn't in kiln; the lockless rule below |
 | `src/sync/mod.rs` | `Semaphore::try_acquire` and `Acquire::poll` call `AtomicU64::try_update` where upstream calls `fetch_update` | Rust 1.99 deprecates `fetch_update`, renamed `try_update`, and kiln's clippy runs `-D warnings` on stable (1.99.1); upstream pins 1.98.1, which has both names (Mantle builds kiln-rt on it). The same function under its new name: no behavior changes. Upstream's to take when it moves past 1.98 |
+| `src/compute.rs`, `src/prioritysys.rs`, `tests/compute.rs`, `tests/compute_beside.rs`, `benches/compute_priority.rs` | new: the compute pool, a small work-stealing pool for CPU-heavy jobs (snapshots, serialization, compression, diffs, hashing) as many threads as the CPU the process is granted less its shards, each at a lower OS priority than the shards (Linux `SCHED_IDLE`, macOS background QoS, Windows below normal: on Linux and macOS the policies that kept a shard's wakes at their calm lateness in `benches/compute_priority.rs`, where `SCHED_BATCH`, nice and utility QoS didn't), jobs in pieces of a configured time that give their thread to a waiting job, results by one-shot; `prioritysys.rs` is its OS-interface file, each `unsafe` block with its `SAFETY` line | kiln's departure (goal 3 of the API runtime program, plan `01a1a59c2a8e`): heavy work off the shards, without taking the blocking pool's places. Stays here |
+| `src/machine/facts.rs` | new `cpu_grant()`, with each platform's `allowed_count` | the compute pool's size: the cores the process may run on and its cgroup's CPU budget, without `Facts::query`'s reads of every core's class and caches. Stays here |
+| `src/lib.rs` | `pub mod compute;`, `mod prioritysys;`, and a line of the module list | the compute pool |
+| `Cargo.toml` (dependencies, benches) | `crossbeam-deque`; the `compute_priority` bench | the compute pool's queues: Chase and Lev's deque and a lock-free injector, no lock on any path, already in kiln's lock file through rayon |
 | `ORIGIN.md` | this file, upstream's below | |
 
 ## The rules
