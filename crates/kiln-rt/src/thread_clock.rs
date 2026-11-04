@@ -227,16 +227,69 @@ pub(crate) fn os_thread() -> Option<u64> {
 /// uninterruptibly, usually for a disk). `None` for any other state or a read refused.
 #[cfg(all(target_os = "linux", not(miri)))]
 pub(crate) fn runnable(_clock: u64, os_thread: u64) -> Option<bool> {
+    /// Shape: the stat line through its state field: the pid, a command of at most 64 bytes in parentheses
+    /// (`TASK_COMM_LEN` is 16; `proc(5)` allows 64 for kernel threads) and the state, with room to spare.
+    const STAT: usize = 256;
     if os_thread == 0 {
         return None;
     }
-    let stat = std::fs::read_to_string(format!("/proc/self/task/{os_thread}/stat")).ok()?;
-    let (_, after) = stat.rsplit_once(')')?;
-    match after.trim_start().chars().next()? {
-        'R' => Some(true),
-        'S' | 'D' => Some(false),
+    // Built on the stack and read into it: the watchdog that asks allocates nothing once started
+    // (`crate::watch::Watchdog`).
+    let (path, len) = task_stat_path(os_thread)?;
+    let path = std::ffi::CStr::from_bytes_with_nul(path.get(..len)?).ok()?;
+    let file = rustix::fs::open(path, rustix::fs::OFlags::RDONLY | rustix::fs::OFlags::CLOEXEC, rustix::fs::Mode::empty()).ok()?;
+    let mut stat = [0u8; STAT];
+    let read = rustix::io::read(&file, &mut stat).ok()?;
+    // The state follows the command's closing parenthesis and a space; the command may hold parentheses.
+    let stat = stat.get(..read)?;
+    let close = stat.iter().rposition(|byte| *byte == b')')?;
+    match stat.get(close.checked_add(2)?)? {
+        b'R' => Some(true),
+        b'S' | b'D' => Some(false),
         _ => None,
     }
+}
+
+/// Shape: the path `/proc/self/task/<tid>/stat` and its NUL, a `u64`'s twenty digits at the most.
+#[cfg(all(target_os = "linux", not(miri)))]
+const TASK_STAT_PATH: usize = 64;
+
+/// `/proc/self/task/<os_thread>/stat`, NUL-ended, in a buffer on the stack, and its length with the NUL.
+#[cfg(all(target_os = "linux", not(miri)))]
+fn task_stat_path(os_thread: u64) -> Option<([u8; TASK_STAT_PATH], usize)> {
+    let mut path = [0u8; TASK_STAT_PATH];
+    let mut at = 0usize;
+    let (digits, len) = decimal(os_thread);
+    for part in [&b"/proc/self/task/"[..], digits.get(..len)?, &b"/stat\0"[..]] {
+        let end = at.checked_add(part.len())?;
+        path.get_mut(at..end)?.copy_from_slice(part);
+        at = end;
+    }
+    Some((path, at))
+}
+
+/// Format: a `u64`'s decimal digits at the most.
+#[cfg(all(target_os = "linux", not(miri)))]
+const U64_DIGITS: usize = 20;
+
+/// `n`'s decimal digits, most significant first, on the stack, and how many.
+#[cfg(all(target_os = "linux", not(miri)))]
+fn decimal(mut n: u64) -> ([u8; U64_DIGITS], usize) {
+    let mut digits = [0u8; U64_DIGITS];
+    let mut len = 0usize;
+    // Least significant first, turned around at the end.
+    while let Some(digit) = digits.get_mut(len) {
+        *digit = b'0'.saturating_add(u8::try_from(n % 10).unwrap_or(0));
+        len = len.saturating_add(1);
+        n /= 10;
+        if n == 0 {
+            break;
+        }
+    }
+    if let Some(used) = digits.get_mut(..len) {
+        used.reverse();
+    }
+    (digits, len)
 }
 
 /// Whether the thread whose clock handle is `clock` (its Mach port, tagged) is runnable now rather than waiting:
@@ -291,6 +344,20 @@ fn nanos(seconds: u64, nanos: u64) -> Option<u64> {
 
 #[cfg(test)]
 mod tests {
+    /// The watchdog's /proc path is built on the stack, digits and all.
+    #[cfg(all(target_os = "linux", not(miri)))]
+    #[test]
+    fn a_task_s_stat_path_is_built_on_the_stack() {
+        for (tid, expected) in [(0u64, "/proc/self/task/0/stat"), (7, "/proc/self/task/7/stat"), (1_234_567, "/proc/self/task/1234567/stat"), (u64::MAX, "/proc/self/task/18446744073709551615/stat")] {
+            let (path, len) = super::task_stat_path(tid).unwrap();
+            assert_eq!(&path[..len - 1], expected.as_bytes(), "{tid}");
+            assert_eq!(path[len - 1], 0);
+        }
+        // This thread runs as it asks: runnable.
+        let me = super::os_thread().unwrap();
+        assert_eq!(super::runnable(0, me), Some(true));
+    }
+
     /// §4.14. Do: take the calling thread's clock handle, spin a while, and read it from another thread. Expect: a
     /// reading on every platform with a clock (Linux, macOS, Windows), whose progress grew with the spin and whose time
     /// did not go back.

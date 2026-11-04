@@ -46,7 +46,7 @@ use std::panic::Location;
 use loom::sync::atomic::{AtomicBool, AtomicPtr, AtomicU8, AtomicU64, Ordering, fence};
 #[cfg(not(loom))]
 use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicU8, AtomicU64, Ordering, fence};
-use std::sync::mpsc::{Receiver, RecvTimeoutError, SyncSender, sync_channel};
+use std::sync::mpsc::{Receiver, SyncSender, TryRecvError, sync_channel};
 use std::thread::JoinHandle;
 use std::time::Duration;
 
@@ -503,45 +503,72 @@ fn off_cpu(holder: SlotHolder) -> Whose {
 }
 
 /// A runtime's watchdog: its thread, stopped and joined when this drops.
+///
+/// **It allocates nothing once started**: what it keeps is made on the starting thread and moved to it, it waits
+/// by parking (std's channel would make its waiter's context at its first blocking receive) and reads the stop
+/// by a receive that never blocks, and `start` returns only once the thread runs. So a runtime's work measured
+/// for allocations (kiln-rt's `tests/service_driverless_receipts.rs` counts every allocation in the process) never
+/// counts one of the watchdog's, as it did while it built its list and its channel's waiter on its own thread,
+/// whenever the OS first ran it.
 #[derive(Debug)]
 pub(crate) struct Watchdog {
-    /// Dropped to stop the thread, whose wait between looks ends at once.
+    /// Dropped to stop the thread, which is unparked to see it.
     stop: Option<SyncSender<()>>,
     thread: Option<JoinHandle<()>>,
 }
 
 impl Watchdog {
-    /// Starts watching `holders`, the shards of a runtime built from `config`.
+    /// Starts watching `holders`, the shards of a runtime built from `config`; returns once its thread runs.
     pub(crate) fn start(
         holders: Vec<SlotHolder>,
         config: &crate::runtime::RuntimeConfig,
     ) -> Result<Watchdog, RtError> {
         let limits = Limits::of(config);
+        let now = crate::machine::clock::monotonic_ns();
+        let shards: Vec<Watched> = holders
+            .into_iter()
+            .map(|holder| Watched::new(holder, now))
+            .collect();
         let (stop, stopped) = sync_channel(1);
+        let (running, started) = sync_channel(1);
         #[allow(
             clippy::disallowed_methods,
             reason = "a runtime's watchdog is one thread outside its shards that it starts and joins (kiln's goal 6, crate::watch)"
         )]
         let thread = std::thread::Builder::new()
             .name("kiln-rt-watchdog".into())
-            .spawn(move || watch(holders, limits, &stopped))
+            .spawn(move || {
+                let _ = running.send(());
+                // Let go now, while the starting thread still holds its end: the channel is freed there.
+                drop(running);
+                watch(shards, limits, &stopped);
+            })
             .map_err(|error| RtError::DriverRefused {
                 call: "thread spawn",
                 code: error.raw_os_error(),
             })?;
-        Ok(Watchdog {
+        let mut watchdog = Watchdog {
             stop: Some(stop),
             thread: Some(thread),
-        })
+        };
+        if started.recv().is_err() {
+            watchdog.stop();
+            return Err(RtError::DriverRefused {
+                call: "thread spawn",
+                code: None,
+            });
+        }
+        Ok(watchdog)
     }
 
     /// Stops the thread and joins it.
     pub(crate) fn stop(&mut self) {
         drop(self.stop.take());
-        if let Some(thread) = self.thread.take()
-            && thread.join().is_err()
-        {
-            registry::note_unreported_failure();
+        if let Some(thread) = self.thread.take() {
+            thread.thread().unpark();
+            if thread.join().is_err() {
+                registry::note_unreported_failure();
+            }
         }
     }
 }
@@ -553,18 +580,16 @@ impl Drop for Watchdog {
 }
 
 /// The watchdog's thread: looks at every shard each half limit until its runtime drops its end of `stopped`.
-fn watch(holders: Vec<SlotHolder>, limits: Limits, stopped: &Receiver<()>) {
-    let start = crate::machine::clock::monotonic_ns();
-    let mut shards: Vec<Watched> = holders
-        .into_iter()
-        .map(|holder| Watched::new(holder, start))
-        .collect();
+fn watch(mut shards: Vec<Watched>, limits: Limits, stopped: &Receiver<()>) {
     let mut held: Option<Box<SpawnRequest>> = None;
     let mut every_ns = limits.look_every_ns(limits.limit_ns(limits.fixed_quantum_ns));
-    // Until the runtime drops its end (or sends on it): a wait that ends by its timeout is a look.
-    while let Err(RecvTimeoutError::Timeout) =
-        stopped.recv_timeout(Duration::from_nanos(every_ns))
-    {
+    loop {
+        // A wait that ends early (a spurious unpark) only looks sooner.
+        std::thread::park_timeout(Duration::from_nanos(every_ns));
+        // Until the runtime drops its end (or sends on it).
+        if !matches!(stopped.try_recv(), Err(TryRecvError::Empty)) {
+            break;
+        }
         let now = crate::machine::clock::monotonic_ns();
         let shortest = shards
             .iter_mut()
