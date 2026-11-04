@@ -1207,6 +1207,11 @@ pub fn render() -> String {
     crate::route_latency::render(&mut o);
     crate::overload::render(&mut o);
     crate::pool_health::render(&mut o);
+    // What the server's memory holds, by owner (goal 11, plan 01a1a87b2e56 step 3): the bus keeps its own
+    // count and its limit ([bus] memory).
+    let bus = bus_gauges();
+    let bus = (u64::try_from(bus.memory_bytes.get()).unwrap_or(0), u64::try_from(bus.memory_limit_bytes.get()).ok().filter(|l| *l > 0));
+    crate::memory::render(&mut o, &[("bus", bus.0, bus.1)]);
 
     let samples = agent_samples().read();
     if !samples.is_empty() {
