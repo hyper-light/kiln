@@ -455,9 +455,10 @@ Each round's `server.shed.background` and `server.shed.normal` are the sheds by 
 In process, `crates/kiln/tests/overload.rs` shows both detectors at work on kiln's own HTTP server with
 shedding on: busy tasks of each class flooding every shard shed Background requests, then Normal ones,
 while Critical ones are served (at a 0.56 ms median); and a backlog in the blocking pool's `store` share
-while every shard is calm (its jobs held about 200 ms each, then 1.5 s) sheds Background requests at the
-first, Normal ones only past the tolerance, never Critical ones (served at a 0.08 ms median), and
-`/readyz` says not ready, naming the share, while the API is shed. Sheds are counted by class in both.
+while every shard is calm (its jobs waiting about 200 ms each for a place, then 1.5 s) sheds Background
+requests at the first, Normal ones only past the tolerance, never Critical ones (served at a 0.08 ms
+median), and `/readyz` says not ready, naming the share, while the API is shed. Sheds are counted by
+class in both.
 
 ## What the lab doesn't do yet
 
