@@ -579,10 +579,10 @@ those the file lists, each with why it's off the hot path, or (`todo`) what repl
 a lock in a copy of the hub and holds the check to failing on it.
 
 Still on the hot path, listed so (`todo`): the hub's runners (`agents`) and runner processes
-(`instances`), which `harness/registry.rs` takes too and wait on goal 4's rewrite of it; reach's relay
-(`reach`), each relayed frame's in the hub's loop; and a live job's files (`logs.rs`'s `files`), one per
-job, its writers' alone. Inside Quiver (vendored, the bus's node): its topics' map and each topic's tail,
-for Quiver's own change.
+(`instances`), which `harness/registry.rs` takes too, next now that goal 4's rewrite of it is on main;
+reach's relay (`reach`), each relayed frame's in the hub's loop; and a live job's files (`logs.rs`'s
+`files`), one per job, its writers' alone. Inside Quiver (vendored, the bus's node): its topics' map and
+each topic's tail, for Quiver's own change.
 
 ## What the lab doesn't do yet
 
