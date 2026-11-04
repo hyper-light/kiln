@@ -6418,6 +6418,8 @@ mod tests {
             slow: crate::shard_health::Slow::default(),
             longest_poll: Duration::ZERO,
             overrun: Duration::ZERO,
+            tasks: 0,
+            most_tasks: 0,
         };
         assert_eq!(worst_delay([shard(9, 80, Some(4)), shard(9, 2_000, Some(7))].into_iter(), period), Some(Duration::from_micros(2_000)));
         // Held now: 1.5 s since its probe, past its 10 ms period.
