@@ -13,25 +13,29 @@
 //! ([`tick`]), with no probe of this module's own: the API's (Normal) detector reads the shard's delay, how late
 //! the probe, a Normal task, ran; Background's reads what the shard's Background tasks waited from joining a
 //! ready list to their polls (`Counters::queue_ns_background`). Each detector is headroom's CUSUM on
-//! log-latency against the calm it learns (`kiln_ci::headroom::detect`), its threshold calibrated on the calm
-//! excursions that ended without harm against a false-alarm budget. Background requests on a shard whose
-//! Background or Normal detector alarms are answered 503 at once, before their bodies are read, with
-//! `Retry-After` and `x-kiln-shed` saying which class was shed; Normal ones too while the Normal detector
-//! alarms; Critical never ([`shed`]). Every number is the platform's or a person's, not picked here:
+//! log-latency against the calm it learns (`kiln_ci::headroom::detect`): each sample past its reference, half
+//! the log-distance from the calm to the tolerance, adds to its evidence of a shift, and each sample under it
+//! takes away. A shard sheds a class once that evidence passes one reference, what a single sample at the
+//! tolerance gives, or once a sample reaches the tolerance itself ([`sheds_now`]): a lone late probe is no
+//! overload, a delay that stays is. Headroom also raises its threshold on the false alarms it has seen end
+//! without its acting, against a budget a day; here every alarm that sheds acts at once, so none of its
+//! excursions is noise to learn from (`lag_us` 0), and the one-reference floor is what holds a lone late probe
+//! back. Background requests on a shard that sheds Background, by either detector, are answered 503 at once,
+//! before their bodies are read, with `Retry-After` and `x-kiln-shed` saying which class was shed; Normal ones
+//! too while the Normal detector sheds; Critical never ([`shed`]). Every number is the platform's, a person's or
+//! the shard's own, not picked here:
 //! - the period, 10 ms: goal 1's probes', Node's `monitorEventLoopDelay` default (research 01a1a59c2abf, f20);
 //! - the tolerance, a queueing delay that is harm at once: Kubernetes' default probe timeout, 1 s
 //!   (`crate::headroom::settings::PLATFORM_TOLERANCE_MS`), past which a request waiting fails a health probe of
 //!   that timeout (research f18: starvation that fails health checks cascades);
-//! - the false alarms a day: headroom's default (`Settings::false_alarms_per_day`, 1), a person's choice there.
-//!
 //! - the floor of a period's mean, the shard's step quantum: a shorter wait is no queue (a task waits that long
-//!   behind the poll running as it woke, whatever the load).
+//!   behind the poll running as it woke, whatever the load);
+//! - the false alarms a day the detectors are given, headroom's default (`Settings::false_alarms_per_day`, 1).
 //!
-//! A detector alarms when a class's delay leaves its calm toward the tolerance by more than its calm ever did
-//! (CUSUM's reference is half the log-distance from calm to the tolerance), so the limit is learned from the
-//! shard's own calm: from a calm at the floor, kiln's 250 µs quantum, a class whose mean wait passes about
-//! 16 ms (the geometric mean of the floor and the tolerance) is shed within a few periods. While it sheds,
-//! nothing is learned as calm: shedding ends the excursions it starts on.
+//! So the limit is learned from the shard's own calm: from a calm at the floor, kiln's 250 µs quantum, the
+//! reference point is about 16 ms (the geometric mean of the floor and the tolerance), and a delay that stays at
+//! 100 ms sheds at the third probe, at 50 ms the fourth, at 20 ms the eighteenth. While a detector alarms,
+//! nothing is learned as calm.
 //! Shedding is off until `[server] shed = true` declares it, as what kiln decides on its own is (docs/ci.md
 //! §0.3, "Opt-in automation"); every shed says why (its body, `x-kiln-shed`, the log, `/metrics`). The
 //! classes and the detectors run either way, on `/metrics` and `/readyz`.
@@ -344,17 +348,18 @@ pub fn tick(index: usize, late: Duration) {
             mean_ns(now.queue_ns_critical, last.queue_ns_critical, now.queue_polls_critical, last.queue_polls_critical),
         ];
         let late_ns = u64::try_from(late.as_nanos()).unwrap_or(u64::MAX);
-        let events = [feed(&mut d.background, waits[0], floor_ns, now_us), feed(&mut d.normal, Some(late_ns), floor_ns, now_us)];
+        feed(&mut d.background, waits[0], floor_ns, now_us);
+        feed(&mut d.normal, Some(late_ns), floor_ns, now_us);
         publish(state, waits, late_ns, d);
-        let level = if d.normal.alarm.is_some() {
+        let level = if sheds_now(&d.normal) {
             2
-        } else if d.background.alarm.is_some() {
+        } else if sheds_now(&d.background) {
             1
         } else {
             0
         };
         if state.level.swap(level, Ordering::Relaxed) != level {
-            note_level(index, state, level, &events);
+            note_level(index, state, level, d);
         }
         state.coop_yields.store(now.coop_yields, Ordering::Relaxed);
         d.reported = log_stall(index, state.holder, d.reported);
@@ -394,24 +399,46 @@ fn feed(d: &mut Detector, mean_ns: Option<u64>, floor_ns: u64, now_us: u64) -> E
     d.sample(now_us, ns as f64 / 1e3, false, budget_per_day())
 }
 
+/// The CUSUM's reference of `d`: half the log-distance from its calm to its tolerance; `None` with no calm yet.
+fn reference(d: &Detector) -> Option<f64> {
+    d.calm_us().map(|calm| (d.tolerance_us.max(1.0).ln() - calm.max(1.0).ln()) / 2.0)
+}
+
+/// Whether a shard sheds the class `d` watches now: a sample reached the tolerance (harm at once), or the CUSUM's
+/// evidence of a shift is past one reference (a single sample at the tolerance's worth) and past any threshold
+/// the detector learned. The detector alarms at its first sample past the reference, as headroom's does with
+/// nothing learned; a shed waits for that much evidence, so a lone late probe sheds nothing.
+fn sheds_now(d: &Detector) -> bool {
+    let Some(alarm) = d.alarm.as_ref() else {
+        return false;
+    };
+    alarm.harm || reference(d).is_some_and(|k| d.level() > k.max(d.threshold(budget_per_day())))
+}
+
+/// Why `d` sheds, for the log: its evidence against what it takes, or the tolerance reached.
+fn why(name: &str, d: &Detector) -> Option<String> {
+    if !sheds_now(d) {
+        return None;
+    }
+    let calm_ms = d.calm_us().unwrap_or(0.0) / 1e3;
+    Some(match d.alarm.as_ref() {
+        Some(alarm) if alarm.harm => format!("{name}: a wait reached the tolerance, {:.0} ms", d.tolerance_us / 1e3),
+        _ => format!("{name}: CUSUM {:.2} past {:.2} from a calm of {calm_ms:.2} ms", d.level(), reference(d).unwrap_or(0.0)),
+    })
+}
+
 /// The log of a change of what a shard sheds, with why.
-fn note_level(index: usize, state: &ShardState, level: u8, events: &[Event; 2]) {
-    let why: Vec<&str> = events
-        .iter()
-        .filter_map(|e| match e {
-            Event::Alarm(why) | Event::Regime(why) => Some(why.as_str()),
-            _ => None,
-        })
-        .collect();
+fn note_level(index: usize, state: &ShardState, level: u8, d: &Detectors) {
+    let reasons: Vec<String> = [why("normal", &d.normal), why("background", &d.background)].into_iter().flatten().collect();
     let delay = |class: Class| state.delay_ns.get(class as usize).map_or(0, |d| d.load(Ordering::Relaxed));
     match level {
-        0 => tracing::info!(shard = index, "shard no longer sheds requests: its queueing delay is back at its calm"),
+        0 => tracing::info!(shard = index, "shard no longer sheds requests: its queueing delay came back toward its calm"),
         _ => tracing::warn!(
             shard = index,
             sheds = if level >= 2 { "normal and background" } else { "background" },
             normal_delay_us = delay(Class::Normal) / 1_000,
             background_delay_us = delay(Class::Background) / 1_000,
-            why = %why.join("; "),
+            why = %reasons.join("; "),
             shedding = ENABLED.load(Ordering::Relaxed),
             "shard overloaded: its queueing delay left its calm"
         ),
@@ -613,15 +640,15 @@ mod tests {
         }
     }
 
-    /// Step 4: a detector fed a class's mean waits alarms within a few periods of the waits leaving the calm it
+    /// Step 4: a detector fed a class's mean waits sheds within a few periods of the waits leaving the calm it
     /// learned (waits of nanoseconds to a few hundred microseconds under a quantum of 250, then 50 ms and 100 ms: a
-    /// busy shard's round of tasks), stays quiet through the calm with its noise, also after a load that only
-    /// doubled the calm (Background's busy, Normal's waits a poll), and clears once the waits are back, or once the
-    /// class has nothing waiting at all.
+    /// busy shard's round of tasks; the fourth period at 50 ms, the third at 100 ms, by the module's arithmetic),
+    /// stays quiet through the calm with its noise, also after a load that only doubled the calm (Background's busy,
+    /// Normal's waits a poll), and stops once the waits are back, or once the class has nothing waiting at all.
     #[test]
-    fn g6_s4_a_detector_alarms_soon_after_the_waits_leave_their_calm_and_clears_after() {
+    fn g6_s4_a_detector_sheds_soon_after_the_waits_leave_their_calm_and_stops_after() {
         const QUANTUM_NS: u64 = 250_000;
-        for overload_ns in [50_000_000u64, 100_000_000] {
+        for (overload_ns, within) in [(50_000_000u64, 4u64), (100_000_000, 3)] {
             let mut d = detector(0);
             let mut now_us = 0;
             for i in 0..2_000u64 {
@@ -634,22 +661,48 @@ mod tests {
                 feed(&mut d, Some(2 * QUANTUM_NS), QUANTUM_NS, now_us);
             }
             assert!(d.alarm.is_none(), "a doubled calm is no overload");
-            let mut alarmed_after = None;
+            let mut shed_after = None;
             for i in 0..20u64 {
                 now_us += 10_000;
                 feed(&mut d, Some(overload_ns), QUANTUM_NS, now_us);
-                if d.alarm.is_some() {
-                    alarmed_after = Some(i + 1);
+                if sheds_now(&d) {
+                    shed_after = Some(i + 1);
                     break;
                 }
             }
-            assert!(alarmed_after.is_some_and(|n| n <= 5), "alarmed after {alarmed_after:?} periods at {overload_ns} ns");
+            assert_eq!(shed_after, Some(within), "shed after {shed_after:?} periods at {overload_ns} ns");
             for _ in 0..50 {
                 now_us += 10_000;
                 feed(&mut d, None, QUANTUM_NS, now_us);
             }
-            assert!(d.alarm.is_none(), "cleared once nothing waits");
+            assert!(d.alarm.is_none() && !sheds_now(&d), "stopped once nothing waits");
         }
+    }
+
+    /// Step 4: a lone late probe is no overload: one wait of 100 ms, or two apart, amid the calm alarm the detector
+    /// (its first sample past the reference) but shed nothing; a wait at the tolerance sheds at once.
+    #[test]
+    fn g6_s4_a_lone_late_wait_sheds_nothing_and_one_at_the_tolerance_sheds_at_once() {
+        const QUANTUM_NS: u64 = 250_000;
+        let mut d = detector(0);
+        let mut now_us = 0;
+        let mut step = |d: &mut Detector, ns: u64| {
+            now_us += 10_000;
+            feed(d, Some(ns), QUANTUM_NS, now_us);
+            sheds_now(d)
+        };
+        for _ in 0..1_000 {
+            assert!(!step(&mut d, QUANTUM_NS));
+        }
+        for _ in 0..2 {
+            assert!(!step(&mut d, 100_000_000), "a lone 100 ms wait sheds nothing");
+            assert!(d.alarm.is_some(), "though the detector alarms");
+            for _ in 0..10 {
+                assert!(!step(&mut d, QUANTUM_NS));
+            }
+            assert!(d.alarm.is_none(), "and clears with the calm");
+        }
+        assert!(step(&mut d, 1_000_000_000), "a wait at the tolerance sheds at once");
     }
 
     /// Step 4: Background requests are shed first, then Normal ones, Critical never; the answer is 503 with
