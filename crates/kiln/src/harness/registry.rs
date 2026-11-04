@@ -295,10 +295,10 @@ pub struct Parts {
 /// A snapshot's events go in frames of about this many bytes.
 const EVENTS_FRAME: usize = 256 * 1024;
 
-/// A viewer's snapshot (or catch-up), taken but not written out: written on the compute pool, off
-/// the shards and below them, a frame a unit of its pieces, a long session's being megabytes of JSON
-/// (`crate::rt::compute_pieces`; goal 4, plan 01a1a59c2a9c step 3). Its frames say the copy as of
-/// when it was taken, whatever comes in meanwhile.
+/// A viewer's snapshot (or catch-up), taken from a copy's view but not written out: written on the
+/// blocking pool, off the runtime's threads, a long session's being megabytes of JSON
+/// (`crate::rt::blocking`). Its frames say the copy as of when it was taken, whatever comes in
+/// meanwhile.
 pub struct Snapshot {
     pub(super) parts: Parts,
     /// What's kept of the files its messages mention (`Keeper::frame`): ahead of the events.
@@ -406,23 +406,6 @@ impl Snapshot {
         plan.parts.iter().map(|part| write::string(self.room(&plan, part), |b| self.write(&plan, part, b))).collect()
     }
 
-    /// [`Snapshot::frames`], written on the compute pool a frame at a time: a piece gives its
-    /// thread to a job waiting for one once it has had a shard's step.
-    pub async fn frames_off(self) -> anyhow::Result<Vec<String>> {
-        crate::rt::compute_pieces((self, None::<Plan>, 0usize, Vec::new()), |(s, plan, next, out), turn| {
-            let plan = plan.get_or_insert_with(|| s.plan());
-            while let Some(part) = plan.parts.get(*next) {
-                out.push(write::string(s.room(plan, part), |b| s.write(plan, part, b)));
-                *next += 1;
-                if turn.over() {
-                    return crate::rt::Step::More;
-                }
-            }
-            crate::rt::Step::Done(std::mem::take(out))
-        })
-        .await
-    }
-
     /// Its frames and then `last` (the socket's `synced`), a frame a line, gzip'd as one message.
     /// Each is written into one buffer used again for the next, and goes to the encoder whole:
     /// written straight into the encoder, a frame's many small writes cost it more than the frame.
@@ -436,30 +419,6 @@ impl Snapshot {
         }
         gz.write_all(last.as_bytes())?;
         gz.finish()
-    }
-
-    /// [`Snapshot::packed`], written and gzip'd on the compute pool a frame at a time.
-    pub async fn packed_off(self, last: String) -> anyhow::Result<std::io::Result<Vec<u8>>> {
-        use std::io::Write as _;
-        let gz = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
-        crate::rt::compute_pieces((self, None::<Plan>, 0usize, Vec::new(), Some(gz)), move |(s, plan, next, frame, gz), turn| {
-            let plan = plan.get_or_insert_with(|| s.plan());
-            let Some(enc) = gz.as_mut() else { return crate::rt::Step::Done(Err(std::io::Error::other("a snapshot packed twice"))) };
-            while let Some(part) = plan.parts.get(*next) {
-                if let Err(e) = s.pack(plan, part, frame, enc) {
-                    return crate::rt::Step::Done(Err(e));
-                }
-                *next += 1;
-                if turn.over() {
-                    return crate::rt::Step::More;
-                }
-            }
-            match gz.take() {
-                Some(mut enc) => crate::rt::Step::Done(enc.write_all(last.as_bytes()).and_then(|()| enc.finish())),
-                None => crate::rt::Step::Done(Err(std::io::Error::other("a snapshot packed twice"))),
-            }
-        })
-        .await
     }
 
     /// `part` written into `frame` (cleared first), a line, then to `gz` whole.
@@ -4168,33 +4127,6 @@ mod tests {
             }
             // Most joined while the updates came, and took the rest of them live.
             anyhow::ensure!(lively * 2 > count, "{lively} of {count} viewers took live frames");
-            Ok(())
-        })
-    }
-
-    /// Goal 4, plan 01a1a59c2a9c step 3: a snapshot (and a catch-up) written on the compute pool, a
-    /// frame at a time, is the one written here, frames and gzip alike.
-    #[test]
-    fn a_snapshot_written_in_pieces_on_the_compute_pool_is_the_one_written_here() -> anyhow::Result<()> {
-        crate::rt::block_on(async {
-            let mut m = Mirror::new(Info { id: "s".into(), ..Info::default() }, Location::Local, sim_bus());
-            for n in 1..=3000u64 {
-                took(&mut m, |m| m.upsert(Arc::new(Entry::new(json!({"id": format!("e{n}"), "seq": n, "kind": "assistant", "text": "x".repeat(300)})))));
-            }
-            set_state(&mut m, json!({"status": "running"}));
-            m.take_changes(vec![file("a.rs", None, 40)], Vec::new(), true);
-            let files = Some(r#"{"t":"files","files":[]}"#.to_owned());
-            let whole = || Snapshot { parts: m.view().parts(), files: files.clone() };
-            let here = whole().frames();
-            anyhow::ensure!(here.len() > 6, "a snapshot of several frames, its events in some: {}", here.len());
-            anyhow::ensure!(whole().frames_off().await? == here, "its frames");
-            let synced = r#"{"t":"synced"}"#;
-            anyhow::ensure!(whole().packed_off(synced.to_owned()).await?? == whole().packed(synced)?, "packed");
-            let since = || m.view().parts_since(m.rev - 10).map(|parts| Snapshot { parts, files: None });
-            let resumed = since().ok_or_else(|| anyhow::anyhow!("not resumed"))?;
-            let frames = resumed.frames_off().await?;
-            anyhow::ensure!(frames.first().is_some_and(|f| f.contains(r#""t":"resumed""#)) && ids(&frames).len() == 10, "{} frames", frames.len());
-            anyhow::ensure!(Some(frames) == since().map(|s| s.frames()));
             Ok(())
         })
     }

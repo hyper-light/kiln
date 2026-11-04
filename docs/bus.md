@@ -44,9 +44,9 @@ on any device (`crate::harness::live`):
   the view. The owner publishes each view, then asks whether anyone watches, and sends the change's
   frame only then: of the two, one sees the other (a Dekker handshake on the viewers' count and the
   view, both sequentially consistent), so every change is in a viewer's view or in a frame past
-  where it reads from. The frames of a snapshot are written on the compute pool, below the shards,
-  a frame at a time (gzip'd there too, for a page that asks `?z=gzip`), so a viewer starting over
-  never holds up the copy's owner, another session's frames, or the sockets on the shard it came on.
+  where it reads from. The frames of a snapshot are written on the blocking pool (gzip'd there too,
+  for a page that asks `?z=gzip`), so a viewer starting over never holds up the copy's owner,
+  another session's frames, or the sockets on the shard it came on.
   Each frame on the feed carries the copy's revision, and one a snapshot or catch-up already held
   is skipped.
 - **A viewer that falls behind catches up, alone.** One further behind than the feed keeps is

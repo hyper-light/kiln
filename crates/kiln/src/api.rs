@@ -1214,13 +1214,7 @@ async fn authorized(hub: Arc<Hub>, caller: crate::authz::Caller, req: Request) -
         }
         (&Method::GET, ["api", "harness", "kinds"]) => Ok(harness_kinds(&hub, &q)),
         (&Method::GET, ["api", "harness", "workspaces"]) => Ok(boxed(|| harness_workspaces(&hub)).await),
-        (&Method::GET, ["api", "harness", "sessions"]) => {
-            let seen = boxed(|| crate::harness::lineage::seen(&hub, &caller, hub.harness.list())).await;
-            // Every agent's info (kilobytes each) written out on the compute pool, not on the shard
-            // the request came on (goal 4, plan 01a1a59c2a9c step 3).
-            let body = crate::rt::compute(move || serde_json::to_vec(&seen)).await.map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")))?.map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, format!("serialize: {e}")))?;
-            Ok(srv::response(StatusCode::OK, "application/json", srv::full(body)))
-        }
+        (&Method::GET, ["api", "harness", "sessions"]) => Ok(srv::json(StatusCode::OK, &boxed(|| crate::harness::lineage::seen(&hub, &caller, hub.harness.list())).await)),
         (&Method::POST, ["api", "harness", "sessions"]) => boxed(|| harness_open(&hub, req)).await,
         (&Method::GET, ["api", "harness", "sessions", id]) => match hub.harness.list().into_iter().find(|i| i.id == *id) {
             Some(info) => Ok(srv::json(StatusCode::OK, &info)),
@@ -5915,16 +5909,18 @@ fn harness_ws(hub: Arc<Hub>, id: String, req: Request) -> R {
 
 /// Send a viewer a snapshot: its frames then `synced`, a message each; or, `packed`, all of it in
 /// one gzip'd binary message, a frame a line (frames are JSON, whose strings escape their line
-/// breaks). Written out (and gzip'd) on the compute pool, a frame at a time: a long session's is
-/// megabytes of JSON, and the shards serve every socket (`crate::harness::registry::Snapshot`; goal
-/// 4, plan 01a1a59c2a9c step 3).
+/// breaks). Written out on the blocking pool: a long session's is megabytes of JSON, and the
+/// runtime's threads serve every socket (`crate::harness::registry::Snapshot`). Not on the compute
+/// pool, below the shards: there a snapshot took 2.4 times as long with a busy process beside the
+/// server for each of its CPUs, and the frames its viewer waits on with it 4.7 times (goal 4's lab,
+/// plan 01a1a59c2a9c step 5).
 async fn send_snapshot(tx: &mut ws::Sender, snapshot: crate::harness::registry::Snapshot, packed: bool) -> anyhow::Result<()> {
     if packed {
-        let bytes = snapshot.packed_off(synced()).await??;
+        let bytes = crate::rt::blocking(move || snapshot.packed(&synced())).await??;
         tx.send(ws::binary(bytes)).await?;
         return Ok(());
     }
-    let frames = snapshot.frames_off().await?;
+    let frames = crate::rt::blocking(move || snapshot.frames()).await?;
     for f in frames {
         tx.send(ws::text(f)).await?;
     }
