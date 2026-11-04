@@ -17,7 +17,7 @@ pub async fn send_loop(hub: Arc<Hub>) -> anyhow::Result<()> {
     let Some(o) = super::api::get() else { return Ok(()) };
     let out = o.outgoing();
     while let Ok(m) = out.recv().await {
-        let peer = hub.instances.lock().newest_with(&m.machine, proto::CAP_OBSERVE);
+        let peer = hub.instances.load().newest_with(&m.machine, proto::CAP_OBSERVE);
         let Some(peer) = peer else { continue };
         let msg = ServerMsg::Observe { json: wire::encode(&m.msg), bytes: m.bytes };
         if let Ok(b) = proto::encode(&msg) {
@@ -39,7 +39,7 @@ pub fn heard(machine: &str, msg: wire::Msg, bytes: Vec<u8>) {
 pub async fn announced(hub: &Hub, machine: &str) {
     let Some(o) = super::api::get() else { return };
     let (newest, others) = {
-        let inst = hub.instances.lock();
+        let inst = hub.instances.load();
         let newest = inst.newest_with(machine, proto::CAP_OBSERVE);
         let others: Vec<_> = inst.of(machine).into_iter().filter(|p| Some(*p) != newest && inst.get(*p).is_some_and(|i| i.caps & proto::CAP_OBSERVE != 0)).collect();
         (newest, others)
@@ -56,7 +56,7 @@ pub async fn announced(hub: &Hub, machine: &str) {
 /// A runner process of `machine` went: the group follows the newest that is left, if any.
 pub fn lost(hub: &Hub, machine: &str) {
     if let Some(o) = super::api::get() {
-        o.up(machine, hub.instances.lock().newest_with(machine, proto::CAP_OBSERVE).is_some());
+        o.up(machine, hub.instances.load().newest_with(machine, proto::CAP_OBSERVE).is_some());
     }
 }
 

@@ -1835,7 +1835,7 @@ fn ai_silent(hub: &Hub, caller: &crate::authz::Caller) -> Response {
     let reporting: std::collections::HashSet<String> = hub.ai_sessions.load().keys().cloned().collect();
     let mut machines: Vec<String> = hub
         .agents
-        .lock()
+        .load()
         .values()
         .filter(|a| a.connected && !a.ephemeral && !reporting.contains(&a.name))
         .filter(|a| caller.can("runners.terminal", &crate::harness::lineage::machine_scope(&format!("agent:{}", a.name))))
@@ -3529,7 +3529,7 @@ async fn drain_agent(hub: &Hub, name: &str, req: Request) -> R {
 /// again now. The answer is its new report once it comes (within 30 s), or, when it hasn't yet,
 /// 202 without one.
 pub async fn probe_agent(hub: &Hub, name: &str) -> Result<Response, crate::ci::Fail> {
-    let Some(before) = hub.agents.lock().get(name).map(|a| a.facts.as_ref().map_or(0, |f| f.probed_at)) else {
+    let Some(before) = hub.agents.load().get(name).map(|a| a.facts.as_ref().map_or(0, |f| f.probed_at)) else {
         return Err((StatusCode::NOT_FOUND, format!("no runner `{name}`")));
     };
     if !hub.send_to_agent(name, crate::proto::LANE_CONTROL, &crate::proto::ServerMsg::ProbeFacts).await {
@@ -3537,7 +3537,7 @@ pub async fn probe_agent(hub: &Hub, name: &str) -> Result<Response, crate::ci::F
     }
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
     loop {
-        let fresh = hub.agents.lock().get(name).and_then(|a| a.facts.as_ref().filter(|f| f.probed_at > before).map(|f| serde_json::to_value(f.as_ref()).unwrap_or_default()));
+        let fresh = hub.agents.load().get(name).and_then(|a| a.facts.as_ref().filter(|f| f.probed_at > before).map(|f| serde_json::to_value(f.as_ref()).unwrap_or_default()));
         if let Some(facts) = fresh {
             return Ok(srv::json(StatusCode::OK, &json!({ "runner": name, "facts": facts })));
         }
@@ -4128,7 +4128,7 @@ async fn name_and_label(hub: &Hub, wanted: &str, hostname: &str, machine_id: Opt
 /// two would be one runner (docs/machines.md). The same machine joining again has its runner
 /// stopped first.
 fn a_copy_of_a_connected_machine(hub: &Hub, name: &str) -> Option<String> {
-    let connected = crate::join::is_machine_key(name) && hub.agents.lock().get(name).is_some_and(|a| a.connected);
+    let connected = crate::join::is_machine_key(name) && hub.agents.load().get(name).is_some_and(|a| a.connected);
     connected.then(|| {
         format!(
             "a machine known by this machine's id ({name}) is connected now: if this one is a copy of it, give it an id of its own \
@@ -4331,7 +4331,7 @@ async fn updates_overview(hub: &Arc<Hub>, force: bool) -> Response {
 async fn skew_view(hub: &Hub) -> serde_json::Value {
     let now = crate::skew::tolerance(hub).await;
     let runners: Vec<serde_json::Value> =
-        hub.agents.lock().values().filter(|a| a.connected && !a.ephemeral).map(|a| json!({ "name": a.name, "skew": a.skew })).collect();
+        hub.agents.load().values().filter(|a| a.connected && !a.ephemeral).map(|a| json!({ "name": a.name, "skew": a.skew })).collect();
     json!({
         "now": now,
         "config": crate::skew::Tolerance::of(&hub.cfg.updates),
@@ -4836,7 +4836,7 @@ async fn create_terminal(hub: &Arc<Hub>, req: Request) -> R {
     let (cols, rows) = (t.cols.unwrap_or(120), t.rows.unwrap_or(40));
     let session = match t.target.strip_prefix("agent:") {
         Some(machine) => {
-            if !hub.agents.lock().get(machine).is_some_and(|a| a.connected) {
+            if !hub.agents.load().get(machine).is_some_and(|a| a.connected) {
                 return Err(err(StatusCode::CONFLICT, format!("{} is not connected", hub.shown(machine))));
             }
             // Its kiln is to be upgraded: no new terminal (`crate::skew`).
@@ -5053,7 +5053,7 @@ async fn terminal_attach(hub: Arc<Hub>, existing: Option<String>, target: String
 async fn harness_workspaces(hub: &Hub) -> Response {
     let mut out = serde_json::Map::new();
     let mut targets = vec!["local".to_owned()];
-    targets.extend(hub.agents.lock().values().filter(|a| a.connected && !a.ephemeral).map(|a| format!("agent:{}", a.name)));
+    targets.extend(hub.agents.load().values().filter(|a| a.connected && !a.ephemeral).map(|a| format!("agent:{}", a.name)));
     for t in targets {
         let v = match crate::harness::lineage::workspaces_on(hub, &t).await {
             Ok(()) => json!({"available": true}),
@@ -6265,7 +6265,7 @@ async fn machine_dirs(hub: &Hub, target: &str, q: &HashMap<String, String>) -> R
         return Ok(srv::json(StatusCode::OK, &crate::dirs::here(path).await));
     }
     let machine = target.strip_prefix("agent:").unwrap_or(target);
-    let (connected, agents) = hub.agents.lock().get(machine).map_or((false, false), |a| (a.connected, a.terminal && !a.ephemeral));
+    let (connected, agents) = hub.agents.load().get(machine).map_or((false, false), |a| (a.connected, a.terminal && !a.ephemeral));
     if !connected {
         return Err(err(StatusCode::CONFLICT, format!("{} is not connected", hub.shown(machine))));
     }
@@ -6361,7 +6361,7 @@ fn worst_delay(shards: impl Iterator<Item = crate::shard_health::Snapshot>, peri
 /// Numbers and the commit only, so it's open, as `/healthz` is.
 fn server_health(hub: &Hub) -> Response {
     let memory = crate::os::cgroup::memory().map(|m| json!({ "used": m.used, "limit": m.limit, "share": m.share(), "peak": m.peak, "oom_kills": m.oom_kills }));
-    let connected = hub.agents.lock().values().filter(|a| a.connected && !a.ephemeral).count() as u64;
+    let connected = hub.agents.load().values().filter(|a| a.connected && !a.ephemeral).count() as u64;
     let before = hub.runners_before.load(std::sync::atomic::Ordering::Relaxed);
     srv::json(
         StatusCode::OK,

@@ -209,7 +209,7 @@ pub fn hold_local(hub: &Hub) {
 
 /// The runner processes of `machine` that take its agent limit (each runs sessions of its own).
 fn takers(hub: &Hub, machine: &str) -> Vec<PeerId> {
-    let inst = hub.instances.lock();
+    let inst = hub.instances.load();
     inst.of(machine).into_iter().filter(|p| inst.get(*p).is_some_and(|i| i.wide & CAP_AGENT_LIMIT != 0)).collect()
 }
 
@@ -247,7 +247,7 @@ pub async fn on_caps(hub: &Hub, machine: &str, peer: PeerId, caps: u64) {
 /// a frame carries: one that can't be read is refused to the runner there): the process new work
 /// goes to speaks for its machine.
 pub fn on_held(hub: &Hub, peer: PeerId, machine: &str, held: Held) {
-    if hub.instances.lock().newest(machine) != Some(peer) {
+    if hub.instances.load().newest(machine) != Some(peer) {
         return;
     }
     let changed = {
@@ -266,7 +266,7 @@ pub fn on_held(hub: &Hub, peer: PeerId, machine: &str, held: Held) {
 /// said what it can do past `Build`'s 32 bits (its `Caps`, right after its `Build`), or is known to
 /// be too old to (one from before the channel never says).
 fn takes(hub: &Hub, machine: &str) -> Option<bool> {
-    let inst = hub.instances.lock();
+    let inst = hub.instances.load();
     let i = inst.newest(machine).and_then(|p| inst.get(p))?;
     if i.wide != 0 {
         return Some(i.wide & CAP_AGENT_LIMIT != 0);
@@ -276,7 +276,7 @@ fn takes(hub: &Hub, machine: &str) -> Option<bool> {
 
 /// A runner the server knows (enrolled, or connected now).
 async fn known(hub: &Hub, name: &str) -> bool {
-    hub.agents.lock().contains_key(name) || hub.store.agents().await.is_ok_and(|rows| rows.iter().any(|a| a.name == name))
+    hub.agents.load().contains_key(name) || hub.store.agents().await.is_ok_and(|rows| rows.iter().any(|a| a.name == name))
 }
 
 /// `GET /api/runners/:name/agent-limit` (and what `PUT` answers): what's set here, what the machine
@@ -284,7 +284,7 @@ async fn known(hub: &Hub, name: &str) -> bool {
 /// many it has in all, finished, paused and ended ones too.
 pub async fn view(hub: &Hub, name: &str) -> Value {
     let own = own(hub, name);
-    let (connected, runs_agents) = hub.agents.lock().get(name).filter(|a| a.connected).map_or((false, None), |a| (true, Some(!a.ephemeral && a.terminal)));
+    let (connected, runs_agents) = hub.agents.load().get(name).filter(|a| a.connected).map_or((false, None), |a| (true, Some(!a.ephemeral && a.terminal)));
     let (supported, held) = if own {
         (Some(true), Some(local(hub)))
     } else {

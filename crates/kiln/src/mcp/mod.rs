@@ -243,13 +243,13 @@ pub fn agent_ops() -> Vec<crate::ops::Op> {
 /// first, and kept with kiln's receipt, or the act is refused, the break recorded naming the runner
 /// (`crate::relays::call`).
 pub async fn runner_ask(hub: &Arc<Hub>, runner: &str, peer: crate::instances::PeerId, ask: &crate::reach::Question, raw: &Value, placed: Option<crate::relays::Placed>) -> Value {
-    if hub.agents.lock().get(runner).is_none_or(|a| a.ephemeral || a.outpost) {
+    if hub.agents.load().get(runner).is_none_or(|a| a.ephemeral || a.outpost) {
         return json!({"error": "kiln's operations are for its agents' runners, not a job's"});
     }
     let mut carried = None;
     if let Some(placed) = placed {
         let session = raw.get("session").and_then(Value::as_str).unwrap_or("");
-        let instance = hub.instances.lock().get(peer).map_or_else(|| "legacy".to_owned(), crate::instances::Instance::label);
+        let instance = hub.instances.load().get(peer).map_or_else(|| "legacy".to_owned(), crate::instances::Instance::label);
         match crate::relays::call(hub, runner, &instance, session, raw, placed, crate::util::now_unix()).await {
             Ok(Ok(c)) => carried = c.map(|c| hub.relays.carry(c)),
             Ok(Err(why)) => {
@@ -289,7 +289,7 @@ async fn runner_ask_checked(hub: &Arc<Hub>, runner: &str, peer: crate::instances
         if !session.is_empty() && hub.harness.info(session).is_some() {
             let mut answer = json!({"error": why});
             if !matches!(ask, Question::Registry { .. }) {
-                let instance = hub.instances.lock().get(peer).map_or_else(|| "legacy".to_owned(), crate::instances::Instance::label);
+                let instance = hub.instances.load().get(peer).map_or_else(|| "legacy".to_owned(), crate::instances::Instance::label);
                 let left = format!("session {session} went on elsewhere: this is a copy left behind on {runner}");
                 match crate::custody::refused_act(hub, runner, &instance, session, raw, &left, crate::util::now_unix()).await {
                     Ok(why) => answer = json!({"error": format!("refused: {why}"), "status": 403}),
@@ -306,7 +306,7 @@ async fn runner_ask_checked(hub: &Arc<Hub>, runner: &str, peer: crate::instances
             && !matches!(ask, Question::Registry { .. })
             && let Ok(Some((transfer, work, to))) = crate::custody::work_taken_from(&hub.store, session).await
         {
-            let instance = hub.instances.lock().get(peer).map_or_else(|| "legacy".to_owned(), crate::instances::Instance::label);
+            let instance = hub.instances.load().get(peer).map_or_else(|| "legacy".to_owned(), crate::instances::Instance::label);
             let left = format!("agent session {session} no longer holds {work}: kiln took it for this agent and handed it to {to} (transfer {transfer})");
             let answer = match crate::custody::refused_work_act(hub, runner, &instance, session, raw, &left, &transfer, crate::util::now_unix()).await {
                 Ok(why) => json!({"error": format!("refused: {why}"), "status": 403}),
@@ -323,7 +323,7 @@ async fn runner_ask_checked(hub: &Arc<Hub>, runner: &str, peer: crate::instances
         session_caller(hub, session, Some(runner)).await
     };
     if !session.is_empty() && !matches!(ask, Question::Registry { .. }) {
-        let (instance, signs) = hub.instances.lock().get(peer).map(|i| (i.label(), (u64::from(i.caps) | i.wide) & crate::proto::CAP_CUSTODY != 0)).unwrap_or_else(|| ("legacy".to_owned(), false));
+        let (instance, signs) = hub.instances.load().get(peer).map(|i| (i.label(), (u64::from(i.caps) | i.wide) & crate::proto::CAP_CUSTODY != 0)).unwrap_or_else(|| ("legacy".to_owned(), false));
         match crate::custody::act_counts(hub, runner, &instance, signs, session, raw, crate::util::now_unix()).await {
             Ok(Ok(())) => {}
             Ok(Err(why)) => {
@@ -426,7 +426,7 @@ async fn runner_ask_checked(hub: &Arc<Hub>, runner: &str, peer: crate::instances
 /// elsewhere: it lets go of it (a runner from before letting go stops it), as it would on its
 /// announcing it (W27-R08: at its runner's first word, whatever that is).
 pub async fn let_go(hub: &Hub, runner: &str, peer: crate::instances::PeerId, session: &str) {
-    let lets_go = hub.instances.lock().get(peer).is_some_and(|i| i.caps & crate::proto::CAP_CONVO != 0);
+    let lets_go = hub.instances.load().get(peer).is_some_and(|i| i.caps & crate::proto::CAP_CONVO != 0);
     let msg = if lets_go { crate::proto::ServerMsg::HarnessRelease { session: session.to_owned() } } else { crate::proto::ServerMsg::HarnessClose { session: session.to_owned() } };
     tracing::info!(target: "kiln.custody", %runner, peer, %session, "a copy of an agent session that went on elsewhere: its runner is told to let go of it");
     let _ = hub.command_peers(runner, vec![peer], &msg).await;
@@ -1284,7 +1284,7 @@ mod tests {
         crate::rt::block_on(async {
             let hub = crate::hub::tests::scratch_hub().await?;
             for name in ["box", "mac"] {
-                hub.agents.lock().insert(name.into(), crate::hub::tests::live_runner(name, "linux", "x86_64"));
+                hub.put_agent(crate::hub::tests::live_runner(name, "linux", "x86_64"));
             }
             hub.harness.ingest(&hub, &crate::harness::registry::Location::Machine("box".into()), "s1", open("s1")).await;
             let unread = Question::Unread { session: "s1".into(), what: "tools/call teleport".into(), code: Code::Unknown, why: "Unknown tool: teleport".into() };

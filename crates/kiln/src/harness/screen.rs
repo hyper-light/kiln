@@ -107,7 +107,7 @@ pub async fn open(hub: &Arc<Hub>, agent: &str, o: Open) -> anyhow::Result<Beside
     let windows = match &machine {
         None => cfg!(windows),
         Some(m) => {
-            let agents = hub.agents.lock();
+            let agents = hub.agents.load();
             let Some(a) = agents.get(m).filter(|a| a.connected) else {
                 drop(agents);
                 anyhow::bail!("{} is not connected", hub.shown(m));
@@ -189,7 +189,7 @@ pub async fn watch(hub: Arc<Hub>) -> anyhow::Result<()> {
         // run on there, and are taken back when it returns.
         let gone: Vec<String> = running.keys().filter(|id| !now.iter().any(|(t, _)| &t.id == *id)).cloned().collect();
         for id in gone {
-            let away = running.get(&id).and_then(|(_, m)| m.as_ref()).is_some_and(|m| !hub.agents.lock().get(m).is_some_and(|a| a.connected));
+            let away = running.get(&id).and_then(|(_, m)| m.as_ref()).is_some_and(|m| !hub.agents.load().get(m).is_some_and(|a| a.connected));
             if !away && let Some((agent, _)) = running.remove(&id) {
                 ended.push(agent);
             }

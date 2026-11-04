@@ -1115,12 +1115,12 @@ pub fn spawn(hub: Arc<Hub>) {
         *hub.ci.restored.lock() = Some(restored);
         // The runners that said hello while it rebuilt: what each said it runs is on its record
         // (the hub kept it); a leg it didn't say it has, it lost.
-        let agents: Vec<(String, Vec<String>)> = hub.agents.lock().values().filter(|a| a.connected).map(|a| (a.name.clone(), a.running.clone())).collect();
+        let agents: Vec<(String, Vec<String>)> = hub.agents.load().values().filter(|a| a.connected).map(|a| (a.name.clone(), a.running.clone())).collect();
         for (a, running) in agents {
             d.runner_up(&a, &running).await;
         }
         // Those yet to say it have their grace to.
-        let here: HashSet<String> = hub.agents.lock().keys().cloned().collect();
+        let here: HashSet<String> = hub.agents.load().keys().cloned().collect();
         if d.legs.values().any(|l| l.agent.as_ref().is_some_and(|a| !here.contains(a))) {
             let at = now_ms() + i64::try_from(crate::hub::AGENT_GRACE.as_millis()).unwrap_or(i64::MAX);
             d.absent_after = Some(at);
@@ -1366,7 +1366,7 @@ impl Dispatch {
     }
 
     async fn runner_facts(&mut self, agent: &str) {
-        let Some(a) = self.hub.agents.lock().get(agent).cloned() else { return };
+        let Some(a) = self.hub.agents.load().get(agent).cloned() else { return };
         let r = RunnerIn { id: agent.to_owned(), view: self.runner_view(&a), slots: work_slots(&a), capacity: self.capacity_of(&a), executor: self.hosted_executor(agent, a.ephemeral) };
         let cmds = self.sched.handle(Input::RunnerChanged(Box::new(r)), now_ms());
         Box::pin(self.commands(cmds)).await;
@@ -1379,7 +1379,7 @@ impl Dispatch {
             return;
         }
         let sample = {
-            let g = self.hub.agents.lock();
+            let g = self.hub.agents.load();
             g.get(agent).and_then(|a| a.sample.as_ref().map(|s| sample_of(s, a.facts.as_deref())))
         };
         let Some(sample) = sample else { return };
@@ -1388,7 +1388,7 @@ impl Dispatch {
     }
 
     async fn runner_up(&mut self, agent: &str, running: &[String]) {
-        let Some(a) = self.hub.agents.lock().get(agent).cloned() else { return };
+        let Some(a) = self.hub.agents.load().get(agent).cloned() else { return };
         let view = self.runner_view(&a);
         // Legs this runner was running that it no longer has were lost.
         let gone: Vec<(String, u32)> = self.legs.iter().filter(|(id, l)| l.agent.as_deref() == Some(agent) && !running.contains(id) && !a.running.contains(id)).map(|(id, l)| (id.clone(), l.attempt)).collect();
@@ -1409,7 +1409,7 @@ impl Dispatch {
     /// The legs the rebuild after a restart found running on runners that haven't said hello
     /// within their grace: lost with them, as [`Dispatch::runner_up`]'s are.
     async fn absent(&mut self) {
-        let here: HashSet<String> = self.hub.agents.lock().keys().cloned().collect();
+        let here: HashSet<String> = self.hub.agents.load().keys().cloned().collect();
         let gone: Vec<(String, u32)> = self.legs.iter().filter(|(_, l)| l.agent.as_ref().is_some_and(|a| !here.contains(a))).map(|(id, l)| (id.clone(), l.attempt)).collect();
         if gone.is_empty() {
             return;
@@ -2494,7 +2494,7 @@ impl Dispatch {
         // A one-leg runner in a pod (`kiln agent --ephemeral`: a job's, a `k8s` pool's) has the
         // CPUs its cluster gives it, its node's, which the node's other pods share: CPUs of the
         // leg's own taken there would be the same first ones in each pod (W05-R03).
-        let pod = self.hub.pod_executors.load().contains_key(runner) || self.hub.agents.lock().get(runner).is_some_and(|g| g.ephemeral);
+        let pod = self.hub.pod_executors.load().contains_key(runner) || self.hub.agents.load().get(runner).is_some_and(|g| g.ephemeral);
         if pod && let Some(o) = a.executor.options.as_object_mut() {
             o.remove("cpus");
         }
@@ -2558,15 +2558,13 @@ impl Dispatch {
                 self.workflow_run(r, "in_progress", None);
             }
         }
-        {
-            let mut g = self.hub.agents.lock();
-            if let Some(ag) = g.get_mut(runner) {
-                ag.running.push(leg.to_owned());
-                ag.busy = u32::try_from(ag.running.len()).unwrap_or(u32::MAX);
-                // What it holds there, so the v1 dispatcher packs its jobs beside it (W05-R03).
-                crate::hub::hold_on(ag, leg, kiln_ci::sched::state::Incoming::of(a.exclusive, &a.holds.unwrap_or_default()));
-            }
-        }
+        // What it holds there, so the v1 dispatcher packs its jobs beside it (W05-R03).
+        let incoming = kiln_ci::sched::state::Incoming::of(a.exclusive, &a.holds.unwrap_or_default());
+        self.hub.change_agent(runner, |ag| {
+            ag.running.push(leg.to_owned());
+            ag.busy = u32::try_from(ag.running.len()).unwrap_or(u32::MAX);
+            crate::hub::hold_on(ag, leg, incoming.clone());
+        });
         if let Some(l) = self.legs.get_mut(leg) {
             l.agent = Some(runner.to_owned());
             l.seq = 0;

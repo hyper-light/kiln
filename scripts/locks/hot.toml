@@ -132,18 +132,6 @@ why = "imports the hub's locks listed below"
 
 [[allowed]]
 at = "crates/kiln/src/hub.rs"
-name = "agents"
-why = "every runner's live record: read by the runner pages, MCP's runners and each message a runner sends (its last_seen), written as runners come, go and report"
-todo = "an immutable copy swapped in whole (crate::rcu), as the other runner maps are; next, now that goal 4's rewrite of harness/registry.rs (plan 01a1a59c2a9c), which takes it too, is on main (cba5a019725)"
-
-[[allowed]]
-at = "crates/kiln/src/hub.rs"
-name = "instances"
-why = "each machine's runner processes and what each holds: read on every agent session update a runner sends and every command sent to one, written as processes come and go and sessions open"
-todo = "an immutable copy swapped in whole (crate::rcu); next, now that goal 4's rewrite of harness/registry.rs (plan 01a1a59c2a9c), which takes it too, is on main (cba5a019725)"
-
-[[allowed]]
-at = "crates/kiln/src/hub.rs"
 name = "handovers"
 why = "agent sessions moving between a machine's runner processes (crate::handovers): taken as a runner process is replaced, and on a session's update only when two of a machine's processes both say they hold it"
 
