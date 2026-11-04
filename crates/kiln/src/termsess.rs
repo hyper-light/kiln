@@ -106,6 +106,11 @@ pub struct Session {
     out: Broadcast<Frame>,
     input: async_channel::Sender<Input>,
     close: Shutdown,
+    /// Output the hub had no room for in this session's relay ([`forward`]): gaps its relay repairs
+    /// from the machine's replay of the session. Only rises.
+    gaps: std::sync::atomic::AtomicU64,
+    /// Rung as `gaps` rises, so a relay with nothing else to do repairs at once.
+    gap: crate::rt::Notify,
 }
 
 /// What a client gets when it attaches.
@@ -150,8 +155,21 @@ impl Session {
             out: Broadcast::new(FANOUT),
             input,
             close: Shutdown::new(),
+            gaps: std::sync::atomic::AtomicU64::new(0),
+            gap: crate::rt::Notify::new(),
         });
         (session, input_rx)
+    }
+
+    /// Output its relay had no room for (goal 3, plan 01a1a59c2a8e step 5): a gap the relay repairs.
+    fn lost(&self) {
+        self.gaps.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+        self.gap.notify();
+    }
+
+    /// The gaps in its output so far ([`forward`]).
+    pub fn gaps(&self) -> u64 {
+        self.gaps.load(std::sync::atomic::Ordering::Acquire)
     }
 
     pub fn info(&self) -> Info {
@@ -327,13 +345,12 @@ impl Sessions {
         true
     }
 
+    /// Kept off the calling thread (goal 3, plan 01a1a59c2a8e step 5: `crate::keep`): written here, a
+    /// rename waited on the disk, on the shard of the request that made it.
     fn save_names(&self) {
         let Some(file) = self.names_file.lock().clone() else { return };
         let Ok(json) = serde_json::to_vec_pretty(&*self.names.lock()) else { return };
-        let tmp = file.with_extension("tmp");
-        if let Err(e) = std::fs::write(&tmp, json).and_then(|()| std::fs::rename(&tmp, &file)) {
-            tracing::warn!(file = %file.display(), error = %e, "could not keep terminal names");
-        }
+        crate::keep::later(file, json);
     }
 
     pub fn get(&self, id: &str) -> Option<Arc<Session>> {
@@ -378,7 +395,7 @@ impl Sessions {
         }
     }
 
-    fn insert(&self, s: &Arc<Session>) {
+    pub(crate) fn insert(&self, s: &Arc<Session>) {
         self.map.lock().insert(s.id.clone(), Arc::clone(s));
     }
 
@@ -513,6 +530,56 @@ pub fn adopt_agent(hub: &Arc<Hub>, machine: &str, info: &crate::proto::TermInfo)
     run_agent(hub, machine.to_owned(), session, input, Some(ServerMsg::TermAttach { session: info.session.clone() }));
 }
 
+/// Hands `out` to a terminal's relay without waiting (goal 3, plan 01a1a59c2a8e step 5): the hub's
+/// loop takes every runner's messages, and it waited for room in one terminal's relay, every runner's
+/// messages behind it. Output with no room is a gap in `session`, which its relay repairs from the
+/// machine's replay of the session (the relay asks for it, and sets aside what comes until it does);
+/// an end (`Exit`, `Gone`) with no room goes on its own once there is, after what came before it, as
+/// its relay's sender is taken from the hub's map with it and nothing follows it.
+pub fn forward(tx: &async_channel::Sender<TermOut>, session: Option<&Session>, out: TermOut) {
+    match tx.try_send(out) {
+        Ok(()) | Err(async_channel::TrySendError::Closed(_)) => {}
+        Err(async_channel::TrySendError::Full(TermOut::Data(_) | TermOut::Replay(_))) => {
+            if let Some(s) = session {
+                s.lost();
+            }
+        }
+        Err(async_channel::TrySendError::Full(end)) => {
+            let tx = tx.clone();
+            crate::rt::spawn(async move {
+                let _ = tx.send(end).await;
+            });
+        }
+    }
+}
+
+/// A relay's repair of the gaps the hub left in its output ([`forward`]): the gaps it has asked a
+/// replay for, and whether one is on its way (the output before it set aside: the replay holds it).
+#[derive(Debug, Default)]
+struct Repair {
+    seen: u64,
+    waiting: bool,
+}
+
+impl Repair {
+    /// The session's gaps now: whether one is new, to ask the machine for its replay.
+    fn gap(&mut self, gaps: u64) -> bool {
+        if gaps <= self.seen {
+            return false;
+        }
+        self.seen = gaps;
+        self.waiting = true;
+        true
+    }
+}
+
+/// Asks `machine` for `session`'s replay: its picture of the session now, live output after it.
+async fn ask_replay(hub: &Arc<Hub>, machine: &str, session: &str) {
+    if !hub.send_to_agent(machine, LANE_TERM, &ServerMsg::TermAttach { session: session.to_owned() }).await {
+        tracing::debug!(%machine, session, "a terminal's replay couldn't be asked for: its machine is away");
+    }
+}
+
 fn run_agent(hub: &Arc<Hub>, machine: String, s: Arc<Session>, input: async_channel::Receiver<Input>, first: Option<ServerMsg>) {
     hub.terminals.insert(&s);
     let h = Arc::clone(hub);
@@ -542,24 +609,51 @@ fn run_agent(hub: &Arc<Hub>, machine: String, s: Arc<Session>, input: async_chan
         enum Ev {
             Out(Option<TermOut>),
             In(Option<Input>),
+            Gap,
             Close,
         }
+        let mut repair = Repair::default();
+        // Its turns on its shard (goal 3, plan 01a1a59c2a8e step 3): a burst of output, up to a full queue of
+        // it through the terminal's emulator, held the shard for as long as it all took; it gives the shard
+        // up by its step quantum now.
+        let mut turns = crate::rt::Turns::new();
         loop {
+            turns.after().await;
             let ev = futures::select_biased! {
                 () = s.close.cancelled().fuse() => Ev::Close,
+                () = s.gap.notified().fuse() => Ev::Gap,
                 o = out_rx.recv().fuse() => Ev::Out(o.ok()),
                 i = input.recv().fuse() => Ev::In(i.ok()),
             };
             match ev {
-                Ev::Out(Some(TermOut::Data(d))) => s.output(&d),
-                Ev::Out(Some(TermOut::Replay(d))) => {
-                    // An adopted session starts from the agent's picture of it. One that has a
-                    // picture already (its machine's output stream started over, docs/wire.md) is
-                    // repainted from the new one.
-                    if !s.is_empty() {
-                        s.output(b"\x1bc");
+                Ev::Gap => {
+                    if repair.gap(s.gaps()) {
+                        ask_replay(&h, &machine, &s.id).await;
                     }
-                    s.output(&d);
+                }
+                Ev::Out(Some(TermOut::Data(d))) => {
+                    if repair.gap(s.gaps()) {
+                        ask_replay(&h, &machine, &s.id).await;
+                    }
+                    if !repair.waiting {
+                        s.output(&d);
+                    }
+                }
+                Ev::Out(Some(TermOut::Replay(d))) => {
+                    if repair.gap(s.gaps()) {
+                        // A gap since this replay came: it's older than what was lost, so another
+                        // is asked for.
+                        ask_replay(&h, &machine, &s.id).await;
+                    } else {
+                        repair.waiting = false;
+                        // An adopted session starts from the agent's picture of it. One that has a
+                        // picture already (its machine's output stream started over, docs/wire.md,
+                        // or a gap the hub left) is repainted from the new one.
+                        if !s.is_empty() {
+                            s.output(b"\x1bc");
+                        }
+                        s.output(&d);
+                    }
                 }
                 Ev::Out(Some(TermOut::Exit { code, error })) => {
                     s.finish(code, error);
@@ -610,6 +704,14 @@ mod tests {
         assert!(!reg.rename("nope", "x"), "no such session");
         assert!(reg.rename("t1", "  builds\u{7}  "));
         assert_eq!(reg.list().first().and_then(|i| i.name.clone()).as_deref(), Some("builds"));
+        // Kept off the calling thread, soon after (goal 3, plan 01a1a59c2a8e step 5): read once it's written.
+        let settled = |done: &dyn Fn(&str) -> bool| {
+            let deadline = Instant::now() + Duration::from_secs(20);
+            while !std::fs::read_to_string(&file).is_ok_and(|t| done(&t)) && Instant::now() < deadline {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        };
+        settled(&|t| t.contains("builds"));
         // Another server reads it back when the session comes back under its id.
         let again = Sessions::new();
         again.keep_names_in(file.clone());
@@ -619,7 +721,9 @@ mod tests {
         assert!(again.rename("t1", ""));
         assert_eq!(again.list().first().and_then(|i| i.name.clone()), None);
         assert!(again.rename("t1", "deploys"));
+        settled(&|t| t.contains("deploys"));
         again.remove("t1");
+        settled(&|t| !t.contains("deploys"));
         let third = Sessions::new();
         third.keep_names_in(file);
         assert!(third.names.lock().is_empty());
@@ -648,6 +752,18 @@ mod tests {
         assert_eq!(s.info().attached, 2);
         s.detach();
         assert_eq!(s.info().attached, 1);
+    }
+
+    /// Goal 3, plan 01a1a59c2a8e step 5: a relay asks for one replay a gap, sets the output aside until
+    /// it comes, and asks again for a gap after the one it asked for.
+    #[test]
+    fn g3_s5_a_relay_asks_for_a_replay_once_a_gap() {
+        let mut r = Repair::default();
+        assert!(!r.gap(0) && !r.waiting, "no gap, nothing asked");
+        assert!(r.gap(1) && r.waiting, "a gap: a replay asked for, the output set aside");
+        assert!(!r.gap(1), "the same gap: asked once");
+        r.waiting = false;
+        assert!(r.gap(3) && r.waiting, "gaps since: asked again");
     }
 
     #[test]
