@@ -1,4 +1,5 @@
 /**
+ * Attention plan 01a199e1b177752e84dad5dc990e6a15.
  * How Mission control's list is shown: one filter field (names as you type; runner, harness,
  * state, folder, model and mode as checkboxes with counts) and a sort select beside it. By default
  * the agents that need you come first, as they come to: the list follows them while they work,
@@ -6,13 +7,14 @@
  */
 import * as React from "react";
 import type { AgentInfo } from "@/api/harness";
+import { activityAt } from "./mission-rows";
 import { FacetBox, type Chosen, type Facet } from "@/components/ui/facet-box";
 import { FilterBar, SelectField } from "@/components/ui/misc";
 import { labelOf, useLabels, type Labels } from "@/lib/data";
 import { modelLabel, tildify } from "./derive";
 import { machineName, machineShown } from "./parts";
 
-export type SortId = "priority" | "newest" | "oldest" | "active" | "name" | "name-desc" | "runner" | "harness" | "cost";
+export type SortId = "priority" | "yours" | "newest" | "oldest" | "active" | "name" | "name-desc" | "runner" | "harness" | "cost";
 
 export interface ListView {
   sort: SortId;
@@ -22,7 +24,8 @@ export interface ListView {
 export const DEFAULT_VIEW: ListView = { sort: "priority", facets: {} };
 
 const SORTS: { value: SortId; label: string }[] = [
-  { value: "priority", label: "Needs you first" },
+  { value: "priority", label: "Needs you, then recent" },
+  { value: "yours", label: "Needs you, then yours" },
   { value: "newest", label: "Newest first" },
   { value: "oldest", label: "Oldest first" },
   { value: "active", label: "Recently active" },
@@ -47,11 +50,14 @@ export const STANDS = [
 const RANK = new Map(STANDS.map((s, i) => [s.id, i]));
 
 /** Since when it has waited on you: its oldest request (or, without one, when it paused its goals for you, or its last word). */
-const waitingSince = (a: AgentInfo) => a.approvals.reduce((at, p) => Math.min(at, p.at || at), a.approvals.length > 0 ? Infinity : (a.held?.since ?? a.last_activity));
+const waitingSince = (a: AgentInfo) => a.approvals.reduce((at, p) => Math.min(at, p.at || at), a.approvals.length > 0 ? Infinity : (a.held?.since ?? a.last_turn?.at ?? 0));
 
 export interface ViewRow {
   a: AgentInfo;
   stand: string;
+  rank?: number;
+  pinned?: number;
+  requestRank?: number;
 }
 
 const collator = new Intl.Collator(undefined, {
@@ -116,24 +122,41 @@ const DIMENSIONS: {
   },
 ];
 
+/** Unanswered requests and stopped agents require intervention regardless of their learned rank. */
+const intervention = (row: ViewRow) => (row.stand === "needs" ? 0 : row.stand === "crashed" ? 1 : 2);
+
+/** The server orders the whole pending set; mixing unlike known/unknown ratios here would be inconsistent. */
+function compareIntervention(x: ViewRow, y: ViewRow): number {
+  if (intervention(x) === 2 && intervention(y) === 2) return 0;
+  if (intervention(x) === 2 || intervention(y) === 2) return intervention(x) - intervention(y);
+  const rank = (x.requestRank ?? Number.MAX_SAFE_INTEGER) - (y.requestRank ?? Number.MAX_SAFE_INTEGER);
+  if (rank) return rank;
+  const kind = intervention(x) - intervention(y);
+  if (kind) return kind;
+  return x.stand === "crashed" ? (x.a.exit?.at ?? 0) - (y.a.exit?.at ?? 0) : waitingSince(x.a) - waitingSince(y.a);
+}
+
 function sortBy(sort: SortId, labels?: Labels): (x: ViewRow, y: ViewRow) => number {
   switch (sort) {
     case "priority":
+    case "yours":
       return (x, y) => {
-        // Needs you, working, ready, finished, then inactive states — also the filter's order.
-        const by = (RANK.get(x.stand) ?? RANK.size) - (RANK.get(y.stand) ?? RANK.size);
-        if (by !== 0) return by;
-        // Waiting on you the longest first; the latest news first; otherwise the newest.
-        if (x.stand === "needs") return waitingSince(x.a) - waitingSince(y.a);
-        if (x.stand === "crashed" || x.stand === "paused" || x.stand === "finished") return y.a.last_activity - x.a.last_activity;
-        return y.a.created_at - x.a.created_at;
+        if (intervention(x) < 2 || intervention(y) < 2) {
+          return compareIntervention(x, y);
+        }
+        if (x.pinned !== undefined || y.pinned !== undefined) {
+          if (x.pinned === undefined) return 1;
+          if (y.pinned === undefined) return -1;
+          return x.pinned - y.pinned;
+        }
+        return (x.rank ?? Number.MAX_SAFE_INTEGER) - (y.rank ?? Number.MAX_SAFE_INTEGER);
       };
     case "newest":
       return (x, y) => y.a.created_at - x.a.created_at;
     case "oldest":
       return (x, y) => x.a.created_at - y.a.created_at;
     case "active":
-      return (x, y) => y.a.last_activity - x.a.last_activity;
+      return (x, y) => activityAt(y.a) - activityAt(x.a);
     case "name":
       return (x, y) => collator.compare(x.a.name, y.a.name);
     case "name-desc":
@@ -153,7 +176,7 @@ export const sortOf = (sort: string): SortId => (SORTS.some((s) => s.value === s
 /** In the sort's order; a sort chosen on purpose (by name, by age…) is followed as it is (by runner: by the names they're shown by). */
 export function sortRows<T extends ViewRow>(rows: T[], sort: SortId, labels?: Labels): T[] {
   const by = sortBy(sortOf(sort), labels);
-  return [...rows].sort((x, y) => by(x, y) || y.a.created_at - x.a.created_at || x.a.id.localeCompare(y.a.id));
+  return [...rows].sort((x, y) => by(x, y) || x.a.id.localeCompare(y.a.id));
 }
 
 /** Matches the typed words (its name or title) and every facet chosen (any of a facet's options). */
@@ -225,7 +248,7 @@ interface Kept {
  * keep their places, an agent that no longer matches included, and new agents come in on top; then
  * it follows again.
  */
-export function useShownList<T extends ViewRow>(all: T[], q: string, view: ListView, held: boolean) {
+export function useShownList<T extends ViewRow>(all: T[], q: string, view: ListView, held: boolean, reset = "") {
   // By runner is by the names they're shown by.
   const labels = useLabels();
   const now = React.useMemo(
@@ -238,24 +261,27 @@ export function useShownList<T extends ViewRow>(all: T[], q: string, view: ListV
     [all, q, view, labels],
   );
   // Choosing another filter or sort is using the list too, but it asks for that order at once.
-  const chosen = `${JSON.stringify(view)}|${q}`;
+  const chosen = `${JSON.stringify(view)}|${q}|${reset}`;
   const [kept, setKept] = React.useState<{ chosen: string; was: Kept } | null>(null);
   if (held && (!kept || kept.chosen !== chosen)) {
     setKept({ chosen, was: { ids: now.map((r) => r.a.id), ended: new Set(now.filter((r) => r.stand === "ended").map((r) => r.a.id)) } });
   } else if (!held && kept) setKept(null);
   const was = held && kept?.chosen === chosen ? kept.was : null;
-  return React.useMemo(() => {
-    if (!was) return { live: now.filter((r) => r.stand !== "ended"), ended: now.filter((r) => r.stand === "ended"), matching: now.length };
-    const byId = new Map(all.map((r) => [r.a.id, r]));
-    const known = new Set(was.ids);
-    const fresh = now.filter((r) => !known.has(r.a.id));
-    const stayed = was.ids.map((id) => byId.get(id)).filter((r): r is T => r !== undefined);
-    return {
-      live: [...fresh.filter((r) => r.stand !== "ended"), ...stayed.filter((r) => !was.ended.has(r.a.id))],
-      ended: [...fresh.filter((r) => r.stand === "ended"), ...stayed.filter((r) => was.ended.has(r.a.id))],
-      matching: now.length,
-    };
-  }, [all, now, was]);
+  return React.useMemo(() => heldRows(all, now, was, view.sort === "priority" || view.sort === "yours"), [all, now, was, view.sort]);
+}
+
+/** Keep familiar positions, but never leave a newly urgent row in the folded Ended list. */
+export function heldRows<T extends ViewRow>(all: T[], now: T[], was: Kept | null, prioritized = true) {
+  if (!was) return { live: now.filter((r) => r.stand !== "ended"), ended: now.filter((r) => r.stand === "ended"), matching: now.length };
+  const byId = new Map(all.map((r) => [r.a.id, r]));
+  const known = new Set(was.ids);
+  const fresh = now.filter((r) => !known.has(r.a.id));
+  const stayed = was.ids.map((id) => byId.get(id)).filter((r): r is T => r !== undefined);
+  return {
+    live: [...fresh.filter((r) => r.stand !== "ended"), ...stayed.filter((r) => !was.ended.has(r.a.id) || intervention(r) < 2)].sort((x, y) => (prioritized ? compareIntervention(x, y) : 0)),
+    ended: [...fresh.filter((r) => r.stand === "ended"), ...stayed.filter((r) => was.ended.has(r.a.id) && intervention(r) === 2)],
+    matching: now.length,
+  };
 }
 
 /** After the pointer last moved over the list (or a finger left it), this long before it moves again. */

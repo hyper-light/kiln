@@ -8,7 +8,7 @@
 import type { AgentInfo, Meta, State, Task } from "../src/api/harness.ts";
 import type { Agent } from "../src/api/types.ts";
 
-export const defaultInfo = (): Pick<AgentInfo, "goal" | "summary" | "todos_done" | "todos_total" | "files_changed" | "lines_added" | "lines_removed"> => ({
+export const defaultInfo = (): Pick<AgentInfo, "goal" | "summary" | "todos_done" | "todos_total" | "files_changed" | "lines_added" | "lines_removed" | "owned_work_known"> => ({
   goal: "",
   summary: "",
   todos_done: 0,
@@ -16,6 +16,7 @@ export const defaultInfo = (): Pick<AgentInfo, "goal" | "summary" | "todos_done"
   files_changed: 0,
   lines_added: 0,
   lines_removed: 0,
+  owned_work_known: true,
 });
 
 export const defaultState = (): Pick<

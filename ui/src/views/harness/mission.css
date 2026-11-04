@@ -1828,3 +1828,100 @@ button.mc-pick[aria-expanded="true"] .mc-chev {
 .ms-node:is([data-stand="done"], [data-stand="failed"], [data-stand="stopped"]) {
   touch-action: pan-y;
 }
+
+/* Attention actions stay beside their chats, in flow (01a199e1b177752e84dad5dc990e6a15). */
+.ms-attention-head,
+.ms-attention-notice,
+.ms-attention-controls {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 10px;
+}
+.ms-attention-head {
+  min-height: 32px;
+  justify-content: space-between;
+  margin: 16px 0;
+}
+.ms-attention-field {
+  display: inline-flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px;
+  color: #a1a3ab;
+  font-size: 12px;
+}
+.ms-attention-field input[type="number"] {
+  width: 5rem;
+}
+.ms-attention-controls {
+  grid-column: 1 / -1;
+  padding: 12px 0;
+  font-size: 12px;
+}
+.ms-attention-confirm {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+  width: 100%;
+}
+.ms-attention-settings {
+  max-width: 100%;
+}
+.ms-attention-notice {
+  padding: 12px 0;
+  border-block: 1px solid #2b2d32;
+  font-size: 13px;
+}
+.ms-attention-error {
+  color: #d1aaad;
+}
+.ms-updated {
+  color: #c6b08e;
+  font-family: var(--font-mono);
+  font-size: 10px;
+}
+.ms-rank-reason {
+  grid-column: 2 / -1;
+  color: #848690;
+  font-family: var(--font-mono);
+  font-size: 10px;
+}
+@media (max-width: 640px) {
+  .ms-tail {
+    flex-wrap: wrap;
+  }
+  .ms-attention-controls .select,
+  .ms-attention-controls input {
+    max-width: 100%;
+  }
+}
+
+/* Organize is an action on phones too; review links may yield to the row's arrow. */
+.ms-row .ms-actions .ms-organize {
+  display: inline-flex;
+}
+.ms-organize-icon {
+  display: none;
+}
+@media (max-width: 640px) {
+  .ms-organize-label {
+    display: none;
+  }
+  .ms-organize-icon {
+    display: block;
+  }
+  .ms-row .ms-actions .ms-organize {
+    width: 32px;
+    height: 32px;
+    justify-content: center;
+  }
+}
+
+.ms-stale {
+  color: #d1aaad;
+  font-family: var(--font-mono);
+  font-size: 10px;
+  white-space: nowrap;
+}

@@ -283,6 +283,8 @@ classes! {
         ServerMsg::Freeze { .. } => REFUSED,
         ServerMsg::SignAsLeg { .. } => Class::Ask,
         ServerMsg::Custody { .. } => Class::Ask,
+        ServerMsg::HarnessArchive { .. } => REFUSED,
+        ServerMsg::HarnessRestoreCopy { .. } => REFUSED,
     }
 }
 

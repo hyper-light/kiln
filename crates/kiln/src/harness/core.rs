@@ -94,6 +94,23 @@ pub fn bound_tasks(tasks: &mut Vec<Task>) -> Vec<String> {
     gone
 }
 
+fn merge_owned_reach(tasks: &mut Vec<Task>, owned: &HashMap<String, Task>) -> bool {
+    let mut changed = false;
+    let mut seen = HashSet::new();
+    tasks.retain_mut(|task| {
+        if let Some(actual) = owned.get(&task.id) {
+            if !seen.insert(task.id.clone()) { changed = true; return false; }
+            if task != actual { *task = actual.clone(); changed = true; }
+        }
+        true
+    });
+    let mut missing: Vec<_> = owned.values().filter(|task| !seen.contains(&task.id)).cloned().collect();
+    missing.sort_by(|a, b| a.id.cmp(&b.id));
+    changed |= !missing.is_empty();
+    tasks.extend(missing);
+    changed
+}
+
 /// Who a sent message is from, by its id: one of kiln's own keep-going ones, or a person's.
 pub fn origin_of(client_id: &str) -> &'static str {
     if client_id.starts_with(KEEP_ID) { "kiln" } else { "human" }
@@ -413,6 +430,9 @@ pub struct Core {
     /// The agent session it is (kiln's id): headroom holds and lets in work by it.
     pub session_id: String,
     pub state: State,
+    /// mc_attention (01a199e1b177752e84dad5dc990e6a15): Reach owns these
+    /// lifecycles. A provider's task inventory or exit cannot end them.
+    pub(crate) owned_reach: HashMap<String, Task>,
     pub meta: Meta,
     events: VecDeque<Event>,
     /// id → seq of every event still kept.
@@ -484,6 +504,8 @@ impl Default for Core {
 #[derive(Debug, Serialize, Deserialize)]
 pub struct Frozen {
     state: State,
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    owned_reach: HashMap<String, Task>,
     meta: Meta,
     events: Vec<Event>,
     next_seq: u64,
@@ -509,6 +531,7 @@ impl Core {
         Self {
             session_id: String::new(),
             state: State::default(),
+            owned_reach: HashMap::new(),
             meta: Meta::default(),
             events: VecDeque::new(),
             index: HashMap::new(),
@@ -559,6 +582,7 @@ impl Core {
         use base64::Engine as _;
         Frozen {
             state: self.state.clone(),
+            owned_reach: self.owned_reach.clone(),
             meta: self.meta.clone(),
             events: self.events.iter().cloned().collect(),
             next_seq: self.next_seq,
@@ -585,6 +609,12 @@ impl Core {
         c.events = f.events.into();
         c.next_seq = f.next_seq;
         c.state = f.state;
+        c.owned_reach = f.owned_reach;
+        // Also preserve live ownership from an image predating the separate inventory.
+        for task in c.state.tasks.iter().filter(|task| task.live() && task.id.starts_with(crate::reach::owned::PREFIX)) {
+            c.owned_reach.entry(task.id.clone()).or_insert_with(|| task.clone());
+        }
+        c.sync_owned_reach();
         c.meta = f.meta;
         c.baselines = f.baselines;
         c.by = f.changes.iter().filter(|(_, ch)| !ch.by.is_empty()).map(|(abs, ch)| (abs.clone(), ch.by.clone())).collect();
@@ -1101,6 +1131,7 @@ impl Core {
     /// task's id): it and those under it that ended leave its tasks for good. One still going, or
     /// one it doesn't have, stays as it is. Whether any went.
     pub fn remove_task(&mut self, task: &str) -> bool {
+        self.sync_owned_reach();
         if !self.state.tasks.iter().any(|t| t.id == task && !t.live()) {
             return false;
         }
@@ -1115,6 +1146,7 @@ impl Core {
             }
         }
         self.state.tasks.retain(|t| !gone.contains(&t.id));
+        self.owned_reach.retain(|id, _| !gone.contains(id));
         self.touch_state();
         true
     }
@@ -1180,7 +1212,7 @@ impl Core {
             self.compaction_stopped(parent.as_deref());
         }
         let now = Self::now();
-        for t in self.state.tasks.iter_mut().filter(|t| t.live() && !t.id.starts_with(super::survivors::LEFT)) {
+        for t in self.state.tasks.iter_mut().filter(|t| t.live() && !t.id.starts_with(super::survivors::LEFT) && !t.id.starts_with(crate::reach::owned::PREFIX)) {
             t.status = "stopped".into();
             t.ended.get_or_insert(now);
             self.state_dirty = true;
@@ -1279,9 +1311,11 @@ impl Core {
 
     /// Move everything pending into `out`, in order: changed events, streamed text, then state.
     pub fn flush(&mut self) {
+        self.sync_owned_reach();
         if self.state_dirty || self.reset {
             for id in bound_tasks(&mut self.state.tasks) {
                 self.task_output.remove(&id);
+                self.owned_reach.remove(&id);
             }
         }
         if std::mem::take(&mut self.reset) {
@@ -1326,6 +1360,8 @@ impl Core {
         // Cleared and nothing since: the store still keeps what came before.
         let from = self.events.front().map(|e| e.seq).or(self.state.cleared);
         let mut state = self.state.clone();
+        merge_owned_reach(&mut state.tasks, &self.owned_reach);
+        state.left_behind = state.count_left_behind();
         bound_tasks(&mut state.tasks);
         let mut out = vec![Update::Reset { from }, Update::Meta { meta: Box::new(self.meta.clone()) }, Update::State { state: Box::new(state) }];
         if !self.changes.is_empty() {
@@ -1350,7 +1386,20 @@ impl Core {
 
     pub fn take_out(&mut self) -> Vec<Update> {
         self.flush();
-        std::mem::take(&mut self.out)
+        let mut out = std::mem::take(&mut self.out);
+        for update in &mut out {
+            if let Update::State { state } = update {
+                merge_owned_reach(&mut state.tasks, &self.owned_reach);
+                state.left_behind = state.count_left_behind();
+            }
+        }
+        out
+    }
+
+    pub(crate) fn sync_owned_reach(&mut self) {
+        if merge_owned_reach(&mut self.state.tasks, &self.owned_reach) {
+            self.touch_state();
+        }
     }
 
     pub fn take_writes(&mut self) -> Vec<String> {
@@ -1381,6 +1430,30 @@ impl Core {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn mc_attention_owned_work_survives_native_projection_reset_and_every_state_export() {
+        let mut core = Core::new();
+        let task = Task { id: format!("{}simulated", crate::reach::owned::PREFIX), kind: "reach".into(), class: Some("shell".into()), status: "running".into(), background: true, ..Default::default() };
+        core.owned_reach.insert(task.id.clone(), task.clone());
+        // Include an already queued native snapshot, not just one made by this flush.
+        core.out.push(Update::State { state: Box::new(State::default()) });
+        core.state.tasks = vec![Task { status: "completed".into(), ..task.clone() }];
+        assert!(!core.remove_task(&task.id), "a stale native terminal projection cannot erase live ownership");
+        let updates = core.take_out();
+        let states: Vec<_> = updates.iter().filter_map(|update| if let Update::State { state } = update { Some(state) } else { None }).collect();
+        assert!(!states.is_empty());
+        assert!(states.iter().all(|state| state.tasks.iter().filter(|t| t.id == task.id).count() == 1 && state.tasks.iter().any(|t| t.id == task.id && t.live())));
+        core.adopt(Vec::new(), State::default());
+        assert!(core.state.tasks.is_empty(), "native adopt still owns its native projection");
+        let snapshots = core.snapshot(1024);
+        assert!(snapshots.iter().any(|update| matches!(update, Update::State { state } if state.tasks.iter().any(|t| t.id == task.id && t.live()))));
+        let mut thawed = Core::thaw(core.freeze());
+        assert!(thawed.take_out().iter().any(|update| matches!(update, Update::State { state } if state.tasks.iter().any(|t| t.id == task.id && t.live()))));
+        let mut ended = task.clone(); ended.status = "completed".into();
+        thawed.owned_reach.insert(task.id.clone(), ended);
+        assert!(thawed.take_out().iter().any(|update| matches!(update, Update::State { state } if !state.tasks.iter().any(|t| t.id == task.id && t.live()))));
+    }
 
     /// A subagent that ended is removed with those under it that ended; one still going, under it or
     /// on its own, stays, and so does everything when what's named is still going or isn't there.

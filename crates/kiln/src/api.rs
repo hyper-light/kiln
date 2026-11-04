@@ -899,7 +899,7 @@ async fn authorized(hub: Arc<Hub>, caller: crate::authz::Caller, req: Request) -
                 .map(|repos| Narrow { repos: repos.into_iter().collect(), person: crate::ci::inbox::person(&crate::ci::review::who(&caller).0), runs: HashMap::new() });
             // And of agents, the ones it sees (docs/agents.md, "Whose agents").
             let everyone = caller.agent.is_none() && (caller.is_owner() || caller.can("agents.manage", &crate::authz::Scope::Server));
-            let agents = (!everyone).then(|| AgentsSeen { caller: caller.clone(), seen: HashMap::new() });
+            let agents = Some(AgentsSeen { caller: caller.clone(), all: everyone, seen: HashMap::new() });
             events_ws(hub.clone(), req, narrow, agents)
         }
         (&Method::GET, ["api", "ai-sessions"]) => Ok(ai_sessions(&hub, &caller)),
@@ -1154,6 +1154,7 @@ async fn authorized(hub: Arc<Hub>, caller: crate::authz::Caller, req: Request) -
         }
         (&Method::GET, ["api", "harness", "kinds"]) => Ok(harness_kinds(&hub, &q)),
         (&Method::GET, ["api", "harness", "workspaces"]) => Ok(boxed(|| harness_workspaces(&hub)).await),
+        (_, ["api", "harness", "attention", rest @ ..]) => boxed(|| crate::harness::attention::route(&hub, &caller, &method, rest, req)).await.map_err(|(c, m)| err(c, m)),
         (&Method::GET, ["api", "harness", "sessions"]) => Ok(srv::json(StatusCode::OK, &boxed(|| crate::harness::lineage::seen(&hub, &caller, hub.harness.list())).await)),
         (&Method::POST, ["api", "harness", "sessions"]) => boxed(|| harness_open(&hub, req)).await,
         (&Method::GET, ["api", "harness", "sessions", id]) => match hub.harness.list().into_iter().find(|i| i.id == *id) {
@@ -4567,12 +4568,20 @@ struct Narrow {
 /// (`harness`, `harness_closed`, `agent_change`) reach it only for those; every other event passes.
 struct AgentsSeen {
     caller: crate::authz::Caller,
+    all: bool,
     /// Each session's answer, as asked (whom a session acts for doesn't change).
     seen: HashMap<String, bool>,
 }
 
 impl AgentsSeen {
     async fn lets(&mut self, hub: &Hub, text: &str) -> bool {
+        // Attention plan 01a199e1b177752e84dad5dc990e6a15: attention preferences
+        // belong to their person, including when a manager can see every agent.
+        if text.contains("\"type\":\"attention\"") {
+            let Ok(value) = serde_json::from_str::<serde_json::Value>(text) else { return false };
+            return crate::harness::attention::person(&self.caller).is_some_and(|who| value.get("principal").and_then(serde_json::Value::as_str) == Some(who.as_str()));
+        }
+        if self.all { return true; }
         if !(text.contains("\"type\":\"harness") || text.contains("\"type\":\"agent_change\"")) {
             return true;
         }
@@ -4602,6 +4611,8 @@ impl Narrow {
         let kind = v.get("type").and_then(serde_json::Value::as_str).unwrap_or_default();
         match kind {
             "resync" => return true,
+            // AgentsSeen has already checked the attention event's person.
+            "attention" => return true,
             "inbox" => return v.get("person").and_then(serde_json::Value::as_str) == Some(self.person.as_str()),
             _ => {}
         }
@@ -5081,9 +5092,11 @@ async fn may_steer_goals(hub: &Hub, caller: &crate::authz::Caller, id: &str) -> 
 
 /// An agent's goals not yet started, as they should be (`crate::goals::set`).
 async fn goals_set(hub: &Hub, caller: &crate::authz::Caller, id: &str, req: Request) -> R {
+    let attention_at = crate::util::now_ms();
     may_steer_goals(hub, caller, id).await?;
     let b: GoalsSet = srv::body_json(req.into_body(), JSON_LIMIT).await.map_err(|e| err(StatusCode::BAD_REQUEST, format!("{e:#}")))?;
     let s = crate::goals::set(hub, id, b.goals).await.map_err(goals_err)?;
+    crate::harness::attention_hooks::record(hub, caller, id, "command", &crate::util::new_id(), attention_at).await;
     hub.store.audit(caller.name.clone(), "goals.set".into(), id.to_owned()).await;
     Ok(srv::json(StatusCode::OK, &s))
 }
@@ -5093,6 +5106,7 @@ async fn goals_set(hub: &Hub, caller: &crate::authz::Caller, id: &str, req: Requ
 /// (CP-T3.2; `key`, or its `Idempotency-Key` header): asked again under it, the goals it added are
 /// found, never added twice.
 async fn goals_add(hub: &Hub, caller: &crate::authz::Caller, id: &str, req: Request) -> R {
+    let attention_at = crate::util::now_ms();
     may_steer_goals(hub, caller, id).await?;
     let header = idempotency_key(&req);
     let b: serde_json::Value = srv::body_json(req.into_body(), JSON_LIMIT).await.map_err(|e| err(StatusCode::BAD_REQUEST, format!("{e:#}")))?;
@@ -5109,6 +5123,7 @@ async fn goals_add(hub: &Hub, caller: &crate::authz::Caller, id: &str, req: Requ
     }
     let goals = crate::goals::keyed(&crate::harness::ops::key_scope(caller), id, key.as_deref(), goals);
     let s = crate::goals::add_at(hub, id, goals, start, &crate::goals::At::End).await.map_err(goals_err)?;
+    crate::harness::attention_hooks::record(hub, caller, id, "command", &key.unwrap_or_else(crate::util::new_id), attention_at).await;
     hub.store.audit(caller.name.clone(), "goals.add".into(), id.to_owned()).await;
     Ok(srv::json(StatusCode::OK, &s))
 }
@@ -5170,6 +5185,7 @@ struct HarnessOpen {
 }
 
 async fn harness_open(hub: &Hub, req: Request) -> R {
+    let attention_at = crate::util::now_ms();
     let caller = caller_of(hub, req.headers()).await;
     let mut body: HarnessOpen = srv::body_json(req.into_body(), JSON_LIMIT).await.map_err(|e| err(StatusCode::BAD_REQUEST, format!("{e:#}")))?;
     // Ending a process found running is asked for with a take-over, never with a spec.
@@ -5207,11 +5223,15 @@ async fn harness_open(hub: &Hub, req: Request) -> R {
         Some(_) => {}
     }
     hub.store.audit("admin".into(), "agent.open".into(), format!("{} on {}", body.spec.kind, body.target)).await;
+    let attention_kind = if body.spec.prompt.is_some() { "message" } else { "command" };
     let infos = hub.harness.open(hub, &body.target, body.spec, body.count.unwrap_or(1)).await.map_err(|e| err(StatusCode::BAD_REQUEST, format!("{e:#}")))?;
     // Whom each acts for when its MCP server asks kiln for something (`crate::mcp::runner_ask`), and
     // whose it is.
     if let Some(c) = &caller {
         opened_by(hub, c, &infos).await;
+        for info in &infos {
+            crate::harness::attention_hooks::record(hub, c, &info.id, attention_kind, &info.id, attention_at).await;
+        }
     }
     Ok(srv::json(StatusCode::OK, &infos))
 }
@@ -5242,12 +5262,31 @@ async fn acted_on(hub: &Hub, req: &Request) -> Vec<crate::harness::session::Info
 }
 
 async fn harness_broadcast(hub: &Arc<Hub>, req: Request) -> R {
+    let attention_at = crate::util::now_ms();
+    let caller = req.extensions().get::<crate::authz::Caller>().cloned();
     let (header, by, among) = (idempotency_key(&req), key_scope(&req), acted_on(hub, &req).await);
     let mut b: crate::harness::broadcast::Broadcast = srv::body_json(req.into_body(), JSON_LIMIT).await.map_err(|e| err(StatusCode::BAD_REQUEST, format!("{e:#}")))?;
     if b.key.is_none() {
         b.key = header;
     }
     let report = crate::harness::broadcast::run(hub, &b, &by, &among).await.map_err(|e| err(StatusCode::BAD_REQUEST, format!("{e:#}")))?;
+    if let Some(caller) = &caller {
+        for row in report.results.iter().filter(|r| r.result == "sent") {
+            let kind = if b.approvals.is_some() { "answer" } else if b.text.is_some() || !b.attachments.is_empty() { "message" } else { "command" };
+            crate::harness::attention_hooks::record(hub, caller, &row.id, kind, &report.id, attention_at).await;
+            if b.approvals.is_some() && let Some(info)=among.iter().find(|i|i.id==row.id) {
+                for approval in info.approvals.iter().filter(|a|a.tool!=crate::harness::model::ToolKind::Question) {
+                    if let Some(response)=crate::harness::attention::bind_response(info,&crate::harness::attention::HumanResponse::Approval(approval.id.clone())) {
+                        crate::harness::attention_hooks::response_to(hub,caller,&row.id,&report.id,response,attention_at).await;
+                    }
+                }
+            } else if let Some(command)=b.command.as_ref().and_then(|v|serde_json::from_value::<crate::harness::model::Command>(v.clone()).ok())
+                && let Some(prepared)=crate::harness::attention_hooks::prepare_from_info(&command,Some(&report.id),attention_at,among.iter().find(|i|i.id==row.id))
+                && let Some(response)=prepared.response {
+                crate::harness::attention_hooks::response_to(hub,caller,&row.id,&report.id,response,attention_at).await;
+            }
+        }
+    }
     let what = b.text.as_deref().map_or_else(|| b.approvals.as_deref().map_or_else(|| "a command".to_owned(), |a| format!("{a} what waits")), |t| t.chars().take(80).collect());
     hub.store.audit("admin".into(), "agent.broadcast".into(), format!("{} to {} agents ({} sent, {} skipped, {} failed): {what}", report.id, report.results.len(), report.sent, report.skipped, report.failed)).await;
     Ok(srv::json(StatusCode::OK, &report))
@@ -5323,6 +5362,7 @@ fn idempotency_key(req: &Request) -> Option<String> {
 /// idempotency key, made once by its sender (or, with an `Idempotency-Key` header, made from that):
 /// sent again, it's the same message, delivered once, and answered as it was the first time.
 async fn harness_command(hub: &Arc<Hub>, id: &str, req: Request) -> R {
+    let attention_at = crate::util::now_ms();
     let key = idempotency_key(&req);
     if key.as_ref().is_some_and(|k| k.len() > crate::harness::ops::KEY_MAX || k.chars().any(char::is_control)) {
         return Err(err(StatusCode::BAD_REQUEST, format!("an Idempotency-Key is 1 to {} bytes with no control characters", crate::harness::ops::KEY_MAX)));
@@ -5339,6 +5379,7 @@ async fn harness_command(hub: &Arc<Hub>, id: &str, req: Request) -> R {
         }
     }
     let message = crate::harness::registry::message_id(&c);
+    let attention = crate::harness::attention_hooks::prepare_from_info(&c,key.as_deref(),attention_at,hub.harness.info(id).as_ref());
     // Any other command under a key is taken once (docs/wire.md, "The UI's sockets"): asked again
     // under it, it's answered as it was the first time. A message is its inbox's to take once.
     let sent = match key.filter(|_| !crate::harness::session::is_message(&c)) {
@@ -5358,6 +5399,9 @@ async fn harness_command(hub: &Arc<Hub>, id: &str, req: Request) -> R {
         }
         None => hub.harness.command(hub, id, c).await,
     };
+    if sent.went() && let Some(attention)=attention {
+        crate::harness::attention_hooks::record_prepared(hub,&caller,id,attention).await;
+    }
     answer_command(sent, message)
 }
 
@@ -5409,7 +5453,9 @@ struct HarnessBroadcast {
 /// `/api/harness/broadcast` (each send its own message id); `sent` lists those it reached, and the
 /// rest of the report says why the others weren't.
 async fn harness_command_many(hub: &Arc<Hub>, req: Request) -> R {
+    let attention_at = crate::util::now_ms();
     use crate::harness::broadcast::{Broadcast, To};
+    let caller = req.extensions().get::<crate::authz::Caller>().cloned();
     let (header, by, among) = (idempotency_key(&req), key_scope(&req), acted_on(hub, &req).await);
     let b: HarnessBroadcast = srv::body_json(req.into_body(), JSON_LIMIT).await.map_err(|e| err(StatusCode::BAD_REQUEST, format!("{e:#}")))?;
     // Each agent's message is made from a key: the one given, else the message's own id.
@@ -5420,6 +5466,11 @@ async fn harness_command_many(hub: &Arc<Hub>, req: Request) -> R {
         .await
         .map_err(|e| err(StatusCode::BAD_REQUEST, format!("{e:#}")))?;
     let sent: Vec<&str> = report.results.iter().filter(|o| o.result == "sent").map(|o| o.id.as_str()).collect();
+    if let Some(caller) = &caller {
+        for id in &sent {
+            crate::harness::attention_hooks::command(hub, caller, id, &b.command, Some(&report.id), attention_at,among.iter().find(|i|i.id==*id)).await;
+        }
+    }
     Ok(srv::json(StatusCode::OK, &json!({ "sent": sent, "report": report })))
 }
 
@@ -5770,8 +5821,7 @@ fn harness_ws(hub: Arc<Hub>, id: String, req: Request) -> R {
             Some(c) => crate::harness::lineage::access(&hub, c, &id).await == crate::harness::lineage::Access::Act,
             None => false,
         };
-        let who = caller.map_or_else(|| "admin".to_owned(), |c| c.name);
-        if let Err(e) = harness_attach(hub, id, socket, takes, scope, acts, who).await {
+        if let Err(e) = harness_attach(hub, id, socket, takes, scope, acts, caller).await {
             tracing::debug!(error = %format!("{e:#}"), "agent session websocket ended");
         }
     });
@@ -5830,14 +5880,38 @@ async fn audit_command(hub: &Hub, audit: &mut Option<async_channel::Sender<Strin
 /// What a viewer that may watch an agent but not command it is told of a command.
 const WATCHING: &str = "you may watch this agent but not command it: an agent commands only itself and the agents it started";
 
-/// The frame that answers command `cmd` (of `kind`) once `rx` says what became of it.
-fn answer_of(cmd: String, rx: futures::channel::oneshot::Receiver<crate::harness::registry::Sent>, kind: crate::harness::asked::Kind) -> futures::future::BoxFuture<'static, Option<String>> {
-    use futures::FutureExt as _;
-    async move {
-        let sent = rx.await.unwrap_or_else(|_| crate::harness::registry::Sent::Unanswered("the server let go of it before its answer came".into()));
-        Some(crate::harness::asked::frame(&cmd, &sent, kind))
+/// The authenticated use retained independently of its viewer's socket.
+struct SocketAttention {
+    hub: Arc<Hub>,
+    caller: crate::authz::Caller,
+    agent: String,
+    usage: crate::harness::attention_hooks::Prepared,
+}
+
+impl SocketAttention {
+    fn of(hub: &Arc<Hub>, caller: Option<&crate::authz::Caller>, id: &str, c: &crate::harness::model::Command, key: Option<&str>) -> Option<Self> {
+        Some(Self { hub: hub.clone(), caller: caller?.clone(), agent: id.into(), usage: crate::harness::attention_hooks::prepare(hub,id,c,key)? })
     }
-    .boxed()
+
+    /// Recording cannot delay dispatch or its acknowledgment behind the store's writer.
+    fn record(self) {
+        drop(crate::rt::spawn(async move {
+            crate::harness::attention_hooks::record_prepared(&self.hub, &self.caller, &self.agent, self.usage).await;
+        }));
+    }
+}
+
+fn answer_of(cmd: String, rx: futures::channel::oneshot::Receiver<crate::harness::registry::Sent>, kind: crate::harness::asked::Kind, attention: Option<SocketAttention>) -> futures::future::BoxFuture<'static, Option<String>> {
+    use futures::FutureExt as _;
+    let (tx, output) = futures::channel::oneshot::channel();
+    // A person can navigate away immediately after sending. Keep the accepted action even
+    // when that drops the viewer's answer future.
+    drop(crate::rt::spawn(async move {
+        let sent = rx.await.unwrap_or_else(|_| crate::harness::registry::Sent::Unanswered("the server let go of it before its answer came".into()));
+        if sent.went() && let Some(attention) = attention { attention.record(); }
+        let _ = tx.send(crate::harness::asked::frame(&cmd, &sent, kind));
+    }));
+    async move { output.await.ok() }.boxed()
 }
 
 /// What a viewer is told of a command that didn't get through: refused by its session's inbox (a
@@ -5889,10 +5963,11 @@ enum Live {
 /// offset the snapshot was taken at, so none is missed or seen twice. A viewer that falls behind
 /// what the feed keeps is refused `Behind` (the bus's lag notice) and starts over from a snapshot,
 /// as it does at the feed's resync marker; nothing it does holds up the session or another viewer.
-async fn harness_attach(hub: Arc<Hub>, id: String, socket: ws::WebSocket, takes: Takes, scope: String, acts: bool, who: String) -> anyhow::Result<()> {
+async fn harness_attach(hub: Arc<Hub>, id: String, socket: ws::WebSocket, takes: Takes, scope: String, acts: bool, caller: Option<crate::authz::Caller>) -> anyhow::Result<()> {
     use futures::FutureExt as _;
     use kiln_seams::Bus as _;
     use kiln_seams::bus::Refusal;
+    let who = caller.as_ref().map_or_else(|| "admin".to_owned(), |c| c.name.clone());
     let (mut tx, mut rx) = socket.split();
     // What it can't read of what its person sends, and what they can't read of what it sends,
     // shows on the agent's page.
@@ -6041,10 +6116,11 @@ async fn harness_attach(hub: Arc<Hub>, id: String, socket: ws::WebSocket, takes:
                         match hub.harness.asked.take(&id, &scope, &cmd, kind, Instant::now()) {
                             (kind, Taken::New(rx)) => {
                                 audit_command(&hub, &mut audit, &who, &id, &c).await;
+                                let attention = SocketAttention::of(&hub, caller.as_ref(), &id, &c, Some(&cmd));
                                 hub.harness.send_asked(&hub, &id, &scope, &cmd, c).await;
-                                answers.push(answer_of(cmd, rx, kind));
+                                answers.push(answer_of(cmd, rx, kind, attention));
                             }
-                            (kind, Taken::Waiting(rx)) => answers.push(answer_of(cmd, rx, kind)),
+                            (kind, Taken::Waiting(rx)) => answers.push(answer_of(cmd, rx, kind, None)),
                             (kind, Taken::Answered(sent)) => tx.send(ws::text(frame(&cmd, &sent, kind))).await?,
                         }
                     }
@@ -6052,9 +6128,16 @@ async fn harness_attach(hub: Arc<Hub>, id: String, socket: ws::WebSocket, takes:
                     // the rest.
                     Ok(SessionUp::Bare(c)) => {
                         audit_command(&hub, &mut audit, &who, &id, &c).await;
+                        let attention = SocketAttention::of(&hub, caller.as_ref(), &id, &c, None);
                         let pending = hub.harness.dispatch(&hub, &id, c.clone()).await;
                         let (h, session) = (Arc::clone(&hub), id.clone());
-                        answers.push(async move { refusal_frame(h.harness.resolve(&h, &session, c, pending).await) }.boxed());
+                        let (result, output) = futures::channel::oneshot::channel();
+                        drop(crate::rt::spawn(async move {
+                            let sent = h.harness.resolve(&h, &session, c, pending).await;
+                            if sent.went() && let Some(attention) = attention { attention.record(); }
+                            let _ = result.send(refusal_frame(sent));
+                        }));
+                        answers.push(async move { output.await.ok().flatten() }.boxed());
                     }
                     // What couldn't be read: noted, and answered `nack`, `unsupported` or
                     // `malformed`; told as clients from before ids are, too, when it came as theirs do.

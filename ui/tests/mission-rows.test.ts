@@ -3,7 +3,7 @@ import { registerHooks } from "node:module";
 import { test } from "node:test";
 import type { AgentInfo, SaidHit, SubagentBrief } from "../src/api/harness.ts";
 import type { AiSession } from "../src/api/types.ts";
-import { missionFoundSessions, missionRows, missionSaid, subagentsLine, type MissionRow } from "../src/views/harness/mission-rows.ts";
+import { missionFoundSessions, missionRows, missionSaid, standOf, updatedAt, activityAt, subagentsLine, type MissionRow } from "../src/views/harness/mission-rows.ts";
 import { kilnAtWork, kilnSubagentsOf, subagentsAtWork } from "../src/views/harness/tasks.ts";
 
 // Exercise the actual list matcher and sorter; their view imports need no CSS in Node.
@@ -12,7 +12,7 @@ const loader = registerHooks({
     return url.endsWith(".css") ? { format: "module", source: "export {};", shortCircuit: true } : nextLoad(url, context);
   },
 });
-const { matches, sortRows } = await import("../src/views/harness/list-tools.tsx");
+const { matches, sortRows, heldRows } = await import("../src/views/harness/list-tools.tsx");
 loader.deregister();
 
 const task = (rest: Partial<SubagentBrief> = {}): SubagentBrief => ({
@@ -39,6 +39,7 @@ const agent = (rest: Partial<AgentInfo> = {}): AgentInfo => ({
   approvals: [],
   queued: 0,
   tasks_running: 0,
+  owned_work_known: true,
   cost_usd: 0,
   ...rest,
 });
@@ -112,7 +113,7 @@ test("the subagents kiln starts for an agent's goals or plan steps are on its ro
     rows.map((r) => [r.a.id, r.stand]),
     [
       ["main", "working"],
-      ["helper", "ready"],
+      ["helper", "finished"],
     ],
   );
   const row = rows[0];
@@ -170,18 +171,19 @@ test("a sort chosen on purpose is followed as it is; by default what needs you c
     { a: agent({ id: "epsilon", name: "Epsilon", status: "exited" }), stand: "crashed" },
   ];
   assert.deepEqual(names(sortRows(rows, "name")), ["Alpha", "Beta", "Delta", "Epsilon", "Gamma"]);
-  assert.deepEqual(names(sortRows(rows, "priority")), ["Delta", "Gamma", "Beta", "Alpha", "Epsilon"]);
+  assert.deepEqual(names(sortRows(rows, "priority")), ["Delta", "Gamma", "Epsilon", "Alpha", "Beta"]);
 });
 
-test("needs-first puts working and ready before finished, followed by every inactive state", () => {
+test("mc_attention: needs-first follows server ranking below urgent rows", () => {
   const states = ["ended", "offline", "paused", "crashed", "finished", "ready", "working", "needs"] as const;
   const rows: MissionRow[] = states.map((stand, i) => ({
     a: agent({ id: stand, name: stand, created_at: 9000 - i * 1000, last_activity: 9000 - i * 1000 }),
     stand,
+    rank: ["needs", "working", "ready", "finished", "crashed", "paused", "offline", "ended"].indexOf(stand),
   }));
   assert.deepEqual(
     sortRows(rows, "priority").map((r) => r.stand),
-    ["needs", "working", "ready", "finished", "crashed", "paused", "offline", "ended"],
+    ["needs", "crashed", "working", "ready", "finished", "paused", "offline", "ended"],
   );
   assert.deepEqual(
     rows.map((r) => r.stand),
@@ -190,15 +192,122 @@ test("needs-first puts working and ready before finished, followed by every inac
   );
 });
 
-test("live lifecycle changes update priority even when finished agents are newer", () => {
+test("mc_attention: lifecycle changes preserve the sampled order except needs-you", () => {
   const rows: MissionRow[] = [
-    { a: agent({ id: "work", name: "Work", created_at: 1000 }), stand: "working" },
-    { a: agent({ id: "ready", name: "Ready", created_at: 2000 }), stand: "ready" },
-    { a: agent({ id: "done", name: "Done", created_at: 3000, last_activity: 10000 }), stand: "finished" },
+    { a: agent({ id: "work", name: "Work", created_at: 1000 }), stand: "working", rank: 0 },
+    { a: agent({ id: "ready", name: "Ready", created_at: 2000 }), stand: "ready", rank: 1 },
+    { a: agent({ id: "done", name: "Done", created_at: 3000, last_activity: 10000 }), stand: "finished", rank: 2 },
   ];
   assert.deepEqual(names(sortRows(rows, "priority")), ["Work", "Ready", "Done"]);
   const updated = rows.map((r): MissionRow => (r.a.id === "done" ? { ...r, stand: "working" } : r.a.id === "work" ? { ...r, stand: "finished" } : r));
-  assert.deepEqual(names(sortRows(updated, "priority")), ["Done", "Ready", "Work"]);
+  assert.deepEqual(names(sortRows(updated, "priority")), ["Work", "Ready", "Done"]);
   const needs = updated.map((r): MissionRow => (r.a.id === "work" ? { ...r, stand: "needs" } : r));
-  assert.deepEqual(names(sortRows(needs, "priority")), ["Work", "Done", "Ready"]);
+  assert.deepEqual(names(sortRows(needs, "priority")), ["Work", "Ready", "Done"]);
+});
+
+// Mission Control attention plan 01a199e1b177752e84dad5dc990e6a15.
+test("mc_attention: Finished requires zero work; Updated does not change status", () => {
+  const quiet = agent({ status: "idle", tasks_running: 0, last_turn: { at: 8000, how: "done" } });
+  for (const seen of [0, 8000, 20000]) assert.equal(standOf(quiet, seen), "finished");
+  assert.equal(standOf({ ...quiet, tasks_running: 1 }), "ready");
+  assert.equal(standOf({ ...quiet, left_behind: 1 }), "ready");
+  assert.equal(standOf({ ...quiet, subagents: [task()] }), "working");
+  assert.equal(missionRows([quiet], {}).at(0)?.updated, true);
+  assert.equal(missionRows([quiet], { owner: 8000 }).at(0)?.updated, false);
+  const poll = { ...quiet, last_activity: 999999999, created_at: 999999999 };
+  assert.equal(updatedAt(poll), 8000);
+  assert.equal(activityAt(poll), 8000);
+  assert.equal(missionRows([poll], { owner: 8000 }).at(0)?.updated, false);
+});
+
+test("mc_attention: idle work with an unknown legacy ownership inventory stays Ready", () => {
+  for (const owned_work_known of [undefined, false]) {
+    assert.equal(standOf(agent({ status: "idle", owned_work_known }), 0), "ready");
+  }
+});
+
+test("mc_attention: every explicit Kiln descendant must confirm ownership before Finished", () => {
+  const main = agent({ status: "idle" });
+  const child = agent({ id: "child", parent: "owner", subagent: true, status: "idle" });
+  const nested = agent({ id: "nested", parent: "child", subagent: true, status: "idle", owned_work_known: undefined });
+  assert.equal(missionRows([main, child, nested], {}).at(0)?.stand, "ready");
+  assert.equal(missionRows([main, child, { ...nested, owned_work_known: true }], {}).at(0)?.stand, "finished");
+  assert.equal(missionRows([main, { ...child, subagent: false, owned_work_known: undefined }, nested], {}).at(0)?.stand, "finished");
+});
+
+test("mc_attention: idle subagent background work prevents Finished; standalone work does not", () => {
+  const main = agent({ status: "idle", tasks_running: 0 });
+  const child = agent({ id: "kid", parent: "owner", subagent: true, status: "idle", tasks_running: 1, last_turn: { at: 12000, how: "done" } });
+  const rows = missionRows([main, child], {});
+  assert.deepEqual(
+    rows.map((r) => [r.a.id, r.stand]),
+    [["owner", "ready"]],
+  );
+  assert.equal(rows.at(0)?.updated, true);
+  const standalone = { ...child, subagent: false, status: "running" as const };
+  assert.deepEqual(
+    missionRows([main, standalone], {}).map((r) => [r.a.id, r.stand]),
+    [
+      ["owner", "finished"],
+      ["kid", "working"],
+    ],
+  );
+});
+
+test("mc_attention: nested subagents keep their own row's parent working and updated", () => {
+  const parent = agent({ status: "idle", tasks_running: 0 });
+  const child = agent({ id: "child", parent: "owner", subagent: true, status: "idle", tasks_running: 0 });
+  const grandchild = agent({ id: "grandchild", parent: "child", subagent: true, status: "running" });
+  assert.deepEqual(
+    missionRows([parent, child, grandchild], {}).map((r) => [r.a.id, r.stand]),
+    [["owner", "working"]],
+  );
+  const done = { ...grandchild, status: "idle" as const, tasks_running: 0, last_turn: { at: 15000, how: "done" } };
+  const [row] = missionRows([parent, child, done], { owner: 10000 });
+  assert.equal(row?.stand, "finished");
+  assert.equal(row?.updated, true);
+  assert.equal(row ? updatedAt(row.a) : 0, 15000);
+});
+
+test("mc_attention: errors remain prominent and newly urgent ended rows escape a held fold", () => {
+  const normal: MissionRow = { a: agent({ id: "normal" }), stand: "working", rank: 0 };
+  const error: MissionRow = { a: agent({ id: "error", status: "exited", exit: { code: 1, error: "Cannot restart", at: 10000 } }), stand: "crashed", rank: 999 };
+  const needs: MissionRow = { a: agent({ id: "needs", status: "waiting" }), stand: "needs", rank: 999 };
+  assert.deepEqual(
+    sortRows([normal, error, needs], "priority").map((r) => r.a.id),
+    ["needs", "error", "normal"],
+  );
+  const held = { ids: ["normal", "error", "needs"], ended: new Set(["error", "needs"]) };
+  assert.deepEqual(
+    heldRows([normal, error, needs], [needs, error, normal], held).live.map((r) => r.a.id),
+    ["needs", "error", "normal"],
+  );
+  assert.equal(heldRows([normal, error, needs], [needs, error, normal], held).ended.length, 0);
+});
+
+test("mc_attention: urgent rows follow the server's globally comparable request rank", () => {
+  const old: MissionRow = {
+    a: agent({ id: "old", status: "waiting", approvals: [{ id: "o", tool: "question", tool_name: "question", title: "Old request", at: 10 }] }),
+    stand: "needs",
+    requestRank: 1,
+  };
+  const recent: MissionRow = {
+    a: agent({ id: "recent", status: "waiting", approvals: [{ id: "n", tool: "question", tool_name: "question", title: "New request", at: 20 }] }),
+    stand: "needs",
+    requestRank: 0,
+  };
+  assert.deepEqual(
+    sortRows([old, recent], "priority").map((r) => r.a.id),
+    ["recent", "old"],
+  );
+  assert.deepEqual(
+    sortRows(
+      [
+        { ...old, requestRank: undefined },
+        { ...recent, requestRank: undefined },
+      ],
+      "priority",
+    ).map((r) => r.a.id),
+    ["old", "recent"],
+  );
 });

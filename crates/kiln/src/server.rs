@@ -182,6 +182,7 @@ pub async fn run(cfg: Config, shutdown: Shutdown) -> anyhow::Result<()> {
         child!("terminals", h => h.terminal_loop());
         child!("agent-screens", h => crate::harness::screen::watch(h));
         child!("goal-stacks", h => crate::goals::run(h));
+        child!("attention", h => crate::harness::attention::run(h));
         child!("plan-runs", h => crate::plans::agents::drive(h));
         child!("harness", h => crate::harness::registry::Registry::run_local(h));
         child!("push", h => crate::push::run(h));

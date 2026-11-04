@@ -171,7 +171,7 @@ pub enum Local {
     /// Link up to `peer` (if it is not), answering with the machine it is.
     Connect { peer: String, reply: oneshot::Sender<anyhow::Result<Host>> },
     /// Run on `peer`; what the run says goes to `says`. Answers with its id.
-    Run { peer: String, spec: Box<RunSpec>, says: Says, reply: oneshot::Sender<u64> },
+    Run { peer: String, spec: Box<RunSpec>, says: Says, evidence: Option<async_channel::Sender<bool>>, reply: oneshot::Sender<u64> },
     /// Something more for a run (input, a signal, Forget).
     Ask { peer: String, ask: Ask },
     /// Follow a sync of `key` on `peer` (what it says goes to `says`), then send it `asks`.
@@ -257,7 +257,13 @@ impl Handle {
     }
 
     pub async fn run(&self, peer: &str, spec: RunSpec, says: Says) -> anyhow::Result<u64> {
-        self.ask(|reply| Local::Run { peer: peer.to_owned(), spec: Box::new(spec), says, reply }).await
+        self.ask(|reply| Local::Run { peer: peer.to_owned(), spec: Box::new(spec), says, evidence: None, reply }).await
+    }
+
+    /// Internal provenance of an exit report: true only for an actual peer terminal
+    /// response, false for a locally synthesized loss of knowledge. No wire change.
+    pub(crate) async fn run_observed(&self,peer:&str,spec:RunSpec,says:Says,evidence:async_channel::Sender<bool>)->anyhow::Result<u64>{
+        self.ask(|reply|Local::Run{peer:peer.to_owned(),spec:Box::new(spec),says,evidence:Some(evidence),reply}).await
     }
 
     pub async fn send(&self, peer: &str, ask: Ask) -> bool {
@@ -541,6 +547,7 @@ struct Link {
 /// A run this side follows on another runner.
 struct Follow {
     says: Says,
+    evidence: Option<async_channel::Sender<bool>>,
     /// Output offset received up to.
     got: u64,
     exited: bool,
@@ -1078,6 +1085,7 @@ impl Node {
             p.queue.retain(|a| !matches!(a, Ask::Run(_)));
             for id in never {
                 if let Some(f) = p.follows.remove(&id) {
+                    if let Some(evidence)=&f.evidence{let _=evidence.try_send(false);}
                     let _ = f.says.send(Say::Exit { id, code: None, signal: None, error: Some(why.to_owned()), end: f.got, lost: 0 }).await;
                 }
             }
@@ -1136,6 +1144,7 @@ impl Node {
                 tracing::debug!(peer = %name, resumed = resumed.len(), lost = lost.len(), "reach link ready");
                 for id in lost {
                     if let Some(f) = p.follows.remove(&id) {
+                        if let Some(evidence)=&f.evidence{let _=evidence.try_send(false);}
                         let _ = f.says.send(Say::Exit { id, code: None, signal: None, error: Some(format!("{name} no longer has this run (its runner restarted)")), end: f.got, lost: 0 }).await;
                     }
                 }
@@ -1174,6 +1183,7 @@ impl Node {
                 // On one link output always comes before the exit; a shortfall is output lost.
                 let lost = lost + end.saturating_sub(f.got);
                 f.exited = true;
+                if let Some(evidence)=&f.evidence{let _=evidence.try_send(true);}
                 let _ = f.says.send(Say::Exit { id, code, signal, error, end, lost }).await;
                 p.follows.remove(&id);
                 self.say_on(link, &Ask::Forget { id }).await;
@@ -1640,12 +1650,12 @@ impl Node {
                 }
                 self.ensure_link(&peer).await;
             }
-            Local::Run { peer, mut spec, says, reply } => {
+            Local::Run { peer, mut spec, says, evidence, reply } => {
                 let p = self.peers.entry(peer.clone()).or_insert_with(Peer::new);
                 let id = p.next_id;
                 p.next_id += 1;
                 spec.id = id;
-                p.follows.insert(id, Follow { says, got: 0, exited: false, detached: false });
+                p.follows.insert(id, Follow { says, evidence, got: 0, exited: false, detached: false });
                 let _ = reply.send(id);
                 self.send_or_queue(&peer, Ask::Run(spec)).await;
             }

@@ -1,4 +1,5 @@
 /**
+ * Attention plan 01a199e1b177752e84dad5dc990e6a15.
  * What runs beside an agent, as every view reads it: which tasks are its subagents, when they keep it
  * working, and who can stop each. An agent is at work while its turn runs and, its turn over, while a
  * subagent it sent off still works (it goes on when that one reports back); shells, monitors,
@@ -16,12 +17,30 @@ import { agentLabel, taskLive } from "./derive";
  */
 export const kilnSubagentsOf = (list: readonly AgentInfo[], id: string): AgentInfo[] => list.filter((a) => a.subagent === true && a.parent === id);
 
+/** Explicit Kiln descendants only: an independent agent and its work belong to its own row. */
+export function kilnDescendantsOf(list: readonly AgentInfo[], id: string): AgentInfo[] {
+  const found: AgentInfo[] = [];
+  const visited = new Set([id]);
+  const queue = kilnSubagentsOf(list, id);
+  for (const child of queue) {
+    if (visited.has(child.id)) continue;
+    visited.add(child.id);
+    found.push(child);
+    queue.push(...kilnSubagentsOf(list, child.id));
+  }
+  return found;
+}
+
+/** Finished requires a confirmed ownership inventory, including work outside the harness state. */
+export const idleWorkFinished = (a: Pick<AgentInfo, "owned_work_known" | "tasks_running" | "left_behind"> | null, stateHasWork = false): boolean =>
+  a?.owned_work_known === true && a.tasks_running === 0 && (a.left_behind ?? 0) === 0 && !stateHasWork;
+
 /** Its process ended while nobody ended it: kiln starts it again by itself (docs/agents.md, "An agent lives until it's ended"). */
 export const startingAgain = (a: Pick<AgentInfo, "status" | "exit">) => a.status === "exited" && a.exit?.again_at != null;
 
 /** Where one of them stands, in a task's words: running, paused (on you, or for a usage limit), pending (its machine away), else done. */
-export function kilnStatus(a: Pick<AgentInfo, "status" | "approvals" | "pause" | "exit" | "held">): string {
-  if (a.status === "running" || a.status === "starting" || startingAgain(a)) return "running";
+export function kilnStatus(a: Pick<AgentInfo, "status" | "approvals" | "pause" | "exit" | "held" | "subagents">): string {
+  if (a.status === "running" || a.status === "starting" || startingAgain(a) || (a.status === "idle" && subagentsAtWork(a.subagents).length > 0)) return "running";
   if (a.status === "waiting" || a.approvals.length > 0 || a.held || a.pause) return "paused";
   if (a.status === "disconnected") return "pending";
   if (a.status === "exited" && a.exit?.error) return "failed";
@@ -32,10 +51,25 @@ export function kilnStatus(a: Pick<AgentInfo, "status" | "approvals" | "pause" |
 export const kilnAtWork = (subs: readonly AgentInfo[]): AgentInfo[] => subs.filter((a) => kilnStatus(a) !== "completed" && kilnStatus(a) !== "failed");
 
 /** One of them as lists show an agent's subagents (`SubagentBrief`: its id is its session's). */
-export const kilnBrief = (a: AgentInfo): SubagentBrief => ({ id: a.id, description: agentLabel(a), status: kilnStatus(a), started: a.turn_started ?? a.created_at });
+export const kilnBrief = (a: AgentInfo): SubagentBrief => ({
+  id: a.id,
+  description: agentLabel(a),
+  status: kilnStatus(a),
+  started: a.turn_started ?? a.last_turn?.at ?? 0,
+  ended: Math.max(a.last_turn?.at ?? 0, ...(a.subagents ?? []).map((s) => s.ended ?? 0)) || undefined,
+});
 
 /** An agent as its row shows it: the subagents kiln started for it among its own. */
-export const withKilnSubagents = (a: AgentInfo, subs: readonly AgentInfo[]): AgentInfo => (subs.length > 0 ? { ...a, subagents: [...(a.subagents ?? []), ...subs.map(kilnBrief)] } : a);
+export const withKilnSubagents = (a: AgentInfo, subs: readonly AgentInfo[]): AgentInfo =>
+  subs.length > 0
+    ? {
+        ...a,
+        subagents: [...(a.subagents ?? []), ...subs.map(kilnBrief)],
+        tasks_running: a.tasks_running + subs.reduce((n, s) => n + s.tasks_running, 0),
+        left_behind: (a.left_behind ?? 0) + subs.reduce((n, s) => n + (s.left_behind ?? 0), 0),
+        owned_work_known: a.owned_work_known === true && subs.every((s) => s.owned_work_known === true),
+      }
+    : a;
 
 /** What a task is; machines from before `class` only say the harness's own task type. */
 export const classOf = (t: Pick<Task, "class" | "kind">): string =>

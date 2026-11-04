@@ -22,7 +22,7 @@ use crate::harness::model::{Status, ToolKind};
 use crate::harness::session::Info;
 
 /// Where an agent stands, as Mission Control says it (ui/src/views/harness/mission.tsx, `standOf`;
-/// "finished" and "ready" are both [`Stand::Idle`] here: what a person has seen is the browser's).
+/// "finished" and "ready" are both [`Stand::Idle`] here; attention acknowledgment is separate).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Stand {
     Needs,
@@ -372,6 +372,24 @@ fn pause_line(p: &crate::harness::model::Pause) -> String {
     format!("{what} · {when}")
 }
 
+/// Attention plan 01a199e1b177752e84dad5dc990e6a15: a completion's words describe
+/// the whole row at delivery time. This copy never enters Watch or changes its triggers.
+pub fn for_display(parent:&Info,all:&[Info])->Info{
+    let mut display=parent.clone();
+    let family=crate::harness::lineage::subagents_under(all,&parent.id);
+    for child in all.iter().filter(|i|family.contains(&i.id)){
+        if child.owned_work_known!=Some(true){display.owned_work_known=Some(false);}
+        display.tasks_running=display.tasks_running.saturating_add(child.tasks_running);
+        display.left_behind=display.left_behind.saturating_add(child.left_behind);
+        // A pending/paused subagent still belongs to the ongoing work, just as a
+        // native SubagentBrief with that status does. Standalone agents aren't family.
+        if matches!(stand_of(child),Stand::Working|Stand::Needs|Stand::Paused|Stand::Offline) || child.held.is_some() || child.subagents.iter().any(|s|crate::harness::model::live_task(&s.status)){
+            display.status=Status::Running;
+        }
+    }
+    display
+}
+
 /// The one line Mission Control shows for the agent, as the note's text.
 pub fn line(i: &Info, kind: Kind) -> String {
     let text = match kind {
@@ -392,7 +410,11 @@ pub fn line(i: &Info, kind: Kind) -> String {
         Kind::Finished => {
             let said = plain(&i.summary);
             let what = [said.as_str(), i.goal.trim(), i.title.trim()].into_iter().find(|s| !s.is_empty()).unwrap_or("Done");
-            format!("Finished: {what}")
+            // Attention plan 01a199e1b177752e84dad5dc990e6a15: retain the existing
+            // event kind and notification timing, but describe the work that remains honestly.
+            let status=if matches!(i.status,Status::Running|Status::Starting) || i.subagents.iter().any(|s|crate::harness::model::live_task(&s.status)){"Working"}
+                else if i.tasks_running>0 || i.left_behind>0 || i.owned_work_known!=Some(true){"Ready"}else{"Finished"};
+            format!("{status}: {what}")
         }
         Kind::Stopped => format!("Stopped: {}", i.exit.as_ref().and_then(|e| e.error.as_deref()).filter(|e| !e.trim().is_empty()).unwrap_or("it stopped unexpectedly")),
         Kind::Paused => match &i.pause {
@@ -416,7 +438,7 @@ mod tests {
     use crate::harness::session::ApprovalBrief;
 
     fn agent(status: Status) -> Info {
-        Info { id: "ag1".into(), kind: "claude".into(), kind_name: "Claude Code".into(), name: "Mantle".into(), status, ..Info::default() }
+        Info { owned_work_known:Some(true), id: "ag1".into(), kind: "claude".into(), kind_name: "Claude Code".into(), name: "Mantle".into(), status, ..Info::default() }
     }
 
     fn ask(id: &str, at: i64, tool: ToolKind, title: &str) -> ApprovalBrief {
@@ -433,6 +455,46 @@ mod tests {
         w.due(&d.agent, d.seq).map(|n| vec![(n.kind, line(&n.info, n.kind))]).unwrap_or_default()
     }
 
+    #[test]
+    fn mc_attention_completion_text_distinguishes_ready_from_finished_without_a_new_event()->anyhow::Result<()>{
+        let idle=Info{summary:"Tests passed".into(),..agent(Status::Idle)};
+        assert_eq!(line(&idle,Kind::Finished),"Finished: Tests passed");
+        assert_eq!(line(&Info{tasks_running:1,..idle.clone()},Kind::Finished),"Ready: Tests passed");
+        assert_eq!(line(&Info{left_behind:1,..idle.clone()},Kind::Finished),"Ready: Tests passed");
+        let sub=serde_json::from_value(serde_json::json!({"id":"sub","description":"Checks","status":"running","started":1}))?;
+        assert_eq!(line(&Info{subagents:vec![sub],..idle},Kind::Finished),"Working: Tests passed");
+        assert_eq!(Kind::Finished.event(),"agent.finished");Ok(())
+    }
+
+    #[test]
+    fn mc_attention_notification_words_include_only_recursive_true_kiln_subagents(){
+        let parent=Info{summary:"Tests passed".into(),..agent(Status::Idle)};
+        let child=Info{id:"child".into(),parent:Some(parent.id.clone()),subagent:true,status:Status::Running,..Info::default()};
+        assert_eq!(line(&for_display(&parent,&[child.clone()]),Kind::Finished),"Working: Tests passed");
+        let shell=Info{status:Status::Idle,tasks_running:1,..child.clone()};
+        assert_eq!(line(&for_display(&parent,&[shell]),Kind::Finished),"Ready: Tests passed");
+        let monitor=Info{status:Status::Idle,left_behind:1,..child.clone()};
+        assert_eq!(line(&for_display(&parent,&[monitor]),Kind::Finished),"Ready: Tests passed");
+        let idle=Info{status:Status::Idle,..child.clone()};
+        let grandchild=Info{id:"grandchild".into(),parent:Some(child.id.clone()),subagent:true,status:Status::Running,..Info::default()};
+        assert_eq!(line(&for_display(&parent,&[idle,grandchild.clone()]),Kind::Finished),"Working: Tests passed");
+        let standalone=Info{subagent:false,..child};
+        assert_eq!(line(&for_display(&parent,&[standalone,grandchild]),Kind::Finished),"Finished: Tests passed","MCP/API agents and their own descendants retain independent rows");
+        assert_eq!(parent.status,Status::Idle,"display aggregation never changes the watched state");
+        assert_eq!(Kind::Finished.event(),"agent.finished");
+    }
+
+    #[test]
+    fn mc_attention_notification_finished_requires_confirmed_owned_zero(){
+        let known=Info{summary:"Tests passed".into(),..agent(Status::Idle)};
+        assert_eq!(line(&known,Kind::Finished),"Finished: Tests passed");
+        assert_eq!(line(&Info{owned_work_known:None,..known.clone()},Kind::Finished),"Ready: Tests passed");
+        assert_eq!(line(&Info{owned_work_known:Some(false),..known.clone()},Kind::Finished),"Ready: Tests passed");
+        let child=Info{id:"unknown-child".into(),parent:Some(known.id.clone()),subagent:true,status:Status::Idle,..Info::default()};
+        assert_eq!(line(&for_display(&known,&[child]),Kind::Finished),"Ready: Tests passed");
+        let confirmed=Info{id:"confirmed-child".into(),parent:Some(known.id.clone()),subagent:true,status:Status::Idle,owned_work_known:Some(true),..Info::default()};
+        assert_eq!(line(&for_display(&known,&[confirmed]),Kind::Finished),"Finished: Tests passed");
+    }
     #[test]
     fn stands_as_mission_control_says_them() {
         assert_eq!(stand_of(&agent(Status::Running)), Stand::Working);

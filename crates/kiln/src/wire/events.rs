@@ -127,6 +127,8 @@ pub enum ServerEvent {
     /// What the page sent up this socket that couldn't be read: to that socket alone, never
     /// [`crate::hub::Hub::emit`]ted.
     Refused(crate::wire::ui::Refused),
+    /// A person changed Mission Control placement or a declared park woke.
+    Attention { principal: String },
     /// Something happened to a run or a diff that notification rules hear (`run.failed`,
     /// `mention` ...): the tag is its [`NoticeKind`].
     #[serde(untagged)]

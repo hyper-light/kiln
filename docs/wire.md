@@ -470,9 +470,10 @@ takes a new bit, never one that means something already, even in the other direc
 | 45 | `CAP_LEG_SIGNS` | `AgentMsg::Caps`, `ServerMsg::Caps` | a leg signs as itself what it hands on: its results at its end, and the provenance kiln writes of what it built (`LegResults`, `SignAsLeg`, `LegSignature`; ci.md W27-R05, R06) |
 | 46 | `CAP_CUSTODY` | `AgentMsg::Caps`, `ServerMsg::Caps` | custody: the runner signs its sessions' hand-overs and acts and takes work handed to them signed, and checks the server's words on a hand-over; the server takes custody records and signed acts, signs its words and hands work on signed (`Custody` both ways, `ReachAsk`'s `act`, `HarnessCmd`'s `word`, `Identity`'s `hand_on` and `receipt`; ci.md W27-R08) |
 | 53 | `CAP_FREEZE` | `AgentMsg::Caps` | the runner freezes a job it runs where it runs and lets it go on (`Freeze`: Pause and Resume, ci.md W26-R22); Unix and Windows runners say it |
+| 54 | `CAP_HARNESS_ARCHIVE` | `AgentMsg::Caps` | retained archive and restore, including explicit continuation from a saved conversation (`HarnessArchive`, `HarnessRestoreCopy`; attention plan 01a199e1b177752e84dad5dc990e6a15). Check the capability of the process holding the session. |
 
 Bits 47 to 52 are kept for lines on their way: the unification's, which held bits from 42 on their
-branches before the Changes tab took 42 and 43, and W27's relays. Bits from 54 are free. Take the next
+branches before the Changes tab took 42 and 43, and W27's relays. Bits from 55 are free. Take the next
 one, and add its row here in the same change.
 
 ## The lab
@@ -666,6 +667,8 @@ Four edges are left, and the lab steers clear of each:
 | `Freeze` | command, refused while away | A running leg frozen where it runs, or let go on (Pause and Resume, ci.md W26-R22): its steps' processes stopped, its job container paused, its time limit stopped. A pause that waited for its runner to come back would stop the job later than the person asked. | New: to runners announcing `CAP_FREEZE`, on the channel ("Commands"): answered once done, refused saying why (no such leg there, or one it can't stop in place). |
 | `SignAsLeg` | ask | The provenance kiln wrote of what a leg built, for the leg to sign as itself once it's of what its attest step reported (ci.md W27-R06). Answered by `LegSignature`. | New: to runners that say `CAP_LEG_SIGNS`. |
 | `Custody` | ask | Work kiln handed one of the runner's agent sessions (a plan's step, a subagent's task, what a person handed off): its hand-on, whose receipt the process holding the session signs as the session's next turn starts (ci.md W27-R08). Answered by a `Custody` record. | New: to runners that say `CAP_CUSTODY`; sent again for work not yet received when the runner says what it holds. |
+| `HarnessArchive` | command, refused while away | Archive a session with a durable retained transcript and workspace, or restore its native session. A failed restore keeps the archive. Automatic archive sets `only_if_quiet`: the owning process drains accepted commands and checks current work under its archive fence before admitting the stop. | Only to its owning process announcing `CAP_HARNESS_ARCHIVE`; acknowledged after the retained archive or restored active state is durable. Never translated to destructive `HarnessClose`. |
+| `HarnessRestoreCopy` | command, refused while away | Explicitly start a fresh native session carrying the retained conversation. Used when native restore is unavailable, after the person chooses saved-copy continuation. | Only to its owning process announcing `CAP_HARNESS_ARCHIVE`; failed context installation leaves the archive available for retry. |
 
 ## Commands to a session: `Command`
 

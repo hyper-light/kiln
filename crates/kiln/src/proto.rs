@@ -488,6 +488,10 @@ pub const CAP_LEG_SIGNS: u64 = 1 << 45;
 /// (`crate::custody::take`). (Bits 41 to 43 are main's, 44 `CAP_AGENT_GIT`, 45 `CAP_LEG_SIGNS`.)
 pub const CAP_CUSTODY: u64 = 1 << 46;
 
+/// Attention plan 01a199e1b177752e84dad5dc990e6a15: archive a session without
+/// discarding its workspace or attachments, and restore its exact recorded spec.
+pub const CAP_HARNESS_ARCHIVE: u64 = 1 << 54;
+
 /// What an [`AgentMsg::Identity`] asks for: a certificate for the key of `csr`, as `kind` says.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(default)]
@@ -861,6 +865,12 @@ pub enum ServerMsg {
     /// Appended last, after main's `Freeze` (W26-R22, on main first): postcard encodes variants by
     /// index.
     Custody { json: String },
+    /// Archive/restore is acknowledged only after the session's durable record and process
+    /// transition. Only to runners announcing CAP_HARNESS_ARCHIVE; append-only postcard.
+    HarnessArchive { session: String, restore: bool, only_if_quiet: bool },
+    /// Explicitly continue an archive in a new native conversation using kiln's saved history.
+    /// CAP_HARNESS_ARCHIVE; appended after HarnessArchive to preserve variant indices.
+    HarnessRestoreCopy { session: String },
 }
 
 /// What the server's copy of one agent session has of its events, said in digests
@@ -1360,6 +1370,26 @@ mod tests {
         Ok(())
     }
 
+    /// Attention plan 01a199e1b177752e84dad5dc990e6a15: old runners must never
+    /// mistake retention for destructive Close, and every older postcard index stays put.
+    #[test]
+    fn mc_attention_archive_protocol_is_append_only() -> anyhow::Result<()> {
+        let last = encode(&ServerMsg::Custody { json: "{}".into() })?;
+        let archive = ServerMsg::HarnessArchive { session: "a".into(), restore: false, only_if_quiet: false };
+        let archived = encode(&archive)?;
+        assert_eq!(archived.first().copied(), last.first().map(|i| i + 1));
+        assert_eq!(decode::<ServerMsg>(&archived)?, archive);
+        let automatic = ServerMsg::HarnessArchive { session: "a".into(), restore: false, only_if_quiet: true };
+        assert_eq!(decode::<ServerMsg>(&encode(&automatic)?)?, automatic);
+        let copy = ServerMsg::HarnessRestoreCopy { session: "a".into() };
+        let copied = encode(&copy)?;
+        assert_eq!(copied.first().copied(), archived.first().map(|i| i + 1));
+        assert_eq!(decode::<ServerMsg>(&copied)?, copy);
+        assert!(CAP_HARNESS_ARCHIVE.is_power_of_two());
+        assert_eq!(CAP_HARNESS_ARCHIVE & ((CAP_FREEZE << 1) - 1), 0);
+        Ok(())
+    }
+
     /// Typed messages, step 3: word that a frame couldn't be read is appended last in both, after
     /// the hand-overs', T3's, W24's, the agent limit's, identities', observe's and headroom's, behind
     /// a bit of its own.
@@ -1377,8 +1407,9 @@ mod tests {
         assert_eq!(decode::<AgentMsg>(&encode(&up)?)?, up);
         assert_eq!(decode::<ServerMsg>(&encode(&down)?)?, down);
         // Step 5 appended `LinkUnread` (57) and `ReachRefused` (63) after them, W26-R22 `Freeze` (64),
-        // and W27 its legs' signing and custody (58 to 60, 65 and 66).
-        assert_eq!((crate::wire::agent_classes().len(), crate::wire::server_classes().len()), (61, 67), "each table has every variant once");
+        // and W27 its legs' signing and custody (58 to 60, 65 and 66). The attention
+        // plan appends retained archive and saved-copy restore as server variants 67 and 68.
+        assert_eq!((crate::wire::agent_classes().len(), crate::wire::server_classes().len()), (61, 69), "each table has every variant once");
         assert!(CAP_UNREAD.is_power_of_two() && CAP_UNREAD == 1 << 41 && CAP_UNREAD & (CAP_WIRE | CAP_NET_DROPS | CAP_INBOX | CAP_HANDOVER | CAP_WORK | CAP_AGENT_LIMIT | CAP_IDENTITY | CAP_HEADROOM | CAP_CHANGES_PATCH) == 0);
         assert!(CAP_WORKSPACE_COMMITS.is_power_of_two() && CAP_WORKSPACE_COMMITS == 1 << 42 && CAP_WORKSPACE_COMMITS & (CAP_WIRE | CAP_NET_DROPS | CAP_INBOX | CAP_HANDOVER | CAP_WORK | CAP_AGENT_LIMIT | CAP_IDENTITY | CAP_HEADROOM | CAP_CHANGES_PATCH | CAP_UNREAD) == 0);
         assert!(CAP_WORKSPACE_COMPARE.is_power_of_two() && CAP_WORKSPACE_COMPARE == 1 << 43 && CAP_WORKSPACE_COMPARE & (CAP_WIRE | CAP_NET_DROPS | CAP_INBOX | CAP_HANDOVER | CAP_WORK | CAP_AGENT_LIMIT | CAP_IDENTITY | CAP_HEADROOM | CAP_CHANGES_PATCH | CAP_UNREAD | CAP_WORKSPACE_COMMITS) == 0);

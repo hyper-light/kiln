@@ -38,6 +38,8 @@ impl Owned {
             | ServerMsg::HarnessCmd { session, .. }
             | ServerMsg::HarnessSend { session, .. }
             | ServerMsg::HarnessClose { session }
+            | ServerMsg::HarnessArchive { session, .. }
+            | ServerMsg::HarnessRestoreCopy { session }
             | ServerMsg::HarnessPackage { session, .. }
             | ServerMsg::HarnessRelease { session }
             | ServerMsg::HarnessFileRead { session, .. }
@@ -509,6 +511,27 @@ mod tests {
         assert_eq!(m.newest("box"), Some(20));
         assert!(m.crowded().is_empty());
         Ok(())
+    }
+
+    /// Attention plan 01a199e1b177752e84dad5dc990e6a15: blue/green's newest
+    /// process must not take archive commands for a session still held by the older one.
+    #[test]
+    fn mc_attention_archive_uses_its_holder_and_that_holders_capabilities(){
+        let mut m=Instances::default();m.join(10,"box",hello("old"),1);
+        let owned=Owned::Agent("chat".into());m.own(owned.clone(),10);
+        m.announce(20,ih("new",100));m.join(20,"box",hello("new"),2);
+        m.set_wide(20,crate::proto::CAP_HARNESS_ARCHIVE);
+        assert_eq!(m.newest("box"),Some(20));
+        assert_eq!(m.wide_caps_for("box",&owned)&crate::proto::CAP_HARNESS_ARCHIVE,0,"a capable newest runner does not upgrade the older session holder");
+        let commands=[ServerMsg::HarnessArchive{session:"chat".into(),restore:false,only_if_quiet:false},ServerMsg::HarnessArchive{session:"chat".into(),restore:true,only_if_quiet:false},ServerMsg::HarnessRestoreCopy{session:"chat".into()}];
+        for command in &commands{assert_eq!(Owned::of(command),Some(owned.clone()));assert_eq!(m.route("box",command),Some(10));}
+        m.set_wide(10,crate::proto::CAP_HARNESS_ARCHIVE);
+        assert_ne!(m.wide_caps_for("box",&owned)&crate::proto::CAP_HARNESS_ARCHIVE,0);
+        // Archive's Closed inventory removes ownership. Restore then goes to the newest
+        // connected process, which reads the machine-local retained archive.
+        m.disown(&owned);
+        for command in commands.iter().skip(1){assert_eq!(m.route("box",command),Some(20));}
+        assert_ne!(m.wide_caps_for("box",&owned)&crate::proto::CAP_HARNESS_ARCHIVE,0);
     }
 
     #[test]

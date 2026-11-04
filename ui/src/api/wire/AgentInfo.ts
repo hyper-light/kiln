@@ -28,6 +28,11 @@ target: string, name: string, shell?: string, cwd: string,
  */
 tree?: string, created_at: number, status: SessionStatus, title: string, model: string, mode: string, harness_session?: string, approvals: Array<ApprovalBrief>, queued: number, tasks_running: number, 
 /**
+ * Whether this runner can account for every owned detached Reach command. Older or
+ * incompletely restored ownership stays unknown, so zero native tasks is not Finished.
+ */
+owned_work_known?: boolean, 
+/**
  * Native harness subagents, including finished work, for the list's child disclosure.
  */
 subagents?: Array<SubagentBrief>, cost_usd: number, activity?: string, last_activity: number, exit?: ExitInfo, 

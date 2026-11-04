@@ -379,7 +379,7 @@ pub async fn call(cx: Cx, name: &str, input: Value) -> Out {
             // Read as its type, once its caller may run it: what doesn't fit is refused, saying
             // where and why.
             op.input.fits(&input).map_err(|m| (StatusCode::BAD_REQUEST, m.said(name)))?;
-            (op.run)(cx.clone(), input).await
+            run_recorded(&cx, op, input).await
         };
         if op.read_only {
             return run.await;
@@ -416,7 +416,31 @@ pub async fn call(cx: Cx, name: &str, input: Value) -> Out {
 /// and the audit trail records already.
 pub async fn run_own(cx: Cx, name: &str, input: Value) -> Out {
     let op = own().iter().find(|o| o.name == name).ok_or_else(|| (StatusCode::NOT_FOUND, format!("no operation {name}")))?;
-    (op.run)(cx, input).await
+    run_recorded(&cx, op, input).await
+}
+
+/// Attention plan 01a199e1b177752e84dad5dc990e6a15: preserve the authenticated
+/// caller for MCP, CLI and HTTP, rather than interpreting user-role transcript text.
+async fn run_recorded(cx: &Cx, op: &Op, input: Value) -> Out {
+    let attention_at = crate::util::now_ms();
+    let attention = crate::harness::attention_hooks::tracks_operation(op.name).then(|| {
+        let mut copy = input.clone();
+        // Prefix addressing must teach the same chat as full-ID addressing. Resolve before
+        // an action such as Stop removes the live record.
+        if let Some(id) = input.get("agent").and_then(Value::as_str)
+            && let Ok(info) = crate::harness::ops::known(cx, id)
+            && let Some(o) = copy.as_object_mut()
+        {
+            o.insert("agent".into(), json!(info.id));
+        }
+        copy
+    });
+    let response=attention.as_ref().and_then(|input|crate::harness::attention_hooks::prepare_operation(&cx.hub,op.name,input));
+    let out = (op.run)(cx.clone(), input).await;
+    if let (Some(input), Ok(output)) = (attention, &out) {
+        crate::harness::attention_hooks::operation(&cx.hub, &cx.caller, op.name, &input, output, attention_at,response).await;
+    }
+    out
 }
 
 #[cfg(test)]

@@ -1920,6 +1920,11 @@ where
                 running.extend(subagents::held(hub).await);
             }
             for info in keep_going(&all, &running, &waiting, &quiet) {
+                if let Some(hub) = self.hub
+                    && crate::harness::attention::is_archived(hub, &info.id).await.unwrap_or(true)
+                {
+                    continue;
+                }
                 keep::tick(self.port, info, now, crate::harness::told::children_working(&all, &info.id)).await;
             }
             keep::retain(&all.iter().map(|i| i.id.clone()).collect::<Vec<_>>());
@@ -2717,6 +2722,13 @@ where
     P: HarnessPort<Agent = Info, Command = Command>,
 {
     let (store, port) = (d.store, d.port);
+    // Attention plan 01a199e1b177752e84dad5dc990e6a15: an archive's durable
+    // intent holds goal automation even if its runner has not acknowledged the stop yet.
+    if let Some(hub) = d.hub
+        && crate::harness::attention::is_archived(hub, agent).await?
+    {
+        return Ok(());
+    }
     let mut stack = stack_of(store, agent).await?;
     // Paused or done since it was found running: left as it is.
     if stack.state != "running" {

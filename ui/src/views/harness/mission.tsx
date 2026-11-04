@@ -1,4 +1,5 @@
 /**
+ * Attention plan 01a199e1b177752e84dad5dc990e6a15.
  * Mission control: one list of your agents, the ones that need you first: a row says in one line
  * what that agent is doing — or what it wants, or what it finished — and you answer it right there.
  * An agent that comes to need you rises as it does; while you're using the list, rows hold still,
@@ -8,9 +9,14 @@ import * as React from "react";
 import "./harness.css";
 import "./mission.css";
 import { Link, useNavigate } from "@/lib/router";
-import { ArrowUpRight, ChevronDown, ChevronRight, ChevronUp, GitFork, ListChecks, X } from "lucide-react";
+import { ArrowUpRight, Pin, ChevronDown, ChevronRight, ChevronUp, GitFork, ListChecks, X } from "lucide-react";
 import { api } from "@/api/client";
 import { clientId, harnessApi, type AgentInfo, type ApprovalBrief } from "@/api/harness";
+import { attentionAction, useAttention, useParkTime, type AttentionCommand, type AttentionSnapshot } from "@/api/attention";
+import { ownAgentAction } from "@/lib/own-agent-action";
+import { attentionLayout, useAttentionPresentation } from "./attention-presentation";
+import { AttentionControls, AttentionSettingsForm, type AttentionAct } from "./attention-controls";
+import { attentionRows, isParked } from "./attention-state";
 import { plansApi } from "@/api/plans";
 import type { AiSession } from "@/api/types";
 import { Button } from "@/components/ui/button";
@@ -35,7 +41,7 @@ import { byStart, FoundSessions, sessionKey } from "./found";
 import { Ago, machineName, machineShown } from "./parts";
 import { LowBattery } from "../battery";
 import { useSeen } from "./seen";
-import { missionFoundSessions, missionRows, subagentsLine, type MissionRow, type MissionStand as Stand } from "./mission-rows";
+import { activityAt, missionFoundSessions, missionRows, subagentsLine, type MissionRow, type MissionStand as Stand } from "./mission-rows";
 import { MachinesNote, machinesRes, NewAgent, NewAgentLoading } from "./new-agent";
 import { MISSION_DRAFT } from "./new-agent-draft";
 import { useDrafts } from "./state";
@@ -154,7 +160,7 @@ function HeldDecide({ a }: { a: AgentInfo }) {
       </Button>
     );
   const approve = () =>
-    void plansApi.review(plan, { answer: "approve", key: tries.keyFor(`approve ${plan} ${a.held?.since ?? 0}`) }).then(
+    void ownAgentAction(plansApi.review(plan, { answer: "approve", key: tries.keyFor(`approve ${plan} ${a.held?.since ?? 0}`) })).then(
       () => tries.done(),
       (e: unknown) => toast.error("Couldn't approve its plan", errorMessage(e)),
     );
@@ -184,6 +190,15 @@ const Row = React.memo(function Row({
   onSelect,
   tree,
   onTree,
+  updated,
+  snapshot,
+  act,
+  parked,
+  archived,
+  reason,
+  stale,
+  urgencyReason,
+  onOpen,
 }: {
   a: AgentInfo;
   stand: Stand;
@@ -194,9 +209,19 @@ const Row = React.memo(function Row({
   /** Its subagents' tree is open under it (undefined: it has none). */
   tree?: boolean;
   onTree?: (id: string) => void;
+  updated?: boolean;
+  snapshot: AttentionSnapshot;
+  act: AttentionAct;
+  parked?: boolean;
+  archived?: boolean;
+  reason?: string;
+  stale?: boolean;
+  urgencyReason?: string;
+  onOpen: (agent: string) => void;
 }) {
   useLabels();
   const navigate = useNavigate();
+  const [organizing, setOrganizing] = React.useState(false);
   // Who waits on you: the agent, or its subagent (answered as that one; opened in the agent's chat, its thread shown).
   const who = asking ?? a;
   const ap = who.approvals[0];
@@ -212,7 +237,14 @@ const Row = React.memo(function Row({
   };
   // A plan of its own waiting on your review: opened where it's reviewed, its Plan tab (a phone's row has no Review).
   const review = stand === "needs" && !asking && (ap ? ap.tool === "plan" : Boolean(a.held?.plan));
-  const openAgent = () => navigate(review ? `/agents/${a.id}?tab=plan` : `/agents/${a.id}`);
+  const openAgent = () => {
+    if (archived) {
+      setOrganizing(true);
+      return;
+    }
+    onOpen(a.id);
+    navigate(review ? `/agents/${a.id}?tab=plan` : `/agents/${a.id}`);
+  };
   // A subagent's thread straight, not by its own address: that one's redirect into its agent's chat never lands.
   const answerAt = asking ? `/agents/${a.id}?task=${encodeURIComponent(asking.id)}` : `/agents/${a.id}`;
   const actions = useAgentActions(a);
@@ -222,17 +254,34 @@ const Row = React.memo(function Row({
   const line = (
     <span className="ms-line">
       {/* Working: the prism flows through its word, each agent's its own way, so the list moves as one field. */}
-      <Shimmer on={stand === "working"} flow={a.id} className="ms-word">
+      <Shimmer on={!archived && stand === "working"} flow={a.id} className="ms-word">
         <i aria-hidden="true" />
-        {WORD[stand]}
+        {archived ? (snapshot.agents[a.id]?.archive_status === "archiving" ? "Archiving…" : "Archived") : WORD[stand]}
       </Shimmer>
+      {stand === "needs" && stale && (
+        <span className="ms-stale" title={urgencyReason}>
+          Stale
+        </span>
+      )}
       <span className="ms-text">{asking ? `Its subagent \u201c${agentLabel(asking)}\u201d: ${lineOf(asking, "needs")}` : lineOf(a, stand)}</span>
     </span>
   );
   return (
-    <li className="ms-row" data-stand={stand} data-selected={selected || undefined} data-glide={a.id} data-agent={a.id}>
+    <li
+      className="ms-row"
+      data-stand={stand}
+      data-selected={selected || undefined}
+      data-glide={a.id}
+      data-agent={a.id}
+      onClickCapture={(event) => {
+        const link = event.target instanceof Element ? event.target.closest("a") : null;
+        if (link instanceof HTMLAnchorElement && link.pathname === `/agents/${encodeURIComponent(a.id)}`) onOpen(a.id);
+      }}
+      data-attention-eligible={!archived && !parked && stand !== "needs" && stand !== "crashed" && stand !== "ended" && snapshot.agents[a.id]?.pinned === undefined ? "true" : undefined}
+      {...(!archived && !parked ? swipeRow<HTMLLIElement>(() => setOrganizing(true), ".ms-main") : {})}
+    >
       <label className="ms-check">
-        <input type="checkbox" className="check" checked={selected} onChange={(e) => onSelect(a.id, e.target.checked)} aria-label={`Select ${label}`} />
+        <input type="checkbox" className="check" checked={selected} disabled={archived} onChange={(e) => onSelect(a.id, e.target.checked)} aria-label={`Select ${label}`} />
       </label>
       {actions.renaming ? (
         <div className="ms-main">
@@ -251,7 +300,12 @@ const Row = React.memo(function Row({
       )}
       <span className="ms-meta">
         <span>
-          {machineShown(a.target)} · <Ago className="ms-time" ts={Math.floor(a.last_activity / 1000)} />
+          {machineShown(a.target)}{" "}
+          {activityAt(a) > 0 && (
+            <>
+              · <Ago className="ms-time" ts={Math.floor(activityAt(a) / 1000)} />
+            </>
+          )}
         </span>
         <span className="ms-meta-2">
           {kind && <span className="ms-kind">{a.kind_name}</span>}
@@ -267,7 +321,7 @@ const Row = React.memo(function Row({
       <span className="ms-actions">
         {/* What to answer; on a phone it takes the meta line's place, so the row's corner keeps one width. */}
         <span className="ms-decide">
-          {stand === "needs" && ap && <Decide a={who} ap={ap} to={answerAt} answering={open} onAnswer={toggleAnswer} />}
+          {!archived && stand === "needs" && ap && <Decide a={who} ap={ap} to={answerAt} answering={open} onAnswer={toggleAnswer} />}
           {stand === "needs" && !ap && who.held && <HeldDecide a={who} />}
           {stand === "paused" && (
             <Button size="xs" variant="secondary" onClick={() => void harnessApi.command(a.id, { type: "resume" }).catch((e: unknown) => toast.error("Couldn't resume", errorMessage(e)))}>
@@ -282,6 +336,16 @@ const Row = React.memo(function Row({
           {(stand === "finished" || stand === "ready" || stand === "ended") && (a.files_changed ?? 0) > 0 && <RowReview agentId={a.id} />}
         </span>
         <span className="ms-tail">
+          {updated && (
+            <button type="button" className="ms-updated" title="Clear Updated" aria-label={`Clear Updated for ${label}`} onClick={() => void act({ action: "seen", agent: a.id })}>
+              Updated
+            </button>
+          )}
+          {snapshot.agents[a.id]?.pinned !== undefined && <Pin size={12} role="img" aria-label="Pinned" />}
+          <button type="button" className="ms-link ms-organize" aria-label={`Organize ${label}`} aria-expanded={organizing} onClick={() => setOrganizing(!organizing)}>
+            <span className="ms-organize-label">Organize</span>
+            <ListChecks className="ms-organize-icon" size={15} aria-hidden="true" />
+          </button>
           {tree !== undefined && (
             <button
               type="button"
@@ -295,13 +359,15 @@ const Row = React.memo(function Row({
               {tree ? <ChevronUp size={12} aria-hidden="true" /> : <ChevronDown size={12} aria-hidden="true" />}
             </button>
           )}
-          {actions.menu()}
-          {actions.dialogs}
+          {!archived && actions.menu()}
+          {!archived && actions.dialogs}
           <button type="button" className="ms-go" onClick={openAgent} aria-label={`Open ${label}`}>
             <ArrowUpRight size={16} />
           </button>
         </span>
       </span>
+      {(stand === "needs" ? (urgencyReason ?? reason) : reason) && <span className="ms-rank-reason">{stand === "needs" ? (urgencyReason ?? reason) : reason}</span>}
+      {organizing && <AttentionControls agents={[a]} snapshot={snapshot} act={act} parked={parked} archived={archived} />}
       {shownAsk && (
         <div className="ms-answer">
           <Slide open={open && shownAsk.id === question?.id} onGone={() => setShownAsk(null)}>
@@ -438,6 +504,7 @@ function PageLoading() {
       <div className="mc-mode" data-first="">
         <NewAgentLoading text={text} />
       </div>
+      <div className="ms-attention-head" aria-hidden="true" />
       <div className="filter-bar ms-bar" aria-hidden="true">
         <Skeleton className="ms-loading-bar" />
       </div>
@@ -718,14 +785,59 @@ function MissionComposer({
 }
 
 function Agents() {
-  const { list, reload } = useAgents();
-  const seen = useSeen();
+  // These controls exist before the coin is drawn. Later client changes do not manufacture a new experiment.
+  const [showArchived, setShowArchived] = React.useState(false);
+  const [showParked, setShowParked] = React.useState(false);
   const [showEnded, setShowEnded] = useLocalStorage<boolean>("kiln.agents.showEnded", false);
+  const [stored, setView] = useLocalStorage<Partial<ListView>>("kiln.agents.view", DEFAULT_VIEW);
+  const [q, setQ] = React.useState("");
   const [selected, setSelected] = React.useState<ReadonlySet<string>>(new Set());
-  // Selecting by touch (touch-select.ts): from a row held, or from Select, until Done.
-  const touchScreen = useMediaQuery("(pointer: coarse)");
   const [picking, setPicking] = React.useState(false);
+  const [trees, setTrees] = React.useState<ReadonlySet<string>>(() => new Set());
+  const touchScreen = useMediaQuery("(pointer: coarse)");
+  useMediaQuery("(max-width: 640px)");
   const selecting = picking || selected.size > 0;
+  const { held, bind } = useListHold(selecting);
+  const controls = JSON.stringify({ q, stored, showArchived, showParked, showEnded, selected: [...selected].sort(), picking, trees: [...trees].sort(), layout: attentionLayout() });
+  const attention = useAttention(controls);
+  const { list, reload } = useAgents();
+  const snapshot = attention.data;
+  const now = useParkTime(snapshot.agents);
+  const [notice, setNotice] = React.useState<{ text: string; undo?: { agent: string; revision: number }[] } | null>(null);
+  const [attentionError, setAttentionError] = React.useState<string | null>(null);
+  const act: AttentionAct = React.useCallback(async (commands: AttentionCommand | AttentionCommand[]) => {
+    setAttentionError(null);
+    const batch = Array.isArray(commands) ? commands : [commands];
+    const undos: { agent: string; revision: number }[] = [];
+    try {
+      for (const command of batch) {
+        const next = await attentionAction(command);
+        if (next.undo) undos.push(next.undo);
+        if (command.action === "archive" || command.action === "restore" || command.action === "restore_copy") invalidate("harness/agents");
+      }
+      const command = batch[0];
+      setNotice({
+        text:
+          command?.action === "seen"
+            ? "Updated cleared"
+            : command?.action === "undo"
+              ? "Restored previous placement"
+              : command?.action === "settings"
+                ? "Attention settings saved"
+                : "Chat organization saved",
+        undo: undos.length ? undos : undefined,
+      });
+    } catch (e) {
+      setAttentionError(errorMessage(e));
+      if (undos.length) setNotice({ text: "Some chats were changed before the error", undo: undos });
+    }
+  }, []);
+  const seen = React.useMemo(() => {
+    const next: Record<string, number> = {};
+    for (const [id, mark] of Object.entries(snapshot.agents)) next[id] = Math.max(next[id] ?? 0, mark.updated_seen ?? 0);
+    return next;
+  }, [snapshot.agents]);
+  // Selecting by touch (touch-select.ts): from a row held, or from Select, until Done.
   const clear = () => {
     setSelected(new Set());
     setPicking(false);
@@ -741,15 +853,35 @@ function Agents() {
   const [focusFor, setFocusFor] = React.useState<"new" | "message" | null>(null);
 
   const done = useAnswered();
-  const all = React.useMemo(() => standsOf(list, seen, done), [list, seen, done]);
+  const rows = React.useMemo(
+    () =>
+      attentionRows(
+        standsOf(
+          list.filter((a) => !snapshot.agents[a.id]?.archived),
+          seen,
+          done,
+        ),
+        snapshot,
+      ),
+    [list, seen, done, snapshot],
+  );
+  const parked = rows.filter((r) => isParked(r, snapshot, now));
+  const all = React.useMemo(
+    () => (showArchived ? attentionRows(standsOf(snapshot.archived, seen, done), snapshot).map((r) => ({ ...r, stand: "ready" as const })) : rows.filter((r) => !isParked(r, snapshot, now))),
+    [showArchived, snapshot, seen, done, rows, now],
+  );
   // How the list is shown (the sort and the facets chosen) is kept across visits; the words typed
   // to find a name are not. (A new key: everyone starts on Needs you first once.) While you're using
   // the list, or have agents selected, it holds still: see useListHold.
-  const [stored, setView] = useLocalStorage<Partial<ListView>>("kiln.agents.view", DEFAULT_VIEW);
-  const view = React.useMemo(() => ({ ...DEFAULT_VIEW, ...stored, sort: sortOf(stored.sort ?? DEFAULT_VIEW.sort) }), [stored]);
-  const [q, setQ] = React.useState("");
-  const { held, bind } = useListHold(selecting);
-  const { live, ended } = useShownList(all, q, view, held);
+  const view = React.useMemo(
+    () => ({
+      ...DEFAULT_VIEW,
+      ...stored,
+      sort: stored.sort === undefined || stored.sort === "priority" || stored.sort === "yours" ? (snapshot.settings.sort === "yours" ? "yours" : "priority") : sortOf(stored.sort),
+    }),
+    [stored, snapshot.settings.sort],
+  );
+  const { live, ended } = useShownList(all, q, view, held, snapshot.pair?.key);
   const glide = useGlide(live.map((r) => `${r.a.id}:${r.stand}`).join());
   const selectable = [...live, ...ended];
   const searchAgents = React.useMemo(() => new Set(all.map(({ a }) => a.id)), [all]);
@@ -826,7 +958,6 @@ function Agents() {
     />
   );
   // The agents whose subagents' trees are open under their rows, and every agent as answered here (each tree's subagents and theirs).
-  const [trees, setTrees] = React.useState<ReadonlySet<string>>(() => new Set());
   const toggleTree = React.useCallback(
     (id: string) =>
       setTrees((s) => {
@@ -837,12 +968,44 @@ function Agents() {
     [],
   );
   const answeredList = React.useMemo(() => list.map((agent) => asAnswered(agent, done)), [list, done]);
-  const renderRow = ({ a, stand, asking }: MissionRow) => {
+  const rendered = JSON.stringify([live.map((r) => [r.a.id, r.stand, r.pinned]), showParked ? parked.map((r) => [r.a.id, r.stand]) : [], showEnded ? ended.map((r) => [r.a.id, r.stand]) : []]);
+  const placementControls = Object.entries(snapshot.agents)
+    .filter(([, mark]) => mark.pinned !== undefined || mark.parked_until !== undefined)
+    .map(([id, mark]) => [id, mark.pinned, mark.parked_until])
+    .sort((a, b) => String(a[0]).localeCompare(String(b[0])));
+  const presentation = useAttentionPresentation({
+    snapshot,
+    controls: JSON.stringify({ controls, sort: view.sort, placements: placementControls }),
+    automatic: view.sort === "priority" && !showArchived,
+    allowed: attention.learningAllowed,
+    rendered,
+    departure: attention.departure,
+  });
+  const renderRow = (row: MissionRow) => {
+    const { a, stand, asking, updated, reason, stale, urgencyReason } = row;
     const subs = (a.subagents?.length ?? 0) > 0;
     const open = subs && trees.has(a.id);
     return (
       <React.Fragment key={a.id}>
-        <Row a={a} stand={stand} asking={asking} selected={selected.has(a.id)} picking={touchScreen && selecting} onSelect={select} tree={subs ? open : undefined} onTree={toggleTree} />
+        <Row
+          a={a}
+          stand={stand}
+          asking={asking}
+          updated={updated}
+          snapshot={snapshot}
+          act={act}
+          parked={isParked(row, snapshot, now)}
+          archived={showArchived}
+          reason={reason}
+          stale={stale}
+          urgencyReason={urgencyReason}
+          selected={selected.has(a.id)}
+          picking={touchScreen && selecting}
+          onSelect={select}
+          tree={subs ? open : undefined}
+          onTree={toggleTree}
+          onOpen={presentation.choose}
+        />
         {open && <MissionTree id={a.id} list={answeredList} rowAsk={(asking ?? a).approvals[0]?.id} />}
       </React.Fragment>
     );
@@ -853,9 +1016,54 @@ function Agents() {
   return (
     <>
       {composer}
+      <div className="ms-attention-head">
+        <label className="ms-attention-field">
+          Show{" "}
+          <select
+            className="select"
+            aria-label="Show chats"
+            value={showArchived ? "archived" : "active"}
+            onChange={(e) => {
+              setShowArchived(e.target.value === "archived");
+              clear();
+            }}
+          >
+            <option value="active">Active chats</option>
+            <option value="archived">Archived chats ({snapshot.archived.length})</option>
+          </select>
+        </label>
+        <AttentionSettingsForm snapshot={snapshot} act={act} agents={list} />
+      </div>
+      {notice && (
+        <div className="ms-attention-notice" role="status">
+          {notice.text}{" "}
+          {notice.undo && (
+            <Button size="xs" variant="secondary" onClick={() => void act((notice.undo ?? []).map((token) => ({ action: "undo", ...token })))}>
+              Undo
+            </Button>
+          )}
+          <button type="button" className="ms-link" onClick={() => setNotice(null)}>
+            Dismiss
+          </button>
+        </div>
+      )}
+      {attentionError && (
+        <p className="ms-attention-error" role="alert">
+          {attentionError}
+        </p>
+      )}
       {all.length > 0 && (
         <>
-          <ListBar rows={all} q={q} onQuery={setQ} view={view} onView={setView} />
+          <ListBar
+            rows={all}
+            q={q}
+            onQuery={setQ}
+            view={view}
+            onView={(v) => {
+              setView(v);
+              if (v.sort === "priority" || v.sort === "yours") void act({ action: "settings", settings: { sort: v.sort === "yours" ? "yours" : "learned" } });
+            }}
+          />
           <React.Suspense fallback={null}>
             <Recover rows={all} />
           </React.Suspense>
@@ -867,7 +1075,7 @@ function Agents() {
 
       {all.length === 0 ? (
         <div className="ms-empty">
-          <p className="ms-empty-title">No agents yet.</p>
+          <p className="ms-empty-title">{showArchived ? "No archived chats." : parked.length > 0 ? "Your chats are parked below." : "No agents yet."}</p>
           <p>Claude Code, Codex, or any harness your machines have — one or a dozen: tell the box above what to do, and it starts. kiln runs them: steer them, answer them, review what they change.</p>
         </div>
       ) : (
@@ -884,7 +1092,7 @@ function Agents() {
                   data-on={selecting || undefined}
                   tabIndex={selecting ? undefined : -1}
                   aria-hidden={selecting ? undefined : true}
-                  disabled={!selecting || live.length === 0}
+                  disabled={showArchived || !selecting || live.length === 0}
                   checked={live.length > 0 && liveChecked === live.length}
                   onChange={(e) => setSelected(e.target.checked ? new Set([...selected, ...live.map((r) => r.a.id)]) : new Set([...selected].filter((id) => !live.some((r) => r.a.id === id))))}
                   aria-label={filtered ? `Select the ${live.length} agents shown` : `Select all ${live.length} agents`}
@@ -901,7 +1109,7 @@ function Agents() {
                   ref={allBox}
                   type="checkbox"
                   className="check"
-                  disabled={live.length === 0}
+                  disabled={showArchived || live.length === 0}
                   checked={live.length > 0 && liveChecked === live.length}
                   onChange={(e) => setSelected(e.target.checked ? new Set([...selected, ...live.map((r) => r.a.id)]) : new Set([...selected].filter((id) => !live.some((r) => r.a.id === id))))}
                   aria-label={filtered ? `Select the ${live.length} agents shown` : `Select all ${live.length} agents`}
@@ -932,6 +1140,7 @@ function Agents() {
               onClear={clear}
             />
           </div>
+          {picked.length > 0 && <AttentionControls agents={picked} snapshot={snapshot} act={act} archived={showArchived} />}
           {live.length > 0 ? (
             <div {...touch.props} data-held={held || undefined}>
               <ul className="ms-list" ref={glide}>
@@ -958,6 +1167,17 @@ function Agents() {
         </>
       )}
 
+      {!showArchived && parked.length > 0 && (
+        <section className="ms-ended">
+          <div className="ms-fold">
+            <button type="button" className="ms-fold-btn" aria-expanded={showParked} onClick={() => setShowParked(!showParked)}>
+              <ChevronRight size={13} className="ms-chev" aria-hidden="true" />
+              Parked · {parked.length}
+            </button>
+          </div>
+          {showParked && <ul className="ms-list">{parked.map(renderRow)}</ul>}
+        </section>
+      )}
       {/* Search the standalone agents' conversations, without their child threads. */}
       {all.length > 0 && <SaidInConversations q={q} agents={searchAgents} />}
 
@@ -982,6 +1202,8 @@ function Agents() {
           {showEnded && <ul className="ms-list">{ended.map(renderRow)}</ul>}
         </section>
       )}
+      <span hidden ref={presentation.lifetime} />
+      <span hidden ref={presentation.capture} />
     </>
   );
 }
