@@ -1,5 +1,6 @@
 Subject: hyper-rt from kiln's own runtime, crates/kiln-rt
 Why: kiln's runtime is its own copy of hyper-rt (crates/kiln-rt/ORIGIN.md), which kiln's [patch.crates-io] gives every crate that names hyper-rt. hyper-block and hyper-rt-transport take it by path, which a patch can't reach, and two path packages named hyper-rt 0.1.0 can't share a lock file (cargo: package collision in the lockfile), so their paths point at kiln's copy. hyper-rt's own folder here is upstream's, unchanged; no crate kiln builds takes it
+Kiln-only: crates/kiln-rt is kiln's own copy of hyper-rt, which no product's tree holds: Quiver, Focal's bus and Mantle take hyper-rt from their own copies
 
 diff --git a/crates/hyper-block/Cargo.toml b/crates/hyper-block/Cargo.toml
 index c823fce13c2e1ebca0b099b4fd5c0b01d0e31820..31b577419947336679a8d58160009a04196fdbbf 100644

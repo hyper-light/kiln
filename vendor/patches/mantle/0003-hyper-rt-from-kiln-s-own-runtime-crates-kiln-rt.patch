@@ -1,5 +1,6 @@
 Subject: hyper-rt from kiln's own runtime, crates/kiln-rt
 Why: kiln's runtime is its own copy of hyper-rt (crates/kiln-rt/ORIGIN.md), which every crate kiln builds that names hyper-rt takes. Mantle's crates take it by path, which a patch can't reach, and two path packages named hyper-rt 0.1.0 can't share a lock file, so each path points at kiln's copy, as hyper-raft's own crates' do (vendor/hyper-raft/UPSTREAM.md). Cargo.lock doesn't say where a path package lives, so it is unchanged
+Kiln-only: crates/kiln-rt is kiln's own copy of hyper-rt, which Mantle's tree doesn't hold
 
 diff --git a/crates/chunk/Cargo.toml b/crates/chunk/Cargo.toml
 index dbb12e20af6f98150058f8eba6420b3f48bea118..71429efbc2368b4878f8b36d774331aabdf964bf 100644
