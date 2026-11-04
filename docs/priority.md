@@ -277,8 +277,8 @@ the lab's stand-in (`lab:hog:<threads>:<secs>`), each in a cgroup of its own tha
 turns headroom off and on. `record.py` notes `/healthz/delay` four times a second, the shards'
 histogram, headroom's status as the server has it, and each group's freezer and CPU. `timeline.py`
 reads that back. Other agents' kiln builds loaded fedora throughout (a load of 15 to 80), and it
-reset once (16:48 UTC); the lab's own runs are in its folder, not here, as raw recordings (about
-40 MB each).
+reset three times (16:48, 18:45 and 18:58 UTC); the lab's raw recordings stay in its folder on that
+machine, not here.
 
 **What main (`82ca3c74d03`) did.** Research 01a1a59c2b2a, f44 to f47:
 
@@ -310,8 +310,8 @@ kiln.slice's weight's 0.31-0.85, and the shared cgroup's reached 2.8 (4.5 at p90
 
 - **Where the weights hold the server, it holds still.** With 32 hog threads at kiln.slice's
   weight, the server's mean delay between reads stayed at 0.23-0.27 ms (calm 0.22), and the target's
-  CUSUM at 0 (18:35 to 18:39 UTC). Its one cut came from the runner-disk target (an fsync of 0.5 s),
-  raised back within 6 s, as on main.
+  CUSUM at 0 (18:35 to 18:39 UTC). Its one cut came from the runner-disk target (a slow fsync), and
+  was raised back within seconds, as on main.
 - **Where they don't, it slows the legs before harm.** With the server sharing the runner's cgroup,
   32 hog threads raised the mean to 0.5-0.8 ms (calm 0.2-0.3), short of trouble. 64 more raised it to
   4.6 ms, and 23 s after they started headroom alarmed on the server's delay ("typical 0.4 ms, now
