@@ -30,6 +30,13 @@ revision.
   this against the product's own `vendor/MANIFEST.toml` and `vendor/patches/`.
 - **One revision linked.** `crates/kiln/tests/vendored.rs` fails the gate when `Cargo.lock` links a
   crate a vendored project provides more than once, or from crates.io or git instead of its folder.
+- **Taken as kiln's own.** A crate kiln changes as its own code leaves its project for `crates/`,
+  under its name, with an `ORIGIN.md` naming the revision it came from and each change since:
+  hyper-raft's `hyper-rt` is kiln's runtime, `crates/kiln-rt`. kiln's `[patch]` points the name there,
+  and recorded changes point the vendored crates that take it by path there (a path can't be
+  patched); the project's own copy stays upstream's, and nothing kiln builds takes it.
+  `scripts/vendor.py` doesn't follow the crate: a re-vendor of hyper-raft moves `vendor/hyper-raft`
+  alone, and upstream's fixes come into `crates/kiln-rt` by hand (its `ORIGIN.md`, "The rules").
 - **The person's word.** Pushing to any hyper-light repository takes the person's go-ahead, and so
   does creating one.
 
