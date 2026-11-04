@@ -46,7 +46,7 @@ for (const engine of engines.length ? engines : ["chromium", "webkit"]) {
       try {
         await page.goto(base + at, { waitUntil: "load", timeout: 120_000 });
         await page.waitForTimeout(4000);
-        if (await page.locator('[aria-busy="true"] >> text=Loading kiln').count()) problems.push("still on the splash");
+        if (await page.locator('[aria-busy="true"]:has-text("Loading kiln") >> visible=true').count()) problems.push("still on the splash");
         // The conversation's deferred tabs (goal 8 step 6) open in place.
         if (name === "conversation" && form === "desktop")
           for (const tab of ["Plan", "Tools"]) {
@@ -63,6 +63,27 @@ for (const engine of engines.length ? engines : ["chromium", "webkit"]) {
         mkdirSync(SHOTS, { recursive: true });
         await page.screenshot({ path: path.join(SHOTS, `${name}-${engine}-${form}.png`) }).catch(() => {});
       }
+      // Once the app runs, the HTML's splash (goal 8 step 7) has given way to it.
+      if (
+        await page
+          .locator("#kiln-splash")
+          .isVisible()
+          .catch(() => false)
+      )
+        problems.push("the HTML's splash still shows over the app");
+      // Without JavaScript the splash shows, in kiln's look.
+      const still = await browser.newContext({ ...device, javaScriptEnabled: false });
+      const bare = await still.newPage();
+      await bare.goto(base + at, { waitUntil: "load", timeout: 120_000 }).catch((e) => problems.push(`no-JS load: ${e.message.split("\n")[0]}`));
+      if (
+        !(await bare
+          .locator("#kiln-splash svg")
+          .isVisible()
+          .catch(() => false))
+      )
+        problems.push("without JavaScript the splash doesn't show");
+      if (SHOTS) await bare.screenshot({ path: path.join(SHOTS, `${name}-${engine}-${form}-nojs.png`) }).catch(() => {});
+      await still.close();
       console.log(`${problems.length ? "FAIL" : "ok  "} ${engine.padEnd(8)} ${form.padEnd(7)} ${name}${problems.length ? `\n      ${problems.slice(0, 5).join("\n      ")}` : ""}`);
       failed += problems.length ? 1 : 0;
       await ctx.close();

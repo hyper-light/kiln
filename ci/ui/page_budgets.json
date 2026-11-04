@@ -20,12 +20,12 @@
   "pages": {
     "signin": {
       "first": {
-        "total_br": 235971,
+        "total_br": 238507,
         "js_br": 155544,
         "css_br": 25335,
         "font_br": 54581,
         "html_br": 8220,
-        "requests": 47,
+        "requests": 49,
         "waves": 5
       },
       "deploy": {
@@ -35,12 +35,12 @@
     },
     "overview": {
       "first": {
-        "total_br": 231713,
+        "total_br": 234370,
         "js_br": 151411,
         "css_br": 25335,
         "font_br": 54581,
         "html_br": 8220,
-        "requests": 44,
+        "requests": 46,
         "waves": 4
       },
       "deploy": {
@@ -55,7 +55,7 @@
         "css_br": 61392,
         "font_br": 54581,
         "html_br": 8220,
-        "requests": 98,
+        "requests": 100,
         "waves": 4
       },
       "deploy": {
@@ -70,7 +70,7 @@
         "css_br": 64103,
         "font_br": 54581,
         "html_br": 8220,
-        "requests": 102,
+        "requests": 104,
         "waves": 4
       },
       "deploy": {
@@ -85,7 +85,7 @@
         "css_br": 56682,
         "font_br": 54581,
         "html_br": 8220,
-        "requests": 81,
+        "requests": 83,
         "waves": 4
       },
       "deploy": {
@@ -95,12 +95,12 @@
     },
     "run": {
       "first": {
-        "total_br": 251819,
+        "total_br": 254228,
         "js_br": 170538,
         "css_br": 26084,
         "font_br": 54581,
         "html_br": 8220,
-        "requests": 51,
+        "requests": 53,
         "waves": 4
       },
       "deploy": {

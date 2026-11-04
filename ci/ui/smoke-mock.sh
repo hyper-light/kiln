@@ -9,4 +9,4 @@ PORT=${PORT:-17073}
 MOCK=$!
 trap 'kill $MOCK 2>/dev/null' EXIT
 for i in $(seq 1 60); do curl -sf "http://127.0.0.1:$PORT/healthz" >/dev/null && break; sleep 1; done
-node "$ROOT/ci/ui/smoke.mjs" "http://127.0.0.1:$PORT" ${ENGINES:-chromium webkit}
+node "$ROOT/ci/ui/${SMOKE:-smoke.mjs}" "http://127.0.0.1:$PORT" ${ENGINES:-chromium webkit}
