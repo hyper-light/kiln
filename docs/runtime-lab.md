@@ -647,10 +647,50 @@ p99 and `api_write` p99 went -19.7% and +4.2% under `steer`, -22.3% and +5.6% un
 +6.3% under `both`, each inside its noise (±91% to ±281%). The other placements stay behind the setting for
 later A/B tests.
 
-**The shared layout and calm** (from 22:10 UTC) were stopped after one or two rounds of each placement, when
-another lab took the machine (its `HOLD_FILE`); they don't change the pick (rule 5). Their driver goes on where
-it stopped once the machine is free again, into fedora's `~/.cache/kiln-g7-placement-ab/lab/runs`
-(`report.sh` gives their tables).
+**The shared layout and calm, partial** (22:10 to 23:50 UTC; the same build, CPUs and profile). In `shared`
+the server, its runners, the lab and 16 of kiln-lab's own hogs share the lab's cgroup at one weight; in `calm`
+the server has its scope at `cpu.weight` 1000 and there are no hogs. The block waited from 22:28 to 23:11 while
+another lab held the machine, and was stopped at 23:50, short of its six rounds, to give the machine back;
+another agent's A/B of runner restarts ran beside it, unpinned, from 22:49. Fedora thrashed from 23:04 to 23:23
+(a kiln CI job's unbounded release build: a load of 330 to 400, swap full), so the six rounds measured in it are
+dropped, not run again: round 2 of calm under `round-robin` and of shared under every placement, and round 3 of
+shared under `steal`. What's left: in shared, four rounds of `round-robin` and `steer` and three of `steal` and
+`both`; in calm, three of `round-robin` and four of the others. Their rounds:
+`docs/runtime-lab/2026-11-04/goal7-shared-<placement>.json` and `goal7-calm-<placement>.json`. Medians and
+their noise, as above:
+
+| number | round-robin | steer | steal | both |
+| --- | --- | --- | --- | --- |
+| shared: page p99 ms | 2.42 (1.90 to 3.34) | 2.48 (1.96 to 5.42) | 2.02 (1.96 to 10.2) | 1.94 (1.93 to 7.94) |
+| shared: api_write p99 ms | 193 (65.1 to 348) | 366 (194 to 530) | 413 (364 to 3411) | 338 (188 to 543) |
+| shared: api_read p99 ms | 63.6 (39.0 to 74.7) | 111 (93.4 to 147) | 74.0 (68.8 to 1279) | 85.6 (82.1 to 138) |
+| shared: API reads a second | 72.1 (71.6 to 74.6) | 69.8 (67.7 to 70.5) | 69.9 (40.9 to 70.5) | 67.7 (67.0 to 71.2) |
+| shared: live deliveries a second | 88.8 (88.0 to 90.4) | 88.6 (87.1 to 89.1) | 87.8 (75.6 to 88.4) | 87.3 (87.3 to 88.3) |
+| shared: server CPU ms a request | 9.55 (9.10 to 12.0) | 9.49 (9.15 to 10.1) | 9.81 (9.27 to 10.6) | 9.60 (8.99 to 9.99) |
+| shared: shards' delay p99 ms | 2.27 (1.77 to 7.15) | 2.29 (1.94 to 8.10) | 2.19 (2.18 to 6.33) | 2.26 (2.19 to 8.50) |
+| calm: page p99 ms | 0.448 (0.354 to 1.30) | 0.413 (0.354 to 1.17) | 0.384 (0.350 to 8.37) | 1.09 (0.334 to 2.18) |
+| calm: api_write p99 ms | 496 (492 to 574) | 600 (376 to 754) | 638 (334 to 1184) | 369 (335 to 2228) |
+| calm: api_read p99 ms | 82.3 (80.7 to 176) | 85.5 (83.2 to 161) | 105 (82.1 to 135) | 85.3 (60.9 to 114) |
+| calm: API reads a second | 68.4 (66.2 to 70.3) | 68.3 (66.9 to 69.1) | 67.4 (67.0 to 71.7) | 69.6 (64.2 to 71.8) |
+| calm: live deliveries a second | 86.2 (86.1 to 86.6) | 86.2 (85.5 to 87.0) | 86.6 (83.7 to 88.0) | 86.5 (83.0 to 87.9) |
+| calm: server CPU ms a request | 14.9 (12.0 to 15.3) | 12.4 (9.54 to 15.5) | 10.8 (9.54 to 14.0) | 11.7 (10.7 to 14.8) |
+| calm: shards' delay p99 ms | 0.992 (0.646 to 1.41) | 0.721 (0.490 to 1.01) | 0.561 (0.491 to 2.30) | 0.671 (0.569 to 1.11) |
+
+Against `round-robin` (`kiln-lab compare`, as above):
+
+- **Shared:** no people's p99 is better beyond noise under any placement, and `steal`'s API writes' p99 is
+  worse beyond it (413 ms against 193, +114%). The API reads' throughput is worse beyond noise under all three
+  (-3.1% under `steer` and `steal`, -6.1% under `both`), and so is their p99 under `steer` (+75%) and `both`
+  (+35%); with the server's wait before handlers, 5, 13 and 8 numbers differ in all. `both`'s rounds began at
+  a load of 63 before each window against `round-robin`'s 27 (one as the thrash ended), so its differences are
+  the least sure.
+- **Calm:** no people's p99, no throughput and no CPU per request differs beyond noise under any placement.
+  What does is the server's wait before handlers (`steal` one number, `both` three) and numbers of the fill
+  (six under `steer`, one under `both`).
+
+**The pick holds in both.** No placement qualifies by rule 3 in either, and in the shared layout `round-robin`
+leads; rule 5 names `steal` there, worse beyond noise in API writes' p99. With fewer than six rounds, these say
+less than the deciding run.
 
 What it says:
 
