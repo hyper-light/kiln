@@ -315,6 +315,9 @@ struct ChangeRec {
     /// A host's pull request kiln opened for an agent (`agents.change`): that agent's session
     /// (W26-R18 drafts). A kiln change names its agent as its author.
     by_agent: Option<String>,
+    /// How fresh it is on its trunk, from its latest version (W26-R16): a replay of kiln's says what
+    /// it went onto. None when its latest isn't a replay.
+    fresh: Option<String>,
 }
 
 impl ChangeRec {
@@ -434,7 +437,9 @@ fn load_change(c: &rusqlite::Connection, repo_id: &str, sha: &str) -> anyhow::Re
         })
     })?;
     let mut marks: Vec<MarkRec> = Vec::new();
-    let mut st = c.prepare("SELECT n, commit_sha, rebase_only, created_at, message, pushed_by, why, thread FROM diff_versions WHERE diff_id = ?1 ORDER BY n")?;
+    let trunk: String = c.query_row("SELECT trunk FROM diffs WHERE id = ?1", [&id], |r| r.get(0)).unwrap_or_default();
+    let mut latest_replay: Option<(Option<String>, String)> = None;
+    let mut st = c.prepare("SELECT n, commit_sha, rebase_only, created_at, message, pushed_by, why, thread, base FROM diff_versions WHERE diff_id = ?1 ORDER BY n")?;
     for row in st.query_map([&id], |r| {
         Ok((
             r.get::<_, u32>(0)?,
@@ -445,18 +450,24 @@ fn load_change(c: &rusqlite::Connection, repo_id: &str, sha: &str) -> anyhow::Re
             r.get::<_, String>(5)?,
             r.get::<_, Option<String>>(6)?,
             r.get::<_, Option<String>>(7)?,
+            r.get::<_, String>(8)?,
         ))
     })? {
-        let (v, commit, rebase_only, at, message, pushed_by, why, thread) = row?;
+        let (v, commit, rebase_only, at, message, pushed_by, why, thread, base) = row?;
+        latest_replay = Some((why.clone(), base));
         if v == ch.n {
             (ch.message, ch.at) = (message, at);
         }
         ch.pushes.push((v, rebase_only, at));
         (ch.latest, ch.latest_sha) = (v, commit);
         // A revision is the lane's push, the fix answering a thread (an agent's fix, a suggestion
-        // applied) or the resolution of a replay's conflicts, by which `why` it was made (W26-R14).
+        // applied), the resolution of a replay's conflicts, or kiln's replay as its trunk moved
+        // (W26-R16), by which `why` it was made (W26-R14). A replay kept with its conflicts is its
+        // replay's mark, below.
         let kind = match why.as_deref() {
             Some("conflict resolved") => "resolution",
+            Some(w) if w == kiln_ci::fresh::WHY => "replay",
+            Some(w) if w == kiln_ci::fresh::WHY_CONFLICTED => "",
             Some(_) => "fix",
             None if thread.is_some() => "fix",
             None => "push",
@@ -464,18 +475,28 @@ fn load_change(c: &rusqlite::Connection, repo_id: &str, sha: &str) -> anyhow::Re
         if kind == "fix" {
             ch.fixes.push(v);
         }
-        marks.push(MarkRec {
-            id: format!("{id}:v{v}"),
-            kind,
-            at,
-            end: Some(at),
-            by: pushed_by,
-            revision: Some(v),
-            state: "passed",
-            thread,
-            note: why.or_else(|| rebase_only.then(|| "rebase only".to_string())),
-        });
+        if !kind.is_empty() {
+            marks.push(MarkRec {
+                id: format!("{id}:v{v}"),
+                kind,
+                at,
+                end: Some(at),
+                by: pushed_by,
+                revision: Some(v),
+                state: "passed",
+                thread,
+                note: why.or_else(|| rebase_only.then(|| "rebase only".to_string())),
+            });
+        }
     }
+    // How fresh it is (W26-R16), as the change page says it, from what the store has: a replay of
+    // kiln's names the trunk tip it went onto (its base).
+    let on = |base: &str| format!("{trunk}@{}", base.get(..6).unwrap_or(base));
+    ch.fresh = match latest_replay {
+        Some((Some(w), base)) if w == kiln_ci::fresh::WHY => Some(format!("replays clean on {}", on(&base))),
+        Some((Some(w), base)) if w == kiln_ci::fresh::WHY_CONFLICTED => Some(format!("conflicts on {}", on(&base))),
+        _ => None,
+    };
     let mut st = c.prepare("SELECT reviewer, added_at FROM diff_reviewers WHERE diff_id = ?1 ORDER BY added_at, reviewer")?;
     ch.reviewers = st.query_map([&id], |r| Ok((r.get(0)?, r.get(1)?)))?.collect::<Result<_, _>>()?;
     let mut st = c.prepare("SELECT reviewer, action, created_at, body, version FROM reviews WHERE diff_id = ?1 ORDER BY created_at, rowid")?;
@@ -649,7 +670,21 @@ fn load_pull(c: &rusqlite::Connection, repo_id: &str, host: &str, number: i64, n
             |r| r.get(0),
         )
         .optional()?;
+    // How fresh it is (W26-R16): its latest head's latest replay onto its base, in kiln's mirror.
+    let fresh = c
+        .query_row(
+            "SELECT r.state, r.onto, p.base FROM review_pull_replays r JOIN host_pulls p ON p.repo_id = r.repo_id AND p.host = r.host AND p.number = r.number
+              WHERE r.repo_id = ?1 AND r.host = ?2 AND r.number = ?3 AND r.head_sha = ?4 ORDER BY r.k DESC LIMIT 1",
+            params![repo_id, host, number, latest_sha],
+            |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get::<_, String>(2)?)),
+        )
+        .optional()?
+        .map(|(state, onto, base)| {
+            let at = format!("{base}@{}", onto.get(..6).unwrap_or(&onto));
+            if state == "clean" { format!("replays clean on {at}") } else { format!("conflicts on {at}") }
+        });
     Ok(ChangeRec {
+        fresh,
         name: format!("{}{number}", if host == "gitlab" { "!" } else { "#" }),
         kind: "request",
         host: host.to_string(),
@@ -780,7 +815,7 @@ fn review_of(ch: &ChangeRec, sha: &str, handed: Option<&HandoffRec>, held: Optio
     let about = held.filter(|_| state != ReviewState::Fixing).unwrap_or(about);
     let tip = ch.tip();
     let superseded_by = (sha != tip).then(|| if ch.n < ch.latest { format!("v{}", ch.latest) } else { short(tip) });
-    Some(Review { state, turn: whose, author, open, conflicts: gate.conflicts, fixing: handed.map(|h| h.to.clone()), about, superseded_by, fixed_in })
+    Some(Review { state, turn: whose, author, open, conflicts: gate.conflicts, fixing: handed.map(|h| h.to.clone()), about, superseded_by, fixed_in, fresh: ch.fresh.clone() })
 }
 
 fn short(sha: &str) -> String {
@@ -1245,6 +1280,27 @@ fn made_by(rec: &Records) -> MadeBy {
 }
 
 impl MadeBy {
+    /// Who made one of the conflict ladder's tries (docs/ci.md W26-R17), from its actor's
+    /// principal: an agent's (`agent:<id> for user:kim`) names the agent and the person it acts for;
+    /// a person's (`user:kim`) the person; kiln's own (its structural merge, a remembered resolution)
+    /// neither, its rung saying who. A try isn't a commit until it's accepted; the revision it
+    /// becomes then reads its maker through [`made_by`], as every commit does.
+    fn of_actor(principal: &str) -> MadeBy {
+        if let Some(rest) = principal.strip_prefix("agent:") {
+            let mut words = rest.split(' ');
+            let agent = words.next().filter(|a| !a.is_empty()).map(str::to_owned);
+            let person = match (words.next(), words.next()) {
+                (Some("for"), Some(p)) if !p.is_empty() => Some(p.to_owned()),
+                _ => None,
+            };
+            return MadeBy { agent, person };
+        }
+        if principal.starts_with("user:") {
+            return MadeBy { agent: None, person: Some(principal.to_owned()) };
+        }
+        MadeBy::default()
+    }
+
     /// `{agent?, person?}` (optional fields, W26-R18), or null when kiln knows neither.
     fn json(&self) -> Value {
         if self.agent.is_none() && self.person.is_none() {
@@ -1259,6 +1315,11 @@ impl MadeBy {
         }
         Value::Object(v)
     }
+}
+
+/// [`MadeBy::of_actor`] as the API shows it: `{agent?, person?}`, or null.
+pub(crate) fn made_by_actor(principal: &str) -> Value {
+    MadeBy::of_actor(principal).json()
 }
 
 /// A commit's kind for the facets: its change's (`diff`, `request`), else `commit`.
@@ -1564,14 +1625,15 @@ pub async fn list_in(store: &crate::store::Store, q: &HashMap<String, String>, o
         .await
         .map_err(internal)?;
     let more = recs.len() > usize::try_from(limit).unwrap_or(usize::MAX);
-    let page: Vec<Value> = recs
-        .iter()
-        .take(usize::try_from(limit).unwrap_or(30))
-        .map(|r| {
-            let x = render(r, &runners, now);
-            if holds(&x.whose, viewer) { x.yours.unwrap_or(x.others) } else { x.others }
-        })
-        .collect();
+    // The page's rows drawn on the compute pool, a commit a unit (goal 3, plan 01a1a59c2a8e step 5),
+    // not on the request's shard.
+    let viewer = viewer.cloned();
+    let page: Vec<Value> = crate::rt::compute_map(recs.into_iter().take(usize::try_from(limit).unwrap_or(30)).collect(), move |r| {
+        let x = render(&r, &runners, now);
+        if holds(&x.whose, viewer.as_ref()) { x.yours.unwrap_or(x.others) } else { x.others }
+    })
+    .await
+    .map_err(internal)?;
     let next = if more { page.last().and_then(|c| c.get("cursor")).cloned() } else { None };
     Ok(json!({ "commits": page, "next_cursor": next }))
 }
@@ -1656,6 +1718,9 @@ struct Row {
     host: Option<String>,
     stand: journey::Stand,
     agent: Option<String>,
+    /// What time moves without a record changing: its guard or its soak runs down. Drawn again at
+    /// each refresh, as production's commit is.
+    moves: bool,
 }
 
 impl Row {
@@ -1664,7 +1729,16 @@ impl Row {
         let text = |v: &Value| serde_json::to_string(v).map_err(|e| internal(e.into()));
         let (others, yours) = (text(&x.others)?, x.yours.as_ref().map(text).transpose()?);
         let (kind, host) = (kind_of(&rec), rec.change.as_ref().map(|c| c.host.clone()));
-        Ok(Self { rec, others, yours, whose: x.whose, kind, host, stand: x.stand, agent: x.agent })
+        let moves = others.contains("\"guard\"") || others.contains("\"soaking\"");
+        Ok(Self { rec, others, yours, whose: x.whose, kind, host, stand: x.stand, agent: x.agent, moves })
+    }
+
+    /// Each commit's row of `items`, drawn on the compute pool, a commit a unit of each piece (goal 3,
+    /// plan 01a1a59c2a8e step 5): a render and its JSON each, which drawn on the request's shard held
+    /// every other request on that shard for as long as the drawing took.
+    async fn draw<K: Send + 'static>(items: Vec<(K, Records)>, runners: &[RunnerSeen], now: i64) -> Result<Vec<(K, Row)>, Fail> {
+        let runners = runners.to_vec();
+        crate::rt::compute_map(items, move |(key, rec)| Row::of(rec, &runners, now).map(|row| (key, row))).await.map_err(internal)?.into_iter().collect()
     }
 
     fn json(&self, viewer: Option<&HashSet<String>>) -> &str {
@@ -1819,16 +1893,45 @@ impl ShipCache {
             })
             .await
             .map_err(internal)?;
-        // Each loaded commit's row drawn before the model's lock is taken (a render and its JSON
-        // each): every page that reads the model waits on its write lock, on every shard.
+        // Each loaded commit's row drawn on the compute pool, before the model's lock is taken (a
+        // render and its JSON each): every page that reads the model waits on its write lock, on
+        // every shard, and the drawing on the request's shard held up every request on it.
+        let mut items = Vec::new();
         let mut loaded = Vec::with_capacity(read.loaded.len());
-        for (ctx, recs, all, drop) in read.loaded {
-            let mut rows = Vec::with_capacity(recs.len());
-            for rec in recs {
-                rows.push((rec.sha.clone(), Row::of(rec, runners, now)?));
-            }
-            loaded.push((ctx, rows, all, drop));
+        for (i, (ctx, recs, all, drop)) in read.loaded.into_iter().enumerate() {
+            items.extend(recs.into_iter().map(|rec| (i, rec)));
+            loaded.push((ctx, Vec::new(), all, drop));
         }
+        for (i, row) in Row::draw(items, runners, now).await? {
+            if let Some((_, rows, _, _)) = loaded.get_mut(i) {
+                rows.push((row.rec.sha.clone(), row));
+            }
+        }
+        // What time and the runners move without a record changing: the guard and the soak run
+        // down, and the commit production runs replants. Those few are drawn again, on the pool too,
+        // from their records as held: the rows a repository's reload doesn't draw afresh.
+        let again = {
+            let h = self.held.read().map_err(|_| poisoned())?;
+            let mut again: Vec<((String, String), Records)> = Vec::new();
+            for held in h.repos.values() {
+                let fresh = loaded.iter().find(|(ctx, _, _, _)| ctx.id == held.ctx.id);
+                if fresh.is_some_and(|(_, _, all, _)| *all) {
+                    continue;
+                }
+                let ctx = fresh.map_or(&held.ctx, |(ctx, _, _, _)| ctx);
+                let prod = ctx.current.iter().find(|d| d.production).map(|d| d.sha.as_str());
+                for (sha, row) in &held.rows {
+                    if fresh.is_some_and(|(_, rows, _, _)| rows.iter().any(|(s, _)| s == sha)) {
+                        continue;
+                    }
+                    if prod == Some(sha.as_str()) || row.moves {
+                        again.push(((held.ctx.id.clone(), sha.clone()), row.rec.clone()));
+                    }
+                }
+            }
+            again
+        };
+        let again = Row::draw(again, runners, now).await?;
         let mut h = self.held.write().map_err(|_| poisoned())?;
         if read.top < h.seq {
             return Ok(());
@@ -1859,14 +1962,10 @@ impl ShipCache {
             held.total = ctx.commits.len();
             held.ctx = ctx;
         }
-        // What time and the runners move without a record changing: the guard and the soak run
-        // down, and the commit production runs replants. Those few are drawn again.
-        for held in h.repos.values_mut() {
-            let prod = held.ctx.current.iter().find(|d| d.production).map(|d| d.sha.clone());
-            for (sha, row) in held.rows.iter_mut() {
-                if prod.as_deref() == Some(sha.as_str()) || row.others.contains("\"guard\"") || row.others.contains("\"soaking\"") {
-                    *row = Row::of(std::mem::take(&mut row.rec), runners, now)?;
-                }
+        // The rows drawn again, where their commit is still held.
+        for ((id, sha), row) in again {
+            if let Some(slot) = h.repos.values_mut().find(|r| r.ctx.id == id).and_then(|r| r.rows.get_mut(&sha)) {
+                *slot = row;
             }
         }
         h.seq = read.top;
@@ -2251,12 +2350,65 @@ async fn ready_in(hub: &std::sync::Arc<Hub>, caller: &crate::authz::Caller, body
 /// way its comments reach it (docs/agentic.md C3). A failure with no agent of its own goes to the
 /// agent attached to what failed, as the failure itself wakes it (an incident, W20-R08). Each is
 /// kept (`ship_handoffs`), so the row says who is on it; with nothing open, or no agent to take it,
-/// it says why. As the caller, with `runs.rerun` on the repository, as Retry asks.
+/// it says why. As the caller, with `runs.rerun` on the repository, as Retry asks. The person's side
+/// is signed (docs/ci.md W27-R08): their own hand-on beside it (`hand_on`), else kiln's take for
+/// them, saying why it isn't theirs (`unsigned`: their browser's reason).
 pub async fn hand_off(hub: &std::sync::Arc<Hub>, caller: &crate::authz::Caller, body: &Value) -> Result<Response, Fail> {
     hand_off_in(hub, caller, body).await.map(|v| srv::json(StatusCode::OK, &v))
 }
 
-async fn hand_off_in(hub: &std::sync::Arc<Hub>, caller: &crate::authz::Caller, body: &Value) -> Result<Value, Fail> {
+/// `POST /api/ship/hand-off/statement` `{repo, sha}`: what a person signs to hand the commit off from
+/// a browser, with the browser's own key (docs/ci.md W27-R08; `ui/src/lib/signing.ts`), said as a
+/// verdict's is. It's their hand-on of what's open of it to kiln's server, which passes it on
+/// unchanged to the agent that takes it, since kiln knows who that is only as it hands it
+/// ([`hand_off`], with the signed hand-on as `hand_on`). Refused as Hand off would be.
+pub async fn hand_off_statement(hub: &std::sync::Arc<Hub>, caller: &crate::authz::Caller, body: &Value) -> Result<Response, Fail> {
+    hand_off_statement_in(hub, caller, body).await.map(|v| srv::json(StatusCode::OK, &v))
+}
+
+async fn hand_off_statement_in(hub: &std::sync::Arc<Hub>, caller: &crate::authz::Caller, body: &Value) -> Result<Value, Fail> {
+    use kiln_ci::identity::custody::{Body, Kind, to_value};
+    use kiln_ci::identity::statement::Statement;
+    let h = handing(hub, caller, body).await?;
+    let org = hub.pki.organization();
+    let person = crate::identities::person_identity(&hub.store, &org, caller).await.map_err(|e| (StatusCode::FORBIDDEN, e.to_string()))?;
+    let what = h.what().join(", ");
+    let b = Body { to: Some(crate::custody::server_uri(&org)), why: handed_why(&h.rec, &what), ..Body::new(Kind::HandedOn, &person) };
+    let s = Statement { subject: vec![handed_work(&h.rec, &what)], ..Statement::new(to_value(&b)) };
+    crate::custody::to_sign(&s).map_err(internal)
+}
+
+/// A commit's Hand off as kiln decides it, before anything is handed: the commit, its journey, and
+/// its change's author's agent while that runs (its id and name), which takes all that's open;
+/// without one, its failure goes to the agent attached to what failed.
+struct Handing {
+    rec: Records,
+    j: Journey,
+    running: Option<(String, String)>,
+}
+
+impl Handing {
+    /// What's open: a change's conflicts and threads, at its live revision only, and a failure
+    /// while no one has it.
+    fn open(&self) -> (&[kiln_ci::review::Conflict], &[ThreadRec], Option<&LegRec>) {
+        let live = self.rec.change.as_ref().filter(|_| self.j.review.as_ref().is_some_and(|r| r.superseded_by.is_none()));
+        let (conflicts, threads) = live.map(|ch| (ch.conflicts.as_slice(), ch.threads.as_slice())).unwrap_or_default();
+        (conflicts, threads, failed_leg(&self.rec).filter(|_| self.j.handled_by.is_none()))
+    }
+
+    /// What its taker is handed: all that's open, to the author's agent; else the failed checks.
+    fn what(&self) -> Vec<&'static str> {
+        if self.running.is_none() || self.rec.change.is_none() {
+            return vec!["checks"];
+        }
+        let (conflicts, threads, failed) = self.open();
+        [(!conflicts.is_empty(), "conflicts"), (!threads.is_empty(), "threads"), (failed.is_some(), "checks")].into_iter().filter_map(|(y, w)| y.then_some(w)).collect()
+    }
+}
+
+/// `body`'s commit's Hand off, decided ([`Handing`]): refused when the caller can't hand it off,
+/// when nothing is open, or when no one could take it.
+async fn handing(hub: &std::sync::Arc<Hub>, caller: &crate::authz::Caller, body: &Value) -> Result<Handing, Fail> {
     let field = |k: &str| body.get(k).and_then(Value::as_str).map(str::trim).filter(|s| !s.is_empty()).map(str::to_owned);
     let (Some(repo), Some(sha)) = (field("repo"), field("sha")) else {
         return Err((StatusCode::BAD_REQUEST, "`repo` and `sha`: the commit to hand off".to_string()));
@@ -2264,44 +2416,30 @@ async fn hand_off_in(hub: &std::sync::Arc<Hub>, caller: &crate::authz::Caller, b
     if !caller.can("runs.rerun", &crate::authz::Scope::Repo { repo: repo.clone() }) {
         return Err((StatusCode::FORBIDDEN, format!("handing off needs `runs.rerun` on {repo}")));
     }
-    let (r, s, deploys) = (repo.clone(), sha.clone(), cd_deploys());
-    let rec = hub.store.call(move |c| load(c, &r, &s, &deploys)).await.map_err(internal)?.ok_or_else(|| (StatusCode::NOT_FOUND, "no such commit".to_string()))?;
+    let deploys = cd_deploys();
+    let rec = hub.store.call(move |c| load(c, &repo, &sha, &deploys)).await.map_err(internal)?.ok_or_else(|| (StatusCode::NOT_FOUND, "no such commit".to_string()))?;
     let j = journey_of(&rec, &runners_seen(hub).await, crate::util::now_ms());
-    // A change's review is handed at its live revision only; a failure while no one has it.
-    let live = rec.change.as_ref().filter(|_| j.review.as_ref().is_some_and(|r| r.superseded_by.is_none()));
-    let (conflicts, threads) = live.map(|ch| (ch.conflicts.as_slice(), ch.threads.as_slice())).unwrap_or_default();
-    let failed = failed_leg(&rec).filter(|_| j.handled_by.is_none());
-    let at = short(&rec.sha);
-    if conflicts.is_empty() && threads.is_empty() && failed.is_none() {
-        return Err((StatusCode::CONFLICT, format!("{at} has nothing open to hand off")));
-    }
-    let base = hub.cfg.server.public_url.trim_end_matches('/').to_owned();
     // Its maker's agent, from the one place Ship reads it (made_by: Chain of Ownership fills it in time).
     let author = made_by(&rec).agent;
     let running = match author.as_deref() {
         Some(id) => {
             let agent = crate::workspace::change::of(hub, id).await.map_or_else(|| id.to_owned(), |r| r.agent);
-            hub.harness.info(&agent).filter(|i| i.status != crate::harness::model::Status::Exited)
+            hub.harness.info(&agent).filter(|i| i.status != crate::harness::model::Status::Exited).map(|i| (i.id, i.name))
         }
         None => None,
     };
-    if let (Some(info), Some(ch)) = (running, rec.change.as_ref()) {
-        let excerpt = match failed {
-            Some(leg) => crate::ci::logsearch::failure(hub, &leg.job, HANDED_LINES).await.ok(),
-            None => None,
-        };
-        let text = handed_text(&rec, ch, conflicts, threads, failed.map(|l| (l, excerpt.as_ref())), &base, &caller.name);
-        if !crate::workspace::follow::deliver(hub, &info.id, text).await {
-            return Err((StatusCode::BAD_GATEWAY, format!("{} didn't get it: kiln couldn't reach it", info.name)));
-        }
-        let what: Vec<&str> = [(!conflicts.is_empty(), "conflicts"), (!threads.is_empty(), "threads"), (failed.is_some(), "checks")].into_iter().filter_map(|(y, w)| y.then_some(w)).collect();
-        keep(hub, &rec, &what, &info.name, Some(&info.id), None, Some(ch.n), &caller.name).await?;
-        let custody = hand_off_signed(hub, caller, &rec, &what, &info.id, body.get("hand_on")).await;
-        return Ok(json!({ "handed": { "to": info.name, "agent": info.id, "what": what }, "custody": custody }));
+    let h = Handing { rec, j, running };
+    let (nothing, failure) = {
+        let (conflicts, threads, failed) = h.open();
+        (conflicts.is_empty() && threads.is_empty() && failed.is_none(), failed.is_some())
+    };
+    let at = short(&h.rec.sha);
+    if nothing {
+        return Err((StatusCode::CONFLICT, format!("{at} has nothing open to hand off")));
     }
-    // No agent of its own: a failure goes to what looks after it; a change's review has no one.
-    let Some(leg) = failed else {
-        let name = rec.change.as_ref().map_or_else(|| at.clone(), |ch| ch.name.clone());
+    // No agent of its own and nothing failed: a change's review has no one to go to.
+    if (h.running.is_none() || h.rec.change.is_none()) && !failure {
+        let name = h.rec.change.as_ref().map_or(at, |ch| ch.name.clone());
         return Err((
             StatusCode::CONFLICT,
             match author {
@@ -2309,13 +2447,39 @@ async fn hand_off_in(hub: &std::sync::Arc<Hub>, caller: &crate::authz::Caller, b
                 None => format!("{name} is its author's own: no agent of its author to hand it to"),
             },
         ));
+    }
+    Ok(h)
+}
+
+async fn hand_off_in(hub: &std::sync::Arc<Hub>, caller: &crate::authz::Caller, body: &Value) -> Result<Value, Fail> {
+    let h = handing(hub, caller, body).await?;
+    let (rec, what) = (&h.rec, h.what());
+    let (conflicts, threads, failed) = h.open();
+    let at = short(&rec.sha);
+    let base = hub.cfg.server.public_url.trim_end_matches('/').to_owned();
+    if let (Some((id, name)), Some(ch)) = (h.running.as_ref(), rec.change.as_ref()) {
+        let excerpt = match failed {
+            Some(leg) => crate::ci::logsearch::failure(hub, &leg.job, HANDED_LINES).await.ok(),
+            None => None,
+        };
+        let text = handed_text(rec, ch, conflicts, threads, failed.map(|l| (l, excerpt.as_ref())), &base, &caller.name);
+        if !crate::workspace::follow::deliver(hub, id, text).await {
+            return Err((StatusCode::BAD_GATEWAY, format!("{name} didn't get it: kiln couldn't reach it")));
+        }
+        keep(hub, rec, &what, name, Some(id), None, Some(ch.n), &caller.name).await?;
+        let custody = hand_off_signed(hub, caller, rec, &what, id, body).await;
+        return Ok(json!({ "handed": { "to": name, "agent": id, "what": what }, "custody": custody }));
+    }
+    // No agent of its own: its failure goes to what looks after it ([`handing`] saw one).
+    let Some(leg) = failed else {
+        return Err((StatusCode::CONFLICT, format!("{at} has nothing open to hand off")));
     };
     let Some(notice) = crate::ci::notify::failed_notice(hub, &leg.run_id).await else {
         return Err((StatusCode::NOT_FOUND, format!("no run {} to hand off", leg.run_id)));
     };
     let t = crate::ci::attach::failure_of(hub, &notice, "failure").await;
     let Some(a) = crate::ci::attach::all(hub).await.into_iter().find(|a| crate::ci::attach::looks_after(a, &t.about)) else {
-        return Err((StatusCode::CONFLICT, format!("No agent looks after {repo}: attach one on its page in Repos (an agent woken by failures), and Hand off gives it {at}")));
+        return Err((StatusCode::CONFLICT, format!("No agent looks after {}: attach one on its page in Repos (an agent woken by failures), and Hand off gives it {at}", rec.repo)));
     };
     let Some(i) = crate::ci::attach::wake(hub, &a, &t).await else {
         return Err((StatusCode::CONFLICT, format!("{} didn't take {at}", a.name)));
@@ -2323,21 +2487,35 @@ async fn hand_off_in(hub: &std::sync::Arc<Hub>, caller: &crate::authz::Caller, b
     let Some(agent) = i.agent.clone() else {
         return Err((StatusCode::CONFLICT, format!("{} didn't take {at}: {}", a.name, i.why.unwrap_or_else(|| "its incident waits on a person".to_string()))));
     };
-    keep(hub, &rec, &["checks"], &a.name, Some(&agent), Some(&i.id), None, &caller.name).await?;
-    let custody = hand_off_signed(hub, caller, &rec, &["checks"], &agent, body.get("hand_on")).await;
-    Ok(json!({ "handed": { "to": a.name, "agent": agent, "incident": i.id, "what": ["checks"] }, "custody": custody }))
+    keep(hub, rec, &what, &a.name, Some(&agent), Some(&i.id), None, &caller.name).await?;
+    let custody = hand_off_signed(hub, caller, rec, &what, &agent, body).await;
+    Ok(json!({ "handed": { "to": a.name, "agent": agent, "incident": i.id, "what": what }, "custody": custody }))
+}
+
+/// The work a hand-off of `rec`'s commit hands (`what`: its checks, threads or conflicts), by its
+/// repository, commit and what (`kiln-work-v1`).
+fn handed_work(rec: &Records, what: &str) -> kiln_ci::identity::statement::Subject {
+    crate::custody::work(&format!("{}@{} {what}", rec.repo, short(&rec.sha)), &[&rec.repo, &rec.sha, what])
+}
+
+/// Why a hand-off's records say it changed hands.
+fn handed_why(rec: &Records, what: &str) -> String {
+    format!("handed off: {what} of {}@{}", rec.repo, short(&rec.sha))
 }
 
 /// What `caller` handed agent session `agent` of `rec`'s commit (`what`: its checks, threads or
 /// conflicts) changes hands signed (docs/ci.md W27-R08; the Transfers plan's step 6). The person's
-/// own hand-on when they sent one (`signed`, signed on their device: a hand-on of that work to the
-/// agent), else kiln's take for them on their signed-in session, saying their own signature is
-/// missing; the agent signs its receipt as it takes the work up, at its next turn. What the answer
-/// says of it: the hand-on, and whether kiln signed it for them.
-async fn hand_off_signed(hub: &Hub, caller: &crate::authz::Caller, rec: &Records, what: &[&str], agent: &str, signed: Option<&Value>) -> Value {
+/// own hand-on when they sent one (`hand_on` in `body`, signed on their device), of that work to the
+/// agent, or, from a browser, which signs before kiln knows who takes it, to kiln's server, which
+/// passes it on unchanged to the agent (a relay's record). Else kiln's take for them on their
+/// signed-in session, saying their own signature is missing and why: their browser's reason
+/// (`unsigned`), the one they sent refused, or no key on the device that asked. The agent signs its
+/// receipt as it takes the work up, at its next turn. What the answer says of it: the hand-on, what
+/// kiln passed on, and whether kiln signed it for them.
+async fn hand_off_signed(hub: &Hub, caller: &crate::authz::Caller, rec: &Records, what: &[&str], agent: &str, body: &Value) -> Value {
     let org = hub.pki.organization();
     let what = what.join(", ");
-    let thing = crate::custody::work(&format!("{}@{} {what}", rec.repo, short(&rec.sha)), &[&rec.repo, &rec.sha, &what]);
+    let thing = handed_work(rec, &what);
     let person = crate::identities::person_identity(&hub.store, &org, caller).await.unwrap_or_else(|_| crate::custody::person_uri(&org, &crate::identities::person_of(&caller.name)));
     let to = match crate::identities::agent_at(hub, agent, hub.harness.epoch_of(agent)).await {
         Ok(to) => to,
@@ -2346,19 +2524,40 @@ async fn hand_off_signed(hub: &Hub, caller: &crate::authz::Caller, rec: &Records
             return Value::Null;
         }
     };
-    let why = format!("handed off: {what} of {}@{}", rec.repo, short(&rec.sha));
-    // Their own, signed on their device: kept if it's theirs, and of this work to this agent.
-    if let Some(bundle) = signed {
-        match crate::custody::person_hand_on(hub, &person, &to, &thing, bundle, &format!("api:{}", caller.name)).await {
+    let why = handed_why(rec, &what);
+    let mut missing = body.get("unsigned").and_then(Value::as_str).map(|m| m.chars().take(300).collect::<String>());
+    // Their own, signed on their device: kept if it's theirs, of this work, to this agent or to kiln.
+    if let Some(bundle) = body.get("hand_on") {
+        let server = crate::custody::server_uri(&org);
+        let via_kiln = crate::custody::hand_on_to(bundle).is_some_and(|t| t == server);
+        let kept = crate::custody::person_hand_on(hub, &person, if via_kiln { &server } else { &to }, &thing, bundle, &format!("api:{}", caller.name)).await;
+        match kept {
+            Ok(Ok(digest)) if via_kiln => {
+                let passed = crate::custody::pass_on(hub, vec![thing], &digest, &person, &to, "handed off from Ship, passed on unchanged to the agent that took it").await;
+                return match passed {
+                    Ok((passed, bundle)) => {
+                        crate::custody::ask_receipt(hub, agent, &bundle).await;
+                        json!({ "hand_on": digest, "passed_on": passed, "kiln_signed_for_you": false })
+                    }
+                    Err(e) => {
+                        tracing::warn!(target: "kiln.custody", %agent, error = %format!("{e:#}"), "a person's hand-off to kiln wasn't passed on to its agent");
+                        json!({ "hand_on": digest, "kiln_signed_for_you": false })
+                    }
+                };
+            }
             Ok(Ok(digest)) => {
                 crate::custody::ask_receipt(hub, agent, bundle).await;
                 return json!({ "hand_on": digest, "kiln_signed_for_you": false });
             }
-            Ok(Err(why)) => tracing::info!(target: "kiln.custody", %agent, %why, "a person's own hand-off refused: kiln signs it for them"),
+            Ok(Err(why)) => {
+                tracing::info!(target: "kiln.custody", %agent, %why, "a person's own hand-off refused: kiln signs it for them");
+                missing = Some(format!("the one they sent was refused ({why})"));
+            }
             Err(e) => tracing::warn!(target: "kiln.custody", %agent, error = %format!("{e:#}"), "a person's own hand-off couldn't be checked"),
         }
     }
-    let why = format!("{why}: kiln's take for them, on their signed-in session; their own signature is missing: no key on the device that asked");
+    let missing = missing.unwrap_or_else(|| "no key on the device that asked".to_owned());
+    let why = format!("{why}: kiln's take for them, on their signed-in session; their own signature is missing: {missing}");
     match crate::custody::hand_work(hub, thing, &to, &why, crate::custody::Giver::For(person)).await {
         Ok((digest, bundle)) => {
             crate::custody::ask_receipt(hub, agent, &bundle).await;
@@ -2442,6 +2641,20 @@ pub async fn kiln_kept(hub: &Hub, repo: &str, sha: &str, version: u32, what: &st
 
 /// Keeps a Hand off of `rec`'s commit, one row for each of `what` (W26-R18): to whom (`to`, its
 /// agent and the incident it opened), the change's revision for its review, by whom, now.
+/// A change's conflicts the conflict ladder handed to an agent (docs/ci.md W26-R17), kept as Hand
+/// off keeps them (W26-R18), so its row reads "<to> fixing" until a new revision replaces it.
+pub(crate) async fn conflicts_handed(hub: &Hub, repo: &str, sha: &str, to: &str, agent: &str, version: u32) -> Result<(), Fail> {
+    let (repo, sha, to, agent, at) = (repo.to_owned(), sha.to_owned(), to.to_owned(), agent.to_owned(), crate::util::now_unix());
+    hub.store
+        .call(move |c| {
+            let repo_id: String = c.query_row("SELECT id FROM repos WHERE name = ?1 OR id = ?1", [&repo], |r| r.get(0))?;
+            c.execute("INSERT INTO ship_handoffs (repo_id, sha, what, to_name, agent, incident, version, by, at) VALUES (?1, ?2, 'conflicts', ?3, ?4, NULL, ?5, 'kiln', ?6)", params![repo_id, sha, to, agent, version, at])?;
+            Ok(())
+        })
+        .await
+        .map_err(internal)
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn keep(hub: &Hub, rec: &Records, what: &[&str], to: &str, agent: Option<&str>, incident: Option<&str>, version: Option<u32>, by: &str) -> Result<(), Fail> {
     let (repo, sha, what) = (rec.repo.clone(), rec.sha.clone(), what.iter().map(|w| (*w).to_owned()).collect::<Vec<String>>());
@@ -2465,6 +2678,16 @@ async fn keep(hub: &Hub, rec: &Records, what: &[&str], to: &str, agent: Option<&
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// W26-R17: who made each of the conflict ladder's tries reads back in MadeBy's shape: an agent's
+    /// offer names the agent and its person, a person's edit the person, kiln's own merge neither.
+    #[test]
+    fn w26_r17_a_ladder_trys_made_by() {
+        assert_eq!(made_by_actor("agent:01a18b4228f7 for user:kim"), json!({ "agent": "01a18b4228f7", "person": "user:kim" }));
+        assert_eq!(made_by_actor("agent:resolver"), json!({ "agent": "resolver" }));
+        assert_eq!(made_by_actor("user:kim"), json!({ "person": "user:kim" }));
+        assert_eq!(made_by_actor("kiln"), Value::Null);
+    }
 
     const C1: &str = "1111111aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
     const C2: &str = "2222222bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
@@ -3322,6 +3545,71 @@ mod tests {
         })
     }
 
+    /// A future's longest poll: how long one of its polls held its thread at the most.
+    struct Longest<F> {
+        inner: std::pin::Pin<Box<F>>,
+        most: std::time::Duration,
+    }
+
+    impl<F: std::future::Future> std::future::Future for Longest<F> {
+        type Output = (F::Output, std::time::Duration);
+        fn poll(mut self: std::pin::Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> std::task::Poll<Self::Output> {
+            let t = std::time::Instant::now();
+            let polled = self.inner.as_mut().poll(cx);
+            self.most = self.most.max(t.elapsed());
+            polled.map(|v| (v, self.most))
+        }
+    }
+
+    /// Goal 3, plan 01a1a59c2a8e step 5 (perf/api-pass's leftover): the ship page's rows are drawn on
+    /// the compute pool, not on the shard of the request that brings the model up to date. Building
+    /// the model of 1,000 commits (4 runs of 2 legs each), no poll of the refresh holds its thread
+    /// for a fifth of what drawing the rows takes; drawn on the shard, the drawing was one poll.
+    #[test]
+    fn g3_s5_the_ship_pages_rows_are_drawn_off_the_requests_shard() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let store = crate::store::Store::open(&dir.path().join("kiln.db"))?;
+        crate::rt::block_on(async move {
+            store
+                .call(|c| {
+                    let tx = c.savepoint()?;
+                    tx.execute("INSERT INTO repos (id, name, clone_url, created_at) VALUES ('kiln', 'hyper-light/kiln', 'https://example.invalid/kiln.git', 1)", [])?;
+                    let mut run = tx.prepare("INSERT INTO runs (id, repo_id, number, pipeline, event, branch, sha, message, author, status, created_at, attempt) VALUES (?1, 'kiln', ?2, ?3, 'push', 'main', ?4, 'a change', 'ada', 'completed', ?5, 1)")?;
+                    let mut leg = tx.prepare("INSERT INTO jobs (id, run_id, key, display, status, conclusion, labels, needs, spec, job_id, run_attempt) VALUES (?1, ?2, ?3, ?3, 'completed', 'success', '[]', '[]', '{}', ?3, 1)")?;
+                    let mut n = 0i64;
+                    for commit in 0..1000i64 {
+                        let sha = format!("{commit:07x}{}", "a".repeat(33));
+                        for pipeline in ["ci", "e2e", "sim", "release"] {
+                            n += 1;
+                            let id = format!("r{n}");
+                            run.execute(params![id, n, pipeline, sha, NOW_S + n])?;
+                            for k in 0..2 {
+                                leg.execute(params![format!("{id}l{k}"), id, format!("{pipeline} leg {k}")])?;
+                            }
+                        }
+                    }
+                    drop((run, leg));
+                    tx.commit()?;
+                    Ok(())
+                })
+                .await?;
+            let cache = ShipCache::new();
+            let now = NOW_S * 1000;
+            let (built, longest) = Longest { inner: Box::pin(cache.refresh(&store, &runners(), &[], now)), most: std::time::Duration::ZERO }.await;
+            built.map_err(|(_, m)| anyhow::anyhow!(m))?;
+            // What drawing every row takes, on this thread.
+            let recs: Vec<Records> = cache.held.read().map_err(|_| anyhow::anyhow!("the model's lock was poisoned"))?.repos.values().flat_map(|r| r.rows.values().map(|row| row.rec.clone())).collect();
+            anyhow::ensure!(recs.len() == 1000, "{} commits held", recs.len());
+            let t = std::time::Instant::now();
+            for rec in recs {
+                Row::of(rec, &runners(), now).map_err(|(_, m)| anyhow::anyhow!(m))?;
+            }
+            let draw = t.elapsed();
+            anyhow::ensure!(longest * 5 < draw, "the refresh held its thread {longest:?} in one poll; drawing the rows takes {draw:?}");
+            Ok(())
+        })
+    }
+
     /// W26-R14: a commit with no change carries the Review lane group's one mark — its push,
     /// revision null, signer null until W27-R03.
     #[test]
@@ -3471,6 +3759,37 @@ mod tests {
         })
     }
 
+    /// W26-R16 on Ship's row: a change kiln replayed as its trunk moved says so at the end of its
+    /// line, the replay's base naming the tip it went onto; before the replay, the line says nothing
+    /// of it. The row's line changes, so its cache must take the new version (diff_versions'
+    /// triggers note the change).
+    #[test]
+    fn w26_r16_a_replay_ends_the_rows_line_with_how_fresh_it_is() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let store = crate::store::Store::open(&dir.path().join("kiln.db"))?;
+        crate::rt::block_on(async move {
+            let sql = fixture() + &fixture_person_change();
+            store.call(move |c| Ok(c.execute_batch(&sql)?)).await?;
+            let line = |page: &Value, short: &str| page.get("commits").and_then(Value::as_array).into_iter().flatten().find(|c| c.get("short") == Some(&json!(short))).and_then(|c| c.get("line").and_then(Value::as_str).map(str::to_owned)).unwrap_or_default();
+            let page = list_in(&store, &HashMap::new(), None, None, runners(), &[], NOW_S * 1000).await.map_err(|(_, m)| anyhow::anyhow!(m))?;
+            let before = line(&page, "5151515");
+            assert!(!before.contains("replays clean"), "{before}");
+            let seq = |store: crate::store::Store| async move { store.call(|c| Ok(c.query_row("SELECT n FROM ship_seq", [], |r| r.get::<_, i64>(0))?)).await };
+            let was = seq(store.clone()).await?;
+            let t = NOW_S - 60;
+            let replay = "5252525aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+            let sql = format!(
+                "INSERT INTO diff_versions (diff_id, n, commit_sha, parent, base, message, pushed_by, created_at, rebase_only, why) VALUES ('d51', 2, '{replay}', '4c1e2a9f00', '4c1e2a9f00', 'sched: lee', 'kiln', {t}, 1, 'replayed');"
+            );
+            store.call(move |c| Ok(c.execute_batch(&sql)?)).await?;
+            assert!(seq(store.clone()).await? > was, "the replay notes the change for Ship's cache");
+            let page = list_in(&store, &HashMap::new(), None, None, runners(), &[], NOW_S * 1000).await.map_err(|(_, m)| anyhow::anyhow!(m))?;
+            let after = line(&page, "5252525");
+            assert!(after.ends_with(" · replays clean on main@4c1e2a") || after == "replays clean on main@4c1e2a", "{after}");
+            Ok(())
+        })
+    }
+
     /// D51: lee's own diff, a person's change.
     fn fixture_person_change() -> String {
         let t = NOW_S - 300;
@@ -3582,6 +3901,86 @@ mod tests {
             let taken = v.pointer("/hops/1").cloned().unwrap_or_default();
             anyhow::ensure!(taken.get("kind") == Some(&json!("taken")) && taken.get("custodian") == Some(&json!(server)) && taken.get("taken_for") == Some(&json!(person)), "kiln for the person: {taken}");
             anyhow::ensure!(taken.get("why").and_then(Value::as_str).is_some_and(|w| w.contains("no key on the device that asked")), "{taken}");
+            Ok(())
+        })
+    }
+
+    /// W27-R08, from a browser with its own key: the browser signs what kiln says
+    /// (`hand_off_statement`), the person's hand-on to kiln's server, since kiln doesn't know yet who
+    /// takes it. kiln passes it on unchanged to the agent the failure goes to, whose receipt follows,
+    /// and the chain walks back to the person's own signature, no link of it kiln's for them. From a
+    /// browser that can't sign, kiln's take for them gives the browser's reason.
+    #[test]
+    fn w27_r08_a_hand_off_from_a_browser_is_its_persons_own() -> anyhow::Result<()> {
+        use base64::Engine as _;
+        use kiln_ci::identity::custody::{Body, Kind, to_value};
+        use kiln_ci::identity::statement::{PAYLOAD_CUSTODY, Statement, bundle, payload, to_sign};
+        use rcgen::SigningKey as _;
+        within(async {
+            for signs in [true, false] {
+                let hub = crate::hub::tests::scratch_hub_with(|c| c.terminal.enabled = true).await?;
+                let h = std::sync::Arc::clone(&hub);
+                crate::rt::spawn(async move {
+                    let _ = crate::harness::registry::Registry::run_local(h).await;
+                });
+                hub.harness.set_test_program("/nonexistent/kiln-test-no-harness");
+                crate::identities::own_identities(&hub.store, &hub.pki).await?;
+                let sql = fixture();
+                hub.store.call(move |c| Ok(c.execute_batch(&sql)?)).await?;
+                let owner = crate::authz::Caller::owner();
+                let folder = tempfile::tempdir()?;
+                let cwd = folder.path().to_string_lossy().into_owned();
+                let cx = crate::ops::Cx { hub: std::sync::Arc::clone(&hub), caller: owner.clone() };
+                crate::ops::call(cx, "attachments.save", json!({ "name": "ci-doctor", "on": "repo:hyper-light/kiln", "harness": { "kind": "claude", "on": "local", "cwd": cwd }, "wake": ["failure"] }))
+                    .await
+                    .map_err(|(c, m)| anyhow::anyhow!("{c}: {m}"))?;
+                let org = hub.pki.organization();
+                let (person, server) = (crate::custody::person_uri(&org, "admin"), crate::custody::server_uri(&org));
+                let commit = json!({ "repo": "hyper-light/kiln", "sha": C3 });
+                let ask = if signs {
+                    // What kiln says to sign, signed with the browser's key, certified as the person.
+                    let said = hand_off_statement_in(&hub, &owner, &commit).await.map_err(|(c, m)| anyhow::anyhow!("{c}: {m}"))?;
+                    anyhow::ensure!(said.pointer("/statement/body/by") == Some(&json!(person)) && said.pointer("/statement/body/to") == Some(&json!(server)), "{said}");
+                    let key = crate::pki::new_key_pem()?;
+                    let pem = hub.pki.issue_identity(&crate::pki::make_csr_with_key("kiln-identity", &key)?, &kiln_ci::identity::chain::Identity::parse(&person)?, &[], time::Duration::hours(1))?;
+                    let b64 = base64::engine::general_purpose::STANDARD;
+                    let part = |k: &str| b64.decode(said.get(k).and_then(Value::as_str).unwrap_or_default());
+                    let (p, pae) = (part("payload")?, part("pae")?);
+                    let hand_on = bundle(PAYLOAD_CUSTODY, &p, &rcgen::KeyPair::from_pem(&key)?.sign(&pae)?, &crate::pki::der_of(&pem)?);
+                    json!({ "repo": "hyper-light/kiln", "sha": C3, "hand_on": hand_on })
+                } else {
+                    json!({ "repo": "hyper-light/kiln", "sha": C3, "unsigned": "this page isn't secure (https), so this browser has no key" })
+                };
+                let handed = hand_off_in(&hub, &owner, &ask).await.map_err(|(c, m)| anyhow::anyhow!("{c}: {m}"))?;
+                anyhow::ensure!(handed.pointer("/custody/kiln_signed_for_you") == Some(&json!(!signs)), "{handed}");
+                // The agent's receipt of what kiln handed it: what kiln passed on, else its take.
+                let agent = handed.pointer("/handed/agent").and_then(Value::as_str).unwrap_or_default().to_owned();
+                let to = crate::identities::agent_at(&hub, &agent, hub.harness.epoch_of(&agent)).await?;
+                let follows = handed.pointer(if signs { "/custody/passed_on" } else { "/custody/hand_on" }).and_then(Value::as_str).unwrap_or_default().to_owned();
+                let key = crate::pki::new_key_pem()?;
+                let pem = hub.pki.issue_identity(&crate::pki::make_csr_with_key("kiln-identity", &key)?, &kiln_ci::identity::chain::Identity::parse(&to)?, &[], time::Duration::hours(1))?;
+                let thing = crate::custody::work("hyper-light/kiln@3333333 checks", &["hyper-light/kiln", C3, "checks"]);
+                let body = Body { from: Some(if signs { server.clone() } else { person.clone() }), why: "handed off".into(), ..Body::new(Kind::Received, &to) };
+                let st = Statement { subject: vec![thing], follows: vec![follows], ..Statement::new(to_value(&body)) };
+                let p = payload(&st)?;
+                let receipt = bundle(PAYLOAD_CUSTODY, &p, &rcgen::KeyPair::from_pem(&key)?.sign(&to_sign(PAYLOAD_CUSTODY, &p))?, &crate::pki::der_of(&pem)?);
+                let now = crate::util::now_unix();
+                let got = crate::custody::take(&hub.store, &hub.pki.ca_der, &org, &receipt, "runner local", now).await?.map_err(|r| anyhow::anyhow!("{r}"))?;
+                let v = crate::custody::chain(&hub.store, &hub.pki.ca_der, &org, &got.digest, now).await?.ok_or_else(|| anyhow::anyhow!("no chain"))?;
+                anyhow::ensure!(v.get("unbroken") == Some(&json!(true)), "{v}");
+                let hops = v.get("hops").and_then(Value::as_array).cloned().unwrap_or_default();
+                let kinds: Vec<&str> = hops.iter().filter_map(|h| h.get("kind").and_then(Value::as_str)).collect();
+                if signs {
+                    anyhow::ensure!(kinds == ["received", "passed-on", "handed-on"], "the person's own hand-on, passed on: {v}");
+                    anyhow::ensure!(hops.get(2).and_then(|h| h.get("custodian")) == Some(&json!(person)), "{v}");
+                    anyhow::ensure!(hops.iter().all(|h| h.get("taken_for").is_none_or(Value::is_null)), "nothing of it kiln's for them: {v}");
+                } else {
+                    anyhow::ensure!(kinds == ["received", "taken"], "{v}");
+                    let taken = hops.get(1).cloned().unwrap_or_default();
+                    anyhow::ensure!(taken.get("taken_for") == Some(&json!(person)), "kiln for the person: {taken}");
+                    anyhow::ensure!(taken.get("why").and_then(Value::as_str).is_some_and(|w| w.contains("this page isn't secure (https), so this browser has no key")), "{taken}");
+                }
+            }
             Ok(())
         })
     }

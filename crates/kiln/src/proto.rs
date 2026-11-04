@@ -488,6 +488,16 @@ pub const CAP_LEG_SIGNS: u64 = 1 << 45;
 /// (`crate::custody::take`). (Bits 41 to 43 are main's, 44 `CAP_AGENT_GIT`, 45 `CAP_LEG_SIGNS`.)
 pub const CAP_CUSTODY: u64 = 1 << 46;
 
+/// [`AgentMsg::Caps`] and [`ServerMsg::Caps`] capability: relays record what they pass on
+/// (docs/ci.md W27-R08's relays). A runner that says it sends its record of each act of its agents'
+/// it passes on to kiln (`passed_on` beside the ask), checks what kiln relays to it (an agent's words
+/// with their records, `relayed`; kiln's records of a reach link's frames) and signs its receipts;
+/// a server that says it checks the runner's records and relays so. Neither sends the other these
+/// without it. (Bits 41 to 46 are main's `CAP_UNREAD`, `CAP_WORKSPACE_COMMITS` and
+/// `CAP_WORKSPACE_COMPARE`, then W27's `CAP_AGENT_GIT`, `CAP_LEG_SIGNS` and `CAP_CUSTODY`; 53 is
+/// `CAP_FREEZE`.)
+pub const CAP_RELAYS: u64 = 1 << 47;
+
 /// What an [`AgentMsg::Identity`] asks for: a certificate for the key of `csr`, as `kind` says.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(default)]
@@ -1337,6 +1347,13 @@ mod tests {
     fn the_changes_patch_bit_is_a_new_one() {
         let before = CAP_WIRE | CAP_NET_DROPS | CAP_INBOX | CAP_HANDOVER | CAP_WORK | CAP_AGENT_LIMIT | CAP_IDENTITY | CAP_HEADROOM;
         assert!(CAP_CHANGES_PATCH.is_power_of_two() && CAP_CHANGES_PATCH == 1 << 40 && CAP_CHANGES_PATCH & before == 0);
+    }
+
+    /// W27-R08's relays: their bit is a new one, past custody's (46) and every bit of main's.
+    #[test]
+    fn w27_r08_relays_bit_is_a_new_one() {
+        let before = CAP_WIRE | CAP_NET_DROPS | CAP_INBOX | CAP_HANDOVER | CAP_WORK | CAP_AGENT_LIMIT | CAP_IDENTITY | CAP_HEADROOM | CAP_CHANGES_PATCH | CAP_UNREAD | CAP_WORKSPACE_COMMITS | CAP_WORKSPACE_COMPARE | CAP_AGENT_GIT | CAP_LEG_SIGNS | CAP_CUSTODY | CAP_FREEZE;
+        assert!(CAP_RELAYS.is_power_of_two() && CAP_RELAYS == 1 << 47 && CAP_RELAYS & before == 0);
     }
 
     /// W27-R08: custody records come after every older variant (the legs' signing, W27-R05, last

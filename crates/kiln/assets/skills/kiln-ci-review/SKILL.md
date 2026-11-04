@@ -82,6 +82,20 @@ await kiln.ci.diffs.review({ diff: input.diff, action: "request_changes", body: 
 the trunk's policy says `agents-can-approve`; never accept your own work, and review what the
 change does, not only whether its checks pass.
 
+## When the trunk moves
+
+kiln replays every open change onto the trunk's new tip in its own copy, stack by stack. A clean
+replay is a rebase-only revision (why `replayed`, its approvals and checks carried, no runs of its
+own). One that conflicts is kept as a revision with its markers (why `replayed with conflicts`),
+and its gate holds until its conflicts are resolved in the diff; the changes above it move on
+regardless. Don't rebase by hand just to be current: pull the replay (`refs/kiln/diffs/<D>/v<n>`).
+
+A branch moves only when someone presses Update (`POST /api/change-requests/:id/update`), unless
+the trunk's `.kiln/review.yaml` says `fresh: { push: auto }`. A change turning that on warns when
+it's approved: every open branch is pushed each time the trunk moves. A change's `fresh` (in
+`GET /api/diffs/:id`) says how fresh it is, and `GET /api/diffs/:id/collisions` lists the open
+changes that change the same lines as it: talk to their authors before both land.
+
 ## Landing and the queue
 
 ```js

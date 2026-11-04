@@ -397,6 +397,9 @@ pub static ROUTES: &[Rule] = &[
     r("POST", "/api/diffs/*/land", "diffs.land", At::Diff(2)),
     // Conflicts resolved where they fall, then committed as a revision (W26-R12): code, as Apply is.
     r("POST", "/api/diffs/*/conflicts/commit", "diffs.submit", At::Diff(2)),
+    // The conflict ladder (W26-R17): accepting what it offers changes the code, as Commit resolution does.
+    r("POST", "/api/diffs/*/conflicts/accept", "diffs.submit", At::Diff(2)),
+    r("POST", "/api/diffs/*/update", "diffs.submit", At::Diff(2)),
     r("POST", "/api/diffs/*/conflicts/*/resolution", "diffs.submit", At::Diff(2)),
     r("DELETE", "/api/diffs/*/conflicts/*/resolution", "diffs.submit", At::Diff(2)),
     r("PATCH", "/api/comments/*", "diffs.review", At::Comment(2)),
@@ -414,6 +417,9 @@ pub static ROUTES: &[Rule] = &[
     // Whether agents fix code from agents' feedback (docs/ci.md W26-R18): the land queue's capability changes it.
     r("GET", "/api/repos/*/agent-fixes", "diffs.read", At::Repo(2)),
     r("PUT", "/api/repos/*/agent-fixes", "diffs.land", At::Repo(2)),
+    // A repository's ladder switches (W26-R17): changing them is a maintainer's.
+    r("GET", "/api/repos/*/ladder", "diffs.read", At::Repo(2)),
+    r("PUT", "/api/repos/*/ladder", "diffs.land", At::Repo(2)),
     r("DELETE", "/api/queue/*", "queue.manage", At::Entry(2)),
     // Review holds, lets go of or withdraws a land queue entry (docs/ci.md W28-R104).
     r("POST", "/api/queue/*/hold", "diffs.review", At::Entry(2)),
@@ -429,6 +435,8 @@ pub static ROUTES: &[Rule] = &[
     r("POST", "/api/change-requests/*/viewed", "diffs.read", At::Diff(2)),
     r("POST", "/api/change-requests/*/land", "diffs.land", At::Diff(2)),
     r("POST", "/api/change-requests/*/conflicts/commit", "diffs.submit", At::Diff(2)),
+    r("POST", "/api/change-requests/*/conflicts/accept", "diffs.submit", At::Diff(2)),
+    r("POST", "/api/change-requests/*/update", "diffs.submit", At::Diff(2)),
     r("POST", "/api/change-requests/*/conflicts/*/resolution", "diffs.submit", At::Diff(2)),
     r("DELETE", "/api/change-requests/*/conflicts/*/resolution", "diffs.submit", At::Diff(2)),
     r("POST", "/api/change-requests/*/ready", "diffs.submit", At::Diff(2)),
@@ -502,6 +510,7 @@ pub static ROUTES: &[Rule] = &[
     r("POST", "/api/ci/repos/*/pulls/*/comments", "diffs.review", At::Repo(3)),
     r("POST", "/api/ci/repos/*/pulls/*/reviews", "diffs.review", At::Repo(3)),
     r("POST", "/api/ci/repos/*/pulls/*/merge", "diffs.land", At::Repo(3)),
+    r("POST", "/api/ci/repos/*/pulls/*/update", "diffs.submit", At::Repo(3)),
     r("POST", "/api/ci/repos/*/hooks", "secrets.manage", At::Repo(3)),
     r("DELETE", "/api/ci/repos/*/hooks/*", "secrets.manage", At::Repo(3)),
     r("GET", "/api/ci/repos/*/**", "runs.read", At::Repo(3)),
@@ -609,6 +618,8 @@ pub static ROUTES: &[Rule] = &[
     r("GET", "/api/ship/**", "runs.read", At::Anywhere),
     // A row's Hand off: the handler checks `runs.rerun` on the repository its body names (W26-R18).
     r("POST", "/api/ship/hand-off", "runs.rerun", At::Anywhere),
+    // What a browser signs to hand it off, asked as Hand off is (W27-R08).
+    r("POST", "/api/ship/hand-off/statement", "runs.rerun", At::Anywhere),
     // A row's Ready: the handler lets an agent's draft be marked ready by its person, or one with
     // `diffs.land` on the repository its body names (W26-R18).
     r("POST", "/api/ship/ready", "diffs.submit", At::Anywhere),
@@ -673,6 +684,9 @@ pub static ROUTES: &[Rule] = &[
     r("POST", "/api/verify/vsa", "audit.read", At::Server),
     r("POST", "/api/custody", SIGNED_IN, At::Server),
     r("GET", "/api/custody/breaks", "audit.read", At::Server),
+    r("GET", "/api/custody/walk", "audit.read", At::Server),
+    r("GET", "/api/custody/relays", "audit.read", At::Server),
+    r("POST", "/api/custody/relays", "settings.manage", At::Server),
     r("GET", "/api/custody", "audit.read", At::Server),
     r("GET", "/api/transfers/refused", "audit.read", At::Server),
     r("GET", "/api/transfers/unsigned", "audit.read", At::Server),

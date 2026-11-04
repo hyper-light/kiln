@@ -15,6 +15,7 @@ import { Hold } from "@/components/ui/hold";
 import { Loadable } from "@/components/ui/loading";
 import { Crumbs, Panel, SelectField, TextField } from "@/components/ui/misc";
 import { toast } from "@/components/ui/toast";
+import { useAction } from "@/lib/action";
 import { useRes } from "@/lib/data";
 import { errorMessage } from "@/lib/hooks";
 import { invalidate } from "@/lib/resource";
@@ -76,7 +77,6 @@ function DashboardView({ id }: { id: string }) {
   const [editing, setEditing] = React.useState<Widget | null>(null);
   const [vars, setVars] = React.useState(false);
   const [removing, setRemoving] = React.useState(false);
-  const [busy, setBusy] = React.useState(false);
   const navigate = useNavigate();
   const values = Object.fromEntries(d.template_variables.map((v) => [v.name, params.get(`var.${v.name}`) ?? v.default]));
   const fill = (q: string) => fillVariables(q, d.template_variables, values);
@@ -142,32 +142,21 @@ function DashboardView({ id }: { id: string }) {
     );
   };
 
-  const save = async () => {
+  // Its answer ends the editing only if the draft is still the one saved: one changed since stays,
+  // to be saved again. Cancel waits for it, as what is on its way can't be taken back (W21-R15).
+  const [save, saving] = useAction(async () => {
     if (!draft) return;
-    setBusy(true);
-    try {
-      const after = await observeApi.updateDashboard({ ...draft, widgets: reflow(draft.widgets) });
-      saved.setData(() => after);
-      setDraft(null);
-      invalidate("observe/dashboards");
-    } catch (e) {
-      toast({ title: "Couldn't save the dashboard", description: errorMessage(e), tone: "failed" });
-    } finally {
-      setBusy(false);
-    }
-  };
-  const copy = async () => {
-    setBusy(true);
-    try {
-      const made = await observeApi.createDashboard({ title: `${d.title} (copy)`, description: d.description, template_variables: d.template_variables, widgets: d.widgets });
-      invalidate("observe/dashboards");
-      navigate(`/observe/dashboards/${encodeURIComponent(made.id)}`);
-    } catch (e) {
-      toast({ title: "Couldn't copy the dashboard", description: errorMessage(e), tone: "failed" });
-    } finally {
-      setBusy(false);
-    }
-  };
+    const sent = draft;
+    const after = await observeApi.updateDashboard({ ...sent, widgets: reflow(sent.widgets) });
+    saved.setData(() => after);
+    setDraft((cur) => (cur === sent ? null : cur));
+    invalidate("observe/dashboards");
+  }, "Couldn't save the dashboard");
+  const [copy, copying] = useAction(async () => {
+    const made = await observeApi.createDashboard({ title: `${d.title} (copy)`, description: d.description, template_variables: d.template_variables, widgets: d.widgets });
+    invalidate("observe/dashboards");
+    await navigate(`/observe/dashboards/${encodeURIComponent(made.id)}`);
+  }, "Couldn't copy the dashboard");
 
   return (
     <>
@@ -189,15 +178,15 @@ function DashboardView({ id }: { id: string }) {
         </div>
         <div className="flex flex-wrap items-center gap-2">
           {d.builtin ? (
-            <Button variant="secondary" onClick={() => void copy()} disabled={busy}>
+            <Button variant="secondary" onClick={copy} pending={copying}>
               <Copy /> Copy to change
             </Button>
           ) : draft ? (
             <>
-              <Button variant="ghost" onClick={() => setDraft(null)} disabled={busy}>
+              <Button variant="ghost" onClick={() => setDraft(null)} disabled={saving}>
                 Cancel
               </Button>
-              <Button onClick={() => void save()} disabled={busy || !draft.title.trim()}>
+              <Button onClick={save} disabled={!draft.title.trim()} pending={saving}>
                 Save
               </Button>
             </>
@@ -300,7 +289,7 @@ function DashboardView({ id }: { id: string }) {
           try {
             await observeApi.deleteDashboard(d.id);
             invalidate("observe/dashboards");
-            navigate("/observe/dashboards");
+            await navigate("/observe/dashboards");
           } catch (e) {
             toast({ title: "Couldn't delete the dashboard", description: errorMessage(e), tone: "failed" });
           }

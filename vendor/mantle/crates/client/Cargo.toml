@@ -11,7 +11,7 @@ publish.workspace = true
 
 [dependencies]
 # The runtime, the transport and its driver on it, vendored from hyper-raft (vendor/UPSTREAM.md).
-hyper-rt = { path = "../../../hyper-raft/crates/hyper-rt" }
+hyper-rt = { path = "../../../../crates/kiln-rt" }
 hyper-rt-transport = { path = "../../../hyper-raft/crates/hyper-rt-transport" }
 hyper-transport = { path = "../../../hyper-raft/crates/hyper-transport" }
 # The native protocol's messages, classes and bounds, shared with the node.

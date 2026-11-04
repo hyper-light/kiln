@@ -12,12 +12,20 @@
 //!
 //! Nothing a list says can reach outside the copy: paths are relative and plain, and no write
 //! goes through a symlink.
+//!
+//! Each side knows the tree it has by its digest (docs/ci.md W27-R08: a sync's custody): the
+//! asking side's of the bytes it sent, the copy's of what it holds once committed
+//! ([`Mirror::tree_digest`]). Neither hashes a file again while its stat is what it was when it
+//! was last hashed ([`Hashes`]); a file of the copy changed there since a sync wrote it is sent
+//! again.
 
 use std::collections::{HashMap, HashSet};
 use std::io::{Read as _, Seek as _, Write as _};
 use std::path::{Component, Path, PathBuf};
 
 use anyhow::Context as _;
+use serde::{Deserialize, Serialize};
+use sha2::{Digest as _, Sha256};
 
 use super::wire::{Entry, EntryKind};
 
@@ -293,6 +301,106 @@ fn real_parents(root: &Path, rel: &Path) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// A file's stat as [`Hashes`] keeps it: its size, its modification time and, on Unix, its change
+/// time and inode, which nothing sets back.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Stat {
+    pub size: u64,
+    pub mtime_ns: i64,
+    #[serde(default)]
+    pub ctime_ns: i64,
+    #[serde(default)]
+    pub ino: u64,
+}
+
+impl Stat {
+    pub fn of(md: &std::fs::Metadata) -> Self {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt as _;
+            Self { size: md.len(), mtime_ns: mtime_ns(md), ctime_ns: md.ctime().saturating_mul(1_000_000_000).saturating_add(md.ctime_nsec()), ino: md.ino() }
+        }
+        #[cfg(not(unix))]
+        {
+            Self { size: md.len(), mtime_ns: mtime_ns(md), ctime_ns: 0, ino: 0 }
+        }
+    }
+
+    /// `path`'s stat, when it's a file.
+    pub fn of_path(path: &Path) -> Option<Self> {
+        std::fs::symlink_metadata(path).ok().filter(|m| m.file_type().is_file()).map(|m| Self::of(&m))
+    }
+}
+
+/// What a tree's files hashed to (SHA-256, hex), each with its stat then, kept beside the tree:
+/// a file is hashed again only once its stat isn't what it was (docs/ci.md W27-R08).
+#[derive(Debug, Default)]
+pub struct Hashes {
+    file: Option<PathBuf>,
+    by_path: HashMap<String, (Stat, String)>,
+}
+
+impl Hashes {
+    /// The hashes kept in `file` (none yet, or unreadable: none).
+    pub fn open(file: PathBuf) -> Self {
+        let by_path = std::fs::read(&file).ok().and_then(|b| serde_json::from_slice::<HashMap<String, (Stat, String)>>(&b).ok()).unwrap_or_default();
+        Self { file: Some(file), by_path }
+    }
+
+    /// `path`'s SHA-256 as kept, while its file (at `at`) is as it was when hashed.
+    pub fn kept(&self, path: &str, at: &Path) -> Option<String> {
+        let (stat, sha) = self.by_path.get(path)?;
+        (Stat::of_path(at) == Some(*stat)).then(|| sha.clone())
+    }
+
+    /// Whether `path` was hashed when its file (at `at`) was otherwise: changed since.
+    pub fn stale(&self, path: &str, at: &Path) -> bool {
+        self.by_path.get(path).is_some_and(|(stat, _)| Stat::of_path(at) != Some(*stat))
+    }
+
+    /// `path`'s SHA-256: as kept, else its file's (at `at`), hashed now and kept.
+    pub fn hash(&mut self, path: &str, at: &Path) -> anyhow::Result<String> {
+        if let Some(sha) = self.kept(path, at) {
+            return Ok(sha);
+        }
+        let before = Stat::of_path(at);
+        let sha = crate::sync::blobs::hash_file(at).with_context(|| format!("hash {}", at.display()))?;
+        if let Some(s) = before.filter(|s| Stat::of_path(at).as_ref() == Some(s)) {
+            self.by_path.insert(path.to_owned(), (s, sha.clone()));
+        }
+        Ok(sha)
+    }
+
+    /// Keeps `sha` as `path`'s, its file (at `at`) as it is now.
+    pub fn put(&mut self, path: &str, at: &Path, sha: String) {
+        match Stat::of_path(at) {
+            Some(s) => {
+                self.by_path.insert(path.to_owned(), (s, sha));
+            }
+            None => {
+                self.by_path.remove(path);
+            }
+        }
+    }
+
+    pub fn forget(&mut self, path: &str) {
+        self.by_path.remove(path);
+    }
+
+    /// Writes what's kept of the paths `listed` names (the others went) to its file.
+    pub fn save(&mut self, listed: &HashSet<&str>) -> anyhow::Result<()> {
+        self.by_path.retain(|p, _| listed.contains(p.as_str()));
+        let Some(file) = &self.file else { return Ok(()) };
+        if let Some(dir) = file.parent() {
+            std::fs::create_dir_all(dir)?;
+        }
+        let tmp = file.with_extension("kiln-hashes-part");
+        std::fs::write(&tmp, serde_json::to_vec(&self.by_path)?).with_context(|| format!("write {}", tmp.display()))?;
+        std::fs::rename(&tmp, file).with_context(|| format!("place {}", file.display()))?;
+        Ok(())
+    }
+}
+
 /// The files of `entries` the copy at `root` lacks or has otherwise.
 pub fn need(root: &Path, entries: &[Entry]) -> Vec<String> {
     entries
@@ -331,6 +439,12 @@ fn set_mode(path: &Path, e: &Entry) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Where something kept of the copy at `root` lives: beside it (`<copy>.<ext>`), never in it.
+fn beside(root: &Path, ext: &str) -> PathBuf {
+    let name = root.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+    root.with_file_name(format!("{name}.{ext}"))
+}
+
 /// One copy being brought up to date on this side.
 pub struct Mirror {
     pub root: PathBuf,
@@ -339,6 +453,13 @@ pub struct Mirror {
     open: HashMap<String, (std::fs::File, PathBuf, u64)>,
     pub written: u32,
     pub bytes: u64,
+    /// What its files hashed to, kept beside it.
+    hashes: Hashes,
+    /// Files being written, hashed as their pieces come in order: the hash so far and how far it
+    /// got (None: a piece came out of order, and the file is hashed once it's placed).
+    hashing: HashMap<String, Option<(Sha256, u64)>>,
+    /// The files this sync wrote.
+    wrote: Vec<String>,
 }
 
 impl Mirror {
@@ -352,7 +473,45 @@ impl Mirror {
 
     pub fn new(root: PathBuf) -> anyhow::Result<Self> {
         std::fs::create_dir_all(&root).with_context(|| format!("create {}", root.display()))?;
-        Ok(Self { root, plan: Vec::new(), open: HashMap::new(), written: 0, bytes: 0 })
+        let hashes = Hashes::open(beside(&root, "kiln-hashes"));
+        Ok(Self { root, plan: Vec::new(), open: HashMap::new(), written: 0, bytes: 0, hashes, hashing: HashMap::new(), wrote: Vec::new() })
+    }
+
+    /// The files of the list the copy lacks or has otherwise ([`need`]), and those changed here
+    /// since a sync wrote them, whatever their size and time say.
+    pub fn needed(&self) -> Vec<String> {
+        let mut paths = need(&self.root, &self.plan);
+        let have: HashSet<String> = paths.iter().cloned().collect();
+        for e in self.plan.iter().filter(|e| e.kind == EntryKind::File && !have.contains(&e.path)) {
+            if safe_rel(&e.path).is_ok_and(|rel| self.hashes.stale(&e.path, &self.root.join(rel))) {
+                paths.push(e.path.clone());
+            }
+        }
+        paths
+    }
+
+    /// The digest of the copy as committed (`super::reuse::digest_of` over the list, each file by
+    /// what it holds now: hashed as it was written, or as kept, or now), its hashes kept for the
+    /// next sync. What this side received, for a sync's custody (docs/ci.md W27-R08).
+    pub fn tree_digest(&mut self) -> anyhow::Result<String> {
+        let (root, hashes) = (self.root.clone(), &mut self.hashes);
+        let digest = super::reuse::digest_of(&self.plan, |e| hashes.hash(&e.path, &root.join(safe_rel(&e.path)?)))?;
+        let listed: HashSet<&str> = self.plan.iter().filter(|e| e.kind == EntryKind::File).map(|e| e.path.as_str()).collect();
+        self.hashes.save(&listed)?;
+        Ok(digest)
+    }
+
+    /// The files this sync wrote are dated so the next sync sends them again, and their hashes
+    /// let go: what a refused copy does (its workspace wasn't what was handed on).
+    pub fn spoil(&mut self) -> anyhow::Result<()> {
+        for p in std::mem::take(&mut self.wrote) {
+            self.hashes.forget(&p);
+            if let Ok(f) = std::fs::File::open(self.root.join(safe_rel(&p)?)) {
+                f.set_modified(std::time::UNIX_EPOCH)?;
+            }
+        }
+        let listed: HashSet<&str> = self.plan.iter().filter(|e| e.kind == EntryKind::File).map(|e| e.path.as_str()).collect();
+        self.hashes.save(&listed)
     }
 
     /// More of the list.
@@ -384,6 +543,12 @@ impl Mirror {
         f.write_all(data)?;
         *got = (*got).max(offset + data.len() as u64);
         self.bytes += data.len() as u64;
+        // Hashed as its pieces come, in order; one out of order is hashed once it's placed.
+        let hashing = self.hashing.entry(path.to_owned()).or_insert_with(|| Some((Sha256::new(), 0)));
+        *hashing = hashing.take().filter(|(_, at)| *at == offset).map(|(mut h, at)| {
+            h.update(data);
+            (h, at + data.len() as u64)
+        });
         if last {
             let Some((f, tmp, got)) = self.open.remove(path) else { anyhow::bail!("{path} is not open") };
             f.set_len(got)?;
@@ -398,6 +563,11 @@ impl Mirror {
             std::fs::rename(&tmp, &target).with_context(|| format!("place {}", target.display()))?;
             set_mode(&target, &entry)?;
             self.written += 1;
+            self.wrote.push(path.to_owned());
+            match self.hashing.remove(path).flatten().filter(|(_, at)| *at == got) {
+                Some((h, _)) => self.hashes.put(path, &target, hex::encode(h.finalize())),
+                None => self.hashes.forget(path),
+            }
         }
         Ok(())
     }
@@ -657,6 +827,76 @@ mod tests {
         // The record of what was sent sits beside the copy, never in it.
         assert!(dir.path().join("copy.kiln-sent").exists());
         assert!(!dst.join("copy.kiln-sent").exists());
+        Ok(())
+    }
+
+    /// One sync from `src` into the copy at `dst`, as [`sync`], the first piece it sends having
+    /// byte 0 flipped when `flip` (bytes changed on their way): the copy's digest once committed,
+    /// and the copy as it is then.
+    fn sync_digest(src: &Path, dst: &Path, flip: bool) -> anyhow::Result<(String, Mirror)> {
+        let tree = scan(src)?;
+        let mut m = Mirror::new(dst.to_path_buf())?;
+        m.plan(tree.entries.clone())?;
+        let mut flipped = !flip;
+        for p in m.needed() {
+            let mut off = 0;
+            loop {
+                let (mut data, last) = read_piece(&tree.source(&p), off)?;
+                if !flipped && let Some(b) = data.first_mut() {
+                    *b ^= 0x01;
+                    flipped = true;
+                }
+                m.write(&p, off, &data, last)?;
+                off += data.len() as u64;
+                if last {
+                    break;
+                }
+            }
+        }
+        m.commit()?;
+        Ok((m.tree_digest()?, m))
+    }
+
+    /// W27-R08 (the Transfers plan's step 12): the copy knows the tree it holds by the digest the
+    /// asking side names its own by (`kiln run --reuse`'s), the next sync from the hashes it kept;
+    /// a byte changed on its way makes another digest, and a refused copy has its files sent
+    /// again; a file changed in the copy since a sync wrote it is sent again, whatever its size and
+    /// time say.
+    #[test]
+    fn w27_r08_a_copy_knows_its_tree_by_the_askers_digest() -> anyhow::Result<()> {
+        let (src, dir) = (tempfile::tempdir()?, tempfile::tempdir()?);
+        let s = src.path();
+        git(s, &["init", "-q"])?;
+        std::fs::create_dir_all(s.join("src"))?;
+        std::fs::write(s.join("src/main.rs"), "fn main() {}\n")?;
+        std::fs::write(s.join("big.bin"), vec![7u8; PIECE * 2 + 10])?;
+        git(s, &["add", "."])?;
+        git(s, &["commit", "-qm", "one"])?;
+        let d = dir.path().join("copy");
+        let want = super::super::reuse::tree(s)?;
+        assert_eq!(sync_digest(s, &d, false)?.0, want, "the copy's digest is the asker's");
+        assert!(dir.path().join("copy.kiln-hashes").exists() && !d.join("copy.kiln-hashes").exists(), "its hashes sit beside the copy");
+        let (again, m) = sync_digest(s, &d, false)?;
+        assert!(again == want && m.written == 0, "again, nothing sent, from what it kept");
+        // Changed on its way: another digest. Refused, the files it wrote are sent again.
+        std::fs::write(s.join("src/main.rs"), "fn main() { 1; }\n")?;
+        let want = super::super::reuse::tree(s)?;
+        let (got, mut m) = sync_digest(s, &d, true)?;
+        assert_ne!(got, want, "a byte changed on its way");
+        m.spoil()?;
+        let (fixed, m) = sync_digest(s, &d, false)?;
+        assert!(fixed == want && m.written >= 1, "sent again, and right");
+        // Changed in the copy since, its size and time put back: sent again.
+        #[cfg(unix)]
+        {
+            let f = d.join("src/main.rs");
+            let mtime = std::fs::metadata(&f)?.modified()?;
+            std::fs::write(&f, "fn main() { 2; }\n")?;
+            std::fs::File::open(&f)?.set_modified(mtime)?;
+            let mut m = Mirror::new(d.clone())?;
+            m.plan(scan(s)?.entries)?;
+            assert_eq!(m.needed(), vec!["src/main.rs".to_owned()]);
+        }
         Ok(())
     }
 

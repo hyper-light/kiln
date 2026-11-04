@@ -24,13 +24,14 @@ import { Loadable } from "@/components/ui/loading";
 import { Crumbs, Facts, Panel, SelectField } from "@/components/ui/misc";
 import { Segmented } from "@/components/ui/tabs";
 import { toast } from "@/components/ui/toast";
+import { useAction } from "@/lib/action";
 import { useRes, warm, type Res } from "@/lib/data";
 import { formatDuration, relativeTime } from "@/lib/format";
 import { errorMessage } from "@/lib/hooks";
-import { invalidate } from "@/lib/resource";
+import { change, invalidate } from "@/lib/resource";
 import { Link, useNavigate, useParams } from "@/lib/router";
 import { Handles, IncidentState, SEVERITIES, STATE_WORDS, Severity, ranFor } from "./incidents";
-import { StateBadge } from "./parts";
+import { StateBadge, useOpening } from "./parts";
 import "./observe.css";
 
 // Markdown's renderer is big: only a page with a note loads it.
@@ -172,7 +173,7 @@ function IncidentView({ id }: { id: string }) {
         confirmLabel="Delete"
         danger
         onConfirm={async () => {
-          if (await act("delete it", () => observeApi.removeIncident(i.id))) navigate("/observe/incidents");
+          if (await act("delete it", () => observeApi.removeIncident(i.id))) await navigate("/observe/incidents");
         }}
       />
     </>
@@ -220,21 +221,20 @@ function StateAndSeverity({ i }: { i: Incident }) {
 function Note({ id }: { id: string }) {
   const [text, setText] = React.useState("");
   const [important, setImportant] = React.useState(false);
-  const [busy, setBusy] = React.useState(false);
-  const add = async () => {
-    setBusy(true);
-    if (await act("add the note", () => observeApi.noteIncident(id, text.trim(), important))) {
-      setText("");
-      setImportant(false);
+  const [add, adding] = useAction(async () => {
+    const sent = { text, important };
+    if (await act("add the note", () => observeApi.noteIncident(id, sent.text.trim(), sent.important))) {
+      // Each emptied only if it still holds what was sent: what's written since stays (W21-R15).
+      setText((t) => (t === sent.text ? "" : t));
+      setImportant((on) => (on === sent.important ? false : on));
     }
-    setBusy(false);
-  };
+  });
   return (
     <form
       className="mb-5"
       onSubmit={(e) => {
         e.preventDefault();
-        if (text.trim() && !busy) void add();
+        if (text.trim()) add();
       }}
     >
       <div className="field">
@@ -244,9 +244,9 @@ function Note({ id }: { id: string }) {
           value={text}
           onChange={(e) => setText(e.target.value)}
           onKeyDown={(e) => {
-            if (e.key === "Enter" && (e.metaKey || e.ctrlKey) && text.trim() && !busy) {
+            if (e.key === "Enter" && (e.metaKey || e.ctrlKey) && text.trim()) {
               e.preventDefault();
-              void add();
+              add();
             }
           }}
           placeholder="What was found, what was done (Markdown)"
@@ -256,7 +256,7 @@ function Note({ id }: { id: string }) {
         <label className="flex items-center gap-2 text-[12.5px] text-[#b4b5ba]">
           <input type="checkbox" className="check" checked={important} onChange={(e) => setImportant(e.target.checked)} /> Important
         </label>
-        <Button type="submit" size="sm" disabled={!text.trim() || busy}>
+        <Button type="submit" size="sm" disabled={!text.trim()} pending={adding}>
           Add note
         </Button>
       </div>
@@ -322,18 +322,34 @@ function Cell({ c }: { c: TimelineCell }) {
 
 /** Its todos: done (or not), removed, and one added (`@name` its assignees, read as a monitor's mentions are: a sentence's full stop not part of one). */
 function Todos({ id, incident }: { id: string; incident: string }) {
-  const todos = useRes(todosRes(id)).data;
+  const res = useRes(todosRes(id));
+  const todos = res.data;
   const [text, setText] = React.useState("");
-  const add = async () => {
-    const assignees = [...text.matchAll(/(?:^|[\s(])@([\w-]+(?:\.[\w-]+)*)/g)].flatMap((x) => (x[1] ? [x[1]] : []));
-    if (await act("add the todo", () => observeApi.addIncidentTodo(incident, text.trim(), assignees))) setText("");
+  const [add, adding] = useAction(async () => {
+    const sent = text;
+    const assignees = [...sent.matchAll(/(?:^|[\s(])@([\w-]+(?:\.[\w-]+)*)/g)].flatMap((x) => (x[1] ? [x[1]] : []));
+    // Emptied only if it still holds what was sent: what's written since stays (W21-R15).
+    if (await act("add the todo", () => observeApi.addIncidentTodo(incident, sent.trim(), assignees))) setText((t) => (t === sent ? "" : t));
+  });
+  // Gone at once, and from the panel's count (W21-R15); back if the server refuses.
+  const remove = (t: IncidentTodo) => {
+    res.change((l) => l.filter((x) => x.id !== t.id));
+    const open = t.attributes.completed === null ? 1 : 0;
+    change<Incident>(incidentRes(id).key, (x) => ({
+      ...x,
+      attributes: { ...x.attributes, kiln: { ...x.attributes.kiln, todos: x.attributes.kiln.todos - 1, todos_open: x.attributes.kiln.todos_open - open } },
+    }));
+    void act("remove the todo", () => observeApi.removeIncidentTodo(incident, t.id)).then((ok) => {
+      // Its row and the count, both under the incident's key.
+      if (!ok) invalidate(incidentRes(id).key);
+    });
   };
   return (
     <>
       {todos.length > 0 && (
         <ul className="mb-3 space-y-2">
           {todos.map((t) => (
-            <TodoRow key={`${t.id}:${t.attributes.completed !== null}`} t={t} incident={incident} />
+            <TodoRow key={`${t.id}:${t.attributes.completed !== null}`} t={t} incident={incident} onRemove={() => remove(t)} />
           ))}
         </ul>
       )}
@@ -341,13 +357,13 @@ function Todos({ id, incident }: { id: string; incident: string }) {
         className="flex gap-2"
         onSubmit={(e) => {
           e.preventDefault();
-          if (text.trim()) void add();
+          if (text.trim()) add();
         }}
       >
         <div className="field flex-1">
           <input aria-label="A todo" value={text} onChange={(e) => setText(e.target.value)} placeholder="Roll back search-api @ada" autoComplete="off" />
         </div>
-        <Button type="submit" variant="secondary" size="sm" disabled={!text.trim()}>
+        <Button type="submit" variant="secondary" size="sm" disabled={!text.trim()} pending={adding}>
           Add
         </Button>
       </form>
@@ -357,7 +373,7 @@ function Todos({ id, incident }: { id: string; incident: string }) {
 
 /** A todo: done (or not) at once, put back if the change is refused; made again (by its key) as
  * the server's change of it comes. */
-function TodoRow({ t, incident }: { t: IncidentTodo; incident: string }) {
+function TodoRow({ t, incident, onRemove }: { t: IncidentTodo; incident: string; onRemove: () => void }) {
   const [done, setDone] = React.useState(t.attributes.completed !== null);
   const set = async (now: boolean) => {
     setDone(now);
@@ -370,13 +386,7 @@ function TodoRow({ t, incident }: { t: IncidentTodo; incident: string }) {
         {t.attributes.content}
         {t.attributes.due_date && <span className="ml-1.5 text-[11px] text-[#8c8f98] no-underline">due {t.attributes.due_date}</span>}
       </span>
-      <button
-        type="button"
-        className="icon-btn -my-1"
-        data-variant="bare"
-        aria-label={`Remove the todo: ${t.attributes.content}`}
-        onClick={() => void act("remove the todo", () => observeApi.removeIncidentTodo(incident, t.id))}
-      >
+      <button type="button" className="icon-btn -my-1" data-variant="bare" aria-label={`Remove the todo: ${t.attributes.content}`} onClick={onRemove}>
         <X size={14} />
       </button>
     </li>
@@ -385,17 +395,27 @@ function TodoRow({ t, incident }: { t: IncidentTodo; incident: string }) {
 
 /** Its postmortem (one) and links: opened, removed, one attached. */
 function Attachments({ id, incident }: { id: string; incident: string }) {
-  const all = useRes(attachmentsRes(id)).data;
+  const res = useRes(attachmentsRes(id));
+  const all = res.data;
   const [url, setUrl] = React.useState("");
   const [title, setTitle] = React.useState("");
   const [postmortem, setPostmortem] = React.useState(false);
   const has = all.some((x) => x.attributes.attachment_type === "postmortem");
-  const add = async () => {
-    if (await act("attach it", () => observeApi.attachToIncident(incident, postmortem && !has ? "postmortem" : "link", url.trim(), title.trim() || url.trim()))) {
-      setUrl("");
-      setTitle("");
-      setPostmortem(false);
+  const [add, adding] = useAction(async () => {
+    const sent = { url, title, postmortem };
+    if (await act("attach it", () => observeApi.attachToIncident(incident, sent.postmortem && !has ? "postmortem" : "link", sent.url.trim(), sent.title.trim() || sent.url.trim()))) {
+      // Each emptied only if it still holds what was sent: what's written since stays (W21-R15).
+      setUrl((u) => (u === sent.url ? "" : u));
+      setTitle((t) => (t === sent.title ? "" : t));
+      setPostmortem((on) => (on === sent.postmortem ? false : on));
     }
+  });
+  // Gone at once (W21-R15), and back if the server refuses.
+  const remove = (x: IncidentAttachment) => {
+    res.change((l) => l.filter((y) => y.id !== x.id));
+    void act("remove it", () => observeApi.removeIncidentAttachment(incident, x.id)).then((ok) => {
+      if (!ok) invalidate(attachmentsRes(id).key);
+    });
   };
   const sorted = [...all].sort((x, y) => Number(y.attributes.attachment_type === "postmortem") - Number(x.attributes.attachment_type === "postmortem"));
   return (
@@ -411,13 +431,7 @@ function Attachments({ id, incident }: { id: string; incident: string }) {
             <li key={x.id} className="flex min-w-0 items-center gap-2 text-[13px]">
               {x.attributes.attachment_type === "postmortem" && <span className="chip">postmortem</span>}
               <AttachmentLink url={x.attributes.attachment.documentUrl} title={x.attributes.attachment.title} />
-              <button
-                type="button"
-                className="icon-btn -my-1"
-                data-variant="bare"
-                aria-label={`Remove ${x.attributes.attachment.title}`}
-                onClick={() => void act("remove it", () => observeApi.removeIncidentAttachment(incident, x.id))}
-              >
+              <button type="button" className="icon-btn -my-1" data-variant="bare" aria-label={`Remove ${x.attributes.attachment.title}`} onClick={() => remove(x)}>
                 <X size={14} />
               </button>
             </li>
@@ -428,7 +442,7 @@ function Attachments({ id, incident }: { id: string; incident: string }) {
         className="space-y-2"
         onSubmit={(e) => {
           e.preventDefault();
-          if (/^https?:\/\//.test(url.trim())) void add();
+          if (/^https?:\/\//.test(url.trim())) add();
         }}
       >
         <div className="field">
@@ -438,7 +452,7 @@ function Attachments({ id, incident }: { id: string; incident: string }) {
           <div className="field flex-1">
             <input aria-label="Its title" value={title} onChange={(e) => setTitle(e.target.value)} placeholder="Title" autoComplete="off" />
           </div>
-          <Button type="submit" variant="secondary" size="sm" disabled={!/^https?:\/\//.test(url.trim())}>
+          <Button type="submit" variant="secondary" size="sm" disabled={!/^https?:\/\//.test(url.trim())} pending={adding}>
             Attach
           </Button>
         </div>
@@ -484,19 +498,12 @@ function WritePostmortem({ incident }: { incident: string }) {
   const templates = useRes(templatesRes).data;
   const navigate = useNavigate();
   const [template, setTemplate] = React.useState("");
-  const [busy, setBusy] = React.useState(false);
-  const write = async () => {
-    setBusy(true);
-    try {
-      const n = await observeApi.writePostmortem(incident, template ? Number(template) : undefined);
-      invalidate("observe/incidents");
-      invalidate("observe/notebooks");
-      navigate(`/observe/notebooks/${n.id}`);
-    } catch (e) {
-      toast({ title: "Couldn't write the postmortem", description: errorMessage(e), tone: "failed" });
-      setBusy(false);
-    }
-  };
+  const [write, writing] = useAction(async () => {
+    const n = await observeApi.writePostmortem(incident, template ? Number(template) : undefined);
+    invalidate("observe/incidents");
+    invalidate("observe/notebooks");
+    await navigate(`/observe/notebooks/${n.id}`);
+  }, "Couldn't write the postmortem");
   return (
     <div className="mb-4 flex flex-wrap items-end gap-2">
       {templates.length > 0 && (
@@ -509,7 +516,7 @@ function WritePostmortem({ incident }: { incident: string }) {
           className="min-w-[10rem] flex-1"
         />
       )}
-      <Button size="sm" onClick={() => void write()} disabled={busy}>
+      <Button size="sm" onClick={write} pending={writing}>
         Write the postmortem
       </Button>
     </div>
@@ -577,10 +584,10 @@ function EditDialog({ i, onClose }: { i: Incident; onClose: () => void }) {
   const [detection, setDetection] = React.useState(text("detection_method"));
   const [handles, setHandles] = React.useState(a.notification_handles.map((h) => h.handle.replace(/^@/, "")));
   const [test, setTest] = React.useState(a.is_test);
-  const [busy, setBusy] = React.useState(false);
+  const form = [title, commander, impacted, scope, start, end, summary, cause, services, teams, detection, handles, test];
+  const opening = useOpening(form);
   const ready = title.trim() !== "" && (!impacted || scope.trim() !== "");
-  const save = async () => {
-    setBusy(true);
+  const [save, saving] = useAction(async () => {
     const textbox = (v: string): IncidentField => ({ type: "textbox", value: v.trim() || null });
     const many = (v: string): IncidentField => ({ type: "multiselect", value: list(v).length ? list(v) : null });
     const change: IncidentChange = {
@@ -593,17 +600,17 @@ function EditDialog({ i, onClose }: { i: Incident; onClose: () => void }) {
       notification_handles: handles.map((h) => ({ display_name: h, handle: `@${h}` })),
       is_test: test,
     };
-    if (await act("save it", () => observeApi.updateIncident(i.id, change, commander.trim() || null))) onClose();
-    else setBusy(false);
-  };
+    if ((await act("save it", () => observeApi.updateIncident(i.id, change, commander.trim() || null))) && opening.still(form)) onClose();
+  });
   return (
     <Dialog open onOpenChange={(o) => !o && onClose()}>
       <DialogContent title={`Edit incident #${a.public_id}`} description="A change of its commander or title is put on its timeline.">
         <form
+          ref={opening.ref}
           className="space-y-4"
           onSubmit={(e) => {
             e.preventDefault();
-            if (ready && !busy) void save();
+            if (ready) save();
           }}
         >
           <Text id="edit-title" label="Title" value={title} onChange={setTitle} />
@@ -660,7 +667,7 @@ function EditDialog({ i, onClose }: { i: Incident; onClose: () => void }) {
             <Button type="button" variant="ghost" onClick={onClose}>
               Cancel
             </Button>
-            <Button type="submit" disabled={!ready || busy}>
+            <Button type="submit" disabled={!ready} pending={saving}>
               Save
             </Button>
           </div>

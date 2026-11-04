@@ -19,6 +19,10 @@ use serde_json::{Value, json};
 
 use crate::store::Store;
 
+pub mod blobs;
+pub mod cluster;
+pub mod feeds;
+
 /// The most records a walk loads: a thing's chain, and its custodians' streams.
 pub const WALK_MAX: usize = 10_000;
 /// The most breaks or refusals a list gives, newest first.
@@ -67,7 +71,7 @@ fn kind_name(k: Kind) -> String {
 }
 
 /// The digest of a bundle's statement, read without checking it ("" when it can't be read).
-fn digest_of(bundle: &Value) -> String {
+pub(crate) fn digest_of(bundle: &Value) -> String {
     let env = bundle.get("dsseEnvelope");
     let ty = env.and_then(|e| e.get("payloadType")).and_then(Value::as_str);
     let payload = env.and_then(|e| e.get("payload")).and_then(Value::as_str).and_then(|p| base64::engine::general_purpose::STANDARD.decode(p).ok());
@@ -169,7 +173,26 @@ pub async fn take(store: &Store, root: &[u8], org: &str, bundle: &Value, came_fr
             check(store, root, org, &waiting, &revocations, at).await?;
         }
     }
+    // A delegation: the records taken for someone under it that waited for it (they come from
+    // other machines, in any order) are checked now.
+    if kind.is_none() && !again {
+        for waiting in under_it(store, &c.digest).await? {
+            check(store, root, org, &waiting, &revocations, at).await?;
+        }
+    }
     Ok(Ok(Taken { digest: c.digest, again, broke }))
+}
+
+/// The records that act under delegation `digest`.
+async fn under_it(store: &Store, digest: &str) -> anyhow::Result<Vec<String>> {
+    let d = digest.to_owned();
+    store
+        .call(move |c| {
+            let mut q = c.prepare("SELECT digest FROM custody WHERE under = ?1")?;
+            let rows = q.query_map([d], |r| r.get(0))?.collect::<Result<Vec<String>, _>>()?;
+            Ok(rows)
+        })
+        .await
 }
 
 /// A custody record a runner process sent ([`crate::proto::AgentMsg::Custody`]): taken as having
@@ -177,6 +200,18 @@ pub async fn take(store: &Store, root: &[u8], org: &str, bundle: &Value, came_fr
 pub async fn on_runner(hub: &crate::hub::Hub, peer: crate::instances::PeerId, machine: &str, bundle: Value) {
     let instance = hub.instances.lock().get(peer).map(|i| i.label()).unwrap_or_else(|| "legacy".to_owned());
     let came_from = format!("runner {machine} (instance {instance})");
+    // Something another runner handed it over a reach link that it refused where it would have
+    // used it (W27-R08: a sync's workspace, a run, a run's output not what was handed on, or with
+    // no hand-on or receipt of it).
+    if let Some(r) = bundle.get("refused_hop") {
+        let text = |k: &str| r.get(k).and_then(Value::as_str).unwrap_or_default().to_owned();
+        let why = format!("{} from {}: {}", text("what"), text("from"), text("why"));
+        let refusal = Refusal { act: "a hand-over between machines".into(), why: why.clone(), came_from, at: crate::util::now_unix(), ..Refusal::default() };
+        if let Err(e) = refuse(&hub.store, refusal).await {
+            tracing::warn!(target: "kiln.custody", %machine, error = %format!("{e:#}"), "a refused hand-over between machines couldn't be recorded");
+        }
+        return tracing::info!(target: "kiln.custody", %machine, %instance, %why, "a runner process refused what another handed it");
+    }
     // An act of one of its sessions it didn't do, kiln being out of reach (W27-R08: a machine cut
     // off, as the twin's was).
     if let Some(r) = bundle.get("refused_act") {
@@ -187,6 +222,16 @@ pub async fn on_runner(hub: &crate::hub::Hub, peer: crate::instances::PeerId, ma
             tracing::warn!(target: "kiln.custody", %machine, error = %format!("{e:#}"), "an act a runner didn't do couldn't be recorded");
         }
         return tracing::info!(target: "kiln.custody", %machine, %instance, session = %text("session"), why = %text("why"), "a runner process didn't do an act: kiln was out of its reach");
+    }
+    // A break it found in what a relay passed on to it, and what it refused because of it (W27-R08's
+    // relays): kiln's words, a fellow agent's, blue/green's frames, a reach link's.
+    if let Some(r) = bundle.get("relay_break") {
+        if let Err(e) = crate::relays::reported(hub, machine, &instance, r).await {
+            tracing::warn!(target: "kiln.custody", %machine, error = %format!("{e:#}"), "a break a runner found in what a relay passed on couldn't be recorded");
+        }
+        let said = |k: &str| r.get(k).and_then(Value::as_str).unwrap_or_default().to_owned();
+        let (relay, detail) = (said("relay"), said("detail"));
+        return tracing::info!(target: "kiln.custody", %machine, %instance, %relay, %detail, "a runner process found a break in what a relay passed on");
     }
     // A hand-over's word it refused, not being the process it was for (W27-R08; the 14:18 drop).
     if let Some(r) = bundle.get("refused_word") {
@@ -272,6 +317,16 @@ pub fn word_signed(sign: &dyn Fn(&str, &statement::Statement) -> anyhow::Result<
     Ok(v.to_string())
 }
 
+/// Keeps the word kiln's server signed beside command `json` ([`word`]), so a walk through a relay
+/// that passes it on (blue/green's old build: docs/ci.md W27-R08's relays) reaches it.
+pub(crate) async fn keep_word(store: &Store, root: &[u8], json: &str) {
+    let word = serde_json::from_str::<Value>(json).ok().and_then(|v| v.get("word").and_then(Value::as_str).and_then(|w| serde_json::from_str::<Value>(w).ok()));
+    let Some(bundle) = word else { return };
+    if let Err(e) = keep_originator(store, root, &bundle, "kiln's server", crate::util::now_unix()).await {
+        tracing::warn!(target: "kiln.custody", error = %format!("{e:#}"), "a hand-over's word kiln signed wasn't kept");
+    }
+}
+
 /// The command a hand-over's word signs (`v`, as sent): its JSON without the word, as `serde_json`
 /// writes it again, which the server and the runner write alike.
 pub fn unworded(v: &Value) -> String {
@@ -284,6 +339,18 @@ pub fn without(v: &Value, key: &str) -> String {
     let mut v = v.clone();
     if let Some(o) = v.as_object_mut() {
         o.remove(key);
+    }
+    v.to_string()
+}
+
+/// What an agent session's act signs of ask `v`, as sent: the ask without the act beside it, nor
+/// the runner's record of passing it on (`passed_on`, added after the act was signed: docs/ci.md
+/// W27-R08's relays), as `serde_json` writes it again.
+pub fn signed_part(v: &Value) -> String {
+    let mut v = v.clone();
+    if let Some(o) = v.as_object_mut() {
+        o.remove("act");
+        o.remove("passed_on");
     }
     v.to_string()
 }
@@ -330,7 +397,7 @@ pub async fn act_counts(hub: &crate::hub::Hub, machine: &str, instance: &str, si
         refuse(&hub.store, record(String::new(), Some(e), why.clone(), None)).await?;
         return Ok(Err(why));
     };
-    let what = without(ask, "act");
+    let what = signed_part(ask);
     let revocations = crate::identities::revocations(&hub.store).await?;
     match act_check(&act, &hub.pki.ca_der, &revocations, &held, what.as_bytes(), at) {
         Ok(()) => Ok(Ok(())),
@@ -537,8 +604,14 @@ pub async fn hand_work(hub: &crate::hub::Hub, thing: statement::Subject, to: &st
 /// signed-in session, saying their own signature is missing and why. A walk reads the link as
 /// kiln's for them, never as theirs. Kept at once: its digest.
 pub async fn receive_for(hub: &crate::hub::Hub, person: &str, thing: statement::Subject, hand_on: &str, giver: &str, why: &str) -> anyhow::Result<String> {
+    receive_for_because(hub, person, thing, hand_on, giver, why, "no key on the device that asked").await
+}
+
+/// [`receive_for`], their own signature missing for the reason `missing` (a browser that can't
+/// sign: "this page isn't secure (https), so this browser has no key").
+pub async fn receive_for_because(hub: &crate::hub::Hub, person: &str, thing: statement::Subject, hand_on: &str, giver: &str, why: &str, missing: &str) -> anyhow::Result<String> {
     let org = hub.pki.organization();
-    let why = format!("{why}: kiln's receipt for them, on their signed-in session; their own signature is missing: no key on the device that asked");
+    let why = format!("{why}: kiln's receipt for them, on their signed-in session; their own signature is missing: {missing}");
     let body = custody::Body { from: Some(giver.to_owned()), taken_for: Some(person.to_owned()), why, ..custody::Body::new(Kind::Received, &server_uri(&org)) };
     let s = statement::Statement { subject: vec![thing], follows: vec![hand_on.to_owned()], ..statement::Statement::new(custody::to_value(&body)) };
     let bundle = server_signed(&hub.pki, &s)?;
@@ -588,6 +661,34 @@ pub async fn person_hand_on(hub: &crate::hub::Hub, person: &str, to: &str, thing
     Ok(take(&hub.store, &hub.pki.ca_der, &hub.pki.organization(), bundle, came_from, at).await?.map(|t| t.digest).map_err(|r| r.to_string()))
 }
 
+/// What a person signs on their device for custody statement `s` (a browser, with its own key:
+/// `ui/src/lib/signing.ts`), said as a verdict's is (`ci::verdicts::to_sign`): its payload type, the
+/// statement, its bytes and the bytes signed (DSSE's PAE), those two base64; never required.
+pub fn to_sign(s: &statement::Statement) -> anyhow::Result<Value> {
+    let payload = statement::payload(s).map_err(|e| anyhow::anyhow!("{e}"))?;
+    let b64 = base64::engine::general_purpose::STANDARD;
+    Ok(json!({ "payload_type": PAYLOAD_CUSTODY, "statement": s, "payload": b64.encode(&payload), "pae": b64.encode(statement::to_sign(PAYLOAD_CUSTODY, &payload)), "required": false }))
+}
+
+/// Whom a hand-on (`bundle`, read without checking it) says it hands its things to.
+pub fn hand_on_to(bundle: &Value) -> Option<String> {
+    body_in(&bundle.to_string())?.to
+}
+
+/// kiln's server passes `things`, handed on to it by `from` as `hand_on` (its digest), on unchanged
+/// to `to`, for `why`: a relay's record, its server's (docs/ci.md W27-R08). Kept at once: its
+/// digest and bundle, which `to`'s receipt follows.
+pub async fn pass_on(hub: &crate::hub::Hub, things: Vec<statement::Subject>, hand_on: &str, from: &str, to: &str, why: &str) -> anyhow::Result<(String, Value)> {
+    let org = hub.pki.organization();
+    let body = custody::Body { from: Some(from.to_owned()), to: Some(to.to_owned()), why: why.to_owned(), ..custody::Body::new(Kind::PassedOn, &server_uri(&org)) };
+    let s = statement::Statement { subject: things, follows: vec![hand_on.to_owned()], ..statement::Statement::new(custody::to_value(&body)) };
+    let bundle = server_signed(&hub.pki, &s)?;
+    match take(&hub.store, &hub.pki.ca_der, &org, &bundle, "kiln's server", crate::util::now_unix()).await? {
+        Ok(t) => Ok((t.digest, bundle)),
+        Err(why) => anyhow::bail!("kiln refused its own pass of {hand_on}: {why}"),
+    }
+}
+
 /// Whom a hand-on (`bundle`, read without checking: kiln checked it as it took it) says its things
 /// come from: the giver a take hands on for, else its signer.
 pub fn giver_of(bundle: &Value) -> Option<String> {
@@ -600,7 +701,7 @@ pub fn giver_of(bundle: &Value) -> Option<String> {
 
 /// The receipt by which `holder` came to hold `thing`, its newest of it: one it signed, or kiln's
 /// for it (a person with no key on the device that asked). None if kiln has none.
-async fn held_with(store: &Store, org: &str, holder: &str, thing: &statement::Subject) -> anyhow::Result<Option<String>> {
+pub(crate) async fn held_with(store: &Store, org: &str, holder: &str, thing: &statement::Subject) -> anyhow::Result<Option<String>> {
     let Some((algorithm, hex)) = thing.digest.iter().next().map(|(a, h)| (a.clone(), h.clone())) else { return Ok(None) };
     let rows: Vec<(String, String, String)> = store
         .call(move |c| {
@@ -637,7 +738,7 @@ pub async fn handed_to(store: &Store, to: &str, thing: &statement::Subject) -> a
 }
 
 /// A kept record's statement, read from its envelope as kiln took it.
-fn statement_in(envelope: &str) -> Option<statement::Statement> {
+pub(crate) fn statement_in(envelope: &str) -> Option<statement::Statement> {
     let bundle: Value = serde_json::from_str(envelope).ok()?;
     let payload = bundle.get("dsseEnvelope")?.get("payload")?.as_str()?;
     let bytes = base64::engine::general_purpose::STANDARD.decode(payload).ok()?;
@@ -734,8 +835,20 @@ pub async fn work_taken_from(store: &Store, session: &str) -> anyhow::Result<Opt
 /// process kiln counts as its holder, else its machine's newest. Only one that signs custody
 /// (`CAP_CUSTODY`) is asked: another's hand-on stays unanswered, as a walk shows it.
 pub async fn ask_receipt(hub: &crate::hub::Hub, session: &str, hand_on: &Value) {
+    ask_receipt_of(hub, session, hand_on, false).await;
+}
+
+/// [`ask_receipt`] for the session's first work: kiln started it with the work (a subagent's
+/// task) or gave it the work as its first goal (a plan step's own agent). Its first turn takes the
+/// work up, and may begin before the ask reaches its runner, which then signs the receipt at once.
+pub async fn ask_first_receipt(hub: &crate::hub::Hub, session: &str, hand_on: &Value) {
+    ask_receipt_of(hub, session, hand_on, true).await;
+}
+
+async fn ask_receipt_of(hub: &crate::hub::Hub, session: &str, hand_on: &Value, first: bool) {
     let Some(crate::harness::registry::Location::Machine(machine)) = hub.harness.location(session) else { return };
-    let msg = crate::proto::ServerMsg::Custody { json: json!({ "session": session, "hand_on": hand_on.to_string() }).to_string() };
+    let ask = if first { json!({ "session": session, "hand_on": hand_on.to_string(), "first": true }) } else { json!({ "session": session, "hand_on": hand_on.to_string() }) };
+    let msg = crate::proto::ServerMsg::Custody { json: ask.to_string() };
     let (owner, signs) = {
         let inst = hub.instances.lock();
         let owner = inst.owner(&crate::instances::Owned::Agent(session.to_owned()));
@@ -774,15 +887,8 @@ pub async fn subagents_handed(hub: &crate::hub::Hub, came_from: &str, hand_on: &
                 continue;
             }
         };
-        let body = custody::Body { from: Some(parent.clone()), to: Some(to), why: "a subagent's task, passed on unchanged as kiln started it".into(), ..custody::Body::new(Kind::PassedOn, &server_uri(&org)) };
-        let passed = statement::Statement { subject: s.subject.clone(), follows: vec![taken.digest.clone()], ..statement::Statement::new(custody::to_value(&body)) };
-        let bundle = match server_signed(&hub.pki, &passed) {
-            Ok(b) => b,
-            Err(e) => return tracing::warn!(target: "kiln.custody", error = %format!("{e:#}"), "kiln couldn't sign a subagent's task passed on"),
-        };
-        match take(&hub.store, &hub.pki.ca_der, &org, &bundle, "kiln's server", at).await {
-            Ok(Ok(_)) => ask_receipt(hub, child, &bundle).await,
-            Ok(Err(why)) => tracing::warn!(target: "kiln.custody", %child, %why, "kiln refused its own pass of a subagent's task"),
+        match pass_on(hub, s.subject.clone(), &taken.digest, &parent, &to, "a subagent's task, passed on unchanged as kiln started it").await {
+            Ok((_, bundle)) => ask_first_receipt(hub, child, &bundle).await,
             Err(e) => tracing::warn!(target: "kiln.custody", %child, error = %format!("{e:#}"), "a subagent's task passed on wasn't kept"),
         }
     }
@@ -875,7 +981,7 @@ pub async fn unsigned_list(store: &Store, limit: usize) -> anyhow::Result<Vec<Va
 }
 
 /// Whether kiln keeps record `digest`.
-async fn kept(store: &Store, digest: &str) -> anyhow::Result<bool> {
+pub(crate) async fn kept(store: &Store, digest: &str) -> anyhow::Result<bool> {
     let d = digest.to_owned();
     store.call(move |c| Ok(c.query_row("SELECT 1 FROM custody WHERE digest = ?1", [&d], |_| Ok(())).optional()?.is_some())).await
 }
@@ -996,9 +1102,12 @@ async fn load(store: &Store, root: &[u8], digests: &[String], revocations: &[Rev
         // (one in the same second included) doesn't undo it.
         let before: Vec<Revocation> = revocations.iter().filter(|r| r.at < at).cloned().collect();
         match statement::verify(&bundle, root, &before, at) {
-            Ok(c) => {
+            // Kept by its statement's digest: an envelope of another statement there (changed
+            // where kiln keeps it) isn't the record.
+            Ok(c) if c.digest == d => {
                 map.insert(d, c);
             }
+            Ok(c) => tracing::warn!(record = %d, kept = %c.digest, "a custody record kiln kept is another record now"),
             Err(e) => tracing::warn!(record = %d, error = %e, "a custody record kiln kept no longer checks as of when it took it"),
         }
     }
@@ -1006,13 +1115,16 @@ async fn load(store: &Store, root: &[u8], digests: &[String], revocations: &[Rev
 }
 
 /// Checks record `digest`'s own hop, at `at`: a break, recorded, if it doesn't hold; none if it
-/// holds or waits for a record it follows that kiln doesn't have yet.
+/// holds or waits for a record it follows that kiln doesn't have yet, or, taken for someone, the
+/// delegation it acts under (W27-R08: another machine's, which comes in any order).
 async fn check(store: &Store, root: &[u8], org: &str, digest: &str, revocations: &[Revocation], at: i64) -> anyhow::Result<Option<String>> {
     let mine = load(store, root, &[digest.to_owned()], revocations).await?;
     let Some(r) = mine.get(digest) else { return Ok(None) };
     let follows = r.statement.follows.clone();
-    let mut map = load(store, root, &follows, revocations).await?;
-    if follows.iter().any(|f| !map.contains_key(f)) {
+    let held_for = custody::body(r).is_ok_and(|b| b.kind.takes() && b.held_for.as_deref().is_some_and(|w| !w.is_empty()));
+    let wanted: Vec<String> = follows.iter().cloned().chain(r.statement.under.clone().filter(|_| held_for)).collect();
+    let mut map = load(store, root, &wanted, revocations).await?;
+    if wanted.iter().any(|f| !map.contains_key(f)) {
         return Ok(None);
     }
     map.extend(mine);
@@ -1021,15 +1133,48 @@ async fn check(store: &Store, root: &[u8], org: &str, digest: &str, revocations:
         Err(b) => {
             let mut around = follows;
             around.insert(0, digest.to_owned());
-            record_break(store, digest, &b, &around, at).await?;
+            record_break(store, digest, &b, &around, &relay_named(&b, digest, &map), at).await?;
             Ok(Some(b.to_string()))
         }
     }
 }
 
-/// Records break `b` at record `record`, with the records around it, once.
-async fn record_break(store: &Store, record: &str, b: &Break, around: &[String], at: i64) -> anyhow::Result<()> {
-    let (r, kind, detail, around_json) = (record.to_owned(), b.code().to_owned(), b.to_string(), serde_json::to_string(around)?);
+/// Records break `b` at record `record`, with the records around it, once; naming `relay` when
+/// it's in what a relay passed on ([`relay_named`]).
+async fn record_break(store: &Store, record: &str, b: &Break, around: &[String], relay: &str, at: i64) -> anyhow::Result<()> {
+    insert_break(store, record, b.code(), &b.to_string(), around, "", relay, at).await
+}
+
+/// The relay break `b` at record `record` names, when it's in what a relay passed on (docs/ci.md
+/// W27-R08's relays): the broken record's signer when it's a relay's record, else the signer of the
+/// relay's record it follows; "" for none.
+fn relay_named(b: &Break, record: &str, map: &BTreeMap<String, Checked>) -> String {
+    let passed = |d: &str| map.get(d).filter(|c| custody::body(c).is_ok_and(|b| b.kind == Kind::PassedOn)).map(|c| c.custodian.clone());
+    let from = match b {
+        Break::Changed { from, .. }
+        | Break::NoCommonDigest { from, .. }
+        | Break::NotHandedOn { from, .. }
+        | Break::NotAll { from, .. }
+        | Break::NotTheTaker { from, .. }
+        | Break::NotTheGiver { from, .. }
+        | Break::NotTheHolder { from, .. } => Some(from.as_str()),
+        _ => None,
+    };
+    passed(record).or_else(|| from.and_then(passed)).unwrap_or_default()
+}
+
+/// Records a break found in what relay `relay` (its identity's URI) passed on (docs/ci.md
+/// W27-R08's relays): at record `record`, the relay's record by its digest; its kind (`code`, as
+/// `kiln_ci::identity::relay::Unrelayed::code` names it) and words; the records around it; and
+/// what was refused because of it, if anything. Once.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn relay_break(store: &Store, record: &str, code: &str, detail: &str, around: &[String], refused: &str, relay: &str, at: i64) -> anyhow::Result<()> {
+    insert_break(store, record, code, detail, around, refused, relay, at).await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn insert_break(store: &Store, record: &str, kind: &str, detail: &str, around: &[String], refused: &str, relay: &str, at: i64) -> anyhow::Result<()> {
+    let (r, kind, detail, around_json, refused, relay) = (record.to_owned(), kind.to_owned(), detail.to_owned(), serde_json::to_string(around)?, refused.to_owned(), relay.to_owned());
     let (rr, dd) = (r.clone(), detail.clone());
     let new = store
         .call(move |c| {
@@ -1037,7 +1182,7 @@ async fn record_break(store: &Store, record: &str, b: &Break, around: &[String],
             if seen.is_some() {
                 return Ok(false);
             }
-            c.execute("INSERT INTO custody_breaks (record, kind, detail, around, at) VALUES (?1, ?2, ?3, ?4, ?5)", params![r, kind, detail, around_json, at])?;
+            c.execute("INSERT INTO custody_breaks (record, kind, detail, around, refused, relay, at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)", params![r, kind, detail, around_json, refused, relay, at])?;
             Ok(true)
         })
         .await?;
@@ -1047,6 +1192,24 @@ async fn record_break(store: &Store, record: &str, b: &Break, around: &[String],
         crate::audit::write(store, entry).await;
     }
     Ok(())
+}
+
+/// Records that kiln, or a runner process, refused `what`, which relay `relay` passed on, for
+/// `why` (docs/ci.md W27-R08's relays): the relay's record by its digest and envelope, and what it
+/// came over.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn refused_relayed(store: &Store, digest: &str, what: &str, relay: &str, why: &str, envelope: &str, came_from: &str, at: i64) -> anyhow::Result<()> {
+    let r = Refusal { digest: digest.to_owned(), act: what.to_owned(), signer: relay.to_owned(), why: why.to_owned(), envelope: envelope.to_owned(), came_from: came_from.to_owned(), at, ..Refusal::default() };
+    refuse(store, r).await
+}
+
+/// Keeps `bundle`, an originator's own signed statement that a relay passed on (an agent session's
+/// act: docs/ci.md W27-R08's relays), by its digest, so a walk from a relay's record finds it: not
+/// a custody record, so of no kind; checked as of `at`, revocations aside (whether the act counts
+/// is its own check's). Whether it's new.
+pub(crate) async fn keep_originator(store: &Store, root: &[u8], bundle: &Value, came_from: &str, at: i64) -> anyhow::Result<bool> {
+    let c = statement::verify(bundle, root, &[], at).map_err(|e| anyhow::anyhow!("{e}"))?;
+    keep(store, &c, None, None, bundle, came_from).await
 }
 
 /// Records refusal `r`, and audits it.
@@ -1240,6 +1403,11 @@ async fn on_stream(store: &Store, custodian: &str, stream: &str) -> anyhow::Resu
 /// A thing's chain of custody, walked now from `digest` (a record's, or a thing's): each hop with
 /// both sides and who signed it, or the first break, recorded. None when kiln has no record of it.
 pub async fn chain(store: &Store, root: &[u8], org: &str, digest: &str, at: i64) -> anyhow::Result<Option<Value>> {
+    Ok(walked(store, root, org, digest, at).await?.map(|(v, _)| v))
+}
+
+/// [`chain`], and the digests of the records it read.
+async fn walked(store: &Store, root: &[u8], org: &str, digest: &str, at: i64) -> anyhow::Result<Option<(Value, Vec<String>)>> {
     let Some(from) = start(store, digest).await? else { return Ok(None) };
     let revocations = crate::identities::revocations(store).await?;
     let mut map: BTreeMap<String, Checked> = BTreeMap::new();
@@ -1248,7 +1416,9 @@ pub async fn chain(store: &Store, root: &[u8], org: &str, digest: &str, at: i64)
         let got = load(store, root, &frontier, &revocations).await?;
         let mut next: BTreeSet<String> = BTreeSet::new();
         for c in got.values() {
-            next.extend(c.statement.follows.iter().filter(|f| !map.contains_key(*f) && !got.contains_key(*f)).cloned());
+            // What it follows, and the delegation it acts under (a record taken for someone is
+            // judged by it: W27-R08).
+            next.extend(c.statement.follows.iter().chain(c.statement.under.iter()).filter(|f| !map.contains_key(*f) && !got.contains_key(*f)).cloned());
         }
         map.extend(got);
         frontier = next.into_iter().filter(|d| !map.contains_key(d)).collect();
@@ -1273,6 +1443,9 @@ pub async fn chain(store: &Store, root: &[u8], org: &str, digest: &str, at: i64)
             "from": b.as_ref().and_then(|b| b.from.clone()),
             // The part of its custodian that holds them: a promotion's environment.
             "component": b.as_ref().and_then(|b| b.component.clone()),
+            // Whom it holds them for, and the delegation it takes them under (W27-R08).
+            "for": b.as_ref().and_then(|b| b.held_for.clone()),
+            "under": c.and_then(|c| c.statement.under.clone()),
             "why": b.as_ref().map(|b| b.why.clone()),
             "at": h.at,
             "subject": h.subject,
@@ -1293,14 +1466,169 @@ pub async fn chain(store: &Store, root: &[u8], org: &str, digest: &str, at: i64)
             held_by = Some(if b.kind == Kind::Taken { b.taken_for.clone().unwrap_or_default() } else { c.custodian.clone() });
         }
     }
-    Ok(Some(match custody::walk(&from, &map, &server_uri(org)) {
+    let read: Vec<String> = map.keys().cloned().collect();
+    let v = match custody::walk(&from, &map, &server_uri(org)) {
         Ok(w) => json!({ "from": from, "unbroken": true, "open": open, "lapsed": lapsed, "held_by": held_by, "hops": w.hops.iter().map(view).collect::<Vec<_>>(), "began": w.began }),
         Err(b) => {
+            let b = unchecked(store, root, &revocations, b).await?;
             let at_record = break_record(&b).unwrap_or(&from).to_owned();
-            record_break(store, &at_record, &b, std::slice::from_ref(&from), at).await?;
-            json!({ "from": from, "unbroken": false, "break": { "kind": b.code(), "record": at_record, "detail": b.to_string() } })
+            // A gap in a relay's stream names the relay: records it passed on never came.
+            let relay = match &b {
+                Break::Gap(statement::Gap::Missing { custodian, stream, .. } | statement::Gap::Twice { custodian, stream, .. })
+                    if map.values().any(|c| c.custodian == *custodian && c.statement.stream.as_deref() == Some(stream) && custody::body(c).is_ok_and(|b| b.kind == Kind::PassedOn)) =>
+                {
+                    custodian.clone()
+                }
+                _ => relay_named(&b, &at_record, &map),
+            };
+            record_break(store, &at_record, &b, std::slice::from_ref(&from), &relay, at).await?;
+            json!({ "from": from, "unbroken": false, "break": { "kind": b.code(), "record": at_record, "detail": b.to_string(), "relay": relay } })
         }
-    }))
+    };
+    Ok(Some((v, read)))
+}
+
+/// A walk's break at a record kiln doesn't have, when kiln keeps it but it no longer checks as kiln
+/// took it (changed where it's kept): a break at that record, saying so, not a record missing.
+async fn unchecked(store: &Store, root: &[u8], revocations: &[Revocation], b: Break) -> anyhow::Result<Break> {
+    let Break::NoRecord { record, .. } = &b else { return Ok(b) };
+    let d = record.clone();
+    let kept: Option<(String, i64)> = store.call(move |c| Ok(c.query_row("SELECT envelope, taken_at FROM custody WHERE digest = ?1", [&d], |r| Ok((r.get(0)?, r.get(1)?))).optional()?)).await?;
+    let Some((envelope, at)) = kept else { return Ok(b) };
+    let before: Vec<Revocation> = revocations.iter().filter(|r| r.at < at).cloned().collect();
+    let checked = serde_json::from_str::<Value>(&envelope).map_err(|e| e.to_string()).and_then(|bundle| statement::verify(&bundle, root, &before, at).map_err(|e| e.to_string()));
+    let why = match checked {
+        Ok(c) if c.digest == *record => return Ok(b),
+        Ok(c) => format!("what kiln keeps as it is another record, {}", c.digest),
+        Err(e) => format!("what kiln keeps as it no longer checks as kiln took it: {e}"),
+    };
+    Ok(Break::Unreadable { record: record.clone(), why })
+}
+
+/// A thing's chain of custody walked for whoever audits it (docs/ci.md W27-R08; the Transfers
+/// plan's step 15): [`chain`]'s walk from `digest` (a record's, or a thing's, from where it's used
+/// back to where it was made), each hop also in words, or its first break; with `export`, every
+/// record the walk read as kiln took it (its Sigstore bundle), kiln's CA certificate and the
+/// revocations each was checked against, which check each signature and walk it again without
+/// kiln. None when kiln has no record of it.
+pub async fn walk(store: &Store, pki: &crate::pki::Pki, digest: &str, at: i64, export: bool) -> anyhow::Result<Option<Value>> {
+    let Some((mut v, mut read)) = walked(store, &pki.ca_der, &pki.organization(), digest, at).await? else { return Ok(None) };
+    // Its words name a runner as people see it, kiln knowing it by its machine id (docs/machines.md).
+    let labels = store.agent_labels().await.unwrap_or_else(|e| {
+        tracing::warn!(target: "kiln.custody", error = %format!("{e:#}"), "the runners' labels couldn't be read: a walk names them by their ids");
+        Default::default()
+    });
+    let shown = |machine: &str| labels.get(machine).cloned().unwrap_or_else(|| machine.to_owned());
+    if let Some(hops) = v.get_mut("hops").and_then(Value::as_array_mut) {
+        for h in hops.iter_mut() {
+            let words = hop_words(h, &shown);
+            if let Some(o) = h.as_object_mut() {
+                o.insert("words".into(), Value::String(words));
+            }
+        }
+    }
+    if !export {
+        return Ok(Some(v));
+    }
+    // The record a break is at, as kiln keeps it, too: one that no longer checks among them.
+    if let Some(b) = v.pointer("/break/record").and_then(Value::as_str)
+        && !read.iter().any(|d| d == b)
+    {
+        read.push(b.to_owned());
+    }
+    let rows: Vec<(String, String, i64, String)> = store
+        .call(move |c| {
+            let mut q = c.prepare("SELECT digest, envelope, taken_at, came_from FROM custody WHERE digest = ?1")?;
+            let mut out = Vec::new();
+            for d in &read {
+                if let Some(row) = q.query_row([d], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?))).optional()? {
+                    out.push(row);
+                }
+            }
+            Ok(out)
+        })
+        .await?;
+    let records: Vec<Value> = rows
+        .into_iter()
+        .map(|(digest, envelope, taken_at, came_from)| json!({ "digest": digest, "taken_at": taken_at, "came_from": came_from, "bundle": serde_json::from_str::<Value>(&envelope).unwrap_or(Value::String(envelope)) }))
+        .collect();
+    let revocations: Vec<Value> = crate::identities::revocations(store).await?.into_iter().map(|r| json!({ "serial": r.serial, "key": r.key, "at": r.at, "reason": r.reason, "by": r.by })).collect();
+    if let Some(o) = v.as_object_mut() {
+        o.insert("records".into(), Value::Array(records));
+        o.insert("root".into(), Value::String(pki.ca_pem.clone()));
+        o.insert("revocations".into(), Value::Array(revocations));
+    }
+    Ok(Some(v))
+}
+
+/// Custodian `uri` in words: "kiln", "kiln's CD", "ada", "the runner on fedora-2", "run 812's leg
+/// build on fedora-2", "agent session 01a1751c at epoch 3 (on adacachy)", "kiln's store of bytes
+/// (s3)", "node m02 (cluster e2e)", "pod shop/web-1 (cluster e2e)"; as it's written when it's none
+/// of those. A machine is named as `shown` gives it.
+fn custodian_words(uri: &str, shown: &dyn Fn(&str) -> String) -> String {
+    if let Ok(id) = Identity::parse(uri) {
+        return match id.actor {
+            Actor::Person { name } => name,
+            Actor::Agent { agent, epoch, held_by, .. } => format!("agent session {} at epoch {epoch}{}", agent.get(..8).unwrap_or(&agent), held_by.map(|h| format!(" (on {})", shown(&h.machine))).unwrap_or_default()),
+            Actor::Runner { machine, .. } => format!("the runner on {}", shown(&machine)),
+            Actor::Leg { machine, run, leg, .. } => format!("run {run}'s leg {leg} on {}", shown(&machine)),
+            Actor::Server => "kiln".into(),
+            Actor::Cd => "kiln's CD".into(),
+        };
+    }
+    if let Some((_, kind)) = uri.rsplit_once("/blobs/") {
+        return format!("kiln's store of bytes ({kind})");
+    }
+    if let Some(runner) = uri.strip_prefix("reach-v1:") {
+        return format!("runner {}, from before custody", shown(runner));
+    }
+    // A deploy's cluster, its nodes and its pods (kiln_ci::identity::deployed).
+    if let Some(rest) = uri.strip_prefix("kubernetes://") {
+        return match rest.split('/').collect::<Vec<_>>().as_slice() {
+            [cluster] => format!("cluster {cluster}"),
+            [cluster, "node", node] => format!("node {node} (cluster {cluster})"),
+            [cluster, namespace, "pod", pod] => format!("pod {namespace}/{pod} (cluster {cluster})"),
+            _ => uri.to_owned(),
+        };
+    }
+    uri.to_owned()
+}
+
+/// A walk's hop in words: "the runner on box-b received binaries/kiln-x from kiln", a machine
+/// named as `shown` gives it.
+fn hop_words(h: &Value, shown: &dyn Fn(&str) -> String) -> String {
+    let s = |k: &str| h.get(k).and_then(Value::as_str).unwrap_or_default();
+    let names: Vec<String> = h
+        .get("subject")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .map(|t| match t.get("name").and_then(Value::as_str).filter(|n| !n.is_empty()) {
+            Some(n) => n.to_owned(),
+            None => t.get("digest").and_then(Value::as_object).and_then(|d| d.iter().next()).map_or_else(|| "something unnamed".to_owned(), |(alg, hex)| format!("{alg}:{}", hex.as_str().and_then(|x| x.get(..12)).unwrap_or_default())),
+        })
+        .collect();
+    let things = match names.as_slice() {
+        [] => "nothing named".to_owned(),
+        [one] => one.clone(),
+        [a, b] => format!("{a} and {b}"),
+        [a, b, rest @ ..] => format!("{a}, {b} and {} more", rest.len()),
+    };
+    // kiln's take, or its receipt, for someone who couldn't sign: "kiln for sam".
+    let by = h.get("taken_for").and_then(Value::as_str).map_or_else(|| custodian_words(s("custodian"), shown), |who| format!("kiln for {}", custodian_words(who, shown)));
+    let to = |before: &str| match s("to") {
+        "" => String::new(),
+        to => format!("{before}to {}", custodian_words(to, shown)),
+    };
+    let made = h.get("made_from").and_then(Value::as_array).is_some_and(|m| !m.is_empty());
+    match s("kind") {
+        "received" => format!("{by} received {things} from {}", custodian_words(s("from"), shown)),
+        "passed-on" => format!("{by} passed {things} on{}", to(" ")),
+        "taken" => format!("{by} took {things}"),
+        _ if made => format!("{by} handed on {things}, made from what it received{}", to(", ")),
+        _ if h.get("began") == Some(&Value::Bool(true)) => format!("{by} handed on {things}{}, where the chain begins", to(" ")),
+        _ => format!("{by} handed {things} on{}", to(" ")),
+    }
 }
 
 /// The record a break is at.
@@ -1319,7 +1647,8 @@ fn break_record(b: &Break) -> Option<&str> {
         | Break::NotTheHolder { record, .. }
         | Break::NoHandOn { record, .. }
         | Break::OutOfOrder { record, .. }
-        | Break::TakenNotByServer { record, .. } => record,
+        | Break::TakenNotByServer { record, .. }
+        | Break::NotEntitled { record, .. } => record,
         Break::Gap(_) => return None,
     })
 }
@@ -1329,11 +1658,13 @@ pub async fn breaks(store: &Store, limit: usize) -> anyhow::Result<Vec<Value>> {
     let n = i64::try_from(limit).unwrap_or(i64::MAX);
     store
         .call(move |c| {
-            let mut q = c.prepare("SELECT record, kind, detail, around, refused, at FROM custody_breaks ORDER BY at DESC, id DESC LIMIT ?1")?;
+            let mut q = c.prepare("SELECT record, kind, detail, around, refused, at, relay FROM custody_breaks ORDER BY at DESC, id DESC LIMIT ?1")?;
             let rows = q
                 .query_map([n], |r| {
                     let around: String = r.get(3)?;
-                    Ok(json!({ "record": r.get::<_, String>(0)?, "kind": r.get::<_, String>(1)?, "detail": r.get::<_, String>(2)?, "around": serde_json::from_str::<Value>(&around).unwrap_or(Value::Null), "refused": r.get::<_, String>(4)?, "at": r.get::<_, i64>(5)? }))
+                    // The relay, when it's in what one passed on (docs/ci.md W27-R08's relays).
+                    let relay: String = r.get(6)?;
+                    Ok(json!({ "record": r.get::<_, String>(0)?, "kind": r.get::<_, String>(1)?, "detail": r.get::<_, String>(2)?, "around": serde_json::from_str::<Value>(&around).unwrap_or(Value::Null), "refused": r.get::<_, String>(4)?, "at": r.get::<_, i64>(5)?, "relay": relay }))
                 })?
                 .collect::<Result<Vec<_>, _>>()?;
             Ok(rows)
@@ -1376,6 +1707,15 @@ enum CustodyCmd {
     Show { digest: String },
     /// The breaks kiln found in chains of custody, newest first.
     Breaks,
+    /// A thing's chain walked from where it's used back to where it was made (a record's digest,
+    /// or a thing's), each hop in words, or its first break.
+    Walk {
+        digest: String,
+        /// Also write the walk to this file as JSON, with every record it read as signed, kiln's
+        /// CA certificate and its revocations: what an auditor checks it with, without kiln.
+        #[arg(long)]
+        export: Option<std::path::PathBuf>,
+    },
 }
 
 /// `kiln transfers`: what kiln refused because its signer no longer held what it acted on, and the
@@ -1425,6 +1765,24 @@ pub async fn cli(args: CustodyArgs, cfg: &crate::config::Config) -> anyhow::Resu
             let v = api.call_api(Method::Get, "/api/custody/breaks", None).await?;
             for b in v.get("breaks").and_then(Value::as_array).cloned().unwrap_or_default() {
                 println!("{}  {:<16} {}  {}", when(b.get("at").and_then(Value::as_i64)), s(&b, "kind"), s(&b, "record"), s(&b, "detail"));
+            }
+        }
+        CustodyCmd::Walk { digest, export } => {
+            let v = api.call_api(Method::Get, &format!("/api/custody/walk?digest={}{}", enc(&digest), if export.is_some() { "&export=true" } else { "" }), None).await?;
+            if v.get("unbroken").and_then(Value::as_bool) == Some(true) {
+                let hops = v.get("hops").and_then(Value::as_array).cloned().unwrap_or_default();
+                println!("{digest}: unbroken, each of its {} hop(s) signed", hops.len());
+                for h in hops {
+                    println!("  {}  {}", when(h.get("at").and_then(Value::as_i64)), s(&h, "words"));
+                }
+            } else {
+                let b = v.get("break").cloned().unwrap_or(Value::Null);
+                println!("{digest}: broken at {} ({}): {}", s(&b, "record"), s(&b, "kind"), s(&b, "detail"));
+            }
+            if let Some(path) = export {
+                std::fs::write(&path, serde_json::to_vec_pretty(&v)?)?;
+                let n = v.get("records").and_then(Value::as_array).map_or(0, Vec::len);
+                println!("exported to {}: {n} record(s) as signed, kiln's CA certificate and its revocations", path.display());
             }
         }
     }
@@ -1864,6 +2222,95 @@ mod tests {
             assert!(transfer(stale, Some(receipt(&stale_digest, &thing("session 01a1751c at epoch 0", 'a'))?)).await?.is_err_and(|why| why.contains("refused") && why.contains("epoch 0 left")));
             let r = refusals(&store, LIST_MAX).await?;
             assert!(r.iter().any(|x| x.get("signer") == Some(&json!(left_uri))), "{r:?}");
+            Ok(())
+        })
+    }
+
+    /// W27-R08 (the Transfers plan's step 15): a walk from where a thing is used back to where it
+    /// was made says each hop in words; exported, it carries every record it read as signed, kiln's
+    /// CA certificate and its revocations, which check each record without kiln; and with one hop's
+    /// record removed, or changed where kiln keeps it, it names the break at that hop.
+    #[test]
+    fn w27_r08_a_walk_says_each_hop_and_exports_what_it_read() -> anyhow::Result<()> {
+        use base64::Engine as _;
+        crate::rt::block_on(async {
+            let dir = tempfile::tempdir()?;
+            let store = Store::in_memory()?;
+            let pki = crate::pki::Pki::open_scratch(&dir.path().join("pki"))?;
+            let (root, org) = (pki.ca_der.clone(), pki.organization());
+            let at = crate::util::now_unix();
+            let (server, fedora_uri) = (server_uri(&org), FEDORA.replace(ORG, &org));
+            let (kiln, fedora) = (Signer::new(&pki, &server)?, Signer::new(&pki, &fedora_uri)?);
+            // kiln hands commit 4c1e2a to fedora-2's runner, which makes image kiln:4c1e2a from it
+            // and hands that to kiln.
+            let (commit, image) = (thing("commit 4c1e2a", 'c'), thing("image kiln:4c1e2a", 'e'));
+            let handed = kiln.sign(&record(Kind::HandedOn, &commit, Some(&fedora_uri), None, &[], "land", 1))?;
+            let h = kiln_or(take(&store, &root, &org, &handed, "kiln", at).await?)?;
+            let received = fedora.sign(&record(Kind::Received, &commit, None, Some(&server), &[&h.digest], "legs", 1))?;
+            let r = kiln_or(take(&store, &root, &org, &received, "runner fedora-2", at).await?)?;
+            let made = kiln_or(take(&store, &root, &org, &fedora.sign(&record(Kind::HandedOn, &image, Some(&server), None, &[&r.digest], "legs", 2))?, "runner fedora-2", at).await?)?;
+            let got = kiln_or(take(&store, &root, &org, &kiln.sign(&record(Kind::Received, &image, None, Some(&fedora_uri), &[&made.digest], "land", 2))?, "kiln", at).await?)?;
+            assert_eq!([&h.broke, &r.broke, &made.broke, &got.broke], [&None, &None, &None, &None]);
+            // Walked from the image's digest: kiln's receipt of it, back to kiln's hand-on of the
+            // commit it was made from.
+            let image_digest = format!("sha256:{}", "e".repeat(64));
+            let v = walk(&store, &pki, &image_digest, at, true).await?.ok_or_else(|| anyhow::anyhow!("no walk from {image_digest}"))?;
+            assert_eq!(v.get("unbroken"), Some(&json!(true)), "{v}");
+            let words: Vec<&str> = v.get("hops").and_then(Value::as_array).into_iter().flatten().filter_map(|h| h.get("words").and_then(Value::as_str)).collect();
+            assert_eq!(
+                words,
+                [
+                    "kiln received image kiln:4c1e2a from the runner on fedora-2",
+                    "the runner on fedora-2 handed on image kiln:4c1e2a, made from what it received, to kiln",
+                    "the runner on fedora-2 received commit 4c1e2a from kiln",
+                    "kiln handed on commit 4c1e2a to the runner on fedora-2, where the chain begins",
+                ]
+            );
+            // Exported: each record as signed, each checking against kiln's CA certificate alone.
+            let ca = crate::pki::der_of(v.get("root").and_then(Value::as_str).unwrap_or_default())?;
+            let records = v.get("records").and_then(Value::as_array).cloned().unwrap_or_default();
+            assert_eq!(records.len(), 4, "{v}");
+            for x in &records {
+                let c = statement::verify(x.get("bundle").unwrap_or(&Value::Null), &ca, &[], at)?;
+                assert_eq!(Some(c.digest.as_str()), x.get("digest").and_then(Value::as_str));
+            }
+            assert_eq!(v.get("revocations"), Some(&json!([])));
+            let plain = walk(&store, &pki, &image_digest, at, false).await?.unwrap_or_default();
+            assert_eq!((plain.get("records"), plain.get("root")), (None, None), "exported only when asked");
+            let set = |envelope: Option<String>| {
+                let (d, store) = (r.digest.clone(), store.clone());
+                async move {
+                    match envelope {
+                        Some(e) => store.call(move |c| Ok(c.execute("UPDATE custody SET envelope = ?2 WHERE digest = ?1", params![d, e])?)).await,
+                        None => store.call(move |c| Ok(c.execute("DELETE FROM custody WHERE digest = ?1", [&d])?)).await,
+                    }
+                }
+            };
+            // fedora-2's receipt of the commit removed: the walk breaks where the image's hand-on
+            // follows it, naming it.
+            set(None).await?;
+            let v = walk(&store, &pki, &image_digest, at, false).await?.unwrap_or_default();
+            assert_eq!((v.pointer("/break/kind"), v.pointer("/break/record")), (Some(&json!("no-record")), Some(&json!(made.digest))), "{v}");
+            assert!(v.pointer("/break/detail").and_then(Value::as_str).is_some_and(|d| d.contains(&r.digest)), "{v}");
+            kiln_or(take(&store, &root, &org, &received, "runner fedora-2", at).await?)?;
+            assert_eq!(walk(&store, &pki, &image_digest, at, false).await?.unwrap_or_default().get("unbroken"), Some(&json!(true)), "kept again, it walks");
+            // Its signed payload changed where kiln keeps it: the walk breaks at it, saying it no
+            // longer checks, and the export carries it as kiln keeps it.
+            let mut changed = received.clone();
+            if let Some(p) = changed.pointer_mut("/dsseEnvelope/payload") {
+                let was = base64::engine::general_purpose::STANDARD.decode(p.as_str().unwrap_or_default())?;
+                *p = Value::String(base64::engine::general_purpose::STANDARD.encode(String::from_utf8_lossy(&was).replace("a test", "a lie")));
+            }
+            set(Some(changed.to_string())).await?;
+            let v = walk(&store, &pki, &image_digest, at, true).await?.unwrap_or_default();
+            assert_eq!((v.pointer("/break/kind"), v.pointer("/break/record")), (Some(&json!("unreadable")), Some(&json!(r.digest))), "{v}");
+            assert!(v.pointer("/break/detail").and_then(Value::as_str).is_some_and(|d| d.contains("no longer checks")), "{v}");
+            assert!(v.get("records").and_then(Value::as_array).is_some_and(|x| x.iter().any(|x| x.get("digest") == Some(&json!(r.digest)))), "{v}");
+            // Another record's envelope kept in its place: a break at it, naming the other.
+            set(Some(handed.to_string())).await?;
+            let v = walk(&store, &pki, &image_digest, at, false).await?.unwrap_or_default();
+            assert_eq!((v.pointer("/break/kind"), v.pointer("/break/record")), (Some(&json!("unreadable")), Some(&json!(r.digest))), "{v}");
+            assert!(v.pointer("/break/detail").and_then(Value::as_str).is_some_and(|d| d.contains(&h.digest)), "{v}");
             Ok(())
         })
     }

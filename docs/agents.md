@@ -290,14 +290,19 @@ server says, and counts every session it has, ended ones included, until it's up
   page's composer, the field and its bar. Under it, More
   options opens to one row each: the machine, the folder, how many, its name, its workspace, where
   its commands run, a shell to run in and the machine's past sessions to continue (closed, it says
-  what isn't as it starts out). Each opens in place. Start starts it and opens it: the agent's socket opens at once, and its page opens as
-  soon as its first snapshot is in (a moment at most), one view transition carrying each part of
-  the composer to its place on the page. That snapshot names its settings as the composer did,
+  what isn't as it starts out). Each opens in place. Start starts it and opens it, waiting for
+  nothing (docs/ci.md W21-R15): the page makes the agent's id and the server starts it under that
+  id (`ids`, below), so its page opens at once, one view transition carrying each part of the
+  composer to its place on the page, listed as starting everywhere agents are. Until its machine
+  has started it the page shows its first message as sent and says it's starting, and its message
+  box takes what's written meanwhile, kept to go once it can; a start that's refused says why
+  there, with Try again (under the same id: nothing starts twice) and Back (its message back in
+  Mission control's box). Its first snapshot names its settings as the composer did,
   before its harness says anything (it may wait for room on its machine, then take seconds to
   start): its permissions, model, effort and speed, by its harness's lists as the machine knows
   them; what the harness says once it runs takes their place, as it does when a switch starts
-  another. Several stay on Mission control: the line under the box
-  says what started, and they come into the list. Files go with the first message, sent once the
+  another. Several stay on Mission control, in the list at once as they start: the line under the
+  box says how they go (Try again if they couldn't), and opens the first. Files go with the first message, sent once the
   agent can take it. Everything else that started agents (Duplicate, a message's "Start new agent
   on this", Ask an agent, a shell's "Start agents in this shell", the command palette) fills the
   composer in and says where it came from, with Clear for your own defaults.
@@ -323,7 +328,7 @@ server says, and counts every session it has, ended ones included, until it's up
 |---|---|---|
 | GET | `/api/harness/kinds?target=` | the harnesses each machine offers (`KindInfo[]`: id, name, verified, available, modes, structured, and its models with the efforts and speeds each takes) |
 | GET | `/api/harness/sessions` | `Info[]` |
-| POST | `/api/harness/sessions` | `{target: "local" \| "agent:<name>", spec: Spec, count?}` → `Info[]` |
+| POST | `/api/harness/sessions` | `{target: "local" \| "agent:<name>", spec: Spec, count?, ids?}` → `Info[]`; `ids`: the ids to start them under, one each (32 lowercase hex digits), made by the client so its page can open the agent's own page before it has started (docs/ci.md W21-R15); an id that's a session's already, or another start's under way, is refused (409) before anything starts, so a start asked again under its ids never starts twice |
 | GET / DELETE | `/api/harness/sessions/:id` | one session / close it for good |
 | POST | `/api/harness/sessions/:id/command` | a `Command` → its runner's answer: 204 taken, 202 `{parked: true}` (its machine is away and it waits for it), 404 when its runner doesn't have the session, 409 for another refusal (how and why) or a machine that's away for one refused while away, 504 when its link dropped before it answered (docs/wire.md, "Commands"); for a message (a `send`, a skill run with its `id`) its inbox's answer: 200 `{sent, message, accepted}` (`accepted.repeat` when its id was taken before), or a typed refusal (409 for an epoch the agent left, a machine it moved from, or an id given to other words). A message's `id` is its idempotency key; an `Idempotency-Key` header makes it from that instead (docs/sends.md), and takes any other command once under it |
 | POST | `/api/harness/broadcast` | one thing to many agents on every machine: a prompt or slash command, a command, or answers to what waits on you; see below |
@@ -1444,6 +1449,15 @@ working: what you send is kept in your browser ("Kept here", editable and remova
 reloads) and goes to the agent in order once it can take it, ahead of anything sent after.
 Files attached go along when they were uploaded; ones that couldn't be (no server) stay with the
 page until it reloads.
+
+A message sent while one of its files still uploads waits there too (W21-R15): Send never waits
+for a file, and the box is free at once for what's written next. Its row says each file on its
+way; once they're up it goes, in its turn, carrying each that made it (one that didn't is said in
+a toast, and the message goes without it), and what's queued after it waits behind it. Kept from
+before a reload, its uploads went with that page: it waits for you to send it without each (its ×)
+or remove it. Mission control's Start doesn't wait for files either: the agent starts, and its first
+message waits for them on its page; several agents get theirs once they've started and the files
+are up.
 
 ### A copy left behind
 

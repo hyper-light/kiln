@@ -1,11 +1,15 @@
 /**
- * Requests you've answered here that the agent hasn't taken yet. An answer shows as given at once,
- * wherever its request showed (its row in Mission control, its card anywhere in kiln, the agent's
- * page), however slow the way to the agent; if sending it fails, the request is back as it was. An
- * answer not taken within a minute is let go, so a request the agent still waits on shows again.
+ * Requests you've answered here that the agent hasn't taken yet, and paused goals you resumed here
+ * (or whose plan you approved). An answer shows as given at once, wherever its request showed (its
+ * row in Mission control, its card anywhere in kiln, the agent's page), however slow the way to the
+ * agent; if sending it fails, the request is back as it was. An answer not taken within a minute is
+ * let go, so a request the agent still waits on shows again.
  */
 import { useSyncExternalStore } from "react";
-import { harnessApi, type ApprovalBrief, type Command } from "@/api/harness";
+import { clientId, commandId, harnessApi, type ApprovalBrief, type Command, type SessionStore } from "@/api/harness";
+import { toast } from "@/components/ui/toast";
+import { errorMessage } from "@/lib/hooks";
+import { Tries } from "@/lib/tries";
 import { markNotices } from "./notices";
 
 /** How long an answer given here stands in for the agent's own word. */
@@ -65,6 +69,76 @@ export async function answer(agent: string, c: Extract<Command, { type: "approve
   markNotices([c.id], "done", [agent]);
 }
 
+/**
+ * Send `c` to agent `agent` from its page: over its socket, else (the socket reconnecting) over
+ * HTTP under the same id, which its session takes once however it comes; never "try again in a
+ * moment" (W21-R15). An answer shows as given at once, and is back, with why, if it doesn't go.
+ * Settles once it's gone (at once over the socket, which says itself what it waits for): a
+ * control can say it's on its way until then (`useAction`); a failure is said here.
+ */
+export function sendCommand(store: SessionStore, agent: string, c: Command): Promise<void> {
+  if (c.type === "approve") markAnswered([c.id]);
+  if (store.send(c)) return Promise.resolve();
+  return harnessApi.command(agent, c, commandId(c)).then(
+    () => {
+      if (c.type === "approve") markNotices([c.id], "done", [agent]);
+    },
+    (e: unknown) => {
+      if (c.type === "approve") unmark([c.id]);
+      toast.error("Couldn't reach the agent", errorMessage(e));
+    },
+  );
+}
+
+/** What says an agent's paused goals were resumed here, or the plan they wait on approved: its card's key (cards.ts). */
+export const heldKey = (a: { id: string; held?: { since: number } }) => (a.held ? `held:${a.id}:${a.held.since}` : "");
+
+/**
+ * What waits on you of agent `agent` (its card's `key`, cards.ts), dealt with here as `go` asks:
+ * shown so at once, back if it doesn't go (and thrown), and gone from your other devices once it has.
+ */
+export async function dealWith(key: string, agent: string, go: () => Promise<unknown>) {
+  markAnswered([key]);
+  try {
+    await go();
+  } catch (e) {
+    unmark([key]);
+    throw e;
+  }
+  markNotices([key], "done", [agent]);
+}
+
+/**
+ * The retries of what's asked of each card (its key, cards.ts), kept while its card is out of sight:
+ * dealt with here, a card goes at once and comes back new if it didn't go, and what it asks then is
+ * the same request under the same key (CP-T3.2), never a second one.
+ */
+const tries = new Map<string, Tries>();
+
+/** The key to ask `said` of the card under `card` with: the last try's, while it's the same. */
+export function tryKey(card: string, said: string): string {
+  let t = tries.get(card);
+  if (!t) {
+    t = new Tries(clientId);
+    tries.set(card, t);
+  }
+  return t.keyFor(said);
+}
+
+/** What was asked of the card under `card` went through: what's asked next is new. */
+export function tried(card: string) {
+  tries.delete(card);
+}
+
+/**
+ * Resume agent `a`'s paused goals, or approve the plan they wait on (`go` asks): its card gone and
+ * its row no longer waiting on you at once, wherever they show (`dealWith`).
+ */
+export async function resumeHeld(a: { id: string; held?: { since: number } }, go: () => Promise<unknown>) {
+  const key = heldKey(a);
+  if (key) await dealWith(key, a.id, go);
+}
+
 const subscribe = (l: () => void) => {
   listeners.add(l);
   return () => listeners.delete(l);
@@ -83,10 +157,16 @@ export function stillAsked<T extends { id: string }>(approvals: T[], done: Reado
 
 /**
  * An agent as it stands once what was answered here is taken: those requests gone, and one that
- * waited only on them working again (the same object when nothing changes).
+ * waited only on them working again; its goals no longer paused once resumed here (`resumeHeld`).
+ * The same object when nothing changes.
  */
-export function asAnswered<T extends { approvals: ApprovalBrief[]; status: string }>(a: T, done: ReadonlyMap<string, number>): T {
+export function asAnswered<T extends { id: string; approvals: ApprovalBrief[]; status: string; held?: { since: number } }>(a: T, done: ReadonlyMap<string, number>): T {
   const left = stillAsked(a.approvals, done);
-  if (left === a.approvals) return a;
-  return { ...a, approvals: left, status: left.length === 0 && a.status === "waiting" ? "running" : a.status };
+  const resumed = done.size > 0 && done.has(heldKey(a));
+  if (left === a.approvals && !resumed) return a;
+  // Working again: answered, it had only those to wait on; resumed, its goals go on.
+  const working = (left.length === 0 && a.status === "waiting") || (resumed && a.status === "idle");
+  const next = { ...a, approvals: left, status: working ? "running" : a.status };
+  if (resumed) delete next.held;
+  return next;
 }

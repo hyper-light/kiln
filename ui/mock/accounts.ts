@@ -464,7 +464,31 @@ export async function handleAccounts(req: http.IncomingMessage, res: http.Server
     return true;
   }
   if (p === "/api/harness/sessions" && m === "POST") {
-    json(res, 200, [demos.get("demo-claude")!.info]);
+    // Under the ids its page made (W21-R15), as the server starts them: after a moment, a runner's
+    // answer (MOCK_START_MS); refused as there already when one is. Asked with none, the Claude demo.
+    const b = await body<{ target?: string; spec?: { kind?: string; prompt?: string; name?: string; model?: string }; ids?: string[] }>(req);
+    const ids = b.ids ?? [];
+    if (ids.length === 0) {
+      json(res, 200, [demos.get("demo-claude")!.info]);
+      return true;
+    }
+    const taken = ids.find((id) => demos.has(id));
+    if (taken) {
+      json(res, 409, { error: `an agent ${taken} is there already, or starting` });
+      return true;
+    }
+    await new Promise((r) => setTimeout(r, Number(process.env.MOCK_START_MS ?? 600)));
+    const kind = b.spec?.kind ?? "claude";
+    const made = ids.map((id, i) => {
+      const d = demo(id, kind, b.target ?? "local", "", b.spec?.model || (kind === "claude" ? "claude-opus-5-5" : "gpt-5.5-codex"), b.spec?.prompt ?? "", "Invalid API key · Please run /login");
+      const name = b.spec?.name?.trim() || d.info.name;
+      d.info = { ...d.info, name: ids.length > 1 ? `${name} ${i + 1}` : name, created_at: Date.now(), last_activity: Date.now() };
+      if (!b.spec?.prompt) d.events = [];
+      demos.set(id, d);
+      emitEvent({ type: "harness", info: d.info });
+      return d.info;
+    });
+    json(res, 200, made);
     return true;
   }
   if (p === "/api/harness/sessions" && m === "GET") {

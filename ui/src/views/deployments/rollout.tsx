@@ -11,8 +11,10 @@ import { cdApi } from "@/api/cd";
 import type { CdCheckRun, CdRollout, CdRolloutStep } from "@/api/types";
 import { Button } from "@/components/ui/button";
 import { Confirm } from "@/components/ui/misc";
+import { useHold } from "@/lib/action";
+import { change } from "@/lib/resource";
 import { RelTime } from "@/views/shared";
-import { StatePair, shortRev } from "./parts";
+import { StatePair, appKey, shortRev } from "./parts";
 
 const TONE: Record<CdRollout["status"]["state"], string> = { running: "running", paused: "timed_out", succeeded: "succeeded", aborted: "failed", superseded: "skipped" };
 const WORD: Record<CdRollout["status"]["state"], string> = { running: "Rolling out", paused: "Paused", succeeded: "Rolled out", aborted: "Aborted", superseded: "Superseded" };
@@ -106,14 +108,13 @@ export function RolloutPanel({
   appId,
   appName,
   rollouts,
-  busy,
   onAct,
 }: {
   appId: string;
   appName: string;
   rollouts: CdRollout[];
-  busy: boolean;
-  onAct: (done: string, f: () => Promise<unknown>) => Promise<void>;
+  /** Does it and says how it went: true once it went. */
+  onAct: (done: string, f: () => Promise<unknown>) => Promise<boolean>;
 }) {
   const r = rollouts[0];
   const [open, setOpen] = React.useState(false);
@@ -132,30 +133,28 @@ export function RolloutPanel({
       </p>
     );
   }
-  return <Rollout key={r.id} appId={appId} appName={appName} r={r} busy={busy} onAct={onAct} onFold={done ? () => setOpen(false) : undefined} />;
+  return <Rollout key={r.id} appId={appId} appName={appName} r={r} onAct={onAct} onFold={done ? () => setOpen(false) : undefined} />;
 }
 
-function Rollout({
-  appId,
-  appName,
-  r,
-  busy,
-  onAct,
-  onFold,
-}: {
-  appId: string;
-  appName: string;
-  r: CdRollout;
-  busy: boolean;
-  onAct: (done: string, f: () => Promise<unknown>) => Promise<void>;
-  onFold?: () => void;
-}) {
+function Rollout({ appId, appName, r, onAct, onFold }: { appId: string; appName: string; r: CdRollout; onAct: (done: string, f: () => Promise<unknown>) => Promise<boolean>; onFold?: () => void }) {
   const [ask, setAsk] = React.useState<Ask>(null);
   const [reason, setReason] = React.useState("");
   const st = r.status;
   const over = st.state === "succeeded" || st.state === "aborted" || st.state === "superseded";
-  const call = (done: string, action: Parameters<typeof cdApi.rollout>[1], body: Parameters<typeof cdApi.rollout>[2] = {}) =>
-    onAct(done, () => cdApi.rollout(appId, action, { ...body, rollout: r.id })).then(() => setAsk(null));
+  // Its actions go one at a time: the button pressed says it's on its way, and the others wait until
+  // the rollout is read again with what it did (its state, its log); then the question it was asked
+  // from closes, unless another is open by then (W21-R15).
+  const hold = useHold();
+  const call = (control: string, done: string, action: Parameters<typeof cdApi.rollout>[1], body: Parameters<typeof cdApi.rollout>[2] = {}) =>
+    hold.change(control, () => {
+      const from = ask;
+      return onAct(done, async () => {
+        await cdApi.rollout(appId, action, { ...body, rollout: r.id });
+        const now = await cdApi.rollouts(appId);
+        change<typeof now>(`${appKey(appId)}rollout`, () => now);
+      }).then((ok) => ok && setAsk((cur) => (cur === from ? null : cur)));
+    });
+  const { doing, held } = hold;
   const why = [st.why, st.waiting, !r.ready && r.unready ? `green isn't ready: ${r.unready}` : ""].filter((x, i, all) => x && all.indexOf(x) === i);
   return (
     <section className="cd-rollout" data-state={st.state} aria-label="Rollout">
@@ -175,7 +174,10 @@ function Rollout({
       <Traffic r={r} />
       {r.preview_url && (
         <p className="cd-meta cd-rollout-preview">
-          Green's preview: <a href={r.preview_url} target="_blank" rel="noreferrer">{r.preview_url}</a>
+          Green's preview:{" "}
+          <a href={r.preview_url} target="_blank" rel="noreferrer">
+            {r.preview_url}
+          </a>
         </p>
       )}
       {r.waiting.length > 0 && (
@@ -186,10 +188,16 @@ function Rollout({
                 <strong>{c}</strong> waits for your approval to go on.
               </span>
               <span className="cd-fix-acts">
-                <Button size="xs" onClick={() => call(`Approved ${c}.`, "approve", { check: c })} disabled={busy}>
+                <Button size="xs" onClick={() => call(`approve:${c}`, `Approved ${c}.`, "approve", { check: c })} pending={doing(`approve:${c}`)} disabled={held(`approve:${c}`)}>
                   Approve
                 </Button>
-                <Button size="xs" variant="secondary" onClick={() => call(`Denied ${c}: the rollout aborts.`, "deny", { check: c })} disabled={busy}>
+                <Button
+                  size="xs"
+                  variant="secondary"
+                  onClick={() => call(`deny:${c}`, `Denied ${c}: the rollout aborts.`, "deny", { check: c })}
+                  pending={doing(`deny:${c}`)}
+                  disabled={held(`deny:${c}`)}
+                >
                   Deny
                 </Button>
               </span>
@@ -207,28 +215,28 @@ function Rollout({
       <div className="cd-actions">
         {!over && (
           <>
-            <Button size="xs" onClick={() => call("Promoted.", "promote")} disabled={busy} title="Past the step it waits at">
+            <Button size="xs" onClick={() => call("promote", "Promoted.", "promote")} pending={doing("promote")} disabled={held("promote")} title="Past the step it waits at">
               Promote
             </Button>
-            <Button size="xs" variant="secondary" onClick={() => setAsk(ask === "full" ? null : "full")} aria-expanded={ask === "full"} disabled={busy}>
+            <Button size="xs" variant="secondary" onClick={() => setAsk(ask === "full" ? null : "full")} aria-expanded={ask === "full"} pending={doing("full")}>
               Promote fully…
             </Button>
             {st.held ? (
-              <Button size="xs" variant="secondary" onClick={() => call("Resumed.", "resume")} disabled={busy}>
+              <Button size="xs" variant="secondary" onClick={() => call("resume", "Resumed.", "resume")} pending={doing("resume")} disabled={held("resume")}>
                 Resume
               </Button>
             ) : (
-              <Button size="xs" variant="secondary" onClick={() => call("Paused: traffic stays where it is.", "pause")} disabled={busy}>
+              <Button size="xs" variant="secondary" onClick={() => call("pause", "Paused: traffic stays where it is.", "pause")} pending={doing("pause")} disabled={held("pause")}>
                 Pause
               </Button>
             )}
-            <Button size="xs" variant="ghost" onClick={() => setAsk(ask === "abort" ? null : "abort")} aria-expanded={ask === "abort"} disabled={busy}>
+            <Button size="xs" variant="ghost" onClick={() => setAsk(ask === "abort" ? null : "abort")} aria-expanded={ask === "abort"} pending={doing("abort")}>
               Abort…
             </Button>
           </>
         )}
         {st.state === "aborted" && (
-          <Button size="xs" variant="secondary" onClick={() => call("Rolling green out again, from the first step.", "retry")} disabled={busy}>
+          <Button size="xs" variant="secondary" onClick={() => call("retry", "Rolling green out again, from the first step.", "retry")} pending={doing("retry")} disabled={held("retry")}>
             Retry
           </Button>
         )}
@@ -238,7 +246,7 @@ function Rollout({
           label="Confirm"
           actions={
             <>
-              <Button size="xs" onClick={() => call("Promoted past every step: green takes all the traffic.", "promote", { full: true })} disabled={busy}>
+              <Button size="xs" onClick={() => call("full", "Promoted past every step: green takes all the traffic.", "promote", { full: true })} pending={doing("full")} disabled={held("full")}>
                 Promote fully
               </Button>
               <Button size="xs" variant="ghost" onClick={() => setAsk(null)}>
@@ -256,7 +264,13 @@ function Rollout({
           tone="danger"
           actions={
             <>
-              <Button size="xs" variant="danger" onClick={() => call("Aborted: traffic goes back to blue.", "abort", reason.trim() ? { reason: reason.trim() } : {})} disabled={busy}>
+              <Button
+                size="xs"
+                variant="danger"
+                onClick={() => call("abort", "Aborted: traffic goes back to blue.", "abort", reason.trim() ? { reason: reason.trim() } : {})}
+                pending={doing("abort")}
+                disabled={held("abort")}
+              >
                 Abort
               </Button>
               <Button size="xs" variant="ghost" onClick={() => setAsk(null)}>
@@ -305,8 +319,7 @@ function Traffic({ r }: { r: CdRollout }) {
           <i className="cd-traffic-key" data-side="blue" aria-hidden="true" /> Blue · {version(r.blue)} · {100 - w}%
         </span>
         <span>
-          <i className="cd-traffic-key" data-side="green" aria-hidden="true" /> Green · {version(r.green)} · {w}%
-          {r.status.target !== w && r.status.state === "running" ? ` → ${r.status.target}%` : ""}
+          <i className="cd-traffic-key" data-side="green" aria-hidden="true" /> Green · {version(r.green)} · {w}%{r.status.target !== w && r.status.state === "running" ? ` → ${r.status.target}%` : ""}
         </span>
       </div>
     </div>
@@ -320,8 +333,7 @@ function Steps({ r }: { r: CdRollout }) {
   return (
     <ol className="cd-rollout-steps" aria-label="Steps">
       {r.steps.map((s, i) => {
-        const at =
-          i < r.step || state === "succeeded" ? "done" : i === r.step && state === "aborted" ? "failed" : i === r.step && !finished ? "now" : "next";
+        const at = i < r.step || state === "succeeded" ? "done" : i === r.step && state === "aborted" ? "failed" : i === r.step && !finished ? "now" : "next";
         return (
           <li key={i} className="cd-rollout-step" data-at={at} aria-current={at === "now" ? "step" : undefined}>
             <span className="cd-rollout-n">{i + 1}</span>
@@ -342,7 +354,9 @@ function Checks({ runs, waiting }: { runs: CdCheckRun[]; waiting: string[] }) {
       {runs.map((c) => {
         const last = c.measurements[c.measurements.length - 1];
         const t = c.tally;
-        const counts = [t.passed && `${t.passed} passed`, t.failed && `${t.failed} failed`, t.inconclusive && `${t.inconclusive} inconclusive`, t.errors && `${t.errors} errors`].filter(Boolean).join(" · ");
+        const counts = [t.passed && `${t.passed} passed`, t.failed && `${t.failed} failed`, t.inconclusive && `${t.inconclusive} inconclusive`, t.errors && `${t.errors} errors`]
+          .filter(Boolean)
+          .join(" · ");
         return (
           <li key={c.name} className="cd-check" data-verdict={c.verdict ?? "measuring"}>
             <span className="cd-check-name">{c.name}</span>

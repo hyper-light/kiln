@@ -6,6 +6,7 @@ import { api } from "@/api/client";
 import type { Repo } from "@/api/types";
 import { Button } from "@/components/ui/button";
 import { Confirm, ErrorState, SelectField, TextField } from "@/components/ui/misc";
+import { useAction } from "@/lib/action";
 import { errorMessage } from "@/lib/hooks";
 
 export type Notice = { tone: "ok" | "fail"; text: string } | null;
@@ -16,16 +17,12 @@ export function AddRepoForm({ onAdded, onCancel }: { onAdded: (r: Repo) => void;
   const [cloneUrl, setCloneUrl] = React.useState("");
   const [branches, setBranches] = React.useState("main");
   const [poll, setPoll] = React.useState("60");
-  const [busy, setBusy] = React.useState(false);
   const [err, setErr] = React.useState<string | null>(null);
   const valid = /^[\w.-]+\/[\w.-]+$/.test(name.trim());
 
-  const submit = async (e: React.FormEvent) => {
-    e.preventDefault();
-    if (!valid) return;
-    setBusy(true);
-    setErr(null);
-    try {
+  const [add, adding] = useAction(
+    async () => {
+      setErr(null);
       const repo = await api.addRepo({
         name: name.trim(),
         clone_url: cloneUrl.trim() || undefined,
@@ -36,26 +33,32 @@ export function AddRepoForm({ onAdded, onCancel }: { onAdded: (r: Repo) => void;
         poll_seconds: Number(poll) > 0 ? Number(poll) : undefined,
       });
       onAdded(repo);
-    } catch (e2) {
-      setErr(errorMessage(e2));
-    } finally {
-      setBusy(false);
-    }
+    },
+    (e) => setErr(errorMessage(e)),
+  );
+  const submit = (e: React.FormEvent) => {
+    e.preventDefault();
+    if (valid) add();
   };
 
   return (
     <form onSubmit={submit} aria-label="Add a repository" className="mb-8 max-w-[640px] space-y-4 rounded-md border border-white/10 bg-[#0b0c0e] p-4">
       <p className="text-[12.5px] leading-relaxed text-[#aab3c1]">kiln polls GitHub for new commits on the listed branches, and for pull requests.</p>
       <TextField label="Repository" placeholder="hyper-light/hyper-raft" value={name} onChange={(e) => setName(e.target.value)} autoFocus hint="owner/name on GitHub" />
-      <TextField label="Clone URL (optional)" placeholder={name ? `https://github.com/${name.trim()}.git` : "https://github.com/owner/name.git"} value={cloneUrl} onChange={(e) => setCloneUrl(e.target.value)} />
+      <TextField
+        label="Clone URL (optional)"
+        placeholder={name ? `https://github.com/${name.trim()}.git` : "https://github.com/owner/name.git"}
+        value={cloneUrl}
+        onChange={(e) => setCloneUrl(e.target.value)}
+      />
       <div className="grid grid-cols-[1fr_120px] gap-3">
         <TextField label="Branches" placeholder="main, release/*" value={branches} onChange={(e) => setBranches(e.target.value)} hint="Comma-separated; globs allowed" />
         <TextField label="Poll (s)" type="number" min={10} value={poll} onChange={(e) => setPoll(e.target.value)} />
       </div>
       {err && <ErrorState error={err} compact />}
       <div className="flex gap-2">
-        <Button type="submit" size="sm" disabled={!valid || busy}>
-          {busy ? "Adding…" : "Add repository"}
+        <Button type="submit" size="sm" disabled={!valid} pending={adding}>
+          {adding ? "Adding…" : "Add repository"}
         </Button>
         <Button type="button" size="sm" variant="ghost" onClick={onCancel}>
           Cancel
@@ -72,14 +75,12 @@ export function RunForm({ repo, onCancel, onNotice }: { repo: Repo; onCancel: ()
   const [branch, setBranch] = React.useState(concrete[0] ?? "");
   const [custom, setCustom] = React.useState("");
   const [pipeline, setPipeline] = React.useState("");
-  const [busy, setBusy] = React.useState(false);
   const [err, setErr] = React.useState<string | null>(null);
 
-  const submit = async (e: React.FormEvent) => {
-    e.preventDefault();
-    setBusy(true);
-    setErr(null);
-    try {
+  // It waits for its run, to open it (W21-R15): one refused says why here, with what was picked still in place.
+  const [start, starting] = useAction(
+    async () => {
+      setErr(null);
       const b = (branch === "__custom" ? custom : branch).trim();
       const runs = await api.triggerRepo(repo.id, { branch: b || undefined, pipeline: pipeline.trim() || undefined });
       const first = runs[0];
@@ -87,13 +88,14 @@ export function RunForm({ repo, onCancel, onNotice }: { repo: Repo; onCancel: ()
         onNotice({ tone: "ok", text: `Nothing to run: no pipeline of ${repo.name} matched that branch.` });
         onCancel();
       } else {
-        navigate(`/runs/${first.id}`);
+        await navigate(`/runs/${first.id}`);
       }
-    } catch (e2) {
-      setErr(errorMessage(e2));
-    } finally {
-      setBusy(false);
-    }
+    },
+    (e) => setErr(errorMessage(e)),
+  );
+  const submit = (e: React.FormEvent) => {
+    e.preventDefault();
+    start();
   };
 
   return (
@@ -111,8 +113,8 @@ export function RunForm({ repo, onCancel, onNotice }: { repo: Repo; onCancel: ()
       {branch === "__custom" && <TextField label="Branch name" value={custom} onChange={(e) => setCustom(e.target.value)} placeholder="feature/xyz" autoFocus />}
       {err && <ErrorState error={err} compact />}
       <div className="flex gap-2">
-        <Button type="submit" size="sm" disabled={busy || (branch === "__custom" && !custom.trim())}>
-          <Play /> {busy ? "Starting…" : "Start run"}
+        <Button type="submit" size="sm" disabled={branch === "__custom" && !custom.trim()} pending={starting}>
+          <Play /> {starting ? "Starting…" : "Start run"}
         </Button>
         <Button type="button" size="sm" variant="ghost" onClick={onCancel}>
           Cancel
@@ -124,8 +126,15 @@ export function RunForm({ repo, onCancel, onNotice }: { repo: Repo; onCancel: ()
 
 /** Deleting a repository, confirmed under its row. */
 export function DeleteRepo({ repo, onCancel, onDeleted }: { repo: Repo; onCancel: () => void; onDeleted: () => void }) {
-  const [busy, setBusy] = React.useState(false);
   const [err, setErr] = React.useState<string | null>(null);
+  const [remove, removing] = useAction(
+    async () => {
+      setErr(null);
+      await api.deleteRepo(repo.id);
+      onDeleted();
+    },
+    (e) => setErr(errorMessage(e)),
+  );
   return (
     <div className="py-2">
       <Confirm
@@ -133,23 +142,7 @@ export function DeleteRepo({ repo, onCancel, onDeleted }: { repo: Repo; onCancel
         tone="danger"
         actions={
           <>
-            <Button
-              size="sm"
-              variant="danger"
-              disabled={busy}
-              onClick={async () => {
-                setBusy(true);
-                setErr(null);
-                try {
-                  await api.deleteRepo(repo.id);
-                  onDeleted();
-                } catch (e) {
-                  setErr(errorMessage(e));
-                } finally {
-                  setBusy(false);
-                }
-              }}
-            >
+            <Button size="sm" variant="danger" pending={removing} onClick={remove}>
               Delete {repo.name}
             </Button>
             <Button size="sm" variant="ghost" onClick={onCancel}>

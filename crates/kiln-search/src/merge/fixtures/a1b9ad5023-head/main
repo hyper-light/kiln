@@ -1,0 +1,195 @@
+/**
+ * The agent page's head, in hyper-light.dev's figure-header voice: a mono eyebrow (where you are),
+ * the agent's name, a line of state, round controls; then how it runs — permissions, model, effort —
+ * as one line of words that opens in place to change them (no popups). Settings live in ⋯.
+ */
+import * as React from "react";
+import { Link, useNavigate } from "@/lib/router";
+import { ArrowLeft, MoreHorizontal, Pause, PencilLine, Power, RotateCcw, Search, SquareTerminal } from "lucide-react";
+import type { AgentInfo, Command, Meta, State, Status } from "@/api/harness";
+import { agentLabel, costText, hasOwnName, modelLabel, tildify } from "./derive";
+import { useListener } from "./dom";
+import { RoundButton } from "./figure/figure";
+import { LimitBadge, UsagePanel } from "./limits";
+import { machineName, StateWord } from "./parts";
+import { RunSettings } from "./run-settings";
+import { NameField, type useAgentActions } from "./actions";
+import "./console.css";
+
+export function AgentHeader({
+  info,
+  state,
+  meta,
+  status,
+  conn,
+  cwd,
+  actions,
+  send,
+  onUsage,
+  onSettings,
+  onBackground,
+  onFind,
+}: {
+  /** Find in the conversation. */
+  onFind?: () => void;
+  info: AgentInfo | null;
+  state: State | null;
+  meta: Meta | null;
+  status: Status;
+  conn: string;
+  cwd: string;
+  actions: ReturnType<typeof useAgentActions>;
+  send: (c: Command) => void;
+  /** Everything about the session's usage and status (the inspector's Tools). */
+  onUsage: () => void;
+  onSettings: () => void;
+  /** Show what it left running in the background. */
+  onBackground?: () => void;
+}) {
+  const navigate = useNavigate();
+  const features = meta?.features ?? [];
+  const sessionControls = (meta?.controls ?? []).filter((c) => (c.scope ?? "session") === "session").length;
+  const running = status === "running" || status === "waiting";
+  const activity = state?.activity ?? info?.activity;
+  const cost = state?.usage?.cost_usd ?? info?.cost_usd ?? 0;
+  const plan = state?.plan ?? info?.plan;
+  const approvals = state?.approvals ?? [];
+  const left = state?.left_behind ?? info?.left_behind ?? 0;
+  const openShell = info?.shell ? () => navigate(`/terminal?session=${encodeURIComponent(info.shell ?? "")}`) : null;
+  const extra = [...(openShell ? [{ label: "Open its shell", onSelect: openShell }] : []), ...(sessionControls > 0 ? [{ label: "Settings…", onSelect: onSettings }] : [])];
+  // Codex takes a new permission mode, model or effort from its next turn.
+  const nextTurn = info?.kind === "codex" ? { mode: true, model: true, effort: true } : undefined;
+  // The plan's limits open in place under the line, from the usage badge.
+  const limits = state?.limits ?? info?.limits ?? [];
+  const [usage, setUsage] = React.useState(false);
+  const usageId = React.useId();
+  useListener<KeyboardEvent>(
+    document,
+    "keydown",
+    (e) => {
+      if (e.key === "Escape") setUsage(false);
+    },
+    { on: usage },
+  );
+  // The kind is said beside a label that isn't the kind's own name.
+  const label = info ? agentLabel(info) : "Agent";
+  const named = Boolean(info && label.toLowerCase() !== info.kind_name.trim().toLowerCase());
+
+  return (
+    <header className="ag-head">
+      <div className="ag-top">
+        <div className="ag-id">
+          <p className="ag-eyebrow">
+            <Link to="/agents" className="ag-back">
+              <ArrowLeft size={12} aria-hidden="true" /> Agents
+            </Link>
+            <span aria-hidden="true">/</span>
+            {named && (
+              <>
+                <span>{info?.kind_name}</span>
+                <span aria-hidden="true">·</span>
+              </>
+            )}
+            {info && <span>{machineName(info.target)}</span>}
+          </p>
+          {actions.renaming && info ? (
+            <NameField value={hasOwnName(info) ? info.name : ""} placeholder={label} onSave={actions.rename} onDone={actions.stopRenaming} className="ag-title-field" label="Agent name" />
+          ) : (
+            <h1 className="ag-title">
+              {/* Says it can be renamed: a pencil after the name, and "Name it" while it has none of its own. */}
+              <button
+                type="button"
+                className="ag-title-btn"
+                onClick={actions.startRenaming}
+                disabled={!info}
+                aria-label={info && hasOwnName(info) ? `Rename ${label}` : `Name this agent (shown as ${label})`}
+              >
+                <span className={info && !hasOwnName(info) ? "ag-title-unnamed" : undefined}>{label}</span>
+                <span className="ag-rename" aria-hidden="true">
+                  <PencilLine size={13} />
+                  {info && !hasOwnName(info) && <span>Name it</span>}
+                </span>
+              </button>
+            </h1>
+          )}
+          <div className="ag-state">
+            <StateWord a={{ status, approvals }} />
+            {status === "running" && activity && <span className="ag-activity">{activity}</span>}
+            <span className="ag-cwd ag-wide-only" title={cwd}>
+              {tildify(cwd)}
+            </span>
+            {cost > 0 && (
+              <span className="ag-cost ag-wide-only" title={costText(cost, plan).title}>
+                {costText(cost, plan).text}
+              </span>
+            )}
+            {left > 0 && (
+              <button type="button" className="ag-left" onClick={onBackground}>
+                {left} left running
+              </button>
+            )}
+            <LimitBadge limits={limits} open={usage} controls={usageId} onClick={() => setUsage(!usage)} />
+            {conn === "reconnecting" && <span className="ag-warn">reconnecting…</span>}
+          </div>
+        </div>
+        <div className="ag-actions">
+          {running && features.includes("interrupt") && (
+            <RoundButton label="Stop the current turn" onClick={() => send({ type: "interrupt" })}>
+              <Pause size={15} aria-hidden="true" />
+            </RoundButton>
+          )}
+          {status === "exited" && features.includes("resume") && (
+            <RoundButton label="Restart" onClick={() => send({ type: "restart" })}>
+              <RotateCcw size={15} aria-hidden="true" />
+            </RoundButton>
+          )}
+          {onFind && (
+            <RoundButton label="Find in the conversation (Ctrl F)" onClick={onFind}>
+              <Search size={15} aria-hidden="true" />
+            </RoundButton>
+          )}
+          {openShell && (
+            <RoundButton label="Open its shell" className="ag-wide" onClick={openShell}>
+              <SquareTerminal size={15} aria-hidden="true" />
+            </RoundButton>
+          )}
+          <RoundButton label={actions.live ? "End the agent" : "Remove the agent"} tone="danger" className="ag-wide" onClick={actions.end}>
+            <Power size={15} aria-hidden="true" />
+          </RoundButton>
+          {actions.menu(
+            <RoundButton label={`More for ${info?.name ?? "this agent"}`}>
+              <MoreHorizontal size={16} aria-hidden="true" />
+            </RoundButton>,
+            extra,
+          )}
+        </div>
+      </div>
+      {usage && limits.length > 0 && (
+        <UsagePanel
+          id={usageId}
+          limits={limits}
+          plan={plan}
+          onMore={() => {
+            setUsage(false);
+            onUsage();
+          }}
+        />
+      )}
+      <RunSettings
+        className="ag-run"
+        modes={meta?.modes ?? []}
+        mode={state?.mode ?? info?.mode ?? ""}
+        onMode={features.includes("set_mode") ? (m) => send({ type: "set_mode", mode: m }) : undefined}
+        models={meta?.models ?? []}
+        model={state?.model ?? info?.model ?? ""}
+        onModel={features.includes("set_model") ? (m) => send({ type: "set_model", model: m }) : undefined}
+        modelLabel={modelLabel}
+        efforts={meta?.efforts ?? []}
+        effort={state?.effort ?? ""}
+        onEffort={features.includes("set_effort") || (meta?.efforts?.length ?? 0) > 0 ? (e) => send({ type: "set_effort", effort: e }) : undefined}
+        appliesNextTurn={nextTurn}
+        running={running}
+      />
+    </header>
+  );
+}

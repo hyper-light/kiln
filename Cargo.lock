@@ -1835,6 +1835,8 @@ name = "hyper-rt"
 version = "0.1.0"
 dependencies = [
  "crc32c",
+ "crossbeam-deque",
+ "hyper-measure",
  "libc",
  "loom",
  "pin-project-lite",
@@ -2272,6 +2274,9 @@ dependencies = [
  "kiln-seams",
  "kiln-search",
  "kiln-sim",
+ "mantle-client",
+ "mantle-protocol",
+ "mantle-s3",
  "memchr",
  "mime_guess",
  "nix 0.31.3",
@@ -2393,6 +2398,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "kiln-lab"
+version = "0.2.0"
+dependencies = [
+ "anyhow",
+ "clap",
+ "hex",
+ "serde",
+ "serde_json",
+ "sha2 0.11.1",
+]
+
+[[package]]
 name = "kiln-obs"
 version = "0.2.0"
 dependencies = [
@@ -2449,6 +2466,7 @@ dependencies = [
  "memchr",
  "parking_lot",
  "postcard",
+ "proptest",
  "rayon",
  "regex",
  "serde",
@@ -2609,6 +2627,57 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ecbdfe44b1bd960b68170b417450a628c43f7cf56bb3c5317e61cb230ee7f226"
 dependencies = [
  "twox-hash",
+]
+
+[[package]]
+name = "mantle-client"
+version = "0.1.0"
+dependencies = [
+ "getrandom 0.4.3",
+ "hyper-rt",
+ "hyper-rt-transport",
+ "hyper-transport",
+ "mantle-protocol",
+ "mantle-s3",
+ "thiserror 2.0.21",
+]
+
+[[package]]
+name = "mantle-codec"
+version = "0.1.0"
+
+[[package]]
+name = "mantle-crc"
+version = "0.1.0"
+dependencies = [
+ "crc-fast",
+]
+
+[[package]]
+name = "mantle-protocol"
+version = "0.1.0"
+dependencies = [
+ "hyper-rt-transport",
+ "hyper-timing",
+ "hyper-transport",
+ "mantle-codec",
+ "mantle-s3",
+ "thiserror 2.0.21",
+]
+
+[[package]]
+name = "mantle-s3"
+version = "0.1.0"
+dependencies = [
+ "aws-lc-rs",
+ "base64 0.23.1",
+ "getrandom 0.4.3",
+ "mantle-crc",
+ "memchr",
+ "thiserror 2.0.21",
+ "twox-hash",
+ "unicode-general-category",
+ "zeroize",
 ]
 
 [[package]]
@@ -4855,6 +4924,12 @@ name = "unicase"
 version = "2.10.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "357cc3acc6a036009fd6c973ed009037c732d60d0b4f6c673e9041497482a28f"
+
+[[package]]
+name = "unicode-general-category"
+version = "1.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "0b993bddc193ae5bd0d623b49ec06ac3e9312875fdae725a975c51db1cc1677f"
 
 [[package]]
 name = "unicode-ident"

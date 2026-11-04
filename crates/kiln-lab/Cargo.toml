@@ -1,0 +1,19 @@
+[package]
+name = "kiln-lab"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "kiln's load lab: realistic kiln use against any build of kiln, and A/B between two (docs/runtime-lab.md)."
+
+# The lab drives kiln as a person, its agents and its runners do, over HTTP, WebSockets and the
+# runners' own link, so it depends on no build of kiln: any two builds are measured by the same lab.
+[dependencies]
+anyhow = "1.0.104"
+clap = { version = "4.6.7", features = ["derive"] }
+hex = "0.4.3"
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.154"
+sha2 = "0.11.1"
+
+[lints]
+workspace = true

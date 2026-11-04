@@ -19,6 +19,7 @@ import { clientId, harnessApi, type GoalItem, type GoalStack, type SessionStore 
 import { Button } from "@/components/ui/button";
 import { toast } from "@/components/ui/toast";
 import { Loadable } from "@/components/ui/loading";
+import { sendingProps, useHold } from "@/lib/action";
 import { harnessSessionsRes, useLabels, useRes } from "@/lib/data";
 import { relativeTime } from "@/lib/format";
 import { ApiError } from "@/api/client";
@@ -275,6 +276,22 @@ function sentWords(g: GoalItem): string {
  */
 const reads = stackReads(() => performance.now());
 
+/** A goal added here, shown before the server has it: its id until then. */
+const ADDING = "adding:";
+
+/** The stack run on, as the server does it (goals/mod.rs `run_from_here`): running, its pause and why gone, its goal under way to be sent afresh. */
+const started = (s: GoalStack): GoalStack => ({
+  ...s,
+  state: "running",
+  reason: undefined,
+  resume_at: undefined,
+  held_for: undefined,
+  items: s.items.map((i) => (i.status === "active" ? { ...i, reminded_at: undefined, reminders: undefined } : i)),
+});
+
+/** Why a stack you paused is paused, as the server says it (goals/mod.rs `PAUSED_BY_YOU`). */
+const PAUSED_BY_YOU = "Paused by you: the agent isn't held to its goal (its own goal is cleared) until you resume.";
+
 function readGoals(agent: string): Promise<{ stack: GoalStack | null; error: unknown }> {
   const took = reads.ask(agent);
   return harnessApi.goals(agent).then(
@@ -361,7 +378,6 @@ function GoalPanel({
   const [editing, setEditing] = React.useState<{ text: string; goals: GoalItem[] } | null>(null);
   const [asking, setAsking] = React.useState(false);
   const [earlier, setEarlier] = React.useState(false);
-  const [busy, setBusy] = React.useState(false);
   const [error, setError] = React.useState<string | null>(null);
   const items = stack?.items ?? [];
   // The stack's own goals: their parts are drawn under them, as their steps.
@@ -405,44 +421,91 @@ function GoalPanel({
     asks.done();
     return s;
   };
-  const act = async (f: () => Promise<GoalStack>) => {
-    setBusy(true);
+  const failed = (e: unknown) => setError(errorMessage(e));
+  // One change to the stack at a time (W21-R15): the control pressed says it's on its way and the
+  // stack's other controls wait for its answer, so answers come back in the order asked and each try
+  // keeps its key (CP-T3.2). Add's field stays free to type the next goal in.
+  const hold = useHold(failed);
+  const act = hold.change;
+  /** A control that changes the stack as `whats` do: one of them on its way, it says so; another change, it waits. */
+  const stackControl = (...whats: string[]) => {
+    const mine = whats.some((w) => hold.doing(w));
+    return { pending: mine, disabled: hold.going && !mine };
+  };
+  /**
+   * A change whose next stack is known: shown at once (`next` makes it of the stack shown), then
+   * asked for. The stack the server answers shows once it comes; if it doesn't go, the stack is back
+   * as it was, saying why, unless what shows since is the server's own. Whether it went.
+   */
+  const change = async (next: (s: GoalStack) => GoalStack, ask: () => Promise<GoalStack>) => {
+    const was = stack;
+    const shown = was ? next(was) : null;
     setError(null);
+    if (shown) onStack?.(shown);
+    const back = reads.sending(agent);
     try {
-      const s = await f();
+      const s = await ask();
+      back();
       onStack?.(s);
       return true;
     } catch (e) {
-      setError(errorMessage(e));
+      back();
+      if (was && reads.last(agent) === shown) onStack?.(was);
+      failed(e);
       return false;
-    } finally {
-      setBusy(false);
     }
   };
-  const add = async () => {
+  /** A change whose next stack is the server's to say (which goal goes next, what comes back): shown once it answers. */
+  const asked = async (ask: () => Promise<GoalStack>) => {
+    setError(null);
+    onStack?.(await ask());
+  };
+  const add = () => {
     const text = adding.trim();
     if (!text) return;
-    // A stack that was done goes on with it. Asked again (its answer lost, or it failed), the
-    // same goal under its key, never a second: the key is for what was asked, not for the stack,
-    // which the first try may have changed.
-    const start = stack?.state === "done";
-    const key = tries.keyFor(JSON.stringify({ agent, text }));
-    if (await act(() => harnessApi.addGoals(agent, [text], start, key))) {
-      tries.done();
+    act("add", () => {
+      // A stack that was done goes on with it. Asked again (its answer lost, or it failed), the
+      // same goal under its key, never a second: the key is for what was asked, not for the stack,
+      // which the first try may have changed.
+      const start = stack?.state === "done";
+      const key = tries.keyFor(JSON.stringify({ agent, text }));
+      // On the stack at once, the field free for the next; back in the field if it doesn't go and
+      // nothing was typed there since.
       setAdding("");
-    }
+      return change(
+        (s) => {
+          const more = { ...s, items: [...s.items, { id: `${ADDING}${key}`, text, status: "pending" as const }] };
+          return start ? started(more) : more;
+        },
+        () => harnessApi.addGoals(agent, [text], start, key),
+      ).then((went) => {
+        if (went) tries.done();
+        else setAdding((t) => t || text);
+      });
+    });
   };
   const saveEdit = async () => {
     if (editing === null) return;
+    setError(null);
     const { goals, dropped } = fromLines(editing.text, editing.goals);
-    if (
-      await act(async () => {
-        const s = await harnessApi.setGoals(agent, goals);
-        // The goal under way, its line taken out: skipped, if it's still the one under way.
-        return dropped && s.items.some((i) => i.id === dropped.id && i.status === "active") ? control("skip", dropped.id) : s;
-      })
-    )
-      setEditing(null);
+    const s = await harnessApi.setGoals(agent, goals);
+    // The goal under way, its line taken out: skipped, if it's still the one under way.
+    onStack?.(dropped && s.items.some((i) => i.id === dropped.id && i.status === "active") ? await control("skip", dropped.id) : s);
+    // Saved, the box closes, unless it was put away and opened again meanwhile.
+    setEditing((cur) => (cur?.goals === editing.goals ? null : cur));
+  };
+  const tryAgain = async () => {
+    if (!unmet) return;
+    setError(null);
+    await harnessApi.setGoals(agent, [{ text: unmet.text }, ...pending.map((p) => ({ id: p.id, text: p.text }))]);
+    onStack?.(await control("start"));
+  };
+  const planIt = async (goal: string) => {
+    setError(null);
+    const r = await harnessApi.planGoal(agent, goal);
+    if (r.dispatched) toast({ title: "A subagent is planning it now", tone: "running" });
+    else if (r.why) toast({ title: "Not planned now", description: r.why, tone: "info" });
+    onStack?.(await harnessApi.goals(agent));
   };
 
   // Not read yet (the stand-in while it loads), or it couldn't be: not "no goals", which it may have.
@@ -484,13 +547,21 @@ function GoalPanel({
             Until then kiln keeps it on the goal: whenever it stops short, or loses the goal when it starts again, kiln sends it again.
           </p>
           {/* Big goals planned first (docs/goals.md): a person's setting, on unless turned off. */}
-          <label className="gs-option">
+          <label className="gs-option" {...sendingProps(hold.doing("plan_big"))}>
             <input
               type="checkbox"
               className="check"
               checked={stack?.plan_big ?? true}
-              disabled={busy}
-              onChange={(e) => void act(() => harnessApi.goalSettings(agent, { plan_big: e.target.checked }))}
+              disabled={stackControl("plan_big").disabled}
+              onChange={(e) => {
+                const plan_big = e.target.checked;
+                act("plan_big", () =>
+                  change(
+                    (s) => ({ ...s, plan_big }),
+                    () => harnessApi.goalSettings(agent, { plan_big }),
+                  ),
+                );
+              }}
             />
             <span>
               Plan big goals first
@@ -522,7 +593,7 @@ function GoalPanel({
                 />
               </div>
               <div className="gs-actions">
-                <Button size="sm" disabled={busy} onClick={() => void saveEdit()}>
+                <Button size="sm" {...stackControl("save")} onClick={() => act("save", saveEdit)}>
                   Save goals
                 </Button>
                 <Button size="sm" variant="ghost" onClick={() => setEditing(null)}>
@@ -553,19 +624,7 @@ function GoalPanel({
                     const planning = planner?.kind === "asked" || planner?.kind === "planning";
                     // A goal of its own still to go becomes a plan, planned now by a subagent of its agent's; one being planned, its planning waiting its turn, too; one whose subagent stopped short, again.
                     const planButton = (canPlan(g) || (canPlanNow(g, items) && !planning)) && (
-                      <Button
-                        size="xs"
-                        variant="secondary"
-                        disabled={busy}
-                        onClick={() =>
-                          void act(async () => {
-                            const r = await harnessApi.planGoal(agent, g.id);
-                            if (r.dispatched) toast({ title: "A subagent is planning it now", tone: "running" });
-                            else if (r.why) toast({ title: "Not planned now", description: r.why, tone: "info" });
-                            return harnessApi.goals(agent);
-                          })
-                        }
-                      >
+                      <Button size="xs" variant="secondary" {...stackControl(`plan:${g.id}`)} onClick={() => act(`plan:${g.id}`, () => planIt(g.id))}>
                         <ListTree aria-hidden="true" /> {canPlan(g) ? "Make a plan" : planner?.kind === "ended" ? "Plan it again" : "Plan it now"}
                       </Button>
                     );
@@ -633,7 +692,7 @@ function GoalPanel({
                 className="gs-add"
                 onSubmit={(e) => {
                   e.preventDefault();
-                  void add();
+                  add();
                 }}
               >
                 <label className="sr-only" htmlFor={`gs-add-${agent}`}>
@@ -642,40 +701,45 @@ function GoalPanel({
                 <div className="field">
                   <input id={`gs-add-${agent}`} value={adding} placeholder={items.length ? "Add the next goal" : "Add a goal"} onChange={(e) => setAdding(e.target.value)} />
                 </div>
-                <Button size="sm" variant="secondary" type="submit" disabled={busy || !adding.trim() || !onStack}>
+                <Button size="sm" variant="secondary" type="submit" pending={hold.doing("add")} disabled={stackControl("add").disabled || !adding.trim() || !onStack}>
                   Add
                 </Button>
               </form>
               <p className="field-hint gs-hint">A condition it can meet, like &ldquo;the parser tests pass&rdquo;. A plan&rsquo;s steps go here too: run it as Goals.</p>
               {(items.length > 0 || cleared > 0) && (
                 <div className="gs-actions">
+                  {/* Start and Pause take turns in one place, which says so while either's change is on its way. Run on from
+                      its goal under way, the stack shows it at once; else which goal goes next is the server's to say. */}
                   {startWord && (
-                    <Button size="sm" disabled={busy} onClick={() => void act(() => control("start"))}>
+                    <Button size="sm" {...stackControl("run")} onClick={() => act("run", () => (active ? change(started, () => control("start")) : asked(() => control("start"))))}>
                       {startWord}
                     </Button>
                   )}
                   {unmet && (
-                    <Button
-                      size="sm"
-                      variant="secondary"
-                      disabled={busy}
-                      onClick={() =>
-                        void act(async () => {
-                          await harnessApi.setGoals(agent, [{ text: unmet.text }, ...pending.map((p) => ({ id: p.id, text: p.text }))]);
-                          return control("start");
-                        })
-                      }
-                    >
+                    <Button size="sm" variant="secondary" {...stackControl("again")} onClick={() => act("again", tryAgain)}>
                       Try it again
                     </Button>
                   )}
                   {stack?.state === "running" && (
-                    <Button size="sm" variant="secondary" disabled={busy} onClick={() => void act(() => control("pause"))}>
+                    <Button
+                      size="sm"
+                      variant="secondary"
+                      {...stackControl("run")}
+                      onClick={() =>
+                        act("run", () =>
+                          change(
+                            (s) => ({ ...s, state: "paused", reason: PAUSED_BY_YOU, resume_at: undefined, held_for: undefined }),
+                            () => control("pause"),
+                          ),
+                        )
+                      }
+                    >
                       Pause
                     </Button>
                   )}
+                  {/* Which goal goes next is the server's to say: shown once it answers. */}
                   {active && (
-                    <Button size="sm" variant="ghost" disabled={busy} onClick={() => void act(() => control("skip", active.id))}>
+                    <Button size="sm" variant="ghost" {...stackControl("skip")} onClick={() => act("skip", () => asked(() => control("skip", active.id)))}>
                       Skip this one
                     </Button>
                   )}
@@ -683,7 +747,6 @@ function GoalPanel({
                     <Button
                       size="sm"
                       variant="ghost"
-                      disabled={busy}
                       onClick={() => {
                         const goals = toGo(items);
                         setEditing({ text: goals.map((g) => g.text).join("\n"), goals });
@@ -692,8 +755,9 @@ function GoalPanel({
                       Edit
                     </Button>
                   )}
+                  {/* In Clear's place once it's pressed: it says the clear is on its way. */}
                   {cleared > 0 && (
-                    <Button size="sm" variant="secondary" disabled={busy} onClick={() => void act(() => control("restore"))}>
+                    <Button size="sm" variant="secondary" {...stackControl("restore", "clear")} onClick={() => act("restore", () => asked(() => control("restore")))}>
                       Bring back {cleared} cleared {cleared === 1 ? "goal" : "goals"}
                     </Button>
                   )}
@@ -703,10 +767,16 @@ function GoalPanel({
                       <Button
                         size="sm"
                         variant="danger"
-                        disabled={busy}
+                        {...stackControl("clear")}
                         onClick={() => {
                           setAsking(false);
-                          void act(() => control("clear"));
+                          // Every goal goes at once, kept to bring back (goals/mod.rs `clear`).
+                          act("clear", () =>
+                            change(
+                              (s) => ({ ...s, state: "paused", reason: undefined, resume_at: undefined, held_for: undefined, items: [], cleared: s.items.length }),
+                              () => control("clear"),
+                            ),
+                          );
                         }}
                       >
                         Clear

@@ -14,6 +14,7 @@ pub mod api;
 pub mod artifacts;
 pub mod checks;
 pub mod cli;
+pub mod custody;
 pub mod guard;
 pub mod images;
 pub mod kube;
@@ -233,6 +234,8 @@ pub struct Cd {
     pub repo_names: RwLock<HashMap<String, String>>,
     /// Rollouts on targets being driven (docs/cd-targets.md §5).
     pub rollouts: rollouts::Drivers,
+    /// What a sync applied, and what custody to production has looked at (docs/ci.md W27-R08).
+    pub custody: custody::Custody,
 }
 
 impl Cd {
@@ -1386,7 +1389,13 @@ impl Cd {
                                 // kiln's own Deployment: a guard watches the restart first.
                                 let guarded = if dry_run || cluster.as_ref() != apps::IN_CLUSTER { Ok(()) } else { this.before_self_apply(&object, &c).await };
                                 match guarded {
-                                    Ok(()) => c.apply(&object, &manager, dry_run).await.map(Some).map_err(|e| format!("{e:#}")),
+                                    Ok(()) => {
+                                        let answered = c.apply(&object, &manager, dry_run).await;
+                                        if let (false, Ok(answer)) = (dry_run, &answered) {
+                                            this.custody.applied(&object, answer, &manager);
+                                        }
+                                        answered.map(Some).map_err(|e| format!("{e:#}"))
+                                    }
                                     Err(e) => Err(format!("not deploying kiln itself without its guard: {e:#}")),
                                 }
                             }
@@ -1413,6 +1422,7 @@ impl Cd {
                     self.dirty.lock().insert(app);
                 }
                 Action::Record(r) => {
+                    custody::on_record(&self, &r);
                     if let kiln_cd::engine::Record::Started { app, op, revision, trigger, by, at_ms } = &r {
                         let s = guard::Started { op: *op, revision: revision.as_ref().map(|r| r.to_string()), trigger: trigger.as_str().to_owned(), by: by.clone(), at_ms: *at_ms };
                         self.started.lock().insert(app.to_string(), s);
@@ -1676,6 +1686,7 @@ pub async fn run(hub: Arc<Hub>) -> Result<()> {
         target_errors: Mutex::new(BTreeMap::new()),
         repo_names: RwLock::new(HashMap::new()),
         rollouts: rollouts::Drivers::default(),
+        custody: custody::Custody::default(),
     });
     *CD.write() = Some(cd.clone());
     // Apps kept in kiln, then the clusters they deploy to.
@@ -1687,6 +1698,7 @@ pub async fn run(hub: Arc<Hub>) -> Result<()> {
     crate::rt::spawn(cd.clone().dispatch(arx));
     crate::rt::spawn(cd.clone().poll_loop());
     crate::rt::spawn(cd.clone().flush_loop());
+    crate::rt::spawn(custody::run(cd.clone()));
     cd.resume_rollouts();
     // The store's changes (from this server or, later, other members) reach the registry.
     if let Some(changes) = changes {
@@ -1783,6 +1795,7 @@ impl Cd {
             target_errors: Mutex::new(BTreeMap::new()),
             repo_names: RwLock::new(HashMap::new()),
             rollouts: rollouts::Drivers::default(),
+            custody: custody::Custody::default(),
         });
         Ok((cd, t))
     }

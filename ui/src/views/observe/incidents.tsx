@@ -13,13 +13,13 @@ import { TableHold } from "@/components/ui/hold";
 import { Loadable } from "@/components/ui/loading";
 import { PageIntro, SelectField } from "@/components/ui/misc";
 import { Segmented } from "@/components/ui/tabs";
-import { toast } from "@/components/ui/toast";
+import { useAction } from "@/lib/action";
 import { useRes, warm, type Res } from "@/lib/data";
 import { formatDuration, relativeTime } from "@/lib/format";
-import { errorMessage, useFieldText } from "@/lib/hooks";
+import { useFieldText } from "@/lib/hooks";
 import { invalidate } from "@/lib/resource";
 import { Link, useNavigate } from "@/lib/router";
-import { ObserveNav, integrationsRes, useParam, useParams } from "./parts";
+import { HeldFields, ObserveNav, integrationsRes, useOpening, useParam, useParams } from "./parts";
 
 const PAGE = 50;
 
@@ -262,84 +262,82 @@ function DeclareDialog({ onClose }: { onClose: () => void }) {
   const [scope, setScope] = React.useState("");
   const [handles, setHandles] = React.useState<string[]>([]);
   const [note, setNote] = React.useState("");
-  const [busy, setBusy] = React.useState(false);
+  const form = [title, severity, commander, impacted, scope, handles, note];
+  const opening = useOpening(form);
   const ready = title.trim() !== "" && (!impacted || scope.trim() !== "");
-  const save = async () => {
-    setBusy(true);
-    try {
-      const i = await observeApi.declareIncident(
-        {
-          title: title.trim(),
-          severity,
-          customer_impacted: impacted,
-          ...(impacted ? { customer_impact_scope: scope.trim() } : {}),
-          notification_handles: handles.map((h) => ({ display_name: h, handle: `@${h}` })),
-          ...(note.trim() ? { initial_cells: [{ cell_type: "markdown" as const, content: { content: note.trim() } }] } : {}),
-        },
-        commander.trim() || undefined,
-      );
-      invalidate("observe/incidents");
-      navigate(`/observe/incidents/${i.attributes.public_id}`);
-    } catch (e) {
-      toast({ title: "Couldn't declare it", description: errorMessage(e), tone: "failed" });
-      setBusy(false);
-    }
-  };
+  const [save, saving] = useAction(async () => {
+    const i = await observeApi.declareIncident(
+      {
+        title: title.trim(),
+        severity,
+        customer_impacted: impacted,
+        ...(impacted ? { customer_impact_scope: scope.trim() } : {}),
+        notification_handles: handles.map((h) => ({ display_name: h, handle: `@${h}` })),
+        ...(note.trim() ? { initial_cells: [{ cell_type: "markdown" as const, content: { content: note.trim() } }] } : {}),
+      },
+      commander.trim() || undefined,
+    );
+    invalidate("observe/incidents");
+    if (opening.still(form)) await navigate(`/observe/incidents/${i.attributes.public_id}`);
+  }, "Couldn't declare it");
   return (
     <Dialog open onOpenChange={(o) => !o && onClose()}>
       <DialogContent title="Declare an incident" description="It starts active. The integrations you pick are told now, and again as its state or severity changes.">
         <form
+          ref={opening.ref}
           className="space-y-4"
           onSubmit={(e) => {
             e.preventDefault();
-            if (ready && !busy) void save();
+            if (ready) save();
           }}
         >
-          <div>
-            <label htmlFor="incident-title" className="field-label">
-              What is happening
-            </label>
-            <div className="field">
-              <input id="incident-title" value={title} onChange={(e) => setTitle(e.target.value)} placeholder="Checkout requests failing" maxLength={512} autoComplete="off" />
-            </div>
-          </div>
-          <div className="grid grid-cols-1 gap-4 sm:grid-cols-2">
-            <SelectField label="Severity" value={severity} onChange={setSeverity} options={SEVERITIES.map((s) => ({ value: s, label: s === "UNKNOWN" ? "Unknown" : s }))} />
+          <HeldFields held={saving}>
             <div>
-              <label htmlFor="incident-commander" className="field-label">
-                Commander (optional)
+              <label htmlFor="incident-title" className="field-label">
+                What is happening
               </label>
               <div className="field">
-                <input id="incident-commander" value={commander} onChange={(e) => setCommander(e.target.value)} placeholder="Who leads the response" autoComplete="off" />
+                <input id="incident-title" value={title} onChange={(e) => setTitle(e.target.value)} placeholder="Checkout requests failing" maxLength={512} autoComplete="off" />
               </div>
             </div>
-          </div>
-          <div>
-            <label className="flex items-center gap-2 text-[13px]">
-              <input type="checkbox" className="check" checked={impacted} onChange={(e) => setImpacted(e.target.checked)} /> Customers are impacted
-            </label>
-            {impacted && (
-              <div className="field mt-2">
-                <textarea aria-label="How customers are impacted" rows={2} value={scope} onChange={(e) => setScope(e.target.value)} placeholder="Every checkout fails with a 502" />
+            <div className="grid grid-cols-1 gap-4 sm:grid-cols-2">
+              <SelectField label="Severity" value={severity} onChange={setSeverity} options={SEVERITIES.map((s) => ({ value: s, label: s === "UNKNOWN" ? "Unknown" : s }))} />
+              <div>
+                <label htmlFor="incident-commander" className="field-label">
+                  Commander (optional)
+                </label>
+                <div className="field">
+                  <input id="incident-commander" value={commander} onChange={(e) => setCommander(e.target.value)} placeholder="Who leads the response" autoComplete="off" />
+                </div>
               </div>
-            )}
-          </div>
-          <Loadable label="the integrations" fallback={null}>
-            <Handles value={handles} onChange={setHandles} />
-          </Loadable>
-          <div>
-            <label htmlFor="incident-note" className="field-label">
-              A first note (optional, Markdown)
-            </label>
-            <div className="field">
-              <textarea id="incident-note" rows={3} value={note} onChange={(e) => setNote(e.target.value)} placeholder="What is known so far" />
             </div>
-          </div>
+            <div>
+              <label className="flex items-center gap-2 text-[13px]">
+                <input type="checkbox" className="check" checked={impacted} onChange={(e) => setImpacted(e.target.checked)} /> Customers are impacted
+              </label>
+              {impacted && (
+                <div className="field mt-2">
+                  <textarea aria-label="How customers are impacted" rows={2} value={scope} onChange={(e) => setScope(e.target.value)} placeholder="Every checkout fails with a 502" />
+                </div>
+              )}
+            </div>
+            <Loadable label="the integrations" fallback={null}>
+              <Handles value={handles} onChange={setHandles} />
+            </Loadable>
+            <div>
+              <label htmlFor="incident-note" className="field-label">
+                A first note (optional, Markdown)
+              </label>
+              <div className="field">
+                <textarea id="incident-note" rows={3} value={note} onChange={(e) => setNote(e.target.value)} placeholder="What is known so far" />
+              </div>
+            </div>
+          </HeldFields>
           <div className="flex justify-end gap-2">
             <Button type="button" variant="ghost" onClick={onClose}>
               Cancel
             </Button>
-            <Button type="submit" disabled={!ready || busy}>
+            <Button type="submit" disabled={!ready} pending={saving}>
               Declare
             </Button>
           </div>

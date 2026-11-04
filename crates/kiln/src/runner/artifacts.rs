@@ -27,6 +27,8 @@ pub struct Service<'a> {
     pub token: &'a str,
     pub run: &'a str,
     pub job: &'a str,
+    /// kiln's root (DER), which its hand-ons of what it serves chain to (docs/ci.md W27-R08).
+    pub root: Option<Vec<u8>>,
 }
 
 impl Service<'_> {
@@ -265,7 +267,8 @@ pub async fn download(svc: &Service<'_>, temp: &Path, d: &Download) -> anyhow::R
     let one = d.name.is_some() || all.len() == 1;
     for a in all {
         let name = a.get("name").and_then(Value::as_str).unwrap_or_default().to_owned();
-        let signed = svc.call("GetSignedArtifactURL", json!({ "name": name })).await?;
+        // kiln's hand-on of it to this runner process too, asked for (docs/ci.md W27-R08).
+        let signed = svc.call("GetSignedArtifactURL", json!({ "name": name, "kiln_custody": true })).await?;
         let url = signed.get("signed_url").and_then(Value::as_str).ok_or_else(|| anyhow::anyhow!("{name}: no download URL"))?.to_owned();
         let file = temp.join(format!("kiln-download-{}.zip", crate::util::new_id()));
         let got = fetch(svc, &url, &file).await;
@@ -276,6 +279,14 @@ pub async fn download(svc: &Service<'_>, temp: &Path, d: &Download) -> anyhow::R
                 return Err(e.context(format!("downloading {name}")));
             }
         };
+        // Used only if it's what kiln handed on; else the break is recorded at that hop.
+        if let Some(h) = signed.get("hand_on").filter(|h| !h.is_null()) {
+            let what = crate::runner::signed::thing(format!("artifact/{name}"), [("sha256", digest.clone())]);
+            if let Err(why) = crate::runner::signed::check_handed(svc.job, h.clone(), svc.root.as_deref(), what) {
+                let _ = std::fs::remove_file(&file);
+                anyhow::bail!("{name} {why}: the leg doesn't take it (docs/ci.md W27-R08)");
+            }
+        }
         if let Some(want) = a.get("digest").and_then(Value::as_str).and_then(|d| d.strip_prefix("sha256:"))
             && !want.eq_ignore_ascii_case(&digest)
         {

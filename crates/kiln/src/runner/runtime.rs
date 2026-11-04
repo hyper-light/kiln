@@ -951,7 +951,29 @@ impl Leg {
         if let Some(until) = super::kept::ended(&job, ws, keep).await {
             self.event(&JobEventV2::Kept { until }).await;
         }
+        self.pushed_images().await;
         JobResult { job, status, exit_code: None, error, peak_rss: None, cpu_seconds: None }
+    }
+
+    /// The images this leg's token pushed to kiln's registry, as kiln kept them (`/_kiln/pushed`),
+    /// handed on with what the leg made (docs/ci.md W27-R08; the Transfers plan's step 11): each
+    /// by its repository and digest, so kiln's receipt of the leg's hand-on takes custody of them.
+    /// None from a server from before (it doesn't answer that).
+    async fn pushed_images(&self) {
+        let url = format!("{}/_kiln/pushed", self.a.runtime.results_url.trim_end_matches('/'));
+        let asked = self.http.get(&url).bearer(&self.a.runtime.runtime_token).timeout(Duration::from_secs(20)).send().await;
+        let Ok(r) = asked.inspect_err(|e| tracing::debug!(leg = %self.a.job_id, error = %format!("{e:#}"), "kiln wasn't asked what the leg pushed")) else { return };
+        if !r.is_success() {
+            return;
+        }
+        let Ok(v) = r.json::<serde_json::Value>(1 << 20).await else { return };
+        for p in v.get("pushed").and_then(serde_json::Value::as_array).into_iter().flatten() {
+            let repo = p.get("repo").and_then(serde_json::Value::as_str);
+            let hex = p.get("digest").and_then(serde_json::Value::as_str).and_then(|d| d.strip_prefix("sha256:"));
+            if let (Some(repo), Some(hex)) = (repo, hex) {
+                crate::runner::signed::handed_on(&self.a.job_id, crate::runner::signed::thing(format!("image {repo}"), [("sha256", hex.to_owned())]));
+            }
+        }
     }
 
     /// A leg whose job keeps a warm workspace (`work: { warm }`, W24-R11) leases one of its lane's
@@ -1723,7 +1745,9 @@ impl Leg {
         anyhow::ensure!(ws.starts_with(&st.layout.workspace) && !c.path.split(['/', '\\']).any(|p| p == ".."), "`path` must stay inside the workspace");
         let remote = format!("{}/{}", st.server_url.trim_end_matches('/'), a.repo);
         let token = a.runtime.github_token.clone();
-        if crate::rt::blocking(|| crate::os::have("git")).await.unwrap_or(false) {
+        // A test build's `no_git`: as on a machine without git, the tarball.
+        let no_git = crate::runner::chaos::get().is_some_and(|c| c.no_git);
+        if !no_git && crate::rt::blocking(|| crate::os::have("git")).await.unwrap_or(false) {
             // The token rides in git's environment config, never on a command line.
             let header = format!("AUTHORIZATION: basic {}", base64::engine::general_purpose::STANDARD.encode(format!("x-access-token:{token}")));
             let w = ws.to_string_lossy().to_string();
@@ -1860,14 +1884,37 @@ impl Leg {
             self.note(idx, &format!("The server didn't answer; trying again in {}s", wait.as_secs())).await;
             crate::rt::sleep(wait).await;
         };
+        let hand_on = Self::hand_on_of(&resp);
         let mut bytes = Vec::new();
         while let Some(c) = resp.chunk().await? {
             bytes.extend_from_slice(&c);
             anyhow::ensure!(bytes.len() < 8 << 30, "the commit is over 8 GiB");
         }
         let sha256 = crate::util::sha256_hex(&bytes);
+        // kiln's hand-on of the tarball (W27-R08): the leg runs on these bytes only if they're the
+        // ones kiln handed on, before any step; else the break is recorded at that hop.
+        if let Some(h) = hand_on {
+            let mut what = crate::runner::signed::thing("checkout", [("sha256", sha256.clone())]);
+            what.annotations.insert("commit".into(), sha.clone().into());
+            if let Err(why) = crate::runner::signed::check_handed(&self.a.job_id, h, self.kilns_root().as_deref(), what) {
+                anyhow::bail!("the commit's tarball {why}: the leg doesn't run on it (docs/ci.md W27-R08)");
+            }
+        }
         crate::rt::blocking(move || unpack_tree(&bytes, &ws)).await??;
         Ok(Got::Tarball(sha256))
+    }
+
+    /// kiln's root as this leg's runner trusts it (DER), which kiln's hand-ons chain to; none when
+    /// it hasn't one.
+    fn kilns_root(&self) -> Option<Vec<u8>> {
+        self.a.runtime.server_ca.as_deref().and_then(|pem| crate::pki::der_of(pem).ok())
+    }
+
+    /// The hand-on kiln said with what it served (`Kiln-Custody-Hand-On`, a bundle in base64).
+    fn hand_on_of(resp: &crate::http::client::Response) -> Option<serde_json::Value> {
+        use base64::Engine as _;
+        let text = base64::engine::general_purpose::STANDARD.decode(resp.header(crate::ci::signed::HAND_ON_HEADER)?).ok()?;
+        serde_json::from_slice(&text).ok()
     }
 
     /// Starts `step` in the background when it says so (W06-R17): on a copy of the leg's state,
@@ -3596,12 +3643,20 @@ impl Leg {
         if !resp.is_success() {
             anyhow::bail!("downloading {}@{}: HTTP {}", r.repo, r.sha, resp.status());
         }
+        let hand_on = Self::hand_on_of(&resp);
         let mut bytes = Vec::new();
         while let Some(c) = resp.chunk().await? {
             bytes.extend_from_slice(&c);
             anyhow::ensure!(bytes.len() < 1 << 30, "the action is over 1 GiB");
         }
         let (d, sha256) = (dir.clone(), crate::util::sha256_hex(&bytes));
+        // kiln's hand-on of the action (W27-R08): run only if it's what kiln handed on.
+        if let Some(h) = hand_on {
+            let what = crate::runner::signed::thing(format!("action/{}", r.repo), [("gitCommit", r.sha.clone()), ("sha256", sha256.clone())]);
+            if let Err(why) = crate::runner::signed::check_handed(&self.a.job_id, h, self.kilns_root().as_deref(), what) {
+                anyhow::bail!("action {}@{} {why}: the leg doesn't run it (docs/ci.md W27-R08)", r.repo, r.sha);
+            }
+        }
         crate::rt::blocking(move || -> anyhow::Result<()> {
             let _ = std::fs::remove_dir_all(&d);
             std::fs::create_dir_all(&d)?;
@@ -4069,7 +4124,14 @@ impl Leg {
             "deploy" if with.contains_key("image") => anyhow::bail!("`image` deploys to a `microvm` environment, and this job's isn't one"),
             "deploy" => self.deploy_step(idx, &with, &mut outputs).await?,
             "upload" | "download" => {
-                let svc = super::artifacts::Service { http: &self.http, base: super::artifacts::Service::origin_of(&self.a.runtime.results_url), token: &self.a.runtime.runtime_token, run: &self.a.run_id, job: &self.a.job_id };
+                let svc = super::artifacts::Service {
+                    http: &self.http,
+                    base: super::artifacts::Service::origin_of(&self.a.runtime.results_url),
+                    token: &self.a.runtime.runtime_token,
+                    run: &self.a.run_id,
+                    job: &self.a.job_id,
+                    root: self.kilns_root(),
+                };
                 let ws = st.layout.workspace.clone();
                 let flag = |k: &str| get(k).is_some_and(|v| v == "true");
                 if b.name == "upload" {
@@ -4381,6 +4443,10 @@ impl Leg {
                     if let Some(d) = &found.digest {
                         let what = crate::runner::signed::thing(format!("cache/{}", found.key), [("sha256", d.clone())]);
                         crate::runner::signed::received(&self.a.job_id, what, crate::runner::signed::Giver::Server, &format!("its cache {}", found.key));
+                        // kiln's hand-on of it to this process, which signs its receipt (W27-R08).
+                        if let Some(h) = found.hand_on.clone() {
+                            crate::runner::signed::kiln_handed(&self.a.job_id, h);
+                        }
                     }
                     if !look_only {
                         let (a, p, staging) = (archive.clone(), paths.clone(), st.layout.temp.join(format!("kiln-cache-{}", crate::util::new_id())));

@@ -6,9 +6,8 @@
 import { api } from "@/api/client";
 import { useRes } from "@/lib/data";
 import { formatBytes } from "@/lib/format";
-import { invalidate } from "@/lib/resource";
 import { RulesForm } from "./rules";
-import { CopyList, keepRes, taking } from "./section";
+import { CopyList, keepRes, readKeepAgain, taking } from "./section";
 
 export function RepoKeep({ repoKey }: { repoKey: string }) {
   const view = useRes(keepRes).data;
@@ -29,7 +28,7 @@ export function RepoKeep({ repoKey }: { repoKey: string }) {
         label={`${repoKey}'s rules for its copies`}
         onSave={async (r) => {
           await api.setRepoKeep(repoKey, r);
-          invalidate("reach/keep");
+          await readKeepAgain();
         }}
       />
     </section>

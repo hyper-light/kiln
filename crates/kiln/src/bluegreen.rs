@@ -46,6 +46,11 @@ pub enum Frame {
         /// [`Frame::Role`]. A new build from before says nothing, and is sent none.
         #[serde(default, skip_serializing_if = "std::ops::Not::not")]
         role: bool,
+        /// It checks blue's records of the frames blue forwards to it (docs/ci.md W27-R08's
+        /// relays): blue sends each [`Frame::Forward`] with one. A new build from before says
+        /// nothing, and is sent none.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        relays: bool,
         #[serde(default, skip_serializing_if = "std::ops::Not::not")]
         stores: bool,
     },
@@ -69,7 +74,14 @@ pub enum Frame {
     Promoted,
     /// blue → green, after `Done`: a frame from the server about something handed over (or new
     /// that blue holds for green), which reached blue meanwhile (as the server sent it, base64).
-    Forward { data: String },
+    /// `passed_on`: blue's record of passing it on (a bundle, as JSON), numbered on its stream to
+    /// green (docs/ci.md W27-R08's relays), to a new build that said `custody`; green checks it
+    /// before taking the frame. A runner from before sends none, and is taken as before.
+    Forward {
+        data: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        passed_on: Option<String>,
+    },
     /// green → blue: taken over, or why not.
     Ack { id: String, ok: bool, error: Option<String> },
     /// blue → green, after its sessions, to a new build that said `role`: blue's hand-on of the
@@ -221,9 +233,9 @@ mod unix {
         /// Wait (blocking) for green (process `pid`) to connect and say it's ready, until
         /// `deadline`, as long as it runs. The connection to hand it everything over, the
         /// instance it runs as, whether it takes sessions signed for, whether it takes the
-        /// machine's runner role so, and whether it takes this runner's conversation stores over
-        /// ([`Frame::Ready`]).
-        pub fn ready(&self, pid: u32, deadline: Instant) -> Result<(Conn, String, bool, bool, bool)> {
+        /// machine's runner role so, whether it checks the records of what's forwarded to it, and
+        /// whether it takes this runner's conversation stores over ([`Frame::Ready`]).
+        pub fn ready(&self, pid: u32, deadline: Instant) -> Result<(Conn, String, bool, bool, bool, bool)> {
             loop {
                 match self.listener.accept() {
                     Ok((stream, _)) => {
@@ -231,7 +243,7 @@ mod unix {
                         stream.set_read_timeout(Some(Duration::from_secs(60)))?;
                         let conn = Conn { stream };
                         match conn.recv() {
-                            Ok((Frame::Ready { pid: said, instance, custody, role, stores }, _)) if said == pid => return Ok((conn, instance, custody, role, stores)),
+                            Ok((Frame::Ready { pid: said, instance, custody, role, relays, stores }, _)) if said == pid => return Ok((conn, instance, custody, role, relays, stores)),
                             // Not the process started for this: not listened to.
                             Ok((Frame::Ready { pid: said, .. }, _)) => tracing::warn!(said, expected = pid, "a runner that isn't the new build tried to take over; ignored"),
                             Ok(_) => tracing::warn!("a connection to the handover socket didn't open by saying it's ready; ignored"),
@@ -340,8 +352,8 @@ mod unix {
         fn a_ready_from_a_build_from_before_takes_no_stores_and_stores_read_back() -> anyhow::Result<()> {
             let before: Frame = serde_json::from_str(r#"{"ready":{"pid":7,"instance":"g"}}"#)?;
             assert!(matches!(before, Frame::Ready { pid: 7, stores: false, .. }));
-            assert_eq!(serde_json::to_string(&Frame::Ready { pid: 7, instance: "g".into(), custody: false, role: false, stores: false })?, r#"{"ready":{"pid":7,"instance":"g"}}"#);
-            assert_eq!(serde_json::to_string(&Frame::Ready { pid: 7, instance: "g".into(), custody: false, role: false, stores: true })?, r#"{"ready":{"pid":7,"instance":"g","stores":true}}"#);
+            assert_eq!(serde_json::to_string(&Frame::Ready { pid: 7, instance: "g".into(), custody: false, role: false, relays: false, stores: false })?, r#"{"ready":{"pid":7,"instance":"g"}}"#);
+            assert_eq!(serde_json::to_string(&Frame::Ready { pid: 7, instance: "g".into(), custody: false, role: false, relays: false, stores: true })?, r#"{"ready":{"pid":7,"instance":"g","stores":true}}"#);
             let said = serde_json::to_string(&Frame::Stores { own: Some("/s/instances/g/conversations.db".into()), mirror: None })?;
             assert!(matches!(serde_json::from_str::<Frame>(&said)?, Frame::Stores { own: Some(o), mirror: None } if o.ends_with("/g/conversations.db")));
             // Its answer: where green set aside what wouldn't open, said only when it did.
@@ -357,10 +369,10 @@ mod unix {
             let (a, b) = (Conn { stream: a }, Conn { stream: b });
             // A pipe: its write end goes across, and still writes into the same pipe.
             let (r, w) = rustix::pipe::pipe()?;
-            a.send(&Frame::Forward { data: "AAE=".into() }, &[w.as_raw_fd()])?;
+            a.send(&Frame::Forward { data: "AAE=".into(), passed_on: None }, &[w.as_raw_fd()])?;
             drop(w);
             let (frame, fds) = b.recv()?;
-            assert!(matches!(frame, Frame::Forward { data } if data == "AAE="));
+            assert!(matches!(frame, Frame::Forward { data, passed_on: None } if data == "AAE="));
             assert_eq!(fds.len(), 1);
             rustix::io::write(fds.first().context("no fd")?, b"through")?;
             let mut buf = [0u8; 7];

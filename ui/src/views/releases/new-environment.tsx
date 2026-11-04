@@ -16,6 +16,7 @@ import { Dialog, DialogContent } from "@/components/ui/dialog";
 import { Loadable } from "@/components/ui/loading";
 import { SelectField, TextField } from "@/components/ui/misc";
 import { toast } from "@/components/ui/toast";
+import { useAction } from "@/lib/action";
 import { errorMessage } from "@/lib/hooks";
 import { invalidate, useSuspenseResource } from "@/lib/resource";
 import { useNavigate } from "@/lib/router";
@@ -37,32 +38,36 @@ function Form({ onDone }: { onDone: () => void }) {
   const [root, setRoot] = React.useState("");
   const [picked, setPicked] = React.useState<string[]>([]);
   const [argoClusters, setArgoClusters] = React.useState("in-cluster");
-  const [busy, setBusy] = React.useState(false);
   const argo = provider.startsWith("argocd/");
   const clean = name.trim();
   const wrong =
     clean && !LABEL.test(clean) ? "Lowercase letters, digits and '-', as Kubernetes names things." : !/^[^/\s]+\/[^/\s]+$/.test(repo.trim()) ? "The release repository is owner/name." : null;
-  const make = async () => {
+  // Made, it opens the environment's page; until it's answered the dialog stays, so a refusal is said
+  // with what was asked still there, and Close still closes it (W21-R15).
+  const [make, making] = useAction(async () => {
     const kubernetes = argo
       ? argoClusters
           .split(",")
           .map((c) => c.trim())
           .filter(Boolean)
       : picked;
-    setBusy(true);
     try {
       const gates = host !== "kiln" && pulls ? { via: "pull-request" as const } : undefined;
-      const e = await deployApi.createEnvironment({ name: clean, provider, release_repo: { host, repo: repo.trim(), branch: branch.trim() || "main", root: root.trim() }, targets: { kubernetes }, gates });
+      const e = await deployApi.createEnvironment({
+        name: clean,
+        provider,
+        release_repo: { host, repo: repo.trim(), branch: branch.trim() || "main", root: root.trim() },
+        targets: { kubernetes },
+        gates,
+      });
       toast({ title: `${e.name} is made`, description: "Set its gates on its page; register apps in it from theirs.", tone: "succeeded", href: releaseEnvHref(e.name) });
       invalidate("deploy/");
       onDone();
-      navigate(releaseEnvHref(e.name));
+      await navigate(releaseEnvHref(e.name));
     } catch (err) {
       toast({ title: "Not made", description: errorMessage(err), tone: "failed" });
-    } finally {
-      setBusy(false);
     }
-  };
+  });
   return (
     <div className="rel-dialog">
       <TextField label="Name" placeholder="staging" value={name} autoFocus spellCheck={false} onChange={(e) => setName(e.target.value)} />
@@ -83,7 +88,17 @@ function Form({ onDone }: { onDone: () => void }) {
           options={[
             { value: "kiln", label: "kiln's own git server" },
             ...(hosts.some((h) => h.host === "github") ? [{ value: "github", label: "GitHub, through kiln's GitHub App" }] : []),
-            ...(hosts.some((h) => h.host === "gitlab") ? [{ value: "gitlab", label: `GitLab (${hosts.filter((h) => h.host === "gitlab").map((h) => h.web).join(", ")})` }] : []),
+            ...(hosts.some((h) => h.host === "gitlab")
+              ? [
+                  {
+                    value: "gitlab",
+                    label: `GitLab (${hosts
+                      .filter((h) => h.host === "gitlab")
+                      .map((h) => h.web)
+                      .join(", ")})`,
+                  },
+                ]
+              : []),
             ...(hosts.some((h) => h.host === "bitbucket") ? [{ value: "bitbucket", label: "Bitbucket" }] : []),
           ]}
         />
@@ -110,8 +125,8 @@ function Form({ onDone }: { onDone: () => void }) {
       </div>
       {host !== "kiln" && (
         <label className="cd-new-check">
-          <input type="checkbox" className="check" checked={pulls} onChange={(e) => setPulls(e.target.checked)} /> Releases as {host === "gitlab" ? "merge requests" : "pull requests"}: merging one releases it,
-          closing it cancels it
+          <input type="checkbox" className="check" checked={pulls} onChange={(e) => setPulls(e.target.checked)} /> Releases as {host === "gitlab" ? "merge requests" : "pull requests"}: merging one
+          releases it, closing it cancels it
         </label>
       )}
       {argo ? (
@@ -136,7 +151,7 @@ function Form({ onDone }: { onDone: () => void }) {
         <Button variant="ghost" onClick={onDone}>
           Close
         </Button>
-        <Button disabled={busy || !clean || !!wrong} onClick={() => void make()}>
+        <Button disabled={!clean || !!wrong} pending={making} onClick={make}>
           <Plus /> Make {clean || "it"}
         </Button>
       </div>

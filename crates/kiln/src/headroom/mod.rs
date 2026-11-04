@@ -155,6 +155,12 @@ pub fn pause(session: &str, on: bool) -> Result<(), String> {
     Ok(())
 }
 
+/// `dir`, a CI job's group, is paused (`crate::runner::freeze`) while `paused`: the pacer never
+/// stops it or lets it go on meanwhile, so a pause holds whatever pacing was doing.
+pub fn paused_elsewhere(dir: &Path, paused: bool) {
+    pace::held_elsewhere(dir, paused);
+}
+
 /// The pacer's shares with each group a person paused ([`pause`]) held all the time: at 0 it never
 /// runs, and only while a guard runs that will start it again.
 fn with_paused(shares: &mut HashMap<PathBuf, f64>, groups: &[pace::Group], paused: &HashSet<String>) {
@@ -244,11 +250,35 @@ fn targets(s: &Settings, ctx: &Ctx) -> Vec<settings::Target> {
     if s.automatic {
         out.push(settings::Target { name: "runner disk".into(), probe: settings::Probe::Fsync { path: ctx.data_dir.display().to_string() }, tolerance_ms: None });
         if ctx.server_url.starts_with("http://") {
-            out.push(settings::Target { name: "kiln server".into(), probe: settings::Probe::Http { url: format!("{}/healthz", ctx.server_url.trim_end_matches('/')) }, tolerance_ms: None });
+            let server = ctx.server_url.trim_end_matches('/');
+            out.push(settings::Target { name: "kiln server".into(), probe: settings::Probe::Http { url: format!("{server}/healthz") }, tolerance_ms: None });
+            // The server's own delay, where it runs on this machine (docs/priority.md; goal 8, plan
+            // 01a1a59c2b29 step 5): when its shards run ready work late, the legs and agents beside
+            // it are what's slowed first.
+            if server_here(server) {
+                out.push(settings::Target { name: SERVER_DELAY.into(), probe: settings::Probe::Delay { url: format!("{server}/healthz/delay") }, tolerance_ms: None });
+            }
         }
     }
     out.extend(s.targets.iter().cloned());
     out
+}
+
+/// The target of the server's own delay ([`targets`]).
+const SERVER_DELAY: &str = "kiln server delay";
+
+/// Whether the kiln server at `url` (`http://host:port`) runs on this machine, worked out once: an
+/// address of its is loopback, or one this machine may bind. Its delay is then what kiln's own work
+/// beside it can cause; elsewhere slowing it wouldn't help the server.
+fn server_here(url: &str) -> bool {
+    static HERE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *HERE.get_or_init(|| {
+        use std::net::ToSocketAddrs as _;
+        let Some(rest) = url.strip_prefix("http://") else { return false };
+        let host = rest.split('/').next().unwrap_or_default();
+        let addr = if host.contains(':') && !host.ends_with(']') { host.to_owned() } else { format!("{host}:80") };
+        addr.to_socket_addrs().into_iter().flatten().any(|a| a.ip().is_loopback() || std::net::UdpSocket::bind((a.ip(), 0)).is_ok())
+    })
 }
 
 /// One group of work, as the status shows it.

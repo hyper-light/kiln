@@ -63,6 +63,8 @@ pub async fn open(hub: &Arc<Hub>, seg: &[&str], req: Request) -> Option<Result<R
         }
         // W19-R03: what a leg runs on, for comparing runs.
         ["_kiln", "facts"] => Some(super::compare::facts_from_leg(hub, req).await),
+        // W27-R08: the images a leg's token pushed to kiln's registry, for its hand-on of them.
+        ["_kiln", "pushed"] => Some(super::signed::pushed_by_leg(hub, &req).await),
         // W18: an attest step's SBOM and bundles, for its runner; the key that signs them.
         ["_kiln", "attestations", "sbom"] if req.method() == Method::POST => Some(super::attest::upload(hub, req).await),
         ["_kiln", "attestations"] => Some(super::attest::for_leg(hub, &req).await),
@@ -199,6 +201,9 @@ async fn outside(hub: &Arc<Hub>, method: &Method, rest: &[&str], q: &HashMap<Str
         (&Method::GET, ["repos", repo, "commits", sha, "verdict", "wait"]) => Ok(ok(&super::verdict::wait(hub, repo, sha, q).await?)),
         // W26-R07: a search across a host's pull request, at its mirrored head.
         (&Method::GET, ["repos", repo, "pulls", n, "search"]) => Ok(ok(&super::search::pull(hub, repo, n, q, caller).await?)),
+        // W26-R16: Update pushes a host's pull request's replay through the forge seam.
+        (&Method::POST, ["repos", repo, "pulls", n, "update"]) => Ok(ok(&super::fresh::update_pull(hub, repo, n, caller).await?)),
+        (&Method::GET, ["repos", repo, "pulls", n, "fresh"]) => Ok(ok(&super::fresh::pull_state(hub, repo, n).await?)),
         // W23-R06: the host's pull requests (merge requests).
         (_, ["repos", repo, "pulls", tail @ ..]) => crate::githost::pulls::route(hub, method, repo, tail, body, caller).await,
         // W03-R11: dispatches (another provider's, W23-R01).

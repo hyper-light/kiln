@@ -9,6 +9,7 @@ import { Link } from "@/lib/router";
 import { changesApi, changesRes, changeWords, type AgentChange } from "@/api/changes";
 import { Button } from "@/components/ui/button";
 import { toast } from "@/components/ui/toast";
+import { useAction } from "@/lib/action";
 import { useRes } from "@/lib/data";
 import { changeState } from "./change-state";
 import { errorMessage } from "@/lib/hooks";
@@ -97,20 +98,17 @@ export function RowReview({ agentId }: { agentId: string }) {
 export function ChangeBar({ agentId }: { agentId: string }) {
   const all: AgentChange[] = useRes(changesRes).data;
   const c = all.find((x) => x.agent === agentId);
-  const [busy, setBusy] = React.useState(false);
   const [fix, setFix] = React.useState(true);
-  const push = async () => {
-    setBusy(true);
+  // Its button says the push is on its way (W21-R15).
+  const [push, pushing] = useAction(async () => {
     try {
       const r = await changesApi.open(agentId, c ? {} : { fix_checks: fix });
       toast({ title: r.change ? `${r.change} version ${r.version} is up for review` : `Pushed ${r.branch}: open its pull request from its link`, tone: "running" });
       invalidate("agents/changes");
     } catch (e) {
       toast.error(c ? "Couldn't push a new version" : "Couldn't open a pull request", errorMessage(e));
-    } finally {
-      setBusy(false);
     }
-  };
+  });
   const s = changeState(c);
   // Its state, what it is, and what to do: one line on a wide card, a line each on a narrow one.
   return (
@@ -143,15 +141,15 @@ export function ChangeBar({ agentId }: { agentId: string }) {
               <input type="checkbox" className="check" checked={fix} onChange={(e) => setFix(e.target.checked)} />
               Auto-Fix
             </label>
-            <Button size="xs" variant="secondary" disabled={busy} onClick={() => void push()} title="Commit its work beside the folder and push it for review">
-              {busy ? "Opening…" : "Open PR"}
+            <Button size="xs" variant="secondary" pending={pushing} onClick={push} title="Commit its work beside the folder and push it for review">
+              {pushing ? "Opening…" : "Open PR"}
             </Button>
           </span>
         ) : (
           c.state === "open" && (
             <span className="hx-cr-do">
-              <Button size="xs" variant="secondary" disabled={busy} onClick={() => void push()} title="Push its work as a new version">
-                {busy ? "Pushing…" : "Push update"}
+              <Button size="xs" variant="secondary" pending={pushing} onClick={push} title="Push its work as a new version">
+                {pushing ? "Pushing…" : "Push update"}
               </Button>
             </span>
           )

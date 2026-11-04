@@ -7,6 +7,7 @@ import { api } from "@/api/client";
 import type { InstallOs, JoinInfo, JoinRequest, OutpostInvite } from "@/api/types";
 import { Button } from "@/components/ui/button";
 import { SectionHeading } from "@/components/ui/misc";
+import { sendingProps } from "@/lib/action";
 import { relativeTime } from "@/lib/format";
 import { errorMessage, useNow } from "@/lib/hooks";
 import type { SuspenseResource } from "@/lib/resource";
@@ -66,7 +67,7 @@ export function InstallSection({
       </div>
       <p className="am-note">
         {os === "windows" ? "In PowerShell on the machine: downloads" : "On the machine: downloads"} kiln from this server, installs it as {SERVICE[os]} and joins as a runner.
-        <Expiry at={data.expires_at} onRenew={info.reload} />
+        <Expiry at={data.expires_at} onRenew={info.reload} renewing={info.refreshing} />
       </p>
       <Status arrived={arrived} asking={asking} rowOf={rowOf} />
       <Alternatives info={data} os={os} />
@@ -187,8 +188,8 @@ function OutpostLine({ os, invite, error, onRenew }: { os: InstallOs; invite: Ou
   );
 }
 
-/** " Its token expires in 23h." — live, and a way to a fresh command once it has expired. */
-function Expiry({ at, onRenew }: { at: number | null | undefined; onRenew: () => void }) {
+/** " Its token expires in 23h." — live, and a way to a fresh command once it has expired (`renewing`: that one is on its way). */
+function Expiry({ at, onRenew, renewing = false }: { at: number | null | undefined; onRenew: () => void; renewing?: boolean }) {
   const now = useNow();
   if (!at) return null;
   if (at * 1000 <= now) {
@@ -196,7 +197,7 @@ function Expiry({ at, onRenew }: { at: number | null | undefined; onRenew: () =>
       <>
         {" "}
         <span className="am-warn">Its token has expired.</span>{" "}
-        <button type="button" className="am-act am-inline-act" onClick={onRenew}>
+        <button type="button" className="am-act am-inline-act" {...sendingProps(renewing)} onClick={renewing ? undefined : onRenew}>
           <RotateCcw aria-hidden="true" /> New command
         </button>
       </>

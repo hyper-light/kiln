@@ -56,6 +56,11 @@ pub fn token_path(cfg: &Config) -> PathBuf {
 
 pub async fn run(cfg: Config, shutdown: Shutdown) -> anyhow::Result<()> {
     crate::os::start_reaper();
+    // Each shard's health on /metrics: its delay, busy share and slow polls (goal 1, plan
+    // 01a1a59c2a68 step 1).
+    if let Some(period) = crate::shard_health::period_from_env() {
+        crate::shard_health::start(period);
+    }
     crate::updates::warm_own_binary().await;
     let cfg = Arc::new(cfg);
     std::fs::create_dir_all(&cfg.server.data_dir)
@@ -65,6 +70,7 @@ pub async fn run(cfg: Config, shutdown: Shutdown) -> anyhow::Result<()> {
         let dir = cfg.server.data_dir.clone();
         crate::rt::spawn_spread(async move {
             let _ = crate::rt::blocking(move || crate::ui::keep_assets(&dir)).await;
+            crate::ui::warm().await;
         });
     }
     crate::password::seed_from_env(&crate::password::path(&cfg));
@@ -115,6 +121,8 @@ pub async fn run(cfg: Config, shutdown: Shutdown) -> anyhow::Result<()> {
     if let Err(e) = crate::identities::own_identities(&hub.store, &pki).await {
         tracing::warn!(error = %format!("{e:#}"), "the server's and CD's identities weren't issued");
     }
+    // The conversation feeds' batches signed for at the server's ends (docs/ci.md W27-R08).
+    crate::custody::feeds::install(&hub);
     hub.runners_before.store(runners_before, std::sync::atomic::Ordering::Relaxed);
     // The names people see of the runners kiln knows by their machine ids, for the sentences that
     // name them (docs/machines.md).
@@ -189,6 +197,8 @@ pub async fn run(cfg: Config, shutdown: Shutdown) -> anyhow::Result<()> {
         child!("gitops-poll", h => crate::gitops::poll_loop(h));
         child!("gitops-schedule", h => crate::gitops::schedule_loop(h));
         child!("land-queue", h => crate::ci::land::run_loop(h));
+        child!("conflict-ladder", h => crate::ci::ladder::run_loop(h));
+        child!("review-fresh", h => crate::ci::fresh::run(h));
         child!("github-checks", h => crate::githost::github::checks_loop(h));
         child!("host-pulls-mirror", h => crate::githost::mirror::run(h));
         child!("host-statuses", h => crate::githost::statuses::statuses_loop(h));
@@ -213,6 +223,9 @@ pub async fn run(cfg: Config, shutdown: Shutdown) -> anyhow::Result<()> {
         child!("identities", h => crate::identities::own_identities_loop(h));
         // The trail's checkpoints, signed as they come due (docs/ci.md W27-R09).
         child!("trail", h => crate::trail::checkpoints_loop(h));
+        // Relays' records no receipt answered, once they lapse: each a break naming its relay
+        // (docs/ci.md W27-R08's relays).
+        child!("relays", h => crate::relays::relays_loop(h));
         // kiln's base chart in its own registry, for apps' charts to depend on (docs/deploy-api.md §3.4).
         child!("kiln-base", h => crate::deploy::init::publish_base(h));
         if cfg.cd.enabled {
@@ -221,6 +234,9 @@ pub async fn run(cfg: Config, shutdown: Shutdown) -> anyhow::Result<()> {
         }
         child!("sync", h => h.sync_loop());
         child!("cluster", h => h.cluster_loop());
+        // Checkpoints of the cluster group's log, to the learners that check them (docs/ci.md
+        // W27-R08).
+        child!("cluster-custody", h => crate::custody::cluster::checkpoints_loop(h));
         child!("tailnet-dns", h => crate::frontdoor::tailnet::run(h));
         child!("in-step", h => crate::updates::in_step_loop(h));
         child!("ui-server", h => crate::uiserver::run(h));

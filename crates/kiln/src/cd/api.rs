@@ -183,6 +183,7 @@ pub async fn route(hub: &Arc<Hub>, rest: &[&str], q: &HashMap<String, String>, r
         (&Method::GET, ["apps", p, n, "diff"]) => ("cd.apps.diff".into(), app(p, n)),
         (&Method::GET, ["apps", p, n, "tree"]) => ("cd.apps.tree".into(), with(app(p, n), "fresh", json!(q.get("fresh").is_some_and(|v| v == "true" || v == "1")))),
         (&Method::GET, ["apps", p, n, "manifests"]) => ("cd.apps.manifests".into(), app(p, n)),
+        (&Method::GET, ["apps", p, n, "custody"]) => ("cd.apps.custody".into(), app(p, n)),
         (&Method::GET, ["apps", p, n, "resources", key]) => ("cd.apps.resource".into(), res_input(p, n, key, q, &[])?),
         (&Method::GET, ["apps", p, n, "resources", key, "events"]) => ("cd.apps.resource_events".into(), res_input(p, n, key, q, &[])?),
         (&Method::GET, ["apps", p, n, "resources", key, "logs"]) => {

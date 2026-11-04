@@ -155,10 +155,20 @@ pub struct Api {
 impl srv::Handler for Api {
     async fn handle(self: Arc<Self>, req: Request) -> Response {
         let hub = self.hub.clone();
-        match route(hub, req).await {
+        // How long it waited before this handler started, from its head's arrival off its socket,
+        // and how long it then took, by its class (goal 1, plan 01a1a59c2a68 step 2).
+        let began = Instant::now();
+        let upgrade = req.headers().get(header::UPGRADE).is_some_and(|v| v.as_bytes().eq_ignore_ascii_case(b"websocket"));
+        let class = crate::route_latency::class_of(req.method(), req.uri().path(), upgrade);
+        let waited = req.extensions().get::<kiln_http::Received>().map(|r| began.saturating_duration_since(r.0));
+        let resp = match route(hub, req).await {
             Ok(r) => r,
             Err(e) => e.into_response(),
+        };
+        if let Some(class) = class {
+            crate::route_latency::observe(class, waited, began.elapsed());
         }
+        resp
     }
 }
 
@@ -418,6 +428,7 @@ async fn route(hub: Arc<Hub>, req: Request) -> R {
         (&Method::GET, ["healthz"]) => return Ok(srv::text(StatusCode::OK, "ok")),
         (&Method::GET, ["readyz"]) => return Ok(boxed(|| readyz(&hub)).await),
         (&Method::GET, ["healthz", "server"]) => return Ok(server_health(&hub)),
+        (&Method::GET, ["healthz", "delay"]) => return Ok(shard_delay()),
         (&Method::GET, ["dl", "kiln"]) => return boxed(download_binary).await,
         (&Method::GET, ["dl", "kiln", target]) => return boxed(|| download_for(&hub, target)).await,
         (&Method::GET, ["dl", "kiln", target, build]) => return boxed(|| download_build(&hub, target, build)).await,
@@ -561,6 +572,11 @@ async fn authorized(hub: Arc<Hub>, caller: crate::authz::Caller, req: Request) -
             let body: serde_json::Value = boxed(|| srv::body_json(req.into_body(), JSON_LIMIT)).await.map_err(|e| err(StatusCode::BAD_REQUEST, e.to_string()))?;
             boxed(|| crate::ship::hand_off(&hub, &caller, &body)).await.map_err(|(c, m)| err(c, m))
         }
+        // What a person signs to hand it off from a browser, with the browser's own key (W27-R08).
+        (&Method::POST, ["api", "ship", "hand-off", "statement"]) => {
+            let body: serde_json::Value = boxed(|| srv::body_json(req.into_body(), JSON_LIMIT)).await.map_err(|e| err(StatusCode::BAD_REQUEST, e.to_string()))?;
+            boxed(|| crate::ship::hand_off_statement(&hub, &caller, &body)).await.map_err(|(c, m)| err(c, m))
+        }
         // A row's Ready: an agent's draft marked ready for review, by its person (W26-R18).
         (&Method::POST, ["api", "ship", "ready"]) => {
             let body: serde_json::Value = boxed(|| srv::body_json(req.into_body(), JSON_LIMIT)).await.map_err(|e| err(StatusCode::BAD_REQUEST, e.to_string()))?;
@@ -595,7 +611,7 @@ async fn authorized(hub: Arc<Hub>, caller: crate::authz::Caller, req: Request) -
             .map_err(|(c, m)| err(c, m))
         }
         // W14: diffs and stacks.
-        (_, ["api", "diffs" | "change-requests" | "stacks" | "comments" | "review" | "queue", ..]) | (&Method::GET, ["api", "repos", _, "diffs" | "queue" | "change-requests"] | ["api", "repos", _, "lands", _]) | (&Method::GET | &Method::PUT, ["api", "repos", _, "agent-fixes"]) | (&Method::POST, ["api", "repos", _, "change-requests" | "submit"]) => {
+        (_, ["api", "diffs" | "change-requests" | "stacks" | "comments" | "review" | "queue", ..]) | (&Method::GET, ["api", "repos", _, "diffs" | "queue" | "change-requests"] | ["api", "repos", _, "lands", _]) | (&Method::GET | &Method::PUT, ["api", "repos", _, "agent-fixes" | "ladder"]) | (&Method::POST, ["api", "repos", _, "change-requests" | "submit"]) => {
             let segs: Vec<&str> = s.iter().skip(1).copied().collect();
             let body: serde_json::Value = if matches!(method, Method::POST | Method::PATCH | Method::PUT) { boxed(|| srv::body_json(req.into_body(), JSON_LIMIT)).await.unwrap_or(serde_json::Value::Null) } else { serde_json::Value::Null };
             boxed(|| crate::ci::diffs::route(&hub, &method, &segs, &q, &caller, &body)).await.map_err(|(c, m)| err(c, m))
@@ -813,11 +829,43 @@ async fn authorized(hub: Arc<Hub>, caller: crate::authz::Caller, req: Request) -
             let by = caller_of(&hub, req.headers()).await.map_or_else(|| "admin".to_owned(), |c| c.name);
             boxed(|| custody_take(&hub, req, &by)).await
         }
+        // Walked for whoever audits it: each hop in words; `export=true`, every record it read as
+        // signed, kiln's CA certificate and its revocations (the Transfers plan's step 15).
+        (&Method::GET, ["api", "custody", "walk"]) => {
+            let mut q = srv::query(&req);
+            let (digest, name, export) = (q.remove("digest").unwrap_or_default(), q.remove("name"), q.remove("export").is_some_and(|e| e == "true" || e == "1"));
+            boxed(|| async {
+                let digest = match name {
+                    Some(n) => crate::custody::head_named(&hub.store, &n).await.map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")))?.unwrap_or(n),
+                    None => digest,
+                };
+                let walked = crate::custody::walk(&hub.store, &hub.pki, &digest, crate::util::now_unix(), export).await.map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")))?;
+                walked.map(|v| srv::json(StatusCode::OK, &v)).ok_or_else(|| err(StatusCode::NOT_FOUND, format!("kiln has no custody record of {digest:?}")))
+            })
+            .await
+        }
         (&Method::GET, ["api", "custody", "breaks"]) => boxed(|| async {
             let breaks = crate::custody::breaks(&hub.store, crate::custody::LIST_MAX).await.map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")))?;
             Ok(srv::json(StatusCode::OK, &json!({ "breaks": breaks })))
         })
         .await,
+        // The relays' streams (W27-R08's relays), and their records no receipt answered `lapse`
+        // seconds on (kiln's own lapse unless said); posted, those are recorded as breaks naming
+        // their relays now, as kiln does once they lapse.
+        (&Method::GET | &Method::POST, ["api", "custody", "relays"]) => {
+            let lapse = srv::query(&req).remove("lapse").and_then(|l| l.parse::<i64>().ok()).unwrap_or(crate::custody::LAPSE_AFTER);
+            let post = req.method() == Method::POST;
+            boxed(|| async {
+                let at = crate::util::now_unix();
+                let v = if post {
+                    json!({ "recorded": crate::relays::unanswered(&hub.store, lapse, at, true).await.map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")))? })
+                } else {
+                    crate::relays::view(&hub.store, lapse, at).await.map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")))?
+                };
+                Ok(srv::json(StatusCode::OK, &v))
+            })
+            .await
+        }
         (&Method::GET, ["api", "custody"]) => {
             let mut q = srv::query(&req);
             let (digest, name) = (q.remove("digest").unwrap_or_default(), q.remove("name"));
@@ -1035,8 +1083,20 @@ async fn authorized(hub: Arc<Hub>, caller: crate::authz::Caller, req: Request) -
             let n: usize = n.parse().map_err(|_| err(StatusCode::BAD_REQUEST, "a step's number, from 1"))?;
             let person = crate::identities::person_identity(&hub.store, &hub.pki.organization(), &caller).await.map_err(|e| err(StatusCode::FORBIDDEN, e.to_string()))?;
             let body = boxed(|| body_value(req)).await?;
+            // A browser that can't sign says why (`unsigned`): kiln's receipt for them, saying so.
+            if let Some(missing) = body.get("unsigned").and_then(serde_json::Value::as_str) {
+                let missing = missing.chars().take(300).collect::<String>();
+                return boxed(|| crate::plans::agents::receipt_for(&hub, run, n, &person, &missing)).await.map(|v| srv::json(StatusCode::OK, &v)).map_err(plan_err);
+            }
             let receipt = body.get("receipt").cloned().ok_or_else(|| err(StatusCode::BAD_REQUEST, "send your receipt: `receipt`, a Sigstore bundle signed on your device"))?;
             boxed(|| crate::plans::agents::receipt(&hub, run, n, &person, &receipt)).await.map(|v| srv::json(StatusCode::OK, &v)).map_err(plan_err)
+        }
+        // What a person signs to receive a step they took over, said as a verdict's is, so a
+        // browser signs it with its own key (docs/ci.md W27-R08; ui/src/lib/signing.ts).
+        (&Method::POST, ["api", "plans", "runs", run, "steps", n, "statement"]) => {
+            let n: usize = n.parse().map_err(|_| err(StatusCode::BAD_REQUEST, "a step's number, from 1"))?;
+            let person = crate::identities::person_identity(&hub.store, &hub.pki.organization(), &caller).await.map_err(|e| err(StatusCode::FORBIDDEN, e.to_string()))?;
+            boxed(|| crate::plans::agents::receipt_statement(&hub, run, n, &person)).await.map(|v| srv::json(StatusCode::OK, &v)).map_err(plan_err)
         }
         (&Method::GET, ["api", "programs"]) => boxed(|| own_op(&hub, &caller, "programs.list", json!({}))).await,
         (&Method::GET, ["api", "programs", id]) => boxed(|| own_op(&hub, &caller, "programs.get", json!({"program": id}))).await,
@@ -1965,9 +2025,13 @@ fn sync_machine(req: &Request) -> String {
 static CLUSTER_COPIES: async_lock::Semaphore = async_lock::Semaphore::new(1);
 
 /// A copy of kiln.db for a runner's learner, made now and streamed: for the runner's token for its
-/// machine (`?machine=`), or the admin token. The copy goes once sent.
+/// machine (`?machine=`), or the admin token. The copy goes once sent. kiln hands it on by its
+/// SHA-256 to the runner process that asks for it (`?instance=`, a learner that signs its receipt),
+/// saying so in a header (`crate::custody::cluster::COPY_HEADER`; docs/ci.md W27-R08).
 async fn cluster_copy(hub: &Hub, req: &Request) -> R {
-    let machine = srv::query(req).get("machine").cloned().unwrap_or_default();
+    let q = srv::query(req);
+    let machine = q.get("machine").cloned().unwrap_or_default();
+    let instance = q.get("instance").filter(|i| !i.is_empty()).cloned();
     let theirs = !machine.is_empty() && bearer(req.headers()).is_some_and(|t| crate::util::ct_eq(t.as_bytes(), crate::store::learner::token(&hub.admin_token, &machine).as_bytes()));
     if !theirs && !authed(hub, req.headers()) {
         return Err(err(StatusCode::UNAUTHORIZED, "bad cluster token"));
@@ -1987,10 +2051,46 @@ async fn cluster_copy(hub: &Hub, req: &Request) -> R {
         std::fs::remove_file(&path).ok();
         return Err(err(StatusCode::SERVICE_UNAVAILABLE, format!("{e:#}")));
     }
+    let handed = if theirs { crate::custody::cluster::copy_hand_on(hub, &machine, instance.as_deref(), &path).await } else { None };
+    if handed.is_some() {
+        copy_changed(&path).await;
+    }
     let (size, rx) = copy_body(path).map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, format!("reading the copy of kiln.db: {e}")))?;
-    tracing::info!(machine, bytes = size, took_ms = started.elapsed().as_millis() as u64, "a copy of kiln.db for a runner's learner");
+    tracing::info!(machine, bytes = size, took_ms = started.elapsed().as_millis() as u64, handed_on = handed.is_some(), "a copy of kiln.db for a runner's learner");
     let r = srv::response(StatusCode::OK, "application/octet-stream", srv::channel_body(rx));
-    Ok(srv::with_header(r, header::CONTENT_LENGTH, &size.to_string()))
+    let r = srv::with_header(r, header::CONTENT_LENGTH, &size.to_string());
+    Ok(match handed {
+        Some(h) => srv::with_header(r, header::HeaderName::from_static(crate::custody::cluster::COPY_HEADER), &h),
+        None => r,
+    })
+}
+
+/// A test build's `copy_changed` (the server's, docs/ci.md W27-R08): the first copy of kiln.db kiln
+/// hands on to a learner has a byte in its middle changed after kiln hashed it, once, as one changed
+/// on its way. The learner refuses it and fetches another.
+async fn copy_changed(path: &std::path::Path) {
+    static CHANGED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    if !crate::runner::chaos::get().is_some_and(|c| c.copy_changed) || CHANGED.swap(true, std::sync::atomic::Ordering::SeqCst) {
+        return;
+    }
+    let path = path.to_path_buf();
+    let changed = crate::rt::blocking(move || -> std::io::Result<()> {
+        use std::io::{Read as _, Seek as _, Write as _};
+        let mut f = std::fs::OpenOptions::new().read(true).write(true).open(&path)?;
+        let middle = f.metadata()?.len() / 2;
+        let mut b = [0u8; 1];
+        f.seek(std::io::SeekFrom::Start(middle))?;
+        f.read_exact(&mut b)?;
+        let [byte] = b;
+        f.seek(std::io::SeekFrom::Start(middle))?;
+        f.write_all(&[byte ^ 0x01])
+    })
+    .await
+    .and_then(|r| r.map_err(anyhow::Error::from));
+    match changed {
+        Ok(()) => tracing::warn!(target: "kiln.custody", "chaos: a copy of kiln.db handed on to a learner changed on its way"),
+        Err(e) => tracing::warn!(target: "kiln.custody", error = %format!("{e:#}"), "chaos: a copy of kiln.db couldn't be changed"),
+    }
 }
 
 /// Streams the copy at `path` (it goes once sent): its size, and its bytes as they're read, from
@@ -2047,19 +2147,20 @@ fn not_granted() -> ApiError {
     err(StatusCode::FORBIDDEN, "this URL grants nothing here")
 }
 
-/// `/api/blobs/<key>?expires=&sig=` (and `&length=` for a put): one of the local store's presigned
-/// URLs (docs/blobs.md, `crate::blobs::local`). The URL is the only credential: its signature covers
-/// the method, the exact key, the expiry (at most an hour) and a put's length, and is checked in
-/// constant time before anything is read or written. A get streams the one object it names, in a
-/// range when one is asked; a put keeps a body of exactly the length declared, or nothing. No
-/// listing, no prefixes, and keys with `.` or `..` segments are refused as any bad key is. An S3
-/// store's presigned URLs lead to the S3, not here.
+/// `/api/blobs/<key>?expires=&sig=` (and `&length=` for a put): one of the local or the Mantle
+/// store's presigned URLs (docs/blobs.md, `crate::blobs::local`). The URL is the only credential:
+/// its signature covers the method, the exact key, the expiry (at most an hour) and a put's
+/// length, and is checked in constant time before anything is read or written. A get streams the
+/// one object it names, in a range when one is asked; a put keeps a body of exactly the length
+/// declared, or nothing. No listing, no prefixes, and keys with `.` or `..` segments are refused as
+/// any bad key is. An S3 store's presigned URLs lead to the S3, not here.
 async fn presigned(hub: &Arc<Hub>, encoded: &str, req: Request) -> R {
     use kiln_seams::blobs::{Access, Method as Signed, Refusal};
-    let local = hub.blobs.local.clone().ok_or_else(not_granted)?;
     let signed = if req.method() == Method::PUT { Signed::Put } else { Signed::Get };
     let query = req.uri().query().unwrap_or_default().to_owned();
-    let (key, access) = local.check_presigned(encoded, &query, signed).map_err(|_| not_granted())?;
+    let grant = hub.blobs.local.as_ref().map(|l| l.check_presigned(encoded, &query, signed))
+        .or_else(|| hub.blobs.mantle.as_ref().map(|m| m.check_presigned(encoded, &query, signed))).ok_or_else(not_granted)?;
+    let (key, access) = grant.map_err(|_| not_granted())?;
     let blobs = Arc::clone(&hub.blobs.blobs);
     let failed = |e: Refusal| match e {
         Refusal::Unavailable(_) => err(StatusCode::SERVICE_UNAVAILABLE, e.to_string()),
@@ -2567,9 +2668,12 @@ async fn login_password(hub: &Hub, req: Request) -> R {
         return Ok(srv::with_header(r, header::RETRY_AFTER, &secs.to_string()));
     }
     let path = crate::password::path(&hub.cfg);
-    let outcome = crate::rt::blocking(move || crate::password::load(&path).map(|phc| crate::password::verify(&l.password, &phc)))
-        .await
-        .unwrap_or(Some(false));
+    // The file read on the blocking pool, Argon2's check on the compute pool (goal 3, plan 01a1a59c2a8e step 4).
+    let outcome = match crate::rt::blocking(move || crate::password::load(&path)).await {
+        Ok(Some(phc)) => Some(crate::rt::compute(move || crate::password::verify(&l.password, &phc)).await.unwrap_or(false)),
+        Ok(None) => None,
+        Err(_) => Some(false),
+    };
     match outcome {
         Some(true) => {
             PASSWORD_THROTTLE.succeeded();
@@ -2617,7 +2721,10 @@ async fn set_password(hub: &Hub, req: Request) -> R {
         srv::body_json(req.into_body(), JSON_LIMIT).await.map_err(|e| err(StatusCode::BAD_REQUEST, e.to_string()))?;
     crate::password::validate(&p.password).map_err(|why| err(StatusCode::BAD_REQUEST, format!("Password not accepted: {why}.")))?;
     let path = crate::password::path(&hub.cfg);
-    crate::rt::blocking(move || crate::password::hash(&p.password).and_then(|h| crate::password::store(&path, &h))).await??;
+    // Argon2 on the compute pool, then the file on the blocking pool (goal 3, plan 01a1a59c2a8e step 4: the
+    // blocking pool's places are for calls that block, and a password's hashing is CPU alone).
+    let hash = crate::rt::compute(move || crate::password::hash(&p.password)).await??;
+    crate::rt::blocking(move || crate::password::store(&path, &hash)).await??;
     PASSWORD_THROTTLE.succeeded();
     hub.store.audit("admin".into(), "password".into(), "set".into()).await;
     Ok(srv::status(StatusCode::NO_CONTENT))
@@ -5167,6 +5274,11 @@ struct HarnessOpen {
     spec: crate::harness::session::Spec,
     #[serde(default)]
     count: Option<usize>,
+    /// The ids to start them under, one each, made by the client (`crate::util::is_id`), so its
+    /// page can open the first one's own page at once (W21-R15); asked again under the same ids, a
+    /// start is refused (409) rather than started twice.
+    #[serde(default)]
+    ids: Vec<String>,
 }
 
 async fn harness_open(hub: &Hub, req: Request) -> R {
@@ -5206,8 +5318,25 @@ async fn harness_open(hub: &Hub, req: Request) -> R {
         }
         Some(_) => {}
     }
+    let count = body.count.unwrap_or(1);
+    if !body.ids.is_empty() {
+        let n = count.clamp(1, 16);
+        if body.ids.len() != n {
+            return Err(err(StatusCode::BAD_REQUEST, format!("`ids` names one id for each agent it starts: {n}, not {}", body.ids.len())));
+        }
+        if let Some(bad) = body.ids.iter().find(|id| !crate::util::is_id(id)) {
+            return Err(err(StatusCode::BAD_REQUEST, format!("{bad:?} isn't an id: an id is 32 lowercase hex digits")));
+        }
+        let mut seen = std::collections::HashSet::new();
+        if !body.ids.iter().all(|id| seen.insert(id.as_str())) {
+            return Err(err(StatusCode::BAD_REQUEST, "`ids` names each agent's id once"));
+        }
+    }
     hub.store.audit("admin".into(), "agent.open".into(), format!("{} on {}", body.spec.kind, body.target)).await;
-    let infos = hub.harness.open(hub, &body.target, body.spec, body.count.unwrap_or(1)).await.map_err(|e| err(StatusCode::BAD_REQUEST, format!("{e:#}")))?;
+    let infos = hub.harness.open_as(hub, &body.target, body.spec, count, &body.ids).await.map_err(|e| {
+        let status = if e.downcast_ref::<crate::harness::registry::IdTaken>().is_some() { StatusCode::CONFLICT } else { StatusCode::BAD_REQUEST };
+        err(status, format!("{e:#}"))
+    })?;
     // Whom each acts for when its MCP server asks kiln for something (`crate::mcp::runner_ask`), and
     // whose it is.
     if let Some(c) = &caller {
@@ -5959,6 +6088,7 @@ async fn harness_attach(hub: Arc<Hub>, id: String, socket: ws::WebSocket, takes:
                         // Read now: each frame's delivery, from its publish on this process's
                         // microsecond clock (the bus's own stamps are milliseconds).
                         let now = crate::harness::live::now_us();
+                        let read_at = Instant::now();
                         let next = batch.next;
                         // Each frame read where it is in its payload, and sent as the payload's own
                         // bytes (this viewer's copy of it, moved): no other copy of it is made.
@@ -5992,11 +6122,15 @@ async fn harness_attach(hub: Arc<Hub>, id: String, socket: ws::WebSocket, takes:
                                 start_over = true;
                                 break;
                             }
-                            if let Some(at) = published {
-                                crate::metrics::bus().delivery_seconds.observe(now.saturating_sub(at) as f64 / 1e6);
+                            let waited = published.map(|at| Duration::from_micros(now.saturating_sub(at)));
+                            if let Some(w) = waited {
+                                crate::metrics::bus().delivery_seconds.observe(w.as_secs_f64());
                             }
                             have = have.max(rev);
                             tx.send(ws::text(said)).await?;
+                            // From its publish to this viewer's read, then to its write on the socket
+                            // (goal 1, plan 01a1a59c2a68 step 2).
+                            crate::route_latency::observe(crate::route_latency::Class::Websocket, waited, read_at.elapsed());
                         }
                         at = Some(next);
                     }
@@ -6165,6 +6299,27 @@ async fn readyz(hub: &Hub) -> Response {
     }
 }
 
+/// `/healthz/delay`: how late this server's shards run ready work now, in seconds: the target
+/// headroom probes on a runner beside it (docs/priority.md; goal 8, plan 01a1a59c2b29 step 5). From
+/// the shards' own figures (`crate::shard_health`): no shard is asked. Open, as `/healthz` is; 503
+/// where the shards aren't probed (`KILN_SHARD_PROBE_MS=0`) or haven't been yet.
+fn shard_delay() -> Response {
+    let Some(period) = crate::shard_health::period_from_env() else {
+        return srv::text(StatusCode::SERVICE_UNAVAILABLE, "this server doesn't probe its shards (KILN_SHARD_PROBE_MS=0)");
+    };
+    match worst_delay(crate::shard_health::shards().iter().map(crate::shard_health::Shard::snapshot), period) {
+        Some(d) => srv::text(StatusCode::OK, &format!("{:.6}", d.as_secs_f64())),
+        None => srv::text(StatusCode::SERVICE_UNAVAILABLE, "this server's shards haven't been probed yet"),
+    }
+}
+
+/// The worst of the shards' delay now: each one's latest probe, how late it ran, or, for a shard held
+/// now, how long past its `period` it has gone without one (a hold shows there before its probe can
+/// say how late it ran).
+fn worst_delay(shards: impl Iterator<Item = crate::shard_health::Snapshot>, period: Duration) -> Option<Duration> {
+    shards.filter(|s| s.probes > 0 || s.since_probe.is_some()).map(|s| s.late.max(s.since_probe.map_or(Duration::ZERO, |d| d.saturating_sub(period)))).max()
+}
+
 /// `/healthz/server`: how this server is, for the checks that watch a deploy of kiln
 /// (docs/cd-targets.md §10). The commit it runs; how long it has been up; how many times kiln's
 /// supervisor started it again (a crash, or the kernel's OOM killer: neither shows in its pod's
@@ -6212,6 +6367,29 @@ fn back(connected: u64, before: u64) -> f64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Goal 8 (plan 01a1a59c2b29 step 5, docs/priority.md): the server's delay is its worst shard's,
+    /// the latest probe's lateness, or a hold under way past the probes' period; a shard not probed
+    /// yet says nothing.
+    #[test]
+    fn g8_s5_the_delay_is_the_worst_shards_now() {
+        let period = Duration::from_millis(10);
+        let shard = |probes: u64, late_us: u64, since_ms: Option<u64>| crate::shard_health::Snapshot {
+            probes,
+            late: Duration::from_micros(late_us),
+            most_late: Duration::from_micros(late_us),
+            since_probe: since_ms.map(Duration::from_millis),
+            busy: None,
+            polls: 0,
+            slow: crate::shard_health::Slow::default(),
+            longest_poll: Duration::ZERO,
+            overrun: Duration::ZERO,
+        };
+        assert_eq!(worst_delay([shard(9, 80, Some(4)), shard(9, 2_000, Some(7))].into_iter(), period), Some(Duration::from_micros(2_000)));
+        // Held now: 1.5 s since its probe, past its 10 ms period.
+        assert_eq!(worst_delay([shard(9, 80, Some(4)), shard(9, 100, Some(1_500))].into_iter(), period), Some(Duration::from_millis(1_490)));
+        assert_eq!(worst_delay([shard(0, 0, None)].into_iter(), period), None);
+    }
 
     /// P2: a learner's copy streams whole though the next copy, made once this one is handed over,
     /// clears its name (what a stop left behind) before this one's reader has run.

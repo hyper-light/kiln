@@ -13,11 +13,12 @@ import { Hold } from "@/components/ui/hold";
 import { Loadable } from "@/components/ui/loading";
 import { Crumbs, Panel, SelectField, TextField } from "@/components/ui/misc";
 import { toast } from "@/components/ui/toast";
+import { useAction } from "@/lib/action";
 import { useRes } from "@/lib/data";
 import { errorMessage } from "@/lib/hooks";
 import { invalidate } from "@/lib/resource";
 import { swapped } from "@/lib/utils";
-import { pipelineRes } from "./parts";
+import { HeldFields, pipelineRes, useOpening } from "./parts";
 
 const TYPES: { value: ProcessorType; label: string }[] = [
   { value: "grok-parser", label: "Grok parser" },
@@ -92,6 +93,11 @@ function Header({ crumb, title, children }: { crumb: string; title?: string; chi
 function Existing({ id }: { id: string }) {
   const p = useRes(pipelineRes(id)).data;
   const navigate = useNavigate();
+  const [copy, copying] = useAction(async () => {
+    const made = await observeApi.createPipeline({ name: `${p.name} (copy)`, is_enabled: true, filter: p.filter, processors: p.processors });
+    invalidate("observe/pipelines");
+    await navigate(`/observe/pipelines/${encodeURIComponent(made.id)}`);
+  }, "Couldn't copy it");
   if (!p.builtin)
     return (
       <>
@@ -100,20 +106,11 @@ function Existing({ id }: { id: string }) {
         <Editor initial={p} id={p.id} />
       </>
     );
-  const copy = async () => {
-    try {
-      const made = await observeApi.createPipeline({ name: `${p.name} (copy)`, is_enabled: true, filter: p.filter, processors: p.processors });
-      invalidate("observe/pipelines");
-      navigate(`/observe/pipelines/${encodeURIComponent(made.id)}`);
-    } catch (e) {
-      toast({ title: "Couldn't copy it", description: errorMessage(e), tone: "failed" });
-    }
-  };
   return (
     <>
       <title>{`${p.name} · Pipelines · kiln`}</title>
       <Header crumb={p.name} title={p.name}>
-        <Button variant="secondary" onClick={() => void copy()}>
+        <Button variant="secondary" onClick={copy} pending={copying}>
           <Copy /> Copy to change
         </Button>
       </Header>
@@ -130,49 +127,45 @@ function Existing({ id }: { id: string }) {
 
 function Editor({ initial, id }: { initial: PipelineIn; id?: string }) {
   const [p, setP] = React.useState<PipelineIn>(() => ({ name: initial.name, is_enabled: initial.is_enabled, filter: initial.filter, processors: initial.processors }));
-  const [busy, setBusy] = React.useState(false);
+  const opening = useOpening();
   const navigate = useNavigate();
-  const save = async () => {
-    setBusy(true);
-    try {
-      const saved = id ? await observeApi.updatePipeline(id, p) : await observeApi.createPipeline(p);
-      invalidate("observe/pipelines");
-      invalidate(`observe/pipeline/${saved.id}`);
-      toast({ title: id ? "Saved" : "Made", description: `${saved.name}: records taken from now are read by it.`, tone: "succeeded" });
-      if (!id) navigate(`/observe/pipelines/${encodeURIComponent(saved.id)}`);
-    } catch (e) {
-      toast({ title: "Couldn't save it", description: errorMessage(e), tone: "failed" });
-    } finally {
-      setBusy(false);
-    }
-  };
+  const [save, saving] = useAction(async () => {
+    const saved = id ? await observeApi.updatePipeline(id, p) : await observeApi.createPipeline(p);
+    invalidate("observe/pipelines");
+    invalidate(`observe/pipeline/${saved.id}`);
+    toast({ title: id ? "Saved" : "Made", description: `${saved.name}: records taken from now are read by it.`, tone: "succeeded" });
+    if (!id && opening.still()) await navigate(`/observe/pipelines/${encodeURIComponent(saved.id)}`);
+  }, "Couldn't save it");
   return (
     <form
+      ref={opening.ref}
       className="space-y-8"
       onSubmit={(e) => {
         e.preventDefault();
-        if (p.name.trim()) void save();
+        if (p.name.trim()) save();
       }}
     >
-      <div className="grid max-w-[860px] grid-cols-1 gap-3 sm:grid-cols-2">
-        <TextField label="Name" value={p.name} onChange={(e) => setP({ ...p, name: e.target.value })} placeholder="checkout's access log" required />
-        <TextField
-          label="Filter"
-          value={p.filter.query}
-          onChange={(e) => setP({ ...p, filter: { query: e.target.value } })}
-          placeholder="source:checkout"
-          hint="A log search: the records it reads. Empty, every record."
-          className="font-mono"
-          spellCheck={false}
-        />
-      </div>
-      <Processors processors={p.processors} onChange={(processors) => setP({ ...p, processors })} />
+      <HeldFields held={saving && !id} className="space-y-8">
+        <div className="grid max-w-[860px] grid-cols-1 gap-3 sm:grid-cols-2">
+          <TextField label="Name" value={p.name} onChange={(e) => setP({ ...p, name: e.target.value })} placeholder="checkout's access log" required />
+          <TextField
+            label="Filter"
+            value={p.filter.query}
+            onChange={(e) => setP({ ...p, filter: { query: e.target.value } })}
+            placeholder="source:checkout"
+            hint="A log search: the records it reads. Empty, every record."
+            className="font-mono"
+            spellCheck={false}
+          />
+        </div>
+        <Processors processors={p.processors} onChange={(processors) => setP({ ...p, processors })} />
+      </HeldFields>
       <TryIt pipeline={p} />
       <div className="flex justify-end gap-2">
         <Button variant="ghost" asChild>
           <Link to="/observe/pipelines">Cancel</Link>
         </Button>
-        <Button type="submit" disabled={busy || !p.name.trim()}>
+        <Button type="submit" disabled={!p.name.trim()} pending={saving}>
           {id ? "Save" : "Make the pipeline"}
         </Button>
       </div>
@@ -505,19 +498,22 @@ function ProcessorDialog({ processor, onSave, onClose, readOnly }: { processor: 
 
 /** A grok parser: its rules, and its samples read by them as they are written. */
 function Grok({ x, set, readOnly }: { x: Processor; set: (p: Partial<Processor>) => void; readOnly?: boolean }) {
-  const [tried, setTried] = React.useState<{ sample: string; out: PipelineResult | null; error?: string }[] | null>(null);
+  const [result, setResult] = React.useState<{ of: Processor; tried: { sample: string; out: PipelineResult | null; error?: string }[] } | null>(null);
   const samples = x.samples ?? [];
-  const tryIt = async () => {
+  const [tryIt, trying] = useAction(async () => {
+    const of = x;
     try {
       const out = await observeApi.tryPipeline(
-        { name: "try", is_enabled: true, filter: { query: "" }, processors: [{ ...x, is_enabled: true }] },
+        { name: "try", is_enabled: true, filter: { query: "" }, processors: [{ ...of, is_enabled: true }] },
         samples.map((s) => ({ message: s })),
       );
-      setTried(samples.map((s, i) => ({ sample: s, out: out[i] ?? null })));
+      setResult({ of, tried: samples.map((s, i) => ({ sample: s, out: out[i] ?? null })) });
     } catch (e) {
-      setTried(samples.map((s) => ({ sample: s, out: null, error: errorMessage(e) })));
+      setResult({ of, tried: samples.map((s) => ({ sample: s, out: null, error: errorMessage(e) })) });
     }
-  };
+  });
+  // Shown only under the rules and samples it tried: one that comes after an edit was of what was there before (W21-R15).
+  const tried = result?.of === x ? result.tried : null;
   return (
     <>
       <TextField
@@ -549,7 +545,7 @@ function Grok({ x, set, readOnly }: { x: Processor; set: (p: Partial<Processor>)
       <Area id="grok-samples" label="Samples" value={samples.join("\n")} onChange={(v) => set({ samples: lines(v) })} rows={3} placeholder="A line as it comes, a line each" readOnly={readOnly} />
       {samples.length > 0 && (
         <div>
-          <Button variant="ghost" size="xs" onClick={() => void tryIt()}>
+          <Button variant="ghost" size="xs" onClick={tryIt} pending={trying}>
             Try the rules on the samples
           </Button>
           {tried && (
@@ -636,22 +632,25 @@ function TryIt({ pipeline }: { pipeline: PipelineIn }) {
   // The filter's source, until one is typed here.
   const [typed, setTyped] = React.useState<string | null>(null);
   const source = typed ?? guess;
-  const [out, setOut] = React.useState<{ r: PipelineResult; matched: boolean } | { error: string } | null>(null);
-  const run = async () => {
+  const [result, setResult] = React.useState<{ of: { pipeline: PipelineIn; message: string; source: string }; out: { r: PipelineResult; matched: boolean } | { error: string } } | null>(null);
+  const [run, running] = useAction(async () => {
+    const of = { pipeline, message, source };
     try {
       const [r] = await observeApi.tryPipeline({ ...pipeline, is_enabled: true }, [{ message, source }]);
       const changed = !!r && (Object.keys(r.attributes).length > 0 || r.message !== message || r.status !== "info" || r.service !== "");
-      setOut(r ? { r, matched: changed } : { error: "no record came back" });
+      setResult({ of, out: r ? { r, matched: changed } : { error: "no record came back" } });
     } catch (e) {
-      setOut({ error: errorMessage(e) });
+      setResult({ of, out: { error: errorMessage(e) } });
     }
-  };
+  });
+  // Shown only under what it tried: one that comes after an edit was of what was there before (W21-R15).
+  const out = result && result.of.pipeline === pipeline && result.of.message === message && result.of.source === source ? result.out : null;
   return (
     <Panel eyebrow="Try it" title="A record through the pipeline" description="As it is now, saved or not: nothing is kept.">
       <div className="grid grid-cols-1 gap-3 sm:grid-cols-[1fr_12rem_auto] sm:items-end">
         <TextField label="Message" value={message} onChange={(e) => setMessage(e.target.value)} placeholder="A line as it comes" className="font-mono" spellCheck={false} />
         <TextField label="Source" value={source} onChange={(e) => setTyped(e.target.value)} placeholder="nginx" spellCheck={false} />
-        <Button variant="secondary" disabled={!message.trim()} onClick={() => void run()}>
+        <Button variant="secondary" disabled={!message.trim()} pending={running} onClick={run}>
           Try it
         </Button>
       </div>

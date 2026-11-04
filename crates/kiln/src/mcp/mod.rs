@@ -238,12 +238,37 @@ pub fn agent_ops() -> Vec<crate::ops::Op> {
 /// `{"registry", "skills"}`, `{"ok": <answer>}`, or `{"error", "status"?}`. An act (all but the
 /// registry) counts only from the session's holder now, signed so once kiln has certified one
 /// (`crate::custody::act_counts`, docs/ci.md W27-R08), checked over `raw`, the ask as it came; a copy
-/// left behind is refused, and told to let go of the session, which went on elsewhere.
-pub async fn runner_ask(hub: &Arc<Hub>, runner: &str, peer: crate::instances::PeerId, ask: &crate::reach::Question, raw: &Value) -> Value {
-    use crate::reach::Question;
+/// left behind is refused, and told to let go of the session, which went on elsewhere. The runner
+/// relays the act: its record of passing it on, as the hub `placed` it on its stream, is checked
+/// first, and kept with kiln's receipt, or the act is refused, the break recorded naming the runner
+/// (`crate::relays::call`).
+pub async fn runner_ask(hub: &Arc<Hub>, runner: &str, peer: crate::instances::PeerId, ask: &crate::reach::Question, raw: &Value, placed: Option<crate::relays::Placed>) -> Value {
     if hub.agents.lock().get(runner).is_none_or(|a| a.ephemeral || a.outpost) {
         return json!({"error": "kiln's operations are for its agents' runners, not a job's"});
     }
+    let mut carried = None;
+    if let Some(placed) = placed {
+        let session = raw.get("session").and_then(Value::as_str).unwrap_or("");
+        let instance = hub.instances.lock().get(peer).map_or_else(|| "legacy".to_owned(), crate::instances::Instance::label);
+        match crate::relays::call(hub, runner, &instance, session, raw, placed, crate::util::now_unix()).await {
+            Ok(Ok(c)) => carried = c.map(|c| hub.relays.carry(c)),
+            Ok(Err(why)) => {
+                tracing::info!(target: "kiln.custody", %session, %runner, %instance, %why, "a call refused: its runner's record of passing it on doesn't hold");
+                return json!({"error": format!("refused: {why}"), "status": 403});
+            }
+            Err(e) => return json!({"error": format!("its runner's record of passing it on couldn't be checked: {e:#}"), "status": 503}),
+        }
+    }
+    let answer = Box::pin(runner_ask_checked(hub, runner, peer, ask, raw)).await;
+    if let Some(n) = carried {
+        hub.relays.uncarry(n);
+    }
+    answer
+}
+
+/// [`runner_ask`], its runner's record of passing it on checked.
+async fn runner_ask_checked(hub: &Arc<Hub>, runner: &str, peer: crate::instances::PeerId, ask: &crate::reach::Question, raw: &Value) -> Value {
+    use crate::reach::Question;
     let (session, terminal) = match ask {
         Question::Directory => return json!({ "runners": hub.reach_directory() }),
         // Noted whoever started the session (`runner_unread`).
@@ -251,7 +276,7 @@ pub async fn runner_ask(hub: &Arc<Hub>, runner: &str, peer: crate::instances::Pe
         Question::Registry { session, terminal } | Question::Call { session, terminal, .. } => (session.as_str(), terminal.as_str()),
         Question::Page { session, .. } | Question::Stream { session, .. } | Question::Act { session, .. } => (session.as_str(), ""),
         // The hub answers these itself (`Hub::on_read`).
-        Question::Keep { .. } | Question::Holds { .. } | Question::Holders { .. } => return json!({"error": "not a question for kiln's operations"}),
+        Question::Keep { .. } | Question::Holds { .. } | Question::Holders { .. } | Question::Custody { .. } => return json!({"error": "not a question for kiln's operations"}),
     };
     // The person in one of its kiln shells (`kiln spawn --on`, `kiln agents wait`), for a call.
     let caller = if session.is_empty() && !terminal.is_empty() && matches!(ask, Question::Call { .. }) {
@@ -388,7 +413,7 @@ pub async fn runner_ask(hub: &Arc<Hub>, runner: &str, peer: crate::instances::Pe
         Question::Act { .. } => json!({"ok": {}}),
         Question::Directory => json!({ "runners": hub.reach_directory() }),
         Question::Unread { session, what, code, why } => runner_unread(hub, runner, session, what, *code, why).await,
-        Question::Keep { .. } | Question::Holds { .. } | Question::Holders { .. } => json!({"error": "not a question for kiln's operations"}),
+        Question::Keep { .. } | Question::Holds { .. } | Question::Holders { .. } | Question::Custody { .. } => json!({"error": "not a question for kiln's operations"}),
     };
     let size = answer.to_string().len();
     if size > RUNNER_ANSWER_MAX {
@@ -1263,12 +1288,12 @@ mod tests {
             }
             hub.harness.ingest(&hub, &crate::harness::registry::Location::Machine("box".into()), "s1", open("s1"));
             let unread = Question::Unread { session: "s1".into(), what: "tools/call teleport".into(), code: Code::Unknown, why: "Unknown tool: teleport".into() };
-            let a = runner_ask(&hub, "box", 0, &unread, &serde_json::to_value(&unread)?).await;
+            let a = runner_ask(&hub, "box", 0, &unread, &serde_json::to_value(&unread)?, None).await;
             anyhow::ensure!(a.get("ok").is_some(), "{a}");
-            let elsewhere = runner_ask(&hub, "mac", 0, &unread, &serde_json::to_value(&unread)?).await;
+            let elsewhere = runner_ask(&hub, "mac", 0, &unread, &serde_json::to_value(&unread)?, None).await;
             anyhow::ensure!(elsewhere.get("error").is_some(), "{elsewhere}");
             let call = Question::Call { session: "s1".into(), terminal: String::new(), name: "goals.add".into(), input: json!({"golas": ["x"]}), act: None, hand_on: None };
-            let a = runner_ask(&hub, "box", 0, &call, &serde_json::to_value(&call)?).await;
+            let a = runner_ask(&hub, "box", 0, &call, &serde_json::to_value(&call)?, None).await;
             anyhow::ensure!(a.get("code") == Some(&json!("unknown_field")) && a.get("path") == Some(&json!("/golas")) && a.get("status") == Some(&json!(400)), "{a}");
             let session = hub.harness.list().into_iter().find(|i| i.id == "s1").and_then(|i| i.refused);
             anyhow::ensure!(session.as_ref().map(Kept::total) == Some(2), "the session's page: {session:?}");

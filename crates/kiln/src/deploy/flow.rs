@@ -2335,6 +2335,9 @@ async fn follow(d: &Deploy, r: &Release, commit: &str) -> Result<(Landed, Value)
     }
     let since_ms = u64::try_from(r.committed_at.unwrap_or(r.created_at)).unwrap_or(0).saturating_mul(1000);
     let (landed, view) = kilncd::landed(&cd, &id, commit, since_ms);
+    // An environment requiring a verified chain counts it healthy only once its pods run what it
+    // handed on (docs/ci.md W27-R08, R11; the Transfers plan's step 14).
+    let (landed, view) = if landed == Landed::Yes && env.gates.require_chain == Some(true) { kilncd::custody_says(&cd, &id, view).await } else { (landed, view) };
     // Its sync failed because the cluster didn't answer then: synced again now that it does,
     // rather than judged on what the outage did.
     if let Landed::Failed(why) = &landed
@@ -3071,6 +3074,13 @@ mod tests {
             for (environment, running) in [("staging", Some(ran.id)), ("production", None)] {
                 store::put_registration(st, &Registration { app: "web".into(), environment: environment.into(), enabled: true, paused: false, running, created_at: 0, degraded: None }).await?;
             }
+            // Staging's deploy of A through KilnCD left CD's receipt of it for staging's app (the
+            // Transfers plan's step 14): what a promotion from staging follows.
+            let cd_uri = crate::custody::cd_uri(&hub.pki.organization());
+            let image = kiln_ci::identity::deployed::image("registry.example/acme/web", &a);
+            let staged = kiln_ci::identity::deployed::cd_receipt(&cd_uri, &format!("docker://registry.example/acme/web@sha256:{a}"), image, None, "shop/web-staging");
+            let staged = crate::custody::cd_signed(&hub.pki, &staged)?;
+            let held = crate::custody::take(&hub.store, &hub.pki.ca_der, &hub.pki.organization(), &staged, "a test", crate::util::now_unix()).await?.map_err(|e| anyhow::anyhow!("{e}"))?.digest;
             // Production takes it at A: CD hands it on from staging as it goes...
             let (p, _) = store::insert_release(st, &release("production", &a, State::Waiting)).await?;
             step(&d, p.id).await?;
@@ -3090,8 +3100,10 @@ mod tests {
             let cd = crate::custody::cd_uri(&org);
             let said: Vec<(Option<&str>, Option<&str>, Option<&str>)> =
                 hops.iter().map(|h| (h.get("kind").and_then(Value::as_str), h.get("custodian").and_then(Value::as_str), h.get("component").and_then(Value::as_str))).collect();
-            let both = [(Some("received"), Some(cd.as_str()), Some("environment production")), (Some("handed-on"), Some(cd.as_str()), Some("environment staging"))];
+            // Back through what staging's deploy held: the promotion follows CD's receipt of A there.
+            let both = [(Some("received"), Some(cd.as_str()), Some("environment production")), (Some("handed-on"), Some(cd.as_str()), Some("environment staging")), (Some("received"), Some(cd.as_str()), Some("app shop/web-staging"))];
             anyhow::ensure!(said == both, "{said:?}");
+            anyhow::ensure!(hops.last().and_then(|h| h.get("record")) == Some(&json!(held)), "{view}");
             anyhow::ensure!(hops.iter().all(|h| h.pointer("/subject/0/digest/sha256") == Some(&json!(a))), "{view}");
             // Production at B: not what staging ran, refused as a promotion and recorded.
             let (other, _) = store::insert_release(st, &release("production", &b, State::Waiting)).await?;

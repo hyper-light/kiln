@@ -15,6 +15,7 @@ import { ChevronDown } from "lucide-react";
 import { ApiError } from "@/api/client";
 import { peersApi, type Frame, type Openable } from "@/api/peers";
 import { toast } from "@/components/ui/toast";
+import { sendingProps, useAction } from "@/lib/action";
 import { useRes, type Res } from "@/lib/data";
 import { useNavigate } from "@/lib/router";
 import "./clusters.css";
@@ -133,9 +134,9 @@ export function ClusterPicker() {
   return embed ? <FramedPicker embed={embed} /> : <OwnPicker />;
 }
 
-function Pick({ label, away, value, onPick, children }: { label: string; away: boolean; value: string; onPick: (v: string) => void; children: React.ReactNode }) {
+function Pick({ label, away, value, pending = false, onPick, children }: { label: string; away: boolean; value: string; pending?: boolean; onPick: (v: string) => void; children: React.ReactNode }) {
   return (
-    <label className="cluster-pick" data-away={away ? "" : undefined}>
+    <label className="cluster-pick" data-away={away ? "" : undefined} {...sendingProps(pending)}>
       <span className="cluster-pick-name">{label}</span>
       <ChevronDown size={12} aria-hidden="true" />
       <select aria-label="Cluster" value={value} onChange={(e) => onPick(e.target.value)}>
@@ -150,13 +151,21 @@ function OwnPicker() {
   const { data } = useRes(openRes);
   const shown = useClusters((s) => s.shown);
   const navigate = useNavigate();
+  // The cluster picked is named at once, the picker saying its frame is on its way (W21-R15).
+  const [picked, setPicked] = React.useState<string | null>(null);
+  const [open, opening] = useAction((id: string, name: string) => {
+    setPicked(id);
+    return openCluster(id, name);
+  });
   if (data.peers.length === 0) return null;
-  const current = data.peers.find((p) => p.id === shown)?.name ?? data.name;
+  const at = opening ? picked : shown;
+  const current = data.peers.find((p) => p.id === at)?.name ?? data.name;
   return (
     <Pick
       label={current}
-      away={shown !== null}
-      value={shown ?? ""}
+      away={at !== null}
+      value={at ?? ""}
+      pending={opening}
       onPick={(v) => {
         if (v === "") showHome();
         else if (v === MANAGE) {
@@ -164,7 +173,7 @@ function OwnPicker() {
           navigate("/clusters");
         } else {
           const p = data.peers.find((x) => x.id === v);
-          if (p) void openCluster(p.id, p.name);
+          if (p) open(p.id, p.name);
         }
       }}
     >

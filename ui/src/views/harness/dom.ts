@@ -5,7 +5,7 @@
  * and off faster than that never shows). DOM objects that belong to one element (observers, focus,
  * scrolling) are wired with a ref callback that returns its cleanup instead.
  */
-import { useCallback, useState, useSyncExternalStore } from "react";
+import { useCallback, useRef, useState, useSyncExternalStore, type RefObject } from "react";
 
 const nothing = () => 0;
 
@@ -122,4 +122,20 @@ export function useRecent(on: boolean, ms: number): boolean {
   else if (was.last === Infinity) was.last = performance.now();
   const come = useCome(was.last + ms);
   return on || !come;
+}
+
+/**
+ * Whether what holds this ref still shows (`[shown, ref]`): a dialog's answer closes it only then,
+ * not one closed and opened again since, which is another (W21-R15).
+ */
+export function useShown(): [RefObject<boolean>, (el: HTMLElement | null) => (() => void) | undefined] {
+  const shown = useRef(false);
+  const ref = useCallback((el: HTMLElement | null) => {
+    if (!el) return;
+    shown.current = true;
+    return () => {
+      shown.current = false;
+    };
+  }, []);
+  return [shown, ref];
 }

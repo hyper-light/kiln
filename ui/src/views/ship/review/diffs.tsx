@@ -14,6 +14,7 @@ import type { Hunk } from "@/api/harness";
 import type { Conflict, Thread } from "@/api/review";
 import { AboutCard, AboutContext, cardKey, linesLabel, offsetAt, selecting, useCards, wordAt, type Asked } from "@/components/code/about";
 import { Toks } from "@/components/code/highlighted";
+import { sendingProps, useAction } from "@/lib/action";
 import { resolveLanguage, useHighlighter, type Highlight, type Tok } from "@/lib/syntax/browser";
 import type { Res } from "@/lib/data";
 import { useRes } from "@/lib/data";
@@ -40,8 +41,8 @@ export interface FilesCtx {
   q: string;
   /** The lines a span holds, as a file's rows have them (stable, for the memoized threads). */
   linesOf: LinesOf;
-  /** Marks a file viewed, or not, where kiln keeps it (a kiln change's, POST /api/diffs/:key/viewed); left out where nothing keeps it. */
-  viewed?: (file: string, on: boolean) => void;
+  /** Marks a file viewed, or not, where kiln keeps it (a kiln change's, POST /api/diffs/:key/viewed), failing if kiln refuses it; left out where nothing keeps it. */
+  viewed?: (file: string, on: boolean) => Promise<void>;
 }
 
 /** A file's status in words, as kiln's review page says it: the server's when it says one (git's
@@ -115,6 +116,17 @@ export const FileDiff = React.memo(function FileDiff({
   // Viewed folds the file, as on GitHub and kiln's review page; one viewed before opens folded.
   const [viewed, setViewed] = React.useState(meta?.viewed ?? false);
   const [open, setOpen] = React.useState(!(meta?.generated ?? false) && !(meta?.viewed ?? false));
+  // Ticked, it shows at once; while kiln has it the box holds (a press waits), and one kiln refuses
+  // goes back as it was, unfolded again unless it's been opened or shut since (W21-R15).
+  const [view, viewing] = useAction((on: boolean) => {
+    const was = open;
+    setViewed(on);
+    setOpen(!on);
+    return ctx.viewed?.(file.path, on).catch(() => {
+      setViewed(!on);
+      setOpen((o) => (o === !on ? was : o));
+    });
+  });
   const status = statusOf(file, meta?.status);
   const rows = ctx.rowsByFile.get(file.path) ?? [];
   const add = rows.filter((r) => r.kind === "add").length;
@@ -143,18 +155,8 @@ export const FileDiff = React.memo(function FileDiff({
           <span className="rv-add">+{add}</span> <span className="rv-del">−{del}</span>
         </span>
         {ctx.viewed && (
-          <label className="rv-viewed">
-            <input
-              type="checkbox"
-              className="check"
-              checked={viewed}
-              onChange={(e) => {
-                const on = e.currentTarget.checked;
-                setViewed(on);
-                setOpen(!on);
-                ctx.viewed?.(file.path, on);
-              }}
-            />
+          <label className="rv-viewed" {...sendingProps(viewing)}>
+            <input type="checkbox" className="check" checked={viewed} onChange={(e) => view(e.currentTarget.checked)} />
             Viewed
           </label>
         )}
@@ -378,7 +380,8 @@ function Line({ file, row, ctx, map, q, toks, asking }: { file: PatchFile; row: 
             at={{ item: ctx.ops.item, file: file.path, line: n, side }}
             lines={linesIn(ctx.rowsByFile.get(file.path) ?? [], side, from, n!)}
             placeholder={from < n! ? `Comment on lines ${from}–${n}` : `Comment on line ${n}`}
-            onSend={(body, kind) => ctx.ops.commentAt(file.path, n!, side, body, kind ?? "question", from < n! ? from : undefined).then(() => ctx.setDraft(null))}
+            onSend={(body, kind) => ctx.ops.commentAt(file.path, n!, side, body, kind ?? "question", from < n! ? from : undefined)}
+            onSent={() => ctx.setDraft(null)}
             onCancel={() => ctx.setDraft(null)}
             autoFocus
           />

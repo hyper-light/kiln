@@ -7,6 +7,10 @@
 //! Which runners: those named first (`mirror_on`), then the ones connected longest (a machine that
 //! sleeps reconnects often), then the most free disk. One away for a day is replaced; the copy it
 //! has stays where it is.
+//!
+//! Each batch to a mirror goes signed by the server (docs/ci.md W27-R08), once the server gives
+//! its mirrors a custodian for each ([`Mirrors::sign_with`]): its hand-on to the runner process
+//! keeping the copy there now, which signs its receipt as it takes it (`super::feed::Custodian`).
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -15,8 +19,12 @@ use std::sync::{Arc, Mutex, PoisonError};
 use hyper_transport::PeerId;
 use serde::{Deserialize, Serialize};
 
-use super::feed::{Link, Msg, Shipper};
+use super::feed::{Custodian, Link, Msg, Shipper};
 use super::store::Store;
+
+/// The custodian of each mirror's feed: made for its machine, which runner process of it
+/// (`peer`) keeps the copy now said as it changes.
+pub type Custodians = Arc<dyn Fn(&str, Arc<Mutex<Option<PeerId>>>) -> Arc<dyn Custodian> + Send + Sync>;
 
 /// A mirror away this long is replaced.
 const AWAY_MS: i64 = 24 * 3600 * 1000;
@@ -68,6 +76,8 @@ pub struct Mirrors {
     out: async_channel::Sender<(PeerId, String, Vec<u8>)>,
     /// What each mirror sent back to restore the store from: not sent to it again.
     echoes: Option<Arc<super::feed::Echoes>>,
+    /// Who signs for each feed, once the server can ([`Mirrors::sign_with`]).
+    custodians: Mutex<Option<Custodians>>,
 }
 
 /// The candidates in the order they are picked in.
@@ -86,7 +96,16 @@ impl Mirrors {
     pub fn start(store: Store, want: usize, first: Vec<String>, file: PathBuf, echoes: Option<Arc<super::feed::Echoes>>) -> (Arc<Self>, async_channel::Receiver<(PeerId, String, Vec<u8>)>) {
         let chosen: Vec<Chosen> = std::fs::read(&file).ok().and_then(|b| serde_json::from_slice(&b).ok()).unwrap_or_default();
         let (out, rx) = async_channel::bounded(64);
-        (Arc::new(Self { store, want, first, file, chosen: Mutex::new(chosen), feeds: Mutex::new(HashMap::new()), out, echoes }), rx)
+        (Arc::new(Self { store, want, first, file, chosen: Mutex::new(chosen), feeds: Mutex::new(HashMap::new()), out, echoes, custodians: Mutex::new(None) }), rx)
+    }
+
+    /// Each mirror's feed goes signed by the custodian `make` makes for it from now on (those made
+    /// already, too).
+    pub fn sign_with(&self, make: Custodians) {
+        for (machine, f) in self.feeds.lock().unwrap_or_else(PoisonError::into_inner).iter() {
+            f.shipper.sign_with(make(machine, f.peer.clone()));
+        }
+        *self.custodians.lock().unwrap_or_else(PoisonError::into_inner) = Some(make);
     }
 
     /// The machines picked to keep a copy (`mirrors.json`).
@@ -120,6 +139,9 @@ impl Mirrors {
             None => Shipper::start(self.store.clone()),
         };
         let peer: Arc<Mutex<Option<PeerId>>> = Arc::default();
+        if let Some(make) = self.custodians.lock().unwrap_or_else(PoisonError::into_inner).as_ref() {
+            shipper.sign_with(make(machine, peer.clone()));
+        }
         let (to, out) = (peer.clone(), self.out.clone());
         crate::rt::spawn(async move {
             while let Ok((json, data)) = said.recv().await {

@@ -82,6 +82,68 @@ pub mod metrics;
 #[path = "metrics_sysinfo.rs"]
 pub mod metrics;
 
+/// What a reach run's group of processes is named with (`run-<id>`, `crate::reach::serve`): a
+/// person's or an agent's, never an agent's session.
+pub const RUN_GROUP: &str = "run-";
+
+/// The leaf of a delegated systemd unit's cgroup that kiln's own processes (its supervisor and
+/// runners) run in, so the unit's cgroup holds none and can share the CPU among the legs and agents
+/// beside it (docs/priority.md): what `kiln install` names systemd's `DelegateSubgroup=`, and where
+/// a runner moves them where systemd has none.
+pub const UNIT_LEAF: &str = "kiln";
+
+/// A CPU list as Linux writes one (`0-3,8,10-11`: cpuset(7)'s list format, systemd's
+/// `AllowedCPUs=`): the CPUs it names, in order, each once; why not, for one that isn't.
+pub fn cpu_list(text: &str) -> Result<Vec<u32>, String> {
+    /// No Linux numbers more CPUs than this: `NR_CPUS` at its largest (x86's `MAXSMP`).
+    const MOST: u32 = 8192;
+    let mut out = Vec::new();
+    for part in text.split(',').map(str::trim).filter(|p| !p.is_empty()) {
+        let (a, b) = part.split_once('-').unwrap_or((part, part));
+        let cpu = |s: &str| s.trim().parse::<u32>().ok().filter(|c| *c < MOST).ok_or_else(|| format!("{part:?} isn't a CPU (0 to {}) or a range of them (`8-15`)", MOST - 1));
+        let (a, b) = (cpu(a)?, cpu(b)?);
+        if b < a {
+            return Err(format!("{part:?} runs backwards"));
+        }
+        out.extend(a..=b);
+    }
+    out.sort_unstable();
+    out.dedup();
+    if out.is_empty() { Err(format!("{text:?} names no CPU")) } else { Ok(out) }
+}
+
+/// Cores of the server's own (`[server] cores`, docs/priority.md "Cores of its own"; goal 8, plan
+/// 01a1a59c2b29 step 6): those of the CPU list `list` this process may run on, in order; why none,
+/// when none.
+pub fn own_cores(list: &str) -> Result<Vec<u32>, String> {
+    let cores = cpu_list(list)?;
+    #[cfg(target_os = "linux")]
+    {
+        let allowed = rustix::thread::sched_getaffinity(None).map_err(|e| format!("this process's CPUs can't be read: {e}"))?;
+        let mine: Vec<u32> = cores.into_iter().filter(|c| usize::try_from(*c).is_ok_and(|c| allowed.is_set(c))).collect();
+        if mine.is_empty() {
+            return Err(format!("this process may run on none of {list}: its kiln.slice doesn't give them to it (`kiln install` writes it)"));
+        }
+        Ok(mine)
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = cores;
+        Err("cores of the server's own are Linux's alone (a slice's cpuset)".to_owned())
+    }
+}
+
+/// The server first (docs/priority.md; goal 8, plan 01a1a59c2b29 steps 2 to 4): on Windows its
+/// process runs above normal priority; on Linux and macOS its service says how it runs (the
+/// weight of its `kiln.slice`, launchd's `ProcessType`), as `kiln install` writes it.
+pub fn server_first() {
+    #[cfg(windows)]
+    match contain::server_first() {
+        Ok(()) => tracing::info!("the server runs above normal priority"),
+        Err(e) => tracing::warn!(error = %e, "the server runs at normal priority: Windows refused above normal"),
+    }
+}
+
 /// Lowers the calling thread's scheduling priority, ten nice levels below its own (19 at the
 /// most): work that may wait (a query's helper threads) yields to what may not (the writes the
 /// server takes). Linux's threads each have their own nice value (`setpriority(PRIO_PROCESS, tid)`);
@@ -436,6 +498,17 @@ fn reg_query_value(out: &str, name: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Goal 8 (plan 01a1a59c2b29 step 6): `[server] cores` reads as Linux writes a CPU list, and
+    /// says what's wrong with one that isn't.
+    #[test]
+    fn g8_s6_a_cpu_list_reads_as_linux_writes_one() {
+        assert_eq!(cpu_list("8-11"), Ok(vec![8, 9, 10, 11]));
+        assert_eq!(cpu_list(" 4-5, 2 ,4"), Ok(vec![2, 4, 5]));
+        for bad in ["", "x", "3-1", "8192", "0-99999"] {
+            assert!(cpu_list(bad).is_err(), "{bad:?} read");
+        }
+    }
 
     #[test]
     fn machines_are_told_apart_by_the_id_their_os_keeps() {

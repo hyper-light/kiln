@@ -10,16 +10,33 @@ import { Link, useNavigate, useParams } from "@/lib/router";
 import { ArrowRightLeft, Plus, Snowflake, Sun, Trash2 } from "lucide-react";
 
 import { api } from "@/api/client";
-import { boardHref, checkName, deployApi, describe, diffsOf, providerName, releaseAppHref, releaseHref, releaseRepoUrl, type Check, type CheckSpec, type Environment, type Gates, type Move, type ProvenanceRequirement } from "@/api/deploy";
+import {
+  boardHref,
+  checkName,
+  deployApi,
+  describe,
+  diffsOf,
+  providerName,
+  releaseAppHref,
+  releaseHref,
+  releaseRepoUrl,
+  type Check,
+  type CheckSpec,
+  type Environment,
+  type Gates,
+  type Move,
+  type ProvenanceRequirement,
+} from "@/api/deploy";
 import { Button } from "@/components/ui/button";
 import { ConfirmDialog } from "@/components/ui/dialog";
 import { Loadable } from "@/components/ui/loading";
 import { Crumbs, Facts, Panel, SelectField, TextField } from "@/components/ui/misc";
 import { Segmented } from "@/components/ui/tabs";
 import { toast } from "@/components/ui/toast";
+import { useHold, type Hold } from "@/lib/action";
 import { useRes } from "@/lib/data";
 import { errorMessage } from "@/lib/hooks";
-import { invalidate, useSuspenseResource } from "@/lib/resource";
+import { change, invalidate, useSuspenseResource } from "@/lib/resource";
 import { boardRes, DEPLOY_EVENTS, ReleaseState } from "./index";
 import "@/views/deployments/deployments.css";
 import "./releases.css";
@@ -95,8 +112,15 @@ function checkSpec(r: CheckRow): CheckSpec {
   return { name: r.name.trim(), ...how, report_only: r.reportOnly || undefined };
 }
 
+/**
+ * The environment's own changes, one at a time (`EnvView`'s hold), each answering with the
+ * environment as it is now (none: unchanged). While one is `going`, its settings' fields are held
+ * too: its answer starts them again, and would take what was typed meanwhile (W21-R15).
+ */
+type Edits = Omit<Hold, "change"> & { change: (which: string, f: () => Promise<Environment | null>) => void };
+
 /** What every release here passes, how a second one waits, and what agents may do; saved whole. */
-function Settings({ e }: { e: Environment }) {
+function Settings({ e, edits }: { e: Environment; edits: Edits }) {
   const g = e.gates;
   const [after, setAfter] = React.useState((g.after ?? []).join(", "));
   const [soak, setSoak] = React.useState(g.soak ?? "");
@@ -119,7 +143,6 @@ function Settings({ e }: { e: Environment }) {
   const [agents, setAgents] = React.useState(e.agents);
   const [ownersRelease, setOwnersRelease] = React.useState(e.owners?.release ?? false);
   const [pulls, setPulls] = React.useState(g.via === "pull-request");
-  const [busy, setBusy] = React.useState(false);
   // Pull requests (GitLab's merge requests) where the release repository is on another host.
   const onHost = e.release_repo.host !== "kiln";
   const count = Number(approvals);
@@ -128,178 +151,194 @@ function Settings({ e }: { e: Environment }) {
       ? "Approvals: a whole number, 0 for none."
       : pulls && count > 0
         ? "With pull requests, merging one is the approval: set approvals to 0 (who may merge is the branch's protection on its host)."
-      : windows.some((w) => !w.cron.trim() || !w.duration.trim())
-        ? "Each window needs its schedule and how long it lasts."
-        : external.some((r) => !r.name.trim() || (r.kind === "http" ? !r.url.trim() : !r.repository.trim() || !r.workflow.trim()))
-          ? "Each check needs its name, and its URL, or its repository and workflow."
-          : null;
+        : windows.some((w) => !w.cron.trim() || !w.duration.trim())
+          ? "Each window needs its schedule and how long it lasts."
+          : external.some((r) => !r.name.trim() || (r.kind === "http" ? !r.url.trim() : !r.repository.trim() || !r.workflow.trim()))
+            ? "Each check needs its name, and its URL, or its repository and workflow."
+            : null;
   const setWindow = (i: number, patch: Partial<WindowRow>) => setWindows((ws) => ws.map((w, j) => (j === i ? { ...w, ...patch } : w)));
   const setCheck = (i: number, patch: Partial<CheckRow>) => setExternal((xs) => xs.map((x, j) => (j === i ? { ...x, ...patch } : x)));
-  const save = async () => {
-    const builtIn: Check[] = checks.map((n) => builtInSpecs.find((s) => s.name === n) ?? n);
-    const gates: Gates = {
-      // What this form doesn't show is kept as it is.
-      ...g,
-      after: names(after),
-      soak: soak.trim() || undefined,
-      promote: promote === "auto" && names(after).length ? "auto" : undefined,
-      approvals: count > 0 ? { count, reviewers: names(reviewers), self_approve: selfApprove } : undefined,
-      windows: windows.map((w) => {
-        const when = { duration: w.duration.trim(), timezone: w.timezone.trim() || undefined };
-        return w.kind === "allow" ? { allow: w.cron.trim(), ...when } : { deny: w.cron.trim(), ...when };
-      }),
-      checks: [...builtIn, ...external.map(checkSpec)],
-      require_provenance: provenance ? { builder: g.require_provenance?.builder, workflows: names(provWorkflows), branches: names(provBranches) } : undefined,
-      freeze: g.freeze,
-      via: onHost && pulls ? "pull-request" : undefined,
-    };
-    setBusy(true);
-    try {
-      await deployApi.putEnvironment({ ...e, gates, concurrency, agents, owners: { release: ownersRelease } });
-      toast({ title: `${e.name} is saved`, description: "Releases asked for from now on pass its gates as they are.", tone: "succeeded" });
-      invalidate("deploy/");
-    } catch (err) {
-      toast({ title: "Not saved", description: errorMessage(err), tone: "failed" });
-    } finally {
-      setBusy(false);
-    }
-  };
+  const save = () =>
+    edits.change("save", async () => {
+      const builtIn: Check[] = checks.map((n) => builtInSpecs.find((s) => s.name === n) ?? n);
+      const gates: Gates = {
+        // What this form doesn't show is kept as it is.
+        ...g,
+        after: names(after),
+        soak: soak.trim() || undefined,
+        promote: promote === "auto" && names(after).length ? "auto" : undefined,
+        approvals: count > 0 ? { count, reviewers: names(reviewers), self_approve: selfApprove } : undefined,
+        windows: windows.map((w) => {
+          const when = { duration: w.duration.trim(), timezone: w.timezone.trim() || undefined };
+          return w.kind === "allow" ? { allow: w.cron.trim(), ...when } : { deny: w.cron.trim(), ...when };
+        }),
+        checks: [...builtIn, ...external.map(checkSpec)],
+        require_provenance: provenance ? { builder: g.require_provenance?.builder, workflows: names(provWorkflows), branches: names(provBranches) } : undefined,
+        freeze: g.freeze,
+        via: onHost && pulls ? "pull-request" : undefined,
+      };
+      try {
+        const next = await deployApi.putEnvironment({ ...e, gates, concurrency, agents, owners: { release: ownersRelease } });
+        toast({ title: `${e.name} is saved`, description: "Releases asked for from now on pass its gates as they are.", tone: "succeeded" });
+        invalidate("deploy/");
+        return next;
+      } catch (err) {
+        toast({ title: "Not saved", description: errorMessage(err), tone: "failed" });
+        return null;
+      }
+    });
   return (
     <Panel eyebrow="Settings" title="How releases go here" description="Each release passes these gates in order; a person changes what agents may do.">
-      <div className="cd-new-grid">
-        <TextField label="After" placeholder="staging" value={after} spellCheck={false} onChange={(ev) => setAfter(ev.target.value)} hint="Environments a version runs in first." />
-        <TextField label="Soak" placeholder="30m" value={soak} spellCheck={false} onChange={(ev) => setSoak(ev.target.value)} hint="How long it runs there first." />
-        <TextField label="Approvals" inputMode="numeric" value={approvals} onChange={(ev) => setApprovals(ev.target.value)} hint="How many people approve; 0 for none." />
-        <TextField label="Reviewers" placeholder="ada, grace" value={reviewers} onChange={(ev) => setReviewers(ev.target.value)} hint="Who may approve; anyone who approves releases when empty." />
-      </div>
-      <div className="cd-new-checks">
-        <label className="cd-new-check">
-          <input type="checkbox" className="check" checked={selfApprove} onChange={(ev) => setSelfApprove(ev.target.checked)} /> Whoever asked may approve it too
-        </label>
-        {CHECKS.map((c) => (
-          <label key={c.name} className="cd-new-check">
-            <input type="checkbox" className="check" checked={checks.includes(c.name)} onChange={(ev) => setChecks((xs) => (ev.target.checked ? [...xs, c.name] : xs.filter((x) => x !== c.name)))} />{" "}
-            {c.words}
-          </label>
-        ))}
-        <label className="cd-new-check">
-          <input type="checkbox" className="check" checked={provenance} onChange={(ev) => setProvenance(ev.target.checked)} /> Only what kiln's CI built and signed (provenance)
-        </label>
-        {onHost && (
-          <label className="cd-new-check">
-            <input type="checkbox" className="check" checked={pulls} onChange={(ev) => setPulls(ev.target.checked)} /> Releases as pull requests: merging one releases it, closing it cancels it
-          </label>
-        )}
-      </div>
-      {provenance && (
+      <fieldset className="rel-fields" disabled={edits.going}>
         <div className="cd-new-grid">
-          <TextField label="Built by" placeholder=".kiln/build.yaml" value={provWorkflows} spellCheck={false} onChange={(ev) => setProvWorkflows(ev.target.value)} hint="The workflows it may come from; any when empty." />
-          <TextField label="From branches" placeholder="main" value={provBranches} spellCheck={false} onChange={(ev) => setProvBranches(ev.target.value)} hint="The branches it may be built from; any when empty." />
+          <TextField label="After" placeholder="staging" value={after} spellCheck={false} onChange={(ev) => setAfter(ev.target.value)} hint="Environments a version runs in first." />
+          <TextField label="Soak" placeholder="30m" value={soak} spellCheck={false} onChange={(ev) => setSoak(ev.target.value)} hint="How long it runs there first." />
+          <TextField label="Approvals" inputMode="numeric" value={approvals} onChange={(ev) => setApprovals(ev.target.value)} hint="How many people approve; 0 for none." />
+          <TextField label="Reviewers" placeholder="ada, grace" value={reviewers} onChange={(ev) => setReviewers(ev.target.value)} hint="Who may approve; anyone who approves releases when empty." />
         </div>
-      )}
-      <div className="rel-windows">
-        <span className="field-label">Checks of its own</span>
-        {external.map((r, i) => (
-          <div key={i} className="rel-ext-check">
-            <TextField label="Name" placeholder="smoke" value={r.name} spellCheck={false} onChange={(ev) => setCheck(i, { name: ev.target.value })} />
-            <SelectField
-              label="Kind"
-              value={r.kind}
-              onChange={(v) => setCheck(i, { kind: v === "workflow" ? "workflow" : "http" })}
-              options={[
-                { value: "http", label: "A URL answers" },
-                { value: "workflow", label: "A workflow runs" },
-              ]}
-            />
-            {r.kind === "http" ? (
-              <>
-                <TextField label="URL" placeholder="https://checks.example.com/smoke" value={r.url} spellCheck={false} onChange={(ev) => setCheck(i, { url: ev.target.value })} />
-                <TextField label="Timeout" placeholder="10s" value={r.timeout} spellCheck={false} onChange={(ev) => setCheck(i, { timeout: ev.target.value })} />
-              </>
-            ) : (
-              <>
-                <TextField label="Repository" placeholder="acme/web" value={r.repository} spellCheck={false} onChange={(ev) => setCheck(i, { repository: ev.target.value })} />
-                <TextField label="Workflow" placeholder=".kiln/smoke.yaml" value={r.workflow} spellCheck={false} onChange={(ev) => setCheck(i, { workflow: ev.target.value })} />
-                <TextField label="At" placeholder="main" value={r.ref} spellCheck={false} onChange={(ev) => setCheck(i, { ref: ev.target.value })} />
-              </>
-            )}
-            <label className="rel-check">
-              <input type="checkbox" className="check" checked={r.reportOnly} onChange={(ev) => setCheck(i, { reportOnly: ev.target.checked })} />
-              <span>Report only</span>
-            </label>
-            <Button size="xs" variant="ghost-danger" aria-label="Remove the check" onClick={() => setExternal((xs) => xs.filter((_, j) => j !== i))}>
-              <Trash2 />
-            </Button>
-          </div>
-        ))}
-        <Button size="xs" variant="ghost" onClick={() => setExternal((xs) => [...xs, { name: "", kind: "http", url: "", timeout: "", repository: "", workflow: "", ref: "", reportOnly: false }])}>
-          <Plus /> A check
-        </Button>
-      </div>
-      <div className="rel-windows">
-        <span className="field-label">Windows</span>
-        {windows.map((w, i) => (
-          <div key={i} className="rel-window">
-            <SelectField
-              label="Kind"
-              hideLabel
-              value={w.kind}
-              onChange={(v) => setWindow(i, { kind: v === "allow" ? "allow" : "deny" })}
-              options={[
-                { value: "deny", label: "No releases" },
-                { value: "allow", label: "Releases only" },
-              ]}
-            />
-            <TextField label="From (cron)" placeholder="0 17 * * 5" value={w.cron} spellCheck={false} onChange={(ev) => setWindow(i, { cron: ev.target.value })} />
-            <TextField label="For" placeholder="64h" value={w.duration} spellCheck={false} onChange={(ev) => setWindow(i, { duration: ev.target.value })} />
-            <TextField label="Time zone" placeholder="UTC" value={w.timezone} spellCheck={false} onChange={(ev) => setWindow(i, { timezone: ev.target.value })} />
-            <Button size="xs" variant="ghost-danger" aria-label="Remove the window" onClick={() => setWindows((ws) => ws.filter((_, j) => j !== i))}>
-              <Trash2 />
-            </Button>
-          </div>
-        ))}
-        <Button size="xs" variant="ghost" onClick={() => setWindows((ws) => [...ws, { kind: "deny", cron: "", duration: "", timezone: "" }])}>
-          <Plus /> A window
-        </Button>
-      </div>
-      {names(after).length > 0 && (
-        <div className="rel-settings-row">
-          <Segmented
-            label="A version that lands there comes here"
-            value={promote}
-            onChange={setPromote}
-            options={[
-              { value: "manual", label: "When someone releases it" },
-              { value: "auto", label: "By itself" },
-            ]}
-          />
-        </div>
-      )}
-      <div className="rel-settings-row">
-        <Segmented
-          label="A release asked for while one is on its way"
-          value={concurrency}
-          onChange={setConcurrency}
-          options={[
-            { value: "reject", label: "Refused" },
-            { value: "queue", label: "Waits its turn" },
-          ]}
-        />
         <div className="cd-new-checks">
           <label className="cd-new-check">
-            <input type="checkbox" className="check" checked={agents.deploy} onChange={(ev) => setAgents({ ...agents, deploy: ev.target.checked })} /> Agents may release here
+            <input type="checkbox" className="check" checked={selfApprove} onChange={(ev) => setSelfApprove(ev.target.checked)} /> Whoever asked may approve it too
           </label>
+          {CHECKS.map((c) => (
+            <label key={c.name} className="cd-new-check">
+              <input type="checkbox" className="check" checked={checks.includes(c.name)} onChange={(ev) => setChecks((xs) => (ev.target.checked ? [...xs, c.name] : xs.filter((x) => x !== c.name)))} />{" "}
+              {c.words}
+            </label>
+          ))}
           <label className="cd-new-check">
-            <input type="checkbox" className="check" checked={agents.approve} onChange={(ev) => setAgents({ ...agents, approve: ev.target.checked })} /> Agents may approve here
+            <input type="checkbox" className="check" checked={provenance} onChange={(ev) => setProvenance(ev.target.checked)} /> Only what kiln's CI built and signed (provenance)
           </label>
-          <label className="cd-new-check">
-            <input type="checkbox" className="check" checked={ownersRelease} onChange={(ev) => setOwnersRelease(ev.target.checked)} /> An app's owner teams may release it here
-          </label>
+          {onHost && (
+            <label className="cd-new-check">
+              <input type="checkbox" className="check" checked={pulls} onChange={(ev) => setPulls(ev.target.checked)} /> Releases as pull requests: merging one releases it, closing it cancels it
+            </label>
+          )}
         </div>
-      </div>
+        {provenance && (
+          <div className="cd-new-grid">
+            <TextField
+              label="Built by"
+              placeholder=".kiln/build.yaml"
+              value={provWorkflows}
+              spellCheck={false}
+              onChange={(ev) => setProvWorkflows(ev.target.value)}
+              hint="The workflows it may come from; any when empty."
+            />
+            <TextField
+              label="From branches"
+              placeholder="main"
+              value={provBranches}
+              spellCheck={false}
+              onChange={(ev) => setProvBranches(ev.target.value)}
+              hint="The branches it may be built from; any when empty."
+            />
+          </div>
+        )}
+        <div className="rel-windows">
+          <span className="field-label">Checks of its own</span>
+          {external.map((r, i) => (
+            <div key={i} className="rel-ext-check">
+              <TextField label="Name" placeholder="smoke" value={r.name} spellCheck={false} onChange={(ev) => setCheck(i, { name: ev.target.value })} />
+              <SelectField
+                label="Kind"
+                value={r.kind}
+                onChange={(v) => setCheck(i, { kind: v === "workflow" ? "workflow" : "http" })}
+                options={[
+                  { value: "http", label: "A URL answers" },
+                  { value: "workflow", label: "A workflow runs" },
+                ]}
+              />
+              {r.kind === "http" ? (
+                <>
+                  <TextField label="URL" placeholder="https://checks.example.com/smoke" value={r.url} spellCheck={false} onChange={(ev) => setCheck(i, { url: ev.target.value })} />
+                  <TextField label="Timeout" placeholder="10s" value={r.timeout} spellCheck={false} onChange={(ev) => setCheck(i, { timeout: ev.target.value })} />
+                </>
+              ) : (
+                <>
+                  <TextField label="Repository" placeholder="acme/web" value={r.repository} spellCheck={false} onChange={(ev) => setCheck(i, { repository: ev.target.value })} />
+                  <TextField label="Workflow" placeholder=".kiln/smoke.yaml" value={r.workflow} spellCheck={false} onChange={(ev) => setCheck(i, { workflow: ev.target.value })} />
+                  <TextField label="At" placeholder="main" value={r.ref} spellCheck={false} onChange={(ev) => setCheck(i, { ref: ev.target.value })} />
+                </>
+              )}
+              <label className="rel-check">
+                <input type="checkbox" className="check" checked={r.reportOnly} onChange={(ev) => setCheck(i, { reportOnly: ev.target.checked })} />
+                <span>Report only</span>
+              </label>
+              <Button size="xs" variant="ghost-danger" aria-label="Remove the check" onClick={() => setExternal((xs) => xs.filter((_, j) => j !== i))}>
+                <Trash2 />
+              </Button>
+            </div>
+          ))}
+          <Button size="xs" variant="ghost" onClick={() => setExternal((xs) => [...xs, { name: "", kind: "http", url: "", timeout: "", repository: "", workflow: "", ref: "", reportOnly: false }])}>
+            <Plus /> A check
+          </Button>
+        </div>
+        <div className="rel-windows">
+          <span className="field-label">Windows</span>
+          {windows.map((w, i) => (
+            <div key={i} className="rel-window">
+              <SelectField
+                label="Kind"
+                hideLabel
+                value={w.kind}
+                onChange={(v) => setWindow(i, { kind: v === "allow" ? "allow" : "deny" })}
+                options={[
+                  { value: "deny", label: "No releases" },
+                  { value: "allow", label: "Releases only" },
+                ]}
+              />
+              <TextField label="From (cron)" placeholder="0 17 * * 5" value={w.cron} spellCheck={false} onChange={(ev) => setWindow(i, { cron: ev.target.value })} />
+              <TextField label="For" placeholder="64h" value={w.duration} spellCheck={false} onChange={(ev) => setWindow(i, { duration: ev.target.value })} />
+              <TextField label="Time zone" placeholder="UTC" value={w.timezone} spellCheck={false} onChange={(ev) => setWindow(i, { timezone: ev.target.value })} />
+              <Button size="xs" variant="ghost-danger" aria-label="Remove the window" onClick={() => setWindows((ws) => ws.filter((_, j) => j !== i))}>
+                <Trash2 />
+              </Button>
+            </div>
+          ))}
+          <Button size="xs" variant="ghost" onClick={() => setWindows((ws) => [...ws, { kind: "deny", cron: "", duration: "", timezone: "" }])}>
+            <Plus /> A window
+          </Button>
+        </div>
+        {names(after).length > 0 && (
+          <div className="rel-settings-row">
+            <Segmented
+              label="A version that lands there comes here"
+              value={promote}
+              onChange={setPromote}
+              options={[
+                { value: "manual", label: "When someone releases it" },
+                { value: "auto", label: "By itself" },
+              ]}
+            />
+          </div>
+        )}
+        <div className="rel-settings-row">
+          <Segmented
+            label="A release asked for while one is on its way"
+            value={concurrency}
+            onChange={setConcurrency}
+            options={[
+              { value: "reject", label: "Refused" },
+              { value: "queue", label: "Waits its turn" },
+            ]}
+          />
+          <div className="cd-new-checks">
+            <label className="cd-new-check">
+              <input type="checkbox" className="check" checked={agents.deploy} onChange={(ev) => setAgents({ ...agents, deploy: ev.target.checked })} /> Agents may release here
+            </label>
+            <label className="cd-new-check">
+              <input type="checkbox" className="check" checked={agents.approve} onChange={(ev) => setAgents({ ...agents, approve: ev.target.checked })} /> Agents may approve here
+            </label>
+            <label className="cd-new-check">
+              <input type="checkbox" className="check" checked={ownersRelease} onChange={(ev) => setOwnersRelease(ev.target.checked)} /> An app's owner teams may release it here
+            </label>
+          </div>
+        </div>
+      </fieldset>
       {wrong && <p className="rel-msg">{wrong}</p>}
       <div className="rel-settings-actions">
-        <Button size="sm" disabled={busy || !!wrong} onClick={() => void save()}>
+        <Button size="sm" disabled={!!wrong || edits.held("save")} pending={edits.doing("save")} onClick={save}>
           Save
         </Button>
       </div>
@@ -308,37 +347,39 @@ function Settings({ e }: { e: Environment }) {
 }
 
 /** A freeze, put on with why, or lifted. */
-function Freeze({ e }: { e: Environment }) {
+function Freeze({ e, edits }: { e: Environment; edits: Edits }) {
   const [why, setWhy] = React.useState("");
-  const [busy, setBusy] = React.useState(false);
   const frozen = e.gates.freeze;
-  const put = async (freeze: string | undefined) => {
-    setBusy(true);
-    try {
-      await deployApi.putEnvironment({ ...e, gates: { ...e.gates, freeze } });
-      toast({
-        title: freeze ? `${e.name} is frozen` : `${e.name} is thawed`,
-        description: freeze ? "Releases wait here until it's lifted." : "Releases held here go on.",
-        tone: freeze ? "info" : "succeeded",
-      });
-      setWhy("");
-      invalidate("deploy/");
-    } catch (err) {
-      toast({ title: freeze ? "Not frozen" : "Not thawed", description: errorMessage(err), tone: "failed" });
-    } finally {
-      setBusy(false);
-    }
-  };
+  // Frozen or thawed once the server says so (the settings below start again from what it answers),
+  // its button saying meanwhile that it's on its way; Why is emptied only if it still says what was
+  // sent (W21-R15).
+  const put = (freeze: string | undefined) =>
+    edits.change(freeze ? "freeze" : "thaw", async () => {
+      try {
+        const next = await deployApi.putEnvironment({ ...e, gates: { ...e.gates, freeze } });
+        toast({
+          title: freeze ? `${e.name} is frozen` : `${e.name} is thawed`,
+          description: freeze ? "Releases wait here until it's lifted." : "Releases held here go on.",
+          tone: freeze ? "info" : "succeeded",
+        });
+        if (freeze) setWhy((w) => (w.trim() === freeze ? "" : w));
+        invalidate("deploy/");
+        return next;
+      } catch (err) {
+        toast({ title: freeze ? "Not frozen" : "Not thawed", description: errorMessage(err), tone: "failed" });
+        return null;
+      }
+    });
   return (
     <Panel eyebrow="Freeze" title={frozen ? "Frozen" : "Releases go"} description={frozen ? `Why: ${frozen}` : "A freeze holds every release here until it's lifted; each waits, and goes once it is."}>
       {frozen ? (
-        <Button size="sm" variant="secondary" disabled={busy} onClick={() => void put(undefined)}>
+        <Button size="sm" variant="secondary" pending={edits.doing("thaw")} disabled={edits.held("thaw")} onClick={() => put(undefined)}>
           <Sun /> Lift the freeze
         </Button>
       ) : (
         <div className="rel-register">
           <TextField label="Why" placeholder="An incident in payments" value={why} onChange={(ev) => setWhy(ev.target.value)} />
-          <Button size="sm" variant="ghost-danger" disabled={busy || !why.trim()} onClick={() => void put(why.trim())}>
+          <Button size="sm" variant="ghost-danger" disabled={!why.trim() || edits.held("freeze")} pending={edits.doing("freeze")} onClick={() => put(why.trim())}>
             <Snowflake /> Freeze {e.name}
           </Button>
         </div>
@@ -401,12 +442,11 @@ function Provider({ e }: { e: Environment }) {
   const options = [{ value: "kilncd", label: "KilnCD (kiln's own)" }, ...integrations.map((i) => ({ value: `argocd/${i.name}`, label: `Argo CD ${i.name}` }))].filter((o) => o.value !== e.provider);
   const [to, setTo] = React.useState(options[0]?.value ?? "");
   const [applications, setApplications] = React.useState(false);
-  const [busy, setBusy] = React.useState(false);
   const open = !!move && (["comparing", "compared", "handing_over"].includes(move.phase) || (move.phase === "failed" && move.handing_over));
   const agree = !!move && move.registrations.every((r) => r.agrees);
   const argo = e.provider.startsWith("argocd/");
-  const ask = async (handover: boolean, force = false) => {
-    setBusy(true);
+  const key = `deploy/move/${e.name}`;
+  const ask = async (handover: boolean, force: boolean) => {
     try {
       const target = open && move ? move.to : to;
       const m = await deployApi.startMove(e.name, { to: target, handover, force, argocd: { applications: open && move ? move.argocd.applications : applications } });
@@ -415,25 +455,25 @@ function Provider({ e }: { e: Environment }) {
         description: "It goes on by itself; this page follows it.",
         tone: "info",
       });
-      invalidate(`deploy/move/${e.name}`);
+      change<Move | null>(key, () => m);
+      invalidate(key);
     } catch (err) {
       toast({ title: "Not moved", description: errorMessage(err), tone: "failed" });
-    } finally {
-      setBusy(false);
     }
   };
   const cancel = async () => {
-    setBusy(true);
     try {
-      await deployApi.cancelMove(e.name);
+      const m = await deployApi.cancelMove(e.name);
       toast({ title: "Move cancelled", description: `${e.name} stays on ${providerName(e.provider)}.`, tone: "info" });
-      invalidate(`deploy/move/${e.name}`);
+      change<Move | null>(key, () => m);
+      invalidate(key);
     } catch (err) {
       toast({ title: "Not cancelled", description: errorMessage(err), tone: "failed" });
-    } finally {
-      setBusy(false);
     }
   };
+  // The move's steps go one at a time (Hand over anyway and Cancel the move can't both be on their
+  // way): the button pressed says so and the others wait, until the move shows its answer (W21-R15).
+  const { change: go, doing, held } = useHold();
   return (
     <Panel
       eyebrow="Provider"
@@ -457,7 +497,7 @@ function Provider({ e }: { e: Environment }) {
                 <span>kiln writes each Application (no ApplicationSet)</span>
               </label>
             )}
-            <Button size="sm" variant="secondary" disabled={busy || !to} onClick={() => void ask(false)}>
+            <Button size="sm" variant="secondary" disabled={!to || held("compare")} pending={doing("compare")} onClick={() => go("compare", () => ask(false, false))}>
               <ArrowRightLeft /> Compare there
             </Button>
           </div>
@@ -465,22 +505,22 @@ function Provider({ e }: { e: Environment }) {
       ) : (
         <div className="rel-register">
           {move?.phase === "compared" && (
-            <Button size="sm" disabled={busy || !agree} onClick={() => void ask(true)}>
+            <Button size="sm" disabled={!agree || held("hand-over")} pending={doing("hand-over")} onClick={() => go("hand-over", () => ask(true, false))}>
               Hand over to {providerName(move.to)}
             </Button>
           )}
           {move?.phase === "compared" && !agree && (
-            <Button size="sm" variant="ghost-danger" disabled={busy} onClick={() => void ask(true, true)}>
+            <Button size="sm" variant="ghost-danger" disabled={held("anyway")} pending={doing("anyway")} onClick={() => go("anyway", () => ask(true, true))}>
               Hand over anyway
             </Button>
           )}
           {move?.phase === "failed" && move.handing_over && (
-            <Button size="sm" disabled={busy} onClick={() => void ask(true)}>
+            <Button size="sm" disabled={held("finish")} pending={doing("finish")} onClick={() => go("finish", () => ask(true, false))}>
               Finish the handover
             </Button>
           )}
           {move?.phase === "compared" && (
-            <Button size="sm" variant="ghost" disabled={busy} onClick={() => void cancel()}>
+            <Button size="sm" variant="ghost" disabled={held("cancel")} pending={doing("cancel")} onClick={() => go("cancel", cancel)}>
               Cancel the move
             </Button>
           )}
@@ -512,7 +552,7 @@ function Here({ env }: { env: string }) {
 }
 
 /** The environment deleted, once no app is registered there: its release repository is kept. */
-function DeleteEnvironment({ e }: { e: Environment }) {
+function DeleteEnvironment({ e, edits }: { e: Environment; edits: Edits }) {
   const navigate = useNavigate();
   const apps = useRes(boardRes)
     .data.cells.filter((c) => c.registration.environment === e.name)
@@ -523,14 +563,21 @@ function DeleteEnvironment({ e }: { e: Environment }) {
       await deployApi.deleteEnvironment(e.name);
       toast({ title: `${e.name} is deleted`, description: `Its release repository ${e.release_repo.repo} is kept.`, tone: "succeeded" });
       invalidate("deploy/");
-      navigate(boardHref);
+      await navigate(boardHref);
     } catch (err) {
       toast({ title: "Not deleted", description: errorMessage(err), tone: "failed" });
     }
   };
   return (
     <>
-      <Button size="sm" variant="ghost-danger" disabled={apps.length > 0} title={apps.length ? `Registered here: ${apps.join(", ")}. Deregister them first.` : undefined} onClick={() => setAsking(true)}>
+      <Button
+        size="sm"
+        variant="ghost-danger"
+        disabled={apps.length > 0 || edits.held("delete")}
+        pending={edits.doing("delete")}
+        title={apps.length ? `Registered here: ${apps.join(", ")}. Deregister them first.` : undefined}
+        onClick={() => setAsking(true)}
+      >
         <Trash2 /> Delete
       </Button>
       <ConfirmDialog
@@ -540,7 +587,12 @@ function DeleteEnvironment({ e }: { e: Environment }) {
         description={`No app is registered here. ${e.provider.startsWith("argocd/") ? "Its ApplicationSet goes with it. " : ""}Its release repository ${e.release_repo.repo} is kept, and its releases stay in the history.`}
         confirmLabel="Delete the environment"
         danger
-        onConfirm={remove}
+        onConfirm={() => {
+          // Its other changes wait for its deletion, as for any of its changes.
+          const done = remove();
+          edits.change("delete", () => done.then(() => null));
+          return done;
+        }}
       />
     </>
   );
@@ -573,7 +625,13 @@ function RepoLine({ e }: { e: Environment }) {
 }
 
 function EnvView({ name }: { name: string }) {
-  const e = useSuspenseResource(`deploy/environment/${name}`, (s) => deployApi.environment(name, s), { on: DEPLOY_EVENTS }).data;
+  const res = useSuspenseResource(`deploy/environment/${name}`, (s) => deployApi.environment(name, s), { on: DEPLOY_EVENTS });
+  const e = res.data;
+  // Its own changes (its freeze, its settings) go one at a time: the control pressed says it's on its
+  // way and the others wait. Held here, above the settings, which start again from the environment
+  // each answer brings (W21-R15).
+  const hold = useHold();
+  const edits: Edits = { ...hold, change: (which, f) => hold.change(which, () => f().then((next) => next && res.change(() => next))) };
   const gates = gateLines(e.gates);
   const clusters = e.targets.kubernetes.length ? e.targets.kubernetes.join(", ") : "the cluster kiln runs in";
   const platforms = Object.keys(e.targets.platforms ?? {});
@@ -587,7 +645,7 @@ function EnvView({ name }: { name: string }) {
           <h1 className="cd-title">{e.name}</h1>
           <div className="rel-head-actions">
             <Loadable label="what's registered here">
-              <DeleteEnvironment e={e} />
+              <DeleteEnvironment e={e} edits={edits} />
             </Loadable>
           </div>
         </div>
@@ -612,7 +670,7 @@ function EnvView({ name }: { name: string }) {
         <Panel eyebrow="Gates" title={gates.length ? "Each release passes" : "No gates"} description={gates.length ? undefined : "Releases go as soon as they're asked for."}>
           {gates.length > 0 && <Facts items={gates} />}
         </Panel>
-        <Freeze e={e} />
+        <Freeze e={e} edits={edits} />
         <Loadable label="its provider">
           <Provider e={e} />
         </Loadable>
@@ -621,7 +679,7 @@ function EnvView({ name }: { name: string }) {
         <Here env={e.name} />
       </Loadable>
       <div className="rel-stack">
-        <Settings key={JSON.stringify(e)} e={e} />
+        <Settings key={JSON.stringify(e)} e={e} edits={edits} />
       </div>
     </>
   );

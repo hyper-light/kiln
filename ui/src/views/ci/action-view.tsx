@@ -10,6 +10,7 @@ import { Button } from "@/components/ui/button";
 import { Hold } from "@/components/ui/hold";
 import { Panel, SelectField, TextField } from "@/components/ui/misc";
 import { Link } from "@/lib/router";
+import { useAction } from "@/lib/action";
 import { errorMessage } from "@/lib/hooks";
 import { useSuspenseResource } from "@/lib/resource";
 import * as W from "@/lib/workflow-doc";
@@ -124,28 +125,32 @@ export function TryPane({ repo, path, gitRef, text, blocked }: { repo: string; p
   const labels = useSuspenseResource(`ci-labels/${repo}`, (s) => ci.labels(repo, s)).data.labels.map((l) => l.label);
   const [values, setValues] = React.useState<Record<string, string>>({});
   const [runsOn, setRunsOn] = React.useState(labels[0] ?? "");
-  const [started, setStarted] = React.useState<{ run: string; trusted: boolean } | null>(null);
-  const [error, setError] = React.useState<string | null>(null);
-  const [busy, setBusy] = React.useState(false);
+  // What's given; what's left empty takes its default.
+  const inputs = Object.fromEntries(Object.entries(values).filter(([k, v]) => v !== "" && shape.inputs.some((i) => i.name === k)));
+  // A try's answer shows only under what it ran on, and goes once any of that changes (W21-R15).
+  const on = JSON.stringify([repo, path, gitRef, inputs, runsOn]);
+  const [started, setStarted] = React.useState<{ run: string; trusted: boolean; text: string; on: string } | null>(null);
+  const [error, setError] = React.useState<{ said: string; text: string; on: string } | null>(null);
+  if (started && (started.text !== text || started.on !== on)) setStarted(null);
+  if (error && (error.text !== text || error.on !== on)) setError(null);
   const dir = path.slice(0, path.lastIndexOf("/"));
-  const go = async (e: React.FormEvent) => {
-    e.preventDefault();
-    setBusy(true);
-    setError(null);
-    try {
-      // What's given; what's left empty takes its default.
-      const inputs = Object.fromEntries(Object.entries(values).filter(([k, v]) => v !== "" && shape.inputs.some((i) => i.name === k)));
+  const [go, going] = useAction(
+    async () => {
+      setError(null);
       const r = await ci.tryAction(repo, { path, content: text, ref: gitRef || undefined, inputs, runs_on: runsOn });
-      setStarted({ run: r.run, trusted: r.trusted });
-    } catch (err) {
-      setError(errorMessage(err));
-    } finally {
-      setBusy(false);
-    }
-  };
+      setStarted({ run: r.run, trusted: r.trusted, text, on });
+    },
+    (err) => setError({ said: errorMessage(err), text, on }),
+  );
   return (
     <Panel eyebrow="Try it" title={shape.name ? `${shape.name}, once` : "Run it once"}>
-      <form className="grid gap-3" onSubmit={(e) => void go(e)}>
+      <form
+        className="grid gap-3"
+        onSubmit={(e) => {
+          e.preventDefault();
+          go();
+        }}
+      >
         {shape.inputs.map((i) => (
           <TextField
             key={i.name}
@@ -162,14 +167,14 @@ export function TryPane({ repo, path, gitRef, text, blocked }: { repo: string; p
           ) : (
             <p className="flex-1 text-[12.5px] text-[#a1a4ad]">No runner here has a label yet.</p>
           )}
-          <Button size="sm" type="submit" variant="secondary" disabled={busy || blocked || !runsOn}>
+          <Button size="sm" type="submit" variant="secondary" disabled={blocked || !runsOn} pending={going}>
             Try it
           </Button>
         </div>
         <p className="text-[12px] leading-[1.55] text-[#8c8f98]">It runs as the editor has it, saved or not, on {gitRef || "the default branch"}.</p>
         {error && (
           <p role="status" className="text-[12.5px] leading-[1.55] text-[var(--color-fail)] [overflow-wrap:anywhere]">
-            {error}
+            {error.said}
           </p>
         )}
       </form>

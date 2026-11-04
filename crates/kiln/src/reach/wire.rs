@@ -8,8 +8,17 @@
 
 use serde::{Deserialize, Serialize};
 
-/// The inner protocol's version; a peer with another is told so and the link ends.
-pub const VERSION: u32 = 1;
+/// The inner protocol's version this build speaks. A link runs at the asker's version when the
+/// doer speaks it too (from [`MIN_VERSION`] up); a runner from before speaks only 1, and refuses a
+/// Hello at any other, so the asker asks again at 1.
+pub const VERSION: u32 = 2;
+
+/// The oldest version a link may run at.
+pub const MIN_VERSION: u32 = 1;
+
+/// The version a link carries custody records at ([`Ask::Custody`], [`Say::Custody`]; docs/ci.md
+/// W27-R08): never on a link below it.
+pub const CUSTODY: u32 = 2;
 
 /// The largest message either side sends or accepts.
 pub const MAX_MESSAGE: usize = 4 << 20;
@@ -52,12 +61,17 @@ pub enum Ask {
     /// which can't read this either, ends it as it would on any garbage. Appended last: postcard
     /// encodes variants by index.
     Unread { what: String, code: crate::wire::unread::Code, why: String },
+    /// A custody record of what this side hands the other, as JSON (docs/ci.md W27-R08): a sync's
+    /// workspace (before its [`SyncAsk::Commit`]) or a run (before its [`Ask::Run`]), its hand-on
+    /// and the delegation the other side takes it under, or why it goes unsigned. Only on a link at
+    /// [`CUSTODY`] or later. Appended last, after main's `Unread`: postcard numbers variants by place.
+    Custody { json: String },
 }
 
 /// How many variants [`Ask`] has: a newer peer's past them is `unknown`.
-pub const ASK_VARIANTS: usize = 12;
+pub const ASK_VARIANTS: usize = 13;
 /// How many variants [`Say`] has.
-pub const SAY_VARIANTS: usize = 12;
+pub const SAY_VARIANTS: usize = 13;
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Resume {
@@ -93,6 +107,11 @@ pub enum Say {
     /// Word that a message of the asker's couldn't be read here, as [`Ask::Unread`]. Appended last:
     /// postcard encodes variants by index.
     Unread { what: String, code: crate::wire::unread::Code, why: String },
+    /// A custody record of this side's, as JSON (docs/ci.md W27-R08): its receipt of a sync's
+    /// workspace (before its [`SyncSay::Done`]) or of a run (before it starts), or its hand-on of a
+    /// run's output (before its [`Say::Exit`]), or why it goes unsigned. Only on a link at
+    /// [`CUSTODY`] or later. Appended last, after main's `Unread`.
+    Custody { json: String },
 }
 
 /// The machine a link reached.
@@ -277,21 +296,21 @@ mod tests {
         Ok(())
     }
 
-    /// Word that a message couldn't be read is appended last in both, after every older variant,
-    /// and the counts say so.
+    /// Word that a message couldn't be read is appended in both after every older variant (W27's
+    /// custody frames after it), and the counts say so.
     #[test]
     fn word_of_an_unread_message_is_appended_last() -> anyhow::Result<()> {
         use crate::wire::unread::Code;
-        let ask = postcard::to_allocvec(&Ask::Unread { what: "variant 12".into(), code: Code::Unknown, why: "Say has 12 variants".into() })?;
+        let ask = postcard::to_allocvec(&Ask::Unread { what: "variant 13".into(), code: Code::Unknown, why: "Say has 13 variants".into() })?;
         let say = postcard::to_allocvec(&Say::Unread { what: "Ask".into(), code: Code::Malformed, why: "cut short".into() })?;
-        assert_eq!((ask.first().copied(), say.first().copied()), (u8::try_from(ASK_VARIANTS - 1).ok(), u8::try_from(SAY_VARIANTS - 1).ok()));
+        assert_eq!((ask.first().copied(), say.first().copied()), (u8::try_from(ASK_VARIANTS - 2).ok(), u8::try_from(SAY_VARIANTS - 2).ok()));
         let mut d = Deframer::default();
         d.push(&frame(&Ask::Ping { at: 1 })?);
         assert_eq!(d.read::<Ask>(ASK_VARIANTS).ok().flatten(), Some(Ask::Ping { at: 1 }));
         // A newer peer's kind, one cut short inside its length, and one too large.
         let mut d = Deframer::default();
-        d.push(&[0, 0, 0, 1, 12]);
-        assert!(d.read::<Ask>(ASK_VARIANTS).is_err_and(|e| e.code() == Code::Unknown && e.what() == "variant 12"));
+        d.push(&[0, 0, 0, 1, 13]);
+        assert!(d.read::<Ask>(ASK_VARIANTS).is_err_and(|e| e.code() == Code::Unknown && e.what() == "variant 13"));
         let mut d = Deframer::default();
         d.push(&[0, 0, 0, 1, 2]);
         assert!(d.read::<Ask>(ASK_VARIANTS).is_err_and(|e| e.code() == Code::Malformed));
@@ -311,6 +330,22 @@ mod tests {
         let data = first(postcard::to_allocvec(&Say::ObjectData { id: 1, offset: 0, data: vec![1], last: true })?);
         let missing = first(postcard::to_allocvec(&Say::ObjectMissing { id: 1 })?);
         anyhow::ensure!(data == adopted.map(|i| i + 1) && missing == adopted.map(|i| i + 2), "Say's come after Adopted");
+        Ok(())
+    }
+
+    /// W27-R08 (the Transfers plan's step 12): custody frames come after every older variant, so a
+    /// link at version 1 reads as it did; and a link carries them only from [`CUSTODY`] on.
+    #[test]
+    fn w27_r08_custody_frames_are_appended_after_every_older_variant() -> anyhow::Result<()> {
+        use crate::wire::unread::Code;
+        let first = |b: Vec<u8>| b.first().copied();
+        let unread = first(postcard::to_allocvec(&Ask::Unread { what: String::new(), code: Code::Unknown, why: String::new() })?);
+        let custody = first(postcard::to_allocvec(&Ask::Custody { json: "{}".into() })?);
+        anyhow::ensure!(custody == unread.map(|i| i + 1) && custody == u8::try_from(ASK_VARIANTS - 1).ok(), "Ask::Custody comes right after main's Unread, last");
+        let unread = first(postcard::to_allocvec(&Say::Unread { what: String::new(), code: Code::Unknown, why: String::new() })?);
+        let said = first(postcard::to_allocvec(&Say::Custody { json: "{}".into() })?);
+        anyhow::ensure!(said == unread.map(|i| i + 1) && said == u8::try_from(SAY_VARIANTS - 1).ok(), "Say::Custody comes right after main's Unread, last");
+        anyhow::ensure!(MIN_VERSION == 1 && CUSTODY > MIN_VERSION && VERSION >= CUSTODY, "a build from before speaks 1, which carries no custody");
         Ok(())
     }
 

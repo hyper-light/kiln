@@ -1154,6 +1154,8 @@ pub struct Registry {
     pub opened: super::opened::Openings,
     /// Messages waiting for their session's inbox to answer (CP-T3.2), by session and message id.
     waiting: Mutex<HashMap<(String, String), Vec<futures::channel::oneshot::Sender<Said>>>>,
+    /// The ids starts under way asked for ([`Registry::open_as`]), each until its start is done.
+    opening: Mutex<std::collections::HashSet<String>>,
     /// Tests: what every session started here runs instead of its harness (a program that isn't
     /// there, so no harness ever starts, whatever this machine has installed).
     #[cfg(test)]
@@ -1204,6 +1206,37 @@ async fn send_package(hub: &Hub, id: &str, to: &str, bytes: &[u8]) -> Result<(),
         offset += piece.len() as u64;
     }
     Ok(())
+}
+
+/// A start was asked under an id that's a session's already, or another start's under way
+/// ([`Registry::open_as`]).
+#[derive(Debug)]
+pub struct IdTaken(pub String);
+
+impl std::fmt::Display for IdTaken {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "an agent {} is there already, or starting", self.0)
+    }
+}
+
+impl std::error::Error for IdTaken {}
+
+/// The ids a start holds while it's under way ([`Registry::claim`]), let go of as it ends.
+struct Claim<'a> {
+    held: &'a Mutex<std::collections::HashSet<String>>,
+    ids: Vec<String>,
+}
+
+impl Drop for Claim<'_> {
+    fn drop(&mut self) {
+        if self.ids.is_empty() {
+            return;
+        }
+        let mut held = self.held.lock();
+        for id in &self.ids {
+            held.remove(id);
+        }
+    }
 }
 
 impl Registry {
@@ -1292,6 +1325,7 @@ impl Registry {
             ports: super::opened::Tunnels::default(),
             opened: super::opened::Openings::default(),
             waiting: Mutex::new(HashMap::new()),
+            opening: Mutex::new(std::collections::HashSet::new()),
             #[cfg(test)]
             test_program: Mutex::new(None),
         }
@@ -1399,9 +1433,12 @@ impl Registry {
         }
     }
 
-    /// `value` as `file` in the registry's folder, whole or not at all.
+    /// `value` as `file` in the registry's folder, whole or not at all: written off the calling
+    /// thread, soon after, in the order kept (goal 3, plan 01a1a59c2a8e step 5: `crate::keep`).
+    /// Written here, renaming an agent or raising its epoch waited on the disk, on a shard.
     fn keep_json(&self, file: &str, value: &impl serde::Serialize) -> anyhow::Result<()> {
-        keep_json_in(&self.dir, file, value)
+        crate::keep::later(self.dir.join(file), serde_json::to_vec(value)?);
+        Ok(())
     }
 
     /// Whether kiln keeps a session going when it stops part-way (the "keep_going" control, from
@@ -2488,6 +2525,15 @@ impl Registry {
     /// Start sessions on `target`. Sessions on machines are named here and appear at once
     /// (starting); the machine fills them in.
     pub async fn open(&self, hub: &Hub, target: &str, spec: Spec, count: usize) -> anyhow::Result<Vec<Info>> {
+        self.open_as(hub, target, spec, count, &[]).await
+    }
+
+    /// [`Registry::open`], the sessions under `ids` in order (made by the client that asks, so its
+    /// page can open a session's own page before it has started, W21-R15; those it names no id
+    /// for get one made here). One that's a session's already, or a start's under way, is refused
+    /// ([`IdTaken`]) before anything starts: asked again under the same ids, as its answer was
+    /// lost, a start never starts its sessions twice.
+    pub async fn open_as(&self, hub: &Hub, target: &str, spec: Spec, count: usize, ids: &[String]) -> anyhow::Result<Vec<Info>> {
         let count = count.clamp(1, 16);
         let loc = Location::of_target(target);
         // A machine whose kiln is to be upgraded takes no new agent (`crate::skew`).
@@ -2496,6 +2542,7 @@ impl Registry {
         {
             anyhow::bail!("{why}");
         }
+        let _held = self.claim(ids)?;
         let mut out = Vec::new();
         for i in 0..count {
             let mut spec = spec.clone();
@@ -2519,9 +2566,21 @@ impl Registry {
                         }
                     }
                     // A workspace of its own first: a volume over its folder, mounted, its folder in it.
-                    let id = crate::util::new_id();
+                    let id = ids.get(i).cloned().unwrap_or_else(crate::util::new_id);
                     crate::workspace::prepare(&mut spec, &id).await.map_err(|e| e.context("its workspace"))?;
-                    let s = self.local.open(Some(id), spec)?;
+                    let made = spec.workspace.as_ref().and_then(|w| w.made.clone());
+                    let s = match self.local.open(Some(id), spec) {
+                        Ok(s) => s,
+                        Err(e) => {
+                            // What was made for it goes with it: asked again under its id, it's made anew.
+                            if let Some(m) = made
+                                && let Err(gone) = crate::workspace::slates::remove(&m).await
+                            {
+                                tracing::warn!(volume = %m.volume, error = %format!("{gone:#}"), "the workspace of an agent that couldn't start stayed");
+                            }
+                            return Err(e);
+                        }
+                    };
                     let mut info = s.info();
                     info.target = loc.target();
                     // Seed the mirror so the session lists before its first update arrives.
@@ -2529,7 +2588,7 @@ impl Registry {
                     out.push(info);
                 }
                 Location::Machine(machine) => {
-                    let id = crate::util::new_id();
+                    let id = ids.get(i).cloned().unwrap_or_else(crate::util::new_id);
                     let json = serde_json::to_string(&spec)?;
                     // Its runner answers once it started it (docs/wire.md, "Commands").
                     use crate::wire::commands::Answer;
@@ -2612,6 +2671,21 @@ impl Registry {
             hub.emit(&crate::wire::events::ServerEvent::Harness { info: Box::new(info.clone()) });
         }
         Ok(out)
+    }
+
+    /// Holds `ids` for a start ([`Registry::open_as`]) until what's returned goes: none of them may
+    /// be a session's already, or held by another start.
+    fn claim(&self, ids: &[String]) -> anyhow::Result<Claim<'_>> {
+        if ids.is_empty() {
+            return Ok(Claim { held: &self.opening, ids: Vec::new() });
+        }
+        let mirrors = self.mirrors.lock();
+        let mut held = self.opening.lock();
+        if let Some(id) = ids.iter().find(|id| mirrors.contains_key(id.as_str()) || held.contains(id.as_str())) {
+            return Err(anyhow::Error::new(IdTaken(id.clone())));
+        }
+        held.extend(ids.iter().cloned());
+        Ok(Claim { held: &self.opening, ids: ids.to_vec() })
     }
 
     /// Keep an uploaded file for the messages that refer to it (by the returned id): until it
@@ -2944,8 +3018,37 @@ impl Registry {
         Box::pin(self.dispatch_one(hub, id, c)).await
     }
 
+    /// Command `c` for session `id` as [`Registry::command`] sends it, with what kiln and the relays
+    /// before it record of passing it on (`relayed`: docs/ci.md W27-R08's relays, `crate::relays::words`)
+    /// beside it in what goes to the runner, which checks it before the session takes it; sent again
+    /// so when its epoch was left meanwhile.
+    pub async fn command_relayed(&self, hub: &Hub, id: &str, c: Command, relayed: Value) -> Sent {
+        let pending = self.dispatch_relayed(hub, id, c.clone(), Some(&relayed)).await;
+        if let Pending::Answer { message, rx } = pending {
+            let sent = self.answer(hub, id, &message, rx).await;
+            if let Sent::Refused(r) = &sent
+                && let Some(current) = again_for(r)
+            {
+                self.raise_epoch(id, current);
+                return match self.dispatch_relayed(hub, id, c, Some(&relayed)).await {
+                    Pending::Now(sent) => sent,
+                    Pending::Answer { message, rx } => self.answer(hub, id, &message, rx).await,
+                    Pending::Command(p) => Sent::of(p.answer_or_parked(crate::hub::COMMAND_WITHIN).await),
+                };
+            }
+            return sent;
+        }
+        self.resolve(hub, id, c, pending).await
+    }
+
     /// [`Registry::dispatch`], to session `id` alone.
     async fn dispatch_one(&self, hub: &Hub, id: &str, c: Command) -> Pending {
+        self.dispatch_relayed(hub, id, c, None).await
+    }
+
+    /// [`Registry::dispatch_one`], with what kiln and the relays before it record of passing it on
+    /// (`relayed`, [`Registry::command_relayed`]) beside it in what goes to the runner.
+    async fn dispatch_relayed(&self, hub: &Hub, id: &str, c: Command, relayed: Option<&Value>) -> Pending {
         let Some(loc) = self.location(id) else { return Pending::Now(Sent::NoSession) };
         // Kiln's own (`goals::keep`), kept here: its harness has nothing to do with it.
         if let Command::Control { id: control, value } = &c
@@ -2997,7 +3100,14 @@ impl Registry {
                 }
             }
             Location::Machine(machine) => {
-                let Ok(json) = serde_json::to_string(&c) else { return Pending::Now(Sent::NoSession) };
+                let Ok(mut json) = serde_json::to_string(&c) else { return Pending::Now(Sent::NoSession) };
+                if let Some(r) = relayed
+                    && let Ok(mut v) = serde_json::from_str::<Value>(&json)
+                    && let Some(o) = v.as_object_mut()
+                {
+                    o.insert("relayed".into(), r.clone());
+                    json = v.to_string();
+                }
                 // A runner with inboxes takes a message for an epoch, and answers it.
                 let (caps, away) = {
                     let inst = hub.instances.lock();
@@ -3276,6 +3386,35 @@ mod tests {
     /// A viewer that takes state patches, and one that takes nothing as a patch.
     const STATE: Patches = Patches { state: true, changes: false };
     const WHOLE: Patches = Patches { state: false, changes: false };
+
+    /// W21-R15: a start under ids its client made starts its sessions under them, and one asked
+    /// again under any of them (its answer lost on the way back) starts nothing: it's refused as
+    /// taken. An id a start under way holds is refused too, until that start is done.
+    #[test]
+    fn w21_r15_a_start_under_ids_its_client_made_starts_each_once() -> anyhow::Result<()> {
+        crate::rt::block_on(async {
+            let hub = crate::hub::tests::scratch_hub_with(|c| c.terminal.enabled = true).await?;
+            hub.harness.set_test_program("/nonexistent/kiln-test-no-harness");
+            let dir = tempfile::tempdir()?;
+            let spec = Spec { kind: "claude".into(), cwd: Some(dir.path().to_string_lossy().into_owned()), ..Spec::default() };
+            let (a, b) = (crate::util::new_id(), crate::util::new_id());
+            let started = hub.harness.open_as(&hub, "local", spec.clone(), 2, &[a.clone(), b.clone()]).await?;
+            assert_eq!(started.iter().map(|i| i.id.as_str()).collect::<Vec<_>>(), [a.as_str(), b.as_str()]);
+            let listed = hub.harness.list().len();
+            let again = hub.harness.open_as(&hub, "local", spec.clone(), 1, std::slice::from_ref(&b)).await;
+            assert!(again.as_ref().err().and_then(|e| e.downcast_ref::<IdTaken>()).is_some_and(|t| t.0 == b), "{again:?}");
+            assert_eq!(hub.harness.list().len(), listed, "nothing started twice");
+            // Held by a start under way: refused until that start is done.
+            let c = crate::util::new_id();
+            let held = hub.harness.claim(std::slice::from_ref(&c))?;
+            assert!(hub.harness.claim(std::slice::from_ref(&c)).is_err());
+            drop(held);
+            let one = hub.harness.open_as(&hub, "local", spec, 1, std::slice::from_ref(&c)).await?;
+            assert_eq!(one.first().map(|i| i.id.as_str()), Some(c.as_str()));
+            assert!(crate::util::is_id(&crate::util::new_id()) && !crate::util::is_id("../../etc") && !crate::util::is_id(&a.to_uppercase()));
+            Ok(())
+        })
+    }
 
     /// CP-T3.2: a message a machine without inboxes took (`seq` 0) is answered as taken, and as
     /// unchecked: sent again, it's another message. One an inbox took says nothing of the kind.
@@ -3978,8 +4117,43 @@ mod tests {
         let r = Registry::new(dir.path().to_owned());
         r.names.lock().insert("s1".into(), "Mantle".into());
         r.save_names();
-        let again = Registry::new(dir.path().to_owned());
-        assert_eq!(again.names.lock().get("s1").map(String::as_str), Some("Mantle"));
+        // Written off the calling thread, soon after (goal 3, plan 01a1a59c2a8e step 5).
+        let kept = || Registry::new(dir.path().to_owned()).names.lock().get("s1").cloned();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+        while kept().is_none() && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert_eq!(kept().as_deref(), Some("Mantle"));
+        Ok(())
+    }
+
+    /// Goal 3, plan 01a1a59c2a8e step 5 (perf/api-pass's leftover): an agent's name and its epoch
+    /// are kept without the caller waiting on the disk. Here their files' writes wait (each `.part`
+    /// a named pipe nobody reads yet): keeping a name and raising an epoch return at once all the
+    /// same, where they used to wait on the write; read, each pipe then holds what was kept.
+    #[cfg(unix)]
+    #[test]
+    fn g3_s5_names_and_epochs_are_kept_without_waiting_on_the_disk() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        for file in ["names.json.part", "epochs.json.part"] {
+            let made = std::process::Command::new("mkfifo").arg(dir.path().join(file)).status()?;
+            anyhow::ensure!(made.success(), "mkfifo {file}");
+        }
+        let r = Arc::new(Registry::new(dir.path().to_owned()));
+        let (done, kept) = std::sync::mpsc::channel();
+        let keeper = Arc::clone(&r);
+        std::thread::spawn(move || {
+            keeper.names.lock().insert("s1".into(), "Mantle".into());
+            keeper.save_names();
+            keeper.raise_epoch("s1", 7);
+            let _ = done.send(());
+        });
+        anyhow::ensure!(kept.recv_timeout(std::time::Duration::from_secs(10)).is_ok(), "keeping a name and an epoch waited on the disk");
+        // Each pipe read: what the writer, waiting on it, was handed.
+        let names: HashMap<String, String> = serde_json::from_slice(&std::fs::read(dir.path().join("names.json.part"))?)?;
+        anyhow::ensure!(names.get("s1").map(String::as_str) == Some("Mantle"), "{names:?}");
+        let epochs: HashMap<String, u64> = serde_json::from_slice(&std::fs::read(dir.path().join("epochs.json.part"))?)?;
+        anyhow::ensure!(epochs.get("s1") == Some(&7), "{epochs:?}");
         Ok(())
     }
 }

@@ -1,6 +1,9 @@
 import * as React from "react";
 import { Dialog as D } from "radix-ui";
 import { X } from "lucide-react";
+import { sendingProps } from "@/lib/action";
+import { toast } from "./toast";
+import { errorMessage } from "@/lib/hooks";
 import { cn } from "@/lib/utils";
 
 export const Dialog = D.Root;
@@ -57,7 +60,13 @@ export function DialogContent({
   );
 }
 
-/** Simple confirmation dialog. */
+/**
+ * Simple confirmation dialog. Confirmed, it closes once `onConfirm` has done, its button saying
+ * meanwhile that it's on its way (W21-R15); Cancel still closes it (what was confirmed goes on), and
+ * one that failed says why here (or in a toast, once it's closed). One confirm at a time: while one
+ * is on its way, the button says so in every opening, and a press does nothing; an earlier opening's
+ * answer (cancelled, the dialog then opened again, maybe for another row) never closes this one.
+ */
 export function ConfirmDialog({
   open,
   onOpenChange,
@@ -75,32 +84,59 @@ export function ConfirmDialog({
   danger?: boolean;
   onConfirm: () => void | Promise<void>;
 }) {
-  const [busy, setBusy] = React.useState(false);
+  const [shown, setShown] = React.useState({ open, n: 0 });
+  if (shown.open !== open) setShown({ open, n: open ? shown.n + 1 : shown.n });
+  const opening = React.useRef(shown.n);
+  opening.current = shown.n;
+  const openNow = React.useRef(open);
+  openNow.current = open;
+  /** The opening whose confirm is on its way, and why one's failed. */
+  const [going, setGoing] = React.useState<number | null>(null);
+  const [failed, setFailed] = React.useState<{ n: number; why: string } | null>(null);
+  const confirm = () => {
+    const n = shown.n;
+    if (going !== null) return;
+    let done: unknown;
+    try {
+      done = onConfirm();
+    } catch (e) {
+      setFailed({ n, why: errorMessage(e) });
+      return;
+    }
+    setGoing(n);
+    setFailed(null);
+    void Promise.resolve(done)
+      .then(
+        () => {
+          if (opening.current === n) onOpenChange(false);
+        },
+        (e: unknown) => {
+          // Closed since: said where it can still be read.
+          if (opening.current === n && openNow.current) setFailed({ n, why: errorMessage(e) });
+          else toast.error(`${confirmLabel}: it didn't go through`, errorMessage(e));
+        },
+      )
+      .finally(() => setGoing((g) => (g === n ? null : g)));
+  };
+  const why = failed?.n === shown.n ? failed.why : null;
   return (
     <Dialog open={open} onOpenChange={onOpenChange}>
       <DialogContent title={title} eyebrow="Confirm" description={description}>
+        {why && (
+          <p role="alert" className="mb-4 text-[12.5px] leading-[1.55] text-[var(--color-fail)] [overflow-wrap:anywhere]">
+            {why}
+          </p>
+        )}
         <div className="flex flex-wrap justify-end gap-2">
           <DialogClose asChild>
-            <button className="inline-flex min-h-11 items-center rounded-full px-5 text-sm text-[#b4b5ba] hover:bg-white/[0.06] hover:text-white">
-              Cancel
-            </button>
+            <button className="inline-flex min-h-11 items-center rounded-full px-5 text-sm text-[#b4b5ba] hover:bg-white/[0.06] hover:text-white">Cancel</button>
           </DialogClose>
           <button
-            disabled={busy}
-            onClick={async () => {
-              setBusy(true);
-              try {
-                await onConfirm();
-                onOpenChange(false);
-              } finally {
-                setBusy(false);
-              }
-            }}
+            {...sendingProps(going !== null)}
+            onClick={confirm}
             className={cn(
               "inline-flex min-h-11 items-center rounded-full border px-5 text-sm font-medium transition-colors disabled:opacity-40",
-              danger
-                ? "border-[#d1aaad]/40 bg-[#d1aaad]/[0.06] text-[#e7c9cb] hover:border-[#d1aaad]/70 hover:bg-[#d1aaad]/[0.12]"
-                : "border-[#e4e5e7] bg-[#e4e5e7] text-[#111214] hover:bg-white",
+              danger ? "border-[#d1aaad]/40 bg-[#d1aaad]/[0.06] text-[#e7c9cb] hover:border-[#d1aaad]/70 hover:bg-[#d1aaad]/[0.12]" : "border-[#e4e5e7] bg-[#e4e5e7] text-[#111214] hover:bg-white",
             )}
           >
             {confirmLabel}

@@ -1,9 +1,11 @@
-//! kiln's runtime: hyper-raft's hyper-rt (thread-per-core shards with an epoll driver and a timing
-//! wheel, a blocking pool, signals, DNS) behind the handful of primitives the rest of kiln uses.
+//! kiln's runtime: kiln-rt, its own copy of hyper-raft's hyper-rt (thread-per-core shards with an
+//! epoll driver and a timing wheel, a blocking pool, a compute pool, signals, DNS) behind the handful
+//! of primitives the rest of kiln uses.
 //!
 //! * One process-wide [`hyper_rt::Runtime`], started on first use with the sizing chosen by
 //!   [`configure`] (server, agent or CLI). Shards never steal work and there is no preemption, so
-//!   anything CPU-heavy or blocking goes to the blocking pool ([`blocking`]).
+//!   CPU-heavy work goes to the compute pool ([`compute`], [`compute_pieces`]: off the shards and below
+//!   them in the OS's priority) and calls that block go to the blocking pool ([`blocking`]).
 //! * [`spawn`] keeps a task on the calling shard (locality: sockets and timers stay where they were
 //!   registered); spawns from outside the runtime are spread round-robin over the shards.
 //! * hyper-rt's leaf futures (timers, socket readiness, its sync channels) accept only the polling
@@ -36,26 +38,76 @@ pub struct Profile {
     pub shards: u16,
     /// Task slots per shard (about 650 B of RSS each with timers and interests at 2x).
     pub tasks_per_shard: usize,
-    /// Places in the blocking pool's shares: (dns, store, fs).
+    /// Places in the blocking pool's shares: (dns, store, fs). The blocking pool is for calls that block a
+    /// thread; CPU work goes to the compute pool ([`compute`]; goal 3, plan 01a1a59c2a8e step 4), which the
+    /// pool's `fs` share carried before (the UI's compression, password hashing, digests of bytes in
+    /// memory). The server's come from what the lab measured of each share (goal 3, step 4; the series
+    /// `kiln_blocking_*` on /metrics, `crate::pool_health`; docs/runtime-lab.md, "Goal 3"), by Little's law
+    /// as hyper-rt sizes a shard's tasks (`hyper_rt::runtime::admission_limit`): the jobs a share holds at
+    /// once are the rate they come at times the time each runs, here its p99 ([`AtOnce`]):
+    /// - `fs` (files, `/proc`, archives, a child's wait): [`SERVER_FS`];
+    /// - `store` (kiln.db's statements): its one connection takes one at a time (`crate::store`), so places
+    ///   past the connection's and one waiting its turn at it would only wait on its lock: two
+    ///   ([`SERVER_STORE`]). The lab's rate times p99 run asks far more, 24 places calm: what its statements
+    ///   wait for is the connection, not the share (`blocking.store.wait_p99_ms`, 440 ms calm);
+    /// - `dns` (`getaddrinfo`): the lab's kiln resolves no name (every address it dials is a literal), so
+    ///   the lab can't size it: four, kiln's count from its move onto hyper-rt (f202896cb2d), until
+    ///   production's `kiln_blocking_run_seconds{share="dns"}` says how many it holds at once.
+    ///
+    /// A runner's and a command's are kiln's counts from that move: the lab reads only its server's
+    /// /metrics.
     pub pool: (usize, usize, usize),
+    /// Whether the runtime says how it was sized at `info` (a server's and a runner's logs), or only at
+    /// `debug` (a command's, whose output is the person's).
+    pub announce: bool,
 }
+
+/// What the lab measured of one of the server's blocking pool shares where it held the most (goal 3, plan
+/// 01a1a59c2a8e step 4; docs/runtime-lab.md, "Goal 3"): its jobs at once by Little's law, each round's jobs a
+/// second times their p99 run (kiln-lab's `blocking.<share>.little_p99`), the median of a run's rounds.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct AtOnce(pub f64);
+
+impl AtOnce {
+    /// The places that is: rounded up to whole places, at least one.
+    pub fn places(self) -> usize {
+        if self.0.is_finite() && self.0 > 1.0 { self.0.ceil() as usize } else { 1 }
+    }
+}
+
+/// The server's `fs` share where its jobs ran longest, with as many CPU hogs as the lab's CPUs: 24.9 jobs a
+/// second at a p99 run of 1,056 ms, 25.5 at once (four rounds, 2026-11-04; calm, 47.8 a second at a p99 of
+/// 82 ms, 3.8 at once). Against the 8 places it had, 26 made no difference beyond noise in any of the lab's
+/// 94 numbers there (six rounds each, interleaved): its jobs waited 4.7 and 4.8 ms at p99 for a place, the
+/// pool's threads' own wait for a CPU beside the hogs, not a share that's full.
+pub const SERVER_FS: AtOnce = AtOnce(25.54);
+
+/// The connections `crate::store` holds (its one `conn`), each taking a statement at a time.
+pub const STORE_CONNECTIONS: usize = 1;
+
+/// The server's `store` share: a place for each connection's statement, and one waiting its turn at it.
+pub const SERVER_STORE: usize = STORE_CONNECTIONS + 1;
+
+/// The server's `dns` share: kiln's count from its move onto hyper-rt, which the lab can't measure
+/// ([`Profile::pool`]).
+pub const SERVER_DNS: usize = 4;
 
 impl Profile {
     /// The server: HTTP connections, websockets, the scheduler and GitOps loops.
     pub fn server() -> Self {
         let cpus = std::thread::available_parallelism().map_or(4, std::num::NonZero::get);
         let shards = u16::try_from((cpus / 4).clamp(2, 4)).unwrap_or(2);
-        Self { shards, tasks_per_shard: 8192, pool: (4, 2, 8) }
+        Self { shards, tasks_per_shard: 8192, pool: (SERVER_DNS, SERVER_STORE, SERVER_FS.places()), announce: true }
     }
 
     /// An agent: a few jobs, their output pumps, terminals.
     pub fn agent() -> Self {
-        Self { shards: 2, tasks_per_shard: 2048, pool: (2, 1, 6) }
+        Self { shards: 2, tasks_per_shard: 2048, pool: (2, 1, 6), announce: true }
     }
 
     /// One-shot CLI commands and tests.
     pub fn tool() -> Self {
-        Self { shards: 2, tasks_per_shard: 4096, pool: (2, 2, 4) }
+        Self { shards: 2, tasks_per_shard: 4096, pool: (2, 2, 4), announce: false }
     }
 
     fn with_env_overrides(mut self) -> Self {
@@ -65,8 +117,19 @@ impl Profile {
         if let Some(n) = std::env::var("KILN_RT_TASKS").ok().and_then(|v| v.parse::<usize>().ok()) {
             self.tasks_per_shard = n.clamp(256, 1 << 20);
         }
+        // The blocking pool's places, `dns,store,fs` (the lab's A/B of share sizes on one build).
+        if let Some(pool) = std::env::var("KILN_RT_BLOCKING").ok().as_deref().and_then(places) {
+            self.pool = pool;
+        }
         self
     }
+}
+
+/// `dns,store,fs` as three counts of places, each at least one.
+fn places(v: &str) -> Option<(usize, usize, usize)> {
+    let mut it = v.split(',').map(|n| n.trim().parse::<usize>().ok().filter(|n| *n > 0));
+    let pool = (it.next()??, it.next()??, it.next()??);
+    it.next().is_none().then_some(pool)
 }
 
 static PROFILE: OnceLock<Profile> = OnceLock::new();
@@ -74,6 +137,30 @@ static PROFILE: OnceLock<Profile> = OnceLock::new();
 /// Choose the runtime's size. Only the first call before the runtime starts has any effect.
 pub fn configure(profile: Profile) {
     let _ = PROFILE.set(profile);
+}
+
+/// The runtime's size as it starts (or started): the profile chosen, with the environment's overrides.
+pub fn profile() -> Profile {
+    PROFILE.get().copied().unwrap_or_else(Profile::tool).with_env_overrides()
+}
+
+/// The cores of the process's own its shards are fixed to (docs/priority.md, "Cores of its own";
+/// goal 8, plan 01a1a59c2b29 step 6), as [`pin`] chose them.
+static CORES: OnceLock<Vec<u32>> = OnceLock::new();
+
+/// Fix the runtime's shards to `cores`, cores of the process's own (the server's `[server] cores`),
+/// in their order: only the first call before the runtime starts has any effect.
+pub fn pin(cores: Vec<u32>) {
+    let _ = CORES.set(cores);
+}
+
+/// The core each of `shards` shards is fixed to, from cores of the process's own: the first kept
+/// for its threads that aren't shards (its blocking pool, its timers' helpers), as hyper-rt's
+/// placement keeps one, and each shard on the next, around again when there are more shards than
+/// cores; with a single core, every shard on it.
+fn shard_cores(cores: &[u32], shards: u16) -> Vec<u32> {
+    let rest = cores.get(1..).filter(|r| !r.is_empty()).unwrap_or(cores);
+    (0..usize::from(shards)).filter_map(|i| rest.get(i.checked_rem(rest.len())?).copied()).collect()
 }
 
 /// hyper-rt configuration (see the sizing rules in hyper-rt's docs): timers at twice the tasks so the
@@ -111,8 +198,11 @@ struct Rt {
 static RT: OnceLock<Result<Rt, String>> = OnceLock::new();
 
 fn start() -> Result<Rt, String> {
-    let p = PROFILE.get().copied().unwrap_or_else(Profile::tool).with_env_overrides();
+    let p = profile();
     let (dns, store, fs) = p.pool;
+    // Each job's wait and run, by share, on /metrics: what the shares' sizes are derived from (goal 3, plan
+    // 01a1a59c2a8e step 4; `crate::pool_health`).
+    let _ = hyper_rt::blocking::observe(crate::pool_health::blocking_job);
     let pool = hyper_rt::blocking::Config {
         workers: dns + store + fs,
         shares: vec![
@@ -125,13 +215,63 @@ fn start() -> Result<Rt, String> {
         Ok(()) | Err(RtError::BadConfig { .. }) => {}
         Err(e) => return Err(format!("blocking pool: {e}")),
     }
-    let runtime = Runtime::start(&runtime_config(p.shards, p.tasks_per_shard)).map_err(|e| format!("runtime: {e}"))?;
+    let mut config = runtime_config(p.shards, p.tasks_per_shard);
+    if let Some(cores) = CORES.get() {
+        config.cores = shard_cores(cores, p.shards);
+        config.pin = !config.cores.is_empty();
+    }
+    start_compute(&p, &config);
+    let runtime = Runtime::start(&config).map_err(|e| format!("runtime: {e}"))?;
     let holders: Vec<SlotHolder> = runtime.shard_ids().iter().filter_map(|id| runtime.holder_of(*id)).collect();
     if holders.is_empty() {
         return Err("runtime started without shards".to_owned());
     }
+    // Each shard asks for a slice of its step (goal 3, plan 01a1a59c2a8e step 1): waking on a CPU a compute
+    // pool thread holds, it takes the CPU at once (`hyper_rt::compute::prefer_current_thread`; Linux).
+    for holder in &holders {
+        let slice = config.step_budget_ns;
+        let _ = hyper_rt::runtime::submit_to_holder(*holder, async move {
+            if let Err(refusal) = hyper_rt::compute::prefer_current_thread(slice) {
+                tracing::debug!(%refusal, "a shard kept the OS's slice");
+            }
+        });
+    }
     tracing::debug!(shards = p.shards, tasks = p.tasks_per_shard, "hyper-rt runtime started");
     Ok(Rt { _runtime: runtime, holders, next: AtomicUsize::new(0) })
+}
+
+/// The compute pool (goal 3 of the API runtime program, plan 01a1a59c2a8e step 1; `hyper_rt::compute`): as
+/// many threads as the CPU the process is granted (its cgroup's quota or its cpuset, else the OS's count)
+/// less its shards, at a lower OS priority than the shards that still has its share of the CPU against
+/// other work in the process's cgroup, as requests wait on its jobs (`Rank::Below`); a piece of a job as
+/// long as a shard's step, so a long job gives its thread to a waiting one as a task gives its shard; room
+/// for a job for every task the shards can hold, each of which awaits its own. Said with how its size was
+/// derived.
+fn start_compute(p: &Profile, config: &RuntimeConfig) {
+    if hyper_rt::compute::running() {
+        return;
+    }
+    let grant = hyper_rt::compute::Grant::of_process();
+    let shards = usize::from(p.shards);
+    let workers = hyper_rt::compute::workers_for(&grant, shards);
+    let pool = hyper_rt::compute::Config { workers, queued: shards.saturating_mul(p.tasks_per_shard), piece_ns: config.step_budget_ns, rank: hyper_rt::compute::Rank::Below };
+    // Each job's wait for a thread and each piece's time, on /metrics (step 3; `crate::pool_health`).
+    let _ = hyper_rt::compute::observe(crate::pool_health::compute_job);
+    match hyper_rt::compute::start(pool) {
+        Ok(started) => {
+            let priority = match started.priority {
+                Ok(priority) => priority.to_string(),
+                Err(refusal) => format!("the process's own ({refusal})"),
+            };
+            let size = format!("{} threads: {grant}, less {shards} shards", started.workers);
+            if p.announce {
+                tracing::info!(size = %size, priority = %priority, lowered = started.lowered, "compute pool started");
+            } else {
+                tracing::debug!(size = %size, priority = %priority, lowered = started.lowered, "compute pool started");
+            }
+        }
+        Err(e) => tracing::warn!(error = %e, "the compute pool didn't start: CPU-heavy jobs run on threads of their own"),
+    }
 }
 
 fn rt() -> anyhow::Result<&'static Rt> {
@@ -267,6 +407,19 @@ pub fn spawn_spread<F: Future<Output = ()> + Send + 'static>(fut: F) {
     tracing::error!("hyper-rt refused a connection task on every shard; connection dropped");
 }
 
+/// The runtime's shards (it's started if it hasn't been): 0 when it couldn't start.
+pub fn shard_count() -> usize {
+    rt().map_or(0, |rt| rt.holders.len())
+}
+
+/// Run `fut` on shard `i` (of [`shard_count`]) and no other, for a task whose work is that shard's
+/// own: a probe of its health (`crate::shard_health`), or a test holding one shard and not the
+/// rest. Whether the shard took it.
+pub fn spawn_on<F: Future<Output = ()> + Send + 'static>(i: usize, fut: F) -> bool {
+    let Ok(rt) = rt() else { return false };
+    rt.holders.get(i).is_some_and(|holder| hyper_rt::runtime::submit_to_holder(*holder, fut).is_ok())
+}
+
 /// Run a `!Send` future as a task on the current shard. Refused off the runtime.
 pub fn spawn_local<F: Future<Output = ()> + 'static>(fut: F) -> Result<TaskId, RtError> {
     hyper_rt::futures::spawn_detached(fut)
@@ -299,13 +452,151 @@ where
 
 // ------------------------------------------------------------------------------- blocking pool
 
-/// Run `f` on the blocking pool's `fs` share (files, `/proc`, archives, anything that blocks).
+/// Run `f` on the blocking pool's `fs` share: files, `/proc`, archives, anything that blocks. Work that
+/// only computes goes to [`compute`].
 pub async fn blocking<R, F>(f: F) -> anyhow::Result<R>
 where
     F: FnOnce() -> R + Send + 'static,
     R: Send + 'static,
 {
     blocking_in(SHARE_FS, f).await
+}
+
+// --------------------------------------------------------------------------------- compute pool
+
+pub use hyper_rt::compute::{Step, Turn};
+
+/// Run `f` on the compute pool: CPU-heavy work (building snapshots, serializing big payloads,
+/// compressing, diffing, hashing), off every shard and below them in the OS's priority, so one heavy
+/// request holds up no other (goal 3, plan 01a1a59c2a8e; `hyper_rt::compute`). Its result comes back
+/// here. Waits while the pool is at its bound; with no pool running, `f` gets a thread of its own. A
+/// job that can run long goes in pieces: [`compute_pieces`].
+pub async fn compute<R, F>(f: F) -> anyhow::Result<R>
+where
+    F: FnOnce() -> R + Send + 'static,
+    R: Send + 'static,
+{
+    rt()?;
+    let (tx, rx) = futures::channel::oneshot::channel::<R>();
+    let job = move || {
+        let _ = tx.send(f());
+    };
+    to_compute(job, |job| hyper_rt::compute::run(job).map(drop), |job| job()).await?;
+    rx.await.map_err(|_| anyhow::anyhow!("compute job failed (it panicked)"))
+}
+
+/// Run a job in pieces on the compute pool: `step` is called with `state` and its piece's [`Turn`]
+/// until it returns [`Step::Done`]. Between units of its work it asks [`Turn::over`], and returns
+/// [`Step::More`] when told yes: its piece has had a shard's step and another job waits for the thread,
+/// which it then gives up, going on after (big JSON written a part at a time, a long diff a file at a
+/// time). Otherwise as [`compute`].
+pub async fn compute_pieces<S, T, F>(state: S, mut step: F) -> anyhow::Result<T>
+where
+    S: Send + 'static,
+    T: Send + 'static,
+    F: FnMut(&mut S, &Turn<'_>) -> Step<T> + Send + 'static,
+{
+    rt()?;
+    let (tx, rx) = futures::channel::oneshot::channel::<T>();
+    let piece = move |(state, tx): &mut (S, Option<futures::channel::oneshot::Sender<T>>), turn: &Turn<'_>| match step(state, turn) {
+        Step::Done(value) => {
+            if let Some(tx) = tx.take() {
+                let _ = tx.send(value);
+            }
+            Step::Done(())
+        }
+        Step::More => Step::More,
+    };
+    to_compute(((state, Some(tx)), piece), |(state, piece)| hyper_rt::compute::run_pieces(state, piece).map(drop), |(state, piece)| hyper_rt::compute::run_here(state, piece)).await?;
+    rx.await.map_err(|_| anyhow::anyhow!("compute job failed (it panicked)"))
+}
+
+/// `f` of each item on the compute pool, in pieces ([`compute_pieces`]): an item a unit, its piece
+/// ended where another job waits, so a long list holds no pool thread long. The outputs in the items'
+/// order.
+pub async fn compute_map<T, R, F>(items: Vec<T>, f: F) -> anyhow::Result<Vec<R>>
+where
+    T: Send + 'static,
+    R: Send + 'static,
+    F: FnMut(T) -> R + Send + 'static,
+{
+    let out = Vec::with_capacity(items.len());
+    compute_pieces((items.into_iter(), out, f), |(todo, out, f), turn| {
+        for item in todo.by_ref() {
+            out.push(f(item));
+            if turn.over() {
+                return Step::More;
+            }
+        }
+        Step::Done(std::mem::take(out))
+    })
+    .await
+}
+
+/// [`compute_pieces`] for a thread of its own, which may block (never a shard): the job runs on the compute
+/// pool, in pieces, and this thread waits for its result. At the pool's bound it waits and asks again, as
+/// [`to_compute`] does; with no pool running the job runs here. For a thread that works through what comes
+/// to it in order (the conversation feed's intake: `crate::convo::feed`), which keeps its order by waiting.
+pub fn compute_pieces_blocking<S, T, F>(state: S, mut step: F) -> anyhow::Result<T>
+where
+    S: Send + 'static,
+    T: Send + 'static,
+    F: FnMut(&mut S, &Turn<'_>) -> Step<T> + Send + 'static,
+{
+    // The pool starts with the runtime; where neither can, the job is refused and runs here.
+    let _ = rt();
+    let (tx, rx) = std::sync::mpsc::sync_channel::<T>(1);
+    let piece = move |(state, tx): &mut (S, Option<std::sync::mpsc::SyncSender<T>>), turn: &Turn<'_>| match step(state, turn) {
+        Step::Done(value) => {
+            if let Some(tx) = tx.take() {
+                let _ = tx.send(value);
+            }
+            Step::Done(())
+        }
+        Step::More => Step::More,
+    };
+    let mut job = ((state, Some(tx)), piece);
+    let mut delay = Duration::from_millis(1);
+    loop {
+        match hyper_rt::compute::run_pieces(job.0, job.1) {
+            Ok(_) => break,
+            Err(refused) if matches!(refused.error, RtError::Capacity { .. }) => {
+                job = refused.job;
+                std::thread::sleep(delay);
+                delay = (delay * 2).min(Duration::from_millis(100));
+            }
+            Err(refused) => {
+                // Here, inside an unwind boundary as the pool's are: one that unwinds drops its sender.
+                let (state, piece) = refused.job;
+                let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || hyper_rt::compute::run_here(state, piece)));
+                break;
+            }
+        }
+    }
+    rx.recv().map_err(|_| anyhow::anyhow!("compute job failed (it panicked)"))
+}
+
+/// Hands `job` to the compute pool by `submit`. At the pool's bound it waits, as [`blocking_in`] does
+/// for a full share, and asks again with the job handed back; with no pool running it runs the job by
+/// `alone` on a thread of its own.
+async fn to_compute<J: Send + 'static>(mut job: J, submit: impl Fn(J) -> Result<(), hyper_rt::compute::Refused<J>>, alone: fn(J)) -> anyhow::Result<()> {
+    let mut delay = Duration::from_millis(1);
+    loop {
+        match submit(job) {
+            Ok(()) => return Ok(()),
+            Err(refused) if matches!(refused.error, RtError::Capacity { .. }) => {
+                job = refused.job;
+                sleep(delay).await;
+                delay = (delay * 2).min(Duration::from_millis(100));
+            }
+            Err(refused) => {
+                tracing::warn!(error = %refused.error, "compute pool unavailable; running on a thread of its own");
+                let job = refused.job;
+                std::thread::Builder::new().name("kiln-compute".into()).spawn(move || alone(job)).context("spawn a compute thread")?;
+                return Ok(());
+            }
+        }
+    }
 }
 
 /// Run `f` on a thread of its own, not the pool's: for a job that mostly waits on other work, for
@@ -1000,6 +1291,17 @@ impl Signals {
 mod tests {
     use super::*;
 
+    /// Goal 8 (plan 01a1a59c2b29 step 6): with cores of its own the server's shards each get one,
+    /// the first core kept for its other threads; more shards than cores go around again, and a
+    /// single core takes them all.
+    #[test]
+    fn g8_s6_shards_are_fixed_to_cores_of_the_servers_own() {
+        assert_eq!(shard_cores(&[8, 9, 10, 11], 2), vec![9, 10]);
+        assert_eq!(shard_cores(&[8, 9, 10], 4), vec![9, 10, 9, 10]);
+        assert_eq!(shard_cores(&[5], 2), vec![5, 5]);
+        assert!(shard_cores(&[], 2).is_empty());
+    }
+
     /// `each` keeps the items' order, runs no more than `n` at once, runs them at once (four
     /// 50 ms waits take ~one), and polls them under the task's own waker: a hyper-rt connect inside
     /// it works, as it would not under futures' `buffered`.
@@ -1146,6 +1448,83 @@ mod tests {
             assert_eq!(a.port(), 80);
             Ok(())
         })
+    }
+
+    /// Goal 3, plan 01a1a59c2a8e step 1: CPU-heavy work goes to the compute pool, started with the
+    /// runtime: it runs on none of the shards, at a lower OS priority than theirs, and its result comes
+    /// back to the task that asked; a job in pieces goes on to its end.
+    #[test]
+    fn g3_s1_compute_runs_off_the_shards_below_them_and_answers() -> anyhow::Result<()> {
+        block_on(async {
+            anyhow::ensure!(hyper_rt::compute::running(), "the compute pool started with the runtime");
+            let here = hyper_rt::compute::thread_priority();
+            let (on_a_shard, there) = compute(|| (on_shard(), hyper_rt::compute::thread_priority())).await?;
+            anyhow::ensure!(!on_a_shard, "the job ran on a shard");
+            #[cfg(any(target_os = "linux", target_os = "macos", windows))]
+            anyhow::ensure!(there.is_below(here), "the pool's thread at {there}, the shard's at {here}");
+            #[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
+            let _ = (here, there);
+            let sum = compute_pieces((0u64, 0u64), |(i, sum), turn| {
+                while *i < 1_000_000 {
+                    *sum += *i;
+                    *i += 1;
+                    if turn.over() {
+                        return Step::More;
+                    }
+                }
+                Step::Done(*sum)
+            })
+            .await?;
+            anyhow::ensure!(sum == 499_999_500_000, "{sum}");
+            Ok(())
+        })
+    }
+
+    /// Goal 3, plan 01a1a59c2a8e step 3: a thread of its own (the conversation feed's intake) hands a job
+    /// in pieces to the compute pool and waits there for its result: the job runs on a pool thread, below
+    /// the caller, a piece at a time to its end; and its result comes back however many pieces it took.
+    #[test]
+    fn g3_s3_a_thread_of_its_own_waits_for_a_compute_job_in_pieces() -> anyhow::Result<()> {
+        let here = hyper_rt::compute::thread_priority();
+        // Three pieces, the last saying where it ran.
+        let (thread, there, pieces) = compute_pieces_blocking(0u32, |pieces, _turn| {
+            *pieces += 1;
+            if *pieces < 3 { Step::More } else { Step::Done((std::thread::current().name().map(str::to_owned), hyper_rt::compute::thread_priority(), *pieces)) }
+        })?;
+        anyhow::ensure!(hyper_rt::compute::running(), "the compute pool started with the runtime");
+        anyhow::ensure!(pieces == 3, "{pieces} pieces");
+        anyhow::ensure!(thread.as_deref().is_some_and(|t| t.starts_with("kiln-compute-")), "the job ran on {thread:?}");
+        #[cfg(any(target_os = "linux", target_os = "macos", windows))]
+        anyhow::ensure!(there.is_below(here), "the pool's thread at {there}, the caller's at {here}");
+        #[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
+        let _ = (here, there);
+        Ok(())
+    }
+
+    /// Goal 3, plan 01a1a59c2a8e step 4: the blocking pool's places from `KILN_RT_BLOCKING`, `dns,store,fs`
+    /// (the lab's A/B of share sizes on one build): three counts of at least one, or nothing taken.
+    #[test]
+    fn g3_s4_the_blocking_pools_places_from_the_environment() {
+        assert_eq!(places("4,2,8"), Some((4, 2, 8)));
+        assert_eq!(places(" 1, 3 ,12"), Some((1, 3, 12)));
+        for refused in ["", "4,2", "4,2,8,1", "0,2,8", "a,2,8", "4,,8", "-1,2,8"] {
+            assert_eq!(places(refused), None, "{refused:?}");
+        }
+    }
+
+    /// Goal 3, plan 01a1a59c2a8e step 4: the server's shares from what the lab measured: the jobs a share
+    /// holds at once by Little's law, rounded up to whole places, at least one; the store's by its one
+    /// connection.
+    #[test]
+    fn g3_s4_the_servers_shares_are_derived() {
+        assert_eq!(AtOnce(25.54).places(), 26);
+        assert_eq!(AtOnce(3.0).places(), 3);
+        assert_eq!(AtOnce(1.01).places(), 2);
+        for none in [0.0, 0.4, 1.0, -3.0, f64::NAN, f64::INFINITY] {
+            assert_eq!(AtOnce(none).places(), 1, "{none}");
+        }
+        let (dns, store, fs) = Profile::server().pool;
+        assert_eq!((dns, store, fs), (SERVER_DNS, STORE_CONNECTIONS + 1, SERVER_FS.places()));
     }
 
     /// kiln's runtime passes kiln-seams' Clock suite on real time (CP-M2, AC-M2.2): the clock the

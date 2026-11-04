@@ -10,10 +10,9 @@ import { api } from "@/api/client";
 import type { ConvoLogLine, ConvoStatus } from "@/api/types";
 import { Button } from "@/components/ui/button";
 import { EmptyState, FilterBar, SearchField, SectionHeading } from "@/components/ui/misc";
-import { toast } from "@/components/ui/toast";
+import { useAction } from "@/lib/action";
 import { labelOf, useLabels } from "@/lib/data";
 import { fileStamp, saveFile } from "@/lib/download";
-import { errorMessage } from "@/lib/hooks";
 import { useSuspenseResource } from "@/lib/resource";
 import { cn } from "@/lib/utils";
 import { cylinder, frontArc, healthOf, metricsOf, replicationScene, wall, type Cable, type Node, type Plate, type ReplicationScene } from "./replication-scene";
@@ -297,18 +296,10 @@ export function ReplicationLog() {
   const [q, setQ] = React.useState("");
   const words = React.useDeferredValue(q.trim());
   const log = useSuspenseResource(`conversations/log/${words}`, (sig) => api.convoLog({ q: words || undefined, limit: SHOWN }, sig), { pollMs: 4_000 }).data;
-  const [saving, setSaving] = React.useState(false);
-  const download = async () => {
-    setSaving(true);
-    try {
-      const all = await api.convoLog({ q: words || undefined, limit: 5_000 });
-      saveFile(`kiln-replication-log-${fileStamp()}.txt`, all.lines.map(lineText).join("\n") + "\n");
-    } catch (e) {
-      toast.error("Couldn't download the replication log", errorMessage(e));
-    } finally {
-      setSaving(false);
-    }
-  };
+  const [download, saving] = useAction(async () => {
+    const all = await api.convoLog({ q: words || undefined, limit: 5_000 });
+    saveFile(`kiln-replication-log-${fileStamp()}.txt`, all.lines.map(lineText).join("\n") + "\n");
+  }, "Couldn't download the replication log");
   const count = words ? `${log.matched.toLocaleString("en-US")} of ${log.total.toLocaleString("en-US")}` : log.total.toLocaleString("en-US");
   return (
     <section className="rp-log">
@@ -318,7 +309,7 @@ export function ReplicationLog() {
         aside={
           <>
             <span className="log-count">{count} lines</span>
-            <Button variant="ghost" size="bar" disabled={saving || log.lines.length === 0} title="Download every line that matches" onClick={() => void download()}>
+            <Button variant="ghost" size="bar" disabled={log.lines.length === 0} pending={saving} title="Download every line that matches" onClick={download}>
               <Download /> {saving ? "Downloading…" : "Download"}
             </Button>
           </>

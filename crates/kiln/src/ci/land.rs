@@ -12,7 +12,8 @@
 //!    tested beside every other component's: its first entries, as many as its window lets (R101),
 //!    applied onto the trunk's tip without a working tree (`git merge-tree`; a temporary worktree
 //!    where git is older than 2.40), each landed commit with `Differential-Revision:` and
-//!    `Reviewed-by:` trailers. An entry that conflicts with the trunk goes back to Review (R107).
+//!    `Reviewed-by:` trailers. An entry that conflicts with the trunk goes back to Review (R107),
+//!    where its diffs climb the conflict ladder (W26-R17).
 //! 3. Each candidate is kept at `refs/kiln/land/<trunk>/<batch>` and starts its `land` and
 //!    `merge_group` workflows; a required check (`land.checks`) none of them runs ejects its
 //!    entries.
@@ -21,8 +22,9 @@
 //!    changes it shares nothing with, to its entries applied again onto the tip, its result standing
 //!    (R102, R103). A failure ejects a lone entry with its reason, or is bisected inside its
 //!    component.
-//! 5. The landed diffs are marked, said (`pull_request` `closed`), recorded (R108), and the open
-//!    diffs above them restacked onto the new trunk as rebase-only versions.
+//! 5. The landed diffs are marked, said (`pull_request` `closed`), recorded (R108), and the trunk's
+//!    open changes replayed onto it (W26-R16): a clean replay is a rebase-only version, a
+//!    conflicted one climbs the conflict ladder.
 //!
 //! A repository whose host has a queue of its own lands there, through the forge seam (R109).
 
@@ -453,6 +455,11 @@ async fn return_to_review(hub: &Arc<Hub>, e: &Entry, files: &[String]) -> anyhow
         queue_event(hub, &e.diffs, "dequeued", Some("INVALID_MERGE_COMMIT"), "kiln").await;
         crate::rt::spawn(super::notify::land_ejected(Arc::clone(hub), e.diffs.clone(), reason.clone()));
     }
+    // Its diffs climb the conflict ladder (W26-R17): once Review's gate clears the resolution a person
+    // accepts, the entry joins the queue again.
+    for d in &e.diffs {
+        super::ladder::kick(d);
+    }
     hub.store.audit("kiln".into(), "queue.return".into(), format!("{}: {reason}", e.id)).await;
     tell(hub, e, "returned", Some(reason.as_str())).await;
     tracing::info!(entry = %e.id, %reason, "back to Review from the land queue");
@@ -518,6 +525,11 @@ async fn split_off(hub: &Arc<Hub>, e: &Entry, k: usize, state: &'static str, why
     if matches!(e.state.as_str(), "queued" | "testing") {
         to_review(hub, &rest).await?;
         queue_event(hub, &rest, "dequeued", Some(if state == "returned" { "INVALID_MERGE_COMMIT" } else { "BRANCH_PROTECTIONS" }), "kiln").await;
+    }
+    if state == "returned" {
+        for d in &rest {
+            super::ladder::kick(d);
+        }
     }
     hub.store.audit("kiln".into(), "queue.split".into(), format!("{}: its last {} diffs into {new}, {state}: {why}", e.id, rest.len())).await;
     if let Some(n) = entry_by_id(hub, &new).await? {
@@ -1399,7 +1411,7 @@ async fn apply(hub: &Hub, path: &str, tip: &str, e: &Entry) -> Result<Applied, R
 }
 
 /// A commit as payloads describe it: its tree, message, and who and when.
-async fn commit_of(hub: &Hub, path: &str, sha: &str) -> kiln_ci::trigger::context::Commit {
+pub(crate) async fn commit_of(hub: &Hub, path: &str, sha: &str) -> kiln_ci::trigger::context::Commit {
     use kiln_ci::trigger::context::{Commit, Person};
     let o = gitops::run_git(hub, &["-C", path, "show", "-s", "--format=%T%x00%an%x00%ae%x00%aI%x00%cn%x00%ce%x00%B", sha], LS_REMOTE_TIMEOUT).await.unwrap_or_default();
     let text = String::from_utf8_lossy(&o).into_owned();
@@ -1426,7 +1438,7 @@ fn candidate_events(ctx: &kiln_ci::trigger::context::Repo, repo: &Repo, trunk: &
 }
 
 /// Starts the candidate's workflows: those whose `on` takes `merge_group` or `land`. Their paths.
-async fn start_checks(hub: &Hub, repo: &Repo, events: &(Event, Event)) -> anyhow::Result<Vec<String>> {
+pub(crate) async fn start_checks(hub: &Hub, repo: &Repo, events: &(Event, Event)) -> anyhow::Result<Vec<String>> {
     if !hub.ci.enabled() {
         return Ok(Vec::new());
     }
@@ -2119,7 +2131,9 @@ async fn landed(hub: &Arc<Hub>, repo: &Repo, path: &str, trunk: &str, batch: &[(
             tracing::warn!(diff = %d.name, error = %format!("{e:#}"), "a landed diff's closing event didn't start");
         }
     }
-    restack(hub, repo, path, trunk, &all, tip).await;
+    // The open diffs above the landed ones, and every other open change of the trunk, are replayed
+    // onto it (W26-R16).
+    super::fresh::moved(hub, repo, trunk, "", tip);
     // What waits on Review may apply now, or not.
     recheck();
     Ok(())
@@ -2224,63 +2238,6 @@ async fn record(hub: &Hub, repo_id: &str, trunk: &str, e: &Entry, landed: &BTree
             Ok(())
         })
         .await
-}
-
-/// The open diffs standing on `landed` ones, onto `tip` as rebase-only versions, each on the one
-/// below it; a chain that conflicts stays as it was (its author syncs it).
-async fn restack(hub: &Arc<Hub>, repo: &Repo, path: &str, trunk: &str, landed: &[String], tip: &str) {
-    let children = |parents: Vec<String>| {
-        let hub = hub.clone();
-        async move {
-            hub.store
-                .call(move |c| {
-                    let mut out = Vec::new();
-                    let mut st = c.prepare("SELECT id FROM diffs WHERE parent_diff = ?1 AND state NOT IN ('landed', 'abandoned', 'landing')")?;
-                    for p in &parents {
-                        out.extend(st.query_map([p], |r| r.get::<_, String>(0))?.filter_map(Result::ok));
-                    }
-                    Ok(out)
-                })
-                .await
-                .unwrap_or_default()
-        }
-    };
-    // (diff, the commit it goes on, the diff below it now).
-    let mut work: Vec<(String, String, Option<String>)> = children(landed.to_vec()).await.into_iter().map(|id| (id, tip.to_owned(), None)).collect();
-    let mut seen = 0usize;
-    while let Some((id, onto, below)) = work.pop() {
-        seen += 1;
-        if seen > 500 {
-            break;
-        }
-        let Ok(Some(d)) = diffs::find(hub, &id).await else { continue };
-        let Some(v) = diffs::versions(hub, &d).await.ok().and_then(|mut v| v.pop()) else { continue };
-        let tree = match pick_tree(hub, path, &onto, &v.commit, &v.parent).await {
-            Ok(t) => t,
-            Err(_) => {
-                tracing::info!(diff = %d.name, "a diff above a landed one doesn't restack cleanly; its author syncs it");
-                continue;
-            }
-        };
-        let Ok(who) = author(hub, path, &v.commit).await else { continue };
-        let message = gitops::run_git(hub, &["-C", path, "log", "-1", "--format=%B", &v.commit], LS_REMOTE_TIMEOUT).await.map(|o| String::from_utf8_lossy(&o).into_owned()).unwrap_or_default();
-        // The commit kiln makes carries its change's `Kiln-Change` (W26-R03).
-        let message = kiln_ci::identity::with_kiln_changes(&message, &changes_of(&[&d]));
-        let Ok(c) = commit_tree(hub, path, &tree, &[&onto], &who, &message).await else { continue };
-        let patch = diffs::git_run(hub, &["-C", path, "show", "--no-color", &c], &[], Vec::new()).await.ok().map(|r| r.out).unwrap_or_default();
-        let patch_id = diffs::git_with_input(hub, &["-C", path, "patch-id", "--stable"], patch).await.ok().and_then(|o| String::from_utf8_lossy(&o).split_whitespace().next().map(str::to_owned)).unwrap_or_default();
-        let nv = diffs::NewVersion { commit: c.clone(), parent: onto.clone(), base: tip.to_owned(), patch_id, message, note: Some(format!("restacked onto {trunk} after a land")), rebase_only: true, pushed_by: "kiln".into(), parent_diff: below.clone() };
-        match diffs::add_version(hub, repo, path, &d, nv).await {
-            Ok(n) => tracing::info!(diff = %d.name, version = n, "restacked onto the trunk"),
-            Err(e) => {
-                tracing::warn!(diff = %d.name, error = %format!("{e:#}"), "a restack's version couldn't be kept");
-                continue;
-            }
-        }
-        for child in children(vec![d.id.clone()]).await {
-            work.push((child, c.clone(), Some(d.id.clone())));
-        }
-    }
 }
 
 // ------------------------------------------------------------------ a host's own queue

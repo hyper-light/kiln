@@ -129,6 +129,12 @@ class AccountStore {
     );
   }
 
+  /** Reads them again after a read failed: checking at once, in place of why it couldn't (W21-R15). */
+  retry(target: string) {
+    this.patch(target, { error: null });
+    this.load(target);
+  }
+
   /** Lets go of outcomes that are old news. */
   prune(target: string) {
     const flows = this.view(target).flows;
@@ -501,7 +507,7 @@ function ChoosePanel({ a, target, loading, where, onStart, onCancel }: { a: Acco
   );
 }
 
-/** Signing out takes a second word: agents there stop working. */
+/** Signing out takes a second word: agents there stop working. Once it's on its way (`busy`), Sign out says so, and there's nothing left to keep. */
 function ConfirmPanel({ a, where, busy, onConfirm, onKeep }: { a: Account; where: string; busy: boolean; onConfirm: () => void; onKeep: () => void }) {
   const takeFocus = useTakeFocus();
   return (
@@ -510,7 +516,7 @@ function ConfirmPanel({ a, where, busy, onConfirm, onKeep }: { a: Account; where
         Sign out of {a.name} on {where}? Agents there that use it stop working until you sign in again.
       </p>
       <div className="ac-actions">
-        <Button size="xs" variant="danger" className="ac-btn" disabled={busy} onClick={onConfirm}>
+        <Button size="xs" variant="danger" className="ac-btn" pending={busy} onClick={onConfirm}>
           {busy ? "Signing out…" : "Sign out"}
         </Button>
         <Button size="xs" variant="ghost" className="ac-btn" disabled={busy} onClick={onKeep}>
@@ -621,8 +627,9 @@ function FlowPanel({
   const showPaste = asks === "code";
   const showKey = asks === "api_key";
   const numbered = showLink && (showCode || showPaste);
-  // The CLI is waiting for the code or key right now.
-  const ready = phase === "waiting" && f.asks === asks && !sending;
+  // The CLI is waiting for the code or key right now; while one is on its way, its button says so (W21-R15).
+  const waits = phase === "waiting" && f.asks === asks;
+  const ready = waits && !sending;
   const hint = entry.sendError
     ? `Couldn't pass it on: ${entry.sendError}`
     : askedAgain(entry)
@@ -638,7 +645,8 @@ function FlowPanel({
     setSending(true);
     const ok = await store.send(target, a.kind, text);
     setSending(false);
-    if (ok) setCode("");
+    // Taken: the field empties, unless something else was typed in it since.
+    if (ok) setCode((c) => (c.trim() === text ? "" : c));
   };
   const submitKey = async () => {
     const text = key.trim();
@@ -720,7 +728,14 @@ function FlowPanel({
                   enterKeyHint="go"
                   disabled={phase === "checking"}
                 />
-                <Button type="submit" size="xs" variant={code.trim() && ready ? "primary" : "secondary"} className="ac-btn" disabled={!code.trim() || !ready}>
+                <Button
+                  type="submit"
+                  size="xs"
+                  variant={sending || (code.trim() && waits) ? "primary" : "secondary"}
+                  className="ac-btn"
+                  disabled={!sending && (!code.trim() || !waits)}
+                  pending={sending}
+                >
                   Submit
                 </Button>
               </div>
@@ -759,7 +774,14 @@ function FlowPanel({
                   data-bwignore=""
                   disabled={phase === "checking"}
                 />
-                <Button size="xs" variant={key.trim() && ready ? "primary" : "secondary"} className="ac-btn" disabled={!key.trim() || !ready} onClick={() => void submitKey()}>
+                <Button
+                  size="xs"
+                  variant={sending || (key.trim() && waits) ? "primary" : "secondary"}
+                  className="ac-btn"
+                  disabled={!sending && (!key.trim() || !waits)}
+                  pending={sending}
+                  onClick={() => void submitKey()}
+                >
                   Sign in
                 </Button>
               </div>
@@ -922,7 +944,7 @@ function AccountRow({
             aria-hidden={away || undefined}
             aria-label={`${act === "Retry" ? "Check again" : act}: ${a.name}`}
             onClick={() => {
-              if (listError) return store.load(target);
+              if (listError) return store.retry(target);
               store.forget(target, a.kind);
               onOpen(a.signed_in === true ? "signout" : "signin");
             }}

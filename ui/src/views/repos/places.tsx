@@ -13,6 +13,7 @@ import { Button } from "@/components/ui/button";
 import { Confirm, SelectField, TextField } from "@/components/ui/misc";
 import { StatusDot } from "@/components/ui/status";
 import { Tip } from "@/components/ui/tooltip";
+import { sendingProps, useAction, useActions } from "@/lib/action";
 import { shortSha } from "@/lib/format";
 import { errorMessage } from "@/lib/hooks";
 import { RelTime } from "../shared";
@@ -189,23 +190,21 @@ function MoveForm({ entry, place, machines, onCancel, onStarted }: { entry: Entr
   const [to, setTo] = React.useState(eligible[0]?.name ?? "");
   const [path, setPath] = React.useState(() => defaultPath(entry, machines, place));
   const [del, setDel] = React.useState(false);
-  const [busy, setBusy] = React.useState(false);
   const [error, setError] = React.useState<string | null>(null);
   const resolved = resolvedOn(path, machines.get(to));
   const changed = place.git?.changed ?? 0;
   const ahead = place.git?.ahead ?? 0;
 
-  const submit = async (e: React.FormEvent) => {
-    e.preventDefault();
-    setBusy(true);
-    setError(null);
-    try {
+  const [move, moving] = useAction(
+    async () => {
+      setError(null);
       onStarted(await api.placesStart("move", { key: entry.key, from: { kind: "machine", machine: place.machine, path: place.path }, to: [{ machine: to, path: path.trim() }], delete: del }));
-    } catch (err) {
-      setError(errorMessage(err));
-    } finally {
-      setBusy(false);
-    }
+    },
+    (err) => setError(errorMessage(err)),
+  );
+  const submit = (e: React.FormEvent) => {
+    e.preventDefault();
+    move();
   };
 
   if (eligible.length === 0) {
@@ -252,8 +251,8 @@ function MoveForm({ entry, place, machines, onCancel, onStarted }: { entry: Entr
       </label>
       {error && <p className="repo-error">{error}</p>}
       <div className="repo-actions">
-        <Button type="submit" size="xs" disabled={busy || !to || !path.trim()}>
-          {busy ? "Starting…" : `Move to ${labelOf(to)}`}
+        <Button type="submit" size="xs" disabled={!to || !path.trim()} pending={moving}>
+          {moving ? "Starting…" : `Move to ${labelOf(to)}`}
         </Button>
         <Button type="button" size="xs" variant="ghost" onClick={onCancel}>
           Cancel
@@ -268,21 +267,16 @@ function RemoveForm({ entry, place, onCancel, onStarted }: { entry: Entry; place
   useLabels();
   const found = place.kind === "found";
   const [del, setDel] = React.useState(found);
-  const [busy, setBusy] = React.useState(false);
   const [error, setError] = React.useState<string | null>(null);
   const changed = place.git?.changed ?? 0;
   const ahead = place.git?.ahead ?? 0;
-  const go = async () => {
-    setBusy(true);
-    setError(null);
-    try {
+  const [go, going] = useAction(
+    async () => {
+      setError(null);
       onStarted(await api.placesStart("remove", { key: entry.key, from: { kind: "machine", machine: place.machine, path: place.path }, delete: del }));
-    } catch (err) {
-      setError(errorMessage(err));
-    } finally {
-      setBusy(false);
-    }
-  };
+    },
+    (err) => setError(errorMessage(err)),
+  );
   const keep = place.kind === "copy" ? "Stop syncing it here" : "Forget kiln's clone";
   const on = labelOf(place.machine);
   return (
@@ -292,8 +286,8 @@ function RemoveForm({ entry, place, onCancel, onStarted }: { entry: Entry; place
       className="repo-inline"
       actions={
         <>
-          <Button size="xs" variant="danger" disabled={busy} onClick={() => void go()}>
-            {busy ? "Starting…" : del ? `Delete it on ${on}` : keep}
+          <Button size="xs" variant="danger" pending={going} onClick={go}>
+            {going ? "Starting…" : del ? `Delete it on ${on}` : keep}
           </Button>
           <Button size="xs" variant="ghost" onClick={onCancel}>
             Keep it
@@ -335,16 +329,26 @@ const TASK_DOT: Record<string, string> = { done: "succeeded", failed: "failed", 
 export function TaskList({ tasks, machines, onChange }: { tasks: PlaceTask[]; machines: Map<string, PlaceMachine>; onChange: () => void }) {
   useLabels();
   const [error, setError] = React.useState<string | null>(null);
-  const shown = [...tasks.filter(isActive), ...tasks.filter((t) => !isActive(t)).slice(0, 4)];
-  if (shown.length === 0) return null;
-  const act = async (f: () => Promise<unknown>) => {
-    setError(null);
-    try {
-      await f();
+  // Dismissed here at once (W21-R15), back if that doesn't go.
+  const [dismissed, setDismissed] = React.useState<ReadonlySet<string>>(() => new Set());
+  const [retry, retrying] = useActions(
+    async (id: string) => {
+      setError(null);
+      await api.placesRetry(id);
       onChange();
-    } catch (e) {
+    },
+    (e) => setError(errorMessage(e)),
+  );
+  const left = tasks.filter((t) => !dismissed.has(t.id));
+  const shown = [...left.filter(isActive), ...left.filter((t) => !isActive(t)).slice(0, 4)];
+  if (shown.length === 0) return null;
+  const dismiss = (id: string) => {
+    setError(null);
+    setDismissed((d) => new Set(d).add(id));
+    api.placesDismiss(id).then(onChange, (e: unknown) => {
+      setDismissed((d) => new Set([...d].filter((x) => x !== id)));
       setError(errorMessage(e));
-    }
+    });
   };
   return (
     <div className="repo-tasks">
@@ -363,14 +367,14 @@ export function TaskList({ tasks, machines, onChange }: { tasks: PlaceTask[]; ma
               <span className="repo-place-acts">
                 {t.state === "failed" && (
                   <Tip content="Start it again">
-                    <button type="button" className="icon-btn" data-variant="bare" data-size="sm" aria-label="Start it again" onClick={() => void act(() => api.placesRetry(t.id))}>
+                    <button type="button" className="icon-btn" data-variant="bare" data-size="sm" aria-label="Start it again" {...sendingProps(retrying(t.id))} onClick={() => retry(t.id)}>
                       <RotateCcw size={14} />
                     </button>
                   </Tip>
                 )}
                 {!isActive(t) && (
                   <Tip content="Dismiss">
-                    <button type="button" className="icon-btn" data-variant="bare" data-size="sm" aria-label="Dismiss" onClick={() => void act(() => api.placesDismiss(t.id))}>
+                    <button type="button" className="icon-btn" data-variant="bare" data-size="sm" aria-label="Dismiss" onClick={() => dismiss(t.id)}>
                       <X size={14} />
                     </button>
                   </Tip>

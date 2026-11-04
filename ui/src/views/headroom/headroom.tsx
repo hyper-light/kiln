@@ -14,6 +14,7 @@ import { Button } from "@/components/ui/button";
 import { Hold } from "@/components/ui/hold";
 import { Loadable } from "@/components/ui/loading";
 import { SectionHeading } from "@/components/ui/misc";
+import { useAction } from "@/lib/action";
 import { labelOf, shownName } from "@/lib/data";
 import { errorMessage } from "@/lib/hooks";
 import { getPref, setPref } from "@/lib/prefs";
@@ -53,7 +54,8 @@ export function HeadroomSection({ agents, index }: { agents: Agent[]; index: str
               onChange={(e) => {
                 const v = e.target.value;
                 setPref(PICKED, v);
-                React.startTransition(() => setPicked(v));
+                // The runner chosen shows as it's chosen, its loader in place until what it says is in (W21-R15).
+                setPicked(v);
               }}
             >
               {runners.map((a) => (
@@ -82,7 +84,6 @@ function HeadroomPanel({ runner }: { runner: string }) {
   });
   const v = view.data;
   const [draft, setDraft] = React.useState<HeadroomSettings | null>(null);
-  const [saving, setSaving] = React.useState(false);
   const [msg, setMsg] = React.useState<{ tone: "ok" | "error" | "quiet"; text: string } | null>(null);
   const d = draft ?? v.settings;
   const dirty = Boolean(draft && JSON.stringify(draft) !== JSON.stringify(v.settings));
@@ -90,19 +91,18 @@ function HeadroomPanel({ runner }: { runner: string }) {
     setDraft({ ...d, ...p });
     setMsg(null);
   };
-  const save = async () => {
-    setSaving(true);
-    try {
+  // Save says it's on its way; the settings and Revert go on working, and what's changed meanwhile
+  // stays a draft (W21-R15).
+  const [save, saving] = useAction(
+    async () => {
+      const sent = draft;
       const next = await headroomApi.save(runner, d);
-      view.setData(() => next);
-      setDraft(null);
+      view.change(() => next);
+      setDraft((cur) => (cur === sent ? null : cur));
       setMsg({ tone: "ok", text: next.connected ? `Saved. ${labelOf(runner)} applies it now.` : `Saved. ${labelOf(runner)} applies it when it connects.` });
-    } catch (e) {
-      setMsg({ tone: "error", text: errorMessage(e) });
-    } finally {
-      setSaving(false);
-    }
-  };
+    },
+    (e) => setMsg({ tone: "error", text: errorMessage(e) }),
+  );
 
   return (
     <div className="fd-body">
@@ -111,7 +111,7 @@ function HeadroomPanel({ runner }: { runner: string }) {
         className="fd-form"
         onSubmit={(e) => {
           e.preventDefault();
-          void save();
+          save();
         }}
       >
         <fieldset className="fd-group">
@@ -145,10 +145,10 @@ function HeadroomPanel({ runner }: { runner: string }) {
         </fieldset>
         <Targets targets={d.targets} onChange={(targets) => set({ targets })} />
         <div className="fd-actions">
-          <Button type="submit" size="xs" className="fd-btn" disabled={saving || !dirty}>
+          <Button type="submit" size="xs" className="fd-btn" disabled={!dirty} pending={saving}>
             {saving ? "Saving…" : "Save"}
           </Button>
-          <Button type="button" size="xs" variant="ghost" className="fd-btn" disabled={saving || !dirty} onClick={() => setDraft(null)}>
+          <Button type="button" size="xs" variant="ghost" className="fd-btn" disabled={!dirty} onClick={() => setDraft(null)}>
             Revert
           </Button>
           <span className="fd-msg" role="status" data-tone={msg?.tone ?? "quiet"}>

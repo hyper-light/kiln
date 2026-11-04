@@ -13,7 +13,7 @@ import { toast } from "@/components/ui/toast";
 import { useRes } from "@/lib/data";
 import { relativeTime } from "@/lib/format";
 import { errorMessage } from "@/lib/hooks";
-import { invalidate } from "@/lib/resource";
+import { change, invalidate } from "@/lib/resource";
 import "./review.css";
 
 export default function InboxPage() {
@@ -113,25 +113,24 @@ function inApp(url: string): string | null {
 }
 
 function Notes({ notes, unread }: { notes: InboxNote[]; unread: number }) {
-  const [busy, setBusy] = React.useState(false);
   if (notes.length === 0) return null;
-  const readAll = async () => {
-    setBusy(true);
-    try {
-      await reviewApi.readAll();
-      invalidate("review/inbox");
-    } catch (e) {
-      toast.error("That didn't work", errorMessage(e));
-    } finally {
-      setBusy(false);
-    }
+  // Read at once (W21-R15), and unread again if that doesn't go.
+  const readAll = () => {
+    change<Inbox>(inboxRes.key, (d) => ({ ...d, unread: 0, notifications: (d.notifications ?? []).map((n) => ({ ...n, read: true })) }));
+    reviewApi.readAll().then(
+      () => invalidate("review/inbox"),
+      (e: unknown) => {
+        toast.error("That didn't work", errorMessage(e));
+        invalidate("review/inbox");
+      },
+    );
   };
   return (
     <section className="rv-inbox-section">
       <h2 className="rv-inbox-title">
         Notifications <span className="rv-sub">{unread > 0 ? `${unread} new` : notes.length}</span>
         {unread > 0 && (
-          <Button size="sm" variant="ghost" className="rv-inbox-read" disabled={busy} onClick={readAll}>
+          <Button size="sm" variant="ghost" className="rv-inbox-read" onClick={readAll}>
             Mark all read
           </Button>
         )}

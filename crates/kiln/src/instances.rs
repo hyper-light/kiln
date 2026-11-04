@@ -366,6 +366,12 @@ impl Instances {
         self.owner(what).filter(|p| self.by_peer.get(p).is_some_and(|i| i.name == name))
     }
 
+    /// The runner process of machine `name` a message about `what` goes to: the one that holds it,
+    /// else the newest ([`Instances::route`], without making it an owner).
+    pub fn reaches(&self, name: &str, what: &Owned) -> Option<PeerId> {
+        self.owner_on(name, what).or_else(|| self.newest(name))
+    }
+
     pub fn route(&mut self, name: &str, msg: &ServerMsg) -> Option<PeerId> {
         let what = Owned::of(msg);
         let held = what.as_ref().filter(|_| !Owned::creates(msg)).and_then(|w| self.owner_on(name, w));

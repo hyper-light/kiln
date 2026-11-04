@@ -6,6 +6,8 @@
 //! entry edited, a commit pushed to main without the queue. A production environment refuses a
 //! release whose chain doesn't verify.
 
+#![cfg(unix)]
+
 mod common;
 
 use std::path::{Path, PathBuf};

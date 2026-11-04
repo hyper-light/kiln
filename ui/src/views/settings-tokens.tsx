@@ -9,6 +9,8 @@ import { Button } from "@/components/ui/button";
 import { Hold } from "@/components/ui/hold";
 import { Confirm, SelectField } from "@/components/ui/misc";
 import { SettingRow, SettingsGroup } from "@/components/ui/settings";
+import { toast } from "@/components/ui/toast";
+import { useAction } from "@/lib/action";
 import { useRes, type Res } from "@/lib/data";
 import { relativeTime } from "@/lib/format";
 import { errorMessage } from "@/lib/hooks";
@@ -42,26 +44,34 @@ export function TokensGroup() {
   const [note, setNote] = React.useState<Note>(null);
   const [made, setMade] = React.useState<Minted | null>(null);
   const [removing, setRemoving] = React.useState<string | null>(null);
-  const [busy, setBusy] = React.useState(false);
   const [what, setWhat] = React.useState("");
   const [role, setRole] = React.useState("viewer");
   const [where, setWhere] = React.useState("server");
   const [days, setDays] = React.useState("90");
-  const act = async (f: () => Promise<unknown>, done: string | null) => {
-    setBusy(true);
-    setNote(null);
-    try {
-      await f();
-      res.reload();
-      if (done) setNote({ text: done });
-      return true;
-    } catch (e) {
-      setNote({ tone: "error", text: errorMessage(e) });
-      return false;
-    } finally {
-      setBusy(false);
-    }
+  const failed = (e: unknown) => setNote({ tone: "error", text: errorMessage(e) });
+  // Revoked at once (W21-R15), and as it was, saying why, if the server says no; said in a toast, as
+  // the line under the form is a new token's.
+  const revoke = (id: string) => {
+    setRemoving(null);
+    res.change((l) => l.map((t) => (t.id === id ? { ...t, revoked_at: Math.floor(Date.now() / 1000) } : t)));
+    people.revoke(id).then(
+      () => {
+        res.reload();
+        toast({ title: "Revoked", tone: "info" });
+      },
+      (e: unknown) => {
+        toast.error("Couldn't revoke it", errorMessage(e));
+        res.reload();
+      },
+    );
   };
+  // Its answer empties what it's for, so that's held as it is until then (W21-R15).
+  const [mint, minting] = useAction(async () => {
+    setNote(null);
+    setMade(await people.mint(what.trim(), [grantText(role, where)], Number(days)));
+    res.reload();
+    setWhat("");
+  }, failed);
   return (
     <SettingsGroup
       id="tokens.mine"
@@ -83,7 +93,7 @@ export function TokensGroup() {
                 </span>
                 {!t.revoked_at && (
                   <span className="st-item-acts">
-                    <Button size="xs" variant="ghost" disabled={busy} aria-expanded={removing === t.id} onClick={() => setRemoving(removing === t.id ? null : t.id)}>
+                    <Button size="xs" variant="ghost" aria-expanded={removing === t.id} onClick={() => setRemoving(removing === t.id ? null : t.id)}>
                       Revoke
                     </Button>
                   </span>
@@ -96,10 +106,10 @@ export function TokensGroup() {
                   className="mt-3"
                   actions={
                     <>
-                      <Button size="xs" variant="primary" disabled={busy} onClick={() => void act(() => people.revoke(t.id), "Revoked.").then((ok) => ok && setRemoving(null))}>
+                      <Button size="xs" variant="primary" onClick={() => revoke(t.id)}>
                         Revoke it
                       </Button>
-                      <Button size="xs" variant="ghost" disabled={busy} onClick={() => setRemoving(null)}>
+                      <Button size="xs" variant="ghost" onClick={() => setRemoving(null)}>
                         Keep it
                       </Button>
                     </>
@@ -118,14 +128,12 @@ export function TokensGroup() {
         className="mt-4"
         onSubmit={(e) => {
           e.preventDefault();
-          void act(async () => setMade(await people.mint(what.trim(), [grantText(role, where)], Number(days))), null).then((ok) => {
-            if (ok) setWhat("");
-          });
+          mint();
         }}
       >
         <SettingRow label="A new one" htmlFor="st-token-what" help="What it's for, so you know it later.">
           <div className="field st-wide">
-            <input id="st-token-what" type="text" placeholder="Release script" maxLength={120} value={what} disabled={busy} onChange={(e) => setWhat(e.target.value)} />
+            <input id="st-token-what" type="text" placeholder="Release script" maxLength={120} value={what} disabled={minting} onChange={(e) => setWhat(e.target.value)} />
           </div>
         </SettingRow>
         <SettingRow label="May" help="owner: everything you may.">
@@ -135,7 +143,7 @@ export function TokensGroup() {
           <SelectField label="Lasts" hideLabel className="st-wide" value={days} onChange={setDays} options={LIVES} />
         </SettingRow>
         <div className="mt-3 flex justify-end">
-          <Button type="submit" size="xs" variant="secondary" disabled={busy}>
+          <Button type="submit" size="xs" variant="secondary" pending={minting}>
             Make the token
           </Button>
         </div>
