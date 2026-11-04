@@ -470,7 +470,7 @@ mod tests {
     fn mc_attention_notification_words_include_only_recursive_true_kiln_subagents(){
         let parent=Info{summary:"Tests passed".into(),..agent(Status::Idle)};
         let child=Info{id:"child".into(),parent:Some(parent.id.clone()),subagent:true,status:Status::Running,..Info::default()};
-        assert_eq!(line(&for_display(&parent,&[child.clone()]),Kind::Finished),"Working: Tests passed");
+        assert_eq!(line(&for_display(&parent,std::slice::from_ref(&child)),Kind::Finished),"Working: Tests passed");
         let shell=Info{status:Status::Idle,tasks_running:1,..child.clone()};
         assert_eq!(line(&for_display(&parent,&[shell]),Kind::Finished),"Ready: Tests passed");
         let monitor=Info{status:Status::Idle,left_behind:1,..child.clone()};

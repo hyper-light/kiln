@@ -780,7 +780,7 @@ mod tests{
         use super::super::session::ApprovalBrief;
         let approval=|id:&str,at|ApprovalBrief{id:id.into(),tool:super::super::model::ToolKind::Question,tool_name:"question".into(),title:"Choose".into(),at,agent:None};
         let old=Info{id:"parent".into(),status:Status::Waiting,approvals:vec![approval("existing",1000)],..Info::default()};
-        let parked=Placement{parked_at:Some(20),parked_until:Some(2000),deferred_requests:Some(deferred_requests("parent",&[old.clone()])),..Placement::default()};
+        let parked=Placement{parked_at:Some(20),parked_until:Some(2000),deferred_requests:Some(deferred_requests("parent",std::slice::from_ref(&old))),..Placement::default()};
         assert!(!park_wakes(&old,&parked,false),"captured current request stays deferred even when its runner clock is ahead");
         let older=Info{approvals:vec![approval("new",5)],..old.clone()};
         assert!(park_wakes(&older,&parked,false),"a new request wakes even when the runner timestamp is behind");
@@ -897,7 +897,7 @@ mod tests{
             let info=Info{id:"timer".into(),status:Status::Idle,owned_work_known:Some(true),..Info::default()};
             let settings=Settings{auto_archive:true,archive_after_days:1,..Settings::default()};
             hub.store.call(|c|{let before=store::placement(c,"owner","timer")?;store::put(c,"owner","timer",&before,&Placement{parked_at:Some(1),parked_until:Some(100),deferred_requests:Some(Vec::new()),..before.clone()},false)?;Ok(())}).await?;
-            let rows=refresh_placements(&hub,"owner",&[info.clone()],&settings,100_000_000).await?;assert!(rows.get("timer").is_some_and(|p|p.parked_until.is_none()));
+            let rows=refresh_placements(&hub,"owner",std::slice::from_ref(&info),&settings,100_000_000).await?;assert!(rows.get("timer").is_some_and(|p|p.parked_until.is_none()));
             hub.store.call(|c|{let before=store::placement(c,"owner","timer")?;store::put(c,"owner","timer",&before,&Placement{parked_at:Some(1),parked_until:Some(86_400_001),deferred_requests:Some(Vec::new()),..before.clone()},false)?;Ok(())}).await?;
             let rows=refresh_placements(&hub,"owner",&[info],&settings,100_000_000).await?;assert!(rows.get("timer").is_some_and(|p|p.parked_until.is_some()),"a declared due archive gets fresh quiet/CAS admission before the coincident timer wake");Ok(())
         })
@@ -909,8 +909,8 @@ mod tests{
         let standalone=Info{id:"standalone".into(),parent:Some("root".into()),subagent:false,..Info::default()};
         let known=[("child".into(),RowLineage{parent:Some("root".into()),subagent:true})].into_iter().collect();
         assert_eq!(display_row("child",&[parent.clone(),child.clone()],&known),"root");
-        assert_eq!(display_row("child",&[parent.clone()],&known),"root","successful removal retains observed lineage for recording");
-        assert_eq!(display_row("child",&[child.clone()],&known),"child","an inaccessible parent cannot become a recording target");
+        assert_eq!(display_row("child",std::slice::from_ref(&parent),&known),"root","successful removal retains observed lineage for recording");
+        assert_eq!(display_row("child",std::slice::from_ref(&child),&known),"child","an inaccessible parent cannot become a recording target");
         assert_eq!(display_row("standalone",&[parent,standalone],&known),"standalone");
         assert_eq!(row_candidates(&[child]),vec!["child".to_owned()],"a visible orphan remains a row");
     }

@@ -51,7 +51,7 @@ impl Run {
                 if let Some(task)=core.owned_reach.get_mut(&self.id){
                     match event{
                         Ev::Started{runner,..}=>{task.status="running".into();task.started=crate::util::now_ms();task.summary=Some(format!("Running on {runner}"));},
-                        Ev::Exit{code,error,..}=>{if terminal.as_ref().is_some_and(Result::is_ok){task.status=if *code==Some(0){"completed"}else{"failed"}.into();task.ended=Some(crate::util::now_ms());task.exit_code=*code;}task.summary=error.clone();},
+                        Ev::Exit{code,error,..}=>{if terminal.as_ref().is_some_and(Result::is_ok){task.status=if *code==Some(0){"completed"}else{"failed"}.into();task.ended=Some(crate::util::now_ms());task.exit_code = *code;}task.summary=error.clone();},
                         Ev::Error(error)=>{if terminal.as_ref().is_some_and(Result::is_ok){task.status="failed".into();task.ended=Some(crate::util::now_ms());}task.summary=Some(error.clone());},
                         _=>{},
                     }
@@ -59,7 +59,7 @@ impl Run {
                 core.sync_owned_reach();
                 if matches!(event,Ev::Started{..}|Ev::Exit{..}|Ev::Error(_)){core.touch_state();true}else{false}
             };
-            if update { if let Err(error)=host.publish_owned(&session).await{tracing::warn!(agent=%self.agent,%error,"owned Reach work could not be recorded");} }
+            if update && let Err(error)=host.publish_owned(&session).await{tracing::warn!(agent=%self.agent,%error,"owned Reach work could not be recorded");}
         }
         if let Some(terminal)=terminal{
             let confirmed=terminal.is_ok();
@@ -75,6 +75,38 @@ async fn finish_owned_work<W,B>(work:W,bridge:B)
 where W:std::future::Future<Output=()>,B:std::future::Future<Output=()>{
     futures::pin_mut!(work,bridge);
     if let futures::future::Either::Right(((),remaining))=futures::future::select(work,bridge).await{remaining.await;}
+}
+
+/// A bound run keeps its controller and exit observer even after a detached CLI client leaves.
+/// No human/unowned run is registered or stopped through this path.
+pub async fn run(host: Option<Arc<Host>>, handle:&super::node::Handle, me:&str, req:RunReq, ev:async_channel::Sender<Ev>, ctl:async_channel::Receiver<Req>, reuse:bool){
+    let Some(agent)=req.asker.as_deref() else{
+        if reuse{super::reuse::run(handle,me,req,ev,ctl).await;}else{super::local::run(handle,me,req,ev,ctl).await;}return;
+    };
+    let Some(host)=host else{let _=ev.send(Ev::Error("the authenticated agent has no owned-work tracker on this runner".into())).await;return;};
+    let (owned,stop)=match host.begin_owned_reach(agent,&req).await{Ok(run)=>run,Err(error)=>{let _=ev.send(Ev::Error(error)).await;return;}};
+    let (events,seen)=async_channel::unbounded();let (control,commands)=async_channel::unbounded();
+    let execute=async{
+        if reuse{super::reuse::run_owned(handle,me,req,events,commands,Some(owned.clone())).await;}else{super::local::run_owned(handle,me,req,events,commands,Some(owned.clone())).await;}
+    };
+    let forward=async{
+        while let Ok(event)=seen.recv().await{owned.see(&event).await;let _=ev.send(event).await;}
+        let missing=owned.outcome.lock().is_none();
+        if missing{owned.see(&Ev::Error("lost confirmation of the owned run's exit".into())).await;}
+    };
+    let bridge=async{
+        let mut client=true;
+        loop{
+            use futures::FutureExt as _;
+            let receiving=client;
+            let next=async{if receiving{ctl.recv().await}else{futures::future::pending().await}}.fuse();
+            let stopping=stop.recv().fuse();futures::pin_mut!(next,stopping);
+            let command=futures::select!{request=next=>match request{Ok(request)=>Some(request),Err(_)=>{client=false;None}},signal=stopping=>match signal{Ok(())=>Some(Req::Signal(super::wire::Signal::Kill)),Err(_)=>return}};
+            if let Some(command)=command && control.send(command).await.is_err(){return;}
+        }
+    };
+    let work=async{futures::join!(execute,forward);};
+    finish_owned_work(work,bridge).await;
 }
 
 #[cfg(test)]
@@ -242,36 +274,4 @@ mod tests{
             host.archive(&session.id).await.map_err(anyhow::Error::msg)?;Ok(())
         })
     }
-}
-
-/// A bound run keeps its controller and exit observer even after a detached CLI client leaves.
-/// No human/unowned run is registered or stopped through this path.
-pub async fn run(host: Option<Arc<Host>>, handle:&super::node::Handle, me:&str, req:RunReq, ev:async_channel::Sender<Ev>, ctl:async_channel::Receiver<Req>, reuse:bool){
-    let Some(agent)=req.asker.as_deref() else{
-        if reuse{super::reuse::run(handle,me,req,ev,ctl).await;}else{super::local::run(handle,me,req,ev,ctl).await;}return;
-    };
-    let Some(host)=host else{let _=ev.send(Ev::Error("the authenticated agent has no owned-work tracker on this runner".into())).await;return;};
-    let (owned,stop)=match host.begin_owned_reach(agent,&req).await{Ok(run)=>run,Err(error)=>{let _=ev.send(Ev::Error(error)).await;return;}};
-    let (events,seen)=async_channel::unbounded();let (control,commands)=async_channel::unbounded();
-    let execute=async{
-        if reuse{super::reuse::run_owned(handle,me,req,events,commands,Some(owned.clone())).await;}else{super::local::run_owned(handle,me,req,events,commands,Some(owned.clone())).await;}
-    };
-    let forward=async{
-        while let Ok(event)=seen.recv().await{owned.see(&event).await;let _=ev.send(event).await;}
-        let missing=owned.outcome.lock().is_none();
-        if missing{owned.see(&Ev::Error("lost confirmation of the owned run's exit".into())).await;}
-    };
-    let bridge=async{
-        let mut client=true;
-        loop{
-            use futures::FutureExt as _;
-            let receiving=client;
-            let next=async{if receiving{ctl.recv().await}else{futures::future::pending().await}}.fuse();
-            let stopping=stop.recv().fuse();futures::pin_mut!(next,stopping);
-            let command=futures::select!{request=next=>match request{Ok(request)=>Some(request),Err(_)=>{client=false;None}},signal=stopping=>match signal{Ok(())=>Some(Req::Signal(super::wire::Signal::Kill)),Err(_)=>return}};
-            if let Some(command)=command && control.send(command).await.is_err(){return;}
-        }
-    };
-    let work=async{futures::join!(execute,forward);};
-    finish_owned_work(work,bridge).await;
 }

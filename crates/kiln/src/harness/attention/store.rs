@@ -176,6 +176,7 @@ mod tests{
 }
 
 /// The whole family is durable before its first process is stopped.
+#[cfg(test)]
 pub fn begin_archive(c:&Connection,root:&str,members:&[(String,String,String)],at:i64)->anyhow::Result<()>{begin_archive_checked(c,root,members,at,|_|Ok(()))}
 pub fn begin_archive_checked(c:&Connection,root:&str,members:&[(String,String,String)],at:i64,check:impl FnOnce(&Connection)->anyhow::Result<()>)->anyhow::Result<()>{
     let tx=c.unchecked_transaction()?;check(&tx)?;
