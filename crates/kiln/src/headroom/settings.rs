@@ -85,7 +85,8 @@ pub enum Probe {
     /// `GET` a kiln server's own measure of how late its shards run ready work (`/healthz/delay`):
     /// what kiln adds itself for a server on this machine (docs/priority.md; goal 8, plan
     /// 01a1a59c2b29 step 5), answered with how late its ready work ran on average since the last
-    /// read, or a hold under way where that's longer. kiln's own: never in settings sent or kept.
+    /// read (a hold under way only when no probe ran at all). kiln's own: never in settings sent or
+    /// kept.
     #[serde(skip)]
     Delay { url: String },
 }

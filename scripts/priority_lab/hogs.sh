@@ -7,6 +7,7 @@
 #                                      threads for SECS seconds (the stand-in's lab:hog)
 #   hogs.sh OUT headroom on|off        the runner's headroom on, or off (settings, as a person sets them)
 #   hogs.sh OUT cancel                 every run of the legs cancelled
+#   hogs.sh OUT join                   the server's process into the runner's cgroup (as SAME_CGROUP=1)
 #   hogs.sh OUT end                    the recorder stopped and the runner with it
 set -uo pipefail
 OUT=$1 WHAT=$2
@@ -42,12 +43,25 @@ case "$WHAT" in
     for run in $(tr ',' '\n' < "$OUT/legs.runs" 2>/dev/null); do api -X POST "$S/api/runs/$run/cancel" > /dev/null; done
     say "legs: cancelled"
     ;;
+  join)
+    # The server's process joins the runner's scope, as headroom.sh's SAME_CGROUP=1 has it from the
+    # start, and the lab's own unit (its runners and clients) goes to the scope's weight, so neither
+    # outranks the other.
+    name=$(basename "$OUT")
+    labcg=/sys/fs/cgroup$(systemctl --user show "g8b-s5-lab-$name.service" -p ControlGroup --value)
+    for pid in $(cat "$labcg/cgroup.procs"); do
+      if tr '\0' ' ' < "/proc/$pid/cmdline" 2>/dev/null | grep -q -- "$ROUND/kiln.toml server"; then
+        echo "$pid" > "$SCOPE/cgroup.procs" && say "join: the server ($pid) shares the runner's cgroup"
+      fi
+    done
+    systemctl --user set-property --runtime "g8b-s5-lab-$name.service" CPUWeight="$(cat "$SCOPE/cpu.weight")" && say "join: the lab's unit at CPUWeight=$(cat "$SCOPE/cpu.weight"), as the runner's scope"
+    ;;
   end)
     touch "$OUT/STOP"
     say "end"
     ;;
   *)
-    echo "legs | agents N THREADS SECS | headroom on|off | cancel | end" >&2
+    echo "legs | agents N THREADS SECS | headroom on|off | cancel | join | end" >&2
     exit 2
     ;;
 esac

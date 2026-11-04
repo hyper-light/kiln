@@ -152,15 +152,18 @@ struct Delay {
 }
 
 /// How late the server's ready work ran on average since the last read (µs), every probe of every
-/// shard counted, or how long a shard held now has gone past its period where that's longer, in
-/// periods of this build's own (`crate::shard_health::PERIOD`, the target's tolerance): a server
-/// asked for another period is measured against its own. The first read has nothing to compare,
-/// and a server that started again since starts over: no answer yet, and no harm.
+/// shard counted, in periods of this build's own (`crate::shard_health::PERIOD`, the target's
+/// tolerance): a server asked for another period is measured against its own. A shard held by a
+/// long poll counts once its probe runs, its lateness in the total: a hold under way isn't the
+/// answer while others' probes run (a shard serving one long request is the server's own work,
+/// which pacing kiln's can't shorten; in the lab such holds reached 10 to 38 ms calm), only when
+/// no probe ran at all since the last read. The first read has nothing to compare, and a server
+/// that started again since starts over: no answer yet, and no harm.
 fn since(totals: &mut Option<(f64, f64)>, now: &Delay) -> Result<f64, Failed> {
     let before = totals.replace((now.late_s, now.probes));
     let ran = before.and_then(|(late, probes)| (now.late_s >= late && now.probes > probes).then(|| (now.late_s - late) / (now.probes - probes)));
     let worst = match ran {
-        Some(mean) => mean.max(now.held_s),
+        Some(mean) => mean,
         None if before.is_some_and(|(_, probes)| now.probes == probes) && now.held_s > 0.0 => now.held_s,
         None => return Err(Failed::Down),
     };
@@ -274,8 +277,9 @@ mod tests {
 
     /// Goal 8 (plan 01a1a59c2b29 step 5): a server's delay probe answers with how late the server's
     /// ready work ran on average between two of its reads, from the totals the server says (every
-    /// probe of every shard counted), or with a hold under way where that's longer; the first read
-    /// has nothing to compare, and a server without the figures (older, or a 404) is down, not slow.
+    /// probe of every shard counted), and with a hold under way only when no probe ran at all; the
+    /// first read has nothing to compare, and a server without the figures (older, or a 404) is
+    /// down, not slow.
     #[test]
     fn g8_s5_a_servers_delay_is_how_late_its_work_ran_since_the_last_read() -> anyhow::Result<()> {
         use std::io::{Read as _, Write as _};
@@ -300,14 +304,16 @@ mod tests {
         };
         let figures = |late_s: f64, probes: u64, held_s: f64| ("200 OK", format!(r#"{{"delay_s":0.002,"late_s":{late_s},"probes":{probes},"held_s":{held_s},"period_s":0.01}}"#));
         // 100 probes ran 0.25 s late in all between the first two reads: 2.5 ms on average. Then none
-        // ran, a shard held 40 ms past its period: the hold.
-        let url = serve(vec![figures(1.0, 1_000, 0.0), figures(1.25, 1_100, 0.0), figures(1.25, 1_100, 0.04)])?;
+        // ran, a shard held 40 ms past its period: the hold. Then 100 ran 10 ms late in all while one
+        // shard was held 30 ms (serving one long request): the mean, 0.1 ms, not the hold.
+        let url = serve(vec![figures(1.0, 1_000, 0.0), figures(1.25, 1_100, 0.0), figures(1.25, 1_100, 0.04), figures(1.26, 1_200, 0.03)])?;
         let p = Probes::start(vec![Spec { name: "delay".into(), probe: Probe::Delay { url }, window: Duration::from_secs(2) }], Arc::new(|| {}));
         p.set_interval("delay", 1_000.0);
-        let (a, _) = wait_for(&p, |a, _| a.len() >= 3);
+        let (a, _) = wait_for(&p, |a, _| a.len() >= 4);
         anyhow::ensure!(a.first() == Some(&("delay".to_owned(), Answer::Unavailable)), "the first read has nothing to compare: {a:?}");
         anyhow::ensure!(matches!(a.get(1), Some((_, Answer::Took(us))) if (us - 2_500.0).abs() < 1e-6), "{a:?}");
         anyhow::ensure!(matches!(a.get(2), Some((_, Answer::Took(us))) if (us - 40_000.0).abs() < 1e-6), "{a:?}");
+        anyhow::ensure!(matches!(a.get(3), Some((_, Answer::Took(us))) if (us - 100.0).abs() < 1e-6), "{a:?}");
         drop(p);
         for answer in [("404 Not Found", String::new()), ("200 OK", "0.25\n".to_owned())] {
             let url = serve(vec![answer.clone(), answer])?;

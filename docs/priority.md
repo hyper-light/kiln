@@ -95,16 +95,31 @@ the same.
 ## headroom listens to the server
 
 Where the server runs on the runner's own machine (its address is loopback or one this machine
-binds), headroom adds a target of its own, `kiln server delay`: `GET /healthz/delay`, the server's
-own measure of how late its shards run ready work, from the probes behind `kiln_shard_delay_seconds`
-([runtime-lab.md](runtime-lab.md)): its worst shard's latest probe, or a hold under way past the
-probes' period; or how long the probe took where that's longer. A server without the route, or
-with its probes off, is no reading, never a breach. Its tolerance is the platform's (1 s) unless a
-person sets another, and it's detected as every target is ([headroom.md](headroom.md)): a shift of
-its delay from calm toward the tolerance cuts kiln's CPU and write budgets, and the pacer slows
-what runs. CI jobs' cgroups are paced now, as agents' sessions are, so the legs and agents beside
-the server are what's slowed first. A job a person paused is the pause's alone: the pacer neither
-stops it nor lets it go on.
+binds), headroom adds a target of its own, `kiln server delay`, read from `GET /healthz/delay`: the
+server's own figures from the probes behind `kiln_shard_delay_seconds`
+([runtime-lab.md](runtime-lab.md)), as JSON. `delay_s` is its worst shard's now, for a person;
+`late_s` and `probes` are every probe's lateness added up and how many ran; `held_s` is a hold under
+way past the probes' period; `period_s` is that period. A server without them (older), or with its
+probes off, is no reading, never a breach.
+
+- **What headroom reads:** how late the server's ready work ran on average since headroom last
+  looked, every probe of every shard counted (the change in `late_s` over the change in
+  `probes`). Not one probe of one shard at an instant: in the lab that missed nearly everything
+  between two reads. A shard held by one long request (opening a long conversation) counts once
+  its probe runs, its lateness in the total; the hold itself is the answer only when no probe ran
+  at all since the last look. In the lab such holds reached 10 to 38 ms calm, the server's own
+  work, which slowing kiln's can't shorten.
+- **Its tolerance:** the shards' own clock, their probes' period (10 ms, `KILN_SHARD_PROBE_MS`):
+  ready work a whole period late on average is a server behind its own work. A server probed at
+  another period is measured against its own.
+- **Its window:** trouble is caught within the platform's time (1 s), as every other target's is, so
+  its probes keep that pace, and a probe still out is harm only once it's out that long (what it
+  answers is what the server measured, not how long asking took).
+
+It's detected as every target is ([headroom.md](headroom.md)): a shift of the delay from calm toward
+the tolerance cuts kiln's CPU and write budgets, and the pacer slows what runs. CI jobs' cgroups are
+paced, as agents' sessions are, so the legs and agents beside the server are what's slowed first. A
+job a person paused is the pause's alone: the pacer neither stops it nor lets it go on.
 
 ## Cores of its own
 
@@ -235,10 +250,18 @@ whole.
   `g8_s4_the_server_runs_above_normal` (Windows): an agent's job's priority class and CPU rate
   control read back, cmd and its child below normal, the first process's memory and I/O priority;
   a person's job without a priority class; the server above normal.
-- `api::tests::g8_s5_the_delay_is_the_worst_shards_now`: the server's answer, its worst shard's.
-- `headroom::probes::tests::g8_s5_a_servers_delay_is_what_it_says_its_shards_wait` and
-  kiln-ci's `headroom::tests::g8_s5_the_servers_delay_rising_slows_legs_and_agents`: the probe reads
-  the delay a server says; the engine, the delay rising from calm, cuts kiln's CPU and paces a leg
-  and an agent alike, then sees it back to calm.
+- `api::tests::g8_s5_the_delay_is_the_worst_shards_now`: the server's answer, its worst shard's
+  now, its probes' lateness added up and counted, the hold and the period.
+- `headroom::probes::tests::g8_s5_a_servers_delay_is_how_late_its_work_ran_since_the_last_read`: the
+  probe answers with the mean since its last read, or the hold, and gives no answer from a first
+  read or a server without the figures.
+- kiln-ci's `headroom::tests::g8_s5_the_servers_delay_rising_slows_legs_and_agents`, with the lab's
+  numbers: calm near 0.43 ms with a stall every two minutes, then legs and agents raising it to
+  1.9 to 4.5 ms: the engine alarms within seconds, cuts kiln's CPU, paces a leg and an agent alike,
+  sees it back to calm, and probes at the window's pace, not the tolerance's.
+  `g8_s5_a_windowed_targets_probe_out_past_its_tolerance_is_no_harm_until_its_window`: a rise the
+  weights held (1.4 to 1.8 times calm) is no trouble, and a probe out is harm only at the window.
+- kiln-lab's `standin::tests::g8_s5_a_hog_turn_burns_for_its_time_and_no_longer`: the stand-in's CPU
+  hog turn, the lab's agents.
 - `rt::tests::g8_s6_shards_are_fixed_to_cores_of_the_servers_own` and
   `os::tests::g8_s6_a_cpu_list_reads_as_linux_writes_one`: cores of the server's own.

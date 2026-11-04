@@ -91,12 +91,16 @@ for r in head:
     last = ev
 
 print(f"t 0 s is {time.strftime('%H:%M:%S', time.gmtime(t0))} UTC\n")
-# How late the server's ready work ran on average between two of the recorder's reads (as headroom
-# reads it since the fix: the server's totals), or a hold under way where that's longer.
+# How late the server's ready work ran on average between two of the recorder's reads, as headroom
+# reads it (the server's totals), or a hold under way where no probe ran at all.
 means = []
 for a, b in zip(delay, delay[1:]):
-    if all(k in a and k in b and a[k] is not None and b[k] is not None for k in ("late", "probes")) and b["probes"] > a["probes"] and b["late"] >= a["late"]:
-        means.append((b["t"], max((b["late"] - a["late"]) / (b["probes"] - a["probes"]), b.get("held") or 0.0)))
+    if not all(k in a and k in b and a[k] is not None and b[k] is not None for k in ("late", "probes")):
+        continue
+    if b["probes"] > a["probes"] and b["late"] >= a["late"]:
+        means.append((b["t"], (b["late"] - a["late"]) / (b["probes"] - a["probes"])))
+    elif b["probes"] == a["probes"] and (b.get("held") or 0.0) > 0.0:
+        means.append((b["t"], b["held"]))
 print(f"| t s | delay med ms | delay most ms | mean since read med ms | mean since read most ms | shards p99 ms | shards p99.9 ms | calm ms | CUSUM | threshold | alarm | CPU budget | paced | least share | hogs' cores | frozen |")
 print("| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |")
 ts = [r["t"] for r in shards]

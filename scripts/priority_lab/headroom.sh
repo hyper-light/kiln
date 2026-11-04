@@ -17,12 +17,15 @@ CPUS=${CPUS:-0-15} SERVER_WEIGHT=${SERVER_WEIGHT:-1000} RUNNER_WEIGHT=${RUNNER_W
 NAME=$(basename "$OUT")
 D=$(cd "$(dirname "$0")" && pwd)
 mkdir -p "$OUT"
+# Temporary files under the lab's own folder, never a shared /tmp (a RAM disk on kiln's machines).
+export TMPDIR=${TMPDIR:-$OUT/tmp}
+mkdir -p "$TMPDIR"
 say() { echo "$(date -u +%H:%M:%S) $*" | tee -a "$OUT/driver.log"; }
 say "start: $NAME, CPUs $CPUS, server at $SERVER_WEIGHT, runner at $RUNNER_WEIGHT, window ${WINDOW}s; load $(cut -d' ' -f1-3 /proc/loadavg)"
 
 # The lab: one round, its window long enough for every phase.
 systemd-run --user --quiet --collect --unit="g8b-s5-lab-$NAME" -p CPUWeight="$SERVER_WEIGHT" -p MemoryMax=16G \
-  --working-directory="$OUT" -E HOME="$HOME" -E PATH="$PATH" \
+  --working-directory="$OUT" -E HOME="$HOME" -E PATH="$PATH" -E TMPDIR="$TMPDIR" \
   bash -c "taskset -c $CPUS $LAB run --kiln $KILN --label main --rounds 1 --window $WINDOW --out $OUT/lab > $OUT/lab.log 2>&1"
 ROUND=$OUT/lab/rounds/001-main
 for _ in $(seq 600); do [ -s "$ROUND/data/admin.token" ] && [ -s "$ROUND/data/join.token" ] && break; sleep 1; done
@@ -52,7 +55,7 @@ echo "$SETTINGS" > "$OUT/hog-state/headroom/settings.json"
 printf '#!/bin/sh\nexec taskset -c %s %s "$@"\n' "$CPUS" "$OUT/lab/bin/claude" > "$OUT/hog-bin/claude"
 chmod +x "$OUT/hog-bin/claude"
 systemd-run --user --scope --quiet --collect --unit="g8b-s5-hogs-$NAME" -p CPUWeight="$RUNNER_WEIGHT" -p Delegate=yes \
-  env -i HOME="$OUT/hog-home" PATH="$OUT/hog-bin:$PATH" XDG_RUNTIME_DIR="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}" USER="$USER" LANG=C.UTF-8 \
+  env -i HOME="$OUT/hog-home" PATH="$OUT/hog-bin:$PATH" XDG_RUNTIME_DIR="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}" USER="$USER" LANG=C.UTF-8 TMPDIR="$TMPDIR" \
   KILN_MACHINE_ID=hog-runner KILN_WARM_FLOOR=0 NO_COLOR=1 RUST_LOG=info \
   "$KILN" agent --server "http://127.0.0.1:$PORT" --token "$(cat "$ROUND/data/join.token")" --name hog-runner --labels hogs --slots 16 \
   --work-dir "$OUT/hog-work" --state-dir "$OUT/hog-state" > "$OUT/hog-runner.log" 2>&1 &
