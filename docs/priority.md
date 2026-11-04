@@ -222,6 +222,47 @@ to 3.41 at p99), and calm's own page tail was wide on this busy machine: in quie
 took 0.33 to 0.46 ms at p99 calm, against 2 ms with legs. Cores of its own held pages and the API
 whole.
 
+### headroom's lab (step 5)
+
+`scripts/priority_lab/headroom.sh` runs one long round of the `realistic` profile on fedora's CPUs
+0-15 (other agents' labs held 16-31), the lab's unit standing in for `kiln.slice` at
+`CPUWeight=1000`. Beside it, a runner of the same build with headroom on, its settings' defaults
+(`escapes` off), in a delegated scope of its own at 100. Its legs and agents are CPU hogs it started:
+CI jobs of a pipeline run by hand (`legs.yaml`, four jobs of four busy loops) and agents' turns of
+the lab's stand-in (`lab:hog:<threads>:<secs>`), each in a cgroup of its own that headroom paces.
+`hogs.sh` starts and raises them, moves the server's process into the runner's cgroup (`join`), and
+turns headroom off and on. `record.py` notes `/healthz/delay` four times a second, the shards'
+histogram, headroom's status as the server has it, and each group's freezer and CPU. `timeline.py`
+reads that back. Other agents' kiln builds loaded fedora throughout (a load of 15 to 80), and it
+reset once (16:48 UTC); the lab's own runs are in its folder, not here, as raw recordings (about
+40 MB each).
+
+**What main (`82ca3c74d03`) did.** Research 01a1a59c2b2a, f44 to f47:
+
+- **Weights held the server.** With 16, then 32 hog threads at kiln.slice's weight, the server's
+  delay rose in its body, not toward harm: `/healthz/delay`'s median from 0.21 ms to 0.3-0.8, the
+  shards' p99 from 0.5-0.9 ms to 2-5, the shards' mean over 2 s from 0.23 ms to 0.31-0.85. At even
+  weights, with 48 more threads, the same. headroom's delay target never moved: its CUSUM stayed at
+  0.
+- **Sharing the server's cgroup, they didn't, and headroom didn't see it.** With 96 hog threads in
+  the server's own cgroup (as a server's own runner holds its agents where the server isn't a
+  delegated unit), its shards ran ready work 40 to 100 times later than calm for four minutes
+  (median 8 to 28 ms, the shards' p99 25 to 97 ms, their mean over 2 s 2.8 ms). The delay target
+  never alarmed: its CUSUM peaked at 6.5 against a threshold of 12.2, while its calm rose with the
+  hogs from 1.3 ms to 4.6.
+- **It caught harm, not trouble.** It alarmed only when probes took a second: a machine-wide stall
+  under the other agents' compiles (the shards' probes every 2 s fell from about 775 to 347), where
+  headroom cut kiln's CPU from 10.9 cores to 5.5 and froze its 16 groups 50-75% of the time. That
+  stall wasn't kiln's, and slowing kiln didn't end it.
+
+Why: it read one probe of the worst shard at an instant, which calm's own spikes (30 to 223 ms at
+most in each 30 s, from other load and long requests) dwarf and which misses everything between two
+reads; and against the platform's 1 s, the CUSUM counts a reading only past about 40 ms (half way
+from calm to 1 s, in its logarithm). Below that every reading pulled the CUSUM down and joined calm.
+What headroom reads now ("headroom listens to the server", above) is every probe of every shard
+between two reads, against the shards' 10 ms period: calm's mean stayed within 0.21-0.44 ms over 2 s,
+kiln.slice's weight's 0.31-0.85, and the shared cgroup's reached 2.8 (4.5 at p90).
+
 ## Needs root, or a person
 
 - A system install (root, once) for the top-level `kiln.slice`, the partition, and the server's
