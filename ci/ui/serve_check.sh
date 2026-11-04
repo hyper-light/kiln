@@ -80,6 +80,7 @@ for path in /agents /agents/demo-long / /manifest.webmanifest /sw.js /favicon.sv
   h=$(head_of -H 'accept: text/html' -H 'accept-encoding: br, gzip' "http://127.0.0.1:$PORT$path")
   tag=$(grep -i '^etag:' <<<"$h" | cut -d' ' -f2-)
   first=$(wc -c <"$WORK/body")
+  : >"$WORK/body2"
   h2=$(curl -s -o "$WORK/body2" -D - -H 'accept: text/html' -H 'accept-encoding: br, gzip' -H "if-none-match: $tag" "http://127.0.0.1:$PORT$path" | tr -d '\r')
   code=$(head -1 <<<"$h2" | cut -d' ' -f2)
   again=$(( $(wc -c <"$WORK/body2") + $(printf '%s' "$h2" | wc -c) ))

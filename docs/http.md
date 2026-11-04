@@ -101,6 +101,50 @@ request, and its handshake still needs the client's own key exchange. Resumption
 `kiln_tls_handshakes_total{door,kind}` counts handshakes by door (`server`, `front_door`) and kind
 (`full`, `full_hello_retry`, `resumed`).
 
+## The UI's files
+
+kiln serves the web UI's static files itself (`crates/kiln/src/ui.rs`); goal 8 of the browser
+protocol program (plan `01a1a832ebfd`) set how they are compressed, cached and revalidated, so a
+page loads in bounded time on a 50 kbit/s link (docs/browser-lab/ui-loads.md).
+
+- **Compressed once, at build time.** kiln's build packs every compressible file of the UI's
+  build (text, scripts, JSON, SVG and WebAssembly over 1 KiB: `crates/kiln/src/ui_pack.rs`) with
+  Brotli 11 into the binary (`crates/kiln/build.rs`; goal 11 of the API runtime program), and a
+  request that takes `br` gets that copy, so none goes out uncompressed after a restart. A client
+  that takes gzip alone (none of the browsers) gets the file as it is the first time, and a gzip
+  copy, made on the compute pool and kept, after. The grammars are plain WebAssembly the browser
+  decodes, not gzip files inflated in the page.
+- **The compression policy.** Brotli encodes only kiln's own static files, made at build time; a
+  dynamic response is never compressed in a context that holds a secret beside text an attacker
+  can choose (BREACH). kiln's `brotli` is 9.1 or later (it refuses the streams behind
+  CVE-2026-111497 in the C decoder browsers use).
+- **Names that change only with content.** Hashed assets (`assets/`) are `public,
+  max-age=31536000, immutable`. After the build, `ui/scripts/stable-names.mjs` names each chunk by
+  its own content and has chunks name each other by keys an import map in every page resolves, so
+  a deploy renames only the chunks that changed (and the shell, which carries the map).
+- **Revalidated, not downloaded again.** Every response carries a strong ETag of the bytes it
+  sends (each coding its own); `If-None-Match` naming it gets a 304 with no body. The shell and the
+  other unhashed files (the manifest, icons, `sw.js`) are `no-cache`, so a repeat visit costs a
+  revalidation for each. A page that renders only in the browser (every page but those the build
+  lists as rendered on the server, `_server-pages.json`: today `/shared/plans/`) gets kiln's own
+  shell, packed by the build and revalidated, rather than the UI server's render of the same
+  document.
+- **Deltas for what a deploy changed** (Compression Dictionary Transport, RFC 9842). Every hashed
+  script and stylesheet goes with `Use-As-Dictionary: match="/assets/<name>-*.<ext>"` and `Vary:
+  Accept-Encoding, Available-Dictionary`. A request whose `Available-Dictionary` names a version of
+  the same name kiln has (this build's or a kept earlier one's, by its SHA-256) and whose
+  Accept-Encoding takes `dcb` gets Brotli against that version: the magic, the dictionary's SHA-256,
+  then the stream. A delta is made once per pair on the compute pool and kept with the kept assets
+  (`<data>/ui-assets/.deltas`, aged out with them); until it's made, the plain Brotli copy goes, so
+  no request waits. Only Chromium asks for it; Firefox and Safari get the plain copies.
+  Whether Chromium uses dictionaries over a connection signed by kiln's own root is for the page-load
+  lab to measure (goal 1's lab, not yet run for page loads).
+- **Earlier builds' assets** are kept for 14 days after the last build that had them, each with
+  the Brotli copy its build packed (on disk), so a page loaded before a deploy can still load what
+  it hasn't yet, compressed.
+
+`ci/ui/serve_check.sh` checks all of it against a real server.
+
 ## Clients
 
 `kiln_http::client::http1` sends one request at a time over a kept-alive connection, mirroring

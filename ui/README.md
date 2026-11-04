@@ -1,6 +1,6 @@
 # kiln UI
 
-The web console for kiln. It is built with Vite, React 19, TypeScript, Tailwind v4, Radix, xterm.js and uPlot, and styled after hyperlight-site. `npm run build` writes `dist/`, which the Rust server embeds with rust-embed. The server serves it at `/` and falls back to `index.html` for unknown paths.
+The web console for kiln. It is built with Vite, React 19, TypeScript, Tailwind v4, Radix, xterm.js and uPlot, and styled after hyperlight-site. `npm run build` writes `dist/`, which the Rust server embeds with rust-embed. The server serves it at `/` and answers a page that renders only in the browser with the app's shell (`_shell.html`).
 
 ```sh
 npm install
@@ -38,3 +38,27 @@ mock/            mock API server + fake data
 - The UI's metrics page lives at **`/telemetry`**, because `/metrics` is the server's Prometheus endpoint.
 - PTY sessions use the WebGL renderer and fall back to the DOM renderer. Log views always use the DOM renderer, because browsers cap the number of live WebGL contexts. Setting localStorage `kiln.term.renderer` to `"dom"` forces the DOM renderer everywhere.
 - While a terminal has focus, every key goes to the PTY. The Ctrl/Cmd+K palette only opens when no terminal is focused.
+
+## Bytes on a slow link
+
+What each page costs on the wire is held to a budget on every build (goal 8, plan `01a1a832ebfd`;
+the arithmetic and the lab's numbers are in `docs/browser-lab/ui-loads.md`):
+
+- `node ci/ui/page_bytes.mjs --dist ui/dist` prints each of the lab's pages (sign-in, overview,
+  Mission control, a conversation, `/runs` (Ship), a run) as the shell plus its route, in Brotli
+  as kiln sends it, with requests and critical waves. `--check` holds them to
+  `ci/ui/page_budgets.json` and names any page over; `--ratchet` moves the budgets down to the
+  build (never up); `--since <dist>` says what a visit after a deploy from that build downloads
+  again. `ci/ui/two_builds.sh` builds twice, the second with a one-line change in the
+  conversation, and fails when more than 2 hashed files take new names. Both run in the ui job.
+- `KILN_UI_SOURCEMAP=1 npx vite build`, then `node ci/ui/attribute.mjs --page conversation`, says
+  which modules a page's code is made of.
+- The build names chunks by their own content through an import map (`scripts/stable-names.mjs`)
+  and lists the pages the server renders (`scripts/server-pages.mjs`); kiln's own build packs the
+  files with Brotli (`crates/kiln/build.rs`), and docs/http.md "The UI's files" says how kiln
+  serves them.
+- After a page is ready, not before: the editor, xterm (Ship's log boxes load it as a log shows),
+  uPlot and tree-sitter come only where a page shows them, and the conversation's Plan and Tools
+  tabs load when one is pointed at or opened. Code shows plain until its grammar is here.
+- The splash is in every page's HTML (`components/shell/splash.tsx`, rendered by the document),
+  so a slow link shows it before the code arrives.
