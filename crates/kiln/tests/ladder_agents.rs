@@ -4,7 +4,8 @@
 //! into a workspace of its own, resolves, runs the tests there and answers with why; kiln commits
 //! it as the agent, tests it again, and with automatic resolution off it waits for a person. A
 //! person's change in a repository that sends agents and resolves automatically gets an agent kiln
-//! starts on a runner, and its tested resolution goes on by itself.
+//! starts on a runner, and its tested resolution goes on by itself. Code no agent made, asked about
+//! in Ship (W26-R07), is asked of a helper kiln starts on a runner the same way.
 
 #![cfg(unix)]
 
@@ -413,5 +414,46 @@ fn w26_r16_conflict_agent_only_when_on() -> anyhow::Result<()> {
     let s = started(&w)?;
     let r1 = common::machine("r1");
     assert!(s.iter().any(|x| x.to_string().contains(&r1)), "on r1 ({r1}): {s:?}");
+    Ok(())
+}
+
+/// docs/ci.md W26-R07: code no agent made, asked about in Ship, is asked of a helper kiln starts for
+/// the person (`ci.repos.about`): on r1, the runner with the harness, named for what was asked, the
+/// card's (no agent of the list), its answer read as an agent's helper's is. It takes `agents.run`
+/// on the server, as asking an agent does: a commit that isn't one is refused, and so is kim, who
+/// may run agents for acme/app alone, and a viewer.
+#[test]
+fn w26_r07_code_no_agent_made_is_asked_of_a_helper_kiln_starts() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let w = world(dir.path())?;
+    let head = git(&w.home, &w.bare, &["rev-parse", "main"])?.trim().to_owned();
+    let ask = json!({ "commit": head, "path": "plan/expand.rs", "code": " fn expand() {}", "line": 1, "selection": "expand" });
+    // Asked again until r1 has said it has the harness: a refusal starts nothing.
+    let mut r = Value::Null;
+    until(60, "a helper started on r1", || {
+        let (st, text) = http(w.s.port, "POST", "/api/repos/acme%2Fapp/about", &w.s.admin, Some(&ask))?;
+        if st == 200 {
+            r = serde_json::from_str(&text)?;
+            return Ok(None);
+        }
+        anyhow::ensure!(st == 409, "{st} {text}");
+        Ok(Some(text))
+    })?;
+    let id = r.pointer("/agents/0/id").and_then(Value::as_str).unwrap_or_default().to_owned();
+    anyhow::ensure!(!id.is_empty() && r.get("itself") == Some(&json!(false)), "{r}");
+    let sessions: Value = serde_json::from_str(&http(w.s.port, "GET", "/api/harness/sessions", &w.s.admin, None)?.1).unwrap_or_default();
+    let started = sessions.as_array().cloned().unwrap_or_default().into_iter().find(|s| text(s, "id") == id).unwrap_or_default();
+    let r1 = common::machine("r1");
+    anyhow::ensure!(text(&started, "name") == "About expand" && started.to_string().contains(&r1), "on r1 ({r1}), named for what was asked: {started}");
+    let listed = ok(&w.s, &w.s.admin, "GET", "/api/harness/agents", None)?;
+    anyhow::ensure!(!listed.to_string().contains(&id), "a card's helper is no agent of the list: {listed}");
+    ok(&w.s, &w.s.admin, "GET", &format!("/api/harness/agents/{id}/result"), None)?;
+    let (st, _) = http(w.s.port, "POST", "/api/repos/acme%2Fapp/about", &w.s.admin, Some(&json!({ "commit": "main", "path": "a", "code": "b" })))?;
+    anyhow::ensure!(st == 400, "a commit that isn't one: {st}");
+    let (st, _) = http(w.s.port, "POST", "/api/repos/acme%2Fapp/about", &w.kim, Some(&ask))?;
+    anyhow::ensure!(st == 403, "agents.run for acme/app alone: {st}");
+    let viewer = token(&w.s, json!({ "kind": "pat", "user": "kim", "grants": ["viewer@repo:acme/app"] }))?;
+    let (st, _) = http(w.s.port, "POST", "/api/repos/acme%2Fapp/about", &viewer, Some(&ask))?;
+    anyhow::ensure!(st == 403, "only someone who may run agents starts one: {st}");
     Ok(())
 }

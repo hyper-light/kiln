@@ -616,7 +616,7 @@ async fn authorized(hub: Arc<Hub>, caller: crate::authz::Caller, req: Request) -
             .map_err(|(c, m)| err(c, m))
         }
         // W14: diffs and stacks.
-        (_, ["api", "diffs" | "change-requests" | "stacks" | "comments" | "review" | "queue", ..]) | (&Method::GET, ["api", "repos", _, "diffs" | "queue" | "change-requests"] | ["api", "repos", _, "lands", _]) | (&Method::GET | &Method::PUT, ["api", "repos", _, "agent-fixes" | "ladder"]) | (&Method::POST, ["api", "repos", _, "change-requests" | "submit"]) => {
+        (_, ["api", "diffs" | "change-requests" | "stacks" | "comments" | "review" | "queue", ..]) | (&Method::GET, ["api", "repos", _, "diffs" | "queue" | "change-requests"] | ["api", "repos", _, "lands", _]) | (&Method::GET | &Method::PUT, ["api", "repos", _, "agent-fixes" | "ladder"]) | (&Method::POST, ["api", "repos", _, "change-requests" | "submit" | "about"]) => {
             let segs: Vec<&str> = s.iter().skip(1).copied().collect();
             let body: serde_json::Value = if matches!(method, Method::POST | Method::PATCH | Method::PUT) { boxed(|| srv::body_json(req.into_body(), JSON_LIMIT)).await.unwrap_or(serde_json::Value::Null) } else { serde_json::Value::Null };
             boxed(|| crate::ci::diffs::route(&hub, &method, &segs, &q, &caller, &body)).await.map_err(|(c, m)| err(c, m))
