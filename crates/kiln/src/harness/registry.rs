@@ -2135,12 +2135,13 @@ impl Registry {
         }));
     }
 
-    /// Keeps session `id`'s changeset `files` in the conversation store, written out on the blocking
-    /// pool as it is when its turn comes. One writer at a time, at the pace the store commits: it
-    /// writes each session's newest, waits for the store to have it, then takes what came
-    /// meanwhile, a patch that comes while it works taking the place of the one before (each is the
-    /// changeset whole). A burst of patches (a runner sending what it held) writes a session's
-    /// changeset as often as the store takes it, not once a patch (most of a megabyte each).
+    /// Keeps session `id`'s changeset `files` in the conversation store as it is when its turn comes:
+    /// written out on the compute pool (most of a megabyte of JSON for a long session's), kept by the
+    /// store on the blocking pool (goal 4, plan 01a1a59c2a9c step 3). One writer at a time, at the pace
+    /// the store commits: it writes each session's newest, waits for the store to have it, then takes
+    /// what came meanwhile, a patch that comes while it works taking the place of the one before (each
+    /// is the changeset whole). A burst of patches (a runner sending what it held) writes a session's
+    /// changeset as often as the store takes it, not once a patch.
     fn store_changes(&self, id: &str, files: Files, store: crate::convo::store::Store) {
         use std::sync::atomic::Ordering;
         self.changes_to_store.lock().insert(id.to_owned(), files);
@@ -2148,9 +2149,9 @@ impl Registry {
             return;
         }
         let (pending, storing) = (Arc::clone(&self.changes_to_store), Arc::clone(&self.changes_storing));
-        let write = move || {
+        drop(crate::rt::spawn(async move {
             loop {
-                let batch = std::mem::take(&mut *pending.lock());
+                let batch: Vec<(String, Files)> = std::mem::take(&mut *pending.lock()).into_iter().collect();
                 if batch.is_empty() {
                     storing.store(false, Ordering::Release);
                     // One that came in between finds no writer at work: this one goes on with it,
@@ -2160,8 +2161,8 @@ impl Registry {
                     }
                     continue;
                 }
-                for (session, files) in batch {
-                    // Its files are their texts, written out once.
+                // Each changeset is its files' texts, written out once: a session at a time.
+                let rows = crate::rt::compute_map(batch, |(session, files)| {
                     let changes = Some(write::string(write::texts_len(files.iter().map(|f| &**f)), |b| {
                         b.push(b'[');
                         for (i, f) in files.iter().enumerate() {
@@ -2173,15 +2174,26 @@ impl Registry {
                         b.push(b']');
                         Ok(())
                     }));
-                    store.put(vec![crate::convo::rows::Row::Session { session, info: None, meta: None, state: None, changes, epoch: None, open: false, at: crate::util::now_ms() }]);
-                }
-                if let Err(e) = store.sync() {
+                    crate::convo::rows::Row::Session { session, info: None, meta: None, state: None, changes, epoch: None, open: false, at: crate::util::now_ms() }
+                })
+                .await;
+                let rows = match rows {
+                    Ok(rows) => rows,
+                    Err(e) => {
+                        tracing::debug!(error = %format!("{e:#}"), "the sessions' changesets couldn't be written out for the conversation store");
+                        continue;
+                    }
+                };
+                let store = store.clone();
+                let kept = crate::rt::blocking(move || {
+                    store.put(rows);
+                    store.sync()
+                })
+                .await;
+                if let Err(e) = kept.and_then(|r| r) {
                     tracing::debug!(error = %format!("{e:#}"), "the conversation store didn't say it had the changesets");
                 }
             }
-        };
-        drop(crate::rt::spawn(async move {
-            let _ = crate::rt::blocking(write).await;
         }));
     }
 

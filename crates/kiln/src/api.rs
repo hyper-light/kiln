@@ -1203,7 +1203,13 @@ async fn authorized(hub: Arc<Hub>, caller: crate::authz::Caller, req: Request) -
         }
         (&Method::GET, ["api", "harness", "kinds"]) => Ok(harness_kinds(&hub, &q)),
         (&Method::GET, ["api", "harness", "workspaces"]) => Ok(boxed(|| harness_workspaces(&hub)).await),
-        (&Method::GET, ["api", "harness", "sessions"]) => Ok(srv::json(StatusCode::OK, &boxed(|| crate::harness::lineage::seen(&hub, &caller, hub.harness.list())).await)),
+        (&Method::GET, ["api", "harness", "sessions"]) => {
+            let seen = boxed(|| crate::harness::lineage::seen(&hub, &caller, hub.harness.list())).await;
+            // Every agent's info (kilobytes each) written out on the compute pool, not on the shard
+            // the request came on (goal 4, plan 01a1a59c2a9c step 3).
+            let body = crate::rt::compute(move || serde_json::to_vec(&seen)).await.map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")))?.map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, format!("serialize: {e}")))?;
+            Ok(srv::response(StatusCode::OK, "application/json", srv::full(body)))
+        }
         (&Method::POST, ["api", "harness", "sessions"]) => boxed(|| harness_open(&hub, req)).await,
         (&Method::GET, ["api", "harness", "sessions", id]) => match hub.harness.list().into_iter().find(|i| i.id == *id) {
             Some(info) => Ok(srv::json(StatusCode::OK, &info)),
