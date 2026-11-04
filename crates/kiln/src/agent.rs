@@ -1867,7 +1867,12 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
     let mut harness_kinds_tick: u32 = 0;
     // Whether its user's login shell had said its PATH when they were last looked at.
     let mut users_path_known = false;
-    let mut sampler = crate::host::Sampler::new(Some(&o.work_dir));
+    // Its host's sample is taken on the blocking pool, never on this loop: on a Mac it reads the
+    // work dir's volume through CacheDelete (an XPC call, slow on a full disk) and, before, every
+    // process; inline it held this loop's shard for all of every interval (2026-11-04), so the
+    // server's commands went unanswered and its agent sessions read offline. One at a time.
+    let sampler = Arc::new(parking_lot::Mutex::new(crate::host::Sampler::new(Some(&o.work_dir))));
+    let sampling = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let mut sample_tick = Interval::new(Duration::from_secs(5));
     let mut heartbeat = Interval::new(Duration::from_secs(10));
     let mut watchdog = Interval::new(Duration::from_secs(5));
@@ -4600,8 +4605,15 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                     own.0.send(Up::Term(AgentMsg::Wire(wire_in.have()))).await.ok();
                 }
                 if connected {
-                    let s = sampler.sample();
-                    own.msg(AgentMsg::Sample(s)).await;
+                    if !sampling.swap(true, std::sync::atomic::Ordering::AcqRel) {
+                        let (sampler, sampling, said) = (Arc::clone(&sampler), Arc::clone(&sampling), own.clone());
+                        crate::rt::spawn(async move {
+                            if let Ok(s) = crate::rt::blocking(move || sampler.lock().sample()).await {
+                                said.msg(AgentMsg::Sample(s)).await;
+                            }
+                            sampling.store(false, std::sync::atomic::Ordering::Release);
+                        });
+                    }
                     // What its QUIC layer let go below the channel, for its page: once it changed.
                     let dropped = crate::metrics::net().counts();
                     if server_drops && welcomed && drops_said.as_ref() != Some(&dropped) {
