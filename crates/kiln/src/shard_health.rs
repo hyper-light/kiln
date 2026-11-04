@@ -217,7 +217,10 @@ async fn probe(i: usize, period: Duration) {
     loop {
         crate::rt::sleep_until(due).await;
         let now = Instant::now();
-        me.note(now.saturating_duration_since(due), now);
+        let late = now.saturating_duration_since(due);
+        me.note(late, now);
+        // What the shard sheds, from its delay (goal 6, plan 01a1a59c2abe step 4).
+        crate::overload::tick(i, late);
         // The next one a period from now: a shard that was held doesn't then run a burst of probes
         // to catch up, each noting the same hold again.
         due = now + period;

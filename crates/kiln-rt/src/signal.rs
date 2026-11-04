@@ -278,6 +278,10 @@ impl Future for Recv<'_> {
     type Output = Result<Signals, RtError>;
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        // A charge of the task's turn (`crate::coop`), before a delivery is taken.
+        if crate::coop::poll_proceed(cx).is_pending() {
+            return Poll::Pending;
+        }
         let Some(slot) = self.stream.slot() else {
             return Poll::Ready(Err(RtError::BadConfig {
                 what: "a signal subscription outside the table",

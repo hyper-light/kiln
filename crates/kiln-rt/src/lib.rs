@@ -56,6 +56,7 @@ mod cells;
 pub mod combine;
 pub mod compute;
 pub mod control;
+pub mod coop;
 pub mod dns;
 pub mod driver;
 pub mod error;
@@ -94,6 +95,7 @@ pub mod udp;
 mod unwind;
 pub mod waker;
 pub mod wakes;
+pub mod watch;
 
 #[cfg(target_os = "windows")]
 mod afd;

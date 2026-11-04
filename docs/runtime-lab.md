@@ -102,17 +102,22 @@ conversations to about 20,000 events. The lab runs 4 runners and 32 live session
 events, 6 of 4,000, 24 of 400), 8 of them at work (a 40-event turn, 25 ms apart, then about 2 s
 before the next message), 8 viewers (20 s on each agent), 4 API readers (50 ms apart), 2 agents
 calling MCP (250 ms apart) and a page loader (100 ms apart), with a 5 s warm-up and a 60 s window.
-`--profile small` is a minute's try.
+`--profile small` is a minute's try. `--profile overload` is the realistic one with no think time
+for its viewers and readers (each asks again as soon as it is answered): with one shard
+(`--env KILN_RT_SHARDS=1`) it overloads the server on purpose, as goal 6's shedding is measured
+(`--env-b KILN_SHED=1` against the same build without).
 
 ### What it reports
 
 Each round reports, for each class the lab times (`page`, `api_read`, `api_write`, `websocket`: an
 event from its harness writing it to a viewer's socket bringing it, `attach`: a viewer opening a
-whole conversation), its median, p99, p99.9 and most (the stall tail) and its rate; the server's CPU
-for each request and its share of a CPU; and, where the build has them, from `/metrics`: the shards'
-delay (p99, p99.9 and the top bucket reached, all shards together), their busy share and slow polls
-a second, all and by cause (`shards.slow_polls_task_per_s` and the others), and each route class's
-server-side p99 took and waited. Where the build has the pools' series: the compute pool's jobs and
+whole conversation), its median, p99, p99.9 and most (the stall tail), its rate and its errors (a
+status of 400 or more, or no answer); the server's CPU for each request and its share of a CPU; and,
+where the build has them, from `/metrics`: the shards' delay (p99, p99.9 and the top bucket reached,
+all shards together), their busy share and slow polls a second, all and by cause
+(`shards.slow_polls_task_per_s` and the others), each route class's server-side p99 took and waited,
+and the requests the server shed by class (`kiln_shed_total`: goal 6's shedding, `crate::overload`,
+on with `KILN_SHED=1`). Where the build has the pools' series: the compute pool's jobs and
 pieces a second, its jobs' wait for a thread at p99, its pieces' p99 and the top bucket one reached,
 and its threads busy on average (`compute.*`); and for each of the blocking pool's shares, its jobs a
 second, their run and wait at p99, the places they held on average (`busy`: their runs' time over the

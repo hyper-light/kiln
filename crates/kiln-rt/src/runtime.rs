@@ -26,6 +26,7 @@ use crate::task::{AdmissionReceipt, SpawnRequest};
 /// (a submitter that may outlive the runtime — an observation still pending while its daemon stops),
 /// and returns the receipt of its admission; refused `ShardGone` when the slot is free or held by a
 /// later registration, `ControlFull` when the holder's control queue is full.
+#[track_caller]
 pub fn submit_to_holder<F: Future<Output = ()> + Send + 'static>(
     holder: registry::SlotHolder,
     future: F,
@@ -37,6 +38,7 @@ pub fn submit_to_holder<F: Future<Output = ()> + Send + 'static>(
 
 /// Submits an opt-in service bootstrap to this exact registration. An unadmitted
 /// bootstrap must not own live I/O; transfer that ownership only after `Admitted`.
+#[track_caller]
 pub fn submit_service_to_holder<F: Future<Output = ()> + Send + 'static>(
     holder: registry::SlotHolder,
     future: F,
@@ -44,6 +46,52 @@ pub fn submit_service_to_holder<F: Future<Output = ()> + Send + 'static>(
     let (request, receipt) = SpawnRequest::with_receipt(Box::pin(future), None);
     registry::send_control_to_holder(holder, Control::SpawnService(Box::new(request)))?;
     Ok(receipt)
+}
+
+/// Submits a detached task to the shard `holder` names as work that may move (kiln's goal 6, `crate::watch`): it
+/// waits in that shard's queue of movable spawns, and should the watchdog find the shard held in one poll past
+/// its limit before the shard admits it, it is handed to another shard of the same runtime, its receipt
+/// answered by whichever admits it. What spreads work over shards submits this way (a server's accepted
+/// connections, spawns from off the runtime); what must run on one shard (its own state's owner, a probe of that
+/// shard) submits with [`submit_to_holder`]. Refused `ShardGone` when the slot is free, held by a later
+/// registration or stopping, and `ControlFull` when the queue is full.
+#[track_caller]
+pub fn submit_movable<F: Future<Output = ()> + Send + 'static>(
+    holder: registry::SlotHolder,
+    future: F,
+) -> Result<AdmissionReceipt, RtError> {
+    let (request, receipt) = SpawnRequest::with_receipt(Box::pin(future), None);
+    push_movable(holder, request, receipt)
+}
+
+/// [`submit_movable`], its task starting in `class` (kiln's goal 6, `crate::coop::Class`): a server's accepted
+/// connection, whose first request must be read before its own class is known, starts Critical.
+#[track_caller]
+pub fn submit_movable_as<F: Future<Output = ()> + Send + 'static>(
+    holder: registry::SlotHolder,
+    class: crate::coop::Class,
+    future: F,
+) -> Result<AdmissionReceipt, RtError> {
+    let (request, receipt) = SpawnRequest::with_receipt(Box::pin(future), None);
+    push_movable(holder, request.in_class(class), receipt)
+}
+
+/// Queues a movable request, its receipt back when the shard took it.
+fn push_movable(
+    holder: registry::SlotHolder,
+    request: SpawnRequest,
+    receipt: AdmissionReceipt,
+) -> Result<AdmissionReceipt, RtError> {
+    match registry::push_movable(holder, Box::new(request)) {
+        Ok(()) => Ok(receipt),
+        // Handed back: the shard is gone or stopping, or its queue full; the request drops with its receipt answered.
+        Err(_) if registry::with_holder(holder, |_| ()).is_none() => Err(RtError::ShardGone {
+            shard: holder.shard(),
+        }),
+        Err(_) => Err(RtError::ControlFull {
+            shard: holder.shard(),
+        }),
+    }
 }
 
 /// Requests a task's cancellation from any thread without a runtime handle (the message
@@ -353,6 +401,9 @@ pub struct Runtime {
     notes: Vec<String>,
     retirement: Vec<retirement::Owner>,
     retirement_capacity: usize,
+    /// The thread that watches the shards for one held in a poll past its limit (`crate::watch`), stopped before
+    /// the workers are.
+    watchdog: Option<crate::watch::Watchdog>,
 }
 
 impl std::fmt::Debug for Runtime {
@@ -368,6 +419,10 @@ impl Drop for Runtime {
     /// slots back, exactly as `shutdown` would; a worker's failure is reported on the error stream, the one
     /// place a drop can put it.
     fn drop(&mut self) {
+        // The watchdog first: it moves nothing among shards that are stopping.
+        if let Some(mut watchdog) = self.watchdog.take() {
+            watchdog.stop();
+        }
         if !self.workers.is_empty() && stop(std::mem::take(&mut self.workers)).is_err() {
             registry::note_unreported_failure();
         }
@@ -558,12 +613,23 @@ impl Runtime {
             roll_back(workers, &error);
             return Err(error);
         }
+        let watchdog = match crate::watch::Watchdog::start(
+            workers.iter().map(|worker| worker.holder).collect(),
+            config,
+        ) {
+            Ok(watchdog) => watchdog,
+            Err(error) => {
+                roll_back(workers, &error);
+                return Err(error);
+            }
+        };
         Ok(Runtime {
             workers,
             ids,
             notes,
             retirement: Vec::new(),
             retirement_capacity,
+            watchdog: Some(watchdog),
         })
     }
 
@@ -652,6 +718,7 @@ impl Runtime {
     /// channel is full (its admission limit) or the shard is gone. `Ok` is a **submission**: the request
     /// is in the shard's control queue, and whether the shard admits it is answered only to a receipt
     /// ([`Self::spawn_on_with_receipt`]).
+    #[track_caller]
     pub fn spawn_on<F: Future<Output = ()> + Send + 'static>(
         &self,
         shard: ShardId,
@@ -665,6 +732,7 @@ impl Runtime {
     /// ([`AdmissionReceipt`]): refused here when the shard's control queue is full or the shard is gone;
     /// otherwise the receipt reports, once the shard drains the request, whether the task was admitted
     /// (and as which task), refused (the arena full), or terminated unadmitted (the shard shutting down).
+    #[track_caller]
     pub fn spawn_on_with_receipt<F: Future<Output = ()> + Send + 'static>(
         &self,
         shard: ShardId,
@@ -677,6 +745,7 @@ impl Runtime {
 
     /// Submits an opt-in service bootstrap and returns its real admission receipt.
     /// Cancellation keeps the admitted future alive until its cleanup returns Ready.
+    #[track_caller]
     pub fn spawn_service_on_with_receipt<F: Future<Output = ()> + Send + 'static>(
         &self,
         shard: ShardId,
@@ -702,6 +771,9 @@ impl Runtime {
     /// counters in shard order, or the first worker's failure (typed; every worker is still joined and every
     /// slot still given back).
     pub fn shutdown(mut self) -> Result<Vec<Counters>, RtError> {
+        if let Some(mut watchdog) = self.watchdog.take() {
+            watchdog.stop();
+        }
         let mut result = stop(std::mem::take(&mut self.workers));
         for owner in &mut self.retirement {
             if let Err(error) = owner.join()
@@ -828,6 +900,7 @@ impl LocalRuntime {
     }
 
     /// Spawns a joinable task.
+    #[track_caller]
     pub fn spawn<F: Future<Output = ()> + 'static>(
         &mut self,
         future: F,
@@ -836,6 +909,7 @@ impl LocalRuntime {
     }
 
     /// Spawns a joinable service whose future completes its cancellation cleanup.
+    #[track_caller]
     pub fn spawn_service<F: Future<Output = ()> + 'static>(
         &mut self,
         future: F,
@@ -858,6 +932,7 @@ impl LocalRuntime {
     /// call. Refused when the root cannot be admitted, `ShardGone` when the shard's driver is lost before
     /// the root finishes, and `RootUnwound` when the root's future unwinds: the shard's boundary ends that
     /// task with no output to wait for.
+    #[track_caller]
     pub fn block_on<T: 'static>(
         &mut self,
         future: impl Future<Output = T> + 'static,

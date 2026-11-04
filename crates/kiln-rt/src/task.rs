@@ -58,10 +58,16 @@ pub struct SpawnRequest {
     pub parent: Option<Encoded>,
     /// The receipt to answer at admission; none for a fire-and-forget submission.
     pub receipt: ReceiptSlot,
+    /// Where it was made (`#[track_caller]`): what the watchdog names for its task should it hold its shard
+    /// (`crate::watch`).
+    pub(crate) at: &'static std::panic::Location<'static>,
+    /// The class its task starts in (`crate::coop::Class`); `None`: Normal.
+    pub(crate) class: Option<crate::coop::Class>,
 }
 
 impl SpawnRequest {
     /// A request whose admission nobody reads.
+    #[track_caller]
     pub fn new(
         future: Pin<Box<dyn Future<Output = ()> + Send + 'static>>,
         parent: Option<Encoded>,
@@ -70,10 +76,13 @@ impl SpawnRequest {
             future,
             parent,
             receipt: ReceiptSlot::none(),
+            at: std::panic::Location::caller(),
+            class: None,
         }
     }
 
     /// A request whose admission the submitter reads: the request, and the receipt it answers.
+    #[track_caller]
     pub fn with_receipt(
         future: Pin<Box<dyn Future<Output = ()> + Send + 'static>>,
         parent: Option<Encoded>,
@@ -84,9 +93,20 @@ impl SpawnRequest {
                 future,
                 parent,
                 receipt: slot,
+                at: std::panic::Location::caller(),
+                class: None,
             },
             receipt,
         )
+    }
+}
+
+impl SpawnRequest {
+    /// The request with its task starting in `class` (kiln's goal 6, `crate::coop::Class`): a connection's task
+    /// reads its first request at the class that reads requests promptly, before it knows the request's own.
+    pub fn in_class(mut self, class: crate::coop::Class) -> Self {
+        self.class = Some(class);
+        self
     }
 }
 

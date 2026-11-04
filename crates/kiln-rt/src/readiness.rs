@@ -76,6 +76,11 @@ impl Future for Ready {
             // (mantle's review, finding 1): refused, as the synchronization primitives refuse it.
             return Poll::Ready(Err(RtError::NotOnShardThread));
         };
+        // A charge of the task's turn (`crate::coop`), before a fired wait is taken: past its share the task
+        // yields here, its wait kept armed.
+        if crate::coop::poll_proceed(cx).is_pending() {
+            return Poll::Pending;
+        }
         if let Some((ticket, armed_for)) = self.armed {
             if armed_for == word {
                 let outcome = registry::with_current(|ctx| ctx.interest_outcome(ticket)).flatten();
