@@ -142,37 +142,37 @@ jobs:
           rustup toolchain install stable --profile minimal
           rustup default stable
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
-      - id: build
-        name: Build the tests
-        run: |
-          cargo test -p hyper-rt --locked --test compute --test compute_beside --test compute_wait --no-run 2>&1 | tee "$RUNNER_TEMP/build.txt"
-          cargo test -p kiln --locked --lib --no-run 2>&1 | tee -a "$RUNNER_TEMP/build.txt"
+      # Each check builds and runs its tests in one cargo call: kiln's build script runs again at
+      # every call in a fetched checkout (it watches .git/packed-refs, which that has none of), so a
+      # build of its tests in a step before would be built again here.
       - id: compute
         name: The compute pool's threads run below normal (goal 3 step 1)
-        if: ${{ !cancelled() && steps.build.outcome == 'success' }}
-        timeout-minutes: 15
+        timeout-minutes: 30
         run: cargo test -p hyper-rt --locked --test compute --test compute_beside --test compute_wait -- --nocapture 2>&1 | tee "$RUNNER_TEMP/compute.txt"
       - id: jobs
         name: Job objects below normal, the server above normal (goal 8 step 4)
-        if: ${{ !cancelled() && steps.build.outcome == 'success' }}
-        timeout-minutes: 15
+        if: ${{ !cancelled() }}
+        timeout-minutes: 60
         run: cargo test -p kiln --locked --lib -- os::contain::tests::g8_s4 --nocapture 2>&1 | tee "$RUNNER_TEMP/jobs.txt"
-      # A run's logs take a GitHub sign-in to read; its annotations don't. What each test step said
-      # (its last 150 lines) and a failed build (150 from its first error), without cargo's
-      # progress, each as one annotation.
+      # A run's logs take a GitHub sign-in to read; its annotations don't. What each check said,
+      # without cargo's progress, as one annotation: its last 150 lines, or, where no test ran (the
+      # build failed), 150 from its first error.
       - name: Report
         if: ${{ always() }}
         env:
-          OUTCOMES: build=${{ steps.build.outcome }} compute=${{ steps.compute.outcome }} jobs=${{ steps.jobs.outcome }}
+          OUTCOMES: compute=${{ steps.compute.outcome }} jobs=${{ steps.jobs.outcome }}
         run: |
           set +e +o pipefail
           for said in $OUTCOMES; do
             step=${said%%=*} outcome=${said#*=}
             out="$RUNNER_TEMP/$step.txt"
-            if [ ! -s "$out" ] || { [ "$step" = build ] && [ "$outcome" != failure ]; }; then continue; fi
-            plain=$(sed -e 's/\x1b\[[0-9;]*[A-Za-z]//g' -e 's/\r$//' "$out" | grep -v -E '^ *(Compiling|Blocking|Downloaded|Downloading|Updating|Locking|Finished) ')
-            text=$(printf '%s\n' "$plain" | sed -n '/^error/,$p' | head -n 150)
-            if [ "$step" != build ] || [ -z "$text" ]; then text=$(printf '%s\n' "$plain" | tail -n 150); fi
+            if [ ! -s "$out" ]; then continue; fi
+            plain=$(sed -e 's/\x1b\[[0-9;]*[A-Za-z]//g' -e 's/\r$//' "$out" | grep -v -E '^ *(Compiling|Blocking|Downloaded|Downloading|Updating|Locking) ')
+            text=$(printf '%s\n' "$plain" | tail -n 150)
+            if ! printf '%s\n' "$plain" | grep -q -E '^running [0-9]+ tests?$'; then
+              first=$(printf '%s\n' "$plain" | sed -n '/^error/,$p' | head -n 150)
+              if [ -n "$first" ]; then text=$first; fi
+            fi
             level=notice
             if [ "$outcome" != success ]; then level=error; fi
             echo "::$level title=$step $outcome::$(printf '%s\n' "$text" | sed -e 's/%/%25/g' -e 's/\r/%0D/g' | awk 'BEGIN { ORS = "%0A" } { print }')"
