@@ -78,6 +78,7 @@ impl Writer {
             .spawn(move || {
                 let mut conn = conn;
                 while let Ok((job, sent)) = rx.recv() {
+                    crate::pool_health::store_write_queued(-1);
                     let began = Instant::now();
                     job(&mut conn, watch.as_ref());
                     crate::pool_health::store_write(began.saturating_duration_since(sent), began.elapsed());
@@ -90,8 +91,15 @@ impl Writer {
         Ok(Self { tx: Some(tx), thread: Some(thread) })
     }
 
+    /// Sends `job` to the thread: counted as waiting until the thread starts it (what goal 6's detector
+    /// reads of the writer's backlog, `crate::pool_health::queues`).
     fn send(&self, job: WriteCall) -> bool {
-        self.tx.as_ref().is_some_and(|tx| tx.send((job, Instant::now())).is_ok())
+        crate::pool_health::store_write_queued(1);
+        let sent = self.tx.as_ref().is_some_and(|tx| tx.send((job, Instant::now())).is_ok());
+        if !sent {
+            crate::pool_health::store_write_queued(-1);
+        }
+        sent
     }
 
     /// Ends its thread once the calls sent are done (on the thread itself, as the last of a store

@@ -295,6 +295,7 @@ fn pool_delay_ns(i: usize) -> u64 {
 fn pool_name(i: usize) -> String {
     match QUEUES.get(i) {
         Some(_) if i == 0 => "the compute pool".to_owned(),
+        Some(&pool_health::STORE_WRITE) => "kiln.db's writer".to_owned(),
         Some(share) => format!("the blocking pool's {share} share"),
         None => "a pool".to_owned(),
     }

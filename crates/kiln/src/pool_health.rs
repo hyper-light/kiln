@@ -17,6 +17,7 @@
 
 use std::fmt::Write as _;
 use std::sync::OnceLock;
+use std::sync::atomic::{AtomicI64, Ordering};
 
 use hyper_rt::compute::Observed;
 
@@ -48,6 +49,15 @@ fn pools() -> &'static Pools {
         store_write_wait: Histogram::new(STALL_BUCKETS),
         store_write_run: Histogram::new(STALL_BUCKETS),
     })
+}
+
+/// Calls sent to kiln.db's writer not yet started: what the overload detector reads of whether one waits
+/// ([`queues`]), as kiln-rt's occupancy says it of a pool's.
+static STORE_WRITE_WAITING: AtomicI64 = AtomicI64::new(0);
+
+/// A call was sent to kiln.db's writer (`1`), or the writer started one (`-1`).
+pub fn store_write_queued(delta: i64) {
+    STORE_WRITE_WAITING.fetch_add(delta, Ordering::Relaxed);
 }
 
 /// A call kiln.db's writer ran: how long it waited for its turn, from being sent, and how long it ran.
@@ -94,8 +104,10 @@ pub struct Queue {
     pub waiting: bool,
 }
 
-/// The pools [`queues`] reads, by name, in its order: the compute pool, then the blocking pool's shares.
-pub const QUEUES: [&str; 1 + SHARES.len()] = ["compute", SHARES[0], SHARES[1], SHARES[2]];
+/// The pools [`queues`] reads, by name, in its order: the compute pool, the blocking pool's shares, then
+/// kiln.db's writer, whose backlog of writes sheds as a share's does (goal 5 moved them off the `store`
+/// share, which its reads keep).
+pub const QUEUES: [&str; 2 + SHARES.len()] = ["compute", SHARES[0], SHARES[1], SHARES[2], STORE_WRITE];
 
 /// Each pool of [`QUEUES`] as it stands: lock-free reads of atomics the pools' threads write as they go.
 pub fn queues() -> [Queue; QUEUES.len()] {
@@ -105,6 +117,9 @@ pub fn queues() -> [Queue; QUEUES.len()] {
     let mut out = [compute; QUEUES.len()];
     for ((slot, share), wait) in out.iter_mut().skip(1).zip(SHARES).zip(&p.blocking_wait) {
         *slot = Queue { waits: wait.count(), waited_us: wait.sum_us(), waiting: waiting(hyper_rt::blocking::occupancy(share)) };
+    }
+    if let Some(slot) = out.last_mut() {
+        *slot = Queue { waits: p.store_write_wait.count(), waited_us: p.store_write_wait.sum_us(), waiting: STORE_WRITE_WAITING.load(Ordering::Relaxed) > 0 };
     }
     out
 }
