@@ -383,7 +383,7 @@ pub async fn get(hub: &Hub, agent: &str) -> R<Stack> {
 
 async fn stack_of(store: &crate::store::Store, agent: &str) -> R<Stack> {
     let agent = agent.to_owned();
-    Ok(store.call(move |c| load(c, &agent)).await?)
+    Ok(store.read(move |c| load(c, &agent)).await?)
 }
 
 fn load(c: &rusqlite::Connection, agent: &str) -> anyhow::Result<Stack> {

@@ -59,20 +59,20 @@ impl Drop for Inner {
 
 /// What the writer's thread runs: a call, with the connection and, with the cluster group, the
 /// watch on what it writes.
-type Job = Box<dyn FnOnce(&mut Connection, Option<&capture::Watch>) + Send>;
+type WriteCall = Box<dyn FnOnce(&mut Connection, Option<&capture::Watch>) + Send>;
 
 /// The one connection that writes, owned by a thread of its own (`kiln-store`): every call that may
 /// write comes to it as a message, in order, and runs in its turn, as SQLite takes one writer at a
 /// time. Its callers wait for their answer, not on a lock: a thread preempted while it holds the
 /// connection is this one, which no shard ever is.
 struct Writer {
-    tx: Option<std::sync::mpsc::Sender<(Job, Instant)>>,
+    tx: Option<std::sync::mpsc::Sender<(WriteCall, Instant)>>,
     thread: Option<std::thread::JoinHandle<()>>,
 }
 
 impl Writer {
     fn start(conn: Connection, watch: Option<capture::Watch>) -> anyhow::Result<Self> {
-        let (tx, rx) = std::sync::mpsc::channel::<(Job, Instant)>();
+        let (tx, rx) = std::sync::mpsc::channel::<(WriteCall, Instant)>();
         let thread = std::thread::Builder::new()
             .name("kiln-store".to_owned())
             .spawn(move || {
@@ -90,7 +90,7 @@ impl Writer {
         Ok(Self { tx: Some(tx), thread: Some(thread) })
     }
 
-    fn send(&self, job: Job) -> bool {
+    fn send(&self, job: WriteCall) -> bool {
         self.tx.as_ref().is_some_and(|tx| tx.send((job, Instant::now())).is_ok())
     }
 
@@ -692,7 +692,7 @@ impl Store {
             return f(&mut c.lock());
         }
         let (tx, rx) = std::sync::mpsc::sync_channel(1);
-        let job: Job = Box::new(move |conn, _| {
+        let job: WriteCall = Box::new(move |conn, _| {
             let out = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| f(conn))).unwrap_or_else(|_| Err(anyhow::anyhow!("a read of the store panicked")));
             let _ = tx.send(out);
         });
@@ -707,7 +707,7 @@ impl Store {
 
     /// With the cluster group, where it stands: kiln.db's last write and the last entry applied.
     pub fn group_standing(&self) -> Option<(u64, u64)> {
-        self.inner.group.as_ref().map(group::Group::standing)
+        self.inner.group.as_deref().map(group::Group::standing)
     }
 
     /// The database's size on disk, with its write-ahead log (with the cluster group).
@@ -820,7 +820,7 @@ impl Store {
         R: Send + 'static,
     {
         let (tx, rx) = futures::channel::oneshot::channel();
-        let job: Job = Box::new(move |conn, watch| {
+        let job: WriteCall = Box::new(move |conn, watch| {
             // A call that panics answers with an error; the writer goes on with the next.
             let out = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| f(conn, watch))).unwrap_or_else(|_| Err(anyhow::anyhow!("a store call panicked")));
             let _ = tx.send(out);

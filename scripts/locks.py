@@ -468,6 +468,9 @@ def check(root: Path) -> int:
     for (at, name), why in allowed.items():
         if not why.strip():
             fail(f"{HOT}: {at} {name} says no why")
+    # Those on the hot path still, each with what replaces it: listed so the check holds the rest, and
+    # said each time it runs.
+    todo = sorted(f"{a['at']} {a['name']}: {a['todo']}" for a in spec.get("allowed", []) if a.get("todo"))
     seen: set[tuple[str, str]] = set()
     found = []
     for f in hot_files(root, spec):
@@ -493,6 +496,8 @@ def check(root: Path) -> int:
     if found or stale:
         return 1
     print(f"locks: no lock on the hot path but the {len(allowed)} {HOT} lists, each with why")
+    if todo:
+        print(f"\n{len(todo)} of them are on the hot path still, each to be replaced so:\n" + "\n".join(todo))
     return 0
 
 

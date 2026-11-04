@@ -84,7 +84,7 @@ mod tests {
         });
         assert_eq!(len, 3);
         assert_eq!(*held, vec![1, 2]);
-        assert_eq!(*r.load(), vec![1, 2, 3]);
+        assert_eq!(*r.get(), vec![1, 2, 3]);
     }
 
     /// Writers on many threads at once: none is lost, as a lock would have kept them.
@@ -104,7 +104,7 @@ mod tests {
         for t in threads {
             t.join().map_err(|_| anyhow::anyhow!("a writer panicked"))?;
         }
-        assert_eq!(*r.load(), 8000);
+        assert_eq!(*r.get(), 8000);
         Ok(())
     }
 }

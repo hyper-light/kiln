@@ -23,6 +23,7 @@
 pub mod deploys;
 
 use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
 
 use http::StatusCode;
 use kiln_cd::journey::{self, Attempt, Author, Build, Check, Journey, Kinds, Land, Leg, Part, Platform, Production, Replant, Review, ReviewState, Runner, RunnerReplant, Staging};
@@ -1698,11 +1699,12 @@ pub async fn get_in(store: &crate::store::Store, repo: &str, sha: &str, viewer: 
 
 /// A repository's newest commits held in memory: each one's records and its list JSON already
 /// rendered, their order newest first (each one's place in ship_order, item), and how many it has.
-#[derive(Debug, Default)]
+/// Each row is shared with the models before and after it: a refresh copies what it changes.
+#[derive(Debug, Default, Clone)]
 struct HeldRepo {
     ctx: RepoCtx,
     order: Vec<(i64, String)>,
-    rows: HashMap<String, Row>,
+    rows: HashMap<String, Arc<Row>>,
     total: usize,
 }
 
@@ -1749,12 +1751,12 @@ impl Row {
     }
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 struct Held {
     seq: i64,
     built: bool,
     at_ms: i64,
-    repos: HashMap<String, HeldRepo>,
+    repos: HashMap<String, Arc<HeldRepo>>,
     /// KilnCD's deployments as last read ([`cd_mark`]).
     cd: u64,
 }
@@ -1766,10 +1768,12 @@ struct Read {
     gone_repos: Vec<String>,
 }
 
-/// Ship's read model in memory.
+/// Ship's read model in memory: every page reads it without a lock, and a refresh, one at a time,
+/// swaps a new one in whole (goal 5 of the API runtime program, plan 01a1a59c2aae: `crate::rcu`), the
+/// repositories and rows it didn't change shared with the one before.
 #[derive(Debug)]
 pub struct ShipCache {
-    held: std::sync::RwLock<Held>,
+    held: crate::rcu::Rcu<Held>,
     refreshing: std::sync::atomic::AtomicBool,
     cap: usize,
 }
@@ -1784,10 +1788,6 @@ impl Default for ShipCache {
 const FRESH_MS: i64 = 250;
 /// The most commits held per repository; older pages come from the store.
 const CAP: usize = 5000;
-
-fn poisoned() -> Fail {
-    (StatusCode::INTERNAL_SERVER_ERROR, "ship's read model lock was poisoned".to_string())
-}
 
 /// Lets the next refresh start when this one ends, however it ends.
 struct Flight<'a>(&'a std::sync::atomic::AtomicBool);
@@ -1804,21 +1804,22 @@ impl ShipCache {
     }
 
     pub fn with_cap(cap: usize) -> Self {
-        Self { held: std::sync::RwLock::new(Held::default()), refreshing: std::sync::atomic::AtomicBool::new(false), cap: cap.max(1) }
+        Self { held: crate::rcu::Rcu::default(), refreshing: std::sync::atomic::AtomicBool::new(false), cap: cap.max(1) }
     }
 
     /// Whether the model is older than [`FRESH_MS`] (or not built yet).
     pub fn stale(&self, now: i64) -> bool {
-        self.held.read().map(|h| !h.built || now - h.at_ms >= FRESH_MS).unwrap_or(true)
+        let h = self.held.load();
+        !h.built || now - h.at_ms >= FRESH_MS
     }
 
     pub fn built(&self) -> bool {
-        self.held.read().map(|h| h.built).unwrap_or(false)
+        self.held.load().built
     }
 
     /// The last change applied (tests: it never goes back).
     pub fn applied(&self) -> i64 {
-        self.held.read().map(|h| h.seq).unwrap_or(0)
+        self.held.load().seq
     }
 
     /// Brings the model up to date: every commit the first time, then those whose records
@@ -1834,13 +1835,13 @@ impl ShipCache {
         // KilnCD's deployments aren't the store's: when they changed, every commit is read again.
         let cd = cd_mark(deploys);
         let (built, seq) = {
-            let h = self.held.read().map_err(|_| poisoned())?;
+            let h = self.held.load();
             (h.built && h.cd == cd, h.seq)
         };
         let deploys = deploys.to_vec();
         let cap = self.cap;
         let waiting: HashMap<String, Vec<String>> = {
-            let h = self.held.read().map_err(|_| poisoned())?;
+            let h = self.held.load();
             h.repos.values().map(|r| (r.ctx.id.clone(), r.rows.iter().filter(|(_, row)| row.rec.releases.iter().any(|x| x.state == "waiting")).map(|(s, _)| s.clone()).collect())).collect()
         };
         let read = store
@@ -1911,7 +1912,7 @@ impl ShipCache {
         // down, and the commit production runs replants. Those few are drawn again, on the pool too,
         // from their records as held: the rows a repository's reload doesn't draw afresh.
         let again = {
-            let h = self.held.read().map_err(|_| poisoned())?;
+            let h = self.held.load();
             let mut again: Vec<((String, String), Records)> = Vec::new();
             for held in h.repos.values() {
                 let fresh = loaded.iter().find(|(ctx, _, _, _)| ctx.id == held.ctx.id);
@@ -1932,7 +1933,9 @@ impl ShipCache {
             again
         };
         let again = Row::draw(again, runners, now).await?;
-        let mut h = self.held.write().map_err(|_| poisoned())?;
+        // The new model, from the one held: refreshes run one at a time (`refreshing`), so no other
+        // writer swaps one in meanwhile; readers keep the copy they took.
+        let mut h = Held::clone(&self.held.get());
         if read.top < h.seq {
             return Ok(());
         }
@@ -1943,7 +1946,7 @@ impl ShipCache {
             if let Some(r) = old.and_then(|old| h.repos.remove(&old)) {
                 h.repos.insert(ctx.name.clone(), r);
             }
-            let held = h.repos.entry(ctx.name.clone()).or_default();
+            let held = Arc::make_mut(h.repos.entry(ctx.name.clone()).or_default());
             if all {
                 held.rows.clear();
             }
@@ -1951,7 +1954,7 @@ impl ShipCache {
                 held.rows.remove(&sha);
             }
             for (sha, row) in rows {
-                held.rows.insert(sha, row);
+                held.rows.insert(sha, Arc::new(row));
             }
             let newest: Vec<(i64, String)> = ctx.commits.iter().take(cap).map(|(s, f, _)| (*f, s.clone())).collect();
             {
@@ -1964,14 +1967,15 @@ impl ShipCache {
         }
         // The rows drawn again, where their commit is still held.
         for ((id, sha), row) in again {
-            if let Some(slot) = h.repos.values_mut().find(|r| r.ctx.id == id).and_then(|r| r.rows.get_mut(&sha)) {
-                *slot = row;
+            if let Some(slot) = h.repos.values_mut().find(|r| r.ctx.id == id).and_then(|r| Arc::make_mut(r).rows.get_mut(&sha)) {
+                *slot = Arc::new(row);
             }
         }
         h.seq = read.top;
         h.built = true;
         h.at_ms = now;
         h.cd = cd;
+        self.held.set(h);
         Ok(())
     }
 
@@ -1980,12 +1984,12 @@ impl ShipCache {
     /// `viewer` sees it. None when memory can't answer it whole (not built, or the page reaches
     /// past the commits held): the store answers then.
     pub fn page(&self, repo: Option<&str>, only: Option<&[String]>, facets: &Facets, viewer: Option<&HashSet<String>>, cursor: i64, limit: usize) -> Result<Option<String>, Fail> {
-        let h = self.held.read().map_err(|_| poisoned())?;
+        let h = self.held.load();
         if !h.built {
             return Ok(None);
         }
         let mut picked: Vec<(i64, &str)> = Vec::new();
-        let repos: Vec<(&String, &HeldRepo)> = h.repos.iter().filter(|(name, r)| repo.is_none_or(|x| x == name.as_str() || x == r.ctx.id) && only.is_none_or(|o| o.iter().any(|n| n == *name))).collect();
+        let repos: Vec<(&String, &Arc<HeldRepo>)> = h.repos.iter().filter(|(name, r)| repo.is_none_or(|x| x == name.as_str() || x == r.ctx.id) && only.is_none_or(|o| o.iter().any(|n| n == *name))).collect();
         for (_, r) in &repos {
             // Newest first already: skip to the cursor, take what a page needs.
             let from = r.order.partition_point(|(f, _)| *f >= cursor);
@@ -2016,7 +2020,7 @@ impl ShipCache {
     /// repository in view holds none that matches though it has commits memory doesn't hold: the
     /// store says then.
     pub fn heads(&self, only: Option<&[String]>, facets: &Facets, viewer: Option<&HashSet<String>>) -> Result<Option<String>, Fail> {
-        let h = self.held.read().map_err(|_| poisoned())?;
+        let h = self.held.load();
         if !h.built {
             return Ok(None);
         }
@@ -2038,13 +2042,13 @@ impl ShipCache {
     /// and how many commits production is behind; and how many of the connected runners run
     /// production's commit. None until the model is built.
     pub fn pace(&self, repo: Option<&str>, only: Option<&[String]>, runners: &[RunnerSeen]) -> Option<Value> {
-        let h = self.held.read().ok()?;
+        let h = self.held.load();
         if !h.built {
             return None;
         }
-        let mut repos: Vec<(&String, &HeldRepo)> = h.repos.iter().filter(|(name, r)| repo.is_none_or(|x| x == name.as_str() || x == r.ctx.id) && only.is_none_or(|o| o.iter().any(|n| n == *name))).collect();
+        let mut repos: Vec<(&String, &Arc<HeldRepo>)> = h.repos.iter().filter(|(name, r)| repo.is_none_or(|x| x == name.as_str() || x == r.ctx.id) && only.is_none_or(|o| o.iter().any(|n| n == *name))).collect();
         repos.sort_unstable_by(|a, b| a.0.cmp(b.0));
-        let flight: Vec<&Row> = repos.iter().flat_map(|(_, r)| r.rows.values()).filter(|row| matches!(row.stand, journey::Stand::Landing | journey::Stand::Checking | journey::Stand::Building)).collect();
+        let flight: Vec<&Row> = repos.iter().flat_map(|(_, r)| r.rows.values().map(|row| &**row)).filter(|row| matches!(row.stand, journey::Stand::Landing | journey::Stand::Checking | journey::Stand::Building)).collect();
         let agents: HashSet<&str> = flight.iter().filter_map(|row| row.agent.as_deref()).collect();
         let runs = |r: &RunnerSeen, sha: &str| r.commit.as_deref().is_some_and(|c| sha.starts_with(c) || c.starts_with(sha));
         let mut envs = Vec::new();
@@ -2067,7 +2071,7 @@ impl ShipCache {
 
     /// One commit's detail from memory (`sha`: whole, or a prefix of seven or more), if held.
     pub fn detail(&self, repo: &str, sha: &str, runners: &[RunnerSeen], now: i64, viewer: Option<&HashSet<String>>) -> Option<Value> {
-        let h = self.held.read().ok()?;
+        let h = self.held.load();
         if !h.built {
             return None;
         }
@@ -3598,7 +3602,7 @@ mod tests {
             let (built, longest) = Longest { inner: Box::pin(cache.refresh(&store, &runners(), &[], now)), most: std::time::Duration::ZERO }.await;
             built.map_err(|(_, m)| anyhow::anyhow!(m))?;
             // What drawing every row takes, on this thread.
-            let recs: Vec<Records> = cache.held.read().map_err(|_| anyhow::anyhow!("the model's lock was poisoned"))?.repos.values().flat_map(|r| r.rows.values().map(|row| row.rec.clone())).collect();
+            let recs: Vec<Records> = cache.held.load().repos.values().flat_map(|r| r.rows.values().map(|row| row.rec.clone())).collect();
             anyhow::ensure!(recs.len() == 1000, "{} commits held", recs.len());
             let t = std::time::Instant::now();
             for rec in recs {

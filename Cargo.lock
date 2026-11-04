@@ -2233,6 +2233,7 @@ name = "kiln"
 version = "0.2.0"
 dependencies = [
  "anyhow",
+ "arc-swap",
  "argon2",
  "async-broadcast",
  "async-channel",
@@ -2244,6 +2245,7 @@ dependencies = [
  "bytes",
  "clap",
  "command-group",
+ "concurrent-queue",
  "crypto_secretbox",
  "event-listener",
  "filedescriptor",

@@ -586,7 +586,7 @@ fn run_agent(hub: &Arc<Hub>, machine: String, s: Arc<Session>, input: async_chan
     crate::rt::spawn(async move {
         let key = format!("{machine}/{}", s.id);
         let (out_tx, out_rx) = async_channel::bounded::<TermOut>(4096);
-        h.terms.lock().insert(key.clone(), out_tx);
+        h.terms.update(|m| m.insert(key.clone(), out_tx.clone()));
         // A terminal to open is a live command (`crate::wire::commands`): refused at once while its
         // machine is away, and answered once it opened it. Unanswered, it goes on: its output says.
         let failed = match first {
@@ -600,7 +600,7 @@ fn run_agent(hub: &Arc<Hub>, machine: String, s: Arc<Session>, input: async_chan
             None => None,
         };
         if let Some(why) = failed {
-            h.terms.lock().remove(&key);
+            h.terms.update(|m| m.remove(&key));
             s.finish(None, Some(why));
             h.emit_terminals();
             return;
@@ -683,7 +683,7 @@ fn run_agent(hub: &Arc<Hub>, machine: String, s: Arc<Session>, input: async_chan
                 }
             }
         }
-        h.terms.lock().remove(&key);
+        h.terms.update(|m| m.remove(&key));
         crate::metrics::global().terminal_sessions.add(-1);
         h.emit_terminals();
     });

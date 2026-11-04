@@ -1779,12 +1779,12 @@ fn ai_sessions(hub: &Hub, caller: &crate::authz::Caller) -> Response {
     // Conversations kiln already runs as agent sessions (taken over, or resumed by hand there too).
     let managed: HashMap<String, String> = hub.harness.list().into_iter().filter_map(|i| Some((i.harness_session?, i.id))).collect();
     let mut out: Vec<serde_json::Value> = Vec::new();
-    for (machine, sessions) in hub.ai_sessions.lock().iter() {
+    for (machine, sessions) in hub.ai_sessions.load().iter() {
         // Only the machines whose terminal the caller may use (docs/agents.md, "Whose agents").
         if !caller.can("runners.terminal", &crate::harness::lineage::machine_scope(&format!("agent:{machine}"))) {
             continue;
         }
-        for s in sessions {
+        for s in sessions.iter() {
             let mut v = serde_json::to_value(s).unwrap_or_default();
             if let Some(o) = v.as_object_mut() {
                 o.insert("machine".into(), json!(machine));
@@ -1827,7 +1827,7 @@ fn forks_on(hub: &Hub, machine: &str) -> bool {
 /// Connected runners that have never reported AI sessions (an older kiln): what they run can't
 /// be listed. A current runner reports right after it connects, even when it has none.
 fn ai_silent(hub: &Hub, caller: &crate::authz::Caller) -> Response {
-    let reporting: std::collections::HashSet<String> = hub.ai_sessions.lock().keys().cloned().collect();
+    let reporting: std::collections::HashSet<String> = hub.ai_sessions.load().keys().cloned().collect();
     let mut machines: Vec<String> = hub
         .agents
         .lock()
@@ -1863,7 +1863,7 @@ async fn ai_takeover(hub: &Hub, caller: &crate::authz::Caller, machine: &str, pi
         serde_json::from_slice(&body).map_err(|e| err(StatusCode::BAD_REQUEST, format!("{e:#}")))?
     };
     let stop = opts.stop || q.get("stop").is_some_and(|v| v == "1" || v == "true");
-    let found = hub.ai_sessions.lock().get(machine).and_then(|l| l.iter().find(|s| s.pid == pid).cloned());
+    let found = hub.ai_sessions.load().get(machine).and_then(|l| l.iter().find(|s| s.pid == pid).cloned());
     let Some(found) = found else {
         return Err(err(StatusCode::NOT_FOUND, "no such session on that machine (it may have ended: resume it with spec.resume)"));
     };
@@ -1918,7 +1918,7 @@ fn may_run_on(caller: &crate::authz::Caller, target: &str, what: &str) -> Result
 /// of its conversation, in the same folder), leaving the original running as it is.
 async fn ai_fork(hub: &Hub, caller: &crate::authz::Caller, machine: &str, pid: &str) -> R {
     let pid: u32 = pid.parse().map_err(|_| err(StatusCode::BAD_REQUEST, "bad pid"))?;
-    let found = hub.ai_sessions.lock().get(machine).and_then(|l| l.iter().find(|s| s.pid == pid).cloned());
+    let found = hub.ai_sessions.load().get(machine).and_then(|l| l.iter().find(|s| s.pid == pid).cloned());
     let Some(found) = found else {
         return Err(err(StatusCode::NOT_FOUND, "no such session on that machine (it may have ended: resume it with spec.resume)"));
     };
@@ -2808,7 +2808,7 @@ async fn overview(hub: &Hub, caller: &crate::authz::Caller) -> R {
     let stats = hub.store.stats(None).await?;
     let agents = hub.agent_list().await;
     let m = crate::metrics::global();
-    let sample = hub.history.lock().get("server").and_then(|q| q.back().cloned());
+    let sample = hub.history.load().get("server").and_then(|q| q.back().cloned());
     Ok(srv::json(
         StatusCode::OK,
         &json!({
@@ -2827,7 +2827,7 @@ async fn overview(hub: &Hub, caller: &crate::authz::Caller) -> R {
 }
 
 fn system_json(hub: &Hub) -> serde_json::Value {
-    let sample = hub.history.lock().get("server").and_then(|q| q.back().cloned());
+    let sample = hub.history.load().get("server").and_then(|q| q.back().cloned());
     json!({
         "version": env!("CARGO_PKG_VERSION"),
         "uptime_s": hub.started.elapsed().as_secs(),
@@ -2863,11 +2863,11 @@ async fn audit(hub: &Hub, q: &HashMap<String, String>) -> R {
 }
 
 fn history(hub: &Hub, q: &HashMap<String, String>) -> Response {
-    let h = hub.history.lock();
+    let h = hub.history.load();
     let mut out = serde_json::Map::new();
     for (k, v) in h.iter() {
         if q.get("agent").is_none_or(|a| a == k) {
-            out.insert(k.clone(), json!(v));
+            out.insert(k.clone(), json!(&**v));
         }
     }
     srv::json(StatusCode::OK, &serde_json::Value::Object(out))

@@ -401,8 +401,9 @@ impl AgentLive {
 }
 
 /// The names people see of the runners kiln knows by their machine ids, by name (docs/machines.md):
-/// [`Hub`]'s, shared with what names machines away from it (repo sync's activity).
-pub type Labels = Arc<Mutex<HashMap<String, String>>>;
+/// [`Hub`]'s, shared with what names machines away from it (repo sync's activity). Read wherever kiln
+/// names a runner to a person, written as one is renamed: a copy swapped in whole (`crate::rcu`).
+pub type Labels = Arc<crate::rcu::Rcu<HashMap<String, String>>>;
 
 /// Output from a remote (agent) terminal session, routed to its websocket.
 #[derive(Debug)]
@@ -439,7 +440,9 @@ pub struct Hub {
     /// Runners' HTTP tunnels, and which QUIC connections they carry (see `crate::tunnel`).
     pub tunnels: Arc<crate::tunnel::Registry>,
     pub events: Broadcast<Arc<str>>,
-    pub terms: Mutex<HashMap<String, async_channel::Sender<TermOut>>>,
+    /// Each remote terminal's output, by `machine/session`: read on every frame a terminal sends,
+    /// written as one opens and closes (`crate::rcu`).
+    pub terms: crate::rcu::Rcu<HashMap<String, async_channel::Sender<TermOut>>>,
     /// Every terminal session, local and on machines.
     pub terminals: crate::termsess::Sessions,
     /// Every kiln-native agent session, local and on machines.
@@ -455,7 +458,7 @@ pub struct Hub {
     /// loop sends them now rather than on its next tick.
     commands_due: Notify,
     /// The AI coding sessions each connected machine last reported.
-    pub ai_sessions: Mutex<HashMap<String, Vec<crate::aisessions::AiSession>>>,
+    pub ai_sessions: crate::rcu::Rcu<HashMap<String, Arc<Vec<crate::aisessions::AiSession>>>>,
     /// Questions asked of runners (transcripts, views, folders, a doctor's look) waiting for their
     /// answers, by request number: each read as its asker wants it.
     ai_requests: Mutex<HashMap<u64, Asked>>,
@@ -463,7 +466,9 @@ pub struct Hub {
     /// File reads (`crate::harness::files`) waiting for their machine's answer: what it says of the
     /// file, and the bytes.
     file_requests: Mutex<HashMap<u64, futures::channel::oneshot::Sender<Result<(crate::harness::files::Answer, Vec<u8>), String>>>>,
-    pub history: Mutex<HashMap<String, VecDeque<HostSample>>>,
+    /// Each machine's recent samples (the server's too): read by the overview, written a sample at a
+    /// time, each machine's own copy swapped in with it (`crate::rcu`).
+    pub history: crate::rcu::Rcu<HashMap<String, Arc<VecDeque<HostSample>>>>,
     pub wake: Notify,
     pub launching: Mutex<HashMap<String, Launch>>,
     pub started: Instant,
@@ -628,7 +633,7 @@ impl Hub {
             pending_peers: Default::default(),
             tunnels: Arc::default(),
             events: Broadcast::new(4096),
-            terms: Mutex::new(HashMap::new()),
+            terms: Default::default(),
             terminals: crate::termsess::Sessions::new(),
             harness,
             wire: crate::wire::link::Links::new(),
@@ -637,11 +642,11 @@ impl Hub {
             cmds: Mutex::new(crate::wire::commands::Commands::new(rand::random::<u64>() >> 11)),
             away_peers: Default::default(),
             commands_due: Notify::new(),
-            ai_sessions: Mutex::new(HashMap::new()),
+            ai_sessions: Default::default(),
             ai_requests: Mutex::new(HashMap::new()),
             ai_seq: AtomicU64::new(1),
             file_requests: Mutex::new(HashMap::new()),
-            history: Mutex::new(HashMap::new()),
+            history: Default::default(),
             wake: Notify::new(),
             launching: Mutex::new(HashMap::new()),
             started: Instant::now(),
@@ -909,7 +914,7 @@ impl Hub {
     /// with `hostname`, until its runner connects), and its pages told.
     pub async fn set_label(&self, name: &str, label: &str, hostname: &str) -> anyhow::Result<()> {
         self.store.set_agent_label(name.to_owned(), label.to_owned(), hostname.to_owned()).await?;
-        self.labels.lock().insert(name.to_owned(), label.to_owned());
+        self.labels.update(|m| m.insert(name.to_owned(), label.to_owned()));
         let live = self.agents.lock().get_mut(name).map(|a| {
             a.label = Some(label.to_owned());
             a.clone()
@@ -937,13 +942,13 @@ impl Hub {
     /// links), `name` itself.
     pub fn shown(&self, name: &str) -> String {
         let live = self.agents.lock().get(name).and_then(|a| a.label.clone());
-        live.or_else(|| self.labels.lock().get(name).cloned()).unwrap_or_else(|| name.to_owned())
+        live.or_else(|| self.labels.load().get(name).cloned()).unwrap_or_else(|| name.to_owned())
     }
 
     /// The runners' labels as the store keeps them, for [`Hub::shown`]: as this server starts.
     pub async fn load_labels(&self) {
         match self.store.agent_labels().await {
-            Ok(labels) => *self.labels.lock() = labels,
+            Ok(labels) => self.labels.set(labels),
             Err(e) => tracing::warn!(error = %format!("{e:#}"), "the runners' labels couldn't be read: sentences name them by their ids"),
         }
     }
@@ -1078,14 +1083,13 @@ impl Hub {
     }
 
     pub fn record_sample(&self, agent: &str, s: HostSample) {
-        {
-            let mut h = self.history.lock();
-            let q = h.entry(agent.to_owned()).or_default();
+        self.history.update(|h| {
+            let q = Arc::make_mut(h.entry(agent.to_owned()).or_default());
             if q.len() >= HISTORY {
                 q.pop_front();
             }
             q.push_back(s.clone());
-        }
+        });
         if agent != "server" {
             metrics::agent_samples().update(|m| m.insert(agent.to_owned(), s.clone()));
             // A runner too old to report its own figures (`crate::observe::host`): its samples, as
@@ -1658,11 +1662,10 @@ impl Hub {
         anyhow::ensure!(!connected, "{from} has a runner process connected: it moves to its machine id once none is");
         let prefixes = vec![crate::frontdoor::control::KEY_PREFIX, crate::harness::limit::KEY_PREFIX, crate::updates::POLICY_PREFIX];
         self.store.move_runner(from.to_owned(), to.to_owned(), label.to_owned(), hostname.to_owned(), prefixes).await?;
-        {
-            let mut labels = self.labels.lock();
+        self.labels.update(|labels| {
             labels.remove(from);
             labels.insert(to.to_owned(), label.to_owned());
-        }
+        });
         self.agents.lock().remove(from);
         self.away_peers.update(|m| m.remove(from));
         self.reach.lock().forget(from);
@@ -1973,17 +1976,17 @@ impl Hub {
         let sessions: Vec<String> = if self.wire.keeps(name) {
             Vec::new()
         } else {
-            self.terms.lock().keys().filter(|k| k.starts_with(&format!("{name}/"))).cloned().collect()
+            self.terms.load().keys().filter(|k| k.starts_with(&format!("{name}/"))).cloned().collect()
         };
         for s in sessions {
-            if let Some(tx) = self.terms.lock().remove(&s) {
+            if let Some(tx) = self.terms.update(|m| m.remove(&s)) {
                 crate::termsess::forward(&tx, None, TermOut::Gone);
             }
         }
         metrics::agent_samples().update(|m| m.remove(name));
         // Its agent sessions keep running there too; they are announced again on reconnect.
         self.harness.machine_lost(self, name);
-        if self.ai_sessions.lock().remove(name).is_some() {
+        if self.ai_sessions.update(|m| m.remove(name)).is_some() {
             self.emit(&ServerEvent::AiSessions { machine: name.to_owned() });
         }
         self.update_slot_gauges();
@@ -2204,7 +2207,7 @@ impl Hub {
             // (goal 3, plan 01a1a59c2a8e step 5; `crate::termsess::forward`).
             AgentMsg::TermOutput { session, data } => {
                 let key = format!("{agent}/{session}");
-                let tx = self.terms.lock().get(&key).cloned();
+                let tx = self.terms.load().get(&key).cloned();
                 if let Some(tx) = tx {
                     crate::termsess::forward(&tx, self.terminals.get(&session).as_deref(), TermOut::Data(data));
                 }
@@ -2353,14 +2356,14 @@ impl Hub {
             AgentMsg::UpgradeDone { job, ok, error } => self.updates.on_done(self, &job, ok, error),
             AgentMsg::TermReplay { session, data } => {
                 let key = format!("{agent}/{session}");
-                let tx = self.terms.lock().get(&key).cloned();
+                let tx = self.terms.load().get(&key).cloned();
                 if let Some(tx) = tx {
                     crate::termsess::forward(&tx, self.terminals.get(&session).as_deref(), TermOut::Replay(data));
                 }
             }
             AgentMsg::TermExit { session, code, error } => {
                 let key = format!("{agent}/{session}");
-                let tx = self.terms.lock().remove(&key);
+                let tx = self.terms.update(|m| m.remove(&key));
                 if let Some(tx) = tx {
                     crate::termsess::forward(&tx, None, TermOut::Exit { code, error });
                 }
@@ -2378,8 +2381,9 @@ impl Hub {
             // One report per machine: its newest runner process's.
             FromRunner::AiSessions(_) if self.instances.lock().newest(agent).is_some_and(|n| n != peer) => {}
             FromRunner::AiSessions(sessions) => {
-                let old = self.ai_sessions.lock().insert(agent.to_owned(), sessions.clone());
-                if old.as_ref() != Some(&sessions) {
+                let sessions = Arc::new(sessions);
+                let old = self.ai_sessions.update(|m| m.insert(agent.to_owned(), Arc::clone(&sessions)));
+                if old.as_deref() != Some(&*sessions) {
                     self.emit(&ServerEvent::AiSessions { machine: agent.to_owned() });
                 }
             }
@@ -2942,7 +2946,7 @@ impl Hub {
         for o in owned {
             match o {
                 Owned::Terminal(s) => {
-                    if let Some(tx) = self.terms.lock().remove(&format!("{name}/{s}")) {
+                    if let Some(tx) = self.terms.update(|m| m.remove(&format!("{name}/{s}"))) {
                         crate::termsess::forward(&tx, None, TermOut::Gone);
                     }
                 }
@@ -4285,7 +4289,7 @@ pub(crate) mod tests {
             // Its relay's queue full, nobody taking from it.
             let (tx, rx) = async_channel::bounded::<TermOut>(1);
             tx.try_send(TermOut::Data(b"first".to_vec())).map_err(|_| anyhow::anyhow!("the relay's queue had no room for its first"))?;
-            hub.terms.lock().insert("box/t1".into(), tx);
+            hub.terms.update(|m| m.insert("box/t1".into(), tx.clone()));
             let heard = crate::rt::timeout(Duration::from_secs(5), hub.on_runner_msg(1, AgentMsg::TermOutput { session: "t1".into(), data: b"second".to_vec() })).await;
             anyhow::ensure!(heard.is_ok(), "the runners' messages waited on a terminal's relay with no room");
             anyhow::ensure!(session.gaps() == 1, "output with no room is a gap to repair: {}", session.gaps());
