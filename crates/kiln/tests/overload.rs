@@ -304,11 +304,12 @@ fn backlog(wait: Arc<AtomicU64>) -> std::thread::JoinHandle<anyhow::Result<()>> 
     })
 }
 
-/// Step 4, the pools: work waiting in a pool sheds requests even while every shard is calm. With a backlog in the
-/// blocking pool's `store` share that keeps each of its jobs waiting about 200 ms for a place (past the calm it
-/// learned, short of the tolerance), Background requests are shed and Normal and Critical ones served; at about 1.5 s a job, past the
-/// tolerance, Normal ones are shed too, every shard sheds the API (/readyz: not ready, naming the share), and
-/// Critical ones are served and promptly; once it drains, everything is served again. The shards' own detectors
+/// Step 4, the pools: work standing in a pool's line sheds requests even while every shard is calm. With a backlog
+/// in the blocking pool's `store` share, its line kept full by new jobs so each waits about 200 ms for a place (past
+/// the calm it learned), Background requests are shed once the line has stood a tolerance past its jobs' waits, and
+/// Normal and Critical ones served; once it has stood another tolerance with Background shed (its jobs now waiting
+/// about 1.5 s), Normal ones are shed too, every shard sheds the API (/readyz: not ready, naming the share), and
+/// Critical ones are served and promptly; once it drains, everything is served again. The shards' own watches
 /// never shed: what sheds is the pool's.
 #[test]
 fn g6_s4_work_waiting_in_a_pool_sheds_background_then_normal_and_never_critical() -> anyhow::Result<()> {
@@ -334,7 +335,7 @@ fn g6_s4_work_waiting_in_a_pool_sheds_background_then_normal_and_never_critical(
     wait.store(1_500, Ordering::Release);
     shed_background?;
     anyhow::ensure!(status == 503 && header(&headers, "x-kiln-shed") == Some("background"), "{status} {headers:?}");
-    anyhow::ensure!(normal_served == 200, "Normal served while the store's waits are short of the tolerance: {normal_served}: {}", shedding());
+    anyhow::ensure!(normal_served == 200, "Normal served in the tolerance Background is shed alone: {normal_served}: {}", shedding());
     anyhow::ensure!(critical_served == 200, "Critical served: {critical_served}");
     anyhow::ensure!(metrics.contains("kiln_pool_shedding{pool=\"store\",class=\"background\"} 1"), "the store's shedding on /metrics");
     anyhow::ensure!(!metrics.contains("kiln_shard_shedding{shard=\"0\",class=\"background\"} 1"), "the shards' own detectors shed nothing: {}", shedding());

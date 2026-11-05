@@ -214,8 +214,13 @@ impl Topology {
 /// steps running now.
 pub struct Pins {
     topo: Option<Topology>,
-    /// The CPUs the runner may run on itself (its affinity, within its cgroup's cpuset).
+    /// The CPUs the runner may run on itself (its affinity, within its cgroup's cpuset), less a
+    /// server's cores beside it ([`crate::os::work_cpus`]).
     all: Vec<usize>,
+    /// Whether `all` keeps off a server's cores (docs/priority.md, "Legs and agents keep off the
+    /// server's cores"): then every step runs on `all` or its share of it, never anywhere it
+    /// pleases, as with nothing held.
+    apart: bool,
     state: Mutex<State>,
 }
 
@@ -255,7 +260,14 @@ impl Pins {
             (None, Some(t)) => t.cpus(),
             (None, None) => Vec::new(),
         };
-        Pins { topo, all, state: Mutex::new(State::default()) }
+        Pins { topo, all, apart: false, state: Mutex::new(State::default()) }
+    }
+
+    /// [`Pins::new`] over `work`, the CPUs a runner beside a server with cores of its own keeps its
+    /// legs to (goal 8, plan 01a1a59c2b29 step 7): shares and leases are made of them alone, and every
+    /// step runs on them, or on its share of them.
+    pub fn apart(topo: Option<Topology>, work: Vec<usize>) -> Self {
+        Pins { apart: true, ..Pins::new(topo, Some(work)) }
     }
 
     /// A share for `job`: whole cores for `threads` CPUs that no other share holds, and none a lease
@@ -322,7 +334,8 @@ impl Pins {
     }
 
     /// The CPUs `job`'s processes may run on: its own share; else what of its lease no share holds;
-    /// else what no share holds. `None`: any (nothing held, nothing lent).
+    /// else what no share holds. `None`: any (nothing held, nothing lent, and no server's cores to
+    /// keep off).
     pub fn allowed(&self, job: &str) -> Option<Vec<usize>> {
         self.allowed_in(&self.state.lock(), job)
     }
@@ -338,7 +351,7 @@ impl Pins {
             let mine: Vec<usize> = lent.into_iter().filter(|c| !shared.contains(c)).collect();
             return Some(if mine.is_empty() { rest() } else { mine });
         }
-        (!shared.is_empty()).then(rest)
+        (!shared.is_empty() || self.apart).then(rest)
     }
 
     /// A step of `job` started in process group `pgid`: on the CPUs its leg may use, and counted
@@ -362,10 +375,14 @@ impl Pins {
     }
 }
 
-/// This runner's: its machine's topology and its own CPUs, read once.
+/// This runner's: its machine's topology and its own CPUs, read once; beside a server with cores of
+/// its own, its work CPUs alone (`crate::os::work_cpus`: set as the process starts, before any leg).
 pub fn pins() -> &'static Pins {
     static PINS: OnceLock<Pins> = OnceLock::new();
-    PINS.get_or_init(|| Pins::new(Topology::read(), usable()))
+    PINS.get_or_init(|| match crate::os::work_cpus() {
+        Some(work) => Pins::apart(Topology::read(), work),
+        None => Pins::new(Topology::read(), usable()),
+    })
 }
 
 /// A leg's CPUs, lent from this runner's (resource mode), given back when it ends.
@@ -665,6 +682,27 @@ mod tests {
             let _ = c.kill();
             let _ = c.wait();
         }
+        Ok(())
+    }
+
+    /// Goal 8 (plan 01a1a59c2b29 step 7): beside a server with cores of its own (adacachy's cores 0-3,
+    /// with their siblings 16-19), a runner makes its legs' shares and leases of its work CPUs alone,
+    /// and runs every step on them, a step of a leg holding nothing too, where without a server's
+    /// cores to keep off such a step runs anywhere.
+    #[test]
+    fn g8_s7_legs_keep_off_the_servers_cores() -> anyhow::Result<()> {
+        let work: Vec<usize> = (4..16).chain(20..32).collect();
+        let p = Pins::apart(Some(adacachy()), work.clone());
+        assert_eq!(p.allowed("ordinary"), Some(work.clone()), "nothing held: the work CPUs, not anywhere");
+        let share = p.hold("bench", 8).ok_or_else(|| anyhow!("no share"))?;
+        assert!(share.len() == 8 && share.iter().all(|c| work.contains(c)), "a share of the work CPUs: {}", list(&share));
+        let (id, lent) = p.lease("leg", 4).ok_or_else(|| anyhow!("no lease"))?;
+        assert!(lent.iter().all(|c| work.contains(c) && !share.contains(c)), "a lease of the work CPUs no share holds: {}", list(&lent));
+        assert!(p.allowed("ordinary").is_some_and(|c| c.iter().all(|c| work.contains(c) && !share.contains(c))));
+        p.give(id);
+        p.release("bench");
+        assert_eq!(p.allowed("ordinary"), Some(work.clone()));
+        assert_eq!(Pins::new(Some(adacachy()), Some(work)).allowed("ordinary"), None, "no server's cores to keep off: anywhere");
         Ok(())
     }
 }

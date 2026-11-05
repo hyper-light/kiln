@@ -893,7 +893,7 @@ async fn wait_news(hub: &Arc<Hub>, id: &str, machine: &str, ids: &[String]) -> R
         } else if start.elapsed() > QUIET {
             return Err(format!("{} never started: is its runner up to date?", hub.shown(machine)));
         }
-        let online = hub.agents.lock().get(machine).is_some_and(|a| a.connected);
+        let online = hub.agents.load().get(machine).is_some_and(|a| a.connected);
         if online {
             away = None;
         } else if away.get_or_insert_with(Instant::now).elapsed() > AWAY {

@@ -95,11 +95,28 @@ const COPY_TRIES: u32 = 3;
 
 /// A raft message's frames: one, or the parts of a bigger one, numbered `id`.
 pub fn frames(id: u64, bytes: Vec<u8>) -> Vec<(Msg, Vec<u8>)> {
-    if bytes.len() <= PART {
-        return vec![(Msg::Raft { id: 0, part: 0, parts: 0 }, bytes)];
-    }
-    let parts = u32::try_from(bytes.chunks(PART).count()).unwrap_or(u32::MAX);
-    bytes.chunks(PART).zip(0..).map(|(chunk, part)| (Msg::Raft { id, part, parts }, chunk.to_vec())).collect()
+    parts(id, bytes).collect()
+}
+
+/// [`frames`], each made as it's asked for: a long message's parts copied one at a time, so whoever sends
+/// them can give its shard up between them (goal 9, plan 01a1a87b2cec step 3: the hub's cluster loop copied
+/// every part of a learner's catch-up, then sent them, in one poll, up to 5.7 ms in the lab's g6c2). One that
+/// fits a frame goes whole, uncopied.
+pub fn parts(id: u64, bytes: Vec<u8>) -> impl Iterator<Item = (Msg, Vec<u8>)> + Send {
+    let whole = bytes.len() <= PART;
+    let parts = u32::try_from(bytes.len().div_ceil(PART)).unwrap_or(u32::MAX);
+    let (mut left, mut part) = (Some(bytes), 0u32);
+    std::iter::from_fn(move || {
+        if whole {
+            return left.take().map(|b| (Msg::Raft { id: 0, part: 0, parts: 0 }, b));
+        }
+        let start = usize::try_from(part).ok()?.checked_mul(PART)?;
+        let rest = left.as_ref()?.get(start..).filter(|r| !r.is_empty())?;
+        let chunk = rest.get(..PART.min(rest.len()))?.to_vec();
+        let this = part;
+        part = part.saturating_add(1);
+        Some((Msg::Raft { id, part: this, parts }, chunk))
+    })
 }
 
 /// The token a runner fetches copies of kiln.db with: signed by the server's key, for it.
@@ -107,17 +124,19 @@ pub fn token(key: &str, machine: &str) -> String {
     crate::util::hmac_hex(key.as_bytes(), format!("cluster:{machine}").as_bytes())
 }
 
-/// This process's learner, when it holds one (the front door answers reads from it).
-static GLOBAL: parking_lot::RwLock<Option<Arc<Learner>>> = parking_lot::RwLock::new(None);
+/// This process's learner, when it holds one (the front door answers reads from it): read on every
+/// front-door connection without a lock, swapped as the learner starts and stops (goal 5, plan
+/// 01a1a59c2aae step 2; P2, plan 01a1a283e14c).
+static GLOBAL: arc_swap::ArcSwapOption<Learner> = arc_swap::ArcSwapOption::const_empty();
 
 /// Says this process holds `learner` (or none now).
 pub fn set_global(learner: Option<Arc<Learner>>) {
-    *GLOBAL.write() = learner;
+    GLOBAL.store(learner);
 }
 
 /// This process's learner, if it holds one.
 pub fn global() -> Option<Arc<Learner>> {
-    GLOBAL.read().clone()
+    GLOBAL.load_full()
 }
 
 /// Where a runner keeps its replica and its log.
@@ -137,8 +156,9 @@ pub struct Learner {
     me: String,
     /// What it says to the server.
     say: async_channel::Sender<AgentMsg>,
-    /// Questions to the server of where kiln.db stands, waiting for their answers.
-    asks: parking_lot::Mutex<std::collections::HashMap<u64, async_channel::Sender<u64>>>,
+    /// Questions to the server of where kiln.db stands, waiting for their answers: each answer, or its
+    /// asker giving up, takes it once, with no lock (`crate::rcu::Pending`; goal 5, plan 01a1a59c2aae).
+    asks: crate::rcu::Pending<u64, async_channel::Sender<u64>>,
     next_ask: std::sync::atomic::AtomicU64,
     /// The server's checkpoints of the log, to check in the order they came.
     checkpoints: async_channel::Sender<Checkpoint>,
@@ -193,7 +213,7 @@ impl Learner {
             store,
             me: me.to_owned(),
             say,
-            asks: parking_lot::Mutex::new(std::collections::HashMap::new()),
+            asks: crate::rcu::Pending::default(),
             next_ask: std::sync::atomic::AtomicU64::new(1),
             checkpoints,
             diverged,
@@ -220,7 +240,7 @@ impl Learner {
         }
         let id = self.next_ask.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let (tx, rx) = async_channel::bounded(1);
-        self.asks.lock().insert(id, tx);
+        self.asks.put(id, tx);
         let checks = checks(&self.group);
         let asked = async {
             self.say.send(AgentMsg::Cluster { json: encode(&Msg::Ask { id, checks }), raft: Vec::new() }).await.ok()?;
@@ -231,7 +251,7 @@ impl Learner {
             Some(())
         };
         let done = matches!(crate::rt::timeout(within, asked).await, Ok(Some(())));
-        self.asks.lock().remove(&id);
+        drop(self.asks.take(&id));
         done
     }
 
@@ -239,8 +259,7 @@ impl Learner {
     /// stands; or a checkpoint of the log, to check.
     pub fn heard(&self, msg: &Msg, raft: Vec<u8>) {
         if let Msg::At { id, seq } = *msg {
-            let waiting = self.asks.lock().remove(&id);
-            if let Some(tx) = waiting {
+            if let Some(tx) = self.asks.take(&id) {
                 tx.try_send(seq).ok();
             }
             return;
@@ -444,8 +463,9 @@ impl Periods {
 #[derive(Default)]
 pub struct Learners {
     /// Each learner's machine, by its member: those that said they hold one since the server
-    /// started (the group's other learners are away).
-    machines: parking_lot::Mutex<std::collections::HashMap<u64, String>>,
+    /// started (the group's other learners are away). Read for every message the group sends a
+    /// learner without a lock, a copy swapped in as learners come and go (goal 5, plan 01a1a59c2aae).
+    machines: crate::rcu::Rcu<std::collections::HashMap<u64, String>>,
     joiner: parking_lot::Mutex<Joiner>,
     next: std::sync::atomic::AtomicU64,
     /// The checkpoints of the log owed to the learners that check them (docs/ci.md W27-R08).
@@ -462,11 +482,11 @@ impl Learners {
     pub fn announced(&self, group: &Group, machine: &str) -> u64 {
         let member = super::group::member_of(machine);
         let mut wanted: std::collections::BTreeSet<u64> = group.point().1.learners.iter().copied().collect();
-        {
-            let mut m = self.machines.lock();
+        let known: Vec<u64> = self.machines.update(|m| {
             m.insert(member, machine.to_owned());
-            wanted.extend(m.keys().copied());
-        }
+            m.keys().copied().collect()
+        });
+        wanted.extend(known);
         group.learners(wanted);
         member
     }
@@ -475,17 +495,17 @@ impl Learners {
     /// the group, and the machine comes back as a new one when it announces itself as it is now.
     pub fn moved(&self, group: &Group, from: &str) {
         let gone = super::group::member_of(from);
-        let wanted: std::collections::BTreeSet<u64> = {
-            let mut m = self.machines.lock();
+        let known: Vec<u64> = self.machines.update(|m| {
             m.remove(&gone);
-            group.point().1.learners.iter().copied().filter(|l| *l != gone).chain(m.keys().copied()).collect()
-        };
+            m.keys().copied().collect()
+        });
+        let wanted: std::collections::BTreeSet<u64> = group.point().1.learners.iter().copied().filter(|l| *l != gone).chain(known).collect();
         group.learners(wanted);
     }
 
     /// The machine of learner `member`, if it said so since the server started.
     pub fn machine(&self, member: u64) -> Option<String> {
-        self.machines.lock().get(&member).cloned()
+        self.machines.load().get(&member).cloned()
     }
 
     /// A raft message from `machine`'s learner, or a part of one: to the group once whole.
@@ -497,14 +517,14 @@ impl Learners {
         }
     }
 
-    /// A message to learner `member`, in its frames.
-    pub fn frames(&self, member: u64, bytes: Vec<u8>) -> Vec<(Msg, Vec<u8>)> {
+    /// A message to learner `member`, in its frames, each made as it's asked for ([`parts`]).
+    pub fn frames(&self, member: u64, bytes: Vec<u8>) -> impl Iterator<Item = (Msg, Vec<u8>)> + Send + use<> {
         let after = if crate::runner::chaos::get().is_some_and(|c| c.entry_changed) { self.changes_after.lock().get(&member).copied() } else { None };
         let bytes = match after {
             Some(after) => changed_in_transit(bytes, after),
             None => bytes,
         };
-        frames(self.next.fetch_add(1, std::sync::atomic::Ordering::Relaxed), bytes)
+        parts(self.next.fetch_add(1, std::sync::atomic::Ordering::Relaxed), bytes)
     }
 
     /// `machine`'s learner, held by runner process `peer`, checks the log's checkpoints, holding the
@@ -680,6 +700,23 @@ mod tests {
         }
         assert_eq!(got, Some(bytes));
         assert_eq!(decode(&encode(&Msg::Join { member: 7, token: "t".into() })), Some(Msg::Join { member: 7, token: "t".into() }));
+    }
+
+    /// Goal 9, plan 01a1a87b2cec step 3: a message's parts made one at a time are its frames: a small one whole and
+    /// uncopied; a long one in parts of `PART`, the last what's left, numbered in order, together the message.
+    #[test]
+    fn g9_s3_parts_made_one_at_a_time_are_the_frames() {
+        let small = vec![1u8, 2, 3];
+        let at = small.as_ptr();
+        let mut one = parts(5, small);
+        let first = one.next();
+        assert!(matches!(&first, Some((Msg::Raft { id: 0, part: 0, parts: 0 }, b)) if b.as_ptr() == at), "whole, uncopied: {first:?}");
+        assert!(one.next().is_none());
+        let bytes: Vec<u8> = (0..(PART * 2 + 17)).map(|i| (i % 251) as u8).collect();
+        let made: Vec<(Msg, Vec<u8>)> = parts(9, bytes.clone()).collect();
+        assert_eq!(made.iter().map(|(_, b)| b.len()).collect::<Vec<_>>(), vec![PART, PART, 17]);
+        assert!(made.iter().zip(0u32..).all(|((m, _), n)| matches!(m, Msg::Raft { id: 9, part, parts: 3 } if *part == n)));
+        assert_eq!(made.into_iter().flat_map(|(_, b)| b).collect::<Vec<u8>>(), bytes);
     }
 
     /// W27-R08: a learner from before asks with no `checks`, and is read as one that checks

@@ -37,6 +37,26 @@
 //!
 //! Each only ever lowers: a thread already below the target (a process started under `nice`, at background
 //! QoS, at a lower level) keeps what it has, as `nice` adds its increment to what a process runs at.
+//!
+//! One call raises, for a shard alone, where the system grants it ([`realtime_current_thread`]; kiln's goal 8,
+//! plan 01a1a59c2b29 step 7, and goal 9, plan 01a1a87b2cec step 4): Linux's round-robin real-time class at
+//! the lowest real-time priority, with the reset-on-fork flag, so nothing the shard starts inherits it. A
+//! real-time thread waking where a normal one runs preempts it at once under every preemption mode, the lazy
+//! one too, where a normal thread waking beside one busy in user space waits for the next tick (research
+//! 01a1a87b2cee f17; kiln's docs/priority.md, "The kernel's preemption"). macOS and Windows refuse it: what
+//! each has instead is in their `realtime`.
+//!
+//! One more bounds a shard's wait for its CPU where the real-time class is refused ([`nudge_current_thread`];
+//! kiln's goal 8, plan 01a1a59c2b29 step 7): Linux's lazy preemption marks a thread busy in user space for a
+//! reschedule when a shard wakes on its CPU and sends no interrupt, so the CPU switches at its next interrupt,
+//! the tick at the latest, 1 ms at 1000 Hz. Every fair-class wakeup preemption ends in `resched_curr_lazy`
+//! (Linux 6.19's `check_preempt_wakeup_fair`, a custom slice and an idle-policy neighbour included), and the
+//! lazy mark sends an interrupt only to the idle task (`__resched_curr`), so nothing a normal thread may set
+//! makes its wake preempt at once; but any interrupt's return to user space takes the mark
+//! (`exit_to_user_mode_loop` tests `_TIF_NEED_RESCHED_LAZY`). A nudged thread's waits in its driver end at least
+//! every period, so its CPU takes a timer interrupt of the thread's own at least that often while it waits: a
+//! wait's timer is armed on the CPU the thread parks on while that CPU is busy with it (`get_nohz_timer_target`).
+//! The thread's own, as its policy is: a thread-local the driver's wait reads on that thread (the epoll driver).
 #![allow(unsafe_code)]
 
 use crate::compute::{Priority, Rank, Refusal};
@@ -69,10 +89,62 @@ pub(crate) fn prefer_current_thread(slice_ns: u64) -> Result<(), Refusal> {
     platform::prefer(slice_ns)
 }
 
+/// Puts the calling thread (a shard) in Linux's round-robin real-time class at `priority`, what it starts
+/// not (reset on fork): Linux only ([`crate::compute::realtime_current_thread`]).
+pub(crate) fn realtime_current_thread(priority: i32) -> Result<(), Refusal> {
+    platform::realtime(priority)
+}
+
+/// Holds each of the calling thread's (a shard's) waits in its driver to `period_ns` (0 lifts it), so its CPU
+/// takes an interrupt at least that often while it waits: Linux only
+/// ([`crate::compute::nudge_current_thread`]).
+pub(crate) fn nudge_current_thread(period_ns: u64) -> Result<(), Refusal> {
+    platform::nudge(period_ns)
+}
+
+/// A driver's wait of `timeout_ns` (none: until an event comes) on the calling thread, held to the thread's
+/// nudge ([`nudge_current_thread`]): as asked on a thread with none.
+#[cfg(target_os = "linux")]
+pub(crate) fn nudged_timeout(timeout_ns: Option<u64>) -> Option<u64> {
+    held_to(timeout_ns, platform::nudge_ns())
+}
+
+/// `timeout_ns` held to `period_ns`: the shorter of the two, the period for a wait with no timeout, and the
+/// timeout as asked for a period of 0 (no nudge).
+#[cfg(any(target_os = "linux", test))]
+fn held_to(timeout_ns: Option<u64>, period_ns: u64) -> Option<u64> {
+    match (timeout_ns, period_ns) {
+        (asked, 0) => asked,
+        (None, period) => Some(period),
+        (Some(timeout), period) => Some(timeout.min(period)),
+    }
+}
+
 #[cfg(target_os = "linux")]
 mod platform {
     use super::{INCREMENT, MAX_NICE};
     use crate::compute::{Priority, Rank, Refusal};
+    use std::cell::Cell;
+
+    thread_local! {
+        /// The calling thread's nudge, nanoseconds (0: none): set by [`nudge`], read by each wait of the driver on
+        /// this thread (`crate::epoll`). A thread's own, as its policy is: one it starts has none.
+        static NUDGE_NS: Cell<u64> = const { Cell::new(0) };
+    }
+
+    /// Holds the calling thread's driver waits to `period_ns` each (0 lifts it). Refused only on a thread whose
+    /// thread-locals are already gone (it is ending).
+    pub(super) fn nudge(period_ns: u64) -> Result<(), Refusal> {
+        NUDGE_NS.try_with(|nudge| nudge.set(period_ns)).map_err(|_| Refusal {
+            call: "a nudge on a thread that is ending",
+            code: None,
+        })
+    }
+
+    /// The calling thread's nudge, nanoseconds; 0 for none, and on a thread that is ending.
+    pub(super) fn nudge_ns() -> u64 {
+        NUDGE_NS.try_with(Cell::get).unwrap_or(0)
+    }
 
     /// [`Rank::Idle`]: the idle policy by `sched_setattr`. [`Rank::Below`], or where the idle policy is
     /// refused: the batch policy at a nice value [`INCREMENT`] above the thread's own (at most [`MAX_NICE`]),
@@ -122,6 +194,71 @@ mod platform {
         done == 0
     }
 
+    /// The round-robin real-time policy at `priority`, with the reset-on-fork flag, so a thread or process the
+    /// calling thread starts runs at the normal policy (sched(7), "The reset-on-fork flag"): one `sched_setattr`.
+    /// The kernel refuses it (EPERM) to a thread with neither `CAP_SYS_NICE` nor `RLIMIT_RTPRIO` room for
+    /// `priority`, and to one in a cgroup given no real-time runtime where the kernel keeps real-time group
+    /// scheduling (sched(7); `CONFIG_RT_GROUP_SCHED`).
+    pub(super) fn realtime(priority: i32) -> Result<(), Refusal> {
+        let refused = || Refusal {
+            call: "sched_setattr",
+            code: std::io::Error::last_os_error().raw_os_error(),
+        };
+        let (Ok(size), Ok(policy), Ok(priority), Ok(flags)) = (
+            u32::try_from(std::mem::size_of::<libc::sched_attr>()),
+            u32::try_from(libc::SCHED_RR),
+            u32::try_from(priority),
+            u64::try_from(libc::SCHED_FLAG_RESET_ON_FORK),
+        ) else {
+            return Err(Refusal {
+                call: "sched_setattr",
+                code: Some(libc::EINVAL),
+            });
+        };
+        let attr = libc::sched_attr {
+            size,
+            sched_policy: policy,
+            sched_flags: flags,
+            sched_nice: 0,
+            sched_priority: priority,
+            sched_runtime: 0,
+            sched_deadline: 0,
+            sched_period: 0,
+        };
+        let pid: libc::pid_t = 0;
+        let call_flags: libc::c_uint = 0;
+        // SAFETY: `attr` is a live, initialised `sched_attr` whose `size` states its own size, which the kernel
+        // reads for the call's duration and does not keep; pid 0 names the calling thread and flags 0 asks
+        // nothing more (sched_setattr(2)). No memory of this process is written.
+        let done = unsafe { libc::syscall(libc::SYS_sched_setattr, pid, &raw const attr, call_flags) };
+        if done == 0 { Ok(()) } else { Err(refused()) }
+    }
+
+    /// The calling thread's real-time priority, by `sched_getattr`: `None` where the kernel doesn't say.
+    fn realtime_priority() -> Option<i32> {
+        let size = u32::try_from(std::mem::size_of::<libc::sched_attr>()).ok()?;
+        let mut attr = libc::sched_attr {
+            size,
+            sched_policy: 0,
+            sched_flags: 0,
+            sched_nice: 0,
+            sched_priority: 0,
+            sched_runtime: 0,
+            sched_deadline: 0,
+            sched_period: 0,
+        };
+        let pid: libc::pid_t = 0;
+        let flags: libc::c_uint = 0;
+        // SAFETY: `attr` is live, writable and `size` bytes long, the most the kernel writes, for the call's
+        // duration only; pid 0 names the calling thread and flags 0 asks nothing more (sched_getattr(2)).
+        let done = unsafe { libc::syscall(libc::SYS_sched_getattr, pid, &raw mut attr, size, flags) };
+        if done == 0 {
+            i32::try_from(attr.sched_priority).ok()
+        } else {
+            None
+        }
+    }
+
     /// The normal policy at the thread's own nice value with an EEVDF slice of `slice_ns` (`sched_runtime`).
     pub(super) fn prefer(slice_ns: u64) -> Result<(), Refusal> {
         let thread = rustix::thread::gettid();
@@ -149,12 +286,16 @@ mod platform {
         }
     }
 
-    /// The calling thread's policy (`sched_getscheduler`) and nice value (`getpriority` on its id).
+    /// The calling thread's policy (`sched_getscheduler`, its reset-on-fork flag set aside) and nice value
+    /// (`getpriority` on its id), or its real-time priority in a real-time class.
     pub(super) fn of_current() -> Priority {
         let pid: libc::pid_t = 0;
         // SAFETY: no pointer passes; pid 0 names the calling thread, and the call only reads its policy
         // (sched_getscheduler(2)).
-        let policy = unsafe { libc::sched_getscheduler(pid) };
+        let policy = unsafe { libc::sched_getscheduler(pid) } & !libc::SCHED_RESET_ON_FORK;
+        if policy == libc::SCHED_RR || policy == libc::SCHED_FIFO {
+            return realtime_priority().map_or(Priority::Unknown, |priority| Priority::Realtime { priority });
+        }
         let Ok(nice) = rustix::process::getpriority_process(Some(rustix::thread::gettid())) else {
             return Priority::Unknown;
         };
@@ -206,6 +347,28 @@ mod platform {
     pub(super) fn prefer(_slice_ns: u64) -> Result<(), Refusal> {
         Err(Refusal {
             call: "no slice to ask for on macOS",
+            code: None,
+        })
+    }
+
+    /// No real-time class is asked for on macOS: its one for user threads, the time-constraint policy
+    /// (`THREAD_TIME_CONSTRAINT_POLICY`), is for periodic work of a known computation each period, as audio's
+    /// is, and demotes a thread that overruns what it declared; a shard's work has no such period. The server's
+    /// launchd job runs `Interactive` and legs and agents under background policy, which the scheduler keeps off
+    /// the performance cores (docs/priority.md).
+    pub(super) fn realtime(_priority: i32) -> Result<(), Refusal> {
+        Err(Refusal {
+            call: "no real-time class to ask for on macOS",
+            code: None,
+        })
+    }
+
+    /// No nudge on macOS: it has no lazy preemption to bound. What holds a shard there is a thread of its own
+    /// class beside it, which the server keeps off by running legs and agents under background policy
+    /// (docs/priority.md; a shard's p99 0.54 ms beside background threads, `benches/compute_priority.rs`).
+    pub(super) fn nudge(_period_ns: u64) -> Result<(), Refusal> {
+        Err(Refusal {
+            call: "no lazy preemption to nudge on macOS",
             code: None,
         })
     }
@@ -273,6 +436,28 @@ mod platform {
         })
     }
 
+    /// No real-time class is asked for on Windows: its scheduler runs a waking thread of a higher priority
+    /// level at once, "without allowing it to finish using its time slice" [B: Microsoft Learn, "Scheduling
+    /// Priorities"], and the server's process runs above normal while legs and agents run below it
+    /// (docs/priority.md), so its shards already preempt them as they wake. `REALTIME_PRIORITY_CLASS` would put
+    /// it above the system's own work: "a real-time process that executes for more than a very brief interval
+    /// can cause disk caches not to flush or cause the mouse to be unresponsive" [B: the same].
+    pub(super) fn realtime(_priority: i32) -> Result<(), Refusal> {
+        Err(Refusal {
+            call: "no real-time class to ask for on Windows",
+            code: None,
+        })
+    }
+
+    /// No nudge on Windows: its scheduler runs a waking thread of a higher priority level at once (the module's
+    /// notes), so there is no lazy preemption to bound.
+    pub(super) fn nudge(_period_ns: u64) -> Result<(), Refusal> {
+        Err(Refusal {
+            call: "no lazy preemption to nudge on Windows",
+            code: None,
+        })
+    }
+
     /// The calling thread's priority level, as `GetThreadPriority` reports it.
     pub(super) fn of_current() -> Priority {
         // SAFETY: the calling thread's pseudo-handle, valid for the call; no pointer passes.
@@ -306,5 +491,63 @@ mod platform {
             call: "no slice to ask for on this OS",
             code: None,
         })
+    }
+
+    pub(super) fn realtime(_priority: i32) -> Result<(), Refusal> {
+        Err(Refusal {
+            call: "no real-time class to ask for on this OS",
+            code: None,
+        })
+    }
+
+    pub(super) fn nudge(_period_ns: u64) -> Result<(), Refusal> {
+        Err(Refusal {
+            call: "no nudge on this OS",
+            code: None,
+        })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Goal 8, plan 01a1a59c2b29 step 7: a nudge holds a wait to its period, whichever is shorter, gives a wait
+    /// with no timeout the period, and a period of 0 leaves every wait as asked, a zero-timeout harvest included.
+    #[test]
+    fn g8_s7_a_nudge_holds_a_wait_to_its_period() {
+        assert_eq!(held_to(None, 0), None, "no nudge: an untimed wait stays untimed");
+        assert_eq!(held_to(Some(5_000_000), 0), Some(5_000_000));
+        assert_eq!(held_to(None, 100_000), Some(100_000), "an untimed wait ends at the period");
+        assert_eq!(held_to(Some(5_000_000), 100_000), Some(100_000), "a longer timeout is held to it");
+        assert_eq!(held_to(Some(40_000), 100_000), Some(40_000), "a shorter one stands");
+        assert_eq!(held_to(Some(0), 100_000), Some(0), "a harvest that must not wait doesn't");
+    }
+
+    /// Goal 8, plan 01a1a59c2b29 step 7: the nudge is the calling thread's alone (a thread it starts has none, as a
+    /// thread started under a policy keeps its own), and 0 lifts it.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn g8_s7_a_nudge_is_its_thread_s_own_and_0_lifts_it() {
+        let seen = std::thread::spawn(|| {
+            nudge_current_thread(100_000).unwrap();
+            let mine = nudged_timeout(None);
+            let started = std::thread::spawn(|| nudged_timeout(None)).join().unwrap();
+            nudge_current_thread(0).unwrap();
+            (mine, started, nudged_timeout(None))
+        })
+        .join()
+        .unwrap();
+        assert_eq!(seen, (Some(100_000), None, None));
+        assert_eq!(nudged_timeout(Some(7)), Some(7), "a thread never nudged waits as asked");
+    }
+
+    /// Off Linux the nudge is refused, saying so, and nothing changes.
+    #[cfg(not(target_os = "linux"))]
+    #[test]
+    fn g8_s7_a_nudge_is_refused_off_linux() {
+        let refusal = nudge_current_thread(100_000).unwrap_err();
+        assert!(refusal.call.starts_with("no "), "{refusal}");
+        assert_eq!(refusal.code, None);
     }
 }

@@ -49,7 +49,7 @@ const UNANSWERED: &str = " (unanswered: a runner from before)";
 /// Whether runner process `peer` checks what relays pass on to it, and signs its receipts
 /// (`CAP_RELAYS`).
 fn answers(hub: &Hub, peer: PeerId) -> bool {
-    hub.instances.lock().get(peer).is_some_and(|i| (u64::from(i.caps) | i.wide) & crate::proto::CAP_RELAYS != 0)
+    hub.instances.load().get(peer).is_some_and(|i| (u64::from(i.caps) | i.wide) & crate::proto::CAP_RELAYS != 0)
 }
 
 /// kiln's own state of the relays it takes from and is.
@@ -240,16 +240,19 @@ pub async fn call(hub: &Hub, machine: &str, instance: &str, session: &str, ask: 
         return Ok(Err(why));
     };
     let revocations = crate::identities::revocations(&hub.store).await?;
-    let record = match statement::verify(&bundle, &hub.pki.ca_der, &revocations, at) {
+    // The relay's record checked, and the act as it came, signed by its originator or not: another of its
+    // signer's, swapped in, is genuine; one altered on the way isn't. Both on the compute pool, off the
+    // shards (goal 9, plan 01a1a87b2cec step 3): with kiln's receipt below, three public-key checks and a
+    // signature held the shard of the MCP call that relayed it.
+    let (b, a, root) = (bundle.clone(), act.clone(), hub.pki.ca_der.clone());
+    let (record, signed) = crate::rt::compute(move || (statement::verify(&b, &root, &revocations, at), statement::verify(&a, &root, &[], at).ok())).await?;
+    let record = match record {
         Ok(c) => c,
         Err(e) => {
             let why = found.record(&Unrelayed::Unreadable { relay: relay.clone(), why: e.to_string() }, true).await?;
             return Ok(Err(why));
         }
     };
-    // The act as it came, signed by its originator or not: another of its signer's, swapped in, is
-    // genuine; one altered on the way isn't.
-    let signed = statement::verify(&act, &hub.pki.ca_der, &[], at).ok();
     let thing = act_thing(session, &op_of(ask), &act_digest);
     // What the act signs: the ask that came, unchanged (an ask changed on the way isn't the one its
     // agent signed, though the act itself holds).
@@ -280,14 +283,17 @@ pub async fn call(hub: &Hub, machine: &str, instance: &str, session: &str, ask: 
             return Ok(Err(why));
         }
     }
-    crate::custody::keep_originator(&hub.store, &hub.pki.ca_der, &act, &came_from, at).await?;
+    // The act, kept as checked above (a call that got this far has it signed: one that isn't was refused).
+    if let Some(c) = &signed {
+        crate::custody::keep_originator_checked(&hub.store, c, &act, &came_from).await?;
+    }
     match crate::custody::take(&hub.store, &hub.pki.ca_der, &org, &bundle, &came_from, at).await? {
         Ok(t) if t.broke.is_none() => {}
         Ok(t) => return Ok(Err(format!("{relay}'s record of passing it on doesn't hold: {}", t.broke.unwrap_or_default()))),
         Err(why) => return Ok(Err(format!("{relay}'s record of passing it on was refused: {why}"))),
     }
     let receipt = relay::receipt(&server, &relay, vec![thing], &record.digest, "an agent's call, taken by kiln");
-    let signed_receipt = crate::custody::server_signed(&hub.pki, &receipt)?;
+    let signed_receipt = crate::custody::server_signed_off(&hub.pki, receipt).await?;
     if let Ok(Err(why)) = crate::custody::take(&hub.store, &hub.pki.ca_der, &org, &signed_receipt, "kiln's server", at).await {
         tracing::warn!(target: "kiln.custody", %session, %why, "kiln's receipt of a relayed call wasn't kept");
     }
@@ -322,7 +328,7 @@ fn named(u: Unrelayed, relay: &str) -> Unrelayed {
 pub async fn words(hub: &Hub, to: &str, carried: Carried) -> Option<(Value, u64, String)> {
     let Some(crate::harness::registry::Location::Machine(machine)) = hub.harness.location(to) else { return None };
     let held = {
-        let inst = hub.instances.lock();
+        let inst = hub.instances.load();
         inst.reaches(&machine, &crate::instances::Owned::Agent(to.to_owned())).and_then(|p| inst.get(p).map(|i| (i.label(), p)))
     };
     let (instance, peer) = held?;
@@ -342,7 +348,8 @@ pub async fn words(hub: &Hub, to: &str, carried: Carried) -> Option<(Value, u64,
         let stream = format!("words to {to_uri}, from kiln started {}{}", *STARTED, if answers { "" } else { UNANSWERED });
         let pass = Pass { by: &server, from: &from, to: &to_uri, stream: &stream, seq: hub.relays.next(&stream), why: "an agent's words, passed on to the runner process holding the agent they're for" };
         let s = relay::passed_on(&pass, vec![thing], vec![crate::custody::digest_of(last)]);
-        let bundle = crate::custody::server_signed(&hub.pki, &s)?;
+        // Signed on the compute pool, off the shards (goal 9, plan 01a1a87b2cec step 3).
+        let bundle = crate::custody::server_signed_off(&hub.pki, s).await?;
         match crate::custody::take(&hub.store, &hub.pki.ca_der, &org, &bundle, "kiln's server", crate::util::now_unix()).await? {
             Ok(_) => {}
             Err(why) => anyhow::bail!("kiln refused its own record of passing words on: {why}"),
@@ -378,7 +385,7 @@ pub async fn frames(hub: &Hub, runs: Vec<crate::reach::relay::Passed>) {
     let org = hub.pki.organization();
     let server = crate::custody::server_uri(&org);
     for p in runs {
-        let of = |peer: PeerId| hub.instances.lock().get(peer).map(|i| i.label());
+        let of = |peer: PeerId| hub.instances.load().get(peer).map(|i| i.label());
         let (Some(from_instance), Some(to_instance)) = (of(p.from_peer), of(p.to_peer)) else { continue };
         let answers = answers(hub, p.to_peer);
         let run = || async {
@@ -388,7 +395,8 @@ pub async fn frames(hub: &Hub, runs: Vec<crate::reach::relay::Passed>) {
             let thing = p.frames.thing(&format!("frames {} to {last} of reach link {} from {}", p.frames.first(), p.link, p.from));
             let stream = format!("reach link {} to {to}, from kiln started {}{}", p.link, *STARTED, if answers { "" } else { UNANSWERED });
             let pass = Pass { by: &server, from: &from, to: &to, stream: &stream, seq: p.seq, why: "a reach link's frames, passed on unread by kiln's relay" };
-            let bundle = crate::custody::server_signed(&hub.pki, &relay::passed_on(&pass, vec![thing], Vec::new()))?;
+            // Signed on the compute pool, off the shards (goal 9, plan 01a1a87b2cec step 3).
+            let bundle = crate::custody::server_signed_off(&hub.pki, relay::passed_on(&pass, vec![thing], Vec::new())).await?;
             if let Err(why) = crate::custody::take(&hub.store, &hub.pki.ca_der, &org, &bundle, "kiln's server", crate::util::now_unix()).await? {
                 anyhow::bail!("kiln refused its own record of passing a reach link's frames on: {why}");
             }
@@ -469,8 +477,8 @@ pub async fn unanswered(store: &Store, lapse: i64, at: i64, record: bool) -> any
 pub async fn relays_loop(hub: std::sync::Arc<Hub>) -> anyhow::Result<()> {
     let mut ticks = 0u32;
     while hub.shutdown.sleep(std::time::Duration::from_secs(5)).await {
-        let due = hub.reach.lock().due();
-        hub.reach_passed(due);
+        // The relay's owner records them in its turn (goal 5, plan 01a1a59c2aae step 2).
+        hub.relay().send(crate::reach::relay::Ask::Due);
         ticks = ticks.wrapping_add(1);
         if ticks.is_multiple_of(12)
             && let Err(e) = unanswered(&hub.store, crate::custody::LAPSE_AFTER, crate::util::now_unix(), true).await

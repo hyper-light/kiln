@@ -85,6 +85,15 @@ impl Profile {
         Self { dwell_s: 0, read_think_ms: 0, ..Self::realistic() }
     }
 
+    /// The overload profile with many more clients: 64 readers and 8 agents calling MCP, none thinking, so a server
+    /// of one shard has more work than that shard can run, whatever its pools do (goal 6, plan 01a1a59c2abe step 4:
+    /// under the overload profile, fedora 2026-11-05, the one shard was 34% busy while the pools' threads took the
+    /// server's CPUs, so no queue of its own stood and a calm-learned limit had nothing to shed). Its readers' event
+    /// catch-ups are Background, its other reads and the MCP calls Normal, its pages and `/api/me` Critical.
+    pub fn flood() -> Self {
+        Self { readers: 64, mcp: 8, mcp_think_ms: 0, ..Self::overload() }
+    }
+
     /// The realistic profile at production's whole shape rather than its busy hour's share: its ten
     /// runners and all 134 of its live feeds (2 of 20,000 events, 6 of 4,000, the rest of 400), every
     /// one at work, at the same pace. What many sessions changing at once cost a server that kept them
@@ -126,6 +135,9 @@ pub struct Build {
     pub label: String,
     pub kiln: PathBuf,
     pub env: Vec<(String, String)>,
+    /// Its server's `[bus] memory` in bytes, when the run sets it (`--bus-memory`).
+    #[serde(default)]
+    pub bus_memory: Option<u64>,
 }
 
 /// The machine around a round.
@@ -291,6 +303,16 @@ pub struct Round {
     pub shards: usize,
     pub numbers: BTreeMap<String, f64>,
     pub seen: BTreeMap<String, measure::Seen>,
+    /// What held the shards past 100 µs in the window, and over the fill (`kiln_shard_held_*`, goal 9, plan
+    /// 01a1a87b2cec step 2), each the most first: a build without the series has none.
+    #[serde(default)]
+    pub held: Vec<measure::Held>,
+    #[serde(default)]
+    pub fill_held: Vec<measure::Held>,
+    /// The step quantum the server's shards ran with, µs (`kiln_shard_quantum_seconds`, goal 9, plan 01a1a87b2cec
+    /// step 3): what the report holds what held the shards to. None from a build from before it said.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub quantum_us: Option<f64>,
     /// A build that counts its locks (`scripts/locks.py census`, goal 5 of the API runtime program,
     /// plan 01a1a59c2aae step 1): each place a lock is taken, by its site and kind, with what the
     /// window and the fill took there. Kept apart from `numbers`, which an A/B compares one by one.
@@ -427,6 +449,16 @@ fn stamps(text: &[u8]) -> impl Iterator<Item = u64> + '_ {
     })
 }
 
+/// Whether a session socket's text frame brings events, an event's own frame (`{"t":"events"…}`, or its text
+/// streamed: `{"t":"stream"…}`): the frames whose stamps are deliveries, as `websocket` times them. A state's
+/// frame quotes an event's words (its `summary` is the agent's latest), and so may a meta's: after an attach,
+/// the first carried the stamp of an event the viewer took in its snapshot seconds before, counted as a frame
+/// that took that long (goal 10, plan 01a1a87b2dae step 5: rt5's `websocket.own_attach` p50 0.9 s, most 2.6 s,
+/// which were most of the class's p99.9 and all of its most).
+fn brings_events(text: &[u8]) -> bool {
+    text.starts_with(br#"{"t":"events""#) || text.starts_with(br#"{"t":"stream""#)
+}
+
 /// A person viewing agents: opens one's conversation (its whole, packed, as the UI asks), watches
 /// its live frames, then another.
 fn viewer(s: &Shared, i: usize) -> (Vec<Sample>, Vec<Watch>) {
@@ -474,7 +506,7 @@ fn viewer(s: &Shared, i: usize) -> (Vec<Sample>, Vec<Watch>) {
         let mut seen = HashSet::new();
         while Instant::now() < until && !s.stop.load(Ordering::Relaxed) {
             match sock.next() {
-                Ok(Frame::Text(text)) => {
+                Ok(Frame::Text(text)) if brings_events(&text) => {
                     let now = now_us();
                     for stamp in stamps(&text) {
                         if seen.insert(stamp) {
@@ -483,8 +515,8 @@ fn viewer(s: &Shared, i: usize) -> (Vec<Sample>, Vec<Watch>) {
                         }
                     }
                 }
-                // A catch-up (a whole again), or nothing yet.
-                Ok(Frame::Binary | Frame::Nothing) => {}
+                // A catch-up (a whole again), a frame that only quotes events (a state, a meta), or nothing yet.
+                Ok(Frame::Binary | Frame::Text(_) | Frame::Nothing) => {}
                 Ok(Frame::Closed) | Err(_) => break,
             }
         }
@@ -731,10 +763,42 @@ fn statuses(http: &mut Http) -> anyhow::Result<BTreeMap<String, String>> {
     Ok(list.iter().filter_map(|i| Some((i.get("id")?.as_str()?.to_owned(), i.get("status")?.as_str()?.to_owned()))).collect())
 }
 
+/// A command the lab runs as each part of a round begins and ends, from `KILN_LAB_HOOK` (goal 9, plan
+/// 01a1a87b2cec step 2: a profiler of the round's server over its window): `<hook> <event> <server's pid>
+/// <folder>`, the event `fill-start`, `fill-end`, `window-start` or `window-end`, the folder one of the
+/// round's own beside its kiln's (`<round>.hook`, kept when the kiln's is removed). The lab waits for it, so
+/// it starts what lasts in the background; one that fails is said and the round goes on.
+struct Hook {
+    command: Option<PathBuf>,
+    pid: u32,
+    dir: PathBuf,
+}
+
+impl Hook {
+    fn from_env(fleet: &Fleet, dir: &Path) -> Self {
+        let command = std::env::var_os("KILN_LAB_HOOK").filter(|c| !c.is_empty()).map(PathBuf::from);
+        Self { command, pid: fleet.server.child.id(), dir: dir.with_extension("hook") }
+    }
+
+    fn run(&self, event: &str) {
+        let Some(command) = &self.command else { return };
+        let ran = std::fs::create_dir_all(&self.dir).map_err(anyhow::Error::from).and_then(|()| Ok(Command::new(command).arg(event).arg(self.pid.to_string()).arg(&self.dir).stdin(Stdio::null()).status()?));
+        match ran {
+            Ok(status) if status.success() => {}
+            Ok(status) => eprintln!("kiln-lab: the hook's {event} exited {status}"),
+            Err(e) => eprintln!("kiln-lab: the hook's {event} didn't run: {e:#}"),
+        }
+    }
+}
+
 /// One round of `build` with `hogs`, in `dir` (left for the next round's: the caller removes it).
 pub fn round(build: &Build, p: &Profile, hogs: usize, place: &Place, dir: &Path, bin: &Path, index: usize) -> anyhow::Result<Round> {
     std::fs::create_dir_all(dir)?;
-    let mut fleet = Fleet::server(&build.kiln, dir, &build.env, place, &format!("kiln-lab-server-{}-{index}", std::process::id()))?;
+    let mut fleet = Fleet::server(&build.kiln, dir, &build.env, build.bus_memory, place, &format!("kiln-lab-server-{}-{index}", std::process::id()))?;
+    // The hook hears of the server before its runners connect: what a runner sends as it does (its Build, its
+    // ReachHello) can be profiled from here (goal 9, plan 01a1a87b2cec step 3; `scripts/shard_lab/hook.sh`'s PERF_FROM).
+    let hook = Hook::from_env(&fleet, dir);
+    hook.run("server-up");
     let names: Vec<String> = (0..p.runners.max(1)).map(|r| format!("lab-runner-{r}")).collect();
     for n in &names {
         fleet.runner(&build.kiln, n, bin)?;
@@ -746,6 +810,7 @@ pub fn round(build: &Build, p: &Profile, hogs: usize, place: &Place, dir: &Path,
     // conversation through its runner's shipper and the server's intake at once (goal 3's heavy path).
     let scrape = |fleet: &Fleet| -> anyhow::Result<Scrape> { Ok(Scrape::parse(&String::from_utf8_lossy(&Http::new(fleet.port, &fleet.admin).send("GET", "/metrics", None)?.body))) };
     let fill_before = scrape(&fleet)?;
+    hook.run("fill-start");
     let filled = Instant::now();
     let mut opened: Vec<(String, u64)> = Vec::new();
     std::thread::scope(|scope| -> anyhow::Result<()> {
@@ -789,6 +854,7 @@ pub fn round(build: &Build, p: &Profile, hogs: usize, place: &Place, dir: &Path,
         std::thread::sleep(Duration::from_millis(250));
     }
     let fill_s = filled.elapsed().as_secs_f64();
+    hook.run("fill-end");
     let fill_after = scrape(&fleet)?;
 
     // The MCP tools agents call, where this build has them.
@@ -844,9 +910,11 @@ pub fn round(build: &Build, p: &Profile, hogs: usize, place: &Place, dir: &Path,
         m.mhz_before = cpu_mhz(m.affinity.as_deref());
         m.server_mhz_before = place.cpus.as_deref().and_then(|c| cpu_mhz(Some(c)));
         let before = Scrape::parse(&String::from_utf8_lossy(&scraper.send("GET", "/metrics", None)?.body));
+        hook.run("window-start");
         let start = now_us();
         std::thread::sleep(Duration::from_secs(p.window_s));
         let end = now_us();
+        hook.run("window-end");
         let after = Scrape::parse(&String::from_utf8_lossy(&scraper.send("GET", "/metrics", None)?.body));
         m.load_after = loadavg();
         m.cpu_pressure_after = cpu_pressure();
@@ -872,12 +940,14 @@ pub fn round(build: &Build, p: &Profile, hogs: usize, place: &Place, dir: &Path,
     let (mut numbers, shards) = numbers(&seen, &before, &after, secs);
     numbers.insert("fill.s".into(), fill_s);
     server_numbers(&mut numbers, "fill.", &fill_before, &fill_after, fill_s);
+    let (held, fill_held) = (measure::held(&before, &after, secs), measure::held(&fill_before, &fill_after, fill_s));
     let locks = lock_census((&fill_before, &fill_after), (&before, &after));
     drop(fleet);
     let mut seen: BTreeMap<String, measure::Seen> = seen.into_iter().map(|(c, s)| (c.name().to_owned(), s)).collect();
     seen.extend(measure::seen_by_what(&in_window));
     seen.extend(frames_against_attaches(&watches, window));
-    Ok(Round { build: build.label.clone(), index, hogs, machine: m, fill_s, shards, numbers, seen, locks })
+    let quantum_us = measure::quantum_us(&after);
+    Ok(Round { build: build.label.clone(), index, hogs, machine: m, fill_s, shards, numbers, seen, held, fill_held, quantum_us, locks })
 }
 
 /// The window's frames (stamped in it) told apart by how they met the attaches, as each viewer saw
@@ -937,14 +1007,44 @@ fn numbers(seen: &BTreeMap<Class, measure::Seen>, before: &Scrape, after: &Scrap
     if let Some(rss) = after.get("process_resident_memory_bytes", &[]) {
         n.insert("server.rss_mb".into(), rss / 1e6);
     }
+    // The resident memory by kind and what each of the server's caches and buffers holds, where the build
+    // says them (`kiln_memory_*`; goal 11, plan 01a1a87b2e56 step 1): anon is what the server's own work
+    // holds, file the binary's pages read in.
+    for kind in after.values_of("kiln_memory_resident_bytes", "kind") {
+        if let Some(b) = after.get("kiln_memory_resident_bytes", &[("kind", kind.as_str())]) {
+            n.insert(format!("server.rss_{kind}_mb"), b / 1e6);
+        }
+    }
+    for owner in after.values_of("kiln_memory_bytes", "owner") {
+        if let Some(b) = after.get("kiln_memory_bytes", &[("owner", owner.as_str())]) {
+            n.insert(format!("server.memory.{owner}_mb"), b / 1e6);
+        }
+    }
     let shards = server_numbers(&mut n, "", before, after, secs);
-    // The routes': how long each class took and waited at the server.
+    per_request_wakes(&mut n, before, after, requests);
+    per_request_pools(&mut n, before, after, requests);
+    // The routes': how long each class took and waited at the server, at p99 and at p99.9 (the bar's: goal 10,
+    // plan 01a1a87b2dae step 5, so a class's tail can be set against its legs at the server).
     for class in ["page", "api_read", "api_write", "websocket", "runner"] {
         let want = [("class", class)];
         for (family, key) in [("kiln_route_seconds", "took"), ("kiln_route_wait_seconds", "wait")] {
             let d = measure::delta(&before.buckets(family, &want), &after.buckets(family, &want));
-            if let Some(v) = measure::histogram_quantile(0.99, &d) {
-                n.insert(format!("server.{class}.{key}_p99_ms"), v * 1000.0);
+            for (q, at) in [("p99", 0.99), ("p999", 0.999)] {
+                if let Some(v) = measure::histogram_quantile(at, &d) {
+                    n.insert(format!("server.{class}.{key}_{q}_ms"), v * 1000.0);
+                }
+            }
+        }
+    }
+    // A runner's message's wait by its legs, to the microsecond, where the build has them
+    // (`kiln_runner_wait_leg_seconds`; goal 10, plan 01a1a87b2dae step 4): to the hub's loop taking its frame
+    // (every frame's), that loop handing an agent session's update to the inbox of the shard that owns its
+    // copy, and that owner taking it.
+    for leg in ["to_loop", "in_loop", "to_owner"] {
+        let d = measure::delta(&before.buckets("kiln_runner_wait_leg_seconds", &[("leg", leg)]), &after.buckets("kiln_runner_wait_leg_seconds", &[("leg", leg)]));
+        for (q, at) in [("p50", 0.5), ("p99", 0.99), ("p999", 0.999)] {
+            if let Some(v) = measure::histogram_quantile(at, &d) {
+                n.insert(format!("server.runner.{leg}_{q}_us"), v * 1e6);
             }
         }
     }
@@ -975,15 +1075,20 @@ fn server_numbers(n: &mut BTreeMap<String, f64>, prefix: &str, before: &Scrape, 
         }
     };
     put("server.cpu_share".into(), diff("process_cpu_seconds_total", &[]).map(per_s));
-    // The shards': their delays together, their busy share on average, their slow polls.
+    // The shards': their delays together and each shard's, to the microsecond (median, p99, p99.9 and the top
+    // bucket reached: goal 9, plan 01a1a87b2cec step 1), their busy share on average and each one's, the
+    // worst shard's p99.9 and busy share, and their slow polls.
     let shards = after.values_of("kiln_shard_polls_total", "shard");
     if !shards.is_empty() {
         let mut delay: Vec<(f64, f64)> = Vec::new();
         let mut busy = 0.0;
+        let (mut worst_p999, mut worst_busy) = (None::<f64>, None::<f64>);
         let mut slow = [("task", 0.0), ("blocking", 0.0), ("host", 0.0), ("unknown", 0.0)];
         for sh in &shards {
             let want = [("shard", sh.as_str())];
             let d = histogram("kiln_shard_delay_seconds", &want);
+            let p999 = delay_us(&mut put, &format!("shard{sh}."), &d);
+            worst_p999 = most(worst_p999, p999);
             if delay.is_empty() {
                 delay = d;
             } else {
@@ -991,22 +1096,38 @@ fn server_numbers(n: &mut BTreeMap<String, f64>, prefix: &str, before: &Scrape, 
                     *total += add;
                 }
             }
-            busy += diff("kiln_shard_busy_seconds_total", &want).unwrap_or(0.0);
+            let own = diff("kiln_shard_busy_seconds_total", &want).map(per_s);
+            put(format!("shard{sh}.busy_share"), own);
+            worst_busy = most(worst_busy, own);
+            busy += own.unwrap_or(0.0);
             for (cause, total) in &mut slow {
                 *total += diff("kiln_shard_slow_polls_total", &[("shard", sh.as_str()), ("cause", *cause)]).unwrap_or(0.0);
             }
         }
-        put("shards.delay_p99_ms".into(), measure::histogram_quantile(0.99, &delay).map(|v| v * 1000.0));
-        put("shards.delay_p999_ms".into(), measure::histogram_quantile(0.999, &delay).map(|v| v * 1000.0));
-        put("shards.delay_top_ms".into(), measure::histogram_top(&delay).map(|v| v * 1000.0));
+        delay_us(&mut put, "shards.", &delay);
+        put("shards.worst_delay_p999_us".into(), worst_p999);
+        put("shards.worst_busy_share".into(), worst_busy);
         #[allow(clippy::cast_precision_loss)]
         let count = shards.len() as f64;
-        put("shards.busy_share".into(), Some(per_s(busy) / count));
+        put("shards.busy_share".into(), Some(busy / count));
         put("shards.slow_polls_per_s".into(), Some(per_s(slow.iter().map(|(_, v)| v).sum())));
         for (cause, v) in slow {
             put(format!("shards.slow_polls_{cause}_per_s"), Some(per_s(v)));
         }
+        // The most tasks any shard held, where the build says it: what a shard's task slots are sized from
+        // (goal 11, plan 01a1a87b2e56 step 3).
+        let most = shards.iter().filter_map(|sh| after.get("kiln_shard_tasks_most", &[("shard", sh.as_str())])).reduce(f64::max);
+        put("shards.tasks_most".into(), most);
     }
+    // The bus's (goal 11, plan 01a1a87b2e56 step 3): how long a live feed's frame took from its publish to a
+    // viewer's read, the frames published and the viewers sent back to a snapshot: what a topic needs to keep.
+    put("bus.published_per_s".into(), diff("kiln_bus_published_total", &[]).map(per_s));
+    put("bus.lag_notices".into(), diff("kiln_bus_lag_notices_total", &[]));
+    let delivery = histogram("kiln_bus_delivery_seconds", &[]);
+    put("bus.delivery_p99_ms".into(), measure::histogram_quantile(0.99, &delivery).map(|v| v * 1000.0));
+    put("bus.delivery_p999_ms".into(), measure::histogram_quantile(0.999, &delivery).map(|v| v * 1000.0));
+    put("bus.delivery_top_ms".into(), measure::histogram_top(&delivery).map(|v| v * 1000.0));
+    put("bus.topics".into(), after.get("kiln_bus_topics", &[]));
     // The compute pool's (goal 3): where the heavy work went, how long it waited and how long a piece held a
     // pool thread.
     if let Some(jobs) = diff("kiln_compute_jobs_total", &[]) {
@@ -1032,6 +1153,107 @@ fn server_numbers(n: &mut BTreeMap<String, f64>, prefix: &str, before: &Scrape, 
     shards.len()
 }
 
+/// What each of the window's `requests` cost the shards in loop steps, polls, parks, wakes and system calls (goal
+/// 9, plan 01a1a87b2cec step 5, beside `server.cpu_ms_per_request`): each family's growth over the window summed
+/// over the shards, over the requests, as `shards.<what>_per_request`, where the build has the family; and, where
+/// it has every one, the calls' sum (`shards.syscalls_per_request`). A park that waits is a system call and a
+/// sleep, and a kick a system call on its sender; a park withdrawn costs neither.
+fn per_request_wakes(n: &mut BTreeMap<String, f64>, before: &Scrape, after: &Scrape, requests: u64) {
+    const FAMILIES: [(&str, &str, &[(&str, &str)]); 20] = [
+        ("steps", "kiln_shard_steps_total", &[]),
+        ("polls", "kiln_shard_polls_total", &[]),
+        ("parks", "kiln_shard_parks_total", &[]),
+        ("parks_withdrawn", "kiln_shard_parks_withdrawn_total", &[]),
+        ("wakeups_kick", "kiln_shard_wakeups_total", &[("by", "kick")]),
+        ("wakeups_io", "kiln_shard_wakeups_total", &[("by", "io")]),
+        ("wakeups_timer", "kiln_shard_wakeups_total", &[("by", "timer")]),
+        ("wakes_taken", "kiln_shard_wakes_taken_total", &[]),
+        ("wakes_sent_own", "kiln_shard_wakes_sent_total", &[("to", "own")]),
+        ("wakes_sent_other", "kiln_shard_wakes_sent_total", &[("to", "other")]),
+        ("kicks_sent", "kiln_shard_kicks_sent_total", &[]),
+        ("kicks_saved", "kiln_shard_kicks_saved_total", &[]),
+        ("threads_woken", "kiln_shard_threads_woken_total", &[]),
+        ("harvests", "kiln_shard_harvests_total", &[]),
+        ("arms", "kiln_shard_arms_total", &[]),
+        ("socket_accepts", "kiln_shard_socket_calls_total", &[("call", "accept")]),
+        ("socket_reads", "kiln_shard_socket_calls_total", &[("call", "read")]),
+        ("socket_writes", "kiln_shard_socket_calls_total", &[("call", "write")]),
+        ("socket_reads_empty", "kiln_shard_socket_calls_idle_total", &[("call", "read")]),
+        ("socket_writes_full", "kiln_shard_socket_calls_idle_total", &[("call", "write")]),
+    ];
+    // Each of these a system call on a shard: their sum is what a request costs the shards in calls into the
+    // kernel, as counted (docs/runtime-lab.md says what isn't).
+    const CALLS: [&str; 8] = ["parks", "kicks_sent", "threads_woken", "harvests", "arms", "socket_accepts", "socket_reads", "socket_writes"];
+    if requests == 0 {
+        return;
+    }
+    #[allow(clippy::cast_precision_loss)]
+    let requests = requests as f64;
+    let shards = after.values_of("kiln_shard_polls_total", "shard");
+    for (what, family, labels) in FAMILIES {
+        let mut grown = None::<f64>;
+        for sh in &shards {
+            let mut want = vec![("shard", sh.as_str())];
+            want.extend_from_slice(labels);
+            if let (Some(a), Some(b)) = (after.get(family, &want), before.get(family, &want)) {
+                *grown.get_or_insert(0.0) += a - b;
+            }
+        }
+        if let Some(grown) = grown {
+            n.insert(format!("shards.{what}_per_request"), grown / requests);
+        }
+    }
+    let calls: Option<Vec<f64>> = CALLS.iter().map(|what| n.get(&format!("shards.{what}_per_request")).copied()).collect();
+    if let Some(calls) = calls {
+        n.insert("shards.syscalls_per_request".into(), calls.iter().sum());
+    }
+}
+
+/// What each of the window's `requests` handed the pools (goal 9, plan 01a1a87b2cec step 5: each hand-off a wake
+/// of a pool's thread and a wake back, beside `shards.*_per_request`): the compute pool's jobs, the workers its
+/// jobs woke (each a system call on the thread that queued the job) and the times they went to park
+/// (`compute.<what>_per_request`), and each of the blocking pool's shares' jobs, kiln.db's writer's among them
+/// (`blocking.<share>.per_request`), where the build has their series.
+fn per_request_pools(n: &mut BTreeMap<String, f64>, before: &Scrape, after: &Scrape, requests: u64) {
+    if requests == 0 {
+        return;
+    }
+    #[allow(clippy::cast_precision_loss)]
+    let requests = requests as f64;
+    let grown = |family: &str, want: &[(&str, &str)]| Some(after.get(family, want)? - before.get(family, want)?);
+    for (what, family) in [("jobs", "kiln_compute_jobs_total"), ("unparks", "kiln_compute_unparks_total"), ("parks", "kiln_compute_parks_total")] {
+        if let Some(v) = grown(family, &[]) {
+            n.insert(format!("compute.{what}_per_request"), v / requests);
+        }
+    }
+    for share in after.values_of("kiln_blocking_run_seconds_count", "share") {
+        if let Some(v) = grown("kiln_blocking_run_seconds_count", &[("share", share.as_str())]) {
+            n.insert(format!("blocking.{share}.per_request"), v / requests);
+        }
+    }
+}
+
+/// The larger of two numbers either may lack.
+fn most(a: Option<f64>, b: Option<f64>) -> Option<f64> {
+    match (a, b) {
+        (Some(a), Some(b)) => Some(a.max(b)),
+        (a, None) => a,
+        (None, b) => b,
+    }
+}
+
+/// A shard delay histogram's numbers, each `prefix` then its name, in microseconds: its median, p99, p99.9 and
+/// the top bucket reached (an observation's bound from above: `+Inf` past the last). Its p99.9, if it has one.
+fn delay_us(put: &mut impl FnMut(String, Option<f64>), prefix: &str, buckets: &[(f64, f64)]) -> Option<f64> {
+    let us = |v: f64| v * 1e6;
+    let p999 = measure::histogram_quantile(0.999, buckets).map(us);
+    put(format!("{prefix}delay_p50_us"), measure::histogram_quantile(0.5, buckets).map(us));
+    put(format!("{prefix}delay_p99_us"), measure::histogram_quantile(0.99, buckets).map(us));
+    put(format!("{prefix}delay_p999_us"), p999);
+    put(format!("{prefix}delay_max_us"), measure::histogram_top(buckets).filter(|v| v.is_finite()).map(us));
+    p999
+}
+
 /// Which way each number is better: each class's throughput up, everything else (latency, CPU, delay,
 /// slow polls, the pools' work) down.
 pub fn better(name: &str) -> crate::stats::Better {
@@ -1046,6 +1268,171 @@ pub fn better(name: &str) -> crate::stats::Better {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Goal 6, plan 01a1a59c2abe step 4: the flood profile is the overload one with many more clients, none thinking.
+    #[test]
+    fn g6_s4_flood_is_overload_with_many_more_clients() {
+        let (flood, overload) = (Profile::flood(), Profile::overload());
+        assert!(flood.readers >= 16 * overload.readers && flood.mcp > overload.mcp, "{flood:?}");
+        assert_eq!((flood.read_think_ms, flood.mcp_think_ms, flood.dwell_s), (0, 0, 0));
+        assert_eq!((flood.sessions.len(), flood.viewers, flood.window_s), (overload.sessions.len(), overload.viewers, overload.window_s));
+    }
+
+    /// Goal 10, plan 01a1a87b2dae step 4: a runner's wait is reported by its legs, each to the microsecond, from
+    /// the server's histogram of it between the window's two scrapes.
+    #[test]
+    fn g10_s4_a_runners_wait_is_reported_by_its_legs() {
+        let legs = ["to_loop", "in_loop", "to_owner"];
+        let scrape = |n: f64| {
+            let mut t = String::new();
+            for leg in legs {
+                // Half the leg's observations at or under 0.5 ms, all of them at or under 1 ms.
+                for (le, c) in [("0.0005", n / 2.0), ("0.001", n), ("+Inf", n)] {
+                    t.push_str(&format!("kiln_runner_wait_leg_seconds_bucket{{leg=\"{leg}\",le=\"{le}\"}} {c}\n"));
+                }
+            }
+            measure::Scrape::parse(&t)
+        };
+        let (n, _) = numbers(&BTreeMap::new(), &scrape(0.0), &scrape(1000.0), 60.0);
+        for leg in legs {
+            let p50 = n.get(&format!("server.runner.{leg}_p50_us")).copied();
+            let p99 = n.get(&format!("server.runner.{leg}_p99_us")).copied();
+            assert!(p50.is_some_and(|v| (v - 500.0).abs() < 1.0), "{leg}: p50 {p50:?}");
+            assert!(p99.is_some_and(|v| (v - 990.0).abs() < 1.0), "{leg}: p99 {p99:?}");
+        }
+        let (n, _) = numbers(&BTreeMap::new(), &scrape(0.0), &scrape(0.0), 60.0);
+        assert!(!n.keys().any(|k| k.contains("to_owner")), "a build without the legs reports none");
+    }
+
+    /// Goal 10, plan 01a1a87b2dae step 5: only a frame that brings events (or an event's streamed text) is a
+    /// delivery; a state's or a meta's frame that quotes an event's words (a summary is the agent's latest) isn't,
+    /// whatever stamp it carries.
+    #[test]
+    fn g10_s5_only_frames_that_bring_events_are_deliveries() {
+        let event = format!(r#"{{"t":"events","events":[{{"id":"e1","text":"{STAMP}1700000000000000 the retry loop"}}],"rev":9}}"#);
+        let stream = format!(r#"{{"t":"stream","id":"e2","text":"{STAMP}1700000000000500 more","rev":10}}"#);
+        let state = format!(r#"{{"t":"state","state":{{"summary":"{STAMP}1699999990000000 the retry loop"}},"rev":11}}"#);
+        let patch = format!(r#"{{"t":"state_patch","set":{{"summary":"{STAMP}1699999990000000 x"}},"rev":12}}"#);
+        for (frame, brings) in [(&event, true), (&stream, true), (&state, false), (&patch, false)] {
+            assert_eq!(brings_events(frame.as_bytes()), brings, "{frame}");
+            assert_eq!(stamps(frame.as_bytes()).count(), 1, "the stamp is read either way: {frame}");
+        }
+    }
+
+    /// Goal 10, plan 01a1a87b2dae step 5: each class's server-side wait and time taken are reported at p99.9 too.
+    #[test]
+    fn g10_s5_a_classs_server_numbers_reach_p999() {
+        let scrape = |n: f64| {
+            let mut t = String::new();
+            for family in ["kiln_route_wait_seconds", "kiln_route_seconds"] {
+                // A thousand observations: 990 at or under 1 ms, the rest at or under 10 ms.
+                for (le, c) in [("0.001", n * 0.99), ("0.01", n), ("+Inf", n)] {
+                    t.push_str(&format!("{family}_bucket{{class=\"websocket\",le=\"{le}\"}} {c}\n"));
+                }
+            }
+            measure::Scrape::parse(&t)
+        };
+        let (n, _) = numbers(&BTreeMap::new(), &scrape(0.0), &scrape(1000.0), 60.0);
+        for key in ["wait", "took"] {
+            let p999 = n.get(&format!("server.websocket.{key}_p999_ms")).copied();
+            assert!(p999.is_some_and(|v| (v - 9.1).abs() < 0.01), "{key}: p99.9 {p999:?}");
+            assert!(n.get(&format!("server.websocket.{key}_p99_ms")).is_some_and(|v| (v - 1.0).abs() < 0.01), "{key}: p99");
+        }
+    }
+
+    /// Goal 9, plan 01a1a87b2cec step 5: what the window's requests cost the shards in polls, parks, wakes and kicks
+    /// is reported per request, each family's growth summed over the shards and its labels kept apart; a family
+    /// the build lacks, or a window with no requests, reports nothing.
+    #[test]
+    fn g9_s5_the_shards_parks_and_wakes_are_reported_per_request() {
+        let scrape = |k: f64| {
+            let mut t = String::new();
+            for sh in ["0", "1"] {
+                t.push_str(&format!("kiln_shard_polls_total{{shard=\"{sh}\"}} {}\n", 30.0 * k));
+                t.push_str(&format!("kiln_shard_parks_total{{shard=\"{sh}\"}} {}\n", 10.0 * k));
+                for (by, each) in [("kick", 5.0), ("io", 3.0), ("timer", 2.0)] {
+                    t.push_str(&format!("kiln_shard_wakeups_total{{shard=\"{sh}\",by=\"{by}\"}} {}\n", each * k));
+                }
+                t.push_str(&format!("kiln_shard_kicks_sent_total{{shard=\"{sh}\"}} {}\n", 4.0 * k));
+                for (call, each, idle) in [("accept", 1.0, None), ("read", 6.0, Some(2.0)), ("write", 3.0, Some(0.0))] {
+                    t.push_str(&format!("kiln_shard_socket_calls_total{{shard=\"{sh}\",call=\"{call}\"}} {}\n", each * k));
+                    if let Some(idle) = idle {
+                        t.push_str(&format!("kiln_shard_socket_calls_idle_total{{shard=\"{sh}\",call=\"{call}\"}} {}\n", idle * k));
+                    }
+                }
+            }
+            measure::Scrape::parse(&t)
+        };
+        let mut n = BTreeMap::new();
+        per_request_wakes(&mut n, &scrape(1.0), &scrape(2.0), 10);
+        for (key, want) in [("socket_accepts", 0.2), ("socket_reads", 1.2), ("socket_writes", 0.6), ("socket_reads_empty", 0.4), ("socket_writes_full", 0.0)] {
+            let got = n.get(&format!("shards.{key}_per_request")).copied();
+            assert!(got.is_some_and(|v| (v - want).abs() < 1e-9), "{key}: {got:?}, want {want}");
+        }
+        assert!(!n.contains_key("shards.syscalls_per_request"), "the sum only where every call is counted: {n:?}");
+        // Each shard's count grew by itself once more: two shards' growth over ten requests.
+        for (key, want) in [("polls", 6.0), ("parks", 2.0), ("wakeups_kick", 1.0), ("wakeups_io", 0.6), ("wakeups_timer", 0.4), ("kicks_sent", 0.8)] {
+            let got = n.get(&format!("shards.{key}_per_request")).copied();
+            assert!(got.is_some_and(|v| (v - want).abs() < 1e-9), "{key}: {got:?}, want {want}");
+        }
+        assert!(!n.contains_key("shards.steps_per_request"), "a family the build lacks isn't reported: {n:?}");
+        let mut none = BTreeMap::new();
+        per_request_wakes(&mut none, &scrape(1.0), &scrape(2.0), 0);
+        assert!(none.is_empty(), "no requests, no per-request numbers: {none:?}");
+    }
+
+    /// Goal 9, plan 01a1a87b2cec step 5: where the build counts every kind of system call a shard makes, a request's
+    /// calls are reported summed too: its parks, kicks, unparks, harvests, arms and socket calls.
+    #[test]
+    fn g9_s5_a_requests_system_calls_are_summed_where_all_are_counted() {
+        let scrape = |k: f64| {
+            let mut t = String::new();
+            for (family, label, each) in [
+                ("kiln_shard_polls_total", "", 9.0),
+                ("kiln_shard_parks_total", "", 1.0),
+                ("kiln_shard_kicks_sent_total", "", 2.0),
+                ("kiln_shard_threads_woken_total", "", 3.0),
+                ("kiln_shard_harvests_total", "", 4.0),
+                ("kiln_shard_arms_total", "", 5.0),
+                ("kiln_shard_socket_calls_total", ",call=\"accept\"", 6.0),
+                ("kiln_shard_socket_calls_total", ",call=\"read\"", 7.0),
+                ("kiln_shard_socket_calls_total", ",call=\"write\"", 8.0),
+            ] {
+                t.push_str(&format!("{family}{{shard=\"0\"{label}}} {}\n", each * k));
+            }
+            measure::Scrape::parse(&t)
+        };
+        let mut n = BTreeMap::new();
+        per_request_wakes(&mut n, &scrape(1.0), &scrape(3.0), 4);
+        // Each grew by twice itself, over four requests: (1 + 2 + ... + 8) * 2 / 4.
+        let got = n.get("shards.syscalls_per_request").copied();
+        assert!(got.is_some_and(|v| (v - 18.0).abs() < 1e-9), "{got:?}");
+    }
+
+    /// Goal 9, plan 01a1a87b2cec step 5: what the window's requests handed the pools is reported per request: the
+    /// compute pool's jobs, unparks and parks, and each blocking share's jobs by its name; no requests, nothing.
+    #[test]
+    fn g9_s5_the_pools_hand_offs_are_reported_per_request() {
+        let scrape = |k: f64| {
+            let mut t = String::new();
+            t.push_str(&format!("kiln_compute_jobs_total {}\n", 40.0 * k));
+            t.push_str(&format!("kiln_compute_unparks_total {}\n", 30.0 * k));
+            t.push_str(&format!("kiln_compute_parks_total {}\n", 20.0 * k));
+            for (share, jobs) in [("store", 5.0), ("store_write", 60.0)] {
+                t.push_str(&format!("kiln_blocking_run_seconds_count{{share=\"{share}\"}} {}\n", jobs * k));
+            }
+            measure::Scrape::parse(&t)
+        };
+        let mut n = BTreeMap::new();
+        per_request_pools(&mut n, &scrape(1.0), &scrape(2.0), 10);
+        for (key, want) in [("compute.jobs_per_request", 4.0), ("compute.unparks_per_request", 3.0), ("compute.parks_per_request", 2.0), ("blocking.store.per_request", 0.5), ("blocking.store_write.per_request", 6.0)] {
+            let got = n.get(key).copied();
+            assert!(got.is_some_and(|v| (v - want).abs() < 1e-9), "{key}: {got:?}, want {want}");
+        }
+        let mut none = BTreeMap::new();
+        per_request_pools(&mut none, &scrape(1.0), &scrape(2.0), 0);
+        assert!(none.is_empty(), "no requests, no per-request numbers: {none:?}");
+    }
 
     #[test]
     fn an_affinity_list_names_its_cpus() {

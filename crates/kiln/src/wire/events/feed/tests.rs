@@ -242,8 +242,7 @@ fn events_resume_across_a_gap_and_an_epoch() {
 /// The ring is the size of the broadcast it stands beside (its justification).
 #[test]
 fn events_ring_is_the_broadcasts_size() -> anyhow::Result<()> {
-    let hub = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/src/hub.rs"))?;
-    anyhow::ensure!(hub.contains(&format!("events: Broadcast::new({RING})")), "the events broadcast's size isn't the feed's RING ({RING})");
+    anyhow::ensure!(RING == crate::hub::EVENTS, "the hub's events ring keeps {}, the feed {RING}", crate::hub::EVENTS);
     Ok(())
 }
 

@@ -16,7 +16,6 @@ use http::StatusCode;
 use kiln_ci::identity::statement;
 use kiln_ci::identity::verdict::{self, Asked, Holds, Kept, Place, Revision};
 use kiln_ci::land::Action;
-use parking_lot::Mutex;
 use rusqlite::{OptionalExtension as _, params};
 use serde_json::{Value, json};
 
@@ -38,21 +37,24 @@ fn bad(why: String) -> Fail {
 
 /// `commit`'s verbatim patch-id: `git patch-id --verbatim` of its diff as `git show` gives it,
 /// context and whitespace as they are. W26-R16's replays make this same comparison for their
-/// `same_patch`; once both are on main, a replay's carrying can read that instead. Remembered.
+/// `same_patch`; once both are on main, a replay's carrying can read that instead. Remembered: read
+/// without a lock by the pages and the land queue that ask (goal 5, plan 01a1a59c2aae step 2), one
+/// worked out swapped in whole with the rest (`crate::rcu`).
 pub async fn verbatim(hub: &Hub, path: &str, commit: &str) -> Option<String> {
-    static KEPT: OnceLock<Mutex<HashMap<String, String>>> = OnceLock::new();
+    static KEPT: OnceLock<crate::rcu::Rcu<HashMap<String, String>>> = OnceLock::new();
     let kept = KEPT.get_or_init(Default::default);
-    if let Some(p) = kept.lock().get(commit) {
+    if let Some(p) = kept.load().get(commit) {
         return Some(p.clone());
     }
     let patch = super::diffs::git_run(hub, &["-C", path, "show", "--no-color", "--format=", commit], &[], Vec::new()).await.ok()?.out;
     let out = super::diffs::git_with_input(hub, &["-C", path, "patch-id", "--verbatim"], patch).await.ok()?;
     let id = String::from_utf8_lossy(&out).split_whitespace().next().map(str::to_owned)?;
-    let mut k = kept.lock();
-    if k.len() >= PATCH_IDS_KEPT {
-        k.clear();
-    }
-    k.insert(commit.to_owned(), id.clone());
+    kept.update(|k| {
+        if k.len() >= PATCH_IDS_KEPT {
+            k.clear();
+        }
+        k.insert(commit.to_owned(), id.clone());
+    });
     Some(id)
 }
 

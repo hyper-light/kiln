@@ -1,0 +1,48 @@
+#!/bin/bash
+# kiln-lab's hook (KILN_LAB_HOOK) in goal 9's lab (plan 01a1a87b2cec steps 2 and 4, docs/runtime-lab.md "Goal 9").
+# Every round: as its window ends, each of the server's threads and children with the CPUs it may run on, the one it
+# last ran on, and its scheduling policy and real-time priority (stat's 41st and 40th fields: policy 2 is SCHED_RR, 0
+# the normal class) (affinity.txt), so a round on cores of the server's own shows what shares the shards' cores, and an
+# rt-* round whether its shards took the real-time class. With PERF_ON=1
+# (the driver's profiled rounds), perf records the round's server over its window too: every thread, its call graph by
+# PERF_CALL_GRAPH (DWARF by default: a release build keeps .eh_frame; `fp` for a build with frame pointers), user space only (perf_event_paranoid 2 lets a user profile their own
+# processes). The lab waits for the hook, so perf runs in the background from window-start until window-end stops it.
+#   hook.sh <event> <server pid> <dir>     (PERF_ON; PERF: the perf binary; PERF_LIBS: a folder of its libraries;
+#                                          PERF_CALL_GRAPH: perf record's --call-graph; PERF_FROM: below)
+# PERF_FROM says where perf starts (goal 9, plan 01a1a87b2cec step 3), and it stops as the window ends: `window`, the
+# default, the measured window alone; `fill`, from the fill's start, for what only the fill does (sessions' Open, the
+# owners' first events); `server`, from the server's start, before its runners connect (their Build and ReachHello).
+event=$1 pid=$2 dir=$3
+case "${PERF_FROM:-window}" in
+  server) perf_from=server-up ;;
+  fill) perf_from=fill-start ;;
+  *) perf_from=window-start ;;
+esac
+case "$event" in
+  server-up | fill-start | window-start)
+    if [ "${PERF_ON:-0}" = 1 ] && [ "$event" = "$perf_from" ]; then
+      LD_LIBRARY_PATH=${PERF_LIBS:-${LD_LIBRARY_PATH:-}} nohup "${PERF:-perf}" record -F 499 --call-graph "${PERF_CALL_GRAPH:-dwarf,16384}" -p "$pid" -o "$dir/perf.data" > "$dir/perf.log" 2>&1 &
+      echo $! > "$dir/perf.pid"
+    fi
+    ;;
+  window-end)
+    {
+      for t in /proc/"$pid"/task/*; do
+        # comm, the CPUs it may run on, the CPU it last ran on (stat's 39th field, after the comm's closing parenthesis),
+        # its real-time priority and its policy (the 40th and 41st).
+        stat=$(sed 's/.*) //' "$t/stat" 2>/dev/null)
+        printf '%s %s cpus=%s last=%s policy=%s rtprio=%s\n' "${t##*/}" "$(cat "$t/comm" 2>/dev/null)" "$(awk '/^Cpus_allowed_list:/ {print $2}' "$t/status" 2>/dev/null)" \
+          "$(echo "$stat" | awk '{print $37}')" "$(echo "$stat" | awk '{print $39}')" "$(echo "$stat" | awk '{print $38}')"
+      done
+      for c in $(cat /proc/"$pid"/task/*/children 2>/dev/null); do
+        printf 'child %s %s cpus=%s\n' "$c" "$(cat "/proc/$c/comm" 2>/dev/null)" "$(awk '/^Cpus_allowed_list:/ {print $2}' "/proc/$c/status" 2>/dev/null)"
+      done
+    } > "$dir/affinity.txt" 2>/dev/null
+    if [ -s "$dir/perf.pid" ]; then
+      p=$(cat "$dir/perf.pid")
+      kill -INT "$p" 2>/dev/null
+      for _ in $(seq 300); do kill -0 "$p" 2>/dev/null || break; sleep 0.1; done
+    fi
+    ;;
+esac
+exit 0

@@ -317,6 +317,12 @@ pub async fn wait(hub: &Hub, repo_key: &str, sha: &str, q: &HashMap<String, Stri
                 () = nap => break,
                 m = rx.recv().fuse() => match m {
                     Ok(text) => {
+                        // A verdict's and a run's events alone are parsed: the rest, every agent session's
+                        // change of its info among them, are passed over by their front (goal 4, plan
+                        // 01a1a59c2a9c step 5).
+                        if !crate::wire::events::is_one_of(&text, &["ci_verdict", "run"]) {
+                            continue;
+                        }
                         let v: Value = serde_json::from_str(&text).unwrap_or(Value::Null);
                         heard = match v.get("type").and_then(Value::as_str) {
                             Some("ci_verdict") => v.get("sha").and_then(Value::as_str) == Some(full.as_str()),
@@ -351,6 +357,11 @@ pub async fn verdict_loop(hub: Arc<Hub>) -> anyhow::Result<()> {
             () = hub.shutdown.cancelled().fuse() => return Ok(()),
             m = rx.recv().fuse() => match m {
                 Ok(text) => {
+                    // A run's events alone are parsed: the rest, every agent session's change of its info
+                    // among them, are passed over by their front (goal 4, plan 01a1a59c2a9c step 5).
+                    if !crate::wire::events::is_one_of(&text, &["run"]) {
+                        continue;
+                    }
                     let v: Value = serde_json::from_str(&text).unwrap_or(Value::Null);
                     if v.get("type").and_then(Value::as_str) != Some("run") {
                         continue;

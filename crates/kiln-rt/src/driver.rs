@@ -210,6 +210,15 @@ pub trait Driver {
     /// can tell without a syscall (an idle loop skips the wait when this is false).
     fn has_pending(&self) -> bool;
 
+    /// The kicks this driver's waits have taken so far: each a `wait` whose events held the kick (the
+    /// eventfd's, kqueue's `EVFILT_USER`, IOCP's kick packet, the simulation's flag), however many senders
+    /// it took to make it. The shard reads it either side of a park's wait, to tell a wake by a kick from
+    /// one by I/O or by its deadline (kiln's goal 9, plan 01a1a87b2cec step 5: what wakes cost a shard). A
+    /// driver that can't tell (a test double's) says 0, and its kicked waits count as the others.
+    fn kicks_taken(&self) -> u64 {
+        0
+    }
+
     /// The clock the shard's tasks read: the one [`Driver::now_ns`] reads, live.
     fn clock(&self) -> Clock {
         Clock::Published

@@ -82,6 +82,25 @@ impl Routes {
         }
     }
 
+    /// [`Routes::observe`]'s wait alone, for work whose time taken is told once it and others are done
+    /// ([`Routes::observe_took`]): a live frame fed to a viewer's socket with the rest of its batch, all
+    /// written at once (goal 9, plan 01a1a87b2cec step 5).
+    pub fn observe_wait(&self, class: Class, wait: Duration) {
+        if let Some(h) = self.wait.get(class.index()) {
+            h.observe(wait.as_secs_f64());
+        }
+    }
+
+    /// [`Routes::observe`]'s time taken alone, for `n` pieces of `class`'s work done at once, each taking
+    /// `took`: a batch of frames written with one write.
+    pub fn observe_took(&self, class: Class, took: Duration, n: u64) {
+        if let Some(h) = self.took.get(class.index()) {
+            for _ in 0..n {
+                h.observe(took.as_secs_f64());
+            }
+        }
+    }
+
     /// `class`'s histograms: how long its work waited, and took.
     pub fn of(&self, class: Class) -> Option<(&Histogram, &Histogram)> {
         Some((self.wait.get(class.index())?, self.took.get(class.index())?))
@@ -94,9 +113,87 @@ pub fn routes() -> &'static Routes {
     R.get_or_init(Routes::new)
 }
 
+/// The legs of a runner's message's wait, apart (goal 10, plan 01a1a87b2dae step 4: the runner class's wait
+/// was 2.8 ms at p99 with each session's updates taken by the shard that owns its copy, and which leg it
+/// spends that in decides what's cut). On `/metrics` as `kiln_runner_wait_leg_seconds`, beside
+/// `kiln_route_wait_seconds{class="runner"}`, which is their sum for an agent session's update.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RunnerLeg {
+    /// From the network thread handing a frame over to the hub's loop taking it: every frame's.
+    ToLoop,
+    /// From the hub's loop taking an agent session's update to handing it to the inbox of the shard that
+    /// owns the session's copy: its frame read, its channel item's place checked, what it carries read.
+    InLoop,
+    /// From that hand-over to the owner taking the update: the wait for room in its inbox, then for the
+    /// owner, on its own shard.
+    ToOwner,
+}
+
+impl RunnerLeg {
+    pub const ALL: [RunnerLeg; 3] = [RunnerLeg::ToLoop, RunnerLeg::InLoop, RunnerLeg::ToOwner];
+
+    pub fn name(self) -> &'static str {
+        match self {
+            RunnerLeg::ToLoop => "to_loop",
+            RunnerLeg::InLoop => "in_loop",
+            RunnerLeg::ToOwner => "to_owner",
+        }
+    }
+
+    fn index(self) -> usize {
+        match self {
+            RunnerLeg::ToLoop => 0,
+            RunnerLeg::InLoop => 1,
+            RunnerLeg::ToOwner => 2,
+        }
+    }
+}
+
+/// Each leg's histogram, in [`RunnerLeg::ALL`]'s order, to the microsecond below a few milliseconds as the
+/// shards' delay is (`crate::shard_health::DELAY_BUCKETS`): a leg's p99 sits about a millisecond.
+pub struct Legs([Histogram; 3]);
+
+impl Legs {
+    fn new() -> Self {
+        Self(std::array::from_fn(|_| Histogram::new(crate::shard_health::DELAY_BUCKETS)))
+    }
+
+    /// A runner's message spent `took` on `leg`.
+    pub fn observe(&self, leg: RunnerLeg, took: Duration) {
+        if let Some(h) = self.0.get(leg.index()) {
+            h.observe(took.as_secs_f64());
+        }
+    }
+
+    pub fn of(&self, leg: RunnerLeg) -> Option<&Histogram> {
+        self.0.get(leg.index())
+    }
+}
+
+/// The server's.
+pub fn legs() -> &'static Legs {
+    static L: OnceLock<Legs> = OnceLock::new();
+    L.get_or_init(Legs::new)
+}
+
+/// A runner's message spent `took` on `leg`, on the server's histograms.
+pub fn observe_leg(leg: RunnerLeg, took: Duration) {
+    legs().observe(leg, took);
+}
+
 /// Work of `class` that waited `wait` and took `took`, on the server's histograms.
 pub fn observe(class: Class, wait: Option<Duration>, took: Duration) {
     routes().observe(class, wait, took);
+}
+
+/// Work of `class` that waited `wait`, its time taken told once it and others are done ([`observe_took`]).
+pub fn observe_wait(class: Class, wait: Duration) {
+    routes().observe_wait(class, wait);
+}
+
+/// `n` pieces of `class`'s work done at once, each having taken `took`, on the server's histograms.
+pub fn observe_took(class: Class, took: Duration, n: u64) {
+    routes().observe_took(class, took, n);
 }
 
 /// A request's class, by its method and path; `None` for a WebSocket's opening (`upgrade`), whose
@@ -117,6 +214,57 @@ pub fn class_of(method: &Method, path: &str, upgrade: bool) -> Option<Class> {
         _ => crate::ci::api::is_open(&segs),
     };
     Some(if kiln_s_own || !read { api } else { Class::Page })
+}
+
+/// What a request's polls are labeled with for the shards' table of slow polls (`hyper_rt::slow`; goal 9,
+/// plan 01a1a87b2cec step 2): whether it reads or changes, and which of the API's resources it is
+/// (`/api/<resource>`, and the harness's own under `/api/harness/<resource>`), from a fixed set of labels, so
+/// a label costs a match and nothing is kept per request; a WebSocket's opening, a page, kiln's own routes at
+/// the root, and what matches none of them by their kind alone.
+pub fn label_of(method: &Method, path: &str, upgrade: bool) -> &'static hyper_rt::slow::Label {
+    use hyper_rt::slow::Label;
+    static OPEN: Label = Label { name: "websocket open" };
+    static PAGE: Label = Label { name: "page" };
+    static ROOT: Label = Label { name: "read /<kiln's own>" };
+    static OTHER_READ: Label = Label { name: "read /api/<other>" };
+    static OTHER_WRITE: Label = Label { name: "write /api/<other>" };
+    static ROOT_WRITE: Label = Label { name: "write /<other>" };
+    /// Each name's read and write labels, as statics of a `match` arm's own.
+    macro_rules! resources {
+        ($prefix:literal, $of:expr, $read:expr; $($name:literal),* $(,)?) => {
+            match $of {
+                $(Some($name) => {
+                    static READ: Label = Label { name: concat!("read /api/", $prefix, $name) };
+                    static WRITE: Label = Label { name: concat!("write /api/", $prefix, $name) };
+                    Some(if $read { &READ } else { &WRITE })
+                })*
+                _ => None,
+            }
+        };
+    }
+    if upgrade {
+        return &OPEN;
+    }
+    let read = *method == Method::GET || *method == Method::HEAD;
+    let mut segs = path.split('/').filter(|s| !s.is_empty());
+    let (first, second, third) = (segs.next(), segs.next(), segs.next());
+    if first != Some("api") {
+        return match (read, class_of(method, path, false)) {
+            (true, Some(Class::Page)) => &PAGE,
+            (true, _) => &ROOT,
+            (false, _) => &ROOT_WRITE,
+        };
+    }
+    let label = if second == Some("harness") && third.is_some() {
+        resources!("harness/", third, read; "agents", "broadcast", "changes", "command", "conversations", "files", "history", "kinds", "machines", "sessions", "workspaces")
+    } else {
+        resources!("", second, read;
+            "accounts", "agents", "ai-sessions", "attachments", "audit", "auth", "blobs", "cd", "chaos", "ci", "cluster", "conversations", "custody", "deploy", "diffs",
+            "discovery", "events", "experiments", "front-doors", "harness", "headroom", "hooks", "identities", "incidents", "join", "join-requests", "jobs", "machines", "mcp",
+            "me", "metrics", "observe", "ops", "outposts", "overview", "peers", "places", "plans", "programs", "push", "reach", "repos", "research", "runners", "runs",
+            "settings", "shared", "ship", "sync", "system", "tailscale", "terminal", "trail", "transfers", "updates", "verify", "voice")
+    };
+    label.unwrap_or(if read { &OTHER_READ } else { &OTHER_WRITE })
 }
 
 /// Routes runners and their jobs call: enrolling and their link's tunnel, a job's source and
@@ -154,6 +302,16 @@ pub fn render(o: &mut String) {
     for c in Class::ALL {
         if let Some((_, took)) = r.of(c) {
             took.render(o, "kiln_route_seconds", &format!("class=\"{}\"", c.name()));
+        }
+    }
+    let _ = writeln!(
+        o,
+        "# HELP kiln_runner_wait_leg_seconds A runner's message's wait, by leg: to_loop (to the hub's loop taking its frame, every frame's), in_loop (that loop handing an agent session's update to its owner's inbox), to_owner (that owner taking it).\n# TYPE kiln_runner_wait_leg_seconds histogram"
+    );
+    let l = legs();
+    for leg in RunnerLeg::ALL {
+        if let Some(h) = l.of(leg) {
+            h.render(o, "kiln_runner_wait_leg_seconds", &format!("leg=\"{}\"", leg.name()));
         }
     }
 }
@@ -195,6 +353,27 @@ mod tests {
         assert_eq!(class_of(&get, "/api/harness/sessions/s1/ws", true), None);
     }
 
+    /// Goal 9, plan 01a1a87b2cec step 2: a request's polls are labeled by whether it reads or changes and
+    /// which of the API's resources it is; a page, kiln's own reads at the root, a WebSocket's opening and the
+    /// API's other paths by their kind; the same route is the same label each time.
+    #[test]
+    fn g9_s2_a_request_is_labeled_by_its_route() {
+        let (get, post) = (Method::GET, Method::POST);
+        let name = |m: &Method, p: &str| label_of(m, p, false).name;
+        assert_eq!(name(&get, "/api/harness/sessions/s1/events"), "read /api/harness/sessions");
+        assert_eq!(name(&post, "/api/harness/sessions/s1/command"), "write /api/harness/sessions");
+        assert_eq!(name(&get, "/api/harness"), "read /api/harness");
+        assert_eq!(name(&get, "/api/runners"), "read /api/runners");
+        assert_eq!(name(&post, "/api/mcp"), "write /api/mcp");
+        assert_eq!(name(&get, "/api/nothing-here/x"), "read /api/<other>");
+        assert_eq!(name(&Method::DELETE, "/api/nothing-here"), "write /api/<other>");
+        assert_eq!(name(&get, "/agents/01a19ff6"), "page");
+        assert_eq!(name(&get, "/metrics"), "read /<kiln's own>");
+        assert_eq!(name(&post, "/agents"), "write /<other>");
+        assert_eq!(label_of(&get, "/api/harness/sessions/s1/ws", true).name, "websocket open");
+        assert!(std::ptr::eq(label_of(&get, "/api/runs", false), label_of(&Method::HEAD, "/api/runs/7", false)));
+    }
+
     /// Goal 1, plan 01a1a59c2a68 step 2: what's observed moves its own class's histograms alone.
     #[test]
     fn g1_s2_an_observation_moves_its_own_class_alone() {
@@ -217,5 +396,27 @@ mod tests {
             assert!(o.contains(&format!("kiln_route_seconds_count{{class=\"{}\"}}", c.name())), "{} rendered", c.name());
             assert!(o.contains(&format!("kiln_route_wait_seconds_bucket{{class=\"{}\",le=\"0.00005\"}}", c.name())), "{} rendered", c.name());
         }
+    }
+
+    /// Goal 10, plan 01a1a87b2dae step 4: a runner's message's wait moves its own leg's histogram alone, to the
+    /// microsecond, and each leg is rendered, its family beside the runner class's.
+    #[test]
+    fn g10_s4_a_runners_wait_is_told_apart_by_its_legs() {
+        let l = Legs::new();
+        l.observe(RunnerLeg::InLoop, Duration::from_micros(40));
+        l.observe(RunnerLeg::ToOwner, Duration::from_micros(900));
+        l.observe(RunnerLeg::ToOwner, Duration::from_micros(1100));
+        let counts: Vec<u64> = RunnerLeg::ALL.iter().map(|leg| l.of(*leg).map_or(0, Histogram::count)).collect();
+        assert_eq!(counts, vec![0, 1, 2]);
+        // Finer than a millisecond: 0.9 ms and 1.1 ms land in buckets apart.
+        let at = |bound: f64| l.of(RunnerLeg::ToOwner).and_then(|h| h.cumulative().into_iter().find(|(b, _)| (*b - bound).abs() < 1e-12).map(|(_, n)| n));
+        assert_eq!((at(0.001), at(0.00125)), (Some(1), Some(2)));
+        let mut o = String::new();
+        observe_leg(RunnerLeg::ToLoop, Duration::from_micros(10));
+        render(&mut o);
+        for leg in RunnerLeg::ALL {
+            assert!(o.contains(&format!("kiln_runner_wait_leg_seconds_count{{leg=\"{}\"}}", leg.name())), "{} rendered", leg.name());
+        }
+        assert!(o.contains("kiln_runner_wait_leg_seconds_bucket{leg=\"to_loop\",le=\"0.00001\"}"), "the shards' delay buckets");
     }
 }

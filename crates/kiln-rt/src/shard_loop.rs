@@ -200,6 +200,46 @@ counters! {
     queue_ns_background,
     /// Polls of Background tasks.
     queue_polls_background,
+    /// Parks the shard announced and withdrew without a wait, an inbox already holding work: no system call
+    /// (kiln's goal 9, plan 01a1a87b2cec step 5, what wakes cost a shard; the parks that waited are
+    /// [`Counters::waits`]).
+    parks_withdrawn,
+    /// Driver waits that returned for a kick: a wake or a message from another thread while the shard was
+    /// parked, one kick however many senders woke it ([`crate::driver::Driver::kicks_taken`]).
+    woken_by_kick,
+    /// Driver waits that returned for I/O and no kick: a socket's readiness, a completion.
+    woken_by_io,
+    /// Driver waits that returned for neither: the deadline they waited for (a timer's), or a signal.
+    woken_by_timer,
+    /// Kicks this shard's thread made to parked shards: each a system call here (an eventfd's write, a
+    /// `kevent`, a posted packet), counted by the sender as it claims the park's kick.
+    kicks_sent,
+    /// Wakes and messages sent to this shard that found it running, or its park's kick claimed already: the
+    /// kicks the parking word saved its senders (`crate::parking::Parking::kicks_skipped`), read as the
+    /// counters are taken.
+    kicks_saved,
+    /// Wakes this shard's thread made to tasks of its own through their wakers (a channel's send, a
+    /// broadcast's subscribers, a cell's publisher): each lists the task on this desk.
+    wakes_sent_local,
+    /// Wakes this shard's thread made to tasks of other shards through their wakers: each a bit in the
+    /// target's wake bitmap, and a kick where the target was parked ([`Counters::kicks_sent`]).
+    wakes_sent_foreign,
+    /// Threads this shard's thread unparked: compute pool workers woken for the jobs it queued, a thread waiting
+    /// on what its task published; each a system call here (a futex wake on Linux).
+    threads_woken,
+    /// Readiness registrations the shard made with its driver, a task's wait and a handle armed again for the
+    /// waits left after a fire: each a system call (epoll_ctl, kevent; an AFD poll on Windows).
+    arms,
+    /// Reads of TCP sockets the shard's tasks made (read, readv; recv on Windows): each a system call.
+    socket_reads,
+    /// Of those, the reads that found nothing ready: each a call that brought nothing, and a wait (an arm) after.
+    socket_reads_empty,
+    /// Writes to TCP sockets the shard's tasks made (write, writev; send on Windows): each a system call.
+    socket_writes,
+    /// Of those, the writes that found the send buffer full: a call that sent nothing, and a wait after.
+    socket_writes_full,
+    /// Accepts of TCP connections the shard's listeners made, each a system call, those that found none among them.
+    socket_accepts,
 }
 
 /// Shape: the exponential-forgetting shift of the measured scheduler overrun — an overrun not renewed
@@ -267,7 +307,9 @@ struct Poller {
 #[repr(C)]
 struct Core {
     // First: what a poll, a batch and the input read's test read.
-    tasks: Box<[TaskSlot]>,
+    /// A record for each task slot the desk has made, made as its slot is first asked for (kiln's goal 11:
+    /// room for the shard's task bound is taken as it's built, its pages written only as records are made).
+    tasks: Vec<TaskSlot>,
     /// The configured poll count a step's batch may make (`config.batch`, at least one), kept here so a
     /// batch reads it from the first line rather than from the configuration's.
     batch: usize,
@@ -362,7 +404,7 @@ impl Drop for Shard {
         // actual unwind permits this exceptional classification; ordinary missing
         // ownership is never silently treated as completed service cleanup.
         if std::thread::panicking() {
-            for index in 0..self.core.tasks.len() {
+            for index in 0..self.desk.tasks.made() {
                 let Ok(slot) = u32::try_from(index) else {
                     continue;
                 };
@@ -430,9 +472,7 @@ impl Shard {
         }
         let now_ns = driver.now_ns();
         let core = Core {
-            tasks: (0..config.tasks_per_shard)
-                .map(|_| TaskSlot::empty())
-                .collect(),
+            tasks: Vec::with_capacity(config.tasks_per_shard),
             timers: Wheel::new(config.timer_tick_ns, config.timers_per_shard, now_ns),
             fired: Vec::with_capacity(config.timers_per_shard),
             completions: Vec::with_capacity(config.ring_entries),
@@ -991,6 +1031,7 @@ impl Shard {
             .waiting
             .add(interest.raw, interest.writable, word, interest.ticket)
             .and_then(|wanted| {
+                count(&self.desk.live.arms, 1);
                 self.core
                     .driver
                     .arm(interest.raw, wanted, interests::tag_of(interest.raw))
@@ -1029,6 +1070,9 @@ impl Shard {
             let left = self.core.waiting.fire(raw, fired, |word, ticket| {
                 desk.fire_wait(ticket, Encoded::from_word(word));
             });
+            if !left.is_empty() {
+                count(&desk.live.arms, 1);
+            }
             if !left.is_empty()
                 && let Err(refusal) = self.core.driver.arm(raw, left, interests::tag_of(raw))
             {
@@ -1287,9 +1331,13 @@ impl Shard {
     }
 
     /// The batch's next task: the ring's oldest, or, where only tasks that woke themselves remain, the
-    /// first after the inputs are read again, which lists them behind what those made ready.
+    /// first after the inputs are read again, which lists them behind what those made ready. With classes
+    /// kept, a class goes ahead of less urgent ones while it has run no more than the quantum past the least
+    /// run of them (`crate::queue::LocalQueue::pop_within`, kiln's goal 6): a task's turn, which every other
+    /// task waits for anyway.
     fn next_in_batch(&mut self, at: &mut BatchMark) -> Option<u32> {
-        if let Some(slot) = self.desk.local.pop() {
+        let lead_ns = self.desk.quantum_ns.get();
+        if let Some(slot) = self.desk.local.pop_within(lead_ns) {
             return Some(slot);
         }
         if !self.desk.local.has_yielded() {
@@ -1300,7 +1348,7 @@ impl Shard {
             None => self.carried_now_ns(),
         };
         self.read_inputs_within(at, now);
-        self.desk.local.pop()
+        self.desk.local.pop_within(lead_ns)
     }
 
     /// The inputs read again within the batch at `now_ns`, the step's time from here; where they did work,
@@ -1428,6 +1476,7 @@ impl Shard {
             },
         );
         let Parked::Waited(woken) = parked else {
+            count(&self.desk.live.parks_withdrawn, 1);
             return (false, lost);
         };
         if let Some(woken) = woken {
@@ -1447,7 +1496,7 @@ impl Shard {
     /// invoking step recursively, or waiting for a receiver. Service ownership and
     /// any hard parent's live service children remain until their own Ready.
     fn finish_hard_cancelled(&mut self) {
-        for index in 0..self.core.tasks.len() {
+        for index in 0..self.desk.tasks.made() {
             let Ok(slot) = u32::try_from(index) else {
                 break;
             };
@@ -1649,14 +1698,26 @@ impl Shard {
     }
 
     /// The driver's blocking wait until a kick, a completion or `deadline_ns`, its completions queued; true
-    /// when the driver was lost.
+    /// when the driver was lost. Each wait is counted by what ended it (kiln's goal 9, plan 01a1a87b2cec step 5):
+    /// a kick (the driver's count of them moved), else I/O (completions came), else its deadline.
     fn wait_in_driver(&mut self, deadline_ns: Option<u64>) -> bool {
         count(&self.desk.live.waits, 1);
         if let Some(entry) = self.desk.entry {
             entry.pulse.record_waits(self.desk.live.waits.get());
         }
         let timeout = deadline_ns.map(|d| d.saturating_sub(self.core.driver.now_ns()));
-        let _ = self.receive_completions(timeout);
+        let kicks = self.core.driver.kicks_taken();
+        let harvested = self.receive_completions(timeout);
+        if !self.core.driver_lost {
+            let by = if self.core.driver.kicks_taken() != kicks {
+                &self.desk.live.woken_by_kick
+            } else if harvested {
+                &self.desk.live.woken_by_io
+            } else {
+                &self.desk.live.woken_by_timer
+            };
+            count(by, 1);
+        }
         self.core.driver_lost
     }
 
@@ -1890,9 +1951,10 @@ impl Shard {
         let mut cx = Context::from_waker(&waker);
         self.desk.current.set(word.word());
         self.desk.now_ns.set(start);
-        // Each poll starts within its share (`crate::coop`).
+        // Each poll starts within its share (`crate::coop`), and says what it does afresh (`crate::slow`).
         self.desk.coop_spent.set(false);
         self.desk.coop_charged.set(false);
+        self.desk.label.set(None);
         // Which poll runs, and its task, for the watchdog (`crate::watch`).
         if let Some(entry) = self.desk.entry {
             entry.watch.begin(word.word());
@@ -1933,6 +1995,9 @@ impl Shard {
         } else {
             None
         };
+        if elapsed > crate::slow::SLOW_POLL_NS {
+            self.note_slow(slot, elapsed, matches!(attributed, Some(crate::attribution::Attribution::Preempted)));
+        }
         let Some(poll) = poll else {
             self.unwound(slot, future, word, current);
             return ended;
@@ -2000,6 +2065,16 @@ impl Shard {
         };
         count(sum, waited);
         count(polls, 1);
+    }
+
+    /// A poll of the task in `slot` that held the shard `elapsed`, past `crate::slow::SLOW_POLL_NS`: counted
+    /// against the task's spawn site and the label its code set (kiln's goal 9, plan 01a1a87b2cec step 2), and
+    /// as the host's when the poll was found preempted (`host`; steps 3 and 4).
+    #[cold]
+    fn note_slow(&self, slot: u32, elapsed: u64, host: bool) {
+        if let Some(entry) = self.desk.entry {
+            entry.slow.note(entry.spawned_at(slot), self.desk.label.get(), elapsed, host);
+        }
     }
 
     /// Counts a poll that ran `elapsed` and was `attributed`.
@@ -2289,7 +2364,7 @@ impl Shard {
     }
 
     fn task_mut(&mut self, slot: u32) -> Option<&mut TaskSlot> {
-        self.core.tasks.get_mut(usize::try_from(slot).ok()?)
+        slot_mut(&mut self.core.tasks, slot)
     }
 }
 
@@ -2319,11 +2394,21 @@ pub(crate) fn count(counter: &std::cell::Cell<u64>, by: u64) {
     counter.set(counter.get().saturating_add(by));
 }
 
-fn slot_mut(tasks: &mut [TaskSlot], slot: u32) -> Option<&mut TaskSlot> {
-    tasks.get_mut(usize::try_from(slot).ok()?)
+/// Slot `slot`'s record, made as it's first asked for (kiln's goal 11): every slot below the last asked has its
+/// record (an empty one for a slot never installed), as every slot had one when they were all made up front.
+/// The room taken as the shard was built is its bound: nothing past it is made, nor moved.
+fn slot_mut(tasks: &mut Vec<TaskSlot>, slot: u32) -> Option<&mut TaskSlot> {
+    let index = usize::try_from(slot).ok()?;
+    if index >= tasks.len() {
+        if index >= tasks.capacity() {
+            return None;
+        }
+        tasks.resize_with(index.checked_add(1)?, TaskSlot::empty);
+    }
+    tasks.get_mut(index)
 }
 
-fn link_child(tasks: &mut [TaskSlot], parent: u32, child: u32) {
+fn link_child(tasks: &mut Vec<TaskSlot>, parent: u32, child: u32) {
     let old_first = match slot_mut(tasks, parent) {
         Some(p) => {
             let old = p.first_child;
@@ -2344,7 +2429,7 @@ fn link_child(tasks: &mut [TaskSlot], parent: u32, child: u32) {
     }
 }
 
-fn unlink_child(tasks: &mut [TaskSlot], parent: u32, child: u32) {
+fn unlink_child(tasks: &mut Vec<TaskSlot>, parent: u32, child: u32) {
     let (prev, next) = match slot_mut(tasks, child) {
         Some(c) => {
             let links = (c.prev_sibling, c.next_sibling);
@@ -2369,3 +2454,7 @@ fn unlink_child(tasks: &mut [TaskSlot], parent: u32, child: u32) {
         nx.prev_sibling = prev;
     }
 }
+
+// Kiln's goal 9, plan 01a1a87b2cec step 5: what parks and wakes are counted as.
+#[cfg(test)]
+mod wake_counts;

@@ -125,6 +125,9 @@ pub struct Entry {
     /// The shard thread's id in the kernel (Linux: its `gettid`), recorded as it starts, for the watchdog to read
     /// its state (`/proc/self/task/<tid>/stat`): zero until then and on other platforms.
     os_thread: AtomicU64,
+    /// The shard's polls past `crate::slow::SLOW_POLL_NS`, by spawn site and label: the shard writes it after
+    /// such a poll, any thread reads it (`crate::slow`, kiln's goal 9).
+    pub(crate) slow: crate::slow::SlowTable,
 }
 
 impl Entry {
@@ -169,8 +172,11 @@ impl Entry {
         self.parking.kick_if_parked(|| self.kick_now());
     }
 
-    /// The kick of a park claimed: the driver's, or the owner's thread in driverless cleanup.
+    /// The kick of a park claimed: the driver's, or the owner's thread in driverless cleanup. Counted on the
+    /// shard that sends it, where a shard does (kiln's goal 9, plan 01a1a87b2cec step 5: the system calls a
+    /// shard's thread makes to wake others); a thread off the runtime counts nothing.
     fn kick_now(&self) {
+        let _ = with_current(|sender| crate::shard_loop::count(&sender.live.kicks_sent, 1));
         if self.cleanup_mode.load(Ordering::Acquire) {
             // An unpark retains one permit even before its owner enters park.
             if let Some(owner) = self.cleanup_thread.get() {
@@ -547,6 +553,7 @@ pub(crate) fn register_runtime_slot(
                 .map(|_| AtomicPtr::new(std::ptr::null_mut()))
                 .collect(),
             os_thread: AtomicU64::new(0),
+            slow: crate::slow::SlowTable::default(),
         });
         entry.kick = match kick {
             RegisterKick::Kick(kick) => kick,
@@ -939,6 +946,13 @@ pub fn wake(word: Encoded) {
         if own {
             ctx.wake_local(word.slot());
         }
+        // Counted on the waking shard (kiln's goal 9, plan 01a1a87b2cec step 5): what its tasks' wakes cost it.
+        let sent = if own {
+            &ctx.live.wakes_sent_local
+        } else {
+            &ctx.live.wakes_sent_foreign
+        };
+        crate::shard_loop::count(sent, 1);
         own
     });
     if local == Some(true) {
@@ -954,6 +968,22 @@ pub fn wake(word: Encoded) {
     if landed != Some(true) {
         count_stale(target);
     }
+}
+
+/// Counts one on the counter `of` names among the calling thread's shard's, where it runs one (kiln's goal 9,
+/// plan 01a1a87b2cec step 5: what a shard's thread does that costs it a system call); a thread off the runtime
+/// counts nothing.
+pub(crate) fn count_here(
+    of: impl FnOnce(&crate::shard_loop::LiveCounters) -> &std::cell::Cell<u64>,
+) {
+    let _ = with_current(|ctx| crate::shard_loop::count(of(&ctx.live), 1));
+}
+
+/// Counts a thread the calling thread just unparked on its shard, where it runs one (kiln's goal 9, plan
+/// 01a1a87b2cec step 5: a compute worker woken for its job, a thread waiting on what its task published, each a
+/// system call on the shard); a thread off the runtime counts nothing.
+pub(crate) fn count_thread_woken() {
+    count_here(|live| &live.threads_woken);
 }
 
 /// Counts a wake that found no live consumer (a stale waker, or a holder that exited): a tripwire,

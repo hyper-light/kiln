@@ -12,12 +12,11 @@ use std::sync::{Arc, OnceLock};
 use parking_lot::Mutex;
 use serde_json::Value;
 
-/// Frames kept for a page to resume from. The events broadcast this ring stands beside holds 4096
-/// frames for a socket that falls behind before that socket is told `resync` (`Hub::events`,
-/// `Broadcast::new(4096)`): the ring keeps as many, sharing their text, so a socket that falls
-/// behind is told `resync` exactly when it was before, and a page that was away for no more than
-/// that many frames resumes instead.
-pub const RING: usize = 4096;
+/// The frames the feed keeps: as many as the hub's events ring keeps of its events
+/// ([`crate::hub::EVENTS`]), sharing their text, so a socket that falls behind is told `resync` when
+/// a listener of the ring would be, and a page that was away for no more than that many frames
+/// resumes instead.
+pub const RING: usize = crate::hub::EVENTS;
 
 /// How long a socket that asked for batches gathers frames before it sends them: T3 Code's
 /// `Stream.groupedWithin(512, Duration.millis(50))` (`apps/server/src/ws.ts`, its shell stream).

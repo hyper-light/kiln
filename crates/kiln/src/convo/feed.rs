@@ -151,11 +151,22 @@ const ZIP_QUALITY: u32 = 4;
 /// of the decompressor's, or hashing as much, a few microseconds, well inside a piece.
 const ZIP_BUFFER: usize = 4096;
 
+/// The brotli window a batch of `len` bytes is zipped with, as bits: the smallest that holds it
+/// (`crate::util::brotli_window`), and at most a batch's own size (`BATCH_BYTES`, 2^21 bytes; a row larger
+/// than a batch goes alone, in a batch of its own past it). The decoder on the other side ([`Decoding`]) grows
+/// its ring buffer to the window as the output passes it: at 22 bits for every batch, a batch just past 2 MiB
+/// took a 4 MiB ring buffer, and one being decoded held 5.2 MB of the server's live memory in the lab's
+/// realistic profile (goal 11, plan 01a1a87b2e56 step 5). A window of the batch's size reaches every match
+/// the batch's own bytes offer but those a large row's spill past it, and any brotli decoder reads it.
+fn zip_window(len: usize) -> u32 {
+    crate::util::brotli_window(len).min(BATCH_BYTES.ilog2())
+}
+
 fn zip(bytes: &[u8]) -> anyhow::Result<Vec<u8>> {
     use std::io::Write as _;
     let mut out = Vec::with_capacity(bytes.len() / 4 + 16);
     {
-        let mut w = brotli::CompressorWriter::new(&mut out, ZIP_BUFFER, ZIP_QUALITY, 22);
+        let mut w = brotli::CompressorWriter::new(&mut out, ZIP_BUFFER, ZIP_QUALITY, zip_window(bytes.len()));
         w.write_all(bytes)?;
         w.flush()?;
     }
@@ -230,7 +241,9 @@ impl Shipper {
         // Each commit, as a nudge in the same queue.
         let watch = store.watch();
         let nudge = tx.clone();
-        crate::rt::spawn(async move {
+        // The feed's two tasks on the next shards round-robin, not the one that starts it: a server
+        // starts every feed on the shard its start-up runs on (goal 9, plan 01a1a87b2cec step 3).
+        crate::rt::spawn_spread(async move {
             while watch.recv().await.is_ok() {
                 if nudge.send(Link::Wrote).await.is_err() {
                     break;
@@ -239,7 +252,7 @@ impl Shipper {
         });
         let stats: std::sync::Arc<ShipStats> = std::sync::Arc::default();
         let signs = Signs::default();
-        crate::rt::spawn(ship(store, rx, out_tx, restore, skip, stats.clone(), signs.clone()));
+        crate::rt::spawn_spread(ship(store, rx, out_tx, restore, skip, stats.clone(), signs.clone()));
         (Self { tx, stats, signs }, out_rx)
     }
 
@@ -492,7 +505,7 @@ pub enum Brings {
 /// The taking side: one thread takes what feeds send into a store, in the order each sent it, and
 /// hands back what to answer. The server's takes runners' stores; a mirror's takes the server's.
 pub struct Intake {
-    tx: std::sync::mpsc::SyncSender<(hyper_transport::PeerId, String, Msg, Vec<u8>)>,
+    tx: crate::memory::queue::Sender<Heard>,
     restores: std::sync::Arc<Restores>,
     peers: std::sync::Arc<Peers>,
     signs: Signs,
@@ -501,6 +514,31 @@ pub struct Intake {
 /// Where each store that feeds an intake stands, by its name among the store's peers
 /// ([`peer_name`]): for telemetry.
 type Peers = std::sync::Mutex<HashMap<String, PeerView>>;
+
+/// A feed's message as its intake's thread takes it: the link it came on, its machine, the message, and
+/// the bytes that came with it (a part of a batch).
+type Heard = (hyper_transport::PeerId, String, Msg, Vec<u8>);
+
+impl crate::memory::queue::Weigh for Heard {
+    /// Its place, its machine's and store's names, a batch's hand-on, and the bytes it carries: a batch's
+    /// part (up to [`PART`]) is all of it but those few names (a report's figures counted by its place).
+    fn weight(&self) -> usize {
+        let hand_on = match &self.2 {
+            Msg::Batch { hand_on, .. } => hand_on.as_ref().map_or(0, String::len),
+            Msg::Stats { .. } => size_of::<Report>(),
+            _ => 0,
+        };
+        size_of::<Heard>().saturating_add(self.1.len()).saturating_add(self.2.store().len()).saturating_add(hand_on).saturating_add(self.3.len())
+    }
+}
+
+/// The bytes of messages waiting for an intake's thread, at most (goal 11, plan 01a1a87b2e56 step 3): one
+/// connection's receive window ([`crate::net::WINDOW`]), what the hub's queue of runner events it's handed
+/// from may hold; a feed sends at most [`WINDOW`] batches of [`BATCH_BYTES`] ahead of the server, so it
+/// holds every feed's window for as many feeds as fit in it. Past it a message is dropped, as it was past
+/// 256 messages of any size (up to 768 MiB of parts): its runner, holding the batch until the server has
+/// it, asks again ([`STALL`]). Nothing a person sent is lost.
+pub const HEARD_BYTES: usize = crate::net::WINDOW as usize;
 
 /// What each mirror sent back to restore a store, by the numbers it was written under there: the
 /// feed to that mirror leaves it out, as the mirror has it already, in the copy it sent.
@@ -534,7 +572,7 @@ type Restores = std::sync::Mutex<std::collections::HashSet<String>>;
 impl Intake {
     /// `echoes`: where to note what a mirror's copy brought (the server's intake).
     pub fn start(store: Store, brings: Brings, echoes: Option<std::sync::Arc<Echoes>>) -> anyhow::Result<(Self, async_channel::Receiver<Out>)> {
-        let (tx, rx) = std::sync::mpsc::sync_channel::<(hyper_transport::PeerId, String, Msg, Vec<u8>)>(256);
+        let (tx, rx) = crate::memory::queue::bounded::<Heard>(&crate::memory::owners::FEED_INTAKE, HEARD_BYTES);
         let (out_tx, out_rx) = async_channel::bounded::<Out>(1024);
         let restores: std::sync::Arc<Restores> = std::sync::Arc::default();
         let peers: std::sync::Arc<Peers> = std::sync::Arc::default();
@@ -542,7 +580,7 @@ impl Intake {
         let (restoring, seen, signing) = (restores.clone(), peers.clone(), signs.clone());
         std::thread::Builder::new().name("kiln-convo-intake".into()).spawn(move || {
             let mut taking: HashMap<(hyper_transport::PeerId, String), Taking> = HashMap::new();
-            while let Ok((peer, machine, msg, data)) = rx.recv() {
+            while let Ok((peer, machine, msg, data)) = rx.recv_blocking() {
                 let signer = signing.read().clone();
                 let feed = Feed { store: &store, brings, restores: &restoring, echoes: echoes.as_deref(), peers: &seen, custodian: signer.as_deref() };
                 for m in take(&feed, &mut taking, peer, &machine, msg, data) {
@@ -572,8 +610,8 @@ impl Intake {
     }
 
     /// What runner process `peer` of `machine` sent on the feed's lane, read where its frame was
-    /// (`crate::wire::payload_of`). Never blocks: when the intake is behind, it's dropped (the
-    /// runner asks again, [`STALL`]).
+    /// (`crate::wire::payload_of`). Never blocks: when the intake is behind (its queue holds
+    /// [`HEARD_BYTES`]), it's dropped (the runner asks again, [`STALL`]).
     pub fn heard(&self, peer: hyper_transport::PeerId, machine: &str, msg: Msg, data: Vec<u8>) {
         let _ = self.tx.try_send((peer, machine.to_owned(), msg, data));
     }
@@ -1534,6 +1572,22 @@ mod tests {
         let longest_row = batch.rows.iter().map(|c| serde_json::to_vec(c).map_or(0, |v| v.len())).max().unwrap_or(0);
         anyhow::ensure!(units >= 2 * json.len() / ZIP_BUFFER + batch.rows.len(), "{units} units for {} bytes and {} rows", json.len(), batch.rows.len());
         anyhow::ensure!(biggest <= ZIP_BUFFER.max(longest_row + 2), "a unit of {biggest} bytes");
+        Ok(())
+    }
+
+    /// Goal 11, plan 01a1a87b2e56 step 5: a batch is zipped in a window no larger than it needs and at most a
+    /// batch's size, past which a decoder's ring buffer doesn't grow, and comes back whole: a small batch, one
+    /// of a batch's size, and one a large row took past it.
+    #[test]
+    fn g11_s5_a_batch_is_zipped_in_a_window_of_its_size() -> anyhow::Result<()> {
+        anyhow::ensure!(zip_window(0) == 10 && zip_window(1000) == 10 && zip_window(20_000) == 15);
+        anyhow::ensure!(zip_window(BATCH_BYTES) == 21 && zip_window(3 * BATCH_BYTES) == 21, "at most a batch's size");
+        for len in [1000, BATCH_BYTES, BATCH_BYTES + BATCH_BYTES / 2] {
+            let json: Vec<u8> = (0u64..).map(|i| format!("{{\"seq\":{i},\"text\":\"a line of the agent's {}\"}},", i % 977)).flat_map(String::into_bytes).take(len).collect();
+            let mut back = Vec::new();
+            brotli::BrotliDecompress(&mut zip(&json)?.as_slice(), &mut back)?;
+            anyhow::ensure!(back == json, "{len} bytes came back as {}", back.len());
+        }
         Ok(())
     }
 }

@@ -8,10 +8,10 @@ use std::sync::{Arc, OnceLock};
 
 use kiln_ci::wf::Workflow;
 use kiln_ci::work::graph::{self, Graph};
-use parking_lot::Mutex;
 
 use crate::gitops::{self, LS_REMOTE_TIMEOUT};
 use crate::hub::Hub;
+use crate::rcu::Rcu;
 use crate::store::Repo;
 
 /// The commits whose graphs are kept, newest first.
@@ -20,11 +20,48 @@ const KEPT: usize = 64;
 /// graph isn't read, and `affected()` says it couldn't be.
 const MAX_MANIFESTS: usize = 20_000;
 const MAX_BYTES: usize = 64 << 20;
+/// The graphs kept, in bytes at the most (goal 11, plan 01a1a87b2e56 step 3:
+/// `crate::memory::owners::CI_GRAPHS`): as much as one commit's manifests may be read from
+/// ([`MAX_BYTES`]), each graph counted as its JSON's bytes. Past it the oldest go, the newest kept
+/// whatever it holds: a graph let go is read again from the mirror when a run asks.
+const KEPT_BYTES: usize = MAX_BYTES;
 
-/// (repository id, commit) → its graph, newest first.
-fn kept() -> &'static Mutex<VecDeque<(String, String, Arc<Graph>)>> {
-    static KEPT_GRAPHS: OnceLock<Mutex<VecDeque<(String, String, Arc<Graph>)>>> = OnceLock::new();
-    KEPT_GRAPHS.get_or_init(Mutex::default)
+/// A graph kept: (repository id, commit), the graph, its bytes.
+type Kept = (String, String, Arc<Graph>, usize);
+
+/// (repository id, commit) → its graph, newest first: read without a lock as runs are planned and
+/// the land queue checks its candidates (goal 5, plan 01a1a59c2aae step 2), one read swapped in whole
+/// with the others' pointers (`crate::rcu`).
+fn kept() -> &'static Rcu<VecDeque<Kept>> {
+    static KEPT_GRAPHS: OnceLock<Rcu<VecDeque<Kept>>> = OnceLock::new();
+    KEPT_GRAPHS.get_or_init(|| {
+        crate::memory::owners::CI_GRAPHS.bound_at(KEPT_BYTES);
+        Rcu::default()
+    })
+}
+
+/// `graph` kept as `(repo, sha)`'s, newest: past [`KEPT`] graphs or [`KEPT_BYTES`] of them, the oldest
+/// go. What the kept graphs hold is counted on `/metrics` as it changes.
+fn keep(repo: &str, sha: &str, graph: &Arc<Graph>) {
+    static COUNTED: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    let bytes = size_of::<Graph>().saturating_add(crate::memory::queue::json_bytes(&**graph));
+    let total = kept().update(|k| {
+        if !k.iter().any(|(r, s, _, _)| r == repo && s == sha) {
+            k.push_front((repo.to_owned(), sha.to_owned(), Arc::clone(graph), bytes));
+        }
+        let mut total: usize = k.iter().map(|(_, _, _, b)| *b).fold(0, usize::saturating_add);
+        while k.len() > KEPT || (k.len() > 1 && total > KEPT_BYTES) {
+            let Some((_, _, _, b)) = k.pop_back() else { break };
+            total = total.saturating_sub(b);
+        }
+        total
+    });
+    let before = COUNTED.swap(total, std::sync::atomic::Ordering::AcqRel);
+    if total >= before {
+        crate::memory::owners::CI_GRAPHS.add(total - before);
+    } else {
+        crate::memory::owners::CI_GRAPHS.sub(before - total);
+    }
 }
 
 /// Whether `wf`, or a workflow it calls, may use `affected()`: a run reads its commit's graph only
@@ -53,17 +90,13 @@ pub async fn at(hub: &Hub, repo: &Repo, sha: &str) -> Option<Arc<Graph>> {
 /// queue's candidates and diffs' versions are: docs/ci.md W28-R100). A commit's graph is the same
 /// wherever it's read, so it's kept alike.
 pub async fn at_in(hub: &Hub, repo: &Repo, dir: &str, sha: &str) -> Option<Arc<Graph>> {
-    if let Some(g) = kept().lock().iter().find(|(r, s, _)| *r == repo.id && s == sha).map(|(_, _, g)| Arc::clone(g)) {
+    if let Some(g) = kept().load().iter().find(|(r, s, _, _)| *r == repo.id && s == sha).map(|(_, _, g, _)| Arc::clone(g)) {
         return Some(g);
     }
     match read(hub, dir, sha).await {
         Ok(g) => {
             let g = Arc::new(g);
-            let mut k = kept().lock();
-            if !k.iter().any(|(r, s, _)| *r == repo.id && s == sha) {
-                k.push_front((repo.id.clone(), sha.to_owned(), Arc::clone(&g)));
-                k.truncate(KEPT);
-            }
+            keep(&repo.id, sha, &g);
             Some(g)
         }
         Err(e) => {
@@ -147,6 +180,22 @@ fn parse_batch(mut out: &[u8]) -> HashMap<String, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Goal 11, plan 01a1a87b2e56 step 3: the graphs kept are at most [`KEPT`] and [`KEPT_BYTES`], the
+    /// newest kept, and what they hold shows on `/metrics` as the CI graphs'.
+    #[test]
+    fn g11_s3_the_graphs_kept_are_bounded_and_counted() {
+        let g = Arc::new(Graph::default());
+        for n in 0..(KEPT + 10) {
+            keep("g11-repo", &format!("sha{n}"), &g);
+        }
+        let k = kept().load();
+        assert!(k.len() <= KEPT, "{} kept", k.len());
+        assert!(k.iter().map(|(_, _, _, b)| *b).sum::<usize>() <= KEPT_BYTES);
+        assert!(k.iter().any(|(r, s, _, _)| r == "g11-repo" && *s == format!("sha{}", KEPT + 9)), "the newest kept");
+        assert_eq!(crate::memory::owners::CI_GRAPHS.bound(), Some(KEPT_BYTES));
+        assert!(crate::memory::owners::CI_GRAPHS.bytes() > 0);
+    }
 
     #[test]
     fn w24_r16_manifests_of_a_listing() {

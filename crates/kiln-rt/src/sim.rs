@@ -1133,6 +1133,8 @@ pub struct SimDriver {
     kick: Kick,
     shared: &'static SimShared,
     nops: Vec<u64>,
+    /// The waits that found the kick flag set ([`Driver::kicks_taken`]).
+    kicks_taken: u64,
 }
 
 impl Driver for SimDriver {
@@ -1165,7 +1167,11 @@ impl Driver for SimDriver {
             user_data,
             result: 0,
         }));
-        if self.shared.kicked.swap(false, Ordering::AcqRel) || !out.is_empty() {
+        let kicked = self.shared.kicked.swap(false, Ordering::AcqRel);
+        if kicked {
+            self.kicks_taken = self.kicks_taken.saturating_add(1);
+        }
+        if kicked || !out.is_empty() {
             self.shared
                 .requested_deadline
                 .store(NO_DEADLINE, Ordering::Release);
@@ -1200,6 +1206,10 @@ impl Driver for SimDriver {
 
     fn has_pending(&self) -> bool {
         !self.nops.is_empty() || self.shared.kicked.load(Ordering::Acquire)
+    }
+
+    fn kicks_taken(&self) -> u64 {
+        self.kicks_taken
     }
 
     fn is_sim(&self) -> bool {
@@ -1266,6 +1276,7 @@ impl SimRuntime {
                         kick,
                         shared: flags,
                         nops: Vec::new(),
+                        kicks_taken: 0,
                     }) as Box<dyn Driver>)
                 }
                 _ => Err(RtError::DriverRefused {

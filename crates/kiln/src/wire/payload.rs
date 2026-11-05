@@ -116,7 +116,19 @@ fn message_of(json: &str) -> Option<String> {
 /// `json`, what a message of variant `of` carries on `wire`, read as a `T`: `unknown` for a tag
 /// this build doesn't know, `malformed` for the rest it can't read. The fields of it `T` doesn't
 /// have are taken, counted and said in the log ([`Ignored`]).
+///
+/// On a shard it's read straight into its type, with no JSON tree between, and its unknown fields are
+/// looked for off the shard, by [`checker`]'s thread (goal 9, plan 01a1a87b2cec step 5: looking read each
+/// runner message's JSON into a tree, the type out of that, and the type back into another tree to
+/// compare, on the hub's shard). What can't be read straight is read the way it always was, so it's
+/// refused, and said why, as before.
 pub fn payload<T: DeserializeOwned + Serialize>(wire: Wire, of: &'static str, json: &str) -> Result<T, Box<Unreadable>> {
+    if crate::rt::on_shard()
+        && let Ok(read) = serde_json::from_str::<T>(json)
+    {
+        check_later(wire, of, json, unknown_in::<T>);
+        return Ok(read);
+    }
     let came: Value = serde_json::from_str(json).map_err(|e| {
         Box::new(Unreadable {
             of,
@@ -129,15 +141,94 @@ pub fn payload<T: DeserializeOwned + Serialize>(wire: Wire, of: &'static str, js
     })?;
     let read = T::deserialize(&came).map_err(|e| refused(of, &e))?;
     if let Ok(kept) = serde_json::to_value(&read) {
-        let fields = unknown_fields(&came, &kept);
-        if !fields.is_empty() {
-            let said = ignored_here().lock().note(wire, &fields);
-            for field in said {
-                tracing::info!(wire = wire.name(), of, %field, "a field this build doesn't know, in a message it read: taken (said once an hour for each wire and field)");
-            }
-        }
+        say_unknown(wire, of, &unknown_fields(&came, &kept));
     }
     Ok(read)
+}
+
+/// Counts `fields`, what a message of variant `of` on `wire` carried that this build doesn't know, and
+/// says each in the log that wasn't said within the hour.
+fn say_unknown(wire: Wire, of: &'static str, fields: &[String]) {
+    if fields.is_empty() {
+        return;
+    }
+    let said = ignored_here().lock().note(wire, fields);
+    for field in said {
+        tracing::info!(wire = wire.name(), of, %field, "a field this build doesn't know, in a message it read: taken (said once an hour for each wire and field)");
+    }
+}
+
+/// The fields of `json` that a `T` read of it doesn't keep, as [`payload`] finds them off a shard
+/// ([`unknown_fields`]); none when it isn't a `T`.
+fn unknown_in<T: DeserializeOwned + Serialize>(json: &str) -> Vec<String> {
+    let Ok(came) = serde_json::from_str::<Value>(json) else { return Vec::new() };
+    let Ok(read) = T::deserialize(&came) else { return Vec::new() };
+    serde_json::to_value(&read).map(|kept| unknown_fields(&came, &kept)).unwrap_or_default()
+}
+
+/// A payload read on a shard, for [`checker`]'s thread to look for its unknown fields in (`find`).
+struct Check {
+    wire: Wire,
+    of: &'static str,
+    json: String,
+    find: fn(&str) -> Vec<String>,
+}
+
+/// The most bytes of payloads waiting for [`checker`]'s thread: as many as the hub's loop keeps waiting
+/// from runners (`crate::net::EVENTS_BYTES`), so it falls no further behind than the hub may. Past it, one
+/// is let go unlooked at, counted, and said at each power of two.
+const CHECKS_MOST: usize = crate::net::EVENTS_BYTES;
+
+impl crate::memory::queue::Weigh for Check {
+    /// Its place and its payload's text.
+    fn weight(&self) -> usize {
+        size_of::<Check>().saturating_add(self.json.len())
+    }
+}
+
+/// The payloads let go unlooked at for want of room ([`CHECKS_MOST`]).
+static CHECKS_LET_GO: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Hands a payload read on a shard to [`checker`]'s thread to look for its unknown fields in; where
+/// there's no such thread, they're looked for here, as before.
+fn check_later(wire: Wire, of: &'static str, json: &str, find: fn(&str) -> Vec<String>) {
+    let Some(tx) = checker() else {
+        say_unknown(wire, of, &find(json));
+        return;
+    };
+    match tx.try_send(Check { wire, of, json: json.to_owned(), find }) {
+        Ok(()) => {}
+        Err(async_channel::TrySendError::Full(_)) => {
+            let n = CHECKS_LET_GO.fetch_add(1, std::sync::atomic::Ordering::Relaxed).saturating_add(1);
+            if n.is_power_of_two() {
+                tracing::warn!(let_go = n, "runners' messages weren't looked at for fields this build doesn't know: their checker is behind");
+            }
+        }
+        // Its thread is gone: looked for here.
+        Err(async_channel::TrySendError::Closed(c)) => say_unknown(c.wire, c.of, &(c.find)(&c.json)),
+    }
+}
+
+/// The thread that looks for the unknown fields of payloads read on the shards, started the first time
+/// one is; none where it couldn't start (said so).
+fn checker() -> Option<&'static crate::memory::queue::Sender<Check>> {
+    static TX: OnceLock<Option<crate::memory::queue::Sender<Check>>> = OnceLock::new();
+    TX.get_or_init(|| {
+        let (tx, rx) = crate::memory::queue::bounded::<Check>(&crate::memory::owners::WIRE_CHECKS, CHECKS_MOST);
+        let started = std::thread::Builder::new().name("kiln-wire-check".into()).spawn(move || {
+            while let Ok(c) = rx.recv_blocking() {
+                say_unknown(c.wire, c.of, &(c.find)(&c.json));
+            }
+        });
+        match started {
+            Ok(_) => Some(tx),
+            Err(e) => {
+                tracing::warn!(error = %e, "no thread to look for fields this build doesn't know in runners' messages: looked for on the shards");
+                None
+            }
+        }
+    })
+    .as_ref()
 }
 
 /// Why `T` couldn't be read from what came: a tag it doesn't know is `unknown`, the rest
@@ -272,6 +363,149 @@ pub trait Carries: Sized {
 /// names the type here, matched without a catch-all arm. Read where its frame is read, once.
 pub fn payload_of<M: Carries>(msg: M) -> Result<Carried<M, M::Read>, Box<Unreadable>> {
     msg.read()
+}
+
+/// A runner's frame, as [`read_frame`] read it.
+pub enum Frame {
+    /// It isn't a runner's message this build reads.
+    Unreadable(crate::proto::Unreadable),
+    /// A message that may not come before its runner's Hello, from a runner whose Hello hasn't come: its
+    /// kind (`crate::wire::agent_name`), and nothing it carries read.
+    BeforeHello { what: String },
+    /// A runner's message, what it carries read ([`payload_of`]), and the label of its kind for the shards'
+    /// table of what held them (`crate::wire::agent_label`), for the polls that handle it.
+    Read { label: &'static hyper_rt::slow::Label, carried: Result<Carried<AgentMsg, FromRunner>, Box<Unreadable>> },
+}
+
+/// What reading a runner frame is expected to take, by its length ([`read_frame`]): moving averages of
+/// each frame's bytes and of how long its read took where it ran, nanoseconds (the weight of a new
+/// sample 1/8, as RFC 6298 smooths a round trip). One writer, the hub's loop.
+#[derive(Default)]
+struct Expect {
+    bytes: std::sync::atomic::AtomicU64,
+    ns: std::sync::atomic::AtomicU64,
+}
+
+impl Expect {
+    /// An [`Expect`] with nothing learned.
+    const fn nothing_yet() -> Self {
+        Self { bytes: std::sync::atomic::AtomicU64::new(0), ns: std::sync::atomic::AtomicU64::new(0) }
+    }
+
+    /// Nanoseconds a frame of `len` bytes is expected to take to read: it grows with its length at the
+    /// rate the frames so far were read, not a short one's fixed cost; none expected until one was read.
+    fn expected(&self, len: u64) -> u64 {
+        use std::sync::atomic::Ordering::Relaxed;
+        len.saturating_mul(self.ns.load(Relaxed)).checked_div(self.bytes.load(Relaxed)).unwrap_or(0)
+    }
+
+    /// A frame of `len` bytes took `took` nanoseconds to read, on a shard or off one.
+    fn learn(&self, len: u64, took: u64) {
+        use std::sync::atomic::Ordering::Relaxed;
+        // x ← x + (sample − x)/8, in whole bytes and nanoseconds.
+        let smooth = |avg: u64, sample: u64| if avg == 0 { sample } else { avg - avg / 8 + sample / 8 };
+        self.bytes.store(smooth(self.bytes.load(Relaxed), len), Relaxed);
+        self.ns.store(smooth(self.ns.load(Relaxed), took), Relaxed);
+    }
+}
+
+/// Format: room in [`KIND_COSTS`] for [`AgentMsg`]'s variants by their index on the wire (its table,
+/// `crate::wire::agent_classes`, has 70-some; a test holds it within), a kind past it sharing the rest's.
+const KINDS: usize = 128;
+
+/// What reading a runner's message of each kind is expected to take, as the hub's loop reads frames
+/// ([`read_frame`]) and channel items ([`read_item`]): an [`Expect`] for each of [`AgentMsg`]'s variants (goal
+/// 9, plan 01a1a87b2cec step 3). One for all judged an agent session's update, whose JSON costs much more a
+/// byte, by the many messages that carry bytes (terminal output, streams): mid-sized updates were read on
+/// the shard, up to 2.4 ms each in the lab's g6c2.
+static KIND_COSTS: [Expect; KINDS] = [const { Expect::nothing_yet() }; KINDS];
+
+/// What [`KIND_COSTS`] has no room for: kinds past it, and what doesn't say its kind.
+static REST_COSTS: Expect = Expect::nothing_yet();
+
+/// The kind of runner message `data` holds: its variant's index on the wire, postcard's first varint (up to
+/// a `u32`'s five bytes); [`KINDS`] − 1 for one past the room or that can't be read.
+fn kind_of(data: &[u8]) -> usize {
+    let mut index: u64 = 0;
+    for (i, b) in data.iter().take(5).enumerate() {
+        index |= u64::from(b & 0x7f) << (7 * i);
+        if b & 0x80 == 0 {
+            return usize::try_from(index).map_or(KINDS - 1, |k| k.min(KINDS - 1));
+        }
+    }
+    KINDS - 1
+}
+
+/// What reading `data`, a runner's message, is expected to take, by its kind ([`KIND_COSTS`]).
+fn costs_of(data: &[u8]) -> &'static Expect {
+    KIND_COSTS.get(kind_of(data)).unwrap_or(&REST_COSTS)
+}
+
+/// Reads runner frame `data` (postcard) and what its message carries (JSON, [`payload_of`]); the
+/// latter only for a runner whose Hello has come (`hello`), or for a message that may come before it
+/// (`Hello`, `Instance`, `Machine`). On the shard while that's expected ([`Expect`]) to take less than a
+/// slow poll (`hyper_rt::slow::SLOW_POLL_NS`), else on the compute pool, the caller waiting either way, so
+/// its messages are still taken in order (goal 9, plan 01a1a87b2cec step 3: the hub's net loop read
+/// runners' frames on its shard, holding it up to 76 ms).
+pub async fn read_frame(data: Vec<u8>, hello: bool) -> Frame {
+    read_frame_by(costs_of(&data), data, hello).await
+}
+
+/// A runner's channel item (`crate::wire::channel::Frame::Item`), as [`read_item`] read it.
+pub enum Item {
+    /// The message it carries isn't one this build reads.
+    Unreadable(crate::proto::Unreadable),
+    /// The message it carries, what that carries read ([`payload_of`]), and the label of its kind for the
+    /// shards' table of what held them (`crate::wire::agent_label`).
+    Read { label: &'static hyper_rt::slow::Label, carried: Result<Carried<AgentMsg, FromRunner>, Box<Unreadable>> },
+}
+
+/// Reads the message channel item `body` carries, and what that carries, as [`read_frame`] reads a frame: on
+/// the shard while that's expected to take less than a slow poll, else on the compute pool, the caller
+/// waiting either way, so the items are still taken in order (goal 9, plan 01a1a87b2cec step 3: the channel
+/// carries most of what a runner sends, its sessions' updates among it, which the hub read on its shard
+/// whatever their length; the lab's s7c had its loop's polls under that label held up to 28 ms). An item
+/// comes after its runner's Hello.
+pub async fn read_item(body: Vec<u8>) -> Item {
+    match read_frame_by(costs_of(&body), body, true).await {
+        Frame::Read { label, carried } => Item::Read { label, carried },
+        Frame::Unreadable(e) => Item::Unreadable(e),
+        // Read as after its Hello, so none comes before it; said as what it would be.
+        Frame::BeforeHello { what } => Item::Unreadable(crate::proto::Unreadable::Malformed { variant: None, why: format!("{what}, before its runner's Hello") }),
+    }
+}
+
+/// [`read_frame`] by what `expect` learned. A read is timed where it runs, so one off the shard teaches
+/// it too: else one slow sample (a preempted read) could send every frame of a runner sending only long
+/// ones off the shard for good, none read on it to bring the expectation back down.
+async fn read_frame_by(expect: &Expect, data: Vec<u8>, hello: bool) -> Frame {
+    let len = u64::try_from(data.len()).unwrap_or(u64::MAX);
+    let (frame, took) = if expect.expected(len) > hyper_rt::slow::SLOW_POLL_NS {
+        match crate::rt::compute(move || timed(|| read_now(&data, hello))).await {
+            Ok(read) => read,
+            Err(e) => return Frame::Unreadable(crate::proto::Unreadable::Malformed { variant: None, why: format!("it couldn't be read off the shard: {e:#}") }),
+        }
+    } else {
+        timed(|| read_now(&data, hello))
+    };
+    expect.learn(len, took);
+    frame
+}
+
+/// `read()`'s frame, and how long it took, nanoseconds.
+fn timed(read: impl FnOnce() -> Frame) -> (Frame, u64) {
+    let began = Instant::now();
+    let frame = read();
+    (frame, u64::try_from(began.elapsed().as_nanos()).unwrap_or(u64::MAX))
+}
+
+/// [`read_frame`]'s work, where it runs.
+fn read_now(data: &[u8], hello: bool) -> Frame {
+    match crate::proto::read_agent(data) {
+        Err(e) => Frame::Unreadable(e),
+        Ok(msg) if !hello && !matches!(msg, AgentMsg::Hello(_) | AgentMsg::Instance(_) | AgentMsg::Machine { .. }) => Frame::BeforeHello { what: super::agent_name(&msg).to_owned() },
+        Ok(msg) => Frame::Read { label: super::agent_label(&msg), carried: payload_of(msg) },
+    }
 }
 
 /// An answer by `req` to something the server asked a runner ([`AgentMsg::Answer`],
@@ -966,6 +1200,92 @@ mod tests {
             anyhow::ensure!(told, "the runner is told: {:?}", hub.sent.lock());
             let kept = hub.refusals.load().kept(&Page::Runner("fedora".into())).map(crate::wire::unread::Kept::total);
             anyhow::ensure!(kept == Some(1), "kept for the runner's page: {kept:?}");
+            Ok(())
+        })
+    }
+
+    /// A runner's frame read off the shard teaches what reading one is expected to take, as one read on
+    /// it does: one slow read can't keep a runner's long frames off the shard for good (goal 9, plan
+    /// 01a1a87b2cec step 3).
+    #[test]
+    fn g9_s3_frames_read_off_the_shard_teach_the_expectation() -> anyhow::Result<()> {
+        crate::rt::block_on(async {
+            let data = crate::proto::encode(&AgentMsg::TermOutput { session: "s1".into(), data: vec![7; 4096] })?;
+            let len = u64::try_from(data.len())?;
+            // As if one read of a frame this long had taken a second: each like it is expected slow, so
+            // read off the shard.
+            let expect = Expect::default();
+            expect.learn(len, 1_000_000_000);
+            anyhow::ensure!(expect.expected(len) > hyper_rt::slow::SLOW_POLL_NS, "expected slow");
+            for _ in 0..64 {
+                let frame = read_frame_by(&expect, data.clone(), true).await;
+                anyhow::ensure!(matches!(frame, Frame::Read { carried: Ok(_), .. }), "the frame is read");
+            }
+            // Each read off the shard took its eighth of the averages: (7/8)^64 of the second is 0.19 ms,
+            // plus what the reads took; a hundred milliseconds leaves a debug build's reads plenty of room.
+            let left = expect.expected(len);
+            anyhow::ensure!(left < 100_000_000, "still expected to take {left} ns");
+            Ok(())
+        })
+    }
+
+    /// Goal 9, plan 01a1a87b2cec step 3: a channel item is read as a frame is, the message it carries labeled by
+    /// its kind; a channel frame inside one comes back as itself, for the hub to refuse; bytes that aren't a
+    /// message are unreadable.
+    #[test]
+    fn g9_s3_a_channel_item_is_read_as_a_frame_is() -> anyhow::Result<()> {
+        crate::rt::block_on(async {
+            let term = crate::proto::encode(&AgentMsg::TermOutput { session: "s1".into(), data: vec![1, 2, 3] })?;
+            match read_item(term).await {
+                Item::Read { label, carried: Ok(Carried::Nothing(AgentMsg::TermOutput { .. })) } => anyhow::ensure!(label.name.contains("TermOutput"), "labeled {}", label.name),
+                _ => anyhow::bail!("not read as the message it carries"),
+            }
+            let nested = crate::proto::encode(&AgentMsg::Wire(crate::wire::channel::Frame::Want { stream: "s".into(), from: 1 }))?;
+            anyhow::ensure!(matches!(read_item(nested).await, Item::Read { carried: Ok(Carried::Nothing(AgentMsg::Wire(_))), .. }), "a channel frame inside one comes back as itself");
+            anyhow::ensure!(matches!(read_item(vec![0xff; 4]).await, Item::Unreadable(_)), "bytes that aren't a message");
+            Ok(())
+        })
+    }
+
+    /// Goal 9, plan 01a1a87b2cec step 3: what reading a runner's message is expected to take is kept for each kind
+    /// apart, by its variant's index on the wire; a kind past the room, and bytes that don't say one, share the
+    /// last; and the room holds every kind there is.
+    #[test]
+    fn g9_s3_each_kind_of_message_has_its_own_expectation() -> anyhow::Result<()> {
+        let term = |session: &str| crate::proto::encode(&AgentMsg::TermOutput { session: session.into(), data: vec![0; 64] });
+        let harness = crate::proto::encode(&AgentMsg::Harness { session: "s".into(), json: "{}".into() })?;
+        anyhow::ensure!(!std::ptr::eq(costs_of(&term("s")?), costs_of(&harness)), "each kind its own");
+        anyhow::ensure!(std::ptr::eq(costs_of(&term("s")?), costs_of(&term("t")?)), "a kind's own, each time");
+        anyhow::ensure!(kind_of(&[0x05]) == 5 && kind_of(&[0x81, 0x01]) == (KINDS - 1).min(129), "postcard's varint");
+        anyhow::ensure!(kind_of(&[0xff, 0xff, 0xff, 0xff, 0x0f]) == KINDS - 1 && kind_of(&[]) == KINDS - 1, "past the room, or none: the last");
+        anyhow::ensure!(crate::wire::agent_classes().len() <= KINDS, "room for every kind: {}", crate::wire::agent_classes().len());
+        Ok(())
+    }
+
+    /// Goal 9, plan 01a1a87b2cec step 5: on a shard a payload is read straight into its type, and comes out
+    /// as it does off one: the same value, a field given twice read as before (its last), the same refusal
+    /// of what can't be read. Its unknown fields are still counted, by the checker's thread.
+    #[test]
+    fn g9_s5_a_payload_read_on_a_shard_is_read_as_off_one() -> anyhow::Result<()> {
+        #[derive(Debug, PartialEq, Serialize, serde::Deserialize)]
+        struct Two {
+            a: u32,
+            #[serde(default, skip_serializing_if = "Option::is_none")]
+            b: Option<String>,
+        }
+        const CASES: [&str; 6] = [r#"{"a":1,"b":"x"}"#, r#"{"a":1,"a":2}"#, r#"{"a":"one"}"#, r#"{"a":1"#, "", r#"{"a":1,"new":[1],"empty":null}"#];
+        let wire = Wire::StreamDown;
+        let off: Vec<Result<Two, Box<Unreadable>>> = CASES.iter().map(|j| payload::<Two>(wire, "Two", j)).collect();
+        let before = crate::metrics::wire().ignored.get(&[wire.name()]);
+        crate::rt::block_on(async move {
+            let on: Vec<Result<Two, Box<Unreadable>>> = CASES.iter().map(|j| payload::<Two>(wire, "Two", j)).collect();
+            anyhow::ensure!(on == off, "on a shard {on:?}, off one {off:?}");
+            // `new` came with something in it (`empty` didn't): counted once its thread has looked.
+            let deadline = Instant::now() + Duration::from_secs(30);
+            while crate::metrics::wire().ignored.get(&[wire.name()]).saturating_sub(before) < 1 {
+                anyhow::ensure!(Instant::now() < deadline, "the unknown field read on a shard wasn't counted");
+                crate::rt::sleep(Duration::from_millis(5)).await;
+            }
             Ok(())
         })
     }

@@ -20,6 +20,7 @@ use std::cell::Cell;
 use std::task::Poll;
 
 use crate::cells::{CellRing, CellStack};
+use crate::slab::Slab;
 use crate::error::RtError;
 use crate::mem::Encoded;
 use crate::queue::LocalQueue;
@@ -379,16 +380,23 @@ pub struct ShardContext {
     /// goes on whatever its time, so each poll makes at least one operation. The loop clears it as each poll
     /// begins.
     pub(crate) coop_charged: Cell<bool>,
+    /// What the task being polled says it is doing ([`crate::futures::label`]), for the shard's table of slow
+    /// polls (`crate::slow`, kiln's goal 9). The loop clears it as each poll begins.
+    pub(crate) label: Cell<Option<&'static crate::slow::Label>>,
     // The second: the run queue, and the counters a poll counts (`LiveCounters` leads with them).
     /// The local run queue.
     pub(crate) local: LocalQueue,
     /// The loop's counters, which it counts here in place (`crate::shard_loop::LiveCounters`).
     pub(crate) live: crate::shard_loop::LiveCounters,
     // What a task asks the loop: the intents and their tables.
-    pub(crate) tasks: Box<[TaskCell]>,
+    /// The task cells, made as they are first needed (kiln's goal 11: [`Slab`]): memory follows the most the
+    /// shard has held, the bound stays its bound.
+    pub(crate) tasks: Slab<TaskCell>,
+    /// Task slots given back, taken before a cell is made.
     pub(crate) free_tasks: CellStack<u32>,
     pub(crate) dirty_tasks: CellRing<u32>,
-    pub(crate) timers: Box<[TimerCell]>,
+    /// The timer cells, made as they are first needed (as `tasks`).
+    pub(crate) timers: Slab<TimerCell>,
     pub(crate) free_timers: CellStack<u32>,
     pub(crate) dirty_timers: CellRing<u32>,
     pub(crate) timer_waiters: CellRing<u32>,
@@ -397,9 +405,12 @@ pub struct ShardContext {
     /// registered and abandoned, and is then held `Abandoned` until the loop has drained — so a push is
     /// never refused and a withdrawal never lost (mantle's final review, finding 2).
     pub(crate) interests: CellRing<Interest>,
-    /// The readiness waits, one slot each, bounded by `interests_per_shard`.
-    waits: Box<[WaitCell]>,
+    /// The readiness waits, one slot each, bounded by `interests_per_shard`, made as they are first needed (as
+    /// `tasks`).
+    waits: Slab<WaitCell>,
     free_waits: CellStack<u32>,
+    /// The generation a task cell starts at when it is made: the registry slot's for this incarnation.
+    generation_base: u32,
     // What admission, the root, the clock's overrun, spawns and the simulation touch.
     /// When the server last served a client's work here, opening the idle window (`note_activity`).
     pub(crate) activity_ns: Cell<Option<u64>>,
@@ -457,72 +468,27 @@ impl ShardContext {
         is_sim: bool,
         clock: crate::driver::Clock,
     ) -> Self {
-        let slot_ids = |count: usize| {
-            (0..count)
-                .rev()
-                .filter_map(|slot| u32::try_from(slot).ok())
-                .collect::<Vec<u32>>()
-        };
-        let task_ids = slot_ids(shape.tasks);
-        let timer_ids = slot_ids(shape.timers);
-        let wait_ids = slot_ids(shape.interests);
         Self {
             id,
             local: LocalQueue::new(shape.tasks),
             frames: crate::frames::Frames::new(shape.tasks),
-            tasks: (0..shape.tasks)
-                .map(|_| TaskCell {
-                    generation: Cell::new(shape.generation_base),
-                    phase: Cell::new(Phase::Free),
-                    outcome: Cell::new(None),
-                    joiner: Cell::new(None),
-                    asks: Cell::new(0),
-                    dirty: Cell::new(false),
-                    incoming: Cell::new(None),
-                    poller: Cell::new(None),
-                    waits_for_timer: Cell::new(false),
-                    service: Cell::new(false),
-                    cancelled: Cell::new(false),
-                    cancel_children: Cell::new(false),
-                    parented: Cell::new(false),
-                })
-                .collect(),
-            free_tasks: CellStack::full_of(task_ids.into_iter()),
+            tasks: Slab::new(shape.tasks),
+            free_tasks: CellStack::new(shape.tasks),
             dirty_tasks: CellRing::new(shape.tasks),
-            timers: (0..shape.timers)
-                .map(|_| TimerCell {
-                    generation: Cell::new(0),
-                    phase: Cell::new(TimerPhase::Free),
-                    deadline_ns: Cell::new(0),
-                    word: Cell::new(0),
-                    dirty: Cell::new(false),
-                })
-                .collect(),
-            free_timers: CellStack::full_of(timer_ids.into_iter()),
+            timers: Slab::new(shape.timers),
+            free_timers: CellStack::new(shape.timers),
             dirty_timers: CellRing::new(shape.timers),
             timer_waiters: CellRing::new(shape.tasks),
             interests: CellRing::new(shape.interests.saturating_mul(2)),
-            waits: (0..shape.interests)
-                .map(|_| WaitCell {
-                    generation: Cell::new(0),
-                    phase: Cell::new(WaitPhase::Free),
-                    refusal: Cell::new(None),
-                    raw: Cell::new(None),
-                    writable: Cell::new(false),
-                    word: Cell::new(None),
-                    group: Cell::new(None),
-                    key: Cell::new(0),
-                    listed: Cell::new(false),
-                    next: Cell::new(NO_WAIT),
-                    last: Cell::new(NO_WAIT),
-                })
-                .collect(),
-            free_waits: CellStack::full_of(wait_ids.into_iter()),
+            waits: Slab::new(shape.interests),
+            free_waits: CellStack::new(shape.interests),
+            generation_base: shape.generation_base,
             asked: Cell::new(false),
             current: Cell::new(NO_TASK),
             accepting: Cell::new(true),
             coop_spent: Cell::new(false),
             coop_charged: Cell::new(false),
+            label: Cell::new(None),
             now_ns: Cell::new(0),
             activity_ns: Cell::new(None),
             activity_noted: Cell::new(false),
@@ -736,6 +702,9 @@ impl ShardContext {
         counters.timer_waits = counters.timer_waits.saturating_add(self.timer_waits.get());
         counters.scheduler_overrun_ns = self.scheduler_overrun_ns.get();
         counters.wake_cost_ns = self.quantum_ns.get();
+        counters.kicks_saved = self
+            .entry
+            .map_or(0, |entry| entry.parking.kicks_skipped());
         counters
     }
 
@@ -852,8 +821,8 @@ impl ShardContext {
         {
             return Err(RtError::ShardGone { shard: self.id });
         }
-        let capacity = self.tasks.len();
-        let Some(slot) = self.free_tasks.pop() else {
+        let capacity = self.tasks.capacity();
+        let Some(slot) = self.free_tasks.pop().or_else(|| self.make_task()) else {
             self.refused_spawns
                 .set(self.refused_spawns.get().saturating_add(1));
             return Err(RtError::TooManyTasks { capacity });
@@ -980,7 +949,7 @@ impl ShardContext {
         if self.driver_lost() {
             return None;
         }
-        let slot = self.free_timers.pop()?;
+        let slot = self.free_timers.pop().or_else(|| self.make_timer())?;
         let cell = self.timer(slot)?;
         cell.phase.set(TimerPhase::Claimed);
         cell.deadline_ns.set(deadline_ns);
@@ -1078,13 +1047,13 @@ impl ShardContext {
             return Err(RtError::DriverLost);
         }
         let owner = self.incarnation.ok_or(RtError::NotOnShardThread)?;
-        let slot = self.free_waits.pop().ok_or(RtError::Capacity {
+        let slot = self.free_waits.pop().or_else(|| self.make_wait()).ok_or(RtError::Capacity {
             what: "readiness waits",
-            bound: self.waits.len(),
+            bound: self.waits.capacity(),
         })?;
         let cell = self.wait_cell(slot).ok_or(RtError::Capacity {
             what: "readiness waits",
-            bound: self.waits.len(),
+            bound: self.waits.capacity(),
         })?;
         cell.phase.set(WaitPhase::Armed);
         cell.raw.set(raw);
@@ -1247,7 +1216,7 @@ impl ShardContext {
             WaitPhase::Armed => return None,
             WaitPhase::Refused => Err(cell.refusal.take().unwrap_or(RtError::Capacity {
                 what: "readiness registrations",
-                bound: self.waits.len(),
+                bound: self.waits.capacity(),
             })),
             WaitPhase::Fired | WaitPhase::Free | WaitPhase::Abandoned => Ok(()),
             // A group's slot is no lone wait's: it reads as fired, and only its group frees it.
@@ -1419,7 +1388,7 @@ impl ShardContext {
             return Ok(None);
         };
         // Bounded: each turn takes one member off the list, which holds at most the table's slots.
-        for _ in 0..self.waits.len() {
+        for _ in 0..self.waits.capacity() {
             let Some((slot, cell)) = self.unlist_first(head) else {
                 return Ok(None);
             };
@@ -1432,7 +1401,7 @@ impl ShardContext {
                 WaitPhase::Fired => Ok(()),
                 WaitPhase::Refused => Err(cell.refusal.take().unwrap_or(RtError::Capacity {
                     what: "readiness registrations",
-                    bound: self.waits.len(),
+                    bound: self.waits.capacity(),
                 })),
                 // Abandoned while listed: its owner is gone.
                 _ => {
@@ -1476,7 +1445,7 @@ impl ShardContext {
         };
         // Bounded: each turn lets one listed member go, of at most the table's slots. Each is fired,
         // refused or abandoned: none is in the loop's table any more.
-        for _ in 0..self.waits.len() {
+        for _ in 0..self.waits.capacity() {
             let Some((slot, cell)) = self.unlist_first(head) else {
                 break;
             };
@@ -1505,7 +1474,7 @@ impl ShardContext {
 
     /// Wait slots held now (a test's view of the table's bound).
     pub fn waits_held(&self) -> usize {
-        self.waits.len().saturating_sub(self.free_waits.len())
+        self.waits.made().saturating_sub(self.free_waits.len())
     }
 
     /// Registers `task` as a poller: the loop wakes it whenever `ready` says so (slates' client rings).
@@ -1544,6 +1513,57 @@ impl ShardContext {
 
     pub(crate) fn task(&self, slot: u32) -> Option<&TaskCell> {
         self.tasks.get(usize::try_from(slot).ok()?)
+    }
+
+    /// A task cell made at the slab's high-water mark, free, at the incarnation's first generation: its slot.
+    /// None at the bound.
+    fn make_task(&self) -> Option<u32> {
+        let made = self.tasks.make(TaskCell {
+            generation: Cell::new(self.generation_base),
+            phase: Cell::new(Phase::Free),
+            outcome: Cell::new(None),
+            joiner: Cell::new(None),
+            asks: Cell::new(0),
+            dirty: Cell::new(false),
+            incoming: Cell::new(None),
+            poller: Cell::new(None),
+            waits_for_timer: Cell::new(false),
+            service: Cell::new(false),
+            cancelled: Cell::new(false),
+            cancel_children: Cell::new(false),
+            parented: Cell::new(false),
+        })?;
+        u32::try_from(made).ok()
+    }
+
+    /// A timer cell made at the slab's high-water mark, free: its slot. None at the bound.
+    fn make_timer(&self) -> Option<u32> {
+        let made = self.timers.make(TimerCell {
+            generation: Cell::new(0),
+            phase: Cell::new(TimerPhase::Free),
+            deadline_ns: Cell::new(0),
+            word: Cell::new(0),
+            dirty: Cell::new(false),
+        })?;
+        u32::try_from(made).ok()
+    }
+
+    /// A wait cell made at the slab's high-water mark, free: its slot. None at the bound.
+    fn make_wait(&self) -> Option<u32> {
+        let made = self.waits.make(WaitCell {
+            generation: Cell::new(0),
+            phase: Cell::new(WaitPhase::Free),
+            refusal: Cell::new(None),
+            raw: Cell::new(None),
+            writable: Cell::new(false),
+            word: Cell::new(None),
+            group: Cell::new(None),
+            key: Cell::new(0),
+            listed: Cell::new(false),
+            next: Cell::new(NO_WAIT),
+            last: Cell::new(NO_WAIT),
+        })?;
+        u32::try_from(made).ok()
     }
 
     pub(crate) fn timer(&self, slot: u32) -> Option<&TimerCell> {

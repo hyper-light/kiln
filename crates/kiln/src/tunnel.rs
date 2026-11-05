@@ -1273,7 +1273,7 @@ mod tests {
             agent.command(Out::Connect { addr: relay.addr() }).await;
 
             let deadline = Instant::now() + Duration::from_secs(20);
-            let next = async |rx: &async_channel::Receiver<NetEvent>| -> anyhow::Result<NetEvent> {
+            let next = async |rx: &crate::memory::queue::Receiver<NetEvent>| -> anyhow::Result<NetEvent> {
                 crate::rt::timeout(deadline.saturating_duration_since(Instant::now()), rx.recv())
                     .await
                     .map_err(|_| anyhow::anyhow!("timed out"))?

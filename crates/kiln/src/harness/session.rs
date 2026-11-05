@@ -542,15 +542,104 @@ impl Info {
     }
 
     /// The parts lists care about changed (activity timestamps aside, the words of what's queued: a
-    /// message edited while it waits changes nothing they show, and what kiln's own were handed).
+    /// message edited while it waits changes nothing they show, and what kiln's own were handed). Field by
+    /// field where each is, neither side copied: both were copied whole for each state a session's owner
+    /// took (goal 4, plan 01a1a59c2a9c step 5: about 1,700 a second in the lab's many-sessions profile).
+    /// Every field is named, so one added to `Info` is said here too, or this doesn't build.
     pub fn differs(&self, o: &Self) -> bool {
-        let strip = |i: &Self| Self { last_activity: 0, queue: Vec::new(), said: Vec::new(), ..i.clone() };
-        strip(self) != strip(o)
+        let Self { id, kind, kind_name, target, name, shell, cwd, tree, created_at, status, title, model, mode, harness_session, approvals, queued, queue: _, said: _, tasks_running, subagents, cost_usd, activity, last_activity: _, exit, goal, objective, summary, doing, epoch, todos_done, todos_total, files_changed, lines_added, lines_removed, context_pct, turn_started, limits, account, plan, left_behind, reach, pause, frozen, perms, room_wait, last_turn, keep_off, held, refused, move_on_limit, move_plan, pause_at, max_subagents, parent, plan_run, helper, subagent, variant_of, no_bypass, workspace } = self;
+        !(*id == o.id
+            && *kind == o.kind
+            && *kind_name == o.kind_name
+            && *target == o.target
+            && *name == o.name
+            && *shell == o.shell
+            && *cwd == o.cwd
+            && *tree == o.tree
+            && *created_at == o.created_at
+            && *status == o.status
+            && *title == o.title
+            && *model == o.model
+            && *mode == o.mode
+            && *harness_session == o.harness_session
+            && *approvals == o.approvals
+            && *queued == o.queued
+            && *tasks_running == o.tasks_running
+            && *subagents == o.subagents
+            && *cost_usd == o.cost_usd
+            && *activity == o.activity
+            && *exit == o.exit
+            && *goal == o.goal
+            && *objective == o.objective
+            && *summary == o.summary
+            && *doing == o.doing
+            && *epoch == o.epoch
+            && *todos_done == o.todos_done
+            && *todos_total == o.todos_total
+            && *files_changed == o.files_changed
+            && *lines_added == o.lines_added
+            && *lines_removed == o.lines_removed
+            && *context_pct == o.context_pct
+            && *turn_started == o.turn_started
+            && *limits == o.limits
+            && *account == o.account
+            && *plan == o.plan
+            && *left_behind == o.left_behind
+            && *reach == o.reach
+            && *pause == o.pause
+            && *frozen == o.frozen
+            && *perms == o.perms
+            && *room_wait == o.room_wait
+            && *last_turn == o.last_turn
+            && *keep_off == o.keep_off
+            && *held == o.held
+            && *refused == o.refused
+            && *move_on_limit == o.move_on_limit
+            && *move_plan == o.move_plan
+            && *pause_at == o.pause_at
+            && *max_subagents == o.max_subagents
+            && *parent == o.parent
+            && *plan_run == o.plan_run
+            && *helper == o.helper
+            && *subagent == o.subagent
+            && *variant_of == o.variant_of
+            && *no_bypass == o.no_bypass
+            && *workspace == o.workspace)
     }
 }
 
-/// Where a session's updates go (the server's registry, or the uplink to it).
-pub type Sink = async_channel::Sender<(String, Update)>;
+/// Where a session's updates go (the server's registry, or the uplink to it): a queue bounded in bytes
+/// (`crate::memory::queue`: the server's own sessions', goal 11, plan 01a1a87b2e56 step 3), or a channel's
+/// sending end (a runner's, which its uplink bounds in bytes, and tests'). Either way a sender waits for
+/// room: nothing is dropped.
+#[derive(Clone, Debug)]
+pub enum Sink {
+    Bounded(crate::memory::queue::Sender<(String, Update)>),
+    Channel(async_channel::Sender<(String, Update)>),
+}
+
+impl Sink {
+    /// Hands an update on, waiting while there's no room for it: an error, with it, once no one takes
+    /// updates any more.
+    pub async fn send(&self, update: (String, Update)) -> Result<(), async_channel::SendError<(String, Update)>> {
+        match self {
+            Sink::Bounded(q) => q.send(update).await,
+            Sink::Channel(c) => c.send(update).await,
+        }
+    }
+}
+
+impl From<crate::memory::queue::Sender<(String, Update)>> for Sink {
+    fn from(q: crate::memory::queue::Sender<(String, Update)>) -> Self {
+        Sink::Bounded(q)
+    }
+}
+
+impl From<async_channel::Sender<(String, Update)>> for Sink {
+    fn from(c: async_channel::Sender<(String, Update)>) -> Self {
+        Sink::Channel(c)
+    }
+}
 
 /// What a session needs from the machine that holds it: where it keeps the files attached to
 /// its messages, how it collects ones that arrived separately (uploaded, or sent in pieces from
@@ -1022,23 +1111,23 @@ pub fn resolve_cwd(cwd: Option<&str>) -> String {
 }
 
 /// Start a session; its updates go to `sink`, tagged with its id.
-pub fn start(id: String, spec: Spec, sink: Sink, on_change: Arc<dyn Fn() + Send + Sync>, files: Files) -> anyhow::Result<Arc<Session>> {
+pub fn start(id: String, spec: Spec, sink: impl Into<Sink>, on_change: Arc<dyn Fn() + Send + Sync>, files: Files) -> anyhow::Result<Arc<Session>> {
     start_seeded(id, spec, sink, on_change, files, None)
 }
 
 /// Go on with a session this process's previous image handed over ([`Session::hand_over`]): its
 /// timeline and state as they were, and its harness process, still running.
-pub fn start_handed(id: String, spec: Spec, sink: Sink, on_change: Arc<dyn Fn() + Send + Sync>, files: Files, h: Box<Handed>) -> anyhow::Result<Arc<Session>> {
+pub fn start_handed(id: String, spec: Spec, sink: impl Into<Sink>, on_change: Arc<dyn Fn() + Send + Sync>, files: Files, h: Box<Handed>) -> anyhow::Result<Arc<Session>> {
     use base64::Engine as _;
     let kind = Kind::get(&h.kind).ok_or_else(|| anyhow::anyhow!("unknown harness {:?}", h.kind))?;
     let h = *h;
     let core = Core::thaw(h.core);
     let adopt = Adopt { process: h.process, adapter: super::kinds::Adapter::thaw(h.adapter), partial: base64::engine::general_purpose::STANDARD.decode(h.partial).unwrap_or_default() };
-    begin(id, spec, kind, core, sink, on_change, files, None, Some(adopt))
+    begin(id, spec, kind, core, sink.into(), on_change, files, None, Some(adopt))
 }
 
 /// Start a session, seeded with what it had on another machine when it moved here.
-pub fn start_seeded(id: String, spec: Spec, sink: Sink, on_change: Arc<dyn Fn() + Send + Sync>, files: Files, seed: Option<Seed>) -> anyhow::Result<Arc<Session>> {
+pub fn start_seeded(id: String, spec: Spec, sink: impl Into<Sink>, on_change: Arc<dyn Fn() + Send + Sync>, files: Files, seed: Option<Seed>) -> anyhow::Result<Arc<Session>> {
     let kind = Kind::get(&spec.kind).ok_or_else(|| anyhow::anyhow!("unknown harness {:?}", spec.kind))?;
     let cwd = resolve_cwd(spec.cwd.as_deref());
     let mut core = Core::new();
@@ -1087,7 +1176,7 @@ pub fn start_seeded(id: String, spec: Spec, sink: Sink, on_change: Arc<dyn Fn() 
     }
     core.state.reach.clone_from(&spec.reach);
     named_ahead(&mut core.meta, kind, spec.model.as_deref());
-    begin(id, spec, kind, core, sink, on_change, files, items, None)
+    begin(id, spec, kind, core, sink.into(), on_change, files, items, None)
 }
 
 /// Harness `kind`'s lists as this machine knows them, for a session's page to name its settings by
@@ -3263,6 +3352,9 @@ async fn drive(s: Arc<Session>, kind: &'static Kind, ctl_rx: async_channel::Rece
                                     Err(e) => tracing::warn!(session = %s.id, error = %format!("{e:#}"), "its git won't sign or push as the agent"),
                                 }
                             }
+                            // Off the cores of a server beside it, and so is everything it starts
+                            // (docs/priority.md, "Legs and agents keep off the server's cores").
+                            crate::os::onto_work_cpus(&mut p);
                             crate::proc::spawn_duplex_in_pool(p, crate::os::contain::Group::of(&s.id)).await
                         }
                         Err(e) => Err(e),
@@ -4117,6 +4209,42 @@ mod tests {
             prompted: std::sync::atomic::AtomicBool::new(false),
         };
         (s, rx)
+    }
+
+    /// Goal 4, plan 01a1a59c2a9c step 5: whether two infos differ in what lists show, compared field by
+    /// field without copying either, is what comparing their copies with the activity time, the queue's
+    /// words and what was said cleared said: every field changed alone, and those three changed together.
+    #[test]
+    fn g4_s5_infos_differ_as_their_copies_did() {
+        let was = |a: &Info, b: &Info| {
+            let strip = |i: &Info| Info { last_activity: 0, queue: Vec::new(), said: Vec::new(), ..i.clone() };
+            strip(a) != strip(b)
+        };
+        let base = Info { id: "s1".into(), kind: "claude".into(), name: "n".into(), cost_usd: 0.25, ..Info::default() };
+        let changes: Vec<(&str, Info)> = vec![
+            ("id", Info { id: "s2".into(), ..base.clone() }),
+            ("name", Info { name: "m".into(), ..base.clone() }),
+            ("status", Info { status: super::super::model::Status::Running, ..base.clone() }),
+            ("queued", Info { queued: 1, ..base.clone() }),
+            ("cost_usd", Info { cost_usd: 0.5, ..base.clone() }),
+            ("summary", Info { summary: "said".into(), ..base.clone() }),
+            ("doing", Info { doing: Some("reading".into()), ..base.clone() }),
+            ("epoch", Info { epoch: 2, ..base.clone() }),
+            ("context_pct", Info { context_pct: Some(40), ..base.clone() }),
+            ("keep_off", Info { keep_off: true, ..base.clone() }),
+            ("no_bypass", Info { no_bypass: true, ..base.clone() }),
+            ("parent", Info { parent: Some("p".into()), ..base.clone() }),
+            ("last_activity", Info { last_activity: 99, ..base.clone() }),
+            ("queue", Info { queue: vec![super::super::queued::Queued::of("q1", "later")], ..base.clone() }),
+            ("all three", Info { last_activity: 7, queue: vec![super::super::queued::Queued::of("q1", "x")], said: vec![super::super::model::Given::default()], ..base.clone() }),
+        ];
+        assert!(!base.differs(&base.clone()), "the same");
+        for (what, other) in &changes {
+            assert_eq!(base.differs(other), was(&base, other), "{what}");
+            assert_eq!(other.differs(&base), was(other, &base), "{what}, the other way");
+        }
+        assert!(changes.iter().filter(|(w, _)| ["last_activity", "queue", "all three"].contains(w)).all(|(_, o)| !base.differs(o)), "what lists don't show");
+        assert!(changes.iter().filter(|(w, _)| !["last_activity", "queue", "all three"].contains(w)).all(|(_, o)| base.differs(o)), "what they show");
     }
 
     fn message(id: &str, text: &str) -> Command {

@@ -1802,6 +1802,10 @@ struct Row {
     /// on each row drawn for the commit works them out too, and a `ship` frame says how they
     /// changed. Unread details cost nothing.
     tracked: std::sync::OnceLock<Tracked>,
+    /// What it holds, in bytes (goal 11, plan 01a1a87b2e56 step 3): its place, its JSON for everyone and
+    /// for those whose turn it is, who they are, and its records, counted as large as the JSON for
+    /// everyone that renders them.
+    bytes: usize,
 }
 
 impl Row {
@@ -1815,7 +1819,9 @@ impl Row {
         if let Some(t) = x.tracked {
             let _ = tracked.set(t);
         }
-        Ok(Self { rec, others, yours, whose: x.whose, kind, host, stand: x.stand, agent: x.agent, moves, tracked })
+        let whose: usize = x.whose.iter().map(|w| size_of::<String>().saturating_add(w.len())).fold(0, usize::saturating_add);
+        let bytes = size_of::<Self>().saturating_add(others.len().saturating_mul(2)).saturating_add(yours.as_ref().map_or(0, String::len)).saturating_add(whose);
+        Ok(Self { rec, others, yours, whose: x.whose, kind, host, stand: x.stand, agent: x.agent, moves, bytes, tracked })
     }
 
     /// Each commit's row of `items`, drawn on the compute pool, a commit a unit of each piece (goal 3,
@@ -1884,6 +1890,16 @@ pub struct ShipCache {
     held: crate::rcu::Rcu<Held>,
     refreshing: std::sync::atomic::AtomicBool,
     cap: usize,
+    /// What its model holds and its bound, as last counted into `crate::memory::owners::SHIP_CACHE`.
+    counted: std::sync::atomic::AtomicUsize,
+    bound: std::sync::atomic::AtomicUsize,
+}
+
+impl Drop for ShipCache {
+    fn drop(&mut self) {
+        crate::memory::owners::SHIP_CACHE.sub(*self.counted.get_mut());
+        crate::memory::owners::SHIP_CACHE.bound_sub(*self.bound.get_mut());
+    }
 }
 
 impl Default for ShipCache {
@@ -1949,7 +1965,34 @@ impl ShipCache {
     }
 
     pub fn with_cap(cap: usize) -> Self {
-        Self { held: crate::rcu::Rcu::default(), refreshing: std::sync::atomic::AtomicBool::new(false), cap: cap.max(1) }
+        Self { held: crate::rcu::Rcu::default(), refreshing: std::sync::atomic::AtomicBool::new(false), cap: cap.max(1), counted: std::sync::atomic::AtomicUsize::new(0), bound: std::sync::atomic::AtomicUsize::new(0) }
+    }
+
+    /// What `h` holds, and its bound (goal 11, plan 01a1a87b2e56 step 3), counted into
+    /// `crate::memory::owners::SHIP_CACHE`: its rows' bytes, and for each repository its count of rows
+    /// at the most ([`CAP`]) as large as its largest row held. Refreshes run one at a time, so this
+    /// counts after each.
+    fn count(&self, h: &Held) {
+        use std::sync::atomic::Ordering;
+        let (mut held, mut bound) = (0usize, 0usize);
+        for repo in h.repos.values() {
+            let (sum, largest) = repo.rows.values().fold((0usize, 0usize), |(s, l), r| (s.saturating_add(r.bytes), l.max(r.bytes)));
+            held = held.saturating_add(sum);
+            bound = bound.saturating_add(largest.saturating_mul(self.cap));
+        }
+        let owner = &crate::memory::owners::SHIP_CACHE;
+        let before = self.counted.swap(held, Ordering::AcqRel);
+        if held >= before {
+            owner.add(held - before);
+        } else {
+            owner.sub(before - held);
+        }
+        let before = self.bound.swap(bound, Ordering::AcqRel);
+        if bound >= before {
+            owner.bound_add(bound - before);
+        } else {
+            owner.bound_sub(before - bound);
+        }
     }
 
     /// Whether the model is older than [`FRESH_MS`] (or not built yet).
@@ -2177,6 +2220,7 @@ impl ShipCache {
         h.built = true;
         h.at_ms = now;
         h.cd = cd;
+        self.count(&h);
         self.held.set(h);
         let mut out: Vec<ShipRows> = said.into_values().collect();
         out.sort_by(|a, b| a.repo.cmp(&b.repo));
@@ -2290,7 +2334,7 @@ async fn runners_seen(hub: &std::sync::Arc<Hub>) -> Vec<RunnerSeen> {
                 .find(|j| j.kind == "runner" && j.target == r.name)
                 .filter(|j| matches!(j.state, crate::updates::JobState::Failed))
                 .map(|j| j.error.clone().unwrap_or_else(|| "the upgrade failed".to_string()));
-            let freeze = hub.instances.lock().newest_wide_caps(&r.name) & crate::proto::CAP_FREEZE != 0;
+            let freeze = hub.instances.load().newest_wide_caps(&r.name) & crate::proto::CAP_FREEZE != 0;
             RunnerSeen { name: r.name, connected: r.connected, commit: r.commit, failed, freeze }
         })
         .collect()
@@ -3641,6 +3685,11 @@ mod tests {
                 compared += same(&store, &cache, now, round).await?;
             }
             assert!(compared >= 400, "memory answered only {compared} times");
+            // Goal 11, plan 01a1a87b2e56 step 3: what the model holds is counted, within its bound (its
+            // repositories' rows at most, each as large as its largest), on /metrics as Ship's cache's.
+            let (held, bound) = (cache.counted.load(std::sync::atomic::Ordering::Acquire), cache.bound.load(std::sync::atomic::Ordering::Acquire));
+            assert!(held > 0 && held <= bound, "{held} held, {bound} its bound");
+            assert!(crate::memory::owners::SHIP_CACHE.bytes() >= held && crate::memory::owners::SHIP_CACHE.bound().is_some_and(|b| b >= bound));
             // Nothing noted is left once applied: one row per commit at most while it waits.
             let left: i64 = store.call(|c| Ok(c.query_row("SELECT COUNT(*) FROM ship_changes", [], |r| r.get(0))?)).await?;
             assert_eq!(left, 0);

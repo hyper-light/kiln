@@ -28,10 +28,18 @@ const STORED_MAX: usize = u16::MAX as usize;
 /// An empty stored block that's final: what ends a stream of pieces that each end on a sync flush.
 const END: [u8; 5] = [1, 0, 0, 0xff, 0xff];
 
+#[cfg(test)]
+thread_local! {
+    /// Segments inflated on this thread (goal 10, plan 01a1a87b2dae step 5's tests: what a read inflated).
+    pub(crate) static INFLATED: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
 /// What a segment holds, inflated again (goal 11 reads an event's text out of its chunk's so): its
 /// raw deflate ended with [`END`], checked against the length and CRC-32 it says it holds.
 pub fn inflate(s: &Segment) -> io::Result<Vec<u8>> {
     use std::io::Read as _;
+    #[cfg(test)]
+    INFLATED.with(|n| n.set(n.get() + 1));
     let mut out = Vec::with_capacity(usize::try_from(s.len).unwrap_or(0));
     flate2::read::DeflateDecoder::new(s.deflated.as_ref().chain(END.as_slice())).read_to_end(&mut out)?;
     if u64::try_from(out.len()).ok() != Some(s.len) || crc32fast::hash(&out) != s.crc {
@@ -42,17 +50,44 @@ pub fn inflate(s: &Segment) -> io::Result<Vec<u8>> {
 
 /// `parts`, one after the other, deflated at `level` into a [`Segment`].
 pub fn deflate<'a>(level: Compression, parts: impl IntoIterator<Item = &'a [u8]>) -> io::Result<Segment> {
-    let mut c = Compress::new(level, false);
-    let mut crc = crc32fast::Hasher::new();
-    let mut out = Vec::new();
-    let mut len = 0u64;
+    let mut d = Deflating::new(level);
     for part in parts {
-        crc.update(part);
-        len = len.saturating_add(u64::try_from(part.len()).unwrap_or(u64::MAX));
-        feed(&mut c, &mut out, part, false)?;
+        d.part(part)?;
     }
-    feed(&mut c, &mut out, &[], true)?;
-    Ok(Segment { deflated: Bytes::from(out), crc: crc.finalize(), len })
+    d.finish()
+}
+
+/// A [`Segment`] made a part at a time, over as many calls as its maker likes ([`deflate`] makes one in
+/// one): the packer's, a sealed chunk an event at a time, giving its compute thread up between any two
+/// (goal 10, plan 01a1a87b2dae step 3: `super::copies`). The parts fed the same way make the same bytes,
+/// however the calls fall.
+pub struct Deflating {
+    c: Compress,
+    crc: crc32fast::Hasher,
+    out: Vec<u8>,
+    len: u64,
+}
+
+impl Deflating {
+    pub fn new(level: Compression) -> Self {
+        Self { c: Compress::new(level, false), crc: crc32fast::Hasher::new(), out: Vec::new(), len: 0 }
+    }
+
+    /// `part`, after the parts before it.
+    pub fn part(&mut self, part: &[u8]) -> io::Result<()> {
+        self.crc.update(part);
+        self.len = self.len.saturating_add(u64::try_from(part.len()).unwrap_or(u64::MAX));
+        feed(&mut self.c, &mut self.out, part, false)
+    }
+
+    /// The segment of the parts fed, flushed to a byte boundary.
+    pub fn finish(mut self) -> io::Result<Segment> {
+        feed(&mut self.c, &mut self.out, &[], true)?;
+        // What it holds and no more: a segment is kept as long as its chunk (goal 11, plan 01a1a87b2e56 step 2),
+        // and the buffer it was deflated into grew by doubling.
+        self.out.shrink_to_fit();
+        Ok(Segment { deflated: Bytes::from(self.out), crc: self.crc.finalize(), len: self.len })
+    }
 }
 
 /// `input` into the compressor `c`, its output appended to `out`; with `sync`, everything it holds
@@ -121,6 +156,17 @@ impl Gzip {
             self.segment(&deflate(level, [bytes])?);
         }
         Ok(())
+    }
+
+    /// What it's made so far that hasn't been taken (its header with the first): a member sent as it's made
+    /// goes out a piece at a time (goal 11, plan 01a1a87b2e56 step 5), [`Gzip::finish`] giving the rest.
+    pub fn take(&mut self) -> Vec<u8> {
+        std::mem::take(&mut self.out)
+    }
+
+    /// The bytes it's made since what was last taken.
+    pub fn made(&self) -> usize {
+        self.out.len()
     }
 
     /// The member: an empty final stored block, then the trailer (the CRC-32 and the length of all it
