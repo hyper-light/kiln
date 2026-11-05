@@ -318,3 +318,82 @@ fn g9_s5_the_os_drivers_kick_ends_a_wait_counted_as_a_kick() {
         ran.try_recv().expect("the woken task ran");
     }
 }
+
+/// A driver whose clock moves only as its waits take the time the test scripts for each, nanoseconds.
+struct Timed {
+    now: u64,
+    takes: Receiver<u64>,
+}
+
+impl Driver for Timed {
+    fn kind(&self) -> DriverKind {
+        DriverKind::Kqueue
+    }
+
+    fn kick_handle(&self) -> Kick {
+        Kick::None
+    }
+
+    fn now_ns(&self) -> u64 {
+        self.now
+    }
+
+    fn wait(&mut self, timeout: Option<u64>, _out: &mut Vec<Completion>) -> Result<(), RtError> {
+        if timeout == Some(0) {
+            return Ok(());
+        }
+        let took = self.takes.recv().map_err(|_| RtError::DriverLost)?;
+        self.now = self.now.saturating_add(took);
+        Ok(())
+    }
+
+    fn submit_nop(&mut self, _user_data: u64) -> Result<(), RtError> {
+        Ok(())
+    }
+
+    fn arm(&mut self, _raw: i32, _want: Readiness, _tag: u64) -> Result<(), RtError> {
+        Ok(())
+    }
+
+    fn has_pending(&self) -> bool {
+        false
+    }
+}
+
+/// Do: park a shard four times, its waits lasting 0.5 µs, 5 µs, 100 µs and 20 ms on the driver's clock. Expect: their
+/// time summed, and each counted under every bound past it (`PARK_BOUNDS_NS`, a histogram's cumulative buckets).
+#[test]
+fn g9_s5_each_wait_is_counted_by_how_long_it_lasted() {
+    let (script, takes) = channel::<u64>();
+    let seed: DriverSeed = Box::new(move |_kick| Ok(Box::new(Timed { now: 0, takes }) as Box<dyn Driver>));
+    let mut rt = LocalRuntime::with_driver(&config(), seed, Kick::None).unwrap();
+    let lasted = [500, 5_000, 100_000, 20_000_000];
+    let before = rt.counters();
+    for took in lasted {
+        script.send(took).unwrap();
+        rt.park(None);
+    }
+    let after = rt.counters();
+    assert_eq!(after.waits - before.waits, 4);
+    assert_eq!(after.parked_ns - before.parked_ns, lasted.iter().sum::<u64>());
+    let under = |c: &Counters| {
+        [
+            c.parks_under_1us,
+            c.parks_under_2us,
+            c.parks_under_4us,
+            c.parks_under_8us,
+            c.parks_under_16us,
+            c.parks_under_32us,
+            c.parks_under_64us,
+            c.parks_under_128us,
+            c.parks_under_256us,
+            c.parks_under_512us,
+            c.parks_under_1024us,
+            c.parks_under_2048us,
+            c.parks_under_4096us,
+            c.parks_under_8192us,
+        ]
+    };
+    let moved: Vec<u64> = under(&after).iter().zip(under(&before)).map(|(a, b)| a - b).collect();
+    assert_eq!(moved, [1, 1, 1, 2, 2, 2, 2, 3, 3, 3, 3, 3, 3, 3], "under 1, 2, 4, ... 8,192 µs");
+}

@@ -1114,6 +1114,25 @@ fn server_numbers(n: &mut BTreeMap<String, f64>, prefix: &str, before: &Scrape, 
         for (cause, v) in slow {
             put(format!("shards.slow_polls_{cause}_per_s"), Some(per_s(v)));
         }
+        // How long their parks lasted, all shards together (goal 9, plan 01a1a87b2cec step 5), where the build says it:
+        // the median and p99, and the share of parks under 16 µs, the first of hyper-rt's bounds (`PARK_BOUNDS_NS`) past
+        // the cheapest wake measured on fedora (a socket's on the waiting thread's own CPU, 12.6 µs at its median:
+        // the wake-2 lab): a spin as long would have served their work sooner than their wakes did.
+        let mut parks: Vec<(f64, f64)> = Vec::new();
+        for sh in &shards {
+            let d = histogram("kiln_shard_park_seconds", &[("shard", sh.as_str())]);
+            if parks.is_empty() {
+                parks = d;
+            } else {
+                for ((_, total), (_, add)) in parks.iter_mut().zip(d) {
+                    *total += add;
+                }
+            }
+        }
+        put("shards.park_p50_us".into(), measure::histogram_quantile(0.5, &parks).map(|v| v * 1e6));
+        put("shards.park_p99_us".into(), measure::histogram_quantile(0.99, &parks).map(|v| v * 1e6));
+        let short = parks.iter().find(|(bound, _)| (*bound - 16e-6).abs() < 1e-12).map(|(_, n)| *n);
+        put("shards.parks_under_16us_share".into(), short.zip(parks.last().map(|(_, n)| *n)).filter(|(_, all)| *all > 0.0).map(|(n, all)| n / all));
         // The most tasks any shard held, where the build says it: what a shard's task slots are sized from
         // (goal 11, plan 01a1a87b2e56 step 3).
         let most = shards.iter().filter_map(|sh| after.get("kiln_shard_tasks_most", &[("shard", sh.as_str())])).reduce(f64::max);
@@ -1432,6 +1451,31 @@ mod tests {
         let mut none = BTreeMap::new();
         per_request_pools(&mut none, &scrape(1.0), &scrape(2.0), 0);
         assert!(none.is_empty(), "no requests, no per-request numbers: {none:?}");
+    }
+
+    /// Goal 9, plan 01a1a87b2cec step 5: how long the shards' parks lasted is reported from their histograms, all
+    /// shards together: the median, the p99, and the share of parks under 16 µs.
+    #[test]
+    fn g9_s5_the_shards_park_times_are_reported_together() {
+        let scrape = |k: f64| {
+            let mut t = String::new();
+            for sh in ["0", "1"] {
+                t.push_str(&format!("kiln_shard_polls_total{{shard=\"{sh}\"}} {}\n", k));
+                // Each shard's window: 10 parks, 2 under 2 µs, 4 under 16 µs, 8 under 128 µs, all under 8,192 µs.
+                for (le, n) in [("0.000001", 0.0), ("0.000002", 2.0), ("0.000004", 2.0), ("0.000008", 2.0), ("0.000016", 4.0), ("0.000032", 4.0), ("0.000064", 4.0), ("0.000128", 8.0), ("0.000256", 8.0), ("0.000512", 8.0), ("0.001024", 8.0), ("0.002048", 8.0), ("0.004096", 9.0), ("0.008192", 10.0), ("+Inf", 10.0)] {
+                    t.push_str(&format!("kiln_shard_park_seconds_bucket{{shard=\"{sh}\",le=\"{le}\"}} {}\n", n * k));
+                }
+            }
+            measure::Scrape::parse(&t)
+        };
+        let mut n = BTreeMap::new();
+        server_numbers(&mut n, "", &scrape(0.0), &scrape(1.0), 60.0);
+        let got = |key: &str| n.get(key).copied();
+        assert!(got("shards.parks_under_16us_share").is_some_and(|v| (v - 0.4).abs() < 1e-9), "{:?}", got("shards.parks_under_16us_share"));
+        // The median of 20 parks, 8 under 16 µs and 16 under 128 µs: between 64 and 128 µs.
+        assert!(got("shards.park_p50_us").is_some_and(|v| (64.0..=128.0).contains(&v)), "{:?}", got("shards.park_p50_us"));
+        // Their p99, of the 2 between 4,096 and 8,192 µs.
+        assert!(got("shards.park_p99_us").is_some_and(|v| (4096.0..=8192.0).contains(&v)), "{:?}", got("shards.park_p99_us"));
     }
 
     #[test]
