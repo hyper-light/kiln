@@ -196,8 +196,11 @@ next hidden (f40). So a newer server serves older pages for a while after every 
 speaks the version `Accepted` names: it sends only kinds whose version is at most that one, and in
 each frame only the fields that version knows (it stops before newer trailing fields). Version N
 serves N-1; a page older than that is refused `TooOld` and told the build to switch to. Version 1
-is the first; the skew rules are held by a test schema with a second version's field and kind
-(`crates/kiln-bp/tests/skew.rs`), so the first real change finds them working.
+is the first; the skew rules are held by a test schema with a second version's fields
+(`crates/kiln-bp/tests/codec.rs`, `older_and_newer_layouts_read_both_ways`) and by opens across
+version pairs (`tests/conn.rs`, builds speaking 3 down to 2 and 2 down to 1), so the first real
+change finds them working. The core takes the versions it speaks from its settings
+(`ServerConfig::version`, `oldest`), and each kind carries the version it came in (`Kind::since`).
 
 ## Requests and answers
 
@@ -263,7 +266,8 @@ dropped. So a page can move to another carrier, or reconnect, without losing or 
 
 Keys: `Num` and `Str` name an item; `Ref(n)` is the n-th `Str` key (from 0) the subscription has
 been sent since its last `Snapshot` or `Resumed`, as MQTT's topic aliases are (f28), so a runner's
-name goes once.
+name goes once. A subscription's table holds at most 4,096 names; past that a `Str` goes whole and
+isn't added, on both sides alike.
 
 A record type has at most 64 fields, numbered by order. Its delta carries only the fields that
 changed from what the subscription was last sent.
@@ -321,7 +325,10 @@ covers its frames.
 What waits for a client is bounded (1 MiB by default). Past the bound, the largest waiting
 subscription lets its waiting changes go and is resumed from what it was last sent (`Resumed` and
 the change log, or a `Snapshot`) once it has room: never an unbounded queue, never a change dropped
-without the page being brought back to the topic's state (f41).
+without the page being brought back to the topic's state (f41). A snapshot under way goes whole,
+as the channel's do (docs/wire.md): the bound holds what waits after it, and a topic's own bounds
+(its change log, the text it keeps for snapshots) hold a snapshot's size. A subscription granted
+credit 0 is held by the connection's credit alone.
 
 ## Compression
 
@@ -339,11 +346,55 @@ Contexts are per trust class (f34): attacker-influenced data never shares a hist
 | ctx | Trust class | What |
 |---|---|---|
 | — | `secret` | never compressed: `Open` (the ticket), `SecretAnswer`; an `Answer` the server doesn't class |
-| 1 | `records` | kiln's records: runs, legs, steps, runners, samples, the queue |
-| 2 | `text` | attacker-influenced text: transcripts, logs, terminal output, repository text, notices |
+| 1 | `records` | kiln's own numbers: samples, the queue, resources changed |
+| 2 | `text` | attacker-influenced text: runs, legs, steps and runners (commit messages, branch and step names are a repository's), transcripts, logs, terminal output, notices |
 
-The core's types keep a secret frame away from every compressor. On a carrier with a stream per
+The core's types keep a secret frame away from every compressor: `compress::Compressible::of` is
+the only way into one, and it refuses `Open`, `SecretAnswer` and every frame of the secret class
+(`tests/compress.rs`; a BREACH-style probe's compressed sizes are the same with and without the
+secret sent, and the same probe against a shared context finds it, 15 B against 18 to 22 B). On a carrier with a stream per
 subscription (WebTransport), a context is per stream as well, since streams don't keep one order.
+
+## Topics
+
+kiln's live data as topics (`crates/kiln/src/bp/`; numbers on the wire, append-only). Access is
+decided once, when a page subscribes, from the topic alone (`kiln::bp::allowed`): each topic is
+scoped to what may see it, so no event is read per connection to decide who may have it.
+
+| Kind | Name | Key | Items | Class | Priority | Trust |
+|---|---|---|---|---|---|---|
+| 1 | `runs` | a repository's name | runs by id (`records::Run`) | state | state | text |
+| 2 | `legs` | a repository's name | legs by id, without steps (`Leg`) | state | state | text |
+| 3 | `steps` | a repository's name | steps by `<leg>.<idx>` (`Step`) | state | state | text |
+| 4 | `runners` | empty | runners by name (`Runner`) | state | state | text |
+| 5 | `samples` | empty | host samples by machine (`Sample`) | telemetry | state | records |
+| 6 | `queue` | empty | one record (`QueueCounts`) | telemetry | state | records |
+| 7 | `changed` | empty, a repository's name, or `person:<name>` | how often each resource changed (`Changed`) | state | state | records |
+| 8 | `events` | empty or a repository's name | events carried as their JSON by number, the newest 256 kept (`Event`) | stream | stream | text |
+| 9 | `session` | an agent session's id | `info`, `meta`, `state.<field>`, `change.<tree>\|<path>`, `files`, events by number (`SessionItem`, streamed text by `Extend`/`Tail`) | stream | interactive | text |
+| 10 | `step_log` | `<leg>/<step>` | the log, by offset | stream | stream | text |
+| 11 | `terminal` | a terminal's id | its output, by offset | stream | interactive | text |
+| 12 | `cd_log` | `<app>/<resource>` | a deployment's log, by offset | stream | stream | text |
+
+Runs, legs, steps and the repository-scoped `events` and `changed` are a person's when they may see
+the repository; `session` when they may see the session; `changed` under `person:<name>` is theirs;
+the rest are the owner's, as on today's events socket (`Narrow`). Every `ServerEvent` kind maps to
+one of these (`kiln::bp::Feed::event`, a match without a catch-all): runs, legs and steps, runners
+and samples, and the queue's counts as typed deltas of only the fields that changed; the "read it
+again" events (`terminals`, `updates`, `places`, `discovery`, `join_requests`, `tailscale`, `push`,
+`peers`, `keep`, `ai_sessions`, `plan_stack`, `inbox`, `program`, `front_door`, `agent_limit`,
+`headroom`, `cd_rollout`) as a counter per resource, merged while they wait; and the events with
+records of their own but no protocol record yet (comments, reviews, diff runs, landings, images,
+verdicts, experiments, previews, conflicts, notices, incidents, deploy plans and the rest) carried as
+their JSON, which either side can grow, until goal 9 gives each its record. `resync` and `refused`
+have none: nothing falls behind into a resync, and an unreadable frame is the protocol's `Unread`.
+
+A record goes field by field (`kiln_bp::wire::Fields`): each field its own encoding, a change only
+the fields that differ (`wire::diff`). The records are kiln-bp's (`crates/kiln-bp/src/records.rs`),
+so the TypeScript codec has readers for them (`fromFields<Name>`, `toFields<Name>` in `gen.ts`).
+Times are Unix milliseconds; a percentage is per mille, a load in hundredths: no floats. A session
+viewed through the topic converges to what its socket's viewer holds for the same frames
+(`kiln::bp::tests`, `a_session_converges_as_its_socket_would`).
 
 ## Liveness
 
