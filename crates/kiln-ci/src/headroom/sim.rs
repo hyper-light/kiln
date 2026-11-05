@@ -250,6 +250,10 @@ fn run(trace: &Trace, mut control: Control, seed: u64) -> Report {
     let mut longest_pause = 0.0f64;
     let mut t = -HISTORY_S;
     let cap = 6.0 * 3600.0;
+    // The kiln server's delay, where the engine watches it too: calm all along (what's in trouble
+    // here is the disk), read every step as the lab read it (a median of 0.195 ms, 12% of reads 2 to
+    // 8 times that).
+    let mut server = Rng(seed ^ 0x5e57_e7de_1a75);
     while t < cap && jobs.iter().any(|j| j.done.is_none()) {
         for (at, bps) in &trace.disk {
             if (*at - t).abs() < DT / 2.0 {
@@ -301,9 +305,14 @@ fn run(trace: &Trace, mut control: Control, seed: u64) -> Report {
                 answers.clear();
             }
             Control::V2(e) => {
+                let mut answers = std::mem::take(&mut answers);
+                if e.targets.iter().any(|t| t.first) {
+                    let noise = if server.next() < 0.12 { (0.8 + 1.3 * server.next()).exp() } else { (0.15 * server.normal()).exp() };
+                    answers.push(("kiln server delay".into(), Answer::Took(195.0 * noise)));
+                }
                 let obs = Observation {
                     now_us: us(t),
-                    answers: std::mem::take(&mut answers),
+                    answers,
                     inflight: probe_out.map(|(s, _)| vec![("disk".to_owned(), (t - s) * 1e6)]).unwrap_or_default(),
                     delivered_bps: Some(delivered),
                     mem_free: m.mem - jobs.iter().filter(|j| j.start.is_some() && j.done.is_none()).map(|j| j.kind.mem).sum::<f64>(),
@@ -422,7 +431,20 @@ fn run(trace: &Trace, mut control: Control, seed: u64) -> Report {
 fn v2() -> Control {
     Control::V2(Box::new(Engine::new(
         Policy { false_alarms_per_day: 1.0, probe_load_share: 0.1 },
-        vec![Target { name: "disk".into(), tolerance_us: TOLERANCE_US, window_us: None }],
+        vec![Target { name: "disk".into(), tolerance_us: TOLERANCE_US, window_us: None, first: false }],
+        Learned::default(),
+        0,
+    )))
+}
+
+/// v2 on a machine whose kiln server runs there too: the server's delay a target that comes first.
+fn v2_beside_the_server() -> Control {
+    Control::V2(Box::new(Engine::new(
+        Policy { false_alarms_per_day: 1.0, probe_load_share: 0.1 },
+        vec![
+            Target { name: "disk".into(), tolerance_us: TOLERANCE_US, window_us: None, first: false },
+            Target { name: "kiln server delay".into(), tolerance_us: 10_000.0, window_us: Some(1e6), first: true },
+        ],
         Learned::default(),
         0,
     )))
@@ -469,6 +491,30 @@ fn the_night_of_10_28() {
         let trace = night();
         let none = run(&trace, Control::None, seed);
         let new = run(&trace, v2(), seed);
+        let ratio = new.work_by(7200.0) / none.work_by(7200.0).max(f64::MIN_POSITIVE);
+        eprintln!("seed {seed}:\n{}\n{}\nwork with v2 / without: {ratio:.4}, longest pause {:.1} s", row(&none), row(&new), new.longest_pause_s);
+        if ratio < 0.99 {
+            failures.push(format!("seed {seed}: v2 did {ratio:.4} of the work no control did"));
+        }
+        if new.longest_pause_s > 2.0 {
+            failures.push(format!("seed {seed}: a job stopped {:.1} s at once", new.longest_pause_s));
+        }
+    }
+    assert!(failures.is_empty(), "{failures:?}");
+}
+
+/// Goal 8 (plan 01a1a59c2b29 step 5): the 10-28 night where the kiln server's delay is a target too
+/// (calm all night). A target that comes first lengthens every hold (a level is held only once a
+/// rise past its calm's noise would have shown), and the disk's trouble, which isn't kiln's, still
+/// doesn't hold kiln's work back: at least 99% of the work no control does, and no job stopped
+/// longer than 2 s at a time.
+#[test]
+fn g8_s5_the_night_of_10_28_beside_a_calm_server() {
+    let mut failures = Vec::new();
+    for seed in [1u64, 2, 3] {
+        let trace = night();
+        let none = run(&trace, Control::None, seed);
+        let new = run(&trace, v2_beside_the_server(), seed);
         let ratio = new.work_by(7200.0) / none.work_by(7200.0).max(f64::MIN_POSITIVE);
         eprintln!("seed {seed}:\n{}\n{}\nwork with v2 / without: {ratio:.4}, longest pause {:.1} s", row(&none), row(&new), new.longest_pause_s);
         if ratio < 0.99 {
@@ -531,4 +577,238 @@ fn trace() {
     for t in traces(1).into_iter().filter(|t| name.is_empty() || t.name == name) {
         eprintln!("{}", row(&run(&t, v2(), 1)));
     }
+}
+
+/// Goal 8's headroom lab on fedora, 2026-11-05 (item2; plan 01a1a59c2b29 step 5, docs/priority.md
+/// "headroom's lab"): the kiln server and a runner's CI legs and agents' turns, CPU hogs all, in one
+/// cgroup on 16 CPUs, the runner's headroom watching the server's delay. The machine below is that
+/// lab's as it measured it; none of it is given to the engine.
+mod lab {
+    use super::*;
+
+    /// The CPUs the server and the hogs shared (16-31); the runner, not pinned, counts all 32.
+    const CPUS: f64 = 16.0;
+    const CORES: f64 = 32.0;
+    /// Calm, the median of what headroom read (the mean lateness of every shard's probes between
+    /// two reads, ~0.5 s apart): 0.195 ms; the geometric mean 0.235 ms, p90 0.65, p99 1.5.
+    const CALM_US: f64 = 195.0;
+    /// The legs: two runs of `legs.yaml`, four jobs of four busy threads each; the agents: four
+    /// turns of sixteen.
+    const LEGS: (usize, f64) = (8, 4.0);
+    const AGENTS: (usize, f64) = (4, 16.0);
+    /// item2b's schedule (item2's, with the hogs ending together and 120 s recorded after).
+    pub const LEGS_AT: f64 = 120.0;
+    pub const AGENTS_AT: f64 = 210.0;
+    pub const END_AT: f64 = 630.0;
+    pub const UNTIL: f64 = 750.0;
+    const DT: f64 = 0.05;
+
+    /// How much later than calm the server runs ready work with `l` runnable hog threads a CPU:
+    /// none while a CPU is free for it, then as the lab measured it, 2.5 times calm with the legs'
+    /// 32 threads (2 a CPU), 4 to 6.4 with the agents' 64 more (6).
+    fn slower(l: f64) -> f64 {
+        1.0 + 1.5 * (l - 1.0).max(0.0).powf(0.75)
+    }
+
+    struct Hog {
+        id: String,
+        threads: f64,
+        from: f64,
+        until: f64,
+        /// The share in force (applied from the pacer's next period) and the one decided.
+        share: f64,
+        next: f64,
+        /// The last whole second's CPU and the share it ran at, as the runner measures them.
+        cpu_acc: f64,
+        share_acc: f64,
+        cpu: f64,
+        ran: f64,
+    }
+
+    /// One answer of the server's delay as headroom read it, and what the engine did then.
+    #[derive(Clone, Debug)]
+    pub struct Read {
+        pub t: f64,
+        pub us: f64,
+        /// The least share of a leg, and of any group, in force (1: none slowed).
+        pub legs: f64,
+        pub least: f64,
+        pub calm_us: Option<f64>,
+    }
+
+    pub fn engine() -> Engine {
+        Engine::new(
+            Policy { false_alarms_per_day: 1.0, probe_load_share: 0.1 },
+            vec![Target { name: "kiln server delay".into(), tolerance_us: 10_000.0, window_us: Some(1e6), first: true }],
+            Learned::default(),
+            0,
+        )
+    }
+
+    pub fn run(mut e: Engine, seed: u64) -> Vec<Read> {
+        let mut rng = Rng(seed);
+        let mut hogs: Vec<Hog> = Vec::new();
+        for (n, (count, threads), from) in [(0, LEGS, LEGS_AT), (1, AGENTS, AGENTS_AT)] {
+            for i in 0..count {
+                hogs.push(Hog { id: format!("{}{i}", if n == 0 { "leg" } else { "agent" }), threads, from, until: END_AT, share: 1.0, next: 1.0, cpu_acc: 0.0, share_acc: 0.0, cpu: 0.0, ran: 1.0 });
+            }
+        }
+        let mut reads = Vec::new();
+        let (mut t, mut next_read, mut every) = (0.0f64, 0.5f64, 0.5f64);
+        let (mut level_sum, mut level_n) = (0.0f64, 0.0f64);
+        let mut second = 0u64;
+        let mut delivered = 200e6;
+        while t < UNTIL {
+            let running: Vec<usize> = hogs.iter().enumerate().filter(|(_, h)| t >= h.from && t < h.until).map(|(i, _)| i).collect();
+            // A whole second: the pacer applies the shares decided, and the runner measures each
+            // group's CPU over it; fedora's other agents write what they write.
+            let s = t.floor() as u64;
+            if s != second {
+                second = s;
+                for h in &mut hogs {
+                    h.cpu = h.cpu_acc;
+                    h.ran = if h.cpu_acc > 0.0 || h.share_acc > 0.0 { h.share_acc } else { 1.0 };
+                    h.cpu_acc = 0.0;
+                    h.share_acc = 0.0;
+                    h.share = h.next;
+                }
+                delivered = 100e6 + 350e6 * rng.next();
+            }
+            // Runnable threads share the CPUs the server leaves (one), each at most a whole CPU.
+            let runnable: f64 = running.iter().filter_map(|i| hogs.get(*i)).map(|h| h.threads * h.share).sum();
+            let each = if runnable > 0.0 { ((CPUS - 1.0) / runnable).min(1.0) } else { 0.0 };
+            for i in &running {
+                if let Some(h) = hogs.get_mut(*i) {
+                    h.cpu_acc += h.threads * h.share * each * DT;
+                    h.share_acc += h.share * DT;
+                }
+            }
+            level_sum += CALM_US * slower(runnable / CPUS);
+            level_n += 1.0;
+            if t >= next_read {
+                // The server's figures since the last read, as its probes measured them.
+                let noise = if rng.next() < 0.12 { (0.8 + 1.3 * rng.next()).exp() } else { (0.15 * rng.normal()).exp() };
+                let us = level_sum / level_n.max(1.0) * noise;
+                level_sum = 0.0;
+                level_n = 0.0;
+                let o = Observation {
+                    now_us: (t * 1e6) as u64,
+                    answers: vec![("kiln server delay".into(), Answer::Took(us))],
+                    delivered_bps: Some(delivered),
+                    mem_free: 40e9,
+                    running: running
+                        .iter()
+                        .filter_map(|i| hogs.get(*i))
+                        .map(|h| Group { id: h.id.clone(), key: h.id.trim_end_matches(char::is_numeric).into(), class: Class::Agent, protected: false, write_bps: 0.0, cpu_cores: h.cpu, mem_bytes: 1e9, share: h.ran })
+                        .collect(),
+                    cores: Some(CORES),
+                    ..Observation::default()
+                };
+                let p = e.step(&o);
+                for h in &mut hogs {
+                    h.next = p.shares.iter().find(|s| s.id == h.id).map_or(1.0, |s| s.share);
+                }
+                let share = |pre: &str| hogs.iter().filter(|h| h.id.starts_with(pre) && t >= h.from && t < h.until).map(|h| h.share).fold(1.0, f64::min);
+                let d = p.status.targets.first();
+                reads.push(Read { t, us, legs: share("leg"), least: share(""), calm_us: d.and_then(|d| d.calm_us) });
+                if std::env::var_os("KILN_SIM_TRACE").is_some() && (!p.events.is_empty() || (t % 10.0) < every) {
+                    let d = e.learned.detectors.get("kiln server delay");
+                    eprintln!(
+                        "t={t:.1} us={us:.0} budget={:?} legs={:.2} least={:.2} calm={:?} spread={:?} hp={:?} settle={:?} every={every:.2} ev={:?}",
+                        p.status.cpu_budget.map(|b| (b * 10.0).round() / 10.0),
+                        share("leg"),
+                        share(""),
+                        d.and_then(|d| d.calm_us()).map(f64::round),
+                        d.and_then(|d| d.spread()).map(|s| (s * 100.0).round() / 100.0),
+                        d.map(|d| (d.past_threshold(1.0) * 100.0).round() / 100.0),
+                        d.map(|d| d.settle_samples(1.0)),
+                        p.events
+                    );
+                }
+                every = p.probe_every_us.get("kiln server delay").map_or(every, |e| e / 1e6);
+                next_read = t + every;
+            }
+            t += DT;
+        }
+        reads
+    }
+
+    /// The geometric mean of what was read from `from` to `to` s.
+    pub fn geo(reads: &[Read], from: f64, to: f64) -> f64 {
+        let v: Vec<f64> = reads.iter().filter(|r| r.t >= from && r.t < to).map(|r| r.us.max(1.0).ln()).collect();
+        if v.is_empty() { 0.0 } else { (v.iter().sum::<f64>() / v.len() as f64).exp() }
+    }
+
+    /// Calm's spread: the standard deviation of log-latency read from `from` to `to` s.
+    pub fn spread(reads: &[Read], from: f64, to: f64) -> f64 {
+        let v: Vec<f64> = reads.iter().filter(|r| r.t >= from && r.t < to).map(|r| r.us.max(1.0).ln()).collect();
+        let n = v.len().max(1) as f64;
+        let m = v.iter().sum::<f64>() / n;
+        (v.iter().map(|x| (x - m) * (x - m)).sum::<f64>() / n).sqrt()
+    }
+}
+
+/// Goal 8 (plan 01a1a59c2b29 step 5): item2, the 11-05 lab, as a trace. The server's delay rises
+/// with the legs and again with the agents; headroom must pace the legs, bring the delay back within
+/// calm's noise and hold it there while the load stays, keep calm what calm was, and let go only
+/// once the load ends. On 11-05 it let go a second after each alarm and the delay sat at 2.5 to 6
+/// times calm for seven minutes, its calm drifting from 0.24 ms to 0.92.
+#[test]
+fn g8_s5_the_11_05_lab_rising_delay_paces_the_legs_and_holds_it_down_until_the_load_ends() {
+    use lab::{AGENTS_AT, END_AT, LEGS_AT, UNTIL};
+    let mut failures = Vec::new();
+    for seed in [1u64, 2, 3] {
+        let reads = lab::run(lab::engine(), seed);
+        // Calm's noise, as this machine's calm read it: within one standard deviation of calm's
+        // log-latency of its geometric mean.
+        let calm = lab::geo(&reads, 10.0, LEGS_AT);
+        let noise = calm * lab::spread(&reads, 10.0, LEGS_AT).exp();
+        let within = |from: f64, to: f64| lab::geo(&reads, from, to) <= noise;
+        // The delay rose with the legs, and the legs were paced.
+        let paced_at = reads.iter().find(|r| r.t >= LEGS_AT && r.legs < 1.0).map(|r| r.t);
+        match paced_at {
+            Some(at) if at - LEGS_AT <= 30.0 => {}
+            _ => failures.push(format!("seed {seed}: the legs weren't paced within 30 s of starting ({paced_at:?})")),
+        }
+        // Held within calm's noise while the load stayed: every 30 s past the first 30 s of each rise.
+        let mut bins = 0;
+        let mut out = Vec::new();
+        let mut from = LEGS_AT + 30.0;
+        while from + 30.0 <= END_AT {
+            if !(from < AGENTS_AT + 30.0 && from + 30.0 > AGENTS_AT) {
+                bins += 1;
+                if !within(from, from + 30.0) {
+                    out.push(format!("{from:.0}-{:.0} s at {:.0} µs", from + 30.0, lab::geo(&reads, from, from + 30.0)));
+                }
+            }
+            from += 30.0;
+        }
+        if out.len() * 5 > bins {
+            failures.push(format!("seed {seed}: calm {calm:.0} µs, its noise to {noise:.0} µs; {} of {bins} loaded stretches past it: {out:?}", out.len()));
+        }
+        // Never let go while the load stayed: from the first cut to the load's end, something paced.
+        if let Some(first) = paced_at {
+            let free: Vec<f64> = reads.iter().filter(|r| r.t > first + 5.0 && r.t < END_AT && r.least >= 1.0).map(|r| r.t).collect();
+            if !free.is_empty() {
+                failures.push(format!("seed {seed}: nothing paced at {} reads while the load stayed (from {:.0} s)", free.len(), free.first().copied().unwrap_or(0.0)));
+            }
+        }
+        // Calm after the load: the delay back within calm's noise, nothing paced.
+        if !within(END_AT + 20.0, UNTIL) {
+            failures.push(format!("seed {seed}: after the load {:.0} µs, calm's noise to {noise:.0}", lab::geo(&reads, END_AT + 20.0, UNTIL)));
+        }
+        // What calm is stays what calm was, through the load and after it.
+        let before = reads.iter().rev().find(|r| r.t < LEGS_AT).and_then(|r| r.calm_us).unwrap_or(0.0);
+        let learned = reads.iter().filter(|r| r.t >= LEGS_AT).filter_map(|r| r.calm_us).fold(0.0, f64::max);
+        if learned > before * 1.2 {
+            failures.push(format!("seed {seed}: calm drifted from {before:.0} µs to {learned:.0}"));
+        }
+        eprintln!(
+            "seed {seed}: calm {calm:.0} µs (noise to {noise:.0}); legs {:.0}; agents {:.0}; recovery {:.0}; first paced at {paced_at:?}; calm learned {before:.0}, at most {learned:.0} after",
+            lab::geo(&reads, LEGS_AT + 30.0, AGENTS_AT),
+            lab::geo(&reads, AGENTS_AT + 30.0, END_AT),
+            lab::geo(&reads, END_AT + 20.0, UNTIL)
+        );
+    }
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
 }

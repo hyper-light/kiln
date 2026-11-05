@@ -160,7 +160,7 @@ async fn choose(hub: &Arc<Hub>, info: &Info) -> Result<Choice, String> {
             None => format!("no other connected machine has {want} installed"),
         });
     }
-    let taking: Vec<_> = with_one.into_iter().filter(|r| r.reach && hub.instances.lock().newest_with(&r.name, crate::proto::CAP_REACH).is_some()).collect();
+    let taking: Vec<_> = with_one.into_iter().filter(|r| r.reach && hub.instances.load().newest_with(&r.name, crate::proto::CAP_REACH).is_some()).collect();
     if taking.is_empty() {
         return Err(format!("the machines with {} don't take sessions over from others", info.kind_name));
     }

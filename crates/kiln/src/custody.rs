@@ -132,12 +132,12 @@ pub async fn take(store: &Store, root: &[u8], org: &str, bundle: &Value, came_fr
     }
     let revocations = crate::identities::revocations(store).await?;
     let refusal = |act: &str, signer: String, why: String| Refusal { digest: digest_of(bundle), act: act.to_owned(), signer, why, envelope: bundle.to_string(), came_from: came_from.to_owned(), at, ..Refusal::default() };
-    let c = match statement::verify(bundle, root, &revocations, at) {
+    let (checked, signer) = verified(bundle, root, &revocations, at).await?;
+    let c = match checked {
         Ok(c) => c,
         Err(e) => {
-            // Who signed it, as its certificate says, revocations aside: a copy left behind signs
-            // as the epoch it left.
-            let signer = statement::verify(bundle, root, &[], at).map(|c| c.custodian).unwrap_or_default();
+            // Who signed it, as its certificate says, revocations aside (`verified`): a copy left
+            // behind signs as the epoch it left.
             let (epoch, superseded_by) = left(store, &signer).await?;
             let why = e.to_string();
             refuse(store, Refusal { epoch, superseded_by, ..refusal("a signed statement", signer, why.clone()) }).await?;
@@ -183,6 +183,25 @@ pub async fn take(store: &Store, root: &[u8], org: &str, bundle: &Value, came_fr
     Ok(Ok(Taken { digest: c.digest, again, broke }))
 }
 
+/// `bundle` checked as [`statement::verify`] checks it, against kiln's root `root` and
+/// `revocations` as of `at`, and, refused, who signed it as its certificate says, revocations aside:
+/// on the compute pool, off the shards (goal 9, plan 01a1a87b2cec step 3). Its signature and its
+/// certificate chain are several public-key verifications, a third of a millisecond together on the
+/// lab machine, which kiln's server ran for each batch of every conversation feed on one shard: its
+/// polls that held a shard longest, calm.
+async fn verified(bundle: &Value, root: &[u8], revocations: &[Revocation], at: i64) -> anyhow::Result<(Result<Checked, statement::Refusal>, String)> {
+    let (bundle, root, revocations) = (bundle.clone(), root.to_vec(), revocations.to_vec());
+    crate::rt::compute(move || {
+        let checked = statement::verify(&bundle, &root, &revocations, at);
+        let signer = match &checked {
+            Ok(_) => String::new(),
+            Err(_) => statement::verify(&bundle, &root, &[], at).map(|c| c.custodian).unwrap_or_default(),
+        };
+        (checked, signer)
+    })
+    .await
+}
+
 /// The records that act under delegation `digest`.
 async fn under_it(store: &Store, digest: &str) -> anyhow::Result<Vec<String>> {
     let d = digest.to_owned();
@@ -198,7 +217,7 @@ async fn under_it(store: &Store, digest: &str) -> anyhow::Result<Vec<String>> {
 /// A custody record a runner process sent ([`crate::proto::AgentMsg::Custody`]): taken as having
 /// come over that process's connection, and logged either way.
 pub async fn on_runner(hub: &crate::hub::Hub, peer: crate::instances::PeerId, machine: &str, bundle: Value) {
-    let instance = hub.instances.lock().get(peer).map(|i| i.label()).unwrap_or_else(|| "legacy".to_owned());
+    let instance = hub.instances.load().get(peer).map(|i| i.label()).unwrap_or_else(|| "legacy".to_owned());
     let came_from = format!("runner {machine} (instance {instance})");
     // Something another runner handed it over a reach link that it refused where it would have
     // used it (W27-R08: a sync's workspace, a run, a run's output not what was handed on, or with
@@ -257,6 +276,14 @@ pub async fn on_runner(hub: &crate::hub::Hub, peer: crate::instances::PeerId, ma
 /// server signs takes.
 pub fn server_signed(pki: &crate::pki::Pki, s: &statement::Statement) -> anyhow::Result<Value> {
     server_signed_as(pki, PAYLOAD_CUSTODY, s)
+}
+
+/// [`server_signed`] on the compute pool, off the shards (goal 9, plan 01a1a87b2cec step 3): a
+/// signature reads kiln's signing key and certificate and signs, which a shard did for each batch of
+/// every conversation feed it took or handed on.
+pub async fn server_signed_off(pki: &std::sync::Arc<crate::pki::Pki>, s: statement::Statement) -> anyhow::Result<Value> {
+    let pki = std::sync::Arc::clone(pki);
+    crate::rt::compute(move || server_signed(&pki, &s)).await?
 }
 
 /// [`server_signed`], as `payload_type`.
@@ -850,7 +877,7 @@ async fn ask_receipt_of(hub: &crate::hub::Hub, session: &str, hand_on: &Value, f
     let ask = if first { json!({ "session": session, "hand_on": hand_on.to_string(), "first": true }) } else { json!({ "session": session, "hand_on": hand_on.to_string() }) };
     let msg = crate::proto::ServerMsg::Custody { json: ask.to_string() };
     let (owner, signs) = {
-        let inst = hub.instances.lock();
+        let inst = hub.instances.load();
         let owner = inst.owner(&crate::instances::Owned::Agent(session.to_owned()));
         let signs = owner.and_then(|p| inst.get(p)).is_some_and(|i| (u64::from(i.caps) | i.wide) & crate::proto::CAP_CUSTODY != 0);
         (owner, signs)
@@ -898,7 +925,7 @@ pub async fn subagents_handed(hub: &crate::hub::Hub, came_from: &str, hand_on: &
 /// that no receipt answers yet is asked for again (its ask may have gone while the runner was
 /// away).
 pub async fn ask_again(hub: &crate::hub::Hub, peer: crate::instances::PeerId, sessions: &[String]) {
-    let signs = hub.instances.lock().get(peer).is_some_and(|i| (u64::from(i.caps) | i.wide) & crate::proto::CAP_CUSTODY != 0);
+    let signs = hub.instances.load().get(peer).is_some_and(|i| (u64::from(i.caps) | i.wide) & crate::proto::CAP_CUSTODY != 0);
     if !signs {
         return;
     }
@@ -1095,23 +1122,28 @@ async fn load(store: &Store, root: &[u8], digests: &[String], revocations: &[Rev
             Ok(out)
         })
         .await?;
-    let mut map = BTreeMap::new();
-    for (d, envelope, at) in rows {
-        let Ok(bundle) = serde_json::from_str::<Value>(&envelope) else { continue };
-        // Only what was revoked before kiln took it: kiln checked it then, and a revocation since
-        // (one in the same second included) doesn't undo it.
-        let before: Vec<Revocation> = revocations.iter().filter(|r| r.at < at).cloned().collect();
-        match statement::verify(&bundle, root, &before, at) {
-            // Kept by its statement's digest: an envelope of another statement there (changed
-            // where kiln keeps it) isn't the record.
-            Ok(c) if c.digest == d => {
-                map.insert(d, c);
+    // Each checked again as of when kiln took it, on the compute pool, off the shards (`verified`).
+    let (root, revocations) = (root.to_vec(), revocations.to_vec());
+    crate::rt::compute(move || {
+        let mut map = BTreeMap::new();
+        for (d, envelope, at) in rows {
+            let Ok(bundle) = serde_json::from_str::<Value>(&envelope) else { continue };
+            // Only what was revoked before kiln took it: kiln checked it then, and a revocation since
+            // (one in the same second included) doesn't undo it.
+            let before: Vec<Revocation> = revocations.iter().filter(|r| r.at < at).cloned().collect();
+            match statement::verify(&bundle, &root, &before, at) {
+                // Kept by its statement's digest: an envelope of another statement there (changed
+                // where kiln keeps it) isn't the record.
+                Ok(c) if c.digest == d => {
+                    map.insert(d, c);
+                }
+                Ok(c) => tracing::warn!(record = %d, kept = %c.digest, "a custody record kiln kept is another record now"),
+                Err(e) => tracing::warn!(record = %d, error = %e, "a custody record kiln kept no longer checks as of when it took it"),
             }
-            Ok(c) => tracing::warn!(record = %d, kept = %c.digest, "a custody record kiln kept is another record now"),
-            Err(e) => tracing::warn!(record = %d, error = %e, "a custody record kiln kept no longer checks as of when it took it"),
         }
-    }
-    Ok(map)
+        map
+    })
+    .await
 }
 
 /// Checks record `digest`'s own hop, at `at`: a break, recorded, if it doesn't hold; none if it

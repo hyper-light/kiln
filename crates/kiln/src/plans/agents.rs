@@ -1194,7 +1194,7 @@ mod tests {
                         .collect::<Vec<_>>()
                 };
                 for (name, os) in [("box", "linux"), ("studio", "macos")] {
-                    hub.agents.lock().insert(name.into(), crate::hub::tests::live_runner(name, os, "aarch64"));
+                    hub.put_agent(crate::hub::tests::live_runner(name, os, "aarch64"));
                 }
                 hub.harness.set_kinds("local", offering(&["claude"]));
                 hub.harness.set_kinds("agent:box", offering(&["claude", "devin"]));
