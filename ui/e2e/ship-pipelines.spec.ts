@@ -5,6 +5,7 @@
  * repository, needs-someone first, DRAFT beside a draft's title, and a New row last; `?repo=&path=`
  * opens a row and brings it into view; nothing scrolls sideways.
  */
+import { readFileSync } from "node:fs";
 import { expect, test, type Locator, type Page } from "@playwright/test";
 
 const REAL = !!process.env.E2E_BASE_URL;
@@ -547,7 +548,8 @@ test("New: seven kinds, the dialect a workflow's, where it starts; the files it 
   await row.locator(".ship-main").click();
   const pane = row.getByRole("region", { name: "New" });
   await expect(pane.locator('.jp-j[data-key^="make."]')).toHaveCount(7);
-  await expect(pane.locator('.jp-j[data-key="lang.ts"]')).toHaveAttribute("data-dim", "true");
+  // A workflow is written in YAML or TypeScript (W29-R27); an action is its action.yml.
+  await expect(pane.locator('.jp-j[data-key="lang.ts"]')).not.toHaveAttribute("data-dim", "true");
   await expect(pane.locator('.jp-j[data-key^="lang."] .n')).toHaveText(["YAML", "TypeScript"]);
   const shards = pane.locator('.jp-j[data-key="make.shards"]');
   await expect(shards).toHaveAttribute("data-dim", "true");
@@ -751,4 +753,69 @@ test("Settings say what a workflow's locks hold and what its trunk requires, and
   const ci = await openPane(page, isMobile, "hyper-light/quiver", ".github/workflows/ci.yml");
   await expect(ci.locator('.jp-j[data-key^="settings.lock"], .jp-j[data-key^="settings.require"]')).toHaveCount(0);
   expect(await sideways(page)).toBe(0);
+});
+
+/** kiln's own .kiln/ci.yaml in TypeScript (docs/ci.md W29-AC25's fixture). */
+const KILN_CI_TS = readFileSync(new URL("../../crates/kiln/tests/fixtures/code/kiln/ci.ts", import.meta.url), "utf8");
+
+test("a code workflow (W29-S13): New writes it in TypeScript; kiln's CI typed into its Code view, a job renamed, the plan follows and What it makes shows the YAML; an enum is refused at its line", async ({
+  page,
+  isMobile,
+}) => {
+  await page.request.get("/api/mock/ship/pipelines?reset=1");
+  await atStillWidth(page, isMobile);
+  await page.goto("/ship/pipelines");
+  await notices(page);
+  // New, written in TypeScript: its file under .kiln/, saved as a draft, a row of its own.
+  const row = page.locator('.ppl-row[data-key="hyper-light/kiln:new"]');
+  await row.locator(".ship-main").click();
+  const make = row.getByRole("region", { name: "New" });
+  await make.locator('.jp-j[data-key="lang.ts"] .jp-line').click();
+  await expect(make.locator('.jp-j[data-key="lang.ts"]')).toHaveAttribute("data-sel", "true");
+  await expect(make.locator('li[data-field="path"] .v')).toHaveText(".kiln/new-workflow.ts");
+  await make.locator(".ppl-verbs button", { hasText: "Create draft" }).click();
+  await expect(make.locator(".jp-said")).toContainText("Saved new-workflow as a draft");
+  // kiln's own CI in TypeScript, in a draft of its own (made as New makes one): Code first, then the YAML it makes, then its plan.
+  await page.request.post("/api/ship/pipelines", {
+    data: { repo: "hyper-light/kiln", path: "", verb: "new", kind: "workflow", name: "kiln-ci", language: "ts", from: "blank", files: [{ path: ".kiln/kiln-ci.ts", text: KILN_CI_TS }] },
+  });
+  const pane = await openPane(page, isMobile, "hyper-light/kiln", ".kiln/kiln-ci.ts", "d-new-2");
+  const detail = pane.locator(".ppl-detail");
+  const tabs = detail.getByRole("tab");
+  await expect(tabs.nth(0)).toHaveText("Code");
+  await expect(tabs.nth(1)).toHaveText("What it makes");
+  await expect(tabs.nth(2)).toHaveText("Plan");
+  await expect(detail.locator(".cm-content")).toContainText("@kiln/sdk");
+  // Its vendor job renamed: its line in the jobs, typed over (selected as a person selects it, on any platform).
+  expect(KILN_CI_TS).toMatch(/^ {4}vendor,$/m);
+  await toTheEnd(pane);
+  await detail.locator(".cm-line", { hasText: /^\s*vendor,$/ }).click();
+  await page.keyboard.press("End");
+  await page.keyboard.press("Shift+Home");
+  await page.keyboard.insertText("vendored: vendor,");
+  // Its lines follow what it makes as it's typed: the renamed job among them, its triggers its program's (no Add a trigger).
+  await expect(pane.locator('.jp-j[data-key="jobs.vendored"]')).toBeVisible();
+  await expect(pane.locator('.jp-j[data-key="add-trigger"]')).toHaveCount(0);
+  // The plan follows as it's typed.
+  await detail.getByRole("tab", { name: "Plan" }).click();
+  await expect(detail.locator(".ppl-lines")).toContainText("vendored");
+  // What it makes: its YAML; kiln's keys in it, so Save as a GitHub workflow says why not, in place.
+  await detail.getByRole("tab", { name: "What it makes" }).click();
+  await expect(detail.locator(".ppl-made .ppl-code")).toContainText("vendored:");
+  await expect(detail.getByRole("button", { name: "Save as a GitHub workflow" })).toHaveAttribute("aria-disabled", "true");
+  await expect(detail.locator(".ppl-made-act")).toContainText("it uses kiln's keys");
+  // An enum typed in at its first line: KCI1033 there, under the code.
+  await detail.getByRole("tab", { name: "Code" }).click();
+  await pane.locator(".ppl-detail .cm-scroller").evaluate((e) => (e.scrollTop = 0));
+  await detail.locator(".cm-line").first().click();
+  await page.keyboard.press("Home");
+  await page.keyboard.insertText("enum Stage { Build }\n");
+  const problems = pane.getByLabel("Problems");
+  await expect(problems.locator("li")).toContainText("KCI1033");
+  await expect(problems.locator("li")).toContainText("line 1:");
+  // A program past 300 lines: the page still doesn't scroll sideways, and nothing floats.
+  await page.keyboard.insertText(Array.from({ length: 210 }, (_, i) => `// line ${i + 2}\n`).join(""));
+  await expect(page.locator(".cm-tooltip, [role=dialog]")).toHaveCount(0);
+  expect(await sideways(page)).toBe(0);
+  await page.request.get("/api/mock/ship/pipelines?reset=1");
 });

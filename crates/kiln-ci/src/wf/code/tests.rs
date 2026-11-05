@@ -93,3 +93,15 @@ fn w29_r27_imports_are_found_where_they_are_named() {
     assert_eq!(default_export(ts).map(|p| (p.line, p.col)), Some((6, 1)));
     assert_eq!(default_export("const a = 1;\n"), None);
 }
+
+#[test]
+fn w29_r27_what_a_program_makes_reads_as_yaml_in_its_order() {
+    let gha = r#"{"name":"ci","on":{"push":{"branches":["main"]}},"jobs":{"b":{"runs-on":"ubuntu-latest","steps":[{"run":"make"}]}}}"#;
+    let (yaml, github) = emitted(gha).unwrap_or_default();
+    let top: Vec<&str> = yaml.lines().filter(|l| !l.starts_with([' ', '-'])).filter_map(|l| l.split(':').next()).map(|k| k.trim_matches('"')).collect();
+    assert_eq!(top, vec!["name", "on", "jobs"], "{yaml}");
+    assert!(github, "{yaml}");
+    let kiln = r#"{"name":"ci","on":"diff","jobs":{"b":{"runs-on":"linux","steps":[{"run":"make"}]}}}"#;
+    let (_, github) = emitted(kiln).unwrap_or_default();
+    assert!(!github, "kiln's keys aren't GitHub's");
+}

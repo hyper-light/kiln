@@ -88,6 +88,9 @@ pub async fn start(hub: &Hub, repo: &Repo, event: &Event, l: &load::Loaded, mess
 
 /// [`start`], with what a run of a working tree brings besides (W17-R06).
 pub async fn start_given(hub: &Hub, repo: &Repo, event: &Event, l: &load::Loaded, (message, author): (&str, &str), inputs: serde_json::Value, given: super::dispatch::Given) -> anyhow::Result<bool> {
+    // W29-R27: a code workflow's plan comes from its program, made for this event.
+    let made = load::for_event(hub, repo, event, l).await?;
+    let l = made.as_ref().unwrap_or(l);
     let (Some(w), false) = (&l.workflow, l.has_errors()) else {
         let id = startup_failure(hub, repo, event, l, message, author).await?;
         if let Some(r) = &given.reply {
@@ -438,7 +441,7 @@ pub async fn start_written(hub: &Hub, repo: &Repo, sha: &str, path: &str, yaml: 
     }
     let (p, text) = (path.to_owned(), yaml.to_owned());
     let (workflow, diags) = crate::rt::blocking(move || kiln_ci::wf::parse_workflow(&p, &text, kiln_ci::expr::Dialect::Kiln)).await.map_err(|e| refused(http::StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")))?;
-    let l = load::Loaded { path: path.to_owned(), dialect: kiln_ci::expr::Dialect::Kiln, runs: true, workflow, diagnostics: load::stored(&diags) };
+    let l = load::Loaded { path: path.to_owned(), dialect: kiln_ci::expr::Dialect::Kiln, runs: true, workflow, diagnostics: load::stored(&diags), program: None };
     if l.has_errors() {
         let first = l.diagnostics.iter().find(|d| d.severity == kiln_ci::wf::Severity::Error).map(|d| format!("{}: {}", d.path, d.message)).unwrap_or_else(|| "it isn't a workflow".into());
         return Err(refused(http::StatusCode::UNPROCESSABLE_ENTITY, format!("the workflow kiln wrote for {path} doesn't read: {first}")));
@@ -559,6 +562,19 @@ async fn dispatch_with(
     let (message, _) = gitops::commit_info(hub, repo, &sha).await;
     let mut e = Event { name: "workflow_dispatch".into(), repo: repo.name.clone(), git_ref: full_ref, sha, actor: actor.to_owned(), trusted: true, source: Source::Api, message: Some(message.clone()), started_by, ..Event::default() };
     e.payload = context::workflow_dispatch(&e, &f.repo, &l.path, &strings);
+    // W29-R27: a code workflow made for this dispatch, then held to the jobs asked for.
+    let made;
+    let l = match load::for_event(hub, repo, &e, l).await.map_err(|err| refused(http::StatusCode::INTERNAL_SERVER_ERROR, format!("{err:#}")))? {
+        Some(mut m) => {
+            if !jobs.is_empty() {
+                let w = m.workflow.as_ref().and_then(|w| super::uploads::only_jobs(w, jobs)).ok_or_else(|| refused(http::StatusCode::NOT_FOUND, format!("{} has no job {}", m.path, jobs.iter().map(|j| format!("`{j}`")).collect::<Vec<_>>().join(", "))))?;
+                m.workflow = Some(w);
+            }
+            made = m;
+            &made
+        }
+        None => l,
+    };
     let (tx, rx) = async_channel::bounded(1);
     let reply = super::dispatch::Given { reply: offered.then_some(tx), ..super::dispatch::Given::default() };
     let started = start_given(hub, repo, &e, l, (&message, actor), typed, reply).await.map_err(|err| refused(http::StatusCode::INTERNAL_SERVER_ERROR, format!("{err:#}")))?;

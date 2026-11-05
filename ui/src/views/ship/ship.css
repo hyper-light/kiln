@@ -1558,6 +1558,44 @@
   padding: 6px 0;
   list-style: none;
 }
+/* What a code workflow makes (W29-R27): its YAML, scrolling in the height held, then one act
+   under it, on a line of its own that never moves. */
+.ppl-made {
+  display: grid;
+  grid-template-rows: minmax(0, 1fr) 19px;
+  overflow: hidden;
+}
+.ppl-made > .ppl-code {
+  overflow: auto;
+}
+.ppl-made-act {
+  display: flex;
+  gap: 12px;
+  align-items: center;
+  min-width: 0;
+  padding: 0 8px;
+  font-size: 12px;
+  color: #8b8e96;
+  white-space: nowrap;
+}
+.ppl-made-act span {
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.ppl-made-act button {
+  flex: none;
+  padding: 0;
+  border: 0;
+  background: none;
+  color: #d4dde8;
+  font: inherit;
+  text-decoration: underline;
+  cursor: pointer;
+}
+.ppl-made-act button[aria-disabled] {
+  opacity: 0.35;
+  cursor: default;
+}
 .ppl-lines li {
   display: grid;
   grid-template-columns: 20px minmax(0, 1fr) auto;

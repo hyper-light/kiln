@@ -26,7 +26,10 @@ use kiln_ci::wf::{self, Diag, Workflow};
 use rquickjs::{Ctx, Function, Module, Object};
 use serde_json::Value;
 
+use crate::gitops::{self, LS_REMOTE_TIMEOUT};
+use crate::hub::Hub;
 use crate::mcp::code::{Engine, Limits, engine};
+use crate::store::Repo;
 
 /// What a program reads of its commit's tree.
 pub trait Tree: Send + Sync {
@@ -34,6 +37,139 @@ pub trait Tree: Send + Sync {
     fn read(&self, path: &str) -> Option<String>;
     /// The entries of the directory `dir`, from the tree's root, a directory's ending in `/`.
     fn list(&self, dir: &str) -> Vec<String>;
+}
+
+/// A tree with nothing in it: where a program is checked with no commit at hand.
+pub struct NoTree;
+
+impl Tree for NoTree {
+    fn read(&self, _path: &str) -> Option<String> {
+        None
+    }
+
+    fn list(&self, _dir: &str) -> Vec<String> {
+        Vec::new()
+    }
+}
+
+/// A commit's tree in a repository's mirror: its paths listed once, each file read when the
+/// program asks, with git on the program's own thread (the blocking pool's).
+pub struct MirrorTree {
+    dir: std::path::PathBuf,
+    sha: String,
+    paths: Vec<String>,
+}
+
+/// The largest file a program reads: its result's bound.
+const READ_MAX: u64 = 4 << 20;
+
+impl MirrorTree {
+    /// The tree of `sha` in the mirror at `dir`.
+    pub async fn of(hub: &Hub, dir: &std::path::Path, sha: &str) -> anyhow::Result<Arc<dyn Tree>> {
+        let d = dir.to_string_lossy().into_owned();
+        let out = gitops::run_git(hub, &["-C", &d, "ls-tree", "-r", "-z", "--name-only", sha], LS_REMOTE_TIMEOUT).await?;
+        let mut paths: Vec<String> = out.split(|b| *b == 0).filter(|p| !p.is_empty()).map(|p| String::from_utf8_lossy(p).into_owned()).collect();
+        paths.sort();
+        Ok(Arc::new(Self { dir: dir.to_owned(), sha: sha.to_owned(), paths }))
+    }
+
+    fn git(&self, args: &[&str]) -> Option<Vec<u8>> {
+        let mut c = std::process::Command::new("git");
+        crate::os::git_no_prompts(&mut c).stdin(std::process::Stdio::null()).arg("-C").arg(&self.dir).args(args);
+        let out = c.output().ok()?;
+        out.status.success().then_some(out.stdout)
+    }
+}
+
+impl Tree for MirrorTree {
+    fn read(&self, path: &str) -> Option<String> {
+        let p = in_tree(path)?;
+        self.paths.binary_search(&p).ok()?;
+        let at = format!("{}:{p}", self.sha);
+        let size: u64 = String::from_utf8_lossy(&self.git(&["cat-file", "-s", &at])?).trim().parse().ok()?;
+        if size > READ_MAX {
+            return None;
+        }
+        Some(String::from_utf8_lossy(&self.git(&["cat-file", "blob", &at])?).into_owned())
+    }
+
+    fn list(&self, dir: &str) -> Vec<String> {
+        entries(&self.paths, dir)
+    }
+}
+
+/// A tree with a draft's edits over it: a file edited reads as edited, one deleted (`None`) as
+/// none, and the rest as the tree has them.
+pub struct Edited {
+    pub base: Arc<dyn Tree>,
+    pub edits: std::collections::BTreeMap<String, Option<String>>,
+}
+
+impl Tree for Edited {
+    fn read(&self, path: &str) -> Option<String> {
+        let p = in_tree(path)?;
+        match self.edits.get(&p) {
+            Some(edited) => edited.clone(),
+            None => self.base.read(&p),
+        }
+    }
+
+    fn list(&self, dir: &str) -> Vec<String> {
+        if self.edits.is_empty() {
+            return self.base.list(dir);
+        }
+        // Every file the tree has, less the deleted, with the added, listed as the edited tree is.
+        let mut all = all_files(self.base.as_ref(), "");
+        for (p, text) in &self.edits {
+            if text.is_some() {
+                all.insert(p.clone());
+            } else {
+                all.remove(p);
+            }
+        }
+        entries(&all.into_iter().collect::<Vec<_>>(), dir)
+    }
+}
+
+/// Every file of `tree` under `dir`.
+fn all_files(tree: &dyn Tree, dir: &str) -> std::collections::BTreeSet<String> {
+    let mut out = std::collections::BTreeSet::new();
+    for e in tree.list(dir) {
+        match e.strip_suffix('/') {
+            Some(sub) => out.extend(all_files(tree, sub)),
+            None => {
+                out.insert(e);
+            }
+        }
+    }
+    out
+}
+
+/// The tree of commit `sha` of `repo`, fetched into its mirror when it isn't there yet.
+pub async fn tree_at(hub: &Hub, repo: &Repo, sha: &str) -> anyhow::Result<Arc<dyn Tree>> {
+    let dir = gitops::ensure_commit(hub, repo, sha).await?;
+    MirrorTree::of(hub, &dir, sha).await
+}
+
+/// `path` as a tree names it (no `./`, no empty parts), or `None` for one outside it: absolute,
+/// or with `..`.
+fn in_tree(path: &str) -> Option<String> {
+    let parts: Vec<&str> = path.split('/').filter(|p| !p.is_empty() && *p != ".").collect();
+    (!path.starts_with('/') && !parts.contains(&"..")).then(|| parts.join("/"))
+}
+
+/// The entries of `dir` among the sorted `paths`, one level down, a directory's ending in `/`.
+pub fn entries(paths: &[String], dir: &str) -> Vec<String> {
+    let Some(d) = in_tree(dir) else { return Vec::new() };
+    let prefix = if d.is_empty() { String::new() } else { format!("{d}/") };
+    let mut out: Vec<String> = Vec::new();
+    for rest in paths.iter().filter_map(|p| p.strip_prefix(prefix.as_str())) {
+        let e = rest.split_once('/').map_or_else(|| format!("{prefix}{rest}"), |(sub, _)| format!("{prefix}{sub}/"));
+        if out.last() != Some(&e) {
+            out.push(e);
+        }
+    }
+    out
 }
 
 /// Plan time's limits (W29-R27): a 64 MiB heap, 1 s of wall clock, no `kiln` operations and a
@@ -56,17 +192,23 @@ pub struct Made {
 /// The workflow the program at `path` makes for `event`, as W02 reads it, with W02's diagnostics
 /// at the program's lines. Blocks: call it on the blocking pool.
 pub fn workflow(path: &str, text: &str, event: &Value, tree: Arc<dyn Tree>) -> (Option<Workflow>, Vec<Diag>) {
+    let (w, diags, _) = checked(path, text, event, tree);
+    (w, diags)
+}
+
+/// [`workflow`], and what the program made, to [`place`] what else is said of it. Blocks.
+pub fn checked(path: &str, text: &str, event: &Value, tree: Arc<dyn Tree>) -> (Option<Workflow>, Vec<Diag>, Option<Made>) {
     match evaluate(path, text, event, tree, limits()) {
-        Err(diags) => (None, diags),
+        Err(diags) => (None, diags, None),
         Ok(made) => {
             let (w, diags) = wf::parse_workflow(path, &made.json, Dialect::Kiln);
-            (w, diags.into_iter().map(|d| placed(d, &made)).collect())
+            (w, diags.into_iter().map(|d| place(d, &made)).collect(), Some(made))
         }
     }
 }
 
-/// A diagnostic on what a program made, moved to the SDK call that made its part.
-fn placed(mut d: Diag, made: &Made) -> Diag {
+/// A diagnostic on what a program made, moved to the SDK call that made its part (by its path).
+pub fn place(mut d: Diag, made: &Made) -> Diag {
     let within = |p: &str| p.is_empty() || d.path == p || d.path.strip_prefix(p).is_some_and(|rest| rest.starts_with(['.', '[']));
     let at = made.at.iter().filter(|(p, _)| within(p)).max_by_key(|(p, _)| p.len()).map_or(made.export, |(_, at)| *at);
     d.range = Range { start: at, end: at };

@@ -330,6 +330,9 @@ impl Collector<'_> {
 
     async fn model(&mut self, tree: &Tree, path: &str) -> Result<Workflow, String> {
         let text = self.file(tree, path).await?.ok_or_else(|| format!("KCI4051 {path}: workflow is missing"))?;
+        if wf::file_kind(path) == Some(wf::FileKind::CodeWorkflow) {
+            return self.program(tree, path, text).await;
+        }
         let dialect = if path.starts_with(".kiln/") { kiln_ci::expr::Dialect::Kiln } else { kiln_ci::expr::Dialect::Gha };
         let (model, ds) = wf::parse_workflow(path, &text, dialect);
         if ds.iter().any(wf::diag::Diag::is_error) { return Err(diagnostics(path, ds)); }
@@ -347,6 +350,25 @@ impl Collector<'_> {
             }
         }
         Ok(model)
+    }
+
+    /// W29-R27: what a code workflow makes for a push of its commit to the trunk, over the draft's
+    /// edits: what its locks hold. A use it makes only for another event isn't locked, and a run
+    /// for that event says so (`KCI4050`).
+    async fn program(&mut self, tree: &Tree, path: &str, text: String) -> Result<Workflow, String> {
+        if tree.owner.remote.is_some() {
+            return Err(format!("KCI4050 {path}: a code workflow can't be called: call a YAML workflow"));
+        }
+        let base = super::super::code::tree_at(self.hub, self.caller, &tree.owner.commit).await.map_err(|e| format!("KCI4051 {path}: {e:#}"))?;
+        let edits = tree.edits.iter().map(|(p, b)| (p.clone(), b.as_ref().map(|b| String::from_utf8_lossy(b).into_owned()))).collect();
+        let files: Arc<dyn super::super::code::Tree> = Arc::new(super::super::code::Edited { base, edits });
+        let push = super::super::load::push_of(self.caller, &tree.owner.commit);
+        let p = path.to_owned();
+        let (model, ds) = crate::rt::blocking(move || super::super::code::workflow(&p, &text, &push, files)).await.map_err(|e| format!("KCI4051 {path}: {e:#}"))?;
+        if ds.iter().any(wf::diag::Diag::is_error) {
+            return Err(diagnostics(path, ds));
+        }
+        model.ok_or_else(|| format!("KCI1022 {path}: workflow is invalid"))
     }
 
     async fn workflow(&mut self, tree: &Tree, path: &str, inherited: &[native::Layer], prefix: &str, depth: usize) -> Result<Vec<String>, String> {
@@ -462,7 +484,7 @@ async fn gather(hub: &Hub, source: &dyn DependencySources, caller: &Repo, commit
         Some(paths) => paths.to_vec(),
         None => {
             let loaded = super::super::load::load(hub, caller, commit).await.map_err(|_| "KCI4051 workflow tree is unavailable")?;
-            let paths: BTreeSet<_> = loaded.workflows.into_iter().map(|w| w.path).chain(root.edits.iter().filter(|(p, text)| text.is_some() && matches!(wf::file_kind(p), Some(wf::FileKind::GhaWorkflow | wf::FileKind::KilnWorkflow))).map(|(p, _)| p.clone())).filter(|p| root.edits.get(p).is_none_or(Option::is_some)).collect();
+            let paths: BTreeSet<_> = loaded.workflows.into_iter().map(|w| w.path).chain(root.edits.iter().filter(|(p, text)| text.is_some() && matches!(wf::file_kind(p), Some(wf::FileKind::GhaWorkflow | wf::FileKind::KilnWorkflow | wf::FileKind::CodeWorkflow))).map(|(p, _)| p.clone())).filter(|p| root.edits.get(p).is_none_or(Option::is_some)).collect();
             paths.into_iter().collect()
         }
     };

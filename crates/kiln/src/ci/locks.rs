@@ -563,7 +563,7 @@ pub async fn draft_files(hub: &Arc<Hub>, caller: &Repo, commit: &str, changed: &
     crate::gitops::ensure_commit(hub, caller, commit).await.map_err(|_| "KCI4051 the draft's exact base is unavailable".to_owned())?;
     let source = super::dependency_sources::Sources::new(Arc::clone(hub), caller.name.clone());
     let all = all || changed.iter().any(|f| wf::file_kind(&f.path) == Some(wf::FileKind::Action));
-    let paths: Vec<_> = changed.iter().filter(|f| matches!(wf::file_kind(&f.path), Some(wf::FileKind::GhaWorkflow | wf::FileKind::KilnWorkflow))).map(|f| f.path.clone()).collect::<BTreeSet<_>>().into_iter().collect();
+    let paths: Vec<_> = changed.iter().filter(|f| matches!(wf::file_kind(&f.path), Some(wf::FileKind::GhaWorkflow | wf::FileKind::KilnWorkflow | wf::FileKind::CodeWorkflow))).map(|f| f.path.clone()).collect::<BTreeSet<_>>().into_iter().collect();
     let edits = changed.iter().map(|f| (f.path.clone(), f.content.clone())).collect();
     generate::collect(hub, &source, caller, commit, edits, if all { None } else { Some(&paths) }, kiln_ci::lock::regenerate::Mode::Preserve).await
 }

@@ -4,10 +4,11 @@
 //! time.
 
 use std::collections::BTreeMap;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Instant;
 
-use serde_json::json;
+use serde_json::{Value, json};
 
 use super::*;
 
@@ -127,5 +128,65 @@ fn w29_r27_a_program_reads_its_event_and_tree_and_nothing_else() -> anyhow::Resu
     let v: serde_json::Value = serde_json::from_str(&made.json)?;
     assert_eq!(v.pointer("/name"), Some(&json!("refs/heads/main")));
     assert_eq!(v.pointer("/env"), Some(&json!({ "PASSWD": "null", "UI": "ui/package.json,ui/src/", "KILN": "undefined", "TIMERS": "undefined", "CRYPTO": "undefined", "ORIGIN": "undefined" })));
+    Ok(())
+}
+
+/// The first place two values differ, as a path (`jobs[0].steps[3].run`).
+fn differs(a: &Value, b: &Value, at: &str) -> Option<String> {
+    match (a, b) {
+        (Value::Object(x), Value::Object(y)) => x.keys().chain(y.keys()).find_map(|k| {
+            let here = if at.is_empty() { k.clone() } else { format!("{at}.{k}") };
+            match (x.get(k), y.get(k)) {
+                (Some(p), Some(q)) => differs(p, q, &here),
+                _ => Some(here),
+            }
+        }),
+        (Value::Array(x), Value::Array(y)) if x.len() == y.len() => x.iter().zip(y).enumerate().find_map(|(i, (p, q))| differs(p, q, &format!("{at}[{i}]"))),
+        _ => (a != b).then(|| at.to_owned()),
+    }
+}
+
+/// A workflow's model as the comparison reads it: its file's own path left out.
+fn model(w: Option<&Workflow>) -> anyhow::Result<Value> {
+    let mut v = serde_json::to_value(w)?;
+    if let Some(o) = v.as_object_mut() {
+        o.remove("path");
+    }
+    Ok(v)
+}
+
+/// Kiln's own workflow `name` (tests/fixtures/code/kiln): what its YAML makes, and its program.
+fn kilns(name: &str) -> anyhow::Result<(Value, String)> {
+    let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/code/kiln");
+    let yaml = std::fs::read_to_string(dir.join(format!("{name}.yaml")))?;
+    let (w, d) = wf::parse_workflow(&format!(".kiln/{name}.yaml"), &yaml, Dialect::Kiln);
+    anyhow::ensure!(!d.iter().any(Diag::is_error), "{name}.yaml: {d:?}");
+    Ok((model(w.as_ref())?, std::fs::read_to_string(dir.join(format!("{name}.ts")))?))
+}
+
+/// W29-AC25: kiln's own workflows, each also written as a TypeScript program (`ci.ts` by hand,
+/// the rest by `translate.mjs`), make the workflows their YAML does: the same model, ranges left
+/// out, so every event plans alike.
+#[test]
+fn w29_ac25_kilns_workflows_in_typescript_make_what_their_yaml_does() -> anyhow::Result<()> {
+    for name in ["bench", "ci", "custody-lab", "e2e", "image", "release", "sim", "stress", "wire-lab"] {
+        let (want, ts) = kilns(name)?;
+        let (got, d) = workflow(&format!(".kiln/{name}.ts"), &ts, &json!({ "ref": "refs/heads/main" }), Arc::new(NoTree));
+        assert!(!d.iter().any(Diag::is_error), "{name}.ts: {d:?}");
+        let got = model(got.as_ref())?;
+        assert!(differs(&got, &want, "").is_none(), "{name}.ts makes another workflow from {:?} on", differs(&got, &want, ""));
+    }
+    Ok(())
+}
+
+/// W29-AC25: a step of ci.ts changed, the comparison names the job and the step.
+#[test]
+fn w29_ac25_a_changed_step_is_named() -> anyhow::Result<()> {
+    let (want, ts) = kilns("ci")?;
+    let changed = ts.replace("cargo test --locked --no-fail-fast", "cargo test --locked");
+    let (got, _) = workflow(".kiln/ci.ts", &changed, &json!({}), Arc::new(NoTree));
+    let at = differs(&model(got.as_ref())?, &want, "").unwrap_or_default();
+    let job = at.strip_prefix("jobs[").and_then(|r| r.split_once(']')).and_then(|(i, _)| i.parse::<usize>().ok()).and_then(|i| want.pointer(&format!("/jobs/{i}/id")).cloned());
+    assert_eq!((job, at.contains(".steps[3].")), (Some(json!("rust")), true), "{at}");
     Ok(())
 }

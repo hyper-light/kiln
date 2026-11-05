@@ -51,6 +51,30 @@ fn w29_r25_save_and_update_share_one_native_draft_and_retain_its_companions() ->
     })
 }
 
+/// W29-R27: a code workflow's draft locks what its program uses, as a YAML workflow's does; a
+/// program that throws isn't saved, the refusal naming its code and line.
+#[test]
+fn w29_r27_a_code_workflows_draft_locks_what_its_program_uses() -> anyhow::Result<()> {
+    crate::rt::block_on(async {
+        let root = tempfile::tempdir()?;
+        let hub = crate::hub::tests::scratch_hub().await?;
+        let publisher = native::publish(&hub, root.path(), "acme/tools", vec![("action.yml".into(), "runs: {using: composite, steps: []}\n".into())], "owner").await?;
+        let program = "import { workflow, job, step } from \"@kiln/sdk\";\nexport default workflow({ on: \"push\", jobs: { build: job({ \"runs-on\": \"k8s\", steps: [step({ uses: \"kiln://acme/tools@v1\" })] }) } });\n";
+        let app = native::publish(&hub, root.path(), "acme/app", vec![(".kiln/ci.ts".into(), program.to_owned())], "none").await?;
+        crate::gitops::sync_mirror(&hub, &app.repo).await?;
+        let author = crate::authz::Caller::owner();
+        let saved = crate::ci::workflows::edit(&hub, &author, &app.repo.name, ".kiln/ci.ts", &serde_json::json!({ "content": format!("{program}// saved\n"), "draft": true })).await.map_err(fail)?;
+        let head = draft_head(&hub, &app.repo, &saved).await?;
+        let kl = format::parse(&crate::ci::load::blob(&hub, &app.repo, &head, format::PATH).await?).map_err(|e| anyhow::anyhow!("{e:?}"))?;
+        let pinned = kl.dependencies.get("kiln://acme/tools@v1").and_then(|d| if let format::Dependency::Git(g) = d { github::digest(&g.commit) } else { None });
+        assert_eq!(pinned, Some(publisher.commit.as_str()));
+        let refused = crate::ci::workflows::edit(&hub, &author, &app.repo.name, ".kiln/ci.ts", &serde_json::json!({ "content": "const n: number = 1;\nthrow new Error(\"not yet\");\nexport default {};\n", "draft": true })).await;
+        let Err((status, message)) = refused else { anyhow::bail!("a program that throws was saved") };
+        assert!(status == http::StatusCode::UNPROCESSABLE_ENTITY && message.contains("KCI1030") && message.contains(":2:"), "{status} {message}");
+        Ok(())
+    })
+}
+
 #[test]
 fn w29_r25_verify_reports_a_moved_full_tag_without_acceptance_or_delivery() -> anyhow::Result<()> {
     crate::rt::block_on(async {

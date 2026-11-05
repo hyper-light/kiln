@@ -193,8 +193,8 @@ export interface ShipPipelineRow {
   /** `owner/name:path`. */
   key: string;
   kind: ShipPipelineKind | string;
-  /** A workflow's: `gha` or `kiln`; null for an action. */
-  dialect: "gha" | "kiln" | null;
+  /** A workflow's: `gha` or `kiln`, or a code workflow's language, `ts` or `js` (W29-R27); null for an action. */
+  dialect: "gha" | "kiln" | "ts" | "js" | null;
   name: string;
   path: string;
   stand: ShipStand | string;
@@ -290,7 +290,7 @@ export interface ShipPipelinePane {
     title: string;
     path: string;
     kind: ShipPipelineKind | string;
-    dialect: "gha" | "kiln" | null;
+    dialect: "gha" | "kiln" | "ts" | "js" | null;
     ref: string;
     commit: string;
     draft: ShipPipelineDraft | null;
@@ -358,7 +358,7 @@ export interface ShipPipelineAct {
   major?: boolean;
   confirm?: boolean;
   notes?: string;
-  /** New's (W29-R08): what to make, its name, its dialect (`gha`, `kiln`), where it starts, its files as edited; `dry` says them without saving. */
+  /** New's (W29-R08): what to make, its name, its dialect (`gha`, `kiln`) or `ts` (W29-R27), where it starts, its files as edited; `dry` says them without saving. */
   kind?: string;
   name?: string;
   language?: string;

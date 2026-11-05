@@ -638,7 +638,7 @@ fn heading_of<'a>(rows: impl Iterator<Item = (&'a Facts, &'a Standing)> + Clone,
 pub struct Row {
     pub facts: Facts,
     pub standing: Standing,
-    /// A workflow's dialect: `gha` or `kiln`.
+    /// A workflow's dialect: `gha` or `kiln`; a code workflow's language, `ts` or `js` (W29-R27).
     pub dialect: Option<&'static str>,
     pub line: String,
     /// Who changed its file last, and when (seconds).
@@ -1959,7 +1959,12 @@ pub fn pane_json(o: &Opened<'_>, groups: &[PaneGroup]) -> Value {
     let seen = o.row.seen_by(o.viewer.name);
     let row = seen.as_ref().unwrap_or(o.row);
     let f = &row.facts;
-    let views: &[&str] = if f.kind.is_action() { &["Changes", "YAML", "Try it"] } else { &["YAML", "Flow", "Plan"] };
+    // A code workflow is its program (W29-R27): Code, the YAML it makes, and its plan.
+    let views: &[&str] = match (f.kind.is_action(), row.dialect) {
+        (true, _) => &["Changes", "YAML", "Try it"],
+        (false, Some("ts" | "js")) => &["Code", "What it makes", "Plan"],
+        (false, _) => &["YAML", "Flow", "Plan"],
+    };
     json!({
         "head": {
             "title": f.name, "path": f.path, "kind": f.kind.as_str(), "dialect": row.dialect,

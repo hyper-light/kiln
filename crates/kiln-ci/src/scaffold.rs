@@ -37,11 +37,12 @@ impl Kind {
     }
 }
 
-/// A workflow's dialect: GitHub's, or kiln's (`.kiln/`).
+/// A workflow's dialect: GitHub's, or kiln's (`.kiln/`) in YAML or TypeScript (W29-R27).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Dialect {
     Gha,
     Kiln,
+    TypeScript,
 }
 
 /// Where it starts.
@@ -115,20 +116,40 @@ pub fn path_of(kind: Kind, dialect: Dialect, name: &str) -> String {
         (true, _) => format!(".github/actions/{name}/action.yml"),
         (false, Dialect::Gha) => format!(".github/workflows/{name}.yml"),
         (false, Dialect::Kiln) => format!(".kiln/{name}.yaml"),
+        (false, Dialect::TypeScript) => format!(".kiln/{name}.ts"),
+    }
+}
+
+/// The commands a workflow's steps run for what the repository is, after its checkout.
+fn commands_for(stack: Stack) -> &'static [&'static str] {
+    match stack {
+        Stack::Rust => &["cargo build --locked", "cargo test --locked"],
+        Stack::Node => &["npm ci", "npm test"],
+        Stack::Go => &["go build ./...", "go test ./..."],
+        Stack::Python => &["pip install -r requirements.txt", "python -m pytest"],
+        Stack::Other => &["echo \"it runs\""],
     }
 }
 
 /// The steps a workflow starts with for what the repository is.
 fn steps_for(stack: Stack, kiln: bool) -> String {
     let checkout = if kiln { "      - uses: kiln/checkout@v1\n" } else { "      - uses: actions/checkout@v4\n" };
-    let rest = match stack {
-        Stack::Rust => "      - run: cargo build --locked\n      - run: cargo test --locked\n",
-        Stack::Node => "      - run: npm ci\n      - run: npm test\n",
-        Stack::Go => "      - run: go build ./...\n      - run: go test ./...\n",
-        Stack::Python => "      - run: pip install -r requirements.txt\n      - run: python -m pytest\n",
-        Stack::Other => "      - run: echo \"it runs\"\n",
-    };
+    let rest: String = commands_for(stack).iter().map(|c| format!("      - run: {c}\n")).collect();
     format!("{checkout}{rest}")
+}
+
+/// A kiln workflow written in TypeScript (W29-R27): the YAML one's triggers, job and steps, made by
+/// `@kiln/sdk`'s calls.
+fn program(name: &str, stack: Stack, branch: &str) -> String {
+    let q = |s: &str| serde_json::to_string(s).unwrap_or_default();
+    let steps: Vec<String> = std::iter::once("step({ uses: \"kiln/checkout@v1\" })".to_owned()).chain(commands_for(stack).iter().map(|c| format!("step({{ run: {} }})", q(c)))).collect();
+    format!(
+        "// {name}: a kiln workflow in TypeScript (docs/ci.md W29-R27). Pipelines shows the YAML it makes.\nimport {{ workflow, job, step }} from \"@kiln/sdk\";\n\nexport default workflow({{\n  name: {},\n  on: {{ push: {{ branches: [{}] }} }},\n  jobs: {{\n    {}: job({{\n      \"runs-on\": [\"baremetal\"],\n      steps: [\n        {},\n      ],\n    }}),\n  }},\n}});\n",
+        q(name),
+        q(branch),
+        q(name),
+        steps.join(",\n        ")
+    )
 }
 
 /// A workflow's or reusable workflow's YAML.
@@ -197,6 +218,14 @@ fn copied(text: &str, name: &str) -> String {
 pub fn scaffold(kind: Kind, dialect: Dialect, name: &str, start: Start<'_>, paths: &[&str], branch: &str) -> Result<Vec<File>, String> {
     check_name(name)?;
     let path = path_of(kind, dialect, name);
+    if dialect == Dialect::TypeScript && !kind.is_action() {
+        return match (kind, start) {
+            (Kind::Reusable, _) => Err("a reusable workflow is YAML, the file its callers read: make it in kiln's or GitHub's dialect".to_owned()),
+            (_, Start::Copy(_) | Start::Starter(_)) => Err("a copy or a starter is YAML: start a TypeScript workflow blank or recommended".to_owned()),
+            (_, Start::Recommended) => Ok(vec![File { path, text: program(name, detect(paths), branch) }]),
+            (_, Start::Blank) => Ok(vec![File { path, text: program(name, Stack::Other, branch) }]),
+        };
+    }
     match start {
         Start::Copy(text) => Ok(vec![File { path, text: copied(text, name) }]),
         _ if kind.is_action() => Ok(action(kind, name)),
@@ -215,6 +244,25 @@ pub fn scaffold(kind: Kind, dialect: Dialect, name: &str, start: Start<'_>, path
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// W29-R27: New's TypeScript workflow is erasable, imports `@kiln/sdk` alone, and keeps the
+    /// YAML one's commands; a reusable workflow, a copy and a starter stay YAML.
+    #[test]
+    fn w29_r27_new_writes_a_typescript_workflow() {
+        let files = scaffold(Kind::Workflow, Dialect::TypeScript, "build-all", Start::Recommended, &["Cargo.toml"], "trunk").unwrap_or_default();
+        assert_eq!(files.len(), 1, "{files:?}");
+        let Some(f) = files.first() else { return };
+        assert_eq!(f.path, ".kiln/build-all.ts");
+        assert!(crate::wf::code::erase(&f.text).is_ok(), "{}", f.text);
+        let imports: Vec<Option<String>> = crate::wf::code::imports(&f.text).into_iter().map(|(n, _)| n).collect();
+        assert_eq!(imports, vec![Some("@kiln/sdk".to_owned())]);
+        for part in ["\"build-all\": job(", "branches: [\"trunk\"]", "step({ run: \"cargo test --locked\" })", "export default workflow("] {
+            assert!(f.text.contains(part), "{part}: {}", f.text);
+        }
+        for (kind, start) in [(Kind::Reusable, Start::Blank), (Kind::Workflow, Start::Starter("rust")), (Kind::Workflow, Start::Copy("name: x\n"))] {
+            assert!(scaffold(kind, Dialect::TypeScript, "x", start, &[], "main").is_err(), "{kind:?} {start:?}");
+        }
+    }
 
     const KINDS: [Kind; 7] = [Kind::Workflow, Kind::Reusable, Kind::Composite, Kind::JavaScript, Kind::Docker, Kind::Firecracker, Kind::Shards];
 

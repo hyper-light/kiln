@@ -69,7 +69,10 @@ const KIND_WORD: Record<string, string> = {
   shards: "Shards",
   unknown: "Unknown",
 };
-const DIALECT_WORD: Record<string, string> = { gha: "GitHub's", kiln: "kiln's" };
+const DIALECT_WORD: Record<string, string> = { gha: "GitHub's", kiln: "kiln's", ts: "TypeScript", js: "JavaScript" };
+
+/** A code workflow (W29-R27): `.kiln/<name>.ts` or `.js`, the workflow its program makes. */
+const isCode = (path: string) => /^\.kiln\/[^/]+\.(ts|js)$/.test(path);
 
 export default function ShipPipelinesPage() {
   return (
@@ -322,6 +325,8 @@ const syntaxOfFile = (path: string): string | undefined => (/action\.ya?ml$/.tes
 function NewPane({ repo, onClose }: { repo: ShipPipelineRepo; onClose: () => void }) {
   const [kind, setKind] = React.useState("workflow");
   const [kiln, setKiln] = React.useState(false);
+  // Written in TypeScript (W29-R27), else YAML in `kiln`'s dialect or GitHub's.
+  const [ts, setTs] = React.useState(false);
   const [from, setFrom] = React.useState<From>("blank");
   const [name, setName] = React.useState("new-workflow");
   const [said, setSaid] = React.useState<{ text: React.ReactNode; refused: boolean } | null>(null);
@@ -337,7 +342,7 @@ function NewPane({ repo, onClose }: { repo: ShipPipelineRepo; onClose: () => voi
     verb: "new",
     kind,
     name,
-    language: kiln && !action ? "kiln" : "gha",
+    language: action ? "gha" : ts ? "ts" : kiln ? "kiln" : "gha",
     from: from === "starter" ? { starter: "rust" } : from === "copy" && copyOf ? { copy: copyOf } : from,
   };
   const key = JSON.stringify(ask);
@@ -387,7 +392,15 @@ function NewPane({ repo, onClose }: { repo: ShipPipelineRepo; onClose: () => voi
               setName(["workflow", "reusable"].includes(k) ? `new-${k === "reusable" ? "reusable" : "workflow"}` : `new-${k}`);
               setSaid(null);
             },
-            onDialect: (k: boolean) => setKiln(k),
+            onDialect: (k: boolean) => {
+              setKiln(k);
+              setTs(false);
+            },
+            onTypeScript: () => {
+              setTs(true);
+              // A starter and a copy are YAML: TypeScript starts blank or recommended.
+              setFrom((f) => (f === "starter" || f === "copy" ? "blank" : f));
+            },
             onFrom: (f: From) => setFrom(f),
             onName: (n: string) => setName(n),
             onEdit: (path: string, text: string) => setEdited((e) => ({ key, files: { ...(e.key === key ? e.files : {}), [path]: text } })),
@@ -395,6 +408,7 @@ function NewPane({ repo, onClose }: { repo: ShipPipelineRepo; onClose: () => voi
             onCancel: onClose,
             onSay: (why: string) => setSaid({ text: why, refused: true }),
             kiln,
+            ts,
           }}
         />
       </Loadable>
@@ -405,6 +419,7 @@ function NewPane({ repo, onClose }: { repo: ShipPipelineRepo; onClose: () => voi
 interface NewActs {
   onKind: (k: string) => void;
   onDialect: (kiln: boolean) => void;
+  onTypeScript: () => void;
   onFrom: (f: From) => void;
   onName: (n: string) => void;
   onEdit: (path: string, text: string) => void;
@@ -412,6 +427,7 @@ interface NewActs {
   onCancel: () => void;
   onSay: (why: string) => void;
   kiln: boolean;
+  ts: boolean;
 }
 
 /** New's strip, its choices and its files: the files a dry run of New makes (the server's `kiln_ci::scaffold`). */
@@ -457,8 +473,8 @@ function NewBody({
   const starts: [From, string, string | null][] = [
     ["blank", "blank", null],
     ["recommended", `recommended for ${String(ask.repo).split("/").pop() ?? ""}`, action ? "an action starts blank: recommended is for workflows" : null],
-    ["starter", "a starter", action || acts.kiln || make.kind === "reusable" ? "GitHub's starter workflows are GitHub's dialect, run on push" : null],
-    ["copy", "a copy", copyOf ? null : "this repository has no workflow to copy yet"],
+    ["starter", "a starter", action || acts.kiln || acts.ts || make.kind === "reusable" ? "GitHub's starter workflows are GitHub's dialect, run on push" : null],
+    ["copy", "a copy", acts.ts ? "a copy is YAML: TypeScript starts blank or recommended" : copyOf ? null : "this repository has no workflow to copy yet"],
   ];
   const detail = (
     <div className="ppl-detail">
@@ -615,22 +631,23 @@ function NewBody({
           {(
             [
               ["yaml", "YAML", "GitHub's or kiln's dialect"],
-              ["ts", "TypeScript", "or Python, Go, Rust …"],
+              ["ts", "TypeScript", "@kiln/sdk"],
             ] as const
           ).map(([id, label, say]) => {
-            const on = !action && id === "yaml";
-            const dim = action || id === "ts";
+            const on = !action && (id === "ts") === acts.ts;
+            // An action is its action.yml; a reusable workflow is YAML, the file its callers read.
+            const why = action ? "An action is its action.yml: a language is a workflow's" : id === "ts" && make.kind === "reusable" ? "A reusable workflow is YAML: the file its callers read" : null;
             return (
               <React.Fragment key={id}>
-                <li className="jp-j" data-key={`lang.${id}`} data-sel={on || undefined} data-dim={dim || undefined}>
+                <li className="jp-j" data-key={`lang.${id}`} data-sel={on || undefined} data-dim={why !== null || undefined}>
                   <span className="jp-glyph" aria-hidden="true">
                     <StatusGlyph state={on ? "passed" : "none"} size={12} />
                   </span>
                   <button
                     type="button"
                     className="jp-line"
-                    aria-disabled={dim || undefined}
-                    onClick={() => (dim ? acts.onSay(action ? "An action is its action.yml: a dialect is a workflow's" : "Workflows in code come with W29-R27") : undefined)}
+                    aria-disabled={why !== null || undefined}
+                    onClick={() => (why ? acts.onSay(why) : id === "ts" ? acts.onTypeScript() : acts.onDialect(acts.kiln))}
                   >
                     <span className="n">{label}</span>
                     <span className="v">{say}</span>
@@ -640,7 +657,7 @@ function NewBody({
                   <li className="jp-q ppl-dialect" aria-label="YAML dialect">
                     <span>dialect:</span>
                     {([false, true] as const).map((k) => (
-                      <button key={String(k)} type="button" aria-pressed={acts.kiln === k} onClick={() => acts.onDialect(k)}>
+                      <button key={String(k)} type="button" aria-pressed={!acts.ts && acts.kiln === k} onClick={() => acts.onDialect(k)}>
                         {k ? "kiln's" : "GitHub's"}
                       </button>
                     ))}
@@ -806,6 +823,8 @@ function viewsFor(p: ShipPipelinePane, l: ShipPipelineLine | null): string[] {
   const action = !["workflow", "reusable"].includes(p.head.kind);
   if (action) return p.detail.views.length ? p.detail.views : ["YAML"];
   if (!l) return p.detail.views.length ? p.detail.views : ["YAML"];
+  // A code workflow's part: its program, edited where it's shown, and what it makes for it (W29-R27).
+  if (isCode(p.head.path)) return l.kind === "job" ? ["Code", "What it makes", "Plan", "Last run"] : l.kind === "run" ? ["Run"] : ["Code", "What it makes", "Plan"];
   switch (l.kind) {
     case "job":
       return ["YAML", "Plan", "Last run"];
@@ -928,10 +947,13 @@ function PipelinePane({ repo, row, onChanged, onLine }: { repo: ShipPipelineRepo
   // kiln's own triggers of a GitHub workflow come from its overlay, each saying so.
   const overlaid = ov ? (triggerLines(overlay, true) ?? []).filter((l) => l.whose === "kiln").map((l) => ({ ...l, note: l.note ? `${l.note} · in its overlay` : "in its overlay" })) : [];
   const inOverlay = (event: string) => overlaid.some((l) => eventKey(l) === event);
-  const written = workflow && (changed || overlaid.length) ? triggerLines(text, kiln) : null;
+  // A code workflow's lines follow what its program makes as it's typed, the YAML its check found, its text not being YAML (W29-R27).
+  const code = workflow && isCode(h.path);
+  const shape = !workflow ? null : code ? (checked?.text === text ? (checked.emitted ?? null) : null) : text;
+  const written = shape !== null && (changed || overlaid.length) ? triggerLines(shape, kiln || code) : null;
   const typed = written ? [...written, ...overlaid] : null;
   // A job or use typed in is a line of its own, marked new; one taken out is gone (pl-3).
-  const typedAll = workflow && textChanged ? typedGroups(text, p.groups) : null;
+  const typedAll = shape !== null && textChanged ? typedGroups(shape, p.groups) : null;
   const added = typedAll ? addedOf(typedAll) : [];
   // What the strip says it adds: its new jobs, else its new uses (pl-3's `Adds helm-lint`); and what its check found.
   const adds = added.some((l) => l.kind === "job") ? added.filter((l) => l.kind === "job") : added.filter((l) => l.kind === "use");
@@ -949,7 +971,8 @@ function PipelinePane({ repo, row, onChanged, onLine }: { repo: ShipPipelineRepo
           )
         ),
     )
-    .map((g) => (g.name === "Triggers" && workflow ? { ...g, lines: [...(typed ?? g.lines), ...(editable ? [ADD_TRIGGER] : [])] } : g));
+    // A code workflow's triggers are its program's, written in Code: Add a trigger writes YAML (W29-R27).
+    .map((g) => (g.name === "Triggers" && workflow ? { ...g, lines: [...(typed ?? g.lines), ...(editable && !code ? [ADD_TRIGGER] : [])] } : g));
   const lines = groups.flatMap((g) => g.lines);
   const at = picked && lines.some((l) => l.key === picked) ? picked : firstPick(p);
   const line = lines.find((l) => l.key === at) ?? null;
@@ -1004,7 +1027,13 @@ function PipelinePane({ repo, row, onChanged, onLine }: { repo: ShipPipelineRepo
   const qualified = !h.dialect || h.kind === "reusable" || Boolean(h.draft) || repo.access !== "none";
   const where = (
     h.dialect
-      ? [qualified ? repo.repo : null, h.path, changed && !h.draft ? null : `${DIALECT_WORD[h.dialect] ?? h.dialect} dialect`, changed && !h.draft ? `from ${h.ref}` : h.ref, h.commit.slice(0, 7)]
+      ? [
+          qualified ? repo.repo : null,
+          h.path,
+          changed && !h.draft ? null : isCode(h.path) ? (DIALECT_WORD[h.dialect] ?? h.dialect) : `${DIALECT_WORD[h.dialect] ?? h.dialect} dialect`,
+          changed && !h.draft ? `from ${h.ref}` : h.ref,
+          h.commit.slice(0, 7),
+        ]
       : [repo.repo, h.path, `${(KIND_WORD[h.kind] ?? h.kind).toLowerCase()} action`]
   )
     .filter(Boolean)
@@ -1234,6 +1263,15 @@ function PipelinePane({ repo, row, onChanged, onLine }: { repo: ShipPipelineRepo
           Locked <b>{uses ?? h.title}</b> at {uses ? "its commit" : "the commits it uses"} in a draft: unpublished until it lands.
         </>,
       ),
+    saveGithub: (yaml) => {
+      const path = `.github/workflows/${h.path.replace(/^.*\//, "").replace(/\.[^.]+$/, "")}.yml`;
+      void act(
+        { verb: "save_draft", content: text, files: [{ path, text: yaml }] },
+        <>
+          Saved <b>{path}</b> beside {h.title} as a draft: unpublished until it lands.
+        </>,
+      );
+    },
     accept: () => {
       const r = p.lock_review;
       if (!r || !h.draft) return;
@@ -1424,6 +1462,8 @@ interface Tools {
   lock: (uses: string | null) => void;
   /** A person's word on a lock-change draft's upstream code, as its head and evidence stand (W29-R25). */
   accept: () => void;
+  /** A code workflow's draft, with the GitHub workflow of its name that it makes beside it (W29-R27). */
+  saveGithub: (yaml: string) => void;
 }
 
 /** What the YAML view's check found of the pane's own file (pl-3): the text it checked, its problems, and its plan's jobs against what's published (none before it's typed in). */
@@ -1432,6 +1472,8 @@ interface Checked {
   errors: number;
   warnings: number;
   jobs: { now: number; was: number | null } | null;
+  /** A code workflow's: the YAML its program makes of `text` (W29-R27). */
+  emitted?: string | null;
 }
 
 /** A check's findings in the strip's words (pl-3): `checks clean`, `checks clean but for 1 warning`, `checks find 2 errors and 1 warning`. */
@@ -2039,6 +2081,14 @@ function View({
       ) : (
         <CodeView text={text} path={h.path} spot={line ? spotOf(text, line) : null} rows={rows} />
       );
+    case "Code":
+      return editable ? (
+        <YamlView pane={pane} line={line} text={text} onText={onText} ask={ask} onChecked={tools.checked} onLock={tools.lock} />
+      ) : (
+        <CodeView text={text} path={h.path} spot={null} rows={rows} />
+      );
+    case "What it makes":
+      return <WhatItMakes pane={pane} line={line} text={text} ask={ask} editable={editable} tools={tools} rows={rows} />;
     case "Flow":
       return <FlowView repo={pane.repo} text={text} onChange={onText} />;
     case "Plan":
@@ -2122,7 +2172,7 @@ function YamlView({
   const workflow = ["workflow", "reusable"].includes(h.kind) && !file;
   const editor = React.useRef<Editor>(null);
   const lint = async (t: string): Promise<Diagnostic[]> => {
-    if (syntax !== "workflow") return [];
+    if (syntax !== "workflow" && !isCode(h.path)) return [];
     try {
       const [r, now, was] = await Promise.all([
         ci.validate(file ?? fileOf(h), t, pane.repo, undefined, h.commit),
@@ -2139,6 +2189,7 @@ function YamlView({
         errors: shown.filter((d) => d.severity === "error").length,
         warnings: shown.filter((d) => d.severity === "warning").length,
         jobs: planned ? { now: planned.now.length, was: planned.was?.length ?? null } : null,
+        emitted: now?.emitted ?? null,
       });
       return shown.map((d) => {
         const from = offsetOf(t, d.range.start);
@@ -2509,6 +2560,44 @@ function CodeView({ text, path, spot, rows }: { text: string; path: string; spot
         </li>
       ))}
     </ol>
+  );
+}
+
+/**
+ * What a code workflow makes (W29-R27): the YAML its program makes for the strip's event, as the
+ * server makes it, read-only, the picked part's lines tinted; and Save as a GitHub workflow, which
+ * acts where that YAML is GitHub-exact and says why not where it isn't.
+ */
+function WhatItMakes({
+  pane,
+  line,
+  text,
+  ask,
+  editable,
+  tools,
+  rows,
+}: {
+  pane: ShipPipelinePane;
+  line: ShipPipelineLine | null;
+  text: string;
+  ask: PlanAsk;
+  editable: boolean;
+  tools: Tools;
+  rows: number;
+}) {
+  const made = useSuspenseResource(`ci/plan-preview/${pane.repo}/${pane.head.path}/${hashOf(text)}/${ask.event ?? ""}`, () => planOf(pane, text, ask.event)).data;
+  const yaml = made.emitted ?? "";
+  const why = !yaml ? "it makes no workflow yet: see its Problems" : made.emitted_github ? (editable ? null : "only who may edit it saves it") : "it uses kiln's keys, which GitHub has none of";
+  return (
+    <div className="ppl-made">
+      <CodeView text={yaml || "# no workflow: see its Problems"} path="what-it-makes.yml" spot={line && yaml ? spotOf(yaml, line) : null} rows={Math.max(1, rows - 1)} />
+      <div className="ppl-made-act">
+        <button type="button" aria-disabled={why !== null || undefined} onClick={() => (why ? tools.say(`Not saved as a GitHub workflow: ${why}.`) : tools.saveGithub(yaml))}>
+          Save as a GitHub workflow
+        </button>
+        <span>{why ?? `.github/workflows/${pane.head.path.replace(/^.*\//, "").replace(/\.[^.]+$/, "")}.yml, beside it in a draft`}</span>
+      </div>
+    </div>
   );
 }
 

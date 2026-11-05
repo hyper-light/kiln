@@ -160,6 +160,10 @@ name = "collect"
 harness = false
 
 [[bench]]
+name = "code_workflows"
+harness = false
+
+[[bench]]
 name = "issues"
 harness = false
 

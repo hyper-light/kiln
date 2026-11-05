@@ -20,7 +20,7 @@ const programs = (sub: string) =>
     .map((f) => join(dir, sub, f));
 
 test("W29-R27: code workflows type-check against @kiln/sdk", () => {
-  const right = [...programs("."), ...programs("types").filter((f) => !f.includes("wrong-"))];
+  const right = [...programs("kiln"), ...programs("types").filter((f) => !f.includes("wrong-"))];
   assert.ok(right.length >= 1);
   for (const f of right) assert.deepEqual(problems(f), [], f);
 });

@@ -269,7 +269,14 @@ fn workflow_row(repo: &Repo, l: &crate::ci::load::Loaded, ctx: &Ctx, env: &Env, 
     };
     let line = workflow_line(l, kind, github_note);
     let (who, when, commit) = ctx.changes.get(&l.path).cloned().map_or((None, None, None), |(w, t, sha)| (Some(w), Some(t), Some(sha)));
-    let mut row = Row::new(facts, Some(if l.dialect == kiln_ci::expr::Dialect::Kiln { "kiln" } else { "gha" }), line, who, when);
+    // A code workflow says its language (W29-R27): what it's written in, not what it makes.
+    let dialect = match (&l.program, l.dialect) {
+        (Some(_), _) if l.path.ends_with(".js") => "js",
+        (Some(_), _) => "ts",
+        (None, kiln_ci::expr::Dialect::Kiln) => "kiln",
+        (None, _) => "gha",
+    };
+    let mut row = Row::new(facts, Some(dialect), line, who, when);
     row.commit = commit;
     row
 }

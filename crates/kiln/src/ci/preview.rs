@@ -15,6 +15,10 @@
 //! and why, combinations removed, and jobs decided only when their needs finish; and each job's
 //! matrix as written, for the builder's matrix view (W21-R06); and each schedule's next runs, as
 //! W03's cron will read them (Ship's Pipelines' Times view, W29-R06).
+//!
+//! A code workflow (`.kiln/<name>.ts` or `.js`, W29-R27) is made for the event it's planned for,
+//! its diagnostics at the program's lines. Its answer adds `emitted`, the YAML it makes (R27's
+//! "What it makes"), and `emitted_github`, whether that YAML is GitHub-exact.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -50,9 +54,34 @@ pub async fn of(hub: &Arc<Hub>, caller: Option<&crate::authz::Caller>, b: Value)
     let refused = |r: events::Refused| (r.status, r.message);
     let (full_ref, sha) = events::preview_ref(hub, &repo, b.get("ref").and_then(Value::as_str).unwrap_or_default(), b.get("sha").and_then(Value::as_str)).await.map_err(refused)?;
     let path = b.get("path").and_then(Value::as_str).map(str::to_owned);
+    let (event_name, payload, given) = match b.get("event") {
+        Some(Value::Object(o)) => (o.get("name").and_then(Value::as_str).unwrap_or("push").to_owned(), o.get("payload").cloned(), o.get("inputs").and_then(Value::as_object).cloned().unwrap_or_default()),
+        Some(Value::String(s)) => (s.clone(), None, b.get("inputs").and_then(Value::as_object).cloned().unwrap_or_default()),
+        _ => ("push".to_owned(), None, b.get("inputs").and_then(Value::as_object).cloned().unwrap_or_default()),
+    };
+    // W29-R27: a code workflow, as edited or the commit's, is made for the event it's planned for.
+    let program = match path.as_deref().filter(|p| kiln_ci::wf::file_kind(p) == Some(kiln_ci::wf::FileKind::CodeWorkflow)) {
+        Some(p) => {
+            let text = match b.get("content").and_then(Value::as_str) {
+                Some(t) => t.to_owned(),
+                None => load::blob(hub, &repo, &sha, p).await.map_err(|e| (StatusCode::NOT_FOUND, format!("No workflow {p} at {sha}: {e:#}")))?,
+            };
+            let tree = super::code::tree_at(hub, &repo, &sha).await.map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")))?;
+            Some((p.to_owned(), text, tree))
+        }
+        None => None,
+    };
+    let mut made = None;
     // The workflow: as edited, or the commit's.
-    let (path, workflow, diagnostics) = match b.get("content").and_then(Value::as_str) {
-        Some(text) => {
+    let (path, workflow, diagnostics) = match (&program, b.get("content").and_then(Value::as_str)) {
+        (Some((p, text, tree)), _) => {
+            // First for the event with no inputs: what the program declares types them after.
+            let (event, _) = events::preview_event(hub, &repo, &event_name, &full_ref, &sha, payload.as_ref(), &serde_json::Map::new(), Some(&[]), p).await.map_err(refused)?;
+            let (w, d, m) = make(p, text, tree, &event.payload).await?;
+            made = m;
+            (p.clone(), w, d)
+        }
+        (None, Some(text)) => {
             let p = path.unwrap_or_else(|| ".github/workflows/preview.yml".into());
             let dialect = if p.starts_with(".kiln/") { Dialect::Kiln } else { Dialect::Gha };
             let (text, q) = (text.to_owned(), p.clone());
@@ -75,7 +104,7 @@ pub async fn of(hub: &Arc<Hub>, caller: Option<&crate::authz::Caller>, b: Value)
             .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")))?;
             (p, w, load::stored(&d))
         }
-        None => {
+        (None, None) => {
             let p = path.ok_or_else(|| bad("`path` or `content` is required".into()))?;
             let commit = load::load(hub, &repo, &sha).await.map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")))?;
             let l = commit.workflows.into_iter().find(|l| l.path == p || l.path.rsplit('/').next() == Some(p.as_str())).ok_or_else(|| (StatusCode::NOT_FOUND, format!("No workflow {p} at {sha}")))?;
@@ -84,16 +113,25 @@ pub async fn of(hub: &Arc<Hub>, caller: Option<&crate::authz::Caller>, b: Value)
     };
     let errors = diagnostics.iter().any(|d| d.severity == kiln_ci::wf::Severity::Error);
     let base = json!({ "repo": repo.name, "ref": full_ref, "sha": sha, "path": path, "diagnostics": diagnostics });
-    let (Some(w), false) = (workflow, errors) else {
+    let (Some(mut w), false) = (workflow, errors) else {
         return Ok(srv::json(StatusCode::OK, &merge(base, json!({ "runs": false, "why": "the workflow has errors", "plan": Value::Null }))));
-    };
-    let (event_name, payload, given) = match b.get("event") {
-        Some(Value::Object(o)) => (o.get("name").and_then(Value::as_str).unwrap_or("push").to_owned(), o.get("payload").cloned(), o.get("inputs").and_then(Value::as_object).cloned().unwrap_or_default()),
-        Some(Value::String(s)) => (s.clone(), None, b.get("inputs").and_then(Value::as_object).cloned().unwrap_or_default()),
-        _ => ("push".to_owned(), None, b.get("inputs").and_then(Value::as_object).cloned().unwrap_or_default()),
     };
     let declared = w.on.iter().find(|t| t.event == "workflow_dispatch").map(|t| t.inputs.clone());
     let (event, inputs) = events::preview_event(hub, &repo, &event_name, &full_ref, &sha, payload.as_ref(), &given, declared.as_deref(), &path).await.map_err(refused)?;
+    // A dispatch's inputs typed as the program declares them: its workflow made for them again.
+    if let (Some((p, text, tree)), Some(_)) = (&program, &declared) {
+        let (again, d, m) = make(p, text, tree, &event.payload).await?;
+        made = m;
+        match again {
+            Some(a) if !d.iter().any(|x| x.severity == kiln_ci::wf::Severity::Error) => w = a,
+            _ => {
+                let base = json!({ "repo": repo.name, "ref": full_ref, "sha": sha, "path": path, "diagnostics": d });
+                return Ok(srv::json(StatusCode::OK, &merge(base, json!({ "runs": false, "why": "the workflow has errors", "plan": Value::Null }))));
+            }
+        }
+    }
+    // R27's "What it makes": the YAML a program makes, and whether it's GitHub-exact.
+    let emitted = made.as_ref().and_then(|m| kiln_ci::wf::code::emitted(&m.json));
     let matched = match kiln_ci::drafts::held_back(&event, &path) {
         Some(why) => Err(why.to_owned()),
         None => kiln_ci::trigger::matches(&w, &event),
@@ -110,7 +148,24 @@ pub async fn of(hub: &Arc<Hub>, caller: Option<&crate::authz::Caller>, b: Value)
         _ => return Err((StatusCode::SERVICE_UNAVAILABLE, "The CI dispatcher didn't answer.".into())),
     };
     let why = matched.as_ref().err().map(ToString::to_string);
-    Ok(srv::json(StatusCode::OK, &merge(base, json!({ "event": event_name, "runs": matched.is_ok() && policy.is_empty(), "why": why, "policy": policy, "plan": plan, "matrices": matrices, "schedules": schedules }))))
+    Ok(srv::json(
+        StatusCode::OK,
+        &merge(
+            base,
+            json!({
+                "event": event_name, "runs": matched.is_ok() && policy.is_empty(), "why": why, "policy": policy, "plan": plan, "matrices": matrices, "schedules": schedules,
+                "emitted": emitted.as_ref().map(|(yaml, _)| yaml), "emitted_github": emitted.as_ref().map(|(_, github)| github),
+            }),
+        ),
+    ))
+}
+
+/// A code workflow made for an event's payload (W29-R27): what W02 reads of it, its diagnostics
+/// at the program's lines, and what it made.
+async fn make(path: &str, text: &str, tree: &Arc<dyn super::code::Tree>, payload: &Value) -> Result<(Option<kiln_ci::wf::Workflow>, Vec<kiln_ci::wf::diag::StoredDiag>, Option<super::code::Made>), Fail> {
+    let (p, t, tree, e) = (path.to_owned(), text.to_owned(), Arc::clone(tree), payload.clone());
+    let (w, d, m) = crate::rt::blocking(move || super::code::checked(&p, &t, &e, tree)).await.map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")))?;
+    Ok((w, load::stored(&d), m))
 }
 
 /// Each schedule's options and its next three runs after `now`, daylight-saving changes said

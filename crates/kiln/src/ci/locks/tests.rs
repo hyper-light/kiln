@@ -209,7 +209,7 @@ fn w29_r23_lock_failure_is_a_startup_failure_with_zero_jobs() -> anyhow::Result<
         let _stop = Stop(Arc::clone(&hub));
         let (tx, rx) = async_channel::bounded(1);
         let event = kiln_ci::trigger::Event { name: "push".into(), repo: caller.repo.name.clone(), git_ref: "refs/heads/main".into(), sha: caller.commit.clone(), actor: "lock-test".into(), trusted: true, ..Default::default() };
-        let loaded = super::super::load::Loaded { path: PATH.into(), dialect: Dialect::Gha, runs: true, workflow: Some((*caller.model).clone()), diagnostics: Vec::new() };
+        let loaded = super::super::load::Loaded { path: PATH.into(), dialect: Dialect::Gha, runs: true, workflow: Some((*caller.model).clone()), diagnostics: Vec::new(), program: None };
         super::super::events::start_given(&hub, &caller.repo, &event, &loaded, ("lock test", "tester"), serde_json::Value::Null, super::super::dispatch::Given { reply: Some(tx), ..Default::default() }).await?;
         let id = crate::rt::timeout(Duration::from_secs(30), rx.recv()).await??;
         let until = std::time::Instant::now() + Duration::from_secs(30);

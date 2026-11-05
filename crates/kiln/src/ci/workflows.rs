@@ -85,7 +85,16 @@ pub async fn validate_value(hub: &Hub, caller: Option<&Caller>, body: Value) -> 
 async fn checked(hub: &Hub, repo: Option<&Repo>, path: &str, content: String, dialect: Option<Dialect>, sha: Option<&str>) -> Result<wf::Checked, Fail> {
     let p = path.to_owned();
     let overlay_text = content.clone();
-    let (mut checked, model) = crate::rt::blocking(move || wf::check_model(&p, &content, dialect)).await.map_err(|e| internal(&e))?;
+    // W29-R27: a code workflow is what its program makes, for a push to the trunk at the commit.
+    let mut made = None;
+    let (mut checked, model) = if wf::file_kind(path) == Some(wf::FileKind::CodeWorkflow) {
+        let (event, tree) = program_facts(hub, repo, sha).await;
+        let (w, diagnostics, m) = crate::rt::blocking(move || super::code::checked(&p, &content, &event, tree)).await.map_err(|e| internal(&e))?;
+        made = m;
+        (wf::Checked { kind: "workflow", dialect: Dialect::Kiln, diagnostics, outline: w.as_ref().map(wf::outline) }, w)
+    } else {
+        crate::rt::blocking(move || wf::check_model(&p, &content, dialect)).await.map_err(|e| internal(&e))?
+    };
     if let (Some(repo), Some(w)) = (repo, &model)
         && runs_here(hub, repo, path).await
     {
@@ -99,6 +108,10 @@ async fn checked(hub: &Hub, repo: Option<&Repo>, path: &str, content: String, di
         checked.diagnostics.extend(more);
         let policy = super::repo_config::lock_policy(hub, repo).await.unwrap_or_default();
         kiln_ci::lock::editor::feedback(&mut checked.diagnostics, w, path, &kiln_ci::lock::editor::Facts { locked: &locked, onboarded, policy });
+        // What the server says of a program's workflow, at the SDK call that made each part.
+        if let Some(m) = &made {
+            checked.diagnostics = checked.diagnostics.drain(..).map(|d| super::code::place(d, m)).collect();
+        }
         checked.diagnostics.sort_by_key(|x| (x.range.start.line, x.range.start.col, x.code));
     }
     // An overlay against the workflow it overlays, at the repository's default branch: the keys it
@@ -125,6 +138,24 @@ async fn checked(hub: &Hub, repo: Option<&Repo>, path: &str, content: String, di
         checked.diagnostics.sort_by_key(|x| (x.range.start.line, x.range.start.col, x.code));
     }
     Ok(checked)
+}
+
+/// What a code workflow is made with where it's checked (W29-R27): a push of its commit to the
+/// repository's trunk, and that commit's tree (`sha`, else the default branch's head); with no
+/// repository, a push to `main` and no files.
+async fn program_facts(hub: &Hub, repo: Option<&Repo>, sha: Option<&str>) -> (Value, Arc<dyn super::code::Tree>) {
+    if let Some(repo) = repo {
+        let at = match sha {
+            Some(s) => Some(s.to_owned()),
+            None => load::resolve(hub, repo, "HEAD").await.ok().flatten(),
+        };
+        if let Some(at) = at
+            && let Ok(tree) = super::code::tree_at(hub, repo, &at).await
+        {
+            return (load::push_of(repo, &at), tree);
+        }
+    }
+    (json!({ "ref": "refs/heads/main" }), Arc::new(super::code::NoTree))
 }
 
 /// Whether kiln runs the workflow at `path` of `repo`: KilnCI is a CI provider of it (W23-R01),
@@ -293,14 +324,14 @@ struct FileAsk {
 /// host a draft change from a branch of its own (`kiln/draft/<stem>-<id8>`) whose commits say
 /// `[skip ci]`. A later save of the caller's draft of the file adds to it: a new version of the
 /// diff, or a new commit on the branch. Its answer says the draft as kiln records it (`draft`).
-/// A GitHub workflow's draft may carry its overlay (`files: [{ path, text }]`, W29-R06), checked
-/// as the workflow is.
+/// A GitHub workflow's draft may carry its overlay (`files: [{ path, text }]`, W29-R06), and a code
+/// workflow's the GitHub workflow of its name that it makes (W29-R27), each checked as it is.
 ///
 /// Each answer has the diagnostics, and the plan a push of it to the default branch makes (W20-R03).
 pub async fn edit(hub: &Arc<Hub>, caller: &Caller, repo_key: &str, path: &str, body: &Value) -> Result<Value, Fail> {
     let ask: EditAsk = serde_json::from_value(body.clone()).map_err(|e| bad(format!("{e}")))?;
     let file = path.trim_start_matches("./");
-    if !matches!(wf::file_kind(file), Some(wf::FileKind::GhaWorkflow | wf::FileKind::KilnWorkflow | wf::FileKind::Action)) || file.split('/').any(|s| s.is_empty() || s == "." || s == "..") {
+    if !matches!(wf::file_kind(file), Some(wf::FileKind::GhaWorkflow | wf::FileKind::KilnWorkflow | wf::FileKind::CodeWorkflow | wf::FileKind::Action)) || file.split('/').any(|s| s.is_empty() || s == "." || s == "..") {
         return Err(bad(format!("`{path}` is not where workflows or actions are (.github/workflows/*.yml, .kiln/*.yaml, .github/actions/**/action.yml)")));
     }
     let repo = find_repo(hub, repo_key).await?;
@@ -309,12 +340,21 @@ pub async fn edit(hub: &Arc<Hub>, caller: &Caller, repo_key: &str, path: &str, b
     if !errors.is_empty() {
         return Err((StatusCode::UNPROCESSABLE_ENTITY, format!("{file} has errors, so it isn't saved:\n{}", errors.join("\n"))));
     }
-    // Its overlay, saved beside it in the draft (W29-R06): only its own, each checked as it is.
+    // Its overlay, saved beside it in the draft (W29-R06): only its own, each checked as it is. A
+    // code workflow's draft may carry the GitHub workflow of its name that it makes (W29-R27).
+    let stem = |p: &str| p.rsplit('/').next().and_then(|n| n.rsplit_once('.')).map(|(s, _)| s.to_owned());
     let mut more = Vec::new();
     for f in &ask.files {
-        let own = matches!((wf::file_kind(file), wf::file_kind(&f.path)), (Some(wf::FileKind::GhaWorkflow), Some(wf::FileKind::Overlay { stem })) if file.rsplit('/').next().and_then(|n| n.rsplit_once('.')).is_some_and(|(s, _)| s == stem));
+        let own = match (wf::file_kind(file), wf::file_kind(&f.path)) {
+            (Some(wf::FileKind::GhaWorkflow), Some(wf::FileKind::Overlay { stem: s })) => stem(file).as_deref() == Some(s.as_str()),
+            (Some(wf::FileKind::CodeWorkflow), Some(wf::FileKind::GhaWorkflow)) => stem(file) == stem(&f.path),
+            _ => false,
+        };
         if !own || ask.draft != Some(true) {
-            return Err(bad(format!("`files` carries a GitHub workflow's own overlay in its draft (.kiln/overlays/<its name>.yaml, with `draft`), not `{}`", f.path)));
+            return Err(bad(format!(
+                "`files` carries a GitHub workflow's own overlay in its draft (.kiln/overlays/<its name>.yaml), or a code workflow's GitHub workflow (.github/workflows/<its name>.yml), with `draft`; not `{}`",
+                f.path
+            )));
         }
         let c = self::checked(hub, Some(&repo), &f.path, f.text.clone(), None, None).await?;
         let errors: Vec<String> = c.diagnostics.iter().filter(|d| d.is_error()).map(|d| d.render(&f.path)).collect();
@@ -605,7 +645,7 @@ pub(crate) async fn fresh_lock_draft(hub: &Arc<Hub>, caller: &Caller, repo: &Rep
 }
 
 /// Pipelines' New (docs/ci.md W29-R08): `kiln_ci::scaffold`'s files for a kind (`kind`), a
-/// dialect (`language`: `gha` or `kiln`), a name and where it starts (`from`: `blank`,
+/// dialect (`language`: `gha`, `kiln` or `ts`, W29-R27), a name and where it starts (`from`: `blank`,
 /// `recommended`, `{ "starter": "rust" }` or `{ "copy": path }`), or `files` as the caller edited
 /// them, each one of the scaffold's paths or under its folder. With `dry` it says the files;
 /// otherwise each is checked as Save draft checks a file, and they're saved together as the
@@ -618,7 +658,8 @@ pub async fn new_draft(hub: &Arc<Hub>, caller: &Caller, repo_key: &str, body: &V
     let dialect = match text("language") {
         None | Some("gha" | "yaml") => scaffold::Dialect::Gha,
         Some("kiln") => scaffold::Dialect::Kiln,
-        Some(other) => return Err(bad(format!("`language` is gha or kiln, not `{other}`: workflows in code come with W29-R27"))),
+        Some("ts" | "typescript") => scaffold::Dialect::TypeScript,
+        Some(other) => return Err(bad(format!("`language` is gha, kiln or ts, not `{other}`"))),
     };
     let repo = find_repo(hub, repo_key).await?;
     let default = super::events::facts(hub, &repo).await.default_branch;
@@ -800,8 +841,8 @@ pub async fn get(hub: &Hub, repo: &str, path: &str, q: &HashMap<String, String>)
     if wf::file_kind(path) == Some(wf::FileKind::Action) {
         return get_action(hub, repo, path, q).await;
     }
-    if !matches!(wf::file_kind(path), Some(wf::FileKind::GhaWorkflow | wf::FileKind::KilnWorkflow)) {
-        return Err(missing(format!("`{path}` is not where workflows are (.github/workflows/*.yml, .kiln/*.yaml)")));
+    if !matches!(wf::file_kind(path), Some(wf::FileKind::GhaWorkflow | wf::FileKind::KilnWorkflow | wf::FileKind::CodeWorkflow)) {
+        return Err(missing(format!("`{path}` is not where workflows are (.github/workflows/*.yml, .kiln/*.yaml, .kiln/*.ts)")));
     }
     let (repo, r, sha) = at_ref(hub, repo, q).await?;
     let commit = load::load(hub, &repo, &sha).await.map_err(|e| internal(&e))?;

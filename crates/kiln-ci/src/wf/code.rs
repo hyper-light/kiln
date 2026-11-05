@@ -75,6 +75,19 @@ pub fn default_export(text: &str) -> Option<Pos> {
     Some(pos(text, at))
 }
 
+/// What a program made, as YAML (R27's "What it makes"), in its own key order; and whether it's
+/// GitHub-exact: read as a GitHub workflow, it uses none of kiln's keys (no `KCI5xxx`).
+pub fn emitted(json: &str) -> Option<(String, bool)> {
+    // Read as YAML 1.2, which JSON is, so each mapping keeps the order the program wrote it in.
+    let doc = yaml_rust2::YamlLoader::load_from_str(json).ok()?.into_iter().next()?;
+    let mut text = String::new();
+    yaml_rust2::YamlEmitter::new(&mut text).dump(&doc).ok()?;
+    let yaml = format!("{}\n", text.strip_prefix("---\n").unwrap_or(&text));
+    let (_, diags) = super::parse_workflow(".github/workflows/emitted.yml", &yaml, crate::expr::Dialect::Gha);
+    let github = !diags.iter().any(|d| d.code.starts_with("KCI5"));
+    Some((yaml, github))
+}
+
 fn unquote(s: &str) -> String {
     s.get(1..s.len().saturating_sub(1)).unwrap_or_default().to_owned()
 }

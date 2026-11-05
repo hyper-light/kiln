@@ -8,7 +8,9 @@
  * projects running side by side don't see each other's.
  */
 import type http from "node:http";
-import { parse, parseDocument } from "yaml";
+import { stripTypeScriptTypes } from "node:module";
+import vm from "node:vm";
+import { parse, parseDocument, stringify } from "yaml";
 import type { ShipPipelineDraft, ShipPipelineGroup, ShipPipelineLine, ShipPipelinePane, ShipPipelineRepo, ShipPipelineRow, ShipPipelineVerb, ShipPipelines } from "../src/api/ship.ts";
 import { ADDED, CALLED, CHECKS, FILES, JOB_SECS, LAST_COMMIT, LOCK_REVIEWS, LOCKS, RESOLVED, RUNS, SET_IN, TAG_AGO, TAGS, UPDATES, USED_BY } from "./pipelines-files.ts";
 // The pane's words as the server words them: the UI's own, so the mock and the typed text agree.
@@ -511,7 +513,7 @@ function workflowGroups(key: string, text: string, kiln: boolean, runsHere: bool
         ? { key: "settings.on", kind: "setting", name: "Turned on", value: "runs on its triggers" }
         : { key: "settings.on", kind: "setting", name: "Not run here", value: "this repository's .kiln/ workflows run instead" },
       { key: "settings.machines", kind: "setting", name: "Machines", value: "bare metal unless a job says" },
-      ...(doc.concurrency ? [{ key: "settings.concurrency", kind: "setting", name: "Concurrency", value: String(doc.concurrency) }] : []),
+      ...(doc.concurrency ? [{ key: "settings.concurrency", kind: "setting", name: "Concurrency", value: String(obj(doc.concurrency).group ?? doc.concurrency) }] : []),
       ...lockLines(LOCKS[key.replace(/:draft:.*$/, "")], jobs),
       ...(Object.keys(call).length ? [{ key: "settings.access", kind: "setting", name: "Access", value: "shared with hyper-light's repositories", state: "owner" }] : []),
     ],
@@ -763,7 +765,11 @@ function paneOf(repo: string, row: ShipPipelineRow, ua = ""): ShipPipelinePane {
   const tip = row.draft ? row.commit : (HEADS[repo]?.commit ?? row.commit);
   const action = !["workflow", "reusable"].includes(row.kind);
   const kiln = row.dialect === "kiln";
-  const groups = action ? actionGroups(repo, key, text, row.kind, tip) : workflowGroups(key, text, kiln, row.stand !== "superseded");
+  // A code workflow's groups are what its program makes (W29-R27).
+  const code = !action && isCode(row.path);
+  const program = code ? made(row.path, text) : null;
+  const shape = program && "workflow" in program ? stringify(program.workflow) : code ? "" : text;
+  const groups = action ? actionGroups(repo, key, text, row.kind, tip) : workflowGroups(key, shape, kiln || code, row.stand !== "superseded");
   const update = UPDATES[key];
   // kiln's update draft in its ordinary groups: the use it moves in Uses, under the version it had, marked (`kiln_ci::pipelines::mark_moved`, pl-7).
   if (update)
@@ -813,7 +819,7 @@ function paneOf(repo: string, row: ShipPipelineRow, ua = ""): ShipPipelinePane {
     groups,
     detail: {
       name: row.path,
-      views: action ? ["Changes", "YAML", "Try it"] : ["YAML", "Flow", "Plan"],
+      views: action ? ["Changes", "YAML", "Try it"] : code ? ["Code", "What it makes", "Plan"] : ["YAML", "Flow", "Plan"],
       text,
       ...(row.released && !row.draft && (action || row.kind === "reusable")
         ? {
@@ -840,6 +846,44 @@ function paneOf(repo: string, row: ShipPipelineRow, ua = ""): ShipPipelinePane {
     repo,
     ...(review ? { lock_review: { ...review, accepted_by: accepted } } : {}),
   };
+}
+
+/** A code workflow (W29-R27): `.kiln/<name>.ts` or `.js`, the workflow its program makes. */
+const isCode = (path: string) => /^\.kiln\/[^/]+\.(ts|js)$/.test(path);
+
+/** kiln's own keys, as the mock knows them: what GitHub has none of. */
+const KILN_KEYS = ["toolchain", "resources", "requires", "image", "artifacts", "routing", "supersede", "cadence", "coalesce", "run-env", "checkout"];
+
+/**
+ * What a code workflow's program makes, as the server's QuickJS makes it (the mock's stand-in):
+ * its types stripped as Node strips them (the server's erasure is held to the same), then run with
+ * `@kiln/sdk`'s calls; or the code, line and message of why it makes nothing.
+ */
+function made(path: string, text: string, event: Obj = { ref: "refs/heads/main" }): { workflow: Obj } | { code: string; line: number; message: string } {
+  let js = text;
+  if (path.endsWith(".ts")) {
+    try {
+      js = stripTypeScriptTypes(text, { mode: "strip" });
+    } catch (e) {
+      const line = text.split("\n").findIndex((l) => /^\s*(export\s+)?(const\s+)?enum\b|\bnamespace\b|import\s+\w+\s*=/.test(l)) + 1;
+      return {
+        code: "KCI1033",
+        line: Math.max(line, 1),
+        message: /\benum\b/.test(text.split("\n")[line - 1] ?? "") ? "an `enum` isn't erasable TypeScript: use a `const` object" : String((e as Error).message),
+      };
+    }
+  }
+  const body = js.replace(/import\s*\{([^}]*)\}\s*from\s*["']@kiln\/sdk["'];?/g, (_, names: string) => `const {${names}} = __sdk;`).replace(/export\s+default\s+/, "__out.v = ");
+  const sdk = { workflow: (w: unknown) => w, job: (j: unknown) => j, step: (x: unknown) => x, event, tree: { read: () => null, list: () => [] } };
+  const out: { v?: unknown } = {};
+  try {
+    vm.runInNewContext(body, { __sdk: sdk, __out: out }, { timeout: 1000, filename: path });
+    const v = typeof out.v === "function" ? (out.v as (e: Obj) => unknown)(event) : out.v;
+    return { workflow: obj(JSON.parse(JSON.stringify(v ?? null))) };
+  } catch (e) {
+    const at = new RegExp(`${path.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}:(\\d+)`).exec(String((e as Error).stack ?? ""));
+    return { code: "KCI1030", line: Number(at?.[1] ?? 1), message: String((e as Error).message) };
+  }
 }
 
 /** The labels the mock's machines carry, for the Flow view's and Try it's pickers. */
@@ -895,11 +939,37 @@ function overlaySchedules(text: string): Obj[] {
 function preview(body: Obj): unknown {
   const text = String(body.content ?? FILES[`${String(body.repo)}:${String(body.path)}`] ?? "");
   let doc: Obj;
-  try {
-    doc = obj(parse(text));
-  } catch (e) {
-    return { repo: body.repo, ref: "main", sha: "", path: body.path, event: body.event, runs: false, why: `it isn't YAML: ${String(e)}`, diagnostics: [], plan: null };
-  }
+  let emitted: { emitted: string; emitted_github: boolean } | null = null;
+  if (isCode(String(body.path ?? ""))) {
+    const event = obj(body.event).name ?? body.event ?? "push";
+    const m = made(String(body.path), text, {
+      ref: "refs/heads/main",
+      ...(event === "pull_request" ? { pull_request: { number: 1 } } : {}),
+      ...(event === "workflow_dispatch" ? { inputs: obj(obj(body.event).inputs) } : {}),
+    });
+    if (!("workflow" in m)) {
+      const at = { line: m.line, col: 1 };
+      return {
+        repo: body.repo,
+        ref: "main",
+        sha: "",
+        path: body.path,
+        event: body.event,
+        runs: false,
+        why: "the workflow has errors",
+        diagnostics: [{ code: m.code, severity: "error", message: m.message, path: "", range: { start: at, end: at } }],
+        plan: null,
+      };
+    }
+    doc = m.workflow;
+    const yaml = stringify(doc);
+    emitted = { emitted: yaml, emitted_github: !KILN_KEYS.some((k) => new RegExp(`^\\s*${k}:`, "m").test(yaml)) };
+  } else
+    try {
+      doc = obj(parse(text));
+    } catch (e) {
+      return { repo: body.repo, ref: "main", sha: "", path: body.path, event: body.event, runs: false, why: `it isn't YAML: ${String(e)}`, diagnostics: [], plan: null };
+    }
   const fit = (name: string) => ({ runner: name, name, connected: true, eligible: true, room: true, score: 1, checks: [] });
   const legs = Object.entries(obj(doc.jobs)).flatMap(([id, j]) => {
     const job = obj(j);
@@ -947,6 +1017,7 @@ function preview(body: Obj): unknown {
     diagnostics: [],
     plan: { name: String(doc.name ?? ""), legs, decided: [], removed: {}, later: [] },
     schedules,
+    ...(emitted ?? {}),
   };
 }
 
@@ -961,6 +1032,11 @@ const PINS: Record<string, string> = { "azure/setup-helm@v4": "1a275c3f0b9e8d7c6
 function validate(body: Obj): unknown {
   const text = String(body.content ?? "");
   const diagnostics: unknown[] = [];
+  if (isCode(String(body.path ?? ""))) {
+    const m = made(String(body.path), text);
+    if (!("workflow" in m)) diagnostics.push({ code: m.code, severity: "error", message: m.message, path: "", range: { start: { line: m.line, col: 1 }, end: { line: m.line, col: 2 } } });
+    return { kind: "workflow", dialect: "kiln", diagnostics, outline: null };
+  }
   const doc = parseDocument(text);
   for (const e of doc.errors) {
     const [line, col] = [e.linePos?.[0]?.line ?? 1, e.linePos?.[0]?.col ?? 1];
@@ -991,6 +1067,11 @@ function scaffoldOf(body: Obj): { path: string; files: { path: string; text: str
   const kind = String(body.kind ?? "workflow");
   const name = String(body.name ?? "new");
   const kiln = body.language === "kiln";
+  if (kind === "workflow" && body.language === "ts") {
+    const path = `.kiln/${name}.ts`;
+    const text = `// ${name}: a kiln workflow in TypeScript (docs/ci.md W29-R27). Pipelines shows the YAML it makes.\nimport { workflow, job, step } from "@kiln/sdk";\n\nexport default workflow({\n  name: ${JSON.stringify(name)},\n  on: { push: { branches: ["main"] } },\n  jobs: {\n    ${JSON.stringify(name)}: job({\n      "runs-on": ["baremetal"],\n      steps: [\n        step({ uses: "kiln/checkout@v1" }),\n        step({ run: 'echo "it runs"' }),\n      ],\n    }),\n  },\n});\n`;
+    return { path, files: [{ path, text }] };
+  }
   if (["workflow", "reusable"].includes(kind)) {
     const path = kiln ? `.kiln/${name}.yaml` : `.github/workflows/${name}.yml`;
     const copy = obj(body.from).copy;
@@ -1103,7 +1184,7 @@ export async function handlePipelines(req: http.IncomingMessage, res: http.Serve
       const action = !["workflow", "reusable"].includes(String(body.kind));
       const seed: Seed = {
         kind: String(body.kind),
-        dialect: action ? null : body.language === "kiln" ? "kiln" : "gha",
+        dialect: action ? null : body.language === "ts" ? "ts" : body.language === "kiln" ? "kiln" : "gha",
         name: String(body.name),
         path: made.path,
         stand: "waiting",

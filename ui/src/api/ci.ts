@@ -462,6 +462,9 @@ export interface CiPreview {
   matrices?: Record<string, CiMatrix>;
   /** Each schedule's options and next runs, as W03's cron reads them (W29-R06's Times view). */
   schedules?: CiSchedule[];
+  /** A code workflow's (W29-R27): the YAML its program makes, and whether that's GitHub-exact. */
+  emitted?: string | null;
+  emitted_github?: boolean | null;
 }
 
 /** A schedule of a workflow's, as the preview says it: its options, and its next three runs (or why it has none). */
