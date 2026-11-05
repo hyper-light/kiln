@@ -993,13 +993,17 @@ impl Hub {
     /// runners' ([`crate::rcu::Rcu::update`]: `f` may run again, on a newer copy, so it only changes
     /// the record it's given), and what `f` said; none when the runner isn't known.
     pub(crate) fn change_agent<R>(&self, name: &str, mut f: impl FnMut(&mut AgentLive) -> R) -> Option<R> {
-        self.agents.update(|m| m.get_mut(name).map(|a| f(Arc::make_mut(a))))
+        let changed = self.agents.update(|m| m.get_mut(name).map(|a| f(Arc::make_mut(a))));
+        // `GET /api/agents` and the overview, kept encoded, are made again (goal 10, plan 01a1a87b2dae step 2).
+        self.harness.views.changed();
+        changed
     }
 
     /// Runner `a`'s live record from now on, in place of one by its name.
     pub(crate) fn put_agent(&self, a: AgentLive) {
         let a = Arc::new(a);
         self.agents.update(|m| m.insert(a.name.clone(), Arc::clone(&a)));
+        self.harness.views.changed();
     }
 
     /// Where `msg` for machine `name` goes ([`crate::instances::Instances::route`]): read from the
@@ -1199,6 +1203,8 @@ impl Hub {
     }
 
     pub fn emit_queue(&self) {
+        // The overview says them (goal 10, plan 01a1a87b2dae step 2).
+        self.harness.views.changed();
         let m = metrics::global();
         self.emit(&ServerEvent::Queue(crate::wire::events::Queue::Counts { queued: m.jobs_queued.get(), running: m.jobs_running.get() }));
     }
@@ -1211,6 +1217,10 @@ impl Hub {
             }
             q.push_back(s.clone());
         });
+        // The overview says the server's newest (goal 10, plan 01a1a87b2dae step 2).
+        if agent == "server" {
+            self.harness.views.changed();
+        }
         if agent != "server" {
             metrics::agent_samples().update(|m| m.insert(agent.to_owned(), s.clone()));
             // A runner too old to report its own figures (`crate::observe::host`): its samples, as
@@ -1229,7 +1239,13 @@ impl Hub {
         let rows = self.store.agents().await.unwrap_or_default();
         let labels = self.store.agent_labels().await.unwrap_or_default();
         let machines = self.store.agent_machines().await.unwrap_or_default();
-        let live = self.agents.get();
+        self.agent_list_of(rows, &labels, &machines, &self.agents.get())
+    }
+
+    /// [`Hub::agent_list`] of the store's rows, labels and machines given (kept in memory for `GET
+    /// /api/agents` and the overview: goal 10, plan 01a1a87b2dae step 2) and the runners' live records
+    /// `live`.
+    pub fn agent_list_of(&self, rows: Vec<crate::store::AgentRow>, labels: &HashMap<String, String>, machines: &HashMap<String, String>, live: &HashMap<String, Arc<AgentLive>>) -> Vec<AgentLive> {
         let mut out: Vec<AgentLive> = rows
             .into_iter()
             .map(|r| match live.get(&r.name) {
@@ -2163,23 +2179,28 @@ impl Hub {
     // ------------------------------------------------------------ network
 
     /// Consume transport events forever (supervised).
-    pub async fn net_loop(self: Arc<Self>, rx: async_channel::Receiver<NetEvent>) -> anyhow::Result<()> {
+    pub async fn net_loop(self: Arc<Self>, rx: crate::memory::queue::Receiver<NetEvent>) -> anyhow::Result<()> {
         // Runners keep its channel full: its turns are bounded, or it holds its shard (the HTTP
         // listener's) for as long as they send.
         let mut turns = crate::rt::Turns::new();
         while let Ok(ev) = rx.recv().await {
             // A runner's message: how long it waited for this loop, and how long applying it took
             // (goal 1, plan 01a1a59c2a68 step 2).
-            let arrived = match &ev {
+            let mut arrived = match &ev {
                 NetEvent::Frame { at, .. } => Some(*at),
                 _ => None,
             };
             let began = Instant::now();
+            // Its polls labeled by what came, should one hold the shard: a frame by its message's kind
+            // once it's read (goal 9, plan 01a1a87b2cec step 3).
+            let label = Self::net_label(&ev);
             // What can't be read is refused and noted where it's read (`unreadable`); what's left is
             // a message read whole that couldn't be applied.
-            if let Err(e) = self.on_net(ev).await {
+            if let Err(e) = crate::rt::labeled(label, self.on_net_at(ev, &mut arrived)).await {
                 tracing::warn!(error = %format!("{e:#}"), "a runner's message couldn't be applied");
             }
+            // An agent session's update is timed where it's taken, by the shard that owns its copy,
+            // from when it came (`Hub::runner_update`): its arrival went there with it.
             if let Some(at) = arrived {
                 crate::route_latency::observe(crate::route_latency::Class::Runner, Some(began.saturating_duration_since(at)), began.elapsed());
             }
@@ -2188,7 +2209,38 @@ impl Hub {
         anyhow::bail!("transport event stream ended")
     }
 
+    /// Whether a frame of `kind` on `lane` is job output: bulk frames are, but on the conversation
+    /// feed's and the files' lanes (messages, in bulk).
+    fn job_log(kind: Kind, lane: u32) -> bool {
+        kind == Kind::Log && lane != proto::LANE_CONVO && lane != proto::LANE_FILES
+    }
+
+    /// What [`Hub::net_loop`] labels its polls with for event `ev` in the shards' table of what held
+    /// them (`hyper_rt::slow`; goal 9, plan 01a1a87b2cec step 3); a runner's message, read, then by its
+    /// kind (`crate::wire::agent_label`).
+    fn net_label(ev: &NetEvent) -> &'static hyper_rt::slow::Label {
+        use hyper_rt::slow::Label;
+        static CONNECTED: Label = Label { name: "runner connected" };
+        static CLOSED: Label = Label { name: "runner closed" };
+        static LOG: Label = Label { name: "runner job log" };
+        static FRAME: Label = Label { name: "runner frame" };
+        match ev {
+            NetEvent::Connected { .. } => &CONNECTED,
+            NetEvent::Closed { .. } | NetEvent::Unreachable { .. } => &CLOSED,
+            NetEvent::Frame { kind, lane, .. } if Self::job_log(*kind, *lane) => &LOG,
+            NetEvent::Frame { .. } => &FRAME,
+        }
+    }
+
+    /// [`Hub::on_net_at`], for the tests, which time nothing.
+    #[cfg(test)]
     async fn on_net(self: &Arc<Self>, ev: NetEvent) -> anyhow::Result<()> {
+        self.on_net_at(ev, &mut None).await
+    }
+
+    /// A transport event, taken. `arrived`: when its frame came, taken by what's timed elsewhere (an
+    /// agent session's update, by the shard that owns its copy: `Hub::runner_update`).
+    async fn on_net_at(self: &Arc<Self>, ev: NetEvent, arrived: &mut Option<Instant>) -> anyhow::Result<()> {
         match ev {
             NetEvent::Connected { peer, name, binding } => {
                 self.tunnels.connected(peer, binding);
@@ -2234,9 +2286,7 @@ impl Hub {
                     }
                 }
             }
-            // Bulk frames are job output, but on the conversation feed's and the files' lanes
-            // (messages, in bulk).
-            NetEvent::Frame { peer, kind: Kind::Log, lane, data, .. } if lane != proto::LANE_CONVO && lane != proto::LANE_FILES => match proto::read_whole::<proto::LogChunk>(&data) {
+            NetEvent::Frame { peer, kind, lane, data, .. } if Self::job_log(kind, lane) => match proto::read_whole::<proto::LogChunk>(&data) {
                 Ok(chunk) => {
                     if self.owns_job(peer, &chunk.job) {
                         // Written by the job's writer on the blocking pool, in order (each waited for):
@@ -2247,20 +2297,21 @@ impl Hub {
                 }
                 Err(e) => self.unreadable(peer, Wire::Runner, "a log chunk".to_owned(), e.code(), e.why("LogChunk"), true).await,
             },
-            NetEvent::Frame { peer, lane, data, .. } => match proto::read_agent(&data) {
+            // Read where it's quick to, else off the shard, in order either way (`crate::wire::payload::read_frame`;
+            // goal 9, plan 01a1a87b2cec step 3).
+            NetEvent::Frame { peer, lane, data, .. } => match crate::wire::payload::read_frame(data, self.agent_of(peer).is_some()).await {
                 // Anything on its control lane before its Hello is out of order: Hello comes first
                 // there. On its other lanes a frame may come before its Hello is read (it sends them
                 // once it's connected): it's let go, as it was.
-                Ok(msg) if self.agent_of(peer).is_none() && !matches!(msg, AgentMsg::Hello(_) | AgentMsg::Instance(_) | AgentMsg::Machine { .. }) => {
-                    let what = crate::wire::agent_name(&msg).to_owned();
+                crate::wire::payload::Frame::BeforeHello { what } => {
                     if lane == proto::LANE_CONTROL {
                         self.unreadable(peer, Wire::Runner, what, Code::Malformed, "out of order: before its Hello".to_owned(), true).await;
                     } else {
                         tracing::debug!(peer, lane = proto::lane_name(lane), %what, "a runner's frame before its Hello, on a lane that may outrun it: let go");
                     }
                 }
-                Ok(msg) => self.on_runner_msg(peer, msg).await?,
-                Err(e) => self.unreadable(peer, Wire::Runner, e.what(), e.code(), e.why("AgentMsg"), true).await,
+                crate::wire::payload::Frame::Read { label, carried } => crate::rt::labeled(label, self.on_carried(peer, carried, arrived)).await?,
+                crate::wire::payload::Frame::Unreadable(e) => self.unreadable(peer, Wire::Runner, e.what(), e.code(), e.why("AgentMsg"), true).await,
             },
         }
         Ok(())
@@ -2268,10 +2319,17 @@ impl Hub {
 
     /// A runner's message read whole off one of its lanes: what it carries read too
     /// (`crate::wire::payload_of`), then applied; or, when that can't be read, refused to it
-    /// (`Unread`) and noted.
+    /// (`Unread`) and noted. The tests' way in: a frame comes through `on_net` (`read_frame`).
+    #[cfg(test)]
     async fn on_runner_msg(self: &Arc<Self>, peer: PeerId, msg: AgentMsg) -> anyhow::Result<()> {
-        match crate::wire::payload_of(msg) {
-            Ok(m) => self.on_agent_msg(peer, m).await,
+        self.on_carried(peer, crate::wire::payload_of(msg), &mut None).await
+    }
+
+    /// A runner's message with what it carries read ([`Hub::on_runner_msg`]), applied; or, when that
+    /// couldn't be read, refused to it (`Unread`) and noted. `arrived`: as [`Hub::on_net_at`]'s.
+    async fn on_carried(self: &Arc<Self>, peer: PeerId, carried: Result<Carried<AgentMsg, FromRunner>, Box<crate::wire::payload::Unreadable>>, arrived: &mut Option<Instant>) -> anyhow::Result<()> {
+        match carried {
+            Ok(m) => self.on_agent_msg(peer, m, arrived).await,
             Err(e) => {
                 self.unreadable_payload(peer, e, true).await;
                 Ok(())
@@ -2457,8 +2515,10 @@ impl Hub {
     }
 
     /// A frame of a runner's channel (docs/wire.md). An item is applied as the message it carries,
-    /// then answered: taken, or refused saying why. Never answered before it's applied.
-    async fn on_wire(self: &Arc<Self>, peer: PeerId, agent: &str, frame: crate::wire::channel::Frame) {
+    /// then answered: taken, or refused saying why. Never answered before it's applied, or for an agent
+    /// session's update, before the shard that owns its copy has it in its inbox (`Hub::runner_update`).
+    /// `arrived`: as [`Hub::on_net_at`]'s.
+    async fn on_wire(self: &Arc<Self>, peer: PeerId, agent: &str, frame: crate::wire::channel::Frame, arrived: &mut Option<Instant>) {
         use crate::wire::channel::{Arrival, Frame, Refusal};
         match frame {
             Frame::Item { stream, seq, low, body } => {
@@ -2471,7 +2531,7 @@ impl Hub {
                                 Some((Refusal::Malformed, why))
                             }
                             Ok(inner) => match crate::wire::payload_of(inner) {
-                                Ok(m) => Box::pin(self.on_agent_msg(peer, m)).await.err().map(|e| (Refusal::Refused, format!("{e:#}"))),
+                                Ok(m) => Box::pin(self.on_agent_msg(peer, m, arrived)).await.err().map(|e| (Refusal::Refused, format!("{e:#}"))),
                                 // What it carries can't be read: its NACK says so, as for an item
                                 // that can't be read, and it's noted.
                                 Err(e) => {
@@ -2505,7 +2565,8 @@ impl Hub {
         }
     }
 
-    async fn on_agent_msg(self: &Arc<Self>, peer: PeerId, msg: Carried<AgentMsg, FromRunner>) -> anyhow::Result<()> {
+    /// A runner's message, read. `arrived`: as [`Hub::on_net_at`]'s.
+    async fn on_agent_msg(self: &Arc<Self>, peer: PeerId, msg: Carried<AgentMsg, FromRunner>, arrived: &mut Option<Instant>) -> anyhow::Result<()> {
         if let Carried::Nothing(AgentMsg::Hello(h)) = msg {
             return self.on_hello(peer, h).await;
         }
@@ -2549,7 +2610,7 @@ impl Hub {
         }
         let msg = match msg {
             Carried::Nothing(m) => m,
-            Carried::Read(read) => return self.on_read(peer, &agent, read).await,
+            Carried::Read(read) => return self.on_read(peer, &agent, read, arrived).await,
         };
         match msg {
             AgentMsg::Hello(_) | AgentMsg::Instance(_) | AgentMsg::Machine { .. } => {}
@@ -2718,7 +2779,7 @@ impl Hub {
                 // One that takes its agent limit from here is sent what's set for its machine.
                 crate::harness::limit::on_caps(self, &agent, peer, caps).await;
             }
-            AgentMsg::Wire(frame) => self.on_wire(peer, &agent, frame).await,
+            AgentMsg::Wire(frame) => self.on_wire(peer, &agent, frame, arrived).await,
             AgentMsg::Reach { to, link, open, data, close } => {
                 // Job pods neither send nor receive reach links: one's frame is refused, and noted.
                 if self.agents.load().get(&agent).is_none_or(|a| a.ephemeral) {
@@ -2787,9 +2848,118 @@ impl Hub {
         Ok(())
     }
 
+    /// An agent session's update from runner process `r.peer`, judged and taken by the shard that owns
+    /// the session's copy (`s`), in the order its runner sent it (goal 10, plan 01a1a87b2dae step 4).
+    /// The hub's loop judged every runner's updates itself, on the HTTP listener's shard, behind every
+    /// runner's other messages: the lab's runner wait at p99 was 155 to 195 ms. What it starts that waits
+    /// (a runner told to let go of a copy, custody's ask, a hand-over's checks) goes on beside it. Its
+    /// wait, from its frame's arrival, and the time it took here are the runner class's
+    /// (`crate::route_latency`).
+    /// What's left of it when the owner's turn ran out (`over`; goal 9, plan 01a1a87b2cec step 3) comes
+    /// back, for the owner to take first at its next turn.
+    pub(crate) fn runner_update(self: &Arc<Self>, s: &mut crate::harness::copies::Shard, r: crate::harness::copies::RunnerUpdate, over: &dyn Fn() -> bool) -> Option<crate::harness::copies::Ingest> {
+        let began = Instant::now();
+        let crate::harness::copies::RunnerUpdate { peer, agent, session, update, shipped, arrived } = r;
+        let rest = self.judge_runner_update(s, peer, &agent, &session, update, shipped, over);
+        crate::route_latency::observe(crate::route_latency::Class::Runner, arrived.map(|at| began.saturating_duration_since(at)), began.elapsed());
+        rest
+    }
+
+    /// [`Hub::runner_update`]'s judgment, as the hub's loop made it: whether the update counts, which of
+    /// its machine's processes holds the session, then the copy takes it.
+    #[allow(clippy::too_many_arguments)]
+    fn judge_runner_update(self: &Arc<Self>, s: &mut crate::harness::copies::Shard, peer: PeerId, agent: &str, session: &str, update: crate::harness::core::Update, shipped: bool, over: &dyn Fn() -> bool) -> Option<crate::harness::copies::Ingest> {
+        use crate::harness::core::Update;
+        match update {
+            // A copy of a session that went on elsewhere since (an older epoch): its machine lets go
+            // of it, and nothing it says of it counts.
+            Update::Open { info, .. } if self.harness.stale(session, info.epoch) => {
+                tracing::info!(%agent, %session, epoch = info.epoch, "an agent session that went on elsewhere: this machine lets go of its copy");
+                // A runner from before letting go stops its copy instead (what it says of it doesn't
+                // count either way).
+                let lets_go = self.instances.load().get(peer).is_some_and(|i| i.caps & proto::CAP_CONVO != 0);
+                let msg = if lets_go { ServerMsg::HarnessRelease { session: session.to_owned() } } else { ServerMsg::HarnessClose { session: session.to_owned() } };
+                let (hub, agent) = (Arc::clone(self), agent.to_owned());
+                crate::rt::spawn(async move { hub.command_peers(&agent, vec![peer], &msg).await.log_when_answered(LOG_WITHIN) });
+                None
+            }
+            // The rest of what a copy left behind says (its machine was told to let go of it): none
+            // of it counts, and it doesn't take the session's messages from where it runs.
+            u if !matches!(u, Update::Open { .. }) && !self.harness.runs_on(session, agent) => None,
+            u => {
+                let closed = matches!(u, Update::Closed);
+                // Two processes of one machine never both run a session: of two that say they hold
+                // it, the newer keeps it and the older lets go (a hand-over whose word came late,
+                // `crate::handovers`). Read off the runner processes' copy; one is swapped in only
+                // when the session's holder changes (it opens here, moves here, or closes), the
+                // decision taken again on the copy that's changed. A process whose link has closed
+                // since it sent this holds nothing: its disconnect, taken on the hub's loop before
+                // this, let go of what it held (`Instances::lost`), as it did when this was judged
+                // there first.
+                let linked = self.peers.load().contains_key(&peer);
+                let what = crate::instances::Owned::Agent(session.to_owned());
+                let decide = |inst: &crate::instances::Instances| {
+                    if !linked {
+                        return (None, None, false);
+                    }
+                    let other = inst.owner(&what).filter(|q| *q != peer && inst.hands_over(*q) && inst.hands_over(peer));
+                    match other.and_then(|q| inst.newer_of(q, peer).map(|newer| (q, newer))) {
+                        Some((q, newer)) if newer == q => (None, Some(peer), false),
+                        pair => {
+                            let change = if closed { inst.owner(&what).is_some() } else { inst.owner(&what) != Some(peer) };
+                            (inst.get(peer).map(crate::instances::Instance::label).filter(|_| !closed), pair.map(|(q, _)| q), change)
+                        }
+                    }
+                };
+                let (holder, older, change) = decide(&self.instances.load());
+                let (holder, older) = if change {
+                    self.instances.update(|inst| {
+                        let (holder, older, change) = decide(inst);
+                        if change && closed {
+                            inst.disown(&what);
+                        } else if change {
+                            inst.own(what.clone(), peer);
+                        }
+                        (holder, older)
+                    })
+                } else {
+                    (holder, older)
+                };
+                // Not one a hand-over is taking there now: the newer says so once it took it.
+                if let Some(older) = older.filter(|_| !self.handovers.lock().going_to(session, peer)) {
+                    let (hub, agent, session) = (Arc::clone(self), agent.to_owned(), session.to_owned());
+                    crate::rt::spawn(async move { hub.let_go_of(&agent, older, &session).await });
+                }
+                if older == Some(peer) {
+                    return None;
+                }
+                if let Some(label) = holder {
+                    self.harness.held_by(session, &label);
+                }
+                let opened = matches!(u, Update::Open { .. });
+                let rest = self.harness.take_from(s, self, &crate::harness::registry::Location::Machine(agent.to_owned()), session, u, shipped, over);
+                // Opened: the work kiln handed it as it started is asked to be signed for, as it takes
+                // it up (docs/ci.md W27-R08).
+                if opened {
+                    let (hub, id) = (Arc::clone(self), session.to_owned());
+                    crate::rt::spawn(async move { crate::custody::ask_open(&hub, &id).await });
+                }
+                // Let go of by its copy: what's held is read from the copies.
+                if closed {
+                    let hub = Arc::clone(self);
+                    crate::rt::spawn(async move {
+                        hub.check_retire().await;
+                        hub.check_handover().await;
+                    });
+                }
+                rest
+            }
+        }
+    }
+
     /// What a runner's message carried, read where its frame was (`crate::wire::payload_of`): each
-    /// handler takes its value.
-    async fn on_read(self: &Arc<Self>, peer: PeerId, agent: &str, read: FromRunner) -> anyhow::Result<()> {
+    /// handler takes its value. `arrived`: as [`Hub::on_net_at`]'s.
+    async fn on_read(self: &Arc<Self>, peer: PeerId, agent: &str, read: FromRunner, arrived: &mut Option<Instant>) -> anyhow::Result<()> {
         match read {
             // One report per machine: its newest runner process's.
             FromRunner::AiSessions(_) if self.instances.load().newest(agent).is_some_and(|n| n != peer) => {}
@@ -3014,89 +3184,28 @@ impl Hub {
             // Its replica's word in observe's group (docs/observe.md §5).
             FromRunner::Observe { msg, bytes } => crate::observe::hub::heard(agent, *msg, bytes),
             FromRunner::Harness { session, update } => match *update {
-                // A copy of a session that went on elsewhere since (an older epoch): its machine
-                // lets go of it, and nothing it says of it counts.
-                crate::harness::core::Update::Open { info, .. } if self.harness.stale(&session, info.epoch) => {
-                    tracing::info!(%agent, %session, epoch = info.epoch, "an agent session that went on elsewhere: this machine lets go of its copy");
-                    // A runner from before letting go stops its copy instead (what it says of it
-                    // doesn't count either way).
-                    let lets_go = self.instances.load().get(peer).is_some_and(|i| i.caps & proto::CAP_CONVO != 0);
-                    let msg = if lets_go { ServerMsg::HarnessRelease { session } } else { ServerMsg::HarnessClose { session } };
-                    self.command_peers(agent, vec![peer], &msg).await.log_when_answered(LOG_WITHIN);
-                }
                 // An inbox's answer counts wherever it came from (it's for the message sent there),
                 // and says nothing of where the session runs: whoever waits for it is told, and
                 // the session's messages still go where it runs.
                 u @ crate::harness::core::Update::Inbox { .. } => {
                     self.harness.ingest_from(self, &crate::harness::registry::Location::Machine(agent.to_owned()), &session, u, false).await;
                 }
-                // The rest of what a copy left behind says (its machine was told to let go of it):
-                // none of it counts, and it doesn't take the session's messages from where it runs.
-                u if !matches!(u, crate::harness::core::Update::Open { .. }) && !self.harness.runs_on(&session, agent) => {}
+                // The rest goes to the shard that owns the session's copy, which judges it there and
+                // takes it, in the order its runner sent it (goal 10, plan 01a1a87b2dae step 4;
+                // `Hub::runner_update`). This loop goes on with the runner's next word as soon as that
+                // owner's inbox has it, and that's when a channel item is answered (`Hub::on_wire`).
                 u => {
-                    let closed = matches!(u, crate::harness::core::Update::Closed);
+                    let lifecycle = matches!(u, crate::harness::core::Update::Open { .. } | crate::harness::core::Update::Closed);
                     // A runner process that sends its conversation store: the server keeps its
                     // sessions from that.
                     let shipped = self.instances.load().get(peer).is_some_and(|i| i.caps & proto::CAP_CONVO != 0);
-                    // Two processes of one machine never both run a session: of two that say they
-                    // hold it, the newer keeps it and the older lets go (a hand-over whose word
-                    // came late, `crate::handovers`).
-                    // Read off the runner processes' copy; one is swapped in only when the session's
-                    // holder changes (it opens here, moves here, or closes), the decision taken again
-                    // on the copy that's changed.
-                    let what = crate::instances::Owned::Agent(session.clone());
-                    let decide = |inst: &crate::instances::Instances| {
-                        let other = inst.owner(&what).filter(|q| *q != peer && inst.hands_over(*q) && inst.hands_over(peer));
-                        match other.and_then(|q| inst.newer_of(q, peer).map(|newer| (q, newer))) {
-                            Some((q, newer)) if newer == q => (None, Some(peer), false),
-                            pair => {
-                                let change = if closed { inst.owner(&what).is_some() } else { inst.owner(&what) != Some(peer) };
-                                (inst.get(peer).map(crate::instances::Instance::label).filter(|_| !closed), pair.map(|(q, _)| q), change)
-                            }
-                        }
-                    };
-                    let (holder, older, change) = decide(&self.instances.load());
-                    let (holder, older) = if change {
-                        self.instances.update(|inst| {
-                            let (holder, older, change) = decide(inst);
-                            if change && closed {
-                                inst.disown(&what);
-                            } else if change {
-                                inst.own(what.clone(), peer);
-                            }
-                            (holder, older)
-                        })
-                    } else {
-                        (holder, older)
-                    };
-                    // Not one a hand-over is taking there now: the newer says so once it took it.
-                    if let Some(older) = older.filter(|_| !self.handovers.lock().going_to(&session, peer)) {
-                        self.let_go_of(agent, older, &session).await;
-                    }
-                    if older == Some(peer) {
-                        return Ok(());
-                    }
-                    if let Some(label) = holder {
-                        self.harness.held_by(&session, &label);
-                    }
-                    // Opened: the work kiln handed it as it started is asked to be signed for, as
-                    // it takes it up (docs/ci.md W27-R08).
-                    let opened = matches!(u, crate::harness::core::Update::Open { .. });
-                    // To the shard that owns its copy (`crate::harness::copies`): this loop goes on
-                    // with the next as soon as it's handed over.
-                    self.harness.ingest_from(self, &crate::harness::registry::Location::Machine(agent.to_owned()), &session, u, shipped).await;
-                    if opened {
-                        // An Open says where the session runs now: its copy takes it before this
-                        // loop checks the runner's next word against where it runs (`runs_on`).
+                    let r = crate::harness::copies::RunnerUpdate { peer, agent: agent.to_owned(), session: session.clone(), update: u, shipped, arrived: arrived.take() };
+                    self.harness.from_runner(r).await;
+                    // An Open says where the session runs now, a Closed lets it go: what this loop reads
+                    // of it next (the runner's next word, its inventory, a hand-over) waits for its owner
+                    // to have taken it, as it did when this loop took it itself.
+                    if lifecycle {
                         self.harness.applied(&session).await;
-                        let (hub, id) = (Arc::clone(self), session.clone());
-                        crate::rt::spawn(async move { crate::custody::ask_open(&hub, &id).await });
-                    }
-                    if closed {
-                        // Once its copy let it go: what's held is read from the copies.
-                        self.harness.applied(&session).await;
-                        self.check_retire().await;
-                        self.check_handover().await;
                     }
                 }
             },
@@ -4179,15 +4288,31 @@ impl Hub {
 
     /// Sample the server host itself for the UI ("server" series).
     pub async fn sampler_loop(self: Arc<Self>) -> anyhow::Result<()> {
-        let mut sampler = crate::host::Sampler::new(Some(&self.cfg.server.data_dir));
+        let mut sampler = Some(crate::host::Sampler::new(Some(&self.cfg.server.data_dir)));
         let mut tick = Interval::new(Duration::from_secs(u64::from(self.cfg.telemetry.sample_seconds.max(1))));
         loop {
             futures::select_biased! {
                 () = self.shutdown.cancelled().fuse() => return Ok(()),
                 () = tick.tick().fuse() => {}
             }
-            let s = sampler.sample();
-            self.record_sample("server", s);
+            // Taken on the blocking pool, as a runner's is (`crate::agent`): the sample reads the host's
+            // files, and sysinfo's refresh of every process where it's used, which held the shard that ran
+            // this loop about 2 s every minute (found by the Bare Metal Migration agent, 01a195ef; goal 9,
+            // plan 01a1a87b2cec step 3). The sampler goes with it and comes back, so each sample is the
+            // difference from the one before, as it was.
+            let mut s = sampler.take().unwrap_or_else(|| crate::host::Sampler::new(Some(&self.cfg.server.data_dir)));
+            match crate::rt::blocking(move || {
+                let sample = s.sample();
+                (s, sample)
+            })
+            .await
+            {
+                Ok((back, sample)) => {
+                    sampler = Some(back);
+                    self.record_sample("server", sample);
+                }
+                Err(e) => tracing::warn!(error = %format!("{e:#}"), "the server's host sample wasn't taken"),
+            }
         }
     }
 
@@ -4643,7 +4768,7 @@ pub(crate) mod tests {
     pub(crate) async fn hear_item(hub: &Arc<Hub>, peer: PeerId, stream: &str, seq: u64, msg: &AgentMsg) -> anyhow::Result<()> {
         let agent = hub.agent_of(peer).ok_or_else(|| anyhow::anyhow!("no runner as {peer}"))?;
         let body = proto::encode(msg)?;
-        hub.on_wire(peer, &agent, crate::wire::channel::Frame::Item { stream: stream.to_owned(), seq, low: seq.saturating_sub(1), body }).await;
+        hub.on_wire(peer, &agent, crate::wire::channel::Frame::Item { stream: stream.to_owned(), seq, low: seq.saturating_sub(1), body }, &mut None).await;
         Ok(())
     }
 
@@ -4798,6 +4923,58 @@ pub(crate) mod tests {
             hub.on_runner_msg(2, say(&crate::harness::core::Update::Inbox { said: Box::new(refused) })?).await?;
             assert!(hub.harness.runs_on("s1", "box-a"), "it still runs on box-a");
             assert_eq!(hub.instances.load().owner(&crate::instances::Owned::Agent("s1".into())), Some(1), "box-a's runner still holds it");
+            Ok(())
+        })
+    }
+
+    /// Goal 10, plan 01a1a87b2dae step 4: a runner's updates to its agent sessions are judged and taken
+    /// by the shards that own their copies, each session's in the order its runner sent them. The hub's
+    /// loop answers each channel item taken once its owner's inbox has it, and waits for no owner to
+    /// take one, but an Open or a Closed, which it reads the runner's next word after (where the session
+    /// runs, which process holds it). What another machine says of a session that runs here counts for
+    /// nothing, and its item is still answered taken.
+    #[test]
+    fn g10_s4_a_runners_session_updates_are_judged_and_taken_by_their_owners() -> anyhow::Result<()> {
+        use crate::harness::core::Update;
+        use crate::harness::model::{Body, Event};
+        use crate::wire::channel::Frame;
+        crate::rt::block_on(async {
+            let hub = hub_with_runner(crate::rt::clock(), "fedora", proto::CAP_UNREAD | proto::CAP_WIRE).await?;
+            join_runner(&hub, 2, "box-b", proto::CAP_UNREAD | proto::CAP_WIRE);
+            let say = |id: &str, u: &Update| serde_json::to_string(u).map(|json| AgentMsg::Harness { session: id.to_owned(), json });
+            let said = |id: &str, n: u64| Event { id: format!("{id}-e{n}"), seq: n, at: 1, parent: None, by: None, body: Body::Assistant { text: format!("{n}: the retry loop reads its deadline"), streaming: false } };
+            let ids = ["s0", "s1", "s2", "s3"];
+            for id in ids {
+                let open = Update::Open { info: Box::new(crate::harness::session::Info { id: id.into(), kind: "claude".into(), ..Default::default() }), since: None };
+                hear_item(&hub, 1, &format!("s:{id}#a1"), 1, &say(id, &open)?).await?;
+                // Taken by its owner before the loop went on: where it runs, and which process holds it.
+                anyhow::ensure!(hub.harness.located_on(id, "fedora"), "{id} opened on fedora");
+                assert_eq!(hub.instances.load().owner(&crate::instances::Owned::Agent(id.into())), Some(1), "{id} held by the runner's process");
+            }
+            // Ten events each, the sessions' interleaved, each one an item of its session's stream.
+            for n in 1..=10u64 {
+                for id in ids {
+                    hear_item(&hub, 1, &format!("s:{id}#a1"), n + 1, &say(id, &Update::Events { events: vec![said(id, n)] })?).await?;
+                }
+            }
+            // Another machine's word on s0, which runs on fedora: a copy left behind there.
+            hear_item(&hub, 2, "s:s0#b1", 1, &say("s0", &Update::Events { events: vec![said("s0", 11)] })?).await?;
+            let answered = |stream: &str| {
+                hub.sent.lock().iter().rev().find_map(|(_, m)| match m {
+                    ServerMsg::Wire(Frame::Ack(has)) if has.stream == stream => Some((has.upto, has.nacks.len())),
+                    _ => None,
+                })
+            };
+            for id in ids {
+                hub.harness.applied(id).await;
+                let events = hub.harness.events_json(id, None, 20).ok_or_else(|| anyhow::anyhow!("{id}'s copy didn't say its events"))?;
+                let events: serde_json::Value = serde_json::from_slice(&events)?;
+                let seen: Vec<&str> = events.get("events").and_then(serde_json::Value::as_array).into_iter().flatten().filter_map(|e| e.get("id").and_then(serde_json::Value::as_str)).collect();
+                let want: Vec<String> = (1..=10).map(|n| format!("{id}-e{n}")).collect();
+                assert_eq!(seen, want, "{id}: in the order sent, nothing from box-b");
+                assert_eq!(answered(&format!("s:{id}#a1")), Some((11, 0)), "{id}: every item answered taken");
+            }
+            assert_eq!(answered("s:s0#b1"), Some((1, 0)), "box-b's item answered taken, counting for nothing");
             Ok(())
         })
     }

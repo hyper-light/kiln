@@ -166,7 +166,9 @@ impl srv::Handler for Api {
         let upgrade = req.headers().get(header::UPGRADE).is_some_and(|v| v.as_bytes().eq_ignore_ascii_case(b"websocket"));
         let class = crate::route_latency::class_of(req.method(), req.uri().path(), upgrade);
         let waited = req.extensions().get::<kiln_http::Received>().map(|r| began.saturating_duration_since(r.0));
-        let resp = match route(hub, req).await {
+        // Its polls labeled by its route, should one hold its shard (goal 9, plan 01a1a87b2cec step 2).
+        let label = crate::route_latency::label_of(req.method(), req.uri().path(), upgrade);
+        let resp = match crate::rt::labeled(label, route(hub, req)).await {
             Ok(r) => r,
             Err(e) => e.into_response(),
         };
@@ -720,7 +722,7 @@ async fn authorized(hub: Arc<Hub>, caller: crate::authz::Caller, req: Request) -
             job_logs_ws(hub.clone(), id, step, req)
         }
         (&Method::GET, ["api", "jobs", id, "artifacts"]) => boxed(|| get_artifacts(&hub, id)).await,
-        (&Method::GET, ["api", "agents"]) => Ok(srv::json(StatusCode::OK, &boxed(|| crate::doctor::runners_for(&hub, &caller)).await)),
+        (&Method::GET, ["api", "agents"]) => Ok(boxed(|| agents_read(&hub, &caller)).await),
         (&Method::GET, ["api", "reach", "runners"]) => {
             let want = srv::query(&req).get("want").cloned();
             reach_runners(&hub, want.as_deref())
@@ -2792,12 +2794,30 @@ fn logout() -> Response {
 
 async fn me(hub: &Hub, headers: &HeaderMap) -> Response {
     let caller = caller_of(hub, headers).await;
+    // The owner's, encoded once for what in it can change (goal 10, plan 01a1a87b2dae step 2): it has
+    // no groups to read, and the rest is the same each time.
+    if let Some(owner) = caller.as_ref().filter(|c| c.is_owner() && c.user.is_none())
+        && let Ok(made) = hub.harness.views.me.answer(me_key(hub), |_| crate::reads::encode(&me_json(hub, Some(owner), Vec::new())))
+    {
+        return pre_encoded(made);
+    }
     // The groups the person is in (kiln's, and their identity providers'): the owner teams they may
     // name for an app (docs/deploy-api.md §3.1).
     let groups = match caller.as_ref().and_then(|c| c.user.clone()) {
         Some(u) => crate::authz::groups::of_user(hub, &u).await.unwrap_or_default(),
         None => Vec::new(),
     };
+    srv::json(StatusCode::OK, &me_json(hub, caller.as_ref(), groups))
+}
+
+/// What can change in the owner's `GET /api/me` ([`crate::reads::MeKey`]).
+fn me_key(hub: &Hub) -> crate::reads::MeKey {
+    let d = &hub.discovery;
+    crate::reads::MeKey { origins: hub.front_doors.origins(), advert: d.announcing().then(|| d.advert.lock().clone()), hostname: crate::config::Config::hostname() }
+}
+
+/// `GET /api/me` for `caller` (none: not signed in), in `groups`.
+fn me_json(hub: &Hub, caller: Option<&crate::authz::Caller>, groups: Vec<String>) -> serde_json::Value {
     // What discovery announces anyway (when it does), so a probe can tell which instance answers.
     let d = &hub.discovery;
     let announced = d.announcing().then(|| {
@@ -2807,45 +2827,42 @@ async fn me(hub: &Hub, headers: &HeaderMap) -> Response {
             "port": a.port, "quic": a.quic, "ca": a.ca, "os": a.os, "arch": a.arch,
         })
     });
-    srv::json(
-        StatusCode::OK,
-        &json!({
-            "authenticated": caller.is_some(),
-            // Who (W10-R01): `admin` for the owner, `user:<name>`, a token, a job; and what they
-            // hold, when that isn't everything.
-            "principal": caller.as_ref().map(|c| c.name.clone()),
-            "kind": caller.as_ref().map(|c| c.kind),
-            "grants": caller.as_ref().and_then(crate::authz::Caller::grants),
-            "groups": groups,
-            // What it may do (W10-R02), for pages that show only what one can use: each
-            // capability held on the whole server, or only somewhere (a repository, …).
-            "can": caller.as_ref().map(|c| {
-                crate::authz::CAPABILITIES
-                    .iter()
-                    .filter_map(|cap| {
-                        if c.can(cap, &crate::authz::Scope::Server) {
-                            Some(((*cap).to_owned(), json!("server")))
-                        } else {
-                            c.has_somewhere(cap).then(|| ((*cap).to_owned(), json!("some")))
-                        }
-                    })
-                    .collect::<serde_json::Map<String, serde_json::Value>>()
-            }),
-            "public_url": hub.cfg.server.public_url,
-            // Where pages agents show are served, when not here (docs/previews.md).
-            "pages_url": hub.cfg.server.pages_url,
-            // Where else browsers find this server: its runners' front doors (HTTPS).
-            "origins": hub.front_doors.origins(),
-            "version": env!("CARGO_PKG_VERSION"),
-            "hostname": crate::config::Config::hostname(),
-            "discovery": announced,
+    json!({
+        "authenticated": caller.is_some(),
+        // Who (W10-R01): `admin` for the owner, `user:<name>`, a token, a job; and what they
+        // hold, when that isn't everything.
+        "principal": caller.map(|c| c.name.clone()),
+        "kind": caller.map(|c| c.kind),
+        "grants": caller.and_then(crate::authz::Caller::grants),
+        "groups": groups,
+        // What it may do (W10-R02), for pages that show only what one can use: each
+        // capability held on the whole server, or only somewhere (a repository, …).
+        "can": caller.map(|c| {
+            crate::authz::CAPABILITIES
+                .iter()
+                .filter_map(|cap| {
+                    if c.can(cap, &crate::authz::Scope::Server) {
+                        Some(((*cap).to_owned(), json!("server")))
+                    } else {
+                        c.has_somewhere(cap).then(|| ((*cap).to_owned(), json!("some")))
+                    }
+                })
+                .collect::<serde_json::Map<String, serde_json::Value>>()
         }),
-    )
+        "public_url": hub.cfg.server.public_url,
+        // Where pages agents show are served, when not here (docs/previews.md).
+        "pages_url": hub.cfg.server.pages_url,
+        // Where else browsers find this server: its runners' front doors (HTTPS).
+        "origins": hub.front_doors.origins(),
+        "version": env!("CARGO_PKG_VERSION"),
+        "hostname": crate::config::Config::hostname(),
+        "discovery": announced,
+    })
 }
 
 // ------------------------------------------------------------------ overview / system
 
-async fn overview(hub: &Hub, caller: &crate::authz::Caller) -> R {
+async fn overview(hub: &Arc<Hub>, caller: &crate::authz::Caller) -> R {
     // A person of some repositories sees theirs (W10): their runs, jobs and queue, none of the
     // server's (its runners, processes and samples, its host's name).
     if let Some(repos) = crate::authz::gate::readable(hub, caller, "runs.read").await {
@@ -2854,39 +2871,151 @@ async fn overview(hub: &Hub, caller: &crate::authz::Caller) -> R {
         let system = json!({ "version": env!("CARGO_PKG_VERSION"), "uptime_s": hub.started.elapsed().as_secs(), "hostname": null, "generation": hub.generation, "children": [], "sample": null });
         return Ok(srv::json(StatusCode::OK, &json!({ "stats": stats, "queue": queue, "agents": null, "system": system, "sample": null, "narrowed": repos })));
     }
+    // Kept encoded ahead of its asking (goal 10, plan 01a1a87b2dae step 2), made of the last day's
+    // figures and the runners' rows kept in memory, the runners' live records and the server's own
+    // figures: nothing is read from the store or encoded while it's answered. The store's, while
+    // what's kept is behind it.
+    hub.harness.views.start(hub);
+    if let Some(made) = overview_key(hub).and_then(|key| hub.harness.views.overview.answer(key, |k| overview_made(hub, k)).ok()) {
+        return Ok(pre_encoded(made));
+    }
     let stats = hub.store.stats(None).await?;
     let agents = hub.agent_list().await;
+    Ok(srv::json(StatusCode::OK, &overview_json(hub, &stats, &agents, &system_now(hub), queue_now())))
+}
+
+/// The jobs queued and running now, as the overview says them.
+fn queue_now() -> (i64, i64) {
     let m = crate::metrics::global();
-    let sample = hub.history.load().get("server").and_then(|q| q.back().cloned());
-    Ok(srv::json(
-        StatusCode::OK,
-        &json!({
-            "stats": stats,
-            "queue": { "queued": m.jobs_queued.get(), "running": m.jobs_running.get() },
-            "agents": {
-                "connected": agents.iter().filter(|a| a.connected).count(),
-                "total": agents.len(),
-                "slots": agents.iter().filter(|a| a.connected).map(|a| a.slots).sum::<u32>(),
-                "busy": agents.iter().filter(|a| a.connected).map(|a| a.busy).sum::<u32>(),
-            },
-            "system": system_json(hub),
-            "sample": sample,
-        }),
-    ))
+    (m.jobs_queued.get(), m.jobs_running.get())
+}
+
+/// The overview of every repository: the last day's figures `stats`, the runners `agents`, the server
+/// as `system` says and the jobs `queue` (queued, running).
+fn overview_json(hub: &Hub, stats: &serde_json::Value, agents: &[crate::hub::AgentLive], system: &crate::reads::SystemNow, queue: (i64, i64)) -> serde_json::Value {
+    json!({
+        "stats": stats,
+        "queue": { "queued": queue.0, "running": queue.1 },
+        "agents": {
+            "connected": agents.iter().filter(|a| a.connected).count(),
+            "total": agents.len(),
+            "slots": agents.iter().filter(|a| a.connected).map(|a| a.slots).sum::<u32>(),
+            "busy": agents.iter().filter(|a| a.connected).map(|a| a.busy).sum::<u32>(),
+        },
+        "system": system_of(hub, system),
+        "sample": system.sample,
+    })
+}
+
+/// What `GET /api/overview` is made of now, for whoever reads every repository's runs: none while the
+/// last day's figures or the runners' rows kept in memory are behind the store's.
+fn overview_key(hub: &Hub) -> Option<crate::reads::OverviewKey> {
+    let v = &hub.harness.views;
+    let stats = v.stats.fresh_while(&hub.store, crate::store::Stats::holds_now, crate::store::stats_now)?;
+    let rows = v.agent_rows.fresh(&hub.store, crate::store::agent_rows)?;
+    Some(crate::reads::OverviewKey { stats, rows, live: hub.agents.get(), system: system_now(hub), queue: queue_now() })
+}
+
+/// `GET /api/overview` made of what `key` says, encoded.
+fn overview_made(hub: &Hub, key: &crate::reads::OverviewKey) -> anyhow::Result<Bytes> {
+    let rows = &key.rows.1;
+    let agents = hub.agent_list_of(rows.rows.clone(), &rows.labels, &rows.machines, &key.live);
+    crate::reads::encode(&overview_json(hub, &key.stats.1.json, &agents, &key.system, key.queue))
+}
+
+/// The maker's turn ([`crate::reads::Views::start`]): each read kept ahead that's been asked for, made
+/// again where what it's made of changed: the runners' encoded on the compute pool (a long list of
+/// them is hundreds of microseconds of encoding, more than a shard's step), the overview here (a few
+/// kilobytes). Says when the overview next changes by itself: at the next second of the server's
+/// uptime, which it says.
+pub(crate) async fn make_ahead(hub: &Hub) -> Option<Instant> {
+    let v = &hub.harness.views;
+    if v.agents.asked()
+        && let Some(key) = agents_key(hub)
+        && !v.agents.holds(&key)
+    {
+        let was = v.agents.now();
+        let list = agents_made(hub, &key);
+        match crate::rt::compute(move || crate::reads::encode(&list)).await {
+            Ok(Ok(made)) => v.agents.keep(&was, key, made),
+            Ok(Err(e)) | Err(e) => tracing::debug!(error = %format!("{e:#}"), "the runners' list wasn't made ahead: a read makes it"),
+        }
+    }
+    if !v.overview.asked() {
+        return None;
+    }
+    if let Some(key) = overview_key(hub)
+        && !v.overview.holds(&key)
+    {
+        let was = v.overview.now();
+        match overview_made(hub, &key) {
+            Ok(made) => v.overview.keep(&was, key, made),
+            Err(e) => tracing::debug!(error = %format!("{e:#}"), "the overview wasn't made ahead: a read makes it"),
+        }
+    }
+    Some(hub.started + Duration::from_secs(hub.started.elapsed().as_secs().saturating_add(1)))
+}
+
+/// `GET /api/agents`: the runners `caller` may read. The owner's, kept encoded ahead of its asking
+/// (goal 10, plan 01a1a87b2dae step 2), made of the runners' rows kept in memory and their live
+/// records: nothing is read from the store or encoded while it's answered. The store's, while the
+/// rows kept are behind it.
+async fn agents_read(hub: &Arc<Hub>, caller: &crate::authz::Caller) -> Response {
+    if caller.is_owner() {
+        hub.harness.views.start(hub);
+        if let Some(made) = agents_key(hub).and_then(|key| hub.harness.views.agents.answer(key, |k| crate::reads::encode(&agents_made(hub, k))).ok()) {
+            return pre_encoded(made);
+        }
+    }
+    srv::json(StatusCode::OK, &crate::doctor::runners_for(hub, caller).await)
+}
+
+/// What the owner's `GET /api/agents` is made of now: none while the runners' rows kept in memory are
+/// behind the store's, or while a machine runs more than one runner process (what each holds is read
+/// from more than these: `Hub::runner_processes`).
+fn agents_key(hub: &Hub) -> Option<crate::reads::AgentsKey> {
+    let rows = hub.harness.views.agent_rows.fresh(&hub.store, crate::store::agent_rows)?;
+    let (live, instances) = (hub.agents.get(), hub.instances.get());
+    if !instances.crowded().is_empty() {
+        return None;
+    }
+    let transports = live.values().filter(|a| a.connected).filter_map(|a| a.peer).map(|p| (p, hub.tunnels.transport(p))).collect();
+    Some(crate::reads::AgentsKey { rows, live, instances, refusals: hub.refusals.get(), drops: crate::metrics::net().toward_all(), transports })
+}
+
+/// The runners as `key` says they are, as `Hub::agent_list` lists them.
+fn agents_made(hub: &Hub, key: &crate::reads::AgentsKey) -> Vec<crate::hub::AgentLive> {
+    let rows = &key.rows.1;
+    hub.agent_list_of(rows.rows.clone(), &rows.labels, &rows.machines, &key.live)
+}
+
+/// What the server says of itself now ([`crate::reads::SystemNow`]).
+fn system_now(hub: &Hub) -> crate::reads::SystemNow {
+    crate::reads::SystemNow {
+        uptime_s: hub.started.elapsed().as_secs(),
+        hostname: crate::config::Config::hostname(),
+        children: crate::server::registry().snapshot(),
+        sample: hub.history.load().get("server").and_then(|q| q.back().cloned()),
+        kubernetes: hub.k8s.get().is_some_and(Option::is_some),
+    }
+}
+
+/// The server as `s` says it is, as `GET /api/system` and the overview say it.
+fn system_of(hub: &Hub, s: &crate::reads::SystemNow) -> serde_json::Value {
+    json!({
+        "version": env!("CARGO_PKG_VERSION"),
+        "uptime_s": s.uptime_s,
+        "hostname": s.hostname,
+        "generation": hub.generation,
+        "children": s.children,
+        "sample": s.sample,
+        "kubernetes": s.kubernetes,
+        "runtime": "hyper-rt",
+    })
 }
 
 fn system_json(hub: &Hub) -> serde_json::Value {
-    let sample = hub.history.load().get("server").and_then(|q| q.back().cloned());
-    json!({
-        "version": env!("CARGO_PKG_VERSION"),
-        "uptime_s": hub.started.elapsed().as_secs(),
-        "hostname": crate::config::Config::hostname(),
-        "generation": hub.generation,
-        "children": crate::server::registry().snapshot(),
-        "sample": sample,
-        "kubernetes": hub.k8s.get().is_some_and(Option::is_some),
-        "runtime": "hyper-rt",
-    })
+    system_of(hub, &system_now(hub))
 }
 
 async fn system(hub: &Hub) -> Response {
@@ -3054,6 +3183,14 @@ async fn trigger(hub: &Hub, id: &str, req: Request) -> R {
 /// `GET /api/runs`: runs newest first, of the repositories the caller may read (W10).
 async fn runs(hub: &Hub, q: &HashMap<String, String>, caller: &crate::authz::Caller) -> R {
     let among = crate::authz::gate::readable(hub, caller, "runs.read").await;
+    // Every repository's newest, asked with nothing in the query: kept in memory, encoded once (goal 10,
+    // plan 01a1a87b2dae step 2), while it's what the store holds.
+    if among.is_none()
+        && q.is_empty()
+        && let Some(listed) = hub.harness.views.runs.fresh(&hub.store, crate::reads::runs_listed)
+    {
+        return Ok(pre_encoded(listed.1.clone()));
+    }
     Ok(srv::json(StatusCode::OK, &crate::reads::runs(&hub.store, q, among).await?))
 }
 
@@ -5209,6 +5346,7 @@ async fn conversation_events(hub: &Hub, id: &str, q: &HashMap<String, String>) -
         return Ok(pre_encoded(events));
     }
     let id = id.to_owned();
+    crate::reads::trace::asked();
     let rows = crate::rt::blocking(move || store.events(&id, before, limit)).await.map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")))?;
     let rows = rows.map_err(|e| err(StatusCode::SERVICE_UNAVAILABLE, format!("{e:#}")))?;
     let events: Vec<serde_json::Value> = rows.iter().filter_map(|r| serde_json::from_str(&r.body).ok()).collect();
@@ -6050,16 +6188,23 @@ fn pieces(bytes: Vec<u8>) -> impl Iterator<Item = ws::Message> {
 /// server for each of its CPUs, and the frames its viewer waits on with it 4.7 times (goal 4's lab,
 /// plan 01a1a59c2a9c step 5).
 async fn send_snapshot(tx: &mut ws::Sender, snapshot: crate::harness::registry::Snapshot, packed: bool) -> anyhow::Result<()> {
+    // What's made and not yet handed to the socket is counted as the snapshots' (`crate::memory::SNAPSHOTS`;
+    // goal 11, plan 01a1a87b2e56 step 3): a packed one until its last piece goes (its pieces share its
+    // buffer), frames as each goes.
     if packed {
         let bytes = crate::rt::blocking(move || snapshot.packed(&synced())).await??;
+        let _held = crate::memory::SNAPSHOTS.hold(bytes.capacity());
         for piece in pieces(bytes) {
             tx.send(piece).await?;
         }
         return Ok(());
     }
     let frames = crate::rt::blocking(move || snapshot.frames()).await?;
+    let mut held = crate::memory::SNAPSHOTS.hold(frames.iter().map(String::capacity).sum());
     for f in frames {
+        let n = f.capacity();
         tx.send(ws::text(f)).await?;
+        held.release(n);
     }
     tx.send(ws::text(synced())).await?;
     Ok(())
@@ -6170,7 +6315,11 @@ async fn harness_attach(hub: Arc<Hub>, id: String, socket: ws::WebSocket, takes:
         tx.send(ws::text(SessionDown::from(SessionFrame::Closed).text())).await?;
         return Ok(());
     };
-    send_snapshot(&mut tx, att.snapshot, takes.packed).await?;
+    {
+        // Counted while it's written (goal 10, plan 01a1a87b2dae step 3's trace).
+        let _writing = crate::reads::Writing::of(&hub.harness.views.attaching);
+        send_snapshot(&mut tx, att.snapshot, takes.packed).await?;
+    }
     // Its place among the session's viewers, given back as it goes.
     let viewer = att.viewer;
     let topic = att.topic;
@@ -6373,7 +6522,10 @@ async fn harness_attach(hub: Arc<Hub>, id: String, socket: ws::WebSocket, takes:
                 tx.send(closed()).await?;
                 return Ok(());
             };
-            send_snapshot(&mut tx, snapshot, takes.packed).await?;
+            {
+                let _writing = crate::reads::Writing::of(&hub.harness.views.attaching);
+                send_snapshot(&mut tx, snapshot, takes.packed).await?;
+            }
             caught_up = Some((Instant::now(), began.elapsed()));
             at = from;
             refusals = now;
@@ -6550,6 +6702,8 @@ mod tests {
             slow: crate::shard_health::Slow::default(),
             longest_poll: Duration::ZERO,
             overrun: Duration::ZERO,
+            tasks: 0,
+            most_tasks: 0,
         };
         assert_eq!(worst_delay([shard(9, 80, Some(4)), shard(9, 2_000, Some(7))].into_iter(), period), Some(Duration::from_micros(2_000)));
         // Held now: 1.5 s since its probe, past its 10 ms period.
@@ -6769,6 +6923,8 @@ mod tests {
                     crate::rt::sleep(Duration::from_millis(5)).await;
                 }
                 let asked = hub.store.asked();
+                // What every read of an agent's page passes first (`authorized`): whether its caller sees it.
+                crate::harness::lineage::may_see(&hub, &crate::authz::Caller::owner(), "a").await.map_err(|(c, m)| anyhow::anyhow!("{c} {m}"))?;
                 let list = body_of(harness_sessions(&hub, &crate::authz::Caller::owner()).await).await?;
                 let one = hub.harness.info_json("a").ok_or_else(|| anyhow::anyhow!("no session a"))?;
                 let events = body_of(conversation_events(&hub, "a", &q(&[("limit", "50")])).await.map_err(api)?).await?;
@@ -6834,6 +6990,298 @@ mod tests {
             }
         }
         Ok(())
+    }
+
+    /// A GET of `path` as the lab's readers send it (crates/kiln-lab's `reader`): the owner's, by the
+    /// admin token, taking nothing packed.
+    fn lab_get(path: &str) -> anyhow::Result<Request> {
+        Ok(http::Request::builder().method(Method::GET).uri(path).header(header::AUTHORIZATION, "Bearer test-admin-token").header(header::ACCEPT_ENCODING, "identity").body(srv::Incoming::empty())?)
+    }
+
+    /// Goal 10, plan 01a1a87b2dae step 2, traced: every read the lab's realistic profile makes
+    /// (crates/kiln-lab's `reader`: the sessions, one session, its newest events, the runners, who's
+    /// asking, the overview, the runs, an agent's plans, its goals and an unknown agent's), sent to the
+    /// API as a request, asks no store and encodes no JSON while it's answered once what's kept is made
+    /// (`crate::reads::trace`), each saying what the store's path says. A runner's live record changed,
+    /// the runners' list is made again off the request path and the read after it encodes nothing; a
+    /// run added sends the next read of the runs to the store, which has it, and the list is kept again.
+    #[test]
+    fn g10_s2_every_read_the_lab_makes_asks_no_store_and_encodes_nothing() -> anyhow::Result<()> {
+        use crate::harness::core::Update;
+        use crate::harness::model::{Body, Event, State};
+        use crate::http::server::Handler as _;
+        use crate::reads::trace::{Counts, traced};
+        crate::rt::block_on(async {
+            let hub = crate::hub::tests::scratch_hub().await?;
+            // An agent at work, with a plan and a goal.
+            let there = crate::harness::registry::Location::Machine("box".into());
+            let info = crate::harness::session::Info { id: "a".into(), kind: "claude".into(), ..crate::harness::session::Info::default() };
+            hub.harness.ingest(&hub, &there, "a", Update::Open { info: Box::new(info), since: None }).await;
+            let said = |n: u64| Event { id: format!("e{n}"), seq: n, at: 1, parent: None, by: None, body: Body::Assistant { text: format!("{n}: the deadline"), streaming: false } };
+            hub.harness.ingest(&hub, &there, "a", Update::Events { events: (1..=60).map(said).collect() }).await;
+            hub.harness.ingest(&hub, &there, "a", Update::State { state: Box::new(State::default()) }).await;
+            let source = crate::plans::Source { session: Some("a".into()), ..crate::plans::Source::default() };
+            crate::plans::create(&hub, crate::plans::New { body: "1. Measure the reads\n2. Prove it".into(), source: Some(source), ..crate::plans::New::default() }, "admin").await?;
+            crate::goals::add(&hub, "a", vec!["reads from memory".into()], false).await?;
+            // A runner (its row, its live record) and a repository's run.
+            let row = crate::store::AgentRow { name: "box".into(), labels: vec![], slots: 1, hostname: "box".into(), os: "linux".into(), arch: "x86_64".into(), version: String::new(), ephemeral: false, connected: true, last_seen: 0, enrolled_at: 0 };
+            hub.store.upsert_agent(row).await?;
+            hub.put_agent(crate::hub::tests::live_runner("box", "linux", "x86_64"));
+            let repo = Repo { id: "r1".into(), name: "acme/app".into(), clone_url: "https://example/app".into(), branches: vec![], poll_seconds: 60, enabled: true, created_at: 0, last_polled_at: None, last_error: None, mode: "upstream".into(), default_branch: None, mirror: None };
+            let repo = hub.store.upsert_repo(repo).await?;
+            let run = |id: &str, at: i64| crate::store::Run {
+                id: id.into(),
+                repo_id: repo.id.clone(),
+                repo_name: repo.name.clone(),
+                number: 0,
+                pipeline: "ci".into(),
+                event: "push".into(),
+                branch: "main".into(),
+                sha: "abc".into(),
+                message: String::new(),
+                author: String::new(),
+                status: crate::store::Status::Succeeded,
+                created_at: at,
+                started_at: None,
+                finished_at: None,
+                error: None,
+                concurrency_group: None,
+            };
+            hub.store.create_run(run("run1", 1), Vec::new()).await?;
+            let api = Arc::new(Api { hub: Arc::clone(&hub) });
+            let read = |path: &'static str| {
+                let api = Arc::clone(&api);
+                async move {
+                    let (r, took) = traced(api.handle(lab_get(path)?)).await;
+                    anyhow::Ok((r.status(), body_of(r).await?, took))
+                }
+            };
+            let paths = [
+                "/api/harness/sessions",
+                "/api/harness/sessions/a",
+                "/api/harness/sessions/a/events?limit=50",
+                "/api/agents",
+                "/api/me",
+                "/api/overview",
+                "/api/runs",
+                "/api/plans?session=a",
+                "/api/harness/sessions/a/goals",
+                "/api/harness/sessions/nobody/goals",
+            ];
+            // Made (the reads meanwhile are the store's, or make what's kept ahead), and then each read
+            // asks nothing of a store and encodes nothing. A change of the hub's own between makes some
+            // stale again: they're all read again.
+            let deadline = Instant::now() + Duration::from_secs(30);
+            let answers = loop {
+                let (mut answers, mut busy) = (HashMap::new(), Vec::new());
+                for path in paths {
+                    let (status, body, took) = read(path).await?;
+                    anyhow::ensure!(status == StatusCode::OK, "{path}: {status} {}", String::from_utf8_lossy(&body));
+                    if took != Counts::default() {
+                        busy.push((path, took));
+                    }
+                    answers.insert(path, body);
+                }
+                if busy.is_empty() {
+                    break answers;
+                }
+                anyhow::ensure!(Instant::now() < deadline, "reads that still asked a store or encoded: {busy:?}");
+                crate::rt::sleep(Duration::from_millis(5)).await;
+            };
+            let got = |path: &str| answers.get(path).cloned().unwrap_or_default();
+            let owner = crate::authz::Caller::owner();
+            // Each says what the store's path says.
+            assert_eq!(got("/api/harness/sessions"), serde_json::to_vec(&hub.harness.list())?);
+            let a = hub.harness.list().into_iter().find(|i| i.id == "a").ok_or_else(|| anyhow::anyhow!("no session a"))?;
+            assert_eq!(got("/api/harness/sessions/a"), serde_json::to_vec(&a)?);
+            let events: serde_json::Value = serde_json::from_slice(&got("/api/harness/sessions/a/events?limit=50"))?;
+            let seqs: Vec<u64> = events.get("events").and_then(serde_json::Value::as_array).into_iter().flatten().filter_map(|e| e.get("seq").and_then(serde_json::Value::as_u64)).collect();
+            assert_eq!(seqs, (11..=60).collect::<Vec<u64>>(), "its newest fifty, oldest first");
+            assert_eq!(got("/api/agents"), serde_json::to_vec(&crate::doctor::runners_for(&hub, &owner).await)?);
+            assert_eq!(got("/api/me"), serde_json::to_vec(&me_json(&hub, Some(&owner), Vec::new()))?);
+            // The uptime may have gone on a second between the two: compared without it.
+            let without_uptime = |mut v: serde_json::Value| {
+                if let Some(system) = v.get_mut("system").and_then(serde_json::Value::as_object_mut) {
+                    system.remove("uptime_s");
+                }
+                v
+            };
+            let stored = overview_json(&hub, &hub.store.stats(None).await?, &hub.agent_list().await, &system_now(&hub), queue_now());
+            assert_eq!(without_uptime(serde_json::from_slice(&got("/api/overview"))?), without_uptime(stored));
+            assert_eq!(got("/api/runs"), serde_json::to_vec(&crate::reads::runs(&hub.store, &HashMap::new(), None).await?)?);
+            let plans = crate::plans::of_source(crate::plans::list(&hub, None, None).await?, Some("a"), false);
+            assert_eq!(got("/api/plans?session=a"), serde_json::to_vec(&plans)?);
+            assert_eq!(got("/api/harness/sessions/a/goals"), serde_json::to_vec(&crate::goals::get(&hub, "a").await?)?);
+            assert_eq!(got("/api/harness/sessions/nobody/goals"), serde_json::to_vec(&crate::goals::get(&hub, "nobody").await?)?);
+            // A runner's live record changed: its maker makes the list again before any read, and the
+            // read after that encodes nothing and says the change. (A write of the hub's own that sends
+            // that read to the store: the record changed again.)
+            let deadline = Instant::now() + Duration::from_secs(30);
+            let mut busy = 0;
+            let agents = loop {
+                busy += 1;
+                hub.change_agent("box", |a| a.busy = busy);
+                while !agents_key(&hub).is_some_and(|k| hub.harness.views.agents.holds(&k)) {
+                    anyhow::ensure!(Instant::now() < deadline, "the runners' list wasn't made again");
+                    crate::rt::sleep(Duration::from_millis(5)).await;
+                }
+                let (_, agents, took) = read("/api/agents").await?;
+                if took == Counts::default() {
+                    break agents;
+                }
+                anyhow::ensure!(Instant::now() < deadline, "the reads of the runners' list made ahead still asked or encoded: {took:?}");
+            };
+            assert_eq!(agents, serde_json::to_vec(&crate::doctor::runners_for(&hub, &owner).await)?);
+            assert!(String::from_utf8_lossy(&agents).contains(&format!(r#""busy":{busy}"#)), "{}", String::from_utf8_lossy(&agents));
+            // A run added: the next read of the runs asks the store, which has it; then it's kept again.
+            hub.store.create_run(run("run2", 2), Vec::new()).await?;
+            let (_, runs, took) = read("/api/runs").await?;
+            assert!(took.asked > 0, "stale: the store answered");
+            assert!(String::from_utf8_lossy(&runs).contains("run2"), "{}", String::from_utf8_lossy(&runs));
+            loop {
+                if hub.harness.views.runs.fresh(&hub.store, crate::reads::runs_listed).is_some() {
+                    let (_, again, took) = read("/api/runs").await?;
+                    if took == Counts::default() {
+                        assert_eq!(again, runs, "kept again, as the store has it");
+                        break;
+                    }
+                }
+                anyhow::ensure!(Instant::now() < deadline, "the runs' list wasn't kept again");
+                crate::rt::sleep(Duration::from_millis(5)).await;
+            }
+            Ok(())
+        })
+    }
+
+    /// A WebSocket client of the API at `port` on `path`, as the owner; with `rcvbuf`, its socket holds
+    /// at most about that many bytes it hasn't read.
+    fn ws_client(port: u16, path: &str, rcvbuf: Option<usize>) -> anyhow::Result<tungstenite::WebSocket<std::net::TcpStream>> {
+        use tungstenite::client::IntoClientRequest as _;
+        let sock = socket2::Socket::new(socket2::Domain::IPV4, socket2::Type::STREAM, None)?;
+        if let Some(n) = rcvbuf {
+            sock.set_recv_buffer_size(n)?;
+        }
+        sock.connect(&std::net::SocketAddr::from(([127, 0, 0, 1], port)).into())?;
+        let mut req = format!("ws://127.0.0.1:{port}{path}").into_client_request()?;
+        req.headers_mut().insert("authorization", "Bearer test-admin-token".parse()?);
+        let (ws, _) = tungstenite::client::client(req, std::net::TcpStream::from(sock)).map_err(|e| anyhow::anyhow!("{path}: {e}"))?;
+        Ok(ws)
+    }
+
+    /// Goal 10, plan 01a1a87b2dae step 3, traced: a frame published while another viewer of its session
+    /// attaches reaches the viewer already watching without waiting for that attach. The attaching one's
+    /// socket takes its snapshot's first frame and nothing more, so its snapshot (megabytes) is still
+    /// being written (`crate::reads::Views::attaching`) when the frame goes and when the other has it.
+    /// The frame is one message on the session's feed, encoded once, and its bytes are what each viewer
+    /// reads; the attaching one has it after its snapshot.
+    #[test]
+    fn g10_s3_a_frame_reaches_the_viewers_while_another_attaches() -> anyhow::Result<()> {
+        use crate::harness::core::Update;
+        use crate::harness::model::{Body, Event, State};
+        use kiln_seams::Bus as _;
+        use std::sync::atomic::Ordering;
+        const MARK: &str = "g10-s3: published while another viewer attaches";
+        // What a viewer's thread says: its snapshot came (false), or the frame (true, its text); or why it stopped.
+        type Said = Result<(bool, String), String>;
+        crate::rt::block_on(async {
+            // kiln's API on a port of its own.
+            let tcp = hyper_rt::tcp::TcpListener::bind(std::net::SocketAddr::from(([127, 0, 0, 1], 0)), 16).map_err(|e| anyhow::anyhow!("{e}"))?;
+            let port = tcp.local_addr().map_err(|e| anyhow::anyhow!("{e}"))?.port();
+            let hub = crate::hub::tests::scratch_hub().await?;
+            let api = Arc::new(Api { hub: Arc::clone(&hub) });
+            crate::rt::spawn(async move {
+                while let Ok(stream) = tcp.accept().await {
+                    let (api, remote) = (Arc::clone(&api), stream.peer_addr().ok());
+                    crate::rt::spawn(async move { crate::http::server::serve_accepted(stream, api, remote, None).await });
+                }
+            });
+            // A long session: its snapshot is megabytes, far more than the sockets between hold.
+            let there = crate::harness::registry::Location::Machine("box".into());
+            let info = crate::harness::session::Info { id: "s".into(), kind: "claude".into(), ..crate::harness::session::Info::default() };
+            hub.harness.ingest(&hub, &there, "s", Update::Open { info: Box::new(info), since: None }).await;
+            hub.harness.ingest(&hub, &there, "s", Update::State { state: Box::new(State::default()) }).await;
+            let said = |n: u64, text: String| Event { id: format!("e{n}"), seq: n, at: 1, parent: None, by: None, body: Body::Assistant { text, streaming: false } };
+            let long: Vec<Event> = (1..=256).map(|n| said(n, format!("{n}: {}", "the retry loop reads its deadline ".repeat(960)))).collect();
+            hub.harness.ingest(&hub, &there, "s", Update::Events { events: long }).await;
+            let wait = Duration::from_secs(60);
+            let next = |rx: async_channel::Receiver<Said>, what: &'static str| async move {
+                match crate::rt::timeout(wait, rx.recv()).await {
+                    Ok(Ok(Ok(said))) => Ok(said),
+                    Ok(Ok(Err(why))) => Err(anyhow::anyhow!("{what}: {why}")),
+                    Ok(Err(_)) => Err(anyhow::anyhow!("{what}: its viewer went")),
+                    Err(_) => Err(anyhow::anyhow!("{what}: not within {wait:?}")),
+                }
+            };
+            // Viewer A watches it, as the UI does (its snapshot packed).
+            let (a_tx, a_rx) = async_channel::unbounded::<Said>();
+            std::thread::spawn(move || {
+                let watch = || -> anyhow::Result<String> {
+                    let mut ws = ws_client(port, "/api/harness/sessions/s/ws?z=gzip&patch=state&patch=changes", None)?;
+                    loop {
+                        match ws.read()? {
+                            tungstenite::Message::Binary(_) => {
+                                let _ = a_tx.send_blocking(Ok((false, String::new())));
+                            }
+                            tungstenite::Message::Text(t) if t.as_str().contains(MARK) => return Ok(t.as_str().to_owned()),
+                            _ => {}
+                        }
+                    }
+                };
+                let _ = a_tx.send_blocking(watch().map(|t| (true, t)).map_err(|e| format!("{e:#}")));
+            });
+            anyhow::ensure!(!next(a_rx.clone(), "A's snapshot").await?.0, "A's snapshot comes first");
+            // Viewer B attaches: its socket takes its snapshot's first frame (its head) and nothing more
+            // until it's told to read on.
+            let (b_tx, b_rx) = async_channel::unbounded::<Said>();
+            let (go, read_on) = async_channel::bounded::<()>(1);
+            std::thread::spawn(move || {
+                let attach = || -> anyhow::Result<String> {
+                    let mut ws = ws_client(port, "/api/harness/sessions/s/ws", Some(4096))?;
+                    let head = ws.read()?;
+                    let _ = b_tx.send_blocking(Ok((false, head.to_text().unwrap_or_default().to_owned())));
+                    let _ = read_on.recv_blocking();
+                    loop {
+                        if let tungstenite::Message::Text(t) = ws.read()?
+                            && t.as_str().contains(MARK)
+                        {
+                            return Ok(t.as_str().to_owned());
+                        }
+                    }
+                };
+                let _ = b_tx.send_blocking(attach().map(|t| (true, t)).map_err(|e| format!("{e:#}")));
+            });
+            let (_, head) = next(b_rx.clone(), "B's snapshot's head").await?;
+            anyhow::ensure!(!head.contains(MARK), "B's snapshot was taken before the frame");
+            // B's snapshot is being written (A's is done), and stays so: B reads none of it.
+            let writing = || hub.harness.views.attaching.load(Ordering::Acquire);
+            let deadline = Instant::now() + wait;
+            while writing() != 1 {
+                anyhow::ensure!(Instant::now() < deadline, "{} snapshots being written, not B's alone", writing());
+                crate::rt::sleep(Duration::from_millis(5)).await;
+            }
+            // The feed, as a viewer of its own reads it: where it ends now.
+            let feed = hub.harness.attach("s").ok_or_else(|| anyhow::anyhow!("no session s"))?;
+            let from = feed.at.ok_or_else(|| anyhow::anyhow!("the session's feed has no topic"))?;
+            // The frame, published while B attaches: A has it, while B's snapshot is still being written.
+            hub.harness.ingest(&hub, &there, "s", Update::Events { events: vec![said(257, MARK.to_owned())] }).await;
+            let (live, a_has) = next(a_rx, "A's frame (it waited for B's attach)").await?;
+            anyhow::ensure!(live, "A had the frame live");
+            anyhow::ensure!(writing() == 1, "B's attach was under way as A had the frame: {} snapshots being written", writing());
+            // Encoded once: one message on the feed carries it, and its bytes are what A read.
+            let batch = hub.bus.read(&feed.topic, from, 64).await.map_err(|e| anyhow::anyhow!("{e}"))?;
+            let carrying: Vec<String> = batch.messages.iter().filter_map(|m| crate::harness::live::decode_ref(&m.payload)).filter(|f| f.text.contains(MARK)).map(|f| f.text.to_owned()).collect();
+            anyhow::ensure!(carrying == vec![a_has.clone()], "one message on the feed carries the frame, as A read it: {} do", carrying.len());
+            // B reads on: its snapshot, then the frame, the same bytes.
+            go.send(()).await?;
+            let (live, b_has) = next(b_rx, "B's frame").await?;
+            anyhow::ensure!(live && b_has == a_has, "B had the frame's bytes after its snapshot");
+            while writing() != 0 {
+                anyhow::ensure!(Instant::now() < deadline, "B's snapshot was never written whole");
+                crate::rt::sleep(Duration::from_millis(5)).await;
+            }
+            drop(feed);
+            Ok(())
+        })
     }
 
     /// A command on a session's socket doesn't wait for the store: with the store's one connection

@@ -56,8 +56,9 @@ struct Common {
     /// CI legs and agents run on bare metal (docs/priority.md; Linux with systemd's user manager).
     #[arg(long, default_value = "shared")]
     layout: String,
-    /// `realistic` (production's shape at a busy hour), `overload` (that, with no think time), `many` (all of
-    /// production's live sessions at work at once) or `small` (to try the lab out).
+    /// `realistic` (production's shape at a busy hour), `overload` (that, with no think time), `flood` (that, with
+    /// 64 readers and 8 agents calling MCP), `many` (all of production's live sessions at work at once) or `small`
+    /// (to try the lab out).
     #[arg(long, default_value = "realistic")]
     profile: String,
     /// Seconds each round measures (the profile's own otherwise).
@@ -177,7 +178,8 @@ fn measure(builds: &[Build], c: &Common) -> anyhow::Result<Run> {
         "realistic" => Profile::realistic(),
         "overload" => Profile::overload(),
         "many" => Profile::many(),
-        p => anyhow::bail!("no profile {p}: realistic, overload, many or small"),
+        "flood" => Profile::flood(),
+        p => anyhow::bail!("no profile {p}: realistic, overload, flood, many or small"),
     };
     if let Some(w) = c.window {
         profile.window_s = w;
@@ -230,13 +232,15 @@ fn summary_line(r: &lab::Round) -> String {
     // Latencies to the microsecond (goal 10, plan 01a1a87b2dae step 1).
     let get = |k: &str| r.numbers.get(k).map_or_else(|| "-".to_owned(), |v| format!("{v:.3}"));
     format!(
-        "api_read p50 {} p99.9 {} ms, websocket p50 {} p99.9 {} ms, attach p99 {} ms, shards' delay p99 {} ms, server CPU {} ms a request",
+        "api_read p50 {} p99.9 {} ms, websocket p50 {} p99.9 {} ms, attach p99 {} ms, shards' delay p99.9 {} µs (worst shard {} µs), shards' busy share {}, server CPU {} ms a request",
         get("api_read.p50_ms"),
         get("api_read.p999_ms"),
         get("websocket.p50_ms"),
         get("websocket.p999_ms"),
         get("attach.p99_ms"),
-        get("shards.delay_p99_ms"),
+        get("shards.delay_p999_us"),
+        get("shards.worst_delay_p999_us"),
+        get("shards.busy_share"),
         get("server.cpu_ms_per_request")
     )
 }

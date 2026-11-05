@@ -17,13 +17,13 @@ use kiln_cd::model::{Health, Sync};
 use kiln_cd::stands::{self, App, Standing};
 use kiln_cd::state::{Deployment, Pin, RolloutRecord};
 use kiln_cd::tree::{self, Managed, Node};
-use parking_lot::Mutex;
 use serde_json::{Value, json};
 
 use super::Fail;
 use crate::cd::Cd;
 use crate::http::server::{self as srv, Response};
 use crate::hub::Hub;
+use crate::rcu::Rcu;
 
 /// How far back a source's log is read to say how far trunk is ahead of what runs.
 const AHEAD_LOOK: usize = 100;
@@ -171,8 +171,10 @@ pub(crate) fn gather(cd: &Cd, only: Option<&str>) -> Vec<Facts> {
     out
 }
 
-/// Each source's newest commits on its revision, kept a while: by repository and revision.
-static LOGS: LazyLock<Mutex<HashMap<(String, String), (Instant, Arc<Vec<String>>)>>> = LazyLock::new(|| Mutex::new(HashMap::new()));
+/// Each source's newest commits on its revision, kept a while: by repository and revision. Read
+/// without a lock as Ship's Deploys is gathered (goal 5, plan 01a1a59c2aae step 2), a source read
+/// again swapped in whole (`crate::rcu`).
+static LOGS: LazyLock<Rcu<HashMap<(String, String), (Instant, Arc<Vec<String>>)>>> = LazyLock::new(Rcu::default);
 
 /// How many commits each app's source has on its revision after the one that runs (as far as
 /// [`AHEAD_LOOK`] goes): read from KilnCD's mirrors, each repository and revision once.
@@ -182,7 +184,7 @@ async fn read_ahead(cd: &Arc<Cd>, facts: &mut [Facts]) {
     wanted.dedup();
     let mut logs: HashMap<(String, String), Arc<Vec<String>>> = HashMap::new();
     for key in wanted {
-        if let Some((at, l)) = LOGS.lock().get(&key)
+        if let Some((at, l)) = LOGS.load().get(&key)
             && at.elapsed() < AHEAD_FOR
         {
             logs.insert(key, l.clone());
@@ -192,11 +194,13 @@ async fn read_ahead(cd: &Arc<Cd>, facts: &mut [Facts]) {
         let got = crate::rt::blocking(move || kiln_cd::git::Mirror::open(&dir, &url, auth)?.log(&rev, AHEAD_LOOK)).await.ok().and_then(Result::ok);
         let Some(got) = got else { continue };
         let shas = Arc::new(got.into_iter().map(|c| c.sha).collect::<Vec<_>>());
-        let mut cache = LOGS.lock();
-        if cache.len() > 256 {
-            cache.clear();
-        }
-        cache.insert(key.clone(), (Instant::now(), shas.clone()));
+        let now = Instant::now();
+        LOGS.update(|cache| {
+            if cache.len() > 256 {
+                cache.clear();
+            }
+            cache.insert(key.clone(), (now, Arc::clone(&shas)));
+        });
         logs.insert(key, shas);
     }
     for f in facts.iter_mut() {
@@ -216,7 +220,9 @@ async fn read_ahead(cd: &Arc<Cd>, facts: &mut [Facts]) {
 pub(crate) struct Model {
     /// Changes heard: each of CD's events and store changes, and each of Ship's verbs done.
     changes: AtomicU64,
-    held: Mutex<Option<Held>>,
+    /// The facts as last gathered: read by every list without a lock (goal 5, plan 01a1a59c2aae step
+    /// 2), the next gathering swapped in whole (`crate::rcu`).
+    held: Rcu<Option<Held>>,
     listening: AtomicBool,
 }
 
@@ -270,13 +276,13 @@ impl Model {
         self.listen(hub);
         // Read before gathering: a change heard meanwhile is gathered by the next read.
         let heard = self.changes.load(Ordering::Acquire);
-        if let Some(h) = self.held.lock().as_ref().filter(|h| h.changes == heard && h.at.elapsed() < KEEP_FOR) {
+        if let Some(h) = Option::as_ref(&self.held.load()).filter(|h| h.changes == heard && h.at.elapsed() < KEEP_FOR) {
             return Arc::clone(&h.facts);
         }
         let mut facts = gather(cd, None);
         read_ahead(cd, &mut facts).await;
         let facts = Arc::new(facts);
-        *self.held.lock() = Some(Held { changes: heard, at: Instant::now(), facts: Arc::clone(&facts) });
+        self.held.set(Some(Held { changes: heard, at: Instant::now(), facts: Arc::clone(&facts) }));
         facts
     }
 }

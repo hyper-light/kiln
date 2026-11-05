@@ -415,7 +415,7 @@ fn run(ctx: Ctx, mut settings: Settings) {
         targets(s, &ctx).into_iter().filter(|t| t.probe != settings::Probe::Messages).map(|t| probes::Spec { window: Duration::from_millis(u64::from(t.window_ms())), name: t.name, probe: t.probe }).collect()
     };
     let engine_targets = |s: &Settings| -> Vec<Target> {
-        targets(s, &ctx).into_iter().map(|t| Target { tolerance_us: f64::from(t.tolerance_ms()) * 1e3, window_us: t.window_ms.map(|w| f64::from(w) * 1e3), name: t.name }).collect()
+        targets(s, &ctx).into_iter().map(|t| Target { tolerance_us: f64::from(t.tolerance_ms()) * 1e3, window_us: t.window_ms.map(|w| f64::from(w) * 1e3), first: matches!(t.probe, settings::Probe::Delay { .. }), name: t.name }).collect()
     };
     let learned_path = ctx.dir.join(LEARNED);
     let learned: Learned = read_json(&learned_path).unwrap_or_default();

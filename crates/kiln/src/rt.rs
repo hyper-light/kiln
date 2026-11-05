@@ -153,10 +153,32 @@ pub fn profile() -> Profile {
 /// goal 8, plan 01a1a59c2b29 step 6), as [`pin`] chose them.
 static CORES: OnceLock<Vec<u32>> = OnceLock::new();
 
+/// Whether the process's other threads are kept off its shards' cores ([`pin`]): its compute pool
+/// is then sized to the cores they have, the shards not among them.
+static SHARDS_APART: AtomicBool = AtomicBool::new(false);
+
 /// Fix the runtime's shards to `cores`, cores of the process's own (the server's `[server] cores`),
-/// in their order: only the first call before the runtime starts has any effect.
+/// in their order, one shard to a core, and keep every other thread the process starts from here on
+/// off the shards' cores, so a shard waking finds its core free (goal 9, plan 01a1a87b2cec step 4: under
+/// Linux's lazy preemption a waking thread waits up to a tick, 1 ms, for a busy core's thread to
+/// give way, research 01a1a59c2b2a f36). Call it on the thread that starts the runtime, before it
+/// starts: only the first call has any effect.
 pub fn pin(cores: Vec<u32>) {
+    if CORES.get().is_some() {
+        return;
+    }
+    let mut shards = shard_cores(&cores, profile().shards);
+    shards.sort_unstable();
+    shards.dedup();
+    // Apart only where the other threads keep a core: the first, which `shard_cores` leaves them.
+    let apart = !shards.is_empty() && shards.len() < cores.len();
     let _ = CORES.set(cores);
+    if apart {
+        match crate::os::keep_threads_off(&shards) {
+            Ok(()) => SHARDS_APART.store(true, Ordering::Relaxed),
+            Err(why) => tracing::warn!(why = %why, "the server's other threads share its shards' cores"),
+        }
+    }
 }
 
 /// The core each of `shards` shards is fixed to, from cores of the process's own: the first kept
@@ -224,6 +246,11 @@ fn start() -> Result<Rt, String> {
         Err(e) => return Err(format!("blocking pool: {e}")),
     }
     let mut config = runtime_config(p.shards, p.tasks_per_shard);
+    // The step quantum from `KILN_RT_QUANTUM_US`: the lab's A/B of quanta on one build (goal 9, plan
+    // 01a1a87b2cec step 3).
+    if let Some(us) = std::env::var("KILN_RT_QUANTUM_US").ok().and_then(|v| v.trim().parse::<u64>().ok()).filter(|us| *us > 0) {
+        config.step_budget_ns = us.saturating_mul(1000);
+    }
     if let Some(cores) = CORES.get() {
         config.cores = shard_cores(cores, p.shards);
         config.pin = !config.cores.is_empty();
@@ -244,8 +271,49 @@ fn start() -> Result<Rt, String> {
             }
         });
     }
+    if SHARDS_APART.load(Ordering::Relaxed) {
+        keep_apart(&holders);
+    }
     tracing::debug!(shards = p.shards, tasks = p.tasks_per_shard, "hyper-rt runtime started");
     Ok(Rt { runtime, holders, next: AtomicUsize::new(0) })
+}
+
+/// Keeps the process's other threads off its shards' cores for as long as it runs ([`pin`]; goal 9,
+/// plan 01a1a87b2cec step 4): a thread starts with the CPUs of the thread that started it, and the
+/// server starts most of its threads from tasks on its shards, each fixed to its core. Each shard
+/// tells its thread's kernel id; then a thread of its own, once each period of the shards' probes
+/// (`crate::shard_health::PERIOD`, so a thread a shard started shares its core for at most a probe's
+/// period), moves each thread it hasn't seen yet that may run on a shard's core
+/// (`crate::os::keep_off_shards`). A child process a shard starts is moved as it starts
+/// (`crate::os::keep_child_off_shards`).
+fn keep_apart(holders: &[SlotHolder]) {
+    let tids: Arc<Vec<std::sync::atomic::AtomicU32>> = Arc::new(holders.iter().map(|_| std::sync::atomic::AtomicU32::new(0)).collect());
+    for (i, holder) in holders.iter().enumerate() {
+        let tids = Arc::clone(&tids);
+        let _ = hyper_rt::runtime::submit_to_holder(*holder, async move {
+            if let (Some(slot), Some(id)) = (tids.get(i), crate::os::thread_id()) {
+                slot.store(id, Ordering::Release);
+            }
+        });
+    }
+    let spawned = std::thread::Builder::new().name("kiln-apart".into()).spawn(move || {
+        let mut seen = std::collections::HashSet::new();
+        loop {
+            std::thread::sleep(crate::shard_health::PERIOD);
+            let shards: Vec<u32> = tids.iter().map(|t| t.load(Ordering::Acquire)).collect();
+            // Not until every shard has said which thread is its own.
+            if shards.contains(&0) {
+                continue;
+            }
+            let moved = crate::os::keep_off_shards(&shards, &mut seen);
+            if moved > 0 {
+                tracing::debug!(moved, "threads moved off the shards' cores");
+            }
+        }
+    });
+    if let Err(e) = spawned {
+        tracing::warn!(error = %e, "the server's other threads may share its shards' cores: no thread to keep them off");
+    }
 }
 
 /// The compute pool (goal 3 of the API runtime program, plan 01a1a59c2a8e step 1; `hyper_rt::compute`): as
@@ -261,7 +329,8 @@ fn start_compute(p: &Profile, config: &RuntimeConfig) {
     }
     let grant = hyper_rt::compute::Grant::of_process();
     let shards = usize::from(p.shards);
-    let workers = hyper_rt::compute::workers_for(&grant, shards);
+    // Shards on cores of their own aren't among the cores the pool's threads may take ([`pin`]).
+    let workers = hyper_rt::compute::workers_for(&grant, if SHARDS_APART.load(Ordering::Relaxed) { 0 } else { shards });
     let pool = hyper_rt::compute::Config { workers, queued: shards.saturating_mul(p.tasks_per_shard), piece_ns: config.step_budget_ns, rank: hyper_rt::compute::Rank::Below };
     // Each job's wait for a thread and each piece's time, on /metrics (step 3; `crate::pool_health`).
     let _ = hyper_rt::compute::observe(crate::pool_health::compute_job);
@@ -271,7 +340,11 @@ fn start_compute(p: &Profile, config: &RuntimeConfig) {
                 Ok(priority) => priority.to_string(),
                 Err(refusal) => format!("the process's own ({refusal})"),
             };
-            let size = format!("{} threads: {grant}, less {shards} shards", started.workers);
+            let size = if SHARDS_APART.load(Ordering::Relaxed) {
+                format!("{} threads: {grant}, its shards on cores of their own", started.workers)
+            } else {
+                format!("{} threads: {grant}, less {shards} shards", started.workers)
+            };
             if p.announce {
                 tracing::info!(size = %size, priority = %priority, lowered = started.lowered, "compute pool started");
             } else {
@@ -452,6 +525,44 @@ pub fn spawn_spread<F: Future<Output = ()> + Send + 'static>(fut: F) {
     tracing::error!("hyper-rt refused a connection task on every shard; connection dropped");
 }
 
+/// [`spawn`], placed as [`spawn_spread`] places a task: on the next shard round-robin wherever the
+/// caller is, passing over one the watchdog sees held. For a service the process starts and keeps (a
+/// supervised child, a feed's loop): started from a task on one shard, as a server's are by its
+/// start-up on the shard that runs it, [`spawn`] would keep every one of them on that shard (goal 9,
+/// plan 01a1a87b2cec step 3: the lab's calm baseline found the server's shard 0 busy 0.24 of the time
+/// against 0.016 on each of the others, and its delay p99.9 94 ms against about 1 ms).
+#[track_caller]
+pub fn spawn_spread_joined<F>(fut: F) -> JoinHandle<F::Output>
+where
+    F: Future + Send + 'static,
+    F::Output: Send + 'static,
+{
+    let (tx, rx) = futures::channel::oneshot::channel();
+    let (fut, abort) = futures::future::abortable(fut);
+    let slot = handoff(Box::pin(async move {
+        if let Ok(v) = fut.await {
+            let _ = tx.send(v);
+        }
+    }));
+    let mut placed = submit_spread(&slot) || submit(&slot);
+    // Off the runtime (start-up, tests), a burst that filled the control queues is waited out, as
+    // `spawn_boxed` waits it out (a loop, not a closure, so the caller's place stays the spawn site).
+    if !placed && !on_shard() {
+        for _ in 0..2000 {
+            std::thread::sleep(Duration::from_millis(2));
+            if submit_spread(&slot) {
+                placed = true;
+                break;
+            }
+        }
+    }
+    if !placed {
+        crate::metrics::global().panics_caught.inc();
+        tracing::error!("hyper-rt refused a task on every shard (arenas or control queues full); task dropped");
+    }
+    JoinHandle { rx, abort }
+}
+
 /// Run an accepted connection on the next shard round-robin, as [`spawn_spread`] does, or, where the
 /// placement steers (goal 7, `crate::placement`), on the less delayed of two shards drawn at random; its
 /// task starting Critical: its first request's head must be read before the request's class is known, and
@@ -475,30 +586,30 @@ pub fn shard_count() -> usize {
 
 /// Run `fut` on shard `i` (of [`shard_count`]) and no other, for a task whose work is that shard's
 /// own: a probe of its health (`crate::shard_health`), or a test holding one shard and not the
-/// rest. Whether the shard took it.
+/// rest. Whether the shard took it. The caller's place is the task's spawn site.
+#[track_caller]
 pub fn spawn_on<F: Future<Output = ()> + Send + 'static>(i: usize, fut: F) -> bool {
     let Ok(rt) = rt() else { return false };
-    rt.holders.get(i).is_some_and(|holder| hyper_rt::runtime::submit_to_holder(*holder, fut).is_ok())
+    let Some(holder) = rt.holders.get(i) else { return false };
+    hyper_rt::runtime::submit_to_holder(*holder, fut).is_ok()
 }
 
 /// Run `fut` as its own task on shard `shard` (of [`shard_count`]) for its whole life, wherever the
 /// caller is: a task that owns what belongs to that shard (each agent session's copy,
 /// `crate::harness::copies`). Refused there (its arena or control queue full), it waits as
 /// [`spawn`] does off the runtime, then runs on whichever shard takes it, said, rather than not at
-/// all, where [`spawn_on`] gives up. Goal 4, plan 01a1a59c2a9c step 2.
+/// all, where [`spawn_on`] gives up. Goal 4, plan 01a1a59c2a9c step 2. The caller's place is the
+/// task's spawn site.
+#[track_caller]
 pub fn spawn_owner<F: Future<Output = ()> + Send + 'static>(shard: usize, fut: F) {
     let slot = handoff(Box::pin(fut));
-    let there = |slot: &Arc<Mutex<Option<Boxed>>>| {
-        let holder = rt().ok().and_then(|rt| rt.holders.get(shard % rt.holders.len().max(1)).copied());
-        holder.is_some_and(|h| hyper_rt::runtime::submit_to_holder(h, bootstrap(slot)).is_ok())
-    };
-    if there(&slot) {
+    if owner_takes(shard, &slot) {
         return;
     }
     if !on_shard() {
         for _ in 0..2000 {
             std::thread::sleep(Duration::from_millis(2));
-            if there(&slot) {
+            if owner_takes(shard, &slot) {
                 return;
             }
         }
@@ -509,6 +620,26 @@ pub fn spawn_owner<F: Future<Output = ()> + Send + 'static>(shard: usize, fut: F
     }
     crate::metrics::global().panics_caught.inc();
     tracing::error!("hyper-rt refused a task on every shard (arenas or control queues full); task dropped");
+}
+
+/// Whether shard `shard` (of [`shard_count`], around again past the last) took the task in `slot`.
+#[track_caller]
+fn owner_takes(shard: usize, slot: &Arc<Mutex<Option<Boxed>>>) -> bool {
+    let Some(holder) = rt().ok().and_then(|rt| rt.holders.get(shard.checked_rem(rt.holders.len())?).copied()) else { return false };
+    hyper_rt::runtime::submit_to_holder(holder, bootstrap(slot)).is_ok()
+}
+
+/// `fut`, each of its polls labeled `label` for the shards' table of slow polls: should a poll of it hold
+/// its shard past 100 µs, the shard counts it against `label` as well as its task's spawn site
+/// (`hyper_rt::slow`; goal 9, plan 01a1a87b2cec step 2). A request's route, say
+/// (`crate::route_latency::label_of`).
+pub async fn labeled<F: Future>(label: &'static hyper_rt::slow::Label, fut: F) -> F::Output {
+    let mut fut = pin!(fut);
+    std::future::poll_fn(move |cx| {
+        hyper_rt::futures::label(label);
+        fut.as_mut().poll(cx)
+    })
+    .await
 }
 
 /// Run a `!Send` future as a task on the current shard. Refused off the runtime.

@@ -62,33 +62,128 @@ impl Location {
     }
 }
 
-/// One of a copy's events, or one of its changeset's files: its JSON, and its text once made. A
-/// long session's copy is megabytes of JSON that every viewer's snapshot, every live frame and
-/// every digest reads: each is written out once, when first asked for (or as its live frame is
-/// made), and shared from then on, however many take it. Changed, it's written out again when next
-/// asked for.
+/// One of a copy's events, or one of its changeset's files: its JSON as frames carry it, written out once
+/// as it comes in (every viewer's snapshot, every live frame and every digest take that as it is), and
+/// what's read of it without the JSON: an event's id, number and kind and whether it's on its session's
+/// main thread, a file's path and tree. Its JSON's tree isn't kept: a long session's copy kept every
+/// event's beside its text, 8,260 bytes for each event it kept where its JSON is about 3,500 (goal 11, plan
+/// 01a1a87b2e56 step 2; `tests/session_resident.rs`). One that text is streamed into is held as its tree
+/// while that goes on, and written out again when next asked for.
 pub struct Entry {
-    value: Value,
-    text: std::sync::OnceLock<Box<str>>,
+    body: Body,
+    head: Head,
     /// Its digest as a runner that starts again compares it (`crate::wire::sums`), once asked for.
     sum: std::sync::OnceLock<u64>,
 }
 
-impl Entry {
-    pub(super) fn new(value: Value) -> Self {
-        Self { value, text: std::sync::OnceLock::new(), sum: std::sync::OnceLock::new() }
+/// An entry's JSON: as written out, or its tree while text is streamed into it.
+#[derive(Clone)]
+enum Body {
+    Text(Box<str>),
+    Changing(Box<Changing>),
+}
+
+/// An entry text is being streamed into: its tree, and its JSON once asked for again.
+#[derive(Clone)]
+struct Changing {
+    value: Value,
+    text: std::sync::OnceLock<Box<str>>,
+}
+
+/// What's read of an entry without its JSON.
+#[derive(Clone, Default)]
+struct Head {
+    id: Option<Box<str>>,
+    seq: Option<u64>,
+    kind: Option<std::borrow::Cow<'static, str>>,
+    /// An event of its session's main thread: no `parent`, or a null one.
+    main: bool,
+    /// A changeset file's path and tree ([`file_ref`]).
+    file: Option<Box<(Option<Box<str>>, Option<Box<str>>)>>,
+}
+
+/// The kinds events have (`super::model::Body`'s tags), kept without a copy each.
+const KINDS: [&str; 5] = ["user", "assistant", "thinking", "tool", "notice"];
+
+impl Head {
+    fn of(v: &Value) -> Self {
+        let s = |k: &str| v.get(k).and_then(Value::as_str);
+        let kind = s("kind").map(|k| KINDS.iter().find(|known| **known == k).map_or_else(|| std::borrow::Cow::Owned(k.to_owned()), |known| std::borrow::Cow::Borrowed(*known)));
+        let file = (v.get("path").is_some() || v.get("tree").is_some()).then(|| Box::new((s("path").map(Box::from), s("tree").map(Box::from))));
+        Self { id: s("id").map(Box::from), seq: v.get("seq").and_then(Value::as_u64), kind, main: v.get("parent").is_none_or(Value::is_null), file }
     }
 
-    /// `value` with `text`, its JSON as [`Entry::text`] writes it (made already, for a live frame).
+    /// [`Head::of`] an event's JSON, read from the event itself: its kind is its body's tag (`super::model::Body`
+    /// is tagged `kind`, in snake case), and an event's JSON has no changeset file's path or tree of its own.
+    fn of_event(e: &super::model::Event) -> Self {
+        use super::model::Body as B;
+        let kind = match &e.body {
+            B::User { .. } => "user",
+            B::Assistant { .. } => "assistant",
+            B::Thinking { .. } => "thinking",
+            B::Tool(_) => "tool",
+            B::Notice { .. } => "notice",
+        };
+        Self { id: Some(e.id.as_str().into()), seq: Some(e.seq), kind: Some(std::borrow::Cow::Borrowed(kind)), main: e.parent.is_none(), file: None }
+    }
+}
+
+impl Entry {
+    /// `value`, its JSON written out now.
+    pub(super) fn new(value: Value) -> Self {
+        let text = serde_json::to_string(&value).unwrap_or_default();
+        Self::written(value, text)
+    }
+
+    /// An entry as `text`, its JSON, says (an event of a compact chunk read again): what's looked up of it
+    /// read from it.
+    pub(super) fn from_text(text: &str) -> Self {
+        let head = serde_json::from_str::<Value>(text).map(|v| Head::of(&v)).unwrap_or_default();
+        crate::memory::SESSION_ENTRIES.add(text.len());
+        Self { head, body: Body::Text(text.into()), sum: std::sync::OnceLock::new() }
+    }
+
+    /// `value` as `text` writes it (made already, for a live frame): the text kept, the tree let go of.
     pub(super) fn written(value: Value, text: String) -> Self {
-        let made = std::sync::OnceLock::new();
-        let _ = made.set(text.into_boxed_str());
-        Self { value, text: made, sum: std::sync::OnceLock::new() }
+        crate::memory::SESSION_ENTRIES.add(text.len());
+        Self { head: Head::of(&value), body: Body::Text(text.into_boxed_str()), sum: std::sync::OnceLock::new() }
+    }
+
+    /// Event `e` as a copy keeps it, written out once, straight from the event (goal 9, plan 01a1a87b2cec
+    /// step 5: its owner wrote each event into a JSON tree, then the tree out, then the event again for the
+    /// store's row). It's the text the tree wrote, as a runner's digests of it take it (`crate::agent`):
+    /// serde_json's maps keep their keys in the order they come (its `preserve_order`, which kiln's build
+    /// has). What's looked up of it is read from the event ([`Head::of_event`]); its text goes to `keep`
+    /// as well (the conversation store's row), when anyone keeps it. One that can't be written out is
+    /// `null`, as before.
+    pub(super) fn of_event(e: &super::model::Event, keep: Option<&mut dyn FnMut(String)>) -> Self {
+        let Ok(text) = serde_json::to_string(e) else { return Self::written(Value::Null, "null".to_owned()) };
+        crate::memory::SESSION_ENTRIES.add(text.len());
+        let body: Box<str> = match keep {
+            Some(keep) => {
+                let body = Box::from(text.as_str());
+                keep(text);
+                body
+            }
+            None => text.into_boxed_str(),
+        };
+        Self { head: Head::of_event(e), body: Body::Text(body), sum: std::sync::OnceLock::new() }
+    }
+
+    /// The bytes it holds as text, as `crate::memory::SESSION_ENTRIES` counts them.
+    fn counted(&self) -> usize {
+        match &self.body {
+            Body::Text(t) => t.len(),
+            Body::Changing(_) => 0,
+        }
     }
 
     /// Its JSON as frames carry it: `serde_json`'s compact form of its value.
     pub fn text(&self) -> &str {
-        self.text.get_or_init(|| serde_json::to_string(&self.value).unwrap_or_default().into_boxed_str())
+        match &self.body {
+            Body::Text(t) => t,
+            Body::Changing(c) => c.text.get_or_init(|| serde_json::to_string(&c.value).unwrap_or_default().into_boxed_str()),
+        }
     }
 
     /// Its digest, of its text (`crate::wire::sums::event_text`): made once, however many ask.
@@ -96,35 +191,76 @@ impl Entry {
         *self.sum.get_or_init(|| crate::wire::sums::event_text(self.text()))
     }
 
-    /// Its id: what the copy finds an event by (read through here, not its JSON's tree, which goal 11's
-    /// stored form doesn't keep).
+    /// Its id: what the copy finds an event by.
     pub fn id(&self) -> Option<&str> {
-        self.value.get("id").and_then(Value::as_str)
+        self.head.id.as_deref()
     }
 
     /// Its number in its session's timeline.
     pub fn seq(&self) -> Option<u64> {
-        self.value.get("seq").and_then(Value::as_u64)
+        self.head.seq
     }
 
-    /// Its value, to change: its text and digest are made again when next asked for.
-    pub(super) fn value_mut(&mut self) -> &mut Value {
-        self.text = std::sync::OnceLock::new();
+    /// An event's kind (`user`, `assistant`, `thinking`, `tool`, `notice`).
+    pub fn kind(&self) -> Option<&str> {
+        self.head.kind.as_deref()
+    }
+
+    /// Whether it's an event of its session's main thread (one of no subagent's).
+    pub fn on_main_thread(&self) -> bool {
+        self.head.main
+    }
+
+    /// Whether its JSON is `null`: an event that couldn't be written out as JSON, nothing for a copy to
+    /// take.
+    pub fn is_null(&self) -> bool {
+        self.text() == "null"
+    }
+
+    /// A changeset file's path and tree, as [`file_ref`] names a file's JSON.
+    pub(super) fn file(&self) -> FileRef<'_> {
+        self.head.file.as_deref().map_or((None, None), |(path, tree)| (path.as_deref(), tree.as_deref()))
+    }
+
+    /// Its JSON's tree, read again from its text: for what reads more of it than the above (an agent's
+    /// conclusion, a changeset as JSON).
+    pub fn value(&self) -> Value {
+        match &self.body {
+            Body::Text(t) => serde_json::from_str(t).unwrap_or(Value::Null),
+            Body::Changing(c) => c.value.clone(),
+        }
+    }
+
+    /// `more` added to its `text`, as a runner streams it: its tree held while that goes on, its JSON and
+    /// digest written again when next asked for. False when it has no text to add to.
+    pub(super) fn append_text(&mut self, more: &str) -> bool {
+        if let Body::Text(t) = &self.body {
+            let Ok(value) = serde_json::from_str::<Value>(t) else { return false };
+            if !value.get("text").is_some_and(Value::is_string) {
+                return false;
+            }
+            crate::memory::SESSION_ENTRIES.sub(t.len());
+            self.body = Body::Changing(Box::new(Changing { value, text: std::sync::OnceLock::new() }));
+        }
+        let Body::Changing(c) = &mut self.body else { return false };
+        let Some(Value::String(s)) = c.value.get_mut("text") else { return false };
+        s.push_str(more);
+        c.text = std::sync::OnceLock::new();
         self.sum = std::sync::OnceLock::new();
-        &mut self.value
+        true
     }
 }
 
 impl Clone for Entry {
     fn clone(&self) -> Self {
-        Self { value: self.value.clone(), text: self.text.clone(), sum: self.sum.clone() }
+        crate::memory::SESSION_ENTRIES.add(self.counted());
+        Self { body: self.body.clone(), head: self.head.clone(), sum: self.sum.clone() }
     }
 }
 
-impl std::ops::Deref for Entry {
-    type Target = Value;
-    fn deref(&self) -> &Value {
-        &self.value
+impl Drop for Entry {
+    fn drop(&mut self) {
+        crate::memory::SESSION_ENTRIES.sub(self.counted());
     }
 }
 
@@ -201,6 +337,15 @@ pub(super) mod write {
     pub fn events<'a>(w: &mut impl Write, all: impl IntoIterator<Item = &'a Entry>, rev: Option<u64>) -> io::Result<()> {
         head(w, "events", Some("events"))?;
         texts(w, all)?;
+        tail(w, rev)
+    }
+
+    /// `{"t":"events","events":[…]}` of texts already joined by `,` (a compact chunk's: goal 11).
+    pub fn joined_events(w: &mut impl Write, joined: &[u8], rev: Option<u64>) -> io::Result<()> {
+        head(w, "events", Some("events"))?;
+        w.write_all(b"[")?;
+        w.write_all(joined)?;
+        w.write_all(b"]")?;
         tail(w, rev)
     }
 
@@ -384,8 +529,8 @@ impl Snapshot {
     }
 
     /// The events of `batch` (where they are among those `plan` brings).
-    fn batch<'a>(&'a self, plan: &'a Plan, batch: &std::ops::Range<usize>) -> impl Iterator<Item = &'a Entry> + Clone + 'a {
-        plan.brought.get(batch.clone()).unwrap_or_default().iter().filter_map(|at| self.parts.events.get(*at)).map(|e| &*e.entry)
+    fn batch(&self, plan: &Plan, batch: &std::ops::Range<usize>) -> Vec<Arc<Entry>> {
+        self.parts.events.entries_at(plan.brought.get(batch.clone()).unwrap_or_default())
     }
 
     /// About the bytes `part` takes: the room it's written into.
@@ -398,7 +543,7 @@ impl Snapshot {
             Part::State => p.state_bytes,
             Part::Changes => p.changes.as_ref().map_or(0, |files| write::envelope("changes", Some("files"), None) + write::texts_len(files.iter().map(|f| &**f))),
             Part::Files => self.files.as_ref().map_or(0, String::len),
-            Part::Events(batch) => write::envelope("events", Some("events"), None) + write::texts_len(self.batch(plan, batch)),
+            Part::Events(batch) => write::envelope("events", Some("events"), None) + write::texts_len(self.batch(plan, batch).iter().map(|e| &**e)),
             // Its texts joined, and the `[` and `]` around them.
             Part::Chunk(i) => write::envelope("events", Some("events"), None) + p.events.chunks().get(*i).and_then(|c| c.metas().last()).map_or(0, |m| m.off + m.len) + "[]".len(),
         }
@@ -421,8 +566,13 @@ impl Snapshot {
                 None => Ok(()),
             },
             Part::Files => w.write_all(self.files.as_deref().unwrap_or_default().as_bytes()),
-            Part::Events(batch) => write::events(w, self.batch(plan, batch), None),
-            Part::Chunk(i) => write::events(w, p.events.chunks().get(*i).map(|c| c.evs()).unwrap_or_default().iter().map(|e| &*e.entry), None),
+            Part::Events(batch) => write::events(w, self.batch(plan, batch).iter().map(|e| &**e), None),
+            Part::Chunk(i) => match p.events.chunks().get(*i) {
+                // A compact chunk's texts are its segment's, as they were joined.
+                Some(c) if c.is_compact() => write::joined_events(w, &c.joined()?, None),
+                Some(c) => write::events(w, c.evs()?.iter().map(|e| &*e.entry), None),
+                None => write::events(w, std::iter::empty::<&Entry>(), None),
+            },
         }
     }
 
@@ -714,11 +864,11 @@ pub(super) fn file_ref(f: &Value) -> FileRef<'_> {
 }
 
 /// A changeset's file's key, as a patch says it's gone (`{"path", "tree"?}`).
-fn file_key(f: &Value) -> Value {
+fn file_key((path, tree): FileRef<'_>) -> Value {
     let mut key = serde_json::Map::new();
-    for k in ["path", "tree"] {
-        if let Some(v) = f.get(k).filter(|v| !v.is_null()) {
-            key.insert(k.to_owned(), v.clone());
+    for (k, v) in [("path", path), ("tree", tree)] {
+        if let Some(v) = v {
+            key.insert(k.to_owned(), Value::String(v.to_owned()));
         }
     }
     Value::Object(key)
@@ -730,12 +880,12 @@ fn file_key(f: &Value) -> Value {
 pub(super) fn merge_changes(files: &mut Vec<Arc<Entry>>, set: Vec<Value>, gone: &[Value]) {
     if !gone.is_empty() {
         let out: std::collections::HashSet<FileRef<'_>> = gone.iter().map(file_ref).collect();
-        files.retain(|f| !out.contains(&file_ref(f)));
+        files.retain(|f| !out.contains(&f.file()));
     }
     // Where each goes, by its key, borrowed (nothing copied to look it up): in place of the file
     // with its key, or after the rest, as one new before it with its key was.
     let places: Vec<usize> = {
-        let mut at: HashMap<FileRef<'_>, usize> = files.iter().enumerate().map(|(i, f)| (file_ref(f), i)).collect();
+        let mut at: HashMap<FileRef<'_>, usize> = files.iter().enumerate().map(|(i, f)| (f.file(), i)).collect();
         let mut next = files.len();
         set.iter()
             .map(|f| {
@@ -761,13 +911,13 @@ pub(super) fn merge_changes(files: &mut Vec<Arc<Entry>>, set: Vec<Value>, gone: 
 /// [`merge_changes`] does, they make `now`. None when they wouldn't make `now` (a changeset that
 /// started over in another order): then it goes whole.
 pub(super) fn changes_patch_of<'a>(was: &'a [Arc<Entry>], now: &'a [Arc<Entry>]) -> Option<(Vec<&'a Entry>, Vec<Value>)> {
-    let before: HashMap<FileRef<'a>, &'a Arc<Entry>> = was.iter().map(|f| (file_ref(f), f)).collect();
-    let kept: std::collections::HashSet<FileRef<'a>> = now.iter().map(|f| file_ref(f)).collect();
-    let set: Vec<&'a Entry> = now.iter().filter(|f| before.get(&file_ref(f)).is_none_or(|b| !Arc::ptr_eq(b, f) && b.value != f.value)).map(|f| &**f).collect();
-    let gone: Vec<Value> = was.iter().filter(|f| !kept.contains(&file_ref(f))).map(|f| file_key(f)).collect();
+    let before: HashMap<FileRef<'a>, &'a Arc<Entry>> = was.iter().map(|f| (f.file(), f)).collect();
+    let kept: std::collections::HashSet<FileRef<'a>> = now.iter().map(|f| f.file()).collect();
+    let set: Vec<&'a Entry> = now.iter().filter(|f| before.get(&f.file()).is_none_or(|b| !Arc::ptr_eq(b, f) && b.text() != f.text())).map(|f| &**f).collect();
+    let gone: Vec<Value> = was.iter().filter(|f| !kept.contains(&f.file())).map(|f| file_key(f.file())).collect();
     // Taken in, the files keep their places and the new ones come after: `now` must be in that order.
-    let order = was.iter().map(|f| file_ref(f)).filter(|id| kept.contains(id)).chain(set.iter().map(|f| file_ref(f)).filter(|id| !before.contains_key(id)));
-    if !order.eq(now.iter().map(|f| file_ref(f))) {
+    let order = was.iter().map(|f| f.file()).filter(|id| kept.contains(id)).chain(set.iter().map(|f| f.file()).filter(|id| !before.contains_key(id)));
+    if !order.eq(now.iter().map(|f| f.file())) {
         return None;
     }
     Some((set, gone))
@@ -839,13 +989,13 @@ pub struct Registry {
     feed_out: Option<async_channel::Receiver<crate::convo::feed::Out>>,
     /// The runners that keep a copy of it (`crate::convo::mirror`), and what to send them.
     pub copies: Option<Arc<crate::convo::mirror::Mirrors>>,
-    copies_out: Option<async_channel::Receiver<(hyper_transport::PeerId, String, Vec<u8>)>>,
+    copies_out: Option<crate::memory::queue::Receiver<crate::convo::mirror::Out>>,
     /// Every store, as the server sees it: the System page's (`super::stores`).
     pub board: crate::convo::board::Board,
     /// What agents' pages read of the store, kept in memory while it holds (`crate::reads::Views`:
     /// the plans' list, the goal stacks; goal 10, plan 01a1a87b2dae step 2).
     pub views: crate::reads::Views,
-    local_rx: async_channel::Receiver<(String, Update)>,
+    local_rx: crate::memory::queue::Receiver<(String, Update)>,
     /// Where `kiln spawn` in the server's own terminals reaches `local`.
     local_sock: Rcu<Option<String>>,
     /// The shell pid of each of the server's own terminals (their directory and environment are
@@ -999,7 +1149,11 @@ impl Registry {
     /// The registry, its store in `dir`, its mirrors as `conversations` says, the server's own
     /// sessions' host on `clock` (the hub's), its sessions' live feeds on `bus`.
     pub fn with(dir: std::path::PathBuf, conversations: &crate::config::Conversations, clock: Arc<dyn kiln_seams::Clock>, bus: Arc<dyn kiln_seams::Bus>) -> Self {
-        let (tx, rx) = async_channel::bounded(8192);
+        // The server's own sessions' updates, waiting for the loop that hands them to their owners
+        // (`run_local`): as many bytes as an owner's inbox holds (`crate::net::EVENTS_BYTES`), where they go
+        // next; past it a session waits to send (goal 11, plan 01a1a87b2e56 step 3). Its 8,192 places, made
+        // up front, took 1.05 MB of an idle server's heap (research 01a1a87b2e57, f10).
+        let (tx, rx) = crate::memory::queue::bounded::<(String, Update)>(&crate::memory::owners::LOCAL_UPDATES, crate::net::EVENTS_BYTES);
         // Every session's conversation, on every machine, kept on disk as it comes in
         // (docs/conversations.md): the server's own sessions' too, as they pass through `ingest`.
         let convo = if conversations.off { None } else { crate::convo::open(&dir, conversations.upkeep()) };
@@ -1730,11 +1884,40 @@ impl Registry {
     /// machine keeps it in a store it sends the server's (`crate::convo::feed`), which keeps it from
     /// that, not from here. Goal 4, plan 01a1a59c2a9c step 2.
     pub async fn ingest_from(&self, hub: &Hub, from: &Location, id: &str, u: Update, shipped: bool) {
+        let Some(ingest) = self.prepare(hub, from, id, u, shipped) else { return };
+        if !self.sessions.send(id, Msg::Update(Box::new(ingest))).await {
+            tracing::debug!(session = id, "an agent session's update came as the server's copies went");
+        }
+    }
+
+    /// An update from a session's runner, handed to the shard that owns its copy to judge and take
+    /// there (`crate::hub::Hub::runner_update`; goal 10, plan 01a1a87b2dae step 4): back once that
+    /// owner's inbox has it, waiting only while it's full, as [`Registry::ingest_from`] does.
+    pub async fn from_runner(&self, r: super::copies::RunnerUpdate) {
+        let id = r.session.clone();
+        if !self.sessions.send(&id, Msg::Runner(Box::new(r))).await {
+            tracing::debug!(session = %id, "an agent session's update came as the server's copies went");
+        }
+    }
+
+    /// An update of session `id` from `from`, taken by the shard that owns its copy, `s` (goal 10, plan
+    /// 01a1a87b2dae step 4: a runner's update is judged and taken there, not on the hub's loop): what's
+    /// left of it when the owner's turn ran out (`over`, [`Registry::apply`]; goal 9), to take first next.
+    #[allow(clippy::too_many_arguments)]
+    pub fn take_from(&self, s: &mut Shard, hub: &Arc<Hub>, from: &Location, id: &str, u: Update, shipped: bool, over: &dyn Fn() -> bool) -> Option<Ingest> {
+        let ingest = self.prepare(hub, from, id, u, shipped)?;
+        self.apply(s, hub, ingest, over)
+    }
+
+    /// An update of session `id` from `from` as its copy takes it ([`Registry::apply`]): an inbox's
+    /// answer is told whoever waits for it, and leaves nothing to take; an Open takes where it runs
+    /// and the name given here, and raises its epoch.
+    fn prepare(&self, hub: &Hub, from: &Location, id: &str, u: Update, shipped: bool) -> Option<Ingest> {
         // What became of a message: for whoever waits for it, wherever it was taken or refused.
         let u = match u {
             Update::Inbox { said } => {
                 self.answered(id, *said);
-                return;
+                return None;
             }
             other => other,
         };
@@ -1768,41 +1951,40 @@ impl Registry {
             }
             self.raise_epoch(id, info.epoch);
         }
-        let ingest = Ingest { from: from.clone(), id: id.to_owned(), u, shipped, reported };
-        if !self.sessions.send(id, Msg::Update(Box::new(ingest))).await {
-            tracing::debug!(session = id, "an agent session's update came as the server's copies went");
-        }
+        Some(Ingest { from: from.clone(), id: id.to_owned(), u, shipped, reported })
     }
 
     /// An update of a session from the machine it runs on, as the shard that owns the session's copy
     /// takes it (`super::copies`): the copy changes and its view goes out, its viewers are sent what
     /// changed, then what the change tells the rest of kiln happens. Goal 4, plan 01a1a59c2a9c
     /// step 2: only this shard writes the copy.
-    pub(super) fn apply(&self, s: &mut Shard, hub: &Arc<Hub>, i: Ingest) {
-        let Ingest { from, id, u, shipped, reported } = i;
+    ///
+    /// An update's events are taken while its owner's turn lasts (`over`: its step quantum spent), one at
+    /// the least, and the copy goes out with those: the rest come back, for the owner to take first at
+    /// its next turn, before anything newer (goal 9, plan 01a1a87b2cec step 3: a runner's whole history
+    /// in one update held its owner's shard up to 83 ms).
+    pub(super) fn apply(&self, s: &mut Shard, hub: &Arc<Hub>, i: Ingest, over: &dyn Fn() -> bool) -> Option<Ingest> {
+        let Ingest { from, id, mut u, shipped, reported } = i;
         let id = id.as_str();
         // Only the machine a session runs on speaks for it: a copy left behind where it went on
         // from says nothing more of it.
         if !matches!(u, Update::Open { .. }) && s.get(id).is_some_and(|m| *m.location != from) {
-            return;
+            return None;
         }
-        // A changeset's patch is stored as the whole changeset it makes, once taken in (below).
-        if let Some(store) = self.convo.as_ref().filter(|_| !shipped && !matches!(u, Update::ChangesPatch { .. })) {
+        // A changeset's patch is stored as the whole changeset it makes, once taken in (below); an
+        // update's events as they're taken, each written out once for the copy and its row (below).
+        let store = self.convo.as_ref().filter(|_| !shipped);
+        if let Some(store) = store.filter(|_| !matches!(u, Update::ChangesPatch { .. } | Update::Events { .. })) {
             store.send(id, &u);
         }
         // What the copy takes: each event's JSON and its text, written out once for the copy, its
-        // live frame, its digest and every snapshot after; a state's and a meta's JSON.
-        let entries: Vec<Arc<Entry>> = match &u {
-            Update::Events { events } => events
-                .iter()
-                .map(|e| {
-                    let v = serde_json::to_value(e).unwrap_or(Value::Null);
-                    let text = serde_json::to_string(&v).unwrap_or_default();
-                    Arc::new(Entry::written(v, text))
-                })
-                .collect(),
-            _ => Vec::new(),
-        };
+        // live frame, its digest and every snapshot after (`Entry::of_event`, as they're taken, below);
+        // a state's and a meta's JSON.
+        let mut entries: Vec<Arc<Entry>> = Vec::new();
+        // The events' rows for the conversation store, of the same texts.
+        let mut rows: Vec<crate::convo::rows::Row> = Vec::new();
+        // How many of an update's events its turn took.
+        let mut taken = 0;
         let mut made: Option<Value> = match &u {
             Update::State { state } => Some(serde_json::to_value(state).unwrap_or(Value::Null)),
             Update::Meta { meta } => Some(serde_json::to_value(meta).unwrap_or(Value::Null)),
@@ -1875,13 +2057,17 @@ impl Registry {
             changed = Some(info);
         }
         let Some(m) = s.get_mut(id) else {
+            // Its events are stored all the same, as they were before a copy took them.
+            if let Some(store) = store.filter(|_| matches!(u, Update::Events { .. })) {
+                store.send(id, &u);
+            }
             // A session this server does not know yet (it restarted): ask for all of it.
             if let Location::Machine(machine) = &from
                 && !matches!(u, Update::Closed)
             {
                 self.request_snapshot(hub, machine, id);
             }
-            return;
+            return None;
         };
         m.rev = m.rev.saturating_add(1);
         match &u {
@@ -1958,7 +2144,13 @@ impl Registry {
                 }
             }
             Update::Events { events } => {
-                for (e, entry) in events.iter().zip(&entries) {
+                for e in events {
+                    // Written out once, for the copy and for its row alike (goal 9, plan 01a1a87b2cec step 5).
+                    let entry = Arc::new(if store.is_some() {
+                        Entry::of_event(e, Some(&mut |text: String| rows.push(crate::convo::rows::Row::Event(Box::new(crate::convo::rows::event_written(id, e, text))))))
+                    } else {
+                        Entry::of_event(e, None)
+                    });
                     if let Some(job) = mentions(id, &m.info.cwd, &m.location, e) {
                         jobs.push(job);
                     }
@@ -1973,11 +2165,26 @@ impl Registry {
                         proposed = Some(plan);
                     }
                     if !entry.is_null() {
-                        resync |= m.upsert(Arc::clone(entry));
+                        resync |= m.upsert(Arc::clone(&entry));
+                    }
+                    entries.push(entry);
+                    taken += 1;
+                    // Its turn spent: the rest at the owner's next (below), one taken at the least.
+                    if taken < events.len() && over() {
+                        break;
                     }
                 }
             }
             Update::Stream { id, text } => m.append(id, text),
+        }
+        // What of an update's events its turn had no time for (goal 9, plan 01a1a87b2cec step 3): the copy
+        // goes out with those taken, and the rest come back to the owner.
+        let rest = match &mut u {
+            Update::Events { events } if taken < events.len() => Some(Update::Events { events: events.split_off(taken) }),
+            _ => None,
+        };
+        if let Some(store) = store {
+            store.put(std::mem::take(&mut rows));
         }
         // Its viewers start over from the copy as it is now (its events went another way than
         // they have them): the feed's resync marker sends each back to a snapshot, and none
@@ -2051,6 +2258,7 @@ impl Registry {
         } else if let Some(info) = changed {
             hub.emit(&crate::wire::events::ServerEvent::Harness { info: Box::new(info) });
         }
+        rest.map(|u| Ingest { from, id: id.to_owned(), u, shipped, reported: String::new() })
     }
 
     /// A session reached its account's usage limit: the account's other sessions, on every machine,
@@ -2484,10 +2692,9 @@ impl Registry {
                     v.events
                         .iter()
                         .rev()
-                        .map(|e| &e.entry)
-                        .filter(|e| matches!(e.get("kind").and_then(Value::as_str), Some("user" | "assistant")))
-                        .filter_map(|e| e.get("text").and_then(Value::as_str))
-                        .any(|t| files::mentioned(t).iter().any(|p| files::resolve(p, cwd).as_deref() == Some(path)))
+                        .filter(|e| matches!(e.entry.kind(), Some("user" | "assistant")))
+                        .filter_map(|e| e.entry.value().get("text").and_then(Value::as_str).map(str::to_owned))
+                        .any(|t| files::mentioned(&t).iter().any(|p| files::resolve(p, cwd).as_deref() == Some(path)))
                 };
                 (listed || said()).then(|| Location::clone(&v.location))
             })
@@ -3326,11 +3533,11 @@ impl Registry {
     pub fn conclusion(&self, id: &str) -> Option<(Value, Option<Value>, Value)> {
         // References from its view; the copies made after.
         let (state, reply, changes) = self.sessions.with(id, |v| {
-            let reply = v.events.iter().rev().map(|e| &e.entry).find(|e| e.get("kind").and_then(Value::as_str) == Some("assistant") && e.get("parent").is_none_or(Value::is_null)).cloned();
+            let reply = v.events.iter().rev().find(|e| e.entry.kind() == Some("assistant") && e.entry.on_main_thread()).map(|e| Arc::clone(&e.entry));
             (Arc::clone(&v.state), reply, v.changes.clone())
         })?;
-        let changes = changes.map_or(Value::Null, |files| Value::Array(files.iter().map(|f| f.value.clone()).collect()));
-        Some((Value::clone(&state), reply.map(|e| e.value.clone()), changes))
+        let changes = changes.map_or(Value::Null, |files| Value::Array(files.iter().map(|f| f.value()).collect()));
+        Some((Value::clone(&state), reply.map(|e| e.value()), changes))
     }
 
     /// Tests: session `id`'s changeset, as its machine would report it.
@@ -3514,7 +3721,7 @@ mod tests {
 
     /// A copy's changeset as JSON (null before it has one).
     fn changes_of(m: &Mirror) -> Value {
-        m.changes.as_ref().map_or(Value::Null, |files| Value::Array(files.iter().map(|f| f.value.clone()).collect()))
+        m.changes.as_ref().map_or(Value::Null, |files| Value::Array(files.iter().map(|f| f.value()).collect()))
     }
 
     /// Changeset files as a copy keeps them.
@@ -3618,8 +3825,8 @@ mod tests {
         // A reply's words still go to its event, at the revision they came.
         let last = format!("e{n}");
         took(&mut m, |m| m.append(&last, "more"));
-        let at = m.index.get(&last).copied().unwrap_or(usize::MAX);
-        assert_eq!(m.events.get(at).and_then(|e| e.entry.get("text")).and_then(Value::as_str), Some("xmore"));
+        let at = m.index.get(last.as_str()).copied().unwrap_or(usize::MAX);
+        assert_eq!(m.events.get(at).and_then(|e| e.entry.value().get("text").and_then(Value::as_str).map(str::to_owned)).as_deref(), Some("xmore"));
         assert_eq!(m.events.get(at).map(|e| e.entry.text().contains("xmore")), Some(true), "its text written again");
         assert_eq!(m.events.get(at).map(|e| e.at), Some(m.rev), "changed at the revision it came");
     }
@@ -3820,16 +4027,16 @@ mod tests {
     fn a_changesets_patch_is_taken_in_place() {
         let mut files = entries(vec![file("a.rs", None, 1), file("b.rs", None, 1), file("a.rs", Some("/w"), 1)]);
         merge_changes(&mut files, vec![file("c.rs", None, 1), file("a.rs", Some("/w"), 5)], &[json!({"path": "b.rs"})]);
-        let values: Vec<Value> = files.iter().map(|f| f.value.clone()).collect();
+        let values: Vec<Value> = files.iter().map(|f| f.value()).collect();
         assert_eq!(values, vec![file("a.rs", None, 1), file("a.rs", Some("/w"), 5), file("c.rs", None, 1)]);
         // Many set at once (a changeset sent whole) go by key the same way.
         let mut files = entries((0..20).map(|n| file(&format!("f{n}.rs"), None, 1)).collect());
         let set: Vec<Value> = (10..30).rev().map(|n| file(&format!("f{n}.rs"), None, 2)).collect();
         merge_changes(&mut files, set, &[]);
-        let paths: Vec<String> = files.iter().filter_map(|f| f.get("path").and_then(Value::as_str).map(str::to_owned)).collect();
+        let paths: Vec<String> = files.iter().filter_map(|f| f.file().0.map(str::to_owned)).collect();
         let want: Vec<String> = (0..20).chain((20..30).rev()).map(|n| format!("f{n}.rs")).collect();
         assert_eq!(paths, want);
-        assert!(files.iter().skip(10).all(|f| f.get("added") == Some(&json!(2))));
+        assert!(files.iter().skip(10).all(|f| f.value().get("added") == Some(&json!(2))));
     }
 
     /// A changeset goes to its viewers whole and as what changed in it: the file the agent touched
@@ -3862,7 +4069,7 @@ mod tests {
         let set = patch.get("set").and_then(Value::as_array).cloned().unwrap_or_default();
         let gone = patch.get("gone").and_then(Value::as_array).cloned().unwrap_or_default();
         merge_changes(&mut had, set, &gone);
-        assert_eq!(Value::Array(had.iter().map(|f| f.value.clone()).collect()), changes_of(&m));
+        assert_eq!(Value::Array(had.iter().map(|f| f.value()).collect()), changes_of(&m));
         Ok(())
     }
 
@@ -4144,7 +4351,7 @@ mod tests {
     fn said_in(hub: &Hub, id: &str) -> Vec<(String, String)> {
         hub.harness
             .sessions
-            .with(id, |v| v.events.iter().map(|e| (e.entry.get("id").and_then(Value::as_str).unwrap_or_default().to_owned(), e.entry.get("text").and_then(Value::as_str).unwrap_or_default().to_owned())).collect())
+            .with(id, |v| v.events.iter().map(|e| (e.entry.id().unwrap_or_default().to_owned(), e.entry.value().get("text").and_then(Value::as_str).unwrap_or_default().to_owned())).collect())
             .unwrap_or_default()
     }
 
@@ -4386,5 +4593,122 @@ mod tests {
         let epochs: HashMap<String, u64> = serde_json::from_slice(&std::fs::read(dir.path().join("epochs.json.part"))?)?;
         anyhow::ensure!(epochs.get("s1") == Some(&7), "{epochs:?}");
         Ok(())
+    }
+
+    /// Every kind of event, with what each may carry and what it may leave out.
+    fn every_kind_of_event() -> Vec<crate::harness::model::Event> {
+        use crate::harness::model::{Body, Event, FileDiff, Hunk, Level, Todo, ToolCall, ToolKind, ToolStatus};
+        let event = |n: u64, parent: Option<&str>, body: Body| Event { id: format!("e{n}"), seq: n, at: 1_793_800_000_000, parent: parent.map(str::to_owned), by: n.is_multiple_of(2).then(|| "Claude Code".to_owned()), body };
+        let tool = ToolCall {
+            tool_id: "t1".into(),
+            name: "mcp__github__search".into(),
+            tool: ToolKind::Edit,
+            title: "Edit src/lib.rs".into(),
+            detail: Some("a \"quoted\" detail\n".into()),
+            // A path and a tree inside it, not of the event's own.
+            input: json!({"path": "src/lib.rs", "tree": "t", "nested": {"b": 2, "a": [1, 2.5, null, true]}}),
+            status: ToolStatus::Done,
+            output: Some("ok \u{2713}".into()),
+            truncated: true,
+            diffs: vec![FileDiff { path: "src/lib.rs".into(), created: true, hunks: vec![Hunk { old_start: 1, old_lines: 0, new_start: 1, new_lines: 1, lines: vec!["+x".into()] }] }],
+            todos: vec![Todo { text: "do it".into(), status: "pending".into() }],
+            task: Some("t".into()),
+            exit_code: Some(-1),
+            started: 5,
+            ended: Some(6),
+            server: Some("github".into()),
+            tool_short: Some("search".into()),
+            skill: Some("s".into()),
+            runner: Some("linux/amd64".into()),
+        };
+        let bare = ToolCall { detail: None, output: None, truncated: false, diffs: Vec::new(), todos: Vec::new(), task: None, exit_code: None, ended: None, server: None, tool_short: None, skill: None, runner: None, ..tool.clone() };
+        vec![
+            event(1, None, Body::User { text: "hello \u{1F600}".into(), images: 2, client_id: Some("c1".into()), origin: Some("human".into()), attachments: vec!["a.png".into()], reply_to: Some("e0".into()) }),
+            event(2, None, Body::User { text: String::new(), images: 0, client_id: None, origin: None, attachments: Vec::new(), reply_to: None }),
+            event(3, Some("t1"), Body::Assistant { text: "line".into(), streaming: true }),
+            event(4, Some(""), Body::Thinking { text: "hmm".into(), streaming: false, redacted: true }),
+            event(5, None, Body::Tool(Box::new(tool))),
+            event(6, Some("t9"), Body::Tool(Box::new(bare))),
+            event(7, None, Body::Notice { level: Level::Warn, text: "retrying".into() }),
+        ]
+    }
+
+    /// Goal 9, plan 01a1a87b2cec step 5: an event written out once, straight from itself, is the text its
+    /// JSON tree wrote (the copy's before, and what a runner's digest of it is of), its store row has that
+    /// text, and what's looked up of it is what the tree said, for every kind of event. It holds while
+    /// serde_json's maps keep their keys in the order they come (`preserve_order`, which kiln's build has
+    /// through hyper-quic's qlog): a build that loses that fails here.
+    #[test]
+    fn g9_s5_an_event_is_written_out_once_as_its_tree_wrote_it() {
+        for e in every_kind_of_event() {
+            let n = e.seq;
+            let v = serde_json::to_value(&e).unwrap_or(Value::Null);
+            let tree = Entry::written(v.clone(), serde_json::to_string(&v).unwrap_or_default());
+            let mut kept: Option<String> = None;
+            let once = Entry::of_event(&e, Some(&mut |t: String| kept = Some(t)));
+            assert_eq!(once.text(), tree.text(), "event {n}");
+            assert_eq!(kept.as_deref(), Some(tree.text()), "event {n}: its row's text");
+            assert_eq!(Entry::of_event(&e, None).text(), tree.text(), "event {n}, kept by no one else");
+            assert_eq!((once.id(), once.seq(), once.kind(), once.on_main_thread()), (tree.id(), tree.seq(), tree.kind(), tree.on_main_thread()), "event {n}");
+            assert!(once.head.file.is_none() && tree.head.file.is_none(), "event {n}: no file's path or tree of its own");
+            assert_eq!(crate::wire::sums::event_text(once.text()), crate::wire::sums::event(&v), "event {n}: a runner's digest of it");
+            // Its row is the one the event written out again makes.
+            assert_eq!(kept.map(|t| crate::convo::rows::event_written("s", &e, t)), crate::convo::rows::event("s", &e), "event {n}: its row");
+        }
+    }
+
+    /// Goal 9, plan 01a1a87b2cec step 3: an update's events are taken while its owner's turn lasts, one at
+    /// the least, the rest coming back to take next. Five events by turns that each run out at once take
+    /// five turns, and the copy has each once, in order, as one turn would have left it.
+    #[test]
+    fn g9_s3_an_update_is_taken_in_turns() -> anyhow::Result<()> {
+        use crate::harness::model::{Body, Event};
+        crate::rt::block_on(async {
+            let hub = crate::hub::tests::scratch_hub().await?;
+            let there = Location::Machine("box".into());
+            let said = |n: u64| Event { id: format!("m{n}"), seq: n, at: 1, parent: None, by: None, body: Body::Assistant { text: format!("line {n}"), streaming: false } };
+            hub.harness.ingest(&hub, &there, "s", Update::Open { info: Box::new(Info { id: "s".into(), kind: "claude".into(), epoch: 1, ..Info::default() }), since: None }).await;
+            let ingest = Ingest { from: there.clone(), id: "s".into(), u: Update::Events { events: (1..=5).map(said).collect() }, shipped: false, reported: String::new() };
+            let h = Arc::clone(&hub);
+            let turns = hub
+                .harness
+                .sessions
+                .on("s", move |s| {
+                    let (mut turns, mut next) = (0, Some(ingest));
+                    while let Some(i) = next.take() {
+                        turns += 1;
+                        next = h.harness.apply(s, &h, i, &|| true);
+                    }
+                    turns
+                })
+                .await;
+            anyhow::ensure!(turns == Some(5), "taken in {turns:?} turns");
+            let names: Vec<String> = (1..=5).map(|n| format!("m{n}")).collect();
+            anyhow::ensure!(copy_of(&hub, "s") == names, "the copy: {:?}", copy_of(&hub, "s"));
+            Ok(())
+        })
+    }
+
+    /// Goal 9, plan 01a1a87b2cec step 3: the rest of an update its owner's turn ran out in goes on before
+    /// anything sent after it. A job sent right behind an update of as many events as a copy keeps
+    /// (`MAX_EVENTS`, more than a step quantum takes on any machine) finds every one of them in the copy,
+    /// however many turns they took.
+    #[test]
+    fn g9_s3_the_rest_of_an_update_goes_before_anything_newer() -> anyhow::Result<()> {
+        use crate::harness::model::{Body, Event};
+        crate::rt::block_on(async {
+            let hub = crate::hub::tests::scratch_hub().await?;
+            let there = Location::Machine("box".into());
+            let said = |n: u64| Event { id: format!("m{n}"), seq: n, at: 1, parent: None, by: None, body: Body::Assistant { text: format!("line {n}"), streaming: false } };
+            hub.harness.ingest(&hub, &there, "s", Update::Open { info: Box::new(Info { id: "s".into(), kind: "claude".into(), epoch: 1, ..Info::default() }), since: None }).await;
+            let rev = hub.harness.attach("s").map(|a| a.rev).unwrap_or_default();
+            let n = u64::try_from(MAX_EVENTS)?;
+            hub.harness.ingest_from(&hub, &there, "s", Update::Events { events: (1..=n).map(said).collect() }, false).await;
+            let found = hub.harness.sessions.on("s", |s| s.get("s").map(|m| m.events.len())).await.flatten();
+            anyhow::ensure!(found == Some(MAX_EVENTS), "the job behind it found {found:?} of {MAX_EVENTS}");
+            let turns = hub.harness.attach("s").map(|a| a.rev).unwrap_or_default().saturating_sub(rev);
+            anyhow::ensure!(turns >= 1, "the update's turns: {turns}");
+            Ok(())
+        })
     }
 }

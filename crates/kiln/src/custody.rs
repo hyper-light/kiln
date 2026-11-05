@@ -132,12 +132,12 @@ pub async fn take(store: &Store, root: &[u8], org: &str, bundle: &Value, came_fr
     }
     let revocations = crate::identities::revocations(store).await?;
     let refusal = |act: &str, signer: String, why: String| Refusal { digest: digest_of(bundle), act: act.to_owned(), signer, why, envelope: bundle.to_string(), came_from: came_from.to_owned(), at, ..Refusal::default() };
-    let c = match statement::verify(bundle, root, &revocations, at) {
+    let (checked, signer) = verified(bundle, root, &revocations, at).await?;
+    let c = match checked {
         Ok(c) => c,
         Err(e) => {
-            // Who signed it, as its certificate says, revocations aside: a copy left behind signs
-            // as the epoch it left.
-            let signer = statement::verify(bundle, root, &[], at).map(|c| c.custodian).unwrap_or_default();
+            // Who signed it, as its certificate says, revocations aside (`verified`): a copy left
+            // behind signs as the epoch it left.
             let (epoch, superseded_by) = left(store, &signer).await?;
             let why = e.to_string();
             refuse(store, Refusal { epoch, superseded_by, ..refusal("a signed statement", signer, why.clone()) }).await?;
@@ -181,6 +181,25 @@ pub async fn take(store: &Store, root: &[u8], org: &str, bundle: &Value, came_fr
         }
     }
     Ok(Ok(Taken { digest: c.digest, again, broke }))
+}
+
+/// `bundle` checked as [`statement::verify`] checks it, against kiln's root `root` and
+/// `revocations` as of `at`, and, refused, who signed it as its certificate says, revocations aside:
+/// on the compute pool, off the shards (goal 9, plan 01a1a87b2cec step 3). Its signature and its
+/// certificate chain are several public-key verifications, a third of a millisecond together on the
+/// lab machine, which kiln's server ran for each batch of every conversation feed on one shard: its
+/// polls that held a shard longest, calm.
+async fn verified(bundle: &Value, root: &[u8], revocations: &[Revocation], at: i64) -> anyhow::Result<(Result<Checked, statement::Refusal>, String)> {
+    let (bundle, root, revocations) = (bundle.clone(), root.to_vec(), revocations.to_vec());
+    crate::rt::compute(move || {
+        let checked = statement::verify(&bundle, &root, &revocations, at);
+        let signer = match &checked {
+            Ok(_) => String::new(),
+            Err(_) => statement::verify(&bundle, &root, &[], at).map(|c| c.custodian).unwrap_or_default(),
+        };
+        (checked, signer)
+    })
+    .await
 }
 
 /// The records that act under delegation `digest`.
@@ -257,6 +276,14 @@ pub async fn on_runner(hub: &crate::hub::Hub, peer: crate::instances::PeerId, ma
 /// server signs takes.
 pub fn server_signed(pki: &crate::pki::Pki, s: &statement::Statement) -> anyhow::Result<Value> {
     server_signed_as(pki, PAYLOAD_CUSTODY, s)
+}
+
+/// [`server_signed`] on the compute pool, off the shards (goal 9, plan 01a1a87b2cec step 3): a
+/// signature reads kiln's signing key and certificate and signs, which a shard did for each batch of
+/// every conversation feed it took or handed on.
+pub async fn server_signed_off(pki: &std::sync::Arc<crate::pki::Pki>, s: statement::Statement) -> anyhow::Result<Value> {
+    let pki = std::sync::Arc::clone(pki);
+    crate::rt::compute(move || server_signed(&pki, &s)).await?
 }
 
 /// [`server_signed`], as `payload_type`.
@@ -1095,23 +1122,28 @@ async fn load(store: &Store, root: &[u8], digests: &[String], revocations: &[Rev
             Ok(out)
         })
         .await?;
-    let mut map = BTreeMap::new();
-    for (d, envelope, at) in rows {
-        let Ok(bundle) = serde_json::from_str::<Value>(&envelope) else { continue };
-        // Only what was revoked before kiln took it: kiln checked it then, and a revocation since
-        // (one in the same second included) doesn't undo it.
-        let before: Vec<Revocation> = revocations.iter().filter(|r| r.at < at).cloned().collect();
-        match statement::verify(&bundle, root, &before, at) {
-            // Kept by its statement's digest: an envelope of another statement there (changed
-            // where kiln keeps it) isn't the record.
-            Ok(c) if c.digest == d => {
-                map.insert(d, c);
+    // Each checked again as of when kiln took it, on the compute pool, off the shards (`verified`).
+    let (root, revocations) = (root.to_vec(), revocations.to_vec());
+    crate::rt::compute(move || {
+        let mut map = BTreeMap::new();
+        for (d, envelope, at) in rows {
+            let Ok(bundle) = serde_json::from_str::<Value>(&envelope) else { continue };
+            // Only what was revoked before kiln took it: kiln checked it then, and a revocation since
+            // (one in the same second included) doesn't undo it.
+            let before: Vec<Revocation> = revocations.iter().filter(|r| r.at < at).cloned().collect();
+            match statement::verify(&bundle, &root, &before, at) {
+                // Kept by its statement's digest: an envelope of another statement there (changed
+                // where kiln keeps it) isn't the record.
+                Ok(c) if c.digest == d => {
+                    map.insert(d, c);
+                }
+                Ok(c) => tracing::warn!(record = %d, kept = %c.digest, "a custody record kiln kept is another record now"),
+                Err(e) => tracing::warn!(record = %d, error = %e, "a custody record kiln kept no longer checks as of when it took it"),
             }
-            Ok(c) => tracing::warn!(record = %d, kept = %c.digest, "a custody record kiln kept is another record now"),
-            Err(e) => tracing::warn!(record = %d, error = %e, "a custody record kiln kept no longer checks as of when it took it"),
         }
-    }
-    Ok(map)
+        map
+    })
+    .await
 }
 
 /// Checks record `digest`'s own hop, at `at`: a break, recorded, if it doesn't hold; none if it
@@ -1208,8 +1240,21 @@ pub(crate) async fn refused_relayed(store: &Store, digest: &str, what: &str, rel
 /// a custody record, so of no kind; checked as of `at`, revocations aside (whether the act counts
 /// is its own check's). Whether it's new.
 pub(crate) async fn keep_originator(store: &Store, root: &[u8], bundle: &Value, came_from: &str, at: i64) -> anyhow::Result<bool> {
-    let c = statement::verify(bundle, root, &[], at).map_err(|e| anyhow::anyhow!("{e}"))?;
+    let c = verify_off(bundle, root, Vec::new(), at).await?.map_err(|e| anyhow::anyhow!("{e}"))?;
     keep(store, &c, None, None, bundle, came_from).await
+}
+
+/// [`keep_originator`], `c` its check made already (a relayed act's, `crate::relays::call`): not made again.
+pub(crate) async fn keep_originator_checked(store: &Store, c: &Checked, bundle: &Value, came_from: &str) -> anyhow::Result<bool> {
+    keep(store, c, None, None, bundle, came_from).await
+}
+
+/// [`statement::verify`] on the compute pool, off the shards (goal 9, plan 01a1a87b2cec step 3): a statement's
+/// signature and its certificate chain, public-key checks that took a third of a millisecond together on the
+/// lab machine, on the shard of whatever task asked.
+pub(crate) async fn verify_off(bundle: &Value, root: &[u8], revocations: Vec<Revocation>, at: i64) -> anyhow::Result<Result<Checked, statement::Refusal>> {
+    let (bundle, root) = (bundle.clone(), root.to_vec());
+    crate::rt::compute(move || statement::verify(&bundle, &root, &revocations, at)).await
 }
 
 /// Records refusal `r`, and audits it.

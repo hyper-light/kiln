@@ -356,10 +356,11 @@ async fn upload(http: &Client, server: &str, me: &str, token: &str, blobs: &Blob
         return (Put::There, Moved::default());
     }
     let Some(path) = blobs.path(hash) else { return failed("it isn't here any more".to_owned()) };
-    let bytes = std::fs::metadata(&path).map_or(0, |m| m.len());
-    let body = crate::rt::file_source(path);
-    let Ok(body) = body else { return failed("it couldn't be read".to_owned()) };
-    match http.put(&url).bearer(token).header("content-type", "application/octet-stream").body_stream(body).timeout(Duration::from_secs(1800)).send().await {
+    let Ok(meta) = std::fs::metadata(&path) else { return failed("it couldn't be read".to_owned()) };
+    let bytes = meta.len();
+    // Read from its start for each send: an upload the server shed goes again whole after its Retry-After (goal 6,
+    // plan 01a1a59c2abe step 4).
+    match http.put(&url).bearer(token).header("content-type", "application/octet-stream").body_file(path).timeout(Duration::from_secs(1800)).send().await {
         Ok(r) if r.is_success() => (Put::Sent, Moved { bytes, ..Moved::default() }),
         Ok(r) => failed(format!("the server answered {}", r.status())),
         Err(e) => failed(format!("{e:#}")),

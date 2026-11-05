@@ -20,13 +20,15 @@ of its own; `/metrics` reads only those, so reading never touches a shard.
 
 | series | what it says |
 | --- | --- |
-| `kiln_shard_delay_seconds{shard}` (histogram) | How late the shard ran its ready work: a probe's timer against when the probe ran. Up to a tick of the timer wheel (100 µs) is by design. |
+| `kiln_shard_delay_seconds{shard}` (histogram) | How late the shard ran its ready work: a probe's timer against when the probe ran. Up to a tick of the timer wheel (100 µs) and the thread's timer slack (the tick again) is by design. Its buckets are 25 µs apart to 250 µs and 50 µs apart to 1 ms (`shard_health::DELAY_BUCKETS`, goal 9), so its quantiles read to tens of microseconds below a millisecond. |
 | `kiln_shard_stalled_seconds{shard}` | How long since the shard's probe last ran. A shard held in one poll shows here at once; its delay only once it's let go. |
 | `kiln_shard_busy_seconds_total{shard}` | CPU time the shard's thread has run: its rate is the share of the time the shard was busy on the CPU. Linux and macOS (Windows keeps a thread's times at its scheduler's tick). Time the host held a ready shard off the CPU isn't busy: it shows as delay, and as `host` slow polls. |
 | `kiln_shard_polls_total{shard}` | Task polls. |
 | `kiln_shard_slow_polls_total{shard,cause}` | Polls that held the shard past twice its step quantum (250 µs here, so past 500 µs), by who held it, as hyper-rt attributes them: `task` (it ran on the CPU), `blocking` (it waited inside a call), `host` (runnable, off the CPU: preempted), `unknown` (the OS couldn't tell: off the CPU on macOS, every one on Windows, and a shard's first long poll after a calm spell, since hyper-rt reads the thread's account only once a long poll has armed it). |
 | `kiln_shard_longest_poll_seconds{shard}` | The longest single poll the shard has run. |
 | `kiln_shard_scheduler_overrun_seconds{shard}` | How late the shard's steps ran after its waits, as the shard measured it: the host descheduling it, decaying as it recovers. |
+| `kiln_shard_held_polls_total{shard,site,label}`, `kiln_shard_held_seconds_total{...}`, `kiln_shard_held_longest_seconds{...}` | What held the shard: every poll past 100 µs (`hyper_rt::slow::SLOW_POLL_NS`, a tenth of goal 9's bar), counted against the spawn site of its task (`#[track_caller]`, `file:line:column`) and the label its code set (`label`: an HTTP request's route, as `read /api/harness/sessions`; `crate::route_latency::label_of`), with their holds added up and the longest. Each shard keeps its own table (`hyper_rt::slow`), which only it writes; `/metrics` reads it without a lock. |
+| `kiln_shard_held_host_polls_total{shard,site,label}`, `kiln_shard_held_host_seconds_total{...}` | Of those polls, the ones the host held, and their time: the shard's thread runnable and off the CPU (preempted), as hyper-rt attributes a poll past twice the step quantum (`hyper_rt::attribution`), so a shorter one is never among them. What no code held, and cores of its own would (goal 9, plan 01a1a87b2cec steps 3 and 4); the lab's report gives each site and label's share. |
 
 ### Each route class's latency (`kiln_route_*`, `crate::route_latency`)
 
@@ -68,22 +70,40 @@ places and its run. The histograms are atomics the pools' threads write as they 
 
 Goal 6 of the API runtime program (plan `01a1a59c2abe`): each request is Critical (health, sign-in, a
 person's pages and actions), Normal (the API) or Background (agents' and CI's polling, catch-ups, sync,
-telemetry). Goal 1's probe on each shard ticks detectors that learn the shard's calm (headroom's CUSUM,
-`kiln_ci::headroom::detect`): the shard's delay for Normal, its Background tasks' waits for Background.
-The first shard's probe also ticks one for the compute pool and one for each of the blocking pool's
-shares, on the mean wait of the jobs whose waits the pool told over the period, since what a request
-waits on off its shard waits there, where no shard's delay sees it. A pool whose waits leave their calm
-sheds Background requests on every shard, and once its waits reach the tolerance (1 s), Normal ones
-too, while any of its jobs waits; Critical never. A shed request is answered 503 at once, before its
-body is read, with `Retry-After` (the delay that shed it, in whole seconds) and `x-kiln-shed` (its
-class). Shedding is off until `[server] shed = true` or `KILN_SHED=1`; the detectors run either way.
+telemetry). Goal 1's probe on each shard ticks a watch for each of the shard's queues: the shard's delay
+for Normal, its Background tasks' waits for Background. The first shard's probe also ticks one for the
+compute pool's line, each of the blocking pool's shares' and kiln.db's writer's, on the mean wait of the
+jobs whose waits the pool told over the period, since what a request waits on off its shard waits there,
+where no shard's delay sees it. Each watch learns its queue's calm (the typical wait of the periods it came
+back to) and sheds only on a queue that *stands*, CoDel's test (research f14): every period for a whole
+tolerance (1 s, Kubernetes' default probe timeout) past its calm and past the shard's quantum, a pool's
+line never emptying, and a pool's line kept standing by work that came after it formed (it stood a
+tolerance longer than its jobs' longest wait), not one request's batch worked off. A queue that stood a
+tolerance sheds Background requests; one that stood another with Background shed, Normal ones too (a
+shard's: its API queue's); Critical never; shedding stops the period it comes back. A shed request is
+answered 503 at once, before its body is read, with `Retry-After` (the delay that shed it, in whole
+seconds) and `x-kiln-shed` (its class); kiln's client sends it again after that (a file's upload read
+again from its start, a WebSocket's opening too). Shedding is off until `[server] shed = true` or
+`KILN_SHED=1`; the watches run either way.
+
+Calm is bursty, and a queue that comes back is not overload: in the lab's calm on fedora (2026-11-05,
+research f32) the store share's jobs waited 307 to 620 ms at p99 (one attach's reads queued behind each
+other while the share held under one of its 24 places on average) and every round's shards ran a probe
+250 ms late; the CUSUM on each period's mean wait that this replaced (headroom's, with nothing it
+learned of calm's excursions) read those as shifts and shed 6.5 Background requests a calm round. Its
+unit tests replay those waits (`overload::tests`, `g6_s4_*`): the lab's calm store share, fan-outs whose
+reads wait up to 2.3 s, the calm's probes with startup holds of 2.9 s and a scheduler's tick of jitter
+shed nothing; work outrunning a pool, a closed loop past its places and a saturated shard shed
+Background a tolerance in and Normal a tolerance later.
 
 | series | what it says |
 | --- | --- |
 | `kiln_shard_queue_delay_seconds{shard,class}` | Each class's mean wait from ready to run on the shard, over the probe's last period. |
-| `kiln_shard_shedding{shard,class}` | 1 while the shard's own queueing delay sheds the class's requests. |
-| `kiln_pool_queue_delay_seconds{pool}` | Each pool's mean wait for a place over the probe's last period, as its detector read it: `compute` (a thread), `dns`, `store`, `fs` (the blocking pool's shares). |
-| `kiln_pool_shedding{pool,class}` | 1 while work waiting in the pool past its calm sheds the class's requests on every shard. |
+| `kiln_shard_queue_standing_seconds{shard,class}` | How long the class's queue on the shard has stayed past its calm (0 once back): it sheds at a tolerance. |
+| `kiln_shard_shedding{shard,class}` | 1 while the shard's own queue, standing, sheds the class's requests. |
+| `kiln_pool_queue_delay_seconds{pool}` | Each pool's mean wait for a place over the probe's last period, as its watch read it: `compute` (a thread), `dns`, `store`, `fs` (the blocking pool's shares), `store_write` (kiln.db's writer). |
+| `kiln_pool_queue_standing_seconds{pool}` | How long the pool's line has stood past its calm, never emptying (0 once back). |
+| `kiln_pool_shedding{pool,class}` | 1 while work standing in the pool's line sheds the class's requests on every shard. |
 | `kiln_shed_total{class}` | Requests answered 503 at once, by class (`background`, `normal`; Critical is never shed). |
 | `kiln_shard_stalled`, `kiln_shard_stalls_total`, `kiln_shard_stall_moved_total` and the others | kiln-rt's watchdog: a shard held in one poll past its limit, and the spawns it moved to other shards. |
 
@@ -130,7 +150,9 @@ for its viewers and readers (each asks again as soon as it is answered): with on
 (`--env KILN_RT_SHARDS=1`) it overloads the server on purpose, as goal 6's shedding is measured
 (`--env-b KILN_SHED=1` against the same build without). A request the server sheds counts as an
 error, and its worker waits out the answer's `Retry-After` before asking again, as kiln's own clients
-do, rather than asking again at once. `--profile many` is production's whole shape rather than its
+do, rather than asking again at once. `--profile flood` is the overload profile with 64 readers and 8
+agents calling MCP, none thinking: more work than one shard runs, as goal 6 overloads one on purpose.
+`--profile many` is production's whole shape rather than its
 busy hour's share: its ten runners and all 134 live feeds (the realistic profile's sizes, the rest of
 400 events), every one at work at the realistic pace, as goal 4 measures many sessions changing at
 once.
@@ -161,6 +183,14 @@ the attaches, as each viewer saw them: `websocket.own_attach`, published before 
 snapshot came, which they wait for by protocol; `websocket.while_another_attaches`, published while
 another viewer of the same session attached, which shouldn't wait for that; and `websocket.live`, the
 rest.
+
+The shards' delay is reported to the microsecond (goal 9): all shards together and each shard
+(`shards.delay_p50_us`, `_p99_us`, `_p999_us`, `_max_us`, and `shard<N>.delay_*_us`), the max being
+the top bucket the window reached; each shard's busy share (`shard<N>.busy_share`) beside their
+mean; and the worst shard's p99.9 and busy share (`shards.worst_delay_p999_us`,
+`shards.worst_busy_share`). What held the shards past 100 µs (`kiln_shard_held_*`) is each round's
+too, in the window and over the fill (`held`, `fill_held` in `run.json`), and the report lists it by
+spawn site and label: polls and milliseconds held a second, the mean hold and the longest.
 
 The fill is reported too (`fill.*`): how long it took (`fill.s`) and the server's own numbers over it
 (its CPU share, the shards', the pools'). It is the conversation feed at its busiest: every session's
@@ -218,6 +248,11 @@ everything in the lab's own cgroup. The two together are production's layout:
 # the lab's clients on CPUs 8-15; the server and as many hogs as its CPUs on 16-31, at production's weights
 taskset -c 8-15 target/release/kiln-lab run --kiln target/release/kiln --server-cpus 16-31 --layout production --hogs 1x
 ```
+
+`KILN_LAB_HOOK` names a command the lab runs as each part of a round begins and ends
+(`<hook> <event> <server's pid> <folder>`: `fill-start`, `fill-end`, `window-start`, `window-end`; the
+folder `<round>.hook`, kept when the round's kiln is removed): `scripts/shard_lab/hook.sh` has perf
+record the server over the window.
 
 A new build against main's baseline is an `ab` of the two on one machine, not a `compare` with the
 files below: they hold the baseline's numbers and machine, which another machine (or this one under
@@ -520,28 +555,40 @@ The step holds when `page.p99_ms` with hogs is within noise of calm in productio
 
 ### Shedding by priority, overloaded on purpose (step 4)
 
-The lab's overload sits in kiln-rt's pools, not on a shard (research `01a1a59c2abf`, f28: with one
-shard and no think time, API reads took 2 to 3 s at p99 and attaches 7 to 8 s while the shard's delay
-stayed at 1.8 ms at p99), so the pools' waits shed too: the compute pool's and each of the blocking
-pool's shares' (`kiln_pool_*`). `scripts/overload_lab/overload.sh` runs the `overload` profile with one
-shard, shedding off against on, interleaved (`kiln-lab ab`, the server in its scope as above); with
-`PROFILE=realistic SHARDS=default` it asks what shedding costs a calm server.
+What the lab found on fedora (2026-11-05, main `0c11fb03a06`, 6 interleaved rounds each, the server alone
+in its scope on 8 CPUs of its own, the lab on 8 others): with the CUSUM shedding replaced, a calm server
+(the `realistic` profile, 4 shards) shed 6.5 Background requests a round (research f32), and one
+overloaded on purpose (the `overload` profile, one shard) 14.5 (f31), neither moving a latency beyond
+noise. Both were calm's own fan-outs in the store share: its jobs waited less at p99 overloaded (97 to
+206 ms) than calm (307 to 620 ms). The overload itself was the server's CPUs, 7.8 of its 8 busy, mostly
+with the blocking pool's `fs` share's threads (9 places busy, the attaches'), while the one shard stayed
+34% busy, its probes late by a scheduler's tick at a time (p99 17 ms): no queue of the server's stood. So
+the overloaded run now uses `--profile flood`, the overload profile with 64 readers and 8 agents calling
+MCP, none thinking, more work than one shard runs, its readers' event catch-ups Background, its other
+reads and MCP calls Normal, its pages and `/api/me` Critical.
+
+`scripts/overload_lab/overload.sh` runs a profile shedding off against on, interleaved (`kiln-lab ab`, the
+server in its scope as above): one shard and `PROFILE=flood` overloads it on purpose; with
+`PROFILE=realistic SHARDS=default` it asks what shedding costs a calm server, which should be nothing.
 
 ```sh
-ROUNDS=6 CPUS=16-31 scripts/overload_lab/overload.sh target/release/kiln target/release/kiln-lab ~/.cache/kiln-lab/g6-overload
+ROUNDS=6 CPUS=16-31 PROFILE=flood scripts/overload_lab/overload.sh target/release/kiln target/release/kiln-lab ~/.cache/kiln-lab/g6-overload
 ROUNDS=6 CPUS=16-31 PROFILE=realistic SHARDS=default scripts/overload_lab/overload.sh target/release/kiln target/release/kiln-lab ~/.cache/kiln-lab/g6-calm-shedding
 ```
 
 Each round's `server.shed.background` and `server.shed.normal` are the sheds by class
-(`kiln_shed_total`), and `page.errors` and `page.p99_ms` whether Critical requests were served.
+(`kiln_shed_total`), and `page.errors` and `page.p99_ms` whether Critical requests were served. Each round's
+server log says each queue that stood, when and why (`shard overloaded: its queue stood past its calm`,
+`work waiting in a pool stood past its calm`), and its `/metrics` how long each queue stood
+(`kiln_*_queue_standing_seconds`).
 
-In process, `crates/kiln/tests/overload.rs` shows both detectors at work on kiln's own HTTP server with
-shedding on: busy tasks of each class flooding every shard shed Background requests, then Normal ones,
-while Critical ones are served (at a 0.56 ms median); and a backlog in the blocking pool's `store` share
-while every shard is calm (its jobs waiting about 200 ms each for a place, then 1.5 s) sheds Background
-requests at the first, Normal ones only past the tolerance, never Critical ones (served at a 0.08 ms
-median), and `/readyz` says not ready, naming the share, while the API is shed. Sheds are counted by
-class in both.
+In process, `crates/kiln/tests/overload.rs` shows both kinds of watch at work on kiln's own HTTP server
+with shedding on: busy tasks of each class flooding every shard shed Background requests, then Normal ones,
+while Critical ones are served; and a backlog in the blocking pool's `store` share while every shard is
+calm (its line kept full so its jobs wait about 200 ms each for a place, then 1.5 s) sheds Background
+requests once it has stood a tolerance past those waits, Normal ones a tolerance later, never Critical
+ones, and `/readyz` says not ready, naming the share, while the API is shed. Sheds are counted by class in
+both.
 
 ## Goal 5: no lock on the hot path
 
@@ -616,6 +663,57 @@ python3 scripts/locks.py rank census/run.json
 - **The runners' commands** (`crate::wire::commands::Owner`): one task owns their state machine and takes
   every change and question as a message, in order; a sync path's command (`Hub::command_soon`) is queued
   in its turn and its answer comes on its one wait.
+- **CI's engine's legs, runs and kept legs** (`ci::dispatch::Handle`), which the hub reads on every message
+  a runner sends about a job (is it one of the engine's legs, does this runner keep it) and the API on its
+  calls, are copies: the dispatcher, the legs' and runs' one writer, swaps a new one in as they come and go,
+  and a kept leg's (the dispatcher's or the API's) is a compare-and-swap. A reader sees every change made
+  before it looked, as under the lock; a finished run's legs go in one swap, so it sees all of them or
+  none. What the dispatcher rebuilt as it started is set once, and its messages' end is taken once.
+- **CI's caches** that the API's calls and the runs being planned read are copies too: each repository's
+  trunk files (`.kiln/config.yaml`, `routing.yaml`, `environments.yaml`, read again at most every 20 s),
+  its tests' timings (shards balanced by time), the package graphs of the newest commits, the patch-ids
+  of commits signed over, and how far each runner's checkouts are behind. A value read again goes in with
+  the others' pointers (each value its own `Arc` where it's more than a few words); readers that found one
+  stale both read it again, as under the lock.
+- **Ship's Deploys** (`ship::deploys::Model`): the facts as last gathered, which every list reads, are a
+  copy a new gathering replaces whole, and so are each source's newest commits.
+
+### What's left in the bus, Ship and CI, and why it's off the hot path
+
+The census (`python3 scripts/locks.py list`; every Mutex and RwLock outside a test build's code in
+`bus.rs`, `ship.rs`, `ship/`, `ci/` and `store.rs`, and kiln-seams' `bus.rs`) found none on the bus's
+side in kiln: its node is Quiver's (vendored; its locks are its own change), and `SimBus`'s is the
+simulator's, built for tests only. In Ship, only Deploys' (above). In CI, besides those above, these,
+none taken on a runner's message, a page's read or a websocket's frame:
+
+- **Async locks**, which park the task that waits and never a shard (a holder whose shard the OS
+  preempts holds up only that lock's waiters): the table of steps in flight (`services/memo.rs`, its
+  leases changed in order, each kept in SQLite before the next); a digest's put against its collection
+  (`services/cas.rs`'s stripes); one artifact finishing at a time (`services/pipelines.rs`); the OIDC
+  keys' rotation (`oidc.rs` `ROTATE`, so two requests never both make a key); a push to a repository kiln
+  hosts (`hosting.rs`, one at a time a repository, its `refs/for/*` the way in); the search's meta file and
+  a tree's index while it's built (`search.rs`); an incident's bookkeeping (`attach.rs` `WAKING`).
+- **One loop's own, or taken as something rare happens:** the scheduler's sweep every 5 s (`notify.rs`
+  `OFFLINE`, `QUARANTINED`, `UNUSED_LOOKED`), a release's move (`MOVING`), a cache's eviction
+  (`NEAR_QUOTA`); a push (`QUARANTINED`, and `fresh.rs`'s queues of trunk moves and of changes with a new
+  revision, which its replayer's loop takes); kiln's events, by the attachments' listener (`attach.rs`
+  `FROM_REPOS`, read again at most once a minute, `UPGRADES_SEEN`, `UPGRADES_THROUGH`) and by review's
+  (`cd_events.rs`, CD's apps moving); the replies mailbox's loop (`replies.rs`); the land queue's and the conflict
+  ladder's loops, and a review or landing as it's given (`land.rs`, `ladder.rs`); a preview's leg ending,
+  or a runner that takes previews down connecting or saying it did (`previews.rs`); an attest step's
+  signature (`attest.rs`); a credential minted for a brokered secret, a deployment or a tracker, each
+  around a token exchange over the network (`integrations/aws.rs`, `azure.rs`, `gcp.rs`, `oci.rs`,
+  `trackers.rs`), a cloud service's endpoint, read as each call to it is made (`integrations/mod.rs`,
+  where a test puts its fakes), and the KMS key's public half, fetched once (`signing.rs`); a person's
+  search of a change (`search.rs` `TREES`, `CHANGED`, `BUILDING`, around git and an index's build); a push
+  to a repository kiln hosts (`hosting.rs`'s map of its locks); an artifact kept in CAS, and the collector
+  (`services/cas.rs` `uploading`); the issuer's own listener (`[ci.oidc] listen`), whose documents' rate
+  limit by client (`oidc.rs` `asked`) clouds meet as they fetch kiln's keys, never the API's listener.
+- **One request's own:** GraphQL's errors and missing fields (`rest/graphql.rs`), made and dropped with
+  its request, so no other request, and no other shard, takes them.
+
+`scripts/locks/hot.toml` names the files above that became lock-free, and the CI modules the API's runs,
+legs, pools and insights are read through, so a lock there fails the check.
 
 ### Keeping them out
 
@@ -826,6 +924,114 @@ What it says:
 - **Not built: per-shard `SO_REUSEPORT` listeners with a BPF picker** (step 1's option). Per-worker accept
   queues leave a clogged worker's connections waiting for it (research f3, f21), the picker would need the
   shards' delays in a BPF map, and the portable acceptor's two choices, the option's own aim, didn't win.
+
+## Goal 9: shards in under a millisecond
+
+Goal 9 of the API runtime program (plan `01a1a87b2cec70b8be87932f1cd55fc3`, research
+`01a1a87b2cee763282534206fdb0c990`): every shard runs its ready work within a millisecond at p99.9,
+calm and with CPU hogs in production's layout, at a tenth of goal 3's busy share (Ada: "sub
+millisecond p99.9 on shard delay, at least an order of magnitude on busy share").
+
+### Its lab (`scripts/shard_lab`)
+
+`driver.sh` runs `kiln-lab`'s rounds in production's layout, the configurations taking turns round by
+round, the lab's clients and runners on CPUs of their own (`LAB_CPUS`) so it measures the server, not
+itself, and every server at 4 shards (`KILN_RT_SHARDS`, the count the server sizes itself to on 16
+CPUs):
+
+- `calm`: the server alone in a scope of its own at `CPUWeight=1000` (`kiln.slice`'s weight on bare
+  metal) on `SERVER_CPUS`;
+- `hogs`: that, and 16 busy loops in a scope of their own at `cpu.weight` 1 (CI legs' and agents'
+  weight) on the server's CPUs;
+- `cores-calm`, `cores`: the server on cores of its own (`[server] cores`, and its scope's
+  `AllowedCPUs=`), calm and with the hogs on the CPUs past the server's;
+- `q<µs>-<configuration>`: a configuration with the shards' step quantum at `<µs>`
+  (`KILN_RT_QUANTUM_US`).
+
+With `PROF=1` each configuration gets one round more with perf recording the server over its window
+(`hook.sh`), kept apart from the measured rounds; every round's hook writes which CPUs each of the
+server's threads and children may run on as its window ends (`affinity.txt`).
+
+```sh
+# the calm baseline below: the lab on 0-7 and the server on 16-23, beside another lab on the rest
+ROUNDS=8 LAB_CPUS=0-7 SERVER_CPUS=16-23 CONFIGS=calm SHARDS=4 PROF=1 PROF_KILN=<an unstripped kiln> \
+  PERF=<perf> scripts/shard_lab/driver.sh <kiln> <kiln-lab> ~/.cache/kiln-lab/g9-calm
+```
+
+### Main's baseline, calm (step 1)
+
+Measured on 2026-11-05 from 01:12 to 01:26 UTC on fedora (Intel Core i9-14900HX, Fedora's Linux
+6.19.10 with lazy preemption at 1000 Hz: research f17): the server on 8 efficient cores (16-23), the
+lab on 8 performance threads (0-7), another lab on the rest. The build: main at `0ed7bc79afa` with this
+goal's instruments (`5036242688e`, built with zig against glibc 2.43). Eight rounds; each cell the
+median of the rounds and, after it, their range. The rounds: `docs/runtime-lab/2026-11-05/g9-calm.json`.
+
+| number | all shards | shard 0 | shard 1 | shard 2 | shard 3 |
+| --- | --- | --- | --- | --- | --- |
+| delay p50 µs | 194.5 (193 to 196) | | | | |
+| delay p99 µs | 615 (480 to 1087) | 1303 (847 to 3917) | 382 (324 to 864) | 337 (304 to 789) | 340 (323 to 824) |
+| delay p99.9 µs | 20,110 (12,770 to 24,320) | 93,830 (89,230 to 127,100) | 1026 (544 to 2271) | 924 (527 to 2543) | 984 (727 to 2386) |
+| delay, top bucket reached µs | 250,000 | 250,000 | 3500 (1250 to 10,000) | 2000 (1000 to 10,000) | 2500 (1250 to 10,000) |
+| busy share | 0.071 (0.068 to 0.079) | 0.239 (0.232 to 0.259) | 0.0168 | 0.0157 | 0.0166 |
+
+Over the fill the shards' delay was 21.6 ms at p99.9 and their busy share 0.166; the server used 1.09
+cores, 12.4 ms of CPU a request.
+
+What it says:
+
+- **One shard made the tail.** Shard 0 ran every task the server's start-up spawned (a task spawned on a
+  shard stays on it, and the start-up runs on shard 0): busy 0.24 of the time, against 0.016 on each of
+  the others, and 94 ms late at p99.9, where the other three ran their ready work about 1 ms late.
+- **A calm shard waits about 195 µs:** the probe's timer tick (100 µs) and its thread's timer slack (the
+  tick again), by design.
+
+### What held the shards (step 2)
+
+Every poll past 100 µs, by its task's spawn site and the label its code set (`kiln_shard_held_*`), in
+the calm window: the mean of the eight rounds a second, the mean hold and the longest seen.
+
+| site | label | ms held a second | polls a second | mean hold ms | longest ms |
+| --- | --- | --- | --- | --- | --- |
+| `custody/feeds.rs:28` (custody's receipts of the feeds' batches) | | 105.9 | 313.9 | 0.337 | 14.1 |
+| `hub.rs:2588` (runners' custody records, `custody::on_runner`) | | 32.6 | 98.6 | 0.331 | 7.0 |
+| `convo/feed.rs:242` (the server's feed to its mirrors: its hand-ons) | | 30.9 | 101.9 | 0.304 | 4.9 |
+| `sup.rs:136` (the hub's net loop, `spawn_guarded("net-events")`) | | 18.6 | 93.5 | 0.199 | 76.0 |
+| `server.rs:471` (HTTP) | read /api/harness/sessions | 16.1 | 45.3 | 0.355 | 13.2 |
+| `server.rs:471` | write /api/mcp | 6.2 | 8.0 | 0.774 | 18.1 |
+| `harness/copies.rs:745` (sessions' owners, goal 4) | | 5.7 | 32.6 | 0.176 | 51.3 |
+| `sup.rs:87` (the server's supervised children) | | 2.9 | 7.0 | 0.417 | 14.8 |
+| `api.rs:5901` (a viewer's socket) | | 1.6 | 5.0 | 0.315 | 6.2 |
+| `server.rs:471` | read /api/agents | 1.4 | 7.6 | 0.186 | 4.0 |
+| `server.rs:471` | read /api/overview | 1.1 | 3.7 | 0.295 | 3.8 |
+| `server.rs:286` (Error Tracking's issues, saved each minute) | | 0.35 | 0.02 | 21.0 | 29.3 |
+
+Over the fill: the sessions' owners 588 ms a second (297 polls a second, 2.1 ms each, the longest 51
+ms), the net loop 120 ms (283, 0.42 ms, 76 ms), custody's receipts 21 ms.
+
+perf over a ninth round's window (an unstripped build of the same commit; its DWARF unwinding stopped
+at the leaf on most samples, so by the function holding the IP): half of the shards' CPU was P-256
+ECDSA (aws-lc's `nistz256` arithmetic and its modular inverse: custody's signatures, verified and made
+on the shards), 15% glibc's malloc and free, 4% memmove and memset, 3.5% serde_json, 2% postcard
+reading and writing `Vec<u8>` a byte at a time. Of the whole server's CPU, a third was deflate
+(`miniz_oxide`) on the blocking pool: viewers' gzipped attaches.
+
+### What moved (step 3)
+
+- **Custody's signatures off the shards** (`custody::verified`, `load`, `server_signed_off`): a record
+  is verified, and the feeds' receipts and hand-ons signed, on the compute pool; each in the order it
+  was, nothing said before it's signed (W27-R08).
+- **Services spread over the shards:** `sup::spawn` and `sup::spawn_guarded` place their tasks round-robin
+  (`rt::spawn_spread_joined`), as do custody's receipts task and a feed's tasks.
+- **Error Tracking's save on the blocking pool** (`observe::errors`).
+- **Named by their callers:** `sup::spawn` and `sup::spawn_guarded` are `#[track_caller]`, so the table
+  names the hub's net loop and each supervised child by where it was started.
+- **Runners' frames read whole, and off the hub's shard when long:** each `Vec<u8>` of the wire's
+  messages is written and read as bytes (`proto::wire_bytes`: the same bytes on the wire), and
+  `wire::payload::read_frame` reads a frame and what it carries on the compute pool when that's expected
+  to take past a slow poll (100 µs), by the moving averages of the frames read before; the hub's loop
+  waits either way, so its messages keep their order.
+- **The server's host sample on the blocking pool** (`Hub::sampler_loop`), as a runner's already was: it
+  held its shard about 2 s every minute where sysinfo samples (found by the Bare Metal Migration agent).
 
 ## What the lab doesn't do yet
 

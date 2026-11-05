@@ -116,10 +116,25 @@ probes off, is no reading, never a breach.
   its probes keep that pace, and a probe still out is harm only once it's out that long (what it
   answers is what the server measured, not how long asking took).
 
-It's detected as every target is ([headroom.md](headroom.md)): a shift of the delay from calm toward
-the tolerance cuts kiln's CPU and write budgets, and the pacer slows what runs. CI jobs' cgroups are
-paced, as agents' sessions are, so the legs and agents beside the server are what's slowed first. A
-job a person paused is the pause's alone: the pacer neither stops it nor lets it go on.
+It comes first ([headroom.md](headroom.md), "Detection"): besides a shift toward the tolerance, a
+rise past calm's noise is trouble, read by a second CUSUM whose reference is half calm's standard
+deviation above calm's mean. Trouble cuts kiln's CPU (whatever the disks deliver: this delay is the
+CPU's) and write budgets, and the pacer slows what runs. CI jobs' cgroups are paced, as agents'
+sessions are, so the legs and agents beside the server are what's slowed first. A job a person
+paused is the pause's alone: the pacer neither stops it nor lets it go on.
+
+- **The cut holds** until the delay is back within calm's noise: the mirror of that CUSUM (what
+  samples fell short of its reference, added up) passing the same threshold, counted from samples
+  measured after the cut could show. At calm that takes as many samples as a rise past calm's
+  noise takes to alarm (on a calm like fedora's, about 45 reads, 22 s). A cut that leaves the delay rising
+  past calm's noise to the threshold again, once it could show, is cut again.
+- **Calm stays calm:** what's measured while any share under 1 is in force, or under an alarm that
+  cut kiln's work, neither joins calm nor calibrates the thresholds; an excursion learned as it
+  came is taken back out once it turns out not to be calm.
+- **Raised only as it holds:** a level counts as held only once it stayed calm as long as a rise
+  past calm's noise takes to be seen, plus the longest a cut took to show; and the level is what
+  kiln's work used, never more than its budget let it (CPU paced groups give up, unpaced ones take,
+  so what kiln uses barely moves while the pacer holds it to less).
 
 ## Cores of its own
 
@@ -130,7 +145,12 @@ job a person paused is the pause's alone: the pacer neither stops it nor lets it
   root): nothing outside it runs on those cores (f21). A user's install can confine the server
   there, not keep others off.
 - The server fixes its shards to them, one each, keeping the first core for its threads that
-  aren't shards, as hyper-rt's placement does (f11).
+  aren't shards, as hyper-rt's placement does (f11), and keeps its other threads off the shards'
+  cores (goal 9, plan `01a1a87b2cec` step 4): a thread or process starts with the CPUs of the thread
+  that started it, so the threads it starts after fixing them start on the rest, a thread a task on
+  a shard starts is moved off within the shards' probe period (`crate::rt::keep_apart`), and a child
+  a shard starts is moved as it starts. Linux alone: macOS and Windows have no cores of the server's
+  own (`[server] cores` is refused there), so nothing changes on them.
 
 In the lab, cores of its own held every page and API number within noise of the server alone, which
 weights didn't ("The lab", below). It stays off all the same: cores held for the server sit idle
@@ -329,6 +349,36 @@ since the stall wasn't kiln's. The engine's test with the lab's numbers
 paces the leg and the agent alike, and the delay back down clears the alarm, the cut held until the
 level holds.
 
+**item2: main let go (`0c11fb03a06`, 2026-11-05 01:27-01:39 UTC, CPUs 16-31).** Research
+01a1a59c2b2a, f52 to f55. The server joined the runner's cgroup at 90 s, the legs (32 threads)
+started at 120 s and the agents (64) at 210 s. In 10 s bins of `timeline.py`:
+
+| t s | delay med ms | mean since read med ms | shards p99 ms | calm ms | CUSUM | threshold | CPU budget | paced | least share |
+|---|---|---|---|---|---|---|---|---|---|
+| 110 | 0.21 | 0.20 | 0.60 | 0.234 | 0.00 | 0.21 | - | 0 | |
+| 120 | 1.00 | 0.55 | 7.76 | 0.245 | 0.00 | 1.79 | 14.3 | 8 | 52 |
+| 130 | 0.76 | 0.51 | 5.99 | 0.260 | 0.00 | 1.77 | 28.6 | 0 | |
+| 220 | 5.75 | 1.38 | 21.84 | 0.407 | 0.00 | 5.25 | 29.6 | 0 | |
+| 340 | 0.21 | 0.25 | 13.89 | 0.607 | 0.00 | 3.89 | 7.5 | 5 | 24 |
+| 460 | 10.04 | 2.05 | 33.15 | 0.757 | 0.00 | 3.40 | 30.1 | 0 | |
+| 630 | 3.97 | 1.05 | 19.41 | 0.914 | 0.00 | 3.40 | 28.4 | 0 | |
+
+headroom alarmed at 126 s ("typical 0.2 ms, now 3.5 ms (CUSUM 0.82 past 0.23)") and cut kiln's CPU
+from 14.3 cores to 7.1, was back to calm a second later, and had the budget at 28.6 cores by 137 s.
+The agents' alarm at 216 s cut nothing and cleared at 221 s. From then to the end the delay sat at
+4 to 6 times calm with nothing paced, but for a runner-disk alarm at 346 s whose cut (the agents at
+24-30%) brought it back to calm until it was let go at 358 s. Read back from its own status, the
+causes: every sample not under an alarm joined calm, and the legs' 2.5 and the agents' 4 to 6.4
+times calm sat below the CUSUM's reference (half way to the 10 ms tolerance, 6.6 times calm), so
+calm drifted from 0.238 ms to 0.919 and the CUSUM never rose again; an alarm cleared the moment its
+CUSUM touched zero; the engine read only the writes' lag, unknown all run since only the CPU was cut,
+so a level counted as held after a second, and every excursion a cut ended was learned as noise (the
+threshold from 0.23 to 5.6); the CPU knee took kiln's measured cores, 12.9-14.4 under a 7.1-core
+budget (what paced groups gave up, unpaced ones took), as the level held, and so disproved the bound
+it had cut at; and the alarm at 216 s found the disks "full" against a capacity read during the
+kiln-server alarm at 204 s, so cut no CPU. headroom.md's "Simulation" runs this as a trace, and goal
+8 step 5's engine holds it there; item2b below is the lab's word.
+
 ## Needs root, or a person
 
 - A system install (root, once) for the top-level `kiln.slice`, the partition, and the server's
@@ -366,8 +416,14 @@ level holds.
   numbers: calm near 0.43 ms with a stall every two minutes, then legs and agents raising it to
   1.9 to 4.5 ms: the engine alarms within seconds, cuts kiln's CPU, paces a leg and an agent alike,
   sees it back to calm, and probes at the window's pace, not the tolerance's.
-  `g8_s5_a_windowed_targets_probe_out_past_its_tolerance_is_no_harm_until_its_window`: a rise the
-  weights held (1.4 to 1.8 times calm) is no trouble, and a probe out is harm only at the window.
+  `g8_s5_a_windowed_targets_probe_out_past_its_tolerance_is_no_harm_until_its_window`: for a
+  windowed target that doesn't come first, a rise the weights held (1.4 to 1.8 times calm) is no
+  trouble, and a probe out is harm only at the window.
+- kiln-ci's `headroom::sim::g8_s5_the_11_05_lab_rising_delay_paces_the_legs_and_holds_it_down_until_the_load_ends`:
+  item2 as a trace (headroom.md, "Simulation"). On main's engine every loaded stretch was past
+  calm's noise and nothing was paced 5 s after the first cut; now the legs are paced within 30 s,
+  the delay is held within calm's noise while the load stays, something stays paced until it ends,
+  it's calm after, and calm stays what it was.
 - kiln-lab's `standin::tests::g8_s5_a_hog_turn_burns_for_its_time_and_no_longer`: the stand-in's CPU
   hog turn, the lab's agents.
 - `rt::tests::g8_s6_shards_are_fixed_to_cores_of_the_servers_own` and

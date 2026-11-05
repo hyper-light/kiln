@@ -549,8 +549,38 @@ impl Info {
     }
 }
 
-/// Where a session's updates go (the server's registry, or the uplink to it).
-pub type Sink = async_channel::Sender<(String, Update)>;
+/// Where a session's updates go (the server's registry, or the uplink to it): a queue bounded in bytes
+/// (`crate::memory::queue`: the server's own sessions', goal 11, plan 01a1a87b2e56 step 3), or a channel's
+/// sending end (a runner's, which its uplink bounds in bytes, and tests'). Either way a sender waits for
+/// room: nothing is dropped.
+#[derive(Clone, Debug)]
+pub enum Sink {
+    Bounded(crate::memory::queue::Sender<(String, Update)>),
+    Channel(async_channel::Sender<(String, Update)>),
+}
+
+impl Sink {
+    /// Hands an update on, waiting while there's no room for it: an error, with it, once no one takes
+    /// updates any more.
+    pub async fn send(&self, update: (String, Update)) -> Result<(), async_channel::SendError<(String, Update)>> {
+        match self {
+            Sink::Bounded(q) => q.send(update).await,
+            Sink::Channel(c) => c.send(update).await,
+        }
+    }
+}
+
+impl From<crate::memory::queue::Sender<(String, Update)>> for Sink {
+    fn from(q: crate::memory::queue::Sender<(String, Update)>) -> Self {
+        Sink::Bounded(q)
+    }
+}
+
+impl From<async_channel::Sender<(String, Update)>> for Sink {
+    fn from(c: async_channel::Sender<(String, Update)>) -> Self {
+        Sink::Channel(c)
+    }
+}
 
 /// What a session needs from the machine that holds it: where it keeps the files attached to
 /// its messages, how it collects ones that arrived separately (uploaded, or sent in pieces from
@@ -1022,23 +1052,23 @@ pub fn resolve_cwd(cwd: Option<&str>) -> String {
 }
 
 /// Start a session; its updates go to `sink`, tagged with its id.
-pub fn start(id: String, spec: Spec, sink: Sink, on_change: Arc<dyn Fn() + Send + Sync>, files: Files) -> anyhow::Result<Arc<Session>> {
+pub fn start(id: String, spec: Spec, sink: impl Into<Sink>, on_change: Arc<dyn Fn() + Send + Sync>, files: Files) -> anyhow::Result<Arc<Session>> {
     start_seeded(id, spec, sink, on_change, files, None)
 }
 
 /// Go on with a session this process's previous image handed over ([`Session::hand_over`]): its
 /// timeline and state as they were, and its harness process, still running.
-pub fn start_handed(id: String, spec: Spec, sink: Sink, on_change: Arc<dyn Fn() + Send + Sync>, files: Files, h: Box<Handed>) -> anyhow::Result<Arc<Session>> {
+pub fn start_handed(id: String, spec: Spec, sink: impl Into<Sink>, on_change: Arc<dyn Fn() + Send + Sync>, files: Files, h: Box<Handed>) -> anyhow::Result<Arc<Session>> {
     use base64::Engine as _;
     let kind = Kind::get(&h.kind).ok_or_else(|| anyhow::anyhow!("unknown harness {:?}", h.kind))?;
     let h = *h;
     let core = Core::thaw(h.core);
     let adopt = Adopt { process: h.process, adapter: super::kinds::Adapter::thaw(h.adapter), partial: base64::engine::general_purpose::STANDARD.decode(h.partial).unwrap_or_default() };
-    begin(id, spec, kind, core, sink, on_change, files, None, Some(adopt))
+    begin(id, spec, kind, core, sink.into(), on_change, files, None, Some(adopt))
 }
 
 /// Start a session, seeded with what it had on another machine when it moved here.
-pub fn start_seeded(id: String, spec: Spec, sink: Sink, on_change: Arc<dyn Fn() + Send + Sync>, files: Files, seed: Option<Seed>) -> anyhow::Result<Arc<Session>> {
+pub fn start_seeded(id: String, spec: Spec, sink: impl Into<Sink>, on_change: Arc<dyn Fn() + Send + Sync>, files: Files, seed: Option<Seed>) -> anyhow::Result<Arc<Session>> {
     let kind = Kind::get(&spec.kind).ok_or_else(|| anyhow::anyhow!("unknown harness {:?}", spec.kind))?;
     let cwd = resolve_cwd(spec.cwd.as_deref());
     let mut core = Core::new();
@@ -1087,7 +1117,7 @@ pub fn start_seeded(id: String, spec: Spec, sink: Sink, on_change: Arc<dyn Fn() 
     }
     core.state.reach.clone_from(&spec.reach);
     named_ahead(&mut core.meta, kind, spec.model.as_deref());
-    begin(id, spec, kind, core, sink, on_change, files, items, None)
+    begin(id, spec, kind, core, sink.into(), on_change, files, items, None)
 }
 
 /// Harness `kind`'s lists as this machine knows them, for a session's page to name its settings by
