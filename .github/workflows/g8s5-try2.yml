@@ -1,0 +1,78 @@
+# Trial only, never on main: the landing checks of g8s5-headroom-holds (goal 8, plan 01a1a59c2b29 step 5: headroom
+# holds the server's delay down): clippy on kiln-ci and kiln as ci/gate.sh runs it, and kiln-ci's and kiln's headroom
+# tests, on Linux, macOS and Windows. Run by a push to g8s5-try2.
+name: g8s5-try2
+
+on:
+  push:
+    branches: [g8s5-try2]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: g8s5-try2
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: "0"
+  KILN_SKIP_UI_BUILD: "1"
+  AWS_LC_SYS_PREBUILT_NASM: "1"
+
+jobs:
+  check:
+    name: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Rust
+        run: |
+          rustup toolchain install stable --profile minimal --component clippy
+          rustup default stable
+      - name: Room to build
+        if: ${{ runner.os == 'Linux' }}
+        run: |
+          swap=/mnt/kiln-swap
+          [ -d /mnt ] || swap=/kiln-swap
+          sudo fallocate -l 16G "$swap" || sudo dd if=/dev/zero of="$swap" bs=1M count=16384
+          sudo chmod 600 "$swap" && sudo mkswap "$swap" && sudo swapon "$swap"
+          echo "CARGO_BUILD_JOBS=2" >> "$GITHUB_ENV"
+      - id: clippy
+        name: Clippy (as ci/gate.sh)
+        timeout-minutes: 120
+        run: |
+          if [ "$RUNNER_OS" = Linux ]; then all=--all-targets; else all=; fi
+          cargo clippy --locked -p kiln-ci -p kiln $all -- -D warnings 2>&1 | tee "$RUNNER_TEMP/clippy.txt"
+      - id: tests
+        name: Tests (kiln-ci's and kiln's headroom)
+        if: ${{ !cancelled() }}
+        timeout-minutes: 120
+        run: |
+          set -o pipefail
+          { cargo test -p kiln-ci --locked --lib -- headroom:: && cargo test -p kiln --locked --lib -- headroom::; } 2>&1 | tee "$RUNNER_TEMP/tests.txt"
+      - name: Report
+        if: ${{ always() }}
+        env:
+          OUTCOMES: clippy=${{ steps.clippy.outcome }} tests=${{ steps.tests.outcome }}
+        run: |
+          set +e +o pipefail
+          esc() { sed -e 's/%/%25/g' -e 's/\r/%0D/g' | awk 'BEGIN { ORS = "%0A" } { print }'; }
+          for said in $OUTCOMES; do
+            step=${said%%=*} outcome=${said#*=}
+            out="$RUNNER_TEMP/$step.txt"
+            [ -s "$out" ] || continue
+            plain=$(sed -e 's/\x1b\[[0-9;]*[A-Za-z]//g' -e 's/\r$//' "$out" | grep -v -E '^ *(Compiling|Checking|Blocking|Downloaded|Downloading|Updating|Locking) ')
+            if [ "$step" = tests ]; then text=$(printf '%s\n' "$plain" | grep -E '^test .*(FAILED|ok)$|^test result|panicked|^error' | grep -E 'FAILED|test result|panicked|^error|g8_s5|automatic_targets' | head -n 80); else text=$(printf '%s\n' "$plain" | grep -E '^(error|warning)|-->' | head -n 80); [ -n "$text" ] || text="clippy clean"; fi
+            level=notice; [ "$outcome" != success ] && level=error
+            echo "::$level title=${{ matrix.os }} $step $outcome::$(printf '%s\n' "$text" | esc)"
+          done
