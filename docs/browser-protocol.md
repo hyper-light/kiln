@@ -407,8 +407,17 @@ in the core, used by goals 3 and 5):
   The next bytes are expected by the last arrival, plus the declared period, plus the learned
   spread (mean plus four deviations).
 - Past that the link is suspect, and a `Probe` goes ahead of everything else.
-- It is dead only if it stays silent past the probe by its measured round trip (from probes and the
-  open, smoothed the same way).
+- It is dead only if it stays silent past the probe through `2^backoff - 1` of its measured round
+  trips (from probes and the open, smoothed the same way; `backoff` 5 by default). The carrier below
+  may be retransmitting with doubling timers meanwhile: over TCP a lost packet holds everything after
+  it, and a probe's answer waits behind every byte already queued, so a link silent for one round trip
+  is often only stalled (goal 9's traces at 50 kbit/s, 5% loss and a 6 s queue: one window gave 231
+  false dead verdicts in 300). What's in flight can't shorten this for the receiver: on one ordered
+  stream, a position the sender declares arrives after every byte it declares, so the receiver never
+  learns what's queued behind its last arrival; only the sender knows its own unacknowledged bytes.
+- A page that ran again after a freeze (shown, `pageshow`, resume) says so (`resumed(now)`) before it
+  reads what came meanwhile: the gap was its own, so it's neither learned as the link's lateness nor
+  judged as silence.
 - All of this is worked out from the arrival times the core was given, whenever it's asked, so a
   page that was frozen judges from what arrived, not from timers that didn't fire.
 

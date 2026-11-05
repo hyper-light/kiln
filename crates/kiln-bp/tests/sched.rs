@@ -74,12 +74,13 @@ fn bp_g2_s7_an_echo_waits_behind_at_most_one_fragment() {
                 let start = p.down.free_at.max(now as f64);
                 if let Some(t) = p.server.poll_transmit(FRAGMENT, now) {
                     for f in &t.frames {
-                        if f.lane == Lane::Sub(1) && f.prio == Prio::Interactive {
-                            // Which echo this is: the oldest pushed not yet seen.
-                            if let Some((rev, when)) = pushed.iter().find(|(r, _)| !seen.contains(r)).copied() {
-                                seen.insert(rev);
-                                waits.push(start - when as f64);
-                            }
+                        // Which echo this is: the oldest pushed not yet seen.
+                        if f.lane == Lane::Sub(1)
+                            && f.prio == Prio::Interactive
+                            && let Some((rev, when)) = pushed.iter().find(|(r, _)| !seen.contains(r)).copied()
+                        {
+                            seen.insert(rev);
+                            waits.push(start - when as f64);
                         }
                     }
                     p.down.send(now, t.bytes);

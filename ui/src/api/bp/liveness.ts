@@ -3,7 +3,8 @@
  * decides it, number for number: the peer promises bytes at least every idle period; how late
  * they come beyond it is learned (RFC 6298's smoothed mean and mean deviation), and so is the
  * round trip. Live while bytes are due, suspect once they're late (a probe goes first), dead only
- * when a suspect link stays silent a round trip past the probe. Judged from the arrival times
+ * when a suspect link stays silent through 2^backoff - 1 round trips past the probe (a TCP carrier
+ * may be retransmitting with doubling timers meanwhile). Judged from the arrival times
  * given, whenever asked: a page that was frozen judges from what arrived, not from timers that
  * didn't fire. Times are milliseconds on the caller's clock.
  */
@@ -45,6 +46,8 @@ export type Verdict = "live" | "suspect" | "dead";
 
 /** The floor on the learned spread and round trip: the clock's grain. */
 export const GRAIN_MS = 1;
+/** How many doublings of the round trip a silent link is given after its probe (as kiln-bp's `BACKOFF`). */
+export const BACKOFF = 5;
 
 export class Liveness {
   private idle: number;
@@ -52,10 +55,20 @@ export class Liveness {
   private readonly late = new Estimate();
   readonly rtt = new Estimate();
   private probed: number | null = null;
+  /** Round-trip windows a silent link is given: 2^backoff - 1. */
+  readonly backoff: number;
 
-  constructor(idleMs: number, now: number) {
+  constructor(idleMs: number, now: number, backoff = BACKOFF) {
     this.idle = Math.max(idleMs, GRAIN_MS);
     this.last = now;
+    this.backoff = Math.min(backoff, 20);
+  }
+
+  /** The page ran again after a freeze (shown, pageshow, resume): the gap is the page's, not the link's. Moves the last arrival to `now` without learning from it. */
+  resumed(now: number): void {
+    this.last = Math.max(this.last, now);
+    // A probe that went before the freeze isn't a round trip of the link's any more.
+    this.probed = null;
   }
 
   setIdle(idleMs: number): void {
@@ -98,9 +111,10 @@ export class Liveness {
     return this.probed !== null;
   }
 
+  /** When the link is dead if nothing arrives: 2^backoff - 1 round trips after the probe (the carrier below may be retransmitting with doubling timers). */
   deadAt(): number {
     const from = Math.max(this.probed ?? this.expectedBy(), this.expectedBy());
-    return from + this.rttBound();
+    return from + this.rttBound() * (2 ** this.backoff - 1);
   }
 
   verdict(now: number): Verdict {

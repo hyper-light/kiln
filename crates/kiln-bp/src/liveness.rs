@@ -3,7 +3,11 @@
 //! every idle period; the receiver learns how late they come beyond it (RFC 6298's smoothed mean
 //! and mean deviation, over the gaps between arrivals), and how long a round trip takes. A link is
 //! live while bytes are due, suspect once they're late (a probe goes first), and dead only when a
-//! suspect link stays silent past its round trip after the probe. Everything is worked out from
+//! suspect link stays silent through a backed-off number of round trips after the probe: the
+//! carrier below may be retransmitting with doubling timers (TCP's RFC 6298 backoff; a lost
+//! packet holds everything after it), so a silent link is given `2^backoff - 1` round-trip
+//! windows, as TCP gives a lost segment, before it's called dead (goal 9's traces: one window gave
+//! 231 false dead verdicts in 300 traces at 50 kbit/s, 5% loss and a 6 s queue). Everything is worked out from
 //! the arrival times given, whenever it's asked: a page that was frozen judges from what arrived,
 //! not from timers that didn't fire. Times are milliseconds on the caller's clock; nothing here
 //! reads one.
@@ -65,6 +69,8 @@ pub enum Verdict {
 
 /// The floor on the learned spread and round trip: the clock's own grain.
 pub const GRAIN_MS: u64 = 1;
+/// How many doublings of the round trip a silent link is given after its probe (`Liveness::dead_at`).
+pub const BACKOFF: u32 = 5;
 
 /// One side's view of its peer.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -79,13 +85,31 @@ pub struct Liveness {
     rtt: Estimate,
     /// When a probe went, while one is out.
     probed: Option<u64>,
+    /// Round-trip windows a silent link is given: `2^backoff - 1`.
+    backoff: u32,
 }
 
 impl Liveness {
     /// A link that opened at `now`, whose peer declared `idle_ms`, with a first round trip
     /// (the open's) when one is known.
     pub fn new(idle_ms: u64, now: u64) -> Self {
-        Self { idle_ms: idle_ms.max(GRAIN_MS), last: now, late: Estimate::default(), rtt: Estimate::default(), probed: None }
+        Self { idle_ms: idle_ms.max(GRAIN_MS), last: now, late: Estimate::default(), rtt: Estimate::default(), probed: None, backoff: BACKOFF }
+    }
+
+    /// With another backoff (what the measurements trade: fewer windows find a dead link sooner
+    /// and misjudge more stalled ones).
+    pub fn with_backoff(mut self, backoff: u32) -> Self {
+        self.backoff = backoff.min(20);
+        self
+    }
+
+    /// The page ran again after a freeze (shown, `pageshow`, resume): what it reads now came while
+    /// it slept, so the gap is the page's, not the link's. Moves the last arrival to `now` without
+    /// learning from the gap.
+    pub fn resumed(&mut self, now: u64) {
+        self.last = self.last.max(now);
+        // A probe that went before the freeze isn't a round trip of the link's any more.
+        self.probed = None;
     }
 
     pub fn set_idle(&mut self, idle_ms: u64) {
@@ -146,11 +170,12 @@ impl Liveness {
         self.probed.is_some()
     }
 
-    /// When the link is dead if nothing arrives: a round trip after the probe, which goes no
-    /// sooner than the link is suspect.
+    /// When the link is dead if nothing arrives: `2^backoff - 1` round trips after the probe,
+    /// which goes no sooner than the link is suspect.
     pub fn dead_at(&self) -> u64 {
         let from = self.probed.unwrap_or(self.expected_by()).max(self.expected_by());
-        from.saturating_add(self.rtt_bound())
+        let windows = (1u64 << self.backoff).saturating_sub(1);
+        from.saturating_add(self.rtt_bound().saturating_mul(windows))
     }
 
     pub fn verdict(&self, now: u64) -> Verdict {
@@ -200,13 +225,18 @@ mod tests {
         assert_eq!(l.verdict(suspect), Verdict::Suspect);
         l.probe_sent(suspect);
         let dead = l.dead_at();
-        assert!(dead <= suspect + l.rtt_bound());
+        assert!(dead <= suspect + l.rtt_bound() * ((1 << BACKOFF) - 1));
         assert_eq!(l.verdict(dead - 1), Verdict::Suspect);
         assert_eq!(l.verdict(dead), Verdict::Dead);
         // A page that froze, then judges: no probe went, so it's suspect, not dead.
         let mut f = l.clone();
         f.probed = None;
         assert_eq!(f.verdict(dead + 60_000), Verdict::Suspect);
+        // A page that resumes judges afresh from then, learning nothing from its own freeze.
+        let spread = f.spread();
+        f.resumed(dead + 60_000);
+        assert_eq!(f.verdict(dead + 60_001), Verdict::Live);
+        assert_eq!(f.spread(), spread);
     }
 
     #[test]

@@ -190,7 +190,7 @@ fn bp_g2_s5_liveness_by_bytes_arriving_and_session_expiry() {
     p.down.cut = true;
     let dark = 20_001;
     let mut dead_at = None;
-    for t in dark..dark + 20_000 {
+    for t in dark..dark + 120_000 {
         p.step(&mut host, t);
         if p.client.verdict(t) == Verdict::Dead {
             dead_at = Some(t);
@@ -198,7 +198,7 @@ fn bp_g2_s5_liveness_by_bytes_arriving_and_session_expiry() {
         }
     }
     let dead_at = dead_at.unwrap_or(u64::MAX);
-    let bound = p.client.liveness().last_arrival() + 1000 + p.client.liveness().spread() + p.client.liveness().rtt_bound() + 2;
+    let bound = p.client.liveness().last_arrival() + 1000 + p.client.liveness().spread() + p.client.liveness().rtt_bound() * ((1 << kiln_bp::liveness::BACKOFF) - 1) + 2;
     assert!(dead_at <= bound, "dead at {dead_at}, bound {bound}");
     assert!(dead_at >= p.client.liveness().last_arrival() + 1000, "not before its idle period");
     // The session's end cuts the connection.

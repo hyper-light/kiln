@@ -425,6 +425,12 @@ export class Client {
     this.events.push({ t: "change", sub, rev: s.rev, delta: d });
   }
 
+  /** The page ran again after a freeze (visibilitychange, pageshow, resume): the gap is its own, not the link's. Call before reading what came meanwhile. */
+  resumed(now: number): void {
+    this.live.resumed(now);
+    this.probeOut = null;
+  }
+
   /** The link's verdict now; a suspect link gets a probe. */
   verdict(now: number): Verdict {
     const v = this.live.verdict(now);

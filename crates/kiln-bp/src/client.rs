@@ -530,6 +530,12 @@ impl Client {
         self.events.push_back(ClientEvent::Change { sub: t.sub, rev, delta: d });
     }
 
+    /// The page ran again after a freeze: the gap is its own, not the link's.
+    pub fn resumed(&mut self, now: u64) {
+        self.live.resumed(now);
+        self.probe_out = None;
+    }
+
     /// The link's verdict now; a suspect link gets a probe.
     pub fn verdict(&mut self, now: u64) -> Verdict {
         let v = self.live.verdict(now);

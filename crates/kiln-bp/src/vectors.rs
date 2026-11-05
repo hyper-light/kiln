@@ -319,6 +319,11 @@ pub fn liveness_traces() -> Vec<(Vec<String>, String)> {
                 l.probe_sent(t);
                 ops.push(format!("[\"p\",{t}]"));
             }
+            if g.below(16) == 0 {
+                t += g.below(idle * 8);
+                l.resumed(t);
+                ops.push(format!("[\"z\",{t}]"));
+            }
             let v = l.verdict(t);
             ops.push(format!("[\"v\",{t}]"));
             verdicts.push(match v {
@@ -386,12 +391,11 @@ pub fn conversation() -> (Vec<Vec<u8>>, Vec<(u32, u32, String, u64, u64)>) {
                 }
             };
             let at = usize::try_from(i).unwrap_or(0);
-            if let Some(log) = logs.get_mut(at) {
-                if let Ok(p) = log.publish(d) {
-                    if let Some((sub, _, _)) = topics.get(at) {
-                        srv.push(*sub, &p);
-                    }
-                }
+            if let Some(log) = logs.get_mut(at)
+                && let Ok(p) = log.publish(d)
+                && let Some((sub, _, _)) = topics.get(at)
+            {
+                srv.push(*sub, &p);
             }
         }
         if let Some(t) = cli.poll_transmit(64 * 1024, now) {
@@ -400,10 +404,10 @@ pub fn conversation() -> (Vec<Vec<u8>>, Vec<(u32, u32, String, u64, u64)>) {
         while let Some(e) = srv.poll_event() {
             match e {
                 Event::Subscribe { sub, cursor, .. } | Event::Resume { sub, cursor, .. } => {
-                    if let Some(at) = topics.iter().position(|x| x.0 == sub) {
-                        if let (Some(log), Some((_, kind, _))) = (logs.get(at), topics.get(at)) {
-                            srv.start(sub, spec(*kind), log.start(cursor.as_ref()));
-                        }
+                    if let Some(at) = topics.iter().position(|x| x.0 == sub)
+                        && let (Some(log), Some((_, kind, _))) = (logs.get(at), topics.get(at))
+                    {
+                        srv.start(sub, spec(*kind), log.start(cursor.as_ref()));
                     }
                 }
                 Event::Request { id, .. } => {

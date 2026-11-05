@@ -131,6 +131,7 @@ test("the liveness rule gives Rust's verdicts on the same traces", async () => {
       else if (op === "a") l.arrived(x);
       else if (op === "r") l.roundTrip(x);
       else if (op === "p") l.probeSent(x);
+      else if (op === "z") l.resumed(x);
       else got += l.verdict(x)[0];
     }
     assert.equal(got, tr.verdicts, `trace ${n}`);

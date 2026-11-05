@@ -61,10 +61,10 @@ impl Loop {
             let key = (o.topic.kind, o.topic.key.clone());
             let Some(spec) = spec(o.topic.kind) else { continue };
             let log = self.topics.entry(key.clone()).or_insert_with(|| TopicLog::new(spec, BORN));
-            if let Ok(p) = log.publish(o.delta) {
-                if let Some(sub) = self.subs.get(&key) {
-                    self.srv.push(*sub, &p);
-                }
+            if let Ok(p) = log.publish(o.delta)
+                && let Some(sub) = self.subs.get(&key)
+            {
+                self.srv.push(*sub, &p);
             }
         }
     }
