@@ -38,6 +38,10 @@ impl Gauge {
     pub fn add(&self, v: i64) {
         self.0.fetch_add(v, Ordering::Relaxed);
     }
+    /// Raises it to `v` when it's below: the most a figure has been.
+    pub fn raise(&self, v: i64) {
+        self.0.fetch_max(v, Ordering::Relaxed);
+    }
     pub fn get(&self) -> i64 {
         self.0.load(Ordering::Relaxed)
     }
@@ -672,6 +676,12 @@ impl NetMetrics {
             .collect()
     }
 
+    /// The frames dropped toward every runner, as they stand now: a copy swapped in whole at each drop,
+    /// so by its identity a read kept in memory knows they changed (`crate::reads::AgentsKey`).
+    pub fn toward_all(&self) -> std::sync::Arc<BTreeMap<u64, BTreeMap<(&'static str, &'static str), u64>>> {
+        self.toward.get()
+    }
+
     /// What this process dropped of what it had for `peer`, by lane and reason.
     pub fn toward(&self, peer: u64) -> Vec<crate::proto::NetDrop> {
         self.toward
@@ -825,11 +835,14 @@ pub struct BusGauges {
     pub viewers: Gauge,
     pub memory_bytes: Gauge,
     pub memory_limit_bytes: Gauge,
+    /// The most bytes one topic's retention has asked the bus to keep since the server started
+    /// (`crate::harness::live`'s feeds raise it as they publish; goal 11, plan 01a1a87b2e56 step 3).
+    pub topic_bytes_peak: Gauge,
 }
 
 pub fn bus_gauges() -> &'static BusGauges {
     static M: OnceLock<BusGauges> = OnceLock::new();
-    M.get_or_init(|| BusGauges { topics: Gauge::default(), viewers: Gauge::default(), memory_bytes: Gauge::default(), memory_limit_bytes: Gauge::default() })
+    M.get_or_init(|| BusGauges { topics: Gauge::default(), viewers: Gauge::default(), memory_bytes: Gauge::default(), memory_limit_bytes: Gauge::default(), topic_bytes_peak: Gauge::default() })
 }
 
 /// The `kiln_bus_*` families, in the exposition.
@@ -855,6 +868,8 @@ fn render_bus(o: &mut String) {
     let _ = writeln!(o, "kiln_bus_memory_bytes {}", g.memory_bytes.get());
     help(o, "kiln_bus_memory_limit_bytes", "gauge", "Bytes the bus's messages may take ([bus] memory).");
     let _ = writeln!(o, "kiln_bus_memory_limit_bytes {}", g.memory_limit_bytes.get());
+    help(o, "kiln_bus_topic_bytes_peak", "gauge", "The most bytes one topic has asked the bus to keep since the server started: a live feed's newest frames, as many as it keeps, their keys and payloads as [bus] topic_bytes counts them (past topic_bytes the bus keeps fewer).");
+    let _ = writeln!(o, "kiln_bus_topic_bytes_peak {}", g.topic_bytes_peak.get());
 }
 
 /// The `kiln_blobs_*` families, in the exposition.
@@ -970,6 +985,19 @@ mod tests {
         assert!(out.contains("x_seconds_count{repo=\"a\"} 2"), "{out}");
         assert!(out.contains("x_seconds_bucket{repo=\"b\\\"q\",le=\"60\"} 0"), "escaped, and over the top bucket but one: {out}");
         assert!(out.contains("x_seconds_bucket{repo=\"b\\\"q\",le=\"150\"} 1"), "{out}");
+    }
+
+    /// Goal 11, plan 01a1a87b2e56 step 3: the most one topic has asked the bus to keep is a gauge that a
+    /// larger figure raises and a smaller one leaves, on `/metrics` with the bus's families.
+    #[test]
+    fn g11_s3_the_bus_topic_bytes_peak_only_rises_and_renders() {
+        let peak = Gauge::default();
+        peak.raise(5_000);
+        peak.raise(300);
+        assert_eq!(peak.get(), 5_000);
+        let mut o = String::new();
+        render_bus(&mut o);
+        assert!(o.contains("# TYPE kiln_bus_topic_bytes_peak gauge\nkiln_bus_topic_bytes_peak "), "{o}");
     }
 
     /// CP-T3.2: the sends families render before anything was sent, as the sync families do.
@@ -1266,7 +1294,10 @@ pub fn render() -> String {
     let bus = bus_gauges();
     let bus = (u64::try_from(bus.memory_bytes.get()).unwrap_or(0), u64::try_from(bus.memory_limit_bytes.get()).ok().filter(|l| *l > 0));
     let segments = u64::try_from(crate::harness::copies::SEGMENT_BYTES.load(std::sync::atomic::Ordering::Relaxed)).unwrap_or(0);
-    crate::memory::render(&mut o, &[("bus", bus.0, bus.1), ("session_segments", segments, None)]);
+    // kiln-search's open indexes, every one in the process (goal 11, plan 01a1a87b2e56 step 3).
+    let search = kiln_search::memory();
+    let search = (u64::try_from(search.0).unwrap_or(u64::MAX), u64::try_from(search.1).ok().filter(|b| *b > 0));
+    crate::memory::render(&mut o, &[("bus", bus.0, bus.1), ("session_segments", segments, None), ("search_indexes", search.0, search.1)]);
 
     let samples = agent_samples().load();
     if !samples.is_empty() {

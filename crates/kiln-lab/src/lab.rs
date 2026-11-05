@@ -85,6 +85,15 @@ impl Profile {
         Self { dwell_s: 0, read_think_ms: 0, ..Self::realistic() }
     }
 
+    /// The overload profile with many more clients: 64 readers and 8 agents calling MCP, none thinking, so a server
+    /// of one shard has more work than that shard can run, whatever its pools do (goal 6, plan 01a1a59c2abe step 4:
+    /// under the overload profile, fedora 2026-11-05, the one shard was 34% busy while the pools' threads took the
+    /// server's CPUs, so no queue of its own stood and a calm-learned limit had nothing to shed). Its readers' event
+    /// catch-ups are Background, its other reads and the MCP calls Normal, its pages and `/api/me` Critical.
+    pub fn flood() -> Self {
+        Self { readers: 64, mcp: 8, mcp_think_ms: 0, ..Self::overload() }
+    }
+
     /// The realistic profile at production's whole shape rather than its busy hour's share: its ten
     /// runners and all 134 of its live feeds (2 of 20,000 events, 6 of 4,000, the rest of 400), every
     /// one at work, at the same pace. What many sessions changing at once cost a server that kept them
@@ -126,6 +135,9 @@ pub struct Build {
     pub label: String,
     pub kiln: PathBuf,
     pub env: Vec<(String, String)>,
+    /// Its server's `[bus] memory` in bytes, when the run sets it (`--bus-memory`).
+    #[serde(default)]
+    pub bus_memory: Option<u64>,
 }
 
 /// The machine around a round.
@@ -768,7 +780,7 @@ impl Hook {
 /// One round of `build` with `hogs`, in `dir` (left for the next round's: the caller removes it).
 pub fn round(build: &Build, p: &Profile, hogs: usize, place: &Place, dir: &Path, bin: &Path, index: usize) -> anyhow::Result<Round> {
     std::fs::create_dir_all(dir)?;
-    let mut fleet = Fleet::server(&build.kiln, dir, &build.env, place, &format!("kiln-lab-server-{}-{index}", std::process::id()))?;
+    let mut fleet = Fleet::server(&build.kiln, dir, &build.env, build.bus_memory, place, &format!("kiln-lab-server-{}-{index}", std::process::id()))?;
     let names: Vec<String> = (0..p.runners.max(1)).map(|r| format!("lab-runner-{r}")).collect();
     for n in &names {
         fleet.runner(&build.kiln, n, bin)?;
@@ -1141,6 +1153,15 @@ pub fn better(name: &str) -> crate::stats::Better {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Goal 6, plan 01a1a59c2abe step 4: the flood profile is the overload one with many more clients, none thinking.
+    #[test]
+    fn g6_s4_flood_is_overload_with_many_more_clients() {
+        let (flood, overload) = (Profile::flood(), Profile::overload());
+        assert!(flood.readers >= 16 * overload.readers && flood.mcp > overload.mcp, "{flood:?}");
+        assert_eq!((flood.read_think_ms, flood.mcp_think_ms, flood.dwell_s), (0, 0, 0));
+        assert_eq!((flood.sessions.len(), flood.viewers, flood.window_s), (overload.sessions.len(), overload.viewers, overload.window_s));
+    }
 
     #[test]
     fn an_affinity_list_names_its_cpus() {

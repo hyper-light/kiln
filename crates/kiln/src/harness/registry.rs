@@ -12,6 +12,8 @@ use parking_lot::Mutex;
 use serde::Deserialize as _;
 use serde_json::{Value, json};
 
+use crate::rcu::Rcu;
+
 use super::copies::{Copies, Ingest, Mirror, Msg, Shard};
 use super::core::{MAX_EVENTS, Update};
 use super::files;
@@ -110,6 +112,20 @@ impl Head {
         let file = (v.get("path").is_some() || v.get("tree").is_some()).then(|| Box::new((s("path").map(Box::from), s("tree").map(Box::from))));
         Self { id: s("id").map(Box::from), seq: v.get("seq").and_then(Value::as_u64), kind, main: v.get("parent").is_none_or(Value::is_null), file }
     }
+
+    /// [`Head::of`] an event's JSON, read from the event itself: its kind is its body's tag (`super::model::Body`
+    /// is tagged `kind`, in snake case), and an event's JSON has no changeset file's path or tree of its own.
+    fn of_event(e: &super::model::Event) -> Self {
+        use super::model::Body as B;
+        let kind = match &e.body {
+            B::User { .. } => "user",
+            B::Assistant { .. } => "assistant",
+            B::Thinking { .. } => "thinking",
+            B::Tool(_) => "tool",
+            B::Notice { .. } => "notice",
+        };
+        Self { id: Some(e.id.as_str().into()), seq: Some(e.seq), kind: Some(std::borrow::Cow::Borrowed(kind)), main: e.parent.is_none(), file: None }
+    }
 }
 
 impl Entry {
@@ -131,6 +147,27 @@ impl Entry {
     pub(super) fn written(value: Value, text: String) -> Self {
         crate::memory::SESSION_ENTRIES.add(text.len());
         Self { head: Head::of(&value), body: Body::Text(text.into_boxed_str()), sum: std::sync::OnceLock::new() }
+    }
+
+    /// Event `e` as a copy keeps it, written out once, straight from the event (goal 9, plan 01a1a87b2cec
+    /// step 5: its owner wrote each event into a JSON tree, then the tree out, then the event again for the
+    /// store's row). It's the text the tree wrote, as a runner's digests of it take it (`crate::agent`):
+    /// serde_json's maps keep their keys in the order they come (its `preserve_order`, which kiln's build
+    /// has). What's looked up of it is read from the event ([`Head::of_event`]); its text goes to `keep`
+    /// as well (the conversation store's row), when anyone keeps it. One that can't be written out is
+    /// `null`, as before.
+    pub(super) fn of_event(e: &super::model::Event, keep: Option<&mut dyn FnMut(String)>) -> Self {
+        let Ok(text) = serde_json::to_string(e) else { return Self::written(Value::Null, "null".to_owned()) };
+        crate::memory::SESSION_ENTRIES.add(text.len());
+        let body: Box<str> = match keep {
+            Some(keep) => {
+                let body = Box::from(text.as_str());
+                keep(text);
+                body
+            }
+            None => text.into_boxed_str(),
+        };
+        Self { head: Head::of_event(e), body: Body::Text(body), sum: std::sync::OnceLock::new() }
     }
 
     /// The bytes it holds as text, as `crate::memory::SESSION_ENTRIES` counts them.
@@ -895,6 +932,7 @@ fn changes_patch(was: &Value, now: &Value) -> Option<String> {
 }
 
 /// A file uploaded for a message, kept briefly until the message is sent.
+#[derive(Clone)]
 struct Upload {
     name: String,
     mime: String,
@@ -936,9 +974,12 @@ pub struct Registry {
     sessions: Copies,
     /// The bus each session's live feed rides (`super::live`).
     bus: Arc<dyn kiln_seams::Bus>,
-    uploads: Mutex<HashMap<String, Upload>>,
+    /// Files uploaded for messages, by id. This and the registry's other maps but three are copies
+    /// read without a lock and changed by swapping a new copy in whole (`crate::rcu`; goal 5, plan
+    /// 01a1a59c2aae step 2): a session's updates, on the shard that owns its copy, read them.
+    uploads: Rcu<HashMap<String, Upload>>,
     /// What each machine offers ("local" included).
-    kinds: Mutex<HashMap<String, Vec<KindInfo>>>,
+    kinds: Rcu<HashMap<String, Vec<KindInfo>>>,
     /// The server's own sessions.
     pub local: Arc<Host>,
     /// The server's conversation store (docs/conversations.md), when it's on.
@@ -948,35 +989,36 @@ pub struct Registry {
     feed_out: Option<async_channel::Receiver<crate::convo::feed::Out>>,
     /// The runners that keep a copy of it (`crate::convo::mirror`), and what to send them.
     pub copies: Option<Arc<crate::convo::mirror::Mirrors>>,
-    copies_out: Option<async_channel::Receiver<(hyper_transport::PeerId, String, Vec<u8>)>>,
+    copies_out: Option<crate::memory::queue::Receiver<crate::convo::mirror::Out>>,
     /// Every store, as the server sees it: the System page's (`super::stores`).
     pub board: crate::convo::board::Board,
     /// What agents' pages read of the store, kept in memory while it holds (`crate::reads::Views`:
     /// the plans' list, the goal stacks; goal 10, plan 01a1a87b2dae step 2).
     pub views: crate::reads::Views,
-    local_rx: async_channel::Receiver<(String, Update)>,
+    local_rx: crate::memory::queue::Receiver<(String, Update)>,
     /// Where `kiln spawn` in the server's own terminals reaches `local`.
-    local_sock: Mutex<Option<String>>,
+    local_sock: Rcu<Option<String>>,
     /// The shell pid of each of the server's own terminals (their directory and environment are
     /// where agents started "in this shell" begin).
-    local_shells: Mutex<HashMap<String, u32>>,
+    local_shells: Rcu<HashMap<String, u32>>,
     dir: std::path::PathBuf,
     /// The server machine's transcripts, for its past sessions (made on first use).
     scanner: Arc<Mutex<Option<crate::aisessions::Scanner>>>,
     /// Names people gave sessions, by id (the "rename" control), kept in `names.json`: a session
     /// takes its name here at once, whatever its machine's runner knows of names (one from before
-    /// kiln named sessions never reports it), and keeps it across restarts.
-    names: Mutex<HashMap<String, String>>,
+    /// kiln named sessions never reports it), and keeps it across restarts. Read on every state a
+    /// session's machine sends.
+    names: Rcu<HashMap<String, String>>,
     /// Sessions kiln doesn't keep going when they stop part-way (`goals::keep`; the "keep_going"
     /// control), kept in `keep-off.json` so it holds across restarts.
-    keep_off: Mutex<std::collections::HashSet<String>>,
+    keep_off: Rcu<std::collections::HashSet<String>>,
     /// The UI's commands by the ids their clients made, each taken once (`super::asked`).
     pub asked: super::asked::Asked,
     /// Which of its machine's runner processes holds each session on a machine (its instance:
     /// `main`, a uuid, `legacy`), kept in `holders.json` so it holds across restarts: a process
     /// that says what it holds speaks for its own sessions, never for another's that is away
     /// ([`Registry::inventory`]). Shared with the writes of it, which go on the blocking pool.
-    holders: Arc<Mutex<HashMap<String, String>>>,
+    holders: Arc<Rcu<HashMap<String, String>>>,
     /// A write of `holders.json` is on its way (it writes what's newest as it goes); and the one
     /// writing it now (they share the file, and the one it's written beside first).
     holders_saving: Arc<std::sync::atomic::AtomicBool>,
@@ -984,19 +1026,19 @@ pub struct Registry {
     /// Each session's changeset to keep in the conversation store, the newest alone (shared with
     /// its copy, nothing written out yet), and whether its writer is at work
     /// ([`Registry::store_changes`]).
-    changes_to_store: Arc<Mutex<HashMap<String, Files>>>,
+    changes_to_store: Arc<Rcu<HashMap<String, Files>>>,
     changes_storing: Arc<std::sync::atomic::AtomicBool>,
     /// Each session's latest epoch (`State::epoch`) seen, those that went on on another machine at
     /// least once, kept in `epochs.json`: a machine that announces an older copy lets go of it.
-    epochs: Mutex<HashMap<String, u64>>,
+    epochs: Rcu<HashMap<String, u64>>,
     /// The plan each session last proposed (plan mode), not yet kept as one of kiln's plans: the
     /// goals' driver keeps it ([`Self::take_proposed`], `crate::plans::keep_proposed`).
-    proposed: Mutex<HashMap<String, String>>,
+    proposed: Rcu<HashMap<String, String>>,
     /// Restoring the conversation store from a mirror's copy of it.
-    restore: Mutex<Restore>,
+    restore: Rcu<Restore>,
     /// The mirrors to ask for their copy as they connect: the store was found empty at start
     /// while the server had mirrors (it was lost, the rest wasn't).
-    restore_auto: Mutex<Vec<String>>,
+    restore_auto: Rcu<Vec<String>>,
     /// Files finished messages mention, kept so they still show after they go (`super::kept`).
     pub keeper: Keeper,
     /// Pages agents show in their conversations (`super::visuals`).
@@ -1012,7 +1054,7 @@ pub struct Registry {
     /// Messages waiting for their session's inbox to answer (CP-T3.2), by session and message id.
     waiting: Mutex<HashMap<(String, String), Vec<futures::channel::oneshot::Sender<Said>>>>,
     /// The ids starts under way asked for ([`Registry::open_as`]), each until its start is done.
-    opening: Mutex<std::collections::HashSet<String>>,
+    opening: Rcu<std::collections::HashSet<String>>,
     /// Tests: what every session started here runs instead of its harness (a program that isn't
     /// there, so no harness ever starts, whatever this machine has installed).
     #[cfg(test)]
@@ -1080,7 +1122,7 @@ impl std::error::Error for IdTaken {}
 
 /// The ids a start holds while it's under way ([`Registry::claim`]), let go of as it ends.
 struct Claim<'a> {
-    held: &'a Mutex<std::collections::HashSet<String>>,
+    held: &'a Rcu<std::collections::HashSet<String>>,
     ids: Vec<String>,
 }
 
@@ -1089,10 +1131,11 @@ impl Drop for Claim<'_> {
         if self.ids.is_empty() {
             return;
         }
-        let mut held = self.held.lock();
-        for id in &self.ids {
-            held.remove(id);
-        }
+        self.held.update(|held| {
+            for id in &self.ids {
+                held.remove(id);
+            }
+        });
     }
 }
 
@@ -1106,7 +1149,11 @@ impl Registry {
     /// The registry, its store in `dir`, its mirrors as `conversations` says, the server's own
     /// sessions' host on `clock` (the hub's), its sessions' live feeds on `bus`.
     pub fn with(dir: std::path::PathBuf, conversations: &crate::config::Conversations, clock: Arc<dyn kiln_seams::Clock>, bus: Arc<dyn kiln_seams::Bus>) -> Self {
-        let (tx, rx) = async_channel::bounded(8192);
+        // The server's own sessions' updates, waiting for the loop that hands them to their owners
+        // (`run_local`): as many bytes as an owner's inbox holds (`crate::net::EVENTS_BYTES`), where they go
+        // next; past it a session waits to send (goal 11, plan 01a1a87b2e56 step 3). Its 8,192 places, made
+        // up front, took 1.05 MB of an idle server's heap (research 01a1a87b2e57, f10).
+        let (tx, rx) = crate::memory::queue::bounded::<(String, Update)>(&crate::memory::owners::LOCAL_UPDATES, crate::net::EVENTS_BYTES);
         // Every session's conversation, on every machine, kept on disk as it comes in
         // (docs/conversations.md): the server's own sessions' too, as they pass through `ingest`.
         let convo = if conversations.off { None } else { crate::convo::open(&dir, conversations.upkeep()) };
@@ -1149,8 +1196,8 @@ impl Registry {
         Self {
             sessions: Copies::start(Arc::clone(&bus)),
             bus,
-            uploads: Mutex::new(HashMap::new()),
-            kinds: Mutex::new(HashMap::new()),
+            uploads: Rcu::default(),
+            kinds: Rcu::default(),
             local,
             convo,
             feed,
@@ -1160,22 +1207,22 @@ impl Registry {
             board: crate::convo::board::Board::default(),
             views: crate::reads::Views::default(),
             local_rx: rx,
-            local_sock: Mutex::new(None),
-            local_shells: Mutex::new(HashMap::new()),
-            names: Mutex::new(std::fs::read(dir.join("names.json")).ok().and_then(|b| serde_json::from_slice(&b).ok()).unwrap_or_default()),
-            keep_off: Mutex::new(std::fs::read(dir.join("keep-off.json")).ok().and_then(|b| serde_json::from_slice(&b).ok()).unwrap_or_default()),
+            local_sock: Rcu::default(),
+            local_shells: Rcu::default(),
+            names: Rcu::new(std::fs::read(dir.join("names.json")).ok().and_then(|b| serde_json::from_slice(&b).ok()).unwrap_or_default()),
+            keep_off: Rcu::new(std::fs::read(dir.join("keep-off.json")).ok().and_then(|b| serde_json::from_slice(&b).ok()).unwrap_or_default()),
             asked: super::asked::Asked::default(),
-            holders: Arc::new(Mutex::new(std::fs::read(dir.join("holders.json")).ok().and_then(|b| serde_json::from_slice(&b).ok()).unwrap_or_default())),
+            holders: Arc::new(Rcu::new(std::fs::read(dir.join("holders.json")).ok().and_then(|b| serde_json::from_slice(&b).ok()).unwrap_or_default())),
             holders_saving: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             holders_writing: Arc::new(Mutex::new(())),
-            changes_to_store: Arc::new(Mutex::new(HashMap::new())),
+            changes_to_store: Arc::default(),
             changes_storing: Arc::new(std::sync::atomic::AtomicBool::new(false)),
-            epochs: Mutex::new(std::fs::read(dir.join("epochs.json")).ok().and_then(|b| serde_json::from_slice(&b).ok()).unwrap_or_default()),
-            proposed: Mutex::new(HashMap::new()),
+            epochs: Rcu::new(std::fs::read(dir.join("epochs.json")).ok().and_then(|b| serde_json::from_slice(&b).ok()).unwrap_or_default()),
+            proposed: Rcu::default(),
             dir,
             scanner: Arc::new(Mutex::new(None)),
-            restore: Mutex::new(Restore::Idle),
-            restore_auto: Mutex::new(restore_auto),
+            restore: Rcu::new(Restore::Idle),
+            restore_auto: Rcu::new(restore_auto),
             keeper,
             visuals,
             streams: super::streams::Relay::default(),
@@ -1183,7 +1230,7 @@ impl Registry {
             ports: super::opened::Tunnels::default(),
             opened: super::opened::Openings::default(),
             waiting: Mutex::new(HashMap::new()),
-            opening: Mutex::new(std::collections::HashSet::new()),
+            opening: Rcu::default(),
             #[cfg(test)]
             test_program: Mutex::new(None),
         }
@@ -1228,13 +1275,20 @@ impl Registry {
 
     /// Where restoring the conversation store from a mirror's copy stands.
     pub fn restore_view(&self) -> Restore {
-        let mut r = self.restore.lock();
-        if let Restore::Asked { from, at } = &*r
-            && crate::util::now_ms() - at > RESTORE_ANSWER_MS
-        {
-            *r = Restore::Failed { from: from.clone(), error: "no answer: its kiln may be too old to send its copy back".into(), at: crate::util::now_ms() };
+        // Read off its copy; one swapped in only as an ask goes unanswered too long.
+        let now = crate::util::now_ms();
+        let unanswered = |r: &Restore| match r {
+            Restore::Asked { from, at } if now - at > RESTORE_ANSWER_MS => Some(Restore::Failed { from: from.clone(), error: "no answer: its kiln may be too old to send its copy back".into(), at: now }),
+            _ => None,
+        };
+        if unanswered(&self.restore.load()).is_some() {
+            self.restore.update(|r| {
+                if let Some(failed) = unanswered(r) {
+                    *r = failed;
+                }
+            });
         }
-        r.clone()
+        Restore::clone(&self.restore.load())
     }
 
     /// Ask `machine`, a mirror, for its copy of the conversation store, to restore this one from:
@@ -1246,8 +1300,8 @@ impl Registry {
         if matches!(self.restore_view(), Restore::Asked { .. } | Restore::Copying { .. }) {
             anyhow::bail!("a restore is already under way");
         }
-        *self.restore.lock() = Restore::Asked { from: machine.to_owned(), at: crate::util::now_ms() };
-        self.restore_auto.lock().clear();
+        self.restore.set(Restore::Asked { from: machine.to_owned(), at: crate::util::now_ms() });
+        self.restore_auto.set(Vec::new());
         tracing::info!(%machine, "asked a mirror for its copy of the conversation store, to restore this one from");
         let json = crate::convo::feed::encode(&crate::convo::feed::Msg::Restore { store: st.id().to_owned() });
         let h = Arc::clone(hub);
@@ -1261,25 +1315,28 @@ impl Registry {
 
     /// Mirror `machine` begins sending back its copy `store`: whether it was asked for.
     pub fn restore_accepts(&self, machine: &str, store: &str) -> bool {
-        let mut r = self.restore.lock();
-        match &*r {
-            Restore::Asked { from, .. } if from == machine => {
-                *r = Restore::Copying { from: machine.to_owned(), store: store.to_owned(), at: crate::util::now_ms() };
-                true
+        let at = crate::util::now_ms();
+        self.restore.update(|r| {
+            let begins = match &*r {
+                Restore::Asked { from, .. } => from == machine,
+                // Said again (it asks again after a silence).
+                Restore::Copying { from, store: s, .. } => return from == machine && s == store,
+                _ => false,
+            };
+            if begins {
+                *r = Restore::Copying { from: machine.to_owned(), store: store.to_owned(), at };
             }
-            // Said again (it asks again after a silence).
-            Restore::Copying { from, store: s, .. } => from == machine && s == store,
-            _ => false,
-        }
+            begins
+        })
     }
 
     /// Mirror `machine` has sent back its copy `store` whole (an empty `store`: it has none):
     /// the sessions it brought back are listed, away, on the machines they ran on.
     pub fn restore_done(&self, hub: &Arc<Hub>, machine: &str, store: &str) {
-        let state = self.restore.lock().clone();
+        let state = Restore::clone(&self.restore.load());
         match state {
             Restore::Asked { from, .. } if from == machine && store.is_empty() => {
-                *self.restore.lock() = Restore::Failed { from, error: format!("{} keeps no copy of the conversation store", hub.shown(machine)), at: crate::util::now_ms() };
+                self.restore.set(Restore::Failed { from, error: format!("{} keeps no copy of the conversation store", hub.shown(machine)), at: crate::util::now_ms() });
             }
             Restore::Copying { from, store: s, .. } if from == machine && s == store => {
                 let (h, st) = (Arc::clone(hub), self.convo.clone());
@@ -1293,9 +1350,9 @@ impl Registry {
                         Ok(sessions) => {
                             tracing::info!(machine = %from, sessions, "the conversation store was restored from a mirror's copy");
                             Self::list_away(&h).await;
-                            *h.harness.restore.lock() = Restore::Done { from, sessions, at };
+                            h.harness.restore.set(Restore::Done { from, sessions, at });
                         }
-                        Err(e) => *h.harness.restore.lock() = Restore::Failed { from, error: format!("{e:#}"), at },
+                        Err(e) => h.harness.restore.set(Restore::Failed { from, error: format!("{e:#}"), at }),
                     }
                 });
             }
@@ -1306,7 +1363,7 @@ impl Registry {
     /// Runner `machine` keeping a store connected: asked for its copy when the store was found
     /// empty at start and it is one of the server's mirrors.
     pub fn restore_due(&self, hub: &Arc<Hub>, machine: &str) {
-        let due = self.restore_auto.lock().iter().any(|m| m == machine);
+        let due = self.restore_auto.load().iter().any(|m| m == machine);
         if due
             && matches!(self.restore_view(), Restore::Idle)
             && let Err(e) = self.restore_from(hub, machine)
@@ -1316,8 +1373,8 @@ impl Registry {
     }
 
     fn save_names(&self) {
-        let names = self.names.lock().clone();
-        if let Err(e) = self.keep_json("names.json", &names) {
+        let names = self.names.get();
+        if let Err(e) = self.keep_json("names.json", &*names) {
             tracing::warn!(error = %format!("{e:#}"), "couldn't keep the agents' names");
         }
     }
@@ -1333,15 +1390,14 @@ impl Registry {
     /// Whether kiln keeps a session going when it stops part-way (the "keep_going" control, from
     /// any device): kept here, so it holds across restarts whatever its machine's runner knows.
     async fn set_keep_going(&self, hub: &Hub, id: &str, on: bool) {
-        let off: Vec<String> = {
-            let mut g = self.keep_off.lock();
+        let off: Vec<String> = self.keep_off.update(|g| {
             if on {
                 g.remove(id);
             } else {
                 g.insert(id.to_owned());
             }
             g.iter().cloned().collect()
-        };
+        });
         if let Err(e) = self.keep_json("keep-off.json", &off) {
             tracing::warn!(error = %format!("{e:#}"), "couldn't keep which agents kiln doesn't keep going");
         }
@@ -1363,7 +1419,11 @@ impl Registry {
 
     /// The plans sessions proposed (plan mode) since the last look, by session, each its latest.
     pub fn take_proposed(&self) -> Vec<(String, String)> {
-        std::mem::take(&mut *self.proposed.lock()).into_iter().collect()
+        // Every tick of the goals' driver: a copy swapped in only when there's one to take.
+        if self.proposed.load().is_empty() {
+            return Vec::new();
+        }
+        self.proposed.update(std::mem::take).into_iter().collect()
     }
 
     /// What each agent's goals wait on a person for (`goals::held_stacks`, every tick of the goals'
@@ -1418,14 +1478,13 @@ impl Registry {
     /// harness's name back): its page and every list show it at once.
     async fn rename(&self, hub: &Hub, id: &str, value: Option<&Value>) {
         let name: String = value.and_then(Value::as_str).unwrap_or("").trim().chars().take(MAX_NAME).collect();
-        {
-            let mut g = self.names.lock();
+        self.names.update(|g| {
             if name.is_empty() {
                 g.remove(id);
             } else {
                 g.insert(id.to_owned(), name.clone());
             }
-        }
+        });
         self.save_names();
         let sid = id.to_owned();
         let info = self
@@ -1453,22 +1512,23 @@ impl Registry {
     /// Environment for one of the server's own terminals, so `kiln spawn` there works.
     pub fn terminal_env(&self, terminal: &str) -> Vec<(&'static str, String)> {
         let mut env = vec![("KILN_TERM_SESSION", terminal.to_owned())];
-        if let Some(sock) = self.local_sock.lock().clone() {
-            env.push(("KILN_HARNESS_SOCK", sock));
+        if let Some(sock) = self.local_sock.load().as_deref() {
+            env.push(("KILN_HARNESS_SOCK", sock.to_owned()));
         }
         env
     }
 
     /// One of the server's own terminals started (its shell runs as `pid`).
     pub fn note_shell(&self, terminal: &str, pid: Option<u32>) {
-        let mut g = self.local_shells.lock();
-        if let Some(pid) = pid {
-            g.insert(terminal.to_owned(), pid);
-        }
-        // Forget shells that are gone.
-        if g.len() > 256 {
-            g.retain(|_, p| crate::os::pid_alive(*p));
-        }
+        self.local_shells.update(|g| {
+            if let Some(pid) = pid {
+                g.insert(terminal.to_owned(), pid);
+            }
+            // Forget shells that are gone.
+            if g.len() > 256 {
+                g.retain(|_, p| crate::os::pid_alive(*p));
+            }
+        });
     }
 
     /// The server's own sessions' updates, into the mirrors (supervised; restartable).
@@ -1579,7 +1639,7 @@ impl Registry {
         Self::list_away(&hub).await;
         let rx = hub.harness.local_rx.clone();
         let offered = crate::rt::blocking(super::kinds::offered).await.unwrap_or_default();
-        hub.harness.kinds.lock().insert("local".to_owned(), offered);
+        hub.harness.kinds.update(|k| k.insert("local".to_owned(), offered.clone()));
         if !RESTORED.swap(true, std::sync::atomic::Ordering::AcqRel) {
             // Files finished messages mention, kept as they come.
             crate::rt::spawn(Keeper::run(hub.clone()));
@@ -1623,7 +1683,7 @@ impl Registry {
             // agents wait`) is answered here.
             let forward = Some(crate::harness::ops::forward(Arc::clone(&hub)));
             match super::socket::serve_with(&hub.harness.local, super::socket::path("server", &hub.harness.dir), forward, false) {
-                Ok(p) => *hub.harness.local_sock.lock() = Some(p.to_string_lossy().into_owned()),
+                Ok(p) => hub.harness.local_sock.set(Some(p.to_string_lossy().into_owned())),
                 Err(e) => tracing::info!(error = %format!("{e:#}"), "`kiln spawn` will not be available in the server's own terminals"),
             }
         }
@@ -1696,7 +1756,7 @@ impl Registry {
     pub fn kinds(&self) -> HashMap<String, Vec<KindInfo>> {
         #[cfg(not(test))]
         super::acp::warm_models();
-        let mut all = self.kinds.lock().clone();
+        let mut all: HashMap<String, Vec<KindInfo>> = HashMap::clone(&self.kinds.load());
         // The server's own harnesses: the models its sessions listed since it started.
         for k in all.get_mut("local").into_iter().flatten() {
             let m = super::kinds::models_of(&k.id);
@@ -1715,12 +1775,12 @@ impl Registry {
         if self.test_program.lock().is_some() {
             return false;
         }
-        self.kinds.lock().get(target).is_some_and(|ks| !ks.iter().any(|k| k.id == kind && k.available))
+        self.kinds.load().get(target).is_some_and(|ks| !ks.iter().any(|k| k.id == kind && k.available))
     }
 
     #[cfg(test)]
     pub fn set_kinds(&self, target: &str, kinds: Vec<KindInfo>) {
-        self.kinds.lock().insert(target.to_owned(), kinds);
+        self.kinds.update(|k| k.insert(target.to_owned(), kinds.clone()));
     }
 
     /// A session's meta as last reported (its harness's catalog: slash commands, models, modes).
@@ -1786,7 +1846,7 @@ impl Registry {
     /// A copy of session `id` at `epoch` is from before it went on elsewhere: its machine lets go
     /// of it.
     pub fn stale(&self, id: &str, epoch: u64) -> bool {
-        self.epochs.lock().get(id).is_some_and(|e| *e > epoch)
+        self.epochs.load().get(id).is_some_and(|e| *e > epoch)
     }
 
     /// The sessions runner `machine` reports holding (`inv`) whose copy there is one left behind:
@@ -1799,16 +1859,21 @@ impl Registry {
 
     /// Session `id` is at `epoch` now (epochs only rise), kept when it changes.
     pub(crate) fn raise_epoch(&self, id: &str, epoch: u64) {
-        let snapshot = {
-            let mut g = self.epochs.lock();
+        // Read off the epochs' copy; a new one swapped in only when this one rises.
+        if self.epochs.load().get(id).is_some_and(|e| *e >= epoch) {
+            return;
+        }
+        let raised = self.epochs.update(|g| {
             let e = g.entry(id.to_owned()).or_insert(0);
-            if *e >= epoch {
-                return;
-            }
-            *e = epoch;
-            g.clone()
-        };
-        if let Err(e) = self.keep_json("epochs.json", &snapshot) {
+            let raised = *e < epoch;
+            *e = (*e).max(epoch);
+            raised
+        });
+        if !raised {
+            return;
+        }
+        let snapshot = self.epochs.get();
+        if let Err(e) = self.keep_json("epochs.json", &*snapshot) {
             tracing::warn!(error = %format!("{e:#}"), "couldn't keep the agents' epochs");
         }
     }
@@ -1819,11 +1884,40 @@ impl Registry {
     /// machine keeps it in a store it sends the server's (`crate::convo::feed`), which keeps it from
     /// that, not from here. Goal 4, plan 01a1a59c2a9c step 2.
     pub async fn ingest_from(&self, hub: &Hub, from: &Location, id: &str, u: Update, shipped: bool) {
+        let Some(ingest) = self.prepare(hub, from, id, u, shipped) else { return };
+        if !self.sessions.send(id, Msg::Update(Box::new(ingest))).await {
+            tracing::debug!(session = id, "an agent session's update came as the server's copies went");
+        }
+    }
+
+    /// An update from a session's runner, handed to the shard that owns its copy to judge and take
+    /// there (`crate::hub::Hub::runner_update`; goal 10, plan 01a1a87b2dae step 4): back once that
+    /// owner's inbox has it, waiting only while it's full, as [`Registry::ingest_from`] does.
+    pub async fn from_runner(&self, r: super::copies::RunnerUpdate) {
+        let id = r.session.clone();
+        if !self.sessions.send(&id, Msg::Runner(Box::new(r))).await {
+            tracing::debug!(session = %id, "an agent session's update came as the server's copies went");
+        }
+    }
+
+    /// An update of session `id` from `from`, taken by the shard that owns its copy, `s` (goal 10, plan
+    /// 01a1a87b2dae step 4: a runner's update is judged and taken there, not on the hub's loop): what's
+    /// left of it when the owner's turn ran out (`over`, [`Registry::apply`]; goal 9), to take first next.
+    #[allow(clippy::too_many_arguments)]
+    pub fn take_from(&self, s: &mut Shard, hub: &Arc<Hub>, from: &Location, id: &str, u: Update, shipped: bool, over: &dyn Fn() -> bool) -> Option<Ingest> {
+        let ingest = self.prepare(hub, from, id, u, shipped)?;
+        self.apply(s, hub, ingest, over)
+    }
+
+    /// An update of session `id` from `from` as its copy takes it ([`Registry::apply`]): an inbox's
+    /// answer is told whoever waits for it, and leaves nothing to take; an Open takes where it runs
+    /// and the name given here, and raises its epoch.
+    fn prepare(&self, hub: &Hub, from: &Location, id: &str, u: Update, shipped: bool) -> Option<Ingest> {
         // What became of a message: for whoever waits for it, wherever it was taken or refused.
         let u = match u {
             Update::Inbox { said } => {
                 self.answered(id, *said);
-                return;
+                return None;
             }
             other => other,
         };
@@ -1835,10 +1929,10 @@ impl Registry {
             Update::Open { mut info, since } => {
                 info.target = from.target();
                 own_name(&info.name, &info.kind_name).unwrap_or_default().clone_into(&mut reported);
-                if let Some(n) = self.names.lock().get(id) {
+                if let Some(n) = self.names.load().get(id) {
                     info.name.clone_from(n);
                 }
-                info.keep_off = self.keep_off.lock().contains(id);
+                info.keep_off = self.keep_off.load().contains(id);
                 Update::Open { info, since }
             }
             other => other,
@@ -1857,41 +1951,40 @@ impl Registry {
             }
             self.raise_epoch(id, info.epoch);
         }
-        let ingest = Ingest { from: from.clone(), id: id.to_owned(), u, shipped, reported };
-        if !self.sessions.send(id, Msg::Update(Box::new(ingest))).await {
-            tracing::debug!(session = id, "an agent session's update came as the server's copies went");
-        }
+        Some(Ingest { from: from.clone(), id: id.to_owned(), u, shipped, reported })
     }
 
     /// An update of a session from the machine it runs on, as the shard that owns the session's copy
     /// takes it (`super::copies`): the copy changes and its view goes out, its viewers are sent what
     /// changed, then what the change tells the rest of kiln happens. Goal 4, plan 01a1a59c2a9c
     /// step 2: only this shard writes the copy.
-    pub(super) fn apply(&self, s: &mut Shard, hub: &Arc<Hub>, i: Ingest) {
-        let Ingest { from, id, u, shipped, reported } = i;
+    ///
+    /// An update's events are taken while its owner's turn lasts (`over`: its step quantum spent), one at
+    /// the least, and the copy goes out with those: the rest come back, for the owner to take first at
+    /// its next turn, before anything newer (goal 9, plan 01a1a87b2cec step 3: a runner's whole history
+    /// in one update held its owner's shard up to 83 ms).
+    pub(super) fn apply(&self, s: &mut Shard, hub: &Arc<Hub>, i: Ingest, over: &dyn Fn() -> bool) -> Option<Ingest> {
+        let Ingest { from, id, mut u, shipped, reported } = i;
         let id = id.as_str();
         // Only the machine a session runs on speaks for it: a copy left behind where it went on
         // from says nothing more of it.
         if !matches!(u, Update::Open { .. }) && s.get(id).is_some_and(|m| *m.location != from) {
-            return;
+            return None;
         }
-        // A changeset's patch is stored as the whole changeset it makes, once taken in (below).
-        if let Some(store) = self.convo.as_ref().filter(|_| !shipped && !matches!(u, Update::ChangesPatch { .. })) {
+        // A changeset's patch is stored as the whole changeset it makes, once taken in (below); an
+        // update's events as they're taken, each written out once for the copy and its row (below).
+        let store = self.convo.as_ref().filter(|_| !shipped);
+        if let Some(store) = store.filter(|_| !matches!(u, Update::ChangesPatch { .. } | Update::Events { .. })) {
             store.send(id, &u);
         }
         // What the copy takes: each event's JSON and its text, written out once for the copy, its
-        // live frame, its digest and every snapshot after; a state's and a meta's JSON.
-        let entries: Vec<Arc<Entry>> = match &u {
-            Update::Events { events } => events
-                .iter()
-                .map(|e| {
-                    let v = serde_json::to_value(e).unwrap_or(Value::Null);
-                    let text = serde_json::to_string(&v).unwrap_or_default();
-                    Arc::new(Entry::written(v, text))
-                })
-                .collect(),
-            _ => Vec::new(),
-        };
+        // live frame, its digest and every snapshot after (`Entry::of_event`, as they're taken, below);
+        // a state's and a meta's JSON.
+        let mut entries: Vec<Arc<Entry>> = Vec::new();
+        // The events' rows for the conversation store, of the same texts.
+        let mut rows: Vec<crate::convo::rows::Row> = Vec::new();
+        // How many of an update's events its turn took.
+        let mut taken = 0;
         let mut made: Option<Value> = match &u {
             Update::State { state } => Some(serde_json::to_value(state).unwrap_or(Value::Null)),
             Update::Meta { meta } => Some(serde_json::to_value(meta).unwrap_or(Value::Null)),
@@ -1964,13 +2057,17 @@ impl Registry {
             changed = Some(info);
         }
         let Some(m) = s.get_mut(id) else {
+            // Its events are stored all the same, as they were before a copy took them.
+            if let Some(store) = store.filter(|_| matches!(u, Update::Events { .. })) {
+                store.send(id, &u);
+            }
             // A session this server does not know yet (it restarted): ask for all of it.
             if let Location::Machine(machine) = &from
                 && !matches!(u, Update::Closed)
             {
                 self.request_snapshot(hub, machine, id);
             }
-            return;
+            return None;
         };
         m.rev = m.rev.saturating_add(1);
         match &u {
@@ -2004,12 +2101,13 @@ impl Registry {
                 let info = Arc::make_mut(&mut m.info);
                 info.apply(state);
                 info.last_activity = crate::util::now_ms();
-                // Its name: one of its own the machine gives anew; else the one given here.
-                let mut names = self.names.lock();
+                // Its name: one of its own the machine gives anew; else the one given here. Read off
+                // the names' copy, a new one swapped in only as the machine's own is taken up.
+                let names = self.names.load();
                 match naming(&state.name, &m.reported, &info.kind_name, names.contains_key(id)) {
                     Naming::Adopt(own) => {
                         m.reported = own.to_owned();
-                        names.insert(id.to_owned(), own.to_owned());
+                        self.names.update(|n| n.insert(id.to_owned(), own.to_owned()));
                         save_names = true;
                     }
                     Naming::Keep => {
@@ -2046,7 +2144,13 @@ impl Registry {
                 }
             }
             Update::Events { events } => {
-                for (e, entry) in events.iter().zip(&entries) {
+                for e in events {
+                    // Written out once, for the copy and for its row alike (goal 9, plan 01a1a87b2cec step 5).
+                    let entry = Arc::new(if store.is_some() {
+                        Entry::of_event(e, Some(&mut |text: String| rows.push(crate::convo::rows::Row::Event(Box::new(crate::convo::rows::event_written(id, e, text))))))
+                    } else {
+                        Entry::of_event(e, None)
+                    });
                     if let Some(job) = mentions(id, &m.info.cwd, &m.location, e) {
                         jobs.push(job);
                     }
@@ -2061,11 +2165,26 @@ impl Registry {
                         proposed = Some(plan);
                     }
                     if !entry.is_null() {
-                        resync |= m.upsert(Arc::clone(entry));
+                        resync |= m.upsert(Arc::clone(&entry));
+                    }
+                    entries.push(entry);
+                    taken += 1;
+                    // Its turn spent: the rest at the owner's next (below), one taken at the least.
+                    if taken < events.len() && over() {
+                        break;
                     }
                 }
             }
             Update::Stream { id, text } => m.append(id, text),
+        }
+        // What of an update's events its turn had no time for (goal 9, plan 01a1a87b2cec step 3): the copy
+        // goes out with those taken, and the rest come back to the owner.
+        let rest = match &mut u {
+            Update::Events { events } if taken < events.len() => Some(Update::Events { events: events.split_off(taken) }),
+            _ => None,
+        };
+        if let Some(store) = store {
+            store.put(std::mem::take(&mut rows));
         }
         // Its viewers start over from the copy as it is now (its events went another way than
         // they have them): the feed's resync marker sends each back to a snapshot, and none
@@ -2114,11 +2233,16 @@ impl Registry {
             self.keeper.enqueue(job);
         }
         if let Some(plan) = proposed {
-            self.proposed.lock().insert(id.to_owned(), plan);
+            self.proposed.update(|p| p.insert(id.to_owned(), plan.clone()));
         }
         if gone {
-            save_names = self.names.lock().remove(id).is_some() || save_names;
-            self.changes_to_store.lock().remove(id);
+            // Copies swapped in only for what they had of it.
+            if self.names.load().contains_key(id) {
+                save_names = self.names.update(|n| n.remove(id)).is_some() || save_names;
+            }
+            if self.changes_to_store.load().contains_key(id) {
+                self.changes_to_store.update(|c| c.remove(id));
+            }
         }
         if save_names {
             self.save_names();
@@ -2134,6 +2258,7 @@ impl Registry {
         } else if let Some(info) = changed {
             hub.emit(&crate::wire::events::ServerEvent::Harness { info: Box::new(info) });
         }
+        rest.map(|u| Ingest { from, id: id.to_owned(), u, shipped, reported: String::new() })
     }
 
     /// A session reached its account's usage limit: the account's other sessions, on every machine,
@@ -2166,7 +2291,7 @@ impl Registry {
         let keep: std::collections::HashSet<String> = inv.sessions.into_iter().collect();
         let (others, away): (std::collections::HashSet<String>, Vec<String>) = match instance {
             Some(me) => {
-                let g = self.holders.lock();
+                let g = self.holders.load();
                 let others: std::collections::HashSet<String> = g.iter().filter(|(_, h)| h.as_str() != me).map(|(id, _)| id.clone()).collect();
                 let away = g.iter().filter(|(id, h)| h.as_str() != me && !present.contains(h) && !keep.contains(*id)).map(|(id, _)| id.clone()).collect();
                 (others, away)
@@ -2200,7 +2325,8 @@ impl Registry {
             .into_iter()
             .flatten()
             .collect();
-        self.kinds.lock().insert(format!("agent:{machine}"), inv.kinds);
+        let kinds = inv.kinds;
+        self.kinds.update(|k| k.insert(format!("agent:{machine}"), kinds.clone()));
         self.forget_holders(&gone);
         for id in gone {
             super::archive::closed(hub, &id);
@@ -2226,8 +2352,14 @@ impl Registry {
     /// [`Registry::held_by`] for each of `ids`: kept once for them all (a runner coming back says
     /// what it holds of every session at once).
     pub fn held_by_all(&self, ids: &[String], instance: &str) {
-        let changed = {
-            let mut g = self.holders.lock();
+        // A session's updates say who holds it: read off the holders' copy, a new one swapped in
+        // only when one of them changes hands.
+        let held = self.holders.load();
+        if ids.iter().all(|id| held.get(id).is_some_and(|h| h == instance)) {
+            return;
+        }
+        drop(held);
+        let changed = self.holders.update(|g| {
             let mut changed = false;
             for id in ids {
                 if g.get(id).is_none_or(|h| h != instance) {
@@ -2236,7 +2368,7 @@ impl Registry {
                 }
             }
             changed
-        };
+        });
         if changed {
             self.save_holders();
         }
@@ -2244,17 +2376,21 @@ impl Registry {
 
     /// The runner process of its machine that last said it holds session `id`, if one did.
     pub fn holder(&self, id: &str) -> Option<String> {
-        self.holders.lock().get(id).cloned()
+        self.holders.load().get(id).cloned()
     }
 
     fn forget_holders(&self, ids: &[String]) {
-        let mut changed = false;
-        {
-            let mut g = self.holders.lock();
+        // A copy swapped in only when one of them has a holder.
+        if !ids.iter().any(|id| self.holders.load().contains_key(id)) {
+            return;
+        }
+        let changed = self.holders.update(|g| {
+            let mut changed = false;
             for id in ids {
                 changed |= g.remove(id).is_some();
             }
-        }
+            changed
+        });
         if changed {
             self.save_holders();
         }
@@ -2266,6 +2402,9 @@ impl Registry {
     /// loop that takes its messages.
     fn save_holders(&self) {
         use std::sync::atomic::Ordering;
+        // The change just swapped into the holders' copy, then the flag: past the fence a write on
+        // its way either reads the change or is seen to have let go (the fence in `write` below).
+        std::sync::atomic::fence(Ordering::SeqCst);
         if self.holders_saving.swap(true, Ordering::AcqRel) {
             return;
         }
@@ -2275,8 +2414,9 @@ impl Registry {
             let _one = writing.lock();
             // Let go first: a change after the copy below starts another write (after this one).
             saving.store(false, Ordering::Release);
-            let now = holders.lock().clone();
-            if let Err(e) = keep_json_in(&dir, "holders.json", &now) {
+            std::sync::atomic::fence(Ordering::SeqCst);
+            let now = holders.get();
+            if let Err(e) = keep_json_in(&dir, "holders.json", &*now) {
                 tracing::warn!(error = %format!("{e:#}"), "couldn't keep which runner process holds each agent session");
             }
         };
@@ -2294,19 +2434,23 @@ impl Registry {
     /// changeset as often as the store takes it, not once a patch.
     fn store_changes(&self, id: &str, files: Files, store: crate::convo::store::Store) {
         use std::sync::atomic::Ordering;
-        self.changes_to_store.lock().insert(id.to_owned(), files);
+        // Into the changesets' copy, then the writer's flag past a fence: a writer letting go as
+        // this comes either reads this (past the fence it reads it after) or is seen to have let go.
+        self.changes_to_store.update(|c| c.insert(id.to_owned(), Arc::clone(&files)));
+        std::sync::atomic::fence(Ordering::SeqCst);
         if self.changes_storing.swap(true, Ordering::AcqRel) {
             return;
         }
         let (pending, storing) = (Arc::clone(&self.changes_to_store), Arc::clone(&self.changes_storing));
         drop(crate::rt::spawn(async move {
             loop {
-                let batch: Vec<(String, Files)> = std::mem::take(&mut *pending.lock()).into_iter().collect();
+                let batch: Vec<(String, Files)> = if pending.load().is_empty() { Vec::new() } else { pending.update(std::mem::take).into_iter().collect() };
                 if batch.is_empty() {
                     storing.store(false, Ordering::Release);
+                    std::sync::atomic::fence(Ordering::SeqCst);
                     // One that came in between finds no writer at work: this one goes on with it,
                     // unless it started another.
-                    if pending.lock().is_empty() || storing.swap(true, Ordering::AcqRel) {
+                    if pending.load().is_empty() || storing.swap(true, Ordering::AcqRel) {
                         return;
                     }
                     continue;
@@ -2372,12 +2516,11 @@ impl Registry {
             .into_iter()
             .flatten()
             .collect();
-        {
-            let mut k = self.kinds.lock();
+        self.kinds.update(|k| {
             if let Some(v) = k.remove(&at.target()) {
                 k.entry(now.target()).or_insert(v);
             }
-        }
+        });
         if let Some(st) = &self.convo {
             st.put(moved.iter().map(|i| crate::convo::rows::Row::Machine { session: i.id.clone(), machine: to.to_owned() }).collect());
         }
@@ -2431,7 +2574,7 @@ impl Registry {
             .into_iter()
             .flatten()
             .collect();
-        self.kinds.lock().remove(&format!("agent:{machine}"));
+        self.kinds.update(|k| k.remove(&format!("agent:{machine}")));
         for info in infos {
             hub.emit(&crate::wire::events::ServerEvent::Harness { info: Box::new(info) });
         }
@@ -2592,7 +2735,7 @@ impl Registry {
             match &loc {
                 Location::Local => {
                     // Started on one of the server's own shells: in that shell's directory.
-                    if let Some(pid) = spec.shell.as_ref().and_then(|t| self.local_shells.lock().get(t).copied()) {
+                    if let Some(pid) = spec.shell.as_ref().and_then(|t| self.local_shells.load().get(t).copied()) {
                         let (cwd, env) = crate::rt::blocking(move || super::host::shell_context(pid)).await.unwrap_or((None, Vec::new()));
                         if spec.cwd.is_none() {
                             spec.cwd = cwd;
@@ -2719,11 +2862,18 @@ impl Registry {
         if ids.is_empty() {
             return Ok(Claim { held: &self.opening, ids: Vec::new() });
         }
-        let mut held = self.opening.lock();
-        if let Some(id) = ids.iter().find(|id| self.sessions.contains(id) || held.contains(id.as_str())) {
-            return Err(anyhow::Error::new(IdTaken(id.clone())));
+        // Taken on the starts' copy, swapped in whole: of two starts asking for one id at once, the
+        // one whose copy goes in first has it, and the other finds it held.
+        let taken = self.opening.update(|held| {
+            let taken = ids.iter().find(|id| self.sessions.contains(id) || held.contains(id.as_str())).cloned();
+            if taken.is_none() {
+                held.extend(ids.iter().cloned());
+            }
+            taken
+        });
+        if let Some(id) = taken {
+            return Err(anyhow::Error::new(IdTaken(id)));
         }
-        held.extend(ids.iter().cloned());
         Ok(Claim { held: &self.opening, ids: ids.to_vec() })
     }
 
@@ -2731,36 +2881,46 @@ impl Registry {
     /// expires, also after a message carried it (one sent again carries it too). Short of room, the
     /// files messages carried already go first, the oldest first.
     pub fn upload(&self, name: String, mime: String, data: bytes::Bytes) -> anyhow::Result<String> {
-        let mut g = self.uploads.lock();
-        g.retain(|_, u| u.at.elapsed() < UPLOAD_TTL);
-        let mut used: usize = g.values().map(|u| u.data.len()).sum();
-        if used.saturating_add(data.len()) > UPLOADS_MAX {
-            let mut sent: Vec<(std::time::Instant, String)> = g.iter().filter_map(|(id, u)| u.sent.map(|t| (t, id.clone()))).collect();
-            sent.sort();
-            for (_, id) in sent {
-                if used.saturating_add(data.len()) <= UPLOADS_MAX {
-                    break;
-                }
-                if let Some(u) = g.remove(&id) {
-                    used = used.saturating_sub(u.data.len());
+        let id = crate::util::new_id();
+        let upload = Upload { name, mime, data, at: std::time::Instant::now(), sent: None };
+        let len = upload.data.len();
+        self.uploads.update(|g| {
+            g.retain(|_, u| u.at.elapsed() < UPLOAD_TTL);
+            let mut used: usize = g.values().map(|u| u.data.len()).sum();
+            if used.saturating_add(len) > UPLOADS_MAX {
+                let mut sent: Vec<(std::time::Instant, String)> = g.iter().filter_map(|(id, u)| u.sent.map(|t| (t, id.clone()))).collect();
+                sent.sort();
+                for (_, id) in sent {
+                    if used.saturating_add(len) <= UPLOADS_MAX {
+                        break;
+                    }
+                    if let Some(u) = g.remove(&id) {
+                        used = used.saturating_sub(u.data.len());
+                    }
                 }
             }
-        }
-        if used.saturating_add(data.len()) > UPLOADS_MAX {
-            anyhow::bail!("too many uploads waiting; send them first");
-        }
-        let id = crate::util::new_id();
-        g.insert(id.clone(), Upload { name, mime, data, at: std::time::Instant::now(), sent: None });
+            if used.saturating_add(len) > UPLOADS_MAX {
+                anyhow::bail!("too many uploads waiting; send them first");
+            }
+            g.insert(id.clone(), upload.clone());
+            Ok(())
+        })?;
         Ok(id)
     }
 
     /// Upload `id`'s name, type and bytes, for a message that carries it: kept (marked sent), so a
     /// message sent again carries it as well.
     fn upload_of(&self, id: &str) -> Option<(String, String, bytes::Bytes)> {
-        let mut g = self.uploads.lock();
-        let u = g.get_mut(id)?;
-        u.sent.get_or_insert_with(std::time::Instant::now);
-        Some((u.name.clone(), u.mime.clone(), u.data.clone()))
+        // Marked sent the first time, a copy swapped in then; read off the copy.
+        if self.uploads.load().get(id)?.sent.is_none() {
+            let now = std::time::Instant::now();
+            self.uploads.update(|g| {
+                if let Some(u) = g.get_mut(id) {
+                    u.sent.get_or_insert(now);
+                }
+            });
+        }
+        self.uploads.load().get(id).map(|u| (u.name.clone(), u.mime.clone(), u.data.clone()))
     }
 
     /// Attachments that refer to uploads, with the uploads' bytes in them instead: what one
@@ -2879,7 +3039,7 @@ impl Registry {
     /// The epoch the server last heard session `id` is at.
     pub fn epoch_of(&self, id: &str) -> u64 {
         let seen = self.sessions.with(id, |v| v.info.epoch).unwrap_or(0);
-        self.epochs.lock().get(id).copied().unwrap_or(0).max(seen)
+        self.epochs.load().get(id).copied().unwrap_or(0).max(seen)
     }
 
     /// Waits for the answer to message `message` sent to session `id`: none when too many wait
@@ -4358,15 +4518,50 @@ mod tests {
     fn names_are_kept_across_restarts() -> anyhow::Result<()> {
         let dir = tempfile::tempdir()?;
         let r = Registry::new(dir.path().to_owned());
-        r.names.lock().insert("s1".into(), "Mantle".into());
+        r.names.update(|n| n.insert("s1".into(), "Mantle".into()));
         r.save_names();
         // Written off the calling thread, soon after (goal 3, plan 01a1a59c2a8e step 5).
-        let kept = || Registry::new(dir.path().to_owned()).names.lock().get("s1").cloned();
+        let kept = || Registry::new(dir.path().to_owned()).names.load().get("s1").cloned();
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
         while kept().is_none() && std::time::Instant::now() < deadline {
             std::thread::sleep(std::time::Duration::from_millis(10));
         }
         assert_eq!(kept().as_deref(), Some("Mantle"));
+        Ok(())
+    }
+
+    /// Goal 5, plan 01a1a59c2aae step 2: a start's ids are claimed on the starts' copy, swapped in
+    /// whole, with no lock: of threads claiming one id at once (four, as many as `crate::rcu`'s tests
+    /// race), one has it and the rest find it held; let go, it's free again.
+    #[test]
+    fn g5_of_starts_claiming_one_id_at_once_one_has_it() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let r = Arc::new(Registry::new(dir.path().to_owned()));
+        let threads = 4;
+        for round in 0..50 {
+            let id = format!("s{round}");
+            // All claim at once, and each holds what it got until all have tried.
+            let (start, tried) = (Arc::new(std::sync::Barrier::new(threads)), Arc::new(std::sync::Barrier::new(threads)));
+            let claimers: Vec<_> = (0..threads)
+                .map(|_| {
+                    let (r, id, start, tried) = (Arc::clone(&r), id.clone(), Arc::clone(&start), Arc::clone(&tried));
+                    std::thread::spawn(move || {
+                        start.wait();
+                        let claim = r.claim(std::slice::from_ref(&id));
+                        let had = claim.is_ok();
+                        tried.wait();
+                        drop(claim);
+                        had
+                    })
+                })
+                .collect();
+            let mut had = 0;
+            for c in claimers {
+                had += usize::from(c.join().map_err(|_| anyhow::anyhow!("a claimer panicked"))?);
+            }
+            anyhow::ensure!(had == 1, "round {round}: {had} had {id}");
+            anyhow::ensure!(r.claim(std::slice::from_ref(&id)).is_ok(), "round {round}: {id} is free again once let go");
+        }
         Ok(())
     }
 
@@ -4386,7 +4581,7 @@ mod tests {
         let (done, kept) = std::sync::mpsc::channel();
         let keeper = Arc::clone(&r);
         std::thread::spawn(move || {
-            keeper.names.lock().insert("s1".into(), "Mantle".into());
+            keeper.names.update(|n| n.insert("s1".into(), "Mantle".into()));
             keeper.save_names();
             keeper.raise_epoch("s1", 7);
             let _ = done.send(());
@@ -4398,5 +4593,122 @@ mod tests {
         let epochs: HashMap<String, u64> = serde_json::from_slice(&std::fs::read(dir.path().join("epochs.json.part"))?)?;
         anyhow::ensure!(epochs.get("s1") == Some(&7), "{epochs:?}");
         Ok(())
+    }
+
+    /// Every kind of event, with what each may carry and what it may leave out.
+    fn every_kind_of_event() -> Vec<crate::harness::model::Event> {
+        use crate::harness::model::{Body, Event, FileDiff, Hunk, Level, Todo, ToolCall, ToolKind, ToolStatus};
+        let event = |n: u64, parent: Option<&str>, body: Body| Event { id: format!("e{n}"), seq: n, at: 1_793_800_000_000, parent: parent.map(str::to_owned), by: n.is_multiple_of(2).then(|| "Claude Code".to_owned()), body };
+        let tool = ToolCall {
+            tool_id: "t1".into(),
+            name: "mcp__github__search".into(),
+            tool: ToolKind::Edit,
+            title: "Edit src/lib.rs".into(),
+            detail: Some("a \"quoted\" detail\n".into()),
+            // A path and a tree inside it, not of the event's own.
+            input: json!({"path": "src/lib.rs", "tree": "t", "nested": {"b": 2, "a": [1, 2.5, null, true]}}),
+            status: ToolStatus::Done,
+            output: Some("ok \u{2713}".into()),
+            truncated: true,
+            diffs: vec![FileDiff { path: "src/lib.rs".into(), created: true, hunks: vec![Hunk { old_start: 1, old_lines: 0, new_start: 1, new_lines: 1, lines: vec!["+x".into()] }] }],
+            todos: vec![Todo { text: "do it".into(), status: "pending".into() }],
+            task: Some("t".into()),
+            exit_code: Some(-1),
+            started: 5,
+            ended: Some(6),
+            server: Some("github".into()),
+            tool_short: Some("search".into()),
+            skill: Some("s".into()),
+            runner: Some("linux/amd64".into()),
+        };
+        let bare = ToolCall { detail: None, output: None, truncated: false, diffs: Vec::new(), todos: Vec::new(), task: None, exit_code: None, ended: None, server: None, tool_short: None, skill: None, runner: None, ..tool.clone() };
+        vec![
+            event(1, None, Body::User { text: "hello \u{1F600}".into(), images: 2, client_id: Some("c1".into()), origin: Some("human".into()), attachments: vec!["a.png".into()], reply_to: Some("e0".into()) }),
+            event(2, None, Body::User { text: String::new(), images: 0, client_id: None, origin: None, attachments: Vec::new(), reply_to: None }),
+            event(3, Some("t1"), Body::Assistant { text: "line".into(), streaming: true }),
+            event(4, Some(""), Body::Thinking { text: "hmm".into(), streaming: false, redacted: true }),
+            event(5, None, Body::Tool(Box::new(tool))),
+            event(6, Some("t9"), Body::Tool(Box::new(bare))),
+            event(7, None, Body::Notice { level: Level::Warn, text: "retrying".into() }),
+        ]
+    }
+
+    /// Goal 9, plan 01a1a87b2cec step 5: an event written out once, straight from itself, is the text its
+    /// JSON tree wrote (the copy's before, and what a runner's digest of it is of), its store row has that
+    /// text, and what's looked up of it is what the tree said, for every kind of event. It holds while
+    /// serde_json's maps keep their keys in the order they come (`preserve_order`, which kiln's build has
+    /// through hyper-quic's qlog): a build that loses that fails here.
+    #[test]
+    fn g9_s5_an_event_is_written_out_once_as_its_tree_wrote_it() {
+        for e in every_kind_of_event() {
+            let n = e.seq;
+            let v = serde_json::to_value(&e).unwrap_or(Value::Null);
+            let tree = Entry::written(v.clone(), serde_json::to_string(&v).unwrap_or_default());
+            let mut kept: Option<String> = None;
+            let once = Entry::of_event(&e, Some(&mut |t: String| kept = Some(t)));
+            assert_eq!(once.text(), tree.text(), "event {n}");
+            assert_eq!(kept.as_deref(), Some(tree.text()), "event {n}: its row's text");
+            assert_eq!(Entry::of_event(&e, None).text(), tree.text(), "event {n}, kept by no one else");
+            assert_eq!((once.id(), once.seq(), once.kind(), once.on_main_thread()), (tree.id(), tree.seq(), tree.kind(), tree.on_main_thread()), "event {n}");
+            assert!(once.head.file.is_none() && tree.head.file.is_none(), "event {n}: no file's path or tree of its own");
+            assert_eq!(crate::wire::sums::event_text(once.text()), crate::wire::sums::event(&v), "event {n}: a runner's digest of it");
+            // Its row is the one the event written out again makes.
+            assert_eq!(kept.map(|t| crate::convo::rows::event_written("s", &e, t)), crate::convo::rows::event("s", &e), "event {n}: its row");
+        }
+    }
+
+    /// Goal 9, plan 01a1a87b2cec step 3: an update's events are taken while its owner's turn lasts, one at
+    /// the least, the rest coming back to take next. Five events by turns that each run out at once take
+    /// five turns, and the copy has each once, in order, as one turn would have left it.
+    #[test]
+    fn g9_s3_an_update_is_taken_in_turns() -> anyhow::Result<()> {
+        use crate::harness::model::{Body, Event};
+        crate::rt::block_on(async {
+            let hub = crate::hub::tests::scratch_hub().await?;
+            let there = Location::Machine("box".into());
+            let said = |n: u64| Event { id: format!("m{n}"), seq: n, at: 1, parent: None, by: None, body: Body::Assistant { text: format!("line {n}"), streaming: false } };
+            hub.harness.ingest(&hub, &there, "s", Update::Open { info: Box::new(Info { id: "s".into(), kind: "claude".into(), epoch: 1, ..Info::default() }), since: None }).await;
+            let ingest = Ingest { from: there.clone(), id: "s".into(), u: Update::Events { events: (1..=5).map(said).collect() }, shipped: false, reported: String::new() };
+            let h = Arc::clone(&hub);
+            let turns = hub
+                .harness
+                .sessions
+                .on("s", move |s| {
+                    let (mut turns, mut next) = (0, Some(ingest));
+                    while let Some(i) = next.take() {
+                        turns += 1;
+                        next = h.harness.apply(s, &h, i, &|| true);
+                    }
+                    turns
+                })
+                .await;
+            anyhow::ensure!(turns == Some(5), "taken in {turns:?} turns");
+            let names: Vec<String> = (1..=5).map(|n| format!("m{n}")).collect();
+            anyhow::ensure!(copy_of(&hub, "s") == names, "the copy: {:?}", copy_of(&hub, "s"));
+            Ok(())
+        })
+    }
+
+    /// Goal 9, plan 01a1a87b2cec step 3: the rest of an update its owner's turn ran out in goes on before
+    /// anything sent after it. A job sent right behind an update of as many events as a copy keeps
+    /// (`MAX_EVENTS`, more than a step quantum takes on any machine) finds every one of them in the copy,
+    /// however many turns they took.
+    #[test]
+    fn g9_s3_the_rest_of_an_update_goes_before_anything_newer() -> anyhow::Result<()> {
+        use crate::harness::model::{Body, Event};
+        crate::rt::block_on(async {
+            let hub = crate::hub::tests::scratch_hub().await?;
+            let there = Location::Machine("box".into());
+            let said = |n: u64| Event { id: format!("m{n}"), seq: n, at: 1, parent: None, by: None, body: Body::Assistant { text: format!("line {n}"), streaming: false } };
+            hub.harness.ingest(&hub, &there, "s", Update::Open { info: Box::new(Info { id: "s".into(), kind: "claude".into(), epoch: 1, ..Info::default() }), since: None }).await;
+            let rev = hub.harness.attach("s").map(|a| a.rev).unwrap_or_default();
+            let n = u64::try_from(MAX_EVENTS)?;
+            hub.harness.ingest_from(&hub, &there, "s", Update::Events { events: (1..=n).map(said).collect() }, false).await;
+            let found = hub.harness.sessions.on("s", |s| s.get("s").map(|m| m.events.len())).await.flatten();
+            anyhow::ensure!(found == Some(MAX_EVENTS), "the job behind it found {found:?} of {MAX_EVENTS}");
+            let turns = hub.harness.attach("s").map(|a| a.rev).unwrap_or_default().saturating_sub(rev);
+            anyhow::ensure!(turns >= 1, "the update's turns: {turns}");
+            Ok(())
+        })
     }
 }

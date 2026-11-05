@@ -24,7 +24,6 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 use http::StatusCode;
-use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
@@ -138,48 +137,56 @@ struct Entry {
     held: Option<Held>,
 }
 
-/// What's set from the server for each machine, and what each said it holds.
+/// What's set from the server for each machine, and what each said it holds: a copy read without a
+/// lock (each agent session's start, the Runners page) and changed by swapping a new one in whole
+/// (`crate::rcu`; goal 5, plan 01a1a59c2aae step 2).
 #[derive(Default)]
 pub struct AgentLimits {
-    inner: Mutex<HashMap<String, Entry>>,
+    inner: crate::rcu::Rcu<HashMap<String, Entry>>,
 }
 
 impl AgentLimits {
     /// What the UI set, read as the server starts.
     pub async fn load(&self, store: &crate::store::Store) -> anyhow::Result<()> {
         let rows = store.kv_prefix(KEY_PREFIX.to_owned()).await?;
-        let mut g = self.inner.lock();
+        let mut read: Vec<(String, Asked)> = Vec::new();
         for (k, v) in rows {
             let Some(machine) = k.strip_prefix(KEY_PREFIX) else { continue };
             match serde_json::from_str::<Asked>(&v) {
-                Ok(asked) => g.entry(machine.to_owned()).or_default().asked = asked,
+                Ok(asked) => read.push((machine.to_owned(), asked)),
                 Err(e) => tracing::warn!(machine, error = %e, "agent limit: what was set is unreadable; that machine's config holds"),
             }
         }
+        self.inner.update(|g| {
+            for (machine, asked) in &read {
+                g.entry(machine.clone()).or_default().asked = *asked;
+            }
+        });
         Ok(())
     }
 
     /// What's set from the server for `machine`.
     pub fn asked(&self, machine: &str) -> Asked {
-        self.inner.lock().get(machine).map(|e| e.asked).unwrap_or_default()
+        self.inner.load().get(machine).map(|e| e.asked).unwrap_or_default()
     }
 
     fn held(&self, machine: &str) -> Option<Held> {
-        self.inner.lock().get(machine).and_then(|e| e.held)
+        self.inner.load().get(machine).and_then(|e| e.held)
     }
 
     /// A machine known by another name from now on (docs/machines.md): what's set for it goes with it
     /// (its row moves with the store's, `Store::move_runner`).
     pub fn moved(&self, from: &str, to: &str) {
-        let mut g = self.inner.lock();
-        if let Some(e) = g.remove(from) {
-            g.entry(to.to_owned()).or_insert(e);
-        }
+        self.inner.update(|g| {
+            if let Some(e) = g.remove(from) {
+                g.entry(to.to_owned()).or_insert(e);
+            }
+        });
     }
 
     /// A machine forgotten (its runner was): what was set for it goes.
     pub async fn forget(&self, store: &crate::store::Store, machine: &str) {
-        self.inner.lock().remove(machine);
+        self.inner.update(|g| g.remove(machine));
         if let Err(e) = store.kv_delete(format!("{KEY_PREFIX}{machine}")).await {
             tracing::warn!(machine, error = %format!("{e:#}"), "agent limit: what was set wasn't deleted");
         }
@@ -250,13 +257,16 @@ pub fn on_held(hub: &Hub, peer: PeerId, machine: &str, held: Held) {
     if hub.instances.load().newest(machine) != Some(peer) {
         return;
     }
-    let changed = {
-        let mut g = hub.agent_limits.inner.lock();
+    // Said again as it was, nothing changes: a copy swapped in only for a change.
+    if hub.agent_limits.inner.load().get(machine).is_some_and(|e| e.held == Some(held)) {
+        return;
+    }
+    let changed = hub.agent_limits.inner.update(|g| {
         let e = g.entry(machine.to_owned()).or_default();
         let changed = e.held != Some(held);
         e.held = Some(held);
         changed
-    };
+    });
     if changed {
         hub.emit(&crate::wire::events::ServerEvent::AgentLimit { runner: machine.to_owned() });
     }
@@ -356,7 +366,7 @@ pub async fn put(hub: &Hub, name: &str, req: Request) -> Answer {
         None => hub.store.kv_delete(key).await,
     };
     stored.map_err(|e| fail(StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")))?;
-    hub.agent_limits.inner.lock().entry(name.to_owned()).or_default().asked = asked;
+    hub.agent_limits.inner.update(|g| g.entry(name.to_owned()).or_default().asked = asked);
     let said = asked.max_sessions.map_or_else(|| "nothing set here: its config's".to_owned(), |n| format!("at most {n} agent sessions at work at once"));
     hub.store.audit("admin".into(), "agent_limit.update".into(), format!("{name}: {said}")).await;
     push(hub, name).await;

@@ -13,6 +13,10 @@
 use std::fmt::Write as _;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
+pub mod owners;
+pub mod queue;
+pub mod ring;
+
 /// One owner of memory: what it holds now and the most it may hold (0: not known yet).
 pub struct Owner {
     name: &'static str,
@@ -56,6 +60,20 @@ impl Owner {
     /// The most it may hold, once known.
     pub fn bound(&self) -> Option<usize> {
         Some(self.bound.load(Ordering::Relaxed)).filter(|b| *b > 0)
+    }
+
+    /// A queue of its was made, bounded at `n` bytes ([`queue::Room`]): an owner of many queues (one a
+    /// shard, one a viewer) is bounded by their sum.
+    pub fn bound_add(&self, n: usize) {
+        self.bound.fetch_add(n, Ordering::Relaxed);
+    }
+
+    /// A queue of its went, and its bound with it: never below none.
+    pub fn bound_sub(&self, n: usize) {
+        let mut now = self.bound.load(Ordering::Relaxed);
+        while let Err(seen) = self.bound.compare_exchange_weak(now, now.saturating_sub(n), Ordering::Relaxed, Ordering::Relaxed) {
+            now = seen;
+        }
     }
 }
 
@@ -137,7 +155,7 @@ pub fn render(o: &mut String, others: &[(&str, u64, Option<u64>)]) {
             let _ = writeln!(o, "kiln_memory_resident_bytes{{kind=\"{kind}\"}} {bytes}");
         }
     }
-    let ours = OWNERS.iter().map(|w| (w.name, w.bytes() as u64, w.bound().map(|b| b as u64)));
+    let ours = OWNERS.iter().chain(owners::ALL.iter()).map(|w| (w.name, w.bytes() as u64, w.bound().map(|b| b as u64)));
     let all: Vec<(&str, u64, Option<u64>)> = ours.chain(others.iter().copied()).collect();
     help(o, "kiln_memory_bytes", "gauge", "Bytes each of the server's caches and buffers holds now, by owner.");
     for (name, bytes, _) in &all {

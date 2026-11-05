@@ -7,9 +7,11 @@
 //! newest view without a lock and never waits on the owner. No lock guards a session's copy
 //! (`no_lock_guards_session_copies` holds this module, `super::live` and the registry to it).
 //!
-//! An owner's inbox holds as many messages as the hub's queue of runner events
-//! ([`crate::net::EVENTS`]). A sender it has no room for waits, asynchronously (its shard goes on
-//! with its other tasks), until the owner takes the next one: nothing is dropped and the order holds.
+//! An owner's inbox holds as many bytes as the hub's queue of runner events
+//! ([`crate::net::EVENTS_BYTES`]; goal 11, plan 01a1a87b2e56 step 3: its messages counted by what they
+//! carry, [`crate::memory::queue`], its places made as it fills). A sender it has no room for waits,
+//! asynchronously (its shard goes on with its other tasks), until the owner takes enough: nothing is
+//! dropped and the order holds.
 //! The owner waits on nothing but its inbox, so it always drains it. Behind a full inbox the hub's
 //! loop waits, the net thread holds what it can't hand over, QUIC's flow control holds the runner,
 //! and the runner holds its states behind the last unanswered one (the newest in its place) and
@@ -250,11 +252,17 @@ impl Chunk {
         for (m, e) in self.meta.iter().zip(&self.evs) {
             m.sum(e);
         }
-        let made = Arc::new(self.deflate(Compression::default())?);
+        Ok(self.keep(self.deflate(Compression::default())?))
+    }
+
+    /// `made` kept as what it holds deflated, unless it keeps one already (the first kept stays): what it
+    /// keeps.
+    fn keep(&self, made: Segment) -> Arc<Segment> {
+        let made = Arc::new(made);
         if self.packed.set(Arc::clone(&made)).is_ok() {
             SEGMENT_BYTES.fetch_add(made.deflated.len(), Ordering::Relaxed);
         }
-        Ok(self.packed.get().map_or(made, Arc::clone))
+        self.packed.get().map_or(made, Arc::clone)
     }
 
     /// Its texts as an `events` frame joins them, deflated at `level` now and kept nowhere (the newest
@@ -574,13 +582,17 @@ impl Events {
     }
 }
 
-/// Sealed chunks waiting to be packed: one packer for the process, its chunks a unit at a time in one
-/// job on the compute pool, which gives its thread up between them whenever another job waits for it
-/// (`crate::rt::compute_pieces`). A job a seal flooded the pool as a fill sealed thousands, holding
-/// its other jobs seconds (goal 10's A/B: the compute pool's wait at p99, 0.9 ms to 2.3 s). A chunk
+/// A chunk that sealed, waiting to be packed, with its copy's home, whose owner keeps it compact once
+/// it's packed (goal 11).
+type Sealed = (Weak<Chunk>, Option<Home>);
+
+/// Sealed chunks waiting to be packed: one packer for the process ([`Packer`]), in one job on the
+/// compute pool, an event a unit, which gives its thread up between any two events whenever another job
+/// waits for it (`crate::rt::compute_pieces`). A job a seal flooded the pool as a fill sealed thousands,
+/// holding its other jobs seconds (goal 10's A/B: the compute pool's wait at p99, 0.9 ms to 2.3 s), and
+/// a chunk a unit held a thread for a chunk's whole deflate (its pieces at p99, 5 to 45 ms). A chunk
 /// gone or packed by then (let go of, changed, packed by a snapshot that needed it) is passed over.
-/// Each comes with its copy's home, whose owner keeps it compact once it's packed (goal 11).
-static SEALED: OnceLock<async_channel::Sender<(Weak<Chunk>, Option<Home>)>> = OnceLock::new();
+static SEALED: OnceLock<async_channel::Sender<Sealed>> = OnceLock::new();
 
 /// A chunk that sealed, to be packed off the owner's shard ([`SEALED`]), so a snapshot after it takes
 /// it as it is (goal 10, plan 01a1a87b2dae step 3), and its copy's owner then keeps it compact (goal
@@ -604,29 +616,13 @@ fn compact_msg(home: &Home) -> Msg {
     Msg::Run(Box::new(move |s: &mut Shard| s.compact(&id)))
 }
 
-/// The packer ([`SEALED`]): a job on the compute pool for as long as chunks wait, each packed in turn.
+/// The packer ([`SEALED`]): a job on the compute pool for as long as chunks wait ([`Packer::piece`]).
 /// A packed chunk's owner is told from the pool when its inbox takes the message now, else once the
 /// job ends (its inbox full then: the owner busy).
-async fn pack_sealed(rx: async_channel::Receiver<(Weak<Chunk>, Option<Home>)>) {
-    use crate::rt::Step;
+async fn pack_sealed(rx: async_channel::Receiver<Sealed>) {
     while let Ok(first) = rx.recv().await {
-        let packed = crate::rt::compute_pieces((rx.clone(), Some(first), Vec::new()), |(rx, next, later): &mut (_, Option<(Weak<Chunk>, Option<Home>)>, Vec<Home>), turn| {
-            loop {
-                let Some((chunk, home)) = next.take().or_else(|| rx.try_recv().ok()) else { return Step::Done(std::mem::take(later)) };
-                if let Some(chunk) = chunk.upgrade().filter(|c| c.packed().is_none())
-                    && chunk.pack().is_ok()
-                    && let Some(home) = home
-                    && let Some(inbox) = home.inbox.upgrade()
-                    && matches!(inbox.try_send(compact_msg(&home)), Err(async_channel::TrySendError::Full(_)))
-                {
-                    later.push(home);
-                }
-                if turn.over() {
-                    return Step::More;
-                }
-            }
-        })
-        .await;
+        let packer = Packer { rx: rx.clone(), waiting: vec![first], now: None, later: Vec::new() };
+        let packed = crate::rt::compute_pieces(packer, |p, turn| p.piece(&|| turn.over())).await;
         match packed {
             Ok(later) => {
                 for home in later {
@@ -636,6 +632,105 @@ async fn pack_sealed(rx: async_channel::Receiver<(Weak<Chunk>, Option<Home>)>) {
                 }
             }
             Err(e) => tracing::debug!(error = %format!("{e:#}"), "sealed chunks weren't packed: snapshots pack them as they need them"),
+        }
+    }
+}
+
+/// The packer's job ([`pack_sealed`]): the sealed chunks waiting, the one being packed, and the owners
+/// to tell once it ends.
+struct Packer {
+    rx: async_channel::Receiver<Sealed>,
+    /// Those not begun, the newest last: taken newest first, so in a fill a long session's oldest, which
+    /// it lets go of first ([`Events::drain_front`]), are gone before their turn comes rather than packed
+    /// for nothing.
+    waiting: Vec<Sealed>,
+    now: Option<Packing>,
+    /// Owners told to keep a chunk compact whose inbox was full then: told again once the job ends.
+    later: Vec<Home>,
+}
+
+/// A sealed chunk being packed ([`Packer`]): its events fed in so far, and what they deflated to.
+struct Packing {
+    chunk: Arc<Chunk>,
+    home: Option<Home>,
+    next: usize,
+    deflating: super::packed::Deflating,
+}
+
+impl Packer {
+    /// A piece of the job: an event at a time until its turn is `over` (another job waits for its thread:
+    /// `crate::rt::Turn::over`), or no sealed chunk waits, which ends it with the owners to tell after.
+    fn piece(&mut self, over: &dyn Fn() -> bool) -> crate::rt::Step<Vec<Home>> {
+        loop {
+            while let Ok(sealed) = self.rx.try_recv() {
+                self.waiting.push(sealed);
+            }
+            let Some(p) = self.now.take().or_else(|| self.begin()) else {
+                return crate::rt::Step::Done(std::mem::take(&mut self.later));
+            };
+            self.now = self.feed(p);
+            if over() {
+                return crate::rt::Step::More;
+            }
+        }
+    }
+
+    /// The newest that's still there and not packed yet, begun.
+    fn begin(&mut self) -> Option<Packing> {
+        while let Some((chunk, home)) = self.waiting.pop() {
+            if let Some(chunk) = chunk.upgrade().filter(|c| c.packed().is_none()) {
+                return Some(Packing { chunk, home, next: 0, deflating: super::packed::Deflating::new(Compression::default()) });
+            }
+        }
+        None
+    }
+
+    /// `p`'s next event in: its digest made, and its text (after the `,` before it) deflated; back while
+    /// some are still to go in. Once all are in, what they deflated to is kept ([`Chunk::pack`]'s bytes)
+    /// and its owner told to keep it compact. One packed meanwhile (a snapshot needed it) is done with as
+    /// it is; one nothing holds but this (its copy and every view let go of it) is let go of unpacked.
+    fn feed(&mut self, mut p: Packing) -> Option<Packing> {
+        if p.chunk.packed().is_some() {
+            self.tell(p.home);
+            return None;
+        }
+        if Arc::strong_count(&p.chunk) == 1 {
+            return None;
+        }
+        if p.next >= p.chunk.evs.len() {
+            let Packing { chunk, home, deflating, .. } = p;
+            match deflating.finish() {
+                Ok(made) => {
+                    chunk.keep(made);
+                    self.tell(home);
+                }
+                Err(e) => tracing::debug!(error = %e, "a sealed chunk wasn't packed: a snapshot packs it if it needs it"),
+            }
+            return None;
+        }
+        let fed = match (p.chunk.meta.get(p.next), p.chunk.evs.get(p.next)) {
+            (Some(m), Some(e)) => {
+                m.sum(e);
+                let comma = if p.next == 0 { Ok(()) } else { p.deflating.part(b",") };
+                comma.and_then(|()| p.deflating.part(e.entry.text().as_bytes()))
+            }
+            _ => Err(std::io::Error::other("a chunk's metas and events don't match")),
+        };
+        if let Err(e) = fed {
+            tracing::debug!(error = %e, "a sealed chunk wasn't packed: a snapshot packs it if it needs it");
+            return None;
+        }
+        p.next += 1;
+        Some(p)
+    }
+
+    /// A packed chunk's owner told to keep it compact: now if its inbox takes it, else once the job ends.
+    fn tell(&mut self, home: Option<Home>) {
+        if let Some(home) = home
+            && let Some(inbox) = home.inbox.upgrade()
+            && matches!(inbox.try_send(compact_msg(&home)), Err(async_channel::TrySendError::Full(_)))
+        {
+            self.later.push(home);
         }
     }
 }
@@ -835,7 +930,7 @@ pub struct Mirror {
     info_json: (Arc<Info>, Bytes),
     /// Its owner's inbox, held weakly (none until a shard takes it in): a chunk packed off the shard
     /// comes back through it to be kept compact (goal 11, plan 01a1a87b2e56 step 2).
-    owner: Option<async_channel::WeakSender<Msg>>,
+    owner: Option<crate::memory::queue::WeakSender<Msg>>,
 }
 
 /// An info as the API answers with it: `serde_json`'s compact form (what `srv::json` wrote of it).
@@ -846,7 +941,7 @@ fn info_json(info: &Info) -> Bytes {
 /// Where a packed chunk's copy is: its owner's inbox and its session, to keep it compact once packed.
 #[derive(Clone)]
 pub(super) struct Home {
-    inbox: async_channel::WeakSender<Msg>,
+    inbox: crate::memory::queue::WeakSender<Msg>,
     id: Arc<str>,
 }
 
@@ -1167,7 +1262,7 @@ impl Mirror {
 pub struct Shard {
     me: usize,
     /// Its own inbox, held weakly: what its copies' packed chunks come back through.
-    inbox: async_channel::WeakSender<Msg>,
+    inbox: crate::memory::queue::WeakSender<Msg>,
     mirrors: HashMap<String, Mirror>,
     boards: Arc<[ArcSwap<Board>]>,
     bus: Arc<dyn kiln_seams::Bus>,
@@ -1271,21 +1366,29 @@ impl Shard {
         }
     }
 
-    /// Takes one message, a panic in it caught (its shard goes on with the rest).
-    fn take(&mut self, msg: Msg, hub: Option<&Arc<Hub>>) {
+    /// Takes one message, a panic in it caught (its shard goes on with the rest): what's left of it when
+    /// its owner's turn ran out first (`over`; an update's events, `Registry::apply`), to take next.
+    fn take(&mut self, msg: Msg, hub: Option<&Arc<Hub>>, over: &dyn Fn() -> bool) -> Option<Msg> {
+        let mut rest = None;
         let done = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| match msg {
             Msg::Update(i) => {
                 if let Some(h) = hub {
-                    h.harness.apply(self, h, *i);
+                    rest = h.harness.apply(self, h, *i, over).map(|i| Msg::Update(Box::new(i)));
                 }
             }
             Msg::Run(job) => job(self),
+            Msg::Runner(r) => {
+                if let Some(h) = hub {
+                    rest = h.runner_update(self, *r, over).map(|i| Msg::Update(Box::new(i)));
+                }
+            }
         }));
         if let Err(p) = done {
             crate::metrics::global().panics_caught.inc();
             tracing::error!(shard = self.me, panic = %crate::sup::panic_message(p.as_ref()), "a change to an agent session's copy panicked: its shard goes on");
         }
         self.publish_board();
+        rest
     }
 }
 
@@ -1299,6 +1402,24 @@ pub struct Ingest {
     pub reported: String,
 }
 
+/// An agent session's update as one of its machine's runner processes sent it, for the shard that owns
+/// the session's copy to judge (whether it counts, which of the machine's processes holds the session)
+/// and take, in the order its runner sent it (goal 10, plan 01a1a87b2dae step 4; `Hub::runner_update`).
+/// Every runner's updates were judged on the hub's one loop, on the HTTP listener's shard, behind every
+/// runner's other messages (the lab's runner wait at p99, 155 to 195 ms).
+pub struct RunnerUpdate {
+    /// The runner process it came from, and its machine.
+    pub peer: hyper_transport::PeerId,
+    pub agent: String,
+    pub session: String,
+    pub update: Update,
+    /// Its machine keeps the session in a store it sends the server's (`crate::convo::feed`), as its
+    /// process's caps said when it came.
+    pub shipped: bool,
+    /// When its frame came off the wire: what its wait to be taken is measured from (`crate::route_latency`).
+    pub arrived: Option<std::time::Instant>,
+}
+
 type Job = Box<dyn FnOnce(&mut Shard) + Send>;
 
 /// What an owner takes from its inbox.
@@ -1306,6 +1427,20 @@ pub enum Msg {
     Update(Box<Ingest>),
     /// Work on its copies (people's commands, a machine lost, a session opened or closed…).
     Run(Job),
+    /// An update from a session's runner, to judge and take ([`RunnerUpdate`]).
+    Runner(Box<RunnerUpdate>),
+}
+
+impl crate::memory::queue::Weigh for Msg {
+    /// Its place, and an update's ingest with the texts its update carries (`super::weigh`); a job's
+    /// closure as it's kept (what it captured, by value).
+    fn weight(&self) -> usize {
+        size_of::<Msg>().saturating_add(match self {
+            Msg::Update(i) => size_of::<Ingest>().saturating_add(i.id.len()).saturating_add(i.reported.len()).saturating_add(crate::memory::queue::Weigh::weight(&i.u)),
+            Msg::Run(job) => size_of_val(&**job),
+            Msg::Runner(r) => size_of::<RunnerUpdate>().saturating_add(r.agent.len()).saturating_add(r.session.len()).saturating_add(crate::memory::queue::Weigh::weight(&r.update)),
+        })
+    }
 }
 
 /// The shard that owns session `id` among `shards`: FNV-1a over its id, so every process with as
@@ -1317,7 +1452,7 @@ pub fn owner_of(id: &str, shards: usize) -> usize {
 
 /// Every session's copy, each owned by one shard: where messages to them go, and what readers read.
 pub struct Copies {
-    inboxes: Vec<async_channel::Sender<Msg>>,
+    inboxes: Vec<crate::memory::queue::Sender<Msg>>,
     boards: Arc<[ArcSwap<Board>]>,
     /// The hub the owners act through (what a change tells the rest of kiln), once made.
     hub: Arc<OnceLock<Weak<Hub>>>,
@@ -1326,17 +1461,18 @@ pub struct Copies {
 impl Copies {
     /// An owner on each of the runtime's shards, its sessions' feeds on `bus`.
     pub fn start(bus: Arc<dyn kiln_seams::Bus>) -> Self {
-        Self::start_with(bus, crate::rt::shard_count().max(1), crate::net::EVENTS)
+        Self::start_with(bus, crate::rt::shard_count().max(1), crate::net::EVENTS_BYTES)
     }
 
-    /// `shards` owners (one a shard), each inbox holding `inbox` messages.
+    /// `shards` owners (one a shard), each inbox holding `inbox` bytes of messages (their places made as
+    /// it fills: `crate::memory::owners::SESSION_INBOXES`).
     pub fn start_with(bus: Arc<dyn kiln_seams::Bus>, shards: usize, inbox: usize) -> Self {
         let shards = shards.max(1);
         let boards: Arc<[ArcSwap<Board>]> = (0..shards).map(|_| ArcSwap::from_pointee(Board::new())).collect::<Vec<_>>().into();
         let hub = Arc::new(OnceLock::new());
         let mut inboxes = Vec::with_capacity(shards);
         for me in 0..shards {
-            let (tx, rx) = async_channel::bounded(inbox.max(1));
+            let (tx, rx) = crate::memory::queue::bounded(&crate::memory::owners::SESSION_INBOXES, inbox);
             let shard = Shard { me, inbox: tx.downgrade(), mirrors: HashMap::new(), boards: Arc::clone(&boards), bus: Arc::clone(&bus), board_changed: false };
             crate::rt::spawn_owner(me, own(shard, rx, Arc::clone(&hub)));
             inboxes.push(tx);
@@ -1456,18 +1592,65 @@ impl Copies {
     }
 }
 
+/// What an owner's polls taking `msg` are labeled with in the shards' table of what held them (goal 9, plan
+/// 01a1a87b2cec step 3): an update by its kind (`crate::wire::update_label`), a runner's as a taken one, and
+/// work on its copies as such.
+fn label_of(msg: &Msg) -> &'static hyper_rt::slow::Label {
+    static WORK: hyper_rt::slow::Label = hyper_rt::slow::Label { name: "owner work on its copies" };
+    match msg {
+        Msg::Update(i) => crate::wire::update_label(&i.u),
+        Msg::Runner(r) => crate::wire::update_label(&r.update),
+        Msg::Run(_) => &WORK,
+    }
+}
+
 /// A shard's owner: its messages, in the order they came, as fast as they come, in bounded turns of
 /// its shard (the HTTP listener may share it). It waits on nothing but its inbox, and ends with it.
-async fn own(mut shard: Shard, rx: async_channel::Receiver<Msg>, hub: Arc<OnceLock<Weak<Hub>>>) {
+/// A message its turn ran out in the middle of (an update's events) goes on at its next turn, before
+/// anything newer (goal 9, plan 01a1a87b2cec step 3).
+async fn own(mut shard: Shard, rx: crate::memory::queue::Receiver<Msg>, hub: Arc<OnceLock<Weak<Hub>>>) {
     let mut turns = crate::rt::Turns::new();
-    while let Ok(msg) = rx.recv().await {
+    // What's left of the message the last turn ran out in.
+    let mut rest: Option<Msg> = None;
+    loop {
+        let msg = match rest.take() {
+            Some(msg) => msg,
+            None => match rx.try_recv() {
+                Ok(msg) => msg,
+                Err(async_channel::TryRecvError::Closed) => return,
+                // None waiting: waiting for one gives the shard to its other work, so its turn starts afresh
+                // once one comes (else an update after a quiet spell would find its turn spent already).
+                Err(async_channel::TryRecvError::Empty) => match rx.recv().await {
+                    Ok(msg) => {
+                        turns = crate::rt::Turns::new();
+                        msg
+                    }
+                    Err(_) => return,
+                },
+            },
+        };
         // The hub, once a turn: what each change tells the rest of kiln goes through it.
         let h = hub.get().and_then(Weak::upgrade);
-        shard.take(msg, h.as_ref());
+        let over = || turns.over();
+        // The turn's poll labeled by the kind of the message that took longest in it, should the poll hold the
+        // shard (goal 9, plan 01a1a87b2cec step 3: the lab's s7c named this owner's polls, up to 12 ms, not what
+        // held them).
+        let mut longest = std::time::Duration::ZERO;
+        let mut take = |shard: &mut Shard, msg: Msg| {
+            let (label, began) = (label_of(&msg), std::time::Instant::now());
+            let rest = shard.take(msg, h.as_ref(), &over);
+            let took = began.elapsed();
+            if took >= longest {
+                longest = took;
+                hyper_rt::futures::label(label);
+            }
+            rest
+        };
+        rest = take(&mut shard, msg);
         // What's waiting already goes in the same turn.
-        while !turns.over() {
+        while rest.is_none() && !over() {
             let Ok(msg) = rx.try_recv() else { break };
-            shard.take(msg, h.as_ref());
+            rest = take(&mut shard, msg);
         }
         drop(h);
         // The conversation store over its bound holds this owner back before it takes more (goal 11, plan
@@ -1486,6 +1669,10 @@ mod tests {
     use serde_json::json;
 
     use super::*;
+
+    /// About one of these tests' messages, in an inbox's bytes (goal 11, plan 01a1a87b2e56 step 3): its
+    /// place, and a job's closure of a few captured words.
+    const MSG: usize = size_of::<Msg>() + crate::memory::queue::PLACE + 4 * size_of::<usize>();
 
     /// What a source file's code says outside its tests, its comments left out. Lines may end in
     /// CRLF, as a Windows checkout writes them (git's autocrlf): read as LF, or the tests' own
@@ -1706,6 +1893,62 @@ mod tests {
         Ok(())
     }
 
+    /// Goal 10, plan 01a1a87b2dae step 3: the packer packs a sealed chunk an event at a time, giving its
+    /// thread up after any one when another job waits (here, after every one), into the very bytes one
+    /// deflate of the chunk makes, each event's digest made as it goes in; the newest first; and each
+    /// packed chunk's owner is told to keep it compact. One packed meanwhile (a snapshot needed it) is
+    /// done with as it is; one nothing holds but the packer is let go of, unpacked.
+    #[test]
+    fn g10_s3_the_packer_packs_an_event_at_a_time_newest_first() -> anyhow::Result<()> {
+        use crate::rt::Step;
+        let mut events = Events::default();
+        let mut sealed = Vec::new();
+        for s in 1..=u64::try_from(CHUNK * 3 + 1)? {
+            if let Some(c) = events.push(Ev { entry: entry(&format!("e{s}"), s), at: s }) {
+                sealed.push(c);
+            }
+        }
+        let [oldest, middle, newest] = <[Arc<Chunk>; 3]>::try_from(sealed).map_err(|s| anyhow::anyhow!("{} chunks sealed", s.len()))?;
+        let want = newest.deflate(Compression::default())?;
+        let (owner, told) = crate::memory::queue::bounded::<Msg>(&crate::memory::owners::SESSION_INBOXES, 8 * MSG);
+        let home = Home { inbox: owner.downgrade(), id: Arc::from("s") };
+        let (tx, rx) = async_channel::unbounded();
+        for c in [&oldest, &middle, &newest] {
+            tx.try_send((Arc::downgrade(c), Some(home.clone()))).map_err(|_| anyhow::anyhow!("the packer's queue refused a chunk"))?;
+        }
+        let mut packer = Packer { rx, waiting: Vec::new(), now: None, later: Vec::new() };
+        let after_each = || true;
+        for k in 1..=CHUNK {
+            anyhow::ensure!(matches!(packer.piece(&after_each), Step::More), "piece {k} ended the job");
+            assert!(packer.now.as_ref().is_some_and(|p| Arc::ptr_eq(&p.chunk, &newest) && p.next == k), "piece {k}: the newest, its {k} first in");
+            assert_eq!(newest.metas().iter().filter(|m| m.sum_made().is_some()).count(), k, "piece {k}: a digest an event in");
+            assert!(newest.packed().is_none() && told.is_empty(), "piece {k}: not packed yet");
+        }
+        anyhow::ensure!(matches!(packer.piece(&after_each), Step::More));
+        let got = newest.packed().cloned().ok_or_else(|| anyhow::anyhow!("the newest wasn't packed"))?;
+        assert_eq!((&got.deflated, got.crc, got.len), (&want.deflated, want.crc, want.len), "the bytes one deflate makes");
+        assert!(matches!(told.try_recv(), Ok(Msg::Run(_))), "its owner told to keep it compact");
+        // The middle begun, then packed by a snapshot that needed it.
+        anyhow::ensure!(matches!(packer.piece(&after_each), Step::More));
+        assert!(packer.now.as_ref().is_some_and(|p| Arc::ptr_eq(&p.chunk, &middle) && p.next == 1), "the middle next");
+        let snapshot = middle.pack()?;
+        anyhow::ensure!(matches!(packer.piece(&after_each), Step::More));
+        assert!(packer.now.is_none() && middle.packed().is_some_and(|s| Arc::ptr_eq(s, &snapshot)), "the snapshot's kept, the packer's let go of");
+        assert!(matches!(told.try_recv(), Ok(Msg::Run(_))), "its owner told");
+        // The oldest begun, then let go of by its copy (the oldest let go of) and everyone else.
+        anyhow::ensure!(matches!(packer.piece(&after_each), Step::More));
+        assert!(packer.now.as_ref().is_some_and(|p| Arc::ptr_eq(&p.chunk, &oldest)), "the oldest last");
+        let was = Arc::downgrade(&oldest);
+        let _ = events.drain_front(CHUNK);
+        drop(oldest);
+        anyhow::ensure!(matches!(packer.piece(&after_each), Step::More));
+        assert!(packer.now.is_none() && was.upgrade().is_none(), "let go of, unpacked");
+        assert!(told.is_empty(), "no owner told of a chunk gone");
+        assert!(matches!(packer.piece(&after_each), Step::Done(later) if later.is_empty()), "nothing left: the job ends");
+        drop(owner);
+        Ok(())
+    }
+
     /// Goal 11, plan 01a1a87b2e56 step 2: a copy whose sealed chunks are kept compact (their metas and
     /// segment alone) reads as it did: each event, and the events' texts joined as `View::events_json`
     /// joins them, over ranges across the chunks' edges, each compact chunk's segment read once a range.
@@ -1829,7 +2072,7 @@ mod tests {
     #[test]
     fn a_reader_never_waits_on_a_busy_owner() -> anyhow::Result<()> {
         crate::rt::block_on(async {
-            let copies = Arc::new(Copies::start_with(sim_bus(), crate::rt::shard_count().max(1), 8));
+            let copies = Arc::new(Copies::start_with(sim_bus(), crate::rt::shard_count().max(1), 8 * MSG));
             let (bus, id) = (sim_bus(), "s1".to_owned());
             let info = Info { id: id.clone(), kind: "claude".into(), ..Info::default() };
             let i = id.clone();
@@ -1868,7 +2111,7 @@ mod tests {
         })
     }
 
-    /// Goal 4, plan 01a1a59c2a9c step 5: with every owner's inbox holding two messages and the owners
+    /// Goal 4, plan 01a1a59c2a9c step 5: with every owner's inbox holding about two messages and the owners
     /// held up (their shards busy), many senders on every shard each send their session's changes;
     /// they wait for room rather than drop any, and each session's copy takes every change once, in
     /// the order its sender sent them.
@@ -1876,7 +2119,7 @@ mod tests {
     fn changes_keep_their_order_and_none_is_lost_when_shards_are_busy() -> anyhow::Result<()> {
         crate::rt::block_on(async {
             let shards = crate::rt::shard_count().max(1);
-            let copies = Arc::new(Copies::start_with(sim_bus(), shards, 2));
+            let copies = Arc::new(Copies::start_with(sim_bus(), shards, 2 * MSG));
             let sessions: Vec<String> = (0..24).map(|n| format!("s{n}")).collect();
             for id in &sessions {
                 let (i, bus) = (id.clone(), sim_bus());
@@ -1938,7 +2181,7 @@ mod tests {
     #[test]
     fn readers_see_whole_views_and_never_go_back() -> anyhow::Result<()> {
         crate::rt::block_on(async {
-            let copies = Arc::new(Copies::start_with(sim_bus(), crate::rt::shard_count().max(1), 64));
+            let copies = Arc::new(Copies::start_with(sim_bus(), crate::rt::shard_count().max(1), 64 * MSG));
             let (id, bus) = ("s1".to_owned(), sim_bus());
             let info = Info { id: id.clone(), kind: "claude".into(), ..Info::default() };
             let i = id.clone();

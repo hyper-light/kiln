@@ -1935,7 +1935,7 @@ impl Shard {
             None
         };
         if elapsed > crate::slow::SLOW_POLL_NS {
-            self.note_slow(slot, elapsed);
+            self.note_slow(slot, elapsed, matches!(attributed, Some(crate::attribution::Attribution::Preempted)));
         }
         let Some(poll) = poll else {
             self.unwound(slot, future, word, current);
@@ -2007,11 +2007,12 @@ impl Shard {
     }
 
     /// A poll of the task in `slot` that held the shard `elapsed`, past `crate::slow::SLOW_POLL_NS`: counted
-    /// against the task's spawn site and the label its code set (kiln's goal 9, plan 01a1a87b2cec step 2).
+    /// against the task's spawn site and the label its code set (kiln's goal 9, plan 01a1a87b2cec step 2), and
+    /// as the host's when the poll was found preempted (`host`; steps 3 and 4).
     #[cold]
-    fn note_slow(&self, slot: u32, elapsed: u64) {
+    fn note_slow(&self, slot: u32, elapsed: u64, host: bool) {
         if let Some(entry) = self.desk.entry {
-            entry.slow.note(entry.spawned_at(slot), self.desk.label.get(), elapsed);
+            entry.slow.note(entry.spawned_at(slot), self.desk.label.get(), elapsed, host);
         }
     }
 

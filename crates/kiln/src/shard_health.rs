@@ -32,7 +32,9 @@
 //! - **What held a shard** (`kiln_shard_held_*`, by `site` and `label`): every poll past 100 µs
 //!   (`hyper_rt::slow::SLOW_POLL_NS`, goal 9, plan 01a1a87b2cec step 2), counted against the spawn
 //!   site of its task and the label its code set (a request's route, `crate::route_latency::label_of`),
-//!   as the shard keeps them (`hyper_rt::slow`): how many, their holds added up, and the longest.
+//!   as the shard keeps them (`hyper_rt::slow`): how many, their holds added up, and the longest; and of
+//!   them, those the host held (preempted, as hyper-rt finds out for a poll past twice its step quantum),
+//!   with their time: what no code held (steps 3 and 4).
 
 use std::fmt::Write as _;
 use std::sync::OnceLock;
@@ -101,8 +103,8 @@ impl Shard {
     }
 
     /// A probe's wake, `late` after its timer fell due, at `now`; on the shard, so what it reads of
-    /// the shard is the shard's own.
-    fn note(&self, late: Duration, now: Instant) {
+    /// the shard is the shard's own. The CPU time its thread has run, where the OS keeps it.
+    fn note(&self, late: Duration, now: Instant) -> Option<u64> {
         let late_ns = nanos(late);
         self.delay.observe(late.as_secs_f64());
         self.late_ns.store(late_ns, Ordering::Relaxed);
@@ -120,9 +122,11 @@ impl Shard {
             self.tasks.store(tasks, Ordering::Relaxed);
             self.most_tasks.fetch_max(tasks, Ordering::Relaxed);
         }
-        if let Some(cpu) = thread_cpu_ns() {
+        let cpu = thread_cpu_ns();
+        if let Some(cpu) = cpu {
             self.cpu_ns.store(cpu, Ordering::Relaxed);
         }
+        cpu
     }
 
     /// How late its probes ran, each noted.
@@ -278,9 +282,9 @@ async fn probe(i: usize, period: Duration) {
         crate::rt::sleep_until(due).await;
         let now = Instant::now();
         let late = now.saturating_duration_since(due);
-        me.note(late, now);
-        // What the shard sheds, from its delay (goal 6, plan 01a1a59c2abe step 4).
-        crate::overload::tick(i, late);
+        let cpu = me.note(late, now);
+        // What the shard sheds, from its delay and how much of the time it ran (goal 6, plan 01a1a59c2abe step 4).
+        crate::overload::tick(i, late, cpu);
         // The next one a period from now: a shard that was held doesn't then run a burst of probes
         // to catch up, each noting the same hold again.
         due = now + period;
@@ -370,16 +374,18 @@ fn render_held(o: &mut String, help: &dyn Fn(&mut String, &str, &str, &str)) {
     if shards().is_empty() {
         return;
     }
-    // Each shard's entries by what the exposition names them (two labels of one name are one series).
-    let mut rows: std::collections::BTreeMap<(usize, String, &'static str), (u64, u64, u64)> = std::collections::BTreeMap::new();
+    // Each shard's entries by what the exposition names them (two labels of one name are one series): polls,
+    // their time, the longest, and those of them the host held with their time.
+    type Row = (u64, u64, u64, u64, u64);
+    let mut rows: std::collections::BTreeMap<(usize, String, &'static str), Row> = std::collections::BTreeMap::new();
     for (i, holder) in crate::rt::shard_holders().into_iter().take(shards().len()).enumerate() {
         for p in hyper_rt::slow::slow_polls(holder) {
             let site = p.site.map_or_else(String::new, |l| format!("{}:{}:{}", l.file(), l.line(), l.column()));
             let row = rows.entry((i, site, p.label.map_or("", |l| l.name))).or_default();
-            *row = (row.0.saturating_add(p.polls), row.1.saturating_add(p.total_ns), row.2.max(p.longest_ns));
+            *row = (row.0.saturating_add(p.polls), row.1.saturating_add(p.total_ns), row.2.max(p.longest_ns), row.3.saturating_add(p.host_polls), row.4.saturating_add(p.host_ns));
         }
     }
-    let series = |o: &mut String, name: &str, value: &dyn Fn(&(u64, u64, u64)) -> String| {
+    let series = |o: &mut String, name: &str, value: &dyn Fn(&Row) -> String| {
         for ((i, site, label), row) in &rows {
             let _ = writeln!(o, "{name}{{shard=\"{i}\",site=\"{}\",label=\"{}\"}} {}", escape(site), escape(label), value(row));
         }
@@ -390,6 +396,11 @@ fn render_held(o: &mut String, help: &dyn Fn(&mut String, &str, &str, &str)) {
     series(o, "kiln_shard_held_seconds_total", &|r| secs(Duration::from_nanos(r.1)).to_string());
     help(o, "kiln_shard_held_longest_seconds", "gauge", "The longest of those polls.");
     series(o, "kiln_shard_held_longest_seconds", &|r| secs(Duration::from_nanos(r.2)).to_string());
+    // Goal 9, plan 01a1a87b2cec steps 3 and 4: what of it no code held.
+    help(o, "kiln_shard_held_host_polls_total", "counter", "Of those polls, the ones the host held: the shard's thread runnable and off the CPU (preempted), as found for polls past twice the step quantum.");
+    series(o, "kiln_shard_held_host_polls_total", &|r| r.3.to_string());
+    help(o, "kiln_shard_held_host_seconds_total", "counter", "How long the polls the host held held their shard, added up.");
+    series(o, "kiln_shard_held_host_seconds_total", &|r| secs(Duration::from_nanos(r.4)).to_string());
 }
 
 /// A label's value as the exposition writes it: its backslashes, quotes and line ends escaped.

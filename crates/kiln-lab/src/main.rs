@@ -56,8 +56,9 @@ struct Common {
     /// CI legs and agents run on bare metal (docs/priority.md; Linux with systemd's user manager).
     #[arg(long, default_value = "shared")]
     layout: String,
-    /// `realistic` (production's shape at a busy hour), `overload` (that, with no think time), `many` (all of
-    /// production's live sessions at work at once) or `small` (to try the lab out).
+    /// `realistic` (production's shape at a busy hour), `overload` (that, with no think time), `flood` (that, with
+    /// 64 readers and 8 agents calling MCP), `many` (all of production's live sessions at work at once) or `small`
+    /// (to try the lab out).
     #[arg(long, default_value = "realistic")]
     profile: String,
     /// Seconds each round measures (the profile's own otherwise).
@@ -69,6 +70,11 @@ struct Common {
     /// Keep each round's kiln (its data, its logs) rather than removing it.
     #[arg(long)]
     keep: bool,
+    /// The server's `[bus] memory` in bytes, written into the kiln.toml each round's server starts
+    /// with (kiln's default otherwise, 256 MiB): so the lab measures the bus past it (goal 11, plan
+    /// 01a1a87b2e56 step 3).
+    #[arg(long)]
+    bus_memory: Option<u64>,
 }
 
 #[derive(Subcommand)]
@@ -158,10 +164,10 @@ fn env(pairs: &[String]) -> anyhow::Result<Vec<(String, String)>> {
     pairs.iter().map(|p| p.split_once('=').map(|(k, v)| (k.to_owned(), v.to_owned())).ok_or_else(|| anyhow::anyhow!("--env takes KEY=VALUE, not {p}"))).collect()
 }
 
-fn build(label: &str, kiln: &Path, env: Vec<(String, String)>) -> anyhow::Result<Build> {
+fn build(label: &str, kiln: &Path, env: Vec<(String, String)>, c: &Common) -> anyhow::Result<Build> {
     let kiln = std::path::absolute(kiln)?;
     anyhow::ensure!(kiln.is_file(), "no kiln at {}", kiln.display());
-    Ok(Build { label: label.to_owned(), kiln, env })
+    Ok(Build { label: label.to_owned(), kiln, env, bus_memory: c.bus_memory })
 }
 
 /// Runs `builds` in turn, `c.rounds` each (A B, then B A, ...), writing the run as it goes.
@@ -177,7 +183,8 @@ fn measure(builds: &[Build], c: &Common) -> anyhow::Result<Run> {
         "realistic" => Profile::realistic(),
         "overload" => Profile::overload(),
         "many" => Profile::many(),
-        p => anyhow::bail!("no profile {p}: realistic, overload, many or small"),
+        "flood" => Profile::flood(),
+        p => anyhow::bail!("no profile {p}: realistic, overload, flood, many or small"),
     };
     if let Some(w) = c.window {
         profile.window_s = w;
@@ -256,11 +263,11 @@ fn main() -> anyhow::Result<()> {
     }
     match Cli::parse().cmd {
         Cmd::Run { kiln, label, env: e, common } => {
-            measure(&[build(&label, &kiln, env(&e)?)?], &common)?;
+            measure(&[build(&label, &kiln, env(&e)?, &common)?], &common)?;
         }
         Cmd::Ab { a, b, label_a, label_b, env_a, env_b, common } => {
             anyhow::ensure!(label_a != label_b, "the two builds need labels of their own");
-            measure(&[build(&label_a, &a, env(&env_a)?)?, build(&label_b, &b, env(&env_b)?)?], &common)?;
+            measure(&[build(&label_a, &a, env(&env_a)?, &common)?, build(&label_b, &b, env(&env_b)?, &common)?], &common)?;
         }
         Cmd::Compare { first, second, build } => {
             let (one, two) = (load(&first)?, load(&second)?);

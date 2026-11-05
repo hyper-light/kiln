@@ -6,10 +6,11 @@
 //! its log.
 
 use std::collections::{BTreeSet, HashMap, HashSet};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
+use arc_swap::ArcSwapOption;
 use kiln_ci::plan::{self, Conclusion as PlanC, LegReport, LegSpec, PlanAction, PlanSource, RunInput, RunPlan, Settings};
 use kiln_ci::sched::groups::GroupConfig;
 use kiln_ci::sched::retry::{Failed, FailureClass, RetryOn, RetryPolicy};
@@ -20,12 +21,12 @@ use kiln_ci::sched::{Command, Config, Input, LegIn, Outcome, RunnerIn, Scheduler
 use kiln_ci::trigger::Event;
 use kiln_ci::wf::Workflow;
 use kiln_ci::wire::{self, AssignmentV2, JobEventV2};
-use parking_lot::Mutex;
 use rusqlite::OptionalExtension as _;
 
 use super::runs;
 use crate::hub::Hub;
 use crate::proto::{CAP_ACTIONS, CAP_CI2, CAP_DOCKER, JobResult, LANE_CONTROL, ServerMsg};
+use crate::rcu::Rcu;
 use crate::store::{Repo, Status};
 
 /// A run to start: a workflow that matched an event.
@@ -188,6 +189,33 @@ pub enum Msg {
     /// A person paused a leg, or resumed it (docs/ci.md W26-R22): waiting, it's placed nowhere
     /// until it's resumed. The store has it paused already, and its runner froze it if it runs.
     LegPaused { leg: String, paused: bool },
+}
+
+/// The bytes of messages waiting for the dispatcher, at the most (goal 11, plan 01a1a87b2e56 step 3:
+/// `crate::memory::owners::CI_INBOX`): as much as the hub's queue of runners' messages
+/// ([`crate::net::EVENTS_BYTES`]) its runners' messages are made from, one a message. Past it the hub's
+/// loop waits ([`Handle::send_held`]), and behind it the net thread and QUIC's flow control hold the
+/// runners; what's sent where nothing can wait ([`Handle::send`]) is counted all the same.
+const INBOX_BYTES: usize = crate::net::EVENTS_BYTES;
+
+impl crate::memory::queue::Weigh for Msg {
+    /// Its place, and what varies with what a runner said: its names, its payload as JSON's bytes
+    /// (`crate::memory::queue::json_bytes`). A person's asks count by their place and their own size.
+    fn weight(&self) -> usize {
+        use crate::memory::queue::json_bytes;
+        let names = |l: &[String]| l.iter().map(|n| size_of::<String>().saturating_add(n.len())).fold(0usize, usize::saturating_add);
+        size_of::<Self>().saturating_add(match self {
+            Msg::Start(_) | Msg::Preview { .. } => size_of::<Start>(),
+            Msg::RunnerUp { agent, running } => agent.len().saturating_add(names(running)),
+            Msg::Event { agent, leg, event } => agent.len().saturating_add(leg.len()).saturating_add(size_of::<crate::proto::JobEvent>()).saturating_add(json_bytes(event)),
+            Msg::Finished { agent, result } => agent.len().saturating_add(json_bytes(result)),
+            Msg::CancelLegs { run, legs, reason, .. } => run.len().saturating_add(names(legs)).saturating_add(reason.len()),
+            Msg::Executor { agent, said } => agent.len().saturating_add(json_bytes(said)),
+            Msg::WorkState { agent, state } => agent.len().saturating_add(size_of::<kiln_ci::work::slots::WorkState>()).saturating_add(json_bytes(state)),
+            Msg::Warm { agent, held, .. } => agent.len().saturating_add(size_of::<kiln_ci::sched::warm::Held>()).saturating_add(json_bytes(held)),
+            _ => 0,
+        })
+    }
 }
 
 /// Where and how a leg runs, as the scheduler placed it.
@@ -572,18 +600,25 @@ fn with_docker(options: serde_json::Value, docker: &str) -> serde_json::Value {
     serde_json::Value::Object(o)
 }
 
-/// The hub's handle on the dispatcher.
+/// The hub's handle on the dispatcher. What the hub reads of it on its runners' messages (whether
+/// a job is one of the engine's legs, which runner keeps a failed one) and the API on its calls,
+/// each reads without a lock (goal 5, plan 01a1a59c2aae step 2): an immutable copy swapped in whole
+/// as legs, runs and kept legs come and go (`crate::rcu`), the dispatcher the one writer of the legs
+/// and runs. A reader sees every change made before it looked, as it did under the lock, and never
+/// waits on a writer.
 pub struct Handle {
-    tx: async_channel::Sender<Msg>,
-    rx: Mutex<Option<async_channel::Receiver<Msg>>>,
+    /// Its inbox, bounded at [`INBOX_BYTES`].
+    tx: crate::memory::queue::Sender<Msg>,
+    /// The dispatcher's end of its messages, taken once as it starts.
+    rx: ArcSwapOption<crate::memory::queue::Receiver<Msg>>,
     on: AtomicBool,
     /// Legs the dispatcher owns, so the hub hands their messages here and not to v1.
-    legs: Arc<Mutex<HashSet<String>>>,
-    runs: Arc<Mutex<HashSet<String>>>,
+    legs: Rcu<HashSet<Arc<str>>>,
+    runs: Rcu<HashSet<Arc<str>>>,
     /// Failed legs kept to look into: the runner keeping each, and until when (W17-R02).
-    kept: Mutex<HashMap<String, (String, i64)>>,
-    /// The unfinished runs rebuilt as the dispatcher started (W05-R25, AC09).
-    restored: Mutex<Option<Restored>>,
+    kept: Rcu<HashMap<String, (String, i64)>>,
+    /// The unfinished runs rebuilt as the dispatcher started (W05-R25, AC09): set once, then read.
+    restored: OnceLock<Restored>,
 }
 
 /// What the dispatcher rebuilt as it started: the unfinished runs, their legs, and how long it took.
@@ -596,16 +631,28 @@ pub struct Restored {
 
 impl Default for Handle {
     fn default() -> Self {
-        let (tx, rx) = async_channel::unbounded();
-        Handle { tx, rx: Mutex::new(Some(rx)), on: AtomicBool::new(false), legs: Arc::default(), runs: Arc::default(), kept: Mutex::default(), restored: Mutex::default() }
+        let (tx, rx) = crate::memory::queue::bounded(&crate::memory::owners::CI_INBOX, INBOX_BYTES);
+        Handle { tx, rx: ArcSwapOption::from_pointee(rx), on: AtomicBool::new(false), legs: Rcu::default(), runs: Rcu::default(), kept: Rcu::default(), restored: OnceLock::new() }
     }
 }
 
 impl Handle {
-    /// Sends a message, unless the engine is off (then nothing listens).
+    /// Sends a message, unless the engine is off (then nothing listens), never waiting: for callers that
+    /// can't (a person's request, a change to the settings: a message each), counted in the inbox's bytes
+    /// all the same, past [`INBOX_BYTES`] if it must be. Runners' messages wait for room instead
+    /// ([`Handle::send_held`]).
     pub fn send(&self, m: Msg) {
         if self.on.load(Ordering::Relaxed) {
-            let _ = self.tx.try_send(m);
+            let _ = self.tx.force_send(m);
+        }
+    }
+
+    /// Sends a runner's message, unless the engine is off, waiting while the inbox holds
+    /// [`INBOX_BYTES`]: the hub's loop waits, and behind it the net thread and QUIC's flow control hold
+    /// the runners, as for sessions' inboxes (goal 11, plan 01a1a87b2e56 step 3).
+    pub async fn send_held(&self, m: Msg) {
+        if self.on.load(Ordering::Relaxed) {
+            let _ = self.tx.send(m).await;
         }
     }
 
@@ -615,36 +662,63 @@ impl Handle {
 
     /// What the dispatcher rebuilt as it started, once it has.
     pub fn restored(&self) -> Option<Restored> {
-        *self.restored.lock()
+        self.restored.get().copied()
     }
 
     /// Whether `job` is one of the engine's legs.
     pub fn is_leg(&self, job: &str) -> bool {
-        self.legs.lock().contains(job)
+        self.legs.load().contains(job)
     }
 
     /// A failed leg kept on `agent` until `until` (W17-R02): its events and logs (a step rerun in
     /// place) are taken from that runner; `None` lets it go.
     pub fn keep(&self, job: &str, kept: Option<(String, i64)>) {
-        let mut g = self.kept.lock();
-        match kept {
+        self.kept.update(|g| match &kept {
             Some(k) => {
-                g.insert(job.to_owned(), k);
+                g.insert(job.to_owned(), k.clone());
             }
             None => {
                 g.remove(job);
             }
-        }
+        });
     }
 
     /// Whether `agent` keeps `job` now.
     pub fn kept_by(&self, job: &str, agent: &str) -> bool {
-        self.kept.lock().get(job).is_some_and(|(a, until)| a == agent && *until > crate::util::now_unix())
+        self.kept.load().get(job).is_some_and(|(a, until)| a == agent && *until > crate::util::now_unix())
     }
 
     /// Whether `run` is one of the engine's live runs.
     pub fn is_run(&self, run: &str) -> bool {
-        self.runs.lock().contains(run)
+        self.runs.load().contains(run)
+    }
+
+    /// The dispatcher's: `legs` are its now.
+    fn own_legs<'a>(&self, legs: impl IntoIterator<Item = &'a str> + Clone) {
+        self.legs.update(|s| s.extend(legs.clone().into_iter().map(Arc::from)));
+    }
+
+    /// The dispatcher's: `legs` aren't its any more.
+    fn drop_legs<'a>(&self, legs: impl IntoIterator<Item = &'a str> + Clone) {
+        self.legs.update(|s| {
+            for l in legs.clone() {
+                s.remove(l);
+            }
+        });
+    }
+
+    /// The dispatcher's: `run` is live.
+    fn own_run(&self, run: &str) {
+        self.runs.update(|s| {
+            s.insert(Arc::from(run));
+        });
+    }
+
+    /// The dispatcher's: `run` isn't live any more.
+    fn drop_run(&self, run: &str) {
+        self.runs.update(|s| {
+            s.remove(run);
+        });
     }
 }
 
@@ -1064,7 +1138,7 @@ pub fn spawn(hub: Arc<Hub>) {
     if !hub.cfg.ci.enabled {
         return;
     }
-    let Some(rx) = hub.ci.rx.lock().take() else { return };
+    let Some(rx) = hub.ci.rx.swap(None) else { return };
     hub.ci.on.store(true, Ordering::Relaxed);
     super::services::spawn_maintenance(Arc::clone(&hub));
     super::webhooks::spawn(Arc::clone(&hub));
@@ -1112,7 +1186,7 @@ pub fn spawn(hub: Arc<Hub>) {
         if restored.runs > 0 {
             tracing::info!(runs = restored.runs, legs = restored.legs, ms = restored.took.as_millis(), "the CI engine rebuilt its runs");
         }
-        *hub.ci.restored.lock() = Some(restored);
+        let _ = hub.ci.restored.set(restored);
         // The runners that said hello while it rebuilt: what each said it runs is on its record
         // (the hub kept it); a leg it didn't say it has, it lost.
         let agents: Vec<(String, Vec<String>)> = hub.agents.load().values().filter(|a| a.connected).map(|a| (a.name.clone(), a.running.clone())).collect();
@@ -1525,13 +1599,13 @@ impl Dispatch {
             runs::set_approval(&self.hub, &id, "required", None).await?;
             st.awaiting = Some(Awaiting { group });
             self.runs.insert(id.clone(), st);
-            self.hub.ci.runs.lock().insert(id.clone());
+            self.hub.ci.own_run(&id);
             self.hub.emit_run(&id).await;
             crate::rt::spawn(super::notify::approval_waiting(Arc::clone(&self.hub), id, Vec::new()));
             return Ok(());
         }
         self.runs.insert(id.clone(), st);
-        self.hub.ci.runs.lock().insert(id.clone());
+        self.hub.ci.own_run(&id);
         self.hub.emit_run(&id).await;
         let cmds = self.run_queued(&id, group, Arrival::New);
         // Boxed, as each step of the commands-actions-queue cycle is: its futures otherwise nest
@@ -1834,12 +1908,9 @@ impl Dispatch {
                     let cmds = self.sched.handle(Input::RunFinished { run: run.to_owned() }, now_ms());
                     if let Some(r) = self.runs.remove(run) {
                         self.workflow_run(&r, "completed", Some(c.result()));
-                        let mut g = self.hub.ci.legs.lock();
-                        for id in r.keys.values() {
-                            g.remove(id);
-                        }
+                        self.hub.ci.drop_legs(r.keys.values().map(String::as_str));
                     }
-                    self.hub.ci.runs.lock().remove(run);
+                    self.hub.ci.drop_run(run);
                     self.hub.emit_run(run).await;
                     if let Some(cmds) = self.after(cmds) {
                         Box::pin(self.commands(cmds)).await;
@@ -1963,7 +2034,7 @@ impl Dispatch {
         st.who = who_of(&self.hub, &st).await;
         self.workflow_run(&st, "requested", None);
         self.runs.insert(run.to_owned(), st);
-        self.hub.ci.runs.lock().insert(run.to_owned());
+        self.hub.ci.own_run(run);
         self.hub.emit_run(run).await;
         let cmds = self.run_queued(run, group, Arrival::Rerun);
         Box::pin(self.commands(cmds)).await;
@@ -2148,7 +2219,7 @@ impl Dispatch {
         }
         let Some(r) = self.runs.get_mut(run) else { return Ok(()) };
         r.keys.insert(spec.key.clone(), id.clone());
-        self.hub.ci.legs.lock().insert(id.clone());
+        self.hub.ci.own_legs([id.as_str()]);
         let mut leg = leg_in(r, run, &id, &spec, &self.hub.cfg.ci, &self.warm);
         // W28-R46: a run that adopts gives its legs work, keyed by W08-R10's input hash.
         leg.work = work_of(r, &spec, reuse.as_ref().map(|(h, _)| h.clone()));
@@ -2978,7 +3049,7 @@ impl Dispatch {
     /// dispatcher, and its slot the scheduler's to give.
     async fn forget_gone(&mut self, leg: &str, attempt: u32) {
         self.legs.remove(leg);
-        self.hub.ci.legs.lock().remove(leg);
+        self.hub.ci.drop_legs([leg]);
         self.hub.logs.finish(leg);
         let cmds = self.sched.handle(Input::AttemptFinished { leg: leg.to_owned(), attempt, outcome: Outcome::Cancelled }, now_ms());
         if let Some(cmds) = self.after(cmds) {
@@ -3003,12 +3074,12 @@ impl Dispatch {
                     _ => {
                         self.legs.remove(&leg);
                         self.held.remove(&leg);
-                        self.hub.ci.legs.lock().remove(&leg);
+                        self.hub.ci.drop_legs([leg.as_str()]);
                     }
                 }
             }
             self.runs.remove(&run);
-            self.hub.ci.runs.lock().remove(&run);
+            self.hub.ci.drop_run(&run);
             let cmds = self.sched.handle(Input::RunFinished { run }, now_ms());
             Box::pin(self.commands(cmds)).await;
         }
@@ -3321,7 +3392,7 @@ impl Dispatch {
                     rebuild_spec(&wf, &v)
                 }
             };
-            self.hub.ci.legs.lock().insert(id.clone());
+            self.hub.ci.own_legs([id.as_str()]);
             self.legs.insert(
                 id.clone(),
                 LegSt {
@@ -3355,7 +3426,7 @@ impl Dispatch {
                 _ => queued.push(li),
             }
         }
-        self.hub.ci.runs.lock().insert(run.to_owned());
+        self.hub.ci.own_run(run);
         let waits = st.awaiting.is_some();
         self.runs.insert(run.to_owned(), st);
         if waits {
@@ -3750,5 +3821,86 @@ mod tests {
         engine.handle(Input::RunnerUp(Box::new(RunnerIn { id: "adacachy".into(), slots: 4, ..RunnerIn::default() })), 0);
         engine.handle(Input::RunnerSample { runner: "adacachy".into(), sample: s }, 1_000);
         assert!(engine.headroom("adacachy").is_some_and(|h| (h.cpus - 19.2).abs() < 1e-6 && h.mem == 64 * GIB && h.io_full == Some(2.1)), "{:?}", engine.headroom("adacachy"));
+    }
+
+    /// Goal 5, plan 01a1a59c2aae step 2: what the hub asks of the dispatcher on its runners'
+    /// messages answers as it did under the lock: a leg or run the dispatcher took on is the
+    /// engine's from then, until it lets it go; a finished run's legs go together, so a reader
+    /// sees all of them or none; a kept leg is its runner's until it's let go or its time is up;
+    /// what it rebuilt is said once; and its messages' end is taken once.
+    /// Goal 11, plan 01a1a87b2e56 step 3: the dispatcher's inbox is bounded in bytes (on `/metrics` as
+    /// the CI inbox's): past it a runner's message waits for room, and a person's goes all the same; a
+    /// message weighs what it carries.
+    #[test]
+    fn g11_s3_the_dispatchers_inbox_is_bounded_in_bytes() -> anyhow::Result<()> {
+        use crate::memory::queue::Weigh as _;
+        let h = super::Handle::default();
+        anyhow::ensure!(crate::memory::owners::CI_INBOX.bound().is_some_and(|b| b >= super::INBOX_BYTES));
+        h.on.store(true, std::sync::atomic::Ordering::Relaxed);
+        let up = |n: usize| super::Msg::RunnerUp { agent: "a".into(), running: vec!["l".repeat(n)] };
+        anyhow::ensure!(up(1000).weight() - up(0).weight() == 1000);
+        crate::rt::block_on(async move {
+            h.send_held(up(super::INBOX_BYTES / 2)).await;
+            let waited = crate::rt::timeout(std::time::Duration::from_millis(50), h.send_held(up(super::INBOX_BYTES / 2))).await.is_err();
+            anyhow::ensure!(waited, "a runner's message waits for room");
+            h.send(super::Msg::RoutingChanged);
+            anyhow::ensure!(h.tx.len() == 2, "a person's went: {}", h.tx.len());
+            Ok(())
+        })
+    }
+
+    #[test]
+    fn g5_the_dispatchers_legs_runs_and_kept_legs_read_without_a_lock() -> anyhow::Result<()> {
+        let h = super::Handle::default();
+        anyhow::ensure!(!h.is_leg("l1") && !h.is_run("r1") && h.restored().is_none());
+        h.own_run("r1");
+        h.own_legs(["l1"]);
+        h.own_legs(["l2", "l3"]);
+        anyhow::ensure!(h.is_run("r1") && h.is_leg("l1") && h.is_leg("l2") && h.is_leg("l3") && !h.is_leg("l4"));
+        // A reader's copy, taken before the run finished, keeps every leg; the next read, none.
+        let before = h.legs.get();
+        h.drop_legs(["l1", "l2"]);
+        h.drop_run("r1");
+        anyhow::ensure!(before.len() == 3 && !h.is_leg("l1") && !h.is_leg("l2") && h.is_leg("l3") && !h.is_run("r1"));
+        h.drop_legs(["l3"]);
+        anyhow::ensure!(h.legs.load().is_empty());
+        // Kept on a runner until a time to come; another runner doesn't keep it; let go, nobody does.
+        let later = crate::util::now_unix() + 600;
+        h.keep("l9", Some(("metal-1".into(), later)));
+        anyhow::ensure!(h.kept_by("l9", "metal-1") && !h.kept_by("l9", "metal-2"));
+        h.keep("l9", Some(("metal-1".into(), crate::util::now_unix() - 1)));
+        anyhow::ensure!(!h.kept_by("l9", "metal-1"), "its time is up");
+        h.keep("l9", None);
+        anyhow::ensure!(h.kept.load().is_empty());
+        let r = super::Restored { runs: 2, legs: 5, took: std::time::Duration::from_millis(3) };
+        anyhow::ensure!(h.restored.set(r).is_ok() && h.restored() == Some(r));
+        anyhow::ensure!(h.rx.swap(None).is_some() && h.rx.swap(None).is_none(), "the dispatcher's end is taken once");
+        Ok(())
+    }
+
+    /// Goal 5: writers on many threads at once lose none of their changes (kept legs are kept by the
+    /// dispatcher and by the API both), and readers on other threads go on reading meanwhile.
+    #[test]
+    fn g5_kept_legs_written_at_once_lose_nothing() -> anyhow::Result<()> {
+        let h = std::sync::Arc::new(super::Handle::default());
+        let later = crate::util::now_unix() + 600;
+        let threads: Vec<_> = (0..8)
+            .map(|t| {
+                let h = std::sync::Arc::clone(&h);
+                std::thread::spawn(move || {
+                    for i in 0..200 {
+                        let leg = format!("l{t}-{i}");
+                        h.keep(&leg, Some((format!("m{t}"), later)));
+                        let _ = h.kept_by(&leg, "m0");
+                    }
+                })
+            })
+            .collect();
+        for t in threads {
+            t.join().map_err(|_| anyhow::anyhow!("a writer panicked"))?;
+        }
+        anyhow::ensure!(h.kept.load().len() == 8 * 200);
+        anyhow::ensure!((0..8).all(|t| h.kept_by(&format!("l{t}-199"), &format!("m{t}"))));
+        Ok(())
     }
 }

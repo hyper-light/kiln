@@ -172,6 +172,12 @@ pub fn of(session: &str, update: &Update, now: i64) -> Vec<Row> {
 /// An event's row.
 pub fn event(session: &str, e: &Event) -> Option<EventRow> {
     let body = serde_json::to_string(e).ok()?;
+    Some(event_written(session, e, body))
+}
+
+/// [`event`], its JSON written out already (`body`, `serde_json::to_string(e)`'s text), not again: a session's
+/// copy writes each event out once, for itself and its row (goal 9, plan 01a1a87b2cec step 5).
+pub fn event_written(session: &str, e: &Event, body: String) -> EventRow {
     let (kind, level, tool, status, text) = match &e.body {
         Body::User { text, attachments, .. } => {
             let mut t = text.clone();
@@ -193,7 +199,7 @@ pub fn event(session: &str, e: &Event) -> Option<EventRow> {
             ("tool", Some(json_word(&t.tool)), Some(t.name.clone()), Some(status_word(t.status)), words)
         }
     };
-    Some(EventRow {
+    EventRow {
         session: session.to_owned(),
         id: e.id.clone(),
         seq: e.seq,
@@ -206,7 +212,7 @@ pub fn event(session: &str, e: &Event) -> Option<EventRow> {
         status,
         text: clip(&text, SEARCH_TEXT_MAX),
         body,
-    })
+    }
 }
 
 /// Rows in the order they came, with what a later one replaces dropped: one write per event and

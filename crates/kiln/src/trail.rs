@@ -254,27 +254,33 @@ pub async fn checkpoint(hub: &Hub, now: bool) -> anyhow::Result<Option<u64>> {
             Ok((root, proof, recent))
         })
         .await?;
-    let recent: Vec<(Entry, String)> = recent.into_iter().map(entry).collect::<anyhow::Result<_>>()?;
-    let (head, run) = match recent.split_first() {
-        Some((h, rest)) if signed > 0 => (Some(&h.0), rest),
-        _ => (None, recent.as_slice()),
-    };
-    if let Some((e, _)) = run.iter().find(|(e, kept)| hex::encode(e.hash()) != *kept) {
-        anyhow::bail!("entry {} doesn't hash to the hash kept beside it", e.index);
-    }
-    let run: Vec<Entry> = run.iter().map(|(e, _)| e.clone()).collect();
-    trail::check(head, &run)?;
-    let origin = trail::origin(&hub.pki.organization());
-    let cp = Checkpoint { origin: origin.clone(), size, root };
-    let previous = last.as_ref().map(|k| Checkpoint { origin, size: k.size, root: k.root });
-    let pki = hub.pki.clone();
-    let mut under = Vec::new();
-    let note = trail::signed(&cp, previous.as_ref().map(|p| (p, proof.as_slice())), |m| {
-        let (signature, certificate) = crate::identities::sign_own(&pki, "server", m).map_err(|e| format!("{e:#}"))?;
-        under.clone_from(&certificate);
-        Ok((signature, certificate))
-    })?;
-    let (root, certificate) = (hex::encode(cp.root), B64.encode(&under));
+    // The entries since the last checkpoint checked as a chain, and the checkpoint signed, on the compute pool,
+    // off the shards (goal 9, plan 01a1a87b2cec step 3): each entry hashed again and a public-key signature held
+    // the shard that ran this loop, 2.3 ms a poll and up to 8 ms in the lab's s7c.
+    let (origin, pki, last) = (trail::origin(&hub.pki.organization()), hub.pki.clone(), last.as_ref().map(|k| (k.size, k.root)));
+    let (note, under) = crate::rt::compute(move || -> anyhow::Result<(String, Vec<u8>)> {
+        let recent: Vec<(Entry, String)> = recent.into_iter().map(entry).collect::<anyhow::Result<_>>()?;
+        let (head, run) = match recent.split_first() {
+            Some((h, rest)) if signed > 0 => (Some(&h.0), rest),
+            _ => (None, recent.as_slice()),
+        };
+        if let Some((e, _)) = run.iter().find(|(e, kept)| hex::encode(e.hash()) != *kept) {
+            anyhow::bail!("entry {} doesn't hash to the hash kept beside it", e.index);
+        }
+        let run: Vec<Entry> = run.iter().map(|(e, _)| e.clone()).collect();
+        trail::check(head, &run)?;
+        let cp = Checkpoint { origin: origin.clone(), size, root };
+        let previous = last.map(|(size, root)| Checkpoint { origin, size, root });
+        let mut under = Vec::new();
+        let note = trail::signed(&cp, previous.as_ref().map(|p| (p, proof.as_slice())), |m| {
+            let (signature, certificate) = crate::identities::sign_own(&pki, "server", m).map_err(|e| format!("{e:#}"))?;
+            under.clone_from(&certificate);
+            Ok((signature, certificate))
+        })?;
+        Ok((note, under))
+    })
+    .await??;
+    let (root, certificate) = (hex::encode(root), B64.encode(&under));
     let kept = hub
         .store
         .call(move |c| Ok(c.execute("INSERT OR IGNORE INTO trail_checkpoints (size, root, note, certificate, signed_at) VALUES (?1, ?2, ?3, ?4, ?5)", params![to, root, note, certificate, at])?))

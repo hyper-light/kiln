@@ -645,8 +645,11 @@ fn systemd_version() -> Option<u32> {
 /// can share the CPU among the legs and agents it starts, each in a cgroup of its own at the least
 /// CPU weight, with kiln's own processes in the unit's leaf (`DelegateSubgroup=`, on a systemd that
 /// has it). A server's goes in `kiln.slice` ([`kiln_slice`]) with the slice's weights, and, when it
-/// has cores of its own system-wide (`partition`), makes them a cpuset partition as it starts.
-fn systemd_unit(i: &Install<'_>, env: &str, exec: &str, systemd: Option<u32>, partition: bool) -> String {
+/// has cores of its own system-wide (`partition`), makes them a cpuset partition as it starts; with
+/// its shards in the real-time class (`realtime`, `[server] realtime`), it has room for that class at
+/// the priority they ask for (`LimitRTPRIO=`), and only that: `CPUSchedulingPolicy=` would put every
+/// thread of the server, and what it starts, in the class.
+fn systemd_unit(i: &Install<'_>, env: &str, exec: &str, systemd: Option<u32>, partition: bool, realtime: bool) -> String {
     let unit = i.unit;
     let target = if i.system { "multi-user.target" } else { "default.target" };
     let subgroup = if systemd.is_some_and(|v| v >= DELEGATE_SUBGROUP_SINCE) { format!("DelegateSubgroup={}\n", crate::os::UNIT_LEAF) } else { String::new() };
@@ -657,7 +660,15 @@ fn systemd_unit(i: &Install<'_>, env: &str, exec: &str, systemd: Option<u32>, pa
         } else {
             ""
         };
-        format!("# First among what this machine runs: in kiln.slice, with its weights (docs/priority.md).\nSlice=kiln.slice\nCPUWeight={SERVER_WEIGHT}\nIOWeight={SERVER_WEIGHT}\n{partition}")
+        let realtime = if realtime {
+            // Room for the shards' real-time class at its lowest priority (docs/priority.md, "A real-time
+            // class for the shards"): a user's service manager gives what of it its own limit allows, and
+            // the server says what it got.
+            format!("# Its shards in the real-time class at priority {p} (docs/priority.md).\nLimitRTPRIO={p}\n", p = crate::rt::REALTIME_PRIORITY)
+        } else {
+            String::new()
+        };
+        format!("# First among what this machine runs: in kiln.slice, with its weights (docs/priority.md).\nSlice=kiln.slice\nCPUWeight={SERVER_WEIGHT}\nIOWeight={SERVER_WEIGHT}\n{partition}{realtime}")
     } else {
         String::new()
     };
@@ -712,12 +723,15 @@ fn setup_boot(boot: Boot, i: &Install<'_>) -> anyhow::Result<bool> {
                     path = std::env::var("PATH").unwrap_or_default().replace('%', "%%").replace('"', ""),
                 ),
             };
-            // Cores of the server's own (docs/priority.md, "Cores of its own"), read as Linux will.
-            let cores = if i.server() { crate::config::Config::load(config).ok().and_then(|c| c.server.cores) } else { None };
+            // Cores of the server's own (docs/priority.md, "Cores of its own"), read as Linux will, and
+            // whether its shards ask for the real-time class.
+            let server = if i.server() { crate::config::Config::load(config).ok().map(|c| c.server) } else { None };
+            let cores = server.as_ref().and_then(|s| s.cores.clone());
             if let Some(c) = &cores {
                 crate::os::cpu_list(c).map_err(|e| anyhow::anyhow!("[server] cores in {}: {e}", config.display()))?;
             }
-            let body = systemd_unit(i, &env, &exec, systemd_version(), system && cores.is_some());
+            let realtime = server.as_ref().is_some_and(|s| s.realtime);
+            let body = systemd_unit(i, &env, &exec, systemd_version(), system && cores.is_some(), realtime);
             let (path, user_flag): (PathBuf, &[&str]) = if system {
                 (PathBuf::from(format!("/etc/systemd/system/{unit}.service")), &[])
             } else {
@@ -1912,17 +1926,22 @@ mod tests {
         let agent = ["supervise", "--", "agent"].map(str::to_owned);
         let server = ["supervise", "--", "server"].map(str::to_owned);
         let i = Install { system: true, unit: "kiln-agent", bin: Path::new("/usr/local/bin/kiln"), args: &agent, config: Path::new("/etc/kiln/kiln.toml"), state_dir: Path::new("/var/lib/kiln"), env: None, ask: false };
-        let runner = systemd_unit(&i, "", "/usr/local/bin/kiln supervise -- agent", Some(262), false);
+        let runner = systemd_unit(&i, "", "/usr/local/bin/kiln supervise -- agent", Some(262), false, false);
         anyhow::ensure!(runner.contains("\nDelegate=yes\nDelegateSubgroup=kiln\n"), "{runner}");
         anyhow::ensure!(!runner.contains("Slice=") && !runner.contains("CPUWeight") && !runner.contains("ProcessType"), "{runner}");
         // kiln's upgrades still read what it runs.
         anyhow::ensure!(crate::upgrade::parse_unit(&runner, "kiln-agent", true).is_some_and(|e| e.args == ["agent"]), "{runner}");
-        let old = systemd_unit(&i, "", "x", Some(252), false);
+        let old = systemd_unit(&i, "", "x", Some(252), false, false);
         anyhow::ensure!(old.contains("\nDelegate=yes\n") && !old.contains("DelegateSubgroup"), "{old}");
         let s = Install { unit: "kiln", args: &server, ..i };
-        let first = systemd_unit(&s, "", "/usr/local/bin/kiln supervise -- server", Some(262), true);
+        let first = systemd_unit(&s, "", "/usr/local/bin/kiln supervise -- server", Some(262), true, false);
         anyhow::ensure!(first.contains("\nSlice=kiln.slice\nCPUWeight=1000\nIOWeight=1000\n") && first.contains("cpuset.cpus.partition"), "{first}");
-        anyhow::ensure!(!systemd_unit(&s, "", "x", Some(262), false).contains("partition"));
+        anyhow::ensure!(!systemd_unit(&s, "", "x", Some(262), false, false).contains("partition"));
+        // Goal 8, plan 01a1a59c2b29 step 7: with its shards in the real-time class, room for that class
+        // at the priority they ask for, and no policy for every thread of it; a runner's never.
+        let realtime = systemd_unit(&s, "", "x", Some(262), false, true);
+        anyhow::ensure!(realtime.contains("\nLimitRTPRIO=1\n") && !realtime.contains("CPUSchedulingPolicy"), "{realtime}");
+        anyhow::ensure!(!first.contains("LimitRTPRIO") && !systemd_unit(&i, "", "x", Some(262), false, true).contains("LimitRTPRIO"), "only a server asking for it gets the room");
         anyhow::ensure!(kiln_slice(None).contains("\n[Slice]\nCPUWeight=1000\nIOWeight=1000\n") && !kiln_slice(None).contains("AllowedCPUs"));
         anyhow::ensure!(kiln_slice(Some("8-15")).ends_with("\nAllowedCPUs=8-15\n"));
         let plist = launchd_body(&s, Path::new("/tmp/kiln.log"), None);
@@ -1946,8 +1965,8 @@ mod tests {
         let i = Install { system: false, unit: "kiln-g8-agent", bin: Path::new("/bin/true"), args: &agent, config: Path::new("/tmp/kiln.toml"), state_dir: dir.path(), env: None, ask: false };
         let s = Install { unit: "kiln-g8-server", args: &server, ..i };
         let units = [
-            ("kiln-g8-agent.service", systemd_unit(&i, "", "/bin/true supervise -- agent", systemd_version(), false)),
-            ("kiln-g8-server.service", systemd_unit(&s, "", "/bin/true supervise -- server", systemd_version(), true)),
+            ("kiln-g8-agent.service", systemd_unit(&i, "", "/bin/true supervise -- agent", systemd_version(), false, false)),
+            ("kiln-g8-server.service", systemd_unit(&s, "", "/bin/true supervise -- server", systemd_version(), true, true)),
             ("kiln.slice", kiln_slice(Some("0-1"))),
         ];
         let mut paths = Vec::new();
