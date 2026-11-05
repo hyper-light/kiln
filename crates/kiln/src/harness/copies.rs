@@ -35,7 +35,8 @@ use serde_json::Value;
 use super::core::{MAX_EVENTS, Update};
 use super::live::{Feed, Payload, Tap};
 use super::packed::Segment;
-use super::registry::{Entry, Files, Location, Parts, PatchOf, changes_patch_of, merge_changes, null, state_patch_of, write};
+use super::registry::{Entry, Files, Location, Parts, PatchOf, changes_patch_of, merge_changes, null, write};
+use super::state_doc::StateDoc;
 use super::session::Info;
 use crate::hub::Hub;
 
@@ -1102,7 +1103,7 @@ pub struct View {
     pub info_json: Bytes,
     pub location: Arc<Location>,
     pub meta: Arc<Value>,
-    pub state: Arc<Value>,
+    pub state: Arc<StateDoc>,
     pub changes: Option<Files>,
     pub events: Events,
     pub rev: u64,
@@ -1260,17 +1261,18 @@ pub struct Mirror {
     pub(super) reported: String,
     pub(super) location: Arc<Location>,
     /// Its meta and state, shared with its views (a state patch's baseline is the state as it was,
-    /// not a copy of it).
+    /// not a copy of it). The state kept field by field, each field's JSON ([`StateDoc`]; goal 9, plan
+    /// 01a1a87b2cec step 5).
     pub(super) meta: Arc<Value>,
-    pub(super) state: Arc<Value>,
-    /// The state and the meta as its machine last said them, each with the value made of it (goal 9, plan
-    /// 01a1a87b2cec step 5): the same one again isn't made into a value while the copy's is still that one
-    /// (`super::registry::Registry::apply`). Held here too, each value is copied before any change, so a
+    pub(super) state: Arc<StateDoc>,
+    /// The state and the meta as its machine last said them, each with what was made of it (goal 9, plan
+    /// 01a1a87b2cec step 5): the same one again isn't made again while the copy's is still that one
+    /// (`super::registry::Registry::apply`). Held here too, each is copied before any change, so a
     /// changed one is told apart by its pointer.
-    pub(super) state_of: Option<(Box<super::model::State>, Arc<Value>)>,
+    pub(super) state_of: Option<(Box<super::model::State>, Arc<StateDoc>)>,
     pub(super) meta_of: Option<(Box<super::model::Meta>, Arc<Value>)>,
     /// The state as its viewers last had it sent (what a state patch is made against).
-    pub(super) sent: Arc<Value>,
+    pub(super) sent: Arc<StateDoc>,
     /// The bytes its last state frame took whole, and as a patch, and its last meta frame: the
     /// room the next of each is written into (they change little from one to the next).
     pub(super) state_bytes: usize,
@@ -1357,7 +1359,7 @@ impl Mirror {
             info_json: encoded.clone(),
             location: Arc::clone(&location),
             meta: null(),
-            state: null(),
+            state: super::state_doc::none(),
             changes: None,
             events: Events::default(),
             rev: 0,
@@ -1374,10 +1376,10 @@ impl Mirror {
             reported: String::new(),
             location,
             meta: null(),
-            state: null(),
+            state: super::state_doc::none(),
             state_of: None,
             meta_of: None,
-            sent: null(),
+            sent: super::state_doc::none(),
             state_bytes: 0,
             patch_bytes: 0,
             meta_bytes: 0,
@@ -1488,7 +1490,7 @@ impl Mirror {
                 }
             }
             None => {
-                self.sent = null();
+                self.sent = super::state_doc::none();
                 self.changes_sent = None;
             }
         }
@@ -1506,7 +1508,8 @@ impl Mirror {
         }
         let rev = Some(self.rev);
         let (mut p, whole, patched) = {
-            let patch = state_patch_of(&self.sent, &self.state);
+            // Its fields compared with those last sent as their JSON's bytes (goal 9, plan 01a1a87b2cec step 5).
+            let patch = self.state.patch(&self.sent);
             // A state that changed nothing its viewers were last sent goes as nothing: no field to patch,
             // and those that take it whole have it (goal 10, plan 01a1a87b2dae step 5).
             if patch.as_ref().is_some_and(|(set, gone)| set.is_empty() && gone.is_empty()) {
@@ -1517,7 +1520,7 @@ impl Mirror {
             let mut p = Payload::new(self.rev, room);
             let start = p.text().len();
             if whole {
-                let _ = write::value(p.text(), "state", "state", &self.state, rev);
+                let _ = write::state(p.text(), &self.state, rev);
             }
             let text = p.text().len();
             if let Some((set, gone)) = &patch {
@@ -3265,7 +3268,7 @@ mod tests {
                 readers.push(std::thread::spawn(move || -> Result<u64, String> {
                     let (mut last, mut looked) = (0u64, 0u64);
                     while !stop.load(std::sync::atomic::Ordering::Acquire) {
-                        let Some((rev, events, said)) = c.with(&i, |v| (v.rev, u64::try_from(v.events.len()).unwrap_or(0), v.state.get("rev").and_then(Value::as_u64).unwrap_or(0))) else { continue };
+                        let Some((rev, events, said)) = c.with(&i, |v| (v.rev, u64::try_from(v.events.len()).unwrap_or(0), v.state.get::<u64>("rev").unwrap_or(0))) else { continue };
                         if rev < last {
                             return Err(format!("went back from {last} to {rev}"));
                         }
@@ -3288,7 +3291,7 @@ mod tests {
                             if let Some(m) = s.get_mut(&i) {
                                 m.rev += 1;
                                 m.upsert(Arc::new(Entry::new(json!({"id": format!("e{n}"), "seq": n}))));
-                                m.state = Arc::new(json!({"rev": m.rev}));
+                                m.state = Arc::new(StateDoc::of_value(&json!({"rev": m.rev})));
                                 m.commit(|_| None);
                             }
                         })),

@@ -1327,14 +1327,11 @@ impl Shard {
             self.core.attribution.step_began(|| read);
         }
         count(&self.desk.live.steps, 1);
+        // The pulse's step count; its spawns, completions, refusals and longest poll are recorded where they're
+        // counted (kiln's goal 9, plan 01a1a87b2cec step 5: a step read all four, from two lines of counters its
+        // turn otherwise doesn't touch).
         if let Some(entry) = self.desk.entry {
-            entry.pulse.record(
-                self.desk.live.steps.get(),
-                self.desk.live.spawns.get(),
-                self.desk.live.completed.get(),
-                self.desk.live.admission_refused.get(),
-                self.desk.live.longest_step_ns.get(),
-            );
+            entry.pulse.record_steps(self.desk.live.steps.get());
         }
         if let Some(deadline) = self.core.waited_for_ns.take() {
             self.note_wait_overrun(deadline);
@@ -2037,12 +2034,12 @@ impl Shard {
         match message {
             Control::Spawn(request) => {
                 if let Err(RtError::TooManyTasks { .. }) = self.spawn_request(*request) {
-                    count(&self.desk.live.admission_refused, 1);
+                    self.count_refused();
                 }
             }
             Control::SpawnService(request) => {
                 if let Err(RtError::TooManyTasks { .. }) = self.spawn_request_with(*request, true) {
-                    count(&self.desk.live.admission_refused, 1);
+                    self.count_refused();
                 }
             }
             Control::Cancel(word) => {
@@ -2059,6 +2056,16 @@ impl Shard {
                 }
                 self.cancel_all();
             }
+        }
+    }
+
+    /// Counts an admission refused for want of a slot, and records it on the pulse.
+    fn count_refused(&self) {
+        count(&self.desk.live.admission_refused, 1);
+        if let Some(entry) = self.desk.entry {
+            entry
+                .pulse
+                .record_admission_refused(self.desk.live.admission_refused.get());
         }
     }
 
@@ -2247,9 +2254,12 @@ impl Shard {
         if let Some(attributed) = attributed {
             count_long_poll(&self.desk.live, attributed);
         }
-        // A store only when the longest grew, which most polls leave as it was.
+        // A store only when the longest grew, which most polls leave as it was; the pulse's with it.
         if elapsed > self.desk.live.longest_step_ns.get() {
             self.desk.live.longest_step_ns.set(elapsed);
+            if let Some(entry) = self.desk.entry {
+                entry.pulse.record_longest_step_ns(elapsed);
+            }
         }
     }
 
@@ -2342,6 +2352,9 @@ impl Shard {
         match outcome {
             Outcome::Completed => {
                 count(&self.desk.live.completed, 1);
+                if let Some(entry) = self.desk.entry {
+                    entry.pulse.record_completed(self.desk.live.completed.get());
+                }
             }
             Outcome::Cancelled => {
                 count(&self.desk.live.cancelled, 1);

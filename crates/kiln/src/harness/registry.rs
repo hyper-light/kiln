@@ -23,6 +23,7 @@ use super::host::{Host, Inventory, Limits};
 use super::kinds::KindInfo;
 use super::model::{Command, State, Status};
 use super::session::{Held, Info, MAX_NAME, Spec, SubagentBrief};
+use super::state_doc::StateDoc;
 use super::live::Viewer;
 use crate::hub::Hub;
 use crate::proto::{LANE_TERM, ServerMsg};
@@ -482,10 +483,18 @@ pub(super) mod write {
         "[".len() + bytes + n.saturating_sub(1) * ",".len() + "]".len()
     }
 
-    /// `{"t":"<tag>","<key>":<value>}`: a meta, a state, a changeset.
+    /// `{"t":"<tag>","<key>":<value>}`: a meta, a changeset.
     pub fn value(w: &mut impl Write, tag: &str, key: &str, v: &Value, rev: Option<u64>) -> io::Result<()> {
         head(w, tag, Some(key))?;
         serde_json::to_writer(&mut *w, v)?;
+        tail(w, rev)
+    }
+
+    /// `{"t":"state","state":<state>}`, the state written out as its fields are kept (goal 9, plan 01a1a87b2cec
+    /// step 5): the bytes [`value`] wrote of its tree.
+    pub fn state(w: &mut impl Write, s: &super::StateDoc, rev: Option<u64>) -> io::Result<()> {
+        head(w, "state", Some("state"))?;
+        s.write(w)?;
         tail(w, rev)
     }
 
@@ -538,8 +547,9 @@ pub(super) mod write {
         tail(w, rev)
     }
 
-    /// `{"t":"state_patch","set":{…},"gone":[…]}`: `set` always, `gone` left out when empty.
-    pub fn state_patch(w: &mut impl Write, set: &[(&String, &Value)], gone: &[&String], rev: Option<u64>) -> io::Result<()> {
+    /// `{"t":"state_patch","set":{…},"gone":[…]}`: `set` always (each field's key and its value's JSON as the state
+    /// keeps it: `super::StateDoc::patch`), `gone` left out when empty.
+    pub fn state_patch(w: &mut impl Write, set: &[(&str, &[u8])], gone: &[&str], rev: Option<u64>) -> io::Result<()> {
         head(w, "state_patch", Some("set"))?;
         w.write_all(b"{")?;
         for (i, (k, v)) in set.iter().enumerate() {
@@ -548,7 +558,7 @@ pub(super) mod write {
             }
             serde_json::to_writer(&mut *w, k)?;
             w.write_all(b":")?;
-            serde_json::to_writer(&mut *w, v)?;
+            w.write_all(v)?;
         }
         w.write_all(b"}")?;
         if !gone.is_empty() {
@@ -607,7 +617,7 @@ pub struct Parts {
     /// it: goal 10, plan 01a1a87b2dae step 3).
     pub(super) info: Arc<Info>,
     pub(super) meta: Arc<Value>,
-    pub(super) state: Arc<Value>,
+    pub(super) state: Arc<StateDoc>,
     pub(super) changes: Option<Files>,
     pub(super) events: super::copies::Events,
     /// Since a revision: only the events changed after it (it begins with `resumed`). None: the
@@ -811,7 +821,7 @@ impl Snapshot {
                 w.write_all(head.as_bytes())
             }
             Part::Meta => write::value(w, "meta", "meta", &p.meta, None),
-            Part::State => write::value(w, "state", "state", &p.state, None),
+            Part::State => write::state(w, &p.state, None),
             Part::Changes => match &p.changes {
                 Some(files) => write::changes(w, files.iter().map(|f| &**f), None),
                 None => Ok(()),
@@ -1184,17 +1194,6 @@ impl Frame {
             _ => &self.text,
         }
     }
-}
-
-/// What changed in a state, for `{"t":"state_patch","set":{..},"gone":[..]}`: the top-level fields
-/// of `now` that differ from `was` (by reference: nothing copied), and those it no longer has. None
-/// when there is nothing to patch (no state before).
-#[allow(clippy::type_complexity)]
-pub(super) fn state_patch_of<'a>(was: &'a Value, now: &'a Value) -> Option<(Vec<(&'a String, &'a Value)>, Vec<&'a String>)> {
-    let (Value::Object(was), Value::Object(now)) = (was, now) else { return None };
-    let set = now.iter().filter(|(k, v)| was.get(*k) != Some(*v)).collect();
-    let gone = was.keys().filter(|k| !now.contains_key(*k)).collect();
-    Some((set, gone))
 }
 
 /// A changeset's file as its JSON names it ([`crate::harness::model::FileKey`]): its path, and
@@ -1846,8 +1845,8 @@ impl Registry {
                     let info = Arc::make_mut(&mut m.info);
                     info.name = if name.is_empty() { info.kind_name.clone() } else { name };
                     let named = json!(info.name);
-                    if let Some(o) = Arc::make_mut(&mut m.state).as_object_mut() {
-                        o.insert("name".into(), named);
+                    if m.state.is_object() {
+                        Arc::make_mut(&mut m.state).set("name", &named);
                         m.commit(|m| m.state_frame());
                     } else {
                         m.commit(|_| None);
@@ -1912,12 +1911,11 @@ impl Registry {
             }
             let mut m = Mirror::new(info.clone(), Location::Machine(machine), Arc::clone(&self.bus));
             m.meta = Arc::new(u.meta.as_deref().and_then(|j| serde_json::from_str(j).ok()).unwrap_or(Value::Null));
+            let mut state = StateDoc::of_value(&state);
+            state.set("status", &json!("disconnected"));
             m.state = Arc::new(state);
-            if let Some(o) = Arc::make_mut(&mut m.state).as_object_mut() {
-                o.insert("status".into(), json!("disconnected"));
-            }
             // A conversation cleared since: what came before it is history, not its timeline.
-            let cleared = m.state.get("cleared").and_then(Value::as_u64).unwrap_or(0);
+            let cleared = m.state.get::<u64>("cleared").unwrap_or(0);
             for e in events.into_iter().filter(|e| e.seq >= cleared) {
                 if let Ok(v) = serde_json::from_str::<Value>(&e.body) {
                     let text = serde_json::to_string(&v).unwrap_or_default();
@@ -2503,11 +2501,12 @@ impl Registry {
                 m.started_over();
             }
             Update::State { state } => {
-                // The same state as the copy's was made of, the copy's still that value: not made again (goal 9,
-                // plan 01a1a87b2cec step 5: a whole state made into a value, 0.45% of the process in rt7's calm
-                // profile, and compared field by field with the last for a patch of nothing).
+                // The same state as the copy's was made of, the copy's still that one: not made again; another is
+                // written once and kept by its fields, its keys the last one's (goal 9, plan 01a1a87b2cec step 5: a
+                // whole state made into a value tree was 0.45% of the process in rt7's calm profile, its patch's field
+                // compares 0.19%, the last tree let go 0.25%).
                 if !m.state_of.as_ref().is_some_and(|(was, made)| **was == **state && Arc::ptr_eq(made, &m.state)) {
-                    m.state = Arc::new(serde_json::to_value(state).unwrap_or(Value::Null));
+                    m.state = Arc::new(StateDoc::made(&**state, &m.state));
                 }
                 // The info as it was, shared with the copy's views (not copied: its own is, as it changes).
                 let before = Arc::clone(&m.info);
@@ -2528,10 +2527,8 @@ impl Registry {
                             info.name.clone_from(n);
                             // Only where the state doesn't say it already: the copy's own when just made (nothing
                             // copied), else the last one's, shared with its views, copied only to change.
-                            if m.state.get("name").and_then(Value::as_str) != Some(n.as_str())
-                                && let Some(o) = Arc::make_mut(&mut m.state).as_object_mut()
-                            {
-                                o.insert("name".into(), json!(n));
+                            if m.state.is_object() && m.state.get::<String>("name").as_deref() != Some(n.as_str()) {
+                                Arc::make_mut(&mut m.state).set("name", &json!(n));
                             }
                         }
                     }
@@ -3785,7 +3782,7 @@ impl Registry {
     /// count: that machine lets go of it if it comes back. Ok once the package is on its way.
     pub async fn resume_on(&self, hub: &Hub, id: &str, to: &str, cwd: Option<String>) -> Result<(), String> {
         let store = self.convo.clone().ok_or_else(|| "this server keeps no conversations (KILN_CONVERSATIONS is off)".to_owned())?;
-        let (from, epoch) = self.sessions.with(id, |v| (Location::clone(&v.location), v.state.get("epoch").and_then(Value::as_u64).unwrap_or(0))).ok_or_else(|| "no such agent session".to_owned())?;
+        let (from, epoch) = self.sessions.with(id, |v| (Location::clone(&v.location), v.state.get::<u64>("epoch").unwrap_or(0))).ok_or_else(|| "no such agent session".to_owned())?;
         let from_name = match &from {
             Location::Local => return Err("it runs on the server itself, which is up: move it instead".into()),
             Location::Machine(m) => m.clone(),
@@ -3873,7 +3870,7 @@ impl Registry {
             let core = s.core.lock();
             (core.events().cloned().collect::<Vec<_>>(), core.state.clone())
         };
-        let had = self.sessions.with(id, |v| v.state.get("epoch").and_then(Value::as_u64)).flatten().unwrap_or(0);
+        let had = self.sessions.with(id, |v| v.state.get::<u64>("epoch")).flatten().unwrap_or(0);
         let next = had.max(state.epoch) + 1;
         state.epoch = next - 1;
         let from_cwd = state.cwd.clone();
@@ -3947,7 +3944,7 @@ impl Registry {
     pub fn state(&self, id: &str) -> Option<State> {
         // Read from its view (no copy of it made).
         let state = self.sessions.with(id, |v| Arc::clone(&v.state))?;
-        State::deserialize(&*state).ok()
+        state.read::<State>()
     }
 
     /// A session as lists show it.
@@ -3958,7 +3955,7 @@ impl Registry {
     /// What waits in session `id`'s queue, as its machine last said, the messages whole.
     pub fn queue(&self, id: &str) -> Vec<super::model::QueueItem> {
         let Some(state) = self.sessions.with(id, |v| Arc::clone(&v.state)) else { return Vec::new() };
-        state.get("queue").and_then(|q| Vec::<super::model::QueueItem>::deserialize(q).ok()).unwrap_or_default()
+        state.get::<Vec<super::model::QueueItem>>("queue").unwrap_or_default()
     }
 
     /// What `agents.get` and `agents.result` read of a session (`harness::ops`): its state as
@@ -3970,7 +3967,7 @@ impl Registry {
             (Arc::clone(&v.state), reply, v.changes.clone())
         })?;
         let changes = changes.map_or(Value::Null, |files| Value::Array(files.iter().map(|f| f.value()).collect()));
-        Some((Value::clone(&state), reply.map(|e| e.value()), changes))
+        Some((state.to_value(), reply.map(|e| e.value()), changes))
     }
 
     /// Tests: session `id`'s changeset, as its machine would report it.
@@ -3998,8 +3995,8 @@ impl Registry {
 /// A copy whose machine (or runner process) went away: said disconnected, to its viewers too.
 fn disconnected(m: &mut Mirror) -> Info {
     Arc::make_mut(&mut m.info).status = Status::Disconnected;
-    if let Some(o) = Arc::make_mut(&mut m.state).as_object_mut() {
-        o.insert("status".into(), json!("disconnected"));
+    if m.state.is_object() {
+        Arc::make_mut(&mut m.state).set("status", &json!("disconnected"));
     }
     m.commit(|m| m.state_frame());
     Info::clone(&m.info)
@@ -4149,7 +4146,7 @@ mod tests {
 
     /// A copy's state, set as its runner's would be.
     fn set_state(m: &mut Mirror, v: Value) {
-        m.state = Arc::new(v);
+        m.state = Arc::new(StateDoc::of_value(&v));
     }
 
     /// A copy's changeset as JSON (null before it has one).
@@ -4221,7 +4218,8 @@ mod tests {
             let written = |f: &dyn Fn(&mut Vec<u8>) -> std::io::Result<()>| write::string(64, |b| f(b));
             assert_eq!(written(&|b| write::events(b, [&e, &e], rev)), say(SessionFrame::Events { events: vec![odd.clone(), odd.clone()] }));
             assert_eq!(written(&|b| write::events(b, std::iter::empty::<&Entry>(), rev)), say(SessionFrame::Events { events: Vec::new() }));
-            assert_eq!(written(&|b| write::value(b, "state", "state", &odd, rev)), say(SessionFrame::State { state: odd.clone() }));
+            assert_eq!(written(&|b| write::state(b, &StateDoc::of_value(&odd), rev)), say(SessionFrame::State { state: odd.clone() }));
+            assert_eq!(written(&|b| write::state(b, &StateDoc::default(), rev)), say(SessionFrame::State { state: Value::Null }));
             assert_eq!(written(&|b| write::value(b, "meta", "meta", &odd, rev)), say(SessionFrame::Meta { meta: odd.clone() }));
             assert_eq!(written(&|b| write::changes(b, fs.iter(), rev)), say(SessionFrame::Changes { files: Value::Array(files.to_vec()) }));
             let set: Vec<&Entry> = fs.iter().collect();
@@ -4230,10 +4228,12 @@ mod tests {
             assert_eq!(written(&|b| write::changes_patch(b, set.get(..1).unwrap_or_default(), &[], rev)), say(SessionFrame::ChangesPatch { set: files.get(..1).unwrap_or_default().to_vec(), gone: Vec::new() }));
             assert_eq!(written(&|b| write::stream(b, "e\"1", "}\n☃", rev)), say(SessionFrame::Stream { id: "e\"1".into(), text: "}\n☃".into() }));
             let (was, now) = (json!({"a": 1, "b": {"c": 2}, "gone": 3}), json!({"a": 1, "b": {"c": 4}, "new\"": [5]}));
-            let (set, gone) = state_patch_of(&was, &now).ok_or_else(|| anyhow::anyhow!("no patch"))?;
-            let want = SessionFrame::StatePatch { set: set.iter().map(|(k, v)| ((*k).clone(), (*v).clone())).collect(), gone: gone.iter().map(|k| (*k).clone()).collect() };
+            let (was, now) = (StateDoc::of_value(&was), StateDoc::of_value(&now));
+            let (set, gone) = now.patch(&was).ok_or_else(|| anyhow::anyhow!("no patch"))?;
+            let set_values = set.iter().map(|(k, v)| Ok(((*k).to_owned(), serde_json::from_slice(v)?))).collect::<anyhow::Result<serde_json::Map<String, Value>>>()?;
+            let want = SessionFrame::StatePatch { set: set_values, gone: gone.iter().map(|k| (*k).to_owned()).collect() };
             assert_eq!(written(&|b| write::state_patch(b, &set, &gone, rev)), say(want));
-            let (set, gone) = state_patch_of(&now, &now).ok_or_else(|| anyhow::anyhow!("no patch"))?;
+            let (set, gone) = now.patch(&now).ok_or_else(|| anyhow::anyhow!("no patch"))?;
             assert_eq!(written(&|b| write::state_patch(b, &set, &gone, rev)), say(SessionFrame::StatePatch { set: serde_json::Map::new(), gone: Vec::new() }));
             // An entry's text is serde_json's, and its digest the one the runner makes of it.
             assert_eq!(e.text(), serde_json::to_string(&odd)?);
@@ -4388,7 +4388,7 @@ mod tests {
         assert!(first.patch.is_none());
         assert_eq!(first.for_viewer(STATE), first.for_viewer(WHOLE));
         let whole: Value = serde_json::from_str(second.for_viewer(WHOLE))?;
-        assert_eq!(whole, json!({"t": "state", "state": *m.state, "rev": second.rev}));
+        assert_eq!(whole, json!({"t": "state", "state": m.state.to_value(), "rev": second.rev}));
         // As what changed: the activity set, the pause gone, the skills (most of it) left out.
         let patch: Value = serde_json::from_str(second.for_viewer(STATE))?;
         assert_eq!(patch, json!({"t": "state_patch", "set": {"activity": "editing"}, "gone": ["pause"], "rev": second.rev}));
@@ -4402,7 +4402,7 @@ mod tests {
         for k in patch.get("gone").and_then(Value::as_array).into_iter().flatten() {
             had.remove(k.as_str().unwrap_or_default());
         }
-        assert_eq!(Value::Object(had.clone()), *m.state);
+        assert_eq!(Value::Object(had.clone()), m.state.to_value());
         Ok(())
     }
 
@@ -4430,14 +4430,14 @@ mod tests {
         let (_viewer, at) = m.feed.attach(Patches::default());
         let at = at.ok_or_else(|| anyhow::anyhow!("no feed"))?;
         let snapshot = Snapshot { parts: m.view().parts(), files: None, store: None }.frames();
-        assert!(snapshot.iter().any(|f| serde_json::from_str::<Value>(f).ok() == Some(json!({"t": "state", "state": *m.state}))));
+        assert!(snapshot.iter().any(|f| serde_json::from_str::<Value>(f).ok() == Some(json!({"t": "state", "state": m.state.to_value()}))));
         set_state(&mut m, json!({"status": "idle"}));
         m.commit(|m| m.state_frame());
         let frames = on_feed(&bus, &m, at)?;
         let [frame] = frames.as_slice() else { anyhow::bail!("{} frames on the feed", frames.len()) };
         // A field that appeared while nobody watched is absent from the whole state too.
         assert!(frame.patch.is_none());
-        assert_eq!(serde_json::from_str::<Value>(frame.for_viewer(STATE))?, json!({"t": "state", "state": *m.state, "rev": frame.rev}));
+        assert_eq!(serde_json::from_str::<Value>(frame.for_viewer(STATE))?, json!({"t": "state", "state": m.state.to_value(), "rev": frame.rev}));
         Ok(())
     }
 
@@ -4599,7 +4599,7 @@ mod tests {
             let (_watching, topic, mut at) = (attached.viewer, attached.topic, attached.at.unwrap_or_default());
             // The copy's state and meta values, by where they are, and its revision.
             let held = || async { hub.harness.sessions.on("s", |s| s.get("s").map(|m| (Arc::as_ptr(&m.state) as usize, Arc::as_ptr(&m.meta) as usize, m.rev))).await.flatten().unwrap_or_default() };
-            let viewed = || hub.harness.sessions.view("s").map(|v| Value::clone(&v.state)).unwrap_or_default();
+            let viewed = || hub.harness.sessions.view("s").map(|v| v.state.to_value()).unwrap_or_default();
             let state = State { summary: "the retry loop reads its deadline".into(), ..State::default() };
             hub.harness.ingest(&hub, &there, "s", Update::State { state: Box::new(state.clone()) }).await;
             let (made, _, rev) = held().await;
