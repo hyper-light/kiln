@@ -14,12 +14,16 @@
 //! its wait's ticket, so the race's loser withdraws its own node and the join's still fires. A task's word
 //! used to be the node's identity, and the loser's withdrawal stranded the survivor.
 //!
-//! **Bounded, and allocation-free after the build**: at most `bound` waiters (the shard's
-//! `interests_per_shard`, which also bounds the desk's wait slots, so the table is never the first to
-//! refuse), in an arena of that many nodes with a free list, indexed by an open-addressed table of
-//! handles this module owns: a power of two at least twice `bound`, linear probing, and deletion by
-//! backward shift, so no tombstone accumulates and nothing is reallocated after the build (a std map may
-//! resize when its tombstones use up its growth room, which the earlier claim missed).
+//! **Bounded**: at most `bound` waiters (the shard's `interests_per_shard`, which also bounds the desk's
+//! wait slots, so the table is never the first to refuse), in an arena of that many nodes with a free list,
+//! reserved at the build and written as each is first taken, indexed by an open-addressed table of handles
+//! this module owns: a power of two at least twice the handles it holds, linear probing, and deletion by
+//! backward shift, so no tombstone accumulates (a std map may resize when its tombstones use up its growth
+//! room, which an earlier claim missed). The handles' table grows as it first holds more, twice as large each
+//! time, up to twice `bound` (kiln's goal 11, plan 01a1a87b2e56): it was made whole at the build, a shard of
+//! kiln's server paying half a megabyte for handles it never held. So it allocates after the build, at those
+//! growths alone (at most the log of its largest size, over the shard's life, none on a fire or a wake), and a
+//! growth the allocator refuses is refused as `Capacity`, as the bound is.
 
 use crate::error::RtError;
 use crate::shard::Ticket;
@@ -156,10 +160,43 @@ const VACANT: Entry = Entry {
 pub(crate) struct Interests {
     nodes: Vec<Node>,
     free: Vec<u32>,
+    /// The handles, open-addressed, at a load of a half or less: probes stay short and one slot is always
+    /// vacant. Made twice as large as it first holds more than a half (kiln's goal 11, plan 01a1a87b2e56), up to
+    /// the slots `bound` handles take, so its memory follows the most handles it has held, not its bound.
     handles: Box<[Entry]>,
     /// Handles in the table now.
     used: usize,
     bound: usize,
+    /// The slots `bound` handles take at a load of a half: the most the table grows to.
+    most_slots: usize,
+}
+
+/// A handles' table of `slots` (a power of two), every one vacant; none when the allocator refuses the room.
+fn table(slots: usize) -> Option<Box<[Entry]>> {
+    let mut handles = Vec::new();
+    handles.try_reserve_exact(slots).ok()?;
+    handles.resize(slots, VACANT);
+    Some(handles.into_boxed_slice())
+}
+
+/// Puts `entry` in the first vacant slot of `handles` from its home on (linear probing); false when none is.
+fn place(handles: &mut [Entry], entry: Entry) -> bool {
+    let slots = handles.len();
+    let Some(mask) = slots.checked_sub(1) else {
+        return false;
+    };
+    let mut at = home(entry.raw, slots);
+    for _ in 0..slots {
+        let Some(slot) = handles.get_mut(at) else {
+            return false;
+        };
+        if !slot.used {
+            *slot = entry;
+            return true;
+        }
+        at = at.wrapping_add(1) & mask;
+    }
+    false
 }
 
 /// The table's home slot for `raw` among `slots` (a power of two): Fibonacci hashing of the handle's
@@ -172,7 +209,9 @@ fn home(raw: i32, slots: usize) -> usize {
 }
 
 impl Interests {
-    /// A table for at most `bound` waiters, reserved now. `Capacity` when the reservation fails.
+    /// A table for at most `bound` waiters: their nodes reserved now (written as they are first taken), the
+    /// handles' table made for one handle and grown as it first holds more. `Capacity` when the reservation
+    /// fails.
     pub(crate) fn new(bound: usize) -> Result<Interests, RtError> {
         let refused = || RtError::Capacity {
             what: "readiness waiters",
@@ -183,20 +222,20 @@ impl Interests {
         let mut free = Vec::new();
         free.try_reserve_exact(bound).map_err(|_| refused())?;
         // At most `bound` handles at a load of a half or less: probes stay short and one is always vacant.
-        let slots = bound
+        let most_slots = bound
             .max(1)
             .checked_mul(2)
             .and_then(usize::checked_next_power_of_two)
             .ok_or_else(refused)?;
-        let mut handles = Vec::new();
-        handles.try_reserve_exact(slots).map_err(|_| refused())?;
-        handles.resize(slots, VACANT);
+        // The smallest table at that load: one handle, in two slots.
+        let handles = table(2.min(most_slots)).ok_or_else(refused)?;
         Ok(Interests {
             nodes,
             free,
-            handles: handles.into_boxed_slice(),
+            handles,
             used: 0,
             bound,
+            most_slots,
         })
     }
 
@@ -261,25 +300,47 @@ impl Interests {
         if self.used >= self.bound {
             return Err(refused);
         }
-        let slots = self.handles.len();
-        let mask = slots.checked_sub(1).ok_or(refused.clone())?;
-        let mut at = home(raw, slots);
-        for _ in 0..slots {
-            let Some(entry) = self.handles.get_mut(at) else {
-                break;
-            };
-            if !entry.used {
-                *entry = Entry {
-                    raw,
-                    lists,
-                    used: true,
-                };
-                self.used = self.used.saturating_add(1);
-                return Ok(());
-            }
-            at = at.wrapping_add(1) & mask;
+        // Past a load of a half with it: the table twice as large first (a table at most a half full has
+        // twice the handles' slots, so one doubling makes room; within `most_slots`, as `bound` is).
+        let held = self.used.saturating_add(1);
+        if held.saturating_mul(2) > self.handles.len() && !self.grow() {
+            return Err(refused);
         }
-        Err(refused)
+        let entry = Entry {
+            raw,
+            lists,
+            used: true,
+        };
+        if !place(&mut self.handles, entry) {
+            return Err(refused);
+        }
+        self.used = held;
+        Ok(())
+    }
+
+    /// The handles' table made twice as large, within `most_slots`, each handle placed again by its home in
+    /// it. False when it is that large already, or the allocator refuses the room (the table is left as it
+    /// was).
+    #[cold]
+    fn grow(&mut self) -> bool {
+        let Some(slots) = self
+            .handles
+            .len()
+            .checked_mul(2)
+            .filter(|slots| *slots <= self.most_slots)
+        else {
+            return false;
+        };
+        let Some(mut grown) = table(slots) else {
+            return false;
+        };
+        for entry in self.handles.iter().filter(|entry| entry.used) {
+            if !place(&mut grown, *entry) {
+                return false;
+            }
+        }
+        self.handles = grown;
+        true
     }
 
     /// Empties slot `at` and shifts back the entries after it whose probe passed through it (Knuth's
@@ -526,6 +587,33 @@ mod tests {
                 );
             }
             assert_eq!(table.used, model.len());
+            assert!(
+                table.handles.len() >= 2 * table.used,
+                "a load of a half or less"
+            );
         }
+        assert!(table.handles.len() <= table.most_slots);
+    }
+
+    /// kiln's goal 11 (plan 01a1a87b2e56): the handles' table starts at two slots and grows as it first holds
+    /// more, to the size its bound takes at most, each handle findable as it grows; it doesn't shrink.
+    #[test]
+    fn g11_the_handle_table_grows_as_it_first_holds_more() {
+        let mut table = Interests::new(1000).unwrap();
+        assert_eq!((table.handles.len(), table.most_slots), (2, 2048));
+        for raw in 0..1000 {
+            table.add(raw, raw % 2 == 0, 7, t(raw.unsigned_abs())).unwrap();
+            assert!(table.handles.len() >= 2 * table.used);
+            assert!(table.handles.len() <= 2 * 2 * table.used.max(1));
+        }
+        assert_eq!(table.handles.len(), 2048);
+        assert!(matches!(
+            table.add(1000, false, 7, t(1000)),
+            Err(RtError::Capacity { .. })
+        ));
+        for raw in 0..1000 {
+            assert_eq!(table.remove(raw, raw % 2 == 0, t(raw.unsigned_abs())), Readiness::NONE);
+        }
+        assert_eq!((table.used, table.handles.len()), (0, 2048), "the most it held");
     }
 }
