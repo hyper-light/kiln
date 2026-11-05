@@ -35,6 +35,7 @@ of its own; `/metrics` reads only those, so reading never touches a shard.
 | `kiln_shard_wakes_taken_total{shard}`, `kiln_shard_wakes_sent_total{shard,to}` | Wakes from other threads the shard took in (bits drained: a task's wakes before it runs are one), and the wakes its own thread made through tasks' wakers (a channel's send, a broadcast's subscribers, a cell's publisher): `to="own"` to its own tasks, `to="other"` to other shards'. |
 | `kiln_shard_kicks_sent_total{shard}`, `kiln_shard_kicks_saved_total{shard}` | The kicks its thread made to parked shards, each a system call on it, counted by the sender as it claims the park's kick; and the wakes and messages sent to it that found it running or its park's kick claimed, which cost their senders none (`hyper_rt::parking`). |
 | `kiln_shard_threads_woken_total{shard}` | The threads its thread unparked: compute pool workers woken for the jobs it queued, a thread waiting on what its task published; each a system call on it. |
+| `kiln_shard_park_seconds{shard}` (histogram) | How long its parks lasted, each from its driver wait's call to its return, in hyper-rt's bounds (`PARK_BOUNDS_NS`: doubling from 1 µs to 8,192 µs; 16 µs the first past the cheapest wake the lab measured on fedora, a socket's on the waiting thread's own CPU at 12.6 µs, wake-2): the parks a short spin before parking would have served sooner than their wakes, against the rest. |
 | `kiln_shard_harvests_total{shard}`, `kiln_shard_arms_total{shard}`, `kiln_shard_socket_calls_total{shard,call}`, `kiln_shard_socket_calls_idle_total{shard,call}` | The rest of its system calls (`crate::shard_health::Calls`): its driver's non-blocking waits while busy (a harvest, once a quantum); its readiness registrations with its driver (epoll_ctl, kevent, an AFD poll), each a task's wait or a handle armed again for the waits left after a fire; its tasks' TCP calls, `call` `accept`, `read` or `write`; and of the reads and writes, those that moved nothing (a read that found nothing ready, a write that found the send buffer full), each with a wait after it. |
 
 ### Each route class's latency (`kiln_route_*`, `crate::route_latency`)
@@ -218,7 +219,9 @@ a channel to a thread of kiln's own may wake inside std, and, before goal 9's st
 the kick's eventfd on each kicked wake). Beside them, what each request handed the pools: the compute pool's jobs, the
 workers they woke and the times a worker went to park (`compute.jobs_per_request`, `.unparks_per_request`,
 `.parks_per_request`), and each blocking share's jobs, kiln.db's writer's among them
-(`blocking.<share>.per_request`).
+(`blocking.<share>.per_request`). How long the shards' parks lasted, all shards together: `shards.park_p50_us`,
+`shards.park_p99_us`, and `shards.parks_under_16us_share`, the parks a spin as long as fedora's cheapest wake
+would have served sooner than their wakes.
 
 The fill is reported too (`fill.*`): how long it took (`fill.s`) and the server's own numbers over it
 (its CPU share, the shards', the pools'). It is the conversation feed at its busiest: every session's
