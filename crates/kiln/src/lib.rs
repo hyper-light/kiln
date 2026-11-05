@@ -63,6 +63,7 @@ pub mod proto;
 pub mod peers;
 pub mod pool_health;
 pub mod push;
+pub mod rcu;
 pub mod reach;
 pub mod reads;
 pub mod records;

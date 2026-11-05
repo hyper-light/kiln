@@ -80,7 +80,7 @@ pub async fn call(hub: &Hub, caller: &Caller, method: &Method, s: &[&str], q: &H
 
 async fn custom(hub: &Hub) -> Result<HashMap<String, Vec<String>>, Fail> {
     hub.store
-        .call(|c| {
+        .read(|c| {
             let mut st = c.prepare("SELECT name, capabilities FROM roles ORDER BY name")?;
             let rows = st.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?;
             Ok(rows.filter_map(Result::ok).map(|(n, caps)| (n, serde_json::from_str(&caps).unwrap_or_default())).collect())
@@ -141,7 +141,7 @@ async fn delete_role(hub: &Hub, caller: &Caller, name: &str) -> Result<Response,
 pub(super) async fn find_user(hub: &Hub, key: &str) -> Result<(String, String), Fail> {
     let k = key.trim_start_matches("user:").to_owned();
     hub.store
-        .call(move |c| Ok(c.query_row("SELECT id, name FROM users WHERE (id = ?1 OR name = ?1 COLLATE NOCASE) AND disabled_at IS NULL", [&k], |r| Ok((r.get(0)?, r.get(1)?))).optional()?))
+        .read(move |c| Ok(c.query_row("SELECT id, name FROM users WHERE (id = ?1 OR name = ?1 COLLATE NOCASE) AND disabled_at IS NULL", [&k], |r| Ok((r.get(0)?, r.get(1)?))).optional()?))
         .await
         .map_err(internal)?
         .ok_or_else(|| (StatusCode::NOT_FOUND, format!("no user `{key}`")))
@@ -150,7 +150,7 @@ pub(super) async fn find_user(hub: &Hub, key: &str) -> Result<(String, String), 
 async fn users(hub: &Hub) -> Result<Response, Fail> {
     let rows = hub
         .store
-        .call(|c| {
+        .read(|c| {
             let mut st = c.prepare(
                 "SELECT u.id, u.name, u.created_at, u.created_by, u.link_expires_at,
                         (SELECT json_group_array(CASE WHEN g.deny THEN '!' ELSE '' END || g.what || '@' || g.scope) FROM grants g WHERE g.principal = 'user:' || u.id)
@@ -283,7 +283,7 @@ async fn grants(hub: &Hub, q: &HashMap<String, String>) -> Result<Response, Fail
     };
     let rows = hub
         .store
-        .call(move |c| {
+        .read(move |c| {
             let mut st = c.prepare(
                 "SELECT g.id, g.principal, u.name, g.what, g.scope, g.deny, g.created_at, g.created_by FROM grants g JOIN users u ON g.principal = 'user:' || u.id
                  WHERE u.disabled_at IS NULL AND (?1 IS NULL OR u.id = ?1) ORDER BY u.name, g.id",
@@ -375,7 +375,7 @@ async fn tokens(hub: &Hub, caller: &Caller) -> Result<Response, Fail> {
     let only = (!session && mine.is_some()).then(|| caller.token.clone().unwrap_or_default());
     let rows = hub
         .store
-        .call(move |c| {
+        .read(move |c| {
             let mut st = c.prepare(&format!(
                 "SELECT {TOKEN_COLUMNS} FROM tokens WHERE kind IN ('pat', 'agent') AND (?1 IS NULL OR principal = ?1 OR on_behalf_of = ?1) AND (?2 IS NULL OR id = ?2)
                  ORDER BY created_at DESC LIMIT 500"
@@ -475,7 +475,7 @@ async fn may_touch(hub: &Hub, caller: &Caller, id: &str) -> Result<(String, Opti
     let tid = id.to_owned();
     let row: Option<(String, String, Option<String>)> = hub
         .store
-        .call(move |c| Ok(c.query_row("SELECT kind, principal, on_behalf_of FROM tokens WHERE id = ?1 AND kind IN ('pat', 'agent')", [&tid], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?))).optional()?))
+        .read(move |c| Ok(c.query_row("SELECT kind, principal, on_behalf_of FROM tokens WHERE id = ?1 AND kind IN ('pat', 'agent')", [&tid], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?))).optional()?))
         .await
         .map_err(internal)?;
     let Some((_, principal, behalf)) = row else { return Err((StatusCode::NOT_FOUND, "no such token".into())) };

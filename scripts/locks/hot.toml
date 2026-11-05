@@ -1,0 +1,167 @@
+# The API's hot path (goal 5 of the API runtime program, plan 01a1a59c2aae): the modules every request,
+# websocket and runner message runs through. No Mutex, RwLock or Condvar is declared in them outside a
+# test build's code, but those `allowed` lists, each with why it's off the hot path; shared state there is
+# an owner with messages, an immutable copy swapped in whole (`crate::rcu`), or a copy per shard.
+# `python3 scripts/locks.py check` holds the tree to this (CI: .kiln/ci.yaml and .github/workflows/ci.yml),
+# and `python3 scripts/test_locks.py` proves it fails on a planted lock.
+hot = [
+  # HTTP: every request and websocket, kiln's own server and its handlers' entry.
+  "crates/kiln-http/src",
+  "crates/kiln/src/http/server.rs",
+  "crates/kiln/src/http/ws.rs",
+  "crates/kiln/src/http/io.rs",
+  "crates/kiln/src/api.rs",
+  "crates/kiln/src/overload.rs",
+  "crates/kiln/src/ui.rs",
+  "crates/kiln/src/authz",
+  "crates/kiln/src/mcp/mod.rs",
+  "crates/kiln/src/route_latency.rs",
+  "crates/kiln/src/shard_health.rs",
+  "crates/kiln/src/pool_health.rs",
+  "crates/kiln/src/metrics.rs",
+  # Websockets: an agent session's live feed to its viewers, and the pages' sockets.
+  "crates/kiln/src/harness/live.rs",
+  "crates/kiln/src/harness/broadcast.rs",
+  "crates/kiln/src/wire/ui.rs",
+  # Runner ingest: the hub, its link to the runners, and the processes each machine has.
+  "crates/kiln/src/hub.rs",
+  "crates/kiln/src/net.rs",
+  "crates/kiln/src/instances.rs",
+  # The bus the live feeds ride, and the logs.
+  "crates/kiln/src/bus.rs",
+  "crates/kiln/src/logs.rs",
+  # The ship model, and the CI state the API reads.
+  "crates/kiln/src/ship.rs",
+  "crates/kiln/src/store.rs",
+  # What makes them lockless.
+  "crates/kiln/src/rcu.rs",
+]
+
+# kiln-http: a cell per body, upgrade or wait, held by that one object's two ends, no other request's.
+
+[[allowed]]
+at = "crates/kiln-http/src/body.rs"
+name = "use"
+why = "imports the body pipe's cell (state, below)"
+
+[[allowed]]
+at = "crates/kiln-http/src/body.rs"
+name = "state"
+why = "one per body still arriving: its connection feeds it and its reader reads it, both in the connection's task as a rule (a connection's handlers run there); no other request, and no shard but theirs, takes it"
+
+[[allowed]]
+at = "crates/kiln-http/src/upgrade.rs"
+name = "use"
+why = "imports the upgrade's hand-off cell (rx, below)"
+
+[[allowed]]
+at = "crates/kiln-http/src/upgrade.rs"
+name = "rx"
+why = "one per upgraded connection (a WebSocket): its connection hands it over once and its handler takes it once"
+
+[[allowed]]
+at = "crates/kiln-http/src/rt.rs"
+name = "use"
+why = "imports the bridge's cell (shared, below)"
+
+[[allowed]]
+at = "crates/kiln-http/src/rt.rs"
+name = "shared"
+why = "one per wait polled under a foreign waker: its helper task runs on the same shard as its poller, so no other shard ever takes it"
+
+[[allowed]]
+at = "crates/kiln-http/src/h1/client.rs"
+name = "use"
+why = "kiln's HTTP client, not its server: imports its connection's cell (state, below)"
+
+[[allowed]]
+at = "crates/kiln-http/src/h1/client.rs"
+name = "state"
+why = "an outgoing HTTP/1.1 connection's (the UI server's proxy, webhooks, forges): kiln as a client, no request or runner path of the server's"
+
+[[allowed]]
+at = "crates/kiln-http/src/h2/client.rs"
+name = "use"
+why = "kiln's HTTP client, not its server: imports its connection's flag (closed, below)"
+
+[[allowed]]
+at = "crates/kiln-http/src/h2/client.rs"
+name = "closed"
+why = "an outgoing HTTP/2 connection's: kiln as a client, no request or runner path of the server's"
+
+# Signing in: once per sign-in, not per request.
+
+[[allowed]]
+at = "crates/kiln/src/api.rs"
+name = "PASSWORD_GATE"
+why = "a password sign-in's hashing, one at a time (argon2 takes a CPU's worth of memory): taken as a person signs in with a password, never by another route"
+
+[[allowed]]
+at = "crates/kiln/src/authz/passkeys.rs"
+name = "pending"
+why = "passkey sign-in challenges, from one to its answer: taken as a person signs in with a passkey"
+
+[[allowed]]
+at = "crates/kiln/src/authz/passkeys.rs"
+name = "P"
+why = "the static behind pending (above)"
+
+[[allowed]]
+at = "crates/kiln/src/authz/passwords.rs"
+name = "THROTTLES"
+why = "failed password sign-ins by account, to slow guessing: taken as a person signs in with a password"
+
+# A runner's dialer.
+
+[[allowed]]
+at = "crates/kiln/src/net.rs"
+name = "use"
+why = "imports the dialer's last address (last_dial, below)"
+
+[[allowed]]
+at = "crates/kiln/src/net.rs"
+name = "last_dial"
+why = "the address the net thread dialed last (a runner's; the server's net thread doesn't dial), kept across the loops it rebuilds: taken by the net thread alone, never by another thread or a shard"
+
+# The hub.
+
+[[allowed]]
+at = "crates/kiln/src/hub.rs"
+name = "use"
+why = "imports the hub's locks listed below"
+
+[[allowed]]
+at = "crates/kiln/src/hub.rs"
+name = "agents"
+why = "every runner's live record: read by the runner pages, MCP's runners and each message a runner sends (its last_seen), written as runners come, go and report"
+todo = "an immutable copy swapped in whole (crate::rcu), as the other runner maps are; next, now that goal 4's rewrite of harness/registry.rs (plan 01a1a59c2a9c), which takes it too, is on main (cba5a019725)"
+
+[[allowed]]
+at = "crates/kiln/src/hub.rs"
+name = "instances"
+why = "each machine's runner processes and what each holds: read on every agent session update a runner sends and every command sent to one, written as processes come and go and sessions open"
+todo = "an immutable copy swapped in whole (crate::rcu); next, now that goal 4's rewrite of harness/registry.rs (plan 01a1a59c2a9c), which takes it too, is on main (cba5a019725)"
+
+[[allowed]]
+at = "crates/kiln/src/hub.rs"
+name = "handovers"
+why = "agent sessions moving between a machine's runner processes (crate::handovers): taken as a runner process is replaced, and on a session's update only when two of a machine's processes both say they hold it"
+
+[[allowed]]
+at = "crates/kiln/src/hub.rs"
+name = "reach"
+why = "reach's links between runners (crate::reach::relay): each relayed frame takes it in the hub's loop; the reach directory and the relays' checkpoints read it"
+todo = "the hub's loop its one owner, what the directory and the checkpoints read a copy it swaps in (crate::rcu)"
+
+# Logs.
+
+[[allowed]]
+at = "crates/kiln/src/logs.rs"
+name = "use"
+why = "imports a live job's files' cell (files, below)"
+
+[[allowed]]
+at = "crates/kiln/src/logs.rs"
+name = "files"
+why = "one per live job, held by what writes that job's log alone (its runner's chunks, in order through the hub's loop; its steps; its end); no viewer takes it (a job's feed is its entry's, in the live jobs' copy), nor another job's writer"
+todo = "an owner per job's files, its chunks, steps and end its messages"

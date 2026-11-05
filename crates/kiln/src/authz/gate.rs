@@ -225,7 +225,7 @@ pub async fn agent_for(hub: &Hub, name: &str, opener: &str) -> Option<Caller> {
     let uid = opener.strip_prefix("user:")?.to_owned();
     let name = name.to_owned();
     hub.store
-        .call(move |c| {
+        .read(move |c| {
             let Some((who, rights)) = user_rights(c, &uid)? else { return Ok(None) };
             Ok(Some(Caller { kind: Kind::Agent, name: format!("{name} for user:{who}"), user: Some(uid), token: None, agent: None, rights: Some(rights), limit: None }))
         })
@@ -260,7 +260,7 @@ async fn withheld_from(hub: &Hub, by: &serde_json::Value, names: Vec<String>, ta
     let target = target.clone();
     let all = names.clone();
     hub.store
-        .call(move |c| {
+        .read(move |c| {
             let custom = custom_roles(c)?;
             let live = match &user {
                 Some(uid) => match user_rights(c, uid)? {
@@ -293,7 +293,7 @@ pub async fn starter_may(hub: &Hub, by: &serde_json::Value, capability: &str, ta
         let (what, target) = (capability.to_owned(), target.clone());
         let may = hub
             .store
-            .call(move |c| {
+            .read(move |c| {
                 let custom = custom_roles(c)?;
                 let live = match &user {
                     Some(uid) => match user_rights(c, uid)? {
@@ -322,7 +322,7 @@ pub async fn starter_may(hub: &Hub, by: &serde_json::Value, capability: &str, ta
 pub async fn user_caller(hub: &Hub, id: &str) -> Option<Caller> {
     let id = id.to_owned();
     hub.store
-        .call(move |c| {
+        .read(move |c| {
             Ok(user_rights(c, &id)?.map(|(name, rights)| Caller {
                 kind: Kind::User,
                 name: format!("user:{name}"),
@@ -341,12 +341,12 @@ pub async fn user_caller(hub: &Hub, id: &str) -> Option<Caller> {
 /// person's own notification rules are held to (W19-R06).
 pub async fn user_may(hub: &Hub, id: &str, capability: &str, target: &Scope) -> bool {
     let (id, capability, target) = (id.to_owned(), capability.to_owned(), target.clone());
-    hub.store.call(move |c| Ok(user_rights(c, &id)?.is_some_and(|(_, r)| r.allows(&capability, &target)))).await.unwrap_or(false)
+    hub.store.read(move |c| Ok(user_rights(c, &id)?.is_some_and(|(_, r)| r.allows(&capability, &target)))).await.unwrap_or(false)
 }
 
 /// Whether anyone but the owner can sign in here.
 pub async fn has_users(hub: &Hub) -> bool {
-    hub.store.call(|c| Ok(c.query_row("SELECT EXISTS(SELECT 1 FROM users WHERE disabled_at IS NULL)", [], |r| r.get::<_, bool>(0))?)).await.unwrap_or(true)
+    hub.store.read(|c| Ok(c.query_row("SELECT EXISTS(SELECT 1 FROM users WHERE disabled_at IS NULL)", [], |r| r.get::<_, bool>(0))?)).await.unwrap_or(true)
 }
 
 /// Custom roles, by name.
@@ -418,7 +418,7 @@ async fn token(hub: &Hub, t: &str) -> Option<Caller> {
 async fn job(hub: &Hub, t: &str) -> Option<Caller> {
     let j = crate::ci::token::job_of(hub, t).await?;
     let id = j.repo.clone();
-    let repo = hub.store.call(move |c| Ok(c.query_row("SELECT name FROM repos WHERE id = ?1", [&id], |r| r.get::<_, String>(0)).optional()?)).await.ok().flatten()?;
+    let repo = hub.store.read(move |c| Ok(c.query_row("SELECT name FROM repos WHERE id = ?1", [&id], |r| r.get::<_, String>(0)).optional()?)).await.ok().flatten()?;
     let here = Scope::Repo { repo };
     let mut grants = Vec::new();
     let mut give = |caps: &[&str], scope: &Scope| grants.extend(caps.iter().map(|c| Grant { what: (*c).to_owned(), scope: scope.clone(), deny: false }));
@@ -475,7 +475,7 @@ async fn user_session(hub: &Hub, value: &str) -> Option<Caller> {
     }
     let id = id.to_owned();
     hub.store
-        .call(move |c| {
+        .read(move |c| {
             let current: Option<i64> = c.query_row("SELECT session_epoch FROM users WHERE id = ?1 AND disabled_at IS NULL", [&id], |r| r.get(0)).optional()?;
             if current != Some(e) {
                 return Ok(None);
@@ -532,7 +532,7 @@ pub async fn redeem_link(hub: &Hub, code: &str) -> Option<(String, String)> {
 /// The scope a request's rule is checked in.
 async fn target(hub: &Hub, at: At, segs: &[&str], q: &HashMap<String, String>) -> Scope {
     let seg = |i: usize| segs.get(i).copied().unwrap_or_default().to_owned();
-    let one = |sql: &'static str, id: String| async move { hub.store.call(move |c| Ok(c.query_row(sql, [&id], |r| r.get::<_, String>(0)).optional()?)).await.ok().flatten() };
+    let one = |sql: &'static str, id: String| async move { hub.store.read(move |c| Ok(c.query_row(sql, [&id], |r| r.get::<_, String>(0)).optional()?)).await.ok().flatten() };
     let repo_of = |name: Option<String>| name.map_or(Scope::Server, |repo| Scope::Repo { repo });
     match at {
         At::Repo(i) => repo_scope(hub, &seg(i)).await,
@@ -544,7 +544,7 @@ async fn target(hub: &Hub, at: At, segs: &[&str], q: &HashMap<String, String>) -
             let (kind, number) = crate::ci::diffs::key_of(&key);
             let name = hub
                 .store
-                .call(move |c| Ok(c.query_row("SELECT p.name FROM diffs d JOIN repos p ON p.id = d.repo_id WHERE d.id = ?1 OR (d.number = ?2 AND (?3 IS NULL OR d.kind = ?3))", rusqlite::params![key, number, kind], |r| r.get::<_, String>(0)).optional()?))
+                .read(move |c| Ok(c.query_row("SELECT p.name FROM diffs d JOIN repos p ON p.id = d.repo_id WHERE d.id = ?1 OR (d.number = ?2 AND (?3 IS NULL OR d.kind = ?3))", rusqlite::params![key, number, kind], |r| r.get::<_, String>(0)).optional()?))
                 .await
                 .ok()
                 .flatten();
@@ -584,7 +584,7 @@ pub async fn repo_scope(hub: &Hub, s: &str) -> Scope {
     let key = s.to_owned();
     let name = hub
         .store
-        .call(move |c| Ok(c.query_row("SELECT name FROM repos WHERE id = ?1 OR name = ?1 COLLATE NOCASE", [&key], |r| r.get::<_, String>(0)).optional()?))
+        .read(move |c| Ok(c.query_row("SELECT name FROM repos WHERE id = ?1 OR name = ?1 COLLATE NOCASE", [&key], |r| r.get::<_, String>(0)).optional()?))
         .await
         .ok()
         .flatten();

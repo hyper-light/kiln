@@ -829,7 +829,7 @@ fn a_message_a_runner_cant_read_in_a_link_is_answered_unread_and_only_its_link_e
         let rows = refused_rows(&hub, "runner:mac").await?;
         anyhow::ensure!(rows.iter().any(|(t, r, d)| t == "reach_link" && r == "unknown" && d.starts_with("variant 99") && d.contains(&format!("as linux read it, on link {link}"))), "{rows:?}");
         for name in ["mac", "linux"] {
-            let shown = hub.refusals.lock().kept(&Page::Runner(name.into())).is_some_and(|k| k.counts.iter().any(|c| c.wire == Wire::ReachLink && c.code == Code::Unknown));
+            let shown = hub.refusals.load().kept(&Page::Runner(name.into())).is_some_and(|k| k.counts.iter().any(|c| c.wire == Wire::ReachLink && c.code == Code::Unknown));
             anyhow::ensure!(shown, "on {name}'s page");
         }
         // And mac reaches linux again, on a new link.
@@ -882,7 +882,7 @@ fn the_server_refuses_what_its_relay_cant_take_typed_and_notes_it() -> anyhow::R
         anyhow::ensure!(hub.reach.lock().links() == 1, "the link goes on");
         let rows = refused_rows(&hub, "runner:intruder").await?;
         anyhow::ensure!(rows.iter().any(|(t, r, d)| t == "relay" && r == "malformed" && d.contains("link L1 is mac's and linux's")), "{rows:?}");
-        let shown = |name: &str, wire: Wire, code: Code| hub.refusals.lock().kept(&Page::Runner(name.into())).is_some_and(|k| k.counts.iter().any(|c| c.wire == wire && c.code == code));
+        let shown = |name: &str, wire: Wire, code: Code| hub.refusals.load().kept(&Page::Runner(name.into())).is_some_and(|k| k.counts.iter().any(|c| c.wire == wire && c.code == code));
         anyhow::ensure!(shown("intruder", Wire::Relay, Code::Malformed), "on the intruder's page");
         // The relay's other refusals carry their code to a runner that takes word of them.
         hear(&hub, 1, LANE_REACH, &frame("linux", true)).await?;
@@ -909,7 +909,7 @@ fn the_server_refuses_what_its_relay_cant_take_typed_and_notes_it() -> anyhow::R
         // runners' pages.
         clock.advance(Duration::from_millis(100));
         hear(&hub, 2, LANE_CONTROL, &AgentMsg::LinkUnread { from: "mac".into(), link: "L1".into(), what: "variant 99".into(), code: Code::Unknown, why: "Ask has 12 variants".into() }).await?;
-        let total = |name: &str| hub.refusals.lock().kept(&Page::Runner(name.into())).map(Kept::total);
+        let total = |name: &str| hub.refusals.load().kept(&Page::Runner(name.into())).map(Kept::total);
         anyhow::ensure!((total("mac"), total("linux")) == (Some(1), Some(1)), "{:?} {:?}", total("mac"), total("linux"));
         let rows = refused_rows(&hub, "runner:mac").await?;
         anyhow::ensure!(rows.iter().any(|(t, r, d)| t == "reach_link" && r == "unknown" && d.contains("as linux read it, on link L1")), "{rows:?}");

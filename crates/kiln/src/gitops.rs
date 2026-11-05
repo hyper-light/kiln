@@ -604,7 +604,7 @@ fn backoff(failures: u32) -> Duration {
 /// Asks the poller to poll repository `id` (by its id) now: a push, a webhook, a new repository.
 /// One backing off after a failed poll is polled once its backoff is over.
 pub fn want(hub: &Hub, id: &str) {
-    hub.gitops_wanted.lock().insert(id.to_owned());
+    hub.gitops_wanted.update(|w| w.insert(id.to_owned()));
     hub.gitops_kick.notify();
 }
 
@@ -651,7 +651,7 @@ where
     let mut start = true;
     loop {
         let now = crate::util::now_unix();
-        let asked = std::mem::take(&mut *hub.gitops_wanted.lock());
+        let asked = hub.gitops_wanted.update(std::mem::take);
         for repo in hub.store.repos().await? {
             if !repo.enabled {
                 continue;
@@ -666,7 +666,7 @@ where
             if failing.lock().get(&repo.id).is_some_and(|(_, until)| Instant::now() < *until) {
                 // Still asked for once its backoff is over.
                 if wanted {
-                    hub.gitops_wanted.lock().insert(repo.id.clone());
+                    hub.gitops_wanted.update(|w| w.insert(repo.id.clone()));
                 }
                 continue;
             }

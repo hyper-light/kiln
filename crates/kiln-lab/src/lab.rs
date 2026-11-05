@@ -291,6 +291,64 @@ pub struct Round {
     pub shards: usize,
     pub numbers: BTreeMap<String, f64>,
     pub seen: BTreeMap<String, measure::Seen>,
+    /// A build that counts its locks (`scripts/locks.py census`, goal 5 of the API runtime program,
+    /// plan 01a1a59c2aae step 1): each place a lock is taken, by its site and kind, with what the
+    /// window and the fill took there. Kept apart from `numbers`, which an A/B compares one by one.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub locks: BTreeMap<String, LockSeen>,
+}
+
+/// One place a lock is taken, as a build that counts its locks says on `/metrics` (`kiln_lock_*`):
+/// what the window, and the fill, took there.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct LockSeen {
+    /// `mutex`, `read`, `write` (parking_lot's), `std_mutex`, `std_read`, `std_write`.
+    pub kind: String,
+    /// Acquisitions in the window, those that found it held, and the seconds those waited.
+    pub taken: f64,
+    pub contended: f64,
+    pub wait_s: f64,
+    /// The same over the fill.
+    pub fill_taken: f64,
+    pub fill_contended: f64,
+    pub fill_wait_s: f64,
+    /// The longest any one acquisition there waited, by the window's end.
+    pub max_wait_s: f64,
+    /// The first addresses of the locks taken there, in hex: sites that take one lock share its.
+    pub addrs: String,
+}
+
+/// The lock census of a build that counts its locks, between the fill's scrapes and the window's.
+fn lock_census(fill: (&Scrape, &Scrape), window: (&Scrape, &Scrape)) -> BTreeMap<String, LockSeen> {
+    let mut out: BTreeMap<String, LockSeen> = BTreeMap::new();
+    let label = |l: &[(String, String)], k: &str| l.iter().find(|(lk, _)| lk == k).map(|(_, v)| v.clone()).unwrap_or_default();
+    for (name, labels, value) in &window.1.series {
+        let (site, kind) = (label(labels, "site"), label(labels, "kind"));
+        if !name.starts_with("kiln_lock_") || site.is_empty() {
+            continue;
+        }
+        let want = [("site", site.as_str()), ("kind", kind.as_str())];
+        let since = |s: &Scrape| s.get(name, &want).unwrap_or(0.0);
+        let e = out.entry(format!("{site} {kind}")).or_insert_with(|| LockSeen { kind: kind.clone(), ..LockSeen::default() });
+        match name.as_str() {
+            "kiln_lock_taken_total" => {
+                e.taken = value - since(window.0);
+                e.fill_taken = since(fill.1) - since(fill.0);
+            }
+            "kiln_lock_contended_total" => {
+                e.contended = value - since(window.0);
+                e.fill_contended = since(fill.1) - since(fill.0);
+            }
+            "kiln_lock_wait_seconds_total" => {
+                e.wait_s = value - since(window.0);
+                e.fill_wait_s = since(fill.1) - since(fill.0);
+            }
+            "kiln_lock_wait_max_seconds" => e.max_wait_s = *value,
+            "kiln_lock_addresses" => e.addrs = label(labels, "addrs"),
+            _ => {}
+        }
+    }
+    out
 }
 
 // ------------------------------------------------------------------------------------- the load
@@ -814,11 +872,12 @@ pub fn round(build: &Build, p: &Profile, hogs: usize, place: &Place, dir: &Path,
     let (mut numbers, shards) = numbers(&seen, &before, &after, secs);
     numbers.insert("fill.s".into(), fill_s);
     server_numbers(&mut numbers, "fill.", &fill_before, &fill_after, fill_s);
+    let locks = lock_census((&fill_before, &fill_after), (&before, &after));
     drop(fleet);
     let mut seen: BTreeMap<String, measure::Seen> = seen.into_iter().map(|(c, s)| (c.name().to_owned(), s)).collect();
     seen.extend(measure::seen_by_what(&in_window));
     seen.extend(frames_against_attaches(&watches, window));
-    Ok(Round { build: build.label.clone(), index, hogs, machine: m, fill_s, shards, numbers, seen })
+    Ok(Round { build: build.label.clone(), index, hogs, machine: m, fill_s, shards, numbers, seen, locks })
 }
 
 /// The window's frames (stamped in it) told apart by how they met the attaches, as each viewer saw
