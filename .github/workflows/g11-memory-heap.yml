@@ -1,0 +1,76 @@
+# Trial only, never on main (goal 11, plan 01a1a87b2e56 steps 1 and 2): what a 20,000-event session costs the
+# server, by call site. session_resident runs under jemalloc with heap profiling (a profile every 32 MiB
+# allocated), with the conversation store on, and the largest profile is read by call site and by owner.
+# Results go to the branch g11-memory-heap-results.
+name: g11-memory-heap
+
+on:
+  push:
+    branches: [g11-memory-heap]
+
+permissions:
+  contents: write
+
+concurrency:
+  group: g11-memory-heap
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: never
+  CARGO_INCREMENTAL: "0"
+  KILN_UI_SERVER: "off"
+
+jobs:
+  heap:
+    name: session_resident's heap by call site
+    runs-on: ubuntu-latest
+    timeout-minutes: 150
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Room
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL || true
+          sudo mkdir -p /mnt/target /mnt/heap && sudo chown "$USER" /mnt/target /mnt/heap
+          sudo apt-get update -qq && sudo apt-get install -y -qq libjemalloc2 binutils > /dev/null
+      - name: Rust
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+      - name: Profile
+        env:
+          CARGO_TARGET_DIR: /mnt/target
+        run: |
+          set +e
+          R=$RUNNER_TEMP/h; mkdir -p "$R"
+          nice -n 10 cargo test --locked -p kiln --test session_resident --no-run --message-format=json > /mnt/heap/build.json 2> "$R/build.txt"; echo "build exit $?" | tee -a "$R/summary.txt"
+          BIN=$(python3 -I -c 'import json,sys
+          for l in open(sys.argv[1]):
+              try: m=json.loads(l)
+              except Exception: continue
+              if m.get("reason")=="compiler-artifact" and m.get("executable") and "session_resident" in m.get("executable"): print(m["executable"])' /mnt/heap/build.json | tail -1)
+          echo "test binary: $BIN" | tee -a "$R/summary.txt"
+          nm -n -C --defined-only "$BIN" | awk '$2 ~ /^[tTwW]$/' > /mnt/heap/syms.txt; readelf -lW "$BIN" > /mnt/heap/segments.txt
+          export G11_BIN=session_resident
+          for store in on off; do
+            mkdir -p /mnt/heap/$store
+            env G11_RESIDENT_CONVERSATIONS=$store LD_PRELOAD=/usr/lib/x86_64-linux-gnu/libjemalloc.so.2 MALLOC_CONF="prof:true,lg_prof_interval:25,lg_prof_sample:17,prof_prefix:/mnt/heap/$store/jeprof" "$BIN" --nocapture > "$R/run-$store.txt" 2>&1; echo "run store $store exit $?" | tee -a "$R/summary.txt"
+            grep "g11 resident" "$R/run-$store.txt" >> "$R/summary.txt"
+            # Each profile's live bytes; then the one that held the most, and the last (after the session's end).
+            for f in /mnt/heap/$store/jeprof.*.heap; do echo "$(python3 -I .github/g11/owners.py "$f" /mnt/heap/syms.txt /mnt/heap/segments.txt --total) $f"; done | sort -t' ' -k2 > /mnt/heap/$store/live.txt
+            most=$(sort -n /mnt/heap/$store/live.txt | tail -1 | cut -d' ' -f2)
+            last=$(ls /mnt/heap/$store/jeprof.*.heap | sort -t. -k3,3n | tail -1)
+            echo "== store $store: $(wc -l < /mnt/heap/$store/live.txt) profiles; the most live: $(sort -n /mnt/heap/$store/live.txt | tail -1); the last: $last" >> "$R/summary.txt"
+            cp /mnt/heap/$store/live.txt "$R/live-$store.txt"
+            for pick in most last; do f=${!pick}; [ -n "$f" ] || continue
+              echo "-- store $store, $pick ($f)" >> "$R/summary.txt"
+              python3 -I .github/g11/owners.py "$f" /mnt/heap/syms.txt /mnt/heap/segments.txt >> "$R/summary.txt" 2>&1
+              python3 -I .github/g11/heapprof.py "$f" /mnt/heap/syms.txt /mnt/heap/segments.txt --top 40 > "$R/heap-$store-$pick.txt" 2>&1
+            done
+          done
+          echo "${{ github.sha }}" > "$R/COMMIT"
+          cd "$RUNNER_TEMP" && git init -q out && cd out && cp -r "$R" results
+          git config user.name "kiln g11 lab" && git config user.email "g11-lab@users.noreply.github.com"
+          git add results && git commit -q -m "g11 heap for ${{ github.sha }}"
+          git push -q -f "https://x-access-token:${GH_TOKEN}@github.com/${{ github.repository }}.git" HEAD:refs/heads/g11-memory-heap-results
