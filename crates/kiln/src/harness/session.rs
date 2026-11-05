@@ -107,6 +107,11 @@ pub struct Spec {
     /// for one of that session's harness's own subagents.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub variant_of: Option<String>,
+    /// Its claim on this machine, when a runner's owner placed it here (AUDIT M4,
+    /// `crate::reach::place::Claim`): this runner holds its room from its start to its end, in
+    /// the same ledger as CI legs and commands. Set by kiln, never from what was asked.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub claim: Option<crate::reach::place::Claim>,
 }
 
 fn yes() -> bool {

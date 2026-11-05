@@ -210,6 +210,7 @@ struct Suit {
     requires: Vec<String>,
     together: bool,
     request: [u64; 4],
+    among: Vec<String>,
     /// Suited, placing and linked: what's drawn from (by handle, in order).
     live: Vec<Rid>,
     /// Suited and placing, the link down.
@@ -222,7 +223,7 @@ struct Suit {
 
 impl Suit {
     fn is(&self, ask: &Ask) -> bool {
-        self.together == ask.needs.together.is_some() && self.request == super::ask::amounts(&ask.needs.request) && self.requires == ask.needs.requires
+        self.together == ask.needs.together.is_some() && self.request == super::ask::amounts(&ask.needs.request) && self.requires == ask.needs.requires && self.among == ask.among
     }
 }
 
@@ -232,6 +233,7 @@ fn suit_key(ask: &Ask) -> u64 {
     ask.needs.requires.hash(&mut h);
     ask.needs.together.is_some().hash(&mut h);
     super::ask::amounts(&ask.needs.request).hash(&mut h);
+    ask.among.hash(&mut h);
     h.finish()
 }
 
@@ -335,6 +337,9 @@ pub struct Owner {
 /// words a person reads, "not linux"), more than it's known to have, or a gang. A dimension of its
 /// size not measured yet is no reason: the runner itself answers for it.
 pub fn unsuited(m: &Machine, ask: &Ask) -> Option<String> {
+    if !ask.among.is_empty() && !ask.among.contains(&m.name) {
+        return Some("not among the machines that can run it".into());
+    }
     for src in &ask.needs.requires {
         match Constraint::parse(src) {
             Ok(c) if c.eval(&m.facts, &m.labels) => {}
@@ -634,7 +639,7 @@ impl Owner {
         }
         live.sort_unstable();
         away.sort_unstable();
-        let s = Arc::new(Suit { requires: ask.needs.requires.clone(), together: ask.needs.together.is_some(), request: super::ask::amounts(&ask.needs.request), live, away, older, passed: passed.into_iter().collect() });
+        let s = Arc::new(Suit { requires: ask.needs.requires.clone(), together: ask.needs.together.is_some(), request: super::ask::amounts(&ask.needs.request), among: ask.among.clone(), live, away, older, passed: passed.into_iter().collect() });
         self.suits.entry(key).or_default().push(Arc::clone(&s));
         s
     }

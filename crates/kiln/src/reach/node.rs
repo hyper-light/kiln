@@ -178,6 +178,10 @@ pub enum In {
     /// Another runner's room as the server passed it on ([`crate::proto::ServerMsg::Offers`]):
     /// this node's owner chooses where to probe by it.
     Hint(String),
+    /// kiln's server asks this node to own an agent session's start (AUDIT M4,
+    /// [`crate::proto::ServerMsg::Place`], JSON `super::place::SessionAsk`): what placement says
+    /// of it goes back as [`AgentMsg::Placed`] under `req`.
+    SessionPlace { req: u64, json: String },
 }
 
 /// What local tools ask of the node.
@@ -228,6 +232,10 @@ pub enum Local {
     Leg { ask: Box<kiln_ci::place::ask::Ask>, reply: oneshot::Sender<Result<(), String>> },
     /// CI leg `run` ended here.
     LegEnded { run: String, ok: bool },
+    /// An agent session placed here under `claim` started (`true` answered: its claim was live).
+    SessionStarted { claim: super::place::Claim, reply: oneshot::Sender<bool> },
+    /// An agent session placed here under `claim` ended.
+    SessionEnded { claim: super::place::Claim },
     /// What this runner's admission holds, for a view (JSON).
     PlaceView { reply: oneshot::Sender<Value> },
 }
@@ -304,6 +312,17 @@ impl Handle {
     /// CI leg `run` ended here: its room is free.
     pub async fn leg_ended(&self, run: &str, ok: bool) {
         let _ = self.tx.send(In::Local(Local::LegEnded { run: run.to_owned(), ok })).await;
+    }
+
+    /// An agent session placed here under `claim` started: whether its claim was live (its room
+    /// held from now, AUDIT M4).
+    pub async fn session_started(&self, claim: super::place::Claim) -> anyhow::Result<bool> {
+        self.ask(|reply| Local::SessionStarted { claim, reply }).await
+    }
+
+    /// An agent session placed here under `claim` ended: its room is free.
+    pub async fn session_ended(&self, claim: super::place::Claim) {
+        let _ = self.tx.send(In::Local(Local::SessionEnded { claim })).await;
     }
 
     /// Place a run this node owns (docs/needs.md E5): `false` when placement isn't ready yet.
@@ -591,6 +610,7 @@ pub fn start(cfg: Config) -> anyhow::Result<(Handle, async_channel::Receiver<Age
         place_later: Vec::new(),
         hints: false,
         place_touched: false,
+        session_asks: Vec::new(),
     };
     let busy = Arc::new(AtomicU64::new(0));
     let counted = Arc::clone(&busy);
@@ -827,6 +847,9 @@ struct Node {
     /// decided by).
     hints: bool,
     place_touched: bool,
+    /// Agent sessions the server asked this node to place before placement was ready (the
+    /// directory not yet come): placed as it comes.
+    session_asks: Vec<(u64, Box<kiln_ci::place::ask::Ask>)>,
 }
 
 impl Node {
@@ -901,6 +924,7 @@ impl Node {
                 self.hints = takes;
             }
             In::Hint(json) => self.place.hinted(&json),
+            In::SessionPlace { req, json } => self.session_place(req, &json).await,
         }
         while !self.place_later.is_empty() {
             let outs = std::mem::take(&mut self.place_later);
@@ -964,6 +988,70 @@ impl Node {
         }
     }
 
+    /// kiln's server's word on an agent session's start, this node its owner (AUDIT M4): place
+    /// it (once placement is ready: the directory asked for if it hasn't come), or let it go.
+    async fn session_place(&mut self, req: u64, json: &str) {
+        use super::place::SessionAsk;
+        match serde_json::from_str::<SessionAsk>(json) {
+            Ok(SessionAsk::Ask { ask }) if self.measured && self.directory.is_some() => self.session_ask(req, ask).await,
+            Ok(SessionAsk::Ask { ask }) => {
+                self.session_asks.push((req, ask));
+                self.fetch_directory().await;
+            }
+            Ok(SessionAsk::Cancel { run }) => {
+                self.session_asks.retain(|(_, a)| a.run != run);
+                self.placing.remove(&run);
+                let outs = self.place.cancel(&run, crate::util::now_ms());
+                self.place_do(outs).await;
+            }
+            Err(e) => tracing::debug!(error = %e, "a session placement this node couldn't read"),
+        }
+    }
+
+    /// Places agent session `ask` for the server's question `req`: each answer goes back to the
+    /// server as it comes; told to go, the claim is checked live here first (`starting`), then
+    /// said, and the session's runner holds it once it starts the session. Pushed, never polled.
+    async fn session_ask(&mut self, req: u64, ask: Box<kiln_ci::place::ask::Ask>) {
+        use super::place::{Claim, Placed, SessionWord};
+        let run = ask.run.clone();
+        let (tx, rx) = async_channel::unbounded::<Placed>();
+        self.placing.insert(run.clone(), tx);
+        let outs = self.place.ask(*ask, crate::util::now_ms());
+        self.place_do(outs).await;
+        let (out, me, (owner, epoch)) = (self.out.clone(), self.tx.clone(), self.place.owner_of_claims());
+        crate::rt::spawn(async move {
+            let say = |w: SessionWord| AgentMsg::Placed { req, json: serde_json::to_string(&w).unwrap_or_default() };
+            while let Ok(p) = rx.recv().await {
+                match p {
+                    Placed::Answer(answer) => {
+                        let done = matches!(answer, kiln_ci::place::Answer::Never { .. });
+                        if out.send(say(SessionWord::Answer { answer })).await.is_err() || done {
+                            return;
+                        }
+                    }
+                    Placed::Go { runner, fence } => {
+                        let (reply, ok) = oneshot::channel();
+                        if me.send(In::Local(Local::PlaceStarting { run: run.clone(), runner: runner.clone(), fence, reply })).await.is_err() {
+                            return;
+                        }
+                        // Its claim lapsed meanwhile: it waits on, at the runners probed.
+                        if !ok.await.unwrap_or(false) {
+                            continue;
+                        }
+                        let claim = Claim { owner: owner.clone(), epoch, run: run.clone(), fence };
+                        let _ = out.send(say(SessionWord::Go { runner, claim })).await;
+                        return;
+                    }
+                    Placed::Fallback { runners } => {
+                        let _ = me.send(In::Local(Local::PlaceCancel { run: run.clone() })).await;
+                        let _ = out.send(say(SessionWord::Fallback { runners })).await;
+                        return;
+                    }
+                }
+            }
+        });
+    }
+
     // ------------------------------------------------------------------ the server
 
     async fn send_out(&self, m: AgentMsg) -> bool {
@@ -997,6 +1085,9 @@ impl Node {
         self.directory = Some((Instant::now(), runners.clone()));
         let outs = self.place.directory(&runners, crate::util::now_ms());
         self.place_do(outs).await;
+        for (req, ask) in std::mem::take(&mut self.session_asks) {
+            self.session_ask(req, ask).await;
+        }
         for (_, w) in std::mem::take(&mut self.waiting) {
             match w {
                 Waiting::Directory(reply) => {
@@ -1982,6 +2073,15 @@ impl Node {
             }
             Local::LegEnded { run, ok } => {
                 let outs = self.place.leg_ended(&run, ok, crate::util::now_ms());
+                self.place_do(outs).await;
+            }
+            Local::SessionStarted { claim, reply } => {
+                let (ok, outs) = self.place.session_start(&claim, crate::util::now_ms());
+                let _ = reply.send(ok);
+                self.place_do(outs).await;
+            }
+            Local::SessionEnded { claim } => {
+                let outs = self.place.session_ended(&claim, crate::util::now_ms());
                 self.place_do(outs).await;
             }
             Local::PlaceStarting { run, runner, fence, reply } => {

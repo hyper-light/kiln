@@ -47,6 +47,16 @@ pub struct Ask {
     /// Its own limit (`--timeout`): its runner stops it then.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub timeout: Option<Ms>,
+    /// The runners it may go to, by name, when its asker knows which can run it and the runners'
+    /// facts don't say (an agent session's harness: kiln's server knows where each is installed;
+    /// a machine named): a filter, never an order. Empty: any that suits. Appended: optional.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub among: Vec<String>,
+    /// What kind of work it is, for the runner's health (sense's run key: `cmd:…`, `leg:…`,
+    /// `session:<harness>`): a cause its own kind of work met there bars it (AUDIT L2). Appended:
+    /// optional.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub key: Option<String>,
 }
 
 fn is_zero(p: &u8) -> bool {

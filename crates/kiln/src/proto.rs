@@ -322,6 +322,11 @@ pub enum AgentMsg {
     /// per sample; only to a server that named [`feature::OFFERS`]. Appended last: postcard encodes
     /// variants by index.
     Offers { json: String },
+    /// What placement says of an agent session's start that the server asked this runner to own
+    /// ([`ServerMsg::Place`] `req`; JSON `crate::reach::place::SessionWord`), as it changes: its
+    /// answer (queued, never), `go` (its runner and claim), or `fallback`. Appended last, after
+    /// `Offers`: postcard encodes variants by index.
+    Placed { req: u64, json: String },
 }
 
 /// A grant as the wire names it (docs/ci.md W05-R34): its leg, its attempt, and its fence (the
@@ -686,9 +691,12 @@ pub mod feature {
     pub const TOLD: &str = "told";
     /// Sizes from history on reach links (lb/history: `Ask::RunWith`, `Say::Used`, reach index 14).
     pub const SIZES: &str = "reach.sizes";
+    /// Agent sessions placed by a runner's owner (AUDIT M4): a runner that says it takes
+    /// [`super::ServerMsg::Place`] and holds a session's claim while it runs.
+    pub const SESSIONS: &str = "place.sessions";
 
     /// Every name this build speaks, in the order it says them.
-    pub const ALL: &[&str] = &[PLACE, LINK_FEATURES, OFFERS, TOLD, SIZES];
+    pub const ALL: &[&str] = &[PLACE, LINK_FEATURES, OFFERS, TOLD, SIZES, SESSIONS];
 
     /// [`ALL`], as a message carries them.
     pub fn all() -> Vec<String> {
@@ -1011,6 +1019,12 @@ pub enum ServerMsg {
     /// when a runner said a change that decides something. Appended last, after `Features`:
     /// postcard encodes variants by index.
     Offers { json: String },
+    /// Own an agent session's start (docs/needs.md E5, AUDIT M4; JSON
+    /// `crate::reach::place::SessionAsk`): place it as this runner's owner places its own runs,
+    /// among the machines that can run its harness, answered by [`AgentMsg::Placed`] under `req`
+    /// until it's told to go; or let go of it. Only to runners that named
+    /// [`feature::SESSIONS`]. Appended last, after `Offers`: postcard encodes variants by index.
+    Place { req: u64, json: String },
 }
 
 /// What the server's copy of one agent session has of its events, said in digests
@@ -1531,7 +1545,7 @@ mod tests {
         // (`Renew`, `Refused`, `Fenced` 61 to 63; `Renewed`, `Stop` 67 and 68); named features
         // their own (64 and 69; docs/wire.md's registry); the offers hint 65, and its room passed on
         // to owners 70.
-        assert_eq!((crate::wire::agent_classes().len(), crate::wire::server_classes().len()), (66, 71), "each table has every variant once");
+        assert_eq!((crate::wire::agent_classes().len(), crate::wire::server_classes().len()), (67, 72), "each table has every variant once");
         assert!(CAP_UNREAD.is_power_of_two() && CAP_UNREAD == 1 << 41 && CAP_UNREAD & (CAP_WIRE | CAP_NET_DROPS | CAP_INBOX | CAP_HANDOVER | CAP_WORK | CAP_AGENT_LIMIT | CAP_IDENTITY | CAP_HEADROOM | CAP_CHANGES_PATCH) == 0);
         assert!(CAP_WORKSPACE_COMMITS.is_power_of_two() && CAP_WORKSPACE_COMMITS == 1 << 42 && CAP_WORKSPACE_COMMITS & (CAP_WIRE | CAP_NET_DROPS | CAP_INBOX | CAP_HANDOVER | CAP_WORK | CAP_AGENT_LIMIT | CAP_IDENTITY | CAP_HEADROOM | CAP_CHANGES_PATCH | CAP_UNREAD) == 0);
         assert!(CAP_WORKSPACE_COMPARE.is_power_of_two() && CAP_WORKSPACE_COMPARE == 1 << 43 && CAP_WORKSPACE_COMPARE & (CAP_WIRE | CAP_NET_DROPS | CAP_INBOX | CAP_HANDOVER | CAP_WORK | CAP_AGENT_LIMIT | CAP_IDENTITY | CAP_HEADROOM | CAP_CHANGES_PATCH | CAP_UNREAD | CAP_WORKSPACE_COMMITS) == 0);
@@ -1689,6 +1703,7 @@ mod tests {
             ("Fenced", AgentMsg::Fenced { grant: grant.clone(), msg: Box::new(AgentMsg::Custody { json: String::new() }) }),
             ("Features", AgentMsg::Features { names: names.clone() }),
             ("Offers", AgentMsg::Offers { json: "{}".into() }),
+            ("Placed", AgentMsg::Placed { req: 1, json: "{}".into() }),
         ];
         let mut last = 60u8;
         for (name, m) in agent {
@@ -1703,6 +1718,7 @@ mod tests {
             ("Stop", ServerMsg::Stop { grant: grant.clone(), reason: String::new() }),
             ("Features", ServerMsg::Features { names: names.clone() }),
             ("Offers", ServerMsg::Offers { json: "{}".into() }),
+            ("Place", ServerMsg::Place { req: 1, json: "{}".into() }),
         ];
         let mut last = 66u8;
         for (name, m) in server {
@@ -1738,7 +1754,7 @@ mod tests {
         for name in feature::ALL {
             assert!(named.contains(&format!("`{name}`:")), "docs/wire.md's list of names doesn't say what `{name}` means");
         }
-        for name in [feature::OFFERS, feature::TOLD, feature::SIZES] {
+        for name in [feature::OFFERS, feature::TOLD, feature::SIZES, feature::SESSIONS] {
             assert!(feature::speaks(&names, name), "this build speaks {name}");
         }
         assert!(feature::speaks(&names, feature::LINK_FEATURES) && !feature::speaks(&[], feature::LINK_FEATURES));

@@ -550,6 +550,10 @@ pub struct Hub {
     pub copies: crate::reach::copies::Copies,
     /// What each runner can take and what waits, and why (`crate::offers`, docs/reach.md §2.2).
     pub offers: crate::offers::Offers,
+    /// Agent sessions' starts the server asked a runner to own (AUDIT M4): by question, the
+    /// owner's process and where its words go (`harness::lineage`); closed when it goes.
+    pub session_places: parking_lot::Mutex<HashMap<u64, (PeerId, async_channel::Sender<String>)>>,
+    session_place_req: AtomicU64,
     /// The git repositories each machine holds, as it last said (`crate::sync::places`).
     pub places: crate::sync::places::Places,
     /// Clones, syncs and moves of repositories between machines (`crate::sync::tasks`).
@@ -684,6 +688,8 @@ impl Hub {
             reach: Mutex::new(crate::reach::relay::Relay::default()),
             copies,
             offers: crate::offers::Offers::default(),
+            session_places: parking_lot::Mutex::default(),
+            session_place_req: AtomicU64::new(1),
             places,
             tasks,
             shares: crate::sync::share::Shares::default(),
@@ -1582,6 +1588,42 @@ impl Hub {
         sent
     }
 
+    /// Asks runner `owner` to own an agent session's start (AUDIT M4, `ServerMsg::Place`): its
+    /// owner's words on it come on the receiver as they come (JSON
+    /// `crate::reach::place::SessionWord`), until it's dropped or the runner's process goes. None:
+    /// no process of `owner` takes it (it didn't name `place.sessions`).
+    pub async fn place_session(&self, owner: &str, json: String) -> Option<(u64, async_channel::Receiver<String>)> {
+        let peer = {
+            let i = self.instances.lock();
+            let speaking = i.speaking(crate::proto::feature::SESSIONS);
+            i.of(owner).into_iter().filter(|p| speaking.contains(p)).max()
+        }?;
+        let req = self.session_place_req.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let (tx, rx) = async_channel::unbounded();
+        self.session_places.lock().insert(req, (peer, tx));
+        self.send_peer(peer, &ServerMsg::Place { req, json }).await;
+        Some((req, rx))
+    }
+
+    /// The question `req` of an agent session's start is over: what its owner says after isn't
+    /// waited on.
+    pub fn unplace_session(&self, req: u64) {
+        self.session_places.lock().remove(&req);
+    }
+
+    /// Runner `owner` lets go of agent session run `run` it placed (its session didn't start):
+    /// `json` says so (`crate::reach::place::SessionAsk::Cancel`).
+    pub async fn cancel_session(&self, owner: &str, json: String) {
+        let peer = {
+            let i = self.instances.lock();
+            let speaking = i.speaking(crate::proto::feature::SESSIONS);
+            i.of(owner).into_iter().filter(|p| speaking.contains(p)).max()
+        };
+        if let Some(peer) = peer {
+            self.send_peer(peer, &ServerMsg::Place { req: 0, json }).await;
+        }
+    }
+
     /// The room a runner's hint said (from its process `from`) goes on to every other runner
     /// process that named `offers`, for its owner to choose where to probe by (`ServerMsg::Offers`,
     /// AUDIT O1). A hint as said, never a claim: the server decides nothing by it.
@@ -1780,6 +1822,8 @@ impl Hub {
                 let name = self.peers.lock().remove(&peer);
                 self.handovers_lost(peer).await;
                 let lost = self.instances.lock().lost(peer);
+                // The sessions it was placing: whoever waits on them hears it went (AUDIT M4).
+                self.session_places.lock().retain(|_, (p, _)| *p != peer);
                 if let (Some(name), Some(m)) = (&name, &self.harness.copies) {
                     m.disconnected(name, peer);
                 }
@@ -2379,6 +2423,16 @@ impl Hub {
             AgentMsg::Features { names } => self.instances.lock().set_features(peer, names),
             // A runner's admission hint (docs/needs.md E5, AUDIT O1): the offers view takes it, and
             // its room goes on to the other runners' owners.
+            // An owner's word on an agent session's start it was asked to place (AUDIT M4): to
+            // whoever waits on it (`harness::lineage`), which reads it.
+            AgentMsg::Placed { req, json } => {
+                let tx = self.session_places.lock().get(&req).filter(|(p, _)| *p == peer).map(|(_, tx)| tx.clone());
+                if let Some(tx) = tx
+                    && tx.send(json).await.is_err()
+                {
+                    self.session_places.lock().remove(&req);
+                }
+            }
             AgentMsg::Offers { json } => {
                 if let Some(room) = crate::offers::heard(self, &agent, &json) {
                     self.pass_room_on(peer, &room).await;
@@ -4198,6 +4252,28 @@ pub(crate) mod tests {
         assert!(fits(&["linux"], "linux", "x86_64", &["Linux"]), "`Linux` against `linux`");
         assert!(fits(&["Linux"], "linux", "x86_64", &["linux"]), "`linux` against `Linux`");
         assert!(!fits(&["baremetal"], "macos", "aarch64", &["baremetal", "linux"]), "a Mac isn't Linux");
+    }
+
+    /// AUDIT M4: the server asks a runner to own an agent session's start only if that runner
+    /// named `place.sessions`, and its words on it reach whoever waits; a word for a question it
+    /// wasn't asked, or from another process, reaches no one; the waiter gone, nothing is kept.
+    #[test]
+    fn m4_the_server_asks_a_runner_that_places_sessions_and_hears_its_word() -> anyhow::Result<()> {
+        crate::rt::block_on(async {
+            let hub = scratch_hub_on(Arc::new(kiln_seams::clock::SimClock::new()), |_| {}).await?;
+            join_runner(&hub, 1, "placing", proto::CAP_WIRE);
+            join_runner(&hub, 2, "older", proto::CAP_WIRE);
+            hub.instances.lock().set_features(1, vec![proto::feature::SESSIONS.to_owned()]);
+            anyhow::ensure!(hub.place_session("older", "{}".into()).await.is_none(), "a runner that doesn't place sessions isn't asked");
+            let (req, rx) = hub.place_session("placing", "{\"op\":\"ask\"}".into()).await.ok_or_else(|| anyhow::anyhow!("not asked"))?;
+            anyhow::ensure!(hub.sent.lock().iter().any(|(p, m)| *p == 1 && matches!(m, ServerMsg::Place { req: r, .. } if *r == req)), "{:?}", hub.sent.lock());
+            hear(&hub, 2, LANE_CONTROL, &AgentMsg::Placed { req, json: "from another".into() }).await?;
+            hear(&hub, 1, LANE_CONTROL, &AgentMsg::Placed { req, json: "go".into() }).await?;
+            anyhow::ensure!(rx.recv().await? == "go", "its own word only");
+            hub.unplace_session(req);
+            anyhow::ensure!(hub.session_places.lock().is_empty());
+            Ok(())
+        })
     }
 
     /// W26-R22: a runner that doesn't say it can freeze a job in place (`CAP_FREEZE`: one from

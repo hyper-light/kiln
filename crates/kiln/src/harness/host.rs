@@ -817,7 +817,13 @@ impl Host {
     /// opens as its parent runs here ([`Host::like_its_parent`]).
     pub fn open(&self, id: Option<String>, spec: Spec) -> anyhow::Result<Arc<Session>> {
         let spec = self.like_its_parent(spec);
-        self.open_seeded(id, spec, None, None, Vec::new(), false, true)
+        let claim = spec.claim.clone();
+        let s = self.open_seeded(id, spec, None, None, Vec::new(), false, true)?;
+        // Placed here by a runner's owner: its room is held while it runs (AUDIT M4).
+        if let Some(c) = claim {
+            hold_claim(c);
+        }
+        Ok(s)
     }
 
     /// A subagent (`Spec::subagent`) whose parent runs on this machine takes what only the machine
@@ -1027,6 +1033,9 @@ impl Host {
     /// isn't closed (its viewers follow it there). Its inbox here takes nothing more for it.
     pub fn release(&self, id: &str) {
         let gone = self.sessions.lock().remove(id);
+        if let Some(s) = &gone {
+            free_claim(s.spec.lock().claim.clone());
+        }
         self.end_lane(id, Lane::Fence { epoch: gone.as_ref().map_or(0, |s| s.epoch()), handover: false });
         self.leave(id);
         if gone.is_some() {
@@ -1393,6 +1402,7 @@ impl Host {
         self.leave(id);
         let found = s.is_some();
         if let Some(s) = s {
+            free_claim(s.spec.lock().claim.clone());
             s.close();
             // A workspace of its own ends with it.
             let spec = s.spec.lock().clone();
@@ -2268,6 +2278,24 @@ pub fn refusal(id: &str, spec: &Spec, error: &str) -> Vec<super::core::Update> {
     };
     let state = super::model::State { status: Status::Exited, exit: Some(exit), reach: spec.reach.clone(), ..Default::default() };
     vec![super::core::Update::Open { info: Box::new(info), since: None }, super::core::Update::State { state: Box::new(state) }]
+}
+
+
+/// An agent session placed here under `c` started: this runner's placement holds its room
+/// (AUDIT M4), off the caller's thread.
+fn hold_claim(c: crate::reach::place::Claim) {
+    let Some(reach) = crate::reach::node::global() else { return };
+    crate::rt::spawn(async move {
+        if !reach.session_started(c.clone()).await.unwrap_or(false) {
+            tracing::info!(run = %c.run, owner = %c.owner, "an agent session's claim here wasn't live: it runs, and its room isn't held");
+        }
+    });
+}
+
+/// An agent session placed here ended (closed, or gone on elsewhere): its room is free.
+fn free_claim(c: Option<crate::reach::place::Claim>) {
+    let (Some(c), Some(reach)) = (c, crate::reach::node::global()) else { return };
+    crate::rt::spawn(async move { reach.session_ended(c).await });
 }
 
 #[cfg(test)]

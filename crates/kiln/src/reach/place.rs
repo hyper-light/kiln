@@ -35,6 +35,38 @@ use crate::proto::feature;
 /// the CI engine that assigned it. No runner can be named so (a `:` is in no host name).
 pub const CI: &str = "ci:engine";
 
+/// An agent session's claim on the runner it was placed on (AUDIT M4, docs/needs.md E5): the
+/// owner that placed it (its node and epoch), its run there and the claim's fence. The server
+/// gives it to that runner with the session (`harness::session::Spec::claim`); the runner holds
+/// its room from the session's start to its end, in the same ledger as CI legs and commands.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Claim {
+    pub owner: String,
+    pub epoch: u64,
+    pub run: String,
+    pub fence: Fence,
+}
+
+/// What kiln's server asks a runner's node, as the owner of an agent session's start
+/// (`ServerMsg::Place`, JSON): place `ask`, or let go of run `run` (the session didn't start).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "op", rename_all = "snake_case")]
+pub enum SessionAsk {
+    Ask { ask: Box<Ask> },
+    Cancel { run: String },
+}
+
+/// What the owner says back of an agent session's start (`AgentMsg::Placed`, JSON), as it
+/// changes: placement's answer (queued, its place and why; never and why); `go`, to start it on
+/// `runner` under `claim`; or `fallback`, no runner that places can start it, older ones could.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "word", rename_all = "snake_case")]
+pub enum SessionWord {
+    Answer { answer: Answer },
+    Go { runner: String, claim: Claim },
+    Fallback { runners: Vec<String> },
+}
+
 /// A waiting reason in words, as a refused leg says why.
 fn reason_words(r: &kiln_ci::place::msg::Reason) -> String {
     use kiln_ci::place::msg::Reason;
@@ -526,6 +558,46 @@ impl Placer {
     /// Whether it measures its machine itself.
     pub fn senses(&self) -> bool {
         self.sensor.is_some()
+    }
+
+    /// This node's name and placement epoch: an owner's, as its claims name it.
+    pub fn owner_of_claims(&self) -> (String, u64) {
+        (self.me.clone(), self.epoch)
+    }
+
+    /// An agent session placed here under claim `c` started (AUDIT M4): its room is held from now
+    /// until [`Self::session_ended`], as a run's is. Its owner's word that it may (`Start`) is the
+    /// claim the server gave the session; this runner's word that it started goes to that owner.
+    /// A claim that isn't live here any more starts nothing (`false`).
+    pub fn session_start(&mut self, c: &Claim, now: i64) -> (bool, Vec<Out>) {
+        let mut said = Vec::new();
+        let started = if c.owner == self.me {
+            // Its owner is this node: its start was taken as it was told to go (`starting`).
+            self.admission.spawned(Peer { name: &self.me, epoch: self.epoch }, &c.run, &mut said);
+            true
+        } else {
+            let from = Peer { name: &c.owner, epoch: c.epoch };
+            match self.admission.start(from, &c.run, c.fence, now, &mut said) {
+                Some(Start::New | Start::Already) => {
+                    self.admission.spawned(from, &c.run, &mut said);
+                    true
+                }
+                None => false,
+            }
+        };
+        (started, self.said(said, now))
+    }
+
+    /// An agent session placed here under claim `c` ended (closed, or gone on elsewhere): its
+    /// room is free at once.
+    pub fn session_ended(&mut self, c: &Claim, now: i64) -> Vec<Out> {
+        if c.owner == self.me {
+            return self.local_ended(&c.run, true, now);
+        }
+        let mut said = Vec::new();
+        self.admission.ended(Peer { name: &c.owner, epoch: c.epoch }, &c.run, true, now, &mut said);
+        self.measure_now(now, &mut said);
+        self.said(said, now)
     }
 
     /// The runner's admission, for views (`/api/reach/offers`).

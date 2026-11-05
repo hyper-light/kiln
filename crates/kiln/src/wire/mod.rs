@@ -215,6 +215,7 @@ classes! {
         AgentMsg::Fenced { .. } => Class::Stream,
         AgentMsg::Features { .. } => Class::Handshake,
         AgentMsg::Offers { .. } => Class::State,
+        AgentMsg::Placed { .. } => Class::Answer,
     }
 }
 
@@ -292,6 +293,7 @@ classes! {
         ServerMsg::Stop { .. } => PARKED,
         ServerMsg::Features { .. } => Class::Handshake,
         ServerMsg::Offers { .. } => Class::State,
+        ServerMsg::Place { .. } => Class::Ask,
     }
 }
 

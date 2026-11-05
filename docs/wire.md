@@ -505,7 +505,9 @@ run out, and two lines can't take the same one by accident as they could a bit.
   probe it with over links (docs/needs.md E5), and an owner places by probing. `offers`: a runner sends
   its admission hint (`AgentMsg::Offers`) when it changes something decided by; a server reads it (the
   offers view) and passes each runner's room on to the others that named it (`ServerMsg::Offers`), for
-  their owners to choose where to probe by. `told`: news of queued and
+  their owners to choose where to probe by. `place.sessions`: the runner owns an agent session's start
+  when the server asks it (`ServerMsg::Place`, `AgentMsg::Placed`) and holds a session's claim while
+  it runs. `told`: news of queued and
   started runs to the asking agent (lb/told, in place of its branch's bit 58). `reach.sizes`: sizes
   from history on links (lb/history, `Ask::RunWith` and `Say::Used`, reach index 14). A name keeps its
   meaning for good; a change in meaning is a new name. A name a side doesn't know, it ignores.
@@ -543,6 +545,7 @@ this branch's rows to the code: each bit once, each appended variant at its inde
 | `AgentMsg` | 63 | `Fenced` | | lb/integrate (64 then) |
 | `AgentMsg` | 64 | `Features` | | lb/core (65 then) |
 | `AgentMsg` | 65 | `Offers` | | lb/core for lb/offers-ui: the admission hint, JSON, to a server that named `offers` (66 then) |
+| `AgentMsg` | 66 | `Placed` | | lb/core2: an owner's word on an agent session's start the server asked it to place, JSON |
 | `AgentMsg` | 58–62 | `Amphora`, `JobFinishedV2`, `RunnerProcess`, `JobLogChunkV1`, `JobLogEndV1` | | in flight (fb1bf362), on a main older than 861bbe60: each collides, and goes after main's last when it lands |
 | `AgentMsg` | 58 | `SampleWithPressure` | | in flight (`placement/pressure`), on an older main: goes after the last when it lands |
 | `ServerMsg` | 0–66 | `Welcome` … `Custody` | | main |
@@ -550,6 +553,7 @@ this branch's rows to the code: each bit once, each appended variant at its inde
 | `ServerMsg` | 68 | `Stop` | | lb/integrate |
 | `ServerMsg` | 69 | `Features` | | lb/core |
 | `ServerMsg` | 70 | `Offers` | | lb/core2: another runner's room as its admission said it, JSON, for owners choosing where to probe; to a runner that named `offers` |
+| `ServerMsg` | 71 | `Place` | | lb/core2: own an agent session's start, JSON, to a runner that named `place.sessions` |
 | `ServerMsg` | 65–68 | `Amphora`, `ReceivedV2`, `RetainedReceived`, `JobLogReplyV1` | | in flight (fb1bf362): collide; go after the last when they land |
 | `reach::wire::Ask` | 0–11 | `Hello` … `Unread` | reach links | main |
 | `reach::wire::Ask` | 12 | `Features` | reach links | lb/core |
@@ -711,6 +715,7 @@ Four edges are left, and the lab steers clear of each:
 | `Fenced` | stream | What the runner sends about a leg it holds a grant for (its steps, events and result), carried whole and named by its grant (W05-R34), so what a grant that isn't the leg's sends is told from what its grant sends. | New: to a server announcing `CAP_LEASES`, kept and sent again after a reconnect as what it carries is. |
 | `Features` | handshake | The features the runner speaks, by name (docs/wire.md, "Named features"): every name it says, superseding the last list. | New: to a server announcing `CAP_FEATURES`, once its `Caps` said so, and again when they change. |
 | `Offers` | state | What the runner's admission holds, as a hint for the offers view (docs/needs.md E5): budget, room, its line by class, quotes, its own runs waiting. Sent when a decision-relevant value changes, never per sample. | New: to a server that named `offers`. |
+| `Placed` | answer | An owner's word on an agent session's start the server asked it to place (`ServerMsg::Place` `req`): its answer as it changes, `go` with its runner and claim, or `fallback`. | New: from runners that named `place.sessions`. |
 
 ## Server to runner: `ServerMsg`
 
@@ -787,6 +792,7 @@ Four edges are left, and the lab steers clear of each:
 | `Stop` | command, parked | `Cancel` naming the grant to stop (W05-R34): a runner running another of the leg's grants lets that one be. | New: to runners announcing `CAP_LEASES`, on the channel ("Commands"): answered once applied. |
 | `Features` | handshake | The features the server speaks, by name ("Named features"). | New: to runners announcing `CAP_FEATURES`, after `Caps`. |
 | `Offers` | state | Another runner's room as its admission last said it (`{runner, epoch, seq, room}`, JSON), for this runner's owner to choose where to probe by (docs/needs.md E5). A hint, never a claim: the newest of each runner's wins. | New: to runners that named `offers`, when a runner's hint changed something decided by. |
+| `Place` | ask | Own an agent session's start (docs/needs.md E5): place it among the machines that can run its harness, as this runner's owner places its runs, or let it go. Answered by `Placed` until it's told to go; the server waits on no deadline, and a lost link ends the wait at once. | New: to runners that named `place.sessions`. |
 
 ## Commands to a session: `Command`
 

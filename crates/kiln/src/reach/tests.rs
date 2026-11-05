@@ -1506,3 +1506,70 @@ fn o1_a_runners_hint_goes_only_on_a_change_decided_by() -> anyhow::Result<()> {
     p.hinted(&serde_json::to_string(&crate::offers::hint::Room { runner: "r".into(), epoch: 1, seq: 1, room: [0; 4] })?);
     Ok(())
 }
+
+/// AUDIT M4, G1 (docs/needs.md E5): an agent session placed by a runner's owner holds its room on
+/// the runner it was placed on from its start to its end, in the one ledger with CI legs and
+/// commands. kiln's server asks mac to own a session's start among the machines that can run its
+/// harness (linux), asking 4 CPUs: mac's owner probes linux, linux admits it, and mac says go with
+/// its claim. Started there, it holds 4 of linux's 8 CPUs: a leg of 6 beside it is refused, one of
+/// 4 admitted; a command of 2 then waits, and starts on linux once the session ends, nobody
+/// polling. What's held never passes linux's size.
+#[cfg(unix)]
+#[test]
+fn m4_g1_sessions_legs_and_commands_never_pass_a_runners_budget_together() -> anyhow::Result<()> {
+    use super::place::{SessionAsk, SessionWord};
+    crate::rt::block_on(async move {
+        let lab = lab_placing().await?;
+        lab.mac.feed(In::Sampled(reading(100.0))).await;
+        lab.linux.feed(In::Sampled(reading(0.0))).await;
+        lab.mac.directory().await?;
+        lab.linux.directory().await?;
+        let within = |(held, cap): ([u64; 4], [u64; 4])| held.iter().zip(&cap).all(|(h, c)| h <= c);
+        let needs = kiln_ci::sched::needs::parse("cpus=4").map_err(anyhow::Error::msg)?;
+        let ask = kiln_ci::place::Ask { run: "session-1".into(), needs, class: kiln_ci::sched::state::Class::Interactive, among: vec!["linux".into()], key: Some("session:claude".into()), ..kiln_ci::place::Ask::default() };
+        lab.mac.feed(In::SessionPlace { req: 7, json: serde_json::to_string(&SessionAsk::Ask { ask: Box::new(ask) })? }).await;
+        let claim = loop {
+            let (from, m) = crate::rt::timeout(Duration::from_secs(60), lab.said.recv()).await??;
+            if let (true, AgentMsg::Placed { req: 7, json }) = (from == "mac", m)
+                && let SessionWord::Go { runner, claim } = serde_json::from_str::<SessionWord>(&json)?
+            {
+                anyhow::ensure!(runner == "linux", "placed on {runner}");
+                break claim;
+            }
+        };
+        anyhow::ensure!(lab.linux.session_started(claim.clone()).await?, "its claim was live on linux");
+        let hc = held_and_cap(&lab.linux).await?;
+        anyhow::ensure!(hc.0.first() == Some(&4_000) && within(hc), "the session holds its 4 CPUs: {hc:?}");
+        let six = lab.linux.admit_leg(leg("leg-6", 6)?).await?;
+        anyhow::ensure!(six.is_err(), "a leg of 6 beside the session's 4 of 8: {six:?}");
+        anyhow::ensure!(lab.linux.admit_leg(leg("leg-4", 4)?).await? == Ok(()), "a leg of 4 fits beside it");
+        let hc = held_and_cap(&lab.linux).await?;
+        anyhow::ensure!(hc.0.first() == Some(&8_000) && within(hc), "{hc:?}");
+        let (seen_tx, seen_rx) = async_channel::unbounded::<([u64; 4], [u64; 4])>();
+        let (linux, once) = (lab.linux.clone(), std::sync::atomic::AtomicBool::new(false));
+        let session = claim.clone();
+        let req = RunReq { target: "cpus=2".into(), command: "echo after the session".into(), ..RunReq::default() };
+        let evs = run_from_mac(&lab, req, move |e| {
+            if let Ev::Placed { json } = e
+                && json.contains("\"queued\"")
+                && !once.swap(true, std::sync::atomic::Ordering::Relaxed)
+            {
+                let (l, tx, c) = (linux.clone(), seen_tx.clone(), session.clone());
+                crate::rt::spawn(async move {
+                    let _ = tx.send(held_and_cap(&l).await.unwrap_or_default()).await;
+                    l.session_ended(c).await;
+                });
+            }
+            None
+        })
+        .await?;
+        let hc = seen_rx.recv().await?;
+        anyhow::ensure!(within(hc), "while the command waited: {hc:?}");
+        anyhow::ensure!(evs.iter().filter(|e| matches!(e, Ev::Started { .. })).count() == 1, "started once: {evs:?}");
+        anyhow::ensure!(answers(&evs).iter().any(|a| a.contains("linux")), "on linux, once the session ended: {:?}", answers(&evs));
+        lab.linux.leg_ended("leg-4", true).await;
+        let hc = held_and_cap(&lab.linux).await?;
+        anyhow::ensure!(hc.0 == [0, 0, 0, 0], "all of it free again: {hc:?}");
+        anyhow::Ok(())
+    })
+}

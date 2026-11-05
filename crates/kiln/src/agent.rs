@@ -3907,6 +3907,14 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                             r.feed(crate::reach::node::In::Hint(json)).await;
                         }
                     }
+                    // Own an agent session's start (AUDIT M4): its node places it, and says back.
+                    ServerMsg::Place { req, json } => match &reach {
+                        Some(r) => r.feed(crate::reach::node::In::SessionPlace { req, json }).await,
+                        None => {
+                            let word = crate::reach::place::SessionWord::Fallback { runners: Vec::new() };
+                            uplink.msg(AgentMsg::Placed { req, json: serde_json::to_string(&word).unwrap_or_default() }).await;
+                        }
+                    },
                     // From an epoch older than the newest this runner has seen (W05-R37): not applied.
                     ServerMsg::Stop { grant, .. } if leases.stale(grant.epoch) => {
                         refuse(&mut answer_after, crate::wire::channel::Refusal::StaleEpoch, format!("a Stop from epoch {}, older than this runner has seen", grant.epoch));
