@@ -1,0 +1,69 @@
+# A trial, deleted after: goal 5's part 2 (plan 01a1a59c2aae step 4), the integration tests of
+# runners, their processes and agent sessions, on GitHub's hosted Linux runner (kiln's own machines
+# are paced). Not on main.
+name: g5-agents-trial
+
+on:
+  push:
+    branches: [g5-agents-trial]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: g5-agents-trial
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: never
+  CARGO_INCREMENTAL: "0"
+  KILN_SKIP_UI_BUILD: "1"
+  KILN_UI_SERVER: "off"
+  CARGO_PROFILE_DEV_DEBUG: line-tables-only
+
+jobs:
+  agents:
+    name: linux (runners' and agents' integration tests)
+    runs-on: ubuntu-latest
+    timeout-minutes: 150
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Rust
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - id: tests
+        name: The tests
+        timeout-minutes: 140
+        run: |
+          set +e
+          failed=""
+          for n in machines agent_access mixed_fleet harness_commands harness_path harness_history switch_held restart resume old_runner ladder_agents runner_path sends_away sends wire_updates agent_limit exclusive capacity couldnt_start retry_elsewhere instance_rekey ui_commands unread_frames commands replies agents_review; do
+            echo "=== $n $(date -u +%T)" | tee -a "$RUNNER_TEMP/tests.txt"
+            timeout 1500 cargo test -p kiln --locked --test "$n" -- --test-threads=2 2>&1 | grep -E '^test |^test result|^Error|panicked|^error' | tee -a "$RUNNER_TEMP/tests.txt"
+            rc=${PIPESTATUS[0]}
+            echo "--- $n rc=$rc" | tee -a "$RUNNER_TEMP/tests.txt"
+            [ "$rc" -eq 0 ] || failed="$failed $n"
+            # Each binary goes after its run: the runner's disk holds few.
+            find target/debug/deps -maxdepth 1 -type f -name "$n-*" ! -name '*.d' -delete
+          done
+          echo "failed:${failed:- none}" | tee -a "$RUNNER_TEMP/tests.txt"
+          [ -z "$failed" ]
+      - name: Report
+        if: ${{ always() }}
+        env:
+          OUTCOME: ${{ steps.tests.outcome }}
+        run: |
+          set +e +o pipefail
+          out="$RUNNER_TEMP/tests.txt"
+          [ -s "$out" ] || exit 0
+          text=$(grep -E '^--- |^failed:|FAILED|^Error|panicked' "$out" | head -n 80)
+          level=notice
+          if [ "$OUTCOME" != success ]; then level=error; fi
+          echo "::$level title=tests $OUTCOME::$(printf '%s\n' "$text" | sed -e 's/%/%25/g' -e 's/\r/%0D/g' | awk 'BEGIN { ORS = "%0A" } { print }')"
