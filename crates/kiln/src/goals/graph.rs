@@ -303,9 +303,8 @@ pub(super) fn ready<'a>(g: &Graph, nodes: &'a [Node]) -> Vec<&'a Node> {
     out.into_iter().map(|(_, _, n)| n).collect()
 }
 
-/// The room the agent has for subagents now.
+/// The room the agent has for subagents now (`goals::subagents::room_now`: its Subagents setting).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[cfg_attr(not(test), expect(dead_code, reason = "G2 hands ready goals to subagents; until it does, the driver has no room (`Never`)"))]
 pub(super) enum Room {
     /// No maximum: its Subagents setting says none.
     Any,

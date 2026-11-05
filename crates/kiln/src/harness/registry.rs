@@ -3952,6 +3952,12 @@ impl Registry {
         self.sessions.with(id, |v| Info::clone(&v.info))
     }
 
+    /// [`Registry::info`] as its owner shares it with its view, not copied (goal 9, plan 01a1a87b2cec step 3: what
+    /// reads a few fields of a session found by id, the programs' thresholds and the goal stacks' words said again).
+    pub fn info_shared(&self, id: &str) -> Option<Arc<Info>> {
+        self.sessions.with(id, |v| Arc::clone(&v.info))
+    }
+
     /// What waits in session `id`'s queue, as its machine last said, the messages whole.
     pub fn queue(&self, id: &str) -> Vec<super::model::QueueItem> {
         let Some(state) = self.sessions.with(id, |v| Arc::clone(&v.state)) else { return Vec::new() };
@@ -4258,7 +4264,7 @@ mod tests {
         // A reply's words still go to its event, at the revision they came.
         let last = format!("e{n}");
         took(&mut m, |m| m.append(&last, "more"));
-        let at = m.index.get(last.as_str()).copied().unwrap_or(usize::MAX);
+        let at = m.index.get(&m.events, &last).unwrap_or(usize::MAX);
         assert_eq!(m.events.get(at).and_then(|e| e.entry.value().get("text").and_then(Value::as_str).map(str::to_owned)).as_deref(), Some("xmore"));
         assert_eq!(m.events.get(at).map(|e| e.entry.text().contains("xmore")), Some(true), "its text written again");
         assert_eq!(m.events.get(at).map(|e| e.at), Some(m.rev), "changed at the revision it came");
