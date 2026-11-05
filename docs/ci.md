@@ -1664,9 +1664,13 @@ scans agents) with an event-driven state machine in `kiln_ci::sched`, driven by
   and the MCP tools take too: docs/runners.md. **Headroom**, in either mode: each runner's live
   sample (what it has in use of its CPUs and memory, and its I/O pressure, every 5 s) reaches the
   engine, and a leg goes only where what the sample has in use, what kiln placed there since and
-  the leg's request stay within `[ci.scheduler] target_use` (0.85 by default, at most 1) of the
-  runner's CPUs and of its memory; a sample over a minute old is unknown, and the runner is placed
-  by its room alone, as before samples. `[ci.scheduler] headroom = false` places by room alone
+  the leg's request stay within the runner's target use of its CPUs and of its memory:
+  `[ci.scheduler] target_use` (at most 1) where a person sets it, else derived for each runner, its
+  CPUs to the knee of an M/M/m queue of as many servers (Millsap, "Thinking Clearly About
+  Performance", 2010: 74 % for 8 CPUs, 86 % for 32) and its memory to all that the kernel says is
+  available (MemAvailable). A sample stands until the next or until its runner's link is lost (no
+  clock ages it), and what was placed after it stops counting as it ends; a runner with no sample
+  on its link is placed by its room alone, as before samples. `[ci.scheduler] headroom = false` places by room alone
   everywhere (kiln's integration tests do: their runners share the machine running the tests; so
   does `kiln workflow run`'s server, whose one runner is the machine it was asked to run on). The engine and the v1 dispatcher place through one function
   shaped as kiln-seams' `Placement`, `kiln_ci::sched::place`, which Hex's placement (CP-T7.1) takes
@@ -1721,11 +1725,11 @@ scans agents) with an event-driven state machine in `kiln_ci::sched`, driven by
   minute, kept as a key that doesn't move with the clock (`aging × queued-at − priority ×
   60,000,000`, least first, then arrival), so a tenant's own stream of high-priority legs never
   starves its low-priority ones (W05-AC03). Between tenants only fair share counts (W05-R10), and
-  between classes W05-R30 (docs/needs.md E2.3): a class with a floor and a bound (W05-R31; by
-  default `batch` and `background`) doesn't starve behind those before it. The aging between
-  priority levels W28-R65 had is gone; in its place an `interactive` leg goes up into `land` once
-  the `land` work ahead of it when it came is due done by its expected ends (W05-R31), so every
-  class below `land` has a bounded wait (`w28_r65_interactive_behind_a_land_stream_…`).
+  between classes W05-R30 (docs/needs.md E2.3): a class with a floor (W05-R31; by default
+  `batch` and `background`) doesn't starve behind those before it. The aging between priority
+  levels W28-R65 had is gone; in its place a leg of any class below `land` goes up a class once the
+  work of the classes before it that was ahead of it is due done by its expected ends (W05-R31), so
+  every class below `land` has a bounded wait (`w28_r65_interactive_behind_a_land_stream_…`).
 - **W05-R10 Fair share.** Within a class (W05-R30), start-time fair queuing across tenants:
   repositories, weighted by `[ci.fairness] weights`, and inside them actors and lanes as
   `[ci.scheduler] fair_by` lists (W05-R32). A leg's charge is its dominant share of the fleet × its
@@ -1927,22 +1931,27 @@ scans agents) with an event-driven state machine in `kiln_ci::sched`, driven by
   priority only a tenant's own legs (W05-R09). The routing explanation's `standing` names a leg's
   class, the class it was promoted from, and its tenant.
 - **W05-R31 Floors and promotion** (docs/needs.md §7, E2.3). `[sched.classes.<class>] floor`
-  (percent of the fleet) and `bound` (`30m`, or `never`); by default `batch` 15 % and 30 minutes,
-  `background` 5 % and an hour, the rest neither. A class whose running legs hold less of the
+  (percent of the fleet) and `bound` (`30m`, or `never`); by default `batch` 15 % and `background`
+  5 % (the person's, docs/needs.md E-D2), the rest none, and no class a bound: each leg's bound is
+  measured (below). A class whose running legs hold less of the
   fleet than its floor (their total at its largest dimension, as YARN measures a minimum share
   under DRF) takes room ahead of the classes before it when room frees: with a leg that keeps it
   within its floor, always; with one that would take it over (a floor smaller than a leg), once
   its pace has passed, which moves on by `the leg's dominant share × its expected time / what was
   left of the floor` and is settled to the time it ran, so on one slot a 15 % floor is the slot 15
-  % of the time. Nothing is preempted. A leg that has waited its class's bound while its class
-  started no leg at its signature goes up a class (`background` to `batch`, `batch` to
-  `interactive`, never into `critical`), keeping its place in its tenant's order; if its class did start
+  % of the time. Nothing is preempted. A leg's bound is measured: once the legs of the classes
+  before its own that were queued or running when it came to its class have all started, the
+  latest of their expected ends (each grant's p90 from history, else its median, else its
+  timeout, declared or GitHub's 360 minutes: bounded with no history too), from when it came; with
+  none of those when it came, it has none until such work first comes, and its wait counts from
+  then (else every such leg would go up at once and the classes would merge). A person's `bound`
+  for its class is one too. A leg that has waited its bound while its class started no leg at its
+  signature goes up a class (`background` to `batch`, `batch` to `interactive`, `interactive` to
+  `land`, never into `critical`), keeping its place in its tenant's order; if its class did start
   one there, it's looked at again a bound after that start, so a class being served keeps fair
-  share's order, never the longest wait's. An `interactive` leg, which has no bound by default,
-  goes up into `land` once the `land` and `critical` legs queued or running when it came to its
-  class have all started and are due done by their expected ends (each grant's p90 from history,
-  else its median, else its timeout: bounded with no history too), without a bound picked for it
-  (an integration call on merging into main, to confirm with the person). The engine asks for a timer for the next look; a
+  share's order, never the longest wait's. (For `interactive` an integration call on merging into
+  main, to confirm with the person; for every class, lb/constants, replacing the picked 30 and 60
+  minutes.) The engine asks for a timer for the next look; a
   promoted leg preempts nothing.
 - **W05-R32 The tenant tree** (docs/needs.md E2.2). Fair share runs over a tree, one for each class:
   repositories, then their actors, then their lanes, as far as `fair_by` goes, a repository
@@ -2185,8 +2194,8 @@ W20.
   holds about a third, not half. *Simulation tests (`w05_ac14_…`).*
 - **W05-AC15 A class's bound** (W05-R31). A `background` leg under a steady stream of one-minute
   `batch` legs on 20 slots starts when a runner next frees, through its 5 % floor (within 2
-  minutes); with every floor at zero, at its 60-minute bound, promoted to `batch`, and a leg's time
-  (60 to 61 minutes). Under a saturating `land` stream, `batch` holds 13 % to 17 % of 20 slots in
+  minutes); with every floor at zero, at its bound, promoted to `batch`: the batch work ahead of it
+  due done, a minute by that work's history, 5 minutes by its declared timeout with none. Under a saturating `land` stream, `batch` holds 13 % to 17 % of 20 slots in
   every 10-minute window, and on one slot 15 % of the time; `interactive` legs go first while
   `batch` holds its floor; a work-in-progress leg behind gate work starts as the runner next frees;
   a class served at one signature is still promoted where it's passed over. *Simulation tests

@@ -3864,7 +3864,7 @@ pub(crate) struct V1Candidate<'a> {
 /// scheduler's headroom, [`kiln_ci::sched::place::place`]): within the target use by its last
 /// sample, the one with the most headroom left after it; ties by how full the job would leave
 /// each, runners that haven't sampled after those, then the most slots, then the name.
-pub(crate) fn v1_best<'a>(candidates: impl IntoIterator<Item = V1Candidate<'a>>, asked: &kiln_ci::sched::state::Resources, target: f64) -> Option<&'a str> {
+pub(crate) fn v1_best<'a>(candidates: impl IntoIterator<Item = V1Candidate<'a>>, asked: &kiln_ci::sched::state::Resources, target: impl Into<kiln_ci::sched::state::TargetUse>) -> Option<&'a str> {
     let mut found: Vec<V1Candidate<'a>> = candidates.into_iter().collect();
     found.sort_by(|a, b| crate::reach::directory::emptier(a.full, b.full).then(b.slots.cmp(&a.slots)).then(a.name.cmp(b.name)));
     let nodes: Vec<kiln_ci::sched::place::Node<'a>> = found.iter().map(|c| kiln_ci::sched::place::Node { name: c.name, headroom: c.headroom }).collect();

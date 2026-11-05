@@ -127,7 +127,8 @@ the constraints, its capabilities and executors) and has **room** (a slot, or in
 request within capacity × `overcommit`; an exclusive leg's share held, W05-R03), and that it leaves
 **within the target use** by the runner's live headroom: what its latest sample (every 5 s) has in
 use of its CPUs and memory, its own work's and kiln's alike, what kiln placed there since, and the
-leg's request stay within `[ci.scheduler] target_use` (85% by default) of its CPUs and of its
+leg's request stay within its target use (`[ci.scheduler] target_use` where a person sets it; else
+its CPUs' M/M/m knee, 74% for 8 CPUs and 86% for 32, and all its available memory) of its CPUs and of its
 memory, so memory is never placed past what a runner has. Among those it takes its preferences'
 best (W05-R23) when the job or a rule declares any, then the one it leaves the most headroom: the
 larger of its CPUs' and its memory's share in use after it, its I/O pressure on top, the lowest;

@@ -9,8 +9,9 @@
 //! that fits it, unless a class after that one is short of its floor (W05-R31); in a class, from
 //! the tenant whose fair-share standing is least (start-time fair queuing over the class's tree:
 //! repositories, or inside one its actors and lanes, W28-R66; in the dimensions the runner offers,
-//! docs/needs.md E2.1, E2.2). A class passed over at a signature for its bound has its legs there
-//! promoted a class, never above `interactive` (W05-R31). Capacity that frees looks only at the
+//! docs/needs.md E2.1, E2.2). A class passed over at a signature for a leg's bound (the expected
+//! end of the work of the classes before it that was ahead of it, or a person's bound for the
+//! class) has that leg promoted a class, never into `critical` (W05-R31). Capacity that frees looks only at the
 //! signatures that runner can serve.
 //!
 //! Each assignment is a grant (W05-R34, docs/needs.md §8): its [`Fence`] (the epoch, then its
@@ -184,10 +185,10 @@ impl Class {
     /// Every class, in order.
     pub const ALL: [Class; 5] = [Class::Critical, Class::Land, Class::Interactive, Class::Batch, Class::Background];
 
-    /// The class an item that waited past its class's bound goes up to (W05-R31): never into
-    /// `critical`, so `land` and `critical` aren't promoted. `interactive` goes up into `land` once
-    /// the `land` work ahead of it is done ([`Behind`]; an integration call on merging
-    /// needs-engine into main, to confirm with the person).
+    /// The class an item that waited past its bound goes up to (W05-R31): never into `critical`,
+    /// so `land` and `critical` aren't promoted. Each item's bound is the expected end of the work
+    /// of the classes before its own that was ahead of it ([`Behind`]; for `interactive` an
+    /// integration call on merging needs-engine into main, to confirm with the person).
     pub fn up(self) -> Option<Class> {
         match self {
             Class::Background => Some(Class::Batch),
@@ -227,7 +228,8 @@ pub struct ClassConfig {
     /// over it as often as its floor of the fleet's time allows.
     pub floor: PerMille,
     /// How long one of its items waits, the class starting nothing at its signature meanwhile,
-    /// before it's promoted a class.
+    /// before it's promoted a class: a person's setting, none by default. Each item has its own
+    /// bound besides, from what's ahead of it ([`Behind`]); whichever comes first promotes it.
     pub bound: Option<Ms>,
 }
 
@@ -425,7 +427,8 @@ pub struct Config {
     pub warm: warm::Model,
     /// The share of a runner's CPUs and memory placement fills it to, by its live headroom (W05):
     /// a leg goes only where it leaves the runner within it, its memory never past all of it.
-    pub target_use: f64,
+    /// Derived for each runner unless a person sets it ([`TargetUse`]).
+    pub target_use: TargetUse,
     /// How long a leg first in its queue waits with no runner having room for it before it holds
     /// one for itself ([`RoomHold`], W05's admission).
     pub hold_after_ms: i64,
@@ -474,7 +477,7 @@ impl Default for Config {
             fair_by: vec![FairBy::Repo],
             admission: None,
             warm: warm::Model::default(),
-            target_use: TARGET_USE,
+            target_use: TargetUse::Derived,
             hold_after_ms: HOLD_AFTER_MS,
             classes: default_classes(),
             lease: None,
@@ -538,10 +541,17 @@ pub struct Gang {
     pub size: u32,
 }
 
-/// The classes' floors and bounds by default (docs/needs.md §7, E-D2): `background` 5 % of the
-/// fleet and promoted after an hour, `batch` 15 % and promoted after half an hour.
+/// The classes' floors by default: `background` 5 % of the fleet, `batch` 15 %, as the person
+/// decided them (docs/needs.md E-D2, decided 2026-10-26: "the five classes with their floors (5 %
+/// `background`, 15 % `batch`)"). Settings, `[sched.classes.<class>] floor`, each a person's.
+///
+/// No class has a bound by default: an item's bound is measured, the expected end of the work of
+/// the classes before its own that was ahead of it ([`Behind`], W05-R31), as the merge of
+/// needs-engine into main made it for `interactive` (merge-notes.md); this replaced the picked 30
+/// minutes for `batch` and 60 for `background` (lb/constants, constants.md). A person may still
+/// set one (`[sched.classes.<class>] bound`), with their reason.
 pub fn default_classes() -> BTreeMap<Class, ClassConfig> {
-    BTreeMap::from([(Class::Batch, ClassConfig { floor: 150, bound: Some(30 * 60_000) }), (Class::Background, ClassConfig { floor: 50, bound: Some(60 * 60_000) })])
+    BTreeMap::from([(Class::Batch, ClassConfig { floor: 150, bound: None }), (Class::Background, ClassConfig { floor: 50, bound: None })])
 }
 
 /// A leg to schedule.
@@ -736,7 +746,7 @@ pub enum Input {
     /// reports of their workspaces and the ledger's history.
     Warm { runner: String, held: WarmHeld },
     /// What a runner has in use now, from the samples it sends the server: its [`Headroom`] until
-    /// the next, or until it's older than [`SAMPLE_FRESH_MS`] (the scheduler's headroom, W05).
+    /// the next, or until its link is lost (the scheduler's headroom, W05).
     RunnerSample { runner: String, sample: Sample },
     /// A person paused a leg, or resumed it (W26-R22): paused, one waiting is placed nowhere until
     /// it's resumed, and one running is frozen where it runs, keeping its runner, as it was.
@@ -802,10 +812,11 @@ impl Headroom {
         (cpu, mem)
     }
 
-    /// Whether `request` leaves it within `target` of its CPUs and of its memory.
-    pub fn within(&self, request: &Resources, target: f64) -> bool {
+    /// Whether `request` leaves it within `target` of its CPUs and of its memory ([`TargetUse`]).
+    pub fn within(&self, request: &Resources, target: impl Into<TargetUse>) -> bool {
         let (cpu, mem) = self.use_with(request);
-        cpu <= target + 1e-9 && mem <= target + 1e-9
+        let (to_cpu, to_mem) = target.into().of(self);
+        cpu <= to_cpu + 1e-9 && mem <= to_mem + 1e-9
     }
 
     /// How full `request` leaves it: the larger of its CPUs' and its memory's share in use, and on
@@ -821,11 +832,118 @@ impl Headroom {
     }
 }
 
-/// [`Config::target_use`] by default.
-pub const TARGET_USE: f64 = 0.85;
+/// What placement fills a runner to, of its CPUs and of its memory, by its live headroom (W05):
+/// a person's share for both (`[ci.scheduler] target_use`), or, unset, what's derived for each
+/// runner ([`TargetUse::of`]).
+///
+/// Unset by default: main's W05 step 2 (ec1d3c77) picked 0.85 for both, with no derivation
+/// (constants.md). What replaced it is the runner's own size and the kernel's own measure:
+///
+/// - CPUs: the knee of an M/M/m queue with as many servers as the runner has CPUs ([`knee`]):
+///   "the utilization value at which response time divided by utilization is at its minimum",
+///   past which, "allowing sustained resource loads in excess of the knee value results in
+///   response times and throughputs that will fluctuate severely with microscopic changes in load"
+///   (Cary Millsap, "Thinking Clearly About Performance", ACM Queue 8(9), 2010, and Communications
+///   of the ACM 53(10), 2010, "The knee"). 0.5 for one CPU, 0.74 for 8, 0.81 for 16, 0.86 for 32,
+///   0.90 for 64: the more CPUs, the fuller a runner runs before the work on it, its own and
+///   what else runs there, waits on them.
+/// - Memory: all of what the kernel says is available (a sample's `mem_used` is its total less
+///   `MemAvailable` on Linux, sysinfo's available memory elsewhere): "an estimate of how much
+///   memory is available for starting new applications, without swapping" (Linux,
+///   Documentation/filesystems/proc.rst, `MemAvailable`; commit 34e431b0ae39, 2014), the low
+///   watermarks kept back already. Memory doesn't queue as CPUs do: what fits without swapping
+///   fits.
+///
+/// It's still a person's to set, with their reason (a machine shared with production may want
+/// less). To be learned later per runner: the runner's headroom engine already learns a CPU knee
+/// from its targets' probes (`kiln_ci::headroom`, docs/headroom.md "Budgets"); once runners send
+/// it with their samples (asks/sense.md), it takes the place of the queueing model's.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub enum TargetUse {
+    #[default]
+    Derived,
+    Set(f64),
+}
 
-/// How long a runner's sample stands: past it, its headroom is unknown, and it's placed as before
-/// samples were (W05-R23's order).
+impl From<f64> for TargetUse {
+    fn from(t: f64) -> TargetUse {
+        TargetUse::Set(t)
+    }
+}
+
+impl From<Option<f64>> for TargetUse {
+    fn from(t: Option<f64>) -> TargetUse {
+        t.map_or(TargetUse::Derived, TargetUse::Set)
+    }
+}
+
+impl TargetUse {
+    /// Its share of `h`'s CPUs and of its memory.
+    pub fn of(self, h: &Headroom) -> (f64, f64) {
+        match self {
+            TargetUse::Set(t) => (t, t),
+            TargetUse::Derived => (knee(u32::try_from(h.of.cpu.get().div_ceil(1000)).unwrap_or(u32::MAX)), 1.0),
+        }
+    }
+
+    /// The share of its CPUs it allows a runner of `cpus` CPUs, in millionths (for words).
+    pub fn cpu_ppm(self, cpus: u64) -> u32 {
+        match self {
+            TargetUse::Set(t) => units::ppm_of(t),
+            TargetUse::Derived => units::ppm_of(knee(u32::try_from(cpus).unwrap_or(u32::MAX))),
+        }
+    }
+}
+
+/// The knee of an M/M/m queue of `m` servers (Millsap 2010, [`TargetUse`]): the utilization `ρ`
+/// at which `R(ρ)/ρ` is least, `R(ρ) = 1 + C(m, mρ) / (m(1 - ρ))` the response time in service
+/// times and `C` Erlang's C formula. Found by golden-section search over (0, 1) (`R/ρ` is convex
+/// there): 80 steps narrow the bracket below an `f64`'s spacing, and the knee comes out within about
+/// 1e-8 (√ε: `R/ρ` is flat at its least, so values of it closer than that compare equal), far
+/// finer than a share of a runner's CPUs that placement can tell apart. `m = 1` gives the closed
+/// form's 0.5, `m = 2` its 1/√3, to that. Its arithmetic is +, −, ×, ÷ in a fixed order, so it's the same on every
+/// machine; each `m` is worked out once per thread.
+#[allow(clippy::float_arithmetic, clippy::cast_precision_loss)]
+pub fn knee(m: u32) -> f64 {
+    thread_local! {
+        static KNEES: std::cell::RefCell<BTreeMap<u32, f64>> = const { std::cell::RefCell::new(BTreeMap::new()) };
+    }
+    let m = m.max(1);
+    if let Some(k) = KNEES.with(|k| k.borrow().get(&m).copied()) {
+        return k;
+    }
+    let servers = f64::from(m);
+    let per_use = |rho: f64| {
+        // Erlang's B by its recursion, then C from B.
+        let a = servers * rho;
+        let mut b = 1.0;
+        for k in 1..=m {
+            b = a * b / (f64::from(k) + a * b);
+        }
+        let c = b / (1.0 - rho * (1.0 - b));
+        (1.0 + c / (servers * (1.0 - rho))) / rho
+    };
+    let ratio = (5.0_f64.sqrt() - 1.0) / 2.0;
+    let (mut lo, mut hi) = (0.0_f64, 1.0_f64);
+    for _ in 0..80 {
+        let (x, y) = (hi - ratio * (hi - lo), lo + ratio * (hi - lo));
+        if per_use(x) < per_use(y) {
+            hi = y;
+        } else {
+            lo = x;
+        }
+    }
+    let k = f64::midpoint(lo, hi);
+    KNEES.with(|c| c.borrow_mut().insert(m, k));
+    k
+}
+
+/// How long the v1 dispatcher lets a runner's sample stand (`crates/kiln/src/hub.rs`'s
+/// `fresh_headroom`, AUDIT M1/M2, lb/sense's): the engine no longer reads it. A picked minute with
+/// no derivation (constants.md); the engine replaced it by events: a sample stands until the next
+/// one or until its runner's link is lost, and what was placed after it stops counting when it
+/// leaves, so nothing builds up while a runner reports nothing new. To go once the v1 path does
+/// the same (asks/sense.md).
 pub const SAMPLE_FRESH_MS: i64 = 60_000;
 
 /// [`Config::hold_after_ms`] by default.
@@ -843,17 +961,29 @@ pub struct RoomHold {
     pub extra: Resources,
 }
 
-/// An `interactive` leg's wait behind `land` (and `critical`) work, from what kiln measures rather
-/// than a picked bound (W05-R31; an integration call on merging needs-engine into main, which took
-/// away W28-R65's aging between priorities, to confirm with the person). When it came to its class
-/// (`queued`), the `land` and `critical` legs queued or running then are `ahead`; once those
-/// queued (`waiting`) have all started, it goes up into `land` at `due`, the latest of their
-/// expected ends (each grant's [`Due`]: its p90 from history, else its median cost, else its
-/// timeout, as declared or GitHub's 360 minutes, so with no history it's bounded still). `land`
-/// work that came after it no longer goes ahead of it for good.
+/// A queued leg's wait behind the work of the classes before its own, from what kiln measures
+/// rather than a picked bound (W05-R31, docs/needs.md §5 and §7; the rule the merge of needs-engine
+/// into main made for `interactive`, in place of W28-R65's aging between priorities, here for every
+/// class with one above: `background`, `batch` and `interactive`). When it came to its class, the
+/// legs of the classes before it queued or running then are `ahead`, from `since`; once those queued
+/// (`waiting`) have all started, its bound is due at `due`, the latest of their expected ends (each
+/// grant's [`Due`]: its p90 from history, else its median cost, else its timeout, as declared or
+/// GitHub's 360 minutes, so with no history it's bounded still). Its bound is then `due - since`, and
+/// it goes up as a class passed over for its bound does ([`Scheduler::promote_due`]): if its class
+/// started nothing at its signature in that time. Work of a class before it that came after it no
+/// longer goes ahead of it for good.
+///
+/// With nothing of the classes before it queued or running when it came (`ahead` empty), it has no
+/// bound yet: only its own class is ahead of it, which promotion isn't for. Taking `due` as then
+/// would promote every such leg at once and merge the classes (a `batch` backlog would be `land`
+/// two looks later); taking none would leave it to starve behind such work that comes later. So
+/// it waits unbounded until such work first comes (is queued or running), and its wait is from
+/// then (`since`), behind what is ahead of it then.
 #[derive(Debug, Clone, Default, PartialEq)]
 struct Behind {
     queued: i64,
+    class: Class,
+    since: i64,
     ahead: BTreeSet<String>,
     waiting: BTreeSet<String>,
     due: Option<i64>,
@@ -1043,7 +1173,11 @@ enum State {
 /// may run it (a person's retry placed it there, W05-R28) or alone could (W05-R16).
 pub const REFUSED_AGAIN_MS: i64 = 15_000;
 
-/// A leg's timeout when its job says none (W05-R38): 360 minutes, GitHub's.
+/// A leg's timeout when its job says none (W05-R38): 360 minutes, GitHub's, an external convention
+/// kiln's workflows (GitHub Actions' dialect) inherit: "`jobs.<job_id>.timeout-minutes`: The
+/// maximum number of minutes to let a job run before GitHub automatically cancels it. Default:
+/// 360" (GitHub Docs, "Workflow syntax for GitHub Actions"). It bounds a grant's expected end with
+/// no history, and so every promotion's measured bound at cold start ([`Behind`]).
 pub const DEFAULT_TIMEOUT_MS: Ms = 360 * 60_000;
 
 /// A bug planted in the engine for the reference engine (docs/needs.md E4.5) and kiln-sim's model
@@ -1207,10 +1341,13 @@ struct Runner {
     used: Resources,
     connected: bool,
     draining: bool,
-    /// Its latest sample and when it came ([`Input::RunnerSample`]).
+    /// Its latest sample and when it came ([`Input::RunnerSample`]): it stands until the next, or
+    /// until its link is lost (no clock ages it: [`SAMPLE_FRESH_MS`]).
     sample: Option<(Sample, i64)>,
-    /// What was placed on it since its latest sample.
+    /// What was placed on it since its latest sample, and each leg or executor of that, so what
+    /// leaves before the next sample stops counting as it leaves.
     since: Resources,
+    counted: BTreeMap<String, Resources>,
 }
 
 /// What an exclusive leg holds of its runner (W05-R03): asking for CPUs, those and the memory it
@@ -1433,8 +1570,11 @@ pub struct Scheduler {
     /// Promotions to look at, by when: (leg, when it was queued, the class it goes up from)
     /// (W05-R31).
     promotions: BTreeMap<i64, Vec<(String, i64, Class)>>,
-    /// Each queued `interactive` leg's wait behind the `land` work ahead of it ([`Behind`]).
+    /// Each queued leg's wait behind the work of the classes before its own ([`Behind`]).
     behind: BTreeMap<String, Behind>,
+    /// How many running legs each class has (by [`Class::index`]): whether work of a class before a
+    /// leg's is running, so a [`Behind`] with nothing ahead yet starts its wait.
+    running: [u64; 5],
     /// The epoch its grants are made in (docs/needs.md §8: the store group's term), how many it
     /// has made in it (the last one's fence), and the grants that expire, by (expiry, leg)
     /// (W05-R34).
@@ -1744,10 +1884,13 @@ impl Scheduler {
         }
         // Whatever came, the runners held for legs that can't fit, as they now stand (W05).
         self.refresh_holds(now, &mut out);
-        // The `interactive` legs whose `land` work ahead no longer waits: when each goes up.
+        // The legs that had nothing of the classes before theirs ahead, now that such work came:
+        // their wait behind it starts now ([`Behind`]). Then those whose work ahead no longer
+        // waits: when each one's bound is due.
+        self.arm_behind(now);
         let watched: Vec<String> = self.behind.keys().cloned().collect();
         for id in watched {
-            self.land_due(&id, now);
+            self.ahead_due(&id, now);
         }
         // G4 (W05-R40), held after every input of every test: no gang runs in part.
         #[cfg(test)]
@@ -2155,7 +2298,7 @@ impl Scheduler {
             l.ends = ends;
         }
         // The runner may not have reconnected yet: keep what it runs until it does.
-        let r = self.runners.entry(runner.clone()).or_insert_with(|| Runner { input: RunnerIn { id: runner.clone(), ..RunnerIn::default() }, running: Vec::new(), used: Resources::default(), connected: false, draining: false, sample: None, since: Resources::default() });
+        let r = self.runners.entry(runner.clone()).or_insert_with(|| Runner { input: RunnerIn { id: runner.clone(), ..RunnerIn::default() }, running: Vec::new(), used: Resources::default(), connected: false, draining: false, sample: None, since: Resources::default(), counted: BTreeMap::new() });
         r.running.push(id.clone());
         add(&mut r.used, &request);
         // W28-R42: what its runner still runs is the execution of its work. A queued duplicate
@@ -2392,54 +2535,79 @@ impl Scheduler {
         l.state = State::Queued;
         let at = l.queued_at;
         self.promote_at(id, at, at, class);
-        self.watch_land(id, class, at);
+        self.watch_ahead(id, class, at, at);
     }
 
-    /// An `interactive` leg came to its class now (queued at `queued`): the `land` and
-    /// `critical` legs queued or running now are ahead of it ([`Behind`]). Any other class keeps
-    /// no such watch.
-    fn watch_land(&mut self, id: &str, class: Class, queued: i64) {
+    /// A leg came to `class` at `since` (queued at `queued`): the legs of the classes before it
+    /// queued or running now are ahead of it ([`Behind`]). A class with none above (`critical`,
+    /// `land`) keeps no such watch.
+    fn watch_ahead(&mut self, id: &str, class: Class, queued: i64, since: i64) {
         self.behind.remove(id);
-        if class != Class::Interactive {
+        if class.up().is_none() {
             return;
         }
-        let mut b = Behind { queued, ..Behind::default() };
+        let mut b = Behind { queued, class, since, ..Behind::default() };
+        self.fill_ahead(id, &mut b);
+        self.behind.insert(id.to_owned(), b);
+    }
+
+    /// The legs of the classes before `b`'s queued (`waiting` too) or running now, but `id`.
+    fn fill_ahead(&self, id: &str, b: &mut Behind) {
         for (other, l) in self.legs.iter().filter(|(other, _)| other.as_str() != id) {
             match &l.state {
-                State::Queued if l.key.is_some_and(|k| k.0 <= Class::Land) => {
+                State::Queued if l.key.is_some_and(|k| k.0 < b.class) => {
                     b.ahead.insert(other.clone());
                     b.waiting.insert(other.clone());
                 }
-                State::Assigned { .. } if l.charge.as_ref().is_some_and(|c| c.class <= Class::Land) => {
+                State::Assigned { .. } if l.charge.as_ref().is_some_and(|c| c.class < b.class) => {
                     b.ahead.insert(other.clone());
                 }
                 _ => {}
             }
         }
-        self.behind.insert(id.to_owned(), b);
     }
 
-    /// Once none of the `land` work ahead of an `interactive` leg waits any more (each queued when it
-    /// came has started since, and none is queued now, as one lost and queued again would be), when
-    /// it's due to go up ([`Behind`]): the latest expected end of that work still running, or `now`.
+    /// The first class with a leg queued or running, if any.
+    fn first_class_present(&self) -> Option<Class> {
+        let queued = self.sigs.values().filter_map(|s| s.queue.keys().next().copied()).min();
+        let running = Class::ALL.into_iter().find(|c| self.running.get(c.index()).is_some_and(|n| *n > 0));
+        queued.into_iter().chain(running).min()
+    }
+
+    /// Each leg that had nothing of the classes before its own ahead of it ([`Behind`]), now that
+    /// such work is queued or running: its wait behind that work starts now.
+    fn arm_behind(&mut self, now: i64) {
+        let Some(first) = self.first_class_present() else { return };
+        let unarmed: Vec<String> = self.behind.iter().filter(|(_, b)| b.ahead.is_empty() && first < b.class).map(|(id, _)| id.clone()).collect();
+        for id in unarmed {
+            let Some(mut b) = self.behind.get(&id).cloned() else { continue };
+            b.since = now;
+            self.fill_ahead(&id, &mut b);
+            self.behind.insert(id, b);
+        }
+    }
+
+    /// Once none of the work ahead of a leg waits any more (each queued when its wait began has
+    /// started since, and none is queued now, as one lost and queued again would be), when its
+    /// bound is due ([`Behind`]): the latest expected end of that work still running, or `now`.
     /// Worked out once an input is done, so the order its legs were handled in doesn't matter.
-    fn land_due(&mut self, id: &str, now: i64) {
-        let Some(b) = self.behind.get(id).filter(|b| b.waiting.is_empty() && b.due.is_none()) else { return };
+    fn ahead_due(&mut self, id: &str, now: i64) {
+        let Some(b) = self.behind.get(id).filter(|b| !b.ahead.is_empty() && b.waiting.is_empty() && b.due.is_none()) else { return };
         if b.ahead.iter().any(|a| self.legs.get(a).is_some_and(|l| l.state == State::Queued)) {
             return;
         }
         let ends = b.ahead.iter().filter_map(|a| self.legs.get(a)).filter(|l| matches!(l.state, State::Assigned { .. })).filter_map(|l| l.due.map(|d| d.at(now).expected));
         let due = ends.fold(now, i64::max);
-        let queued = b.queued;
+        let (queued, class) = (b.queued, b.class);
         if let Some(b) = self.behind.get_mut(id) {
             b.due = Some(due);
         }
-        self.promotions.entry(due).or_default().push((id.to_owned(), queued, Class::Interactive));
+        self.promotions.entry(due).or_default().push((id.to_owned(), queued, class));
     }
 
-    /// A leg started or ended (`now`): it's ahead of no `interactive` leg's wait any more, and one
-    /// of its own is over.
-    fn land_left(&mut self, id: &str) {
+    /// A leg started or ended (`now`): it's ahead of no leg's wait any more, and one of its own
+    /// is over.
+    fn ahead_left(&mut self, id: &str) {
         self.behind.remove(id);
         for b in self.behind.values_mut() {
             b.waiting.remove(id);
@@ -2462,26 +2630,29 @@ impl Scheduler {
 
     /// Looks at each promotion due by `now`, in turn (W05-R31), as each input comes (a timer asks
     /// for one when the next is due), so what's decided at `now` sees every leg in its class then.
-    /// A leg that has been in its class for its bound goes up a class (never above `interactive`)
-    /// if its class was passed over at its signature: started no leg there in the bound before. If
-    /// it did, the class isn't starved there, and the leg is looked at again a bound after that
-    /// start: in a class served, the order is fair share's and its tenant's own (docs/needs.md
-    /// E2.3), never the longest wait's. A promoted leg keeps its place in its tenant's order and
-    /// its arrival, and preempts nothing.
+    /// A leg that has been in its class for its bound ([`Behind`], or a person's for its class)
+    /// goes up a class (never into `critical`) if its class was passed over at its signature:
+    /// started no leg there in the bound before. If it did, the class isn't starved there, and the
+    /// leg is looked at again a bound after that start: in a class served, the order is fair share's
+    /// and its tenant's own (docs/needs.md E2.3), never the longest wait's. A promoted leg keeps its
+    /// place in its tenant's order and its arrival, and preempts nothing. The legs that go up at one
+    /// time all go up before any takes its watch in its new class, so what's ahead of each there
+    /// doesn't depend on the order they were looked at in.
     fn promote_due(&mut self, now: i64) {
         while let Some(at) = self.promotions.first_key_value().map(|(at, _)| *at).filter(|at| *at <= now) {
+            let mut came: Vec<(String, Class, i64)> = Vec::new();
             for (id, queued, from) in self.promotions.remove(&at).unwrap_or_default() {
                 let Some(to) = from.up() else { continue };
                 let Some(l) = self.legs.get(&id).filter(|l| l.state == State::Queued && l.queued_at == queued && l.key.is_some_and(|k| k.0 == from)) else { continue };
-                // An `interactive` leg whose `land` work ahead is due done goes up ([`Behind`]);
-                // else by its class's bound, if it has one, as any class's.
-                let behind_done = from == Class::Interactive && self.behind.get(&id).is_some_and(|b| b.queued == queued && b.waiting.is_empty() && b.due.is_some_and(|d| d <= at));
-                if !behind_done {
-                    let Some(bound) = self.class_config(from).bound.map(ms_i64) else { continue };
-                    if let Some(last) = self.sigs.get(&l.sig).and_then(|s| s.served.get(&from)).copied().filter(|t| *t > at.saturating_sub(bound)) {
-                        self.promotions.entry(last.saturating_add(bound)).or_default().push((id, queued, from));
-                        continue;
-                    }
+                // Its bound: once the work ahead of it is due done, the time from its wait's start
+                // to then ([`Behind`]); else its class's bound, if a person set one.
+                let derived = self.behind.get(&id).filter(|b| b.queued == queued && b.class == from && b.waiting.is_empty()).and_then(|b| b.due.filter(|d| *d <= at).map(|d| d.saturating_sub(b.since).max(0)));
+                let Some(bound) = derived.or_else(|| self.class_config(from).bound.map(ms_i64)) else { continue };
+                // Passed over only if its class started nothing at its signature in its bound; else
+                // it's looked at again a bound after that start.
+                if let Some(last) = self.sigs.get(&l.sig).and_then(|s| s.served.get(&from)).copied().filter(|t| *t > at.saturating_sub(bound)) {
+                    self.promotions.entry(last.saturating_add(bound)).or_default().push((id, queued, from));
+                    continue;
                 }
                 // A gang's members share a class (W05-R40): its queued members in that class go up
                 // with it.
@@ -2495,10 +2666,16 @@ impl Scheduler {
                     }
                     self.insert_queue(&m);
                     self.promote_at(&m, queued, at, to);
-                    self.watch_land(&m, to, queued);
-                    // Come to `interactive` at the look: what of it is due already is due from then.
-                    self.land_due(&m, at);
+                    came.push((m, to, queued));
                 }
+            }
+            // Each come to its class at the look, all of them in it: what's ahead of it then, and
+            // what of that is due already is due from then.
+            for (m, to, queued) in &came {
+                self.watch_ahead(m, *to, *queued, at);
+            }
+            for (m, _, _) in &came {
+                self.ahead_due(m, at);
             }
         }
     }
@@ -2626,7 +2803,7 @@ impl Scheduler {
 
     /// Eligible runners with room for the leg, in the order to try them: by declared preference
     /// (W05-R23), then those with the most headroom left after it by their live samples (W05),
-    /// then least loaded, most free slots, and name, as runners without a fresh sample go.
+    /// then least loaded, most free slots, and name, as runners without a sample go.
     fn candidates(&self, id: &str) -> Vec<String> {
         let Some(l) = self.legs.get(id) else { return Vec::new() };
         let Some(s) = self.sigs.get(&l.sig) else { return Vec::new() };
@@ -2635,7 +2812,7 @@ impl Scheduler {
         let mut order: Vec<(usize, &Runner)> = rooms.into_iter().enumerate().collect();
         order.sort_by(|(i, a), (j, b)| {
             let (sa, sb) = (scores.get(*i).copied().unwrap_or(0), scores.get(*j).copied().unwrap_or(0));
-            let (ha, hb) = (headroom_of(a, self.now), headroom_of(b, self.now));
+            let (ha, hb) = (headroom_of(a), headroom_of(b));
             sb.cmp(&sa).then_with(|| super::place::before(&l.input.request, ha.as_ref(), hb.as_ref())).then_with(|| lighter(a, b)).then_with(|| free(b).cmp(&free(a))).then_with(|| a.input.id.cmp(&b.input.id))
         });
         order.into_iter().map(|(_, r)| r.input.id.clone()).collect()
@@ -3032,6 +3209,9 @@ impl Scheduler {
         for (h, a) in held.iter_mut().zip(holds) {
             *h = h.saturating_add(u128::from(a));
         }
+        if let Some(n) = self.running.get_mut(class.index()) {
+            *n = n.saturating_add(1);
+        }
         // The class started a leg at this signature: it isn't passed over here (W05-R31).
         if let Some(s) = self.sigs.get_mut(&l.sig) {
             s.served.insert(class, now);
@@ -3047,6 +3227,9 @@ impl Scheduler {
     /// class holds what it held no more, and a floor's pace it moved is settled alike (W05-R31).
     fn settle_charge(&mut self, id: &str, now: i64) {
         let Some(c) = self.legs.get_mut(id).and_then(|l| l.charge.take()) else { return };
+        if let Some(n) = self.running.get_mut(c.class.index()) {
+            *n = n.saturating_sub(1);
+        }
         if let Some(held) = self.held.get_mut(&c.class) {
             for (h, a) in held.iter_mut().zip(c.holds) {
                 *h = h.saturating_sub(u128::from(a));
@@ -3103,8 +3286,8 @@ impl Scheduler {
             self.leases.insert((at, id.to_owned()));
         }
         self.demands.started(id, now);
-        // Started: no `interactive` leg waits behind it in the queue any more ([`Behind`]).
-        self.land_left(id);
+        // Started: no leg waits behind it in the queue any more ([`Behind`]).
+        self.ahead_left(id);
         let Some(l) = self.legs.get_mut(id) else { return };
         let (attempt, request, repo, lease_loss) = (l.attempt, l.input.request, l.input.repo.clone(), l.input.on_lease_loss);
         let req = l.req.clone();
@@ -3128,6 +3311,7 @@ impl Scheduler {
             add(&mut r.used, &request);
             if r.sample.is_some() {
                 add(&mut r.since, &request);
+                r.counted.insert(id.to_owned(), request);
             }
             executor = req.executors.iter().find(|e| super::routing::usable(&req, &r.input.view.facts, e)).cloned();
         }
@@ -3160,6 +3344,7 @@ impl Scheduler {
         if let Some(r) = self.runners.get_mut(&runner) {
             r.running.retain(|x| x != id);
             sub(&mut r.used, &request);
+            uncount(r, id);
         }
         Some(runner)
     }
@@ -3310,8 +3495,8 @@ impl Scheduler {
     }
 
     fn settle(&mut self, id: &str, outcome: Outcome, reason: Option<String>, now: i64, out: &mut Vec<Command>) {
-        // Ended: it's ahead of no `interactive` leg's wait, and its own is over ([`Behind`]).
-        self.land_left(id);
+        // Ended: it's ahead of no leg's wait, and its own is over ([`Behind`]).
+        self.ahead_left(id);
         // An executor made for it goes with it (a pod still starting for a cancelled leg).
         self.discard_used(id, out);
         let passed = match &outcome {
@@ -3435,8 +3620,8 @@ impl Scheduler {
             l.state = State::Adopted { exec: exec.clone() };
             l.key = None;
         }
-        // Out of the queue: no `interactive` leg waits behind it any more ([`Behind`]).
-        self.land_left(id);
+        // Out of the queue: no leg waits behind it any more ([`Behind`]).
+        self.ahead_left(id);
         self.set_reason(id, WaitReason::Adopted { leg: exec.clone(), run }, out);
         if matches!(self.decided.get(&exec), Some(Decision::Fate(Fate::Run { .. } | Fate::Finish { .. }))) {
             self.reconsider(&exec, false, now, out);
@@ -3620,9 +3805,13 @@ impl Scheduler {
                 None => {}
             }
         }
-        let (running, used, sample, since) = self.runners.get(&id).map(|x| (x.running.clone(), x.used, x.sample, x.since)).unwrap_or_default();
+        let (running, used, sample, since, counted, was) = self.runners.get(&id).map(|x| (x.running.clone(), x.used, x.sample, x.since, x.counted.clone(), x.connected)).unwrap_or_default();
+        // A runner coming back on a new link: what it had in use was measured before it went, and
+        // its first sample on this link says what it has now; until then it's placed by its room,
+        // as before samples (W05). One already up says what it offers again and keeps its sample.
+        let (sample, since, counted) = if was { (sample, since, counted) } else { (None, Resources::default(), BTreeMap::new()) };
         let draining = r.draining;
-        self.runners.insert(id.clone(), Runner { input: r, running, used, connected: true, draining, sample, since });
+        self.runners.insert(id.clone(), Runner { input: r, running, used, connected: true, draining, sample, since, counted });
         self.refresh_fleet();
         self.refresh_eligibility(&id);
         self.release_holds(now, out);
@@ -3785,26 +3974,26 @@ impl Scheduler {
         if let Some(r) = self.runners.get_mut(runner) {
             r.sample = Some((sample, now));
             r.since = Resources::default();
+            r.counted.clear();
         }
     }
 
-    /// A runner's headroom now ([`Headroom`]): `None` before its first sample, or with its latest
-    /// older than [`SAMPLE_FRESH_MS`].
+    /// A runner's headroom now ([`Headroom`]): `None` before its first sample on its link.
     pub fn headroom(&self, runner: &str) -> Option<Headroom> {
-        self.runners.get(runner).and_then(|r| headroom_of(r, self.now))
+        self.runners.get(runner).and_then(headroom_of)
     }
 
     /// Whether a leg leaves a runner within the target use ([`Config::target_use`]): its CPUs and
-    /// its memory both ([`super::place::fits`]). A runner with no fresh sample is placed as before
+    /// its memory both ([`super::place::fits`]). A runner with no sample on its link is placed as before
     /// samples were: within it.
     fn under_target(&self, r: &Runner, l: &Leg) -> bool {
-        super::place::fits(&l.input.request, headroom_of(r, self.now).as_ref(), self.config().target_use)
+        super::place::fits(&l.input.request, headroom_of(r).as_ref(), self.config().target_use)
     }
 
     /// Every runner as placement weighs it (kiln-seams' `Placement::nodes`): its headroom now,
-    /// `None` without a fresh sample ([`super::place::Node`]), by id.
+    /// `None` without a sample on its link ([`super::place::Node`]), by id.
     pub fn nodes(&self) -> Vec<super::place::Node<'_>> {
-        self.runners.values().map(|r| super::place::Node { name: &r.input.id, headroom: headroom_of(r, self.now) }).collect()
+        self.runners.values().map(|r| super::place::Node { name: &r.input.id, headroom: headroom_of(r) }).collect()
     }
 
     /// The leg a runner is held for ([`RoomHold`]), and when it's expected to have room there.
@@ -3817,7 +4006,7 @@ impl Scheduler {
     /// those that could take it the one its running legs' expected ends leave room soonest, then
     /// the one with the most headroom now; as many legs as the signature has runners at most. A hold
     /// ends when its leg starts or leaves the queue, or its runner goes or drains; a runner without
-    /// a fresh sample isn't held, and is placed as before.
+    /// a sample on its link isn't held, and is placed as before.
     fn refresh_holds(&mut self, now: i64, out: &mut Vec<Command>) {
         let (legs, runners) = (&self.legs, &self.runners);
         let mut changed: Vec<String> = Vec::new();
@@ -3880,7 +4069,7 @@ impl Scheduler {
             if !r.connected || r.draining || self.holds.contains_key(&r.input.id) || !self.admits(r, l) {
                 continue;
             }
-            let Some(mut free) = headroom_of(r, now) else { continue };
+            let Some(mut free) = headroom_of(r) else { continue };
             let full = free.fullness(&q);
             let mut ends: Vec<(i64, Resources)> = r.running.iter().filter_map(|x| self.legs.get(x)).map(|x| (x.ends.unwrap_or(i64::MAX), x.input.request)).collect();
             ends.sort_by_key(|(at, _)| *at);
@@ -3897,7 +4086,8 @@ impl Scheduler {
                 continue;
             }
             // What it leaves beside the held leg then, within the target.
-            let (keep_cpu, keep_mem) = (free.of.cpu.as_f64() * (1.0 - target), (free.of.mem as f64 * (1.0 - target)) as u64);
+            let (to_cpu, to_mem) = target.of(&free);
+            let (keep_cpu, keep_mem) = (free.of.cpu.as_f64() * (1.0 - to_cpu), (free.of.mem as f64 * (1.0 - to_mem)) as u64);
             let extra = Resources { cpu: Cpus::of_f64((free.cpus - keep_cpu - q.cpu.as_f64()).max(0.0)).unwrap_or_default(), mem: free.mem.saturating_sub(keep_mem).saturating_sub(q.mem), ..Resources::default() };
             let key = (shadow, full);
             if best.as_ref().is_none_or(|(b, _, _)| key.0 < b.0 || (key.0 == b.0 && key.1 < b.1)) {
@@ -4700,6 +4890,7 @@ impl Scheduler {
             && let Some(r) = self.runners.get_mut(&e.runner)
         {
             sub(&mut r.used, &e.reserved);
+            uncount(r, id);
         }
     }
 
@@ -4788,6 +4979,7 @@ impl Scheduler {
                 add(&mut r.used, &p.request);
                 if r.sample.is_some() {
                     add(&mut r.since, &p.request);
+                    r.counted.insert(id.clone(), p.request);
                 }
             }
             out.push(Command::StartExecutor { pool: pool.to_owned(), executor: id, runner: host, kind: p.executor.clone(), image: p.image.clone(), leg: None });
@@ -5042,8 +5234,9 @@ impl Scheduler {
             if !past.is_empty() {
                 let held = self.holds.iter().find(|(_, h)| h.leg == l.input.id);
                 return WaitReason::Headroom {
-                    // In percent, to the nearest, from the target's millionths.
-                    target: (super::units::ppm_of(self.config().target_use) + 5_000) / 10_000,
+                    // In percent, to the nearest, from the target's millionths: the strictest of
+                    // those runners' CPU targets.
+                    target: (eligible.iter().filter(|r| past.contains(&r.input.view.name)).map(|r| self.config().target_use.cpu_ppm(headroom_of(r).map_or(0, |h| h.of.cpu.get().div_ceil(1000)))).min().unwrap_or(units::WHOLE) + 5_000) / 10_000,
                     runners: past,
                     request: needs::request_words(&l.input.request).join(" and "),
                     place: place_of(&l.req),
@@ -5437,13 +5630,18 @@ fn beside(request: &Resources, extra: &Resources) -> bool {
     request.cpu <= extra.cpu && request.mem <= extra.mem
 }
 
-/// [`Scheduler::headroom`] of a runner at `now`. In floats, as [`Headroom`] is.
-#[allow(clippy::float_arithmetic)]
-fn headroom_of(r: &Runner, now: i64) -> Option<Headroom> {
-    let (s, at) = r.sample.as_ref()?;
-    if now.saturating_sub(*at) > SAMPLE_FRESH_MS {
-        return None;
+/// What was counted on `r` since its sample for `id` (a leg or an executor) counts no more: it left
+/// before the next sample could have it.
+fn uncount(r: &mut Runner, id: &str) {
+    if let Some(q) = r.counted.remove(id) {
+        sub(&mut r.since, &q);
     }
+}
+
+/// [`Scheduler::headroom`] of a runner. In floats, as [`Headroom`] is.
+#[allow(clippy::float_arithmetic)]
+fn headroom_of(r: &Runner) -> Option<Headroom> {
+    let (s, _) = r.sample.as_ref()?;
     let h = Headroom::of(s);
     Some(Headroom { cpus: (h.cpus - r.since.cpu.as_f64()).max(0.0), mem: h.mem.saturating_sub(r.since.mem), ..h })
 }

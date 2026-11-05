@@ -6,7 +6,7 @@
 
 use std::cmp::Ordering;
 
-use super::state::{Headroom, Resources};
+use super::state::{Headroom, Resources, TargetUse};
 
 /// A node as placement weighs it (kiln-seams' `NodeUse`, its use live): its name, and its
 /// headroom by its latest sample, what was placed there since counted in use (`None`: no fresh
@@ -26,9 +26,11 @@ pub struct Unplaceable {
     pub past: Vec<String>,
 }
 
-/// Whether work needing `needs` leaves a node within `target` of its CPUs and of its memory. One
-/// without a fresh sample is placed as before samples were: within it.
-pub fn fits(needs: &Resources, headroom: Option<&Headroom>, target: f64) -> bool {
+/// Whether work needing `needs` leaves a node within `target` of its CPUs and of its memory
+/// ([`TargetUse`]: a share, or derived for the node). One without a sample is placed as before
+/// samples were: within it.
+pub fn fits(needs: &Resources, headroom: Option<&Headroom>, target: impl Into<TargetUse>) -> bool {
+    let target = target.into();
     headroom.is_none_or(|h| h.within(needs, target))
 }
 
@@ -44,7 +46,8 @@ pub fn before(needs: &Resources, a: Option<&Headroom>, b: Option<&Headroom>) -> 
 /// first. None within the target: why, what each would have in use with it. In floats, as
 /// [`Headroom`] is (docs/ci.md W05-R29 names it).
 #[allow(clippy::float_arithmetic)]
-pub fn place<'a>(needs: &Resources, nodes: &[Node<'a>], target: f64) -> Result<&'a str, Unplaceable> {
+pub fn place<'a>(needs: &Resources, nodes: &[Node<'a>], target: impl Into<TargetUse>) -> Result<&'a str, Unplaceable> {
+    let target = target.into();
     if let Some(n) = nodes.iter().filter(|n| fits(needs, n.headroom.as_ref(), target)).min_by(|a, b| before(needs, a.headroom.as_ref(), b.headroom.as_ref())) {
         return Ok(n.name);
     }
@@ -55,13 +58,20 @@ pub fn place<'a>(needs: &Resources, nodes: &[Node<'a>], target: f64) -> Result<&
     let mut each: Vec<(&str, String)> = nodes
         .iter()
         .filter_map(|n| {
-            let (cpu, mem) = n.headroom?.use_with(needs);
-            let (what, share) = if mem > cpu { ("memory", mem) } else { ("CPUs", cpu) };
-            Some((n.name, format!("{}'s {what} would be at {:.0}%", n.name, share * 100.0)))
+            let h = n.headroom?;
+            let (cpu, mem) = h.use_with(needs);
+            let (to_cpu, to_mem) = target.of(&h);
+            let (what, share, to) = if mem - to_mem > cpu - to_cpu { ("memory", mem, to_mem) } else { ("CPUs", cpu, to_cpu) };
+            let of = if matches!(target, TargetUse::Derived) { format!(" of {:.0}%", to * 100.0) } else { String::new() };
+            Some((n.name, format!("{}'s {what} would be at {:.0}%{of}", n.name, share * 100.0)))
         })
         .collect();
     each.sort();
-    let why = format!("no node stays within {:.0}% with it: {}", target * 100.0, each.iter().map(|(_, w)| w.as_str()).collect::<Vec<_>>().join(", "));
+    let within = match target {
+        TargetUse::Set(t) => format!("{:.0}%", t * 100.0),
+        TargetUse::Derived => "its target use".to_owned(),
+    };
+    let why = format!("no node stays within {within} with it: {}", each.iter().map(|(_, w)| w.as_str()).collect::<Vec<_>>().join(", "));
     Err(Unplaceable { why, past: each.into_iter().map(|(n, _)| n.to_owned()).collect() })
 }
 
