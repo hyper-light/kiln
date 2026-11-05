@@ -515,3 +515,43 @@ fn the_idle_cost_of_a_connection_and_of_a_session() {
         assert!(live > 0);
     }
 }
+
+#[test]
+fn long_lived_sessions_settle_to_a_steady_size() {
+    // Goal 4 step 10's soak, in memory: admitted sessions that each echo a bidi stream every 15
+    // seconds (inside the 30-second idle timeout) for 30 virtual minutes. What a session holds grows with its first streams (hyper-quic's
+    // tables size up to the streams it has seen at once) and then holds: the minutes print as
+    // `soak-in-memory:` so the soak's resident memory can be read against them.
+    let Some(mut net) = Net::new(cfg(), Echo, 11) else { return };
+    let n = 50usize;
+    let set = connect(&mut net, n, Start::Post);
+    net.run_for(SETTLE);
+    net.measure();
+    let mut lives = Vec::new();
+    for minute in 0..30u32 {
+        for quarter in 0..4 {
+            for &(i, sid) in &set {
+                if let Some(b) = net.b(i)
+                    && let Some(id) = b.open(true)
+                {
+                    let mut bytes = v(frame::WT_STREAM);
+                    bytes.extend(v(sid));
+                    bytes.extend_from_slice(b"ping");
+                    b.write(id, &bytes);
+                    b.finish(id);
+                    b.watch(id);
+                }
+            }
+            net.run_for(Duration::from_secs(15));
+            let _ = quarter;
+        }
+        let (live, _) = net.door_live();
+        lives.push(live / n as i64);
+        println!("soak-in-memory: minute {minute}: {} B a session beyond its idle size", live / n as i64);
+    }
+    hyper_measure::alloc::end();
+    let (at5, end) = (lives.get(5).copied().unwrap_or(0), lives.last().copied().unwrap_or(0));
+    println!("soak-in-memory: minute 5 {at5} B, minute 29 {end} B a session");
+    assert!(end <= cfg().bound(true) as i64);
+    assert!(end - at5 <= GROWTH, "a session grew {} B from minute 5 to 29", end - at5);
+}
