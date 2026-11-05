@@ -286,17 +286,18 @@ struct Work {
 static WORK: OnceLock<Work> = OnceLock::new();
 
 /// Works out where this process starts kiln's own legs and agents beside a server whose cores are
-/// `server` (`text` as declared): the CPUs the calling thread may run on less the server's
+/// `server` (`text` as declared) and whose shards are fixed to `shards` of them: the CPUs the calling
+/// thread may run on less the server's, or, where those are all it may run on, less the shards'
 /// (`super::work_cpus_for`). Affinity rather than a cpuset on kiln's folders of groups: a user's
 /// service manager doesn't delegate the cpuset controller (systemd's `user@.service` delegates
 /// `pids memory cpu`), and where a system install could, its partition already keeps everything
 /// outside the server's slice off its cores (docs/priority.md). Only the first call counts.
-pub fn keep_work_off(server: &[u32], text: &str) -> Result<super::WorkCpus, String> {
+pub fn keep_work_off(server: &[u32], shards: &[u32], text: &str) -> Result<super::WorkCpus, String> {
     let allowed = rustix::thread::sched_getaffinity(None).map_err(|e| format!("this process's CPUs can't be read: {e}"))?;
     let mine: Vec<u32> = (0..rustix::thread::CpuSet::MAX_CPU).filter(|c| allowed.is_set(*c)).filter_map(|c| u32::try_from(c).ok()).collect();
-    let cpus = super::work_cpus_for(&mine, server);
+    let cpus = super::work_cpus_for(&mine, server, shards);
     let set = match &cpus {
-        super::WorkCpus::Apart(onto) => Some(cpu_set(onto)),
+        super::WorkCpus::Apart(onto) | super::WorkCpus::Beside(onto) => Some(cpu_set(onto)),
         super::WorkCpus::Clear | super::WorkCpus::Shared => None,
     };
     let _ = WORK.set(Work { server: text.to_owned(), cpus: cpus.clone(), set });
@@ -364,10 +365,10 @@ pub fn onto_work_cpus_pid(pid: u32) -> bool {
     moved
 }
 
-/// The work CPUs, where kiln's own legs and agents keep off the server's cores.
+/// The work CPUs, where kiln's own legs and agents keep off the server's cores (or its shards').
 pub fn work_cpus() -> Option<Vec<usize>> {
     match &WORK.get()?.cpus {
-        super::WorkCpus::Apart(cpus) => Some(cpus.iter().filter_map(|c| usize::try_from(*c).ok()).collect()),
+        super::WorkCpus::Apart(cpus) | super::WorkCpus::Beside(cpus) => Some(cpus.iter().filter_map(|c| usize::try_from(*c).ok()).collect()),
         super::WorkCpus::Clear | super::WorkCpus::Shared => None,
     }
 }

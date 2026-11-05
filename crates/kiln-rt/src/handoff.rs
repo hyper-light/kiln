@@ -198,6 +198,8 @@ pub(crate) fn wake_waiter_fenced(
             if crate::mem::Encoded::from_word(word).shard() == here.id =>
         {
             here.wake_local(crate::mem::Encoded::from_word(word).slot());
+            // As the registry's wake counts it (kiln's goal 9, plan 01a1a87b2cec step 5).
+            crate::shard_loop::count(&here.live.wakes_sent_local, 1);
         }
         (taken, _) => wake_taken(taken),
     }
@@ -207,7 +209,10 @@ pub(crate) fn wake_waiter_fenced(
 fn wake_taken(taken: Taken<std::thread::Thread>) {
     match taken {
         Taken::Task(word) => crate::registry::wake(crate::mem::Encoded::from_word(word)),
-        Taken::Thread(thread) => thread.unpark(),
+        Taken::Thread(thread) => {
+            thread.unpark();
+            crate::registry::count_thread_woken();
+        }
         Taken::Nobody => {}
     }
 }

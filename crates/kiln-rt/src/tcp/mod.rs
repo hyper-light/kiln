@@ -217,6 +217,8 @@ impl TcpListener {
         crate::coop::consume_budget().await;
         loop {
             for _ in 0..self.backlog {
+                // A system call on the shard (kiln's goal 9, plan 01a1a87b2cec step 5).
+                crate::registry::count_here(|live| &live.socket_accepts);
                 let accepted = match tcpsys::accept(&self.stream)? {
                     Io::Ready(accepted) => accepted,
                     Io::WouldBlock => break,
@@ -388,7 +390,9 @@ impl TcpStream {
     /// Reads into `buf` without waiting: the byte count (zero at end of stream), or `None` when nothing is
     /// ready now.
     pub fn try_read(&self, buf: &mut [u8]) -> Result<Option<usize>, RtError> {
-        Ok(match tcpsys::read(&self.stream, buf)? {
+        let read = tcpsys::read(&self.stream, buf)?;
+        counted_read(&read);
+        Ok(match read {
             Io::Ready(n) => Some(n),
             Io::WouldBlock | Io::Interrupted | Io::Astray => None,
         })
@@ -412,7 +416,9 @@ impl TcpStream {
     pub async fn read_vectored(&self, bufs: &mut [IoSliceMut<'_>]) -> Result<usize, RtError> {
         crate::coop::consume_budget().await;
         loop {
-            match tcpsys::read_vectored(&self.stream, bufs)? {
+            let read = tcpsys::read_vectored(&self.stream, bufs)?;
+            counted_read(&read);
+            match read {
                 Io::Ready(n) => return Ok(n),
                 Io::WouldBlock | Io::Interrupted | Io::Astray => {
                     readable(self.stream.raw_id()).await?;
@@ -423,7 +429,9 @@ impl TcpStream {
 
     /// Writes from `buf` without waiting: the bytes the kernel took, or `None` when the send buffer is full.
     pub fn try_write(&self, buf: &[u8]) -> Result<Option<usize>, RtError> {
-        Ok(match tcpsys::write(&self.stream, buf)? {
+        let wrote = tcpsys::write(&self.stream, buf)?;
+        counted_write(&wrote);
+        Ok(match wrote {
             Io::Ready(n) => Some(n),
             Io::WouldBlock | Io::Interrupted | Io::Astray => None,
         })
@@ -445,7 +453,9 @@ impl TcpStream {
     pub async fn write_vectored(&self, bufs: &[IoSlice<'_>]) -> Result<usize, RtError> {
         crate::coop::consume_budget().await;
         loop {
-            match tcpsys::write_vectored(&self.stream, bufs)? {
+            let wrote = tcpsys::write_vectored(&self.stream, bufs)?;
+            counted_write(&wrote);
+            match wrote {
                 Io::Ready(n) => return Ok(n),
                 Io::WouldBlock | Io::Interrupted | Io::Astray => {
                     writable(self.stream.raw_id()).await?;
@@ -475,5 +485,80 @@ impl TcpStream {
     /// Shuts one half, or both.
     pub fn shutdown(&self, how: Shutdown) -> Result<(), RtError> {
         tcpsys::shutdown(&self.stream, how)
+    }
+}
+
+/// Counts a read the calling shard's task made, and whether it brought nothing (kiln's goal 9, plan
+/// 01a1a87b2cec step 5: each a system call on the shard, and one that brings nothing is followed by a wait).
+fn counted_read<T>(read: &Io<T>) {
+    crate::registry::count_here(|live| &live.socket_reads);
+    if !matches!(read, Io::Ready(_)) {
+        crate::registry::count_here(|live| &live.socket_reads_empty);
+    }
+}
+
+/// Counts a write the calling shard's task made, and whether the send buffer was full (as [`counted_read`]).
+fn counted_write<T>(wrote: &Io<T>) {
+    crate::registry::count_here(|live| &live.socket_writes);
+    if !matches!(wrote, Io::Ready(_)) {
+        crate::registry::count_here(|live| &live.socket_writes_full);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Kiln's goal 9, plan 01a1a87b2cec step 5: each accept, read and write a shard's tasks make of a TCP socket
+    /// is counted on the shard, the read that found nothing ready too, and the readiness wait armed after it; a
+    /// write the send buffer took whole is no full one.
+    #[test]
+    #[cfg_attr(miri, ignore)]
+    fn g9_s5_a_shards_socket_calls_and_arms_are_counted() {
+        let config = crate::runtime::RuntimeConfig {
+            shards: 1,
+            tasks_per_shard: 8,
+            timers_per_shard: 8,
+            interests_per_shard: 8,
+            ring_entries: 16,
+            step_budget_ns: 1_000_000,
+            timer_tick_ns: 100_000,
+            batch: 16,
+            pin: false,
+            cores: Vec::new(),
+            page_bytes: 4096,
+            spin_ns: 0,
+            wake_tracking: None,
+            latency_objective_ns: None,
+        };
+        let mut rt = crate::runtime::LocalRuntime::new(&config).unwrap();
+        let before = rt.counters();
+        let read = rt
+            .block_on(async {
+                let listener = TcpListener::bind(SocketAddr::from(([127, 0, 0, 1], 0)), 4)?;
+                let client = TcpStream::connect(listener.local_addr()?).await?;
+                let server = listener.accept().await?;
+                let mut buf = [0u8; 4];
+                // The read goes first and finds nothing, so it waits; the write after it brings the bytes.
+                let (read, wrote) = crate::combine::join2(server.read(&mut buf), async {
+                    crate::futures::yield_now().await;
+                    client.write_all(b"ping").await
+                })
+                .await;
+                wrote?;
+                read.map(|n| buf.get(..n).map(<[u8]>::to_vec))
+            })
+            .unwrap()
+            .unwrap();
+        assert_eq!(read.as_deref(), Some(&b"ping"[..]));
+        let after = rt.counters();
+        let moved = |of: fn(&crate::shard_loop::Counters) -> u64| of(&after) - of(&before);
+        assert!(moved(|c| c.socket_accepts) >= 1, "the accept");
+        assert!(moved(|c| c.socket_reads) >= 2, "the read that found nothing, and the one that brought the bytes");
+        assert!(moved(|c| c.socket_reads_empty) >= 1, "the read that went first found nothing");
+        assert!(moved(|c| c.socket_reads_empty) < moved(|c| c.socket_reads), "a read brought the bytes");
+        assert_eq!(moved(|c| c.socket_writes), 1, "four bytes, one write");
+        assert_eq!(moved(|c| c.socket_writes_full), 0, "the send buffer took them");
+        assert!(moved(|c| c.arms) >= 1, "the empty read's wait was armed");
     }
 }

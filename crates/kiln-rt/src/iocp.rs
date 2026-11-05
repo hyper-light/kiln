@@ -279,6 +279,8 @@ pub struct IocpDriver {
     in_flight: usize,
     /// A timed wait's timer, where this Windows carries one ([`Precise`]).
     precise: Option<Precise>,
+    /// The waits whose packets held a kick ([`Driver::kicks_taken`]).
+    kicks_taken: u64,
 }
 
 /// Cited: how long a dropped driver waits for completions the kernel still owes it — the I/O manager's own
@@ -340,6 +342,7 @@ impl IocpDriver {
             handles_bound: 0,
             in_flight: 0,
             precise: Precise::make(),
+            kicks_taken: 0,
         })
     }
 
@@ -618,13 +621,14 @@ impl Driver for IocpDriver {
             };
         }
         let mut completed: Vec<*mut Block> = Vec::new();
+        let mut kicked = false;
         for entry in self
             .entries
             .iter()
             .take(usize::try_from(count).unwrap_or(0))
         {
             match entry.lpCompletionKey {
-                KICK_KEY => {}
+                KICK_KEY => kicked = true,
                 // A timed wait's timer fired: the shard's clock tells which timers are due.
                 TIMER_KEY => {
                     if let Some(precise) = self.precise.as_mut() {
@@ -653,11 +657,18 @@ impl Driver for IocpDriver {
                 out.push(completion);
             }
         }
+        if kicked {
+            self.kicks_taken = self.kicks_taken.saturating_add(1);
+        }
         Ok(())
     }
 
     fn has_pending(&self) -> bool {
         false
+    }
+
+    fn kicks_taken(&self) -> u64 {
+        self.kicks_taken
     }
 
     fn submit_nop(&mut self, user_data: u64) -> Result<(), RtError> {

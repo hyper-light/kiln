@@ -1605,6 +1605,15 @@ async fn unroutable(hub: &Hub, attached: &[Attachment]) -> Vec<Trigger> {
         .collect()
 }
 
+/// The kinds of kiln's events that fire attachments' triggers ([`run`]; a succeeded run wakes those its
+/// slowness does).
+const TRIGGERS: [&str; 7] = ["run.failed", "deploy.failed", "leg.flaky", "land.ejected", "runner.offline", "updates", "comment"];
+
+/// Whether [`run`] reads an event of kind `kind`: a succeeded run's, or one that fires triggers.
+fn wakes_on(kind: &str) -> bool {
+    kind == "run.succeeded" || TRIGGERS.contains(&kind)
+}
+
 /// Listens to kiln's events and wakes what they wake, for as long as the server runs.
 pub async fn run(hub: Arc<Hub>) -> anyhow::Result<()> {
     use futures::FutureExt as _;
@@ -1618,13 +1627,18 @@ pub async fn run(hub: Arc<Hub>) -> anyhow::Result<()> {
             () = hub.shutdown.cancelled().fuse() => return Ok(()),
             m = rx.recv().fuse() => match m {
                 Ok(text) => {
+                    // Only the kinds it wakes on are parsed: the rest, every agent session's change of its
+                    // info among them, are passed over by their front (goal 4, plan 01a1a59c2a9c step 5).
+                    if crate::wire::events::kind_of(&text).is_some_and(|k| !wakes_on(k)) {
+                        continue;
+                    }
                     let v: Value = serde_json::from_str(&text).unwrap_or(Value::Null);
                     let kind = v.get("type").and_then(Value::as_str).unwrap_or_default();
                     if kind == "run.succeeded" {
                         for (a, t) in slow(&hub, &v).await {
                             wake(&hub, &a, &t).await;
                         }
-                    } else if matches!(kind, "run.failed" | "deploy.failed" | "leg.flaky" | "land.ejected" | "runner.offline" | "updates" | "comment") && !all(&hub).await.is_empty() {
+                    } else if TRIGGERS.contains(&kind) && !all(&hub).await.is_empty() {
                         for t in trigger_of(&hub, &v).await {
                             fire(&hub, &t).await;
                         }
@@ -2065,6 +2079,22 @@ pub mod input {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Goal 4, plan 01a1a59c2a9c step 5: attachments' listener reads the events it wakes on and passes over
+    /// the rest by their front, an agent session's info change among them.
+    #[test]
+    fn g4_s5_attachments_read_only_the_events_they_wake_on() -> anyhow::Result<()> {
+        use crate::wire::events::{ServerEvent, harness_frame, kind_of};
+        let info = crate::harness::session::Info { id: "s".into(), kind: "claude".into(), ..Default::default() };
+        let passed = [harness_frame(&serde_json::to_vec(&info)?).to_string(), ServerEvent::HarnessClosed { id: "s".into() }.text(), ServerEvent::Terminals.text()];
+        for text in &passed {
+            anyhow::ensure!(kind_of(text).is_some_and(|k| !wakes_on(k)), "{text}");
+        }
+        for text in [ServerEvent::Updates.text(), ServerEvent::Comment(Box::default()).text(), r#"{"type":"run.succeeded","run":{}}"#.to_owned()] {
+            anyhow::ensure!(kind_of(&text).is_some_and(wakes_on), "{text}");
+        }
+        Ok(())
+    }
 
     fn doctor(on: &str) -> Attachment {
         Attachment { name: "CI-Doctor".into(), on: on.into(), harness: Some(Harness { kind: "claude".into(), ..Harness::default() }), ..Attachment::default() }
