@@ -216,8 +216,9 @@ HTTP/2 and Caddy over HTTP/3, 2 links, 30 s jobs):
   same each time: `GET /api/agents` 1.4%, `GET /api/me` 0.0%, `GET /api/overview` 0.1%, the
   terminal's frames 0.1% apart; the message to an agent's answer was 3.7% apart with one id for
   every message, and 8.3% apart (169 bytes against 156) with a new id each time as the UI sends
-  them: kiln's answer follows the agent's state (a message sent while a turn is under way is
-  answered as waiting), which the recording's agent and the run's don't share; operations whose payloads follow the lab kiln's state (the sessions' list, the
+  them. Not yet explained: the answer most likely follows the agent's state (the run's agent gets
+  a message every 700 ms, the recording's every 10 s), which would make it a payload the two don't
+  share; until that is read from the bodies, this check stands unmet; operations whose payloads follow the lab kiln's state (the sessions' list, the
   notices, the metrics' history, `/api/events`, a session's frames) aren't compared;
 - the stall: the longest request waited 2,156 ms (kiln today), 2,097 ms (h2o) and 2,001 ms (Caddy)
   from its scheduled time: the whole wait counted;
