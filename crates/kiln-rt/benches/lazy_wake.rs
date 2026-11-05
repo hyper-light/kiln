@@ -287,7 +287,9 @@ mod linux {
     fn facts(o: &Options) {
         let uname = rustix::system::uname();
         let release = uname.release().to_string_lossy().into_owned();
-        let config = read(&format!("/boot/config-{release}")).unwrap_or_default();
+        let config = read(&format!("/boot/config-{release}"))
+            .or_else(|| read(&format!("/lib/modules/{release}/config")))
+            .unwrap_or_default();
         let config: Vec<&str> = config
             .lines()
             .filter(|l| l.starts_with("CONFIG_PREEMPT") || l.starts_with("CONFIG_HZ=") || l.starts_with("CONFIG_SCHED_CLASS_EXT"))
