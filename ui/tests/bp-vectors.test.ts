@@ -21,6 +21,8 @@ type Vectors = {
   vectors: { name: string; hex: string; outcomes: Outcome[] }[];
   joins: { name: string; fragments: { hex: string; times?: number }[]; outcomes: Outcome[] }[];
   inflate: { len: number; data: string; plain: string }[];
+  liveness: { ops: [string, number][]; verdicts: string }[];
+  conversation: { down: string[]; ends: { sub: number; kind: number; key: string; digest: string; rev: number }[] };
   fuzz: { seed: string; count: number; block: number; digests: string[] };
 };
 
@@ -116,4 +118,41 @@ test("one long-lived inflater gives each batch back whole, before the next", asy
   const r = await check(V, 0);
   assert.deepEqual(r.failed, []);
   assert.ok(V.inflate.length >= 10);
+});
+
+test("the liveness rule gives Rust's verdicts on the same traces", async () => {
+  const { Liveness } = await import("../src/api/bp/liveness.ts");
+  assert.ok(V.liveness.length > 10);
+  for (const [n, tr] of V.liveness.entries()) {
+    let l = new Liveness(1, 0);
+    let got = "";
+    for (const [op, x] of tr.ops) {
+      if (op === "i") l = new Liveness(x, 0);
+      else if (op === "a") l.arrived(x);
+      else if (op === "r") l.roundTrip(x);
+      else if (op === "p") l.probeSent(x);
+      else got += l.verdict(x)[0];
+    }
+    assert.equal(got, tr.verdicts, `trace ${n}`);
+  }
+});
+
+test("a client fed what the Rust server sent ends as the Rust client did", async () => {
+  const { Client, DEFAULT_CONFIG } = await import("../src/api/bp/client.ts");
+  const { Unpacker } = await import("../src/api/bp/inflate.ts");
+  const c = new Client(DEFAULT_CONFIG, new Uint8Array(32).fill(4), 0);
+  for (const e of V.conversation.ends) c.subscribe(e.sub, { kind: e.kind, key: e.key }, 0);
+  const u = new Unpacker();
+  let now = 0;
+  for (const h of V.conversation.down) {
+    for (const plain of await u.unpack(unhex(h))) c.receive(plain, now);
+    now++;
+  }
+  let unreadable = 0;
+  for (let e = c.pollEvent(); e !== undefined; e = c.pollEvent()) if (e.t === "unreadable" || e.t === "gap") unreadable++;
+  assert.equal(unreadable, 0);
+  for (const e of V.conversation.ends) {
+    assert.equal(c.state(e.sub)?.digest().toString(), e.digest, `sub ${e.sub} (${e.key})`);
+    assert.equal(c.cursor(e.sub)?.rev ?? 0, e.rev, `sub ${e.sub} (${e.key}) cursor`);
+  }
 });

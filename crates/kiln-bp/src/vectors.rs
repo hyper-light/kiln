@@ -217,7 +217,7 @@ pub fn render() -> String {
     let batches: Vec<String> = inflate_batches()
         .iter()
         .map(|plain| {
-            let data = z.deflate(2, crate::conn::Lane::Control, plain);
+            let (_, data) = z.deflate(crate::conn::Lane::Control, &crate::compress::Compressible::of(Kind::Change, crate::conn::Trust::Text, plain).into_iter().collect::<Vec<_>>());
             let (mut p, mut d) = (String::new(), String::new());
             hex(plain, &mut p);
             hex(&data, &mut d);
@@ -226,6 +226,21 @@ pub fn render() -> String {
         .collect();
     out.push_str("  \"inflate\": [\n");
     out.push_str(&batches.join(",\n"));
+    out.push_str("\n  ],\n");
+    let (msgs, ends) = conversation();
+    let hexes: Vec<String> = msgs
+        .iter()
+        .map(|m| {
+            let mut h = String::new();
+            hex(m, &mut h);
+            format!("\"{h}\"")
+        })
+        .collect();
+    let ends: Vec<String> = ends.iter().map(|(sub, kind, key, digest, rev)| format!("{{\"sub\":{sub},\"kind\":{kind},\"key\":\"{key}\",\"digest\":\"{digest}\",\"rev\":{rev}}}")).collect();
+    let _ = writeln!(out, "  \"conversation\": {{\"down\": [{}], \"ends\": [{}]}},", hexes.join(","), ends.join(","));
+    let traces: Vec<String> = liveness_traces().iter().map(|(ops, verdicts)| format!("    {{\"ops\":[{}],\"verdicts\":\"{verdicts}\"}}", ops.join(","))).collect();
+    out.push_str("  \"liveness\": [\n");
+    out.push_str(&traces.join(",\n"));
     out.push_str("\n  ],\n");
     let blocks: Vec<String> = (0..FUZZ_COUNT / FUZZ_BLOCK).map(|b| format!("\"{}\"", crate::fuzz::digest(FUZZ_SEED, b * FUZZ_BLOCK, (b + 1) * FUZZ_BLOCK))).collect();
     let _ = writeln!(out, "  \"fuzz\": {{\"seed\": \"{FUZZ_SEED}\", \"count\": {FUZZ_COUNT}, \"block\": {FUZZ_BLOCK}, \"digests\": [{}]}}", blocks.join(", "));
@@ -273,4 +288,138 @@ pub fn inflate_batches() -> Vec<Vec<u8>> {
         v.push(Frame::Change(Change { sub: 1, rev: 50 + u64::from(i), step: 1, delta: Delta::Patch { key: Key::Ref { n: 0 }, mask: crate::wire::Bits(0b11), fields: vec![Bytes(vec![i]), Bytes(vec![7, 7])] } }).encode(VERSION));
     }
     v
+}
+
+/// Seeded traces through the liveness rule: arrivals (`a`), round trips (`r`), probes sent
+/// (`p`) and verdicts asked (`v`, each a letter: live, suspect, dead), which the TypeScript rule
+/// must give the same.
+pub fn liveness_traces() -> Vec<(Vec<String>, String)> {
+    use crate::liveness::{Liveness, Verdict};
+    let mut out = Vec::new();
+    for seed in 0..24u64 {
+        let mut g = crate::rng::Rng::new(0x11FE ^ seed);
+        let idle = 200 + g.below(2000);
+        let mut l = Liveness::new(idle, 0);
+        let mut ops = vec![format!("[\"i\",{idle}]")];
+        let mut verdicts = String::new();
+        let mut t = 0u64;
+        let dark_from = 40 + g.below(40);
+        for step in 0..120u64 {
+            t += g.below(idle * 2);
+            if step < dark_from {
+                l.arrived(t);
+                ops.push(format!("[\"a\",{t}]"));
+                if g.below(3) == 0 {
+                    let ms = 20 + g.below(400);
+                    l.round_trip(ms);
+                    ops.push(format!("[\"r\",{ms}]"));
+                }
+            }
+            if g.below(4) == 0 {
+                l.probe_sent(t);
+                ops.push(format!("[\"p\",{t}]"));
+            }
+            let v = l.verdict(t);
+            ops.push(format!("[\"v\",{t}]"));
+            verdicts.push(match v {
+                Verdict::Live => 'l',
+                Verdict::Suspect => 's',
+                Verdict::Dead => 'd',
+            });
+        }
+        out.push((ops, verdicts));
+    }
+    out
+}
+
+/// A conversation the Rust server holds with a client, as the bytes it sent down (compressed,
+/// fragmented, aliased, with tails), and each subscription's state digest and revision at its
+/// end: a TypeScript client fed the same bytes must end the same.
+pub fn conversation() -> (Vec<Vec<u8>>, Vec<(u32, u32, String, u64, u64)>) {
+    use crate::answers::Answers;
+    use crate::client::{Client, ClientConfig};
+    use crate::conn::{Class, Prio, TopicSpec, Trust};
+    use crate::server::{Event, Server, ServerConfig};
+    use crate::tickets::{Principal, Tickets};
+    use crate::topic::TopicLog;
+    let born = 1_793_825_000_000u64;
+    let spec = |kind: u32| match kind {
+        1 => TopicSpec { kind, class: Class::State, prio: Prio::State, trust: Trust::Records },
+        2 => TopicSpec { kind, class: Class::Telemetry, prio: Prio::State, trust: Trust::Records },
+        _ => TopicSpec { kind, class: Class::Stream, prio: Prio::Stream, trust: Trust::Text },
+    };
+    let topics = [(1, 1u32, "runs"), (2, 2, "samples"), (3, 3, "log"), (4, 10, "session")];
+    let mut tickets = Tickets::new();
+    let mut answers = Answers::new();
+    let t = tickets.mint([4; 32], Principal { who: "ada".into(), ..Default::default() }, 0);
+    let mut srv = Server::new(ServerConfig { fragment: 300, ..Default::default() }, 1, born, 0);
+    let mut cli = Client::new(ClientConfig::default(), &t, 0);
+    let mut logs: Vec<TopicLog> = topics.iter().map(|(_, k, _)| TopicLog::new(spec(*k), born)).collect();
+    for (sub, kind, key) in topics {
+        cli.subscribe(sub, Topic { kind, key: key.into() }, 0);
+    }
+    let mut down = Vec::new();
+    let mut g = crate::rng::Rng::new(0xC0FFEE);
+    let mut log_at = 0u64;
+    let mut text_at = 0u64;
+    for now in 0..400u64 {
+        if now > 5 {
+            let i = g.below(4);
+            let d = match i {
+                0 => Delta::Put { key: Key::Str { s: format!("run-{}", g.below(6)) }, fields: vec![Bytes(vec![g.byte()]), Bytes(vec![g.byte(); 3])] },
+                1 => Delta::Put { key: Key::Str { s: format!("machine-{}", g.below(3)) }, fields: vec![Bytes(vec![g.byte(); 2])] },
+                2 => {
+                    let line = format!("{now}: {}\n", "word ".repeat(g.index(12)));
+                    let d = Delta::Append { at: log_at, data: Bytes::from(line.as_str()) };
+                    log_at += line.len() as u64;
+                    d
+                }
+                _ if text_at == 0 => {
+                    text_at = 1;
+                    Delta::Put { key: Key::Num { n: 1 }, fields: vec![Bytes(vec![1]), Bytes::default()] }
+                }
+                _ => {
+                    let tok = format!(" tok{}", g.below(100));
+                    let d = Delta::Extend { key: Key::Num { n: 1 }, field: 1, at: text_at - 1, data: Bytes::from(tok.as_str()) };
+                    text_at += tok.len() as u64;
+                    d
+                }
+            };
+            let at = usize::try_from(i).unwrap_or(0);
+            if let Some(log) = logs.get_mut(at) {
+                if let Ok(p) = log.publish(d) {
+                    if let Some((sub, _, _)) = topics.get(at) {
+                        srv.push(*sub, &p);
+                    }
+                }
+            }
+        }
+        if let Some(t) = cli.poll_transmit(64 * 1024, now) {
+            srv.receive(&t.bytes, now, &mut tickets, &mut answers);
+        }
+        while let Some(e) = srv.poll_event() {
+            match e {
+                Event::Subscribe { sub, cursor, .. } | Event::Resume { sub, cursor, .. } => {
+                    if let Some(at) = topics.iter().position(|x| x.0 == sub) {
+                        if let (Some(log), Some((_, kind, _))) = (logs.get(at), topics.get(at)) {
+                            srv.start(sub, spec(*kind), log.start(cursor.as_ref()));
+                        }
+                    }
+                }
+                Event::Request { id, .. } => {
+                    srv.answer(id, Outcome::Taken, None, Trust::Secret, &mut answers, now);
+                }
+                _ => {}
+            }
+        }
+        if let Some(t) = srv.poll_transmit(if now % 3 == 0 { 400 } else { 2000 }, now) {
+            cli.receive(&t.bytes, now);
+            down.push(t.bytes);
+        }
+    }
+    let ends = topics
+        .iter()
+        .map(|(sub, kind, key)| (*sub, *kind, (*key).to_owned(), cli.state(*sub).map_or(0, |s| s.digest()), cli.cursor(*sub).map_or(0, |c| c.rev)))
+        .collect();
+    (down, ends)
 }

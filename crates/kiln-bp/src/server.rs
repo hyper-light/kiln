@@ -16,8 +16,8 @@ use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::sync::Arc;
 
 use crate::answers::{Answers, Taking};
-use crate::compress::Compressors;
-use crate::conn::{CAP_DEFLATE_RAW, Class, Lane, PRIOS, Prio, Sent, TopicSpec, Transmit, Trust, credit_exempt, info, secret};
+use crate::compress::{Compressible, Compressors};
+use crate::conn::{CAP_DEFLATE_RAW, Class, Lane, PRIOS, Prio, Sent, TopicSpec, Transmit, Trust, credit_exempt, info};
 use crate::frames::*;
 use crate::join::{Joiner, cut};
 use crate::liveness::{Liveness, Verdict};
@@ -1058,25 +1058,25 @@ impl Server {
         let mut i = 0;
         while i < parts.len() {
             let Some(p) = parts.get(i) else { break };
-            let ctx = if p.kind == Kind::Fragment || secret(p.kind) { None } else { p.trust.ctx() };
-            if let (Some(c), Some(z)) = (ctx, self.compress.as_mut()) {
+            let first = Compressible::of(p.kind, p.trust, &p.bytes);
+            if let (Some(f), Some(z)) = (first, self.compress.as_mut()) {
                 // A run of frames of one context (and one lane, where lanes are streams).
-                let lane = p.lane;
+                let (c, lane) = (f.ctx(), p.lane);
                 let mut j = i;
-                let mut raw = Vec::new();
+                let mut batch: Vec<Compressible<'_>> = Vec::new();
                 let (mut prio, mut urgent) = (p.prio, false);
                 while let Some(q) = parts.get(j) {
-                    let qc = if q.kind == Kind::Fragment || secret(q.kind) { None } else { q.trust.ctx() };
-                    if qc != Some(c) || (z.multistream() && q.lane != lane) {
+                    let Some(qc) = Compressible::of(q.kind, q.trust, &q.bytes) else { break };
+                    if qc.ctx() != c || (z.multistream() && q.lane != lane) {
                         break;
                     }
-                    raw.extend_from_slice(&q.bytes);
+                    batch.push(qc);
                     prio = prio.min(q.prio);
                     urgent |= q.urgent;
                     j += 1;
                 }
-                let data = z.deflate(c, lane, &raw);
-                let len = u32::try_from(raw.len()).unwrap_or(u32::MAX);
+                let (raw_len, data) = z.deflate(lane, &batch);
+                let len = u32::try_from(raw_len).unwrap_or(u32::MAX);
                 let b = Frame::Compressed(Compressed { ctx: c, len, data: Bytes(data) }).encode(version);
                 t.frames.push(Sent { kind: Kind::Compressed, lane, prio, urgent, start: t.bytes.len(), len: b.len() });
                 t.bytes.extend_from_slice(&b);
