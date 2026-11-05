@@ -81,10 +81,10 @@ struct Ctx<'a> {
     out: &'a Path,
 }
 
-fn spawn_driver(lab: &Lab, web: &Path, i: usize, job: &Path) -> anyhow::Result<Child> {
-    let argv = vec!["node".to_owned(), web.join("driver.mjs").display().to_string(), "job".to_owned(), job.display().to_string()];
+fn spawn_driver(lab: &Lab, web: &Path, i: usize, browser: &str, job: &Path) -> anyhow::Result<Child> {
     let log = std::fs::File::create(job.with_extension("log"))?;
-    Ok(lab.command(Ns::Client(i), &argv)?.stdin(Stdio::null()).stdout(log.try_clone()?).stderr(log).spawn()?)
+    let args = ["job".to_owned(), job.display().to_string()];
+    Ok(super::topo::driver(lab, i, browser, web, &args, job.parent())?.stdin(Stdio::null()).stdout(log.try_clone()?).stderr(log).spawn()?)
 }
 
 fn cpu_now(r: &Running) -> CpuTick {
@@ -158,7 +158,7 @@ fn job(c: &mut Ctx<'_>, r: &Running, t: &Target, browser: &str, case: &str, cond
         });
         let path = jd.join("job.json");
         std::fs::write(&path, serde_json::to_vec_pretty(&job)?)?;
-        drivers.push((i, spawn_driver(c.lab, &c.s.web, i, &path)?, jd));
+        drivers.push((i, spawn_driver(c.lab, &c.s.web, i, browser, &path)?, jd));
     }
     // The server's CPU, every window, while the job runs.
     let stop = Arc::new(AtomicBool::new(false));

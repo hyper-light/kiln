@@ -38,8 +38,22 @@ pub fn uid() -> Option<u32> {
 /// Runs this lab command again inside its namespaces, and waits for it: what it came to.
 pub fn reenter(args: &[String]) -> anyhow::Result<()> {
     let exe = std::env::current_exe()?;
-    let status = Command::new("unshare")
-        .args(["--user", "--map-root-user", "--net", "--mount", "--pid", "--fork", "--mount-proc", "--kill-child", "--"])
+    // With a WebKit image (`KILN_LAB_PODMAN`), the user namespace is rootless podman's own
+    // (`podman unshare`), so the containers the lab starts there can join its namespaces.
+    let mut cmd = match podman_image() {
+        Some(_) => {
+            let mut c = Command::new("podman");
+            c.args(["unshare", "--", "unshare"]);
+            c
+        }
+        None => {
+            let mut c = Command::new("unshare");
+            c.args(["--user", "--map-root-user"]);
+            c
+        }
+    };
+    let status = cmd
+        .args(["--net", "--mount", "--pid", "--fork", "--mount-proc", "--kill-child", "--"])
         .arg(&exe)
         .args(args)
         .env(INSIDE, "1")
@@ -48,6 +62,43 @@ pub fn reenter(args: &[String]) -> anyhow::Result<()> {
         .map_err(|e| anyhow::anyhow!("unshare didn't start ({e}): the lab needs util-linux's unshare"))?;
     anyhow::ensure!(status.success(), "the lab in its namespaces ended {status}");
     Ok(())
+}
+
+/// The image WebKit runs in, where the machine's own libraries can't start Playwright's WebKit
+/// (`KILN_LAB_PODMAN`, e.g. `mcr.microsoft.com/playwright:v1.64.1-noble`): under rootless podman,
+/// as the image's own unprivileged user, with podman's default seccomp profile and SELinux.
+pub fn podman_image() -> Option<String> {
+    std::env::var("KILN_LAB_PODMAN").ok().filter(|i| !i.is_empty())
+}
+
+/// The command that runs the web driver (`node driver.mjs ARGS`) for `browser` in client `i`'s
+/// namespace: on the machine itself, or for WebKit in the image, the container joining the
+/// client's network namespace, the driver's folder mounted read-only and `rw` (a job's folder)
+/// read-write, both labelled for SELinux.
+pub fn driver(lab: &Lab, i: usize, browser: &str, web: &Path, args: &[String], rw: Option<&Path>) -> anyhow::Result<Command> {
+    match podman_image().filter(|_| browser == "webkit") {
+        None => {
+            let mut argv = vec!["node".to_owned(), web.join("driver.mjs").display().to_string()];
+            argv.extend(args.iter().cloned());
+            lab.command(Ns::Client(i), &argv)
+        }
+        Some(image) => {
+            let pid = lab.pid(Ns::Client(i)).ok_or_else(|| anyhow::anyhow!("no client {i}"))?;
+            let mut c = Command::new("podman");
+            // No cgroup of its own (`--cgroups=disabled`): systemd, outside the lab's PID namespace,
+            // can't place the container's processes, and the browser's CPU isn't a measure; it
+            // stays in the lab's cgroup.
+            c.args(["run", "--rm", "--cgroups=disabled", "--network", &format!("ns:/proc/{pid}/ns/net"), "--user", "pwuser", "-e", "HOME=/tmp"]);
+            c.arg("-v").arg(format!("{}:{}:ro,z", web.display(), web.display()));
+            if let Some(d) = rw {
+                // The image's user writes the job's files: the folder is open to it.
+                std::fs::set_permissions(d, std::os::unix::fs::PermissionsExt::from_mode(0o777))?;
+                c.arg("-v").arg(format!("{}:{}:z", d.display(), d.display()));
+            }
+            c.arg(image).arg("node").arg(web.join("driver.mjs")).args(args);
+            Ok(c)
+        }
+    }
 }
 
 pub fn inside() -> bool {
@@ -143,7 +194,7 @@ impl Lab {
         Ok(lab)
     }
 
-    fn pid(&self, ns: Ns) -> Option<u32> {
+    pub fn pid(&self, ns: Ns) -> Option<u32> {
         match ns {
             Ns::Link => None,
             Ns::Server => Some(self.server.pid()),

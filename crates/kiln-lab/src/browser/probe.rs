@@ -12,7 +12,7 @@ use std::process::{Command, Stdio};
 use serde::{Deserialize, Serialize};
 
 #[cfg(target_os = "linux")]
-use super::link::{self, Condition, Ns};
+use super::link::{self, Condition};
 #[cfg(target_os = "linux")]
 use super::topo::{self, Lab, Scopes};
 
@@ -100,11 +100,32 @@ pub fn inside(web: &Path, browsers: &[String]) -> Vec<Check> {
         return out;
     }
     // The browsers, started in the client's namespace as the lab starts them.
-    let argv = vec!["node".to_owned(), web.join("driver.mjs").to_string_lossy().into_owned(), "probe".to_owned()];
-    let started = lab.command(Ns::Client(0), &argv).and_then(|mut c| Ok(c.stdin(Stdio::null()).output()?));
-    match started {
+    // WebKit, with an image to run it in, is started there (the container in the client's
+    // namespace) and its line taken from there; the others on the machine.
+    let args = ["probe".to_owned()];
+    let host = topo::driver(&lab, 0, "chromium", web, &args, None).and_then(|mut c| Ok(c.stdin(Stdio::null()).output()?));
+    let boxed = topo::podman_image().map(|_| topo::driver(&lab, 0, "webkit", web, &args, None).and_then(|mut c| Ok(c.stdin(Stdio::null()).output()?)));
+    if let Some(image) = topo::podman_image() {
+        out.push(check("webkit's image", false, Ok(format!("{image}, rootless podman, as its user pwuser"))));
+    }
+    match host {
         Ok(o) => {
-            let text = String::from_utf8_lossy(&o.stdout);
+            let mut text = String::from_utf8_lossy(&o.stdout).into_owned();
+            if let Some(b) = &boxed {
+                // The machine's own WebKit line gives way to the image's.
+                text = text.lines().filter(|l| !l.contains("\"browser\":\"webkit\"")).collect::<Vec<_>>().join("\n");
+                match b {
+                    Ok(bo) => {
+                        let lines: Vec<String> = String::from_utf8_lossy(&bo.stdout).lines().filter(|l| l.contains("\"browser\":\"webkit\"")).map(str::to_owned).collect();
+                        if lines.is_empty() {
+                            let why = String::from_utf8_lossy(&bo.stderr).chars().take(400).collect::<String>();
+                            text.push_str(&format!("\n{{\"browser\":\"webkit\",\"ok\":false,\"error\":{}}}", serde_json::Value::String(format!("the image's driver said nothing ({}): {why}", bo.status))));
+                        }
+                        text.extend(lines.iter().map(|l| format!("\n{l}")));
+                    }
+                    Err(e) => text.push_str(&format!("\n{{\"browser\":\"webkit\",\"ok\":false,\"error\":{}}}", serde_json::Value::String(format!("{e:#}")))),
+                }
+            }
             for line in text.lines() {
                 let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else { continue };
                 let name = v.get("browser").and_then(serde_json::Value::as_str).unwrap_or("?").to_owned();
@@ -112,6 +133,11 @@ pub fn inside(web: &Path, browsers: &[String]) -> Vec<Check> {
                 let detail = if ok { v.get("version").and_then(serde_json::Value::as_str).unwrap_or("").to_owned() } else { v.get("error").and_then(serde_json::Value::as_str).unwrap_or("").chars().take(300).collect() };
                 let required = browsers.contains(&name);
                 out.push(Check { name: format!("{name} starts"), ok, detail, required });
+            }
+            for b in browsers {
+                if !out.iter().any(|c| c.name == format!("{b} starts")) {
+                    out.push(Check { name: format!("{b} starts"), ok: false, detail: "no answer from its driver".into(), required: true });
+                }
             }
             if !o.status.success() && out.iter().all(|c| !c.name.ends_with("starts")) {
                 out.push(Check { name: "browsers start".into(), ok: false, detail: String::from_utf8_lossy(&o.stderr).chars().take(400).collect(), required: true });

@@ -34,6 +34,18 @@ browsers gather samples at once.
 Every server runs in a cgroup scope of its own under the lab's cgroup; its CPU is its scope's
 `cpu.stat`, which counts every process in it whether or not the cpu controller is on (f37).
 
+Where the machine's own libraries can't start Playwright's WebKit (Fedora: its build wants Ubuntu's
+ICU 74, libjpeg 8 and others), WebKit runs in Playwright's official image instead:
+`KILN_LAB_PODMAN=mcr.microsoft.com/playwright:v1.64.1-noble`. The lab then takes rootless podman's
+own user namespace (`podman unshare`) for its namespaces in place of a fresh one, and each WebKit
+driver is a container joining its client's network namespace (`--network ns:/proc/<pid>/ns/net`),
+running as the image's unprivileged user `pwuser` under podman's default seccomp profile and
+SELinux (the driver's folder mounted read-only, the job's folder read-write, both labelled `:z`),
+with no cgroup of its own (`--cgroups=disabled`: systemd, outside the lab's PID namespace, can't
+place it, and a browser's CPU isn't a measure). No sudo, no `--privileged`, nothing loaded outside
+the image. On 2026-11-05 on kiln-a094a12d the probe passed with Chromium 156.0.8078.4 on the
+machine and WebKit 27.2 in the image, started as uid 1000.
+
 `kiln-lab browser probe` checks each capability in turn and stops at the first one missing, naming
 it: Linux, an unprivileged start, `unshare`, `nsenter`, `ip`, `tc`, user namespaces; then, inside,
 the namespaces and veths, netem with the ifb and its redirect on a real link, cgroup scopes, node
@@ -409,10 +421,5 @@ and `h2o-h3-reno`, Reno).
 - A radio's promotion delay after idle, unless Ada adds it.
 - HTTP/3 in WebKit: WebKit on Linux speaks no HTTP/3 (libsoup: f30). Safari on a Mac would, with its
   traffic shaped on the lab host.
-- WebKit at all, for now: on the lab machine (kiln-a094a12d, Fedora 44) Playwright's WebKit doesn't
-  start ("Host system is missing dependencies": ICU 74, libjpeg 8 and others built for Ubuntu), and
-  the machine where it does (adacachy) is production's host, where long labs don't run. The probe
-  names it (`kiln-lab browser probe` stops at "webkit starts"); `--browsers chromium` runs without
-  it. Installing WebKit's libraries on the lab machine is Ada's (it needs root).
 - BBR: TCP is CUBIC for every target (loading `tcp_bbr` needs root on the lab host: Ada's).
 - Page loads and static files: goal 8's.
