@@ -10,6 +10,9 @@ import { defineConfig } from "@playwright/test";
 
 const CHANNEL = process.env.E2E_CHANNEL ?? "chrome";
 const desktop = { width: 1280, height: 800 };
+// A SharedWorker's script is fetched outside the page, where Playwright's own leave of the lab's
+// self-signed certificate doesn't reach: Chromium is told to take it there too.
+const chromium = { browserName: "chromium" as const, channel: CHANNEL, launchOptions: { args: ["--ignore-certificate-errors"] } };
 const phone = { width: 390, height: 844 };
 
 export default defineConfig({
@@ -21,8 +24,8 @@ export default defineConfig({
   timeout: 120_000,
   use: { ignoreHTTPSErrors: true },
   projects: [
-    { name: "chromium-desktop", use: { browserName: "chromium", channel: CHANNEL, viewport: desktop } },
-    { name: "chromium-phone", use: { browserName: "chromium", channel: CHANNEL, viewport: phone, isMobile: true, hasTouch: true } },
+    { name: "chromium-desktop", use: { ...chromium, viewport: desktop } },
+    { name: "chromium-phone", use: { ...chromium, viewport: phone, isMobile: true, hasTouch: true } },
     { name: "webkit-desktop", use: { browserName: "webkit", viewport: desktop } },
     { name: "webkit-phone", use: { browserName: "webkit", viewport: phone, isMobile: true, hasTouch: true } },
   ],

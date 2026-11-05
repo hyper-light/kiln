@@ -27,7 +27,7 @@ const lab = {
     const items = Object.fromEntries([...s.state.items].map(([k, f]) => [k, f.map(hex).join(",")]));
     return { items, cursor: s.cursor, applied: s.applied, snapshots: s.snapshots, version: s.version };
   },
-  conn: () => ({ conn: live.conn, owner: live.owner, owns: live.owns(), sockets: live.sockets }),
+  conn: () => ({ conn: live.conn, owner: live.owner, owns: live.owns(), sockets: live.sockets, errors: live.errors }),
   kill: () => live.killWorker(),
   async get(path: string) {
     const o = await live.request({ t: "Http", method: { t: "Get" }, path, body: new Uint8Array() });

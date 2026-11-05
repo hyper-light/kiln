@@ -20,7 +20,7 @@ type Read = { items: Record<string, string>; cursor: { born: number; rev: number
 type Lab = {
   open: (kind: number, key: string) => number;
   read: (id: number) => Read;
-  conn: () => { conn: string; owner: string; owns: boolean; sockets: number };
+  conn: () => { conn: string; owner: string; owns: boolean; sockets: number; errors: string[] };
   kill: () => void;
 };
 
@@ -34,16 +34,21 @@ async function sessions(context: BrowserContext): Promise<{ id: number; session:
 
 /** Something the hub says changed: a terminal opened (and closed). */
 async function change(context: BrowserContext): Promise<void> {
-  const r = await context.request.post(`${ORIGIN}/api/terminal`, { data: { target: "local", cmd: "true" } });
+  const r = await context.request.post(`${ORIGIN}/api/terminal/sessions`, { data: { target: "local", cmd: "true" } });
   expect(r.ok(), await r.text()).toBeTruthy();
 }
 
 async function tab(context: BrowserContext, mode: string): Promise<{ page: Page; id: number }> {
   const page = await context.newPage();
   await page.goto(`${ORIGIN}/__live/lab.html?mode=${mode}`);
-  await page.waitForSelector("body[data-ready='1']");
+  await page.waitForSelector("body[data-ready='1']", { state: "attached" });
   const id = await lab(page)((k: number) => (globalThis as unknown as { lab: Lab }).lab.open(k, ""), CHANGED);
-  await expect.poll(() => lab(page)((i: number) => (globalThis as unknown as { lab: Lab }).lab.read(i)?.cursor ?? null, id), { timeout: 20_000 }).not.toBeNull();
+  await expect
+    .poll(() => lab(page)((i: number) => (globalThis as unknown as { lab: Lab }).lab.read(i)?.cursor ?? null, id), {
+      timeout: 20_000,
+      message: `subscribed (${mode}): ${JSON.stringify(await conn(page).catch(() => null))}`,
+    })
+    .not.toBeNull();
   return { page, id };
 }
 

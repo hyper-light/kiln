@@ -98,6 +98,8 @@ export class Live {
   owner = "";
   conn: CarrierState = "connecting";
   sockets = 0;
+  /** What went wrong reaching the owner (a worker refused or failing to start), as it was said. */
+  readonly errors: string[] = [];
   private readonly listeners = new Set<() => void>();
 
   constructor(private readonly opts: LiveOptions = {}) {
@@ -157,6 +159,7 @@ export class Live {
     const open = () => {
       this.port?.close();
       const w = new SharedWorker(url, { type: "module", name: "kiln-bp" });
+      w.onerror = (e) => this.errors.push(`worker: ${(e as ErrorEvent).message ?? "failed to start"}`);
       this.port = w.port;
       w.port.onmessage = (m: MessageEvent<Down>) => {
         this.heard(m.data);
