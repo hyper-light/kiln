@@ -1,5 +1,5 @@
-//! Windows' reads for [`crate::sense`]: the CPUs' times (`GetSystemTimes`), memory (`sysinfo`'s
-//! `GlobalMemoryStatusEx`), the work volume's free space to this user (`GetDiskFreeSpaceExW`), and
+//! Windows' reads for [`crate::sense`]: the CPUs' times (`GetSystemTimes`), memory
+//! (`GlobalMemoryStatusEx`), the work volume's free space to this user (`GetDiskFreeSpaceExW`), and
 //! its disk's counters. Nothing privileged; Windows keeps no stall times.
 
 #![allow(unsafe_code)]
@@ -22,9 +22,37 @@ impl FileTime {
     }
 }
 
+/// `MEMORYSTATUSEX`.
+#[repr(C)]
+#[derive(Default)]
+struct MemoryStatus {
+    length: u32,
+    load: u32,
+    total_phys: u64,
+    avail_phys: u64,
+    total_page_file: u64,
+    avail_page_file: u64,
+    total_virtual: u64,
+    avail_virtual: u64,
+    avail_extended_virtual: u64,
+}
+
+const _: () = assert!(std::mem::size_of::<MemoryStatus>() == 64);
+
 #[link(name = "kernel32")]
 unsafe extern "system" {
     fn GetSystemTimes(idle: *mut FileTime, kernel: *mut FileTime, user: *mut FileTime) -> i32;
+    fn GlobalMemoryStatusEx(status: *mut MemoryStatus) -> i32;
+}
+
+/// Physical memory, all and available (`GlobalMemoryStatusEx`): one call.
+fn memory() -> (u64, u64) {
+    let mut m = MemoryStatus { length: u32::try_from(std::mem::size_of::<MemoryStatus>()).unwrap_or(0), ..MemoryStatus::default() };
+    // SAFETY: a whole MEMORYSTATUSEX with its length set, as the call requires.
+    if unsafe { GlobalMemoryStatusEx(&raw mut m) } == 0 {
+        return (0, 0);
+    }
+    (m.total_phys, m.avail_phys)
 }
 
 /// All CPUs' idle time and all their time (kernel time includes idle), in 100 ns.
@@ -37,7 +65,6 @@ fn cpu() -> Option<CpuTicks> {
 
 pub struct Reader {
     work_dir: PathBuf,
-    sys: sysinfo::System,
     device: Option<super::sense_disk_windows::Device>,
 }
 
@@ -45,7 +72,7 @@ impl Reader {
     pub fn new(work_dir: &Path) -> Reader {
         let work_dir = crate::sense::canonical(work_dir);
         let device = super::sense_disk_windows::Device::of(&work_dir);
-        Reader { work_dir, sys: sysinfo::System::new(), device }
+        Reader { work_dir, device }
     }
 
     pub fn work_dir(&self) -> &Path {
@@ -53,12 +80,12 @@ impl Reader {
     }
 
     pub fn read(&mut self) -> Raw {
-        self.sys.refresh_memory();
+        let (mem_total, mem_available) = memory();
         Raw {
             cpu: cpu(),
             cpus: u32::try_from(std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1)).unwrap_or(1),
-            mem_total: self.sys.total_memory(),
-            mem_available: self.sys.available_memory(),
+            mem_total,
+            mem_available,
             space: crate::os::disk_space(&self.work_dir).map(|(total, free)| Space { total, free, important: None }),
             device: self.device.as_mut().and_then(super::sense_disk_windows::Device::counters),
             ..Raw::default()

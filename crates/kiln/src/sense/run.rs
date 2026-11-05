@@ -332,7 +332,10 @@ mod tests {
         assert!(o.wall_s >= 0.02, "{o:?}");
         assert_eq!((o.cpu_s, o.read_bytes, o.write_bytes, o.io_ops, o.p, o.exit_code), (Some(2.5), Some(4_096), Some(8_192), Some(4), Some(0.5), Some(0)));
         assert!(o.io_stall_some.is_some_and(|s| s > 0.0 && s <= 0.25), "{o:?}");
-        assert!(o.idle_cpus.is_some_and(|c| c >= 0.0), "{o:?}");
+        // A sensor made for this run's volume has read once just before: over so short an
+        // interval the CPU counters may not have moved (Windows' tick is 15.6 ms), and it says
+        // none rather than a guess.
+        assert!(o.idle_cpus.is_none_or(|c| c >= 0.0), "{o:?}");
         assert_ne!(command_key("cargo test", dir.path()), command_key("cargo test", Path::new("/elsewhere")));
         assert_eq!((o.peak_rss, o.cause.as_deref()), (Some(1 << 20), None));
         // S6: one the machine ended says so, and bars its key here until that clears.

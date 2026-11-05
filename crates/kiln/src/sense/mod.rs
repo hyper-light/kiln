@@ -563,6 +563,18 @@ mod tests {
             std::hint::black_box(s.measure());
         }
         eprintln!("sense: one measure() took {:.1} µs on average over {reads} reads", t.elapsed().as_secs_f64() * 1e6 / f64::from(reads));
+        // Its parts, for where the time goes: the free space and the device's counters.
+        let t = Instant::now();
+        for _ in 0..reads {
+            std::hint::black_box(crate::os::disk_space(dir.path()));
+        }
+        eprintln!("sense: of which free space {:.1} µs", t.elapsed().as_secs_f64() * 1e6 / f64::from(reads));
+        let mut r = crate::os::sense::Reader::new(dir.path());
+        let t = Instant::now();
+        for _ in 0..reads {
+            std::hint::black_box(r.read());
+        }
+        eprintln!("sense: one raw read {:.1} µs", t.elapsed().as_secs_f64() * 1e6 / f64::from(reads));
         Ok(())
     }
 }
