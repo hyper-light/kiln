@@ -250,11 +250,17 @@ impl Chunk {
         for (m, e) in self.meta.iter().zip(&self.evs) {
             m.sum(e);
         }
-        let made = Arc::new(self.deflate(Compression::default())?);
+        Ok(self.keep(self.deflate(Compression::default())?))
+    }
+
+    /// `made` kept as what it holds deflated, unless it keeps one already (the first kept stays): what it
+    /// keeps.
+    fn keep(&self, made: Segment) -> Arc<Segment> {
+        let made = Arc::new(made);
         if self.packed.set(Arc::clone(&made)).is_ok() {
             SEGMENT_BYTES.fetch_add(made.deflated.len(), Ordering::Relaxed);
         }
-        Ok(self.packed.get().map_or(made, Arc::clone))
+        self.packed.get().map_or(made, Arc::clone)
     }
 
     /// Its texts as an `events` frame joins them, deflated at `level` now and kept nowhere (the newest
@@ -574,13 +580,17 @@ impl Events {
     }
 }
 
-/// Sealed chunks waiting to be packed: one packer for the process, its chunks a unit at a time in one
-/// job on the compute pool, which gives its thread up between them whenever another job waits for it
-/// (`crate::rt::compute_pieces`). A job a seal flooded the pool as a fill sealed thousands, holding
-/// its other jobs seconds (goal 10's A/B: the compute pool's wait at p99, 0.9 ms to 2.3 s). A chunk
+/// A chunk that sealed, waiting to be packed, with its copy's home, whose owner keeps it compact once
+/// it's packed (goal 11).
+type Sealed = (Weak<Chunk>, Option<Home>);
+
+/// Sealed chunks waiting to be packed: one packer for the process ([`Packer`]), in one job on the
+/// compute pool, an event a unit, which gives its thread up between any two events whenever another job
+/// waits for it (`crate::rt::compute_pieces`). A job a seal flooded the pool as a fill sealed thousands,
+/// holding its other jobs seconds (goal 10's A/B: the compute pool's wait at p99, 0.9 ms to 2.3 s), and
+/// a chunk a unit held a thread for a chunk's whole deflate (its pieces at p99, 5 to 45 ms). A chunk
 /// gone or packed by then (let go of, changed, packed by a snapshot that needed it) is passed over.
-/// Each comes with its copy's home, whose owner keeps it compact once it's packed (goal 11).
-static SEALED: OnceLock<async_channel::Sender<(Weak<Chunk>, Option<Home>)>> = OnceLock::new();
+static SEALED: OnceLock<async_channel::Sender<Sealed>> = OnceLock::new();
 
 /// A chunk that sealed, to be packed off the owner's shard ([`SEALED`]), so a snapshot after it takes
 /// it as it is (goal 10, plan 01a1a87b2dae step 3), and its copy's owner then keeps it compact (goal
@@ -604,29 +614,13 @@ fn compact_msg(home: &Home) -> Msg {
     Msg::Run(Box::new(move |s: &mut Shard| s.compact(&id)))
 }
 
-/// The packer ([`SEALED`]): a job on the compute pool for as long as chunks wait, each packed in turn.
+/// The packer ([`SEALED`]): a job on the compute pool for as long as chunks wait ([`Packer::piece`]).
 /// A packed chunk's owner is told from the pool when its inbox takes the message now, else once the
 /// job ends (its inbox full then: the owner busy).
-async fn pack_sealed(rx: async_channel::Receiver<(Weak<Chunk>, Option<Home>)>) {
-    use crate::rt::Step;
+async fn pack_sealed(rx: async_channel::Receiver<Sealed>) {
     while let Ok(first) = rx.recv().await {
-        let packed = crate::rt::compute_pieces((rx.clone(), Some(first), Vec::new()), |(rx, next, later): &mut (_, Option<(Weak<Chunk>, Option<Home>)>, Vec<Home>), turn| {
-            loop {
-                let Some((chunk, home)) = next.take().or_else(|| rx.try_recv().ok()) else { return Step::Done(std::mem::take(later)) };
-                if let Some(chunk) = chunk.upgrade().filter(|c| c.packed().is_none())
-                    && chunk.pack().is_ok()
-                    && let Some(home) = home
-                    && let Some(inbox) = home.inbox.upgrade()
-                    && matches!(inbox.try_send(compact_msg(&home)), Err(async_channel::TrySendError::Full(_)))
-                {
-                    later.push(home);
-                }
-                if turn.over() {
-                    return Step::More;
-                }
-            }
-        })
-        .await;
+        let packer = Packer { rx: rx.clone(), waiting: vec![first], now: None, later: Vec::new() };
+        let packed = crate::rt::compute_pieces(packer, |p, turn| p.piece(&|| turn.over())).await;
         match packed {
             Ok(later) => {
                 for home in later {
@@ -636,6 +630,105 @@ async fn pack_sealed(rx: async_channel::Receiver<(Weak<Chunk>, Option<Home>)>) {
                 }
             }
             Err(e) => tracing::debug!(error = %format!("{e:#}"), "sealed chunks weren't packed: snapshots pack them as they need them"),
+        }
+    }
+}
+
+/// The packer's job ([`pack_sealed`]): the sealed chunks waiting, the one being packed, and the owners
+/// to tell once it ends.
+struct Packer {
+    rx: async_channel::Receiver<Sealed>,
+    /// Those not begun, the newest last: taken newest first, so in a fill a long session's oldest, which
+    /// it lets go of first ([`Events::drain_front`]), are gone before their turn comes rather than packed
+    /// for nothing.
+    waiting: Vec<Sealed>,
+    now: Option<Packing>,
+    /// Owners told to keep a chunk compact whose inbox was full then: told again once the job ends.
+    later: Vec<Home>,
+}
+
+/// A sealed chunk being packed ([`Packer`]): its events fed in so far, and what they deflated to.
+struct Packing {
+    chunk: Arc<Chunk>,
+    home: Option<Home>,
+    next: usize,
+    deflating: super::packed::Deflating,
+}
+
+impl Packer {
+    /// A piece of the job: an event at a time until its turn is `over` (another job waits for its thread:
+    /// `crate::rt::Turn::over`), or no sealed chunk waits, which ends it with the owners to tell after.
+    fn piece(&mut self, over: &dyn Fn() -> bool) -> crate::rt::Step<Vec<Home>> {
+        loop {
+            while let Ok(sealed) = self.rx.try_recv() {
+                self.waiting.push(sealed);
+            }
+            let Some(p) = self.now.take().or_else(|| self.begin()) else {
+                return crate::rt::Step::Done(std::mem::take(&mut self.later));
+            };
+            self.now = self.feed(p);
+            if over() {
+                return crate::rt::Step::More;
+            }
+        }
+    }
+
+    /// The newest that's still there and not packed yet, begun.
+    fn begin(&mut self) -> Option<Packing> {
+        while let Some((chunk, home)) = self.waiting.pop() {
+            if let Some(chunk) = chunk.upgrade().filter(|c| c.packed().is_none()) {
+                return Some(Packing { chunk, home, next: 0, deflating: super::packed::Deflating::new(Compression::default()) });
+            }
+        }
+        None
+    }
+
+    /// `p`'s next event in: its digest made, and its text (after the `,` before it) deflated; back while
+    /// some are still to go in. Once all are in, what they deflated to is kept ([`Chunk::pack`]'s bytes)
+    /// and its owner told to keep it compact. One packed meanwhile (a snapshot needed it) is done with as
+    /// it is; one nothing holds but this (its copy and every view let go of it) is let go of unpacked.
+    fn feed(&mut self, mut p: Packing) -> Option<Packing> {
+        if p.chunk.packed().is_some() {
+            self.tell(p.home);
+            return None;
+        }
+        if Arc::strong_count(&p.chunk) == 1 {
+            return None;
+        }
+        if p.next >= p.chunk.evs.len() {
+            let Packing { chunk, home, deflating, .. } = p;
+            match deflating.finish() {
+                Ok(made) => {
+                    chunk.keep(made);
+                    self.tell(home);
+                }
+                Err(e) => tracing::debug!(error = %e, "a sealed chunk wasn't packed: a snapshot packs it if it needs it"),
+            }
+            return None;
+        }
+        let fed = match (p.chunk.meta.get(p.next), p.chunk.evs.get(p.next)) {
+            (Some(m), Some(e)) => {
+                m.sum(e);
+                let comma = if p.next == 0 { Ok(()) } else { p.deflating.part(b",") };
+                comma.and_then(|()| p.deflating.part(e.entry.text().as_bytes()))
+            }
+            _ => Err(std::io::Error::other("a chunk's metas and events don't match")),
+        };
+        if let Err(e) = fed {
+            tracing::debug!(error = %e, "a sealed chunk wasn't packed: a snapshot packs it if it needs it");
+            return None;
+        }
+        p.next += 1;
+        Some(p)
+    }
+
+    /// A packed chunk's owner told to keep it compact: now if its inbox takes it, else once the job ends.
+    fn tell(&mut self, home: Option<Home>) {
+        if let Some(home) = home
+            && let Some(inbox) = home.inbox.upgrade()
+            && matches!(inbox.try_send(compact_msg(&home)), Err(async_channel::TrySendError::Full(_)))
+        {
+            self.later.push(home);
         }
     }
 }
@@ -692,7 +785,31 @@ impl View {
     /// What this copy has of its events, said in digests (`crate::wire::sums`): each event's
     /// digest is of its text, written out once, however many ask.
     pub fn kept(&self, session: &str) -> crate::proto::KeptSession {
-        let mut events: Vec<(u64, u64)> = self.events.chunks().iter().flat_map(|c| c.metas().iter().zip(c.evs())).filter(|(m, _)| !m.id.is_empty()).filter_map(|(m, e)| Some((m.seq?, m.sum(e)))).collect();
+        let mut events: Vec<(u64, u64)> = Vec::new();
+        for c in self.events.chunks() {
+            let metas = c.metas();
+            // A digest made is taken as it is (a packed chunk's are all made: packing makes them); a
+            // chunk's events are read only for the digests still missing, as a compact chunk gives them
+            // by inflating its segment (goal 11, plan 01a1a87b2e56 step 2).
+            let evs = if metas.iter().any(|m| !m.id.is_empty() && m.sum_made().is_none()) {
+                match c.evs() {
+                    Ok(evs) => Some(evs),
+                    Err(e) => {
+                        // Said less of than it has: its runner sends those events again.
+                        tracing::warn!(session, error = %e, "a chunk's events couldn't be read for their digests");
+                        None
+                    }
+                }
+            } else {
+                None
+            };
+            for (i, m) in metas.iter().enumerate().filter(|(_, m)| !m.id.is_empty()) {
+                let sum = m.sum_made().or_else(|| evs.as_ref().and_then(|evs| evs.get(i)).map(|e| m.sum(e)));
+                if let (Some(seq), Some(sum)) = (m.seq, sum) {
+                    events.push((seq, sum));
+                }
+            }
+        }
         events.sort_unstable_by_key(|(seq, _)| *seq);
         crate::wire::sums::kept(session.to_owned(), self.info.epoch, &events)
     }
@@ -1446,6 +1563,13 @@ async fn own(mut shard: Shard, rx: async_channel::Receiver<Msg>, hub: Arc<OnceLo
             shard.take(msg, h.as_ref());
         }
         drop(h);
+        // The conversation store over its bound holds this owner back before it takes more (goal 11, plan
+        // 01a1a87b2e56 step 3): the updates it would take wait in its inbox, and those behind them upstream,
+        // rather than their rows piling up in the store's queue. The owner's task waits; its shard's thread
+        // goes on with its other tasks.
+        if let Some(store) = hub.get().and_then(Weak::upgrade).and_then(|h| h.harness.convo.clone()) {
+            store.room().await;
+        }
         turns.after().await;
     }
 }
@@ -1623,7 +1747,8 @@ mod tests {
             }
             for c in m.events.chunks().iter().take(3) {
                 assert!(c.metas().iter().all(|meta| meta.sum_made().is_some()), "a packed chunk's digests are all there");
-                for (meta, e) in c.metas().iter().zip(c.evs()) {
+                let evs = c.evs()?;
+                for (meta, e) in c.metas().iter().zip(evs.iter()) {
                     assert_eq!(meta.sum(e), e.entry.sum());
                 }
             }
@@ -1671,6 +1796,62 @@ mod tests {
         assert!(events.chunks().get(1).is_some_and(|c| c.packed().is_some()), "and still packed");
         assert_eq!(events.get(0).and_then(|e| e.entry.seq()), Some(u64::try_from(CHUNK + 6).unwrap_or(0)));
         assert_eq!(events.len(), CHUNK * 3 - 3);
+        Ok(())
+    }
+
+    /// Goal 10, plan 01a1a87b2dae step 3: the packer packs a sealed chunk an event at a time, giving its
+    /// thread up after any one when another job waits (here, after every one), into the very bytes one
+    /// deflate of the chunk makes, each event's digest made as it goes in; the newest first; and each
+    /// packed chunk's owner is told to keep it compact. One packed meanwhile (a snapshot needed it) is
+    /// done with as it is; one nothing holds but the packer is let go of, unpacked.
+    #[test]
+    fn g10_s3_the_packer_packs_an_event_at_a_time_newest_first() -> anyhow::Result<()> {
+        use crate::rt::Step;
+        let mut events = Events::default();
+        let mut sealed = Vec::new();
+        for s in 1..=u64::try_from(CHUNK * 3 + 1)? {
+            if let Some(c) = events.push(Ev { entry: entry(&format!("e{s}"), s), at: s }) {
+                sealed.push(c);
+            }
+        }
+        let [oldest, middle, newest] = <[Arc<Chunk>; 3]>::try_from(sealed).map_err(|s| anyhow::anyhow!("{} chunks sealed", s.len()))?;
+        let want = newest.deflate(Compression::default())?;
+        let (owner, told) = async_channel::bounded::<Msg>(8);
+        let home = Home { inbox: owner.downgrade(), id: Arc::from("s") };
+        let (tx, rx) = async_channel::unbounded();
+        for c in [&oldest, &middle, &newest] {
+            tx.try_send((Arc::downgrade(c), Some(home.clone()))).map_err(|_| anyhow::anyhow!("the packer's queue refused a chunk"))?;
+        }
+        let mut packer = Packer { rx, waiting: Vec::new(), now: None, later: Vec::new() };
+        let after_each = || true;
+        for k in 1..=CHUNK {
+            anyhow::ensure!(matches!(packer.piece(&after_each), Step::More), "piece {k} ended the job");
+            assert!(packer.now.as_ref().is_some_and(|p| Arc::ptr_eq(&p.chunk, &newest) && p.next == k), "piece {k}: the newest, its {k} first in");
+            assert_eq!(newest.metas().iter().filter(|m| m.sum_made().is_some()).count(), k, "piece {k}: a digest an event in");
+            assert!(newest.packed().is_none() && told.is_empty(), "piece {k}: not packed yet");
+        }
+        anyhow::ensure!(matches!(packer.piece(&after_each), Step::More));
+        let got = newest.packed().cloned().ok_or_else(|| anyhow::anyhow!("the newest wasn't packed"))?;
+        assert_eq!((&got.deflated, got.crc, got.len), (&want.deflated, want.crc, want.len), "the bytes one deflate makes");
+        assert!(matches!(told.try_recv(), Ok(Msg::Run(_))), "its owner told to keep it compact");
+        // The middle begun, then packed by a snapshot that needed it.
+        anyhow::ensure!(matches!(packer.piece(&after_each), Step::More));
+        assert!(packer.now.as_ref().is_some_and(|p| Arc::ptr_eq(&p.chunk, &middle) && p.next == 1), "the middle next");
+        let snapshot = middle.pack()?;
+        anyhow::ensure!(matches!(packer.piece(&after_each), Step::More));
+        assert!(packer.now.is_none() && middle.packed().is_some_and(|s| Arc::ptr_eq(s, &snapshot)), "the snapshot's kept, the packer's let go of");
+        assert!(matches!(told.try_recv(), Ok(Msg::Run(_))), "its owner told");
+        // The oldest begun, then let go of by its copy (the oldest let go of) and everyone else.
+        anyhow::ensure!(matches!(packer.piece(&after_each), Step::More));
+        assert!(packer.now.as_ref().is_some_and(|p| Arc::ptr_eq(&p.chunk, &oldest)), "the oldest last");
+        let was = Arc::downgrade(&oldest);
+        let _ = events.drain_front(CHUNK);
+        drop(oldest);
+        anyhow::ensure!(matches!(packer.piece(&after_each), Step::More));
+        assert!(packer.now.is_none() && was.upgrade().is_none(), "let go of, unpacked");
+        assert!(told.is_empty(), "no owner told of a chunk gone");
+        assert!(matches!(packer.piece(&after_each), Step::Done(later) if later.is_empty()), "nothing left: the job ends");
+        drop(owner);
         Ok(())
     }
 

@@ -147,7 +147,25 @@ async fn held(hub: &Arc<Hub>) -> i64 {
     for _ in 0..20 {
         kiln::rt::sleep(std::time::Duration::from_millis(50)).await;
     }
+    settled().await;
     alloc::read_process().live
+}
+
+/// Until the copy has done what it does after taking its events: its sealed chunks packed on the compute
+/// pool, and kept compact once they are (goal 11, plan 01a1a87b2e56 step 2): what it keeps as text and
+/// packed stops changing for two seconds (a debug build packs slowly), a couple of minutes at most.
+async fn settled() {
+    let now = || (kiln::memory::SESSION_ENTRIES.bytes(), kiln::harness::copies::SEGMENT_BYTES.load(std::sync::atomic::Ordering::Relaxed));
+    let (mut last, mut still) = (now(), 0);
+    for _ in 0..600 {
+        kiln::rt::sleep(std::time::Duration::from_millis(200)).await;
+        let seen = now();
+        still = if seen == last { still + 1 } else { 0 };
+        if still >= 10 {
+            return;
+        }
+        last = seen;
+    }
 }
 
 /// Goal 11, plan 01a1a87b2e56 step 2: a 20,000-event session's resident cost, said in bytes and per event kept.
@@ -177,6 +195,8 @@ fn g11_s2_a_20000_event_sessions_resident_cost() -> anyhow::Result<()> {
         });
         let with = held(&hub).await;
         let bus_with = hub.bus.stats().memory_used;
+        // What the copy keeps as text and packed, and what waits for the store's writer (`kiln::memory`).
+        let (entries, segments, queued) = (kiln::memory::SESSION_ENTRIES.bytes(), kiln::harness::copies::SEGMENT_BYTES.load(std::sync::atomic::Ordering::Relaxed), kiln::memory::CONVO_QUEUE.bytes());
         ingest(&hub, &there, vec![Update::Closed]).await;
         let after = held(&hub).await;
         let bus_after = hub.bus.stats().memory_used;
@@ -185,7 +205,7 @@ fn g11_s2_a_20000_event_sessions_resident_cost() -> anyhow::Result<()> {
         println!(
             "g11 resident (conversation store {}): {EVENTS} events sent ({:.1} MB of JSON), {kept} kept; while open the server held {:.2} MB more \
              ({per} bytes an event kept), {:.2} MB of it let go at its end (process {:.2} MB before, {:.2} MB with it, {:.2} MB after); \
-             the bus's own count {:.2} MB with it, {:.2} MB after",
+             the bus's own count {:.2} MB with it, {:.2} MB after; with it, kept as text {:.2} MB, packed {:.2} MB, waiting for the store {:.2} MB",
             if hub.harness.convo.is_some() { "on" } else { "off" },
             text as f64 / 1e6,
             open as f64 / 1e6,
@@ -194,7 +214,10 @@ fn g11_s2_a_20000_event_sessions_resident_cost() -> anyhow::Result<()> {
             with as f64 / 1e6,
             after as f64 / 1e6,
             bus_with as f64 / 1e6,
-            bus_after as f64 / 1e6
+            bus_after as f64 / 1e6,
+            entries as f64 / 1e6,
+            segments as f64 / 1e6,
+            queued as f64 / 1e6
         );
         anyhow::ensure!(kept > 0, "the session kept no events");
         Ok(())
