@@ -2276,6 +2276,9 @@ impl Hub {
             if let Some(a) = arrived {
                 crate::route_latency::observe(crate::route_latency::Class::Runner, Some(began.saturating_duration_since(a.at)), began.elapsed());
             }
+            // How long this loop held the event, its waits included, whatever it was: what the frames queued
+            // behind it waited for (goal 10, plan 01a1a87b2dae step 5).
+            crate::route_latency::observe_leg(crate::route_latency::RunnerLeg::Held, began.elapsed());
             turns.after().await;
         }
         anyhow::bail!("transport event stream ended")

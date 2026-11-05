@@ -174,15 +174,39 @@ impl srv::Handler for Api {
         // on a connection that idled between them (the lab's readers'), was three times the router's (goal
         // 10, plan 01a1a87b2dae step 5).
         let label = crate::route_latency::label_of(req.method(), req.uri().path(), upgrade);
+        let timing = req.headers().contains_key(ASK_TIMING);
         let resp = match crate::rt::labeled(label, boxed(|| route(hub, req))).await {
             Ok(r) => r,
             Err(e) => e.into_response(),
         };
+        let took = began.elapsed();
         if let Some(class) = class {
-            crate::route_latency::observe(class, waited, began.elapsed());
+            crate::route_latency::observe(class, waited, took);
         }
-        resp
+        if timing { with_timing(resp, waited, took) } else { resp }
     }
+}
+
+/// The request header that asks for the request's own timing on its answer: [`with_timing`]'s `Server-Timing`.
+/// Only a request that asks is told (kiln-lab's readers: its `split` numbers), so every other answer is as it was.
+/// Goal 10, plan 01a1a87b2dae step 5: the server's wait and took at p99.9 are each a class's, and say nothing of
+/// what one slow read spent where; one read's own split tells the server's share of it from the hops' and the
+/// transfer's.
+pub const ASK_TIMING: &str = "kiln-timing";
+
+/// `resp` saying how long its request waited before its handler started (`wait`, from its head's arrival off its
+/// socket, where the connection said that) and how long the handler then took (`took`), as `crate::route_latency`
+/// observes them: W3C Server-Timing, `wait;dur=0.123, took;dur=0.045`, milliseconds to the microsecond.
+fn with_timing(mut resp: Response, waited: Option<Duration>, took: Duration) -> Response {
+    let ms = |d: Duration| d.as_secs_f64() * 1e3;
+    let said = match waited {
+        Some(w) => format!("wait;dur={:.3}, took;dur={:.3}", ms(w), ms(took)),
+        None => format!("took;dur={:.3}", ms(took)),
+    };
+    if let Ok(v) = header::HeaderValue::from_str(&said) {
+        resp.headers_mut().insert(header::HeaderName::from_static("server-timing"), v);
+    }
+    resp
 }
 
 /// `path`'s segments, each percent-decoded (and `+` a space) where it has anything to decode, else as it
@@ -7778,6 +7802,34 @@ mod tests {
             let (router_b, handled_b, placed_b) = (size_of_val(&router), size_of_val(&handled), size_of_val(&placed));
             drop((router, handled, placed));
             anyhow::ensure!(handled_b < router_b && placed_b < router_b, "the router's {router_b} bytes, a request's {handled_b}, placed {placed_b}");
+            Ok(())
+        })
+    }
+
+    /// Goal 10, plan 01a1a87b2dae step 5: a request that asks (`kiln-timing`) is told its own wait before its handler
+    /// started, from its head's arrival, and its handler's time, as Server-Timing, in milliseconds to the
+    /// microsecond; one that doesn't ask is answered as before, without it.
+    #[test]
+    fn g10_s5_a_request_that_asks_is_told_its_own_wait_and_took() -> anyhow::Result<()> {
+        use crate::http::server::Handler as _;
+        assert_eq!(with_timing(srv::status(StatusCode::OK), Some(Duration::from_micros(1_234)), Duration::from_micros(56)).headers().get("server-timing").map(|v| v.as_bytes().to_vec()), Some(b"wait;dur=1.234, took;dur=0.056".to_vec()));
+        assert_eq!(with_timing(srv::status(StatusCode::OK), None, Duration::from_micros(56)).headers().get("server-timing").map(|v| v.as_bytes().to_vec()), Some(b"took;dur=0.056".to_vec()));
+        crate::rt::block_on(async {
+            let hub = crate::hub::tests::scratch_hub().await?;
+            let api = Arc::new(Api { hub: Arc::clone(&hub) });
+            let dur = |v: &str, name: &str| v.split(',').find_map(|m| m.trim().strip_prefix(name)?.strip_prefix(";dur=")?.parse::<f64>().ok());
+            // Its head came 2 ms before its handler started.
+            let mut asks = lab_get("/api/me")?;
+            asks.headers_mut().insert(ASK_TIMING, header::HeaderValue::from_static("1"));
+            asks.extensions_mut().insert(kiln_http::Received(Instant::now().checked_sub(Duration::from_millis(2)).unwrap_or_else(Instant::now)));
+            let resp = Arc::clone(&api).handle(asks).await;
+            anyhow::ensure!(resp.status() == StatusCode::OK, "{}", resp.status());
+            let said = resp.headers().get("server-timing").and_then(|v| v.to_str().ok()).map(str::to_owned).unwrap_or_default();
+            let (wait, took) = (dur(&said, "wait"), dur(&said, "took"));
+            anyhow::ensure!(wait.is_some_and(|w| w >= 2.0) && took.is_some_and(|t| t >= 0.0), "{said:?}");
+            // As it was for a request that doesn't ask.
+            let resp = Arc::clone(&api).handle(lab_get("/api/me")?).await;
+            anyhow::ensure!(resp.status() == StatusCode::OK && !resp.headers().contains_key("server-timing"), "{:?}", resp.headers());
             Ok(())
         })
     }
