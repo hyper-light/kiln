@@ -866,7 +866,8 @@ fn the_server_refuses_what_its_relay_cant_take_typed_and_notes_it() -> anyhow::R
         hear(&hub, 2, LANE_CONTROL, &hello).await?;
         let frame = |to: &str, open: bool| AgentMsg::Reach { to: to.into(), link: "L1".into(), open, data: b"x".to_vec(), close: None };
         hear(&hub, 1, LANE_REACH, &frame("linux", true)).await?;
-        anyhow::ensure!(hub.reach.lock().ends("L1") == Some(("mac".into(), "linux".into())), "the link is open");
+        // The relay's owner takes frames in its turn: what it answers comes after those sent before.
+        anyhow::ensure!(hub.relay().ask(|r| r.ends("L1")).await.flatten() == Some(("mac".into(), "linux".into())), "the link is open");
         let told = |hub: &crate::hub::Hub, to: u64| {
             hub.sent.lock().iter().rev().find_map(|(p, m)| match m {
                 ServerMsg::Unread { wire, code, why, .. } if *p == to => Some((*wire, *code, why.clone())),
@@ -877,26 +878,30 @@ fn the_server_refuses_what_its_relay_cant_take_typed_and_notes_it() -> anyhow::R
         // link's ends, while the link goes on.
         clock.advance(Duration::from_millis(100));
         hear(&hub, 3, LANE_REACH, &frame("linux", false)).await?;
+        hub.relay().ask(|_| ()).await;
         let t = told(&hub, 3);
         anyhow::ensure!(t.as_ref().is_some_and(|(w, c, why)| *w == Wire::Relay && *c == Code::Malformed && why.contains("link L1 is mac's and linux's")), "{t:?}");
-        anyhow::ensure!(hub.reach.lock().links() == 1, "the link goes on");
+        anyhow::ensure!(hub.relay().ask(|r| r.links()).await == Some(1), "the link goes on");
         let rows = refused_rows(&hub, "runner:intruder").await?;
         anyhow::ensure!(rows.iter().any(|(t, r, d)| t == "relay" && r == "malformed" && d.contains("link L1 is mac's and linux's")), "{rows:?}");
         let shown = |name: &str, wire: Wire, code: Code| hub.refusals.load().kept(&Page::Runner(name.into())).is_some_and(|k| k.counts.iter().any(|c| c.wire == wire && c.code == code));
         anyhow::ensure!(shown("intruder", Wire::Relay, Code::Malformed), "on the intruder's page");
         // The relay's other refusals carry their code to a runner that takes word of them.
         hear(&hub, 1, LANE_REACH, &frame("linux", true)).await?;
+        hub.relay().ask(|_| ()).await;
         anyhow::ensure!(hub.sent.lock().iter().any(|(p, m)| *p == 1 && matches!(m, ServerMsg::ReachRefused { code: super::relay::Refusal::Taken, .. })), "a link id taken, said so");
         // A runner from before (no CAP_UNREAD) is told in words, as before, and nothing new; its
         // frame on a link not its own still goes nowhere and is noted.
         join_runner(&hub, 4, "old", CAP_WIRE);
         hear(&hub, 4, LANE_REACH, &frame("linux", true)).await?;
+        hub.relay().ask(|_| ()).await;
         let to_old: Vec<ServerMsg> = hub.sent.lock().iter().filter(|(p, _)| *p == 4).map(|(_, m)| m.clone()).collect();
         anyhow::ensure!(matches!(to_old.as_slice(), [ServerMsg::Reach { open: false, close: Some(why), .. }] if why.contains("taken")), "{to_old:?}");
         clock.advance(Duration::from_millis(100));
         hear(&hub, 4, LANE_REACH, &frame("linux", false)).await?;
+        hub.relay().ask(|_| ()).await;
         anyhow::ensure!(hub.sent.lock().iter().filter(|(p, _)| *p == 4).count() == 1, "the old runner is told nothing new");
-        anyhow::ensure!(shown("old", Wire::Relay, Code::Malformed) && hub.reach.lock().links() == 1, "noted on its page, and the link goes on");
+        anyhow::ensure!(shown("old", Wire::Relay, Code::Malformed) && hub.relay().ask(|r| r.links()).await == Some(1), "noted on its page, and the link goes on");
         // A job pod's frame: refused, and noted.
         hub.change_agent("intruder", |a| a.ephemeral = true);
         clock.advance(Duration::from_millis(100));

@@ -370,6 +370,84 @@ impl Relay {
     }
 }
 
+/// What reach's relay's owner is sent ([`Owner`]), taken in the order sent.
+pub enum Ask {
+    /// Runner `from`'s frame, from its connection `peer`: forwarded, refused or noted, and what it
+    /// passes on sent, before the next is taken.
+    Frame { from: String, peer: PeerId, frame: Frame },
+    /// Connection `peer` went: its links close, their other ends told.
+    Lost { peer: PeerId },
+    /// The runs due a record ([`Relay::due`]), recorded.
+    Due,
+    /// Anything else on the relay, in its turn: an announcement, a runner forgotten, a question.
+    Call(Box<dyn FnOnce(&mut Relay) + Send>),
+}
+
+/// Reach's relay with one owner (goal 5 of the API runtime program, plan 01a1a59c2aae step 2): a task
+/// that alone changes it takes each frame, lost connection and question as a message, in order, and
+/// sends what the relay passes on in that order (the hub's `relay_loop`). The hub's loop hands it a
+/// frame without waiting, and no shard waits on another for it. What the directory reads of it, each
+/// runner's announcement, is a copy swapped in whole as one changes.
+pub struct Owner {
+    tx: async_channel::Sender<Ask>,
+    rx: async_channel::Receiver<Ask>,
+    started: std::sync::atomic::AtomicBool,
+    announced: crate::rcu::Rcu<HashMap<String, Announce>>,
+}
+
+impl Default for Owner {
+    fn default() -> Self {
+        // Unbounded, as the runners' commands' owner's (`crate::wire::commands::Owner`): refused only
+        // once its owner has stopped (the server's going). The hub's loop hands it a frame for each
+        // runner's message it takes, so it holds what that loop took and the owner hasn't yet.
+        let (tx, rx) = async_channel::unbounded();
+        Self { tx, rx, started: std::sync::atomic::AtomicBool::new(false), announced: crate::rcu::Rcu::default() }
+    }
+}
+
+impl Owner {
+    /// What its owner takes, to the first caller only: its owner starts then, given what it needs to
+    /// send what it passes on (what was sent before waits for it).
+    pub fn starting(&self) -> Option<async_channel::Receiver<Ask>> {
+        (!self.started.swap(true, std::sync::atomic::Ordering::AcqRel)).then(|| self.rx.clone())
+    }
+
+    /// `ask` to its owner, taken in its turn: not waited for.
+    pub fn send(&self, ask: Ask) {
+        let _ = self.tx.try_send(ask);
+    }
+
+    /// `f` run on the relay in its turn, after what was sent before it was taken (and what that
+    /// passed on, sent); its answer. None once the owner has stopped.
+    pub async fn ask<R: Send + 'static>(&self, f: impl FnOnce(&mut Relay) -> R + Send + 'static) -> Option<R> {
+        let (tx, rx) = futures::channel::oneshot::channel();
+        self.send(Ask::Call(Box::new(move |r| {
+            let _ = tx.send(f(r));
+        })));
+        rx.await.ok()
+    }
+
+    /// Runner `runner`'s announcement from now on: the directory's at once, the relay's in its turn
+    /// (before any frame sent after it).
+    pub fn announce(&self, runner: &str, a: Announce) {
+        self.announced.update(|m| m.insert(runner.to_owned(), a.clone()));
+        let runner = runner.to_owned();
+        self.send(Ask::Call(Box::new(move |r| r.announce(&runner, a))));
+    }
+
+    /// A runner that left for good: its announcement goes, the directory's and the relay's.
+    pub fn forget(&self, runner: &str) {
+        self.announced.update(|m| m.remove(runner));
+        let runner = runner.to_owned();
+        self.send(Ask::Call(Box::new(move |r| r.forget(&runner))));
+    }
+
+    /// Each runner's announcement, as the directory reads it.
+    pub fn announced(&self) -> arc_swap::Guard<std::sync::Arc<HashMap<String, Announce>>> {
+        self.announced.load()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
