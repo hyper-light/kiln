@@ -145,5 +145,5 @@ harness = false
 
 # kiln's goal 11: a spawn on a desk made as it's used, against one made up front (two builds, compared).
 [[bench]]
-name = "spawn"
+name = "desk"
 harness = false

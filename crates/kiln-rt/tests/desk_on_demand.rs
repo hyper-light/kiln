@@ -1,8 +1,10 @@
 //! kiln's goal 11 (plan 01a1a87b2e56): a shard's desk is made as it is used. Its task, timer and wait cells
-//! (`src/slab.rs`), the loop's task records and the timer wheel's entries are made as their slots are first
-//! taken, so a runtime's memory follows the most tasks it has held, not its bound, and the bound stays a
-//! bound. Before, a shard of kiln's server (8,192 tasks, 16,384 timers and waits) wrote about 7 MB of cells
-//! as it started, whatever it held. The resource is resident memory, so that is what is measured: the
+//! (`src/slab.rs`), its rings and free stacks (`src/cells.rs`), its run queue's lists and each slot's place in
+//! them (`src/queue.rs`), the loop's task records, the timer wheel's entries and the readiness waits' handle
+//! table (`src/interests.rs`) are made as they are first needed, so a runtime's memory follows the most it has
+//! held, not its bound, and the bound stays a bound. Before, a shard of kiln's server (8,192 tasks, 16,384
+//! timers and waits) wrote about 7 MB of cells as it started, and some 2 MB more of rings, stacks, run-queue
+//! lists and handle table, whatever it held. The resource is resident memory, so that is what is measured: the
 //! process's own resident size through `ps` (a read of the kernel's accounting). One test per binary, so no
 //! other test's allocations move the numbers.
 
@@ -32,22 +34,23 @@ use std::time::{Duration, Instant};
 
 use hyper_rt::runtime::{Runtime, RuntimeConfig};
 
-/// Shape: a bound far past what the test holds, so cells made for the whole bound would be many megabytes.
+/// Shape: a bound far past what the test holds, so a desk made for the whole bound would be many megabytes.
 const BOUND: usize = 262_144;
-/// Shape: the tasks the burst holds at once, a sixteenth of the bound.
-const BURST: u64 = 16_384;
+/// Shape: the tasks the burst holds at once, an eighth of the bound.
+const BURST: u64 = 32_768;
 /// Shape: how long the burst is given before the test calls it lost.
 const WAIT: Duration = Duration::from_secs(60);
 
 /// How many of the burst's tasks have ended.
 static ENDED: AtomicU64 = AtomicU64::new(0);
 
-fn config(tasks: usize) -> RuntimeConfig {
+/// One shard, its tasks, timers and readiness waits each bounded at `bound`.
+fn config(bound: usize) -> RuntimeConfig {
     RuntimeConfig {
         shards: 1,
-        tasks_per_shard: tasks,
-        timers_per_shard: tasks,
-        interests_per_shard: 64,
+        tasks_per_shard: bound,
+        timers_per_shard: bound,
+        interests_per_shard: bound,
         ring_entries: 64,
         step_budget_ns: 1_000_000,
         timer_tick_ns: 100_000,
@@ -95,12 +98,12 @@ fn burst(rt: &Runtime) {
     }
 }
 
-/// Do: start a runtime of `BOUND` task slots (and as many timers), read the process's resident size, run a
-/// burst of `BURST` tasks to their end, read it again, run the same burst again, and read it a third time.
-/// Expect: the runtime starts in less than a quarter of what the cells of its whole bound would take, at what
-/// the burst's cells took (a sixteenth of the bound: the burst's cells are made, the rest aren't; what still
-/// goes with the bound as the shard starts is its rings and free stacks, a few bytes a slot); the second
-/// burst, of slots given back and taken again, grows it by less than a quarter of the first.
+/// Do: start a runtime of `BOUND` task slots (and as many timers and readiness waits), read the process's
+/// resident size, run a burst of `BURST` tasks to their end, read it again, run the same burst again, and read
+/// it a third time. Expect: the runtime starts in less than the burst then takes (an eighth of the bound: the
+/// burst's cells, rings' and lists' are made, the rest aren't; what still goes with the bound as the shard
+/// starts is its registration's per-slot words, which other threads write, 16 bytes a task and a wait); the
+/// second burst, of slots given back and taken again, grows it by less than a quarter of the first.
 #[test]
 fn a_desk_is_made_as_its_slots_are_first_taken() {
     let before = resident_kib();
@@ -117,9 +120,6 @@ fn a_desk_is_made_as_its_slots_are_first_taken() {
          {BURST} tasks {first} (+{grew}), after the same again {second} (+{again})"
     );
     assert!(grew > 0, "a burst of {BURST} tasks makes their cells (non-vacuity)");
-    // Cells for the whole bound are BOUND / BURST times what the burst made: the runtime started in far less
-    // than that, its cells not made.
-    let whole = grew * (BOUND as u64 / BURST);
-    assert!(start < whole / 4, "the runtime started in {start} KiB, against {whole} KiB for cells of its whole bound");
+    assert!(start < grew, "the runtime started in {start} KiB, more than an eighth of its bound took held: {grew} KiB");
     assert!(again < grew / 4, "a second burst takes the slots the first gave back: +{again} KiB, against +{grew} KiB");
 }
