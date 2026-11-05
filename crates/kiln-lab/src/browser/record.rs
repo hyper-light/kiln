@@ -26,7 +26,7 @@ pub fn run(kiln: &Path, web: &Path, out: &Path, seconds: u64, seed: u64, only: O
     let certs = servers::certs(&out.join("certs"))?;
     let bin = super::standins::install(&out.join("bin"))?;
     let t = targets::named("kiln-today").ok_or_else(|| anyhow::anyhow!("no kiln-today target"))?;
-    let env = Env { lab: &lab, scopes: &scopes, certs: &certs, web, bin: &bin, kiln: Some(kiln), h2o: None, caddy: None, payloads: None, term_per_s: 10.0, seed };
+    let env = Env { lab: &lab, scopes: &scopes, certs: &certs, web, bin: &bin, kiln: Some(kiln), h2o: None, caddy: None, payloads: None, term_per_s: 10.0, logs: true, seed };
     let running = servers::start(&env, &t, &out.join("kiln"), 3)?;
     let k = running.kiln.clone().ok_or_else(|| anyhow::anyhow!("no lab kiln"))?;
     eprintln!("kiln-lab: the lab kiln is up: sessions {:?}, log job {:?}", k.sessions, k.job);

@@ -189,6 +189,9 @@ pub struct RunArgs {
         /// Stop the server for 2 s this many seconds into each request job.
         #[arg(long)]
         stall: Option<u64>,
+        /// A job log's stream in the stream case too (kiln's CI must take the lab job).
+        #[arg(long)]
+        logs: bool,
 }
 
 /// The web driver's folder: `--web`, `KILN_LAB_WEB`, else the one beside this crate's source.
@@ -302,7 +305,7 @@ pub fn run(cmd: Cmd) -> anyhow::Result<()> {
 
 /// A run's settings from its arguments (paths made absolute: the lab runs itself again elsewhere).
 fn settings(args: RunArgs) -> anyhow::Result<report_run::Settings> {
-    let RunArgs { targets: t, profiles, losses, browsers, cases, rounds, k, seed, duration, window_ms, background_s, kiln, h2o, caddy, payloads, web: w, out, capture, stall } = args;
+    let RunArgs { targets: t, profiles, losses, browsers, cases, rounds, k, seed, duration, window_ms, background_s, kiln, h2o, caddy, payloads, web: w, out, capture, stall, logs } = args;
     let settings = report_run::Settings {
         targets: target_list(&t)?,
         profiles: list(&profiles).iter().map(|p| link::profile_named(p).ok_or_else(|| anyhow::anyhow!("no profile {p}"))).collect::<anyhow::Result<_>>()?,
@@ -322,6 +325,7 @@ fn settings(args: RunArgs) -> anyhow::Result<report_run::Settings> {
         web: web(w),
         capture,
         stall_s: stall,
+        logs,
     };
     let _ = out;
     Ok(settings)

@@ -321,9 +321,14 @@ a budget of 120 h:
 | 8 | 109.6 | none |
 | 16 | 73.4 | none |
 
-The matrix runs at **K = 8**. Each case's pace on each profile is `runfile::workload`: a stream case
-sends an agent's events at 5 a second on the good link, 0.5 at 100 kbit/s and 0.25 at 50, with a
-terminal's and a log's lines at 20, 2 and 1 a second; a burst is an agent's turn of 40 events 25 ms
+The matrix runs at **K = 8**, Chromium only (see "What the lab leaves out"), on the recording's
+seed (`--seed 7`, so the baselines' replay is what the run's kiln sends). Each case's pace on each
+profile is `runfile::workload`: a stream case opens an agent's session (its events at 5 a second
+on the good link, 0.5 at 100 kbit/s and 0.25 at 50), a terminal (its lines at 20, 2 and 1 a second)
+and `/api/events`, as the UI does; a job log's stream is there with `--logs` only, since kiln
+today's log needs its CI to take the lab job, which kiln's runner declines while the lab machine's
+load is past its limit (it did in some rounds and not others on the lab machine), and a cell's
+stream mix must be the same for every target; a burst is an agent's turn of 40 events 25 ms
 apart, every 3, 20 and 40 s; requests go every 100 ms, 2 s and 4 s, open-loop, the UI's reads (the
 agents, the sessions, the overview, `me`, the notices, a session's snapshot) and its write (a
 message to an agent) in turn. Each job runs 60 s on the good link and 180 s on the slow ones. At K =
@@ -366,8 +371,31 @@ if its carrier is new, the probe page's reading of it in `probe.js`.
 ## The numbers
 
 <!-- browser-lab tables: begin -->
-(The matrix's tables go here: step 8.)
+(The matrix's tables go here: step 8. As of 2026-11-05 03:37Z the pilot is running on the lab
+machine, in the unit `kiln-bp-g1-lab` (`crates/kiln-lab/web/servers/run-all.sh`), and the matrix
+follows it there; see "Where the run stands".)
 <!-- browser-lab tables: end -->
+
+### Where the run stands
+
+The pilot and the matrix run in one systemd user unit on the lab machine, started by the agent that
+built the lab, from a snapshot of the lab (`~/.cache/kiln-bp/g1/lab-snap`: the `kiln-lab` binary,
+the web driver and `run-all.sh`) that nothing edits while it runs:
+
+```sh
+systemd-run --user --unit=kiln-bp-g1-lab -E PATH=$PATH -E HOME=$HOME -p Delegate=yes \
+  -p StandardOutput=append:$HOME/.cache/kiln-bp/g1/lab-run-all.log \
+  -p StandardError=append:$HOME/.cache/kiln-bp/g1/lab-run-all.log \
+  --collect bash $HOME/.cache/kiln-bp/g1/lab-snap/run-all.sh
+```
+
+Its parts (the pilot's three, then the matrix's 21: each condition and case with the rounds the run
+plan gives it) each write `~/.cache/kiln-bp/g1/lab/<part>/run.json` as their jobs end, and `done`
+when they end well (`failed` otherwise). Started again the same way, it skips what is done and
+runs the rest: that is how it resumes after a stop or a reset. `systemctl --user stop
+kiln-bp-g1-lab` stops it (the lab's PID namespace takes every process it started with it). The
+pilot picks h2o's QUIC controller for the matrix (the lower median p99 at 50k/1 of `h2o-h3`, Cubic,
+and `h2o-h3-reno`, Reno).
 
 ## What the lab leaves out
 
@@ -376,4 +404,10 @@ if its carrier is new, the probe page's reading of it in `probe.js`.
 - A radio's promotion delay after idle, unless Ada adds it.
 - HTTP/3 in WebKit: WebKit on Linux speaks no HTTP/3 (libsoup: f30). Safari on a Mac would, with its
   traffic shaped on the lab host.
+- WebKit at all, for now: on the lab machine (kiln-a094a12d, Fedora 44) Playwright's WebKit doesn't
+  start ("Host system is missing dependencies": ICU 74, libjpeg 8 and others built for Ubuntu), and
+  the machine where it does (adacachy) is production's host, where long labs don't run. The probe
+  names it (`kiln-lab browser probe` stops at "webkit starts"); `--browsers chromium` runs without
+  it. Installing WebKit's libraries on the lab machine is Ada's (it needs root).
+- BBR: TCP is CUBIC for every target (loading `tcp_bbr` needs root on the lab host: Ada's).
 - Page loads and static files: goal 8's.

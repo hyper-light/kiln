@@ -75,6 +75,11 @@ pub struct Settings {
     /// check that requests behind a stall count their whole wait.
     #[serde(default)]
     pub stall_s: Option<u64>,
+    /// A job log's stream in the stream case. Off unless asked: kiln today's log needs its CI to
+    /// take the lab job, which kiln's runner declines while the lab machine is loaded past its
+    /// limit, and the stream case's mix must be the same for every target in a cell.
+    #[serde(default)]
+    pub logs: bool,
 }
 
 /// One job's record: a cell's draw for one round.

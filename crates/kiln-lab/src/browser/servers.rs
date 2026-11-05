@@ -167,6 +167,8 @@ pub struct Env<'a> {
     pub payloads: Option<&'a Path>,
     /// The terminal stand-in's pace, lines a second (each 96 bytes).
     pub term_per_s: f64,
+    /// Whether the lab kiln runs its log job (a job's CI work is the server's work too).
+    pub logs: bool,
     /// The stand-in agents' seed: the same seed says the same things in any run.
     pub seed: u64,
 }
@@ -303,8 +305,12 @@ enabled = false
         let list = v.as_array().cloned().or_else(|| v.get("sessions").and_then(Value::as_array).cloned()).unwrap_or_default();
         Ok(ids.iter().all(|id| list.iter().any(|s| s.get("id").and_then(Value::as_str) == Some(id) && s.get("status").and_then(Value::as_str).is_some_and(|st| st != "running" && st != "starting"))))
     })?;
-    let (run, job) = match log_job(&mut http, dir, e.bin, e.term_per_s) {
+    let (run, job) = match if e.logs { log_job(&mut http, dir, e.bin, e.term_per_s) } else { Err(anyhow::anyhow!("not asked for")) } {
         Ok((r, j)) => (Some(r), Some(j)),
+        Err(err) if !e.logs => {
+            let _ = err;
+            (None, None)
+        }
         Err(err) => {
             eprintln!("kiln-lab: the lab kiln has no log job: {err:#}");
             (None, None)

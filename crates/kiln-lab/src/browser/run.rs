@@ -33,7 +33,7 @@ fn read_jsonl<T: for<'de> Deserialize<'de>>(p: &Path) -> Vec<T> {
 }
 
 /// The operations a case opens on a target, as the probe page takes them.
-fn ops(t: &Target, case: &str, w: &Workload, kiln: Option<&servers::KilnLab>) -> Vec<Value> {
+fn ops(t: &Target, case: &str, w: &Workload, kiln: Option<&servers::KilnLab>, logs: bool) -> Vec<Value> {
     let sid = |i: usize| kiln.and_then(|k| k.sessions.get(i).cloned()).unwrap_or_else(|| "lab".to_owned());
     let base = |kind: &str| if t.carrier == "fetch-stream" { format!("/fetch-stream/{kind}") } else { format!("/stream/{kind}") };
     // A terminal's and a log's frames are text lines, not JSON, as the UI reads them.
@@ -45,12 +45,12 @@ fn ops(t: &Target, case: &str, w: &Workload, kiln: Option<&servers::KilnLab>) ->
                 stream("terminal", "/api/terminal/ws?target=local&cols=120&rows=40".to_owned(), false),
                 stream("events", "/api/events".to_owned(), false),
             ];
-            if let Some(job) = kiln.and_then(|k| k.job.clone()) {
+            if let Some(job) = kiln.and_then(|k| k.job.clone()).filter(|_| logs) {
                 v.push(stream("log", format!("/api/jobs/{job}/logs/ws?step=0"), false));
             }
             v
         }
-        ("stream", _) => ["session", "terminal", "events", "log"].iter().map(|k| stream(k, base(k), false)).collect(),
+        ("stream", _) => ["session", "terminal", "events", "log"].iter().filter(|k| logs || **k != "log").map(|k| stream(k, base(k), false)).collect(),
         ("burst", Server::Kiln) => vec![stream("turn", format!("/api/harness/sessions/{}/ws?z=gzip&patch=state&patch=changes", sid(1)), true)],
         ("burst", _) => vec![stream("turn", base("session"), false)],
         _ => {
@@ -126,7 +126,7 @@ fn job(c: &mut Ctx<'_>, r: &Running, t: &Target, browser: &str, case: &str, cond
     let d = cpu_now(r);
     let before = rate(&a, &d);
     let noise = (rate(&a, &b) - rate(&b, &d)).abs();
-    let ops = ops(t, case, &w, r.kiln.as_ref());
+    let ops = ops(t, case, &w, r.kiln.as_ref(), c.s.logs);
     // A capture on each client link, headers only, for as long as the job runs.
     let mut captures = Vec::new();
     if c.s.capture {
@@ -210,7 +210,7 @@ fn job(c: &mut Ctx<'_>, r: &Running, t: &Target, browser: &str, case: &str, cond
         }
         ("stream", None, Some(sock)) => {
             #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-            for (kind, per_s) in [("session", w.session_per_s), ("terminal", w.lines_per_s), ("log", w.lines_per_s), ("events", w.session_per_s)] {
+            for (kind, per_s) in [("session", w.session_per_s), ("terminal", w.lines_per_s), ("log", w.lines_per_s), ("events", w.session_per_s)].into_iter().filter(|(k, _)| c.s.logs || *k != "log") {
                 let n = (per_s * w.duration_s as f64) as u64;
                 let every = (1000.0 / per_s.max(0.01)) as u64;
                 let _ = servers::replay(sock, kind, n, every, 0);
@@ -349,7 +349,7 @@ pub fn run(s: &Settings, out: &Path) -> anyhow::Result<BrowserRun> {
     let bin = super::standins::install(&out.join("bin"))?;
     let mut run = BrowserRun { command: std::env::args().collect::<Vec<_>>().join(" "), started_us: now_us(), settings: s.clone(), certs_spki: certs.spki.clone(), jobs: Vec::new(), failures: Vec::new(), network: lab.log.clone() };
     let control = {
-        let env = Env { lab: &lab, scopes: &scopes, certs: &certs, web: &s.web, bin: &bin, kiln: s.kiln.as_deref(), h2o: s.h2o.as_deref(), caddy: s.caddy.as_deref(), payloads: s.payloads.as_deref(), term_per_s: 1.0, seed: s.seed };
+        let env = Env { lab: &lab, scopes: &scopes, certs: &certs, web: &s.web, bin: &bin, kiln: s.kiln.as_deref(), h2o: s.h2o.as_deref(), caddy: s.caddy.as_deref(), payloads: s.payloads.as_deref(), term_per_s: 1.0, logs: s.logs, seed: s.seed };
         servers::start_control(&env, out)?
     };
     let mut turn_id = 0;
@@ -370,7 +370,7 @@ pub fn run(s: &Settings, out: &Path) -> anyhow::Result<BrowserRun> {
                 for t in order {
                     let dir = out.join("servers").join(format!("{}-r{round}-{}", name.replace('/', "-"), t.name));
                     let started = {
-                        let env = Env { lab: &lab, scopes: &scopes, certs: &certs, web: &s.web, bin: &bin, kiln: s.kiln.as_deref(), h2o: s.h2o.as_deref(), caddy: s.caddy.as_deref(), payloads: s.payloads.as_deref(), term_per_s: workload("stream", p).lines_per_s, seed: s.seed };
+                        let env = Env { lab: &lab, scopes: &scopes, certs: &certs, web: &s.web, bin: &bin, kiln: s.kiln.as_deref(), h2o: s.h2o.as_deref(), caddy: s.caddy.as_deref(), payloads: s.payloads.as_deref(), term_per_s: workload("stream", p).lines_per_s, logs: s.logs, seed: s.seed };
                         servers::start(&env, t, &dir, 3)
                     };
                     let running = match started {
@@ -429,7 +429,7 @@ pub fn start_stop(s: &Settings, out: &Path, times: usize) -> anyhow::Result<(Str
     for t in &s.targets {
         let (mut up, mut clean, mut why) = (0, 0, String::new());
         for i in 0..times {
-            let env = Env { lab: &lab, scopes: &scopes, certs: &certs, web: &s.web, bin: &bin, kiln: s.kiln.as_deref(), h2o: s.h2o.as_deref(), caddy: s.caddy.as_deref(), payloads: s.payloads.as_deref(), term_per_s: 1.0, seed: s.seed };
+            let env = Env { lab: &lab, scopes: &scopes, certs: &certs, web: &s.web, bin: &bin, kiln: s.kiln.as_deref(), h2o: s.h2o.as_deref(), caddy: s.caddy.as_deref(), payloads: s.payloads.as_deref(), term_per_s: 1.0, logs: s.logs, seed: s.seed };
             let dir = out.join(format!("{}-{i}", t.name));
             match servers::start(&env, t, &dir, 1) {
                 Ok(r) => {
@@ -517,7 +517,7 @@ mod tests {
         let p = link::profile_named("50k").unwrap_or_else(|| link::profiles().swap_remove(0));
         let w = workload("request", &p);
         let t = super::super::targets::named("h2o-h2").unwrap_or_else(|| super::super::targets::targets().swap_remove(0));
-        let o = ops(&t, "request", &w, None);
+        let o = ops(&t, "request", &w, None, false);
         let sched = o.first().and_then(|o| o.get("schedule_ms")).and_then(Value::as_array).cloned().unwrap_or_default();
         assert_eq!(sched.len() as u64, w.duration_s * 1000 / w.request_ms);
         assert_eq!(sched.get(1).and_then(Value::as_u64), Some(w.request_ms));
