@@ -142,6 +142,15 @@ pub struct Server {
     /// declares it in a new server's config wherever the systemd unit it writes grants it, saying why
     /// (docs/priority.md, "The bare-metal default"). `KILN_RT_REALTIME` overrides it.
     pub realtime: bool,
+    /// Each of the server's shards nudges its CPU while it waits (docs/priority.md, "A nudge for the
+    /// shards"; goal 8, plan 01a1a59c2b29 step 7): its waits end at least every timer tick (100 µs), so
+    /// on a Linux kernel that preempts lazily a shard woken behind a thread busy in user space runs within
+    /// two ticks, not at the kernel's next tick (up to 1 ms at 1000 Hz). Needs no privilege; in the
+    /// real-time class's place where that's refused or not asked for (a shard in it needs no nudge). It
+    /// costs a wake of each waiting shard every period, so it's off until declared (docs/ci.md §0.3,
+    /// "Opt-in automation"); macOS and Windows refuse it, having no lazy preemption. `KILN_RT_NUDGE`
+    /// overrides it, and `KILN_RT_NUDGE_US` sets its period for a lab's A/B.
+    pub nudge: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -450,6 +459,7 @@ impl Default for Server {
             placement: crate::placement::Placement::default(),
             cores: None,
             realtime: false,
+            nudge: false,
         }
     }
 }
@@ -636,6 +646,10 @@ impl Config {
         // `[server] realtime`, as a lab's server takes its settings (`kiln-lab ab --env-b KILN_RT_REALTIME=1`).
         if let Ok(v) = std::env::var("KILN_RT_REALTIME") {
             cfg.server.realtime = !matches!(v.trim(), "0" | "false" | "off" | "no");
+        }
+        // `[server] nudge`, as a lab's server takes its settings (`kiln-lab ab --env-b KILN_RT_NUDGE=1`).
+        if let Ok(v) = std::env::var("KILN_RT_NUDGE") {
+            cfg.server.nudge = !matches!(v.trim(), "0" | "false" | "off" | "no");
         }
         // `[server] placement`, as a lab's server takes its settings (`kiln-lab ab --env-b KILN_RT_PLACEMENT=steal`).
         if let Ok(v) = std::env::var("KILN_RT_PLACEMENT") {
