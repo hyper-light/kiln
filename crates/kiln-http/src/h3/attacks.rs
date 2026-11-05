@@ -519,8 +519,9 @@ fn the_idle_cost_of_a_connection_and_of_a_session() {
 #[test]
 fn long_lived_sessions_settle_to_a_steady_size() {
     // Goal 4 step 10's soak, in memory: admitted sessions that each echo a bidi stream every 15
-    // seconds (inside the 30-second idle timeout) for 30 virtual minutes. What a session holds grows with its first streams (hyper-quic's
-    // tables size up to the streams it has seen at once) and then holds: the minutes print as
+    // seconds (inside the 30-second idle timeout) for 30 virtual minutes. What a session holds
+    // grows with its first streams (hyper-quic keeps each freed stream's state for reuse, up to
+    // the stream limit) and then holds: the minutes print as
     // `soak-in-memory:` so the soak's resident memory can be read against them.
     let Some(mut net) = Net::new(cfg(), Echo, 11) else { return };
     let n = 50usize;
@@ -550,8 +551,11 @@ fn long_lived_sessions_settle_to_a_steady_size() {
         println!("soak-in-memory: minute {minute}: {} B a session beyond its idle size", live / n as i64);
     }
     hyper_measure::alloc::end();
-    let (at5, end) = (lives.get(5).copied().unwrap_or(0), lives.last().copied().unwrap_or(0));
-    println!("soak-in-memory: minute 5 {at5} B, minute 29 {end} B a session");
-    assert!(end <= cfg().bound(true) as i64);
-    assert!(end - at5 <= GROWTH, "a session grew {} B from minute 5 to 29", end - at5);
+    // Four streams a minute: the 65 bidi streams the limit allows are reached by minute 16, and
+    // from there a session holds what it holds (each stream's kept state, `STREAM_STATE`).
+    let (at16, end) = (lives.get(16).copied().unwrap_or(0), lives.last().copied().unwrap_or(0));
+    println!("soak-in-memory: minute 16 {at16} B, minute 29 {end} B a session");
+    let c = cfg();
+    assert!(end <= ((c.post.bidi_streams + c.post.uni_streams) as usize * super::door::STREAM_STATE) as i64, "{end}");
+    assert!(end - at16 <= GROWTH, "a session grew {} B from minute 16 to 29", end - at16);
 }

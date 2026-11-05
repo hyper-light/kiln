@@ -76,8 +76,13 @@ pub struct DoorConfig {
 /// held, its events, what it owes a stream): what [`Connection::held`] is checked against.
 pub const H3_FIXED: usize = 4096;
 
+/// What a stream costs a connection once it has been open, at most: hyper-quic keeps each freed
+/// receive stream's state for reuse, up to the stream limit (measured 368 B a stream by
+/// `attacks::long_lived_sessions_settle_to_a_steady_size`, which settles at the limit).
+pub const STREAM_STATE: usize = 512;
+
 impl DoorConfig {
-    /// The door's defaults: B under 64 KiB before a session.
+    /// The door's defaults: B under 64 KiB before a session (56,320 bytes).
     pub fn door() -> DoorConfig {
         let mut h3 = conn::Config::door();
         let pre = Limits { receive_window: 16 << 10, bidi_streams: 1 + h3.pending_streams as u64, uni_streams: 3 + h3.pending_streams as u64, send_window: 4 << 10 };
@@ -102,11 +107,13 @@ impl DoorConfig {
     /// B: the bytes a connection may hold beyond its idle state, before a session (`post` false)
     /// or after: its receive window, its send window, its datagram buffers (the send buffer only
     /// once it may send), its handshake buffer, the field section and its decode (twice the
-    /// budget: the frame's payload and the decoder's scratch), and the HTTP/3 core's fixed state.
+    /// budget: the frame's payload and the decoder's scratch), the HTTP/3 core's fixed state, and
+    /// each stream the limit allows its kept state.
     pub fn bound(&self, post: bool) -> usize {
         let l = if post { self.post } else { self.pre };
         let datagrams = self.datagram_receive_buffer + if post { self.datagram_send_buffer } else { 0 };
-        l.receive_window as usize + l.send_window as usize + datagrams + self.crypto_buffer + 2 * self.h3.budget.bytes + H3_FIXED
+        let streams = (l.bidi_streams + l.uni_streams) as usize * STREAM_STATE;
+        l.receive_window as usize + l.send_window as usize + datagrams + self.crypto_buffer + 2 * self.h3.budget.bytes + H3_FIXED + streams
     }
 
     /// The transport configuration a connection starts with: every parameter that sizes memory

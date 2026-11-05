@@ -130,9 +130,10 @@ streams of 1.25 MB each), so the door sets every transport parameter that sizes 
 (`DoorConfig::transport`, and a test fails if a default leaks through). A connection with no
 session gets a 16 KiB receive window, 5 bidi and 7 uni streams, a 4 KiB send window; once its
 CONNECT is admitted they're raised (1 MiB, 65 and 67, 1 MiB: goal 5 tunes these). Datagrams
-buffer 8 KiB received, 64 KiB to send; the handshake 8 KiB. B, what a connection may hold beyond
-its idle state, is computed from these (`DoorConfig::bound`): 50,176 bytes before a session,
-2,192,384 after. Connections with no session are capped endpoint-wide (1,000); when the cap is full
+buffer 8 KiB received, 64 KiB to send; the handshake 8 KiB; each stream the limit allows, the
+state hyper-quic keeps for it (512 bytes: 368 measured). B, what a connection may hold beyond its
+idle state, is computed from these (`DoorConfig::bound`): 56,320 bytes before a session, 2,259,968
+after. Connections with no session are capped endpoint-wide (1,000); when the cap is full
 the oldest such connection is closed for the new one, never an admitted session (Slowloris, with
 no new timer); past 64 handshakes at once an unvalidated address gets a Retry. The endpoint's own
 per-address memories (loss bursts, Careful Resume) hold 256 addresses each.
@@ -142,19 +143,19 @@ at 1x, 10x and 100x against one connection and against 1,000 at once; the cells 
 
 | attack | source | bytes a connection, most of any cell | B |
 |---|---|---|---|
-| QPACK count, static and Huffman accordions | FoxIO | 3,512 | 50,176 |
-| many HEADERS frames on one stream | FoxIO on lsquic | 2,496 | 50,176 |
-| encoder-stream inserts, duplicate critical streams | CVE-2026-42530 | ≤ 0 (the connection ends) | 50,176 |
-| trailers, an oversized WT_CLOSE_SESSION | RFC 9114 §4.1, draft-14 §6 | ≤ 0 (the session ends) | 2,192,384 |
-| one unknown capsule of 2^62 bytes, streamed | CVE-2026-57497 | 108 | 2,192,384 |
-| many tiny capsules | RFC 9297 §3.2 | 45 | 2,192,384 |
-| unknown uni streams, pre-session WT streams | RFC 9114 §6.2, draft-14 §4.6 | 4,721 | 50,176 |
-| Rapid Reset, bidi and uni | CVE-2023-44487 | 10,240 | 2,192,384 |
-| every stream the limit allows, held open | RFC 9000 §21.8 | 126,976 | 2,192,384 |
-| STOP_SENDING on the door's streams | RFC 9000 §19.5 | 26,352 | 2,192,384 |
-| one-byte STREAM frames, reordered | RFC 9000 §21.7 | 4,144 | 2,192,384 |
-| datagrams for no session | RFC 9297 §2 | 128 | 50,176 |
-| a CONNECT a byte at a time; sessions kept by PINGs alone | RFC 9000 §21.6 | 471; 0 | 50,176 |
+| QPACK count, static and Huffman accordions | FoxIO | 3,512 | 56,320 |
+| many HEADERS frames on one stream | FoxIO on lsquic | 2,496 | 56,320 |
+| encoder-stream inserts, duplicate critical streams | CVE-2026-42530 | ≤ 0 (the connection ends) | 56,320 |
+| trailers, an oversized WT_CLOSE_SESSION | RFC 9114 §4.1, draft-14 §6 | ≤ 0 (the session ends) | 2,259,968 |
+| one unknown capsule of 2^62 bytes, streamed | CVE-2026-57497 | 108 | 2,259,968 |
+| many tiny capsules | RFC 9297 §3.2 | 45 | 2,259,968 |
+| unknown uni streams, pre-session WT streams | RFC 9114 §6.2, draft-14 §4.6 | 4,721 | 56,320 |
+| Rapid Reset, bidi and uni | CVE-2023-44487 | 10,240 | 2,259,968 |
+| every stream the limit allows, held open | RFC 9000 §21.8 | 126,976 | 2,259,968 |
+| STOP_SENDING on the door's streams | RFC 9000 §19.5 | 26,352 | 2,259,968 |
+| one-byte STREAM frames, reordered | RFC 9000 §21.7 | 4,144 | 2,259,968 |
+| datagrams for no session | RFC 9297 §2 | 128 | 56,320 |
+| a CONNECT a byte at a time; sessions kept by PINGs alone | RFC 9000 §21.6 | 471; 0 | 56,320 |
 
 No cell grew by more than 4 KiB from 10x to 100x (what streams held open cost stops at the
 stream limit). The bytes the door sends to an address not yet validated were at most 0.967 of
