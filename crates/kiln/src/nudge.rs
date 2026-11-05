@@ -1,13 +1,14 @@
-//! The shards' nudge, on by default and paid for only where it buys something (goal 8, plan 01a1a59c2b29 step 7;
-//! goal 6, plan 01a1a59c2abe step 3; docs/priority.md, "A nudge for the shards").
+//! The shards' nudge, off until declared and, declared `auto`, paid for only where it buys something (goal 8, plan
+//! 01a1a59c2b29 step 7; goal 6, plan 01a1a59c2abe step 3; docs/priority.md, "A nudge for the shards").
 //!
 //! On a Linux kernel that preempts lazily (fedora's), a shard woken while another thread runs on its CPU in user
 //! space waits for that CPU's next interrupt, its tick at the latest: wake-2 measured a wake from another CPU at
 //! p99 1.00 ms behind every kind of hog (docs/priority.md, "The kernel's preemption"). A nudged shard's waits in
 //! its driver end every period, so its CPU takes an interrupt of the shard's own at least that often while it
 //! waits, and a held wake runs then (`hyper_rt::compute::nudge_current_thread`, `crate::rt::nudge`). It costs a
-//! wake of the waiting shard each period, which a calm server shouldn't pay. So `[server] nudge = "auto"`, the
-//! default, has each shard nudge only while its host holds its wakes ([`Mode`]):
+//! wake of the waiting shard each period, which a calm server shouldn't pay. So `[server] nudge = "auto"`, the mode
+//! a config declares (the default is off until then: docs/ci.md §0.3, "Opt-in automation"), has each shard nudge only
+//! while its host holds its wakes ([`Mode`]):
 //!
 //! - **What a shard reads**, once a period of its health probe (`crate::shard_health::PERIOD`, 10 ms), on its own
 //!   thread: the kernel's count of how long the thread waited, runnable, for a CPU (the run delay of
@@ -20,9 +21,9 @@
 //!   nudging as calm.
 //! - **Nudging** while a held period was within the last [`LINGER`], and not otherwise: a shard that no other thread
 //!   nor any I/O woke for that long is idle and stops, as does one whose host lets it run again. Nudging, a held
-//!   wake waits at most the nudge's bound (its period and its timer's lateness), about 100 µs on average and past
-//!   [`HELD_NS`], so a shard nudges as long as its host holds it, and the lingering keeps one held now and then
-//!   nudging between.
+//!   wake waits at most the nudge's bound (its period and its timer's lateness, 266.7 µs at kiln's period:
+//!   `crate::rt::nudge_period_ns`), about 130 µs on average and past [`HELD_NS`], so a shard nudges as long as its
+//!   host holds it, and the lingering keeps one held now and then nudging between.
 //! - **A calm server pays nothing for it** but the reading: a calm shard's wakes waited 1.2 µs each (wake-2, no
 //!   hog), well under [`HELD_NS`], as do those of a kernel that preempts at once (adacachy's: a wake interrupts the
 //!   busy CPU), where the nudge would buy nothing.
@@ -42,12 +43,12 @@ use std::time::{Duration, Instant};
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum Mode {
-    /// Never.
+    /// Never: the default, until a config declares another (docs/ci.md §0.3, "Opt-in automation").
+    #[default]
     Off,
     /// Every wait, from the shard's start: train 7's `nudge = true`.
     On,
-    /// While the shard's host holds its wakes (the module's notes): the default.
-    #[default]
+    /// While the shard's host holds its wakes (the module's notes): the mode a config declares.
     Auto,
 }
 
@@ -595,7 +596,8 @@ mod tests {
             anyhow::ensure!(s.nudge == mode, "nudge = {said}: {:?}", s.nudge);
         }
         anyhow::ensure!(toml::from_str::<Server>("nudge = \"sometimes\"").is_err(), "an unknown word is refused");
-        anyhow::ensure!(Mode::default() == Mode::Auto, "auto by default");
+        anyhow::ensure!(Mode::default() == Mode::Off, "off until declared (docs/ci.md §0.3, opt-in automation)");
+        anyhow::ensure!(crate::config::Server::default().nudge == Mode::Off, "a server's config: off until it declares a mode");
         for (v, mode) in [("1", Mode::On), ("true", Mode::On), ("yes please", Mode::On), ("0", Mode::Off), ("off", Mode::Off), ("no", Mode::Off), (" auto ", Mode::Auto)] {
             anyhow::ensure!(Mode::from_env(v) == mode, "KILN_RT_NUDGE={v}");
         }

@@ -1304,7 +1304,7 @@ impl HeldWakes {
 /// it has every one, the calls' sum (`shards.syscalls_per_request`). A park that waits is a system call and a
 /// sleep, and a kick a system call on its sender; a park withdrawn costs neither.
 fn per_request_wakes(n: &mut BTreeMap<String, f64>, before: &Scrape, after: &Scrape, requests: u64) {
-    const FAMILIES: [(&str, &str, &[(&str, &str)]); 20] = [
+    const FAMILIES: [(&str, &str, &[(&str, &str)]); 23] = [
         ("steps", "kiln_shard_steps_total", &[]),
         ("polls", "kiln_shard_polls_total", &[]),
         ("parks", "kiln_shard_parks_total", &[]),
@@ -1325,6 +1325,11 @@ fn per_request_wakes(n: &mut BTreeMap<String, f64>, before: &Scrape, after: &Scr
         ("socket_writes", "kiln_shard_socket_calls_total", &[("call", "write")]),
         ("socket_reads_empty", "kiln_shard_socket_calls_idle_total", &[("call", "read")]),
         ("socket_writes_full", "kiln_shard_socket_calls_idle_total", &[("call", "write")]),
+        // The spin before a park, where the server was asked for one (goal 9, plan 01a1a87b2cec step 4): its spins,
+        // those that found work (a park, its wake and a kick saved each), and the seconds they spun, the CPU it cost.
+        ("spins", "kiln_shard_spins_total", &[]),
+        ("spin_hits", "kiln_shard_spin_hits_total", &[]),
+        ("spin_seconds", "kiln_shard_spin_seconds_total", &[]),
     ];
     // Each of these a system call on a shard: their sum is what a request costs the shards in calls into the
     // kernel, as counted (docs/runtime-lab.md says what isn't).
@@ -1600,6 +1605,33 @@ mod tests {
         let mut none = BTreeMap::new();
         per_request_wakes(&mut none, &scrape(1.0), &scrape(2.0), 0);
         assert!(none.is_empty(), "no requests, no per-request numbers: {none:?}");
+    }
+
+    /// Goal 9, plan 01a1a87b2cec step 4: what a spin before each park did is reported per request where the build counts
+    /// it, its spins, its hits and the seconds it spun, summed over the shards; a build without it reports none (and the
+    /// spin isn't among the system calls: no call is made to spin).
+    #[test]
+    fn g9_s4_the_shards_spins_before_their_parks_are_reported_per_request() {
+        let scrape = |k: f64| {
+            let mut t = String::new();
+            for sh in ["0", "1"] {
+                t.push_str(&format!("kiln_shard_polls_total{{shard=\"{sh}\"}} {}\n", 30.0 * k));
+                t.push_str(&format!("kiln_shard_spins_total{{shard=\"{sh}\"}} {}\n", 8.0 * k));
+                t.push_str(&format!("kiln_shard_spin_hits_total{{shard=\"{sh}\"}} {}\n", 3.0 * k));
+                t.push_str(&format!("kiln_shard_spin_seconds_total{{shard=\"{sh}\"}} {}\n", 0.0001 * k));
+            }
+            measure::Scrape::parse(&t)
+        };
+        let mut n = BTreeMap::new();
+        per_request_wakes(&mut n, &scrape(1.0), &scrape(2.0), 10);
+        for (key, want) in [("spins", 1.6), ("spin_hits", 0.6), ("spin_seconds", 0.00002)] {
+            let got = n.get(&format!("shards.{key}_per_request")).copied();
+            assert!(got.is_some_and(|v| (v - want).abs() < 1e-12), "{key}: {got:?}, want {want}");
+        }
+        let mut without = BTreeMap::new();
+        let polls = |k: f64| measure::Scrape::parse(&format!("kiln_shard_polls_total{{shard=\"0\"}} {}\n", 30.0 * k));
+        per_request_wakes(&mut without, &polls(1.0), &polls(2.0), 10);
+        assert!(!without.contains_key("shards.spins_per_request"), "{without:?}");
     }
 
     /// Goal 9, plan 01a1a87b2cec step 5: where the build counts every kind of system call a shard makes, a request's

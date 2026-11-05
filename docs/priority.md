@@ -374,28 +374,38 @@ cores. If the class doesn't beat weights alone there, the default goes back to o
 
 `[server] nudge` is what a shard has in the real-time class's place where that's refused, needing no privilege
 (goal 8, plan `01a1a59c2b29` step 7; goal 6, plan `01a1a59c2abe` step 3; `hyper_rt::compute::nudge_current_thread`,
-`crate::nudge`). `"auto"` is the server's default; `"on"` (or `true`, as it was before it had a mode) and `"off"`
-(or `false`) are the others. `KILN_RT_NUDGE` overrides it (`auto`, `on`, `off`; any other value is on, as the flag
-read it), and `KILN_RT_NUDGE_US` sets its period for a lab's A/B.
+`crate::nudge`). It's off until declared (docs/ci.md §0.3, "Opt-in automation"): `"off"` (or `false`) is the
+default; `"auto"` is the mode a config declares, and `"on"` (or `true`, as it was before it had a mode) the other.
+`KILN_RT_NUDGE` overrides it (`auto`, `on`, `off`; any other value is on, as the flag read it), and
+`KILN_RT_NUDGE_US` sets its period for a lab's A/B.
 
-- **What a nudge is.** A nudged shard's waits in its driver end by the timers' tick (100 µs), so with its timer
-  slack (the tick too) its CPU takes an interrupt of the shard's own at least every 200 µs while it waits. Under
-  `lazy` a wake marks the busy thread and sends no interrupt, and the CPU switches as that thread next returns to
-  user space from the kernel: the shard's own timer is such a return. A shard woken behind a thread spinning in
-  user space then runs within two ticks, as late as a timer of its own may be, instead of at the kernel's next
-  tick (up to 1 ms at 1000 Hz). Nothing a normal thread may set makes the wake itself preempt at once
-  (docs/runtime-lab.md, "Goal 8 step 7 and goal 9 step 4", reads the kernel for why).
-- **Its period, from what wake-2 measured.** A held wake waits at most the period and the lateness of the shard's
+- **What a nudge is.** A nudged shard's waits in its driver end by its period, the step quantum less the timers'
+  tick (166.7 µs; goal 9, plan `01a1a87b2cec` step 4: `crate::rt::nudge_period_ns`), so with its timer slack (that
+  tick) its CPU takes an interrupt of the shard's own at least every quantum, 266.7 µs, while it waits: the host's
+  share of a ready task's delay in the quantum's derivation. Under `lazy` a wake marks the busy thread and sends no
+  interrupt, and the CPU switches as that thread next returns to user space from the kernel: the shard's own timer
+  is such a return. A shard woken behind a thread spinning in user space then runs within about a quantum, instead
+  of at the kernel's next tick (up to 1 ms at 1000 Hz). Nothing a normal thread may set makes the wake itself
+  preempt at once (docs/runtime-lab.md, "Goal 8 step 7 and goal 9 step 4", reads the kernel for why).
+- **Its period, and what wake-2 measured.** A held wake waits at most the period and the lateness of the shard's
   own timer. wake-2 measured that lateness behind each kind of hog: a thread's timer woke it within 57.8 µs of
   due at p99 behind spinning hogs (its slack 50 µs), and within 80 to 129 µs behind compilers and hogs that enter
   the kernel, where it asked for a slice of its own as kiln's shards do (without one, 394 to 641 µs). So at the
-  tick a held wake waits about 160 to 230 µs at the most, the floor every ready timer of a shard pays by design
-  (two ticks, `DELAY_FLOOR_NS`), against up to the 1 ms tick unnudged (wake-2: p99 1.00 ms with every kind of
-  hog). A longer period buys fewer wakes at a later bound; a shorter one, a bound under a floor no ready work
-  of the shard is held to anyway.
+  derived period a held wake waits about 225 to 296 µs at the most, about the quantum the delay bar's derivation
+  leaves the host, against up to the 1 ms tick unnudged (wake-2: p99 1.00 ms with every kind of hog); at the
+  timers' tick, the period until goal 9 step 4, about 160 to 230 µs, the floor every ready timer of a shard pays
+  by design (two ticks, `DELAY_FLOOR_NS`), for a third again as many wakes. A longer period buys fewer wakes at a
+  later bound; a shorter one, a bound under a floor no ready work of the shard is held to anyway. The lab's A/B of
+  the two decides (docs/runtime-lab.md, "The A/B of the wake path": `nudge-on-hogs` against `nudge100-hogs`).
 - **`on`'s cost.** A waiting shard wakes once a period, a park and a turn of its loop, CPU it spends and the
   threads beside it lose; and while a shard waits its CPU can't reach the deeper idle states. A calm server
   pays that for nothing.
+- **What the lab found of `on`** (docs/runtime-lab.md, "The nudge's A/B"; 2026-11-05, at the timers' tick): with
+  hogs it gave back most of what a lazy wake costs a request (API reads' wait for their shard at p99.9 from 1.53 to
+  0.60 ms, their median from 0.63 to 0.24 ms), but not goal 9 step 4's bar (the shards' delay p99.9 2.98 to
+  2.19 ms, the same within noise), at a busy share 27% higher. So `on` isn't the bare-metal default: it needs no
+  grant, but it doesn't make the bar, it costs what goal 9 step 5 cuts, and production's kernel preempts fully,
+  where it would only cost.
 - **`auto`: only while the host holds the shard's wakes.** Once a period of its health probe (10 ms), on its own
   thread, each shard reads the kernel's count of how long its thread waited, runnable, for a CPU (Linux's run
   delay, `/proc/thread-self/schedstat`, a file kept open: one read), and its parks by what ended them. The
@@ -407,8 +417,9 @@ read it), and `KILN_RT_NUDGE_US` sets its period for a lab's A/B.
   sessions' work alone 200 to 223), a factor of 3.9 from each. A shard nudges while a held period was within the
   last tolerance (1 s, the interval `crate::overload` judges a queue over), so one held now and then nudges
   between; it stops a tolerance after its host lets it run, and a shard nothing but its own timers woke for a
-  tolerance is idle and stops too. Nudging, its held wakes still read held (they wait about 100 µs on average,
-  and its own timers' wakes on a busy CPU wait past 0.7 µs each), so it goes on as long as its host holds it.
+  tolerance is idle and stops too. Nudging, its held wakes still read held (they wait about 130 µs on average,
+  half the nudge's bound at its period, and its own timers' wakes on a busy CPU wait past 0.7 µs each), so it goes
+  on as long as its host holds it.
 - **A calm server pays nothing for it** but the reading, a file read each period on each shard: a calm shard's
   wakes waited 1.2 µs each in wake-2, well under 17.2 µs, as do those of a kernel that preempts fully
   (production's), where a wake interrupts the busy CPU at once and a nudge would buy nothing. On fedora, where
@@ -425,8 +436,10 @@ read it), and `KILN_RT_NUDGE_US` sets its period for a lab's A/B.
 - **macOS and Windows** refuse it, saying why: they have no lazy preemption to bound. A Linux kernel that keeps no
   thread's wait for a CPU (no `CONFIG_SCHED_INFO`) refuses `auto`, saying why; `on` works there. `auto` judges
   at its shards' probes, so a server whose probes are off (`KILN_SHARD_PROBE_MS=0`) never nudges on its own.
-- **If the lab shows `auto` costs a calm server beyond noise** (docs/runtime-lab.md, "Goal 6 step 3 and goal 8
-  step 7: the nudge on its own"), the default goes back to `off` (`Config::default`'s `nudge`).
+- **Off until declared.** What kiln decides on its own is off until declared (docs/ci.md §0.3, "Opt-in
+  automation"), so `Config::default`'s `nudge` is `off` and `auto` is the mode a config declares. The lab's A/B
+  (docs/runtime-lab.md, "Goal 6 step 3 and goal 8 step 7: the nudge on its own") says what `auto` costs a calm
+  server and buys beside hogs, for whoever declares it.
 
 ## Critical's own path
 
@@ -456,6 +469,31 @@ What a person's page, sign-in or action and a health check wait for besides thei
 - **Not yet:** the compute pool's line is first come, first served (a sign-in's Argon2 check waited there with
   the rest: 37 ms at p99 with hogs in g9p7); and a sign-in, like a person's action that writes, waits for
   kiln.db's writer, whose line is the store's group commit's to shorten.
+
+## A spin before the park
+
+`KILN_RT_SPIN=1` (the lab's to ask for, off otherwise; goal 9, plan `01a1a87b2cec` step 4; `hyper_rt::park_spin`)
+has each of the server's shards spin before each park as long as its own idle gaps make cheapest in CPU, up to
+16 µs; `KILN_RT_SPIN_US` has it spin a fixed time whatever it costs, the lab's measure of what a longer spin buys:
+
+- A shard still spinning when its work comes is never woken: its senders find it running and skip their kicks, and
+  the work runs at once, where a park's wake would wait, on a kernel that preempts lazily, for its CPU's next
+  interrupt behind a thread busy there (up to a tick).
+- Each window of 385 idle moments, the spin becomes the one of 0, 1, 2, 4, 8 and 16 µs that would have spent the
+  least of the shard's CPU on them: a gap the spin catches costs the spin to it, one it misses the whole spin and
+  the park after it, whose CPU the shard learns from its own parks (its task clock, no system call) and its
+  senders' kicks. A gap a kick ended runs to the kick's stamp, not to the park's return, which adds the wake's own
+  latency. So it spins only where, on the last window's gaps, spinning cost less CPU than parking at once: the busy
+  share goal 9 step 5 holds the shards to can only fall by it.
+- Its spins, their hits, the time they spun and the spin in force are on `/metrics` (`kiln_shard_spins_total`,
+  `kiln_shard_spin_hits_total`, `kiln_shard_spin_seconds_total`, `kiln_shard_spin_window_seconds`), and what was
+  asked in `/healthz/server` (`priority.spin`); the log says it once every shard has taken it.
+- **What it can't do.** It catches only gaps under 16 µs: work a shard waits on longer (a request from another
+  CPU, most jobs on the pools) still wakes it, and that wait is the nudge's to bound. At the lab's rate of parks a
+  16 µs spin that missed every gap would cost 1.9% of a CPU a shard, three times goal 9 step 5's bar with hogs on
+  its own (docs/runtime-lab.md, "The shard's own wake path"), so only the sized spin is a candidate default, and
+  only where the lab's A/B finds it buys a number for no busy share. macOS and Windows take it as Linux does; only
+  Linux's shards learn a park's CPU on a task clock, so elsewhere a sized spin stays at none.
 
 ## Step 7's lab
 
@@ -791,3 +829,14 @@ kiln-server alarm at 204 s, so cut no CPU. headroom.md's "Simulation" runs this 
   gives a partition's cores back. `os::tests::g9_s4_legs_and_agents_in_a_partition_keep_off_the_shards_cores`,
   `os::tests::g9_s4_the_real_time_room_is_given_up_whole` (Linux: a process's `RLIMIT_RTPRIO` to 0, soft and
   hard, read back from `/proc`), `os::cgroup::tests::g9_s4_the_partition_a_server_runs_in`.
+- Goal 9, plan `01a1a87b2cec` step 4, the shard's own wake path: kiln-rt's `park_spin::tests` (the cap a park
+  bound past the cheapest wake, the window's share to five points; long gaps or free parks never spin; the spin the
+  cheapest in CPU on the window's gaps, worked by hand; the chosen spin never costing more than parking, over a
+  spread of gaps and park costs; a sized spin sizing itself from hits and parks, a kicked park's gap to its stamp;
+  stale stamps, withdrawn parks and an unmeasured park cost; fixed and off spins, a new ask; only a shard may ask)
+  and `shard_loop::park_spin_loop` (in the loop: no spin asked, none made; a fixed spin running out and the park
+  after it, or finding a wake at once with no park; a sized spin counting each park's gap and learning a park's
+  CPU where the shard has a task clock). `rt::tests::g9_s4_the_nudge_s_period_is_the_quantum_less_the_timers_slack`,
+  `g9_s4_the_spin_before_a_park_is_the_labs_to_ask_for`, `g9_s4_the_spin_is_said_as_the_shards_took_it`;
+  `shard_health::tests::g9_s4_each_shards_spins_before_its_parks_are_on_metrics`; kiln-lab's
+  `lab::tests::g9_s4_the_shards_spins_before_their_parks_are_reported_per_request`.
