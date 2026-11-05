@@ -89,6 +89,8 @@ test("w21_r15 with ship frames, a pushed commit reaches the row in place and bus
     await opened(page);
     seen.start();
     await page.waitForTimeout(WINDOW_MS);
+    // A loaded host's window may hold fewer of CI's events: what's checked is that they load the lists.
+    await expect.poll(() => seen.count.requests, { message: "without frames, CI's events load the lists again", timeout: 30_000 }).toBeGreaterThan(2);
     const before = seen.stop();
     // After: the server's frames.
     await page.request.post("/api/mock/ship/events?on=1");
@@ -97,7 +99,6 @@ test("w21_r15 with ship frames, a pushed commit reaches the row in place and bus
     await page.waitForTimeout(WINDOW_MS);
     const after = seen.stop();
     console.log(`ship over ${WINDOW_MS / 1000} s, CI busy: before ${JSON.stringify(before)}; after ${JSON.stringify(after)}`);
-    expect(before.requests, "without frames, CI's events load the lists again").toBeGreaterThan(2);
     // The poll (15 s) may fall in the window, once for each list shown.
     expect(after.requests, "with frames, no list loads on CI's events").toBeLessThanOrEqual(3);
     // A commit pushed: kiln's row (closed, so it doesn't hold its commit for you) shows it, without a load.
