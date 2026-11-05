@@ -3303,7 +3303,7 @@ async fn job_log_times(hub: &Hub, id: &str, q: &HashMap<String, String>) -> R {
 
 fn job_logs_ws(hub: Arc<Hub>, job: String, step: u32, req: Request) -> R {
     let sock = ui::Socket::of(Wire::LogUp, Wire::LogDown, &caller_name(&req), None);
-    let (resp, upgrade) = ws::accept(req).map_err(|r| ApiError(r.status, r.reason.into()))?;
+    let (resp, upgrade) = ws::accept_commands(req).map_err(|r| ApiError(r.status, r.reason.into()))?;
     crate::rt::spawn(async move {
         match upgrade.await {
             Ok(socket) => {
@@ -4972,7 +4972,7 @@ impl Narrow {
 
 fn events_ws(hub: Arc<Hub>, req: Request, narrow: Option<Narrow>, agents: Option<AgentsSeen>) -> R {
     let sock = ui::Socket::of(Wire::EventsUp, Wire::EventsDown, &caller_name(&req), None);
-    let (resp, upgrade) = ws::accept(req).map_err(|r| ApiError(r.status, r.reason.into()))?;
+    let (resp, upgrade) = ws::accept_commands(req).map_err(|r| ApiError(r.status, r.reason.into()))?;
     crate::rt::spawn(async move {
         let Ok(socket) = upgrade.await else { return };
         let m = crate::metrics::global();
@@ -5158,7 +5158,7 @@ async fn terminal_ws(hub: Arc<Hub>, q: HashMap<String, String>, req: Request) ->
     // What it can't read shows on the page of the runner it's on.
     let on = existing.as_deref().and_then(|s| hub.terminals.get(s)).map_or_else(|| target.clone(), |t| t.target.clone());
     let sock = ui::Socket::of(Wire::TerminalUp, Wire::TerminalDown, &caller_name(&req), terminal_page(&on));
-    let (resp, upgrade) = ws::accept(req).map_err(|r| ApiError(r.status, r.reason.into()))?;
+    let (resp, upgrade) = ws::accept_commands(req).map_err(|r| ApiError(r.status, r.reason.into()))?;
     let cols = q.get("cols").and_then(|v| v.parse().ok()).unwrap_or(120);
     let rows = q.get("rows").and_then(|v| v.parse().ok()).unwrap_or(40);
     let cmd = q.get("cmd").cloned();
@@ -5201,7 +5201,7 @@ async fn leg_terminal_ws(hub: Arc<Hub>, id: &str, q: HashMap<String, String>, ca
     if existing.is_none() && hub.terminals.live() >= hub.cfg.terminal.max_sessions {
         return Err(err(StatusCode::TOO_MANY_REQUESTS, "too many terminal sessions"));
     }
-    let (resp, upgrade) = ws::accept(req).map_err(|r| ApiError(r.status, r.reason.into()))?;
+    let (resp, upgrade) = ws::accept_commands(req).map_err(|r| ApiError(r.status, r.reason.into()))?;
     let cols = q.get("cols").and_then(|v| v.parse().ok()).unwrap_or(120);
     let rows = q.get("rows").and_then(|v| v.parse().ok()).unwrap_or(40);
     let sock = ui::Socket::of(Wire::TerminalUp, Wire::TerminalDown, &caller.name, Some(Page::Runner(agent.clone())));
