@@ -244,7 +244,7 @@ pub struct Engine {
     runs: HashMap<String, Run>,
     /// Shares in force, and what they were decided from (they change only when that does).
     shares: Vec<Pace>,
-    decided_from: Option<(Option<u64>, Option<u64>, Vec<String>)>,
+    decided_from: Option<(Option<u64>, Option<u64>, Vec<(String, Class)>)>,
     /// The most delivered during the trouble under way.
     trouble_bps: Option<f64>,
     /// The trouble under way, from when it began.
@@ -533,7 +533,9 @@ impl Engine {
         let cpu_budget = self.learned.cpu_knee.budget;
 
         // Shares: decided again only when the budget or the work running changed.
-        let mut ids: Vec<String> = o.running.iter().map(|g| g.id.clone()).collect();
+        // Each group's class too: a session that becomes a person's (something waits to reach its
+        // harness: kiln's headroom/messages.rs) is let go at once, not at the next change of budget.
+        let mut ids: Vec<(String, Class)> = o.running.iter().map(|g| (g.id.clone(), g.class)).collect();
         ids.sort();
         let from = (budget.map(f64::to_bits), cpu_budget.map(f64::to_bits), ids);
         if self.decided_from.as_ref() != Some(&from) {
@@ -956,6 +958,41 @@ mod tests {
             least = (least.0.min(p.status.budget_bps.unwrap_or(f64::INFINITY)), least.1.min(p.status.cpu_budget.unwrap_or(f64::INFINITY)));
         }
         anyhow::ensure!(least.0 >= 1e6 && least.1 >= 1.0, "cut below the least: {least:?}");
+        Ok(())
+    }
+
+    /// A session whose harness has something waiting for it is a person's while it waits (kiln's
+    /// headroom/messages.rs): its share goes to all of it on the very next look, the budget
+    /// unchanged, and back to its pace once nothing waits.
+    #[test]
+    fn a_session_with_a_message_waiting_runs_unpaced_at_once() -> anyhow::Result<()> {
+        let mut e = engine();
+        let at = |t: u64, us: f64, class: Class| Observation {
+            now_us: t,
+            answers: vec![("disk".into(), Answer::Took(us))],
+            mem_free: 1e11,
+            running: vec![Group { cpu_cores: 4.0, class, ..group("s1", 50e6, 1.0) }, Group { cpu_cores: 4.0, ..group("s2", 50e6, 1.0) }],
+            cores: Some(10.0),
+            ..Observation::default()
+        };
+        let mut t = 0;
+        for _ in 0..100 {
+            t += 1_000_000;
+            e.step(&at(t, 4_000.0, Class::Agent));
+        }
+        t += 1_000_000;
+        let p = e.step(&at(t, 1e6, Class::Agent));
+        let share = |p: &Plan, id: &str| p.shares.iter().find(|s| s.id == id).map_or(1.0, |s| s.share);
+        anyhow::ensure!(share(&p, "s1") < 1.0, "harm paces the session: {:?}", p.shares);
+        let budgets = (p.status.budget_bps, p.status.cpu_budget);
+        t += 1_000_000;
+        let p = e.step(&at(t, 1e6, Class::Person));
+        anyhow::ensure!((p.status.budget_bps, p.status.cpu_budget) == budgets, "the budget changed: {:?}", p.events);
+        anyhow::ensure!(share(&p, "s1") >= 1.0, "a message waits, yet the session is paced: {:?}", p.shares);
+        anyhow::ensure!(share(&p, "s2") < 1.0, "the session beside it is let go too: {:?}", p.shares);
+        t += 1_000_000;
+        let p = e.step(&at(t, 1e6, Class::Agent));
+        anyhow::ensure!(share(&p, "s1") < 1.0, "taken, it's paced again: {:?}", p.shares);
         Ok(())
     }
 
