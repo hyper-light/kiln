@@ -1295,6 +1295,13 @@ async fn own(mut shard: Shard, rx: async_channel::Receiver<Msg>, hub: Arc<OnceLo
             shard.take(msg, h.as_ref());
         }
         drop(h);
+        // The conversation store over its bound holds this owner back before it takes more (goal 11, plan
+        // 01a1a87b2e56 step 3): the updates it would take wait in its inbox, and those behind them upstream,
+        // rather than their rows piling up in the store's queue. The owner's task waits; its shard's thread
+        // goes on with its other tasks.
+        if let Some(store) = hub.get().and_then(Weak::upgrade).and_then(|h| h.harness.convo.clone()) {
+            store.room().await;
+        }
         turns.after().await;
     }
 }
