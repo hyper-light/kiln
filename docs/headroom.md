@@ -52,6 +52,12 @@ between the highest level held calm and the lowest level trouble began at. Where
 what its disks write (Linux), what they delivered while trouble last showed is all they take, and
 the write budget is never raised past it less what others write.
 
+**Cutting only what's short.** kiln's CPU is cut for trouble only while the CPU is short: no core
+of the machine idle to within the pacer's step (all processes counted), or a target in trouble
+measures how late work is scheduled itself (the server's delay). With cores idle, cutting kiln's
+CPU can't speed a disk's probe or a harness up. On 2026-11-05 a Mac's agents were held to 1 core of
+18, with 8 idle, for an fsync that slowed.
+
 **Agent messages.** Whether messages get through to the runner's agents is a target too, kiln's
 own on every runner (`headroom/messages.rs`), and the same for every harness: Claude Code, Codex,
 each ACP agent (Devin, Gemini, Goose, Amp…), Antigravity, and whatever comes next. It isn't probed.
