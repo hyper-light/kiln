@@ -509,7 +509,7 @@ impl Handle {
 pub fn start(cfg: Config) -> anyhow::Result<(Handle, async_channel::Receiver<AgentMsg>)> {
     let identity = Identity::load_or_create(&cfg.dir, &cfg.name)?;
     let pins = Pins::open(&cfg.dir);
-    let announce = Announce { fingerprint: identity.fingerprint.clone(), accept: cfg.accept, version: wire::VERSION, features: [crate::proto::feature::all(), super::history::features()].concat() };
+    let announce = Announce { fingerprint: identity.fingerprint.clone(), accept: cfg.accept, version: wire::VERSION, features: crate::proto::feature::all() };
     let (net_tx, net_rx) = async_channel::unbounded::<In>();
     let (tx, rx) = async_channel::bounded::<In>(1024);
     // Unbounded too: the node must never wait on the agent while the agent feeds it.

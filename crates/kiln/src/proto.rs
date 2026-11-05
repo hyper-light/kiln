@@ -677,9 +677,9 @@ pub mod feature {
     /// runner whose announce lists this may be sent `Ask::Features` on a link.
     pub const LINK_FEATURES: &str = "link-features";
 
-    /// Hints of runners' admission state for the server's offers view (lb/offers-ui): a runner
-    /// that says it sends [`super::AgentMsg::Offers`], a server that says it reads them. Said once
-    /// both sides are built (runner: lb/core; server: lb/offers-ui).
+    /// Hints of runners' admission state (docs/needs.md E5, AUDIT O1): a runner that says it
+    /// sends [`super::AgentMsg::Offers`] when its admission's state changes as a decision sees it,
+    /// a server that says it reads them (the offers view) and passes them to the owners asking.
     pub const OFFERS: &str = "offers";
     /// News of queued and started runs to the asking agent (lb/told; it replaces the bit 58 its
     /// branch had).
@@ -688,7 +688,7 @@ pub mod feature {
     pub const SIZES: &str = "reach.sizes";
 
     /// Every name this build speaks, in the order it says them.
-    pub const ALL: &[&str] = &[PLACE, LINK_FEATURES];
+    pub const ALL: &[&str] = &[PLACE, LINK_FEATURES, OFFERS, TOLD, SIZES];
 
     /// [`ALL`], as a message carries them.
     pub fn all() -> Vec<String> {
@@ -1705,22 +1705,32 @@ mod tests {
         }
         // Reach links' own (docs/wire.md, "Named features"): after the twelve every runner reads.
         use crate::reach::wire::{ASK_VARIANTS, Ask, SAY_VARIANTS, Say};
-        let links: [(&str, &str, u8, Vec<u8>); 4] = [
+        let links: [(&str, &str, u8, Vec<u8>); 6] = [
             ("Ask", "Features", 12, postcard::to_allocvec(&Ask::Features { names: names.clone() })?),
             ("Ask", "Place", 13, postcard::to_allocvec(&Ask::Place { json: String::new() })?),
+            ("Ask", "RunWith", 14, postcard::to_allocvec(&Ask::RunWith { spec: Box::default(), with: String::new() })?),
             ("Say", "Features", 12, postcard::to_allocvec(&Say::Features { names: names.clone() })?),
             ("Say", "Place", 13, postcard::to_allocvec(&Say::Place { json: String::new() })?),
+            ("Say", "Used", 14, postcard::to_allocvec(&Say::Used { id: 1, used: String::new() })?),
         ];
         for (side, name, idx, b) in links {
             assert_eq!(b.first(), Some(&idx), "{side}::{name}");
             assert!(registry.contains(&format!("| `reach::wire::{side}` | {idx} | `{name}` |")), "the registry has no row for {side}::{name}");
         }
-        assert_eq!((ASK_VARIANTS, SAY_VARIANTS), (14, 14));
-        // Every name is said once, and a side speaks one only if the other named it.
+        assert_eq!((ASK_VARIANTS, SAY_VARIANTS), (15, 15));
+        // Every name is said once, each said in the doc's list of names, and a side speaks one
+        // only if the other named it.
         let mut all = feature::ALL.to_vec();
         all.sort_unstable();
         all.dedup();
         assert_eq!(all.len(), feature::ALL.len(), "a feature named twice");
+        let named = doc.split("- **Names.**").nth(1).and_then(|n| n.split("\n\n").next()).unwrap_or_default();
+        for name in feature::ALL {
+            assert!(named.contains(&format!("`{name}`:")), "docs/wire.md's list of names doesn't say what `{name}` means");
+        }
+        for name in [feature::OFFERS, feature::TOLD, feature::SIZES] {
+            assert!(feature::speaks(&names, name), "this build speaks {name}");
+        }
         assert!(feature::speaks(&names, feature::LINK_FEATURES) && !feature::speaks(&[], feature::LINK_FEATURES));
         Ok(())
     }

@@ -3864,6 +3864,7 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                     // The features the server speaks by name (docs/wire.md): each says them all.
                     ServerMsg::Features { names } => {
                         tracing::debug!(?names, "the server speaks these features");
+                        crate::reach::told::server_features(&names);
                         server_features = names;
                     }
                     // From an epoch older than the newest this runner has seen (W05-R37): not applied.

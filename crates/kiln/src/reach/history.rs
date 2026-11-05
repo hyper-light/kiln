@@ -41,9 +41,8 @@ use super::wire::RunSpec;
 
 /// What a runner names in its reach announcement (`Announce.features`, docs/wire.md "Named
 /// features") when it takes [`super::wire::Ask::RunWith`] and says [`super::wire::Say::Used`].
-/// TODO(lb/core): lb/core registered it as `crate::proto::feature::SIZES` (uncommitted on
-/// 2026-11-05); use that constant once it's on lb/core.
-pub const FEATURE: &str = "reach.sizes";
+/// Registered as `proto::feature::SIZES`, in `proto::feature::ALL`.
+pub const FEATURE: &str = crate::proto::feature::SIZES;
 
 /// How the note begins that says a run goes again at its ask (`[reach] retry_oom`): what came
 /// before it was the try that was killed (`super::reuse` keeps only what comes after, audit H6).
