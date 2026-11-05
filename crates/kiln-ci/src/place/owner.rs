@@ -14,7 +14,9 @@
 //!   of its own. Which runners suit an ask is worked out once per kind of ask while the directory
 //!   stands (Borg's equivalence classes, Verma et al., EuroSys 2015), so an ask costs O(d), not
 //!   O(N). A run is probed further, d more, only when every runner probed said never or its link
-//!   went down: one that says it waits keeps the run in its line, with news.
+//!   went down: one that says it waits keeps the run in its line, with news. When every runner
+//!   probed says it waits, d more are drawn among the runners whose published room ([`Owner::hint`],
+//!   the `offers` named feature) shows room for it, and only those: by data, not a count picked.
 //! - **Offered**: the first offer is held while the other runners probed answer, for at most the
 //!   offering link's retransmission timeout less its round trip (RFC 6298: the runner holds its
 //!   offer one RTO from when it sent it, so a take sent later than that, less the round trip,
@@ -260,6 +262,15 @@ impl Ticket {
         self.stage == Stage::Waiting && !self.words.iter().any(|(_, w)| w.live())
     }
 
+    /// Every runner probed said it waits there, or can't take it: none offered, none passed, none
+    /// still to answer, one at least waiting.
+    fn full(&self) -> bool {
+        self.stage == Stage::Waiting
+            && self.offers.is_empty()
+            && self.words.iter().any(|(_, w)| matches!(w, Word::Waiting { .. }))
+            && self.words.iter().all(|(_, w)| matches!(w, Word::Waiting { .. } | Word::Never(_) | Word::Away))
+    }
+
     /// Waiting at fewer than [`PROBES`] runners that may yet start it (some were away as it was
     /// drawn).
     fn short(&self) -> bool {
@@ -271,6 +282,10 @@ impl Ticket {
 /// tickets with a word or a claim there.
 #[derive(Debug, Clone, Default)]
 struct Slot {
+    /// Its latest published room (the `offers` named feature): by its count, and what was free.
+    hint: Option<(u64, Resources)>,
+    /// Its place in `roomy`, while its hint shows room.
+    roomy_at: Option<u32>,
     machine: Option<Machine>,
     link: Link,
     at: BTreeSet<Tid>,
@@ -295,6 +310,8 @@ pub struct Owner {
     due: BTreeSet<(i64, Tid)>,
     choose: BTreeSet<(i64, Tid)>,
     draw: Vec<u32>,
+    /// The runners whose latest hint shows any room, in no order (each knows its place).
+    roomy: Vec<Rid>,
 }
 
 /// Why `m` could never run `ask` as asked, if that's known: a constraint it doesn't meet (in the
@@ -461,9 +478,15 @@ impl Owner {
         Rtt::rto_of(self.rtt(r))
     }
 
-    /// How long an offer from `r` is held while the others probed answer: its link's timeout less
-    /// its round trip, so a take sent by then reaches the runner within the timeout it holds the
-    /// offer for (RFC 6298's variation term, `max(G, 4·RTTVAR)`; the initial second, unmeasured).
+    /// How long an offer from `r` is held while the others probed answer: its link's RTO less its
+    /// SRTT (RFC 6298 §2), which follows from both ends' clocks, not a number picked. The runner
+    /// holds an offer one RTO from when it sends it (`runner::Admission::offer`), by its own clock.
+    /// The offer reaches this node one way later, and a take sent at `hold` after that reaches the
+    /// runner a second way later: the take is in time when `one way + hold + one way <= RTO`, that
+    /// is `hold <= RTO − RTT`. The round trip's best estimate is SRTT, so `hold = RTO − SRTT =
+    /// max(G, 4·RTTVAR)`: the variation term RFC 6298 adds for a late answer is the time left to
+    /// wait. Unmeasured, SRTT is unknown and taken as 0, leaving the initial RTO (§2.1, 1 s) at both
+    /// ends.
     fn hold(&self, r: Rid) -> Ms {
         self.rto(r).saturating_sub(self.rtt(r).map_or(0, |x| x.srtt))
     }
@@ -760,8 +783,45 @@ impl Owner {
         }
         if tk.hungry() {
             self.widen(t, out);
+        } else if tk.full() {
+            self.widen_by_hints(t, out);
         }
         self.heard_of(t, out);
+    }
+
+    /// Every runner probed for `t` said it waits there (and none offered or is still to answer):
+    /// it's probed at up to [`PROBES`] more, drawn at random among the runners whose latest hint
+    /// shows room for it, and only those; none does, it waits where it is. Drawn at random, not the
+    /// emptiest by hint: hints are old by the time they're read, and owners reading the same ones
+    /// would all go to the same runner (Mitzenmacher, "How useful is old information?", IEEE TPDS
+    /// 2000: with stale load information, choices at random among the few do better than the least
+    /// loaded).
+    fn widen_by_hints(&mut self, t: Tid, out: &mut Vec<Act>) -> usize {
+        let Some(ask) = self.t(t).map(|tk| Arc::clone(&tk.ask)) else { return 0 };
+        let suit = self.suit(&ask);
+        let q = super::ask::amounts(&ask.needs.request);
+        // A partial Fisher–Yates over the runners hinting room: each drawn at random, looked at
+        // once, until d fit (O(d / the share that fits): O(d) when most do, all of them only when
+        // few do).
+        let mut picked: Vec<Rid> = Vec::new();
+        let n = self.roomy.len();
+        let mut i = 0;
+        while i < n && picked.len() < PROBES as usize {
+            let left = u32::try_from(n.saturating_sub(i)).unwrap_or(u32::MAX);
+            let j = i.saturating_add(ix(self.rng.below(left)));
+            self.roomy_swap(i, j);
+            if let Some(&r) = self.roomy.get(i) {
+                let fits = self.slots.get(ix(r)).and_then(|s| s.hint).is_some_and(|(_, free)| super::ask::fits(&q, &super::ask::amounts(&free)));
+                if fits && suit.live.binary_search(&r).is_ok() && self.t(t).is_some_and(|tk| tk.word(r).is_none()) {
+                    picked.push(r);
+                }
+            }
+            i += 1;
+        }
+        for r in &picked {
+            self.probe_at(t, *r, out);
+        }
+        picked.len()
     }
 
     /// The older runners the shell's pick could start `ask` on now: suited to it, linked, and idle
@@ -904,8 +964,14 @@ impl Owner {
                 Some(_) => Change::Same,
             };
             match change {
-                Change::Gone => self.gone(*r, &mut out),
-                Change::Restarted => self.restarted(*r, &mut out),
+                Change::Gone => {
+                    self.unhint(*r);
+                    self.gone(*r, &mut out);
+                }
+                Change::Restarted => {
+                    self.unhint(*r);
+                    self.restarted(*r, &mut out);
+                }
                 Change::Away => self.went_away(*r, &mut out),
                 Change::Back => self.came_back(*r, &mut out),
                 Change::Same => {}
@@ -1093,6 +1159,58 @@ impl Owner {
             self.probe_at(t, r, out);
             self.heard_of(t, out);
         }
+    }
+
+    /// `runner`'s published room (the `offers` named feature, docs/needs.md §11): what it had
+    /// free as it said so, `seq` its own count of what it published (one not later than the last
+    /// is ignored). A hint, never a claim: only an offer holds room. Read when a run's probed
+    /// runners all say it waits ([`PROBES`] more are drawn among those hinting room for it).
+    pub fn hint(&mut self, runner: &str, free: Resources, seq: u64) {
+        let r = self.rid(runner);
+        let Some(s) = self.slots.get_mut(ix(r)) else { return };
+        if s.hint.is_some_and(|(last, _)| last >= seq) {
+            return;
+        }
+        s.hint = Some((seq, free));
+        let room = super::ask::amounts(&free).iter().any(|a| *a > 0);
+        match (room, s.roomy_at) {
+            (true, None) => {
+                s.roomy_at = u32::try_from(self.roomy.len()).ok();
+                self.roomy.push(r);
+            }
+            (false, Some(_)) => self.unroomy(r),
+            _ => {}
+        }
+    }
+
+    /// `r` no longer hints room: out of `roomy`, the last in its place (O(1)).
+    fn unroomy(&mut self, r: Rid) {
+        let Some(at) = self.slots.get_mut(ix(r)).and_then(|s| s.roomy_at.take()) else { return };
+        self.roomy.swap_remove(ix(at));
+        if let Some(&moved) = self.roomy.get(ix(at))
+            && let Some(s) = self.slots.get_mut(ix(moved))
+        {
+            s.roomy_at = Some(at);
+        }
+    }
+
+    fn roomy_swap(&mut self, i: usize, j: usize) {
+        self.roomy.swap(i, j);
+        for k in [i, j] {
+            if let Some(&r) = self.roomy.get(k)
+                && let Some(s) = self.slots.get_mut(ix(r))
+            {
+                s.roomy_at = u32::try_from(k).ok();
+            }
+        }
+    }
+
+    /// A runner's hint is no longer its own (it's gone, or started again).
+    fn unhint(&mut self, r: Rid) {
+        if let Some(s) = self.slots.get_mut(ix(r)) {
+            s.hint = None;
+        }
+        self.unroomy(r);
     }
 
     /// The link to `runner` went down (the shell's word, between directories).

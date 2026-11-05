@@ -1924,6 +1924,16 @@ impl Admission {
         &self.records
     }
 
+    /// What it publishes of its room (the `offers` named feature): what's free for an ordinary run
+    /// now, nothing while draining or held whole. A hint for owners choosing where to probe, never
+    /// a claim.
+    pub fn hint(&self) -> Resources {
+        if self.draining || self.whole_claims > 0 {
+            return Resources::default();
+        }
+        ask::resources(&self.free_now())
+    }
+
     /// The room it admits against now, and what its claims hold of it.
     pub fn room(&self) -> (Amounts, Amounts) {
         (self.avail, self.held)
