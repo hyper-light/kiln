@@ -116,7 +116,7 @@ function build(recDir, cataloguePath, payloadDir) {
         const s = ws.get(e.requestId);
         if (!s) continue;
         const key = s.kind || s.pattern;
-        const entry = sockets.get(key) || { kind: s.kind, pattern: s.pattern, journeys: new Set(), down: [], up: [], downText: [], secs: 0, stamped: 0, binary: 0 };
+        const entry = sockets.get(key) || { kind: s.kind, pattern: s.pattern, journeys: new Set(), down: [], up: [], downText: [], secs: 0, stamped: 0, binary: 0, stampedAt: [] };
         entry.journeys.add(j.name);
         if (e.ev === "webSocketFrameReceived") {
           const text = frameText(e);
@@ -125,7 +125,10 @@ function build(recDir, cataloguePath, payloadDir) {
           // The packed snapshot a session socket opens with: the reference servers serve it as a read.
           // (the `snapshot` journey's, a session no turn reached, as a run's reads open one).
           if (e.response.opcode !== 1 && s.kind === "session" && (j.name === "snapshot" || replay.snapshot === undefined)) replay.snapshot = text;
-          if (/@lab:\d{16}/.test(text)) entry.stamped += 1;
+          if (/@lab:\d{16}/.test(text)) {
+            entry.stamped += 1;
+            entry.stampedAt.push({ at: e.wall_us, bytes: frameBytes(e) });
+          }
           // The replay: live frames as the UI got them (a packed snapshot is a read, not a frame).
           if (e.response.opcode === 1 || s.kind === "log" || s.kind === "terminal") entry.downText.push(text);
         } else entry.up.push(frameBytes(e));
@@ -189,6 +192,26 @@ function build(recDir, cataloguePath, payloadDir) {
     });
   }
   if (replay.snapshot !== undefined) put(join(payloadDir, "docroot/api/harness/sessions/lab/snapshot"), replay.snapshot);
+  // Bursts, from the streams: a stream's stamped frames in runs no more than 500 ms apart (an
+  // agent's turn on its session; many agents changing at once on /api/events).
+  for (const s of sockets.values()) {
+    if (s.kind !== "session" && s.kind !== "events") continue;
+    const bursts = [];
+    let cur = null;
+    for (const f of s.stampedAt) {
+      if (cur && f.at - cur.last <= 500_000) {
+        cur.n += 1;
+        cur.bytes += f.bytes;
+        cur.last = f.at;
+      } else {
+        if (cur && cur.n >= 5) bursts.push(cur);
+        cur = { n: 1, bytes: f.bytes, first: f.at, last: f.at };
+      }
+    }
+    if (cur && cur.n >= 5) bursts.push(cur);
+    if (!bursts.length) continue;
+    operations.push({ case: "burst", op: s.kind === "session" ? "an agent's turn (session socket)" : "agents changing at once (/api/events)", socket: s.pattern, bursts: bursts.length, events_per_burst: sizes(bursts.map((b) => b.n)), bytes_per_burst: sizes(bursts.map((b) => b.bytes)), burst_ms: sizes(bursts.map((b) => Math.round((b.last - b.first) / 1000))), rate_per_s: +(bursts.length / Math.max(1, s.secs)).toFixed(3) });
+  }
   operations.sort((a, b) => (a.case + a.op).localeCompare(b.case + b.op));
   const catalogue = { built_from: recDir, journeys: journeys.map((j) => j.name), operations, left_out: [...leftOut.values()].sort((a, b) => a.what.localeCompare(b.what)) };
   writeFileSync(cataloguePath, JSON.stringify(catalogue, null, 1) + "\n");

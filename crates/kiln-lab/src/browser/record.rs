@@ -17,7 +17,7 @@ use super::servers::{self, Env};
 use super::targets;
 use super::topo::{Lab, Scopes};
 
-pub fn run(kiln: &Path, web: &Path, out: &Path, seconds: u64, seed: u64) -> anyhow::Result<()> {
+pub fn run(kiln: &Path, web: &Path, out: &Path, seconds: u64, seed: u64, only: Option<&[String]>) -> anyhow::Result<()> {
     std::fs::create_dir_all(out)?;
     let mut lab = Lab::up(1)?;
     let good = link::profile_named("good").ok_or_else(|| anyhow::anyhow!("no good profile"))?;
@@ -55,7 +55,11 @@ pub fn run(kiln: &Path, web: &Path, out: &Path, seconds: u64, seed: u64) -> anyh
         json!({"name": "snapshot", "path": "/", "seconds": 10, "actions": [{"ws": format!("/api/harness/sessions/{}/ws?z=gzip&patch=state&patch=changes", k.sessions.get(2).cloned().unwrap_or_default())}]}),
     ];
     if let (Some(run), Some(job)) = (&k.run, &k.job) {
-        journeys.push(json!({"name": "job-log", "path": format!("/runs/{run}/jobs/{job}"), "seconds": seconds}));
+        // The job's page, and its log's socket as the UI's log view opens it.
+        journeys.push(json!({"name": "job-log", "path": format!("/runs/{run}/jobs/{job}"), "seconds": seconds, "actions": [{"ws": format!("/api/jobs/{job}/logs/ws?step=0")}]}));
+    }
+    if let Some(only) = only {
+        journeys.retain(|j| j.get("name").and_then(serde_json::Value::as_str).is_some_and(|n| only.iter().any(|o| o == n)));
     }
     let rec = out.join("recordings");
     std::fs::create_dir_all(&rec)?;

@@ -59,6 +59,8 @@ pub fn targets() -> Vec<Target> {
         t("caddy-h2-fetch", Server::Caddy, 10443, false, "fetch-stream", "Caddy over HTTP/2: streams as a streaming fetch"),
         t("h2o-h3", Server::H2o, 9443, true, "sse", "h2o over HTTP/3 (quicly)"),
         t("caddy-h3", Server::Caddy, 10443, true, "sse", "Caddy over HTTP/3 (quic-go)"),
+        // h2o's default QUIC controller, for the pilot's choice between it and Cubic.
+        Target { quic_cc: Some("reno".to_owned()), ..t("h2o-h3-reno", Server::H2o, 9443, true, "sse", "h2o over HTTP/3, its QUIC controller Reno (h2o's default)") },
     ]
 }
 

@@ -146,6 +146,7 @@ pub fn job_numbers(clients: &[(Vec<Sample>, Vec<Tick>)], cpu: &[CpuTick], bg_us_
     put_quantiles(&mut n, "time", times.clone());
     let mut sorted = times.clone();
     sorted.sort_by(f64::total_cmp);
+    n.extend(sorted.last().map(|m| ("time.max_ms".to_owned(), *m)));
     if let Some((lo, hi)) = quantile_band(sorted.len(), 0.999) {
         n.extend(sorted.get(lo - 1).map(|v| ("time.p999_band_lo_ms".to_owned(), *v)));
         n.extend(sorted.get(hi - 1).map(|v| ("time.p999_band_hi_ms".to_owned(), *v)));

@@ -116,7 +116,50 @@ Every check passed.
 
 ## The operations
 
-(The catalogue: step 3.)
+`kiln-lab browser record` starts the lab kiln on a good client link (kiln at origin/main
+`01d3ff1c99b`, its own TLS listener with the lab chain, ALPN h2 and http/1.1, no front door; a
+runner whose `claude` is the lab's stand-in; its terminal on, the shell a stand-in writing stamped
+lines; a lab repository whose one job's step writes stamped lines; three sessions of 200 events
+each, two of them at work as agents are, a turn of 40 events 25 ms apart every 3 s). Chromium then
+opens kiln's own pages for each journey (Mission control, an agent's page while it works and is sent
+a message every 10 s as its composer sends one, a terminal, a job's page and its log, a session's
+snapshot), 600 s each, and the browser's own network events (Chrome DevTools Protocol: every request
+with its sizes, every socket and each frame) are written down with their payloads
+(`crates/kiln-lab/web/record.mjs`). `crates/kiln-lab/web/catalogue.mjs` makes them into the
+catalogue, [`docs/browser-lab/catalogue.json`](browser-lab/catalogue.json) (sizes, rates and
+digests, small), and the replay the reference servers serve (payloads under `~/.cache`). Where the
+UI's pages don't open a stream themselves, the journey opens it as the UI's view does (the
+terminal's socket, the log's socket), on the same path with the same parameters.
+
+What the UI does, from the catalogue (sizes in bytes above the transport, rates as recorded):
+
+| case | operation | sizes p50 / p99 | rate |
+| --- | --- | --- | --- |
+| stream | an agent session's socket (`/api/harness/sessions/:id/ws?z=gzip&patch=state&patch=changes`): events, state and changes patches | 687 / 15,966 a frame | 37 frames a second while two agents work |
+| stream | `/api/events`: whole entities (a busy agent's entry on almost any change) | 999 / 1,083 a frame | 31 a second |
+| stream | a terminal's socket: PTY output | 97 / 97 a frame | 10 a second (the stand-in's pace) |
+| stream | a job log's socket: the step's output | 97 / 97 a frame | 20 a second (the stand-in's pace) |
+| burst | an agent's turn, on its session's socket | 60 / 126 frames, 167 KB / 377 KB a burst, over 0.9 / 2.4 s | 0.33 a second |
+| burst | agents changing at once, on `/api/events` | 60 / 102 frames, 61 KB / 104 KB a burst | 0.32 a second |
+| request | `GET /api/agents` | 2,043 / 2,052 | |
+| request | `GET /api/overview` | 6,500 / 6,506 | |
+| request | `GET /api/harness/sessions` | 2,911 / 3,014 | |
+| request | `GET /api/me` | 1,254 / 1,254 | |
+| request | `GET /api/metrics/history` | 114,104 / 171,477 | |
+| request | a session's snapshot (the session socket's first, packed frame) | 715 KB unpacked for a session of 200 events | |
+| request | `POST /api/harness/sessions/:id/command` (a message to an agent) | 156 / 156 answered, 57 sent | |
+
+Every request rode HTTP/2; every socket was an HTTP/1.1 connection of its own. Left out, with why:
+pages, the UI server's server functions and static files (`GET /`, `/agents/:id`, `/runs/...`, 121
+files under `/assets`): page loads are goal 8's.
+
+Two recordings on one stand-in seed (`KILN_LAB_SEED=7`) send the same event bodies once their
+stamps and ids are taken out (`node catalogue.mjs compare`): of the 2,773 events both 150-second
+recordings sent (keyed by their turn and place in it), 2,773 hashed equal. A run uses the same seed,
+so the baselines replay exactly what kiln sends.
+
+At the recording's pace, `/api/events` alone carries about 250 kbit/s: five times a 50 kbit/s link
+before any page, session or request. The matrix's paces are a link's half at most (below).
 
 ## The probe and the three measures
 

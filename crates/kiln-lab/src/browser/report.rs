@@ -199,7 +199,16 @@ pub fn check_probe(run: &BrowserRun, catalogue: &serde_json::Value) -> (String, 
     let ops = catalogue.get("operations").and_then(serde_json::Value::as_array).cloned().unwrap_or_default();
     for op in &ops {
         let name = op.get("op").and_then(serde_json::Value::as_str).unwrap_or_default();
-        let ui = op.pointer("/bodies/mean").or_else(|| op.pointer("/frames_down/p50")).and_then(serde_json::Value::as_f64);
+        // Only where the UI's payloads were the same each time (p50 and p99 within 1%): elsewhere
+        // they follow the lab kiln's state (its sessions' titles, its agents' last words), which a
+        // run's kiln doesn't share with the recording's.
+        let size = |q: &str| op.pointer(&format!("/bodies/{q}")).or_else(|| op.pointer(&format!("/frames_down/{q}"))).and_then(serde_json::Value::as_f64);
+        let (Some(p50), Some(p99)) = (size("p50"), size("p99")) else { continue };
+        if (p99 - p50).abs() > p50.max(1.0) * 0.01 {
+            let _ = writeln!(o, "- sizes: {name}: not compared, its payloads varied in the recording ({} to {} bytes)", fmt(p50), fmt(p99));
+            continue;
+        }
+        let ui = Some(p50);
         let probe_name = if op.get("case").and_then(serde_json::Value::as_str) == Some("stream") { name.to_owned() } else { name.split('?').next().unwrap_or(name).to_owned() };
         let jobs: Vec<&&JobRecord> = good.iter().filter(|j| j.target.starts_with("kiln-today") && j.numbers.contains_key(&format!("op/{probe_name}/app_bytes"))).collect();
         let (Some(ui), false) = (ui, jobs.is_empty()) else { continue };
@@ -215,10 +224,11 @@ pub fn check_probe(run: &BrowserRun, catalogue: &serde_json::Value) -> (String, 
     }
     if let Some(at) = run.settings.stall_s {
         for j in run.jobs.iter().filter(|j| j.case == "request") {
-            let top = j.numbers.get("time.p99_ms").copied().unwrap_or(0.0);
+            // The request due as the stall began waited all of it: the longest is at least 2 s.
+            let top = j.numbers.get("time.max_ms").copied().unwrap_or(0.0);
             let ok = top >= 2000.0;
             pass &= ok;
-            let _ = writeln!(o, "- stall at {at} s: {} {} {}: requests' p99 {} ms{}", j.condition, j.target, j.browser, fmt(top), if ok { ", the whole wait counted" } else { " (**the stall's wait is missing**)" });
+            let _ = writeln!(o, "- stall at {at} s: {} {} {}: the longest request {} ms, p99 {} ms{}", j.condition, j.target, j.browser, fmt(top), fmt(j.numbers.get("time.p99_ms").copied().unwrap_or(0.0)), if ok { ", the whole wait counted" } else { " (**the stall's wait is missing**)" });
         }
     }
     let mut floors: BTreeMap<String, Vec<f64>> = BTreeMap::new();

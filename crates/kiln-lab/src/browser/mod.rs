@@ -15,7 +15,11 @@
 //! kiln-lab browser compare A B [--b-run R2]   two targets (or two runs) cell by cell
 //! ```
 //!
-//! Linux only: on macOS and Windows every command but `profiles` refuses, saying why.
+//! Linux only: on macOS and Windows every command but `profiles`, `plan`, `report`, `compare`,
+//! `check-probe` and `doc-check` refuses, saying why. The lab's pure parts (the link's commands, the
+//! cells' statistics, a capture's bytes) build and are tested everywhere; what only the rounds use
+//! is unused elsewhere.
+#![cfg_attr(not(target_os = "linux"), allow(dead_code))]
 
 mod cells;
 pub mod link;
@@ -85,6 +89,9 @@ pub enum Cmd {
         seed: u64,
         #[arg(long)]
         web: Option<PathBuf>,
+        /// Only these journeys (mission-control, agent, terminal, snapshot, job-log).
+        #[arg(long)]
+        journeys: Option<String>,
     },
     /// The run plan: rounds and hours for every cell at K links.
     Plan {
@@ -110,6 +117,8 @@ pub enum Cmd {
         #[arg(long)]
         catalogue: PathBuf,
     },
+    /// Step 5's test: each target started and stopped `--times` times, cleanly.
+    StartStop(Box<StartStopArgs>),
     /// Whether docs/browser-lab.md's tables are a run's, line by line.
     DocCheck { doc: PathBuf, run: PathBuf },
     /// A run's tables, in Markdown.
@@ -126,6 +135,14 @@ pub enum Cmd {
     #[cfg(target_os = "linux")]
     #[command(hide = true, subcommand)]
     Tool(tools::Tool),
+}
+
+#[derive(clap::Args, Clone, Debug)]
+pub struct StartStopArgs {
+    #[command(flatten)]
+    args: RunArgs,
+    #[arg(long, default_value_t = 20)]
+    times: usize,
 }
 
 #[derive(clap::Args, Clone, Debug)]
@@ -249,7 +266,7 @@ pub fn run(cmd: Cmd) -> anyhow::Result<()> {
             }
             Ok(())
         }
-        Cmd::Record { kiln, out, seconds, seed, web: w } => record_cmd(&kiln, &web(w), &out, seconds, seed),
+        Cmd::Record { kiln, out, seconds, seed, web: w, journeys } => record_cmd(&kiln, &web(w), &out, seconds, seed, journeys.map(|j| list(&j))),
         Cmd::CheckProbe { run, catalogue } => {
             let r: report_run::BrowserRun = serde_json::from_slice(&std::fs::read(&run)?)?;
             let c: serde_json::Value = serde_json::from_slice(&std::fs::read(&catalogue)?)?;
@@ -268,34 +285,46 @@ pub fn run(cmd: Cmd) -> anyhow::Result<()> {
             println!("{}'s tables are {}'s.", doc.display(), run.display());
             Ok(())
         }
+        Cmd::StartStop(a) => {
+            let StartStopArgs { args, times } = *a;
+            let out = std::path::absolute(&args.out)?;
+            start_stop_cmd(&settings(args)?, &out, times)
+        }
         Cmd::Run(args) => {
-            let RunArgs { targets: t, profiles, losses, browsers, cases, rounds, k, seed, duration, window_ms, background_s, kiln, h2o, caddy, payloads, web: w, out, capture, stall } = *args;
-            let settings = report_run::Settings {
-                targets: target_list(&t)?,
-                profiles: list(&profiles).iter().map(|p| link::profile_named(p).ok_or_else(|| anyhow::anyhow!("no profile {p}"))).collect::<anyhow::Result<_>>()?,
-                losses: list(&losses).iter().map(|l| link::loss_named(l).ok_or_else(|| anyhow::anyhow!("no loss {l}"))).collect::<anyhow::Result<_>>()?,
-                browsers: list(&browsers),
-                cases: list(&cases),
-                rounds,
-                k,
-                seed,
-                duration_s: duration,
-                window_ms,
-                background_s,
-                kiln: kiln.map(std::path::absolute).transpose()?,
-                h2o: h2o.map(std::path::absolute).transpose()?,
-                caddy: caddy.map(std::path::absolute).transpose()?,
-                payloads: payloads.map(std::path::absolute).transpose()?,
-                web: web(w),
-                capture,
-                stall_s: stall,
-            };
-            run_cmd(&settings, &out)
+            let s = settings(*args.clone())?;
+            run_cmd(&s, &args.out)
         }
         Cmd::CheckProfiles { out, seed } => check_profiles(out, seed),
         #[cfg(target_os = "linux")]
         Cmd::Tool(t) => tools::run(t),
     }
+}
+
+/// A run's settings from its arguments (paths made absolute: the lab runs itself again elsewhere).
+fn settings(args: RunArgs) -> anyhow::Result<report_run::Settings> {
+    let RunArgs { targets: t, profiles, losses, browsers, cases, rounds, k, seed, duration, window_ms, background_s, kiln, h2o, caddy, payloads, web: w, out, capture, stall } = args;
+    let settings = report_run::Settings {
+        targets: target_list(&t)?,
+        profiles: list(&profiles).iter().map(|p| link::profile_named(p).ok_or_else(|| anyhow::anyhow!("no profile {p}"))).collect::<anyhow::Result<_>>()?,
+        losses: list(&losses).iter().map(|l| link::loss_named(l).ok_or_else(|| anyhow::anyhow!("no loss {l}"))).collect::<anyhow::Result<_>>()?,
+        browsers: list(&browsers),
+        cases: list(&cases),
+        rounds,
+        k,
+        seed,
+        duration_s: duration,
+        window_ms,
+        background_s,
+        kiln: kiln.map(std::path::absolute).transpose()?,
+        h2o: h2o.map(std::path::absolute).transpose()?,
+        caddy: caddy.map(std::path::absolute).transpose()?,
+        payloads: payloads.map(std::path::absolute).transpose()?,
+        web: web(w),
+        capture,
+        stall_s: stall,
+    };
+    let _ = out;
+    Ok(settings)
 }
 
 #[cfg(target_os = "linux")]
@@ -344,16 +373,16 @@ fn check_profiles(_out: PathBuf, _seed: u64) -> anyhow::Result<()> {
 }
 
 #[cfg(target_os = "linux")]
-fn record_cmd(kiln: &std::path::Path, web: &std::path::Path, out: &std::path::Path, seconds: u64, seed: u64) -> anyhow::Result<()> {
+fn record_cmd(kiln: &std::path::Path, web: &std::path::Path, out: &std::path::Path, seconds: u64, seed: u64, only: Option<Vec<String>>) -> anyhow::Result<()> {
     if !topo::inside() {
         std::fs::create_dir_all(out)?;
         return topo::reenter(&again());
     }
-    record::run(&std::path::absolute(kiln)?, web, &std::path::absolute(out)?, seconds, seed)
+    record::run(&std::path::absolute(kiln)?, web, &std::path::absolute(out)?, seconds, seed, only.as_deref())
 }
 
 #[cfg(not(target_os = "linux"))]
-fn record_cmd(_kiln: &std::path::Path, _web: &std::path::Path, _out: &std::path::Path, _seconds: u64, _seed: u64) -> anyhow::Result<()> {
+fn record_cmd(_kiln: &std::path::Path, _web: &std::path::Path, _out: &std::path::Path, _seconds: u64, _seed: u64, _only: Option<Vec<String>>) -> anyhow::Result<()> {
     refuse()
 }
 
@@ -373,5 +402,22 @@ fn run_cmd(s: &report_run::Settings, out: &std::path::Path) -> anyhow::Result<()
 
 #[cfg(not(target_os = "linux"))]
 fn run_cmd(_s: &report_run::Settings, _out: &std::path::Path) -> anyhow::Result<()> {
+    refuse()
+}
+
+#[cfg(target_os = "linux")]
+fn start_stop_cmd(s: &report_run::Settings, out: &std::path::Path, times: usize) -> anyhow::Result<()> {
+    if !topo::inside() {
+        std::fs::create_dir_all(out)?;
+        return topo::reenter(&again());
+    }
+    let (text, ok) = run::start_stop(s, out, times)?;
+    print!("{text}");
+    anyhow::ensure!(ok, "not every start and stop was clean");
+    Ok(())
+}
+
+#[cfg(not(target_os = "linux"))]
+fn start_stop_cmd(_s: &report_run::Settings, _out: &std::path::Path, _times: usize) -> anyhow::Result<()> {
     refuse()
 }

@@ -1,40 +1,151 @@
 {
- "built_from": "~/.cache/kiln-bp/g1/record-a/recordings (2026-11-04, kiln 01d3ff1c99b, seed 7, journeys of 600 s on the good link)",
+ "built_from": "~/.cache/kiln-bp/g1/record-d/recordings with record-e job-log (2026-11-04, kiln 01d3ff1c99b, KILN_LAB_SEED 7, journeys of 600 s on the good link)",
  "journeys": [
   "agent",
+  "job-log",
   "mission-control",
+  "snapshot",
   "terminal"
  ],
  "operations": [
+  {
+   "case": "burst",
+   "op": "agents changing at once (/api/events)",
+   "socket": "/api/events",
+   "bursts": 766,
+   "events_per_burst": {
+    "n": 766,
+    "p50": 60,
+    "p99": 102,
+    "max": 147,
+    "mean": 61
+   },
+   "bytes_per_burst": {
+    "n": 766,
+    "p50": 61023,
+    "p99": 104367,
+    "max": 150472,
+    "mean": 61562
+   },
+   "burst_ms": {
+    "n": 766,
+    "p50": 1020,
+    "p99": 2515,
+    "max": 4173
+   },
+   "rate_per_s": 0.316
+  },
+  {
+   "case": "burst",
+   "op": "an agent's turn (session socket)",
+   "socket": "/api/harness/sessions/:id/ws?patch&z",
+   "bursts": 205,
+   "events_per_burst": {
+    "n": 205,
+    "p50": 60,
+    "p99": 126,
+    "max": 179,
+    "mean": 73
+   },
+   "bytes_per_burst": {
+    "n": 205,
+    "p50": 167392,
+    "p99": 376872,
+    "max": 3094038,
+    "mean": 212812
+   },
+   "burst_ms": {
+    "n": 205,
+    "p50": 907,
+    "p99": 2408,
+    "max": 2442
+   },
+   "rate_per_s": 0.332
+  },
   {
    "case": "request",
    "op": "GET /api/agents",
    "kind": "read",
    "journeys": [
     "agent",
+    "job-log",
     "mission-control",
+    "snapshot",
     "terminal"
    ],
    "bodies": {
-    "n": 43,
-    "p50": 2016,
-    "p99": 2018,
-    "max": 2018,
-    "mean": 2016
+    "n": 45,
+    "p50": 2043,
+    "p99": 2052,
+    "max": 2052,
+    "mean": 2033
    },
    "wire": {
-    "n": 43,
-    "p50": 2071,
-    "p99": 2076,
-    "max": 2076,
-    "mean": 2060
+    "n": 45,
+    "p50": 2076,
+    "p99": 2110,
+    "max": 2110,
+    "mean": 2075
    },
    "protocols": [
     "h2"
    ],
-   "rate_per_s": 0.024,
-   "request_body": 0,
-   "digest": "21d70a0be3abf0bc1a1c7c88290268a1d065c2b4ba550fe30230104e55d805f0"
+   "rate_per_s": 0.019,
+   "request_body": 0
+  },
+  {
+   "case": "request",
+   "op": "GET /api/ci/runs/:id",
+   "kind": "read",
+   "journeys": [
+    "job-log"
+   ],
+   "bodies": {
+    "n": 1,
+    "p50": 23,
+    "p99": 23,
+    "max": 23,
+    "mean": 23
+   },
+   "wire": {
+    "n": 1,
+    "p50": 49,
+    "p99": 49,
+    "max": 49,
+    "mean": 49
+   },
+   "protocols": [
+    "h2"
+   ],
+   "rate_per_s": 0.002,
+   "request_body": 0
+  },
+  {
+   "case": "request",
+   "op": "GET /api/ci/runs/:id/graph",
+   "kind": "read",
+   "journeys": [
+    "job-log"
+   ],
+   "bodies": {
+    "n": 1,
+    "p50": 23,
+    "p99": 23,
+    "max": 23,
+    "mean": 23
+   },
+   "wire": {
+    "n": 1,
+    "p50": 49,
+    "p99": 49,
+    "max": 49,
+    "mean": 49
+   },
+   "protocols": [
+    "h2"
+   ],
+   "rate_per_s": 0.002,
+   "request_body": 0
   },
   {
    "case": "request",
@@ -44,25 +155,24 @@
     "agent"
    ],
    "bodies": {
-    "n": 6,
+    "n": 5,
     "p50": 4279,
     "p99": 4279,
     "max": 4279,
     "mean": 4279
    },
    "wire": {
-    "n": 6,
+    "n": 5,
     "p50": 4337,
     "p99": 4337,
     "max": 4337,
-    "mean": 4332
+    "mean": 4331
    },
    "protocols": [
     "h2"
    ],
-   "rate_per_s": 0.01,
-   "request_body": 0,
-   "digest": "9272e8d10fbe1a464fa563c0f3ee50023f6d03127fb0eff1fcb6897e14e972c6"
+   "rate_per_s": 0.008,
+   "request_body": 0
   },
   {
    "case": "request",
@@ -70,29 +180,30 @@
    "kind": "read",
    "journeys": [
     "agent",
+    "job-log",
     "mission-control",
+    "snapshot",
     "terminal"
    ],
    "bodies": {
-    "n": 5,
+    "n": 7,
     "p50": 2911,
-    "p99": 2912,
-    "max": 2912,
-    "mean": 2862
+    "p99": 3014,
+    "max": 3014,
+    "mean": 2908
    },
    "wire": {
-    "n": 5,
-    "p50": 2969,
-    "p99": 2970,
-    "max": 2970,
-    "mean": 2908
+    "n": 7,
+    "p50": 2968,
+    "p99": 3072,
+    "max": 3072,
+    "mean": 2953
    },
    "protocols": [
     "h2"
    ],
    "rate_per_s": 0.003,
-   "request_body": 0,
-   "digest": "9383b1044b314c52f874e183225567a54a66afc5e23b458c99e4cf239ee3752f"
+   "request_body": 0
   },
   {
    "case": "request",
@@ -119,8 +230,61 @@
     "h2"
    ],
    "rate_per_s": 0.003,
-   "request_body": 0,
-   "digest": "4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945"
+   "request_body": 0
+  },
+  {
+   "case": "request",
+   "op": "GET /api/incidents?run",
+   "kind": "read",
+   "journeys": [
+    "job-log"
+   ],
+   "bodies": {
+    "n": 1,
+    "p50": 16,
+    "p99": 16,
+    "max": 16,
+    "mean": 16
+   },
+   "wire": {
+    "n": 1,
+    "p50": 42,
+    "p99": 42,
+    "max": 42,
+    "mean": 42
+   },
+   "protocols": [
+    "h2"
+   ],
+   "rate_per_s": 0.002,
+   "request_body": 0
+  },
+  {
+   "case": "request",
+   "op": "GET /api/jobs/:id",
+   "kind": "read",
+   "journeys": [
+    "job-log"
+   ],
+   "bodies": {
+    "n": 1,
+    "p50": 1036,
+    "p99": 1036,
+    "max": 1036,
+    "mean": 1036
+   },
+   "wire": {
+    "n": 1,
+    "p50": 1064,
+    "p99": 1064,
+    "max": 1064,
+    "mean": 1064
+   },
+   "protocols": [
+    "h2"
+   ],
+   "rate_per_s": 0.002,
+   "request_body": 0
   },
   {
    "case": "request",
@@ -128,29 +292,30 @@
    "kind": "read",
    "journeys": [
     "agent",
+    "job-log",
     "mission-control",
+    "snapshot",
     "terminal"
    ],
    "bodies": {
-    "n": 3,
+    "n": 5,
     "p50": 1254,
     "p99": 1254,
     "max": 1254,
     "mean": 1254
    },
    "wire": {
-    "n": 3,
+    "n": 5,
     "p50": 1282,
     "p99": 1299,
     "max": 1299,
-    "mean": 1288
+    "mean": 1289
    },
    "protocols": [
     "h2"
    ],
    "rate_per_s": 0.002,
-   "request_body": 0,
-   "digest": "d1844639c3c1846ea71737666add37ca894c14b6bc5e6e1cf3a4c6b4f74cd44f"
+   "request_body": 0
   },
   {
    "case": "request",
@@ -158,28 +323,28 @@
    "kind": "read",
    "journeys": [
     "mission-control",
+    "snapshot",
     "terminal"
    ],
    "bodies": {
-    "n": 12,
-    "p50": 67974,
-    "p99": 182066,
-    "max": 182066,
-    "mean": 96687
+    "n": 13,
+    "p50": 114104,
+    "p99": 171477,
+    "max": 171477,
+    "mean": 92207
    },
    "wire": {
-    "n": 12,
-    "p50": 68039,
-    "p99": 182195,
-    "max": 182195,
-    "mean": 96773
+    "n": 13,
+    "p50": 114188,
+    "p99": 171597,
+    "max": 171597,
+    "mean": 92283
    },
    "protocols": [
     "h2"
    ],
-   "rate_per_s": 0.01,
-   "request_body": 0,
-   "digest": "66d20fb7c05b09f5c818b873898f0e751c29f7c1ddf4a41f400c83dbf97f5c84"
+   "rate_per_s": 0.011,
+   "request_body": 0
   },
   {
    "case": "request",
@@ -187,28 +352,28 @@
    "kind": "read",
    "journeys": [
     "mission-control",
+    "snapshot",
     "terminal"
    ],
    "bodies": {
-    "n": 42,
-    "p50": 6484,
-    "p99": 6489,
-    "max": 6489,
-    "mean": 6482
+    "n": 43,
+    "p50": 6500,
+    "p99": 6506,
+    "max": 6506,
+    "mean": 6496
    },
    "wire": {
-    "n": 42,
-    "p50": 6512,
-    "p99": 6517,
-    "max": 6517,
-    "mean": 6510
+    "n": 43,
+    "p50": 6528,
+    "p99": 6551,
+    "max": 6551,
+    "mean": 6525
    },
    "protocols": [
     "h2"
    ],
    "rate_per_s": 0.035,
-   "request_body": 0,
-   "digest": "56e20588830d35fb81d2da9f5b4029fe79459eb6d1e879104441ba1452f99810"
+   "request_body": 0
   },
   {
    "case": "request",
@@ -216,18 +381,20 @@
    "kind": "read",
    "journeys": [
     "agent",
+    "job-log",
     "mission-control",
+    "snapshot",
     "terminal"
    ],
    "bodies": {
-    "n": 3,
+    "n": 5,
     "p50": 31,
     "p99": 31,
     "max": 31,
     "mean": 31
    },
    "wire": {
-    "n": 3,
+    "n": 5,
     "p50": 57,
     "p99": 57,
     "max": 57,
@@ -237,8 +404,7 @@
     "h2"
    ],
    "rate_per_s": 0.002,
-   "request_body": 0,
-   "digest": "89ea24a70bf4c155eebbf289ad537fe0e1112ca9bad1ad2e3ee91a53c5f05653"
+   "request_body": 0
   },
   {
    "case": "request",
@@ -246,29 +412,30 @@
    "kind": "read",
    "journeys": [
     "agent",
+    "job-log",
     "mission-control",
+    "snapshot",
     "terminal"
    ],
    "bodies": {
-    "n": 3,
+    "n": 5,
     "p50": 26,
     "p99": 105,
     "max": 105,
-    "mean": 52
+    "mean": 58
    },
    "wire": {
-    "n": 3,
+    "n": 5,
     "p50": 52,
     "p99": 132,
     "max": 132,
-    "mean": 79
+    "mean": 84
    },
    "protocols": [
     "h2"
    ],
    "rate_per_s": 0.002,
-   "request_body": 0,
-   "digest": "63192a0b42dffa6b344ce78392e1ea2e8d353f7062cb7346716d22e2091f38c0"
+   "request_body": 0
   },
   {
    "case": "request",
@@ -276,28 +443,55 @@
    "kind": "read",
    "journeys": [
     "mission-control",
+    "snapshot",
     "terminal"
    ],
    "bodies": {
-    "n": 22,
-    "p50": 429,
-    "p99": 429,
-    "max": 429,
-    "mean": 429
+    "n": 23,
+    "p50": 456,
+    "p99": 456,
+    "max": 456,
+    "mean": 452
    },
    "wire": {
-    "n": 22,
-    "p50": 486,
-    "p99": 486,
-    "max": 486,
-    "mean": 473
+    "n": 23,
+    "p50": 505,
+    "p99": 513,
+    "max": 513,
+    "mean": 499
    },
    "protocols": [
     "h2"
    ],
-   "rate_per_s": 0.018,
-   "request_body": 0,
-   "digest": "08e28f16c9e5834bd93845f6fef24fc99d5bf2342fd32f8c9718f25e9bf24dc1"
+   "rate_per_s": 0.019,
+   "request_body": 0
+  },
+  {
+   "case": "request",
+   "op": "GET /api/runs/:id",
+   "kind": "read",
+   "journeys": [
+    "job-log"
+   ],
+   "bodies": {
+    "n": 1,
+    "p50": 944,
+    "p99": 944,
+    "max": 944,
+    "mean": 944
+   },
+   "wire": {
+    "n": 1,
+    "p50": 971,
+    "p99": 971,
+    "max": 971,
+    "mean": 971
+   },
+   "protocols": [
+    "h2"
+   ],
+   "rate_per_s": 0.002,
+   "request_body": 0
   },
   {
    "case": "request",
@@ -324,8 +518,7 @@
     "h2"
    ],
    "rate_per_s": 0.002,
-   "request_body": 0,
-   "digest": "5d172f5b3461f681fa048b752a6bf7b0686d6843f143169e9b9b2ae70d50ef9e"
+   "request_body": 0
   },
   {
    "case": "request",
@@ -337,23 +530,22 @@
    "bodies": {
     "n": 59,
     "p50": 156,
-    "p99": 157,
-    "max": 157,
+    "p99": 156,
+    "max": 156,
     "mean": 156
    },
    "wire": {
     "n": 59,
     "p50": 213,
-    "p99": 230,
-    "max": 230,
+    "p99": 213,
+    "max": 213,
     "mean": 212
    },
    "protocols": [
     "h2"
    ],
    "rate_per_s": 0.098,
-   "request_body": 57,
-   "digest": "26dcc2a764ededf5e92744e0f8c9267009ff5e8b7838706ed2ec6dba5c7793d3"
+   "request_body": 57
   },
   {
    "case": "request",
@@ -363,25 +555,24 @@
     "agent"
    ],
    "bodies": {
-    "n": 17,
+    "n": 18,
     "p50": 31,
     "p99": 31,
     "max": 31,
     "mean": 31
    },
    "wire": {
-    "n": 17,
+    "n": 18,
     "p50": 87,
-    "p99": 87,
-    "max": 87,
-    "mean": 80
+    "p99": 104,
+    "max": 104,
+    "mean": 83
    },
    "protocols": [
     "h2"
    ],
-   "rate_per_s": 0.028,
-   "request_body": 73,
-   "digest": "0ec5c4ce80da6099ea3f67374382bd6132d7d1be548a57b8f8b636d16009f67c"
+   "rate_per_s": 0.03,
+   "request_body": 73
   },
   {
    "case": "stream",
@@ -389,15 +580,17 @@
    "socket": "/api/events",
    "journeys": [
     "agent",
+    "job-log",
     "mission-control",
+    "snapshot",
     "terminal"
    ],
    "frames_down": {
-    "n": 72801,
-    "p50": 1046,
+    "n": 75583,
+    "p50": 999,
     "p99": 1083,
-    "max": 1087,
-    "mean": 788
+    "max": 2019,
+    "mean": 652
    },
    "frames_up": {
     "n": 0,
@@ -406,25 +599,51 @@
     "max": null,
     "mean": null
    },
-   "stamped_frames": 55135,
+   "stamped_frames": 46423,
    "binary_frames": 0,
-   "rate_per_s": 40.196,
-   "recorded_s": 1811,
-   "digest": "35250e0d30573e4de3013758f58c0bf5e2dded38da3fea4600db11d7e29dfa2a"
+   "rate_per_s": 31.146,
+   "recorded_s": 2427
+  },
+  {
+   "case": "stream",
+   "op": "log",
+   "socket": "/api/jobs/:id/logs/ws?step",
+   "journeys": [
+    "job-log"
+   ],
+   "frames_down": {
+    "n": 11981,
+    "p50": 97,
+    "p99": 97,
+    "max": 3886,
+    "mean": 98
+   },
+   "frames_up": {
+    "n": 0,
+    "p50": null,
+    "p99": null,
+    "max": null,
+    "mean": null
+   },
+   "stamped_frames": 11981,
+   "binary_frames": 11981,
+   "rate_per_s": 19.854,
+   "recorded_s": 603
   },
   {
    "case": "stream",
    "op": "session",
    "socket": "/api/harness/sessions/:id/ws?patch&z",
    "journeys": [
-    "agent"
+    "agent",
+    "snapshot"
    ],
    "frames_down": {
-    "n": 22951,
+    "n": 23021,
     "p50": 687,
     "p99": 15966,
-    "max": 2738179,
-    "mean": 2305
+    "max": 2633089,
+    "mean": 2301
    },
    "frames_up": {
     "n": 0,
@@ -433,11 +652,10 @@
     "max": null,
     "mean": null
    },
-   "stamped_frames": 14949,
-   "binary_frames": 1,
-   "rate_per_s": 37.959,
-   "recorded_s": 605,
-   "digest": "a94bc246a9cf353e776f46b734f9c1c87d7ecffdffbeeb8369c4087d6eeeb5b6"
+   "stamped_frames": 14971,
+   "binary_frames": 2,
+   "rate_per_s": 37.332,
+   "recorded_s": 617
   },
   {
    "case": "stream",
@@ -447,7 +665,7 @@
     "terminal"
    ],
    "frames_down": {
-    "n": 6012,
+    "n": 6001,
     "p50": 97,
     "p99": 97,
     "max": 233,
@@ -461,17 +679,16 @@
     "mean": null
    },
    "stamped_frames": 5999,
-   "binary_frames": 6011,
-   "rate_per_s": 9.967,
-   "recorded_s": 603,
-   "digest": "5d4fe6facb5fd019155cad754455622686f23222e264a4e5aa7062e552dc2d02"
+   "binary_frames": 6000,
+   "rate_per_s": 9.95,
+   "recorded_s": 603
   }
  ],
  "left_out": [
   {
    "what": "GET /",
    "why": "a page, a static file or the UI server's server functions: page loads are goal 8's",
-   "n": 11
+   "n": 16
   },
   {
    "what": "GET /agents/:id",
@@ -479,9 +696,14 @@
    "n": 1
   },
   {
-   "what": "GET /assets/* (112 files) and inline images",
+   "what": "GET /runs/:id/jobs/:id",
    "why": "a page, a static file or the UI server's server functions: page loads are goal 8's",
-   "n": 246
+   "n": 1
+  },
+  {
+   "what": "GET /assets/* (121 files) and inline images",
+   "why": "a page, a static file or the UI server's server functions: page loads are goal 8's",
+   "n": 396
   }
  ]
 }

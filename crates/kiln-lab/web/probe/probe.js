@@ -70,15 +70,24 @@ lab.calibrate = async function calibrate(url, n = 200, check = 200) {
   for (let i = 0; i < n; i++) first.push(await once());
   first.sort((a, b) => a.rtt - b.rtt);
   lab.offsetUs = first[0].offset;
+  // The calibration again, in groups of 20 echoes each taken the same way: how far each group's
+  // offset lies from the one the page uses is the calibration's residual. Each echo's own offset
+  // (off by up to half its round trip) is kept beside it.
   const residuals = [];
+  const echoes = [];
   const rtts = [];
-  for (let i = 0; i < check; i++) {
-    const r = await once();
-    rtts.push(r.rtt);
-    residuals.push(Math.abs(r.offset - lab.offsetUs));
+  for (let g = 0; g < Math.max(1, Math.floor(check / 20)); g++) {
+    const group = [];
+    for (let i = 0; i < 20; i++) group.push(await once());
+    group.forEach((r) => {
+      rtts.push(r.rtt);
+      echoes.push(Math.abs(r.offset - lab.offsetUs));
+    });
+    group.sort((a, b) => a.rtt - b.rtt);
+    residuals.push(Math.abs(group[0].offset - lab.offsetUs));
   }
   ws.close();
-  return { offset_us: lab.offsetUs, min_rtt_us: first[0].rtt, rtts_us: rtts, residuals_us: residuals };
+  return { offset_us: lab.offsetUs, min_rtt_us: first[0].rtt, rtts_us: rtts, residuals_us: residuals, echo_residuals_us: echoes };
 };
 
 /** The protocol each resource came over (h2, h3, http/1.1), by path. */
@@ -183,6 +192,8 @@ lab.requests = function requests(op) {
       setTimeout(async () => {
         const sched = (performance.timeOrigin + due) * 1000 + lab.offsetUs;
         const req = op.requests[i % op.requests.length];
+        // A write's id is new each time, as the UI's are (`{n}` in its body).
+        const body = req.body ? req.body.replaceAll("{n}", String(i + 1)) : undefined;
         try {
           if (req.ws_snapshot) {
             // A session socket opened for its packed snapshot, then closed: the UI's read of a session.
@@ -201,7 +212,7 @@ lab.requests = function requests(op) {
             note({ op: req.name, case: op.case, sched_us: Math.round(sched), at_us: Math.round(at), lat_us: Math.round(at - sched), app_bytes: data.byteLength, ok: true });
             return;
           }
-          const r = await fetch(req.path, { method: req.method || "GET", body: req.body, headers: req.body ? { "content-type": "application/json" } : undefined, cache: "no-store" });
+          const r = await fetch(req.path, { method: req.method || "GET", body, headers: body ? { "content-type": "application/json" } : undefined, cache: "no-store" });
           const buf = await r.arrayBuffer();
           const text = utf8.decode(buf);
           if (req.ndjson) for (const line of text.split("\n")) line && JSON.parse(line);

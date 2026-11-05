@@ -65,7 +65,7 @@ fn ops(t: &Target, case: &str, w: &Workload, kiln: Option<&servers::KilnLab>) ->
             } else {
                 json!({"name": "session snapshot", "ndjson": true, "path": "/api/harness/sessions/lab/snapshot"})
             });
-            requests.push(json!({"name": "POST /api/harness/sessions/:id/command", "method": "POST", "path": format!("/api/harness/sessions/{id}/command"), "body": json!({"type": "send", "id": "lab-req", "text": "lab:quiet"}).to_string()}));
+            requests.push(json!({"name": "POST /api/harness/sessions/:id/command", "method": "POST", "path": format!("/api/harness/sessions/{id}/command"), "body": json!({"type": "send", "id": "lab-rec-{n}", "text": "lab:quiet"}).to_string()}));
             #[allow(clippy::cast_precision_loss)]
             let n = (w.duration_s * 1000 / w.request_ms.max(1)) as usize;
             let schedule: Vec<u64> = (0..n as u64).map(|i| i * w.request_ms).collect();
@@ -121,7 +121,7 @@ fn job(c: &mut Ctx<'_>, r: &Running, t: &Target, browser: &str, case: &str, cond
     if c.s.capture {
         for i in 0..c.s.k {
             let pcap = dir.join(format!("c{i}.pcap"));
-            let argv = vec!["tcpdump".to_owned(), "-i".to_owned(), "eth0".to_owned(), "-s".to_owned(), "128".to_owned(), "-w".to_owned(), pcap.display().to_string(), "-U".to_owned()];
+            let argv = vec!["python3".to_owned(), "-I".to_owned(), c.s.web.join("capture.py").display().to_string(), "eth0".to_owned(), pcap.display().to_string()];
             captures.push((i, pcap, c.lab.command(Ns::Client(i), &argv)?.stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null()).spawn()?));
         }
         std::thread::sleep(Duration::from_millis(500));
@@ -287,7 +287,8 @@ fn job(c: &mut Ctx<'_>, r: &Running, t: &Target, browser: &str, case: &str, cond
     // The capture's bytes against the counters', over the window both saw.
     let mut capture = None;
     for (i, pcap, mut child) in captures {
-        let _ = child.kill();
+        // SIGTERM: it writes what it holds and ends.
+        let _ = std::process::Command::new("kill").arg("-TERM").arg(child.id().to_string()).status();
         let _ = child.wait();
         if let (Ok(bytes), Some((_, ticks))) = (std::fs::read(&pcap), clients.get(i))
             && let (Some(f), Some(l)) = (ticks.iter().find(|t| t.t_us >= ready_us), ticks.last())
@@ -394,6 +395,93 @@ pub fn run(s: &Settings, out: &Path) -> anyhow::Result<BrowserRun> {
     drop(control);
     std::fs::write(out.join("run.json"), serde_json::to_vec_pretty(&run)?)?;
     Ok(run)
+}
+
+/// Step 5's test: each target started and stopped `times` times. Each start must answer on its port
+/// (TCP, and UDP too for an HTTP/3 target), each stop leave no process of it (its recorded PIDs
+/// gone and its scopes empty). A line for each target, and whether all passed.
+pub fn start_stop(s: &Settings, out: &Path, times: usize) -> anyhow::Result<(String, bool)> {
+    use std::fmt::Write as _;
+    std::fs::create_dir_all(out)?;
+    let lab = Lab::up(1)?;
+    let scopes = Scopes::mine()?;
+    let certs = servers::certs(&out.join("certs"))?;
+    let bin = super::standins::install(&out.join("bin"))?;
+    let mut text = String::new();
+    let mut all = true;
+    for t in &s.targets {
+        let (mut up, mut clean, mut why) = (0, 0, String::new());
+        for i in 0..times {
+            let env = Env { lab: &lab, scopes: &scopes, certs: &certs, web: &s.web, bin: &bin, kiln: s.kiln.as_deref(), h2o: s.h2o.as_deref(), caddy: s.caddy.as_deref(), payloads: s.payloads.as_deref(), term_per_s: 1.0, seed: s.seed };
+            let dir = out.join(format!("{}-{i}", t.name));
+            match servers::start(&env, t, &dir, 1) {
+                Ok(r) => {
+                    let pids: Vec<u32> = r.pids().iter().map(|(_, p)| *p).collect();
+                    let udp = !t.http3 || pids.iter().any(|p| udp_bound(*p, t.port));
+                    if udp {
+                        up += 1;
+                    } else {
+                        why = format!("start {i}: no UDP socket on {}", t.name);
+                    }
+                    // The first time, every static body it serves against the catalogue's own.
+                    if i == 0
+                        && let (Some(p), true) = (s.payloads.as_deref(), r.kiln.is_none())
+                    {
+                        let (same, of, odd) = served_bodies(&lab, t, &p.join("docroot"));
+                        let _ = writeln!(text, "- {}: {same} of {of} static bodies served as the catalogue holds them{}", t.name, odd.map_or_else(String::new, |o| format!(" (not: {o})")));
+                        all &= same == of && of > 0;
+                    }
+                    let scopes_of = [Some(r.scope.clone()), r.origin_scope.clone()];
+                    drop(r);
+                    std::thread::sleep(Duration::from_millis(300));
+                    let alive = pids.iter().filter(|p| Path::new(&format!("/proc/{p}")).exists()).count();
+                    let left: usize = scopes_of.iter().flatten().map(|d| std::fs::read_to_string(d.join("cgroup.procs")).unwrap_or_default().lines().count()).sum();
+                    if alive == 0 && left == 0 {
+                        clean += 1;
+                    } else {
+                        why = format!("stop {i}: {alive} recorded processes alive, {left} in its scopes");
+                    }
+                }
+                Err(e) => why = format!("start {i}: {e:#}"),
+            }
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+        let ok = up == times && clean == times;
+        all &= ok;
+        let _ = writeln!(text, "- {}: up {up} of {times}, stopped clean {clean} of {times}{}", t.name, if why.is_empty() { String::new() } else { format!(" (last: {why})") });
+    }
+    Ok((text, all))
+}
+
+/// Whether a process's network namespace has a UDP socket bound to `port`.
+fn udp_bound(pid: u32, port: u16) -> bool {
+    let hex = format!(":{port:04X}");
+    std::fs::read_to_string(format!("/proc/{pid}/net/udp")).unwrap_or_default().lines().skip(1).any(|l| l.split_whitespace().nth(1).is_some_and(|a| a.ends_with(&hex)))
+}
+
+/// Each file under `docroot` fetched from `t` by curl in the first client's namespace (HTTP/2,
+/// decompressed): how many came back byte for byte, of how many, and the first that didn't.
+fn served_bodies(lab: &Lab, t: &Target, docroot: &Path) -> (usize, usize, Option<String>) {
+    let mut files = Vec::new();
+    let mut stack = vec![docroot.to_path_buf()];
+    while let Some(d) = stack.pop() {
+        for e in std::fs::read_dir(&d).into_iter().flatten().flatten() {
+            let p = e.path();
+            if p.is_dir() { stack.push(p) } else { files.push(p) }
+        }
+    }
+    let (mut same, mut odd) = (0, None);
+    for f in &files {
+        let Ok(rel) = f.strip_prefix(docroot) else { continue };
+        let url = format!("{}/{}", t.origin(), rel.to_string_lossy().trim_end_matches("index.json").trim_end_matches('/'));
+        let argv = vec!["curl".to_owned(), "-sk".to_owned(), "--http2".to_owned(), "--compressed".to_owned(), url.clone()];
+        let got = lab.command(Ns::Client(0), &argv).and_then(|mut c| Ok(c.stdin(Stdio::null()).output()?));
+        match (got, std::fs::read(f)) {
+            (Ok(o), Ok(want)) if o.stdout == want => same += 1,
+            _ => odd = Some(url),
+        }
+    }
+    (same, files.len(), odd)
 }
 
 #[cfg(test)]
