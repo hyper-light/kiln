@@ -830,6 +830,7 @@ pub fn bus() -> &'static BusMetrics {
 }
 
 /// The bus's figures as the server's node states them when scraped: set by whoever holds the bus.
+#[derive(Default)]
 pub struct BusGauges {
     pub topics: Gauge,
     pub viewers: Gauge,
@@ -848,18 +849,12 @@ pub fn bus_gauges() -> &'static BusGauges {
     M.get_or_init(BusGauges::default)
 }
 
-impl Default for BusGauges {
-    fn default() -> Self {
-        Self { topics: Gauge::default(), viewers: Gauge::default(), memory_bytes: Gauge::default(), memory_limit_bytes: Gauge::default(), topic_bytes_peak: Gauge::default(), memory_bound_bytes: Gauge::default() }
-    }
-}
-
 /// The bus's row of what the server's memory holds, by owner: its bytes, and its bound once the bus has been
 /// observed (its limit is set then; goal 11, plan 01a1a87b2e56 step 3). The bound is the one that binds: the
 /// most its topics and subscriptions can hold, never past its limit.
 fn bus_memory(g: &BusGauges) -> (u64, Option<u64>) {
     let observed = g.memory_limit_bytes.get() > 0;
-    (u64::try_from(g.memory_bytes.get()).unwrap_or(0), Some(u64::try_from(g.memory_bound_bytes.get()).unwrap_or(0)).filter(|_| observed))
+    (u64::try_from(g.memory_bytes.get()).unwrap_or(0), observed.then(|| u64::try_from(g.memory_bound_bytes.get()).unwrap_or(0)))
 }
 
 /// The `kiln_bus_*` families, in the exposition.
