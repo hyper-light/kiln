@@ -2223,8 +2223,8 @@ impl Registry {
             match keep {
                 Some(n) => {
                     let had = m.events.len();
-                    m.events.retain(|e| e.seq.is_some_and(|q| q <= n));
-                    m.reindex();
+                    // Its chunks through `n` kept as they are, none read again (goal 9, plan 01a1a87b2cec step 3).
+                    m.keep_through(n);
                     // Past its machine's newest it had what the machine no longer has: its
                     // viewers let go of that too.
                     resync = m.events.len() != had;

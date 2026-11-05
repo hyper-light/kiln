@@ -1159,6 +1159,25 @@ reading and writing `Vec<u8>` a byte at a time. Of the whole server's CPU, a thi
 - **A loop's turn ends before the piece that would pass the quantum** (`rt::Turns`): by the longest piece
   it has done that turn, where it looked only for the quantum to have passed, so held its shard a piece
   past it.
+- **A runner's Build in pieces, its mirrors' file off the shards** (`hub::build`): the hub's loop took a
+  runner process's Build in one poll of ten things (its process, its legs' receipt, its upgrades, its
+  front door, sync's, observe's and the cluster's announcements, the conversation store's mirrors and a
+  restore, CI's word, its previews), and the mirrors' choice was written and synced there
+  (`mirrors.json`): g9p6's fill held the HTTP listener's shard 5 to 34 ms with it, calm and with hogs
+  alike (the disk's). Now each is a piece of its own, in the order they were, its process first (so its
+  Build still comes before its first job), the shard given up between them once its turn would pass the
+  quantum; and the kept files' writer writes the mirrors' file, synced, on the blocking pool
+  (`keep::synced`). A ReachHello is an announcement (a copy swapped in whole, and a message to the relay's
+  owner not waited for) and a line, whose write to stdout under its lock was its only wait: the log's
+  writer's now (`log_lines`).
+- **An Open going on from its copy keeps its chunks as they are** (`Mirror::keep_through`): a runner that
+  connects again sends each session it holds an Open going on from the copy's newest, and the owner kept
+  the events through it by reading every chunk of the copy again (inflating each, reading spilled ones
+  back from disk, parsing each event's JSON) and making them anew, on its shard, to keep them all. Now the
+  chunks before the cut stay as they are, the one it falls in is made again (read again only when it's
+  compact), and the index lets go of the rest alone. g9p6's fill doesn't have it (its server is fresh);
+  its Opens held up to 10.6 ms with hogs and 0.22 ms calm, a line written to stdout under its lock among
+  their work, now the log's writer's.
 
 ### Step 3's check
 
