@@ -339,16 +339,21 @@ pub fn nudge(on: bool) {
 }
 
 /// The nudge's period: `KILN_RT_NUDGE_US` microseconds where it's set and above 0 (the lab's A/B of
-/// periods, as `KILN_RT_QUANTUM_US` the quantum's), else the timers' tick, `timer_tick_ns`. The shard's
-/// timer slack is that tick too (hyper-rt's `Shard::build`), which the kernel adds to every timed wait,
-/// so at the tick a nudged shard's CPU is interrupted at least every two ticks while it waits: a shard
-/// woken behind a busy thread waits no longer than a timer of its own may be late (hyper-rt's
-/// `Driver::set_timer_slack_ns`: a timed wait ends at most a tick late).
-fn nudge_period_ns(timer_tick_ns: u64, env_us: Option<&str>) -> u64 {
+/// periods, as `KILN_RT_QUANTUM_US` the quantum's), else the longest that keeps a shard woken behind a busy
+/// thread within a step quantum of its CPU (goal 9, plan 01a1a87b2cec step 4: a wait's timeout derived from
+/// the tick). The quantum is the host's share of a ready task's delay ([`STEP_BUDGET_NS`]: its CPU, where
+/// another thread holds it, for about a quantum), and each of a nudged shard's waits ends within its period
+/// and the timer slack the kernel adds to every timed wait, the timers' tick (hyper-rt's `Shard::build`), so
+/// the period is the quantum less that tick, 166.7 µs at kiln's: an interrupt of the shard's own at least
+/// every 266.7 µs while it waits, 3,750 a second, where the timers' tick as the period gave one every 200 µs,
+/// 5,000 a second, for no bar it holds. Never shorter than that tick, the finest wait a shard keeps (a lab's
+/// quantum under two ticks). The kernel's own tick bounds the same wait too, at a millisecond on every HZ
+/// Linux offers (1000 at most), longer than any quantum the bar allows, so the nudge never leaves it to that.
+fn nudge_period_ns(step_budget_ns: u64, timer_tick_ns: u64, env_us: Option<&str>) -> u64 {
     env_us
         .and_then(|us| us.trim().parse::<u64>().ok())
         .filter(|us| *us > 0)
-        .map_or(timer_tick_ns, |us| us.saturating_mul(1000))
+        .map_or_else(|| step_budget_ns.saturating_sub(timer_tick_ns).max(timer_tick_ns), |us| us.saturating_mul(1000))
 }
 
 /// What a shard asks the OS for as it starts, past the real-time class (goal 3, plan 01a1a59c2a8e
@@ -635,7 +640,7 @@ fn start() -> Result<Rt, String> {
         REALTIME_SHARDS.store(shards, Ordering::Relaxed);
     }
     let nudge = NUDGE.load(Ordering::Relaxed);
-    let period_ns = nudge_period_ns(config.timer_tick_ns, std::env::var("KILN_RT_NUDGE_US").ok().as_deref());
+    let period_ns = nudge_period_ns(config.step_budget_ns, config.timer_tick_ns, std::env::var("KILN_RT_NUDGE_US").ok().as_deref());
     if nudge {
         NUDGE_PERIOD_NS.store(period_ns, Ordering::Relaxed);
         NUDGE_SHARDS.store(shards, Ordering::Relaxed);
@@ -2246,17 +2251,24 @@ mod tests {
         assert_eq!(shard_asks(false, false), ShardAsks { slice: true, nudge: false }, "the nudge only where asked for");
     }
 
-    /// Goal 8 (plan 01a1a59c2b29 step 7): the nudge's period is the timers' tick, which with the shard's slack
-    /// (that tick too) bounds a nudged shard's wake as its own timers' lateness is bounded; the lab may set
-    /// another in microseconds, and a value that isn't a positive count leaves the tick.
+    /// Goal 8 (plan 01a1a59c2b29 step 7), goal 9 (plan 01a1a87b2cec step 4): the nudge's period is the step
+    /// quantum less the timers' tick, the slack the kernel adds to each wait, so a nudged shard's CPU takes an
+    /// interrupt of its own within a quantum of the last while it waits: 166.666 µs at kiln's, where the tick as
+    /// the period woke each waiting shard a third again as often. Never under the tick; the lab may set another
+    /// in microseconds, and a value that isn't a positive count leaves the derived one.
     #[test]
-    fn g8_s7_the_nudge_s_period_is_the_timers_tick_unless_the_lab_sets_it() {
-        let tick = runtime_config(4, 64).timer_tick_ns;
-        assert_eq!(nudge_period_ns(tick, None), tick);
-        assert_eq!(nudge_period_ns(tick, Some("50")), 50_000);
-        assert_eq!(nudge_period_ns(tick, Some(" 250 ")), 250_000);
-        assert_eq!(nudge_period_ns(tick, Some("0")), tick, "0 isn't a period");
-        assert_eq!(nudge_period_ns(tick, Some("soon")), tick);
+    fn g9_s4_the_nudge_s_period_is_the_quantum_less_the_timers_slack() {
+        let c = runtime_config(4, 64);
+        let derived = nudge_period_ns(c.step_budget_ns, c.timer_tick_ns, None);
+        assert_eq!(derived, 166_666);
+        assert!(derived + c.timer_tick_ns <= c.step_budget_ns, "each nudge's interrupt within a quantum of the last");
+        assert_eq!(1_000_000_000 / (derived + c.timer_tick_ns), 3_750, "wakes a second of a waiting shard");
+        assert_eq!(1_000_000_000 / (2 * c.timer_tick_ns), 5_000, "with the tick as the period");
+        assert_eq!(nudge_period_ns(150_000, TIMER_TICK_NS, None), TIMER_TICK_NS, "a quantum under two ticks: the tick");
+        assert_eq!(nudge_period_ns(c.step_budget_ns, c.timer_tick_ns, Some("50")), 50_000);
+        assert_eq!(nudge_period_ns(c.step_budget_ns, c.timer_tick_ns, Some(" 250 ")), 250_000);
+        assert_eq!(nudge_period_ns(c.step_budget_ns, c.timer_tick_ns, Some("0")), derived, "0 isn't a period");
+        assert_eq!(nudge_period_ns(c.step_budget_ns, c.timer_tick_ns, Some("soon")), derived);
     }
 
     /// Goal 8 (plan 01a1a59c2b29 step 7): how the shards took the nudge is said once all of them answered,

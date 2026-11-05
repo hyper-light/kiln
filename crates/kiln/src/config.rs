@@ -143,9 +143,10 @@ pub struct Server {
     /// (docs/priority.md, "The bare-metal default"). `KILN_RT_REALTIME` overrides it.
     pub realtime: bool,
     /// Each of the server's shards nudges its CPU while it waits (docs/priority.md, "A nudge for the
-    /// shards"; goal 8, plan 01a1a59c2b29 step 7): its waits end at least every timer tick (100 µs), so
-    /// on a Linux kernel that preempts lazily a shard woken behind a thread busy in user space runs within
-    /// two ticks, not at the kernel's next tick (up to 1 ms at 1000 Hz). Needs no privilege; in the
+    /// shards"; goal 8, plan 01a1a59c2b29 step 7): its waits end at least every step quantum less the timers'
+    /// tick (166.7 µs; goal 9, plan 01a1a87b2cec step 4), so on a Linux kernel that preempts lazily a shard
+    /// woken behind a thread busy in user space runs within a quantum, the timer slack added (266.7 µs), not
+    /// at the kernel's next tick (up to 1 ms at 1000 Hz). Needs no privilege; in the
     /// real-time class's place where that's refused or not asked for (a shard in it needs no nudge). It
     /// costs a wake of each waiting shard every period, so it's off until declared (docs/ci.md §0.3,
     /// "Opt-in automation"); macOS and Windows refuse it, having no lazy preemption. `KILN_RT_NUDGE`
