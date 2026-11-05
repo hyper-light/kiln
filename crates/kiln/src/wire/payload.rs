@@ -116,7 +116,19 @@ fn message_of(json: &str) -> Option<String> {
 /// `json`, what a message of variant `of` carries on `wire`, read as a `T`: `unknown` for a tag
 /// this build doesn't know, `malformed` for the rest it can't read. The fields of it `T` doesn't
 /// have are taken, counted and said in the log ([`Ignored`]).
+///
+/// On a shard it's read straight into its type, with no JSON tree between, and its unknown fields are
+/// looked for off the shard, by [`checker`]'s thread (goal 9, plan 01a1a87b2cec step 5: looking read each
+/// runner message's JSON into a tree, the type out of that, and the type back into another tree to
+/// compare, on the hub's shard). What can't be read straight is read the way it always was, so it's
+/// refused, and said why, as before.
 pub fn payload<T: DeserializeOwned + Serialize>(wire: Wire, of: &'static str, json: &str) -> Result<T, Box<Unreadable>> {
+    if crate::rt::on_shard()
+        && let Ok(read) = serde_json::from_str::<T>(json)
+    {
+        check_later(wire, of, json, unknown_in::<T>);
+        return Ok(read);
+    }
     let came: Value = serde_json::from_str(json).map_err(|e| {
         Box::new(Unreadable {
             of,
@@ -129,15 +141,94 @@ pub fn payload<T: DeserializeOwned + Serialize>(wire: Wire, of: &'static str, js
     })?;
     let read = T::deserialize(&came).map_err(|e| refused(of, &e))?;
     if let Ok(kept) = serde_json::to_value(&read) {
-        let fields = unknown_fields(&came, &kept);
-        if !fields.is_empty() {
-            let said = ignored_here().lock().note(wire, &fields);
-            for field in said {
-                tracing::info!(wire = wire.name(), of, %field, "a field this build doesn't know, in a message it read: taken (said once an hour for each wire and field)");
-            }
-        }
+        say_unknown(wire, of, &unknown_fields(&came, &kept));
     }
     Ok(read)
+}
+
+/// Counts `fields`, what a message of variant `of` on `wire` carried that this build doesn't know, and
+/// says each in the log that wasn't said within the hour.
+fn say_unknown(wire: Wire, of: &'static str, fields: &[String]) {
+    if fields.is_empty() {
+        return;
+    }
+    let said = ignored_here().lock().note(wire, fields);
+    for field in said {
+        tracing::info!(wire = wire.name(), of, %field, "a field this build doesn't know, in a message it read: taken (said once an hour for each wire and field)");
+    }
+}
+
+/// The fields of `json` that a `T` read of it doesn't keep, as [`payload`] finds them off a shard
+/// ([`unknown_fields`]); none when it isn't a `T`.
+fn unknown_in<T: DeserializeOwned + Serialize>(json: &str) -> Vec<String> {
+    let Ok(came) = serde_json::from_str::<Value>(json) else { return Vec::new() };
+    let Ok(read) = T::deserialize(&came) else { return Vec::new() };
+    serde_json::to_value(&read).map(|kept| unknown_fields(&came, &kept)).unwrap_or_default()
+}
+
+/// A payload read on a shard, for [`checker`]'s thread to look for its unknown fields in (`find`).
+struct Check {
+    wire: Wire,
+    of: &'static str,
+    json: String,
+    find: fn(&str) -> Vec<String>,
+}
+
+/// The most bytes of payloads waiting for [`checker`]'s thread: as many as the hub's loop keeps waiting
+/// from runners (`crate::net::EVENTS_BYTES`), so it falls no further behind than the hub may. Past it, one
+/// is let go unlooked at, counted, and said at each power of two.
+const CHECKS_MOST: usize = crate::net::EVENTS_BYTES;
+
+impl crate::memory::queue::Weigh for Check {
+    /// Its place and its payload's text.
+    fn weight(&self) -> usize {
+        size_of::<Check>().saturating_add(self.json.len())
+    }
+}
+
+/// The payloads let go unlooked at for want of room ([`CHECKS_MOST`]).
+static CHECKS_LET_GO: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Hands a payload read on a shard to [`checker`]'s thread to look for its unknown fields in; where
+/// there's no such thread, they're looked for here, as before.
+fn check_later(wire: Wire, of: &'static str, json: &str, find: fn(&str) -> Vec<String>) {
+    let Some(tx) = checker() else {
+        say_unknown(wire, of, &find(json));
+        return;
+    };
+    match tx.try_send(Check { wire, of, json: json.to_owned(), find }) {
+        Ok(()) => {}
+        Err(async_channel::TrySendError::Full(_)) => {
+            let n = CHECKS_LET_GO.fetch_add(1, std::sync::atomic::Ordering::Relaxed).saturating_add(1);
+            if n.is_power_of_two() {
+                tracing::warn!(let_go = n, "runners' messages weren't looked at for fields this build doesn't know: their checker is behind");
+            }
+        }
+        // Its thread is gone: looked for here.
+        Err(async_channel::TrySendError::Closed(c)) => say_unknown(c.wire, c.of, &(c.find)(&c.json)),
+    }
+}
+
+/// The thread that looks for the unknown fields of payloads read on the shards, started the first time
+/// one is; none where it couldn't start (said so).
+fn checker() -> Option<&'static crate::memory::queue::Sender<Check>> {
+    static TX: OnceLock<Option<crate::memory::queue::Sender<Check>>> = OnceLock::new();
+    TX.get_or_init(|| {
+        let (tx, rx) = crate::memory::queue::bounded::<Check>(&crate::memory::owners::WIRE_CHECKS, CHECKS_MOST);
+        let started = std::thread::Builder::new().name("kiln-wire-check".into()).spawn(move || {
+            while let Ok(c) = rx.recv_blocking() {
+                say_unknown(c.wire, c.of, &(c.find)(&c.json));
+            }
+        });
+        match started {
+            Ok(_) => Some(tx),
+            Err(e) => {
+                tracing::warn!(error = %e, "no thread to look for fields this build doesn't know in runners' messages: looked for on the shards");
+                None
+            }
+        }
+    })
+    .as_ref()
 }
 
 /// Why `T` couldn't be read from what came: a tag it doesn't know is `unknown`, the rest
@@ -281,8 +372,9 @@ pub enum Frame {
     /// A message that may not come before its runner's Hello, from a runner whose Hello hasn't come: its
     /// kind (`crate::wire::agent_name`), and nothing it carries read.
     BeforeHello { what: String },
-    /// A runner's message, what it carries read ([`payload_of`]).
-    Read(Result<Carried<AgentMsg, FromRunner>, Box<Unreadable>>),
+    /// A runner's message, what it carries read ([`payload_of`]), and the label of its kind for the shards'
+    /// table of what held them (`crate::wire::agent_label`), for the polls that handle it.
+    Read { label: &'static hyper_rt::slow::Label, carried: Result<Carried<AgentMsg, FromRunner>, Box<Unreadable>> },
 }
 
 /// What reading a runner frame is expected to take, by its length ([`read_frame`]): moving averages of
@@ -354,7 +446,7 @@ fn read_now(data: &[u8], hello: bool) -> Frame {
     match crate::proto::read_agent(data) {
         Err(e) => Frame::Unreadable(e),
         Ok(msg) if !hello && !matches!(msg, AgentMsg::Hello(_) | AgentMsg::Instance(_) | AgentMsg::Machine { .. }) => Frame::BeforeHello { what: super::agent_name(&msg).to_owned() },
-        Ok(msg) => Frame::Read(payload_of(msg)),
+        Ok(msg) => Frame::Read { label: super::agent_label(&msg), carried: payload_of(msg) },
     }
 }
 
@@ -1069,12 +1161,40 @@ mod tests {
             anyhow::ensure!(expect.expected(len) > hyper_rt::slow::SLOW_POLL_NS, "expected slow");
             for _ in 0..64 {
                 let frame = read_frame_by(&expect, data.clone(), true).await;
-                anyhow::ensure!(matches!(frame, Frame::Read(Ok(_))), "the frame is read");
+                anyhow::ensure!(matches!(frame, Frame::Read { carried: Ok(_), .. }), "the frame is read");
             }
             // Each read off the shard took its eighth of the averages: (7/8)^64 of the second is 0.19 ms,
             // plus what the reads took; a hundred milliseconds leaves a debug build's reads plenty of room.
             let left = expect.expected(len);
             anyhow::ensure!(left < 100_000_000, "still expected to take {left} ns");
+            Ok(())
+        })
+    }
+
+    /// Goal 9, plan 01a1a87b2cec step 5: on a shard a payload is read straight into its type, and comes out
+    /// as it does off one: the same value, a field given twice read as before (its last), the same refusal
+    /// of what can't be read. Its unknown fields are still counted, by the checker's thread.
+    #[test]
+    fn g9_s5_a_payload_read_on_a_shard_is_read_as_off_one() -> anyhow::Result<()> {
+        #[derive(Debug, PartialEq, Serialize, serde::Deserialize)]
+        struct Two {
+            a: u32,
+            #[serde(default, skip_serializing_if = "Option::is_none")]
+            b: Option<String>,
+        }
+        const CASES: [&str; 6] = [r#"{"a":1,"b":"x"}"#, r#"{"a":1,"a":2}"#, r#"{"a":"one"}"#, r#"{"a":1"#, "", r#"{"a":1,"new":[1],"empty":null}"#];
+        let wire = Wire::StreamDown;
+        let off: Vec<Result<Two, Box<Unreadable>>> = CASES.iter().map(|j| payload::<Two>(wire, "Two", j)).collect();
+        let before = crate::metrics::wire().ignored.get(&[wire.name()]);
+        crate::rt::block_on(async move {
+            let on: Vec<Result<Two, Box<Unreadable>>> = CASES.iter().map(|j| payload::<Two>(wire, "Two", j)).collect();
+            anyhow::ensure!(on == off, "on a shard {on:?}, off one {off:?}");
+            // `new` came with something in it (`empty` didn't): counted once its thread has looked.
+            let deadline = Instant::now() + Duration::from_secs(30);
+            while crate::metrics::wire().ignored.get(&[wire.name()]).saturating_sub(before) < 1 {
+                anyhow::ensure!(Instant::now() < deadline, "the unknown field read on a shard wasn't counted");
+                crate::rt::sleep(Duration::from_millis(5)).await;
+            }
             Ok(())
         })
     }

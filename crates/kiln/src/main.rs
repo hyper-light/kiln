@@ -580,18 +580,34 @@ fn main() -> ExitCode {
         Cmd::Agent(_) | Cmd::Join(_) | Cmd::Outpost(_) => kiln::rt::Profile::agent(),
         _ => kiln::rt::Profile::tool(),
     });
-    // Cores of the server's own (docs/priority.md, "Cores of its own"): its shards fixed to them,
-    // before the runtime starts.
+    // The server's place on its machine (docs/priority.md), before the runtime starts: cores of its
+    // own, its shards fixed to them, and the legs and agents its own runner starts kept off them
+    // (worked out from the CPUs this thread starts with, before the shards take theirs); and its
+    // shards' real-time class.
+    let config_path = cli.config.clone().unwrap_or_else(config::default_config_path);
     if matches!(cli.cmd, Cmd::Server)
-        && let Some(cores) = config::Config::load(&cli.config.clone().unwrap_or_else(config::default_config_path)).ok().and_then(|c| c.server.cores)
+        && let Ok(cfg) = config::Config::load(&config_path)
     {
-        match kiln::os::own_cores(&cores) {
-            Ok(own) => {
-                tracing::info!(cores = %cores, "the server's shards are fixed to cores of its own");
-                kiln::rt::pin(own);
+        if let Some(cores) = &cfg.server.cores {
+            if cfg.local_agent.enabled {
+                kiln::os::keep_work_off(cores, "the server's own runner");
             }
-            Err(why) => tracing::warn!(why = %why, "the server's shards aren't fixed to cores of its own"),
+            match kiln::os::own_cores(cores) {
+                Ok(own) => {
+                    tracing::info!(cores = %cores, "the server's shards are fixed to cores of its own");
+                    kiln::rt::pin(own);
+                }
+                Err(why) => tracing::warn!(why = %why, "the server's shards aren't fixed to cores of its own"),
+            }
         }
+        kiln::rt::realtime(cfg.server.realtime);
+    }
+    // A runner on a machine whose config gives the server cores of its own keeps the legs and agents
+    // it starts off them (docs/priority.md, "Legs and agents keep off the server's cores").
+    if matches!(cli.cmd, Cmd::Agent(_) | Cmd::Join(_))
+        && let Some(cores) = config::Config::load(&config_path).ok().and_then(|c| c.server.cores)
+    {
+        kiln::os::keep_work_off(&cores, "this runner");
     }
     match kiln::rt::block_on(real_main(cli)) {
         Ok(()) => ExitCode::SUCCESS,

@@ -1240,8 +1240,21 @@ pub(crate) async fn refused_relayed(store: &Store, digest: &str, what: &str, rel
 /// a custody record, so of no kind; checked as of `at`, revocations aside (whether the act counts
 /// is its own check's). Whether it's new.
 pub(crate) async fn keep_originator(store: &Store, root: &[u8], bundle: &Value, came_from: &str, at: i64) -> anyhow::Result<bool> {
-    let c = statement::verify(bundle, root, &[], at).map_err(|e| anyhow::anyhow!("{e}"))?;
+    let c = verify_off(bundle, root, Vec::new(), at).await?.map_err(|e| anyhow::anyhow!("{e}"))?;
     keep(store, &c, None, None, bundle, came_from).await
+}
+
+/// [`keep_originator`], `c` its check made already (a relayed act's, `crate::relays::call`): not made again.
+pub(crate) async fn keep_originator_checked(store: &Store, c: &Checked, bundle: &Value, came_from: &str) -> anyhow::Result<bool> {
+    keep(store, c, None, None, bundle, came_from).await
+}
+
+/// [`statement::verify`] on the compute pool, off the shards (goal 9, plan 01a1a87b2cec step 3): a statement's
+/// signature and its certificate chain, public-key checks that took a third of a millisecond together on the
+/// lab machine, on the shard of whatever task asked.
+pub(crate) async fn verify_off(bundle: &Value, root: &[u8], revocations: Vec<Revocation>, at: i64) -> anyhow::Result<Result<Checked, statement::Refusal>> {
+    let (bundle, root) = (bundle.clone(), root.to_vec());
+    crate::rt::compute(move || statement::verify(&bundle, &root, &revocations, at)).await
 }
 
 /// Records refusal `r`, and audits it.

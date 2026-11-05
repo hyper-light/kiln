@@ -818,7 +818,8 @@ fn writer(mut engine: Box<dyn Engine>, rx: &mpsc::Receiver<Msg>, watchers: &Watc
 
 /// A sink that keeps what passes through it in `store` on its way to `sink`, in order, with the
 /// same room (a full `sink` holds the sessions back, as it always did).
-pub fn tee(sink: Sink, store: Store, room: usize) -> Sink {
+pub fn tee(sink: impl Into<Sink>, store: Store, room: usize) -> Sink {
+    let sink: Sink = sink.into();
     let (tx, rx) = async_channel::bounded::<(String, Update)>(room);
     crate::rt::spawn(async move {
         while let Ok((id, u)) = rx.recv().await {
@@ -830,7 +831,7 @@ pub fn tee(sink: Sink, store: Store, room: usize) -> Sink {
             }
         }
     });
-    tx
+    tx.into()
 }
 
 /// Where the store a [`tee_held`] keeps what passes in stands.
@@ -881,7 +882,8 @@ impl Held {
 
 /// [`tee`], with its store [`Held`]: given now, or later, or taken away. Rows that come before
 /// the store wait for it in memory; never given, they go.
-pub fn tee_held(sink: Sink, store: Option<Store>, room: usize) -> (Sink, Held) {
+pub fn tee_held(sink: impl Into<Sink>, store: Option<Store>, room: usize) -> (Sink, Held) {
+    let sink: Sink = sink.into();
     let (tx, rx) = async_channel::bounded::<(String, Update)>(room);
     let keeping = Arc::new(Mutex::new(store.map_or_else(|| Keeping::Waiting(Vec::new()), Keeping::Store)));
     let held = Held { keeping: keeping.clone(), input: tx.downgrade() };
@@ -908,7 +910,7 @@ pub fn tee_held(sink: Sink, store: Option<Store>, room: usize) -> (Sink, Held) {
             }
         }
     });
-    (tx, held)
+    (tx.into(), held)
 }
 
 /// A store on a new database in a temporary folder, for tests.

@@ -37,6 +37,12 @@ hot = [
   "crates/kiln/src/harness/registry.rs",
   # Each machine's agent limit: read as sessions start and as runners say what they hold.
   "crates/kiln/src/harness/limit.rs",
+  # Reach's relay between runners: every relayed frame, one owner taking them in order.
+  "crates/kiln/src/reach/relay.rs",
+  # A runner's front door with a replica of kiln's records (docs/p2p.md, the peer-to-peer
+  # unification's P2): every request it answers from the replica, and the learner behind it.
+  "crates/kiln/src/frontdoor/replica.rs",
+  "crates/kiln/src/store/learner.rs",
   # The bus the live feeds ride, and the logs.
   "crates/kiln/src/bus.rs",
   "crates/kiln/src/logs.rs",
@@ -45,6 +51,25 @@ hot = [
   "crates/kiln/src/store.rs",
   # What makes them lockless.
   "crates/kiln/src/rcu.rs",
+  # CI (goal 5 step 2): the engine's legs, runs and kept legs, which the hub reads on its runners' job
+  # messages; the caches the API's calls and the runs planned read; the modules the API's runs, legs,
+  # pools and insights are read through.
+  "crates/kiln/src/ci/dispatch.rs",
+  "crates/kiln/src/ci/repo_config.rs",
+  "crates/kiln/src/ci/routing.rs",
+  "crates/kiln/src/ci/environments.rs",
+  "crates/kiln/src/ci/results.rs",
+  "crates/kiln/src/ci/warm.rs",
+  "crates/kiln/src/ci/graphs.rs",
+  "crates/kiln/src/ci/verdicts.rs",
+  "crates/kiln/src/ci/api.rs",
+  "crates/kiln/src/ci/runs_api.rs",
+  "crates/kiln/src/ci/runs.rs",
+  "crates/kiln/src/ci/pools.rs",
+  "crates/kiln/src/ci/insights.rs",
+  "crates/kiln/src/reads.rs",
+  # Ship's Deploys (goal 5 step 2).
+  "crates/kiln/src/ship",
 ]
 
 # kiln-http: a cell per body, upgrade or wait, held by that one object's two ends, no other request's.
@@ -145,25 +170,6 @@ at = "crates/kiln/src/hub.rs"
 name = "handovers"
 why = "agent sessions moving between a machine's runner processes (crate::handovers): taken as a runner process is replaced, and on a session's update only when two of a machine's processes both say they hold it"
 
-[[allowed]]
-at = "crates/kiln/src/hub.rs"
-name = "reach"
-why = "reach's links between runners (crate::reach::relay): each relayed frame takes it in the hub's loop; the reach directory and the relays' checkpoints read it"
-todo = "the hub's loop its one owner, what the directory and the checkpoints read a copy it swaps in (crate::rcu)"
-
-# Logs.
-
-[[allowed]]
-at = "crates/kiln/src/logs.rs"
-name = "use"
-why = "imports a live job's files' cell (files, below)"
-
-[[allowed]]
-at = "crates/kiln/src/logs.rs"
-name = "files"
-why = "one per live job, held by what writes that job's log alone (its runner's chunks, in order through the hub's loop; its steps; its end); no viewer takes it (a job's feed is its entry's, in the live jobs' copy), nor another job's writer"
-todo = "an owner per job's files, its chunks, steps and end its messages"
-
 # Agent sessions' registry: what a session's updates read beside its copy (names, epochs, holders,
 # keep-offs, changesets, what machines offer) are copies swapped in whole (crate::rcu); these three
 # are off the hot path.
@@ -187,3 +193,59 @@ why = "one write of holders.json at a time, on the blocking pool, as a session c
 at = "crates/kiln/src/harness/registry.rs"
 name = "waiting"
 why = "messages waiting for their session's inbox to answer (CP-T3.2): taken twice a message, as it's sent to a session and as its inbox's answer comes (an Inbox update, in the hub's loop); never on any other update, a viewer's read or a command"
+
+# A runner's front door answering reads from its replica, and the learners behind it: the peer-to-peer
+# unification's (docs/p2p.md, P2: plan 01a1a283e14c), the custody of the cluster group added to them by
+# W27-R08 (docs/ci.md, step 12, path f). Listed for their owners to change; those on a request's or a
+# message's path say what replaces them (todo).
+
+[[allowed]]
+at = "crates/kiln/src/frontdoor/replica.rs"
+name = "owners"
+why = "P2's: which credentials are the owner's, as the server said, kept a while; one Door serves all of the front door's connections, so every read it answers from the replica takes it"
+todo = "a crate::rcu copy, swapped in as the server's answer comes, or one per shard"
+
+[[allowed]]
+at = "crates/kiln/src/frontdoor/replica.rs"
+name = "stale_until"
+why = "P2's: until when the server answers every read, the replica behind; every read the front door answers from the replica takes it"
+todo = "an atomic: the instant as milliseconds in an AtomicU64"
+
+[[allowed]]
+at = "crates/kiln/src/frontdoor/replica.rs"
+name = "idle"
+why = "P2's: the front door's kept connections to the server, taken on every request it sends the server"
+todo = "a lock-free queue of kept connections (async_channel), or a pool per shard"
+
+[[allowed]]
+at = "crates/kiln/src/store/learner.rs"
+name = "GLOBAL"
+why = "P2's: this process's learner, read (an RwLock's read) on every front-door connection at a runner holding a replica (frontdoor/proxy.rs door_for), written as its learner starts and stops"
+todo = "a crate::rcu copy of the Option<Arc<Learner>>, read without a lock"
+
+[[allowed]]
+at = "crates/kiln/src/store/learner.rs"
+name = "asks"
+why = "P2's: questions to the server of where kiln.db stands, taken twice on every read the front door answers from the replica (Learner::current) and once as its answer comes"
+todo = "crate::rcu::Pending, the take-once cells the hub's questions to runners use"
+
+[[allowed]]
+at = "crates/kiln/src/store/learner.rs"
+name = "machines"
+why = "P2's, the server's side: each learner's machine by its member, read for every message the cluster group sends a learner (the hub's cluster loop), written as a runner says it holds a replica"
+todo = "a crate::rcu copy, read on every group message, swapped in as learners come"
+
+[[allowed]]
+at = "crates/kiln/src/store/learner.rs"
+name = "joiner"
+why = "P2's: the parts of raft messages coming in (a runner's learner's from the server; the server's from its learners), each taken by its one reader of them; no request takes it"
+
+[[allowed]]
+at = "crates/kiln/src/store/learner.rs"
+name = "periods"
+why = "W27-R08's custody of the cluster group (docs/ci.md, step 12, path f), in P2's learners: the log's checkpoints owed to the learners that check them, taken as checkpoints come due, are sent and are checked, not by a request"
+
+[[allowed]]
+at = "crates/kiln/src/store/learner.rs"
+name = "changes_after"
+why = "a test build's fault (entry_changed) only, taken when the chaos config sets it; nothing in a release takes it"

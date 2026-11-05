@@ -65,6 +65,23 @@ struct Feed {
     shipper: Shipper,
 }
 
+/// What the server sends a mirror: the link it goes on, the message's JSON and the bytes after it (a
+/// batch's part, up to `super::feed::PART`).
+pub type Out = (PeerId, String, Vec<u8>);
+
+impl crate::memory::queue::Weigh for Out {
+    /// Its place, its JSON and the bytes it carries.
+    fn weight(&self) -> usize {
+        size_of::<Out>().saturating_add(self.1.len()).saturating_add(self.2.len())
+    }
+}
+
+/// The bytes waiting to go to mirrors, at most (goal 11, plan 01a1a87b2e56 step 3): as many as the net
+/// thread's queue they're sent into ([`crate::net::OUT_BYTES`]), past which each mirror's feed waits, as it
+/// did past 64 messages of up to 3 MiB (192 MiB). Each feed sends at most [`super::feed::WINDOW`] batches
+/// ahead of what its mirror has acknowledged.
+pub const OUT_BYTES: usize = crate::net::OUT_BYTES;
+
 /// The server's mirrors.
 pub struct Mirrors {
     store: Store,
@@ -73,7 +90,7 @@ pub struct Mirrors {
     file: PathBuf,
     chosen: Mutex<Vec<Chosen>>,
     feeds: Mutex<HashMap<String, Feed>>,
-    out: async_channel::Sender<(PeerId, String, Vec<u8>)>,
+    out: crate::memory::queue::Sender<Out>,
     /// What each mirror sent back to restore the store from: not sent to it again.
     echoes: Option<Arc<super::feed::Echoes>>,
     /// Who signs for each feed, once the server can ([`Mirrors::sign_with`]).
@@ -93,9 +110,9 @@ impl Mirrors {
     /// The server's mirrors of `store`, `want` of them, picked from `first` first; what to send
     /// each comes out of the receiver, `(peer, json, bytes)` for `ServerMsg::Convo`. `echoes`:
     /// what a mirror sent back to restore the store from, which its feed leaves out.
-    pub fn start(store: Store, want: usize, first: Vec<String>, file: PathBuf, echoes: Option<Arc<super::feed::Echoes>>) -> (Arc<Self>, async_channel::Receiver<(PeerId, String, Vec<u8>)>) {
+    pub fn start(store: Store, want: usize, first: Vec<String>, file: PathBuf, echoes: Option<Arc<super::feed::Echoes>>) -> (Arc<Self>, crate::memory::queue::Receiver<Out>) {
         let chosen: Vec<Chosen> = std::fs::read(&file).ok().and_then(|b| serde_json::from_slice(&b).ok()).unwrap_or_default();
-        let (out, rx) = async_channel::bounded(64);
+        let (out, rx) = crate::memory::queue::bounded::<Out>(&crate::memory::owners::MIRRORS_OUT, OUT_BYTES);
         (Arc::new(Self { store, want, first, file, chosen: Mutex::new(chosen), feeds: Mutex::new(HashMap::new()), out, echoes, custodians: Mutex::new(None) }), rx)
     }
 

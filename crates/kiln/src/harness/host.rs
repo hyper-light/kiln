@@ -455,29 +455,30 @@ pub const ATTACHMENT_MAX: u64 = 25 << 20;
 pub const PACKAGE_MAX: u64 = 1 << 30;
 
 impl Host {
-    pub fn new(sink: Sink, file: Option<PathBuf>, limits: Limits) -> Arc<Self> {
+    pub fn new(sink: impl Into<Sink>, file: Option<PathBuf>, limits: Limits) -> Arc<Self> {
         Self::with_clock(sink, file, limits, crate::rt::clock())
     }
 
     /// A host whose time is `clock`'s, its sessions' inboxes keeping their records beside its own
     /// record of them.
-    pub fn with_clock(sink: Sink, file: Option<PathBuf>, limits: Limits, clock: Arc<dyn Clock>) -> Arc<Self> {
+    pub fn with_clock(sink: impl Into<Sink>, file: Option<PathBuf>, limits: Limits, clock: Arc<dyn Clock>) -> Arc<Self> {
         Self::counting_into(sink, file, limits, clock, crate::metrics::agents())
     }
 
     /// A host whose time is `clock`'s, its looks and record writes counted into `metrics`, its
     /// sessions' inboxes keeping their records beside its own record of them.
-    pub fn counting_into(sink: Sink, file: Option<PathBuf>, limits: Limits, clock: Arc<dyn Clock>, metrics: &'static crate::metrics::AgentMetrics) -> Arc<Self> {
+    pub fn counting_into(sink: impl Into<Sink>, file: Option<PathBuf>, limits: Limits, clock: Arc<dyn Clock>, metrics: &'static crate::metrics::AgentMetrics) -> Arc<Self> {
         let records = file.as_ref().and_then(|f| f.parent()).and_then(open_records);
         Self::build(sink, file, limits, clock, records, metrics)
     }
 
     /// A host whose sessions' inboxes keep their records in `records` (none: no inboxes).
-    pub fn with_records(sink: Sink, file: Option<PathBuf>, limits: Limits, clock: Arc<dyn Clock>, records: Option<Arc<dyn kiln_seams::Records>>) -> Arc<Self> {
+    pub fn with_records(sink: impl Into<Sink>, file: Option<PathBuf>, limits: Limits, clock: Arc<dyn Clock>, records: Option<Arc<dyn kiln_seams::Records>>) -> Arc<Self> {
         Self::build(sink, file, limits, clock, records, crate::metrics::agents())
     }
 
-    fn build(sink: Sink, file: Option<PathBuf>, limits: Limits, clock: Arc<dyn Clock>, records: Option<Arc<dyn kiln_seams::Records>>, metrics: &'static crate::metrics::AgentMetrics) -> Arc<Self> {
+    fn build(sink: impl Into<Sink>, file: Option<PathBuf>, limits: Limits, clock: Arc<dyn Clock>, records: Option<Arc<dyn kiln_seams::Records>>, metrics: &'static crate::metrics::AgentMetrics) -> Arc<Self> {
+        let sink: Sink = sink.into();
         // The models its harnesses' sessions list are kept beside its record of them.
         if let Some(dir) = file.as_ref().and_then(|f| f.parent()) {
             super::kinds::keep_models_in(dir.join("harness-models.json"));
@@ -2277,7 +2278,7 @@ mod tests {
 
     /// A host on a simulated clock of its own, never moved: its watch never looks and its record
     /// is written only when a test says (`save_now`).
-    fn sim(tx: Sink, file: Option<PathBuf>, limits: Limits) -> Arc<Host> {
+    fn sim(tx: impl Into<Sink>, file: Option<PathBuf>, limits: Limits) -> Arc<Host> {
         Host::with_clock(tx, file, limits, Arc::new(SimClock::new()))
     }
 
@@ -3016,7 +3017,7 @@ while True:
     }
 
     /// A host whose sessions' inboxes keep their records in the simulator's.
-    fn with_inbox(tx: Sink) -> Arc<Host> {
+    fn with_inbox(tx: impl Into<Sink>) -> Arc<Host> {
         Host::with_records(tx, None, Limits::default(), Arc::new(SimClock::new()), Some(Arc::new(kiln_seams::records::SimRecords::new())))
     }
 

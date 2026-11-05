@@ -41,6 +41,9 @@ struct Entry {
     armed: bool,
 }
 
+/// An entry not made yet: idle.
+static IDLE: Entry = Entry::IDLE;
+
 impl Entry {
     /// Format: an unarmed entry.
     const IDLE: Entry = Entry {
@@ -63,7 +66,12 @@ pub struct Wheel {
     /// found by a compare where the tick's number takes a division (the loop advances at every reading of its
     /// inputs, many within a tick).
     next_tick_ns: u64,
-    entries: Box<[Entry]>,
+    /// The entries of the timers armed so far: one is made as its timer is first armed, the timers below it
+    /// with it (kiln's goal 11: room for `capacity` is taken as the wheel is made, its pages written only as
+    /// entries are), so the wheel's memory follows the most timers the shard has held, not its bound.
+    entries: Vec<Entry>,
+    /// The timers it has room for.
+    capacity: usize,
     heads: Box<[u32]>,
     occupied: [u64; LEVELS],
     armed: usize,
@@ -80,7 +88,8 @@ impl Wheel {
             tick_ns,
             now_tick,
             next_tick_ns: now_tick.saturating_add(1).saturating_mul(tick_ns),
-            entries: vec![Entry::IDLE; capacity].into_boxed_slice(),
+            entries: Vec::with_capacity(capacity),
+            capacity,
             heads: vec![NONE; SLOTS_PER_LEVEL.saturating_mul(LEVELS)].into_boxed_slice(),
             occupied: [0; LEVELS],
             armed: 0,
@@ -105,7 +114,7 @@ impl Wheel {
 
     /// The timers it has room for.
     pub fn capacity(&self) -> usize {
-        self.entries.len()
+        self.capacity
     }
 
     /// Arms timer `id` to report `word` at `deadline_ns` (no earlier than the next tick). Refused for an id
@@ -295,18 +304,27 @@ impl Wheel {
         }
     }
 
+    /// Timer `id`'s entry: one not made yet is idle, as every entry was when they were all made up front.
     fn entry(&self, id: u32) -> Result<&Entry, RtError> {
-        usize::try_from(id)
+        let index = usize::try_from(id)
             .ok()
-            .and_then(|index| self.entries.get(index))
-            .ok_or(RtError::TimerState { id, armed: false })
+            .filter(|index| *index < self.capacity)
+            .ok_or(RtError::TimerState { id, armed: false })?;
+        Ok(self.entries.get(index).unwrap_or(&IDLE))
     }
 
+    /// Timer `id`'s entry, made (with those below it) as it is first asked for, up to the wheel's capacity.
     fn entry_mut(&mut self, id: u32) -> Result<&mut Entry, RtError> {
-        usize::try_from(id)
+        let refused = || RtError::TimerState { id, armed: false };
+        let index = usize::try_from(id)
             .ok()
-            .and_then(|index| self.entries.get_mut(index))
-            .ok_or(RtError::TimerState { id, armed: false })
+            .filter(|index| *index < self.capacity)
+            .ok_or_else(refused)?;
+        if index >= self.entries.len() {
+            self.entries
+                .resize(index.checked_add(1).ok_or_else(refused)?, Entry::IDLE);
+        }
+        self.entries.get_mut(index).ok_or_else(refused)
     }
 }
 

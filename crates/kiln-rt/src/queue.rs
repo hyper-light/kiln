@@ -21,77 +21,13 @@
 
 use std::cell::{Cell, OnceCell};
 
+use crate::cells::CellRing;
 use crate::coop::Class;
+use crate::slab::Slab;
 
-/// A first-in-first-out ring of slot numbers, one entry per slot at most: [`crate::cells::CellRing`]'s
-/// shape with the numbers held bare, since a slot is read only between the head and the length, so no entry
-/// needs a mark of its own.
-struct SlotRing {
-    slots: Box<[Cell<u32>]>,
-    /// The index of the oldest number.
-    head: Cell<usize>,
-    /// Numbers held.
-    len: Cell<usize>,
-}
-
-impl SlotRing {
-    /// A ring that holds at most `capacity` numbers.
-    fn new(capacity: usize) -> Self {
-        Self {
-            slots: (0..capacity).map(|_| Cell::new(0)).collect(),
-            head: Cell::new(0),
-            len: Cell::new(0),
-        }
-    }
-
-    fn len(&self) -> usize {
-        self.len.get()
-    }
-
-    fn is_empty(&self) -> bool {
-        self.len.get() == 0
-    }
-
-    /// Appends `slot`, or hands it back when the ring is full.
-    #[inline]
-    fn push(&self, slot: u32) -> Result<(), u32> {
-        let len = self.len.get();
-        let capacity = self.slots.len();
-        if len >= capacity {
-            return Err(slot);
-        }
-        // `head` and `len` are each below the capacity, so their sum is below twice it: one subtraction wraps it.
-        let end = self.head.get().wrapping_add(len);
-        let at = if end >= capacity {
-            end.wrapping_sub(capacity)
-        } else {
-            end
-        };
-        let Some(cell) = self.slots.get(at) else {
-            return Err(slot);
-        };
-        cell.set(slot);
-        self.len.set(len.wrapping_add(1));
-        Ok(())
-    }
-
-    /// Takes the oldest number.
-    #[inline]
-    fn pop(&self) -> Option<u32> {
-        let len = self.len.get();
-        if len == 0 {
-            return None;
-        }
-        let head = self.head.get();
-        let slot = self.slots.get(head)?.get();
-        // `head` is below the capacity, so the next index is at most the capacity: it wraps by a comparison.
-        let next = head.wrapping_add(1);
-        self.head
-            .set(if next >= self.slots.len() { 0 } else { next });
-        self.len.set(len.wrapping_sub(1));
-        Some(slot)
-    }
-}
+/// A ring of slot numbers, one entry per slot at most ([`crate::cells::CellRing`]: its cells made as it first
+/// holds that many, kiln's goal 11).
+type SlotRing = CellRing<u32>;
 
 /// A class's two lists: its ready FIFO and the slots of it that woke themselves since the loop last released
 /// them. A release onto an empty ready FIFO swaps the lists' roles rather than moving each entry, the case of a
@@ -139,17 +75,8 @@ impl Lists {
     /// for each, the moment it joins the FIFO.
     fn release(&self, queue: &LocalQueue, now_ns: u64) {
         let (ready, yielded) = (self.ready_list(), self.yielded_list());
-        let mut at = yielded.head.get();
         // Each released slot waits from here (its yield was its own choice, not a wait for the shard).
-        for _ in 0..yielded.len() {
-            if let Some(slot) = yielded.slots.get(at) {
-                queue.stamp(slot.get(), now_ns);
-            }
-            at = at.wrapping_add(1);
-            if at >= yielded.slots.len() {
-                at = 0;
-            }
-        }
+        yielded.each(|slot| queue.stamp(slot, now_ns));
         // Behind nothing: the lists swap roles, the released slots in the order they yielded.
         if ready.is_empty() {
             self.ready.set(if self.ready.get() == 0 { 1 } else { 0 });
@@ -158,11 +85,8 @@ impl Lists {
         while let Some(slot) = yielded.pop() {
             // Never refused: a slot is in one list at most, so both hold no more than the arena's slots.
             if ready.push(slot).is_err() {
-                if let Some(flag) = queue
-                    .pending
-                    .get(usize::try_from(slot).unwrap_or(usize::MAX))
-                {
-                    flag.set(false);
+                if let Some(place) = queue.place(slot) {
+                    place.pending.set(false);
                 }
                 queue.overflow.set(queue.overflow.get().saturating_add(1));
             }
@@ -205,12 +129,10 @@ impl Others {
 
 /// The queue.
 pub struct LocalQueue {
-    pending: Box<[Cell<bool>]>,
-    /// Each slot's class, as its task last set it (`crate::coop::set_class`): the lists it joins.
-    class: Box<[Cell<Class>]>,
-    /// When each slot last joined a ready FIFO, on the shard's clock as the loop last read it: its wait to its
-    /// poll is the shard's queueing delay (kiln's goal 6, `Counters::queue_ns_normal` and the others).
-    listed_ns: Box<[Cell<u64>]>,
+    /// Each slot's place, made as the queue first sees the slot (kiln's goal 11, plan 01a1a87b2e56: [`Slab`]), so
+    /// its memory follows the slots its shard has made, not its arena's bound. A slot not made yet is in no list,
+    /// of the Normal class, and never listed.
+    places: Slab<Place>,
     /// The Normal class's lists: the default, and every task's until it takes another.
     normal: Lists,
     /// The other classes' lists, made at the first task that takes one.
@@ -223,20 +145,41 @@ pub struct LocalQueue {
 impl std::fmt::Debug for LocalQueue {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("LocalQueue")
-            .field("capacity", &self.pending.len())
+            .field("capacity", &self.places.capacity())
+            .field("made", &self.places.made())
             .field("listed", &self.len())
             .field("classes", &self.others.get().is_some())
             .finish()
     }
 }
 
+/// One slot's place in the queue.
+struct Place {
+    /// Whether it is listed: in one list, once.
+    pending: Cell<bool>,
+    /// Its class, as its task last set it (`crate::coop::set_class`): the lists it joins.
+    class: Cell<Class>,
+    /// When it last joined a ready FIFO, on the shard's clock as the loop last read it: its wait to its poll is the
+    /// shard's queueing delay (kiln's goal 6, `Counters::queue_ns_normal` and the others).
+    listed_ns: Cell<u64>,
+}
+
+impl Place {
+    /// A slot's place as the queue first sees it: not listed, Normal, never listed.
+    fn new() -> Place {
+        Place {
+            pending: Cell::new(false),
+            class: Cell::new(Class::Normal),
+            listed_ns: Cell::new(0),
+        }
+    }
+}
+
 impl LocalQueue {
-    /// A queue for an arena of `capacity` slots.
+    /// A queue for an arena of `capacity` slots, none of their places made.
     pub fn new(capacity: usize) -> Self {
         Self {
-            pending: (0..capacity).map(|_| Cell::new(false)).collect(),
-            class: (0..capacity).map(|_| Cell::new(Class::Normal)).collect(),
-            listed_ns: (0..capacity).map(|_| Cell::new(0)).collect(),
+            places: Slab::new(capacity),
             normal: Lists::new(capacity),
             others: OnceCell::new(),
             listed: Cell::new(0),
@@ -244,25 +187,53 @@ impl LocalQueue {
         }
     }
 
-    /// The class of the task in `slot` (Normal for a slot past the arena).
+    /// Slot `slot`'s place, once made.
+    #[inline]
+    fn place(&self, slot: u32) -> Option<&Place> {
+        self.places.get(usize::try_from(slot).ok()?)
+    }
+
+    /// Slot `slot`'s place, made now (with each slot's before it not made yet) if it isn't: none past the arena.
+    #[inline]
+    fn place_made(&self, slot: u32) -> Option<&Place> {
+        let index = usize::try_from(slot).ok()?;
+        match self.places.get(index) {
+            Some(place) => Some(place),
+            None => self.make_places(index),
+        }
+    }
+
+    /// The places up to slot `index`'s made, in order: the slab makes them at its high-water mark only. The
+    /// desk's task slots are made in order too, so it is the next one or few as a rule.
+    #[cold]
+    #[inline(never)]
+    fn make_places(&self, index: usize) -> Option<&Place> {
+        if index >= self.places.capacity() {
+            return None;
+        }
+        while self.places.made() <= index {
+            self.places.make(Place::new())?;
+        }
+        self.places.get(index)
+    }
+
+    /// The class of the task in `slot` (Normal for a slot past the arena, or not seen yet).
     pub fn class_of(&self, slot: u32) -> Class {
-        self.class
-            .get(usize::try_from(slot).unwrap_or(usize::MAX))
-            .map_or(Class::Normal, Cell::get)
+        self.place(slot).map_or(Class::Normal, |place| place.class.get())
     }
 
     /// Sets the class of the task in `slot`, from its next listing; the class it had. The first slot of a class
     /// other than Normal makes the other classes' lists.
     pub fn set_class(&self, slot: u32, class: Class) -> Class {
-        let Some(cell) = self.class.get(usize::try_from(slot).unwrap_or(usize::MAX)) else {
+        let Some(place) = self.place_made(slot) else {
             return Class::Normal;
         };
         if class != Class::Normal {
             let _ = self
                 .others
-                .get_or_init(|| Box::new(Others::new(self.pending.len())));
+                .get_or_init(|| Box::new(Others::new(self.places.capacity())));
         }
-        cell.replace(class)
+        place.class.replace(class)
     }
 
     /// The lists `class` joins: Normal's while no other class was taken.
@@ -276,17 +247,12 @@ impl LocalQueue {
 
     /// When the task in `slot` last joined a ready FIFO, on the shard's clock (0 for a slot never listed).
     pub fn listed_ns(&self, slot: u32) -> u64 {
-        self.listed_ns
-            .get(usize::try_from(slot).unwrap_or(usize::MAX))
-            .map_or(0, Cell::get)
+        self.place(slot).map_or(0, |place| place.listed_ns.get())
     }
 
     fn stamp(&self, slot: u32, now_ns: u64) {
-        if let Some(stamp) = self
-            .listed_ns
-            .get(usize::try_from(slot).unwrap_or(usize::MAX))
-        {
-            stamp.set(now_ns);
+        if let Some(place) = self.place(slot) {
+            place.listed_ns.set(now_ns);
         }
     }
 
@@ -315,27 +281,24 @@ impl LocalQueue {
     /// listed twice. A slot beyond the arena is counted as overflow and ignored (a stale or foreign word).
     #[inline]
     pub fn push(&self, slot: u32, now_ns: u64) {
-        let Some(flag) = self
-            .pending
-            .get(usize::try_from(slot).unwrap_or(usize::MAX))
-        else {
+        let Some(place) = self.place_made(slot) else {
             self.overflow.set(self.overflow.get().saturating_add(1));
             return;
         };
-        if flag.replace(true) {
+        if place.pending.replace(true) {
             return;
         }
-        let class = self.class_of(slot);
+        let class = place.class.get();
         let lists = self.lists(class);
         let idle = lists.is_empty();
         // A slot is in the ring at most once (its flag), and the ring holds one entry per slot, so it never
         // refuses; were it to, the flag is cleared so the next wake lists the slot again.
         if lists.ready_list().push(slot).is_err() {
-            flag.set(false);
+            place.pending.set(false);
             self.overflow.set(self.overflow.get().saturating_add(1));
             return;
         }
-        self.stamp(slot, now_ns);
+        place.listed_ns.set(now_ns);
         if idle {
             self.activate(class);
         }
@@ -353,22 +316,19 @@ impl LocalQueue {
     /// ignored.
     #[inline]
     pub fn defer(&self, slot: u32) {
-        let Some(flag) = self
-            .pending
-            .get(usize::try_from(slot).unwrap_or(usize::MAX))
-        else {
+        let Some(place) = self.place_made(slot) else {
             self.overflow.set(self.overflow.get().saturating_add(1));
             return;
         };
-        if flag.replace(true) {
+        if place.pending.replace(true) {
             return;
         }
-        let class = self.class_of(slot);
+        let class = place.class.get();
         let lists = self.lists(class);
         let idle = lists.is_empty();
         // Never refused, as for `push`: one entry per slot, and the list holds one for every slot.
         if lists.yielded_list().push(slot).is_err() {
-            flag.set(false);
+            place.pending.set(false);
             self.overflow.set(self.overflow.get().saturating_add(1));
             return;
         }
@@ -424,11 +384,8 @@ impl LocalQueue {
             Some(others) => self.pick(others)?,
         };
         let slot = lists.ready_list().pop()?;
-        if let Some(flag) = self
-            .pending
-            .get(usize::try_from(slot).unwrap_or(usize::MAX))
-        {
-            flag.set(false);
+        if let Some(place) = self.place(slot) {
+            place.pending.set(false);
         }
         Some(slot)
     }
@@ -654,6 +611,30 @@ mod tests {
         q.push(5, 0);
         q.push(2, 0);
         assert_eq!(q.pop(), Some(2));
+    }
+
+    /// kiln's goal 11 (plan 01a1a87b2e56): a queue makes a slot's place as it first sees the slot, and its lists'
+    /// cells as they first hold that many; a slot not seen yet reads as one never listed, of the Normal class.
+    #[test]
+    fn g11_a_queue_makes_what_it_first_needs() {
+        let q = LocalQueue::new(1 << 20);
+        assert_eq!((q.places.made(), q.normal.ready_list().made()), (0, 0));
+        assert_eq!((q.class_of(7), q.listed_ns(7)), (Class::Normal, 0));
+        for slot in [2, 0, 1] {
+            q.push(slot, 5);
+        }
+        assert_eq!(q.places.made(), 3, "slots 0 to 2");
+        assert!(q.normal.ready_list().made() <= 4);
+        assert_eq!(take(&q, usize::MAX), vec![2, 0, 1]);
+        for _ in 0..1_000 {
+            q.push(1, 6);
+            q.defer(2);
+            q.release_yielded(7);
+            assert_eq!(take(&q, usize::MAX), vec![1, 2]);
+        }
+        assert_eq!(q.places.made(), 3, "the same slots again");
+        assert!(q.normal.ready_list().made() <= 4 && q.normal.yielded_list().made() <= 2);
+        assert_eq!(q.listed_ns(2), 7);
     }
 
     /// A slot's wait is stamped as it joins a ready FIFO: at its push, and for one that yielded, at its release.

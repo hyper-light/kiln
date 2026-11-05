@@ -109,12 +109,12 @@ pub struct Server {
     /// itself: a forwarded or NATed port, a host's Tailscale address. Empty: `webrtc_addr`, or (on
     /// every address) each LAN address of this machine at its port.
     pub webrtc_advertise: Vec<String>,
-    /// A shard whose queueing delay leaves its calm answers Background requests 503 with `Retry-After`,
-    /// and Normal ones too while the API's own delay does; Critical ones (health, sign-in, a person's
-    /// pages and actions) never (`crate::overload`, kiln's goal 6). Off until declared, as what kiln
-    /// decides on its own is (docs/ci.md §0.3, "Opt-in automation"): the delays and alarms are
-    /// measured and shown on `/metrics` and `/readyz` either way, and off, nothing is refused.
-    /// `KILN_SHED` overrides it.
+    /// A shard whose queue stands past its calm (it hasn't come back to it for a whole tolerance, 1 s),
+    /// or a pool's line that work keeps standing so, answers Background requests 503 with `Retry-After`,
+    /// and Normal ones too once it has stood another; Critical ones (health, sign-in, a person's pages
+    /// and actions) never (`crate::overload`, kiln's goal 6). Off until declared, as what kiln decides
+    /// on its own is (docs/ci.md §0.3, "Opt-in automation"): the queues are measured and shown on
+    /// `/metrics` and `/readyz` either way, and off, nothing is refused. `KILN_SHED` overrides it.
     pub shed: bool,
     /// How the server places its work on its runtime's shards (goal 7 of the API runtime program,
     /// `crate::placement`): `round-robin` (connections dealt in turn, requests served in their
@@ -126,9 +126,18 @@ pub struct Server {
     /// Cores of the server's own (docs/priority.md, "Cores of its own"; goal 8, plan 01a1a59c2b29
     /// step 6), as a CPU list (`8-15`, `2,4-7`): on Linux `kiln install` gives its `kiln.slice`
     /// these alone (`AllowedCPUs=`) and, installed system-wide, makes them a cpuset partition that
-    /// nothing outside the slice runs on; the server fixes its shards to them. Unset (the default),
-    /// the server shares every core with what runs beside it, first by its weight.
+    /// nothing outside the slice runs on; the server fixes its shards to them; and kiln's own legs
+    /// and agents keep off them, those its own runner starts and those of every runner whose config
+    /// this is (step 7). Unset (the default), the server shares every core with what runs beside it,
+    /// first by its weight.
     pub cores: Option<String>,
+    /// The server's shards in Linux's round-robin real-time class at its lowest priority
+    /// (docs/priority.md, "A real-time class for the shards"; goal 8, plan 01a1a59c2b29 step 7; goal 9,
+    /// plan 01a1a87b2cec step 4), where the system grants it (`kiln install` writes the grant,
+    /// `LimitRTPRIO=`): a shard waking takes its CPU at once, whatever runs there, under every kernel
+    /// preemption mode. Refused, the shards run as without it and `/healthz/server` and the log say
+    /// why. Off until declared (docs/ci.md §0.3, "Opt-in automation"). `KILN_RT_REALTIME` overrides it.
+    pub realtime: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -436,6 +445,7 @@ impl Default for Server {
             shed: false,
             placement: crate::placement::Placement::default(),
             cores: None,
+            realtime: false,
         }
     }
 }
@@ -618,6 +628,10 @@ impl Config {
         // `[server] shed`, as a lab's server takes its settings (`kiln-lab ab --env-b KILN_SHED=1`).
         if let Ok(v) = std::env::var("KILN_SHED") {
             cfg.server.shed = !matches!(v.trim(), "0" | "false" | "off" | "no");
+        }
+        // `[server] realtime`, as a lab's server takes its settings (`kiln-lab ab --env-b KILN_RT_REALTIME=1`).
+        if let Ok(v) = std::env::var("KILN_RT_REALTIME") {
+            cfg.server.realtime = !matches!(v.trim(), "0" | "false" | "off" | "no");
         }
         // `[server] placement`, as a lab's server takes its settings (`kiln-lab ab --env-b KILN_RT_PLACEMENT=steal`).
         if let Ok(v) = std::env::var("KILN_RT_PLACEMENT") {

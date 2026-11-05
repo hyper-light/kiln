@@ -1073,6 +1073,14 @@ fn leg_cpu() -> [String; 2] {
     [s("--cpu-shares"), LEG_CPU_SHARES.to_string()]
 }
 
+/// `--cpuset-cpus` for a leg's container not given its leg's CPUs (its egress relay, a Docker
+/// action's): beside a server with cores of its own, the CPUs kiln's own work keeps to
+/// (docs/priority.md, "Legs and agents keep off the server's cores"; goal 8, plan 01a1a59c2b29 step
+/// 7), as its job container and services keep to its share of them; else nothing.
+fn work_cpuset() -> Vec<String> {
+    crate::os::work_cpus().map(|c| vec![s("--cpuset-cpus"), super::cpus::list(&c)]).unwrap_or_default()
+}
+
 fn s(x: &str) -> String {
     x.to_owned()
 }
@@ -1404,8 +1412,9 @@ impl Containers {
             // Nothing it needs but its two ports.
             s("--user"), s("65534:65534"), s("--read-only"), s("--cap-drop"), s("ALL"), s("--security-opt"), s("no-new-privileges"),
         ]);
-        // The leg's, at a leg's weight.
+        // The leg's, at a leg's weight, off a server's cores.
         args.extend(leg_cpu());
+        args.extend(work_cpuset());
         args.extend([image.to_owned(), s("egress-relay")]);
         let env: BTreeMap<String, String> = [(s("KILN_EGRESS_TOKEN"), e.token.clone())].into();
         let id = self.cli.run(&args, &env, CALL).await?;
@@ -1519,6 +1528,7 @@ pub fn action_run_args(
         a.extend([s("--entrypoint"), e.to_owned()]);
     }
     a.extend(leg_cpu());
+    a.extend(work_cpuset());
     a.push(image.to_owned());
     a.extend(args.iter().cloned());
     a

@@ -213,6 +213,12 @@ pub struct Held {
     pub polls_per_s: f64,
     pub ms_per_s: f64,
     pub longest_ms: f64,
+    /// Of those polls, the ones the host held (preempted: `kiln_shard_held_host_*`, steps 3 and 4), and their
+    /// time; none from a build from before it said.
+    #[serde(default)]
+    pub host_polls: f64,
+    #[serde(default)]
+    pub host_ms: f64,
 }
 
 /// What held the shards between `before` and `after`, `secs` apart, the most time first.
@@ -228,6 +234,8 @@ pub fn held(before: &Scrape, after: &Scrape, secs: f64) -> Vec<Held> {
             "kiln_shard_held_polls_total" => row.polls += added,
             "kiln_shard_held_seconds_total" => row.ms += added * 1000.0,
             "kiln_shard_held_longest_seconds" => row.longest_ms = row.longest_ms.max(value * 1000.0),
+            "kiln_shard_held_host_polls_total" => row.host_polls += added,
+            "kiln_shard_held_host_seconds_total" => row.host_ms += added * 1000.0,
             _ => {}
         }
     }
@@ -313,6 +321,22 @@ mod tests {
         let page = h.first().cloned().unwrap_or_default();
         assert_eq!((page.site.as_str(), page.label.as_str()), ("a.rs:1:1", "page"));
         assert!((page.polls - 3.0).abs() < 1e-9 && (page.ms - 6.0).abs() < 1e-9 && (page.ms_per_s - 3.0).abs() < 1e-9 && (page.longest_ms - 4.0).abs() < 1e-9, "{page:?}");
+        assert!(page.host_polls == 0.0 && page.host_ms == 0.0, "a build that doesn't say the host's: none {page:?}");
+    }
+
+    /// Goal 9, plan 01a1a87b2cec steps 3 and 4: of what held the shards in a window, the polls the host held and
+    /// their time are the window's own too.
+    #[test]
+    fn g9_s3_what_the_host_held_is_the_window_s_own() {
+        let series = |polls: u32, secs: f64, host: u32, host_secs: f64| {
+            format!(
+                "kiln_shard_held_polls_total{{shard=\"0\",site=\"a.rs:1:1\",label=\"\"}} {polls}\nkiln_shard_held_seconds_total{{shard=\"0\",site=\"a.rs:1:1\",label=\"\"}} {secs}\nkiln_shard_held_host_polls_total{{shard=\"0\",site=\"a.rs:1:1\",label=\"\"}} {host}\nkiln_shard_held_host_seconds_total{{shard=\"0\",site=\"a.rs:1:1\",label=\"\"}} {host_secs}\n"
+            )
+        };
+        let (before, after) = (Scrape::parse(&series(10, 0.01, 2, 0.004)), Scrape::parse(&series(14, 0.02, 5, 0.01)));
+        let h = held(&before, &after, 1.0);
+        let a = h.first().cloned().unwrap_or_default();
+        assert!((a.polls - 4.0).abs() < 1e-9 && (a.host_polls - 3.0).abs() < 1e-9 && (a.host_ms - 6.0).abs() < 1e-9, "{a:?}");
     }
 
     #[test]

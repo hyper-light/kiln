@@ -261,6 +261,8 @@ pub fn response(status: StatusCode, content_type: &str, body: Body) -> Response 
 }
 
 pub fn json<T: serde::Serialize>(status: StatusCode, value: &T) -> Response {
+    // Encoded as it's answered (goal 10, plan 01a1a87b2dae step 2's trace: the lab's reads never are).
+    crate::reads::trace::encoded();
     match serde_json::to_vec(value) {
         Ok(b) => response(status, "application/json", full(b)),
         Err(e) => text(StatusCode::INTERNAL_SERVER_ERROR, &format!("serialize: {e}")),

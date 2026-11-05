@@ -373,7 +373,7 @@ pub enum NetEvent {
 
 #[derive(Clone)]
 pub struct NetHandle {
-    tx: async_channel::Sender<Out>,
+    tx: crate::memory::queue::Sender<Out>,
 }
 
 impl NetHandle {
@@ -404,8 +404,13 @@ impl NetHandle {
 /// Per-peer, per-lane frames refused with `LaneFull`, bounded.
 const OUTBOX_FRAMES: usize = 8192;
 
+/// A connection's receive window (`Limits::window_ceiling`): the most of one peer's bytes the transport
+/// lets be unread at once (QUIC's flow control, RFC 9000 §4.1). The net thread's queues are bounded by it
+/// ([`EVENTS_BYTES`], [`OUT_BYTES`]).
+pub const WINDOW: u64 = 64 << 20;
+
 pub fn limits(server: bool) -> Limits {
-    let window: u64 = 64 << 20;
+    let window: u64 = WINDOW;
     Limits {
         admission: AdmissionLimits {
             pending: if server { 512 } else { 8 },
@@ -468,17 +473,33 @@ pub struct Spec {
 /// boot, drops the handshake silently; QUIC alone would keep the dial pending).
 pub const DIAL_DEADLINE: Duration = Duration::from_secs(15);
 
-/// The transport events the net thread hands its owner (the hub's loop) at most before it holds
-/// them itself.
-pub const EVENTS: usize = 16_384;
+/// The bytes of transport events the net thread hands its owner (the hub's loop) at most before it holds
+/// them itself (goal 11, plan 01a1a87b2e56 step 3): one connection's receive window ([`WINDOW`]), what the
+/// net thread then holds itself before it holds its peers' lanes (`held_most`), so the owner's queue and
+/// the net thread's together never hold more than two windows of what runners sent. Counted in bytes
+/// ([`weight`]), never in events: 16,384 places of an event, made as the queue was, held 1.3 MB of an idle
+/// server's heap (research 01a1a87b2e57, f10) and bounded nothing of the frames they carried.
+pub const EVENTS_BYTES: usize = WINDOW as usize;
+
+/// The bytes of commands (frames to send, mostly) waiting for the net thread, at most (goal 11, plan
+/// 01a1a87b2e56 step 3): one connection's receive window ([`WINDOW`]), the most a peer takes unread, past
+/// which whoever sends waits ([`NetHandle::send`]) or is told it's full ([`NetHandle::try_send`]). Its
+/// 16,384 places took 0.9 MB of an idle server's heap made up front (research 01a1a87b2e57, f10).
+pub const OUT_BYTES: usize = WINDOW as usize;
 
 /// Start a net thread. Returns the command handle and the event stream.
-pub fn start(spec: Spec) -> anyhow::Result<(NetHandle, async_channel::Receiver<NetEvent>)> {
+pub fn start(spec: Spec) -> anyhow::Result<(NetHandle, crate::memory::queue::Receiver<NetEvent>)> {
+    start_bounded(spec, OUT_BYTES, EVENTS_BYTES)
+}
+
+/// [`start`], its queues bounded at `out` and `events` bytes (tests: a bound reached without sending
+/// two windows of frames).
+pub fn start_bounded(spec: Spec, out: usize, events: usize) -> anyhow::Result<(NetHandle, crate::memory::queue::Receiver<NetEvent>)> {
     // Validate the TLS material up front so misconfiguration fails loudly at startup.
     let _ = Tls::mutual(&credentials(&spec.ca_der, &spec.leaf)?, spec.server)
         .map_err(|r| anyhow::anyhow!("tls config: {r}"))?;
-    let (tx, rx) = async_channel::bounded::<Out>(16_384);
-    let (etx, erx) = async_channel::bounded::<NetEvent>(EVENTS);
+    let (tx, rx) = crate::memory::queue::bounded::<Out>(&crate::memory::owners::NET_OUT, out);
+    let (etx, erx) = crate::memory::queue::bounded::<NetEvent>(&crate::memory::owners::NET_EVENTS, events);
     let name = if spec.server { "kiln-net-server" } else { "kiln-net-agent" };
     std::thread::Builder::new().name(name.into()).spawn(move || thread_main(spec, rx, etx))?;
     Ok((NetHandle { tx }, erx))
@@ -492,13 +513,33 @@ type Handing = std::pin::Pin<Box<dyn std::future::Future<Output = bool>>>;
 fn weight(ev: &NetEvent) -> usize {
     std::mem::size_of::<NetEvent>().saturating_add(match ev {
         NetEvent::Frame { data, .. } => data.len(),
-        _ => 0,
+        NetEvent::Connected { name, .. } => name.as_ref().map_or(0, String::len),
+        NetEvent::Closed { reason, .. } | NetEvent::Unreachable { reason, .. } => reason.len(),
     })
+}
+
+impl crate::memory::queue::Weigh for NetEvent {
+    fn weight(&self) -> usize {
+        weight(self)
+    }
+}
+
+impl crate::memory::queue::Weigh for Out {
+    /// Its place and what it carries: a frame's bytes, the names and keys it says.
+    fn weight(&self) -> usize {
+        std::mem::size_of::<Out>().saturating_add(match self {
+            Out::Frame { data, .. } => data.len(),
+            Out::Revoke { name } | Out::Unrevoke { name } => name.len(),
+            Out::RevokeKeys { keys, why } => keys.iter().map(String::len).sum::<usize>().saturating_add(why.len()),
+            Out::Copy(path) => path.as_os_str().len(),
+            Out::Disconnect { .. } | Out::Connect { .. } | Out::Rebuild | Out::Shed(_) | Out::Seed(_) | Out::Sample { .. } => 0,
+        })
+    }
 }
 
 /// Hands `held` to the owner in order: as many as it has room for, the next one waiting in
 /// `handing` when it has no more. False when the owner is gone.
-fn hand_over(etx: &async_channel::Sender<NetEvent>, held: &mut VecDeque<NetEvent>, held_bytes: &mut usize, handing: &mut Option<Handing>) -> bool {
+fn hand_over(etx: &crate::memory::queue::Sender<NetEvent>, held: &mut VecDeque<NetEvent>, held_bytes: &mut usize, handing: &mut Option<Handing>) -> bool {
     while handing.is_none() {
         let Some(ev) = held.pop_front() else { break };
         *held_bytes = held_bytes.saturating_sub(weight(&ev));
@@ -559,7 +600,7 @@ impl Carry {
     }
 }
 
-fn thread_main(spec: Spec, rx: async_channel::Receiver<Out>, etx: async_channel::Sender<NetEvent>) {
+fn thread_main(spec: Spec, rx: crate::memory::queue::Receiver<Out>, etx: crate::memory::queue::Sender<NetEvent>) {
     let spec = Arc::new(spec);
     let last_dial: Arc<Mutex<Option<SocketAddr>>> = Arc::new(Mutex::new(None));
     // One shard: the loop, plus helpers for any wait polled under a foreign waker.
@@ -844,8 +885,8 @@ where
 
 async fn run_loop(
     spec: Arc<Spec>,
-    rx: async_channel::Receiver<Out>,
-    etx: async_channel::Sender<NetEvent>,
+    rx: crate::memory::queue::Receiver<Out>,
+    etx: crate::memory::queue::Sender<NetEvent>,
     last_dial: Arc<Mutex<Option<SocketAddr>>>,
     carry: Carry,
 ) -> anyhow::Result<Exit> {
@@ -1261,7 +1302,7 @@ mod tests {
         assert!(matches!(crate::proto::read_agent(&sent), Err(crate::proto::Unreadable::Unknown { index, .. }) if index == u64::from(past)), "read as it was made");
     }
 
-    async fn next_event(rx: &async_channel::Receiver<NetEvent>, deadline: Instant) -> anyhow::Result<NetEvent> {
+    async fn next_event(rx: &crate::memory::queue::Receiver<NetEvent>, deadline: Instant) -> anyhow::Result<NetEvent> {
         crate::rt::timeout(deadline.saturating_duration_since(Instant::now()), rx.recv())
             .await
             .map_err(|_| anyhow::anyhow!("timed out"))?
@@ -1269,7 +1310,7 @@ mod tests {
     }
 
     /// The server's next `Connected`, skipping other events; `None` once `within` passes.
-    async fn connected_within(rx: &async_channel::Receiver<NetEvent>, within: Duration) -> Option<PeerId> {
+    async fn connected_within(rx: &crate::memory::queue::Receiver<NetEvent>, within: Duration) -> Option<PeerId> {
         let deadline = Instant::now() + within;
         loop {
             match next_event(rx, deadline).await {
@@ -1669,7 +1710,13 @@ mod tests {
             let addr = probe.local_addr()?;
             drop(probe);
             let (srv, srv_ev) = start(Spec { bind: addr, ca_der: pki.ca_der.clone(), leaf: pki.server_leaf(&[])?, server: true, dial_deadline: DIAL_DEADLINE, revoked_keys: Vec::new() })?;
-            let (agent, agent_ev) = start(Spec { bind: "127.0.0.1:0".parse()?, ca_der: pki.ca_der.clone(), leaf: pki.issue_local("full-owner")?, server: false, dial_deadline: Duration::from_secs(1), revoked_keys: Vec::new() })?;
+            // The owner's queue bounded at a mebibyte (goal 11, plan 01a1a87b2e56 step 3: in bytes, not
+            // events), so what's sent below fills it and leaves the net thread more to hold.
+            const ROOM: usize = 1 << 20;
+            let (agent, agent_ev) = start_bounded(Spec { bind: "127.0.0.1:0".parse()?, ca_der: pki.ca_der.clone(), leaf: pki.issue_local("full-owner")?, server: false, dial_deadline: Duration::from_secs(1), revoked_keys: Vec::new() }, OUT_BYTES, ROOM)?;
+            // Full: no room for one more of the frames below (each eight bytes, counted with its place).
+            let one = weight(&NetEvent::Frame { peer: SERVER_PEER, lane: 0, kind: Kind::Control, data: vec![0; 8], at: Instant::now() }).saturating_add(crate::memory::queue::PLACE);
+            let full = |rx: &crate::memory::queue::Receiver<NetEvent>| rx.held().saturating_add(one) > rx.bound();
             agent.command(Out::Connect { addr }).await;
             let deadline = Instant::now() + Duration::from_secs(60);
             let peer = connected_within(&srv_ev, Duration::from_secs(15)).await.ok_or_else(|| anyhow::anyhow!("the agent didn't connect"))?;
@@ -1678,18 +1725,19 @@ mod tests {
                     break;
                 }
             }
-            // More than the owner's queue holds, the owner taking none of it, over four lanes (no
-            // lane's queue past its bound).
+            // More than the owner's queue holds (about 10,000 of these), the owner taking none of it, over
+            // four lanes (no lane's queue past its bound).
             const N: u32 = 17_000;
             const LANES: u32 = 4;
             for i in 0..N {
                 srv.send(peer, i % LANES, Kind::Control, [(i % LANES).to_le_bytes(), i.to_le_bytes()].concat()).await;
             }
-            let full = Instant::now() + Duration::from_secs(30);
-            while !agent_ev.is_full() && Instant::now() < full {
+            let filled = Instant::now() + Duration::from_secs(30);
+            while !full(&agent_ev) && Instant::now() < filled {
                 crate::rt::sleep(Duration::from_millis(10)).await;
             }
-            anyhow::ensure!(agent_ev.is_full(), "the owner's queue never filled: {} of {:?}", agent_ev.len(), agent_ev.capacity());
+            anyhow::ensure!(full(&agent_ev), "the owner's queue never filled: {} of {} bytes", agent_ev.held(), agent_ev.bound());
+            let queued = u32::try_from(agent_ev.len()).unwrap_or(u32::MAX);
             // A dial to an address that takes the handshake and never answers, past its deadline.
             let silent = std::net::UdpSocket::bind("127.0.0.1:0")?;
             agent.command(Out::Connect { addr: silent.local_addr()? }).await;
@@ -1709,7 +1757,7 @@ mod tests {
                     }
                     NetEvent::Unreachable { peer, reason } if peer == SERVER_PEER => {
                         let taken: u32 = next.iter().sum();
-                        anyhow::ensure!(taken >= 16_384, "the Unreachable came after {taken} frames, fewer than the owner's queue held: {reason}");
+                        anyhow::ensure!(taken >= queued, "the Unreachable came after {taken} frames, fewer than the owner's queue held ({queued}): {reason}");
                         break;
                     }
                     _ => {}
