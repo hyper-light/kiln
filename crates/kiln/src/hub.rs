@@ -14,7 +14,7 @@ use parking_lot::Mutex;
 use serde::Serialize;
 use futures::FutureExt as _;
 
-use crate::rt::{Broadcast, Interval, Notify, Shutdown};
+use crate::rt::{Interval, Notify, Shutdown};
 
 use crate::config::Config;
 use crate::logs::Logs;
@@ -52,6 +52,10 @@ const LAUNCH_RETRY: Duration = Duration::from_secs(15);
 /// for their snapshots: time for the snapshots its streams send by themselves (a new server) to
 /// come first.
 const STALE_GRACE: Duration = Duration::from_secs(15);
+/// The events ([`Hub::events`]) kept for their slowest subscriber, at the most: their texts are bounded in
+/// bytes too, at [`crate::net::EVENTS_BYTES`] (goal 11, plan 01a1a87b2e56 step 3:
+/// `crate::memory::owners::UI_EVENTS`).
+pub const EVENTS: usize = 4096;
 
 /// Where a Kubernetes job's pod stands until its agent connects.
 #[derive(Debug, Clone, Copy)]
@@ -509,7 +513,10 @@ pub struct Hub {
     pending_peers: crate::rcu::Rcu<HashMap<PeerId, String>>,
     /// Runners' HTTP tunnels, and which QUIC connections they carry (see `crate::tunnel`).
     pub tunnels: Arc<crate::tunnel::Registry>,
-    pub events: Broadcast<Arc<str>>,
+    /// What `GET /api/events` sockets and kiln's own listeners hear, each event as its JSON text: kept
+    /// for their slowest at most [`EVENTS`] of them and one receive window of their bytes (goal 11, plan
+    /// 01a1a87b2e56 step 3: `crate::memory::owners::UI_EVENTS`).
+    pub events: crate::memory::ring::Ring<Arc<str>>,
     /// Each remote terminal's output, by `machine/session`: read on every frame a terminal sends,
     /// written as one opens and closes (`crate::rcu`).
     pub terms: crate::rcu::Rcu<HashMap<String, async_channel::Sender<TermOut>>>,
@@ -707,7 +714,7 @@ impl Hub {
             peers: Default::default(),
             pending_peers: Default::default(),
             tunnels: Arc::default(),
-            events: Broadcast::new(4096),
+            events: crate::memory::ring::Ring::new(&crate::memory::owners::UI_EVENTS, EVENTS, crate::net::EVENTS_BYTES),
             terms: Default::default(),
             terminals: crate::termsess::Sessions::new(),
             harness,

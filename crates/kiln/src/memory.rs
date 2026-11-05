@@ -15,6 +15,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 pub mod owners;
 pub mod queue;
+pub mod ring;
 
 /// One owner of memory: what it holds now and the most it may hold (0: not known yet).
 pub struct Owner {

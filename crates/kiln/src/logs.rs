@@ -26,12 +26,27 @@ pub enum LogEvent {
 /// Live chunks a viewer's feed holds before a slow one starts losing the oldest; and the most a live
 /// job's writer takes at once, so what one batch tells its viewers fits their feed.
 const FEED: usize = 1024;
+/// The most of its chunks' bytes a live job's feed holds for a slow viewer (goal 11, plan 01a1a87b2e56
+/// step 3: `crate::memory::owners::LOG_FEEDS`): what one batch of its writer tells (`FEED` pieces) of
+/// the largest chunks a runner sends. A viewer that falls further behind is told what it skipped, which
+/// the job's log file holds.
+const FEED_BYTES: usize = FEED * crate::proto::LOG_CHUNK;
+
+/// A piece's place and its bytes, as a live job's feed keeps it for its viewers.
+impl crate::memory::queue::Weigh for LogEvent {
+    fn weight(&self) -> usize {
+        size_of::<Self>().saturating_add(match self {
+            LogEvent::Data { data, .. } => data.len(),
+            LogEvent::Step { .. } | LogEvent::End => 0,
+        })
+    }
+}
 
 /// A live job: its feed to its viewers, and its files' writer.
 struct Live {
-    tx: async_broadcast::Sender<LogEvent>,
-    /// Keeps the channel open while nobody is watching.
-    _idle: async_broadcast::InactiveReceiver<LogEvent>,
+    /// Shared with its writer, which tells it what's written; slow viewers lose its oldest (and are told
+    /// so) instead of stalling the writer, past [`FEED`] pieces or [`FEED_BYTES`] of them.
+    feed: Arc<crate::memory::ring::Ring<LogEvent>>,
     /// What's to be written to the job's files, in the order sent (its chunks, in order from its runner
     /// through the hub's loop; its steps; its end): one writer, a task of its own, alone holds the files
     /// and writes them on the blocking pool (goal 5 of the API runtime program, plan 01a1a59c2aae step 2:
@@ -64,17 +79,13 @@ impl Live {
     /// A live job's feed, and the ends its writer takes: what's sent to be written, and what closes as
     /// the writer goes.
     fn new() -> (Self, async_channel::Receiver<Write>, async_channel::Sender<()>) {
-        let (mut tx, rx) = async_broadcast::broadcast(FEED);
-        // Slow viewers lose the oldest chunks (and are told so) instead of stalling writers.
-        tx.set_overflow(true);
-        tx.set_await_active(false);
-        let idle = rx.deactivate();
+        let feed = Arc::new(crate::memory::ring::Ring::new(&crate::memory::owners::LOG_FEEDS, FEED, FEED_BYTES));
         // Unbounded: what's sent is what was written at once before, and the hub's loop waits for each of
         // its runners' chunks to be written ([`Logs::append_written`]) as it waited for the write.
         let (writes, to_write) = async_channel::unbounded();
         // Nothing is sent on it: it closes as the writer goes.
         let (going, done) = async_channel::bounded(1);
-        (Live { tx, _idle: idle, writes, done }, to_write, going)
+        (Live { feed, writes, done }, to_write, going)
     }
 }
 
@@ -141,7 +152,7 @@ impl Logs {
         let made = Arc::new(made);
         let live = self.live.update(|m| Arc::clone(m.entry(job.to_owned()).or_insert_with(|| Arc::clone(&made))));
         if Arc::ptr_eq(&live, &made) {
-            drop(crate::rt::spawn(writer(self.clone(), job.to_owned(), to_write, live.tx.clone(), going, live.done.clone())));
+            drop(crate::rt::spawn(writer(self.clone(), job.to_owned(), to_write, Arc::clone(&live.feed), going, live.done.clone())));
         }
         live
     }
@@ -328,8 +339,8 @@ impl Logs {
 
     /// Subscribe to a job's live output. Subscribe *before* reading the backlog so nothing falls
     /// in between (viewers may see a few bytes twice at the seam, never miss any).
-    pub fn subscribe(&self, job: &str) -> async_broadcast::Receiver<LogEvent> {
-        self.live(job).tx.new_receiver()
+    pub fn subscribe(&self, job: &str) -> crate::memory::ring::Subscription<LogEvent> {
+        self.live(job).feed.subscribe()
     }
 
     pub fn is_live(&self, job: &str) -> bool {
@@ -445,7 +456,7 @@ impl Logs {
 /// order, a batch at a time on the blocking pool, and telling the job's viewers what's written, until
 /// the job's entry and every holder of it are gone. A previous attempt's writer of the job still
 /// writing (a retry in place), it goes after that one.
-async fn writer(logs: Logs, job: String, to_write: async_channel::Receiver<Write>, viewers: async_broadcast::Sender<LogEvent>, going: async_channel::Sender<()>, done: async_channel::Receiver<()>) {
+async fn writer(logs: Logs, job: String, to_write: async_channel::Receiver<Write>, viewers: Arc<crate::memory::ring::Ring<LogEvent>>, going: async_channel::Sender<()>, done: async_channel::Receiver<()>) {
     logs.after_ending(&job, Some(&done)).await;
     let mut files = Some(Files::default());
     while let Ok(first) = to_write.recv().await {
@@ -468,9 +479,7 @@ async fn writer(logs: Logs, job: String, to_write: async_channel::Receiver<Write
         files = Some(back);
         for t in told {
             match t {
-                Told::Viewers(e) => {
-                    let _ = viewers.try_broadcast(e);
-                }
+                Told::Viewers(e) => viewers.send(e),
                 Told::Written(w) => {
                     let _ = w.send(());
                 }
@@ -530,6 +539,38 @@ fn tail_of(p: &std::path::Path, max: u64) -> std::io::Result<Vec<u8>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Goal 11, plan 01a1a87b2e56 step 3: a live job's feed is bounded in bytes as well as in pieces, on
+    /// `/metrics` as the log feeds'; a piece weighs its bytes; and its viewers get every piece in order
+    /// while they keep up.
+    #[test]
+    fn g11_s3_a_live_jobs_feed_is_bounded_in_bytes() -> anyhow::Result<()> {
+        crate::rt::block_on(async move {
+            let dir = tempfile::tempdir()?;
+            let logs = Logs::new(dir.path().to_path_buf(), 1 << 30);
+            let mut rx = logs.subscribe("job1");
+            let bound = FEED * crate::memory::ring::place::<LogEvent>() + FEED_BYTES;
+            anyhow::ensure!(logs.live("job1").feed.bound() == bound);
+            anyhow::ensure!(crate::memory::owners::LOG_FEEDS.bound().is_some_and(|b| b >= bound));
+            let piece = |n: usize| LogEvent::Data { idx: 0, data: Bytes::from(vec![0u8; n]) };
+            use crate::memory::queue::Weigh as _;
+            anyhow::ensure!(piece(crate::proto::LOG_CHUNK).weight() - piece(0).weight() == crate::proto::LOG_CHUNK);
+            for n in 0..3u8 {
+                logs.append("job1", 0, &[n; 100]);
+            }
+            logs.finish("job1");
+            let mut got = Vec::new();
+            while let Ok(ev) = rx.recv().await {
+                match ev {
+                    LogEvent::Data { data, .. } => got.push(data.first().copied()),
+                    LogEvent::End => break,
+                    LogEvent::Step { .. } => {}
+                }
+            }
+            anyhow::ensure!(got == vec![Some(0), Some(1), Some(2)], "{got:?}");
+            Ok(())
+        })
+    }
 
     #[test]
     fn append_tail_and_cap() -> anyhow::Result<()> {

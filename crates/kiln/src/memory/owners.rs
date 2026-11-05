@@ -72,8 +72,30 @@ pub static SQLITE: Owner = Owner::new("sqlite");
 /// payload is let go unlooked at, counted and said: the message itself was taken whole already.
 pub static WIRE_CHECKS: Owner = Owner::new("wire_checks");
 
+/// The server's events as their JSON texts (`crate::hub::Hub`'s `events`: what `GET /api/events` sockets
+/// and kiln's own listeners hear), kept until their slowest subscriber takes them
+/// (`crate::memory::ring`): at most `crate::hub::EVENTS` of them, and [`crate::net::EVENTS_BYTES`] of
+/// their texts, as much as the hub's queue of runners' messages most of them are made from. At the bound
+/// the oldest go, as they go past the count: a page's socket is told to fetch what it shows again
+/// (`Resync`), and kiln's own listeners are told how many they missed.
+pub static UI_EVENTS: Owner = Owner::new("ui_events");
+
+/// Each live job's log on its way to the job's viewers (`crate::logs`), kept until their slowest takes
+/// it (`crate::memory::ring`): each job's at most `FEED` pieces, and `FEED` x [`crate::proto::LOG_CHUNK`]
+/// of their bytes, what the job's writer tells its viewers at once (`FEED` pieces a batch) of the largest
+/// chunks a runner sends. At the bound the oldest go: a viewer is told how many it skipped, and the job's
+/// log file has them all.
+pub static LOG_FEEDS: Owner = Owner::new("log_feeds");
+
+/// Each terminal session's output on its way to its attached viewers (`crate::termsess`), kept until
+/// their slowest takes it (`crate::memory::ring`): each session's at most `FANOUT` frames, and
+/// `BACKLOG_BYTES` of their bytes, the backlog a viewer that falls behind is repainted from (more would
+/// take a viewer longer to catch up through than the repaint). At the bound the oldest go: their viewer
+/// is repainted from the session's backlog and screen.
+pub static TERMINAL_FEEDS: Owner = Owner::new("terminal_feeds");
+
 /// The owners counted here, in the order the exposition says them.
-pub(super) const ALL: [&Owner; 11] = [&NET_OUT, &NET_EVENTS, &SESSION_INBOXES, &LOCAL_UPDATES, &RECORDS_QUEUE, &FEED_INTAKE, &MIRRORS_OUT, &WIRE_CHECKS, &CUSTODY_RECEIPTS, &KEPT_FILES, &SQLITE];
+pub(super) const ALL: [&Owner; 14] = [&NET_OUT, &NET_EVENTS, &SESSION_INBOXES, &LOCAL_UPDATES, &RECORDS_QUEUE, &FEED_INTAKE, &MIRRORS_OUT, &WIRE_CHECKS, &CUSTODY_RECEIPTS, &KEPT_FILES, &SQLITE, &UI_EVENTS, &LOG_FEEDS, &TERMINAL_FEEDS];
 
 #[cfg(test)]
 mod tests {
@@ -131,7 +153,7 @@ mod tests {
         anyhow::ensure!(SESSION_INBOXES.bound().is_some_and(|b| b >= crate::net::EVENTS_BYTES), "inboxes' bound: {:?}", SESSION_INBOXES.bound());
         let mut o = String::new();
         crate::memory::render(&mut o, &[]);
-        for name in ["net_out", "net_events", "session_inboxes", "local_updates", "records_queue", "feed_intake", "mirrors_out", "custody_receipts", "kept_files", "sqlite"] {
+        for name in ["net_out", "net_events", "session_inboxes", "local_updates", "records_queue", "feed_intake", "mirrors_out", "custody_receipts", "kept_files", "sqlite", "ui_events", "log_feeds", "terminal_feeds"] {
             anyhow::ensure!(o.contains(&format!("kiln_memory_bytes{{owner=\"{name}\"}} ")), "{name} isn't on /metrics:\n{o}");
         }
         anyhow::ensure!(o.contains("kiln_memory_bound_bytes{owner=\"local_updates\"} "), "{o}");

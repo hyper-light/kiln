@@ -17,13 +17,16 @@ use serde::Serialize;
 
 use crate::hub::{Hub, TermOut};
 use crate::proto::{LANE_TERM, ServerMsg};
-use crate::rt::{Broadcast, Shutdown};
+use crate::rt::Shutdown;
 
-/// Raw output kept per session for replay on attach.
+/// Raw output kept per session for replay on attach; and the most of its live frames' bytes kept for
+/// a slow viewer (goal 11, plan 01a1a87b2e56 step 3: `crate::memory::owners::TERMINAL_FEEDS`): one that
+/// falls further behind is repainted from this backlog, which costs it less than catching up would.
 const BACKLOG_BYTES: usize = 256 * 1024;
 /// An exited session stays listed this long, so attached devices can show how it ended.
 const EXITED_LINGER: Duration = Duration::from_secs(60);
-/// Live frames buffered per attached client before a slow one starts losing the oldest.
+/// Live frames buffered per attached client before a slow one starts losing the oldest (or past
+/// [`BACKLOG_BYTES`] of them).
 const FANOUT: usize = 1024;
 
 /// What attached clients receive.
@@ -34,6 +37,18 @@ pub enum Frame {
     /// The session's size changed. Every view draws at exactly this size, so a program's
     /// cursor-addressed redraws line up on every device.
     Size { cols: u16, rows: u16 },
+}
+
+/// A frame's place and its bytes, as its session's ring keeps it for its viewers (goal 11, plan
+/// 01a1a87b2e56 step 3).
+impl crate::memory::queue::Weigh for Frame {
+    fn weight(&self) -> usize {
+        size_of::<Self>().saturating_add(match self {
+            Frame::Data(d) => d.len(),
+            Frame::Exit { error, .. } => error.as_ref().map_or(0, String::capacity),
+            Frame::Size { .. } => 0,
+        })
+    }
 }
 
 /// What attached clients send.
@@ -103,7 +118,7 @@ pub struct Session {
     pub command: Option<String>,
     pub created_at: i64,
     state: Mutex<State>,
-    out: Broadcast<Frame>,
+    out: crate::memory::ring::Ring<Frame>,
     input: async_channel::Sender<Input>,
     close: Shutdown,
     /// Output the hub had no room for in this session's relay ([`forward`]): gaps its relay repairs
@@ -118,7 +133,7 @@ pub struct Attachment {
     /// Bytes that bring a fresh terminal to the session's current state.
     pub replay: Vec<u8>,
     /// Everything after the replay.
-    pub live: crate::rt::Subscription<Frame>,
+    pub live: crate::memory::ring::Subscription<Frame>,
     /// Set when the session had already ended.
     pub ended: Option<(Option<i32>, Option<String>)>,
 }
@@ -152,7 +167,7 @@ impl Session {
                 cols,
                 rows,
             }),
-            out: Broadcast::new(FANOUT),
+            out: crate::memory::ring::Ring::new(&crate::memory::owners::TERMINAL_FEEDS, FANOUT, BACKLOG_BYTES),
             input,
             close: Shutdown::new(),
             gaps: std::sync::atomic::AtomicU64::new(0),
@@ -777,6 +792,30 @@ mod tests {
         assert!(a.replay.len() <= BACKLOG_BYTES + 64);
         // After the reset prefix the replay begins with a whole line.
         assert!(a.replay.get(4..).is_some_and(|r| r.starts_with(b"0123")));
+    }
+
+    /// Goal 11, plan 01a1a87b2e56 step 3: a slow viewer's frames are kept up to the session's backlog in
+    /// bytes (its count of frames too), counted as the terminals' feeds' on `/metrics`; past it the viewer
+    /// is told it fell behind, and the repaint it's sent then holds the session's state.
+    #[test]
+    fn g11_s3_a_slow_viewers_frames_are_kept_up_to_the_backlog_in_bytes() {
+        let (s, _input) = Session::new("local".into(), None, 80, 24);
+        let mut slow = s.attach();
+        let bound = FANOUT * crate::memory::ring::place::<Frame>() + BACKLOG_BYTES;
+        assert_eq!(s.out.bound(), bound);
+        assert!(crate::memory::owners::TERMINAL_FEEDS.bound().is_some_and(|b| b >= bound));
+        let chunk = [b'x'; 32 * 1024];
+        for _ in 0..(2 * BACKLOG_BYTES / chunk.len()) {
+            feed(&s, &chunk);
+            assert!(s.out.held() <= bound, "{} past {bound}", s.out.held());
+        }
+        assert!(matches!(slow.live.try_recv(), Err(async_broadcast::TryRecvError::Overflowed(n)) if n > 0), "told it fell behind");
+        let mut kept = 0;
+        while let Ok(Frame::Data(d)) = slow.live.try_recv() {
+            kept += d.len();
+        }
+        assert!(kept <= BACKLOG_BYTES && kept >= BACKLOG_BYTES - chunk.len(), "the newest backlog's worth: {kept}");
+        assert!(s.attach().replay.len() >= BACKLOG_BYTES - 8192, "the repaint holds the backlog");
     }
 
     #[test]

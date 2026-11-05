@@ -50,6 +50,14 @@ impl Weigh for String {
     }
 }
 
+/// A shared text: its place, its two counts and its bytes, as one holder's (whoever holds it last lets it
+/// go).
+impl Weigh for std::sync::Arc<str> {
+    fn weight(&self) -> usize {
+        size_of::<Self>().saturating_add(2 * size_of::<usize>()).saturating_add(self.len())
+    }
+}
+
 impl<T: Weigh + ?Sized> Weigh for Box<T> {
     fn weight(&self) -> usize {
         size_of::<Self>().saturating_add((**self).weight())
