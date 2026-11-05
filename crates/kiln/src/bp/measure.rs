@@ -3,15 +3,14 @@
 //! runners page, an agent session streaming, a log flood, and a reconnect. Each goes through the
 //! protocol (compressed and not) and as today's endpoints send it (raw JSON, each message gzip'd
 //! alone, and one kept deflate context, as permessage-deflate with context takeover would).
-//! Reports bytes per operation at p50, p99 and p99.9 and the server's CPU per operation to encode
-//! and fan out to 1, 10 and 100 subscribers; writes `ui/tests/bp-measure.json` (KILN_WRITE_BP=1)
-//! for the browsers' decode timings (ui/e2e/bp-decode.spec.ts). Bytes are above the carrier
+//! Reports bytes per operation at p50, p99 and p99.9; writes `ui/tests/bp-measure.json` (KILN_WRITE_BP=1)
+//! for the browsers' decode timings (ui/e2e/bp-decode.spec.ts) and the server's CPU per operation
+//! (crates/kiln-bp/tests/bench.rs, in release). Bytes are above the carrier
 //! (no WebSocket, TLS or TCP bytes on either side) and deterministic: the same on every run.
 //!
 //! `cargo test -p kiln --release --lib bp::measure -- --nocapture`
 
 use std::io::Write as _;
-use std::time::Instant;
 
 use flate2::{Compress, Compression, FlushCompress};
 use kiln_bp::answers::Answers;
@@ -263,42 +262,6 @@ fn bp_g2_s10_measure() {
         }
         report.push_str(&format!("| protocol, compressed, on a busy link (merged and packed) | | | | {busy_total} |\n"));
         totals.push((format!("{name}/busy"), busy_total));
-        // Server CPU per operation: encode and fan out to N subscribers, against today's text
-        // made once and read per socket (the events socket's Narrow parses each event per socket).
-        report.push_str("\n| Subscribers | protocol µs/op | today µs/op |\n|---|---|---|\n");
-        for n in [1usize, 10, 100] {
-            let reps = (2000 / n).max(4);
-            let t0 = Instant::now();
-            for _ in 0..reps.min(20) {
-                let mut topics_log: std::collections::HashMap<(u32, String), TopicLog> = Default::default();
-                let mut srvs: Vec<Server> = (0..n).map(|i| Server::new(ServerConfig { compress: false, ..Default::default() }, i as u64, BORN, 0)).collect();
-                for op in &ops {
-                    for o in &op.outs {
-                        let Some(spec) = spec(o.topic.kind) else { continue };
-                        let log = topics_log.entry((o.topic.kind, o.topic.key.clone())).or_insert_with(|| TopicLog::new(spec, BORN));
-                        if let Ok(p) = log.publish(o.delta.clone()) {
-                            for s in &mut srvs {
-                                s.push(1, &p);
-                                let _ = s.poll_transmit(64 * 1024, 1);
-                            }
-                        }
-                    }
-                }
-            }
-            let bp = t0.elapsed().as_secs_f64() * 1e6 / (reps.min(20) * ops.len()) as f64;
-            let t1 = Instant::now();
-            for _ in 0..reps.min(20) {
-                for op in &ops {
-                    let text = String::from_utf8_lossy(&op.today).into_owned();
-                    for _ in 0..n {
-                        let v: Result<serde_json::Value, _> = serde_json::from_str(&text);
-                        std::hint::black_box(&v);
-                    }
-                }
-            }
-            let today = t1.elapsed().as_secs_f64() * 1e6 / (reps.min(20) * ops.len()) as f64;
-            report.push_str(&format!("| {n} | {bp:.2} | {today:.2} |\n"));
-        }
         // A sample of frames for the browsers' decode timing.
         let mut m = Meter::new(false, &refs);
         for op in ops.iter().take(200) {
@@ -310,7 +273,16 @@ fn bp_g2_s10_measure() {
             }
             let mut h = String::new();
             kiln_bp::wire::hex(&bytes, &mut h);
-            decode.push(json!({"seq": name, "bp": h, "json": String::from_utf8_lossy(&op.today)}));
+            let outs: Vec<serde_json::Value> = op
+                .outs
+                .iter()
+                .map(|o| {
+                    let mut d = String::new();
+                    kiln_bp::wire::hex(&kiln_bp::wire::to_bytes(&o.delta), &mut d);
+                    json!({"kind": o.topic.kind, "key": o.topic.key, "delta": d})
+                })
+                .collect();
+            decode.push(json!({"seq": name, "bp": h, "json": String::from_utf8_lossy(&op.today), "outs": outs}));
         }
     }
     // A reconnect after 30 s away with a busy runners page's minute of changes missed.
