@@ -229,7 +229,10 @@ impl Driver for EpollDriver {
     }
 
     fn wait(&mut self, timeout_ns: Option<u64>, out: &mut Vec<Completion>) -> Result<(), RtError> {
-        let mut timeout_ns = timeout_ns;
+        // Held to the thread's nudge, where it has one (`crate::compute::nudge_current_thread`; kiln's goal 8, plan
+        // 01a1a59c2b29 step 7): under lazy preemption the timer's interrupt is when this CPU gives a shard woken
+        // behind a thread busy in user space its turn. A wait it ends returns nothing, as a timeout does.
+        let mut timeout_ns = crate::prioritysys::nudged_timeout(timeout_ns);
         if !self.nops.is_empty() {
             out.extend(self.nops.drain(..).map(|user_data| Completion {
                 user_data,
@@ -444,6 +447,50 @@ mod tests {
         assert_eq!(rustix::thread::current_timer_slack().unwrap(), SLACK_NS);
         drop(driver);
         assert_eq!(rustix::thread::current_timer_slack().unwrap(), before);
+        drop(registration);
+    }
+
+    /// Goal 8, plan 01a1a59c2b29 step 7: on a nudged thread a wait with no timeout and nothing to wake it ends by
+    /// itself, by the nudge's period, returning nothing; lifted, the thread's waits are as asked again. A kick
+    /// sent long after the period is the test's backstop: a wait only it ended shows the nudge did nothing.
+    #[test]
+    #[cfg_attr(miri, ignore)]
+    fn g8_s7_a_nudged_thread_s_untimed_wait_ends_by_its_period() {
+        /// Shape: a period the machine's timers keep however busy it is, a two-hundredth of the backstop.
+        const PERIOD_NS: u64 = 10_000_000;
+        /// Shape: the backstop's kick, far past any period a loaded machine stretches.
+        const BACKSTOP: std::time::Duration = std::time::Duration::from_secs(2);
+        let efd = prepare_eventfd().unwrap();
+        let registration =
+            crate::registry::register(2, 1, crate::runtime::register_kick(Some(efd))).unwrap();
+        let kick = crate::registry::with_entry(registration.shard(), |entry| entry.kick).unwrap();
+        let crate::driver::Kick::Eventfd(efd) = kick else {
+            panic!("the epoll driver's kick is its eventfd");
+        };
+        let mut driver = EpollDriver::with_eventfd(efd).unwrap();
+        crate::compute::nudge_current_thread(PERIOD_NS).unwrap();
+        let (ended, told) = std::sync::mpsc::channel::<()>();
+        let backstop = std::thread::spawn(move || {
+            let kicked = told.recv_timeout(BACKSTOP).is_err();
+            if kicked {
+                kick.kick();
+            }
+            kicked
+        });
+        let mut out = Vec::new();
+        let began = driver.now_ns();
+        driver.wait(None, &mut out).unwrap();
+        let took = driver.now_ns() - began;
+        crate::compute::nudge_current_thread(0).unwrap();
+        let _ = ended.send(());
+        let backstop_kicked = backstop.join().unwrap();
+        assert!(
+            !backstop_kicked && took < u64::try_from(BACKSTOP.as_nanos()).unwrap(),
+            "the untimed wait ended after {took} ns, the backstop's kick sent: {backstop_kicked}; the nudge \
+             ends it at {PERIOD_NS} ns or a little later"
+        );
+        assert!(out.is_empty(), "a nudge's end returns nothing: {out:?}");
+        assert_eq!(crate::prioritysys::nudged_timeout(None), None, "lifted");
         drop(registration);
     }
 

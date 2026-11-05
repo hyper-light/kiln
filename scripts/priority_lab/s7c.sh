@@ -18,6 +18,11 @@
 #   rt          the server on SERVER_CPUS with its shards in the real-time class (KILN_RT_REALTIME=1, its
 #               RLIMIT_RTPRIO raised to 1 as kiln install's unit grants), N busy loops on SERVER_CPUS.
 #   rt-cc       that, the hogs N C compilers.
+#   nudge       the server on SERVER_CPUS with its shards nudging their CPUs (KILN_RT_NUDGE=1, `[server] nudge`: each
+#               wait in a shard's driver ends by its timer tick, no privilege asked), N busy loops on SERVER_CPUS.
+#   nudge-cc    that, the hogs N C compilers.
+#   calm-nudge  the nudge with no hogs: what it costs a calm server.
+#               NUDGE_US sets the nudge's period for all three (KILN_RT_NUDGE_US; unset, the server's timer tick).
 # rt and rt-cc run only where this machine grants a user's process RLIMIT_RTPRIO room for priority 1; elsewhere they
 # are skipped and the log says so (the machine owner's call). A *-cc configuration needs CC_SRC (sqlite3.c from
 # cargo's registry, unless given). Every configuration's server runs SHARDS shards (4: what it sizes itself to on
@@ -90,6 +95,12 @@ one() {
     fence) server_cpus=$CORES; senv+=(--env "LAB_SERVER_CORES=$CORES") ;;
     rt) senv+=(--env KILN_RT_REALTIME=1 --env LAB_SERVER_RTPRIO=1); hog=spin; hogcpus=$SERVER_CPUS ;;
     rt-cc) senv+=(--env KILN_RT_REALTIME=1 --env LAB_SERVER_RTPRIO=1); hog=cc; hogcpus=$SERVER_CPUS ;;
+    nudge) senv+=(--env KILN_RT_NUDGE=1); hog=spin; hogcpus=$SERVER_CPUS ;;
+    nudge-cc) senv+=(--env KILN_RT_NUDGE=1); hog=cc; hogcpus=$SERVER_CPUS ;;
+    calm-nudge) senv+=(--env KILN_RT_NUDGE=1) ;;
+  esac
+  case "$cfg" in
+    nudge | nudge-cc | calm-nudge) [ -n "${NUDGE_US:-}" ] && senv+=(--env "KILN_RT_NUDGE_US=$NUDGE_US") ;;
   esac
   senv+=(--env "LAB_SERVER_CPUS=$server_cpus")
   [ -n "$SHARDS" ] && senv+=(--env "KILN_RT_SHARDS=$SHARDS")
@@ -125,7 +136,7 @@ one() {
     say "round $i fence: $(tail -1 "$out/fence.txt" 2>/dev/null)"
   fi
   if [ -s "$out/healthz.json" ]; then
-    say "round $i $cfg: the server said $(python3 -I -c 'import json,sys; p=json.load(open(sys.argv[1])).get("priority") or {}; r=p.get("realtime") or {}; print("realtime:", r.get("took"), "of", r.get("shards"), "took it", r.get("why") or "", "| work:", p.get("work"))' "$out/healthz.json" 2>/dev/null)"
+    say "round $i $cfg: the server said $(python3 -I -c 'import json,sys; p=json.load(open(sys.argv[1])).get("priority") or {}; r=p.get("realtime") or {}; n=p.get("nudge") or {}; print("realtime:", r.get("took"), "of", r.get("shards"), "took it", r.get("why") or "", "| nudge:", n.get("nudged"), "of", n.get("shards"), "every", n.get("period_us"), "us", n.get("why") or "", "| work:", p.get("work"))' "$out/healthz.json" 2>/dev/null)"
   fi
   wait 2>/dev/null
 }
@@ -144,7 +155,7 @@ python3 -I "$here/merge.py" "$D/runs" $CONFIGS >> "$D/runs/driver.log" 2>&1
   tab=()
   for c in $CONFIGS; do [ -s "$D/runs/$c/run.json" ] && tab+=("$c=$D/runs/$c/run.json"); done
   "$D/bin/kiln-lab" table "${tab[@]}"
-  for pair in "calm hogs" "calm hogs-cc" "calm cores" "calm cores-cc" "cores-calm cores" "cores fence" "calm rt" "calm rt-cc" "hogs cores" "hogs rt" "hogs-cc cores-cc" "hogs-cc rt-cc"; do
+  for pair in "calm hogs" "calm hogs-cc" "calm cores" "calm cores-cc" "cores-calm cores" "cores fence" "calm rt" "calm rt-cc" "hogs cores" "hogs rt" "hogs-cc cores-cc" "hogs-cc rt-cc" "calm nudge" "calm nudge-cc" "calm calm-nudge" "hogs nudge" "hogs-cc nudge-cc"; do
     set -- $pair
     [ -s "$D/runs/$1/run.json" ] && [ -s "$D/runs/$2/run.json" ] || continue
     echo

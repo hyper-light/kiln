@@ -109,12 +109,14 @@ pub fn spent() -> bool {
 }
 
 /// A task's class on its shard (kiln's goal 6, plan 01a1a59c2abe step 3): which of the run queue's lists it
-/// waits in. The shard gives each class with tasks waiting an equal share of its time, and of the classes that
-/// have run alike, the most urgent goes first (`crate::queue::LocalQueue::pop`): Seastar's scheduling groups
-/// give components shares of a shard the same way (research 01a1a59c2abf, f10), and Google tags each request
-/// with a criticality its servers shed and serve by (f16). Equal shares, since no class's need is known to
-/// outweigh another's: urgency decides the order, the shares the time, and none is starved. A task spawned by a
-/// task takes its spawner's class; any other starts [`Class::Normal`].
+/// waits in. The shard gives each class with tasks waiting an equal share of its time, and the most urgent goes
+/// first while it has run no more than the shard's quantum past the least-run class waiting
+/// (`crate::queue::LocalQueue::pop_within`): Seastar's scheduling groups give components shares of a shard the
+/// same way (research 01a1a59c2abf, f10), and Google tags each request with a criticality its servers shed and
+/// serve by (f16). Equal shares, since no class's need is known to outweigh another's: urgency decides the order,
+/// the shares the time, and none is starved. A task spawned by a task takes its spawner's class; any other starts
+/// [`Class::Normal`]. A task that lowers its class within a poll gives way to a more urgent one waiting
+/// ([`give_way`]) to go on in its own class's turn.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
 #[repr(u8)]
 pub enum Class {
@@ -160,4 +162,216 @@ pub fn class() -> Option<Class> {
             .or_else(|| here.current_slot().map(|slot| here.local.class_of(slot)))
     })
     .flatten()
+}
+
+/// Whether a task of a more urgent class than the polling task's waits on its shard, listed or woken itself and
+/// waiting for its release (kiln's goal 6, plan 01a1a59c2abe step 3): what a task that lowered its class gives way
+/// to ([`give_way`]). `false` off a task, and for a movable task, whose class's queue its carrier keeps.
+pub fn outranked() -> bool {
+    registry::with_current(|here| {
+        if here.movable.current_class().is_some() {
+            return false;
+        }
+        here.current_slot()
+            .is_some_and(|slot| here.local.waiting_above(here.local.class_of(slot)))
+    })
+    .unwrap_or(false)
+}
+
+/// Yields once where a task more urgent than the polling one waits on its shard ([`outranked`]), so a task that
+/// lowered its class within a poll goes on in its own class's turn rather than in the more urgent one it was polled
+/// in: kiln's HTTP connections read each request's head as Critical, and a request of the API given way so lets a
+/// person's page woken meanwhile go first (kiln's `crate::overload::Serving::demoted`; goal 6, plan 01a1a59c2abe
+/// step 3). Ready at once where none waits: the task keeps its place ahead of its own class's queued work, as it
+/// would have without the check.
+pub fn give_way() -> GiveWay {
+    GiveWay { yielded: false }
+}
+
+/// The future of [`give_way`].
+#[derive(Debug)]
+#[must_use = "a yield does nothing unless awaited"]
+pub struct GiveWay {
+    yielded: bool,
+}
+
+impl Future for GiveWay {
+    type Output = ();
+
+    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
+        if self.yielded || !outranked() {
+            return Poll::Ready(());
+        }
+        self.yielded = true;
+        cx.waker().wake_by_ref();
+        Poll::Pending
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering};
+
+    use super::{Class, set_class};
+    use crate::futures::{spawn, yield_now};
+    use crate::runtime::{LocalRuntime, RuntimeConfig};
+
+    /// What the tasks' polls did, in order: a letter a poll (its task's), as many as fit.
+    struct Trail {
+        at: AtomicUsize,
+        marks: Vec<AtomicU8>,
+    }
+
+    impl Trail {
+        fn new(room: usize) -> Arc<Self> {
+            Arc::new(Self { at: AtomicUsize::new(0), marks: (0..room).map(|_| AtomicU8::new(0)).collect() })
+        }
+
+        fn mark(&self, letter: u8) {
+            if let Some(cell) = self.marks.get(self.at.fetch_add(1, Ordering::Relaxed)) {
+                cell.store(letter, Ordering::Relaxed);
+            }
+        }
+
+        fn read(&self) -> String {
+            let n = self.at.load(Ordering::Relaxed).min(self.marks.len());
+            self.marks[..n].iter().map(|m| char::from(m.load(Ordering::Relaxed))).collect()
+        }
+    }
+
+    /// One shard, its quantum a millisecond: far past a poll here, so the order is the classes', not the time's.
+    fn config() -> RuntimeConfig {
+        RuntimeConfig {
+            shards: 1,
+            tasks_per_shard: 32,
+            timers_per_shard: 32,
+            interests_per_shard: 64,
+            ring_entries: 32,
+            step_budget_ns: 1_000_000,
+            timer_tick_ns: 50_000,
+            batch: 32,
+            pin: false,
+            cores: Vec::new(),
+            page_bytes: 4096,
+            spin_ns: 0,
+            wake_tracking: None,
+            latency_objective_ns: None,
+        }
+    }
+
+    /// Three Normal tasks (`n`) and three Background ones (`b`) keep the shard busy, each marking a poll and
+    /// yielding, queued behind each other; a task of `class` waits until the root wakes it (`S`, a wake from
+    /// another task, as a socket's readiness or a reply is), then marks `c`. The trail of marks.
+    fn woken_beside_queued_work(class: Class) -> String {
+        let mut rt = LocalRuntime::new(&config()).unwrap();
+        let trail = Trail::new(4096);
+        let marks = Arc::clone(&trail);
+        rt.block_on(async move {
+            let done = Arc::new(AtomicBool::new(false));
+            for (letter, busy) in [(b'n', Class::Normal), (b'b', Class::Background)] {
+                for _ in 0..3 {
+                    let (marks, done) = (Arc::clone(&marks), Arc::clone(&done));
+                    spawn(async move {
+                        let _ = set_class(busy);
+                        while !done.load(Ordering::Acquire) {
+                            marks.mark(letter);
+                            yield_now().await;
+                        }
+                    })
+                    .unwrap();
+                }
+            }
+            let (wake, woken) = crate::sync::oneshot::<()>().unwrap();
+            let ran = Arc::new(AtomicBool::new(false));
+            let (waiter_marks, waiter_ran) = (Arc::clone(&marks), Arc::clone(&ran));
+            spawn(async move {
+                let _ = set_class(class);
+                let _ = woken.await;
+                waiter_marks.mark(b'c');
+                waiter_ran.store(true, Ordering::Release);
+            })
+            .unwrap();
+            // Rounds of the busy tasks, each queued behind the others, the waiter waiting.
+            for _ in 0..8 {
+                yield_now().await;
+            }
+            marks.mark(b'S');
+            let _ = wake.send(());
+            while !ran.load(Ordering::Acquire) {
+                yield_now().await;
+            }
+            done.store(true, Ordering::Release);
+        })
+        .unwrap();
+        trail.read()
+    }
+
+    /// Kiln's goal 6, plan 01a1a59c2abe step 3: a task that lowered its class gives way to a more urgent task
+    /// waiting on its shard, and only to one: with its own class's and less urgent work waiting, it goes on at once,
+    /// its place kept. Do: the root starts a Critical, a Normal and a Background task that each wait, wakes the
+    /// Normal and Background ones, lowers itself to Normal and gives way (`r`); then wakes the Critical one and gives
+    /// way again (`R`). Expect: not outranked the first time, outranked the second; `r` before every other mark, and
+    /// the Critical task's `k` before `R`.
+    #[test]
+    fn g6_s3_a_task_that_lowered_its_class_gives_way_only_to_more_urgent_work() {
+        let mut rt = LocalRuntime::new(&config()).unwrap();
+        let trail = Trail::new(64);
+        let marks = Arc::clone(&trail);
+        let (first, second) = rt
+            .block_on(async move {
+                let mut wakes = Vec::new();
+                for (letter, class) in [(b'k', Class::Critical), (b'n', Class::Normal), (b'b', Class::Background)] {
+                    let (wake, woken) = crate::sync::oneshot::<()>().unwrap();
+                    let marks = Arc::clone(&marks);
+                    // Spawned in the class the root has: each takes its spawner's.
+                    let _ = set_class(class);
+                    spawn(async move {
+                        let _ = woken.await;
+                        marks.mark(letter);
+                    })
+                    .unwrap();
+                    wakes.push(wake);
+                }
+                let _ = set_class(Class::Critical);
+                // Their first polls, in which each waits.
+                yield_now().await;
+                let mut wakes = wakes.into_iter();
+                let (critical, normal, background) = (wakes.next().unwrap(), wakes.next().unwrap(), wakes.next().unwrap());
+                normal.send(()).unwrap();
+                background.send(()).unwrap();
+                let _ = set_class(Class::Normal);
+                let first = super::outranked();
+                super::give_way().await;
+                marks.mark(b'r');
+                critical.send(()).unwrap();
+                let second = super::outranked();
+                super::give_way().await;
+                marks.mark(b'R');
+                (first, second)
+            })
+            .unwrap();
+        let trail = trail.read();
+        assert!(!first, "only its own class's and less urgent work waited: {trail}");
+        assert!(second, "a Critical task waited: {trail}");
+        assert!(trail.starts_with('r'), "it went on at once, ahead of the Normal and Background work woken: {trail}");
+        let (k, big_r) = (trail.find('k').unwrap(), trail.find('R').unwrap());
+        assert!(k < big_r, "it gave way to the Critical task: {trail}");
+    }
+
+    /// Kiln's goal 6, plan 01a1a59c2abe step 3, on a shard: a Critical task woken while Normal and Background tasks
+    /// are queued is polled next, ahead of all of them; as Normal it waits behind the Normal tasks queued before it.
+    /// Do: three busy Normal and three busy Background tasks taking turns; the root wakes a waiting task. Expect: as
+    /// Critical, `c` right after `S`; as Normal, a queued `n` between them.
+    #[test]
+    fn g6_s3_on_a_shard_a_woken_critical_task_overtakes_queued_normal_and_background_work() {
+        let critical = woken_beside_queued_work(Class::Critical);
+        let s = critical.find('S').unwrap();
+        assert!(critical.matches('n').count() >= 8 && critical.matches('b').count() >= 8, "the busy tasks took turns: {critical}");
+        assert_eq!(critical[s..].chars().nth(1), Some('c'), "the Critical task overtook the queued work: {critical}");
+
+        let normal = woken_beside_queued_work(Class::Normal);
+        let (s, c) = (normal.find('S').unwrap(), normal.find('c').unwrap());
+        assert!(normal[s..c].contains('n'), "as Normal it waits behind the Normal tasks queued before it: {normal}");
+    }
 }

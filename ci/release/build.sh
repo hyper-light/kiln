@@ -19,9 +19,20 @@
 # vendor/bun/README.md; KILN_UI_SERVER=off builds without). Writes dist/kiln-<target>[.exe] and
 # dist/SHA256SUMS. KILN_DIST, KILN_MACOS_STUBS and KILN_MACOS_LINK_ARGS override the output
 # directory, the stubs and extra macOS link arguments (regen-macos-stubs.sh uses them).
+#
+# The Linux binaries' allocator (goal 11, plan 01a1a87b2e56 step 4; docs/runtime-lab.md, "The allocator
+# (step 4)"): `musl`, musl's own malloc, or `jemalloc`, kiln's `jemalloc` feature (jemalloc 5.3 with
+# kiln::os::alloc's settings for giving memory back). The default below is the one switch: it moves to
+# jemalloc once the lab's A/B picks it, and KILN_LINUX_ALLOCATOR overrides it for one build.
 set -euo pipefail
 cd "$(dirname "$0")/../.."
 root=$PWD
+
+linux_allocator=${KILN_LINUX_ALLOCATOR:-musl}
+case $linux_allocator in
+  musl | jemalloc) ;;
+  *) echo "KILN_LINUX_ALLOCATOR is musl or jemalloc, not $linux_allocator" >&2; exit 1 ;;
+esac
 
 all=(x86_64-unknown-linux-musl aarch64-unknown-linux-musl aarch64-apple-darwin x86_64-pc-windows-msvc)
 targets=("$@")
@@ -123,7 +134,17 @@ for t in "${targets[@]}"; do
   case $t in
     *-unknown-linux-musl)
       rustup target add "$t" >/dev/null
-      "$zigbuild" zigbuild --release --locked -p kiln --target "$t"
+      alloc=()
+      if [ "$linux_allocator" = jemalloc ]; then
+        alloc=(--features jemalloc)
+        # jemalloc's page must be at least the system's, or it refuses to start ("Unsupported system page
+        # size"), and built here its configure can't ask the machine it will run on, so it takes 4 KiB.
+        # x86-64's pages are 4 KiB; arm64 Linux runs 4, 16 or 64 KiB pages (16 on Apple silicon and the
+        # Raspberry Pi 5's kernel, 64 on some servers'), so its jemalloc takes 64 KiB (2^16), which runs on
+        # all three. tikv-jemalloc-sys reads it per target.
+        export AARCH64_UNKNOWN_LINUX_MUSL_JEMALLOC_SYS_WITH_LG_PAGE=16
+      fi
+      "$zigbuild" zigbuild --release --locked -p kiln --target "$t" ${alloc[@]+"${alloc[@]}"}
       cp "$target_dir/$t/release/kiln" "$dist/kiln-$t"
       ;;
     *-apple-darwin)

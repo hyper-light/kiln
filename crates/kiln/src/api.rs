@@ -5,6 +5,7 @@
 //! Auth is stateless so it survives restarts: sessions and one-time login links are HMACs of an
 //! expiry under the admin token; job tokens are HMACs of the job id.
 
+use std::borrow::Cow;
 use std::collections::HashMap;
 use std::future::Future;
 use std::net::IpAddr;
@@ -166,9 +167,14 @@ impl srv::Handler for Api {
         let upgrade = req.headers().get(header::UPGRADE).is_some_and(|v| v.as_bytes().eq_ignore_ascii_case(b"websocket"));
         let class = crate::route_latency::class_of(req.method(), req.uri().path(), upgrade);
         let waited = req.extensions().get::<kiln_http::Received>().map(|r| began.saturating_duration_since(r.0));
-        // Its polls labeled by its route, should one hold its shard (goal 9, plan 01a1a87b2cec step 2).
+        // Its polls labeled by its route, should one hold its shard (goal 9, plan 01a1a87b2cec step 2). The
+        // router's state is boxed once, so the layers it's carried in (its label, its placement, the
+        // connection's slot for its handler) each hold a pointer to it, not a copy of it: each took the whole
+        // of what it carried as its own, and a request's future, which kiln-http boxes anew for each request
+        // on a connection that idled between them (the lab's readers'), was three times the router's (goal
+        // 10, plan 01a1a87b2dae step 5).
         let label = crate::route_latency::label_of(req.method(), req.uri().path(), upgrade);
-        let resp = match crate::rt::labeled(label, route(hub, req)).await {
+        let resp = match crate::rt::labeled(label, boxed(|| route(hub, req))).await {
             Ok(r) => r,
             Err(e) => e.into_response(),
         };
@@ -179,8 +185,11 @@ impl srv::Handler for Api {
     }
 }
 
-fn segments(path: &str) -> Vec<String> {
-    path.trim_matches('/').split('/').filter(|s| !s.is_empty()).map(srv::decode).collect()
+/// `path`'s segments, each percent-decoded (and `+` a space) where it has anything to decode, else as it
+/// is in the path: made once a request, by the router, and handed on (goal 10, plan 01a1a87b2dae step 5:
+/// each request split its path twice, two copies a segment each time).
+fn segments(path: &str) -> Vec<Cow<'_, str>> {
+    path.trim_matches('/').split('/').filter(|s| !s.is_empty()).map(|s| if s.contains(['%', '+']) { Cow::Owned(srv::decode(s)) } else { Cow::Borrowed(s) }).collect()
 }
 
 async fn route(hub: Arc<Hub>, req: Request) -> R {
@@ -201,7 +210,7 @@ async fn route(hub: Arc<Hub>, req: Request) -> R {
     let method = req.method().clone();
     let path = req.uri().path().to_owned();
     let seg = segments(&path);
-    let s: Vec<&str> = seg.iter().map(String::as_str).collect();
+    let s: Vec<&str> = seg.iter().map(|c| &**c).collect();
 
     // Pages' own address (`[server] pages_url`): pages agents show, and nothing of kiln's.
     if pages_site(&hub).is_some_and(|site| asks_for(&req, &site)) {
@@ -379,15 +388,15 @@ async fn route(hub: Arc<Hub>, req: Request) -> R {
         // OTLP/HTTP (`crate::observe::otlp`), with the ingest token or the admin's.
         (&Method::POST, ["v1", "metrics"]) => {
             let ok = bearer(req.headers()).is_some_and(|t| crate::observe::api::ingest_allowed(t, &hub.admin_token));
-            return Ok(crate::observe::api::otlp(crate::observe::otlp::Signal::Metrics, req, ok).await);
+            return Ok(boxed(|| crate::observe::api::otlp(crate::observe::otlp::Signal::Metrics, req, ok)).await);
         }
         (&Method::POST, ["v1", "logs"]) => {
             let ok = bearer(req.headers()).is_some_and(|t| crate::observe::api::ingest_allowed(t, &hub.admin_token));
-            return Ok(crate::observe::api::otlp(crate::observe::otlp::Signal::Logs, req, ok).await);
+            return Ok(boxed(|| crate::observe::api::otlp(crate::observe::otlp::Signal::Logs, req, ok)).await);
         }
         (&Method::POST, ["v1", "traces"]) => {
             let ok = bearer(req.headers()).is_some_and(|t| crate::observe::api::ingest_allowed(t, &hub.admin_token));
-            return Ok(crate::observe::api::otlp(crate::observe::otlp::Signal::Traces, req, ok).await);
+            return Ok(boxed(|| crate::observe::api::otlp(crate::observe::otlp::Signal::Traces, req, ok)).await);
         }
         // Prometheus's remote write (`crate::observe::remote`): the same token, as a bearer token
         // or basic auth's password.
@@ -397,7 +406,7 @@ async fn route(hub: Arc<Hub>, req: Request) -> R {
                 return Ok(srv::text(StatusCode::UNAUTHORIZED, "a remote write sends the ingest token: `authorization: credentials`, `bearer_token`, or basic auth's password"));
             }
             return Ok(match crate::observe::api::get() {
-                Some(o) => crate::observe::remote::answer(o, req).await,
+                Some(o) => boxed(|| crate::observe::remote::answer(o, req)).await,
                 None => srv::with_header(srv::text(StatusCode::SERVICE_UNAVAILABLE, "observe is starting"), header::RETRY_AFTER, "1"),
             });
         }
@@ -409,7 +418,7 @@ async fn route(hub: Arc<Hub>, req: Request) -> R {
                 return Ok(srv::json(StatusCode::FORBIDDEN, &serde_json::json!({ "errors": ["Forbidden", "API key is missing or invalid"] })));
             }
             return Ok(match crate::observe::api::get() {
-                Some(o) => crate::observe::ddagent::answer(o, segs, req).await,
+                Some(o) => boxed(|| crate::observe::ddagent::answer(o, segs, req)).await,
                 None => srv::with_header(srv::text(StatusCode::SERVICE_UNAVAILABLE, "observe is starting"), header::RETRY_AFTER, "1"),
             });
         }
@@ -417,17 +426,17 @@ async fn route(hub: Arc<Hub>, req: Request) -> R {
         (&Method::POST, [service, "Export"]) if crate::observe::otlp::grpc_signal(&format!("/{service}/Export")).is_some() => {
             let ok = bearer(req.headers()).is_some_and(|t| crate::observe::api::ingest_allowed(t, &hub.admin_token));
             let signal = crate::observe::otlp::grpc_signal(&format!("/{service}/Export")).unwrap_or(crate::observe::otlp::Signal::Metrics);
-            return Ok(crate::observe::api::otlp_grpc(signal, req, ok).await);
+            return Ok(boxed(|| crate::observe::api::otlp_grpc(signal, req, ok)).await);
         }
         // The clouds' pushes (`crate::observe::cloud::push`), with the ingest token or the admin's:
         // Firehose sends it as its access key, a Pub/Sub push subscription in its endpoint's query.
         (&Method::POST, ["v1", "firehose"]) => {
             let ok = req.headers().get("x-amz-firehose-access-key").and_then(|v| v.to_str().ok()).is_some_and(|t| crate::observe::api::ingest_allowed(t, &hub.admin_token));
-            return Ok(crate::observe::cloud::push::firehose(req, ok).await);
+            return Ok(boxed(|| crate::observe::cloud::push::firehose(req, ok)).await);
         }
         (&Method::POST, ["v1", "pubsub"]) => {
             let ok = srv::query(&req).get("token").is_some_and(|t| crate::observe::api::ingest_allowed(t, &hub.admin_token));
-            return Ok(crate::observe::cloud::push::pubsub(req, ok).await);
+            return Ok(boxed(|| crate::observe::cloud::push::pubsub(req, ok)).await);
         }
         // A snapshot's file for a runner's replica, with that machine's token (`crate::observe`).
         (&Method::GET, ["api", "observe", "v1", "snapshot", snap, file]) => return crate::observe::api::snapshot(snap, file, &req, |m| hub.machine_of(m)).map_err(|(c, m)| err(c, m)),
@@ -476,13 +485,13 @@ async fn route(hub: Arc<Hub>, req: Request) -> R {
         return Err(err(StatusCode::UNAUTHORIZED, "authentication required"));
     };
     if method == Method::GET || method == Method::HEAD {
-        return boxed(|| authorized(hub, caller, req)).await;
+        return boxed(|| authorized(hub, caller, req, seg)).await;
     }
     // A change is audited (W19-R05): one row for the request, refused or not, which takes what
     // its handlers record on the way.
     let (who, q, ip) = (caller.clone(), srv::query(&req), srv::remote_ip(&req));
     let h = Arc::clone(&hub);
-    crate::audit::request(&h, crate::audit::Req { caller: &who, method: &method, path: &path, q: &q, ip }, boxed(|| authorized(hub, caller, req)), |r: &R| match r {
+    crate::audit::request(&h, crate::audit::Req { caller: &who, method: &method, path: &path, q: &q, ip }, boxed(|| authorized(hub, caller, req, seg)), |r: &R| match r {
         Ok(resp) => resp.status().as_u16(),
         Err(e) => e.0.as_u16(),
     })
@@ -497,22 +506,21 @@ pub(crate) fn boxed<'a, F: Future + Send + 'a>(make: impl FnOnce() -> F) -> Pin<
     Box::pin(make())
 }
 
-/// The API past authentication: everyone but the owner is held to the route table (W10-R05).
-async fn authorized(hub: Arc<Hub>, caller: crate::authz::Caller, req: Request) -> R {
+/// The API past authentication: everyone but the owner is held to the route table (W10-R05). `seg` is
+/// the request's path in segments, as the router split it ([`segments`]).
+async fn authorized(hub: Arc<Hub>, caller: crate::authz::Caller, req: Request, mut seg: Vec<Cow<'_, str>>) -> R {
     let method = req.method().clone();
-    let path = req.uri().path().to_owned();
-    let mut seg = segments(&path);
     // A runner the path names by a name people see (its label, a name its certificate carried
     // from before) is the machine id kiln keys it by (docs/machines.md, "One record a machine").
     if let [api, kind, name, ..] = seg.as_mut_slice()
         && api == "api"
         && (kind == "runners" || kind == "agents")
-        && !["enroll", "instance", "rekey", "tunnel", "join"].contains(&name.as_str())
+        && !["enroll", "instance", "rekey", "tunnel", "join"].contains(&&**name)
         && let Some(id) = hub.machine_named(name)
     {
-        *name = id;
+        *name = Cow::Owned(id);
     }
-    let s: Vec<&str> = seg.iter().map(String::as_str).collect();
+    let s: Vec<&str> = seg.iter().map(|c| &**c).collect();
     let q = srv::query(&req);
     if !caller.is_owner() {
         boxed(|| crate::authz::gate::check(&hub, &caller, &method, &s, &q)).await.map_err(|(c, m)| err(c, m))?;
@@ -5343,9 +5351,10 @@ async fn conversation_events(hub: &Hub, id: &str, q: &HashMap<String, String>) -
     // spilled (goal 11, plan 01a1a87b2e56 step 5).
     let limit = q.get("limit").and_then(|l| l.parse::<usize>().ok()).unwrap_or(crate::harness::copies::EVENTS_PAGE).clamp(1, 1000);
     // From the session's copy when it holds them all: the events' texts as each was written once,
-    // joined, neither the store read nor anything encoded (goal 10, plan 01a1a87b2dae step 2).
-    if let Some(events) = hub.harness.events_json(id, before, limit) {
-        return Ok(pre_encoded(events));
+    // neither the store read nor anything encoded (goal 10, plan 01a1a87b2dae step 2), sent in the
+    // pieces they're kept in, nothing inflated or joined for this read (step 5).
+    if let Some(events) = hub.harness.events_page(id, before, limit) {
+        return Ok(srv::response(StatusCode::OK, "application/json", srv::pieces(events)));
     }
     let id = id.to_owned();
     crate::reads::trace::asked();
@@ -6736,9 +6745,11 @@ fn server_health(hub: &Hub) -> Response {
             "schema": { "epoch": crate::store::migrations::SCHEMA_EPOCH, "min_reader": crate::store::migrations::min_reader() },
             "runners": { "connected": connected, "before": before, "back": back(connected, before) },
             // Its place on its machine (docs/priority.md; goal 8, plan 01a1a59c2b29 step 7): its shards'
-            // real-time class as they took it, or why not (`[server] realtime`), and where the legs and
-            // agents its own runner starts run beside its cores (`[server] cores`).
-            "priority": { "realtime": crate::rt::realtime_status(), "work": crate::os::work_said() },
+            // real-time class as they took it, or why not (`[server] realtime`), their nudge in its place
+            // (`[server] nudge`), and where the legs and agents its own runner starts run beside its cores
+            // (`[server] cores`); its cores, its shards' and the partition they're in, if any (goal 9, plan
+            // 01a1a87b2cec step 4).
+            "priority": { "realtime": crate::rt::realtime_status(), "nudge": crate::rt::nudge_status(), "work": crate::os::work_said(), "cores": crate::rt::cores_status() },
             // The cluster group (docs/p2p.md P1, P2): kiln.db's last write, the log's last entry,
             // the runners holding a replica, and kiln.db's size (what a runner's copy takes).
             "store": hub.store.group_standing().map_or(json!({ "group": false }), |(seq, applied)| json!({
@@ -7592,5 +7603,42 @@ mod tests {
             anyhow::ensure!(texts_read(wrote.concat())? == [r#"{"t":"events","rev":9}"#.to_owned(), crate::harness::live::closed().to_owned()], "the frame, then the last");
             Ok(())
         })
+    }
+
+    /// Goal 10, plan 01a1a87b2dae step 5: a request's future holds its router's state by a pointer, not a copy
+    /// of it in each layer it's carried in (its label, its placement): the future kiln-http keeps for each
+    /// request, boxed anew when its connection idled between requests, is smaller than the router's. In this
+    /// (test) build it was 54,816 bytes, three times a router's 8,808; now 2,064, the router's 2,840 boxed
+    /// apart once (its inline awaits of Observe's boxed too).
+    #[test]
+    fn g10_s5_a_requests_future_holds_its_router_by_pointer() -> anyhow::Result<()> {
+        crate::rt::block_on(async {
+            let hub = crate::hub::tests::scratch_hub().await?;
+            let api = Arc::new(Api { hub: Arc::clone(&hub) });
+            let router = route(Arc::clone(&hub), lab_get("/api/me")?);
+            let handled = crate::http::server::Handler::handle(Arc::clone(&api), lab_get("/api/me")?);
+            let placed = crate::placement::request(crate::overload::Class::Normal, false, crate::http::server::Handler::handle(Arc::clone(&api), lab_get("/api/me")?));
+            let (router_b, handled_b, placed_b) = (size_of_val(&router), size_of_val(&handled), size_of_val(&placed));
+            drop((router, handled, placed));
+            anyhow::ensure!(handled_b < router_b && placed_b < router_b, "the router's {router_b} bytes, a request's {handled_b}, placed {placed_b}");
+            Ok(())
+        })
+    }
+
+    /// Goal 10, plan 01a1a87b2dae step 5: a path's segments, split once by the router, are each the path's
+    /// own bytes where there's nothing to decode in it (no copy made), decoded where there is.
+    #[test]
+    fn g10_s5_a_paths_segments_are_its_own_unless_decoded() {
+        let path = "/api/harness/sessions/a%2Fb/events/two+words/";
+        let seg = segments(path);
+        let said: Vec<&str> = seg.iter().map(|c| &**c).collect();
+        assert_eq!(said, ["api", "harness", "sessions", "a/b", "events", "two words"]);
+        for (c, plain) in seg.iter().zip([true, true, true, false, true, false]) {
+            assert_eq!(matches!(c, Cow::Borrowed(_)), plain, "{c}");
+            if let Cow::Borrowed(s) = c {
+                assert!(path.as_bytes().as_ptr_range().contains(&s.as_ptr()), "{s}: the path's own bytes");
+            }
+        }
+        assert!(segments("/").is_empty());
     }
 }

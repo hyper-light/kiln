@@ -142,8 +142,14 @@ paused is the pause's alone: the pacer neither stops it nor lets it go on.
 
 - `kiln install` writes them into `kiln.slice` (`AllowedCPUs=`). Installed system-wide, the server's
   unit also makes the slice a cpuset partition as it starts (`cpuset.cpus.partition` `root`, as
-  root): nothing outside it runs on those cores (f21). A user's install can confine the server
-  there, not keep others off.
+  root): nothing outside it runs on those cores (f21). A system install without them makes the slice
+  a member again as the server starts, and `kiln uninstall` does too: a partition outlives the unit
+  that made it, its cores held from everything else until then. A user's install can confine the
+  server there (where root gave their service manager the cpuset controller), not keep others off
+  ("What kiln install grants", below). The server says whether its cores are a partition's as it
+  starts (its log) and in `/healthz/server` (`priority.cores`: its cores, its shards', and the
+  partition with its state as the kernel says it, `/kiln.slice: root`, or why it's invalid): the
+  unit's write can fail without failing the unit.
 - The server fixes its shards to them, one each, keeping the first core for its threads that
   aren't shards, as hyper-rt's placement does (f11), and keeps its other threads off the shards'
   cores (goal 9, plan `01a1a87b2cec` step 4): a thread or process starts with the CPUs of the thread
@@ -153,6 +159,8 @@ paused is the pause's alone: the pacer neither stops it nor lets it go on.
   own (`[server] cores` is refused there), so nothing changes on them.
 - kiln's own legs and agents keep off them (step 7; "Legs and agents keep off the server's cores",
   below): those the server's own runner starts, and those of every runner whose config declares them.
+  Where the server's slice holds its own runner on its cores (a partition), they run on those cores
+  but off its shards'.
 
 In the lab, cores of its own held every page and API number within noise of the server alone, which
 weights didn't ("The lab", below). It stays off all the same: cores held for the server sit idle
@@ -235,15 +243,19 @@ With `[server] cores`, kiln keeps its own legs and agents off the server's cores
     holds a waking shard for a tick (wake-2, above). The partition makes them the server's alone.
   - The server's own runner shares the server's cores wherever its slice holds the server there
     (`AllowedCPUs=` applied: a system install, or a user's manager given the `cpuset` controller), since
-    everything the server starts is in its slice. It says so; a runner of its own beside the server keeps them
-    off (`[local_agent] enabled = false`, and `kiln install --agent`).
+    everything the server starts is in its slice. Its legs and agents then run on those of them its shards
+    aren't fixed to (the first, which its other threads keep, and any past the shards'; goal 9, plan
+    `01a1a87b2cec` step 4), and only share a shard's where every core is a shard's. It says so; a runner of
+    its own beside the server keeps them off all of them (`[local_agent] enabled = false`, and
+    `kiln install --agent`).
 - **macOS and Windows:** nothing changes, as a server has no cores of its own there. macOS has no CPU affinity
   for a process, and its legs and agents already run under background policy, which Apple silicon runs on its
   efficiency cores; on Windows they run below normal, and its scheduler preempts them at once for the server.
 
 ## A real-time class for the shards
 
-`[server] realtime = true` (off until declared; `KILN_RT_REALTIME` overrides it) puts each of the server's
+`[server] realtime = true` (off until declared, and on bare metal `kiln install` declares it wherever its unit
+grants it: "The bare-metal default", below; `KILN_RT_REALTIME` overrides it) puts each of the server's
 shards in Linux's round-robin real-time class, `SCHED_RR`, at the lowest real-time priority, 1 (goal 8, plan
 `01a1a59c2b29` step 7; goal 9, plan `01a1a87b2cec` step 4; `hyper_rt::compute::realtime_current_thread`):
 
@@ -259,24 +271,126 @@ shards in Linux's round-robin real-time class, `SCHED_RR`, at the lowest real-ti
   its own limit allows (systemd sets the nearest it can, never failing the unit), which is 0 unless the
   machine's owner raised it for the user (a `limits.d` entry, `rtprio 1`). Not `CPUSchedulingPolicy=`: it would
   put every thread of the server, and everything it starts, in the class. On 2026-11-05 fedora (the lab) gave its
-  user 0, in a shell and in a user scope; adacachy (production) gives its user 99, soft and hard, so there the class
-  needs nothing the installer can't give.
+  user 0, in a shell, in a user scope and to the user's service manager; adacachy gives its user 99, soft and hard
+  (its `limits.d` entries for the `audio` group), so there a user's install needs nothing the installer can't give.
+  **Production's server isn't a user's install:** it runs from a hand-written system unit with `User=adalundhe`
+  (the bare-metal design's phase 0), and its process's `RLIMIT_RTPRIO` was 0, soft and hard, on 2026-11-05
+  (`/proc/<pid>/limits`): `limits.d` applies to PAM sessions, a user's service manager among them, never to a
+  system unit, which gets the room only from its own `LimitRTPRIO=` (the system's manager grants it whatever
+  `limits.d` says). Its unit needs `LimitRTPRIO=1` and its config `[server] realtime = true`: a deploy, Ada's call.
+- **The room is the shards' alone.** Once every shard has answered, the server sets its own `RLIMIT_RTPRIO` to 0,
+  soft and hard (`crate::os::drop_realtime_room`): nothing it starts from then on, its own runner's legs and
+  agents among them, inherits room to take the class beside the shards, which keep it (the limit bounds asking,
+  not having). The shards ask as the runtime starts, before the server serves anything.
 - **Refused,** a shard runs as it would without it, with a slice of its step, and the server says so: in its
   log once every shard has answered, and in `/healthz/server` (`priority.realtime`: asked, shards, took,
   refused, why). It never fails for it. A kernel with real-time group scheduling (`CONFIG_RT_GROUP_SCHED`)
-  refuses it too where the server's cgroup has no real-time runtime.
+  refuses it too where the server's cgroup has no real-time runtime (fedora's and adacachy's kernels have none).
 - **Its cost.** A real-time shard keeps its CPU from normal threads for as long as it runs, a long poll (goal
-  9's slow polls) too: it belongs with shards that give up their CPU on time, as kiln's do at their step. The
-  kernel keeps 5% of every CPU for normal threads (`sched_rt_runtime_us`: real-time threads get 950 ms of each
-  second), and shards await other threads' work rather than spin on it.
+  9's slow polls) too: it belongs with shards that give up their CPU on time, as kiln's do at their step, and
+  that await other threads' work rather than spin on it. Normal threads keep a share of a CPU real-time threads
+  hold: from Linux 6.12 the fair server gives them 50 ms of every second on each CPU, and before it real-time
+  throttling (`sched_rt_runtime_us`, 950 ms of each second by default; adacachy sets it to the whole second,
+  leaving the fair server). No `LimitRTTIME=`: a shard busy with ready work makes no blocking call for as long
+  as the work lasts, and the limit would kill the server for it.
 - **macOS and Windows** refuse it, saying why: macOS's real-time policy for user threads (time constraint) is
   for periodic work of a known computation, as audio's is, and demotes a thread that overruns it; Windows
   preempts a lower priority level at once already, and its real-time priority class would put the server above
   the system's own work.
 
-It stays off until an A/B where it's granted picks it ("Step 7's lab", below). Where it needs no more than the
-installer can grant (a system install), the winner becomes the bare-metal default; on a user's install it
-needs the machine owner's grant, theirs to give.
+## What kiln install grants
+
+The server's unit, as `kiln install` writes it on Linux with systemd, for each kind of install (goal 9, plan
+`01a1a87b2cec` step 4). It reads what the machine lets it have first (`crate::install::room_here`: the root
+cgroup's controllers for a system install; for a user's, their service manager's own `RLIMIT_RTPRIO` and its
+cgroup's controllers) and says each line as it installs (`priority`, `realtime`, `cores`):
+
+| | system install (`--system`, as root) | a user's install (`systemd --user`) |
+| --- | --- | --- |
+| CPU and I/O weight 1000 | on `/etc/systemd/system/kiln.slice`, beside `user.slice` and `system.slice`, where CI and agents run | on the user manager's `kiln.slice`, beside the user's other units (`app.slice`, where their runner runs); never against `system.slice`, as only root places a slice at the top |
+| `Delegate=yes` (`DelegateSubgroup=kiln` from systemd 254) | yes | yes |
+| the shards' real-time class (`LimitRTPRIO=1` with `[server] realtime`) | granted: the server runs as root (`CAP_SYS_NICE`) | granted only as far as the user manager's own hard `RLIMIT_RTPRIO` (systemd gives a unit the nearest it can), which only root raises: `<user> - rtprio 1` in `/etc/security/limits.d`, then a new service manager (logging out and in, or a reboot, which restarts the runner) |
+| `AllowedCPUs=` (`[server] cores`) | applies (the root cgroup has the cpuset controller on cgroup v2) | applies only where root delegated the cpuset controller to the user's manager (a drop-in for `user@.service`, `Delegate=pids memory cpu cpuset`; systemd's own delegates `pids memory cpu`): elsewhere the shards are still fixed to the cores, by affinity, but the server isn't held there |
+| a cpuset partition of the cores | made as the server starts (`ExecStartPre=+-`, as root), made a member again without cores, and by `kiln uninstall` | never: `cpuset.cpus.partition` is the parent cgroup's to set and makes a partition only of a partition's child (the root cgroup is one); a user's slice sits inside their service manager's, under cgroups root owns, and a remote partition needs `cpuset.cpus.exclusive` written by root on `user.slice`, `user-<uid>.slice` and `user@<uid>.service` |
+
+So without root a user's unit can't get: a slice ahead of the system's; the real-time class past their service
+manager's limit; `AllowedCPUs=` without the cpuset controller root delegates; a partition; `preempt=full` (a boot
+parameter). The server says what it got as it starts (its log, `/healthz/server`'s `priority`), whatever the unit
+asked for.
+
+## The bare-metal default
+
+What `kiln install` declares for a new server on Linux with systemd (goal 9, plan `01a1a87b2cec` step 4: "the
+winner is the bare-metal default where it needs no more than the installer can grant"):
+
+- **The shards in the real-time class, wherever the unit grants it:** every system install, and a user's install
+  whose service manager allows `RLIMIT_RTPRIO` 1 or more. `kiln install` writes `[server] realtime = true` into
+  the new config with a line saying why, and the unit's `LimitRTPRIO=1`; a config it keeps, it leaves, saying
+  whether this install could grant the class and how to turn it on. Where the unit can't grant it, it stays off,
+  and the install says what it would take. `[server] realtime = false` turns it off. `Config::default()` (tests,
+  `kiln up`, containers, Kubernetes) keeps it off.
+- **Cores of its own stay declared** (`[server] cores`): how many the server needs, and which, is its machine's
+  and its load's to say, and cores held for it sit idle whenever it does. Declared on a system install, they're
+  a partition.
+- **macOS and Windows keep what they have:** the server's launchd job at `ProcessType` `Interactive`, its legs and
+  agents under background policy; on Windows the server above normal, legs and agents below normal in jobs of
+  their own. Neither has cores of the server's own or the real-time class, and `kiln install` says so.
+
+Its basis:
+
+- **Weights alone can't make the bar.** Goal 9's bar is shard delay p99.9 under 1 ms with hogs. In step 7's lab
+  ("Step 7's lab", below; docs/runtime-lab.md), weights alone gave 3.28 ms with hogs (1.12 calm), cores of its own
+  by affinity 1.96, kiln's own placement of a runner's hogs 1.97: on a kernel that preempts lazily a normal-class
+  wake onto a busy CPU waits for its tick (wake-2: p99 1.00 ms, with any hog or none of the lab's), and on cores
+  shared with anything else a shard still waits there.
+- **The real-time class is the one way that holds whatever runs on the shard's CPU,** under every preemption
+  mode: a real-time wake preempts a normal thread at once, lazy kernels included ("The kernel's preemption"
+  above; research `01a1a87b2cee` f17). Cores of their own hold only as far as nothing else runs on them, which
+  takes a partition (root) and cores held idle; research f9 and f12 (Caladan, Heracles) weigh against static
+  partitions.
+- **It needs nothing the installer can't grant** where it's on: root's `CAP_SYS_NICE`, or room within a user's
+  service manager's limit; refused, the server runs as without it and says why.
+- **Its risk is bounded:** the lowest real-time priority, below the kernel's own real-time threads; reset on
+  fork; the room given up once the shards asked; shards that give their CPU back at their step and park when
+  idle; normal threads keep the fair server's share.
+
+It rests on the kernel's rules and step 7's lab, not yet on a lab A/B of the class itself: no lab machine
+granted it (fedora's user manager has `RLIMIT_RTPRIO` 0). The A/B that decides it is in docs/runtime-lab.md
+("Goal 8 step 7 and goal 9 step 4", "The A/B to run"): weights alone, cores, and the class beside hogs and on
+cores. If the class doesn't beat weights alone there, the default goes back to off (`realtime_default` in
+`crate::install`).
+
+**Ada's call** (each needs root, or production):
+
+- **The A/B on fedora:** one root command gives the lab's units the room (docs/runtime-lab.md), or a `limits.d`
+  entry, which takes a new user manager there (a restart of fedora's runner).
+- **Production:** its unit (`kiln-server.service`, a system unit with `User=`) needs `LimitRTPRIO=1` and its
+  config `[server] realtime = true`; `[server] cores` there would also need a partition, which its hand-written
+  unit doesn't make (the installer's does), and a choice of cores.
+- **A partition on fedora's lab,** `preempt=full` at boot there, and `isolated` partitions (no load balancing
+  on the shards' cores) anywhere: root's.
+
+## A nudge for the shards
+
+`[server] nudge = true` (off until declared; `KILN_RT_NUDGE` overrides it, `KILN_RT_NUDGE_US` sets its period
+for a lab's A/B) is what a shard has in the real-time class's place where that's refused, needing no privilege
+(goal 8, plan `01a1a59c2b29` step 7; `hyper_rt::compute::nudge_current_thread`):
+
+- Each of a shard's waits in its driver ends by the timers' tick (100 µs), so with its timer slack (the tick
+  too) its CPU takes an interrupt of the shard's own at least every 200 µs while it waits. Under `lazy` a wake
+  marks the busy thread and sends no interrupt, and the CPU switches as that thread next returns to user space
+  from the kernel: the shard's own timer is such a return. A shard woken behind a thread spinning in user space
+  then runs within two ticks, as late as a timer of its own may be, instead of at the kernel's next tick (up to
+  1 ms at 1000 Hz). Nothing a normal thread may set makes the wake itself preempt at once (docs/runtime-lab.md,
+  "Goal 8 step 7 and goal 9 step 4", reads the kernel for why).
+- A shard that took the real-time class doesn't nudge: its wake preempts at once. The others ask for their
+  slice, then the nudge.
+- **Its cost.** A waiting shard wakes once a period, a park and a turn of its loop, CPU it spends and the
+  threads beside it lose; and while a shard waits its CPU can't reach the deeper idle states. So it's off
+  until declared.
+- The log says how the shards took it once every shard has answered, and `/healthz/server` too
+  (`priority.nudge`: asked, period, shards, nudged, those in the real-time class, refused, why).
+- **macOS and Windows** refuse it, saying why: they have no lazy preemption to bound.
 
 ## Step 7's lab
 
@@ -294,6 +408,8 @@ p99.9 under 1 ms with hogs):
   round notes the CPUs each hog thread may run on;
 - `rt`, `rt-cc`: weights alone with the shards in the real-time class (`KILN_RT_REALTIME=1`, the scope given
   `LimitRTPRIO=1` as the installer's unit is); run only where the machine grants it, else skipped and said so.
+- `nudge`, `nudge-cc`, `calm-nudge`: weights alone with the shards nudging their CPUs (`KILN_RT_NUDGE=1`, "A
+  nudge for the shards"), beside the hogs or the compilers, and with none: what the nudge buys and costs.
 
 Each round notes `/healthz/server` (the real-time class as the shards took it, the work CPUs) and how busy
 other processes kept the server's cores (`foreign.py`): on a lazy kernel, work that isn't the lab's on those
@@ -531,12 +647,17 @@ kiln-server alarm at 204 s, so cut no CPU. headroom.md's "Simulation" runs this 
 - The user manager must give its units the `cpu` controller: systemd's own `user@.service`
   delegates `pids memory cpu`, and a runner's unit's `cgroup.controllers` says what it got.
 - On a lazy kernel, the server's cores are its own only with the partition (a system install): kiln
-  keeps its own legs and agents off them, nothing else.
+  keeps its own legs and agents off them, nothing else. `AllowedCPUs=` on a user's install needs the
+  cpuset controller delegated to their service manager (root's drop-in for `user@.service`).
 - The real-time class for a user's install: the machine's owner raises the user's `RLIMIT_RTPRIO` to 1
-  (a `limits.d` entry), or installs the server system-wide. `preempt=full` at boot, on a lazy kernel.
+  (a `limits.d` entry, then a new service manager), or installs the server system-wide. `preempt=full` at
+  boot, on a lazy kernel.
+- Production (a hand-written system unit with `User=`): `LimitRTPRIO=1` in its unit and `[server] realtime
+  = true` in its config, a deploy ("The bare-metal default", above).
 - The lab: its machine's kernel is lazy and it has no root there, so its A/Bs of the partition and of the
   real-time class wait on the owner (research `01a1a87b2cee` f17, f18: rtkit refuses this user a
-  real-time class there).
+  real-time class there). The real-time A/B needs one root command there (docs/runtime-lab.md, "Goal 8
+  step 7 and goal 9 step 4: the server's cores").
 
 ## Tests
 
@@ -593,3 +714,15 @@ kiln-server alarm at 204 s, so cut no CPU. headroom.md's "Simulation" runs this 
   `g9_s4_a_real_time_class_ranks_above_every_other_policy`. `rt::tests::g9_s4_the_real_time_class_is_said_as_the_shards_took_it`:
   said once every shard answered, a refusal in a person's words. `install::tests::g8_units_are_delegated_and_the_server_comes_first`:
   `LimitRTPRIO=1` for a server asking for the class, and no policy for all of it.
+- Goal 9, plan `01a1a87b2cec` step 4, what `kiln install` grants and the bare-metal default:
+  `install::tests::g9_s4_the_real_time_class_is_granted_by_a_system_install_and_within_a_users_manager_limit`
+  (root grants it; a user's manager at 99, 1 or unlimited grants it, at 0 says what root must do, unread
+  grants nothing); `g9_s4_cores_get_what_each_install_may` (a system install's partition made, given back
+  without cores, left alone on a user's; `AllowedCPUs=` only where the cpuset controller is; the server's own
+  runner off the shards' cores, said so; the unit's `ExecStartPre=` lines); `g9_s4_kiln_install_says_how_the_shards_run`;
+  `g9_s4_a_new_servers_config_declares_the_class_where_its_unit_grants_it` (and `Config::default()` keeps it
+  off); `g9_s4_a_service_managers_limits_and_cgroup_read_as_linux_writes_them` and
+  `g9_s4_this_machines_service_manager_is_read`; `g8_systemd_reads_the_units_kiln_writes` with the unit that
+  gives a partition's cores back. `os::tests::g9_s4_legs_and_agents_in_a_partition_keep_off_the_shards_cores`,
+  `os::tests::g9_s4_the_real_time_room_is_given_up_whole` (Linux: a process's `RLIMIT_RTPRIO` to 0, soft and
+  hard, read back from `/proc`), `os::cgroup::tests::g9_s4_the_partition_a_server_runs_in`.
