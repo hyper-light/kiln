@@ -387,6 +387,11 @@ struct Expect {
 }
 
 impl Expect {
+    /// An [`Expect`] with nothing learned.
+    const fn nothing_yet() -> Self {
+        Self { bytes: std::sync::atomic::AtomicU64::new(0), ns: std::sync::atomic::AtomicU64::new(0) }
+    }
+
     /// Nanoseconds a frame of `len` bytes is expected to take to read: it grows with its length at the
     /// rate the frames so far were read, not a short one's fixed cost; none expected until one was read.
     fn expected(&self, len: u64) -> u64 {
@@ -408,18 +413,15 @@ impl Expect {
 /// `crate::wire::agent_classes`, has 70-some; a test holds it within), a kind past it sharing the rest's.
 const KINDS: usize = 128;
 
-/// An [`Expect`] with nothing learned.
-const NOTHING_YET: Expect = Expect { bytes: std::sync::atomic::AtomicU64::new(0), ns: std::sync::atomic::AtomicU64::new(0) };
-
 /// What reading a runner's message of each kind is expected to take, as the hub's loop reads frames
 /// ([`read_frame`]) and channel items ([`read_item`]): an [`Expect`] for each of [`AgentMsg`]'s variants (goal
 /// 9, plan 01a1a87b2cec step 3). One for all judged an agent session's update, whose JSON costs much more a
 /// byte, by the many messages that carry bytes (terminal output, streams): mid-sized updates were read on
 /// the shard, up to 2.4 ms each in the lab's g6c2.
-static KIND_COSTS: [Expect; KINDS] = [NOTHING_YET; KINDS];
+static KIND_COSTS: [Expect; KINDS] = [const { Expect::nothing_yet() }; KINDS];
 
 /// What [`KIND_COSTS`] has no room for: kinds past it, and what doesn't say its kind.
-static REST_COSTS: Expect = NOTHING_YET;
+static REST_COSTS: Expect = Expect::nothing_yet();
 
 /// The kind of runner message `data` holds: its variant's index on the wire, postcard's first varint (up to
 /// a `u32`'s five bytes); [`KINDS`] − 1 for one past the room or that can't be read.
