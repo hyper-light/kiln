@@ -7499,7 +7499,7 @@ mod tests {
             let api = Arc::new(Api { hub: Arc::clone(&hub) });
             let router = route(Arc::clone(&hub), lab_get("/api/me")?);
             let handled = crate::http::server::Handler::handle(Arc::clone(&api), lab_get("/api/me")?);
-            let placed = crate::placement::request(crate::overload::Class::Normal, crate::http::server::Handler::handle(Arc::clone(&api), lab_get("/api/me")?));
+            let placed = crate::placement::request(crate::overload::Class::Normal, false, crate::http::server::Handler::handle(Arc::clone(&api), lab_get("/api/me")?));
             let (router_b, handled_b, placed_b) = (size_of_val(&router), size_of_val(&handled), size_of_val(&placed));
             drop((router, handled, placed));
             anyhow::ensure!(handled_b < router_b && placed_b < router_b, "the router's {router_b} bytes, a request's {handled_b}, placed {placed_b}");
