@@ -89,6 +89,16 @@ hot = [
   "crates/kiln/src/reads.rs",
   # Ship's Deploys (goal 5 step 2).
   "crates/kiln/src/ship",
+  # The runner process's own side of the runner path (goal 5, plan 01a1a59c2aae, its top goal): a job's
+  # steps and their log (`exec.rs`), a harness's and a step's pipes (`os/proc_unix.rs`; Windows'
+  # `os/proc_windows.rs` keeps each process's job object behind a lock of its own, so it isn't here), and
+  # a terminal's output and keystrokes on every platform (`terminal.rs`, `os/pty_unix.rs`,
+  # `os/pty_windows.rs`). Their queues are `crate::memory::queue`'s.
+  "crates/kiln/src/exec.rs",
+  "crates/kiln/src/os/proc_unix.rs",
+  "crates/kiln/src/terminal.rs",
+  "crates/kiln/src/os/pty_unix.rs",
+  "crates/kiln/src/os/pty_windows.rs",
 ]
 
 # kiln-http: a cell per body, upgrade or wait, held by that one object's two ends, no other request's.

@@ -67,8 +67,8 @@ pub struct Config {
     /// Where copies of other runners' trees live (`~/.kiln/reach`).
     pub mirrors: PathBuf,
     /// Who takes over what another runner hands this one (an agent session moving here); None:
-    /// hand-overs are refused.
-    pub adopt: Option<async_channel::Sender<Adoption>>,
+    /// hand-overs are refused. A lock-free queue (`crate::memory::queue`; goal 5, plan 01a1a59c2aae).
+    pub adopt: Option<crate::memory::queue::Sender<Adoption>>,
     /// The copies' uses, for their keeper (`super::keeper`, docs/reach.md §5.1): each sync and run
     /// holds its copy in use while it's at it.
     pub using: Arc<super::keeper::Using>,

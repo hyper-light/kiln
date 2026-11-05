@@ -817,10 +817,12 @@ fn writer(mut engine: Box<dyn Engine>, rx: &mpsc::Receiver<Msg>, watchers: &Watc
 }
 
 /// A sink that keeps what passes through it in `store` on its way to `sink`, in order, with the
-/// same room (a full `sink` holds the sessions back, as it always did).
+/// same room (a full `sink` holds the sessions back, as it always did): `room` updates, whatever each
+/// carries, on a lock-free queue (goal 5, plan 01a1a59c2aae: an async-channel's wait took
+/// event-listener's `Mutex`, each session's shard sending and the tee's waiting on its own).
 pub fn tee(sink: impl Into<Sink>, store: Store, room: usize) -> Sink {
     let sink: Sink = sink.into();
-    let (tx, rx) = async_channel::bounded::<(String, Update)>(room);
+    let (tx, rx) = crate::memory::queue::places::<(String, Update)>(&crate::memory::owners::CHANNELS, room);
     crate::rt::spawn(async move {
         while let Ok((id, u)) = rx.recv().await {
             store.send(&id, &u);
@@ -850,7 +852,7 @@ enum Keeping {
 pub struct Held {
     keeping: Arc<Mutex<Keeping>>,
     /// The tee's way in, held weakly: the tee still ends once its senders have.
-    input: async_channel::WeakSender<(String, Update)>,
+    input: crate::memory::queue::WeakSender<(String, Update)>,
 }
 
 impl Held {
@@ -884,7 +886,8 @@ impl Held {
 /// the store wait for it in memory; never given, they go.
 pub fn tee_held(sink: impl Into<Sink>, store: Option<Store>, room: usize) -> (Sink, Held) {
     let sink: Sink = sink.into();
-    let (tx, rx) = async_channel::bounded::<(String, Update)>(room);
+    // `room` updates, whatever each carries, on a lock-free queue, as [`tee`]'s.
+    let (tx, rx) = crate::memory::queue::places::<(String, Update)>(&crate::memory::owners::CHANNELS, room);
     let keeping = Arc::new(Mutex::new(store.map_or_else(|| Keeping::Waiting(Vec::new()), Keeping::Store)));
     let held = Held { keeping: keeping.clone(), input: tx.downgrade() };
     crate::rt::spawn(async move {
@@ -1024,6 +1027,60 @@ mod tests {
             st.sync()?;
             let texts = st.kept("a1", 10)?.map(|k| k.events.into_iter().map(|e| e.text).collect::<Vec<_>>()).unwrap_or_default();
             assert_eq!(texts, vec!["before the store".to_owned(), "after it".to_owned()]);
+            Ok(())
+        })
+    }
+
+    /// Goal 5, plan 01a1a59c2aae (its top goal), the runner's side: a tee's way in is a lock-free queue of
+    /// `room` updates. Sessions on every shard sending at once, past its room while what's after it takes
+    /// slowly, each have every update passed on once, in the order sent; its way in never holds more than its
+    /// room; and once its senders are gone and it's drained, what's after it sees the end.
+    #[test]
+    fn g5_a_tee_passes_every_shards_updates_on_once_in_order_within_its_room() -> anyhow::Result<()> {
+        crate::rt::block_on(async move {
+            let (out, passed) = crate::memory::queue::places(&crate::memory::owners::CHANNELS, 4);
+            let room = 16;
+            let (sink, held) = tee_held(out, None, room);
+            // Looked at weakly: a sender held here would keep the tee from ever ending.
+            let way_in = match &sink {
+                Sink::Bounded(q) => q.downgrade(),
+                Sink::Channel(_) => anyhow::bail!("a tee's way in isn't a queue"),
+            };
+            let (senders, per) = (8usize, 200u64);
+            let mut sending = Vec::new();
+            for t in 0..senders {
+                let sink = sink.clone();
+                sending.push(crate::rt::spawn_spread_joined(async move {
+                    for n in 0..per {
+                        if sink.send((format!("s{t}"), said(&format!("m{n}"), n, "x"))).await.is_err() {
+                            return false;
+                        }
+                    }
+                    true
+                }));
+            }
+            drop(sink);
+            let (mut got, mut most) = (vec![Vec::<u64>::new(); senders], 0usize);
+            loop {
+                most = most.max(way_in.upgrade().map_or(0, |q| q.len()));
+                let next = crate::rt::timeout(Duration::from_secs(30), passed.recv()).await.map_err(|_| anyhow::anyhow!("the tee never ended"))?;
+                let Ok((id, u)) = next else { break };
+                let t: usize = id.trim_start_matches('s').parse()?;
+                let Update::Events { events } = u else { anyhow::bail!("not what was sent") };
+                got.get_mut(t).ok_or_else(|| anyhow::anyhow!("no session {t}"))?.extend(events.iter().map(|e| e.seq));
+                // Slower than its senders now and then, so they wait for room.
+                if got.iter().map(Vec::len).sum::<usize>() % 100 == 0 {
+                    crate::rt::sleep(Duration::from_millis(2)).await;
+                }
+            }
+            for s in sending {
+                anyhow::ensure!(s.await.unwrap_or(false), "a session's update was refused");
+            }
+            for (t, theirs) in got.iter().enumerate() {
+                anyhow::ensure!(theirs.iter().copied().eq(0..per), "session {t}'s: {} of {per}, in order: {}", theirs.len(), theirs.windows(2).all(|w| w.first() < w.get(1)));
+            }
+            anyhow::ensure!(most <= room, "its way in held {most}, past its room of {room}");
+            anyhow::ensure!(held.drained(), "drained, its senders gone");
             Ok(())
         })
     }
