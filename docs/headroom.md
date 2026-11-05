@@ -42,7 +42,11 @@ counts while it hangs.
 
 **Detection.** A CUSUM on each target's log-latency against its calm, looking for a shift toward
 its tolerance, calibrated on the machine's own record against the false-alarm budget. A sample at
-the tolerance is harm, at once.
+the tolerance is harm, at once. A target that comes first (`kiln server delay`,
+[priority.md](priority.md)) is in trouble once it rises past what's calm: a second CUSUM, its
+reference half calm's standard deviation above calm's mean, calibrated the same way. Its alarm
+holds until it's back within calm's noise, and calm is learned only from what was measured with
+nothing of kiln's paced and no alarm that cut it.
 
 **Budgets.** For kiln's own work, a budget of writes a second and one of CPU cores, each bisected
 between the highest level held calm and the lowest level trouble began at. Where the system says
@@ -152,27 +156,34 @@ decides.
 |---|---|
 | A target's calm latency | the exact mean of its log-latency in the current regime |
 | CUSUM's reference | half the distance from the calm mean to the tolerance (the shift that matters) |
+| Calm's noise (a target that comes first) | the exact standard deviation of calm's log-latency (its count, sum and sum of squares) |
+| Its reference past calm's noise | half calm's standard deviation above calm's mean: the shift that matters is one of calm's own spread, and half a shift is the reference for detecting it, as above (Page 1954; Lorden; Moustakides) |
+| Its threshold | as the alarm threshold, on a record of its own, over the time that record covers (time calm and unpaced) |
+| Back within calm's noise (a cut held) | the mirror of that CUSUM, what samples fell short of its reference added up, passing the same threshold, from samples measured after the cut could show (its time plus the longest a cut took to show). At calm that takes threshold / reference samples: as long as a rise past calm's noise takes to alarm |
 | The alarm threshold | the higher of: the (allowed + 1)-th largest harmless excursion recorded, where allowed = budget x days recorded; and the height the record's own exponential tail (count and sum of its excursions, CUSUM's near-exponential excursions per Siegmund) puts at the budget's rate |
 | Harm | a sample at the tolerance, or a probe still out at the window (the tolerance, but for a target that answers with a level it measured: the server's delay's is the platform's 1 s) |
 | A new regime | a fall below the calm the lower CUSUM detects with the same calibration |
 | The probe interval | (window - longest measured lag) / (expected samples to alarm + 1), leaving the lag out once it reaches the window (no probe rate wins that time back); never under the probe's own measured cost / load share, for a disk as for a server |
-| The write and CPU budgets | each, for kiln's own work: bisection between the highest level held calm and the lowest level trouble began at; doubling while there is no unsafe level; halving the gap is the only step. Trouble cuts both (either may be the cause) unless the disks are delivering all they were measured to take, when only writes are cut; each is raised on its own where it limits (what runs wants more, or work waiting would take it past) |
-| A level held | the mean kiln's work used over the hold (its integral over time), not its peak: a burst a buffer took isn't a rate the machine sustains |
+| The write and CPU budgets | each, for kiln's own work: bisection between the highest level held calm and the lowest level trouble began at; doubling while there is no unsafe level; halving the gap is the only step. Trouble cuts both (either may be the cause) unless the disks are delivering all they were measured to take, when only writes are cut (not for a target that comes first: its latency is the CPU's); each is raised on its own where it limits (what runs wants more, or work waiting would take it past) |
+| A level held | the mean kiln's work used over the hold (its integral over time), not its peak: a burst a buffer took isn't a rate the machine sustains. With none in use, no level (as trouble with none in use sets no bound) |
+| The CPU's level | what kiln's work used, and no more than its CPU budget let it: CPU paced groups give up goes to unpaced ones, so what kiln uses can stay put while the pacer holds its work to less (11-05: 13-15 cores used under a 7.1-core budget) |
 | A bound tried | once the bisection's gap is finer than the pacer applies (a share is whole percent: what's wanted / 100), the bound itself; held calm there, it was wrong and the next bound up (any higher level trouble began at) takes its place |
-| Cutting again | only on evidence: a probe of the same target sent after the first answer since the cut, itself rising (past CUSUM's reference), and no faster, while kiln still writes. Probes already out at a cut can't show it |
+| Cutting again | only on evidence: a probe of the same target sent after the first answer since the cut, itself rising (past CUSUM's reference), and no faster, while kiln still writes. Probes already out at a cut can't show it. For a target that comes first, its CUSUM past calm's noise passing its threshold again from samples measured after the cut could show; and, where nothing of kiln's was in use when the trouble began, once it is |
 | Undoing a cut | the same evidence with kiln's writes already stopped: what's queued isn't kiln's. Its budgets go back to what they were before the trouble began, nothing is learned from the cuts, and nothing more is cut until the trouble clears. The first answer after a cut is only the mark: that probe still waited behind what was queued before the cut |
 | Not cutting | trouble that begins while kiln writes no more than it did when a cut was last undone, in bytes a second and as a share of what the disks deliver (forgotten in a new regime) |
 | The CPU budget's ceiling | the machine's cores (std::thread::available_parallelism, which counts a container's CPU limit where it can read it) |
 | Any demand's ceiling | the machine's cores for CPU, and the disks' capacity for writes: for each running group, and for each kind of work learned, what an earlier build learned included |
-| The disks' capacity | the most the machine delivered while trouble showed (a queue built up), on systems that say what they write: the trouble under way's while it lasts, else the last |
+| The disks' capacity | the most the machine delivered while trouble showed (a queue built up) on a target that doesn't come first, on systems that say what they write: the trouble under way's while it lasts, else the last |
 | A cut, with the capacity known | to what drains what's queued within the tolerance: capacity x (1 - latency / tolerance) - what others write (Little: what's queued is the latency times the capacity) |
-| Calm to calibrate on | an excursion that ended with no alarm, with kiln quiet, or within the longest a cut takes to show (so it ended on its own); one kiln's cut may have ended isn't noise |
+| Calm to calibrate on | an excursion that ended with no alarm, with kiln quiet, or within the longest a cut takes to show (so it ended on its own); one kiln's cut may have ended isn't noise. For a target that comes first, also none with any share under 1 in force |
+| Calm to learn from (a target that comes first) | the samples measured with no share under 1 in force and no alarm that cut kiln's work; an excursion past calm's noise is learned as it comes and taken back out once it turns out not to be calm |
+| The lag | the longest a cut of kiln's took to show, of its writes or its CPU: to its first answer back within calm's noise, for a target that comes first |
 | A probe still out | at least as slow as it has been out: it raises the alarm once that alone would take the CUSUM past its threshold |
-| How long a level must hold | the slowest target's expected detection time plus the longest a cut took to show (the first probe after it that answered faster) |
+| How long a level must hold | the slowest target's expected detection time (for a target that comes first, of a rise past calm's noise too) plus the longest a cut took to show (the first probe after it that answered faster) |
 | A run's demand | its peak unslowed write rate, CPU cores and memory, and its duration (a session's turn, a build's unit), recorded when it ends; the mean per kind of work, with the mean over everything as the prior |
 | Who starts | when its peak memory fits (writes and CPU are paced, not held for); in order of class, then response ratio ((wait + run) / run); every waiting item a reservation on the time profile of when running work is expected to free memory (conservative backfilling); with nothing learned, one at a time |
 | Each running group's share | each budget water-filled class by class, max-min fair within a class; a group runs at the smaller of its two shares, so work is slowed only for the resource that's short |
-| When shares change | only when the budget or the set of running work does |
+| When shares change | only when the budget or the set of running work does, or a group's demand first shows (a CI job's, before anything is learned of its kind) |
 
 Representation limits are not tuning: estimates are exact counts, sums and extremes, so none has a
 resolution or a window.
@@ -200,6 +211,22 @@ otherwise quiet, beside programs kiln can't pace that hold the disk near its cap
 stretches, 30 s at 104% of it and 30 s at 92%. `headroom::sim::the_night_of_10_28` asserts on
 seeds 1-3 that v2 does at least 99% of the work no control does and stops no job longer than 2 s
 at a time.
+
+The 11-05 lab on fedora (goal 8's item2, [priority.md](priority.md)) is a trace of its own, on a
+machine of CPUs rather than a disk: the kiln server and a runner's CI legs (32 busy threads) and
+agents' turns (64 more), CPU hogs all, in one cgroup on 16 CPUs, the runner's headroom watching
+the server's delay (calm 0.195 ms at the median, 12% of reads 2 to 8 times that). The server runs
+ready work later as the hogs' runnable threads outnumber the CPUs, as the lab measured: 2.5 times
+calm with the legs, 4 to 6.4 with the agents too. A paced group's threads run its share of the
+time; CPU it gives up goes to the others, so what kiln uses barely moves. `headroom::sim::
+g8_s5_the_11_05_lab_rising_delay_paces_the_legs_and_holds_it_down_until_the_load_ends` asserts on
+seeds 1-3 that the legs are paced within 30 s of starting, every 30 s the load stays (past the
+first 30 s of each rise) is within calm's noise (one standard deviation of calm's log-latency of its
+geometric mean), something stays paced until the load ends, it's calm after, and calm stays what
+it was. Main's engine (426b02ea011) fails it as item2 did: the legs at 2.4 to 2.6 times calm and
+the agents at 6, every loaded stretch past calm's noise, nothing paced from 5 s after the first cut.
+With the changes of goal 8 step 5 the delay holds at 0.224 to 0.258 ms against a calm of 0.226 to
+0.239.
 
 | trace | control | done | mean wait s | p99 wait s | mean flow s | makespan s | peak sync s | s over 1 s |
 |---|---|---|---|---|---|---|---|---|

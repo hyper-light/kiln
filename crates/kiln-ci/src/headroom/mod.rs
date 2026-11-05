@@ -45,6 +45,11 @@ pub struct Target {
     /// this long is harm. None: its tolerance.
     #[serde(default)]
     pub window_us: Option<f64>,
+    /// It comes first (kiln's own server's delay, docs/priority.md): a rise past its calm's noise is
+    /// trouble, not only a shift toward its tolerance; a cut for it holds until it's back within that
+    /// noise; and, as its latency is the CPU's, kiln's CPU is cut for it whatever the disks deliver.
+    #[serde(default)]
+    pub first: bool,
 }
 
 /// What the engine learned, kept between runs.
@@ -214,7 +219,7 @@ pub struct Engine {
     runs: HashMap<String, Run>,
     /// Shares in force, and what they were decided from (they change only when that does).
     shares: Vec<Pace>,
-    decided_from: Option<(Option<u64>, Option<u64>, Vec<String>)>,
+    decided_from: Option<(Option<u64>, Option<u64>, Vec<(String, bool)>)>,
     /// The most delivered during the trouble under way.
     trouble_bps: Option<f64>,
     /// The trouble under way, from when it began.
@@ -222,6 +227,9 @@ pub struct Engine {
     /// The last cut: when, and the first answer to a probe sent after it (its target, when it
     /// came, how long it took), which later probes of that target are measured against.
     cut: Option<(u64, Option<(String, u64, f64)>)>,
+    /// The last cut a target that comes first has shown, by when it was made: its lag is when its
+    /// first answer came back within calm's noise, not the last (its alarm holds a dwell after).
+    shown_first: Option<u64>,
 }
 
 impl Engine {
@@ -232,10 +240,16 @@ impl Engine {
         for t in &targets {
             let mut d = learned.detectors.remove(&t.name).filter(|d| d.tolerance_us == t.tolerance_us).unwrap_or_else(|| detect::Detector::new(t.tolerance_us, now_us));
             d.window_us = t.window_us;
+            d.first = t.first;
+            // A target that comes first learned before its calm's spread was kept: what it learned
+            // (calm with its rises in it) starts again.
+            if t.first && d.spread().is_none() && d.calm_us().is_some() {
+                d.restart(now_us);
+            }
             detectors.insert(t.name.clone(), d);
         }
         learned.detectors = detectors;
-        Self { policy, targets, learned, promises: Vec::new(), runs: HashMap::new(), shares: Vec::new(), decided_from: None, trouble_bps: None, episode: None, cut: None }
+        Self { policy, targets, learned, promises: Vec::new(), runs: HashMap::new(), shares: Vec::new(), decided_from: None, trouble_bps: None, episode: None, cut: None, shown_first: None }
     }
 
     /// Holds what's learned and estimated to what the machine has: its `cores`, and what its disks
@@ -265,18 +279,33 @@ impl Engine {
         self.learned.detectors.values().any(|d| d.alarm.is_some())
     }
 
+    /// Whether a target that comes first (`first`), or one that doesn't, is in trouble.
+    fn alarmed_where(&self, first: bool) -> bool {
+        self.targets.iter().filter(|t| t.first == first).any(|t| self.learned.detectors.get(&t.name).is_some_and(|d| d.alarm.is_some()))
+    }
+
+    /// The longest a cut of kiln's has taken to show, of its writes or its CPU (11-05: the CPU's
+    /// alone was cut for the server's delay, and the writes' lag, read alone, stayed unknown).
+    fn lag_us(&self) -> Option<f64> {
+        match (self.learned.knee.lag_us, self.learned.cpu_knee.lag_us) {
+            (Some(w), Some(c)) => Some(w.max(c)),
+            (w, c) => w.or(c),
+        }
+    }
+
     /// How long a level must hold calm to count as held: the slowest target's detection delay
-    /// (its samples to alarm, at its probe interval) plus the longest a cut took to show.
+    /// (its samples to alarm, at its probe interval; for a target that comes first, a rise past
+    /// calm's noise too) plus the longest a cut took to show.
     fn hold_us(&self) -> f64 {
-        let lag = self.learned.knee.lag_us.unwrap_or(0.0);
-        self.targets.iter().map(|t| self.interval(t) * self.learned.detectors.get(&t.name).map_or(1.0, |d| d.delay_samples(self.policy.false_alarms_per_day))).fold(0.0, f64::max) + lag
+        let lag = self.lag_us().unwrap_or(0.0);
+        self.targets.iter().map(|t| self.interval(t) * self.learned.detectors.get(&t.name).map_or(1.0, |d| d.settle_samples(self.policy.false_alarms_per_day))).fold(0.0, f64::max) + lag
     }
 
     fn interval(&self, t: &Target) -> f64 {
         let d = self.learned.detectors.get(&t.name);
         let cost = d.and_then(detect::Detector::calm_us).unwrap_or(0.0);
         let delay = d.map_or(1.0, |d| d.delay_samples(self.policy.false_alarms_per_day));
-        detect::interval_us(t.window_us.unwrap_or(t.tolerance_us), self.learned.knee.lag_us.unwrap_or(0.0), delay, cost, self.policy.probe_load_share)
+        detect::interval_us(t.window_us.unwrap_or(t.tolerance_us), self.lag_us().unwrap_or(0.0), delay, cost, self.policy.probe_load_share)
     }
 
     pub fn step(&mut self, o: &Observation) -> Plan {
@@ -332,18 +361,39 @@ impl Engine {
         // What kiln's own work writes and uses now: what its budgets are measured against.
         let ours_w: f64 = o.running.iter().filter(|g| !g.protected).map(|g| g.write_bps).sum();
         let ours_c: f64 = o.running.iter().filter(|g| !g.protected).map(|g| g.cpu_cores).sum();
+        // The CPU's level: what kiln's work used, and no more than its budget let it. CPU goes to
+        // whoever can run: what paced groups give up, unpaced ones take, so what kiln uses can stay
+        // where it was while the pacer holds its work to less (11-05: 13-15 cores used under a
+        // 7.1-core budget, taken as 14.3 cores held calm, which disproved the bound it was cut at).
+        let ours_c_level = self.learned.cpu_knee.budget.map_or(ours_c, |b| ours_c.min(b));
 
         // Detection.
         let was = self.alarmed();
-        let lag = self.learned.knee.lag_us;
+        let lag = self.lag_us();
+        // What runs is held below what it wants: the shares in force as what's answering now was
+        // measured.
+        let paced = self.shares.iter().any(|p| p.share < 1.0);
         for d in self.learned.detectors.values_mut() {
             d.lag_us = lag;
+            d.paced = paced;
         }
+        // When what each answer measured began (a probe of a target with a window answers for the
+        // time since its last): only what began after a cut can show it.
+        let mut began: Vec<u64> = Vec::with_capacity(o.answers.len());
         for (name, a) in &o.answers {
-            let Some(d) = self.learned.detectors.get_mut(name) else { continue };
+            let Some(d) = self.learned.detectors.get_mut(name) else {
+                began.push(if let Answer::Took(us) = a { now.saturating_sub(*us as u64) } else { now });
+                continue;
+            };
             let ev = match a {
-                Answer::Took(us) => d.sample(now, *us, quiet, budget_per_day),
-                Answer::Unavailable => detect::Event::Same,
+                Answer::Took(us) => {
+                    began.push(d.began_us(now, *us));
+                    d.sample(now, *us, quiet, budget_per_day)
+                }
+                Answer::Unavailable => {
+                    began.push(now);
+                    detect::Event::Same
+                }
             };
             match ev {
                 detect::Event::Alarm(why) => events.push(format!("{name}: {why}")),
@@ -373,13 +423,24 @@ impl Engine {
         // after that answer came) no faster says it isn't draining. Only what is itself trouble
         // (a sample the CUSUM counts as rising) says so.
         let rising = |n: &str, us: f64| self.learned.detectors.get(n).is_some_and(|d| d.rising(us));
+        let firsts: Vec<String> = self.targets.iter().filter(|t| t.first).map(|t| t.name.clone()).collect();
+        let is_first = |n: &str| firsts.iter().any(|f| f == n);
         let mut worse = false;
         let mut shown = false;
         if let Some((at, first)) = &mut self.cut {
-            for (n, a) in &o.answers {
+            for ((n, a), sent) in o.answers.iter().zip(began.iter().copied()) {
                 let Answer::Took(us) = a else { continue };
-                let sent = now.saturating_sub(*us as u64);
                 if sent < *at {
+                    continue;
+                }
+                if is_first(n) {
+                    // A target that comes first: back within calm's noise, measured from after the
+                    // cut, shows it, once; whether trouble persists, its own CUSUM says (one sample
+                    // past calm's noise is noise as often as not).
+                    if !rising(n, *us) && self.shown_first != Some(*at) {
+                        self.shown_first = Some(*at);
+                        shown = true;
+                    }
                     continue;
                 }
                 if !rising(n, *us) {
@@ -400,10 +461,16 @@ impl Engine {
                 worse |= o.inflight.iter().any(|(n, age)| n == n0 && now.saturating_sub(*age as u64) >= *came && age >= took && rising(n, *age));
             }
         }
-        // While trouble shows, a queue is built up and what's delivered is all the disks take.
-        if now_alarmed && let Some(d) = o.delivered_bps {
+        // A target that comes first, still past calm's noise since kiln's last cut could show it.
+        let persists = self.targets.iter().filter(|t| t.first).any(|t| self.learned.detectors.get(&t.name).is_some_and(|d| d.persists(budget_per_day)));
+        // While trouble shows, a queue is built up and what's delivered is all the disks take: not
+        // for a target that comes first, whose latency is the CPU's (11-05: a capacity read during
+        // CPU trouble had a later alarm on the server's delay cut nothing, "the disks are the cause").
+        let disk_trouble = self.alarmed_where(false);
+        let first_trouble = self.alarmed_where(true);
+        if disk_trouble && let Some(d) = o.delivered_bps {
             self.trouble_bps = Some(self.trouble_bps.map_or(d, |t| t.max(d)));
-        } else if !now_alarmed && let Some(t) = self.trouble_bps.take() {
+        } else if !disk_trouble && let Some(t) = self.trouble_bps.take() {
             self.learned.capacity_bps = Some(t);
             self.within_machine(cores);
         }
@@ -419,8 +486,9 @@ impl Engine {
         let worst: f64 = o
             .answers
             .iter()
+            .filter(|(n, _)| !is_first(n))
             .filter_map(|(n, a)| if let Answer::Took(us) = a { Some(us / tolerance(n)) } else { None })
-            .chain(o.inflight.iter().map(|(n, age)| age / tolerance(n)))
+            .chain(o.inflight.iter().filter(|(n, _)| !is_first(n)).map(|(n, age)| age / tolerance(n)))
             .fold(0.0, f64::max);
         let drain_w = capacity.map(|c| c * (1.0 - worst.min(1.0)) - others);
         if shown {
@@ -430,6 +498,9 @@ impl Engine {
         // The disks delivering all they were measured to take: they are the cause, not the CPU.
         let disks_full = matches!((o.delivered_bps, self.learned.capacity_bps), (Some(d), Some(c)) if d + wanted / pace::SHARE_STEPS >= c);
         use knee::Unit;
+        // Whether kiln's work was cut this step (a target that comes first then counts its evidence
+        // from when the cut can show).
+        let mut cut_now = false;
         if now_alarmed && !was {
             // Trouble begins. If stopping kiln's writers didn't speed the probes up before, and kiln
             // writes no more now (in bytes a second and as a share of what the disks deliver),
@@ -441,10 +512,11 @@ impl Engine {
                 events.push(format!("kiln's writes not cut: it writes {}{}, no more than when stopping its writers last didn't speed the probes up", Unit::Writes.fmt(ours_w), of_disks(share)));
             } else {
                 events.push(self.learned.knee.alarm(now, ours_w, drain_w, Unit::Writes));
-                if !disks_full {
-                    events.push(self.learned.cpu_knee.alarm(now, ours_c, None, Unit::Cpu));
+                if !disks_full || first_trouble {
+                    events.push(self.learned.cpu_knee.alarm(now, ours_c_level, None, Unit::Cpu));
                 }
                 self.cut = Some((now, None));
+                cut_now = true;
             }
         } else if now_alarmed && self.episode.as_ref().is_some_and(|e| e.held) {
             // Shown not to be kiln's, or not cut for that: nothing more is cut until it clears.
@@ -470,9 +542,18 @@ impl Engine {
             self.cut = None;
         } else if now_alarmed {
             let cut_w = self.learned.knee.persisting(now, ours_w, drain_w, worse, Unit::Writes);
-            let cut_c = if disks_full { None } else { self.learned.cpu_knee.persisting(now, ours_c, None, worse, Unit::Cpu) };
+            let cut_c = if disks_full && !first_trouble {
+                None
+            } else if persists && !self.learned.cpu_knee.cutting() && ours_c_level > 0.0 {
+                // Nothing of kiln's was in use when the trouble began, so nothing was cut; it runs now,
+                // and the trouble persists past calm's noise: it's cut now.
+                Some(self.learned.cpu_knee.alarm(now, ours_c_level, None, Unit::Cpu))
+            } else {
+                self.learned.cpu_knee.persisting(now, ours_c_level, None, worse || persists, Unit::Cpu)
+            };
             if cut_w.is_some() || cut_c.is_some() {
                 self.cut = Some((now, None));
+                cut_now = true;
             }
             events.extend(cut_w);
             events.extend(cut_c);
@@ -488,13 +569,26 @@ impl Engine {
             let limited = self.learned.knee.budget.is_some_and(|b| wanted > b || next.iter().any(|d| wanted + d.write_bps > b));
             events.extend(self.learned.knee.calm(now, knee::Calm { delivered: ours_w, limited, hold_us: hold, resolution: wanted / pace::SHARE_STEPS, cap: cap_w }, Unit::Writes));
             let limited_cpu = self.learned.cpu_knee.budget.is_some_and(|b| wanted_cpu > b || next.iter().any(|d| wanted_cpu + d.cpu_cores > b));
-            events.extend(self.learned.cpu_knee.calm(now, knee::Calm { delivered: ours_c, limited: limited_cpu, hold_us: hold, resolution: wanted_cpu / pace::SHARE_STEPS, cap: cores }, Unit::Cpu));
+            events.extend(self.learned.cpu_knee.calm(now, knee::Calm { delivered: ours_c_level, limited: limited_cpu, hold_us: hold, resolution: wanted_cpu / pace::SHARE_STEPS, cap: cores }, Unit::Cpu));
+        }
+        if cut_now {
+            // What a target that comes first measures from when the cut can show says whether it
+            // was enough: from now, plus the longest a cut has taken to show.
+            let show = now.saturating_add(self.lag_us().unwrap_or(0.0) as u64);
+            for t in self.targets.iter().filter(|t| t.first) {
+                if let Some(d) = self.learned.detectors.get_mut(&t.name) {
+                    d.cut(show);
+                }
+            }
         }
         let budget = self.learned.knee.budget;
         let cpu_budget = self.learned.cpu_knee.budget;
 
         // Shares: decided again only when the budget or the work running changed.
-        let mut ids: Vec<String> = o.running.iter().map(|g| g.id.clone()).collect();
+        // A group whose demand shows only once it has run (a CI job: nothing learned of its kind yet)
+        // is decided again once it does: until then it's slowed for nothing (11-05: agents' turns
+        // that started under a 14.7-core budget ran at 98-99% until the budget changed).
+        let mut ids: Vec<(String, bool)> = o.running.iter().map(|g| (g.id.clone(), self.runs.get(&g.id).is_some_and(|r| r.demand > 0.0 || r.demand_cpu > 0.0))).collect();
         ids.sort();
         let from = (budget.map(f64::to_bits), cpu_budget.map(f64::to_bits), ids);
         if self.decided_from.as_ref() != Some(&from) {
@@ -579,7 +673,7 @@ impl Engine {
             cpu_budget,
             cpu_safe: self.learned.cpu_knee.safe,
             cpu_unsafe: self.learned.cpu_knee.unsafe_at,
-            lag_us: self.learned.knee.lag_us,
+            lag_us: self.lag_us(),
             delivered_bps: o.delivered_bps,
             wanted_bps: wanted,
             wanted_cpu,
@@ -596,7 +690,7 @@ mod tests {
     fn engine() -> Engine {
         Engine::new(
             Policy { false_alarms_per_day: 1.0, probe_load_share: 0.1 },
-            vec![Target { name: "disk".into(), tolerance_us: 1e6, window_us: None }],
+            vec![Target { name: "disk".into(), tolerance_us: 1e6, window_us: None, first: false }],
             Learned::default(),
             0,
         )
@@ -611,7 +705,7 @@ mod tests {
     /// past the tolerance no longer speeds probing, and the disk is held to the load share too.
     #[test]
     fn a_lag_past_the_tolerance_leaves_probing_at_its_calm_pace() -> anyhow::Result<()> {
-        let targets = vec![Target { name: "disk".into(), tolerance_us: 1e6, window_us: None }, Target { name: "server".into(), tolerance_us: 1e6, window_us: None }];
+        let targets = vec![Target { name: "disk".into(), tolerance_us: 1e6, window_us: None, first: false }, Target { name: "server".into(), tolerance_us: 1e6, window_us: None, first: false }];
         let run = |lag: Option<f64>| {
             let mut learned = Learned::default();
             learned.knee.lag_us = lag;
@@ -645,7 +739,7 @@ mod tests {
     #[test]
     fn g8_s5_the_servers_delay_rising_slows_legs_and_agents() -> anyhow::Result<()> {
         let delay = "kiln server delay";
-        let target = Target { name: delay.into(), tolerance_us: 10_000.0, window_us: Some(1e6) };
+        let target = Target { name: delay.into(), tolerance_us: 10_000.0, window_us: Some(1e6), first: true };
         let mut e = Engine::new(Policy { false_alarms_per_day: 1.0, probe_load_share: 0.1 }, vec![target], Learned::default(), 0);
         let running = |cores: f64, share: f64| vec![Group { cpu_cores: 8.0 * cores * share, ..group("job 01a1", 0.0, share) }, Group { cpu_cores: 4.0 * cores * share, ..group("01a1agent", 0.0, share) }];
         let at = |t: u64, us: f64, cores: f64, share: f64| Observation { now_us: t, answers: vec![(delay.into(), Answer::Took(us))], mem_free: 1e11, running: running(cores, share), cores: Some(32.0), ..Observation::default() };
@@ -698,7 +792,7 @@ mod tests {
     #[test]
     fn g8_s5_a_windowed_targets_probe_out_past_its_tolerance_is_no_harm_until_its_window() -> anyhow::Result<()> {
         let delay = "kiln server delay";
-        let mut e = Engine::new(Policy { false_alarms_per_day: 1.0, probe_load_share: 0.1 }, vec![Target { name: delay.into(), tolerance_us: 10_000.0, window_us: Some(1e6) }], Learned::default(), 0);
+        let mut e = Engine::new(Policy { false_alarms_per_day: 1.0, probe_load_share: 0.1 }, vec![Target { name: delay.into(), tolerance_us: 10_000.0, window_us: Some(1e6), first: false }], Learned::default(), 0);
         let legs = |cores: f64| vec![Group { cpu_cores: cores, ..group("job 01a1", 0.0, 1.0) }];
         let mut t = 0;
         for i in 0..2_000u64 {

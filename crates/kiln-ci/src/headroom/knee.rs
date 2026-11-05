@@ -85,6 +85,11 @@ impl Knee {
         }
     }
 
+    /// A cut made for the trouble under way.
+    pub fn cutting(&self) -> bool {
+        self.cut_at.is_some()
+    }
+
     /// The alarm cleared; a cut not yet shown shows now at the latest.
     pub fn clear(&mut self, now_us: u64) {
         if self.cut_at.is_some() && self.lag_us.is_none() {
@@ -106,9 +111,12 @@ impl Knee {
             return None;
         }
         // Held: what was written meanwhile, on average, was safe (a moment's burst a buffer took
-        // isn't a rate the machine sustains).
+        // isn't a rate the machine sustains). With none of it in use, nothing was shown safe (as
+        // trouble with none in use sets no bound): else trouble later cuts to nothing.
         let held = self.held_area / span;
-        self.safe = Some(self.safe.map_or(held, |s| s.max(held)));
+        if held > 0.0 {
+            self.safe = Some(self.safe.map_or(held, |s| s.max(held)));
+        }
         // Held calm at the bound (as near it as the pacer goes): the bound was wrong.
         let disproved = self.unsafe_at.is_some_and(|u| self.safe.is_some_and(|s| s + resolution >= u));
         if disproved {
