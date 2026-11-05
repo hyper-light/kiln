@@ -18,8 +18,9 @@ use super::uplink::key_of;
 pub struct Links {
     by_runner: Mutex<HashMap<String, Receiver>>,
     /// Runners that said they keep the channel: what they send comes again after a cut, so their
-    /// terminals stay open through it.
-    keep: Mutex<std::collections::HashSet<String>>,
+    /// terminals stay open through it. A copy read without a lock, swapped in as one says otherwise
+    /// (goal 5, plan 01a1a59c2aae step 2: `crate::rcu`).
+    keep: crate::rcu::Rcu<std::collections::HashSet<String>>,
 }
 
 impl Links {
@@ -59,22 +60,27 @@ impl Links {
     /// `runner` is gone for good (removed): what the server had of its streams goes too.
     pub fn forget(&self, runner: &str) {
         self.by_runner.lock().remove(runner);
-        self.keep.lock().remove(runner);
+        self.keep.update(|k| k.remove(runner));
     }
 
     /// Whether `runner` keeps the channel, as it last said (`AgentMsg::Caps`).
     pub fn set_keeps(&self, runner: &str, keeps: bool) {
-        let mut k = self.keep.lock();
-        if keeps {
-            k.insert(runner.to_owned());
-        } else {
-            k.remove(runner);
+        // Said again as it was, nothing changes: a copy swapped in only for a change.
+        if self.keep.load().contains(runner) == keeps {
+            return;
         }
+        self.keep.update(|k| {
+            if keeps {
+                k.insert(runner.to_owned());
+            } else {
+                k.remove(runner);
+            }
+        });
     }
 
     /// Whether `runner` keeps the channel: what it sends comes again after a cut.
     pub fn keeps(&self, runner: &str) -> bool {
-        self.keep.lock().contains(runner)
+        self.keep.load().contains(runner)
     }
 }
 

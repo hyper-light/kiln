@@ -41,6 +41,9 @@ hot = [
   "crates/kiln/src/reach/relay.rs",
   # Terminals: every terminal's output from its machine, its viewers' keystrokes, and their list.
   "crates/kiln/src/termsess.rs",
+  # The live channel (docs/wire.md): every item a runner sends over it, an agent session's updates
+  # and a terminal's output among them, and its answer.
+  "crates/kiln/src/wire/link.rs",
   # A runner's front door with a replica of kiln's records (docs/p2p.md, the peer-to-peer
   # unification's P2): every request it answers from the replica, and the learner behind it.
   "crates/kiln/src/frontdoor/replica.rs",
@@ -189,6 +192,20 @@ why = "imports a terminal session's screen's lock (state, below)"
 at = "crates/kiln/src/termsess.rs"
 name = "state"
 why = "one per terminal session, its screen and backlog: its relay takes it for its output, in order, and its own viewers as they attach or resize it, so a replay and the live output meet with no byte twice or lost; another session's, the list's reads, keystrokes and detaches never take it"
+
+# The live channel's link (docs/wire.md; the ACK/NACK work, 2232eb69457): which runners keep the channel
+# is a copy (crate::rcu).
+
+[[allowed]]
+at = "crates/kiln/src/wire/link.rs"
+name = "use"
+why = "imports the runners' receivers' lock (by_runner, below)"
+
+[[allowed]]
+at = "crates/kiln/src/wire/link.rs"
+name = "by_runner"
+why = "each runner's streams as the server has them: the hub's loop takes it twice for every item a runner sends over the channel (taking it, then its answer), in order, and the hub's commands loop once every HAVE_AGAIN (5 s) for each runner that keeps the channel, to say again what the server has"
+todo = "the hub's loop its one owner (with goal 9's net loop), the commands loop's have-again asking it or sent from it, so no other task takes it"
 
 # A runner's front door answering reads from its replica, and the learners behind it: the peer-to-peer
 # unification's (docs/p2p.md, P2: plan 01a1a283e14c), the custody of the cluster group added to them by
