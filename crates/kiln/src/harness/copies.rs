@@ -490,10 +490,10 @@ impl Events {
     /// Every chunk but the newest (which takes the next event) kept compact once it's packed, and those not
     /// packed yet sent to be (goal 11, plan 01a1a87b2e56 step 2). A view taking a chunk keeps it as it was
     /// until it lets go.
-    pub(super) fn compact(&mut self) {
+    pub(super) fn compact(&mut self, home: Option<&Home>) {
         let Some(sealed) = self.chunks.len().checked_sub(1) else { return };
         for c in self.chunks.iter().take(sealed).filter(|c| !c.is_compact() && c.packed().is_none()) {
-            seal(Arc::clone(c));
+            seal(Arc::clone(c), home.cloned());
         }
         let ready: Vec<usize> = (0..sealed).filter(|i| self.chunks.get(*i).is_some_and(|c| !c.is_compact() && c.packed().is_some())).collect();
         if ready.is_empty() {
@@ -527,10 +527,19 @@ impl Events {
 /// A chunk that sealed, packed off the owner's shard as background work on the compute pool, so a
 /// snapshot after it takes it as it is (goal 10, plan 01a1a87b2dae step 3). Off the runtime (a test's
 /// copy) it waits for the snapshot that needs it.
-fn seal(chunk: Arc<Chunk>) {
+fn seal(chunk: Arc<Chunk>, home: Option<Home>) {
     if crate::rt::on_shard() && chunk.packed().is_none() && !chunk.sealing.swap(true, Ordering::Relaxed) {
         drop(crate::rt::spawn(async move {
-            let _ = crate::rt::compute(move || chunk.pack().map(drop)).await;
+            let packed = crate::rt::compute(move || chunk.pack().map(drop)).await;
+            // Packed, its copy's owner keeps it compact (goal 11, plan 01a1a87b2e56 step 2): at once, not at
+            // the copy's next event, which an idle session may never have.
+            if matches!(packed, Ok(Ok(())))
+                && let Some(home) = home
+                && let Some(inbox) = home.inbox.upgrade()
+            {
+                let id = home.id;
+                let _ = inbox.send(Msg::Run(Box::new(move |s: &mut Shard| s.compact(&id)))).await;
+            }
         }));
     }
 }
@@ -665,6 +674,16 @@ pub struct Mirror {
     pub(super) opened_at: Option<std::time::Instant>,
     /// What its readers find of it.
     slot: Arc<Slot>,
+    /// Its owner's inbox, held weakly (none until a shard takes it in): a chunk packed off the shard
+    /// comes back through it to be kept compact (goal 11, plan 01a1a87b2e56 step 2).
+    owner: Option<async_channel::WeakSender<Msg>>,
+}
+
+/// Where a packed chunk's copy is: its owner's inbox and its session, to keep it compact once packed.
+#[derive(Clone)]
+pub(super) struct Home {
+    inbox: async_channel::WeakSender<Msg>,
+    id: Arc<str>,
 }
 
 impl Mirror {
@@ -705,7 +724,13 @@ impl Mirror {
             started_over_pending: false,
             opened_at: None,
             slot,
+            owner: None,
         }
+    }
+
+    /// Where its chunks come back to once packed, once a shard took it in.
+    fn home(&self) -> Option<Home> {
+        Some(Home { inbox: self.owner.clone()?, id: Arc::clone(&self.slot.id) })
     }
 
     /// The copy as it is now, for its readers.
@@ -895,7 +920,7 @@ impl Mirror {
         }
         self.index.insert(id, self.events.len());
         if let Some(sealed) = self.events.push(ev) {
-            seal(sealed);
+            seal(sealed, self.home());
         }
         if self.events.len() > MAX_EVENTS + MAX_EVENTS / 4 {
             // From where a run of the digests begins, as its machine's timeline lets go of its
@@ -920,10 +945,11 @@ impl Mirror {
                 *at = at.saturating_sub(gone.len());
             }
             if let Some(chunk) = remade {
-                seal(chunk);
+                seal(chunk, self.home());
             }
         }
-        self.events.compact();
+        let home = self.home();
+        self.events.compact(home.as_ref());
         false
     }
 
@@ -958,6 +984,8 @@ impl Mirror {
 /// publish, the others' to read).
 pub struct Shard {
     me: usize,
+    /// Its own inbox, held weakly: what its copies' packed chunks come back through.
+    inbox: async_channel::WeakSender<Msg>,
     mirrors: HashMap<String, Mirror>,
     boards: Arc<[ArcSwap<Board>]>,
     bus: Arc<dyn kiln_seams::Bus>,
@@ -987,10 +1015,11 @@ impl Shard {
     }
 
     /// `m` as session `id`'s copy, unless it has one already (which stays): whether it went in.
-    pub fn insert(&mut self, id: String, m: Mirror) -> bool {
+    pub fn insert(&mut self, id: String, mut m: Mirror) -> bool {
         match self.mirrors.entry(id) {
             std::collections::hash_map::Entry::Occupied(_) => false,
             std::collections::hash_map::Entry::Vacant(slot) => {
+                m.owner = Some(self.inbox.clone());
                 m.publish();
                 slot.insert(m);
                 self.board_changed = true;
@@ -1005,8 +1034,20 @@ impl Shard {
             std::collections::hash_map::Entry::Occupied(o) => o.into_mut(),
             std::collections::hash_map::Entry::Vacant(v) => {
                 self.board_changed = true;
-                v.insert(make())
+                let m = v.insert(make());
+                m.owner = Some(self.inbox.clone());
+                m
             }
+        }
+    }
+
+    /// Session `id`'s copy kept compact, its chunks packed since kept as their segments (goal 11, plan
+    /// 01a1a87b2e56 step 2), and its readers given the view of it that is.
+    pub fn compact(&mut self, id: &str) {
+        if let Some(m) = self.mirrors.get_mut(id) {
+            let home = m.home();
+            m.events.compact(home.as_ref());
+            m.publish();
         }
     }
 
@@ -1114,7 +1155,7 @@ impl Copies {
         let mut inboxes = Vec::with_capacity(shards);
         for me in 0..shards {
             let (tx, rx) = async_channel::bounded(inbox.max(1));
-            let shard = Shard { me, mirrors: HashMap::new(), boards: Arc::clone(&boards), bus: Arc::clone(&bus), board_changed: false };
+            let shard = Shard { me, inbox: tx.downgrade(), mirrors: HashMap::new(), boards: Arc::clone(&boards), bus: Arc::clone(&bus), board_changed: false };
             crate::rt::spawn_owner(me, own(shard, rx, Arc::clone(&hub)));
             inboxes.push(tx);
         }
