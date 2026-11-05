@@ -153,7 +153,8 @@ impl Held for StoreHeld {
             self.0
                 .store
                 .call(move |db| {
-                    let tx = db.transaction()?;
+                    // Nested: a call runs inside its group's transaction (crate::store::tx).
+                    let tx = crate::store::tx(db)?;
                     for id in ids {
                         tx.execute("DELETE FROM review_held WHERE id = ?1", [id])?;
                     }

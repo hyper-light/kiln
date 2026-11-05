@@ -742,7 +742,11 @@ count of its arenas' locks either.
   (WAL), and see every write committed before them. The API's reads on the lab's paths (the runners,
   the overview, runs, plans, goals, sign-in and access checks) and the store's own read methods read so.
   The share's places are goal 3's Little's-law measure of the store's calls (24); the writer's waits and
-  runs are `kiln_blocking_*{share="store_write"}`.
+  runs are `kiln_blocking_*{share="store_write"}`. The writer commits the calls waiting for it together
+  (`Writing::group`: one transaction, each call in a savepoint of its own, at most 1,024 calls or a
+  millisecond of their runs), each caller answered once its group commits (`kiln_store_commit_seconds`,
+  `kiln_store_committed_calls_total`); its WAL is checkpointed on a thread of its own at SQLite's mark,
+  not inside its commits (`kiln_store_checkpoint_seconds`).
 - **Read-mostly state** is an immutable copy swapped in whole (`crate::rcu::Rcu`, on arc-swap; f7, f9):
   readers take the current copy without waiting on anyone, a writer copies, changes and swaps it in (a
   compare-and-swap, tried again on a race). The hub's runner processes' links, the runners' labels and
@@ -1683,6 +1687,18 @@ index keeps no key now (it's the series' metric and tags written canonically, wh
 written again as it's asked for: a cut, a series' re-definition), save one whose bytes aren't that writing,
 kept as sent; and its columns grow by a quarter, not doubling. An index of the lab's shape holds 1.07 MB:
 about 2.2 MB less.
+
+**kiln.db's read connections** (`store::Reads`): each holds the database's whole schema parsed, which no
+owner counted (`sqlite` counts page caches): 604 KB for its 202 tables and 283 indexes, and 62 KB more
+opened (SQLite 3.51 on a lab round's kiln.db, `sqlite3_memory_used`), and its statements. The store kept
+every connection a burst of reads ever opened, up to the `store` share's 24 places, and took them in turn
+(a queue), so none went idle. Now a read takes the lowest place's connection and gives it back to the lowest
+place free, and once each 5 s (`os::alloc::COLD_AFTER`) a read giving one back closes the highest place's
+connection that no read took in that long: what stays open is the reads' recent peak. It saves about 0.75 MB
+for each connection past that peak; how many there were is `kiln_memory_bound_bytes{owner="sqlite"}` over a
+connection's bound (4.6 MB, `store::cache_bound`). A read past the peak opens a connection and parses the
+schema again (2.0 ms at the median, 2.4 at the most, of 30 on fedora, on the blocking pool): watch store-backed
+numbers' p99 (pages, MCP, fill).
 
 ## Goal 10: API reads and frames in under a millisecond
 
