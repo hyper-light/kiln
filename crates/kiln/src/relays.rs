@@ -469,8 +469,8 @@ pub async fn unanswered(store: &Store, lapse: i64, at: i64, record: bool) -> any
 pub async fn relays_loop(hub: std::sync::Arc<Hub>) -> anyhow::Result<()> {
     let mut ticks = 0u32;
     while hub.shutdown.sleep(std::time::Duration::from_secs(5)).await {
-        let due = hub.reach.lock().due();
-        hub.reach_passed(due);
+        // The relay's owner records them in its turn (goal 5, plan 01a1a59c2aae step 2).
+        hub.relay().send(crate::reach::relay::Ask::Due);
         ticks = ticks.wrapping_add(1);
         if ticks.is_multiple_of(12)
             && let Err(e) = unanswered(&hub.store, crate::custody::LAPSE_AFTER, crate::util::now_unix(), true).await

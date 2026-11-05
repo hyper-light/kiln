@@ -613,8 +613,9 @@ pub struct Hub {
     pub tailnet: crate::frontdoor::tailnet::TailnetDns,
     /// Repo sync: every synced repo's group, led from here (`crate::sync`).
     pub sync: crate::sync::server::Sync,
-    /// Reach: the links between runners this server relays, and their identities (`crate::reach`).
-    pub reach: Mutex<crate::reach::relay::Relay>,
+    /// Reach: the links between runners this server relays, and their identities (`crate::reach`):
+    /// one owner changes them, the hub's `relay_loop`, started on first use ([`Hub::relay`]).
+    pub reach: crate::reach::relay::Owner,
     /// What kiln takes from relays and relays itself, checked and numbered (docs/ci.md W27-R08's
     /// relays: `crate::relays`).
     pub(crate) relays: crate::relays::Relays,
@@ -757,7 +758,7 @@ impl Hub {
             peered: crate::peers::Peers::default(),
             tailnet: crate::frontdoor::tailnet::TailnetDns::default(),
             sync,
-            reach: Mutex::new(crate::reach::relay::Relay::recording()),
+            reach: crate::reach::relay::Owner::default(),
             relays: crate::relays::Relays::default(),
             copies,
             places,
@@ -1682,6 +1683,69 @@ impl Hub {
 
     /// Runs of reach links' frames the relay passed on, recorded (docs/ci.md W27-R08's relays): signed,
     /// kept and sent to the runners they went to, on their own (`crate::relays::frames`).
+    /// Reach's relay's owner, started on first use: it needs the hub to send what the relay passes on
+    /// (goal 5, plan 01a1a59c2aae step 2: an owner with messages, no lock on the relay).
+    pub(crate) fn relay(self: &Arc<Self>) -> &crate::reach::relay::Owner {
+        if let Some(rx) = self.reach.starting() {
+            let hub = Arc::downgrade(self);
+            drop(crate::rt::spawn(Self::relay_loop(hub, rx)));
+        }
+        &self.reach
+    }
+
+    /// Reach's relay's one owner: it alone changes the relay, taking each frame, lost connection and
+    /// question in the order sent, and sends what the relay passes on in that order. It holds the hub
+    /// weakly: once the hub goes, its sender with it, so does this.
+    async fn relay_loop(hub: std::sync::Weak<Self>, rx: async_channel::Receiver<crate::reach::relay::Ask>) {
+        use crate::reach::relay::Ask;
+        let mut relay = crate::reach::relay::Relay::recording();
+        while let Ok(ask) = rx.recv().await {
+            let Some(hub) = hub.upgrade() else { return };
+            match ask {
+                Ask::Frame { from, peer, frame } => hub.relay_frame(&mut relay, &from, peer, frame).await,
+                Ask::Lost { peer } => {
+                    for (p, m) in relay.lost(peer, "disconnected from the kiln server") {
+                        if let Ok(b) = proto::encode(&m) {
+                            hub.net.send(p, proto::LANE_REACH, Kind::Term, b).await;
+                        }
+                    }
+                    hub.reach_passed(relay.take_passed());
+                }
+                Ask::Due => hub.reach_passed(relay.due()),
+                Ask::Call(f) => f(&mut relay),
+            }
+        }
+    }
+
+    /// Runner `agent`'s frame on reach's relay, from its connection `peer`, as the relay's owner takes
+    /// it: forwarded to the link's other end, refused back to it, or noted.
+    async fn relay_frame(self: &Arc<Self>, relay: &mut crate::reach::relay::Relay, agent: &str, peer: PeerId, frame: crate::reach::relay::Frame) {
+        let forwarded = relay.forward(
+            agent,
+            peer,
+            frame,
+            |n| {
+                if self.agents.load().get(n).is_none_or(|a| a.ephemeral || !a.connected) {
+                    return None;
+                }
+                self.instances.load().newest_with(n, proto::CAP_REACH)
+            },
+            |n| self.shown(n),
+        );
+        let passed = relay.take_passed();
+        // One from a runner that isn't an end of the link it names goes nowhere: refused to it, and
+        // noted naming the link's ends.
+        if let crate::reach::relay::Forwarded::NotItsLink { link, ends: (a, b) } = &forwarded {
+            let why = format!("not its link: link {link} is {a}'s and {b}'s");
+            self.unreadable(peer, Wire::Relay, "Reach".to_owned(), Code::Malformed, why, true).await;
+        }
+        let typed = self.instances.load().get(peer).is_some_and(|i| i.wide & proto::CAP_UNREAD != 0);
+        for (p, m) in forwarded.sends(peer, typed) {
+            self.send_reach(p, &m).await;
+        }
+        self.reach_passed(passed);
+    }
+
     pub(crate) fn reach_passed(self: &Arc<Self>, passed: Vec<crate::reach::relay::Passed>) {
         if passed.is_empty() {
             return;
@@ -1746,7 +1810,7 @@ impl Hub {
         }
         self.net.command(crate::net::Out::Revoke { name: agent.to_owned() }).await;
         self.away_peers.update(|m| m.remove(agent));
-        self.reach.lock().forget(agent);
+        self.reach.forget(agent);
         metrics::agent_samples().update(|m| m.remove(agent));
         self.store.delete_agent(agent.to_owned()).await?;
         self.front_doors.forget(&self.store, agent).await;
@@ -1788,7 +1852,7 @@ impl Hub {
         });
         self.agents.update(|m| m.remove(from));
         self.away_peers.update(|m| m.remove(from));
-        self.reach.lock().forget(from);
+        self.reach.forget(from);
         metrics::agent_samples().update(|m| m.remove(from));
         self.front_doors.moved(from, to);
         self.agent_limits.moved(from, to);
@@ -2057,13 +2121,13 @@ impl Hub {
             }
             m
         };
-        let relay = self.reach.lock();
+        let announced = self.reach.announced();
         let agents = self.agents.load();
         let mut out: Vec<crate::reach::directory::RunnerInfo> = agents
             .values()
             .filter(|a| !a.ephemeral)
             .map(|a| {
-                let ann = relay.announced(&a.name);
+                let ann = announced.get(&a.name);
                 let s = a.sample.as_ref();
                 crate::reach::directory::RunnerInfo {
                     name: a.name.clone(),
@@ -2164,17 +2228,9 @@ impl Hub {
                 self.tunnels.closed(peer);
                 // Its live commands not yet answered end; its parked ones wait for it.
                 self.cmds.ask(move |c| c.down(peer)).await;
-                // Its reach links end; the runners at their other ends hear so (and resume later).
-                let (closes, passed) = {
-                    let mut r = self.reach.lock();
-                    (r.lost(peer, "disconnected from the kiln server"), r.take_passed())
-                };
-                for (p, m) in closes {
-                    if let Ok(b) = proto::encode(&m) {
-                        self.net.send(p, proto::LANE_REACH, Kind::Term, b).await;
-                    }
-                }
-                self.reach_passed(passed);
+                // Its reach links end; the runners at their other ends hear so (and resume later), from
+                // the relay's owner in its turn.
+                self.relay().send(crate::reach::relay::Ask::Lost { peer });
                 self.pending_peers.update(|m| m.remove(&peer));
                 self.said_machine.update(|m| m.remove(&peer));
                 self.peer_certs.update(|m| m.remove(&peer));
@@ -2705,28 +2761,9 @@ impl Hub {
                     self.unreadable(peer, Wire::Relay, "Reach".to_owned(), Code::Malformed, why, true).await;
                     return Ok(());
                 }
-                let (forwarded, passed) = {
-                    let (agents, instances) = (&self.agents, &self.instances);
-                    let mut r = self.reach.lock();
-                    let out = r.forward(&agent, peer, crate::reach::relay::Frame { to, link, open, data, close }, |n| {
-                        if agents.load().get(n).is_none_or(|a| a.ephemeral || !a.connected) {
-                            return None;
-                        }
-                        instances.load().newest_with(n, proto::CAP_REACH)
-                    }, |n| self.shown(n));
-                    (out, r.take_passed())
-                };
-                // One from a runner that isn't an end of the link it names goes nowhere: refused to
-                // it, and noted naming the link's ends.
-                if let crate::reach::relay::Forwarded::NotItsLink { link, ends: (a, b) } = &forwarded {
-                    let why = format!("not its link: link {link} is {a}'s and {b}'s");
-                    self.unreadable(peer, Wire::Relay, "Reach".to_owned(), Code::Malformed, why, true).await;
-                }
-                let typed = self.instances.load().get(peer).is_some_and(|i| i.wide & proto::CAP_UNREAD != 0);
-                for (p, m) in forwarded.sends(peer, typed) {
-                    self.send_reach(p, &m).await;
-                }
-                self.reach_passed(passed);
+                // Handed to the relay's owner, which forwards it in its turn: this loop goes on to the
+                // next runner's message.
+                self.relay().send(crate::reach::relay::Ask::Frame { from: agent.clone(), peer, frame: crate::reach::relay::Frame { to, link, open, data, close } });
             }
             AgentMsg::NetDrops { dropped } => {
                 let series = dropped.iter().map(|d| (vec![agent.clone(), d.lane.clone(), d.reason.clone()], i64::try_from(d.frames).unwrap_or(i64::MAX)));
@@ -2750,7 +2787,9 @@ impl Hub {
             // sent it, the link's other end as the relay knows it, on this one's page too. Word of
             // one about a link the relay doesn't know with those ends is refused, and noted.
             AgentMsg::LinkUnread { from, link, what, code, why } => {
-                let ends = self.reach.lock().ends(&link);
+                // The relay's owner answers after the frames handed it before this.
+                let asked = link.clone();
+                let ends = self.relay().ask(move |r| r.ends(&asked)).await.flatten();
                 if ends.as_ref().is_some_and(|(a, b)| (*a == agent && *b == from) || (*a == from && *b == agent)) {
                     let sender = crate::wire::unread::Sender::Runner { name: from, instance: String::new() };
                     let u = crate::wire::unread::Unread { wire: Wire::ReachLink, from: sender, what, code, why: format!("{why} (as {agent} read it, on link {link})") };
@@ -2931,7 +2970,7 @@ impl Hub {
                 // Job pods neither send nor receive reach links.
                 if !self.agents.load().get(agent).is_none_or(|r| r.ephemeral) {
                     tracing::info!(agent = %agent, fingerprint = %crate::reach::e2e::short(&a.fingerprint), accept = a.accept, "reach identity");
-                    self.reach.lock().announce(agent, a);
+                    self.relay().announce(agent, a);
                 }
             }
             FromRunner::ReachAsk { req, ask, raw } => match *ask {
