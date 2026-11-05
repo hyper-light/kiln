@@ -106,6 +106,18 @@ impl<T: Copy> std::fmt::Debug for CellStack<T> {
 }
 
 impl<T: Copy> CellStack<T> {
+    /// An empty stack with room for `capacity` values (kiln's goal 11: the desk's free stacks start empty, its
+    /// slabs making each cell as it is first needed, `crate::slab`).
+    pub(crate) fn empty(capacity: usize) -> Self
+    where
+        T: Default,
+    {
+        Self {
+            slots: (0..capacity).map(|_| Cell::new(T::default())).collect(),
+            len: Cell::new(0),
+        }
+    }
+
     /// A stack holding `values`, the last of them on top.
     pub(crate) fn full_of(values: impl ExactSizeIterator<Item = T>) -> Self {
         let slots: Box<[Cell<T>]> = values.map(Cell::new).collect();

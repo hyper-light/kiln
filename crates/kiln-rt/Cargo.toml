@@ -142,3 +142,8 @@ harness = false
 [[bench]]
 name = "compute_wait"
 harness = false
+
+# kiln's goal 11: a spawn on a desk made as it's used, against one made up front (two builds, compared).
+[[bench]]
+name = "spawn"
+harness = false
