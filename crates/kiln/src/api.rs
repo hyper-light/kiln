@@ -657,6 +657,8 @@ async fn authorized(hub: Arc<Hub>, caller: crate::authz::Caller, req: Request, m
             let rest: Vec<&str> = rest.to_vec();
             boxed(|| crate::ci::chat::mine(&hub, &caller, &method, &rest)).await.map_err(|(s, m)| ApiError(s, m))
         }
+        // The HTTP/3 door's URL, pinned hashes and a single-use ticket for the caller (goal 4 step 6).
+        (&Method::POST, ["api", "me", "door"]) => Ok(srv::json(StatusCode::OK, &crate::h3door::info(&caller.name))),
         // W10: one's own passkeys and password.
         (&Method::GET, ["api", "me", "passkeys"]) => boxed(|| crate::authz::passkeys::list(&hub, &caller)).await.map(|v| srv::json(StatusCode::OK, &v)).map_err(|(s, m)| ApiError(s, m)),
         (&Method::POST, ["api", "me", "passkeys", "options"]) => {

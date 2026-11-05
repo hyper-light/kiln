@@ -1,0 +1,28 @@
+# Lines are in the order they arrived.
+# What Chromium 156.0.8078.4 (Playwright's Chrome for Testing, macOS arm64, headless) sent to open
+# a WebTransport session, decrypted per stream as the lab's QUIC server (aioquic 1.7.2 at the QUIC
+# layer alone, crates/kiln-http/lab/wt-capture) received it, 2026-11-04. The server's SETTINGS were
+# the door's (every dialect: 0x2b603742, 0xc671706a, 0x14e9cd29 = 1; QPACK table 0; H3_DATAGRAM
+# under 0x33 and 0xffd277; ENABLE_CONNECT_PROTOCOL 1). Chromium spoke draft-02: its SETTINGS carry
+# 0x2b603742 = 1 and no later dialect, and its CONNECT the header sec-webtransport-http3-draft02: 1.
+# It needs from the server before it sends CONNECT: 0x2b603742 = 1 and H3_DATAGRAM = 1.
+# Then the page echoed a bidi stream, a uni stream and a datagram, and closed (code 7, "bye").
+browser chromium 156.0.8078.4
+draft draft-02
+# The control stream: type 0x00, SETTINGS (QPACK table 65,536, 16 KiB field sections, 100 blocked
+# streams, H3_DATAGRAM both ids, ENABLE_WEBTRANSPORT, GREASE).
+stream 2 00042501800100000680004000074064330180ffd27701ab60374201c0000006f32256e88af2f23ac0000008f6e1e6df02679a
+# Its QPACK encoder stream: Set Dynamic Table Capacity 0 (the door said 0).
+stream 10 0220
+# The CONNECT (HEADERS, 118 bytes).
+stream 0 0140760000d7cf508b089d5c0b8170dc0bcd34cf51a463c27fc4989d4a981294a5294a5294a5294a5294a5294a5294a5294a5294a5294a5294ff2f00b95d8749c87a3f89f058d360ea4567b13f2f0e4148b782c69b07522b3d895a74a6b65692c1ca900b01315f4b909d29aee30c044eae05c0b86e05e69e070034c697693c0cd5b3912b2c078102c61d89be7824cad22b7cbbbc82e69a1ab8755f6676c8f577a41c9905d66b7fad165510938e2d89
+# A bidi stream: the signal 0x41 (as a two-byte integer), session 0, the payload.
+stream 4 404100
+stream 4 68656c6c6f2d62696469 fin
+# A uni stream: type 0x54 (two bytes), session 0, the payload.
+stream 14 405400
+stream 14 68656c6c6f2d756e69 fin
+# A datagram: quarter stream id 0, the payload.
+datagram 0068656c6c6f2d646772616d
+# Last, on the CONNECT stream, WT_CLOSE_SESSION (code 7, "bye") in a DATA frame, and its FIN.
+stream 0 000a68430700000007627965 fin

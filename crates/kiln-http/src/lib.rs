@@ -12,6 +12,7 @@
 //! * [`Incoming`]: a body arriving.
 //! * [`upgrade`]: connections handed over (WebSockets, tunnels).
 //! * [`TcpIo`]: a hyper-rt TCP stream as `futures-io`.
+//! * [`h3`]: HTTP/3 for one purpose, the WebTransport door browsers open sessions through (goal 4).
 
 pub mod body;
 mod buf;
@@ -19,6 +20,7 @@ mod date;
 mod error;
 pub(crate) mod h1;
 pub(crate) mod h2;
+pub mod h3;
 mod io;
 pub(crate) mod rt;
 pub mod service;
@@ -26,6 +28,11 @@ pub mod upgrade;
 
 #[cfg(test)]
 mod testing;
+
+// Tests count what they allocate (the HTTP/3 door's memory bounds, goal 4).
+#[cfg(test)]
+#[global_allocator]
+static ALLOCATOR: hyper_measure::alloc::Counting = hyper_measure::alloc::Counting;
 
 pub use body::Incoming;
 pub use error::{Error, Kind, Parse};
