@@ -2283,7 +2283,6 @@ dependencies = [
  "mantle-s3",
  "memchr",
  "mime_guess",
- "mimalloc",
  "nix 0.31.3",
  "parking_lot",
  "portable-pty",

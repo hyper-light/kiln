@@ -10,12 +10,6 @@ use kiln::rt::Shutdown;
 
 use kiln::{config, install, supervise};
 
-/// The `mimalloc` feature's allocator (goal 11, plan 01a1a87b2e56 step 4): what the lab's A/B measures against
-/// the platform's allocator, by resident memory and latency.
-#[cfg(feature = "mimalloc")]
-#[global_allocator]
-static ALLOCATOR: mimalloc::MiMalloc = mimalloc::MiMalloc;
-
 #[derive(Parser)]
 #[command(name = "kiln", version, about = "Self-hosted GitOps CI/CD for the hyper-light stack")]
 struct Cli {
