@@ -1219,15 +1219,23 @@ mod tests {
     /// words, its jobs' results, its terminals' and sessions' output and its blue/green words (`agent.rs`,
     /// `exec.rs`), its sessions' lanes and hand-overs (`harness/host.rs`, `harness/handing.rs`), its
     /// harnesses' and steps' pipes on every platform (`os/proc_unix.rs`, `os/proc_windows.rs`), its terminals
-    /// on every platform (`terminal.rs`, `os/pty_unix.rs`, `os/pty_windows.rs`, `runner/kept.rs`), and its
-    /// ports' bytes (`browser/ports.rs`).
+    /// on every platform (`terminal.rs`, `os/pty_unix.rs`, `os/pty_windows.rs`, `runner/kept.rs`), its ports'
+    /// bytes (`browser/ports.rs`), its sessions' control and outputs (`harness/session.rs`), and reach's side of
+    /// it: every frame between runners into the node, what the node tells the server, a run's output, stdin
+    /// and events, syncs, and `kiln run`'s and MCP `run`'s requests and events (`reach/node.rs`,
+    /// `reach/serve.rs`, `reach/local.rs`, `reach/reuse.rs`).
     #[test]
     fn g5_the_runners_paths_make_no_async_channel() {
         let files = [
             ("agent.rs", include_str!("../agent.rs")),
             ("exec.rs", include_str!("../exec.rs")),
             ("harness/host.rs", include_str!("../harness/host.rs")),
+            ("harness/session.rs", include_str!("../harness/session.rs")),
             ("harness/handing.rs", include_str!("../harness/handing.rs")),
+            ("reach/node.rs", include_str!("../reach/node.rs")),
+            ("reach/serve.rs", include_str!("../reach/serve.rs")),
+            ("reach/local.rs", include_str!("../reach/local.rs")),
+            ("reach/reuse.rs", include_str!("../reach/reuse.rs")),
             ("os/proc_unix.rs", include_str!("../os/proc_unix.rs")),
             ("os/proc_windows.rs", include_str!("../os/proc_windows.rs")),
             ("terminal.rs", include_str!("../terminal.rs")),

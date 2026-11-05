@@ -2561,7 +2561,8 @@ async fn their_tips(to: &str, there: &str) -> Option<Vec<String>> {
         timeout_ms: Some(30_000),
         ..RunSpec::default()
     };
-    let (tx, rx) = async_channel::unbounded();
+    // What the run says, on a lock-free queue (`reach::node::Says`; goal 5, plan 01a1a59c2aae).
+    let (tx, rx) = crate::memory::queue::unbounded(&crate::memory::owners::CHANNELS);
     reach.run(to, spec, tx).await.ok()?;
     let mut out = Vec::new();
     let until = Instant::now() + Duration::from_secs(40);
