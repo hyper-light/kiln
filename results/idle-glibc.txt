@@ -1,0 +1,18 @@
+t=5s VmRSS: 168964 kB RssAnon: 61280 kB RssFile: 107684 kB RssShmem: 0 kB Threads: 60 
+t=15s VmRSS: 162900 kB RssAnon: 53192 kB RssFile: 109708 kB RssShmem: 0 kB Threads: 60 
+t=30s VmRSS: 163524 kB RssAnon: 53624 kB RssFile: 109900 kB RssShmem: 0 kB Threads: 60 
+t=60s VmRSS: 163644 kB RssAnon: 53744 kB RssFile: 109900 kB RssShmem: 0 kB Threads: 60 
+kiln_bus_memory_bytes 0
+kiln_bus_memory_limit_bytes 268435456
+kiln_shard_tasks{shard="0"} 68
+kiln_shard_tasks{shard="1"} 2
+kiln_shard_tasks_most{shard="0"} 68
+kiln_shard_tasks_most{shard="1"} 3
+kiln_memory_resident_bytes{kind="anon"} 55033856
+kiln_memory_resident_bytes{kind="file"} 113098752
+kiln_memory_resident_bytes{kind="shmem"} 0
+kiln_memory_bytes{owner="ui_assets"} 2985700
+kiln_memory_bytes{owner="bus"} 0
+kiln_memory_bound_bytes{owner="ui_assets"} 2985700
+kiln_memory_bound_bytes{owner="bus"} 268435456
+process_resident_memory_bytes 167534592

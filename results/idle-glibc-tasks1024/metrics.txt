@@ -1,0 +1,1095 @@
+# HELP kiln_runs_started_total Pipeline runs created.
+# TYPE kiln_runs_started_total counter
+kiln_runs_started_total 0
+# HELP kiln_jobs_queued Jobs waiting for an agent.
+# TYPE kiln_jobs_queued gauge
+kiln_jobs_queued 0
+# HELP kiln_jobs_running Jobs currently executing.
+# TYPE kiln_jobs_running gauge
+kiln_jobs_running 0
+# HELP kiln_agents_connected Agents with a live session.
+# TYPE kiln_agents_connected gauge
+kiln_agents_connected 0
+# HELP kiln_agent_slots_total Job slots offered by agents.
+# TYPE kiln_agent_slots_total gauge
+kiln_agent_slots_total 0
+# HELP kiln_agent_slots_busy Job slots in use.
+# TYPE kiln_agent_slots_busy gauge
+kiln_agent_slots_busy 0
+# HELP kiln_log_bytes_total Bytes of job log ingested.
+# TYPE kiln_log_bytes_total counter
+kiln_log_bytes_total 0
+# HELP kiln_github_rate_remaining GitHub API requests remaining.
+# TYPE kiln_github_rate_remaining gauge
+kiln_github_rate_remaining 0
+# HELP kiln_github_rate_limit GitHub API request quota per window.
+# TYPE kiln_github_rate_limit gauge
+kiln_github_rate_limit 0
+# HELP kiln_terminal_sessions Open PTY sessions.
+# TYPE kiln_terminal_sessions gauge
+kiln_terminal_sessions 0
+# HELP kiln_ws_clients Connected UI websocket clients.
+# TYPE kiln_ws_clients gauge
+kiln_ws_clients 0
+# HELP kiln_supervisor_restarts_total Supervised subsystem restarts.
+# TYPE kiln_supervisor_restarts_total counter
+kiln_supervisor_restarts_total 0
+# HELP kiln_panics_caught_total Panics contained at task boundaries.
+# TYPE kiln_panics_caught_total counter
+kiln_panics_caught_total 0
+# HELP kiln_quic_streams_total QUIC streams accepted.
+# TYPE kiln_quic_streams_total counter
+kiln_quic_streams_total 0
+# HELP kiln_jobs_finished_total Finished jobs.
+# TYPE kiln_jobs_finished_total counter
+# HELP kiln_steps_finished_total Finished steps.
+# TYPE kiln_steps_finished_total counter
+# HELP kiln_gitops_polls_total Repository polls by result.
+# TYPE kiln_gitops_polls_total counter
+# HELP kiln_k8s_pods_total Agent pods launched.
+# TYPE kiln_k8s_pods_total counter
+# HELP kiln_runner_up Runners connected (1) or not (0).
+# TYPE kiln_runner_up gauge
+# HELP kiln_runner_behind Runners behind the newest kiln (1) or not (0).
+# TYPE kiln_runner_behind gauge
+# HELP kiln_runner_update_policy Each runner's update policy: auto, notify or off (1).
+# TYPE kiln_runner_update_policy gauge
+# HELP kiln_runner_version_info The kiln each runner runs: its commit, else its build (1).
+# TYPE kiln_runner_version_info gauge
+# HELP kiln_ci_cache_total CI cache lookups (hit, miss) and saves.
+# TYPE kiln_ci_cache_total counter
+# HELP kiln_ci_attempts_total CI leg attempts by conclusion and failure class.
+# TYPE kiln_ci_attempts_total counter
+# HELP kiln_ci_wait_seconds_total Seconds CI legs waited, by wait reason.
+# TYPE kiln_ci_wait_seconds_total counter
+# HELP kiln_ci_rollup_lag_seconds How far behind the CI insights rollups are.
+# TYPE kiln_ci_rollup_lag_seconds gauge
+kiln_ci_rollup_lag_seconds 0
+# HELP kiln_work_lookups_total Lookups of recorded work (W24), by layer (leg, ...) and outcome (hit, miss, error).
+# TYPE kiln_work_lookups_total counter
+# HELP kiln_work_classes_total The work ledger's equivalence classes (W24-R30), by layer and event (merge, split, hit).
+# TYPE kiln_work_classes_total counter
+# HELP kiln_work_saved_seconds_total Seconds of work saved: what the results reuse took over had run.
+# TYPE kiln_work_saved_seconds_total counter
+kiln_work_saved_seconds_total 0
+# HELP kiln_work_reaped_bytes_total Bytes the reaper freed (W24-R31), by store (warm, ...) and reason (max_age, target, floor).
+# TYPE kiln_work_reaped_bytes_total counter
+# HELP kiln_job_duration_seconds Job wall time.
+# TYPE kiln_job_duration_seconds histogram
+kiln_job_duration_seconds_bucket{le="1"} 0
+kiln_job_duration_seconds_bucket{le="5"} 0
+kiln_job_duration_seconds_bucket{le="15"} 0
+kiln_job_duration_seconds_bucket{le="30"} 0
+kiln_job_duration_seconds_bucket{le="60"} 0
+kiln_job_duration_seconds_bucket{le="120"} 0
+kiln_job_duration_seconds_bucket{le="300"} 0
+kiln_job_duration_seconds_bucket{le="600"} 0
+kiln_job_duration_seconds_bucket{le="1200"} 0
+kiln_job_duration_seconds_bucket{le="1800"} 0
+kiln_job_duration_seconds_bucket{le="3600"} 0
+kiln_job_duration_seconds_bucket{le="7200"} 0
+kiln_job_duration_seconds_bucket{le="+Inf"} 0
+kiln_job_duration_seconds_sum 0
+kiln_job_duration_seconds_count 0
+# HELP kiln_queue_wait_seconds Time from queued to started.
+# TYPE kiln_queue_wait_seconds histogram
+kiln_queue_wait_seconds_bucket{le="0.1"} 0
+kiln_queue_wait_seconds_bucket{le="0.5"} 0
+kiln_queue_wait_seconds_bucket{le="1"} 0
+kiln_queue_wait_seconds_bucket{le="2"} 0
+kiln_queue_wait_seconds_bucket{le="5"} 0
+kiln_queue_wait_seconds_bucket{le="10"} 0
+kiln_queue_wait_seconds_bucket{le="30"} 0
+kiln_queue_wait_seconds_bucket{le="60"} 0
+kiln_queue_wait_seconds_bucket{le="300"} 0
+kiln_queue_wait_seconds_bucket{le="900"} 0
+kiln_queue_wait_seconds_bucket{le="+Inf"} 0
+kiln_queue_wait_seconds_sum 0
+kiln_queue_wait_seconds_count 0
+# HELP kiln_sync_steps_committed_total Steps a synced repo's log committed.
+# TYPE kiln_sync_steps_committed_total counter
+# HELP kiln_sync_changes_total Changes committed steps made, by kind (added, changed, deleted).
+# TYPE kiln_sync_changes_total counter
+# HELP kiln_sync_conflicts_total Committed changes that met another machine's: kept beside.
+# TYPE kiln_sync_conflicts_total counter
+# HELP kiln_sync_dropped_total Steps and raft messages the server let go, by reason.
+# TYPE kiln_sync_dropped_total counter
+# HELP kiln_sync_retries_total Steps, contents and transfers tried again.
+# TYPE kiln_sync_retries_total counter
+# HELP kiln_sync_errors_total Sync errors, by kind (group, folder, look).
+# TYPE kiln_sync_errors_total counter
+# HELP kiln_sync_blob_requests_total Contents sent (up) and fetched (down) at the server, by machine and result.
+# TYPE kiln_sync_blob_requests_total counter
+# HELP kiln_sync_blob_bytes_total Bytes of contents sent (up) and fetched (down) at the server, by machine.
+# TYPE kiln_sync_blob_bytes_total counter
+# HELP kiln_sync_proposed_total Steps this machine's copies proposed.
+# TYPE kiln_sync_proposed_total counter
+# HELP kiln_sync_applied_total Committed steps this machine's copies took into their folders.
+# TYPE kiln_sync_applied_total counter
+# HELP kiln_sync_folder_writes_total What taking committed steps did to each file here, by outcome.
+# TYPE kiln_sync_folder_writes_total counter
+# HELP kiln_sync_transfers_total Contents moved with the server, by direction and result.
+# TYPE kiln_sync_transfers_total counter
+# HELP kiln_sync_transfer_bytes_total Bytes of contents moved with the server, by direction.
+# TYPE kiln_sync_transfer_bytes_total counter
+# HELP kiln_moves_total Agent sessions moving off this machine, by result.
+# TYPE kiln_moves_total counter
+# HELP kiln_move_carried_bytes_total What moving sessions carried besides synced files (git, ignored, worktree; home: what their harness keeps for them).
+# TYPE kiln_move_carried_bytes_total counter
+# HELP kiln_reach_copies_let_go_total Copies of other runners' trees this machine let go, by trigger (schedule, room, asked).
+# TYPE kiln_reach_copies_let_go_total counter
+# HELP kiln_reach_copies_let_go_bytes_total Bytes of the copies of other runners' trees this machine let go, by trigger.
+# TYPE kiln_reach_copies_let_go_bytes_total counter
+# HELP kiln_sync_copy_lag_steps Log entries a copy's folder hasn't taken yet.
+# TYPE kiln_sync_copy_lag_steps gauge
+# HELP kiln_sync_copy_unsent_steps A copy's own steps not in the log yet.
+# TYPE kiln_sync_copy_unsent_steps gauge
+# HELP kiln_sync_copy_waiting_blobs Contents a copy waits for.
+# TYPE kiln_sync_copy_waiting_blobs gauge
+# HELP kiln_sync_copy_state Each copy's state: 1 for the one it is in, 0 for the others.
+# TYPE kiln_sync_copy_state gauge
+# HELP kiln_sync_copy_heard_age_seconds Seconds since a copy last said how it is.
+# TYPE kiln_sync_copy_heard_age_seconds gauge
+# HELP kiln_sync_conflict_files Conflict copies a synced repo holds, not resolved yet.
+# TYPE kiln_sync_conflict_files gauge
+# HELP kiln_sync_skipped_files Files a copy's last look left out.
+# TYPE kiln_sync_skipped_files gauge
+# HELP kiln_reach_copies Copies of other runners' trees this machine holds, by the runner whose tree it is.
+# TYPE kiln_reach_copies gauge
+# HELP kiln_reach_copies_bytes What the copies of other runners' trees take on this machine's disk, as last measured.
+# TYPE kiln_reach_copies_bytes gauge
+# HELP kiln_sync_commit_seconds From a step's arrival at the server to its commit.
+# TYPE kiln_sync_commit_seconds histogram
+# HELP kiln_sync_transfer_seconds How long moving contents with the server took, by direction.
+# TYPE kiln_sync_transfer_seconds histogram
+# HELP kiln_sync_apply_lag_seconds From a change's look on the machine that made it to its file here.
+# TYPE kiln_sync_apply_lag_seconds histogram
+# HELP kiln_sync_look_seconds How long a look at a copy's folder took.
+# TYPE kiln_sync_look_seconds histogram
+# HELP kiln_move_barrier_seconds How long a session leaving waited for its folder's last changes to be in the log.
+# TYPE kiln_move_barrier_seconds histogram
+kiln_move_barrier_seconds_bucket{le="0.001"} 0
+kiln_move_barrier_seconds_bucket{le="0.0025"} 0
+kiln_move_barrier_seconds_bucket{le="0.005"} 0
+kiln_move_barrier_seconds_bucket{le="0.01"} 0
+kiln_move_barrier_seconds_bucket{le="0.025"} 0
+kiln_move_barrier_seconds_bucket{le="0.05"} 0
+kiln_move_barrier_seconds_bucket{le="0.1"} 0
+kiln_move_barrier_seconds_bucket{le="0.25"} 0
+kiln_move_barrier_seconds_bucket{le="0.5"} 0
+kiln_move_barrier_seconds_bucket{le="1"} 0
+kiln_move_barrier_seconds_bucket{le="2.5"} 0
+kiln_move_barrier_seconds_bucket{le="5"} 0
+kiln_move_barrier_seconds_bucket{le="10"} 0
+kiln_move_barrier_seconds_bucket{le="25"} 0
+kiln_move_barrier_seconds_bucket{le="60"} 0
+kiln_move_barrier_seconds_bucket{le="150"} 0
+kiln_move_barrier_seconds_bucket{le="300"} 0
+kiln_move_barrier_seconds_bucket{le="600"} 0
+kiln_move_barrier_seconds_bucket{le="+Inf"} 0
+kiln_move_barrier_seconds_sum 0
+kiln_move_barrier_seconds_count 0
+# HELP kiln_move_files_wait_seconds How long a session arriving waited for its folder's last changes.
+# TYPE kiln_move_files_wait_seconds histogram
+kiln_move_files_wait_seconds_bucket{le="0.001"} 0
+kiln_move_files_wait_seconds_bucket{le="0.0025"} 0
+kiln_move_files_wait_seconds_bucket{le="0.005"} 0
+kiln_move_files_wait_seconds_bucket{le="0.01"} 0
+kiln_move_files_wait_seconds_bucket{le="0.025"} 0
+kiln_move_files_wait_seconds_bucket{le="0.05"} 0
+kiln_move_files_wait_seconds_bucket{le="0.1"} 0
+kiln_move_files_wait_seconds_bucket{le="0.25"} 0
+kiln_move_files_wait_seconds_bucket{le="0.5"} 0
+kiln_move_files_wait_seconds_bucket{le="1"} 0
+kiln_move_files_wait_seconds_bucket{le="2.5"} 0
+kiln_move_files_wait_seconds_bucket{le="5"} 0
+kiln_move_files_wait_seconds_bucket{le="10"} 0
+kiln_move_files_wait_seconds_bucket{le="25"} 0
+kiln_move_files_wait_seconds_bucket{le="60"} 0
+kiln_move_files_wait_seconds_bucket{le="150"} 0
+kiln_move_files_wait_seconds_bucket{le="300"} 0
+kiln_move_files_wait_seconds_bucket{le="600"} 0
+kiln_move_files_wait_seconds_bucket{le="+Inf"} 0
+kiln_move_files_wait_seconds_sum 0
+kiln_move_files_wait_seconds_count 0
+# HELP kiln_sends_accepted_total Messages a session's inbox took, the first time.
+# TYPE kiln_sends_accepted_total counter
+kiln_sends_accepted_total 0
+# HELP kiln_sends_repeated_total Messages a session's inbox had taken already: answered, never delivered again.
+# TYPE kiln_sends_repeated_total counter
+kiln_sends_repeated_total 0
+# HELP kiln_sends_unanswered_total Messages the server stopped waiting for an inbox's answer to.
+# TYPE kiln_sends_unanswered_total counter
+kiln_sends_unanswered_total 0
+# HELP kiln_sends_unchecked_total Messages a host without inboxes handed on, not checked for repeats.
+# TYPE kiln_sends_unchecked_total counter
+kiln_sends_unchecked_total 0
+# HELP kiln_sends_refused_total Messages a session's inbox refused, by reason.
+# TYPE kiln_sends_refused_total counter
+# HELP kiln_sends_take_seconds How long a session's inbox took to take a message, where it was taken.
+# TYPE kiln_sends_take_seconds histogram
+kiln_sends_take_seconds_bucket{le="0.0001"} 0
+kiln_sends_take_seconds_bucket{le="0.00025"} 0
+kiln_sends_take_seconds_bucket{le="0.0005"} 0
+kiln_sends_take_seconds_bucket{le="0.001"} 0
+kiln_sends_take_seconds_bucket{le="0.002"} 0
+kiln_sends_take_seconds_bucket{le="0.003"} 0
+kiln_sends_take_seconds_bucket{le="0.004"} 0
+kiln_sends_take_seconds_bucket{le="0.005"} 0
+kiln_sends_take_seconds_bucket{le="0.0075"} 0
+kiln_sends_take_seconds_bucket{le="0.01"} 0
+kiln_sends_take_seconds_bucket{le="0.025"} 0
+kiln_sends_take_seconds_bucket{le="0.05"} 0
+kiln_sends_take_seconds_bucket{le="0.1"} 0
+kiln_sends_take_seconds_bucket{le="0.25"} 0
+kiln_sends_take_seconds_bucket{le="0.5"} 0
+kiln_sends_take_seconds_bucket{le="1"} 0
+kiln_sends_take_seconds_bucket{le="2.5"} 0
+kiln_sends_take_seconds_bucket{le="10"} 0
+kiln_sends_take_seconds_bucket{le="+Inf"} 0
+kiln_sends_take_seconds_sum 0
+kiln_sends_take_seconds_count 0
+# HELP kiln_goals_sent_total Goals the goal driver sent an agent: a goal's first send, or afresh once resumed or reworded (start), or again after the agent stopped short of it (reminder).
+# TYPE kiln_goals_sent_total counter
+kiln_goals_sent_total{kind="reminder"} 0
+kiln_goals_sent_total{kind="start"} 0
+# HELP kiln_goals_ended_total Goals that ended: met (as its harness, the agent or you said, or with its plan's steps or run), or skipped (cleared in the agent, skipped through goal control, or taken out while under way).
+# TYPE kiln_goals_ended_total counter
+kiln_goals_ended_total{status="met"} 0
+kiln_goals_ended_total{status="skipped"} 0
+# HELP kiln_harness_polls_total Looks the harness host's watch took at what its harnesses run (every 10 s).
+# TYPE kiln_harness_polls_total counter
+kiln_harness_polls_total 0
+# HELP kiln_harness_records_written_total Writes of the harness host's record of its sessions.
+# TYPE kiln_harness_records_written_total counter
+kiln_harness_records_written_total 0
+# HELP kiln_blobs_requests_total Requests to the store kiln keeps its bytes in, by store, operation and outcome (ok, refused, unavailable).
+# TYPE kiln_blobs_requests_total counter
+kiln_blobs_requests_total{store="local",op="head",outcome="refused"} 6
+kiln_blobs_requests_total{store="local",op="list",outcome="ok"} 1
+kiln_blobs_requests_total{store="local",op="put",outcome="ok"} 2
+# HELP kiln_blobs_bytes_total Bytes written to and read from the store kiln keeps its bytes in.
+# TYPE kiln_blobs_bytes_total counter
+kiln_blobs_bytes_total{store="local",direction="written"} 4989
+# HELP kiln_blobs_collected_total Objects kiln let go that nothing refers to, by what kept them.
+# TYPE kiln_blobs_collected_total counter
+# HELP kiln_blobs_archives_given_up_total Closed conversations whose record couldn't be archived in the days held past the conversation store's keeping: given up, and let go by the store.
+# TYPE kiln_blobs_archives_given_up_total counter
+kiln_blobs_archives_given_up_total 0
+# HELP kiln_blobs_request_seconds How long requests to the store kiln keeps its bytes in took, by store and operation.
+# TYPE kiln_blobs_request_seconds histogram
+kiln_blobs_request_seconds_bucket{store="local",op="head",le="0.001"} 6
+kiln_blobs_request_seconds_bucket{store="local",op="head",le="0.0025"} 6
+kiln_blobs_request_seconds_bucket{store="local",op="head",le="0.005"} 6
+kiln_blobs_request_seconds_bucket{store="local",op="head",le="0.01"} 6
+kiln_blobs_request_seconds_bucket{store="local",op="head",le="0.025"} 6
+kiln_blobs_request_seconds_bucket{store="local",op="head",le="0.05"} 6
+kiln_blobs_request_seconds_bucket{store="local",op="head",le="0.1"} 6
+kiln_blobs_request_seconds_bucket{store="local",op="head",le="0.25"} 6
+kiln_blobs_request_seconds_bucket{store="local",op="head",le="0.5"} 6
+kiln_blobs_request_seconds_bucket{store="local",op="head",le="1"} 6
+kiln_blobs_request_seconds_bucket{store="local",op="head",le="2.5"} 6
+kiln_blobs_request_seconds_bucket{store="local",op="head",le="5"} 6
+kiln_blobs_request_seconds_bucket{store="local",op="head",le="10"} 6
+kiln_blobs_request_seconds_bucket{store="local",op="head",le="25"} 6
+kiln_blobs_request_seconds_bucket{store="local",op="head",le="60"} 6
+kiln_blobs_request_seconds_bucket{store="local",op="head",le="150"} 6
+kiln_blobs_request_seconds_bucket{store="local",op="head",le="300"} 6
+kiln_blobs_request_seconds_bucket{store="local",op="head",le="600"} 6
+kiln_blobs_request_seconds_bucket{store="local",op="head",le="+Inf"} 6
+kiln_blobs_request_seconds_sum{store="local",op="head"} 0.000719
+kiln_blobs_request_seconds_count{store="local",op="head"} 6
+kiln_blobs_request_seconds_bucket{store="local",op="list",le="0.001"} 0
+kiln_blobs_request_seconds_bucket{store="local",op="list",le="0.0025"} 1
+kiln_blobs_request_seconds_bucket{store="local",op="list",le="0.005"} 1
+kiln_blobs_request_seconds_bucket{store="local",op="list",le="0.01"} 1
+kiln_blobs_request_seconds_bucket{store="local",op="list",le="0.025"} 1
+kiln_blobs_request_seconds_bucket{store="local",op="list",le="0.05"} 1
+kiln_blobs_request_seconds_bucket{store="local",op="list",le="0.1"} 1
+kiln_blobs_request_seconds_bucket{store="local",op="list",le="0.25"} 1
+kiln_blobs_request_seconds_bucket{store="local",op="list",le="0.5"} 1
+kiln_blobs_request_seconds_bucket{store="local",op="list",le="1"} 1
+kiln_blobs_request_seconds_bucket{store="local",op="list",le="2.5"} 1
+kiln_blobs_request_seconds_bucket{store="local",op="list",le="5"} 1
+kiln_blobs_request_seconds_bucket{store="local",op="list",le="10"} 1
+kiln_blobs_request_seconds_bucket{store="local",op="list",le="25"} 1
+kiln_blobs_request_seconds_bucket{store="local",op="list",le="60"} 1
+kiln_blobs_request_seconds_bucket{store="local",op="list",le="150"} 1
+kiln_blobs_request_seconds_bucket{store="local",op="list",le="300"} 1
+kiln_blobs_request_seconds_bucket{store="local",op="list",le="600"} 1
+kiln_blobs_request_seconds_bucket{store="local",op="list",le="+Inf"} 1
+kiln_blobs_request_seconds_sum{store="local",op="list"} 0.001398
+kiln_blobs_request_seconds_count{store="local",op="list"} 1
+kiln_blobs_request_seconds_bucket{store="local",op="put",le="0.001"} 0
+kiln_blobs_request_seconds_bucket{store="local",op="put",le="0.0025"} 2
+kiln_blobs_request_seconds_bucket{store="local",op="put",le="0.005"} 2
+kiln_blobs_request_seconds_bucket{store="local",op="put",le="0.01"} 2
+kiln_blobs_request_seconds_bucket{store="local",op="put",le="0.025"} 2
+kiln_blobs_request_seconds_bucket{store="local",op="put",le="0.05"} 2
+kiln_blobs_request_seconds_bucket{store="local",op="put",le="0.1"} 2
+kiln_blobs_request_seconds_bucket{store="local",op="put",le="0.25"} 2
+kiln_blobs_request_seconds_bucket{store="local",op="put",le="0.5"} 2
+kiln_blobs_request_seconds_bucket{store="local",op="put",le="1"} 2
+kiln_blobs_request_seconds_bucket{store="local",op="put",le="2.5"} 2
+kiln_blobs_request_seconds_bucket{store="local",op="put",le="5"} 2
+kiln_blobs_request_seconds_bucket{store="local",op="put",le="10"} 2
+kiln_blobs_request_seconds_bucket{store="local",op="put",le="25"} 2
+kiln_blobs_request_seconds_bucket{store="local",op="put",le="60"} 2
+kiln_blobs_request_seconds_bucket{store="local",op="put",le="150"} 2
+kiln_blobs_request_seconds_bucket{store="local",op="put",le="300"} 2
+kiln_blobs_request_seconds_bucket{store="local",op="put",le="600"} 2
+kiln_blobs_request_seconds_bucket{store="local",op="put",le="+Inf"} 2
+kiln_blobs_request_seconds_sum{store="local",op="put"} 0.002451
+kiln_blobs_request_seconds_count{store="local",op="put"} 2
+# HELP kiln_bus_published_total Frames sessions' live feeds published on the bus.
+# TYPE kiln_bus_published_total counter
+kiln_bus_published_total 0
+# HELP kiln_bus_refused_total Operations the bus refused a live feed, by operation (create, publish, delete): each sends the feed's viewers back to a snapshot.
+# TYPE kiln_bus_refused_total counter
+# HELP kiln_bus_lag_notices_total Viewers told they fell behind what a live feed keeps, and sent back to a snapshot.
+# TYPE kiln_bus_lag_notices_total counter
+kiln_bus_lag_notices_total 0
+# HELP kiln_bus_delivery_seconds How long a live feed's frame took from its publish to a viewer's read.
+# TYPE kiln_bus_delivery_seconds histogram
+kiln_bus_delivery_seconds_bucket{le="0.00005"} 0
+kiln_bus_delivery_seconds_bucket{le="0.0001"} 0
+kiln_bus_delivery_seconds_bucket{le="0.00025"} 0
+kiln_bus_delivery_seconds_bucket{le="0.0005"} 0
+kiln_bus_delivery_seconds_bucket{le="0.001"} 0
+kiln_bus_delivery_seconds_bucket{le="0.0025"} 0
+kiln_bus_delivery_seconds_bucket{le="0.005"} 0
+kiln_bus_delivery_seconds_bucket{le="0.01"} 0
+kiln_bus_delivery_seconds_bucket{le="0.025"} 0
+kiln_bus_delivery_seconds_bucket{le="0.05"} 0
+kiln_bus_delivery_seconds_bucket{le="0.1"} 0
+kiln_bus_delivery_seconds_bucket{le="0.25"} 0
+kiln_bus_delivery_seconds_bucket{le="0.5"} 0
+kiln_bus_delivery_seconds_bucket{le="1"} 0
+kiln_bus_delivery_seconds_bucket{le="2.5"} 0
+kiln_bus_delivery_seconds_bucket{le="5"} 0
+kiln_bus_delivery_seconds_bucket{le="+Inf"} 0
+kiln_bus_delivery_seconds_sum 0
+kiln_bus_delivery_seconds_count 0
+# HELP kiln_bus_topics Topics the bus holds.
+# TYPE kiln_bus_topics gauge
+kiln_bus_topics 0
+# HELP kiln_bus_viewers Viewers reading sessions' live feeds.
+# TYPE kiln_bus_viewers gauge
+kiln_bus_viewers 0
+# HELP kiln_bus_memory_bytes Bytes the bus's messages take, framing included, until their readers let them go.
+# TYPE kiln_bus_memory_bytes gauge
+kiln_bus_memory_bytes 0
+# HELP kiln_bus_memory_limit_bytes Bytes the bus's messages may take ([bus] memory).
+# TYPE kiln_bus_memory_limit_bytes gauge
+kiln_bus_memory_limit_bytes 268435456
+# HELP kiln_net_frames_dropped_total Frames kiln's QUIC layer let go before they reached the wire, by lane and reason (shed, stuck, refused, closed, ended, chaos).
+# TYPE kiln_net_frames_dropped_total counter
+# HELP kiln_runner_net_frames_dropped Frames each runner's QUIC layer let go, by lane and reason, as it last said.
+# TYPE kiln_runner_net_frames_dropped gauge
+# HELP kiln_wire_refused_total Messages kiln couldn't read, refused, by wire and code (unknown, malformed).
+# TYPE kiln_wire_refused_total counter
+kiln_wire_refused_total{wire="events_down",code="malformed"} 0
+kiln_wire_refused_total{wire="events_down",code="unknown"} 0
+kiln_wire_refused_total{wire="events_up",code="malformed"} 0
+kiln_wire_refused_total{wire="events_up",code="unknown"} 0
+kiln_wire_refused_total{wire="log_down",code="malformed"} 0
+kiln_wire_refused_total{wire="log_down",code="unknown"} 0
+kiln_wire_refused_total{wire="log_up",code="malformed"} 0
+kiln_wire_refused_total{wire="log_up",code="unknown"} 0
+kiln_wire_refused_total{wire="mcp_http",code="malformed"} 0
+kiln_wire_refused_total{wire="mcp_http",code="unknown"} 0
+kiln_wire_refused_total{wire="mcp_reach",code="malformed"} 0
+kiln_wire_refused_total{wire="mcp_reach",code="unknown"} 0
+kiln_wire_refused_total{wire="reach_link",code="malformed"} 0
+kiln_wire_refused_total{wire="reach_link",code="unknown"} 0
+kiln_wire_refused_total{wire="relay",code="malformed"} 0
+kiln_wire_refused_total{wire="relay",code="unknown"} 0
+kiln_wire_refused_total{wire="runner",code="malformed"} 0
+kiln_wire_refused_total{wire="runner",code="unknown"} 0
+kiln_wire_refused_total{wire="runner_item",code="malformed"} 0
+kiln_wire_refused_total{wire="runner_item",code="unknown"} 0
+kiln_wire_refused_total{wire="runner_payload",code="malformed"} 0
+kiln_wire_refused_total{wire="runner_payload",code="unknown"} 0
+kiln_wire_refused_total{wire="server",code="malformed"} 0
+kiln_wire_refused_total{wire="server",code="unknown"} 0
+kiln_wire_refused_total{wire="server_item",code="malformed"} 0
+kiln_wire_refused_total{wire="server_item",code="unknown"} 0
+kiln_wire_refused_total{wire="server_payload",code="malformed"} 0
+kiln_wire_refused_total{wire="server_payload",code="unknown"} 0
+kiln_wire_refused_total{wire="session_down",code="malformed"} 0
+kiln_wire_refused_total{wire="session_down",code="unknown"} 0
+kiln_wire_refused_total{wire="session_up",code="malformed"} 0
+kiln_wire_refused_total{wire="session_up",code="unknown"} 0
+kiln_wire_refused_total{wire="stream_down",code="malformed"} 0
+kiln_wire_refused_total{wire="stream_down",code="unknown"} 0
+kiln_wire_refused_total{wire="stream_up",code="malformed"} 0
+kiln_wire_refused_total{wire="stream_up",code="unknown"} 0
+kiln_wire_refused_total{wire="terminal_down",code="malformed"} 0
+kiln_wire_refused_total{wire="terminal_down",code="unknown"} 0
+kiln_wire_refused_total{wire="terminal_up",code="malformed"} 0
+kiln_wire_refused_total{wire="terminal_up",code="unknown"} 0
+kiln_wire_refused_total{wire="tunnel_down",code="malformed"} 0
+kiln_wire_refused_total{wire="tunnel_down",code="unknown"} 0
+kiln_wire_refused_total{wire="tunnel_up",code="malformed"} 0
+kiln_wire_refused_total{wire="tunnel_up",code="unknown"} 0
+# HELP kiln_wire_ignored_fields_total Fields kiln didn't know in a message it read, taken and ignored, by wire: one for each such field of each message.
+# TYPE kiln_wire_ignored_fields_total counter
+kiln_wire_ignored_fields_total{wire="events_down"} 0
+kiln_wire_ignored_fields_total{wire="events_up"} 0
+kiln_wire_ignored_fields_total{wire="log_down"} 0
+kiln_wire_ignored_fields_total{wire="log_up"} 0
+kiln_wire_ignored_fields_total{wire="mcp_http"} 0
+kiln_wire_ignored_fields_total{wire="mcp_reach"} 0
+kiln_wire_ignored_fields_total{wire="reach_link"} 0
+kiln_wire_ignored_fields_total{wire="relay"} 0
+kiln_wire_ignored_fields_total{wire="runner"} 0
+kiln_wire_ignored_fields_total{wire="runner_item"} 0
+kiln_wire_ignored_fields_total{wire="runner_payload"} 0
+kiln_wire_ignored_fields_total{wire="server"} 0
+kiln_wire_ignored_fields_total{wire="server_item"} 0
+kiln_wire_ignored_fields_total{wire="server_payload"} 0
+kiln_wire_ignored_fields_total{wire="session_down"} 0
+kiln_wire_ignored_fields_total{wire="session_up"} 0
+kiln_wire_ignored_fields_total{wire="stream_down"} 0
+kiln_wire_ignored_fields_total{wire="stream_up"} 0
+kiln_wire_ignored_fields_total{wire="terminal_down"} 0
+kiln_wire_ignored_fields_total{wire="terminal_up"} 0
+kiln_wire_ignored_fields_total{wire="tunnel_down"} 0
+kiln_wire_ignored_fields_total{wire="tunnel_up"} 0
+# HELP kiln_shard_delay_seconds How late ready work ran on each shard: a probe's timer, due every period, against when the probe ran (up to a timer tick, 100 us, by design).
+# TYPE kiln_shard_delay_seconds histogram
+kiln_shard_delay_seconds_bucket{shard="0",le="0.00005"} 2
+kiln_shard_delay_seconds_bucket{shard="0",le="0.0001"} 21
+kiln_shard_delay_seconds_bucket{shard="0",le="0.00025"} 5857
+kiln_shard_delay_seconds_bucket{shard="0",le="0.0005"} 5861
+kiln_shard_delay_seconds_bucket{shard="0",le="0.001"} 5861
+kiln_shard_delay_seconds_bucket{shard="0",le="0.0025"} 5861
+kiln_shard_delay_seconds_bucket{shard="0",le="0.005"} 5861
+kiln_shard_delay_seconds_bucket{shard="0",le="0.01"} 5862
+kiln_shard_delay_seconds_bucket{shard="0",le="0.025"} 5863
+kiln_shard_delay_seconds_bucket{shard="0",le="0.05"} 5863
+kiln_shard_delay_seconds_bucket{shard="0",le="0.1"} 5863
+kiln_shard_delay_seconds_bucket{shard="0",le="0.25"} 5864
+kiln_shard_delay_seconds_bucket{shard="0",le="0.5"} 5864
+kiln_shard_delay_seconds_bucket{shard="0",le="1"} 5864
+kiln_shard_delay_seconds_bucket{shard="0",le="2.5"} 5864
+kiln_shard_delay_seconds_bucket{shard="0",le="5"} 5864
+kiln_shard_delay_seconds_bucket{shard="0",le="10"} 5864
+kiln_shard_delay_seconds_bucket{shard="0",le="25"} 5864
+kiln_shard_delay_seconds_bucket{shard="0",le="60"} 5864
+kiln_shard_delay_seconds_bucket{shard="0",le="+Inf"} 5864
+kiln_shard_delay_seconds_sum{shard="0"} 1.371624
+kiln_shard_delay_seconds_count{shard="0"} 5864
+kiln_shard_delay_seconds_bucket{shard="1",le="0.00005"} 1
+kiln_shard_delay_seconds_bucket{shard="1",le="0.0001"} 27
+kiln_shard_delay_seconds_bucket{shard="1",le="0.00025"} 5880
+kiln_shard_delay_seconds_bucket{shard="1",le="0.0005"} 5886
+kiln_shard_delay_seconds_bucket{shard="1",le="0.001"} 5886
+kiln_shard_delay_seconds_bucket{shard="1",le="0.0025"} 5886
+kiln_shard_delay_seconds_bucket{shard="1",le="0.005"} 5886
+kiln_shard_delay_seconds_bucket{shard="1",le="0.01"} 5886
+kiln_shard_delay_seconds_bucket{shard="1",le="0.025"} 5886
+kiln_shard_delay_seconds_bucket{shard="1",le="0.05"} 5886
+kiln_shard_delay_seconds_bucket{shard="1",le="0.1"} 5886
+kiln_shard_delay_seconds_bucket{shard="1",le="0.25"} 5886
+kiln_shard_delay_seconds_bucket{shard="1",le="0.5"} 5886
+kiln_shard_delay_seconds_bucket{shard="1",le="1"} 5886
+kiln_shard_delay_seconds_bucket{shard="1",le="2.5"} 5886
+kiln_shard_delay_seconds_bucket{shard="1",le="5"} 5886
+kiln_shard_delay_seconds_bucket{shard="1",le="10"} 5886
+kiln_shard_delay_seconds_bucket{shard="1",le="25"} 5886
+kiln_shard_delay_seconds_bucket{shard="1",le="60"} 5886
+kiln_shard_delay_seconds_bucket{shard="1",le="+Inf"} 5886
+kiln_shard_delay_seconds_sum{shard="1"} 1.154209
+kiln_shard_delay_seconds_count{shard="1"} 5886
+# HELP kiln_shard_stalled_seconds How long since each shard's probe last ran: a shard held in one poll shows here before its delay can.
+# TYPE kiln_shard_stalled_seconds gauge
+kiln_shard_stalled_seconds{shard="0"} 0.006066112
+kiln_shard_stalled_seconds{shard="1"} 0.003540829
+# HELP kiln_shard_busy_seconds_total CPU time each shard's thread has run (Linux, macOS): its rate is the share of the time the shard was busy on the CPU.
+# TYPE kiln_shard_busy_seconds_total counter
+kiln_shard_busy_seconds_total{shard="0"} 0.472443456
+kiln_shard_busy_seconds_total{shard="1"} 0.202425882
+# HELP kiln_shard_polls_total Task polls each shard ran.
+# TYPE kiln_shard_polls_total counter
+kiln_shard_polls_total{shard="0"} 7961
+kiln_shard_polls_total{shard="1"} 5930
+# HELP kiln_shard_slow_polls_total Polls that held a shard past twice its step quantum, by cause: task (on the CPU), blocking (waiting inside a call), host (runnable, off the CPU), unknown (the OS can't tell).
+# TYPE kiln_shard_slow_polls_total counter
+kiln_shard_slow_polls_total{shard="0",cause="task"} 3
+kiln_shard_slow_polls_total{shard="0",cause="blocking"} 0
+kiln_shard_slow_polls_total{shard="0",cause="host"} 0
+kiln_shard_slow_polls_total{shard="0",cause="unknown"} 5
+kiln_shard_slow_polls_total{shard="1",cause="task"} 0
+kiln_shard_slow_polls_total{shard="1",cause="blocking"} 0
+kiln_shard_slow_polls_total{shard="1",cause="host"} 0
+kiln_shard_slow_polls_total{shard="1",cause="unknown"} 0
+# HELP kiln_shard_longest_poll_seconds The longest single poll each shard has run.
+# TYPE kiln_shard_longest_poll_seconds gauge
+kiln_shard_longest_poll_seconds{shard="0"} 0.192929642
+kiln_shard_longest_poll_seconds{shard="1"} 0.00006976
+# HELP kiln_shard_scheduler_overrun_seconds How late each shard's steps ran after its waits, as the shard measured it (the host descheduling it), decaying as it recovers.
+# TYPE kiln_shard_scheduler_overrun_seconds gauge
+kiln_shard_scheduler_overrun_seconds{shard="0"} 0.000124321
+kiln_shard_scheduler_overrun_seconds{shard="1"} 0.000126184
+# HELP kiln_shard_tasks Tasks each shard held (admitted, not yet ended) as its probe last woke.
+# TYPE kiln_shard_tasks gauge
+kiln_shard_tasks{shard="0"} 68
+kiln_shard_tasks{shard="1"} 2
+# HELP kiln_shard_tasks_most The most tasks each shard has held as its probe woke: what its task slots are sized from.
+# TYPE kiln_shard_tasks_most gauge
+kiln_shard_tasks_most{shard="0"} 68
+kiln_shard_tasks_most{shard="1"} 3
+# HELP kiln_route_wait_seconds How long the server's work waited before its handler started, by class (page, api_read, api_write, websocket, runner).
+# TYPE kiln_route_wait_seconds histogram
+kiln_route_wait_seconds_bucket{class="page",le="0.00005"} 0
+kiln_route_wait_seconds_bucket{class="page",le="0.0001"} 0
+kiln_route_wait_seconds_bucket{class="page",le="0.00025"} 0
+kiln_route_wait_seconds_bucket{class="page",le="0.0005"} 0
+kiln_route_wait_seconds_bucket{class="page",le="0.001"} 0
+kiln_route_wait_seconds_bucket{class="page",le="0.0025"} 0
+kiln_route_wait_seconds_bucket{class="page",le="0.005"} 0
+kiln_route_wait_seconds_bucket{class="page",le="0.01"} 0
+kiln_route_wait_seconds_bucket{class="page",le="0.025"} 0
+kiln_route_wait_seconds_bucket{class="page",le="0.05"} 0
+kiln_route_wait_seconds_bucket{class="page",le="0.1"} 0
+kiln_route_wait_seconds_bucket{class="page",le="0.25"} 0
+kiln_route_wait_seconds_bucket{class="page",le="0.5"} 0
+kiln_route_wait_seconds_bucket{class="page",le="1"} 0
+kiln_route_wait_seconds_bucket{class="page",le="2.5"} 0
+kiln_route_wait_seconds_bucket{class="page",le="5"} 0
+kiln_route_wait_seconds_bucket{class="page",le="10"} 0
+kiln_route_wait_seconds_bucket{class="page",le="25"} 0
+kiln_route_wait_seconds_bucket{class="page",le="60"} 0
+kiln_route_wait_seconds_bucket{class="page",le="+Inf"} 0
+kiln_route_wait_seconds_sum{class="page"} 0
+kiln_route_wait_seconds_count{class="page"} 0
+kiln_route_wait_seconds_bucket{class="api_read",le="0.00005"} 0
+kiln_route_wait_seconds_bucket{class="api_read",le="0.0001"} 0
+kiln_route_wait_seconds_bucket{class="api_read",le="0.00025"} 0
+kiln_route_wait_seconds_bucket{class="api_read",le="0.0005"} 0
+kiln_route_wait_seconds_bucket{class="api_read",le="0.001"} 0
+kiln_route_wait_seconds_bucket{class="api_read",le="0.0025"} 0
+kiln_route_wait_seconds_bucket{class="api_read",le="0.005"} 0
+kiln_route_wait_seconds_bucket{class="api_read",le="0.01"} 0
+kiln_route_wait_seconds_bucket{class="api_read",le="0.025"} 0
+kiln_route_wait_seconds_bucket{class="api_read",le="0.05"} 0
+kiln_route_wait_seconds_bucket{class="api_read",le="0.1"} 0
+kiln_route_wait_seconds_bucket{class="api_read",le="0.25"} 0
+kiln_route_wait_seconds_bucket{class="api_read",le="0.5"} 0
+kiln_route_wait_seconds_bucket{class="api_read",le="1"} 0
+kiln_route_wait_seconds_bucket{class="api_read",le="2.5"} 0
+kiln_route_wait_seconds_bucket{class="api_read",le="5"} 0
+kiln_route_wait_seconds_bucket{class="api_read",le="10"} 0
+kiln_route_wait_seconds_bucket{class="api_read",le="25"} 0
+kiln_route_wait_seconds_bucket{class="api_read",le="60"} 0
+kiln_route_wait_seconds_bucket{class="api_read",le="+Inf"} 0
+kiln_route_wait_seconds_sum{class="api_read"} 0
+kiln_route_wait_seconds_count{class="api_read"} 0
+kiln_route_wait_seconds_bucket{class="api_write",le="0.00005"} 0
+kiln_route_wait_seconds_bucket{class="api_write",le="0.0001"} 0
+kiln_route_wait_seconds_bucket{class="api_write",le="0.00025"} 0
+kiln_route_wait_seconds_bucket{class="api_write",le="0.0005"} 0
+kiln_route_wait_seconds_bucket{class="api_write",le="0.001"} 0
+kiln_route_wait_seconds_bucket{class="api_write",le="0.0025"} 0
+kiln_route_wait_seconds_bucket{class="api_write",le="0.005"} 0
+kiln_route_wait_seconds_bucket{class="api_write",le="0.01"} 0
+kiln_route_wait_seconds_bucket{class="api_write",le="0.025"} 0
+kiln_route_wait_seconds_bucket{class="api_write",le="0.05"} 0
+kiln_route_wait_seconds_bucket{class="api_write",le="0.1"} 0
+kiln_route_wait_seconds_bucket{class="api_write",le="0.25"} 0
+kiln_route_wait_seconds_bucket{class="api_write",le="0.5"} 0
+kiln_route_wait_seconds_bucket{class="api_write",le="1"} 0
+kiln_route_wait_seconds_bucket{class="api_write",le="2.5"} 0
+kiln_route_wait_seconds_bucket{class="api_write",le="5"} 0
+kiln_route_wait_seconds_bucket{class="api_write",le="10"} 0
+kiln_route_wait_seconds_bucket{class="api_write",le="25"} 0
+kiln_route_wait_seconds_bucket{class="api_write",le="60"} 0
+kiln_route_wait_seconds_bucket{class="api_write",le="+Inf"} 0
+kiln_route_wait_seconds_sum{class="api_write"} 0
+kiln_route_wait_seconds_count{class="api_write"} 0
+kiln_route_wait_seconds_bucket{class="websocket",le="0.00005"} 0
+kiln_route_wait_seconds_bucket{class="websocket",le="0.0001"} 0
+kiln_route_wait_seconds_bucket{class="websocket",le="0.00025"} 0
+kiln_route_wait_seconds_bucket{class="websocket",le="0.0005"} 0
+kiln_route_wait_seconds_bucket{class="websocket",le="0.001"} 0
+kiln_route_wait_seconds_bucket{class="websocket",le="0.0025"} 0
+kiln_route_wait_seconds_bucket{class="websocket",le="0.005"} 0
+kiln_route_wait_seconds_bucket{class="websocket",le="0.01"} 0
+kiln_route_wait_seconds_bucket{class="websocket",le="0.025"} 0
+kiln_route_wait_seconds_bucket{class="websocket",le="0.05"} 0
+kiln_route_wait_seconds_bucket{class="websocket",le="0.1"} 0
+kiln_route_wait_seconds_bucket{class="websocket",le="0.25"} 0
+kiln_route_wait_seconds_bucket{class="websocket",le="0.5"} 0
+kiln_route_wait_seconds_bucket{class="websocket",le="1"} 0
+kiln_route_wait_seconds_bucket{class="websocket",le="2.5"} 0
+kiln_route_wait_seconds_bucket{class="websocket",le="5"} 0
+kiln_route_wait_seconds_bucket{class="websocket",le="10"} 0
+kiln_route_wait_seconds_bucket{class="websocket",le="25"} 0
+kiln_route_wait_seconds_bucket{class="websocket",le="60"} 0
+kiln_route_wait_seconds_bucket{class="websocket",le="+Inf"} 0
+kiln_route_wait_seconds_sum{class="websocket"} 0
+kiln_route_wait_seconds_count{class="websocket"} 0
+kiln_route_wait_seconds_bucket{class="runner",le="0.00005"} 0
+kiln_route_wait_seconds_bucket{class="runner",le="0.0001"} 0
+kiln_route_wait_seconds_bucket{class="runner",le="0.00025"} 0
+kiln_route_wait_seconds_bucket{class="runner",le="0.0005"} 0
+kiln_route_wait_seconds_bucket{class="runner",le="0.001"} 0
+kiln_route_wait_seconds_bucket{class="runner",le="0.0025"} 0
+kiln_route_wait_seconds_bucket{class="runner",le="0.005"} 0
+kiln_route_wait_seconds_bucket{class="runner",le="0.01"} 0
+kiln_route_wait_seconds_bucket{class="runner",le="0.025"} 0
+kiln_route_wait_seconds_bucket{class="runner",le="0.05"} 0
+kiln_route_wait_seconds_bucket{class="runner",le="0.1"} 0
+kiln_route_wait_seconds_bucket{class="runner",le="0.25"} 0
+kiln_route_wait_seconds_bucket{class="runner",le="0.5"} 0
+kiln_route_wait_seconds_bucket{class="runner",le="1"} 0
+kiln_route_wait_seconds_bucket{class="runner",le="2.5"} 0
+kiln_route_wait_seconds_bucket{class="runner",le="5"} 0
+kiln_route_wait_seconds_bucket{class="runner",le="10"} 0
+kiln_route_wait_seconds_bucket{class="runner",le="25"} 0
+kiln_route_wait_seconds_bucket{class="runner",le="60"} 0
+kiln_route_wait_seconds_bucket{class="runner",le="+Inf"} 0
+kiln_route_wait_seconds_sum{class="runner"} 0
+kiln_route_wait_seconds_count{class="runner"} 0
+# HELP kiln_route_seconds How long the server's work took once its handler started, by class.
+# TYPE kiln_route_seconds histogram
+kiln_route_seconds_bucket{class="page",le="0.00005"} 0
+kiln_route_seconds_bucket{class="page",le="0.0001"} 0
+kiln_route_seconds_bucket{class="page",le="0.00025"} 0
+kiln_route_seconds_bucket{class="page",le="0.0005"} 0
+kiln_route_seconds_bucket{class="page",le="0.001"} 0
+kiln_route_seconds_bucket{class="page",le="0.0025"} 0
+kiln_route_seconds_bucket{class="page",le="0.005"} 0
+kiln_route_seconds_bucket{class="page",le="0.01"} 0
+kiln_route_seconds_bucket{class="page",le="0.025"} 0
+kiln_route_seconds_bucket{class="page",le="0.05"} 0
+kiln_route_seconds_bucket{class="page",le="0.1"} 0
+kiln_route_seconds_bucket{class="page",le="0.25"} 0
+kiln_route_seconds_bucket{class="page",le="0.5"} 0
+kiln_route_seconds_bucket{class="page",le="1"} 0
+kiln_route_seconds_bucket{class="page",le="2.5"} 0
+kiln_route_seconds_bucket{class="page",le="5"} 0
+kiln_route_seconds_bucket{class="page",le="10"} 0
+kiln_route_seconds_bucket{class="page",le="25"} 0
+kiln_route_seconds_bucket{class="page",le="60"} 0
+kiln_route_seconds_bucket{class="page",le="+Inf"} 0
+kiln_route_seconds_sum{class="page"} 0
+kiln_route_seconds_count{class="page"} 0
+kiln_route_seconds_bucket{class="api_read",le="0.00005"} 0
+kiln_route_seconds_bucket{class="api_read",le="0.0001"} 0
+kiln_route_seconds_bucket{class="api_read",le="0.00025"} 0
+kiln_route_seconds_bucket{class="api_read",le="0.0005"} 0
+kiln_route_seconds_bucket{class="api_read",le="0.001"} 0
+kiln_route_seconds_bucket{class="api_read",le="0.0025"} 0
+kiln_route_seconds_bucket{class="api_read",le="0.005"} 0
+kiln_route_seconds_bucket{class="api_read",le="0.01"} 0
+kiln_route_seconds_bucket{class="api_read",le="0.025"} 0
+kiln_route_seconds_bucket{class="api_read",le="0.05"} 0
+kiln_route_seconds_bucket{class="api_read",le="0.1"} 0
+kiln_route_seconds_bucket{class="api_read",le="0.25"} 0
+kiln_route_seconds_bucket{class="api_read",le="0.5"} 0
+kiln_route_seconds_bucket{class="api_read",le="1"} 0
+kiln_route_seconds_bucket{class="api_read",le="2.5"} 0
+kiln_route_seconds_bucket{class="api_read",le="5"} 0
+kiln_route_seconds_bucket{class="api_read",le="10"} 0
+kiln_route_seconds_bucket{class="api_read",le="25"} 0
+kiln_route_seconds_bucket{class="api_read",le="60"} 0
+kiln_route_seconds_bucket{class="api_read",le="+Inf"} 0
+kiln_route_seconds_sum{class="api_read"} 0
+kiln_route_seconds_count{class="api_read"} 0
+kiln_route_seconds_bucket{class="api_write",le="0.00005"} 0
+kiln_route_seconds_bucket{class="api_write",le="0.0001"} 0
+kiln_route_seconds_bucket{class="api_write",le="0.00025"} 0
+kiln_route_seconds_bucket{class="api_write",le="0.0005"} 0
+kiln_route_seconds_bucket{class="api_write",le="0.001"} 0
+kiln_route_seconds_bucket{class="api_write",le="0.0025"} 0
+kiln_route_seconds_bucket{class="api_write",le="0.005"} 0
+kiln_route_seconds_bucket{class="api_write",le="0.01"} 0
+kiln_route_seconds_bucket{class="api_write",le="0.025"} 0
+kiln_route_seconds_bucket{class="api_write",le="0.05"} 0
+kiln_route_seconds_bucket{class="api_write",le="0.1"} 0
+kiln_route_seconds_bucket{class="api_write",le="0.25"} 0
+kiln_route_seconds_bucket{class="api_write",le="0.5"} 0
+kiln_route_seconds_bucket{class="api_write",le="1"} 0
+kiln_route_seconds_bucket{class="api_write",le="2.5"} 0
+kiln_route_seconds_bucket{class="api_write",le="5"} 0
+kiln_route_seconds_bucket{class="api_write",le="10"} 0
+kiln_route_seconds_bucket{class="api_write",le="25"} 0
+kiln_route_seconds_bucket{class="api_write",le="60"} 0
+kiln_route_seconds_bucket{class="api_write",le="+Inf"} 0
+kiln_route_seconds_sum{class="api_write"} 0
+kiln_route_seconds_count{class="api_write"} 0
+kiln_route_seconds_bucket{class="websocket",le="0.00005"} 0
+kiln_route_seconds_bucket{class="websocket",le="0.0001"} 0
+kiln_route_seconds_bucket{class="websocket",le="0.00025"} 0
+kiln_route_seconds_bucket{class="websocket",le="0.0005"} 0
+kiln_route_seconds_bucket{class="websocket",le="0.001"} 0
+kiln_route_seconds_bucket{class="websocket",le="0.0025"} 0
+kiln_route_seconds_bucket{class="websocket",le="0.005"} 0
+kiln_route_seconds_bucket{class="websocket",le="0.01"} 0
+kiln_route_seconds_bucket{class="websocket",le="0.025"} 0
+kiln_route_seconds_bucket{class="websocket",le="0.05"} 0
+kiln_route_seconds_bucket{class="websocket",le="0.1"} 0
+kiln_route_seconds_bucket{class="websocket",le="0.25"} 0
+kiln_route_seconds_bucket{class="websocket",le="0.5"} 0
+kiln_route_seconds_bucket{class="websocket",le="1"} 0
+kiln_route_seconds_bucket{class="websocket",le="2.5"} 0
+kiln_route_seconds_bucket{class="websocket",le="5"} 0
+kiln_route_seconds_bucket{class="websocket",le="10"} 0
+kiln_route_seconds_bucket{class="websocket",le="25"} 0
+kiln_route_seconds_bucket{class="websocket",le="60"} 0
+kiln_route_seconds_bucket{class="websocket",le="+Inf"} 0
+kiln_route_seconds_sum{class="websocket"} 0
+kiln_route_seconds_count{class="websocket"} 0
+kiln_route_seconds_bucket{class="runner",le="0.00005"} 0
+kiln_route_seconds_bucket{class="runner",le="0.0001"} 0
+kiln_route_seconds_bucket{class="runner",le="0.00025"} 0
+kiln_route_seconds_bucket{class="runner",le="0.0005"} 0
+kiln_route_seconds_bucket{class="runner",le="0.001"} 0
+kiln_route_seconds_bucket{class="runner",le="0.0025"} 0
+kiln_route_seconds_bucket{class="runner",le="0.005"} 0
+kiln_route_seconds_bucket{class="runner",le="0.01"} 0
+kiln_route_seconds_bucket{class="runner",le="0.025"} 0
+kiln_route_seconds_bucket{class="runner",le="0.05"} 0
+kiln_route_seconds_bucket{class="runner",le="0.1"} 0
+kiln_route_seconds_bucket{class="runner",le="0.25"} 0
+kiln_route_seconds_bucket{class="runner",le="0.5"} 0
+kiln_route_seconds_bucket{class="runner",le="1"} 0
+kiln_route_seconds_bucket{class="runner",le="2.5"} 0
+kiln_route_seconds_bucket{class="runner",le="5"} 0
+kiln_route_seconds_bucket{class="runner",le="10"} 0
+kiln_route_seconds_bucket{class="runner",le="25"} 0
+kiln_route_seconds_bucket{class="runner",le="60"} 0
+kiln_route_seconds_bucket{class="runner",le="+Inf"} 0
+kiln_route_seconds_sum{class="runner"} 0
+kiln_route_seconds_count{class="runner"} 0
+# HELP kiln_shard_stalled 1 while kiln-rt's watchdog sees the shard held in one poll past its limit (new work goes to other shards).
+# TYPE kiln_shard_stalled gauge
+kiln_shard_stalled{shard="0"} 0
+kiln_shard_stalled{shard="1"} 0
+# HELP kiln_shard_stalls_total Polls the watchdog saw hold the shard past its limit (a step's worth of polls: batch x quantum).
+# TYPE kiln_shard_stalls_total counter
+kiln_shard_stalls_total{shard="0"} 2
+kiln_shard_stalls_total{shard="1"} 0
+# HELP kiln_shard_stalled_seconds_total Time those polls held the shard.
+# TYPE kiln_shard_stalled_seconds_total counter
+kiln_shard_stalled_seconds_total{shard="0"} 0.218021
+kiln_shard_stalled_seconds_total{shard="1"} 0.000000
+# HELP kiln_shard_stall_moved_total Spawns waiting for the shard while it was held that the watchdog handed to another shard.
+# TYPE kiln_shard_stall_moved_total counter
+kiln_shard_stall_moved_total{shard="0"} 0
+kiln_shard_stall_moved_total{shard="1"} 0
+# HELP kiln_shard_stall_reports_total Stalls reported (5 a minute a shard at most).
+# TYPE kiln_shard_stall_reports_total counter
+kiln_shard_stall_reports_total{shard="0"} 2
+kiln_shard_stall_reports_total{shard="1"} 0
+# HELP kiln_shard_stall_reports_suppressed_total Stalls past the reports' cap, counted only.
+# TYPE kiln_shard_stall_reports_suppressed_total counter
+kiln_shard_stall_reports_suppressed_total{shard="0"} 0
+kiln_shard_stall_reports_suppressed_total{shard="1"} 0
+# HELP kiln_shard_coop_yields_total Polls that ended because their task used its share of the shard while other work waited.
+# TYPE kiln_shard_coop_yields_total counter
+kiln_shard_coop_yields_total{shard="0"} 1
+kiln_shard_coop_yields_total{shard="1"} 0
+# HELP kiln_shard_last_stall_seconds How long the latest reported stall had held its shard, with its task, spawn site and whose the time was.
+# TYPE kiln_shard_last_stall_seconds gauge
+kiln_shard_last_stall_seconds{shard="0",task="0",spawned_at="crates/kiln/src/rt.rs:512:13",whose="task"} 0.016154
+# HELP kiln_shard_queue_delay_seconds Each class's mean wait from ready to run on the shard, over the last 10 ms.
+# TYPE kiln_shard_queue_delay_seconds gauge
+# HELP kiln_shard_shedding 1 while the shard's own queueing delay sheds the class's requests (the pools': kiln_pool_shedding).
+# TYPE kiln_shard_shedding gauge
+kiln_shard_queue_delay_seconds{shard="0",class="critical"} 0.000000
+kiln_shard_queue_delay_seconds{shard="0",class="normal"} 0.000184
+kiln_shard_queue_delay_seconds{shard="0",class="background"} 0.000000
+kiln_shard_shedding{shard="0",class="background"} 0
+kiln_shard_shedding{shard="0",class="normal"} 0
+kiln_shard_queue_delay_seconds{shard="1",class="critical"} 0.000000
+kiln_shard_queue_delay_seconds{shard="1",class="normal"} 0.000201
+kiln_shard_queue_delay_seconds{shard="1",class="background"} 0.000000
+kiln_shard_shedding{shard="1",class="background"} 0
+kiln_shard_shedding{shard="1",class="normal"} 0
+# HELP kiln_pool_queue_delay_seconds Each pool's mean wait for a place over the shards' probe period, as the overload detector last read it: the compute pool's jobs for a thread, each of the blocking pool's shares' for one of its places.
+# TYPE kiln_pool_queue_delay_seconds gauge
+kiln_pool_queue_delay_seconds{pool="compute"} 0.000250
+kiln_pool_queue_delay_seconds{pool="dns"} 0.000250
+kiln_pool_queue_delay_seconds{pool="store"} 0.000250
+kiln_pool_queue_delay_seconds{pool="fs"} 0.000250
+# HELP kiln_pool_shedding 1 while work waiting in the pool past its calm sheds the class's requests on every shard.
+# TYPE kiln_pool_shedding gauge
+kiln_pool_shedding{pool="compute",class="background"} 0
+kiln_pool_shedding{pool="compute",class="normal"} 0
+kiln_pool_shedding{pool="dns",class="background"} 0
+kiln_pool_shedding{pool="dns",class="normal"} 0
+kiln_pool_shedding{pool="store",class="background"} 0
+kiln_pool_shedding{pool="store",class="normal"} 0
+kiln_pool_shedding{pool="fs",class="background"} 0
+kiln_pool_shedding{pool="fs",class="normal"} 0
+# HELP kiln_shed_total Requests answered 503 at once because their shard, or work waiting in a pool, was overloaded, by class.
+# TYPE kiln_shed_total counter
+kiln_shed_total{class="background"} 0
+kiln_shed_total{class="normal"} 0
+# HELP kiln_compute_jobs_total Jobs the compute pool took: CPU-heavy work off the shards.
+# TYPE kiln_compute_jobs_total counter
+kiln_compute_jobs_total 1
+# HELP kiln_compute_refused_total Jobs the compute pool refused at its bound (each asked again).
+# TYPE kiln_compute_refused_total counter
+kiln_compute_refused_total 0
+# HELP kiln_compute_pieces_total Pieces the compute pool's jobs ran (a job of one closure is one).
+# TYPE kiln_compute_pieces_total counter
+kiln_compute_pieces_total 1
+# HELP kiln_compute_yielded_total Pieces after which their job gave its thread to a waiting job, going on after it.
+# TYPE kiln_compute_yielded_total counter
+kiln_compute_yielded_total 0
+# HELP kiln_compute_longest_piece_seconds The longest piece any compute pool thread has run.
+# TYPE kiln_compute_longest_piece_seconds gauge
+kiln_compute_longest_piece_seconds 6.578221337
+# HELP kiln_compute_wait_seconds How long each compute job waited for a pool thread: from its submission to its first piece.
+# TYPE kiln_compute_wait_seconds histogram
+kiln_compute_wait_seconds_bucket{le="0.00005"} 1
+kiln_compute_wait_seconds_bucket{le="0.0001"} 1
+kiln_compute_wait_seconds_bucket{le="0.00025"} 1
+kiln_compute_wait_seconds_bucket{le="0.0005"} 1
+kiln_compute_wait_seconds_bucket{le="0.001"} 1
+kiln_compute_wait_seconds_bucket{le="0.0025"} 1
+kiln_compute_wait_seconds_bucket{le="0.005"} 1
+kiln_compute_wait_seconds_bucket{le="0.01"} 1
+kiln_compute_wait_seconds_bucket{le="0.025"} 1
+kiln_compute_wait_seconds_bucket{le="0.05"} 1
+kiln_compute_wait_seconds_bucket{le="0.1"} 1
+kiln_compute_wait_seconds_bucket{le="0.25"} 1
+kiln_compute_wait_seconds_bucket{le="0.5"} 1
+kiln_compute_wait_seconds_bucket{le="1"} 1
+kiln_compute_wait_seconds_bucket{le="2.5"} 1
+kiln_compute_wait_seconds_bucket{le="5"} 1
+kiln_compute_wait_seconds_bucket{le="10"} 1
+kiln_compute_wait_seconds_bucket{le="25"} 1
+kiln_compute_wait_seconds_bucket{le="60"} 1
+kiln_compute_wait_seconds_bucket{le="+Inf"} 1
+kiln_compute_wait_seconds_sum 0.000018
+kiln_compute_wait_seconds_count 1
+# HELP kiln_compute_piece_seconds How long each piece of a compute job held its pool thread.
+# TYPE kiln_compute_piece_seconds histogram
+kiln_compute_piece_seconds_bucket{le="0.00005"} 0
+kiln_compute_piece_seconds_bucket{le="0.0001"} 0
+kiln_compute_piece_seconds_bucket{le="0.00025"} 0
+kiln_compute_piece_seconds_bucket{le="0.0005"} 0
+kiln_compute_piece_seconds_bucket{le="0.001"} 0
+kiln_compute_piece_seconds_bucket{le="0.0025"} 0
+kiln_compute_piece_seconds_bucket{le="0.005"} 0
+kiln_compute_piece_seconds_bucket{le="0.01"} 0
+kiln_compute_piece_seconds_bucket{le="0.025"} 0
+kiln_compute_piece_seconds_bucket{le="0.05"} 0
+kiln_compute_piece_seconds_bucket{le="0.1"} 0
+kiln_compute_piece_seconds_bucket{le="0.25"} 0
+kiln_compute_piece_seconds_bucket{le="0.5"} 0
+kiln_compute_piece_seconds_bucket{le="1"} 0
+kiln_compute_piece_seconds_bucket{le="2.5"} 0
+kiln_compute_piece_seconds_bucket{le="5"} 0
+kiln_compute_piece_seconds_bucket{le="10"} 1
+kiln_compute_piece_seconds_bucket{le="25"} 1
+kiln_compute_piece_seconds_bucket{le="60"} 1
+kiln_compute_piece_seconds_bucket{le="+Inf"} 1
+kiln_compute_piece_seconds_sum 6.578221
+kiln_compute_piece_seconds_count 1
+# HELP kiln_blocking_wait_seconds How long each blocking pool job waited for one of its share's places.
+# TYPE kiln_blocking_wait_seconds histogram
+kiln_blocking_wait_seconds_bucket{share="dns",le="0.00005"} 0
+kiln_blocking_wait_seconds_bucket{share="dns",le="0.0001"} 0
+kiln_blocking_wait_seconds_bucket{share="dns",le="0.00025"} 0
+kiln_blocking_wait_seconds_bucket{share="dns",le="0.0005"} 0
+kiln_blocking_wait_seconds_bucket{share="dns",le="0.001"} 0
+kiln_blocking_wait_seconds_bucket{share="dns",le="0.0025"} 0
+kiln_blocking_wait_seconds_bucket{share="dns",le="0.005"} 0
+kiln_blocking_wait_seconds_bucket{share="dns",le="0.01"} 0
+kiln_blocking_wait_seconds_bucket{share="dns",le="0.025"} 0
+kiln_blocking_wait_seconds_bucket{share="dns",le="0.05"} 0
+kiln_blocking_wait_seconds_bucket{share="dns",le="0.1"} 0
+kiln_blocking_wait_seconds_bucket{share="dns",le="0.25"} 0
+kiln_blocking_wait_seconds_bucket{share="dns",le="0.5"} 0
+kiln_blocking_wait_seconds_bucket{share="dns",le="1"} 0
+kiln_blocking_wait_seconds_bucket{share="dns",le="2.5"} 0
+kiln_blocking_wait_seconds_bucket{share="dns",le="5"} 0
+kiln_blocking_wait_seconds_bucket{share="dns",le="10"} 0
+kiln_blocking_wait_seconds_bucket{share="dns",le="25"} 0
+kiln_blocking_wait_seconds_bucket{share="dns",le="60"} 0
+kiln_blocking_wait_seconds_bucket{share="dns",le="+Inf"} 0
+kiln_blocking_wait_seconds_sum{share="dns"} 0
+kiln_blocking_wait_seconds_count{share="dns"} 0
+kiln_blocking_wait_seconds_bucket{share="store",le="0.00005"} 717
+kiln_blocking_wait_seconds_bucket{share="store",le="0.0001"} 775
+kiln_blocking_wait_seconds_bucket{share="store",le="0.00025"} 779
+kiln_blocking_wait_seconds_bucket{share="store",le="0.0005"} 783
+kiln_blocking_wait_seconds_bucket{share="store",le="0.001"} 793
+kiln_blocking_wait_seconds_bucket{share="store",le="0.0025"} 793
+kiln_blocking_wait_seconds_bucket{share="store",le="0.005"} 793
+kiln_blocking_wait_seconds_bucket{share="store",le="0.01"} 793
+kiln_blocking_wait_seconds_bucket{share="store",le="0.025"} 793
+kiln_blocking_wait_seconds_bucket{share="store",le="0.05"} 793
+kiln_blocking_wait_seconds_bucket{share="store",le="0.1"} 793
+kiln_blocking_wait_seconds_bucket{share="store",le="0.25"} 793
+kiln_blocking_wait_seconds_bucket{share="store",le="0.5"} 793
+kiln_blocking_wait_seconds_bucket{share="store",le="1"} 793
+kiln_blocking_wait_seconds_bucket{share="store",le="2.5"} 793
+kiln_blocking_wait_seconds_bucket{share="store",le="5"} 793
+kiln_blocking_wait_seconds_bucket{share="store",le="10"} 793
+kiln_blocking_wait_seconds_bucket{share="store",le="25"} 793
+kiln_blocking_wait_seconds_bucket{share="store",le="60"} 793
+kiln_blocking_wait_seconds_bucket{share="store",le="+Inf"} 793
+kiln_blocking_wait_seconds_sum{share="store"} 0.032612
+kiln_blocking_wait_seconds_count{share="store"} 793
+kiln_blocking_wait_seconds_bucket{share="fs",le="0.00005"} 195
+kiln_blocking_wait_seconds_bucket{share="fs",le="0.0001"} 212
+kiln_blocking_wait_seconds_bucket{share="fs",le="0.00025"} 213
+kiln_blocking_wait_seconds_bucket{share="fs",le="0.0005"} 214
+kiln_blocking_wait_seconds_bucket{share="fs",le="0.001"} 214
+kiln_blocking_wait_seconds_bucket{share="fs",le="0.0025"} 214
+kiln_blocking_wait_seconds_bucket{share="fs",le="0.005"} 214
+kiln_blocking_wait_seconds_bucket{share="fs",le="0.01"} 214
+kiln_blocking_wait_seconds_bucket{share="fs",le="0.025"} 214
+kiln_blocking_wait_seconds_bucket{share="fs",le="0.05"} 214
+kiln_blocking_wait_seconds_bucket{share="fs",le="0.1"} 214
+kiln_blocking_wait_seconds_bucket{share="fs",le="0.25"} 214
+kiln_blocking_wait_seconds_bucket{share="fs",le="0.5"} 214
+kiln_blocking_wait_seconds_bucket{share="fs",le="1"} 214
+kiln_blocking_wait_seconds_bucket{share="fs",le="2.5"} 214
+kiln_blocking_wait_seconds_bucket{share="fs",le="5"} 214
+kiln_blocking_wait_seconds_bucket{share="fs",le="10"} 214
+kiln_blocking_wait_seconds_bucket{share="fs",le="25"} 214
+kiln_blocking_wait_seconds_bucket{share="fs",le="60"} 214
+kiln_blocking_wait_seconds_bucket{share="fs",le="+Inf"} 214
+kiln_blocking_wait_seconds_sum{share="fs"} 0.007841
+kiln_blocking_wait_seconds_count{share="fs"} 214
+# HELP kiln_blocking_run_seconds How long each blocking pool job ran, by share.
+# TYPE kiln_blocking_run_seconds histogram
+kiln_blocking_run_seconds_bucket{share="dns",le="0.00005"} 0
+kiln_blocking_run_seconds_bucket{share="dns",le="0.0001"} 0
+kiln_blocking_run_seconds_bucket{share="dns",le="0.00025"} 0
+kiln_blocking_run_seconds_bucket{share="dns",le="0.0005"} 0
+kiln_blocking_run_seconds_bucket{share="dns",le="0.001"} 0
+kiln_blocking_run_seconds_bucket{share="dns",le="0.0025"} 0
+kiln_blocking_run_seconds_bucket{share="dns",le="0.005"} 0
+kiln_blocking_run_seconds_bucket{share="dns",le="0.01"} 0
+kiln_blocking_run_seconds_bucket{share="dns",le="0.025"} 0
+kiln_blocking_run_seconds_bucket{share="dns",le="0.05"} 0
+kiln_blocking_run_seconds_bucket{share="dns",le="0.1"} 0
+kiln_blocking_run_seconds_bucket{share="dns",le="0.25"} 0
+kiln_blocking_run_seconds_bucket{share="dns",le="0.5"} 0
+kiln_blocking_run_seconds_bucket{share="dns",le="1"} 0
+kiln_blocking_run_seconds_bucket{share="dns",le="2.5"} 0
+kiln_blocking_run_seconds_bucket{share="dns",le="5"} 0
+kiln_blocking_run_seconds_bucket{share="dns",le="10"} 0
+kiln_blocking_run_seconds_bucket{share="dns",le="25"} 0
+kiln_blocking_run_seconds_bucket{share="dns",le="60"} 0
+kiln_blocking_run_seconds_bucket{share="dns",le="+Inf"} 0
+kiln_blocking_run_seconds_sum{share="dns"} 0
+kiln_blocking_run_seconds_count{share="dns"} 0
+kiln_blocking_run_seconds_bucket{share="store",le="0.00005"} 562
+kiln_blocking_run_seconds_bucket{share="store",le="0.0001"} 706
+kiln_blocking_run_seconds_bucket{share="store",le="0.00025"} 777
+kiln_blocking_run_seconds_bucket{share="store",le="0.0005"} 792
+kiln_blocking_run_seconds_bucket{share="store",le="0.001"} 793
+kiln_blocking_run_seconds_bucket{share="store",le="0.0025"} 793
+kiln_blocking_run_seconds_bucket{share="store",le="0.005"} 793
+kiln_blocking_run_seconds_bucket{share="store",le="0.01"} 793
+kiln_blocking_run_seconds_bucket{share="store",le="0.025"} 793
+kiln_blocking_run_seconds_bucket{share="store",le="0.05"} 793
+kiln_blocking_run_seconds_bucket{share="store",le="0.1"} 793
+kiln_blocking_run_seconds_bucket{share="store",le="0.25"} 793
+kiln_blocking_run_seconds_bucket{share="store",le="0.5"} 793
+kiln_blocking_run_seconds_bucket{share="store",le="1"} 793
+kiln_blocking_run_seconds_bucket{share="store",le="2.5"} 793
+kiln_blocking_run_seconds_bucket{share="store",le="5"} 793
+kiln_blocking_run_seconds_bucket{share="store",le="10"} 793
+kiln_blocking_run_seconds_bucket{share="store",le="25"} 793
+kiln_blocking_run_seconds_bucket{share="store",le="60"} 793
+kiln_blocking_run_seconds_bucket{share="store",le="+Inf"} 793
+kiln_blocking_run_seconds_sum{share="store"} 0.046001
+kiln_blocking_run_seconds_count{share="store"} 793
+kiln_blocking_run_seconds_bucket{share="fs",le="0.00005"} 189
+kiln_blocking_run_seconds_bucket{share="fs",le="0.0001"} 191
+kiln_blocking_run_seconds_bucket{share="fs",le="0.00025"} 198
+kiln_blocking_run_seconds_bucket{share="fs",le="0.0005"} 200
+kiln_blocking_run_seconds_bucket{share="fs",le="0.001"} 210
+kiln_blocking_run_seconds_bucket{share="fs",le="0.0025"} 212
+kiln_blocking_run_seconds_bucket{share="fs",le="0.005"} 212
+kiln_blocking_run_seconds_bucket{share="fs",le="0.01"} 212
+kiln_blocking_run_seconds_bucket{share="fs",le="0.025"} 212
+kiln_blocking_run_seconds_bucket{share="fs",le="0.05"} 213
+kiln_blocking_run_seconds_bucket{share="fs",le="0.1"} 213
+kiln_blocking_run_seconds_bucket{share="fs",le="0.25"} 213
+kiln_blocking_run_seconds_bucket{share="fs",le="0.5"} 214
+kiln_blocking_run_seconds_bucket{share="fs",le="1"} 214
+kiln_blocking_run_seconds_bucket{share="fs",le="2.5"} 214
+kiln_blocking_run_seconds_bucket{share="fs",le="5"} 214
+kiln_blocking_run_seconds_bucket{share="fs",le="10"} 214
+kiln_blocking_run_seconds_bucket{share="fs",le="25"} 214
+kiln_blocking_run_seconds_bucket{share="fs",le="60"} 214
+kiln_blocking_run_seconds_bucket{share="fs",le="+Inf"} 214
+kiln_blocking_run_seconds_sum{share="fs"} 0.361111
+kiln_blocking_run_seconds_count{share="fs"} 214
+# HELP kiln_blocking_places Each of the blocking pool's shares: the most of its jobs that run at once (crate::rt::Profile).
+# TYPE kiln_blocking_places gauge
+kiln_blocking_places{share="dns"} 4
+kiln_blocking_places{share="store"} 2
+kiln_blocking_places{share="fs"} 26
+# HELP kiln_memory_resident_bytes The process's resident memory by kind: anon (heap, stacks, what the allocator keeps), file (the binary's pages read in), shmem.
+# TYPE kiln_memory_resident_bytes gauge
+kiln_memory_resident_bytes{kind="anon"} 44384256
+kiln_memory_resident_bytes{kind="file"} 117665792
+kiln_memory_resident_bytes{kind="shmem"} 0
+# HELP kiln_memory_bytes Bytes each of the server's caches and buffers holds now, by owner.
+# TYPE kiln_memory_bytes gauge
+kiln_memory_bytes{owner="ui_assets"} 2985700
+kiln_memory_bytes{owner="bus"} 0
+# HELP kiln_memory_bound_bytes The most each owner of kiln_memory_bytes may hold, where that's known.
+# TYPE kiln_memory_bound_bytes gauge
+kiln_memory_bound_bytes{owner="ui_assets"} 2985700
+kiln_memory_bound_bytes{owner="bus"} 268435456
+# HELP kiln_convo_store_up Conversation stores linked to the server (1) or not (0).
+# TYPE kiln_convo_store_up gauge
+kiln_convo_store_up{store="server",role="server",machine="server",machine_id="",machine_name="server"} 1
+# HELP kiln_convo_store_bytes Each conversation store's file size.
+# TYPE kiln_convo_store_bytes gauge
+kiln_convo_store_bytes{store="server",role="server",machine="server",machine_id="",machine_name="server"} 77824
+# HELP kiln_convo_store_free_bytes The part of each store's file free for what comes next.
+# TYPE kiln_convo_store_free_bytes gauge
+kiln_convo_store_free_bytes{store="server",role="server",machine="server",machine_id="",machine_name="server"} 0
+# HELP kiln_convo_store_wal_bytes Each store's log (WAL) size.
+# TYPE kiln_convo_store_wal_bytes gauge
+kiln_convo_store_wal_bytes{store="server",role="server",machine="server",machine_id="",machine_name="server"} 131872
+# HELP kiln_convo_store_rev Each store's last write number: how many writes it has had.
+# TYPE kiln_convo_store_rev gauge
+kiln_convo_store_rev{store="server",role="server",machine="server",machine_id="",machine_name="server"} 0
+# HELP kiln_convo_store_sessions Sessions each store holds.
+# TYPE kiln_convo_store_sessions gauge
+kiln_convo_store_sessions{store="server",role="server",machine="server",machine_id="",machine_name="server"} 0
+# HELP kiln_convo_store_behind_rows Rows a store's feed hasn't delivered yet (a runner's to the server, the server's to a mirror).
+# TYPE kiln_convo_store_behind_rows gauge
+# HELP kiln_convo_store_commits_total Commits of each store's writer, since its kiln started.
+# TYPE kiln_convo_store_commits_total counter
+kiln_convo_store_commits_total{store="server",role="server",machine="server",machine_id="",machine_name="server"} 0
+# HELP kiln_convo_store_busy_milliseconds_total Time each store's writer was busy, since its kiln started.
+# TYPE kiln_convo_store_busy_milliseconds_total counter
+kiln_convo_store_busy_milliseconds_total{store="server",role="server",machine="server",machine_id="",machine_name="server"} 3
+# HELP kiln_convo_store_dropped_total Updates each store dropped while its writer couldn't keep up.
+# TYPE kiln_convo_store_dropped_total counter
+kiln_convo_store_dropped_total{store="server",role="server",machine="server",machine_id="",machine_name="server"} 0
+# HELP kiln_convo_store_read_timeouts_total Reads of each store that got no answer in time.
+# TYPE kiln_convo_store_read_timeouts_total counter
+kiln_convo_store_read_timeouts_total{store="server",role="server",machine="server",machine_id="",machine_name="server"} 0
+# HELP kiln_convo_feed_batches_total Feed batches: taken by the server, from a runner's store; sent to a mirror.
+# TYPE kiln_convo_feed_batches_total counter
+kiln_convo_feed_batches_total{store="server",role="server",machine="server",machine_id="",machine_name="server"} 0
+# HELP kiln_convo_feed_bytes_total Feed bytes on the wire, as for kiln_convo_feed_batches_total.
+# TYPE kiln_convo_feed_bytes_total counter
+kiln_convo_feed_bytes_total{store="server",role="server",machine="server",machine_id="",machine_name="server"} 0
+# HELP process_resident_memory_bytes Server RSS.
+# TYPE process_resident_memory_bytes gauge
+process_resident_memory_bytes 161894400
+# HELP process_cpu_seconds_total Server CPU time.
+# TYPE process_cpu_seconds_total counter
+process_cpu_seconds_total 7.88
+# HELP process_open_fds Open file descriptors.
+# TYPE process_open_fds gauge
+process_open_fds 32

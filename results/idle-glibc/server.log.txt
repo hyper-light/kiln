@@ -1,0 +1,25 @@
+2026-11-05T01:36:43.096422Z  INFO compute pool started size=2 threads: 4 CPUs: the cores this process may run on, less 2 shards priority=SCHED_BATCH at nice 19 lowered=2
+2026-11-05T01:36:43.115095Z  INFO agents' processes have no cgroups of their own here: they're found by their mark dir=/sys/fs/cgroup/system.slice/hosted-compute-agent.service/kiln-jobs-13584 error=Permission denied (os error 13)
+2026-11-05T01:36:43.704042Z  INFO the store's writes go through the cluster group (docs/p2p.md P1) group=true
+2026-11-05T01:36:43.704099Z  WARN a task held its shard past the watchdog's limit; new work went to other shards shard=0 task=0 spawned_at=crates/kiln/src/rt.rs:512:13 held_ms=16 cpu_ms=13 whose="task"
+2026-11-05T01:36:43.705538Z  INFO created kiln CA dir=/mnt/lab/idle-glibc/run/data/pki
+2026-11-05T01:36:43.706770Z  INFO issued server certificate
+2026-11-05T01:36:43.709763Z  INFO QUIC listening (hyper-transport on hyper-rt, mTLS) addr=Ok(127.0.0.1:42546)
+2026-11-05T01:36:43.718731Z  INFO conversations are kept in the store file=/mnt/lab/idle-glibc/run/data/harness/conversations.db
+2026-11-05T01:36:43.724636Z  INFO issued an identity identity=kiln server of hyper-light
+2026-11-05T01:36:43.725828Z  INFO sync's contents listed event="list" contents=0 whole=true ms=1
+2026-11-05T01:36:43.726002Z  INFO issued an identity identity=CD, for the kiln server of hyper-light
+2026-11-05T01:36:43.730336Z  INFO profiles opened uploads=0 segments=0 bytes=0 ms=0
+2026-11-05T01:36:43.735620Z  INFO observe's store has replayed its log applied=0 took_ms=0
+2026-11-05T01:36:43.758287Z  INFO kiln server started version="0.2.0" data=/mnt/lab/idle-glibc/run/data
+2026-11-05T01:36:43.758305Z  INFO tip: run under `kiln supervise -- server` (or `kiln install`) for automatic restarts
+2026-11-05T01:36:43.760597Z  INFO HTTP listening (hyper-rt) addr=127.0.0.1:52349 url=http://127.0.0.1:52349 https=false
+2026-11-05T01:36:43.760646Z  WARN a task held its shard past the watchdog's limit; new work went to other shards shard=0 task=0 spawned_at=crates/kiln/src/rt.rs:512:13 held_ms=16 cpu_ms=16 whose="task"
+2026-11-05T01:36:43.760860Z  WARN couldn't build every platform from the newest commit commit="1b42743eccd0" error=kiln doesn't build hyper-light/kiln (no repository of that name)
+2026-11-05T01:36:43.760879Z  INFO no UI server here (Bun or its files are missing): every page is the app's shell, rendered in the browser
+2026-11-05T01:36:43.761240Z  INFO made the server's push key (VAPID) path=/mnt/lab/idle-glibc/run/data/push/vapid.pk8
+2026-11-05T01:36:43.761762Z  INFO agents' processes have no cgroups of their own here: they're found by their mark dir=/sys/fs/cgroup/system.slice/hosted-compute-agent.service/kiln-agents-13584 error=Permission denied (os error 13)
+2026-11-05T01:36:43.761806Z  INFO agents' processes are held together by how=none (processes are found by their mark)
+2026-11-05T01:36:43.767092Z  INFO kiln-base is published in kiln's registry version="0.1.3" digest=sha256:11bb377c848d345db54dc16d49b0341c0f1f6e77e6f4947eee2e130bffcec689
+2026-11-05T01:36:43.767115Z  INFO supervised task finished child=kiln-base
+2026-11-05T01:37:43.079299Z  INFO shutting down
