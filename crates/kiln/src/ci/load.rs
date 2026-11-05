@@ -111,7 +111,7 @@ pub async fn load_from(src: &impl Source, sha: &str, setting: GithubWorkflows) -
             files.push((path.to_owned(), oid.to_owned(), kind));
         }
     }
-    let has_kiln = files.iter().any(|(_, _, k)| *k == FileKind::KilnWorkflow);
+    let has_kiln = files.iter().any(|(_, _, k)| k.is_kiln_workflow());
     let (run_github, note) = wf::github_workflows_run(setting, has_kiln);
     let overlays: HashMap<String, (String, String)> =
         files.iter().filter_map(|(p, oid, k)| if let FileKind::Overlay { stem } = k { Some((stem.clone(), (p.clone(), oid.clone()))) } else { None }).collect();

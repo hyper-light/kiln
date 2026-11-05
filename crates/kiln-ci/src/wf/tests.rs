@@ -283,6 +283,23 @@ fn file_kinds_and_precedence() {
 }
 
 #[test]
+fn w29_r27_code_workflows_are_kiln_workflows() {
+    assert_eq!(file_kind(".kiln/ci.ts"), Some(FileKind::CodeWorkflow));
+    assert_eq!(file_kind(".kiln/release.js"), Some(FileKind::CodeWorkflow));
+    assert_eq!(file_kind(".kiln/actions/x/index.ts"), None, "not an action's source");
+    assert_eq!(file_kind(".kiln/.ts"), None);
+    assert_eq!(file_kind(".github/workflows/ci.ts"), None);
+    assert!(FileKind::CodeWorkflow.is_kiln_workflow() && FileKind::KilnWorkflow.is_kiln_workflow());
+    assert!(!FileKind::GhaWorkflow.is_kiln_workflow() && !FileKind::Policy.is_kiln_workflow());
+    // W02-R02: a commit whose only kiln workflow is `.kiln/ci.ts` decides as one with `.kiln/ci.yaml`.
+    let kiln = |paths: &[&str]| paths.iter().any(|p| file_kind(p).is_some_and(|k| k.is_kiln_workflow()));
+    for setting in [GithubWorkflows::Auto, GithubWorkflows::On, GithubWorkflows::Off] {
+        let code = github_workflows_run(setting, kiln(&[".kiln/ci.ts", ".github/workflows/ci.yml"]));
+        assert_eq!(code, github_workflows_run(setting, kiln(&[".kiln/ci.yaml", ".github/workflows/ci.yml"])), "{setting:?}");
+    }
+}
+
+#[test]
 fn actions() {
     let (a, d) = parse_action("name: x\ninputs:\n  token:\n    required: 'true'\n    default: ${{ github.token }}\nruns:\n  using: composite\n  steps:\n    - run: echo hi\n    - run: echo\n      shell: bash\nbranding: {icon: x}\nweird: 1\n");
     let a = a.unwrap_or_default();
