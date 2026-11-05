@@ -130,6 +130,9 @@ pub fn init() {
     let _ = PROFILE.set(profile::start());
     #[cfg(all(feature = "jemalloc", target_os = "linux"))]
     let _ = hyper_rt::idle::when_cold(COLD_AFTER, give_back_thread_cache);
+    // Before anything opens a database: SQLite takes its allocator only before it's first used.
+    #[cfg(all(feature = "jemalloc", target_os = "linux"))]
+    let _ = SQLITE.set(sqlite::through_jemalloc());
     #[cfg(all(target_os = "linux", target_env = "gnu"))]
     {
         let tunables = std::env::var_os("GLIBC_TUNABLES").map(|t| t.to_string_lossy().into_owned());
@@ -188,6 +191,11 @@ fn jemalloc_said() -> Option<String> {
         said.push_str(", though its background threads didn't start: it purges only as its arenas are used");
     }
     said.push_str(&format!("; a pool's worker idle {} s gives its thread's cache back", COLD_AFTER.as_secs()));
+    said.push_str(match SQLITE.get() {
+        Some(true) => "; SQLite allocates through it",
+        Some(false) => "; SQLite refused it (it was in use already), so it allocates through the C library's malloc",
+        None => "",
+    });
     #[cfg(feature = "jemalloc-prof")]
     if let Some(profile) = PROFILE.get() {
         said.push_str(&profile.said());
@@ -264,6 +272,105 @@ fn give_back_thread_cache() {
     // SAFETY: the name ends in a NUL; `thread.tcache.flush` reads and writes nothing of the caller's (no `oldp`, no
     // `newp`), and acts on the calling thread's cache alone.
     let _ = unsafe { tikv_jemalloc_sys::mallctl(c"thread.tcache.flush".as_ptr(), std::ptr::null_mut(), std::ptr::null_mut(), std::ptr::null_mut(), 0) };
+}
+
+/// Whether SQLite took jemalloc as its allocator ([`init`]).
+#[cfg(all(feature = "jemalloc", target_os = "linux"))]
+static SQLITE: OnceLock<bool> = OnceLock::new();
+
+/// SQLite's allocations through jemalloc, not the C library's malloc (goal 11, plan 01a1a87b2e56 step 5).
+/// jemalloc is the binary's allocator under the prefix tikv-jemalloc-sys gives it (`_rjem_`), so the C libraries
+/// linked in allocate through the C library's malloc still: on the static musl build, musl's, whose groups held
+/// 18 to 24 MB of the server's anonymous memory in the lab (alloc2, the musl-jemalloc rounds: 167 to 262
+/// mappings under 1 MiB, none of them jemalloc's, whose every mapping is 2 MiB or more), SQLite's page caches,
+/// schemas, statements and lookaside nearly all of it (7.4 MB live in the train-4 heap profile, where a preloaded
+/// jemalloc took the C libraries' allocations too). Through jemalloc they share its size classes, its purging and
+/// its statistics. SQLite takes an allocator only before it's first used (`sqlite3_config`, `SQLITE_CONFIG_MALLOC`),
+/// so [`init`], `main`'s first call, gives it; a process that used SQLite already is refused, and keeps the C
+/// library's.
+#[cfg(all(feature = "jemalloc", target_os = "linux"))]
+mod sqlite {
+    use std::ffi::{c_int, c_void};
+
+    use rusqlite::ffi;
+
+    /// `xMalloc`: `n` bytes, none for none.
+    #[allow(unsafe_code)]
+    unsafe extern "C" fn malloc(n: c_int) -> *mut c_void {
+        match usize::try_from(n) {
+            // SAFETY: jemalloc's malloc, for a size of at least one byte.
+            Ok(n) if n > 0 => unsafe { tikv_jemalloc_sys::malloc(n) },
+            _ => std::ptr::null_mut(),
+        }
+    }
+
+    /// `xFree`: what `malloc` or `realloc` gave.
+    #[allow(unsafe_code)]
+    unsafe extern "C" fn free(p: *mut c_void) {
+        // SAFETY: SQLite frees only what this allocator gave it, once (or a null, which jemalloc ignores).
+        unsafe { tikv_jemalloc_sys::free(p) }
+    }
+
+    /// `xRealloc`: `p` grown or shrunk to `n` bytes (SQLite asks for at least one: a size `roundup` gave).
+    #[allow(unsafe_code)]
+    unsafe extern "C" fn realloc(p: *mut c_void, n: c_int) -> *mut c_void {
+        match usize::try_from(n) {
+            // SAFETY: `p` is this allocator's (or null), and the size at least one byte.
+            Ok(n) if n > 0 => unsafe { tikv_jemalloc_sys::realloc(p, n) },
+            _ => std::ptr::null_mut(),
+        }
+    }
+
+    /// `xSize`: the bytes `p` holds.
+    #[allow(unsafe_code)]
+    unsafe extern "C" fn size(p: *mut c_void) -> c_int {
+        if p.is_null() {
+            return 0;
+        }
+        // SAFETY: `p` is a live allocation of this allocator's.
+        let n = unsafe { tikv_jemalloc_sys::malloc_usable_size(p) };
+        c_int::try_from(n).unwrap_or(c_int::MAX)
+    }
+
+    /// `xRoundup`: the size an allocation of `n` bytes takes (jemalloc's size class).
+    #[allow(unsafe_code)]
+    unsafe extern "C" fn roundup(n: c_int) -> c_int {
+        let Ok(want) = usize::try_from(n) else {
+            return n;
+        };
+        if want == 0 {
+            return 0;
+        }
+        // SAFETY: nallocx only computes a size class; it allocates nothing.
+        let got = unsafe { tikv_jemalloc_sys::nallocx(want, 0) };
+        if got == 0 { n } else { c_int::try_from(got).unwrap_or(n) }
+    }
+
+    /// `xInit` and `xShutdown`: jemalloc needs neither.
+    extern "C" fn init(_: *mut c_void) -> c_int {
+        ffi::SQLITE_OK
+    }
+
+    extern "C" fn shutdown(_: *mut c_void) {}
+
+    /// Gives SQLite jemalloc as its allocator: whether it took it (it doesn't once it's been used).
+    #[allow(unsafe_code)]
+    pub(super) fn through_jemalloc() -> bool {
+        let methods = ffi::sqlite3_mem_methods {
+            xMalloc: Some(malloc),
+            xFree: Some(free),
+            xRealloc: Some(realloc),
+            xSize: Some(size),
+            xRoundup: Some(roundup),
+            xInit: Some(init),
+            xShutdown: Some(shutdown),
+            pAppData: std::ptr::null_mut(),
+        };
+        // SAFETY: SQLITE_CONFIG_MALLOC takes a pointer to a `sqlite3_mem_methods`, which SQLite copies before the call
+        // returns (sqlite3_config(3)); its functions are this module's, thread-safe as jemalloc is. SQLite refuses
+        // (SQLITE_MISUSE) once it's initialized, changing nothing.
+        unsafe { ffi::sqlite3_config(ffi::SQLITE_CONFIG_MALLOC, &raw const methods) == ffi::SQLITE_OK }
+    }
 }
 
 /// What the allocator holds, in bytes, by what it holds it for: jemalloc's statistics (`stats.*` in its
@@ -686,6 +793,35 @@ mod tests {
         // The 20 blocks freed wait in the thread's cache (a 4 KiB size keeps 20, tcache_nslots_small_min; a full one
         // keeps half as it takes more); given back, none of them.
         anyhow::ensure!(freed >= given.saturating_add(10 * 4096), "freed {freed}, given back {given}");
+        Ok(())
+    }
+
+    /// SQLite allocates through jemalloc once given it before its first use: its pages show in jemalloc's
+    /// statistics, and go from them with the database (goal 11, plan 01a1a87b2e56 step 5). SQLite takes an
+    /// allocator only before it's first used, and this test binary's other tests use it, so this runs again in a
+    /// process of its own (this test's binary, this test alone).
+    #[cfg(all(feature = "jemalloc", target_os = "linux"))]
+    #[test]
+    fn g11_s5_sqlite_allocates_through_jemalloc() -> anyhow::Result<()> {
+        const ALONE: &str = "KILN_TEST_SQLITE_ALONE";
+        if std::env::var_os(ALONE).is_none() {
+            let me = format!("{}::g11_s5_sqlite_allocates_through_jemalloc", module_path!().split_once("::").map_or("", |(_, path)| path));
+            let out = std::process::Command::new(std::env::current_exe()?).args(["--exact", me.as_str(), "--nocapture", "--test-threads=1"]).env(ALONE, "1").output()?;
+            let said = String::from_utf8_lossy(&out.stdout);
+            anyhow::ensure!(out.status.success(), "alone ({}): {said}{}", out.status, String::from_utf8_lossy(&out.stderr));
+            anyhow::ensure!(said.contains("1 passed"), "{me} didn't run alone: {said}");
+            return Ok(());
+        }
+        anyhow::ensure!(sqlite::through_jemalloc(), "SQLite took jemalloc before its first use");
+        let before = stats().unwrap_or_default().allocated;
+        let conn = rusqlite::Connection::open_in_memory()?;
+        // 40,000 rows of 100 random bytes: 4 MB of pages, an in-memory database's all held by its page cache.
+        conn.execute_batch("CREATE TABLE t(x); WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < 40000) INSERT INTO t SELECT randomblob(100) FROM n;")?;
+        let held = stats().unwrap_or_default().allocated;
+        anyhow::ensure!(held >= before.saturating_add(2 << 20), "SQLite's pages through jemalloc: {before} then {held}");
+        drop(conn);
+        let after = stats().unwrap_or_default().allocated;
+        anyhow::ensure!(after.saturating_add(2 << 20) <= held, "given back with the database: {held} then {after}");
         Ok(())
     }
 
