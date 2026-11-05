@@ -1354,7 +1354,10 @@ reading and writing `Vec<u8>` a byte at a time. Of the whole server's CPU, a thi
   - The runner writes a certificate's file with no lock held, on the blocking pool (`given_off`).
   - The rarer signatures and checks run on the compute or blocking pool: kiln's own hand-ons, receipts, passes and
     carries; a person's receipt or hand-on; review verdicts; a leg's records and kiln's receipt of them; KilnCD's
-    records and promotions; the store of bytes; a commit kiln signs.
+    records and promotions; the store of bytes; a commit kiln signs. Then a land's signature and a revision's
+    VSA (`identities::sign_as_off`) and a hand-over's word (`custody::word_off`).
+  - The programs' `list` and `enforce`, and the goal stacks' words said again, find their sessions by id as the
+    registry shares them (`Registry::info_shared`), none copied.
 
 ### Step 3's check
 

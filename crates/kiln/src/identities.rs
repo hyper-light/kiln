@@ -106,6 +106,14 @@ pub fn sign_as(pki: &crate::pki::Pki, kind: &str, payload_type: &str, payload: &
     Ok(statement::bundle(payload_type, payload, &signature, &certificate))
 }
 
+/// [`sign_as`] on the blocking pool, off the shards (goal 9, plan 01a1a87b2cec step 3): the key and its certificate
+/// are read from their files each time ([`sign_own`]), then signed with, which a land's and a revision's VSA did on
+/// the shard of the task that asked.
+pub async fn sign_as_off(pki: &Arc<crate::pki::Pki>, kind: &str, payload_type: &str, payload: Vec<u8>) -> anyhow::Result<serde_json::Value> {
+    let (pki, kind, payload_type) = (Arc::clone(pki), kind.to_owned(), payload_type.to_owned());
+    crate::rt::blocking(move || sign_as(&pki, &kind, &payload_type, &payload)).await?
+}
+
 /// The server's delegation of attempt `attempt` of leg `job` to the identity `uri` it just
 /// certified (`cert_pem`), signed as itself and kept as taken now (W27-R05, R06;
 /// [`kiln_ci::attest::leg::delegation`]): about what kiln handed it (the commit its certificate

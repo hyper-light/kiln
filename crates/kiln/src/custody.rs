@@ -639,6 +639,13 @@ pub fn word(pki: &crate::pki::Pki, session: &str, command: &str, machine: &str, 
     word_signed(&|payload_type, s| server_signed_as(pki, payload_type, s), session, command, machine, instance, epoch)
 }
 
+/// [`word`] on the compute pool, off the shards (goal 9, plan 01a1a87b2cec step 3): the server's key and certificate
+/// read from their files, and the signature, for each hand-over's word kiln sends a runner process.
+pub async fn word_off(pki: &std::sync::Arc<crate::pki::Pki>, session: &str, command: &str, machine: &str, instance: &str, epoch: u64) -> anyhow::Result<String> {
+    let (pki, session, command, machine, instance) = (std::sync::Arc::clone(pki), session.to_owned(), command.to_owned(), machine.to_owned(), instance.to_owned());
+    crate::rt::compute(move || word(&pki, &session, &command, &machine, &instance, epoch)).await?
+}
+
 /// [`word`], signed by `sign` (kiln's server's key: a payload type and a statement to its bundle),
 /// as the transfers simulation (`crate::sim::transfers`) signs one with its own server's.
 pub fn word_signed(sign: &dyn Fn(&str, &statement::Statement) -> anyhow::Result<Value>, session: &str, command: &str, machine: &str, instance: &str, epoch: u64) -> anyhow::Result<String> {
@@ -2320,6 +2327,7 @@ mod tests {
         let code = |file: &str| file.split("\n#[cfg(test)]\nmod tests {").next().unwrap_or_default().lines().map(|l| l.split("//").next().unwrap_or_default()).collect::<Vec<_>>().join("\n");
         let (custody, verdicts, signed, cd, blobs, revision) = (code(include_str!("custody.rs")), code(include_str!("ci/verdicts.rs")), code(include_str!("ci/signed.rs")), code(include_str!("cd/custody.rs")), code(include_str!("custody/blobs.rs")), code(include_str!("ci/revision.rs")));
         let promotion = code(include_str!("deploy/promotion.rs"));
+        let (vsa, lands, handovers) = (code(include_str!("verify.rs")), code(include_str!("ci/lands.rs")), code(include_str!("handovers.rs")));
         // Where a function's body ends: a free function's brace, or a method's in its `impl`.
         let (free, method) = ("\n}\n", "\n    }\n");
         let moved = [
@@ -2342,11 +2350,14 @@ mod tests {
             (signed.as_str(), "async fn receipt(", free, "crate::rt::blocking(move || crate::identities::sign_as(&pki, "),
             (promotion.as_str(), "pub async fn hand_on(", free, "crate::custody::cd_signed_off(&d.hub.pki, "),
             (promotion.as_str(), "pub async fn receipt(", free, "crate::custody::cd_signed_off(&d.hub.pki, "),
+            (vsa.as_str(), "pub async fn vsa(", free, "crate::identities::sign_as_off(&hub.pki, "),
+            (lands.as_str(), "async fn keep(", free, "crate::identities::sign_as_off(&hub.pki, "),
+            (handovers.as_str(), "pub(crate) async fn worded(", method, "crate::custody::word_off(&self.pki, "),
         ];
         for (src, head, end, off) in moved {
             let b = src.split(head).nth(1).and_then(|rest| rest.split(end).next()).unwrap_or_default();
             assert!(!b.is_empty(), "{head} not found");
-            for on_shard in ["statement::verify(", "server_signed(&", "cd_signed(&", "sign_own(", "against.check(hub", "sign_as(&hub.pki"] {
+            for on_shard in ["statement::verify(", "server_signed(&", "cd_signed(&", "sign_own(", "against.check(hub", "sign_as(&hub.pki", "custody::word(&self.pki"] {
                 assert!(!b.contains(on_shard), "{head} calls {on_shard} on its shard: {b}");
             }
             assert!(b.contains(off), "{head} doesn't hand its signature or check to a pool ({off}): {b}");
@@ -2640,6 +2651,40 @@ mod tests {
             assert!(check(&command, "main", Some(3)).is_err_and(|w| w.contains("isn't signed")), "unsigned, from a server that signs words");
             assert_eq!(word_for_me("s1", &command, false, &root, "fedora", "main", Some(3)), Ok(()), "unsigned, from a server from before");
             assert_eq!(check(&serde_json::to_string(&Command::Interrupt)?, "01a17502", None), Ok(()), "not a hand-over's word");
+            Ok(())
+        })
+    }
+
+    /// Goal 9, plan 01a1a87b2cec step 3: a hand-over's word and a statement kiln signs as its server, made on the pools
+    /// (`word_off`, `identities::sign_as_off`), are what the caller's thread made: the same command and word for the same
+    /// process at the same epoch, a statement over the same payload, each verifying to kiln's root as its server.
+    #[test]
+    fn g9_s3_words_and_statements_signed_off_the_shards_are_as_before() -> anyhow::Result<()> {
+        use crate::harness::model::Command;
+        use crate::runner::custody::word_for_me;
+        crate::rt::block_on(async {
+            let dir = tempfile::tempdir()?;
+            let store = Store::in_memory()?;
+            let pki = std::sync::Arc::new(crate::pki::Pki::open_scratch(&dir.path().join("pki"))?);
+            crate::identities::own_identities(&store, &pki).await?;
+            let root = pki.ca_der.clone();
+            let command = serde_json::to_string(&Command::HandedOver { error: None, unsure: false, by_newest: false, none_newer: false })?;
+            let (here, off) = (word(&pki, "s1", &command, "fedora", "main", 3)?, word_off(&pki, "s1", &command, "fedora", "main", 3).await?);
+            let (here_v, off_v): (Value, Value) = (serde_json::from_str(&here)?, serde_json::from_str(&off)?);
+            anyhow::ensure!(unworded(&here_v) == unworded(&off_v), "the same command");
+            anyhow::ensure!(word_for_me("s1", &off, true, &root, "fedora", "main", Some(3)) == Ok(()), "for that process at its epoch");
+            let said = |v: &Value| -> anyhow::Result<(String, statement::Statement, String)> {
+                let bundle: Value = serde_json::from_str(v.get("word").and_then(Value::as_str).unwrap_or_default())?;
+                let c = statement::verify(&bundle, &root, &[], crate::util::now_unix()).map_err(|e| anyhow::anyhow!("{e}"))?;
+                Ok((c.digest, c.statement, c.custodian))
+            };
+            anyhow::ensure!(said(&here_v)? == said(&off_v)?, "the same word, by kiln's server");
+            let payload = statement::payload(&statement::Statement::new(json!({"why": "a land of kiln's"}))).map_err(|e| anyhow::anyhow!("{e}"))?;
+            let signed = crate::identities::sign_as_off(&pki, "server", PAYLOAD_CUSTODY, payload.clone()).await?;
+            let c = statement::verify(&signed, &root, &[], crate::util::now_unix()).map_err(|e| anyhow::anyhow!("{e}"))?;
+            let inline = crate::identities::sign_as(&pki, "server", PAYLOAD_CUSTODY, &payload)?;
+            let d = statement::verify(&inline, &root, &[], crate::util::now_unix()).map_err(|e| anyhow::anyhow!("{e}"))?;
+            anyhow::ensure!(c.digest == d.digest && c.custodian == d.custodian && c.payload_type == d.payload_type, "the same statement, by kiln's server");
             Ok(())
         })
     }

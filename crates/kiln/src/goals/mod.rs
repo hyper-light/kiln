@@ -585,13 +585,32 @@ async fn resay<P>(port: &P, now: i64)
 where
     P: HarnessPort<Agent = Info, Command = Command>,
 {
+    resay_on(port, None, now).await;
+}
+
+/// [`resay`], each agent with a word kept found by its id through `hub` where the driver has one (it's the port then):
+/// its info as the registry shares it, not copied, under the stacks' lock (goal 9, plan 01a1a87b2cec step 3: the
+/// port's `agent` copied each one's whole info).
+async fn resay_on<P>(port: &P, hub: Option<&Hub>, now: i64)
+where
+    P: HarnessPort<Agent = Info, Command = Command>,
+{
     let agents: Vec<String> = SAID.lock().keys().cloned().collect();
-    let infos: Vec<(String, Info)> = agents.into_iter().filter_map(|a| port.agent(&a).map(|i| (a, i))).collect();
+    let infos: Vec<(String, Arc<Info>)> = agents
+        .into_iter()
+        .filter_map(|a| {
+            let info = match hub {
+                Some(hub) => hub.harness.info_shared(&a),
+                None => port.agent(&a).map(Arc::new),
+            };
+            info.map(|i| (a, i))
+        })
+        .collect();
     let lost: Vec<(String, Word)> = {
         let mut said = SAID.lock();
         let mut lost = Vec::new();
         for (agent, info) in &infos {
-            if said.get_mut(agent).is_some_and(|w| w.msg.look_heard(Some(info), now) == Now::Gone)
+            if said.get_mut(agent).is_some_and(|w| w.msg.look_heard(Some(&**info), now) == Now::Gone)
                 && let Some(w) = said.remove(agent)
                 && w.msg.lost()
             {
@@ -2078,7 +2097,7 @@ where
         // What the stacks said that an edit may not have got to their agents: said again.
         {
             let _one = changing.turn().await;
-            resay(self.port, self.clock.unix_ms()).await;
+            resay_on(self.port, self.hub.map(|h| &**h), self.clock.unix_ms()).await;
         }
         let waiting: Vec<String> = self
             .store
@@ -3213,6 +3232,17 @@ mod tests {
         assert_eq!(quiet, ["held", "limit"]);
         let looked_at: Vec<&str> = keep_going(&all, &["driven".to_owned()], &["waits".to_owned()], &quiet).into_iter().map(|i| i.id.as_str()).collect();
         assert_eq!(looked_at, ["free"]);
+    }
+
+    /// Goal 9, plan 01a1a87b2cec step 3: the stacks' words said again (`resay`) find their agents by id through the hub
+    /// where the driver has one, as the registry shares them, under the stacks' lock, none copied; with the port alone
+    /// (the driver's tests) through the port, as before, which the resay tests go through.
+    #[test]
+    fn g9_s3_words_said_again_find_their_agents_by_id_none_copied() {
+        let code: String = include_str!("mod.rs").split("\n#[cfg(test)]\nmod tests {").next().unwrap_or_default().lines().map(|l| l.split("//").next().unwrap_or_default()).collect::<Vec<_>>().join("\n");
+        let body = code.split("async fn resay_on<P>(").nth(1).and_then(|rest| rest.split("\n}\n").next()).unwrap_or_default();
+        assert!(body.contains("Some(hub) => hub.harness.info_shared(&a)") && body.contains("None => port.agent(&a).map(Arc::new)"), "{body}");
+        assert!(code.contains("resay_on(self.port, self.hub.map(|h| &**h), self.clock.unix_ms()).await;"), "the driver's round goes through the hub");
     }
 
     /// Goal 9, plan 01a1a87b2cec step 3: `keep_going`, each agent looked up in one set of those

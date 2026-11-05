@@ -448,3 +448,28 @@ fn a_program_shows_each_track_s_worker_goal_pass_and_slot_and_holds_the_usage_ru
         Ok(())
     })
 }
+
+/// Goal 9, plan 01a1a87b2cec step 3: the programs find their sessions as the registry shares them, none copied:
+/// `list` reads them shared, and `enforce` looks each worker up by its id (`Registry::info_shared`), where it copied
+/// every session's whole info and scanned it for each. A session found so is the one `Registry::info` copies; what
+/// each finds of a program is the other tests'.
+#[test]
+fn g9_s3_programs_find_their_sessions_by_id_none_copied() -> anyhow::Result<()> {
+    use crate::harness::core::Update;
+    use crate::harness::registry::Location;
+    let code = include_str!("mod.rs").lines().map(|l| l.split("//").next().unwrap_or_default()).collect::<Vec<_>>().join("\n");
+    let body = |head: &str| code.split(head).nth(1).and_then(|rest| rest.split("\n}\n").next()).unwrap_or_default().to_owned();
+    let (listed, enforced) = (body("pub async fn list(hub: &Hub)"), body("async fn enforce_all(hub: &Hub)"));
+    anyhow::ensure!(listed.contains("hub.harness.list_shared()") && !listed.contains("harness.list()"), "list: {listed}");
+    anyhow::ensure!(enforced.contains("hub.harness.info_shared(&agent)") && !enforced.contains("harness.list()") && !enforced.contains(".iter().find("), "enforce: {enforced}");
+    crate::rt::block_on(async {
+        let hub = crate::hub::tests::scratch_hub().await?;
+        let there = Location::Machine("g9s3-box".into());
+        let info = Info { id: "g9s3-w".into(), kind: "claude".into(), name: "Worker".into(), pause_at: Some(80), ..Info::default() };
+        hub.harness.ingest(&hub, &there, "g9s3-w", Update::Open { info: Box::new(info), since: None }).await;
+        let shared = hub.harness.info_shared("g9s3-w").map(|i| Info::clone(&i));
+        anyhow::ensure!(shared.is_some() && shared == hub.harness.info("g9s3-w"), "the same session: {shared:?}");
+        anyhow::ensure!(hub.harness.info_shared("g9s3-gone").is_none(), "none for a session that isn't there");
+        Ok(())
+    })
+}
