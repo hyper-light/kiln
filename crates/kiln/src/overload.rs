@@ -25,8 +25,8 @@
 //!   timeout (research f18: starvation that fails health checks cascades), and the soonest `Retry-After` brings a
 //!   shed client back (HTTP's unit, a second).
 //! - **Past its calm**: a period's wait past the calm and past the floor, the shard's quantum (a shorter wait is no
-//!   queue: a task waits that long behind the poll running as it woke, whatever the load; a probe's floor adds its
-//!   timer's tick, a lateness the shard's timers have by design).
+//!   queue: a task waits that long behind the poll running as it woke, whatever the load; a probe's floor adds the
+//!   wheel's tick and the thread's timer slack, the tick again, a lateness the shard's timers have by design).
 //! - **A shard's queue stands** while most of the last tolerance's periods were past its calm (its median wait over
 //!   a tolerance past its calm) and, where the OS keeps a thread's CPU time (Linux, macOS), the shard ran most of
 //!   that tolerance. Most, not every: a shard 82% busy under the lab's flood, its probes 6 ms late at the median and
@@ -609,8 +609,8 @@ thread_local! {
 ///
 /// - **Normal** (the API) sheds on the shard's delay: the probe is a Normal task, so its lateness is what the
 ///   API's own work waits on the shard, the classes ahead of it and its own share counted. Its floor is the
-///   quantum and the timer's tick: a probe that waited for the poll running as its timer fell due, and for the
-///   tick, waited for no queue.
+///   quantum, the wheel's tick and the thread's timer slack: a probe that waited for the poll running as its timer
+///   fell due, and for its timer's own lateness by design, waited for no queue.
 /// - **Background** sheds on what the shard's Background tasks waited, from joining a ready list to their polls,
 ///   over the period (`Counters::queue_ns_background`): Background work waits behind its own kind alone and a
 ///   share of the others', so its own flood shows there and not in the API's delay. A period with no Background
@@ -624,7 +624,9 @@ pub fn tick(index: usize, late: Duration, cpu_ns: Option<u64>) {
         return;
     };
     let quantum_ns = hyper_rt::futures::step_budget_ns().unwrap_or(0);
-    let probe_floor_ns = quantum_ns.saturating_add(hyper_rt::futures::timer_tick_ns());
+    // A probe's lateness by design: up to the wheel's tick, and the thread's timer slack, which the shard sets to its
+    // tick (`hyper_rt`'s `Driver::set_timer_slack_ns`; `crate::shard_health`).
+    let probe_floor_ns = quantum_ns.saturating_add(hyper_rt::futures::timer_tick_ns().saturating_mul(2));
     WATCHES.with(|cell| {
         let mut held = cell.borrow_mut();
         let w = held.get_or_insert_with(|| Watches {
@@ -1052,9 +1054,10 @@ mod tests {
 
     /// Goal 1's probe period, the watches' tick, µs.
     const PERIOD_US: u64 = 10_000;
-    /// The server's step quantum (`crate::rt::STEP_BUDGET_NS`), and a probe's floor: the quantum and the timer's tick.
+    /// The server's step quantum (`crate::rt::STEP_BUDGET_NS`), and a probe's floor: the quantum, the wheel's tick and the
+    /// thread's timer slack (the tick again), 100 µs each.
     const QUANTUM_NS: u64 = crate::rt::STEP_BUDGET_NS;
-    const PROBE_FLOOR_NS: u64 = crate::rt::STEP_BUDGET_NS + 100_000;
+    const PROBE_FLOOR_NS: u64 = crate::rt::STEP_BUDGET_NS + 2 * 100_000;
 
     /// A pool's line replayed: each period as its watch reads it (the mean and longest wait told over it, a share
     /// telling each job's wait as it ends; whether a job waited at its tick), and the trace's own numbers, held to
