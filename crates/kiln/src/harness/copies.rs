@@ -1418,6 +1418,9 @@ pub struct RunnerUpdate {
     pub shipped: bool,
     /// When its frame came off the wire: what its wait to be taken is measured from (`crate::route_latency`).
     pub arrived: Option<std::time::Instant>,
+    /// When the hub's loop handed it to this owner's inbox: its wait's last leg is from there
+    /// (`crate::route_latency::RunnerLeg::ToOwner`).
+    pub handed: Option<std::time::Instant>,
 }
 
 type Job = Box<dyn FnOnce(&mut Shard) + Send>;

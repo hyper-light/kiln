@@ -94,6 +94,74 @@ pub fn routes() -> &'static Routes {
     R.get_or_init(Routes::new)
 }
 
+/// The legs of a runner's message's wait, apart (goal 10, plan 01a1a87b2dae step 4: the runner class's wait
+/// was 2.8 ms at p99 with each session's updates taken by the shard that owns its copy, and which leg it
+/// spends that in decides what's cut). On `/metrics` as `kiln_runner_wait_leg_seconds`, beside
+/// `kiln_route_wait_seconds{class="runner"}`, which is their sum for an agent session's update.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RunnerLeg {
+    /// From the network thread handing a frame over to the hub's loop taking it: every frame's.
+    ToLoop,
+    /// From the hub's loop taking an agent session's update to handing it to the inbox of the shard that
+    /// owns the session's copy: its frame read, its channel item's place checked, what it carries read.
+    InLoop,
+    /// From that hand-over to the owner taking the update: the wait for room in its inbox, then for the
+    /// owner, on its own shard.
+    ToOwner,
+}
+
+impl RunnerLeg {
+    pub const ALL: [RunnerLeg; 3] = [RunnerLeg::ToLoop, RunnerLeg::InLoop, RunnerLeg::ToOwner];
+
+    pub fn name(self) -> &'static str {
+        match self {
+            RunnerLeg::ToLoop => "to_loop",
+            RunnerLeg::InLoop => "in_loop",
+            RunnerLeg::ToOwner => "to_owner",
+        }
+    }
+
+    fn index(self) -> usize {
+        match self {
+            RunnerLeg::ToLoop => 0,
+            RunnerLeg::InLoop => 1,
+            RunnerLeg::ToOwner => 2,
+        }
+    }
+}
+
+/// Each leg's histogram, in [`RunnerLeg::ALL`]'s order, to the microsecond below a few milliseconds as the
+/// shards' delay is (`crate::shard_health::DELAY_BUCKETS`): a leg's p99 sits about a millisecond.
+pub struct Legs([Histogram; 3]);
+
+impl Legs {
+    fn new() -> Self {
+        Self(std::array::from_fn(|_| Histogram::new(crate::shard_health::DELAY_BUCKETS)))
+    }
+
+    /// A runner's message spent `took` on `leg`.
+    pub fn observe(&self, leg: RunnerLeg, took: Duration) {
+        if let Some(h) = self.0.get(leg.index()) {
+            h.observe(took.as_secs_f64());
+        }
+    }
+
+    pub fn of(&self, leg: RunnerLeg) -> Option<&Histogram> {
+        self.0.get(leg.index())
+    }
+}
+
+/// The server's.
+pub fn legs() -> &'static Legs {
+    static L: OnceLock<Legs> = OnceLock::new();
+    L.get_or_init(Legs::new)
+}
+
+/// A runner's message spent `took` on `leg`, on the server's histograms.
+pub fn observe_leg(leg: RunnerLeg, took: Duration) {
+    legs().observe(leg, took);
+}
+
 /// Work of `class` that waited `wait` and took `took`, on the server's histograms.
 pub fn observe(class: Class, wait: Option<Duration>, took: Duration) {
     routes().observe(class, wait, took);
@@ -207,6 +275,16 @@ pub fn render(o: &mut String) {
             took.render(o, "kiln_route_seconds", &format!("class=\"{}\"", c.name()));
         }
     }
+    let _ = writeln!(
+        o,
+        "# HELP kiln_runner_wait_leg_seconds A runner's message's wait, by leg: to_loop (to the hub's loop taking its frame, every frame's), in_loop (that loop handing an agent session's update to its owner's inbox), to_owner (that owner taking it).\n# TYPE kiln_runner_wait_leg_seconds histogram"
+    );
+    let l = legs();
+    for leg in RunnerLeg::ALL {
+        if let Some(h) = l.of(leg) {
+            h.render(o, "kiln_runner_wait_leg_seconds", &format!("leg=\"{}\"", leg.name()));
+        }
+    }
 }
 
 #[cfg(test)]
@@ -289,5 +367,27 @@ mod tests {
             assert!(o.contains(&format!("kiln_route_seconds_count{{class=\"{}\"}}", c.name())), "{} rendered", c.name());
             assert!(o.contains(&format!("kiln_route_wait_seconds_bucket{{class=\"{}\",le=\"0.00005\"}}", c.name())), "{} rendered", c.name());
         }
+    }
+
+    /// Goal 10, plan 01a1a87b2dae step 4: a runner's message's wait moves its own leg's histogram alone, to the
+    /// microsecond, and each leg is rendered, its family beside the runner class's.
+    #[test]
+    fn g10_s4_a_runners_wait_is_told_apart_by_its_legs() {
+        let l = Legs::new();
+        l.observe(RunnerLeg::InLoop, Duration::from_micros(40));
+        l.observe(RunnerLeg::ToOwner, Duration::from_micros(900));
+        l.observe(RunnerLeg::ToOwner, Duration::from_micros(1100));
+        let counts: Vec<u64> = RunnerLeg::ALL.iter().map(|leg| l.of(*leg).map_or(0, Histogram::count)).collect();
+        assert_eq!(counts, vec![0, 1, 2]);
+        // Finer than a millisecond: 0.9 ms and 1.1 ms land in buckets apart.
+        let at = |bound: f64| l.of(RunnerLeg::ToOwner).and_then(|h| h.cumulative().into_iter().find(|(b, _)| (*b - bound).abs() < 1e-12).map(|(_, n)| n));
+        assert_eq!((at(0.001), at(0.00125)), (Some(1), Some(2)));
+        let mut o = String::new();
+        observe_leg(RunnerLeg::ToLoop, Duration::from_micros(10));
+        render(&mut o);
+        for leg in RunnerLeg::ALL {
+            assert!(o.contains(&format!("kiln_runner_wait_leg_seconds_count{{leg=\"{}\"}}", leg.name())), "{} rendered", leg.name());
+        }
+        assert!(o.contains("kiln_runner_wait_leg_seconds_bucket{leg=\"to_loop\",le=\"0.00001\"}"), "the shards' delay buckets");
     }
 }

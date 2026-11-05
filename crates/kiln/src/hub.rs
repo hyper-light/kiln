@@ -477,6 +477,15 @@ pub enum TermOut {
     Gone,
 }
 
+/// A runner's frame on its way to being taken (goal 10, plan 01a1a87b2dae step 4): when it came off the wire
+/// and when the hub's loop took it. Handed down with it, and taken by what times it elsewhere: an agent
+/// session's update, by the shard that owns its copy (`Hub::runner_update`).
+#[derive(Clone, Copy)]
+struct Arrived {
+    at: Instant,
+    taken: Instant,
+}
+
 pub struct Hub {
     pub cfg: Arc<Config>,
     pub store: Store,
@@ -2198,11 +2207,16 @@ impl Hub {
         while let Ok(ev) = rx.recv().await {
             // A runner's message: how long it waited for this loop, and how long applying it took
             // (goal 1, plan 01a1a59c2a68 step 2).
+            let began = Instant::now();
             let mut arrived = match &ev {
-                NetEvent::Frame { at, .. } => Some(*at),
+                NetEvent::Frame { at, .. } => Some(Arrived { at: *at, taken: began }),
                 _ => None,
             };
-            let began = Instant::now();
+            // Its first leg, every frame's: from the network thread handing it over to this loop taking it
+            // (goal 10, plan 01a1a87b2dae step 4).
+            if let Some(a) = arrived {
+                crate::route_latency::observe_leg(crate::route_latency::RunnerLeg::ToLoop, began.saturating_duration_since(a.at));
+            }
             // Its polls labeled by what came, should one hold the shard: a frame by its message's kind
             // once it's read (goal 9, plan 01a1a87b2cec step 3).
             let label = Self::net_label(&ev);
@@ -2213,8 +2227,8 @@ impl Hub {
             }
             // An agent session's update is timed where it's taken, by the shard that owns its copy,
             // from when it came (`Hub::runner_update`): its arrival went there with it.
-            if let Some(at) = arrived {
-                crate::route_latency::observe(crate::route_latency::Class::Runner, Some(began.saturating_duration_since(at)), began.elapsed());
+            if let Some(a) = arrived {
+                crate::route_latency::observe(crate::route_latency::Class::Runner, Some(began.saturating_duration_since(a.at)), began.elapsed());
             }
             turns.after().await;
         }
@@ -2250,9 +2264,9 @@ impl Hub {
         self.on_net_at(ev, &mut None).await
     }
 
-    /// A transport event, taken. `arrived`: when its frame came, taken by what's timed elsewhere (an
-    /// agent session's update, by the shard that owns its copy: `Hub::runner_update`).
-    async fn on_net_at(self: &Arc<Self>, ev: NetEvent, arrived: &mut Option<Instant>) -> anyhow::Result<()> {
+    /// A transport event, taken. `arrived`: when its frame came and this loop took it, taken by what's timed
+    /// elsewhere (an agent session's update, by the shard that owns its copy: `Hub::runner_update`).
+    async fn on_net_at(self: &Arc<Self>, ev: NetEvent, arrived: &mut Option<Arrived>) -> anyhow::Result<()> {
         match ev {
             NetEvent::Connected { peer, name, binding } => {
                 self.tunnels.connected(peer, binding);
@@ -2339,7 +2353,7 @@ impl Hub {
 
     /// A runner's message with what it carries read ([`Hub::on_runner_msg`]), applied; or, when that
     /// couldn't be read, refused to it (`Unread`) and noted. `arrived`: as [`Hub::on_net_at`]'s.
-    async fn on_carried(self: &Arc<Self>, peer: PeerId, carried: Result<Carried<AgentMsg, FromRunner>, Box<crate::wire::payload::Unreadable>>, arrived: &mut Option<Instant>) -> anyhow::Result<()> {
+    async fn on_carried(self: &Arc<Self>, peer: PeerId, carried: Result<Carried<AgentMsg, FromRunner>, Box<crate::wire::payload::Unreadable>>, arrived: &mut Option<Arrived>) -> anyhow::Result<()> {
         match carried {
             Ok(m) => self.on_agent_msg(peer, m, arrived).await,
             Err(e) => {
@@ -2530,7 +2544,7 @@ impl Hub {
     /// then answered: taken, or refused saying why. Never answered before it's applied, or for an agent
     /// session's update, before the shard that owns its copy has it in its inbox (`Hub::runner_update`).
     /// `arrived`: as [`Hub::on_net_at`]'s.
-    async fn on_wire(self: &Arc<Self>, peer: PeerId, agent: &str, frame: crate::wire::channel::Frame, arrived: &mut Option<Instant>) {
+    async fn on_wire(self: &Arc<Self>, peer: PeerId, agent: &str, frame: crate::wire::channel::Frame, arrived: &mut Option<Arrived>) {
         use crate::wire::channel::{Arrival, Frame, Refusal};
         match frame {
             Frame::Item { stream, seq, low, body } => {
@@ -2579,7 +2593,7 @@ impl Hub {
     }
 
     /// A runner's message, read. `arrived`: as [`Hub::on_net_at`]'s.
-    async fn on_agent_msg(self: &Arc<Self>, peer: PeerId, msg: Carried<AgentMsg, FromRunner>, arrived: &mut Option<Instant>) -> anyhow::Result<()> {
+    async fn on_agent_msg(self: &Arc<Self>, peer: PeerId, msg: Carried<AgentMsg, FromRunner>, arrived: &mut Option<Arrived>) -> anyhow::Result<()> {
         if let Carried::Nothing(AgentMsg::Hello(h)) = msg {
             return self.on_hello(peer, h).await;
         }
@@ -2872,7 +2886,12 @@ impl Hub {
     /// back, for the owner to take first at its next turn.
     pub(crate) fn runner_update(self: &Arc<Self>, s: &mut crate::harness::copies::Shard, r: crate::harness::copies::RunnerUpdate, over: &dyn Fn() -> bool) -> Option<crate::harness::copies::Ingest> {
         let began = Instant::now();
-        let crate::harness::copies::RunnerUpdate { peer, agent, session, update, shipped, arrived } = r;
+        let crate::harness::copies::RunnerUpdate { peer, agent, session, update, shipped, arrived, handed } = r;
+        // Its third leg: from the hub's loop handing it over to its owner taking it (goal 10, plan 01a1a87b2dae
+        // step 4).
+        if let Some(h) = handed {
+            crate::route_latency::observe_leg(crate::route_latency::RunnerLeg::ToOwner, began.saturating_duration_since(h));
+        }
         let rest = self.judge_runner_update(s, peer, &agent, &session, update, shipped, over);
         crate::route_latency::observe(crate::route_latency::Class::Runner, arrived.map(|at| began.saturating_duration_since(at)), began.elapsed());
         rest
@@ -2972,7 +2991,7 @@ impl Hub {
 
     /// What a runner's message carried, read where its frame was (`crate::wire::payload_of`): each
     /// handler takes its value. `arrived`: as [`Hub::on_net_at`]'s.
-    async fn on_read(self: &Arc<Self>, peer: PeerId, agent: &str, read: FromRunner, arrived: &mut Option<Instant>) -> anyhow::Result<()> {
+    async fn on_read(self: &Arc<Self>, peer: PeerId, agent: &str, read: FromRunner, arrived: &mut Option<Arrived>) -> anyhow::Result<()> {
         match read {
             // One report per machine: its newest runner process's.
             FromRunner::AiSessions(_) if self.instances.load().newest(agent).is_some_and(|n| n != peer) => {}
@@ -3212,7 +3231,14 @@ impl Hub {
                     // A runner process that sends its conversation store: the server keeps its
                     // sessions from that.
                     let shipped = self.instances.load().get(peer).is_some_and(|i| i.caps & proto::CAP_CONVO != 0);
-                    let r = crate::harness::copies::RunnerUpdate { peer, agent: agent.to_owned(), session: session.clone(), update: u, shipped, arrived: arrived.take() };
+                    // Its second leg: from this loop taking its frame to handing it over (goal 10, plan
+                    // 01a1a87b2dae step 4); the third is the owner's to time.
+                    let handed = Instant::now();
+                    let arrival = arrived.take();
+                    if let Some(a) = arrival {
+                        crate::route_latency::observe_leg(crate::route_latency::RunnerLeg::InLoop, handed.saturating_duration_since(a.taken));
+                    }
+                    let r = crate::harness::copies::RunnerUpdate { peer, agent: agent.to_owned(), session: session.clone(), update: u, shipped, arrived: arrival.map(|a| a.at), handed: Some(handed) };
                     self.harness.from_runner(r).await;
                     // An Open says where the session runs now, a Closed lets it go: what this loop reads
                     // of it next (the runner's next word, its inventory, a hand-over) waits for its owner
