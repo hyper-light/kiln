@@ -1,6 +1,7 @@
 //! HTTP/1.1 and HTTP/2 server: kiln-http's connections on hyper-rt. Each accepted connection is one
-//! hyper-rt task, its requests' handlers polled in it (an HTTP/2 connection's all side by side);
-//! upgrades (WebSocket) are HTTP/1.1's.
+//! hyper-rt task, its requests' handlers polled in it (an HTTP/2 connection's all side by side), or run
+//! where the server's placement puts them (goal 7, `crate::placement`: on a less delayed shard, or as
+//! movable tasks), their responses written by the connection's task; upgrades (WebSocket) are HTTP/1.1's.
 
 use std::future::Future;
 use std::sync::Arc;
@@ -153,7 +154,7 @@ where
         mark(&mut req, remote, secure);
         let request = serving.begin(&mut req);
         let handler = handler.clone();
-        async move { crate::overload::while_sent(handler.handle(req).await, request) }
+        async move { crate::overload::while_sent(placed(request.class(), handler.handle(req)).await, request) }
     });
     let conn = http1::Builder::new()
         // Slow or idle clients cannot pin a connection: headers must arrive within the timeout
@@ -182,7 +183,7 @@ where
         mark(&mut req, remote, secure);
         let request = serving.begin(&mut req);
         let handler = handler.clone();
-        async move { crate::overload::while_sent(handler.handle(req).await, request) }
+        async move { crate::overload::while_sent(placed(request.class(), handler.handle(req)).await, request) }
     });
     let conn = http2::Builder::new()
         // A connection whose client has gone quiet without closing is found and ended.
@@ -192,6 +193,16 @@ where
         .serve_read(io, read, service);
     if let Err(e) = conn.await {
         tracing::debug!(error = %e, "http/2 connection ended with an error");
+    }
+}
+
+/// A request's handler run where the server's placement puts it (goal 7, `crate::placement`): in this task,
+/// on a less delayed shard, or as a movable task; a 503 when the shard it was placed on stopped before it
+/// answered.
+async fn placed(class: crate::overload::Class, handling: impl Future<Output = Response> + Send + 'static) -> Response {
+    match crate::placement::request(class, handling).await {
+        Some(resp) => resp,
+        None => text(StatusCode::SERVICE_UNAVAILABLE, "the server is stopping"),
     }
 }
 
