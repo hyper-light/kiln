@@ -308,4 +308,50 @@ mod tests {
         assert!(ran <= wall.saturating_add(1_000_000), "ran {ran} ns in {wall} ns of wall time");
         assert!(ran >= 5_000_000, "spun 30 ms, ran {ran} ns (spins {spins})");
     }
+
+    /// Kiln's goal 9, plan 01a1a87b2cec step 5: a shard's tasks read its thread's run time from the clock on its desk
+    /// (`crate::futures::thread_run_ns`), the one the loop reads, with no call: none off a shard thread; on one whose
+    /// clock opened, a time that runs while the task spins. Where it can't open (perf_event_open refused, not Linux),
+    /// the shard's tasks read none, as a clock opened here finds.
+    #[test]
+    #[cfg_attr(miri, ignore)]
+    fn g9_s5_a_shards_tasks_read_its_threads_run_time() {
+        assert_eq!(crate::futures::thread_run_ns(), None, "off a shard thread");
+        let config = crate::runtime::RuntimeConfig {
+            shards: 1,
+            tasks_per_shard: 8,
+            timers_per_shard: 8,
+            interests_per_shard: 8,
+            ring_entries: 16,
+            step_budget_ns: 1_000_000,
+            timer_tick_ns: 100_000,
+            batch: 16,
+            pin: false,
+            cores: Vec::new(),
+            page_bytes: 4096,
+            spin_ns: 0,
+            wake_tracking: None,
+            latency_objective_ns: None,
+        };
+        let mut rt = crate::runtime::LocalRuntime::new(&config).unwrap();
+        let read = rt
+            .block_on(async {
+                let a = crate::futures::thread_run_ns()?;
+                let began = std::time::Instant::now();
+                let mut spins = 0u64;
+                while began.elapsed() < std::time::Duration::from_millis(30) {
+                    spins = std::hint::black_box(spins.wrapping_add(1));
+                }
+                let b = crate::futures::thread_run_ns()?;
+                Some((a, b, u64::try_from(began.elapsed().as_nanos()).unwrap_or(u64::MAX), spins))
+            })
+            .unwrap();
+        let Some((a, b, wall, spins)) = read else {
+            assert!(TaskClock::open().is_none(), "a clock opens on this thread, but the shard's tasks read none");
+            return;
+        };
+        let ran = b.saturating_sub(a);
+        assert!(ran <= wall.saturating_add(1_000_000), "ran {ran} ns in {wall} ns of wall time");
+        assert!(ran >= 5_000_000, "spun 30 ms, ran {ran} ns (spins {spins})");
+    }
 }

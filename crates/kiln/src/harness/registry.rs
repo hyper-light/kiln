@@ -1225,8 +1225,9 @@ pub struct Registry {
     /// them (`super::opened`).
     pub ports: super::opened::Tunnels,
     pub opened: super::opened::Openings,
-    /// Messages waiting for their session's inbox to answer (CP-T3.2), by session and message id.
-    waiting: Mutex<HashMap<(String, String), Vec<futures::channel::oneshot::Sender<Said>>>>,
+    /// Messages waiting for their session's inbox to answer (CP-T3.2), by session and message id: one owner
+    /// of their own, no lock (`super::answers`; goal 5, plan 01a1a59c2aae, its top goal).
+    answers: super::answers::Answers,
     /// The ids starts under way asked for ([`Registry::open_as`]), each until its start is done.
     opening: Rcu<std::collections::HashSet<String>>,
     /// Tests: what every session started here runs instead of its harness (a program that isn't
@@ -1412,7 +1413,7 @@ impl Registry {
             webrtc: super::webrtc::Webrtc::default(),
             ports: super::opened::Tunnels::default(),
             opened: super::opened::Openings::default(),
-            waiting: Mutex::new(HashMap::new()),
+            answers: super::answers::Answers::new(WAITING_MAX),
             opening: Rcu::default(),
             #[cfg(test)]
             test_program: Mutex::new(None),
@@ -2072,6 +2073,7 @@ impl Registry {
     /// that, not from here. Goal 4, plan 01a1a59c2a9c step 2.
     pub async fn ingest_from(&self, hub: &Hub, from: &Location, id: &str, u: Update, shipped: bool) {
         let Some(ingest) = self.prepare(hub, from, id, u, shipped) else { return };
+        self.room_for_rows(shipped).await;
         if !self.sessions.send(id, Msg::Update(Box::new(ingest))).await {
             tracing::debug!(session = id, "an agent session's update came as the server's copies went");
         }
@@ -2082,8 +2084,19 @@ impl Registry {
     /// owner's inbox has it, waiting only while it's full, as [`Registry::ingest_from`] does.
     pub async fn from_runner(&self, r: super::copies::RunnerUpdate) {
         let id = r.session.clone();
+        self.room_for_rows(r.shipped).await;
         if !self.sessions.send(&id, Msg::Runner(Box::new(r))).await {
             tracing::debug!(session = %id, "an agent session's update came as the server's copies went");
+        }
+    }
+
+    /// Waits, before an update that makes rows (one whose machine doesn't keep it in a store it ships, `shipped`) is
+    /// handed to its owner, while the conversation store holds more of them than the owners' inboxes may hold
+    /// together (`super::copies::Copies::inboxes_bound`): the owner never waits for the store itself (goal 10, plan
+    /// 01a1a87b2dae step 5; `crate::convo::store::Store::room_within`), so what hands it updates does, past that.
+    async fn room_for_rows(&self, shipped: bool) {
+        if !shipped && let Some(store) = &self.convo {
+            store.room_within(self.sessions.inboxes_bound()).await;
         }
     }
 
@@ -2172,11 +2185,6 @@ impl Registry {
         let mut rows: Vec<crate::convo::rows::Row> = Vec::new();
         // How many of an update's events its turn took.
         let mut taken = 0;
-        let mut made: Option<Value> = match &u {
-            Update::State { state } => Some(serde_json::to_value(state).unwrap_or(Value::Null)),
-            Update::Meta { meta } => Some(serde_json::to_value(meta).unwrap_or(Value::Null)),
-            _ => None,
-        };
         // Its info changed as its pages see it: the events socket is told, its frame made of the bytes its
         // view encoded the info as (goal 10, plan 01a1a87b2dae step 5: it was encoded again for the socket).
         let mut changed = false;
@@ -2286,7 +2294,12 @@ impl Registry {
                 m.started_over();
             }
             Update::State { state } => {
-                m.state = Arc::new(made.take().unwrap_or(Value::Null));
+                // The same state as the copy's was made of, the copy's still that value: not made again (goal 9,
+                // plan 01a1a87b2cec step 5: a whole state made into a value, 0.45% of the process in rt7's calm
+                // profile, and compared field by field with the last for a patch of nothing).
+                if !m.state_of.as_ref().is_some_and(|(was, made)| **was == **state && Arc::ptr_eq(made, &m.state)) {
+                    m.state = Arc::new(serde_json::to_value(state).unwrap_or(Value::Null));
+                }
                 // The info as it was, shared with the copy's views (not copied: its own is, as it changes).
                 let before = Arc::clone(&m.info);
                 let info = Arc::make_mut(&mut m.info);
@@ -2304,8 +2317,11 @@ impl Registry {
                     Naming::Keep => {
                         if let Some(n) = names.get(id) {
                             info.name.clone_from(n);
-                            // The state is the copy's own here (just made): nothing is copied.
-                            if let Some(o) = Arc::make_mut(&mut m.state).as_object_mut() {
+                            // Only where the state doesn't say it already: the copy's own when just made (nothing
+                            // copied), else the last one's, shared with its views, copied only to change.
+                            if m.state.get("name").and_then(Value::as_str) != Some(n.as_str())
+                                && let Some(o) = Arc::make_mut(&mut m.state).as_object_mut()
+                            {
                                 o.insert("name".into(), json!(n));
                             }
                         }
@@ -2326,12 +2342,18 @@ impl Registry {
                     hold_for = Some((account, p.window.clone(), p.until));
                 }
             }
-            Update::Meta { .. } => {
-                let meta = made.take().unwrap_or(Value::Null);
-                if *m.meta == meta {
+            Update::Meta { meta } => {
+                // The same meta as the copy's was made of, the copy's still that value: the same again, not made
+                // into a value to be found so (goal 9, plan 01a1a87b2cec step 5).
+                if m.meta_of.as_ref().is_some_and(|(was, made)| **was == **meta && Arc::ptr_eq(made, &m.meta)) {
                     meta_same = true;
                 } else {
-                    m.meta = Arc::new(meta);
+                    let meta = serde_json::to_value(meta).unwrap_or(Value::Null);
+                    if *m.meta == meta {
+                        meta_same = true;
+                    } else {
+                        m.meta = Arc::new(meta);
+                    }
                 }
             }
             Update::Changes { files } => m.take_changes(files.iter().filter_map(|f| serde_json::to_value(f).ok()).collect(), Vec::new(), true),
@@ -2402,6 +2424,13 @@ impl Registry {
             Update::Meta { .. } if meta_same => None,
             _ => Some(m.frame_of(&u, &entries)),
         });
+        // What the copy's state or meta was made of, kept with the value as made (a name given here in it): the
+        // same one again finds it so (above).
+        match u {
+            Update::State { state } => m.state_of = Some((state, Arc::clone(&m.state))),
+            Update::Meta { meta } => m.meta_of = Some((meta, Arc::clone(&m.meta))),
+            _ => {}
+        }
         if gone {
             s.remove(id);
         }
@@ -3244,35 +3273,15 @@ impl Registry {
     }
 
     /// Waits for the answer to message `message` sent to session `id`: none when too many wait
-    /// already (it isn't waited for).
-    fn wait_for(&self, id: &str, message: &str) -> Option<futures::channel::oneshot::Receiver<Said>> {
-        let mut w = self.waiting.lock();
-        if w.len() >= WAITING_MAX {
-            // Those whose senders went away (and no answer came for) go first.
-            w.retain(|_, v| {
-                v.retain(|tx| !tx.is_canceled());
-                !v.is_empty()
-            });
-            if w.len() >= WAITING_MAX {
-                return None;
-            }
-        }
-        let (tx, rx) = futures::channel::oneshot::channel();
-        w.entry((id.to_owned(), message.to_owned())).or_default().push(tx);
-        Some(rx)
+    /// already (it isn't waited for). Its wait reaches the waits' owner before the message goes.
+    async fn wait_for(&self, id: &str, message: &str) -> Option<futures::channel::oneshot::Receiver<Said>> {
+        self.answers.wait_for(id, message).await
     }
 
     /// No longer waiting for message `message` sent to session `id`: the waits whose ends were
     /// dropped go (an answer for those still waiting still reaches them).
     fn unwait(&self, id: &str, message: &str) {
-        let mut w = self.waiting.lock();
-        let key = (id.to_owned(), message.to_owned());
-        if let Some(v) = w.get_mut(&key) {
-            v.retain(|tx| !tx.is_canceled());
-            if v.is_empty() {
-                w.remove(&key);
-            }
-        }
+        self.answers.unwait(id, message);
     }
 
     /// Session `id`'s inbox said what became of a message: whoever waits for it longest is told (each
@@ -3280,20 +3289,7 @@ impl Registry {
     /// taken and one refused, are each told their own).
     fn answered(&self, id: &str, said: Said) {
         crate::metrics::sends().said(&said);
-        let key = (id.to_owned(), said.message.clone());
-        let first = {
-            let mut w = self.waiting.lock();
-            let Some(v) = w.get_mut(&key) else { return };
-            v.retain(|tx| !tx.is_canceled());
-            let first = (!v.is_empty()).then(|| v.remove(0));
-            if v.is_empty() {
-                w.remove(&key);
-            }
-            first
-        };
-        if let Some(tx) = first {
-            let _ = tx.send(said);
-        }
+        self.answers.answered(id, said);
     }
 
     /// The answer to message `message` sent to session `id`, once it comes (by [`ANSWER_WAIT`]
@@ -3476,7 +3472,10 @@ impl Registry {
         let epoch = self.epoch_of(id);
         match loc {
             Location::Local => {
-                let wait = message.as_deref().and_then(|m| self.wait_for(id, m));
+                let wait = match message.as_deref() {
+                    Some(m) => self.wait_for(id, m).await,
+                    None => None,
+                };
                 if !self.local.command_at(id, c, Some(epoch)) {
                     // Not waited for after all: its end of the wait goes first, then the wait.
                     drop(wait);
@@ -3524,7 +3523,7 @@ impl Registry {
                     return Pending::Now(Sent::Unreachable);
                 }
                 if let Some(m) = message.filter(|_| caps & crate::proto::CAP_INBOX != 0) {
-                    let wait = self.wait_for(id, &m);
+                    let wait = self.wait_for(id, &m).await;
                     if !hub.send_to_agent(&machine, LANE_TERM, &ServerMsg::HarnessSend { session: id.to_owned(), epoch, json }).await {
                         drop(wait);
                         self.unwait(id, &m);
@@ -3865,20 +3864,20 @@ mod tests {
             let dir = tempfile::tempdir()?;
             let conversations = crate::config::Conversations { off: true, ..Default::default() };
             let r = Registry::with(dir.path().to_path_buf(), &conversations, Arc::new(kiln_seams::clock::SimClock::new()), sim_bus());
-            let gone = r.wait_for("s1", "m1");
-            let kept = r.wait_for("s1", "m1").ok_or_else(|| anyhow::anyhow!("not waited for"))?;
+            let gone = r.wait_for("s1", "m1").await;
+            let kept = r.wait_for("s1", "m1").await.ok_or_else(|| anyhow::anyhow!("not waited for"))?;
             drop(gone);
             r.unwait("s1", "m1");
-            assert_eq!(r.waiting.lock().get(&("s1".to_owned(), "m1".to_owned())).map(Vec::len), Some(1), "the one still waiting stays");
+            assert_eq!(r.answers.held().await, Some(1), "the one still waiting stays");
             let said = Said { message: "m1".into(), answer: Err(inbox::Refusal::NoSession { session: "s1".into() }) };
             r.answered("s1", said.clone());
-            assert!(r.waiting.lock().is_empty());
+            assert_eq!(r.answers.held().await, Some(0));
             assert_eq!(kept.await.ok(), Some(said));
             // Given up before any answer: nothing is left.
-            let w = r.wait_for("s2", "m2");
+            let w = r.wait_for("s2", "m2").await;
             drop(w);
             r.unwait("s2", "m2");
-            assert!(r.waiting.lock().is_empty());
+            assert_eq!(r.answers.held().await, Some(0));
             Ok(())
         })
     }
@@ -3892,15 +3891,15 @@ mod tests {
             let dir = tempfile::tempdir()?;
             let conversations = crate::config::Conversations { off: true, ..Default::default() };
             let r = Registry::with(dir.path().to_path_buf(), &conversations, Arc::new(kiln_seams::clock::SimClock::new()), sim_bus());
-            let first = r.wait_for("s1", "m1").ok_or_else(|| anyhow::anyhow!("not waited for"))?;
-            let second = r.wait_for("s1", "m1").ok_or_else(|| anyhow::anyhow!("not waited for"))?;
+            let first = r.wait_for("s1", "m1").await.ok_or_else(|| anyhow::anyhow!("not waited for"))?;
+            let second = r.wait_for("s1", "m1").await.ok_or_else(|| anyhow::anyhow!("not waited for"))?;
             let taken = Said { message: "m1".into(), answer: Ok(inbox::Answer { session: "s1".into(), message: "m1".into(), epoch: 0, at: 1, seq: 7, repeat: false }) };
             let reused = Said { message: "m1".into(), answer: Err(inbox::Refusal::Reused { session: "s1".into(), message: "m1".into() }) };
             r.answered("s1", taken.clone());
             r.answered("s1", reused.clone());
             assert_eq!(first.await.ok(), Some(taken));
             assert_eq!(second.await.ok(), Some(reused));
-            assert!(r.waiting.lock().is_empty());
+            assert_eq!(r.answers.held().await, Some(0));
             Ok(())
         })
     }
@@ -4347,6 +4346,63 @@ mod tests {
             hub.harness.ingest(&hub, &there, "s", Update::Meta { meta: Box::new(meta) }).await;
             let heard = sent(&hub, &topic, &mut at);
             anyhow::ensure!(heard.is_empty() && encodings().await.meta == was.meta + 1, "the same meta again: nothing kept, encoded or sent: {heard:?}");
+            Ok(())
+        })
+    }
+
+    /// Goal 9, plan 01a1a87b2cec step 5: the same state again from its machine isn't made into a value while the
+    /// copy's is still the one made of it: the copy keeps that one (its revision moves, no frame goes), and its
+    /// view holds what making it again would. Changed here since (a name given here), it's made again, the name in
+    /// it, and the same again after that keeps that one; a changed state is made anew. The same meta again
+    /// keeps the copy's.
+    #[test]
+    fn g9_s5_the_same_state_again_isnt_made_into_a_value() -> anyhow::Result<()> {
+        use crate::harness::model::{Meta, State};
+        crate::rt::block_on(async {
+            let hub = crate::hub::tests::scratch_hub().await?;
+            let there = Location::Machine("box".into());
+            hub.harness.ingest(&hub, &there, "s", Update::Open { info: Box::new(Info { id: "s".into(), kind: "claude".into(), ..Info::default() }), since: None }).await;
+            let attached = hub.harness.attach("s").ok_or_else(|| anyhow::anyhow!("no copy"))?;
+            let (_watching, topic, mut at) = (attached.viewer, attached.topic, attached.at.unwrap_or_default());
+            // The copy's state and meta values, by where they are, and its revision.
+            let held = || async { hub.harness.sessions.on("s", |s| s.get("s").map(|m| (Arc::as_ptr(&m.state) as usize, Arc::as_ptr(&m.meta) as usize, m.rev))).await.flatten().unwrap_or_default() };
+            let viewed = || hub.harness.sessions.view("s").map(|v| Value::clone(&v.state)).unwrap_or_default();
+            let state = State { summary: "the retry loop reads its deadline".into(), ..State::default() };
+            hub.harness.ingest(&hub, &there, "s", Update::State { state: Box::new(state.clone()) }).await;
+            let (made, _, rev) = held().await;
+            anyhow::ensure!(sent(&hub, &topic, &mut at).iter().filter(|f| f.starts_with(r#"{"t":"state""#)).count() == 1, "the first state's frame");
+            hub.harness.ingest(&hub, &there, "s", Update::State { state: Box::new(state.clone()) }).await;
+            let (again, _, rev_again) = held().await;
+            anyhow::ensure!(again == made && rev_again == rev + 1, "the same state again: kept ({made:#x} then {again:#x}), its revision {rev} then {rev_again}");
+            let heard = sent(&hub, &topic, &mut at);
+            anyhow::ensure!(heard.is_empty() && viewed() == serde_json::to_value(&state)?, "no frame, and the view as made again: {heard:?}");
+            // A name given here changes the copy's state: the same state again is made again, the name in it.
+            hub.harness.rename(&hub, "s", Some(&json!("parser"))).await;
+            let (renamed, _, _) = held().await;
+            hub.harness.ingest(&hub, &there, "s", Update::State { state: Box::new(state.clone()) }).await;
+            let (remade, _, _) = held().await;
+            let mut named = serde_json::to_value(&state)?;
+            if let Some(o) = named.as_object_mut() {
+                o.insert("name".into(), json!("parser"));
+            }
+            anyhow::ensure!(remade != renamed && viewed() == named, "made again after the name: {}", viewed());
+            hub.harness.ingest(&hub, &there, "s", Update::State { state: Box::new(state.clone()) }).await;
+            anyhow::ensure!(held().await.0 == remade && viewed() == named, "the same again after that: kept, the name in it");
+            // A changed state: made anew.
+            let changed = State { doing: Some("Running cargo test".into()), ..state };
+            hub.harness.ingest(&hub, &there, "s", Update::State { state: Box::new(changed.clone()) }).await;
+            let mut want = serde_json::to_value(&changed)?;
+            if let Some(o) = want.as_object_mut() {
+                o.insert("name".into(), json!("parser"));
+            }
+            anyhow::ensure!(held().await.0 != remade && viewed() == want, "a changed state made anew: {}", viewed());
+            anyhow::ensure!(sent(&hub, &topic, &mut at).iter().any(|f| f.contains("Running cargo test")), "its frame went");
+            // The same meta again: the copy's kept.
+            let meta = Meta { version: "2.1".into(), ..Meta::default() };
+            hub.harness.ingest(&hub, &there, "s", Update::Meta { meta: Box::new(meta.clone()) }).await;
+            let (_, meta_made, _) = held().await;
+            hub.harness.ingest(&hub, &there, "s", Update::Meta { meta: Box::new(meta) }).await;
+            anyhow::ensure!(held().await.1 == meta_made, "the same meta again: kept");
             Ok(())
         })
     }
@@ -5031,6 +5087,44 @@ mod tests {
             // Its row is the one the event written out again makes.
             assert_eq!(kept.map(|t| crate::convo::rows::event_written("s", &e, t)), crate::convo::rows::event("s", &e), "event {n}: its row");
         }
+    }
+
+    /// Goal 10, plan 01a1a87b2dae step 5: a session's owner never waits for the conversation store. With the store past
+    /// its writer's bound, one update after another is taken by the owner and its copy has them (the owner waited
+    /// between turns, so the second waited for the writer); only once the store holds as much as the owners' inboxes
+    /// may does what hands it updates wait, and goes on as the writer lets rows go.
+    #[test]
+    fn g10_s5_an_owner_never_waits_for_the_conversation_store() -> anyhow::Result<()> {
+        use crate::harness::model::{Body, Event};
+        crate::rt::block_on(async {
+            let hub = crate::hub::tests::scratch_hub().await?;
+            let Some(store) = hub.harness.convo.clone() else { anyhow::bail!("the scratch hub keeps no conversations") };
+            let there = Location::Machine("box".into());
+            let said = |n: u64| Update::Events { events: vec![Event { id: format!("m{n}"), seq: n, at: 1, parent: None, by: None, body: Body::Assistant { text: format!("line {n}"), streaming: false } }] };
+            hub.harness.ingest(&hub, &there, "s", Update::Open { info: Box::new(Info { id: "s".into(), kind: "claude".into(), epoch: 1, ..Info::default() }), since: None }).await;
+            let q = store.queue();
+            // Past the writer's own bound, within the inboxes'.
+            let past = q.bound().saturating_add(1);
+            q.pretend_waiting(past);
+            let within = std::time::Duration::from_secs(10);
+            for n in 1..=2 {
+                crate::rt::timeout(within, hub.harness.ingest(&hub, &there, "s", said(n))).await.map_err(|_| anyhow::anyhow!("update {n} waited for the store"))?;
+            }
+            anyhow::ensure!(copy_of(&hub, "s") == ["m1", "m2"], "{:?}", copy_of(&hub, "s"));
+            // Past the inboxes' bound too: the hand-off waits, until the writer lets rows go.
+            let more = hub.harness.sessions.inboxes_bound();
+            q.pretend_waiting(more);
+            {
+                let mut handed = std::pin::pin!(hub.harness.ingest_from(&hub, &there, "s", said(3), false));
+                anyhow::ensure!(futures::poll!(handed.as_mut()).is_pending(), "past what the inboxes may hold: it waits");
+                q.pretend_written(more);
+                crate::rt::timeout(within, handed).await.map_err(|_| anyhow::anyhow!("the hand-off never went on"))?;
+            }
+            q.pretend_written(past);
+            hub.harness.sessions.applied("s").await;
+            anyhow::ensure!(copy_of(&hub, "s") == ["m1", "m2", "m3"], "{:?}", copy_of(&hub, "s"));
+            Ok(())
+        })
     }
 
     /// Goal 9, plan 01a1a87b2cec step 3: an update's events are taken while its owner's turn lasts, one at

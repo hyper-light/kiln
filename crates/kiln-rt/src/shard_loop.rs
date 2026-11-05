@@ -381,10 +381,6 @@ struct Core {
     /// each step's reading of the driver's clock is carried forward by it (`ShardContext::carried`).
     counter_scale: Option<u64>,
     fixed_quantum_ns: u64,
-    /// The shard thread's run time, read with no call at each poll's start (`crate::task_clock`; kiln's goal 9, plan
-    /// 01a1a87b2cec step 3): a slow poll's time on the CPU beside its hold. None off Linux, in a simulation, and where
-    /// the OS refused the event.
-    task_clock: Option<crate::task_clock::TaskClock>,
     /// Whether the driver's clock is real time (the simulation's is not).
     real_time: bool,
     driver_lost: bool,
@@ -512,7 +508,7 @@ impl Shard {
         registry::bind_cleanup_thread(seed.holder)?;
         let is_sim = driver.kind() == DriverKind::Simulation;
         let generation_base = registry::entry(seed.id).map_or(0, |entry| entry.generation_base);
-        let desk = Box::new(ShardContext::new(
+        let mut desk = Box::new(ShardContext::new(
             seed.id,
             &DeskShape {
                 tasks: config.tasks_per_shard,
@@ -525,6 +521,9 @@ impl Shard {
             is_sim,
             driver.clock(),
         ));
+        // Opened on the shard's own thread, which builds it: the clock measures the thread that opens it. On the desk,
+        // so the shard's tasks read it too (`crate::futures::thread_run_ns`).
+        desk.task_clock = if is_sim { None } else { crate::task_clock::TaskClock::open() };
         let times_wakes = config.wake_tracking.is_some() && !is_sim;
         if times_wakes && let Some(entry) = registry::entry(seed.id) {
             entry.parking.time_wakes();
@@ -563,8 +562,6 @@ impl Shard {
             last_driver_ns: now_ns,
             harvest_owed: false,
             real_time: !is_sim,
-            // Opened on the shard's own thread, which builds it: the clock measures the thread that opens it.
-            task_clock: if is_sim { None } else { crate::task_clock::TaskClock::open() },
             attribution: Tracker::default(),
             deferred: Vec::with_capacity(config.batch.max(1)),
             batch: config.batch.max(1),
@@ -2124,7 +2121,7 @@ impl Shard {
         }
         let entered = registry::enter_in(current, &self.desk);
         // The thread's run time as the poll starts, for a slow poll's time on the CPU (`crate::task_clock`).
-        let cpu_from = self.core.task_clock.as_ref().and_then(crate::task_clock::TaskClock::run_ns);
+        let cpu_from = self.desk.task_clock.as_ref().and_then(crate::task_clock::TaskClock::run_ns);
         // The poll is the task's code: inside an unwind boundary of the shard's own, so a task that
         // panics ends there, typed, and costs the shard and its other tasks nothing (CLAUDE.md §1).
         let poll = crate::unwind::contained(|| future.poll(&mut cx));
@@ -2161,7 +2158,7 @@ impl Shard {
             None
         };
         if elapsed > crate::slow::SLOW_POLL_NS {
-            let cpu = cpu_from.and_then(|from| Some(self.core.task_clock.as_ref()?.run_ns()?.saturating_sub(from)));
+            let cpu = cpu_from.and_then(|from| Some(self.desk.task_clock.as_ref()?.run_ns()?.saturating_sub(from)));
             self.note_slow(slot, elapsed, cpu, matches!(attributed, Some(crate::attribution::Attribution::Preempted)));
         }
         let Some(poll) = poll else {
