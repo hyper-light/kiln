@@ -803,7 +803,15 @@ type Sealed = (Weak<Chunk>, Option<Home>);
 /// holding its other jobs seconds (goal 10's A/B: the compute pool's wait at p99, 0.9 ms to 2.3 s), and
 /// a chunk a unit held a thread for a chunk's whole deflate (its pieces at p99, 5 to 45 ms). A chunk
 /// gone or packed by then (let go of, changed, packed by a snapshot that needed it) is passed over.
-static SEALED: OnceLock<async_channel::Sender<Sealed>> = OnceLock::new();
+static SEALED: OnceLock<crate::memory::queue::Sender<Sealed>> = OnceLock::new();
+
+/// The packer's queue ([`SEALED`]): lock-free, its owners on every shard sending and the packer taking (goal 4,
+/// plan 01a1a59c2a9c step 5: an async-channel's wait took event-listener's `Mutex` on both sides). No bound, as
+/// the channel it was had none: an owner never waits for the packer, and each chunk seals once, so it holds at
+/// most one entry a chunk the copies keep as text (`crate::memory::owners::SESSION_ENTRIES`' bound).
+fn sealed_queue() -> (crate::memory::queue::Sender<Sealed>, crate::memory::queue::Receiver<Sealed>) {
+    crate::memory::queue::unbounded(&crate::memory::owners::CHANNELS)
+}
 
 /// A chunk that sealed, to be packed off the owner's shard ([`SEALED`]), so a snapshot after it takes
 /// it as it is (goal 10, plan 01a1a87b2dae step 3), and its copy's owner then keeps it compact (goal
@@ -813,7 +821,7 @@ fn seal(chunk: &Arc<Chunk>, home: Option<Home>) {
         return;
     }
     let packer = SEALED.get_or_init(|| {
-        let (tx, rx) = async_channel::unbounded();
+        let (tx, rx) = sealed_queue();
         drop(crate::rt::spawn(pack_sealed(rx)));
         tx
     });
@@ -830,7 +838,7 @@ fn compact_msg(home: &Home) -> Msg {
 /// The packer ([`SEALED`]): a job on the compute pool for as long as chunks wait ([`Packer::piece`]).
 /// A packed chunk's owner is told from the pool when its inbox takes the message now, else once the
 /// job ends (its inbox full then: the owner busy).
-async fn pack_sealed(rx: async_channel::Receiver<Sealed>) {
+async fn pack_sealed(rx: crate::memory::queue::Receiver<Sealed>) {
     while let Ok(first) = rx.recv().await {
         let packer = Packer { rx: rx.clone(), waiting: vec![first], now: None, later: Vec::new() };
         let packed = crate::rt::compute_pieces(packer, |p, turn| p.piece(&|| turn.over())).await;
@@ -850,7 +858,7 @@ async fn pack_sealed(rx: async_channel::Receiver<Sealed>) {
 /// The packer's job ([`pack_sealed`]): the sealed chunks waiting, the one being packed, and the owners
 /// to tell once it ends.
 struct Packer {
-    rx: async_channel::Receiver<Sealed>,
+    rx: crate::memory::queue::Receiver<Sealed>,
     /// Those not begun, the newest last: taken newest first, so in a fill a long session's oldest, which
     /// it lets go of first ([`Events::drain_front`]), are gone before their turn comes rather than packed
     /// for nothing.
@@ -2333,7 +2341,7 @@ mod tests {
         let want = newest.deflate(Compression::default())?;
         let (owner, told) = crate::memory::queue::bounded::<Msg>(&crate::memory::owners::SESSION_INBOXES, 8 * MSG);
         let home = Home { inbox: owner.downgrade(), id: Arc::from("s") };
-        let (tx, rx) = async_channel::unbounded();
+        let (tx, rx) = sealed_queue();
         for c in [&oldest, &middle, &newest] {
             tx.try_send((Arc::downgrade(c), Some(home.clone()))).map_err(|_| anyhow::anyhow!("the packer's queue refused a chunk"))?;
         }
@@ -2368,6 +2376,39 @@ mod tests {
         assert!(matches!(packer.piece(&after_each), Step::Done(later) if later.is_empty()), "nothing left: the job ends");
         drop(owner);
         Ok(())
+    }
+
+    /// Goal 4, plan 01a1a59c2a9c step 5: the packer's queue (`sealed_queue`, lock-free) takes every owner's
+    /// sealed chunks at once from every shard, none refused and none waiting (no bound, as the channel it was
+    /// had none), and the packer has each owner's in the order it sealed them.
+    #[test]
+    fn g4_s5_sealed_chunks_reach_the_packer_from_every_shard_in_order() -> anyhow::Result<()> {
+        crate::rt::block_on(async {
+            let (owners, per) = (8usize, 2_000usize);
+            let (tx, rx) = sealed_queue();
+            let (inbox, _told) = crate::memory::queue::bounded::<Msg>(&crate::memory::owners::SESSION_INBOXES, MSG);
+            let mut sealing = Vec::new();
+            for o in 0..owners {
+                let (tx, inbox) = (tx.clone(), inbox.downgrade());
+                sealing.push(crate::rt::spawn_spread_joined(async move {
+                    (0..per).all(|n| tx.try_send((Weak::new(), Some(Home { inbox: inbox.clone(), id: Arc::from(format!("{o}/{n}")) }))).is_ok())
+                }));
+            }
+            drop(tx);
+            for s in sealing {
+                anyhow::ensure!(s.await.unwrap_or(false), "an owner's sealed chunk was refused");
+            }
+            let mut got = vec![Vec::new(); owners];
+            while let Ok((_, home)) = rx.try_recv() {
+                let id = home.map(|h| h.id.to_string()).unwrap_or_default();
+                let (o, n) = id.split_once('/').ok_or_else(|| anyhow::anyhow!("an entry without its home: {id}"))?;
+                got.get_mut(o.parse::<usize>()?).ok_or_else(|| anyhow::anyhow!("no owner {o}"))?.push(n.parse::<usize>()?);
+            }
+            for (o, theirs) in got.iter().enumerate() {
+                anyhow::ensure!(theirs.iter().copied().eq(0..per), "owner {o}'s: {} of {per}, in order: {}", theirs.len(), theirs.windows(2).all(|w| w.first() < w.get(1)));
+            }
+            Ok(())
+        })
     }
 
     /// Goal 11, plan 01a1a87b2e56 step 2: a copy whose sealed chunks are kept compact (their metas and

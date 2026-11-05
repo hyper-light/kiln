@@ -174,6 +174,15 @@ pub static CD_ACTIONS: Owner = Owner::new("cd_actions");
 /// among [`ALL`]: there's nothing on `/metrics` to see of it.
 pub static BROADCASTS: Owner = Owner::new("broadcasts");
 
+/// What moved to `crate::memory::queue` from async-channels bounded by a count, or not at all (goal 4, plan
+/// 01a1a59c2a9c step 5): a terminal's keystrokes and its output from its machine (`crate::termsess`), a
+/// conversation feed's links, its parts to send and its intake's answers (`crate::convo::feed`), a live job's
+/// writes (`crate::logs`), the sealed chunks waiting for the packer (`crate::harness::copies`), files read ahead
+/// of their requests and a socket's audit rows (`crate::api`). Each item is counted at its place alone
+/// (`crate::memory::queue::places`, `crate::memory::queue::unbounded`), as many as each channel held, so its
+/// bytes aren't what they carry: not among [`ALL`], as the channels they were weren't counted.
+pub static CHANNELS: Owner = Owner::new("channels");
+
 /// The owners counted here, in the order the exposition says them.
 /// kiln's log lines waiting for the thread that writes them to stdout (`crate::log_lines`; goal 9, plan 01a1a87b2cec
 /// step 3): at most [`crate::log_lines::LINES`] lines, journald's burst, and [`crate::log_lines::LINES_BYTES`], what
