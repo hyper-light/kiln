@@ -231,7 +231,39 @@ Written before the first measured round of the matrix (step 6), and held to by e
   (Bonferroni), leaves out none (`kiln-lab browser compare`).
 
 <!-- run plan: begin -->
-(The run plan's computation goes here: step 6.)
+`kiln-lab browser plan --k K` (2026-11-04), for the five targets of the bar in both browsers (8
+target rows: the HTTP/3 rows run in Chromium only), a 5 s background window twice before each job,
+a budget of 120 h:
+
+| K | hours in all | cells at the 3,688 floor |
+| --- | --- | --- |
+| 1 | 277.4 (over the budget) | every cell |
+| 8 | 109.6 | none |
+| 16 | 73.4 | none |
+
+The matrix runs at **K = 8**. Each case's pace on each profile is `runfile::workload`: a stream case
+sends an agent's events at 5 a second on the good link, 0.5 at 100 kbit/s and 0.25 at 50, with a
+terminal's and a log's lines at 20, 2 and 1 a second; a burst is an agent's turn of 40 events 25 ms
+apart, every 3, 20 and 40 s; requests go every 100 ms, 2 s and 4 s, open-loop, the UI's reads (the
+agents, the sessions, the overview, `me`, the notices, a session's snapshot) and its write (a
+message to an agent) in turn. Each job runs 60 s on the good link and 180 s on the slow ones. At K =
+8 (`kiln-lab browser plan --k 8`):
+
+| condition | case | operations a round (8 links) | rounds | hours |
+| --- | --- | --- | --- | --- |
+| good/0, good/1, good/5 | stream | 21,600 | 5 | 1.02 each |
+| good/0, good/1, good/5 | burst | 6,400 | 5 | 1.02 each |
+| good/0, good/1, good/5 | request | 4,800 | 5 | 1.02 each |
+| 100k/0, 100k/1, 100k/5 | stream | 6,480 | 5 | 2.54 each |
+| 100k/0, 100k/1, 100k/5 | burst | 2,880 | 5 | 2.54 each |
+| 100k/0, 100k/1, 100k/5 | request | 720 | 14 | 7.12 each |
+| 50k/0, 50k/1, 50k/5 | stream | 3,240 | 5 | 2.66 each |
+| 50k/0, 50k/1, 50k/5 | burst | 1,440 | 7 | 3.72 each |
+| 50k/0, 50k/1, 50k/5 | request | 360 | 28 | 14.87 each |
+
+The CPU measure's percentiles are across 1 s windows, so a cell's CPU p99.9 rests on its rounds'
+seconds, not its operations: under 3,688 windows (most cells) the CPU p99.9 is reported with its
+count and marked as not bounded, and its mean carries the cell.
 <!-- run plan: end -->
 
 ## Running it
