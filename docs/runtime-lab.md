@@ -1227,7 +1227,7 @@ What's live, by jemalloc's heap profile at the window's end: 165 MB (its estimat
 
 The rest of the anonymous memory is the allocator's: on glibc's malloc, 88 arenas (one for nearly each of
 the server's 88 threads) had taken 438 MB from the system with 297 MB of it free; under jemalloc, 261 MB
-resident held the 165 MB live. On musl's malloc, which production runs, the same code's 401 MB holds about
+resident held the 165 MB live. On musl's malloc, production's until step 4, the same code's 401 MB holds about
 the same live heap, so about 235 MB is what the allocator keeps. Against the bar: the live heap alone (165
 MB) is past 113 MB, and the binary's own resident pages (127 MB) are past it too, so step 5 needs the
 allocator's (step 4), less held live, and a word on whether file pages count.
@@ -1353,23 +1353,49 @@ The scripts are under `scripts/memory_lab/`: `bus-lab.sh` runs the rounds, `bus-
 
 ### The allocator (step 4)
 
-fedora, 2026-11-05 13:24 to 14:45 UTC, the realistic profile, calm, 4 shards, the server on CPUs 16-23 and
-the lab on 0-7: train 4's tree (`4b429f1a05c`), its glibc build and its static musl build (production's),
-in A/Bs of interleaved rounds (`g11alloc.sh`). Resident memory at the window's end, MB, the median of
-rounds; and what moved beyond noise, B against A, of the 203 numbers kiln-lab compares:
+fedora, 2026-11-05, the realistic profile, calm, 4 shards, the server on CPUs 16-23 and the lab on 0-7,
+in A/Bs of interleaved rounds (`g11alloc.sh`):
+- 13:24 to 14:45 UTC: train 4's tree (`4b429f1a05c`), its glibc build and its static musl build
+  (production's then), and glibc's arenas.
+- 17:18 to 18:01 UTC (g11alloc2): jemalloc with the settings below, in two ways:
+  - preloaded into that glibc build: Fedora's jemalloc 5.3.0 (`/usr/lib64/libjemalloc.so.2`), the
+    settings as `MALLOC_CONF`;
+  - compiled into rt-next `313b1774496`'s static musl build (kiln's `jemalloc` feature), against the same
+    build without it. That tree predates `os::alloc`, so the lab passed the settings as `_RJEM_MALLOC_CONF`,
+    the string `os::alloc` now compiles in.
+
+Resident memory at the window's end, MB, the median of rounds; and what moved beyond noise, B against A, of
+the numbers kiln-lab compares (203; 222 on rt-next's tree):
 
 | A against B | rounds | resident, A to B | anonymous | the binary's pages | latency beyond noise |
 | --- | --- | --- | --- | --- | --- |
 | glibc against musl | 8, 8 | 576 to 541 (within noise) | 449 to 415 | 128 to 127 | worse on musl: attach p50 3.5 to 4.7 ms; the server's wait p99 for API reads, writes and pages 0.10 to 0.25-0.28 ms |
 | glibc against `MALLOC_ARENA_MAX=2` | 8, 8 | 545 to 420 (-23%) | 419 to 293 | 128 to 129 | worse: bus delivery p99 0.25 to 0.50 ms (p99.9 0.74 to 1.69); websocket frames' server wait p99 0.25 to 0.50 ms; runners' messages took p99 0.21 to 0.33 ms (+56%); slow polls +42% |
 | glibc against `MALLOC_ARENA_MAX=5` | 7, 8 | 523 to 459 (-12%) | 396 to 333 | 129 to 128 | none |
-| glibc against jemalloc preloaded | 8, 8 | | | | |
-| musl against musl-jemalloc (kiln's `jemalloc` feature, `os::alloc`'s settings) | 8, 8 | | | | |
+| glibc against jemalloc preloaded | 8, 8 | 530 to 338 (-36%) | 403 to 212 (-47%) | 128 to 129 | worse: attach p50 3.3 to 4.4 ms (+33%, noise ±24%). Better: API writes' p50 1.0 to 0.7 ms |
+| musl against musl-jemalloc (kiln's `jemalloc` feature, `os::alloc`'s settings) | 8, 8 | 523 to 333 (-36%) | 398 to 207 (-48%) | 126 to 128 (+1.6%, worse beyond noise: jemalloc's own code) | none worse. Better: the server's wait p99.9 for API reads 1.16 to 0.25 ms and for pages 1.22 to 0.25 ms; compute's slowest piece 100 to 50 ms |
 
-(glibc's side of the `MALLOC_ARENA_MAX=5` A/B lost its last round to a full disk. The two jemalloc rows are
-run once the queue reaches them.) Before these: one round of the glibc build under jemalloc preloaded, its
-heap profile on, held 261 MB anonymous for 165 MB live (step 1); mimalloc, tried before, held 22.7% more
-resident memory, and idle 3.4 times glibc's anonymous memory (183 against 54 MB, research f18).
+glibc's side of the `MALLOC_ARENA_MAX=5` A/B lost its last round to a full disk.
+
+In the musl-jemalloc A/B, these medians moved within noise, musl to musl-jemalloc:
+- attach p50 8.1 to 5.4 ms;
+- API writes' p50 1.4 to 1.0 ms;
+- API reads' p99.9 2.3 to 2.1 ms;
+- pages' p99.9 1.8 to 1.3 ms;
+- the bus delivery's p99 0.25 to 0.27 ms, and runners' messages took p99 0.16 to 0.20 ms (glibc's 2 arenas
+  moved both beyond noise);
+- the shards' delays, and slow polls 11.5 to 10.0 a second.
+
+Each jemalloc server ran 92 threads to the other side's 88. The extra 4 are jemalloc's background threads,
+which start only when `background_thread:true` is set, so the settings reached jemalloc. The preloaded A/B
+ran train 4's tree. In rt-next's tree, the musl pair's, a packed snapshot goes out a piece at a time, each
+made on the blocking pool (step 5).
+
+Before these:
+- One round of the glibc build under jemalloc preloaded, its heap profile on, held 261 MB anonymous for
+  165 MB live (step 1).
+- mimalloc, tried before, held 22.7% more resident memory, and idle 3.4 times glibc's anonymous memory
+  (183 against 54 MB, research f18).
 
 glibc's default is eight arenas for every core: in the lab, 88, one for nearly each of the server's
 threads, each keeping what its threads freed (438 MB taken, 297 MB of it free). musl's malloc held about
@@ -1379,20 +1405,22 @@ the same as glibc's. So:
   one, by `mallopt(M_ARENA_MAX)` as the process starts (`kiln::os::alloc::init`, `main`'s first call),
   unless `MALLOC_ARENA_MAX` or `GLIBC_TUNABLES` says how many (so a lab can still A/B them). 5 held
   every latency number with 12% less resident memory. 2 took 23% off but doubled the bus delivery's p99,
-  so it isn't 2.
-- **Production's static musl build**: musl's malloc until the jemalloc A/B picks jemalloc. Then the
-  default of `ci/release/build.sh`'s one switch, `KILN_LINUX_ALLOCATOR` (`musl` or `jemalloc`), moves to
-  `jemalloc`, and the image and releases (`.kiln/image.yaml`, `.kiln/release.yaml`) build with kiln's
-  `jemalloc` feature. Both Linux targets build with it under zig's cc (zig 0.17.0 and cargo-zigbuild
-  0.23.4, as `build.sh` pins them): jemalloc's configure finds background threads, `MADV_DONTNEED` and
-  `MADV_FREE`, and the binaries stay static. A cross build can't ask its target's page size and takes
+  so it isn't 2. jemalloc preloaded held 36% less than glibc's default arenas, but its attach p50 was worse
+  beyond noise, so a glibc build keeps glibc's malloc.
+- **Production's static musl build: jemalloc**, the pick (below). `ci/release/build.sh`'s one switch,
+  `KILN_LINUX_ALLOCATOR` (`jemalloc` or `musl`), defaults to `jemalloc`. So the image and releases
+  (`.kiln/image.yaml`, `.kiln/release.yaml`, `.github/workflows/release.yml`) build with kiln's `jemalloc`
+  feature, and `KILN_LINUX_ALLOCATOR=musl` builds one with musl's malloc. Both Linux targets build with it
+  under zig's cc (zig 0.17.0 and cargo-zigbuild 0.23.4, as `build.sh` pins them): jemalloc's configure
+  finds background threads, `MADV_DONTNEED` and `MADV_FREE`, and the binaries stay static. A cross build can't ask its target's page size and takes
   4 KiB, and jemalloc refuses to start under a larger one ("Unsupported system page size"). arm64 Linux
   runs 4, 16 or 64 KiB pages (16 on Apple silicon and the Raspberry Pi 5's kernel), so its jemalloc takes
   64 KiB (tikv-jemalloc-sys's `JEMALLOC_SYS_WITH_LG_PAGE=16`, for that target alone).
 
-jemalloc's settings (`kiln::os::alloc`, its `malloc_conf`; `_RJEM_MALLOC_CONF` in the environment
-overrides them, so a lab can A/B them on one build). A unit test holds the string to the settings, and
-one with the feature has jemalloc read each back:
+jemalloc's settings live in `kiln::os::alloc`, its `malloc_conf`. `_RJEM_MALLOC_CONF` in the environment
+overrides them a setting at a time, so a lab can A/B them on one build. Unit tests hold the string to the
+settings and to what the lab ran. With the feature, jemalloc reads each back, and takes a variant from the
+environment over them:
 
 | Setting | Value | Basis |
 | --- | --- | --- |
@@ -1402,9 +1430,15 @@ one with the feature has jemalloc read each back:
 | `muzzy_decay_ms` | 0 | A page given back with `MADV_FREE` stays resident until the kernel wants memory (smaps' `LazyFree`), so resident memory doesn't count it as given back. At 0, what decays goes with `MADV_DONTNEED` at once. jemalloc 5.3's code has 0 too, though its manual says 10 s |
 | `thp` | never | fedora gives transparent huge pages only where asked (`madvise`), so the lab measures jemalloc without them. adacachy gives them to every anonymous mapping (`always`), and its khugepaged makes a 2 MiB range with 103 of its 512 pages in use one huge page again (`max_ptes_none` 409), filling in what purges gave back. With `never` (`MADV_NOHUGEPAGE` on jemalloc's mappings), production's heap runs as the lab measured it. The check program's glibc build on adacachy started at 6.3 MB anonymous with jemalloc's default (6 MB of it huge pages) and 0.5 MB with `never`. Its static musl build got huge pages only some runs: a fault takes one only when a free one is at hand |
 
-What the musl-jemalloc A/B decides: with resident memory below musl's beyond noise and no latency number
-worse, the switch's default moves to `jemalloc`. Variants are an environment away on the same build, for
-example `--env-b _RJEM_MALLOC_CONF=narenas:8` or `dirty_decay_ms:1000`.
+**The pick: jemalloc, with these settings, for production's static musl build.** The musl-jemalloc A/B
+decided it. On the build production runs, against musl's malloc:
+- resident memory fell from 523 to 333 MB (-36%), and anonymous memory from 398 to 207 MB (-48%), both
+  beyond noise;
+- no latency number was worse beyond noise, and three were better.
+
+So the switch's default is `jemalloc`. The one number worse beyond noise is the binary's own resident pages,
+126 to 128 MB (+1.6%). That's jemalloc's code: the binary is 3.1 MB larger. Variants are an environment
+away on the same build, for example `--env-b _RJEM_MALLOC_CONF=narenas:8` or `dirty_decay_ms:1000`.
 
 ## Goal 10: API reads and frames in under a millisecond
 

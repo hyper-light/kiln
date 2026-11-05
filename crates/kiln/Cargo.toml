@@ -7,12 +7,11 @@ license.workspace = true
 [features]
 # Fault injection for tests (docs/ci.md W22-AC04): `kiln agent --chaos`, `KILN_CHAOS`.
 chaos = []
-# The binary allocates through jemalloc on Linux, for the allocator's A/B (goal 11, plan 01a1a87b2e56 step 4) on
-# the build production runs (static musl, whose malloc takes no preload): in the lab's realistic profile the
-# server's anonymous memory was 261 MB on jemalloc (one round, its profile on), 393 MB on glibc's malloc and
-# 401 MB on musl's (the median of 8; g11load, 2026-11-05). Off until the A/B, latency included, says so;
-# ci/release/build.sh takes it with KILN_LINUX_ALLOCATOR=jemalloc. Its settings are `os::alloc`'s, which its
-# tests read back from jemalloc itself (tikv-jemalloc-sys's mallctl).
+# The binary allocates through jemalloc on Linux (goal 11, plan 01a1a87b2e56 step 4). ci/release/build.sh takes it
+# for production's static musl build by default (KILN_LINUX_ALLOCATOR=musl leaves it out). That's the lab's pick:
+# in the realistic profile, the server's resident memory went from 523 to 333 MB against musl's malloc, and no
+# latency number was worse beyond noise (docs/runtime-lab.md). Cargo's builds leave it off unless asked. Its
+# settings are `os::alloc`'s, which its tests read back from jemalloc itself (tikv-jemalloc-sys's mallctl).
 jemalloc = ["dep:tikv-jemallocator", "dep:tikv-jemalloc-sys"]
 
 # The wire lab drives faults only a build with `chaos` has: asked for without it, cargo says so
