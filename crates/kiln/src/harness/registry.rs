@@ -2255,6 +2255,11 @@ impl Registry {
             m.changes_sent = None;
             changed = true;
         }
+        // The chunk its owner last read back for a change, or tried: changed where it is, should it still be compact.
+        let thawed = s.thawed();
+        // The compact chunk this update's next event changes, to be read back off the shard first (goal 9, plan
+        // 01a1a87b2cec step 3: `super::copies::Shard::want_thaw`).
+        let mut thaw = None;
         let Some(m) = s.get_mut(id) else {
             // Its events are stored all the same, as they were before a copy took them.
             if let Some(store) = store.filter(|_| matches!(u, Update::Events { .. })) {
@@ -2268,6 +2273,14 @@ impl Registry {
             }
             return None;
         };
+        // Its first event changes one in a compact chunk: nothing of it is taken yet, all of it the rest, once that chunk is
+        // read back off the shard (goal 9, plan 01a1a87b2cec step 3).
+        if let Update::Events { events } = &u
+            && let Some(c) = events.first().and_then(|e| m.thaw_for(&e.id, e.seq)).filter(|c| !std::ptr::eq(thawed.as_ptr(), Arc::as_ptr(c)))
+        {
+            s.want_thaw(id, c);
+            return Some(Ingest { from, id: id.to_owned(), u, shipped, reported: String::new() });
+        }
         m.rev = m.rev.saturating_add(1);
         match &u {
             // A whole snapshot follows (not one that goes on from what the copy has): its
@@ -2365,6 +2378,12 @@ impl Registry {
             }
             Update::Events { events } => {
                 for e in events {
+                    // One the copy has in a compact chunk: that chunk is read back off the shard before it's changed, and this
+                    // event and those after it are the rest, its owner's next (as when its turn is spent, below).
+                    if let Some(c) = m.thaw_for(&e.id, e.seq).filter(|c| !std::ptr::eq(thawed.as_ptr(), Arc::as_ptr(c))) {
+                        thaw = Some(c);
+                        break;
+                    }
                     // Written out once, for the copy and for its row alike (goal 9, plan 01a1a87b2cec step 5).
                     let entry = Arc::new(if store.is_some() {
                         Entry::of_event(e, Some(&mut |text: String| rows.push(crate::convo::rows::Row::Event(Box::new(crate::convo::rows::event_written(id, e, text))))))
@@ -2485,6 +2504,9 @@ impl Registry {
             hub.emit(&crate::wire::events::ServerEvent::HarnessClosed { id: id.to_string() });
         } else if changed && let Some(m) = s.get(id) {
             hub.emit_harness(id, m.info_encoded());
+        }
+        if let Some(c) = thaw {
+            s.want_thaw(id, c);
         }
         rest.map(|u| Ingest { from, id: id.to_owned(), u, shipped, reported: String::new() })
     }
@@ -3573,16 +3595,21 @@ impl Registry {
         }
         let (st, i, f) = (store.clone(), id.to_owned(), from_name.clone());
         let (from_shown, to_shown) = (hub.shown(&from_name), hub.shown(to));
-        let mut pkg = crate::rt::blocking(move || crate::convo::resume::package(&st, &i, &f, cwd.as_deref(), (&from_shown, &to_shown)))
-            .await
-            .map_err(|e| format!("{e:#}"))?
-            .map_err(|e| format!("{e:#}"))?;
+        // The package, and its timeline for kiln's take of it (every event's digest), made on the blocking pool (goal 9,
+        // plan 01a1a87b2cec step 3).
+        let (mut pkg, timeline) = crate::rt::blocking(move || crate::convo::resume::package(&st, &i, &f, cwd.as_deref(), (&from_shown, &to_shown)).map(|p| {
+            let t = crate::custody::timeline(&i, p.state.epoch, &p.events);
+            (p, t)
+        }))
+        .await
+        .map_err(|e| format!("{e:#}"))?
+        .map_err(|e| format!("{e:#}"))?;
         // kiln takes it for the process that held it, which can't hand it on: the package carries
         // the take, which the receipt follows as a hand-on's (docs/ci.md W27-R08).
         let heard = hub.agents.load().get(&from_name).map(|a| a.last_seen).unwrap_or_default();
         let when = time::OffsetDateTime::from_unix_timestamp(heard).ok().and_then(|t| t.format(&time::format_description::well_known::Rfc3339).ok()).unwrap_or_else(|| "never".to_owned());
         let why = format!("resumed from kiln's copy: {} was last heard from at {when}", hub.shown(&from_name));
-        match crate::custody::take_for(&hub.store, &hub.pki, id, pkg.state.epoch, &pkg.events, &why).await {
+        match crate::custody::take_for(&hub.store, &hub.pki, id, pkg.state.epoch, timeline, &why).await {
             Ok(take) => pkg.hand_on = take,
             Err(e) => tracing::warn!(target: "kiln.custody", session = %id, error = %format!("{e:#}"), "kiln couldn't take a session it resumes from its copy: it goes on unsigned"),
         }
