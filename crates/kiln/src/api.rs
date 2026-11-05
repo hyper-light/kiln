@@ -166,10 +166,13 @@ impl srv::Handler for Api {
         let upgrade = req.headers().get(header::UPGRADE).is_some_and(|v| v.as_bytes().eq_ignore_ascii_case(b"websocket"));
         let class = crate::route_latency::class_of(req.method(), req.uri().path(), upgrade);
         let waited = req.extensions().get::<kiln_http::Received>().map(|r| began.saturating_duration_since(r.0));
+        // How its answer goes out (compressed, validated): read before the route takes the request (W21-R15).
+        let asked = crate::http::compress::Asked::of(&req);
         let resp = match route(hub, req).await {
             Ok(r) => r,
             Err(e) => e.into_response(),
         };
+        let resp = crate::http::compress::finish(asked, resp).await;
         if let Some(class) = class {
             crate::route_latency::observe(class, waited, began.elapsed());
         }
