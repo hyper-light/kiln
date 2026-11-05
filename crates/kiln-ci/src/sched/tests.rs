@@ -2344,7 +2344,7 @@ fn the_default_target_use_is_each_runners_knee_and_its_available_memory() {
         assert_eq!((knee(m) * 100.0).round() as i64, pct, "{m} CPUs: {}", knee(m));
     }
     assert!((1..200).all(|m| knee(m) < knee(m + 1)), "more CPUs, a later knee");
-    let h = |cpus: u32, busy: f64, used: u64| Headroom::of(&Sample { cpus, busy, load1: 0.0, mem_total: 64 * GIB, mem_used: used * GIB, io_full: None });
+    let h = |cpus: u32, busy: f64, used: u64| Headroom::of(&Sample { cpus, busy, load1: 0.0, mem_total: 64 * GIB, mem_used: used * GIB, io_full: None, mem_full: None });
     let one = Resources { cpu: Cpus::whole(1), mem: GIB, ..Resources::default() };
     // 32 CPUs at 84%: one more is 87%, past 32's knee (86%); at 82%, 85% is within it.
     assert!(!h(32, 0.84, 8).within(&one, TargetUse::Derived));
@@ -2359,7 +2359,7 @@ fn the_default_target_use_is_each_runners_knee_and_its_available_memory() {
     // The wait says the strictest knee of the runners it would pass.
     let mut s = Scheduler::new(Config::default());
     s.handle(Input::RunnerUp(Box::new(linux("a", 8))), 0);
-    s.handle(Input::RunnerSample { runner: "a".into(), sample: Sample { cpus: 32, busy: 0.84, load1: 0.0, mem_total: 64 * GIB, mem_used: 8 * GIB, io_full: None } }, 1);
+    s.handle(Input::RunnerSample { runner: "a".into(), sample: Sample { cpus: 32, busy: 0.84, load1: 0.0, mem_total: 64 * GIB, mem_used: 8 * GIB, io_full: None, mem_full: None } }, 1);
     s.handle(Input::LegQueued(Box::new(LegIn { request: one, ..leg("x", "acme/x", 60) })), 2);
     assert!(matches!(s.reason("x"), Some(WaitReason::Headroom { target: 86, .. })), "{:?}", s.reason("x"));
 }
