@@ -266,7 +266,7 @@ pub async fn missing(hub: &Hub, job: &Job) -> Missing {
 pub async fn report(hub: &Hub, id: &str) -> Result<Value, (StatusCode, String)> {
     let job = hub.store.job(id.to_owned()).await.map_err(internal)?.ok_or((StatusCode::NOT_FOUND, "no such job".to_owned()))?;
     let m = missing(hub, &job).await;
-    let fix = hub.tool_fixes.lock().get(id).cloned();
+    let fix = hub.tool_fixes.load().get(id).cloned();
     Ok(json!({ "job": id, "missing": m, "fix": fix }))
 }
 
@@ -315,25 +315,24 @@ pub async fn fix(hub: Arc<Hub>, caller: crate::authz::Caller, id: &str, ask: Ask
     }
     // The job is this ask's while its agent starts: one asked for meanwhile is told so.
     let f = Fix { agent: String::new(), runner: runner.clone(), tools: tools.clone(), state: "working".into(), note: None, by: caller.name.clone(), started_at: crate::util::now_unix() };
-    let before = {
-        let mut g = hub.tool_fixes.lock();
+    let before = hub.tool_fixes.update(|g| {
         if g.get(id).is_some_and(under_way) {
-            return Err((StatusCode::CONFLICT, "an agent is already installing what this job lacks".into()));
+            return Err(());
         }
         g.retain(|_, o| under_way(o) || f.started_at - o.started_at < FORGET_AFTER);
-        g.insert(id.to_owned(), f.clone())
-    };
+        Ok(g.insert(id.to_owned(), f.clone()))
+    });
+    let Ok(before) = before else { return Err((StatusCode::CONFLICT, "an agent is already installing what this job lacks".into())) };
     // The agent didn't start: the job's fix is what it was.
     let undo = || {
-        let mut g = hub.tool_fixes.lock();
-        match &before {
+        hub.tool_fixes.update(|g| match &before {
             Some(b) => {
                 g.insert(id.to_owned(), b.clone());
             }
             None => {
                 g.remove(id);
             }
-        }
+        });
     };
     let cx = crate::ops::Cx { hub: Arc::clone(&hub), caller: caller.clone() };
     let started = match crate::ops::call(cx.clone(), "agents.start", input).await {
@@ -349,7 +348,7 @@ pub async fn fix(hub: Arc<Hub>, caller: crate::authz::Caller, id: &str, ask: Ask
         return Err((StatusCode::BAD_GATEWAY, format!("no agent started on {shown}: {started}")));
     }
     let f = Fix { agent: agent.clone(), ..f };
-    hub.tool_fixes.lock().insert(id.to_owned(), f.clone());
+    hub.tool_fixes.update(|g| g.insert(id.to_owned(), f.clone()));
     hub.store.audit(caller.name.clone(), "job.tools.fix".into(), format!("{id}: {} on {runner}, agent {agent}", tools.join(", "))).await;
     hub.emit_job(id).await;
     let (hub2, id2) = (Arc::clone(&hub), id.to_owned());
@@ -381,7 +380,7 @@ fn brief(runner: &str, job: &str, repo: &str, number: i64, tools: &[String], why
 /// the job again. While it waits on a person, is paused or its machine is away, kiln waits for a
 /// change rather than for it to settle (which it already has).
 async fn follow(hub: Arc<Hub>, cx: crate::ops::Cx, id: String) {
-    let Some(agent) = hub.tool_fixes.lock().get(&id).map(|f| f.agent.clone()) else { return };
+    let Some(agent) = hub.tool_fixes.load().get(&id).map(|f| f.agent.clone()) else { return };
     let until = std::time::Instant::now() + FOLLOW_FOR;
     let (mut wait_for, mut misses) = ("settled", 0u32);
     loop {
@@ -420,7 +419,7 @@ async fn follow(hub: Arc<Hub>, cx: crate::ops::Cx, id: String) {
 
 /// After the agent: the runner's facts again, then the job again.
 async fn check(hub: Arc<Hub>, id: &str) {
-    let Some(fix) = hub.tool_fixes.lock().get(id).cloned() else { return };
+    let Some(fix) = hub.tool_fixes.load().get(id).cloned() else { return };
     let _ = crate::api::probe_agent(&hub, &fix.runner).await;
     let Ok(Some(job)) = hub.store.job(id.to_owned()).await else { return };
     let facts = hub.agents.lock().get(&fix.runner).and_then(|a| a.facts.as_deref().cloned());
@@ -472,14 +471,14 @@ fn under_way(f: &Fix) -> bool {
 }
 
 async fn set(hub: &Hub, id: &str, state: &str, note: Option<String>) {
-    let changed = match hub.tool_fixes.lock().get_mut(id) {
+    let changed = hub.tool_fixes.update(|g| match g.get_mut(id) {
         Some(f) if f.state != state || f.note != note => {
             f.state = state.to_owned();
-            f.note = note;
+            f.note.clone_from(&note);
             true
         }
         _ => false,
-    };
+    });
     if changed {
         hub.emit_job(id).await;
     }
@@ -603,7 +602,7 @@ mod tests {
             let dev = crate::authz::Caller::with(crate::authz::gate::Kind::User, "user:dev", Some(crate::authz::Rights { grants: vec![grant], ..Default::default() }), None);
             let refused = fix(Arc::clone(&hub), dev, &job, Ask { runner: None, kind: None, mode: None }).await;
             assert_eq!(refused.err().map(|(c, _)| c), Some(StatusCode::FORBIDDEN));
-            assert!(hub.tool_fixes.lock().get(&job).is_none(), "a refused ask claims nothing");
+            assert!(hub.tool_fixes.load().get(&job).is_none(), "a refused ask claims nothing");
 
             if let Some(a) = hub.agents.lock().get_mut("adas-mac-studio-3") {
                 a.terminal = false;
@@ -612,7 +611,7 @@ mod tests {
             assert!(lacks.pointer("/missing/no_agent").and_then(Value::as_str).is_some_and(|w| w.contains("without terminals")), "{lacks}");
             let shut = fix(Arc::clone(&hub), crate::authz::Caller::owner(), &job, Ask { runner: None, kind: None, mode: None }).await;
             assert_eq!(shut.err().map(|(c, _)| c), Some(StatusCode::CONFLICT));
-            assert!(hub.tool_fixes.lock().get(&job).is_none(), "nor does one no agent can do");
+            assert!(hub.tool_fixes.load().get(&job).is_none(), "nor does one no agent can do");
             Ok(())
         })
     }

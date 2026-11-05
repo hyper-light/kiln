@@ -381,9 +381,49 @@ pub async fn get(hub: &Hub, agent: &str) -> R<Stack> {
     stack_of(&hub.store, agent).await
 }
 
+/// The tables an agent's goal stack is made of.
+pub const STACKS_FROM: &[&str] = &["goal_stacks", "goal_items"];
+
+/// Every agent's goal stack as `GET /api/harness/sessions/{id}/goals` answers it ([`get`]), kept in
+/// memory (`crate::reads::Kept`; goal 10, plan 01a1a87b2dae step 2): each agent's with a stack or
+/// goals encoded once, and the empty stack every other agent has, encoded but for its name.
+pub struct Stacks {
+    by: HashMap<String, bytes::Bytes>,
+    /// An empty stack's JSON after its agent's name (`{"agent":<name>` before it).
+    empty: bytes::Bytes,
+}
+
+/// Every agent's goal stack, as the store's tables hold them now, each encoded once.
+pub fn stacks(c: &rusqlite::Connection) -> anyhow::Result<Stacks> {
+    let agents = c.prepare("SELECT agent FROM goal_stacks UNION SELECT agent FROM goal_items")?.query_map([], |r| r.get::<_, String>(0))?.collect::<Result<Vec<_>, _>>()?;
+    let mut by = HashMap::with_capacity(agents.len());
+    for agent in agents {
+        let stack = load(c, &agent)?;
+        by.insert(agent, bytes::Bytes::from(serde_json::to_vec(&stack)?));
+    }
+    let none = serde_json::to_vec(&empty_stack(String::new()))?;
+    let empty = none.strip_prefix(br#"{"agent":"""#).map(<[u8]>::to_vec).ok_or_else(|| anyhow::anyhow!("an empty stack's JSON doesn't begin with its agent"))?;
+    Ok(Stacks { by, empty: empty.into() })
+}
+
+impl Stacks {
+    /// Agent `agent`'s stack as [`get`] answers it: joined, not encoded but for its name.
+    pub fn answer(&self, agent: &str) -> anyhow::Result<bytes::Bytes> {
+        if let Some(s) = self.by.get(agent) {
+            return Ok(s.clone());
+        }
+        let name = serde_json::to_vec(agent)?;
+        let mut out = Vec::with_capacity(br#"{"agent":"#.len() + name.len() + self.empty.len());
+        out.extend_from_slice(br#"{"agent":"#);
+        out.extend_from_slice(&name);
+        out.extend_from_slice(&self.empty);
+        Ok(out.into())
+    }
+}
+
 async fn stack_of(store: &crate::store::Store, agent: &str) -> R<Stack> {
     let agent = agent.to_owned();
-    Ok(store.call(move |c| load(c, &agent)).await?)
+    Ok(store.read(move |c| load(c, &agent)).await?)
 }
 
 fn load(c: &rusqlite::Connection, agent: &str) -> anyhow::Result<Stack> {
@@ -431,9 +471,17 @@ fn load(c: &rusqlite::Connection, agent: &str) -> anyhow::Result<Stack> {
             })
         })?
         .collect::<Result<Vec<_>, _>>()?;
-    let (state, reason, updated_at, dropped_at, cleared, resume_at, held_for, plan_big, side_by_side, asked) = head.unwrap_or_else(|| ("paused".into(), None, 0, 0, 0, 0, None, true, true, None));
+    let Some((state, reason, updated_at, dropped_at, cleared, resume_at, held_for, plan_big, side_by_side, asked)) = head else {
+        return Ok(Stack { items, ..empty_stack(agent.to_owned()) });
+    };
     let asked = asked.and_then(|a| serde_json::from_str(&a).ok()).unwrap_or_default();
     Ok(Stack { agent: agent.to_owned(), state, reason, items, updated_at, cleared, resume_at, held_for, plan_big, side_by_side, dropped_at, asked })
+}
+
+/// The stack of an agent with none kept: paused, its big goals planned first and those that don't wait
+/// for each other side by side.
+fn empty_stack(agent: String) -> Stack {
+    Stack { agent, state: "paused".into(), plan_big: true, side_by_side: true, ..Stack::default() }
 }
 
 /// What a goal stack last said to its agent through its queue (`say`): the message, while it may
