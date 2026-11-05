@@ -310,7 +310,7 @@ fn bp_g3_s1_the_kernel_buffers_read_back() {
     const BUFFER: u32 = 64 << 10;
     let want = if cfg!(target_os = "linux") { 2 * BUFFER } else { BUFFER };
     let mut rt = LocalRuntime::new(&config()).unwrap();
-    rt.block_on(async {
+    rt.block_on(async move {
         let listener =
             TcpListener::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)), BACKLOG).unwrap();
         let client = TcpStream::connect(listener.local_addr().unwrap()).await.unwrap();
