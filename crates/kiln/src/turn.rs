@@ -570,6 +570,7 @@ mod tests {
             ("plans/review.rs", include_str!("plans/review.rs")),
             ("programs/mod.rs", include_str!("programs/mod.rs")),
             ("programs/ops.rs", include_str!("programs/ops.rs")),
+            ("reach/node.rs", include_str!("reach/node.rs")),
             ("records.rs", include_str!("records.rs")),
             ("records/turso.rs", include_str!("records/turso.rs")),
             ("research/mod.rs", include_str!("research/mod.rs")),

@@ -693,9 +693,11 @@ struct Served {
     /// When it was told to stop for its timeout (then killed if it won't).
     stopping: Option<Instant>,
     timed_out: bool,
-    /// Shared with the run's forwarder: bytes held, and its wake-up when that drops.
+    /// Shared with the run's forwarder: bytes held, and its wake-up when that drops (`crate::rt::Changed`, no
+    /// lock; goal 5, plan 01a1a59c2aae, its top goal: it was an event-listener `Event`, its list behind a `Mutex`
+    /// the node's loop and the forwarder took on the runner's shards).
     held: Arc<AtomicU64>,
-    room: Arc<event_listener::Event>,
+    room: Arc<crate::rt::Changed>,
     /// Its output's SHA-256 so far, each byte as the run said it (docs/ci.md W27-R08).
     out: sha2::Sha256,
     /// What it was taken as (its receipt, whom its output goes to), on a link that carries
@@ -725,7 +727,7 @@ impl Served {
             self.acked = self.acked.max(end);
             self.sent = self.sent.max(end);
         }
-        self.room.notify(usize::MAX);
+        self.room.notify();
     }
 }
 
@@ -1473,7 +1475,7 @@ impl Node {
                                 run.held.fetch_sub(d.len() as u64, Ordering::Relaxed);
                             }
                         }
-                        run.room.notify(usize::MAX);
+                        run.room.notify();
                         run.acked = r.from.max(run.acked);
                         run.sent = run.acked;
                         run.exit_sent = false;
@@ -1525,7 +1527,7 @@ impl Node {
                             r.held.fetch_sub(d.len() as u64, Ordering::Relaxed);
                         }
                     }
-                    r.room.notify(usize::MAX);
+                    r.room.notify();
                 }
                 self.pump(&key, id).await;
             }
@@ -1661,7 +1663,7 @@ impl Node {
             self.cfg.dir.join("shells").join(&key.0).join(&key.1).join(safe)
         });
         let held = Arc::new(AtomicU64::new(0));
-        let room = Arc::new(event_listener::Event::new());
+        let room = Arc::new(crate::rt::Changed::new());
         let (ev_tx, ev_rx) = crate::memory::queue::places::<serve::Event>(&crate::memory::owners::CHANNELS, 16);
         let extra = vec![("KILN_REACH_FROM".to_owned(), key.0.clone())];
         // A run in a copy holds it in use until the run's last event, noted as the agent's that
