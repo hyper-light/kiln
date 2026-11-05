@@ -244,6 +244,12 @@ pub fn held(before: &Scrape, after: &Scrape, secs: f64) -> Vec<Held> {
     out
 }
 
+/// The step quantum the server's shards ran with, µs, where the build says it (`kiln_shard_quantum_seconds`, goal 9,
+/// plan 01a1a87b2cec step 3): the largest any shard said.
+pub fn quantum_us(s: &Scrape) -> Option<f64> {
+    s.series.iter().filter(|(n, _, _)| n == "kiln_shard_quantum_seconds").map(|(_, _, v)| *v * 1e6).reduce(f64::max)
+}
+
 /// Two scrapes' histogram buckets, the second less the first: what the window added.
 pub fn delta(before: &[(f64, f64)], after: &[(f64, f64)]) -> Vec<(f64, f64)> {
     after.iter().map(|(b, n)| (*b, n - before.iter().find(|(bb, _)| bb == b).map_or(0.0, |(_, m)| *m))).collect()
@@ -322,6 +328,15 @@ mod tests {
         assert_eq!((page.site.as_str(), page.label.as_str()), ("a.rs:1:1", "page"));
         assert!((page.polls - 3.0).abs() < 1e-9 && (page.ms - 6.0).abs() < 1e-9 && (page.ms_per_s - 3.0).abs() < 1e-9 && (page.longest_ms - 4.0).abs() < 1e-9, "{page:?}");
         assert!(page.host_polls == 0.0 && page.host_ms == 0.0, "a build that doesn't say the host's: none {page:?}");
+    }
+
+    /// Goal 9, plan 01a1a87b2cec step 3: the quantum the shards ran with is read off the server's `/metrics`, the
+    /// largest any shard said, in µs; a build that doesn't say it has none.
+    #[test]
+    fn g9_s3_the_shards_quantum_is_read_off_metrics() {
+        let s = Scrape::parse("kiln_shard_quantum_seconds{shard=\"0\"} 0.000266666\nkiln_shard_quantum_seconds{shard=\"1\"} 0.00025\n");
+        assert!(quantum_us(&s).is_some_and(|q| (q - 266.666).abs() < 1e-6), "{:?}", quantum_us(&s));
+        assert_eq!(quantum_us(&Scrape::parse("kiln_shard_polls_total{shard=\"0\"} 5\n")), None);
     }
 
     /// Goal 9, plan 01a1a87b2cec steps 3 and 4: of what held the shards in a window, the polls the host held and

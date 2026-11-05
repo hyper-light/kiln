@@ -309,6 +309,10 @@ pub struct Round {
     pub held: Vec<measure::Held>,
     #[serde(default)]
     pub fill_held: Vec<measure::Held>,
+    /// The step quantum the server's shards ran with, µs (`kiln_shard_quantum_seconds`, goal 9, plan 01a1a87b2cec
+    /// step 3): what the report holds what held the shards to. None from a build from before it said.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub quantum_us: Option<f64>,
     /// A build that counts its locks (`scripts/locks.py census`, goal 5 of the API runtime program,
     /// plan 01a1a59c2aae step 1): each place a lock is taken, by its site and kind, with what the
     /// window and the fill took there. Kept apart from `numbers`, which an A/B compares one by one.
@@ -939,7 +943,8 @@ pub fn round(build: &Build, p: &Profile, hogs: usize, place: &Place, dir: &Path,
     let mut seen: BTreeMap<String, measure::Seen> = seen.into_iter().map(|(c, s)| (c.name().to_owned(), s)).collect();
     seen.extend(measure::seen_by_what(&in_window));
     seen.extend(frames_against_attaches(&watches, window));
-    Ok(Round { build: build.label.clone(), index, hogs, machine: m, fill_s, shards, numbers, seen, held, fill_held, locks })
+    let quantum_us = measure::quantum_us(&after);
+    Ok(Round { build: build.label.clone(), index, hogs, machine: m, fill_s, shards, numbers, seen, held, fill_held, quantum_us, locks })
 }
 
 /// The window's frames (stamped in it) told apart by how they met the attaches, as each viewer saw
