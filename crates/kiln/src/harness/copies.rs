@@ -255,6 +255,8 @@ impl Chunk {
         if let Some(s) = self.packed.take() {
             SEGMENT_BYTES.fetch_sub(s.deflated.len(), Ordering::Relaxed);
         }
+        // Changed, it's to be packed again once it's sealed (`Events::compact`).
+        *self.sealing.get_mut() = false;
     }
 
     /// Its event `k` changed by `f`, with its meta and where those after it begin.
