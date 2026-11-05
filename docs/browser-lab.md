@@ -207,13 +207,17 @@ for goal 7) and `--stall 10` (the server stopped, every process of it, for 2 s, 
 request job). On 2026-11-04 (`~/.cache/kiln-bp/g1/check4`, the good link, kiln today, h2o over
 HTTP/2 and Caddy over HTTP/3, 2 links, 30 s jobs):
 
-- calibration: the residual's p99, worst job 20.5 µs, median job 14.2 µs (within 200 µs);
+- calibration: the residual's p99, worst job 20.5 µs, median job 14.2 µs (within 200 µs); in the
+  pilot's first jobs at K = 8, on the lab machine at a load of about 67 with no core idle, the worst
+  job's was 232 µs and the median job's 75 µs: on a busy machine eight browsers' echoes wait for a
+  core, so the matrix's good-link times carry up to a quarter of a millisecond of clock error;
 - capture against counters: 0.00% apart in all six jobs (2.1 MB to 15.8 MB each);
 - the probe's sizes above the transport against the real UI's, where the UI's payloads were the
   same each time: `GET /api/agents` 1.4%, `GET /api/me` 0.0%, `GET /api/overview` 0.1%, the
-  terminal's frames 0.1% apart; the message to an agent was 3.7% apart while the probe sent one id
-  for every message (the server answered repeats differently), and now sends a new id each time as
-  the UI does; operations whose payloads follow the lab kiln's state (the sessions' list, the
+  terminal's frames 0.1% apart; the message to an agent's answer was 3.7% apart with one id for
+  every message, and 8.3% apart (169 bytes against 156) with a new id each time as the UI sends
+  them: kiln's answer follows the agent's state (a message sent while a turn is under way is
+  answered as waiting), which the recording's agent and the run's don't share; operations whose payloads follow the lab kiln's state (the sessions' list, the
   notices, the metrics' history, `/api/events`, a session's frames) aren't compared;
 - the stall: the longest request waited 2,156 ms (kiln today), 2,097 ms (h2o) and 2,001 ms (Caddy)
   from its scheduled time: the whole wait counted;
