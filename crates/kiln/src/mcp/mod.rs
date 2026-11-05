@@ -580,7 +580,15 @@ pub(crate) async fn respond(hub: &Arc<Hub>, caller: Caller, read: Result<bytes::
         }
     };
     match answer(hub, caller, &bytes).await {
-        Some(a) => srv::json(StatusCode::OK, &a),
+        // Encoded in a turn of the shard's of its own: a tool's result is made, written out as its text, and then
+        // encoded again with that text in the answer, each a long computation for a long result, and in one poll
+        // they held the shard 1.2 ms a call at the mean in g11alloc2's calm rounds (`agents_list`'s), every read on
+        // that shard waiting behind them. Past its turn, with something else wanting the shard, the call gives it
+        // up between them (goal 10, plan 01a1a87b2dae step 5; `crate::rt::consume_budget`).
+        Some(a) => {
+            crate::rt::consume_budget().await;
+            srv::json(StatusCode::OK, &a)
+        }
         None => srv::status(StatusCode::ACCEPTED),
     }
 }
@@ -820,7 +828,12 @@ impl Server {
                     return tool_error_value(misfit(&self.hub, crate::wire::unread::Wire::McpHttp, &self.caller, &format!("tools/call {name}"), op.name, &m, None).await);
                 }
                 match crate::ops::call(cx, op.name, args).await {
-                    Ok(v) => tool_ok(v),
+                    // Its text, the result written out whole, made in a turn of the shard's of its own
+                    // (`respond`'s notes).
+                    Ok(v) => {
+                        crate::rt::consume_budget().await;
+                        tool_ok(v)
+                    }
                     Err((_, e)) => tool_error(&e),
                 }
             }
