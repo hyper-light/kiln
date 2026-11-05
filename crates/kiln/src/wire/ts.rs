@@ -194,6 +194,11 @@ pub fn hand_written(ui_src: &Path, generated: &Path, names: &[String]) -> Vec<St
                 continue;
             }
             let Ok(text) = std::fs::read_to_string(&path) else { continue };
+            // The browser protocol's codec is made from Rust too (kiln-bp's own types, which share
+            // some names with these: docs/browser-protocol.md).
+            if text.starts_with("// Made from kiln-bp's Rust types") {
+                continue;
+            }
             for (n, line) in text.lines().enumerate() {
                 let l = line.trim_start();
                 let l = l.strip_prefix("export ").unwrap_or(l);
