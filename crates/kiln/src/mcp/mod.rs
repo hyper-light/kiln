@@ -1352,4 +1352,33 @@ mod tests {
         assert_eq!(instructions(&Caller::owner()), INSTRUCTIONS);
         assert!(skills::list().iter().any(|s| s.get("name").and_then(Value::as_str) == Some("kiln-plans")), "the skill the instructions name is there");
     }
+
+    /// Goal 9, plan 01a1a87b2cec step 3: `agents_list` through `/api/mcp`, its briefs and its JSON made in turns of the
+    /// shard's (goal 10's), answers whole: its text is its structured result's JSON, which lists every agent the caller
+    /// sees, in the registry's order, each one's brief; and the answer is that, as JSON.
+    #[test]
+    fn g9_s3_agents_list_through_mcp_is_answered_whole() -> anyhow::Result<()> {
+        use http_body_util::BodyExt as _;
+        crate::rt::block_on(async {
+            let hub = crate::hub::tests::scratch_hub().await?;
+            for id in ["s1", "s2", "s3"] {
+                hub.harness.ingest(&hub, &crate::harness::registry::Location::Machine("box".into()), id, open(id)).await;
+            }
+            let body = bytes::Bytes::from_static(br#"{"jsonrpc":"2.0","id":7,"method":"tools/call","params":{"name":"agents_list","arguments":{}}}"#);
+            let r = respond(&hub, Caller::owner(), Ok(body)).await;
+            anyhow::ensure!(r.status() == StatusCode::OK && r.headers().get(http::header::CONTENT_TYPE).and_then(|v| v.to_str().ok()) == Some("application/json"), "{:?}", r.headers());
+            let answer: Value = serde_json::from_slice(&r.into_body().collect().await.map(|b| b.to_bytes()).unwrap_or_default())?;
+            anyhow::ensure!(answer.get("id") == Some(&json!(7)) && answer.pointer("/result/isError") == Some(&json!(false)), "{answer}");
+            let structured = answer.pointer("/result/structuredContent").cloned().unwrap_or_default();
+            let text: Value = serde_json::from_str(answer.pointer("/result/content/0/text").and_then(Value::as_str).unwrap_or_default())?;
+            anyhow::ensure!(text == structured, "its text is its result's JSON: {text} against {structured}");
+            let want: Vec<Value> = hub.harness.list().iter().filter(|i| i.helper.is_none()).map(crate::harness::wait::brief).collect();
+            anyhow::ensure!(structured.get("agents") == Some(&Value::Array(want)) && want_len(&structured) == 3, "{structured}");
+            Ok(())
+        })
+    }
+
+    fn want_len(v: &Value) -> usize {
+        v.get("agents").and_then(Value::as_array).map_or(0, Vec::len)
+    }
 }
