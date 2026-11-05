@@ -36,7 +36,9 @@ impl Http {
         Self { host: std::net::Ipv4Addr::LOCALHOST, port, token: token.to_owned(), conn: None, buf: Vec::new(), accept: "identity", wants: "*/*" }
     }
 
-    /// One to a server at `host` (the browser lab reaches its kiln in the server's namespace).
+    /// One to a server at `host` (the browser lab, Linux only, reaches its kiln in the server's
+    /// namespace).
+    #[cfg(target_os = "linux")]
     pub fn at(host: std::net::Ipv4Addr, port: u16, token: &str) -> Self {
         Self { host, ..Self::new(port, token) }
     }

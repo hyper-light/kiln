@@ -5,7 +5,9 @@ latency), and from outside, by `kiln-lab` (`crates/kiln-lab`), which replays rea
 against any build, with CPU hogs beside it when asked, and compares two builds round by round. Every
 change to how the server schedules its work is decided by these numbers (Ada: A/B test, and let
 benchmarking under realistic usage decide). Goal 1 of the API runtime program built them: plan
-`01a1a59c2a68718493e26b9415f54824`, research `01a1a59c2a6a73dea4da7a2ba2c36848`.
+`01a1a59c2a68718493e26b9415f54824`, research `01a1a59c2a6a73dea4da7a2ba2c36848`. What a browser
+gets over a slow, lossy link, against HTTP/2 and HTTP/3 servers, is the same lab's other half:
+[browser-lab.md](browser-lab.md) (`kiln-lab browser`).
 
 ## What `/metrics` shows
 
