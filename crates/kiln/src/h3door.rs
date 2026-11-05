@@ -15,8 +15,15 @@
 //! `kiln_session` cookie authenticating it) for the door's URL, the hashes and a single-use
 //! ticket that lasts 30 seconds; the CONNECT carries the ticket in its path, and the door admits
 //! it only with a ticket not yet used, for the principal the path names, from one of the server's
-//! own origins ([`admit`]). The tickets sit behind [`DoorTickets`], to take goal 2's (kiln-bp's
-//! `Redeem`) when it lands, with the same rules.
+//! own origins ([`admit`]). Goal 2's ticket rules (32 random bytes, once, 30 seconds).
+//!
+//! **Lockless** (the API runtime's rule, `scripts/locks/hot.toml`): nothing here is shared under a
+//! lock. What the API and the door both read ([`Published`]: the URL, the hashes, the origins, the
+//! tickets' key) is an immutable copy swapped in whole when the certificate rotates
+//! (`crate::rcu::Rcu`). A ticket carries its own proof ([`TicketKey`]: 32 random bytes, when it was
+//! issued and an HMAC-SHA256 over them and its principal), so minting one writes nothing; using
+//! one up is the door's to record, and the door's driver is one task, which owns that record
+//! ([`Used`]) alone.
 //!
 //! Goal 7 owns the rest of the door's TLS (chain size, compression, resumption policy,
 //! post-quantum, 0-RTT); this turns session tickets on (one a handshake) and early data off.
@@ -32,11 +39,11 @@ use kiln_http::h3::conn::{Admission, Connect, Event};
 use kiln_http::h3::door::{ConnId, Door, DoorConfig};
 use kiln_http::h3::driver::{Driver, Host};
 use kiln_http::h3::{Admit, Read};
-use parking_lot::Mutex;
 use serde_json::{Value, json};
 use sha2::Digest as _;
 
 use crate::hub::Hub;
+use crate::rcu::Rcu;
 
 /// A ticket's life (as goal 2's: 30 seconds).
 pub const TICKET_LIFE_MS: u64 = 30_000;
@@ -138,54 +145,101 @@ impl Certs {
 /// Why a ticket was refused.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Refusal {
+    /// Not one this server made (or made for someone else): its proof doesn't hold.
     Unknown,
     Used,
     Expired,
 }
 
-/// What mints and redeems the door's tickets: this module's [`Tickets`] until goal 2's lands.
-pub trait DoorTickets: Send {
-    /// A ticket of the caller's random bytes for `principal`.
-    fn mint(&mut self, random: [u8; 32], principal: &str, now_ms: u64) -> Vec<u8>;
-    /// Redeems a ticket, once: whom it was minted for.
-    fn redeem(&mut self, ticket: &[u8], now_ms: u64) -> Result<String, Refusal>;
-    /// Tickets held.
-    fn held(&self) -> usize;
-}
+/// The bytes of a ticket: 32 random, when it was issued (ms, big-endian), and 16 of its proof.
+const TICKET_LEN: usize = 32 + 8 + 16;
 
-/// Single-use tickets that expire, as goal 2's: forgotten past twice their life, so one shown
-/// after that reads as never made.
-#[derive(Default)]
-pub struct Tickets {
-    minted: BTreeMap<Vec<u8>, (String, u64, bool)>,
-}
+/// The key the server's tickets are proved with: 32 random bytes made when the door starts. A
+/// ticket is `nonce (32 random bytes) | issued at (ms) | HMAC-SHA256(key, nonce | issued | principal)`
+/// cut to 16 bytes, so whoever holds the key can tell, with nothing written anywhere, that the
+/// server issued it, when, and for whom.
+#[derive(Clone)]
+pub struct TicketKey(aws_lc_rs::hmac::Key);
 
-impl Tickets {
-    fn forget(&mut self, now: u64) {
-        self.minted.retain(|_, (_, at, _)| now.saturating_sub(*at) <= 2 * TICKET_LIFE_MS);
+impl std::fmt::Debug for TicketKey {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("TicketKey(<redacted>)")
     }
 }
 
-impl DoorTickets for Tickets {
-    fn mint(&mut self, random: [u8; 32], principal: &str, now_ms: u64) -> Vec<u8> {
-        self.forget(now_ms);
-        self.minted.insert(random.to_vec(), (principal.to_owned(), now_ms, false));
-        random.to_vec()
+impl TicketKey {
+    pub fn new(secret: [u8; 32]) -> Self {
+        Self(aws_lc_rs::hmac::Key::new(aws_lc_rs::hmac::HMAC_SHA256, &secret))
     }
-    fn redeem(&mut self, ticket: &[u8], now_ms: u64) -> Result<String, Refusal> {
-        self.forget(now_ms);
-        let (who, at, taken) = self.minted.get_mut(ticket).ok_or(Refusal::Unknown)?;
-        if *taken {
-            return Err(Refusal::Used);
+
+    fn tag(&self, nonce: &[u8], issued: &[u8], principal: &str) -> [u8; 16] {
+        let mut ctx = aws_lc_rs::hmac::Context::with_key(&self.0);
+        ctx.update(nonce);
+        ctx.update(issued);
+        ctx.update(principal.as_bytes());
+        let full = ctx.sign();
+        let mut out = [0u8; 16];
+        if let Some(t) = full.as_ref().get(..16) {
+            out.copy_from_slice(t);
         }
-        if now_ms.saturating_sub(*at) > TICKET_LIFE_MS {
+        out
+    }
+
+    /// A ticket of the caller's 32 random bytes for `principal`, issued at `now_ms`.
+    pub fn mint(&self, nonce: [u8; 32], principal: &str, now_ms: u64) -> Vec<u8> {
+        let issued = now_ms.to_be_bytes();
+        let mut t = Vec::with_capacity(TICKET_LEN);
+        t.extend_from_slice(&nonce);
+        t.extend_from_slice(&issued);
+        t.extend_from_slice(&self.tag(&nonce, &issued, principal));
+        t
+    }
+
+    /// Checks a ticket's proof for `principal` and its life at `now_ms`: its nonce and when it was
+    /// issued, for the one-use record.
+    pub fn check(&self, ticket: &[u8], principal: &str, now_ms: u64) -> Result<([u8; 32], u64), Refusal> {
+        if ticket.len() != TICKET_LEN {
+            return Err(Refusal::Unknown);
+        }
+        let (nonce, rest) = ticket.split_at_checked(32).ok_or(Refusal::Unknown)?;
+        let (issued, tag) = rest.split_at_checked(8).ok_or(Refusal::Unknown)?;
+        let want = self.tag(nonce, issued, principal);
+        // Constant time: a guess learns nothing from how long the comparison took.
+        if aws_lc_rs::constant_time::verify_slices_are_equal(&want, tag).is_err() {
+            return Err(Refusal::Unknown);
+        }
+        let at = u64::from_be_bytes(issued.try_into().map_err(|_| Refusal::Unknown)?);
+        // Expired, or issued in the future (past a second's skew).
+        if now_ms.saturating_sub(at) > TICKET_LIFE_MS || at > now_ms.saturating_add(1_000) {
             return Err(Refusal::Expired);
         }
-        *taken = true;
-        Ok(who.clone())
+        let mut n = [0u8; 32];
+        n.copy_from_slice(nonce);
+        Ok((n, at))
     }
-    fn held(&self) -> usize {
-        self.minted.len()
+}
+
+/// The tickets used, owned by the one task that admits sessions (the door's driver): each nonce
+/// until its ticket's life is past twice over, when the ticket is refused as expired anyway.
+#[derive(Debug, Default)]
+pub struct Used {
+    seen: BTreeMap<[u8; 32], u64>,
+}
+
+impl Used {
+    /// Uses a ticket up: `Err(Used)` when it was before.
+    pub fn take(&mut self, nonce: [u8; 32], issued: u64, now_ms: u64) -> Result<(), Refusal> {
+        self.seen.retain(|_, at| now_ms.saturating_sub(*at) <= 2 * TICKET_LIFE_MS);
+        if self.seen.contains_key(&nonce) {
+            return Err(Refusal::Used);
+        }
+        self.seen.insert(nonce, issued);
+        Ok(())
+    }
+
+    /// Tickets held.
+    pub fn held(&self) -> usize {
+        self.seen.len()
     }
 }
 
@@ -199,9 +253,10 @@ fn b64(b: &[u8]) -> String {
     base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(b)
 }
 
-/// Decides a CONNECT: an origin of the server's own, a path it serves, a ticket not yet used and
-/// minted for the principal the path names (`?ticket=…&u=…`).
-pub fn admit(c: &Connect, origins: &[String], tickets: &mut dyn DoorTickets, now_ms: u64) -> Admission {
+/// Decides a CONNECT: an origin of the server's own, a path it serves, a ticket of `key`'s, within
+/// its life, for the principal the path names (`?ticket=…&u=…`), not used before (`used`, the
+/// admitting task's own).
+pub fn admit(c: &Connect, origins: &[String], key: &TicketKey, used: &mut Used, now_ms: u64) -> Admission {
     let Some(origin) = c.origin.as_deref().and_then(|o| std::str::from_utf8(o).ok()) else { return Admission::Forbidden };
     if !origins.iter().any(|o| o == origin) {
         return Admission::Forbidden;
@@ -216,15 +271,34 @@ pub fn admit(c: &Connect, origins: &[String], tickets: &mut dyn DoorTickets, now
     for pair in query.split('&') {
         match pair.split_once('=') {
             Some(("ticket", t)) => ticket = base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(t).ok(),
-            Some(("u", u)) => user = Some(u),
+            Some(("u", u)) => user = Some(unescape(u)),
             _ => {}
         }
     }
-    let Some(ticket) = ticket else { return Admission::Forbidden };
-    match tickets.redeem(&ticket, now_ms) {
-        Ok(who) if user.is_some_and(|u| u == url_part(&who)) => Admission::Accept,
-        _ => Admission::Forbidden,
+    let (Some(ticket), Some(user)) = (ticket, user) else { return Admission::Forbidden };
+    match key.check(&ticket, &user, now_ms).and_then(|(nonce, at)| used.take(nonce, at, now_ms)) {
+        Ok(()) => Admission::Accept,
+        Err(_) => Admission::Forbidden,
     }
+}
+
+/// A query part's `%XX` escapes undone (what [`url_part`] wrote).
+fn unescape(s: &str) -> String {
+    let b = s.as_bytes();
+    let mut out = Vec::with_capacity(b.len());
+    let mut i = 0;
+    while let Some(&c) = b.get(i) {
+        if c == b'%'
+            && let Some(h) = b.get(i + 1..i + 3).and_then(|h| std::str::from_utf8(h).ok()).and_then(|h| u8::from_str_radix(h, 16).ok())
+        {
+            out.push(h);
+            i += 3;
+            continue;
+        }
+        out.push(c);
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
 }
 
 /// A principal as it sits in a URL's query.
@@ -254,16 +328,19 @@ pub fn origins(public_url: &str, tls_names: &[String]) -> Vec<String> {
 
 // ------------------------------------------------------------------------------- the door's state
 
-/// What the HTTP API and the door share: the hashes served, the tickets, the URL.
-pub struct Shared {
+/// What the HTTP API and the door both read: the URL, the pinned hashes (none for a publicly
+/// trusted certificate), the origins, the tickets' key. Immutable; the door swaps a new copy in
+/// whole when its certificate rotates.
+#[derive(Clone, Debug)]
+pub struct Published {
     pub url: String,
-    /// The pinned hashes, or none for a publicly trusted certificate.
     pub hashes: Vec<[u8; 32]>,
-    pub tickets: Box<dyn DoorTickets>,
     pub origins: Vec<String>,
+    pub key: TicketKey,
 }
 
-static DOOR: OnceLock<Arc<Mutex<Shared>>> = OnceLock::new();
+/// The door's published copy, once the door is up: read without a lock (`crate::rcu`).
+static DOOR: OnceLock<Rcu<Published>> = OnceLock::new();
 
 fn now_ms() -> u64 {
     u64::try_from(time::OffsetDateTime::now_utc().unix_timestamp_nanos() / 1_000_000).unwrap_or(0)
@@ -274,33 +351,35 @@ fn now_ms() -> u64 {
 pub fn info(principal: &str) -> Value {
     match DOOR.get() {
         None => json!({ "on": false }),
-        Some(s) => info_of(&mut s.lock(), principal, rand::random(), now_ms()),
+        Some(p) => info_of(&p.load(), principal, rand::random(), now_ms()),
     }
 }
 
-/// [`info`] over given state (the tests' way in).
-pub fn info_of(s: &mut Shared, principal: &str, random: [u8; 32], now_ms: u64) -> Value {
-    let ticket = s.tickets.mint(random, principal, now_ms);
+/// [`info`] over a given copy (the tests' way in): it writes nothing.
+pub fn info_of(p: &Published, principal: &str, nonce: [u8; 32], now_ms: u64) -> Value {
+    let ticket = p.key.mint(nonce, principal, now_ms);
     json!({
         "on": true,
-        "url": format!("{}?ticket={}&u={}", s.url, b64(&ticket), url_part(principal)),
-        "hashes": s.hashes.iter().map(|h| base64::engine::general_purpose::STANDARD.encode(h)).collect::<Vec<_>>(),
+        "url": format!("{}?ticket={}&u={}", p.url, b64(&ticket), url_part(principal)),
+        "hashes": p.hashes.iter().map(|h| base64::engine::general_purpose::STANDARD.encode(h)).collect::<Vec<_>>(),
         "ticket_life_ms": TICKET_LIFE_MS,
     })
 }
 
 /// The door's host: tickets decide CONNECTs; `/wt/echo` sessions echo; rotation happens on turns.
 struct DoorHost {
-    shared: Arc<Mutex<Shared>>,
+    /// The published copy (`DOOR`'s): read on each CONNECT, swapped on rotation.
+    published: &'static Rcu<Published>,
+    /// The tickets used: this task's alone.
+    used: Used,
     certs: Option<(Certs, Vec<String>)>,
     shutdown: crate::rt::Shutdown,
 }
 
 impl Admit for DoorHost {
     fn admit(&mut self, c: &Connect) -> Admission {
-        let mut s = self.shared.lock();
-        let origins = s.origins.clone();
-        admit(c, &origins, s.tickets.as_mut(), now_ms())
+        let p = self.published.load();
+        admit(c, &p.origins, &p.key, &mut self.used, now_ms())
     }
 }
 
@@ -357,7 +436,8 @@ impl Host for DoorHost {
                         }
                         Err(e) => tracing::warn!(error = %format!("{e:#}"), "the door's next certificate"),
                     }
-                    self.shared.lock().hashes = certs.hashes().to_vec();
+                    let hashes = certs.hashes().to_vec();
+                    self.published.update(|p| p.hashes = hashes.clone());
                 }
                 Ok(false) => {}
                 Err(e) => tracing::warn!(error = %format!("{e:#}"), "the door's certificate rotation"),
@@ -404,10 +484,12 @@ pub async fn run(hub: Arc<Hub>) -> anyhow::Result<()> {
     let driver = Driver::bind(door, bind).map_err(|e| anyhow::anyhow!("bind {bind} for the HTTP/3 door: {e}"))?;
     let port = driver.local_addr().map_err(|e| anyhow::anyhow!("{e}"))?.port();
     let host = s.h3_advertise.clone().unwrap_or_else(|| format!("{public_host}:{port}"));
-    let shared = Arc::new(Mutex::new(Shared { url: format!("https://{host}/wt"), hashes, tickets: Box::new(Tickets::default()), origins: origins(&s.public_url, &s.tls_names) }));
-    let _ = DOOR.set(Arc::clone(&shared));
+    let fresh = Published { url: format!("https://{host}/wt"), hashes, origins: origins(&s.public_url, &s.tls_names), key: TicketKey::new(rand::random()) };
+    let published = DOOR.get_or_init(|| Rcu::new(fresh.clone()));
+    // A door started again in the same process (its supervisor restarted it) publishes afresh.
+    published.set(fresh);
     tracing::info!(%bind, %host, "the HTTP/3 WebTransport door");
-    let mut h = DoorHost { shared, certs, shutdown: hub.shutdown.clone() };
+    let mut h = DoorHost { published, used: Used::default(), certs, shutdown: hub.shutdown.clone() };
     driver.run(&mut h).await.map_err(|e| anyhow::anyhow!("the HTTP/3 door: {e}"))
 }
 

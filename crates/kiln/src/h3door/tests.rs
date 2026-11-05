@@ -64,34 +64,43 @@ fn step6_hash_pinned_certificates_last_under_14_days_and_rotate_with_an_overlap(
 fn step6_a_ticket_is_good_once_for_its_principal_from_our_origin() {
     let origins = origins("https://kiln.test:7070", &["kiln.lan".to_owned()]);
     assert!(origins.contains(&"https://kiln.test:7070".to_owned()) && origins.contains(&"https://kiln.lan".to_owned()));
-    let mut t = Tickets::default();
-    let mut shared = Shared { url: "https://kiln.test:7443/wt".into(), hashes: vec![[1; 32]], tickets: Box::new(Tickets::default()), origins: origins.clone() };
-    let v = info_of(&mut shared, "alice", [7; 32], 1_000);
+    let key = TicketKey::new([42; 32]);
+    let p = Published { url: "https://kiln.test:7443/wt".into(), hashes: vec![[1; 32]], origins: origins.clone(), key: key.clone() };
+    let v = info_of(&p, "alice", [7; 32], 1_000);
     let url = v.get("url").and_then(Value::as_str).unwrap_or_default().to_owned();
     assert!(url.starts_with("https://kiln.test:7443/wt?ticket=") && url.ends_with("&u=alice"), "{url}");
     assert_eq!(v.get("hashes").and_then(Value::as_array).map(Vec::len), Some(1));
+    // The ticket in the URL is the key's: it admits once.
+    let mut used = Used::default();
+    let path_of = url.trim_start_matches("https://kiln.test:7443").to_owned();
     let ok = "https://kiln.test:7070";
-    let ticket = b64(&t.mint([9; 32], "alice", 0));
+    assert_eq!(admit(&connect(&path_of, Some(ok)), &origins, &key, &mut used, 1_010), Admission::Accept);
+    let ticket = b64(&key.mint([9; 32], "alice", 0));
     let path = |tk: &str, u: &str| format!("/wt?ticket={tk}&u={u}");
     // Admitted once.
-    assert_eq!(admit(&connect(&path(&ticket, "alice"), Some(ok)), &origins, &mut t, 10), Admission::Accept);
+    assert_eq!(admit(&connect(&path(&ticket, "alice"), Some(ok)), &origins, &key, &mut used, 10), Admission::Accept);
     // Replayed.
-    assert_eq!(admit(&connect(&path(&ticket, "alice"), Some(ok)), &origins, &mut t, 20), Admission::Forbidden);
+    assert_eq!(admit(&connect(&path(&ticket, "alice"), Some(ok)), &origins, &key, &mut used, 20), Admission::Forbidden);
     // Expired.
-    let old = b64(&t.mint([10; 32], "alice", 0));
-    assert_eq!(admit(&connect(&path(&old, "alice"), Some(ok)), &origins, &mut t, TICKET_LIFE_MS + 1), Admission::Forbidden);
-    // For another user.
-    let bobs = b64(&t.mint([11; 32], "bob", 100_000));
-    assert_eq!(admit(&connect(&path(&bobs, "alice"), Some(ok)), &origins, &mut t, 100_010), Admission::Forbidden);
+    let old = b64(&key.mint([10; 32], "alice", 0));
+    assert_eq!(admit(&connect(&path(&old, "alice"), Some(ok)), &origins, &key, &mut used, TICKET_LIFE_MS + 1), Admission::Forbidden);
+    // For another user, and one another key made (another server's, or forged).
+    let bobs = b64(&key.mint([11; 32], "bob", 100_000));
+    assert_eq!(admit(&connect(&path(&bobs, "alice"), Some(ok)), &origins, &key, &mut used, 100_010), Admission::Forbidden);
+    let forged = b64(&TicketKey::new([43; 32]).mint([13; 32], "alice", 100_000));
+    assert_eq!(admit(&connect(&path(&forged, "alice"), Some(ok)), &origins, &key, &mut used, 100_010), Admission::Forbidden);
     // No ticket, a foreign origin, no origin, a path not served.
-    let fresh = b64(&t.mint([12; 32], "alice", 100_000));
-    assert_eq!(admit(&connect("/wt?u=alice", Some(ok)), &origins, &mut t, 100_010), Admission::Forbidden);
-    assert_eq!(admit(&connect(&path(&fresh, "alice"), Some("https://evil.example")), &origins, &mut t, 100_010), Admission::Forbidden);
-    assert_eq!(admit(&connect(&path(&fresh, "alice"), None), &origins, &mut t, 100_010), Admission::Forbidden);
-    assert_eq!(admit(&connect(&format!("/elsewhere?ticket={fresh}&u=alice"), Some(ok)), &origins, &mut t, 100_010), Admission::NotFound);
-    // The fresh one was never redeemed by a refusal above: it still opens a session.
-    assert_eq!(admit(&connect(&path(&fresh, "alice").replacen("/wt", "/wt/echo", 1), Some(ok)), &origins, &mut t, 100_020), Admission::Accept);
+    let fresh = b64(&key.mint([12; 32], "alice", 100_000));
+    assert_eq!(admit(&connect("/wt?u=alice", Some(ok)), &origins, &key, &mut used, 100_010), Admission::Forbidden);
+    assert_eq!(admit(&connect(&path(&fresh, "alice"), Some("https://evil.example")), &origins, &key, &mut used, 100_010), Admission::Forbidden);
+    assert_eq!(admit(&connect(&path(&fresh, "alice"), None), &origins, &key, &mut used, 100_010), Admission::Forbidden);
+    assert_eq!(admit(&connect(&format!("/elsewhere?ticket={fresh}&u=alice"), Some(ok)), &origins, &key, &mut used, 100_010), Admission::NotFound);
+    // The fresh one was never used up by a refusal above: it still opens a session.
+    assert_eq!(admit(&connect(&path(&fresh, "alice").replacen("/wt", "/wt/echo", 1), Some(ok)), &origins, &key, &mut used, 100_020), Admission::Accept);
+    // A principal with characters a URL escapes round-trips.
+    let odd = b64(&key.mint([14; 32], "user:a b", 100_000));
+    assert_eq!(admit(&connect(&path(&odd, &url_part("user:a b")), Some(ok)), &origins, &key, &mut used, 100_030), Admission::Accept);
     // And nothing is held of any of them once their lives are past.
-    assert_eq!(t.redeem(&[0; 32], 400_000), Err(Refusal::Unknown));
-    assert_eq!(t.held(), 0);
+    assert_eq!(used.take([0; 32], 400_000, 400_000), Ok(()));
+    assert_eq!(used.held(), 1);
 }

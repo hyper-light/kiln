@@ -44,8 +44,12 @@ serverCertificateHashes: [{ algorithm: "sha-256", value }], allowPooling: false 
 admits a CONNECT only from one of the server's own origins (`public_url`'s, and `https://` with each
 of `tls_names`), at a path it serves (`/wt`), with a ticket not used before, within its 30
 seconds, for the principal the URL names; anything else is 403 (or 404 for a path), and nothing of
-it is kept. The tickets sit behind `h3door::DoorTickets` with goal 2's rules (32 random bytes, once,
-30 seconds); goal 2's own (`kiln-bp`'s `Redeem`) takes its place when it lands.
+it is kept. Goal 2's rules hold (32 random bytes, once, 30 seconds), and nothing is shared under a
+lock: a ticket proves itself (32 random bytes, when it was issued, and an HMAC-SHA256 over them and
+its principal under a key the door makes when it starts), so minting one writes nothing, and the
+door's driver, one task, keeps the record of tickets used. What the API and the door both read
+(the URL, the hashes, the origins, the key) is an immutable copy swapped in whole when the
+certificate rotates (`crate::rcu::Rcu`).
 
 **The session API** (`kiln_http::h3::door`) is what goal 5's carrier uses, without HTTP/3's
 frames: `Door::session(conn, now)` gives a `Session` with `connect()` (path, origin, dialect),

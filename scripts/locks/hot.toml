@@ -13,6 +13,9 @@ hot = [
   "crates/kiln/src/api.rs",
   "crates/kiln/src/overload.rs",
   "crates/kiln/src/ui.rs",
+  # The HTTP/3 door: POST /api/me/door, and the door's CONNECTs (goal 4 of the browser protocol program).
+  "crates/kiln/src/h3door.rs",
+  "crates/kiln/src/h3door",
   "crates/kiln/src/authz",
   "crates/kiln/src/mcp/mod.rs",
   "crates/kiln/src/route_latency.rs",
