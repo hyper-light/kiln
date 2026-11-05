@@ -23,6 +23,10 @@
 //!   runtime does (`hyper_rt`'s `attribution`): `task` (it ran on the CPU), `blocking` (it waited
 //!   inside a call), `host` (it was runnable and off the CPU: preempted), `unknown` (where the OS
 //!   can't tell: off the CPU on macOS, every one on Windows).
+//! - **Tasks** (`kiln_shard_tasks`, `kiln_shard_tasks_most`): the tasks each shard holds as its probe
+//!   wakes (admitted and not yet ended, by hyper-rt's counts), and the most it has held so: what a shard's
+//!   task slots, which it makes as it starts, are sized from (`crate::rt::Profile`; goal 11, plan
+//!   01a1a87b2e56 step 3).
 
 use std::fmt::Write as _;
 use std::sync::OnceLock;
@@ -54,6 +58,8 @@ pub struct Shard {
     slow_unknown: AtomicU64,
     longest_poll_ns: AtomicU64,
     overrun_ns: AtomicU64,
+    tasks: AtomicU64,
+    most_tasks: AtomicU64,
 }
 
 impl Shard {
@@ -71,6 +77,8 @@ impl Shard {
             slow_unknown: AtomicU64::new(0),
             longest_poll_ns: AtomicU64::new(0),
             overrun_ns: AtomicU64::new(0),
+            tasks: AtomicU64::new(0),
+            most_tasks: AtomicU64::new(0),
         }
     }
 
@@ -90,6 +98,9 @@ impl Shard {
             self.slow_unknown.store(c.unattributed_steps, Ordering::Relaxed);
             self.longest_poll_ns.store(c.longest_step_ns, Ordering::Relaxed);
             self.overrun_ns.store(c.scheduler_overrun_ns, Ordering::Relaxed);
+            let tasks = held_tasks(&c);
+            self.tasks.store(tasks, Ordering::Relaxed);
+            self.most_tasks.fetch_max(tasks, Ordering::Relaxed);
         }
         if let Some(cpu) = thread_cpu_ns() {
             self.cpu_ns.store(cpu, Ordering::Relaxed);
@@ -120,8 +131,16 @@ impl Shard {
             },
             longest_poll: Duration::from_nanos(self.longest_poll_ns.load(Ordering::Relaxed)),
             overrun: Duration::from_nanos(self.overrun_ns.load(Ordering::Relaxed)),
+            tasks: self.tasks.load(Ordering::Relaxed),
+            most_tasks: self.most_tasks.load(Ordering::Relaxed),
         }
     }
+}
+
+/// The tasks a shard holds by its counts: those admitted, less those whose future returned, was dropped or
+/// unwound.
+fn held_tasks(c: &hyper_rt::shard_loop::Counters) -> u64 {
+    c.spawns.saturating_sub(c.completed).saturating_sub(c.cancelled).saturating_sub(c.unwound)
 }
 
 /// Slow polls by cause (see the module's notes).
@@ -158,6 +177,9 @@ pub struct Snapshot {
     pub slow: Slow,
     pub longest_poll: Duration,
     pub overrun: Duration,
+    /// The tasks it held at its probe's latest wake, and the most it held at any.
+    pub tasks: u64,
+    pub most_tasks: u64,
 }
 
 fn nanos(d: Duration) -> u64 {
@@ -310,5 +332,13 @@ pub fn render(o: &mut String) {
     help(o, "kiln_shard_scheduler_overrun_seconds", "gauge", "How late each shard's steps ran after its waits, as the shard measured it (the host descheduling it), decaying as it recovers.");
     for (i, s) in snaps.iter().enumerate() {
         let _ = writeln!(o, "kiln_shard_scheduler_overrun_seconds{{shard=\"{i}\"}} {}", secs(s.overrun));
+    }
+    help(o, "kiln_shard_tasks", "gauge", "Tasks each shard held (admitted, not yet ended) as its probe last woke.");
+    for (i, s) in snaps.iter().enumerate() {
+        let _ = writeln!(o, "kiln_shard_tasks{{shard=\"{i}\"}} {}", s.tasks);
+    }
+    help(o, "kiln_shard_tasks_most", "gauge", "The most tasks each shard has held as its probe woke: what its task slots are sized from.");
+    for (i, s) in snaps.iter().enumerate() {
+        let _ = writeln!(o, "kiln_shard_tasks_most{{shard=\"{i}\"}} {}", s.most_tasks);
     }
 }

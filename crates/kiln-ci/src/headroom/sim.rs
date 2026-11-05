@@ -324,6 +324,9 @@ fn run(trace: &Trace, mut control: Control, seed: u64) -> Report {
                     waiting: queued.iter().filter_map(|i| jobs.get(*i)).map(|j| Waiting { id: j.id.clone(), key: j.kind.key.into(), class: Class::Agent, since_us: us(j.arrive) }).collect(),
                     ended: Vec::new(),
                     cores: Some(m.cores),
+                    // The simulation doesn't model the machine's other processes' CPU: unknown, as
+                    // where the system doesn't say (the CPU counts as short).
+                    cpu_idle: None,
                 };
                 let plan = e.step(&obs);
                 // Trouble known from this step on (counted from the next).
