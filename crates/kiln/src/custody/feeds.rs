@@ -4,7 +4,7 @@
 //! mirror, to the runner process keeping the copy there now, which signs its receipt as it takes
 //! it. A runner process that takes no custody (`CAP_CUSTODY`) is handed nothing signed.
 
-use std::sync::{Arc, Mutex, PoisonError, Weak};
+use std::sync::{Arc, Weak};
 
 use futures::future::BoxFuture;
 use kiln_ci::identity::custody::{Body, Kind, to_value};
@@ -45,7 +45,7 @@ pub fn install(hub: &Arc<Hub>) {
     }
     if let Some(mirrors) = &hub.harness.copies {
         let w = Arc::downgrade(hub);
-        mirrors.sign_with(Arc::new(move |machine: &str, peer: Arc<Mutex<Option<u64>>>| Arc::new(ToMirror { hub: w.clone(), machine: machine.to_owned(), peer }) as Arc<dyn Custodian>));
+        mirrors.sign_with(Arc::new(move |machine: &str, peer: crate::convo::mirror::Peer| Arc::new(ToMirror { hub: w.clone(), machine: machine.to_owned(), peer }) as Arc<dyn Custodian>));
     }
 }
 
@@ -125,14 +125,14 @@ impl Custodian for Taker {
 struct ToMirror {
     hub: Weak<Hub>,
     machine: String,
-    peer: Arc<Mutex<Option<u64>>>,
+    peer: crate::convo::mirror::Peer,
 }
 
 impl Custodian for ToMirror {
     fn hand_on(&self, thing: Subject) -> BoxFuture<'_, Option<String>> {
         Box::pin(async move {
             let hub = self.hub.upgrade()?;
-            let peer = (*self.peer.lock().unwrap_or_else(PoisonError::into_inner))?;
+            let peer = self.peer.load().as_deref().copied()?;
             let instance = {
                 let instances = hub.instances.load();
                 let i = instances.get(peer)?;
