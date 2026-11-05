@@ -8,10 +8,10 @@ use std::sync::{Arc, OnceLock};
 
 use kiln_ci::wf::Workflow;
 use kiln_ci::work::graph::{self, Graph};
-use parking_lot::Mutex;
 
 use crate::gitops::{self, LS_REMOTE_TIMEOUT};
 use crate::hub::Hub;
+use crate::rcu::Rcu;
 use crate::store::Repo;
 
 /// The commits whose graphs are kept, newest first.
@@ -21,10 +21,12 @@ const KEPT: usize = 64;
 const MAX_MANIFESTS: usize = 20_000;
 const MAX_BYTES: usize = 64 << 20;
 
-/// (repository id, commit) → its graph, newest first.
-fn kept() -> &'static Mutex<VecDeque<(String, String, Arc<Graph>)>> {
-    static KEPT_GRAPHS: OnceLock<Mutex<VecDeque<(String, String, Arc<Graph>)>>> = OnceLock::new();
-    KEPT_GRAPHS.get_or_init(Mutex::default)
+/// (repository id, commit) → its graph, newest first: read without a lock as runs are planned and
+/// the land queue checks its candidates (goal 5, plan 01a1a59c2aae step 2), one read swapped in whole
+/// with the others' pointers (`crate::rcu`).
+fn kept() -> &'static Rcu<VecDeque<(String, String, Arc<Graph>)>> {
+    static KEPT_GRAPHS: OnceLock<Rcu<VecDeque<(String, String, Arc<Graph>)>>> = OnceLock::new();
+    KEPT_GRAPHS.get_or_init(Rcu::default)
 }
 
 /// Whether `wf`, or a workflow it calls, may use `affected()`: a run reads its commit's graph only
@@ -53,17 +55,18 @@ pub async fn at(hub: &Hub, repo: &Repo, sha: &str) -> Option<Arc<Graph>> {
 /// queue's candidates and diffs' versions are: docs/ci.md W28-R100). A commit's graph is the same
 /// wherever it's read, so it's kept alike.
 pub async fn at_in(hub: &Hub, repo: &Repo, dir: &str, sha: &str) -> Option<Arc<Graph>> {
-    if let Some(g) = kept().lock().iter().find(|(r, s, _)| *r == repo.id && s == sha).map(|(_, _, g)| Arc::clone(g)) {
+    if let Some(g) = kept().load().iter().find(|(r, s, _)| *r == repo.id && s == sha).map(|(_, _, g)| Arc::clone(g)) {
         return Some(g);
     }
     match read(hub, dir, sha).await {
         Ok(g) => {
             let g = Arc::new(g);
-            let mut k = kept().lock();
-            if !k.iter().any(|(r, s, _)| *r == repo.id && s == sha) {
-                k.push_front((repo.id.clone(), sha.to_owned(), Arc::clone(&g)));
-                k.truncate(KEPT);
-            }
+            kept().update(|k| {
+                if !k.iter().any(|(r, s, _)| *r == repo.id && s == sha) {
+                    k.push_front((repo.id.clone(), sha.to_owned(), Arc::clone(&g)));
+                    k.truncate(KEPT);
+                }
+            });
             Some(g)
         }
         Err(e) => {
