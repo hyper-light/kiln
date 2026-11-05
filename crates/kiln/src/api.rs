@@ -6911,7 +6911,13 @@ mod tests {
             let first = behind.recv().await;
             anyhow::ensure!(send_ready(&hub, &mut three, first, &mut [&mut behind], &mut None, &mut None).await?);
             let said: Vec<String> = three.sent.iter().filter_map(text).collect();
-            anyhow::ensure!(said.first().map(String::as_str) == Some(ServerEvent::Resync.text().as_str()) && said.len() == 3 && three.flushes == 1, "{said:?}");
+            // It starts over from after what it missed: `Resync`, and nothing from before the gap.
+            anyhow::ensure!(said == [ServerEvent::Resync.text()] && three.flushes == 1, "{said:?}");
+            small.send(0, Arc::from(r#"{"type":"updates","n":4}"#));
+            let mut four = Written::default();
+            let first = behind.recv().await;
+            anyhow::ensure!(send_ready(&hub, &mut four, first, &mut [&mut behind], &mut None, &mut None).await?);
+            anyhow::ensure!(four.sent.iter().filter_map(text).collect::<Vec<_>>() == [r#"{"type":"updates","n":4}"#.to_owned()], "then what comes after it");
             Ok(())
         })
     }

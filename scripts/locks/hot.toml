@@ -35,6 +35,9 @@ hot = [
   # and from the hub, and the rest of kiln's that runners' messages pass through (goal 4, plan 01a1a59c2a9c
   # step 5).
   "crates/kiln/src/memory/queue.rs",
+  # Rings: a terminal's output and a live job's log chunks out to their viewers (goal 4, plan 01a1a59c2a9c
+  # step 5).
+  "crates/kiln/src/memory/ring.rs",
   "crates/kiln/src/harness/broadcast.rs",
   "crates/kiln/src/wire/ui.rs",
   # Runner ingest: the hub, its link to the runners, and the processes each machine has.

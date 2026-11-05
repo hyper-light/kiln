@@ -857,7 +857,9 @@ mod tests {
 
     /// Goal 11, plan 01a1a87b2e56 step 3: a slow viewer's frames are kept up to the session's backlog in
     /// bytes (its count of frames too), counted as the terminals' feeds' on `/metrics`; past it the viewer
-    /// is told it fell behind, and the repaint it's sent then holds the session's state.
+    /// is told it fell behind, and goes on from after what it missed (goal 4, plan 01a1a59c2a9c step 5: the
+    /// frames it held from before are let go of, so none older than the gap follows the repaint), and the
+    /// repaint it's sent then holds the session's state.
     #[test]
     fn g11_s3_a_slow_viewers_frames_are_kept_up_to_the_backlog_in_bytes() {
         let (s, _input) = Session::new("local".into(), None, 80, 24);
@@ -875,7 +877,9 @@ mod tests {
         while let Ok(Frame::Data(d)) = slow.live.try_recv() {
             kept += d.len();
         }
-        assert!(kept <= BACKLOG_BYTES && kept >= BACKLOG_BYTES - chunk.len(), "the newest backlog's worth: {kept}");
+        assert_eq!(kept, 0, "nothing from before what it missed");
+        feed(&s, b"after");
+        assert!(matches!(slow.live.try_recv(), Ok(Frame::Data(d)) if &d[..] == b"after"), "it goes on from after the gap");
         assert!(s.attach().replay.len() >= BACKLOG_BYTES - 8192, "the repaint holds the backlog");
     }
 
