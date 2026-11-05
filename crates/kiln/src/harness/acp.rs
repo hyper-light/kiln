@@ -979,6 +979,11 @@ impl Acp {
         !self.waiting.is_empty()
     }
 
+    /// What it holds till its harness is ready, in order.
+    pub fn held(&self) -> &[QueueItem] {
+        &self.waiting
+    }
+
     /// What it held for its session, in order, out of its hands: the agent never got any of it,
     /// and its process is gone (`Adapter::let_go`).
     pub fn take_held(&mut self) -> Vec<QueueItem> {

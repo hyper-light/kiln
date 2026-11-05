@@ -248,7 +248,7 @@ pub async fn missing(hub: &Hub, job: &Job) -> Missing {
             m.no_agent = if job.executor.as_deref() == Some("k8s") {
                 Some(format!("it ran in a pod: add {} to the job's image or toolchain", m.tools.join(", ")))
             } else {
-                agent_cannot(hub.agents.lock().get(&runner), &runner)
+                agent_cannot(hub.agents.load().get(&runner).map(|a| &**a), &runner)
             };
             m.on = Some(runner);
         }
@@ -422,7 +422,7 @@ async fn check(hub: Arc<Hub>, id: &str) {
     let Some(fix) = hub.tool_fixes.load().get(id).cloned() else { return };
     let _ = crate::api::probe_agent(&hub, &fix.runner).await;
     let Ok(Some(job)) = hub.store.job(id.to_owned()).await else { return };
-    let facts = hub.agents.lock().get(&fix.runner).and_then(|a| a.facts.as_deref().cloned());
+    let facts = hub.agents.load().get(&fix.runner).and_then(|a| a.facts.as_deref().cloned());
     let have = |t: &str| facts.as_ref().is_some_and(|f| f.tools.contains_key(fact_key(t)));
     let missing: Vec<String> = fix.tools.iter().filter(|t| fact_known(t) && !have(t)).cloned().collect();
     if !missing.is_empty() {
@@ -585,7 +585,7 @@ mod tests {
             };
             hub.store.create_run(run, crate::pipeline::plan(&p, &crate::pipeline::Context::default())?).await?;
             let job = hub.store.jobs("run1".into(), false).await?.first().map(|j| j.id.clone()).unwrap_or_default();
-            hub.agents.lock().insert("adas-mac-studio-3".into(), crate::hub::tests::live_runner("adas-mac-studio-3", "macos", "aarch64"));
+            hub.put_agent(crate::hub::tests::live_runner("adas-mac-studio-3", "macos", "aarch64"));
             assert!(hub.store.claim_job(job.clone(), "adas-mac-studio-3".into(), "baremetal".into()).await?);
             hub.logs.append(&job, 0, b"$ npm ci\nbash: line 1: npm: command not found\n");
             hub.logs.finish(&job);
@@ -604,9 +604,7 @@ mod tests {
             assert_eq!(refused.err().map(|(c, _)| c), Some(StatusCode::FORBIDDEN));
             assert!(hub.tool_fixes.load().get(&job).is_none(), "a refused ask claims nothing");
 
-            if let Some(a) = hub.agents.lock().get_mut("adas-mac-studio-3") {
-                a.terminal = false;
-            }
+            hub.change_agent("adas-mac-studio-3", |a| a.terminal = false);
             let lacks = report(&hub, &job).await.map_err(|(c, m)| anyhow::anyhow!("{c}: {m}"))?;
             assert!(lacks.pointer("/missing/no_agent").and_then(Value::as_str).is_some_and(|w| w.contains("without terminals")), "{lacks}");
             let shut = fix(Arc::clone(&hub), crate::authz::Caller::owner(), &job, Ask { runner: None, kind: None, mode: None }).await;

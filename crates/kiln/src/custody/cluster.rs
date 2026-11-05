@@ -83,7 +83,7 @@ async fn kept(hub: &Hub, bundle: &Value) {
 /// The URI of runner process `instance` of `machine`, if it's connected and takes custody records.
 async fn learner_uri(hub: &Hub, machine: &str, instance: &str) -> Option<String> {
     let takes = {
-        let inst = hub.instances.lock();
+        let inst = hub.instances.load();
         inst.of(machine).into_iter().filter_map(|p| inst.get(p)).any(|i| i.label() == instance && (u64::from(i.caps) | i.wide) & crate::proto::CAP_CUSTODY != 0)
     };
     if !takes {
@@ -157,7 +157,7 @@ pub async fn checkpoints_loop(hub: Arc<Hub>) -> anyhow::Result<()> {
 async fn checkpoint(hub: &Hub, d: Due) {
     let Some(group) = hub.store.group() else { return };
     let instance = {
-        let inst = hub.instances.lock();
+        let inst = hub.instances.load();
         inst.newest_with(&d.machine, crate::proto::CAP_CLUSTER).filter(|p| *p == d.peer).and_then(|p| inst.get(p)).map(crate::instances::Instance::label)
     };
     let to = match instance {

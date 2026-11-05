@@ -1,0 +1,23 @@
+#!/bin/bash
+# Goal 9's lab (plan 01a1a87b2cec, docs/runtime-lab.md "Goal 9"): the lab's kiln with its server alone in a scope of its
+# own at CPUWeight=1000, as kiln.slice gives the server on bare metal (docs/priority.md), on CPUs of its own, so the
+# lab's clients and runners (the lab's unit, on the lab's CPUs) aren't measured as the server's. Given to kiln-lab as
+# --kiln, beside the kiln it runs (bin/kiln). The lab starts its server as `kiln --config <file> server`; systemd-run
+# --scope and taskset exec it in place, so its pid and process group stay the lab's to stop. Linux with systemd's user
+# manager. From the server's environment (kiln-lab --env):
+#   LAB_SERVER_CPUS   the server on these CPUs (its scope's AllowedCPUs= and its affinity), whatever the lab's own
+#   LAB_SERVER_CORES  `[server] cores` in its config: its shards on cores of their own, its other threads off them
+real=$(dirname "$(readlink -f "$0")")/kiln
+if [ "${3:-}" = server ]; then
+  props=(-p CPUWeight=1000 -p MemoryMax=8G)
+  on=()
+  if [ -n "${LAB_SERVER_CPUS:-}" ]; then
+    props+=(-p AllowedCPUs="$LAB_SERVER_CPUS")
+    on=(taskset -c "$LAB_SERVER_CPUS")
+  fi
+  if [ -n "${LAB_SERVER_CORES:-}" ]; then
+    sed -i "s/^\[server\]\$/[server]\ncores = \"$LAB_SERVER_CORES\"/" "$2"
+  fi
+  exec systemd-run --user --scope --quiet --collect "${props[@]}" --unit="kiln-lab-server-$$" "${on[@]}" "$real" "$@"
+fi
+exec "$real" "$@"

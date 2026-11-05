@@ -207,7 +207,7 @@ impl Copies {
     /// Every runner kiln knows here, and whether it's connected: those that joined (job pods
     /// aside), and those that said what they hold.
     fn runners(&self, hub: &Hub) -> BTreeMap<String, bool> {
-        let mut out: BTreeMap<String, bool> = hub.agents.lock().values().filter(|a| !a.ephemeral).map(|a| (a.name.clone(), a.connected)).collect();
+        let mut out: BTreeMap<String, bool> = hub.agents.load().values().filter(|a| !a.ephemeral).map(|a| (a.name.clone(), a.connected)).collect();
         for n in self.heard.lock().keys() {
             out.entry(n.clone()).or_insert(false);
         }

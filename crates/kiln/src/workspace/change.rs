@@ -165,7 +165,7 @@ pub async fn ask_machine(hub: &Hub, info: &Info, ask: &super::Ask) -> Result<Val
     } else {
         // A question only a newer runner answers isn't sent to one that can't.
         let wide = ask.wide_cap();
-        if wide != 0 && hub.instances.lock().wide_caps_for(&machine, &crate::instances::Owned::Agent(info.id.clone())) & wide != wide {
+        if wide != 0 && hub.instances.load().wide_caps_for(&machine, &crate::instances::Owned::Agent(info.id.clone())) & wide != wide {
             return Err(fail(StatusCode::CONFLICT, format!("{machine}'s kiln is too old to do this: upgrade it (System → Updates)")));
         }
         let json = serde_json::to_string(ask).map_err(|e| fail(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
@@ -668,11 +668,12 @@ mod tests {
         crate::rt::block_on(async {
             let hub = crate::hub::tests::scratch_hub().await?;
             let hello = crate::proto::Hello { protocol: crate::proto::VERSION, name: "box".into(), labels: vec![], slots: 1, hostname: "box".into(), os: "linux".into(), arch: "x86_64".into(), version: "0.0.9".into(), ephemeral: false, dedicated_job: None, running: vec![], terminal: true };
-            {
-                let mut instances = hub.instances.lock();
-                assert!(instances.join(1, "box", hello, 1).newest);
+            let joined = hub.instances.update(|instances| {
+                let joined = instances.join(1, "box", hello.clone(), 1);
                 instances.set_build(1, "0.0.9".into(), crate::proto::CAP_WORKSPACE);
-            }
+                joined
+            });
+            assert!(joined.newest);
             let info = Info { id: "a1".into(), target: "agent:box".into(), cwd: "/w/app".into(), ..Info::default() };
             let commits = crate::workspace::Ask::Commits { branch: None, trunk: None, since_head: None, since_at: None, picks: vec![] };
             let too_old = (StatusCode::CONFLICT, "box's kiln is too old to do this: upgrade it (System → Updates)".to_owned());
@@ -680,7 +681,7 @@ mod tests {
                 assert_eq!(ask_machine(&hub, &info, ask).await.err(), Some(too_old.clone()), "{ask:?}");
             }
             // Once it has said so, it's asked: no runner is connected here to answer, so the question waits.
-            hub.instances.lock().set_wide(1, crate::proto::CAP_WORKSPACE_COMMITS | crate::proto::CAP_WORKSPACE_COMPARE);
+            hub.instances.update(|i| i.set_wide(1, crate::proto::CAP_WORKSPACE_COMMITS | crate::proto::CAP_WORKSPACE_COMPARE));
             for ask in [&commits, &crate::workspace::Ask::Refs] {
                 if let Ok(Err(refused)) = crate::rt::timeout(std::time::Duration::from_millis(300), ask_machine(&hub, &info, ask)).await {
                     assert_ne!(refused, too_old, "{ask:?}");

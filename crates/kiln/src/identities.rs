@@ -869,7 +869,7 @@ struct LegInputs {
 /// now (gone while its ask waited for its session to open) is named in no certificate, rather than
 /// certified as a process kiln can't say it is (docs/ci.md W27-R01).
 fn asker(hub: &Hub, peer: PeerId, machine: &str) -> anyhow::Result<String> {
-    hub.instances.lock().get(peer).map(crate::instances::Instance::label).ok_or_else(|| anyhow::anyhow!("the runner process of {machine} that asked is no longer connected"))
+    hub.instances.load().get(peer).map(crate::instances::Instance::label).ok_or_else(|| anyhow::anyhow!("the runner process of {machine} that asked is no longer connected"))
 }
 
 /// The identity `ask` asks for, certified and recorded: its URI and certificate, and for a leg the
@@ -926,7 +926,7 @@ async fn issue(hub: &Hub, peer: PeerId, machine: &str, ask: &IdentityAsk) -> any
         // None came with it, to an epoch kiln certifies the session at for the first time: its
         // hand-over went unsigned, recorded saying which side is from before signed hand-overs.
         let gave = holder_at(&hub.store, session, epoch - 1).await?.unwrap_or_default();
-        let takes = hub.instances.lock().get(peer).is_some_and(|i| (u64::from(i.caps) | i.wide) & crate::proto::CAP_CUSTODY != 0);
+        let takes = hub.instances.load().get(peer).is_some_and(|i| (u64::from(i.caps) | i.wide) & crate::proto::CAP_CUSTODY != 0);
         let why = if !takes {
             format!("the process it went to, on {}, runs a kiln from before signed hand-overs: it signed no receipt", hub.shown(machine))
         } else if gave.is_empty() {
@@ -952,7 +952,7 @@ async fn issue(hub: &Hub, peer: PeerId, machine: &str, ask: &IdentityAsk) -> any
         // kiln's count of them last named (the 14:18 drop: words for the runner a blue/green
         // upgrade took over from, passed on to the new build).
         hub.harness.raise_epoch(session, *epoch);
-        hub.instances.lock().own(crate::instances::Owned::Agent(session.to_owned()), peer);
+        hub.instances.update(|i| i.own(crate::instances::Owned::Agent(session.to_owned()), peer));
         if let Some(h) = held_by {
             hub.harness.held_by(session, &h.instance);
         }
@@ -960,7 +960,7 @@ async fn issue(hub: &Hub, peer: PeerId, machine: &str, ask: &IdentityAsk) -> any
         // the machine's other processes, as kiln sent them to the one it still counted, which
         // refuse them.
         if crate::runner::chaos::get().is_some_and(|c| c.stale_words) {
-            let others: Vec<crate::instances::PeerId> = hub.instances.lock().of(machine).into_iter().filter(|p| *p != peer).collect();
+            let others: Vec<crate::instances::PeerId> = hub.instances.load().of(machine).into_iter().filter(|p| *p != peer).collect();
             for was in others {
                 stale_words(hub, machine, was, session).await;
             }
