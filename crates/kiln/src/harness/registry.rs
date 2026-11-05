@@ -4594,7 +4594,7 @@ mod tests {
     /// Every kind of event, with what each may carry and what it may leave out.
     fn every_kind_of_event() -> Vec<crate::harness::model::Event> {
         use crate::harness::model::{Body, Event, FileDiff, Hunk, Level, Todo, ToolCall, ToolKind, ToolStatus};
-        let event = |n: u64, parent: Option<&str>, body: Body| Event { id: format!("e{n}"), seq: n, at: 1_793_800_000_000, parent: parent.map(str::to_owned), by: (n % 2 == 0).then(|| "Claude Code".to_owned()), body };
+        let event = |n: u64, parent: Option<&str>, body: Body| Event { id: format!("e{n}"), seq: n, at: 1_793_800_000_000, parent: parent.map(str::to_owned), by: n.is_multiple_of(2).then(|| "Claude Code".to_owned()), body };
         let tool = ToolCall {
             tool_id: "t1".into(),
             name: "mcp__github__search".into(),
