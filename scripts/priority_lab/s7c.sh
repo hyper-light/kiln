@@ -109,8 +109,10 @@ one() {
   python3 -I "$D/bin/foreign.py" sample "$server_cpus" "$out" "$out/foreign.jsonl" "$out/foreign.stop" &
   local sampler=$!
   say "round $i $cfg: load $(cut -d' ' -f1-3 /proc/loadavg); $(awk '/^MemAvailable:/ {print int($2/1048576)}' /proc/meminfo) GB available"
+  # A service's output goes to the journal, not to systemd-run's: the unit writes lab.log itself.
   systemd-run --user --quiet --collect --wait --unit="$unit" -p MemoryMax=16G --working-directory="$D" "${pass[@]}" \
-    taskset -c "$LAB_CPUS" "$D/bin/kiln-lab" run --kiln "$D/bin/kiln-server" --label "$cfg" --profile "$PROFILE" --rounds 1 "${senv[@]}" --out "$out" > "$out/lab.log" 2>&1
+    -p StandardOutput="append:$out/lab.log" -p StandardError="append:$out/lab.log" \
+    taskset -c "$LAB_CPUS" "$D/bin/kiln-lab" run --kiln "$D/bin/kiln-server" --label "$cfg" --profile "$PROFILE" --rounds 1 "${senv[@]}" --out "$out" >> "$out/lab.log" 2>&1
   local rc=$?
   touch "$out/foreign.stop" "$out/hogrunner.stop"
   wait "$sampler" 2>/dev/null

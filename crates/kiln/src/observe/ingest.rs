@@ -267,6 +267,14 @@ pub fn record_bytes(r: &Record) -> usize {
     32 + r.service.len() + r.host.len() + r.source.len() + r.message.len() + r.attrs.iter().map(|(k, v)| k.len() + v.len() + 4).sum::<usize>()
 }
 
+/// A record waiting in a queue (a syslog source's, `crate::observe::collect::syslog`): its place and its
+/// weight against [`WAITING_LOG_BYTES`] (goal 11, plan 01a1a87b2e56 step 3).
+impl crate::memory::queue::Weigh for Record {
+    fn weight(&self) -> usize {
+        size_of::<Record>().saturating_add(record_bytes(self))
+    }
+}
+
 impl Batcher {
     pub fn new(sender: u64) -> Self {
         Self {

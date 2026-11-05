@@ -27,8 +27,19 @@ use crate::wire::ui::{StreamDown, StreamSaid};
 
 /// A stream nobody has looked at for this long closes.
 const UNWATCHED: Duration = Duration::from_secs(600);
-/// Chunks a viewer may be behind before it loses one.
+/// Chunks a viewer may be behind before it loses one: at the stream's most pictures a second
+/// ([`PICTURES_A_SECOND`]), 4 s of them.
 const BEHIND: usize = 240;
+/// A stream's pictures a second at the most: the extension's `framerate` (`crate::browser::stream`).
+const PICTURES_A_SECOND: usize = 60;
+/// What a stream's encoder sends a second at the most unless its viewer asked for more: the ceiling of
+/// the extension's `bitrateFor` (`crate::browser::stream`'s offscreen.js), 25 Mb/s.
+const TOP_BITS_A_SECOND: usize = 25_000_000;
+/// The bytes a viewer may be behind before it loses a chunk (goal 11, plan 01a1a87b2e56 step 3:
+/// `crate::memory::owners::STREAM_VIEWERS`): [`BEHIND`] pictures' time at the encoder's top rate, 4 s of
+/// 25 Mb/s, 12.5 MB. A stream asked for at more loses a chunk sooner, mended by its next key frame, as
+/// one past [`BEHIND`] chunks was.
+pub const VIEWER_BYTES: usize = TOP_BITS_A_SECOND / 8 * BEHIND / PICTURES_A_SECOND;
 /// The largest recording file kiln copies into its store of bytes; a larger one is served from its
 /// machine alone.
 pub const RECORDING_MAX: u64 = 1 << 30;
@@ -42,6 +53,17 @@ pub enum ToViewer {
     Event(String),
 }
 
+/// Its place and its bytes, as a viewer's queue counts it (a chunk's bytes are shared with the other
+/// viewers' copies: each queue counts them as its own, which each is until it's sent).
+impl crate::memory::queue::Weigh for ToViewer {
+    fn weight(&self) -> usize {
+        size_of::<Self>().saturating_add(match self {
+            ToViewer::Chunk(b) => b.len(),
+            ToViewer::Event(e) => e.capacity(),
+        })
+    }
+}
+
 /// One stream, as the server relays it.
 pub struct Live {
     pub id: String,
@@ -51,7 +73,8 @@ pub struct Live {
     pub spec: Value,
     pub by: String,
     pub at: i64,
-    viewers: Mutex<Vec<(u64, async_channel::Sender<ToViewer>)>>,
+    /// Each viewer's queue, bounded at [`VIEWER_BYTES`].
+    viewers: Mutex<Vec<(u64, crate::memory::queue::Sender<ToViewer>)>>,
     /// The decoders' configurations (video, audio), for viewers that join.
     video: Mutex<Option<Bytes>>,
     audio: Mutex<Option<Bytes>>,
@@ -283,8 +306,8 @@ impl Relay {
 
     /// A viewer joins: what it needs first, then the stream as it comes (a fresh key frame asked
     /// of the runner; the stream goes on if it was paused).
-    pub async fn join(&self, hub: &Hub, live: &Arc<Live>) -> (u64, async_channel::Receiver<ToViewer>) {
-        let (tx, rx) = async_channel::bounded(BEHIND);
+    pub async fn join(&self, hub: &Hub, live: &Arc<Live>) -> (u64, crate::memory::queue::Receiver<ToViewer>) {
+        let (tx, rx) = crate::memory::queue::bounded(&crate::memory::owners::STREAM_VIEWERS, VIEWER_BYTES);
         for e in live.said.lock().values() {
             let _ = tx.try_send(ToViewer::Event(e.clone()));
         }
@@ -628,6 +651,40 @@ async fn close_when_unwatched(hub: Arc<Hub>, id: String) {
 mod tests {
     use super::*;
 
+    /// A viewer's queue, as [`Relay::join`] makes it.
+    fn viewer() -> (crate::memory::queue::Sender<ToViewer>, crate::memory::queue::Receiver<ToViewer>) {
+        crate::memory::queue::bounded(&crate::memory::owners::STREAM_VIEWERS, VIEWER_BYTES)
+    }
+
+    /// Goal 11, plan 01a1a87b2e56 step 3: a viewer is behind by bytes, not by chunks: a slow one loses a
+    /// chunk once its queue holds [`VIEWER_BYTES`] (shown as the stream viewers' on `/metrics`), however
+    /// many chunks that is; and the bound's basis is the extension's own top bitrate and picture rate.
+    #[test]
+    fn g11_s3_a_viewer_is_behind_by_bytes() -> anyhow::Result<()> {
+        let r = Relay::default();
+        let l = live("v1", "m1");
+        r.live.lock().insert("v1".into(), l.clone());
+        let (tx, rx) = viewer();
+        l.viewers.lock().push((1, tx));
+        anyhow::ensure!(crate::memory::owners::STREAM_VIEWERS.bound().is_some_and(|b| b >= VIEWER_BYTES));
+        let key = crate::browser::stream::frame(b'v', b'k', 1, 0, 1, &vec![0u8; crate::browser::stream::PART]);
+        let room = VIEWER_BYTES / (key.len() + size_of::<ToViewer>() + crate::memory::queue::PLACE);
+        for _ in 0..room + 5 {
+            r.chunk("m1", "v1", key.clone());
+        }
+        anyhow::ensure!(rx.len() == room, "{} chunks kept, {room} fit", rx.len());
+        anyhow::ensure!(rx.held() <= VIEWER_BYTES, "{} bytes held", rx.held());
+        // A small event still fits beside them once the viewer takes one.
+        anyhow::ensure!(rx.try_recv().is_ok());
+        r.event("m1", "v1", json!({"loaded": {"title": "A"}}));
+        anyhow::ensure!(rx.len() == room, "the event went in");
+        let js = include_str!("../browser/extension/offscreen.js");
+        anyhow::ensure!(js.contains("Math.min(25_000_000,") && TOP_BITS_A_SECOND == 25_000_000, "the encoder's top bitrate is bitrateFor's");
+        let opener = include_str!("../browser/stream.rs");
+        anyhow::ensure!(opener.contains("\"framerate\": 60") && !opener.contains("\"framerate\": 120"), "60 pictures a second at the most");
+        Ok(())
+    }
+
     fn live(id: &str, machine: &str) -> Arc<Live> {
         Arc::new(Live {
             id: id.into(),
@@ -650,7 +707,7 @@ mod tests {
         let r = Relay::default();
         let l = live("v1", "m1");
         r.live.lock().insert("v1".into(), l.clone());
-        let (tx, rx) = async_channel::bounded(16);
+        let (tx, rx) = viewer();
         l.viewers.lock().push((1, tx));
         r.chunk("m1", "v1", crate::browser::stream::frame(b'c', b'-', 0, 0, 1, b"{\"codec\":\"avc1.42E01f\"}"));
         r.chunk("m1", "v1", crate::browser::stream::frame(b'c', b'a', 0, 0, 1, b"{\"codec\":\"opus\"}"));
@@ -694,7 +751,7 @@ mod tests {
         let r = Relay::default();
         let l = live("v1", "m1");
         r.live.lock().insert("v1".into(), l.clone());
-        let (tx, rx) = async_channel::bounded(16);
+        let (tx, rx) = viewer();
         l.viewers.lock().push((1, tx));
         // A kind this build doesn't know, more than one key, not an object: refused, and no viewer
         // is sent it. (What isn't JSON `crate::wire::payload` refuses before it comes here.)
@@ -756,7 +813,7 @@ mod tests {
         assert!(recs.first().and_then(|x| x.file("elsewhere")).is_none());
         // A viewer is told its id.
         let l = live("v2", "m1");
-        let (tx, rx) = async_channel::bounded(4);
+        let (tx, rx) = viewer();
         l.viewers.lock().push((1, tx));
         r.live.lock().insert("v2".into(), l);
         r.event("m1", "v2", json!({"recorded": {"video": "/s/live-3.mp4"}}));

@@ -160,6 +160,11 @@ pub struct Owner {
 impl Owner {
     /// `commands`, owned by a task started for them now.
     pub fn start(commands: Commands) -> Self {
+        // Unbounded, and bounded by its callers (goal 11, plan 01a1a87b2e56 step 3): every call but
+        // `tell`'s is waited for ([`Owner::ask`]), so those are one for each task waiting on the commands;
+        // `tell`'s are `crate::hub::Hub::command_soon`'s, a command each for a session told at once (an
+        // account's sessions held at its limit, a stale session's snapshot asked), each at most
+        // [`ITEM_MOST`]. What the commands keep unanswered is [`ROOM`] a runner process at the most.
         let (tx, rx) = async_channel::unbounded::<Call>();
         drop(crate::rt::spawn(async move {
             let mut commands = commands;

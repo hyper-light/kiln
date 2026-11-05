@@ -14,7 +14,7 @@ use parking_lot::Mutex;
 use serde::Serialize;
 use futures::FutureExt as _;
 
-use crate::rt::{Broadcast, Interval, Notify, Shutdown};
+use crate::rt::{Interval, Notify, Shutdown};
 
 use crate::config::Config;
 use crate::logs::Logs;
@@ -52,6 +52,10 @@ const LAUNCH_RETRY: Duration = Duration::from_secs(15);
 /// for their snapshots: time for the snapshots its streams send by themselves (a new server) to
 /// come first.
 const STALE_GRACE: Duration = Duration::from_secs(15);
+/// The events ([`Hub::events`]) kept for their slowest subscriber, at the most: their texts are bounded in
+/// bytes too, at [`crate::net::EVENTS_BYTES`] (goal 11, plan 01a1a87b2e56 step 3:
+/// `crate::memory::owners::UI_EVENTS`).
+pub const EVENTS: usize = 4096;
 
 /// Where a Kubernetes job's pod stands until its agent connects.
 #[derive(Debug, Clone, Copy)]
@@ -509,7 +513,10 @@ pub struct Hub {
     pending_peers: crate::rcu::Rcu<HashMap<PeerId, String>>,
     /// Runners' HTTP tunnels, and which QUIC connections they carry (see `crate::tunnel`).
     pub tunnels: Arc<crate::tunnel::Registry>,
-    pub events: Broadcast<Arc<str>>,
+    /// What `GET /api/events` sockets and kiln's own listeners hear, each event as its JSON text: kept
+    /// for their slowest at most [`EVENTS`] of them and one receive window of their bytes (goal 11, plan
+    /// 01a1a87b2e56 step 3: `crate::memory::owners::UI_EVENTS`).
+    pub events: crate::memory::ring::Ring<Arc<str>>,
     /// Each remote terminal's output, by `machine/session`: read on every frame a terminal sends,
     /// written as one opens and closes (`crate::rcu`).
     pub terms: crate::rcu::Rcu<HashMap<String, async_channel::Sender<TermOut>>>,
@@ -707,7 +714,7 @@ impl Hub {
             peers: Default::default(),
             pending_peers: Default::default(),
             tunnels: Arc::default(),
-            events: Broadcast::new(4096),
+            events: crate::memory::ring::Ring::new(&crate::memory::owners::UI_EVENTS, EVENTS, crate::net::EVENTS_BYTES),
             terms: Default::default(),
             terminals: crate::termsess::Sessions::new(),
             harness,
@@ -2499,7 +2506,7 @@ impl Hub {
             })
             .unwrap_or_default();
         if jobs.iter().any(|j| self.ci.is_leg(j)) {
-            self.ci.send(crate::ci::dispatch::Msg::RunnerLost { agent: name.to_owned() });
+            self.ci.send_held(crate::ci::dispatch::Msg::RunnerLost { agent: name.to_owned() }).await;
         }
         for j in jobs.into_iter().filter(|j| !self.ci.is_leg(j)) {
             match self.store.requeue_job(j.clone(), format!("{reason} ({})", self.shown(name))).await {
@@ -2650,7 +2657,7 @@ impl Hub {
                 self.change_agent(&agent, |a| a.sample = Some(s.clone()));
                 self.record_sample(&agent, s);
                 // The CI engine weighs its headroom by it: once a sample, as it comes.
-                self.ci.send(crate::ci::dispatch::Msg::RunnerSample { agent: agent.clone() });
+                self.ci.send_held(crate::ci::dispatch::Msg::RunnerSample { agent: agent.clone() }).await;
             }
             AgentMsg::StepStarted { job, idx } => {
                 if self.owns_job(peer, &job) {
@@ -2672,7 +2679,7 @@ impl Hub {
                 let job = r.job.clone();
                 if self.owns_job(peer, &r.job) {
                     if self.ci_leg(&r.job).await {
-                        self.ci.send(crate::ci::dispatch::Msg::Finished { agent: agent.clone(), result: r });
+                        self.ci.send_held(crate::ci::dispatch::Msg::Finished { agent: agent.clone(), result: r }).await;
                     } else {
                         self.job_done(&agent, r).await?;
                     }
@@ -2684,7 +2691,7 @@ impl Hub {
             }
             AgentMsg::Reject { job, .. } if self.ci.is_leg(&job) => {
                 if self.owns_job(peer, &job) {
-                    self.ci.send(crate::ci::dispatch::Msg::Rejected { agent: agent.clone(), leg: job });
+                    self.ci.send_held(crate::ci::dispatch::Msg::Rejected { agent: agent.clone(), leg: job }).await;
                 }
             }
             AgentMsg::Reject { job, reason } => {
@@ -2747,7 +2754,7 @@ impl Hub {
                     self.harness.restore_due(self, &agent);
                 }
                 // What it can do decides which legs it may take.
-                self.ci.send(crate::ci::dispatch::Msg::RunnerUp { agent: agent.clone(), running: Vec::new() });
+                self.ci.send_held(crate::ci::dispatch::Msg::RunnerUp { agent: agent.clone(), running: Vec::new() }).await;
                 // Previews' deployments it's left to take down (docs/ci.md W15-R07).
                 if caps & proto::CAP_UNDEPLOY != 0 {
                     let (hub, agent) = (Arc::clone(self), agent.clone());
@@ -3049,17 +3056,17 @@ impl Hub {
             // CI (docs/ci.md §2.5): the dispatcher's; facts are W13's.
             FromRunner::JobEvent { job, event } => {
                 if self.owns_job(peer, &job) {
-                    self.ci.send(crate::ci::dispatch::Msg::Event { agent: agent.to_owned(), leg: job, event });
+                    self.ci.send_held(crate::ci::dispatch::Msg::Event { agent: agent.to_owned(), leg: job, event }).await;
                 }
             }
             // A pool's executor it was asked to start (docs/ci.md W13-R09).
-            FromRunner::Executor(said) => self.ci.send(crate::ci::dispatch::Msg::Executor { agent: agent.to_owned(), said }),
+            FromRunner::Executor(said) => self.ci.send_held(crate::ci::dispatch::Msg::Executor { agent: agent.to_owned(), said }).await,
             // A preview's deployment it was asked to take down (docs/ci.md W15-R07).
             FromRunner::Undeployed(u) => crate::ci::previews::undeployed(self, agent, u).await,
             // What it holds warm, for placement (docs/ci.md W24-R18); a job's pod holds nothing.
             FromRunner::WorkState(state) => {
                 if !self.agents.load().get(agent).is_none_or(|a| a.ephemeral) {
-                    self.ci.send(crate::ci::dispatch::Msg::WorkState { agent: agent.to_owned(), state });
+                    self.ci.send_held(crate::ci::dispatch::Msg::WorkState { agent: agent.to_owned(), state }).await;
                 }
             }
             // The kiln it runs (`crate::fleet`); the rest is W13's.
@@ -3083,7 +3090,7 @@ impl Hub {
                         !a.ephemeral
                     });
                     if known.is_some() {
-                        self.ci.send(crate::ci::dispatch::Msg::RunnerFacts { agent: agent.to_owned() });
+                        self.ci.send_held(crate::ci::dispatch::Msg::RunnerFacts { agent: agent.to_owned() }).await;
                     }
                     let kept = known.unwrap_or(false);
                     if let Some(m) = machine.filter(|_| kept) {
@@ -3496,7 +3503,7 @@ impl Hub {
         )
         .await;
         tracing::info!(agent = %name, labels = ?live.labels, slots = live.slots, "agent connected");
-        self.ci.send(crate::ci::dispatch::Msg::RunnerUp { agent: name.clone(), running: h.running.clone() });
+        self.ci.send_held(crate::ci::dispatch::Msg::RunnerUp { agent: name.clone(), running: h.running.clone() }).await;
         // Older processes of this machine take no new jobs; what they run, they keep.
         for p in &joined.drain {
             tracing::info!(agent = %name, peer = p, "a newer runner process of this machine connected; the older one keeps what it runs and takes nothing new");
@@ -4231,7 +4238,7 @@ impl Hub {
         });
         for (name, jobs) in expired {
             if jobs.iter().any(|j| self.ci.is_leg(j)) {
-                self.ci.send(crate::ci::dispatch::Msg::RunnerLost { agent: name.clone() });
+                self.ci.send_held(crate::ci::dispatch::Msg::RunnerLost { agent: name.clone() }).await;
             }
             for j in jobs.into_iter().filter(|j| !self.ci.is_leg(j)) {
                 let still = self.agents.load().get(&name).is_some_and(|a| a.running.contains(&j));

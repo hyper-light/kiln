@@ -1272,7 +1272,10 @@ pub fn render() -> String {
     let bus = bus_gauges();
     let bus = (u64::try_from(bus.memory_bytes.get()).unwrap_or(0), u64::try_from(bus.memory_limit_bytes.get()).ok().filter(|l| *l > 0));
     let segments = u64::try_from(crate::harness::copies::SEGMENT_BYTES.load(std::sync::atomic::Ordering::Relaxed)).unwrap_or(0);
-    crate::memory::render(&mut o, &[("bus", bus.0, bus.1), ("session_segments", segments, None)]);
+    // kiln-search's open indexes, every one in the process (goal 11, plan 01a1a87b2e56 step 3).
+    let search = kiln_search::memory();
+    let search = (u64::try_from(search.0).unwrap_or(u64::MAX), u64::try_from(search.1).ok().filter(|b| *b > 0));
+    crate::memory::render(&mut o, &[("bus", bus.0, bus.1), ("session_segments", segments, None), ("search_indexes", search.0, search.1)]);
 
     let samples = agent_samples().load();
     if !samples.is_empty() {
