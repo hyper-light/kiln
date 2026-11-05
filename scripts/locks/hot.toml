@@ -57,6 +57,8 @@ hot = [
   "crates/kiln/src/ci/pools.rs",
   "crates/kiln/src/ci/insights.rs",
   "crates/kiln/src/reads.rs",
+  # Ship's Deploys (goal 5 step 2).
+  "crates/kiln/src/ship",
 ]
 
 # kiln-http: a cell per body, upgrade or wait, held by that one object's two ends, no other request's.

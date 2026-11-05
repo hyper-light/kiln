@@ -605,6 +605,8 @@ python3 scripts/locks.py rank census/run.json
   of commits signed over, and how far each runner's checkouts are behind. A value read again goes in with
   the others' pointers (each value its own `Arc` where it's more than a few words); readers that found one
   stale both read it again, as under the lock.
+- **Ship's Deploys** (`ship::deploys::Model`): the facts as last gathered, which every list reads, are a
+  copy a new gathering replaces whole, and so are each source's newest commits.
 
 ### Keeping them out
 
