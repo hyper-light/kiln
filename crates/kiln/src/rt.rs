@@ -301,6 +301,166 @@ fn took_realtime() -> bool {
     took.is_ok()
 }
 
+/// Whether the shards nudge their CPUs while they wait ([`nudge`]).
+static NUDGE: AtomicBool = AtomicBool::new(false);
+
+/// The shards' answers to the nudge ([`nudge`]), three counts in one atomic so exactly one shard, the
+/// last to answer, sees every answer in: those nudged in units of one, those that took the real-time
+/// class instead in units of [`NUDGE_REALTIME_ONE`], those refused in units of [`NUDGE_REFUSED_ONE`].
+static NUDGE_ANSWERS: AtomicU32 = AtomicU32::new(0);
+
+/// A shard in the real-time class's count in [`NUDGE_ANSWERS`]: past the most shards a runtime has
+/// (`Profile::with_env_overrides`' 64) in ten bits, so no count reaches the next.
+const NUDGE_REALTIME_ONE: u32 = 1 << 10;
+
+/// A refused shard's count in [`NUDGE_ANSWERS`], as [`NUDGE_REALTIME_ONE`] ten bits further.
+const NUDGE_REFUSED_ONE: u32 = 1 << 20;
+
+/// How many shards answer the nudge: the runtime's, once it started.
+static NUDGE_SHARDS: AtomicU32 = AtomicU32::new(0);
+
+/// The nudge's period, nanoseconds, once the runtime started ([`nudge_period_ns`]).
+static NUDGE_PERIOD_NS: AtomicU64 = AtomicU64::new(0);
+
+/// The first refusal a shard met, for why.
+static NUDGE_REFUSAL: OnceLock<hyper_rt::compute::Refusal> = OnceLock::new();
+
+/// Each of the server's shards nudges its CPU while it waits (`[server] nudge`; docs/priority.md, "A nudge
+/// for the shards"; goal 8, plan 01a1a59c2b29 step 7): each wait in its driver ends by the period
+/// [`nudge_period_ns`] gives, so a shard woken behind a thread busy in user space on a kernel that
+/// preempts lazily runs at its own timer's interrupt, not at the kernel's next tick (up to 1 ms at
+/// 1000 Hz). In the real-time class's place where that's refused: a shard that took the real-time class
+/// ([`realtime`]) preempts at once and doesn't nudge. It costs a wake of each waiting shard every period,
+/// so it's off until declared. The log and `/healthz/server` say how the shards took it
+/// ([`nudge_status`]). Call it before the runtime starts: later calls change nothing.
+pub fn nudge(on: bool) {
+    NUDGE.store(on, Ordering::Relaxed);
+}
+
+/// The nudge's period: `KILN_RT_NUDGE_US` microseconds where it's set and above 0 (the lab's A/B of
+/// periods, as `KILN_RT_QUANTUM_US` the quantum's), else the timers' tick, `timer_tick_ns`. The shard's
+/// timer slack is that tick too (hyper-rt's `Shard::build`), which the kernel adds to every timed wait,
+/// so at the tick a nudged shard's CPU is interrupted at least every two ticks while it waits: a shard
+/// woken behind a busy thread waits no longer than a timer of its own may be late (hyper-rt's
+/// `Driver::set_timer_slack_ns`: a timed wait ends at most a tick late).
+fn nudge_period_ns(timer_tick_ns: u64, env_us: Option<&str>) -> u64 {
+    env_us
+        .and_then(|us| us.trim().parse::<u64>().ok())
+        .filter(|us| *us > 0)
+        .map_or(timer_tick_ns, |us| us.saturating_mul(1000))
+}
+
+/// What a shard asks the OS for as it starts, past the real-time class (goal 3, plan 01a1a59c2a8e
+/// step 1; goal 8, plan 01a1a59c2b29 step 7).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct ShardAsks {
+    /// A slice of its step (`hyper_rt::compute::prefer_current_thread`).
+    slice: bool,
+    /// A nudge (`hyper_rt::compute::nudge_current_thread`).
+    nudge: bool,
+}
+
+/// What a shard asks for once it knows whether it took the real-time class: in it, nothing more (a
+/// real-time thread has no slice of the normal class's to ask for, and asking would put it back in that
+/// class; and its wake preempts at once, so it needs no nudge); at the normal class, a slice of its
+/// step, and the nudge where `[server] nudge` asks for it, in the real-time class's place.
+fn shard_asks(took_realtime: bool, nudge: bool) -> ShardAsks {
+    if took_realtime {
+        return ShardAsks { slice: false, nudge: false };
+    }
+    ShardAsks { slice: true, nudge }
+}
+
+/// How the shards took the nudge ([`nudge`]), for the log and `/healthz/server`.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
+pub struct Nudge {
+    /// Whether it was asked for (`[server] nudge`).
+    pub asked: bool,
+    /// Its period, microseconds.
+    pub period_us: u64,
+    /// The shards that answered it.
+    pub shards: u32,
+    /// Of them, those that nudge their CPUs.
+    pub nudged: u32,
+    /// Those that took the real-time class instead, whose wakes preempt at once.
+    pub realtime: u32,
+    /// Those refused it, which run as without it.
+    pub refused: u32,
+    /// Why those refused were.
+    pub why: Option<String>,
+}
+
+impl Nudge {
+    /// The line it's said with once every shard has answered; `None` before, or not asked for.
+    pub fn said(&self) -> Option<String> {
+        let answered = self.nudged.saturating_add(self.realtime).saturating_add(self.refused);
+        if !self.asked || self.shards == 0 || answered < self.shards {
+            return None;
+        }
+        let nudged = format!("nudge their CPUs while they wait, each wait ending within {} µs plus its timer slack: on a kernel that preempts lazily a shard woken behind a busy thread runs then, not at the kernel's next tick", self.period_us);
+        Some(match (self.nudged, self.realtime, &self.why) {
+            (n, 0, _) if self.refused == 0 => format!("the server's {n} shards {nudged}"),
+            (0, r, _) if self.refused == 0 => format!("the server's {r} shards took the real-time class and need no nudge"),
+            (n, r, _) if self.refused == 0 => format!("{n} of the server's {} shards {nudged}; {r} took the real-time class and need none", self.shards),
+            (n, _, why) => format!("{n} of the server's {} shards nudge their CPUs, {} run without it: it was refused ({})", self.shards, self.refused, why.as_deref().unwrap_or("no reason given")),
+        })
+    }
+}
+
+/// How the shards took the nudge so far ([`nudge`]).
+pub fn nudge_status() -> Nudge {
+    nudge_of(NUDGE_ANSWERS.load(Ordering::Acquire))
+}
+
+/// [`Nudge`] from the shards' `answers` ([`NUDGE_ANSWERS`]).
+fn nudge_of(answers: u32) -> Nudge {
+    Nudge {
+        asked: NUDGE.load(Ordering::Relaxed),
+        period_us: NUDGE_PERIOD_NS.load(Ordering::Relaxed) / 1000,
+        shards: NUDGE_SHARDS.load(Ordering::Relaxed),
+        nudged: answers % NUDGE_REALTIME_ONE,
+        realtime: (answers / NUDGE_REALTIME_ONE) % NUDGE_REALTIME_ONE,
+        refused: answers / NUDGE_REFUSED_ONE,
+        why: NUDGE_REFUSAL.get().map(nudge_why),
+    }
+}
+
+/// Why the nudge was refused, for a person: the OS's error where it gave one, else what refused it
+/// (an OS without lazy preemption says so).
+fn nudge_why(refusal: &hyper_rt::compute::Refusal) -> String {
+    match refusal.code {
+        Some(_) => refusal.to_string(),
+        None => refusal.call.to_owned(),
+    }
+}
+
+/// A shard answers the nudge asked for ([`nudge`]): nudged at `period_ns` where it `nudges`, else counted
+/// with those in the real-time class, the one reason a shard asked to nudge doesn't ([`shard_asks`]); or
+/// refused. The last shard to answer says how they all did, once.
+fn answer_nudge(nudges: bool, period_ns: u64) {
+    let one = if !nudges {
+        NUDGE_REALTIME_ONE
+    } else {
+        match hyper_rt::compute::nudge_current_thread(period_ns) {
+            Ok(()) => 1,
+            Err(refusal) => {
+                let _ = NUDGE_REFUSAL.set(refusal);
+                NUDGE_REFUSED_ONE
+            }
+        }
+    };
+    let status = nudge_of(NUDGE_ANSWERS.fetch_add(one, Ordering::AcqRel).wrapping_add(one));
+    if status.nudged.saturating_add(status.realtime).saturating_add(status.refused) == status.shards
+        && let Some(line) = status.said()
+    {
+        if status.refused == 0 {
+            tracing::info!("{line}");
+        } else {
+            tracing::warn!("{line}");
+        }
+    }
+}
+
 /// The core each of `shards` shards is fixed to, from cores of the process's own: the first kept
 /// for its threads that aren't shards (its blocking pool, its timers' helpers), as hyper-rt's
 /// placement keeps one, and each shard on the next, around again when there are more shards than
@@ -465,20 +625,32 @@ fn start() -> Result<Rt, String> {
     }
     // Each shard asks for a slice of its step (goal 3, plan 01a1a59c2a8e step 1): waking on a CPU a compute
     // pool thread holds, it takes the CPU at once (`hyper_rt::compute::prefer_current_thread`; Linux). Where
-    // the real-time class is asked for and granted ([`realtime`]), it takes that instead: a real-time thread
-    // has no slice of the normal class's to ask for, and asking would put it back in that class.
+    // the real-time class is asked for and granted ([`realtime`]), it takes that instead ([`shard_asks`]).
+    // Where the nudge is asked for ([`nudge`]), a shard at the normal class nudges its CPU too, in the
+    // real-time class's place (goal 8, plan 01a1a59c2b29 step 7).
     let realtime = REALTIME.load(Ordering::Relaxed);
+    let shards = u32::try_from(holders.len()).unwrap_or(u32::MAX);
     if realtime {
-        REALTIME_SHARDS.store(u32::try_from(holders.len()).unwrap_or(u32::MAX), Ordering::Relaxed);
+        REALTIME_SHARDS.store(shards, Ordering::Relaxed);
+    }
+    let nudge = NUDGE.load(Ordering::Relaxed);
+    let period_ns = nudge_period_ns(config.timer_tick_ns, std::env::var("KILN_RT_NUDGE_US").ok().as_deref());
+    if nudge {
+        NUDGE_PERIOD_NS.store(period_ns, Ordering::Relaxed);
+        NUDGE_SHARDS.store(shards, Ordering::Relaxed);
     }
     for holder in &holders {
         let slice = config.step_budget_ns;
         let _ = hyper_rt::runtime::submit_to_holder(*holder, async move {
-            if realtime && took_realtime() {
-                return;
-            }
-            if let Err(refusal) = hyper_rt::compute::prefer_current_thread(slice) {
+            let took = realtime && took_realtime();
+            let asks = shard_asks(took, nudge);
+            if asks.slice
+                && let Err(refusal) = hyper_rt::compute::prefer_current_thread(slice)
+            {
                 tracing::debug!(%refusal, "a shard kept the OS's slice");
+            }
+            if nudge {
+                answer_nudge(asks.nudge, period_ns);
             }
         });
     }
@@ -1954,6 +2126,50 @@ mod tests {
         // Both kinds of answer counted in one atomic, each read back apart.
         let answers = 3 + 2 * REFUSED_ONE;
         assert_eq!((answers % REFUSED_ONE, answers / REFUSED_ONE), (3, 2));
+    }
+
+    /// Goal 8 (plan 01a1a59c2b29 step 7): the nudge takes the real-time class's place where that's refused or
+    /// not asked for, and comes after it where it's granted: a shard in the real-time class asks for nothing
+    /// more, neither a slice nor a nudge; one at the normal class asks for its slice, and the nudge only where
+    /// `[server] nudge` asks for it.
+    #[test]
+    fn g8_s7_a_shard_nudges_in_the_real_time_class_s_place() {
+        assert_eq!(shard_asks(true, true), ShardAsks { slice: false, nudge: false }, "granted the real-time class: neither");
+        assert_eq!(shard_asks(true, false), ShardAsks { slice: false, nudge: false });
+        assert_eq!(shard_asks(false, true), ShardAsks { slice: true, nudge: true }, "refused it, or not asked: the slice and the nudge");
+        assert_eq!(shard_asks(false, false), ShardAsks { slice: true, nudge: false }, "the nudge only where asked for");
+    }
+
+    /// Goal 8 (plan 01a1a59c2b29 step 7): the nudge's period is the timers' tick, which with the shard's slack
+    /// (that tick too) bounds a nudged shard's wake as its own timers' lateness is bounded; the lab may set
+    /// another in microseconds, and a value that isn't a positive count leaves the tick.
+    #[test]
+    fn g8_s7_the_nudge_s_period_is_the_timers_tick_unless_the_lab_sets_it() {
+        let tick = runtime_config(4, 64).timer_tick_ns;
+        assert_eq!(nudge_period_ns(tick, None), tick);
+        assert_eq!(nudge_period_ns(tick, Some("50")), 50_000);
+        assert_eq!(nudge_period_ns(tick, Some(" 250 ")), 250_000);
+        assert_eq!(nudge_period_ns(tick, Some("0")), tick, "0 isn't a period");
+        assert_eq!(nudge_period_ns(tick, Some("soon")), tick);
+    }
+
+    /// Goal 8 (plan 01a1a59c2b29 step 7): how the shards took the nudge is said once all of them answered,
+    /// never when it wasn't asked for or before the runtime started; those in the real-time class are said apart,
+    /// and a refusal says why. Three kinds of answer count in one atomic, each read back apart.
+    #[test]
+    fn g8_s7_the_nudge_is_said_as_the_shards_took_it() {
+        let status = |nudged, realtime, refused, why: Option<&str>| Nudge { asked: true, period_us: 100, shards: 4, nudged, realtime, refused, why: why.map(str::to_owned) };
+        assert_eq!(Nudge { asked: false, ..status(4, 0, 0, None) }.said(), None, "not asked for: nothing to say");
+        assert_eq!(Nudge { shards: 0, ..status(0, 0, 0, None) }.said(), None, "before the runtime started");
+        assert_eq!(status(3, 0, 0, None).said(), None, "not every shard has answered");
+        assert!(status(4, 0, 0, None).said().is_some_and(|s| s.starts_with("the server's 4 shards nudge their CPUs") && s.contains("100 µs")));
+        assert!(status(0, 4, 0, None).said().is_some_and(|s| s.contains("4 shards took the real-time class and need no nudge")));
+        assert!(status(1, 3, 0, None).said().is_some_and(|s| s.starts_with("1 of the server's 4 shards nudge") && s.contains("3 took the real-time class")));
+        assert!(status(0, 0, 4, Some("no lazy preemption to nudge on macOS")).said().is_some_and(|s| s.contains("4 run without it") && s.contains("macOS")));
+        let elsewhere = hyper_rt::compute::Refusal { call: "no lazy preemption to nudge on macOS", code: None };
+        assert_eq!(nudge_why(&elsewhere), "no lazy preemption to nudge on macOS");
+        let answers = 2 + 3 * NUDGE_REALTIME_ONE + 64 * NUDGE_REFUSED_ONE;
+        assert_eq!((answers % NUDGE_REALTIME_ONE, (answers / NUDGE_REALTIME_ONE) % NUDGE_REALTIME_ONE, answers / NUDGE_REFUSED_ONE), (2, 3, 64));
     }
 
     /// `each` keeps the items' order, runs no more than `n` at once, runs them at once (four

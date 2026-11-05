@@ -11,8 +11,8 @@ use kiln::rt::Shutdown;
 use kiln::{config, install, supervise};
 
 /// The `jemalloc` feature's allocator, on Linux (goal 11, plan 01a1a87b2e56 step 4): what the lab's A/B measures
-/// against musl's (production's) and glibc's, by resident memory and latency. Elsewhere, and without the
-/// feature, the platform's allocator as before.
+/// against musl's (production's) and glibc's, by resident memory and latency; its settings, for giving memory
+/// back, are `kiln::os::alloc`'s. Elsewhere, and without the feature, the platform's allocator as before.
 #[cfg(all(feature = "jemalloc", target_os = "linux"))]
 #[global_allocator]
 static ALLOCATOR: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
@@ -509,6 +509,8 @@ fn thread_stacks() {
 }
 
 fn main() -> ExitCode {
+    // The allocator's settings, before any other thread starts (goal 11, plan 01a1a87b2e56 step 4).
+    kiln::os::alloc::init();
     thread_stacks();
     // A microVM's init (docs/ci.md W13-R05): before anything else starts, as PID 1 forks.
     #[cfg(target_os = "linux")]
@@ -581,6 +583,10 @@ fn main() -> ExitCode {
     let quiet = matches!(cli.cmd, Cmd::Workflow(_) | Cmd::Setup(_)) && cli.log == "info" && std::env::var_os("KILN_LOG").is_none();
     init_tracing(if quiet { "warn" } else { &cli.log }, cli.json);
     install_panic_hook();
+    // Which allocator, and how it gives memory back (`kiln::os::alloc`): a server's and a runner's log say.
+    if matches!(cli.cmd, Cmd::Server | Cmd::Agent(_)) {
+        tracing::info!("{}", kiln::os::alloc::said());
+    }
     // Everything runs on hyper-rt, hyper-raft's thread-per-core runtime, sized for the role.
     kiln::rt::configure(match &cli.cmd {
         Cmd::Server | Cmd::Up | Cmd::Workflow(_) => kiln::rt::Profile::server(),
@@ -618,6 +624,7 @@ fn main() -> ExitCode {
             }
         }
         kiln::rt::realtime(cfg.server.realtime);
+        kiln::rt::nudge(cfg.server.nudge);
     }
     // A runner on a machine whose config gives the server cores of its own keeps the legs and agents
     // it starts off them (docs/priority.md, "Legs and agents keep off the server's cores").

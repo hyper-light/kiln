@@ -1315,6 +1315,61 @@ topic isn't something kiln can ask it. The bounds it derives:
 Its scripts (`bus-lab.sh`, `bus-hook.sh`, `bus-summary.py`) come with goal 11's step 3 hand-overs, to go
 under `scripts/memory_lab/` with their first run.
 
+### The allocator (step 4)
+
+fedora, 2026-11-05 13:24 to 14:45 UTC, the realistic profile, calm, 4 shards, the server on CPUs 16-23 and
+the lab on 0-7: train 4's tree (`4b429f1a05c`), its glibc build and its static musl build (production's),
+in A/Bs of interleaved rounds (`g11alloc.sh`). Resident memory at the window's end, MB, the median of
+rounds; and what moved beyond noise, B against A, of the 203 numbers kiln-lab compares:
+
+| A against B | rounds | resident, A to B | anonymous | the binary's pages | latency beyond noise |
+| --- | --- | --- | --- | --- | --- |
+| glibc against musl | 8, 8 | 576 to 541 (within noise) | 449 to 415 | 128 to 127 | worse on musl: attach p50 3.5 to 4.7 ms; the server's wait p99 for API reads, writes and pages 0.10 to 0.25-0.28 ms |
+| glibc against `MALLOC_ARENA_MAX=2` | 8, 8 | 545 to 420 (-23%) | 419 to 293 | 128 to 129 | worse: bus delivery p99 0.25 to 0.50 ms (p99.9 0.74 to 1.69); websocket frames' server wait p99 0.25 to 0.50 ms; runners' messages took p99 0.21 to 0.33 ms (+56%); slow polls +42% |
+| glibc against `MALLOC_ARENA_MAX=5` | 7, 8 | 523 to 459 (-12%) | 396 to 333 | 129 to 128 | none |
+| glibc against jemalloc preloaded | 8, 8 | | | | |
+| musl against musl-jemalloc (kiln's `jemalloc` feature, `os::alloc`'s settings) | 8, 8 | | | | |
+
+(glibc's side of the `MALLOC_ARENA_MAX=5` A/B lost its last round to a full disk. The two jemalloc rows are
+run once the queue reaches them.) Before these: one round of the glibc build under jemalloc preloaded, its
+heap profile on, held 261 MB anonymous for 165 MB live (step 1); mimalloc, tried before, held 22.7% more
+resident memory, and idle 3.4 times glibc's anonymous memory (183 against 54 MB, research f18).
+
+glibc's default is eight arenas for every core: in the lab, 88, one for nearly each of the server's
+threads, each keeping what its threads freed (438 MB taken, 297 MB of it free). musl's malloc held about
+the same as glibc's. So:
+
+- **glibc builds** (`*-linux-gnu`, built from source): at most 5 arenas, the shards' 4 and glibc's main
+  one, by `mallopt(M_ARENA_MAX)` as the process starts (`kiln::os::alloc::init`, `main`'s first call),
+  unless `MALLOC_ARENA_MAX` or `GLIBC_TUNABLES` says how many (so a lab can still A/B them). 5 held
+  every latency number with 12% less resident memory. 2 took 23% off but doubled the bus delivery's p99,
+  so it isn't 2.
+- **Production's static musl build**: musl's malloc until the jemalloc A/B picks jemalloc. Then the
+  default of `ci/release/build.sh`'s one switch, `KILN_LINUX_ALLOCATOR` (`musl` or `jemalloc`), moves to
+  `jemalloc`, and the image and releases (`.kiln/image.yaml`, `.kiln/release.yaml`) build with kiln's
+  `jemalloc` feature. Both Linux targets build with it under zig's cc (zig 0.17.0 and cargo-zigbuild
+  0.23.4, as `build.sh` pins them): jemalloc's configure finds background threads, `MADV_DONTNEED` and
+  `MADV_FREE`, and the binaries stay static. A cross build can't ask its target's page size and takes
+  4 KiB, and jemalloc refuses to start under a larger one ("Unsupported system page size"). arm64 Linux
+  runs 4, 16 or 64 KiB pages (16 on Apple silicon and the Raspberry Pi 5's kernel), so its jemalloc takes
+  64 KiB (tikv-jemalloc-sys's `JEMALLOC_SYS_WITH_LG_PAGE=16`, for that target alone).
+
+jemalloc's settings (`kiln::os::alloc`, its `malloc_conf`; `_RJEM_MALLOC_CONF` in the environment
+overrides them, so a lab can A/B them on one build). A unit test holds the string to the settings, and
+one with the feature has jemalloc read each back:
+
+| Setting | Value | Basis |
+| --- | --- | --- |
+| `background_thread` | true | Without them jemalloc purges an arena only as that arena allocates and frees, so what a quiet server holds after a burst stays. A purge's `madvise` then runs on jemalloc's own thread, never inline on a shard that freed (jemalloc's TUNING.md). On the static musl build (adacachy, a check program), a burst of 64 MiB freed and left alone went from 54 MB resident to 0.9 MB within 9.5 s; with jemalloc's defaults it stayed at 54 MB. A quiet server's burst goes within about twice the decay: having found nothing to purge, the background thread sleeps the decay's length before it looks again |
+| `narenas` | 5 | The shards' 4 and one more: the count glibc held every latency number with (above). jemalloc's default is four for every CPU (32 in the lab, 128 on a 32-CPU machine), each keeping what its threads freed. jemalloc takes an arena's locks only past a thread's own cache (up to 200 of a small size, against glibc's 7) |
+| `dirty_decay_ms` | 5000 | jemalloc keeps about what was freed in the last half of it (its decay curve is symmetric about the middle): 2.5 s, as often as the lab's work recurs (an attach every 2.7 s, an agent's turn about every 3 s), so that work reuses its pages rather than faulting new ones in. What's idle longer goes within the 5 s of the lab's warm-up after the fill. Half jemalloc's default (10 s), as its TUNING.md suggests where memory comes first |
+| `muzzy_decay_ms` | 0 | A page given back with `MADV_FREE` stays resident until the kernel wants memory (smaps' `LazyFree`), so resident memory doesn't count it as given back. At 0, what decays goes with `MADV_DONTNEED` at once. jemalloc 5.3's code has 0 too, though its manual says 10 s |
+| `thp` | never | fedora gives transparent huge pages only where asked (`madvise`), so the lab measures jemalloc without them. adacachy gives them to every anonymous mapping (`always`), and its khugepaged makes a 2 MiB range with 103 of its 512 pages in use one huge page again (`max_ptes_none` 409), filling in what purges gave back. With `never` (`MADV_NOHUGEPAGE` on jemalloc's mappings), production's heap runs as the lab measured it. The check program's glibc build on adacachy started at 6.3 MB anonymous with jemalloc's default (6 MB of it huge pages) and 0.5 MB with `never`. Its static musl build got huge pages only some runs: a fault takes one only when a free one is at hand |
+
+What the musl-jemalloc A/B decides: with resident memory below musl's beyond noise and no latency number
+worse, the switch's default moves to `jemalloc`. Variants are an environment away on the same build, for
+example `--env-b _RJEM_MALLOC_CONF=narenas:8` or `dirty_decay_ms:1000`.
+
 ## Goal 10: API reads and frames in under a millisecond
 
 Goal 10 of the API runtime program (plan `01a1a87b2dae`): every read the lab makes answers from memory,
@@ -1468,6 +1523,97 @@ What to read:
   preempts the server's own pools on its CPU). **It goes back to off** where `rt-hogs` doesn't beat `hogs`.
   **Cores need Ada's call** where only `rt-cores` (or `cores`) makes the bar: then cores of its own, which take a
   choice of how many and which, would have to become a default the installer derives.
+
+### Why: fedora's kernel, read (goal 8 step 7)
+
+fedora runs Linux 6.19.10 (`6.19.10-300.fc44`, read 2026-11-05): `CONFIG_PREEMPT_DYNAMIC` booted lazy
+(`CONFIG_PREEMPT_LAZY=y`, no `preempt=` on its command line), `CONFIG_HZ=1000`, `CONFIG_SCHED_CLASS_EXT=y`
+with no scheduler loaded, on an i9-14900HX whose 32 CPUs share one L3. Its scheduler, read in the stable
+tree's v6.19.10 (`kernel/sched/core.c`, `fair.c`, `syscalls.c`, `kernel/entry/common.c`; lines as there):
+
+- **Every wakeup preemption of the fair class is lazy.** `check_preempt_wakeup_fair` ends in
+  `resched_curr_lazy` (fair.c:8981) whatever led there: a shorter slice (`PREEMPT_SHORT`, fair.c:8927), an
+  idle entity beside it (fair.c:8903), the pick. Under lazy preemption that sets `TIF_NEED_RESCHED_LAZY`
+  on the running thread and sends no interrupt: `__resched_curr` sends one only for the full mark
+  (core.c:1131-1132), and makes the lazy one full only for the idle task (core.c:1114).
+- **The busy CPU switches at its next return to user space, or its tick.** `exit_to_user_mode_loop` takes
+  either mark (common.c:31), so a system call's end, a fault's or any interrupt's runs the woken thread;
+  `sched_tick` makes the lazy mark full (core.c:5539). A return to kernel code takes only the full one
+  (common.c:172). Behind a thread spinning in user space, as the lab's hogs do, that is the tick: up to
+  1 ms at 1000 Hz, half of it on average. Real legs enter the kernel often (wake-look1 in docs/priority.md:
+  hogs entering it every 20 µs held a wake 31.6 µs at p99.9), so the lab's hogs are the worst case.
+- **What preempts at once:** a wake of a higher class (`wakeup_preempt` calls `resched_curr`, core.c:2183):
+  a real-time or deadline thread over a normal one, a normal one over a sched_ext one; a wake onto an idle
+  CPU; and a wake that goes through the target's wakelist and its interrupt, which a wake from another
+  last-level cache does (core.c:3854), as does one onto an idle CPU (core.c:3871) or one that finds the task
+  still switching out (core.c:4196).
+
+So for each means a thread has without root:
+
+| means | needs | a wake behind a spinning hog | its cost |
+| --- | --- | --- | --- |
+| a slice of its own (`sched_attr.sched_runtime`, 0.1 to 100 ms, fair.c:5198) | nothing: `user_check_sched_setscheduler` doesn't check it | still lazy; but the wake decides at once, past the hog's slice protection (`RUN_TO_PARITY`, fair.c:1037; the kernel's slice here is 2.8 ms, 0.7 ms × (1 + log2 8), fair.c:79, :206) | turns taken sooner beside threads of its own weight; kiln's shards ask for their step, 266.7 µs, already |
+| the hogs at the idle policy (`SCHED_IDLE`, or `cpu.idle` on their cgroup) | nothing, for kiln's own legs and agents | still lazy: an idle entity is preempted without the pick (fair.c:8903), lazily | the hogs at a weight of 3 |
+| sched_ext | root: loading a scheduler takes `CAP_BPF` and `CAP_SYS_ADMIN` (fedora: `unprivileged_bpf_disabled` 2); without one a `SCHED_EXT` task is fair (ext.c:3734) | at once, with the hogs in the loaded class (core.c:2183) | a BPF scheduler to keep |
+| the wakelist across caches | two last-level caches | at once | not on fedora: one L3 for all 32 CPUs; adacachy has two and preempts fully anyway |
+| spinning before it parks (hyper-rt's `spin_ns`) | nothing | none for a wake within the spin; one after it waits as before | the spin's CPU at every idle gap, taken from the hogs |
+| the real-time class | `RLIMIT_RTPRIO` room (fedora: 0) | at once | "What needs Ada" |
+| a nudge: a timer of its own on its CPU while it waits | nothing | at most the nudge's period: the timer's interrupt returns to the hog's user space and takes the mark | a wake of the waiting shard every period |
+
+### What kiln does: a nudge for the shards (goal 8 step 7)
+
+`[server] nudge = true` (off until declared; `KILN_RT_NUDGE` overrides it, `KILN_RT_NUDGE_US` sets its
+period for a lab's A/B) holds each of a shard's waits in its driver to the timers' tick, 100 µs
+(`hyper_rt::compute::nudge_current_thread`: a thread-local the epoll driver's `wait` reads). With the
+shard's timer slack, which is that tick too (hyper-rt's `Shard::build`), its CPU takes an interrupt of the
+shard's own at least every 200 µs while it waits. The wait's timer is armed on the CPU the shard parks on,
+busy with the shard as it arms (`get_nohz_timer_target`, core.c:1202), and its interrupt's return to the
+hog's user space takes the lazy mark, so a shard woken behind a hog waits at most two ticks, no longer than
+a timer of its own may be late, instead of the kernel's tick.
+
+- **In the real-time class's place.** A shard that took the real-time class (`[server] realtime`, granted)
+  asks for nothing more: its wake preempts at once. Refused, or not asked for, it asks for its slice and,
+  with `[server] nudge`, nudges (`crate::rt::shard_asks`). macOS and Windows refuse the nudge: they have no
+  lazy preemption to bound.
+- **It says so**, in the log once every shard has answered and in `/healthz/server` (`priority.nudge`:
+  asked, period, shards, nudged, those in the real-time class, refused, why).
+- **What it costs.** A waiting shard wakes once a period, up to 10,000 times a second at the tick: a park and
+  a turn of its loop each, CPU the shard spends (its busy share rises with it) and the threads beside it
+  lose; and a calm machine's CPUs can't reach their deeper idle states while a shard waits (fedora's C3
+  takes up to 1,048 µs to leave, which a calm wake pays too). That cost is measurable, so the nudge is a
+  setting, not the default. The microbench below measures it.
+
+### The wake microbench (goal 8 step 7)
+
+`crates/kiln-rt/benches/lazy_wake.rs` times a cross-thread wake of a hyper-rt shard (a task sent from off the
+runtime, `submit_to_holder`: the control queue and the kick) at exponential gaps, 1 ms on average, with
+spinning hogs at `cpu.weight` 1 on the shard's CPUs and the bench at `CPUWeight=1000`, for each means above:
+`calm`, `calm-tick:100`, `plain` (the kernel's slice), `slice` (kiln's), `slice-min`, `idle-hogs`, `rr`
+(where granted), `spin:10`, `spin:100`, `tick:100`, `tick:50`, `unpinned` (the lab's `hogs` layout) and `llc`
+(where there are two caches). Each arm gives its wakes' p50 to max, the shard's CPU, its driver waits a
+second, its run-queue wait, the hogs' CPU, and the CPU other work took on the shard's CPUs. On fedora, the
+lab's queue between its runs:
+
+```text
+cargo bench -p hyper-rt --bench lazy_wake --no-run
+systemd-run --user --scope --quiet --collect -p CPUWeight=1000 -- \
+  cargo bench -p hyper-rt --bench lazy_wake -- --cpus 16-19 --waker 24 --secs 10 --rounds 3
+```
+
+Its results go here when it has run.
+
+### What needs Ada (goal 8 step 7)
+
+- **The real-time class, `preempt=full` or a partition on fedora**, each root's: "Ada's call" above. With any
+  of them the shards need no nudge there: a real-time wake, a full kernel's and a core of its own each run a
+  woken shard at once.
+- **Whether kiln should ask rtkit.** fedora runs `rtkit-daemon`, which grants `SCHED_RR` up to priority 20,
+  without root, to a thread of a local session's process whose `RLIMIT_RTTIME` hard limit is at most 200 ms;
+  kiln would ask over D-Bus. But a shard that ran 200 ms without sleeping would get the server killed (the
+  kernel's `RLIMIT_RTTIME`; goal 9 step 2 found polls of 76 ms), and whenever rtkit's watchdog thread, a
+  normal one, starves for 10 s it demotes every thread it granted and refuses for 5 minutes: its journal shows
+  it did on 2026-11-04 under load. Not built; hers to weigh.
+
 
 ## What the lab doesn't do yet
 

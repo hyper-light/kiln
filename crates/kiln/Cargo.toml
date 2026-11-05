@@ -10,8 +10,10 @@ chaos = []
 # The binary allocates through jemalloc on Linux, for the allocator's A/B (goal 11, plan 01a1a87b2e56 step 4) on
 # the build production runs (static musl, whose malloc takes no preload): in the lab's realistic profile the
 # server's anonymous memory was 261 MB on jemalloc (one round, its profile on), 393 MB on glibc's malloc and
-# 401 MB on musl's (the median of 8; g11load, 2026-11-05). Off until the A/B, latency included, says so.
-jemalloc = ["dep:tikv-jemallocator"]
+# 401 MB on musl's (the median of 8; g11load, 2026-11-05). Off until the A/B, latency included, says so;
+# ci/release/build.sh takes it with KILN_LINUX_ALLOCATOR=jemalloc. Its settings are `os::alloc`'s, which its
+# tests read back from jemalloc itself (tikv-jemalloc-sys's mallctl).
+jemalloc = ["dep:tikv-jemallocator", "dep:tikv-jemalloc-sys"]
 
 # The wire lab drives faults only a build with `chaos` has: asked for without it, cargo says so
 # rather than running nothing (docs/wire.md, "The lab").
@@ -146,6 +148,7 @@ str0m = { version = "0.24.1", default-features = false, features = ["aws-lc-rs"]
 # built with the target's C compiler (zig's for kiln's releases).
 [target.'cfg(target_os = "linux")'.dependencies]
 tikv-jemallocator = { version = "0.6", optional = true }
+tikv-jemalloc-sys = { version = "0.6", optional = true }
 
 [target.'cfg(unix)'.dependencies]
 nix = { version = "0.31.3", features = ["signal", "process", "fs", "user", "term", "feature", "hostname", "net", "socket", "uio", "mount", "reboot", "sched", "time"] }
@@ -160,6 +163,13 @@ winapi-util = "0.1.11"
 
 [lints]
 workspace = true
+
+# The UI's files packed with brotli in the build (build.rs, by src/ui_pack.rs; goal 11, plan 01a1a87b2e56 step 5),
+# with the crate's own versions of what the server packs with.
+[build-dependencies]
+brotli = "8.0.4"
+mime_guess = "2.0.5"
+sha2 = "0.11.1"
 
 [dev-dependencies]
 # The UI's wire types, rendered to ui/src/api/wire/ by `wire::ts` (test builds alone: the release

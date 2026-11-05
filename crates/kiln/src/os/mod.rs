@@ -27,6 +27,9 @@ pub use windows::*;
 #[cfg(windows)]
 mod win32;
 
+/// The allocator and how it gives memory back: jemalloc's settings, glibc's arenas (goal 11, plan
+/// 01a1a87b2e56 step 4).
+pub mod alloc;
 pub mod battery;
 pub mod cgroup;
 /// kiln's own code signature on a Mac, so macOS knows every upgrade as one program.

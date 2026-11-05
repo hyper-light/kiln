@@ -324,6 +324,24 @@ pub fn realtime_current_thread(priority: i32) -> Result<(), Refusal> {
     crate::prioritysys::realtime_current_thread(priority)
 }
 
+/// Bounds how long the calling thread, a shard, waits for its CPU once woken behind a thread busy in user space,
+/// where Linux preempts lazily and the real-time class is refused (kiln's goal 8, plan 01a1a59c2b29 step 7): each
+/// of its waits in the driver ends by `period_ns` (and the thread's timer slack, which the kernel adds to every
+/// timed wait), so its CPU takes a timer interrupt of the shard's own at least that often while it waits. Under
+/// lazy preemption a fair-class wake marks the busy thread for a reschedule and sends no interrupt, and the CPU
+/// switches as that thread next returns to user space from the kernel, at the tick at the latest (1 ms at
+/// 1000 Hz): the shard's own timer is such a return. Nothing a normal thread may set makes the wake itself
+/// preempt at once on Linux 6.19 (a custom slice, the idle policy beside it and the rest: kiln's
+/// docs/runtime-lab.md, "Goal 8 step 7 and goal 9 step 4").
+///
+/// What it costs: one wake of the shard per period while it waits, a park and a return to its loop, CPU the
+/// shard spends and its CPU's other threads lose; on an idle CPU, the deeper idle states it can't reach. 0 lifts
+/// it. Refused on macOS and Windows, which have no lazy preemption to bound (the OS-interface file says what
+/// holds a shard on each): the thread then runs as it did.
+pub fn nudge_current_thread(period_ns: u64) -> Result<(), Refusal> {
+    crate::prioritysys::nudge_current_thread(period_ns)
+}
+
 /// The calling thread's priority as its OS reports it (a pool thread's is lowered; a shard's is not).
 pub fn thread_priority() -> Priority {
     crate::prioritysys::of_current_thread()
