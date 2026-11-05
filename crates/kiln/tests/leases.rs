@@ -633,7 +633,7 @@ fn w05_ac16_a_runner_cut_off_past_its_lease_writes_nothing_after_the_next_attemp
     let (_, body) = http(s.port, "GET", &format!("/api/ci/legs/{}", one.leg), &s.admin, None)?;
     let now: Value = serde_json::from_str(&body)?;
     assert_eq!(now.pointer("/attempts/0/class"), Some(&json!("runner-lost")), "attempt 1 lost: {now}");
-    assert_eq!((now.pointer("/attempts/0/runner"), now.pointer("/attempts/1/runner")), (Some(&json!("a")), Some(&json!("b"))), "{now}");
+    assert_eq!((now.pointer("/attempts/0/runner"), now.pointer("/attempts/1/runner")), (Some(&json!(common::machine("a"))), Some(&json!(common::machine("b")))), "{now}");
     // Attempt 1's tokens refused; attempt 2's taken, its `dist` uploaded whole.
     assert_eq!(uses(&s, &one, "dist-1")?, [401, 401, 401], "attempt 1's tokens, its grant lost\n{}", s.log());
     let dist = b"attempt 2's dist.tar";
