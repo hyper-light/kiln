@@ -109,10 +109,10 @@ pub struct Server {
     /// itself: a forwarded or NATed port, a host's Tailscale address. Empty: `webrtc_addr`, or (on
     /// every address) each LAN address of this machine at its port.
     pub webrtc_advertise: Vec<String>,
-    /// A shard whose queue stands past its calm (it hasn't come back to it for a whole tolerance, 1 s),
-    /// or a pool's line that work keeps standing so, answers Background requests 503 with `Retry-After`,
-    /// and Normal ones too once it has stood another; Critical ones (health, sign-in, a person's pages
-    /// and actions) never (`crate::overload`, kiln's goal 6). Off until declared, as what kiln decides
+    /// A shard whose queue stands past its calm (most of a tolerance, 1 s, past it while the shard runs
+    /// most of the time), or a pool's line that work keeps standing past it, answers Background requests
+    /// 503 with `Retry-After`, and Normal ones too once it has stood another tolerance; Critical ones
+    /// (health, sign-in, a person's pages and actions) never (`crate::overload`, kiln's goal 6). Off until declared, as what kiln decides
     /// on its own is (docs/ci.md §0.3, "Opt-in automation"): the queues are measured and shown on
     /// `/metrics` and `/readyz` either way, and off, nothing is refused. `KILN_SHED` overrides it.
     pub shed: bool,

@@ -75,8 +75,8 @@ impl Shard {
     }
 
     /// A probe's wake, `late` after its timer fell due, at `now`; on the shard, so what it reads of
-    /// the shard is the shard's own.
-    fn note(&self, late: Duration, now: Instant) {
+    /// the shard is the shard's own. The CPU time its thread has run, where the OS keeps it.
+    fn note(&self, late: Duration, now: Instant) -> Option<u64> {
         let late_ns = nanos(late);
         self.delay.observe(late.as_secs_f64());
         self.late_ns.store(late_ns, Ordering::Relaxed);
@@ -91,9 +91,11 @@ impl Shard {
             self.longest_poll_ns.store(c.longest_step_ns, Ordering::Relaxed);
             self.overrun_ns.store(c.scheduler_overrun_ns, Ordering::Relaxed);
         }
-        if let Some(cpu) = thread_cpu_ns() {
+        let cpu = thread_cpu_ns();
+        if let Some(cpu) = cpu {
             self.cpu_ns.store(cpu, Ordering::Relaxed);
         }
+        cpu
     }
 
     /// How late its probes ran, each noted.
@@ -238,9 +240,9 @@ async fn probe(i: usize, period: Duration) {
         crate::rt::sleep_until(due).await;
         let now = Instant::now();
         let late = now.saturating_duration_since(due);
-        me.note(late, now);
-        // What the shard sheds, from its delay (goal 6, plan 01a1a59c2abe step 4).
-        crate::overload::tick(i, late);
+        let cpu = me.note(late, now);
+        // What the shard sheds, from its delay and how much of the time it ran (goal 6, plan 01a1a59c2abe step 4).
+        crate::overload::tick(i, late, cpu);
         // The next one a period from now: a shard that was held doesn't then run a burst of probes
         // to catch up, each noting the same hold again.
         due = now + period;
