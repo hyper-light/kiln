@@ -749,33 +749,46 @@ impl Admission {
             if let Some(f) = self.fair.get_mut(c.index()) {
                 f.moved = false;
             }
+            let mut moves: Vec<(u32, [u128; LEVELS])> = Vec::new();
             for (leaf, had) in leaves {
                 let standing = self.standing_of(c, &leaf);
                 if standing == had {
                     continue;
                 }
-                let slots: Vec<u32> = match self.fair.get_mut(c.index()).and_then(|f| f.leaves.get_mut(&leaf)) {
-                    Some((st, set)) => {
-                        *st = standing;
-                        set.iter().copied().collect()
-                    }
-                    None => continue,
-                };
-                for s in slots {
-                    let Some(p) = self.get(s) else { continue };
-                    let (Some(old), item) = (p.key, Item { slot: s, ask: p.amounts, predicted: p.predicted, timeout: p.ask.timeout }) else { continue };
-                    let key = Key { standing, ..old };
-                    self.line.remove(&old);
+                if let Some((st, set)) = self.fair.get_mut(c.index()).and_then(|f| f.leaves.get_mut(&leaf)) {
+                    *st = standing;
+                    moves.extend(set.iter().map(|s| (*s, standing)));
+                }
+            }
+            // Each move looked at alone costs the boundaries before and after it, two runs at each
+            // power of two, and the run itself: 4·⌈log2 n⌉ + 1 tells to look at. Looking at every
+            // waiting run once costs n. Many moves at once (a tenant with many runs waiting, its
+            // standing moved by a charge) are made together, then every run looked at once
+            // (docs/needs.md §11, AUDIT P6: restand was O(k log² n) for k runs moved).
+            let n = u64::from(self.line.len());
+            let per_move = 4 * u64::from(n.max(1).ilog2() + 1) + 1;
+            let together = (moves.len() as u64).saturating_mul(per_move) > n;
+            for (s, standing) in moves {
+                let Some(p) = self.get(s) else { continue };
+                let (Some(old), item) = (p.key, Item { slot: s, ask: p.amounts, predicted: p.predicted, timeout: p.ask.timeout }) else { continue };
+                let key = Key { standing, ..old };
+                self.line.remove(&old);
+                if !together {
                     self.boundaries(now, out);
-                    self.line.insert(key, item);
-                    if let Some(p) = self.get_mut(s) {
-                        p.key = Some(key);
-                    }
-                    // The others moved a place at most, at the boundaries; this one may have moved
-                    // many, and is told itself.
+                }
+                self.line.insert(key, item);
+                if let Some(p) = self.get_mut(s) {
+                    p.key = Some(key);
+                }
+                // The others moved a place at most, at the boundaries; this one may have moved
+                // many, and is told itself.
+                if !together {
                     self.boundaries(now, out);
                     self.tell_if_changed(s, now, out);
                 }
+            }
+            if together {
+                self.tell_all(now, out);
             }
         }
     }
@@ -1192,16 +1205,22 @@ impl Admission {
 
     /// Tells every waiting probe whose place or reason changed (a drain, an owner back): O(n).
     fn tell_all(&mut self, now: i64, out: &mut Vec<Said>) {
-        for (_, s) in self.line.entries() {
-            self.tell_if_changed(s, now, out);
+        // In order: each one's place is where it comes, no search for it.
+        for (rank, (_, s)) in self.line.entries().into_iter().enumerate() {
+            self.tell_at(s, u32::try_from(rank).unwrap_or(u32::MAX), now, out);
         }
     }
 
     fn tell_if_changed(&mut self, s: u32, now: i64, out: &mut Vec<Said>) {
+        let Some(rank) = self.rank_of(s) else { return };
+        self.tell_at(s, rank, now, out);
+    }
+
+    /// Tells waiting probe `s`, at place `rank` (the first 0), where it stands, if that changed.
+    fn tell_at(&mut self, s: u32, rank: u32, now: i64, out: &mut Vec<Said>) {
         if self.hush == Some(s) {
             return;
         }
-        let Some(rank) = self.rank_of(s) else { return };
         let told = self.told_of(s, rank);
         let Some(p) = self.get(s) else { return };
         if p.told == Some(told) {
