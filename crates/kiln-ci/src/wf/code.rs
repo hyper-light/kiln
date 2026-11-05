@@ -40,6 +40,45 @@ pub fn typed(path: &str) -> bool {
     path.ends_with(".ts")
 }
 
+/// The modules a program imports, each with where it names it: its imports, its re-exports and
+/// its `import()`s (`None` for one whose name isn't a string). R27 lets a program import
+/// `@kiln/sdk` alone.
+pub fn imports(text: &str) -> Vec<(Option<String>, Range)> {
+    let grep = SupportLang::TypeScript.grep(text);
+    let mut out = Vec::new();
+    let mut stack = vec![grep.root()];
+    while let Some(n) = stack.pop() {
+        let named = match n.kind().as_ref() {
+            "import_statement" | "export_statement" => n.field("source").map(|s| Some(unquote(&s.text()))),
+            "call_expression" if n.field("function").is_some_and(|f| f.kind() == "import") => {
+                Some(n.field("arguments").and_then(|a| a.children().find(|c| c.is_named())).filter(|a| a.kind() == "string").map(|a| unquote(&a.text())))
+            }
+            _ => None,
+        };
+        match named {
+            Some(name) => {
+                let r = n.range();
+                out.push((name, Range { start: pos(text, r.start), end: pos(text, r.end) }));
+            }
+            None => stack.extend(n.children()),
+        }
+    }
+    out.sort_by_key(|(_, r)| r.start.offset);
+    out
+}
+
+/// Where a program's `export default` is.
+pub fn default_export(text: &str) -> Option<Pos> {
+    let grep = SupportLang::TypeScript.grep(text);
+    let root = grep.root();
+    let at = root.children().find(|s| s.kind() == "export_statement" && s.children().any(|c| c.kind() == "default"))?.range().start;
+    Some(pos(text, at))
+}
+
+fn unquote(s: &str) -> String {
+    s.get(1..s.len().saturating_sub(1)).unwrap_or_default().to_owned()
+}
+
 struct Eraser<'s> {
     src: &'s str,
     blank: Vec<Span<usize>>,
@@ -367,7 +406,7 @@ fn errors_in(n: &N<'_>) -> bool {
 }
 
 /// The 1-based line and column (in characters) of byte `at` of `src`.
-fn pos(src: &str, at: usize) -> Pos {
+pub fn pos(src: &str, at: usize) -> Pos {
     let before = src.get(..at).unwrap_or(src);
     let line_start = before.rfind('\n').map_or(0, |i| i + 1);
     let line = u32::try_from(before.matches('\n').count() + 1).unwrap_or(u32::MAX);

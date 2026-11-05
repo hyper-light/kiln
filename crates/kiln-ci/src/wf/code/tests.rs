@@ -83,3 +83,13 @@ fn w29_r27_a_type_the_grammar_misreads_is_left_for_quickjs() {
     let ts = "interface I { a: = }\nconst b: number = 1;\n";
     assert_eq!(erase(ts).ok().as_deref(), Some("interface I { a: = }\nconst b         = 1;\n"));
 }
+
+#[test]
+fn w29_r27_imports_are_found_where_they_are_named() {
+    let ts = "import { a } from \"@kiln/sdk\";\nimport \"node:fs\";\nexport * from \"x\";\nconst m = await import(\"z\");\nconst n = import(name);\nexport default { on: \"push\" };\n";
+    let all = imports(ts);
+    let found: Vec<(Option<&str>, u32, u32)> = all.iter().map(|(n, r)| (n.as_deref(), r.start.line, r.start.col)).collect();
+    assert_eq!(found, vec![(Some("@kiln/sdk"), 1, 1), (Some("node:fs"), 2, 1), (Some("x"), 3, 1), (Some("z"), 4, 17), (None, 5, 11)]);
+    assert_eq!(default_export(ts).map(|p| (p.line, p.col)), Some((6, 1)));
+    assert_eq!(default_export("const a = 1;\n"), None);
+}

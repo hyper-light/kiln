@@ -13,6 +13,7 @@ pub mod chat;
 pub mod cd_events;
 pub mod broker;
 pub mod cli;
+pub mod code;
 pub mod compare;
 pub mod conflicts;
 pub mod cr;
