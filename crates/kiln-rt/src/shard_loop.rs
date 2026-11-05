@@ -1560,13 +1560,13 @@ impl Shard {
             self.finish_hard_cancelled();
             return None;
         }
-        let learns = self.core.real_time && self.core.wake.is_some();
-        woke.filter(|_| !learns)
+        woke
     }
 
     /// The registered shard's park: announced, then a wait in the driver unless an inbox already holds work
     /// (the protocol of [`crate::parking`]), learning from a wait what the wake took and what the park
-    /// cost. Whether it waited, and the reading its wait returned with (none where the driver was lost).
+    /// cost. Whether it waited, and the reading its wait returned with: none where the driver was lost, or where
+    /// the shard learns (its readings of its switches and CPU, system calls, follow the wait).
     fn park_announced(
         &mut self,
         entry: &'static Entry,
@@ -1613,7 +1613,7 @@ impl Shard {
                 self.note_park_cost(entry, after.saturating_sub(before));
             }
         }
-        (true, woke)
+        (true, woke.filter(|_| !learns))
     }
 
     /// Driver loss closed admission and marked every live task. A single arena
