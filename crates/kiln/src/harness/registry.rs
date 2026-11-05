@@ -948,7 +948,7 @@ pub struct Registry {
     feed_out: Option<async_channel::Receiver<crate::convo::feed::Out>>,
     /// The runners that keep a copy of it (`crate::convo::mirror`), and what to send them.
     pub copies: Option<Arc<crate::convo::mirror::Mirrors>>,
-    copies_out: Option<async_channel::Receiver<(hyper_transport::PeerId, String, Vec<u8>)>>,
+    copies_out: Option<crate::memory::queue::Receiver<crate::convo::mirror::Out>>,
     /// Every store, as the server sees it: the System page's (`super::stores`).
     pub board: crate::convo::board::Board,
     /// What agents' pages read of the store, kept in memory while it holds (`crate::reads::Views`:
