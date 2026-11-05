@@ -32,11 +32,14 @@ harmed. A target that declares none takes the platform's default, Kubernetes' 1 
   own reasons, not slow, and isn't counted.
 - `tcp`: connect to `host:port`.
 
-kiln adds its own unless `automatic` is off: a sync in the runner's data folder, the health of the
-server the runner reports to, and, where that server runs on this machine, how late its shards ran
+kiln adds its own unless `automatic` is off: a sync in the runner's data folder and, where the
+server the runner reports to runs on this machine, that server's health and how late its shards ran
 ready work on average since the last look (`kiln server delay`, [priority.md](priority.md)): its
 tolerance is the shards' own probe period, and, as it answers with a level it measured rather than
 with how long the probe took, its window (how soon trouble must be caught) is the platform's 1 s.
+A runner on another machine paces nothing for the server: its work can't slow it. (It once did, and
+on 2026-11-05 the Mac runners, reading production's latency while production's own machine was
+loaded as harm their builds did, held every agent's run to about 1% of a CPU.)
 Each target is probed on a thread of its own, at an interval the engine derives; a probe still out
 counts while it hangs.
 
@@ -48,6 +51,28 @@ the tolerance is harm, at once.
 between the highest level held calm and the lowest level trouble began at. Where the system says
 what its disks write (Linux), what they delivered while trouble last showed is all they take, and
 the write budget is never raised past it less what others write.
+
+**Agent messages.** Whether messages get through to the runner's agents is a target too, kiln's
+own on every runner (`headroom/messages.rs`), and the same for every harness: Claude Code, Codex,
+each ACP agent (Devin, Gemini, Goose, Amp…), Antigravity, and whatever comes next. It isn't probed.
+After everything a harness says or is told, the shared harness layer (`harness::kinds::Adapter`)
+reports what of each session waits to be delivered:
+- a message written to its harness and not yet taken (its delivery `Sent`);
+- one its adapter holds until the harness is ready (Codex's thread, an ACP agent's session);
+- one in kiln's queue while the harness is starting or idle (not up yet, or held).
+
+A message queued behind a running turn, or waiting on a person's answer, waits by design and isn't
+counted, and an exited harness's waits are dropped unmeasured. Each wait is timed from when it began
+to when it ended, and the longest still going counts as a probe out, so a harness that's stopped,
+starved or never came up alarms while it's stuck, not after. Its tolerance is the platform's, as
+for any target that declares none. Its calm level and alarm threshold are learned like every
+other target's.
+
+Headroom never stands in a message's way. A session with anything waiting is a person's for as long
+as it waits: never held at admission, never paced (the engine decides shares again when a group's
+class changes), and the pacer is woken as it begins waiting, so a harness stopped mid-period goes
+on at once. Before this (2026-11-05) a Mac's pacer held every agent's processes stopped, harnesses
+included, and nothing sent to them arrived.
 
 **Holding.** Writes and CPU aren't held for: the pacer shares the budgets among what runs, from
 the first moment it runs, so holding work it could slow would protect nothing and only delay it.

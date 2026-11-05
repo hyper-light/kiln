@@ -509,6 +509,35 @@ impl Adapter {
             Self::Agy(a) => a.holds_calls(),
         };
         super::subagent::settle_pausable(core, |t| can && t.tool_id.is_some());
+        self.note_delivery(core);
+    }
+
+    /// What its adapter holds till its harness is ready (Codex's thread, an ACP agent's session).
+    fn held(&self) -> &[QueueItem] {
+        match self {
+            Self::Codex(a) => a.held(),
+            Self::Acp(a) => a.held(),
+            Self::Claude(_) | Self::Agy(_) => &[],
+        }
+    }
+
+    /// Tells headroom what of the session waits to be delivered now (docs/headroom.md, "Agent
+    /// messages"), the same way for every harness: what its harness was handed and hasn't taken (its
+    /// delivery `Sent`), what its adapter holds till the harness is ready, and what waits in kiln's
+    /// queue while the harness is starting or idle (not up yet, or held). What waits in the queue
+    /// while a turn runs, or for a person's answer, waits by design and isn't counted; an exited
+    /// harness's isn't either (`Adapter::exited`).
+    fn note_delivery(&self, core: &Core) {
+        use super::model::{Delivery, Status};
+        if core.state.status == Status::Exited {
+            crate::headroom::messages::gone(&core.session_id);
+            return;
+        }
+        let sent = core.state.delivery.iter().filter(|(_, d)| **d == Delivery::Sent).map(|(id, _)| id.as_str());
+        let held = self.held().iter().map(|q| q.id.as_str());
+        let queued = matches!(core.state.status, Status::Starting | Status::Idle).then(|| core.state.queue.iter().map(|q| q.id.as_str())).into_iter().flatten();
+        let ids: Vec<&str> = sent.chain(held).chain(queued).collect();
+        crate::headroom::messages::waiting(&core.session_id, &ids);
     }
 
     /// What waits for its subagents goes to each that can take it now (one at a time each).
@@ -534,6 +563,8 @@ impl Adapter {
         core.end_harness_work();
         self.settle_subagents(core);
         self.let_go(core);
+        // What waited for this harness isn't measured: it waits for the next one, or for nothing.
+        crate::headroom::messages::gone(&core.session_id);
     }
 
     /// Its process is gone, and this adapter goes with it (it ended, was stopped, or starts again,
@@ -1205,6 +1236,50 @@ mod tests {
         let users = lines.iter().filter(|v| v.get("type").and_then(serde_json::Value::as_str) == Some("user")).filter_map(|v| v.get("uuid").and_then(serde_json::Value::as_str).map(str::to_owned)).collect();
         let asked = lines.iter().find(|v| v.pointer("/request/subtype").and_then(serde_json::Value::as_str) == Some(subtype)).and_then(|v| v.get("request_id").cloned());
         (users, asked)
+    }
+
+    /// docs/headroom.md, "Agent messages": what waits to reach a session's harness is told to
+    /// headroom from the shared state alone, the same for every harness: a message written and
+    /// not yet taken, and one in kiln's queue while the harness is starting or idle; not one queued
+    /// behind a running turn; and nothing once the harness has exited.
+    #[test]
+    fn what_waits_for_a_harness_is_told_the_same_way_for_every_harness() {
+        use super::super::model::{Delivery, Status};
+        let mut core = Core::new();
+        core.session_id = "t-delivery-shared".into();
+        let w = || crate::headroom::messages::waits("t-delivery-shared");
+        let claude = Adapter::Claude(Box::new(Claude::new(false)));
+        let note_delivery = |core: &Core| claude.note_delivery(core);
+        core.state.status = Status::Starting;
+        core.state.queue.push(QueueItem { id: "m1".into(), text: "hi".into(), at: 0, attachments: Vec::new(), overrides: None, reply_to: None });
+        note_delivery(&core);
+        assert_eq!(w(), ["m1"], "held while its harness starts");
+        // Written: it waits on, the same wait; one queued behind the turn it started doesn't.
+        core.state.queue.clear();
+        core.state.queue.push(QueueItem { id: "m2".into(), text: "next".into(), at: 0, attachments: Vec::new(), overrides: None, reply_to: None });
+        core.state.delivery.insert("m1".into(), Delivery::Sent);
+        core.state.status = Status::Running;
+        note_delivery(&core);
+        assert_eq!(w(), ["m1"]);
+        let before = crate::headroom::messages::ended();
+        core.state.delivery.insert("m1".into(), Delivery::Started);
+        note_delivery(&core);
+        assert!(w().is_empty() && crate::headroom::messages::ended() > before, "taken, it's measured");
+        core.state.delivery.insert("m3".into(), Delivery::Sent);
+        note_delivery(&core);
+        core.state.status = Status::Exited;
+        note_delivery(&core);
+        assert!(w().is_empty(), "an exited harness's waits aren't kept");
+        // Through every kind's own adapter (Claude Code, Codex, each ACP agent, Antigravity): a
+        // message for a harness that hasn't answered yet waits, whichever it is.
+        for kind in Kind::all() {
+            let mut a = kind.adapter(&Spec { kind: kind.id.to_owned(), ..Spec::default() });
+            let mut core = Core::new();
+            core.session_id = format!("t-delivery-{}", kind.id);
+            a.start(&mut core);
+            a.command(&mut core, message("m1", "are you there?"));
+            assert!(!crate::headroom::messages::waits(&core.session_id).is_empty(), "{}: a message for a harness still starting isn't told as waiting", kind.id);
+        }
     }
 
     fn queue(core: &Core) -> Vec<&str> {
