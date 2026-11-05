@@ -10,6 +10,11 @@ hot = [
   "crates/kiln/src/http/server.rs",
   "crates/kiln/src/http/ws.rs",
   "crates/kiln/src/http/io.rs",
+  # TLS on every HTTPS connection: the server's own (`server.https`) and a runner's front door,
+  # whose connections are spread across shards (goal 7 step 3's tickets and keys, the front door's
+  # settings).
+  "crates/kiln/src/http/tls.rs",
+  "crates/kiln/src/frontdoor/proxy.rs",
   "crates/kiln/src/api.rs",
   "crates/kiln/src/overload.rs",
   "crates/kiln/src/ui.rs",
