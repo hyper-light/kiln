@@ -50,8 +50,8 @@
     },
     "mission": {
       "first": {
-        "total_br": 479768,
-        "js_br": 361708,
+        "total_br": 482458,
+        "js_br": 363878,
         "css_br": 61392,
         "font_br": 54581,
         "html_br": 8220,
@@ -65,8 +65,8 @@
     },
     "conversation": {
       "first": {
-        "total_br": 522207,
-        "js_br": 401434,
+        "total_br": 525113,
+        "js_br": 403857,
         "css_br": 64103,
         "font_br": 54581,
         "html_br": 8220,
@@ -80,8 +80,8 @@
     },
     "runs": {
       "first": {
-        "total_br": 391492,
-        "js_br": 278140,
+        "total_br": 395088,
+        "js_br": 281228,
         "css_br": 56682,
         "font_br": 54581,
         "html_br": 8220,
