@@ -1270,6 +1270,9 @@ pub struct Mirror {
     pub(super) reset_at: u64,
     /// The Open being taken starts the copy over (a whole snapshot follows it).
     pub(super) started_over_pending: bool,
+    /// The events socket's feed's number of its info's last `harness` frame (0: none yet), which its next lets
+    /// go of (`crate::hub::Hub::emit_harness`; goal 11, plan 01a1a87b2e56 step 5).
+    pub(super) harness_at: u64,
     /// When this server opened it, until its machine announces it: a report from the machine
     /// that left it out was made before its open got there, and doesn't end it.
     pub(super) opened_at: Option<std::time::Instant>,
@@ -1361,6 +1364,7 @@ impl Mirror {
             rev: 0,
             reset_at: 0,
             started_over_pending: false,
+            harness_at: 0,
             opened_at: None,
             slot,
             info_json: encoding,
