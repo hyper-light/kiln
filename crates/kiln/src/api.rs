@@ -70,7 +70,21 @@ fn signed_expiring(hub: &Hub, purpose: &str, ttl: i64) -> String {
 fn verify_expiring(hub: &Hub, purpose: &str, value: &str) -> bool {
     let Some((exp, sig)) = value.split_once('.') else { return false };
     let Ok(e) = exp.parse::<i64>() else { return false };
-    e > crate::util::now_unix() && crate::util::ct_eq(sig.as_bytes(), sign(hub, purpose, exp).as_bytes())
+    e > crate::util::now_unix() && signed(hub, purpose, exp, sig)
+}
+
+/// Whether `sig` is [`sign`]'s signature of `payload` for `purpose`, worked out as the signature is made (the HMAC of
+/// `purpose:payload` under the admin token, in hex) but on the stack: checking a session's cookie, which every request
+/// a signed-in browser sends does, made a string to sign, the signature's hex and a copy of the cookie (goal 9, plan
+/// 01a1a87b2cec step 5: authorization's work a request).
+fn signed(hub: &Hub, purpose: &str, payload: &str, sig: &str) -> bool {
+    use hmac::{KeyInit as _, Mac as _};
+    let Ok(mut mac) = hmac::Hmac::<sha2::Sha256>::new_from_slice(hub.admin_token.as_bytes()) else { return false };
+    mac.update(purpose.as_bytes());
+    mac.update(b":");
+    mac.update(payload.as_bytes());
+    let mut hexed = [0u8; 64];
+    hex::encode_to_slice(mac.finalize().into_bytes(), &mut hexed).is_ok() && crate::util::ct_eq(sig.as_bytes(), &hexed)
 }
 
 pub fn otp_url(hub_admin_token: &str, public_url: &str) -> String {
@@ -83,15 +97,9 @@ pub fn job_token(admin_token: &str, job: &str) -> String {
     crate::util::hmac_hex(admin_token.as_bytes(), format!("job:{job}").as_bytes())
 }
 
-fn cookie(headers: &HeaderMap, name: &str) -> Option<String> {
-    headers
-        .get_all(header::COOKIE)
-        .iter()
-        .filter_map(|v| v.to_str().ok())
-        .flat_map(|v| v.split(';'))
-        .filter_map(|kv| kv.trim().split_once('='))
-        .find(|(k, _)| *k == name)
-        .map(|(_, v)| v.to_owned())
+/// Cookie `name`'s value, as the request carries it.
+fn cookie<'h>(headers: &'h HeaderMap, name: &str) -> Option<&'h str> {
+    headers.get_all(header::COOKIE).iter().filter_map(|v| v.to_str().ok()).flat_map(|v| v.split(';')).filter_map(|kv| kv.trim().split_once('=')).find(|(k, _)| *k == name).map(|(_, v)| v)
 }
 
 fn bearer(headers: &HeaderMap) -> Option<&str> {
@@ -104,7 +112,7 @@ fn authed(hub: &Hub, headers: &HeaderMap) -> bool {
     {
         return true;
     }
-    cookie(headers, SESSION_COOKIE).is_some_and(|c| verify_expiring(hub, "session", &c))
+    cookie(headers, SESSION_COOKIE).is_some_and(|c| verify_expiring(hub, "session", c))
 }
 
 /// The cookie a sign-in sets; `Secure` when the browser reached kiln over HTTPS.
@@ -119,13 +127,13 @@ fn cookie_for(value: &str, secure: bool) -> String {
 }
 
 /// Who a request is: the owner (the admin token, the owner's session), else a token or a user's
-/// session (docs/ci.md W10-R01).
+/// session (docs/ci.md W10-R01). The owner is told at once; only a check past that is a future boxed
+/// apart (goal 9, plan 01a1a87b2cec step 5: the router boxed a future for every request's check).
 async fn caller_of(hub: &Hub, headers: &HeaderMap) -> Option<crate::authz::Caller> {
     if authed(hub, headers) {
         return Some(crate::authz::Caller::owner());
     }
-    let session = cookie(headers, SESSION_COOKIE);
-    crate::authz::gate::caller(hub, bearer(headers), session.as_deref()).await
+    boxed(|| crate::authz::gate::caller(hub, bearer(headers), cookie(headers, SESSION_COOKIE))).await
 }
 
 /// A `Host` header without its port (IPv6 literals keep their brackets).
@@ -142,7 +150,7 @@ fn host_only(h: &str) -> &str {
 /// or a public URL that says https (TLS ends in front of kiln).
 fn is_secure(hub: &Hub, req: &Request) -> bool {
     hub.cfg.server.public_url.starts_with("https")
-        || req.extensions().get::<srv::Secure>().is_some()
+        || srv::secure(req)
         || srv::header_str(req, &header::HOST).is_some_and(|h| hub.front_doors.serves(host_only(h)))
 }
 
@@ -198,12 +206,22 @@ pub const ASK_TIMING: &str = "kiln-timing";
 /// socket, where the connection said that) and how long the handler then took (`took`), as `crate::route_latency`
 /// observes them: W3C Server-Timing, `wait;dur=0.123, took;dur=0.045`, milliseconds to the microsecond.
 fn with_timing(mut resp: Response, waited: Option<Duration>, took: Duration) -> Response {
+    use std::io::Write as _;
     let ms = |d: Duration| d.as_secs_f64() * 1e3;
-    let said = match waited {
-        Some(w) => format!("wait;dur={:.3}, took;dur={:.3}", ms(w), ms(took)),
-        None => format!("took;dur={:.3}", ms(took)),
+    // Said on the stack, its one copy the header's own (goal 9, plan 01a1a87b2cec step 5: a string was made for it
+    // first). Room for two of the longest durations, in milliseconds (`u64::MAX` seconds: 23 digits, the point and 3
+    // more), and the words between.
+    let mut said = [0u8; 2 * 27 + 32];
+    let room = said.len();
+    let mut out = &mut said[..];
+    let wrote = match waited {
+        Some(w) => write!(out, "wait;dur={:.3}, took;dur={:.3}", ms(w), ms(took)),
+        None => write!(out, "took;dur={:.3}", ms(took)),
     };
-    if let Ok(v) = header::HeaderValue::from_str(&said) {
+    let len = room.saturating_sub(out.len());
+    if wrote.is_ok()
+        && let Some(v) = said.get(..len).and_then(|s| header::HeaderValue::from_bytes(s).ok())
+    {
         resp.headers_mut().insert(header::HeaderName::from_static("server-timing"), v);
     }
     resp
@@ -214,6 +232,20 @@ fn with_timing(mut resp: Response, waited: Option<Duration>, took: Duration) -> 
 /// each request split its path twice, two copies a segment each time).
 fn segments(path: &str) -> Vec<Cow<'_, str>> {
     path.trim_matches('/').split('/').filter(|s| !s.is_empty()).map(|s| if s.contains(['%', '+']) { Cow::Owned(srv::decode(s)) } else { Cow::Borrowed(s) }).collect()
+}
+
+/// `seg` as the router matches them, in `room` when they fit ([`srv::ROUTE_DEPTH`]: every route's own do), else in a
+/// vector of their own (goal 9, plan 01a1a87b2cec step 5: the router and its authorized half each made one a request).
+fn strs<'r>(seg: &'r [Cow<'_, str>], room: &'r mut [&'r str; srv::ROUTE_DEPTH]) -> Cow<'r, [&'r str]> {
+    match room.get_mut(..seg.len()) {
+        Some(slots) => {
+            for (slot, s) in slots.iter_mut().zip(seg) {
+                *slot = &**s;
+            }
+            Cow::Borrowed(slots)
+        }
+        None => Cow::Owned(seg.iter().map(|s| &**s).collect()),
+    }
 }
 
 async fn route(hub: Arc<Hub>, req: Request) -> R {
@@ -232,13 +264,17 @@ async fn route(hub: Arc<Hub>, req: Request) -> R {
         return Ok(boxed(|| f.serve_path(&slug, req, secure)).await);
     }
     let method = req.method().clone();
-    let path = req.uri().path().to_owned();
-    let seg = segments(&path);
-    let s: Vec<&str> = seg.iter().map(|c| &**c).collect();
+    // The request's target, shared: its path is the bytes the request came in, counted once more, not copied
+    // (goal 9, plan 01a1a87b2cec step 5).
+    let target = req.uri().clone();
+    let path = target.path();
+    let seg = segments(path);
+    let mut room = [""; srv::ROUTE_DEPTH];
+    let s = strs(&seg, &mut room);
 
     // Pages' own address (`[server] pages_url`): pages agents show, and nothing of kiln's.
     if pages_site(&hub).is_some_and(|site| asks_for(&req, &site)) {
-        return match (&method, s.as_slice()) {
+        return match (&method, &*s) {
             (&Method::GET | &Method::HEAD, ["v", "_", "fonts", name]) => Ok(page_font(name)),
             (&Method::GET | &Method::HEAD, ["v", id, ..]) => boxed(|| page(&hub, id, &req)).await,
             // An agent's app opened on a person's device (`crate::harness::opened`): its link's
@@ -254,17 +290,17 @@ async fn route(hub: Arc<Hub>, req: Request) -> R {
 
     // kiln's OCI registry (docs/ci.md W12-R01), with its own auth (Docker's token flow), as a task
     // of its own (an upload streams for as long as it takes).
-    if hub.cfg.ci.enabled && crate::ci::registry::proxy::is_proxy(&path) {
+    if hub.cfg.ci.enabled && crate::ci::registry::proxy::is_proxy(path) {
         let h = Arc::clone(&hub);
         return boxed(|| crate::rt::spawn(async move { boxed(|| crate::ci::registry::proxy::handle(&h, req)).await })).await.map_err(|_| err(StatusCode::INTERNAL_SERVER_ERROR, "the proxy's answer was lost"));
     }
-    if hub.cfg.ci.enabled && crate::ci::registry::is_registry(&path) {
+    if hub.cfg.ci.enabled && crate::ci::registry::is_registry(path) {
         let h = Arc::clone(&hub);
         return boxed(|| crate::rt::spawn(async move { boxed(|| crate::ci::registry::handle(&h, req)).await })).await.map_err(|_| err(StatusCode::INTERNAL_SERVER_ERROR, "the registry's answer was lost"));
     }
 
     // Open routes (their own auth, if any).
-    match (&method, s.as_slice()) {
+    match (&method, &*s) {
         (&Method::POST, ["api", "mcp"]) => {
             // The owner, by the admin token, its session or an MCP token kiln minted; else a
             // user's session or token, whose operations the route table judges one by one.
@@ -505,7 +541,7 @@ async fn route(hub: Arc<Hub>, req: Request) -> R {
     if !is_api {
         return Ok(boxed(|| crate::uiserver::serve(req)).await);
     }
-    let Some(caller) = boxed(|| caller_of(&hub, req.headers())).await else {
+    let Some(caller) = caller_of(&hub, req.headers()).await else {
         return Err(err(StatusCode::UNAUTHORIZED, "authentication required"));
     };
     if method == Method::GET || method == Method::HEAD {
@@ -515,7 +551,7 @@ async fn route(hub: Arc<Hub>, req: Request) -> R {
     // its handlers record on the way.
     let (who, q, ip) = (caller.clone(), srv::query(&req), srv::remote_ip(&req));
     let h = Arc::clone(&hub);
-    crate::audit::request(&h, crate::audit::Req { caller: &who, method: &method, path: &path, q: &q, ip }, boxed(|| authorized(hub, caller, req, seg)), |r: &R| match r {
+    crate::audit::request(&h, crate::audit::Req { caller: &who, method: &method, path, q: &q, ip }, boxed(|| authorized(hub, caller, req, seg)), |r: &R| match r {
         Ok(resp) => resp.status().as_u16(),
         Err(e) => e.0.as_u16(),
     })
@@ -544,7 +580,8 @@ async fn authorized(hub: Arc<Hub>, caller: crate::authz::Caller, req: Request, m
     {
         *name = Cow::Owned(id);
     }
-    let s: Vec<&str> = seg.iter().map(|c| &**c).collect();
+    let mut room = [""; srv::ROUTE_DEPTH];
+    let s = strs(&seg, &mut room);
     let q = srv::query(&req);
     if !caller.is_owner() {
         boxed(|| crate::authz::gate::check(&hub, &caller, &method, &s, &q)).await.map_err(|(c, m)| err(c, m))?;
@@ -553,7 +590,11 @@ async fn authorized(hub: Arc<Hub>, caller: crate::authz::Caller, req: Request, m
     req.extensions_mut().insert(caller.clone());
     // An agent session answers only to whoever reaches it (docs/agents.md, "Whose agents"): one the
     // caller doesn't see isn't found, and one it sees but doesn't act on refuses every change.
-    if let ["api", "harness", "sessions", id, ..] = s.as_slice() {
+    // Whoever sees every session (the owner, a manager) reaches each: told at once, with no future made to ask
+    // (goal 9, plan 01a1a87b2cec step 5: one was boxed for every read of an agent's page).
+    if let ["api", "harness", "sessions", id, ..] = &*s
+        && !crate::harness::lineage::sees_all(&caller)
+    {
         let reached = if matches!(method, Method::GET | Method::HEAD) {
             boxed(|| crate::harness::lineage::may_see(&hub, &caller, id)).await
         } else {
@@ -567,7 +608,7 @@ async fn authorized(hub: Arc<Hub>, caller: crate::authz::Caller, req: Request, m
             None => Err(err(StatusCode::NOT_FOUND, "not found")),
         };
     }
-    match (&method, s.as_slice()) {
+    match (&method, &*s) {
         (&Method::GET, ["api", "openapi.json"]) => Ok(srv::json(StatusCode::OK, &crate::authz::openapi(env!("CARGO_PKG_VERSION"), &crate::ops::all(&hub)))),
         (&Method::GET, ["api", "peers"]) => boxed(|| crate::peers::list(&hub)).await.map_err(|(c, m)| err(c, m)),
         (&Method::GET, ["api", "peers", "open"]) => crate::peers::openable(&hub).map_err(|(c, m)| err(c, m)),
@@ -8024,5 +8065,190 @@ mod tests {
             }
         }
         assert!(segments("/").is_empty());
+    }
+
+    /// What `f` allocated on this thread, and its output.
+    fn allocating<T>(f: impl FnOnce() -> T) -> (T, u64) {
+        let before = crate::os::counted::made().blocks;
+        let out = f();
+        (out, crate::os::counted::made().blocks.saturating_sub(before))
+    }
+
+    /// Goal 9, plan 01a1a87b2cec step 5: the router's segments are matched from the stack, as many as a route names,
+    /// with no allocation; a path of more has them in a vector.
+    #[test]
+    fn g9_s5_the_routers_segments_are_matched_from_the_stack() {
+        let seg = segments("/api/harness/sessions/a%2Fb/events");
+        let mut room = [""; srv::ROUTE_DEPTH];
+        let (said, made) = allocating(|| match strs(&seg, &mut room) {
+            Cow::Borrowed(s) => matches!(s, ["api", "harness", "sessions", "a/b", "events"]),
+            Cow::Owned(_) => false,
+        });
+        assert!(said && made == 0, "matched from the stack: {made} allocations");
+        let seg = segments("/api/harness/sessions/a/files/src/kiln/lib/http/server.rs");
+        let mut room = [""; srv::ROUTE_DEPTH];
+        let s = strs(&seg, &mut room);
+        assert!(matches!(s, Cow::Owned(_)));
+        assert_eq!(s.join("/"), "api/harness/sessions/a/files/src/kiln/lib/http/server.rs");
+    }
+
+    /// Goal 9, plan 01a1a87b2cec step 5 (authorization's work a request): a session's cookie is checked with nothing
+    /// allocated (it was a copy of the cookie, the string signed and the signature's hex), and says what the
+    /// signature's own comparison says: the owner's own, yes; one whose signature or expiry was changed, or one past
+    /// its expiry, no.
+    #[test]
+    fn g9_s5_a_sessions_cookie_is_checked_without_allocating() -> anyhow::Result<()> {
+        crate::rt::block_on(async {
+            let hub = crate::hub::tests::scratch_hub().await?;
+            let value = signed_expiring(&hub, "session", SESSION_TTL);
+            let with = |v: &str| -> anyhow::Result<HeaderMap> {
+                let mut h = HeaderMap::new();
+                h.insert(header::COOKIE, header::HeaderValue::from_str(&format!("theme=dark; {SESSION_COOKIE}={v}"))?);
+                Ok(h)
+            };
+            let theirs = with(&value)?;
+            let (yes, made) = allocating(|| authed(&hub, &theirs));
+            anyhow::ensure!(yes && made == 0, "the owner's session: {yes}, {made} allocations");
+            let (exp, sig) = value.split_once('.').ok_or_else(|| anyhow::anyhow!("no signature in {value}"))?;
+            anyhow::ensure!(crate::util::ct_eq(sig.as_bytes(), sign(&hub, "session", exp).as_bytes()), "the signature as it's made");
+            let flipped = if sig.ends_with('0') { "1" } else { "0" };
+            let changed = format!("{exp}.{}{flipped}", sig.get(..sig.len().saturating_sub(1)).unwrap_or_default());
+            let later = format!("{}.{sig}", exp.parse::<i64>()? + 1);
+            let past = format!("{}.{}", crate::util::now_unix() - 1, sign(&hub, "session", &(crate::util::now_unix() - 1).to_string()));
+            for (v, why) in [(changed, "its signature changed"), (later, "its expiry changed"), (past, "past its expiry")] {
+                anyhow::ensure!(!authed(&hub, &with(&v)?), "{why}: refused");
+                anyhow::ensure!(!verify_expiring(&hub, "session", &v), "{why}: refused");
+            }
+            anyhow::ensure!(!verify_expiring(&hub, "otp", &value), "another purpose's");
+            Ok(())
+        })
+    }
+
+    /// Goal 9, plan 01a1a87b2cec step 5: a request's own timing is said with one allocation, its header's own, where a
+    /// string was made for it first; the words as before.
+    #[test]
+    fn g9_s5_a_requests_timing_is_said_in_one_allocation() {
+        let resp = srv::text(StatusCode::OK, "ok");
+        let (resp, made) = allocating(|| with_timing(resp, Some(Duration::from_micros(1500)), Duration::from_micros(250)));
+        assert_eq!(made, 1);
+        assert_eq!(resp.headers().get("server-timing").and_then(|v| v.to_str().ok()), Some("wait;dur=1.500, took;dur=0.250"));
+        let resp = with_timing(srv::text(StatusCode::OK, "ok"), None, Duration::from_secs(u64::MAX));
+        assert!(resp.headers().get("server-timing").and_then(|v| v.to_str().ok()).is_some_and(|v| v.starts_with("took;dur=18446744073709551")), "the longest fits");
+    }
+
+    /// What each request cost the server: the allocations its connection's polls made, their bytes, and the polls'
+    /// time, by path, the median of its repeats.
+    type Costs = Vec<(&'static str, crate::os::counted::Made, Duration)>;
+
+    /// One kept-alive connection to kiln's API on a port of its own, over HTTP/1.1 or HTTP/2, the server's side of it
+    /// counted (`crate::os::counted`): what each of `paths`, asked `reps` times as the lab's readers ask it (the
+    /// owner's token, nothing packed, its own timing asked), cost the server once the connection had gone idle after
+    /// the request before, as theirs does (goal 9, plan 01a1a87b2cec step 5).
+    async fn served(api: Arc<Api>, h2: bool, paths: &[&'static str], reps: usize) -> anyhow::Result<Costs> {
+        use crate::os::counted::{Made, Tally, counted_into};
+        use http_body_util::{BodyExt as _, Empty};
+        let tcp = hyper_rt::tcp::TcpListener::bind(std::net::SocketAddr::from(([127, 0, 0, 1], 0)), 16).map_err(|e| anyhow::anyhow!("{e}"))?;
+        let addr = tcp.local_addr().map_err(|e| anyhow::anyhow!("{e}"))?;
+        let tally = Arc::new(Tally::default());
+        let counting = Arc::clone(&tally);
+        crate::rt::spawn(async move {
+            if let Ok(stream) = tcp.accept().await {
+                let remote = stream.peer_addr().ok();
+                counted_into(&counting, crate::http::server::serve_accepted(stream, api, remote, None)).await;
+            }
+        });
+        let io = crate::http::io::TcpIo::new(hyper_rt::tcp::TcpStream::connect(addr).await.map_err(|e| anyhow::anyhow!("{e}"))?);
+        enum Client {
+            One(kiln_http::client::http1::SendRequest<Empty<Bytes>>),
+            Two(kiln_http::client::http2::SendRequest<Empty<Bytes>>),
+        }
+        let mut client = if h2 {
+            let (send, conn) = kiln_http::client::http2::handshake::<_, Empty<Bytes>>(io).await?;
+            crate::rt::spawn(conn);
+            Client::Two(send)
+        } else {
+            let (send, conn) = kiln_http::client::http1::handshake::<_, Empty<Bytes>>(io).await?;
+            crate::rt::spawn(conn);
+            Client::One(send)
+        };
+        let mut costs = Vec::new();
+        for path in paths {
+            let mut each = Vec::new();
+            for _ in 0..reps {
+                let uri = if h2 { format!("http://127.0.0.1:{}{path}", addr.port()) } else { (*path).to_owned() };
+                let req = http::Request::builder()
+                    .uri(uri)
+                    .header(header::HOST, format!("127.0.0.1:{}", addr.port()))
+                    .header(header::AUTHORIZATION, "Bearer test-admin-token")
+                    .header(header::ACCEPT, "*/*")
+                    .header(header::ACCEPT_ENCODING, "identity")
+                    .header(ASK_TIMING, "1")
+                    .body(Empty::<Bytes>::new())?;
+                let before = tally.now();
+                let resp = match &mut client {
+                    Client::One(send) => send.send_request(req).await?,
+                    Client::Two(send) => send.send_request(req).await?,
+                };
+                let status = resp.status();
+                let body = resp.into_body().collect().await?.to_bytes();
+                anyhow::ensure!(status == StatusCode::OK, "{path}: {status} {}", String::from_utf8_lossy(&body));
+                // The server's polls for it ended: its connection is idle again.
+                crate::rt::sleep(Duration::from_millis(3)).await;
+                let after = tally.now();
+                each.push((after.0.blocks.saturating_sub(before.0.blocks), after.0.bytes.saturating_sub(before.0.bytes), after.1.saturating_sub(before.1)));
+            }
+            let mid = |mut v: Vec<u64>| {
+                v.sort_unstable();
+                v.get(v.len() / 2).copied().unwrap_or_default()
+            };
+            let made = Made { blocks: mid(each.iter().map(|e| e.0).collect()), bytes: mid(each.iter().map(|e| e.1).collect()) };
+            costs.push((*path, made, Duration::from_nanos(mid(each.iter().map(|e| e.2).collect()))));
+        }
+        Ok(costs)
+    }
+
+    /// Goal 9, plan 01a1a87b2cec step 5 (a tenth of the CPU): what serving each read the lab makes of an agent's
+    /// pages costs the server, over HTTP/1.1 and HTTP/2, once what's kept for them is made: the allocations a request
+    /// makes on its connection's polls (request, router, handler, answer and write, for the median of its repeats),
+    /// their bytes and the polls' time, said for the hand-over and held under what the serve path's cuts left.
+    #[test]
+    fn g9_s5_what_a_read_costs_the_server_route_by_route() -> anyhow::Result<()> {
+        use crate::harness::core::Update;
+        use crate::harness::model::{Body, Event, State};
+        crate::rt::block_on(async {
+            let hub = crate::hub::tests::scratch_hub().await?;
+            let there = crate::harness::registry::Location::Machine("box".into());
+            let info = crate::harness::session::Info { id: "a".into(), kind: "claude".into(), ..crate::harness::session::Info::default() };
+            hub.harness.ingest(&hub, &there, "a", Update::Open { info: Box::new(info), since: None }).await;
+            let said = |n: u64| Event { id: format!("e{n}"), seq: n, at: 1, parent: None, by: None, body: Body::Assistant { text: format!("{n}: the deadline"), streaming: false } };
+            hub.harness.ingest(&hub, &there, "a", Update::Events { events: (1..=60).map(said).collect() }).await;
+            hub.harness.ingest(&hub, &there, "a", Update::State { state: Box::new(State::default()) }).await;
+            let source = crate::plans::Source { session: Some("a".into()), ..crate::plans::Source::default() };
+            crate::plans::create(&hub, crate::plans::New { body: "1. Measure the reads\n2. Prove it".into(), source: Some(source), ..crate::plans::New::default() }, "admin").await?;
+            crate::goals::add(&hub, "a", vec!["reads from memory".into()], false).await?;
+            let api = Arc::new(Api { hub: Arc::clone(&hub) });
+            let paths = ["/healthz", "/api/me", "/api/harness/sessions", "/api/harness/sessions/a", "/api/harness/sessions/a/events?limit=50", "/api/harness/sessions/a/goals", "/api/plans?session=a"];
+            // What's kept for these reads made (the first reads of each make it, off the request path).
+            for h2 in [false, true] {
+                served(Arc::clone(&api), h2, &paths, 2).await?;
+            }
+            crate::rt::sleep(Duration::from_millis(200)).await;
+            let one = served(Arc::clone(&api), false, &paths, 15).await?;
+            let two = served(Arc::clone(&api), true, &paths, 15).await?;
+            for ((path, a, t), (_, b, u)) in one.iter().zip(&two) {
+                eprintln!("g9_s5 {path}: HTTP/1.1 {} allocations, {} bytes, {:.1} us; HTTP/2 {} allocations, {} bytes, {:.1} us", a.blocks, a.bytes, t.as_secs_f64() * 1e6, b.blocks, b.bytes, u.as_secs_f64() * 1e6);
+            }
+            // The serve path's own, under the least a handler does (`/healthz`'s "ok"): 26 allocations over HTTP/1.1
+            // and 22 over HTTP/2 before step 5's cuts of it, 16 and 13 after (a request's headers in a map an answer
+            // gave back, its arrival one extension, its path matched from the stack, its timing said in place, its
+            // answer's body unboxed again; HTTP/2's frame head in place). What's left: kiln-http's read buffer and its
+            // share, the request's extensions (their table, kiln-http's arrival time, the connection's), the slot an
+            // idle connection makes again, the handler's and the router's futures, the path's segments, the answer's
+            // body and its box, its header map and its timing. Two more allow for another test's request on the same
+            // shard taking the map given back between two of these.
+            let fixed = |costs: &Costs| costs.iter().find(|(p, _, _)| *p == "/healthz").map_or(u64::MAX, |(_, m, _)| m.blocks);
+            anyhow::ensure!(fixed(&one) <= 16 + 2 && fixed(&two) <= 13 + 2, "the serve path's own: {} allocations over HTTP/1.1, {} over HTTP/2", fixed(&one), fixed(&two));
+            Ok(())
+        })
     }
 }

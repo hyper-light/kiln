@@ -64,7 +64,7 @@ fn sign(key: &str, id: &str, perm: &str, expiry: i64) -> String {
 
 /// The origin a request reached the server at (`http://host:port`), for URLs it hands back.
 pub fn origin(req: &Request) -> String {
-    let tls = req.extensions().get::<srv::Secure>().is_some() || req.headers().get("x-forwarded-proto").and_then(|v| v.to_str().ok()) == Some("https");
+    let tls = srv::secure(req) || req.headers().get("x-forwarded-proto").and_then(|v| v.to_str().ok()) == Some("https");
     let host = req.headers().get(header::HOST).and_then(|v| v.to_str().ok()).map(str::to_owned).or_else(|| req.uri().authority().map(|a| a.to_string())).unwrap_or_else(|| "localhost".into());
     format!("{}://{host}", if tls { "https" } else { "http" })
 }

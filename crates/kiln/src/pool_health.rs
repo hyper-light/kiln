@@ -39,6 +39,10 @@ struct Pools {
     blocking_run: [Histogram; SHARES.len()],
     store_write_wait: Histogram,
     store_write_run: Histogram,
+    /// kiln.db's group commits, and its WAL's checkpoints on their own thread and on the writer's.
+    store_commit: Histogram,
+    store_checkpoint: Histogram,
+    store_checkpoint_writer: Histogram,
 }
 
 fn pools() -> &'static Pools {
@@ -50,7 +54,29 @@ fn pools() -> &'static Pools {
         blocking_run: std::array::from_fn(|_| Histogram::new(STALL_BUCKETS)),
         store_write_wait: Histogram::new(STALL_BUCKETS),
         store_write_run: Histogram::new(STALL_BUCKETS),
+        store_commit: Histogram::new(STALL_BUCKETS),
+        store_checkpoint: Histogram::new(STALL_BUCKETS),
+        store_checkpoint_writer: Histogram::new(STALL_BUCKETS),
     })
+}
+
+/// The calls kiln.db's writer committed in its groups, all told (goal 5, plan 01a1a59c2aae): over
+/// `kiln_store_commit_seconds_count`, the calls a commit.
+static STORE_COMMITTED_CALLS: AtomicU64 = AtomicU64::new(0);
+
+/// A group of calls kiln.db's writer committed together, in one transaction (goal 5, plan 01a1a59c2aae):
+/// how many, and how long its commit took (its number kept with the cluster group, `COMMIT`, its changes
+/// handed to the log and its callers told).
+pub fn store_commit(calls: usize, took: std::time::Duration) {
+    STORE_COMMITTED_CALLS.fetch_add(u64::try_from(calls).unwrap_or(u64::MAX), Ordering::Relaxed);
+    pools().store_commit.observe(took.as_secs_f64());
+}
+
+/// A checkpoint of kiln.db's WAL (goal 5, plan 01a1a59c2aae), how long it took: on its own thread, or
+/// (`writer`) on the writer's, between two groups, the WAL past its bound (`crate::store`'s `Checkpoints`).
+pub fn store_checkpoint(writer: bool, took: std::time::Duration) {
+    let p = pools();
+    (if writer { &p.store_checkpoint_writer } else { &p.store_checkpoint }).observe(took.as_secs_f64());
 }
 
 /// Calls sent to kiln.db's writer not yet started: what the overload detector reads of whether one waits
@@ -229,6 +255,13 @@ pub fn render(o: &mut String) {
     for (share, places) in SHARES.iter().zip([dns, store, fs]).chain([(&STORE_WRITE, 1)]) {
         let _ = writeln!(o, "kiln_blocking_places{{share=\"{share}\"}} {places}");
     }
+    help(o, "kiln_store_commit_seconds", "histogram", "How long each of kiln.db's group commits took: the calls waiting for its writer, run in one transaction, then its number kept with the cluster group, COMMIT, its changes handed to the log and its callers told.");
+    p.store_commit.render(o, "kiln_store_commit_seconds", "");
+    help(o, "kiln_store_committed_calls_total", "counter", "The calls kiln.db's group commits held, all told: over kiln_store_commit_seconds_count, the calls a commit.");
+    let _ = writeln!(o, "kiln_store_committed_calls_total {}", STORE_COMMITTED_CALLS.load(Ordering::Relaxed));
+    help(o, "kiln_store_checkpoint_seconds", "histogram", "How long each checkpoint of kiln.db's WAL took, by the thread it ran on: its own (checkpoints), or the writer's between two groups, the WAL past its bound (writer).");
+    p.store_checkpoint.render(o, "kiln_store_checkpoint_seconds", "on=\"checkpoints\"");
+    p.store_checkpoint_writer.render(o, "kiln_store_checkpoint_seconds", "on=\"writer\"");
 }
 
 #[cfg(test)]
