@@ -20,8 +20,9 @@
 //! ([`Mirror::commit`]): one of the two sees the other, so every change is in a viewer's view or in
 //! a frame past where it reads from.
 
+use std::borrow::Cow;
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, OnceLock, Weak};
 
 use arc_swap::ArcSwap;
@@ -86,15 +87,32 @@ pub static SEGMENT_BYTES: AtomicUsize = AtomicUsize::new(0);
 /// deflated once ([`Segment`]): every viewer's packed snapshot takes that as it is (`super::packed`;
 /// goal 10, plan 01a1a87b2dae step 3). Copied to change (a view shares it), the copy starts without
 /// one; changed in place, it lets go of it.
+///
+/// A sealed chunk, once packed, is kept compact: its metas and its segment alone, its events read again
+/// from the segment when they're asked for and kept by no one after (goal 11, plan 01a1a87b2e56 step 2: a
+/// 20,000-event session's copy kept 8,260 bytes for each event, its JSON's tree and its text). Only the
+/// newest chunk, which takes the next event, keeps its events as they are.
 pub struct Chunk {
     meta: Vec<Meta>,
+    /// Its events as they are; none in a compact one ([`Chunk::is_compact`]).
     evs: Vec<Ev>,
     packed: OnceLock<Arc<Segment>>,
+    /// Whether it was sent to be packed (`seal`): once a chunk.
+    sealing: AtomicBool,
 }
 
 impl Clone for Chunk {
     fn clone(&self) -> Self {
-        Self { meta: self.meta.clone(), evs: self.evs.clone(), packed: OnceLock::new() }
+        // A compact chunk's events are its segment: its copy keeps it. Another's copy is made to be changed,
+        // and starts without one.
+        let packed = OnceLock::new();
+        if self.is_compact()
+            && let Some(s) = self.packed.get()
+            && packed.set(Arc::clone(s)).is_ok()
+        {
+            SEGMENT_BYTES.fetch_add(s.deflated.len(), Ordering::Relaxed);
+        }
+        Self { meta: self.meta.clone(), evs: self.evs.clone(), packed, sealing: AtomicBool::new(false) }
     }
 }
 
@@ -115,28 +133,97 @@ impl Chunk {
                 m
             })
             .collect();
-        Self { meta, evs, packed: OnceLock::new() }
+        Self { meta, evs, packed: OnceLock::new(), sealing: AtomicBool::new(false) }
     }
 
     pub fn len(&self) -> usize {
-        self.evs.len()
+        self.meta.len()
     }
 
     pub fn is_empty(&self) -> bool {
-        self.evs.is_empty()
+        self.meta.is_empty()
     }
 
     /// Whether it holds all a chunk holds: no event goes in it after.
     pub fn is_full(&self) -> bool {
-        self.evs.len() >= CHUNK
+        self.meta.len() >= CHUNK
     }
 
     pub fn metas(&self) -> &[Meta] {
         &self.meta
     }
 
-    pub fn evs(&self) -> &[Ev] {
-        &self.evs
+    /// Whether its events are kept in its segment alone (goal 11, plan 01a1a87b2e56 step 2).
+    pub fn is_compact(&self) -> bool {
+        self.evs.is_empty() && !self.meta.is_empty()
+    }
+
+    /// Its events: as it keeps them, or a compact one's read again from its segment, each text as it was and
+    /// what's looked up of it read from that (kept by no one after). Refused when its segment doesn't hold
+    /// what its metas say.
+    pub fn evs(&self) -> std::io::Result<Cow<'_, [Ev]>> {
+        if !self.is_compact() {
+            return Ok(Cow::Borrowed(&self.evs));
+        }
+        let joined = self.joined()?;
+        self.meta
+            .iter()
+            .map(|m| {
+                let text = joined.get(m.off..m.off + m.len).and_then(|b| std::str::from_utf8(b).ok());
+                let text = text.ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidData, "a packed event's text isn't where its meta says"))?;
+                Ok(Ev { entry: Arc::new(Entry::from_text(text)), at: m.at })
+            })
+            .collect::<std::io::Result<Vec<Ev>>>()
+            .map(Cow::Owned)
+    }
+
+    /// Its texts joined as an `events` frame joins them: a compact one's segment inflated, another's
+    /// written out now.
+    pub fn joined(&self) -> std::io::Result<Cow<'_, [u8]>> {
+        if self.is_compact() {
+            let s = self.packed.get().ok_or_else(|| std::io::Error::other("a compact chunk without its segment"))?;
+            return super::packed::inflate(s).map(Cow::Owned);
+        }
+        let mut joined = Vec::with_capacity(self.meta.last().map_or(0, |m| m.off + m.len));
+        for (i, e) in self.evs.iter().enumerate() {
+            if i > 0 {
+                joined.push(b',');
+            }
+            joined.extend_from_slice(e.entry.text().as_bytes());
+        }
+        Ok(Cow::Owned(joined))
+    }
+
+    /// It kept compact, once packed: its metas and its segment (which a view of it still taking it shares).
+    /// None when it isn't packed, or is compact already.
+    fn compacted(&self) -> Option<Self> {
+        let s = self.packed.get()?;
+        if self.is_compact() {
+            return None;
+        }
+        let packed = OnceLock::new();
+        if packed.set(Arc::clone(s)).is_ok() {
+            SEGMENT_BYTES.fetch_add(s.deflated.len(), Ordering::Relaxed);
+        }
+        Some(Self { meta: self.meta.clone(), evs: Vec::new(), packed, sealing: AtomicBool::new(true) })
+    }
+
+    /// A compact chunk's events read again into it, to change one. False when its segment can't give them
+    /// back (it's left as it was).
+    fn thaw(&mut self) -> bool {
+        if !self.is_compact() {
+            return true;
+        }
+        match self.evs().map(Cow::into_owned) {
+            Ok(evs) => {
+                self.evs = evs;
+                true
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "a session copy's packed events couldn't be read again: what was to change them is let go of");
+                false
+            }
+        }
     }
 
     /// Its texts as an `events` frame joins them, deflated: made once and kept, then taken as it is.
@@ -172,6 +259,9 @@ impl Chunk {
 
     /// Its event `k` changed by `f`, with its meta and where those after it begin.
     fn change(&mut self, k: usize, f: impl FnOnce(&mut Ev)) -> bool {
+        if !self.thaw() {
+            return false;
+        }
         self.unpack();
         let Some(ev) = self.evs.get_mut(k) else { return false };
         f(ev);
@@ -188,6 +278,10 @@ impl Chunk {
     }
 
     fn push(&mut self, ev: Ev) {
+        // The newest is never compact (`Events::compact`); one read again first all the same.
+        if !self.thaw() {
+            return;
+        }
         self.unpack();
         self.meta.push(Meta::of(&ev, self.meta.last().map_or(0, Meta::end)));
         self.evs.push(ev);
@@ -236,9 +330,33 @@ impl Events {
         self.len == 0
     }
 
-    pub fn get(&self, i: usize) -> Option<&Ev> {
+    /// Event `i`: as its chunk keeps it, or read again from a compact chunk's segment.
+    pub fn get(&self, i: usize) -> Option<Cow<'_, Ev>> {
         let (c, k) = self.place(i)?;
-        self.chunks.get(c)?.evs.get(k)
+        let chunk = self.chunks.get(c)?;
+        if !chunk.is_compact() {
+            return chunk.evs.get(k).map(Cow::Borrowed);
+        }
+        chunk.evs().ok()?.into_owned().into_iter().nth(k).map(Cow::Owned)
+    }
+
+    /// The entries at `at` (in order), each compact chunk among them read again once.
+    pub fn entries_at(&self, at: &[usize]) -> Vec<Arc<Entry>> {
+        let mut read: Option<(usize, Vec<Ev>)> = None;
+        let mut out = Vec::with_capacity(at.len());
+        for i in at {
+            let Some((c, k)) = self.place(*i) else { continue };
+            let Some(chunk) = self.chunks.get(c) else { continue };
+            if !chunk.is_compact() {
+                out.extend(chunk.evs.get(k).map(|e| Arc::clone(&e.entry)));
+                continue;
+            }
+            if read.as_ref().is_none_or(|(was, _)| *was != c) {
+                read = chunk.evs().ok().map(|evs| (c, evs.into_owned()));
+            }
+            out.extend(read.as_ref().and_then(|(_, evs)| evs.get(k)).map(|e| Arc::clone(&e.entry)));
+        }
+        out
     }
 
     pub fn meta(&self, i: usize) -> Option<&Meta> {
@@ -246,12 +364,24 @@ impl Events {
         self.chunks.get(c)?.meta.get(k)
     }
 
-    pub fn last(&self) -> Option<&Ev> {
+    pub fn last(&self) -> Option<Cow<'_, Ev>> {
         self.len.checked_sub(1).and_then(|i| self.get(i))
     }
 
-    pub fn iter(&self) -> impl DoubleEndedIterator<Item = &Ev> + '_ {
-        self.chunks.iter().flat_map(|c| c.evs.iter())
+    /// Each event in order: as its chunk keeps it, or a compact chunk's read again from its segment as the
+    /// iteration comes to it (a chunk that can't be is passed over, said in the log).
+    pub fn iter(&self) -> impl DoubleEndedIterator<Item = Cow<'_, Ev>> + '_ {
+        self.chunks.iter().flat_map(|c| {
+            let evs: Vec<Cow<'_, Ev>> = match c.evs() {
+                Ok(Cow::Borrowed(evs)) => evs.iter().map(Cow::Borrowed).collect(),
+                Ok(Cow::Owned(evs)) => evs.into_iter().map(Cow::Owned).collect(),
+                Err(e) => {
+                    tracing::warn!(error = %e, "a session copy's packed events couldn't be read again: passed over");
+                    Vec::new()
+                }
+            };
+            evs
+        })
     }
 
     pub fn metas(&self) -> impl DoubleEndedIterator<Item = &Meta> + '_ {
@@ -276,7 +406,7 @@ impl Events {
     /// `ev` last: the chunk that sealed as it came (full, and no longer the newest), if one did.
     pub(super) fn push(&mut self, ev: Ev) -> Option<Arc<Chunk>> {
         let chunks = Arc::make_mut(&mut self.chunks);
-        let room = chunks.last().is_some_and(|c| c.evs.len() < CHUNK);
+        let room = chunks.last().is_some_and(|c| c.len() < CHUNK);
         let only = chunks.len() == 1;
         let sealed = if room {
             if let Some(last) = chunks.last_mut() {
@@ -300,7 +430,7 @@ impl Events {
 
     /// Each event, as owned references (what a change in the middle remakes the chunks from).
     fn to_vec(&self) -> Vec<Ev> {
-        self.iter().cloned().collect()
+        self.iter().map(Cow::into_owned).collect()
     }
 
     /// `ev` in at `i` (rare: an event a runner that started again sends under an older number).
@@ -320,9 +450,9 @@ impl Events {
         // Whole chunks go as they are; the one the cut falls in is made again of its rest.
         let (mut left, mut whole) = (n, 0);
         while let Some(c) = chunks.get(whole)
-            && left >= c.evs.len()
+            && left >= c.len()
         {
-            left -= c.evs.len();
+            left -= c.len();
             whole += 1;
         }
         chunks.drain(..whole.min(chunks.len()));
@@ -330,21 +460,51 @@ impl Events {
         if left > 0
             && let Some(c) = chunks.first_mut()
         {
-            *c = Arc::new(Chunk::of(c.evs.iter().skip(left).cloned().collect()));
+            let rest: Vec<Ev> = c.evs().map(|evs| evs.iter().skip(left).cloned().collect()).unwrap_or_default();
+            *c = Arc::new(Chunk::of(rest));
             remade = Some(Arc::clone(c));
         }
         self.len -= n;
-        self.first = chunks.first().map_or(0, |c| c.evs.len());
+        self.first = chunks.first().map_or(0, |c| c.len());
         (gone, remade.filter(|_| chunks.len() > 1))
     }
 
     pub(super) fn retain(&mut self, mut keep: impl FnMut(&Meta) -> bool) {
-        let all = self.chunks.iter().flat_map(|c| c.meta.iter().zip(&c.evs)).filter(|(m, _)| keep(m)).map(|(_, e)| e.clone()).collect();
+        let mut all = Vec::with_capacity(self.len);
+        for c in self.chunks.iter() {
+            let evs = c.evs().map(Cow::into_owned).unwrap_or_else(|e| {
+                tracing::warn!(error = %e, "a session copy's packed events couldn't be read again: let go of");
+                Vec::new()
+            });
+            all.extend(c.meta.iter().zip(evs).filter(|(m, _)| keep(m)).map(|(_, e)| e));
+        }
         *self = Self::of(all);
     }
 
     pub(super) fn clear(&mut self) {
         *self = Self::default();
+    }
+
+    /// Every chunk but the newest (which takes the next event) kept compact once it's packed, and those not
+    /// packed yet sent to be (goal 11, plan 01a1a87b2e56 step 2). A view taking a chunk keeps it as it was
+    /// until it lets go.
+    pub(super) fn compact(&mut self) {
+        let Some(sealed) = self.chunks.len().checked_sub(1) else { return };
+        for c in self.chunks.iter().take(sealed).filter(|c| !c.is_compact() && c.packed().is_none()) {
+            seal(Arc::clone(c));
+        }
+        let ready: Vec<usize> = (0..sealed).filter(|i| self.chunks.get(*i).is_some_and(|c| !c.is_compact() && c.packed().is_some())).collect();
+        if ready.is_empty() {
+            return;
+        }
+        let chunks = Arc::make_mut(&mut self.chunks);
+        for i in ready {
+            if let Some(slot) = chunks.get_mut(i)
+                && let Some(c) = slot.compacted()
+            {
+                *slot = Arc::new(c);
+            }
+        }
     }
 
     /// The first index whose event `pred` is false for, the events being those it's true for first.
@@ -366,7 +526,7 @@ impl Events {
 /// snapshot after it takes it as it is (goal 10, plan 01a1a87b2dae step 3). Off the runtime (a test's
 /// copy) it waits for the snapshot that needs it.
 fn seal(chunk: Arc<Chunk>) {
-    if crate::rt::on_shard() && chunk.packed().is_none() {
+    if crate::rt::on_shard() && chunk.packed().is_none() && !chunk.sealing.swap(true, Ordering::Relaxed) {
         drop(crate::rt::spawn(async move {
             let _ = crate::rt::compute(move || chunk.pack().map(drop)).await;
         }));
@@ -761,6 +921,7 @@ impl Mirror {
                 seal(chunk);
             }
         }
+        self.events.compact();
         false
     }
 
@@ -1228,7 +1389,7 @@ mod tests {
         let joined = String::from_utf8(super::super::packed::inflate(&seg)?)?;
         assert_eq!(u64::try_from(joined.len()).unwrap_or(0), seg.len);
         assert_eq!(seg.crc, crc32fast::hash(joined.as_bytes()));
-        for (m, e) in chunk.metas().iter().zip(chunk.evs()) {
+        for (m, e) in chunk.metas().iter().zip(chunk.evs()?.iter()) {
             assert_eq!(joined.get(m.off..m.off + m.len), Some(e.entry.text()), "{}", m.id);
             assert_eq!((m.seq, m.sum, &*m.id), (e.entry.seq(), e.entry.sum(), e.entry.id().unwrap_or_default()));
         }

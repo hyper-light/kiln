@@ -119,9 +119,26 @@ impl Entry {
         Self::written(value, text)
     }
 
+    /// An entry as `text`, its JSON, says (an event of a compact chunk read again): what's looked up of it
+    /// read from it.
+    pub(super) fn from_text(text: &str) -> Self {
+        let head = serde_json::from_str::<Value>(text).map(|v| Head::of(&v)).unwrap_or_default();
+        crate::memory::SESSION_ENTRIES.add(text.len());
+        Self { head, body: Body::Text(text.into()), sum: std::sync::OnceLock::new() }
+    }
+
     /// `value` as `text` writes it (made already, for a live frame): the text kept, the tree let go of.
     pub(super) fn written(value: Value, text: String) -> Self {
+        crate::memory::SESSION_ENTRIES.add(text.len());
         Self { head: Head::of(&value), body: Body::Text(text.into_boxed_str()), sum: std::sync::OnceLock::new() }
+    }
+
+    /// The bytes it holds as text, as `crate::memory::SESSION_ENTRIES` counts them.
+    fn counted(&self) -> usize {
+        match &self.body {
+            Body::Text(t) => t.len(),
+            Body::Changing(_) => 0,
+        }
     }
 
     /// Its JSON as frames carry it: `serde_json`'s compact form of its value.
@@ -179,6 +196,7 @@ impl Entry {
             if !value.get("text").is_some_and(Value::is_string) {
                 return false;
             }
+            crate::memory::SESSION_ENTRIES.sub(t.len());
             self.body = Body::Changing(Box::new(Changing { value, text: std::sync::OnceLock::new() }));
         }
         let Body::Changing(c) = &mut self.body else { return false };
@@ -192,7 +210,14 @@ impl Entry {
 
 impl Clone for Entry {
     fn clone(&self) -> Self {
+        crate::memory::SESSION_ENTRIES.add(self.counted());
         Self { body: self.body.clone(), head: self.head.clone(), sum: self.sum.clone() }
+    }
+}
+
+impl Drop for Entry {
+    fn drop(&mut self) {
+        crate::memory::SESSION_ENTRIES.sub(self.counted());
     }
 }
 
@@ -269,6 +294,15 @@ pub(super) mod write {
     pub fn events<'a>(w: &mut impl Write, all: impl IntoIterator<Item = &'a Entry>, rev: Option<u64>) -> io::Result<()> {
         head(w, "events", Some("events"))?;
         texts(w, all)?;
+        tail(w, rev)
+    }
+
+    /// `{"t":"events","events":[…]}` of texts already joined by `,` (a compact chunk's: goal 11).
+    pub fn joined_events(w: &mut impl Write, joined: &[u8], rev: Option<u64>) -> io::Result<()> {
+        head(w, "events", Some("events"))?;
+        w.write_all(b"[")?;
+        w.write_all(joined)?;
+        w.write_all(b"]")?;
         tail(w, rev)
     }
 
@@ -450,8 +484,8 @@ impl Snapshot {
     }
 
     /// The events of `batch` (where they are among those `plan` brings).
-    fn batch<'a>(&'a self, plan: &'a Plan, batch: &std::ops::Range<usize>) -> impl Iterator<Item = &'a Entry> + Clone + 'a {
-        plan.brought.get(batch.clone()).unwrap_or_default().iter().filter_map(|at| self.parts.events.get(*at)).map(|e| &*e.entry)
+    fn batch(&self, plan: &Plan, batch: &std::ops::Range<usize>) -> Vec<Arc<Entry>> {
+        self.parts.events.entries_at(plan.brought.get(batch.clone()).unwrap_or_default())
     }
 
     /// About the bytes `part` takes: the room it's written into.
@@ -464,7 +498,7 @@ impl Snapshot {
             Part::State => p.state_bytes,
             Part::Changes => p.changes.as_ref().map_or(0, |files| write::envelope("changes", Some("files"), None) + write::texts_len(files.iter().map(|f| &**f))),
             Part::Files => self.files.as_ref().map_or(0, String::len),
-            Part::Events(batch) => write::envelope("events", Some("events"), None) + write::texts_len(self.batch(plan, batch)),
+            Part::Events(batch) => write::envelope("events", Some("events"), None) + write::texts_len(self.batch(plan, batch).iter().map(|e| &**e)),
             // Its texts joined, and the `[` and `]` around them.
             Part::Chunk(i) => write::envelope("events", Some("events"), None) + p.events.chunks().get(*i).and_then(|c| c.metas().last()).map_or(0, |m| m.off + m.len) + "[]".len(),
         }
@@ -487,8 +521,13 @@ impl Snapshot {
                 None => Ok(()),
             },
             Part::Files => w.write_all(self.files.as_deref().unwrap_or_default().as_bytes()),
-            Part::Events(batch) => write::events(w, self.batch(plan, batch), None),
-            Part::Chunk(i) => write::events(w, p.events.chunks().get(*i).map(|c| c.evs()).unwrap_or_default().iter().map(|e| &*e.entry), None),
+            Part::Events(batch) => write::events(w, self.batch(plan, batch).iter().map(|e| &**e), None),
+            Part::Chunk(i) => match p.events.chunks().get(*i) {
+                // A compact chunk's texts are its segment's, as they were joined.
+                Some(c) if c.is_compact() => write::joined_events(w, &c.joined()?, None),
+                Some(c) => write::events(w, c.evs()?.iter().map(|e| &*e.entry), None),
+                None => write::events(w, std::iter::empty::<&Entry>(), None),
+            },
         }
     }
 
@@ -2466,9 +2505,8 @@ impl Registry {
                     v.events
                         .iter()
                         .rev()
-                        .map(|e| &e.entry)
-                        .filter(|e| matches!(e.kind(), Some("user" | "assistant")))
-                        .filter_map(|e| e.value().get("text").and_then(Value::as_str).map(str::to_owned))
+                        .filter(|e| matches!(e.entry.kind(), Some("user" | "assistant")))
+                        .filter_map(|e| e.entry.value().get("text").and_then(Value::as_str).map(str::to_owned))
                         .any(|t| files::mentioned(&t).iter().any(|p| files::resolve(p, cwd).as_deref() == Some(path)))
                 };
                 (listed || said()).then(|| Location::clone(&v.location))
@@ -3291,7 +3329,7 @@ impl Registry {
     pub fn conclusion(&self, id: &str) -> Option<(Value, Option<Value>, Value)> {
         // References from its view; the copies made after.
         let (state, reply, changes) = self.sessions.with(id, |v| {
-            let reply = v.events.iter().rev().map(|e| &e.entry).find(|e| e.kind() == Some("assistant") && e.on_main_thread()).cloned();
+            let reply = v.events.iter().rev().find(|e| e.entry.kind() == Some("assistant") && e.entry.on_main_thread()).map(|e| Arc::clone(&e.entry));
             (Arc::clone(&v.state), reply, v.changes.clone())
         })?;
         let changes = changes.map_or(Value::Null, |files| Value::Array(files.iter().map(|f| f.value()).collect()));
