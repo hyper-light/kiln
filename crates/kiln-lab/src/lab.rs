@@ -417,7 +417,7 @@ fn timed(class: Class, what: &'static str, f: impl FnOnce() -> anyhow::Result<u1
     let at_us = now_us();
     let t = Instant::now();
     let ok = matches!(f(), Ok(status) if status < 400);
-    Sample { class, at_us, took_us: u64::try_from(t.elapsed().as_micros()).unwrap_or(u64::MAX), ok, what }
+    Sample { class, at_us, took_us: u64::try_from(t.elapsed().as_micros()).unwrap_or(u64::MAX), ok, what, server: None }
 }
 
 /// One viewer's watch of one session: when its attach began and when its snapshot came (µs since the
@@ -480,7 +480,7 @@ fn viewer(s: &Shared, i: usize) -> (Vec<Sample>, Vec<Watch>) {
         let mut sock = match Socket::open(s.port, &s.admin, &path, Duration::from_millis(200)) {
             Ok(sock) => sock,
             Err(_) => {
-                out.push(Sample { class: Class::Attach, at_us, took_us: 0, ok: false, what: "" });
+                out.push(Sample { class: Class::Attach, at_us, took_us: 0, ok: false, what: "", server: None });
                 nap(s, Duration::from_secs(1));
                 continue;
             }
@@ -497,7 +497,7 @@ fn viewer(s: &Shared, i: usize) -> (Vec<Sample>, Vec<Watch>) {
         if s.stop.load(Ordering::Relaxed) {
             break;
         }
-        out.push(Sample { class: Class::Attach, at_us, took_us: u64::try_from(t.elapsed().as_micros()).unwrap_or(u64::MAX), ok: opened, what: "" });
+        out.push(Sample { class: Class::Attach, at_us, took_us: u64::try_from(t.elapsed().as_micros()).unwrap_or(u64::MAX), ok: opened, what: "", server: None });
         if !opened {
             continue;
         }
@@ -510,7 +510,7 @@ fn viewer(s: &Shared, i: usize) -> (Vec<Sample>, Vec<Watch>) {
                     let now = now_us();
                     for stamp in stamps(&text) {
                         if seen.insert(stamp) {
-                            out.push(Sample { class: Class::Websocket, at_us: stamp, took_us: now.saturating_sub(stamp), ok: true, what: "" });
+                            out.push(Sample { class: Class::Websocket, at_us: stamp, took_us: now.saturating_sub(stamp), ok: true, what: "", server: None });
                             watch.frames.push((stamp, now.saturating_sub(stamp)));
                         }
                     }
@@ -558,7 +558,9 @@ fn driver(s: &Shared, id: &str, p: &Profile, i: usize) -> Vec<Sample> {
 fn reader(s: &Shared, p: &Profile, i: usize) -> Vec<Sample> {
     let mut out = Vec::new();
     let mut r = Lcg(0xa11ce ^ ((i as u64) << 16));
-    let mut http = Http::new(s.port, &s.admin);
+    // Each read asks the server for its own time with it, so the slowest are split (goal 10, plan 01a1a87b2dae
+    // step 5: `measure::split`).
+    let mut http = Http::new(s.port, &s.admin).timed();
     while !s.stop.load(Ordering::Relaxed) {
         let id = s.sessions.get(usize::try_from(r.below(s.sessions.len() as u64)).unwrap_or(0)).map_or("", |(id, _)| id.as_str());
         // Each read is told apart by its route, so a run says which of them its tail is.
@@ -573,13 +575,15 @@ fn reader(s: &Shared, p: &Profile, i: usize) -> Vec<Sample> {
             18 => ("plans", format!("/api/plans?session={id}")),
             _ => ("goals", format!("/api/harness/sessions/{id}/goals")),
         };
-        let mut retry_after = None;
-        out.push(timed(Class::ApiRead, what, || {
+        let (mut retry_after, mut server) = (None, None);
+        let sample = timed(Class::ApiRead, what, || {
             http.send("GET", &path, None).map(|a| {
                 retry_after = a.retry_after;
+                server = a.server;
                 a.status
             })
-        }));
+        });
+        out.push(Sample { server, ..sample });
         if !nap(s, pause(jitter(&mut r, Duration::from_millis(p.read_think_ms)), retry_after)) {
             break;
         }
@@ -938,6 +942,7 @@ pub fn round(build: &Build, p: &Profile, hogs: usize, place: &Place, dir: &Path,
     let secs = (window.1.saturating_sub(window.0)) as f64 / 1e6;
     let seen = measure::seen(&in_window);
     let (mut numbers, shards) = numbers(&seen, &before, &after, secs);
+    splits(&mut numbers, &in_window);
     numbers.insert("fill.s".into(), fill_s);
     server_numbers(&mut numbers, "fill.", &fill_before, &fill_after, fill_s);
     let (held, fill_held) = (measure::held(&before, &after, secs), measure::held(&fill_before, &fill_after, fill_s));
@@ -974,6 +979,28 @@ pub fn frames_against_attaches(watches: &[Watch], window: (u64, u64)) -> BTreeMa
     }
     by.into_iter().map(|(k, took)| (k, measure::seen_of(took, 0))).collect()
 }
+
+/// The slowest API reads of the window split ([`measure::split`]): those at or past the class's p99 and those at
+/// or past its p99.9, each as `split.api_read.<q>.{wait,took,rest}_ms` (the server's wait before its handler, its
+/// handler's time, the rest: the hops either way, the transfer, the client's reading; each the mean over them, so
+/// the three add up to their mean) and `split.api_read.<q>.n`. Goal 10, plan 01a1a87b2dae step 5.
+fn splits(n: &mut BTreeMap<String, f64>, window: &[Sample]) {
+    for (q, at) in [("p99", 0.99), ("p999", 0.999)] {
+        if let Some(s) = measure::split(window, Class::ApiRead, at) {
+            let name = Class::ApiRead.name();
+            n.insert(format!("split.{name}.{q}.wait_ms"), s.wait_ms);
+            n.insert(format!("split.{name}.{q}.took_ms"), s.took_ms);
+            n.insert(format!("split.{name}.{q}.rest_ms"), s.rest_ms);
+            #[allow(clippy::cast_precision_loss)]
+            n.insert(format!("split.{name}.{q}.n"), s.n as f64);
+        }
+    }
+}
+
+/// The legs of a runner's message at the server that a round reports (`kiln_runner_wait_leg_seconds`), each by
+/// its `leg` label: goal 10, plan 01a1a87b2dae step 4's waits, and step 5's `held`, the hub's loop's time with
+/// each event it took.
+const RUNNER_LEGS: [&str; 4] = ["to_loop", "in_loop", "to_owner", "held"];
 
 /// The numbers a round reports, from what the lab saw and the server's `/metrics` either side of
 /// the window: each class's median, p99 and p99.9 and its most (the stall tail), throughput, the
@@ -1039,8 +1066,9 @@ fn numbers(seen: &BTreeMap<Class, measure::Seen>, before: &Scrape, after: &Scrap
     // A runner's message's wait by its legs, to the microsecond, where the build has them
     // (`kiln_runner_wait_leg_seconds`; goal 10, plan 01a1a87b2dae step 4): to the hub's loop taking its frame
     // (every frame's), that loop handing an agent session's update to the inbox of the shard that owns its
-    // copy, and that owner taking it.
-    for leg in ["to_loop", "in_loop", "to_owner"] {
+    // copy, and that owner taking it; and how long the loop held each event it took, its waits included (step 5:
+    // set against `to_loop`, it tells the loop held by its events from the loop waiting for its shard).
+    for leg in RUNNER_LEGS {
         let d = measure::delta(&before.buckets("kiln_runner_wait_leg_seconds", &[("leg", leg)]), &after.buckets("kiln_runner_wait_leg_seconds", &[("leg", leg)]));
         for (q, at) in [("p50", 0.5), ("p99", 0.99), ("p999", 0.999)] {
             if let Some(v) = measure::histogram_quantile(at, &d) {
@@ -1301,7 +1329,8 @@ mod tests {
     /// the server's histogram of it between the window's two scrapes.
     #[test]
     fn g10_s4_a_runners_wait_is_reported_by_its_legs() {
-        let legs = ["to_loop", "in_loop", "to_owner"];
+        let legs = RUNNER_LEGS;
+        assert_eq!(legs, ["to_loop", "in_loop", "to_owner", "held"], "goal 10 step 5: the loop's hold of each event is reported beside the legs");
         let scrape = |n: f64| {
             let mut t = String::new();
             for leg in legs {
@@ -1321,6 +1350,24 @@ mod tests {
         }
         let (n, _) = numbers(&BTreeMap::new(), &scrape(0.0), &scrape(0.0), 60.0);
         assert!(!n.keys().any(|k| k.contains("to_owner")), "a build without the legs reports none");
+    }
+
+    /// Goal 10, plan 01a1a87b2dae step 5: a round reports its slowest API reads split, at p99 and at p99.9, by name;
+    /// a window whose reads the server didn't time reports none.
+    #[test]
+    fn g10_s5_a_round_reports_its_slowest_reads_split() {
+        let read = |took_us: u64, server: Option<crate::client::ServerTime>| Sample { class: Class::ApiRead, at_us: 0, took_us, ok: true, what: "", server };
+        let told = |wait_us, took_us| Some(crate::client::ServerTime { wait_us: Some(wait_us), took_us });
+        // 1,000 reads, the slowest two (the 999th and 1,000th by nearest rank) 4 ms, the server's share 1.5 ms of each.
+        let window: Vec<Sample> = (0..998).map(|_| read(200, told(10, 10))).chain([read(4_000, told(1_000, 500)), read(4_000, told(1_000, 500))]).collect();
+        let mut n = BTreeMap::new();
+        splits(&mut n, &window);
+        let get = |k: &str| n.get(k).copied();
+        assert_eq!((get("split.api_read.p999.wait_ms"), get("split.api_read.p999.took_ms"), get("split.api_read.p999.rest_ms"), get("split.api_read.p999.n")), (Some(1.0), Some(0.5), Some(2.5), Some(2.0)));
+        assert!(get("split.api_read.p99.n").is_some_and(|c| c >= 1.0), "{n:?}");
+        let mut none = BTreeMap::new();
+        splits(&mut none, &[read(200, None)]);
+        assert!(none.is_empty(), "{none:?}");
     }
 
     /// Goal 10, plan 01a1a87b2dae step 5: only a frame that brings events (or an event's streamed text) is a

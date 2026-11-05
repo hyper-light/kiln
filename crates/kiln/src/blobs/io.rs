@@ -115,66 +115,102 @@ async fn send_parts(b: &dyn Blobs, upload: &str, path: &Path, size: u64) -> Resu
 /// reader sees fewer bytes than it was promised), with a warning. A read of the whole object is
 /// checked against its SHA-256 (its etag): its last piece goes only once all of it hashes to it, so
 /// damaged bytes end the stream short too.
-pub fn read_stream(b: Arc<dyn Blobs>, key: String, etag: Option<String>, first: u64, last: u64) -> async_channel::Receiver<Bytes> {
-    let (tx, rx) = async_channel::bounded::<Bytes>(4);
-    crate::rt::spawn(async move {
-        let mut etag = etag;
-        let mut at = first;
-        // The whole object's hash so far, when it's the whole that's read; the piece held back.
-        let mut whole: Option<Sha256> = None;
-        let mut held: Option<Bytes> = None;
-        while at <= last {
-            let end = at.saturating_add(PIECE.saturating_sub(1)).min(last);
-            let (meta, bytes) = match b.get(&key, Some(Range { start: at, end: Some(end) })).await {
-                Ok(got) => got,
-                Err(e) => {
-                    tracing::warn!(target: "kiln.blobs", event = "get", key = %key, error = %e, "a read ends short");
-                    return;
-                }
-            };
-            if etag.get_or_insert_with(|| meta.etag.clone()) != &meta.etag {
-                tracing::warn!(target: "kiln.blobs", event = "get", key = %key, "the object changed while it was read; the read ends short");
-                return;
-            }
-            if at == 0 && last.checked_add(1) == Some(meta.size) {
-                whole = Some(Sha256::new());
-            }
-            let n = u64::try_from(bytes.len()).unwrap_or(u64::MAX);
-            if n == 0 {
-                return;
-            }
-            let bytes = Bytes::from(bytes);
-            if let Some(h) = whole.take() {
-                let piece = bytes.clone();
-                match crate::rt::blocking(move || {
-                    let mut h = h;
-                    h.update(&piece);
-                    h
-                })
-                .await
-                {
-                    Ok(h) => whole = Some(h),
-                    Err(_) => return,
-                }
-            }
-            if let Some(before) = held.replace(bytes)
-                && tx.send(before).await.is_err()
-            {
-                return;
-            }
-            at = at.saturating_add(n);
+///
+/// Lock-free (`crate::memory::queue`; goal 5, plan 01a1a59c2aae, its top goal): an async-channel's wait took
+/// event-listener's `Mutex`, the reading task sending on its shard and the request's connection, a runner's
+/// sync or a viewer's, waiting on its own. [`AHEAD`] pieces ahead of its reader at the most, as the channel
+/// held.
+pub fn read_stream(b: Arc<dyn Blobs>, key: String, etag: Option<String>, first: u64, last: u64) -> crate::memory::queue::Receiver<Bytes> {
+    let (tx, rx) = crate::memory::queue::places(&crate::memory::owners::CHANNELS, AHEAD);
+    crate::rt::spawn(read_into(b, key, etag, first, last, Ahead::Queue(tx)));
+    rx
+}
+
+/// [`read_stream`] on an async-channel, for what takes one: CD's providers, whose uploads, and the HTTP
+/// client's streamed bodies they go through, take its receiver (`crate::cd::artifacts::Files::open`). A
+/// deployment's work, not a request's, a websocket's or a runner's path.
+pub fn read_channel(b: Arc<dyn Blobs>, key: String, etag: Option<String>, first: u64, last: u64) -> async_channel::Receiver<Bytes> {
+    let (tx, rx) = async_channel::bounded::<Bytes>(AHEAD);
+    crate::rt::spawn(read_into(b, key, etag, first, last, Ahead::Channel(tx)));
+    rx
+}
+
+/// A read's pieces of [`PIECE`] ahead of its reader, at the most: as many as the channel they waited in held.
+const AHEAD: usize = 4;
+
+/// Where a read's pieces go ([`read_into`]), each waited for while its reader has no room.
+enum Ahead {
+    Queue(crate::memory::queue::Sender<Bytes>),
+    Channel(async_channel::Sender<Bytes>),
+}
+
+impl Ahead {
+    /// `piece` to the reader once it has room: false once it reads no more.
+    async fn send(&self, piece: Bytes) -> bool {
+        match self {
+            Self::Queue(tx) => tx.send(piece).await.is_ok(),
+            Self::Channel(tx) => tx.send(piece).await.is_ok(),
         }
-        if let (Some(h), Some(e)) = (whole, etag.as_deref())
-            && hex::encode(h.finalize()) != e
-        {
-            tracing::warn!(target: "kiln.blobs", event = "get", key = %key, "damaged: the object's bytes don't hash to its etag; the read ends short");
+    }
+}
+
+/// [`read_stream`]'s read of bytes `first` to `last` of `key`'s object, its pieces to `to` in order.
+async fn read_into(b: Arc<dyn Blobs>, key: String, etag: Option<String>, first: u64, last: u64, to: Ahead) {
+    let mut etag = etag;
+    let mut at = first;
+    // The whole object's hash so far, when it's the whole that's read; the piece held back.
+    let mut whole: Option<Sha256> = None;
+    let mut held: Option<Bytes> = None;
+    while at <= last {
+        let end = at.saturating_add(PIECE.saturating_sub(1)).min(last);
+        let (meta, bytes) = match b.get(&key, Some(Range { start: at, end: Some(end) })).await {
+            Ok(got) => got,
+            Err(e) => {
+                tracing::warn!(target: "kiln.blobs", event = "get", key = %key, error = %e, "a read ends short");
+                return;
+            }
+        };
+        if etag.get_or_insert_with(|| meta.etag.clone()) != &meta.etag {
+            tracing::warn!(target: "kiln.blobs", event = "get", key = %key, "the object changed while it was read; the read ends short");
             return;
         }
-        if let Some(last_piece) = held {
-            let _ = tx.send(last_piece).await;
+        if at == 0 && last.checked_add(1) == Some(meta.size) {
+            whole = Some(Sha256::new());
         }
-    });
-    rx
+        let n = u64::try_from(bytes.len()).unwrap_or(u64::MAX);
+        if n == 0 {
+            return;
+        }
+        let bytes = Bytes::from(bytes);
+        if let Some(h) = whole.take() {
+            let piece = bytes.clone();
+            match crate::rt::blocking(move || {
+                let mut h = h;
+                h.update(&piece);
+                h
+            })
+            .await
+            {
+                Ok(h) => whole = Some(h),
+                Err(_) => return,
+            }
+        }
+        if let Some(before) = held.replace(bytes)
+            && !to.send(before).await
+        {
+            return;
+        }
+        at = at.saturating_add(n);
+    }
+    if let (Some(h), Some(e)) = (whole, etag.as_deref())
+        && hex::encode(h.finalize()) != e
+    {
+        tracing::warn!(target: "kiln.blobs", event = "get", key = %key, "damaged: the object's bytes don't hash to its etag; the read ends short");
+        return;
+    }
+    if let Some(last_piece) = held {
+        let _ = to.send(last_piece).await;
+    }
 }
 
 /// An object written a piece at a time, from wherever its bytes come: held up to a part in memory,
@@ -252,6 +288,43 @@ pub async fn get_all(b: &dyn Blobs, key: &str, limit: u64) -> Result<(Meta, Vec<
 mod tests {
     use super::*;
     use kiln_seams::blobs::{SimBlobs, SimLimits};
+
+    /// Goal 5, plan 01a1a59c2aae (its top goal): an object's read on a lock-free queue now. With its reader
+    /// behind, it reads [`AHEAD`] pieces ahead and stops there (one more in hand), going on as they're
+    /// taken; the queue's reader and CD's channel each give every byte once, in order, the whole checked
+    /// against its SHA-256.
+    #[test]
+    fn g5_a_read_stops_at_its_places_ahead_and_gives_every_byte_in_order() -> anyhow::Result<()> {
+        crate::rt::block_on(async {
+            let dir = tempfile::tempdir()?;
+            let data = kiln_seams::blobs::noise(usize::try_from(PIECE)? * 7 + 5, 9);
+            let path = dir.path().join("o");
+            std::fs::write(&path, &data)?;
+            let sha = crate::util::sha256_hex(&data);
+            let b: Arc<dyn Blobs> = Arc::new(SimBlobs::new(crate::rt::clock(), SimLimits { object: 1 << 30, ..SimLimits::default() }));
+            put_file(b.as_ref(), "o", &path, Some(&sha)).await?;
+            let last = u64::try_from(data.len())?.saturating_sub(1);
+            let rx = read_stream(Arc::clone(&b), "o".into(), Some(sha.clone()), 0, last);
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+            while rx.len() < AHEAD && std::time::Instant::now() < deadline {
+                crate::rt::sleep(std::time::Duration::from_millis(10)).await;
+            }
+            crate::rt::sleep(std::time::Duration::from_millis(100)).await;
+            anyhow::ensure!(rx.len() == AHEAD, "{} pieces read ahead, of {AHEAD}", rx.len());
+            let mut got = Vec::with_capacity(data.len());
+            while let Ok(piece) = rx.recv().await {
+                got.extend_from_slice(&piece);
+            }
+            anyhow::ensure!(got == data, "the queue's reader had {} of {} bytes", got.len(), data.len());
+            let rx = read_channel(Arc::clone(&b), "o".into(), Some(sha), 0, last);
+            let mut got = Vec::with_capacity(data.len());
+            while let Ok(piece) = rx.recv().await {
+                got.extend_from_slice(&piece);
+            }
+            anyhow::ensure!(got == data, "CD's channel had {} of {} bytes", got.len(), data.len());
+            Ok(())
+        })
+    }
 
     /// CP-T10.1: a file larger than one put goes up in parts and reads back whole as a stream; a
     /// file that isn't what its SHA-256 says isn't kept, and the key keeps what it held.
