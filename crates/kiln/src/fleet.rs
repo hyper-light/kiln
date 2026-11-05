@@ -608,15 +608,17 @@ struct Candidate {
     /// How full it is by its last sample (`crate::reach::directory::fullness`, the engine's
     /// measure); `None` before it has sampled.
     full: Option<f64>,
+    /// Its headroom by that sample, which the target use is held to; `None` before it has sampled.
+    headroom: Option<kiln_ci::sched::state::Headroom>,
 }
 
 /// Of `candidates`, the one to build kiln for `target`, and whether it cross-builds: a machine of
 /// that platform with the tools builds natively; a Linux machine with the tools cross-builds a
-/// Mac's (`ci/release/build.sh`). One within `limit` first (`[ci.scheduler] target_use`, how full
-/// placement fills a machine; one that hasn't sampled counts as within it), then natively before
-/// cross-built, then the emptiest, then by name: a Mac past the limit gives way to a Linux machine
-/// within it.
-fn pick(target: &str, candidates: &[Candidate], limit: f64) -> Option<(String, bool)> {
+/// Mac's (`ci/release/build.sh`). One `within` the target use first (`[ci.scheduler] target_use`,
+/// how full placement fills a machine, derived for each unless set; one that hasn't sampled counts
+/// as within it), then natively before cross-built, then the emptiest, then by name: a Mac past it
+/// gives way to a Linux machine within it.
+fn pick(target: &str, candidates: &[Candidate], within: impl Fn(&Candidate) -> bool) -> Option<(String, bool)> {
     candidates
         .iter()
         .filter_map(|c| {
@@ -629,7 +631,6 @@ fn pick(target: &str, candidates: &[Candidate], limit: f64) -> Option<(String, b
             }
         })
         .min_by(|(a, a_cross), (b, b_cross)| {
-            let within = |c: &Candidate| c.full.is_none_or(|f| f <= limit);
             within(b).cmp(&within(a)).then(a_cross.cmp(b_cross)).then(crate::reach::directory::emptier(a.full, b.full)).then_with(|| a.name.cmp(&b.name))
         })
         .map(|(c, cross)| (c.name.clone(), cross))
@@ -653,12 +654,18 @@ pub(crate) fn builder(hub: &Hub, r: &RunnerInfo, target: &str) -> Result<Builder
         .values()
         .filter(|a| a.connected && !a.ephemeral && !a.outpost && !a.draining && a.terminal && a.name != r.name)
         .filter_map(|a| {
-            let full = a.sample.as_ref().and_then(|s| crate::reach::directory::fullness(&crate::ci::dispatch::sample_of(s, a.facts.as_deref()), &kiln_ci::sched::state::Resources::default()));
-            Some(Candidate { name: a.name.clone(), os: a.os.clone(), target: crate::updates::target_for(&a.os, &a.arch), tools: a.facts.as_ref()?.tools.clone(), full })
+            let sample = a.sample.as_ref().map(|s| crate::ci::dispatch::sample_of(s, a.facts.as_deref()));
+            let full = sample.as_ref().and_then(|s| crate::reach::directory::fullness(s, &kiln_ci::sched::state::Resources::default()));
+            let headroom = sample.as_ref().filter(|s| s.cpus > 0 && s.mem_total > 0).map(kiln_ci::sched::state::Headroom::of);
+            Some(Candidate { name: a.name.clone(), os: a.os.clone(), target: crate::updates::target_for(&a.os, &a.arch), tools: a.facts.as_ref()?.tools.clone(), full, headroom })
         })
         .collect();
     let candidates: Vec<Candidate> = candidates.into_iter().filter(|c| cant_build(hub, &c.name).is_none()).collect();
-    match pick(target, &candidates, crate::ci::dispatch::target_use(&hub.cfg.ci.scheduler)) {
+    // Each held to the target use by its own headroom, as placement holds it (a derived target
+    // differs with a machine's CPUs: lb/constants' TargetUse).
+    let target_use = crate::ci::dispatch::target_use(&hub.cfg.ci.scheduler);
+    let within = |c: &Candidate| c.headroom.is_none_or(|h| h.within(&kiln_ci::sched::state::Resources::default(), target_use));
+    match pick(target, &candidates, within) {
         Some((machine, cross)) => Ok(Builder { machine, itself: false, cross, why }),
         None => Err(format!("{why}, and no connected machine can build kiln for {target}")),
     }
@@ -1406,7 +1413,7 @@ mod tests {
     }
 
     fn candidate(name: &str, os: &str, target: &str, tools: &[&str], full: f64) -> Candidate {
-        Candidate { name: name.into(), os: os.into(), target: Some(target.into()), tools: tools.iter().map(|t| ((*t).to_owned(), "1".to_owned())).collect(), full: Some(full) }
+        Candidate { name: name.into(), os: os.into(), target: Some(target.into()), tools: tools.iter().map(|t| ((*t).to_owned(), "1".to_owned())).collect(), full: Some(full), headroom: None }
     }
 
     /// A Mac with no developer tools gets its build from a Mac that has them, natively, before a
@@ -1416,6 +1423,8 @@ mod tests {
     #[test]
     fn a_mac_s_build_is_made_where_the_tools_are() {
         let (mac, limit) = ("aarch64-apple-darwin", 0.85);
+        // A person's target use of 0.85, held to each one's fullness.
+        let limit = |c: &Candidate| c.full.is_none_or(|f| f <= limit);
         let laptop = candidate("laptop", "macos", mac, &["cargo", "node", "git"], 0.8);
         let linux = candidate("linux", "linux", "x86_64-unknown-linux-gnu", &["cargo", "node", "python3"], 0.3);
         let studio = candidate("studio", "macos", mac, &["git", "docker"], 0.1);
