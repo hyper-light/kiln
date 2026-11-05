@@ -99,6 +99,11 @@ pub struct JobRecord {
     pub protocols: std::collections::BTreeMap<String, String>,
     /// The calibration: its offset and the p99 of its residuals (µs), the worst client's.
     pub calibration_p99_us: Option<f64>,
+    /// The page's timer grain (µs): the smallest step `performance.now()` took, the coarsest
+    /// client's (5 µs in Chromium cross-origin isolated, 1,000 µs in WebKit). The calibration can
+    /// resolve no finer, nor can the job's times.
+    #[serde(default)]
+    pub timer_grain_us: Option<f64>,
     /// The background's CPU rate (µs a second), the mean of a window before the job (once the
     /// server is at rest) and one after, and its noise: the larger of two windows' difference
     /// before and the before's and after's.

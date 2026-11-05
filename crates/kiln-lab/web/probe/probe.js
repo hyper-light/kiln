@@ -75,20 +75,24 @@ lab.calibrate = async function calibrate(url, n = 200, check = 400) {
   lab.offsetUs = first[0].offset;
   // The calibration again, in groups of GROUP echoes each taken the same way: how far each group's
   // offset lies from the one the page uses is the calibration's residual. Each echo's own offset
-  // (off by up to half its round trip) is kept beside it.
-  const residuals = [];
+  // (off by up to half its round trip) is kept beside it. The groups are interleaved (echo i goes
+  // to group i mod groups), so each group's echoes span the whole check as the page's own span its
+  // calibration: on a loaded machine a run of echoes all waiting for a core (tens of ms) delays
+  // every echo of a group taken back to back, and that group's least round trip with them.
+  const groups = Math.max(1, Math.floor(check / GROUP));
+  const taken = Array.from({ length: groups }, () => []);
   const echoes = [];
   const rtts = [];
-  for (let g = 0; g < Math.max(1, Math.floor(check / GROUP)); g++) {
-    const group = [];
-    for (let i = 0; i < GROUP; i++) group.push(await once());
-    group.forEach((r) => {
-      rtts.push(r.rtt);
-      echoes.push(Math.abs(r.offset - lab.offsetUs));
-    });
-    group.sort((a, b) => a.rtt - b.rtt);
-    residuals.push(Math.abs(group[0].offset - lab.offsetUs));
+  for (let i = 0; i < groups * GROUP; i++) {
+    const r = await once();
+    taken[i % groups].push(r);
+    rtts.push(r.rtt);
+    echoes.push(Math.abs(r.offset - lab.offsetUs));
   }
+  const residuals = taken.map((group) => {
+    group.sort((a, b) => a.rtt - b.rtt);
+    return Math.abs(group[0].offset - lab.offsetUs);
+  });
   ws.close();
   return { offset_us: lab.offsetUs, min_rtt_us: first[0].rtt, rtts_us: rtts, residuals_us: residuals, echo_residuals_us: echoes };
 };
@@ -224,7 +228,8 @@ lab.requests = function requests(op) {
           if (req.ndjson) for (const line of text.split("\n")) line && JSON.parse(line);
           else if (text) JSON.parse(text);
           const at = nowUs();
-          note({ op: req.name, case: op.case, sched_us: Math.round(sched), at_us: Math.round(at), lat_us: Math.round(at - sched), app_bytes: buf.byteLength, status: r.status, ok: r.ok });
+          // A write's answer is kept whole with its sample, to hold against the UI's recorded ones.
+          note({ op: req.name, case: op.case, sched_us: Math.round(sched), at_us: Math.round(at), lat_us: Math.round(at - sched), app_bytes: buf.byteLength, status: r.status, ok: r.ok, ...(body ? { answer: text } : {}) });
         } catch (e) {
           const at = nowUs();
           note({ op: req.name, case: op.case, sched_us: Math.round(sched), at_us: Math.round(at), lat_us: Math.round(at - sched), app_bytes: 0, ok: false });

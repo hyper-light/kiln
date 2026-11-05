@@ -171,6 +171,15 @@ pub fn doc_differs(doc: &str, run: &BrowserRun) -> Vec<(String, String)> {
     out
 }
 
+/// The calibration's residual limit on the good link (µs), where the page's timer resolves finer.
+const CALIBRATION_US: f64 = 200.0;
+
+/// The calibration's residual limit (µs) for a job: 200 µs, or the page's timer grain where that
+/// is coarser (plan 01a1a832e9cc v5, step 4).
+fn calibration_limit_us(grain_us: Option<f64>) -> f64 {
+    grain_us.filter(|g| g.is_finite()).map_or(CALIBRATION_US, |g| g.max(CALIBRATION_US))
+}
+
 /// Step 4's checks of a run (plan 01a1a832e9cc): the calibration's residuals on the good link (p99
 /// at most 0.2 ms), the counters against a capture (within 1%), the probe's sizes above the
 /// transport against the real UI's in the catalogue (within 2%), the requests behind a stall (their
@@ -179,12 +188,27 @@ pub fn check_probe(run: &BrowserRun, catalogue: &serde_json::Value) -> (String, 
     let mut o = String::new();
     let mut pass = true;
     let good: Vec<&JobRecord> = run.jobs.iter().filter(|j| j.profile == "good").collect();
-    let mut cal: Vec<f64> = good.iter().filter_map(|j| j.calibration_p99_us).collect();
-    cal.sort_by(f64::total_cmp);
-    let worst = cal.last().copied();
-    let ok = worst.is_some_and(|w| w <= 200.0);
-    pass &= ok;
-    let _ = writeln!(o, "- calibration: p99 of the residuals on the good link, worst job {} µs, median job {} µs, over {} jobs: {}", worst.map_or_else(|| "-".to_owned(), fmt), super::cells::quantile(&cal, 0.5).map_or_else(|| "-".to_owned(), fmt), cal.len(), if ok { "within 200 µs" } else { "**not within 200 µs**" });
+    // Each browser's jobs against its own limit: 200 µs, or the page's timer grain where that is
+    // coarser (WebKit's performance.now() steps by 1 ms even cross-origin isolated, so no
+    // calibration in it resolves finer: plan v5's step 4).
+    let mut browsers: BTreeMap<&str, Vec<(f64, f64)>> = BTreeMap::new();
+    for j in &good {
+        if let Some(p) = j.calibration_p99_us {
+            browsers.entry(j.browser.as_str()).or_default().push((p, calibration_limit_us(j.timer_grain_us)));
+        }
+    }
+    if browsers.is_empty() {
+        pass = false;
+        let _ = writeln!(o, "- calibration: **no job on the good link has one**");
+    }
+    for (b, jobs) in &browsers {
+        let mut cal: Vec<f64> = jobs.iter().map(|(p, _)| *p).collect();
+        cal.sort_by(f64::total_cmp);
+        let ok = jobs.iter().all(|(p, limit)| p <= limit);
+        let limit = jobs.iter().map(|(_, l)| *l).fold(CALIBRATION_US, f64::max);
+        pass &= ok;
+        let _ = writeln!(o, "- calibration: {b}: p99 of the residuals on the good link, worst job {} µs, median job {} µs, over {} jobs: {}", cal.last().map_or_else(|| "-".to_owned(), |w| fmt(*w)), super::cells::quantile(&cal, 0.5).map_or_else(|| "-".to_owned(), fmt), cal.len(), if ok { format!("within {} µs", fmt(limit)) } else { format!("**not within {} µs**", fmt(limit)) });
+    }
     let caps: Vec<(&JobRecord, u64, u64)> = run.jobs.iter().filter_map(|j| j.capture.map(|(a, b)| (j, a, b))).collect();
     if caps.is_empty() {
         let _ = writeln!(o, "- capture: none in this run");
@@ -245,6 +269,16 @@ pub fn check_probe(run: &BrowserRun, catalogue: &serde_json::Value) -> (String, 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// plan 01a1a832e9cc v5 step 4: a job's calibration is held to 200 µs, or to its page's timer
+    /// grain where that is coarser (WebKit's 1 ms); a job without a grain recorded, to 200 µs.
+    #[test]
+    fn g1_s4_calibration_limit_is_the_coarser_of_200_us_and_the_grain() {
+        assert!((calibration_limit_us(Some(5.0)) - 200.0).abs() < f64::EPSILON);
+        assert!((calibration_limit_us(Some(1000.0)) - 1000.0).abs() < f64::EPSILON);
+        assert!((calibration_limit_us(None) - 200.0).abs() < f64::EPSILON);
+        assert!((calibration_limit_us(Some(f64::INFINITY)) - 200.0).abs() < f64::EPSILON);
+    }
 
     /// plan 01a1a832e9cc step 10: docs/browser-lab.md's tables are the run files' it names
     /// (`<!-- browser-lab run: PATH -->`, a path from the repository's root), regenerated here; a

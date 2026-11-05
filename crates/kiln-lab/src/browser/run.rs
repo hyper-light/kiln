@@ -281,6 +281,7 @@ fn job(c: &mut Ctx<'_>, r: &Running, t: &Target, browser: &str, case: &str, cond
     let mut protocols = std::collections::BTreeMap::new();
     let mut errors = Vec::new();
     let mut calib: Option<f64> = None;
+    let mut grain: Option<f64> = None;
     for (i, _, jd) in &drivers {
         let samples: Vec<Sample> = read_jsonl(&jd.join("samples.jsonl"));
         let ticks: Vec<Tick> = read_jsonl(&jd.join("counters.jsonl"));
@@ -299,6 +300,9 @@ fn job(c: &mut Ctx<'_>, r: &Running, t: &Target, browser: &str, case: &str, cond
             if let Some(p) = cells::quantile(&v, 0.99) {
                 calib = Some(calib.map_or(p, |c: f64| c.max(p)));
             }
+        }
+        if let Some(g) = res.get("timer_grain_us").and_then(Value::as_f64) {
+            grain = Some(grain.map_or(g, |c: f64| c.max(g)));
         }
         clients.push((samples, ticks));
     }
@@ -332,6 +336,7 @@ fn job(c: &mut Ctx<'_>, r: &Running, t: &Target, browser: &str, case: &str, cond
         numbers: nums.numbers,
         protocols,
         calibration_p99_us: calib,
+        timer_grain_us: grain,
         background_us_per_s: background,
         noise_us_per_s: noise.max((before - after).abs()),
         errors,
