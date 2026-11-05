@@ -816,6 +816,15 @@ fn server_numbers(n: &mut BTreeMap<String, f64>, prefix: &str, before: &Scrape, 
         let most = shards.iter().filter_map(|sh| after.get("kiln_shard_tasks_most", &[("shard", sh.as_str())])).reduce(f64::max);
         put("shards.tasks_most".into(), most);
     }
+    // The bus's (goal 11, plan 01a1a87b2e56 step 3): how long a live feed's frame took from its publish to a
+    // viewer's read, the frames published and the viewers sent back to a snapshot: what a topic needs to keep.
+    put("bus.published_per_s".into(), diff("kiln_bus_published_total", &[]).map(per_s));
+    put("bus.lag_notices".into(), diff("kiln_bus_lag_notices_total", &[]));
+    let delivery = histogram("kiln_bus_delivery_seconds", &[]);
+    put("bus.delivery_p99_ms".into(), measure::histogram_quantile(0.99, &delivery).map(|v| v * 1000.0));
+    put("bus.delivery_p999_ms".into(), measure::histogram_quantile(0.999, &delivery).map(|v| v * 1000.0));
+    put("bus.delivery_top_ms".into(), measure::histogram_top(&delivery).map(|v| v * 1000.0));
+    put("bus.topics".into(), after.get("kiln_bus_topics", &[]));
     // The compute pool's (goal 3): where the heavy work went, how long it waited and how long a piece held a
     // pool thread.
     if let Some(jobs) = diff("kiln_compute_jobs_total", &[]) {
