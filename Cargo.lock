@@ -2311,6 +2311,7 @@ dependencies = [
  "tar",
  "tempfile",
  "thiserror 2.0.21",
+ "tikv-jemalloc-sys",
  "tikv-jemallocator",
  "time",
  "toml",
