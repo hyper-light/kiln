@@ -61,12 +61,19 @@ pub enum Ask {
     /// owner, to the runner it probes. Only to a runner that said `place` in [`Say::Features`] on
     /// this link. Appended last: postcard encodes variants by index.
     Place { json: String },
+    /// A run as [`Ask::Run`], with what its asker knows of it (docs/reach.md, "Sizes from
+    /// history"): `with`, JSON (`super::history::With`), its history key, its ask and the size it
+    /// was placed at. The runner measures it, keeps what it used under its key, and says it
+    /// ([`Say::Used`]) before its Exit. Sent only to a runner whose directory entry names
+    /// [`super::history::FEATURE`] (audit H1); a runner from before reads it as a newer peer's kind.
+    /// Appended last: postcard encodes variants by index.
+    RunWith { spec: Box<RunSpec>, with: String },
 }
 
 /// How many variants [`Ask`] has: a newer peer's past them is `unknown`.
-pub const ASK_VARIANTS: usize = 14;
+pub const ASK_VARIANTS: usize = 15;
 /// How many variants [`Say`] has.
-pub const SAY_VARIANTS: usize = 14;
+pub const SAY_VARIANTS: usize = 15;
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Resume {
@@ -110,6 +117,10 @@ pub enum Say {
     /// the run's owner. Only on a link whose asker said `place` in [`Ask::Features`]. Appended
     /// last: postcard encodes variants by index.
     Place { json: String },
+    /// What a run asked with [`Ask::RunWith`] used, measured here: `used`, JSON
+    /// (`kiln_ci::sizes::Usage`), just before its Exit (and again with it after a dropped link).
+    /// Only to an asker that asked with [`Ask::RunWith`]. Appended last.
+    Used { id: u64, used: String },
 }
 
 /// The machine a link reached.
@@ -294,8 +305,9 @@ mod tests {
         Ok(())
     }
 
-    /// Word that a message couldn't be read is appended last in both, after every older variant,
-    /// and the counts say so.
+    /// Word that a message couldn't be read was appended after every variant before it in both (at
+    /// 11; named features, placement and the runs sized from history came after it), and the counts
+    /// say a newer peer's kind.
     #[test]
     fn word_of_an_unread_message_is_appended_last() -> anyhow::Result<()> {
         use crate::wire::unread::Code;
@@ -313,20 +325,47 @@ mod tests {
         for (m, idx) in says {
             assert_eq!(postcard::to_allocvec(&m)?.first(), Some(&idx), "{m:?}");
         }
-        assert_eq!((ASK_VARIANTS, SAY_VARIANTS), (14, 14));
+        // lb/history's `RunWith` and `Used` come after them, at 14 (docs/reach.md, "Sizes from history").
+        assert_eq!((ASK_VARIANTS, SAY_VARIANTS), (15, 15));
         let mut d = Deframer::default();
         d.push(&frame(&Ask::Ping { at: 1 })?);
         assert_eq!(d.read::<Ask>(ASK_VARIANTS).ok().flatten(), Some(Ask::Ping { at: 1 }));
         // A newer peer's kind, one cut short inside its length, and one too large.
         let mut d = Deframer::default();
-        d.push(&[0, 0, 0, 1, 14]);
-        assert!(d.read::<Ask>(ASK_VARIANTS).is_err_and(|e| e.code() == Code::Unknown && e.what() == "variant 14"));
+        d.push(&[0, 0, 0, 1, 15]);
+        assert!(d.read::<Ask>(ASK_VARIANTS).is_err_and(|e| e.code() == Code::Unknown && e.what() == "variant 15"));
         let mut d = Deframer::default();
         d.push(&[0, 0, 0, 1, 2]);
         assert!(d.read::<Ask>(ASK_VARIANTS).is_err_and(|e| e.code() == Code::Malformed));
         let mut d = Deframer::default();
         d.push(&u32::MAX.to_be_bytes());
         assert!(d.read::<Say>(SAY_VARIANTS).is_err_and(|e| e.code() == Code::Malformed));
+        Ok(())
+    }
+
+    /// H1 (docs/reach.md, "Sizes from history"): a run with what its asker knows, and what it used,
+    /// are appended after every older variant (at 14, after Features and Place), and a runner from
+    /// before (14 of each, or fewer) reads either as a newer peer's kind, never as one of its own:
+    /// why they go only to a runner that says it takes them.
+    #[test]
+    fn h1_sized_runs_and_their_use_are_appended_last_and_unknown_to_older_runners() -> anyhow::Result<()> {
+        use crate::wire::unread::Code;
+        let first = |b: Vec<u8>| b.first().copied();
+        let with = first(postcard::to_allocvec(&Ask::RunWith { spec: Box::new(RunSpec::default()), with: "{}".into() })?);
+        let used = first(postcard::to_allocvec(&Say::Used { id: 1, used: "{}".into() })?);
+        anyhow::ensure!(with == Some(14) && with == u8::try_from(ASK_VARIANTS - 1).ok(), "Ask::RunWith comes right after Place, last");
+        anyhow::ensure!(used == Some(14) && used == u8::try_from(SAY_VARIANTS - 1).ok(), "Say::Used comes right after Place, last");
+        // A runner from before has 14 of each (or fewer): a variant at or past its count is a newer
+        // peer's kind to it, which it reads as unknown, as a byte past this build's count is here.
+        anyhow::ensure!(with.is_some_and(|i| i >= 14) && used.is_some_and(|i| i >= 14));
+        let mut d = Deframer::default();
+        d.push(&[0, 0, 0, 1, u8::try_from(ASK_VARIANTS).unwrap_or(u8::MAX)]);
+        anyhow::ensure!(d.read::<Ask>(ASK_VARIANTS).is_err_and(|e| e.code() == Code::Unknown), "a kind past the count is unknown");
+        // What it sends a runner from before instead reads there as it always did.
+        let mut d = Deframer::default();
+        d.push(&frame(&Ask::Run(Box::new(RunSpec { id: 7, ..RunSpec::default() })))?);
+        anyhow::ensure!(first(postcard::to_allocvec(&Ask::Run(Box::default()))?) == Some(1), "Ask::Run keeps the index runners from before read");
+        anyhow::ensure!(d.read::<Ask>(ASK_VARIANTS).ok().flatten().is_some_and(|a| matches!(a, Ask::Run(s) if s.id == 7)));
         Ok(())
     }
 

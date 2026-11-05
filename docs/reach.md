@@ -62,6 +62,62 @@ load past twice its cores) gets work only when no other suits, and says so (`· 
 directory comes from the server (cached 30 s, refreshed after every reconnect); the choice is the
 asking runner's. `GET /api/reach/runners?want=…` shows the same ranking.
 
+### 2.1 Sizes from history
+
+A run's ask is the most it may be given, not what it needs (docs/needs.md E6). Every run is
+measured where it runs, from its own containment group, as it starts and as it ends: nothing is
+sampled in between, so no sampling period is chosen.
+
+| | Peak memory | CPU time | OOM kills of its processes |
+|---|---|---|---|
+| Linux, run group with the memory controller | `memory.peak` (exact; page cache counts, so it's never under what the run held) | `cpu.stat` `usage_usec` (exact, processes that ended first included) | its own group's `memory.events` `oom_kill` (any OOM killer's, the machine's included) |
+| Linux, run group without it (a runner's usual: its own cgroup holds its process, and cgroup v2 gives controllers only to the children of one that holds none) | not measured | `cpu.stat` (exact) | not seen |
+| macOS | not measured | not measured | not seen: memory pressure kills (jetsam) leave no count a runner can read for a process tree |
+| Windows | not measured | not measured | not seen: Windows fails a commit rather than kill, and counts nothing a runner reads |
+
+What it used goes back to its client as a note before its exit (`[kiln] used …` from `kiln run`),
+which every client reads; nothing new goes over the local socket.
+
+**Kept.** The runner that did it tells the server (ReachAsk `measured`), which keeps it in the
+cluster group (`run_sizes`) as that connection's runner's, on the platform it knows the runner by,
+never what the message says. Only the runner's own code says it: its local socket refuses
+`measured` from an agent. The key is the run's repository and its command as written, its tree's
+top written `.` and spaces collapsed, so two worktrees of a repository share it. The repository is
+the asking folder's tree whether it's synced or not: its `origin` as `owner/name`, else
+`local:<runner>:<path>`; with `--no-sync --cwd <folder>` it's that folder there (`remote:<folder>`).
+A run with no folder isn't kept. Each row folds into its key's rollup on its platform in the same
+transaction (`run_size_rollups`), so the server answers from one row per platform and never reads
+the runs. Rows go with the runs' prune after `[retention] days` (a person's setting, 30 by
+default), and the prune folds again only the keys it touched.
+
+**Predicted.** Memory at the most a run that wasn't killed held (memory can't be slowed: a run fits
+or is killed, and the largest seen is the only figure every kept run fitted under); CPU at the mean
+of their CPUs, CPU time over wall time (CPU is shared, not held: the mean serves a run's measured
+CPU time over its measured duration). No quantile, margin or multiplier is chosen. The ask is the
+ceiling in every dimension it asks; where it asks nothing, history gives memory and never CPU. A
+kill is a floor: once a run is killed for memory in its own group, memory is the ask again (or,
+with nothing asked, the most a killed run was given or held) until a run that wasn't killed is
+measured above it, so a size never goes back to one a run was killed at. Where any of a key's runs
+on a platform ran with its kills unseen, history doesn't size it there and says why.
+
+**Declared, and never in the way.** History has no admission of its own: it predicts a size and
+placement admits (the placement core queues what doesn't fit). It predicts only once the person
+declares `[reach] sizes = "history"`; until then (`"ask"`, the default) runs are placed by their
+ask. The asking runner never waits on the server for it: it places by the prediction it holds for
+the key, from the server's answer to an earlier run, or by the ask as given when it holds none,
+and asks again in the background for the next run. A server from before refuses the question
+(`unknown`), which is taken for "nothing known". The choice's why says how a run was sized.
+
+**Again at its ask.** `[reach] retry_oom = true` runs a run that was killed for memory in its own
+group, sized from history below its ask, once more at its ask (never a retry's retry), saying so
+(`again: …`); `--reuse` records only the try that ended. Not a detached run: its client went, and
+its end is followed with nobody to run it again for or to tell. Not one fed input (`-i`): what it
+read is gone, and holding all of it to feed again would hold without bound.
+
+**Older runners.** A run goes with what its asker knows (`Ask::RunWith`, then `Say::Used` before
+its exit) only to a runner whose directory entry names `reach.sizes` (its reach announcement's
+`features`); to any other it goes as `Ask::Run`, as before, and nothing of it is kept.
+
 ## 3. Security
 
 ### 3.1 End to end

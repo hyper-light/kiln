@@ -218,6 +218,13 @@ impl Group {
         out
     }
 
+    /// Its folder: what the kernel counts of everything ever in it (`cpu.stat`; `memory.peak` and
+    /// `memory.events` where it has the memory controller) is read there (docs/reach.md, "Sizes
+    /// from history").
+    pub fn dir(&self) -> &Path {
+        &self.dir
+    }
+
     /// Ends every process in it at once (`cgroup.kill`; before Linux 5.14, SIGKILL to each until
     /// none is left, so one forking meanwhile is caught on the next pass).
     pub fn kill(&self) {

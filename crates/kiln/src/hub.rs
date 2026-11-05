@@ -2596,6 +2596,22 @@ impl Hub {
                     let up: Vec<String> = crate::reach::directory::holders(&repo, &digest, agent).into_iter().filter(|r| self.agents.lock().get(r).is_some_and(|a| a.connected)).collect();
                     self.send_peer(peer, &ServerMsg::ReachAnswer { req, json: serde_json::json!({ "runners": up }).to_string() }).await;
                 }
+                // What a command's history says on each platform (docs/reach.md, "Sizes from history").
+                crate::reach::Question::Sizes { repo, command } => {
+                    let hub = Arc::clone(self);
+                    crate::rt::spawn(async move {
+                        let answer = crate::reach::history::answer(&hub, &repo, &command).await;
+                        hub.send_peer(peer, &ServerMsg::ReachAnswer { req, json: answer.to_string() }).await;
+                    });
+                }
+                // What a run used, measured on this runner: kept as this connection's runner's.
+                crate::reach::Question::Measured { repo, command, ask, size, used } => {
+                    let (hub, runner) = (Arc::clone(self), agent.to_owned());
+                    crate::rt::spawn(async move {
+                        let answer = crate::reach::history::keep(&hub, &runner, repo, command, ask, size.map(|s| *s), *used).await;
+                        hub.send_peer(peer, &ServerMsg::ReachAnswer { req, json: answer.to_string() }).await;
+                    });
+                }
                 // An agent's MCP server on the runner asks for kiln's operations: answered on
                 // their own, so a slow one holds up nothing else the runner says.
                 ask => {
@@ -3797,6 +3813,10 @@ impl Hub {
             }
             crate::audit::prune(&self.store, self.cfg.retention.audit_days).await;
             let jobs = self.store.prune(self.cfg.retention.days).await?;
+            // What reach runs used goes with them (docs/reach.md, "Sizes from history").
+            if let Err(e) = crate::reach::history::prune(&self.store, self.cfg.retention.days).await {
+                tracing::warn!(error = %format!("{e:#}"), "couldn't prune what reach runs used");
+            }
             if !jobs.is_empty() {
                 tracing::info!(jobs = jobs.len(), "pruned old runs");
                 crate::ci::logsearch::forget(&self, jobs.clone()).await;

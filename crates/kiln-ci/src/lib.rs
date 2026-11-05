@@ -34,6 +34,8 @@
 //!   actors' identities and the chain of whom each acts for, checked (W27).
 //! - [`wire`]: the JSON payloads between the server and CI runners (§2.5).
 //! - [`work`]: fingerprints for doing the least work a change needs (W24).
+//! - [`sizes`]: what a reach run used where it ran, and the size its history predicts for the
+//!   next run, its ask the ceiling (docs/reach.md, "Sizes from history"; docs/needs.md E6).
 
 pub mod attest;
 pub mod compare;
@@ -61,6 +63,7 @@ pub mod runner;
 pub mod sbom;
 pub mod sched;
 pub mod secrets;
+pub mod sizes;
 pub mod stats;
 pub mod store;
 pub mod suggest;

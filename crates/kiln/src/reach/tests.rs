@@ -21,6 +21,11 @@ enum Ctl {
     Back(&'static str),
     /// Change what the directory says a runner's key is.
     Key(&'static str, String),
+    /// Change what the directory says a runner takes beyond its version (docs/reach.md, "Sizes from
+    /// history"): none is a runner from before.
+    Features(&'static str, Vec<String>),
+    /// Change what the directory says a runner has in all, and free, of memory.
+    Mem(&'static str, u64),
 }
 
 struct Lab {
@@ -38,6 +43,10 @@ struct Lab {
     mirrors: std::path::PathBuf,
     /// What linux's node notes of the copies it holds.
     using: Arc<super::keeper::Using>,
+    /// What the "server" answers a command's history question with; none: it never answers.
+    sizes: Arc<Mutex<Option<serde_json::Value>>>,
+    /// What runners told the "server" their runs used, and who told it.
+    measured: Arc<Mutex<Vec<(&'static str, serde_json::Value)>>>,
 }
 
 fn info(name: &str, fp: &str) -> RunnerInfo {
@@ -55,6 +64,7 @@ fn info(name: &str, fp: &str) -> RunnerInfo {
         mem_used: 4 << 30,
         slots: 2,
         via: "direct".into(),
+        features: super::history::features(),
         ..RunnerInfo::default()
     }
 }
@@ -87,6 +97,9 @@ async fn lab_with(objects: [Option<Arc<crate::runner::work::store::Store>>; 2]) 
     let (ctl_tx, ctl_rx) = async_channel::unbounded::<Ctl>();
     let (said_tx, said) = async_channel::unbounded();
     let ended: Arc<Mutex<Vec<String>>> = Arc::default();
+    let sizes: Arc<Mutex<Option<serde_json::Value>>> = Arc::default();
+    let measured: Arc<Mutex<Vec<(&'static str, serde_json::Value)>>> = Arc::default();
+    let (sz, me_) = (Arc::clone(&sizes), Arc::clone(&measured));
     let (m, l, e) = (mac.clone(), linux.clone(), Arc::clone(&ended));
     crate::rt::spawn(async move {
         let mut relay = Relay::default();
@@ -119,6 +132,16 @@ async fn lab_with(objects: [Option<Arc<crate::runner::work::store::Store>>; 2]) 
                                 r.fingerprint = Some(fp);
                             }
                         }
+                        Ok(Ctl::Features(name, features)) => {
+                            if let Some(r) = directory.lock().iter_mut().find(|r| r.name == name) {
+                                r.features = features;
+                            }
+                        }
+                        Ok(Ctl::Mem(name, total)) => {
+                            if let Some(r) = directory.lock().iter_mut().find(|r| r.name == name) {
+                                (r.mem_total, r.mem_used) = (total, 0);
+                            }
+                        }
                         Err(_) => return,
                     }
                     continue;
@@ -144,6 +167,14 @@ async fn lab_with(objects: [Option<Arc<crate::runner::work::store::Store>>; 2]) 
                     let ask: serde_json::Value = serde_json::from_str(&asked).unwrap_or_default();
                     let answer = match ask.get("op").and_then(serde_json::Value::as_str) {
                         Some("call") => serde_json::json!({"ok": {"name": ask.get("name"), "input": ask.get("input"), "session": ask.get("session")}}),
+                        Some("sizes") => match sz.lock().clone() {
+                            Some(v) => v,
+                            None => continue,
+                        },
+                        Some("measured") => {
+                            me_.lock().push((from, ask.clone()));
+                            serde_json::json!({})
+                        }
                         _ => serde_json::json!({ "runners": *directory.lock() }),
                     };
                     handle_of(from).feed(In::Answer { req, answer }).await;
@@ -159,7 +190,7 @@ async fn lab_with(objects: [Option<Arc<crate::runner::work::store::Store>>; 2]) 
     // The "server" takes word of what a link couldn't read.
     mac.feed(In::Unread(true)).await;
     linux.feed(In::Unread(true)).await;
-    Ok(Lab { mac, linux, said, ended, adoptions, ctl: ctl_tx, _dirs: dirs, mirrors, using })
+    Ok(Lab { mac, linux, said, ended, adoptions, ctl: ctl_tx, _dirs: dirs, mirrors, using, sizes, measured })
 }
 
 async fn deliver(peers: &Mutex<HashMap<&'static str, u64>>, handle_of: &impl Fn(&str) -> Handle, to: u64, sm: ServerMsg) {
@@ -226,6 +257,129 @@ fn a_run_on_another_runner_streams_back_over_a_post_quantum_link() -> anyhow::Re
         assert!(s.get("pins").and_then(|p| p.as_array()).is_some_and(|p| p.iter().any(|x| x.get("runner").and_then(|r| r.as_str()) == Some("linux"))));
         let l = lab.linux.status().await?;
         assert!(l.get("pins").and_then(|p| p.as_array()).is_some_and(|p| p.iter().any(|x| x.get("runner").and_then(|r| r.as_str()) == Some("mac"))));
+        Ok(())
+    })
+}
+
+/// What the runners told the "server" their runs used, once some runner told it something, or after
+/// a while.
+async fn measured_by(lab: &Lab) -> Vec<(&'static str, serde_json::Value)> {
+    for _ in 0..200 {
+        let told = lab.measured.lock().clone();
+        if !told.is_empty() {
+            return told;
+        }
+        crate::rt::sleep(Duration::from_millis(20)).await;
+    }
+    Vec::new()
+}
+
+fn notes(evs: &[Ev]) -> Vec<String> {
+    evs.iter().filter_map(|e| if let Ev::Note(n) = e { Some(n.clone()) } else { None }).collect()
+}
+
+/// H1 (docs/reach.md, "Sizes from history"), a rolling upgrade: a runner from before (its
+/// directory entry names nothing it takes) is asked a run as it always was, and does it; once it's
+/// upgraded (it names the feature), the run goes with what its asker knows, says what it used
+/// before its exit, and the runner that did it tells the server, under the run's key, as itself.
+/// The server never answers what the command's history says meanwhile (audit H3): no run waits.
+#[cfg(unix)]
+#[test]
+fn h1_a_run_goes_with_what_its_asker_knows_only_to_a_runner_that_takes_it() -> anyhow::Result<()> {
+    crate::rt::block_on(async move {
+        let lab = lab().await?;
+        let folder = tempfile::tempdir()?;
+        let req = || RunReq { target: "linux".into(), command: "echo used  here".into(), cwd: Some(folder.path().display().to_string()), ..RunReq::default() };
+        // linux from before.
+        lab.ctl.send(Ctl::Features("linux", Vec::new())).await?;
+        let evs = run_from_mac(&lab, req(), |_| None).await?;
+        anyhow::ensure!(exit(&evs) == Some((Some(0), None, 0)) && output(&evs, false) == "used here\n", "{evs:?}");
+        anyhow::ensure!(!notes(&evs).iter().any(|n| n.starts_with("used ")), "a runner from before says nothing of what it used: {evs:?}");
+        anyhow::ensure!(measured_by(&lab).await.is_empty(), "a runner asked as before keeps nothing");
+        // linux upgraded; mac asks the directory again (it keeps one for a while, docs/reach.md §2).
+        lab.ctl.send(Ctl::Features("linux", super::history::features())).await?;
+        lab.mac.feed(In::Server(true)).await;
+        let evs = run_from_mac(&lab, req(), |_| None).await?;
+        anyhow::ensure!(exit(&evs) == Some((Some(0), None, 0)), "{evs:?}");
+        let at = |f: &dyn Fn(&Ev) -> bool| evs.iter().position(f);
+        let (used, ended) = (at(&|e| matches!(e, Ev::Note(n) if n.starts_with("used "))), at(&|e| matches!(e, Ev::Exit { .. })));
+        anyhow::ensure!(used.is_some() && used < ended, "what it used comes before its exit: {evs:?}");
+        let told = measured_by(&lab).await;
+        let (who, m) = told.first().cloned().ok_or_else(|| anyhow::anyhow!("nothing measured was kept"))?;
+        anyhow::ensure!(who == "linux" && told.len() == 1, "the runner that did it tells, once: {told:?}");
+        anyhow::ensure!(m.get("command") == Some(&serde_json::json!("echo used here")) && m.get("repo").and_then(serde_json::Value::as_str).is_some_and(|r| r.starts_with("local:mac:")), "{m}");
+        anyhow::ensure!(m.pointer("/used/exit") == Some(&serde_json::json!(0)) && m.get("size").is_none_or(serde_json::Value::is_null), "placed by its ask: {m}");
+        Ok(())
+    })
+}
+
+/// H2: history has no admission of its own. A run whose runner the directory says has room goes
+/// there and runs, however much it asks: nothing here refuses it (placement admits). And it's sized
+/// from history only once the person declared it, from what the server said for an earlier run.
+#[cfg(unix)]
+#[test]
+fn h2_history_refuses_nothing_and_sizes_only_when_declared() -> anyhow::Result<()> {
+    crate::rt::block_on(async move {
+        let lab = lab().await?;
+        lab.ctl.send(Ctl::Mem("linux", 2 << 50)).await?;
+        let folder = tempfile::tempdir()?;
+        let req = |target: &str| RunReq { target: target.into(), command: "echo sized".into(), cwd: Some(folder.path().display().to_string()), ..RunReq::default() };
+        let evs = run_from_mac(&lab, req("linux,mem=1024t"), |_| None).await?;
+        anyhow::ensure!(exit(&evs) == Some((Some(0), None, 0)) && output(&evs, false) == "sized\n", "nothing refused it: {evs:?}");
+        // Undeclared: what history says places nothing.
+        let rollup = kiln_ci::sizes::Rollup::of(&[kiln_ci::sizes::Kept { at_ms: 1, sized_mem: 0, usage: kiln_ci::sizes::Usage { peak_mem: 1 << 30, mem_how: kiln_ci::sizes::How::Exact, exit: Some(0), oom_counted: kiln_ci::sizes::Counted::Group, ..Default::default() } }]);
+        let answer = |sizes: &str| serde_json::json!({"policy": {"sizes": sizes}, "platforms": {"linux/x86_64": rollup}, "kept_ms": super::history::kept_ms(30)});
+        let key = super::history::Key::of("mac", &req("linux,mem=2g")).ok_or_else(|| anyhow::anyhow!("no key"))?;
+        for (declared, sized) in [("ask", false), ("history", true)] {
+            *lab.sizes.lock() = Some(answer(declared));
+            // The first run asks the server; what it says places the next.
+            run_from_mac(&lab, req("linux,mem=2g"), |_| None).await?;
+            for _ in 0..200 {
+                if super::history::cached(&key.hash()).is_some_and(|s| s.policy.sizes == if sized { kiln_ci::sizes::Source::History } else { kiln_ci::sizes::Source::Ask }) {
+                    break;
+                }
+                crate::rt::sleep(Duration::from_millis(20)).await;
+            }
+            let evs = run_from_mac(&lab, req("linux,mem=2g"), |_| None).await?;
+            let why = evs.iter().find_map(|e| if let Ev::Picked { why, .. } = e { Some(why.clone()) } else { None }).unwrap_or_default();
+            anyhow::ensure!(why.contains("sized from history: 1 GiB") == sized && exit(&evs) == Some((Some(0), None, 0)), "{declared}: {why}");
+        }
+        Ok(())
+    })
+}
+
+/// H9: an agent's question through its runner can't say what a run used; its other questions go
+/// through. And the server keeps what a runner said a run used as that runner's, on the platform
+/// it knows the runner by, whatever the message says.
+#[cfg(unix)]
+#[test]
+fn h9_what_a_run_used_is_only_its_runners_to_say() -> anyhow::Result<()> {
+    use crate::hub::tests::{hear, join_runner, scratch_hub_on};
+    use crate::proto::LANE_CONTROL;
+    crate::rt::block_on(async move {
+        let lab = lab().await?;
+        let forged = r#"{"op": "measured", "repo": "acme/app", "command": "make", "used": {"peak_mem": 1, "mem_how": "exact"}}"#;
+        let refused = super::history::for_agent(&lab.mac, forged.into()).await;
+        anyhow::ensure!(refused.as_ref().is_err_and(|e| e.to_string().contains("never an agent's")), "{refused:?}");
+        let call = super::history::for_agent(&lab.mac, r#"{"op": "call", "name": "runners", "input": {}}"#.into()).await?;
+        anyhow::ensure!(call.contains("runners"), "{call}");
+        crate::rt::sleep(Duration::from_millis(200)).await;
+        anyhow::ensure!(lab.measured.lock().is_empty(), "nothing an agent said was kept");
+        // The server's side: kept as the runner on whose connection it came, on its platform.
+        let hub = scratch_hub_on(Arc::new(kiln_seams::clock::SimClock::new()), |_| {}).await?;
+        join_runner(&hub, 2, "linux", 0);
+        let said = r#"{"op": "measured", "repo": "acme/app", "command": "make", "runner": "mac", "platform": "macos/aarch64", "used": {"peak_mem": 1073741824, "mem_how": "exact", "exit": 0, "oom_counted": "group"}}"#;
+        hear(&hub, 2, LANE_CONTROL, &AgentMsg::ReachAsk { req: 5, json: said.into() }).await?;
+        let key = super::history::Key { repo: "acme/app".into(), command: "make".into() }.hash();
+        let mut kept = std::collections::BTreeMap::new();
+        for _ in 0..200 {
+            kept = super::history::rollups(&hub.store, key.clone()).await?;
+            if !kept.is_empty() {
+                break;
+            }
+            crate::rt::sleep(Duration::from_millis(20)).await;
+        }
+        anyhow::ensure!(kept.len() == 1 && kept.get("linux/x86_64").is_some_and(|r| r.runs == 1 && r.peak == 1 << 30), "{kept:?}");
         Ok(())
     })
 }

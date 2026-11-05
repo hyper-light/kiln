@@ -289,7 +289,7 @@ async fn sync_once(handle: &Handle, peer: &str, root: &Path, key: &str, ev: &asy
 /// Run what `req` says, start to end: pick, sync, run, stream. Control (input, signals) comes on
 /// `ctl`; when it closes before the run ends, the run is stopped (unless `detach`).
 pub async fn run(handle: &Handle, me: &str, req: RunReq, ev: async_channel::Sender<Ev>, ctl: async_channel::Receiver<Req>) {
-    if let Err(e) = run_inner(handle, me, req, &ev, ctl).await {
+    if let Err(e) = super::history::run(handle, me, req, &ev, ctl).await {
         let _ = ev.send(Ev::Error(format!("{e:#}"))).await;
     }
 }
@@ -308,7 +308,9 @@ fn spec_of(req: &RunReq) -> RunSpec {
     }
 }
 
-async fn run_inner(handle: &Handle, me: &str, req: RunReq, ev: &async_channel::Sender<Ev>, ctl: async_channel::Receiver<Req>) -> anyhow::Result<()> {
+/// One try at `req` (`super::history::run` tries again where `[reach] retry_oom` says), its size and
+/// what it used kept in `t` (docs/reach.md, "Sizes from history").
+pub(super) async fn run_try(handle: &Handle, me: &str, req: RunReq, ev: &async_channel::Sender<Ev>, ctl: async_channel::Receiver<Req>, t: &super::history::Try) -> anyhow::Result<()> {
     // An agent session's run on another machine is its act: it goes only once kiln takes it as
     // the session's holder's now (a copy left behind's is refused, and so is any while kiln can't
     // be asked), docs/ci.md W27-R08. One that names another machine is asked about first.
@@ -326,14 +328,14 @@ async fn run_inner(handle: &Handle, me: &str, req: RunReq, ev: &async_channel::S
     if elsewhere {
         taken(req.target.clone()).await?;
     }
-    let choice = pick(handle, me, &req.target).await?;
+    let choice = t.pick(handle, me, &req).await?;
     let peer = choice.runner.name.clone();
     let _ = ev.send(Ev::Picked { runner: peer.clone(), why: choice.why.clone() }).await;
     let mut spec = spec_of(&req);
     if peer == me {
         // This machine suits best: no copy, no link — the folder as it is.
         spec.cwd = req.cwd.clone().or(req.remote_cwd.clone());
-        return run_here(spec, req.detach, ev, ctl).await;
+        return run_here(handle, spec, &req, ev, ctl, t).await;
     }
     if !elsewhere {
         taken(peer.clone()).await?;
@@ -353,7 +355,7 @@ async fn run_inner(handle: &Handle, me: &str, req: RunReq, ev: &async_channel::S
         spec.cwd = req.remote_cwd.clone();
     }
     let (says_tx, says) = async_channel::unbounded::<Say>();
-    let id = handle.run(&peer, spec, says_tx).await?;
+    let id = t.start(handle, &choice.runner, spec, says_tx).await?;
     // Set once the client went away: by then the run should have ended, else it is killed.
     let mut stop_by: Option<Instant> = None;
     loop {
@@ -379,10 +381,8 @@ async fn run_inner(handle: &Handle, me: &str, req: RunReq, ev: &async_channel::S
                 Ok(Say::Output { stream, data, .. }) => {
                     let _ = ev.send(Ev::Output { err: stream == Stream::Err, data }).await;
                 }
-                Ok(Say::Exit { code, error, lost, .. }) => {
-                    let _ = ev.send(Ev::Exit { code, error, lost }).await;
-                    return Ok(());
-                }
+                Ok(Say::Used { used, .. }) => t.used(&used),
+                Ok(Say::Exit { code, error, lost, .. }) => return t.exit(ev, &req, stop_by.is_some(), code, error, lost).await,
                 Ok(_) => {}
                 Err(_) => anyhow::bail!("lost track of the run"),
             },
@@ -412,8 +412,9 @@ async fn run_inner(handle: &Handle, me: &str, req: RunReq, ev: &async_channel::S
 }
 
 /// Run on this machine (it suited best): the same events, no link. A detached run goes on after
-/// its client, its events read to its end so that its output never makes it wait.
-async fn run_here(spec: RunSpec, detach: bool, ev: &async_channel::Sender<Ev>, ctl: async_channel::Receiver<Req>) -> anyhow::Result<()> {
+/// its client, its events read to its end so that its output never makes it wait. What it used is
+/// kept under its key (`t`, docs/reach.md "Sizes from history").
+async fn run_here(handle: &Handle, spec: RunSpec, req: &RunReq, ev: &async_channel::Sender<Ev>, ctl: async_channel::Receiver<Req>, t: &super::history::Try) -> anyhow::Result<()> {
     let cwd = super::serve::resolve_cwd(&spec, None)?;
     let (tx, rx) = async_channel::bounded::<super::serve::Event>(16);
     let shell = spec.shell.as_deref().map(|s| crate::os::home_dir().join(".kiln").join("reach").join("shells").join(s));
@@ -428,10 +429,7 @@ async fn run_here(spec: RunSpec, detach: bool, ev: &async_channel::Sender<Ev>, c
                     let _ = ev.send(Ev::Started { runner: String::new(), pid: p, cwd }).await;
                 }
                 Ok(super::serve::Event::Output { stream, data }) => { let _ = ev.send(Ev::Output { err: stream == Stream::Err, data }).await; }
-                Ok(super::serve::Event::Exit { code, error }) => {
-                    let _ = ev.send(Ev::Exit { code, error, lost: 0 }).await;
-                    return Ok(());
-                }
+                Ok(super::serve::Event::Exit { code, error, used }) => return t.exit_here(handle, ev, req, code, error, used.as_deref()).await,
                 Err(_) => anyhow::bail!("lost track of the run"),
             },
             c = ctl.recv().fuse() => match c {
@@ -439,7 +437,7 @@ async fn run_here(spec: RunSpec, detach: bool, ev: &async_channel::Sender<Ev>, c
                 Ok(Req::InputEnd) => { let _ = stdin.send(Vec::new()).await; }
                 Ok(Req::Signal(s)) => if let Some(p) = pid { super::serve::signal_group(p, s); },
                 Ok(_) => {}
-                Err(_) if detach => break,
+                Err(_) if req.detach => break,
                 Err(_) => {
                     if let Some(p) = pid {
                         super::serve::signal_group(p, Signal::Terminate);
@@ -451,9 +449,11 @@ async fn run_here(spec: RunSpec, detach: bool, ev: &async_channel::Sender<Ev>, c
     }
     // Its input ends with its client.
     drop(stdin);
+    let (t, handle) = (t.clone(), handle.clone());
     crate::rt::spawn(async move {
         while let Ok(e) = rx.recv().await {
-            if matches!(e, super::serve::Event::Exit { .. }) {
+            if let super::serve::Event::Exit { used, .. } = e {
+                t.record(&handle, used.as_deref());
                 return;
             }
         }
@@ -589,7 +589,7 @@ async fn connection(handle: Handle, me: String, fd: std::sync::Arc<std::os::fd::
             let _ = ev_tx.send(Ev::Forgot(ok)).await;
         }
         Req::Ask { json } => {
-            let ev = match handle.query(json).await {
+            let ev = match super::history::for_agent(&handle, json).await {
                 Ok(a) => Ev::Answer(a),
                 Err(e) => Ev::Error(format!("{e:#}")),
             };
