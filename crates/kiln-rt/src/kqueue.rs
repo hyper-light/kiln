@@ -59,6 +59,8 @@ pub struct KqueueDriver {
     /// A timed wait's timer (macOS).
     #[cfg(target_os = "macos")]
     timer: Timer,
+    /// The waits whose events held the kick ([`Driver::kicks_taken`]).
+    kicks_taken: u64,
 }
 
 /// A timed wait's one-shot timer: whether one a wait armed has not yet fired.
@@ -135,6 +137,7 @@ impl KqueueDriver {
             nops: Vec::new(),
             #[cfg(target_os = "macos")]
             timer: Timer::default(),
+            kicks_taken: 0,
         }
     }
 
@@ -168,10 +171,14 @@ impl KqueueDriver {
                 other => Err(refused("kevent", other)),
             };
         }
-        // Kick events carry nothing; other filters become completions keyed by udata.
+        // Kick events carry nothing but their count; other filters become completions keyed by udata.
+        let mut kicked = false;
         for ev in &self.events {
             let fired = match ev.filter() {
-                EventFilter::User { .. } => continue,
+                EventFilter::User { .. } => {
+                    kicked = true;
+                    continue;
+                }
                 EventFilter::Write(_) => Readiness::WRITE,
                 _ => Readiness::READ,
             };
@@ -179,6 +186,9 @@ impl KqueueDriver {
                 user_data: u64::try_from(ev.udata().addr()).unwrap_or(0),
                 result: fired.bits(),
             });
+        }
+        if kicked {
+            self.kicks_taken = self.kicks_taken.saturating_add(1);
         }
         Ok(())
     }
@@ -253,6 +263,7 @@ impl KqueueDriver {
         // SAFETY: the kernel wrote `filled` records, at most the buffer's capacity (checked), into
         // its first places.
         unsafe { self.events.set_len(filled) };
+        let mut kicked = false;
         for ev in &self.events {
             if ev.filter == libc::EVFILT_TIMER && ev.ident == TIMER_IDENT {
                 // The timeout passed (or, `EV_ERROR`, a timer already fired was not there to
@@ -267,9 +278,12 @@ impl KqueueDriver {
                     rustix::io::Errno::from_raw_os_error(i32::try_from(ev.data).unwrap_or(0)),
                 ));
             }
-            // Kick events carry nothing; other filters become completions keyed by udata.
+            // Kick events carry nothing but their count; other filters become completions keyed by udata.
             let fired = match ev.filter {
-                libc::EVFILT_USER => continue,
+                libc::EVFILT_USER => {
+                    kicked = true;
+                    continue;
+                }
                 libc::EVFILT_WRITE => Readiness::WRITE,
                 _ => Readiness::READ,
             };
@@ -277,6 +291,9 @@ impl KqueueDriver {
                 user_data: u64::try_from(ev.udata.addr()).unwrap_or(0),
                 result: fired.bits(),
             });
+        }
+        if kicked {
+            self.kicks_taken = self.kicks_taken.saturating_add(1);
         }
         Ok(())
     }
@@ -349,6 +366,10 @@ impl Driver for KqueueDriver {
 
     fn has_pending(&self) -> bool {
         !self.nops.is_empty()
+    }
+
+    fn kicks_taken(&self) -> u64 {
+        self.kicks_taken
     }
 }
 
