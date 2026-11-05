@@ -6306,7 +6306,11 @@ async fn harness_attach(hub: Arc<Hub>, id: String, socket: ws::WebSocket, takes:
         tx.send(ws::text(SessionDown::from(SessionFrame::Closed).text())).await?;
         return Ok(());
     };
-    send_snapshot(&mut tx, att.snapshot, takes.packed).await?;
+    {
+        // Counted while it's written (goal 10, plan 01a1a87b2dae step 3's trace).
+        let _writing = crate::reads::Writing::of(&hub.harness.views.attaching);
+        send_snapshot(&mut tx, att.snapshot, takes.packed).await?;
+    }
     // Its place among the session's viewers, given back as it goes.
     let viewer = att.viewer;
     let topic = att.topic;
@@ -6509,7 +6513,10 @@ async fn harness_attach(hub: Arc<Hub>, id: String, socket: ws::WebSocket, takes:
                 tx.send(closed()).await?;
                 return Ok(());
             };
-            send_snapshot(&mut tx, snapshot, takes.packed).await?;
+            {
+                let _writing = crate::reads::Writing::of(&hub.harness.views.attaching);
+                send_snapshot(&mut tx, snapshot, takes.packed).await?;
+            }
             caught_up = Some((Instant::now(), began.elapsed()));
             at = from;
             refusals = now;
@@ -7131,6 +7138,137 @@ mod tests {
                 anyhow::ensure!(Instant::now() < deadline, "the runs' list wasn't kept again");
                 crate::rt::sleep(Duration::from_millis(5)).await;
             }
+            Ok(())
+        })
+    }
+
+    /// A WebSocket client of the API at `port` on `path`, as the owner; with `rcvbuf`, its socket holds
+    /// at most about that many bytes it hasn't read.
+    fn ws_client(port: u16, path: &str, rcvbuf: Option<usize>) -> anyhow::Result<tungstenite::WebSocket<std::net::TcpStream>> {
+        use tungstenite::client::IntoClientRequest as _;
+        let sock = socket2::Socket::new(socket2::Domain::IPV4, socket2::Type::STREAM, None)?;
+        if let Some(n) = rcvbuf {
+            sock.set_recv_buffer_size(n)?;
+        }
+        sock.connect(&std::net::SocketAddr::from(([127, 0, 0, 1], port)).into())?;
+        let mut req = format!("ws://127.0.0.1:{port}{path}").into_client_request()?;
+        req.headers_mut().insert("authorization", "Bearer test-admin-token".parse()?);
+        let (ws, _) = tungstenite::client::client(req, std::net::TcpStream::from(sock)).map_err(|e| anyhow::anyhow!("{path}: {e}"))?;
+        Ok(ws)
+    }
+
+    /// Goal 10, plan 01a1a87b2dae step 3, traced: a frame published while another viewer of its session
+    /// attaches reaches the viewer already watching without waiting for that attach. The attaching one's
+    /// socket takes its snapshot's first frame and nothing more, so its snapshot (megabytes) is still
+    /// being written (`crate::reads::Views::attaching`) when the frame goes and when the other has it.
+    /// The frame is one message on the session's feed, encoded once, and its bytes are what each viewer
+    /// reads; the attaching one has it after its snapshot.
+    #[test]
+    fn g10_s3_a_frame_reaches_the_viewers_while_another_attaches() -> anyhow::Result<()> {
+        use crate::harness::core::Update;
+        use crate::harness::model::{Body, Event, State};
+        use kiln_seams::Bus as _;
+        use std::sync::atomic::Ordering;
+        const MARK: &str = "g10-s3: published while another viewer attaches";
+        // What a viewer's thread says: its snapshot came (false), or the frame (true, its text); or why it stopped.
+        type Said = Result<(bool, String), String>;
+        crate::rt::block_on(async {
+            // kiln's API on a port of its own.
+            let tcp = hyper_rt::tcp::TcpListener::bind(std::net::SocketAddr::from(([127, 0, 0, 1], 0)), 16).map_err(|e| anyhow::anyhow!("{e}"))?;
+            let port = tcp.local_addr().map_err(|e| anyhow::anyhow!("{e}"))?.port();
+            let hub = crate::hub::tests::scratch_hub().await?;
+            let api = Arc::new(Api { hub: Arc::clone(&hub) });
+            crate::rt::spawn(async move {
+                while let Ok(stream) = tcp.accept().await {
+                    let (api, remote) = (Arc::clone(&api), stream.peer_addr().ok());
+                    crate::rt::spawn(async move { crate::http::server::serve_accepted(stream, api, remote, None).await });
+                }
+            });
+            // A long session: its snapshot is megabytes, far more than the sockets between hold.
+            let there = crate::harness::registry::Location::Machine("box".into());
+            let info = crate::harness::session::Info { id: "s".into(), kind: "claude".into(), ..crate::harness::session::Info::default() };
+            hub.harness.ingest(&hub, &there, "s", Update::Open { info: Box::new(info), since: None }).await;
+            hub.harness.ingest(&hub, &there, "s", Update::State { state: Box::new(State::default()) }).await;
+            let said = |n: u64, text: String| Event { id: format!("e{n}"), seq: n, at: 1, parent: None, by: None, body: Body::Assistant { text, streaming: false } };
+            let long: Vec<Event> = (1..=256).map(|n| said(n, format!("{n}: {}", "the retry loop reads its deadline ".repeat(960)))).collect();
+            hub.harness.ingest(&hub, &there, "s", Update::Events { events: long }).await;
+            let wait = Duration::from_secs(60);
+            let next = |rx: async_channel::Receiver<Said>, what: &'static str| async move {
+                match crate::rt::timeout(wait, rx.recv()).await {
+                    Ok(Ok(Ok(said))) => Ok(said),
+                    Ok(Ok(Err(why))) => Err(anyhow::anyhow!("{what}: {why}")),
+                    Ok(Err(_)) => Err(anyhow::anyhow!("{what}: its viewer went")),
+                    Err(_) => Err(anyhow::anyhow!("{what}: not within {wait:?}")),
+                }
+            };
+            // Viewer A watches it, as the UI does (its snapshot packed).
+            let (a_tx, a_rx) = async_channel::unbounded::<Said>();
+            std::thread::spawn(move || {
+                let watch = || -> anyhow::Result<String> {
+                    let mut ws = ws_client(port, "/api/harness/sessions/s/ws?z=gzip&patch=state&patch=changes", None)?;
+                    loop {
+                        match ws.read()? {
+                            tungstenite::Message::Binary(_) => {
+                                let _ = a_tx.send_blocking(Ok((false, String::new())));
+                            }
+                            tungstenite::Message::Text(t) if t.as_str().contains(MARK) => return Ok(t.as_str().to_owned()),
+                            _ => {}
+                        }
+                    }
+                };
+                let _ = a_tx.send_blocking(watch().map(|t| (true, t)).map_err(|e| format!("{e:#}")));
+            });
+            anyhow::ensure!(!next(a_rx.clone(), "A's snapshot").await?.0, "A's snapshot comes first");
+            // Viewer B attaches: its socket takes its snapshot's first frame (its head) and nothing more
+            // until it's told to read on.
+            let (b_tx, b_rx) = async_channel::unbounded::<Said>();
+            let (go, read_on) = async_channel::bounded::<()>(1);
+            std::thread::spawn(move || {
+                let attach = || -> anyhow::Result<String> {
+                    let mut ws = ws_client(port, "/api/harness/sessions/s/ws", Some(4096))?;
+                    let head = ws.read()?;
+                    let _ = b_tx.send_blocking(Ok((false, head.to_text().unwrap_or_default().to_owned())));
+                    let _ = read_on.recv_blocking();
+                    loop {
+                        if let tungstenite::Message::Text(t) = ws.read()?
+                            && t.as_str().contains(MARK)
+                        {
+                            return Ok(t.as_str().to_owned());
+                        }
+                    }
+                };
+                let _ = b_tx.send_blocking(attach().map(|t| (true, t)).map_err(|e| format!("{e:#}")));
+            });
+            let (_, head) = next(b_rx.clone(), "B's snapshot's head").await?;
+            anyhow::ensure!(!head.contains(MARK), "B's snapshot was taken before the frame");
+            // B's snapshot is being written (A's is done), and stays so: B reads none of it.
+            let writing = || hub.harness.views.attaching.load(Ordering::Acquire);
+            let deadline = Instant::now() + wait;
+            while writing() != 1 {
+                anyhow::ensure!(Instant::now() < deadline, "{} snapshots being written, not B's alone", writing());
+                crate::rt::sleep(Duration::from_millis(5)).await;
+            }
+            // The feed, as a viewer of its own reads it: where it ends now.
+            let feed = hub.harness.attach("s").ok_or_else(|| anyhow::anyhow!("no session s"))?;
+            let from = feed.at.ok_or_else(|| anyhow::anyhow!("the session's feed has no topic"))?;
+            // The frame, published while B attaches: A has it, while B's snapshot is still being written.
+            hub.harness.ingest(&hub, &there, "s", Update::Events { events: vec![said(257, MARK.to_owned())] }).await;
+            let (live, a_has) = next(a_rx, "A's frame (it waited for B's attach)").await?;
+            anyhow::ensure!(live, "A had the frame live");
+            anyhow::ensure!(writing() == 1, "B's attach was under way as A had the frame: {} snapshots being written", writing());
+            // Encoded once: one message on the feed carries it, and its bytes are what A read.
+            let batch = hub.bus.read(&feed.topic, from, 64).await.map_err(|e| anyhow::anyhow!("{e}"))?;
+            let carrying: Vec<String> = batch.messages.iter().filter_map(|m| crate::harness::live::decode_ref(&m.payload)).filter(|f| f.text.contains(MARK)).map(|f| f.text.to_owned()).collect();
+            anyhow::ensure!(carrying == vec![a_has.clone()], "one message on the feed carries the frame, as A read it: {} do", carrying.len());
+            // B reads on: its snapshot, then the frame, the same bytes.
+            go.send(()).await?;
+            let (live, b_has) = next(b_rx, "B's frame").await?;
+            anyhow::ensure!(live && b_has == a_has, "B had the frame's bytes after its snapshot");
+            while writing() != 0 {
+                anyhow::ensure!(Instant::now() < deadline, "B's snapshot was never written whole");
+                crate::rt::sleep(Duration::from_millis(5)).await;
+            }
+            drop(feed);
             Ok(())
         })
     }

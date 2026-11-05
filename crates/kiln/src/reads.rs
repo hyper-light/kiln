@@ -4,7 +4,7 @@
 
 use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::Instant;
 
 use serde_json::{Value, json};
@@ -253,6 +253,23 @@ pub struct MeKey {
     pub hostname: String,
 }
 
+/// A viewer's snapshot being written, counted in [`Views::attaching`] while it lives (goal 10, plan
+/// 01a1a87b2dae step 3's trace).
+pub struct Writing<'a>(&'a AtomicUsize);
+
+impl<'a> Writing<'a> {
+    pub fn of(count: &'a AtomicUsize) -> Self {
+        count.fetch_add(1, Ordering::AcqRel);
+        Self(count)
+    }
+}
+
+impl Drop for Writing<'_> {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
 /// `parts`, each JSON encoded already, as one JSON array: joined, nothing encoded.
 pub fn json_array<'a>(parts: impl Iterator<Item = &'a bytes::Bytes> + Clone) -> bytes::Bytes {
     let mut out = Vec::with_capacity(parts.clone().map(|p| p.len() + 1).sum::<usize>() + 2);
@@ -283,6 +300,8 @@ pub struct Views {
     /// `GET /api/runs` with nothing in its query, for whoever reads every repository's runs.
     pub runs: Arc<Kept<bytes::Bytes>>,
     pub me: Ahead<MeKey>,
+    /// Viewers whose snapshots are being written now ([`Writing`]; goal 10, plan 01a1a87b2dae step 3).
+    pub attaching: AtomicUsize,
     /// Told when something a read kept ahead is made of changes: wakes their maker.
     wake: Arc<crate::rt::Notify>,
     started: AtomicBool,
@@ -300,6 +319,7 @@ impl Default for Views {
             overview: Ahead::default(),
             runs: Arc::new(Kept::new(RUNS_FROM)),
             me: Ahead::default(),
+            attaching: AtomicUsize::new(0),
             wake,
             started: AtomicBool::new(false),
         }
