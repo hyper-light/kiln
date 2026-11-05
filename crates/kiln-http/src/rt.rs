@@ -76,8 +76,14 @@ impl<T: Send + 'static> Bridge<T> {
 
 impl<T: Send + 'static> Drop for Bridge<T> {
     fn drop(&mut self) {
-        // A helper that finished already is a stale id: refused, harmlessly.
-        let _ = hyper_rt::futures::cancel(self.task);
+        // A helper that finished already is a stale id: refused, harmlessly. Dropped on another shard than its
+        // helper's (a movable task's bridge, the task moved since: kiln's goal 7, `hyper_rt::movable`), it is
+        // cancelled there by a message, so its wait doesn't outlive what it waited for.
+        if hyper_rt::futures::shard_id().is_some_and(|here| here.0 == self.task.0.shard()) {
+            let _ = hyper_rt::futures::cancel(self.task);
+        } else {
+            let _ = hyper_rt::runtime::cancel_task(self.task);
+        }
     }
 }
 
