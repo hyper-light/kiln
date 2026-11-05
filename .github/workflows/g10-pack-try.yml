@@ -35,7 +35,7 @@ jobs:
           rustup toolchain install stable --profile minimal
           rustup default stable
       - name: Tests
-        run: "cargo test --locked -p kiln --lib -j 2 -- store:: api::tests:: harness:: plans:: goals:: reads::"
+        run: "cargo test --locked -p kiln --lib -j 2 -- store:: api::tests:: harness:: plans:: goals:: reads:: authz:: mcp::"
   clippy-linux:
     name: clippy (Linux, kiln, all targets)
     runs-on: ubuntu-latest
