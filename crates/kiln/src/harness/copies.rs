@@ -1834,7 +1834,7 @@ mod tests {
         }
         let [oldest, middle, newest] = <[Arc<Chunk>; 3]>::try_from(sealed).map_err(|s| anyhow::anyhow!("{} chunks sealed", s.len()))?;
         let want = newest.deflate(Compression::default())?;
-        let (owner, told) = async_channel::bounded::<Msg>(8);
+        let (owner, told) = crate::memory::queue::bounded::<Msg>(&crate::memory::owners::SESSION_INBOXES, 8 * MSG);
         let home = Home { inbox: owner.downgrade(), id: Arc::from("s") };
         let (tx, rx) = async_channel::unbounded();
         for c in [&oldest, &middle, &newest] {
