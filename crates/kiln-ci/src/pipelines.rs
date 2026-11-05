@@ -2622,6 +2622,23 @@ mod tests {
     }
 
     #[test]
+    fn w29_r27_a_code_workflows_views_are_code_what_it_makes_and_plan() {
+        let viewer = Viewer { name: "ada", can_submit: true, can_land: true };
+        let views = |kind: Kind, dialect: Option<&'static str>| -> Value {
+            let row = Row::new(facts(kind), dialect, String::new(), None, None);
+            let o = Opened { repo: "acme/x", row: &row, at: "main", sha: "", text: "", viewer, by_hand: false, changes: None, since: None, overlay: None, said: None, lines: None, update: None, narrow: Vec::new() };
+            pane_json(&o, &[]).pointer("/detail/views").cloned().unwrap_or(Value::Null)
+        };
+        for dialect in ["ts", "js"] {
+            assert_eq!(views(Kind::Workflow, Some(dialect)), json!(["Code", "What it makes", "Plan"]), "{dialect}");
+        }
+        for dialect in ["gha", "kiln"] {
+            assert_eq!(views(Kind::Workflow, Some(dialect)), json!(["YAML", "Flow", "Plan"]), "{dialect}");
+        }
+        assert_eq!(views(Kind::Composite, None), json!(["Changes", "YAML", "Try it"]));
+    }
+
+    #[test]
     fn w29_r10_a_draft_in_review_is_its_authors() {
         let mk = |name: &str, kind: Kind| Row::new(Facts { name: name.into(), path: format!(".github/workflows/{name}.yml"), ..facts(kind) }, Some("gha"), String::new(), None, None);
         let review = mk("stress", Kind::Workflow).drafted(DraftOf { id: "d3".into(), state: Draft::Review, author: "ada".into(), change: Some(DraftChange { kind: "change", name: "#5".into(), url: Some("https://github.com/acme/app/pull/5".into()) }) });

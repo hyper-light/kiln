@@ -205,7 +205,7 @@ Statuses: `ready` (can start), `blocked` (waits on what is in brackets), `in pro
 | W24 | Incremental CI: fingerprints, reuse, warm state, shared caches | W04, W05, W06, W08, W13, W18 | ready | specified (2026-10-24): R01–R31, AC01–AC15; milestones M0–M7 and M1e are kiln goals with plans |
 | W26 | Review in Ship: changes as Ship items, each owning its review | W14, W23, W27, Ship (the CI/CD Integration plan) | in progress | R06–R15 built: each item's dropdown owns its review (Files and the Conversation, search on vorpal, kinds and the gate, suggestions and conflicts as revisions, the Review lanes), unsigned until W27-R03; AC06 in Chromium, not yet WebKit; specified (2026-10-25): R01–R20, AC01–AC11; plan `01a175b7d5e1772f8d3c7cb28e50ab2b` |
 | W27 | Attested end to end: identities, signatures, hand-offs, the trail | W10, W18, W26 | in progress | specified (2026-10-25): R01–R12, AC01–AC08; research `01a175c54441773fa28bf1488b82e6aa`; identities built (R01, R02, R12; AC01, AC02): plan `01a17856b1b0712babf8dfd37ce48756`; hand-offs built (R08; AC05: the 14:18 drop and the twin played again, refused and recorded, and the transfers simulation): plan `01a17856b1b477eda14a574ae312a123` |
-| W29 | Pipelines in Ship: author, run, share and lock workflows and actions | W02, W03, W04, W07, W13, W14, W21, W23, W26 | in progress | specified (2026-10-31): R01–R31, AC01–AC29, S01–S17; the design approved on stills `pl-1` to `pl-9`; the read model and API built (R02, R03, R04's pane, R09's reads); drafts built (R10–R14); sharing built (R17–R20: Access, one check, the catalog, Access and Used by in Ship); releases by tag and update drafts built (R21, R22); the tab built (R01, R04–R08; R14, R21 and R22 in its strip); locks built (R23–R26: GitHub's `actions.lock` read, written and verified as the pinned `gh actions-lock` does on its own fixture and four of F-02's repositories, `.kiln/lock` for what it leaves out, one snapshot per run kept through recovery, Require lockfile and moved tags, locks in every draft, reviewed re-locks, Lock it; W29-S04 replayed on real git); plan `01a19474452d7084bae269952cc6c26a` |
+| W29 | Pipelines in Ship: author, run, share and lock workflows and actions | W02, W03, W04, W07, W13, W14, W21, W23, W26 | in progress | specified (2026-10-31): R01–R31, AC01–AC29, S01–S17; the design approved on stills `pl-1` to `pl-9`; the read model and API built (R02, R03, R04's pane, R09's reads); drafts built (R10–R14); sharing built (R17–R20: Access, one check, the catalog, Access and Used by in Ship); releases by tag and update drafts built (R21, R22); the tab built (R01, R04–R08; R14, R21 and R22 in its strip); locks built (R23–R26: GitHub's `actions.lock` read, written and verified as the pinned `gh actions-lock` does on its own fixture and four of F-02's repositories, `.kiln/lock` for what it leaves out, one snapshot per run kept through recovery, Require lockfile and moved tags, locks in every draft, reviewed re-locks, Lock it; W29-S04 replayed on real git); code workflows built (R27: `.kiln/<name>.ts` and `.js`, their types erased as Node 24 strips them and their program planned in code mode's QuickJS, `@kiln/sdk`'s types made from the kiln dialect's schema, the tab's Code · What it makes · Plan; kiln's own nine workflows in TypeScript make what their YAML does); plan `01a19474452d7084bae269952cc6c26a` |
 
 ---
 
@@ -1506,7 +1506,8 @@ for GHA semantics; kiln's matrix and data-flow additions on top. Pure code in
   requirements and routing candidates (W05-R20 explain), and diagnostics. The builder UI and
   agents use it. With `content`, `overlay` is a GitHub workflow's overlay as edited (W02-R07),
   applied as a run applies it. kiln's `diff` and `land` are made as a person's diff onto the
-  default branch would make them.
+  default branch would make them. A code workflow (W29-R27) is made for the event first, and its
+  answer adds `emitted` and `emitted_github`.
 
 **Design.** `crates/kiln-ci/src/plan/`: `graph.rs` (jobs, needs, readiness, skips),
 `matrix.rs` (W04-R07 to W04-R17), `outputs.rs`, `reusable.rs`, `perms.rs`, `preview.rs`. The
@@ -10728,7 +10729,8 @@ is kiln research `01a1947b2b0270fa9d1e32d07aebaa7e` (44 findings, 37 sources) an
     - a trigger: Times (a schedule) or Filters, then YAML · Plan;
     - a use: the action's own summary and versions;
     - a run: its jobs pane (W26-R23);
-    - the whole file: YAML · Flow (· Code, W29-R27) · Plan;
+    - the whole file: YAML · Flow · Plan; a code workflow's (W29-R27): Code · What it makes · Plan,
+      and each of its parts': Code · What it makes · Plan (· Last run for a job);
     - an action: Changes · YAML · Try it (W21-R07).
   - Every verb is `POST /api/ship/pipelines { repo, path, verb, … }`. Each goes to its CI operation
     (`ci.runs.trigger`, `ci.workflows.edit`, `ci.actions.try`, and W29's own) through the ops
@@ -11258,6 +11260,31 @@ endpoint, for a repository kiln hosts and for one on GitHub:
     view re-plans as you type (W29-R07). "What it makes" shows the YAML it emits, which can be
     saved as a GitHub workflow for repositories that also run on GitHub. Where the program uses
     only GitHub's keys, that YAML is GitHub-exact.
+  - As built:
+    - The erasure (`kiln_ci::wf::code`) is held byte for byte to Node 24's `stripTypeScriptTypes`
+      in strip mode (`crates/kiln-ci/tests/fixtures/erase`), its `;` and `)` repairs included.
+      `<T>x` is refused too, as Node refuses it. kiln differs in one place: a `;` before a
+      template holding `${`, where Node's output tags the template with the statement before.
+    - The program runs on code mode's engine (`mcp::code::engine`). `performance.now()` is
+      refused as `Date.now()` is, and `WeakRef` and `FinalizationRegistry` are gone. A refusal
+      caught by the program still fails its plan.
+    - Each SDK call's line and column is kept (`workflow`, `job`, `step`), and W02's diagnostics,
+      and the server's own (W02-R12), point at the call that made the part they're about.
+    - Where a caller has no event of its own (Ship's read model, the catalog, locks, schedules), a
+      program is made for a push of its commit to the repository's trunk, plan-preview's default.
+      Each run makes it again for its own event; a dispatch's inputs reach it as `event.inputs`.
+      What it made for that push is kept in `ci_workflows` by its blob and its commit.
+    - Its locks (W29-R23, R24) hold what it makes for that push. A use it makes only for another
+      event isn't locked, and a run for that event says so (`KCI4050`). It can't be called as a
+      reusable workflow.
+    - plan-preview's answer adds `emitted` (its YAML, in the program's own key order) and
+      `emitted_github` (whether it's GitHub-exact). Its draft may carry the GitHub workflow of its
+      name (Save as a GitHub workflow), checked as one.
+    - New writes it (`language: ts`), blank or recommended, never as a reusable workflow, a starter
+      or a copy, which are YAML.
+    - `@kiln/sdk`'s types take the kiln dialect's schema as it is: two shorthands W02 reads, an
+      event that's just on (`manual: true`) and a schedule's bare cron, are written as the objects
+      the schema names (`manual: {}`, `{ cron }`).
   - kiln's addition: GitHub has no code workflows.
 - **W29-R28 Every other language.** A program in any other language that prints kiln-dialect JSON
   runs in a plan leg. Two file kinds name one:
@@ -11419,7 +11446,8 @@ lockfile, which pins commit A. An attacker moves `v45` and `v45.0.7` to commit M
 | `POST /api/ci/repos/:repo/locks { ref? }` or `{ path, content, files? }` (W29-R25) | `ci.locks.update`, new | a draft of the regenerated locks; with the editor's file, that file saved with its locks |
 | `GET /api/ci/repos/:repo/locks/verify?sha=` (W29-R25) | `ci.locks.verify`, new | `{ fresh, stale: [{ workflow, uses, locked, now, error }], warnings }` |
 | `POST /api/ci/repos/:repo/locks/accept { draft, head, evidence_sha256 }` (W29-R25) | `ci.locks.accept`, new | `{ approval, draft, head, evidence_sha256, accepted }` |
-| `GET /api/ci/sdk/kiln.d.ts` (W29-R27) | | the SDK's types for the editor |
+| `GET /api/ci/sdk/kiln.d.ts` (W29-R27) | `ci::workflows::sdk_types`, from `kiln_ci::wf::sdk` | the SDK's types for the editor |
+| `POST /api/ci/plan-preview` (W29-R27) | `ci.workflows.plan_preview`, grown: a code workflow made for the event first | its plan, `emitted` (the YAML it makes) and `emitted_github` |
 | notification `tag_moved` (W29-R26, W19) | | a full version that resolves to another commit |
 | event `pipelines { repo }` | | pages ask again |
 
@@ -11584,8 +11612,9 @@ Each names the requirements it holds and how it's checked. UI checks run in Chro
 - **W29-AC25 TypeScript workflows** (R07, R27). kiln's own `.kiln/ci.yaml`, rewritten in TypeScript,
   makes a plan structurally equal to the YAML's. A TypeScript workflow plans within 20 ms on the
   server (p99 over kiln's workflows, release build). Diagnostics point at the TypeScript line and
-  column, and each of `KCI1030` to `KCI1033` comes from its case. *Unit tests and a bench (plan
-  01a174b2's step 3).*
+  column, and each of `KCI1030` to `KCI1033` comes from its case. *Unit tests (`ci::code`'s, on
+  kiln's workflows in `crates/kiln/tests/fixtures/code/kiln` and on each code's case) and a bench
+  (`cargo bench -p kiln --bench code_workflows`: 1.1 ms at p50 and 4.8 ms at p99, release build).*
 - **W29-AC26 Every other language** (R28). Plan 01a174b2's nine-language example makes the same plan
   in each language. An unchanged program's plan comes from the store within 50 ms (p99 over 100
   pushes). A fork bomb, 10 GiB of output, an infinite loop, a DNS lookup and a read of
@@ -11727,12 +11756,28 @@ Its step 7, the Pipelines tab, is built (R01, R04 to R08; R14, R21 and R22 in it
 
 Not built yet: R04's pick words ("failed last run · changed in a draft · all": "plan for:" stands
 in their place); R09's ways in (Edit workflow from a commit's jobs pane and a run's page, and
-`/workflows` redirecting to Pipelines); a workflow's Code views (R27, the plan's step 9); GitHub's
-own dispatch where GitHub is the provider (R14); turning a workflow off and on (R15). Sharing step
+`/workflows` redirecting to Pipelines); GitHub's own dispatch where GitHub is the provider (R14);
+turning a workflow off and on (R15). Sharing step
 3 found two gaps. Both are closed. R10's: a draft-only commit pinned through a native source's
 plain name, or by a reusable call, was let through. R12's: a kiln draft's own workflow didn't
-start when it was marked Ready, and a GitHub-dialect one wasn't held while it was a draft. Next
-are locks (R23 to R26), the plan's step 8.
+start when it was marked Ready, and a GitHub-dialect one wasn't held while it was a draft.
+
+Its step 8, locks (R23 to R26), is built, and so is its step 9, code workflows (R27):
+- `.kiln/<name>.ts` and `.js` are W02's code workflows, kiln workflows for W02-R02's precedence.
+  Their types are erased as Node 24 strips them (`kiln_ci::wf::code`), and the program runs in code
+  mode's QuickJS with plan-time limits (`ci::code`).
+- `@kiln/sdk`'s types come from the kiln dialect's schema (`kiln_ci::wf::sdk`,
+  `GET /api/ci/sdk/kiln.d.ts`). The loader, runs, dispatches, validate, plan-preview, the editor's
+  saves, New and the lock writers all take code workflows.
+- The tab's Code view is the editor as YAML has it, checked and planned as it's typed. "What it
+  makes" shows the YAML, with Save as a GitHub workflow where it's GitHub-exact.
+- kiln's own nine workflows, written as programs (`crates/kiln/tests/fixtures/code/kiln`), plan
+  as their YAML does for every event their triggers name (W29-AC25). On a release build a program
+  plans in 1.1 ms at p50 and 4.8 ms at p99 (1,800 calls over the nine, on a busy 32-core Linux
+  runner).
+
+R28, every other language, follows as plan 01a174b2's steps 2 to 4. Next are microVM actions (R29,
+R30), the plan's step 10.
 
 ## 4. API, events, CLI and MCP reference
 
@@ -11860,7 +11905,7 @@ errors as `{ error, code, details? }`. Today's routes (`/api/runs`, `/api/jobs/.
 | POST · GET | `/api/ci/repos/:repo/locks` · `/api/ci/repos/:repo/locks/verify?sha=` | `ci.locks.update`, `ci.locks.verify` | workflows.edit · runs.read | W29 |
 | POST | `/api/ci/repos/:repo/locks/accept` | `ci.locks.accept` (`{ draft, head, evidence_sha256 }`) | a person, with workflows.edit, diffs.submit and diffs.review | W29 |
 | POST | `/api/ci/repos/:repo/workflows/:path/disable` · `/enable` | `ci.workflows.disable`, `.enable` (`{ why? }`) | workflows.edit | W29 |
-| GET | `/api/ci/sdk/kiln.d.ts` | the TypeScript SDK's types | none (public within the API) | W29 |
+| GET | `/api/ci/sdk/kiln.d.ts` | the TypeScript SDK's types | signed in | W29 |
 
 GitHub-compatible runtime services (W08, W10), the facade (W14) and the registry (W12) are listed
 in §2.6; they are not part of the route table's public API but are authenticated by the same

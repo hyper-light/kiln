@@ -131,6 +131,33 @@ fn w29_r27_a_program_reads_its_event_and_tree_and_nothing_else() -> anyhow::Resu
     Ok(())
 }
 
+/// W29-R27: New's TypeScript workflow, from each start it offers, makes its workflow with no
+/// diagnostics; a push to its branch runs it, and W04 plans each of its jobs.
+#[test]
+fn w29_r27_the_typescript_starter_plans_with_no_diagnostics() -> anyhow::Result<()> {
+    use kiln_ci::plan::{NoSource, RunInput, RunPlan, Settings};
+    use kiln_ci::scaffold::{self, Kind, Start};
+    for start in [Start::Blank, Start::Recommended] {
+        let files = scaffold::scaffold(Kind::Workflow, scaffold::Dialect::TypeScript, "build-all", start, &["Cargo.toml"], "main").map_err(|e| anyhow::anyhow!("{start:?}: {e}"))?;
+        let f = files.first().ok_or_else(|| anyhow::anyhow!("{start:?} made no file"))?;
+        let push = json!({ "ref": "refs/heads/main" });
+        let (w, d) = workflow(&f.path, &f.text, &push, tree());
+        assert!(d.is_empty(), "{start:?}: {d:?}\n{}", f.text);
+        let w = w.ok_or_else(|| anyhow::anyhow!("{start:?} made no workflow"))?;
+        let event = kiln_ci::trigger::Event { name: "push".into(), git_ref: "refs/heads/main".into(), ..Default::default() };
+        assert!(kiln_ci::trigger::matches(&w, &event).is_ok(), "{start:?}: {}", f.text);
+        let mut jobs: Vec<String> = w.jobs.iter().map(|j| j.id.clone()).collect();
+        jobs.sort();
+        let input = RunInput { github: json!({ "event_name": "push", "ref": "refs/heads/main", "event": push }), inputs: json!({}), vars: json!({}), changed: None, trusted: true };
+        let plan = RunPlan::preview(Arc::new(w), input, Settings::default(), &NoSource).map_err(|e| anyhow::anyhow!("{start:?}: {e}"))?;
+        let mut planned: Vec<String> = plan.legs.iter().map(|l| l.job.clone()).collect();
+        planned.sort();
+        planned.dedup();
+        assert!(!jobs.is_empty() && planned == jobs, "{start:?}: {planned:?} of {jobs:?}");
+    }
+    Ok(())
+}
+
 /// The first place two values differ, as a path (`jobs[0].steps[3].run`).
 fn differs(a: &Value, b: &Value, at: &str) -> Option<String> {
     match (a, b) {
@@ -155,38 +182,87 @@ fn model(w: Option<&Workflow>) -> anyhow::Result<Value> {
     Ok(v)
 }
 
-/// Kiln's own workflow `name` (tests/fixtures/code/kiln): what its YAML makes, and its program.
-fn kilns(name: &str) -> anyhow::Result<(Value, String)> {
+/// Kiln's own workflow `name` (tests/fixtures/code/kiln): its YAML's workflow, and its program.
+fn kilns(name: &str) -> anyhow::Result<(Workflow, String)> {
     let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/code/kiln");
     let yaml = std::fs::read_to_string(dir.join(format!("{name}.yaml")))?;
     let (w, d) = wf::parse_workflow(&format!(".kiln/{name}.yaml"), &yaml, Dialect::Kiln);
     anyhow::ensure!(!d.iter().any(Diag::is_error), "{name}.yaml: {d:?}");
-    Ok((model(w.as_ref())?, std::fs::read_to_string(dir.join(format!("{name}.ts")))?))
+    let w = w.ok_or_else(|| anyhow::anyhow!("{name}.yaml made no workflow"))?;
+    Ok((w, std::fs::read_to_string(dir.join(format!("{name}.ts")))?))
+}
+
+/// An event's payload, as a program and the plan's `github.event` get it.
+fn payload(event: &str) -> Value {
+    match event {
+        "pull_request" | "pull_request_target" => json!({ "ref": "refs/pull/1/merge", "pull_request": { "number": 1, "base": { "ref": "main" }, "head": { "ref": "change" } } }),
+        "workflow_dispatch" | "manual" => json!({ "ref": "refs/heads/main", "inputs": {} }),
+        _ => json!({ "ref": "refs/heads/main" }),
+    }
+}
+
+/// W04's plan of `w` for `event`, as the comparison reads it: each leg with its job as defined,
+/// its file's own path left out, and what the plan decided without running anything.
+fn planned(w: Workflow, event: &str) -> anyhow::Result<Value> {
+    use kiln_ci::plan::{NoSource, RunInput, RunPlan, Settings};
+    let input = RunInput { github: json!({ "event_name": event, "ref": payload(event).get("ref"), "event": payload(event) }), inputs: json!({}), vars: json!({}), changed: None, trusted: true };
+    let p = RunPlan::preview(Arc::new(w), input, Settings::default(), &NoSource).map_err(|e| anyhow::anyhow!("{event}: {e}"))?;
+    let mut legs = Vec::new();
+    for leg in &p.legs {
+        let mut v = serde_json::to_value(leg)?;
+        if let Some(o) = v.as_object_mut() {
+            o.remove("defined_in");
+            o.insert("def".into(), serde_json::to_value(leg.def())?);
+        }
+        legs.push(v);
+    }
+    Ok(json!({ "name": p.name, "legs": legs, "decided": p.decided, "removed": p.removed, "later": p.later }))
+}
+
+/// Where program `ts`'s plans first differ from those of `name`'s YAML, `yaml`: for each event
+/// the YAML's triggers name, the program made for that event and both planned for it. The event,
+/// the place (`legs[0].def.steps[3].run`) and the YAML's plan.
+fn first_difference(name: &str, yaml: &Workflow, ts: &str) -> anyhow::Result<Option<(String, String, Value)>> {
+    anyhow::ensure!(!yaml.on.is_empty(), "{name}.yaml names no event");
+    for t in &yaml.on {
+        let (made, d) = workflow(&format!(".kiln/{name}.ts"), ts, &payload(&t.event), Arc::new(NoTree));
+        anyhow::ensure!(!d.iter().any(Diag::is_error), "{name}.ts for {}: {d:?}", t.event);
+        let made = made.ok_or_else(|| anyhow::anyhow!("{name}.ts made no workflow for {}", t.event))?;
+        let (want, got) = (planned(yaml.clone(), &t.event)?, planned(made, &t.event)?);
+        if let Some(at) = differs(&got, &want, "") {
+            return Ok(Some((t.event.clone(), at, want)));
+        }
+    }
+    Ok(None)
 }
 
 /// W29-AC25: kiln's own workflows, each also written as a TypeScript program (`ci.ts` by hand,
-/// the rest by `translate.mjs`), make the workflows their YAML does: the same model, ranges left
-/// out, so every event plans alike.
+/// the rest by `translate.mjs`), make the workflows their YAML does (the same model, ranges and
+/// the file's path left out) and plan as it does for every event its triggers name: legs, jobs,
+/// steps, needs, matrix combinations, conditions and routing.
 #[test]
-fn w29_ac25_kilns_workflows_in_typescript_make_what_their_yaml_does() -> anyhow::Result<()> {
+fn w29_ac25_kilns_workflows_in_typescript_plan_as_their_yaml_does() -> anyhow::Result<()> {
     for name in ["bench", "ci", "custody-lab", "e2e", "image", "release", "sim", "stress", "wire-lab"] {
-        let (want, ts) = kilns(name)?;
-        let (got, d) = workflow(&format!(".kiln/{name}.ts"), &ts, &json!({ "ref": "refs/heads/main" }), Arc::new(NoTree));
+        let (yaml, ts) = kilns(name)?;
+        let (got, d) = workflow(&format!(".kiln/{name}.ts"), &ts, &payload("push"), Arc::new(NoTree));
         assert!(!d.iter().any(Diag::is_error), "{name}.ts: {d:?}");
-        let got = model(got.as_ref())?;
+        let (got, want) = (model(got.as_ref())?, model(Some(&yaml))?);
         assert!(differs(&got, &want, "").is_none(), "{name}.ts makes another workflow from {:?} on", differs(&got, &want, ""));
+        let at = first_difference(name, &yaml, &ts)?;
+        assert!(at.is_none(), "{name}.ts plans otherwise: {:?}", at.map(|(event, at, _)| (event, at)));
     }
     Ok(())
 }
 
-/// W29-AC25: a step of ci.ts changed, the comparison names the job and the step.
+/// W29-AC25: a step of ci.ts changed, the comparison of the plans names the job and the step.
 #[test]
 fn w29_ac25_a_changed_step_is_named() -> anyhow::Result<()> {
-    let (want, ts) = kilns("ci")?;
+    let (yaml, ts) = kilns("ci")?;
     let changed = ts.replace("cargo test --locked --no-fail-fast", "cargo test --locked");
-    let (got, _) = workflow(".kiln/ci.ts", &changed, &json!({}), Arc::new(NoTree));
-    let at = differs(&model(got.as_ref())?, &want, "").unwrap_or_default();
-    let job = at.strip_prefix("jobs[").and_then(|r| r.split_once(']')).and_then(|(i, _)| i.parse::<usize>().ok()).and_then(|i| want.pointer(&format!("/jobs/{i}/id")).cloned());
-    assert_eq!((job, at.contains(".steps[3].")), (Some(json!("rust")), true), "{at}");
+    anyhow::ensure!(changed != ts, "ci.ts has no such step");
+    let (event, at, want) = first_difference("ci", &yaml, &changed)?.ok_or_else(|| anyhow::anyhow!("the changed step went unseen"))?;
+    let leg = at.strip_prefix("legs[").and_then(|r| r.split_once(']')).and_then(|(i, _)| i.parse::<usize>().ok());
+    let job = leg.and_then(|i| want.pointer(&format!("/legs/{i}/job")).cloned());
+    assert_eq!((job, at.contains(".def.steps[3].")), (Some(json!("rust")), true), "{event}: {at}");
     Ok(())
 }
