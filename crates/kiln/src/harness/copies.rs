@@ -691,7 +691,7 @@ impl Mirror {
         };
         if whole {
             let kept: std::collections::HashSet<super::registry::FileRef<'_>> = set.iter().map(super::registry::file_ref).collect();
-            files.retain(|f| kept.contains(&super::registry::file_ref(f)));
+            files.retain(|f| kept.contains(&f.file()));
         }
         merge_changes(&mut files, set, if whole { &[] } else { gone.as_slice() });
         self.changes = Some(Arc::new(files));
@@ -770,8 +770,7 @@ impl Mirror {
         let rev = self.rev;
         if let Some(i) = self.index.get(id).copied() {
             self.events.change(i, |ev| {
-                if let Some(Value::String(s)) = Arc::make_mut(&mut ev.entry).value_mut().get_mut("text") {
-                    s.push_str(text);
+                if Arc::make_mut(&mut ev.entry).append_text(text) {
                     ev.at = rev;
                 }
             });
