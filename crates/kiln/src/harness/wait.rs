@@ -214,8 +214,10 @@ pub fn claim(id: &str) -> bool {
 /// another agent waits behind its turn ([`mail`]).
 pub async fn wait(hub: &Hub, ids: &[String], until: Until, any: bool, timeout: Duration, waiter: Option<&Waiter>) -> Value {
     // Listening before the first look: a change between the two isn't missed. An agent's info changing,
-    // or its end, is on the sessions' own ring (`Hub::harness_events`; goal 4, plan 01a1a59c2a9c step 5).
-    let mut events = hub.harness_events.subscribe();
+    // or its end, is on its owner's lane of the sessions' events (`Hub::harness_events`; goal 4, plan
+    // 01a1a59c2a9c step 5), each lane holding its share of what the hub's ring held. None to be had (the
+    // runtime's channels all in use): it looks again at each `RECHECK`.
+    let mut events = hub.harness_events.subscribe(crate::hub::EVENTS.div_ceil(hub.harness_events.lanes())).ok();
     let started = Instant::now();
     let timeout = timeout.min(MAX);
     let first: Vec<Option<Info>> = ids.iter().map(|id| hub.harness.info(id)).collect();
@@ -250,6 +252,10 @@ pub async fn wait(hub: &Hub, ids: &[String], until: Until, any: bool, timeout: D
             if rest.is_zero() {
                 break;
             }
+            let Some(events) = events.as_mut() else {
+                crate::rt::sleep(rest).await;
+                break;
+            };
             match crate::rt::timeout(rest, events.recv()).await {
                 Ok(Ok(ev)) if ids.iter().map(String::as_str).chain(waiter.map(|w| w.id.as_str())).any(|id| ev.contains(id)) => break,
                 Ok(Ok(_)) => {}
