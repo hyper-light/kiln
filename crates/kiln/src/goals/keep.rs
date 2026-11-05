@@ -23,7 +23,7 @@
 //! at most [`MAX_KEPT`] turns in a row since a person last said something, and stops sooner when
 //! the turns it starts do no work.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::LazyLock;
 
 use kiln_seams::HarnessPort;
@@ -228,9 +228,17 @@ where
     }
 }
 
-/// Forget agents that are gone.
-pub fn retain(ids: &[String]) {
-    SEEN.lock().retain(|id, _| ids.contains(id));
+/// Forget agents that are gone: those not among `ids` (every agent known now). Each looked up in a
+/// set of the ids, made before `SEEN` is held, not by a scan of them (goal 9, plan 01a1a87b2cec
+/// step 3: O(N²) in one poll of the goal driver).
+pub fn retain<'a>(ids: impl IntoIterator<Item = &'a str>) {
+    let known: HashSet<&str> = ids.into_iter().collect();
+    retain_known(&mut SEEN.lock(), &known);
+}
+
+/// [`retain`] on `seen`: what isn't among `known` goes.
+fn retain_known(seen: &mut HashMap<String, Seen>, known: &HashSet<&str>) {
+    seen.retain(|id, _| known.contains(id.as_str()));
 }
 
 #[cfg(test)]
@@ -356,6 +364,26 @@ mod tests {
             assert!(!matches!(after_turn(ended("done", now - 12_000), said, (0, 0), now), Next::Keep { .. }), "{said}");
         }
         assert!(message(&Why::Promised("Next, I'll wire the UI".into())).starts_with("You said you'd carry on (\"Next, I'll wire the UI\")"));
+    }
+
+    /// Goal 9, plan 01a1a87b2cec step 3: what `retain` keeps, each agent looked up in a set of the
+    /// ids, is what the scan of the ids for each agent kept: ids given twice, ids of agents never
+    /// seen and an empty one among them (a map: what it keeps, in no order of its own).
+    #[test]
+    fn g9_s3_retain_keeps_what_a_scan_of_the_ids_kept() {
+        let seen: HashMap<String, Seen> = ["a", "b", "c", "d", "e"].into_iter().map(|id| (id.to_owned(), Seen::default())).collect();
+        let ids: Vec<String> = ["d", "b", "d", "x", "b", ""].into_iter().map(str::to_owned).collect();
+        let mut scanned = seen.clone();
+        scanned.retain(|id, _| ids.contains(id));
+        let mut kept = seen;
+        let known: HashSet<&str> = ids.iter().map(String::as_str).collect();
+        retain_known(&mut kept, &known);
+        let names = |m: &HashMap<String, Seen>| m.keys().cloned().collect::<std::collections::BTreeSet<String>>();
+        let want: std::collections::BTreeSet<String> = ["b", "d"].into_iter().map(str::to_owned).collect();
+        assert_eq!(names(&kept), names(&scanned));
+        assert_eq!(names(&kept), want);
+        retain_known(&mut kept, &HashSet::new());
+        assert!(kept.is_empty(), "no agent known now: every one goes");
     }
 
     #[test]

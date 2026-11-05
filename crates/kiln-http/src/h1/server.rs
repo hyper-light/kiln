@@ -164,8 +164,6 @@ struct Conn<I> {
     /// The client closed its sending side.
     eof: bool,
     cfg: Builder,
-    /// The last response's header map, emptied, for the next request's headers to take.
-    spare: Option<Box<HeaderMap>>,
     /// When the latest read brought bytes, and when the next request's head began arriving: what
     /// its [`Received`] says.
     read_at: Option<Instant>,
@@ -175,7 +173,7 @@ struct Conn<I> {
 impl<I> Conn<I> {
     fn new(cfg: Builder, io: I, read: Bytes) -> Conn<I> {
         let read_at = (!read.is_empty()).then(Instant::now);
-        Conn { io, rbuf: BytesMut::from(&read[..]), wbuf: WriteBuf::default(), eof: false, cfg, spare: None, read_at, head_at: None }
+        Conn { io, rbuf: BytesMut::from(&read[..]), wbuf: WriteBuf::default(), eof: false, cfg, read_at, head_at: None }
     }
 
     /// When the request whose head was just taken arrived.
@@ -201,7 +199,7 @@ impl<I: AsyncRead + AsyncWrite + Unpin> Conn<I> {
     /// before the connection waits for more to read.
     fn poll_head(&mut self, cx: &mut Context<'_>, timer: &mut Option<Sleep>) -> Poll<Result<Option<RequestHead>, Error>> {
         loop {
-            if let Some(h) = head::parse_request(&mut self.rbuf, self.cfg.max_head, &mut self.spare)? {
+            if let Some(h) = head::parse_request(&mut self.rbuf, self.cfg.max_head)? {
                 return Poll::Ready(Ok(Some(h)));
             }
             if self.eof {
@@ -439,7 +437,8 @@ fn begin<I: AsyncRead + AsyncWrite + Unpin>(c: &mut Conn<I>, h: RequestHead) -> 
     (req, ex)
 }
 
-/// Encodes a response's head: its body, and how that goes out (`None`: it doesn't).
+/// Encodes a response's head: its body, and how that goes out (`None`: it doesn't). Its header map, its head written,
+/// is given back for a later request's headers (`crate::maps`).
 fn answer<I: AsyncRead + AsyncWrite + Unpin, B: SendBody>(c: &mut Conn<I>, resp: http::Response<B>, ex: &mut Exchange) -> (B, Option<Out>, StatusCode) {
     let (parts, body) = resp.into_parts();
     let date = date::now();
@@ -452,9 +451,7 @@ fn answer<I: AsyncRead + AsyncWrite + Unpin, B: SendBody>(c: &mut Conn<I>, resp:
     };
     let framed = head::encode_response(c.wbuf.tail(), parts.status, &parts.headers, body.size_hint().exact(), head::Answering { method, version: ex.version, keep_alive: ex.keep_alive }, &date);
     ex.keep_alive &= !framed.close;
-    if parts.headers.capacity() > 0 {
-        c.spare = Some(Box::new(parts.headers));
-    }
+    crate::maps::give(parts.headers);
     let out = (framed.framing != Framing::Empty).then(|| Out::new(framed.framing));
     (body, out, parts.status)
 }
@@ -530,7 +527,6 @@ where
         if c.rbuf.is_empty() {
             // Going idle: the connection holds nothing it doesn't need, not even its read buffer.
             slot = None;
-            c.spare = None;
             c.rbuf = BytesMut::new();
         }
     };

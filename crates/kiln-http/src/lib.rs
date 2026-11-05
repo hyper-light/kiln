@@ -20,6 +20,7 @@ mod error;
 pub(crate) mod h1;
 pub(crate) mod h2;
 mod io;
+mod maps;
 pub(crate) mod rt;
 pub mod service;
 pub mod upgrade;

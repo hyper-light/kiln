@@ -25,6 +25,7 @@
 
 pub mod about;
 pub mod acp;
+pub mod answers;
 pub mod antigravity;
 pub mod archive;
 pub mod asked;

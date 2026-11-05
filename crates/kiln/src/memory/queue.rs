@@ -142,15 +142,21 @@ impl<A: Weigh, B: Weigh> Weigh for (A, B) {
 }
 
 /// One wait's place among a queue's waiters: what wakes it (its task, or its thread parked in a blocking
-/// call), and whether it's in the list now (listed once a wait, however often the wait is polled).
-struct Place {
+/// call), and whether it's in the list now (listed once a wait, however often the wait is polled). Also
+/// `crate::rt::Notify`'s and `crate::rt::Shutdown`'s (goal 5, plan 01a1a59c2aae, its top goal).
+pub(crate) struct Place {
     waker: AtomicWaker,
     listed: AtomicBool,
 }
 
 impl Place {
-    fn new() -> Arc<Self> {
+    pub(crate) fn new() -> Arc<Self> {
         Arc::new(Self { waker: AtomicWaker::new(), listed: AtomicBool::new(false) })
+    }
+
+    /// Its wait is over: the waker it held goes, so a wake that finds it listed still wakes no one.
+    pub(crate) fn let_go(&self) {
+        drop(self.waker.take());
     }
 }
 
@@ -159,17 +165,23 @@ impl Place {
 /// fence on each side (a Dekker handshake) means one of the two sees the other, so no wake is lost. A place
 /// listed by a wait that found what it waited for at its look again stays until the next wake, which polls
 /// its task for nothing: each wait lists one place at a time, and every wake takes them all.
-struct Waiters {
+pub(crate) struct Waiters {
     list: ConcurrentQueue<Arc<Place>>,
 }
 
 impl Waiters {
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self { list: ConcurrentQueue::unbounded() }
     }
 
+    /// How many places are listed now (a test's).
+    #[cfg(test)]
+    pub(crate) fn listed(&self) -> usize {
+        self.list.len()
+    }
+
     /// `place` waits, woken by `waker`; what the waiter looks at next is looked at after this.
-    fn wait(&self, place: &Arc<Place>, waker: &Waker) {
+    pub(crate) fn wait(&self, place: &Arc<Place>, waker: &Waker) {
         place.waker.register(waker);
         if !place.listed.swap(true, Ordering::AcqRel) {
             // Unbounded and never closed: the push always goes.
@@ -179,7 +191,7 @@ impl Waiters {
     }
 
     /// Wakes every place listed now: what the waker made (an item in, room let go) is seen by each.
-    fn wake(&self) {
+    pub(crate) fn wake(&self) {
         fence(Ordering::SeqCst);
         for _ in 0..self.list.len() {
             let Ok(place) = self.list.pop() else { break };

@@ -29,6 +29,21 @@ use crate::wire::unread::{Code, Wire};
 
 mod build;
 
+/// The server's secrets as `cfg` says them, a `file:` one read from its file (blocking: [`Hub::job_secrets`] reads them
+/// off the shards).
+fn secrets_of(cfg: &Config) -> Vec<(String, String)> {
+    cfg.secrets
+        .iter()
+        .map(|(k, v)| {
+            let val = match v.strip_prefix("file:") {
+                Some(path) => std::fs::read_to_string(path).map(|s| s.trim().to_owned()).unwrap_or_default(),
+                None => v.clone(),
+            };
+            (k.clone(), val)
+        })
+        .collect()
+}
+
 /// How long a persistent agent may be gone before its jobs are requeued.
 pub(crate) const AGENT_GRACE: Duration = Duration::from_secs(45);
 /// How often the newest runner process is reminded that an older one can be retired.
@@ -3992,33 +4007,31 @@ impl Hub {
         }
     }
 
-    /// The server's secrets, for the CI engine's trusted runs (docs/ci.md W09 narrows them).
-    pub fn ci_secrets(&self) -> Vec<(String, String)> {
-        self.secrets()
-    }
-
     /// What a job's environment gets from the server: its secrets, and where each image kiln
-    /// publishes lives (`KILN_IMAGE_<NAME>`, docs/cd-targets.md §7.1), set in the UI.
-    fn job_secrets(&self) -> Vec<(String, String)> {
-        let mut s = self.secrets();
+    /// publishes lives (`KILN_IMAGE_<NAME>`, docs/cd-targets.md §7.1), set in the UI. Those kept in files are read on the
+    /// blocking pool: each job's assignment read them on the scheduler's shard (goal 9, plan 01a1a87b2cec step 3).
+    async fn job_secrets(&self) -> Vec<(String, String)> {
+        let cfg = Arc::clone(&self.cfg);
+        let mut s = match crate::rt::blocking(move || secrets_of(&cfg)).await {
+            Ok(s) => s,
+            Err(e) => {
+                tracing::warn!(error = %format!("{e:#}"), "the server's secrets couldn't be read off the shard: read here");
+                self.secrets()
+            }
+        };
         if let Some(cd) = crate::cd::get() {
             s.extend(cd.image_env());
         }
         s
     }
 
+    /// The server's secrets, for the CI engine's trusted runs (docs/ci.md W09 narrows them).
+    pub fn ci_secrets(&self) -> Vec<(String, String)> {
+        self.secrets()
+    }
+
     fn secrets(&self) -> Vec<(String, String)> {
-        self.cfg
-            .secrets
-            .iter()
-            .map(|(k, v)| {
-                let val = match v.strip_prefix("file:") {
-                    Some(path) => std::fs::read_to_string(path).map(|s| s.trim().to_owned()).unwrap_or_default(),
-                    None => v.clone(),
-                };
-                (k.clone(), val)
-            })
-            .collect()
+        secrets_of(&self.cfg)
     }
 
     async fn schedule_once(&self) -> anyhow::Result<()> {
@@ -4032,7 +4045,11 @@ impl Hub {
         let mut runs = HashMap::new();
         let k8s = self.k8s.get().and_then(Option::as_ref);
         let mut pods_live = None;
+        // Its turns on its shard: a queue that finds no runner was walked whole in one poll, every second; one job's
+        // pick at a time now, the shard given up once its turn would pass the quantum (goal 9, plan 01a1a87b2cec step 3).
+        let mut turns = crate::rt::Turns::new();
         for job in queued {
+            turns.after().await;
             let Some(spec) = job.spec.clone() else { continue };
             if !runs.contains_key(&job.run_id) {
                 let r = self.store.run(job.run_id.clone()).await?;
@@ -4090,7 +4107,7 @@ impl Hub {
                         run_number: run.number,
                         attempt: job.attempt,
                         spec: spec.for_assignee(self.runner_caps(&agent), ephemeral),
-                        secrets: self.job_secrets(),
+                        secrets: self.job_secrets().await,
                         job_token: crate::api::job_token(&self.admin_token, &job.id),
                         server_url: self.server_url_for(&agent),
                     };

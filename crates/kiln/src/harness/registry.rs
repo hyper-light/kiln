@@ -1225,8 +1225,9 @@ pub struct Registry {
     /// them (`super::opened`).
     pub ports: super::opened::Tunnels,
     pub opened: super::opened::Openings,
-    /// Messages waiting for their session's inbox to answer (CP-T3.2), by session and message id.
-    waiting: Mutex<HashMap<(String, String), Vec<futures::channel::oneshot::Sender<Said>>>>,
+    /// Messages waiting for their session's inbox to answer (CP-T3.2), by session and message id: one owner
+    /// of their own, no lock (`super::answers`; goal 5, plan 01a1a59c2aae, its top goal).
+    answers: super::answers::Answers,
     /// The ids starts under way asked for ([`Registry::open_as`]), each until its start is done.
     opening: Rcu<std::collections::HashSet<String>>,
     /// Tests: what every session started here runs instead of its harness (a program that isn't
@@ -1412,7 +1413,7 @@ impl Registry {
             webrtc: super::webrtc::Webrtc::default(),
             ports: super::opened::Tunnels::default(),
             opened: super::opened::Openings::default(),
-            waiting: Mutex::new(HashMap::new()),
+            answers: super::answers::Answers::new(WAITING_MAX),
             opening: Rcu::default(),
             #[cfg(test)]
             test_program: Mutex::new(None),
@@ -2254,6 +2255,11 @@ impl Registry {
             m.changes_sent = None;
             changed = true;
         }
+        // The chunk its owner last read back for a change, or tried: changed where it is, should it still be compact.
+        let thawed = s.thawed();
+        // The compact chunk this update's next event changes, to be read back off the shard first (goal 9, plan
+        // 01a1a87b2cec step 3: `super::copies::Shard::want_thaw`).
+        let mut thaw = None;
         let Some(m) = s.get_mut(id) else {
             // Its events are stored all the same, as they were before a copy took them.
             if let Some(store) = store.filter(|_| matches!(u, Update::Events { .. })) {
@@ -2267,6 +2273,14 @@ impl Registry {
             }
             return None;
         };
+        // Its first event changes one in a compact chunk: nothing of it is taken yet, all of it the rest, once that chunk is
+        // read back off the shard (goal 9, plan 01a1a87b2cec step 3).
+        if let Update::Events { events } = &u
+            && let Some(c) = events.first().and_then(|e| m.thaw_for(&e.id, e.seq)).filter(|c| !std::ptr::eq(thawed.as_ptr(), Arc::as_ptr(c)))
+        {
+            s.want_thaw(id, c);
+            return Some(Ingest { from, id: id.to_owned(), u, shipped, reported: String::new() });
+        }
         m.rev = m.rev.saturating_add(1);
         match &u {
             // A whole snapshot follows (not one that goes on from what the copy has): its
@@ -2364,6 +2378,12 @@ impl Registry {
             }
             Update::Events { events } => {
                 for e in events {
+                    // One the copy has in a compact chunk: that chunk is read back off the shard before it's changed, and this
+                    // event and those after it are the rest, its owner's next (as when its turn is spent, below).
+                    if let Some(c) = m.thaw_for(&e.id, e.seq).filter(|c| !std::ptr::eq(thawed.as_ptr(), Arc::as_ptr(c))) {
+                        thaw = Some(c);
+                        break;
+                    }
                     // Written out once, for the copy and for its row alike (goal 9, plan 01a1a87b2cec step 5).
                     let entry = Arc::new(if store.is_some() {
                         Entry::of_event(e, Some(&mut |text: String| rows.push(crate::convo::rows::Row::Event(Box::new(crate::convo::rows::event_written(id, e, text))))))
@@ -2484,6 +2504,9 @@ impl Registry {
             hub.emit(&crate::wire::events::ServerEvent::HarnessClosed { id: id.to_string() });
         } else if changed && let Some(m) = s.get(id) {
             hub.emit_harness(id, m.info_encoded());
+        }
+        if let Some(c) = thaw {
+            s.want_thaw(id, c);
         }
         rest.map(|u| Ingest { from, id: id.to_owned(), u, shipped, reported: String::new() })
     }
@@ -3272,35 +3295,15 @@ impl Registry {
     }
 
     /// Waits for the answer to message `message` sent to session `id`: none when too many wait
-    /// already (it isn't waited for).
-    fn wait_for(&self, id: &str, message: &str) -> Option<futures::channel::oneshot::Receiver<Said>> {
-        let mut w = self.waiting.lock();
-        if w.len() >= WAITING_MAX {
-            // Those whose senders went away (and no answer came for) go first.
-            w.retain(|_, v| {
-                v.retain(|tx| !tx.is_canceled());
-                !v.is_empty()
-            });
-            if w.len() >= WAITING_MAX {
-                return None;
-            }
-        }
-        let (tx, rx) = futures::channel::oneshot::channel();
-        w.entry((id.to_owned(), message.to_owned())).or_default().push(tx);
-        Some(rx)
+    /// already (it isn't waited for). Its wait reaches the waits' owner before the message goes.
+    async fn wait_for(&self, id: &str, message: &str) -> Option<futures::channel::oneshot::Receiver<Said>> {
+        self.answers.wait_for(id, message).await
     }
 
     /// No longer waiting for message `message` sent to session `id`: the waits whose ends were
     /// dropped go (an answer for those still waiting still reaches them).
     fn unwait(&self, id: &str, message: &str) {
-        let mut w = self.waiting.lock();
-        let key = (id.to_owned(), message.to_owned());
-        if let Some(v) = w.get_mut(&key) {
-            v.retain(|tx| !tx.is_canceled());
-            if v.is_empty() {
-                w.remove(&key);
-            }
-        }
+        self.answers.unwait(id, message);
     }
 
     /// Session `id`'s inbox said what became of a message: whoever waits for it longest is told (each
@@ -3308,20 +3311,7 @@ impl Registry {
     /// taken and one refused, are each told their own).
     fn answered(&self, id: &str, said: Said) {
         crate::metrics::sends().said(&said);
-        let key = (id.to_owned(), said.message.clone());
-        let first = {
-            let mut w = self.waiting.lock();
-            let Some(v) = w.get_mut(&key) else { return };
-            v.retain(|tx| !tx.is_canceled());
-            let first = (!v.is_empty()).then(|| v.remove(0));
-            if v.is_empty() {
-                w.remove(&key);
-            }
-            first
-        };
-        if let Some(tx) = first {
-            let _ = tx.send(said);
-        }
+        self.answers.answered(id, said);
     }
 
     /// The answer to message `message` sent to session `id`, once it comes (by [`ANSWER_WAIT`]
@@ -3504,7 +3494,10 @@ impl Registry {
         let epoch = self.epoch_of(id);
         match loc {
             Location::Local => {
-                let wait = message.as_deref().and_then(|m| self.wait_for(id, m));
+                let wait = match message.as_deref() {
+                    Some(m) => self.wait_for(id, m).await,
+                    None => None,
+                };
                 if !self.local.command_at(id, c, Some(epoch)) {
                     // Not waited for after all: its end of the wait goes first, then the wait.
                     drop(wait);
@@ -3552,7 +3545,7 @@ impl Registry {
                     return Pending::Now(Sent::Unreachable);
                 }
                 if let Some(m) = message.filter(|_| caps & crate::proto::CAP_INBOX != 0) {
-                    let wait = self.wait_for(id, &m);
+                    let wait = self.wait_for(id, &m).await;
                     if !hub.send_to_agent(&machine, LANE_TERM, &ServerMsg::HarnessSend { session: id.to_owned(), epoch, json }).await {
                         drop(wait);
                         self.unwait(id, &m);
@@ -3602,16 +3595,21 @@ impl Registry {
         }
         let (st, i, f) = (store.clone(), id.to_owned(), from_name.clone());
         let (from_shown, to_shown) = (hub.shown(&from_name), hub.shown(to));
-        let mut pkg = crate::rt::blocking(move || crate::convo::resume::package(&st, &i, &f, cwd.as_deref(), (&from_shown, &to_shown)))
-            .await
-            .map_err(|e| format!("{e:#}"))?
-            .map_err(|e| format!("{e:#}"))?;
+        // The package, and its timeline for kiln's take of it (every event's digest), made on the blocking pool (goal 9,
+        // plan 01a1a87b2cec step 3).
+        let (mut pkg, timeline) = crate::rt::blocking(move || crate::convo::resume::package(&st, &i, &f, cwd.as_deref(), (&from_shown, &to_shown)).map(|p| {
+            let t = crate::custody::timeline(&i, p.state.epoch, &p.events);
+            (p, t)
+        }))
+        .await
+        .map_err(|e| format!("{e:#}"))?
+        .map_err(|e| format!("{e:#}"))?;
         // kiln takes it for the process that held it, which can't hand it on: the package carries
         // the take, which the receipt follows as a hand-on's (docs/ci.md W27-R08).
         let heard = hub.agents.load().get(&from_name).map(|a| a.last_seen).unwrap_or_default();
         let when = time::OffsetDateTime::from_unix_timestamp(heard).ok().and_then(|t| t.format(&time::format_description::well_known::Rfc3339).ok()).unwrap_or_else(|| "never".to_owned());
         let why = format!("resumed from kiln's copy: {} was last heard from at {when}", hub.shown(&from_name));
-        match crate::custody::take_for(&hub.store, &hub.pki, id, pkg.state.epoch, &pkg.events, &why).await {
+        match crate::custody::take_for(&hub.store, &hub.pki, id, pkg.state.epoch, timeline, &why).await {
             Ok(take) => pkg.hand_on = take,
             Err(e) => tracing::warn!(target: "kiln.custody", session = %id, error = %format!("{e:#}"), "kiln couldn't take a session it resumes from its copy: it goes on unsigned"),
         }
@@ -3893,20 +3891,20 @@ mod tests {
             let dir = tempfile::tempdir()?;
             let conversations = crate::config::Conversations { off: true, ..Default::default() };
             let r = Registry::with(dir.path().to_path_buf(), &conversations, Arc::new(kiln_seams::clock::SimClock::new()), sim_bus());
-            let gone = r.wait_for("s1", "m1");
-            let kept = r.wait_for("s1", "m1").ok_or_else(|| anyhow::anyhow!("not waited for"))?;
+            let gone = r.wait_for("s1", "m1").await;
+            let kept = r.wait_for("s1", "m1").await.ok_or_else(|| anyhow::anyhow!("not waited for"))?;
             drop(gone);
             r.unwait("s1", "m1");
-            assert_eq!(r.waiting.lock().get(&("s1".to_owned(), "m1".to_owned())).map(Vec::len), Some(1), "the one still waiting stays");
+            assert_eq!(r.answers.held().await, Some(1), "the one still waiting stays");
             let said = Said { message: "m1".into(), answer: Err(inbox::Refusal::NoSession { session: "s1".into() }) };
             r.answered("s1", said.clone());
-            assert!(r.waiting.lock().is_empty());
+            assert_eq!(r.answers.held().await, Some(0));
             assert_eq!(kept.await.ok(), Some(said));
             // Given up before any answer: nothing is left.
-            let w = r.wait_for("s2", "m2");
+            let w = r.wait_for("s2", "m2").await;
             drop(w);
             r.unwait("s2", "m2");
-            assert!(r.waiting.lock().is_empty());
+            assert_eq!(r.answers.held().await, Some(0));
             Ok(())
         })
     }
@@ -3920,15 +3918,15 @@ mod tests {
             let dir = tempfile::tempdir()?;
             let conversations = crate::config::Conversations { off: true, ..Default::default() };
             let r = Registry::with(dir.path().to_path_buf(), &conversations, Arc::new(kiln_seams::clock::SimClock::new()), sim_bus());
-            let first = r.wait_for("s1", "m1").ok_or_else(|| anyhow::anyhow!("not waited for"))?;
-            let second = r.wait_for("s1", "m1").ok_or_else(|| anyhow::anyhow!("not waited for"))?;
+            let first = r.wait_for("s1", "m1").await.ok_or_else(|| anyhow::anyhow!("not waited for"))?;
+            let second = r.wait_for("s1", "m1").await.ok_or_else(|| anyhow::anyhow!("not waited for"))?;
             let taken = Said { message: "m1".into(), answer: Ok(inbox::Answer { session: "s1".into(), message: "m1".into(), epoch: 0, at: 1, seq: 7, repeat: false }) };
             let reused = Said { message: "m1".into(), answer: Err(inbox::Refusal::Reused { session: "s1".into(), message: "m1".into() }) };
             r.answered("s1", taken.clone());
             r.answered("s1", reused.clone());
             assert_eq!(first.await.ok(), Some(taken));
             assert_eq!(second.await.ok(), Some(reused));
-            assert!(r.waiting.lock().is_empty());
+            assert_eq!(r.answers.held().await, Some(0));
             Ok(())
         })
     }
