@@ -674,12 +674,16 @@ fn w21_r15_agent_page_cold_open_budget() -> anyhow::Result<()> {
 /// the compress track's permessage-deflate: median 70,453 to 70,538 (z=gzip) and 70,444 to 70,527
 /// (no gzip), p90 166,862 to 167,052 and 166,752 to 166,954 (spreads 0.1%); a tab from before the
 /// window, median 180,380 to 180,438, p90 1,496,911 to 1,498,266 (where the rule would raise its
-/// budget from before the tracks, that one stays).
+/// budget from before the tracks, that one stays). Raised with origin/main 04b541b044f, for goal 10
+/// (plan 01a1a87b2dae step 3): a packed snapshot deflates what it writes at open time at the fast
+/// level, and only whole chunks at the default one. A window is written at open time, so z=gzip
+/// came to median 100,766 to 102,748 and p90 244,269 to 245,133, and a tab from before the window
+/// median 202,501 to 204,054 (five runs).
 const COLD_WIRE: &[(&str, &str, usize)] = &[
-    ("median", "UI (z=gzip)", 75_561),
+    ("median", "UI (z=gzip)", 111_962),
     ("median", "UI, no gzip", 75_547),
-    ("median", "whole (older)", 192_552),
-    ("p90", "UI (z=gzip)", 178_936),
+    ("median", "whole (older)", 219_903),
+    ("p90", "UI (z=gzip)", 263_160),
     ("p90", "UI, no gzip", 178_844),
     ("p90", "whole (older)", 1_604_501),
 ];
@@ -695,8 +699,9 @@ const COLD_DECODED: &[(&str, &str, usize)] = &[
     ("p90", "whole (older)", 7_685_208),
 ];
 /// Cold open, frames to `synced` (a packed snapshot's lines counted). Before the tracks: median 9,
-/// p90 33, as a tab from before the window still gets; with the window 7.
-const COLD_FRAMES: &[(&str, &str, usize)] = &[("median", "UI (z=gzip)", 8), ("median", "UI, no gzip", 8), ("median", "whole (older)", 10), ("p90", "UI (z=gzip)", 8), ("p90", "UI, no gzip", 8), ("p90", "whole (older)", 36)];
+/// p90 33; with the window 7. A tab from before the window: since goal 10 (a frame per chunk of the
+/// copy's events) median 10 and p90 41.
+const COLD_FRAMES: &[(&str, &str, usize)] = &[("median", "UI (z=gzip)", 8), ("median", "UI, no gzip", 8), ("median", "whole (older)", 10), ("p90", "UI (z=gzip)", 8), ("p90", "UI, no gzip", 8), ("p90", "whole (older)", 44)];
 
 /// Events: `run`, `job`, `run.*` and `ci_verdict` wire bytes per job of the push. Before the tracks
 /// 11,207, no spread (the first run counted only `run` and `job`: 10,250); with the events and

@@ -4444,7 +4444,8 @@ mod tests {
     }
 
     fn mirror_of(events: &[Value]) -> Mirror {
-        let mut m = Mirror::new(Info::default(), Location::Local, sim_bus());
+        // Its id is where a shard keeps it (`super::super::copies::Shard::insert`).
+        let mut m = Mirror::new(Info { id: "s".into(), ..Info::default() }, Location::Local, sim_bus());
         set_state(&mut m, json!({"status": "idle", "dropped": 0}));
         for e in events {
             took(&mut m, |m| m.upsert(Arc::new(Entry::new(e.clone()))));
