@@ -422,6 +422,9 @@ pub static ROUTES: &[Rule] = &[
     // A repository's ladder switches (W26-R17): changing them is a maintainer's.
     r("GET", "/api/repos/*/ladder", "diffs.read", At::Repo(2)),
     r("PUT", "/api/repos/*/ladder", "diffs.land", At::Repo(2)),
+    // Asking about code no agent made (W26-R07): it starts a helper, as asking an agent does
+    // (`/api/harness/**`), and reads the repository (`diffs.read`, checked there).
+    r("POST", "/api/repos/*/about", "agents.run", At::Server),
     r("DELETE", "/api/queue/*", "queue.manage", At::Entry(2)),
     // Review holds, lets go of or withdraws a land queue entry (docs/ci.md W28-R104).
     r("POST", "/api/queue/*/hold", "diffs.review", At::Entry(2)),

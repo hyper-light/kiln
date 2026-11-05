@@ -113,11 +113,12 @@ pub struct Fleet {
 }
 
 impl Fleet {
-    /// A server of `kiln` under `dir`, answering: `env` goes to it as well.
-    pub fn server(kiln: &Path, dir: &Path, env: &[(String, String)]) -> anyhow::Result<Fleet> {
+    /// A server of `kiln` under `dir`, answering: `env` goes to it as well. It runs where `place` says
+    /// (its own CPUs, its own scope `unit`), its runners where the lab does.
+    pub fn server(kiln: &Path, dir: &Path, env: &[(String, String)], place: &crate::lab::Place, unit: &str) -> anyhow::Result<Fleet> {
         let mut why = String::new();
-        for _ in 0..3 {
-            match Self::try_server(kiln, dir, env)? {
+        for attempt in 0..3 {
+            match Self::try_server(kiln, dir, env, place, &format!("{unit}-{attempt}"))? {
                 Ok(f) => return Ok(f),
                 Err(w) => why = w,
             }
@@ -125,7 +126,7 @@ impl Fleet {
         anyhow::bail!("the server didn't start: {why}")
     }
 
-    fn try_server(kiln: &Path, dir: &Path, env: &[(String, String)]) -> anyhow::Result<Result<Fleet, String>> {
+    fn try_server(kiln: &Path, dir: &Path, env: &[(String, String)], place: &crate::lab::Place, unit: &str) -> anyhow::Result<Result<Fleet, String>> {
         let (port, quic) = (free_tcp()?, free_udp()?);
         let data = dir.join("data");
         std::fs::create_dir_all(&data)?;
@@ -168,7 +169,7 @@ enabled = false
         );
         std::fs::write(dir.join("kiln.toml"), config)?;
         let log = std::fs::File::create(dir.join("server.log"))?;
-        let mut cmd = clean(Command::new(kiln));
+        let mut cmd = clean(place.server(kiln, unit));
         cmd.args(["--config", &dir.join("kiln.toml").to_string_lossy(), "server"])
             .env("HOME", &home)
             .env("KILN_MACHINE_ID", format!("lab server {}", dir.display()))

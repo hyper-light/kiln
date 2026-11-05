@@ -320,8 +320,12 @@
   .hx-diff[data-split] .hx-hunk {
     grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
   }
-  .hx-diff[data-split] :is(.hx-row, .hx-fill, .hx-fold) {
+  .hx-diff[data-split] :is(.hx-row, .hx-fill, .hx-fold, .hx-ask-row) {
     grid-row: var(--sr);
+  }
+  /* A card asking about a line spans both sides, in the row under its line's. */
+  .hx-diff[data-split] .hx-ask-row {
+    grid-column: 1 / -1;
   }
   .hx-diff[data-split] :is(.hx-row[data-kind="ctx"], .hx-fold, .hx-sep) {
     grid-column: 1 / -1;

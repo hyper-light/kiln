@@ -65,7 +65,9 @@ pub fn median(v: &mut [f64]) -> Option<f64> {
 }
 
 /// The bootstrap 95 % interval of `median(current) / median(baseline)`, from `rounds` resamples
-/// of each side. `None` without values on both sides, or a baseline whose median is zero.
+/// of each side. `None` without values on both sides, a baseline whose median is zero, or when
+/// every resampled baseline median is zero, so no ratio could be drawn (W16-R08: no interval, no
+/// verdict).
 pub fn ratio_interval(baseline: &[f64], current: &[f64], rounds: usize, seed: u64) -> Option<Interval> {
     let finite = |v: &[f64]| v.iter().copied().filter(|x| x.is_finite()).collect::<Vec<f64>>();
     let (base, cur) = (finite(baseline), finite(current));
@@ -86,7 +88,10 @@ pub fn ratio_interval(baseline: &[f64], current: &[f64], rounds: usize, seed: u6
         }
     }
     ratios.sort_by(f64::total_cmp);
-    let at = |p: f64| ratios.get(((ratios.len() - 1) as f64 * p).round() as usize).copied();
+    // W16-R08: every resampled baseline median may be zero (a baseline mostly of zeros), which
+    // leaves no ratio to read a percentile from; that is "can't say", not a position below zero.
+    let last = ratios.len().checked_sub(1)?;
+    let at = |p: f64| ratios.get((last as f64 * p).round() as usize).copied();
     Some(Interval { low: at(0.025)?, mid, high: at(0.975)? })
 }
 
@@ -135,5 +140,27 @@ mod tests {
         assert!(matches!(judge(i, 0.05, Better::Higher), Verdict::Improved { .. }));
         assert_eq!(ratio_interval(&[], &slow, 100, 1), None);
         assert_eq!(ratio_interval(&[0.0, 0.0], &slow, 100, 1), None);
+    }
+
+    /// W16-R08: a baseline whose median isn't zero but whose every resample's median is (seed 62
+    /// draws `[0, 0]` from `[0, 1]` in all four rounds) leaves no ratio, so no interval rather
+    /// than a percentile read below index zero.
+    #[test]
+    fn w16_r08_ratio_interval_all_zero_baseline_is_undecided() {
+        assert_eq!(ratio_interval(&[0.0, 1.0], &[1.0, 2.0, 3.0], 4, 62), None);
+        // The same inputs with other seeds draw some non-zero medians and give an interval.
+        assert!((0..16).any(|seed| ratio_interval(&[0.0, 1.0], &[1.0, 2.0, 3.0], 4, seed).is_some()));
+    }
+
+    /// W16-R08: empty inputs, inputs with no finite value and zero rounds give no interval or one,
+    /// never a panic.
+    #[test]
+    fn w16_r08_ratio_interval_empty_inputs_are_undecided() {
+        assert_eq!(ratio_interval(&[], &[], 100, 1), None);
+        assert_eq!(ratio_interval(&[1.0, 2.0], &[], 100, 1), None);
+        assert_eq!(ratio_interval(&[], &[1.0, 2.0], 100, 1), None);
+        assert_eq!(ratio_interval(&[f64::NAN, f64::INFINITY], &[1.0, 2.0], 100, 1), None);
+        assert_eq!(ratio_interval(&[1.0, 2.0], &[f64::NAN], 100, 1), None);
+        assert!(ratio_interval(&[1.0, 2.0], &[1.0, 2.0], 0, 1).is_some());
     }
 }

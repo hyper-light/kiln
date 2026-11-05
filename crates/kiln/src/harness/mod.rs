@@ -13,7 +13,8 @@
 //! * [`host`] — a machine's sessions: limits, commands, continuing them after a restart.
 //! * [`limit`] — how many agent sessions a machine runs at once: set from the server, in its config,
 //!   or kiln's default.
-//! * [`registry`] — the server's mirror of every session, for any number of viewers.
+//! * [`registry`] — the server's copy of every session, for any number of viewers.
+//! * [`copies`] — each session's copy, owned by one shard and read from the views it publishes.
 //! * [`lineage`] — agents an agent starts: its children, held to no more than it has.
 //! * [`ops`] — the `agents.*` operations (HTTP, MCP, code mode, the CLI).
 //! * [`wait`] — where agents stand, and waiting for them to settle.
@@ -33,6 +34,7 @@ pub mod carry;
 pub mod claude;
 pub mod cli;
 pub mod codex;
+pub mod copies;
 pub mod core;
 pub mod diff;
 pub mod elicit;
@@ -55,6 +57,7 @@ pub mod model;
 pub mod moving;
 pub mod opened;
 pub mod ops;
+pub mod packed;
 pub mod pause;
 pub mod port;
 pub mod queued;

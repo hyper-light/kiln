@@ -428,7 +428,7 @@ async fn route(hub: Arc<Hub>, req: Request) -> R {
             return Ok(crate::observe::cloud::push::pubsub(req, ok).await);
         }
         // A snapshot's file for a runner's replica, with that machine's token (`crate::observe`).
-        (&Method::GET, ["api", "observe", "v1", "snapshot", snap, file]) => return crate::observe::api::snapshot(snap, file, &req).map_err(|(c, m)| err(c, m)),
+        (&Method::GET, ["api", "observe", "v1", "snapshot", snap, file]) => return crate::observe::api::snapshot(snap, file, &req, |m| hub.machine_of(m)).map_err(|(c, m)| err(c, m)),
         (&Method::GET, ["metrics"]) => return Ok(metrics_handler(&hub, req.headers())),
         (&Method::GET, ["healthz"]) => return Ok(srv::text(StatusCode::OK, "ok")),
         (&Method::GET, ["readyz"]) => return Ok(boxed(|| readyz(&hub)).await),
@@ -499,7 +499,17 @@ pub(crate) fn boxed<'a, F: Future + Send + 'a>(make: impl FnOnce() -> F) -> Pin<
 async fn authorized(hub: Arc<Hub>, caller: crate::authz::Caller, req: Request) -> R {
     let method = req.method().clone();
     let path = req.uri().path().to_owned();
-    let seg = segments(&path);
+    let mut seg = segments(&path);
+    // A runner the path names by a name people see (its label, a name its certificate carried
+    // from before) is the machine id kiln keys it by (docs/machines.md, "One record a machine").
+    if let [api, kind, name, ..] = seg.as_mut_slice()
+        && api == "api"
+        && (kind == "runners" || kind == "agents")
+        && !["enroll", "instance", "rekey", "tunnel", "join"].contains(&name.as_str())
+        && let Some(id) = hub.machine_named(name)
+    {
+        *name = id;
+    }
     let s: Vec<&str> = seg.iter().map(String::as_str).collect();
     let q = srv::query(&req);
     if !caller.is_owner() {
@@ -616,7 +626,7 @@ async fn authorized(hub: Arc<Hub>, caller: crate::authz::Caller, req: Request) -
             .map_err(|(c, m)| err(c, m))
         }
         // W14: diffs and stacks.
-        (_, ["api", "diffs" | "change-requests" | "stacks" | "comments" | "review" | "queue", ..]) | (&Method::GET, ["api", "repos", _, "diffs" | "queue" | "change-requests"] | ["api", "repos", _, "lands", _]) | (&Method::GET | &Method::PUT, ["api", "repos", _, "agent-fixes" | "ladder"]) | (&Method::POST, ["api", "repos", _, "change-requests" | "submit"]) => {
+        (_, ["api", "diffs" | "change-requests" | "stacks" | "comments" | "review" | "queue", ..]) | (&Method::GET, ["api", "repos", _, "diffs" | "queue" | "change-requests"] | ["api", "repos", _, "lands", _]) | (&Method::GET | &Method::PUT, ["api", "repos", _, "agent-fixes" | "ladder"]) | (&Method::POST, ["api", "repos", _, "change-requests" | "submit" | "about"]) => {
             let segs: Vec<&str> = s.iter().skip(1).copied().collect();
             let body: serde_json::Value = if matches!(method, Method::POST | Method::PATCH | Method::PUT) { boxed(|| srv::body_json(req.into_body(), JSON_LIMIT)).await.unwrap_or(serde_json::Value::Null) } else { serde_json::Value::Null };
             boxed(|| crate::ci::diffs::route(&hub, &method, &segs, &q, &caller, &body)).await.map_err(|(c, m)| err(c, m))
@@ -1221,10 +1231,11 @@ async fn authorized(hub: Arc<Hub>, caller: crate::authz::Caller, req: Request) -
         }
         (&Method::GET, ["api", "harness", "kinds"]) => Ok(harness_kinds(&hub, &q)),
         (&Method::GET, ["api", "harness", "workspaces"]) => Ok(boxed(|| harness_workspaces(&hub)).await),
-        (&Method::GET, ["api", "harness", "sessions"]) => Ok(srv::json(StatusCode::OK, &boxed(|| crate::harness::lineage::seen(&hub, &caller, hub.harness.list())).await)),
+        (&Method::GET, ["api", "harness", "sessions"]) => Ok(boxed(|| harness_sessions(&hub, &caller)).await),
         (&Method::POST, ["api", "harness", "sessions"]) => boxed(|| harness_open(&hub, req)).await,
-        (&Method::GET, ["api", "harness", "sessions", id]) => match hub.harness.list().into_iter().find(|i| i.id == *id) {
-            Some(info) => Ok(srv::json(StatusCode::OK, &info)),
+        // As its owner encoded it once (goal 10, plan 01a1a87b2dae step 2).
+        (&Method::GET, ["api", "harness", "sessions", id]) => match hub.harness.info_json(id) {
+            Some(info) => Ok(pre_encoded(info)),
             None => Err(err(StatusCode::NOT_FOUND, "no such agent session")),
         },
         (&Method::DELETE, ["api", "harness", "sessions", id]) => {
@@ -1874,6 +1885,8 @@ async fn ai_takeover(hub: &Hub, caller: &crate::authz::Caller, machine: &str, pi
     let Some(found) = found else {
         return Err(err(StatusCode::NOT_FOUND, "no such session on that machine (it may have ended: resume it with spec.resume)"));
     };
+    // Before anything of it is ended: refused here, it goes on running where it is.
+    let target = found_target(hub, caller, machine, "take over a session found on that machine")?;
     let held = found.terminal.as_deref().is_some_and(|t| hub.terminals.get(t).is_some());
     let spec = match (takeover_on(hub, machine, found.takeover(held)), found.takeover_spec(held)) {
         (TakeOver::Ready, Some(spec)) => spec,
@@ -1896,7 +1909,7 @@ async fn ai_takeover(hub: &Hub, caller: &crate::authz::Caller, machine: &str, pi
     }
     let how = if spec.takeover_stop { ", ended there" } else { "" };
     hub.store.audit("admin".into(), "agent.takeover".into(), format!("{} (process {pid}) on {machine}{how}", found.tool)).await;
-    let infos = hub.harness.open(hub, &format!("agent:{machine}"), spec, 1).await.map_err(|e| err(StatusCode::BAD_REQUEST, format!("{e:#}")))?;
+    let infos = hub.harness.open(hub, &target, spec, 1).await.map_err(|e| err(StatusCode::BAD_REQUEST, format!("{e:#}")))?;
     opened_by(hub, caller, &infos).await;
     Ok(srv::json(StatusCode::OK, &infos))
 }
@@ -1914,6 +1927,20 @@ async fn opened_by(hub: &Hub, caller: &crate::authz::Caller, infos: &[crate::har
             let _ = hub.store.kv_set(crate::mcp::opened_by_key(&i.id), p.clone()).await;
         }
     }
+}
+
+/// Where a session found on `machine` continues as an agent: on that machine's runner, except the
+/// server's own, which runs no agents (`crate::harness::limit`): they're the server's (`local`), on
+/// the same machine, under the server's right to run them.
+fn found_target(hub: &Hub, caller: &crate::authz::Caller, machine: &str, what: &str) -> Result<String, ApiError> {
+    if !crate::harness::limit::own(hub, machine) {
+        return Ok(format!("agent:{machine}"));
+    }
+    may_run_on(caller, "local", what)?;
+    if !hub.cfg.terminal.enabled {
+        return Err(err(StatusCode::FORBIDDEN, "terminals (and so agents) are disabled on this server"));
+    }
+    Ok("local".to_owned())
 }
 
 /// [`crate::harness::lineage::may_run_on`], as the API answers it.
@@ -1939,8 +1966,9 @@ async fn ai_fork(hub: &Hub, caller: &crate::authz::Caller, machine: &str, pid: &
             err(StatusCode::BAD_REQUEST, format!("kiln cannot branch a {} session", found.tool))
         });
     };
+    let target = found_target(hub, caller, machine, "branch a session found on that machine")?;
     hub.store.audit("admin".into(), "agent.fork".into(), format!("{} (process {pid}) on {machine}", found.tool)).await;
-    let infos = hub.harness.open(hub, &format!("agent:{machine}"), spec, 1).await.map_err(|e| err(StatusCode::BAD_REQUEST, format!("{e:#}")))?;
+    let infos = hub.harness.open(hub, &target, spec, 1).await.map_err(|e| err(StatusCode::BAD_REQUEST, format!("{e:#}")))?;
     opened_by(hub, caller, &infos).await;
     Ok(srv::json(StatusCode::OK, &infos))
 }
@@ -1996,9 +2024,8 @@ async fn accounts_input(id: &str, req: Request) -> R {
 
 /// Whether a blob request carries the token of the machine it names (`?machine=`), or an admin's.
 fn sync_token_ok(hub: &Hub, req: &Request) -> bool {
-    let q = srv::query(req);
-    let machine = q.get("machine").map_or("", String::as_str);
-    (!machine.is_empty() && bearer(req.headers()).is_some_and(|t| crate::util::ct_eq(t.as_bytes(), hub.sync.token(machine).as_bytes())))
+    let machine = sync_machine(hub, req);
+    (!machine.is_empty() && bearer(req.headers()).is_some_and(|t| crate::util::ct_eq(t.as_bytes(), hub.sync.token(&machine).as_bytes())))
         || authed(hub, req.headers())
 }
 
@@ -2023,9 +2050,10 @@ fn sync_blob_counted(machine: &str, direction: &str, result: &str, bytes: u64) {
     }
 }
 
-/// The machine a blob request names.
-fn sync_machine(req: &Request) -> String {
-    srv::query(req).get("machine").cloned().unwrap_or_default()
+/// The machine a blob request names: by its id, whatever name the runner's certificate carries
+/// (docs/machines.md, "One record a machine").
+fn sync_machine(hub: &Hub, req: &Request) -> String {
+    srv::query(req).get("machine").filter(|m| !m.is_empty()).map(|m| hub.machine_of(m)).unwrap_or_default()
 }
 
 /// Copies of kiln.db for learners are made one at a time (each reads the whole database).
@@ -2037,7 +2065,7 @@ static CLUSTER_COPIES: async_lock::Semaphore = async_lock::Semaphore::new(1);
 /// saying so in a header (`crate::custody::cluster::COPY_HEADER`; docs/ci.md W27-R08).
 async fn cluster_copy(hub: &Hub, req: &Request) -> R {
     let q = srv::query(req);
-    let machine = q.get("machine").cloned().unwrap_or_default();
+    let machine = q.get("machine").map(|m| hub.machine_of(m)).unwrap_or_default();
     let instance = q.get("instance").filter(|i| !i.is_empty()).cloned();
     let theirs = !machine.is_empty() && bearer(req.headers()).is_some_and(|t| crate::util::ct_eq(t.as_bytes(), crate::store::learner::token(&hub.admin_token, &machine).as_bytes()));
     if !theirs && !authed(hub, req.headers()) {
@@ -2131,7 +2159,7 @@ fn sync_blob_get(hub: &Hub, hash: &str, req: &Request) -> R {
         sync_blob_counted("", direction, "unauthorized", 0);
         return Err(err(StatusCode::UNAUTHORIZED, "bad sync token"));
     }
-    let machine = sync_machine(req);
+    let machine = sync_machine(hub, req);
     let contents = hub.sync.contents();
     if req.method() == Method::HEAD {
         let held = contents.has(hash);
@@ -2234,7 +2262,7 @@ async fn sync_blob_put(hub: &Hub, hash: &str, req: Request) -> R {
         sync_blob_counted("", "up", "unauthorized", 0);
         return Err(err(StatusCode::UNAUTHORIZED, "bad sync token"));
     }
-    let machine = sync_machine(&req);
+    let machine = sync_machine(hub, &req);
     let counted = |result: &str, bytes: u64| sync_blob_counted(&machine, "up", result, bytes);
     let contents = hub.sync.contents();
     if !crate::sync::blobs::valid_hash(hash) {
@@ -2386,7 +2414,7 @@ const SYNC_BUNDLE_MAX: u64 = 64 << 30;
 /// A bundle's request: the machine it names (`?machine=`), when it carries that machine's token.
 fn bundle_machine(hub: &Hub, req: &Request) -> Option<String> {
     let q = srv::query(req);
-    let machine = q.get("machine").filter(|m| !m.is_empty())?.clone();
+    let machine = hub.machine_of(q.get("machine").filter(|m| !m.is_empty())?);
     bearer(req.headers()).is_some_and(|t| crate::util::ct_eq(t.as_bytes(), hub.sync.token(&machine).as_bytes())).then_some(machine)
 }
 
@@ -3368,6 +3396,7 @@ async fn get_artifacts(hub: &Hub, id: &str) -> R {
 // ------------------------------------------------------------------ agents
 
 async fn forget_agent(hub: &Hub, name: &str, by: &str) -> R {
+    let name = &hub.machine_of(name);
     hub.forget_agent(name, by).await?;
     hub.store.audit(by.to_owned(), "agent.forget".into(), name.to_owned()).await;
     Ok(srv::status(StatusCode::NO_CONTENT))
@@ -3630,6 +3659,10 @@ async fn enroll(hub: &Hub, req: Request) -> R {
     // by its machine id when it sent one, shown by the name it asked for unless another machine
     // has it. A job's pod has its pod's name.
     let (name, label) = if persistent || outpost {
+        // Registered by its machine id, or not at all (docs/machines.md, "One record a machine").
+        if crate::join::machine_key(r.machine_id.as_deref()).is_none() {
+            return Err(err(StatusCode::BAD_REQUEST, crate::join::NO_MACHINE_ID));
+        }
         let (name, label) = name_and_label(hub, &name, &r.hostname, crate::join::clean_machine_id(r.machine_id.as_deref()).as_deref()).await?;
         if let Some(why) = a_copy_of_a_connected_machine(hub, &name) {
             return Err(err(StatusCode::CONFLICT, why));
@@ -3699,6 +3732,20 @@ async fn enroll_instance(hub: &Hub, req: Request) -> R {
             return Err(err(StatusCode::FORBIDDEN, format!("{e:#}")));
         }
     };
+    // A process of a machine is the machine's, by its id (docs/machines.md, "One record a
+    // machine"): one whose certificate carries a name from before gets its certificate for the id.
+    let id = hub.machine_of(&name);
+    if !crate::join::is_machine_key(&id) {
+        return Err(err(StatusCode::FORBIDDEN, format!("{name} never said its machine id, so kiln can't tell which machine this process is of: start its runner once so it says, or {}", crate::join::NO_MACHINE_ID)));
+    }
+    let (name, cert) = if id == name {
+        (name, cert)
+    } else {
+        match hub.pki.sign_moved(&r.cert_pem, &r.csr, &id) {
+            Ok((_, cert)) => (id, cert),
+            Err(e) => return Err(err(StatusCode::FORBIDDEN, format!("{e:#}"))),
+        }
+    };
     // Only machines this server still knows: a forgotten (revoked) one must enroll again.
     let known = hub.store.agents().await.map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")))?.iter().any(|a| a.name == name);
     if !known {
@@ -3718,8 +3765,10 @@ async fn enroll_instance(hub: &Hub, req: Request) -> R {
 /// key, as `/api/agents/instance`'s does ([`crate::pki::Pki::sign_moved`]). What kiln kept under its
 /// name goes to the id ([`Hub::move_runner`]), its name becomes its label, and the answer carries
 /// its certificate for the id. Refused for a machine this server doesn't know, for an id other than
-/// the one its facts said, for an id another runner is known by, and while a process of it is
-/// connected (what it holds would move from under it).
+/// the one its facts said, for an id a connected runner is known by or a connected record of the
+/// machine says it is, and while a process of it is connected (what it holds would move from under
+/// it). An id known already, not connected, is the same machine's second record: the two merge,
+/// and every other record of the machine not connected folds in with them ([`Hub::fold_duplicates`]).
 async fn rekey_agent(hub: &Hub, req: Request) -> R {
     let r: crate::agent::RekeyRequest = srv::body_json(req.into_body(), JSON_LIMIT).await.map_err(|e| err(StatusCode::BAD_REQUEST, e.to_string()))?;
     let Some(to) = crate::join::machine_key(Some(&r.machine_id)) else {
@@ -3742,6 +3791,18 @@ async fn rekey_agent(hub: &Hub, req: Request) -> R {
         crate::rt::sleep(Duration::from_millis(500)).await;
         return Err(err(StatusCode::FORBIDDEN, format!("{from}'s key was {why}")));
     }
+    // Known by the id already (its name is one its certificate carried from before, moved as it
+    // connected): its certificate for the id is a refresh of its credentials, nothing moves, and
+    // its process being connected doesn't matter (docs/machines.md, "One record a machine").
+    if hub.machine_of(&from) == to {
+        crate::identities::record(&hub.store, "machine", &to, &cert).await.map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")))?;
+        hub.net.command(crate::net::Out::Unrevoke { name: to.clone() }).await;
+        hub.store.audit("kiln".into(), "agent.certificate".into(), format!("{} has its certificate for its machine id {to}", hub.shown(&to))).await;
+        return Ok(srv::json(
+            StatusCode::OK,
+            &crate::agent::EnrollResponse { cert_pem: cert, ca_pem: hub.pki.ca_pem.clone(), quic: hub.cfg.server.quic_advertise.clone(), name: to.clone(), label: Some(hub.shown(&to)) },
+        ));
+    }
     let agents = hub.agent_list().await;
     let Some(me) = agents.iter().find(|a| a.name == from) else {
         return Err(err(StatusCode::FORBIDDEN, format!("{from} is not enrolled here any more; enroll it again")));
@@ -3749,21 +3810,33 @@ async fn rekey_agent(hub: &Hub, req: Request) -> R {
     if let Some(said) = hub.store.agent_machines().await.ok().and_then(|m| m.get(&from).cloned()).filter(|s| *s != to) {
         return Err(err(StatusCode::FORBIDDEN, format!("{from} said it is machine {said}, not {to}")));
     }
-    if agents.iter().any(|a| a.name == to) {
-        return Err(err(StatusCode::CONFLICT, format!("a runner is known by {to} already")));
+    // The id known already and connected: a copy of that machine, or the machine itself (docs/machines.md).
+    if let Some(known) = agents.iter().find(|a| a.name == to && a.connected) {
+        return Err(err(StatusCode::CONFLICT, format!("a runner is known by {to} already and is connected ({})", known.shown())));
+    }
+    // Another record of the machine still connected: what it holds would move from under it.
+    let dups = hub.duplicates_of(&to).await.map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")))?;
+    if let Some((dup, _)) = dups.iter().find(|(n, up)| *up && *n != from) {
+        return Err(err(StatusCode::CONFLICT, format!("{} says it is machine {to} too and is connected: this runner moves once it isn't", hub.shown(dup))));
     }
     // Its certificate for the id, recorded first as every one kiln issues is (W27-R01): forgetting
     // the runner then revokes its key, its certificate for its name with it.
     crate::identities::record(&hub.store, "machine", &to, &cert).await.map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")))?;
     // Its name, as its label, unless another machine shows by it.
     let label = free_agent_name(hub, &from, &me.hostname, Some(&to)).await?;
-    if let Err(e) = hub.move_runner(&from, &to, &label, &me.hostname).await {
-        return Err(err(StatusCode::CONFLICT, format!("{e:#}")));
-    }
+    // The id's own label, when it's known already and has one.
+    let label = match hub.move_runner(&from, &to, &label, &me.hostname).await {
+        Ok(kept) => kept,
+        Err(e) => return Err(err(StatusCode::CONFLICT, format!("{e:#}"))),
+    };
     // The id may connect, as a machine enrolled under it may: a revoked key stays refused.
     hub.net.command(crate::net::Out::Unrevoke { name: to.clone() }).await;
     hub.store.audit("kiln".into(), "agent.moved".into(), format!("{from} is known by its machine id {to}, shown as {label}")).await;
     tracing::info!(from = %from, to = %to, label = %label, "a runner moved to its machine id");
+    // The machine's other records, not connected, fold in too.
+    if let Err(e) = hub.fold_duplicates(&to).await {
+        tracing::warn!(machine = %to, error = %format!("{e:#}"), "couldn't fold this machine's other records");
+    }
     Ok(srv::json(
         StatusCode::OK,
         &crate::agent::EnrollResponse { cert_pem: cert, ca_pem: hub.pki.ca_pem.clone(), quic: hub.cfg.server.quic_advertise.clone(), name: to, label: Some(label) },
@@ -5097,10 +5170,30 @@ async fn harness_history(hub: &Hub, caller: &crate::authz::Caller, q: &HashMap<S
 /// `GET /api/harness/sessions/:id/events?before=&limit=`: a session's history beyond what its
 /// timeline holds, from the server's conversation store (docs/conversations.md): `{events}`, oldest
 /// first, the newest `limit` (100, at most 1000) before event number `before`.
+/// JSON encoded before it was asked for (a view's, encoded once per change of it): sent as it is.
+fn pre_encoded(json: bytes::Bytes) -> Response {
+    srv::response(StatusCode::OK, "application/json", srv::full(json))
+}
+
+/// `GET /api/harness/sessions`: the sessions `caller` sees, oldest first. For one who sees them all,
+/// each one's info as its owner encoded it once, joined (goal 10, plan 01a1a87b2dae step 2); an agent
+/// sees by lineage, found as it reads.
+async fn harness_sessions(hub: &Hub, caller: &crate::authz::Caller) -> Response {
+    if crate::harness::lineage::sees_all(caller) {
+        return pre_encoded(hub.harness.list_json());
+    }
+    srv::json(StatusCode::OK, &crate::harness::lineage::seen(hub, caller, hub.harness.list()).await)
+}
+
 async fn conversation_events(hub: &Hub, id: &str, q: &HashMap<String, String>) -> R {
     let Some(store) = hub.harness.convo.clone() else { return Err(err(StatusCode::NOT_FOUND, "this server keeps no conversations (KILN_CONVERSATIONS is off)")) };
     let before = q.get("before").and_then(|b| b.parse::<u64>().ok());
     let limit = q.get("limit").and_then(|l| l.parse::<usize>().ok()).unwrap_or(100).clamp(1, 1000);
+    // From the session's copy when it holds them all: the events' texts as each was written once,
+    // joined, neither the store read nor anything encoded (goal 10, plan 01a1a87b2dae step 2).
+    if let Some(events) = hub.harness.events_json(id, before, limit) {
+        return Ok(pre_encoded(events));
+    }
     let id = id.to_owned();
     let rows = crate::rt::blocking(move || store.events(&id, before, limit)).await.map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")))?;
     let rows = rows.map_err(|e| err(StatusCode::SERVICE_UNAVAILABLE, format!("{e:#}")))?;
@@ -5917,7 +6010,10 @@ fn harness_ws(hub: Arc<Hub>, id: String, req: Request) -> R {
 /// Send a viewer a snapshot: its frames then `synced`, a message each; or, `packed`, all of it in
 /// one gzip'd binary message, a frame a line (frames are JSON, whose strings escape their line
 /// breaks). Written out on the blocking pool: a long session's is megabytes of JSON, and the
-/// runtime's threads serve every socket (`crate::harness::registry::Snapshot`).
+/// runtime's threads serve every socket (`crate::harness::registry::Snapshot`). Not on the compute
+/// pool, below the shards: there a snapshot took 2.4 times as long with a busy process beside the
+/// server for each of its CPUs, and the frames its viewer waits on with it 4.7 times (goal 4's lab,
+/// plan 01a1a59c2a9c step 5).
 async fn send_snapshot(tx: &mut ws::Sender, snapshot: crate::harness::registry::Snapshot, packed: bool) -> anyhow::Result<()> {
     if packed {
         let bytes = crate::rt::blocking(move || snapshot.packed(&synced())).await??;
@@ -6236,7 +6332,7 @@ async fn harness_attach(hub: Arc<Hub>, id: String, socket: ws::WebSocket, takes:
             let began = Instant::now();
             // What it missed since what it has (it begins with "resumed"), or all of it when the copy
             // can't tell (it begins with "open"); and the feed from where that is.
-            let Some((snapshot, from, now, rev)) = hub.harness.frames_since(&id, have) else {
+            let Some((snapshot, from, now, rev)) = hub.harness.frames_since(&id, &viewer, have) else {
                 tx.send(closed()).await?;
                 return Ok(());
             };
@@ -6489,11 +6585,11 @@ mod tests {
             let hub = crate::hub::tests::scratch_hub().await?;
             let there = crate::harness::registry::Location::Machine("box".into());
             let info = crate::harness::session::Info { id: "s".into(), kind: "claude".into(), ..crate::harness::session::Info::default() };
-            hub.harness.ingest(&hub, &there, "s", Update::Open { info: Box::new(info), since: None });
-            hub.harness.ingest(&hub, &there, "s", Update::State { state: Box::new(State::default()) });
+            hub.harness.ingest(&hub, &there, "s", Update::Open { info: Box::new(info), since: None }).await;
+            hub.harness.ingest(&hub, &there, "s", Update::State { state: Box::new(State::default()) }).await;
             let long = format!("{}\nsecond line", "word ".repeat(4000));
             let said = |n: u64, text: &str| Event { id: format!("e{n}"), seq: n, at: 1, parent: None, by: None, body: Body::Assistant { text: text.into(), streaming: false } };
-            hub.harness.ingest(&hub, &there, "s", Update::Events { events: vec![said(1, &long), said(2, "short")] });
+            hub.harness.ingest(&hub, &there, "s", Update::Events { events: vec![said(1, &long), said(2, "short")] }).await;
             let att = hub.harness.attach("s").ok_or_else(|| anyhow::anyhow!("no session"))?;
             let frames = att.frames();
             let packed = att.snapshot.packed(&synced())?;
@@ -6506,6 +6602,92 @@ mod tests {
             want.push(synced());
             assert_eq!(lines, want);
             assert!(frames.iter().any(|f| f.contains("second line")), "{frames:?}");
+            Ok(())
+        })
+    }
+
+    /// Goal 10, plan 01a1a87b2dae step 3: a long session's packed snapshot, put together from its
+    /// chunks' pieces packed once (the sealed ones), its newest deflated as it's taken and what's between
+    /// them stored, unpacks with flate2 to exactly what the whole gzip of its frames and `synced` held
+    /// before; and taken again, it takes the pieces as they were packed and unpacks the same.
+    #[test]
+    fn g10_s3_a_snapshot_put_together_from_packed_chunks_unpacks_as_the_whole_gzip_did() -> anyhow::Result<()> {
+        use crate::harness::core::Update;
+        use crate::harness::model::{Body, Event, State};
+        use std::io::{Read as _, Write as _};
+        crate::rt::block_on(async {
+            let hub = crate::hub::tests::scratch_hub().await?;
+            let there = crate::harness::registry::Location::Machine("box".into());
+            let info = crate::harness::session::Info { id: "s".into(), kind: "claude".into(), ..crate::harness::session::Info::default() };
+            hub.harness.ingest(&hub, &there, "s", Update::Open { info: Box::new(info), since: None }).await;
+            hub.harness.ingest(&hub, &there, "s", Update::State { state: Box::new(State::default()) }).await;
+            let said = |n: u64| Event { id: format!("e{n}"), seq: n, at: 1, parent: None, by: None, body: Body::Assistant { text: format!("{n}: {}", "the retry loop reads its deadline ".repeat(usize::try_from(n % 7 + 1).unwrap_or(1))), streaming: false } };
+            // Past two chunks, a third begun.
+            hub.harness.ingest(&hub, &there, "s", Update::Events { events: (1..=150).map(said).collect() }).await;
+            let unpack = |b: &[u8]| -> anyhow::Result<String> {
+                let mut text = String::new();
+                flate2::read::GzDecoder::new(b).read_to_string(&mut text)?;
+                Ok(text)
+            };
+            let att = hub.harness.attach("s").ok_or_else(|| anyhow::anyhow!("no session"))?;
+            let frames = att.frames();
+            assert!(frames.iter().filter(|f| f.starts_with(r#"{"t":"events""#)).count() >= 3, "a frame a chunk: {}", frames.len());
+            let mut whole = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+            whole.write_all(format!("{}\n{}", frames.join("\n"), synced()).as_bytes())?;
+            let was = unpack(&whole.finish()?)?;
+            let packed = att.snapshot.packed(&synced())?;
+            assert_eq!(unpack(&packed)?, was, "what the whole gzip held");
+            let again = hub.harness.attach("s").ok_or_else(|| anyhow::anyhow!("no session"))?.snapshot.packed(&synced())?;
+            assert_eq!(unpack(&again)?, was, "taken again, the same");
+            assert!(packed.len() * 5 < was.len(), "it packs: {} of {}", packed.len(), was.len());
+            Ok(())
+        })
+    }
+
+    /// Goal 10, plan 01a1a87b2dae step 2: the reads of agent sessions the lab makes come from the
+    /// copies' views as their owners encoded them, and say what they said when each read encoded
+    /// its answer: the list and one session as `srv::json` wrote their infos (a state's change
+    /// encoded again), and a session's newest events as the conversation store answers them; a copy
+    /// that lacks some of those asked for leaves them to the store.
+    #[test]
+    fn g10_s2_session_reads_come_from_the_views_as_they_were_written() -> anyhow::Result<()> {
+        use crate::harness::core::Update;
+        use crate::harness::model::{Body, Event, State};
+        crate::rt::block_on(async {
+            let hub = crate::hub::tests::scratch_hub().await?;
+            let there = crate::harness::registry::Location::Machine("box".into());
+            for (id, at) in [("b", 2), ("a", 1)] {
+                let info = crate::harness::session::Info { id: id.into(), kind: "claude".into(), created_at: at, ..crate::harness::session::Info::default() };
+                hub.harness.ingest(&hub, &there, id, Update::Open { info: Box::new(info), since: None }).await;
+            }
+            let said = |n: u64| Event { id: format!("e{n}"), seq: n, at: 1, parent: None, by: None, body: Body::Assistant { text: format!("{n}: the retry loop reads its \"deadline\""), streaming: false } };
+            hub.harness.ingest(&hub, &there, "a", Update::Events { events: (1..=120).map(said).collect() }).await;
+            hub.harness.ingest(&hub, &there, "a", Update::State { state: Box::new(State::default()) }).await;
+            // The second's copy holds its timeline from its fifth event on.
+            hub.harness.ingest(&hub, &there, "b", Update::Events { events: (5..=20).map(said).collect() }).await;
+            assert_eq!(hub.harness.list_json().as_ref(), serde_json::to_vec(&hub.harness.list())?.as_slice(), "the list, oldest first");
+            let a = hub.harness.list().into_iter().find(|i| i.id == "a").ok_or_else(|| anyhow::anyhow!("no session a"))?;
+            assert!(a.last_activity > 0, "the state changed its info");
+            assert_eq!(hub.harness.info_json("a").as_deref(), Some(serde_json::to_vec(&a)?.as_slice()), "one, as it is now");
+            assert!(hub.harness.info_json("nobody").is_none());
+            let store = hub.harness.convo.clone().ok_or_else(|| anyhow::anyhow!("no conversation store"))?;
+            crate::rt::blocking({
+                let store = store.clone();
+                move || store.sync()
+            })
+            .await??;
+            // As `conversation_events` answers from the store.
+            let stored = |id: &str, before: Option<u64>, limit: usize| -> anyhow::Result<Vec<u8>> {
+                let events: Vec<serde_json::Value> = store.events(id, before, limit)?.iter().filter_map(|r| serde_json::from_str(&r.body).ok()).collect();
+                Ok(serde_json::to_vec(&json!({ "events": events }))?)
+            };
+            for (before, limit) in [(None, 50), (Some(100), 50), (None, 1000), (Some(30), 10), (Some(1), 5)] {
+                let copy = hub.harness.events_json("a", before, limit).ok_or_else(|| anyhow::anyhow!("the copy didn't say {before:?}, {limit}"))?;
+                assert_eq!(String::from_utf8_lossy(&copy), String::from_utf8_lossy(&stored("a", before, limit)?), "{before:?}, {limit}");
+            }
+            assert_eq!(hub.harness.events_json("b", None, 10).as_deref(), Some(stored("b", None, 10)?.as_slice()), "ten of the sixteen it holds");
+            assert!(hub.harness.events_json("b", None, 50).is_none(), "fewer than asked, its first four elsewhere: the store's to say");
+            assert!(hub.harness.events_json("nobody", None, 50).is_none());
             Ok(())
         })
     }

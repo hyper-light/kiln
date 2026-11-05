@@ -760,7 +760,7 @@ mod end_to_end {
                 let (cx, hub, id, cwd) = (cx.clone(), Arc::clone(&hub), id.clone(), cwd.clone());
                 async move {
                     for _ in 0..50 {
-                        anyhow::ensure!(hub.harness.set_changes(&id, json!([{"path": format!("{cwd}/a"), "added": 1, "removed": 1}])), "no agent to set the changes of");
+                        anyhow::ensure!(hub.harness.set_changes(&id, json!([{"path": format!("{cwd}/a"), "added": 1, "removed": 1}])).await, "no agent to set the changes of");
                         match call(cx.clone(), "agents.change", input.clone()).await {
                             Err((_, m)) if m.contains("hasn't changed any files") => crate::rt::sleep(Duration::from_millis(100)).await,
                             r => return r.map_err(|(c, m)| anyhow::anyhow!("{c}: {m}")),
