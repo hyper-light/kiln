@@ -1890,9 +1890,10 @@ impl Shard {
         let mut cx = Context::from_waker(&waker);
         self.desk.current.set(word.word());
         self.desk.now_ns.set(start);
-        // Each poll starts within its share (`crate::coop`).
+        // Each poll starts within its share (`crate::coop`), and says what it does afresh (`crate::slow`).
         self.desk.coop_spent.set(false);
         self.desk.coop_charged.set(false);
+        self.desk.label.set(None);
         // Which poll runs, and its task, for the watchdog (`crate::watch`).
         if let Some(entry) = self.desk.entry {
             entry.watch.begin(word.word());
@@ -1933,6 +1934,9 @@ impl Shard {
         } else {
             None
         };
+        if elapsed > crate::slow::SLOW_POLL_NS {
+            self.note_slow(slot, elapsed);
+        }
         let Some(poll) = poll else {
             self.unwound(slot, future, word, current);
             return ended;
@@ -2000,6 +2004,15 @@ impl Shard {
         };
         count(sum, waited);
         count(polls, 1);
+    }
+
+    /// A poll of the task in `slot` that held the shard `elapsed`, past `crate::slow::SLOW_POLL_NS`: counted
+    /// against the task's spawn site and the label its code set (kiln's goal 9, plan 01a1a87b2cec step 2).
+    #[cold]
+    fn note_slow(&self, slot: u32, elapsed: u64) {
+        if let Some(entry) = self.desk.entry {
+            entry.slow.note(entry.spawned_at(slot), self.desk.label.get(), elapsed);
+        }
     }
 
     /// Counts a poll that ran `elapsed` and was `attributed`.

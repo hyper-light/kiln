@@ -42,17 +42,44 @@ pub fn inflate(s: &Segment) -> io::Result<Vec<u8>> {
 
 /// `parts`, one after the other, deflated at `level` into a [`Segment`].
 pub fn deflate<'a>(level: Compression, parts: impl IntoIterator<Item = &'a [u8]>) -> io::Result<Segment> {
-    let mut c = Compress::new(level, false);
-    let mut crc = crc32fast::Hasher::new();
-    let mut out = Vec::new();
-    let mut len = 0u64;
+    let mut d = Deflating::new(level);
     for part in parts {
-        crc.update(part);
-        len = len.saturating_add(u64::try_from(part.len()).unwrap_or(u64::MAX));
-        feed(&mut c, &mut out, part, false)?;
+        d.part(part)?;
     }
-    feed(&mut c, &mut out, &[], true)?;
-    Ok(Segment { deflated: Bytes::from(out), crc: crc.finalize(), len })
+    d.finish()
+}
+
+/// A [`Segment`] made a part at a time, over as many calls as its maker likes ([`deflate`] makes one in
+/// one): the packer's, a sealed chunk an event at a time, giving its compute thread up between any two
+/// (goal 10, plan 01a1a87b2dae step 3: `super::copies`). The parts fed the same way make the same bytes,
+/// however the calls fall.
+pub struct Deflating {
+    c: Compress,
+    crc: crc32fast::Hasher,
+    out: Vec<u8>,
+    len: u64,
+}
+
+impl Deflating {
+    pub fn new(level: Compression) -> Self {
+        Self { c: Compress::new(level, false), crc: crc32fast::Hasher::new(), out: Vec::new(), len: 0 }
+    }
+
+    /// `part`, after the parts before it.
+    pub fn part(&mut self, part: &[u8]) -> io::Result<()> {
+        self.crc.update(part);
+        self.len = self.len.saturating_add(u64::try_from(part.len()).unwrap_or(u64::MAX));
+        feed(&mut self.c, &mut self.out, part, false)
+    }
+
+    /// The segment of the parts fed, flushed to a byte boundary.
+    pub fn finish(mut self) -> io::Result<Segment> {
+        feed(&mut self.c, &mut self.out, &[], true)?;
+        // What it holds and no more: a segment is kept as long as its chunk (goal 11, plan 01a1a87b2e56 step 2),
+        // and the buffer it was deflated into grew by doubling.
+        self.out.shrink_to_fit();
+        Ok(Segment { deflated: Bytes::from(self.out), crc: self.crc.finalize(), len: self.len })
+    }
 }
 
 /// `input` into the compressor `c`, its output appended to `out`; with `sync`, everything it holds

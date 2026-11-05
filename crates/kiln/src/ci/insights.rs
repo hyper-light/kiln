@@ -139,7 +139,7 @@ pub fn spawn(hub: Arc<Hub>) {
 /// Adds `secs` of each runner's time to its hour: connected, slots and busy slots.
 async fn sample(hub: &Hub, secs: f64) -> anyhow::Result<()> {
     let bucket = floor(crate::util::now_unix(), HOUR);
-    let rows: Vec<(String, f64, f64)> = hub.agents.lock().values().filter(|a| a.connected && a.slots > 0 && !a.outpost).map(|a| (a.name.clone(), f64::from(a.slots), f64::from(a.busy.min(a.slots)))).collect();
+    let rows: Vec<(String, f64, f64)> = hub.agents.load().values().filter(|a| a.connected && a.slots > 0 && !a.outpost).map(|a| (a.name.clone(), f64::from(a.slots), f64::from(a.busy.min(a.slots)))).collect();
     hub.store
         .call(move |c| {
             let tx = crate::store::tx(c)?;

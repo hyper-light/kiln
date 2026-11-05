@@ -1864,7 +1864,7 @@ async fn native(hub: &Arc<Hub>, id: &str, machine: &str, b: &Binary) {
     }
     // A runner that upgrades blue/green is through once it says its new build took over.
     let blue_green = {
-        let inst = hub.instances.lock();
+        let inst = hub.instances.load();
         inst.newest(machine).and_then(|p| inst.get(p)).is_some_and(|i| i.caps & crate::proto::CAP_BLUE_GREEN != 0)
     };
     let held: Vec<String> = if blue_green { hub.harness.list().into_iter().filter(|i| i.target == format!("agent:{machine}")).map(|i| i.id).collect() } else { Vec::new() };
