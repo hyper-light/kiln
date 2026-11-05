@@ -1,0 +1,50 @@
+profile /mnt/heap/off/jeprof.10827.31.i31.heap: sample period 131072, 63 stacks, live 85.3 MB (unsampled estimate)
+
+## by first own frame (top 40)
+    55.61 MB  <hyper_measure::alloc::Counting as core::alloc::global::GlobalAlloc>::alloc
+    25.69 MB  <hyper_measure::alloc::Counting as core::alloc::global::GlobalAlloc>::realloc
+     3.72 MB  sqlite3MemMalloc
+     0.18 MB  libstdc++.so.6.0.33
+     0.13 MB  sqlite3MemRealloc
+
+## by own frames, four deep (top 40)
+    20.29 MB  <hyper_measure::alloc::Counting as core::alloc::global::GlobalAlloc>::realloc <- <kiln::harness::registry::Entry>::written <- <kiln::harness::registry::Registry>::apply::{closure#2} <- <kiln::harness::registry::Registry>::apply
+    15.51 MB  <hyper_measure::alloc::Counting as core::alloc::global::GlobalAlloc>::alloc <- kiln::harness::registry::write::string::<<kiln::harness::registry::Snapshot>::frames::{closure#0}::{closure#0}> <- <kiln::harness::registry::Snapshot>::frames::{closure#0} <- <kiln::harness::registry::Snapshot>::frames
+    12.53 MB  <hyper_measure::alloc::Counting as core::alloc::global::GlobalAlloc>::alloc <- <u8 as <[_]>::to_vec_in::ConvertVec>::to_vec::<alloc::alloc::Global> <- <str as alloc::borrow::ToOwned>::to_owned <- <kiln::harness::model::ToolCall as serde_core::ser::Serialize>::serialize::<serde::private::ser::TaggedSerializer>
+     5.56 MB  <hyper_measure::alloc::Counting as core::alloc::global::GlobalAlloc>::alloc <- <hyper_rt::shard::ShardContext>::new <- <hyper_rt::shard_loop::Shard>::build <- hyper_rt::runtime::run_worker
+     5.27 MB  <hyper_measure::alloc::Counting as core::alloc::global::GlobalAlloc>::realloc <- <indexmap::inner::Core>::reserve_entries <- <indexmap::inner::Core>::push_entry <- <indexmap::inner::Core>::insert_full
+     4.75 MB  <hyper_measure::alloc::Counting as core::alloc::global::GlobalAlloc>::alloc <- <u8 as <[_]>::to_vec_in::ConvertVec>::to_vec::<alloc::alloc::Global> <- <str as alloc::borrow::ToOwned>::to_owned <- <kiln::harness::model::Body as serde_core::ser::Serialize>::serialize::<serde::private::ser::FlatMapSerializer>
+     2.81 MB  sqlite3MemMalloc <- pcache1Alloc <- pcache1FetchStage2 <- pcache1Fetch
+     2.64 MB  <hyper_measure::alloc::Counting as core::alloc::global::GlobalAlloc>::alloc <- <hyper_rt::cells::CellRing>::new <- <hyper_rt::shard::ShardContext>::new <- <hyper_rt::shard_loop::Shard>::build
+     2.31 MB  <hyper_measure::alloc::Counting as core::alloc::global::GlobalAlloc>::alloc <- <hyper_rt::interests::Interests>::new <- <hyper_rt::shard_loop::Shard>::build <- hyper_rt::runtime::run_worker
+     1.37 MB  <hyper_measure::alloc::Counting as core::alloc::global::GlobalAlloc>::alloc <- <hyper_rt::shard_loop::Shard>::build <- hyper_rt::runtime::run_worker <- <hyper_rt::runtime::Runtime>::start_with::{closure#1}
+     1.31 MB  <hyper_measure::alloc::Counting as core::alloc::global::GlobalAlloc>::alloc <- <concurrent_queue::bounded::Bounded>::new <- <concurrent_queue::ConcurrentQueue>::bounded <- async_channel::bounded::<kiln::net::NetEvent>
+     1.07 MB  <hyper_measure::alloc::Counting as core::alloc::global::GlobalAlloc>::alloc <- <hyper_rt::timer::Entry as alloc::vec::spec_from_elem::SpecFromElem>::from_elem::<alloc::alloc::Global> <- <hyper_rt::timer::Wheel>::new <- <hyper_rt::shard_loop::Shard>::build
+     1.05 MB  <hyper_measure::alloc::Counting as core::alloc::global::GlobalAlloc>::alloc <- <concurrent_queue::bounded::Bounded>::new <- <concurrent_queue::ConcurrentQueue>::bounded <- async_channel::bounded::<(alloc::string::String, kiln::harness::core::Update)>
+     0.92 MB  <hyper_measure::alloc::Counting as core::alloc::global::GlobalAlloc>::alloc <- <concurrent_queue::bounded::Bounded>::new <- <concurrent_queue::ConcurrentQueue>::bounded <- async_channel::bounded::<kiln::net::Out>
+     0.83 MB  <hyper_measure::alloc::Counting as core::alloc::global::GlobalAlloc>::alloc <- <concurrent_queue::bounded::Bounded>::new <- <concurrent_queue::ConcurrentQueue>::bounded <- async_channel::bounded::<kiln::harness::copies::Msg>
+     0.52 MB  <hyper_measure::alloc::Counting as core::alloc::global::GlobalAlloc>::alloc <- <indexmap::inner::Core>::with_capacity <- <indexmap::map::IndexMap>::with_capacity_and_hasher <- <kiln::harness::model::ToolCall as serde_core::ser::Serialize>::serialize::<serde::private::ser::TaggedSerializer>
+     0.52 MB  <hyper_measure::alloc::Counting as core::alloc::global::GlobalAlloc>::alloc <- <indexmap::inner::Core>::insert_full <- <indexmap::map::IndexMap>::insert_full <- <indexmap::map::IndexMap>::insert
+     0.52 MB  <hyper_measure::alloc::Counting as core::alloc::global::GlobalAlloc>::alloc <- <kiln::harness::registry::Registry>::apply::{closure#2} <- <kiln::harness::registry::Registry>::apply <- <kiln::harness::copies::Shard>::take::{closure#0}
+     0.47 MB  <hyper_measure::alloc::Counting as core::alloc::global::GlobalAlloc>::alloc <- <concurrent_queue::bounded::Bounded>::new <- <concurrent_queue::ConcurrentQueue>::bounded <- async_channel::bounded::<kiln::records::turso::Job>
+     0.42 MB  <hyper_measure::alloc::Counting as core::alloc::global::GlobalAlloc>::alloc <- <concurrent_queue::bounded::Bounded>::new <- <concurrent_queue::ConcurrentQueue>::bounded <- async_channel::bounded::<kiln::harness::kept::Job>
+     0.39 MB  <hyper_measure::alloc::Counting as core::alloc::global::GlobalAlloc>::alloc <- <u8 as <[_]>::to_vec_in::ConvertVec>::to_vec::<alloc::alloc::Global> <- <str as alloc::borrow::ToOwned>::to_owned <- <str as serde_core::ser::Serialize>::serialize::<serde_json::value::ser::MapKeySerializer>
+     0.37 MB  <hyper_measure::alloc::Counting as core::alloc::global::GlobalAlloc>::alloc <- hyper_rt::registry::register_runtime_slot <- <hyper_rt::shard_loop::ShardSeed>::register <- hyper_rt::runtime::register_seeds::{closure#0}
+     0.35 MB  <hyper_measure::alloc::Counting as core::alloc::global::GlobalAlloc>::alloc <- <kiln::harness::copies::Mirror>::upsert <- <kiln::harness::registry::Registry>::apply <- <kiln::harness::copies::Shard>::take::{closure#0}
+     0.33 MB  <hyper_measure::alloc::Counting as core::alloc::global::GlobalAlloc>::alloc <- <hyper_rt::interests::Interests>::new <- <hyper_rt::shard_loop::Shard>::build <- <hyper_rt::runtime::LocalRuntime>::new
+     0.33 MB  <hyper_measure::alloc::Counting as core::alloc::global::GlobalAlloc>::alloc <- <hyper_rt::queue::LocalQueue>::new <- <hyper_rt::shard::ShardContext>::new <- <hyper_rt::shard_loop::Shard>::build
+     0.30 MB  <hyper_measure::alloc::Counting as core::alloc::global::GlobalAlloc>::alloc <- <concurrent_queue::bounded::Bounded>::new <- <concurrent_queue::ConcurrentQueue>::bounded <- async_channel::bounded::<kiln::harness::webrtc::Cmd>
+     0.26 MB  <hyper_measure::alloc::Counting as core::alloc::global::GlobalAlloc>::alloc <- <u8 as <[_]>::to_vec_in::ConvertVec>::to_vec::<alloc::alloc::Global> <- <str as alloc::borrow::ToOwned>::to_owned <- <kiln::harness::model::Event as serde_core::ser::Serialize>::serialize::<serde_json::value::ser::Serializer>
+     0.25 MB  <hyper_measure::alloc::Counting as core::alloc::global::GlobalAlloc>::alloc <- <hyper_rt::shard::ShardContext>::new <- <hyper_rt::shard_loop::Shard>::build <- <hyper_rt::runtime::LocalRuntime>::new
+     0.18 MB  libstdc++.so.6.0.33
+     0.15 MB  <hyper_measure::alloc::Counting as core::alloc::global::GlobalAlloc>::alloc <- <hyper_rt::queue::SlotRing>::new <- <hyper_rt::queue::Lists>::new <- <hyper_rt::queue::LocalQueue>::new
+     0.15 MB  <hyper_measure::alloc::Counting as core::alloc::global::GlobalAlloc>::alloc <- <hyper_rt::shard_loop::Shard>::build <- <hyper_rt::runtime::LocalRuntime>::new <- kiln::net::thread_main
+     0.13 MB  <hyper_measure::alloc::Counting as core::alloc::global::GlobalAlloc>::realloc <- <<serde_json::value::Value as serde_core::de::Deserialize>::deserialize::ValueVisitor as serde_core::de::Visitor>::visit_map::<serde_json::de::MapAccess> <- <<serde_json::value::Value as serde_core::de::Deserialize>::deserialize::ValueVisitor as serde_core::de::Visitor>::visit_seq::<serde_json::de::SeqAccess> <- <<ser
+     0.13 MB  <hyper_measure::alloc::Counting as core::alloc::global::GlobalAlloc>::alloc <- <kiln::harness::copies::Events>::push <- <kiln::harness::copies::Mirror>::upsert <- <kiln::harness::registry::Registry>::apply
+     0.13 MB  sqlite3MemMalloc <- dbMallocRawFinish <- exprDup <- sqlite3SelectDup
+     0.13 MB  sqlite3MemMalloc <- dbMallocRawFinish <- sqlite3DbStrNDup <- triggerStepAllocate
+     0.13 MB  sqlite3MemRealloc <- dbReallocFinish <- sqlite3AddColumn <- yy_reduce.isra.0
+     0.13 MB  sqlite3MemMalloc <- dbMallocRawFinish <- exprDup <- sqlite3ExprListDup
+     0.13 MB  sqlite3MemMalloc <- dbMallocRawFinish <- sqlite3ExprListDup <- sqlite3SelectDup
+     0.13 MB  sqlite3MemMalloc <- dbMallocRawFinish <- sqlite3DbMallocZero <- sqlite3UpsertNew
+     0.13 MB  <hyper_measure::alloc::Counting as core::alloc::global::GlobalAlloc>::alloc <- hyper_rt::blocking::thread::<hyper_rt::blocking::start::{closure#1}> <- hyper_rt::blocking::start <- kiln::rt::start

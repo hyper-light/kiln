@@ -1,0 +1,51 @@
+profile /mnt/heap/on/jeprof.10650.104.i104.heap: sample period 131072, 77 stacks, live 99.0 MB (unsampled estimate)
+
+## by first own frame (top 40)
+    50.47 MB  <hyper_measure::alloc::Counting as core::alloc::global::GlobalAlloc>::alloc
+    38.58 MB  <hyper_measure::alloc::Counting as core::alloc::global::GlobalAlloc>::realloc
+     6.40 MB  <hyper_measure::alloc::Counting as core::alloc::global::GlobalAlloc>::alloc_zeroed
+     3.20 MB  sqlite3MemMalloc
+     0.18 MB  libstdc++.so.6.0.33
+     0.13 MB  sqlite3MemRealloc
+
+## by own frames, four deep (top 40)
+    25.42 MB  <hyper_measure::alloc::Counting as core::alloc::global::GlobalAlloc>::realloc <- <kiln::harness::model::ToolCall as serde_core::ser::Serialize>::serialize::<serde::private::ser::TaggedSerializer> <- <kiln::harness::model::Body as serde_core::ser::Serialize>::serialize::<serde::private::ser::FlatMapSerializer> <- <kiln::harness::model::Event as serde_core::ser::Serialize>::serialize::<&mut serde_js
+    24.39 MB  <hyper_measure::alloc::Counting as core::alloc::global::GlobalAlloc>::alloc <- <u8 as <[_]>::to_vec_in::ConvertVec>::to_vec::<alloc::alloc::Global> <- <str as alloc::borrow::ToOwned>::to_owned <- kiln::convo::rows::clip
+    10.33 MB  <hyper_measure::alloc::Counting as core::alloc::global::GlobalAlloc>::realloc <- <kiln::harness::model::Body as serde_core::ser::Serialize>::serialize::<serde::private::ser::FlatMapSerializer> <- <kiln::harness::model::Event as serde_core::ser::Serialize>::serialize::<&mut serde_json::ser::Serializer> <- kiln::convo::rows::event
+     6.40 MB  <hyper_measure::alloc::Counting as core::alloc::global::GlobalAlloc>::alloc_zeroed <- <u8 as alloc::vec::spec_from_elem::SpecFromElem>::from_elem::<alloc::alloc::Global> <- <turso_core::io::Buffer>::new_temporary::{closure#0} <- <turso_core::io::Buffer>::new_temporary
+     5.56 MB  <hyper_measure::alloc::Counting as core::alloc::global::GlobalAlloc>::alloc <- <hyper_rt::shard::ShardContext>::new <- <hyper_rt::shard_loop::Shard>::build <- hyper_rt::runtime::run_worker
+     2.88 MB  <hyper_measure::alloc::Counting as core::alloc::global::GlobalAlloc>::alloc <- <hyper_rt::cells::CellRing>::new <- <hyper_rt::shard::ShardContext>::new <- <hyper_rt::shard_loop::Shard>::build
+     2.67 MB  sqlite3MemMalloc <- pcache1Alloc <- pcache1FetchStage2 <- pcache1Fetch
+     2.14 MB  <hyper_measure::alloc::Counting as core::alloc::global::GlobalAlloc>::alloc <- <hyper_rt::interests::Interests>::new <- <hyper_rt::shard_loop::Shard>::build <- hyper_rt::runtime::run_worker
+     2.10 MB  <hyper_measure::alloc::Counting as core::alloc::global::GlobalAlloc>::alloc <- <kiln::convo::store::Store>::start <- kiln::convo::open_file::{closure#0} <- kiln::convo::open_file
+     1.81 MB  <hyper_measure::alloc::Counting as core::alloc::global::GlobalAlloc>::alloc <- <hyper_rt::shard_loop::Shard>::build <- hyper_rt::runtime::run_worker <- <hyper_rt::runtime::Runtime>::start_with::{closure#1}
+     1.57 MB  <hyper_measure::alloc::Counting as core::alloc::global::GlobalAlloc>::alloc <- kiln::convo::rows::of::{closure#2} <- kiln::convo::rows::of <- <kiln::convo::store::Store>::send
+     1.42 MB  <hyper_measure::alloc::Counting as core::alloc::global::GlobalAlloc>::realloc <- kiln::convo::rows::of <- <kiln::convo::store::Store>::send <- <kiln::harness::registry::Registry>::apply
+     1.31 MB  <hyper_measure::alloc::Counting as core::alloc::global::GlobalAlloc>::alloc <- <concurrent_queue::bounded::Bounded>::new <- <concurrent_queue::ConcurrentQueue>::bounded <- async_channel::bounded::<kiln::net::NetEvent>
+     1.07 MB  <hyper_measure::alloc::Counting as core::alloc::global::GlobalAlloc>::alloc <- <hyper_rt::timer::Entry as alloc::vec::spec_from_elem::SpecFromElem>::from_elem::<alloc::alloc::Global> <- <hyper_rt::timer::Wheel>::new <- <hyper_rt::shard_loop::Shard>::build
+     1.05 MB  <hyper_measure::alloc::Counting as core::alloc::global::GlobalAlloc>::alloc <- <concurrent_queue::bounded::Bounded>::new <- <concurrent_queue::ConcurrentQueue>::bounded <- async_channel::bounded::<(alloc::string::String, kiln::harness::core::Update)>
+     0.92 MB  <hyper_measure::alloc::Counting as core::alloc::global::GlobalAlloc>::alloc <- <concurrent_queue::bounded::Bounded>::new <- <concurrent_queue::ConcurrentQueue>::bounded <- async_channel::bounded::<kiln::net::Out>
+     0.66 MB  <hyper_measure::alloc::Counting as core::alloc::global::GlobalAlloc>::realloc <- kiln::convo::rows::coalesce <- kiln::convo::store::writer::{closure#0} <- kiln::convo::store::writer
+     0.48 MB  <hyper_measure::alloc::Counting as core::alloc::global::GlobalAlloc>::realloc <- <hyper_rt::shard::ShardContext>::new::{closure#0} <- <hyper_rt::shard::ShardContext>::new <- <hyper_rt::shard_loop::Shard>::build
+     0.47 MB  <hyper_measure::alloc::Counting as core::alloc::global::GlobalAlloc>::alloc <- <concurrent_queue::bounded::Bounded>::new <- <concurrent_queue::ConcurrentQueue>::bounded <- async_channel::bounded::<kiln::records::turso::Job>
+     0.44 MB  <hyper_measure::alloc::Counting as core::alloc::global::GlobalAlloc>::alloc <- <hyper_rt::shard::ShardContext>::new <- <hyper_rt::shard_loop::Shard>::build <- <hyper_rt::runtime::LocalRuntime>::new
+     0.42 MB  <hyper_measure::alloc::Counting as core::alloc::global::GlobalAlloc>::alloc <- <concurrent_queue::bounded::Bounded>::new <- <concurrent_queue::ConcurrentQueue>::bounded <- async_channel::bounded::<kiln::harness::kept::Job>
+     0.42 MB  <hyper_measure::alloc::Counting as core::alloc::global::GlobalAlloc>::alloc <- <concurrent_queue::bounded::Bounded>::new <- <concurrent_queue::ConcurrentQueue>::bounded <- async_channel::bounded::<kiln::harness::copies::Msg>
+     0.37 MB  <hyper_measure::alloc::Counting as core::alloc::global::GlobalAlloc>::alloc <- hyper_rt::registry::register_runtime_slot <- <hyper_rt::shard_loop::ShardSeed>::register <- hyper_rt::runtime::register_seeds::{closure#0}
+     0.35 MB  <hyper_measure::alloc::Counting as core::alloc::global::GlobalAlloc>::alloc <- <turso_core::storage::wal::InProcessWalCoordination as turso_core::storage::wal::WalCoordination>::cache_frame <- <turso_core::storage::wal::WalFile>::complete_append_frame <- <turso_core::storage::wal::WalFile as turso_core::storage::wal::Wal>::commit_prepared_frames
+     0.33 MB  <hyper_measure::alloc::Counting as core::alloc::global::GlobalAlloc>::alloc <- <hyper_rt::queue::LocalQueue>::new <- <hyper_rt::shard::ShardContext>::new <- <hyper_rt::shard_loop::Shard>::build
+     0.30 MB  <hyper_measure::alloc::Counting as core::alloc::global::GlobalAlloc>::alloc <- <concurrent_queue::bounded::Bounded>::new <- <concurrent_queue::ConcurrentQueue>::bounded <- async_channel::bounded::<kiln::harness::webrtc::Cmd>
+     0.26 MB  <hyper_measure::alloc::Counting as core::alloc::global::GlobalAlloc>::alloc <- turso_core::storage::btree::_insert_into_cell <- turso_core::storage::btree::insert_into_cell <- <turso_core::storage::btree::BTreeCursor>::insert_into_page
+     0.26 MB  <hyper_measure::alloc::Counting as core::alloc::global::GlobalAlloc>::alloc <- turso_core::storage::pager::allocate_new_page <- <turso_core::storage::pager::Pager>::allocate_page <- <turso_core::storage::pager::Pager>::allocate_overflow_page
+     0.26 MB  <hyper_measure::alloc::Counting as core::alloc::global::GlobalAlloc>::alloc <- <turso_core::storage::page_cache::PageCacheEntry>::new <- <turso_core::storage::page_cache::PageCache>::_insert <- <turso_core::storage::page_cache::PageCache>::insert
+     0.19 MB  <hyper_measure::alloc::Counting as core::alloc::global::GlobalAlloc>::alloc <- async_broadcast::broadcast::<alloc::sync::Arc> <- <kiln::rt::Broadcast>::new <- <kiln::hub::Hub>::new_on
+     0.18 MB  libstdc++.so.6.0.33
+     0.17 MB  <hyper_measure::alloc::Counting as core::alloc::global::GlobalAlloc>::alloc <- hyper_rt::udp::batched::zeroed <- <hyper_rt::udp::batched::Ring>::new <- <hyper_rt_transport::driver::Driver>::bind
+     0.17 MB  <hyper_measure::alloc::Counting as core::alloc::global::GlobalAlloc>::alloc <- <turso_core::storage::wal::InProcessWalCoordination as turso_core::storage::wal::WalCoordination>::iter_latest_frames <- <turso_core::storage::wal::WalFile>::checkpoint_inner <- <turso_core::storage::wal::WalFile as turso_core::storage::wal::Wal>::checkpoint
+     0.17 MB  <hyper_measure::alloc::Counting as core::alloc::global::GlobalAlloc>::alloc <- <focal_memory::budget::Levels>::segment <- <focal_memory::budget::Levels>::take <- <focal_memory::budget::MemoryBudget>::begin
+     0.15 MB  <hyper_measure::alloc::Counting as core::alloc::global::GlobalAlloc>::alloc <- <hyper_rt::queue::SlotRing>::new <- <hyper_rt::queue::Lists>::new <- <hyper_rt::queue::LocalQueue>::new
+     0.14 MB  <hyper_measure::alloc::Counting as core::alloc::global::GlobalAlloc>::realloc <- <turso_core::vdbe::builder::ProgramBuilder>::emit_insn <- turso_core::translate::upsert::emit_upsert <- turso_core::translate::insert::resolve_upserts
+     0.14 MB  <hyper_measure::alloc::Counting as core::alloc::global::GlobalAlloc>::alloc <- <hyper_rt::shard_loop::Shard>::build <- <hyper_rt::runtime::LocalRuntime>::new <- kiln::net::thread_main
+     0.14 MB  <hyper_measure::alloc::Counting as core::alloc::global::GlobalAlloc>::alloc <- <turso_core::storage::wal::WalFile>::new_with_coordination <- <turso_core::storage::wal::WalFile>::new <- <turso_core::database::Database>::build_wal
+     0.14 MB  <hyper_measure::alloc::Counting as core::alloc::global::GlobalAlloc>::realloc <- <str as serde_core::ser::Serialize>::serialize::<serde_json::ser::MapKeySerializer> <- <kiln::harness::model::ToolCall as serde_core::ser::Serialize>::serialize::<serde::private::ser::TaggedSerializer> <- <kiln::harness::model::Body as serde_core::ser::Serialize>::serialize::<serde::private::ser::FlatMapSerializer>
+     0.13 MB  <hyper_measure::alloc::Counting as core::alloc::global::GlobalAlloc>::alloc <- <turso_core::io::memory::MemStore>::get_or_allocate_page::{closure#0} <- <turso_core::io::memory::MemStore>::get_or_allocate_page <- <turso_core::io::memory::MemStore>::write_at_inner

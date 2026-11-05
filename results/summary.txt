@@ -1,0 +1,112 @@
+build exit 0
+test binary: /mnt/target/debug/deps/session_resident-d10b6205b5879d70
+run store on exit 0
+g11 resident (conversation store on): 20000 events sent (70.1 MB of JSON), 4640 kept; while open the server held 149.25 MB more (32165 bytes an event kept), 75.55 MB of it let go at its end (process 0.10 MB before, 149.35 MB with it, 73.80 MB after); the bus's own count 0.00 MB with it, 0.00 MB after
+== store on: 105 profiles; the most live: 214.4 /mnt/heap/on/jeprof.10650.87.i87.heap; the last: /mnt/heap/on/jeprof.10650.104.i104.heap
+-- store on, most (/mnt/heap/on/jeprof.10650.87.i87.heap)
+/mnt/heap/on/jeprof.10650.87.i87.heap: live 214.4 MB (unsampled estimate), sample period 131072
+    100.8 MB  conversation store
+             40.67 MB  <kiln::harness::model::ToolCall as serde_core::ser::Serialize>::serialize::<serde::private::ser::TaggedSerializer<serde::private::ser::FlatM
+             37.01 MB  kiln::convo::rows::clip
+             17.48 MB  <kiln::harness::model::Body as serde_core::ser::Serialize>::serialize::<serde::private::ser::FlatMapSerializer<serde_json::ser::Compound<&mu
+              2.49 MB  kiln::convo::rows::of::{closure#2}
+     59.1 MB  sessions' copies (harness)
+             17.81 MB  kiln::harness::registry::write::string::<<kiln::harness::registry::Snapshot>::frames::{closure#0}::{closure#0}>
+             17.65 MB  <kiln::harness::registry::Entry>::written
+             15.48 MB  <kiln::harness::model::ToolCall as serde_core::ser::Serialize>::serialize::<serde::private::ser::TaggedSerializer<serde::private::ser::FlatM
+              6.06 MB  <kiln::harness::model::Body as serde_core::ser::Serialize>::serialize::<serde::private::ser::FlatMapSerializer<serde_json::value::ser::Seria
+     27.8 MB  turso (other)
+             21.17 MB  <kiln::convo::turso::Turso>::exec
+              6.39 MB  <kiln::convo::turso::Turso>::run_while::<<kiln::convo::turso::Turso>::run<<kiln::convo::turso::Turso>::write::{closure#0}>::{closure#0}>
+              0.14 MB  <kiln::records::turso::Db>::open
+              0.13 MB  <kiln::convo::turso::Turso>::prepare
+     16.0 MB  runtime (hyper-rt)
+             14.35 MB  libjemalloc.so.2
+              0.79 MB  kiln::net::thread_main
+              0.50 MB  kiln::rt::start
+              0.19 MB  <kiln::rt::Broadcast<alloc::sync::Arc<str>>>::new
+      7.0 MB  queues made up front
+              2.23 MB  kiln::net::start
+              2.10 MB  <kiln::convo::store::Store>::start
+              1.05 MB  <kiln::harness::registry::Registry>::with
+              0.47 MB  <kiln::records::turso::TursoRecords>::open_with
+      3.3 MB  kiln.db (SQLite)
+              2.93 MB  kiln::store::migrations::apply_list
+              0.40 MB  <kiln::store::Store>::in_memory
+      0.2 MB  other
+              0.18 MB  libjemalloc.so.2
+      0.2 MB  bus (live feeds' frames)
+              0.17 MB  <kiln::bus::QuiverBus>::open
+-- store on, last (/mnt/heap/on/jeprof.10650.104.i104.heap)
+/mnt/heap/on/jeprof.10650.104.i104.heap: live 99.0 MB (unsampled estimate), sample period 131072
+     63.9 MB  conversation store
+             25.55 MB  <kiln::harness::model::ToolCall as serde_core::ser::Serialize>::serialize::<serde::private::ser::TaggedSerializer<serde::private::ser::FlatM
+             24.39 MB  kiln::convo::rows::clip
+             10.33 MB  <kiln::harness::model::Body as serde_core::ser::Serialize>::serialize::<serde::private::ser::FlatMapSerializer<serde_json::ser::Compound<&mu
+              1.57 MB  kiln::convo::rows::of::{closure#2}
+     16.0 MB  runtime (hyper-rt)
+             14.35 MB  libjemalloc.so.2
+              0.79 MB  kiln::net::thread_main
+              0.50 MB  kiln::rt::start
+              0.19 MB  <kiln::rt::Broadcast<alloc::sync::Arc<str>>>::new
+      8.1 MB  turso (other)
+              5.85 MB  <kiln::convo::turso::Turso>::run_while::<<kiln::convo::turso::Turso>::run<<kiln::convo::turso::Turso>::write::{closure#0}>::{closure#0}>
+              1.85 MB  <kiln::convo::turso::Turso>::exec
+              0.27 MB  <kiln::convo::turso::Turso>::prepare
+              0.14 MB  <kiln::records::turso::Db>::open
+      7.0 MB  queues made up front
+              2.23 MB  kiln::net::start
+              2.10 MB  <kiln::convo::store::Store>::start
+              1.05 MB  <kiln::harness::registry::Registry>::with
+              0.47 MB  <kiln::records::turso::TursoRecords>::open_with
+      3.6 MB  kiln.db (SQLite)
+              2.93 MB  kiln::store::migrations::apply_list
+              0.40 MB  <kiln::store::Store>::in_memory
+              0.26 MB  <kiln::convo::turso::Turso>::run_while::<<kiln::convo::turso::Turso>::run<<kiln::convo::turso::Turso>::write::{closure#0}>::{closure#0}>
+      0.2 MB  other
+              0.18 MB  libjemalloc.so.2
+      0.2 MB  bus (live feeds' frames)
+              0.17 MB  <kiln::bus::QuiverBus>::open
+run store off exit 0
+g11 resident (conversation store off): 20000 events sent (70.1 MB of JSON), 4640 kept; while open the server held 39.22 MB more (8451 bytes an event kept), 39.21 MB of it let go at its end (process 0.10 MB before, 39.32 MB with it, 0.10 MB after); the bus's own count 0.00 MB with it, 0.00 MB after
+== store off: 32 profiles; the most live: 85.3 /mnt/heap/off/jeprof.10827.31.i31.heap; the last: /mnt/heap/off/jeprof.10827.31.i31.heap
+-- store off, most (/mnt/heap/off/jeprof.10827.31.i31.heap)
+/mnt/heap/off/jeprof.10827.31.i31.heap: live 85.3 MB (unsampled estimate), sample period 131072
+     61.3 MB  sessions' copies (harness)
+             20.29 MB  <kiln::harness::registry::Entry>::written
+             16.75 MB  <kiln::harness::model::ToolCall as serde_core::ser::Serialize>::serialize::<serde::private::ser::TaggedSerializer<serde::private::ser::FlatM
+             15.51 MB  kiln::harness::registry::write::string::<<kiln::harness::registry::Snapshot>::frames::{closure#0}::{closure#0}>
+              6.99 MB  <kiln::harness::model::Body as serde_core::ser::Serialize>::serialize::<serde::private::ser::FlatMapSerializer<serde_json::value::ser::Seria
+     14.7 MB  runtime (hyper-rt)
+             13.43 MB  libjemalloc.so.2
+              0.74 MB  kiln::net::thread_main
+              0.50 MB  kiln::rt::start
+      5.3 MB  queues made up front
+              2.23 MB  kiln::net::start
+              1.05 MB  <kiln::harness::registry::Registry>::with
+              0.83 MB  <kiln::harness::copies::Copies>::start_with
+              0.47 MB  <kiln::records::turso::TursoRecords>::open_with
+      3.9 MB  kiln.db (SQLite)
+              3.86 MB  kiln::store::migrations::apply_list
+      0.2 MB  other
+              0.18 MB  libjemalloc.so.2
+-- store off, last (/mnt/heap/off/jeprof.10827.31.i31.heap)
+/mnt/heap/off/jeprof.10827.31.i31.heap: live 85.3 MB (unsampled estimate), sample period 131072
+     61.3 MB  sessions' copies (harness)
+             20.29 MB  <kiln::harness::registry::Entry>::written
+             16.75 MB  <kiln::harness::model::ToolCall as serde_core::ser::Serialize>::serialize::<serde::private::ser::TaggedSerializer<serde::private::ser::FlatM
+             15.51 MB  kiln::harness::registry::write::string::<<kiln::harness::registry::Snapshot>::frames::{closure#0}::{closure#0}>
+              6.99 MB  <kiln::harness::model::Body as serde_core::ser::Serialize>::serialize::<serde::private::ser::FlatMapSerializer<serde_json::value::ser::Seria
+     14.7 MB  runtime (hyper-rt)
+             13.43 MB  libjemalloc.so.2
+              0.74 MB  kiln::net::thread_main
+              0.50 MB  kiln::rt::start
+      5.3 MB  queues made up front
+              2.23 MB  kiln::net::start
+              1.05 MB  <kiln::harness::registry::Registry>::with
+              0.83 MB  <kiln::harness::copies::Copies>::start_with
+              0.47 MB  <kiln::records::turso::TursoRecords>::open_with
+      3.9 MB  kiln.db (SQLite)
+              3.86 MB  kiln::store::migrations::apply_list
+      0.2 MB  other
+              0.18 MB  libjemalloc.so.2

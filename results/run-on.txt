@@ -1,0 +1,7 @@
+
+running 1 test
+g11 resident (conversation store on): 20000 events sent (70.1 MB of JSON), 4640 kept; while open the server held 149.25 MB more (32165 bytes an event kept), 75.55 MB of it let go at its end (process 0.10 MB before, 149.35 MB with it, 73.80 MB after); the bus's own count 0.00 MB with it, 0.00 MB after
+test g11_s2_a_20000_event_sessions_resident_cost ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 9.09s
+
