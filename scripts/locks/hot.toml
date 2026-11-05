@@ -28,6 +28,9 @@ hot = [
   "crates/kiln/src/log_lines.rs",
   # Websockets: an agent session's live feed to its viewers, and the pages' sockets.
   "crates/kiln/src/harness/live.rs",
+  # Agent sessions' events (every change of a session's info) out of each owner shard to their readers:
+  # the events sockets, push and agents.wait (goal 4, plan 01a1a59c2a9c step 5).
+  "crates/kiln/src/memory/lanes.rs",
   "crates/kiln/src/harness/broadcast.rs",
   "crates/kiln/src/wire/ui.rs",
   # Runner ingest: the hub, its link to the runners, and the processes each machine has.

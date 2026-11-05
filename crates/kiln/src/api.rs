@@ -4994,9 +4994,10 @@ async fn pump_events(hub: &Hub, socket: ws::WebSocket, sock: &ui::Socket, mut na
     use futures::FutureExt as _;
     let (mut tx, mut rx_ws) = socket.split();
     let mut rx = hub.events.subscribe();
-    // Agent sessions' own events come on a ring of their own (`Hub::harness_events`; goal 4, plan
-    // 01a1a59c2a9c step 5): the socket sends both, each as it comes.
-    let mut sessions = hub.harness_events.subscribe();
+    // Agent sessions' own events come on their owners' lanes (`Hub::harness_events`; goal 4, plan 01a1a59c2a9c
+    // step 5): the socket sends both, each as it comes, holding as many of the sessions' as the hub's ring
+    // held for a socket ([`crate::hub::EVENTS`], in all its lanes).
+    let mut sessions = hub.harness_events.subscribe(crate::hub::EVENTS.div_ceil(hub.harness_events.lanes()))?;
     hub.emit_queue();
     loop {
         let first = futures::select_biased! {
@@ -5009,7 +5010,7 @@ async fn pump_events(hub: &Hub, socket: ws::WebSocket, sock: &ui::Socket, mut na
                 continue;
             }
         };
-        let mut rings = [&mut rx, &mut sessions];
+        let mut rings: [&mut (dyn Ready + Send); 2] = [&mut rx, &mut sessions];
         if !send_ready(hub, &mut tx, first, &mut rings, &mut narrow, &mut agents).await? {
             return Ok(());
         }
@@ -5025,7 +5026,7 @@ async fn send_ready<S>(
     hub: &Hub,
     tx: &mut S,
     first: Result<Arc<str>, async_broadcast::RecvError>,
-    rings: &mut [&mut crate::memory::ring::Subscription<Arc<str>>],
+    rings: &mut [&mut (dyn Ready + Send)],
     narrow: &mut Option<Narrow>,
     agents: &mut Option<AgentsSeen>,
 ) -> anyhow::Result<bool>
@@ -5057,7 +5058,7 @@ where
         }
         taken += 1;
         if taken < crate::hub::EVENTS {
-            next = rings.iter_mut().find_map(|ring| ready(ring));
+            next = rings.iter_mut().find_map(|ring| ring.ready());
         }
     }
     tx.flush().await?;
@@ -5065,12 +5066,31 @@ where
 }
 
 /// The next of `ring`'s events that's ready now, if one is: what its `recv` would have said at once.
-fn ready(ring: &mut crate::memory::ring::Subscription<Arc<str>>) -> Option<Result<Arc<str>, async_broadcast::RecvError>> {
-    match ring.try_recv() {
+/// An events socket's source of hub events: the hub's ring, and agent sessions' lanes.
+trait Ready {
+    /// The next of its events that's ready now, if one is: what its `recv` would have said at once.
+    fn ready(&mut self) -> Option<Result<Arc<str>, async_broadcast::RecvError>>;
+}
+
+/// What a source's `try_recv` said, as its `recv` would have said it (none: nothing ready).
+fn ready_of(taken: Result<Arc<str>, async_broadcast::TryRecvError>) -> Option<Result<Arc<str>, async_broadcast::RecvError>> {
+    match taken {
         Ok(text) => Some(Ok(text)),
         Err(async_broadcast::TryRecvError::Overflowed(n)) => Some(Err(async_broadcast::RecvError::Overflowed(n))),
         Err(async_broadcast::TryRecvError::Closed) => Some(Err(async_broadcast::RecvError::Closed)),
         Err(async_broadcast::TryRecvError::Empty) => None,
+    }
+}
+
+impl Ready for crate::memory::ring::Subscription<Arc<str>> {
+    fn ready(&mut self) -> Option<Result<Arc<str>, async_broadcast::RecvError>> {
+        ready_of(self.try_recv())
+    }
+}
+
+impl Ready for crate::memory::lanes::Reader<Arc<str>> {
+    fn ready(&mut self) -> Option<Result<Arc<str>, async_broadcast::RecvError>> {
+        ready_of(self.try_recv())
     }
 }
 
@@ -6863,18 +6883,18 @@ mod tests {
         use crate::wire::events::{ServerEvent, kind_of};
         crate::rt::block_on(async {
             let hub = crate::hub::tests::scratch_hub().await?;
-            let (mut rx, mut sessions) = (hub.events.subscribe(), hub.harness_events.subscribe());
-            let (mut rx2, mut sessions2) = (hub.events.subscribe(), hub.harness_events.subscribe());
+            let (mut rx, mut sessions) = (hub.events.subscribe(), hub.harness_events.subscribe(16)?);
+            let (mut rx2, mut sessions2) = (hub.events.subscribe(), hub.harness_events.subscribe(16)?);
             let info = crate::harness::session::Info { id: "s1".into(), kind: "claude".into(), ..Default::default() };
             hub.emit(&ServerEvent::Updates);
-            hub.emit_harness(&serde_json::to_vec(&info)?);
+            hub.emit_harness("s1", &serde_json::to_vec(&info)?);
             hub.emit(&ServerEvent::Terminals);
             hub.emit(&ServerEvent::HarnessClosed { id: "s1".into() });
             let (mut one, mut two) = (Written::default(), Written::default());
             let first = rx.recv().await;
-            anyhow::ensure!(send_ready(&hub, &mut one, first, &mut [&mut rx, &mut sessions], &mut None, &mut None).await?, "the rings are there");
+            anyhow::ensure!(send_ready(&hub, &mut one, first, &mut [&mut rx as &mut (dyn Ready + Send), &mut sessions], &mut None, &mut None).await?, "the rings are there");
             let first = rx2.recv().await;
-            anyhow::ensure!(send_ready(&hub, &mut two, first, &mut [&mut rx2, &mut sessions2], &mut None, &mut None).await?, "the rings are there");
+            anyhow::ensure!(send_ready(&hub, &mut two, first, &mut [&mut rx2 as &mut (dyn Ready + Send), &mut sessions2], &mut None, &mut None).await?, "the rings are there");
             let text = |m: &ws::Message| match m {
                 ws::Message::Text(t) => Some(t.as_str().to_owned()),
                 _ => None,
@@ -6905,7 +6925,7 @@ mod tests {
             }
             let mut three = Written::default();
             let first = behind.recv().await;
-            anyhow::ensure!(send_ready(&hub, &mut three, first, &mut [&mut behind], &mut None, &mut None).await?);
+            anyhow::ensure!(send_ready(&hub, &mut three, first, &mut [&mut behind as &mut (dyn Ready + Send)], &mut None, &mut None).await?);
             let said: Vec<String> = three.sent.iter().filter_map(text).collect();
             anyhow::ensure!(said.first().map(String::as_str) == Some(ServerEvent::Resync.text().as_str()) && said.len() == 3 && three.flushes == 1, "{said:?}");
             Ok(())

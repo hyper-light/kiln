@@ -240,7 +240,51 @@ counters! {
     socket_writes_full,
     /// Accepts of TCP connections the shard's listeners made, each a system call, those that found none among them.
     socket_accepts,
+    /// How long the shard's driver waits lasted, nanoseconds, summed, each from its call to its return: with
+    /// [`Counters::waits`], how long a park lasts (kiln's goal 9, plan 01a1a87b2cec step 5: whether a short spin before
+    /// parking would catch its work for less than a park and its wake cost).
+    parked_ns,
+    /// Driver waits that lasted under 1 µs ([`PARK_BOUNDS_NS`]' first bound), and so on up by doubling: each the waits
+    /// under its bound, the waits under the bound before it among them, as a histogram's cumulative buckets are.
+    parks_under_1us,
+    /// Under 2 µs.
+    parks_under_2us,
+    /// Under 4 µs.
+    parks_under_4us,
+    /// Under 8 µs.
+    parks_under_8us,
+    /// Under 16 µs.
+    parks_under_16us,
+    /// Under 32 µs.
+    parks_under_32us,
+    /// Under 64 µs.
+    parks_under_64us,
+    /// Under 128 µs.
+    parks_under_128us,
+    /// Under 256 µs.
+    parks_under_256us,
+    /// Under 512 µs.
+    parks_under_512us,
+    /// Under 1024 µs.
+    parks_under_1024us,
+    /// Under 2048 µs.
+    parks_under_2048us,
+    /// Under 4096 µs.
+    parks_under_4096us,
+    /// Under 8192 µs.
+    parks_under_8192us,
 }
+
+/// Shape: the bounds of the park durations counted ([`Counters::parks_under_1us`] and on), nanoseconds, doubling from
+/// 1 µs to 8,192 µs, so a duration reads within a factor of two (a p50 and a p99 within one). From 1 µs, under what a
+/// park and its wake cost a shard's thread; through 16 µs, the first bound past the cheapest wake the lab measured on
+/// fedora (a socket's wake on the waiting thread's own CPU, 12.6 µs at its median: the wake-2 lab, 2026-11-05), so
+/// the parks under it are those a spin as long would have served sooner than a park's wake; to 8,192 µs, under the
+/// 10 ms period of kiln's health probe, which ends an idle shard's longest park.
+pub const PARK_BOUNDS_NS: [u64; 14] = [
+    1_000, 2_000, 4_000, 8_000, 16_000, 32_000, 64_000, 128_000, 256_000, 512_000, 1_024_000, 2_048_000, 4_096_000,
+    8_192_000,
+];
 
 /// Shape: the exponential-forgetting shift of the measured scheduler overrun — an overrun not renewed
 /// decays by `1/8` (`>> 3`) at each later wait, so a starvation spike lingers about eight waits and then
@@ -1711,7 +1755,8 @@ impl Shard {
         if let Some(entry) = self.desk.entry {
             entry.pulse.record_waits(self.desk.live.waits.get());
         }
-        let timeout = deadline_ns.map(|d| d.saturating_sub(self.core.driver.now_ns()));
+        let began = self.core.driver.now_ns();
+        let timeout = deadline_ns.map(|d| d.saturating_sub(began));
         let kicks = self.core.driver.kicks_taken();
         let harvested = self.receive_completions(timeout);
         if !self.core.driver_lost {
@@ -1723,8 +1768,36 @@ impl Shard {
                 &self.desk.live.woken_by_timer
             };
             count(by, 1);
+            self.note_parked(self.core.driver.now_ns().saturating_sub(began));
         }
         self.core.driver_lost
+    }
+
+    /// Counts a driver wait that lasted `parked_ns` into the shard's park durations ([`PARK_BOUNDS_NS`]).
+    fn note_parked(&self, parked_ns: u64) {
+        let live = &self.desk.live;
+        count(&live.parked_ns, parked_ns);
+        let under = [
+            &live.parks_under_1us,
+            &live.parks_under_2us,
+            &live.parks_under_4us,
+            &live.parks_under_8us,
+            &live.parks_under_16us,
+            &live.parks_under_32us,
+            &live.parks_under_64us,
+            &live.parks_under_128us,
+            &live.parks_under_256us,
+            &live.parks_under_512us,
+            &live.parks_under_1024us,
+            &live.parks_under_2048us,
+            &live.parks_under_4096us,
+            &live.parks_under_8192us,
+        ];
+        for (bound, bucket) in PARK_BOUNDS_NS.iter().zip(under) {
+            if parked_ns < *bound {
+                count(bucket, 1);
+            }
+        }
     }
 
     /// Driver loss has already marked cancellation. The normal loop keeps owning
