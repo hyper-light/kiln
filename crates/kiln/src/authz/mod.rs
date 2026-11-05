@@ -637,6 +637,7 @@ pub static ROUTES: &[Rule] = &[
     // a runner's rules and asking it to let go now its managers'; every runner's rules and a
     // repository's are the server's settings (unnamed).
     r("GET", "/api/reach/keep", "runners.read", At::Server),
+    r("GET", "/api/reach/offers", "runners.read", At::Server),
     r("PUT", "/api/reach/keep/runners/*", "runners.manage", At::Runner(4)),
     r("DELETE", "/api/reach/keep/runners/*", "runners.manage", At::Runner(4)),
     r("POST", "/api/reach/keep/runners/*/now", "runners.manage", At::Runner(4)),
