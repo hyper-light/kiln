@@ -17,9 +17,9 @@
 //! * hyper-rt's leaf futures (timers, socket readiness, its sync channels) accept only the polling
 //!   task's own waker. Everything exported here works under any waker: timers fall back to a
 //!   helper task ([`Bridge`]) when polled through a combinator or library that substitutes its own
-//!   waker, and the cross-task primitives work with any executor: [`Notify`] and [`Shutdown`] wait on
-//!   `crate::memory::queue`'s lock-free list of waiters (goal 5), [`Broadcast`] on `crate::memory::lanes`,
-//!   and the channels here are `async-channel`'s.
+//!   waker, and the cross-task primitives work with any executor: [`Notify`], [`Shutdown`] and [`Changed`]
+//!   wait on `crate::memory::queue`'s lock-free list of waiters (goal 5), [`Broadcast`] on
+//!   `crate::memory::lanes`, and the channels here are `async-channel`'s.
 
 use std::future::Future;
 use std::io;
@@ -1879,6 +1879,103 @@ impl Notify {
     }
 }
 
+// ------------------------------------------------------------------------------------ changed
+
+/// Something changed (a store's commit, a session let in, a task's news): a notify ends every wait begun before
+/// it, and a wait begun after it waits for the next; nothing is kept for a wait to come. So a waiter listens first
+/// ([`Changed::listen`]), looks at what it waits for, then waits: a change made after its look is a notify after
+/// its listen. With no lock ([`Waits`]; goal 5, plan 01a1a59c2aae, its top goal): it was event-listener's `Event`,
+/// whose list of listeners sits behind a std `Mutex` that every listen, every wait given up and every notify finding
+/// a listener took. The records' change feed, the conversation store's writer's room, a sync task's news, a
+/// runner's harness host and cache uploads, and headroom's held sessions waited so (the census of train 8's tree:
+/// event-listener's the one lock the shards still shared, 1.8 ms a second waited with hogs, docs/runtime-lab.md).
+#[derive(Default)]
+pub struct Changed {
+    /// The notifies so far: a wait is over once they're more than when it began.
+    count: AtomicU64,
+    waits: Waits,
+}
+
+impl Changed {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Ends every wait begun before it.
+    pub fn notify(&self) {
+        self.count.fetch_add(1, Ordering::SeqCst);
+        self.waits.wake();
+    }
+
+    /// A wait for the next notify, begun now: a notify between this and its await still ends it. Awaited, or on
+    /// a thread of its own ([`Listen::wait_deadline`]).
+    pub fn listen(&self) -> Listen<'_> {
+        Listen { changed: self, seen: self.count.load(Ordering::SeqCst), held: None }
+    }
+}
+
+/// A wait on a [`Changed`], begun as it was made: a future (a charge of the task's turn on its shard first,
+/// `hyper_rt::coop`, as [`Notify::notified`]'s), or a thread's wait ([`Listen::wait_deadline`]). Its place on the
+/// list is one of the changed's spares, back among them as it's dropped ([`Waits`]).
+#[must_use = "a wait does nothing unless it's awaited"]
+pub struct Listen<'a> {
+    changed: &'a Changed,
+    seen: u64,
+    held: Option<Held<'a>>,
+}
+
+impl<'a> Listen<'a> {
+    /// Whether a notify came since it began.
+    fn over(&self) -> bool {
+        self.changed.count.load(Ordering::SeqCst) != self.seen
+    }
+
+    /// Its place on the list: a spare's, taken up as it first waits.
+    fn place(&mut self) -> Arc<crate::memory::queue::Place> {
+        let changed: &'a Changed = self.changed;
+        let held = self.held.get_or_insert_with(|| Held { place: changed.waits.spares.pop().unwrap_or_else(|_| crate::memory::queue::Place::new()), spares: &changed.waits.spares });
+        Arc::clone(&held.place)
+    }
+
+    /// Waits, blocking its thread (a thread of its own, never a shard's), until a notify or `until`: whether a
+    /// notify came.
+    pub fn wait_deadline(mut self, until: Instant) -> bool {
+        let waker = crate::memory::queue::thread_waker();
+        loop {
+            if self.over() {
+                return true;
+            }
+            let place = self.place();
+            self.changed.waits.list.wait(&place, &waker);
+            if self.over() {
+                return true;
+            }
+            let now = Instant::now();
+            if now >= until {
+                return false;
+            }
+            std::thread::park_timeout(until.saturating_duration_since(now));
+        }
+    }
+}
+
+impl Future for Listen<'_> {
+    type Output = ();
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
+        let this = self.get_mut();
+        if hyper_rt::coop::poll_proceed(cx).is_pending() {
+            return Poll::Pending;
+        }
+        if this.over() {
+            return Poll::Ready(());
+        }
+        let place = this.place();
+        this.changed.waits.list.wait(&place, cx.waker());
+        if this.over() { Poll::Ready(()) } else { Poll::Pending }
+    }
+}
+
 // ---------------------------------------------------------------------------------- broadcast
 
 /// Fan-out to every current subscriber, with no lock on any path (goal 4, plan 01a1a59c2a9c step 5; goal 5's
@@ -2663,16 +2760,16 @@ mod tests {
         section.lines().map(|l| l.split("//").next().unwrap_or_default()).collect::<Vec<_>>().join("\n")
     }
 
-    /// Goal 5, plan 01a1a59c2aae (its top goal), run by kiln's CI with every test: a notifier and a shutdown take
-    /// no lock and wait on nothing that does. Their waits were event-listener's, whose list sits behind a `Mutex`
-    /// every wait and every wake took: goal 5's census of train 8's tree found it the one lock the shards still
-    /// shared.
+    /// Goal 5, plan 01a1a59c2aae (its top goal), run by kiln's CI with every test: a notifier, a shutdown and a
+    /// changed take no lock and wait on nothing that does. Their waits were event-listener's, whose list sits behind
+    /// a `Mutex` every wait and every wake took: goal 5's census of train 8's tree found it the one lock the shards
+    /// still shared.
     #[test]
     fn g5_notify_and_shutdown_take_no_lock() {
         let code = shutdown_and_notify_code();
-        assert!(code.contains("pub struct Notify") && code.contains("pub struct Shutdown"), "not Notify's and Shutdown's code:\n{code}");
+        assert!(code.contains("pub struct Notify") && code.contains("pub struct Shutdown") && code.contains("pub struct Changed"), "not Notify's, Shutdown's and Changed's code:\n{code}");
         for lock in ["Mutex", "RwLock", "Condvar", "parking_lot", "async_lock", "event_listener", "Event::new", "async_channel"] {
-            assert!(!code.contains(lock), "rt::Notify or rt::Shutdown takes a lock, or waits on something that does: {lock}");
+            assert!(!code.contains(lock), "rt::Notify, rt::Shutdown or rt::Changed takes a lock, or waits on something that does: {lock}");
         }
     }
 
@@ -2823,6 +2920,104 @@ mod tests {
             for w in waiting {
                 timeout(Duration::from_secs(5), w).await?.map_err(|_| anyhow::anyhow!("a waiter ended without its notify"))?;
             }
+            Ok(())
+        })
+    }
+
+    /// Goal 5, plan 01a1a59c2aae (its top goal): a changed's notify ends every wait begun before it, on every shard,
+    /// one begun before it and awaited after it among them; it keeps nothing for a wait begun after it. Every wait
+    /// over, its places are spares, never more than the waits at once.
+    #[test]
+    fn g5_a_changed_ends_every_wait_begun_before_it_and_keeps_nothing() -> anyhow::Result<()> {
+        block_on(async {
+            let c = Arc::new(Changed::new());
+            let early = c.listen();
+            c.notify();
+            timeout(Duration::from_secs(1), early).await?;
+            let mut after = std::pin::pin!(c.listen());
+            anyhow::ensure!(futures::poll!(after.as_mut()).is_pending(), "a wait begun after a notify ended without one");
+            let (waiters, listening, ended) = (32usize, Arc::new(AtomicUsize::new(0)), Arc::new(AtomicUsize::new(0)));
+            let mut waiting = Vec::new();
+            for _ in 0..waiters {
+                let (c, listening, ended) = (Arc::clone(&c), Arc::clone(&listening), Arc::clone(&ended));
+                waiting.push(spawn_spread_joined(async move {
+                    let l = c.listen();
+                    listening.fetch_add(1, Ordering::SeqCst);
+                    l.await;
+                    ended.fetch_add(1, Ordering::SeqCst);
+                }));
+            }
+            let until = Instant::now() + Duration::from_secs(5);
+            while listening.load(Ordering::SeqCst) < waiters {
+                anyhow::ensure!(Instant::now() < until, "{} of {waiters} listening after 5 s", listening.load(Ordering::SeqCst));
+                sleep(Duration::from_millis(1)).await;
+            }
+            sleep(Duration::from_millis(20)).await;
+            anyhow::ensure!(ended.load(Ordering::SeqCst) == 0, "a wait ended before the notify");
+            c.notify();
+            for w in waiting {
+                timeout(Duration::from_secs(5), w).await?.map_err(|_| anyhow::anyhow!("a waiter ended without its wake"))?;
+            }
+            anyhow::ensure!(ended.load(Ordering::SeqCst) == waiters, "{} of {waiters} waits ended", ended.load(Ordering::SeqCst));
+            timeout(Duration::from_secs(1), after).await?;
+            let (listed, spares) = (c.waits.list.listed(), c.waits.spares.len());
+            anyhow::ensure!(listed <= spares && spares <= waiters + 1, "{listed} places listed, {spares} spare, for {} waits at most", waiters + 1);
+            Ok(())
+        })
+    }
+
+    /// Goal 5, plan 01a1a59c2aae (its top goal): a thread's wait on a changed (the conversation store's senders'
+    /// room) ends at its deadline with no notify, at once for a notify after its listen, and at a notify from a shard.
+    #[test]
+    fn g5_a_threads_wait_on_a_changed_ends_at_a_notify_or_its_deadline() -> anyhow::Result<()> {
+        let c = Arc::new(Changed::new());
+        let began = Instant::now();
+        anyhow::ensure!(!c.listen().wait_deadline(began + Duration::from_millis(30)), "a wait ended with no notify");
+        anyhow::ensure!(began.elapsed() >= Duration::from_millis(30), "a wait ended before its deadline with no notify");
+        let begun = c.listen();
+        c.notify();
+        anyhow::ensure!(begun.wait_deadline(Instant::now() + Duration::from_secs(5)), "a notify after the listen was lost");
+        let c2 = Arc::clone(&c);
+        let ringer = std::thread::spawn(move || {
+            block_on(async move {
+                let until = Instant::now() + Duration::from_secs(5);
+                while c2.waits.list.listed() == 0 {
+                    anyhow::ensure!(Instant::now() < until, "the thread's wait never listed its place");
+                    sleep(Duration::from_millis(1)).await;
+                }
+                c2.notify();
+                Ok(())
+            })
+        });
+        anyhow::ensure!(c.listen().wait_deadline(Instant::now() + Duration::from_secs(10)), "a notify from a shard didn't end a thread's wait");
+        ringer.join().map_err(|_| anyhow::anyhow!("the ringer panicked"))??;
+        Ok(())
+    }
+
+    /// Goal 5, plan 01a1a59c2aae (its top goal): a loop that listens each turn beside an arm that wins (the records'
+    /// waits beside their callers' timeouts) keeps one place, not one more a turn; its next wait is woken from
+    /// another shard.
+    #[test]
+    fn g5_waits_on_a_changed_given_up_each_turn_keep_one_place() -> anyhow::Result<()> {
+        use futures::FutureExt as _;
+        block_on(async {
+            let c = Arc::new(Changed::new());
+            for _ in 0..10_000 {
+                let ev = futures::select_biased! {
+                    () = c.listen().fuse() => "changed",
+                    () = futures::future::ready(()).fuse() => "turn",
+                };
+                anyhow::ensure!(ev == "turn", "{ev}, with no notify");
+            }
+            anyhow::ensure!(c.waits.list.listed() <= 1 && c.waits.spares.len() <= 1, "{} places listed, {} spare after 10,000 turns", c.waits.list.listed(), c.waits.spares.len());
+            let next = c.listen();
+            let c2 = Arc::clone(&c);
+            let ringing = spawn_spread_joined(async move {
+                sleep(Duration::from_millis(20)).await;
+                c2.notify();
+            });
+            timeout(Duration::from_secs(5), next).await?;
+            timeout(Duration::from_secs(5), ringing).await?.map_err(|_| anyhow::anyhow!("the ringer ended"))?;
             Ok(())
         })
     }

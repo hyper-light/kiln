@@ -128,8 +128,8 @@ pub struct Assignment {
 
 /// One change to programs' settings and assignments at a time (each is read, changed and kept
 /// whole): a person's, the coordinator's, the weights' seeding and a notice's delivery. Taken
-/// before the stacks' lock (`goals::CHANGING`), never while it's held.
-pub(crate) static WRITING: async_lock::Mutex<()> = async_lock::Mutex::new(());
+/// before the stacks' lock (`goals::CHANGING`), never while it's held. In the order they came, with no lock (`crate::turn`; goal 5, plan 01a1a59c2aae, its top goal).
+pub(crate) static WRITING: crate::turn::Gate = crate::turn::Gate::one();
 
 fn settings_key(program: &str) -> String {
     format!("programs/{program}/settings")
@@ -510,7 +510,7 @@ async fn seeded(hub: &Hub, master: &str) -> anyhow::Result<Settings> {
     }
     // Seeded under the lock, from the settings as they are then: a person's change made meanwhile
     // is kept.
-    let _w = WRITING.lock().await;
+    let _w = WRITING.turn().await;
     let mut s = settings(hub, master).await?;
     if s.seeded {
         return Ok(s);
@@ -787,7 +787,7 @@ async fn enforce_all(hub: &Hub) -> anyhow::Result<()> {
             let sent = deliver(hub, c, n.clone()).await;
             // Kept only if it's still the notice the settings hold: a change of the person's made
             // meanwhile (and its own notice) stands.
-            let _w = WRITING.lock().await;
+            let _w = WRITING.turn().await;
             let mut s = settings(hub, &p.id).await?;
             if s.notice.as_ref() == Some(n) {
                 s.notice = Some(sent);

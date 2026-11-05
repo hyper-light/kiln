@@ -784,10 +784,12 @@ pub async fn enrolled(store: &Store, machine: &str, by: &str) -> anyhow::Result<
         .await
 }
 
-/// Who enrolled `machine`: `admin` for one enrolled before kiln recorded it.
+/// Who enrolled `machine`: `admin` for one enrolled before kiln recorded it. Read on the store's read connections, not
+/// in the writer's turn (goal 9, plan 01a1a87b2cec step 5: train 8's census had it 37 times a second behind the writes,
+/// 4.6 ms each, on every runner's identity and every mirror's hand-on): an enrollment committed before it is read.
 pub async fn enrolled_by(store: &Store, machine: &str) -> anyhow::Result<String> {
     let machine = machine.to_owned();
-    let by: Option<String> = store.call(move |c| Ok(c.query_row("SELECT enrolled_by FROM enrollments WHERE machine = ?1", [machine], |r| r.get(0)).optional()?)).await?;
+    let by: Option<String> = store.read(move |c| Ok(c.query_row("SELECT enrolled_by FROM enrollments WHERE machine = ?1", [machine], |r| r.get(0)).optional()?)).await?;
     Ok(by.unwrap_or_else(|| "admin".to_owned()))
 }
 
@@ -1285,15 +1287,16 @@ fn revocations_on(c: &rusqlite::Connection) -> rusqlite::Result<Vec<Revocation>>
     q.query_map([], |r| Ok(Revocation { serial: r.get(0)?, key: r.get(1)?, at: r.get(2)?, reason: r.get(3)?, by: r.get(4)? }))?.collect()
 }
 
-/// What tells one set of revocations from another: how many there are, and the newest's id. Nothing changes or
-/// deletes a revocation; one is only added ([`revoke`]), under an id past every id before it (the table's
-/// `AUTOINCREMENT`, migration `w27_identities`), so the stamp moves with each one added, and with nothing else.
-pub type Stamp = (i64, i64);
+/// What tells one set of revocations from another: the newest's id (0 for none). Nothing changes or deletes a
+/// revocation; one is only added ([`revoke`]), under an id past every id before it (the table's `AUTOINCREMENT`,
+/// migration `w27_identities`), so the stamp moves with each one added, and with nothing else.
+pub type Stamp = i64;
 
-/// The revocations' [`Stamp`] as `c` has them now: a count and a lookup of the largest key, the same few pages
-/// read however many there are.
+/// The revocations' [`Stamp`] as `c` has them now: one lookup of the largest key, the same few pages read however
+/// many there are. Goal 9, plan 01a1a87b2cec step 5: it counted them too, and a count visits every leaf page of the
+/// table, in every custody record's keeping call, in the writer's turn; the newest id alone moves as the count did.
 pub fn revoked_stamp(c: &rusqlite::Connection) -> rusqlite::Result<Stamp> {
-    c.query_row("SELECT COUNT(*), COALESCE(MAX(id), 0) FROM revocations", [], |r| Ok((r.get(0)?, r.get(1)?)))
+    c.query_row("SELECT COALESCE(MAX(id), 0) FROM revocations", [], |r| r.get(0))
 }
 
 /// Every revocation as one read of them found them, with their [`Stamp`] then (goal 9, plan 01a1a87b2cec step 5):
@@ -1455,6 +1458,55 @@ mod tests {
     fn cert(pki: &crate::pki::Pki, name: &str) -> anyhow::Result<String> {
         let (csr, _key) = crate::pki::make_csr(name)?;
         pki.sign_csr(&csr, name, 30)
+    }
+
+    /// Goal 9, plan 01a1a87b2cec step 5: who enrolled a machine is read on the store's read connections, not in the
+    /// writer's turn: answered while the writer is held by another call, with what the last enrollment committed, and
+    /// `admin` for a machine never enrolled.
+    #[test]
+    fn g9_s5_who_enrolled_a_machine_is_read_beside_the_writer() -> anyhow::Result<()> {
+        crate::rt::block_on(async {
+            let dir = tempfile::tempdir()?;
+            let store = Store::open(&dir.path().join("kiln.db"))?;
+            enrolled(&store, "box", "user:sam").await?;
+            enrolled(&store, "box", "user:ada").await?;
+            let hold = store.call(|_| {
+                std::thread::sleep(std::time::Duration::from_secs(2));
+                Ok(())
+            });
+            let ask = async {
+                // The writer has taken the held call by now.
+                crate::rt::sleep(std::time::Duration::from_millis(200)).await;
+                let began = std::time::Instant::now();
+                let (by, never) = (enrolled_by(&store, "box").await, enrolled_by(&store, "never").await);
+                (by, never, began.elapsed())
+            };
+            let (held, (by, never, took)) = futures::join!(hold, ask);
+            held?;
+            anyhow::ensure!(by? == "ada" && never? == "admin", "the last enrollment's, and admin for none");
+            anyhow::ensure!(took < std::time::Duration::from_secs(1), "read in {took:?}, behind the writer's 2 s call");
+            Ok(())
+        })
+    }
+
+    /// Goal 9, plan 01a1a87b2cec step 5: the revocations' stamp is the newest's id, no count: it moves with each one
+    /// added and with nothing else (a read, another table's write), and the list read with it carries the same.
+    #[test]
+    fn g9_s5_the_revocations_stamp_moves_with_each_one_added() -> anyhow::Result<()> {
+        crate::rt::block_on(async {
+            let store = Store::in_memory()?;
+            let stamp = || store.call(|c| Ok(revoked_stamp(c)?));
+            let none = stamp().await?;
+            anyhow::ensure!(none == 0, "none yet: {none}");
+            revoke(&store, Target::Key("ab".into()), "lost", "ada", 1).await?;
+            let one = stamp().await?;
+            enrolled(&store, "box", "user:ada").await?;
+            anyhow::ensure!(one > none && stamp().await? == one, "moved with the one added ({none} then {one}), not with another table's write");
+            revoke(&store, Target::Key("cd".into()), "lost", "ada", 2).await?;
+            let (two, read) = (stamp().await?, revoked_now(&store).await?);
+            anyhow::ensure!(two > one && read.stamp == two && read.list.len() == 2, "{two} after {one}; the list read with it: {read:?}");
+            Ok(())
+        })
     }
 
     /// W27-R01: a leg's certificate lasts as long as its attempt may (its timeout) and an hour

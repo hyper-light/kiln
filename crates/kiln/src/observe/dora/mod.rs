@@ -9,7 +9,6 @@ pub mod http;
 pub mod ledger;
 pub mod levels;
 
-use std::collections::HashMap;
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, OnceLock};
@@ -127,10 +126,12 @@ pub struct Dora {
     hub: Option<Arc<Hub>>,
     ledger: Mutex<Ledger>,
     journal: Arc<Mutex<Journal>>,
-    /// Changes to the ledger, one at a time: its file in its order.
-    writing: async_lock::Mutex<()>,
-    /// Each service and environment's deployments, one at a time: each finds the one before it.
-    turns: Mutex<HashMap<Key, Arc<async_lock::Mutex<()>>>>,
+    /// Changes to the ledger, one at a time: its file in its order. In the order they came, with no lock
+    /// (`crate::turn`; goal 5, plan 01a1a59c2aae, its top goal).
+    writing: crate::turn::Gate,
+    /// Each service and environment's deployments, one at a time: each finds the one before it. A gate per
+    /// service and environment while one is recorded, gone with its last (`crate::turn::Keyed`, no lock).
+    turns: crate::turn::Keyed<Key, crate::turn::Gate>,
 }
 
 static DORA: OnceLock<Arc<Dora>> = OnceLock::new();
@@ -161,13 +162,13 @@ impl Dora {
         {
             tracing::warn!(error = %e, "DORA's ledger: could not be rewritten");
         }
-        Arc::new(Self { hub, ledger: Mutex::new(ledger), journal: Arc::new(Mutex::new(journal)), writing: async_lock::Mutex::new(()), turns: Mutex::new(HashMap::new()) })
+        Arc::new(Self { hub, ledger: Mutex::new(ledger), journal: Arc::new(Mutex::new(journal)), writing: crate::turn::Gate::one(), turns: crate::turn::Keyed::new() })
     }
 
     /// What `f` makes of the ledger, its lines written to its file (the whole rewritten when the
     /// file holds twice what stands, or a write before failed).
     async fn change<R>(&self, f: impl FnOnce(&mut Ledger) -> (R, Vec<Line>)) -> R {
-        let _w = self.writing.lock().await;
+        let _w = self.writing.turn().await;
         let (r, lines, whole) = {
             let mut l = self.ledger.lock();
             let (r, lines) = f(&mut l);
@@ -203,8 +204,8 @@ impl Dora {
         r
     }
 
-    fn turn(&self, service: &str, env: &str) -> Arc<async_lock::Mutex<()>> {
-        self.turns.lock().entry((service.to_owned(), env.to_owned())).or_default().clone()
+    fn turn(&self, service: &str, env: &str) -> crate::turn::Entry<'_, Key, crate::turn::Gate> {
+        self.turns.of(&(service.to_owned(), env.to_owned()))
     }
 
     /// What reads the ledger, a moment.
@@ -248,7 +249,7 @@ impl Dora {
             d.team = team;
         }
         let turn = self.turn(&d.service, &d.env);
-        let _t = turn.lock().await;
+        let _t = turn.turn().await;
         let (prev, next, existed) = self.read(|l| {
             let prev = l.before(&d.service, &d.env, d.finished_at, &d.id);
             let next = l.after(&d.service, &d.env, d.finished_at, &d.id);
@@ -324,7 +325,7 @@ impl Dora {
     pub async fn patch(&self, id: &str, failed: bool, remedy: Option<RemedyBy>) -> Result<Deployment, PatchError> {
         let (service, env) = self.read(|l| l.deployment(id).map(|d| (d.service.clone(), d.env.clone()))).ok_or(PatchError::NoDeployment)?;
         let turn = self.turn(&service, &env);
-        let _t = turn.lock().await;
+        let _t = turn.turn().await;
         let (changed, now) = self
             .change(|l| {
                 let Some(d) = l.deployment(id) else { return (Err(PatchError::NoDeployment), Vec::new()) };

@@ -1705,6 +1705,113 @@ connection's bound (4.6 MB, `store::cache_bound`). A read past the peak opens a 
 schema again (2.0 ms at the median, 2.4 at the most, of 30 on fedora, on the blocking pool): watch store-backed
 numbers' p99 (pages, MCP, fill).
 
+### What still holds the heap, and the A/B for jemalloc's share (step 5, part 3)
+
+What's live, biggest first, from train 4's heap profile (the newest there is, 164.6 MB by its estimate) less
+what's been cut since. A figure marked "est." is that arithmetic, not a measurement: the lab's owners and
+a heap profile of the merged tree (below) say what's there now.
+
+| What holds it | train 4 | now | Whose | Where it stands |
+| --- | --- | --- | --- | --- |
+| the events socket's feed: 4,096 frames, most an agent's whole info | (not in that tree) | est. 8 to 10 | kiln (`wire::events::feed`, main's W21-R15) | cut, on train 8's tree with main's (branch `g11s5-anon-feed`): below |
+| session copies: each event's meta, its id and its index entry, the newest page or not | 8.7: `Events::compact` 3.16 (compact chunks' metas), the ids among `Registry::apply`'s 5.25, `Mirror::upsert` 2.65 (the index) | est. 8 (about 45,000 events at 180 bytes) | kiln (`harness::copies`) | below: about 2 MB can go; not cut here |
+| session copies: open chunks' texts and the newest page's | 4.7 (`Entry::of_event`) | 6.8 (`session_entries`, g11pages) | kiln | at its basis: each copy's newest chunk as text |
+| hyper-log's read pool and zero-fill buffer; hyper-durable's log entries | 16.4; 5.8 | the same | vendored hyper-raft | not kiln's: READY 1's vendor patches |
+| the bus's frames | 9.5 | 6.9 to 7.7 (`bus`) | vendored quiver, kiln's bounds | at what its topics retain |
+| observe: its owner's batcher and log, its store's head, its ingest | 6.0 | 6.0, and the index's 1.07 | kiln-obs | not on `/metrics`: an owner for it is next |
+| QUIC's transmits | 5.2 | 5.2 | vendored hyper-quic | not kiln's |
+| websockets' send buffers | 2.4 | 2.4 | tungstenite (crates.io) | below |
+| snapshots in flight | 6.3 | 0 at the window's end (`snapshots`) | kiln | in flight only |
+
+**The events feed** (`crate::wire::events::feed`, on main since W21-R15, lock-free in train 8). Every frame
+the hub emits is numbered and kept in a ring of `RING` (4,096) places, so a page that reconnects resumes. Most
+of what's pushed is an agent's `harness` frame: its whole info (about 60 fields, 1.5 to 3 KB) at each change,
+about 1,700 a second in the many-sessions profile (`wire::events::kind_of`'s count), so in the realistic
+profile (8 of 32 agents at work) the ring holds most of a minute of them. Each frame took its text and
+about 224 bytes of room (its `Meta`, 176 bytes, inline), and a socket's read added its kind, key and agent:
+4,096 x about 2.3 KB, est. 9.4 MB, with no owner and no bound in bytes. Every frame but each agent's newest
+is one no socket is sent: a batch sends a thing's newest alone, and a page that resumes from before the
+newest is sent the newest. The cut:
+- `Feed::push_over`: an agent's info frame says the number of that agent's last one (its copy keeps it,
+  `Mirror::harness_at`), and once the new one is in its place, the old one's place takes a frame of its
+  number alone (80 bytes), which readers pass over. Numbers, gaps and resumes are as they were.
+- A frame's `Meta` is boxed, made by the first socket that reads it: a frame's room is 48 bytes.
+- Bounded: 4,096 frames and `feed::BYTES`, 64 MiB of them (`net::EVENTS_BYTES`, what a listener of the
+  hub's events holds before it starts over, where a socket is told `resync`), the oldest going past either,
+  never the newest. `kiln_memory_bytes{owner="events_feed"}` says what its places hold.
+- Expected, the lab's realistic profile: est. 0.8 MB (32 agents' newest, about 75 KB; 4,096 places at 80
+  bytes, 0.33 MB; the other frames), so anonymous memory about 8 MB less than main's feed holds.
+
+**Session copies past the newest page.** A copy keeps its spilled chunks' segments on disk but each event's
+`Meta` in memory: 72 bytes (its id's `Arc<str>` 16, number 16, revision 8, offset 8, length 8, digest 16),
+its id's own allocation (two counts and 30 to 36 bytes: jemalloc's 48 or 64-byte class) and its entry in
+the copy's index (`HashMap<Arc<str>, usize>`, 24 bytes a bucket, 8,192 buckets for a copy of 4,000 to 5,000
+events: 224 KiB): about 180 bytes an event. The realistic profile keeps about 45,000 (2 copies at 4,000 to
+5,000, 6 at 4,000 to 5,000, 24 at 400): est. 8 MB, train 4's 8.7. What would take about 2.2 MB off, all in
+`harness/copies.rs` (`registry.rs` reads a meta's offset, length, number and revision alone): a chunk's ids
+in one allocation, a meta saying where its id is in them (64 bytes a meta), and the index keyed by a 64-bit
+hash of the id to the event's place (16 bytes a bucket), each hit checked against the id in its chunk (in
+memory, spilled or not) and the rare collision kept apart in a small map by id. Not made here: most of the
+copy's index upkeep changes with it (drains, cuts, re-indexing), in a file every item shares; it's a step of
+its own once the lab says what the feed and jemalloc's settings gave.
+
+**Per-connection and per-shard buffers.** kiln-http keeps per thread a 64 KiB scratch buffer and at most 64
+write buffers of at most 64 KiB, and the API's encode buffer at most 64 KiB (`ENCODE_KEPT`); the sockets read
+16 KiB at a time; a shard's desk is written only as far as it's used. What's left is tungstenite's: each
+socket's send buffer keeps its capacity at the most it ever buffered (`FrameCodec::out_buffer` is drained,
+never shrunk), a batch of the events socket or a snapshot's piece: 2.4 MB in train 4. Kiln can't shrink it
+through tungstenite 0.30's API; either sends go as frames of at most 64 KiB, with `write_buffer_size` at 64
+KiB, or a vendored tungstenite lets an emptied buffer past 64 KiB go. And hyper-quic's transmits (5.2 MB) are
+the vendored transport's.
+
+**Bounds against the lab's peaks.** None of the lab's resident memory sits at a bound: the queues' (64 MiB
+each, most) held 0 to 0.1 MB at the window's end (g11pages, calm and hogs) and make their places as they
+fill, so a tighter bound wouldn't move what's resident. Those that fill as they're used are under theirs:
+`session_segments` 1.5 MB of 2.9 (32 copies x `PAGE_BYTES`), `sqlite` 1.4 to 1.6 MB of about 4.3 MB a
+connection, the bus 12.2 MB at its busiest second of a 171 MiB bound reckoned for production's 134 agents (a
+topic 3.7 MB at the most of 5 MiB). `custody_receipts` reached 4.6 MB (a hogs round) of 64 MiB. What's resident and
+unbounded in bytes was the feed (cut above) and the copies' metas, bounded by `MAX_EVENTS` a copy.
+
+**The A/B for jemalloc's share, in order** (the build: rt-next with this step's branches merged, its static
+musl build with jemalloc; A without a variant, B with it; 8 rounds calm, a winner again with hogs):
+1. Any A/B first reads `kiln_memory_allocator_bytes{kind}` at the window's end, A's rounds: live =
+   `allocated` - `thread_caches`; `thread_caches`; slack = `active` - `allocated`; `dirty`; `metadata`; not
+   jemalloc's = anonymous - `resident`. Each caps what a setting can take: decide from these which of 2 to 4
+   can matter, and skip a setting whose kind is under 2 MB.
+2. `dirty` first (the decay's): `--env-b _RJEM_MALLOC_CONF=dirty_decay_ms:1000`. Expect about four fifths of
+   `dirty` off. Watch attach p50, API writes' p50 and p99, the server's minor faults a second. If one is
+   worse beyond noise: `--env-b KILN_ALLOC_POOL_DECAY_MS=1000` instead (the blocking pool's own arena),
+   watching `blocking.<share>.little_p99`.
+3. `thread_caches`: `--env-b _RJEM_MALLOC_CONF=tcache_max:4096` against the pick so far; if API reads' p99.9
+   or websocket frames' p99 is worse, `tcache_nslots_small_max:64,tcache_nslots_large:4` instead.
+4. Slack: `narenas:3,lg_extent_max_active_fit:2` against the pick so far; watch bus delivery p99 and runners'
+   messages p99 (glibc's 2 arenas doubled the first).
+5. One round of `dirty_decay_ms:0` (every free purged at once) says the floor of what decay can give, and
+   its latency cost: a reading, not a candidate.
+6. The pick goes into `os::alloc`'s compiled string once its A/B holds with hogs (`JEMALLOC_CONF`'s test holds
+   the string to what the lab ran).
+
+**What 113 MB takes** (the realistic profile, calm, at the window's end). The binary's pages: 105 MB after
+startup's drop, est. 12 to 17 with BOLT's layout (the coordinator's lab). So anonymous memory has to be at
+most about 96 to 101 MB, from alloc2's 207. What's cut since alloc2, est.: SQLite on jemalloc 10 to 15, the
+transport's spares 7, cold workers' caches and stacks 2 to 4, observe's index 2.2, 16 KiB reads 1.6, the feed
+8 (against main's), so about 175 to 180 MB with main's feed in. jemalloc's settings can take at most what
+`dirty`, `thread_caches` and slack hold (step 1 of the A/B says it; est. 30 to 50 MB). The rest has to come
+from the live heap, est. 85 MB: what's named above that kiln holds (copies' metas 2.2 to cut, observe's 7
+to put an owner on, websockets' buffers 2.4) and what the vendored projects hold (hyper-log's and
+hyper-durable's 22, QUIC's 5, turso's 8 outside jemalloc), which their owners' patches would cut.
+
+**A heap profile of the merged tree** (what's live now, ranked; READY 1's method):
+- build: `CARGO_PROFILE_RELEASE_STRIP=none KILN_LINUX_ALLOCATOR=jemalloc-prof ci/release/build.sh x86_64-unknown-linux-musl`
+- run: one round, the realistic profile, calm, with `--env _RJEM_MALLOC_CONF=prof:true,lg_prof_sample:19,prof_accum:true,prof_prefix:$OUT/jeprof`
+  (no `prof_active`: kiln turns sampling on once its unwinder is in, and says so in its log)
+- dump at the window's end: `gdb -p $PID -batch -nx -q -ex 'call (int)_rjem_mallctl("prof.dump", (void*)0, (void*)0, (void*)0, 0)'`
+- read: `nm -n -C --defined-only kiln | awk '$2 ~ /^[tTwW]$/' > syms.txt; readelf -lW kiln > segments.txt;
+  python3 ~/.cache/kiln-g11-lab/scripts2/heapprof.py $OUT/jeprof.$PID.*.m*.heap syms.txt segments.txt --owners`
+- look for: `wire::events::feed` (est. under 1 MB after the cut), `harness::copies::Meta::of` and
+  `Mirror::upsert` (the copies' metas and index), `tungstenite::protocol::WebSocketContext::buffer_frame`,
+  and with `prof_accum` the sites whose frees make `dirty`.
+
 ## Goal 10: API reads and frames in under a millisecond
 
 Goal 10 of the API runtime program (plan `01a1a87b2dae`): every read the lab makes answers from memory,

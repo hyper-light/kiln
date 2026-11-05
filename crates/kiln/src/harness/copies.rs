@@ -2002,6 +2002,10 @@ pub struct RunnerUpdate {
     /// When the hub's loop handed it to this owner's inbox: its wait's last leg is from there
     /// (`crate::route_latency::RunnerLeg::ToOwner`).
     pub handed: Option<std::time::Instant>,
+    /// How long before its frame was made its runner took it in, where its runner said: a duration on the
+    /// runner's clock (`crate::wire::stamp`; goal 10, plan 01a1a87b2dae step 5), its leg beside the server's
+    /// (`crate::route_latency::RunnerLeg::Runner`, `Server`).
+    pub taken: Option<std::time::Duration>,
 }
 
 type Job = Box<dyn FnOnce(&mut Shard) + Send>;

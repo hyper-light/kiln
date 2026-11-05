@@ -95,6 +95,7 @@ pub mod termsess;
 pub mod toolfix;
 pub mod trail;
 pub mod tunnel;
+pub mod turn;
 pub mod ui;
 pub mod ui_pack;
 pub mod uiserver;

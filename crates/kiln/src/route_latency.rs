@@ -133,10 +133,21 @@ pub enum RunnerLeg {
     /// `to_loop` was 6.1 ms at p99 where a frame's own legs at the loop came to 1.3 ms at p99.9, and only this
     /// tells the loop held by its events from the loop waiting for its shard.
     Held,
+    /// Not the server's wait but the runner's, as the runner says it (`crate::wire::stamp`): from the runner
+    /// taking an agent session's update in to making its frame, a duration on the runner's own clock. Goal 10,
+    /// plan 01a1a87b2dae step 5: in g9p7's fifth round frames lagged with every leg at the server short, and
+    /// nothing said whether the runner or the wire held them. Only an update whose runner said it, at its owner's
+    /// take.
+    Runner,
+    /// The server's time with the same updates, on the server's clock: from its frame's arrival off the wire to
+    /// its owner done with it (its copy changed, its viewers' frames published). Set against `runner` and a
+    /// frame's whole time, what's left is the wire's: the runner's way to its link, the network, the server's
+    /// net thread before the arrival.
+    Server,
 }
 
 impl RunnerLeg {
-    pub const ALL: [RunnerLeg; 4] = [RunnerLeg::ToLoop, RunnerLeg::InLoop, RunnerLeg::ToOwner, RunnerLeg::Held];
+    pub const ALL: [RunnerLeg; 6] = [RunnerLeg::ToLoop, RunnerLeg::InLoop, RunnerLeg::ToOwner, RunnerLeg::Held, RunnerLeg::Runner, RunnerLeg::Server];
 
     pub fn name(self) -> &'static str {
         match self {
@@ -144,6 +155,8 @@ impl RunnerLeg {
             RunnerLeg::InLoop => "in_loop",
             RunnerLeg::ToOwner => "to_owner",
             RunnerLeg::Held => "held",
+            RunnerLeg::Runner => "runner",
+            RunnerLeg::Server => "server",
         }
     }
 
@@ -153,6 +166,8 @@ impl RunnerLeg {
             RunnerLeg::InLoop => 1,
             RunnerLeg::ToOwner => 2,
             RunnerLeg::Held => 3,
+            RunnerLeg::Runner => 4,
+            RunnerLeg::Server => 5,
         }
     }
 }
@@ -322,7 +337,7 @@ pub fn render(o: &mut String) {
     }
     let _ = writeln!(
         o,
-        "# HELP kiln_runner_wait_leg_seconds A runner's message's wait, by leg: to_loop (to the hub's loop taking its frame, every frame's), in_loop (that loop handing an agent session's update to its owner's inbox), to_owner (that owner taking it); and held, the loop's own time with each event it takes, its waits included (what the frames behind it wait for), every event's.\n# TYPE kiln_runner_wait_leg_seconds histogram"
+        "# HELP kiln_runner_wait_leg_seconds A runner's message's wait, by leg: to_loop (to the hub's loop taking its frame, every frame's), in_loop (that loop handing an agent session's update to its owner's inbox), to_owner (that owner taking it); held, the loop's own time with each event it takes, its waits included (what the frames behind it wait for), every event's; and of each agent session's update whose runner said how long it held it, runner (from the runner taking it in to making its frame, on the runner's clock) and server (from its frame's arrival to its owner done with it, on the server's).\n# TYPE kiln_runner_wait_leg_seconds histogram"
     );
     let l = legs();
     for leg in RunnerLeg::ALL {
@@ -424,7 +439,7 @@ mod tests {
         l.observe(RunnerLeg::ToOwner, Duration::from_micros(900));
         l.observe(RunnerLeg::ToOwner, Duration::from_micros(1100));
         let counts: Vec<u64> = RunnerLeg::ALL.iter().map(|leg| l.of(*leg).map_or(0, Histogram::count)).collect();
-        assert_eq!(counts, vec![0, 1, 2, 0]);
+        assert_eq!(counts, vec![0, 1, 2, 0, 0, 0]);
         // Finer than a millisecond: 0.9 ms and 1.1 ms land in buckets apart.
         let at = |bound: f64| l.of(RunnerLeg::ToOwner).and_then(|h| h.cumulative().into_iter().find(|(b, _)| (*b - bound).abs() < 1e-12).map(|(_, n)| n));
         assert_eq!((at(0.001), at(0.00125)), (Some(1), Some(2)));
@@ -442,19 +457,45 @@ mod tests {
     /// with the others.
     #[test]
     fn g10_s5_the_loops_hold_of_each_event_is_a_leg_of_its_own() {
-        assert_eq!(RunnerLeg::ALL.iter().map(|l| l.name()).collect::<Vec<_>>(), vec!["to_loop", "in_loop", "to_owner", "held"]);
-        assert_eq!(RunnerLeg::ALL.iter().map(|l| l.index()).collect::<Vec<_>>(), vec![0, 1, 2, 3]);
+        assert_eq!(RunnerLeg::ALL.iter().map(|l| l.name()).collect::<Vec<_>>(), vec!["to_loop", "in_loop", "to_owner", "held", "runner", "server"]);
+        assert_eq!(RunnerLeg::ALL.iter().map(|l| l.index()).collect::<Vec<_>>(), vec![0, 1, 2, 3, 4, 5]);
         let l = Legs::new();
         l.observe(RunnerLeg::Held, Duration::from_micros(150));
         l.observe(RunnerLeg::Held, Duration::from_micros(6_000));
         let counts: Vec<u64> = RunnerLeg::ALL.iter().map(|leg| l.of(*leg).map_or(0, Histogram::count)).collect();
-        assert_eq!(counts, vec![0, 0, 0, 2]);
+        assert_eq!(counts, vec![0, 0, 0, 2, 0, 0]);
         let under = |bound: f64| l.of(RunnerLeg::Held).and_then(|h| h.cumulative().into_iter().find(|(b, _)| (*b - bound).abs() < 1e-12).map(|(_, n)| n));
         assert_eq!((under(0.00025), under(0.001)), (Some(1), Some(1)), "150 µs under a quarter millisecond, 6 ms past a millisecond");
         let mut o = String::new();
         observe_leg(RunnerLeg::Held, Duration::from_micros(150));
         render(&mut o);
         assert!(o.contains("kiln_runner_wait_leg_seconds_count{leg=\"held\"}"), "held rendered");
+    }
+
+    /// Goal 10, plan 01a1a87b2dae step 5: the runner's hold of an update, as its runner says it, and the server's
+    /// time with it are legs of their own, `runner` and `server`, appended after the legs before them (which keep
+    /// their places), each on its own histogram to the microsecond, and rendered with the others.
+    #[test]
+    fn g10_s5_the_runners_hold_and_the_servers_time_are_legs_of_their_own() {
+        let names: Vec<&str> = RunnerLeg::ALL.iter().map(|l| l.name()).collect();
+        assert_eq!(names.get(names.len().saturating_sub(2)..), Some(&["runner", "server"][..]), "appended last");
+        assert_eq!((RunnerLeg::Runner.index(), RunnerLeg::Server.index()), (RunnerLeg::Held.index() + 1, RunnerLeg::Held.index() + 2));
+        let l = Legs::new();
+        l.observe(RunnerLeg::Runner, Duration::from_micros(80));
+        l.observe(RunnerLeg::Runner, Duration::from_micros(74_000));
+        l.observe(RunnerLeg::Server, Duration::from_micros(900));
+        let count = |leg| l.of(leg).map_or(0, Histogram::count);
+        assert_eq!((count(RunnerLeg::Runner), count(RunnerLeg::Server), count(RunnerLeg::Held)), (2, 1, 0), "each its own");
+        let under = |leg, bound: f64| l.of(leg).and_then(|h| h.cumulative().into_iter().find(|(b, _)| (*b - bound).abs() < 1e-12).map(|(_, n)| n));
+        assert_eq!((under(RunnerLeg::Runner, 0.0001), under(RunnerLeg::Runner, 0.05)), (Some(1), Some(1)), "80 µs under a tenth of a millisecond, 74 ms past 50");
+        assert_eq!(under(RunnerLeg::Server, 0.001), Some(1), "900 µs under a millisecond");
+        let mut o = String::new();
+        observe_leg(RunnerLeg::Runner, Duration::from_micros(80));
+        observe_leg(RunnerLeg::Server, Duration::from_micros(900));
+        render(&mut o);
+        for leg in ["runner", "server"] {
+            assert!(o.contains(&format!("kiln_runner_wait_leg_seconds_count{{leg=\"{leg}\"}}")), "{leg} rendered");
+        }
     }
 
     /// Goal 9, plan 01a1a87b2cec step 5: a request's class is told from its path's segments split on the stack, with
