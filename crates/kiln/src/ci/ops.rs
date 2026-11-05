@@ -505,6 +505,10 @@ pub fn ops() -> &'static [Op] {
                 input: Input::of::<input::CiDiffsConflictsLadder>(),
                 route: |v| Ok((Method::GET, path(&["diffs", &text(v, "diff")?, "conflicts", "ladder"]), HashMap::new())),
                 run: |cx: Cx, v: Value| async move { let d = text(&v, "diff")?; diffs(&cx, Method::GET, &["diffs", d.as_str(), "conflicts", "ladder"], &HashMap::new(), &Value::Null).await }),
+            op!("ci.repos.about", "Ask about code no agent made (W26-R07): a name, a line or the change on a line, in a person's change, a lone commit or a host's pull request, at `commit`. kiln starts a helper for you that gets the repository at that commit, reads and searches it, and changes nothing; read its answer with agents.result. A change an agent made is asked of its agent: agents.about.", base: "", ro: false, destructive: false,
+                input: Input::of::<input::CiReposAbout>(),
+                route: |v| Ok((Method::POST, path(&["repos", &text(v, "repo")?, "about"]), HashMap::new())),
+                run: |cx: Cx, v: Value| async move { let r = text(&v, "repo")?; diffs(&cx, Method::POST, &["repos", r.as_str(), "about"], &HashMap::new(), &v).await }),
             op!("ci.diffs.review", "Review a diff: accept, request changes, comment, or resign; publishes your draft comments.", base: "", ro: false, destructive: false,
                 input: Input::of::<input::CiDiffsReview>(),
                 route: |v| Ok((Method::POST, path(&["diffs", &text(v, "diff")?, "review"]), HashMap::new())),
@@ -1756,6 +1760,31 @@ pub mod input {
         pub text: Option<String>,
         /// Why, with the tests it ran: an agent's.
         pub explanation: Option<String>,
+    }
+
+    /// Code no agent made, asked about (W26-R07): what was tapped, at a commit of a repository.
+    #[derive(Debug, Deserialize, JsonSchema)]
+    #[serde(deny_unknown_fields)]
+    pub struct CiReposAbout {
+        /// The repository, `owner/name`.
+        pub repo: String,
+        /// The commit the code is at.
+        pub commit: String,
+        /// The file the code is in.
+        pub path: String,
+        /// The code around what was tapped.
+        pub code: String,
+        pub line: Option<u64>,
+        /// The last of the lines, when they're several.
+        pub end_line: Option<u64>,
+        /// The name tapped; none: the whole line.
+        pub selection: Option<String>,
+        /// It's about the change on that line.
+        pub change: Option<bool>,
+        /// What to ask, if not "what is this?".
+        pub question: Option<String>,
+        /// As agents.about takes it: a helper kiln starts answers at once either way.
+        pub now: Option<bool>,
     }
 
     /// Where a diff's conflicts are on the conflict ladder (W26-R17).

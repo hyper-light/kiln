@@ -15,6 +15,8 @@ use std::sync::Arc;
 use bytes::Bytes;
 use parking_lot::Mutex;
 
+use crate::rcu::Rcu;
+
 #[derive(Debug, Clone)]
 pub enum LogEvent {
     Data { idx: u32, data: Bytes },
@@ -22,10 +24,29 @@ pub enum LogEvent {
     End,
 }
 
+/// A live job: its feed to its viewers, and its files.
 struct Live {
     tx: async_broadcast::Sender<LogEvent>,
     /// Keeps the channel open while nobody is watching.
     _idle: async_broadcast::InactiveReceiver<LogEvent>,
+    /// What writes the job's log holds this alone (its chunks, in order from its runner through the
+    /// hub's loop; its steps; its end): no viewer takes it (the feed is theirs), nor another job's writer.
+    files: Mutex<Files>,
+}
+
+impl Live {
+    fn new() -> Self {
+        let (mut tx, rx) = async_broadcast::broadcast(1024);
+        // Slow viewers lose the oldest chunks (and are told so) instead of stalling writers.
+        tx.set_overflow(true);
+        tx.set_await_active(false);
+        let idle = rx.deactivate();
+        Live { tx, _idle: idle, files: Mutex::new(Files { files: HashMap::new(), times: HashMap::new(), digests: HashMap::new(), bytes: 0, truncated: false }) }
+    }
+}
+
+/// A live job's open files and how much of its log is kept.
+struct Files {
     files: HashMap<u32, std::fs::File>,
     /// Each step's `<step>.times`, open while it's written.
     times: HashMap<u32, std::fs::File>,
@@ -39,9 +60,11 @@ struct Live {
 pub struct Logs {
     dir: PathBuf,
     max_bytes: u64,
-    /// Each live job's, under a lock of its own: what writes a job's files holds its own lock alone,
-    /// so a slow disk holds up that job's writer, never a viewer of another (or the list).
-    live: Arc<Mutex<HashMap<String, Arc<Mutex<Live>>>>>,
+    /// Each live job's, by job: read by every viewer and writer without a lock, a copy swapped in whole
+    /// as a job starts and ends (goal 5 of the API runtime program, plan 01a1a59c2aae: `crate::rcu`). What
+    /// writes a job's files holds that job's alone, so a slow disk holds up that job's writer, never a
+    /// viewer (or another job).
+    live: Arc<Rcu<HashMap<String, Arc<Live>>>>,
 }
 
 fn safe(id: &str) -> String {
@@ -50,7 +73,7 @@ fn safe(id: &str) -> String {
 
 impl Logs {
     pub fn new(dir: PathBuf, max_bytes: u64) -> Self {
-        Self { dir, max_bytes, live: Arc::new(Mutex::new(HashMap::new())) }
+        Self { dir, max_bytes, live: Arc::default() }
     }
 
     fn job_dir(&self, job: &str) -> PathBuf {
@@ -71,18 +94,19 @@ impl Logs {
         self.job_dir(job).join(format!("{idx}.digests"))
     }
 
-    fn with_live<R>(&self, job: &str, f: impl FnOnce(&mut Live) -> R) -> R {
-        // The list's lock for the job's own, held as long as that takes; then the job's alone.
-        let live = Arc::clone(self.live.lock().entry(job.to_owned()).or_insert_with(|| {
-            let (mut tx, rx) = async_broadcast::broadcast(1024);
-            // Slow viewers lose the oldest chunks (and are told so) instead of stalling writers.
-            tx.set_overflow(true);
-            tx.set_await_active(false);
-            let idle = rx.deactivate();
-            Arc::new(Mutex::new(Live { tx, _idle: idle, files: HashMap::new(), times: HashMap::new(), digests: HashMap::new(), bytes: 0, truncated: false }))
-        }));
-        let mut g = live.lock();
-        f(&mut g)
+    /// Job `job`'s live entry: the one there, else one made, swapped in with it.
+    fn live(&self, job: &str) -> Arc<Live> {
+        if let Some(live) = self.live.load().get(job) {
+            return Arc::clone(live);
+        }
+        self.live.update(|m| Arc::clone(m.entry(job.to_owned()).or_insert_with(|| Arc::new(Live::new()))))
+    }
+
+    /// `f` with job `job`'s files, and its feed to tell its viewers.
+    fn with_live<R>(&self, job: &str, f: impl FnOnce(&mut Files, &async_broadcast::Sender<LogEvent>) -> R) -> R {
+        let live = self.live(job);
+        let mut files = live.files.lock();
+        f(&mut files, &live.tx)
     }
 
     /// Append output for a step. Never fails the caller: disk errors are logged and the data still
@@ -109,7 +133,7 @@ impl Logs {
         let notice: &[u8] = b"\r\n\x1b[33m[kiln] log size limit reached; further output discarded\x1b[0m\r\n";
         // The chunk as the leg sent it, kept by its digest whether its bytes are or not.
         let (len, digest) = (data.len() as u64, kiln_ci::logs::digest(data));
-        self.with_live(job, |live| {
+        self.with_live(job, |live, tx| {
             if live.truncated {
                 if taken {
                     note_piece(live, idx, &digests_path, &kiln_ci::logs::Piece { at: None, len, digest });
@@ -177,38 +201,39 @@ impl Logs {
                     tracing::warn!(error = %e, "log times write failed");
                 }
             }
-            let _ = live.tx.try_broadcast(LogEvent::Data { idx, data: Bytes::copy_from_slice(chunk) });
+            let _ = tx.try_broadcast(LogEvent::Data { idx, data: Bytes::copy_from_slice(chunk) });
         });
     }
 
     pub fn step(&self, job: &str, idx: u32, status: &'static str) {
-        self.with_live(job, |live| {
+        self.with_live(job, |live, tx| {
             if status != "running" {
                 live.files.remove(&idx);
                 live.times.remove(&idx);
                 live.digests.remove(&idx);
             }
-            let _ = live.tx.try_broadcast(LogEvent::Step { idx, status });
+            let _ = tx.try_broadcast(LogEvent::Step { idx, status });
         });
     }
 
     /// The job is over: close files, tell viewers, drop the channel.
     pub fn finish(&self, job: &str) {
-        let live = self.live.lock().remove(job);
+        let live = self.live.update(|m| m.remove(job));
         if let Some(live) = live {
-            // After its last piece is written (a writer holding its lock writes first).
-            let _ = live.lock().tx.try_broadcast(LogEvent::End);
+            // After its last piece is written (a writer holding its files writes first).
+            let _files = live.files.lock();
+            let _ = live.tx.try_broadcast(LogEvent::End);
         }
     }
 
     /// Subscribe to a job's live output. Subscribe *before* reading the backlog so nothing falls
     /// in between (viewers may see a few bytes twice at the seam, never miss any).
     pub fn subscribe(&self, job: &str) -> async_broadcast::Receiver<LogEvent> {
-        self.with_live(job, |live| live.tx.new_receiver())
+        self.live(job).tx.new_receiver()
     }
 
     pub fn is_live(&self, job: &str) -> bool {
-        self.live.lock().contains_key(job)
+        self.live.load().contains_key(job)
     }
 
     pub async fn read(&self, job: &str, idx: u32) -> Vec<u8> {
@@ -311,7 +336,7 @@ impl Logs {
 
 /// Notes the leg's chunk `p` in its step's `<step>.digests` (opened once, kept open while the step
 /// writes). Never fails the caller: a disk error is logged.
-fn note_piece(live: &mut Live, idx: u32, path: &Path, p: &kiln_ci::logs::Piece) {
+fn note_piece(live: &mut Files, idx: u32, path: &Path, p: &kiln_ci::logs::Piece) {
     let file = match live.digests.entry(idx) {
         std::collections::hash_map::Entry::Occupied(o) => Some(o.into_mut()),
         std::collections::hash_map::Entry::Vacant(v) => match path.parent().map_or(Ok(()), std::fs::create_dir_all).and_then(|()| std::fs::OpenOptions::new().create(true).append(true).open(path)) {

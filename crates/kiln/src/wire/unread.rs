@@ -368,6 +368,7 @@ pub struct Noted {
 }
 
 /// One sender's audit rows for one wire and code, over the minute since the last row.
+#[derive(Clone)]
 struct Window {
     /// When the last row went: none, no row within the minute.
     since: Option<Instant>,
@@ -378,13 +379,16 @@ struct Window {
 }
 
 /// One sender's tells over the current second.
+#[derive(Clone)]
 struct Tells {
     second: Instant,
     told: u32,
     untold: u64,
 }
 
-/// Every wire's refusals, noted.
+/// Every wire's refusals, noted. The hub keeps them as a copy swapped in whole as one is noted (goal 5
+/// of the API runtime program, plan 01a1a59c2aae: `crate::rcu`): a runner's page reads them without a lock.
+#[derive(Clone)]
 pub struct Refusals {
     clock: Arc<dyn Clock>,
     kept: Recent<Page, Kept>,
@@ -603,6 +607,7 @@ fn summary(from: &Sender, wire: Wire, code: Code, n: u64, newest: &Unread) -> Ro
 }
 
 /// A map of at most `most` entries: the least recently touched is let go to make room.
+#[derive(Clone)]
 pub(crate) struct Recent<K, V> {
     most: usize,
     next: u64,

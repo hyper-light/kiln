@@ -64,6 +64,8 @@ pub async fn run(cfg: Config, shutdown: Shutdown) -> anyhow::Result<()> {
     // Each shard's queueing delay by class, and what it sheds when it leaves its calm (goal 6, plan
     // 01a1a59c2abe step 4).
     crate::overload::start(cfg.server.shed);
+    // Where its connections and requests run on the shards (goal 7, plan 01a1a59c2aea step 3).
+    crate::placement::set(cfg.server.placement);
     crate::updates::warm_own_binary().await;
     let cfg = Arc::new(cfg);
     std::fs::create_dir_all(&cfg.server.data_dir)
@@ -156,6 +158,10 @@ pub async fn run(cfg: Config, shutdown: Shutdown) -> anyhow::Result<()> {
     if !cfg.ci.local {
         crate::harness::registry::Registry::list_away(&hub).await;
     }
+
+    // One record a machine (docs/machines.md): what was kept under names folds into machine ids,
+    // its sessions' copies with it, before any runner's message is taken in.
+    hub.one_record_a_machine().await;
 
     // Transport events. Each message is handled in isolation; the stream itself never ends while
     // the net thread lives (it restarts its endpoint internally).

@@ -270,7 +270,7 @@ pub async fn runner_ask(hub: &Arc<Hub>, runner: &str, peer: crate::instances::Pe
 async fn runner_ask_checked(hub: &Arc<Hub>, runner: &str, peer: crate::instances::PeerId, ask: &crate::reach::Question, raw: &Value) -> Value {
     use crate::reach::Question;
     let (session, terminal) = match ask {
-        Question::Directory => return json!({ "runners": hub.reach_directory() }),
+        Question::Directory => return json!({ "runners": hub.directory().await }),
         // Noted whoever started the session (`runner_unread`).
         Question::Unread { session, what, code, why } => return runner_unread(hub, runner, session, what, *code, why).await,
         Question::Registry { session, terminal } | Question::Call { session, terminal, .. } => (session.as_str(), terminal.as_str()),
@@ -411,7 +411,7 @@ async fn runner_ask_checked(hub: &Arc<Hub>, runner: &str, peer: crate::instances
         // An act its runner asks kiln to take before it does it (a run on another machine):
         // taken above, as the session's holder's now (W27-R08).
         Question::Act { .. } => json!({"ok": {}}),
-        Question::Directory => json!({ "runners": hub.reach_directory() }),
+        Question::Directory => json!({ "runners": hub.directory().await }),
         Question::Unread { session, what, code, why } => runner_unread(hub, runner, session, what, *code, why).await,
         Question::Keep { .. } | Question::Holds { .. } | Question::Holders { .. } | Question::Custody { .. } => json!({"error": "not a question for kiln's operations"}),
     };
@@ -1152,7 +1152,7 @@ mod tests {
     fn code_mode_s_tools_are_typed() -> anyhow::Result<()> {
         crate::rt::block_on(async {
             let hub = crate::hub::tests::scratch_hub().await?;
-            hub.harness.ingest(&hub, &crate::harness::registry::Location::Machine("box".into()), "s1", open("s1"));
+            hub.harness.ingest(&hub, &crate::harness::registry::Location::Machine("box".into()), "s1", open("s1")).await;
             let mut agent = Caller::with(crate::authz::gate::Kind::Agent, "agent:s1", None, None);
             agent.agent = Some("s1".into());
             let call = |tool: &str, arguments: Value| {
@@ -1211,7 +1211,7 @@ mod tests {
     fn what_mcp_cant_read_is_answered_as_json_rpc_says_and_noted() -> anyhow::Result<()> {
         crate::rt::block_on(async {
             let hub = crate::hub::tests::scratch_hub().await?;
-            hub.harness.ingest(&hub, &crate::harness::registry::Location::Machine("box".into()), "s1", open("s1"));
+            hub.harness.ingest(&hub, &crate::harness::registry::Location::Machine("box".into()), "s1", open("s1")).await;
             let mut agent = Caller::with(crate::authz::gate::Kind::Agent, "agent:s1", None, None);
             agent.agent = Some("s1".into());
             let ask = |body: &'static str| answer(&hub, agent.clone(), body.as_bytes());
@@ -1252,7 +1252,7 @@ mod tests {
         use http_body_util::BodyExt as _;
         crate::rt::block_on(async {
             let hub = crate::hub::tests::scratch_hub().await?;
-            hub.harness.ingest(&hub, &crate::harness::registry::Location::Machine("box".into()), "s1", open("s1"));
+            hub.harness.ingest(&hub, &crate::harness::registry::Location::Machine("box".into()), "s1", open("s1")).await;
             let mut agent = Caller::with(crate::authz::gate::Kind::Agent, "agent:s1", None, None);
             agent.agent = Some("s1".into());
             let said = |r: Response| async move {
@@ -1286,7 +1286,7 @@ mod tests {
             for name in ["box", "mac"] {
                 hub.agents.lock().insert(name.into(), crate::hub::tests::live_runner(name, "linux", "x86_64"));
             }
-            hub.harness.ingest(&hub, &crate::harness::registry::Location::Machine("box".into()), "s1", open("s1"));
+            hub.harness.ingest(&hub, &crate::harness::registry::Location::Machine("box".into()), "s1", open("s1")).await;
             let unread = Question::Unread { session: "s1".into(), what: "tools/call teleport".into(), code: Code::Unknown, why: "Unknown tool: teleport".into() };
             let a = runner_ask(&hub, "box", 0, &unread, &serde_json::to_value(&unread)?, None).await;
             anyhow::ensure!(a.get("ok").is_some(), "{a}");

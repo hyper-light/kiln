@@ -290,6 +290,12 @@ pub enum AgentMsg {
     /// (a giver's hand-on, from the package it took). Only to a server announcing [`CAP_CUSTODY`].
     /// Appended last: postcard encodes variants by index.
     Custody { json: String },
+    /// The machine this runner is ([`crate::os::machine_id`]), said before its `Instance` and
+    /// `Hello` on every connection (docs/machines.md, "One record a machine"): a runner whose
+    /// certificate carries a name from before is keyed by this id from its Hello on. A job's pod
+    /// never says it (it's known by its pod). An older server skips it. Appended last: postcard
+    /// encodes variants by index.
+    Machine { id: String },
 }
 
 /// A leg's event as a runner sends it ([`AgentMsg::JobEvent`]'s JSON): the event, and its place in
@@ -1394,11 +1400,23 @@ mod tests {
         assert_eq!(decode::<AgentMsg>(&encode(&up)?)?, up);
         assert_eq!(decode::<ServerMsg>(&encode(&down)?)?, down);
         // Step 5 appended `LinkUnread` (57) and `ReachRefused` (63) after them, W26-R22 `Freeze` (64),
-        // and W27 its legs' signing and custody (58 to 60, 65 and 66).
-        assert_eq!((crate::wire::agent_classes().len(), crate::wire::server_classes().len()), (61, 67), "each table has every variant once");
+        // W27 its legs' signing and custody (58 to 60, 65 and 66), and docs/machines.md `Machine` (61).
+        assert_eq!((crate::wire::agent_classes().len(), crate::wire::server_classes().len()), (62, 67), "each table has every variant once");
         assert!(CAP_UNREAD.is_power_of_two() && CAP_UNREAD == 1 << 41 && CAP_UNREAD & (CAP_WIRE | CAP_NET_DROPS | CAP_INBOX | CAP_HANDOVER | CAP_WORK | CAP_AGENT_LIMIT | CAP_IDENTITY | CAP_HEADROOM | CAP_CHANGES_PATCH) == 0);
         assert!(CAP_WORKSPACE_COMMITS.is_power_of_two() && CAP_WORKSPACE_COMMITS == 1 << 42 && CAP_WORKSPACE_COMMITS & (CAP_WIRE | CAP_NET_DROPS | CAP_INBOX | CAP_HANDOVER | CAP_WORK | CAP_AGENT_LIMIT | CAP_IDENTITY | CAP_HEADROOM | CAP_CHANGES_PATCH | CAP_UNREAD) == 0);
         assert!(CAP_WORKSPACE_COMPARE.is_power_of_two() && CAP_WORKSPACE_COMPARE == 1 << 43 && CAP_WORKSPACE_COMPARE & (CAP_WIRE | CAP_NET_DROPS | CAP_INBOX | CAP_HANDOVER | CAP_WORK | CAP_AGENT_LIMIT | CAP_IDENTITY | CAP_HEADROOM | CAP_CHANGES_PATCH | CAP_UNREAD | CAP_WORKSPACE_COMMITS) == 0);
+        Ok(())
+    }
+
+    /// docs/machines.md, "One record a machine": the machine a runner says it is, before its
+    /// Hello, is appended after every older variant (an older server skips it), and reads back.
+    #[test]
+    fn machines_the_machine_a_runner_says_it_is_is_appended_last() -> anyhow::Result<()> {
+        let said = AgentMsg::Machine { id: "5f2a9c3e0b1d4e6f8a7c9b0d1e2f3a4b".into() };
+        let custody = encode(&AgentMsg::Custody { json: String::new() })?;
+        assert_eq!(encode(&said)?.first().copied(), custody.first().map(|i| i + 1), "Machine comes right after Custody");
+        assert_eq!(encode(&said)?.first(), Some(&61));
+        assert_eq!(decode::<AgentMsg>(&encode(&said)?)?, said);
         Ok(())
     }
 

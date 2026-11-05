@@ -251,9 +251,10 @@ kiln.db's writes go through the cluster group: one hyper-raft group, its log at
 On the server alone the group has one voter, which commits alone.
 
 - **A write** (`Store::call`):
-  - It runs as it always has, in a transaction of the store's connection (`BEGIN IMMEDIATE`, so what
-    it reads is what it writes over), while SQLite's pre-update hook notes the rows it touches
-    (`store/capture.rs`).
+  - It runs as it always has, in a transaction of the store's one connection that writes (`BEGIN
+    IMMEDIATE`, so what it reads is what it writes over), on that connection's own thread, which
+    takes the store's calls in turn as messages, while SQLite's pre-update hook notes the rows it
+    touches (`store/capture.rs`).
   - When it's done, those rows are read as it left them: what it commits, with the parts it took
     back, or that failed half way, left out.
   - It commits with its number (`seq`, in `cluster_state`), and its net change goes to the group as
@@ -261,7 +262,9 @@ On the server alone the group has one voter, which commits alone.
   - The caller's answer comes once kiln.db holds the write, as before the group, and is as durable:
     kiln.db commits without waiting for the disk. Measured on adacachy's NVMe, a small write took
     104 µs at the median and 305 µs at p95 through the group, against 48 µs and 120 µs without it;
-    the log caught up 18 ms after the last write. A read is only a read.
+    the log caught up 18 ms after the last write. A read is only a read: one that says so
+    (`Store::read`) takes a read-only connection of its own, beside the writer (WAL), and never goes
+    through the group.
 - **A restart replays** the log's writes kiln.db doesn't hold: those whose commit the disk lost while
   the log's flush kept them. An entry applies when its `seq` is past kiln.db's, and is skipped
   otherwise. Its rows are written whole by key, so applying one twice leaves what once does.

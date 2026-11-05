@@ -1076,7 +1076,7 @@ mod tests {
                     core.state.turn_started = Some(t);
                     core.state.clone()
                 };
-                hub.harness.ingest(hub, &crate::harness::registry::Location::Local, id, crate::harness::core::Update::State { state: Box::new(state) });
+                hub.harness.ingest(hub, &crate::harness::registry::Location::Local, id, crate::harness::core::Update::State { state: Box::new(state) }).await;
             }
             crate::rt::sleep(Duration::from_millis(20)).await;
         }

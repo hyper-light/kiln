@@ -251,3 +251,126 @@ fn opening_and_reading_a_machines_agents_need_its_terminal() -> anyhow::Result<(
     }
     Ok(())
 }
+
+/// Set for this test's binary run as the stand-in for a `claude` started by hand.
+const BY_HAND: &str = "KILN_TEST_CLAUDE_BY_HAND";
+
+/// A `claude` running by hand on this machine, as a found session: Claude Code's record of it and
+/// its transcript in `home`. It's waited for, so its end is seen, and ended with the test.
+struct Found {
+    pid: u32,
+    ended: std::sync::mpsc::Receiver<()>,
+}
+
+impl Found {
+    fn start(dir: &std::path::Path, home: &std::path::Path, work: &std::path::Path) -> anyhow::Result<Self> {
+        let id = "8b2c0000-0000-4000-8000-000000000001";
+        let by_hand = dir.join("by-hand");
+        std::fs::create_dir_all(&by_hand)?;
+        // A native program named claude, which macOS lets run: this test's own binary by that name
+        // (macOS kills a copy of /bin/sleep), asked to do nothing but wait, under `BY_HAND`.
+        let program = by_hand.join("claude");
+        let this = std::env::current_exe()?;
+        if std::fs::hard_link(&this, &program).is_err() {
+            std::fs::copy(&this, &program)?;
+        }
+        let mut child = std::process::Command::new(&program)
+            .args(["--exact", "a_session_found_on_the_servers_own_machine_is_taken_over_as_one_of_the_servers_agents", "--nocapture"])
+            .env(BY_HAND, "1")
+            .current_dir(work)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()?;
+        let pid = child.id();
+        let (done, ended) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = child.wait();
+            let _ = done.send(());
+        });
+        let project = home.join(".claude/projects/here");
+        std::fs::create_dir_all(&project)?;
+        let line = json!({"type": "user", "sessionId": id, "cwd": work.display().to_string(), "message": {"role": "user", "content": "carry on"}});
+        std::fs::write(project.join(format!("{id}.jsonl")), format!("{line}\n"))?;
+        let sessions = home.join(".claude/sessions");
+        std::fs::create_dir_all(&sessions)?;
+        let record = json!({"pid": pid, "sessionId": id, "cwd": work.display().to_string(), "kind": "interactive"});
+        std::fs::write(sessions.join(format!("{pid}.json")), record.to_string())?;
+        Ok(Self { pid, ended })
+    }
+}
+
+impl Drop for Found {
+    fn drop(&mut self) {
+        let _ = std::process::Command::new("kill").args(["-9", &self.pid.to_string()]).stderr(std::process::Stdio::null()).status();
+    }
+}
+
+/// The server's own runner holds no agents (`crate::harness::limit`), so a session found on its
+/// machine continues as one of the server's. That takes the server's right as well as the runner's,
+/// and a refusal leaves it running (docs/agents.md, "Whose agents").
+#[test]
+fn a_session_found_on_the_servers_own_machine_is_taken_over_as_one_of_the_servers_agents() -> anyhow::Result<()> {
+    if std::env::var_os(BY_HAND).is_some() {
+        std::thread::sleep(Duration::from_secs(600));
+        return Ok(());
+    }
+    let tmp = tempfile::tempdir()?;
+    let dir = tmp.path();
+    let bin = dir.join("bin");
+    std::fs::create_dir_all(&bin)?;
+    std::fs::copy(std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/fake-claude/claude"), bin.join("claude"))?;
+    let path = format!("{}:{}", bin.display(), std::env::var("PATH").unwrap_or_default());
+    let o = Options { agent: true, extra: "[terminal]\nenabled = true\n", ..Options::default() };
+    let s = common::start_env(dir, &o, false, &[("PATH", &path), ("FAKE_CLAUDE_LINES", "1"), ("FAKE_CLAUDE_EVERY_MS", "1")])?;
+    let work = dir.join("project");
+    std::fs::create_dir_all(&work)?;
+    let found = Found::start(dir, &dir.join("home"), &work)?;
+    let own = machine(&format!("server {}", dir.display()));
+
+    let started = Instant::now();
+    let listed = loop {
+        let (st, body) = http(s.port, "GET", "/api/ai-sessions", &s.admin, None)?;
+        let list: Value = serde_json::from_str(&body).unwrap_or_default();
+        let this = list.as_array().into_iter().flatten().find(|f| f.get("pid") == Some(&json!(found.pid))).cloned();
+        if let Some(this) = this.filter(|f| f.get("takeover") == Some(&json!("stop"))) {
+            break this;
+        }
+        anyhow::ensure!(started.elapsed() < Duration::from_secs(120), "never found as one to take over: {st} {body}");
+        std::thread::sleep(Duration::from_millis(250));
+    };
+    assert_eq!(listed.get("machine"), Some(&json!(own)), "found on the server's own runner: {listed}");
+    let take = format!("/api/ai-sessions/{own}/{}/takeover", found.pid);
+    let stop = json!({"stop": true});
+
+    // The runner's right alone doesn't run an agent on the server, and nothing is ended for trying.
+    let dan = person(&s, "dan", &["developer"])?;
+    let grant = format!("runners.terminal@runner:{own}");
+    let (st, body) = http(s.port, "POST", "/api/grants", &s.admin, Some(&json!({ "user": "dan", "grant": grant })))?;
+    anyhow::ensure!((200..300).contains(&st), "granting {grant}: {st} {body}");
+    let (st, said) = dan.call(&s, "POST", &take, Some(&stop))?;
+    assert!(st == 403 && said.contains("runners.terminal"), "dan takes it over onto the server: {st} {said}");
+    assert!(found.ended.try_recv().is_err(), "a refused take-over ended the session");
+
+    // The owner: it's the server's agent, and what ran by hand gives way to it.
+    let (st, body) = http(s.port, "POST", &take, &s.admin, Some(&stop))?;
+    assert_eq!(st, 200, "taking it over: {body}");
+    let infos: Value = serde_json::from_str(&body)?;
+    let agent = infos.get(0).cloned().unwrap_or_default();
+    assert_eq!(agent.get("target"), Some(&json!("local")), "it runs as the server's: {agent}");
+    found.ended.recv_timeout(Duration::from_secs(60)).map_err(|e| anyhow::anyhow!("what ran by hand wasn't ended: {e}"))?;
+
+    let id = agent.get("id").and_then(Value::as_str).unwrap_or_default();
+    let started = Instant::now();
+    loop {
+        let (st, body) = http(s.port, "GET", &format!("/api/harness/sessions/{id}"), &s.admin, None)?;
+        let now: Value = serde_json::from_str(&body).unwrap_or_default();
+        let status = now.pointer("/info/status").or_else(|| now.get("status")).and_then(Value::as_str).unwrap_or_default().to_owned();
+        anyhow::ensure!(!matches!(status.as_str(), "closed" | "error" | "failed"), "the agent didn't carry on: {st} {body}");
+        if !status.is_empty() && status != "starting" {
+            break;
+        }
+        anyhow::ensure!(started.elapsed() < Duration::from_secs(60), "the agent never started: {st} {body}");
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    Ok(())
+}

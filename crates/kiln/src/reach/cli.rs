@@ -320,7 +320,11 @@ pub fn runners(a: RunnersArgs) -> anyhow::Result<()> {
         println!("No runner suits {}.", v.get("want").and_then(serde_json::Value::as_str).unwrap_or("that"));
     }
     // A runner kiln knows by its machine id is shown by the name people see (docs/machines.md).
-    let mut shown: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+    let mut shown: std::collections::HashMap<String, String> = v
+        .get("labels")
+        .and_then(serde_json::Value::as_object)
+        .map(|m| m.iter().filter_map(|(n, l)| l.as_str().map(|l| (n.clone(), l.to_owned()))).collect())
+        .unwrap_or_default();
     for r in v.get("runners").and_then(serde_json::Value::as_array).into_iter().flatten().chain(list.iter().filter_map(|c| c.get("runner"))) {
         if let (Some(n), Some(l)) = (r.get("name").and_then(serde_json::Value::as_str), r.get("label").and_then(serde_json::Value::as_str)) {
             shown.insert(n.to_owned(), l.to_owned());

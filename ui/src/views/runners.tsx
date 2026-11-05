@@ -14,7 +14,24 @@ import { Chips, StatusDot } from "@/components/ui/status";
 import { toast } from "@/components/ui/toast";
 import { Tip } from "@/components/ui/tooltip";
 import { sendingProps, useAction, useActions, useHold } from "@/lib/action";
-import { agentsRes, fuller, historyRes, labelOf, lastSamples, mergeJobs, noteLabels, shownName, updatesRes, upsert, useAgentsLive, useLabels, useMetricsHistory, useRes, useUpdateJobs, warm } from "@/lib/data";
+import {
+  agentsRes,
+  fuller,
+  historyRes,
+  labelOf,
+  lastSamples,
+  mergeJobs,
+  noteLabels,
+  shownName,
+  updatesRes,
+  upsert,
+  useAgentsLive,
+  useLabels,
+  useMetricsHistory,
+  useRes,
+  useUpdateJobs,
+  warm,
+} from "@/lib/data";
 import { absoluteTime, formatBytes, formatPct } from "@/lib/format";
 import { errorMessage, useNow } from "@/lib/hooks";
 import { usePref } from "@/lib/prefs";
@@ -28,6 +45,7 @@ import { JoinNotice } from "./add-machines/notice";
 import { AgentMiniCard, LiveDuration, RelTime, diskPct, memPct } from "./shared";
 import { BatteryLine, LowBattery } from "./battery";
 import { lostLine } from "./runner-lost";
+import { offlineLabel, staleWhy } from "./runner-stale";
 import { limitLine, parseLimit, settable, standing, withEvent } from "./agent-limit";
 import { refusedLately, refusedLine } from "./refused";
 import { useClock } from "./harness/dom";
@@ -49,7 +67,7 @@ export function agentStatus(a: Agent) {
   return !a.connected ? "cancelled" : a.draining ? "timed_out" : a.busy > 0 ? "running" : "succeeded";
 }
 export function agentStateLabel(a: Agent) {
-  return !a.connected ? "offline" : a.draining ? "draining" : a.busy > 0 ? "busy" : "idle";
+  return !a.connected ? offlineLabel(a) : a.draining ? "draining" : a.busy > 0 ? "busy" : "idle";
 }
 
 const LEAD = "Runners are long-lived machines that take CI jobs; Kubernetes job pods show up under their jobs.";
@@ -287,6 +305,7 @@ function RunnersBody() {
                           ) : (
                             <>
                               last seen <RelTime ts={a.last_seen} />
+                              {a.stale && " · stale: no machine id"}
                             </>
                           )}
                         </div>
@@ -567,6 +586,7 @@ function AgentDetails({
         )}
       </div>
       <RunnerName agent={agent} onRename={onRename} />
+      {staleWhy(agent) && <p className="mt-3 text-[12.5px] text-[#c8cad0]">{staleWhy(agent)}</p>}
       {forgetting && (
         <Confirm
           className="mt-3"
