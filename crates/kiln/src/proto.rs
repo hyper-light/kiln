@@ -1705,17 +1705,20 @@ mod tests {
         }
         // Reach links' own (docs/wire.md, "Named features"): after the twelve every runner reads.
         use crate::reach::wire::{ASK_VARIANTS, Ask, SAY_VARIANTS, Say};
-        let links: [(&str, &str, u8, Vec<u8>); 4] = [
+        let links: [(&str, &str, u8, Vec<u8>); 6] = [
             ("Ask", "Features", 12, postcard::to_allocvec(&Ask::Features { names: names.clone() })?),
             ("Ask", "Place", 13, postcard::to_allocvec(&Ask::Place { json: String::new() })?),
             ("Say", "Features", 12, postcard::to_allocvec(&Say::Features { names: names.clone() })?),
             ("Say", "Place", 13, postcard::to_allocvec(&Say::Place { json: String::new() })?),
+            // lb/history's, after Place: a run with its sizes, and what a run used.
+            ("Ask", "RunWith", 14, postcard::to_allocvec(&Ask::RunWith { spec: Box::default(), with: String::new() })?),
+            ("Say", "Used", 14, postcard::to_allocvec(&Say::Used { id: 0, used: String::new() })?),
         ];
         for (side, name, idx, b) in links {
             assert_eq!(b.first(), Some(&idx), "{side}::{name}");
             assert!(registry.contains(&format!("| `reach::wire::{side}` | {idx} | `{name}` |")), "the registry has no row for {side}::{name}");
         }
-        assert_eq!((ASK_VARIANTS, SAY_VARIANTS), (14, 14));
+        assert_eq!((ASK_VARIANTS, SAY_VARIANTS), (15, 15));
         // Every name is said once, and a side speaks one only if the other named it.
         let mut all = feature::ALL.to_vec();
         all.sort_unstable();
