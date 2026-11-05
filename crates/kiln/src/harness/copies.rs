@@ -1271,12 +1271,14 @@ impl Shard {
         }
     }
 
-    /// Takes one message, a panic in it caught (its shard goes on with the rest).
-    fn take(&mut self, msg: Msg, hub: Option<&Arc<Hub>>) {
+    /// Takes one message, a panic in it caught (its shard goes on with the rest): what's left of it when
+    /// its owner's turn ran out first (`over`; an update's events, `Registry::apply`), to take next.
+    fn take(&mut self, msg: Msg, hub: Option<&Arc<Hub>>, over: &dyn Fn() -> bool) -> Option<Msg> {
+        let mut rest = None;
         let done = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| match msg {
             Msg::Update(i) => {
                 if let Some(h) = hub {
-                    h.harness.apply(self, h, *i);
+                    rest = h.harness.apply(self, h, *i, over).map(|i| Msg::Update(Box::new(i)));
                 }
             }
             Msg::Run(job) => job(self),
@@ -1286,6 +1288,7 @@ impl Shard {
             tracing::error!(shard = self.me, panic = %crate::sup::panic_message(p.as_ref()), "a change to an agent session's copy panicked: its shard goes on");
         }
         self.publish_board();
+        rest
     }
 }
 
@@ -1458,16 +1461,37 @@ impl Copies {
 
 /// A shard's owner: its messages, in the order they came, as fast as they come, in bounded turns of
 /// its shard (the HTTP listener may share it). It waits on nothing but its inbox, and ends with it.
+/// A message its turn ran out in the middle of (an update's events) goes on at its next turn, before
+/// anything newer (goal 9, plan 01a1a87b2cec step 3).
 async fn own(mut shard: Shard, rx: async_channel::Receiver<Msg>, hub: Arc<OnceLock<Weak<Hub>>>) {
     let mut turns = crate::rt::Turns::new();
-    while let Ok(msg) = rx.recv().await {
+    // What's left of the message the last turn ran out in.
+    let mut rest: Option<Msg> = None;
+    loop {
+        let msg = match rest.take() {
+            Some(msg) => msg,
+            None => match rx.try_recv() {
+                Ok(msg) => msg,
+                Err(async_channel::TryRecvError::Closed) => return,
+                // None waiting: waiting for one gives the shard to its other work, so its turn starts afresh
+                // once one comes (else an update after a quiet spell would find its turn spent already).
+                Err(async_channel::TryRecvError::Empty) => match rx.recv().await {
+                    Ok(msg) => {
+                        turns = crate::rt::Turns::new();
+                        msg
+                    }
+                    Err(_) => return,
+                },
+            },
+        };
         // The hub, once a turn: what each change tells the rest of kiln goes through it.
         let h = hub.get().and_then(Weak::upgrade);
-        shard.take(msg, h.as_ref());
+        let over = || turns.over();
+        rest = shard.take(msg, h.as_ref(), &over);
         // What's waiting already goes in the same turn.
-        while !turns.over() {
+        while rest.is_none() && !over() {
             let Ok(msg) = rx.try_recv() else { break };
-            shard.take(msg, h.as_ref());
+            rest = shard.take(msg, h.as_ref(), &over);
         }
         drop(h);
         turns.after().await;
