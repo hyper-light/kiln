@@ -406,3 +406,39 @@ fn bp_g3_s1_tcp_info_sees_unsent_bytes_held_at_the_mark() {
     })
     .unwrap();
 }
+
+/// Do: take a stream's options handle, set its low-water mark and buffers through it, drop the handle,
+/// and use the stream. Expect: what the handle set reads back on the stream itself, its reading is the
+/// stream's, and dropping it leaves the connection open; Windows makes no handle (bp-g3 step 1).
+#[test]
+fn bp_g3_s1_an_options_handle_sets_the_streams_own_socket() {
+    /// Shape: a low-water mark.
+    const LOWAT: u32 = 8_192;
+    let mut rt = LocalRuntime::new(&config()).unwrap();
+    rt.block_on(async {
+        let listener =
+            TcpListener::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)), BACKLOG).unwrap();
+        let client = TcpStream::connect(listener.local_addr().unwrap()).await.unwrap();
+        let server = listener.accept().await.unwrap();
+        let Some(handle) = server.options().unwrap() else {
+            assert!(cfg!(windows), "Unix makes a handle");
+            return;
+        };
+        if handle.set_notsent_lowat(LOWAT).unwrap() {
+            assert_eq!(server.notsent_lowat().unwrap(), Some(LOWAT), "the stream's own socket");
+        }
+        assert!(handle.set_recv_buffer(32 << 10).unwrap());
+        assert_eq!(handle.recv_buffer().unwrap(), server.recv_buffer().unwrap());
+        assert_eq!(handle.congestion().unwrap(), server.congestion().unwrap());
+        assert!(handle.tcp_info().unwrap().is_some());
+        drop(handle);
+        client.write_all(b"still").await.unwrap();
+        let mut got = [0u8; 5];
+        let mut n = 0;
+        while n < got.len() {
+            n += server.read(&mut got[n..]).await.unwrap();
+        }
+        assert_eq!(&got, b"still");
+    })
+    .unwrap();
+}

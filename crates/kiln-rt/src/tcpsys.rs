@@ -792,6 +792,14 @@ mod imp {
         }
     }
 
+    /// A second descriptor of the same socket, close-on-exec, for its options alone: never registered with a
+    /// driver, so the stream's own reads and writes are untouched, and closing it leaves the connection open.
+    pub(crate) fn duplicate(stream: &Stream) -> Result<Option<Stream>, RtError> {
+        let fd = rustix::io::fcntl_dupfd_cloexec(&stream.fd, 0)
+            .map_err(|e| refused("fcntl(F_DUPFD_CLOEXEC)", e))?;
+        Ok(Some(Stream { fd }))
+    }
+
     /// Sets one `int` option.
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     fn set_int(
@@ -1259,6 +1267,11 @@ mod imp {
         }))
     }
 
+    /// Winsock duplicates a socket only through `WSADuplicateSocket` for another process: not offered.
+    pub(crate) fn duplicate(_stream: &Stream) -> Result<Option<Stream>, RtError> {
+        Ok(None)
+    }
+
     /// `TCP_MAXRTMS` (Windows 10 1607): how long, in milliseconds, retransmissions go on before the
     /// connection is dropped, Linux's `TCP_USER_TIMEOUT` in effect.
     pub(crate) fn set_user_timeout(stream: &Stream, ms: u32) -> Result<bool, RtError> {
@@ -1315,7 +1328,8 @@ mod imp {
 #[cfg(unix)]
 pub(crate) use imp::set_reuseport;
 pub(crate) use imp::{
-    OwnedStream, Stream, accept, adopt, bind, congestion, connect, into_owned, listen, local_addr,
+    OwnedStream, Stream, accept, adopt, bind, congestion, connect, duplicate, into_owned, listen,
+    local_addr,
     nodelay, notsent_lowat, peer_addr, read, read_vectored, recv_buffer, send_buffer,
     set_congestion, set_no_sigpipe, set_notsent_lowat, set_options, set_recv_buffer,
     set_send_buffer, set_user_timeout, shutdown, stream_socket, take_error, tcp_info,

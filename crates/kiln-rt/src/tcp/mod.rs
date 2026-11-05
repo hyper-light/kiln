@@ -271,6 +271,61 @@ impl TcpListener {
 
 // ------------------------------------------------------------------------------------------ stream
 
+/// A connection's socket, for its options alone ([`TcpStream::options`]): what [`TcpStream`]'s option
+/// calls do, on the same socket, from wherever the handle is kept. It reads and writes nothing; dropping
+/// it closes only its own descriptor (bp-g3 step 1, plan `01a1a832eb2f711f9c6f51d88effe89d`).
+#[derive(Debug)]
+pub struct SocketOptions {
+    stream: Stream,
+}
+
+impl SocketOptions {
+    /// [`TcpStream::set_notsent_lowat`].
+    pub fn set_notsent_lowat(&self, bytes: u32) -> Result<bool, RtError> {
+        tcpsys::set_notsent_lowat(&self.stream, bytes)
+    }
+
+    /// [`TcpStream::notsent_lowat`].
+    pub fn notsent_lowat(&self) -> Result<Option<u32>, RtError> {
+        tcpsys::notsent_lowat(&self.stream)
+    }
+
+    /// [`TcpStream::set_congestion`].
+    pub fn set_congestion(&self, name: CongestionName) -> Result<bool, CongestionError> {
+        tcpsys::set_congestion(&self.stream, name)
+    }
+
+    /// [`TcpStream::congestion`].
+    pub fn congestion(&self) -> Result<Option<CongestionName>, RtError> {
+        tcpsys::congestion(&self.stream)
+    }
+
+    /// [`TcpStream::set_send_buffer`].
+    pub fn set_send_buffer(&self, bytes: u32) -> Result<bool, RtError> {
+        tcpsys::set_send_buffer(&self.stream, bytes)
+    }
+
+    /// [`TcpStream::send_buffer`].
+    pub fn send_buffer(&self) -> Result<Option<u32>, RtError> {
+        tcpsys::send_buffer(&self.stream)
+    }
+
+    /// [`TcpStream::set_recv_buffer`].
+    pub fn set_recv_buffer(&self, bytes: u32) -> Result<bool, RtError> {
+        tcpsys::set_recv_buffer(&self.stream, bytes)
+    }
+
+    /// [`TcpStream::recv_buffer`].
+    pub fn recv_buffer(&self) -> Result<Option<u32>, RtError> {
+        tcpsys::recv_buffer(&self.stream)
+    }
+
+    /// [`TcpStream::tcp_info`].
+    pub fn tcp_info(&self) -> Result<Option<TcpInfo>, RtError> {
+        tcpsys::tcp_info(&self.stream)
+    }
+}
+
 /// A connected TCP stream whose reads and writes await the shard's driver.
 #[derive(Debug)]
 pub struct TcpStream {
@@ -438,6 +493,14 @@ impl TcpStream {
     /// two system calls, no allocation (bp-g3 step 1).
     pub fn tcp_info(&self) -> Result<Option<TcpInfo>, RtError> {
         tcpsys::tcp_info(&self.stream)
+    }
+
+    /// A handle to this connection's socket for its options alone ([`SocketOptions`]), to keep where the
+    /// stream itself can't go (the stream wrapped in a TLS session and an HTTP connection, its handler
+    /// holding the handle): a second descriptor of the same socket on Unix, so the handle stays sound
+    /// whoever drops first. `None` where the platform can't make one (Windows) (bp-g3 step 1).
+    pub fn options(&self) -> Result<Option<SocketOptions>, RtError> {
+        Ok(tcpsys::duplicate(&self.stream)?.map(|stream| SocketOptions { stream }))
     }
 
     /// Awaits read readiness once (or a spurious wake).
