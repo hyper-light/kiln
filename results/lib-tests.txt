@@ -1,0 +1,200 @@
+   Compiling phc v0.6.1
+   Compiling tracing-serde v0.2.0
+   Compiling tracing-log v0.2.0
+   Compiling xattr v1.6.1
+   Compiling matchers v0.2.0
+   Compiling filetime v0.2.29
+   Compiling cobs v0.3.0
+   Compiling encoding_rs v0.8.35
+   Compiling thread_local v1.1.10
+   Compiling clap_lex v1.1.1
+   Compiling sha1_smol v1.0.1
+   Compiling kiln-cd v0.2.0 (/home/runner/work/kiln/kiln/crates/kiln-cd)
+   Compiling softaes v0.1.7
+   Compiling fallible-iterator v0.3.0
+   Compiling nu-ansi-term v0.50.3
+   Compiling arraydeque v0.5.1
+   Compiling focal-memory v0.1.0 (/home/runner/work/kiln/kiln/vendor/focal-bus/crates/focal-memory)
+   Compiling mantle-codec v0.1.0 (/home/runner/work/kiln/kiln/vendor/mantle/crates/codec)
+   Compiling mantle-protocol v0.1.0 (/home/runner/work/kiln/kiln/vendor/mantle/crates/protocol)
+warning: use of deprecated method `std::sync::atomic::Atomic::<usize>::fetch_update`: renamed to `try_update` for consistency
+   --> vendor/focal-bus/crates/focal-memory/src/budget.rs:235:18
+    |
+235 |                 .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |next| {
+    |                  ^^^^^^^^^^^^
+    |
+    = note: `#[warn(deprecated)]` on by default
+help: replace the use of the deprecated method
+    |
+235 -                 .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |next| {
+235 +                 .try_update(Ordering::Relaxed, Ordering::Relaxed, |next| {
+    |
+
+warning: use of deprecated method `std::sync::atomic::Atomic::<usize>::fetch_update`: renamed to `try_update` for consistency
+   --> vendor/focal-bus/crates/focal-memory/src/budget.rs:467:14
+    |
+467 |             .fetch_update(Ordering::AcqRel, Ordering::Acquire, |available| {
+    |              ^^^^^^^^^^^^
+    |
+help: replace the use of the deprecated method
+    |
+467 -             .fetch_update(Ordering::AcqRel, Ordering::Acquire, |available| {
+467 +             .try_update(Ordering::AcqRel, Ordering::Acquire, |available| {
+    |
+
+warning: use of deprecated method `std::sync::atomic::Atomic::<usize>::fetch_update`: renamed to `try_update` for consistency
+    --> vendor/focal-bus/crates/focal-memory/src/budget.rs:1188:10
+     |
+1188 |         .fetch_update(Ordering::AcqRel, Ordering::Acquire, |used| {
+     |          ^^^^^^^^^^^^
+     |
+help: replace the use of the deprecated method
+     |
+1188 -         .fetch_update(Ordering::AcqRel, Ordering::Acquire, |used| {
+1188 +         .try_update(Ordering::AcqRel, Ordering::Acquire, |used| {
+     |
+
+warning: use of deprecated method `std::sync::atomic::Atomic::<u64>::fetch_update`: renamed to `try_update` for consistency
+   --> vendor/focal-bus/crates/focal-memory/src/disk.rs:281:18
+    |
+281 |                 .fetch_update(Ordering::AcqRel, Ordering::Acquire, |free| {
+    |                  ^^^^^^^^^^^^
+    |
+help: replace the use of the deprecated method
+    |
+281 -                 .fetch_update(Ordering::AcqRel, Ordering::Acquire, |free| {
+281 +                 .try_update(Ordering::AcqRel, Ordering::Acquire, |free| {
+    |
+
+warning: use of deprecated method `std::sync::atomic::Atomic::<u64>::fetch_update`: renamed to `try_update` for consistency
+  --> vendor/focal-bus/crates/focal-memory/src/owner.rs:18:10
+   |
+18 |         .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
+   |          ^^^^^^^^^^^^
+   |
+help: replace the use of the deprecated method
+   |
+18 -         .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
+18 +         .try_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
+   |
+
+   Compiling yaml-rust2 v0.13.0
+   Compiling tracing-subscriber v0.3.23
+   Compiling focal-bus v0.1.0 (/home/runner/work/kiln/kiln/vendor/focal-bus/crates/focal-bus)
+warning: `focal-memory` (lib) generated 5 warnings (run `cargo fix --lib -p focal-memory` to apply 5 suggestions)
+   Compiling aegis v0.9.20
+   Compiling uuid v1.28.0
+   Compiling clap_builder v4.6.7
+   Compiling postcard v1.1.3
+   Compiling aristo v0.4.1
+   Compiling tar v0.4.46
+   Compiling password-hash v0.6.1
+   Compiling tungstenite v0.30.0
+   Compiling pbkdf2 v0.12.2
+   Compiling vorpal-language v0.10.2 (/home/runner/work/kiln/kiln/vendor/vorpal/crates/language)
+   Compiling icu_collator v2.3.1
+   Compiling vorpal-kg v0.10.2 (/home/runner/work/kiln/kiln/vendor/vorpal/crates/kg)
+   Compiling nix v0.28.0
+   Compiling flate2 v1.1.10
+   Compiling libsqlite3-sys v0.38.2
+   Compiling icu_locale v2.3.1
+   Compiling rquickjs-core v0.14.0
+   Compiling mlua v0.12.2
+   Compiling rust-embed-impl v8.13.0
+   Compiling turso_parser v0.9.0-pre.1 (/home/runner/work/kiln/kiln/vendor/turso/sqlite/parser)
+   Compiling aes-gcm v0.10.3
+   Compiling turso_ext v0.9.0-pre.1 (/home/runner/work/kiln/kiln/vendor/turso/extensions/core)
+   Compiling branches v0.4.6
+   Compiling bigdecimal v0.4.11
+   Compiling uncased v0.9.10
+   Compiling filedescriptor v0.8.3
+   Compiling fancy-regex v0.19.2
+   Compiling is v0.11.1
+   Compiling str0m-aws-lc-rs v0.6.0
+   Compiling intrusive-collections v0.9.7
+   Compiling sctp-proto v0.10.7
+   Compiling roaring v0.11.5
+   Compiling poly1305 v0.8.0
+   Compiling tempfile v3.27.0
+   Compiling lz4_flex v0.14.0
+   Compiling rapidhash v4.5.1
+   Compiling arc-swap v1.9.3
+   Compiling quiver-api v0.1.0 (/home/runner/work/kiln/kiln/vendor/quiver/crates/quiver-api)
+   Compiling cms v0.2.3
+   Compiling pack1 v1.1.0
+   Compiling fastbloom v0.14.1
+   Compiling sha2 v0.10.9
+   Compiling blake2 v0.11.0
+   Compiling combine v4.6.9
+   Compiling vte v0.15.0
+   Compiling polling v3.11.0
+   Compiling concurrent-queue v2.5.0
+   Compiling rtoolbox v0.0.6
+   Compiling serial2 v0.2.38
+   Compiling libloading v0.8.9
+   Compiling cfg_block v0.1.1
+   Compiling fallible-streaming-iterator v0.1.9
+   Compiling allocator-api2 v0.4.0
+   Compiling glob v0.3.4
+   Compiling shell-words v1.1.1
+   Compiling kiln v0.2.0 (/home/runner/work/kiln/kiln/crates/kiln)
+   Compiling atomic-waker v1.1.2
+   Compiling typed-path v0.12.3
+   Compiling downcast-rs v1.2.1
+   Compiling simdutf8 v0.1.5
+   Compiling base64 v0.22.1
+   Compiling unicode-width v0.2.2
+   Compiling k8s-openapi v0.28.0
+   Compiling vt100 v0.16.2
+   Compiling zip v9.0.5
+   Compiling turso_core v0.9.0-pre.1 (/home/runner/work/kiln/kiln/vendor/turso/core)
+   Compiling str0m v0.24.1
+   Compiling portable-pty v0.9.0
+   Compiling async-tungstenite v0.35.0
+   Compiling rusqlite v0.40.2
+   Compiling rpassword v7.5.4
+   Compiling async-channel v2.5.0
+   Compiling argon2 v0.6.0
+   Compiling scrypt v0.11.0
+   Compiling kiln-ci v0.2.0 (/home/runner/work/kiln/kiln/crates/kiln-ci)
+   Compiling quiver v0.1.0 (/home/runner/work/kiln/kiln/vendor/quiver/crates/quiver)
+   Compiling rust-embed v8.13.0
+   Compiling clap v4.6.7
+   Compiling crypto_secretbox v0.1.1
+   Compiling rquickjs v0.14.0
+   Compiling kiln-search v0.2.0 (/home/runner/work/kiln/kiln/crates/kiln-search)
+   Compiling nix v0.31.3
+   Compiling kiln-sim v0.2.0 (/home/runner/work/kiln/kiln/crates/kiln-sim)
+   Compiling mantle-client v0.1.0 (/home/runner/work/kiln/kiln/vendor/mantle/crates/client)
+   Compiling kiln-http v0.2.0 (/home/runner/work/kiln/kiln/crates/kiln-http)
+   Compiling http-body-util v0.1.5
+   Compiling async-broadcast v0.7.2
+   Compiling async-lock v3.4.2
+   Compiling kiln-obs v0.2.0 (/home/runner/work/kiln/kiln/crates/kiln-obs)
+   Compiling toml_edit v0.25.17+spec-1.1.0
+   Compiling hmac v0.13.0
+   Compiling webpki-roots v1.0.9
+   Compiling serde_path_to_error v0.1.20
+   Compiling socket2 v0.6.5
+   Compiling sysinfo v0.39.6
+   Compiling hyper-measure v0.1.0 (/home/runner/work/kiln/kiln/vendor/hyper-raft/crates/hyper-measure)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 10m 11s
+     Running unittests src/lib.rs (/mnt/target/debug/deps/kiln-001552c59bc51659)
+
+running 13 tests
+test memory::tests::g11_s1_resident_memory_is_read_by_kind ... ok
+test memory::tests::g11_s3_an_owners_count_and_bound_show ... ok
+test ui::tests::only_plain_asset_names_are_looked_up ... ok
+test ui::tests::g11_s3_only_this_builds_files_are_kept_packed ... ok
+test wire::ui::tests::a_socket_notes_from_its_person_on_its_page ... ok
+test wire::ui::tests::a_session_socket_reads_what_comes_up_or_says_why_not ... ok
+test wire::ui::tests::the_feeds_last_frame_is_closed ... ok
+test wire::ui::tests::an_update_goes_down_as_its_frame ... ok
+test wire::ui::tests::the_other_sockets_read_their_frames_and_unread_or_say_why_not ... ok
+test wire::ui::tests::what_ends_a_socket_is_closed_with_its_code ... ok
+test wire::ui::tests::what_a_runner_says_of_a_live_page_is_one_of_its_kinds ... ok
+test ui::tests::brotli_and_gzip_are_taken_as_the_browser_says ... ok
+test ui::tests::g11_s3_brotlis_window_holds_the_file_and_no_more ... ok
+
+test result: ok. 13 passed; 0 failed; 0 ignored; 0 measured; 2841 filtered out; finished in 11.42s
+

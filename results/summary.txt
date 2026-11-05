@@ -1,0 +1,24 @@
+clippy exit 0
+lib tests exit 0
+resident exit 0
+/home/runner/work/_temp/checks/clippy.txt:warning: use of deprecated method `std::sync::atomic::Atomic::<usize>::fetch_update`: renamed to `try_update` for consistency
+/home/runner/work/_temp/checks/clippy.txt:warning: use of deprecated method `std::sync::atomic::Atomic::<usize>::fetch_update`: renamed to `try_update` for consistency
+/home/runner/work/_temp/checks/clippy.txt:warning: use of deprecated method `std::sync::atomic::Atomic::<usize>::fetch_update`: renamed to `try_update` for consistency
+/home/runner/work/_temp/checks/clippy.txt:warning: use of deprecated method `std::sync::atomic::Atomic::<u64>::fetch_update`: renamed to `try_update` for consistency
+/home/runner/work/_temp/checks/clippy.txt:warning: use of deprecated method `std::sync::atomic::Atomic::<u64>::fetch_update`: renamed to `try_update` for consistency
+/home/runner/work/_temp/checks/clippy.txt:warning: `focal-memory` (lib) generated 5 warnings (run `cargo clippy --fix --lib -p focal-memory -- -D warnings` to apply 5 suggestions)
+/home/runner/work/_temp/checks/lib-tests.txt:warning: use of deprecated method `std::sync::atomic::Atomic::<usize>::fetch_update`: renamed to `try_update` for consistency
+/home/runner/work/_temp/checks/lib-tests.txt:warning: use of deprecated method `std::sync::atomic::Atomic::<usize>::fetch_update`: renamed to `try_update` for consistency
+/home/runner/work/_temp/checks/lib-tests.txt:warning: use of deprecated method `std::sync::atomic::Atomic::<usize>::fetch_update`: renamed to `try_update` for consistency
+/home/runner/work/_temp/checks/lib-tests.txt:warning: use of deprecated method `std::sync::atomic::Atomic::<u64>::fetch_update`: renamed to `try_update` for consistency
+/home/runner/work/_temp/checks/lib-tests.txt:warning: use of deprecated method `std::sync::atomic::Atomic::<u64>::fetch_update`: renamed to `try_update` for consistency
+/home/runner/work/_temp/checks/lib-tests.txt:warning: `focal-memory` (lib) generated 5 warnings (run `cargo fix --lib -p focal-memory` to apply 5 suggestions)
+/home/runner/work/_temp/checks/lib-tests.txt:test result: ok. 13 passed; 0 failed; 0 ignored; 0 measured; 2841 filtered out; finished in 11.42s
+/home/runner/work/_temp/checks/resident.txt:warning: use of deprecated method `std::sync::atomic::Atomic::<usize>::fetch_update`: renamed to `try_update` for consistency
+/home/runner/work/_temp/checks/resident.txt:warning: use of deprecated method `std::sync::atomic::Atomic::<usize>::fetch_update`: renamed to `try_update` for consistency
+/home/runner/work/_temp/checks/resident.txt:warning: use of deprecated method `std::sync::atomic::Atomic::<usize>::fetch_update`: renamed to `try_update` for consistency
+/home/runner/work/_temp/checks/resident.txt:warning: use of deprecated method `std::sync::atomic::Atomic::<u64>::fetch_update`: renamed to `try_update` for consistency
+/home/runner/work/_temp/checks/resident.txt:warning: use of deprecated method `std::sync::atomic::Atomic::<u64>::fetch_update`: renamed to `try_update` for consistency
+/home/runner/work/_temp/checks/resident.txt:warning: `focal-memory` (lib) generated 5 warnings (run `cargo fix --lib -p focal-memory` to apply 5 suggestions)
+/home/runner/work/_temp/checks/resident.txt:g11 resident: 20000 events sent (70.1 MB of JSON), 4640 kept; while open the server held 122.96 MB more (26499 bytes an event kept), 61.53 MB of it let go at its end (process 0.11 MB before, 123.06 MB with it, 61.53 MB after)
+/home/runner/work/_temp/checks/resident.txt:test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 14.79s
