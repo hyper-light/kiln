@@ -8,7 +8,9 @@
 //! repository. One with no remote is a place of its own.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
@@ -83,13 +85,24 @@ pub struct Held {
 /// Every machine's repositories, as each last said (`<data>/sync/places.json`).
 pub struct Places {
     file: PathBuf,
-    held: Mutex<BTreeMap<String, Held>>,
+    /// Each machine's, shared with the writer of the file ([`Places::save`]), which takes them as they
+    /// are by their handles alone.
+    held: Arc<Mutex<BTreeMap<String, Arc<Held>>>>,
+    saving: Arc<Saving>,
+}
+
+/// [`Places`]'s file writes, one at a time: whether one was asked for since the last began, and whether
+/// one is under way.
+#[derive(Default)]
+struct Saving {
+    asked: AtomicBool,
+    busy: AtomicBool,
 }
 
 impl Places {
     pub fn open(file: PathBuf) -> Self {
-        let held = std::fs::read(&file).ok().and_then(|b| serde_json::from_slice(&b).ok()).unwrap_or_default();
-        Self { file, held: Mutex::new(held) }
+        let held: BTreeMap<String, Held> = std::fs::read(&file).ok().and_then(|b| serde_json::from_slice(&b).ok()).unwrap_or_default();
+        Self { file, held: Arc::new(Mutex::new(held.into_iter().map(|(m, h)| (m, Arc::new(h))).collect())), saving: Arc::default() }
     }
 
     /// What a machine said; true when it changed anything.
@@ -97,8 +110,9 @@ impl Places {
         let held = Held { home: r.home, repos: r.repos, error: r.error, at: r.at };
         let changed = {
             let mut all = self.held.lock();
-            let same = all.get(machine).is_some_and(|h| Held { at: held.at, ..h.clone() } == held);
-            all.insert(machine.to_owned(), held);
+            // The same as it said before, when it said so again (`at` aside).
+            let same = all.get(machine).is_some_and(|h| h.home == held.home && h.repos == held.repos && h.error == held.error);
+            all.insert(machine.to_owned(), Arc::new(held));
             !same
         };
         if changed {
@@ -141,11 +155,11 @@ impl Places {
     }
 
     pub fn of(&self, machine: &str) -> Option<Held> {
-        self.held.lock().get(machine).cloned()
+        self.held.lock().get(machine).map(|h| Held::clone(h))
     }
 
     pub fn all(&self) -> BTreeMap<String, Held> {
-        self.held.lock().clone()
+        self.held.lock().iter().map(|(m, h)| (m.clone(), Held::clone(h))).collect()
     }
 
     /// The repository at `path` on `machine`, as it last said.
@@ -174,10 +188,47 @@ impl Places {
         (whole && plain && out.len() > 1).then(|| out.trim_end_matches(['/', '\\']).to_owned())
     }
 
+    /// Its file written with what's held now, off the caller's thread (goal 9, plan 01a1a87b2cec step 3: written
+    /// and synced on the hub's shard each time a runner said what it holds, it held the shard 23 ms a poll, up to
+    /// 49 ms, as runners connected in the lab's g6c2). One write at a time, each of what's held as it begins: a
+    /// change that comes while one is under way is written after it, so the file ends with the last change,
+    /// and changes that come together are written once. Off the runtime, it's written here.
     fn save(&self) {
-        let bytes = serde_json::to_vec(&*self.held.lock()).unwrap_or_default();
-        if let Err(e) = super::group::save_atomic(&self.file, &bytes) {
+        self.saving.asked.store(true, Ordering::SeqCst);
+        if self.saving.busy.swap(true, Ordering::SeqCst) {
+            return;
+        }
+        let (file, held, saving) = (self.file.clone(), Arc::clone(&self.held), Arc::clone(&self.saving));
+        if !crate::rt::on_shard() {
+            return write_all(&file, &held, &saving);
+        }
+        let freed = Arc::clone(&self.saving);
+        drop(crate::rt::spawn(async move {
+            if let Err(e) = crate::rt::blocking(move || write_all(&file, &held, &saving)).await {
+                tracing::warn!(error = %format!("{e:#}"), "what machines hold could not be saved");
+                // The next change starts a writer of its own.
+                freed.busy.store(false, Ordering::SeqCst);
+            }
+        }));
+    }
+}
+
+/// [`Places::save`]'s writer: what's held, written whole; again while another write was asked for meanwhile;
+/// then the next ask starts a writer of its own.
+fn write_all(file: &Path, held: &Mutex<BTreeMap<String, Arc<Held>>>, saving: &Saving) {
+    loop {
+        saving.asked.store(false, Ordering::SeqCst);
+        // What's held now, by its handles: the lock is held for that alone, never for the writing.
+        let now: BTreeMap<String, Arc<Held>> = held.lock().clone();
+        let bytes = serde_json::to_vec(&now.iter().map(|(m, h)| (m, &**h)).collect::<BTreeMap<_, _>>()).unwrap_or_default();
+        if let Err(e) = super::group::save_atomic(file, &bytes) {
             tracing::warn!(error = %e, "what machines hold could not be saved");
+        }
+        saving.busy.store(false, Ordering::SeqCst);
+        // An ask that came while it wrote found it under way and left it to this writer: written now, unless
+        // a writer of its own has started since and taken it.
+        if !saving.asked.load(Ordering::SeqCst) || saving.busy.swap(true, Ordering::SeqCst) {
+            return;
         }
     }
 }
@@ -464,5 +515,43 @@ mod tests {
         let mac = v.machines.iter().find(|m| m.name == "mac").map(|m| (m.can_clone, m.home.clone()));
         assert_eq!(mac, Some((true, Some("/Users/ada".to_owned()))));
         assert!(v.machines.iter().any(|m| m.name == "box" && !m.can_clone), "an offline machine clones nothing");
+    }
+
+    /// What a machine said, `n` its mark.
+    fn said(n: i64) -> Repos {
+        Repos { home: format!("/home/{n}"), at: n, ..Repos::default() }
+    }
+
+    /// Goal 9, plan 01a1a87b2cec step 3: on the runtime, what machines hold is written off the shard that heard
+    /// it, one write at a time, and the file ends with the last change however the changes came together; a
+    /// place opened again reads it.
+    #[test]
+    fn g9_s3_places_are_written_off_the_shard_ending_with_the_last_change() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let file = dir.path().join("places.json");
+        crate::rt::block_on(async move {
+            let places = Places::open(file.clone());
+            for n in 1..=20 {
+                anyhow::ensure!(places.heard("box", said(n)), "change {n} is one");
+            }
+            anyhow::ensure!(!places.heard("box", Repos { at: 99, ..said(20) }), "the same again, but for when, isn't a change");
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+            while Places::open(file.clone()).of("box").is_none_or(|h| h.home != "/home/20") {
+                anyhow::ensure!(std::time::Instant::now() < deadline, "the last change wasn't written");
+                crate::rt::sleep(std::time::Duration::from_millis(5)).await;
+            }
+            Ok(())
+        })
+    }
+
+    /// Off the runtime, what machines hold is written as it changes, where it changed.
+    #[test]
+    fn g9_s3_places_off_the_runtime_are_written_at_once() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let places = Places::open(dir.path().join("places.json"));
+        anyhow::ensure!(places.heard("mac", said(7)));
+        let kept = Places::open(dir.path().join("places.json")).of("mac").map(|h| h.home);
+        anyhow::ensure!(kept.as_deref() == Some("/home/7"), "{kept:?}");
+        Ok(())
     }
 }

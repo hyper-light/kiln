@@ -846,6 +846,7 @@ impl Hub {
     /// machine that holds one), on the sync lane; a learner whose runner is away misses them.
     pub async fn cluster_loop(self: Arc<Self>) -> anyhow::Result<()> {
         let Some(out) = self.store.group().map(crate::store::group::Group::outgoing) else { return Ok(()) };
+        let mut turns = crate::rt::Turns::new();
         while let Ok((member, bytes)) = out.recv().await {
             let peer = self.cluster.machine(member).and_then(|m| self.instances.load().newest_with(&m, proto::CAP_CLUSTER));
             let Some(peer) = peer else {
@@ -854,10 +855,14 @@ impl Hub {
                 }
                 continue;
             };
+            // A long message's parts made and sent one at a time, the shard given up between them once this
+            // loop has had its turn (goal 9, plan 01a1a87b2cec step 3: a learner's catch-up, copied and sent in
+            // one poll, held its shard up to 5.7 ms in the lab's g6c2).
             for (msg, raft) in self.cluster.frames(member, bytes) {
                 if let Ok(b) = proto::encode(&ServerMsg::Cluster { json: crate::store::learner::encode(&msg), raft }) {
                     self.net.send(peer, proto::LANE_SYNC, Kind::Control, b).await;
                 }
+                turns.after().await;
             }
         }
         Ok(())
