@@ -82,6 +82,10 @@ pub fn keep_assets(data_dir: &Path) {
         tracing::warn!(error = %e, dir = %dir.display(), "can't keep the UI's earlier assets");
         return;
     }
+    // Earlier builds' assets are servable from here on, while this build's are kept beside them and the
+    // dictionaries are found: a page loaded before the deploy needn't wait for all of it (goal 8, plan
+    // 01a1a832ebfd step 5: reading every kept script for its SHA-256 takes a while).
+    let _ = KEPT.set(dir.clone());
     let now = SystemTime::now();
     for name in Assets::iter() {
         let Some(file) = name.strip_prefix("assets/") else { continue };
@@ -127,9 +131,8 @@ pub fn keep_assets(data_dir: &Path) {
             }
         }
     }
-    kept_dictionaries().set(index);
     let _ = std::fs::create_dir_all(dir.join(DELTAS));
-    let _ = KEPT.set(dir);
+    kept_dictionaries().set(index);
 }
 
 /// Where the deltas are kept, in the kept assets' directory (a name no asset path can reach).

@@ -101,8 +101,10 @@ h=$(head_of -H 'accept-encoding: br, gzip' "http://127.0.0.1:$PORT/assets/$old")
 kenc=$(grep -i '^content-encoding:' <<<"$h" | cut -d' ' -f2)
 echo "  $old, kept from build A: $(head -1 <<<"$h" | cut -d' ' -f2) ${kenc:-uncompressed}, $(wc -c <"$WORK/body") bytes"
 [ "$kenc" = br ] || fail=1
-dict=$(python3 -I -c 'import base64,hashlib,sys; print(base64.b64encode(hashlib.sha256(open(sys.argv[1],"rb").read()).digest()).decode())' "$A/client/assets/$old")
-for i in 1 2 3 4 5; do
+dict=$(node -e 'console.log(require("node:crypto").createHash("sha256").update(require("node:fs").readFileSync(process.argv[1])).digest("base64"))' "$A/client/assets/$old")
+# The delta is made on the compute pool after the first ask, once the server has found the kept
+# builds' dictionaries (keep_assets, in the background as it starts).
+for i in $(seq 1 30); do
   h=$(head_of -H 'accept-encoding: br, gzip, dcb' -H "available-dictionary: :$dict:" "http://127.0.0.1:$PORT/assets/$new")
   enc=$(grep -i '^content-encoding:' <<<"$h" | cut -d' ' -f2)
   [ "$enc" = dcb ] && break
@@ -113,6 +115,6 @@ br=$(node -e 'const z=require("node:zlib"),d=require("node:fs").readFileSync(pro
 echo "  $new against $old: $enc, $size bytes (Brotli alone $br); $(grep -i '^use-as-dictionary:' <<<"$h")"
 echo "  vary: $(grep -i '^vary:' <<<"$h" | cut -d' ' -f2-)"
 [ "$enc" = dcb ] || fail=1
-python3 -I -c 'import hashlib,sys; d=open(sys.argv[1],"rb").read(); b=open(sys.argv[2],"rb").read(); print("  dcb header names the dictionary:", d[:4]==b"\xffDCB" and d[4:36]==hashlib.sha256(b).digest())' "$WORK/body" "$A/client/assets/$old"
+node -e 'const fs=require("node:fs"),d=fs.readFileSync(process.argv[1]),b=fs.readFileSync(process.argv[2]),h=require("node:crypto").createHash("sha256").update(b).digest();const ok=d.subarray(0,4).equals(Buffer.from([0xff,0x44,0x43,0x42]))&&d.subarray(4,36).equals(h);console.log("  dcb header names the dictionary:",ok);process.exit(ok?0:1)' "$WORK/body" "$A/client/assets/$old" || fail=1
 stop
 exit $fail
