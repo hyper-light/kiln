@@ -2184,11 +2184,6 @@ impl Registry {
         let mut rows: Vec<crate::convo::rows::Row> = Vec::new();
         // How many of an update's events its turn took.
         let mut taken = 0;
-        let mut made: Option<Value> = match &u {
-            Update::State { state } => Some(serde_json::to_value(state).unwrap_or(Value::Null)),
-            Update::Meta { meta } => Some(serde_json::to_value(meta).unwrap_or(Value::Null)),
-            _ => None,
-        };
         // Its info changed as its pages see it: the events socket is told, its frame made of the bytes its
         // view encoded the info as (goal 10, plan 01a1a87b2dae step 5: it was encoded again for the socket).
         let mut changed = false;
@@ -2298,7 +2293,12 @@ impl Registry {
                 m.started_over();
             }
             Update::State { state } => {
-                m.state = Arc::new(made.take().unwrap_or(Value::Null));
+                // The same state as the copy's was made of, the copy's still that value: not made again (goal 9,
+                // plan 01a1a87b2cec step 5: a whole state made into a value, 0.45% of the process in rt7's calm
+                // profile, and compared field by field with the last for a patch of nothing).
+                if !m.state_of.as_ref().is_some_and(|(was, made)| **was == **state && Arc::ptr_eq(made, &m.state)) {
+                    m.state = Arc::new(serde_json::to_value(state).unwrap_or(Value::Null));
+                }
                 // The info as it was, shared with the copy's views (not copied: its own is, as it changes).
                 let before = Arc::clone(&m.info);
                 let info = Arc::make_mut(&mut m.info);
@@ -2316,8 +2316,11 @@ impl Registry {
                     Naming::Keep => {
                         if let Some(n) = names.get(id) {
                             info.name.clone_from(n);
-                            // The state is the copy's own here (just made): nothing is copied.
-                            if let Some(o) = Arc::make_mut(&mut m.state).as_object_mut() {
+                            // Only where the state doesn't say it already: the copy's own when just made (nothing
+                            // copied), else the last one's, shared with its views, copied only to change.
+                            if m.state.get("name").and_then(Value::as_str) != Some(n.as_str())
+                                && let Some(o) = Arc::make_mut(&mut m.state).as_object_mut()
+                            {
                                 o.insert("name".into(), json!(n));
                             }
                         }
@@ -2338,12 +2341,18 @@ impl Registry {
                     hold_for = Some((account, p.window.clone(), p.until));
                 }
             }
-            Update::Meta { .. } => {
-                let meta = made.take().unwrap_or(Value::Null);
-                if *m.meta == meta {
+            Update::Meta { meta } => {
+                // The same meta as the copy's was made of, the copy's still that value: the same again, not made
+                // into a value to be found so (goal 9, plan 01a1a87b2cec step 5).
+                if m.meta_of.as_ref().is_some_and(|(was, made)| **was == **meta && Arc::ptr_eq(made, &m.meta)) {
                     meta_same = true;
                 } else {
-                    m.meta = Arc::new(meta);
+                    let meta = serde_json::to_value(meta).unwrap_or(Value::Null);
+                    if *m.meta == meta {
+                        meta_same = true;
+                    } else {
+                        m.meta = Arc::new(meta);
+                    }
                 }
             }
             Update::Changes { files } => m.take_changes(files.iter().filter_map(|f| serde_json::to_value(f).ok()).collect(), Vec::new(), true),
@@ -2414,6 +2423,13 @@ impl Registry {
             Update::Meta { .. } if meta_same => None,
             _ => Some(m.frame_of(&u, &entries)),
         });
+        // What the copy's state or meta was made of, kept with the value as made (a name given here in it): the
+        // same one again finds it so (above).
+        match u {
+            Update::State { state } => m.state_of = Some((state, Arc::clone(&m.state))),
+            Update::Meta { meta } => m.meta_of = Some((meta, Arc::clone(&m.meta))),
+            _ => {}
+        }
         if gone {
             s.remove(id);
         }
@@ -4359,6 +4375,63 @@ mod tests {
             hub.harness.ingest(&hub, &there, "s", Update::Meta { meta: Box::new(meta) }).await;
             let heard = sent(&hub, &topic, &mut at);
             anyhow::ensure!(heard.is_empty() && encodings().await.meta == was.meta + 1, "the same meta again: nothing kept, encoded or sent: {heard:?}");
+            Ok(())
+        })
+    }
+
+    /// Goal 9, plan 01a1a87b2cec step 5: the same state again from its machine isn't made into a value while the
+    /// copy's is still the one made of it: the copy keeps that one (its revision moves, no frame goes), and its
+    /// view holds what making it again would. Changed here since (a name given here), it's made again, the name in
+    /// it, and the same again after that keeps that one; a changed state is made anew. The same meta again
+    /// keeps the copy's.
+    #[test]
+    fn g9_s5_the_same_state_again_isnt_made_into_a_value() -> anyhow::Result<()> {
+        use crate::harness::model::{Meta, State};
+        crate::rt::block_on(async {
+            let hub = crate::hub::tests::scratch_hub().await?;
+            let there = Location::Machine("box".into());
+            hub.harness.ingest(&hub, &there, "s", Update::Open { info: Box::new(Info { id: "s".into(), kind: "claude".into(), ..Info::default() }), since: None }).await;
+            let attached = hub.harness.attach("s").ok_or_else(|| anyhow::anyhow!("no copy"))?;
+            let (_watching, topic, mut at) = (attached.viewer, attached.topic, attached.at.unwrap_or_default());
+            // The copy's state and meta values, by where they are, and its revision.
+            let held = || async { hub.harness.sessions.on("s", |s| s.get("s").map(|m| (Arc::as_ptr(&m.state) as usize, Arc::as_ptr(&m.meta) as usize, m.rev))).await.flatten().unwrap_or_default() };
+            let viewed = || hub.harness.sessions.view("s").map(|v| Value::clone(&v.state)).unwrap_or_default();
+            let state = State { summary: "the retry loop reads its deadline".into(), ..State::default() };
+            hub.harness.ingest(&hub, &there, "s", Update::State { state: Box::new(state.clone()) }).await;
+            let (made, _, rev) = held().await;
+            anyhow::ensure!(sent(&hub, &topic, &mut at).iter().filter(|f| f.starts_with(r#"{"t":"state""#)).count() == 1, "the first state's frame");
+            hub.harness.ingest(&hub, &there, "s", Update::State { state: Box::new(state.clone()) }).await;
+            let (again, _, rev_again) = held().await;
+            anyhow::ensure!(again == made && rev_again == rev + 1, "the same state again: kept ({made:#x} then {again:#x}), its revision {rev} then {rev_again}");
+            let heard = sent(&hub, &topic, &mut at);
+            anyhow::ensure!(heard.is_empty() && viewed() == serde_json::to_value(&state)?, "no frame, and the view as made again: {heard:?}");
+            // A name given here changes the copy's state: the same state again is made again, the name in it.
+            hub.harness.rename(&hub, "s", Some(&json!("parser"))).await;
+            let (renamed, _, _) = held().await;
+            hub.harness.ingest(&hub, &there, "s", Update::State { state: Box::new(state.clone()) }).await;
+            let (remade, _, _) = held().await;
+            let mut named = serde_json::to_value(&state)?;
+            if let Some(o) = named.as_object_mut() {
+                o.insert("name".into(), json!("parser"));
+            }
+            anyhow::ensure!(remade != renamed && viewed() == named, "made again after the name: {}", viewed());
+            hub.harness.ingest(&hub, &there, "s", Update::State { state: Box::new(state.clone()) }).await;
+            anyhow::ensure!(held().await.0 == remade && viewed() == named, "the same again after that: kept, the name in it");
+            // A changed state: made anew.
+            let changed = State { doing: Some("Running cargo test".into()), ..state };
+            hub.harness.ingest(&hub, &there, "s", Update::State { state: Box::new(changed.clone()) }).await;
+            let mut want = serde_json::to_value(&changed)?;
+            if let Some(o) = want.as_object_mut() {
+                o.insert("name".into(), json!("parser"));
+            }
+            anyhow::ensure!(held().await.0 != remade && viewed() == want, "a changed state made anew: {}", viewed());
+            anyhow::ensure!(sent(&hub, &topic, &mut at).iter().any(|f| f.contains("Running cargo test")), "its frame went");
+            // The same meta again: the copy's kept.
+            let meta = Meta { version: "2.1".into(), ..Meta::default() };
+            hub.harness.ingest(&hub, &there, "s", Update::Meta { meta: Box::new(meta.clone()) }).await;
+            let (_, meta_made, _) = held().await;
+            hub.harness.ingest(&hub, &there, "s", Update::Meta { meta: Box::new(meta) }).await;
+            anyhow::ensure!(held().await.1 == meta_made, "the same meta again: kept");
             Ok(())
         })
     }
