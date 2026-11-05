@@ -22,7 +22,7 @@ const COPY_BELOW: usize = 4 << 10;
 const MAX_IOVECS: usize = 64;
 
 /// Spare write buffers kept per thread.
-const POOL: usize = 64;
+pub(crate) const POOL: usize = 64;
 
 thread_local! {
     static SCRATCH_BUF: Cell<Option<Box<[u8]>>> = const { Cell::new(None) };

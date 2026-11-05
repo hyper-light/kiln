@@ -154,17 +154,8 @@ fn narrowed(mut head: Bytes, span: (usize, usize)) -> Bytes {
     head
 }
 
-/// The header map of a head (into `reuse`'s allocation, emptied, when one is given), its values
-/// sharing `head`'s bytes.
-fn header_map(head: Bytes, spans: &[Spans], said: &mut Said, reuse: Option<HeaderMap>) -> Result<HeaderMap, Error> {
-    let mut headers = match reuse {
-        Some(mut h) => {
-            h.clear();
-            h.reserve(spans.len());
-            h
-        }
-        None => HeaderMap::with_capacity(spans.len()),
-    };
+/// The header map of a head, filled into `headers` (empty, with room for `spans`), its values sharing `head`'s bytes.
+fn header_map(head: Bytes, spans: &[Spans], said: &mut Said, mut headers: HeaderMap) -> Result<HeaderMap, Error> {
     let Some((last, rest)) = spans.split_last() else { return Ok(headers) };
     for s in rest {
         let name = HeaderName::from_bytes(head.get(s.name.0..s.name.1).ok_or(Error::parse(Parse::Head))?).map_err(|_| Error::parse(Parse::Head))?;
@@ -216,8 +207,8 @@ fn head_error(e: httparse::Error) -> Error {
 
 /// Parses the request head at the start of `buf`, taking its bytes; `Ok(None)` while it's incomplete.
 /// A head over `max` bytes is refused. Blank lines before a request are skipped (RFC 9112 §2.2).
-/// `reuse` is a header map whose allocation the request's may take.
-pub(crate) fn parse_request(buf: &mut BytesMut, max: usize, reuse: &mut Option<Box<HeaderMap>>) -> Result<Option<RequestHead>, Error> {
+/// Its headers take a header map an answer on this thread gave back, where there is one (`crate::maps`).
+pub(crate) fn parse_request(buf: &mut BytesMut, max: usize) -> Result<Option<RequestHead>, Error> {
     let skip = buf.iter().take_while(|b| matches!(b, b'\r' | b'\n')).count();
     if skip > 0 {
         bytes::Buf::advance(buf, skip);
@@ -226,13 +217,13 @@ pub(crate) fn parse_request(buf: &mut BytesMut, max: usize, reuse: &mut Option<B
         return Ok(None);
     }
     let mut spans = SPANS.with(std::cell::Cell::take);
-    let parsed = parse_request_in(buf, max, &mut spans, reuse);
+    let parsed = parse_request_in(buf, max, &mut spans);
     spans.clear();
     SPANS.with(|c| c.set(spans));
     parsed
 }
 
-fn parse_request_in(buf: &mut BytesMut, max: usize, spans: &mut Vec<Spans>, reuse: &mut Option<Box<HeaderMap>>) -> Result<Option<RequestHead>, Error> {
+fn parse_request_in(buf: &mut BytesMut, max: usize, spans: &mut Vec<Spans>) -> Result<Option<RequestHead>, Error> {
     let mut parsed = slots();
     let mut req = httparse::Request::new(&mut []);
     let len = match req.parse_with_uninit_headers(buf, &mut parsed) {
@@ -258,7 +249,7 @@ fn parse_request_in(buf: &mut BytesMut, max: usize, spans: &mut Vec<Spans>, reus
     let head = buf.split_to(len).freeze();
     let uri = Uri::from_maybe_shared(if spans.is_empty() { narrowed(head.clone(), path) } else { piece(&head, path) }).map_err(|_| Error::parse(Parse::Uri))?;
     let mut said = Said::default();
-    let headers = header_map(head, spans, &mut said, reuse.take().map(|b| *b))?;
+    let headers = header_map(head, spans, &mut said, crate::maps::take(spans.len()))?;
     let framing = if said.transfer_encoding {
         // A request's length must be knowable: chunked, last (RFC 9112 §6.3), and never with
         // HTTP/1.0, which has no chunked coding; whatever `Content-Length` said is overridden.
@@ -310,7 +301,7 @@ fn parse_response_in(buf: &mut BytesMut, max: usize, method: &Method, spans: &mu
     spans.extend(resp.headers.iter().map(|h| Spans { name: span_of(base, h.name.as_bytes()), value: span_of(base, h.value) }));
     let head = buf.split_to(len).freeze();
     let mut said = Said::default();
-    let headers = header_map(head, spans, &mut said, None)?;
+    let headers = header_map(head, spans, &mut said, HeaderMap::with_capacity(spans.len()))?;
     let bodiless = method == Method::HEAD || status.is_informational() || status == StatusCode::NO_CONTENT || status == StatusCode::NOT_MODIFIED || (method == Method::CONNECT && status.is_success());
     let framing = if bodiless {
         Framing::Empty
@@ -540,7 +531,7 @@ mod tests {
     use super::*;
 
     fn req(s: &str) -> Result<Option<RequestHead>, Error> {
-        parse_request(&mut BytesMut::from(s), 64 << 10, &mut None)
+        parse_request(&mut BytesMut::from(s), 64 << 10)
     }
 
     #[test]
@@ -602,15 +593,34 @@ mod tests {
     #[test]
     fn a_head_too_large_is_refused() {
         let big = format!("GET / HTTP/1.1\r\nX: {}\r\n", "a".repeat(100));
-        assert!(parse_request(&mut BytesMut::from(big.as_str()), 64, &mut None).is_err());
+        assert!(parse_request(&mut BytesMut::from(big.as_str()), 64).is_err());
     }
 
     #[test]
     fn header_values_share_the_bytes_they_arrived_in() -> Result<(), Error> {
         let mut buf = BytesMut::from("GET / HTTP/1.1\r\nX-Long: abcdefghijklmnop\r\n\r\nGET /next HTTP/1.1\r\n\r\n");
-        let h = parse_request(&mut buf, 1 << 16, &mut None)?.ok_or(Error::closed())?;
+        let h = parse_request(&mut buf, 1 << 16)?.ok_or(Error::closed())?;
         assert_eq!(h.headers.get("x-long").map(HeaderValue::as_bytes), Some(&b"abcdefghijklmnop"[..]));
         assert_eq!(&buf[..], b"GET /next HTTP/1.1\r\n\r\n");
+        Ok(())
+    }
+
+    /// Goal 9 of kiln's API runtime program, plan 01a1a87b2cec step 5: a request's head takes the header map an answer
+    /// on its thread gave back (`crate::maps`), its room kept and its headers its own, rather than a map of its own
+    /// made each time; with none given back it has one made.
+    #[test]
+    fn g9_s5_a_request_head_takes_the_map_an_answer_gave_back() -> Result<(), Error> {
+        let mut answer = HeaderMap::new();
+        answer.insert(header::CONTENT_TYPE, HeaderValue::from_static("application/json"));
+        answer.insert(header::SERVER, HeaderValue::from_static("kiln"));
+        let room = answer.capacity();
+        crate::maps::give(answer);
+        let h = req("GET /a HTTP/1.1\r\nHost: x\r\nAccept: */*\r\n\r\n")?.ok_or(Error::closed())?;
+        assert_eq!(h.headers.capacity(), room, "the map given back");
+        assert_eq!((h.headers.len(), h.headers.get(header::HOST).map(HeaderValue::as_bytes)), (2, Some(&b"x"[..])), "its own headers only");
+        assert!(h.headers.get(header::CONTENT_TYPE).is_none());
+        let h = req("GET /a HTTP/1.1\r\nHost: x\r\n\r\n")?.ok_or(Error::closed())?;
+        assert_eq!(h.headers.capacity(), HeaderMap::<HeaderValue>::with_capacity(1).capacity(), "none given back: one made");
         Ok(())
     }
 
