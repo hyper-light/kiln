@@ -24,18 +24,19 @@ fn g9_s3_services_started_on_one_shard_spread_over_all() -> anyhow::Result<()> {
             for i in 0..SERVICES {
                 let tx = tx.clone();
                 if i % 2 == 0 {
-                    let _ = kiln::sup::spawn(&reg, "a service", stop.clone(), move || {
+                    // Dropping a handle leaves its task running.
+                    drop(kiln::sup::spawn(&reg, "a service", stop.clone(), move || {
                         let tx = tx.clone();
                         async move {
                             let _ = tx.send(hyper_rt::futures::shard_id().map(|s| s.0));
                             Ok(())
                         }
-                    });
+                    }));
                 } else {
-                    let _ = kiln::sup::spawn_guarded("a guarded task", async move {
+                    drop(kiln::sup::spawn_guarded("a guarded task", async move {
                         let _ = tx.send(hyper_rt::futures::shard_id().map(|s| s.0));
                         Ok(())
-                    });
+                    }));
                 }
             }
         }),
