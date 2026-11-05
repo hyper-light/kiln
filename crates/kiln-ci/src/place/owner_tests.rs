@@ -5,13 +5,13 @@ use std::collections::BTreeMap;
 
 use super::answer::{Answer, At, Count};
 use super::ask::Ask;
-use super::link::Offset;
+use super::link::{Offset, Rtt};
 use super::msg::{Dim, Estimate, Place, Reason, Short, ToOwner, ToRunner};
 use super::owner::{Act, Link, Machine, Owner, Size};
 use super::{Mutant, planted};
 use crate::facts::RunnerFacts;
 use crate::sched::needs;
-use crate::sched::state::{Cpus, Fence, Resources};
+use crate::sched::state::{Class, Cpus, Fence, Resources};
 
 const GIB: u64 = 1 << 30;
 
@@ -80,6 +80,14 @@ fn offer(run: &str, fence: Fence) -> ToOwner {
     ToOwner::Offer { run: run.into(), fence, got: res(4, 0), free: res(8, 8), predicted: None, disk: Default::default() }
 }
 
+/// An offer from `runner`, and its hold let pass with no other answer: taken (P6: an offer is held
+/// for the others probed, the unmeasured link's initial timeout at most).
+fn offered(o: &mut Owner, runner: &str, run: &str, fence: Fence, now: i64) -> Vec<Act> {
+    let mut acts = o.heard(runner, offer(run, fence), now);
+    acts.extend(o.tick(now + i64::try_from(Rtt::INITIAL).unwrap_or(0)));
+    acts
+}
+
 /// Never names the need no runner meets and the runner nearest to it; a Linux run is probed at the
 /// Linux runners alone; one whose link is down isn't probed, and counts as link down.
 #[test]
@@ -137,8 +145,10 @@ fn e5_starting_then_started_on_the_runner_s_word_and_news_on_change() -> Result<
     assert!(matches!(answer(&acts), Some(Answer::Queued { place: Some(At { lo: 2, .. }), .. })), "a better place is news: {acts:?}");
     assert!(answer(&o.heard("lin-a", waiting("r0", Reason::Line, 2, soon(10), res(0, 8)), 3)).is_none(), "nothing changed: no news");
     let (fa, fb) = (Fence { epoch: 1, n: 1 }, Fence { epoch: 7, n: 3 });
+    // Every runner probed has answered: the offer is taken at once, the other probe withdrawn (the
+    // runner whose link is down was never probed: P6 probes two drawn among the linked).
     let acts = o.heard("lin-a", offer("r0", fa), 4);
-    assert_eq!(told(&acts), vec![("lin-a".to_owned(), "take"), ("lin-b".to_owned(), "withdraw"), ("lin-c".to_owned(), "withdraw")]);
+    assert_eq!(told(&acts), vec![("lin-a".to_owned(), "take"), ("lin-b".to_owned(), "withdraw")]);
     assert_eq!(told(&o.heard("lin-b", offer("r0", fb), 4)), vec![("lin-b".to_owned(), "decline")]);
     assert!(o.heard("lin-a", offer("r0", fa), 4).is_empty(), "doubled");
     let acts = o.heard("lin-a", ToOwner::Held { run: "r0".into(), fence: fa }, 5);
@@ -157,8 +167,8 @@ fn e5_starting_then_started_on_the_runner_s_word_and_news_on_change() -> Result<
     let acts = planted(Some(Mutant::StartedAtHeld), || -> Result<Vec<Act>, String> {
         let mut o = owner();
         let _ = o.ask(ask("r1", "linux/amd64")?, 0);
-        let _ = o.heard("lin-a", offer("r1", fa), 1);
-        Ok(o.heard("lin-a", ToOwner::Held { run: "r1".into(), fence: fa }, 2))
+        let _ = offered(&mut o, "lin-a", "r1", fa, 1);
+        Ok(o.heard("lin-a", ToOwner::Held { run: "r1".into(), fence: fa }, 2000))
     })?;
     assert!(matches!(answer(&acts), Some(Answer::Started { .. })), "StartedAtHeld planted, as the model catches it");
     Ok(())
@@ -172,7 +182,7 @@ fn e5_a_disconnect_waits_and_only_absence_or_a_new_epoch_ends_a_claim() -> Resul
     let mut o = owner();
     let f = Fence { epoch: 1, n: 1 };
     let _ = o.ask(ask("r1", "linux/amd64,cpus=4")?, 0);
-    let _ = o.heard("lin-a", offer("r1", f), 1);
+    let _ = offered(&mut o, "lin-a", "r1", f, 1);
     let _ = o.heard("lin-a", ToOwner::Held { run: "r1".into(), fence: f }, 2);
     assert!(o.starting("r1", "lin-a", f));
     let acts = o.heard("lin-a", ToOwner::Lapsed { run: "r1".into(), fence: f, why: "its claim lapsed".into() }, 3);
@@ -180,7 +190,7 @@ fn e5_a_disconnect_waits_and_only_absence_or_a_new_epoch_ends_a_claim() -> Resul
     assert!(matches!(answer(&acts), Some(Answer::Queued { .. })), "the asker, told it was starting, is told it waits: {acts:?}");
     // Started on lin-b, whose link then goes down: it waits for lin-b, in the directory or out of it.
     let h = Fence { epoch: 9, n: 1 };
-    let _ = o.heard("lin-b", offer("r1", h), 6);
+    let _ = offered(&mut o, "lin-b", "r1", h, 6);
     let _ = o.heard("lin-b", ToOwner::Held { run: "r1".into(), fence: h }, 7);
     assert!(o.starting("r1", "lin-b", h));
     assert!(o.away("lin-b").is_empty());
@@ -199,7 +209,7 @@ fn e5_a_disconnect_waits_and_only_absence_or_a_new_epoch_ends_a_claim() -> Resul
     // Running on lin-a when lin-a starts again under a new epoch: lost.
     let mut o = owner();
     let _ = o.ask(ask("r2", "linux/amd64")?, 0);
-    let _ = o.heard("lin-a", offer("r2", f), 1);
+    let _ = offered(&mut o, "lin-a", "r2", f, 1);
     let _ = o.heard("lin-a", ToOwner::Held { run: "r2".into(), fence: f }, 2);
     let _ = o.starting("r2", "lin-a", f);
     let _ = o.heard("lin-a", ToOwner::Started { run: "r2".into(), fence: f }, 3);
@@ -210,7 +220,7 @@ fn e5_a_disconnect_waits_and_only_absence_or_a_new_epoch_ends_a_claim() -> Resul
     let lost = planted(Some(Mutant::LostOnDisconnect), || -> Result<bool, String> {
         let mut o = owner();
         let _ = o.ask(ask("r3", "linux/amd64")?, 0);
-        let _ = o.heard("lin-b", offer("r3", h), 1);
+        let _ = offered(&mut o, "lin-b", "r3", h, 1);
         let _ = o.heard("lin-b", ToOwner::Held { run: "r3".into(), fence: h }, 2);
         let _ = o.starting("r3", "lin-b", h);
         Ok(matches!(answer(&o.machines(down)), Some(Answer::Lost { .. })))
@@ -314,12 +324,131 @@ fn e5_an_offer_gives_way_to_a_runner_sure_to_finish_sooner() -> Result<(), Strin
 fn e5_a_cancelled_ticket_lets_go_of_what_it_holds() -> Result<(), String> {
     let mut o = owner();
     let _ = o.ask(ask("r1", "linux/amd64")?, 0);
-    assert_eq!(told(&o.cancel("r1")), vec![("lin-a".to_owned(), "withdraw"), ("lin-b".to_owned(), "withdraw"), ("lin-c".to_owned(), "withdraw")]);
+    assert_eq!(told(&o.cancel("r1")), vec![("lin-a".to_owned(), "withdraw"), ("lin-b".to_owned(), "withdraw")]);
     let f = Fence { epoch: 1, n: 1 };
     assert_eq!(told(&o.heard("lin-a", offer("r1", f), 1)), vec![("lin-a".to_owned(), "decline")]);
     let _ = o.ask(ask("r2", "linux/amd64")?, 2);
     let _ = o.heard("lin-a", offer("r2", f), 3);
-    assert_eq!(told(&o.cancel("r2")), vec![("lin-a".to_owned(), "decline")]);
+    assert_eq!(told(&o.cancel("r2")), vec![("lin-a".to_owned(), "decline"), ("lin-b".to_owned(), "withdraw")], "an offer held while choosing is declined");
+    let _ = o.ask(ask("r3", "linux/amd64")?, 4);
+    let _ = offered(&mut o, "lin-a", "r3", f, 5);
+    assert_eq!(told(&o.cancel("r3")), vec![("lin-a".to_owned(), "decline")]);
+    Ok(())
+}
+
+/// `n` Linux runners of 8 CPUs and 16 GiB, linked and placing.
+fn linux_fleet(n: usize) -> Vec<Machine> {
+    (0..n).map(|j| machine(&format!("r{j}"), "linux", "x86_64", 8, 16)).collect()
+}
+
+fn probes(acts: &[Act]) -> Vec<String> {
+    let mut v: Vec<String> = told(acts).into_iter().filter(|(_, what)| *what == "probe").map(|(r, _)| r).collect();
+    v.sort_unstable();
+    v
+}
+
+fn probes_of(acts: &[Act], run: &str) -> Vec<String> {
+    let mut v: Vec<String> = acts.iter().filter_map(|a| match a {
+        Act::Tell { runner, msg: ToRunner::Probe { ask } } if ask.run == run => Some(runner.clone()),
+        _ => None,
+    }).collect();
+    v.sort_unstable();
+    v
+}
+
+/// docs/needs.md §11, AUDIT P6: a run is probed at two runners drawn at random among those that
+/// suit it (Mitzenmacher's two choices), each runner drawn as often as the others; it waits where
+/// they said it waits, and is probed further only when each probed said never or went away.
+#[test]
+fn p6_a_run_probes_two_drawn_at_random_and_further_only_on_never_or_away() -> Result<(), String> {
+    let mut o = Owner::seeded("me", 1, 42);
+    let _ = o.machines(linux_fleet(10));
+    let mut hits: BTreeMap<String, u32> = BTreeMap::new();
+    for i in 0..5_000 {
+        let run = format!("x{i}");
+        let p = probes(&o.ask(ask(&run, "linux")?, 0));
+        assert_eq!(p.len(), 2, "{p:?}");
+        assert_ne!(p.first(), p.get(1));
+        for r in p {
+            *hits.entry(r).or_default() += 1;
+        }
+        let _ = o.cancel(&run);
+    }
+    // Each runner is drawn with chance 1/5 a run: 1,000 of 5,000 expected, sd 28.
+    assert_eq!(hits.len(), 10);
+    assert!(hits.values().all(|h| (880..=1_120).contains(h)), "{hits:?}");
+    // Both say it waits: no more probes; the asker told it's queued.
+    let p = probes(&o.ask(ask("w", "linux")?, 0));
+    let mut acts = Vec::new();
+    for r in &p {
+        acts.extend(o.heard(r, waiting("w", Reason::Line, 2, soon(10), res(0, 8)), 1));
+    }
+    assert!(probes(&acts).is_empty(), "a run that waits stays queued there: {acts:?}");
+    assert!(matches!(answer(&acts), Some(Answer::Queued { of: 10, .. })), "{acts:?}");
+    // Both say never: two more are probed, none of the two.
+    let p = probes(&o.ask(ask("n", "linux")?, 0));
+    let mut acts = Vec::new();
+    for r in &p {
+        acts.extend(o.heard(r, ToOwner::Never { run: "n".into(), why: "no".into() }, 1));
+    }
+    let more = probes(&acts);
+    assert_eq!(more.len(), 2, "{acts:?}");
+    assert!(more.iter().all(|r| !p.contains(r)), "{p:?} then {more:?}");
+    // One says never and the other's link goes down: two more.
+    let p = probes(&o.ask(ask("a", "linux")?, 0));
+    let (Some(first), Some(second)) = (p.first(), p.get(1)) else { return Err(format!("{p:?}")) };
+    assert!(probes(&o.heard(first, ToOwner::Never { run: "a".into(), why: "no".into() }, 1)).is_empty(), "the other may still take it");
+    let more = probes_of(&o.away(second), "a");
+    assert_eq!(more.len(), 2, "{more:?}");
+    assert!(more.iter().all(|r| !p.contains(r)));
+    assert_eq!(o.probed("a").len(), 4);
+    Ok(())
+}
+
+/// docs/needs.md §5 and §11: of the offers held, the emptiest by the engine's fullness is taken
+/// and the other declined; between offers as full, `interactive` (with `land` and `critical`) takes
+/// the most room, `batch` and `background` the least.
+#[test]
+fn p6_the_emptiest_offer_is_taken_and_ties_go_by_class() -> Result<(), String> {
+    let two = |o: &mut Owner, run: &str, class: Class| -> Result<Vec<String>, String> {
+        let _ = o.machines(linux_fleet(2));
+        Ok(probes(&o.ask(Ask { class, ..ask(run, "linux")? }, 0)))
+    };
+    let offer_free = |run: &str, n: u64, free: Resources| ToOwner::Offer { run: run.into(), fence: Fence { epoch: 1, n }, got: res(1, 0), free, predicted: None, disk: Default::default() };
+    let mut o = Owner::new("me", 1);
+    assert_eq!(two(&mut o, "r1", Class::Batch)?, vec!["r0".to_owned(), "r1".to_owned()]);
+    // r0 offers first, three quarters full; r1 a quarter: r1's is taken, r0's declined.
+    assert!(told(&o.heard("r0", offer_free("r1", 1, res(2, 16)), 1)).is_empty(), "held for the other");
+    let acts = o.heard("r1", offer_free("r1", 2, res(6, 16)), 1);
+    assert_eq!(told(&acts), vec![("r1".to_owned(), "take"), ("r0".to_owned(), "decline")]);
+    // As full (half, by CPUs), one with all its memory free and one with half.
+    for (class, want) in [(Class::Interactive, "r0"), (Class::Land, "r0"), (Class::Critical, "r0"), (Class::Batch, "r1"), (Class::Background, "r1")] {
+        let mut o = Owner::new("me", 1);
+        let _ = two(&mut o, "t", class)?;
+        let _ = o.heard("r0", offer_free("t", 1, res(4, 16)), 1);
+        let acts = o.heard("r1", offer_free("t", 2, res(4, 8)), 1);
+        assert!(told(&acts).contains(&(want.to_owned(), "take")), "{class:?}: {acts:?}");
+    }
+    assert_eq!(super::owner::fullness(&Size::known(&res(8, 16)), &res(4, 8)), 500_000);
+    assert_eq!(super::owner::fullness(&Size::default(), &res(4, 8)), u64::MAX, "nothing known ranks last");
+    Ok(())
+}
+
+/// RFC 6298 and P6: an offer is held, while another runner probed hasn't answered, its link's
+/// timeout less its round trip (so a take reaches the runner within the timeout it holds the offer
+/// for): the owner's timer says when, and then the offer is taken.
+#[test]
+fn p6_an_offer_is_held_its_timeout_less_its_round_trip() -> Result<(), String> {
+    let mut o = Owner::new("me", 1);
+    let _ = o.machines(linux_fleet(2));
+    let rtt = Rtt { srtt: 10, rttvar: 5, granularity: 1 };
+    o.link("r0", Link { rtt: Some(rtt), offset: Offset::default() });
+    let _ = o.ask(ask("r1", "linux")?, 0);
+    assert!(o.heard("r0", offer("r1", Fence { epoch: 1, n: 1 }), 100).is_empty());
+    assert_eq!(o.timer(), Some(120), "RTO 30 less SRTT 10");
+    assert!(o.tick(119).is_empty());
+    assert_eq!(told(&o.tick(120)), vec![("r0".to_owned(), "take"), ("r1".to_owned(), "withdraw")]);
+    assert_eq!(o.stage("r1"), Some(("taking", Some("r0"))));
     Ok(())
 }
 
@@ -343,6 +472,8 @@ mod props {
         Away { runner: u8 },
         Back { runner: u8 },
         Lost { runner: u8 },
+        /// The time passes an offer's hold (P6).
+        Tick,
     }
 
     fn ev() -> impl Strategy<Value = Ev> {
@@ -356,6 +487,7 @@ mod props {
             (0..2u8).prop_map(|runner| Ev::Away { runner }),
             (0..2u8).prop_map(|runner| Ev::Back { runner }),
             (0..2u8).prop_map(|runner| Ev::Lost { runner }),
+            Just(Ev::Tick),
         ]
     }
 
@@ -405,6 +537,10 @@ mod props {
                 }
                 Ev::Away { runner } => o.away(name(runner)),
                 Ev::Back { runner } => o.back(name(runner)),
+                Ev::Tick => {
+                    now += i64::try_from(Rtt::INITIAL).unwrap_or(0);
+                    o.tick(now)
+                }
                 Ev::Lost { runner } => {
                     lost.push(name(runner).to_owned());
                     machines.retain(|m| m.name != name(runner));

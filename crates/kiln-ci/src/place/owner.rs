@@ -1,18 +1,32 @@
-//! The owner's side of placement (docs/reach.md §2; docs/needs.md §9 and §13): the node a run is
-//! asked of owns it (Ray's ownership). There's no queue at the owner: each run is a ticket whose
-//! probes wait at the runners that could take it, and the first runner with room starts it (late
+//! The owner's side of placement (docs/reach.md §2; docs/needs.md §9, §11 and §13): the node a
+//! run is asked of owns it (Ray's ownership). There's no queue at the owner: each run is a ticket
+//! whose probes wait at the runners that could take it, and a runner with room starts it (late
 //! binding: Sparrow).
 //!
 //! - **Asked**: a run no runner could run even idle (a constraint none meets, or more than any is
 //!   known to have) is answered never at once, naming the need and the nearest runner; a size not
-//!   yet measured is unknown, never too small. Otherwise every runner that could, and admits
-//!   probes, is probed.
-//! - **Offered**: the first offer is taken (no scan of runners: the decision is O(1)) and every
-//!   other probe withdrawn, unless another runner is sure to finish it sooner: its latest start
-//!   plus its predicted run there before this one's predicted end (both runners' predictions, the
-//!   shell's from history, docs/needs.md E6). A runner holding the take gets the run: the asker is
-//!   told it's starting there, and the shell copies its tree and starts it under that claim if
-//!   [`Owner::starting`] still says so.
+//!   yet measured is unknown, never too small. Otherwise [`PROBES`] runners are probed, drawn at
+//!   random among those that could take it, are linked and admit probes (the power of two choices:
+//!   Mitzenmacher, "The Power of Two Choices in Randomized Load Balancing", IEEE TPDS 2001, the
+//!   most loaded of n at log log n / log d + O(1) where one random choice leaves log n / log log n;
+//!   Sparrow's batch sampling, Ousterhout et al., SOSP 2013, probes d·m for m tasks, here m = 1).
+//!   The draw is from a seed the shell passes in ([`Owner::seeded`]): kiln-ci takes no randomness
+//!   of its own. Which runners suit an ask is worked out once per kind of ask while the directory
+//!   stands (Borg's equivalence classes, Verma et al., EuroSys 2015), so an ask costs O(d), not
+//!   O(N). A run is probed further, d more, only when every runner probed said never or its link
+//!   went down: one that says it waits keeps the run in its line, with news.
+//! - **Offered**: the first offer is held while the other runners probed answer, for at most the
+//!   offering link's retransmission timeout less its round trip (RFC 6298: the runner holds its
+//!   offer one RTO from when it sent it, so a take sent later than that, less the round trip,
+//!   would find it lapsed). Then the emptiest offer is taken, by the engine's fullness (the largest
+//!   share of any dimension the runner's size knows that isn't free, `sched::state::held_share`'s
+//!   rule); between equals, by class (docs/needs.md §5): `critical`, `land` and `interactive` take
+//!   the most room (latency), `batch` and `background` the least (packing, big holes left); then
+//!   by name. The others are declined, at most d − 1. An offer gives way when another runner is
+//!   sure to finish it sooner: its latest start plus its predicted run there before this one's
+//!   predicted end (both runners' predictions, the shell's from history, docs/needs.md E6). A
+//!   runner holding the take gets the run: the asker is told it's starting there, and the shell
+//!   copies its tree and starts it under that claim if [`Owner::starting`] still says so.
 //! - **Started** only on the runner's word that its process started ([`ToOwner::Started`]); a
 //!   claim that lapses before that is told to the asker as a correction.
 //! - **Once**: a run's start goes to one runner. It goes back to waiting only on that runner's word
@@ -27,18 +41,30 @@
 //! - **Older runners** (a rolling upgrade): a run no runner that places could start now goes to an
 //!   older one the shell's own pick can start it on, idle as the directory last saw it; refused
 //!   there, it waits at the runners that place.
+//! - **Fast** (docs/needs.md §11, AUDIT P6): a word's runner and run are looked up once, by hash
+//!   ([`super::keys`]); past that, runners and tickets are integer handles into slabs, a ticket's
+//!   words a short list, its ask shared by every probe of it, and a word about a ticket gone
+//!   answered in O(1).
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::hash::{Hash, Hasher};
+use std::sync::Arc;
 
 use super::answer::{self, Answer, At, Count, Nearest};
 use super::ask::{Ask, Peer};
+use super::keys::{Fx, FxMap, Interner, SplitMix};
 use super::link::{Offset, Rtt};
 use super::msg::{Dim, Estimate, Place, Reason, ToOwner, ToRunner};
 use crate::facts::RunnerFacts;
 use crate::sched::needs;
 use crate::sched::routing::{Constraint, Op};
-use crate::sched::state::{Cpus, Fence, Resources};
+use crate::sched::state::{Class, Cpus, Fence, Resources};
 use crate::sched::units::Ms;
+
+/// How many runners a run is probed at, and probed further by: two (Mitzenmacher, IEEE TPDS 2001:
+/// from one choice to two, the most loaded of n falls from log n / log log n to log log n / log 2;
+/// each choice past two takes off only a constant factor more, log 2 / log d).
+pub const PROBES: u32 = 2;
 
 /// What a runner has, as far as the directory knows: each dimension `None` until it's measured.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -102,12 +128,22 @@ pub enum Act {
     Restart { run: String, runner: String, fence: Fence },
 }
 
+/// A runner's handle: its name interned.
+type Rid = u32;
+/// A ticket's handle: its place in the slab.
+type Tid = u32;
+
+fn ix(h: u32) -> usize {
+    h as usize
+}
+
 /// A probed runner's last word on a ticket.
 #[derive(Debug, Clone, PartialEq)]
 enum Word {
     /// Probed, not answered yet.
     Asked,
     Waiting { reason: Reason, place: Place, start: Estimate, predicted: Option<Ms>, free: Resources },
+    /// It offered: the offer held while the owner chooses, or taken.
     Offered,
     Never(String),
     /// Its link is down: probed again when it's back.
@@ -115,6 +151,13 @@ enum Word {
     /// It offered, and the offer was declined for a runner sure to finish sooner: probed again
     /// when what's known of the others changes.
     Passed,
+}
+
+impl Word {
+    /// Whether the runner may yet start the run: it hasn't said never, and its link is up.
+    fn live(&self) -> bool {
+        !matches!(self, Word::Never(_) | Word::Away)
+    }
 }
 
 /// Where a ticket stands.
@@ -134,25 +177,103 @@ enum Stage {
     Fallback,
 }
 
+/// An offer held while the owner chooses: its runner, its claim, what it gets and what was free.
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct Offer {
+    runner: Rid,
+    fence: Fence,
+    got: Resources,
+    free: Resources,
+}
+
+/// The runners a kind of ask suits, as the directory stood (Borg's equivalence classes): asks
+/// with the same constraints and amounts suit the same runners, worked out once.
+#[derive(Debug)]
+struct Suit {
+    requires: Vec<String>,
+    together: bool,
+    request: [u64; 4],
+    /// Suited, placing and linked: what's drawn from (by handle, in order).
+    live: Vec<Rid>,
+    /// Suited and placing, the link down.
+    away: Vec<Rid>,
+    /// Suited, older (no placement).
+    older: Vec<Rid>,
+    /// The runners not suited or older, by reason, and how many.
+    passed: Vec<(String, u32)>,
+}
+
+impl Suit {
+    fn is(&self, ask: &Ask) -> bool {
+        self.together == ask.needs.together.is_some() && self.request == super::ask::amounts(&ask.needs.request) && self.requires == ask.needs.requires
+    }
+}
+
+/// The hash of what decides which runners an ask suits.
+fn suit_key(ask: &Ask) -> u64 {
+    let mut h = Fx::default();
+    ask.needs.requires.hash(&mut h);
+    ask.needs.together.is_some().hash(&mut h);
+    super::ask::amounts(&ask.needs.request).hash(&mut h);
+    h.finish()
+}
+
 #[derive(Debug, Clone)]
 struct Ticket {
-    ask: Ask,
+    run: String,
+    /// Shared by every probe of it.
+    ask: Arc<Ask>,
+    /// The runners it suits, as its answer counts them.
+    suit: Arc<Suit>,
     stage: Stage,
     /// The runner of a stage past waiting.
-    runner: Option<String>,
+    runner: Option<Rid>,
     /// What it got there and what was free: the offer taken.
     got: Option<(Resources, Resources)>,
     /// Each runner probed, and its last word.
-    words: BTreeMap<String, Word>,
-    /// Each runner known and not probed, and why.
-    passed: BTreeMap<String, String>,
+    words: Vec<(Rid, Word)>,
+    /// Each runner probed that's gone since, and why.
+    gone: Vec<(Rid, String)>,
+    /// Offers held while it chooses, and when it chooses at the latest.
+    offers: Vec<Offer>,
+    choose_at: Option<i64>,
     /// What its asker was told last.
     told: Option<Answer>,
     /// When its first answer is due, if it hasn't been given.
     due: Option<i64>,
     /// A second offer taken: what [`super::Mutant::TakeTwo`] plants.
     #[cfg(test)]
-    second: Option<(String, Fence)>,
+    second: Option<(Rid, Fence)>,
+}
+
+impl Ticket {
+    fn word(&self, r: Rid) -> Option<&Word> {
+        self.words.iter().find(|(x, _)| *x == r).map(|(_, w)| w)
+    }
+
+    fn offer_of(&self, r: Rid) -> Option<Fence> {
+        self.offers.iter().find(|o| o.runner == r).map(|o| o.fence)
+    }
+
+    /// Waiting, with no runner probed that may yet start it.
+    fn hungry(&self) -> bool {
+        self.stage == Stage::Waiting && !self.words.iter().any(|(_, w)| w.live())
+    }
+
+    /// Waiting at fewer than [`PROBES`] runners that may yet start it (some were away as it was
+    /// drawn).
+    fn short(&self) -> bool {
+        self.stage == Stage::Waiting && self.words.iter().filter(|(_, w)| w.live()).count() < PROBES as usize
+    }
+}
+
+/// A runner as the owner keeps it: as the directory has it (`None`: gone), its link, and the
+/// tickets with a word or a claim there.
+#[derive(Debug, Clone, Default)]
+struct Slot {
+    machine: Option<Machine>,
+    link: Link,
+    at: BTreeSet<Tid>,
 }
 
 /// The tickets a node owns.
@@ -160,13 +281,20 @@ struct Ticket {
 pub struct Owner {
     me: String,
     epoch: u64,
-    machines: BTreeMap<String, Machine>,
-    links: BTreeMap<String, Link>,
-    tickets: BTreeMap<String, Ticket>,
-    /// For each runner, the runs with a word or a claim there.
-    at: BTreeMap<String, BTreeSet<String>>,
-    /// First answers due, by when.
-    due: BTreeSet<(i64, String)>,
+    rng: SplitMix,
+    names: Interner,
+    slots: Vec<Slot>,
+    /// The runners in the directory, by name.
+    present: Vec<Rid>,
+    /// Which runners suit each kind of ask, as the directory stands: dropped as it changes.
+    suits: FxMap<u64, Vec<Arc<Suit>>>,
+    tickets: Vec<Option<Ticket>>,
+    spare: Vec<Tid>,
+    by_run: FxMap<String, Tid>,
+    /// First answers due, and choices due, by when.
+    due: BTreeSet<(i64, Tid)>,
+    choose: BTreeSet<(i64, Tid)>,
+    draw: Vec<u32>,
 }
 
 /// Why `m` could never run `ask` as asked, if that's known: a constraint it doesn't meet (in the
@@ -206,6 +334,27 @@ pub fn unsuited(m: &Machine, ask: &Ask) -> Option<String> {
     (!short.is_empty()).then(|| format!("too small ({})", short.join(", ")))
 }
 
+/// How full a runner is by an offer's word, in millionths, as the engine's `held_share` counts a
+/// share: the largest, over the dimensions its size knows, of what isn't free over its size.
+/// Nothing known ranks last.
+pub fn fullness(size: &Size, free: &Resources) -> u64 {
+    let dims = [(size.cpu.map(Cpus::get), free.cpu.get()), (size.mem, free.mem), (size.disk, free.disk), (size.gpu.map(u64::from), u64::from(free.gpu))];
+    dims.into_iter()
+        .filter_map(|(s, f)| {
+            let s = s.filter(|s| *s > 0)?;
+            let held = s.saturating_sub(f.min(s));
+            Some(u64::try_from(u128::from(held).saturating_mul(1_000_000) / u128::from(s)).unwrap_or(u64::MAX))
+        })
+        .max()
+        .unwrap_or(u64::MAX)
+}
+
+/// Whether a class wants the most room (latency) rather than the least that fits (packing), as
+/// docs/needs.md §5 sorts them.
+fn wants_room(c: Class) -> bool {
+    matches!(c, Class::Critical | Class::Land | Class::Interactive)
+}
+
 /// A reason in the words counted across runners.
 fn reason_words(r: &Reason) -> String {
     match r {
@@ -223,6 +372,9 @@ fn reason_words(r: &Reason) -> String {
         Reason::Away => "link down".into(),
     }
 }
+
+/// What a runner suited and not probed counts as.
+const NOT_PROBED: &str = "not probed (two drawn at random)";
 
 /// The lesser of two times, either known.
 fn min_some(a: Option<i64>, b: Option<i64>) -> Option<i64> {
@@ -246,11 +398,17 @@ enum Change {
     Back,
 }
 
-// Bookkeeping, words and answers.
+// Handles, bookkeeping, words and answers.
 impl Owner {
-    /// The tickets of the node `me`, in its epoch (one past the last it took, kept on its disk).
+    /// The tickets of the node `me`, in its epoch (one past the last it took, kept on its disk),
+    /// its draws from `seed`: the shell's own randomness (the OS's), so that owners draw apart.
+    pub fn seeded(me: &str, epoch: u64, seed: u64) -> Owner {
+        Owner { me: me.to_owned(), epoch, rng: SplitMix(seed), ..Owner::default() }
+    }
+
+    /// [`Self::seeded`] with seed 0, for tests and tools: a shell passes its own.
     pub fn new(me: &str, epoch: u64) -> Owner {
-        Owner { me: me.to_owned(), epoch, ..Owner::default() }
+        Owner::seeded(me, epoch, 0)
     }
 
     /// Who it is to a runner.
@@ -258,115 +416,236 @@ impl Owner {
         Peer { name: &self.me, epoch: self.epoch }
     }
 
+    fn rid(&mut self, name: &str) -> Rid {
+        let r = self.names.intern(name);
+        while self.slots.len() <= ix(r) {
+            self.slots.push(Slot::default());
+        }
+        r
+    }
+
+    fn name(&self, r: Rid) -> String {
+        self.names.name(r).to_owned()
+    }
+
+    fn machine(&self, r: Rid) -> Option<&Machine> {
+        self.slots.get(ix(r)).and_then(|s| s.machine.as_ref())
+    }
+
+    fn connected(&self, r: Rid) -> bool {
+        self.machine(r).is_some_and(|m| m.connected)
+    }
+
+    fn t(&self, t: Tid) -> Option<&Ticket> {
+        self.tickets.get(ix(t)).and_then(Option::as_ref)
+    }
+
+    fn t_mut(&mut self, t: Tid) -> Option<&mut Ticket> {
+        self.tickets.get_mut(ix(t)).and_then(Option::as_mut)
+    }
+
     /// What the link to `runner` measures now (its round trip, RFC 6298; its clock's offset,
     /// RFC 5905).
     pub fn link(&mut self, runner: &str, link: Link) {
-        self.links.insert(runner.to_owned(), link);
+        let r = self.rid(runner);
+        if let Some(s) = self.slots.get_mut(ix(r)) {
+            s.link = link;
+        }
     }
 
-    fn rto(&self, runner: &str) -> Ms {
-        Rtt::rto_of(self.links.get(runner).and_then(|l| l.rtt.as_ref()))
+    fn rtt(&self, r: Rid) -> Option<&Rtt> {
+        self.slots.get(ix(r)).and_then(|s| s.link.rtt.as_ref())
+    }
+
+    fn rto(&self, r: Rid) -> Ms {
+        Rtt::rto_of(self.rtt(r))
+    }
+
+    /// How long an offer from `r` is held while the others probed answer: its link's timeout less
+    /// its round trip, so a take sent by then reaches the runner within the timeout it holds the
+    /// offer for (RFC 6298's variation term, `max(G, 4·RTTVAR)`; the initial second, unmeasured).
+    fn hold(&self, r: Rid) -> Ms {
+        self.rto(r).saturating_sub(self.rtt(r).map_or(0, |x| x.srtt))
     }
 
     /// A time in `runner`'s clock, in this node's.
-    fn owner_time(&self, runner: &str, at: i64) -> i64 {
+    fn owner_time(&self, r: Rid, at: i64) -> i64 {
         #[cfg(test)]
         if super::mutant() == Some(super::Mutant::SkewedClock) {
             return at;
         }
-        self.links.get(runner).map_or(at, |l| l.offset.owner_time(at))
+        self.slots.get(ix(r)).map_or(at, |s| s.link.offset.owner_time(at))
     }
 
-    fn note(&mut self, runner: &str, run: &str) {
-        self.at.entry(runner.to_owned()).or_default().insert(run.to_owned());
+    fn note(&mut self, r: Rid, t: Tid) {
+        if let Some(s) = self.slots.get_mut(ix(r)) {
+            s.at.insert(t);
+        }
     }
 
-    fn unnote(&mut self, runner: &str, run: &str) {
-        if let Some(runs) = self.at.get_mut(runner) {
-            runs.remove(run);
-            if runs.is_empty() {
-                self.at.remove(runner);
+    fn unnote(&mut self, r: Rid, t: Tid) {
+        if let Some(s) = self.slots.get_mut(ix(r)) {
+            s.at.remove(&t);
+        }
+    }
+
+    fn runs_at(&self, r: Rid) -> Vec<Tid> {
+        self.slots.get(ix(r)).map(|s| s.at.iter().copied().collect()).unwrap_or_default()
+    }
+
+    fn set_word(&mut self, t: Tid, r: Rid, w: Word) {
+        let Some(tk) = self.t_mut(t) else { return };
+        match tk.words.iter_mut().find(|(x, _)| *x == r) {
+            Some((_, old)) => *old = w,
+            None => tk.words.push((r, w)),
+        }
+        self.note(r, t);
+    }
+
+    fn drop_word(&mut self, t: Tid, r: Rid) {
+        if let Some(tk) = self.t_mut(t) {
+            tk.words.retain(|(x, _)| *x != r);
+            tk.offers.retain(|o| o.runner != r);
+        }
+        self.unnote(r, t);
+        self.unhold_if_none(t);
+    }
+
+    /// An offer held from `r` gone (it lapsed, its runner went or said otherwise).
+    fn unhold(&mut self, t: Tid, r: Rid) {
+        if let Some(tk) = self.t_mut(t) {
+            tk.offers.retain(|o| o.runner != r);
+        }
+        self.unhold_if_none(t);
+    }
+
+    fn unhold_if_none(&mut self, t: Tid) {
+        let at = match self.t_mut(t) {
+            Some(tk) if tk.offers.is_empty() => tk.choose_at.take(),
+            _ => None,
+        };
+        if let Some(at) = at {
+            self.choose.remove(&(at, t));
+        }
+    }
+
+    fn undue(&mut self, t: Tid) {
+        if let Some(d) = self.t_mut(t).and_then(|tk| tk.due.take()) {
+            self.due.remove(&(d, t));
+        }
+    }
+
+    fn remove(&mut self, t: Tid) -> Option<Ticket> {
+        let tk = self.tickets.get_mut(ix(t)).and_then(Option::take)?;
+        for (r, _) in &tk.words {
+            self.unnote(*r, t);
+        }
+        if let Some(r) = tk.runner {
+            self.unnote(r, t);
+        }
+        if let Some(d) = tk.due {
+            self.due.remove(&(d, t));
+        }
+        if let Some(c) = tk.choose_at {
+            self.choose.remove(&(c, t));
+        }
+        self.by_run.remove(&tk.run);
+        self.spare.push(t);
+        Some(tk)
+    }
+
+    /// The runners `ask` suits, as the directory stands: worked out once for each kind of ask.
+    fn suit(&mut self, ask: &Ask) -> Arc<Suit> {
+        let key = suit_key(ask);
+        if let Some(s) = self.suits.get(&key).and_then(|v| v.iter().find(|s| s.is(ask))) {
+            return Arc::clone(s);
+        }
+        let (mut live, mut away, mut older) = (Vec::new(), Vec::new(), Vec::new());
+        let mut passed: BTreeMap<String, u32> = BTreeMap::new();
+        for &r in &self.present {
+            let Some(m) = self.machine(r) else { continue };
+            match unsuited(m, ask) {
+                Some(why) => *passed.entry(why).or_default() += 1,
+                None if !m.places => {
+                    older.push(r);
+                    *passed.entry("an older runner, without placement".into()).or_default() += 1;
+                }
+                None if !m.connected => away.push(r),
+                None => live.push(r),
             }
         }
+        live.sort_unstable();
+        away.sort_unstable();
+        let s = Arc::new(Suit { requires: ask.needs.requires.clone(), together: ask.needs.together.is_some(), request: super::ask::amounts(&ask.needs.request), live, away, older, passed: passed.into_iter().collect() });
+        self.suits.entry(key).or_default().push(Arc::clone(&s));
+        s
     }
 
-    fn runs_at(&self, runner: &str) -> Vec<String> {
-        self.at.get(runner).map(|runs| runs.iter().cloned().collect()).unwrap_or_default()
+    /// The directory changed (a runner came, went, or its link did): which runners suit what is
+    /// worked out again as it's next asked.
+    fn redraw(&mut self) {
+        self.suits.clear();
     }
 
-    fn set_word(&mut self, run: &str, runner: &str, w: Word) {
-        if let Some(t) = self.tickets.get_mut(run) {
-            t.words.insert(runner.to_owned(), w);
-            self.note(runner, run);
+    /// Probes the ticket at `r`, its ask shared.
+    fn probe_at(&mut self, t: Tid, r: Rid, out: &mut Vec<Act>) {
+        let Some(ask) = self.t(t).map(|tk| Arc::clone(&tk.ask)) else { return };
+        self.set_word(t, r, Word::Asked);
+        out.push(Act::Tell { runner: self.name(r), msg: ToRunner::Probe { ask } });
+    }
+
+    /// Probes `t` at up to [`PROBES`] more runners, drawn at random among those that suit it now,
+    /// are linked and haven't been probed: how many.
+    fn widen(&mut self, t: Tid, out: &mut Vec<Act>) -> usize {
+        let Some(ask) = self.t(t).map(|tk| Arc::clone(&tk.ask)) else { return 0 };
+        let suit = self.suit(&ask);
+        let Some(tk) = self.t(t) else { return 0 };
+        let fresh: Vec<Rid> = suit.live.iter().copied().filter(|r| tk.word(*r).is_none()).collect();
+        let n = u32::try_from(fresh.len()).unwrap_or(u32::MAX);
+        let mut draw = std::mem::take(&mut self.draw);
+        self.rng.sample(n, PROBES, &mut draw);
+        let picked: Vec<Rid> = draw.iter().filter_map(|i| fresh.get(ix(*i)).copied()).collect();
+        self.draw = draw;
+        for r in &picked {
+            self.probe_at(t, *r, out);
+        }
+        picked.len()
+    }
+
+    /// Withdraws every probe of `t` but at `keep` and the runners that said never; an offer held
+    /// is declined.
+    fn withdraw_others(&mut self, t: Tid, keep: Option<Rid>, out: &mut Vec<Act>) {
+        let Some(tk) = self.t(t) else { return };
+        let run = tk.run.clone();
+        let others: Vec<(Rid, Option<Fence>)> = tk.words.iter().filter(|(r, w)| Some(*r) != keep && !matches!(w, Word::Never(_))).map(|(r, _)| (*r, tk.offer_of(*r))).collect();
+        for (r, offer) in others {
+            self.drop_word(t, r);
+            let msg = match offer {
+                Some(fence) => ToRunner::Decline { run: run.clone(), fence },
+                None => ToRunner::Withdraw { run: run.clone() },
+            };
+            out.push(Act::Tell { runner: self.name(r), msg });
         }
     }
 
-    fn drop_word(&mut self, run: &str, runner: &str) {
-        if let Some(t) = self.tickets.get_mut(run) {
-            t.words.remove(runner);
-        }
-        self.unnote(runner, run);
-    }
-
-    fn remove(&mut self, run: &str) -> Option<Ticket> {
-        let t = self.tickets.remove(run)?;
-        for r in t.words.keys() {
-            self.unnote(r, run);
-        }
-        if let Some(d) = t.due {
-            self.due.remove(&(d, run.to_owned()));
-        }
-        Some(t)
-    }
-
-    /// Probes `run` at `runner`.
-    fn probe_at(&mut self, run: &str, runner: &str, out: &mut Vec<Act>) {
-        let Some(t) = self.tickets.get(run) else { return };
-        let ask = Box::new(t.ask.clone());
-        self.set_word(run, runner, Word::Asked);
-        out.push(Act::Tell { runner: runner.to_owned(), msg: ToRunner::Probe { ask } });
-    }
-
-    /// Withdraws every probe of `run` but at `keep` and the runners that said never.
-    fn withdraw_others(&mut self, run: &str, keep: &str, out: &mut Vec<Act>) {
-        let others: Vec<String> = self.tickets.get(run).map(|t| t.words.iter().filter(|(r, w)| r.as_str() != keep && !matches!(w, Word::Never(_))).map(|(r, _)| r.clone()).collect()).unwrap_or_default();
-        for r in others {
-            self.drop_word(run, &r);
-            out.push(Act::Tell { runner: r, msg: ToRunner::Withdraw { run: run.to_owned() } });
-        }
-    }
-
-    /// Probes a ticket afresh at every runner that could take it (after a claim lapsed or its
-    /// runner went), a runner whose link is down marked so.
-    fn probe_afresh(&mut self, run: &str, out: &mut Vec<Act>) {
-        let Some(t) = self.tickets.get(run) else { return };
-        let stale: Vec<String> = t.words.iter().filter(|(_, w)| !matches!(w, Word::Never(_))).map(|(r, _)| r.clone()).collect();
-        let (mut probe, mut away) = (Vec::new(), Vec::new());
-        for m in self.machines.values().filter(|m| m.places && unsuited(m, &t.ask).is_none() && !matches!(t.words.get(&m.name), Some(Word::Never(_)))) {
-            if m.connected {
-                probe.push(m.name.clone());
-            } else {
-                away.push(m.name.clone());
-            }
-        }
+    /// Probes a ticket afresh (after a claim lapsed or its runner went): its words but the nevers
+    /// dropped, then [`PROBES`] runners drawn again.
+    fn probe_afresh(&mut self, t: Tid, out: &mut Vec<Act>) {
+        let Some(tk) = self.t(t) else { return };
+        let stale: Vec<Rid> = tk.words.iter().filter(|(_, w)| !matches!(w, Word::Never(_))).map(|(r, _)| *r).collect();
         for r in stale {
-            self.drop_word(run, &r);
+            self.drop_word(t, r);
         }
-        for r in away {
-            self.set_word(run, &r, Word::Away);
-        }
-        for r in probe {
-            self.probe_at(run, &r, out);
-        }
+        self.widen(t, out);
     }
 
     /// Probes again each runner passed over for one sure to finish sooner (what's known of the
     /// others changed): news, never a timer, decides when.
-    fn unpass(&mut self, run: &str, out: &mut Vec<Act>) {
-        let passed: Vec<String> = self.tickets.get(run).map(|t| t.words.iter().filter(|(_, w)| **w == Word::Passed).map(|(r, _)| r.clone()).collect()).unwrap_or_default();
+    fn unpass(&mut self, t: Tid, out: &mut Vec<Act>) {
+        let passed: Vec<Rid> = self.t(t).map(|tk| tk.words.iter().filter(|(_, w)| *w == Word::Passed).map(|(r, _)| *r).collect()).unwrap_or_default();
         for r in passed {
-            if self.machines.get(&r).is_some_and(|m| m.connected) {
-                self.probe_at(run, &r, out);
+            if self.connected(r) {
+                self.probe_at(t, r, out);
             }
         }
     }
@@ -386,16 +665,16 @@ impl Owner {
                 Word::Never(why) => why.clone(),
                 Word::Waiting { reason, place: p, start, free, .. } => {
                     if p.lo > 0 && place.as_ref().is_none_or(|b| p.lo < b.lo) {
-                        place = Some(At { lo: p.lo, hi: p.hi, runner: r.clone() });
+                        place = Some(At { lo: p.lo, hi: p.hi, runner: self.name(*r) });
                     }
-                    soonest = min_some(soonest, start.soonest.map(|at| self.owner_time(r, at)));
-                    latest = min_some(latest, start.latest.map(|at| self.owner_time(r, at)));
+                    soonest = min_some(soonest, start.soonest.map(|at| self.owner_time(*r, at)));
+                    latest = min_some(latest, start.latest.map(|at| self.owner_time(*r, at)));
                     if matches!(reason, Reason::Room { .. } | Reason::Kept { .. })
                         && let Some(n) = answer::nearest(&t.ask.needs.request, free)
                     {
                         let k = answer::kept(&t.ask.needs.request, &n);
                         if nearest.as_ref().is_none_or(|(best, _)| k > *best) {
-                            nearest = Some((k, Nearest { ask: n, runner: r.clone() }));
+                            nearest = Some((k, Nearest { ask: n, runner: self.name(*r) }));
                         }
                     }
                     reason_words(reason)
@@ -403,98 +682,126 @@ impl Owner {
             };
             *counts.entry(why).or_default() += 1;
         }
-        for why in t.passed.values() {
+        for (_, why) in &t.gone {
             *counts.entry(why.clone()).or_default() += 1;
         }
-        let of = u32::try_from(t.words.len().saturating_add(t.passed.len())).unwrap_or(u32::MAX);
+        for (why, n) in &t.suit.passed {
+            *counts.entry(why.clone()).or_default() += n;
+        }
+        // The runners it suited and wasn't probed at, counted from the handles that were.
+        let mut seen: Vec<Rid> = t.words.iter().map(|(r, _)| *r).chain(t.gone.iter().map(|(r, _)| *r)).collect();
+        seen.sort_unstable();
+        seen.dedup();
+        let among = |set: &[Rid]| set.len().saturating_sub(seen.iter().filter(|r| set.binary_search(r).is_ok()).count());
+        for (why, n) in [(NOT_PROBED, among(&t.suit.live)), ("link down", among(&t.suit.away))] {
+            if n > 0 {
+                *counts.entry(why.to_owned()).or_default() += u32::try_from(n).unwrap_or(u32::MAX);
+            }
+        }
+        let of = counts.values().fold(0u32, |a, n| a.saturating_add(*n));
         let mut reasons: Vec<Count> = counts.into_iter().map(|(reason, runners)| Count { reason, runners }).collect();
         reasons.sort_by(|a, b| b.runners.cmp(&a.runners).then_with(|| a.reason.cmp(&b.reason)));
         Answer::Queued { of, reasons, place, start: Estimate { soonest, latest }, nearest: nearest.map(|(_, n)| n) }
     }
 
     /// Tells the asker `answer`, if it isn't what it was told last (only real changes are news).
-    fn tell(&mut self, run: &str, answer: Answer, out: &mut Vec<Act>) {
-        let Some(t) = self.tickets.get_mut(run) else { return };
-        if t.told.as_ref() == Some(&answer) {
+    fn tell(&mut self, t: Tid, answer: Answer, out: &mut Vec<Act>) {
+        let Some(tk) = self.t_mut(t) else { return };
+        if tk.told.as_ref() == Some(&answer) {
             return;
         }
         #[cfg(test)]
-        if t.told.is_some() && matches!(answer, Answer::Queued { .. }) && super::mutant() == Some(super::Mutant::QuietAnswer) {
+        if tk.told.is_some() && matches!(answer, Answer::Queued { .. }) && super::mutant() == Some(super::Mutant::QuietAnswer) {
             return;
         }
-        t.told = Some(answer.clone());
-        out.push(Act::Answer { run: run.to_owned(), answer });
+        tk.told = Some(answer.clone());
+        let run = tk.run.clone();
+        out.push(Act::Answer { run, answer });
     }
 
-    /// Tells a waiting ticket's asker where it stands now: its first answer, or news.
-    fn answer(&mut self, run: &str, out: &mut Vec<Act>) {
-        let Some(t) = self.tickets.get(run) else { return };
-        if t.stage != Stage::Waiting {
+    /// Tells a waiting ticket's asker where it stands now: its first answer, or news. Not while
+    /// it holds offers: it's choosing, and its next answer is where it starts.
+    fn answer(&mut self, t: Tid, out: &mut Vec<Act>) {
+        let Some(tk) = self.t(t) else { return };
+        if tk.stage != Stage::Waiting || !tk.offers.is_empty() {
             return;
         }
-        let first = t.due.is_some() || t.told.is_none();
-        let a = self.queued(t);
-        if let Some(d) = t.due {
-            self.due.remove(&(d, run.to_owned()));
-        }
-        if let Some(t) = self.tickets.get_mut(run) {
-            t.due = None;
-        }
-        self.tell(run, a, out);
+        let first = tk.due.is_some() || tk.told.is_none();
+        let a = self.queued(tk);
+        self.undue(t);
+        self.tell(t, a, out);
         if first {
-            self.try_older_for(run, out);
+            self.try_older_for(t, out);
         }
     }
 
     /// Whether every runner probed has answered.
-    fn all_answered(&self, run: &str) -> bool {
-        self.tickets.get(run).is_some_and(|t| t.words.values().all(|w| !matches!(w, Word::Asked)))
+    fn all_answered(&self, t: Tid) -> bool {
+        self.t(t).is_some_and(|tk| tk.words.iter().all(|(_, w)| !matches!(w, Word::Asked)))
     }
 
     /// A ticket's runner's word changed what's known of it: its first answer once every runner
     /// probed has answered, news after.
-    fn heard_of(&mut self, run: &str, out: &mut Vec<Act>) {
-        let pending = self.tickets.get(run).is_some_and(|t| t.due.is_some());
-        if !pending || self.all_answered(run) {
-            self.answer(run, out);
+    fn heard_of(&mut self, t: Tid, out: &mut Vec<Act>) {
+        let pending = self.t(t).is_some_and(|tk| tk.due.is_some());
+        if !pending || self.all_answered(t) {
+            self.answer(t, out);
         }
+    }
+
+    /// What follows a word on a waiting ticket: the choice, once every runner probed has answered
+    /// and an offer is held; more runners probed, once none probed may yet start it; and the
+    /// asker told.
+    fn settle(&mut self, t: Tid, now: i64, out: &mut Vec<Act>) {
+        let Some(tk) = self.t(t) else { return };
+        if tk.stage == Stage::Waiting && !tk.offers.is_empty() && self.all_answered(t) {
+            self.choose_now(t, now, out);
+            return;
+        }
+        if tk.hungry() {
+            self.widen(t, out);
+        }
+        self.heard_of(t, out);
     }
 
     /// The older runners the shell's pick could start `ask` on now: suited to it, linked, and idle
     /// enough as the directory last saw them.
-    fn older_for(&self, ask: &Ask) -> Vec<String> {
+    fn older_for(&mut self, t: Tid) -> Vec<String> {
+        let Some(ask) = self.t(t).map(|tk| Arc::clone(&tk.ask)) else { return Vec::new() };
         let q = super::ask::amounts(&ask.needs.request);
-        self.machines.values().filter(|m| !m.places && m.connected && unsuited(m, ask).is_none() && m.idle.is_some_and(|i| super::ask::fits(&q, &super::ask::amounts(&i)))).map(|m| m.name.clone()).collect()
+        let suit = self.suit(&ask);
+        suit.older.iter().filter_map(|r| self.machine(*r)).filter(|m| !m.places && m.connected && m.idle.is_some_and(|i| super::ask::fits(&q, &super::ask::amounts(&i)))).map(|m| m.name.clone()).collect()
     }
 
     /// A waiting ticket that no runner that places offered goes to an older runner idle enough for
     /// it, if there's one (a rolling upgrade: placed as before placement rather than waiting).
-    fn try_older_for(&mut self, run: &str, out: &mut Vec<Act>) {
+    fn try_older_for(&mut self, t: Tid, out: &mut Vec<Act>) {
         #[cfg(test)]
         if super::mutant() == Some(super::Mutant::SkipOlder) {
             return;
         }
-        let Some(t) = self.tickets.get(run) else { return };
-        if t.stage != Stage::Waiting || t.words.values().any(|w| *w == Word::Offered) {
+        let Some(tk) = self.t(t) else { return };
+        if tk.stage != Stage::Waiting || tk.words.iter().any(|(_, w)| *w == Word::Offered) {
             return;
         }
-        let older = self.older_for(&t.ask);
-        self.fallback(run, older, out);
+        let older = self.older_for(t);
+        self.fallback(t, older, out);
     }
 
-    fn fallback(&mut self, run: &str, runners: Vec<String>, out: &mut Vec<Act>) {
+    fn fallback(&mut self, t: Tid, runners: Vec<String>, out: &mut Vec<Act>) {
         if runners.is_empty() {
             return;
         }
-        if let Some(t) = self.tickets.get_mut(run) {
-            t.stage = Stage::Fallback;
-        }
-        out.push(Act::Fallback { run: run.to_owned(), runners });
+        let Some(tk) = self.t_mut(t) else { return };
+        tk.stage = Stage::Fallback;
+        let run = tk.run.clone();
+        out.push(Act::Fallback { run, runners });
     }
 
     /// Never: what no runner meets, and the runner nearest to it.
     fn never(&self, ask: &Ask) -> Answer {
-        if self.machines.is_empty() {
+        let machines: Vec<&Machine> = self.present.iter().filter_map(|r| self.machine(*r)).collect();
+        if machines.is_empty() {
             return Answer::Never { need: "is known yet".into(), nearest: None };
         }
         let meets = |m: &Machine, src: &str| Constraint::parse(src).is_ok_and(|c| c.eval(&m.facts, &m.labels));
@@ -502,13 +809,13 @@ impl Owner {
             .needs
             .requires
             .iter()
-            .find(|src| !self.machines.values().any(|m| meets(m, src)))
+            .find(|src| !machines.iter().any(|m| meets(m, src)))
             .map(|src| format!("meets {src}"))
-            .or_else(|| (!ask.needs.requires.is_empty() && !self.machines.values().any(|m| ask.needs.requires.iter().all(|s| meets(m, s)))).then(|| format!("meets all of {}", ask.needs.requires.join(", "))))
+            .or_else(|| (!ask.needs.requires.is_empty() && !machines.iter().any(|m| ask.needs.requires.iter().all(|s| meets(m, s)))).then(|| format!("meets all of {}", ask.needs.requires.join(", "))))
             .or_else(|| ask.needs.together.as_ref().map(|_| "starts commands together yet".to_owned()))
             .unwrap_or_else(|| format!("has room for {}", needs::request_words(&ask.needs.request).join(", ")));
         let met = |m: &Machine| ask.needs.requires.iter().filter(|s| meets(m, s)).count();
-        let nearest = self.machines.values().max_by(|a, b| met(a).cmp(&met(b)).then_with(|| (a.size.cpu, a.size.mem).cmp(&(b.size.cpu, b.size.mem))).then_with(|| b.name.cmp(&a.name)));
+        let nearest = machines.iter().max_by(|a, b| met(a).cmp(&met(b)).then_with(|| (a.size.cpu, a.size.mem).cmp(&(b.size.cpu, b.size.mem))).then_with(|| b.name.cmp(&a.name)));
         let nearest = nearest.map(|m| {
             let cpus = m.size.cpu.map_or_else(|| "CPUs not measured".to_owned(), needs::cpus);
             let mem = m.size.mem.map_or_else(|| "memory not measured".to_owned(), |b| format!("{} of memory", needs::show_size(b)));
@@ -517,16 +824,53 @@ impl Owner {
         Answer::Never { need, nearest }
     }
 
-    /// Whether another runner is sure to finish `run` before an offer from `runner` would: its
+    /// Whether another runner is sure to finish `t` before an offer from `runner` would: its
     /// latest start (in this node's clock) plus its predicted run there, before now plus the
     /// predicted run here. Unknown predictions are never sure.
-    fn sooner_elsewhere(&self, run: &str, runner: &str, predicted: Option<Ms>, now: i64) -> bool {
+    fn sooner_elsewhere(&self, t: Tid, runner: Rid, predicted: Option<Ms>, now: i64) -> bool {
         let Some(here) = predicted.map(|p| later(now, p)) else { return false };
-        let Some(t) = self.tickets.get(run) else { return false };
-        t.words.iter().any(|(o, w)| match w {
-            Word::Waiting { start: Estimate { latest: Some(l), .. }, predicted: Some(p), .. } if o.as_str() != runner => later(self.owner_time(o, *l), *p) < here,
+        let Some(tk) = self.t(t) else { return false };
+        tk.words.iter().any(|(o, w)| match w {
+            Word::Waiting { start: Estimate { latest: Some(l), .. }, predicted: Some(p), .. } if *o != runner => later(self.owner_time(*o, *l), *p) < here,
             _ => false,
         })
+    }
+
+    /// The offer to take of those held: the emptiest by fullness, then by class the most room or
+    /// the least, then by name.
+    fn best(&self, tk: &Ticket) -> Option<Offer> {
+        let room = wants_room(tk.ask.class);
+        let size = |r: Rid| self.machine(r).map(|m| m.size).unwrap_or_default();
+        let key = |o: &Offer| {
+            let f = fullness(&size(o.runner), &o.free);
+            let free = (o.free.cpu.get(), o.free.mem, o.free.disk, o.free.gpu);
+            (f, free)
+        };
+        tk.offers.iter().copied().min_by(|a, b| {
+            let ((fa, ra), (fb, rb)) = (key(a), key(b));
+            fa.cmp(&fb).then_with(|| if room { rb.cmp(&ra) } else { ra.cmp(&rb) }).then_with(|| self.names.name(a.runner).cmp(self.names.name(b.runner)))
+        })
+    }
+
+    /// Takes the best offer held and declines the others (one each, at most d − 1); the probes
+    /// still out are withdrawn.
+    fn choose_now(&mut self, t: Tid, now: i64, out: &mut Vec<Act>) {
+        let _ = now;
+        let Some(best) = self.t(t).and_then(|tk| self.best(tk)) else { return };
+        let Some(tk) = self.t_mut(t) else { return };
+        tk.stage = Stage::Taking { fence: best.fence };
+        tk.runner = Some(best.runner);
+        tk.got = Some((best.got, best.free));
+        tk.offers.retain(|o| o.runner != best.runner);
+        let run = tk.run.clone();
+        out.push(Act::Tell { runner: self.name(best.runner), msg: ToRunner::Take { run, fence: best.fence } });
+        self.withdraw_others(t, Some(best.runner), out);
+        if let Some(tk) = self.t_mut(t) {
+            tk.offers.clear();
+        }
+        self.unhold_if_none(t);
+        self.set_word(t, best.runner, Word::Offered);
+        self.undue(t);
     }
 }
 
@@ -540,10 +884,19 @@ impl Owner {
     /// an older one newly idle is tried for waiting runs no runner that places offered.
     pub fn machines(&mut self, ms: Vec<Machine>) -> Vec<Act> {
         let mut out = Vec::new();
-        let new: BTreeMap<String, Machine> = ms.into_iter().map(|m| (m.name.clone(), m)).collect();
-        let old = std::mem::replace(&mut self.machines, new);
-        for (name, m) in &old {
-            let change = match self.machines.get(name) {
+        let old: BTreeMap<String, (Rid, Machine)> = self.present.iter().filter_map(|r| self.slots.get_mut(ix(*r)).and_then(|s| s.machine.take()).map(|m| (m.name.clone(), (*r, m)))).collect();
+        let mut new: BTreeMap<String, Rid> = BTreeMap::new();
+        for m in ms {
+            let r = self.rid(&m.name);
+            new.insert(m.name.clone(), r);
+            if let Some(s) = self.slots.get_mut(ix(r)) {
+                s.machine = Some(m);
+            }
+        }
+        self.present = new.values().copied().collect();
+        self.redraw();
+        for (r, m) in old.values() {
+            let change = match self.machine(*r) {
                 None => Change::Gone,
                 Some(n) if n.epoch != m.epoch => Change::Restarted,
                 Some(n) if m.connected && !n.connected => Change::Away,
@@ -551,154 +904,163 @@ impl Owner {
                 Some(_) => Change::Same,
             };
             match change {
-                Change::Gone => self.gone(name, &mut out),
-                Change::Restarted => self.restarted(name, &mut out),
-                Change::Away => self.went_away(name, &mut out),
-                Change::Back => self.came_back(name, &mut out),
+                Change::Gone => self.gone(*r, &mut out),
+                Change::Restarted => self.restarted(*r, &mut out),
+                Change::Away => self.went_away(*r, &mut out),
+                Change::Back => self.came_back(*r, &mut out),
                 Change::Same => {}
             }
         }
         // Runners new to the directory, or newly placing (a runner started again is `restarted`'s):
         // each waiting run it could take is probed there, or, its link down, waits for it.
-        let fresh: Vec<(String, bool)> = self.machines.values().filter(|m| m.places && old.get(&m.name).is_none_or(|o| !o.places)).map(|m| (m.name.clone(), m.connected)).collect();
+        let fresh: Vec<(Rid, bool)> = self.present.iter().filter_map(|r| self.machine(*r).map(|m| (*r, m))).filter(|(_, m)| m.places && old.get(&m.name).is_none_or(|(_, o)| !o.places)).map(|(r, m)| (r, m.connected)).collect();
         if !fresh.is_empty() {
-            let waiting: Vec<String> = self.tickets.iter().filter(|(_, t)| t.stage == Stage::Waiting).map(|(r, _)| r.clone()).collect();
-            for run in waiting {
+            let waiting: Vec<Tid> = self.waiting();
+            for t in waiting {
                 for (r, connected) in &fresh {
-                    let probe = match (self.tickets.get(&run), self.machines.get(r)) {
-                        (Some(t), Some(m)) => !matches!(t.words.get(r), Some(Word::Asked | Word::Waiting { .. } | Word::Offered | Word::Never(_))) && unsuited(m, &t.ask).is_none(),
+                    let probe = match (self.t(t), self.machine(*r)) {
+                        (Some(tk), Some(m)) => tk.stage == Stage::Waiting && !matches!(tk.word(*r), Some(Word::Asked | Word::Waiting { .. } | Word::Offered | Word::Never(_))) && unsuited(m, &tk.ask).is_none(),
                         _ => false,
                     };
                     if probe {
-                        if let Some(t) = self.tickets.get_mut(&run) {
-                            t.passed.remove(r);
+                        if let Some(tk) = self.t_mut(t) {
+                            tk.gone.retain(|(g, _)| g != r);
                         }
                         if *connected {
-                            self.probe_at(&run, r, &mut out);
+                            self.probe_at(t, *r, &mut out);
                         } else {
-                            self.set_word(&run, r, Word::Away);
+                            self.set_word(t, *r, Word::Away);
                         }
-                        self.heard_of(&run, &mut out);
+                        self.heard_of(t, &mut out);
                     }
                 }
             }
         }
         // An older runner new, back, or idle otherwise than it was: waiting runs are tried there.
-        let older = self.machines.values().any(|m| !m.places && old.get(&m.name).is_none_or(|o| o.places || o.idle != m.idle || o.connected != m.connected));
+        let older = self.present.iter().filter_map(|r| self.machine(*r)).any(|m| !m.places && old.get(&m.name).is_none_or(|(_, o)| o.places || o.idle != m.idle || o.connected != m.connected));
         if older {
             self.retry_older(&mut out);
         }
         out
     }
 
+    /// The tickets waiting, in order.
+    fn waiting(&self) -> Vec<Tid> {
+        self.tickets.iter().enumerate().filter_map(|(i, t)| t.as_ref().filter(|t| t.stage == Stage::Waiting).and_then(|_| u32::try_from(i).ok())).collect()
+    }
+
     /// Each waiting run no runner that places has offered, tried on the older runners again.
     fn retry_older(&mut self, out: &mut Vec<Act>) {
-        let waiting: Vec<String> = self.tickets.iter().filter(|(_, t)| t.stage == Stage::Waiting && t.due.is_none()).map(|(r, _)| r.clone()).collect();
-        for run in waiting {
-            self.try_older_for(&run, out);
+        let waiting: Vec<Tid> = self.waiting().into_iter().filter(|t| self.t(*t).is_some_and(|tk| tk.due.is_none())).collect();
+        for t in waiting {
+            self.try_older_for(t, out);
         }
     }
 
-    /// A ticket's stage, whether `runner` holds its claim, and that runner's word on it.
-    fn where_is(&self, run: &str, runner: &str) -> Option<(Stage, bool, Option<Word>)> {
-        let t = self.tickets.get(run)?;
-        Some((t.stage, t.runner.as_deref() == Some(runner), t.words.get(runner).cloned()))
+    /// A ticket's stage, whether `r` holds its claim, and that runner's word on it.
+    fn where_is(&self, t: Tid, r: Rid) -> Option<(Stage, bool, Option<Word>)> {
+        let tk = self.t(t)?;
+        Some((tk.stage, tk.runner == Some(r), tk.word(r).cloned()))
     }
 
-    /// `runner` is gone from the directory: what it held ends.
-    fn gone(&mut self, runner: &str, out: &mut Vec<Act>) {
-        for run in self.runs_at(runner) {
-            let Some((stage, here, _)) = self.where_is(&run, runner) else { continue };
+    fn back_to_waiting(&mut self, t: Tid) {
+        if let Some(tk) = self.t_mut(t) {
+            tk.stage = Stage::Waiting;
+            tk.runner = None;
+            tk.got = None;
+        }
+    }
+
+    /// `r` is gone from the directory: what it held ends.
+    fn gone(&mut self, r: Rid, out: &mut Vec<Act>) {
+        for t in self.runs_at(r) {
+            let Some((stage, here, _)) = self.where_is(t, r) else { continue };
             match stage {
                 Stage::Starting { .. } | Stage::Running { .. } if here => {
-                    self.remove(&run);
-                    out.push(Act::Answer { run, answer: Answer::Lost { runner: runner.to_owned(), why: "is gone from the directory, as the run started or ran there: it may have run, and it isn't started again".into() } });
+                    if let Some(tk) = self.remove(t) {
+                        out.push(Act::Answer { run: tk.run, answer: Answer::Lost { runner: self.name(r), why: "is gone from the directory, as the run started or ran there: it may have run, and it isn't started again".into() } });
+                    }
                 }
                 Stage::Taking { .. } | Stage::Held { .. } if here => {
-                    if let Some(t) = self.tickets.get_mut(&run) {
-                        t.stage = Stage::Waiting;
-                        t.runner = None;
-                        t.got = None;
-                    }
-                    self.drop_word(&run, runner);
-                    self.probe_afresh(&run, out);
-                    self.answer(&run, out);
+                    self.back_to_waiting(t);
+                    self.drop_word(t, r);
+                    self.probe_afresh(t, out);
+                    self.answer(t, out);
                 }
                 _ => {
-                    self.drop_word(&run, runner);
-                    if let Some(t) = self.tickets.get_mut(&run) {
-                        t.passed.insert(runner.to_owned(), "gone".into());
+                    self.drop_word(t, r);
+                    if let Some(tk) = self.t_mut(t) {
+                        tk.gone.retain(|(g, _)| *g != r);
+                        tk.gone.push((r, "gone".into()));
                     }
-                    self.unpass(&run, out);
-                    self.heard_of(&run, out);
+                    self.unpass(t, out);
+                    self.settle(t, 0, out);
                 }
             }
         }
     }
 
-    /// `runner` started again under a new epoch: its claims of the old one end; a start sent to it
-    /// is said again, for the record on its disk to answer (it ran, how it ended, or the claim
+    /// `r` started again under a new epoch: its claims of the old one end; a start sent to it is
+    /// said again, for the record on its disk to answer (it ran, how it ended, or the claim
     /// lapsed); a run there under the old epoch is lost; its probes are made again.
-    fn restarted(&mut self, runner: &str, out: &mut Vec<Act>) {
-        let connected = self.machines.get(runner).is_some_and(|m| m.connected);
-        for run in self.runs_at(runner) {
-            let Some((stage, here, word)) = self.where_is(&run, runner) else { continue };
+    fn restarted(&mut self, r: Rid, out: &mut Vec<Act>) {
+        let connected = self.connected(r);
+        for t in self.runs_at(r) {
+            let Some((stage, here, word)) = self.where_is(t, r) else { continue };
             match stage {
                 Stage::Running { .. } if here => {
-                    self.remove(&run);
-                    out.push(Act::Answer { run, answer: Answer::Lost { runner: runner.to_owned(), why: "started again under a new epoch as the run ran there: it isn't started again".into() } });
+                    if let Some(tk) = self.remove(t) {
+                        out.push(Act::Answer { run: tk.run, answer: Answer::Lost { runner: self.name(r), why: "started again under a new epoch as the run ran there: it isn't started again".into() } });
+                    }
                 }
                 Stage::Starting { fence } if here => {
-                    if connected {
-                        out.push(Act::Restart { run, runner: runner.to_owned(), fence });
+                    if connected && let Some(run) = self.t(t).map(|tk| tk.run.clone()) {
+                        out.push(Act::Restart { run, runner: self.name(r), fence });
                     }
                 }
                 Stage::Taking { .. } | Stage::Held { .. } if here => {
-                    if let Some(t) = self.tickets.get_mut(&run) {
-                        t.stage = Stage::Waiting;
-                        t.runner = None;
-                        t.got = None;
-                    }
-                    self.probe_afresh(&run, out);
-                    self.answer(&run, out);
+                    self.back_to_waiting(t);
+                    self.probe_afresh(t, out);
+                    self.answer(t, out);
                 }
-                // Its probe went with the old process: made again, or, its link down, when it's back.
+                // Its probe went with the old process (an offer held with it): made again, or, its
+                // link down, when it's back.
                 Stage::Waiting if !matches!(word, Some(Word::Never(_))) => {
+                    self.unhold(t, r);
                     if connected {
-                        self.probe_at(&run, runner, out);
+                        self.probe_at(t, r, out);
                     } else {
-                        self.set_word(&run, runner, Word::Away);
+                        self.set_word(t, r, Word::Away);
                     }
-                    self.heard_of(&run, out);
+                    self.settle(t, 0, out);
                 }
                 _ => {}
             }
         }
     }
 
-    /// The link to `runner` went down: it's still there, and what it holds waits for it.
-    fn went_away(&mut self, runner: &str, out: &mut Vec<Act>) {
+    /// The link to `r` went down: it's still there, and what it holds waits for it. An offer held
+    /// from it lapses there.
+    fn went_away(&mut self, r: Rid, out: &mut Vec<Act>) {
         #[cfg(test)]
         if super::mutant() == Some(super::Mutant::LostOnDisconnect) {
-            self.gone(runner, out);
+            self.gone(r, out);
             return;
         }
-        for run in self.runs_at(runner) {
-            let Some((stage, here, word)) = self.where_is(&run, runner) else { continue };
+        for t in self.runs_at(r) {
+            let Some((stage, here, word)) = self.where_is(t, r) else { continue };
             match stage {
                 Stage::Waiting if !matches!(word, Some(Word::Never(_))) => {
-                    self.set_word(&run, runner, Word::Away);
-                    self.unpass(&run, out);
-                    self.heard_of(&run, out);
+                    self.unhold(t, r);
+                    self.set_word(t, r, Word::Away);
+                    self.unpass(t, out);
+                    self.settle(t, 0, out);
                 }
                 #[cfg(test)]
                 Stage::Starting { .. } if here && super::mutant() == Some(super::Mutant::ReplaceOnSilence) => {
-                    if let Some(t) = self.tickets.get_mut(&run) {
-                        t.stage = Stage::Waiting;
-                        t.runner = None;
-                    }
-                    self.drop_word(&run, runner);
-                    self.probe_afresh(&run, out);
+                    self.back_to_waiting(t);
+                    self.drop_word(t, r);
+                    self.probe_afresh(t, out);
                 }
                 _ => {
                     let _ = here;
@@ -707,32 +1069,42 @@ impl Owner {
         }
     }
 
-    /// The link to `runner` is back: what it may have missed is said again: a waiting ticket's
-    /// probe (answered as it stands), a take not yet held, and a start (said again, it starts
-    /// nothing twice).
-    fn came_back(&mut self, runner: &str, out: &mut Vec<Act>) {
-        for run in self.runs_at(runner) {
-            let Some((stage, here, word)) = self.where_is(&run, runner) else { continue };
+    /// The link to `r` is back: what it may have missed is said again: a waiting ticket's probe
+    /// (answered as it stands), a take not yet held, and a start (said again, it starts nothing
+    /// twice). A waiting ticket probed at fewer than [`PROBES`] runners that may yet start it (they
+    /// were away, or said never) is probed there.
+    fn came_back(&mut self, r: Rid, out: &mut Vec<Act>) {
+        for t in self.runs_at(r) {
+            let Some((stage, here, word)) = self.where_is(t, r) else { continue };
+            let Some(run) = self.t(t).map(|tk| tk.run.clone()) else { continue };
             match stage {
                 Stage::Waiting if matches!(word, Some(Word::Away | Word::Asked | Word::Passed)) => {
-                    self.probe_at(&run, runner, out);
-                    self.heard_of(&run, out);
+                    self.probe_at(t, r, out);
+                    self.heard_of(t, out);
                 }
-                Stage::Taking { fence } if here => out.push(Act::Tell { runner: runner.to_owned(), msg: ToRunner::Take { run, fence } }),
-                Stage::Starting { fence } if here => out.push(Act::Restart { run, runner: runner.to_owned(), fence }),
+                Stage::Taking { fence } if here => out.push(Act::Tell { runner: self.name(r), msg: ToRunner::Take { run, fence } }),
+                Stage::Starting { fence } if here => out.push(Act::Restart { run, runner: self.name(r), fence }),
                 _ => {}
             }
+        }
+        let Some(m) = self.machine(r).filter(|m| m.places).cloned() else { return };
+        let hungry: Vec<Tid> = self.waiting().into_iter().filter(|t| self.t(*t).is_some_and(|tk| tk.short() && tk.word(r).is_none() && unsuited(&m, &tk.ask).is_none())).collect();
+        for t in hungry {
+            self.probe_at(t, r, out);
+            self.heard_of(t, out);
         }
     }
 
     /// The link to `runner` went down (the shell's word, between directories).
     pub fn away(&mut self, runner: &str) -> Vec<Act> {
         let mut out = Vec::new();
-        if let Some(m) = self.machines.get_mut(runner)
+        let Some(r) = self.names.get(runner) else { return out };
+        if let Some(m) = self.slots.get_mut(ix(r)).and_then(|s| s.machine.as_mut())
             && m.connected
         {
             m.connected = false;
-            self.went_away(runner, &mut out);
+            self.redraw();
+            self.went_away(r, &mut out);
         }
         out
     }
@@ -740,12 +1112,14 @@ impl Owner {
     /// The link to `runner` is back (the shell's word, between directories).
     pub fn back(&mut self, runner: &str) -> Vec<Act> {
         let mut out = Vec::new();
-        if let Some(m) = self.machines.get_mut(runner)
+        let Some(r) = self.names.get(runner) else { return out };
+        if let Some(m) = self.slots.get_mut(ix(r)).and_then(|s| s.machine.as_mut())
             && !m.connected
         {
             m.connected = true;
             let older = !m.places;
-            self.came_back(runner, &mut out);
+            self.redraw();
+            self.came_back(r, &mut out);
             if older {
                 self.retry_older(&mut out);
             }
@@ -754,69 +1128,75 @@ impl Owner {
     }
 
     /// A run is asked of this node: answered never at once if no runner could run it even idle,
-    /// handed to the older pick if only older runners could, else probed at every runner that
-    /// could and places; its first answer comes once each has answered, or by the last of their
-    /// links' timeouts.
+    /// handed to the older pick if only older runners could, else probed at [`PROBES`] runners
+    /// drawn among those that could, are linked and place; its first answer comes once each has
+    /// answered, or by the last of their links' timeouts.
     pub fn ask(&mut self, ask: Ask, now: i64) -> Vec<Act> {
         let mut out = Vec::new();
-        let run = ask.run.clone();
-        if self.tickets.contains_key(&run) {
+        if self.by_run.contains_key(&ask.run) {
             return out;
         }
-        let mut passed = BTreeMap::new();
-        let (mut probe, mut away, mut older) = (Vec::new(), Vec::new(), Vec::new());
-        for m in self.machines.values() {
-            match unsuited(m, &ask) {
-                Some(why) => {
-                    passed.insert(m.name.clone(), why);
-                }
-                None if !m.places => {
-                    older.push(m.name.clone());
-                    passed.insert(m.name.clone(), "an older runner, without placement".into());
-                }
-                None if !m.connected => away.push(m.name.clone()),
-                None => probe.push(m.name.clone()),
-            }
-        }
-        if probe.is_empty() && away.is_empty() && older.is_empty() {
+        let suit = self.suit(&ask);
+        if suit.live.is_empty() && suit.away.is_empty() && suit.older.is_empty() {
+            let run = ask.run.clone();
             out.push(Act::Answer { run, answer: self.never(&ask) });
             return out;
         }
-        let t = Ticket {
-            ask,
+        let run = ask.run.clone();
+        let tk = Ticket {
+            run: run.clone(),
+            ask: Arc::new(ask),
+            suit: Arc::clone(&suit),
             stage: Stage::Waiting,
             runner: None,
             got: None,
-            words: BTreeMap::new(),
-            passed,
+            words: Vec::new(),
+            gone: Vec::new(),
+            offers: Vec::new(),
+            choose_at: None,
             told: None,
             due: None,
             #[cfg(test)]
             second: None,
         };
-        self.tickets.insert(run.clone(), t);
-        for r in &away {
-            self.set_word(&run, r, Word::Away);
-        }
-        if probe.is_empty() && away.is_empty() {
-            self.fallback(&run, older, &mut out);
+        let t = match self.spare.pop() {
+            Some(t) => {
+                if let Some(slot) = self.tickets.get_mut(ix(t)) {
+                    *slot = Some(tk);
+                }
+                t
+            }
+            None => {
+                self.tickets.push(Some(tk));
+                u32::try_from(self.tickets.len().saturating_sub(1)).unwrap_or(u32::MAX)
+            }
+        };
+        self.by_run.insert(run, t);
+        if suit.live.is_empty() && suit.away.is_empty() {
+            let older = suit.older.iter().map(|r| self.name(*r)).collect();
+            self.fallback(t, older, &mut out);
             return out;
         }
+        let n = u32::try_from(suit.live.len()).unwrap_or(u32::MAX);
+        let mut draw = std::mem::take(&mut self.draw);
+        self.rng.sample(n, PROBES, &mut draw);
         let mut due: Option<i64> = None;
-        for r in &probe {
-            self.probe_at(&run, r, &mut out);
+        for i in &draw {
+            let Some(r) = suit.live.get(ix(*i)).copied() else { continue };
+            self.probe_at(t, r, &mut out);
             let at = later(now, self.rto(r));
             due = Some(due.map_or(at, |d| d.max(at)));
         }
+        self.draw = draw;
         match due {
             Some(d) => {
-                if let Some(t) = self.tickets.get_mut(&run) {
-                    t.due = Some(d);
+                if let Some(tk) = self.t_mut(t) {
+                    tk.due = Some(d);
                 }
-                self.due.insert((d, run));
+                self.due.insert((d, t));
             }
             // Only runners whose link is down could take it: answered so now.
-            None => self.answer(&run, &mut out),
+            None => self.answer(t, &mut out),
         }
         out
     }
@@ -824,95 +1204,106 @@ impl Owner {
     /// A runner's word about a run.
     pub fn heard(&mut self, runner: &str, msg: ToOwner, now: i64) -> Vec<Act> {
         let mut out = Vec::new();
-        let run = msg.run().to_owned();
-        let r = runner.to_owned();
-        let Some(t) = self.tickets.get(&run) else {
+        let Some(t) = self.by_run.get(msg.run()).copied() else {
             // Its ticket is gone (ended, cancelled, answered never): an offer's room goes back, a
-            // probe still waiting there is withdrawn, and an end is acknowledged.
+            // probe still waiting there is withdrawn, and an end is acknowledged. O(1).
+            let runner = runner.to_owned();
             match msg {
-                ToOwner::Offer { fence, .. } | ToOwner::Held { fence, .. } => out.push(Act::Tell { runner: r, msg: ToRunner::Decline { run, fence } }),
-                ToOwner::Waiting { .. } => out.push(Act::Tell { runner: r, msg: ToRunner::Withdraw { run } }),
-                ToOwner::Ended { .. } => out.push(Act::Tell { runner: r, msg: ToRunner::Ack { run } }),
+                ToOwner::Offer { run, fence, .. } | ToOwner::Held { run, fence } => out.push(Act::Tell { runner, msg: ToRunner::Decline { run, fence } }),
+                ToOwner::Waiting { run, .. } => out.push(Act::Tell { runner, msg: ToRunner::Withdraw { run } }),
+                ToOwner::Ended { run, .. } => out.push(Act::Tell { runner, msg: ToRunner::Ack { run } }),
                 _ => {}
             }
             return out;
         };
-        let stage = t.stage;
-        let here = t.runner.as_deref() == Some(runner);
-        let probed = t.words.contains_key(runner);
-        let got = t.got;
+        let r = self.rid(runner);
+        let Some(tk) = self.t(t) else { return out };
+        let stage = tk.stage;
+        let here = tk.runner == Some(r);
+        let probed = tk.word(r).is_some();
+        let got = tk.got;
+        let run = tk.run.clone();
         #[cfg(test)]
-        let second = t.second.as_ref().is_some_and(|(s, _)| s == runner);
+        let second = tk.second.is_some_and(|(s, _)| s == r);
         match msg {
             ToOwner::Offer { fence, got: g, free, predicted, .. } => match stage {
                 Stage::Waiting => {
-                    if self.sooner_elsewhere(&run, runner, predicted, now) {
+                    if self.sooner_elsewhere(t, r, predicted, now) {
                         // Another runner is sure to finish it sooner: this one's room goes back, and
                         // it's probed again when what's known of the others changes.
-                        out.push(Act::Tell { runner: r, msg: ToRunner::Decline { run: run.clone(), fence } });
-                        self.set_word(&run, runner, Word::Passed);
-                        self.heard_of(&run, &mut out);
+                        self.unhold(t, r);
+                        out.push(Act::Tell { runner: self.name(r), msg: ToRunner::Decline { run, fence } });
+                        self.set_word(t, r, Word::Passed);
+                        self.heard_of(t, &mut out);
                         return out;
                     }
-                    if let Some(t) = self.tickets.get_mut(&run) {
-                        t.stage = Stage::Taking { fence };
-                        t.runner = Some(r.clone());
-                        t.got = Some((g, free));
+                    if self.t(t).and_then(|tk| tk.offer_of(r)) == Some(fence) {
+                        return out;
                     }
-                    out.push(Act::Tell { runner: r.clone(), msg: ToRunner::Take { run: run.clone(), fence } });
-                    self.withdraw_others(&run, runner, &mut out);
-                    self.set_word(&run, runner, Word::Offered);
-                    if let Some(d) = self.tickets.get_mut(&run).and_then(|t| t.due.take()) {
-                        self.due.remove(&(d, run.clone()));
+                    let at = later(now, self.hold(r));
+                    let Some(tk) = self.t_mut(t) else { return out };
+                    tk.offers.retain(|o| o.runner != r);
+                    tk.offers.push(Offer { runner: r, fence, got: g, free });
+                    // The first offer starts the hold.
+                    if tk.choose_at.is_none() {
+                        tk.choose_at = Some(at);
+                        self.choose.insert((at, t));
+                    }
+                    self.set_word(t, r, Word::Offered);
+                    // Its next answer is where it starts, or, the offers lapsing, where it waits.
+                    self.undue(t);
+                    if self.all_answered(t) {
+                        self.choose_now(t, now, &mut out);
                     }
                 }
                 // An older runner is being tried: the offer lapses back into that runner's line.
                 Stage::Fallback => {}
                 Stage::Taking { fence: f } | Stage::Held { fence: f } | Stage::Starting { fence: f } | Stage::Running { fence: Some(f) } if here && f == fence => {}
                 #[cfg(test)]
-                _ if super::mutant() == Some(super::Mutant::TakeTwo) && self.tickets.get(&run).is_some_and(|t| t.second.is_none()) => {
-                    if let Some(t) = self.tickets.get_mut(&run) {
-                        t.second = Some((r.clone(), fence));
+                _ if super::mutant() == Some(super::Mutant::TakeTwo) && self.t(t).is_some_and(|tk| tk.second.is_none()) => {
+                    if let Some(tk) = self.t_mut(t) {
+                        tk.second = Some((r, fence));
                     }
-                    out.push(Act::Tell { runner: r, msg: ToRunner::Take { run, fence } });
+                    out.push(Act::Tell { runner: self.name(r), msg: ToRunner::Take { run, fence } });
                 }
-                _ => out.push(Act::Tell { runner: r, msg: ToRunner::Decline { run, fence } }),
+                _ => out.push(Act::Tell { runner: self.name(r), msg: ToRunner::Decline { run, fence } }),
             },
             ToOwner::Held { fence, .. } => match stage {
                 Stage::Taking { fence: f } if f == fence && here => {
-                    if let Some(t) = self.tickets.get_mut(&run) {
-                        t.stage = Stage::Held { fence };
+                    if let Some(tk) = self.t_mut(t) {
+                        tk.stage = Stage::Held { fence };
                     }
-                    out.push(Act::Go { run: run.clone(), runner: r.clone(), fence });
+                    let name = self.name(r);
+                    out.push(Act::Go { run, runner: name.clone(), fence });
                     let (g, free) = got.unwrap_or_default();
                     #[cfg(test)]
                     if super::mutant() == Some(super::Mutant::StartedAtHeld) {
-                        self.tell(&run, Answer::Started { runner: r, got: g, why: format!("room for it there: {} free", words(&free)) }, &mut out);
+                        self.tell(t, Answer::Started { runner: name, got: g, why: format!("room for it there: {} free", words(&free)) }, &mut out);
                         return out;
                     }
                     let _ = free;
-                    self.tell(&run, Answer::Starting { runner: r, got: g }, &mut out);
+                    self.tell(t, Answer::Starting { runner: name, got: g }, &mut out);
                 }
                 Stage::Held { fence: f } | Stage::Starting { fence: f } if f == fence && here => {}
                 #[cfg(test)]
                 _ if second => {
-                    if let Some(t) = self.tickets.get_mut(&run) {
-                        t.second = None;
-                        t.stage = Stage::Held { fence };
-                        t.runner = Some(r.clone());
+                    if let Some(tk) = self.t_mut(t) {
+                        tk.second = None;
+                        tk.stage = Stage::Held { fence };
+                        tk.runner = Some(r);
                     }
-                    out.push(Act::Go { run, runner: r, fence });
+                    out.push(Act::Go { run, runner: self.name(r), fence });
                 }
-                _ => out.push(Act::Tell { runner: r, msg: ToRunner::Decline { run, fence } }),
+                _ => out.push(Act::Tell { runner: self.name(r), msg: ToRunner::Decline { run, fence } }),
             },
             // The runner's word that the process started: the one on which the asker is told so.
             ToOwner::Started { fence, .. } => {
                 if matches!(stage, Stage::Starting { fence: f } | Stage::Held { fence: f } if f == fence) && here {
-                    if let Some(t) = self.tickets.get_mut(&run) {
-                        t.stage = Stage::Running { fence: Some(fence) };
+                    if let Some(tk) = self.t_mut(t) {
+                        tk.stage = Stage::Running { fence: Some(fence) };
                     }
                     let (g, free) = got.unwrap_or_default();
-                    self.tell(&run, Answer::Started { runner: r, got: g, why: format!("room for it there: {} free", words(&free)) }, &mut out);
+                    self.tell(t, Answer::Started { runner: self.name(r), got: g, why: format!("room for it there: {} free", words(&free)) }, &mut out);
                 }
             }
             // It started there before: it runs there, and nowhere else.
@@ -921,74 +1312,81 @@ impl Owner {
                     return out;
                 }
                 if let (Stage::Taking { fence } | Stage::Held { fence }, false) = (stage, here)
-                    && let Some(w) = self.tickets.get(&run).and_then(|t| t.runner.clone())
+                    && let Some(w) = self.t(t).and_then(|tk| tk.runner)
                 {
-                    self.drop_word(&run, &w);
-                    out.push(Act::Tell { runner: w, msg: ToRunner::Decline { run: run.clone(), fence } });
+                    self.drop_word(t, w);
+                    out.push(Act::Tell { runner: self.name(w), msg: ToRunner::Decline { run: run.clone(), fence } });
                 }
-                if let Some(t) = self.tickets.get_mut(&run) {
-                    t.stage = Stage::Running { fence: None };
-                    t.runner = Some(r.clone());
+                if let Some(tk) = self.t_mut(t) {
+                    tk.stage = Stage::Running { fence: None };
+                    tk.runner = Some(r);
                 }
-                self.withdraw_others(&run, runner, &mut out);
-                self.set_word(&run, runner, Word::Offered);
-                if let Some(d) = self.tickets.get_mut(&run).and_then(|t| t.due.take()) {
-                    self.due.remove(&(d, run.clone()));
-                }
+                self.unhold(t, r);
+                self.withdraw_others(t, Some(r), &mut out);
+                self.set_word(t, r, Word::Offered);
+                self.undue(t);
                 let (g, free) = got.unwrap_or_default();
-                self.tell(&run, Answer::Started { runner: r, got: g, why: format!("it started there before ({} free as it was offered)", words(&free)) }, &mut out);
+                self.tell(t, Answer::Started { runner: self.name(r), got: g, why: format!("it started there before ({} free as it was offered)", words(&free)) }, &mut out);
             }
             ToOwner::Ended { ok, .. } => {
-                self.withdraw_others(&run, runner, &mut out);
-                self.remove(&run);
-                out.push(Act::Answer { run: run.clone(), answer: Answer::Ended { runner: r.clone(), ok } });
-                out.push(Act::Tell { runner: r, msg: ToRunner::Ack { run } });
+                self.withdraw_others(t, Some(r), &mut out);
+                self.remove(t);
+                out.push(Act::Answer { run: run.clone(), answer: Answer::Ended { runner: self.name(r), ok } });
+                out.push(Act::Tell { runner: self.name(r), msg: ToRunner::Ack { run } });
             }
             ToOwner::Waiting { reason, place, start, predicted, free, .. } => {
                 if stage == Stage::Waiting && probed {
-                    self.set_word(&run, runner, Word::Waiting { reason, place, start, predicted, free });
-                    self.unpass(&run, &mut out);
-                    self.heard_of(&run, &mut out);
+                    // An offer held from it lapsed back into its line.
+                    self.unhold(t, r);
+                    self.set_word(t, r, Word::Waiting { reason, place, start, predicted, free });
+                    self.unpass(t, &mut out);
+                    self.settle(t, now, &mut out);
                 }
             }
             ToOwner::Never { why, .. } => {
                 if probed {
-                    self.set_word(&run, runner, Word::Never(why));
+                    self.unhold(t, r);
+                    self.set_word(t, r, Word::Never(why));
                 }
                 if stage != Stage::Waiting {
                     return out;
                 }
-                let (all_never, older) = match self.tickets.get(&run) {
-                    Some(t) => (!t.words.is_empty() && t.words.values().all(|w| matches!(w, Word::Never(_))), self.machines.values().filter(|m| !m.places && unsuited(m, &t.ask).is_none()).map(|m| m.name.clone()).collect::<Vec<_>>()),
-                    None => (false, Vec::new()),
-                };
-                if all_never && !older.is_empty() {
-                    self.fallback(&run, older, &mut out);
+                if self.t(t).is_some_and(Ticket::hungry) {
+                    self.widen(t, &mut out);
+                }
+                // Every runner that places and suits it said never: older ones, or never.
+                let Some(ask) = self.t(t).map(|tk| Arc::clone(&tk.ask)) else { return out };
+                let suit = self.suit(&ask);
+                let all_never = self.t(t).is_some_and(|tk| !tk.words.is_empty() && tk.words.iter().all(|(_, w)| matches!(w, Word::Never(_))) && suit.live.iter().chain(&suit.away).all(|r| tk.word(*r).is_some()));
+                if all_never && !suit.older.is_empty() {
+                    let older = suit.older.iter().map(|r| self.name(*r)).collect();
+                    self.fallback(t, older, &mut out);
                 } else if all_never {
-                    let Some(t) = self.remove(&run) else { return out };
-                    let need = t.words.values().filter_map(|w| if let Word::Never(why) = w { Some(why.clone()) } else { None }).collect::<BTreeSet<_>>().into_iter().collect::<Vec<_>>().join("; ");
-                    let nearest = match self.never(&t.ask) {
+                    let Some(tk) = self.remove(t) else { return out };
+                    let need = tk.words.iter().filter_map(|(_, w)| if let Word::Never(why) = w { Some(why.clone()) } else { None }).collect::<BTreeSet<_>>().into_iter().collect::<Vec<_>>().join("; ");
+                    let nearest = match self.never(&tk.ask) {
                         Answer::Never { nearest, .. } => nearest,
                         _ => None,
                     };
                     out.push(Act::Answer { run, answer: Answer::Never { need: format!("takes it as asked ({need})"), nearest } });
                 } else {
-                    self.unpass(&run, &mut out);
-                    self.heard_of(&run, &mut out);
+                    self.unpass(t, &mut out);
+                    self.settle(t, now, &mut out);
                 }
             }
             // The runner's word that the claim isn't live there and the run wasn't started under
             // it: the one word that sends a ticket past waiting back to waiting. The asker, told it
-            // was starting there, is told where it stands instead.
+            // was starting there, is told where it stands instead. An offer held lapsed: it waits
+            // there again, its place told next.
             ToOwner::Lapsed { fence, .. } => {
-                if matches!(stage, Stage::Taking { fence: f } | Stage::Held { fence: f } | Stage::Starting { fence: f } if f == fence) && here {
-                    if let Some(t) = self.tickets.get_mut(&run) {
-                        t.stage = Stage::Waiting;
-                        t.runner = None;
-                        t.got = None;
-                    }
-                    self.probe_afresh(&run, &mut out);
-                    self.answer(&run, &mut out);
+                if stage == Stage::Waiting && self.t(t).and_then(|tk| tk.offer_of(r)) == Some(fence) {
+                    self.unhold(t, r);
+                    self.set_word(t, r, Word::Asked);
+                    self.settle(t, now, &mut out);
+                } else if matches!(stage, Stage::Taking { fence: f } | Stage::Held { fence: f } | Stage::Starting { fence: f } if f == fence) && here {
+                    self.back_to_waiting(t);
+                    self.probe_afresh(t, &mut out);
+                    self.answer(t, &mut out);
                 }
             }
         }
@@ -999,26 +1397,32 @@ impl Owner {
     /// still may (its runner holds it under that claim). Once this says yes, the run's start has
     /// gone to that runner, and goes nowhere else unless it says it never started it.
     pub fn starting(&mut self, run: &str, runner: &str, fence: Fence) -> bool {
-        match self.tickets.get_mut(run) {
-            Some(t) if t.stage == (Stage::Held { fence }) && t.runner.as_deref() == Some(runner) => {
-                t.stage = Stage::Starting { fence };
+        let (Some(t), Some(r)) = (self.by_run.get(run).copied(), self.names.get(runner)) else { return false };
+        match self.t_mut(t) {
+            Some(tk) if tk.stage == (Stage::Held { fence }) && tk.runner == Some(r) => {
+                tk.stage = Stage::Starting { fence };
                 true
             }
             _ => false,
         }
     }
 
-    /// The asker doesn't want it any more: its probes are withdrawn and a claim it took declined.
-    /// A run starting or running is stopped by the shell, as any run is.
+    /// The asker doesn't want it any more: its probes are withdrawn, and a claim it took or an
+    /// offer it held declined. A run starting or running is stopped by the shell, as any run is.
     pub fn cancel(&mut self, run: &str) -> Vec<Act> {
         let mut out = Vec::new();
-        let Some(t) = self.remove(run) else { return out };
-        if let (Stage::Taking { fence } | Stage::Held { fence }, Some(r)) = (t.stage, t.runner.as_ref()) {
-            out.push(Act::Tell { runner: r.clone(), msg: ToRunner::Decline { run: run.to_owned(), fence } });
+        let Some(t) = self.by_run.get(run).copied() else { return out };
+        let Some(tk) = self.remove(t) else { return out };
+        if let (Stage::Taking { fence } | Stage::Held { fence }, Some(r)) = (tk.stage, tk.runner) {
+            out.push(Act::Tell { runner: self.name(r), msg: ToRunner::Decline { run: run.to_owned(), fence } });
         }
-        for (r, w) in &t.words {
-            if t.runner.as_ref() != Some(r) && !matches!(w, Word::Never(_)) {
-                out.push(Act::Tell { runner: r.clone(), msg: ToRunner::Withdraw { run: run.to_owned() } });
+        for (r, w) in &tk.words {
+            if tk.runner != Some(*r) && !matches!(w, Word::Never(_)) {
+                let msg = match tk.offer_of(*r) {
+                    Some(fence) => ToRunner::Decline { run: run.to_owned(), fence },
+                    None => ToRunner::Withdraw { run: run.to_owned() },
+                };
+                out.push(Act::Tell { runner: self.name(*r), msg });
             }
         }
         out
@@ -1028,9 +1432,10 @@ impl Owner {
     /// and its probes are withdrawn.
     pub fn fallback_started(&mut self, run: &str) -> Vec<Act> {
         let mut out = Vec::new();
-        if self.tickets.get(run).is_some_and(|t| t.stage == Stage::Fallback) {
-            self.withdraw_others(run, "", &mut out);
-            self.remove(run);
+        let Some(t) = self.by_run.get(run).copied() else { return out };
+        if self.t(t).is_some_and(|tk| tk.stage == Stage::Fallback) {
+            self.withdraw_others(t, None, &mut out);
+            self.remove(t);
         }
         out
     }
@@ -1039,46 +1444,62 @@ impl Owner {
     /// its probes still in their lines (offers it let lapse meanwhile went back to their places).
     pub fn fallback_refused(&mut self, run: &str) -> Vec<Act> {
         let mut out = Vec::new();
-        if let Some(t) = self.tickets.get_mut(run)
-            && t.stage == Stage::Fallback
+        let Some(t) = self.by_run.get(run).copied() else { return out };
+        if let Some(tk) = self.t_mut(t)
+            && tk.stage == Stage::Fallback
         {
-            t.stage = Stage::Waiting;
-            if t.words.is_empty() {
+            tk.stage = Stage::Waiting;
+            if tk.words.is_empty() {
                 // Only older runners could take it: it waits for one, or for a runner that places.
-                self.answer(run, &mut out);
+                self.answer(t, &mut out);
             } else {
-                self.heard_of(run, &mut out);
+                self.heard_of(t, &mut out);
             }
         }
         out
     }
 
-    /// The time: first answers due (a runner probed hasn't answered within its link's timeout)
-    /// are given with what's known.
+    /// The time: choices due (an offer held its time) are made with the offers held, and first
+    /// answers due (a runner probed hasn't answered within its link's timeout) are given with
+    /// what's known.
     pub fn tick(&mut self, now: i64) -> Vec<Act> {
         let mut out = Vec::new();
-        while let Some((at, run)) = self.due.first().cloned() {
+        while let Some(&(at, t)) = self.choose.first() {
             if at > now {
                 break;
             }
-            self.due.remove(&(at, run.clone()));
-            if let Some(t) = self.tickets.get_mut(&run) {
-                t.due = None;
+            self.choose.remove(&(at, t));
+            if let Some(tk) = self.t_mut(t) {
+                tk.choose_at = None;
             }
-            self.answer(&run, &mut out);
+            if self.t(t).is_some_and(|tk| tk.stage == Stage::Waiting && !tk.offers.is_empty()) {
+                self.choose_now(t, now, &mut out);
+            }
+        }
+        while let Some(&(at, t)) = self.due.first() {
+            if at > now {
+                break;
+            }
+            self.due.remove(&(at, t));
+            if let Some(tk) = self.t_mut(t) {
+                tk.due = None;
+            }
+            self.answer(t, &mut out);
         }
         out
     }
 
-    /// When it's to be told the time again ([`Self::tick`]): the soonest first answer due.
+    /// When it's to be told the time again ([`Self::tick`]): the soonest choice or first answer
+    /// due.
     pub fn timer(&self) -> Option<i64> {
-        self.due.first().map(|(at, _)| *at)
+        [self.choose.first().map(|(at, _)| *at), self.due.first().map(|(at, _)| *at)].into_iter().flatten().min()
     }
 
     /// Where a run's ticket stands, in a word, and its runner, if it has one.
     pub fn stage(&self, run: &str) -> Option<(&'static str, Option<&str>)> {
-        self.tickets.get(run).map(|t| {
-            let s = match t.stage {
+        let t = self.by_run.get(run)?;
+        self.t(*t).map(|tk| {
+            let s = match tk.stage {
                 Stage::Waiting => "waiting",
                 Stage::Taking { .. } => "taking",
                 Stage::Held { .. } => "held",
@@ -1086,25 +1507,37 @@ impl Owner {
                 Stage::Running { .. } => "running",
                 Stage::Fallback => "fallback",
             };
-            (s, t.runner.as_deref())
+            (s, tk.runner.map(|r| self.names.name(r)))
         })
     }
 
     /// What a run's asker was told last.
     pub fn told(&self, run: &str) -> Option<&Answer> {
-        self.tickets.get(run).and_then(|t| t.told.as_ref())
+        let t = self.by_run.get(run)?;
+        self.t(*t).and_then(|tk| tk.told.as_ref())
     }
 
     /// What a waiting run's asker would be told now, once its first answer has been given (for
     /// `needs.explain`, and the property that every waiting asker hears each change).
     pub fn answer_now(&self, run: &str) -> Option<Answer> {
-        let t = self.tickets.get(run).filter(|t| t.stage == Stage::Waiting && t.due.is_none() && t.told.is_some())?;
-        Some(self.queued(t))
+        let t = self.by_run.get(run)?;
+        let tk = self.t(*t).filter(|tk| tk.stage == Stage::Waiting && tk.offers.is_empty() && tk.due.is_none() && tk.told.is_some())?;
+        Some(self.queued(tk))
     }
 
-    /// Its tickets' runs.
+    /// Its tickets' runs, in order.
     pub fn runs(&self) -> Vec<String> {
-        self.tickets.keys().cloned().collect()
+        let mut runs: Vec<String> = self.by_run.keys().cloned().collect();
+        runs.sort_unstable();
+        runs
+    }
+
+    /// The runners a run is probed at now (for tests and views).
+    pub fn probed(&self, run: &str) -> Vec<String> {
+        let Some(tk) = self.by_run.get(run).and_then(|t| self.t(*t)) else { return Vec::new() };
+        let mut v: Vec<String> = tk.words.iter().map(|(r, _)| self.name(*r)).collect();
+        v.sort_unstable();
+        v
     }
 }
 

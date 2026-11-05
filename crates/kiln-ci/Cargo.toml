@@ -64,5 +64,10 @@ harness = false
 name = "place"
 harness = false
 
+# Placement's decision under the competitors' common trace (ci/bench/README.md, LB00/LB14).
+[[bench]]
+name = "lb_vs"
+harness = false
+
 [lints]
 workspace = true

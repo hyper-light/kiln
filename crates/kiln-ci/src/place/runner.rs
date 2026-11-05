@@ -49,6 +49,7 @@
 //!   line, the runs at the boundaries between powers of two are looked at, O(log n) of them.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::sync::Arc;
 
 use super::ask::{self, Amounts, Ask, Peer, Sample};
 use super::line::{Item, Key, Line, Query};
@@ -210,7 +211,8 @@ struct Charge {
 struct Probe {
     owner: u32,
     run: String,
-    ask: Ask,
+    /// The ask as its owner's probe shares it: never copied.
+    ask: Arc<Ask>,
     amounts: Amounts,
     predicted: Option<Ms>,
     state: State,
@@ -317,6 +319,10 @@ pub struct Admission {
     land_waiting: BTreeSet<(u64, u32)>,
     land_claims: BTreeSet<(u64, u32)>,
     watchers: BTreeSet<(u64, u32)>,
+    /// A probe just come, not told it waits until admitting has had its say in the same input: one
+    /// offered at once is told only the offer (an owner choosing between offers takes a word that
+    /// it waits for its answer, docs/needs.md §11, AUDIT P6), and a message is saved.
+    hush: Option<u32>,
 }
 
 fn ix(s: u32) -> usize {
@@ -371,6 +377,7 @@ impl Admission {
             land_waiting: BTreeSet::new(),
             land_claims: BTreeSet::new(),
             watchers: BTreeSet::new(),
+            hush: None,
         };
         a.remeasure();
         let _ = now;
@@ -1118,6 +1125,9 @@ impl Admission {
     }
 
     fn tell_if_changed(&mut self, s: u32, now: i64, out: &mut Vec<Said>) {
+        if self.hush == Some(s) {
+            return;
+        }
         let Some(rank) = self.rank_of(s) else { return };
         let told = self.told_of(s, rank);
         let Some(p) = self.get(s) else { return };
@@ -1369,13 +1379,13 @@ impl Admission {
     /// prediction from history, with this runner's disk among what it knows; `None`: unknown):
     /// answered with an offer, where it waits, that it never could, or that it ran it already; a
     /// probe again is answered as it stands.
-    pub fn probe(&mut self, from: Peer<'_>, ask: Ask, predicted: Option<Ms>, now: i64, out: &mut Vec<Said>) {
+    pub fn probe(&mut self, from: Peer<'_>, ask: impl Into<Arc<Ask>>, predicted: Option<Ms>, now: i64, out: &mut Vec<Said>) {
         self.begin(now, out);
-        self.probe_in(from, ask, predicted, now, out);
+        self.probe_in(from, ask.into(), predicted, now, out);
         self.close(now);
     }
 
-    fn probe_in(&mut self, from: Peer<'_>, ask: Ask, predicted: Option<Ms>, now: i64, out: &mut Vec<Said>) {
+    fn probe_in(&mut self, from: Peer<'_>, ask: Arc<Ask>, predicted: Option<Ms>, now: i64, out: &mut Vec<Said>) {
         let Some(o) = self.speaker(from, now, out) else { return };
         if self.recorded(from, &ask.run, out) {
             return;
@@ -1385,7 +1395,7 @@ impl Admission {
             return;
         }
         if let Some(why) = self.never(&ask) {
-            out.push((from.name.to_owned(), ToOwner::Never { run: ask.run, why }));
+            out.push((from.name.to_owned(), ToOwner::Never { run: ask.run.clone(), why }));
             return;
         }
         let amounts = ask::amounts(&ask.needs.request);
@@ -1420,10 +1430,13 @@ impl Admission {
         if away {
             return;
         }
-        // One change to the line at a time, each looked at: its arrival, then what admitting does.
+        // One change to the line at a time, each looked at: its arrival, then what admitting does;
+        // the run itself told where it stands once admitting has.
         self.enter(s);
+        self.hush = Some(s);
         self.boundaries(now, out);
         self.admit(now, out);
+        self.hush = None;
         self.boundaries(now, out);
         if self.get(s).is_some_and(|p| p.state == State::Waiting && p.told.is_none()) {
             self.tell_if_changed(s, now, out);

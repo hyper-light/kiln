@@ -4,6 +4,8 @@
 //! optional, and a message a peer doesn't know is one it ignores, so neither side breaks the link.
 //! The link itself says whose words they are: the owner's node and its epoch ([`super::ask::Peer`]).
 
+use std::sync::Arc;
+
 use serde::{Deserialize, Serialize};
 
 use super::ask::{Ask, DiskFacts};
@@ -14,8 +16,13 @@ use crate::sched::units::Ms;
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "op", rename_all = "snake_case")]
 pub enum ToRunner {
-    /// Keep this run's place in your line, and offer it to me once you have room for it.
-    Probe { ask: Box<Ask> },
+    /// Keep this run's place in your line, and offer it to me once you have room for it. The ask is
+    /// shared by every probe of the run, not copied (docs/needs.md §11, AUDIT P6); on the wire it's
+    /// the ask itself, as it was.
+    Probe {
+        #[serde(with = "shared")]
+        ask: Arc<Ask>,
+    },
     /// Forget it: it was placed elsewhere, ended, or is no longer wanted.
     Withdraw { run: String },
     /// I take your offer `fence`: hold its room for me until I start the run.
@@ -26,6 +33,23 @@ pub enum ToRunner {
     Start { run: String, fence: Fence },
     /// I heard how it ended (or that it ran here before): the record of it can go.
     Ack { run: String },
+}
+
+/// A shared ask, on the wire as the ask itself.
+mod shared {
+    use std::sync::Arc;
+
+    use serde::{Deserialize, Deserializer, Serialize, Serializer};
+
+    use super::Ask;
+
+    pub fn serialize<S: Serializer>(a: &Arc<Ask>, s: S) -> Result<S::Ok, S::Error> {
+        a.as_ref().serialize(s)
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<Arc<Ask>, D::Error> {
+        Ask::deserialize(d).map(Arc::new)
+    }
 }
 
 /// A runner's word to an owner about one of the owner's runs. Times are the runner's clock's:

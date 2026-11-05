@@ -133,7 +133,7 @@ impl Placer {
     /// Node `me` in `epoch`, its runner's facts and labels, its first reading and settings.
     pub fn new(me: &str, epoch: u64, facts: RunnerFacts, labels: Vec<String>, sample: Sample, settings: Settings, now: i64) -> Placer {
         let init = Init { me: me.to_owned(), epoch, facts: facts.clone(), labels: labels.clone(), sample, records: Records::new(), settings };
-        Placer { me: me.to_owned(), epoch, owner: Owner::new(me, epoch), admission: Admission::new(init, now), specs: BTreeMap::new(), started: BTreeMap::new(), machines: Vec::new(), facts, labels, away: std::collections::BTreeSet::new(), told_to: std::collections::BTreeSet::new() }
+        Placer { me: me.to_owned(), epoch, owner: Owner::seeded(me, epoch, rand::random()), admission: Admission::new(init, now), specs: BTreeMap::new(), started: BTreeMap::new(), machines: Vec::new(), facts, labels, away: std::collections::BTreeSet::new(), told_to: std::collections::BTreeSet::new() }
     }
 
     /// The directory came (or changed): the owner's machines, this one among them as it measures
@@ -212,7 +212,7 @@ impl Placer {
             self.admission.back(from, now, &mut said);
         }
         match e.msg {
-            ToRunner::Probe { ask } => self.admission.probe(from, *ask, None, now, &mut said),
+            ToRunner::Probe { ask } => self.admission.probe(from, ask, None, now, &mut said),
             ToRunner::Withdraw { run } => self.admission.withdraw(from, &run, now, &mut said),
             ToRunner::Take { run, fence } => self.admission.take(from, &run, fence, now, &mut said),
             ToRunner::Decline { run, fence } => self.admission.decline(from, &run, fence, now, &mut said),
@@ -358,7 +358,7 @@ impl Placer {
                     let mut said = Vec::new();
                     let me = Peer { name: &self.me, epoch: self.epoch };
                     match msg {
-                        ToRunner::Probe { ask } => self.admission.probe(me, *ask, None, now, &mut said),
+                        ToRunner::Probe { ask } => self.admission.probe(me, ask, None, now, &mut said),
                         ToRunner::Withdraw { run } => self.admission.withdraw(me, &run, now, &mut said),
                         ToRunner::Take { run, fence } => self.admission.take(me, &run, fence, now, &mut said),
                         ToRunner::Decline { run, fence } => self.admission.decline(me, &run, fence, now, &mut said),

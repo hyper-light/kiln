@@ -304,7 +304,7 @@ impl Sim {
             }
             plans.push(p);
         }
-        let owners = (0..n_owners).map(|i| OwnerNode { alive: true, life: 1, core: Owner::new(&oname(i), 1), died: None, starts: BTreeMap::new(), next_tick: None }).collect();
+        let owners = (0..n_owners).map(|i| OwnerNode { alive: true, life: 1, core: Owner::seeded(&oname(i), 1, draw.next_u64()), died: None, starts: BTreeMap::new(), next_tick: None }).collect();
         let rtt = Rtt { srtt: u64::try_from(slow).unwrap_or(0), rttvar: u64::try_from(slow / 2).unwrap_or(0), granularity: 1 };
         let mut s = Sim {
             rng,
@@ -727,7 +727,7 @@ impl Sim {
             };
             let Some(core) = self.runners.get_mut(j).and_then(|r| r.core.as_mut()) else { return };
             match msg {
-                ToRunner::Probe { ask } => core.probe(peer, *ask, predicted, now, &mut out),
+                ToRunner::Probe { ask } => core.probe(peer, ask, predicted, now, &mut out),
                 ToRunner::Withdraw { run } => core.withdraw(peer, &run, now, &mut out),
                 ToRunner::Take { run, fence } => core.take(peer, &run, fence, now, &mut out),
                 ToRunner::Decline { run, fence } => core.decline(peer, &run, fence, now, &mut out),
@@ -878,12 +878,16 @@ impl Sim {
                     core.back(Peer { name: &name, epoch: life }, rn, &mut out);
                 }
                 self.runner_said(runner, out);
-                // The owner: what its runner may have missed, said again.
+                // The owner: what its runner may have missed, said again. A new link means the one
+                // before it went, whether or not the owner heard so (its word of that is dropped as
+                // stale once this one is up): it's told, then told the link is back.
                 let theta = self.runners.get(runner).map_or(0, |r| r.theta);
                 let acts = match self.owners.get_mut(owner) {
                     Some(o) => {
                         o.core.link(&rname(runner), Link { rtt: Some(rtt), offset: Offset { theta, delta: 0 } });
-                        o.core.back(&rname(runner))
+                        let mut acts = o.core.away(&rname(runner));
+                        acts.extend(o.core.back(&rname(runner)));
+                        acts
                     }
                     None => Vec::new(),
                 };
@@ -1058,7 +1062,7 @@ impl Sim {
                     if let Some(o) = self.owners.get_mut(i) {
                         o.alive = true;
                         o.life = life;
-                        o.core = Owner::new(&oname(i), life);
+                        o.core = Owner::seeded(&oname(i), life, self.rng.stream(&format!("owner {i} life {life}")).next_u64());
                         o.next_tick = None;
                     }
                     self.directory();
