@@ -36,7 +36,7 @@ touching the copy Focal, Mantle and Quiver share.
 Behavior: upstream's, and kiln's own additions: the compute pool and an observer of each pool's jobs (goal 3),
 turns by time, a watchdog and task classes (goal 6, plan `01a1a59c2abe`, "Shards that protect themselves"),
 movable tasks that idle shards take from busy ones (goal 7, plan `01a1a59c2aea`, "Steering vs stealing"), and what
-held a shard past 100 µs by spawn site and label (goal 9, plan `01a1a87b2cec`). `src/`,
+held a shard past 100 µs by spawn site and label, and how much of it the host held, preempted (goal 9, plan `01a1a87b2cec`). `src/`,
 `tests/` and `benches/` are upstream's but for the rows below; `diff -r vendor/hyper-raft/crates/hyper-rt
 crates/kiln-rt` shows each row.
 

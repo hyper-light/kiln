@@ -66,20 +66,26 @@ impl Key {
     }
 }
 
-/// One entry: a key set once, then the polls it held and for how long.
+/// One entry: a key set once, then the polls it held and for how long, and those of them the host held.
 #[derive(Debug, Default)]
 struct Entry {
     key: OnceLock<Key>,
     polls: AtomicU64,
     total_ns: AtomicU64,
     longest_ns: AtomicU64,
+    host_polls: AtomicU64,
+    host_ns: AtomicU64,
 }
 
 impl Entry {
-    /// Counts one poll of `ns` (the writer's alone).
-    fn count(&self, ns: u64) {
+    /// Counts one poll of `ns`, the host's when `host` (the writer's alone).
+    fn count(&self, ns: u64, host: bool) {
         self.total_ns.fetch_add(ns, Ordering::Relaxed);
         self.longest_ns.fetch_max(ns, Ordering::Relaxed);
+        if host {
+            self.host_ns.fetch_add(ns, Ordering::Relaxed);
+            self.host_polls.fetch_add(1, Ordering::Relaxed);
+        }
         self.polls.fetch_add(1, Ordering::Relaxed);
     }
 
@@ -93,6 +99,8 @@ impl Entry {
             polls,
             total_ns: self.total_ns.load(Ordering::Relaxed),
             longest_ns: self.longest_ns.load(Ordering::Relaxed),
+            host_polls: self.host_polls.load(Ordering::Relaxed),
+            host_ns: self.host_ns.load(Ordering::Relaxed),
         })
     }
 }
@@ -115,12 +123,14 @@ impl Default for SlowTable {
 }
 
 impl SlowTable {
-    /// One poll that held the shard `ns`, by the task spawned at `site` with `label` set: the shard's own call.
+    /// One poll that held the shard `ns`, by the task spawned at `site` with `label` set, the host's when `host`
+    /// (see [`SlowPoll::host_polls`]): the shard's own call.
     pub(crate) fn note(
         &self,
         site: Option<&'static Location<'static>>,
         label: Option<&'static Label>,
         ns: u64,
+        host: bool,
     ) {
         let key = Key { site, label };
         let n = self.entries.len();
@@ -132,9 +142,9 @@ impl SlowTable {
             // The shard is the table's only writer: a free entry it finds is still free as it sets the key.
             Some(entry) => {
                 let _ = entry.key.set(key);
-                entry.count(ns);
+                entry.count(ns, host);
             }
-            None => self.rest.count(ns),
+            None => self.rest.count(ns, host),
         }
     }
 
@@ -163,6 +173,13 @@ pub struct SlowPoll {
     pub total_ns: u64,
     /// The longest of them, nanoseconds.
     pub longest_ns: u64,
+    /// Of them, the polls the host held: the shard's runtime found its thread runnable and off the CPU for the
+    /// poll (preempted, `crate::attribution`), which it finds out only for a poll past twice its step quantum,
+    /// so a shorter one is never counted here. Code didn't hold the shard in these: cores of its own would
+    /// (kiln's goal 9, plan 01a1a87b2cec steps 3 and 4).
+    pub host_polls: u64,
+    /// Their holds added up, nanoseconds.
+    pub host_ns: u64,
 }
 
 /// The slow polls of the shard `holder` names, as they stand (any thread; nothing of the shard's own is
@@ -184,10 +201,10 @@ mod tests {
     fn g9_s2_slow_polls_count_by_site_and_label() {
         let table = SlowTable::default();
         let here = Location::caller();
-        table.note(Some(here), Some(&ROUTE), 150_000);
-        table.note(Some(here), Some(&ROUTE), 450_000);
-        table.note(Some(here), Some(&OTHER), 200_000);
-        table.note(Some(here), None, 120_000);
+        table.note(Some(here), Some(&ROUTE), 150_000, false);
+        table.note(Some(here), Some(&ROUTE), 450_000, false);
+        table.note(Some(here), Some(&OTHER), 200_000, false);
+        table.note(Some(here), None, 120_000, false);
         let mut read = table.read();
         read.sort_by_key(|p| std::cmp::Reverse(p.total_ns));
         assert_eq!(read.len(), 3, "{read:?}");
@@ -204,12 +221,28 @@ mod tests {
         let table = SlowTable::default();
         let labels: Vec<&'static Label> = (0..ENTRIES + 5).map(|_| &*Box::leak(Box::new(Label { name: "a route" }))).collect();
         for label in &labels {
-            table.note(None, Some(label), 100_001);
+            table.note(None, Some(label), 100_001, false);
         }
         let read = table.read();
         assert_eq!(read.iter().map(|p| p.polls).sum::<u64>(), labels.len() as u64);
         let rest: Vec<&SlowPoll> = read.iter().filter(|p| p.label.is_none() && p.site.is_none()).collect();
         assert_eq!(rest.len(), 1);
         assert_eq!(rest[0].polls, 5);
+    }
+
+    /// Goal 9, plan 01a1a87b2cec steps 3 and 4: of an entry's polls, those the host held are counted apart, with
+    /// their time, in its count and total too: what held the shard that no code of it did.
+    #[test]
+    fn g9_s3_the_hosts_polls_are_counted_apart() {
+        let table = SlowTable::default();
+        let here = Location::caller();
+        table.note(Some(here), Some(&ROUTE), 600_000, true);
+        table.note(Some(here), Some(&ROUTE), 150_000, false);
+        table.note(Some(here), Some(&ROUTE), 900_000, true);
+        let read = table.read();
+        assert_eq!(read.len(), 1, "{read:?}");
+        let p = read[0];
+        assert_eq!((p.polls, p.total_ns, p.longest_ns), (3, 1_650_000, 900_000));
+        assert_eq!((p.host_polls, p.host_ns), (2, 1_500_000));
     }
 }

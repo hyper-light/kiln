@@ -233,14 +233,17 @@ const HELD_ROWS: usize = 25;
 
 /// What held a build's shards past 100 µs in `when` (the window or the fill; goal 9, plan 01a1a87b2cec step 2),
 /// in Markdown: each spawn site and label, its polls a second and the time they held a shard a second, each the
-/// mean over the rounds (a round it held nothing in counts as none), the mean hold and the longest seen.
+/// mean over the rounds (a round it held nothing in counts as none), the mean hold, the longest seen, and the
+/// share of its time the host held (preempted; steps 3 and 4): what no code of it held.
 fn held_markdown<'a>(rounds: impl Iterator<Item = &'a Round>, when: &str, of: fn(&Round) -> &[Held]) -> String {
+    /// Polls a second, ms a second, polls, ms, the longest ms, the host's ms.
+    type Row = (f64, f64, f64, f64, f64, f64);
     let rounds: Vec<&Round> = rounds.collect();
-    let mut by: BTreeMap<(String, String), (f64, f64, f64, f64, f64)> = BTreeMap::new();
+    let mut by: BTreeMap<(String, String), Row> = BTreeMap::new();
     for r in &rounds {
         for h in of(r) {
             let row = by.entry((h.site.clone(), h.label.clone())).or_default();
-            *row = (row.0 + h.polls_per_s, row.1 + h.ms_per_s, row.2 + h.polls, row.3 + h.ms, row.4.max(h.longest_ms));
+            *row = (row.0 + h.polls_per_s, row.1 + h.ms_per_s, row.2 + h.polls, row.3 + h.ms, row.4.max(h.longest_ms), row.5 + h.host_ms);
         }
     }
     let mut o = String::new();
@@ -249,13 +252,14 @@ fn held_markdown<'a>(rounds: impl Iterator<Item = &'a Round>, when: &str, of: fn
     }
     #[allow(clippy::cast_precision_loss)]
     let n = rounds.len().max(1) as f64;
-    let mut rows: Vec<((String, String), (f64, f64, f64, f64, f64))> = by.into_iter().collect();
+    let mut rows: Vec<((String, String), Row)> = by.into_iter().collect();
     rows.sort_by(|a, b| (b.1).1.total_cmp(&(a.1).1));
     let _ = writeln!(o, "\nWhat held the shards past 100 µs in {when} (spawn site and label; each a second, the mean of {} rounds):\n", rounds.len());
-    let _ = writeln!(o, "| site | label | polls a second | ms held a second | mean hold ms | longest ms |\n| --- | --- | --- | --- | --- | --- |");
-    for ((site, label), (polls_s, ms_s, polls, ms, longest)) in rows.into_iter().take(HELD_ROWS) {
+    let _ = writeln!(o, "| site | label | polls a second | ms held a second | mean hold ms | longest ms | host's share |\n| --- | --- | --- | --- | --- | --- | --- |");
+    for ((site, label), (polls_s, ms_s, polls, ms, longest, host_ms)) in rows.into_iter().take(HELD_ROWS) {
         let mean = if polls > 0.0 { ms / polls } else { 0.0 };
-        let _ = writeln!(o, "| {site} | {label} | {} | {} | {} | {} |", fmt(polls_s / n), fmt(ms_s / n), fmt(mean), fmt(longest));
+        let host = if ms > 0.0 { host_ms / ms } else { 0.0 };
+        let _ = writeln!(o, "| {site} | {label} | {} | {} | {} | {} | {} |", fmt(polls_s / n), fmt(ms_s / n), fmt(mean), fmt(longest), fmt(host));
     }
     o
 }
