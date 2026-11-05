@@ -5,7 +5,7 @@
 mod common;
 
 use common::*;
-use kiln_bp::client::ClientConfig;
+use kiln_bp::client::{ClientConfig, ClientEvent};
 use kiln_bp::frames::*;
 use kiln_bp::server::{ACK_NONCE, ACKS_OUT, Event, ServerConfig};
 
@@ -121,4 +121,70 @@ fn bp_g3_s3_every_message_is_at_most_a_chunk_and_reassembles() -> Result<(), Str
         }
     }
     Ok(())
+}
+
+/// Do: what goal 3's carrier does each turn (its window's room, a chunk at most, an acknowledgement
+/// asked a quarter-window apart or when the window is full), with a 40 KB answer to send over a link of
+/// 1 ms each way. Expect: the answer arrives whole, the window never passed by more than a chunk.
+#[test]
+fn bp_g3_s4_a_large_answer_goes_through_the_window() -> Result<(), String> {
+    use kiln_bp::window::{Config, Window};
+    const CHUNK: usize = 1_200;
+    let mut host = Host::new();
+    host.auto_answer = false;
+    let t = host.ticket("ada", 4, 0);
+    let mut p = Pair::open(&mut host, 1, ServerConfig { fragment: CHUNK - 26, ..Default::default() }, ClientConfig::default(), &t, 0);
+    p.up = Link::new(0.0, 1);
+    p.down = Link::new(0.0, 1);
+    let mut w = Window::new(Config::default());
+    let mut since_ask = 0u64;
+    p.client.request(9, Call::Http { method: Method::Get, path: "/x".into(), body: kiln_bp::Bytes::default() });
+    let mut answered = false;
+    let mut events = Vec::new();
+    for now in 0..20_000u64 {
+        for m in p.up.due(now) {
+            p.server.receive(&m, now, &mut host.tickets, &mut host.answers);
+        }
+        while let Some(e) = p.server.poll_event() {
+            match e {
+                Event::Request { id, .. } if !answered => {
+                    answered = true;
+                    p.server.answer(id, Outcome::Reply { status: 200, body: kiln_bp::Bytes(vec![b'z'; 40_000]) }, None, kiln_bp::conn::Trust::Secret, &mut host.answers, now);
+                }
+                Event::Acked { got, rtt, at } => w.on_ack(now, got, rtt, at, false),
+                _ => {}
+            }
+        }
+        if w.stalled(CHUNK as u64, p.server.acks_out()) {
+            p.server.ask_ack();
+        }
+        let room_w = usize::try_from(w.room()).unwrap_or(usize::MAX);
+        let room = (CHUNK - 10).min(room_w).max(24);
+        if let Some(tx) = p.server.poll_transmit(room, now) {
+            let n = tx.bytes.len() as u64;
+            w.on_sent(n);
+            since_ask += n;
+            if since_ask >= w.ack_every(CHUNK as u64) {
+                p.server.ask_ack();
+                since_ask = 0;
+            }
+            if w.in_flight() > w.window() + CHUNK as u64 {
+                return Err(format!("in flight {} past window {}", w.in_flight(), w.window()));
+            }
+            p.down.send(now, tx.bytes);
+        }
+        for m in p.down.due(now) {
+            p.client.receive(&m, now);
+        }
+        while let Some(e) = p.client.poll_event() {
+            events.push(e);
+        }
+        if let Some(tx) = p.client.poll_transmit(1 << 16, now) {
+            p.up.send(now, tx.bytes);
+        }
+        if events.iter().any(|e| matches!(e, ClientEvent::Answer { id: 9, .. })) {
+            return Ok(());
+        }
+    }
+    Err(format!("no answer; window {} in flight {} acks out {}", w.window(), w.in_flight(), p.server.acks_out()))
 }

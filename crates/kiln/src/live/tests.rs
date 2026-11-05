@@ -65,3 +65,22 @@ fn bp_g3_s3_a_sockets_numbers_read_whole() {
     super::render(&mut out);
     assert!(out.contains("kiln_proto_sockets_opened_total"));
 }
+
+/// bp-g3 step 2: a request's read runs through the API's own routes as the caller and comes back whole;
+/// the protocol's own endpoint and paths outside the API are refused.
+#[test]
+fn bp_g3_s2_a_read_runs_through_the_apis_routes() -> anyhow::Result<()> {
+    crate::rt::block_on(async {
+        let hub = crate::hub::tests::scratch_hub().await?;
+        let read = crate::rt::timeout(std::time::Duration::from_secs(20), crate::api::live_read(std::sync::Arc::clone(&hub), crate::authz::Caller::owner(), "/api/system", 1 << 20)).await;
+        let (status, body) = read.map_err(|_| anyhow::anyhow!("the read took past 20 s"))?;
+        anyhow::ensure!(status == 200, "{status}: {}", String::from_utf8_lossy(&body));
+        let v: serde_json::Value = serde_json::from_slice(&body)?;
+        anyhow::ensure!(v.get("runtime").is_some(), "{v}");
+        let (status, _) = crate::api::live_read(std::sync::Arc::clone(&hub), crate::authz::Caller::owner(), "/api/live/sockets", 1 << 20).await;
+        anyhow::ensure!(status == 404, "the protocol's own endpoint: {status}");
+        let (status, _) = crate::api::live_read(hub, crate::authz::Caller::owner(), "/healthz", 1 << 20).await;
+        anyhow::ensure!(status == 404, "outside the API: {status}");
+        Ok(())
+    })
+}

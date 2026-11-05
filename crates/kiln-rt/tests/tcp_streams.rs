@@ -420,10 +420,9 @@ fn bp_g3_s1_an_options_handle_sets_the_streams_own_socket() {
             TcpListener::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)), BACKLOG).unwrap();
         let client = TcpStream::connect(listener.local_addr().unwrap()).await.unwrap();
         let server = listener.accept().await.unwrap();
-        let Some(handle) = server.options().unwrap() else {
-            assert!(cfg!(windows), "Unix makes a handle");
-            return;
-        };
+        let handle = server.options().unwrap();
+        assert_eq!(handle.is_some(), cfg!(unix), "Unix makes a handle, Windows none");
+        let Some(handle) = handle else { return };
         if handle.set_notsent_lowat(LOWAT).unwrap() {
             assert_eq!(server.notsent_lowat().unwrap(), Some(LOWAT), "the stream's own socket");
         }

@@ -204,12 +204,11 @@ fn bp_g3_s2_a_subscription_a_request_and_a_malformed_frame() -> anyhow::Result<(
     // A malformed frame: answered typed, and the socket stays open for the next request.
     send_binary(&mut page.s, &[0xff; 12])?;
     page.until("the refusal", |e| e.iter().any(|e| matches!(e, ClientEvent::Unread { .. })))?;
-    page.client.request(8, Call::Http { method: Method::Get, path: "/api/live/sockets".into(), body: kiln_bp::Bytes::default() });
-    page.until("an answer after it", |e| e.iter().any(|e| matches!(e, ClientEvent::Answer { id: 8, .. })))?;
-    let sockets = page.events.iter().find_map(|e| match e {
-        ClientEvent::Answer { id: 8, outcome: Outcome::Reply { body, .. }, .. } => serde_json::from_slice::<Value>(&body.0).ok(),
-        _ => None,
-    });
+    page.client.request(8, Call::Http { method: Method::Get, path: "/api/overview".into(), body: kiln_bp::Bytes::default() });
+    page.until("an answer after it", |e| e.iter().any(|e| matches!(e, ClientEvent::Answer { id: 8, outcome: Outcome::Reply { status: 200, .. }, .. })))?;
+    let (code, body) = http(port, "GET", "/api/live/sockets", &admin, None)?;
+    assert_eq!(code, 200);
+    let sockets: Option<Value> = serde_json::from_str(&body).ok();
     let held = sockets.as_ref().and_then(|v| v.get("sockets")).and_then(Value::as_array).map_or(0, Vec::len);
     assert_eq!(held, 1, "one socket held: {sockets:?}");
     // A write over the protocol is goal 9's: refused, not run.
