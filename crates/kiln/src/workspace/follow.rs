@@ -494,7 +494,7 @@ mod tests {
     #[test]
     fn g4_s5_the_follower_reads_only_the_kinds_it_follows() -> anyhow::Result<()> {
         use crate::wire::events::{ServerEvent, is_one_of};
-        anyhow::ensure!(!is_one_of(&crate::wire::events::harness_frame(&serde_json::to_vec(&crate::harness::session::Info { id: "s".into(), kind: "claude".into(), ..Default::default() })?).to_string(), &FOLLOWS) && !is_one_of(&ServerEvent::Terminals.text(), &FOLLOWS));
+        anyhow::ensure!(!is_one_of(&crate::wire::events::harness_frame(&serde_json::to_vec(&crate::harness::session::Info { id: "s".into(), kind: "claude".into(), ..Default::default() })?).as_ref(), &FOLLOWS) && !is_one_of(&ServerEvent::Terminals.text(), &FOLLOWS));
         for text in [ServerEvent::Comment(Box::default()).text(), ServerEvent::Queue(crate::wire::events::Queue::Counts { queued: 1, running: 0 }).text(), r#"{"type":"landed","repo":"r"}"#.to_owned()] {
             anyhow::ensure!(is_one_of(&text, &FOLLOWS), "{text}");
         }

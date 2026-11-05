@@ -703,7 +703,7 @@ mod tests {
         for slot in 1..=6 {
             q.push(slot, 0);
         }
-        let class_of = |slot: u32| usize::from(slot % 3 != 1) + usize::from(slot % 3 == 0);
+        let class_of = |slot: u32| usize::from(slot % 3 != 1) + usize::from(slot.is_multiple_of(3));
         let (mut ran, mut polls) = ([0u64; 3], [0u64; 3]);
         let mut first = Vec::new();
         for round in 0..3_000 {

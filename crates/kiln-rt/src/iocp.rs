@@ -559,6 +559,30 @@ pub fn post_kick(port: usize) {
     unsafe { PostQueuedCompletionStatus(handle, 0, KICK_KEY, std::ptr::null_mut()) };
 }
 
+impl IocpDriver {
+    /// A wait's timeout in milliseconds, its precise timer armed for a timed wait or disarmed for an untimed
+    /// one: the timer ends a timed wait when due, the wait's own timeout only backing it (0 once it has fired).
+    fn arm_wait(&mut self, timeout_ns: Option<u64>) -> u32 {
+        /// Format: nanoseconds per millisecond.
+        const NANOS_PER_MILLI: u64 = 1_000_000;
+        /// Format: INFINITE.
+        const INFINITE: u32 = u32::MAX;
+        let timeout_ms = timeout_ns.map_or(INFINITE, |ns| u32::try_from(ns.div_ceil(NANOS_PER_MILLI)).unwrap_or(INFINITE - 1));
+        match (timeout_ns, self.precise.as_mut()) {
+            // A zero timeout needs no timer.
+            (Some(0), _) | (_, None) => timeout_ms,
+            (Some(ns), Some(precise)) => {
+                if let Armed::Signaled = precise.arm(self.port, ns) { 0 } else { timeout_ms }
+            }
+            // An untimed wait first disarms what an earlier one left, or that timer would end it.
+            (None, Some(precise)) => {
+                precise.disarm();
+                timeout_ms
+            }
+        }
+    }
+}
+
 impl Driver for IocpDriver {
     fn kind(&self) -> DriverKind {
         DriverKind::Iocp
@@ -577,25 +601,7 @@ impl Driver for IocpDriver {
     }
 
     fn wait(&mut self, timeout_ns: Option<u64>, out: &mut Vec<Completion>) -> Result<(), RtError> {
-        /// Format: nanoseconds per millisecond.
-        const NANOS_PER_MILLI: u64 = 1_000_000;
-        /// Format: INFINITE.
-        const INFINITE: u32 = u32::MAX;
-        let mut timeout_ms = timeout_ns.map_or(INFINITE, |ns| {
-            u32::try_from(ns.div_ceil(NANOS_PER_MILLI)).unwrap_or(INFINITE - 1)
-        });
-        match (timeout_ns, self.precise.as_mut()) {
-            // A zero timeout needs no timer.
-            (Some(0), _) | (_, None) => {}
-            // The timer ends a timed wait when due; the wait's own timeout only backs it.
-            (Some(ns), Some(precise)) => {
-                if let Armed::Signaled = precise.arm(self.port, ns) {
-                    timeout_ms = 0;
-                }
-            }
-            // An untimed wait first disarms what an earlier one left, or that timer would end it.
-            (None, Some(precise)) => precise.disarm(),
-        }
+        let timeout_ms = self.arm_wait(timeout_ns);
         let mut count: u32 = 0;
         let capacity = u32::try_from(self.entries.len()).unwrap_or(u32::MAX);
         // SAFETY: the entry buffer holds `capacity` records and `count` is writable.

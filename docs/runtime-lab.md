@@ -1039,7 +1039,9 @@ CPUs):
 
 With `PROF=1` each configuration gets one round more with perf recording the server over its window
 (`hook.sh`), kept apart from the measured rounds; every round's hook writes which CPUs each of the
-server's threads and children may run on as its window ends (`affinity.txt`).
+server's threads and children may run on as its window ends (`affinity.txt`). `PERF_FROM=fill` starts
+perf at the fill's start (sessions' Open), `PERF_FROM=server` at the server's, before its runners
+connect (their Build and ReachHello); either way it stops as the window ends.
 
 ```sh
 # the calm baseline below: the lab on 0-7 and the server on 16-23, beside another lab on the rest

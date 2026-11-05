@@ -4848,7 +4848,7 @@ mod tests {
                     let runner = |update: Update| crate::harness::copies::RunnerUpdate { peer: 7, agent: "box".into(), session: id.clone(), update, shipped: false, arrived: None, handed: None };
                     let mut n = 0u64;
                     while n < per {
-                        let run = if n % 4 == 0 { 8.min(per - n) } else { 1 };
+                        let run = if n.is_multiple_of(4) { 8.min(per - n) } else { 1 };
                         let events: Vec<Event> = (n + 1..=n + run).map(|q| Event { id: format!("{id}-e{q}"), seq: q, at: 1, parent: None, by: None, body: Body::Assistant { text: String::new(), streaming: true } }).collect();
                         hub.harness.from_runner(runner(Update::Events { events })).await;
                         for q in n + 1..=n + run {
@@ -4858,7 +4858,7 @@ mod tests {
                         }
                         n += run;
                         hub.harness.from_runner(runner(Update::State { state: Box::new(State { summary: format!("through {n}"), ..State::default() }) })).await;
-                        if n % 2 == 0 {
+                        if n.is_multiple_of(2) {
                             crate::rt::sleep(std::time::Duration::from_millis(2)).await;
                         }
                     }
