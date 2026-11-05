@@ -1728,7 +1728,7 @@ a heap profile of the merged tree (below) say what's there now.
 | What holds it | train 4 | now | Whose | Where it stands |
 | --- | --- | --- | --- | --- |
 | the events socket's feed: 4,096 frames, most an agent's whole info | (not in that tree) | est. 8 to 10 | kiln (`wire::events::feed`, main's W21-R15) | cut, on train 8's tree with main's (branch `g11s5-anon-feed`): below |
-| session copies: each event's meta, its id and its index entry, the newest page or not | 8.7: `Events::compact` 3.16 (compact chunks' metas), the ids among `Registry::apply`'s 5.25, `Mirror::upsert` 2.65 (the index) | est. 8 (about 45,000 events at 180 bytes) | kiln (`harness::copies`) | below: about 2 MB can go; not cut here |
+| session copies: each event's meta, its id and its index entry, the newest page or not | 8.7: `Events::compact` 3.16 (compact chunks' metas), the ids among `Registry::apply`'s 5.25, `Mirror::upsert` 2.65 (the index) | est. 8 (about 45,000 events at 180 bytes) | kiln (`harness::copies`) | cut: ids in their metas, the index by hash (below): est. 2.4 off |
 | session copies: open chunks' texts and the newest page's | 4.7 (`Entry::of_event`) | 6.8 (`session_entries`, g11pages) | kiln | at its basis: each copy's newest chunk as text |
 | hyper-log's read pool and zero-fill buffer; hyper-durable's log entries | 16.4; 5.8 | the same | vendored hyper-raft | not kiln's: READY 1's vendor patches |
 | the bus's frames | 9.5 | 6.9 to 7.7 (`bus`) | vendored quiver, kiln's bounds | at what its topics retain |
@@ -1761,13 +1761,18 @@ newest is sent the newest. The cut:
 its id's own allocation (two counts and 30 to 36 bytes: jemalloc's 48 or 64-byte class) and its entry in
 the copy's index (`HashMap<Arc<str>, usize>`, 24 bytes a bucket, 8,192 buckets for a copy of 4,000 to 5,000
 events: 224 KiB): about 180 bytes an event. The realistic profile keeps about 45,000 (2 copies at 4,000 to
-5,000, 6 at 4,000 to 5,000, 24 at 400): est. 8 MB, train 4's 8.7. What would take about 2.2 MB off, all in
-`harness/copies.rs` (`registry.rs` reads a meta's offset, length, number and revision alone): a chunk's ids
-in one allocation, a meta saying where its id is in them (64 bytes a meta), and the index keyed by a 64-bit
-hash of the id to the event's place (16 bytes a bucket), each hit checked against the id in its chunk (in
-memory, spilled or not) and the rare collision kept apart in a small map by id. Not made here: most of the
-copy's index upkeep changes with it (drains, cuts, re-indexing), in a file every item shares; it's a step of
-its own once the lab says what the feed and jemalloc's settings gave.
+5,000, 6 at 4,000 to 5,000, 24 at 400): est. 8 MB, train 4's 8.7. The cut, all in `harness/copies.rs`
+(`registry.rs` reads a meta's offset, length, number and revision alone):
+- An id is kept in its meta (`copies::Id`), up to 38 bytes (a UUID either way, kiln's 32 hex digits, a
+  harness's `msg_` and `toolu_` ids), a longer one boxed: a meta is 96 bytes and the id no allocation of its
+  own, against 72 and 48 to 64. About 40 bytes an event.
+- The index (`copies::Index`) is keyed by a hash of the id (the process's own key), 16 bytes a bucket against
+  24, each place it finds checked against the id its event's meta keeps (in memory, its chunk spilled or not),
+  and an id whose hash another's place already has kept apart by itself. As events go from the copy's front or
+  past a number, its places move by position (`Index::drop_front`, `Index::retain`), as the ids' lists the
+  drains made did, with none of those lists made.
+- Expected: est. 2.4 MB less in the realistic profile (1.8 the metas, 0.6 the index), more for longer sessions'
+  copies; `harness::copies::Meta::of` and `Mirror::upsert` in a heap profile say it.
 
 **Per-connection and per-shard buffers.** kiln-http keeps per thread a 64 KiB scratch buffer and at most 64
 write buffers of at most 64 KiB, and the API's encode buffer at most 64 KiB (`ENCODE_KEPT`); the sockets read
@@ -1811,7 +1816,7 @@ most about 96 to 101 MB, from alloc2's 207. What's cut since alloc2, est.: SQLit
 transport's spares 7, cold workers' caches and stacks 2 to 4, observe's index 2.2, 16 KiB reads 1.6, the feed
 8 (against main's), so about 175 to 180 MB with main's feed in. jemalloc's settings can take at most what
 `dirty`, `thread_caches` and slack hold (step 1 of the A/B says it; est. 30 to 50 MB). The rest has to come
-from the live heap, est. 85 MB: what's named above that kiln holds (copies' metas 2.2 to cut, observe's 7
+from the live heap, est. 85 MB: what's named above that kiln holds (copies' metas 2.4, cut above; observe's 7
 to put an owner on, websockets' buffers 2.4) and what the vendored projects hold (hyper-log's and
 hyper-durable's 22, QUIC's 5, turso's 8 outside jemalloc), which their owners' patches would cut.
 
