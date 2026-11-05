@@ -785,7 +785,31 @@ impl View {
     /// What this copy has of its events, said in digests (`crate::wire::sums`): each event's
     /// digest is of its text, written out once, however many ask.
     pub fn kept(&self, session: &str) -> crate::proto::KeptSession {
-        let mut events: Vec<(u64, u64)> = self.events.chunks().iter().flat_map(|c| c.metas().iter().zip(c.evs())).filter(|(m, _)| !m.id.is_empty()).filter_map(|(m, e)| Some((m.seq?, m.sum(e)))).collect();
+        let mut events: Vec<(u64, u64)> = Vec::new();
+        for c in self.events.chunks() {
+            let metas = c.metas();
+            // A digest made is taken as it is (a packed chunk's are all made: packing makes them); a
+            // chunk's events are read only for the digests still missing, as a compact chunk gives them
+            // by inflating its segment (goal 11, plan 01a1a87b2e56 step 2).
+            let evs = if metas.iter().any(|m| !m.id.is_empty() && m.sum_made().is_none()) {
+                match c.evs() {
+                    Ok(evs) => Some(evs),
+                    Err(e) => {
+                        // Said less of than it has: its runner sends those events again.
+                        tracing::warn!(session, error = %e, "a chunk's events couldn't be read for their digests");
+                        None
+                    }
+                }
+            } else {
+                None
+            };
+            for (i, m) in metas.iter().enumerate().filter(|(_, m)| !m.id.is_empty()) {
+                let sum = m.sum_made().or_else(|| evs.as_ref().and_then(|evs| evs.get(i)).map(|e| m.sum(e)));
+                if let (Some(seq), Some(sum)) = (m.seq, sum) {
+                    events.push((seq, sum));
+                }
+            }
+        }
         events.sort_unstable_by_key(|(seq, _)| *seq);
         crate::wire::sums::kept(session.to_owned(), self.info.epoch, &events)
     }
@@ -1716,7 +1740,8 @@ mod tests {
             }
             for c in m.events.chunks().iter().take(3) {
                 assert!(c.metas().iter().all(|meta| meta.sum_made().is_some()), "a packed chunk's digests are all there");
-                for (meta, e) in c.metas().iter().zip(c.evs()) {
+                let evs = c.evs()?;
+                for (meta, e) in c.metas().iter().zip(evs.iter()) {
                     assert_eq!(meta.sum(e), e.entry.sum());
                 }
             }
