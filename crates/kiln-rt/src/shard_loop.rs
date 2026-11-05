@@ -200,6 +200,33 @@ counters! {
     queue_ns_background,
     /// Polls of Background tasks.
     queue_polls_background,
+    /// Parks the shard announced and withdrew without a wait, an inbox already holding work: no system call
+    /// (kiln's goal 9, plan 01a1a87b2cec step 5, what wakes cost a shard; the parks that waited are
+    /// [`Counters::waits`]).
+    parks_withdrawn,
+    /// Driver waits that returned for a kick: a wake or a message from another thread while the shard was
+    /// parked, one kick however many senders woke it ([`crate::driver::Driver::kicks_taken`]).
+    woken_by_kick,
+    /// Driver waits that returned for I/O and no kick: a socket's readiness, a completion.
+    woken_by_io,
+    /// Driver waits that returned for neither: the deadline they waited for (a timer's), or a signal.
+    woken_by_timer,
+    /// Kicks this shard's thread made to parked shards: each a system call here (an eventfd's write, a
+    /// `kevent`, a posted packet), counted by the sender as it claims the park's kick.
+    kicks_sent,
+    /// Wakes and messages sent to this shard that found it running, or its park's kick claimed already: the
+    /// kicks the parking word saved its senders (`crate::parking::Parking::kicks_skipped`), read as the
+    /// counters are taken.
+    kicks_saved,
+    /// Wakes this shard's thread made to tasks of its own through their wakers (a channel's send, a
+    /// broadcast's subscribers, a cell's publisher): each lists the task on this desk.
+    wakes_sent_local,
+    /// Wakes this shard's thread made to tasks of other shards through their wakers: each a bit in the
+    /// target's wake bitmap, and a kick where the target was parked ([`Counters::kicks_sent`]).
+    wakes_sent_foreign,
+    /// Threads this shard's thread unparked: compute pool workers woken for the jobs it queued, a thread waiting
+    /// on what its task published; each a system call here (a futex wake on Linux).
+    threads_woken,
 }
 
 /// Shape: the exponential-forgetting shift of the measured scheduler overrun — an overrun not renewed
@@ -1432,6 +1459,7 @@ impl Shard {
             },
         );
         let Parked::Waited(woken) = parked else {
+            count(&self.desk.live.parks_withdrawn, 1);
             return (false, lost);
         };
         if let Some(woken) = woken {
@@ -1653,14 +1681,26 @@ impl Shard {
     }
 
     /// The driver's blocking wait until a kick, a completion or `deadline_ns`, its completions queued; true
-    /// when the driver was lost.
+    /// when the driver was lost. Each wait is counted by what ended it (kiln's goal 9, plan 01a1a87b2cec step 5):
+    /// a kick (the driver's count of them moved), else I/O (completions came), else its deadline.
     fn wait_in_driver(&mut self, deadline_ns: Option<u64>) -> bool {
         count(&self.desk.live.waits, 1);
         if let Some(entry) = self.desk.entry {
             entry.pulse.record_waits(self.desk.live.waits.get());
         }
         let timeout = deadline_ns.map(|d| d.saturating_sub(self.core.driver.now_ns()));
-        let _ = self.receive_completions(timeout);
+        let kicks = self.core.driver.kicks_taken();
+        let harvested = self.receive_completions(timeout);
+        if !self.core.driver_lost {
+            let by = if self.core.driver.kicks_taken() != kicks {
+                &self.desk.live.woken_by_kick
+            } else if harvested {
+                &self.desk.live.woken_by_io
+            } else {
+                &self.desk.live.woken_by_timer
+            };
+            count(by, 1);
+        }
         self.core.driver_lost
     }
 
@@ -2397,3 +2437,7 @@ fn unlink_child(tasks: &mut Vec<TaskSlot>, parent: u32, child: u32) {
         nx.prev_sibling = prev;
     }
 }
+
+// Kiln's goal 9, plan 01a1a87b2cec step 5: what parks and wakes are counted as.
+#[cfg(test)]
+mod wake_counts;
