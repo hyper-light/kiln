@@ -516,6 +516,15 @@ impl Server {
         if sync && !self.session.is_empty() && !env.iter().any(|(k, _)| k == super::keeper::AGENT_ENV) {
             env.push((super::keeper::AGENT_ENV.to_owned(), self.session.clone()));
         }
+        let id = {
+            let mut n = self.next.lock().map_err(|_| "busy".to_owned())?;
+            *n += 1;
+            format!("r{}", *n)
+        };
+        // Its runner tells this agent placement's answers for it under the line this server
+        // follows it by (AUDIT O5): what it's called goes with it, for the runner alone.
+        let telling = super::told::Telling::begin(&self.sock, &id, args);
+        env.extend(telling.names());
         let req = RunReq {
             target: run_target(args, self.prefer.as_deref())?,
             command,
@@ -533,13 +542,8 @@ impl Server {
         let mut client = Client::connect(&self.sock).map_err(|e| format!("{e:#}"))?;
         let reuse = args.get("reuse").and_then(Value::as_bool).unwrap_or(false);
         client.send(&if reuse { Req::RunReuse(Box::new(req)) } else { Req::Run(Box::new(req)) }).map_err(|e| format!("{e:#}"))?;
-        let id = {
-            let mut n = self.next.lock().map_err(|_| "busy".to_owned())?;
-            *n += 1;
-            format!("r{}", *n)
-        };
         let signal = client.sender().ok();
-        let cell: Cell = Arc::new((Mutex::new(Run { signal, telling: super::told::Telling::begin(&self.sock, &id, args), ..Run::default() }), std::sync::Condvar::new()));
+        let cell: Cell = Arc::new((Mutex::new(Run { signal, telling, ..Run::default() }), std::sync::Condvar::new()));
         if let Ok(mut runs) = self.runs.lock() {
             runs.insert(id.clone(), Arc::clone(&cell));
         }

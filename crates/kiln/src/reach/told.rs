@@ -47,8 +47,8 @@ use super::wire::Say;
 
 /// The named feature a server says when it takes news of its agents' runs (docs/wire.md, "Named
 /// features"; it was capability bit 58, which four branches claimed).
-// TODO(lb/core Features): add to `proto::feature::ALL`; the runner's `ServerMsg::Features` handler calls `server_features(&names)`.
-pub const FEATURE: &str = "told";
+/// In `proto::feature::ALL`; the runner's `ServerMsg::Features` handler calls [`server_features`].
+pub const FEATURE: &str = crate::proto::feature::TOLD;
 
 /// Why a run's end isn't known: what followed it went.
 const STOPPED: &str = "stopped: the kiln MCP server that followed it ended (its agent's harness started again, or ended)";
@@ -75,6 +75,11 @@ struct Entry {
     /// A detached run's output so far, its end ([`LINE_SHARE`]): its news's tail once it ends.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     tail: String,
+    /// Placement's answer for the run ([`Answers`], AUDIT O5), not what follows it: it goes as
+    /// `Question::Answer`, kept apart from the follower's news of the same run, so neither stands
+    /// for the other here; the server folds both into the run's one line.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    answer: bool,
 }
 
 /// Where a detached run is followed: run `run` of reach session `session` on `peer` (none: it ran
@@ -158,7 +163,7 @@ fn merge(kept: Vec<Entry>) -> Vec<Entry> {
     st.loaded = true;
     let mut resume = Vec::new();
     for mut e in kept {
-        if st.entries.iter().any(|m| m.news.key == e.news.key && m.session == e.session) {
+        if st.entries.iter().any(|m| m.news.key == e.news.key && m.session == e.session && m.answer == e.answer) {
             continue;
         }
         st.seq += 1;
@@ -262,6 +267,16 @@ fn will_tell() -> bool {
 /// none: this runner): into the outbox, after what's there, of each run its latest only. The same
 /// again is no news (T9), nor is what an MCP server says again of a run it told was over.
 pub fn say(session: &str, news: RunNews, by: Option<u32>) {
+    put(session, news, by, false);
+}
+
+/// Placement's answer `news` for a run of agent session `session`'s ([`Answers`]): into the
+/// outbox as [`say`] puts news, apart from what follows the run.
+fn say_answer(session: &str, news: RunNews) {
+    put(session, news, None, true);
+}
+
+fn put(session: &str, news: RunNews, by: Option<u32>, answer: bool) {
     if session.is_empty() || news.key.is_empty() {
         return;
     }
@@ -275,7 +290,7 @@ pub fn say(session: &str, news: RunNews, by: Option<u32>) {
         }
         st.seq += 1;
         let seq = st.seq;
-        match st.entries.iter_mut().find(|e| e.news.key == news.key && e.session == session) {
+        match st.entries.iter_mut().find(|e| e.news.key == news.key && e.session == session && e.answer == answer) {
             Some(e) if news == e.news || news.event < e.news.event => return,
             Some(e) => {
                 e.news = news;
@@ -283,7 +298,7 @@ pub fn say(session: &str, news: RunNews, by: Option<u32>) {
                 e.seq = seq;
                 e.by = by.or(e.by);
             }
-            None => st.entries.push(Entry { session: session.to_owned(), news, sent: false, seq, by, resume: None, tail: String::new() }),
+            None => st.entries.push(Entry { session: session.to_owned(), news, sent: false, seq, by, resume: None, tail: String::new(), answer }),
         }
     }
     persist();
@@ -301,18 +316,19 @@ async fn forward(handle: Handle) {
         let news_ear = NEWS.listen();
         let next = {
             let st = STATE.lock();
-            if st.up && st.takes { st.entries.iter().filter(|e| !e.sent).min_by_key(|e| e.seq).map(|e| (e.session.clone(), e.news.clone())) } else { None }
+            if st.up && st.takes { st.entries.iter().filter(|e| !e.sent).min_by_key(|e| e.seq).map(|e| (e.session.clone(), e.news.clone(), e.answer)) } else { None }
         };
-        let Some((session, news)) = next else {
+        let Some((session, news, answer)) = next else {
             news_ear.await;
             tries = 0;
             continue;
         };
-        let ask = match serde_json::to_string(&super::Question::Told { session: session.clone(), news: news.clone() }) {
+        let question = if answer { super::Question::Answer { session: session.clone(), news: news.clone() } } else { super::Question::Told { session: session.clone(), news: news.clone() } };
+        let ask = match serde_json::to_string(&question) {
             Ok(a) => a,
             Err(e) => {
                 tracing::warn!(target: "kiln.reach", error = %e, "news of a run that can't be written");
-                answered(&session, &news, false);
+                answered(&session, &news, answer, false);
                 continue;
             }
         };
@@ -333,7 +349,7 @@ async fn forward(handle: Handle) {
                 if let Some(why) = &refused {
                     tracing::info!(target: "kiln.reach", %session, run = %news.key, %why, "the server didn't take news of a run");
                 }
-                answered(&session, &news, refused.is_some());
+                answered(&session, &news, answer, refused.is_some());
             }
             Some(Err(_)) | None => {
                 tries = tries.saturating_add(1);
@@ -353,17 +369,18 @@ async fn forward(handle: Handle) {
 }
 
 /// The server answered `news` (`refused`: it didn't take it, and won't): it has it, unless later
-/// news came meanwhile; a run over is followed no more.
-fn answered(session: &str, news: &RunNews, refused: bool) {
+/// news came meanwhile; a run over is followed no more, and placement's answer, once the server
+/// has it, is kept no more (the server keeps the run's line).
+fn answered(session: &str, news: &RunNews, answer: bool, refused: bool) {
     {
         let mut st = STATE.lock();
-        let Some(i) = st.entries.iter().position(|e| e.session == session && e.news.key == news.key) else { return };
+        let Some(i) = st.entries.iter().position(|e| e.session == session && e.news.key == news.key && e.answer == answer) else { return };
         let Some(e) = st.entries.get_mut(i) else { return };
         if e.news != *news {
             return;
         }
         e.sent = true;
-        if e.news.event.over() || refused {
+        if e.news.event.over() || refused || answer {
             let gone = st.entries.remove(i);
             if let Some(pid) = gone.by {
                 st.over.entry(pid).or_default().insert(gone.news.key);
@@ -421,7 +438,7 @@ pub fn gone(client: Option<u32>) {
     let runs: Vec<(String, RunNews)> = {
         let mut st = STATE.lock();
         st.over.remove(&pid);
-        st.entries.iter().filter(|e| e.by == Some(pid) && !e.news.event.over()).map(|e| (e.session.clone(), e.news.clone())).collect()
+        st.entries.iter().filter(|e| e.by == Some(pid) && !e.answer && !e.news.event.over()).map(|e| (e.session.clone(), e.news.clone())).collect()
     };
     for (session, news) in runs {
         let news = RunNews { event: RunEvent::Ended, id: String::new(), ended_at: Some(now), exit_code: None, error: Some(STOPPED.to_owned()), tail: String::new(), ..news };
@@ -458,11 +475,83 @@ pub fn note(req: &RunReq) -> Option<Ev> {
     (req.detach && req.asker.is_some() && will_tell()).then(|| Ev::Note(format!("{DETACHED_NOTE} should this stop first, the command goes on, and kiln tells you how it ends (where, how long, its exit code, the end of its output): no need to wait for it")))
 }
 
+/// What an agent's MCP server names a run it starts in the run's environment for its runner
+/// (never the command's: [`strip`]): the line its news of the run is under, and what its agent
+/// calls it (`output`'s id).
+pub const KEY_ENV: &str = "KILN_TOLD_KEY";
+pub const ID_ENV: &str = "KILN_TOLD_ID";
+
+/// `env` without what's for this runner alone ([`KEY_ENV`], [`ID_ENV`]).
+pub fn strip(env: &[(String, String)]) -> Vec<(String, String)> {
+    env.iter().filter(|(k, _)| k != KEY_ENV && k != ID_ENV).cloned().collect()
+}
+
+/// Placement's answers for a run an agent session asked for, as they change (AUDIT O5, docs/needs.md
+/// E5): from its first `queued` on, each change of its place or expected start, its start by its
+/// runner's word, or never and why, go to its agent through the server (`Question::Answer`, mapped
+/// to `crate::harness::told::answer`), in the outbox's order, kept and sent again as the rest is.
+/// They're the agent's news of a run it isn't waiting on: no answer says to ask again, and
+/// nothing polls. A run that starts as asked isn't news (its asker has it). Under the line of what
+/// follows the run: its MCP server's name for it ([`KEY_ENV`]), or for a detached run, placement's
+/// own ([`Watch::keyed`]).
+#[derive(Debug, Clone)]
+pub struct Answers {
+    session: String,
+    key: String,
+    id: String,
+    command: String,
+    queued: std::sync::Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl Answers {
+    /// For `req`, placed as `run`: a run its agent session's MCP server follows, or a detached
+    /// one an agent session asked for. None: its asker alone hears its answers (a person at a
+    /// terminal, or a `kiln run` an agent waits on).
+    pub fn of(req: &RunReq, run: &str) -> Option<Self> {
+        let session = req.asker.clone().filter(|s| !s.is_empty())?;
+        let env = |k: &str| req.env.iter().find(|(n, _)| n == k).map(|(_, v)| v.clone()).filter(|v| !v.is_empty());
+        let (key, id) = match env(KEY_ENV) {
+            Some(key) => (key, env(ID_ENV).unwrap_or_default()),
+            None if req.detach => (run.to_owned(), String::new()),
+            None => return None,
+        };
+        Some(Answers { session, key, id, command: req.command.clone(), queued: std::sync::Arc::default() })
+    }
+
+    /// Placement answered `a`, at `now` (the owner's clock, this machine's).
+    pub fn heard(&self, a: &kiln_ci::place::Answer, now: i64) {
+        use kiln_ci::place::Answer as A;
+        use std::sync::atomic::Ordering::Relaxed;
+        let base = RunNews { key: self.key.clone(), id: self.id.clone(), command: self.command.clone(), how: "run".to_owned(), ..RunNews::default() };
+        let news = match a {
+            A::Queued { place, start, .. } => {
+                self.queued.store(true, Relaxed);
+                RunNews { event: RunEvent::Queued, place: place.as_ref().map(|p| p.lo), expected_start: start.soonest, ..base }
+            }
+            A::Started { runner, .. } if self.queued.load(Relaxed) => RunNews { event: RunEvent::Started, on: runner.clone(), started_at: Some(now), ..base },
+            A::Never { .. } if self.queued.load(Relaxed) => RunNews { event: RunEvent::Never, error: Some(a.words(now)), ..base },
+            _ => return,
+        };
+        say_answer(&self.session, news);
+    }
+
+    /// Its asker saw it end (a detached run whose client stayed): its agent's line of it is closed,
+    /// if its answers opened one.
+    pub fn seen(&self) {
+        if self.queued.load(std::sync::atomic::Ordering::Relaxed) {
+            let news = RunNews { key: self.key.clone(), id: self.id.clone(), command: self.command.clone(), how: "run".to_owned(), event: RunEvent::Seen, ..RunNews::default() };
+            say(&self.session, news, None);
+        }
+    }
+}
+
 /// What this runner sees of a run while its client is there, for its agent's news should the
 /// client go first and the run be detached ([`detached`]): when it started, the end of its output.
 pub struct Watch {
     /// The client's process.
     client: Option<u32>,
+    /// Placement's answers for it, when its agent is told them: its news is under their line.
+    answers: Option<Answers>,
     /// The run is detached: should its client go, it goes on, and its agent is told how it ends.
     detach: bool,
     command: String,
@@ -472,7 +561,20 @@ pub struct Watch {
 
 impl Watch {
     pub fn new(req: &RunReq) -> Self {
-        Self { client: req.client, detach: req.detach, command: req.command.clone(), started_at: None, tail: String::new() }
+        Self { client: req.client, answers: None, detach: req.detach, command: req.command.clone(), started_at: None, tail: String::new() }
+    }
+
+    /// Its news is under the line placement's answers for it are ([`Answers`]).
+    pub fn keyed(&mut self, answers: &Answers) {
+        self.answers = Some(answers.clone());
+    }
+
+    /// Its client saw a detached run end: the line its answers opened for its agent is closed (an
+    /// MCP server closes its own runs' lines, [`Telling`]).
+    pub fn seen(&self) {
+        if let Some(a) = self.answers.as_ref().filter(|_| self.detach) {
+            a.seen();
+        }
     }
 
     /// The client's process ([`gone`]).
@@ -557,11 +659,11 @@ impl Detached {
     /// news holds it as work it has going, and the outbox keeps how to follow it on (`resume`).
     fn going(session: &str, w: &Watch, on: &str, resume: Option<Resume>) -> Self {
         let event = if w.started_at.is_some() { RunEvent::Started } else { RunEvent::Going };
-        let news = RunNews { key: crate::util::new_id(), event: RunEvent::Going, command: w.command.clone(), on: on.to_owned(), how: DETACHED.to_owned(), handed: 1, started_at: w.started_at, ..RunNews::default() };
+        let news = RunNews { key: w.answers.as_ref().map_or_else(crate::util::new_id, |a| a.key.clone()), event: RunEvent::Going, command: w.command.clone(), on: on.to_owned(), how: DETACHED.to_owned(), handed: 1, started_at: w.started_at, ..RunNews::default() };
         say(session, news.clone(), None);
         {
             let mut st = STATE.lock();
-            if let Some(e) = st.entries.iter_mut().find(|e| e.news.key == news.key) {
+            if let Some(e) = st.entries.iter_mut().find(|e| e.news.key == news.key && !e.answer) {
                 e.resume = resume;
                 e.tail.clone_from(&w.tail);
             }
@@ -587,7 +689,7 @@ impl Detached {
     fn output(&mut self, data: &[u8]) {
         {
             let mut st = STATE.lock();
-            let Some(e) = st.entries.iter_mut().find(|e| e.news.key == self.news.key) else { return };
+            let Some(e) = st.entries.iter_mut().find(|e| e.news.key == self.news.key && !e.answer) else { return };
             push_tail(&mut e.tail, data);
         }
         persist();
@@ -595,7 +697,7 @@ impl Detached {
 
     /// It ended as its exit says: news, with the end of its output.
     fn ended(self, code: Option<i32>, error: Option<String>, lost: u64) {
-        let tail = STATE.lock().entries.iter().find(|e| e.news.key == self.news.key).map(|e| clip_tail(&e.tail, LINE_SHARE)).unwrap_or_default();
+        let tail = STATE.lock().entries.iter().find(|e| e.news.key == self.news.key && !e.answer).map(|e| clip_tail(&e.tail, LINE_SHARE)).unwrap_or_default();
         let news = RunNews { event: RunEvent::Ended, ended_at: Some(crate::util::now_ms()), exit_code: code, error, lost, tail, ..self.news };
         say(&self.session, news, None);
     }
@@ -750,6 +852,8 @@ pub struct Telling {
     waiting: usize,
     /// Its end was told, or its agent saw it, or stopped it.
     done: bool,
+    /// Placement said it waits ([`Answers`]): its agent has news of it, which its end closes.
+    queued: bool,
 }
 
 #[cfg(unix)]
@@ -760,6 +864,12 @@ impl Telling {
         let command = args.get("command").and_then(Value::as_str).unwrap_or_default().to_owned();
         let news = RunNews { key: format!("{}-{id}", *ME), id: id.to_owned(), command, how: "run".to_owned(), ..RunNews::default() };
         Self { teller: Some(teller(sock)), news, ..Self::default() }
+    }
+
+    /// What its runner is told it's called for its agent's news ([`KEY_ENV`], [`ID_ENV`]), so
+    /// placement's answers are on its line ([`Answers`]).
+    pub fn names(&self) -> [(String, String); 2] {
+        [(KEY_ENV.to_owned(), self.news.key.clone()), (ID_ENV.to_owned(), self.news.id.clone())]
     }
 
     /// How it was started (`kiln.machines.start`, …), when not by `run`.
@@ -789,6 +899,11 @@ impl Telling {
                 }
                 return;
             }
+            // Placement said it waits: its runner tells its agent so, and of each change after.
+            Ok(Some(Ev::Placed { json })) => {
+                self.queued |= serde_json::from_str::<kiln_ci::place::Answer>(json).is_ok_and(|a| matches!(a, kiln_ci::place::Answer::Queued { .. }));
+                return;
+            }
             Ok(Some(Ev::Exit { code, error, lost })) => (*code, error.clone(), *lost),
             Ok(Some(Ev::Error(e))) => (None, Some(e.clone()), 0),
             Ok(Some(_)) => return,
@@ -816,7 +931,7 @@ impl Telling {
             return;
         }
         if done {
-            if self.news.handed > 0 {
+            if self.news.handed > 0 || self.queued {
                 self.done = true;
                 self.tell(RunNews { event: RunEvent::Seen, ..self.news.clone() });
             }

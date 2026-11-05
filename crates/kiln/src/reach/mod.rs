@@ -147,6 +147,17 @@ pub enum Question {
         #[serde(default)]
         news: crate::harness::told::RunNews,
     },
+    /// Placement's answer for a run an agent session asked of this runner, as it changes (AUDIT O5,
+    /// docs/needs.md E5: queued with its place and expected start, started by its runner's word,
+    /// never with why; `news` says it as `RunEvent::{Queued, Started, Never}`): kiln tells the
+    /// agent in its news, as kiln's own word (`crate::harness::told::answer`). The asking runner is
+    /// the run's owner, so it says it; asked only of a server that takes news (`told`).
+    Answer {
+        #[serde(default)]
+        session: String,
+        #[serde(default)]
+        news: crate::harness::told::RunNews,
+    },
 }
 
 /// The MCP servers whose tools are reach's: a runner's own kiln server (`kiln`, `crate::reach::mcp`),

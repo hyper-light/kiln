@@ -312,7 +312,7 @@ pub async fn run(handle: &Handle, me: &str, req: RunReq, ev: async_channel::Send
 fn spec_of(req: &RunReq) -> RunSpec {
     RunSpec {
         command: req.command.clone(),
-        env: req.env.clone(),
+        env: super::told::strip(&req.env),
         stdin: req.stdin,
         timeout_ms: req.timeout_ms,
         linger_ms: req.detach.then_some(wire::DETACHED),
@@ -345,20 +345,24 @@ pub(super) async fn run_try(handle: &Handle, me: &str, req: RunReq, ev: &async_c
     // admits it. A runner named, or placement not ready, picks as before: by the sizes history
     // predicts (`t`, docs/reach.md "Sizes from history").
     let placed = place(handle, me, &req, ev).await?;
-    let (peer, claim, picked) = match placed {
+    let (peer, claim, picked, answers) = match placed {
         Some(p) => {
             let _ = ev.send(Ev::Picked { runner: p.runner.clone(), why: "its room was first".to_owned() }).await;
-            (p.runner, Some((p.run, p.fence)), None)
+            (p.runner, Some((p.run, p.fence)), None, p.answers)
         }
         None => {
             let choice = t.pick(handle, me, &req).await?;
             let _ = ev.send(Ev::Picked { runner: choice.runner.name.clone(), why: choice.why.clone() }).await;
-            (choice.runner.name.clone(), None, Some(choice.runner))
+            (choice.runner.name.clone(), None, Some(choice.runner), None)
         }
     };
     if let Some(note) = super::told::note(&req) { let _ = ev.send(note).await; }
     let mut spec = spec_of(&req);
     let mut told = super::told::Watch::new(&req);
+    // A detached run's news is under the line its answers opened (AUDIT O5).
+    if let Some(a) = &answers {
+        told.keyed(a);
+    }
     if peer == me {
         // This machine suits best: no copy, no link — the folder as it is.
         spec.cwd = req.cwd.clone().or(req.remote_cwd.clone());
@@ -416,7 +420,11 @@ pub(super) async fn run_try(handle: &Handle, me: &str, req: RunReq, ev: &async_c
                     let _ = ev.send(Ev::Output { err: stream == Stream::Err, data }).await;
                 }
                 Ok(Say::Used { used, .. }) => t.used(&used),
-                Ok(Say::Exit { code, error, lost, .. }) => return t.exit(ev, &req, stop_by.is_some(), code, error, lost).await,
+                Ok(Say::Exit { code, error, lost, .. }) => {
+                    // Its client saw it end: what its answers told its agent is closed.
+                    told.seen();
+                    return t.exit(ev, &req, stop_by.is_some(), code, error, lost).await;
+                }
                 Ok(_) => {}
                 Err(_) => anyhow::bail!("lost track of the run"),
             },
@@ -445,18 +453,22 @@ pub(super) async fn run_try(handle: &Handle, me: &str, req: RunReq, ev: &async_c
     super::told::detached(handle, &peer, id, told, says).await
 }
 
-/// A run placement gave a runner: which, and its claim there.
+/// A run placement gave a runner: which, and its claim there; and its answers' teller, when its
+/// agent is told them (AUDIT O5).
 struct Placing {
     runner: String,
     run: String,
     fence: kiln_ci::sched::Fence,
+    answers: Option<super::told::Answers>,
 }
 
 /// Places a run (docs/needs.md E5) when its target is what it needs (no runner named) and this
 /// node's placement is ready: its asker is told each answer as it comes, at once and on every
 /// change, until it's to start somewhere (the runner's room first), and after, as it starts and
-/// ends. `None`: placed as before (a runner named, placement not ready, or only older runners
-/// could take it).
+/// ends; and the agent session that asked, once it's queued, through told (AUDIT O5,
+/// [`super::told::Answers`]): pushed both ways, never polled, and no answer says to ask again.
+/// `None`: placed as before (a runner named, placement not ready, or only older runners could take
+/// it).
 async fn place(handle: &Handle, me: &str, req: &RunReq, ev: &async_channel::Sender<Ev>) -> anyhow::Result<Option<Placing>> {
     use super::place::Placed;
     let Ok(needs) = kiln_ci::sched::needs::parse(&req.target) else { return Ok(None) };
@@ -469,9 +481,13 @@ async fn place(handle: &Handle, me: &str, req: &RunReq, ev: &async_channel::Send
         return Ok(None);
     }
     let tell = |a: &kiln_ci::place::Answer| Ev::Placed { json: serde_json::to_string(a).unwrap_or_default() };
+    let answers = super::told::Answers::of(req, &run);
     loop {
         match rx.recv().await {
             Ok(Placed::Answer(a)) => {
+                if let Some(t) = &answers {
+                    t.heard(&a, crate::util::now_ms());
+                }
                 let _ = ev.send(tell(&a)).await;
                 if let kiln_ci::place::Answer::Never { .. } = a {
                     anyhow::bail!("{}", a.words(crate::util::now_ms()));
@@ -482,18 +498,24 @@ async fn place(handle: &Handle, me: &str, req: &RunReq, ev: &async_channel::Send
                 if !handle.place_starting(&run, &runner, fence).await? {
                     continue;
                 }
-                // What it hears after (started, ended) goes on to its asker.
-                let ev = ev.clone();
+                // What it hears after (started, ended) goes on to its asker, and its start by its
+                // runner's word to the agent that asked (AUDIT O5), even once its client went.
+                let (ev, told) = (ev.clone(), answers.clone());
                 crate::rt::spawn(async move {
+                    let mut asker = true;
                     while let Ok(p) = rx.recv().await {
-                        if let Placed::Answer(a) = p
-                            && ev.send(tell(&a)).await.is_err()
-                        {
-                            return;
+                        if let Placed::Answer(a) = p {
+                            if let Some(t) = &told {
+                                t.heard(&a, crate::util::now_ms());
+                            }
+                            asker = asker && ev.send(tell(&a)).await.is_ok();
+                            if !asker && told.is_none() {
+                                return;
+                            }
                         }
                     }
                 });
-                return Ok(Some(Placing { runner, run, fence }));
+                return Ok(Some(Placing { runner, run, fence, answers }));
             }
             Ok(Placed::Fallback { .. }) => {
                 handle.place_cancel(&run).await;
@@ -536,6 +558,7 @@ async fn run_here(handle: &Handle, spec: RunSpec, req: &RunReq, ev: &async_chann
                     if let Some((h, run)) = &placed {
                         h.place_local(run, Some(error.is_none())).await;
                     }
+                    told.seen();
                     return t.exit_here(handle, ev, req, code, error, used.as_deref()).await;
                 }
                 Err(_) => anyhow::bail!("lost track of the run"),

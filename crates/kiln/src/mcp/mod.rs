@@ -248,12 +248,22 @@ pub async fn runner_ask(hub: &Arc<Hub>, runner: &str, peer: crate::instances::Pe
     if let Question::Told { session, news } = ask {
         return crate::harness::told::heard(hub, runner, session, news).await;
     }
+    // Placement's answer for a run the session asked of this runner, its owner (AUDIT O5): only
+    // from where the session is (E8: no runner answers for another's agents).
+    if let Question::Answer { session, news } = ask {
+        if !hub.harness.located_on(session, runner) {
+            return json!({"error": format!("agent session {session} isn't on {}: placement's answers for its runs come from where it is", hub.shown(runner)), "status": 403});
+        }
+        let Some(answer) = crate::harness::told::AnswerNews::of(news) else { return json!({"error": "placement answers queued, started or never", "status": 400}) };
+        crate::harness::told::answer(hub, session, answer).await;
+        return json!({"ok": {}});
+    }
     let (session, terminal) = match ask {
         Question::Directory => return json!({ "runners": hub.reach_directory() }),
         // Noted whoever started the session (`runner_unread`).
         Question::Unread { session, what, code, why } => return runner_unread(hub, runner, session, what, *code, why).await,
         Question::Registry { session, terminal } | Question::Call { session, terminal, .. } => (session.as_str(), terminal.as_str()),
-        Question::Page { session, .. } | Question::Stream { session, .. } | Question::Act { session, .. } | Question::Told { session, .. } => (session.as_str(), ""),
+        Question::Page { session, .. } | Question::Stream { session, .. } | Question::Act { session, .. } | Question::Told { session, .. } | Question::Answer { session, .. } => (session.as_str(), ""),
         // The hub answers these itself (`Hub::on_read`).
         Question::Keep { .. } | Question::Holds { .. } | Question::Holders { .. } | Question::Sizes { .. } | Question::Measured { .. } => return json!({"error": "not a question for kiln's operations"}),
     };
@@ -389,7 +399,7 @@ pub async fn runner_ask(hub: &Arc<Hub>, runner: &str, peer: crate::instances::Pe
         }
         // An act its runner asks kiln to take before it does it (a run on another machine):
         // taken above, as the session's holder's now (W27-R08).
-        Question::Act { .. } | Question::Told { .. } => json!({"ok": {}}),
+        Question::Act { .. } | Question::Told { .. } | Question::Answer { .. } => json!({"ok": {}}),
         Question::Directory => json!({ "runners": hub.reach_directory() }),
         Question::Unread { session, what, code, why } => runner_unread(hub, runner, session, what, *code, why).await,
         Question::Keep { .. } | Question::Holds { .. } | Question::Holders { .. } | Question::Sizes { .. } | Question::Measured { .. } => json!({"error": "not a question for kiln's operations"}),

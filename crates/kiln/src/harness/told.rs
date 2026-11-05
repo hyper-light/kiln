@@ -504,6 +504,18 @@ pub struct AnswerNews {
 }
 
 impl AnswerNews {
+    /// Placement's answer as its asking runner says it (`crate::reach::Question::Answer`): queued,
+    /// started or never; none for anything else.
+    pub fn of(news: &RunNews) -> Option<AnswerNews> {
+        let answer = match news.event {
+            RunEvent::Queued => Answer::Queued { place: news.place.unwrap_or(0), expected_start: news.expected_start },
+            RunEvent::Started => Answer::Started { on: news.on.clone() },
+            RunEvent::Never => Answer::Never { why: news.error.clone().unwrap_or_default() },
+            RunEvent::Going | RunEvent::Ended | RunEvent::Seen => return None,
+        };
+        Some(AnswerNews { key: news.key.clone(), id: news.id.clone(), command: news.command.clone(), answer })
+    }
+
     fn into_run(self) -> RunNews {
         let mut run = RunNews { key: self.key, id: self.id, command: self.command, how: "run".to_owned(), ..RunNews::default() };
         match self.answer {
@@ -2052,6 +2064,17 @@ mod tests {
         // The runner that runs it may say the rest, though kiln said the first word.
         t.ran(RUNNER, true, "a12", RunNews { key: "q1".into(), ..run_ended("q1") }, 1_000_200).map_err(anyhow::Error::msg)?;
         Ok(())
+    }
+
+    /// AUDIT O5: placement's answer as its asking runner says it (`Question::Answer`) is the answer
+    /// it was, queued, started or never; anything else isn't one.
+    #[test]
+    fn o5_an_answer_said_by_its_runner_is_the_answer_it_was() {
+        for answer in [Answer::Queued { place: 2, expected_start: Some(9_000) }, Answer::Started { on: "linux".into() }, Answer::Never { why: "never: no runner has a GPU".into() }] {
+            let a = AnswerNews { key: "k".into(), id: "r1".into(), command: "make".into(), answer };
+            assert_eq!(AnswerNews::of(&a.clone().into_run()), Some(a));
+        }
+        assert_eq!(AnswerNews::of(&run_ended("r7")), None);
     }
 
     /// How a run's news says how long it took, and a detached run.

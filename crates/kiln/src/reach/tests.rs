@@ -1336,3 +1336,78 @@ fn e5_a_queued_command_waits_through_a_disconnect_and_starts_after() -> anyhow::
         anyhow::Ok(())
     })
 }
+
+/// The asking agent hears placement's answers for a run it isn't waiting on (AUDIT O5, docs/needs.md
+/// E5), as `req` says it was asked of mac while both runners are full: queued (its place), then
+/// started on linux by linux's word, once linux measures room. Every word pushed (the asker's
+/// socket, the told outbox), none polled; what the agent's news has of it, in order.
+#[cfg(unix)]
+async fn o5_told_of(req: RunReq, session: &str) -> anyhow::Result<(Vec<Ev>, Vec<super::told::RunNews>)> {
+    let lab = lab_placing().await?;
+    lab.mac.feed(In::Sampled(reading(100.0))).await;
+    lab.linux.feed(In::Sampled(reading(100.0))).await;
+    lab.mac.directory().await?;
+    lab.linux.directory().await?;
+    let linux = lab.linux.clone();
+    let once = std::sync::atomic::AtomicBool::new(false);
+    let evs = run_from_mac(&lab, req, move |e| {
+        if let Ev::Placed { json } = e
+            && json.contains("\"queued\"")
+            && !once.swap(true, std::sync::atomic::Ordering::Relaxed)
+        {
+            let l = linux.clone();
+            crate::rt::spawn(async move { l.feed(In::Sampled(reading(0.0))).await });
+        }
+        None
+    })
+    .await?;
+    Ok((evs, super::told::heard_of(session)))
+}
+
+/// AUDIT O5: an MCP `run` its agent left queued is told of each change of placement's answer under
+/// the line its MCP server follows it by (the name it gave its runner, which its command never
+/// sees): queued with its place, then started on linux, by linux's word. Nothing says to ask
+/// again; the run starts once, with no poll.
+#[cfg(unix)]
+#[test]
+fn o5_an_mcp_run_left_queued_hears_each_answer_and_starts_without_polling() -> anyhow::Result<()> {
+    crate::rt::block_on(async move {
+        let session = format!("o5-mcp-{}", crate::util::new_id());
+        let env = vec![(super::told::KEY_ENV.to_owned(), "mcp-r1".to_owned()), (super::told::ID_ENV.to_owned(), "r1".to_owned())];
+        let req = RunReq { target: "cpus=2".into(), command: "echo key=${KILN_TOLD_KEY:-none}".into(), env, asker: Some(session.clone()), ..RunReq::default() };
+        let (evs, news) = o5_told_of(req, &session).await?;
+        assert_eq!(evs.iter().filter(|e| matches!(e, Ev::Started { .. })).count(), 1, "started once: {evs:?}");
+        assert!(output(&evs, false).contains("key=none"), "the told names are its runner's alone: {}", output(&evs, false));
+        assert!(news.iter().all(|n| n.key == "mcp-r1" && n.id == "r1"), "one line, its MCP server's: {news:?}");
+        let queued = news.iter().find(|n| n.event == super::told::RunEvent::Queued);
+        assert!(queued.is_some_and(|n| n.place.is_some()), "told it waits, and where: {news:?}");
+        assert!(answers(&evs).iter().all(|a| !a.contains("ask again")), "{evs:?}");
+        if answers(&evs).iter().any(|a| a.starts_with("started")) {
+            assert!(news.iter().any(|n| n.event == super::told::RunEvent::Started && n.on == "linux"), "told it started on linux: {news:?}");
+        }
+        let events: Vec<_> = news.iter().map(|n| n.event).collect();
+        assert!(events.windows(2).all(|w| w.first() <= w.get(1)), "in order: {events:?}");
+        anyhow::Ok(())
+    })
+}
+
+/// AUDIT O5: a detached `kiln run` an agent asked for while every runner was full: its asker hears
+/// each answer on its socket, and its agent through told, under placement's own name for it (the
+/// line its follower would use had its client gone), then the line closed as its client saw it end.
+#[cfg(unix)]
+#[test]
+fn o5_a_queued_detached_kiln_run_hears_each_answer_and_its_line_closes() -> anyhow::Result<()> {
+    crate::rt::block_on(async move {
+        let session = format!("o5-cli-{}", crate::util::new_id());
+        let req = RunReq { target: "cpus=2".into(), command: "echo detached".into(), detach: true, asker: Some(session.clone()), ..RunReq::default() };
+        let (evs, news) = o5_told_of(req, &session).await?;
+        let said = answers(&evs);
+        assert!(said.first().is_some_and(|a| a.starts_with("queued")), "its asker heard it queued first: {said:?}");
+        assert_eq!(evs.iter().filter(|e| matches!(e, Ev::Started { .. })).count(), 1, "started once: {evs:?}");
+        let key = news.first().map(|n| n.key.clone()).unwrap_or_default();
+        assert!(key.starts_with("mac-") && news.iter().all(|n| n.key == key), "one line, placement's run: {news:?}");
+        assert_eq!(news.first().map(|n| n.event), Some(super::told::RunEvent::Queued), "{news:?}");
+        assert_eq!(news.last().map(|n| n.event), Some(super::told::RunEvent::Seen), "closed as its client saw it end: {news:?}");
+        anyhow::Ok(())
+    })
+}
