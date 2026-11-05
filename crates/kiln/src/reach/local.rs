@@ -475,7 +475,9 @@ async fn place(handle: &Handle, me: &str, req: &RunReq, ev: &async_channel::Send
     let run = format!("{me}-{}", crate::util::new_id());
     let repo = req.cwd.as_deref().and_then(|c| Path::new(c).file_name()).map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
     // A person at a terminal, or an agent's turn, waits on it (docs/needs.md §7).
-    let ask = kiln_ci::place::Ask { run: run.clone(), needs, class: kiln_ci::sched::Class::Interactive, repo, actor: req.asker.clone().unwrap_or_else(|| "person".to_owned()), timeout: req.timeout_ms, ..kiln_ci::place::Ask::default() };
+    // Its kind of work, as its runner's health bars it (AUDIT L2): its command in its folder here.
+    let key = req.cwd.as_deref().map(|c| crate::sense::run::command_key(&req.command, Path::new(c)));
+    let ask = kiln_ci::place::Ask { run: run.clone(), needs, class: kiln_ci::sched::Class::Interactive, repo, actor: req.asker.clone().unwrap_or_else(|| "person".to_owned()), timeout: req.timeout_ms, key, ..kiln_ci::place::Ask::default() };
     let (tx, rx) = async_channel::unbounded::<Placed>();
     if !handle.place(ask, tx).await? {
         return Ok(None);
@@ -537,6 +539,8 @@ async fn place(handle: &Handle, me: &str, req: &RunReq, ev: &async_channel::Send
 #[allow(clippy::too_many_arguments)]
 async fn run_here(handle: &Handle, spec: RunSpec, req: &RunReq, ev: &async_channel::Sender<Ev>, ctl: async_channel::Receiver<Req>, t: &super::history::Try, placed: Option<(Handle, String)>, mut told: super::told::Watch, me: &str) -> anyhow::Result<()> {
     let cwd = super::serve::resolve_cwd(&spec, None)?;
+    // Its kind of work as this runner keys it (sense's), for its asker's key (AUDIT L2).
+    let here_key = crate::sense::run::command_key(&spec.command, &cwd);
     let (tx, rx) = async_channel::bounded::<super::serve::Event>(16);
     let shell = spec.shell.as_deref().map(|s| crate::os::home_dir().join(".kiln").join("reach").join("shells").join(s));
     let stdin = super::serve::start(spec, cwd, shell, Vec::new(), tx);
@@ -548,7 +552,7 @@ async fn run_here(handle: &Handle, spec: RunSpec, req: &RunReq, ev: &async_chann
                 Ok(super::serve::Event::Started { pid: p, cwd }) => {
                     pid = Some(p);
                     if let Some((h, run)) = &placed {
-                        h.place_local_up(run, p).await;
+                        h.place_local_up(run, p, here_key.clone()).await;
                     }
                     told.started();
                     let _ = ev.send(Ev::Started { runner: String::new(), pid: p, cwd }).await;

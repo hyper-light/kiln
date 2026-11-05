@@ -224,7 +224,7 @@ pub enum Local {
     /// Run on `peer` under claim `fence` of run `run`: its start said first, then the spec.
     PlaceRun { peer: String, run: String, fence: kiln_ci::sched::Fence, spec: Box<RunSpec>, says: Says, reply: oneshot::Sender<u64> },
     /// A run of this node's that placement started here is up (`ended` None), or ended.
-    PlaceLocal { run: String, ended: Option<bool>, pid: Option<u32> },
+    PlaceLocal { run: String, ended: Option<bool>, pid: Option<u32>, key: Option<String> },
     /// Its asker doesn't want a run any more.
     PlaceCancel { run: String },
     /// CI leg `ask.run`, assigned this runner: admitted against placement's ledger, or refused and
@@ -343,13 +343,13 @@ impl Handle {
 
     /// A placed run here is up (`ended` None) or ended.
     pub async fn place_local(&self, run: &str, ended: Option<bool>) {
-        let _ = self.tx.send(In::Local(Local::PlaceLocal { run: run.to_owned(), ended, pid: None })).await;
+        let _ = self.tx.send(In::Local(Local::PlaceLocal { run: run.to_owned(), ended, pid: None, key: None })).await;
     }
 
     /// A run of this node's that placement started here is up, as process `pid`: what it uses is
     /// read from its group (room counted once).
-    pub async fn place_local_up(&self, run: &str, pid: u32) {
-        let _ = self.tx.send(In::Local(Local::PlaceLocal { run: run.to_owned(), ended: None, pid: Some(pid) })).await;
+    pub async fn place_local_up(&self, run: &str, pid: u32, key: String) {
+        let _ = self.tx.send(In::Local(Local::PlaceLocal { run: run.to_owned(), ended: None, pid: Some(pid), key: Some(key) })).await;
     }
 
     /// Its asker doesn't want run `run` any more.
@@ -1787,6 +1787,8 @@ impl Node {
         // A run in a copy holds it in use until the run's last event, noted as the agent's that
         // asked for it (docs/reach.md §5.1).
         let busy = spec.mirror.as_deref().map(|m| self.cfg.using.busy(&key.0, m, super::keeper::agent_of(&spec.env)));
+        // Its kind of work as this runner keys it (sense's), for its asker's key (AUDIT L2).
+        self.place.spec_ran_as(&key.0, id, crate::sense::run::command_key(&spec.command, &cwd));
         let stdin = serve::start(spec.clone(), cwd, shell, extra, ev_tx);
         // Forward the run's events into the node, waiting while its asker has too much unread.
         let (tx, k, h, r) = (self.tx.clone(), key.clone(), Arc::clone(&held), Arc::clone(&room));
@@ -2108,8 +2110,12 @@ impl Node {
                 self.send_or_queue(&peer, Ask::Place { json }).await;
                 self.send_or_queue(&peer, Ask::Run(spec)).await;
             }
-            Local::PlaceLocal { run, ended, pid } => {
+            Local::PlaceLocal { run, ended, pid, key } => {
                 let now = crate::util::now_ms();
+                if let Some(k) = key {
+                    let (me, epoch) = self.place.owner_of_claims();
+                    self.place.ran_as(&me, epoch, &run, k);
+                }
                 let outs = match ended {
                     None => self.place.local_spawned_pid(&run, pid, now),
                     Some(ok) => self.place.local_ended(&run, ok, now),

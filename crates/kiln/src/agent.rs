@@ -916,14 +916,16 @@ mod replica_tests {
 /// `name`, its sockets named by `sock`): the new build once it has taken over, or the old one again
 /// after a rollback (the paths are the same).
 #[cfg(unix)]
-/// CI leg `id`, asking `request` (`exclusive`: the runner whole), admitted against this runner's
+/// CI leg `id` (its kind `key`), asking `request` (`exclusive`: the runner whole), admitted against this runner's
 /// placement ledger beside the runs owners placed here (docs/needs.md E5, AUDIT M4: one ledger
 /// for CI legs, commands and sessions, so together they never pass its budget, G1): `Err(why)`
 /// when it leaves no room. Without reach, as before.
-async fn leg_room(reach: Option<&crate::reach::node::Handle>, id: &str, exclusive: bool, request: kiln_ci::sched::state::Resources) -> Result<(), String> {
+async fn leg_room(reach: Option<&crate::reach::node::Handle>, id: &str, key: String, exclusive: bool, request: kiln_ci::sched::state::Resources) -> Result<(), String> {
     let Some(r) = reach else { return Ok(()) };
     let needs = kiln_ci::sched::needs::Needs { request, exclusive, ..kiln_ci::sched::needs::Needs::default() };
-    let ask = kiln_ci::place::Ask { run: id.to_owned(), needs, class: kiln_ci::sched::state::Class::Batch, ..kiln_ci::place::Ask::default() };
+    // Its kind as its run here is keyed (`sense::run::leg_key`, as the executor keys it): a cause
+    // its own runs met here bars it (AUDIT L2).
+    let ask = kiln_ci::place::Ask { run: id.to_owned(), needs, class: kiln_ci::sched::state::Class::Batch, key: Some(key), ..kiln_ci::place::Ask::default() };
     r.admit_leg(ask).await.unwrap_or(Ok(()))
 }
 
@@ -3397,7 +3399,7 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                         // refused, saying why, when they leave it no room. A pool's leg runs in its
                         // executor, not on this machine's room.
                         if !pooled
-                            && let Err(why) = leg_room(reach.as_ref(), &id, a.exclusive, a.holds.unwrap_or_default()).await
+                            && let Err(why) = leg_room(reach.as_ref(), &id, crate::sense::run::leg_key(&a.repo, a.job_workflow.as_ref().map_or("", |w| w.workflow_file_path.as_str()), &a.leg.job_id, &a.leg.matrix.to_string()), a.exclusive, a.holds.unwrap_or_default()).await
                         {
                             let refusal = match a.fence {
                                 Some(fence) if server_leases => AgentMsg::Refused { grant: proto::Grant::of(&id, a.attempt, fence), reason: why },
@@ -3814,7 +3816,7 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                             continue;
                         }
                         // Admitted against the same ledger as the runs placed here (AUDIT M4, G1).
-                        if let Err(why) = leg_room(reach.as_ref(), &id, a.spec.exclusive, crate::hub::v1_asked(&a.spec.resources)).await {
+                        if let Err(why) = leg_room(reach.as_ref(), &id, crate::sense::run::leg_key(&a.repo, "", &a.spec.key, ""), a.spec.exclusive, crate::hub::v1_asked(&a.spec.resources)).await {
                             uplink.msg(AgentMsg::Reject { job: id, reason: why }).await;
                             continue;
                         }

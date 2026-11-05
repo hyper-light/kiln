@@ -170,6 +170,12 @@ pub struct Placer {
     /// read from its own group when the machine is, and taken out of what the machine has in use,
     /// so the room a run holds isn't counted again as others' load (docs/needs.md E5).
     groups: std::collections::HashMap<(String, u64, String), Held>,
+    /// The kind of work each probe here is, as its asker keyed it (`Ask::key`), by (owner,
+    /// epoch, run); and each asker's key as this runner's own runs of it are keyed (a command's
+    /// key is its folder's and text's, and its folder here isn't its asker's): sense's health
+    /// bars work here by the latter (AUDIT L2).
+    asked_keys: std::collections::HashMap<(String, u64, String), String>,
+    aliases: std::collections::HashMap<String, String>,
 }
 
 /// Where a placed run's processes are counted, and its CPU time as last read with when.
@@ -273,10 +279,13 @@ pub fn sample_of_measure(m: &crate::sense::Measure, last: Option<&crate::sense::
 }
 
 /// Why this runner's health bars `ask`'s kind of work now (L2, sense's `Health::check` but its
-/// strain, which the admission keeps): every run works in the work volume, so a full one, or its
-/// device's errors rising, bars all work; memory and tools as asked.
-fn barred(ask: &Ask, m: &crate::sense::Measure) -> Option<crate::sense::health::Refusal> {
-    let a = crate::sense::health::Ask { key: None, disk: ask.needs.request.disk.max(1), mem: ask.needs.request.mem, tools: Vec::new() };
+/// strain, which the admission keeps), its kind `key` as this runner keys its own runs of it:
+/// every run works in the work volume, so a full one, or its device's errors rising, bars all
+/// work; a run of its kind killed for memory here, or missing a tool here, bars it whatever it
+/// asks; memory and tools as asked bar the rest.
+fn barred(ask: &Ask, key: Option<String>, m: &crate::sense::Measure) -> Option<crate::sense::health::Refusal> {
+    let tools = ask.needs.requires.iter().filter_map(|r| r.strip_prefix("tools has ")).map(|t| t.trim_matches(|c| c == '\'' || c == '"').to_owned()).collect();
+    let a = crate::sense::health::Ask { key, disk: ask.needs.request.disk.max(1), mem: ask.needs.request.mem, tools };
     let h = crate::sense::health::runner().lock().ok()?;
     // Its strain is the admission's (it waits, saying so): only the causes its runs met bar here.
     h.check(&a, m, 0.0).err().filter(|r| r.kind != "strained")
@@ -305,7 +314,7 @@ impl Placer {
     /// Node `me` in `epoch`, its runner's facts and labels, its first reading and settings.
     pub fn new(me: &str, epoch: u64, facts: RunnerFacts, labels: Vec<String>, sample: Sample, settings: Settings, now: i64) -> Placer {
         let init = Init { me: me.to_owned(), epoch, facts: facts.clone(), labels: labels.clone(), sample, records: Records::new(), settings };
-        Placer { me: me.to_owned(), epoch, owner: Owner::seeded(me, epoch, rand::random()), admission: Admission::new(init, now), specs: BTreeMap::new(), started: BTreeMap::new(), machines: Vec::new(), facts, labels, away: std::collections::BTreeSet::new(), told_to: std::collections::BTreeSet::new(), hinted: None, waits: BTreeMap::new(), gone: Vec::new(), waits_moved: false, whole: true, sensor: None, last: None, strained: None, parked: Vec::new(), groups: std::collections::HashMap::new() }
+        Placer { me: me.to_owned(), epoch, owner: Owner::seeded(me, epoch, rand::random()), admission: Admission::new(init, now), specs: BTreeMap::new(), started: BTreeMap::new(), machines: Vec::new(), facts, labels, away: std::collections::BTreeSet::new(), told_to: std::collections::BTreeSet::new(), hinted: None, waits: BTreeMap::new(), gone: Vec::new(), waits_moved: false, whole: true, sensor: None, last: None, strained: None, parked: Vec::new(), groups: std::collections::HashMap::new(), asked_keys: std::collections::HashMap::new(), aliases: std::collections::HashMap::new() }
     }
 
     /// It measures its machine itself when it decides, with `sensor` (AUDIT L1, L2).
@@ -342,12 +351,36 @@ impl Placer {
             self.strained = strained;
         }
         for (peer, epoch, ask) in std::mem::take(&mut self.parked) {
-            match barred(&ask, &m) {
+            let key = self.key_here(&ask);
+            match barred(&ask, key, &m) {
                 Some(_) => self.parked.push((peer, epoch, ask)),
                 None => self.admission.probe(Peer { name: &peer, epoch }, ask, None, now, said),
             }
         }
         self.last = Some(m);
+    }
+
+    /// `ask`'s kind of work as this runner keys its own runs of it (its asker's key, or what it
+    /// maps to here).
+    fn key_here(&self, ask: &Ask) -> Option<String> {
+        ask.key.as_ref().map(|k| self.aliases.get(k).cloned().unwrap_or_else(|| k.clone()))
+    }
+
+    /// Placed run `run` of owner `owner` (`epoch`) runs here keyed `here` (sense's key of its
+    /// command in its folder here): its asker's key for its kind maps to that from now on (L2).
+    pub fn ran_as(&mut self, owner: &str, epoch: u64, run: &str, here: String) {
+        if let Some(k) = self.asked_keys.remove(&(owner.to_owned(), epoch, run.to_owned()))
+            && k != here
+        {
+            self.aliases.insert(k, here);
+        }
+    }
+
+    /// The run spec `id` of `peer` starts here keyed `here` ([`Self::ran_as`]).
+    pub fn spec_ran_as(&mut self, peer: &str, id: u64, here: String) {
+        if let Some((epoch, run)) = self.started.get(&(peer.to_owned(), id)).cloned() {
+            self.ran_as(peer, epoch, &run, here);
+        }
     }
 
     /// Placed run `run` of owner `owner` (`epoch`) runs in group `at`: what it uses is read from
@@ -389,9 +422,13 @@ impl Placer {
     /// health bars its kind of work (L2), parked here and answered so, until a measure clears it.
     fn probe(&mut self, peer: &str, epoch: u64, ask: std::sync::Arc<Ask>, now: i64, said: &mut Vec<(String, ToOwner)>) {
         self.measure_now(now, said);
+        if let Some(k) = &ask.key {
+            self.asked_keys.insert((peer.to_owned(), epoch, ask.run.clone()), k.clone());
+        }
+        let key = self.key_here(&ask);
         if self.strained.is_none()
             && let Some(m) = &self.last
-            && let Some(r) = barred(&ask, m)
+            && let Some(r) = barred(&ask, key, m)
         {
             let free = self.admission.hint();
             said.push((peer.to_owned(), ToOwner::Waiting { run: ask.run.clone(), reason: kiln_ci::place::msg::Reason::Barred { cause: r.kind, why: r.why }, place: kiln_ci::place::msg::Place::default(), start: kiln_ci::place::msg::Estimate::default(), predicted: None, free }));
@@ -888,6 +925,41 @@ impl Placer {
             }
         }
         out
+    }
+}
+
+#[cfg(test)]
+mod key_tests {
+    use super::*;
+
+    /// AUDIT L2 by run key: a probe carries its asker's key for its kind of work; once this runner
+    /// ran a run of that kind (keyed here by its command in its folder here, not its asker's), the
+    /// asker's key maps to its own, and a run of that kind killed for memory here bars the next of
+    /// it, though it asks for no memory, until memory is back (an event, never a timer).
+    #[test]
+    fn l2_a_probe_is_barred_by_what_its_kind_of_work_met_here() {
+        let mut p = Placer::new("doer", 1, kiln_ci::facts::RunnerFacts::default(), Vec::new(), Sample::default(), Settings::default(), 0);
+        let (asker_key, here) = (format!("cmd:asker-{}", crate::util::new_id()), format!("cmd:here-{}", crate::util::new_id()));
+        let ask = |run: &str| Ask { run: run.into(), key: Some(asker_key.clone()), ..Ask::default() };
+        let mut said = Vec::new();
+        p.probe("owner", 1, std::sync::Arc::new(ask("r0")), 0, &mut said);
+        p.ran_as("owner", 1, "r0", here.clone());
+        assert_eq!(p.key_here(&ask("r1")), Some(here.clone()), "the asker's key maps to this runner's");
+        let m = crate::sense::Measure { mem_total: 16 << 30, mem_available: 1 << 30, ..crate::sense::Measure::default() };
+        if let Ok(mut h) = crate::sense::health::runner().lock() {
+            h.ended(&here, Some(&crate::sense::health::Failure::OutOfMemory), &m, 0, 8 << 30);
+        }
+        let r = barred(&ask("r1"), p.key_here(&ask("r1")), &m);
+        assert!(r.as_ref().is_some_and(|r| r.kind == "memory"), "{r:?}");
+        // Another kind of work, asking no memory, isn't barred by it.
+        let other = Ask { run: "r2".into(), key: Some(format!("cmd:other-{}", crate::util::new_id())), ..Ask::default() };
+        assert_eq!(barred(&other, p.key_here(&other), &m), None);
+        // Memory back past what the killed run held: the bar clears as it's measured.
+        let back = crate::sense::Measure { mem_available: 12 << 30, ..m };
+        if let Ok(mut h) = crate::sense::health::runner().lock() {
+            h.measured(&back);
+        }
+        assert_eq!(barred(&ask("r1"), p.key_here(&ask("r1")), &back), None);
     }
 }
 
