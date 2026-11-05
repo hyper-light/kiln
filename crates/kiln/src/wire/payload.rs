@@ -404,8 +404,40 @@ impl Expect {
     }
 }
 
-/// The runner frames the hub's loop reads ([`read_frame`]).
-static FRAMES: Expect = Expect { bytes: std::sync::atomic::AtomicU64::new(0), ns: std::sync::atomic::AtomicU64::new(0) };
+/// Format: room in [`KIND_COSTS`] for [`AgentMsg`]'s variants by their index on the wire (its table,
+/// `crate::wire::agent_classes`, has 70-some; a test holds it within), a kind past it sharing the rest's.
+const KINDS: usize = 128;
+
+/// An [`Expect`] with nothing learned.
+const NOTHING_YET: Expect = Expect { bytes: std::sync::atomic::AtomicU64::new(0), ns: std::sync::atomic::AtomicU64::new(0) };
+
+/// What reading a runner's message of each kind is expected to take, as the hub's loop reads frames
+/// ([`read_frame`]) and channel items ([`read_item`]): an [`Expect`] for each of [`AgentMsg`]'s variants (goal
+/// 9, plan 01a1a87b2cec step 3). One for all judged an agent session's update, whose JSON costs much more a
+/// byte, by the many messages that carry bytes (terminal output, streams): mid-sized updates were read on
+/// the shard, up to 2.4 ms each in the lab's g6c2.
+static KIND_COSTS: [Expect; KINDS] = [NOTHING_YET; KINDS];
+
+/// What [`KIND_COSTS`] has no room for: kinds past it, and what doesn't say its kind.
+static REST_COSTS: Expect = NOTHING_YET;
+
+/// The kind of runner message `data` holds: its variant's index on the wire, postcard's first varint (up to
+/// a `u32`'s five bytes); [`KINDS`] − 1 for one past the room or that can't be read.
+fn kind_of(data: &[u8]) -> usize {
+    let mut index: u64 = 0;
+    for (i, b) in data.iter().take(5).enumerate() {
+        index |= u64::from(b & 0x7f) << (7 * i);
+        if b & 0x80 == 0 {
+            return usize::try_from(index).map_or(KINDS - 1, |k| k.min(KINDS - 1));
+        }
+    }
+    KINDS - 1
+}
+
+/// What reading `data`, a runner's message, is expected to take, by its kind ([`KIND_COSTS`]).
+fn costs_of(data: &[u8]) -> &'static Expect {
+    KIND_COSTS.get(kind_of(data)).unwrap_or(&REST_COSTS)
+}
 
 /// Reads runner frame `data` (postcard) and what its message carries (JSON, [`payload_of`]); the
 /// latter only for a runner whose Hello has come (`hello`), or for a message that may come before it
@@ -414,12 +446,8 @@ static FRAMES: Expect = Expect { bytes: std::sync::atomic::AtomicU64::new(0), ns
 /// its messages are still taken in order (goal 9, plan 01a1a87b2cec step 3: the hub's net loop read
 /// runners' frames on its shard, holding it up to 76 ms).
 pub async fn read_frame(data: Vec<u8>, hello: bool) -> Frame {
-    read_frame_by(&FRAMES, data, hello).await
+    read_frame_by(costs_of(&data), data, hello).await
 }
-
-/// The channel items the hub's loop reads ([`read_item`]): averages of their own, an item's message being
-/// of other sizes than a whole frame's.
-static ITEMS: Expect = Expect { bytes: std::sync::atomic::AtomicU64::new(0), ns: std::sync::atomic::AtomicU64::new(0) };
 
 /// A runner's channel item (`crate::wire::channel::Frame::Item`), as [`read_item`] read it.
 pub enum Item {
@@ -437,7 +465,7 @@ pub enum Item {
 /// whatever their length; the lab's s7c had its loop's polls under that label held up to 28 ms). An item
 /// comes after its runner's Hello.
 pub async fn read_item(body: Vec<u8>) -> Item {
-    match read_frame_by(&ITEMS, body, true).await {
+    match read_frame_by(costs_of(&body), body, true).await {
         Frame::Read { label, carried } => Item::Read { label, carried },
         Frame::Unreadable(e) => Item::Unreadable(e),
         // Read as after its Hello, so none comes before it; said as what it would be.
@@ -1215,6 +1243,21 @@ mod tests {
             anyhow::ensure!(matches!(read_item(vec![0xff; 4]).await, Item::Unreadable(_)), "bytes that aren't a message");
             Ok(())
         })
+    }
+
+    /// Goal 9, plan 01a1a87b2cec step 3: what reading a runner's message is expected to take is kept for each kind
+    /// apart, by its variant's index on the wire; a kind past the room, and bytes that don't say one, share the
+    /// last; and the room holds every kind there is.
+    #[test]
+    fn g9_s3_each_kind_of_message_has_its_own_expectation() -> anyhow::Result<()> {
+        let term = |session: &str| crate::proto::encode(&AgentMsg::TermOutput { session: session.into(), data: vec![0; 64] });
+        let harness = crate::proto::encode(&AgentMsg::Harness { session: "s".into(), json: "{}".into() })?;
+        anyhow::ensure!(!std::ptr::eq(costs_of(&term("s")?), costs_of(&harness)), "each kind its own");
+        anyhow::ensure!(std::ptr::eq(costs_of(&term("s")?), costs_of(&term("t")?)), "a kind's own, each time");
+        anyhow::ensure!(kind_of(&[0x05]) == 5 && kind_of(&[0x81, 0x01]) == (KINDS - 1).min(129), "postcard's varint");
+        anyhow::ensure!(kind_of(&[0xff, 0xff, 0xff, 0xff, 0x0f]) == KINDS - 1 && kind_of(&[]) == KINDS - 1, "past the room, or none: the last");
+        anyhow::ensure!(crate::wire::agent_classes().len() <= KINDS, "room for every kind: {}", crate::wire::agent_classes().len());
+        Ok(())
     }
 
     /// Goal 9, plan 01a1a87b2cec step 5: on a shard a payload is read straight into its type, and comes out
