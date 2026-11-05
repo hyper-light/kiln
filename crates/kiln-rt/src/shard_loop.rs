@@ -284,6 +284,15 @@ counters! {
     parks_under_4096us,
     /// Under 8192 µs.
     parks_under_8192us,
+    /// Idle moments the spin before a park spun (kiln's goal 9, plan 01a1a87b2cec step 4; `crate::park_spin`).
+    park_spins,
+    /// Of those, the ones that found work, or a timer due, before the spin ran out: a park, its wake and its senders'
+    /// kicks saved.
+    park_spin_hits,
+    /// How long those spins spun, nanoseconds, summed: CPU the shard's thread spent spinning.
+    park_spin_ns,
+    /// The spin before a park in force, nanoseconds: 0 when asked for none, or sized to none (`crate::park_spin`).
+    park_spin_now_ns,
 }
 
 /// Shape: the bounds of the park durations counted ([`Counters::parks_under_1us`] and on), nanoseconds, doubling from
@@ -405,6 +414,8 @@ struct Core {
     kick_cost: ParkCost,
     /// The parking word's kick sums last folded into `kick_cost`.
     kicks_seen: (u64, u64),
+    /// The spin before each park its thread asked for, and what sizes it (kiln's goal 9, plan 01a1a87b2cec step 4).
+    park_spin: crate::park_spin::ParkSpin,
     idle_ratio: u64,
     fixed_spin_ns: u64,
     /// The absolute deadline the shard last waited for and has not stepped since.
@@ -549,6 +560,7 @@ impl Shard {
             park_cost: ParkCost::new(),
             kick_cost: ParkCost::new(),
             kicks_seen: (0, 0),
+            park_spin: crate::park_spin::ParkSpin::default(),
             idle_ratio: config
                 .wake_tracking
                 .map_or(1, |tracking| tracking.idle_ratio),
@@ -1013,6 +1025,10 @@ impl Shard {
             if self.spin_after_activity(outcome.next_deadline_ns) {
                 continue;
             }
+            // The spin before a park its thread asked for, if any (kiln's goal 9, plan 01a1a87b2cec step 4).
+            if self.spin_before_park(outcome.next_deadline_ns) {
+                continue;
+            }
             reading = self.park_owned_then(outcome.next_deadline_ns);
         }
     }
@@ -1229,6 +1245,64 @@ impl Shard {
             self.wait_ended(false, None);
         }
         found
+    }
+
+    /// The spin before a park the shard's thread asked for (kiln's goal 9, plan 01a1a87b2cec step 4; `crate::park_spin`):
+    /// true when work came, or `deadline_ns` fell due, before it ran out. Each idle moment, as long as the ask says: a
+    /// fixed time, or what the shard's own gaps make cheapest in CPU; none where none was asked for, as before, or off a
+    /// real clock. Its spins, hits and time are counted; a spin that runs out leaves its idle moment's gap to the park.
+    fn spin_before_park(&mut self, deadline_ns: Option<u64>) -> bool {
+        let asked = crate::park_spin::asked();
+        if asked != self.core.park_spin.ask() {
+            self.take_park_spin(asked);
+        }
+        if asked == crate::park_spin::Ask::Off || self.core.driver_lost || !self.core.real_time {
+            return false;
+        }
+        let spin_ns = self.core.park_spin.spin_ns();
+        let (found, spun) = if spin_ns == 0 {
+            (false, 0)
+        } else {
+            let start = self.carried_now_ns();
+            self.core.attribution.wait_began();
+            if let Some(entry) = self.desk.entry {
+                entry.pulse.record_spinning(true);
+            }
+            let found = self.spin_for_work(start.saturating_add(spin_ns), deadline_ns);
+            if let Some(entry) = self.desk.entry {
+                entry.pulse.record_spinning(false);
+            }
+            let spun = self.carried_now_ns().saturating_sub(start);
+            count(&self.desk.live.park_spins, 1);
+            count(&self.desk.live.park_spin_ns, spun);
+            (found, spun)
+        };
+        if found {
+            count(&self.desk.live.park_spin_hits, 1);
+            // No driver wait: its retrieval age stands, as after the activity spin's.
+            self.wait_ended(false, None);
+            let park_ns = self.blocking_cost_ns();
+            self.core.park_spin.hit(spun, park_ns);
+        } else {
+            self.core.park_spin.missed(spun);
+        }
+        self.desk.live.park_spin_now_ns.set(self.core.park_spin.spin_ns());
+        found
+    }
+
+    /// Takes the thread's new ask for a spin before each park. A spin that sizes itself reads each gap a kick ended to
+    /// the kick's stamp, so its senders stamp their kicks from now on (`Parking::time_wakes`; the stamps and the
+    /// senders' CPU around their kicks are measurement words, outside the parking protocol).
+    #[cold]
+    fn take_park_spin(&mut self, asked: crate::park_spin::Ask) {
+        self.core.park_spin.take(asked);
+        if self.core.park_spin.sizes()
+            && self.core.real_time
+            && let Some(entry) = self.desk.entry
+        {
+            entry.parking.time_wakes();
+        }
+        self.desk.live.park_spin_now_ns.set(self.core.park_spin.spin_ns());
     }
 
     /// The spin: true when work arrived or `deadline_ns` fell due before `spin_end`. Each turn asks the
@@ -1570,6 +1644,12 @@ impl Shard {
         deadline_ns: Option<u64>,
     ) -> (bool, Option<Reading>) {
         let learns = self.core.real_time && self.core.wake.is_some();
+        // A spin before each park that sizes itself reads each park's gap, and learns what a park costs from the parks
+        // it pays on the thread's task clock, no system call, where a learning shard doesn't read its OS clock already
+        // (kiln's goal 9, plan 01a1a87b2cec step 4; `crate::park_spin`).
+        let spin_sizes = self.core.park_spin.sizes();
+        let reads_run = spin_sizes && !learns;
+        let mut run_before = None;
         let mut switches_before_wait = None;
         let mut woke = None;
         // The CPU clock is read (a system call) only by a learning shard, only around a wait it makes, and
@@ -1594,11 +1674,18 @@ impl Shard {
                     cpu_before = attribution::thread_cpu_now();
                     count(&self.desk.live.park_cost_reads, 1);
                 }
+                if reads_run {
+                    run_before = self.desk.task_clock.as_ref().and_then(crate::task_clock::TaskClock::run_ns);
+                }
                 woke = self.wait_in_driver(deadline_ns);
             },
         );
         let Parked::Waited(woken) = parked else {
             count(&self.desk.live.parks_withdrawn, 1);
+            if spin_sizes {
+                let park_ns = self.blocking_cost_ns();
+                self.core.park_spin.withdrawn(park_ns);
+            }
             return (false, None);
         };
         if let Some(woken) = woken {
@@ -1609,6 +1696,15 @@ impl Shard {
             if let Some(after) = attribution::thread_cpu_now() {
                 self.note_park_cost(entry, after.saturating_sub(before));
             }
+        }
+        if spin_sizes {
+            if let Some(before) = run_before
+                && let Some(after) = self.desk.task_clock.as_ref().and_then(crate::task_clock::TaskClock::run_ns)
+            {
+                self.note_park_cost(entry, after.saturating_sub(before));
+            }
+            let park_ns = self.blocking_cost_ns();
+            self.core.park_spin.waited(woken, park_ns);
         }
         (true, woke.filter(|_| !learns))
     }
@@ -2638,3 +2734,7 @@ mod wake_counts;
 // Kiln's goal 9, plan 01a1a87b2cec step 5: what the loop does per turn that it needn't.
 #[cfg(test)]
 mod turn_costs;
+
+// Kiln's goal 9, plan 01a1a87b2cec step 4: the spin before a park, in the loop.
+#[cfg(test)]
+mod park_spin_loop;

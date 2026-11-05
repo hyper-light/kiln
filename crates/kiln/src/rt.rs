@@ -331,9 +331,10 @@ static NUDGE_REFUSAL: OnceLock<hyper_rt::compute::Refusal> = OnceLock::new();
 /// for the shards"; goal 8, plan 01a1a59c2b29 step 7; goal 6, plan 01a1a59c2abe step 3): a nudged shard's
 /// waits in its driver end by the period [`nudge_period_ns`] gives, so a shard woken behind a thread busy in
 /// user space on a kernel that preempts lazily runs at its own timer's interrupt, not at the kernel's next
-/// tick (up to 1 ms at 1000 Hz). `on` nudges every wait; `auto`, the server's default, only while the shard's
-/// host holds its wakes, judged by its probe each period (`crate::nudge`), so a calm server pays nothing; `off`
-/// never. In the real-time class's place where that's refused: a shard that took the real-time class
+/// tick (up to 1 ms at 1000 Hz). `on` nudges every wait; `auto`, the mode a config declares, only while the
+/// shard's host holds its wakes, judged by its probe each period (`crate::nudge`), so a calm server pays nothing;
+/// `off`, the default until a config declares another (docs/ci.md §0.3, "Opt-in automation"), never. In the
+/// real-time class's place where that's refused: a shard that took the real-time class
 /// ([`realtime`]) preempts at once and doesn't nudge. The log and `/healthz/server` say how the shards took it
 /// ([`nudge_status`]). Call it before the runtime starts: later calls change nothing. A process that never
 /// calls it (a runner, a command) doesn't nudge.
@@ -347,16 +348,21 @@ fn nudge_mode() -> crate::nudge::Mode {
 }
 
 /// The nudge's period: `KILN_RT_NUDGE_US` microseconds where it's set and above 0 (the lab's A/B of
-/// periods, as `KILN_RT_QUANTUM_US` the quantum's), else the timers' tick, `timer_tick_ns`. The shard's
-/// timer slack is that tick too (hyper-rt's `Shard::build`), which the kernel adds to every timed wait,
-/// so at the tick a nudged shard's CPU is interrupted at least every two ticks while it waits: a shard
-/// woken behind a busy thread waits no longer than a timer of its own may be late (hyper-rt's
-/// `Driver::set_timer_slack_ns`: a timed wait ends at most a tick late).
-fn nudge_period_ns(timer_tick_ns: u64, env_us: Option<&str>) -> u64 {
+/// periods, as `KILN_RT_QUANTUM_US` the quantum's), else the longest that keeps a shard woken behind a busy
+/// thread within a step quantum of its CPU (goal 9, plan 01a1a87b2cec step 4: a wait's timeout derived from
+/// the tick). The quantum is the host's share of a ready task's delay ([`STEP_BUDGET_NS`]: its CPU, where
+/// another thread holds it, for about a quantum), and each of a nudged shard's waits ends within its period
+/// and the timer slack the kernel adds to every timed wait, the timers' tick (hyper-rt's `Shard::build`), so
+/// the period is the quantum less that tick, 166.7 µs at kiln's: an interrupt of the shard's own at least
+/// every 266.7 µs while it waits, 3,750 a second, where the timers' tick as the period gave one every 200 µs,
+/// 5,000 a second, for no bar it holds. Never shorter than that tick, the finest wait a shard keeps (a lab's
+/// quantum under two ticks). The kernel's own tick bounds the same wait too, at a millisecond on every HZ
+/// Linux offers (1000 at most), longer than any quantum the bar allows, so the nudge never leaves it to that.
+fn nudge_period_ns(step_budget_ns: u64, timer_tick_ns: u64, env_us: Option<&str>) -> u64 {
     env_us
         .and_then(|us| us.trim().parse::<u64>().ok())
         .filter(|us| *us > 0)
-        .map_or(timer_tick_ns, |us| us.saturating_mul(1000))
+        .map_or_else(|| step_budget_ns.saturating_sub(timer_tick_ns).max(timer_tick_ns), |us| us.saturating_mul(1000))
 }
 
 /// What a shard asks the OS for as it starts, past the real-time class (goal 3, plan 01a1a59c2a8e
@@ -486,6 +492,89 @@ fn answer_nudge(mode: crate::nudge::Mode, nudges: bool, period_ns: u64) {
             tracing::info!("{line}");
         } else {
             tracing::warn!("{line}");
+        }
+    }
+}
+
+/// What each of the server's shards asks of its spin before a park (goal 9, plan 01a1a87b2cec step 4;
+/// `hyper_rt::park_spin`; docs/priority.md, "A spin before the park"): `KILN_RT_SPIN_US` microseconds,
+/// `fixed_us`, where it's set and above 0, at every idle moment whatever it costs (the lab's measure of what a
+/// spin buys and costs); else, where `KILN_RT_SPIN` is on, `on`, the spin each shard's own gaps make cheapest
+/// in CPU, up to 16 µs (`hyper_rt::park_spin::CAP_NS`), so it spends less of the shard's CPU than parking at
+/// once wherever it spins; else none, as before. Off until asked: the lab's A/B decides whether it becomes a
+/// default (docs/runtime-lab.md, "The shard's own wake path").
+fn spin_ask(on: Option<&str>, fixed_us: Option<&str>) -> hyper_rt::park_spin::Ask {
+    use hyper_rt::park_spin::{Ask, CAP_NS};
+    if let Some(us) = fixed_us.and_then(|us| us.trim().parse::<u64>().ok()).filter(|us| *us > 0) {
+        return Ask::Fixed { ns: us.saturating_mul(1000) };
+    }
+    match on.map(str::trim) {
+        Some(v) if !v.is_empty() && !matches!(v, "0" | "false" | "off" | "no") => Ask::Sized { cap_ns: CAP_NS },
+        _ => Ask::Off,
+    }
+}
+
+/// The spin before a park the shards were asked for ([`spin_ask`]), once the runtime started.
+static SPIN: OnceLock<hyper_rt::park_spin::Ask> = OnceLock::new();
+
+/// How many shards answer the spin: the runtime's, where one was asked for.
+static SPIN_SHARDS: AtomicU32 = AtomicU32::new(0);
+
+/// The shards that took the spin, and those refused it (a task off its shard's thread: never, here), in one atomic
+/// as the nudge's answers are, refusals in units of [`REFUSED_ONE`].
+static SPIN_ANSWERS: AtomicU32 = AtomicU32::new(0);
+
+/// How the shards took the spin before a park ([`spin_ask`]), for the log and `/healthz/server`.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
+pub struct Spin {
+    /// What was asked: `off`, `sized` (as long as each shard's own gaps make cheapest in CPU) or `fixed`.
+    pub asked: &'static str,
+    /// Its length, microseconds: the sized spin's cap, the fixed spin's time; 0 when off.
+    pub us: u64,
+    /// The shards that answered it.
+    pub shards: u32,
+    /// Of them, those that took it.
+    pub took: u32,
+}
+
+impl Spin {
+    /// The line it's said with once every shard has answered; `None` before, or not asked for.
+    pub fn said(&self) -> Option<String> {
+        if self.asked == "off" || self.shards == 0 || self.took < self.shards {
+            return None;
+        }
+        Some(match self.asked {
+            "sized" => format!("the server's {} shards spin before each park as long as their own gaps make cheapest in CPU, up to {} µs: a gap a spin catches needs no wake (KILN_RT_SPIN)", self.took, self.us),
+            _ => format!("the server's {} shards spin {} µs before each park, whatever it costs (KILN_RT_SPIN_US, the lab's measure)", self.took, self.us),
+        })
+    }
+}
+
+/// How the shards took the spin so far ([`spin_ask`]).
+pub fn spin_status() -> Spin {
+    spin_of(SPIN.get().copied().unwrap_or_default(), SPIN_ANSWERS.load(Ordering::Acquire))
+}
+
+/// [`Spin`] from what was asked and the shards' `answers` ([`SPIN_ANSWERS`]).
+fn spin_of(ask: hyper_rt::park_spin::Ask, answers: u32) -> Spin {
+    use hyper_rt::park_spin::Ask;
+    let (asked, ns) = match ask {
+        Ask::Off => ("off", 0),
+        Ask::Sized { cap_ns } => ("sized", cap_ns),
+        Ask::Fixed { ns } => ("fixed", ns),
+    };
+    Spin { asked, us: ns / 1000, shards: SPIN_SHARDS.load(Ordering::Relaxed), took: answers % REFUSED_ONE }
+}
+
+/// A shard takes the spin asked for ([`spin_ask`]), on its own thread; the last to answer says how they all did, once.
+fn answer_spin(ask: hyper_rt::park_spin::Ask) {
+    let one = if hyper_rt::park_spin::ask_current_thread(ask).is_ok() { 1 } else { REFUSED_ONE };
+    let answers = SPIN_ANSWERS.fetch_add(one, Ordering::AcqRel).wrapping_add(one);
+    let status = spin_of(ask, answers);
+    if status.took.saturating_add(answers / REFUSED_ONE) == status.shards {
+        match status.said() {
+            Some(line) => tracing::info!("{line}"),
+            None => tracing::warn!(refused = answers / REFUSED_ONE, "a shard was refused its spin before a park: it parks at once"),
         }
     }
 }
@@ -664,10 +753,16 @@ fn start() -> Result<Rt, String> {
     }
     let mode = nudge_mode();
     let nudge = mode != crate::nudge::Mode::Off;
-    let period_ns = nudge_period_ns(config.timer_tick_ns, std::env::var("KILN_RT_NUDGE_US").ok().as_deref());
+    let period_ns = nudge_period_ns(config.step_budget_ns, config.timer_tick_ns, std::env::var("KILN_RT_NUDGE_US").ok().as_deref());
     if nudge {
         NUDGE_PERIOD_NS.store(period_ns, Ordering::Relaxed);
         NUDGE_SHARDS.store(shards, Ordering::Relaxed);
+    }
+    // The spin before each park, where the lab asks for one (goal 9, plan 01a1a87b2cec step 4; [`spin_ask`]).
+    let spin = spin_ask(std::env::var("KILN_RT_SPIN").ok().as_deref(), std::env::var("KILN_RT_SPIN_US").ok().as_deref());
+    let _ = SPIN.set(spin);
+    if spin != hyper_rt::park_spin::Ask::Off {
+        SPIN_SHARDS.store(shards, Ordering::Relaxed);
     }
     for holder in &holders {
         let slice = config.step_budget_ns;
@@ -684,6 +779,9 @@ fn start() -> Result<Rt, String> {
             }
             if nudge {
                 answer_nudge(mode, asks.nudge, period_ns);
+            }
+            if spin != hyper_rt::park_spin::Ask::Off {
+                answer_spin(spin);
             }
         });
     }
@@ -2372,17 +2470,59 @@ mod tests {
         assert_eq!(shard_asks(false, false), ShardAsks { slice: true, nudge: false }, "the nudge only where asked for");
     }
 
-    /// Goal 8 (plan 01a1a59c2b29 step 7): the nudge's period is the timers' tick, which with the shard's slack
-    /// (that tick too) bounds a nudged shard's wake as its own timers' lateness is bounded; the lab may set
-    /// another in microseconds, and a value that isn't a positive count leaves the tick.
+    /// Goal 8 (plan 01a1a59c2b29 step 7), goal 9 (plan 01a1a87b2cec step 4): the nudge's period is the step
+    /// quantum less the timers' tick, the slack the kernel adds to each wait, so a nudged shard's CPU takes an
+    /// interrupt of its own within a quantum of the last while it waits: 166.666 µs at kiln's, where the tick as
+    /// the period woke each waiting shard a third again as often. Never under the tick; the lab may set another
+    /// in microseconds, and a value that isn't a positive count leaves the derived one.
     #[test]
-    fn g8_s7_the_nudge_s_period_is_the_timers_tick_unless_the_lab_sets_it() {
-        let tick = runtime_config(4, 64).timer_tick_ns;
-        assert_eq!(nudge_period_ns(tick, None), tick);
-        assert_eq!(nudge_period_ns(tick, Some("50")), 50_000);
-        assert_eq!(nudge_period_ns(tick, Some(" 250 ")), 250_000);
-        assert_eq!(nudge_period_ns(tick, Some("0")), tick, "0 isn't a period");
-        assert_eq!(nudge_period_ns(tick, Some("soon")), tick);
+    fn g9_s4_the_nudge_s_period_is_the_quantum_less_the_timers_slack() {
+        let c = runtime_config(4, 64);
+        let derived = nudge_period_ns(c.step_budget_ns, c.timer_tick_ns, None);
+        assert_eq!(derived, 166_666);
+        assert!(derived + c.timer_tick_ns <= c.step_budget_ns, "each nudge's interrupt within a quantum of the last");
+        assert_eq!(1_000_000_000 / (derived + c.timer_tick_ns), 3_750, "wakes a second of a waiting shard");
+        assert_eq!(1_000_000_000 / (2 * c.timer_tick_ns), 5_000, "with the tick as the period");
+        assert_eq!(nudge_period_ns(150_000, TIMER_TICK_NS, None), TIMER_TICK_NS, "a quantum under two ticks: the tick");
+        assert_eq!(nudge_period_ns(c.step_budget_ns, c.timer_tick_ns, Some("50")), 50_000);
+        assert_eq!(nudge_period_ns(c.step_budget_ns, c.timer_tick_ns, Some(" 250 ")), 250_000);
+        assert_eq!(nudge_period_ns(c.step_budget_ns, c.timer_tick_ns, Some("0")), derived, "0 isn't a period");
+        assert_eq!(nudge_period_ns(c.step_budget_ns, c.timer_tick_ns, Some("soon")), derived);
+    }
+
+    /// Goal 9 (plan 01a1a87b2cec step 4): the spin before a park is off unless the lab asks for it: `KILN_RT_SPIN` on
+    /// asks for the spin each shard's own gaps size, up to 16 µs; `KILN_RT_SPIN_US` for a fixed one, which goes first;
+    /// anything else is none, as before.
+    #[test]
+    fn g9_s4_the_spin_before_a_park_is_the_labs_to_ask_for() {
+        use hyper_rt::park_spin::{Ask, CAP_NS};
+        assert_eq!(spin_ask(None, None), Ask::Off);
+        for off in ["", "0", "false", "off", "no", " off "] {
+            assert_eq!(spin_ask(Some(off), None), Ask::Off, "{off:?}");
+        }
+        for on in ["1", "on", "true", "auto", " yes "] {
+            assert_eq!(spin_ask(Some(on), None), Ask::Sized { cap_ns: CAP_NS }, "{on:?}");
+        }
+        assert_eq!(CAP_NS, 16_000);
+        assert_eq!(spin_ask(None, Some("16")), Ask::Fixed { ns: 16_000 });
+        assert_eq!(spin_ask(Some("off"), Some(" 4 ")), Ask::Fixed { ns: 4_000 }, "a fixed spin asked for goes first");
+        assert_eq!(spin_ask(Some("1"), Some("0")), Ask::Sized { cap_ns: CAP_NS }, "0 isn't a spin's length");
+        assert_eq!(spin_ask(None, Some("soon")), Ask::Off);
+    }
+
+    /// Goal 9 (plan 01a1a87b2cec step 4): how the shards took the spin is said once every shard has answered, never
+    /// when none was asked for; what was asked reads back from its ask, and the answers count in one atomic.
+    #[test]
+    fn g9_s4_the_spin_is_said_as_the_shards_took_it() {
+        use hyper_rt::park_spin::Ask;
+        let status = |asked, us, took| Spin { asked, us, shards: 4, took };
+        assert_eq!(Spin { asked: "off", us: 0, shards: 0, took: 0 }.said(), None, "not asked for: nothing to say");
+        assert_eq!(status("sized", 16, 3).said(), None, "not every shard has answered");
+        assert!(status("sized", 16, 4).said().is_some_and(|s| s.contains("4 shards spin before each park") && s.contains("up to 16 µs")));
+        assert!(status("fixed", 8, 4).said().is_some_and(|s| s.contains("spin 8 µs before each park") && s.contains("KILN_RT_SPIN_US")));
+        let sized = spin_of(Ask::Sized { cap_ns: 16_000 }, 2 + REFUSED_ONE);
+        assert_eq!((sized.asked, sized.us, sized.took), ("sized", 16, 2));
+        assert_eq!((spin_of(Ask::Fixed { ns: 8_000 }, 0).asked, spin_of(Ask::Off, 0).asked), ("fixed", "off"));
     }
 
     /// Goal 8 (plan 01a1a59c2b29 step 7): how the shards took the nudge is said once all of them answered,
@@ -2404,7 +2544,7 @@ mod tests {
         assert_eq!((answers % NUDGE_REALTIME_ONE, (answers / NUDGE_REALTIME_ONE) % NUDGE_REALTIME_ONE, answers / NUDGE_REFUSED_ONE), (2, 3, 64));
     }
 
-    /// Goal 8 (plan 01a1a59c2b29 step 7) and goal 6 (plan 01a1a59c2abe step 3): `auto`, the server's default, is said as
+    /// Goal 8 (plan 01a1a59c2b29 step 7) and goal 6 (plan 01a1a59c2abe step 3): `auto`, the mode a config declares, is said as
     /// nudging only while a shard's host holds its wakes, with the threshold it judges by; `/healthz/server` carries the
     /// mode as its word and the shards nudging now; a process that never set it (a runner, a command) doesn't nudge.
     #[test]

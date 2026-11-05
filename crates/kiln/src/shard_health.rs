@@ -107,6 +107,8 @@ pub struct Shard {
     calls: CallCells,
     /// How long its parks lasted ([`ParkTimes`]), as the probe last copied them.
     parks: ParkCells,
+    /// What its spin before a park did ([`Spins`]), as the probe last copied it.
+    spins: SpinCells,
 }
 
 /// What a shard's parks and wakes cost it, as hyper-rt counts them on the shard (goal 9, plan 01a1a87b2cec step
@@ -275,6 +277,41 @@ impl ParkCells {
     }
 }
 
+/// What a shard's spin before a park did, as hyper-rt counts it on the shard (goal 9, plan 01a1a87b2cec step 4;
+/// `hyper_rt::park_spin`): its spins, those that found work before they ran out (each a park, its wake and its
+/// senders' kick saved), the time they spun (CPU its busy share counts), and the spin in force. All 0 where none was
+/// asked for (`KILN_RT_SPIN`, `crate::rt`).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Spins {
+    pub spins: u64,
+    pub hits: u64,
+    pub spun_ns: u64,
+    pub now_ns: u64,
+}
+
+impl Spins {
+    fn of(c: &hyper_rt::shard_loop::Counters) -> Self {
+        Self { spins: c.park_spins, hits: c.park_spin_hits, spun_ns: c.park_spin_ns, now_ns: c.park_spin_now_ns }
+    }
+}
+
+/// [`Spins`] as the probe stores them: an atomic each, in [`Spins`]' order.
+#[derive(Default)]
+struct SpinCells([AtomicU64; 4]);
+
+impl SpinCells {
+    fn store(&self, spins: &Spins) {
+        for (cell, n) in self.0.iter().zip([spins.spins, spins.hits, spins.spun_ns, spins.now_ns]) {
+            cell.store(n, Ordering::Relaxed);
+        }
+    }
+
+    fn load(&self) -> Spins {
+        let [spins, hits, spun_ns, now_ns] = self.0.each_ref().map(|cell| cell.load(Ordering::Relaxed));
+        Spins { spins, hits, spun_ns, now_ns }
+    }
+}
+
 impl Shard {
     fn new() -> Self {
         Self {
@@ -296,6 +333,7 @@ impl Shard {
             wakes: WakeCells::default(),
             calls: CallCells::default(),
             parks: ParkCells::default(),
+            spins: SpinCells::default(),
         }
     }
 
@@ -324,6 +362,7 @@ impl Shard {
                 self.wakes.store(&Wakes::of(c));
                 self.calls.store(&Calls::of(c));
                 self.parks.store(&ParkTimes::of(c));
+                self.spins.store(&Spins::of(c));
             }
         }
         if let Some(q) = hyper_rt::futures::step_budget_ns() {
@@ -352,6 +391,11 @@ impl Shard {
     /// How long its parks have lasted, as its probe last copied them ([`ParkTimes`]).
     pub fn parks(&self) -> ParkTimes {
         self.parks.load()
+    }
+
+    /// What its spin before a park did, as its probe last copied it ([`Spins`]).
+    pub fn spins(&self) -> Spins {
+        self.spins.load()
     }
 
     /// What the shard's probe has noted, as it stands.
@@ -635,7 +679,26 @@ pub fn render(o: &mut String) {
     render_wakes(o, &all.iter().map(Shard::wakes).collect::<Vec<_>>(), &help);
     render_calls(o, &all.iter().map(Shard::calls).collect::<Vec<_>>(), &help);
     render_parks(o, &all.iter().map(|s| (s.parks(), s.wakes().parks)).collect::<Vec<_>>(), &help);
+    render_spins(o, &all.iter().map(Shard::spins).collect::<Vec<_>>(), &help);
     render_held(o, &help);
+}
+
+/// The families of what each shard's spin before a park did ([`Spins`]; goal 9, plan 01a1a87b2cec step 4), from `all`,
+/// each shard's in the runtime's order: its spins and their hits, the time they spun, and the spin in force.
+fn render_spins(o: &mut String, all: &[Spins], help: &dyn Fn(&mut String, &str, &str, &str)) {
+    type Value = fn(&Spins) -> String;
+    let families: [(&str, &str, &str, Value); 4] = [
+        ("kiln_shard_spins_total", "counter", "Idle moments each shard spun before it parked (KILN_RT_SPIN; none where it wasn't asked for).", |s: &Spins| s.spins.to_string()),
+        ("kiln_shard_spin_hits_total", "counter", "Of those, the spins that found work before they ran out: each a park, its wake and its senders' kick saved.", |s: &Spins| s.hits.to_string()),
+        ("kiln_shard_spin_seconds_total", "counter", "The time each shard's spins before its parks spun: CPU its busy share counts.", |s: &Spins| secs(Duration::from_nanos(s.spun_ns)).to_string()),
+        ("kiln_shard_spin_window_seconds", "gauge", "The spin before a park each shard makes now: the one its own gaps make cheapest in CPU where it sizes itself, the asked one where fixed, 0 for none.", |s: &Spins| secs(Duration::from_nanos(s.now_ns)).to_string()),
+    ];
+    for (name, kind, h, value) in families {
+        help(o, name, kind, h);
+        for (i, s) in all.iter().enumerate() {
+            let _ = writeln!(o, "{name}{{shard=\"{i}\"}} {}", value(s));
+        }
+    }
 }
 
 /// `kiln_shard_park_seconds`: how long each shard's parks lasted ([`ParkTimes`]; goal 9, plan 01a1a87b2cec step 5), a
@@ -909,6 +972,35 @@ mod tests {
             "kiln_shard_park_seconds_bucket{shard=\"0\",le=\"+Inf\"} 4",
             "kiln_shard_park_seconds_sum{shard=\"0\"} 0.003",
             "kiln_shard_park_seconds_count{shard=\"0\"} 4",
+        ] {
+            assert!(o.lines().any(|l| l == line), "{line:?} not in:\n{o}");
+        }
+    }
+
+    /// Goal 9, plan 01a1a87b2cec step 4: what a shard's spin before a park did is on `/metrics`, each count in its
+    /// place, its time and the spin in force in seconds, and survives the probe's atomics as it was; a shard asked for
+    /// none says zeros.
+    #[test]
+    fn g9_s4_each_shards_spins_before_its_parks_are_on_metrics() {
+        let c = hyper_rt::shard_loop::Counters { park_spins: 10, park_spin_hits: 4, park_spin_ns: 120_000, park_spin_now_ns: 16_000, ..Default::default() };
+        let spins = Spins::of(&c);
+        assert_eq!(spins, Spins { spins: 10, hits: 4, spun_ns: 120_000, now_ns: 16_000 });
+        let cells = SpinCells::default();
+        cells.store(&spins);
+        assert_eq!(cells.load(), spins);
+        let mut o = String::new();
+        render_spins(&mut o, &[spins, Spins::default()], &|o: &mut String, name: &str, kind: &str, _: &str| {
+            let _ = writeln!(o, "# TYPE {name} {kind}");
+        });
+        for line in [
+            "# TYPE kiln_shard_spins_total counter",
+            "kiln_shard_spins_total{shard=\"0\"} 10",
+            "kiln_shard_spin_hits_total{shard=\"0\"} 4",
+            "kiln_shard_spin_seconds_total{shard=\"0\"} 0.00012",
+            "# TYPE kiln_shard_spin_window_seconds gauge",
+            "kiln_shard_spin_window_seconds{shard=\"0\"} 0.000016",
+            "kiln_shard_spins_total{shard=\"1\"} 0",
+            "kiln_shard_spin_window_seconds{shard=\"1\"} 0",
         ] {
             assert!(o.lines().any(|l| l == line), "{line:?} not in:\n{o}");
         }
