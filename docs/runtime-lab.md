@@ -1104,6 +1104,46 @@ Goal 11 of the API runtime program (plan `01a1a87b2e5673758106c92602a8b04d`, res
 `01a1a87b2e577517ab4c81874f8700a2`): in the lab's realistic profile the server's resident memory is at
 most a tenth of goal 3's (113 MB, from 1,132 MB), with no latency number worse.
 
+### Where the memory goes (step 1)
+
+fedora, 2026-11-05 12:59 to 13:24 UTC, the realistic profile, calm, 4 shards, the server on 8 CPUs of its
+own (16-23) and the lab on 0-7: main before goal 11 (`1460599d430`) against train 4's tree (`4b429f1a05c`),
+both the static musl build production runs, 8 interleaved rounds each; then one round each of the same
+tree's glibc build, under jemalloc's heap profile and on glibc's own malloc with `malloc_info`
+(`g11load.sh`, with step 3's scripts). Resident memory at the window's end, MB, the median of 8 rounds:
+
+| | main | train 4 |
+| --- | --- | --- |
+| all (`server.rss_mb`) | 1,126 (1,028 to 1,141) | 526 (454 to 570) |
+| the binary's pages (file) | | 127 (104 to 127) |
+| anonymous | | 401 (328 to 443) |
+| of it, named on `/metrics` | | 51: `session_segments` 30.0, `bus` 7.2, `session_entries` 6.3, `sqlite` 3.9, `ui_assets` 3.0, `custody_receipts` 0.4, `ui_events` 0.2 |
+| of it, not named | | 351 (277 to 395) |
+
+What's live, by jemalloc's heap profile at the window's end: 165 MB (its estimate from samples), by owner:
+
+| owner | MB | the most of it |
+| --- | --- | --- |
+| sessions' copies | 45.5 | packed segments 29.7 (`session_segments`), the registry's entries and mirrors 12.6, compaction 3.2 |
+| the runtime | 27.7 | each shard's context 16.4, and its interests, timer wheel and queues |
+| other | 18.5 | hyper_log's device and its buffers 16.4 |
+| the network (QUIC, the net thread) | 15.2 | the send budget's reserve 8.3, QUIC's transmits 5.2 |
+| observe | 11.9 | its index 4.0, its owner 3.2, its store 2.1 |
+| kiln.db (SQLite and its group) | 11.7 | SQLite's page cache 4.7, the group's driver 2.6, the capture's tables 2.1 |
+| the bus (live feeds' frames) | 10.1 | Quiver's frames 6.8 |
+| the conversation store | 9.0 | its feed's decoding 5.2, custody's intake 2.6, turso 1.1 |
+| snapshots in flight | 6.3 | packed for viewers 3.3, being sent 2.4 |
+| UI assets | 5.4 | gzip 3.8, brotli 1.6 |
+| HTTP | 2.3 | websockets' buffers 1.8 |
+| queues made up front; runners, CI and CD | 1.0 | |
+
+The rest of the anonymous memory is the allocator's: on glibc's malloc, 88 arenas (one for nearly each of
+the server's 88 threads) had taken 438 MB from the system with 297 MB of it free; under jemalloc, 261 MB
+resident held the 165 MB live. On musl's malloc, which production runs, the same code's 401 MB holds about
+the same live heap, so about 235 MB is what the allocator keeps. Against the bar: the live heap alone (165
+MB) is past 113 MB, and the binary's own resident pages (127 MB) are past it too, so step 5 needs the
+allocator's (step 4), less held live, and a word on whether file pages count.
+
 ### Every cache and buffer, bounded (step 3)
 
 Each holds at most a stated number of bytes, from a measurement or a stated derivation, and says what
