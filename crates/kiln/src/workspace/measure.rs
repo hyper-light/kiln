@@ -257,7 +257,7 @@ async fn follow(key: String, rx: async_channel::Receiver<Event>, metrics: PathBu
                         tail.drain(..tail.len() - TAIL);
                     }
                 }
-                Ok(Event::Exit { code, error }) => break (code, error),
+                Ok(Event::Exit { code, error, .. }) => break (code, error),
                 Err(_) => break (None, Some("kiln lost track of it".to_owned())),
             },
             () = deadline => {

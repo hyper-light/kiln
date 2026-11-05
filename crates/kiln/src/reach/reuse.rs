@@ -214,6 +214,17 @@ impl Kept {
             self.pieces.push((err, data.to_vec()));
         }
     }
+
+    /// What the run said, as it goes by: its output kept, and all of it let go when it goes again at
+    /// its ask after a try killed for memory (`[reach] retry_oom`): only the try that ends is
+    /// recorded (audit H6).
+    fn hear(&mut self, e: &Ev) {
+        match e {
+            Ev::Output { err, data } => self.see(*err, data),
+            Ev::Note(n) if n.starts_with(super::history::AGAIN) => *self = Kept::default(),
+            _ => {}
+        }
+    }
 }
 
 /// `kiln run --reuse`, start to end: keyed and looked up first; a hit replayed, a miss run as
@@ -266,8 +277,8 @@ pub async fn run_with(svc: Option<&std::sync::Arc<Service>>, handle: &Handle, me
     let forwarding = async {
         let mut kept = Kept::default();
         while let Ok(e) = seen.recv().await {
+            kept.hear(&e);
             match &e {
-                Ev::Output { err, data } => kept.see(*err, data),
                 Ev::Exit { code: Some(0), error: None, lost: 0 } if !kept.over => {
                     let ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
                     let note = match record(svc, &keyed, &kept.pieces, ms).await {
@@ -290,6 +301,19 @@ pub async fn run_with(svc: Option<&std::sync::Arc<Service>>, handle: &Handle, me
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// H6: a reused run that went again at its ask after a try killed for memory records only the
+    /// try that ended, not both tries' output.
+    #[test]
+    fn h6_a_retry_records_only_the_try_that_ended() {
+        let mut k = Kept::default();
+        let out = |s: &str| Ev::Output { err: false, data: s.as_bytes().to_vec() };
+        for e in [out("first try\n"), Ev::Note("used 1 GiB at most; killed for memory".into()), Ev::Note(format!("{} again at its ask", super::super::history::AGAIN)), out("second try\n"), Ev::Note("used 4 GiB at most".into())] {
+            k.hear(&e);
+        }
+        assert_eq!(k.pieces, vec![(false, b"second try\n".to_vec())]);
+        assert_eq!((k.bytes, k.over), (11, false));
+    }
 
     fn runner(name: &str) -> RunnerInfo {
         RunnerInfo { name: name.to_owned(), os: "linux".to_owned(), arch: "x86_64".to_owned(), connected: true, ..RunnerInfo::default() }

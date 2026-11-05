@@ -251,7 +251,7 @@ pub async fn runner_ask(hub: &Arc<Hub>, runner: &str, peer: crate::instances::Pe
         Question::Registry { session, terminal } | Question::Call { session, terminal, .. } => (session.as_str(), terminal.as_str()),
         Question::Page { session, .. } | Question::Stream { session, .. } | Question::Act { session, .. } => (session.as_str(), ""),
         // The hub answers these itself (`Hub::on_read`).
-        Question::Keep { .. } | Question::Holds { .. } | Question::Holders { .. } => return json!({"error": "not a question for kiln's operations"}),
+        Question::Keep { .. } | Question::Holds { .. } | Question::Holders { .. } | Question::Sizes { .. } | Question::Measured { .. } => return json!({"error": "not a question for kiln's operations"}),
     };
     // The person in one of its kiln shells (`kiln spawn --on`, `kiln agents wait`), for a call.
     let caller = if session.is_empty() && !terminal.is_empty() && matches!(ask, Question::Call { .. }) {
@@ -388,7 +388,7 @@ pub async fn runner_ask(hub: &Arc<Hub>, runner: &str, peer: crate::instances::Pe
         Question::Act { .. } => json!({"ok": {}}),
         Question::Directory => json!({ "runners": hub.reach_directory() }),
         Question::Unread { session, what, code, why } => runner_unread(hub, runner, session, what, *code, why).await,
-        Question::Keep { .. } | Question::Holds { .. } | Question::Holders { .. } => json!({"error": "not a question for kiln's operations"}),
+        Question::Keep { .. } | Question::Holds { .. } | Question::Holders { .. } | Question::Sizes { .. } | Question::Measured { .. } => json!({"error": "not a question for kiln's operations"}),
     };
     let size = answer.to_string().len();
     if size > RUNNER_ANSWER_MAX {

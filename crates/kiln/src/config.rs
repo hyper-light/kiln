@@ -55,6 +55,29 @@ pub struct Config {
     pub secrets: BTreeMap<String, String>,
     /// kiln's records through the cluster group (docs/p2p.md).
     pub cluster: Cluster,
+    /// What reach decides on its own about runs on other machines (docs/reach.md, "Sizes from
+    /// history"): each off until declared.
+    pub reach: Reach,
+}
+
+/// `[reach]` (docs/reach.md, "Sizes from history"; docs/needs.md E6): what kiln decides on its own
+/// about reach runs, each off until the person declares it (AGENTS.md: opt-in automation). Every
+/// run is measured and kept either way.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct Reach {
+    /// What sizes a run for placement: `"ask"` (what it asks: the default) or `"history"` (what its
+    /// command used before on that platform, its ask the ceiling).
+    pub sizes: kiln_ci::sizes::Source,
+    /// A run killed for memory that ran sized from history below its ask runs once more at its
+    /// ask (not a detached run, nor one fed input: docs/reach.md says why).
+    pub retry_oom: bool,
+}
+
+impl Reach {
+    pub fn policy(&self) -> kiln_ci::sizes::Policy {
+        kiln_ci::sizes::Policy { sizes: self.sizes, retry_oom: self.retry_oom }
+    }
 }
 
 /// `[cluster]` (docs/p2p.md).

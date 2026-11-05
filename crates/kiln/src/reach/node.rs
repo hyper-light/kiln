@@ -174,8 +174,9 @@ pub enum Local {
     Directory { reply: oneshot::Sender<anyhow::Result<Vec<RunnerInfo>>> },
     /// Link up to `peer` (if it is not), answering with the machine it is.
     Connect { peer: String, reply: oneshot::Sender<anyhow::Result<Host>> },
-    /// Run on `peer`; what the run says goes to `says`. Answers with its id.
-    Run { peer: String, spec: Box<RunSpec>, says: Says, reply: oneshot::Sender<u64> },
+    /// Run on `peer`; what the run says goes to `says`. Answers with its id. `with`: what the asker
+    /// knows of it (`super::history::With`, JSON) for a runner that takes it ([`Ask::RunWith`]).
+    Run { peer: String, spec: Box<RunSpec>, with: Option<String>, says: Says, reply: oneshot::Sender<u64> },
     /// Something more for a run (input, a signal, Forget).
     Ask { peer: String, ask: Ask },
     /// Follow a sync of `key` on `peer` (what it says goes to `says`), then send it `asks`.
@@ -306,7 +307,13 @@ impl Handle {
     }
 
     pub async fn run(&self, peer: &str, spec: RunSpec, says: Says) -> anyhow::Result<u64> {
-        self.ask(|reply| Local::Run { peer: peer.to_owned(), spec: Box::new(spec), says, reply }).await
+        self.ask(|reply| Local::Run { peer: peer.to_owned(), spec: Box::new(spec), with: None, says, reply }).await
+    }
+
+    /// [`Handle::run`] with what this runner knows of it (`with`, JSON: `super::history::With`),
+    /// for a runner that says it takes that (docs/reach.md, "Sizes from history").
+    pub async fn run_with(&self, peer: &str, spec: RunSpec, with: String, says: Says) -> anyhow::Result<u64> {
+        self.ask(|reply| Local::Run { peer: peer.to_owned(), spec: Box::new(spec), with: Some(with), says, reply }).await
     }
 
     pub async fn send(&self, peer: &str, ask: Ask) -> bool {
@@ -483,7 +490,7 @@ impl Handle {
 pub fn start(cfg: Config) -> anyhow::Result<(Handle, async_channel::Receiver<AgentMsg>)> {
     let identity = Identity::load_or_create(&cfg.dir, &cfg.name)?;
     let pins = Pins::open(&cfg.dir);
-    let announce = Announce { fingerprint: identity.fingerprint.clone(), accept: cfg.accept, version: wire::VERSION, features: crate::proto::feature::all() };
+    let announce = Announce { fingerprint: identity.fingerprint.clone(), accept: cfg.accept, version: wire::VERSION, features: [crate::proto::feature::all(), super::history::features()].concat() };
     let (net_tx, net_rx) = async_channel::unbounded::<In>();
     let (tx, rx) = async_channel::bounded::<In>(1024);
     // Unbounded too: the node must never wait on the agent while the agent feeds it.
@@ -690,6 +697,9 @@ struct Served {
     taken: Instant,
     /// Output that gave way unread: what its exit says was lost.
     dropped: u64,
+    /// What its asker knew of it, when it asked with [`Ask::RunWith`] (docs/reach.md, "Sizes from
+    /// history"): it's told what the run used ([`Say::Used`]).
+    doing: Option<super::history::Doing>,
 }
 
 impl Served {
@@ -1047,7 +1057,7 @@ impl Node {
                     p.state = PeerState::Retry { at: Instant::now() + crate::sup::jitter(backoff), backoff };
                     p.error = Some(why.to_owned());
                     // Asks for a run never sent wait for the next link; acks and pings do not matter.
-                    p.queue.retain(|a| matches!(a, Ask::Run(_) | Ask::Stdin { .. } | Ask::StdinEnd { .. } | Ask::Signal { .. } | Ask::Place { .. }));
+                    p.queue.retain(|a| matches!(a, Ask::Run(_) | Ask::RunWith { .. } | Ask::Stdin { .. } | Ask::StdinEnd { .. } | Ask::Signal { .. } | Ask::Place { .. }));
                     for w in p.waiters.drain(..) {
                         let _ = w.send(Err(anyhow::anyhow!("{why}")));
                     }
@@ -1228,9 +1238,9 @@ impl Node {
             let _ = w.send(Err(anyhow::anyhow!("{why}")));
         }
         // Runs that never started there can't resume: they end here, with why.
-        let never: Vec<u64> = p.queue.iter().filter_map(|a| if let Ask::Run(s) = a { Some(s.id) } else { None }).collect();
+        let never: Vec<u64> = p.queue.iter().filter_map(|a| if let Ask::Run(s) | Ask::RunWith { spec: s, .. } = a { Some(s.id) } else { None }).collect();
         if p.host.is_none() || !never.is_empty() {
-            p.queue.retain(|a| !matches!(a, Ask::Run(_)));
+            p.queue.retain(|a| !matches!(a, Ask::Run(_) | Ask::RunWith { .. }));
             for id in never {
                 if let Some(f) = p.follows.remove(&id) {
                     let _ = f.says.send(Say::Exit { id, code: None, signal: None, error: Some(why.to_owned()), end: f.got, lost: 0 }).await;
@@ -1387,6 +1397,12 @@ impl Node {
                 let outs = self.place.heard(&name, &json, crate::util::now_ms());
                 self.place_do(outs).await;
             }
+            // What a run asked with what this runner knew of it used, just before its Exit.
+            Say::Used { id, used } => {
+                if let Some(f) = self.peers.get(&name).and_then(|p| p.follows.get(&id)) {
+                    let _ = f.says.send(Say::Used { id, used }).await;
+                }
+            }
             // The other end couldn't read a message of this one's: it ends the link.
             Say::Unread { what, code, why } => {
                 tracing::warn!(peer = %name, link, %what, code = code.name(), %why, "the other runner couldn't read a message of this one's on a reach link");
@@ -1473,6 +1489,7 @@ impl Node {
         match a {
             Ask::Hello { .. } => {}
             Ask::Run(spec) => self.start_run(&key, *spec).await,
+            Ask::RunWith { spec, with } => self.start_run_with(&key, *spec, &with).await,
             Ask::Stdin { id, data } => {
                 if let Some(tx) = self.served.get(&key).and_then(|s| s.runs.get(&id)).and_then(|r| r.stdin.clone())
                     && !data.is_empty()
@@ -1641,8 +1658,25 @@ impl Node {
                 detached: spec.linger_ms == Some(wire::DETACHED),
                 taken: now,
                 dropped: 0,
+                doing: None,
             },
         );
+    }
+
+    /// [`Node::start_run`] for an asker that sent what it knows of the run (`with`, JSON): what it
+    /// used is told to the asker and kept under its key (docs/reach.md, "Sizes from history").
+    async fn start_run_with(&mut self, key: &(String, String), spec: RunSpec, with: &str) {
+        let id = spec.id;
+        self.start_run(key, spec).await;
+        if let Some(r) = self.served.get_mut(key).and_then(|s| s.runs.get_mut(&id)).filter(|r| r.doing.is_none()) {
+            r.doing = super::history::doing(with);
+        }
+    }
+
+    /// Tell the server `json` (what a run here used), answered to no one.
+    async fn tell_server(&mut self, json: String) {
+        let (reply, _) = oneshot::channel();
+        self.on_local(Local::Query { json, reply }).await;
     }
 
     async fn refuse_run(&mut self, key: &(String, String), id: u64, why: String) {
@@ -1671,7 +1705,7 @@ impl Node {
                 r.buf.push_back((off, stream, data));
                 self.pump(&key, id).await;
             }
-            serve::Event::Exit { code, error } => {
+            serve::Event::Exit { code, error, used } => {
                 let error = if r.timed_out { Some(error.unwrap_or_else(|| "timed out".into())) } else { error };
                 // Its room is free in the same input (docs/needs.md E5): `ok`, its process exited.
                 let outs = self.place.ended(&key.0, id, error.is_none(), crate::util::now_ms());
@@ -1681,7 +1715,11 @@ impl Node {
                 };
                 r.exit = Some((code, error));
                 r.stdin = None;
+                let told = r.doing.as_mut().and_then(|d| d.ended(used.as_deref()));
                 self.pump(&key, id).await;
+                if let Some(json) = told {
+                    self.tell_server(json).await;
+                }
                 self.place_do(outs).await;
             }
         }
@@ -1709,7 +1747,10 @@ impl Node {
                 && let Some((code, error)) = r.exit.clone()
             {
                 r.exit_sent = true;
-                let (end, lost) = (r.next, r.dropped);
+                let (end, lost, used) = (r.next, r.dropped, r.doing.as_ref().and_then(super::history::Doing::used));
+                if let Some(used) = used {
+                    self.say_on(&link, &Say::Used { id, used }).await;
+                }
                 self.say_on(&link, &Say::Exit { id, code, signal: None, error, end, lost }).await;
             }
             return;
@@ -1894,14 +1935,18 @@ impl Node {
             Local::PlaceView { reply } => {
                 let _ = reply.send(self.place.view());
             }
-            Local::Run { peer, mut spec, says, reply } => {
+            Local::Run { peer, mut spec, with, says, reply } => {
                 let p = self.peers.entry(peer.clone()).or_insert_with(Peer::new);
                 let id = p.next_id;
                 p.next_id += 1;
                 spec.id = id;
                 p.follows.insert(id, Follow { says, got: 0, exited: false, detached: false });
                 let _ = reply.send(id);
-                self.send_or_queue(&peer, Ask::Run(spec)).await;
+                let ask = match with {
+                    Some(with) => Ask::RunWith { spec, with },
+                    None => Ask::Run(spec),
+                };
+                self.send_or_queue(&peer, ask).await;
             }
             Local::Ask { peer, ask } => {
                 if self.peers.contains_key(&peer) {

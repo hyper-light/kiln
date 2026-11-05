@@ -21,7 +21,9 @@ use super::wire::{RunSpec, Signal, Stream};
 pub enum Event {
     Started { pid: u32, cwd: String },
     Output { stream: Stream, data: Vec<u8> },
-    Exit { code: Option<i32>, error: Option<String> },
+    /// It ended; `used`: what it used, measured here (`super::measure`; docs/reach.md, "Sizes from
+    /// history"), none when it never started.
+    Exit { code: Option<i32>, error: Option<String>, used: Option<Box<kiln_ci::sizes::Usage>> },
 }
 
 /// How long the resolved login environment is kept before it is asked for again.
@@ -378,7 +380,7 @@ pub fn start(spec: RunSpec, cwd: PathBuf, shell_state: Option<PathBuf>, extra_en
         if let Some(dir) = &shell_state
             && let Err(e) = std::fs::create_dir_all(dir)
         {
-            let _ = events.send(Event::Exit { code: None, error: Some(format!("cannot keep the shell's state in {}: {e}", dir.display())) }).await;
+            let _ = events.send(Event::Exit { code: None, error: Some(format!("cannot keep the shell's state in {}: {e}", dir.display())), used: None }).await;
             return;
         }
         // A named shell starts where it was left, unless the run says where.
@@ -386,7 +388,7 @@ pub fn start(spec: RunSpec, cwd: PathBuf, shell_state: Option<PathBuf>, extra_en
         let shell = match bash() {
             Ok(b) => b,
             Err(e) => {
-                let _ = events.send(Event::Exit { code: None, error: Some(e) }).await;
+                let _ = events.send(Event::Exit { code: None, error: Some(e), used: None }).await;
                 return;
             }
         };
@@ -409,7 +411,7 @@ pub fn start(spec: RunSpec, cwd: PathBuf, shell_state: Option<PathBuf>, extra_en
                 if let Some(g) = group {
                     g.remove();
                 }
-                let _ = events.send(Event::Exit { code: None, error: Some(format!("{e:#}")) }).await;
+                let _ = events.send(Event::Exit { code: None, error: Some(format!("{e:#}")), used: None }).await;
                 return;
             }
         };
@@ -423,6 +425,8 @@ pub fn start(spec: RunSpec, cwd: PathBuf, shell_state: Option<PathBuf>, extra_en
         // Its output looked over, each stream's lines apart, for what the machine ended it of
         // (no space, a tool not found: S6).
         let (mut out_scan, mut err_scan) = (crate::sense::health::Scan::default(), crate::sense::health::Scan::default());
+        // Measured from its own group, from now to its end (audit H5).
+        let measure = super::measure::Measure::start(group.as_ref());
         if events.send(Event::Started { pid, cwd: cwd.to_string_lossy().into_owned() }).await.is_err() {
             end_now(pid, group);
             return;
@@ -502,9 +506,11 @@ pub fn start(spec: RunSpec, cwd: PathBuf, shell_state: Option<PathBuf>, extra_en
                 crate::sense::run::report(o);
             }
         }
+        // What it used, read before its group goes (its counts are kept there).
+        let used = crate::rt::blocking(move || measure.finish(code)).await.ok().map(Box::new);
         // What it left running (`nohup … &`, a daemon) ends with it, before it's said to have ended.
         let _ = crate::rt::blocking(move || end_leftovers(pid, group)).await;
-        let _ = events.send(Event::Exit { code, error: None }).await;
+        let _ = events.send(Event::Exit { code, error: None, used }).await;
     });
     stdin_tx
 }
@@ -579,7 +585,7 @@ mod tests {
                 Ok(Ok(Event::Started { pid, .. })) => anyhow::ensure!(pid > 0),
                 Ok(Ok(Event::Output { stream: Stream::Out, data })) => out.extend(data),
                 Ok(Ok(Event::Output { stream: Stream::Err, data })) => err.extend(data),
-                Ok(Ok(Event::Exit { code, error })) => return Ok((out, err, code, error)),
+                Ok(Ok(Event::Exit { code, error, .. })) => return Ok((out, err, code, error)),
                 Ok(Err(_)) => anyhow::bail!("events ended without an exit"),
                 Err(_) => anyhow::bail!("timed out"),
             }

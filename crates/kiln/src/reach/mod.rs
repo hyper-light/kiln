@@ -6,11 +6,13 @@ pub mod cli;
 pub mod copies;
 pub mod directory;
 pub mod e2e;
+pub mod history;
 pub mod keep;
 pub mod keeper;
 pub mod local;
 #[cfg(unix)]
 pub mod mcp;
+pub mod measure;
 pub mod node;
 pub mod place;
 pub mod relay;
@@ -108,6 +110,32 @@ pub enum Question {
         code: crate::wire::unread::Code,
         #[serde(default)]
         why: String,
+    },
+    /// What the runs kept under a run's history key say on each platform, with the person's
+    /// `[reach]` policy (docs/reach.md, "Sizes from history"): answered with [`history::Sizes`]
+    /// from one rolled-up row per platform. A server from before refuses it `unknown`, which its
+    /// asker takes for "nothing known".
+    Sizes {
+        #[serde(default)]
+        repo: String,
+        #[serde(default)]
+        command: String,
+    },
+    /// What a reach run used, measured on the runner that asks, to keep under its key; the runner,
+    /// its platform and its cores are the server's own record of the connection it came on. Only
+    /// the runner's own code says it: its local socket refuses it from an agent (audit H9,
+    /// [`history::for_agent`]).
+    Measured {
+        #[serde(default)]
+        repo: String,
+        #[serde(default)]
+        command: String,
+        #[serde(default)]
+        ask: kiln_ci::sched::state::Resources,
+        #[serde(default)]
+        size: Option<Box<kiln_ci::sizes::Size>>,
+        #[serde(default)]
+        used: Box<kiln_ci::sizes::Usage>,
     },
 }
 
