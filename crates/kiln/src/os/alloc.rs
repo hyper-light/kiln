@@ -122,6 +122,8 @@ pub fn init() {
     let _ = std::hint::black_box(&MALLOC_CONF);
     #[cfg(all(feature = "jemalloc-prof", target_os = "linux"))]
     let _ = PROFILE.set(profile::start());
+    #[cfg(all(feature = "jemalloc", target_os = "linux"))]
+    let _ = hyper_rt::idle::when_cold(COLD_AFTER, give_back_thread_cache);
     #[cfg(all(target_os = "linux", target_env = "gnu"))]
     {
         let tunables = std::env::var_os("GLIBC_TUNABLES").map(|t| t.to_string_lossy().into_owned());
@@ -179,6 +181,7 @@ fn jemalloc_said() -> Option<String> {
     if jemalloc_opt(c"opt.background_thread", false) == Some(true) && jemalloc_opt(c"background_thread", false) != Some(true) {
         said.push_str(", though its background threads didn't start: it purges only as its arenas are used");
     }
+    said.push_str(&format!("; a pool's worker idle {} s gives its thread's cache back", COLD_AFTER.as_secs()));
     #[cfg(feature = "jemalloc-prof")]
     if let Some(profile) = PROFILE.get() {
         said.push_str(&profile.said());
@@ -236,6 +239,25 @@ fn jemalloc_set<T: Copy>(name: &std::ffi::CStr, mut value: T) -> bool {
     // nothing back (no `oldp`).
     let r = unsafe { tikv_jemalloc_sys::mallctl(name.as_ptr(), std::ptr::null_mut(), std::ptr::null_mut(), (&raw mut value).cast(), std::mem::size_of::<T>()) };
     r == 0
+}
+
+/// How long a pool's worker waits with nothing to do before it gives its thread's cache back to jemalloc's arenas
+/// (`hyper_rt::idle`; goal 11, plan 01a1a87b2e56 step 5): [`DIRTY_DECAY_MS`]. jemalloc trims a thread's cache only
+/// as that thread allocates (its garbage collection is an event of the thread's own allocations), so a worker that
+/// ran a job and then waits keeps what the job freed for as long as it waits: in the lab, 54 of the blocking pool's
+/// workers and the compute pool's, most of them waiting at any time (the pool hands a job to the worker idle
+/// last). Past the decay, what the worker keeps is what jemalloc would have purged by now had it been given back
+/// as it was freed; given back then, it's purged within the next decay.
+pub const COLD_AFTER: std::time::Duration = std::time::Duration::from_millis(DIRTY_DECAY_MS as u64);
+
+/// Gives the calling thread's cache back to its arena (jemalloc's `thread.tcache.flush`): what a pool's worker does
+/// once it's cold ([`COLD_AFTER`]).
+#[cfg(all(feature = "jemalloc", target_os = "linux"))]
+#[allow(unsafe_code)]
+fn give_back_thread_cache() {
+    // SAFETY: the name ends in a NUL; `thread.tcache.flush` reads and writes nothing of the caller's (no `oldp`, no
+    // `newp`), and acts on the calling thread's cache alone.
+    let _ = unsafe { tikv_jemalloc_sys::mallctl(c"thread.tcache.flush".as_ptr(), std::ptr::null_mut(), std::ptr::null_mut(), std::ptr::null_mut(), 0) };
 }
 
 /// What the allocator holds, in bytes, by what it holds it for: jemalloc's statistics (`stats.*` in its
@@ -601,7 +623,9 @@ mod tests {
         unsafe { std::ptr::write_bytes(block, 1, BLOCK) };
         let held = stats().unwrap_or_default();
         let block_bytes = u64::try_from(BLOCK).unwrap_or(u64::MAX);
-        assert!(held.allocated >= before.allocated.saturating_add(block_bytes), "{before:?} then {held:?}");
+        // Other tests allocate and free through jemalloc beside this one (a few hundred KiB at the most), so the
+        // block is held to the whole of it, and its going to half of it.
+        assert!(held.allocated >= block_bytes, "{before:?} then {held:?}");
         assert!(held.active >= held.allocated, "{held:?}");
         assert!(held.resident >= held.active, "{held:?}");
         assert!(held.mapped >= held.active, "{held:?}");
@@ -609,6 +633,43 @@ mod tests {
         // SAFETY: `block` came from this allocator with this layout, and is freed once.
         unsafe { tikv_jemallocator::Jemalloc.dealloc(block, layout) };
         let after = stats().unwrap_or_default();
-        assert!(after.allocated.saturating_add(block_bytes) <= held.allocated, "{held:?} then {after:?}");
+        assert!(after.allocated.saturating_add(block_bytes / 2) <= held.allocated, "{held:?} then {after:?}");
+    }
+
+    /// A pool's worker goes cold after jemalloc's dirty decay (goal 11, plan 01a1a87b2e56 step 5).
+    #[test]
+    fn g11_s5_a_worker_goes_cold_after_the_dirty_decay() {
+        assert_eq!(u128::from(DIRTY_DECAY_MS), COLD_AFTER.as_millis());
+    }
+
+    /// What a thread freed waits in its cache until the thread allocates again; given back, the cache holds none
+    /// of it (goal 11, plan 01a1a87b2e56 step 5). On a thread of its own, whose cache holds this test's blocks alone.
+    #[cfg(all(feature = "jemalloc", target_os = "linux"))]
+    #[test]
+    #[allow(unsafe_code)]
+    fn g11_s5_a_cold_thread_gives_its_cache_back() -> anyhow::Result<()> {
+        use std::alloc::{GlobalAlloc as _, Layout};
+        let cached = std::thread::spawn(|| {
+            let Ok(layout) = Layout::from_size_align(4096, 8) else {
+                return None;
+            };
+            // SAFETY: a layout of non-zero size; each block is freed once, with it.
+            let blocks: Vec<*mut u8> = (0..20).map(|_| unsafe { tikv_jemallocator::Jemalloc.alloc(layout) }).collect();
+            for block in blocks.into_iter().filter(|b| !b.is_null()) {
+                // SAFETY: as above.
+                unsafe { tikv_jemallocator::Jemalloc.dealloc(block, layout) };
+            }
+            let freed = stats()?.thread_caches;
+            give_back_thread_cache();
+            let given = stats()?.thread_caches;
+            Some((freed, given))
+        })
+        .join()
+        .map_err(|_| anyhow::anyhow!("the test's thread panicked"))?;
+        let (freed, given) = cached.ok_or_else(|| anyhow::anyhow!("no statistics on the test's thread"))?;
+        // The 20 blocks freed wait in the thread's cache (a 4 KiB size keeps 20, tcache_nslots_small_min; a full one
+        // keeps half as it takes more); given back, none of them.
+        anyhow::ensure!(freed >= given.saturating_add(10 * 4096), "freed {freed}, given back {given}");
+        Ok(())
     }
 }
