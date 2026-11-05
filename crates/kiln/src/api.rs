@@ -6170,16 +6170,35 @@ const SNAPSHOT_PIECE: usize = 128 * 1024;
 
 /// `bytes` as one binary message in frames of at most [`SNAPSHOT_PIECE`] bytes (RFC 6455 5.4's
 /// fragments, which every client joins into the one message they are).
+#[cfg(test)]
 fn pieces(bytes: Vec<u8>) -> impl Iterator<Item = ws::Message> {
+    pieces_of(bytes, true, true)
+}
+
+/// `bytes`, a piece of one binary message, in frames of at most [`SNAPSHOT_PIECE`] bytes: the message's
+/// first frame (when `first`) binary and the rest continuations, its last (when `last`) final (RFC 6455
+/// 5.4), so the pieces of a message packed as it goes out make one message (goal 11, plan 01a1a87b2e56 step 5).
+fn pieces_of(bytes: Vec<u8>, first: bool, last: bool) -> impl Iterator<Item = ws::Message> {
     use tungstenite::protocol::frame::Frame;
     use tungstenite::protocol::frame::coding::{Data, OpCode};
     let bytes = bytes::Bytes::from(bytes);
     let n = bytes.len().div_ceil(SNAPSHOT_PIECE).max(1);
     (0..n).map(move |i| {
         let piece = bytes.slice((i * SNAPSHOT_PIECE).min(bytes.len())..((i + 1) * SNAPSHOT_PIECE).min(bytes.len()));
-        let op = if i == 0 { Data::Binary } else { Data::Continue };
-        ws::Message::Frame(Frame::message(piece, OpCode::Data(op), i + 1 == n))
+        let op = if i == 0 && first { Data::Binary } else { Data::Continue };
+        ws::Message::Frame(Frame::message(piece, OpCode::Data(op), last && i + 1 == n))
     })
+}
+
+/// A snapshot's next piece as it's packed going out ([`crate::harness::registry::Packing`]), made on the
+/// blocking pool: a place held for the piece, not for the viewer's reading (goal 11, plan 01a1a87b2e56 step 5).
+async fn next_piece(mut packing: crate::harness::registry::Packing) -> anyhow::Result<(crate::harness::registry::Packing, Option<Vec<u8>>)> {
+    let (packing, piece) = crate::rt::blocking(move || {
+        let piece = packing.next_piece(SNAPSHOT_PIECE);
+        (packing, piece)
+    })
+    .await?;
+    Ok((packing, piece?))
 }
 
 /// Send a viewer a snapshot: its frames then `synced`, a message each; or, `packed`, all of it in
@@ -6200,11 +6219,23 @@ async fn send_snapshot(tx: &mut ws::Sender, snapshot: crate::harness::registry::
     // 4.4 ms at the most in rt5's calm lab and 8.6 ms with shedding on (goal 10, plan 01a1a87b2dae step 5).
     let mut held = crate::harness::registry::InFlight::take(crate::harness::registry::snapshot_room(), snapshot.weight(packed)).await;
     if packed {
-        let bytes = crate::rt::blocking(move || snapshot.packed(&synced())).await??;
-        held.made(bytes.capacity());
-        for piece in pieces(bytes) {
-            tx.send(piece).await?;
-            crate::rt::consume_budget().await;
+        // Packed as it goes out (goal 11, plan 01a1a87b2e56 step 5): a piece made, then the next made while
+        // it's held (so its last frame is known final), then written; what's in flight is those two, not the
+        // whole message, and a place of the blocking pool is held for each piece's making, not for the
+        // viewer's reading.
+        let (mut packing, mut now) = next_piece(snapshot.packing(&synced())).await?;
+        let mut first = true;
+        while let Some(piece) = now {
+            let (rest, following) = next_piece(packing).await?;
+            packing = rest;
+            held.made(piece.capacity().saturating_add(following.as_ref().map_or(0, Vec::capacity)));
+            let last = following.is_none();
+            for frame in pieces_of(piece, first, last) {
+                tx.send(frame).await?;
+                crate::rt::consume_budget().await;
+            }
+            first = false;
+            now = following;
         }
         return Ok(());
     }
@@ -7005,6 +7036,33 @@ mod tests {
             match client.read()? {
                 ws::Message::Binary(got) => assert!(got.as_ref() == bytes.as_slice(), "{len} bytes, joined: {} came", got.len()),
                 other => anyhow::bail!("{len} bytes came as {other:?}"),
+            }
+        }
+        Ok(())
+    }
+
+    /// Goal 11, plan 01a1a87b2e56 step 5: a message packed as it goes out, sent as its pieces come (each in
+    /// frames of at most [`SNAPSHOT_PIECE`]: the first piece's first binary, every other a continuation, the
+    /// last piece's last final), is the one message a client joins, whatever the pieces' sizes.
+    #[test]
+    fn g11_s5_a_snapshots_pieces_as_they_come_make_one_message() -> anyhow::Result<()> {
+        use std::io::Cursor;
+        use tungstenite::protocol::{Role, WebSocket};
+        for sizes in [vec![10], vec![SNAPSHOT_PIECE + 5, 7], vec![3, SNAPSHOT_PIECE, 2 * SNAPSHOT_PIECE + 1, 0, 9]] {
+            let parts: Vec<Vec<u8>> = sizes.iter().enumerate().map(|(k, n)| (0..*n).map(|i| u8::try_from((i + k) % 251).unwrap_or(0)).collect()).collect();
+            let mut server = WebSocket::from_raw_socket(Cursor::new(Vec::new()), Role::Server, None);
+            let last = parts.len().saturating_sub(1);
+            for (k, piece) in parts.iter().enumerate() {
+                for frame in pieces_of(piece.clone(), k == 0, k == last) {
+                    server.send(frame)?;
+                }
+            }
+            let wire = server.get_ref().get_ref().clone();
+            let mut client = WebSocket::from_raw_socket(Cursor::new(wire), Role::Client, None);
+            let whole = parts.concat();
+            match client.read()? {
+                ws::Message::Binary(got) => anyhow::ensure!(got.as_ref() == whole.as_slice(), "pieces of {sizes:?}: {} bytes came of {}", got.len(), whole.len()),
+                other => anyhow::bail!("pieces of {sizes:?} came as {other:?}"),
             }
         }
         Ok(())
