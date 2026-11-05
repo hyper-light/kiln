@@ -63,6 +63,7 @@ pub mod driver;
 pub mod error;
 mod frames;
 pub mod futures;
+pub mod idle;
 mod handoff;
 pub mod interests;
 pub mod local;

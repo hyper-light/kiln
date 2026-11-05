@@ -25,14 +25,17 @@
 # memory back), or `musl`, musl's own malloc. The default is jemalloc, the lab's pick: on the static musl
 # build, resident memory 523 to 333 MB, and no latency number worse beyond noise. KILN_LINUX_ALLOCATOR=musl
 # leaves it out of one build.
+# A lab's build may take `jemalloc-prof`: jemalloc with its heap profile built in (kiln's `jemalloc-prof`
+# feature, off until a run's _RJEM_MALLOC_CONF says prof:true; goal 11, plan 01a1a87b2e56 step 5), never a
+# release's.
 set -euo pipefail
 cd "$(dirname "$0")/../.."
 root=$PWD
 
 linux_allocator=${KILN_LINUX_ALLOCATOR:-jemalloc}
 case $linux_allocator in
-  musl | jemalloc) ;;
-  *) echo "KILN_LINUX_ALLOCATOR is musl or jemalloc, not $linux_allocator" >&2; exit 1 ;;
+  musl | jemalloc | jemalloc-prof) ;;
+  *) echo "KILN_LINUX_ALLOCATOR is musl, jemalloc or jemalloc-prof (a lab's), not $linux_allocator" >&2; exit 1 ;;
 esac
 
 all=(x86_64-unknown-linux-musl aarch64-unknown-linux-musl aarch64-apple-darwin x86_64-pc-windows-msvc)
@@ -136,8 +139,8 @@ for t in "${targets[@]}"; do
     *-unknown-linux-musl)
       rustup target add "$t" >/dev/null
       alloc=()
-      if [ "$linux_allocator" = jemalloc ]; then
-        alloc=(--features jemalloc)
+      if [ "$linux_allocator" != musl ]; then
+        alloc=(--features "$linux_allocator")
         # jemalloc's page must be at least the system's, or it refuses to start ("Unsupported system page
         # size"), and built here its configure can't ask the machine it will run on, so it takes 4 KiB.
         # x86-64's pages are 4 KiB; arm64 Linux runs 4, 16 or 64 KiB pages (16 on Apple silicon and the

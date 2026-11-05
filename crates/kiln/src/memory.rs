@@ -5,6 +5,9 @@
 //!   `/proc/self/status`): `anon` (the heap, threads' stacks, what the allocator keeps that it hasn't given
 //!   back), `file` (the binary's and its libraries' pages read in, which the OS can take back and read again)
 //!   and `shmem`. `process_resident_memory_bytes` is their sum.
+//! - `kiln_memory_allocator_bytes{kind}`: what the allocator holds of `anon`, where it says (jemalloc, its
+//!   statistics; `crate::os::alloc::Stats`): what's live, what threads' caches keep, freed pages not yet given
+//!   back, its own metadata (step 5).
 //! - `kiln_memory_bytes{owner}`: what each of the server's caches and buffers holds now: counted as it
 //!   changes (an atomic each: no lock, and a scrape reads them without asking the owner anything), or read at
 //!   the scrape where the owner keeps its own count.
@@ -144,6 +147,21 @@ fn resident_of(status: &str) -> Option<[(&'static str, u64); 3]> {
     Some([("anon", kb("RssAnon:")?), ("file", kb("RssFile:")?), ("shmem", kb("RssShmem:")?)])
 }
 
+/// `kiln_memory_allocator_bytes{kind}`: what the allocator holds, by what for (`crate::os::alloc::Stats`; goal
+/// 11, plan 01a1a87b2e56 step 5), where it says (jemalloc); nothing otherwise.
+fn render_allocator(o: &mut String, stats: Option<crate::os::alloc::Stats>) {
+    let Some(stats) = stats else {
+        return;
+    };
+    let _ = writeln!(
+        o,
+        "# HELP kiln_memory_allocator_bytes What the allocator (jemalloc) holds, by kind: allocated (the program's allocations, thread_caches included), thread_caches (freed, kept for each thread's next), active (pages holding allocations, never-written ones included), dirty (freed pages not yet given back), muzzy (given back lazily), metadata (its own), resident (active, dirty and metadata pages), mapped and retained (address space).\n# TYPE kiln_memory_allocator_bytes gauge"
+    );
+    for (kind, bytes) in stats.kinds() {
+        let _ = writeln!(o, "kiln_memory_allocator_bytes{{kind=\"{kind}\"}} {bytes}");
+    }
+}
+
 /// The `kiln_memory_*` families, in the exposition: the owners counted here, and those that keep their own
 /// count (`others`, each its name, what it holds and its bound).
 pub fn render(o: &mut String, others: &[(&str, u64, Option<u64>)]) {
@@ -156,6 +174,7 @@ pub fn render(o: &mut String, others: &[(&str, u64, Option<u64>)]) {
             let _ = writeln!(o, "kiln_memory_resident_bytes{{kind=\"{kind}\"}} {bytes}");
         }
     }
+    render_allocator(o, crate::os::alloc::stats());
     let ours = OWNERS.iter().chain(owners::ALL.iter()).map(|w| (w.name, w.bytes() as u64, w.bound().map(|b| b as u64)));
     let all: Vec<(&str, u64, Option<u64>)> = ours.chain(others.iter().copied()).collect();
     help(o, "kiln_memory_bytes", "gauge", "Bytes each of the server's caches and buffers holds now, by owner.");
@@ -180,6 +199,25 @@ mod tests {
         let status = "Name:\tkiln\nVmRSS:\t  1300 kB\nRssAnon:\t  1000 kB\nRssFile:\t   300 kB\nRssShmem:\t     0 kB\nThreads:\t4\n";
         assert_eq!(resident_of(status), Some([("anon", 1_024_000), ("file", 307_200), ("shmem", 0)]));
         assert_eq!(resident_of("Name:\tkiln\nVmRSS:\t1 kB\n"), None);
+    }
+
+    /// Goal 11, plan 01a1a87b2e56 step 5: the allocator's kinds are said where it says them, and the family is
+    /// left out where it doesn't (the platform's allocator, or a build without jemalloc's statistics).
+    #[test]
+    fn g11_s5_the_allocators_bytes_are_said_by_kind() {
+        let mut o = String::new();
+        render_allocator(&mut o, None);
+        assert_eq!(o, "");
+        let stats = crate::os::alloc::Stats { allocated: 100, thread_caches: 10, active: 120, dirty: 30, muzzy: 0, metadata: 5, resident: 155, mapped: 130, retained: 900 };
+        render_allocator(&mut o, Some(stats));
+        assert!(o.starts_with("# HELP kiln_memory_allocator_bytes "), "{o}");
+        assert!(o.contains("# TYPE kiln_memory_allocator_bytes gauge\n"), "{o}");
+        for line in ["allocated\"} 100\n", "thread_caches\"} 10\n", "active\"} 120\n", "dirty\"} 30\n", "muzzy\"} 0\n", "metadata\"} 5\n", "resident\"} 155\n", "mapped\"} 130\n", "retained\"} 900\n"] {
+            assert!(o.contains(&format!("kiln_memory_allocator_bytes{{kind=\"{line}")), "{line} in {o}");
+        }
+        let mut whole = String::new();
+        render(&mut whole, &[]);
+        assert_eq!(whole.contains("kiln_memory_allocator_bytes"), crate::os::alloc::stats().is_some(), "{whole}");
     }
 
     /// Goal 11, plan 01a1a87b2e56 step 3: an owner's count goes up and down and never below none, and its

@@ -32,10 +32,11 @@
 use std::collections::VecDeque;
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
-use std::sync::mpsc::{Receiver, Sender, SyncSender, channel, sync_channel};
+use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender, SyncSender, channel, sync_channel};
 use std::thread::JoinHandle;
 
 use crate::error::RtError;
+use crate::idle::Cold;
 use crate::sync::{OneshotReceiver, oneshot};
 
 /// One kind of work: the most jobs of it running at once, and the most waiting for one of those places.
@@ -243,12 +244,26 @@ fn work(index: usize, take: &Receiver<(usize, Job)>, notify: &Sender<Message>) {
         if notify.send(idle).is_err() {
             return;
         }
-        let Ok((share, job)) = take.recv() else {
+        let Some((share, job)) = next(take, crate::idle::cold()) else {
             return;
         };
         job();
         finished = Some(share);
     }
+}
+
+/// What this worker is handed next: waited for `cold.after` first, then, cold, waited for as long as it takes
+/// once it has done `cold.then` on its own thread (kiln's goal 11, plan 01a1a87b2e56 step 5: [`crate::idle`]).
+/// None once the dispatcher is gone.
+fn next<T>(take: &Receiver<T>, cold: Option<Cold>) -> Option<T> {
+    if let Some(cold) = cold {
+        match take.recv_timeout(cold.after) {
+            Ok(handed) => return Some(handed),
+            Err(RecvTimeoutError::Disconnected) => return None,
+            Err(RecvTimeoutError::Timeout) => (cold.then)(),
+        }
+    }
+    take.recv().ok()
 }
 
 /// The dispatcher's own state: each share's line and running count, and the workers idle.
@@ -483,5 +498,45 @@ pub fn stop() -> Result<(), RtError> {
         Err(_) => Err(RtError::BadConfig {
             what: "the blocking pool's dispatcher ended abnormally",
         }),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::time::Duration;
+
+    use super::*;
+
+    static COLD: AtomicUsize = AtomicUsize::new(0);
+
+    fn went_cold() {
+        COLD.fetch_add(1, Ordering::SeqCst);
+    }
+
+    /// Kiln's goal 11, plan 01a1a87b2e56 step 5: a worker handed a job within its wait takes it as before; one that
+    /// waits past it goes cold once, on its own thread, then takes the job that comes; one whose dispatcher is
+    /// gone ends.
+    #[test]
+    fn g11_s5_a_worker_idle_past_its_wait_goes_cold_once_then_takes_its_job() {
+        let (give, take) = sync_channel::<u32>(1);
+        let cold = Cold {
+            after: Duration::from_millis(20),
+            then: went_cold,
+        };
+        give.send(1).unwrap();
+        assert_eq!(next(&take, Some(cold)), Some(1));
+        assert_eq!(COLD.load(Ordering::SeqCst), 0, "handed a job within its wait");
+        let late = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(200));
+            give.send(2).unwrap();
+            give
+        });
+        assert_eq!(next(&take, Some(cold)), Some(2));
+        assert_eq!(COLD.load(Ordering::SeqCst), 1, "cold once in a wait past 20 ms");
+        drop(late.join().unwrap());
+        assert_eq!(next(&take, Some(cold)), None, "the dispatcher gone");
+        assert_eq!(next(&take, None), None);
+        assert_eq!(COLD.load(Ordering::SeqCst), 1);
     }
 }
