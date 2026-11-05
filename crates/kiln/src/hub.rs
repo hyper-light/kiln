@@ -2870,6 +2870,7 @@ impl Hub {
 
     /// [`Hub::runner_update`]'s judgment, as the hub's loop made it: whether the update counts, which of
     /// its machine's processes holds the session, then the copy takes it.
+    #[allow(clippy::too_many_arguments)]
     fn judge_runner_update(self: &Arc<Self>, s: &mut crate::harness::copies::Shard, peer: PeerId, agent: &str, session: &str, update: crate::harness::core::Update, shipped: bool, over: &dyn Fn() -> bool) -> Option<crate::harness::copies::Ingest> {
         use crate::harness::core::Update;
         match update {

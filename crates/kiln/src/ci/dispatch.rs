@@ -3798,7 +3798,7 @@ mod tests {
         anyhow::ensure!(h.is_run("r1") && h.is_leg("l1") && h.is_leg("l2") && h.is_leg("l3") && !h.is_leg("l4"));
         // A reader's copy, taken before the run finished, keeps every leg; the next read, none.
         let before = h.legs.get();
-        h.drop_legs(["l1", "l2"].into_iter());
+        h.drop_legs(["l1", "l2"]);
         h.drop_run("r1");
         anyhow::ensure!(before.len() == 3 && !h.is_leg("l1") && !h.is_leg("l2") && h.is_leg("l3") && !h.is_run("r1"));
         h.drop_legs(["l3"]);
