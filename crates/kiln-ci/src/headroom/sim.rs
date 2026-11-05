@@ -250,6 +250,10 @@ fn run(trace: &Trace, mut control: Control, seed: u64) -> Report {
     let mut longest_pause = 0.0f64;
     let mut t = -HISTORY_S;
     let cap = 6.0 * 3600.0;
+    // The kiln server's delay, where the engine watches it too: calm all along (what's in trouble
+    // here is the disk), read every step as the lab read it (a median of 0.195 ms, 12% of reads 2 to
+    // 8 times that).
+    let mut server = Rng(seed ^ 0x5e57_e7de_1a75);
     while t < cap && jobs.iter().any(|j| j.done.is_none()) {
         for (at, bps) in &trace.disk {
             if (*at - t).abs() < DT / 2.0 {
@@ -301,9 +305,14 @@ fn run(trace: &Trace, mut control: Control, seed: u64) -> Report {
                 answers.clear();
             }
             Control::V2(e) => {
+                let mut answers = std::mem::take(&mut answers);
+                if e.targets.iter().any(|t| t.first) {
+                    let noise = if server.next() < 0.12 { (0.8 + 1.3 * server.next()).exp() } else { (0.15 * server.normal()).exp() };
+                    answers.push(("kiln server delay".into(), Answer::Took(195.0 * noise)));
+                }
                 let obs = Observation {
                     now_us: us(t),
-                    answers: std::mem::take(&mut answers),
+                    answers,
                     inflight: probe_out.map(|(s, _)| vec![("disk".to_owned(), (t - s) * 1e6)]).unwrap_or_default(),
                     delivered_bps: Some(delivered),
                     mem_free: m.mem - jobs.iter().filter(|j| j.start.is_some() && j.done.is_none()).map(|j| j.kind.mem).sum::<f64>(),
@@ -425,6 +434,19 @@ fn v2() -> Control {
     )))
 }
 
+/// v2 on a machine whose kiln server runs there too: the server's delay a target that comes first.
+fn v2_beside_the_server() -> Control {
+    Control::V2(Box::new(Engine::new(
+        Policy { false_alarms_per_day: 1.0, probe_load_share: 0.1 },
+        vec![
+            Target { name: "disk".into(), tolerance_us: TOLERANCE_US, window_us: None, first: false },
+            Target { name: "kiln server delay".into(), tolerance_us: 10_000.0, window_us: Some(1e6), first: true },
+        ],
+        Learned::default(),
+        0,
+    )))
+}
+
 fn traces(seed: u64) -> Vec<Trace> {
     vec![crash(), steady(seed, "steady 80%", vec![(0.0, 1e9)]), bursts(), steady(seed, "disk halves at 30 min", vec![(0.0, 1e9), (1800.0, 0.5e9)])]
 }
@@ -466,6 +488,30 @@ fn the_night_of_10_28() {
         let trace = night();
         let none = run(&trace, Control::None, seed);
         let new = run(&trace, v2(), seed);
+        let ratio = new.work_by(7200.0) / none.work_by(7200.0).max(f64::MIN_POSITIVE);
+        eprintln!("seed {seed}:\n{}\n{}\nwork with v2 / without: {ratio:.4}, longest pause {:.1} s", row(&none), row(&new), new.longest_pause_s);
+        if ratio < 0.99 {
+            failures.push(format!("seed {seed}: v2 did {ratio:.4} of the work no control did"));
+        }
+        if new.longest_pause_s > 2.0 {
+            failures.push(format!("seed {seed}: a job stopped {:.1} s at once", new.longest_pause_s));
+        }
+    }
+    assert!(failures.is_empty(), "{failures:?}");
+}
+
+/// Goal 8 (plan 01a1a59c2b29 step 5): the 10-28 night where the kiln server's delay is a target too
+/// (calm all night). A target that comes first lengthens every hold (a level is held only once a
+/// rise past its calm's noise would have shown), and the disk's trouble, which isn't kiln's, still
+/// doesn't hold kiln's work back: at least 99% of the work no control does, and no job stopped
+/// longer than 2 s at a time.
+#[test]
+fn g8_s5_the_night_of_10_28_beside_a_calm_server() {
+    let mut failures = Vec::new();
+    for seed in [1u64, 2, 3] {
+        let trace = night();
+        let none = run(&trace, Control::None, seed);
+        let new = run(&trace, v2_beside_the_server(), seed);
         let ratio = new.work_by(7200.0) / none.work_by(7200.0).max(f64::MIN_POSITIVE);
         eprintln!("seed {seed}:\n{}\n{}\nwork with v2 / without: {ratio:.4}, longest pause {:.1} s", row(&none), row(&new), new.longest_pause_s);
         if ratio < 0.99 {

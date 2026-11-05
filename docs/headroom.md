@@ -226,7 +226,10 @@ geometric mean), something stays paced until the load ends, it's calm after, and
 it was. Main's engine (426b02ea011) fails it as item2 did: the legs at 2.4 to 2.6 times calm and
 the agents at 6, every loaded stretch past calm's noise, nothing paced from 5 s after the first cut.
 With the changes of goal 8 step 5 the delay holds at 0.224 to 0.258 ms against a calm of 0.226 to
-0.239.
+0.239. A target that comes first lengthens every hold (a level counts as held only once a rise past
+its calm's noise would have shown); `headroom::sim::g8_s5_the_night_of_10_28_beside_a_calm_server`
+runs the 10-28 night with the server's delay a target too, calm all night, and v2 does the same
+99.88% of the work, with no job stopped longer than 1.5 s. The other traces' rows are main's.
 
 | trace | control | done | mean wait s | p99 wait s | mean flow s | makespan s | peak sync s | s over 1 s |
 |---|---|---|---|---|---|---|---|---|
