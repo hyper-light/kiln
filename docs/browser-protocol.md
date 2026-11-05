@@ -480,3 +480,49 @@ included, before the carrier's own bytes. Step 10 measures them all on recorded 
 | A command's ack | ~40 B (`{"t":"ack","id":"…","outcome":"taken"}`) | ≤ 8 B | `Answer`: envelope 2, id ≤ 3, outcome 1, `at` none 1 |
 | A resume after a reconnect | every key fetched again (`resync`, `onReopen`) | the missed changes + ≤ 64 B | `Subscribe` with its cursor, `Resumed`, the changes since, `Ready`; no snapshot while the log holds them |
 | An idle link | nothing (a dead link goes unseen for minutes) | 3 B per idle period each way | `Idle` |
+
+## Where it lives and how it's held
+
+| Part | Where |
+|---|---|
+| the frames, their codec and schema | `crates/kiln-bp/src/{wire,schema,macros,frames,records}.rs` |
+| the connection's halves, sans-IO | `crates/kiln-bp/src/{server,client}.rs`, with `liveness`, `tickets`, `answers`, `topic`, `state`, `join`, `compress` |
+| the browser's codec, generated | `ui/src/api/bp/gen.ts` (`KILN_WRITE_BP=1 cargo test -p kiln-bp --test ts`) |
+| the browser's runtime and client core | `ui/src/api/bp/{runtime,frames,join,inflate,state,liveness,client,caps,index}.ts` |
+| kiln's topics | `crates/kiln/src/bp/` (`Feed`, `SessionFeed`, `Streams`, `allowed`, `unread`) |
+
+A carrier drives a `Server` (and a page a `Client`) with `receive(bytes, now, ..)` and
+`poll_transmit(room, now)`, which returns one message of frames (`Transmit`), each named with its
+lane, priority and urgency (`Sent`), so WebTransport can give each subscription a stream and put
+small urgent frames on datagrams; `poll_timeout(now)` says when to look again. The server's code
+hears `Event`s (`Request`, `Subscribe`, `Resume`, `Input`, refusals to note) and answers with
+`answer`, `answer_secret`, `start` (from `TopicLog::start`) and `push`. A browser passes each
+message through `Unpacker.unpack` (compressed batches inflated in order) into `Client.receive`.
+Neither half has a lock, a clock or randomness of its own; both are on the lockless list
+(`scripts/locks/hot.toml`).
+
+The tests, each named for the plan's step it holds:
+
+| What | Where |
+|---|---|
+| every kind round-trips, indexes pinned, layouts of two versions read both ways, hostile frames refused and the next read, a million seeded inputs without a panic, a refused decode allocating nothing | `crates/kiln-bp/tests/codec.rs`, `tests/alloc.rs` |
+| the generated codec and the vectors are this build's | `tests/ts.rs`, `tests/vectors.rs` |
+| the vectors, the joins, the inflate batches, a million seeded inputs to Rust's digests, the liveness traces and a Rust server's conversation, in Node | `ui/tests/bp-vectors.test.ts` |
+| the same in Chromium and WebKit, desktop and phone | `ui/e2e/bp-vectors.spec.ts` (`npx playwright test -c playwright.bp.config.ts`) |
+| open, tickets, version pairs, requests once per id, liveness, expiry | `tests/conn.rs` |
+| resume, budgets, convergence over seeds | `tests/subs.rs` |
+| the scheduler at 50 kbit/s | `tests/sched.rs` |
+| compression by trust class, the BREACH probe | `tests/compress.rs` |
+| this page's frame table | `tests/doc.rs` |
+| kiln's topics against the core | `crates/kiln/src/bp/tests.rs` |
+| the measurements | `crates/kiln/src/bp/measure.rs`, `crates/kiln-bp/tests/bench.rs`, `ui/e2e/bp-decode.spec.ts` |
+
+## Ada's calls, and what's taken meanwhile
+
+- The crate's name: `kiln-bp`.
+- Version skew: version N serves N-1; older pages are told the build to switch to.
+- Compression for attacker-influenced content: on, by trust class, when the page offers deflate-raw
+  (`ServerConfig::compress`). Within the `text` context a page's own visible data shares a history
+  with attacker-influenced text; no secret ever does.
+- Default limits: as the table above.
+- The browser's codec: TypeScript, no WASM (the measurements below say whether that holds).
