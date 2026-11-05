@@ -234,6 +234,9 @@ pub fn label_of(method: &Method, path: &str, upgrade: bool) -> &'static hyper_rt
     static OPEN: Label = Label { name: "websocket open" };
     static PAGE: Label = Label { name: "page" };
     static ROOT: Label = Label { name: "read /<kiln's own>" };
+    // A scrape of the server's figures apart from kiln's other own reads: the lab's own scrape at its window's start is
+    // counted in that window (goal 10, plan 01a1a87b2dae step 5: g9p7's 2.5 ms `read /<kiln's own>`).
+    static METRICS: Label = Label { name: "read /metrics" };
     static OTHER_READ: Label = Label { name: "read /api/<other>" };
     static OTHER_WRITE: Label = Label { name: "write /api/<other>" };
     static ROOT_WRITE: Label = Label { name: "write /<other>" };
@@ -257,6 +260,9 @@ pub fn label_of(method: &Method, path: &str, upgrade: bool) -> &'static hyper_rt
     let mut segs = path.split('/').filter(|s| !s.is_empty());
     let (first, second, third) = (segs.next(), segs.next(), segs.next());
     if first != Some("api") {
+        if read && first == Some("metrics") && second.is_none() {
+            return &METRICS;
+        }
         return match (read, class_of(method, path, false)) {
             (true, Some(Class::Page)) => &PAGE,
             (true, _) => &ROOT,
@@ -376,7 +382,8 @@ mod tests {
         assert_eq!(name(&get, "/api/nothing-here/x"), "read /api/<other>");
         assert_eq!(name(&Method::DELETE, "/api/nothing-here"), "write /api/<other>");
         assert_eq!(name(&get, "/agents/01a19ff6"), "page");
-        assert_eq!(name(&get, "/metrics"), "read /<kiln's own>");
+        assert_eq!(name(&get, "/metrics"), "read /metrics", "goal 10 step 5: a scrape apart from kiln's other own reads");
+        assert_eq!(name(&get, "/healthz"), "read /<kiln's own>");
         assert_eq!(name(&post, "/agents"), "write /<other>");
         assert_eq!(label_of(&get, "/api/harness/sessions/s1/ws", true).name, "websocket open");
         assert!(std::ptr::eq(label_of(&get, "/api/runs", false), label_of(&Method::HEAD, "/api/runs/7", false)));

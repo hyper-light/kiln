@@ -464,7 +464,7 @@ async fn route(hub: Arc<Hub>, req: Request) -> R {
         }
         // A snapshot's file for a runner's replica, with that machine's token (`crate::observe`).
         (&Method::GET, ["api", "observe", "v1", "snapshot", snap, file]) => return crate::observe::api::snapshot(snap, file, &req, |m| hub.machine_of(m)).map_err(|(c, m)| err(c, m)),
-        (&Method::GET, ["metrics"]) => return Ok(metrics_handler(&hub, req.headers())),
+        (&Method::GET, ["metrics"]) => return Ok(metrics_handler(&hub, req.headers()).await),
         (&Method::GET, ["healthz"]) => return Ok(srv::text(StatusCode::OK, "ok")),
         (&Method::GET, ["readyz"]) => return Ok(boxed(|| readyz(&hub)).await),
         (&Method::GET, ["healthz", "server"]) => return Ok(server_health(&hub)),
@@ -6514,6 +6514,16 @@ where
     Ok(came_to)
 }
 
+/// What a viewer's socket is doing, for the shards' table of what held them (`hyper_rt::slow`; goal 10, plan
+/// 01a1a87b2dae step 5: g9p7's calm lab named the socket's task by its spawn site alone, held 6.3 ms, and not which
+/// of its parts held it): its attach (what's kept of its files, its place among the viewers, the view), its
+/// snapshot's pieces, a catch-up after it fell behind, its live frames, a command it sent.
+static VIEWER_ATTACH: hyper_rt::slow::Label = hyper_rt::slow::Label { name: "viewer attach" };
+static VIEWER_SNAPSHOT: hyper_rt::slow::Label = hyper_rt::slow::Label { name: "viewer snapshot" };
+static VIEWER_CATCH_UP: hyper_rt::slow::Label = hyper_rt::slow::Label { name: "viewer catch-up" };
+static VIEWER_LIVE: hyper_rt::slow::Label = hyper_rt::slow::Label { name: "viewer live" };
+static VIEWER_COMMAND: hyper_rt::slow::Label = hyper_rt::slow::Label { name: "viewer command" };
+
 /// A viewer of one agent session: the snapshot, then live updates (JSON frames tagged `t`); the
 /// viewer sends commands (JSON tagged `type`). `{"t": "synced"}` follows each snapshot sent here
 /// (on attach, and again after falling behind): the history resent since its `open` is complete,
@@ -6534,6 +6544,11 @@ async fn harness_attach(hub: Arc<Hub>, id: String, socket: ws::WebSocket, takes:
     // What it can't read of what its person sends, and what they can't read of what it sends,
     // shows on the agent's page.
     let sock = ui::Socket::of(Wire::SessionUp, Wire::SessionDown, &who, Some(Page::Session(id.clone())));
+    // What's kept of its files read and its frame made off the shards (`crate::harness::kept::warm`): the attach
+    // copies that frame.
+    hyper_rt::futures::label(&VIEWER_ATTACH);
+    crate::harness::kept::warm(&hub, &id).await;
+    hyper_rt::futures::label(&VIEWER_ATTACH);
     let Some(att) = hub.harness.attach_from(&id, takes.after, takes.patches) else {
         tx.send(ws::text(SessionDown::from(SessionFrame::Closed).text())).await?;
         return Ok(());
@@ -6541,7 +6556,7 @@ async fn harness_attach(hub: Arc<Hub>, id: String, socket: ws::WebSocket, takes:
     {
         // Counted while it's written (goal 10, plan 01a1a87b2dae step 3's trace).
         let _writing = crate::reads::Writing::of(&hub.harness.views.attaching);
-        send_snapshot(&mut tx, att.snapshot, takes.packed).await?;
+        crate::rt::labeled(&VIEWER_SNAPSHOT, send_snapshot(&mut tx, att.snapshot, takes.packed)).await?;
     }
     // Its place among the session's viewers, given back as it goes.
     let viewer = att.viewer;
@@ -6595,12 +6610,12 @@ async fn harness_attach(hub: Arc<Hub>, id: String, socket: ws::WebSocket, takes:
                 }
             }
             w = live.fuse() => match w {
-                Live::Ready => match hub.bus.read(&topic, at.unwrap_or_default(), FEED_READ).await {
+                Live::Ready => match crate::rt::labeled(&VIEWER_LIVE, hub.bus.read(&topic, at.unwrap_or_default(), FEED_READ)).await {
                     Ok(batch) => {
                         // Read now: each frame's delivery, from its publish on this process's
                         // microsecond clock (the bus's own stamps are milliseconds).
                         let (now, read_at, next) = (crate::harness::live::now_us(), Instant::now(), batch.next);
-                        match write_live_batch(&mut tx, batch.messages, &mut have, takes.patches, &topic, now, read_at).await? {
+                        match crate::rt::labeled(&VIEWER_LIVE, write_live_batch(&mut tx, batch.messages, &mut have, takes.patches, &topic, now, read_at)).await? {
                             Fed::Written => {}
                             Fed::StartOver => start_over = true,
                             Fed::Closed => return Ok(()),
@@ -6647,6 +6662,7 @@ async fn harness_attach(hub: Arc<Hub>, id: String, socket: ws::WebSocket, takes:
                     // it comes, and answered on this socket once, `ack` or `nack`.
                     Ok(SessionUp::Under { id: cmd, c, .. }) => {
                         use crate::harness::asked::{Taken, frame};
+                        hyper_rt::futures::label(&VIEWER_COMMAND);
                         let kind = hub.harness.kind_of(&hub, &id, &c);
                         match hub.harness.asked.take(&id, &scope, &cmd, kind, Instant::now()) {
                             (kind, Taken::New(rx)) => {
@@ -6661,6 +6677,7 @@ async fn harness_attach(hub: Arc<Hub>, id: String, socket: ws::WebSocket, takes:
                     // As clients from before ids send them: refusals said as errors, nothing for
                     // the rest.
                     Ok(SessionUp::Bare(c)) => {
+                        hyper_rt::futures::label(&VIEWER_COMMAND);
                         audit_command(&hub, &mut audit, &who, &id, &c).await;
                         let pending = hub.harness.dispatch(&hub, &id, c.clone()).await;
                         let (h, session) = (Arc::clone(&hub), id.clone());
@@ -6704,14 +6721,18 @@ async fn harness_attach(hub: Arc<Hub>, id: String, socket: ws::WebSocket, takes:
             }
             let began = Instant::now();
             // What it missed since what it has (it begins with "resumed"), or all of it when the copy
-            // can't tell (it begins with "open"); and the feed from where that is.
+            // can't tell (it begins with "open"); and the feed from where that is. What's kept of its
+            // files made off the shards first, as for an attach.
+            hyper_rt::futures::label(&VIEWER_CATCH_UP);
+            crate::harness::kept::warm(&hub, &id).await;
+            hyper_rt::futures::label(&VIEWER_CATCH_UP);
             let Some((snapshot, from, now, rev)) = hub.harness.frames_since(&id, &viewer, have) else {
                 tx.send(closed()).await?;
                 return Ok(());
             };
             {
                 let _writing = crate::reads::Writing::of(&hub.harness.views.attaching);
-                send_snapshot(&mut tx, snapshot, takes.packed).await?;
+                crate::rt::labeled(&VIEWER_CATCH_UP, send_snapshot(&mut tx, snapshot, takes.packed)).await?;
             }
             caught_up = Some((Instant::now(), began.elapsed()));
             at = from;
@@ -6752,13 +6773,20 @@ async fn machine_dirs(hub: &Hub, target: &str, q: &HashMap<String, String>) -> R
 
 // ------------------------------------------------------------------ misc
 
-fn metrics_handler(hub: &Hub, headers: &HeaderMap) -> Response {
+async fn metrics_handler(hub: &Hub, headers: &HeaderMap) -> Response {
     if !hub.cfg.server.metrics_public && !authed(hub, headers) {
         return err(StatusCode::UNAUTHORIZED, "authentication required").into_response();
     }
     // The bus's figures as its node states them now.
     hub.bus.observe();
-    srv::response(StatusCode::OK, "text/plain; version=0.0.4", srv::full(crate::metrics::render()))
+    // Written out on the blocking pool, not on the request's shard: every family's every series, hundreds of
+    // kilobytes, in one call, held a shard 2.5 ms in g9p7's calm lab (goal 10, plan 01a1a87b2dae step 5). What it
+    // reads is the process's, not a shard's.
+    let text = match crate::rt::blocking(crate::metrics::render).await {
+        Ok(text) => text,
+        Err(e) => return err(StatusCode::SERVICE_UNAVAILABLE, format!("the figures couldn't be written out: {e:#}")).into_response(),
+    };
+    srv::response(StatusCode::OK, "text/plain; version=0.0.4", srv::full(text))
 }
 
 async fn readyz(hub: &Hub) -> Response {
@@ -7944,6 +7972,31 @@ mod tests {
             // As it was for a request that doesn't ask.
             let resp = Arc::clone(&api).handle(lab_get("/api/me")?).await;
             anyhow::ensure!(resp.status() == StatusCode::OK && !resp.headers().contains_key("server-timing"), "{:?}", resp.headers());
+            Ok(())
+        })
+    }
+
+    /// Goal 10, plan 01a1a87b2dae step 5: the server's figures are written out off the request's shard and answered
+    /// whole, every family there (the routes', the runner's legs with the loop's hold); without the owner's token,
+    /// refused as before.
+    #[test]
+    fn g10_s5_the_figures_are_written_out_off_the_shard_and_answered_whole() -> anyhow::Result<()> {
+        use crate::http::server::Handler as _;
+        crate::rt::block_on(async {
+            let hub = crate::hub::tests::scratch_hub().await?;
+            let api = Arc::new(Api { hub: Arc::clone(&hub) });
+            let resp = Arc::clone(&api).handle(lab_get("/metrics")?).await;
+            anyhow::ensure!(resp.status() == StatusCode::OK, "{}", resp.status());
+            let body = http_body_util::BodyExt::collect(resp.into_body()).await.map_err(|e| anyhow::anyhow!("{e}"))?.to_bytes();
+            let text = String::from_utf8_lossy(&body);
+            for family in ["kiln_route_seconds", "kiln_runner_wait_leg_seconds_count{leg=\"held\"}", "kiln_memory_bytes"] {
+                anyhow::ensure!(text.contains(family), "{family} missing from {} bytes", text.len());
+            }
+            if !hub.cfg.server.metrics_public {
+                let anyone = http::Request::builder().method(Method::GET).uri("/metrics").body(srv::Incoming::empty())?;
+                let resp = Arc::clone(&api).handle(anyone).await;
+                anyhow::ensure!(resp.status() == StatusCode::UNAUTHORIZED, "{}", resp.status());
+            }
             Ok(())
         })
     }
