@@ -6005,6 +6005,27 @@ fn harness_ws(hub: Arc<Hub>, id: String, req: Request) -> R {
     Ok(resp)
 }
 
+/// The most bytes of a packed snapshot one WebSocket frame carries: the socket's writer copies a frame
+/// into its buffer whole before it writes any of it, on the shard that serves the socket, and a long
+/// session's snapshot is megabytes; as much as the writer gathers before it writes (tungstenite's
+/// `write_buffer_size`, by default) goes at a time, and the shard serves its other sockets between
+/// (goal 10, plan 01a1a87b2dae step 3).
+const SNAPSHOT_PIECE: usize = 128 * 1024;
+
+/// `bytes` as one binary message in frames of at most [`SNAPSHOT_PIECE`] bytes (RFC 6455 5.4's
+/// fragments, which every client joins into the one message they are).
+fn pieces(bytes: Vec<u8>) -> impl Iterator<Item = ws::Message> {
+    use tungstenite::protocol::frame::Frame;
+    use tungstenite::protocol::frame::coding::{Data, OpCode};
+    let bytes = bytes::Bytes::from(bytes);
+    let n = bytes.len().div_ceil(SNAPSHOT_PIECE).max(1);
+    (0..n).map(move |i| {
+        let piece = bytes.slice((i * SNAPSHOT_PIECE).min(bytes.len())..((i + 1) * SNAPSHOT_PIECE).min(bytes.len()));
+        let op = if i == 0 { Data::Binary } else { Data::Continue };
+        ws::Message::Frame(Frame::message(piece, OpCode::Data(op), i + 1 == n))
+    })
+}
+
 /// Send a viewer a snapshot: its frames then `synced`, a message each; or, `packed`, all of it in
 /// one gzip'd binary message, a frame a line (frames are JSON, whose strings escape their line
 /// breaks). Written out on the blocking pool: a long session's is megabytes of JSON, and the
@@ -6015,7 +6036,9 @@ fn harness_ws(hub: Arc<Hub>, id: String, req: Request) -> R {
 async fn send_snapshot(tx: &mut ws::Sender, snapshot: crate::harness::registry::Snapshot, packed: bool) -> anyhow::Result<()> {
     if packed {
         let bytes = crate::rt::blocking(move || snapshot.packed(&synced())).await??;
-        tx.send(ws::binary(bytes)).await?;
+        for piece in pieces(bytes) {
+            tx.send(piece).await?;
+        }
         return Ok(());
     }
     let frames = crate::rt::blocking(move || snapshot.frames()).await?;
@@ -6688,6 +6711,31 @@ mod tests {
             assert!(hub.harness.events_json("nobody", None, 50).is_none());
             Ok(())
         })
+    }
+
+    /// Goal 10, plan 01a1a87b2dae step 3: a packed snapshot goes in frames of at most
+    /// [`SNAPSHOT_PIECE`] bytes (the first binary, the rest continuations, the last final), which a
+    /// client joins into the one message they are, whatever its length.
+    #[test]
+    fn g10_s3_a_packed_snapshot_goes_in_pieces_a_client_joins() -> anyhow::Result<()> {
+        use std::io::Cursor;
+        use tungstenite::protocol::{Role, WebSocket};
+        for len in [0, 1, SNAPSHOT_PIECE - 1, SNAPSHOT_PIECE, SNAPSHOT_PIECE + 1, 3 * SNAPSHOT_PIECE + 17] {
+            let bytes: Vec<u8> = (0..len).map(|i| u8::try_from(i % 251).unwrap_or(0)).collect();
+            let sent: Vec<ws::Message> = pieces(bytes.clone()).collect();
+            assert_eq!(sent.len(), len.div_ceil(SNAPSHOT_PIECE).max(1), "{len} bytes' frames");
+            let mut server = WebSocket::from_raw_socket(Cursor::new(Vec::new()), Role::Server, None);
+            for m in sent {
+                server.send(m)?;
+            }
+            let wire = server.get_ref().get_ref().clone();
+            let mut client = WebSocket::from_raw_socket(Cursor::new(wire), Role::Client, None);
+            match client.read()? {
+                ws::Message::Binary(got) => assert!(got.as_ref() == bytes.as_slice(), "{len} bytes, joined: {} came", got.len()),
+                other => anyhow::bail!("{len} bytes came as {other:?}"),
+            }
+        }
+        Ok(())
     }
 
     /// A command on a session's socket doesn't wait for the store: with the store's one connection
