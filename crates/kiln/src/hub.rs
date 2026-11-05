@@ -989,6 +989,14 @@ impl Hub {
         }
     }
 
+    /// An agent session's info changed: [`ServerEvent::Harness`]'s frame, made of `info_json`, the bytes
+    /// its copy's view encoded it as, not encoded again (goal 10, plan 01a1a87b2dae step 5).
+    pub fn emit_harness(&self, info_json: &[u8]) {
+        if self.events.receiver_count() > 0 {
+            self.events.send(crate::wire::events::harness_frame(info_json));
+        }
+    }
+
     pub async fn emit_job(&self, job_id: &str) {
         if let Ok(Some(mut j)) = self.store.job(job_id.to_owned()).await {
             j.spec = None;
