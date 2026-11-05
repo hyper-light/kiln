@@ -79,7 +79,7 @@ async fn tick(hub: &Arc<Hub>) -> anyhow::Result<()> {
     // Tests under way: a candidate's (`r`) or a whole's (`w`), its diff, commit and workflows.
     let pending: Vec<(String, String, String, String, Option<String>)> = hub
         .store
-        .call(|c| {
+        .read(|c| {
             let mut st = c.prepare(
                 "SELECT 'r', id, diff_id, commit_sha, started FROM review_resolutions WHERE tests = 'pending' AND commit_sha IS NOT NULL
                  UNION ALL SELECT 'w', replay_id, diff_id, whole_sha, whole_started FROM review_ladders WHERE whole_tests = 'pending' AND whole_sha IS NOT NULL",
