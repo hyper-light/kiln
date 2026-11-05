@@ -50,10 +50,11 @@ struct Live {
     /// What's to be written to the job's files, in the order sent (its chunks, in order from its runner
     /// through the hub's loop; its steps; its end): one writer, a task of its own, alone holds the files
     /// and writes them on the blocking pool (goal 5 of the API runtime program, plan 01a1a59c2aae step 2:
-    /// an owner with messages), so no writer, viewer or shard waits on another for them.
-    writes: async_channel::Sender<Write>,
+    /// an owner with messages), so no writer, viewer or shard waits on another for them. Lock-free
+    /// ([`Live::new`]).
+    writes: crate::memory::queue::Sender<Write>,
     /// Closed once its writer has written all it was sent and let go of the files.
-    done: async_channel::Receiver<()>,
+    done: crate::memory::queue::Receiver<()>,
 }
 
 /// What a live job's writer is sent ([`Live::writes`]), written in order.
@@ -77,14 +78,16 @@ enum Told {
 
 impl Live {
     /// A live job's feed, and the ends its writer takes: what's sent to be written, and what closes as
-    /// the writer goes.
-    fn new() -> (Self, async_channel::Receiver<Write>, async_channel::Sender<()>) {
+    /// the writer goes. Both lock-free (`crate::memory::queue`; goal 4, plan 01a1a59c2a9c step 5): an
+    /// async-channel's wait took event-listener's `Mutex`, the hub's loop and the job's viewers sending
+    /// on their shards and its writer waiting on its own.
+    fn new() -> (Self, crate::memory::queue::Receiver<Write>, crate::memory::queue::Sender<()>) {
         let feed = Arc::new(crate::memory::ring::Ring::new(&crate::memory::owners::LOG_FEEDS, FEED, FEED_BYTES));
         // Unbounded: what's sent is what was written at once before, and the hub's loop waits for each of
         // its runners' chunks to be written ([`Logs::append_written`]) as it waited for the write.
-        let (writes, to_write) = async_channel::unbounded();
-        // Nothing is sent on it: it closes as the writer goes.
-        let (going, done) = async_channel::bounded(1);
+        let (writes, to_write) = crate::memory::queue::unbounded(&crate::memory::owners::CHANNELS);
+        // Nothing is sent on it: it closes as the writer goes, and every wait on it ends then.
+        let (going, done) = crate::memory::queue::places(&crate::memory::owners::CHANNELS, 1);
         (Live { feed, writes, done }, to_write, going)
     }
 }
@@ -112,7 +115,7 @@ pub struct Logs {
     live: Arc<Rcu<HashMap<String, Arc<Live>>>>,
     /// Jobs over whose writers are still writing what they were sent, by job (a copy, as `live`): what
     /// reads one, and its next attempt's writer (a retry in place), wait for that first.
-    ending: Arc<Rcu<HashMap<String, async_channel::Receiver<()>>>>,
+    ending: Arc<Rcu<HashMap<String, crate::memory::queue::Receiver<()>>>>,
 }
 
 fn safe(id: &str) -> String {
@@ -225,7 +228,7 @@ impl Logs {
     }
 
     /// Waits for the writer of job `job` that's ending, when one is, unless it's `mine`.
-    async fn after_ending(&self, job: &str, mine: Option<&async_channel::Receiver<()>>) {
+    async fn after_ending(&self, job: &str, mine: Option<&crate::memory::queue::Receiver<()>>) {
         let ending = self.ending.load().get(job).cloned();
         if let Some(done) = ending.filter(|d| mine.is_none_or(|m| !d.same_channel(m))) {
             // Never sent on: it ends as its writer goes.
@@ -456,7 +459,7 @@ impl Logs {
 /// order, a batch at a time on the blocking pool, and telling the job's viewers what's written, until
 /// the job's entry and every holder of it are gone. A previous attempt's writer of the job still
 /// writing (a retry in place), it goes after that one.
-async fn writer(logs: Logs, job: String, to_write: async_channel::Receiver<Write>, viewers: Arc<crate::memory::ring::Ring<LogEvent>>, going: async_channel::Sender<()>, done: async_channel::Receiver<()>) {
+async fn writer(logs: Logs, job: String, to_write: crate::memory::queue::Receiver<Write>, viewers: Arc<crate::memory::ring::Ring<LogEvent>>, going: crate::memory::queue::Sender<()>, done: crate::memory::queue::Receiver<()>) {
     logs.after_ending(&job, Some(&done)).await;
     let mut files = Some(Files::default());
     while let Ok(first) = to_write.recv().await {
@@ -709,6 +712,47 @@ mod tests {
                 anyhow::ensure!(mine == sent, "thread {t}: {mine:?}");
             }
             anyhow::ensure!(logs.pieces("job1", 0).await.first().map(Vec::len) == Some(threads * each), "a digest a piece");
+            Ok(())
+        })
+    }
+
+    /// Goal 4, plan 01a1a59c2a9c step 5: a live job's writes, on a lock-free queue now (`crate::memory::queue`),
+    /// sent from every shard at once, each waited for until it's written as the hub's loop waits for its
+    /// runners' chunks: all written, each shard's in the order it sent them, none lost or doubled. Its next
+    /// attempt at once (a retry in place) is written after them, its writer waiting for the one ending, and a
+    /// read waits for both.
+    #[test]
+    fn g4_s5_a_live_jobs_writes_from_every_shard_keep_their_order() -> anyhow::Result<()> {
+        crate::rt::block_on(async move {
+            let dir = tempfile::tempdir()?;
+            let logs = Logs::new(dir.path().to_path_buf(), 1 << 30);
+            logs.step("job1", 0, "running");
+            let (senders, each) = (8usize, 200usize);
+            let mut sending = Vec::new();
+            for s in 0..senders {
+                let logs = logs.clone();
+                sending.push(crate::rt::spawn_spread_joined(async move {
+                    for i in 0..each {
+                        logs.append_written("job1", 0, format!("[{s}:{i}]\n").as_bytes()).await;
+                    }
+                }));
+            }
+            for s in sending {
+                s.await.map_err(|_| anyhow::anyhow!("a sender ended before its writes"))?;
+            }
+            logs.finish("job1");
+            logs.append("job1", 0, b"[again]\n");
+            logs.finish("job1");
+            let log = String::from_utf8(logs.read("job1", 0).await)?;
+            let lines: Vec<&str> = log.lines().collect();
+            anyhow::ensure!(lines.len() == senders * each + 1, "{} lines of {}", lines.len(), senders * each + 1);
+            anyhow::ensure!(lines.last() == Some(&"[again]"), "the next attempt's after the first's: {:?}", lines.last());
+            for s in 0..senders {
+                let mine: Vec<&str> = lines.iter().copied().filter(|l| l.starts_with(&format!("[{s}:"))).collect();
+                let sent: Vec<String> = (0..each).map(|i| format!("[{s}:{i}]")).collect();
+                anyhow::ensure!(mine == sent, "shard sender {s}'s, {} of {each}: lost, doubled or out of order", mine.len());
+            }
+            anyhow::ensure!(!logs.is_live("job1") && logs.ending.load().get("job1").is_none(), "its writers went once they'd written all");
             Ok(())
         })
     }
