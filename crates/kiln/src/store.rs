@@ -3170,7 +3170,7 @@ mod tests {
     fn g10_s2_writes_move_the_counts_of_the_tables_they_touched() -> anyhow::Result<()> {
         let dir = tempfile::tempdir()?;
         let grouped = Store::open_grouped(&dir.path().join("kiln.db"), &dir.path().join("cluster"))?;
-        crate::rt::block_on(async {
+        crate::rt::block_on(async move {
             let c = grouped.changes();
             let (kv, plans) = (c.of(&["kv"]), c.of(&["plans", "plan_runs"]));
             grouped.kv_set("a".into(), "1".into()).await?;
