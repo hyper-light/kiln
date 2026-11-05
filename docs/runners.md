@@ -169,7 +169,8 @@ needs in `KILN_NEEDS`. Reach holds nothing for it: what's idle when it's picked 
 **A change's gate** is commands like any other, composed by the agent that owns the change
 (AGENTS.md): a run per platform, side by side, each `ci/gate.sh [clippy|test] --since origin/main`
 through `kiln run` with `--needs` its platform and the CPUs and memory its steps were measured to
-need (`cpus=`, `mem=`), natively on Linux, macOS or Windows, scoped to the
+need (`cpus=`, `mem=`; clippy on kiln-ci alone peaked at 4 GiB at six rustcs: `kiln run --needs
+linux/amd64,cpus=6,mem=4g -- ci/gate.sh clippy -p kiln-ci`), natively on Linux, macOS or Windows, scoped to the
 crates the change touches, those whose code reads a changed file by path, and those that depend on
 them (a changed file it can't place: the whole workspace). `ci/gates.sh` starts the runs, never
 detached, waits for each and passes only when every one exited 0 and said `GATE: PASS`.

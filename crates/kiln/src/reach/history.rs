@@ -204,7 +204,14 @@ pub fn pick_sized(runners: &[RunnerInfo], want: &Want, me: &str, size_of: impl F
             ok.push((c, size.clone()));
         }
     }
-    ok.sort_by(|(a, _), (b, _)| b.score.total_cmp(&a.score).then_with(|| a.runner.name.cmp(&b.runner.name)));
+    // More room first, a runner that hasn't said its size last, as lb/sense's ranking has it.
+    let room = |a: Option<f32>, b: Option<f32>| match (a, b) {
+        (Some(a), Some(b)) => b.total_cmp(&a),
+        (Some(_), None) => std::cmp::Ordering::Less,
+        (None, Some(_)) => std::cmp::Ordering::Greater,
+        (None, None) => std::cmp::Ordering::Equal,
+    };
+    ok.sort_by(|(a, _), (b, _)| room(a.score, b.score).then_with(|| a.runner.name.cmp(&b.runner.name)));
     match ok.into_iter().next() {
         Some(best) => Ok(best),
         None => directory::pick(runners, want, me).map(|c| (c, None)),
