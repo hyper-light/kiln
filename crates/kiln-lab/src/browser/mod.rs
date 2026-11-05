@@ -123,6 +123,13 @@ pub enum Cmd {
     DocCheck { doc: PathBuf, run: PathBuf },
     /// A run's tables, in Markdown.
     Report { run: PathBuf },
+    /// Several runs' jobs as one run file (a pass split into parts across machines and workers,
+    /// each job keeping the machine it ran on): the first run's settings, every run's targets.
+    Merge {
+        #[arg(long)]
+        out: PathBuf,
+        runs: Vec<PathBuf>,
+    },
     /// Target `a` against target `b`, cell by cell, in one run (an A/A) or, with `--b-run`, in two.
     Compare {
         run: PathBuf,
@@ -252,6 +259,29 @@ pub fn run(cmd: Cmd) -> anyhow::Result<()> {
         Cmd::Report { run } => {
             let r: report_run::BrowserRun = serde_json::from_slice(&std::fs::read(&run)?)?;
             print!("{}", report::tables(&r));
+            Ok(())
+        }
+        Cmd::Merge { out, runs } => {
+            let mut merged: Option<report_run::BrowserRun> = None;
+            for p in &runs {
+                let r: report_run::BrowserRun = serde_json::from_slice(&std::fs::read(p)?)?;
+                match merged.as_mut() {
+                    None => merged = Some(r),
+                    Some(m) => {
+                        for t in r.settings.targets {
+                            if !m.settings.targets.iter().any(|x| x.name == t.name) {
+                                m.settings.targets.push(t);
+                            }
+                        }
+                        m.jobs.extend(r.jobs);
+                        m.failures.extend(r.failures);
+                    }
+                }
+            }
+            let mut m = merged.ok_or_else(|| anyhow::anyhow!("no run files to merge"))?;
+            m.command = format!("kiln-lab browser merge of {} runs: {}", runs.len(), runs.iter().map(|p| p.display().to_string()).collect::<Vec<_>>().join(" "));
+            std::fs::write(&out, serde_json::to_vec_pretty(&m)?)?;
+            println!("{}: {} jobs from {} runs, {} failures", out.display(), m.jobs.len(), runs.len(), m.failures.len());
             Ok(())
         }
         Cmd::Compare { run, a, b, b_run } => {
