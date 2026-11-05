@@ -18,19 +18,16 @@ metal: docs/priority.md.
   | 3 | `5c4047a47e5` | 11:26 | `7dd67a5ce0f` | goal 5 step 2 (terminals, the front door's replica locks, the live channel's receivers); goal 11 step 3 (the remaining bounds) |
   | 4 | `6a3f0072091` | 12:37 | `4b429f1a05c` | goal 11 step 3 (the deployments engine's inputs and actions, the bus's per-topic peak); goal 10 step 1's baseline and the server-cores lab, in docs |
   | 5 | `3e8f9f1c9b0` | 13:40 | `f5b2ce35c36` | goal 6 step 4 (the standing rule); goal 9 step 3; goal 5's A/B, goal 6's runs and goal 11's memory by owner, in docs |
+  | 6 | `fa6d88b754f` | 16:11 | `58ebfa84134` | goal 9 step 3 (places.json off the hub's shard, learner catch-ups in parts, read costs per kind); goal 10 steps 4 and 5 (the runner wait's legs, deliveries timed, snapshots yielding); goal 11 steps 4 and 5 (gzip on request, the brotli window, 16 KiB agent sockets, the jemalloc feature, spill files); goal 5's checks in its message |
 
-- **Gating, not landed: train 6,** rt-next `6b577fdeba7`, everything after train 5:
-  - goal 9 step 3: places.json written off the hub's shard, learner catch-ups sent in parts, a
-    runner message's read cost learned per kind;
-  - goal 10 steps 4 and 5: the runner's wait told by its legs, kiln-lab timing only frames that
-    bring events, a viewer's snapshot giving up its shard between pieces;
-  - goal 11 steps 4 and 5: the UI's gzip copies made on request, the feed's brotli window fitted to
-    its batch, agent pages' sockets reading 16 KiB at a time, an off-by-default jemalloc feature,
-    and spill files for session copies' sealed chunks;
-  - its gate: `ci/gate.sh` on `rt-int`, fast-forwarded to it with one clippy rename
-    (`58ebfa84134`), running since about 14:46Z.
-- **Handed over since, in no train yet:** goal 11's bounds on session segments and snapshots
-  (`85a4cee6fa2`), and goal 10's one encoding of a session's info (`c18943b4e25`).
+- **Landed since: train 6,** `fa6d88b754f` at 16:11Z (the table above). Its gate on `58ebfa84134`:
+  clippy passed on all three targets; 5,319 tests passed, and the one that failed in the run (w05_r03)
+  passed alone 3 of 3.
+- **In the next train (rt-next):** everything handed over since train 6, among it goal 11's bounds on
+  session segments and snapshots and its streaming snapshots, goal 10's one encoding of a session's info
+  and its read cuts, goal 9's step 3 quantum and step 5 counters, goal 9 step 4's install defaults, goal
+  6 step 3's run-queue order, goal 8 step 7's `[server] nudge`, goal 11 step 4's allocator settings, goal
+  11 step 5's dropped startup pages and build-time brotli copies, and goal 4's harness ring.
 - **Deployed: none of it.**
   - Production is the bare-metal server on adacachy: `kiln-server.service`, a system unit in
     `kiln.slice`, its process running since 04:45:18Z on 2026-11-05.
@@ -57,8 +54,9 @@ metal: docs/priority.md.
   | 3 | 2: `harness::socket`'s sweep test, w05_r03 |
   | 4 | 2: `hosting` w03_r09, w05_r03 |
   | 5 | 1, beside 5,303 passed: w05_r03 (3 of 3 alone) |
+  | 6 | 1, beside 5,319 passed: w05_r03 (3 of 3 alone) |
 
-  `w05_r03_a_host_leg_runs_on_its_cpus` failed beside the full suite in all five, its leg seeing
+  `w05_r03_a_host_leg_runs_on_its_cpus` failed beside the full suite in all six, its leg seeing
   the host's load (W05-R03).
 
 ## What it delivers, by goal
