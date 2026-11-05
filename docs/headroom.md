@@ -32,11 +32,14 @@ harmed. A target that declares none takes the platform's default, Kubernetes' 1 
   own reasons, not slow, and isn't counted.
 - `tcp`: connect to `host:port`.
 
-kiln adds its own unless `automatic` is off: a sync in the runner's data folder, the health of the
-server the runner reports to, and, where that server runs on this machine, how late its shards ran
+kiln adds its own unless `automatic` is off: a sync in the runner's data folder and, where the
+server the runner reports to runs on this machine, that server's health and how late its shards ran
 ready work on average since the last look (`kiln server delay`, [priority.md](priority.md)): its
 tolerance is the shards' own probe period, and, as it answers with a level it measured rather than
 with how long the probe took, its window (how soon trouble must be caught) is the platform's 1 s.
+A runner on another machine paces nothing for the server: its work can't slow it. (It once did, and
+on 2026-11-05 the Mac runners, reading production's latency while production's own machine was
+loaded as harm their builds did, held every agent's run to about 1% of a CPU.)
 Each target is probed on a thread of its own, at an interval the engine derives; a probe still out
 counts while it hangs.
 
