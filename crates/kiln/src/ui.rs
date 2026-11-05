@@ -339,8 +339,8 @@ mod tests {
         let data = Bytes::from("an earlier build's script ".repeat(200));
         assert!(packed("assets/earlier-g11test.js", &data, br_cache(), false).is_none());
         assert!(packed("assets/earlier-g11test.js", &data, gz_cache(), false).is_none());
-        assert!(!br_cache().lock().contains_key("assets/earlier-g11test.js"));
-        assert!(!gz_cache().lock().contains_key("assets/earlier-g11test.js"));
+        assert!(!br_cache().load().contains_key("assets/earlier-g11test.js"));
+        assert!(!gz_cache().load().contains_key("assets/earlier-g11test.js"));
         let before = crate::memory::UI_ASSETS.bytes();
         let made = gzip("assets/ours-g11test.js", data.as_ref()).map_or(0, |b| b.len());
         assert!(made > 0);
