@@ -258,16 +258,31 @@ impl Drop for AbortOnDrop {
 /// the caller's task (`round-robin`, or a request steering keeps where it is), as a task on another shard
 /// (`steer`), or as a movable task (`steal`, `both`). Its output; `None` when the task it was placed in ended
 /// without one (its runtime stopping). Dropped before it ends, the placed task is aborted at its next poll.
-pub async fn request<F>(class: Class, fut: F) -> Option<F::Output>
+///
+/// `demoted`: the request lowered the caller's task to `class` from a more urgent one, its head read in that
+/// class's turn (`crate::overload::Serving::demoted`; goal 6, plan 01a1a59c2abe step 3). Kept in the caller's task,
+/// it first gives way to a more urgent task waiting on the shard (`hyper_rt::coop::give_way`), so a person's page
+/// woken meanwhile goes first; else it ran on in Critical's turn, and a page queued behind every API call read
+/// before it. With none waiting it goes on at once, its place kept. Placed apart, its task starts in `class`.
+pub async fn request<F>(class: Class, demoted: bool, fut: F) -> Option<F::Output>
 where
     F: Future + Send + 'static,
     F::Output: Send + 'static,
 {
-    request_in(get(), class, fut).await
+    request_as(get(), class, demoted, fut).await
 }
 
 /// [`request`] under placement `p`, whatever the setting.
 pub async fn request_in<F>(p: Placement, class: Class, fut: F) -> Option<F::Output>
+where
+    F: Future + Send + 'static,
+    F::Output: Send + 'static,
+{
+    request_as(p, class, false, fut).await
+}
+
+/// [`request`] under placement `p`.
+async fn request_as<F>(p: Placement, class: Class, demoted: bool, fut: F) -> Option<F::Output>
 where
     F: Future + Send + 'static,
     F::Output: Send + 'static,
@@ -279,6 +294,9 @@ where
         return placed(fut, |task| hyper_rt::runtime::submit_movable_as(holder, class, task).is_ok(), Placed::Moved).await;
     }
     count(Placed::Local);
+    if demoted {
+        hyper_rt::coop::give_way().await;
+    }
     Some(fut.await)
 }
 
@@ -457,6 +475,78 @@ mod tests {
             }
             Ok(())
         })
+    }
+
+    /// Goal 6, plan 01a1a59c2abe step 3: a request that lowered its connection's task from Critical (its head read
+    /// in Critical's turn) and stays in that task gives way before its handler runs to a Critical task woken
+    /// meanwhile on the shard (a page's connection, its socket ready), which goes first; not demoted, the handler
+    /// runs at once, ahead of it. Do: on one shard, the connection's task at Critical starts a Critical task that
+    /// waits, wakes it, lowers itself to Normal and runs a handler, demoted and then not. Expect: the Critical
+    /// task's mark before the handler's, then after it.
+    #[test]
+    fn g6_s3_a_demoted_request_gives_way_to_a_woken_critical_task() -> anyhow::Result<()> {
+        use std::sync::Arc;
+        use std::sync::atomic::AtomicUsize;
+        let mut shard = hyper_rt::runtime::LocalRuntime::new(&hyper_rt::runtime::RuntimeConfig {
+            shards: 1,
+            tasks_per_shard: 16,
+            timers_per_shard: 16,
+            interests_per_shard: 32,
+            ring_entries: 16,
+            step_budget_ns: crate::rt::STEP_BUDGET_NS,
+            timer_tick_ns: 50_000,
+            batch: 16,
+            pin: false,
+            cores: Vec::new(),
+            page_bytes: 4096,
+            spin_ns: 0,
+            wake_tracking: None,
+            latency_objective_ns: None,
+        })
+        .map_err(|e| anyhow::anyhow!("a shard: {e}"))?;
+        let order = shard.block_on(async {
+            // Each mark's place: the woken Critical task's (`k`) and the handler's (`h`), twice.
+            let at = Arc::new(AtomicUsize::new(0));
+            let mut marks = Vec::new();
+            for demoted in [true, false] {
+                let _ = hyper_rt::coop::set_class(Class::Critical);
+                let (wake, woken) = hyper_rt::sync::oneshot::<()>().map_err(|e| anyhow::anyhow!("{e}"))?;
+                let (k, h) = (Arc::new(AtomicUsize::new(0)), Arc::new(AtomicUsize::new(0)));
+                let (waiting, at_k) = (Arc::clone(&k), Arc::clone(&at));
+                let spawned = hyper_rt::futures::spawn(async move {
+                    let _ = woken.await;
+                    waiting.store(at_k.fetch_add(1, Ordering::Relaxed) + 1, Ordering::Relaxed);
+                });
+                anyhow::ensure!(spawned.is_ok(), "spawned: {spawned:?}");
+                // Its first poll, in which it waits.
+                hyper_rt::futures::yield_now().await;
+                anyhow::ensure!(wake.send(()).is_ok(), "woken");
+                // The request read lowers the task to its own class.
+                let _ = hyper_rt::coop::set_class(Class::Normal);
+                let (handled, at_h) = (Arc::clone(&h), Arc::clone(&at));
+                let out = request_as(Placement::RoundRobin, Class::Normal, demoted, async move {
+                    handled.store(at_h.fetch_add(1, Ordering::Relaxed) + 1, Ordering::Relaxed);
+                    7
+                })
+                .await;
+                anyhow::ensure!(out == Some(7), "answered {out:?}");
+                // The Critical task's turn comes by now either way.
+                hyper_rt::futures::yield_now().await;
+                marks.push((demoted, k.load(Ordering::Relaxed), h.load(Ordering::Relaxed)));
+            }
+            Ok::<_, anyhow::Error>(marks)
+        });
+        let marks = order.map_err(|e| anyhow::anyhow!("the shard: {e}"))??;
+        anyhow::ensure!(marks.len() == 2, "{marks:?}");
+        for (demoted, k, h) in marks {
+            anyhow::ensure!(k > 0 && h > 0, "both ran: {k}, {h}");
+            if demoted {
+                anyhow::ensure!(k < h, "demoted, the handler gave way to the Critical task: k {k}, h {h}");
+            } else {
+                anyhow::ensure!(h < k, "not demoted, the handler ran at once: k {k}, h {h}");
+            }
+        }
+        Ok(())
     }
 
     /// Step 1's acceptance, on the picks: with one shard busy (its delay far past the others', then held too), no

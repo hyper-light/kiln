@@ -4,7 +4,9 @@
 //! movable tasks), their responses written by the connection's task; upgrades (WebSocket) are HTTP/1.1's.
 
 use std::future::Future;
+use std::pin::Pin;
 use std::sync::Arc;
+use std::task::{Context, Poll};
 
 use bytes::Bytes;
 use futures::io::{AsyncRead, AsyncWrite};
@@ -161,7 +163,7 @@ where
         mark(&mut req, remote, secure);
         let request = serving.begin(&mut req);
         let handler = handler.clone();
-        async move { crate::overload::while_sent(placed(request.class(), handler.handle(req)).await, request) }
+        async move { crate::overload::while_sent(placed(request.class(), request.demoted(), handler.handle(req)).await, request) }
     });
     let conn = http1::Builder::new()
         // Slow or idle clients cannot pin a connection: headers must arrive within the timeout
@@ -190,7 +192,7 @@ where
         mark(&mut req, remote, secure);
         let request = serving.begin(&mut req);
         let handler = handler.clone();
-        async move { crate::overload::while_sent(placed(request.class(), handler.handle(req)).await, request) }
+        async move { crate::overload::while_sent(placed(request.class(), request.demoted(), handler.handle(req)).await, request) }
     });
     let conn = http2::Builder::new()
         // A connection whose client has gone quiet without closing is found and ended.
@@ -205,9 +207,10 @@ where
 
 /// A request's handler run where the server's placement puts it (goal 7, `crate::placement`): in this task,
 /// on a less delayed shard, or as a movable task; a 503 when the shard it was placed on stopped before it
-/// answered.
-async fn placed(class: crate::overload::Class, handling: impl Future<Output = Response> + Send + 'static) -> Response {
-    match crate::placement::request(class, handling).await {
+/// answered. A `demoted` request (its head read in a more urgent class's turn) takes its own class's turn
+/// first where it stays in this task (goal 6, plan 01a1a59c2abe step 3).
+async fn placed(class: crate::overload::Class, demoted: bool, handling: impl Future<Output = Response> + Send + 'static) -> Response {
+    match crate::placement::request(class, demoted, handling).await {
         Some(resp) => resp,
         None => text(StatusCode::SERVICE_UNAVAILABLE, "the server is stopping"),
     }
@@ -251,10 +254,60 @@ pub fn channel_body(rx: async_channel::Receiver<Bytes>) -> Body {
     BodyExt::boxed(http_body_util::StreamBody::new(frames))
 }
 
+/// A body of `parts` made already, sent in order as they are: none joined or copied here (kiln-http sends a
+/// large one from its own buffer, a small one beside the head), its length known for the head (goal 10,
+/// plan 01a1a87b2dae step 5: a session's events page, slices of what its copy keeps).
+pub fn pieces(parts: Vec<Bytes>) -> Body {
+    let left = parts.iter().map(|p| u64::try_from(p.len()).unwrap_or(u64::MAX)).fold(0u64, u64::saturating_add);
+    BodyExt::boxed(Pieces { parts: parts.into(), left })
+}
+
+/// [`pieces`]' body: the parts still to go, and their bytes.
+struct Pieces {
+    parts: std::collections::VecDeque<Bytes>,
+    left: u64,
+}
+
+impl http_body::Body for Pieces {
+    type Data = Bytes;
+    type Error = std::io::Error;
+
+    fn poll_frame(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Option<Result<Frame<Bytes>, std::io::Error>>> {
+        let this = self.get_mut();
+        while let Some(part) = this.parts.pop_front() {
+            if !part.is_empty() {
+                this.left = this.left.saturating_sub(u64::try_from(part.len()).unwrap_or(u64::MAX));
+                return Poll::Ready(Some(Ok(Frame::data(part))));
+            }
+        }
+        Poll::Ready(None)
+    }
+
+    fn is_end_stream(&self) -> bool {
+        self.left == 0
+    }
+
+    fn size_hint(&self) -> http_body::SizeHint {
+        http_body::SizeHint::with_exact(self.left)
+    }
+}
+
+/// The API's own content types, whose header each answer takes as the words themselves, not a copy made of
+/// them for each answer (goal 10, plan 01a1a87b2dae step 5: every JSON answer copied its type).
+static JSON: &str = "application/json";
+static TEXT: &str = "text/plain; charset=utf-8";
+
 pub fn response(status: StatusCode, content_type: &str, body: Body) -> Response {
     let mut r = http::Response::new(body);
     *r.status_mut() = status;
-    if let Ok(v) = HeaderValue::from_str(content_type) {
+    let value = if content_type == JSON {
+        Some(HeaderValue::from_static(JSON))
+    } else if content_type == TEXT {
+        Some(HeaderValue::from_static(TEXT))
+    } else {
+        HeaderValue::from_str(content_type).ok()
+    };
+    if let Some(v) = value {
         r.headers_mut().insert(header::CONTENT_TYPE, v);
     }
     r
@@ -264,13 +317,13 @@ pub fn json<T: serde::Serialize>(status: StatusCode, value: &T) -> Response {
     // Encoded as it's answered (goal 10, plan 01a1a87b2dae step 2's trace: the lab's reads never are).
     crate::reads::trace::encoded();
     match serde_json::to_vec(value) {
-        Ok(b) => response(status, "application/json", full(b)),
+        Ok(b) => response(status, JSON, full(b)),
         Err(e) => text(StatusCode::INTERNAL_SERVER_ERROR, &format!("serialize: {e}")),
     }
 }
 
 pub fn text(status: StatusCode, s: &str) -> Response {
-    response(status, "text/plain; charset=utf-8", full(s.to_owned()))
+    response(status, TEXT, full(s.to_owned()))
 }
 
 pub fn status(status: StatusCode) -> Response {
@@ -400,6 +453,37 @@ mod tests {
         assert_eq!(req.headers().get(header::HOST).and_then(|v| v.to_str().ok()), Some("b.test"));
         assert_eq!(req.headers().get(header::COOKIE).and_then(|v| v.to_str().ok()), Some("x=1"));
         assert_eq!(req.uri().to_string(), "/");
+        Ok(())
+    }
+
+    /// Goal 10, plan 01a1a87b2dae step 5: an answer's own content type is the words themselves, not a copy
+    /// made of them for it; another type is said as it's given.
+    #[test]
+    fn g10_s5_an_answers_own_content_type_is_not_copied() {
+        let said = |r: &Response| r.headers().get(header::CONTENT_TYPE).map(|v| (v.as_bytes().as_ptr(), v.as_bytes().to_vec()));
+        assert_eq!(said(&response(StatusCode::OK, "application/json", empty())), Some((JSON.as_ptr(), JSON.as_bytes().to_vec())), "the JSON type's own words");
+        assert_eq!(said(&json(StatusCode::OK, &1)).map(|s| s.0), Some(JSON.as_ptr()));
+        assert_eq!(said(&text(StatusCode::OK, "ok")), Some((TEXT.as_ptr(), TEXT.as_bytes().to_vec())));
+        assert_eq!(said(&response(StatusCode::OK, "image/png", empty())).map(|s| s.1), Some(b"image/png".to_vec()), "another as given");
+    }
+
+    /// Goal 10, plan 01a1a87b2dae step 5: a body of pieces sends each as it is, in order (a large one from its
+    /// own buffer, not a copy), its length known for the head; an empty one is passed over.
+    #[test]
+    fn g10_s5_a_body_of_pieces_sends_each_as_it_is() -> anyhow::Result<()> {
+        use http_body::Body as _;
+        let big = Bytes::from(vec![b'x'; 8 << 10]);
+        let mut body = pieces(vec![Bytes::from_static(b"["), Bytes::new(), big.clone(), Bytes::from_static(b"]")]);
+        assert_eq!(body.size_hint().exact(), Some(2 + (8 << 10)));
+        let mut cx = Context::from_waker(std::task::Waker::noop());
+        let mut frames = Vec::new();
+        while let Poll::Ready(Some(frame)) = Pin::new(&mut body).poll_frame(&mut cx) {
+            frames.push(frame?.into_data().map_err(|_| anyhow::anyhow!("a frame that isn't data"))?);
+        }
+        assert_eq!(frames.len(), 3, "the empty one passed over");
+        assert_eq!(frames.get(1).map(|f| f.as_ptr()), Some(big.as_ptr()), "the large one as it is");
+        assert_eq!(frames.concat(), [b"[".as_slice(), big.as_ref(), b"]"].concat());
+        assert!(body.is_end_stream());
         Ok(())
     }
 

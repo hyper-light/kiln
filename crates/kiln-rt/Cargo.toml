@@ -147,3 +147,9 @@ harness = false
 [[bench]]
 name = "desk"
 harness = false
+
+# kiln's goal 8 step 7: a shard's wait for its CPU once woken, beside spinning hogs at cpu.weight 1, by
+# each unprivileged means (Linux; elsewhere it says so and ends).
+[[bench]]
+name = "lazy_wake"
+harness = false

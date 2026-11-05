@@ -324,6 +324,24 @@ pub fn realtime_current_thread(priority: i32) -> Result<(), Refusal> {
     crate::prioritysys::realtime_current_thread(priority)
 }
 
+/// Bounds how long the calling thread, a shard, waits for its CPU once woken behind a thread busy in user space,
+/// where Linux preempts lazily and the real-time class is refused (kiln's goal 8, plan 01a1a59c2b29 step 7): each
+/// of its waits in the driver ends by `period_ns` (and the thread's timer slack, which the kernel adds to every
+/// timed wait), so its CPU takes a timer interrupt of the shard's own at least that often while it waits. Under
+/// lazy preemption a fair-class wake marks the busy thread for a reschedule and sends no interrupt, and the CPU
+/// switches as that thread next returns to user space from the kernel, at the tick at the latest (1 ms at
+/// 1000 Hz): the shard's own timer is such a return. Nothing a normal thread may set makes the wake itself
+/// preempt at once on Linux 6.19 (a custom slice, the idle policy beside it and the rest: kiln's
+/// docs/runtime-lab.md, "Goal 8 step 7 and goal 9 step 4").
+///
+/// What it costs: one wake of the shard per period while it waits, a park and a return to its loop, CPU the
+/// shard spends and its CPU's other threads lose; on an idle CPU, the deeper idle states it can't reach. 0 lifts
+/// it. Refused on macOS and Windows, which have no lazy preemption to bound (the OS-interface file says what
+/// holds a shard on each): the thread then runs as it did.
+pub fn nudge_current_thread(period_ns: u64) -> Result<(), Refusal> {
+    crate::prioritysys::nudge_current_thread(period_ns)
+}
+
 /// The calling thread's priority as its OS reports it (a pool thread's is lowered; a shard's is not).
 pub fn thread_priority() -> Priority {
     crate::prioritysys::of_current_thread()
@@ -427,6 +445,12 @@ pub struct Stats {
     pub stolen: u64,
     /// The longest piece any worker has run, nanoseconds.
     pub longest_piece_ns: u64,
+    /// Workers woken from their park (kiln's goal 9, plan 01a1a87b2cec step 5: what handing work to the pool
+    /// costs): each an unpark, a system call (a futex wake on Linux) on the thread that queued the job, a shard's
+    /// most often, or on a worker that found more waiting.
+    pub unparks: u64,
+    /// Times a worker went to park with nothing to do: each a sleep that a later job's unpark ends.
+    pub parks: u64,
 }
 
 /// What the pool tells its consumer ([`observe`]), in nanoseconds on the pool's clock.
@@ -467,6 +491,8 @@ static PIECES: AtomicU64 = AtomicU64::new(0);
 static YIELDED: AtomicU64 = AtomicU64::new(0);
 static STOLEN: AtomicU64 = AtomicU64::new(0);
 static LONGEST_PIECE_NS: AtomicU64 = AtomicU64::new(0);
+static UNPARKS: AtomicU64 = AtomicU64::new(0);
+static PARKS: AtomicU64 = AtomicU64::new(0);
 
 /// What the pool has done.
 pub fn stats() -> Stats {
@@ -479,6 +505,8 @@ pub fn stats() -> Stats {
         yielded: YIELDED.load(Ordering::Relaxed),
         stolen: STOLEN.load(Ordering::Relaxed),
         longest_piece_ns: LONGEST_PIECE_NS.load(Ordering::Relaxed),
+        unparks: UNPARKS.load(Ordering::Relaxed),
+        parks: PARKS.load(Ordering::Relaxed),
     }
 }
 
@@ -710,6 +738,9 @@ impl Pool {
             self.claim(slot);
             return !stopping || self.any_work(local);
         }
+        // Counted once a rest that found nothing, however its park returns (a claim that came first, a
+        // spurious return parked again).
+        PARKS.fetch_add(1, Ordering::Relaxed);
         while slot.state.load(Ordering::Acquire) == IDLE {
             std::thread::park();
         }
@@ -749,6 +780,9 @@ impl Pool {
         });
         if let Some(slot) = woken {
             slot.thread.unpark();
+            UNPARKS.fetch_add(1, Ordering::Relaxed);
+            // On the waking shard too, where a shard queued the job (kiln's goal 9, plan 01a1a87b2cec step 5).
+            crate::registry::count_thread_woken();
         }
     }
 
@@ -1116,5 +1150,64 @@ mod tests {
             }
             Err(_) => panic!("the asking thread panicked"),
         }
+    }
+
+    /// Kiln's goal 9, plan 01a1a87b2cec step 5: a worker that finds nothing to do is counted a park, the wake that
+    /// claims it an unpark, and that unpark is counted on the shard whose task made it, a system call there; a
+    /// wake that finds no worker idle unparks nothing. (No other unit test runs a pool, so the counts are exact.)
+    #[test]
+    fn g9_s5_a_workers_park_and_the_unpark_that_ends_it_are_counted() {
+        let (pool_tx, pool_rx) = std::sync::mpsc::channel::<&'static Pool>();
+        let worker = std::thread::spawn(move || {
+            let pool = pool_rx.recv().unwrap();
+            pool.rest(0, &Worker::new_fifo())
+        });
+        let pool: &'static Pool = Box::leak(Box::new(Pool {
+            injector: Injector::new(),
+            stealers: Box::new([]),
+            slots: Box::new([Slot {
+                state: AtomicU8::new(RUNNING),
+                thread: worker.thread().clone(),
+            }]),
+            idle: AtomicUsize::new(0),
+            next: AtomicUsize::new(0),
+            held: AtomicUsize::new(0),
+            queued: 1,
+            piece_ns: 1,
+            stopping: AtomicBool::new(false),
+            live: AtomicUsize::new(1),
+            stopper: OnceLock::new(),
+        }));
+        let (unparks, parks) = (UNPARKS.load(Ordering::Relaxed), PARKS.load(Ordering::Relaxed));
+        pool.wake_one();
+        assert_eq!(UNPARKS.load(Ordering::Relaxed), unparks, "every worker running: no one to unpark");
+        pool_tx.send(pool).unwrap();
+        // The worker said it is idle: it parks, or is about to.
+        while pool.idle.load(Ordering::SeqCst) == 0 {
+            std::hint::spin_loop();
+        }
+        let config = crate::runtime::RuntimeConfig {
+            shards: 1,
+            tasks_per_shard: 4,
+            timers_per_shard: 4,
+            interests_per_shard: 4,
+            ring_entries: 16,
+            step_budget_ns: 1_000_000,
+            timer_tick_ns: 100_000,
+            batch: 16,
+            pin: false,
+            cores: Vec::new(),
+            page_bytes: 4096,
+            spin_ns: 0,
+            wake_tracking: None,
+            latency_objective_ns: None,
+        };
+        let mut rt = crate::runtime::LocalRuntime::new(&config).unwrap();
+        rt.spawn(async move { pool.wake_one() }).unwrap();
+        while rt.step().did_work {}
+        assert!(worker.join().unwrap(), "the woken worker goes on serving");
+        assert_eq!(UNPARKS.load(Ordering::Relaxed) - unparks, 1, "one unpark woke it");
+        assert_eq!(PARKS.load(Ordering::Relaxed) - parks, 1, "it parked once");
+        assert_eq!(rt.counters().threads_woken, 1, "counted on the shard whose task woke it");
     }
 }
