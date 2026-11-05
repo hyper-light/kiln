@@ -151,11 +151,22 @@ const ZIP_QUALITY: u32 = 4;
 /// of the decompressor's, or hashing as much, a few microseconds, well inside a piece.
 const ZIP_BUFFER: usize = 4096;
 
+/// The brotli window a batch of `len` bytes is zipped with, as bits: the smallest that holds it
+/// (`crate::util::brotli_window`), and at most a batch's own size (`BATCH_BYTES`, 2^21 bytes; a row larger
+/// than a batch goes alone, in a batch of its own past it). The decoder on the other side ([`Decoding`]) grows
+/// its ring buffer to the window as the output passes it: at 22 bits for every batch, a batch just past 2 MiB
+/// took a 4 MiB ring buffer, and one being decoded held 5.2 MB of the server's live memory in the lab's
+/// realistic profile (goal 11, plan 01a1a87b2e56 step 5). A window of the batch's size reaches every match
+/// the batch's own bytes offer but those a large row's spill past it, and any brotli decoder reads it.
+fn zip_window(len: usize) -> u32 {
+    crate::util::brotli_window(len).min(BATCH_BYTES.ilog2())
+}
+
 fn zip(bytes: &[u8]) -> anyhow::Result<Vec<u8>> {
     use std::io::Write as _;
     let mut out = Vec::with_capacity(bytes.len() / 4 + 16);
     {
-        let mut w = brotli::CompressorWriter::new(&mut out, ZIP_BUFFER, ZIP_QUALITY, 22);
+        let mut w = brotli::CompressorWriter::new(&mut out, ZIP_BUFFER, ZIP_QUALITY, zip_window(bytes.len()));
         w.write_all(bytes)?;
         w.flush()?;
     }
@@ -1561,6 +1572,22 @@ mod tests {
         let longest_row = batch.rows.iter().map(|c| serde_json::to_vec(c).map_or(0, |v| v.len())).max().unwrap_or(0);
         anyhow::ensure!(units >= 2 * json.len() / ZIP_BUFFER + batch.rows.len(), "{units} units for {} bytes and {} rows", json.len(), batch.rows.len());
         anyhow::ensure!(biggest <= ZIP_BUFFER.max(longest_row + 2), "a unit of {biggest} bytes");
+        Ok(())
+    }
+
+    /// Goal 11, plan 01a1a87b2e56 step 5: a batch is zipped in a window no larger than it needs and at most a
+    /// batch's size, past which a decoder's ring buffer doesn't grow, and comes back whole: a small batch, one
+    /// of a batch's size, and one a large row took past it.
+    #[test]
+    fn g11_s5_a_batch_is_zipped_in_a_window_of_its_size() -> anyhow::Result<()> {
+        anyhow::ensure!(zip_window(0) == 10 && zip_window(1000) == 10 && zip_window(20_000) == 15);
+        anyhow::ensure!(zip_window(BATCH_BYTES) == 21 && zip_window(3 * BATCH_BYTES) == 21, "at most a batch's size");
+        for len in [1000, BATCH_BYTES, BATCH_BYTES + BATCH_BYTES / 2] {
+            let json: Vec<u8> = (0u64..).map(|i| format!("{{\"seq\":{i},\"text\":\"a line of the agent's {}\"}},", i % 977)).flat_map(String::into_bytes).take(len).collect();
+            let mut back = Vec::new();
+            brotli::BrotliDecompress(&mut zip(&json)?.as_slice(), &mut back)?;
+            anyhow::ensure!(back == json, "{len} bytes came back as {}", back.len());
+        }
         Ok(())
     }
 }

@@ -55,6 +55,29 @@ pub fn accept_limited(
     req: Request,
     max_message: usize,
 ) -> Result<(Response, impl Future<Output = anyhow::Result<WebSocket>> + Send + 'static), Refused> {
+    accept_with(req, limits(max_message))
+}
+
+/// What a socket whose peer sends people's commands reads at a time: a TLS record's most (RFC 8446 §5.1, 2^14
+/// bytes of plaintext), what one read of a TLS connection hands over. tungstenite's default, 128 KiB, is made
+/// up front for every socket: 1.8 MB for the agent pages' sockets in the lab's realistic profile, whose
+/// peers send a command now and then (goal 11, plan 01a1a87b2e56 step 5). A frame larger than it still comes
+/// whole: tungstenite's reader grows its buffer to the frame's length as the frame comes.
+const COMMANDS_READ: usize = 16 << 10;
+
+/// [`accept`] for a socket whose peer sends people's commands (an agent's page), reading
+/// [`COMMANDS_READ`] bytes at a time.
+pub fn accept_commands(
+    req: Request,
+) -> Result<(Response, impl Future<Output = anyhow::Result<WebSocket>> + Send + 'static), Refused> {
+    accept_with(req, limits(16 << 20).read_buffer_size(COMMANDS_READ))
+}
+
+/// Answers the handshake for a socket of `config`.
+fn accept_with(
+    req: Request,
+    config: WebSocketConfig,
+) -> Result<(Response, impl Future<Output = anyhow::Result<WebSocket>> + Send + 'static), Refused> {
     let bad = |reason: &'static str| Refused { status: StatusCode::BAD_REQUEST, reason };
     if !is_upgrade(&req) {
         return Err(bad("expected a WebSocket upgrade"));
@@ -79,7 +102,7 @@ pub fn accept_limited(
         let ws = async_tungstenite::WebSocketStream::from_raw_socket(
             upgraded,
             tungstenite::protocol::Role::Server,
-            Some(limits(max_message)),
+            Some(config),
         )
         .await;
         Ok(ws)
@@ -459,5 +482,22 @@ mod tests {
             Ok::<_, anyhow::Error>(())
         })?;
         server.join().map_err(|_| anyhow::anyhow!("server thread panicked"))?
+    }
+
+    /// Goal 11, plan 01a1a87b2e56 step 5: a commands socket reads [`COMMANDS_READ`] bytes at a time, and a
+    /// message many times that still comes whole.
+    #[test]
+    fn g11_s5_a_commands_socket_takes_a_message_past_its_read_buffer() -> anyhow::Result<()> {
+        use std::io::Cursor;
+        let big = "a pasted file's line\n".repeat(COMMANDS_READ);
+        anyhow::ensure!(big.len() > 10 * COMMANDS_READ);
+        let mut client = tungstenite::WebSocket::from_raw_socket(Cursor::new(Vec::new()), tungstenite::protocol::Role::Client, None);
+        client.send(tungstenite::Message::text(big.clone()))?;
+        let wire = client.get_ref().get_ref().clone();
+        let config = limits(16 << 20).read_buffer_size(COMMANDS_READ);
+        let mut server = tungstenite::WebSocket::from_raw_socket(Cursor::new(wire), tungstenite::protocol::Role::Server, Some(config));
+        let got = server.read()?.into_text()?;
+        anyhow::ensure!(got.as_str() == big, "{} bytes came of {}", got.len(), big.len());
+        Ok(())
     }
 }
