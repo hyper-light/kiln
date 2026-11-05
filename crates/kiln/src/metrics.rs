@@ -719,6 +719,47 @@ fn render_wire(o: &mut String) {
     wire().ignored.render(o, "kiln_wire_ignored_fields_total");
 }
 
+/// TLS handshakes on kiln's browser-facing listeners (goal 7 step 3, plan
+/// 01a1a832ebbf7327a203df446e16ecac), by `door` (`server`: the server's own listeners with
+/// `server.https`; `front_door`: a runner's HTTPS) and `kind` (`full`, `full_hello_retry`,
+/// `resumed`): every series there from the start.
+pub struct TlsMetrics {
+    pub handshakes: CounterVec,
+}
+
+/// The doors [`TlsMetrics`] counts.
+pub const TLS_DOORS: [&str; 2] = ["server", "front_door"];
+/// The kinds of handshake it counts (`crate::http::tls::Stream::handshake`).
+pub const TLS_HANDSHAKES: [&str; 3] = ["full", "full_hello_retry", "resumed"];
+
+impl TlsMetrics {
+    /// One handshake completed on `door`, of `kind`.
+    pub fn handshake(&self, door: &'static str, kind: &'static str) {
+        self.handshakes.inc(&[door, kind]);
+    }
+}
+
+pub fn tls() -> &'static TlsMetrics {
+    static M: OnceLock<TlsMetrics> = OnceLock::new();
+    M.get_or_init(|| {
+        let handshakes = CounterVec::new(&["door", "kind"]);
+        for door in TLS_DOORS {
+            for kind in TLS_HANDSHAKES {
+                handshakes.add(&[door, kind], 0);
+            }
+        }
+        TlsMetrics { handshakes }
+    })
+}
+
+fn render_tls(o: &mut String) {
+    let _ = writeln!(
+        o,
+        "# HELP kiln_tls_handshakes_total TLS handshakes completed on kiln's browser-facing listeners, by door (server, front_door) and kind (full, full_hello_retry, resumed).\n# TYPE kiln_tls_handshakes_total counter"
+    );
+    tls().handshakes.render(o, "kiln_tls_handshakes_total");
+}
+
 pub fn net() -> &'static NetMetrics {
     static M: OnceLock<NetMetrics> = OnceLock::new();
     M.get_or_init(|| NetMetrics { frames_dropped: CounterVec::new(&["lane", "reason"]), toward: Rcu::default() })
@@ -1214,6 +1255,7 @@ pub fn render() -> String {
     render_bus(&mut o);
     render_net(&mut o);
     render_wire(&mut o);
+    render_tls(&mut o);
     crate::shard_health::render(&mut o);
     crate::route_latency::render(&mut o);
     crate::overload::render(&mut o);
