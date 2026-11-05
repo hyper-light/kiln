@@ -174,6 +174,12 @@ impl Entry {
         self.head.main
     }
 
+    /// Whether its JSON is `null`: an event that couldn't be written out as JSON, nothing for a copy to
+    /// take.
+    pub fn is_null(&self) -> bool {
+        self.text() == "null"
+    }
+
     /// A changeset file's path and tree, as [`file_ref`] names a file's JSON.
     pub(super) fn file(&self) -> FileRef<'_> {
         self.head.file.as_deref().map_or((None, None), |(path, tree)| (path.as_deref(), tree.as_deref()))
