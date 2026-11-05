@@ -1,6 +1,7 @@
 /**
  * The highlighter as the page has it: web-tree-sitter and each grammar fetched the first time code
- * in its language shows (a grammar is a gzipped asset the browser inflates), its queries with it.
+ * in its language shows (built, a grammar is plain WebAssembly kiln sends Brotli-encoded; in the dev
+ * server, the gzip file the source keeps, inflated here), its queries with it.
  * Code shows plain until then, and in its colours once the grammar is here: a component asks
  * through `useHighlighter`, which subscribes to what has loaded (useSyncExternalStore, no
  * effects) and starts loading what it needs while rendering, once, as lib/resource.ts does.
@@ -33,6 +34,7 @@ const assets: Assets = {
     if (!url) throw new Error(`no grammar ${id}`);
     const res = await fetch(url);
     if (!res.ok || !res.body) throw new Error(`${url}: HTTP ${res.status}`);
+    if (!url.endsWith(".gz")) return new Uint8Array(await res.arrayBuffer());
     return new Uint8Array(await new Response(res.body.pipeThrough(new DecompressionStream("gzip"))).arrayBuffer());
   },
   query: (path) => {

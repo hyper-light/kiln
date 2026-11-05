@@ -37,7 +37,7 @@ type Runtime = typeof import("web-tree-sitter");
 export interface Assets {
   /** web-tree-sitter, initialized. */
   runtime(): Promise<Runtime>;
-  /** A grammar's WebAssembly (grammars/<id>.wasm.gz, inflated). */
+  /** A grammar's WebAssembly (grammars/<id>.wasm.gz, inflated; built, plain WebAssembly the browser decoded). */
   grammar(id: string): Promise<Uint8Array>;
   /** A query's text, by its path under src/lib/syntax. */
   query(path: string): Promise<string>;
