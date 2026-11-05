@@ -2173,7 +2173,11 @@ impl Registry {
             Update::Meta { meta } => Some(serde_json::to_value(meta).unwrap_or(Value::Null)),
             _ => None,
         };
-        let mut changed: Option<Info> = None;
+        // Its info changed as its pages see it: the events socket is told, its frame made of the bytes its
+        // view encoded the info as (goal 10, plan 01a1a87b2dae step 5: it was encoded again for the socket).
+        let mut changed = false;
+        // The same meta again (a harness says it at each turn): nothing to keep, encode or send.
+        let mut meta_same = false;
         let mut gone = false;
         // The copy's events went another way than its viewers have them: they start over from it.
         let mut resync = false;
@@ -2218,7 +2222,7 @@ impl Registry {
             let m = s.entry(id, || Mirror::new(info.clone(), from.clone(), bus));
             // Its machine announced it: what it reports from now on counts.
             m.opened_at = None;
-            m.info = Arc::new(info.clone());
+            m.info = Arc::new(info);
             m.reported = reported;
             m.location = Arc::new(from.clone());
             match keep {
@@ -2237,7 +2241,7 @@ impl Registry {
             }
             m.changes = None;
             m.changes_sent = None;
-            changed = Some(info);
+            changed = true;
         }
         let Some(m) = s.get_mut(id) else {
             // Its events are stored all the same, as they were before a copy took them.
@@ -2306,7 +2310,7 @@ impl Registry {
                 }
                 drop(names);
                 if m.info.differs(&before) {
-                    changed = Some(Info::clone(&m.info));
+                    changed = true;
                 }
                 if before.pause.is_none()
                     && let Some(p) = m.info.pause.as_ref().filter(|p| p.reason == super::pause::LIMIT && p.by == "harness")
@@ -2318,7 +2322,14 @@ impl Registry {
                     hold_for = Some((account, p.window.clone(), p.until));
                 }
             }
-            Update::Meta { .. } => m.meta = Arc::new(made.take().unwrap_or(Value::Null)),
+            Update::Meta { .. } => {
+                let meta = made.take().unwrap_or(Value::Null);
+                if *m.meta == meta {
+                    meta_same = true;
+                } else {
+                    m.meta = Arc::new(meta);
+                }
+            }
             Update::Changes { files } => m.take_changes(files.iter().filter_map(|f| serde_json::to_value(f).ok()).collect(), Vec::new(), true),
             Update::ChangesPatch { set, gone } => {
                 m.take_changes(set.iter().filter_map(|f| serde_json::to_value(f).ok()).collect(), gone.iter().filter_map(|k| serde_json::to_value(k).ok()).collect(), false);
@@ -2384,6 +2395,7 @@ impl Registry {
             Update::Open { since: Some(_), .. } => None,
             Update::State { .. } => m.state_frame(),
             Update::Changes { .. } | Update::ChangesPatch { .. } => m.changes_frame(),
+            Update::Meta { .. } if meta_same => None,
             _ => Some(m.frame_of(&u, &entries)),
         });
         if gone {
@@ -2438,8 +2450,8 @@ impl Registry {
             self.asked.forget(id);
             super::archive::closed(hub, id);
             hub.emit(&crate::wire::events::ServerEvent::HarnessClosed { id: id.to_string() });
-        } else if let Some(info) = changed {
-            hub.emit(&crate::wire::events::ServerEvent::Harness { info: Box::new(info) });
+        } else if changed && let Some(m) = s.get(id) {
+            hub.emit_harness(m.info_encoded());
         }
         rest.map(|u| Ingest { from, id: id.to_owned(), u, shipped, reported: String::new() })
     }
@@ -4281,6 +4293,58 @@ mod tests {
         let Ok(read) = futures::executor::block_on(hub.bus.read(topic, *at, 1000)) else { return Vec::new() };
         *at = read.next;
         read.messages.iter().filter_map(|m| super::super::live::decode(&m.payload)).map(|f| f.text.to_string()).collect()
+    }
+
+    /// Goal 10, plan 01a1a87b2dae step 5 (and goal 9 step 3's owner's poll): a state's update encodes its
+    /// session's info once, for its view, and the events socket's frame of it is those bytes, as
+    /// `ServerEvent::Harness` wrote it before; a state that changes nothing its viewer has goes as no frame;
+    /// the same meta again is kept, encoded and sent as nothing, a new one encoded once, its frame as before.
+    #[test]
+    fn g10_s5_an_update_encodes_once_what_it_changed() -> anyhow::Result<()> {
+        use crate::harness::model::{Meta, State};
+        crate::rt::block_on(async {
+            let hub = crate::hub::tests::scratch_hub().await?;
+            let there = Location::Machine("box".into());
+            hub.harness.ingest(&hub, &there, "s", Update::Open { info: Box::new(Info { id: "s".into(), kind: "claude".into(), ..Info::default() }), since: None }).await;
+            let attached = hub.harness.attach("s").ok_or_else(|| anyhow::anyhow!("no copy"))?;
+            // Watching, so the feed publishes; and the events socket's frames, as a page takes them.
+            let (_watching, topic, mut at) = (attached.viewer, attached.topic, attached.at.unwrap_or_default());
+            let mut events = hub.events.subscribe();
+            let encodings = || async { hub.harness.sessions.on("s", |s| s.get("s").map(|m| m.encodings)).await.flatten().unwrap_or_default() };
+            let state = State { summary: "the retry loop reads its deadline".into(), ..State::default() };
+            let was = encodings().await;
+            hub.harness.ingest(&hub, &there, "s", Update::State { state: Box::new(state.clone()) }).await;
+            let now = encodings().await;
+            anyhow::ensure!(now.info == was.info + 1, "the info encoded once: {was:?} then {now:?}");
+            let view = hub.harness.sessions.view("s").ok_or_else(|| anyhow::anyhow!("no view"))?;
+            let frame = loop {
+                let f = events.try_recv().map_err(|e| anyhow::anyhow!("no info frame on the events socket: {e:?}"))?;
+                if f.starts_with(r#"{"type":"harness""#) {
+                    break f;
+                }
+            };
+            assert_eq!(&*frame, crate::wire::events::ServerEvent::Harness { info: Box::new((*view.info).clone()) }.text(), "the frame as before");
+            assert_eq!(frame.as_bytes().get(r#"{"type":"harness","info":"#.len()..frame.len() - 1), Some(view.info_json.as_ref()), "the view's own bytes");
+            let heard = sent(&hub, &topic, &mut at);
+            anyhow::ensure!(heard.iter().filter(|f| f.starts_with(r#"{"t":"state""#)).count() == 1, "one state frame: {heard:?}");
+            // The same state again: its info encoded for its view (its last activity moves), no frame.
+            hub.harness.ingest(&hub, &there, "s", Update::State { state: Box::new(state) }).await;
+            let heard = sent(&hub, &topic, &mut at);
+            anyhow::ensure!(heard.is_empty(), "no frame for a state that changed nothing its viewer has: {heard:?}");
+            // A meta: one frame, as it was written before, encoded once; the same again, nothing.
+            let meta = Meta { version: "2.1".into(), agents: vec!["explore".into()], ..Meta::default() };
+            let was = encodings().await;
+            hub.harness.ingest(&hub, &there, "s", Update::Meta { meta: Box::new(meta.clone()) }).await;
+            let heard = sent(&hub, &topic, &mut at);
+            let mut want = Vec::new();
+            write::value(&mut want, "meta", "meta", &serde_json::to_value(&meta)?, hub.harness.rev("s"))?;
+            anyhow::ensure!(heard == vec![String::from_utf8(want)?], "the meta's frame as before: {heard:?}");
+            anyhow::ensure!(encodings().await.meta == was.meta + 1, "the meta encoded once");
+            hub.harness.ingest(&hub, &there, "s", Update::Meta { meta: Box::new(meta) }).await;
+            let heard = sent(&hub, &topic, &mut at);
+            anyhow::ensure!(heard.is_empty() && encodings().await.meta == was.meta + 1, "the same meta again: nothing kept, encoded or sent: {heard:?}");
+            Ok(())
+        })
     }
 
     /// CP-T3.2 (the thirteenth and fourteenth adversarial checks'): what kiln's own words (a goal
