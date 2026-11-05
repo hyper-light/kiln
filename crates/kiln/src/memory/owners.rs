@@ -38,6 +38,16 @@ pub static RECORDS_QUEUE: Owner = Owner::new("records_queue");
 /// batch until the server has it and sends it again.
 pub static FEED_INTAKE: Owner = Owner::new("feed_intake");
 
+/// Kiln's receipts of runners' conversation-feed batches waiting for the task that signs and keeps them
+/// (`crate::custody::feeds`): at most [`crate::custody::feeds::RECEIPTS_BYTES`], as much as the intake's
+/// queue their hand-ons came in. At the bound a receipt is let go, said so, its hand-on unanswered.
+pub static CUSTODY_RECEIPTS: Owner = Owner::new("custody_receipts");
+
+/// Finished messages' mentions of files waiting for the task that keeps them (`crate::harness::kept`): at
+/// most `QUEUE_BYTES` there, an owner's inbox's bytes ([`crate::net::EVENTS_BYTES`]), where the messages
+/// came from. At the bound a message's files aren't kept as it finishes: they're read when someone looks.
+pub static KEPT_FILES: Owner = Owner::new("kept_files");
+
 /// What the server sends its conversation store's mirrors, waiting for the loop that hands it to the net
 /// thread (`crate::convo::mirror`): at most [`crate::convo::mirror::OUT_BYTES`], as much as the net
 /// thread's queue it goes into. At the bound a mirror's feed waits.
@@ -63,7 +73,7 @@ pub static SQLITE: Owner = Owner::new("sqlite");
 pub static WIRE_CHECKS: Owner = Owner::new("wire_checks");
 
 /// The owners counted here, in the order the exposition says them.
-pub(super) const ALL: [&Owner; 9] = [&NET_OUT, &NET_EVENTS, &SESSION_INBOXES, &LOCAL_UPDATES, &RECORDS_QUEUE, &FEED_INTAKE, &MIRRORS_OUT, &WIRE_CHECKS, &SQLITE];
+pub(super) const ALL: [&Owner; 11] = [&NET_OUT, &NET_EVENTS, &SESSION_INBOXES, &LOCAL_UPDATES, &RECORDS_QUEUE, &FEED_INTAKE, &MIRRORS_OUT, &WIRE_CHECKS, &CUSTODY_RECEIPTS, &KEPT_FILES, &SQLITE];
 
 #[cfg(test)]
 mod tests {
@@ -121,10 +131,13 @@ mod tests {
         anyhow::ensure!(SESSION_INBOXES.bound().is_some_and(|b| b >= crate::net::EVENTS_BYTES), "inboxes' bound: {:?}", SESSION_INBOXES.bound());
         let mut o = String::new();
         crate::memory::render(&mut o, &[]);
-        for name in ["net_out", "net_events", "session_inboxes", "local_updates", "records_queue", "feed_intake", "mirrors_out", "sqlite"] {
+        for name in ["net_out", "net_events", "session_inboxes", "local_updates", "records_queue", "feed_intake", "mirrors_out", "custody_receipts", "kept_files", "sqlite"] {
             anyhow::ensure!(o.contains(&format!("kiln_memory_bytes{{owner=\"{name}\"}} ")), "{name} isn't on /metrics:\n{o}");
         }
         anyhow::ensure!(o.contains("kiln_memory_bound_bytes{owner=\"local_updates\"} "), "{o}");
+        anyhow::ensure!(KEPT_FILES.bound().is_some_and(|b| b >= crate::net::EVENTS_BYTES), "kept files' bound: {:?}", KEPT_FILES.bound());
+        let job = |paths: usize| crate::harness::kept::Job { session: "s1".into(), seq: 1, paths: vec!["p".repeat(100); paths], location: crate::harness::registry::Location::Local };
+        anyhow::ensure!(job(10).weight() - job(0).weight() == 10 * (size_of::<String>() + 100), "a job weighs its paths");
         Ok(())
     }
 

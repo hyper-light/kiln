@@ -28,9 +28,12 @@ use crate::hub::Hub;
 pub const MOST_KEPT: u64 = 64 << 20;
 pub const MOST_PER_SESSION: u64 = 512 << 20;
 pub const MOST_ALL: u64 = 4 << 30;
-/// Finished messages waiting for their files to be kept; past that, a message's are read when
-/// someone looks.
-const QUEUE: usize = 4096;
+/// The bytes of finished messages' mentions waiting for their files to be kept (goal 11, plan
+/// 01a1a87b2e56 step 3): as many as the inbox of the session's owner that applied the message holds
+/// ([`crate::net::EVENTS_BYTES`]), the names a job carries being a message's words; past that, a message's
+/// files are read when someone looks, nothing lost. Its 4,096 places, made up front, took 0.4 MB of an idle
+/// server's heap (research 01a1a87b2e57, f10).
+const QUEUE_BYTES: usize = crate::net::EVENTS_BYTES;
 /// How often content no list names is cleared away.
 const SWEEP_EVERY: Duration = Duration::from_secs(6 * 3600);
 
@@ -67,20 +70,32 @@ pub struct Job {
     pub location: Location,
 }
 
+impl crate::memory::queue::Weigh for Job {
+    /// Its place, its session's id, each path with its place, and its machine's name.
+    fn weight(&self) -> usize {
+        let paths = self.paths.iter().map(|p| size_of::<String>().saturating_add(p.len())).fold(0usize, usize::saturating_add);
+        let machine = match &self.location {
+            Location::Machine(m) => m.len(),
+            Location::Local => 0,
+        };
+        size_of::<Job>().saturating_add(self.session.len()).saturating_add(paths).saturating_add(machine)
+    }
+}
+
 pub struct Keeper {
     dir: PathBuf,
     lists: Mutex<HashMap<String, Vec<Kept>>>,
     /// Conversations closed since start: nothing more is kept for them.
     gone: Mutex<HashSet<String>>,
-    tx: async_channel::Sender<Job>,
-    rx: async_channel::Receiver<Job>,
+    tx: crate::memory::queue::Sender<Job>,
+    rx: crate::memory::queue::Receiver<Job>,
     /// What the kept content takes, as of the last sweep and since (`u64::MAX` before the first).
     used: AtomicU64,
 }
 
 impl Keeper {
     pub fn new(harness_dir: &Path) -> Self {
-        let (tx, rx) = async_channel::bounded(QUEUE);
+        let (tx, rx) = crate::memory::queue::bounded(&crate::memory::owners::KEPT_FILES, QUEUE_BYTES);
         Self { dir: harness_dir.join("files"), lists: Mutex::default(), gone: Mutex::default(), tx, rx, used: AtomicU64::new(u64::MAX) }
     }
 
