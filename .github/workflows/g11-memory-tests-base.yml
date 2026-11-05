@@ -1,0 +1,57 @@
+# Trial only, never on main (goal 11, plan 01a1a87b2e56): main as goal 11 started from (the baseline for its test runs), tested on Linux
+# as kiln's CI tests them (the library's tests built first, then every test of kiln and kiln-lab). Results go to
+# the branch g11-memory-tests-results.
+name: g11-memory-tests-base
+
+on:
+  push:
+    branches: [g11-memory-tests-base]
+
+permissions:
+  contents: write
+
+concurrency:
+  group: g11-memory-tests-base
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: never
+  CARGO_INCREMENTAL: "0"
+  KILN_UI_SERVER: "off"
+  CARGO_PROFILE_DEV_DEBUG: line-tables-only
+
+jobs:
+  linux:
+    name: linux (kiln and kiln-lab tests)
+    runs-on: ubuntu-latest
+    timeout-minutes: 300
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Room
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL || true
+          sudo mkdir -p /mnt/target && sudo chown "$USER" /mnt/target
+          df -h / /mnt; free -m; nproc
+      - name: Rust
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+      - name: Tests
+        env:
+          CARGO_TARGET_DIR: /mnt/target
+        run: |
+          set +e
+          R=$RUNNER_TEMP/t; mkdir -p "$R"
+          nice -n 10 cargo test -p kiln --locked --lib --no-run > "$R/build-lib.txt" 2>&1; echo "build lib tests exit $?" | tee -a "$R/summary.txt"
+          nice -n 10 cargo test -p kiln --locked > "$R/kiln.txt" 2>&1; echo "kiln tests exit $?" | tee -a "$R/summary.txt"
+          nice -n 10 cargo test -p kiln-lab --locked > "$R/kiln-lab.txt" 2>&1; echo "kiln-lab tests exit $?" | tee -a "$R/summary.txt"
+          grep -h -E "^test result|^failures:|^    [A-Za-z_:0-9]+$|panicked at|^error" "$R/kiln.txt" "$R/kiln-lab.txt" "$R/build-lib.txt" | head -200 >> "$R/summary.txt"
+          echo "${{ github.sha }}" > "$R/COMMIT"
+          cd "$RUNNER_TEMP" && git init -q out && cd out && mkdir results && cp "$R/summary.txt" "$R/COMMIT" results/
+          for f in kiln kiln-lab build-lib; do grep -v -E '^ *(Compiling|Checking|Downloaded|Downloading) ' "$R/$f.txt" | grep -v -E '^test .* \.\.\. ok$' | tail -400 > "results/$f.txt"; done
+          git config user.name "kiln g11 lab" && git config user.email "g11-lab@users.noreply.github.com"
+          git add results && git commit -q -m "g11 tests for ${{ github.sha }}"
+          git push -q -f "https://x-access-token:${GH_TOKEN}@github.com/${{ github.repository }}.git" HEAD:refs/heads/g11-memory-tests-base-results
+          grep -q "kiln tests exit 0" "$R/summary.txt" && grep -q "kiln-lab tests exit 0" "$R/summary.txt"
