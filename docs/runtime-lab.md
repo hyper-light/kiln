@@ -737,7 +737,11 @@ count of its arenas' locks either.
   (WAL), and see every write committed before them. The API's reads on the lab's paths (the runners,
   the overview, runs, plans, goals, sign-in and access checks) and the store's own read methods read so.
   The share's places are goal 3's Little's-law measure of the store's calls (24); the writer's waits and
-  runs are `kiln_blocking_*{share="store_write"}`.
+  runs are `kiln_blocking_*{share="store_write"}`. The writer commits the calls waiting for it together
+  (`Writing::group`: one transaction, each call in a savepoint of its own, at most 1,024 calls or a
+  millisecond of their runs), each caller answered once its group commits (`kiln_store_commit_seconds`,
+  `kiln_store_committed_calls_total`); its WAL is checkpointed on a thread of its own at SQLite's mark,
+  not inside its commits (`kiln_store_checkpoint_seconds`).
 - **Read-mostly state** is an immutable copy swapped in whole (`crate::rcu::Rcu`, on arc-swap; f7, f9):
   readers take the current copy without waiting on anyone, a writer copies, changes and swaps it in (a
   compare-and-swap, tried again on a race). The hub's runner processes' links, the runners' labels and
