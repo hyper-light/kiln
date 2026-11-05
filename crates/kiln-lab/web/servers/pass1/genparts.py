@@ -15,12 +15,13 @@ PILOT = ["kiln-today","kiln-today-b","h2o-h2","h2o-h3","h2o-h3-reno"]
 for c in ["request","stream","burst"]:
     add("A", f"pilot-50k-{c}", "50k", 1, c, PILOT, 5)
     add("F", f"pilot-good-{c}", "good", 0, c, PILOT, 5)
-# K links against one, on each machine, and the same cells across the machines.
+# K links against one, on each machine, and the same cells across the machines (kiln today and h2o
+# over HTTP/2: the two machines' h2o builds differ, same source, each against its own OpenSSL).
 for m in ["F","A"]:
     add(m, f"k1-50k-stream", "50k", 1, "stream", ["kiln-today"], 5, k=1)
     add(m, f"k1-good-request", "good", 0, "request", ["kiln-today"], 5, k=1)
-add("F", "xm-50k-stream", "50k", 1, "stream", ["kiln-today"], 5)
-add("A", "xm-good-request", "good", 0, "request", ["kiln-today"], 5)
+add("F", "xm-50k-stream", "50k", 1, "stream", ["kiln-today","h2o-h2"], 5)
+add("A", "xm-good-request", "good", 0, "request", ["kiln-today","h2o-h2"], 5)
 # The matrix: every condition and case; the pilot's cells stand for good/0 and 50k/1 except 50k/1's
 # requests, which the plan gives 11 rounds. h2o-h3's row ($H3) runs on A, after the pilot chose.
 mat = []
