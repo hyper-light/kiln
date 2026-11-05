@@ -32,7 +32,7 @@ import { handleKeep } from "./keep.ts";
 import { handleReap } from "./reap.ts";
 import { handleExperiments } from "./experiments.ts";
 import { handlePlaces } from "./places.ts";
-import { handleLongFiles, handleLongSession, handleShownPages, longInfo, searchSaid, sendAway, setLongEmit } from "./conversation.ts";
+import { handleLongFiles, handleLongSession, handleLongTimeline, handleShownPages, longInfo, searchSaid, sendAway, setLongEmit } from "./conversation.ts";
 import { fastInfos, handleFastSession } from "./fast.ts";
 import { handlePush, pushHeard } from "./push.ts";
 import { handleReview } from "./review.ts";
@@ -1679,6 +1679,7 @@ const server = http.createServer(async (req, res) => {
     }
     // ---- files the long session's messages mention ----
     if (handleLongFiles(p, url, req, res)) return;
+    if (handleLongTimeline(p, url, res)) return;
     // ---- live pages a person opens (the Tools tab): what its machine serves; no streams here ----
     const live = /^\/api\/harness\/sessions\/([^/]+)\/(preview|preview\/stop|streams)$/.exec(p);
     if (live) {
@@ -2152,7 +2153,10 @@ server.on("upgrade", (req, socket, head) => {
         handleReviewSession(ws, decodeURIComponent(hm[1]!)) ||
         handleFamilySession(ws, decodeURIComponent(hm[1]!)) ||
         handleFastSession(ws, decodeURIComponent(hm[1]!), url.searchParams.get("patch") === "state") ||
-        handleLongSession(ws, decodeURIComponent(hm[1]!), url.searchParams.get("z") === "gzip", url.searchParams.get("patch") === "state"))
+        handleLongSession(ws, decodeURIComponent(hm[1]!), url.searchParams.get("z") === "gzip", url.searchParams.get("patch") === "state", {
+          window: url.searchParams.get("window") === "1",
+          lean: url.searchParams.get("lean") === "1",
+        }))
     )
       return;
     ws.close(1008, "no such socket");

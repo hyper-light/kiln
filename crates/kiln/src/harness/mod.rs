@@ -73,4 +73,5 @@ pub mod visuals;
 pub mod wait;
 pub mod webrtc;
 pub mod whose;
+pub mod window;
 pub mod worktree;

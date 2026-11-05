@@ -335,7 +335,7 @@ server says, and counts every session it has, ended ones included, until it's up
 | POST | `/api/harness/command` | `{ids, command, key?}`: one command for the sessions listed → `{sent, report}` (the same sending as `/broadcast`); each agent's message id is made from `key` (or the `Idempotency-Key` header, else the command's own `id`) and the agent, so sending it again sends the same messages |
 | POST | `/api/harness/files?name=&mime=` | a file for a later message → `{file_id, size}` |
 | GET | `/api/harness/sessions/:id/tasks/:task/output?since=` | a task's output, read on its machine: `{data, offset, live, truncated, path?, gone?}` or `{error}`; without `since` the last 64 KiB, with it what came after that byte (up to 256 KiB); ask again from `offset` to follow it. Native Codex subagents return `reset: true`: replace previous output with this snapshot (last 64 KiB), regardless of `since`; `pending: true` means a live child has not produced output yet |
-| WS | `/api/harness/sessions/:id/ws?z=gzip&patch=state` | updates (below); commands go on it too, each under an id and answered `ack` or `nack` (docs/wire.md, "The UI's sockets") |
+| WS | `/api/harness/sessions/:id/ws?z=gzip&patch=state&window=1&lean=1` | updates (below); commands go on it too, each under an id and answered `ack` or `nack` (docs/wire.md, "The UI's sockets"); `window=1`, a first load of its newest events alone, `lean=1`, settled tool calls without their bodies (docs/wire.md, "Windows") |
 | GET | `/api/harness/sessions/:id/terminals` | the terminals beside it (its shell, its harness's own screen), live ones first → `[{terminal, what, command?, to_type?}]`; see below |
 | GET / POST / PUT | `/api/harness/sessions/:id/goals` | its goal stack: goals one after another (docs/goals.md) |
 | GET / PUT / DELETE | `/api/harness/sessions/:id/keep` | its copies on other runners (each with what the rules say of it) and its own rules for them (docs/reach.md §5.1); DELETE: its repository's and runner's apply |
@@ -346,6 +346,8 @@ server says, and counts every session it has, ended ones included, until it's up
 | POST | `/api/ai-sessions/:machine/:pid/fork` | continue a copy of a found session, leaving it running → `Info[]`; see below |
 | GET | `/api/harness/history?target=&kind=&limit=` | a machine's past sessions to continue → `PastSession[]`, newest first; see below |
 | GET | `/api/harness/sessions/:id/events?before=&limit=` | the session's history from the conversation store, beyond what its timeline holds → `{events}`, oldest first ([conversations.md](conversations.md)) |
+| GET | `/api/harness/sessions/:id/timeline?before=&lean=` | the page of its events just before number `before`, where a window (or the last page) begins → `{events, before?, more}`, oldest first, whole turns where they fit; from the server's copy, then the conversation store ([wire.md](wire.md), "Windows") |
+| GET | `/api/harness/sessions/:id/events/:event?seq=` | one event whole: what a lean one held back, asked for as it's opened ([wire.md](wire.md), "Windows") |
 | GET | `/api/conversations/search?q=&agent=&kind=&tool=&status=&since=&until=&limit=` | events across every agent's conversation, newest first → `{hits: [{agent, name, machine, event}]}` |
 
 Updates (`t`): `open {info}` (a snapshot follows), `state {state}`, `meta {meta}`,

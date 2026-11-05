@@ -1349,6 +1349,8 @@ async fn authorized(hub: Arc<Hub>, caller: crate::authz::Caller, req: Request) -
         }
         (&Method::GET, ["api", "harness", "history"]) => boxed(|| harness_history(&hub, &caller, &q)).await,
         (&Method::GET, ["api", "harness", "sessions", id, "events"]) => boxed(|| conversation_events(&hub, id, &q)).await,
+        (&Method::GET, ["api", "harness", "sessions", id, "events", event]) => boxed(|| harness_event(&hub, id, event, &q)).await,
+        (&Method::GET, ["api", "harness", "sessions", id, "timeline"]) => boxed(|| harness_timeline(&hub, id, &q)).await,
         (&Method::GET, ["api", "conversations", "search"]) => boxed(|| conversation_search(&hub, &q)).await,
         // The runners that keep a copy of the server's conversation store (docs/conversations.md, "Mirrors").
         (&Method::GET, ["api", "conversations", "mirrors"]) => Ok(srv::json(StatusCode::OK, &json!({ "mirrors": hub.harness.copies.as_ref().map(|m| m.view()).unwrap_or_default() }))),
@@ -5106,6 +5108,63 @@ async fn conversation_events(hub: &Hub, id: &str, q: &HashMap<String, String>) -
     Ok(srv::json(StatusCode::OK, &json!({ "events": events })))
 }
 
+/// `GET /api/harness/sessions/:id/timeline?before=<seq>&lean=1`: the page of a session's events
+/// just before number `before`, for a viewer whose window (or last page) begins there (docs/wire.md,
+/// "Windows"): `{events, before?, more}`, oldest first, whole turns where they fit, at most a page's
+/// bounds (`crate::harness::window`); `before` where it begins, to ask for the one before it. From
+/// the server's copy of the session, and past what that holds, from its conversation store. Pages
+/// asked for one after another meet with no gap and nothing twice: each is the events numbered
+/// from where it begins up to where the last began, and new events are numbered after them all.
+async fn harness_timeline(hub: &Hub, id: &str, q: &HashMap<String, String>) -> R {
+    use crate::harness::registry::Paged;
+    use crate::wire::ui::{EventsWindow, TimelinePage};
+    let Some(before) = q.get("before").and_then(|b| b.parse::<u64>().ok()) else { return Err(err(StatusCode::BAD_REQUEST, "before is the number of the first event the viewer has")) };
+    let lean = q.get("lean").is_some_and(|v| v == "1");
+    let page = match hub.harness.page(id, before, lean).ok_or_else(|| err(StatusCode::NOT_FOUND, "no such agent session"))? {
+        Paged::Page { events, window } => TimelinePage { events: events.iter().filter_map(|t| serde_json::from_str(t).ok()).collect(), window },
+        Paged::Store { before, floor } => {
+            let Some(store) = hub.harness.convo.clone() else { return Ok(srv::json(StatusCode::OK, &TimelinePage { events: Vec::new(), window: EventsWindow::default() })) };
+            let session = id.to_owned();
+            // As many as a page holds at most, by number; the page is cut from them as the copy's are.
+            let rows = crate::rt::blocking(move || store.events(&session, Some(before), crate::harness::window::ROWS)).await.map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")))?;
+            let rows = rows.map_err(|e| err(StatusCode::SERVICE_UNAVAILABLE, format!("{e:#}")))?;
+            let read = rows.len();
+            let events: Vec<serde_json::Value> = rows.iter().filter(|r| r.seq >= floor).filter_map(|r| serde_json::from_str::<serde_json::Value>(&r.body).ok()).map(|e| if lean { crate::harness::window::lean(&e).unwrap_or(e) } else { e }).collect();
+            store_page(events, read, floor)
+        }
+    };
+    Ok(srv::json(StatusCode::OK, &page))
+}
+
+/// A page cut from `events`, the newest the conversation store keeps before a viewer's (oldest
+/// first, `read` of them asked for, the timeline beginning at `floor`): as many as a page holds,
+/// whole turns where they fit. More before it when it left some of them out, or the store had
+/// as many as were asked for (it may have more).
+fn store_page(events: Vec<serde_json::Value>, read: usize, floor: u64) -> crate::wire::ui::TimelinePage {
+    use crate::harness::window;
+    let begin = window::start(&events, events.len(), window::PAGE_TURNS, |e| serde_json::to_string(e).map_or(0, |t| t.len()), window::begins_turn);
+    let before = events.get(begin).and_then(|e| e.get("seq")).and_then(serde_json::Value::as_u64);
+    let more = begin > 0 || (read >= window::ROWS && before.is_some_and(|s| s > floor));
+    crate::wire::ui::TimelinePage { events: events.into_iter().skip(begin).collect(), window: crate::wire::ui::EventsWindow { before, more } }
+}
+
+/// `GET /api/harness/sessions/:id/events/:event?seq=`: one event of a session, whole: what a lean
+/// one (`?lean=1` on its socket or its pages) held back, asked for when a person opens it. From the
+/// server's copy, else (`seq`: its number) the conversation store.
+async fn harness_event(hub: &Hub, id: &str, event: &str, q: &HashMap<String, String>) -> R {
+    if let Some(text) = hub.harness.event_text(id, event) {
+        let v: serde_json::Value = serde_json::from_str(&text).map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+        return Ok(srv::json(StatusCode::OK, &v));
+    }
+    let (Some(store), Some(seq)) = (hub.harness.convo.clone(), q.get("seq").and_then(|s| s.parse::<u64>().ok())) else { return Err(err(StatusCode::NOT_FOUND, "no such event")) };
+    let session = id.to_owned();
+    let rows = crate::rt::blocking(move || store.events(&session, Some(seq.saturating_add(1)), 1)).await.map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")))?;
+    let rows = rows.map_err(|e| err(StatusCode::SERVICE_UNAVAILABLE, format!("{e:#}")))?;
+    let found = rows.into_iter().find(|r| r.id == event && r.seq == seq).ok_or_else(|| err(StatusCode::NOT_FOUND, "no such event"))?;
+    let v: serde_json::Value = serde_json::from_str(&found.body).map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    Ok(srv::json(StatusCode::OK, &v))
+}
+
 #[derive(Deserialize)]
 struct RestoreFrom {
     from: String,
@@ -5877,6 +5936,9 @@ struct Takes {
     /// `after=<born>.<rev>`: it had the session through that revision of this server's copy
     /// (docs/wire.md, "Revisions"), and gets only what it lacks when the copy can say.
     after: Option<(u64, u64)>,
+    /// `window=1`: its first load the newest events alone, as many as a window holds; `lean=1`:
+    /// settled tool calls without their bodies (docs/wire.md, "Windows").
+    view: crate::harness::registry::View,
 }
 
 impl Takes {
@@ -5886,7 +5948,12 @@ impl Takes {
             .and_then(|q| q.split('&').find_map(|x| x.strip_prefix("after=")))
             .and_then(|v| v.split_once('.'))
             .and_then(|(b, r)| Some((b.parse().ok()?, r.parse().ok()?)));
-        Self { packed: has("z=gzip"), patches: crate::harness::registry::Patches { state: has("patch=state"), changes: has("patch=changes") }, after }
+        Self {
+            packed: has("z=gzip"),
+            patches: crate::harness::registry::Patches { state: has("patch=state"), changes: has("patch=changes") },
+            after,
+            view: crate::harness::registry::View { window: has("window=1"), lean: has("lean=1") },
+        }
     }
 }
 
@@ -6031,7 +6098,7 @@ async fn harness_attach(hub: Arc<Hub>, id: String, socket: ws::WebSocket, takes:
     // What it can't read of what its person sends, and what they can't read of what it sends,
     // shows on the agent's page.
     let sock = ui::Socket::of(Wire::SessionUp, Wire::SessionDown, &who, Some(Page::Session(id.clone())));
-    let Some(att) = hub.harness.attach_from(&id, takes.after, takes.patches) else {
+    let Some(att) = hub.harness.attach_from(&id, takes.after, takes.patches, takes.view) else {
         tx.send(ws::text(SessionDown::from(SessionFrame::Closed).text())).await?;
         return Ok(());
     };
@@ -6234,7 +6301,7 @@ async fn harness_attach(hub: Arc<Hub>, id: String, socket: ws::WebSocket, takes:
             let began = Instant::now();
             // What it missed since what it has (it begins with "resumed"), or all of it when the copy
             // can't tell (it begins with "open"); and the feed from where that is.
-            let Some((snapshot, from, now, rev)) = hub.harness.frames_since(&id, have) else {
+            let Some((snapshot, from, now, rev)) = hub.harness.frames_since(&id, have, takes.view) else {
                 tx.send(closed()).await?;
                 return Ok(());
             };
@@ -6476,6 +6543,31 @@ mod tests {
         // A changeset as what changed in it, asked for on its own or with a state's.
         assert_eq!(Takes::of(Some("z=gzip&patch=state&patch=changes")).patches, Patches { state: true, changes: true });
         assert_eq!(Takes::of(Some("patch=changes")).patches, Patches { state: false, changes: true });
+        // A window and lean events, each its own (docs/wire.md, "Windows"); one from before neither.
+        use crate::harness::registry::View;
+        assert_eq!(Takes::of(Some("z=gzip&window=1&lean=1")).view, View { window: true, lean: true });
+        assert_eq!(Takes::of(Some("window=1")).view, View { window: true, lean: false });
+        assert_eq!(Takes::of(Some("patch=state&window=2&leanest=1")).view, View::default());
+    }
+
+    /// W21-R15: a page from the conversation store is cut as the copy's are (whole turns, a page's
+    /// bounds), and says there's more when it left some out or the store may have more.
+    #[test]
+    fn w21_r15_a_store_page_is_cut_as_the_copys_are() {
+        let ev = |seq: u64, kind: &str| json!({"id": format!("e{seq}"), "seq": seq, "at": 0, "kind": kind, "text": "x"});
+        // Thirty turns of three: a page holds twenty, from a prompt.
+        let events: Vec<serde_json::Value> = (1..=90u64).map(|s| ev(s, if s % 3 == 1 { "user" } else { "assistant" })).collect();
+        let p = store_page(events.clone(), 90, 1);
+        assert_eq!(p.events.len(), 60);
+        assert_eq!(p.window, crate::wire::ui::EventsWindow { before: Some(31), more: true });
+        // All of what was read fits, fewer than asked for: nothing more.
+        let few = store_page(events.get(..9).unwrap_or_default().to_vec(), 9, 1);
+        assert_eq!((few.events.len(), few.window), (9, crate::wire::ui::EventsWindow { before: Some(1), more: false }));
+        // As many as asked for: there may be more, unless it reached where the timeline begins.
+        let full: Vec<serde_json::Value> = (11..11 + crate::harness::window::ROWS as u64).map(|s| ev(s, "assistant")).collect();
+        assert!(store_page(full.clone(), crate::harness::window::ROWS, 1).window.more);
+        assert!(!store_page(full, crate::harness::window::ROWS, 11).window.more);
+        assert_eq!(store_page(Vec::new(), 0, 1).window, crate::wire::ui::EventsWindow::default());
     }
 
     #[test]
