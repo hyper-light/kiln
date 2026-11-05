@@ -7,6 +7,8 @@ import type { Gpu } from "./Gpu";
 import type { KilnFacts } from "./KilnFacts";
 import type { Mem } from "./Mem";
 import type { Net } from "./Net";
+import type { Observation } from "./Observation";
+import type { Storage } from "./Storage";
 import type { Virt } from "./Virt";
 import type { WorkFacts } from "./WorkFacts";
 import type { Workspaces } from "./Workspaces";
@@ -68,4 +70,17 @@ work: WorkFacts | null,
  * The machine itself: a hash of the id its OS keeps for it (W13-R01). The server keeps it with
  * the runner's name, so another machine joining with the same host name isn't taken for it.
  */
-machine_id: string | null, };
+machine_id: string | null, 
+/**
+ * What the work directory's volume is made of: its file system and the devices under it,
+ * each with its type, interconnect and health (docs/needs.md, W13-R01). Probed with the
+ * other facts; the counters that change (throughput, latency, errors) are measured when a
+ * decision needs them, not reported here.
+ */
+storage: Storage | null, 
+/**
+ * Runs that finished on it since it last said (docs/needs.md): sent when one finishes, kept
+ * by the server for the learned run-time model ([`crate::runtime`]), and not kept with the
+ * facts.
+ */
+runs: Array<Observation>, };

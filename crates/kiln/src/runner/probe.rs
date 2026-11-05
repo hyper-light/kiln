@@ -241,10 +241,9 @@ fn io_pressure() -> Option<f64> {
 }
 
 /// `full avg10` of a PSI file (`some avg10=0.00 avg60=0.00 avg300=0.00 total=0`, then the same
-/// for `full`).
+/// for `full`), as a runner's samples read it too (`crate::metrics::psi_avg10`).
 fn io_full(text: &str) -> Option<f64> {
-    let line = text.lines().find(|l| l.split_whitespace().next() == Some("full"))?;
-    line.split_whitespace().find_map(|w| w.strip_prefix("avg10=")).and_then(|v| v.parse::<f64>().ok()).filter(|v| v.is_finite() && *v >= 0.0)
+    crate::metrics::psi_avg10(text, "full")
 }
 
 /// This machine's size, as its facts give it: its CPUs (threads) and memory. What a runner's own
@@ -289,8 +288,14 @@ fn machine(work_dir: &Path) -> RunnerFacts {
         virt: Virt { kvm, hvf: false, nested },
         binfmt: binfmt(),
         // Its load, for admission (W24-R19).
-        work: Some(kiln_ci::facts::WorkFacts { io_full: io_pressure() }),
+        work: Some({
+            let p = crate::host::pressure();
+            kiln_ci::facts::WorkFacts { io_full: io_pressure(), mem_full: p.mem_full, memory_level: p.memory.map(|l| l.as_str().to_owned()) }
+        }),
         machine_id: crate::os::machine_id(),
+        // What its work volume is made of: file system, devices, their kinds and health
+        // (docs/needs.md).
+        storage: crate::sense::storage(&dir),
         ..RunnerFacts::default()
     }
 }
@@ -336,6 +341,11 @@ pub async fn gather(work_dir: &Path, declared: &Declared) -> RunnerFacts {
     f.kiln = Some(crate::updates::kiln_facts());
     f.workspaces = Some(crate::workspace::slates::facts().await);
     f.probed_at = crate::util::now_unix();
+    // A tool a run here couldn't find, found now: work that needs it is offered again (S6).
+    let path = crate::harness::kinds::search_path();
+    if let Ok(mut h) = crate::sense::health::runner().lock() {
+        h.probed(&|t| f.tools.contains_key(t) || path.as_ref().is_some_and(|p| crate::os::which_in(t, p).is_some()));
+    }
     f
 }
 

@@ -50,15 +50,19 @@ still meet `--needs`. It takes what `--needs` does too, as it did before needs, 
 and `-name` to exclude one. A runner older than the needs spelling reads a word it doesn't know as a
 runner's name, so it refuses such a run rather than running it where it doesn't suit.
 
-Of the connected runners that take reach links and suit, the asking machine itself comes first
-while it has 4 GiB of memory free beyond what the work asks and isn't overloaded (nothing crosses the network — it then runs
-locally — and another machine's resources stay its own): work goes elsewhere only when it asks for
-what this machine isn't or hasn't (another platform, a GPU, more cores or memory). Of the others,
-the one with the most idle cores wins (by its busy share or its load average, whichever leaves
-fewer: work waiting on disk or memory shows in its load), then free memory; CI work on it and a
-tunnelled path (HTTP instead of UDP) count against it, and the asking machine wins a tie when it's
-short of memory. A machine that's overloaded (under 2 GiB or a twentieth of its memory free, or a
-load past twice its cores) gets work only when no other suits, and says so (`· overloaded`). The
+Of the connected runners that take reach links and suit, every one is weighed by the measure CI's
+engine places by (W05, `kiln_ci::sched::place`): how full the work would leave it, the larger of
+its CPUs' and its memory's share in use with what's asked, the shares of time its tasks all stalled
+on memory and on I/O on top (Linux's pressure stall information; macOS at critical memory pressure
+counts all its memory in use). What the asking machine placed on a runner since that runner's
+latest sample counts in use there until a newer sample shows it, as the engine counts what it
+placed (docs/needs.md): two commands asked in a row go one to each of two equal machines. The
+emptiest goes first; one that hasn't sampled goes after every one that has. A machine's idle cores are its
+CPUs times the share of their time they were idle: its load average plays no part (Linux counts
+tasks waiting on disk in it, which its I/O pressure counts on its own, and Windows has none). The
+asking machine is weighed like any other and comes first only on a tie, where nothing then has to
+cross the network; no constant puts it, or anything else, first. Each choice's `score` is the share
+of the machine the work would leave free. The
 directory comes from the server (cached 30 s, refreshed after every reconnect); the choice is the
 asking runner's. `GET /api/reach/runners?want=…` shows the same ranking.
 

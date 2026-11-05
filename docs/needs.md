@@ -588,6 +588,35 @@ so no agent carries it to another.
 - A `quiet` result carries what else ran on the machine (by `KILN_AGENT` mark) and the load while it
   ran, for a benchmark's record.
 
+### 17.1 What a runner measures, and when
+
+A runner owns its capacity: it decides admission from its own measurements, read when it decides
+(`crate::sense::Sensor::measure`), never from a timer. The runner's 5-second sample feeds its page
+and the server's charts; placement doesn't use it (legacy placement reads what a runner last said,
+however old, until the new protocol replaces it).
+
+- **What one read gives** (each share exact over the interval since the previous read, any
+  interval; each level as read): CPU idle share (`/proc/stat`, Mach's `HOST_CPU_LOAD_INFO`,
+  `GetSystemTimes`), memory available (no more than the runner's cgroup leaves), the work
+  directory's free space (APFS's important-use figure too), pressure (Linux PSI `some`/`full` for
+  CPU, memory and I/O, the machine's and the runner's own cgroup's, from their cumulative stall
+  times; macOS's memory pressure level) and the work device's throughput, latency, queue and
+  errors from the OS's own counters. A read costs microseconds and starts nothing.
+- **What the work volume is** (`RunnerFacts.storage`, probed with the other facts, unprivileged):
+  file system, mount, source, network or not, and each device under it with its kind by
+  interconnect before medium flag (NVMe, SSD, HDD, network, virtual, RAM), its model, size and,
+  where an unprivileged reader can have it, NVMe health.
+- **What each run did** (`RunnerFacts.runs`, sent as the run ends): wall time, CPU time (its cgroup,
+  job object, or `wait4`'s tree), I/O bytes and operations, its share stalled on I/O, the device's
+  latency and throughput over it, the idle CPUs it started with, and the probability its
+  placement had. The server folds each into its key's sufficient statistics and keeps the newest
+  `ROWS_KEPT` rows per key (the model's terms and one): no age bounds it.
+- **The learned run time** (`kiln_ci::runtime`): per key, `wall ≈ θ0 + θ1·cpu_s/idle_cpus +
+  θ2·bytes/throughput + θ3·ops·latency`, θ ≥ 0 by non-negative least squares (Ernest, NSDI'16),
+  rows weighted by their placement's inverse probability (Bottou et al. 2013), with a posterior a
+  placer draws from (Thompson sampling) instead of a fixed exploration rate.
+  `Model::predict(key, facts, now)` is the place core's prediction input.
+
 ## 18. Machines away
 
 - An item only an offline machine could hold waits (`no-runner`, naming it). The person gets one card

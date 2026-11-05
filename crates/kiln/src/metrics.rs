@@ -867,6 +867,43 @@ fn render_sync(o: &mut String) {
 mod tests {
     use super::*;
 
+    /// W05 (docs/reach.md §2): pressure is a stall file's 10-second figure of the line asked for,
+    /// and none where the kernel doesn't say it or says no share; macOS's level is one of its three
+    /// dispatch levels, or none.
+    #[test]
+    fn w05_pressure_is_psi_avg10_of_the_line_asked_for() {
+        let cpu = "some avg10=2.45 avg60=11.43 avg300=8.52 total=44076217564\nfull avg10=0.00 avg60=0.00 avg300=0.00 total=0\n";
+        assert_eq!((psi_avg10(cpu, "some"), psi_avg10(cpu, "full")), (Some(2.45), Some(0.0)));
+        let io = "some avg10=62.54 avg60=46.90 avg300=34.08 total=242189566596\nfull avg10=42.80 avg60=25.37 avg300=18.41 total=171556488716\n";
+        assert_eq!(psi_avg10(io, "full"), Some(42.8));
+        assert_eq!(psi_avg10("some avg10=1.00 avg60=0.00 avg300=0.00 total=1\n", "full"), None, "a kernel without `full`");
+        assert_eq!(psi_avg10("full avg10=nan avg60=0.00\n", "full"), None);
+        assert_eq!(psi_avg10("full avg10=-1.00 avg60=0.00\n", "full"), None);
+        assert_eq!(psi_avg10("", "some"), None);
+        assert_eq!([1, 2, 4, 0, 3, 8].map(MemoryLevel::of_dispatch), [Some(MemoryLevel::Normal), Some(MemoryLevel::Warn), Some(MemoryLevel::Critical), None, None, None]);
+    }
+
+    /// W05: this machine says its pressure as its OS has it: with Linux's pressure stall
+    /// information, its three figures, each a share; on macOS, its memory pressure level and no
+    /// stall figures; on Windows, nothing.
+    #[test]
+    fn w05_this_machine_says_its_pressure() {
+        let p = crate::host::pressure();
+        if cfg!(target_os = "linux") && std::path::Path::new("/proc/pressure/io").exists() {
+            for v in [p.cpu_some, p.mem_full, p.io_full] {
+                assert!(v.is_some_and(|v| (0.0..=100.0).contains(&v)), "{p:?}");
+            }
+        }
+        if cfg!(target_os = "macos") {
+            assert!(p.memory.is_some() && p.cpu_some.is_none() && p.mem_full.is_none() && p.io_full.is_none(), "{p:?}");
+        } else {
+            assert_eq!(p.memory, None, "{p:?}");
+        }
+        if cfg!(windows) {
+            assert_eq!(p, Pressure::default());
+        }
+    }
+
     #[test]
     fn a_runners_series_carry_its_machines_id_and_name() {
         set_machine("5f2a9c3e0b1d4e6f8a7c9b0d1e2f3a4b", "5f2a9c3e0b1d4e6f8a7c9b0d1e2f3a4b", "adas-macbook-pro-3.local");
@@ -1041,6 +1078,72 @@ pub struct HostSample {
     pub net_rx: u64,
     pub net_tx: u64,
     pub procs: u32,
+}
+
+/// A machine's pressure as its OS says it (docs/reach.md §2): Linux's pressure stall
+/// information, each figure the share of the last 10 seconds (`avg10`) in percent, and macOS's
+/// memory pressure level. What its OS doesn't say is `None`; Windows says none of it. A runner's
+/// admission reads its pressure over its own interval through [`crate::sense`] instead.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq)]
+#[serde(default)]
+pub struct Pressure {
+    /// The share of time some runnable task waited for a CPU (`/proc/pressure/cpu`'s `some`): time
+    /// lost to delay, not to a stall, which placement says but doesn't add (its busy share counts
+    /// the CPUs in use).
+    pub cpu_some: Option<f64>,
+    /// The share of time all its non-idle tasks were stalled on memory at once
+    /// (`/proc/pressure/memory`'s `full`): nothing advanced, and the CPU went idle.
+    pub mem_full: Option<f64>,
+    /// The share of time all its non-idle tasks were stalled on I/O at once (`/proc/pressure/io`'s
+    /// `full`).
+    pub io_full: Option<f64>,
+    /// macOS's memory pressure level (`kern.memorystatus_vm_pressure_level`).
+    pub memory: Option<MemoryLevel>,
+}
+
+/// macOS's memory pressure, as its kernel's dispatch levels say it (XNU's
+/// `doc/vm/memorystatus_notify.md`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum MemoryLevel {
+    /// "Device is operating normally."
+    Normal,
+    /// "Device is beginning to experience memory pressure": it compresses, and its memory is
+    /// still available.
+    Warn,
+    /// "Device is in a critical memory state": even compressed, its working set no longer fits,
+    /// and it swaps.
+    Critical,
+}
+
+impl MemoryLevel {
+    /// Its name as facts say it (`normal`, `warn`, `critical`).
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Normal => "normal",
+            Self::Warn => "warn",
+            Self::Critical => "critical",
+        }
+    }
+
+    /// The level `kern.memorystatus_vm_pressure_level` reads as: `NOTE_MEMORYSTATUS_PRESSURE_NORMAL`
+    /// (1), `_WARN` (2, XNU's warning and urgent alike) or `_CRITICAL` (4); none for any other.
+    pub fn of_dispatch(level: u32) -> Option<Self> {
+        match level {
+            1 => Some(Self::Normal),
+            2 => Some(Self::Warn),
+            4 => Some(Self::Critical),
+            _ => None,
+        }
+    }
+}
+
+/// The `avg10` of line `kind` (`some` or `full`) of a pressure stall file (`some avg10=0.00
+/// avg60=0.00 avg300=0.00 total=0`, then the same for `full`), in percent: none where that line
+/// isn't there (a kernel without it) or its figure is no share.
+pub fn psi_avg10(text: &str, kind: &str) -> Option<f64> {
+    let line = text.lines().find(|l| l.split_whitespace().next() == Some(kind))?;
+    line.split_whitespace().find_map(|w| w.strip_prefix("avg10=")).and_then(|v| v.parse::<f64>().ok()).filter(|v| v.is_finite() && *v >= 0.0)
 }
 
 pub static AGENT_SAMPLES: OnceLock<RwLock<BTreeMap<String, HostSample>>> = OnceLock::new();

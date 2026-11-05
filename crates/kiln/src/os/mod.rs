@@ -82,6 +82,27 @@ pub mod metrics;
 #[path = "metrics_sysinfo.rs"]
 pub mod metrics;
 
+/// [`crate::sense`]'s reads of this machine and its work volume: procfs and sysfs on Linux, Mach,
+/// IOKit and Core Foundation on macOS, Win32 on Windows; nothing elsewhere.
+#[cfg(target_os = "linux")]
+#[path = "sense_linux.rs"]
+pub mod sense;
+#[cfg(target_os = "linux")]
+pub mod sense_disk_linux;
+#[cfg(target_os = "macos")]
+#[path = "sense_macos.rs"]
+pub mod sense;
+#[cfg(target_os = "macos")]
+pub mod sense_disk_macos;
+#[cfg(windows)]
+#[path = "sense_windows.rs"]
+pub mod sense;
+#[cfg(windows)]
+pub mod sense_disk_windows;
+#[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
+#[path = "sense_none.rs"]
+pub mod sense;
+
 /// Lowers the calling thread's scheduling priority, ten nice levels below its own (19 at the
 /// most): work that may wait (a query's helper threads) yields to what may not (the writes the
 /// server takes). Linux's threads each have their own nice value (`setpriority(PRIO_PROCESS, tid)`);

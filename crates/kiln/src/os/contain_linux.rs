@@ -168,6 +168,18 @@ fn name_of(session: &str) -> Option<&str> {
     (!session.is_empty() && session.len() <= 128 && session.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')).then_some(session)
 }
 
+/// What the processes of the cgroup at `dir` used (docs/needs.md): `cpu.stat`'s `usage_usec`
+/// (kept whether or not the cpu controller is on), `io.stat` where the io controller is, and
+/// `io.pressure`. Its figures count everything it ever held, those ended included.
+fn usage_of(dir: &Path) -> crate::sense::run::Usage {
+    let read = |n: &str| fs::read_to_string(dir.join(n)).ok();
+    let cpu_us = read("cpu.stat").and_then(|t| crate::sense::parse::keyed(&t, "usage_usec"));
+    let io = read("io.stat").and_then(|t| crate::sense::run::io_stat(&t));
+    let stall = read("io.pressure").and_then(|t| crate::sense::parse::psi(&t));
+    let oom_kills = read("memory.events").and_then(|t| crate::sense::parse::keyed(&t, "oom_kill"));
+    crate::sense::run::Usage { cpu_us, read_bytes: io.map(|i| i.0), write_bytes: io.map(|i| i.1), ops: io.map(|i| i.2), stall_some: stall.and_then(|s| s.some), stall_full: stall.and_then(|s| s.full), peak_rss: None, oom_kills }
+}
+
 /// An agent session's group of processes: a cgroup of its own.
 #[derive(Debug, Clone)]
 pub struct Group {
@@ -241,6 +253,11 @@ impl Group {
         remove_tree(&self.dir, DEPTH);
     }
 
+    /// What its processes used, all told (docs/needs.md).
+    pub fn usage(&self) -> crate::sense::run::Usage {
+        usage_of(&self.dir)
+    }
+
     /// Removes it, and the groups its processes made in it, once nothing runs in them, on a thread
     /// of its own (its last processes count for a moment after they're reaped): never waited for
     /// here. What still runs keeps its group, which goes with the next runner's start.
@@ -294,6 +311,11 @@ impl Job {
     /// before it moved stays where it was.
     pub fn adopt(&self, pid: u32) -> bool {
         fs::write(self.dir.join("cgroup.procs"), pid.to_string()).is_ok()
+    }
+
+    /// What its steps' processes used, all told (docs/needs.md).
+    pub fn usage(&self) -> crate::sense::run::Usage {
+        usage_of(&self.dir)
     }
 
     /// Every process in it now.

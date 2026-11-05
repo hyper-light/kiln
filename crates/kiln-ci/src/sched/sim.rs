@@ -495,7 +495,7 @@ impl Sim {
         let on = self.on(runner);
         let busy = m.own_cpu + on.cpu.as_f64();
         let cpus = f64::from(m.cpus);
-        Sample { cpus: m.cpus, busy: if cpus > 0.0 { (busy / cpus).min(1.0) } else { 0.0 }, load1: busy, mem_total: m.mem, mem_used: m.own_mem.saturating_add(on.mem), io_full: Some(m.io_full) }
+        Sample { cpus: m.cpus, busy: if cpus > 0.0 { (busy / cpus).min(1.0) } else { 0.0 }, load1: busy, mem_total: m.mem, mem_used: m.own_mem.saturating_add(on.mem), io_full: Some(m.io_full), mem_full: None }
     }
 
     /// Each repository's share of the slot-time in `[from, to)`: a measurement of what the engine
