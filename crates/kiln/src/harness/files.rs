@@ -597,13 +597,18 @@ fn bare_path(w: &str) -> Option<String> {
     (full && w.len() > 2 && (deep || w.contains('.'))).then(|| percent_decode(w))
 }
 
-/// Whether a name is of a kind people show: images, recordings, sounds, documents, logs.
+/// The extensions of the kinds of file people show ([`shown_kind`]).
+const SHOWN: [&str; 24] = ["png", "jpg", "jpeg", "gif", "webp", "avif", "heic", "svg", "bmp", "mp4", "webm", "mov", "mkv", "mp3", "wav", "ogg", "oga", "flac", "m4a", "aac", "pdf", "log", "md", "csv"];
+
+/// Whether a name is of a kind people show: images, recordings, sounds, documents, logs. An ASCII extension is
+/// compared without a lowercase copy of it (goal 9, plan 01a1a87b2cec step 5: every word of every event's text with a
+/// dot in it made one); any other is lowercased as before, the same answer either way.
 fn shown_kind(name: &str) -> bool {
     let Some((_, ext)) = name.rsplit_once('.') else { return false };
-    matches!(
-        ext.to_lowercase().as_str(),
-        "png" | "jpg" | "jpeg" | "gif" | "webp" | "avif" | "heic" | "svg" | "bmp" | "mp4" | "webm" | "mov" | "mkv" | "mp3" | "wav" | "ogg" | "oga" | "flac" | "m4a" | "aac" | "pdf" | "log" | "md" | "csv"
-    )
+    if ext.is_ascii() {
+        return SHOWN.iter().any(|k| ext.eq_ignore_ascii_case(k));
+    }
+    SHOWN.contains(&ext.to_lowercase().as_str())
 }
 
 fn percent_decode(s: &str) -> String {
@@ -628,6 +633,17 @@ fn percent_decode(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Goal 9, plan 01a1a87b2cec step 5: a name's kind is told without a lowercase copy of its extension, the same as
+    /// with one: in any case, without an extension, and with letters past ASCII (the Kelvin sign lowercases to `k`).
+    #[test]
+    fn g9_s5_a_names_kind_is_told_as_before() {
+        let before = |name: &str| name.rsplit_once('.').is_some_and(|(_, ext)| SHOWN.contains(&ext.to_lowercase().as_str()));
+        for name in ["a.png", "A.PNG", "shot.JpEg", "notes.md", "loop.", "loop", "registry.rs", ".csv", "a.MKV", "a.m\u{212A}v", "x.\u{212A}", "été.PDF", "x.pdf.gz", "dir.d/file"] {
+            assert_eq!(shown_kind(name), before(name), "{name}");
+        }
+        assert!(shown_kind("a.m\u{212A}v") && shown_kind("A.PNG") && !shown_kind("registry.rs"));
+    }
 
     #[test]
     fn messages_mention_the_files_they_show_and_not_routes() {
