@@ -658,14 +658,15 @@ fn wait_while_idle(state: &AtomicU8, mut cold: Option<Cold>) {
     }
 }
 
-/// A worker: lowers its own priority to `rank` and says what the OS took, waits for the pool, then serves it
-/// until it stops.
+/// A worker: does what the process said a worker does as it starts ([`crate::idle::started`]), lowers its own
+/// priority to `rank` and says what the OS took, waits for the pool, then serves it until it stops.
 fn work(
     index: usize,
     rank: Rank,
     local: &Worker<Job>,
     report: &SyncSender<Result<Priority, Refusal>>,
 ) {
+    crate::idle::started(crate::idle::Pool::Compute);
     let _ = report.send(crate::prioritysys::lower_current_thread(rank));
     let pool = loop {
         match POOL.get() {

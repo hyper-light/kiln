@@ -28,6 +28,18 @@
 # A lab's build may take `jemalloc-prof`: jemalloc with its heap profile built in (kiln's `jemalloc-prof`
 # feature, off until a run's _RJEM_MALLOC_CONF says prof:true; goal 11, plan 01a1a87b2e56 step 5), never a
 # release's.
+#
+# The Linux x86-64 binary's code layout (goal 11, plan 01a1a87b2e56 step 5; ci/release/bolt.sh): off unless
+# KILN_RELEASE_BOLT says, which builds x86_64-unknown-linux-musl keeping its relocations and symbols (strip off,
+# linked by ci/release/zig-relocs.sh: --emit-relocs and a build id) in a target dir of its own (<target dir>/bolt,
+# so the release's own build stays built), and then:
+# - `relocs`: dist/kiln-x86_64-unknown-linux-musl is that build stripped, the release as it would be: what a lab
+#   profiles (its build id matches the unstripped one's, BOLT's input, which stays at
+#   <target dir>/bolt/x86_64-unknown-linux-musl/release/kiln) and the A/B's side without BOLT;
+# - a profile's path (perf2bolt's or an instrumented window's .fdata, of that very build; or a .yaml, which BOLT
+#   matches to a nearby build's code): dist/kiln-x86_64-unknown-linux-musl is the build laid out by it
+#   (bolt.sh optimize) and stripped.
+# Other targets build as ever.
 set -euo pipefail
 cd "$(dirname "$0")/../.."
 root=$PWD
@@ -44,6 +56,19 @@ targets=("$@")
 for t in "${targets[@]}"; do
   case $t in x86_64-apple-darwin) echo "kiln doesn't ship for Intel Macs: only aarch64-apple-darwin" >&2; exit 1 ;; esac
 done
+
+bolt=${KILN_RELEASE_BOLT:-}
+if [ -n "$bolt" ]; then
+  if [ "$bolt" != relocs ]; then
+    # A path as the caller gave it, from where they were before the cd above.
+    case $bolt in /*) ;; *) bolt=$OLDPWD/$bolt ;; esac
+    [ -s "$bolt" ] || { echo "KILN_RELEASE_BOLT is relocs or a profile's path: $bolt is no profile" >&2; exit 1; }
+  fi
+  case " ${targets[*]} " in
+    *" x86_64-unknown-linux-musl "*) ;;
+    *) echo "KILN_RELEASE_BOLT lays out x86_64-unknown-linux-musl, which this build doesn't make" >&2; exit 1 ;;
+  esac
+fi
 
 native_mac=false
 if [ "$(uname -s)" = Darwin ]; then
@@ -148,8 +173,22 @@ for t in "${targets[@]}"; do
         # all three. tikv-jemalloc-sys reads it per target.
         export AARCH64_UNKNOWN_LINUX_MUSL_JEMALLOC_SYS_WITH_LG_PAGE=16
       fi
-      "$zigbuild" zigbuild --release --locked -p kiln --target "$t" ${alloc[@]+"${alloc[@]}"}
-      cp "$target_dir/$t/release/kiln" "$dist/kiln-$t"
+      if [ -n "$bolt" ] && [ "$t" = x86_64-unknown-linux-musl ]; then
+        # BOLT's input (above): its relocations and symbols kept, linked through zig-relocs.sh.
+        input=$target_dir/bolt/$t/release/kiln
+        KILN_ZIG_REAL="$zig_home/zigbin/zig" CARGO_ZIGBUILD_ZIG_COMMAND="$root/ci/release/zig-relocs.sh" \
+          CARGO_PROFILE_RELEASE_STRIP=false CARGO_TARGET_DIR="$target_dir/bolt" \
+          "$zigbuild" zigbuild --release --locked -p kiln --target "$t" ${alloc[@]+"${alloc[@]}"}
+        ci/release/bolt.sh check "$input"
+        if [ "$bolt" = relocs ]; then
+          "${KILN_STRIP:-strip}" --strip-all -o "$dist/kiln-$t" "$input"
+        else
+          ci/release/bolt.sh optimize "$input" "$bolt" "$dist/kiln-$t"
+        fi
+      else
+        "$zigbuild" zigbuild --release --locked -p kiln --target "$t" ${alloc[@]+"${alloc[@]}"}
+        cp "$target_dir/$t/release/kiln" "$dist/kiln-$t"
+      fi
       ;;
     *-apple-darwin)
       rustup target add "$t" >/dev/null

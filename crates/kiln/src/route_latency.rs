@@ -212,7 +212,9 @@ pub fn class_of(method: &Method, path: &str, upgrade: bool) -> Option<Class> {
     }
     let read = *method == Method::GET || *method == Method::HEAD;
     let api = if read { Class::ApiRead } else { Class::ApiWrite };
-    let segs: Vec<&str> = path.split('/').filter(|s| !s.is_empty()).collect();
+    // On the stack, as many as a route names (goal 9, plan 01a1a87b2cec step 5: each request made a vector of them).
+    let mut room = [""; crate::http::server::ROUTE_DEPTH];
+    let segs = crate::http::server::split_path(path, &mut room);
     if runners(&segs) {
         return Some(Class::Runner);
     }
@@ -453,5 +455,25 @@ mod tests {
         observe_leg(RunnerLeg::Held, Duration::from_micros(150));
         render(&mut o);
         assert!(o.contains("kiln_runner_wait_leg_seconds_count{leg=\"held\"}"), "held rendered");
+    }
+
+    /// Goal 9, plan 01a1a87b2cec step 5: a request's class is told from its path's segments split on the stack, with
+    /// no allocation (each request made a vector of them), and is what it was: the API's reads and writes, runners'
+    /// routes, pages, kiln's own at the root, and a path deeper than any route.
+    #[test]
+    fn g9_s5_a_requests_class_is_told_without_allocating() {
+        let before = crate::os::counted::made().blocks;
+        let told = [
+            class_of(&Method::GET, "/api/harness/sessions/a/events", false),
+            class_of(&Method::POST, "/api/harness/sessions/a/command", false),
+            class_of(&Method::POST, "/api/agents/enroll", false),
+            class_of(&Method::GET, "/agents/a1", false),
+            class_of(&Method::GET, "/healthz", false),
+            class_of(&Method::GET, "/api/harness/sessions/a/ws", true),
+        ];
+        let made = crate::os::counted::made().blocks.saturating_sub(before);
+        assert_eq!(made, 0, "{made} allocations");
+        assert_eq!(told, [Some(Class::ApiRead), Some(Class::ApiWrite), Some(Class::Runner), Some(Class::Page), Some(Class::ApiRead), None]);
+        assert_eq!(class_of(&Method::GET, "/api/harness/sessions/a/files/src/kiln/lib/http/server.rs", false), Some(Class::ApiRead), "deeper than any route");
     }
 }

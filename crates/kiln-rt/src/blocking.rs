@@ -232,9 +232,11 @@ pub fn start(config: Config) -> Result<(), RtError> {
     Ok(())
 }
 
-/// A worker: tells the dispatcher it is idle (and which share's job it finished), takes the job it is
-/// handed, runs it, and again; ends when its slot or the dispatcher's channel closes.
+/// A worker: does what the process said a worker does as it starts ([`crate::idle::started`]), then tells the
+/// dispatcher it is idle (and which share's job it finished), takes the job it is handed, runs it, and again; ends
+/// when its slot or the dispatcher's channel closes.
 fn work(index: usize, take: &Receiver<(usize, Job)>, notify: &Sender<Message>) {
+    crate::idle::started(crate::idle::Pool::Blocking);
     let mut finished = None;
     loop {
         let idle = Message::Idle {
