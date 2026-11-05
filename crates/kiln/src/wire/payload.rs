@@ -274,6 +274,61 @@ pub fn payload_of<M: Carries>(msg: M) -> Result<Carried<M, M::Read>, Box<Unreada
     msg.read()
 }
 
+/// A runner's frame, as [`read_frame`] read it.
+pub enum Frame {
+    /// It isn't a runner's message this build reads.
+    Unreadable(crate::proto::Unreadable),
+    /// A message that may not come before its runner's Hello, from a runner whose Hello hasn't come: its
+    /// kind (`crate::wire::agent_name`), and nothing it carries read.
+    BeforeHello { what: String },
+    /// A runner's message, what it carries read ([`payload_of`]).
+    Read(Result<Carried<AgentMsg, FromRunner>, Box<Unreadable>>),
+}
+
+/// Each runner frame's bytes and how long reading it took on a shard, nanoseconds, as moving averages
+/// (`read_frame`): what a frame's read is expected to take, by its length. One writer, the hub's loop.
+static FRAME_BYTES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static FRAME_NS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Reads runner frame `data` (postcard) and what its message carries (JSON, [`payload_of`]); the
+/// latter only for a runner whose Hello has come (`hello`), or for a message that may come before it
+/// (`Hello`, `Instance`, `Machine`). On the shard while that's expected to take less than a slow poll
+/// (`hyper_rt::slow::SLOW_POLL_NS`), else on the compute pool, the caller waiting either way, so its
+/// messages are still taken in order (goal 9, plan 01a1a87b2cec step 3: the hub's net loop read runners'
+/// frames on its shard, holding it up to 76 ms). The expectation is the frames read here so far, by bytes:
+/// moving averages of each frame's length and of its read's time (the weight of a new sample 1/8, as
+/// RFC 6298 smooths a round trip), so a frame's expected time grows with its length at the rate long
+/// frames were read, not a short one's fixed cost; none expected until one has been read.
+pub async fn read_frame(data: Vec<u8>, hello: bool) -> Frame {
+    use std::sync::atomic::Ordering::Relaxed;
+    let len = u64::try_from(data.len()).unwrap_or(u64::MAX);
+    let (bytes, ns) = (FRAME_BYTES.load(Relaxed), FRAME_NS.load(Relaxed));
+    let expected = len.saturating_mul(ns).checked_div(bytes).unwrap_or(0);
+    if expected > hyper_rt::slow::SLOW_POLL_NS {
+        return match crate::rt::compute(move || read_now(&data, hello)).await {
+            Ok(frame) => frame,
+            Err(e) => Frame::Unreadable(crate::proto::Unreadable::Malformed { variant: None, why: format!("it couldn't be read off the shard: {e:#}") }),
+        };
+    }
+    let began = Instant::now();
+    let frame = read_now(&data, hello);
+    let took = u64::try_from(began.elapsed().as_nanos()).unwrap_or(u64::MAX);
+    // x ← x + (sample − x)/8, in whole bytes and nanoseconds.
+    let smooth = |avg: u64, sample: u64| if avg == 0 { sample } else { avg - avg / 8 + sample / 8 };
+    FRAME_BYTES.store(smooth(bytes, len), Relaxed);
+    FRAME_NS.store(smooth(ns, took), Relaxed);
+    frame
+}
+
+/// [`read_frame`]'s work, where it runs.
+fn read_now(data: &[u8], hello: bool) -> Frame {
+    match crate::proto::read_agent(data) {
+        Err(e) => Frame::Unreadable(e),
+        Ok(msg) if !hello && !matches!(msg, AgentMsg::Hello(_) | AgentMsg::Instance(_) | AgentMsg::Machine { .. }) => Frame::BeforeHello { what: super::agent_name(&msg).to_owned() },
+        Ok(msg) => Frame::Read(payload_of(msg)),
+    }
+}
+
 /// An answer by `req` to something the server asked a runner ([`AgentMsg::Answer`],
 /// `AiTranscript`, `AiView`, `HarnessTaskOutput`, `HarnessHistory`, `DirList`). It's of the type
 /// its question asks for, so it's read once it's matched to its question (`crate::hub`'s asks), by
