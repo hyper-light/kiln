@@ -112,28 +112,12 @@ pub struct Fleet {
     pub runners: Vec<(String, Proc)>,
 }
 
-impl Fleet {
-    /// A server of `kiln` under `dir`, answering: `env` goes to it as well. It runs where `place` says
-    /// (its own CPUs, its own scope `unit`), its runners where the lab does.
-    pub fn server(kiln: &Path, dir: &Path, env: &[(String, String)], place: &crate::lab::Place, unit: &str) -> anyhow::Result<Fleet> {
-        let mut why = String::new();
-        for attempt in 0..3 {
-            match Self::try_server(kiln, dir, env, place, &format!("{unit}-{attempt}"))? {
-                Ok(f) => return Ok(f),
-                Err(w) => why = w,
-            }
-        }
-        anyhow::bail!("the server didn't start: {why}")
-    }
-
-    fn try_server(kiln: &Path, dir: &Path, env: &[(String, String)], place: &crate::lab::Place, unit: &str) -> anyhow::Result<Result<Fleet, String>> {
-        let (port, quic) = (free_tcp()?, free_udp()?);
-        let data = dir.join("data");
-        std::fs::create_dir_all(&data)?;
-        let home = dir.join("home");
-        std::fs::create_dir_all(&home)?;
-        let config = format!(
-            r#"[server]
+/// The kiln.toml of a round's server on `port` (HTTP) and `quic`, its data in `data`: production's
+/// settings but what a lab can't have, and `[bus] memory` when the run sets it (`--bus-memory`; goal
+/// 11, plan 01a1a87b2e56 step 3).
+fn config(port: u16, quic: u16, data: &Path, bus_memory: Option<u64>) -> String {
+    let mut config = format!(
+        r#"[server]
 http_addr = "127.0.0.1:{port}"
 quic_addr = "127.0.0.1:{quic}"
 public_url = "http://127.0.0.1:{port}"
@@ -165,9 +149,36 @@ enabled = false
 [ci]
 enabled = false
 "#,
-            data = toml_path(&data),
-        );
-        std::fs::write(dir.join("kiln.toml"), config)?;
+        data = toml_path(data),
+    );
+    if let Some(memory) = bus_memory {
+        config.push_str(&format!("\n[bus]\nmemory = {memory}\n"));
+    }
+    config
+}
+
+impl Fleet {
+    /// A server of `kiln` under `dir`, answering: `env` goes to it as well, and `[bus] memory` is
+    /// `bus_memory` when that's set. It runs where `place` says (its own CPUs, its own scope `unit`),
+    /// its runners where the lab does.
+    pub fn server(kiln: &Path, dir: &Path, env: &[(String, String)], bus_memory: Option<u64>, place: &crate::lab::Place, unit: &str) -> anyhow::Result<Fleet> {
+        let mut why = String::new();
+        for attempt in 0..3 {
+            match Self::try_server(kiln, dir, env, bus_memory, place, &format!("{unit}-{attempt}"))? {
+                Ok(f) => return Ok(f),
+                Err(w) => why = w,
+            }
+        }
+        anyhow::bail!("the server didn't start: {why}")
+    }
+
+    fn try_server(kiln: &Path, dir: &Path, env: &[(String, String)], bus_memory: Option<u64>, place: &crate::lab::Place, unit: &str) -> anyhow::Result<Result<Fleet, String>> {
+        let (port, quic) = (free_tcp()?, free_udp()?);
+        let data = dir.join("data");
+        std::fs::create_dir_all(&data)?;
+        let home = dir.join("home");
+        std::fs::create_dir_all(&home)?;
+        std::fs::write(dir.join("kiln.toml"), config(port, quic, &data, bus_memory))?;
         let log = std::fs::File::create(dir.join("server.log"))?;
         let mut cmd = clean(place.server(kiln, unit));
         cmd.args(["--config", &dir.join("kiln.toml").to_string_lossy(), "server"])
@@ -297,4 +308,23 @@ pub fn tail(path: &Path) -> String {
     let text = std::fs::read_to_string(path).unwrap_or_default();
     let lines: Vec<&str> = text.lines().collect();
     lines.iter().rev().take(30).rev().copied().collect::<Vec<_>>().join("\n")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Goal 11, plan 01a1a87b2e56 step 3: a run that sets `--bus-memory` writes `[bus] memory` into the
+    /// kiln.toml its servers start with, after what the lab always sets; one that doesn't leaves
+    /// kiln's default (no `[bus]` at all).
+    #[test]
+    fn g11_s3_the_bus_memory_goes_into_the_servers_config() {
+        let data = Path::new("/lab/round/data");
+        let set = config(7001, 7002, data, Some(1 << 30));
+        assert!(set.contains("http_addr = \"127.0.0.1:7001\"\n") && set.contains("[cd]\nenabled = false\n"), "{set}");
+        assert!(set.ends_with("\n[bus]\nmemory = 1073741824\n"), "{set}");
+        let unset = config(7001, 7002, data, None);
+        assert!(!unset.contains("[bus]"), "{unset}");
+        assert_eq!(set.strip_suffix("\n[bus]\nmemory = 1073741824\n"), Some(unset.as_str()), "nothing else changes");
+    }
 }
