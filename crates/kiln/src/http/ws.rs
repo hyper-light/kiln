@@ -55,6 +55,15 @@ pub fn accept_limited(
     req: Request,
     max_message: usize,
 ) -> Result<(Response, impl Future<Output = anyhow::Result<WebSocket>> + Send + 'static), Refused> {
+    accept_with(req, limits(max_message))
+}
+
+/// [`accept`], with the WebSocket's settings given whole (the browser protocol's socket bounds its
+/// write buffer too, `crate::live`). The 101 names no extension, whatever the client offered.
+pub fn accept_with(
+    req: Request,
+    config: WebSocketConfig,
+) -> Result<(Response, impl Future<Output = anyhow::Result<WebSocket>> + Send + 'static), Refused> {
     let bad = |reason: &'static str| Refused { status: StatusCode::BAD_REQUEST, reason };
     if !is_upgrade(&req) {
         return Err(bad("expected a WebSocket upgrade"));
@@ -79,7 +88,7 @@ pub fn accept_limited(
         let ws = async_tungstenite::WebSocketStream::from_raw_socket(
             upgraded,
             tungstenite::protocol::Role::Server,
-            Some(limits(max_message)),
+            Some(config),
         )
         .await;
         Ok(ws)

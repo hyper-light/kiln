@@ -89,6 +89,10 @@ pub async fn serve_accepted<H: Handler>(stream: hyper_rt::tcp::TcpStream, handle
     // Where the platform offers it: a slow reader's backlog waits here, where kiln can catch it
     // up (a session's viewer: docs/wire.md, "Revisions"), not megabytes deep in the kernel.
     let _ = stream.set_notsent_lowat(NOTSENT_LOWAT);
+    // Where the browser protocol is served, what its socket needs of the connection should one of its
+    // requests upgrade to it: a handle to the socket's options and its TLS buffer's bound
+    // (`crate::live`; HTTP/1.1 only, as WebSockets are).
+    let control = crate::live::control_for(&stream);
     let mut head = Vec::with_capacity(H2_PREFACE.len());
     let mut buf = [0u8; 32];
     let kind = loop {
@@ -110,13 +114,16 @@ pub async fn serve_accepted<H: Handler>(stream: hyper_rt::tcp::TcpStream, handle
             let Ok(config) = tls.config_alpn(&[super::tls::H2, super::tls::HTTP11]) else { return };
             let io = super::tls::Prefixed::new(head, io);
             match crate::rt::timeout(HANDSHAKE, super::tls::ServerTlsStream::accept(io, config)).await {
-                Ok(Ok(s)) => {
+                Ok(Ok(mut s)) => {
                     // Full or resumed (goal 7 step 3): the listener's sessions are shared.
                     crate::metrics::tls().handshake("server", s.handshake());
                     if s.alpn_protocol() == Some(super::tls::H2) {
                         Box::pin(serve_h2(s, Bytes::new(), handler, remote, true)).await
                     } else {
-                        Box::pin(serve_read(s, Bytes::new(), handler, remote, true)).await
+                        if let Some(c) = &control {
+                            s.set_send_limit(Arc::clone(&c.tls_limit));
+                        }
+                        Box::pin(serve_read(s, Bytes::new(), handler, remote, true, control)).await
                     }
                 }
                 Ok(Err(e)) => tracing::debug!(error = %e, ?remote, "TLS handshake failed"),
@@ -125,12 +132,20 @@ pub async fn serve_accepted<H: Handler>(stream: hyper_rt::tcp::TcpStream, handle
         }
         (Opening::H2, _) => Box::pin(serve_h2(io, Bytes::from(head), handler, remote, false)).await,
         // HTTP/1.1, or TLS without a certificate here: HTTP/1.1 answers what it can.
-        _ => Box::pin(serve_read(io, Bytes::from(head), handler, remote, false)).await,
+        _ => Box::pin(serve_read(io, Bytes::from(head), handler, remote, false, control)).await,
     }
 }
 
 /// What every request of a connection carries: where it came from, and whether over TLS.
 fn mark(req: &mut Request, remote: Option<std::net::SocketAddr>, secure: bool) {
+    mark_with(req, remote, secure, None);
+}
+
+/// [`mark`], with the connection's [`crate::live::Control`] where it has one.
+fn mark_with(req: &mut Request, remote: Option<std::net::SocketAddr>, secure: bool, control: Option<&Arc<crate::live::Control>>) {
+    if let Some(c) = control {
+        req.extensions_mut().insert(Arc::clone(c));
+    }
     if let Some(r) = remote {
         req.extensions_mut().insert(RemoteAddr(r));
     }
@@ -145,11 +160,11 @@ where
     I: AsyncRead + AsyncWrite + Unpin + Send + 'static,
     H: Handler,
 {
-    serve_read(io, Bytes::new(), handler, remote, secure).await;
+    serve_read(io, Bytes::new(), handler, remote, secure, None).await;
 }
 
 /// HTTP/1.1 over `io`, whose first bytes `read` were taken off it already.
-async fn serve_read<I, H>(io: I, read: Bytes, handler: Arc<H>, remote: Option<std::net::SocketAddr>, secure: bool)
+async fn serve_read<I, H>(io: I, read: Bytes, handler: Arc<H>, remote: Option<std::net::SocketAddr>, secure: bool, control: Option<Arc<crate::live::Control>>)
 where
     I: AsyncRead + AsyncWrite + Unpin + Send + 'static,
     H: Handler,
@@ -158,7 +173,7 @@ where
     // 01a1a59c2abe step 3).
     let serving = crate::overload::Connection::new();
     let service = service_fn(move |mut req: Request| {
-        mark(&mut req, remote, secure);
+        mark_with(&mut req, remote, secure, control.as_ref());
         let request = serving.begin(&mut req);
         let handler = handler.clone();
         async move { crate::overload::while_sent(placed(request.class(), handler.handle(req)).await, request) }

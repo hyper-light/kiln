@@ -487,6 +487,28 @@ async fn route(hub: Arc<Hub>, req: Request) -> R {
     .await
 }
 
+/// A read run as `caller` through the API's own routes and checks (`authorized`), for the browser
+/// protocol's requests (`crate::live`, goal 3 of the browser protocol program): the answer's status and
+/// body, a body past `most` answered 413. Only the API's reads, never the protocol's own endpoint.
+pub(crate) async fn live_read(hub: Arc<Hub>, caller: crate::authz::Caller, path: &str, most: usize) -> (u16, Vec<u8>) {
+    use http_body_util::BodyExt as _;
+    if !path.starts_with("/api/") || path.starts_with(crate::live::PATH) {
+        return (404, b"not a read the protocol carries".to_vec());
+    }
+    let Ok(req) = http::Request::builder().method(Method::GET).uri(path).body(kiln_http::Incoming::empty()) else {
+        return (400, b"not a path".to_vec());
+    };
+    let resp = match boxed(|| authorized(hub, caller, req)).await {
+        Ok(r) => r,
+        Err(e) => e.into_response(),
+    };
+    let status = resp.status().as_u16();
+    match http_body_util::Limited::new(resp.into_body(), most).collect().await {
+        Ok(c) => (status, c.to_bytes().to_vec()),
+        Err(_) => (413, b"the answer is larger than a frame holds".to_vec()),
+    }
+}
+
 /// A future made and boxed in a frame of its own. A debug build gives each temporary of an async
 /// function its own stack slot, so a router awaiting many futures inline made one of every future
 /// it could await, in its poll frame: `authorized`'s was 772 KiB, and a request that reached out
@@ -955,6 +977,11 @@ async fn authorized(hub: Arc<Hub>, caller: crate::authz::Caller, req: Request) -
         (&Method::DELETE, ["api", "tailscale"]) => front_door(boxed(|| crate::frontdoor::tailnet::delete(&hub)).await),
         (&Method::PUT, ["api", "settings", "password"]) => boxed(|| set_password(&hub, req)).await,
         (&Method::DELETE, ["api", "settings", "password"]) => boxed(|| clear_password(&hub)).await,
+        // The browser protocol over one WebSocket (goal 3 of the browser protocol program, `crate::live`):
+        // a ticket for the open, the socket, and the caller's own sockets as the server holds them.
+        (&Method::POST, ["api", "live", "ticket"]) => Ok(crate::live::ticket(&hub, &caller, &req)),
+        (&Method::GET, ["api", "live"]) => Ok(crate::live::socket(hub.clone(), caller.clone(), req)),
+        (&Method::GET, ["api", "live", "sockets"]) => Ok(crate::live::sockets(&hub, &caller)),
         (&Method::GET, ["api", "events"]) => {
             // A person of some repositories hears theirs (W10); the server's scope hears it all.
             let narrow = boxed(|| crate::authz::gate::readable(&hub, &caller, "runs.read"))
@@ -2817,6 +2844,9 @@ async fn me(hub: &Hub, headers: &HeaderMap) -> Response {
             "kind": caller.as_ref().map(|c| c.kind),
             "grants": caller.as_ref().and_then(crate::authz::Caller::grants),
             "groups": groups,
+            // The browser protocol's endpoint, when served (`crate::live`): a page never tries it on a
+            // server that lacks it.
+            "live": hub.live.offer(),
             // What it may do (W10-R02), for pages that show only what one can use: each
             // capability held on the whole server, or only somewhere (a repository, …).
             "can": caller.as_ref().map(|c| {
@@ -2886,6 +2916,7 @@ fn system_json(hub: &Hub) -> serde_json::Value {
         "sample": sample,
         "kubernetes": hub.k8s.get().is_some_and(Option::is_some),
         "runtime": "hyper-rt",
+        "live": hub.live.offer(),
     })
 }
 

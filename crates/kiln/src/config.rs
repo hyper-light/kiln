@@ -129,6 +129,17 @@ pub struct Server {
     /// nothing outside the slice runs on; the server fixes its shards to them. Unset (the default),
     /// the server shares every core with what runs beside it, first by its weight.
     pub cores: Option<String>,
+    /// The browser protocol over one WebSocket (`GET /api/live`, `crate::live`; goal 3 of the browser
+    /// protocol program, docs/browser-protocol.md): served beside today's sockets when true. Off until
+    /// declared, as the plan's open call leaves it until goal 9 moves the UI onto it. `KILN_LIVE`
+    /// overrides it.
+    pub live: bool,
+    /// The TCP congestion control the protocol's sockets ask for (`bbr`, say), on Linux, where the host
+    /// allows it: loaded, and listed in `net.ipv4.tcp_allowed_congestion_control` (the host's
+    /// administrator's step). Each socket says what it got, or why it was refused, on `/metrics` and
+    /// `GET /api/live/sockets`; nothing falls back silently. Unset (the default): the host's own.
+    /// `KILN_BROWSER_CONGESTION` overrides it.
+    pub browser_congestion: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -436,6 +447,8 @@ impl Default for Server {
             shed: false,
             placement: crate::placement::Placement::default(),
             cores: None,
+            live: false,
+            browser_congestion: None,
         }
     }
 }
@@ -618,6 +631,13 @@ impl Config {
         // `[server] shed`, as a lab's server takes its settings (`kiln-lab ab --env-b KILN_SHED=1`).
         if let Ok(v) = std::env::var("KILN_SHED") {
             cfg.server.shed = !matches!(v.trim(), "0" | "false" | "off" | "no");
+        }
+        // `[server] live` and `browser_congestion`, as a lab's server takes its settings.
+        if let Ok(v) = std::env::var("KILN_LIVE") {
+            cfg.server.live = !matches!(v.trim(), "0" | "false" | "off" | "no" | "");
+        }
+        if let Ok(v) = std::env::var("KILN_BROWSER_CONGESTION") {
+            cfg.server.browser_congestion = Some(v.trim().to_owned()).filter(|v| !v.is_empty());
         }
         // `[server] placement`, as a lab's server takes its settings (`kiln-lab ab --env-b KILN_RT_PLACEMENT=steal`).
         if let Ok(v) = std::env::var("KILN_RT_PLACEMENT") {

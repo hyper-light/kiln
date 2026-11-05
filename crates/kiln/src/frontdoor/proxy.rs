@@ -39,7 +39,20 @@ use crate::rt::Shutdown;
 pub const MAX_CONNECTIONS: usize = 512;
 pub const HANDSHAKE: Duration = Duration::from_secs(10);
 pub const CONNECT: Duration = Duration::from_secs(5);
-const BUFFER: usize = 32 * 1024;
+/// Shape: each direction's pipe buffer: TLS's largest record, the browser protocol's largest chunk
+/// (`crate::live::send::CHUNK_MAX`), so the pipe holds no more than one of them (goal 3 of the browser
+/// protocol program, plan `01a1a832eb2f711f9c6f51d88effe89d` step 5; it was 32 KiB).
+const BUFFER: usize = 16 * 1024;
+/// Shape: the most the browser-facing socket holds that it hasn't sent (`TCP_NOTSENT_LOWAT`): what
+/// the server's own sockets keep for the protocol on a fast path, and Cloudflare's for its priorities
+/// with BBR (research f28). Unset, Linux lets a slow browser's backlog grow to 4 MiB in the front
+/// door's kernel, where no priority reaches it (step 5).
+pub const RELAY_LOWAT: u32 = 16 << 10;
+/// Shape: the upstream socket's receive buffer: the server's own sockets' low-water mark, so the
+/// front door's kernel can't take megabytes from the server that the browser hasn't been sent
+/// (Linux autotunes it up to `tcp_rmem`'s most, 32 MiB on adacachy: research f22). On the loopback
+/// or LAN hop it bounds, it still carries hundreds of MB a second.
+pub const RELAY_RCVBUF: u32 = 128 << 10;
 /// How often the front door asks its upstream whether it speaks HTTP/2, and how long it waits.
 pub const PROBE_EVERY: Duration = Duration::from_secs(30);
 const PROBE_WAIT: Duration = Duration::from_secs(5);
@@ -292,9 +305,36 @@ pub async fn speaks_h2(upstream: &Upstream) -> bool {
     matches!(crate::rt::timeout(PROBE_WAIT, ask).await, Ok(Ok(true)))
 }
 
+/// The congestion control the browser-facing sockets ask for (`KILN_BROWSER_CONGESTION`, as the
+/// server's `[server] browser_congestion`), checked once: off until declared.
+fn relay_congestion() -> Option<hyper_rt::tcp::CongestionName> {
+    static C: std::sync::OnceLock<Option<hyper_rt::tcp::CongestionName>> = std::sync::OnceLock::new();
+    *C.get_or_init(|| std::env::var("KILN_BROWSER_CONGESTION").ok().as_deref().map(str::trim).filter(|c| !c.is_empty()).and_then(hyper_rt::tcp::CongestionName::new))
+}
+
+/// The browser-facing socket kept small (step 5): its unsent bytes at [`RELAY_LOWAT`], and the
+/// congestion control declared, where the platform offers each. A refusal is said once, with why.
+pub(crate) fn relay_browser_side(tcp: &hyper_rt::tcp::TcpStream) {
+    let _ = tcp.set_notsent_lowat(RELAY_LOWAT);
+    if let Some(want) = relay_congestion()
+        && let Err(e) = tcp.set_congestion(want)
+    {
+        static SAID: AtomicBool = AtomicBool::new(false);
+        if !SAID.swap(true, Ordering::Relaxed) {
+            tracing::warn!(error = %e, "front door: the browser's congestion control wasn't taken; the host's default stays");
+        }
+    }
+}
+
+/// The upstream socket kept small (step 5): its receive buffer at [`RELAY_RCVBUF`].
+pub(crate) fn relay_upstream_side(tcp: &hyper_rt::tcp::TcpStream) {
+    let _ = tcp.set_recv_buffer(RELAY_RCVBUF);
+}
+
 /// One connection: the TLS handshake, the upstream connection, then the pipe.
 async fn proxy(tcp: hyper_rt::tcp::TcpStream, shared: &Shared) -> anyhow::Result<()> {
     let remote = tcp.peer_addr().ok();
+    relay_browser_side(&tcp);
     let tls = shared.tls.read().clone().context("no certificate yet")?;
     let upstream = shared.upstream.read().clone().context("no upstream")?;
     let door = door_for(shared, &upstream);
@@ -335,6 +375,7 @@ async fn proxy(tcp: hyper_rt::tcp::TcpStream, shared: &Shared) -> anyhow::Result
     let up = crate::rt::timeout(CONNECT, crate::http::io::connect(&upstream.host, upstream.port))
         .await
         .with_context(|| format!("{} did not answer", upstream.url))??;
+    relay_upstream_side(&up);
     match &upstream.tls {
         None => pipe(client, RtFuturesIo::new(up)).await?,
         Some(ct) => {
@@ -682,6 +723,62 @@ mod tests {
         assert!(Upstream::parse("ftp://x", &[]).is_err());
         assert!(Upstream::parse("nonsense", &[]).is_err());
         Ok(())
+    }
+
+    /// bp-g3 step 5 (plan 01a1a832eb2f711f9c6f51d88effe89d): a browser that stops reading, behind the
+    /// front door's pipe, while the server floods. What the front door holds (its pipe, its upstream
+    /// socket's receive buffer, its browser-side unsent bytes) stays within their bounds, so what the
+    /// server got written before it stalled is those, the server's own send buffer and the browser's
+    /// receive buffer: hundreds of KiB, where the front door's kernel alone would take 4 MiB unbounded
+    /// (`tcp_wmem`'s most) and its upstream socket up to `tcp_rmem`'s (research f22).
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn bp_g3_s5_a_slow_browser_leaves_the_flood_at_the_server() -> anyhow::Result<()> {
+        /// Shape: the server's and the browser's own buffers in the test, fixed so the bound is known.
+        const ENDS: u32 = 64 << 10;
+        /// Shape: 1 ms tries with nothing written before the server counts as stalled.
+        const STALL: u32 = 300;
+        crate::rt::block_on(async {
+            let up_listener = hyper_rt::tcp::TcpListener::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)), 8).map_err(|e| anyhow::anyhow!("{e}"))?;
+            let up_addr = up_listener.local_addr().map_err(|e| anyhow::anyhow!("{e}"))?;
+            let flood = crate::rt::spawn(async move {
+                let s = up_listener.accept().await.map_err(|e| anyhow::anyhow!("{e}"))?;
+                let _ = s.set_send_buffer(ENDS);
+                let chunk = vec![b'x'; 16 << 10];
+                let (mut written, mut idle) = (0usize, 0u32);
+                while idle < STALL && written < 64 << 20 {
+                    match s.try_write(&chunk).map_err(|e| anyhow::anyhow!("{e}"))? {
+                        Some(n) => {
+                            written += n;
+                            idle = 0;
+                        }
+                        None => {
+                            idle += 1;
+                            crate::rt::sleep(Duration::from_millis(1)).await;
+                        }
+                    }
+                }
+                Ok::<_, anyhow::Error>(written)
+            });
+            let front = hyper_rt::tcp::TcpListener::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)), 8).map_err(|e| anyhow::anyhow!("{e}"))?;
+            let front_addr = front.local_addr().map_err(|e| anyhow::anyhow!("{e}"))?;
+            crate::rt::spawn(async move {
+                let Ok(client) = front.accept().await else { return };
+                relay_browser_side(&client);
+                let Ok(up) = hyper_rt::tcp::TcpStream::connect(up_addr).await else { return };
+                relay_upstream_side(&up);
+                let _ = pipe(RtFuturesIo::new(client), RtFuturesIo::new(up)).await;
+            });
+            let browser = hyper_rt::tcp::TcpStream::connect(front_addr).await.map_err(|e| anyhow::anyhow!("{e}"))?;
+            let _ = browser.set_recv_buffer(ENDS);
+            let written = flood.await.map_err(|_| anyhow::anyhow!("flood task"))??;
+            // Linux doubles each buffer set; in flight to the browser is at most its receive buffer.
+            let bound = 2 * ENDS as usize + 2 * RELAY_RCVBUF as usize + BUFFER + RELAY_LOWAT as usize + (16 << 10) + 2 * ENDS as usize;
+            eprintln!("bp_g3_s5: the server wrote {written} B before it stalled; bound {bound} B");
+            assert!(written > 0 && written <= bound, "written {written}, bound {bound}");
+            drop(browser);
+            Ok(())
+        })
     }
 
     /// Bytes go both ways through the pipe, ends travel, and the totals add up.

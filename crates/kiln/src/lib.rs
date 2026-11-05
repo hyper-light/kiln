@@ -44,6 +44,7 @@ pub mod instances;
 pub mod join;
 pub mod k8s;
 pub mod keep;
+pub mod live;
 pub mod logs;
 pub mod mcp;
 pub mod metrics;

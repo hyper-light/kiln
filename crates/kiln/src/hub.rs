@@ -599,6 +599,9 @@ pub struct Hub {
     pub updates: crate::updates::Updates,
     /// Runners' front doors: their settings and what each last reported (`crate::frontdoor`).
     pub front_doors: crate::frontdoor::control::FrontDoors,
+    /// The browser protocol over one WebSocket (`crate::live`, goal 3 of the browser protocol
+    /// program): its tickets and its topics' owner, when `[server] live` serves it.
+    pub live: crate::live::Live,
     /// How many agent sessions each machine runs at once, as set here, and what each said it
     /// holds (`crate::harness::limit`).
     pub agent_limits: crate::harness::limit::AgentLimits,
@@ -687,6 +690,7 @@ impl Hub {
         let tasks = crate::sync::tasks::Tasks::open(&cfg.data("sync"));
         let copies = crate::reach::copies::Copies::open(cfg.data("reach").join("copies.json"));
         let records: Arc<dyn kiln_seams::Records> = Arc::new(crate::records::StoreRecords::open(store.clone())?);
+        let live = crate::live::Live::new(&cfg.server);
         let hub = Arc::new(Self {
             cfg,
             store,
@@ -749,6 +753,7 @@ impl Hub {
             handovers: Mutex::new(crate::handovers::Handovers::default()),
             updates: crate::updates::Updates::default(),
             front_doors: crate::frontdoor::control::FrontDoors::default(),
+            live,
             agent_limits: crate::harness::limit::AgentLimits::default(),
             headrooms: crate::headroom::control::Headrooms::default(),
             peered: crate::peers::Peers::default(),
@@ -959,6 +964,8 @@ impl Hub {
 
     /// Sends `e` down every events socket (`GET /api/events`) and to kiln's own listeners.
     pub fn emit(&self, e: &ServerEvent) {
+        // The browser protocol's topics hear every event once, whoever listens on the events socket.
+        self.live.event(e);
         if self.events.receiver_count() > 0 {
             self.events.send(Arc::from(e.text()));
         }
