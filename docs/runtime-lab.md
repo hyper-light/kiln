@@ -1621,6 +1621,69 @@ So the switch's default is `jemalloc`. The one number worse beyond noise is the 
 126 to 128 MB (+1.6%). That's jemalloc's code: the binary is 3.1 MB larger. Variants are an environment
 away on the same build, for example `--env-b _RJEM_MALLOC_CONF=narenas:8` or `dirty_decay_ms:1000`.
 
+### The allocator's overhead, threads' stacks and observe's index (step 5)
+
+Of the musl-jemalloc build's 207 MB anonymous (alloc2, the window's end), jemalloc's mappings held 145 to
+165 MB for a live heap of about 88 MB touched (train 4's heap profile, less what's gone since). The rest is
+jemalloc's own: what threads' caches keep, freed pages not yet purged, the room left in slabs and size
+classes, and its metadata. `kiln_memory_allocator_bytes{kind}` splits it, and each kind caps what a setting
+can save: `thread_caches` the cache settings, `dirty` the decays, `active` less `allocated` the fit and arena
+count, `metadata` nothing here.
+
+**Settings past the pick**, each a variant of one build through `_RJEM_MALLOC_CONF` (`os::alloc::CANDIDATES`;
+the allocator's log line names each one a run gives, beside jemalloc's default):
+
+| Setting | jemalloc 5.3's | Variant | Saves at most | Latency risk |
+| --- | --- | --- | --- | --- |
+| `tcache_max` | 32768 | 4096 (TUNING.md's memory-first pick) | what `thread_caches` holds of 4 to 32 KiB, most of it: a busy thread's cache keeps up to 20 of each such size, 2.4 MB of 16 to 32 KiB alone | every allocation of 4 to 32 KiB takes its arena's lock, a growing buffer's every step among them: watch API reads' p99.9, websocket frames' p99, CPU a request |
+| `tcache_nslots_small_max`, `tcache_nslots_large` | 200, 20 | 64, 4 | the same caches, fewer of each size: about half of `tcache_max`'s | lower: refills come sooner, each smaller |
+| `dirty_decay_ms` | (kiln's 5000) | 1000 | about four fifths of `dirty` (what's kept is what was freed in the last half of the decay) | the recurring work (an attach every 2.7 s) faults pages in anew, and purges' TLB shootdowns reach the shards' CPUs five times as often: watch attach p50, API writes' p50, minor faults |
+| `narenas` | (kiln's 5) | 3 | slabs' room and dirty pages spread over fewer arenas: a few MB | shards share arenas (glibc's 2 arenas doubled the bus delivery's p99): watch bus delivery p99, runners' messages p99 |
+| `lg_extent_max_active_fit` | 6 | 2 | large allocations no longer cut from extents up to 64 times their size: part of `active` less `allocated` | low: more fresh extents, more first-touch faults |
+| `oversize_threshold` | 8388608 | 1048576 | dirty pages of frees of 1 to 8 MiB, purged at once instead | the purge runs inline on the thread that frees, a shard among them, and the next such allocation faults its pages in: watch slow polls and frames' p99.9 |
+| `retain` | true | false | none of resident memory: retained address space is never resident (only page tables, `VmPTE`) | every extent given back is unmapped under the process's mmap lock, which every thread's page fault takes: not worth a round |
+
+**The blocking pool's arena** (`KILN_ALLOC_POOL_DECAY_MS`, `os::alloc::POOL_DECAY_VAR`): jemalloc keeps no
+decay of its own for an idle arena, so this gives one. Set, the blocking pool's workers allocate in an arena
+of their own (jemalloc's `arenas.create` and `thread.arena`, TUNING.md's "Explicit arenas"), whose dirty
+pages are kept that long, while the shards' arenas keep theirs 5 s. Most of the pool's 54 workers wait; what
+a job frees is idle until the next job of its kind. It saves about four fifths of the pool's share of
+`dirty`, without the shards' re-faulting that a decay of 1 s for every arena risks. The pool's workers then
+share one arena's locks among the jobs running at once (up to 54): watch the store's and the snapshots' jobs
+(API writes, attach, `blocking.<share>.little_p99`). Unset, as by default, nothing changes.
+
+**The A/B to run**, one build (this branch's musl-jemalloc release build), A without a variant and B with
+one, 8 rounds calm, the winners again with hogs:
+1. Any A/B of this build reads `kiln_memory_allocator_bytes` at the window's end: the split above, which says
+   which of these can matter.
+2. Memory first: `--env-b _RJEM_MALLOC_CONF=tcache_max:4096,dirty_decay_ms:1000,narenas:3`. If anonymous
+   memory falls beyond noise and no latency number is worse beyond noise, kiln compiles them in.
+3. If a number is worse, one at a time, in the order of what the split says they can save: `dirty_decay_ms:1000`;
+   then `KILN_ALLOC_POOL_DECAY_MS=1000` in its place; `tcache_max:4096`, or `tcache_nslots_small_max:64,
+   tcache_nslots_large:4` in its place; `narenas:3`.
+4. Then `lg_extent_max_active_fit:2` and `oversize_threshold:1048576` against the pick so far, if
+   `active` less `allocated` or `dirty` is still more than a few MB.
+
+**Threads' stacks** (`os::stack`): the server's 91 threads' stacks held 5.8 MB (alloc2's smaps): the four
+shards 0.40 to 0.75 MB each, 16 threads 88 KB, the rest 12 to 20 KB. A stack's size is no lever on what's
+resident (a thread holds the pages it reached, whatever its 16 MiB reservation); two things are, and kiln
+does both:
+- A pool's worker gone cold (idle past 5 s, step 5's `hyper_rt::idle`) gives back its stack's pages below its
+  frame (`MADV_DONTNEED`), as it gives back its cache: about 1 to 1.5 MB in the lab at the window's end.
+- A runtime thread (a shard, a pool's worker) marks its stack `MADV_NOHUGEPAGE` as it starts. Production's
+  host gives huge pages to every anonymous mapping, musl maps a stack without `MAP_STACK` (which Linux keeps
+  off huge pages), and khugepaged collapses a range with 103 of its 512 pages in use: a shard's 0.4 to 0.75 MB
+  would be 2 MB. The lab (fedora: `madvise`) can't show it; on adacachy, the server's stack mappings'
+  `AnonHugePages` in smaps say it.
+
+**observe's index** (`kiln_obs::index`): 4 MB in train 4's heap profile. The server's index held 13,779
+series (train 4's realistic profile, a round's block), whose keys took 1,898,546 bytes in a 2 MiB column for
+17,266 bytes of distinct strings: its 233 metrics and 489 tag pairs' 722 posting lists held 60,000 ids. The
+index keeps no key now (it's the series' metric and tags written canonically, which the symbols hold, and is
+written again as it's asked for: a cut, a series' re-definition), save one whose bytes aren't that writing,
+kept as sent; and its columns grow by a quarter, not doubling. An index of the lab's shape holds 1.07 MB:
+about 2.2 MB less.
+
 ## Goal 10: API reads and frames in under a millisecond
 
 Goal 10 of the API runtime program (plan `01a1a87b2dae`): every read the lab makes answers from memory,

@@ -18,8 +18,10 @@ types and bodies are `http-body`'s, so handlers are written as they were on hype
 - **An idle connection holds no buffer.** Reads go through one 64 KiB scratch buffer per thread.
   A connection keeps only what was read and not yet taken (a request's head shares those bytes:
   header values are slices of them, not copies). Write buffers come from a per-thread pool and go
-  back to it when a connection has nothing to send. Between requests, an HTTP/1.1 connection
-  drops its read buffer, its handler slot and its spare header map.
+  back to it when a connection has nothing to send. Header maps are kept per thread too: a
+  response's, once its head is written, goes back emptied, and a request read on that thread takes
+  it for its headers. Between requests, an HTTP/1.1 connection drops its read buffer and its
+  handler slot.
 - **No speculative reads.** A read that took less than it had room for emptied the socket, so the
   connection next waits for readiness instead of asking the kernel first: one system call fewer
   for every request a connection waits for.

@@ -61,10 +61,6 @@ impl Lists {
         if self.ready.get() == 0 { second } else { first }
     }
 
-    fn is_empty(&self) -> bool {
-        self.ready_list().is_empty() && self.yielded_list().is_empty()
-    }
-
     fn len(&self) -> usize {
         self.ready_list()
             .len()
@@ -139,7 +135,23 @@ pub struct LocalQueue {
     others: OnceCell<Box<Others>>,
     /// Slots `push` has listed, a count the loop reads twice to tell whether polls between listed any.
     listed: Cell<u64>,
+    /// The classes whose ready FIFO holds a slot, a bit each ([`bit`]), and those whose list of slots that woke
+    /// themselves does: what the lists' lengths say, set from them after every change to a class's lists (kiln's
+    /// goal 9, plan 01a1a87b2cec step 5). A pop, a poll's charge, a class's start, a step's release of yielded
+    /// slots, every `wanted` of a leaf's charge and every park's look read every class's lists for their
+    /// emptiness, the other classes' a heap block of four lines; these read none where no other class has work.
+    ready_classes: Cell<u8>,
+    yielded_classes: Cell<u8>,
     overflow: Cell<u64>,
+}
+
+/// `class`'s bit in the queue's sets of classes ([`LocalQueue::ready_classes`]).
+const fn bit(class: Class) -> u8 {
+    match class {
+        Class::Background => 1,
+        Class::Normal => 2,
+        Class::Critical => 4,
+    }
 }
 
 impl std::fmt::Debug for LocalQueue {
@@ -183,8 +195,25 @@ impl LocalQueue {
             normal: Lists::new(capacity),
             others: OnceCell::new(),
             listed: Cell::new(0),
+            ready_classes: Cell::new(0),
+            yielded_classes: Cell::new(0),
             overflow: Cell::new(0),
         }
+    }
+
+    /// `class`'s bits as its `lists` hold now, after a change to them.
+    fn note(&self, class: Class, lists: &Lists) {
+        let bit = bit(class);
+        let set = |classes: &Cell<u8>, holds: bool| {
+            classes.set(if holds { classes.get() | bit } else { classes.get() & !bit });
+        };
+        set(&self.ready_classes, !lists.ready_list().is_empty());
+        set(&self.yielded_classes, !lists.yielded_list().is_empty());
+    }
+
+    /// The classes with a slot listed or waiting for its release.
+    fn listed_classes(&self) -> u8 {
+        self.ready_classes.get() | self.yielded_classes.get()
     }
 
     /// Slot `slot`'s place, once made.
@@ -236,13 +265,22 @@ impl LocalQueue {
         place.class.replace(class)
     }
 
-    /// The lists `class` joins: Normal's while no other class was taken.
-    fn lists(&self, class: Class) -> &Lists {
+    /// The lists `class` joins, with the class whose they are: Normal's while no other class was taken.
+    fn lists(&self, class: Class) -> (Class, &Lists) {
         match (class, self.others.get()) {
-            (Class::Critical, Some(others)) => &others.critical,
-            (Class::Background, Some(others)) => &others.background,
-            _ => &self.normal,
+            (Class::Critical, Some(others)) => (Class::Critical, &others.critical),
+            (Class::Background, Some(others)) => (Class::Background, &others.background),
+            _ => (Class::Normal, &self.normal),
         }
+    }
+
+    /// The least time run of the classes in `classes` ([`bit`]s), `None` with none.
+    fn least_run(others: &Others, classes: u8) -> Option<u64> {
+        [Class::Critical, Class::Normal, Class::Background]
+            .into_iter()
+            .filter(|class| classes & bit(*class) != 0)
+            .map(|class| others.ran(class).get())
+            .min()
     }
 
     /// When the task in `slot` last joined a ready FIFO, on the shard's clock (0 for a slot never listed).
@@ -265,11 +303,7 @@ impl LocalQueue {
         let Some(others) = self.others.get() else {
             return;
         };
-        let least = [Class::Critical, Class::Normal, Class::Background]
-            .into_iter()
-            .filter(|other| *other != class && !self.lists(*other).is_empty())
-            .map(|other| others.ran(other).get())
-            .min();
+        let least = Self::least_run(others, self.listed_classes() & !bit(class));
         // A listed class has run at least the virtual time (it was in the least that set it, or raised to it), so
         // this is the least listed's where one is listed.
         let floor = least.unwrap_or(0).max(others.vtime_ns.get());
@@ -288,9 +322,8 @@ impl LocalQueue {
         if place.pending.replace(true) {
             return;
         }
-        let class = place.class.get();
-        let lists = self.lists(class);
-        let idle = lists.is_empty();
+        let (class, lists) = self.lists(place.class.get());
+        let idle = self.listed_classes() & bit(class) == 0;
         // A slot is in the ring at most once (its flag), and the ring holds one entry per slot, so it never
         // refuses; were it to, the flag is cleared so the next wake lists the slot again.
         if lists.ready_list().push(slot).is_err() {
@@ -298,6 +331,7 @@ impl LocalQueue {
             self.overflow.set(self.overflow.get().saturating_add(1));
             return;
         }
+        self.note(class, lists);
         place.listed_ns.set(now_ns);
         if idle {
             self.activate(class);
@@ -323,37 +357,40 @@ impl LocalQueue {
         if place.pending.replace(true) {
             return;
         }
-        let class = place.class.get();
-        let lists = self.lists(class);
-        let idle = lists.is_empty();
+        let (class, lists) = self.lists(place.class.get());
+        let idle = self.listed_classes() & bit(class) == 0;
         // Never refused, as for `push`: one entry per slot, and the list holds one for every slot.
         if lists.yielded_list().push(slot).is_err() {
             place.pending.set(false);
             self.overflow.set(self.overflow.get().saturating_add(1));
             return;
         }
+        self.note(class, lists);
         if idle {
             self.activate(class);
         }
     }
 
     /// Lists every slot that woke itself behind the slots ready now in its class, oldest first, its wait counted
-    /// from `now_ns`: the loop calls it once its inputs are in the queue.
+    /// from `now_ns`: the loop calls it once its inputs are in the queue, every step. A class with none waiting is
+    /// left as it is (its release would move nothing), so a step with no yield reads no list.
     pub fn release_yielded(&self, now_ns: u64) {
-        self.normal.release(self, now_ns);
-        if let Some(others) = self.others.get() {
-            others.critical.release(self, now_ns);
-            others.background.release(self, now_ns);
+        let yielded = self.yielded_classes.get();
+        if yielded == 0 {
+            return;
+        }
+        for class in [Class::Critical, Class::Normal, Class::Background] {
+            if yielded & bit(class) != 0 {
+                let (class, lists) = self.lists(class);
+                lists.release(self, now_ns);
+                self.note(class, lists);
+            }
         }
     }
 
     /// Whether a slot that woke itself waits for its release.
     pub fn has_yielded(&self) -> bool {
-        !self.normal.yielded_list().is_empty()
-            || self.others.get().is_some_and(|others| {
-                !others.critical.yielded_list().is_empty()
-                    || !others.background.yielded_list().is_empty()
-            })
+        self.yielded_classes.get() != 0
     }
 
     /// How many slots the step about to run may take: at most `limit`, and only those ready now, so a wake
@@ -392,38 +429,35 @@ impl LocalQueue {
     /// them.
     #[inline]
     pub fn pop_within(&self, lead_ns: u64) -> Option<u32> {
-        let lists = match self.others.get() {
-            None => &self.normal,
+        let (class, lists) = match self.others.get() {
+            None => (Class::Normal, &self.normal),
             Some(others) => self.pick(others, lead_ns)?,
         };
         let slot = lists.ready_list().pop()?;
+        self.note(class, lists);
         if let Some(place) = self.place(slot) {
             place.pending.set(false);
         }
         Some(slot)
     }
 
-    /// The lists to take from: of those with a slot ready, the first in priority order that has run no more than
-    /// `lead_ns` past the least-run of them (with no lead, the least-run, the first in priority order where they
-    /// have run alike).
-    fn pick<'a>(&'a self, others: &'a Others, lead_ns: u64) -> Option<&'a Lists> {
-        let classes = [
-            (Class::Critical, &others.critical),
-            (Class::Normal, &self.normal),
-            (Class::Background, &others.background),
-        ];
-        let least = classes
-            .iter()
-            .filter(|(_, lists)| !lists.ready_list().is_empty())
-            .map(|(class, _)| others.ran(*class).get())
-            .min()?;
-        let within = least.saturating_add(lead_ns);
-        classes
+    /// The lists to take from, with their class: of those with a slot ready, the first in priority order that has run
+    /// no more than `lead_ns` past the least-run of them (with no lead, the least-run, the first in priority order
+    /// where they have run alike); the one class with a slot ready, whatever it ran, without reading what the
+    /// classes ran.
+    fn pick<'a>(&'a self, others: &'a Others, lead_ns: u64) -> Option<(Class, &'a Lists)> {
+        let ready = self.ready_classes.get();
+        if ready.count_ones() == 1 {
+            let class = [Class::Critical, Class::Normal, Class::Background]
+                .into_iter()
+                .find(|class| ready & bit(*class) != 0)?;
+            return Some(self.lists(class));
+        }
+        let within = Self::least_run(others, ready)?.saturating_add(lead_ns);
+        [Class::Critical, Class::Normal, Class::Background]
             .into_iter()
-            .find(|(class, lists)| {
-                !lists.ready_list().is_empty() && others.ran(*class).get() <= within
-            })
-            .map(|(_, lists)| lists)
+            .find(|class| ready & bit(*class) != 0 && others.ran(*class).get() <= within)
+            .map(|class| self.lists(class))
     }
 
     /// Counts `ns` of poll time to the class of the task in `slot`, while classes are kept, and moves the shard's
@@ -434,23 +468,14 @@ impl LocalQueue {
             let class = self.class_of(slot);
             let ran = others.ran(class);
             ran.set(ran.get().saturating_add(ns));
-            let least = [Class::Critical, Class::Normal, Class::Background]
-                .into_iter()
-                .filter(|other| *other == class || !self.lists(*other).is_empty())
-                .map(|other| others.ran(other).get())
-                .min()
-                .unwrap_or(0);
+            let least = Self::least_run(others, self.listed_classes() | bit(class)).unwrap_or(0);
             others.vtime_ns.set(others.vtime_ns.get().max(least));
         }
     }
 
     /// Whether nothing is ready, yielded tasks included.
     pub fn is_empty(&self) -> bool {
-        self.normal.is_empty()
-            && self
-                .others
-                .get()
-                .is_none_or(|others| others.critical.is_empty() && others.background.is_empty())
+        self.listed_classes() == 0
     }
 
     /// Ready entries, yielded tasks included.
@@ -471,14 +496,15 @@ impl LocalQueue {
     /// (kiln's goal 6, plan 01a1a59c2abe step 3: what a task that lowered its class gives way to,
     /// `crate::coop::give_way`). False while no task of the shard took a class other than Normal.
     pub fn waiting_above(&self, class: Class) -> bool {
-        let Some(others) = self.others.get() else {
+        if self.others.get().is_none() {
             return false;
-        };
-        match class {
-            Class::Critical => false,
-            Class::Normal => !others.critical.is_empty(),
-            Class::Background => !others.critical.is_empty() || !self.normal.is_empty(),
         }
+        let above = match class {
+            Class::Critical => 0,
+            Class::Normal => bit(Class::Critical),
+            Class::Background => bit(Class::Critical) | bit(Class::Normal),
+        };
+        self.listed_classes() & above != 0
     }
 
     /// Wakes for slots beyond the arena, ignored.
@@ -745,6 +771,135 @@ mod tests {
         assert_eq!(q.places.made(), 3, "the same slots again");
         assert!(q.normal.ready_list().made() <= 4 && q.normal.yielded_list().made() <= 2);
         assert_eq!(q.listed_ns(2), 7);
+    }
+
+    /// What class `class`'s own lists hold, read from them: (a slot ready, a slot yielded); none for a class whose
+    /// lists aren't made.
+    fn held(q: &LocalQueue, class: Class) -> (bool, bool) {
+        let lists = match (class, q.others.get()) {
+            (Class::Normal, _) => &q.normal,
+            (Class::Critical, Some(others)) => &others.critical,
+            (Class::Background, Some(others)) => &others.background,
+            _ => return (false, false),
+        };
+        (!lists.ready_list().is_empty(), !lists.yielded_list().is_empty())
+    }
+
+    const CLASSES: [Class; 3] = [Class::Critical, Class::Normal, Class::Background];
+
+    /// The class a pop takes from, worked out from the lists themselves (the policy of `pick`).
+    fn picked_by_lists(q: &LocalQueue, lead_ns: u64) -> Option<Class> {
+        let Some(others) = q.others.get() else {
+            return held(q, Class::Normal).0.then_some(Class::Normal);
+        };
+        let least = CLASSES.into_iter().filter(|c| held(q, *c).0).map(|c| others.ran(c).get()).min()?;
+        CLASSES
+            .into_iter()
+            .find(|c| held(q, *c).0 && others.ran(*c).get() <= least.saturating_add(lead_ns))
+    }
+
+    /// The least time run of the classes with a slot listed or yielded, by the lists, `extra` among them.
+    fn least_listed_by_lists(q: &LocalQueue, others: &Others, extra: Option<Class>, but: Option<Class>) -> Option<u64> {
+        CLASSES
+            .into_iter()
+            .filter(|c| Some(*c) != but && (Some(*c) == extra || held(q, *c) != (false, false)))
+            .map(|c| others.ran(c).get())
+            .min()
+    }
+
+    /// Kiln's goal 9, plan 01a1a87b2cec step 5: the queue keeps which classes have a slot ready and which have one
+    /// yielded, so a pop, a charge, a class's start and a step's release read no other class's lists. Do: 30,000
+    /// random pushes, yields, pops (with and without a lead), releases, charges and class changes (of listed slots
+    /// too) over 16 slots. Expect: after each, the kept classes are what the lists hold, and `is_empty`,
+    /// `has_yielded` and `waiting_above` say what the lists say; each pop takes the front of the class the lists'
+    /// own reading picks; each charge and each class's start leave the virtual time and the time run that the
+    /// lists' own reading gives.
+    #[test]
+    fn g9_s5_the_classes_kept_say_what_the_lists_hold() {
+        const SLOTS: usize = 16;
+        const QUANTUM: u64 = 250_000;
+        let q = LocalQueue::new(SLOTS);
+        let mut rng = crate::machine::stats::Xorshift::new(crate::machine::stats::Xorshift::SEED);
+        let mut now = 0u64;
+        let mut popped: Option<u32> = None;
+        for op in 0..30_000 {
+            let slot = u32::try_from(rng.below(SLOTS)).unwrap();
+            match rng.below(9) {
+                0 => {
+                    let class = CLASSES[rng.below(3)];
+                    q.set_class(slot, class);
+                }
+                1..=2 => {
+                    now += 1;
+                    let class = q.class_of(slot);
+                    let (lists_class, _) = q.lists(class);
+                    let (idle, pending) = (held(&q, lists_class) == (false, false), q.place(slot).is_some_and(|p| p.pending.get()));
+                    let expected_ran = q.others.get().map(|others| {
+                        let floor = least_listed_by_lists(&q, others, None, Some(lists_class)).unwrap_or(0).max(others.vtime_ns.get());
+                        if idle && !pending { others.ran(lists_class).get().max(floor) } else { others.ran(lists_class).get() }
+                    });
+                    if rng.below(2) == 0 {
+                        q.push(slot, now);
+                    } else {
+                        q.defer(slot);
+                    }
+                    if let (Some(others), Some(expected)) = (q.others.get(), expected_ran) {
+                        assert_eq!(others.ran(lists_class).get(), expected, "op {op}: a class's start");
+                    }
+                }
+                3..=5 => {
+                    let lead = if rng.below(2) == 0 { 0 } else { QUANTUM };
+                    let expected = picked_by_lists(&q, lead).map(|class| {
+                        let (_, lists) = q.lists(class);
+                        let mut front = None;
+                        lists.ready_list().each(|s| {
+                            front.get_or_insert(s);
+                        });
+                        front.unwrap()
+                    });
+                    popped = q.pop_within(lead);
+                    assert_eq!(popped, expected, "op {op}: the pop");
+                }
+                6 => {
+                    now += 1;
+                    q.release_yielded(now);
+                }
+                _ => {
+                    let charged = popped.unwrap_or(slot);
+                    let ns = u64::try_from(rng.below(2 * usize::try_from(QUANTUM).unwrap())).unwrap();
+                    let expected_vtime = q.others.get().map(|others| {
+                        let class = q.class_of(charged);
+                        let ran_after = others.ran(class).get().saturating_add(ns);
+                        let least = CLASSES
+                            .into_iter()
+                            .filter(|c| *c == class || held(&q, *c) != (false, false))
+                            .map(|c| if c == class { ran_after } else { others.ran(c).get() })
+                            .min()
+                            .unwrap_or(0);
+                        others.vtime_ns.get().max(least)
+                    });
+                    q.charge(charged, ns);
+                    assert_eq!(q.others.get().map(|others| others.vtime_ns.get()), expected_vtime, "op {op}: the charge");
+                }
+            }
+            for class in CLASSES {
+                let (ready, yielded) = held(&q, class);
+                assert_eq!(q.ready_classes.get() & bit(class) != 0, ready, "op {op}: {class:?} ready");
+                assert_eq!(q.yielded_classes.get() & bit(class) != 0, yielded, "op {op}: {class:?} yielded");
+            }
+            let all: Vec<(bool, bool)> = CLASSES.into_iter().map(|c| held(&q, c)).collect();
+            assert_eq!(q.is_empty(), all.iter().all(|h| *h == (false, false)), "op {op}");
+            assert_eq!(q.has_yielded(), all.iter().any(|h| h.1), "op {op}");
+            let listed = |c: Class| held(&q, c) != (false, false);
+            let above = |c: Class| match c {
+                Class::Critical => false,
+                Class::Normal => listed(Class::Critical),
+                Class::Background => listed(Class::Critical) || listed(Class::Normal),
+            };
+            for class in CLASSES {
+                assert_eq!(q.waiting_above(class), q.others.get().is_some() && above(class), "op {op}: above {class:?}");
+            }
+        }
     }
 
     /// A slot's wait is stamped as it joins a ready FIFO: at its push, and for one that yielded, at its release.

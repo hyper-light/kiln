@@ -203,6 +203,48 @@ fn g9_s5_a_step_taken_alone_reads_the_clock_afresh() {
     assert_eq!(asked.reads() - before, 5, "the step after reads its own");
 }
 
+/// Do: on a shard, three tasks that end at once; then tasks that wait for good until the arena refuses one, and one
+/// more sent from off the shard (a control message, refused for want of a slot), a step after each. Expect: the pulse's
+/// steps, spawns, completions, refusals and longest poll are what the loop has counted (its live counters, which
+/// the step used to copy to the pulse whole): each figure recorded where it is counted, the steps at each step.
+#[test]
+fn g9_s5_the_pulse_says_what_the_counters_say() {
+    let asked = Arc::new(Asked::default());
+    let mut rt = counting(&asked, None, None);
+    let shard = rt.shard_id().0;
+    let pulse = || {
+        crate::registry::with_entry(shard, |entry| {
+            let pulse = &entry.pulse;
+            (pulse.steps(), pulse.spawns(), pulse.completed(), pulse.admission_refused(), pulse.longest_step_ns())
+        })
+        .unwrap()
+    };
+    let counted = |rt: &LocalRuntime| {
+        let live = &rt.context().live;
+        (
+            live.steps.get(),
+            live.spawns.get(),
+            live.completed.get(),
+            live.admission_refused.get(),
+            live.longest_step_ns.get(),
+        )
+    };
+    for _ in 0..3 {
+        rt.spawn(async {}).unwrap();
+    }
+    while rt.step().did_work {}
+    assert_eq!(pulse(), counted(&rt));
+    let (_, spawns, completed, _, _) = counted(&rt);
+    assert_eq!((spawns, completed), (3, 3));
+    while rt.spawn(std::future::pending::<()>()).is_ok() {}
+    while rt.step().did_work {}
+    let holder = crate::registry::holder_of(shard).unwrap();
+    crate::runtime::submit_to_holder(holder, async {}).unwrap();
+    while rt.step().did_work {}
+    assert_eq!(pulse(), counted(&rt));
+    assert_eq!(counted(&rt).3, 1, "the loop refused the spawn sent to it");
+}
+
 /// Do: hold a readiness wait on a shard (registered, unfired), then take an idle step. Expect: the step asked nothing of
 /// the driver (it looked at nothing: no input was pending, and its harvest wasn't due), where it read every input
 /// before, asking the driver twice; and the driver is still owed its look before the shard ends a nonblocking run, so

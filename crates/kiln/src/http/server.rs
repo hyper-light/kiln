@@ -28,18 +28,32 @@ pub trait Handler: Send + Sync + 'static {
     fn handle(self: Arc<Self>, req: Request) -> impl Future<Output = Response> + Send;
 }
 
-/// The client's address, attached to every request of a connection (request extension).
+/// Where a request came from and how its connection serves it, put on every request a connection reads (a request
+/// extension): the client's address when the listener knew it, whether it came over TLS (the server's own HTTPS), and
+/// its class (`crate::overload`). One extension, one allocation, where there were up to three and two allocations:
+/// with kiln-http's arrival time before them and the router's caller after, they outgrew the request's table of
+/// extensions, made again larger for each request the router authorized (goal 9, plan 01a1a87b2cec step 5).
 #[derive(Clone, Copy, Debug)]
-pub struct RemoteAddr(pub std::net::SocketAddr);
+pub struct Arrival {
+    pub remote: Option<std::net::SocketAddr>,
+    pub secure: bool,
+    pub class: crate::overload::Class,
+}
+
+/// The address a request came from, when the listener knew it.
+pub fn remote_addr(req: &Request) -> Option<std::net::SocketAddr> {
+    req.extensions().get::<Arrival>().and_then(|a| a.remote)
+}
 
 /// The address a request came from, when the listener knew it.
 pub fn remote_ip(req: &Request) -> Option<std::net::IpAddr> {
-    req.extensions().get::<RemoteAddr>().map(|r| r.0.ip())
+    remote_addr(req).map(|r| r.ip())
 }
 
-/// Attached to every request of a connection that came over TLS (the server's own HTTPS).
-#[derive(Clone, Copy, Debug)]
-pub struct Secure;
+/// Whether a request came over TLS (the server's own HTTPS).
+pub fn secure(req: &Request) -> bool {
+    req.extensions().get::<Arrival>().is_some_and(|a| a.secure)
+}
 
 /// Serve one accepted connection until the client goes away. Errors are logged at debug level:
 /// clients disappearing mid-request are normal.
@@ -131,17 +145,12 @@ pub async fn serve_accepted<H: Handler>(stream: hyper_rt::tcp::TcpStream, handle
     }
 }
 
-/// What every request of a connection carries: where it came from, and whether over TLS.
-fn mark(req: &mut Request, remote: Option<std::net::SocketAddr>, secure: bool) {
-    if let Some(r) = remote {
-        req.extensions_mut().insert(RemoteAddr(r));
-    }
-    if secure {
-        req.extensions_mut().insert(Secure);
-    }
+/// What every request of a connection carries: where it came from, whether over TLS, and its class ([`Arrival`]).
+fn mark(req: &mut Request, remote: Option<std::net::SocketAddr>, secure: bool, class: crate::overload::Class) {
+    req.extensions_mut().insert(Arrival { remote, secure, class });
 }
 
-/// [`serve_connection`], saying whether the connection is TLS ([`Secure`] on its requests).
+/// [`serve_connection`], saying whether the connection is TLS ([`secure`] of its requests).
 pub async fn serve_connection_with<I, H>(io: I, handler: Arc<H>, remote: Option<std::net::SocketAddr>, secure: bool)
 where
     I: AsyncRead + AsyncWrite + Unpin + Send + 'static,
@@ -160,8 +169,8 @@ where
     // 01a1a59c2abe step 3).
     let serving = crate::overload::Connection::new();
     let service = service_fn(move |mut req: Request| {
-        mark(&mut req, remote, secure);
-        let request = serving.begin(&mut req);
+        let request = serving.begin(&req);
+        mark(&mut req, remote, secure, request.class());
         answer(handler.clone(), req, request)
     });
     let conn = http1::Builder::new()
@@ -188,8 +197,8 @@ where
     let serving = crate::overload::Connection::new();
     let service = service_fn(move |mut req: Request| {
         as_http1(&mut req);
-        mark(&mut req, remote, secure);
-        let request = serving.begin(&mut req);
+        let request = serving.begin(&req);
+        mark(&mut req, remote, secure, request.class());
         answer(handler.clone(), req, request)
     });
     let conn = http2::Builder::new()
@@ -197,6 +206,8 @@ where
         .keep_alive_interval(Some(std::time::Duration::from_secs(30)))
         .keep_alive_timeout(std::time::Duration::from_secs(20))
         .max_header_list_size(64 << 10)
+        // Its `Host` the authority's own bytes ([`as_http1`]'s, without a copy).
+        .host_from_authority(true)
         .serve_read(io, read, service);
     if let Err(e) = conn.await {
         tracing::debug!(error = %e, "http/2 connection ended with an error");
@@ -211,8 +222,9 @@ where
 /// step 5): its handler's future boxed where it's made, so each layer that carries it (this one, its placement,
 /// the connection's slot for it) moves a pointer. Each moved the handler's whole future as it was first polled:
 /// 36 KB a layer at rt6's tree, 6.6% of the shards' CPU in g9p6's calm profile copying them; 2 KB since goal 10's
-/// step 5 (the router boxed apart). Boxed, it's copied once, into its box.
-fn answer<H: Handler>(handler: Arc<H>, req: Request, serving: crate::overload::Serving) -> impl Future<Output = Response> + Send + 'static {
+/// step 5 (the router boxed apart). Boxed, it's copied once, into its box. Its answer's body goes to the connection
+/// in its guard as it is, not boxed again (`crate::overload::Guarded`).
+fn answer<H: Handler>(handler: Arc<H>, req: Request, serving: crate::overload::Serving) -> impl Future<Output = http::Response<crate::overload::Guarded>> + Send + 'static {
     let handling = Box::pin(handler.handle(req));
     async move { crate::overload::while_sent(placed(serving.class(), serving.demoted(), handling).await, serving) }
 }
@@ -225,17 +237,27 @@ async fn placed(class: crate::overload::Class, demoted: bool, handling: impl Fut
 }
 
 /// An HTTP/2 request shaped as the HTTP/1.1 request it stands for, so handlers see one shape:
-/// its authority (`:authority`) as `Host`, its cookies in one `Cookie` (a browser sends them
-/// separately over HTTP/2, RFC 9113 §8.2.3), and its target as a path (origin form).
+/// its authority (`:authority`) as `Host` (kiln-http's connection gives it, as it was decoded:
+/// [`serve_h2`]), its cookies in one `Cookie` (a browser sends them separately over HTTP/2, RFC 9113
+/// §8.2.3), and its target as a path (origin form). The cookies are joined into one buffer made at
+/// their length, the header's own (goal 9, plan 01a1a87b2cec step 5: a list of them, the joined copy
+/// and the header's copy of that were three a request).
 fn as_http1<B>(req: &mut http::Request<B>) {
     if !req.headers().contains_key(header::HOST)
         && let Some(v) = req.uri().authority().and_then(|a| HeaderValue::from_str(a.as_str()).ok())
     {
         req.headers_mut().insert(header::HOST, v);
     }
-    if req.headers().get_all(header::COOKIE).iter().nth(1).is_some() {
-        let joined = req.headers().get_all(header::COOKIE).iter().map(HeaderValue::as_bytes).collect::<Vec<_>>().join(&b"; "[..]);
-        if let Ok(v) = HeaderValue::from_bytes(&joined) {
+    let cookies = req.headers().get_all(header::COOKIE);
+    if cookies.iter().nth(1).is_some() {
+        let mut joined = Vec::with_capacity(cookies.iter().map(|v| v.len() + 2).sum::<usize>().saturating_sub(2));
+        for (i, v) in cookies.iter().enumerate() {
+            if i > 0 {
+                joined.extend_from_slice(b"; ");
+            }
+            joined.extend_from_slice(v.as_bytes());
+        }
+        if let Ok(v) = HeaderValue::from_maybe_shared(Bytes::from(joined)) {
             req.headers_mut().insert(header::COOKIE, v);
         }
     }
@@ -325,10 +347,33 @@ pub fn response(status: StatusCode, content_type: &str, body: Body) -> Response 
 pub fn json<T: serde::Serialize>(status: StatusCode, value: &T) -> Response {
     // Encoded as it's answered (goal 10, plan 01a1a87b2dae step 2's trace: the lab's reads never are).
     crate::reads::trace::encoded();
-    match serde_json::to_vec(value) {
+    match encode(value) {
         Ok(b) => response(status, JSON, full(b)),
         Err(e) => text(StatusCode::INTERNAL_SERVER_ERROR, &format!("serialize: {e}")),
     }
+}
+
+/// The most of [`encode`]'s buffer a thread keeps between answers: 64 KiB, what kiln-http keeps a thread for the
+/// bytes it reads (its scratch buffer, docs/http.md). A larger answer's buffer is let go once it's copied out.
+const ENCODE_KEPT: usize = 64 << 10;
+
+thread_local! {
+    /// Where [`encode`] writes, kept between answers on this thread.
+    static ENCODING: std::cell::Cell<Vec<u8>> = const { std::cell::Cell::new(Vec::new()) };
+}
+
+/// `value` as JSON, written where this thread wrote its last answer and copied out once at its length (goal 9, plan
+/// 01a1a87b2cec step 5). Each answer encoded into a vector of its own grew it from 128 bytes by doubling, each step
+/// a reallocation and a copy of what it held (a 10 KB answer: 7 and about 16 KB moved), then a block more to share
+/// it, its length short of its room.
+fn encode<T: serde::Serialize + ?Sized>(value: &T) -> serde_json::Result<Bytes> {
+    let mut buf = ENCODING.try_with(std::cell::Cell::take).unwrap_or_default();
+    buf.clear();
+    let out = serde_json::to_writer(&mut buf, value).map(|()| Bytes::copy_from_slice(&buf));
+    if buf.capacity() <= ENCODE_KEPT {
+        let _ = ENCODING.try_with(move |e| e.set(buf));
+    }
+    out
 }
 
 pub fn text(status: StatusCode, s: &str) -> Response {
@@ -349,6 +394,25 @@ pub fn with_header(mut r: Response, name: header::HeaderName, value: &str) -> Re
 }
 
 // ---------------------------------------------------------------- request helpers
+
+/// Room on the stack for a request path's segments as kiln's routes match them: as many as the API's deepest route
+/// names (8, CI's `/api/uploads/repos/{owner}/{repo}/releases/{id}/assets`). A path of more (under a route that takes
+/// the rest: a file's, a blob's) has them in a vector of its own (goal 9, plan 01a1a87b2cec step 5).
+pub const ROUTE_DEPTH: usize = 8;
+
+/// `path`'s segments (empty ones skipped), in `room` when they fit, else in a vector of their own.
+pub fn split_path<'r, 'p: 'r>(path: &'p str, room: &'r mut [&'p str; ROUTE_DEPTH]) -> std::borrow::Cow<'r, [&'p str]> {
+    let mut n = 0;
+    for part in path.split('/').filter(|p| !p.is_empty()) {
+        match room.get_mut(n) {
+            Some(slot) => *slot = part,
+            None => return std::borrow::Cow::Owned(path.split('/').filter(|p| !p.is_empty()).collect()),
+        }
+        n += 1;
+    }
+    let room: &'r [&'p str; ROUTE_DEPTH] = room;
+    std::borrow::Cow::Borrowed(room.get(..n).unwrap_or_default())
+}
 
 /// Collect a request body, refusing more than `limit` bytes.
 pub async fn body_bytes(body: Incoming, limit: usize) -> anyhow::Result<Bytes> {
@@ -503,7 +567,7 @@ mod tests {
         async fn handle(self: Arc<Self>, req: Request) -> Response {
             let host = header_str(&req, &header::HOST).unwrap_or("-").to_owned();
             let cookie = header_str(&req, &header::COOKIE).unwrap_or("-").to_owned();
-            let secure = req.extensions().get::<Secure>().is_some();
+            let secure = secure(&req);
             text(StatusCode::OK, &format!("{:?} {host} {} [{cookie}] secure={secure}", req.version(), req.uri()))
         }
     }
@@ -635,8 +699,8 @@ mod tests {
             let handling = Arc::new(Big).handle(request()?);
             let whole = size_of_val(&handling);
             drop(handling);
-            let mut req = request()?;
-            let serving = conn.begin(&mut req);
+            let req = request()?;
+            let serving = conn.begin(&req);
             let fut = answer(Arc::new(Big), req, serving);
             let kept = size_of_val(&fut);
             anyhow::ensure!(whole >= 64 << 10 && kept < 1024, "the handler's future {whole} bytes, the request's as kept {kept}");
@@ -646,11 +710,124 @@ mod tests {
             let hub = crate::hub::tests::scratch_hub().await?;
             let api = Arc::new(crate::api::Api { hub });
             let handled = size_of_val(&Handler::handle(Arc::clone(&api), request()?));
-            let mut req = request()?;
-            let serving = conn.begin(&mut req);
+            let req = request()?;
+            let serving = conn.begin(&req);
             let kept = size_of_val(&answer(api, req, serving));
             anyhow::ensure!(kept < 1024, "the API's handler future {handled} bytes, the request's as kept {kept}");
             Ok(())
         })
+    }
+
+    /// What `f` allocated on this thread, and its output.
+    fn allocating<T>(f: impl FnOnce() -> T) -> (T, u64) {
+        let before = crate::os::counted::made().blocks;
+        let out = f();
+        (out, crate::os::counted::made().blocks.saturating_sub(before))
+    }
+
+    /// Goal 9, plan 01a1a87b2cec step 5: what a request's connection puts on it is one extension, where it came from,
+    /// whether over TLS and its class, and one allocation; the router's caller after it is one more, its table room
+    /// enough for kiln-http's arrival time, the connection's and the caller's.
+    #[test]
+    fn g9_s5_a_requests_arrival_is_one_extension() -> anyhow::Result<()> {
+        let addr = std::net::SocketAddr::from(([10, 0, 0, 7], 4242));
+        let mut req = http::Request::builder().uri("/api/me").body(Incoming::empty())?;
+        req.extensions_mut().insert(kiln_http::Received(std::time::Instant::now()));
+        let ((), marking) = allocating(|| mark(&mut req, Some(addr), true, crate::overload::Class::Normal));
+        assert_eq!(marking, 1, "one extension, one allocation");
+        assert_eq!((remote_addr(&req), remote_ip(&req), secure(&req)), (Some(addr), Some(addr.ip()), true));
+        assert_eq!(req.extensions().get::<Arrival>().map(|a| a.class), Some(crate::overload::Class::Normal));
+        let ((), calling) = allocating(|| {
+            req.extensions_mut().insert(crate::authz::Caller::owner());
+        });
+        assert_eq!(calling, 2, "the caller's name and its box: the table had room");
+        assert_eq!(req.extensions().len(), 3);
+        let plain = http::Request::builder().uri("/").body(Incoming::empty())?;
+        assert_eq!((remote_ip(&plain), secure(&plain)), (None, false), "a request no connection marked");
+        Ok(())
+    }
+
+    /// Goal 9, plan 01a1a87b2cec step 5: an answer's body goes to its connection in its guard as it is (no box made
+    /// for it), and sends what it did.
+    #[test]
+    fn g9_s5_an_answers_body_goes_in_its_guard_unboxed() -> anyhow::Result<()> {
+        crate::rt::block_on(async {
+            let conn = crate::overload::Connection::new();
+            let req = http::Request::builder().uri("/api/me").body(Incoming::empty())?;
+            let serving = conn.begin(&req);
+            let resp = text(StatusCode::OK, "said");
+            let (guarded, made) = allocating(|| crate::overload::while_sent(resp, serving));
+            anyhow::ensure!(made == 0, "{made} allocations to guard it");
+            let body = guarded.into_body().collect().await?.to_bytes();
+            anyhow::ensure!(body.as_ref() == b"said", "{body:?}");
+            Ok(())
+        })
+    }
+
+    /// Goal 9, plan 01a1a87b2cec step 5: an answer's JSON is written where the thread wrote its last and copied out
+    /// once at its length: the same bytes, in four allocations however long (the copy, the header map's two, the
+    /// body's box), where its own vector grew by doubling and was shared in a block more.
+    #[test]
+    fn g9_s5_json_is_written_where_the_last_was_and_copied_once() -> anyhow::Result<()> {
+        let value: Vec<serde_json::Value> = (0..200).map(|i| serde_json::json!({ "id": format!("session-{i}"), "seq": i, "text": "the retry loop reads its deadline" })).collect();
+        let whole = serde_json::to_vec(&value)?;
+        anyhow::ensure!(whole.len() > 10 << 10, "{} bytes", whole.len());
+        let (_, own) = allocating(|| Bytes::from(serde_json::to_vec(&value).unwrap_or_default()));
+        let _ = json(StatusCode::OK, &value);
+        let (resp, made) = allocating(|| json(StatusCode::OK, &value));
+        anyhow::ensure!(made <= 4 && made < own + 3, "{made} allocations to answer; its own vector alone took {own}");
+        let body = crate::rt::block_on(async move { Ok(resp.into_body().collect().await?.to_bytes()) })?;
+        anyhow::ensure!(body.as_ref() == whole.as_slice(), "the same bytes");
+        let ok = serde_json::json!({ "ok": true });
+        let (small, made) = allocating(|| json(StatusCode::OK, &ok));
+        anyhow::ensure!(made <= 4 && small.status() == StatusCode::OK, "{made} allocations for a small one");
+        Ok(())
+    }
+
+    /// Goal 9, plan 01a1a87b2cec step 5: an HTTP/2 request's cookies (a browser sends each apart) are joined into one
+    /// buffer made at their length, the header's own: one allocation, where there were three; its `Host`, given by
+    /// its connection, stands.
+    #[test]
+    fn g9_s5_an_http2_requests_cookies_are_joined_in_one_allocation() -> anyhow::Result<()> {
+        // Its target shared, as kiln-http decodes it (a clone of it counts, copies nothing).
+        let mut req = http::Request::builder()
+            .uri(http::Uri::from_maybe_shared(Bytes::from_static(b"https://kiln.dev/api/runs"))?)
+            .header(header::HOST, "kiln.dev")
+            .header(header::COOKIE, "kiln_session=abc")
+            .header(header::COOKIE, "theme=dark")
+            .header(header::COOKIE, "tz=utc")
+            .body(())?;
+        let ((), made) = allocating(|| as_http1(&mut req));
+        anyhow::ensure!(made == 1, "{made} allocations");
+        assert_eq!(req.headers().get(header::COOKIE).and_then(|v| v.to_str().ok()), Some("kiln_session=abc; theme=dark; tz=utc"));
+        assert_eq!(req.headers().get_all(header::COOKIE).iter().count(), 1);
+        assert_eq!((req.headers().get(header::HOST).and_then(|v| v.to_str().ok()), req.uri().to_string()), (Some("kiln.dev"), "/api/runs".to_owned()));
+        Ok(())
+    }
+
+    /// Goal 9, plan 01a1a87b2cec step 5: a path's segments are split on the stack, as many as a route names, with no
+    /// allocation; a path of more has them all in a vector.
+    #[test]
+    fn g9_s5_a_paths_segments_are_split_on_the_stack() {
+        use std::borrow::Cow;
+        let on_stack = |path: &'static str| {
+            let mut room = [""; ROUTE_DEPTH];
+            allocating(|| match split_path(path, &mut room) {
+                Cow::Borrowed(segs) => Some(segs.join("|")),
+                Cow::Owned(_) => None,
+            })
+        };
+        assert_eq!(on_stack("/api/harness/sessions/a//events/").0.as_deref(), Some("api|harness|sessions|a|events"));
+        let (deepest, _) = on_stack("/api/uploads/repos/o/r/releases/1/assets");
+        assert_eq!(deepest.as_deref(), Some("api|uploads|repos|o|r|releases|1|assets"), "the deepest route's on the stack");
+        let mut room = [""; ROUTE_DEPTH];
+        let (borrowed, made) = allocating(|| matches!(split_path("/api/me", &mut room), Cow::Borrowed(_)));
+        assert!(borrowed && made == 0, "{made} allocations to split it");
+        let mut room = [""; ROUTE_DEPTH];
+        let deep = split_path("/v/x/a/b/c/d/e/f/g", &mut room);
+        assert!(matches!(deep, std::borrow::Cow::Owned(_)));
+        assert_eq!(&*deep, ["v", "x", "a", "b", "c", "d", "e", "f", "g"]);
+        let mut room = [""; ROUTE_DEPTH];
+        assert!(split_path("/", &mut room).is_empty());
     }
 }
