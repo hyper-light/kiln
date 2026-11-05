@@ -1135,6 +1135,73 @@ topic isn't something kiln can ask it. The bounds it derives:
 Its scripts (`bus-lab.sh`, `bus-hook.sh`, `bus-summary.py`) come with goal 11's step 3 hand-overs, to go
 under `scripts/memory_lab/` with their first run.
 
+## Goal 10: API reads and frames in under a millisecond
+
+Goal 10 of the API runtime program (plan `01a1a87b2dae`): every read the lab makes answers from memory,
+encoded ahead; frames never wait behind another viewer's snapshot; a runner's session update goes
+straight to its session's owner shard.
+
+### Main's baseline (step 1)
+
+Measured on 2026-11-05 from 09:26 to 10:43 UTC on fedora, as the calm and hogs configurations of goal 8
+step 7's lab (`scripts/priority_lab/s7c.sh`, below): production's layout, the server on 16-31 at
+`CPUWeight=1000`, 16 spinning hogs at `cpu.weight` 1 beside it in `hogs`, the lab on 0-15, 4 shards, 8
+rounds each. The build: rt-int `d46ceb48d67`, whose tree is main's since `3e427eae99b` (zig, glibc 2.43).
+Each cell the median of the rounds, in microseconds.
+
+| number | calm | hogs |
+| --- | --- | --- |
+| API read p50 / p99 / p99.9 | 234 / 970 / 1244 | 437 / 1833 / 3804 |
+| frame p50 / p99 / p99.9 (all) | 703 / 2025 / 16,443 | 1713 / 5657 / 39,909 |
+| frame p99, live (not a viewer's own attach) | 1891 to 2169 | 4680 to 5625 |
+| page p50 / p99 | 207 / 407 | 392 / 1453 |
+| runner's wait for its owner p99 | 6595 | 14,526 |
+
+A frame published while another viewer attaches reached its viewer in 0.39 to 4.7 ms in every round
+that had one (29 of them, across all of the lab's configurations), at or under that round's live p99,
+while the attaches took 6 ms to 1.7 s at the median: frames don't wait behind a snapshot (step 3).
+The frames' p99.9 is a viewer's own attach (its snapshot), counted with the rest.
+
+## Goal 8 step 7 and goal 9 step 4: the server's cores
+
+`[server] cores` gives the server cores of its own; kiln then keeps its own legs and agents off them
+(Linux affinity, the CPU ledger, Docker's cpusets), and `[server] realtime` gives the shards Linux's
+round-robin class at its lowest priority where the server's unit grants it (docs/priority.md).
+`scripts/priority_lab/s7c.sh` ran 8 rounds of each configuration, interleaved, on fedora on
+2026-11-05 (09:26 to 10:43 UTC; the build as above):
+
+- `calm`: the server on 16-31, nothing else of the lab's there;
+- `hogs`: and 16 spinning hogs on 16-31 at weight 1;
+- `cores-calm`: the server on its cores, 16-23;
+- `cores`: and the hogs on 24-31;
+- `fence`: the hogs started as a kiln runner's agent, which kiln itself put on 24-31.
+
+| number (µs) | calm | hogs | cores-calm | cores | fence |
+| --- | --- | --- | --- | --- | --- |
+| page p99 | 407 | 1453 | 1028 | 1157 | 1108 |
+| API read p99 | 970 | 1833 | 1151 | 1274 | 1312 |
+| API write p99 | 446,456 | 406,874 | 434,740 | 434,803 | 425,894 |
+| frame p99 | 2025 | 5657 | 2798 | 3665 | 3500 |
+| shards' delay p99 | 338 | 1139 | 1056 | 1188 | 1178 |
+| shards' delay p99.9 | 1115 | 3284 | 1558 | 1964 | 1971 |
+| shards' busy share | 0.037 | 0.037 | 0.035 | 0.037 | 0.037 |
+
+What it says:
+
+- **Hogs on the server's CPUs cost its tail** (calm against hogs, beyond noise): pages 0.41 to 1.45 ms
+  at p99, API reads 0.97 to 1.83 ms, frames 2.0 to 5.7 ms, the shards' delay 1.1 to 3.3 ms at p99.9.
+- **Kept off its cores, they cost little more** (cores-calm against cores): pages, API writes and
+  frames the same within noise; API reads 1.15 to 1.27 ms at p99, 10.7% worse, just past the noise.
+  kiln's own placement does what `taskset` does (cores against fence: every number the same), and
+  the fence's verdict each round was that none of the hog agent's threads may run on 16-23.
+- **The rest is fedora's**: with 8 cores instead of 16, and other sessions' work on those 8 (fedora
+  has no cpuset partition, and its kernel preempts lazily at 1000 Hz, so a wake onto a busy CPU waits
+  up to a tick: docs/priority.md, wakelab wake-2), every configuration with the server on its cores
+  ran its shards about a millisecond late at p99, and none made goal 9 step 4's bar (p99.9 under 1
+  ms with hogs). Production's machine preempts fully and its installer can make the cores a
+  partition; on fedora that needs root, as does the real-time class (`RLIMIT_RTPRIO` 0 there), so
+  neither ran here.
+
 ## What the lab doesn't do yet
 
 - **CI.** A lab kiln has no repositories, so its "CI pages" are the run lists and overview, empty;
