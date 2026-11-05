@@ -49,6 +49,13 @@ hot = [
   # Agent sessions: the registry every session's update from its runner, every viewer's read and
   # every command to one runs through (each session's copy its shard's, goal 4).
   "crates/kiln/src/harness/registry.rs",
+  # Messages waiting for their sessions' inboxes to answer (CP-T3.2): one owner, a wait and its answer as
+  # messages (goal 5, plan 01a1a59c2aae, its top goal).
+  "crates/kiln/src/harness/answers.rs",
+  # Conversation stores' feeds: each batch a runner's store sends the server's and the server's sends its
+  # mirrors, and every answer to them (goal 5, plan 01a1a59c2aae, its top goal).
+  "crates/kiln/src/convo/feed.rs",
+  "crates/kiln/src/convo/mirror.rs",
   # Each machine's agent limit: read as sessions start and as runners say what they hold.
   "crates/kiln/src/harness/limit.rs",
   # Reach's relay between runners: every relayed frame, one owner taking them in order.
@@ -208,13 +215,22 @@ at = "crates/kiln/src/harness/registry.rs"
 name = "holders_writing"
 why = "one write of holders.json at a time, on the blocking pool, as a session changes hands; no shard takes it"
 
-[[allowed]]
-at = "crates/kiln/src/harness/registry.rs"
-name = "waiting"
-why = "messages waiting for their session's inbox to answer (CP-T3.2): taken twice a message, as it's sent to a session and as its inbox's answer comes (an Inbox update, in the hub's loop); never on any other update, a viewer's read or a command"
-
 # Terminals: every session, their names and their list are copies (crate::rcu); a session's figures
 # (attached, active, size, title, end) are atomics and copies beside it.
+
+# Conversation stores' mirrors: each feed and the runner process it goes to are read lock-free (crate::rcu,
+# arc-swap); which runners keep a copy is chosen under a lock as runners connect (goal 5, plan 01a1a59c2aae,
+# its top goal).
+
+[[allowed]]
+at = "crates/kiln/src/convo/mirror.rs"
+name = "use"
+why = "imports the mirrors' choice's lock (chosen, below)"
+
+[[allowed]]
+at = "crates/kiln/src/convo/mirror.rs"
+name = "chosen"
+why = "which runners keep a copy of the conversation store: taken as runners connect or go and the mirrors are picked again (Mirrors::connected, from the hub's mirrors_seen), by telemetry (the stores page, GET /api/conversations/mirrors) and once at start (chosen_machines). Never for a message: a mirror's word (heard), a feed's part and a batch's hand-on read the feeds and their runner processes lock-free. It also keeps feeds being made and let go of to one caller at a time"
 
 [[allowed]]
 at = "crates/kiln/src/termsess.rs"
@@ -224,7 +240,7 @@ why = "imports a terminal session's screen's lock (state, below)"
 [[allowed]]
 at = "crates/kiln/src/termsess.rs"
 name = "state"
-why = "one per terminal session, its screen and backlog: its relay takes it for its output, in order, and its own viewers as they attach or resize it, so a replay and the live output meet with no byte twice or lost; another session's, the list's reads, keystrokes and detaches never take it"
+why = "one per terminal session, its screen and backlog. Per output frame one task alone takes it: the session's relay on the server (output, finish), or on a runner the pump of the PTY a Session::detached mirrors. A viewer takes it only as it attaches (its replay and its live feed made together, so they meet with no byte twice or lost) or resizes the terminal (a person's act, the size in order with the output); keystrokes, detaches, the list's reads and other sessions never do. Not made an owner with messages (goal 5, plan 01a1a59c2aae, its top goal), as that changes behaviour: attach() answers at once at its 14 call sites (the API's terminal sockets, accounts, fleet, updates, CD's logs, a runner's own terminals), and through an owner each would wait for the relay's turn, behind up to a full relay of output (4,096 frames, termsess::RELAY) and the relay's own waits (a replay asked of the runner, each keystroke's command); and a Session::detached has no task to own it. Goal 5's census of train 8's tree on fedora (3 calm rounds and 3 with hogs, production's layout): none of kiln's own locks waited, this one among them"
 
 # The live channel's link (docs/wire.md; the ACK/NACK work, 2232eb69457): which runners keep the channel,
 # and what each runner's receivers have of each stream, are copies (crate::rcu).
