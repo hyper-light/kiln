@@ -267,7 +267,9 @@ struct Poller {
 #[repr(C)]
 struct Core {
     // First: what a poll, a batch and the input read's test read.
-    tasks: Box<[TaskSlot]>,
+    /// A record for each task slot the desk has made, made as its slot is first asked for (kiln's goal 11:
+    /// room for the shard's task bound is taken as it's built, its pages written only as records are made).
+    tasks: Vec<TaskSlot>,
     /// The configured poll count a step's batch may make (`config.batch`, at least one), kept here so a
     /// batch reads it from the first line rather than from the configuration's.
     batch: usize,
@@ -362,7 +364,7 @@ impl Drop for Shard {
         // actual unwind permits this exceptional classification; ordinary missing
         // ownership is never silently treated as completed service cleanup.
         if std::thread::panicking() {
-            for index in 0..self.core.tasks.len() {
+            for index in 0..self.desk.tasks.made() {
                 let Ok(slot) = u32::try_from(index) else {
                     continue;
                 };
@@ -430,9 +432,7 @@ impl Shard {
         }
         let now_ns = driver.now_ns();
         let core = Core {
-            tasks: (0..config.tasks_per_shard)
-                .map(|_| TaskSlot::empty())
-                .collect(),
+            tasks: Vec::with_capacity(config.tasks_per_shard),
             timers: Wheel::new(config.timer_tick_ns, config.timers_per_shard, now_ns),
             fired: Vec::with_capacity(config.timers_per_shard),
             completions: Vec::with_capacity(config.ring_entries),
@@ -1447,7 +1447,7 @@ impl Shard {
     /// invoking step recursively, or waiting for a receiver. Service ownership and
     /// any hard parent's live service children remain until their own Ready.
     fn finish_hard_cancelled(&mut self) {
-        for index in 0..self.core.tasks.len() {
+        for index in 0..self.desk.tasks.made() {
             let Ok(slot) = u32::try_from(index) else {
                 break;
             };
@@ -2289,7 +2289,7 @@ impl Shard {
     }
 
     fn task_mut(&mut self, slot: u32) -> Option<&mut TaskSlot> {
-        self.core.tasks.get_mut(usize::try_from(slot).ok()?)
+        slot_mut(&mut self.core.tasks, slot)
     }
 }
 
@@ -2319,11 +2319,21 @@ pub(crate) fn count(counter: &std::cell::Cell<u64>, by: u64) {
     counter.set(counter.get().saturating_add(by));
 }
 
-fn slot_mut(tasks: &mut [TaskSlot], slot: u32) -> Option<&mut TaskSlot> {
-    tasks.get_mut(usize::try_from(slot).ok()?)
+/// Slot `slot`'s record, made as it's first asked for (kiln's goal 11): every slot below the last asked has its
+/// record (an empty one for a slot never installed), as every slot had one when they were all made up front.
+/// The room taken as the shard was built is its bound: nothing past it is made, nor moved.
+fn slot_mut(tasks: &mut Vec<TaskSlot>, slot: u32) -> Option<&mut TaskSlot> {
+    let index = usize::try_from(slot).ok()?;
+    if index >= tasks.len() {
+        if index >= tasks.capacity() {
+            return None;
+        }
+        tasks.resize_with(index.checked_add(1)?, TaskSlot::empty);
+    }
+    tasks.get_mut(index)
 }
 
-fn link_child(tasks: &mut [TaskSlot], parent: u32, child: u32) {
+fn link_child(tasks: &mut Vec<TaskSlot>, parent: u32, child: u32) {
     let old_first = match slot_mut(tasks, parent) {
         Some(p) => {
             let old = p.first_child;
@@ -2344,7 +2354,7 @@ fn link_child(tasks: &mut [TaskSlot], parent: u32, child: u32) {
     }
 }
 
-fn unlink_child(tasks: &mut [TaskSlot], parent: u32, child: u32) {
+fn unlink_child(tasks: &mut Vec<TaskSlot>, parent: u32, child: u32) {
     let (prev, next) = match slot_mut(tasks, child) {
         Some(c) => {
             let links = (c.prev_sibling, c.next_sibling);
