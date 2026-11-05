@@ -2,7 +2,7 @@
 
 On a machine where kiln's server runs beside its own work, the server comes first: it runs at the
 most CPU weight, and CI legs and agents below it, each in a group of its own at the least weight
-(Linux), under background policy (macOS) or below normal (Windows); headroom slows them when the
+(Linux), below normal (macOS: nice 10, on every core; Windows); headroom slows them when the
 server's own delay rises; and the server can be given cores of its own. This is plan 01a1a59c2b29
 (goal 8) and the CPU-priority part of plan 01a19617's step 10. It
 joins `docs/baremetal.md` (the bare-metal design, on its own branch until it lands) as that lands:
@@ -75,10 +75,24 @@ settings of its own under cgroup v2 (f22). A microVM deployment's VMM runs as th
 
 The server's launchd job (a LaunchDaemon installed system-wide, else a LaunchAgent) runs with
 `ProcessType` `Interactive`: no limits for its purpose, as an app has none. Left unset, launchd
-throttles a job's CPU and I/O (f25). Each agent's harness and each CI step starts under background
-policy, `setpriority(PRIO_DARWIN_PROCESS, 0, PRIO_DARWIN_BG)` between fork and exec, as `taskpolicy
--b` runs a program: lower CPU priority and throttled disk and network I/O, inherited by everything
-it starts (f26). A step on a pty is put there as it starts.
+throttles a job's CPU and I/O (f25). Each agent's harness and each CI step starts below normal,
+nice 10 (`setpriority(PRIO_PROCESS, 0, 10)` between fork and exec), inherited by everything it
+starts. A step on a pty is put there as it starts.
+
+Not under Darwin background policy (`PRIO_DARWIN_BG`, `taskpolicy -b`, f26), as they did until
+2026-11-05: Apple silicon runs background work on its efficiency cores alone and throttles its disk
+and network I/O, so an agent's builds and measurements had a fraction of the machine. Agents moved
+their work where that didn't reach: a Windows VM and its measurements as launchd jobs of their own,
+builds in Docker's VM. Neither was anything kiln knew of the agent when that Mac's memory ran out
+and it panicked (no response from userspace for 93 s). Below normal, agents' work has every core the
+server and a person's work aren't using; headroom slows it when the server's delay, a message's
+delivery or memory says so.
+
+What an agent starts through launchd (`launchctl bootstrap`, `load`, `submit`, `start` or
+`kickstart` run by one of its processes) is the agent's too: the runner reads each `launchctl` an
+agent's process runs and the label of each property list it names, follows the job's process as the
+agent's whenever launchd runs one (headroom paces it with the agent's, at the agent's priority), and
+boots the job out when the agent ends.
 
 ## Windows
 
@@ -238,8 +252,8 @@ With `[server] cores`, kiln keeps its own legs and agents off the server's cores
     everything the server starts is in its slice. It says so; a runner of its own beside the server keeps them
     off (`[local_agent] enabled = false`, and `kiln install --agent`).
 - **macOS and Windows:** nothing changes, as a server has no cores of its own there. macOS has no CPU affinity
-  for a process, and its legs and agents already run under background policy, which Apple silicon runs on its
-  efficiency cores; on Windows they run below normal, and its scheduler preempts them at once for the server.
+  for a process, and its legs and agents run below normal, so its scheduler runs the server first on any
+  core; on Windows they run below normal, and its scheduler preempts them at once for the server.
 
 ## A real-time class for the shards
 
@@ -550,8 +564,13 @@ kiln-server alarm at 204 s, so cut no CPU. headroom.md's "Simulation" runs this 
   its weights and cores, `ProcessType` `Interactive` for the server's launchd job, and
   `systemd-analyze verify` finding nothing against them.
 - `os::contain::tests::g8_s3_an_agents_processes_run_under_background_policy` (macOS): an agent's
-  harness and what it starts under background policy, their scheduling priority (`ps`) below a
-  plain process's; a person's run not; a running process put there.
+  harness and what it starts run below normal, their scheduling priority (`ps`) below a plain
+  process's; a person's run doesn't; a step on a pty is put there as it runs.
+- `os::contain::tests::what_an_agent_starts_through_launchd_is_followed_as_its` (macOS): a launchd
+  job an agent's script bootstraps from a relative property list is followed as the agent's, below
+  normal, and ending the agent boots it out.
+- `os::contain::tests::what_launchctl_starts_is_read_from_its_arguments` (macOS): `bootstrap`,
+  `load`, `submit`, `start` and `kickstart`.
 - `os::contain::tests::g8_s4_an_agents_job_runs_below_normal_at_the_least_weight` and
   `g8_s4_the_server_runs_above_normal` (Windows): an agent's job's priority class and CPU rate
   control read back, cmd and its child below normal, the first process's memory and I/O priority;
