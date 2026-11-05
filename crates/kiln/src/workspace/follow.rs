@@ -38,6 +38,9 @@ const EXCERPT_LINES: usize = 40;
 /// Failed legs an agent is told about by name.
 const LEGS_NAMED: usize = 8;
 
+/// The kinds of kiln's events [`follow_loop`] follows: review's, CI's and the land queue's.
+const FOLLOWS: [&str; 5] = ["comment", "review", "diff_run", "queue", "landed"];
+
 /// Follows review, CI and land queue events for the agents whose changes they are, for as long as
 /// the server runs.
 pub async fn follow_loop(hub: Arc<Hub>) -> anyhow::Result<()> {
@@ -48,9 +51,14 @@ pub async fn follow_loop(hub: Arc<Hub>) -> anyhow::Result<()> {
             () = hub.shutdown.cancelled().fuse() => return Ok(()),
             m = rx.recv().fuse() => match m {
                 Ok(text) => {
+                    // Only the kinds it follows are parsed: the rest, every agent session's change of its
+                    // info among them, are passed over by their front (goal 4, plan 01a1a59c2a9c step 5).
+                    if !crate::wire::events::is_one_of(&text, &FOLLOWS) {
+                        continue;
+                    }
                     let v: Value = serde_json::from_str(&text).unwrap_or(Value::Null);
                     let kind = v.get("type").and_then(Value::as_str).unwrap_or_default();
-                    if matches!(kind, "comment" | "review" | "diff_run" | "queue" | "landed") {
+                    if FOLLOWS.contains(&kind) {
                         heard(&hub, kind, &v).await;
                     }
                 }
@@ -480,6 +488,18 @@ async fn checks_text(hub: &Hub, r: &Record, v: &Value) -> String {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    /// Goal 4, plan 01a1a59c2a9c step 5: the agents' changes' follower reads the kinds it follows and passes
+    /// over the rest by their front, an agent session's info change among them.
+    #[test]
+    fn g4_s5_the_follower_reads_only_the_kinds_it_follows() -> anyhow::Result<()> {
+        use crate::wire::events::{ServerEvent, is_one_of};
+        anyhow::ensure!(!is_one_of(&crate::wire::events::harness_frame(&serde_json::to_vec(&crate::harness::session::Info { id: "s".into(), kind: "claude".into(), ..Default::default() })?).to_string(), &FOLLOWS) && !is_one_of(&ServerEvent::Terminals.text(), &FOLLOWS));
+        for text in [ServerEvent::Comment(Box::default()).text(), ServerEvent::Queue(crate::wire::events::Queue::Counts { queued: 1, running: 0 }).text(), r#"{"type":"landed","repo":"r"}"#.to_owned()] {
+            anyhow::ensure!(is_one_of(&text, &FOLLOWS), "{text}");
+        }
+        Ok(())
+    }
 
     fn record() -> Record {
         Record { agent: "0192abcd00000000000000000000beef".into(), change: Some("CR12".into()), url: "https://k/diffs/CR12".into(), version: 3, fix_checks: true, ..Record::default() }
