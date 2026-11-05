@@ -470,6 +470,65 @@ pub struct Snapshot {
     pub(super) store: Option<(crate::convo::store::Store, Arc<str>)>,
 }
 
+/// A whole snapshot's events at the most: as many as a copy keeps before it lets its oldest go
+/// (`MAX_EVENTS` and a quarter: `super::copies::Mirror::upsert`), at the packed size an event measured
+/// (`super::copies::PACKED_EVENT_BYTES`, research f20), 3.2 MB (goal 11, plan 01a1a87b2e56 step 3).
+const SNAPSHOT_BYTES: usize = (super::core::MAX_EVENTS + super::core::MAX_EVENTS / 4) * super::copies::PACKED_EVENT_BYTES;
+
+/// The room of viewers' snapshots in flight, made and not yet written to their sockets
+/// (`crate::memory::SNAPSHOTS`; goal 11, plan 01a1a87b2e56 step 3): as many as the blocking pool makes at
+/// once (its `fs` share's places, which the server's profile takes from the lab's measure,
+/// `crate::rt::SERVER_FS`: 26), each a whole snapshot's events at the most ([`SNAPSHOT_BYTES`]), 84 MB on
+/// the server. At the bound an attach waits its turn ([`InFlight::take`]: a task's wait, its shard goes on
+/// with its other work) until one in flight is written out; one larger than the room goes alone.
+pub fn snapshot_room() -> &'static crate::memory::queue::Room {
+    static ROOM: std::sync::OnceLock<crate::memory::queue::Room> = std::sync::OnceLock::new();
+    ROOM.get_or_init(|| crate::memory::queue::Room::new(&crate::memory::SNAPSHOTS, snapshot_bound(crate::rt::profile().pool.2)))
+}
+
+/// The room of snapshots in flight for a blocking pool whose `fs` share has `places`.
+fn snapshot_bound(places: usize) -> usize {
+    places.max(1).saturating_mul(SNAPSHOT_BYTES)
+}
+
+/// A snapshot's bytes taken of a room of snapshots in flight ([`snapshot_room`]): what's left of them given
+/// back as it goes, however it ends (written, an error, a socket gone).
+pub struct InFlight {
+    room: &'static crate::memory::queue::Room,
+    bytes: usize,
+}
+
+impl InFlight {
+    /// `bytes` of `room`, waiting for them to fit (a task's wait): none taken once it's closed.
+    pub async fn take(room: &'static crate::memory::queue::Room, bytes: usize) -> Self {
+        let bytes = if room.take(bytes).await { bytes } else { 0 };
+        Self { room, bytes }
+    }
+
+    /// The snapshot as it was made, `n` bytes: the room holds that, not the guess it was taken by (more taken
+    /// whatever the room holds then, as it's made already; or what wasn't needed given back).
+    pub fn made(&mut self, n: usize) {
+        match n.checked_sub(self.bytes) {
+            Some(more) => self.room.force(more),
+            None => self.room.give(self.bytes.saturating_sub(n)),
+        }
+        self.bytes = n;
+    }
+
+    /// `n` of its bytes written to the socket: given back now.
+    pub fn written(&mut self, n: usize) {
+        let n = n.min(self.bytes);
+        self.room.give(n);
+        self.bytes = self.bytes.saturating_sub(n);
+    }
+}
+
+impl Drop for InFlight {
+    fn drop(&mut self) {
+        self.room.give(self.bytes);
+    }
+}
+
 /// One of a snapshot's frames, in the order they go: its head (`open` or `resumed`), its meta,
 /// state, changes and kept files, then its events: a whole snapshot's a chunk of the copy's at a time
 /// (`super::copies::Chunk`, each packed once: `super::packed`), a catch-up's those it brings a batch at
@@ -493,6 +552,25 @@ struct Plan {
 }
 
 impl Snapshot {
+    /// About the bytes it takes made, `packed` as one message or as frames: what it takes of the room of
+    /// snapshots in flight before it's made ([`snapshot_room`]; [`InFlight::made`] counts it as it was made).
+    /// Packed, each chunk's segment as it's kept (in memory or spilled) and a quarter of the texts of one
+    /// that isn't packed (deflate's ratio on them), beside the other frames whole.
+    pub fn weight(&self, packed: bool) -> usize {
+        let p = &self.parts;
+        let frames = p.meta_bytes.saturating_add(p.state_bytes).saturating_add(self.files.as_ref().map_or(0, String::len));
+        let events = p.events.chunks().iter().map(|c| {
+            let texts = c.metas().last().map_or(0, |m| m.off + m.len);
+            match (packed, c.packed(), c.spilled_bytes()) {
+                (false, _, _) => texts,
+                (true, Some(s), _) => s.deflated.len(),
+                (true, None, Some(n)) => n,
+                (true, None, None) => texts / 4,
+            }
+        });
+        events.fold(frames, usize::saturating_add)
+    }
+
     /// Its frames, in order. The events it brings are all of them, a frame for each of the copy's
     /// chunks (goal 10, plan 01a1a87b2dae step 3: each chunk's frame is packed once, then taken as it
     /// is), or those changed since its revision, in batches of about [`EVENTS_FRAME`] bytes each (one
@@ -1244,6 +1322,9 @@ impl Registry {
         if let Err(e) = sessions.spill_to(&dir.join("spill")) {
             tracing::warn!(error = %e, "the session copies' spill folder couldn't be made: their sealed chunks stay in memory");
         }
+        // The room of viewers' snapshots in flight made now, so /metrics says its bound from the start (goal 11,
+        // plan 01a1a87b2e56 step 3).
+        let _ = snapshot_room();
         Self {
             sessions,
             bus,
@@ -4763,5 +4844,61 @@ mod tests {
             anyhow::ensure!(turns >= 1, "the update's turns: {turns}");
             Ok(())
         })
+    }
+
+    /// Goal 11, plan 01a1a87b2e56 step 3: snapshots in flight hold at most their room: one past it waits its
+    /// turn until one in flight is written out; each holds what it was made at, given back as it's written
+    /// and the rest as it goes; one larger than the room goes alone into an empty one. The server's room is
+    /// its blocking pool's `fs` places of whole snapshots.
+    #[test]
+    fn g11_s3_snapshots_past_their_room_wait_their_turn() -> anyhow::Result<()> {
+        crate::rt::block_on(async {
+            static ROOM: std::sync::OnceLock<crate::memory::queue::Room> = std::sync::OnceLock::new();
+            let room = ROOM.get_or_init(|| crate::memory::queue::Room::new(&crate::memory::SNAPSHOTS, 1000));
+            let mut first = InFlight::take(room, 800).await;
+            anyhow::ensure!(room.held() == 800);
+            let went = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let next = {
+                let went = Arc::clone(&went);
+                crate::rt::spawn(async move {
+                    let held = InFlight::take(room, 300).await;
+                    went.store(true, std::sync::atomic::Ordering::SeqCst);
+                    held
+                })
+            };
+            crate::rt::sleep(std::time::Duration::from_millis(50)).await;
+            anyhow::ensure!(!went.load(std::sync::atomic::Ordering::SeqCst), "past the room, it waits");
+            first.made(900);
+            anyhow::ensure!(room.held() == 900, "made, it holds what it was made at");
+            first.written(600);
+            let next = next.await.map_err(|_| anyhow::anyhow!("the next never went"))?;
+            anyhow::ensure!(went.load(std::sync::atomic::Ordering::SeqCst) && room.held() == 600, "its turn once there was room: {}", room.held());
+            drop((first, next));
+            anyhow::ensure!(room.held() == 0, "the rest given back as each goes");
+            let alone = InFlight::take(room, 5000).await;
+            anyhow::ensure!(room.held() == 5000, "larger than the room, alone");
+            drop(alone);
+            anyhow::ensure!(snapshot_bound(26) == 26 * SNAPSHOT_BYTES && SNAPSHOT_BYTES == 5000 * 647, "the server's: its fs places of whole snapshots");
+            Ok(())
+        })
+    }
+
+    /// Goal 11, plan 01a1a87b2e56 step 3: a snapshot's weight, what it takes of the room before it's made, is
+    /// its chunks' segments as they're kept (and a quarter of the texts of one not packed) packed, and their
+    /// texts as frames, beside its other frames.
+    #[test]
+    fn g11_s3_a_snapshots_weight_is_its_segments_packed_and_its_texts_as_frames() -> anyhow::Result<()> {
+        let mut m = super::super::copies::Mirror::new(Info { id: "s".into(), ..Info::default() }, Location::Local, Arc::new(kiln_seams::bus::SimBus::default()));
+        for q in 1..=300u64 {
+            m.rev = q;
+            m.upsert(Arc::new(Entry::new(json!({"id": format!("e{q}"), "seq": q, "kind": "assistant", "text": format!("line {q} of what was said")}))));
+        }
+        let parts = m.view().parts();
+        let segments: usize = parts.events.chunks().iter().filter(|c| c.is_full()).filter_map(|c| c.pack().ok().map(|s| s.deflated.len())).sum();
+        let texts: usize = parts.events.chunks().iter().map(|c| c.metas().last().map_or(0, |m| m.off + m.len)).sum();
+        let s = Snapshot { parts: m.view().parts(), files: None, store: None };
+        anyhow::ensure!(s.weight(false) == texts, "as frames, its texts: {} of {texts}", s.weight(false));
+        anyhow::ensure!(s.weight(true) >= segments && s.weight(true) < texts, "packed, its segments: {} of {segments}", s.weight(true));
+        Ok(())
     }
 }

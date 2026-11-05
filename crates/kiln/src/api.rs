@@ -6190,16 +6190,18 @@ fn pieces(bytes: Vec<u8>) -> impl Iterator<Item = ws::Message> {
 /// server for each of its CPUs, and the frames its viewer waits on with it 4.7 times (goal 4's lab,
 /// plan 01a1a59c2a9c step 5).
 async fn send_snapshot(tx: &mut ws::Sender, snapshot: crate::harness::registry::Snapshot, packed: bool) -> anyhow::Result<()> {
-    // What's made and not yet handed to the socket is counted as the snapshots' (`crate::memory::SNAPSHOTS`;
-    // goal 11, plan 01a1a87b2e56 step 3): a packed one until its last piece goes (its pieces share its
-    // buffer), frames as each goes.
+    // Room in the snapshots in flight first (`crate::harness::registry::snapshot_room`; goal 11, plan
+    // 01a1a87b2e56 step 3): past it this attach waits its turn, until one in flight is written out. Made, it's
+    // counted as it is, until handed to the socket: a packed one until its last piece goes (its pieces share
+    // its buffer), frames as each goes.
     // Between its pieces the shard goes to its other tasks once this one has had its share of it
     // (`crate::rt::consume_budget`): a socket that takes each piece at once never made it wait, and a long
     // session's megabytes went out in one poll, holding its shard's other viewers, owners and requests
     // 4.4 ms at the most in rt5's calm lab and 8.6 ms with shedding on (goal 10, plan 01a1a87b2dae step 5).
+    let mut held = crate::harness::registry::InFlight::take(crate::harness::registry::snapshot_room(), snapshot.weight(packed)).await;
     if packed {
         let bytes = crate::rt::blocking(move || snapshot.packed(&synced())).await??;
-        let _held = crate::memory::SNAPSHOTS.hold(bytes.capacity());
+        held.made(bytes.capacity());
         for piece in pieces(bytes) {
             tx.send(piece).await?;
             crate::rt::consume_budget().await;
@@ -6207,11 +6209,11 @@ async fn send_snapshot(tx: &mut ws::Sender, snapshot: crate::harness::registry::
         return Ok(());
     }
     let frames = crate::rt::blocking(move || snapshot.frames()).await?;
-    let mut held = crate::memory::SNAPSHOTS.hold(frames.iter().map(String::capacity).sum());
+    held.made(frames.iter().map(String::capacity).fold(0usize, usize::saturating_add));
     for f in frames {
         let n = f.capacity();
         tx.send(ws::text(f)).await?;
-        held.release(n);
+        held.written(n);
         crate::rt::consume_budget().await;
     }
     tx.send(ws::text(synced())).await?;

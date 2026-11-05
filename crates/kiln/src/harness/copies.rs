@@ -60,6 +60,29 @@ const CHUNK: usize = (MAX_EVENTS + MAX_EVENTS / 4).isqrt();
 /// a copy keeps its index, its open chunk and the chunks among these (two at the most, of [`CHUNK`]).
 pub const EVENTS_PAGE: usize = 100;
 
+/// The packed bytes an event measured (research f20: a 20,000-event session's copy kept 4,640 events packed
+/// in 3.00 MB, 647 bytes each): what the bounds of what's packed are reckoned in (goal 11, plan 01a1a87b2e56
+/// step 3).
+pub const PACKED_EVENT_BYTES: usize = 647;
+
+/// The most of its packed segments a copy keeps in memory once its spills land (goal 11, plan 01a1a87b2e56
+/// step 3): the sealed chunks among its newest [`EVENTS_PAGE`] events, two at the most (the open chunk holds
+/// at least one of those events), at the packed size an event measured: 2 × [`CHUNK`] × [`PACKED_EVENT_BYTES`],
+/// 90,580 bytes. Chunks of larger events than that past it are spilled too, the newest page or not (the
+/// events API then reads that copy's page from the store), so `session_segments` holds at most this for each
+/// copy ([`segments_bound`]), beside what's still on its way to a spill: a copy's one spill in flight, the
+/// packer's backlog, and the views a snapshot being made still holds.
+pub const PAGE_BYTES: usize = 2 * CHUNK * PACKED_EVENT_BYTES;
+
+/// Session copies there are (a copy made, less one let go of): what `session_segments`' bound is reckoned for.
+static COPIES: AtomicUsize = AtomicUsize::new(0);
+
+/// `session_segments`' bound on `/metrics` (`kiln_memory_bound_bytes{owner="session_segments"}`): [`PAGE_BYTES`]
+/// for each copy there is.
+pub fn segments_bound() -> u64 {
+    u64::try_from(COPIES.load(Ordering::Relaxed).saturating_mul(PAGE_BYTES)).unwrap_or(u64::MAX)
+}
+
 /// What a reader needs of one of a copy's events without its text: its id and number, the copy's
 /// revision when it last changed, where its text is among its chunk's texts joined by `,` (as an
 /// `events` frame joins them), and its text's digest (`crate::wire::sums::event_text`). Numbering,
@@ -242,6 +265,11 @@ impl Chunk {
     /// Whether its segment is on disk (`super::spill`), not in memory.
     pub fn is_spilled(&self) -> bool {
         self.spilled.is_some()
+    }
+
+    /// Its segment's bytes on disk, once spilled.
+    pub fn spilled_bytes(&self) -> Option<usize> {
+        self.spilled.as_ref().map(super::spill::Spilled::bytes)
     }
 
     /// It spilled: its metas, and where its segment went (`s`). None unless it's compact with its segment in
@@ -604,14 +632,23 @@ impl Events {
         }
     }
 
-    /// Its sealed chunks past its newest `page` events that are packed and in memory: what its copy's owner
-    /// spills (`super::spill`), oldest first.
-    pub(super) fn spillable(&self, page: usize) -> Vec<Arc<Chunk>> {
-        let mut after = 0usize;
+    /// Its sealed chunks that are packed and in memory past its newest `page` events, and those among them
+    /// past the first `bytes` of segments they keep (counted from the newest): what its copy's owner spills
+    /// (`super::spill`), oldest first.
+    pub(super) fn spillable(&self, page: usize, bytes: usize) -> Vec<Arc<Chunk>> {
+        let (mut after, mut kept) = (0usize, 0usize);
         let mut out = Vec::new();
         for c in self.chunks.iter().rev() {
-            if after >= page && c.is_compact() && !c.is_spilled() && c.packed().is_some() {
-                out.push(Arc::clone(c));
+            if c.is_compact()
+                && !c.is_spilled()
+                && let Some(s) = c.packed()
+            {
+                let with = kept.saturating_add(s.deflated.len());
+                if after < page && with <= bytes {
+                    kept = with;
+                } else {
+                    out.push(Arc::clone(c));
+                }
             }
             after = after.saturating_add(c.len());
         }
@@ -1009,6 +1046,15 @@ pub struct Mirror {
     spill_refused: bool,
 }
 
+impl Drop for Mirror {
+    fn drop(&mut self) {
+        let mut now = COPIES.load(Ordering::Relaxed);
+        while let Err(seen) = COPIES.compare_exchange_weak(now, now.saturating_sub(1), Ordering::Relaxed, Ordering::Relaxed) {
+            now = seen;
+        }
+    }
+}
+
 /// An info as the API answers with it: `serde_json`'s compact form (what `srv::json` wrote of it).
 fn info_json(info: &Info) -> Bytes {
     serde_json::to_vec(info).map_or_else(|_| Bytes::from_static(b"null"), Bytes::from)
@@ -1042,6 +1088,7 @@ impl Mirror {
         };
         let slot = Arc::new(Slot { id: Arc::from(info.id.as_str()), view: ArcSwap::from_pointee(view), tap: feed.tap() });
         let encoding = (Arc::clone(&info), encoded);
+        COPIES.fetch_add(1, Ordering::Relaxed);
         Self {
             info,
             reported: String::new(),
@@ -1086,7 +1133,7 @@ impl Mirror {
         if self.spilling || !crate::rt::on_shard() {
             return;
         }
-        let chunks = self.events.spillable(EVENTS_PAGE);
+        let chunks = self.events.spillable(EVENTS_PAGE, PAGE_BYTES);
         let segments: Vec<Arc<Segment>> = chunks.iter().filter_map(|c| c.packed().cloned()).collect();
         if chunks.is_empty() || segments.len() != chunks.len() {
             return;
@@ -2163,7 +2210,7 @@ mod tests {
         let before = attached(&m)?;
         let newest = m.view().events_json(None, 50);
         anyhow::ensure!(newest.is_some(), "the newest page from memory");
-        let chunks = m.events.spillable(EVENTS_PAGE);
+        let chunks = m.events.spillable(EVENTS_PAGE, PAGE_BYTES);
         anyhow::ensure!(chunks.len() == 4, "{} chunks past the newest page", chunks.len());
         let segments: Vec<Arc<Segment>> = chunks.iter().filter_map(|c| c.packed().cloned()).collect();
         let held = SEGMENT_BYTES.load(Ordering::Relaxed);
@@ -2211,7 +2258,7 @@ mod tests {
         }
         m.events.compact(None);
         let before = super::super::registry::Snapshot { parts: m.view().parts(), files: None, store: None }.frames();
-        let chunks = m.events.spillable(EVENTS_PAGE);
+        let chunks = m.events.spillable(EVENTS_PAGE, PAGE_BYTES);
         let segments: Vec<Arc<Segment>> = chunks.iter().filter_map(|c| c.packed().cloned()).collect();
         let (_file, spilled) = super::super::spill::write(&dir, None, "s", &segments)?;
         anyhow::ensure!(m.events.spilled(&chunks, spilled) == 4);
@@ -2294,6 +2341,58 @@ mod tests {
             }
             Ok(())
         })
+    }
+
+    /// Goal 11, plan 01a1a87b2e56 step 3: once its spills land a copy keeps at most [`PAGE_BYTES`] of segments
+    /// in memory: the sealed chunks among its newest page while they fit (two of events the lab's size), and of
+    /// events too large for two chunks of them to fit, those past it spilled as well; `session_segments`' bound
+    /// counts each copy.
+    #[test]
+    fn g11_s3_a_copy_keeps_its_page_bytes_of_segments_at_most() -> anyhow::Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let dir = super::super::spill::Dir::open(&tmp.path().join("spill"))?;
+        let resident = |m: &Mirror| m.events.chunks().iter().filter(|c| !c.is_spilled()).filter_map(|c| c.packed()).map(|s| s.deflated.len()).sum::<usize>();
+        let spill = |m: &mut Mirror| -> anyhow::Result<usize> {
+            for c in m.events.chunks().iter().filter(|c| c.is_full()) {
+                c.pack()?;
+            }
+            m.events.compact(None);
+            let chunks = m.events.spillable(EVENTS_PAGE, PAGE_BYTES);
+            let segments: Vec<Arc<Segment>> = chunks.iter().filter_map(|c| c.packed().cloned()).collect();
+            let (_file, spilled) = super::super::spill::write(&dir, None, &m.info.id, &segments)?;
+            Ok(m.events.spilled(&chunks, spilled))
+        };
+        // Events the lab's size: the two sealed chunks among the newest page stay.
+        let mut small = Mirror::new(Info { id: "small".into(), ..Info::default() }, Location::Local, sim_bus());
+        for q in 1..=u64::try_from(CHUNK * 6 + 9)? {
+            small.rev = q;
+            small.upsert(entry(&format!("e{q}"), q));
+        }
+        anyhow::ensure!(spill(&mut small)? == 4, "past the newest page");
+        anyhow::ensure!(small.events.chunks().iter().filter(|c| c.is_compact() && !c.is_spilled()).count() == 2, "the newest page's two stay");
+        anyhow::ensure!(resident(&small) <= PAGE_BYTES, "{} resident", resident(&small));
+        // Events of 1,500 bytes that don't compress: two chunks of them are past PAGE_BYTES.
+        let mut x = 0x2545_f491_4f6c_dd1d_u64;
+        let mut noise = |n: usize| -> String {
+            (0..n)
+                .map(|_| {
+                    x ^= x << 13;
+                    x ^= x >> 7;
+                    x ^= x << 17;
+                    char::from(b"0123456789abcdef".get(usize::try_from(x & 15).unwrap_or(0)).copied().unwrap_or(b'0'))
+                })
+                .collect()
+        };
+        let mut large = Mirror::new(Info { id: "large".into(), ..Info::default() }, Location::Local, sim_bus());
+        for q in 1..=u64::try_from(CHUNK * 4 + 9)? {
+            large.rev = q;
+            large.upsert(Arc::new(Entry::new(json!({"id": format!("e{q}"), "seq": q, "kind": "assistant", "text": noise(1500)}))));
+        }
+        spill(&mut large)?;
+        anyhow::ensure!(resident(&large) <= PAGE_BYTES, "{} resident of large events", resident(&large));
+        anyhow::ensure!(large.events.chunks().iter().rev().skip(1).take(2).any(|c| c.is_spilled()), "the newest page's too, past its bytes");
+        anyhow::ensure!(segments_bound() >= u64::try_from(2 * PAGE_BYTES)?, "both copies counted");
+        Ok(())
     }
 
     /// Each order of `owner` steps of the owner's and `viewer` steps of a viewer's, each keeping its
