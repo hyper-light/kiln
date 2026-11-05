@@ -29,6 +29,11 @@ use kiln_http::h3::driver::{Driver, Host};
 use kiln_http::h3::{Admit, Read};
 use kiln_http::{Incoming, TcpIo, service_fn};
 
+// Live heap bytes, counted across the process (the soak tells them apart from resident memory,
+// which an allocator's fragmentation also moves).
+#[global_allocator]
+static ALLOCATOR: hyper_measure::alloc::Counting = hyper_measure::alloc::Counting;
+
 /// Days from 1970-01-01 to a civil date (Howard Hinnant's algorithm).
 fn civil(days: i64) -> (i32, u8, u8) {
     let z = days + 719_468;
@@ -169,6 +174,18 @@ fn run() -> Result<(), String> {
         latency_objective_ns: None,
     };
     let runtime = Runtime::start(&cfg).map_err(|e| e.to_string())?;
+    if std::env::var_os("DOOR_LAB_LIVE").is_some() {
+        hyper_measure::alloc::begin_process();
+        let _ = std::thread::Builder::new().name("live".into()).spawn(|| {
+            let mut m = 0u64;
+            loop {
+                let c = hyper_measure::alloc::read_process();
+                println!("live: minute={m} live={} B peak={} B allocations={}", c.live, c.peak, c.allocations);
+                std::thread::sleep(std::time::Duration::from_secs(60));
+                m += 1;
+            }
+        });
+    }
     let holder = runtime.shard_ids().first().and_then(|id| runtime.holder_of(*id)).ok_or("no shard")?;
     let tickets = Arc::new(Mutex::new(BTreeSet::new()));
     let (done_tx, done_rx) = std::sync::mpsc::channel::<String>();
