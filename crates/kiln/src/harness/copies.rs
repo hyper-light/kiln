@@ -7,9 +7,11 @@
 //! newest view without a lock and never waits on the owner. No lock guards a session's copy
 //! (`no_lock_guards_session_copies` holds this module, `super::live` and the registry to it).
 //!
-//! An owner's inbox holds as many messages as the hub's queue of runner events
-//! ([`crate::net::EVENTS`]). A sender it has no room for waits, asynchronously (its shard goes on
-//! with its other tasks), until the owner takes the next one: nothing is dropped and the order holds.
+//! An owner's inbox holds as many bytes as the hub's queue of runner events
+//! ([`crate::net::EVENTS_BYTES`]; goal 11, plan 01a1a87b2e56 step 3: its messages counted by what they
+//! carry, [`crate::memory::queue`], its places made as it fills). A sender it has no room for waits,
+//! asynchronously (its shard goes on with its other tasks), until the owner takes enough: nothing is
+//! dropped and the order holds.
 //! The owner waits on nothing but its inbox, so it always drains it. Behind a full inbox the hub's
 //! loop waits, the net thread holds what it can't hand over, QUIC's flow control holds the runner,
 //! and the runner holds its states behind the last unanswered one (the newest in its place) and
@@ -748,7 +750,7 @@ pub struct Mirror {
     info_json: (Arc<Info>, Bytes),
     /// Its owner's inbox, held weakly (none until a shard takes it in): a chunk packed off the shard
     /// comes back through it to be kept compact (goal 11, plan 01a1a87b2e56 step 2).
-    owner: Option<async_channel::WeakSender<Msg>>,
+    owner: Option<crate::memory::queue::WeakSender<Msg>>,
 }
 
 /// An info as the API answers with it: `serde_json`'s compact form (what `srv::json` wrote of it).
@@ -759,7 +761,7 @@ fn info_json(info: &Info) -> Bytes {
 /// Where a packed chunk's copy is: its owner's inbox and its session, to keep it compact once packed.
 #[derive(Clone)]
 pub(super) struct Home {
-    inbox: async_channel::WeakSender<Msg>,
+    inbox: crate::memory::queue::WeakSender<Msg>,
     id: Arc<str>,
 }
 
@@ -1080,7 +1082,7 @@ impl Mirror {
 pub struct Shard {
     me: usize,
     /// Its own inbox, held weakly: what its copies' packed chunks come back through.
-    inbox: async_channel::WeakSender<Msg>,
+    inbox: crate::memory::queue::WeakSender<Msg>,
     mirrors: HashMap<String, Mirror>,
     boards: Arc<[ArcSwap<Board>]>,
     bus: Arc<dyn kiln_seams::Bus>,
@@ -1221,6 +1223,17 @@ pub enum Msg {
     Run(Job),
 }
 
+impl crate::memory::queue::Weigh for Msg {
+    /// Its place, and an update's ingest with the texts its update carries (`super::weigh`); a job's
+    /// closure as it's kept (what it captured, by value).
+    fn weight(&self) -> usize {
+        size_of::<Msg>().saturating_add(match self {
+            Msg::Update(i) => size_of::<Ingest>().saturating_add(i.id.len()).saturating_add(i.reported.len()).saturating_add(crate::memory::queue::Weigh::weight(&i.u)),
+            Msg::Run(job) => size_of_val(&**job),
+        })
+    }
+}
+
 /// The shard that owns session `id` among `shards`: FNV-1a over its id, so every process with as
 /// many shards puts it in the same place.
 pub fn owner_of(id: &str, shards: usize) -> usize {
@@ -1230,7 +1243,7 @@ pub fn owner_of(id: &str, shards: usize) -> usize {
 
 /// Every session's copy, each owned by one shard: where messages to them go, and what readers read.
 pub struct Copies {
-    inboxes: Vec<async_channel::Sender<Msg>>,
+    inboxes: Vec<crate::memory::queue::Sender<Msg>>,
     boards: Arc<[ArcSwap<Board>]>,
     /// The hub the owners act through (what a change tells the rest of kiln), once made.
     hub: Arc<OnceLock<Weak<Hub>>>,
@@ -1239,17 +1252,18 @@ pub struct Copies {
 impl Copies {
     /// An owner on each of the runtime's shards, its sessions' feeds on `bus`.
     pub fn start(bus: Arc<dyn kiln_seams::Bus>) -> Self {
-        Self::start_with(bus, crate::rt::shard_count().max(1), crate::net::EVENTS)
+        Self::start_with(bus, crate::rt::shard_count().max(1), crate::net::EVENTS_BYTES)
     }
 
-    /// `shards` owners (one a shard), each inbox holding `inbox` messages.
+    /// `shards` owners (one a shard), each inbox holding `inbox` bytes of messages (their places made as
+    /// it fills: `crate::memory::owners::SESSION_INBOXES`).
     pub fn start_with(bus: Arc<dyn kiln_seams::Bus>, shards: usize, inbox: usize) -> Self {
         let shards = shards.max(1);
         let boards: Arc<[ArcSwap<Board>]> = (0..shards).map(|_| ArcSwap::from_pointee(Board::new())).collect::<Vec<_>>().into();
         let hub = Arc::new(OnceLock::new());
         let mut inboxes = Vec::with_capacity(shards);
         for me in 0..shards {
-            let (tx, rx) = async_channel::bounded(inbox.max(1));
+            let (tx, rx) = crate::memory::queue::bounded(&crate::memory::owners::SESSION_INBOXES, inbox);
             let shard = Shard { me, inbox: tx.downgrade(), mirrors: HashMap::new(), boards: Arc::clone(&boards), bus: Arc::clone(&bus), board_changed: false };
             crate::rt::spawn_owner(me, own(shard, rx, Arc::clone(&hub)));
             inboxes.push(tx);
@@ -1371,7 +1385,7 @@ impl Copies {
 
 /// A shard's owner: its messages, in the order they came, as fast as they come, in bounded turns of
 /// its shard (the HTTP listener may share it). It waits on nothing but its inbox, and ends with it.
-async fn own(mut shard: Shard, rx: async_channel::Receiver<Msg>, hub: Arc<OnceLock<Weak<Hub>>>) {
+async fn own(mut shard: Shard, rx: crate::memory::queue::Receiver<Msg>, hub: Arc<OnceLock<Weak<Hub>>>) {
     let mut turns = crate::rt::Turns::new();
     while let Ok(msg) = rx.recv().await {
         // The hub, once a turn: what each change tells the rest of kiln goes through it.
@@ -1392,6 +1406,10 @@ mod tests {
     use serde_json::json;
 
     use super::*;
+
+    /// About one of these tests' messages, in an inbox's bytes (goal 11, plan 01a1a87b2e56 step 3): its
+    /// place, and a job's closure of a few captured words.
+    const MSG: usize = size_of::<Msg>() + crate::memory::queue::PLACE + 4 * size_of::<usize>();
 
     /// What a source file's code says outside its tests, its comments left out. Lines may end in
     /// CRLF, as a Windows checkout writes them (git's autocrlf): read as LF, or the tests' own
@@ -1705,7 +1723,7 @@ mod tests {
     #[test]
     fn a_reader_never_waits_on_a_busy_owner() -> anyhow::Result<()> {
         crate::rt::block_on(async {
-            let copies = Arc::new(Copies::start_with(sim_bus(), crate::rt::shard_count().max(1), 8));
+            let copies = Arc::new(Copies::start_with(sim_bus(), crate::rt::shard_count().max(1), 8 * MSG));
             let (bus, id) = (sim_bus(), "s1".to_owned());
             let info = Info { id: id.clone(), kind: "claude".into(), ..Info::default() };
             let i = id.clone();
@@ -1744,7 +1762,7 @@ mod tests {
         })
     }
 
-    /// Goal 4, plan 01a1a59c2a9c step 5: with every owner's inbox holding two messages and the owners
+    /// Goal 4, plan 01a1a59c2a9c step 5: with every owner's inbox holding about two messages and the owners
     /// held up (their shards busy), many senders on every shard each send their session's changes;
     /// they wait for room rather than drop any, and each session's copy takes every change once, in
     /// the order its sender sent them.
@@ -1752,7 +1770,7 @@ mod tests {
     fn changes_keep_their_order_and_none_is_lost_when_shards_are_busy() -> anyhow::Result<()> {
         crate::rt::block_on(async {
             let shards = crate::rt::shard_count().max(1);
-            let copies = Arc::new(Copies::start_with(sim_bus(), shards, 2));
+            let copies = Arc::new(Copies::start_with(sim_bus(), shards, 2 * MSG));
             let sessions: Vec<String> = (0..24).map(|n| format!("s{n}")).collect();
             for id in &sessions {
                 let (i, bus) = (id.clone(), sim_bus());
@@ -1814,7 +1832,7 @@ mod tests {
     #[test]
     fn readers_see_whole_views_and_never_go_back() -> anyhow::Result<()> {
         crate::rt::block_on(async {
-            let copies = Arc::new(Copies::start_with(sim_bus(), crate::rt::shard_count().max(1), 64));
+            let copies = Arc::new(Copies::start_with(sim_bus(), crate::rt::shard_count().max(1), 64 * MSG));
             let (id, bus) = ("s1".to_owned(), sim_bus());
             let info = Info { id: id.clone(), kind: "claude".into(), ..Info::default() };
             let i = id.clone();

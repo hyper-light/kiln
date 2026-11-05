@@ -492,7 +492,7 @@ pub enum Brings {
 /// The taking side: one thread takes what feeds send into a store, in the order each sent it, and
 /// hands back what to answer. The server's takes runners' stores; a mirror's takes the server's.
 pub struct Intake {
-    tx: std::sync::mpsc::SyncSender<(hyper_transport::PeerId, String, Msg, Vec<u8>)>,
+    tx: crate::memory::queue::Sender<Heard>,
     restores: std::sync::Arc<Restores>,
     peers: std::sync::Arc<Peers>,
     signs: Signs,
@@ -501,6 +501,31 @@ pub struct Intake {
 /// Where each store that feeds an intake stands, by its name among the store's peers
 /// ([`peer_name`]): for telemetry.
 type Peers = std::sync::Mutex<HashMap<String, PeerView>>;
+
+/// A feed's message as its intake's thread takes it: the link it came on, its machine, the message, and
+/// the bytes that came with it (a part of a batch).
+type Heard = (hyper_transport::PeerId, String, Msg, Vec<u8>);
+
+impl crate::memory::queue::Weigh for Heard {
+    /// Its place, its machine's and store's names, a batch's hand-on, and the bytes it carries: a batch's
+    /// part (up to [`PART`]) is all of it but those few names (a report's figures counted by its place).
+    fn weight(&self) -> usize {
+        let hand_on = match &self.2 {
+            Msg::Batch { hand_on, .. } => hand_on.as_ref().map_or(0, String::len),
+            Msg::Stats { .. } => size_of::<Report>(),
+            _ => 0,
+        };
+        size_of::<Heard>().saturating_add(self.1.len()).saturating_add(self.2.store().len()).saturating_add(hand_on).saturating_add(self.3.len())
+    }
+}
+
+/// The bytes of messages waiting for an intake's thread, at most (goal 11, plan 01a1a87b2e56 step 3): one
+/// connection's receive window ([`crate::net::WINDOW`]), what the hub's queue of runner events it's handed
+/// from may hold; a feed sends at most [`WINDOW`] batches of [`BATCH_BYTES`] ahead of the server, so it
+/// holds every feed's window for as many feeds as fit in it. Past it a message is dropped, as it was past
+/// 256 messages of any size (up to 768 MiB of parts): its runner, holding the batch until the server has
+/// it, asks again ([`STALL`]). Nothing a person sent is lost.
+pub const HEARD_BYTES: usize = crate::net::WINDOW as usize;
 
 /// What each mirror sent back to restore a store, by the numbers it was written under there: the
 /// feed to that mirror leaves it out, as the mirror has it already, in the copy it sent.
@@ -534,7 +559,7 @@ type Restores = std::sync::Mutex<std::collections::HashSet<String>>;
 impl Intake {
     /// `echoes`: where to note what a mirror's copy brought (the server's intake).
     pub fn start(store: Store, brings: Brings, echoes: Option<std::sync::Arc<Echoes>>) -> anyhow::Result<(Self, async_channel::Receiver<Out>)> {
-        let (tx, rx) = std::sync::mpsc::sync_channel::<(hyper_transport::PeerId, String, Msg, Vec<u8>)>(256);
+        let (tx, rx) = crate::memory::queue::bounded::<Heard>(&crate::memory::owners::FEED_INTAKE, HEARD_BYTES);
         let (out_tx, out_rx) = async_channel::bounded::<Out>(1024);
         let restores: std::sync::Arc<Restores> = std::sync::Arc::default();
         let peers: std::sync::Arc<Peers> = std::sync::Arc::default();
@@ -542,7 +567,7 @@ impl Intake {
         let (restoring, seen, signing) = (restores.clone(), peers.clone(), signs.clone());
         std::thread::Builder::new().name("kiln-convo-intake".into()).spawn(move || {
             let mut taking: HashMap<(hyper_transport::PeerId, String), Taking> = HashMap::new();
-            while let Ok((peer, machine, msg, data)) = rx.recv() {
+            while let Ok((peer, machine, msg, data)) = rx.recv_blocking() {
                 let signer = signing.read().clone();
                 let feed = Feed { store: &store, brings, restores: &restoring, echoes: echoes.as_deref(), peers: &seen, custodian: signer.as_deref() };
                 for m in take(&feed, &mut taking, peer, &machine, msg, data) {
@@ -572,8 +597,8 @@ impl Intake {
     }
 
     /// What runner process `peer` of `machine` sent on the feed's lane, read where its frame was
-    /// (`crate::wire::payload_of`). Never blocks: when the intake is behind, it's dropped (the
-    /// runner asks again, [`STALL`]).
+    /// (`crate::wire::payload_of`). Never blocks: when the intake is behind (its queue holds
+    /// [`HEARD_BYTES`]), it's dropped (the runner asks again, [`STALL`]).
     pub fn heard(&self, peer: hyper_transport::PeerId, machine: &str, msg: Msg, data: Vec<u8>) {
         let _ = self.tx.try_send((peer, machine.to_owned(), msg, data));
     }

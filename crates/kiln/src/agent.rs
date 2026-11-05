@@ -1790,7 +1790,7 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
             convo_held = Some(tee);
             sink
         } else {
-            harness_tx.clone()
+            harness_tx.clone().into()
         };
         stores_wait = waits;
         let held = crate::harness::limit::held(limit_asked, limit_config);

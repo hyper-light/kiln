@@ -444,7 +444,7 @@ fn power(percent: u8) -> AgentMsg {
 struct Peer {
     name: String,
     net: NetHandle,
-    events: async_channel::Receiver<NetEvent>,
+    events: kiln::memory::queue::Receiver<NetEvent>,
     got: Vec<ServerMsg>,
 }
 

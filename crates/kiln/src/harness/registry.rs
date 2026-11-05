@@ -954,7 +954,7 @@ pub struct Registry {
     /// What agents' pages read of the store, kept in memory while it holds (`crate::reads::Views`:
     /// the plans' list, the goal stacks; goal 10, plan 01a1a87b2dae step 2).
     pub views: crate::reads::Views,
-    local_rx: async_channel::Receiver<(String, Update)>,
+    local_rx: crate::memory::queue::Receiver<(String, Update)>,
     /// Where `kiln spawn` in the server's own terminals reaches `local`.
     local_sock: Mutex<Option<String>>,
     /// The shell pid of each of the server's own terminals (their directory and environment are
@@ -1106,7 +1106,11 @@ impl Registry {
     /// The registry, its store in `dir`, its mirrors as `conversations` says, the server's own
     /// sessions' host on `clock` (the hub's), its sessions' live feeds on `bus`.
     pub fn with(dir: std::path::PathBuf, conversations: &crate::config::Conversations, clock: Arc<dyn kiln_seams::Clock>, bus: Arc<dyn kiln_seams::Bus>) -> Self {
-        let (tx, rx) = async_channel::bounded(8192);
+        // The server's own sessions' updates, waiting for the loop that hands them to their owners
+        // (`run_local`): as many bytes as an owner's inbox holds (`crate::net::EVENTS_BYTES`), where they go
+        // next; past it a session waits to send (goal 11, plan 01a1a87b2e56 step 3). Its 8,192 places, made
+        // up front, took 1.05 MB of an idle server's heap (research 01a1a87b2e57, f10).
+        let (tx, rx) = crate::memory::queue::bounded::<(String, Update)>(&crate::memory::owners::LOCAL_UPDATES, crate::net::EVENTS_BYTES);
         // Every session's conversation, on every machine, kept on disk as it comes in
         // (docs/conversations.md): the server's own sessions' too, as they pass through `ingest`.
         let convo = if conversations.off { None } else { crate::convo::open(&dir, conversations.upkeep()) };
