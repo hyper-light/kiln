@@ -43,6 +43,16 @@ pub fn shard_counters() -> Option<crate::shard_loop::Counters> {
     registry::with_current(|ctx| ctx.counters())
 }
 
+/// The current shard thread's run time in nanoseconds, read with no system call: its task clock's
+/// ([`crate::shard::ShardContext::task_clock`], counting from when the shard's thread opened it as it built the
+/// shard), what the loop reads at each poll's start. Kiln's probe read the thread's time with
+/// `clock_gettime(CLOCK_THREAD_CPUTIME_ID)` (155 ns, `crate::task_clock`'s notes) every 10 ms on every shard
+/// (kiln's goal 9, plan 01a1a87b2cec step 5). `None` off a shard thread, and where its shard has no clock: off
+/// Linux, in a simulation, where the OS refused the event, or a page that stopped offering the time.
+pub fn thread_run_ns() -> Option<u64> {
+    registry::with_current(|ctx| ctx.task_clock.as_ref().and_then(crate::task_clock::TaskClock::run_ns)).flatten()
+}
+
 /// The current shard's timer tick in nanoseconds ([`crate::shard::ShardContext::timer_tick_ns`]): a sleep
 /// ends up to a tick later than due by design, and later still by [`scheduler_overrun_ns`]. A wait that must
 /// end before another's (an answer before its asker gives up) sets both aside. Zero off a shard thread.

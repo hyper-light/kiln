@@ -19,7 +19,9 @@
 //! - **Busy** (`kiln_shard_busy_seconds_total`): the CPU time the shard's thread has run, so its rate
 //!   is the share of the time the shard was on the CPU (Linux and macOS; Windows keeps a thread's
 //!   times at the scheduler's tick, so no series there). Time the host held a ready shard off the
-//!   CPU isn't busy: it shows in the delay, and as `host` slow polls.
+//!   CPU isn't busy: it shows in the delay, and as `host` slow polls. Read from hyper-rt's task clock
+//!   with no system call where the shard has one (Linux), else the OS's clock for the thread
+//!   ([`CpuClock`]; goal 9, plan 01a1a87b2cec step 5).
 //! - **Slow polls** (`kiln_shard_slow_polls_total`, by `cause`): hyper-rt's long polls, each one that
 //!   held its shard past twice the step quantum (`crate::rt::STEP_BUDGET_NS`, 266.7 µs, so past 533
 //!   µs), attributed as the runtime does (`hyper_rt`'s `attribution`): `task` (it ran on the CPU),
@@ -298,9 +300,9 @@ impl Shard {
     }
 
     /// A probe's wake, `late` after its timer fell due, at `now`, with the shard's counts as the wake read them
-    /// (`counters`); on the shard, so what it reads of the shard is the shard's own. The CPU time its thread has
-    /// run, where the OS keeps it.
-    fn note(&self, late: Duration, now: Instant, counters: Option<&hyper_rt::shard_loop::Counters>) -> Option<u64> {
+    /// (`counters`) and its thread's CPU time (`cpu`, [`CpuClock`]); on the shard, so what it reads of the shard is
+    /// the shard's own.
+    fn note(&self, late: Duration, now: Instant, counters: Option<&hyper_rt::shard_loop::Counters>, cpu: Option<u64>) {
         let late_ns = nanos(late);
         self.delay.observe(late.as_secs_f64());
         self.late_ns.store(late_ns, Ordering::Relaxed);
@@ -327,11 +329,9 @@ impl Shard {
         if let Some(q) = hyper_rt::futures::step_budget_ns() {
             self.quantum_ns.store(q, Ordering::Relaxed);
         }
-        let cpu = thread_cpu_ns();
         if let Some(cpu) = cpu {
             self.cpu_ns.store(cpu, Ordering::Relaxed);
         }
-        cpu
     }
 
     /// How late its probes ran, each noted.
@@ -504,6 +504,7 @@ async fn probe(i: usize, period: Duration) {
 /// however idle the shard (goal 9, plan 01a1a87b2cec step 1's samples: none skipped).
 async fn wake_every(me: &Shard, i: usize, period: Duration, wakes: u64) {
     let mut due = Instant::now() + period;
+    let mut clock = CpuClock::Unchosen;
     for _ in 0..wakes {
         crate::rt::sleep_until(due).await;
         let now = Instant::now();
@@ -511,12 +512,47 @@ async fn wake_every(me: &Shard, i: usize, period: Duration, wakes: u64) {
         // The shard's counts, read once a wake: noted for `/metrics` and handed to what it sheds, which read a copy
         // of its own (goal 9, plan 01a1a87b2cec step 5).
         let counters = hyper_rt::futures::shard_counters();
-        let cpu = me.note(late, now, counters.as_ref());
+        let cpu = clock.read();
+        me.note(late, now, counters.as_ref(), cpu);
         // What the shard sheds, from its delay and how much of the time it ran (goal 6, plan 01a1a59c2abe step 4).
         crate::overload::tick(i, late, cpu, counters.as_ref());
         // The next one a period from now: a shard that was held doesn't then run a burst of probes
         // to catch up, each noting the same hold again.
         due = now + period;
+    }
+}
+
+/// Where a probe reads its shard thread's CPU time (goal 9, plan 01a1a87b2cec step 5): hyper-rt's task clock, read with
+/// no call (`hyper_rt::futures::thread_run_ns`), where the shard has one (Linux, where the OS opened the event); else the
+/// OS's clock for the thread ([`thread_cpu_ns`]: `clock_gettime`, a call at every wake of every shard, 155 ns on the
+/// lab's machine by hyper-rt's `task_clock` notes). Chosen at the probe's first reading and kept: the two count from
+/// different starts (the task clock from its opening, as the shard's thread began), so the busy counter never mixes
+/// them. Both run while the thread runs, in its system calls too (`tests`), so the busy share means what it meant.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CpuClock {
+    Unchosen,
+    Task,
+    Os,
+}
+
+impl CpuClock {
+    /// The shard thread's CPU time now, nanoseconds, by the clock chosen (at the first reading: the task clock where the
+    /// shard has one). None where neither keeps it, or where the task clock's page stopped offering it.
+    fn read(&mut self) -> Option<u64> {
+        match self {
+            CpuClock::Task => hyper_rt::futures::thread_run_ns(),
+            CpuClock::Os => thread_cpu_ns(),
+            CpuClock::Unchosen => match hyper_rt::futures::thread_run_ns() {
+                Some(ns) => {
+                    *self = CpuClock::Task;
+                    Some(ns)
+                }
+                None => {
+                    *self = CpuClock::Os;
+                    thread_cpu_ns()
+                }
+            },
+        }
     }
 }
 
@@ -916,6 +952,38 @@ mod tests {
             anyhow::ensure!(me.wakes().steps > first.0.steps, "not copied again at its {COUNTS_EVERY}th wake after");
             let s = me.snapshot();
             anyhow::ensure!(s.probes == COUNTS_EVERY + 1 && s.polls > polls, "each wake noted all the same: {s:?}");
+            Ok(())
+        })
+    }
+
+    /// Goal 9, plan 01a1a87b2cec step 5: a probe reads its shard thread's CPU time from hyper-rt's task clock, with no
+    /// call, where the shard has one, else from the OS's clock for the thread, and keeps to the one it chose. Over the
+    /// same stretch of spinning and system calls the task clock runs as the OS's does, the calls' time in the kernel
+    /// with the rest, so the busy share means what it meant; and the probe's samples are as they were.
+    #[test]
+    fn g9_s5_a_probe_reads_its_threads_cpu_time_from_the_task_clock() -> anyhow::Result<()> {
+        let _ = base();
+        crate::rt::block_on(async {
+            let mut clock = CpuClock::Unchosen;
+            let first = clock.read();
+            let task = hyper_rt::futures::thread_run_ns().is_some();
+            anyhow::ensure!(clock == if task { CpuClock::Task } else { CpuClock::Os }, "{clock:?} chosen, the task clock there: {task}");
+            if let (true, Some(os0), Some(t0)) = (task, thread_cpu_ns(), clock.read()) {
+                // A file's metadata asked again and again (system calls, their time in the kernel) until the thread has
+                // run 20 ms on the CPU, or for 2 s on a loaded machine.
+                let began = Instant::now();
+                let mut calls = 0_u64;
+                while thread_cpu_ns().unwrap_or(os0).saturating_sub(os0) < 20_000_000 && began.elapsed() < Duration::from_secs(2) {
+                    calls += u64::from(std::fs::metadata("/").is_ok());
+                }
+                let (os, t) = (thread_cpu_ns().unwrap_or(os0).saturating_sub(os0), clock.read().unwrap_or(t0).saturating_sub(t0));
+                anyhow::ensure!(os.abs_diff(t) <= (os / 10).max(2_000_000), "over {calls} calls the OS's clock ran {os} ns, the task clock {t} ns");
+            }
+            anyhow::ensure!(clock.read() >= first, "the chosen clock only moves on");
+            let me = Shard::new();
+            wake_every(&me, usize::MAX, PERIOD, 3).await;
+            let s = me.snapshot();
+            anyhow::ensure!(s.probes == 3 && (s.busy.is_some() || first.is_none()), "three wakes noted, with the thread's CPU time: {s:?}");
             Ok(())
         })
     }

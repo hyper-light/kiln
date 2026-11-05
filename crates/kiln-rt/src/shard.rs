@@ -441,6 +441,12 @@ pub struct ShardContext {
     pub(crate) sim: Option<crate::sim::SimSockets>,
     /// The shard's movable queues and carriers, once its runtime installs them (`crate::movable`, kiln's goal 7).
     pub(crate) movable: crate::movable::Local,
+    /// The shard thread's run time, read with no call (`crate::task_clock`): by the loop at each poll's start (a slow
+    /// poll's time on the CPU; kiln's goal 9, plan 01a1a87b2cec step 3), and by its tasks
+    /// ([`crate::futures::thread_run_ns`]; step 5: kiln's probe read the thread's time with a call every 10 ms). Opened by
+    /// the loop on the shard's own thread as it builds the shard; none off Linux, in a simulation, and where the OS
+    /// refused the event.
+    pub(crate) task_clock: Option<crate::task_clock::TaskClock>,
 }
 
 impl std::fmt::Debug for ShardContext {
@@ -513,6 +519,7 @@ impl ShardContext {
             live: crate::shard_loop::LiveCounters::default(),
             sim: None,
             movable: crate::movable::Local::default(),
+            task_clock: None,
         }
     }
 
