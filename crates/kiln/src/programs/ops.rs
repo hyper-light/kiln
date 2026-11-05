@@ -76,7 +76,7 @@ async fn set(cx: Cx, v: Value) -> Out {
         }
     }
     // Changed as they're kept now, under the lock: two changes made at once both stand.
-    let writing = super::WRITING.lock().await;
+    let writing = super::WRITING.turn().await;
     let mut s = super::settings(&cx.hub, &id).await.map_err(failed)?;
     let said = changed(&s, slots, &weights);
     if let Some(n) = slots {
@@ -121,7 +121,7 @@ async fn assign(cx: Cx, v: Value) -> Out {
     }
     let t = before.tracks.iter().find(|x| x.id == track).ok_or((StatusCode::BAD_REQUEST, format!("{id} has no track {track}")))?;
     // Changed as they're kept now, under the lock (then the stacks', to hand the goal over).
-    let writing = super::WRITING.lock().await;
+    let writing = super::WRITING.turn().await;
     let mut all = super::assignments(&cx.hub.store, &id).await.map_err(failed)?;
     let now = crate::util::now_ms();
     let mut a = all.get(&track).cloned().unwrap_or_default();

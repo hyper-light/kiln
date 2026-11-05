@@ -68,8 +68,8 @@ const PAUSED_BY_YOU: &str = "Paused by you: the agent isn't held to its goal (it
 pub const TICK: Duration = Duration::from_millis(1500);
 
 /// One change to the stacks at a time, yours (start, skip, an edit …) or the server's own steps: a
-/// goal goes to its agent once, and what's decided is decided on the stack as it is.
-static CHANGING: async_lock::Mutex<()> = async_lock::Mutex::new(());
+/// goal goes to its agent once, and what's decided is decided on the stack as it is. In the order they came, with no lock (`crate::turn`; goal 5, plan 01a1a59c2aae, its top goal).
+static CHANGING: crate::turn::Gate = crate::turn::Gate::one();
 
 /// An agent's goal stack.
 #[derive(Debug, Clone, Default, Serialize)]
@@ -842,7 +842,7 @@ fn known(hub: &Hub, agent: &str) -> R<Info> {
 pub async fn set(hub: &Hub, agent: &str, given: Vec<Given>) -> R<Stack> {
     let info = known(hub, agent)?;
     let given = given.into_iter().map(|g| Ok((g.id, clean(&g.text)?))).collect::<R<Vec<_>>>()?;
-    let _one = CHANGING.lock().await;
+    let _one = CHANGING.turn().await;
     set_locked(hub, &info, agent, given, Vec::new()).await
 }
 
@@ -996,7 +996,7 @@ fn arrange(items: &[Item], given: Vec<(Option<String>, String)>) -> (Vec<Row>, V
 /// a plan made from it, run again as goals, gives it its steps again as its parts, before it
 /// (`plans::run_goals`), and it's met once they are ([`met_by_parts`]). One still to go stays as it is.
 pub async fn reopen(hub: &Hub, agent: &str, id: &str) -> R<Stack> {
-    let _one = CHANGING.lock().await;
+    let _one = CHANGING.turn().await;
     let stack = get(hub, agent).await?;
     let Some(goal) = stack.items.iter().find(|i| i.id == id) else {
         return Err(Error::Bad(format!("no goal {id} here (goals_get lists them)")));
@@ -1034,7 +1034,7 @@ pub async fn add_at(hub: &Hub, agent: &str, goals: Vec<NewGoal>, start: bool, at
     let info = known(hub, agent)?;
     let goals = goals.into_iter().map(|g| Ok(NewGoal { text: clean(&g.text)?, ..g })).collect::<R<Vec<_>>>()?;
     let stack = {
-        let _one = CHANGING.lock().await;
+        let _one = CHANGING.turn().await;
         let now = get(hub, agent).await?;
         // Asked again under its key (CP-T3.2; its answer lost): the goals it added are there, by
         // the ids the key made, whatever became of them since: none is added again, and the stack
@@ -1151,7 +1151,7 @@ async fn done_counted(hub: &Hub, agent: &str, id: Option<&str>, evidence: Option
     if evidence.as_ref().is_some_and(|e| e.chars().count() > TEXT) {
         return Err(Error::Bad(format!("what shows it's met is at most {TEXT} characters")));
     }
-    let _one = CHANGING.lock().await;
+    let _one = CHANGING.turn().await;
     let stack = get(hub, agent).await?;
     // Asked again under its key (its answer lost): done already (CP-T3.2).
     if asked.is_some_and(|a| stack.asked.iter().any(|x| x == a)) {
@@ -1239,7 +1239,7 @@ async fn update_counted(hub: &Hub, agent: &str, id: &str, change: Change, by: &B
     if !change.remove && text.is_none() && at.is_none() && change.needs.is_none() {
         return Err(Error::Bad("say what changes: `text`, `before`, `after`, `next`, `needs` or `remove`".into()));
     }
-    let _one = CHANGING.lock().await;
+    let _one = CHANGING.turn().await;
     let stack = get(hub, agent).await?;
     let it = stack.items.iter().find(|i| i.id == id).ok_or_else(|| Error::Bad(format!("no goal {id} in this stack (goals_get lists them)")))?;
     if !matches!(it.status.as_str(), "pending" | "active") {
@@ -1340,7 +1340,7 @@ pub async fn order(hub: &Hub, agent: &str, given: Vec<(String, Vec<String>)>, by
     if given.is_empty() {
         return Err(Error::Bad("say what at least one goal waits for: `goals`, each {id, needs}".into()));
     }
-    let _one = CHANGING.lock().await;
+    let _one = CHANGING.turn().await;
     let stack = get(hub, agent).await?;
     for (k, (id, _)) in given.iter().enumerate() {
         let it = stack.items.iter().find(|i| i.id == *id).ok_or_else(|| Error::Bad(format!("no goal {id} in this stack (goals_get lists them)")))?;
@@ -1374,7 +1374,7 @@ pub async fn order(hub: &Hub, agent: &str, given: Vec<(String, Vec<String>)>, by
 pub async fn split(hub: &Hub, agent: &str, id: Option<&str>, parts: Vec<String>) -> R<Stack> {
     let info = known(hub, agent)?;
     let given_parts = parts.iter().map(|p| clean(p)).collect::<R<Vec<_>>>()?;
-    let _one = CHANGING.lock().await;
+    let _one = CHANGING.turn().await;
     let stack = get(hub, agent).await?;
     let target = match id.map(str::trim).filter(|i| !i.is_empty()) {
         Some(id) => stack.items.iter().find(|i| i.id == id).ok_or_else(|| Error::Bad(format!("no goal {id} in this stack (goals_get lists them)")))?,
@@ -1517,7 +1517,7 @@ async fn control_counted(hub: &Hub, agent: &str, action: Action, by: &By, pausin
         (By::Itself, None) if until == 0 => Some(String::new()),
         _ => None,
     };
-    let _one = CHANGING.lock().await;
+    let _one = CHANGING.turn().await;
     let stack = get(hub, agent).await?;
     // Asked again under its key (its answer lost): done already, whatever changed since (CP-T3.2).
     if on.asked.is_some_and(|a| stack.asked.iter().any(|x| x == a)) {
@@ -2002,7 +2002,7 @@ where
                 // you, and a card wherever you are in kiln (said at once too, as each change makes
                 // it: `say_held`).
                 {
-                    let _one = CHANGING.lock().await;
+                    let _one = CHANGING.turn().await;
                     say_held(hub).await;
                 }
                 // The plans agents proposed (plan mode) since the last look, kept as kiln's plans:
@@ -2024,7 +2024,7 @@ where
     /// adoption, resumption and step is one change to the stacks, under `changing` (`CHANGING`, as
     /// each of yours is; kiln-sim's model has its own). The stacks running, and those paused for a
     /// while.
-    async fn round(&self, changing: &async_lock::Mutex<()>) -> (Vec<String>, Vec<String>) {
+    async fn round(&self, changing: &crate::turn::Gate) -> (Vec<String>, Vec<String>) {
         // Each agent as the registry shares it, none copied (`agents_shared`), and the loop's turn on
         // its shard given up between agents, before the stacks are held: an agent with no goal of its
         // own to adopt takes no wait, so the loop over every agent was one poll (goal 9, plan
@@ -2032,7 +2032,7 @@ where
         let mut turns = crate::rt::Turns::new();
         for info in self.agents_shared() {
             turns.after().await;
-            let _one = changing.lock().await;
+            let _one = changing.turn().await;
             if let Err(e) = adopt(self, &info).await {
                 tracing::warn!(agent = %info.id, error = %format!("{e:#}"), "goal stack");
             }
@@ -2049,7 +2049,7 @@ where
             .await
             .unwrap_or_default();
         for agent in &due {
-            let _one = changing.lock().await;
+            let _one = changing.turn().await;
             if let Err(e) = resume_due(self, agent).await {
                 tracing::warn!(%agent, error = %format!("{e:#}"), "goal stack");
             }
@@ -2064,7 +2064,7 @@ where
             .await
             .unwrap_or_default();
         for agent in &running {
-            let _one = changing.lock().await;
+            let _one = changing.turn().await;
             if let Err(e) = step(self, agent, false).await {
                 tracing::warn!(%agent, error = %format!("{e:#}"), "goal stack");
             }
@@ -2077,7 +2077,7 @@ where
         resume_lifted(self, changing).await;
         // What the stacks said that an edit may not have got to their agents: said again.
         {
-            let _one = changing.lock().await;
+            let _one = changing.turn().await;
             resay(self.port, self.clock.unix_ms()).await;
         }
         let waiting: Vec<String> = self
@@ -2308,7 +2308,7 @@ pub struct Planned {
 /// than the agent, a goal it isn't on yet is for a subagent of its to plan now ([`Planned`]).
 pub async fn plan(hub: &Hub, agent: &str, id: Option<&str>, title: Option<&str>, by: &str, delegated: bool) -> R<Planned> {
     let info = known(hub, agent)?;
-    let _one = CHANGING.lock().await;
+    let _one = CHANGING.turn().await;
     let (planned, sends) = plan_locked(hub, &info, agent, id, title, by, delegated).await?;
     // The goal under way put back after its planning: that goes to the agent at once.
     if sends {
@@ -2435,7 +2435,7 @@ fn plans_first(stack: &Stack, id: &str) -> bool {
 /// each as given, the other as it was.
 pub async fn settings(hub: &Hub, agent: &str, plan_big: Option<bool>, side_by_side: Option<bool>) -> R<Stack> {
     known(hub, agent)?;
-    let _one = CHANGING.lock().await;
+    let _one = CHANGING.turn().await;
     let (a, now) = (agent.to_owned(), now_ms(hub));
     hub.store
         .call(move |c| {
@@ -2549,7 +2549,7 @@ pub async fn answer_plan(hub: &Hub, agent: &str, goal: &str, plan: &crate::plans
     known(hub, agent)?;
     let part = revise.map(|(words, research)| clean(&revise_words(plan, research, words))).transpose()?;
     {
-        let _one = CHANGING.lock().await;
+        let _one = CHANGING.turn().await;
         let stack = get(hub, agent).await?;
         if !stack.items.iter().any(|i| i.id == goal && matches!(i.status.as_str(), "pending" | "active")) {
             return Err(Error::Bad("the goal this plan was made from has ended, or gone: its review has nothing left to answer".into()));
@@ -2750,7 +2750,7 @@ async fn paused_for_usage(store: &crate::store::Store) -> Vec<String> {
 /// harness said of it before (the clear the pause sent) doesn't count. A stack you paused stays
 /// paused: each goes on only if it's still paused for usage when it does, under the stacks' lock
 /// (`CHANGING`), so a pause of yours made meanwhile holds.
-async fn resume_lifted<P>(d: &Driver<'_, P>, changing: &async_lock::Mutex<()>)
+async fn resume_lifted<P>(d: &Driver<'_, P>, changing: &crate::turn::Gate)
 where
     P: HarnessPort<Agent = Info, Command = Command>,
 {
@@ -2764,7 +2764,7 @@ where
         if crate::programs::rule(d.store, &all, &agent).await != crate::programs::Rule::Ok {
             continue;
         }
-        let _one = changing.lock().await;
+        let _one = changing.turn().await;
         let said_at = all.iter().find(|i| i.id == agent).and_then(|i| i.objective.as_ref()).map_or(0, |o| o.at);
         let now = d.clock.unix_ms();
         let (a, like) = (agent.clone(), format!("{}%", crate::programs::PAUSED_FOR_USAGE));
@@ -2801,7 +2801,7 @@ where
 /// `CP-T7.`) under way elsewhere comes back first: a track has one goal under way. False, with
 /// nothing changed, when `item` isn't a goal of the stack still to come.
 pub async fn delegate(store: &crate::store::Store, agent: &str, track: &str, item: Option<&str>, on: Option<&str>, met: bool, now: i64) -> anyhow::Result<bool> {
-    let _one = CHANGING.lock().await;
+    let _one = CHANGING.turn().await;
     // A goal said met through it (programs.assign) ends, and counts as one said met does.
     let saying_met = met && item.is_some();
     let (agent, item, on) = (agent.to_owned(), item.map(str::to_owned), on.map(str::to_owned));

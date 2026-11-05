@@ -20,7 +20,6 @@ use std::sync::mpsc;
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
-use event_listener::Listener as _;
 use serde::{Deserialize, Serialize};
 
 use super::rows::{self, EventRow, Row};
@@ -307,8 +306,9 @@ pub struct Queue {
     /// Bytes committed, and the microseconds their commits took: the writer's measured rate.
     written: AtomicU64,
     took_us: AtomicU64,
-    /// Told each time the writer commits.
-    room: event_listener::Event,
+    /// Told each time the writer commits (`crate::rt::Changed`, no lock; goal 5, plan 01a1a59c2aae, its top goal: it
+    /// was an event-listener `Event`, its list behind a `Mutex`).
+    room: crate::rt::Changed,
     /// The most any sender may let wait past [`Queue::bound`] before it waits itself ([`Store::room_within`]),
     /// for what `/metrics` says the queue may hold.
     within: AtomicUsize,
@@ -372,7 +372,7 @@ impl Queue {
         }
         crate::memory::CONVO_QUEUE.sub(bytes);
         crate::memory::CONVO_QUEUE.bound_at(self.bound().max(self.within.load(Ordering::Relaxed)));
-        self.room.notify(usize::MAX);
+        self.room.notify();
     }
 }
 

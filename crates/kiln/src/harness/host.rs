@@ -405,7 +405,9 @@ pub struct Host {
     saves: AtomicU64,
     /// Where its looks and record writes are counted for /metrics (kiln's, `metrics::agents()`).
     metrics: &'static crate::metrics::AgentMetrics,
-    changed: event_listener::Event,
+    /// Told after each look and each record written (`crate::rt::Changed`, no lock; goal 5, plan 01a1a59c2aae, its top
+    /// goal: it was an event-listener `Event`, its list behind a `Mutex`).
+    changed: crate::rt::Changed,
     /// Its sessions' inboxes (CP-T3.2): none without their records (`KILN_INBOX` off, or they
     /// couldn't be opened), and messages then go on as they come, unchecked.
     inbox: Option<Arc<Inbox>>,
@@ -507,7 +509,7 @@ impl Host {
             looks: AtomicU64::new(0),
             saves: AtomicU64::new(0),
             metrics,
-            changed: event_listener::Event::new(),
+            changed: crate::rt::Changed::new(),
             inbox: records.map(|r| Arc::new(Inbox::new(r, inbox::Limits::default()))),
             lanes: Mutex::new(HashMap::new()),
             ending: Mutex::new(HashMap::new()),
@@ -1782,7 +1784,7 @@ impl Host {
                 }
                 h.looks.fetch_add(1, Ordering::AcqRel);
                 h.metrics.harness_polls.inc();
-                h.changed.notify(usize::MAX);
+                h.changed.notify();
             }
         });
     }
@@ -1873,7 +1875,7 @@ impl Host {
             }
             Err(e) => tracing::warn!(error = %e, file = %file.display(), "could not record agent sessions"),
         }
-        self.changed.notify(usize::MAX);
+        self.changed.notify();
     }
 }
 
