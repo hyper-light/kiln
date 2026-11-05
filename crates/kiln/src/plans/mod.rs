@@ -716,6 +716,63 @@ fn get_in(c: &rusqlite::Connection, id: &str) -> rusqlite::Result<Option<Plan>> 
     c.query_row(&format!("SELECT {COLUMNS} FROM plans p WHERE p.id = ?1"), params![id], row).optional()
 }
 
+/// The tables the plans' list is made of: each plan's count of runs and newest research are in it.
+pub const LISTED_FROM: &[&str] = &["plans", "plan_runs", "research"];
+
+/// The plans' list as `GET /api/plans` answers it, kept in memory (`crate::reads::Kept`; goal 10, plan
+/// 01a1a87b2dae step 2): each plan in the list's order, encoded once as `srv::json` writes it and as
+/// its brief, with what its filters read of it.
+pub struct Listed(Vec<Listing>);
+
+struct Listing {
+    tags: Vec<String>,
+    session: Option<String>,
+    proposed: bool,
+    /// Its title, body, tags and steps in lower case: what `q` is looked for in.
+    lower: (String, String, Vec<String>, Vec<String>),
+    json: bytes::Bytes,
+    brief: bytes::Bytes,
+}
+
+/// The plans' list, as the store's tables hold it now, each plan encoded once.
+pub fn listed(c: &rusqlite::Connection) -> anyhow::Result<Listed> {
+    let mut st = c.prepare(&format!("SELECT {COLUMNS} FROM plans p ORDER BY p.updated_at DESC, p.id"))?;
+    let all = st.query_map([], row)?.collect::<Result<Vec<_>, _>>()?;
+    let lower = |all: &[String]| all.iter().map(|x| x.to_lowercase()).collect::<Vec<_>>();
+    all.iter()
+        .map(|p| {
+            Ok(Listing {
+                tags: p.tags.clone(),
+                session: p.source.as_ref().and_then(|s| s.session.clone()),
+                proposed: p.source.as_ref().is_some_and(|s| s.proposed),
+                lower: (p.title.to_lowercase(), p.body.to_lowercase(), lower(&p.tags), lower(&p.steps)),
+                json: serde_json::to_vec(p)?.into(),
+                brief: serde_json::to_vec(&brief(p))?.into(),
+            })
+        })
+        .collect::<anyhow::Result<Vec<_>>>()
+        .map(Listed)
+}
+
+impl Listed {
+    /// What `GET /api/plans` answers: the plans holding `q` (any case; blank, all) with `tag`
+    /// ([`list`]), of agent `session` and only those it proposed with `proposed` ([`of_source`]), in
+    /// brief with `brief`. Joined, not encoded.
+    pub fn answer(&self, q: Option<&str>, tag: Option<&str>, session: Option<&str>, proposed: bool, brief: bool) -> bytes::Bytes {
+        let q = q.map(str::to_lowercase).filter(|q| !q.trim().is_empty());
+        let holds = |l: &Listing, q: &str| l.lower.0.contains(q) || l.lower.1.contains(q) || l.lower.2.iter().any(|t| t.contains(q)) || l.lower.3.iter().any(|s| s.contains(q));
+        crate::reads::json_array(
+            self.0
+                .iter()
+                .filter(|l| tag.is_none_or(|t| l.tags.iter().any(|x| x == t)))
+                .filter(|l| q.as_deref().is_none_or(|q| holds(l, q)))
+                .filter(|l| session.is_none_or(|x| l.session.as_deref() == Some(x)))
+                .filter(|l| !proposed || l.proposed)
+                .map(|l| if brief { &l.brief } else { &l.json }),
+        )
+    }
+}
+
 /// Plans, newest change first: those whose title, body or tags hold `q` (any case), with `tag`.
 pub async fn list(hub: &Hub, q: Option<String>, tag: Option<String>) -> R<Vec<Plan>> {
     let all = hub
