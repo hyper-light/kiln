@@ -99,6 +99,8 @@ fn runner(s: &Server, dir: &Path, name: &str, env: &[(&str, &str)]) -> anyhow::R
         .arg("--state-dir")
         .arg(dir.join(format!("{name}-state")))
         .env("HOME", &home)
+        // A machine of its own (docs/machines.md): a test's runners would all be this one.
+        .env("KILN_MACHINE_ID", name)
         .env("NO_COLOR", "1")
         .env_remove("KILN_CONFIG")
         .env_remove("KILN_CHAOS")
@@ -111,7 +113,8 @@ fn runner(s: &Server, dir: &Path, name: &str, env: &[(&str, &str)]) -> anyhow::R
         let (_, body) = http(s.port, "GET", "/api/agents", &s.admin, None)?;
         let agents: Value = serde_json::from_str(&body).unwrap_or_default();
         let list = agents.as_array().cloned().or_else(|| agents.get("agents").and_then(Value::as_array).cloned()).unwrap_or_default();
-        let up = list.iter().any(|a| a.get("name").and_then(Value::as_str) == Some(name) && a.get("connected").and_then(Value::as_bool).unwrap_or(true));
+        // Known by its machine id (docs/machines.md), as main's tests find theirs.
+        let up = list.iter().any(|a| a.get("name").and_then(Value::as_str) == Some(common::machine(name).as_str()) && a.get("connected").and_then(Value::as_bool).unwrap_or(true));
         Ok((!up).then(|| format!("{body}\n{}", std::fs::read_to_string(&log).unwrap_or_default())))
     })?;
     Ok(r)

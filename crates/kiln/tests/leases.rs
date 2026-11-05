@@ -159,6 +159,8 @@ fn runner(s: &Server, dir: &Path, name: &str, labels: &str, env: &[(&str, &str)]
         .arg("--state-dir")
         .arg(dir.join(format!("{name}-state")))
         .env("HOME", &home)
+        // A machine of its own (docs/machines.md): a test's runners would all be this one.
+        .env("KILN_MACHINE_ID", name)
         .env("NO_COLOR", "1")
         .env_remove("KILN_CONFIG")
         .envs(env.iter().copied())
@@ -170,7 +172,8 @@ fn runner(s: &Server, dir: &Path, name: &str, labels: &str, env: &[(&str, &str)]
         let (_, body) = http(s.port, "GET", "/api/agents", &s.admin, None)?;
         let agents: Value = serde_json::from_str(&body).unwrap_or_default();
         let list = agents.as_array().cloned().or_else(|| agents.get("agents").and_then(Value::as_array).cloned()).unwrap_or_default();
-        let up = list.iter().any(|a| a.get("name").and_then(Value::as_str) == Some(name) && a.get("connected").and_then(Value::as_bool).unwrap_or(true));
+        // Known by its machine id (docs/machines.md), as main's tests find theirs.
+        let up = list.iter().any(|a| a.get("name").and_then(Value::as_str) == Some(common::machine(name).as_str()) && a.get("connected").and_then(Value::as_bool).unwrap_or(true));
         Ok((!up).then(|| format!("{body}\n{}", r.log())))
     })?;
     Ok(r)
@@ -655,9 +658,9 @@ fn w05_ac16_a_runner_cut_off_past_its_lease_writes_nothing_after_the_next_attemp
     let attempts = about.get("attempts").and_then(Value::as_array).cloned().unwrap_or_default();
     let field = |i: usize, k: &str| attempts.get(i).and_then(|x| x.get(k)).cloned().unwrap_or_default();
     assert_eq!(attempts.len(), 2, "{attempts:?}");
-    assert_eq!((field(0, "conclusion"), field(0, "class"), field(0, "runner")), (json!("failure"), json!("runner-lost"), json!("a")), "attempt 1 lost with its lease, its late result taken for nothing: {attempts:?}");
+    assert_eq!((field(0, "conclusion"), field(0, "class"), field(0, "runner")), (json!("failure"), json!("runner-lost"), json!(common::machine("a"))), "attempt 1 lost with its lease, its late result taken for nothing: {attempts:?}");
     assert!(field(0, "error").as_str().is_some_and(|e| e.contains("lease ran out")), "{attempts:?}");
-    assert_eq!((field(1, "conclusion"), field(1, "runner")), (json!("success"), json!("b")), "{attempts:?}");
+    assert_eq!((field(1, "conclusion"), field(1, "runner")), (json!("success"), json!(common::machine("b"))), "{attempts:?}");
     assert_eq!(about.pointer("/run/conclusion"), Some(&json!("success")), "{about}");
     let steps: Vec<Value> = about.get("steps").and_then(Value::as_array).into_iter().flatten().filter_map(|x| x.get("status").cloned()).collect();
     assert!(!steps.is_empty() && steps.iter().all(|st| *st == json!("succeeded")), "the steps are attempt 2's, not attempt 1's failed late: {steps:?}");
