@@ -1,0 +1,50 @@
+# Trial only, never on main (goal 10, plan 01a1a87b2dae step 2): the sealed chunks packer and lazy digests (goal 10 step 3); before: the reads kept in memory (plans, goal
+# stacks, the store's change counts), on goal 5's g5-lockless-hotpath: kiln's tests for what they touch,
+# and clippy of kiln for Linux, on GitHub's runners (adacachy's disk is short).
+name: g10-pack-try
+
+on:
+  push:
+    branches: [g10-pack-try]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: g10-pack-try
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: never
+  CARGO_INCREMENTAL: "0"
+  KILN_UI_SERVER: "off"
+
+jobs:
+  tests:
+    name: kiln's tests of what it touches (Linux)
+    runs-on: ubuntu-latest
+    timeout-minutes: 150
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Room
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL || true
+          nproc; free -g; df -h /
+      - name: Rust
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+      - name: Tests
+        run: "cargo test --locked -p kiln --lib -j 2 -- store:: api::tests:: harness:: plans:: goals:: reads::"
+  clippy-linux:
+    name: clippy (Linux, kiln, all targets)
+    runs-on: ubuntu-latest
+    timeout-minutes: 150
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Rust
+        run: |
+          rustup toolchain install stable --profile minimal --component clippy
+          rustup default stable
+      - name: Clippy
+        run: cargo clippy --locked -p kiln --all-targets -j 2 -- -D warnings
