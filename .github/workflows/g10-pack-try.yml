@@ -20,12 +20,20 @@ env:
   KILN_UI_SERVER: "off"
 
 jobs:
-  tests:
-    name: kiln's tests of what it touches (Linux)
+  survivors:
+    name: the process tests, ${{ matrix.side }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { side: this branch, ref: "" }
+          - { side: main 29fa3f34d62, ref: 29fa3f34d62132e8669b4520885fe6da7967bfda }
     runs-on: ubuntu-latest
     timeout-minutes: 150
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ matrix.ref }}
       - name: Room
         run: |
           sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL || true
@@ -34,17 +42,7 @@ jobs:
         run: |
           rustup toolchain install stable --profile minimal
           rustup default stable
-      - name: Tests
-        run: "cargo test --locked -p kiln --lib -j 2 -- store:: api::tests:: harness:: plans:: goals:: reads:: authz:: mcp::"
-  clippy-linux:
-    name: clippy (Linux, kiln, all targets)
-    runs-on: ubuntu-latest
-    timeout-minutes: 150
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - name: Rust
+      - name: The three alone, then their modules
         run: |
-          rustup toolchain install stable --profile minimal --component clippy
-          rustup default stable
-      - name: Clippy
-        run: cargo clippy --locked -p kiln --all-targets -j 2 -- -D warnings
+          cargo test --locked -p kiln --lib -j 2 -- --exact harness::host::tests::what_a_session_left_running_is_taken_back_over_after_a_restart harness::survivors::tests::a_harness_started_while_a_look_goes_on_is_never_left_running harness::survivors::tests::what_a_session_started_is_found_under_it_or_by_its_mark_until_it_is_stopped
+          cargo test --locked -p kiln --lib -j 2 -- harness::survivors:: harness::host::
