@@ -1313,6 +1313,9 @@ pub async fn apply_suggestion(hub: &std::sync::Arc<Hub>, id: &str, caller: &Call
     Ok(json!({ "diff": d.name, "version": n, "thread": c.thread, "state": if resolved { "resolved" } else { "open" }, "commit": made.sha, "suggestion": which, "signer": made.signer }))
 }
 
+/// The kinds of kiln's events [`runs_loop`] acts on: a diff's conversation, CD's apps moving, and runs.
+const RUNS_LOOP_READS: [&str; 4] = ["comment", "review", "cd_apps", "run"];
+
 /// Says when a run on a diff's or change request's version finishes (`diff_run`): which version,
 /// how it ended, its failed legs (with where their failure excerpts are), and whose it is, for
 /// whoever follows the diff (an agent that wrote it, its person). And raises the workflow events
@@ -1325,6 +1328,11 @@ pub async fn runs_loop(hub: std::sync::Arc<Hub>) -> anyhow::Result<()> {
             () = hub.shutdown.cancelled().fuse() => return Ok(()),
             m = rx.recv().fuse() => match m {
                 Ok(text) => {
+                    // Only the kinds it acts on are parsed: the rest, every agent session's change of its
+                    // info among them, are passed over by their front (goal 4, plan 01a1a59c2a9c step 5).
+                    if !crate::wire::events::is_one_of(&text, &RUNS_LOOP_READS) {
+                        continue;
+                    }
                     let v: Value = serde_json::from_str(&text).unwrap_or(Value::Null);
                     // A diff's conversation raises its workflow events (W03-R09).
                     if matches!(v.get("type").and_then(Value::as_str), Some("comment" | "review"))
@@ -1383,4 +1391,21 @@ async fn diff_run(hub: &Hub, run: &str) -> anyhow::Result<()> {
         .await?;
     hub.emit(&crate::wire::events::ServerEvent::DiffRun(Box::new(crate::wire::events::DiffRun { repo, diff: name, version, run: run.to_owned(), workflow, status, conclusion, failed, diff_author: author, diff_author_for: author_for })));
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Goal 4, plan 01a1a59c2a9c step 5: the diffs' runs loop reads a diff's conversation, CD's apps and runs,
+    /// and passes over the rest by their front, an agent session's info change among them.
+    #[test]
+    fn g4_s5_the_runs_loop_reads_only_the_kinds_it_acts_on() -> anyhow::Result<()> {
+        use crate::wire::events::{ServerEvent, is_one_of};
+        anyhow::ensure!(!is_one_of(&crate::wire::events::harness_frame(&serde_json::to_vec(&crate::harness::session::Info { id: "s".into(), kind: "claude".into(), ..Default::default() })?).to_string(), &RUNS_LOOP_READS) && !is_one_of(&ServerEvent::Updates.text(), &RUNS_LOOP_READS));
+        for text in [ServerEvent::Comment(Box::default()).text(), ServerEvent::CdApps { apps: vec![] }.text(), r#"{"type":"run","run":{"id":"r1"}}"#.to_owned(), r#"{"type":"review"}"#.to_owned()] {
+            anyhow::ensure!(is_one_of(&text, &RUNS_LOOP_READS), "{text}");
+        }
+        Ok(())
+    }
 }

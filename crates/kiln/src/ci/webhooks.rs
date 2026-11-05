@@ -152,6 +152,11 @@ pub fn spawn(hub: Arc<Hub>) {
                 }
                 Err(async_broadcast::RecvError::Closed) => return,
             };
+            // Only the kinds a subscription may take are parsed: the rest, every agent session's change of
+            // its info among them, are passed over by their front (goal 4, plan 01a1a59c2a9c step 5).
+            if crate::wire::events::kind_of(&text).is_some_and(|k| !EVENTS.iter().any(|(e, _)| *e == k)) {
+                continue;
+            }
             let Ok(event) = serde_json::from_str::<Value>(&text) else { continue };
             let Some(kind) = event.get("type").and_then(Value::as_str).filter(|k| EVENTS.iter().any(|(e, _)| e == k)) else { continue };
             if read_at.is_none_or(|t| t.elapsed() > FRESH) {
@@ -374,6 +379,20 @@ pub async fn route(hub: &Hub, method: &http::Method, rest: &[&str], q: &HashMap<
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Goal 4, plan 01a1a59c2a9c step 5: every event a subscription may take is read off its front as itself,
+    /// and an agent session's info change, which none may take, is passed over unparsed.
+    #[test]
+    fn g4_s5_webhooks_pass_over_what_no_subscription_takes() -> anyhow::Result<()> {
+        use crate::wire::events::kind_of;
+        for (e, _) in EVENTS {
+            let text = format!(r#"{{"type":{},"x":1}}"#, serde_json::to_string(e)?);
+            anyhow::ensure!(kind_of(&text) == Some(*e), "{text}");
+        }
+        let harness = crate::wire::events::harness_frame(&serde_json::to_vec(&crate::harness::session::Info { id: "s".into(), kind: "claude".into(), ..Default::default() })?).to_string();
+        anyhow::ensure!(kind_of(&harness).is_some_and(|k| !EVENTS.iter().any(|(e, _)| *e == k)));
+        Ok(())
+    }
 
     fn sub(scope: &str, events: Value) -> Integration {
         Integration { id: "i1".into(), kind: "webhook".into(), name: "audit".into(), config: json!({ "url": "http://x", "events": events }), has_secret: true, has_signing_secret: false, scope: scope.into(), created_by: "admin".into(), created_at: 0, updated_at: 0, verified_at: None, last_error: None, last_used_at: None }
