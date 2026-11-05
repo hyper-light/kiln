@@ -1424,7 +1424,7 @@ mod tests {
         let units: u64 = 5_000;
         crate::rt::block_on(async move {
             s.call(move |c| {
-                let tx = c.transaction()?;
+                let tx = crate::store::tx(c)?;
                 let sc = scope("acme/app", "trusted");
                 for n in 0..units {
                     for v in 0..4 {

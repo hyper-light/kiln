@@ -448,8 +448,8 @@ impl Only {
 
 impl srv::Handler for Only {
     async fn handle(self: Arc<Self>, req: Request) -> Response {
-        if let Some(r) = req.extensions().get::<srv::RemoteAddr>()
-            && !self.allow(r.0.ip())
+        if let Some(ip) = srv::remote_ip(&req)
+            && !self.allow(ip)
         {
             let mut resp = srv::json(StatusCode::TOO_MANY_REQUESTS, &json!({ "error": "too many requests" }));
             resp.headers_mut().insert(http::header::RETRY_AFTER, http::HeaderValue::from_static("1"));
