@@ -1,0 +1,64 @@
+# A trial, deleted after: goal 5's part 1 (plan 01a1a59c2aae step 4), kiln's and kiln-lab's lib tests
+# on macOS, on GitHub's hosted runner (kiln's own Macs pace agents' runs). Not on main.
+name: g5-mac-trial
+
+on:
+  push:
+    branches: [g5-mac-trial]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: g5-mac-trial
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: never
+  CARGO_INCREMENTAL: "0"
+  KILN_SKIP_UI_BUILD: "1"
+  KILN_UI_SERVER: "off"
+  # No debug info: the runner's memory is kiln's crate's to compile.
+  CARGO_PROFILE_DEV_DEBUG: "0"
+
+jobs:
+  mac-lib:
+    name: macos (kiln and kiln-lab lib tests)
+    runs-on: macos-latest
+    timeout-minutes: 150
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Rust
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - id: lib
+        name: kiln's lib tests
+        timeout-minutes: 120
+        run: cargo test -p kiln --locked --lib -j 2 -- --test-threads=3 2>&1 | tee "$RUNNER_TEMP/lib.txt"
+      - id: lab
+        name: kiln-lab's tests
+        if: ${{ !cancelled() }}
+        timeout-minutes: 30
+        run: cargo test -p kiln-lab --locked -j 2 2>&1 | tee "$RUNNER_TEMP/lab.txt"
+      - name: Report
+        if: ${{ always() }}
+        env:
+          OUTCOMES: lib=${{ steps.lib.outcome }} lab=${{ steps.lab.outcome }}
+        run: |
+          set +e +o pipefail
+          for said in $OUTCOMES; do
+            step=${said%%=*} outcome=${said#*=}
+            out="$RUNNER_TEMP/$step.txt"
+            if [ ! -s "$out" ]; then continue; fi
+            text=$(grep -E '^test .*FAILED|^test result|panicked at|^error' "$out" | head -n 60)
+            level=notice
+            if [ "$outcome" != success ]; then level=error; fi
+            echo "::$level title=$step $outcome::$(printf '%s\n' "$text" | sed -e 's/%/%25/g' -e 's/\r/%0D/g' | awk 'BEGIN { ORS = "%0A" } { print }')"
+          done
