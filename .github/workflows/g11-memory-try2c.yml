@@ -1,0 +1,105 @@
+# Trial only, never on main (goal 11, plan 01a1a87b2e56 step 1): where the server's memory goes in the lab's
+# realistic profile, calm. Two trials lost their hosted runner (a build, and a lab round, starving it), so here
+# everything heavy is niced, swap is there for the build alone (the rounds run without it, so the kernel takes
+# what runs out, not the runner's agent), one release build is made at two jobs, and each part's results are pushed as it ends: an idle server, a round
+# with jemalloc's heap profile (by call site), a round on the platform's allocator (RSS by kind, smaps with
+# each 20 s window's referenced pages). Results go to g11-memory-results2c.
+name: g11-memory-try2c
+
+on:
+  push:
+    branches: [g11-memory-try2c]
+
+permissions:
+  contents: write
+
+concurrency:
+  group: g11-memory-try2c
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: never
+  CARGO_INCREMENTAL: "0"
+  KILN_UI_SERVER: "off"
+
+jobs:
+  lab:
+    name: lab memory (idle, realistic with a heap profile, realistic)
+    runs-on: ubuntu-latest
+    timeout-minutes: 330
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Room
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL || true
+          sudo mkdir -p /mnt/target /mnt/lab /mnt/bin && sudo chown "$USER" /mnt/target /mnt/lab /mnt/bin
+          sudo apt-get update -qq && sudo apt-get install -y -qq libjemalloc2 binutils > /dev/null
+          cat /sys/kernel/mm/transparent_hugepage/enabled; df -h / /mnt; free -m; nproc; swapon --show || true
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: ui/package-lock.json
+      - name: UI
+        working-directory: ui
+        run: npm ci --no-audit --no-fund --loglevel=error && npm run build
+      - name: Rust
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+      - name: Build (release, symbols kept)
+        timeout-minutes: 200
+        env:
+          CARGO_PROFILE_RELEASE_STRIP: "false"
+          CARGO_TARGET_DIR: /mnt/target
+        run: |
+          set -o pipefail
+          # Swap for the build alone (its link outgrows 16 GB; a build without it was killed), let go of before
+          # the rounds (a round that swapped lost its runner).
+          sudo fallocate -l 16G /mnt/g11-swap && sudo chmod 600 /mnt/g11-swap && sudo mkswap /mnt/g11-swap > /dev/null && sudo swapon /mnt/g11-swap || true
+          nice -n 15 cargo build --locked --release -p kiln -p kiln-lab --bin kiln --bin kiln-lab -j 2 2>&1 | grep -v -E '^ *(Compiling|Downloaded|Downloading) ' | tail -40
+          cp /mnt/target/release/kiln /mnt/bin/kiln && cp /mnt/target/release/kiln-lab /mnt/bin/kiln-lab && ls -la /mnt/bin
+          nm -n -C --defined-only /mnt/bin/kiln | awk '$2 ~ /^[tTwW]$/' > /mnt/lab/syms.txt
+          readelf -lW /mnt/bin/kiln > /mnt/lab/segments.txt
+          readelf -SW /mnt/bin/kiln > /mnt/lab/sections.txt
+          rm -rf /mnt/target
+          sudo swapoff /mnt/g11-swap && sudo rm -f /mnt/g11-swap || true
+      - name: Idle server
+        timeout-minutes: 10
+        run: |
+          set +e
+          chmod +x .github/g11/*.sh
+          nice -n 15 bash .github/g11/idle.sh /mnt/bin/kiln /mnt/lab/idle 2>&1 | tee /mnt/lab/idle.txt
+          R=$RUNNER_TEMP/results; mkdir -p "$R/idle"; cp /mnt/lab/idle.txt /mnt/lab/sections.txt /mnt/lab/segments.txt "$R/"; cp /mnt/lab/idle/metrics.txt "$R/idle/"; gzip -c /mnt/lab/idle/smaps > "$R/idle/smaps.gz"; tail -50 /mnt/lab/idle/server.log > "$R/idle/server.log.txt"
+          echo "${{ github.sha }}" > "$R/COMMIT"
+          bash .github/g11/push.sh "$R" "idle"
+      - name: A realistic round with jemalloc's heap profile
+        timeout-minutes: 45
+        env:
+          G11_KILN: /mnt/bin/kiln
+          G11_JEMALLOC: "1"
+          G11_JEMALLOC_LIB: /usr/lib/x86_64-linux-gnu/libjemalloc.so.2
+        run: |
+          set +e
+          nice -n 15 timeout 2400 /mnt/bin/kiln-lab run --kiln "$GITHUB_WORKSPACE/.github/g11/kiln-wrap.sh" --label jeprof --profile realistic --rounds 1 --keep --out /mnt/lab/jeprof > /mnt/lab/jeprof.stdout 2> /mnt/lab/jeprof.stderr
+          echo "exit $?"; tail -3 /mnt/lab/jeprof.stderr
+          R=$RUNNER_TEMP/results; d=/mnt/lab/jeprof; mkdir -p "$R/jeprof"
+          python3 -I .github/g11/summarize.py "$d" /mnt/lab/syms.txt /mnt/lab/segments.txt > "$R/jeprof/summary.txt" 2>&1
+          cp "$d/run.json" "$d/report.md" "$R/jeprof/" 2>/dev/null; tail -60 /mnt/lab/jeprof.stderr > "$R/jeprof/lab.stderr.txt"
+          for m in "$d"/mem/*/; do r=$R/jeprof/mem/$(basename "$m"); mkdir -p "$r"; cp "$m"/rss.csv "$m"/env.txt "$m"/smaps.index "$r/" 2>/dev/null; heap=$(ls -t "$m"/jeprof.*.heap 2>/dev/null | head -1); [ -n "$heap" ] && gzip -c "$heap" > "$r/jeprof.last.heap.gz"; done
+          bash .github/g11/push.sh "$R" "jeprof"
+      - name: A realistic round on the platform's allocator
+        timeout-minutes: 45
+        env:
+          G11_KILN: /mnt/bin/kiln
+        run: |
+          set +e
+          nice -n 15 timeout 2400 /mnt/bin/kiln-lab run --kiln "$GITHUB_WORKSPACE/.github/g11/kiln-wrap.sh" --label glibc --profile realistic --rounds 1 --keep --out /mnt/lab/glibc > /mnt/lab/glibc.stdout 2> /mnt/lab/glibc.stderr
+          echo "exit $?"; tail -3 /mnt/lab/glibc.stderr
+          R=$RUNNER_TEMP/results; d=/mnt/lab/glibc; mkdir -p "$R/glibc"
+          python3 -I .github/g11/summarize.py "$d" /mnt/lab/syms.txt /mnt/lab/segments.txt > "$R/glibc/summary.txt" 2>&1
+          cp "$d/run.json" "$d/report.md" "$R/glibc/" 2>/dev/null; tail -60 /mnt/lab/glibc.stderr > "$R/glibc/lab.stderr.txt"
+          for m in "$d"/mem/*/; do r=$R/glibc/mem/$(basename "$m"); mkdir -p "$r"; cp "$m"/rss.csv "$m"/env.txt "$m"/smaps.index "$r/" 2>/dev/null; last=$(tail -1 "$m/smaps.index" 2>/dev/null | cut -d' ' -f1); [ -n "$last" ] && gzip -c "$m/smaps.$last" > "$r/smaps.last.gz"; done
+          bash .github/g11/push.sh "$R" "glibc"
