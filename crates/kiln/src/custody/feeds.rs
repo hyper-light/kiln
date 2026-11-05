@@ -50,6 +50,8 @@ pub fn install(hub: &Arc<Hub>) {
         intake.sign_with(Arc::new(Taker { hub: Arc::downgrade(hub), tx }));
     }
     if let Some(mirrors) = &hub.harness.copies {
+        // kiln's hand-ons to its mirrors kept beside the store, for their receipts' hops (goal 9, plan 01a1a87b2cec step 5).
+        super::recent::keep_for(hub.cfg.conversations.mirrors);
         let w = Arc::downgrade(hub);
         mirrors.sign_with(Arc::new(move |machine: &str, peer: crate::convo::mirror::Peer| Arc::new(ToMirror { hub: w.clone(), machine: machine.to_owned(), peer }) as Arc<dyn Custodian>));
     }

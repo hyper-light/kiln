@@ -275,7 +275,83 @@ type Broken = (Break, Vec<String>, String);
 /// store.
 async fn read(bundle: &std::sync::Arc<Value>, root: &std::sync::Arc<[u8]>, revocations: &std::sync::Arc<[Revocation]>, came_from: &str, at: i64, org: &str) -> anyhow::Result<Read> {
     let (bundle, root, revocations, came_from, org) = (std::sync::Arc::clone(bundle), std::sync::Arc::clone(root), std::sync::Arc::clone(revocations), came_from.to_owned(), org.to_owned());
-    crate::rt::compute(move || read_now(&bundle, &root, &revocations, came_from, at, &org)).await
+    crate::rt::compute(move || with_recent_hop(read_now(&bundle, &root, &revocations, came_from, at, &org), &org)).await
+}
+
+/// `read`, its own hop checked now where every record it needs is one of kiln's own kept moments ago ([`recent`]: a
+/// mirror's receipt of kiln's hand-on of a batch), with those as they checked when kiln signed them (goal 9, plan
+/// 01a1a87b2cec step 5). Its keeping call then reads no row for the hop, and no job of its own reads them back and
+/// checks them again: the same hop as those rows give (the same records, checked as kiln took them).
+fn with_recent_hop(mut read: Read, org: &str) -> Read {
+    let found = match &read.verdict {
+        Verdict::Custody { own: Own::Waits { checked, wanted }, .. } => recent::hop(checked, wanted, org),
+        _ => None,
+    };
+    if let (Some(found), Verdict::Custody { own, .. }) = (found, &mut read.verdict) {
+        *own = Own::Alone(found);
+        recent::served();
+    }
+    read
+}
+
+/// kiln's own records kept moments ago, as they checked when it signed them (its hand-ons of its store's batches to
+/// mirrors: [`sign_and_take`]), found by digest (goal 9, plan 01a1a87b2cec step 5): a mirror's receipt of one, taken
+/// soon after, has its hop checked with it as it's read ([`with_recent_hop`]). A ring of slots, each swapped whole,
+/// no lock; one found in none (older, another process's) is read back from the store, as before.
+pub(crate) mod recent {
+    use std::collections::BTreeMap;
+    use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+    use std::sync::{Arc, OnceLock};
+
+    use arc_swap::ArcSwapOption;
+    use kiln_ci::identity::statement::Checked;
+
+    struct Ring {
+        slots: Box<[ArcSwapOption<Checked>]>,
+        next: AtomicUsize,
+    }
+
+    static RING: OnceLock<Ring> = OnceLock::new();
+    /// Hops checked with records found here: what a lab and the tests read.
+    static SERVED: AtomicU64 = AtomicU64::new(0);
+
+    /// Keeps them for `mirrors` mirrors (`[conversations] mirrors`), once a process: each mirror's feed has at most
+    /// `crate::convo::feed::WINDOW` batches sent ahead of its answers, and a batch's receipt can still be on its way as
+    /// the window moves on, so twice that a mirror, one at the least.
+    pub fn keep_for(mirrors: usize) {
+        let slots = 2 * crate::convo::feed::WINDOW * mirrors.max(1);
+        let _ = RING.get_or_init(|| Ring { slots: (0..slots).map(|_| ArcSwapOption::empty()).collect(), next: AtomicUsize::new(0) });
+    }
+
+    /// `c`, one of kiln's own records just kept, in the place of the oldest.
+    pub fn keep(c: Checked) {
+        let Some(ring) = RING.get() else { return };
+        let at = ring.next.fetch_add(1, Ordering::Relaxed).checked_rem(ring.slots.len());
+        if let Some(slot) = at.and_then(|i| ring.slots.get(i)) {
+            slot.store(Some(Arc::new(c)));
+        }
+    }
+
+    /// Record `digest`, if it's here.
+    pub fn find(digest: &str) -> Option<Arc<Checked>> {
+        RING.get()?.slots.iter().find_map(|s| s.load_full().filter(|c| c.digest == digest))
+    }
+
+    /// The hop of `mine` (a record as read), which needs the records `wanted`, checked with them here ([`super::broken`]),
+    /// when every one is; else none (read back as before).
+    pub fn hop(mine: &Checked, wanted: &[String], org: &str) -> Option<Option<super::Broken>> {
+        let map: BTreeMap<String, Checked> = wanted.iter().map(|w| find(w).map(|c| (w.clone(), Checked::clone(&c)))).collect::<Option<_>>()?;
+        Some(super::broken(&mine.digest, mine.clone(), map, wanted, org))
+    }
+
+    pub fn served() {
+        SERVED.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Hops checked with records kept here, so far.
+    pub fn served_so_far() -> u64 {
+        SERVED.load(Ordering::Relaxed)
+    }
 }
 
 /// [`read`], on the thread it's called on: a compute job's.
@@ -393,13 +469,17 @@ pub async fn sign_and_take(store: &Store, pki: &std::sync::Arc<crate::pki::Pki>,
     let revoked = crate::identities::revoked(store).await?;
     let org = pki.organization();
     let (signer, revocations, came, of) = (std::sync::Arc::clone(pki), std::sync::Arc::clone(&revoked.list), came_from.to_owned(), org.clone());
-    let (bundle, read) = crate::rt::compute(move || -> anyhow::Result<(std::sync::Arc<Value>, Read)> {
+    let (bundle, read, checked) = crate::rt::compute(move || -> anyhow::Result<(std::sync::Arc<Value>, Read, Option<Checked>)> {
         let bundle = std::sync::Arc::new(server_signed(&signer, &s)?);
-        let read = read_now(&bundle, &signer.ca_der, &revocations, came, at, &of);
-        Ok((bundle, read))
+        let (read, checked) = read_keeping(&bundle, &signer.ca_der, &revocations, came, at, &of, true);
+        Ok((bundle, read, checked))
     })
     .await??;
     let taken = take_read(store, &pki.ca_der, &org, std::sync::Arc::clone(&bundle), Some((read, revoked)), came_from, at).await;
+    // Kept (or kept before), as it checked: what a receipt of it, soon after, has its hop checked with (`recent`).
+    if let (Ok(Ok(_)), Some(checked)) = (&taken, checked) {
+        recent::keep(checked);
+    }
     Ok((std::sync::Arc::unwrap_or_clone(bundle), taken))
 }
 
@@ -2532,6 +2612,51 @@ mod tests {
             assert!(matches!(&late, Err(Refused::Unsigned(why)) if why.contains("runner forgotten")), "{late:?}");
             assert_eq!(count(&store, "custody").await?, 2, "the revoked signer's record isn't kept");
             assert_eq!(store.revoked_kept().map(|r| r.list.len()), Some(1), "the revocations were read again");
+            Ok(())
+        })
+    }
+
+    /// Goal 9, plan 01a1a87b2cec step 5: a mirror's receipt of kiln's hand-on, taken while kiln keeps the hand-on beside the
+    /// store as it checked ([`recent`]), has its hop checked with it as the receipt is read, and comes out as taking it with
+    /// the hand-on read back from the store does: the same digests, the same break (none for a hop that holds; the same
+    /// one for a hop that doesn't), the same rows.
+    #[test]
+    fn g9_s5_a_receipts_hop_with_kilns_hand_on_kept_beside_it_is_as_read_back() -> anyhow::Result<()> {
+        // Room enough that other tests' hand-ons kept meanwhile don't push this one's out.
+        recent::keep_for(16);
+        crate::rt::block_on(async {
+            let dir = tempfile::tempdir()?;
+            let pki = crate::pki::Pki::open_scratch(&dir.path().join("pki"))?;
+            let (root, org) = (pki.ca_der.clone(), pki.organization());
+            let at = crate::util::now_unix();
+            let server = server_uri(&org);
+            let (fedora_uri, jupiter_uri) = (FEDORA.replace(ORG, &org), JUPITER.replace(ORG, &org));
+            let (kiln, fedora) = (Signer::new(&pki, &server)?, Signer::new(&pki, &fedora_uri)?);
+            // A hand-on to fedora (its receipt's hop holds) and one to jupiter (fedora's receipt of it breaks).
+            for (n, to) in [(1, &fedora_uri), (2, &jupiter_uri)] {
+                let batch = thing(&format!("conversation store s1 batch {n}"), 'e');
+                let hand_on = kiln.sign(&record(Kind::HandedOn, &batch, Some(to.as_str()), None, &[], "feed", n))?;
+                let receipt = fedora.sign(&record(Kind::Received, &batch, None, Some(&server), &[&digest_of(&hand_on)], "feed", n))?;
+                let mut outcomes = Vec::new();
+                for beside in [false, true] {
+                    let store = Store::in_memory()?;
+                    crate::identities::record(&store, "runner", &fedora_uri, &fedora.pem).await?;
+                    crate::identities::revoked(&store).await?;
+                    let given = kiln_or(take(&store, &root, &org, &hand_on, "kiln", at).await?)?;
+                    if beside {
+                        recent::keep(statement::verify(&hand_on, &root, &[], at).map_err(|e| anyhow::anyhow!("{e}"))?);
+                    }
+                    let served = recent::served_so_far();
+                    let took = kiln_or(take(&store, &root, &org, &receipt, "runner fedora-2", at).await?)?;
+                    anyhow::ensure!(!beside || recent::served_so_far() > served, "{n}: its hop checked with the hand-on kept beside the store");
+                    outcomes.push((given.digest, took.digest, took.broke, count(&store, "custody").await?, count(&store, "custody_breaks").await?));
+                }
+                anyhow::ensure!(outcomes.first() == outcomes.get(1), "{n}: read back, then beside the store: {outcomes:?}");
+                let broke = outcomes.first().and_then(|o| o.2.clone());
+                anyhow::ensure!(broke.is_some() == (n == 2), "{n}: {broke:?}");
+            }
+            // One not kept beside the store: none found, its hop read back as before.
+            anyhow::ensure!(recent::find("f".repeat(64).as_str()).is_none());
             Ok(())
         })
     }
