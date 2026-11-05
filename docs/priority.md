@@ -428,6 +428,35 @@ read it), and `KILN_RT_NUDGE_US` sets its period for a lab's A/B.
 - **If the lab shows `auto` costs a calm server beyond noise** (docs/runtime-lab.md, "Goal 6 step 3 and goal 8
   step 7: the nudge on its own"), the default goes back to `off` (`Config::default`'s `nudge`).
 
+## Critical's own path
+
+What a person's page, sign-in or action and a health check wait for besides their shard's turn (goal 6, plan
+`01a1a59c2abe` step 3), and what each does now:
+
+- **Their shard's wakes.** A request on a kept-alive connection (a browser's, the lab's pages) wakes its
+  connection's shard as its bytes arrive; a new connection wakes the shard its listener's task runs on, then the
+  one it's placed on (`crate::rt::spawn_connection`, round-robin as goal 7's A/B chose). On a lazy kernel beside
+  a busy thread each such wake waits up to a tick; nudging (`auto`, above), each waits at most the nudge's bound.
+  Placing a new connection on the shard that accepts it would take one of the two wakes off it, but changes goal
+  7's placement, and is for its A/B to decide.
+- **The answer's write.** A response is written in its connection's task as its handler returns (HTTP/1.1 and
+  HTTP/2 alike, round-robin placement), no wake between; a page's bytes come from memory (`crate::ui`).
+- **Health.** `/readyz` answers from what the server knows (`crate::pool_health::store_writer_stuck`,
+  `Store::writer_running`), no longer a `SELECT 1` through kiln.db's one writer, which waited behind every write
+  before it (the lab's writer line: 0.7 s at p99; on 2026-10-30 production's readiness failed on it under the
+  host's load and a deploy was rolled back). The store is unready only once its writer's thread has stopped, or
+  while calls wait for it and it has finished none for 30 s: as long as the longest any prober kiln configures
+  waits for `/readyz` (KilnCD's checks, 30 s where they name no timeout; the Kubernetes probe kiln installs, 3 s),
+  so no prober sees it unready where the `SELECT 1` would have answered within its wait.
+- **The pools' lines.** A job a Critical task submits to the blocking pool (a sign-in's password file, a
+  person's session and rights read from kiln.db on the `store` share) waits ahead of the rest of its share's
+  line, as the shard's run queue takes that class first, its share's places bounding it as they bound the rest
+  (`hyper_rt::blocking`). Before, a person's read waited behind every read before it: custody's held the `store`
+  share's line at about 14 jobs, 80 ms each (the census, train 8).
+- **Not yet:** the compute pool's line is first come, first served (a sign-in's Argon2 check waited there with
+  the rest: 37 ms at p99 with hogs in g9p7); and a sign-in, like a person's action that writes, waits for
+  kiln.db's writer, whose line is the store's group commit's to shorten.
+
 ## Step 7's lab
 
 `scripts/priority_lab/s7c.sh` runs the A/B of the three ways to keep the host off the shards, in production's

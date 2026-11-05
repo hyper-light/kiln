@@ -57,9 +57,33 @@ fn pools() -> &'static Pools {
 /// ([`queues`]), as kiln-rt's occupancy says it of a pool's.
 static STORE_WRITE_WAITING: AtomicI64 = AtomicI64::new(0);
 
+/// When kiln.db's writer last finished a call, and when its line last formed (a call sent while none waited), on
+/// [`clock_ms`]'s clock (0: never): what readiness reads of whether the writer keeps up ([`store_writer_stuck`]).
+static STORE_WRITE_ENDED_MS: AtomicU64 = AtomicU64::new(0);
+static STORE_WRITE_FORMED_MS: AtomicU64 = AtomicU64::new(0);
+
+/// How long kiln.db's writer may finish nothing while calls wait for it before readiness says the store is stuck
+/// (goal 6, plan 01a1a59c2abe step 3: `/readyz` answered from memory): as long as the longest any prober kiln
+/// configures waits for `/readyz`. KilnCD's checks give one 30 s where it names no timeout (`crate::cd::guard`;
+/// `.kiln/deploy.yaml`'s `serving` names none and rolls back on one failure), and the Kubernetes probe kiln installs
+/// waits 3 s (`crate::install_targets`). The `SELECT 1` `/readyz` sent through the writer before failed a prober
+/// whenever the writer's line took longer than its wait to reach it, moving or not; a writer that finished nothing
+/// for the longest of them would have failed every one, so no prober sees the store unready where it saw it ready.
+pub const WRITER_STUCK: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Milliseconds since this clock was first read, plus one, so 0 says never.
+fn clock_ms() -> u64 {
+    static BASE: OnceLock<std::time::Instant> = OnceLock::new();
+    let base = *BASE.get_or_init(std::time::Instant::now);
+    u64::try_from(base.elapsed().as_millis()).unwrap_or(u64::MAX).saturating_add(1)
+}
+
 /// A call was sent to kiln.db's writer (`1`), or the writer started one (`-1`).
 pub fn store_write_queued(delta: i64) {
-    STORE_WRITE_WAITING.fetch_add(delta, Ordering::Relaxed);
+    let before = STORE_WRITE_WAITING.fetch_add(delta, Ordering::Relaxed);
+    if delta > 0 && before <= 0 {
+        STORE_WRITE_FORMED_MS.store(clock_ms(), Ordering::Relaxed);
+    }
 }
 
 /// A call kiln.db's writer ran: how long it waited for its turn, from being sent, and how long it ran.
@@ -68,6 +92,22 @@ pub fn store_write(waited: std::time::Duration, ran: std::time::Duration) {
     p.store_write_wait.observe(waited.as_secs_f64());
     p.store_write_run.observe(ran.as_secs_f64());
     longest(QUEUES.len() - 1, u64::try_from(waited.as_micros()).unwrap_or(u64::MAX));
+    STORE_WRITE_ENDED_MS.store(clock_ms(), Ordering::Relaxed);
+}
+
+/// Whether kiln.db's writer is stuck (goal 6, plan 01a1a59c2abe step 3; `/readyz`): calls wait for it and it has
+/// finished none for [`WRITER_STUCK`] since their line formed. How many wait, and how long it has finished none; none
+/// while it keeps up, however long its line, and while nothing waits.
+pub fn store_writer_stuck() -> Option<(u64, std::time::Duration)> {
+    stuck(STORE_WRITE_WAITING.load(Ordering::Relaxed), STORE_WRITE_FORMED_MS.load(Ordering::Relaxed), STORE_WRITE_ENDED_MS.load(Ordering::Relaxed), clock_ms(), WRITER_STUCK)
+}
+
+/// [`store_writer_stuck`] from `waiting` calls, the line `formed_ms`, the last call `ended_ms` and `now_ms`, stuck
+/// once it has finished none for `after`.
+fn stuck(waiting: i64, formed_ms: u64, ended_ms: u64, now_ms: u64, after: std::time::Duration) -> Option<(u64, std::time::Duration)> {
+    let waiting = u64::try_from(waiting).ok().filter(|n| *n > 0)?;
+    let still = std::time::Duration::from_millis(now_ms.saturating_sub(formed_ms.max(ended_ms)));
+    (still >= after).then_some((waiting, still))
 }
 
 /// The longest wait each pool of [`QUEUES`] told since the overload detector last took them, microseconds (goal 6,
@@ -213,5 +253,26 @@ mod tests {
         };
         assert!(count("kiln_blocking_run_seconds", crate::rt::SHARE_STORE).is_some_and(|n| n >= 1), "the store's job: {o}");
         assert!(!o.contains("no such share"));
+    }
+
+    /// Goal 6, plan 01a1a59c2abe step 3: kiln.db's writer is stuck only where calls wait for it and it finished none for
+    /// as long as kiln's longest prober waits, from the later of their line forming and its last call: never while
+    /// nothing waits, nor while it keeps finishing calls however long its line.
+    #[test]
+    fn g6_s3_the_writer_is_stuck_only_when_it_finishes_nothing_while_calls_wait() {
+        let after = WRITER_STUCK;
+        let ms = u64::try_from(after.as_millis()).unwrap_or(u64::MAX);
+        assert_eq!(stuck(0, 1, 1, 10 * ms, after), None, "nothing waits");
+        assert_eq!(stuck(-1, 1, 1, 10 * ms, after), None, "a count that went past zero waits for nothing");
+        assert_eq!(stuck(40, 1_000, 2 * ms, 2 * ms + 50, after), None, "a long line it keeps working off");
+        assert_eq!(stuck(3, 1_000, 900, 1_000 + ms - 1, after), None, "not yet");
+        assert_eq!(stuck(3, 1_000, 900, 1_000 + ms, after), Some((3, after)), "a line of 3 nothing finished for the whole wait");
+        assert_eq!(stuck(1, 5_000, 0, 5_000 + 2 * ms, after), Some((1, 2 * after)), "a writer that never finished one");
+        // The writer's figures as it tells them: a call sent while none waited forms a line; one finished moves it on.
+        store_write_queued(1);
+        store_write_queued(-1);
+        store_write(std::time::Duration::ZERO, std::time::Duration::ZERO);
+        assert!(STORE_WRITE_FORMED_MS.load(Ordering::Relaxed) > 0 && STORE_WRITE_ENDED_MS.load(Ordering::Relaxed) > 0);
+        assert_eq!(store_writer_stuck(), None, "just finished one");
     }
 }

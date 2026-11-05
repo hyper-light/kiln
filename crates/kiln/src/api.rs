@@ -6806,9 +6806,17 @@ async fn readyz(hub: &Hub) -> Response {
         let v = o.view();
         return srv::text(StatusCode::SERVICE_UNAVAILABLE, &format!("observe's store is replaying its log ({} of {} entries applied)", v.applied, v.replay_to));
     }
-    match hub.store.call(|c| Ok(c.query_row("SELECT 1", [], |r| r.get::<_, i64>(0))?)).await {
-        Ok(_) => srv::text(StatusCode::OK, &format!("ready{note}")),
-        Err(e) => srv::text(StatusCode::SERVICE_UNAVAILABLE, &format!("store: {e:#}")),
+    // The store, from what the server knows of it (goal 6, plan 01a1a59c2abe step 3): readiness is Critical, and the
+    // `SELECT 1` it sent through kiln.db's one writer waited behind every write before it (the lab's writer line, 0.7 s
+    // at p99; a deploy rolled back on it, 2026-10-30). Ready while its writer runs and keeps up; not once its thread has
+    // stopped, or while calls wait and it has finished none for as long as kiln's longest prober waits
+    // (`crate::pool_health::WRITER_STUCK`), so no prober sees it unready where the call would have answered in time.
+    if !hub.store.writer_running() {
+        return srv::text(StatusCode::SERVICE_UNAVAILABLE, "store: its writer has stopped");
+    }
+    match crate::pool_health::store_writer_stuck() {
+        Some((waiting, still)) => srv::text(StatusCode::SERVICE_UNAVAILABLE, &format!("store: {waiting} calls wait for its writer, which has finished none for {} s", still.as_secs())),
+        None => srv::text(StatusCode::OK, &format!("ready{note}")),
     }
 }
 
