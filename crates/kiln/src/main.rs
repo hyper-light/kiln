@@ -10,6 +10,13 @@ use kiln::rt::Shutdown;
 
 use kiln::{config, install, supervise};
 
+/// The `jemalloc` feature's allocator, on Linux (goal 11, plan 01a1a87b2e56 step 4): what the lab's A/B measures
+/// against musl's (production's) and glibc's, by resident memory and latency. Elsewhere, and without the
+/// feature, the platform's allocator as before.
+#[cfg(all(feature = "jemalloc", target_os = "linux"))]
+#[global_allocator]
+static ALLOCATOR: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
+
 #[derive(Parser)]
 #[command(name = "kiln", version, about = "Self-hosted GitOps CI/CD for the hyper-light stack")]
 struct Cli {

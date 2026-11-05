@@ -52,6 +52,14 @@ pub struct Ev {
 /// references), never every event.
 const CHUNK: usize = (MAX_EVENTS + MAX_EVENTS / 4).isqrt();
 
+/// A session's newest events its copy keeps in memory, whatever else of it is spilled (`super::spill`; goal
+/// 11, plan 01a1a87b2e56 step 5): the events API's page as it's asked for without a `limit` (`GET
+/// /api/harness/sessions/{id}/events`, `crate::api`'s `conversation_events`), which is what a client's first
+/// read asks for at the most (the lab's readers ask for 50), so the API answers it from memory as before
+/// (goal 10, plan 01a1a87b2dae step 2). A sealed chunk past it, once packed, goes to its copy's spill file:
+/// a copy keeps its index, its open chunk and the chunks among these (two at the most, of [`CHUNK`]).
+pub const EVENTS_PAGE: usize = 100;
+
 /// What a reader needs of one of a copy's events without its text: its id and number, the copy's
 /// revision when it last changed, where its text is among its chunk's texts joined by `,` (as an
 /// `events` frame joins them), and its text's digest (`crate::wire::sums::event_text`). Numbering,
@@ -115,6 +123,9 @@ pub struct Chunk {
     packed: OnceLock<Arc<Segment>>,
     /// Whether it was sent to be packed (`seal`): once a chunk.
     sealing: AtomicBool,
+    /// Where its segment went, once spilled (`super::spill`): a spilled chunk keeps its metas alone in
+    /// memory, its segment read back where it's asked for (a snapshot, on the blocking pool).
+    spilled: Option<super::spill::Spilled>,
 }
 
 impl Clone for Chunk {
@@ -128,7 +139,8 @@ impl Clone for Chunk {
         {
             SEGMENT_BYTES.fetch_add(s.deflated.len(), Ordering::Relaxed);
         }
-        Self { meta: self.meta.clone(), evs: self.evs.clone(), packed, sealing: AtomicBool::new(false) }
+        let spilled = self.spilled.clone().filter(|_| self.is_compact());
+        Self { meta: self.meta.clone(), evs: self.evs.clone(), packed, sealing: AtomicBool::new(false), spilled }
     }
 }
 
@@ -149,7 +161,7 @@ impl Chunk {
                 m
             })
             .collect();
-        Self { meta, evs, packed: OnceLock::new(), sealing: AtomicBool::new(false) }
+        Self { meta, evs, packed: OnceLock::new(), sealing: AtomicBool::new(false), spilled: None }
     }
 
     pub fn len(&self) -> usize {
@@ -193,12 +205,15 @@ impl Chunk {
             .map(Cow::Owned)
     }
 
-    /// Its texts joined as an `events` frame joins them: a compact one's segment inflated, another's
-    /// written out now.
+    /// Its texts joined as an `events` frame joins them: a compact one's segment inflated (read back first
+    /// when it's spilled), another's written out now.
     pub fn joined(&self) -> std::io::Result<Cow<'_, [u8]>> {
         if self.is_compact() {
-            let s = self.packed.get().ok_or_else(|| std::io::Error::other("a compact chunk without its segment"))?;
-            return super::packed::inflate(s).map(Cow::Owned);
+            if let Some(s) = self.packed.get() {
+                return super::packed::inflate(s).map(Cow::Owned);
+            }
+            let s = self.spilled.as_ref().ok_or_else(|| std::io::Error::other("a compact chunk without its segment"))?;
+            return super::packed::inflate(&s.segment()?).map(Cow::Owned);
         }
         let mut joined = Vec::with_capacity(self.meta.last().map_or(0, |m| m.off + m.len));
         for (i, e) in self.evs.iter().enumerate() {
@@ -221,7 +236,18 @@ impl Chunk {
         if packed.set(Arc::clone(s)).is_ok() {
             SEGMENT_BYTES.fetch_add(s.deflated.len(), Ordering::Relaxed);
         }
-        Some(Self { meta: self.meta.clone(), evs: Vec::new(), packed, sealing: AtomicBool::new(true) })
+        Some(Self { meta: self.meta.clone(), evs: Vec::new(), packed, sealing: AtomicBool::new(true), spilled: None })
+    }
+
+    /// Whether its segment is on disk (`super::spill`), not in memory.
+    pub fn is_spilled(&self) -> bool {
+        self.spilled.is_some()
+    }
+
+    /// It spilled: its metas, and where its segment went (`s`). None unless it's compact with its segment in
+    /// memory (one changed since is kept as it is).
+    fn spilled_as(&self, s: super::spill::Spilled) -> Option<Self> {
+        (self.is_compact() && self.packed.get().is_some()).then(|| Self { meta: self.meta.clone(), evs: Vec::new(), packed: OnceLock::new(), sealing: AtomicBool::new(true), spilled: Some(s) })
     }
 
     /// A compact chunk's events read again into it, to change one. False when its segment can't give them
@@ -232,7 +258,9 @@ impl Chunk {
         }
         match self.evs().map(Cow::into_owned) {
             Ok(evs) => {
+                // Read back to change: kept in memory again (a later spill writes it anew).
                 self.evs = evs;
+                self.spilled = None;
                 true
             }
             Err(e) => {
@@ -247,6 +275,10 @@ impl Chunk {
     pub fn pack(&self) -> std::io::Result<Arc<Segment>> {
         if let Some(s) = self.packed.get() {
             return Ok(Arc::clone(s));
+        }
+        // Spilled: read back (on the blocking pool, as snapshots are made), and kept nowhere.
+        if let Some(s) = &self.spilled {
+            return s.segment().map(Arc::new);
         }
         // Its digests with it, off the owner's shard: a packed chunk's are all there.
         for (m, e) in self.meta.iter().zip(&self.evs) {
@@ -395,7 +427,9 @@ impl Events {
     /// The texts of the events in `range`, joined by `,` as an `events` frame joins them, onto `out`: a
     /// compact chunk's inflated once for all of its events there (goal 11, plan 01a1a87b2e56 step 2), whose
     /// texts lie joined so in its segment, from the first one's `off` to the end of the last one's. None when
-    /// the range isn't all there, or a compact chunk's segment can't be read.
+    /// the range isn't all there, a compact chunk's segment can't be read, or one is spilled: it's read on the
+    /// runtime's threads, which don't wait on disk, and the store answers instead (goal 11, plan 01a1a87b2e56
+    /// step 5; the newest [`EVENTS_PAGE`] are never spilled).
     pub fn texts_into(&self, range: std::ops::Range<usize>, out: &mut Vec<u8>) -> Option<()> {
         let mut i = range.start;
         while i < range.end {
@@ -403,6 +437,9 @@ impl Events {
             let chunk = self.chunks.get(c)?;
             let n = chunk.len().checked_sub(k)?.min(range.end - i);
             if n == 0 {
+                return None;
+            }
+            if chunk.is_spilled() {
                 return None;
             }
             if i > range.start {
@@ -565,6 +602,38 @@ impl Events {
                 *slot = Arc::new(c);
             }
         }
+    }
+
+    /// Its sealed chunks past its newest `page` events that are packed and in memory: what its copy's owner
+    /// spills (`super::spill`), oldest first.
+    pub(super) fn spillable(&self, page: usize) -> Vec<Arc<Chunk>> {
+        let mut after = 0usize;
+        let mut out = Vec::new();
+        for c in self.chunks.iter().rev() {
+            if after >= page && c.is_compact() && !c.is_spilled() && c.packed().is_some() {
+                out.push(Arc::clone(c));
+            }
+            after = after.saturating_add(c.len());
+        }
+        out.reverse();
+        out
+    }
+
+    /// Each of `chunks` swapped for its spilled form (`spilled`, in the same order), where it's still one of
+    /// these events' chunks as it was: one changed or let go of meanwhile stays as it is (its spilled bytes
+    /// go when nothing refers to them). How many were.
+    pub(super) fn spilled(&mut self, chunks: &[Arc<Chunk>], spilled: Vec<super::spill::Spilled>) -> usize {
+        let mut n = 0;
+        let list = Arc::make_mut(&mut self.chunks);
+        for (c, s) in chunks.iter().zip(spilled) {
+            if let Some(slot) = list.iter_mut().find(|slot| Arc::ptr_eq(slot, c))
+                && let Some(made) = c.spilled_as(s)
+            {
+                *slot = Arc::new(made);
+                n += 1;
+            }
+        }
+        n
     }
 
     /// The first index whose event `pred` is false for, the events being those it's true for first.
@@ -931,6 +1000,13 @@ pub struct Mirror {
     /// Its owner's inbox, held weakly (none until a shard takes it in): a chunk packed off the shard
     /// comes back through it to be kept compact (goal 11, plan 01a1a87b2e56 step 2).
     owner: Option<crate::memory::queue::WeakSender<Msg>>,
+    /// Where its sealed chunks are spilled (none: they're kept in memory), the file they go to now, and
+    /// whether a spill is under way (one at a time): goal 11, plan 01a1a87b2e56 step 5.
+    spill: Option<Arc<super::spill::Dir>>,
+    spill_file: Option<Arc<super::spill::File>>,
+    spilling: bool,
+    /// Its last spill was refused (said once, until one is written again).
+    spill_refused: bool,
 }
 
 /// An info as the API answers with it: `serde_json`'s compact form (what `srv::json` wrote of it).
@@ -988,12 +1064,46 @@ impl Mirror {
             slot,
             info_json: encoding,
             owner: None,
+            spill: None,
+            spill_file: None,
+            spilling: false,
+            spill_refused: false,
         }
     }
 
     /// Where its chunks come back to once packed, once a shard took it in.
     fn home(&self) -> Option<Home> {
         Some(Home { inbox: self.owner.clone()?, id: Arc::clone(&self.slot.id) })
+    }
+
+    /// Its sealed chunks past its newest [`EVENTS_PAGE`] events, once packed, written to its spill file off
+    /// the runtime's threads (the blocking pool), then kept as their metas and where they went: its owner
+    /// swaps them in as the write comes back (`Shard::spilled`), a spill at a time (goal 11, plan
+    /// 01a1a87b2e56 step 5). None is let go of until its bytes are written and synced; a write that fails
+    /// leaves them in memory.
+    fn spill_old(&mut self) {
+        let (Some(dir), Some(home)) = (self.spill.clone(), self.home()) else { return };
+        if self.spilling || !crate::rt::on_shard() {
+            return;
+        }
+        let chunks = self.events.spillable(EVENTS_PAGE);
+        let segments: Vec<Arc<Segment>> = chunks.iter().filter_map(|c| c.packed().cloned()).collect();
+        if chunks.is_empty() || segments.len() != chunks.len() {
+            return;
+        }
+        self.spilling = true;
+        let file = self.spill_file.clone();
+        drop(crate::rt::spawn(async move {
+            let id = Arc::clone(&home.id);
+            let written = match crate::rt::blocking(move || super::spill::write(&dir, file, &id, &segments)).await {
+                Ok(written) => written,
+                Err(e) => Err(std::io::Error::other(format!("{e:#}"))),
+            };
+            if let Some(inbox) = home.inbox.upgrade() {
+                let id = Arc::clone(&home.id);
+                let _ = inbox.send(Msg::Run(Box::new(move |s: &mut Shard| s.spilled(&id, &chunks, written)))).await;
+            }
+        }));
     }
 
     /// The copy as it is now, for its readers.
@@ -1227,6 +1337,7 @@ impl Mirror {
         }
         let home = self.home();
         self.events.compact(home.as_ref());
+        self.spill_old();
         false
     }
 
@@ -1252,7 +1363,7 @@ impl Mirror {
     /// once ([`View::parts_since`]).
     #[cfg(test)]
     pub fn resume(&self, after: u64, files: Option<String>) -> Option<Vec<String>> {
-        self.view().parts_since(after).map(|parts| super::registry::Snapshot { parts, files }.frames())
+        self.view().parts_since(after).map(|parts| super::registry::Snapshot { parts, files, store: None }.frames())
     }
 
 }
@@ -1268,6 +1379,8 @@ pub struct Shard {
     bus: Arc<dyn kiln_seams::Bus>,
     /// A session came or went since its board was last published.
     board_changed: bool,
+    /// Where its copies' sealed chunks are spilled, once set (`Copies::spill_to`).
+    spill: Arc<OnceLock<Arc<super::spill::Dir>>>,
 }
 
 impl Shard {
@@ -1297,6 +1410,7 @@ impl Shard {
             std::collections::hash_map::Entry::Occupied(_) => false,
             std::collections::hash_map::Entry::Vacant(slot) => {
                 m.owner = Some(self.inbox.clone());
+                m.spill = self.spill.get().cloned();
                 m.publish();
                 slot.insert(m);
                 self.board_changed = true;
@@ -1313,6 +1427,7 @@ impl Shard {
                 self.board_changed = true;
                 let m = v.insert(make());
                 m.owner = Some(self.inbox.clone());
+                m.spill = self.spill.get().cloned();
                 m
             }
         }
@@ -1324,7 +1439,32 @@ impl Shard {
         if let Some(m) = self.mirrors.get_mut(id) {
             let home = m.home();
             m.events.compact(home.as_ref());
+            m.spill_old();
             m.publish();
+        }
+    }
+
+    /// A spill of session `id`'s chunks come back (`Mirror::spill_old`): written, each chunk still its
+    /// copy's as it was swapped for its spilled form, its readers given the view of that, and what sealed
+    /// meanwhile spilled in turn; refused, they stay in memory as they were, said (goal 11, plan 01a1a87b2e56
+    /// step 5). Either way the next spill may go.
+    fn spilled(&mut self, id: &str, chunks: &[Arc<Chunk>], written: std::io::Result<(Arc<super::spill::File>, Vec<super::spill::Spilled>)>) {
+        let Some(m) = self.mirrors.get_mut(id) else { return };
+        m.spilling = false;
+        match written {
+            Ok((file, spilled)) => {
+                m.spill_refused = false;
+                m.spill_file = Some(file);
+                if m.events.spilled(chunks, spilled) > 0 {
+                    m.publish();
+                }
+                m.spill_old();
+            }
+            Err(e) => {
+                if !std::mem::replace(&mut m.spill_refused, true) {
+                    tracing::warn!(session = id, error = %e, "a session copy's sealed chunks couldn't be spilled: they stay in memory (said again once a spill is written)");
+                }
+            }
         }
     }
 
@@ -1418,6 +1558,9 @@ pub struct RunnerUpdate {
     pub shipped: bool,
     /// When its frame came off the wire: what its wait to be taken is measured from (`crate::route_latency`).
     pub arrived: Option<std::time::Instant>,
+    /// When the hub's loop handed it to this owner's inbox: its wait's last leg is from there
+    /// (`crate::route_latency::RunnerLeg::ToOwner`).
+    pub handed: Option<std::time::Instant>,
 }
 
 type Job = Box<dyn FnOnce(&mut Shard) + Send>;
@@ -1456,6 +1599,8 @@ pub struct Copies {
     boards: Arc<[ArcSwap<Board>]>,
     /// The hub the owners act through (what a change tells the rest of kiln), once made.
     hub: Arc<OnceLock<Weak<Hub>>>,
+    /// Where the owners spill their copies' sealed chunks, once set.
+    spill: Arc<OnceLock<Arc<super::spill::Dir>>>,
 }
 
 impl Copies {
@@ -1470,14 +1615,24 @@ impl Copies {
         let shards = shards.max(1);
         let boards: Arc<[ArcSwap<Board>]> = (0..shards).map(|_| ArcSwap::from_pointee(Board::new())).collect::<Vec<_>>().into();
         let hub = Arc::new(OnceLock::new());
+        let spill = Arc::new(OnceLock::new());
         let mut inboxes = Vec::with_capacity(shards);
         for me in 0..shards {
             let (tx, rx) = crate::memory::queue::bounded(&crate::memory::owners::SESSION_INBOXES, inbox);
-            let shard = Shard { me, inbox: tx.downgrade(), mirrors: HashMap::new(), boards: Arc::clone(&boards), bus: Arc::clone(&bus), board_changed: false };
+            let shard = Shard { me, inbox: tx.downgrade(), mirrors: HashMap::new(), boards: Arc::clone(&boards), bus: Arc::clone(&bus), board_changed: false, spill: Arc::clone(&spill) };
             crate::rt::spawn_owner(me, own(shard, rx, Arc::clone(&hub)));
             inboxes.push(tx);
         }
-        Self { inboxes, boards, hub }
+        Self { inboxes, boards, hub, spill }
+    }
+
+    /// Its copies' sealed chunks spilled to the folder at `path` (`super::spill`), emptied of what an
+    /// earlier process spilled there: set once, as the registry starts, before any copy is made. Without
+    /// it they're kept in memory.
+    pub fn spill_to(&self, path: &std::path::Path) -> std::io::Result<()> {
+        let dir = super::spill::Dir::open(path)?;
+        let _ = self.spill.set(dir);
+        Ok(())
     }
 
     /// The hub the owners act through, once it's made.
@@ -1975,6 +2130,170 @@ mod tests {
         }
         assert!(events.texts_into(n - 1..n + 1, &mut Vec::new()).is_none(), "past its end");
         Ok(())
+    }
+
+    /// A viewer's snapshot of `m` as it is: its frames, all of it packed as one message, and a catch-up from
+    /// revision 3 (as `crate::api`'s `send_snapshot` writes them, here on the test's thread).
+    fn attached(m: &Mirror) -> anyhow::Result<(Vec<String>, Vec<u8>, Option<Vec<String>>)> {
+        let whole = super::super::registry::Snapshot { parts: m.view().parts(), files: None, store: None };
+        let caught_up = m.view().parts_since(3).map(|parts| super::super::registry::Snapshot { parts, files: None, store: None }.frames());
+        Ok((whole.frames(), whole.packed("synced")?, caught_up))
+    }
+
+    /// Goal 11, plan 01a1a87b2e56 step 5: a copy whose sealed chunks past its newest page went to its spill
+    /// file attaches as it did: a viewer's snapshot (its frames, and packed as one message) and a catch-up are
+    /// the same bytes, in the same order, as before the spill. The events API's newest page still comes from
+    /// memory, an older page from the store; and an event changed in a spilled chunk is read back and changed.
+    #[test]
+    fn g11_s5_a_spilled_copy_attaches_as_it_did() -> anyhow::Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let dir = super::super::spill::Dir::open(&tmp.path().join("spill"))?;
+        let mut m = Mirror::new(Info { id: "s".into(), ..Info::default() }, Location::Local, sim_bus());
+        // Seven chunks, the newest open with nine: the three among the newest hundred events stay, four go.
+        let n = u64::try_from(CHUNK * 6 + 9)?;
+        for q in 1..=n {
+            m.rev = q;
+            m.upsert(entry(&format!("e{q}"), q));
+        }
+        for c in m.events.chunks().iter().filter(|c| c.is_full()) {
+            c.pack()?;
+        }
+        m.events.compact(None);
+        m.publish();
+        let before = attached(&m)?;
+        let newest = m.view().events_json(None, 50);
+        anyhow::ensure!(newest.is_some(), "the newest page from memory");
+        let chunks = m.events.spillable(EVENTS_PAGE);
+        anyhow::ensure!(chunks.len() == 4, "{} chunks past the newest page", chunks.len());
+        let segments: Vec<Arc<Segment>> = chunks.iter().filter_map(|c| c.packed().cloned()).collect();
+        let held = SEGMENT_BYTES.load(Ordering::Relaxed);
+        let (_file, spilled) = super::super::spill::write(&dir, None, "s", &segments)?;
+        anyhow::ensure!(m.events.spilled(&chunks, spilled) == 4, "every one of them spilled");
+        drop((chunks, segments));
+        m.publish();
+        anyhow::ensure!(m.events.chunks().iter().filter(|c| c.is_spilled()).all(|c| c.packed().is_none()), "a spilled chunk keeps no segment in memory");
+        anyhow::ensure!(SEGMENT_BYTES.load(Ordering::Relaxed) < held, "what went to the file left memory");
+        anyhow::ensure!(attached(&m)? == before, "the same bytes, in the same order, after the spill");
+        anyhow::ensure!(m.view().events_json(None, 50) == newest, "the newest page still from memory");
+        anyhow::ensure!(m.view().events_json(Some(20), 10).is_none(), "an older page is the store's to answer");
+        // An event of a spilled chunk changed: read back, changed, its chunk in memory again.
+        m.rev = n + 1;
+        m.upsert(Arc::new(Entry::new(json!({"id": "e3", "seq": 3, "kind": "assistant", "text": "said again"}))));
+        anyhow::ensure!(m.events.chunks().first().is_some_and(|c| !c.is_spilled()), "the changed chunk is in memory again");
+        anyhow::ensure!(m.events.get(2).is_some_and(|e| e.entry.text().contains("said again")), "changed");
+        anyhow::ensure!(m.events.get(80).and_then(|e| e.entry.seq()) == Some(81), "the rest as they were");
+        Ok(())
+    }
+
+    /// Goal 11, plan 01a1a87b2e56 step 5: a spilled chunk whose file doesn't give it back is never lost to a
+    /// viewer: its snapshot reads those events from the conversation store by their numbers (here kept as the
+    /// copy had them: the same frames as before), and without a store the snapshot is refused, not made wrong.
+    #[test]
+    fn g11_s5_a_spill_that_doesnt_read_back_is_read_from_the_store() -> anyhow::Result<()> {
+        use crate::convo::rows::{EventRow, Row};
+        let tmp = tempfile::tempdir()?;
+        let folder = tmp.path().join("spill");
+        let dir = super::super::spill::Dir::open(&folder)?;
+        let store = crate::convo::store::Store::start(Box::new(crate::convo::turso::Turso::open(&tmp.path().join("convo.db"))?), crate::convo::store::Upkeep::default())?;
+        let mut m = Mirror::new(Info { id: "s".into(), ..Info::default() }, Location::Local, sim_bus());
+        let n = u64::try_from(CHUNK * 6 + 9)?;
+        let mut rows = Vec::new();
+        for q in 1..=n {
+            m.rev = q;
+            let e = entry(&format!("e{q}"), q);
+            let body = e.text().to_owned();
+            rows.push(Row::Event(Box::new(EventRow { session: "s".into(), id: format!("e{q}"), seq: q, at: 0, parent: None, by: None, kind: "assistant".into(), level: None, tool: None, status: None, text: String::new(), body })));
+            m.upsert(e);
+        }
+        store.put(rows);
+        for c in m.events.chunks().iter().filter(|c| c.is_full()) {
+            c.pack()?;
+        }
+        m.events.compact(None);
+        let before = super::super::registry::Snapshot { parts: m.view().parts(), files: None, store: None }.frames();
+        let chunks = m.events.spillable(EVENTS_PAGE);
+        let segments: Vec<Arc<Segment>> = chunks.iter().filter_map(|c| c.packed().cloned()).collect();
+        let (_file, spilled) = super::super::spill::write(&dir, None, "s", &segments)?;
+        anyhow::ensure!(m.events.spilled(&chunks, spilled) == 4);
+        drop((chunks, segments));
+        // The file's bytes lost under it: each spilled chunk is refused as it's read back.
+        for f in std::fs::read_dir(&folder)? {
+            let path = f?.path();
+            let len = std::fs::metadata(&path)?.len();
+            std::fs::write(&path, vec![0u8; usize::try_from(len)?])?;
+        }
+        let with = super::super::registry::Snapshot { parts: m.view().parts(), files: None, store: Some((store.clone(), Arc::from("s"))) };
+        anyhow::ensure!(with.frames() == before, "the store's events, the same frames");
+        anyhow::ensure!(with.packed("synced").is_ok(), "packed from the store's events too");
+        let without = super::super::registry::Snapshot { parts: m.view().parts(), files: None, store: None };
+        anyhow::ensure!(without.packed("synced").is_err(), "no store: refused, not made wrong");
+        store.close()?;
+        Ok(())
+    }
+
+    /// Goal 11, plan 01a1a87b2e56 step 5: a session's owner spills its sealed chunks past its newest page by
+    /// itself, once they're packed; a viewer's snapshot of it, read back on the blocking pool, is the one a
+    /// copy that kept them all in memory makes; and its spill file goes with the session.
+    #[test]
+    fn g11_s5_an_owner_spills_its_sealed_chunks_past_the_newest_page() -> anyhow::Result<()> {
+        crate::rt::block_on(async {
+            let tmp = tempfile::tempdir()?;
+            let folder = tmp.path().join("spill");
+            let copies = Arc::new(Copies::start_with(sim_bus(), 1, 64 * MSG));
+            copies.spill_to(&folder)?;
+            let (bus, id) = (sim_bus(), "s1".to_owned());
+            let info = Info { id: id.clone(), ..Info::default() };
+            let i = id.clone();
+            copies.on(&id, move |s| s.insert(i, Mirror::new(info, Location::Local, bus))).await;
+            let n = u64::try_from(CHUNK * 6 + 3)?;
+            let i = id.clone();
+            copies
+                .on(&id, move |s| {
+                    if let Some(m) = s.get_mut(&i) {
+                        for q in 1..=n {
+                            m.rev = q;
+                            m.upsert(entry(&format!("e{q}"), q));
+                        }
+                        m.publish();
+                    }
+                })
+                .await;
+            // Seven chunks, the newest open: the three among the newest hundred events stay, four go.
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+            loop {
+                let spilled = copies.with(&id, |v| v.events.chunks().iter().filter(|c| c.is_spilled()).count()).unwrap_or(0);
+                if spilled == 4 {
+                    break;
+                }
+                anyhow::ensure!(std::time::Instant::now() < deadline, "{spilled} of 4 chunks spilled");
+                crate::rt::sleep(std::time::Duration::from_millis(5)).await;
+            }
+            // The same copy, its chunks packed and kept in memory.
+            let mut kept = Mirror::new(Info { id: id.clone(), ..Info::default() }, Location::Local, sim_bus());
+            for q in 1..=n {
+                kept.rev = q;
+                kept.upsert(entry(&format!("e{q}"), q));
+            }
+            for c in kept.events.chunks().iter().filter(|c| c.is_full()) {
+                c.pack()?;
+            }
+            kept.events.compact(None);
+            kept.publish();
+            let want = super::super::registry::Snapshot { parts: kept.view().parts(), files: None, store: None }.frames();
+            let view = copies.view(&id).ok_or_else(|| anyhow::anyhow!("no copy"))?;
+            let got = crate::rt::blocking(move || super::super::registry::Snapshot { parts: view.parts(), files: None, store: None }.frames()).await?;
+            anyhow::ensure!(got == want, "the spilled copy's snapshot is the kept one's");
+            anyhow::ensure!(std::fs::read_dir(&folder)?.count() == 1, "one spill file, the copy's");
+            // The session gone, its file goes with it.
+            let i = id.clone();
+            copies.on(&id, move |s| drop(s.remove(&i))).await;
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+            while std::fs::read_dir(&folder)?.count() > 0 {
+                anyhow::ensure!(std::time::Instant::now() < deadline, "the spill file outlived its session");
+                crate::rt::sleep(std::time::Duration::from_millis(5)).await;
+            }
+            Ok(())
+        })
     }
 
     /// Each order of `owner` steps of the owner's and `viewer` steps of a viewer's, each keeping its

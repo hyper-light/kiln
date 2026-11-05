@@ -5339,7 +5339,9 @@ async fn harness_sessions(hub: &Hub, caller: &crate::authz::Caller) -> Response 
 async fn conversation_events(hub: &Hub, id: &str, q: &HashMap<String, String>) -> R {
     let Some(store) = hub.harness.convo.clone() else { return Err(err(StatusCode::NOT_FOUND, "this server keeps no conversations (KILN_CONVERSATIONS is off)")) };
     let before = q.get("before").and_then(|b| b.parse::<u64>().ok());
-    let limit = q.get("limit").and_then(|l| l.parse::<usize>().ok()).unwrap_or(100).clamp(1, 1000);
+    // The page asked for without a `limit` is what each session's copy keeps in memory, whatever else of it is
+    // spilled (goal 11, plan 01a1a87b2e56 step 5).
+    let limit = q.get("limit").and_then(|l| l.parse::<usize>().ok()).unwrap_or(crate::harness::copies::EVENTS_PAGE).clamp(1, 1000);
     // From the session's copy when it holds them all: the events' texts as each was written once,
     // joined, neither the store read nor anything encoded (goal 10, plan 01a1a87b2dae step 2).
     if let Some(events) = hub.harness.events_json(id, before, limit) {
@@ -6142,7 +6144,7 @@ fn harness_ws(hub: Arc<Hub>, id: String, req: Request) -> R {
     let caller = req.extensions().get::<crate::authz::Caller>().cloned();
     // Whose its commands' ids are: a caller's, as an Idempotency-Key's are.
     let scope = caller.as_ref().map_or_else(String::new, crate::harness::ops::key_scope);
-    let (resp, upgrade) = ws::accept(req).map_err(|r| ApiError(r.status, r.reason.into()))?;
+    let (resp, upgrade) = ws::accept_commands(req).map_err(|r| ApiError(r.status, r.reason.into()))?;
     crate::rt::spawn(async move {
         let Ok(socket) = upgrade.await else { return };
         // Watching is seeing (checked before the upgrade); commands on the socket need acting, and
@@ -6191,11 +6193,16 @@ async fn send_snapshot(tx: &mut ws::Sender, snapshot: crate::harness::registry::
     // What's made and not yet handed to the socket is counted as the snapshots' (`crate::memory::SNAPSHOTS`;
     // goal 11, plan 01a1a87b2e56 step 3): a packed one until its last piece goes (its pieces share its
     // buffer), frames as each goes.
+    // Between its pieces the shard goes to its other tasks once this one has had its share of it
+    // (`crate::rt::consume_budget`): a socket that takes each piece at once never made it wait, and a long
+    // session's megabytes went out in one poll, holding its shard's other viewers, owners and requests
+    // 4.4 ms at the most in rt5's calm lab and 8.6 ms with shedding on (goal 10, plan 01a1a87b2dae step 5).
     if packed {
         let bytes = crate::rt::blocking(move || snapshot.packed(&synced())).await??;
         let _held = crate::memory::SNAPSHOTS.hold(bytes.capacity());
         for piece in pieces(bytes) {
             tx.send(piece).await?;
+            crate::rt::consume_budget().await;
         }
         return Ok(());
     }
@@ -6205,6 +6212,7 @@ async fn send_snapshot(tx: &mut ws::Sender, snapshot: crate::harness::registry::
         let n = f.capacity();
         tx.send(ws::text(f)).await?;
         held.release(n);
+        crate::rt::consume_budget().await;
     }
     tx.send(ws::text(synced())).await?;
     Ok(())
@@ -6422,6 +6430,9 @@ async fn harness_attach(hub: Arc<Hub>, id: String, socket: ws::WebSocket, takes:
                             crate::route_latency::observe(crate::route_latency::Class::Websocket, waited, read_at.elapsed());
                         }
                         at = Some(next);
+                        // A viewer behind its feed reads batch after batch, each ready at once: past its
+                        // share of its shard, the shard's other tasks go between (as a snapshot's pieces do).
+                        crate::rt::consume_budget().await;
                     }
                     Err(Refusal::Behind { .. }) => {
                         crate::metrics::bus().lag_notices.inc();

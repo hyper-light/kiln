@@ -116,14 +116,11 @@ fn keep(cache: &Rcu<HashMap<String, Bytes>>, name: &str, packed: &Bytes) {
     }
 }
 
-/// The brotli window for `len` bytes, as bits: the smallest that holds the whole file, between brotli's
-/// least (10 bits) and the 22 bits (4 MiB) kiln took for every file before. A window past the file finds no
-/// match the file's own doesn't, and the encoder's memory at quality 11 grows with the window, eight bytes
-/// a place of it: 22 bits took 34 MB for each file, a 20 KB file's took 256 KB (goal 11, plan
-/// 01a1a87b2e56 step 3).
+/// The brotli window for a file of `len` bytes: the smallest that holds the whole file
+/// (`crate::util::brotli_window`), where kiln took 22 bits (4 MiB) for every file before: 34 MB of encoder
+/// for each at quality 11, a 20 KB file's 256 KB (goal 11, plan 01a1a87b2e56 step 3).
 fn window_bits(len: usize) -> u32 {
-    // A window of `bits` holds (1 << bits) - 16 bytes.
-    (10..22).find(|bits| (1usize << bits).saturating_sub(16) >= len).unwrap_or(22)
+    crate::util::brotli_window(len)
 }
 
 /// `data` brotli-compressed at the highest quality, once per file.
@@ -137,16 +134,28 @@ fn brotli(name: &str, data: &[u8]) -> Option<Bytes> {
         w.write_all(data).ok()?;
         w.flush().ok()?;
     }
+    smaller(name, data, out, br_cache())
+}
+
+/// `out`, `data` packed, kept for `name` in `cache` if it's smaller than `data` (else `data` goes as it is),
+/// in an allocation of its own size: the buffer it was made in grew as it went, and what's kept is kept as
+/// long as the server runs (goal 11, plan 01a1a87b2e56 step 5).
+fn smaller(name: &str, data: &[u8], mut out: Vec<u8>, cache: &Rcu<HashMap<String, Bytes>>) -> Option<Bytes> {
+    if out.len() >= data.len() {
+        return None;
+    }
+    out.shrink_to_fit();
     let out = Bytes::from(out);
-    keep(br_cache(), name, &out);
+    keep(cache, name, &out);
     Some(out)
 }
 
-/// `name` packed (brotli or gzip, by its cache), made already; else none now, and both made on the
-/// compute pool for the next request (once at a time for a file): CPU work, which held a place of the
-/// blocking pool's, meant for calls that block (goal 3, plan 01a1a59c2a8e step 4). Only this build's
-/// files (`ours`) are packed and kept: an earlier build's goes as it is, so what's kept is bounded by the
-/// build (goal 11, plan 01a1a87b2e56 step 3).
+/// `name` packed (brotli or gzip, by its cache), made already; else none now, and made that way on the
+/// compute pool for the next request (once at a time for a file and a coding): CPU work, which held a
+/// place of the blocking pool's, meant for calls that block (goal 3, plan 01a1a59c2a8e step 4). Only the
+/// coding asked for is made: browsers take brotli, so a gzip copy is made only for a client that takes
+/// gzip alone (goal 11, plan 01a1a87b2e56 step 5). Only this build's files (`ours`) are packed and kept:
+/// an earlier build's goes as it is, so what's kept is bounded by the build (goal 11, step 3).
 fn packed(name: &str, data: &Bytes, cache: &'static Rcu<HashMap<String, Bytes>>, ours: bool) -> Option<(Bytes, &'static str)> {
     let coding = if std::ptr::eq(cache, br_cache()) { "br" } else { "gzip" };
     if let Some(b) = cache.load().get(name) {
@@ -155,21 +164,23 @@ fn packed(name: &str, data: &Bytes, cache: &'static Rcu<HashMap<String, Bytes>>,
     if !ours {
         return None;
     }
-    static MAKING: OnceLock<Rcu<std::collections::HashSet<String>>> = OnceLock::new();
+    static MAKING: OnceLock<Rcu<std::collections::HashSet<(&'static str, String)>>> = OnceLock::new();
     let making = MAKING.get_or_init(Default::default);
-    if making.update(|m| m.insert(name.to_owned())) {
+    if making.update(|m| m.insert((coding, name.to_owned()))) {
         let (name, data) = (name.to_owned(), data.clone());
         drop(crate::rt::spawn(async move {
             let n = name.clone();
-            let _ = crate::rt::compute(move || {
-                let _ = brotli(&n, &data);
-                let _ = gzip(&n, &data);
-            })
-            .await;
-            making.update(|m| m.remove(&name));
+            let _ = crate::rt::compute(move || make(&n, &data, coding)).await;
+            let key = (coding, name);
+            making.update(|m| m.remove(&key));
         }));
     }
     None
+}
+
+/// `data`, `name`'s, packed as `coding` says (`br` or `gzip`), and kept so.
+fn make(name: &str, data: &[u8], coding: &str) -> Option<Bytes> {
+    if coding == "br" { brotli(name, data) } else { gzip(name, data) }
 }
 
 /// Whether an Accept-Encoding header takes `coding` (and doesn't refuse it with q=0).
@@ -182,24 +193,28 @@ fn accepts(header: Option<&str>, coding: &str) -> bool {
     })
 }
 
-/// Compresses every embedded file that's worth it, both ways, so no request has to wait for it: on the
-/// compute pool, a file at a time (goal 3, plan 01a1a59c2a8e step 4: CPU work, which held one of the
-/// blocking pool's places for as long as every file took, written out with the assets' files). What
-/// they take so is the bound of what the UI's files keep in memory (`crate::memory::UI_ASSETS`).
+/// Compresses every embedded file that's worth it with brotli, the coding browsers take, so no browser's
+/// request has to wait for it: on the compute pool, a file at a time (goal 3, plan 01a1a59c2a8e step 4: CPU
+/// work, which held one of the blocking pool's places for as long as every file took, written out with the
+/// assets' files). A gzip copy is made only for a client that takes gzip alone (`packed`): kept for every
+/// file as well, gzip took 3.8 MB of the 5.4 MB the UI's files held in the lab's realistic profile, whose
+/// pages (as a browser's: `br, gzip`) never asked for one (goal 11, plan 01a1a87b2e56 step 5). The bound of
+/// what the UI's files keep in memory (`crate::memory::UI_ASSETS`) is the brotli copies made here and, for
+/// each, its file's own size: a gzip copy is kept only when it's smaller than its file.
 pub async fn warm() {
     let names: Vec<String> = Assets::iter().map(|n| n.into_owned()).collect();
     let made = crate::rt::compute_map(names, |name| {
         let Some(f) = Assets::get(&name) else { return 0 };
         let mime = mime_guess::from_path(&name).first_or_octet_stream();
         if compressible(mime.as_ref()) && f.data.len() > 1024 {
-            brotli(&name, &f.data).map_or(0, |b| b.len()) + gzip(&name, &f.data).map_or(0, |b| b.len())
+            brotli(&name, &f.data).map_or(0, |b| b.len()).saturating_add(f.data.len())
         } else {
             0
         }
     })
     .await;
     match made {
-        Ok(sizes) => crate::memory::UI_ASSETS.bound_at(sizes.iter().sum()),
+        Ok(sizes) => crate::memory::UI_ASSETS.bound_at(sizes.iter().fold(0usize, |a, b| a.saturating_add(*b))),
         Err(e) => tracing::warn!(error = %format!("{e:#}"), "the UI's files weren't compressed ahead: each is as it's first asked for"),
     }
 }
@@ -214,9 +229,7 @@ fn gzip(name: &str, data: &[u8]) -> Option<Bytes> {
     }
     let mut enc = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::best());
     enc.write_all(data).ok()?;
-    let out = Bytes::from(enc.finish().ok()?);
-    keep(gz_cache(), name, &out);
-    Some(out)
+    smaller(name, data, enc.finish().ok()?, gz_cache())
 }
 
 /// A static file of the UI, if `req` asks for one: this build's, or an earlier build's asset (a page
@@ -345,5 +358,31 @@ mod tests {
         let made = gzip("assets/ours-g11test.js", data.as_ref()).map_or(0, |b| b.len());
         assert!(made > 0);
         assert!(crate::memory::UI_ASSETS.bytes() >= before + made);
+    }
+
+    /// Goal 11, plan 01a1a87b2e56 step 5: a copy is kept only when it's smaller than its file, and only in the
+    /// coding asked for: a brotli copy (what browsers take) doesn't bring a gzip one with it.
+    #[test]
+    fn g11_s5_a_copy_is_kept_only_smaller_and_only_as_asked() {
+        // Bytes no compressor shortens (a xorshift stream): nothing kept, the file goes as it is.
+        let mut x = 0x9e37_79b9_7f4a_7c15_u64;
+        let noise: Vec<u8> = (0..4096)
+            .map(|_| {
+                x ^= x << 13;
+                x ^= x >> 7;
+                x ^= x << 17;
+                u8::try_from(x & 0xff).unwrap_or(0)
+            })
+            .collect();
+        assert!(gzip("assets/noise-g11s5.bin", &noise).is_none());
+        assert!(!gz_cache().load().contains_key("assets/noise-g11s5.bin"));
+        let text = "kiln's ui, a line again and again\n".repeat(400);
+        let br = make("assets/asked-g11s5.js", text.as_bytes(), "br").unwrap_or_default();
+        assert!(!br.is_empty() && br.len() < text.len());
+        assert!(br_cache().load().contains_key("assets/asked-g11s5.js"));
+        assert!(!gz_cache().load().contains_key("assets/asked-g11s5.js"), "a gzip copy only when one is asked for");
+        let gz = make("assets/asked-g11s5.js", text.as_bytes(), "gzip").unwrap_or_default();
+        assert!(!gz.is_empty() && gz.len() < text.len());
+        assert!(gz_cache().load().contains_key("assets/asked-g11s5.js"));
     }
 }

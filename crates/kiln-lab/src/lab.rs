@@ -445,6 +445,16 @@ fn stamps(text: &[u8]) -> impl Iterator<Item = u64> + '_ {
     })
 }
 
+/// Whether a session socket's text frame brings events, an event's own frame (`{"t":"events"…}`, or its text
+/// streamed: `{"t":"stream"…}`): the frames whose stamps are deliveries, as `websocket` times them. A state's
+/// frame quotes an event's words (its `summary` is the agent's latest), and so may a meta's: after an attach,
+/// the first carried the stamp of an event the viewer took in its snapshot seconds before, counted as a frame
+/// that took that long (goal 10, plan 01a1a87b2dae step 5: rt5's `websocket.own_attach` p50 0.9 s, most 2.6 s,
+/// which were most of the class's p99.9 and all of its most).
+fn brings_events(text: &[u8]) -> bool {
+    text.starts_with(br#"{"t":"events""#) || text.starts_with(br#"{"t":"stream""#)
+}
+
 /// A person viewing agents: opens one's conversation (its whole, packed, as the UI asks), watches
 /// its live frames, then another.
 fn viewer(s: &Shared, i: usize) -> (Vec<Sample>, Vec<Watch>) {
@@ -492,7 +502,7 @@ fn viewer(s: &Shared, i: usize) -> (Vec<Sample>, Vec<Watch>) {
         let mut seen = HashSet::new();
         while Instant::now() < until && !s.stop.load(Ordering::Relaxed) {
             match sock.next() {
-                Ok(Frame::Text(text)) => {
+                Ok(Frame::Text(text)) if brings_events(&text) => {
                     let now = now_us();
                     for stamp in stamps(&text) {
                         if seen.insert(stamp) {
@@ -501,8 +511,8 @@ fn viewer(s: &Shared, i: usize) -> (Vec<Sample>, Vec<Watch>) {
                         }
                     }
                 }
-                // A catch-up (a whole again), or nothing yet.
-                Ok(Frame::Binary | Frame::Nothing) => {}
+                // A catch-up (a whole again), a frame that only quotes events (a state, a meta), or nothing yet.
+                Ok(Frame::Binary | Frame::Text(_) | Frame::Nothing) => {}
                 Ok(Frame::Closed) | Err(_) => break,
             }
         }
@@ -1003,13 +1013,28 @@ fn numbers(seen: &BTreeMap<Class, measure::Seen>, before: &Scrape, after: &Scrap
         }
     }
     let shards = server_numbers(&mut n, "", before, after, secs);
-    // The routes': how long each class took and waited at the server.
+    // The routes': how long each class took and waited at the server, at p99 and at p99.9 (the bar's: goal 10,
+    // plan 01a1a87b2dae step 5, so a class's tail can be set against its legs at the server).
     for class in ["page", "api_read", "api_write", "websocket", "runner"] {
         let want = [("class", class)];
         for (family, key) in [("kiln_route_seconds", "took"), ("kiln_route_wait_seconds", "wait")] {
             let d = measure::delta(&before.buckets(family, &want), &after.buckets(family, &want));
-            if let Some(v) = measure::histogram_quantile(0.99, &d) {
-                n.insert(format!("server.{class}.{key}_p99_ms"), v * 1000.0);
+            for (q, at) in [("p99", 0.99), ("p999", 0.999)] {
+                if let Some(v) = measure::histogram_quantile(at, &d) {
+                    n.insert(format!("server.{class}.{key}_{q}_ms"), v * 1000.0);
+                }
+            }
+        }
+    }
+    // A runner's message's wait by its legs, to the microsecond, where the build has them
+    // (`kiln_runner_wait_leg_seconds`; goal 10, plan 01a1a87b2dae step 4): to the hub's loop taking its frame
+    // (every frame's), that loop handing an agent session's update to the inbox of the shard that owns its
+    // copy, and that owner taking it.
+    for leg in ["to_loop", "in_loop", "to_owner"] {
+        let d = measure::delta(&before.buckets("kiln_runner_wait_leg_seconds", &[("leg", leg)]), &after.buckets("kiln_runner_wait_leg_seconds", &[("leg", leg)]));
+        for (q, at) in [("p50", 0.5), ("p99", 0.99), ("p999", 0.999)] {
+            if let Some(v) = measure::histogram_quantile(at, &d) {
+                n.insert(format!("server.runner.{leg}_{q}_us"), v * 1e6);
             }
         }
     }
@@ -1161,6 +1186,68 @@ mod tests {
         assert!(flood.readers >= 16 * overload.readers && flood.mcp > overload.mcp, "{flood:?}");
         assert_eq!((flood.read_think_ms, flood.mcp_think_ms, flood.dwell_s), (0, 0, 0));
         assert_eq!((flood.sessions.len(), flood.viewers, flood.window_s), (overload.sessions.len(), overload.viewers, overload.window_s));
+    }
+
+    /// Goal 10, plan 01a1a87b2dae step 4: a runner's wait is reported by its legs, each to the microsecond, from
+    /// the server's histogram of it between the window's two scrapes.
+    #[test]
+    fn g10_s4_a_runners_wait_is_reported_by_its_legs() {
+        let legs = ["to_loop", "in_loop", "to_owner"];
+        let scrape = |n: f64| {
+            let mut t = String::new();
+            for leg in legs {
+                // Half the leg's observations at or under 0.5 ms, all of them at or under 1 ms.
+                for (le, c) in [("0.0005", n / 2.0), ("0.001", n), ("+Inf", n)] {
+                    t.push_str(&format!("kiln_runner_wait_leg_seconds_bucket{{leg=\"{leg}\",le=\"{le}\"}} {c}\n"));
+                }
+            }
+            measure::Scrape::parse(&t)
+        };
+        let (n, _) = numbers(&BTreeMap::new(), &scrape(0.0), &scrape(1000.0), 60.0);
+        for leg in legs {
+            let p50 = n.get(&format!("server.runner.{leg}_p50_us")).copied();
+            let p99 = n.get(&format!("server.runner.{leg}_p99_us")).copied();
+            assert!(p50.is_some_and(|v| (v - 500.0).abs() < 1.0), "{leg}: p50 {p50:?}");
+            assert!(p99.is_some_and(|v| (v - 990.0).abs() < 1.0), "{leg}: p99 {p99:?}");
+        }
+        let (n, _) = numbers(&BTreeMap::new(), &scrape(0.0), &scrape(0.0), 60.0);
+        assert!(!n.keys().any(|k| k.contains("to_owner")), "a build without the legs reports none");
+    }
+
+    /// Goal 10, plan 01a1a87b2dae step 5: only a frame that brings events (or an event's streamed text) is a
+    /// delivery; a state's or a meta's frame that quotes an event's words (a summary is the agent's latest) isn't,
+    /// whatever stamp it carries.
+    #[test]
+    fn g10_s5_only_frames_that_bring_events_are_deliveries() {
+        let event = format!(r#"{{"t":"events","events":[{{"id":"e1","text":"{STAMP}1700000000000000 the retry loop"}}],"rev":9}}"#);
+        let stream = format!(r#"{{"t":"stream","id":"e2","text":"{STAMP}1700000000000500 more","rev":10}}"#);
+        let state = format!(r#"{{"t":"state","state":{{"summary":"{STAMP}1699999990000000 the retry loop"}},"rev":11}}"#);
+        let patch = format!(r#"{{"t":"state_patch","set":{{"summary":"{STAMP}1699999990000000 x"}},"rev":12}}"#);
+        for (frame, brings) in [(&event, true), (&stream, true), (&state, false), (&patch, false)] {
+            assert_eq!(brings_events(frame.as_bytes()), brings, "{frame}");
+            assert_eq!(stamps(frame.as_bytes()).count(), 1, "the stamp is read either way: {frame}");
+        }
+    }
+
+    /// Goal 10, plan 01a1a87b2dae step 5: each class's server-side wait and time taken are reported at p99.9 too.
+    #[test]
+    fn g10_s5_a_classs_server_numbers_reach_p999() {
+        let scrape = |n: f64| {
+            let mut t = String::new();
+            for family in ["kiln_route_wait_seconds", "kiln_route_seconds"] {
+                // A thousand observations: 990 at or under 1 ms, the rest at or under 10 ms.
+                for (le, c) in [("0.001", n * 0.99), ("0.01", n), ("+Inf", n)] {
+                    t.push_str(&format!("{family}_bucket{{class=\"websocket\",le=\"{le}\"}} {c}\n"));
+                }
+            }
+            measure::Scrape::parse(&t)
+        };
+        let (n, _) = numbers(&BTreeMap::new(), &scrape(0.0), &scrape(1000.0), 60.0);
+        for key in ["wait", "took"] {
+            let p999 = n.get(&format!("server.websocket.{key}_p999_ms")).copied();
+            assert!(p999.is_some_and(|v| (v - 9.1).abs() < 0.01), "{key}: p99.9 {p999:?}");
+            assert!(n.get(&format!("server.websocket.{key}_p99_ms")).is_some_and(|v| (v - 1.0).abs() < 0.01), "{key}: p99");
+        }
     }
 
     #[test]

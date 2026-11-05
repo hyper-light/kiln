@@ -122,6 +122,16 @@ pub fn truncate(s: &str, max: usize) -> &str {
     s.get(..end).unwrap_or_default()
 }
 
+/// The brotli window for `len` bytes, as bits: the smallest that holds them all, between brotli's least (10
+/// bits) and 22 bits (4 MiB). A window past the data finds no match the data's own doesn't, and memory follows
+/// the window on both sides: the encoder's at quality 11 takes eight bytes a place of it (22 bits took 34 MB
+/// for each UI file), and a decoder's ring buffer grows to the window as the output passes it (goal 11, plan
+/// 01a1a87b2e56 steps 3 and 5).
+pub fn brotli_window(len: usize) -> u32 {
+    // A window of `bits` holds (1 << bits) - 16 bytes.
+    (10..22).find(|bits| (1usize << bits).saturating_sub(16) >= len).unwrap_or(22)
+}
+
 /// HMAC-SHA256 of `msg` under `key`, hex encoded.
 pub fn hmac_hex(key: &[u8], msg: &[u8]) -> String {
     use hmac::{KeyInit as _, Mac as _};
