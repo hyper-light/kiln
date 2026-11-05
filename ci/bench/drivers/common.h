@@ -30,6 +30,13 @@
 #include <string.h>
 #include <time.h>
 
+/* A cast either language compiles cleanly: Envoy builds C++ with -Werror,-Wold-style-cast. */
+#ifdef __cplusplus
+#define KB_CAST(T, x) static_cast<T>(x)
+#else
+#define KB_CAST(T, x) ((T)(x))
+#endif
+
 typedef struct {
     const char *algo;
     uint32_t n, c;
@@ -48,11 +55,11 @@ static inline uint64_t kb_splitmix(uint64_t *s) {
 static inline uint64_t kb_now(void) {
     struct timespec t;
     clock_gettime(CLOCK_MONOTONIC, &t);
-    return (uint64_t)t.tv_sec * 1000000000ULL + (uint64_t)t.tv_nsec;
+    return KB_CAST(uint64_t, t.tv_sec) * 1000000000ULL + KB_CAST(uint64_t, t.tv_nsec);
 }
 
 static int kb_cmp64(const void *a, const void *b) {
-    uint64_t x = *(const uint64_t *)a, y = *(const uint64_t *)b;
+    uint64_t x = *KB_CAST(const uint64_t *, a), y = *KB_CAST(const uint64_t *, b);
     return x < y ? -1 : x > y;
 }
 
@@ -75,8 +82,8 @@ static inline int kb_parse(int argc, char **argv, kb_args *a) {
     a->seed = 1;
     for (int i = 1; i + 1 < argc; i += 2) {
         if (!strcmp(argv[i], "-a")) a->algo = argv[i + 1];
-        else if (!strcmp(argv[i], "-n")) a->n = (uint32_t)strtoul(argv[i + 1], 0, 10);
-        else if (!strcmp(argv[i], "-c")) a->c = (uint32_t)strtoul(argv[i + 1], 0, 10);
+        else if (!strcmp(argv[i], "-n")) a->n = KB_CAST(uint32_t, strtoul(argv[i + 1], 0, 10));
+        else if (!strcmp(argv[i], "-c")) a->c = KB_CAST(uint32_t, strtoul(argv[i + 1], 0, 10));
         else if (!strcmp(argv[i], "-r")) a->rho = strtod(argv[i + 1], 0);
         else if (!strcmp(argv[i], "-s")) a->steps = strtoull(argv[i + 1], 0, 10);
         else if (!strcmp(argv[i], "-S")) a->seed = strtoull(argv[i + 1], 0, 10);
@@ -104,8 +111,8 @@ typedef struct {
 static inline void kb_quality_init(kb_quality *q, uint32_t n, uint32_t c, uint64_t k) {
     memset(q, 0, sizeof *q);
     q->n = n, q->c = c;
-    q->load = (uint32_t *)calloc(n, sizeof *q->load);
-    q->level = (uint32_t *)calloc(k + 2, sizeof *q->level);
+    q->load = KB_CAST(uint32_t *, calloc(n, sizeof *q->load));
+    q->level = KB_CAST(uint32_t *, calloc(k + 2, sizeof *q->level));
     q->level[0] = n;
 }
 
@@ -130,8 +137,8 @@ static inline void kb_quality_drop(kb_quality *q, uint32_t b) {
 
 static inline void kb_quality_sample(kb_quality *q) {
     if (q->total == 0) return;
-    double mean = (double)q->total / q->n;
-    double var = (double)q->sumsq / q->n - mean * mean;
+    double mean = KB_CAST(double, q->total) / q->n;
+    double var = KB_CAST(double, q->sumsq) / q->n - mean * mean;
     q->cv += sqrt(var > 0 ? var : 0) / mean;
     q->peak += q->max / mean;
     q->samples++;
@@ -155,23 +162,23 @@ static inline void kb_report(const char *who, const kb_args *a, uint64_t k, kb_t
         FILE *f = fopen(a->out, "wb");
         if (f) {
             for (uint64_t i = 0; i < t->picks; i++) {
-                uint32_t v = t->ns[i] > 0xffffffffULL ? 0xffffffffU : (uint32_t)t->ns[i];
+                uint32_t v = t->ns[i] > 0xffffffffULL ? 0xffffffffU : KB_CAST(uint32_t, t->ns[i]);
                 fwrite(&v, sizeof v, 1, f);
             }
             fclose(f);
         }
     }
-    uint64_t *s = (uint64_t *)malloc((t->picks ? t->picks : 1) * sizeof *s);
+    uint64_t *s = KB_CAST(uint64_t *, malloc((t->picks ? t->picks : 1) * sizeof *s));
     memcpy(s, t->ns, t->picks * sizeof *s);
     qsort(s, t->picks, sizeof *s, kb_cmp64);
     uint64_t p50 = t->picks ? s[(t->picks - 1) * 50 / 100] : 0, p99 = t->picks ? s[(t->picks - 1) * 99 / 100] : 0;
-    double mean = t->picks ? (double)sum / t->picks : 0;
+    double mean = t->picks ? KB_CAST(double, sum) / t->picks : 0;
     printf("{\"who\":\"%s\",\"algo\":\"%s\",\"n\":%u,\"c\":%u,\"rho\":%.3f,\"d\":1,\"k\":%llu,\"steps\":%llu,\"seed\":%llu,"
            "\"overhead_ns\":%llu,\"p50_ns\":%llu,\"p99_ns\":%llu,\"mean_ns\":%.2f,\"per_s\":%.0f,"
            "\"over\":%llu,\"refused\":%llu,\"cv\":%.5f,\"peak\":%.5f%s%s}\n",
-           who, a->algo, a->n, a->c, a->rho, (unsigned long long)k, (unsigned long long)t->picks, (unsigned long long)a->seed,
-           (unsigned long long)t->overhead, (unsigned long long)p50, (unsigned long long)p99, mean, mean > 0 ? 1e9 / mean : 0.0,
-           (unsigned long long)q->over, (unsigned long long)q->refused, q->samples ? q->cv / q->samples : 0.0,
+           who, a->algo, a->n, a->c, a->rho, KB_CAST(unsigned long long, k), KB_CAST(unsigned long long, t->picks), KB_CAST(unsigned long long, a->seed),
+           KB_CAST(unsigned long long, t->overhead), KB_CAST(unsigned long long, p50), KB_CAST(unsigned long long, p99), mean, mean > 0 ? 1e9 / mean : 0.0,
+           KB_CAST(unsigned long long, q->over), KB_CAST(unsigned long long, q->refused), q->samples ? q->cv / q->samples : 0.0,
            q->samples ? q->peak / q->samples : 0.0, extra && *extra ? "," : "", extra ? extra : "");
     free(s);
 }
@@ -191,11 +198,11 @@ static inline uint64_t kb_less(uint64_t a, uint64_t b, uint64_t overhead) {
 #define KB_RUN(who, a, extra_fmt, PREP, PICK, FREE) KB_RUN2(who, a, extra_fmt, PREP, PICK, (void)0, FREE)
 #define KB_RUN2(who, a, extra_fmt, PREP, PICK, POST, FREE)                                                         \
     do {                                                                                             \
-        uint64_t kb_k = (uint64_t)llround((a)->rho * (double)(a)->n * (double)(a)->c);               \
+        uint64_t kb_k = KB_CAST(uint64_t, llround((a)->rho * KB_CAST(double, (a)->n) * KB_CAST(double, (a)->c)));               \
         kb_quality kb_q;                                                                             \
         kb_quality_init(&kb_q, (a)->n, (a)->c, kb_k + 1);                                            \
-        kb_req *kb_reqs = (kb_req *)calloc(kb_k + 1, sizeof *kb_reqs);                                         \
-        kb_times kb_t = {(uint64_t *)calloc((a)->steps, sizeof(uint64_t)), 0, kb_overhead()};                    \
+        kb_req *kb_reqs = KB_CAST(kb_req *, calloc(kb_k + 1, sizeof *kb_reqs));                                         \
+        kb_times kb_t = {KB_CAST(uint64_t *, calloc((a)->steps, sizeof(uint64_t))), 0, kb_overhead()};                    \
         uint64_t kb_seed = (a)->seed, kb_live = 0;                                                   \
         for (uint64_t kb_i = 0; kb_i < kb_k; kb_i++) {                                               \
             int kb_b = -1;                                                                           \
@@ -204,8 +211,8 @@ static inline uint64_t kb_less(uint64_t a, uint64_t b, uint64_t overhead) {
             PICK;                                                                                    \
             POST;                                                                                    \
             if (kb_b < 0) { kb_q.refused++; continue; }                                              \
-            kb_quality_add(&kb_q, (uint32_t)kb_b);                                                   \
-            kb_reqs[kb_live].backend = (uint32_t)kb_b, kb_reqs[kb_live++].handle = kb_h;                                     \
+            kb_quality_add(&kb_q, KB_CAST(uint32_t, kb_b));                                                   \
+            kb_reqs[kb_live].backend = KB_CAST(uint32_t, kb_b), kb_reqs[kb_live++].handle = kb_h;                                     \
         }                                                                                            \
         kb_q.over = 0, kb_q.refused = 0;                                                             \
         for (uint64_t kb_s = 0; kb_s < (a)->steps; kb_s++) {                                         \
@@ -225,14 +232,14 @@ static inline uint64_t kb_less(uint64_t a, uint64_t b, uint64_t overhead) {
             kb_t.ns[kb_t.picks++] = kb_less(kb_t0, kb_t1, kb_t.overhead);                            \
             POST;                                                                                    \
             if (kb_b < 0) { kb_q.refused++; continue; }                                              \
-            kb_quality_add(&kb_q, (uint32_t)kb_b);                                                   \
+            kb_quality_add(&kb_q, KB_CAST(uint32_t, kb_b));                                                   \
             kb_quality_sample(&kb_q);                                                                \
             if (kb_k == 0) {                                                                         \
-                kb_req kb_one; kb_one.backend = (uint32_t)kb_b, kb_one.handle = kb_h; kb_req *kb_r = &kb_one;                             \
+                kb_req kb_one; kb_one.backend = KB_CAST(uint32_t, kb_b), kb_one.handle = kb_h; kb_req *kb_r = &kb_one;                             \
                 FREE;                                                                                \
                 kb_quality_drop(&kb_q, kb_r->backend);                                               \
             } else {                                                                                 \
-                kb_reqs[kb_live].backend = (uint32_t)kb_b, kb_reqs[kb_live++].handle = kb_h;                                 \
+                kb_reqs[kb_live].backend = KB_CAST(uint32_t, kb_b), kb_reqs[kb_live++].handle = kb_h;                                 \
             }                                                                                        \
         }                                                                                            \
         char kb_extra[256];                                                                          \

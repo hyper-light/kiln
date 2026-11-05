@@ -155,7 +155,9 @@ def main():
         for (who, b, algo, d) in configs:
             for n in ns:
                 for rho in rhos:
-                    cal = once(args.cpu, b, algo, n, rho, d, 200, 0, args.c)
+                    # Calibrated idle (rho 0): no warm-up to pay, which at N = 10,000 and rho 0.9
+                    # is 72,000 of kiln's decisions; a loaded pick costs about what an idle one does.
+                    cal = once(args.cpu, b, algo, n, 0, d, 200, 0, args.c)
                     mean = max((l.get("mean_ns", 0) for l in cal), default=0)
                     s = int(TARGET_NS / mean) if mean > 0 else MIN_STEPS
                     steps[(who, algo, d, n, rho)] = max(MIN_STEPS, min(MAX_STEPS, s))

@@ -97,6 +97,8 @@ def no_worse(k, c):
 def ns(x):
     if x != x:
         return "-"
+    if x >= 10_000_000:
+        return f"{x / 1e6:.2f} ms"
     return f"{x / 1000:.2f} µs" if x >= 10_000 else f"{x:.0f} ns"
 
 
@@ -105,11 +107,17 @@ def fmt_ci(t):
     return f"{ns(v)} [{ns(lo)}, {ns(hi)}]"
 
 
+def sig(x):
+    return f"{x:.3g}"
+
+
 def fmt_ratio(t):
+    """The ratio to 3 significant digits; below 1, also how many times slower kiln is."""
     v, lo, hi = t
     if v != v:
         return "-"
-    return f"{v:.2f}× [{lo:.2f}, {hi:.2f}]"
+    text = f"{sig(v)}× [{sig(lo)}, {sig(hi)}]"
+    return text + (f" (kiln {sig(1 / v)}× slower)" if 0 < v < 1 else "")
 
 
 def main():
@@ -158,11 +166,12 @@ def main():
                 r99 = boot_ratio([r["p99_ns"] for r in algos[best["p99_ns"]]], [r["p99_ns"] for r in k], rng)
                 rmean = boot_ratio([r["mean_ns"] for r in algos[best["mean_ns"]]], [r["mean_ns"] for r in k], rng)
                 cq = quality(algos[best["p50_ns"]])
-                bad = no_worse(kq, cq)
+                # One request in flight at a time (rho 0): no balance to compare.
+                bad = no_worse(kq, cq) if rho > 0 else []
                 speed = r50[1] >= 10 and r99[1] >= 10
                 verdict = "PASS" if speed and not bad else "FAIL"
                 verdicts.append((c, n, rho, verdict, r50, r99, bad))
-                qtxt = (f"over {kq['over']:.3f} vs {cq['over']:.3f}; cv {kq['cv']:.3f} vs {cq['cv']:.3f}; refused {kq['refused']:.3f} vs {cq['refused']:.3f}"
+                qtxt = "n/a (one request in flight)" if rho == 0 else (f"over {kq['over']:.3f} vs {cq['over']:.3f}; cv {kq['cv']:.3f} vs {cq['cv']:.3f}; refused {kq['refused']:.3f} vs {cq['refused']:.3f}"
                         + (f" — worse: {', '.join(bad)}" if bad else ""))
                 w(f"| {c} | {rho} | {best['p50_ns']} | {fmt_ci(boot_mean([r['p50_ns'] for r in algos[best['p50_ns']]], rng))} | {fmt_ci(boot_mean([r['p50_ns'] for r in k], rng))} | "
                   f"{fmt_ratio(r50)} | {best['p99_ns']} | {fmt_ratio(r99)} | {fmt_ratio(rmean)} | {qtxt} | **{verdict}** |")
