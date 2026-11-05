@@ -10,6 +10,8 @@
 //! - [`policy`]: which remote actions a run may use (W07).
 //! - [`oidc`]: the OIDC issuer's key rotation, claims and subjects (W10).
 //! - [`sched`]: queues, concurrency, priorities, fairness, routing, retries (W05).
+//! - [`place`]: placement for commands with no leader on its path: owners' tickets and runners'
+//!   admission (docs/reach.md §2, docs/needs.md E5).
 //! - [`results`]: test reports and flaky classification (W16).
 //! - [`verdict`]: each commit's verdict per unit and test: direct, covered, suspect, culprit (W28).
 //! - [`insights`]: rollups that merge, percentiles, critical paths (W19).
@@ -50,6 +52,7 @@ pub mod land;
 pub mod logs;
 pub mod mirror;
 pub mod oidc;
+pub mod place;
 pub mod plan;
 pub mod policy;
 pub mod results;
