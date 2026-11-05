@@ -93,6 +93,7 @@ pub mod toolfix;
 pub mod trail;
 pub mod tunnel;
 pub mod ui;
+pub mod ui_pack;
 pub mod uiserver;
 pub mod updates;
 pub mod updates_cli;
