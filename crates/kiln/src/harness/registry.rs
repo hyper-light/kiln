@@ -3952,6 +3952,12 @@ impl Registry {
         self.sessions.with(id, |v| Info::clone(&v.info))
     }
 
+    /// [`Registry::info`] as its owner shares it with its view, not copied (goal 9, plan 01a1a87b2cec step 3: what
+    /// reads a few fields of a session found by id, the programs' thresholds and the goal stacks' words said again).
+    pub fn info_shared(&self, id: &str) -> Option<Arc<Info>> {
+        self.sessions.with(id, |v| Arc::clone(&v.info))
+    }
+
     /// What waits in session `id`'s queue, as its machine last said, the messages whole.
     pub fn queue(&self, id: &str) -> Vec<super::model::QueueItem> {
         let Some(state) = self.sessions.with(id, |v| Arc::clone(&v.state)) else { return Vec::new() };

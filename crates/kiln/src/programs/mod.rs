@@ -585,7 +585,9 @@ fn goal_of(i: &crate::goals::Item, names: &HashMap<&str, &str>) -> Goal {
 
 /// Every program kiln runs, the critical path first.
 pub async fn list(hub: &Hub) -> anyhow::Result<Vec<Program>> {
-    let agents = hub.harness.list();
+    // Each session as the registry shares it, none copied (goal 9, plan 01a1a87b2cec step 3: every session's whole
+    // info was copied for each list, and the goal driver's `enforce` asks for one every 15 s).
+    let agents = hub.harness.list_shared();
     let mut out = Vec::new();
     for m in masters(&hub.store).await? {
         out.push(build(hub, &m, &agents).await?);
@@ -617,12 +619,12 @@ async fn changes_of(store: &crate::store::Store, agents: &[&str]) -> anyhow::Res
     Ok(out)
 }
 
-async fn build(hub: &Hub, m: &Master, agents: &[Info]) -> anyhow::Result<Program> {
+async fn build(hub: &Hub, m: &Master, agents: &[std::sync::Arc<Info>]) -> anyhow::Result<Program> {
     let tag = program_tag(&m.tags).unwrap_or_default();
     let settings = seeded(hub, &m.id).await?;
     let slots = settings.slots.unwrap_or(SLOTS).clamp(1, SLOTS_MAX);
     let assigned = assignments(&hub.store, &m.id).await?;
-    let by_id: HashMap<&str, &Info> = agents.iter().map(|i| (i.id.as_str(), i)).collect();
+    let by_id: HashMap<&str, &Info> = agents.iter().map(|i| (i.id.as_str(), &**i)).collect();
     let names: HashMap<&str, &str> = agents.iter().map(|i| (i.id.as_str(), i.name.as_str())).collect();
     let coordinator = m.coordinator.as_deref().and_then(|c| by_id.get(c).copied());
     // Its list of record, whether kiln knows the coordinator's session right now or not.
@@ -745,7 +747,6 @@ pub async fn enforce(hub: &Hub) {
 }
 
 async fn enforce_all(hub: &Hub) -> anyhow::Result<()> {
-    let agents = hub.harness.list();
     for p in list(hub).await? {
         let mut last: BTreeMap<String, u8> = kv_json(&hub.store, thresholds_key(&p.id)).await?;
         let mut wanted: BTreeMap<String, u8> = BTreeMap::new();
@@ -757,8 +758,9 @@ async fn enforce_all(hub: &Hub) -> anyhow::Result<()> {
         let mut changed = false;
         let seen: Vec<String> = last.keys().cloned().collect();
         for agent in wanted.keys().chain(seen.iter().filter(|a| !wanted.contains_key(*a))).cloned().collect::<Vec<_>>() {
-            // A session that's gone: what kiln set on it is forgotten.
-            let Some(info) = agents.iter().find(|i| i.id == agent) else {
+            // A session that's gone: what kiln set on it is forgotten. Each found by its id, as the registry shares
+            // it: every session's whole info was copied, and scanned for each worker (goal 9, plan 01a1a87b2cec step 3).
+            let Some(info) = hub.harness.info_shared(&agent) else {
                 changed |= last.remove(&agent).is_some();
                 continue;
             };
