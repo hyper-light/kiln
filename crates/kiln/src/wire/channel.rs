@@ -633,6 +633,12 @@ impl Receiver {
         Frame::Have(self.streams.iter().map(|(s, i)| i.has(s)).collect())
     }
 
+    /// What it has of stream `stream`, as [`Receiver::have`] says it of each; none when it has no such
+    /// stream.
+    pub fn has(&self, stream: &str) -> Option<Has> {
+        self.streams.get(stream).map(|i| i.has(stream))
+    }
+
     /// The link went down: an item being applied is answered when it's done, on the next link, and
     /// a gap is asked for again only once an item past it comes on that one (its sender sends again
     /// from what this side says it has).

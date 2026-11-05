@@ -734,8 +734,11 @@ door answering reads from its replica (the peer-to-peer unification's P2, plan 0
 its learner from an atomic pointer on each connection, the owners it knows from a copy, whether its
 replica is behind from an atomic, its kept connections to the server from a lock-free queue, and its
 learner's questions of the server from take-once cells; the server's side reads its learners'
-machines from a copy. Inside Quiver
-(vendored, the bus's node): its topics' map and each topic's tail, for Quiver's own change.
+machines from a copy. The live channel's receivers (`wire/link.rs`) are the hub's loop's alone: it
+takes them for each item a runner sends and then its answer, as before, and publishes what they have
+of the stream it changed into a copy per stream, which the commands loop's have-again (every few
+seconds) and a link coming up read: what they say, and when and where acks go, are as they were.
+Inside Quiver (vendored, the bus's node): its topics' map and each topic's tail, for Quiver's own change.
 
 ## Goal 7: placement
 
