@@ -228,6 +228,14 @@ pub enum Reason {
     /// Its owner's link to the runner is down: it keeps its probe there, offered nothing until the
     /// owner is back.
     Away,
+    /// The runner's machine is under strain as the gate's guard sees it (AUDIT L1: its tasks
+    /// stalled on memory and I/O past the scheduler's reserve, `why`): it offers nothing new until
+    /// a measure shows it isn't. Appended: an owner from before reads none of it.
+    Strained { why: String },
+    /// The runner's own health bars this kind of work here until its cause clears, by an event
+    /// (AUDIT L2: its work volume ran full, a run was killed for memory, a tool wasn't found, its
+    /// device's errors rose; `cause` as `sense::health` names it, `why` in words). Appended.
+    Barred { cause: String, why: String },
 }
 
 impl Reason {
@@ -241,6 +249,8 @@ impl Reason {
             Reason::Whole { .. } => (3, None),
             Reason::Draining => (4, None),
             Reason::Away => (5, None),
+            Reason::Strained { .. } => (6, None),
+            Reason::Barred { .. } => (7, None),
         }
     }
 }

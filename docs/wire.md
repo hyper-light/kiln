@@ -503,7 +503,9 @@ run out, and two lines can't take the same one by accident as they could a bit.
   build's announce.
 - **Names.** `link-features`: the runner takes `Ask::Features`. `place`: the runner admits runs owners
   probe it with over links (docs/needs.md E5), and an owner places by probing. `offers`: a runner sends
-  its admission hint (`AgentMsg::Offers`), a server reads it (lb/offers-ui). `told`: news of queued and
+  its admission hint (`AgentMsg::Offers`) when it changes something decided by; a server reads it (the
+  offers view) and passes each runner's room on to the others that named it (`ServerMsg::Offers`), for
+  their owners to choose where to probe by. `told`: news of queued and
   started runs to the asking agent (lb/told, in place of its branch's bit 58). `reach.sizes`: sizes
   from history on links (lb/history, `Ask::RunWith` and `Say::Used`, reach index 14). A name keeps its
   meaning for good; a change in meaning is a new name. A name a side doesn't know, it ignores.
@@ -547,6 +549,7 @@ this branch's rows to the code: each bit once, each appended variant at its inde
 | `ServerMsg` | 67 | `Renewed` | | lb/integrate |
 | `ServerMsg` | 68 | `Stop` | | lb/integrate |
 | `ServerMsg` | 69 | `Features` | | lb/core |
+| `ServerMsg` | 70 | `Offers` | | lb/core2: another runner's room as its admission said it, JSON, for owners choosing where to probe; to a runner that named `offers` |
 | `ServerMsg` | 65–68 | `Amphora`, `ReceivedV2`, `RetainedReceived`, `JobLogReplyV1` | | in flight (fb1bf362): collide; go after the last when they land |
 | `reach::wire::Ask` | 0–11 | `Hello` … `Unread` | reach links | main |
 | `reach::wire::Ask` | 12 | `Features` | reach links | lb/core |
@@ -783,6 +786,7 @@ Four edges are left, and the lab steers clear of each:
 | `Renewed` | telemetry | The answer to a `Renew` (ci.md W05-R34): the lease each grant it named lives from when the server took it, the server's epoch, and the grants it named that aren't the runner's any more (lost, or granted again). The next stands in for a lost one. | New: to runners announcing `CAP_LEASES`. |
 | `Stop` | command, parked | `Cancel` naming the grant to stop (W05-R34): a runner running another of the leg's grants lets that one be. | New: to runners announcing `CAP_LEASES`, on the channel ("Commands"): answered once applied. |
 | `Features` | handshake | The features the server speaks, by name ("Named features"). | New: to runners announcing `CAP_FEATURES`, after `Caps`. |
+| `Offers` | state | Another runner's room as its admission last said it (`{runner, epoch, seq, room}`, JSON), for this runner's owner to choose where to probe by (docs/needs.md E5). A hint, never a claim: the newest of each runner's wins. | New: to runners that named `offers`, when a runner's hint changed something decided by. |
 
 ## Commands to a session: `Command`
 

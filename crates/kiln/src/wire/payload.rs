@@ -568,7 +568,8 @@ impl Carries for ServerMsg {
             | ServerMsg::SignAsLeg { .. }
             | ServerMsg::Renewed { .. }
             | ServerMsg::Stop { .. }
-            | ServerMsg::Features { .. }) => return Ok(Carried::Nothing(m)),
+            | ServerMsg::Features { .. }
+            | ServerMsg::Offers { .. }) => return Ok(Carried::Nothing(m)),
         };
         Ok(Carried::Read(read))
     }

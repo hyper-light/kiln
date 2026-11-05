@@ -87,6 +87,26 @@ fn ended(a: &mut Admission, from: Peer<'_>, run: &str, now: i64) -> Vec<Said> {
     out
 }
 
+/// AUDIT L1: a runner whose machine is under strain (the gate guard's predicate, as its shell
+/// measured it when it decided) offers nothing new: a probe waits there saying why, its room is
+/// hinted as none, and once a measure shows the strain gone what fits is offered in that same
+/// input, nobody polling.
+#[test]
+fn l1_a_strained_runner_offers_nothing_until_a_measure_says_it_isnt() -> Result<(), String> {
+    let mut a = runner(machine(8, 16, 0, 0), false);
+    let mut out = Vec::new();
+    a.strain(Some("its tasks all stalled on memory and I/O 40% of the time".into()), 0, &mut out);
+    let said = probe(&mut a, O1, ask("r1", "cpus=2")?, None, 1);
+    assert!(offer(&said, "o1", "r1").is_none(), "{said:?}");
+    assert!(matches!(waiting(&said, "r1"), Some((Reason::Strained { why }, _)) if why.contains("40%")), "{said:?}");
+    assert_eq!(a.hint(), Resources::default());
+    a.check()?;
+    let mut out = Vec::new();
+    a.strain(None, 2, &mut out);
+    assert!(offer(&out, "o1", "r1").is_some(), "offered once it isn't strained: {out:?}");
+    a.check()
+}
+
 /// A probe that fits the runner's measured room less what it promised is offered at once; one
 /// that doesn't waits with exactly one reason and a place; one it could never run is answered
 /// never, saying why. The runner: 32 CPUs, 64 GiB, others using 20 CPUs and 50 GiB.

@@ -3,4 +3,19 @@
 import type { OfferAmounts } from "./OfferAmounts";
 import type { OffersShown } from "./OffersShown";
 
-export type OfferAnswer = { ask: OfferAmounts, answer: string, reason?: string, soonest?: OffersShown, latest?: OffersShown, derived: boolean, };
+/**
+ * A runner's answer for one ask size.
+ */
+export type OfferAnswer = { ask: OfferAmounts, 
+/**
+ * `now`, `waits` or `never`.
+ */
+answer: string, 
+/**
+ * Why it waits, or why never.
+ */
+reason?: string, soonest?: OffersShown, latest?: OffersShown, 
+/**
+ * The runner didn't quote this size: it follows from its room and budget.
+ */
+derived: boolean, };

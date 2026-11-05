@@ -1,5 +1,5 @@
 /**
- * Runners → Offers (docs/reach.md §2.1): what each runner can take now, and what waits and why.
+ * Runners → Offers (docs/reach.md §2.2): what each runner can take now, and what waits and why.
  * One surface: the runners, each with its answer for the ask sizes in question, then the waiting
  * work by what it needs and asks, a page as long as the fleet. Static: it changes only when the
  * server says something decided by did (an `offers` event of a newer version).

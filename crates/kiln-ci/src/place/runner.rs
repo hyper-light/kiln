@@ -381,6 +381,8 @@ pub struct Admission {
     unpredicted_claims: u32,
     untimed_claims: u32,
     draining: bool,
+    /// Its machine is under strain, and why (AUDIT L1, the shell's measure): it offers nothing new.
+    strained: Option<String>,
     slots: Vec<Option<Probe>>,
     spare: Vec<u32>,
     owners: Vec<OwnerAt>,
@@ -494,6 +496,7 @@ impl Admission {
             unpredicted_claims: 0,
             untimed_claims: 0,
             draining: false,
+            strained: None,
             slots: Vec::new(),
             spare: Vec::new(),
             owners: Vec::new(),
@@ -1430,7 +1433,7 @@ impl Admission {
     fn admit(&mut self, now: i64, out: &mut Vec<Reply>) {
         loop {
             self.restand(now, out);
-            if self.draining {
+            if self.draining || self.strained.is_some() {
                 self.kept = None;
                 return;
             }
@@ -1609,6 +1612,9 @@ impl Admission {
     fn reason(&self, s: u32, rank: u32) -> Reason {
         if self.draining {
             return Reason::Draining;
+        }
+        if let Some(why) = &self.strained {
+            return Reason::Strained { why: why.clone() };
         }
         if rank > 0 {
             return Reason::Line;
@@ -1975,7 +1981,7 @@ impl Admission {
         // Nobody waits here and it has room: it's offered as it comes, which is what entering the
         // line, admitting and leaving it again come to with no one else in it (docs/needs.md §11,
         // AUDIT P6: an arrival at an empty line touches no line).
-        if self.line.is_empty() && !self.draining && self.can_start(s) {
+        if self.line.is_empty() && !self.draining && self.strained.is_none() && self.can_start(s) {
             self.kept = None;
             self.offer(s, now, out);
             return;
@@ -2226,6 +2232,25 @@ impl Admission {
         self.close(now);
     }
 
+    /// Its machine under strain (`why`), or not (AUDIT L1, as the shell measured it at decision
+    /// time): strained, it offers nothing new, and its runs wait saying why; no longer, what fits
+    /// starts in the same input.
+    pub fn strain(&mut self, why: Option<String>, now: i64, out: &mut Vec<Said>) {
+        self.wire(out, |a, r| a.strain_r(why, now, r));
+    }
+
+    /// [`Self::strain`], its replies by handle.
+    pub fn strain_r(&mut self, why: Option<String>, now: i64, out: &mut Vec<Reply>) {
+        if self.strained == why {
+            return;
+        }
+        self.begin(now, out);
+        self.strained = why;
+        self.admit(now, out);
+        self.tell_all(now, out);
+        self.close(now);
+    }
+
     /// Draining (an upgrade pending) or not: draining, it offers nothing new.
     pub fn drain_r(&mut self, draining: bool, now: i64, out: &mut Vec<Reply>) {
         self.begin(now, out);
@@ -2411,7 +2436,7 @@ impl Admission {
     /// now, nothing while draining or held whole. A hint for owners choosing where to probe, never
     /// a claim.
     pub fn hint(&self) -> Resources {
-        if self.draining || self.whole_claims > 0 {
+        if self.draining || self.strained.is_some() || self.whole_claims > 0 {
             return Resources::default();
         }
         ask::resources(&self.free_now())
@@ -2501,6 +2526,7 @@ impl Admission {
         }
         // Work-conserving: what can start is offered in the input that let it, nobody polling.
         if !self.draining
+            && self.strained.is_none()
             && let Some((_, h)) = self.line.first()
             && self.can_start(h)
         {

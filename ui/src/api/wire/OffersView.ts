@@ -4,4 +4,21 @@ import type { OfferAmounts } from "./OfferAmounts";
 import type { OfferRunner } from "./OfferRunner";
 import type { OffersWaiting } from "./OffersWaiting";
 
-export type OffersView = { version: number, now: number, runners: Array<OfferRunner>, sizes: Array<OfferAmounts>, waiting: OffersWaiting, };
+/**
+ * The offers view.
+ */
+export type OffersView = { 
+/**
+ * Its version: one up whenever something shown changed. Its ETag, and what
+ * `ServerEvent::Offers` says.
+ */
+version: number, 
+/**
+ * The server's clock as it was made (unix ms).
+ */
+now: number, runners: Array<OfferRunner>, 
+/**
+ * The ask sizes answered for each runner: those of this page's groups, then those runners
+ * quote, most waiting first.
+ */
+sizes: Array<OfferAmounts>, waiting: OffersWaiting, };

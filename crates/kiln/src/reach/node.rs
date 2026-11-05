@@ -75,6 +75,10 @@ pub struct Config {
     /// The cache whose objects this runner's peers may ask for (docs/ci.md W24-R27); `None`, the
     /// running cache service's.
     pub objects: Option<Arc<crate::runner::work::store::Store>>,
+    /// Placement's admission measures its machine itself when it decides (`crate::sense::Sensor`
+    /// on [`Config::mirrors`]' volume, AUDIT L1, L2), not by the host sampler's readings: a
+    /// runner's. Off, it admits against the readings it's fed ([`In::Sampled`]), as tests do.
+    pub sense: bool,
 }
 
 /// Something another runner hands this one to take over, whole: `reply` says whether it was.
@@ -137,7 +141,7 @@ const ADOPT_PIECE: usize = 1 << 20;
 impl Config {
     /// A runner's usual settings: identity under `state`, copies under `~/.kiln/reach`.
     pub fn for_runner(name: &str, state: &std::path::Path, accept: bool) -> Self {
-        Self { name: name.to_owned(), dir: state.join("reach"), accept, mirrors: crate::os::home_dir().join(".kiln").join("reach"), adopt: None, using: Arc::default(), objects: None }
+        Self { name: name.to_owned(), dir: state.join("reach"), accept, mirrors: crate::os::home_dir().join(".kiln").join("reach"), adopt: None, using: Arc::default(), objects: None, sense: true }
     }
 }
 
@@ -163,10 +167,17 @@ pub enum In {
     /// Whether this runner took over what another handed it.
     Adopted { key: (String, String), id: u64, error: Option<String> },
     Tick,
-    /// A reading of this machine's host sampler: placement's room (docs/needs.md E5).
+    /// A reading of this machine's host sampler: placement's room (docs/needs.md E5), or, where
+    /// placement measures itself ([`Config::sense`]), a moment to measure again.
     Sampled(crate::metrics::HostSample),
     /// The time placement's timer asked for (`super::place::Placer::timer`).
     PlaceTick,
+    /// Whether the server takes this runner's admission hints (it named
+    /// [`crate::proto::feature::OFFERS`]): it's told the whole of them when it does.
+    Offers(bool),
+    /// Another runner's room as the server passed it on ([`crate::proto::ServerMsg::Offers`]):
+    /// this node's owner chooses where to probe by it.
+    Hint(String),
 }
 
 /// What local tools ask of the node.
@@ -212,6 +223,11 @@ pub enum Local {
     PlaceLocal { run: String, ended: Option<bool> },
     /// Its asker doesn't want a run any more.
     PlaceCancel { run: String },
+    /// CI leg `ask.run`, assigned this runner: admitted against placement's ledger, or refused and
+    /// why (AUDIT M4, G1).
+    Leg { ask: Box<kiln_ci::place::ask::Ask>, reply: oneshot::Sender<Result<(), String>> },
+    /// CI leg `run` ended here.
+    LegEnded { run: String, ok: bool },
     /// What this runner's admission holds, for a view (JSON).
     PlaceView { reply: oneshot::Sender<Value> },
 }
@@ -277,6 +293,17 @@ impl Handle {
 
     pub async fn connect(&self, peer: &str) -> anyhow::Result<Host> {
         self.ask(|reply| Local::Connect { peer: peer.to_owned(), reply }).await?
+    }
+
+    /// CI leg `ask.run`, assigned this runner by the CI engine: whether its room is held here, in
+    /// the same ledger as the runs placed here (AUDIT M4, G1), or why not.
+    pub async fn admit_leg(&self, ask: kiln_ci::place::ask::Ask) -> anyhow::Result<Result<(), String>> {
+        self.ask(|reply| Local::Leg { ask: Box::new(ask), reply }).await
+    }
+
+    /// CI leg `run` ended here: its room is free.
+    pub async fn leg_ended(&self, run: &str, ok: bool) {
+        let _ = self.tx.send(In::Local(Local::LegEnded { run: run.to_owned(), ok })).await;
     }
 
     /// Place a run this node owns (docs/needs.md E5): `false` when placement isn't ready yet.
@@ -527,6 +554,8 @@ pub fn start(cfg: Config) -> anyhow::Result<(Handle, async_channel::Receiver<Age
     // Placement's epoch: one past the last this node used, kept beside its identity, so a claim of a
     // run asked before a restart is never taken for one after (docs/needs.md §8).
     let place_epoch = super::place::next_epoch(&cfg.dir);
+    let sensor = cfg.sense.then(|| crate::sense::Sensor::new(&cfg.mirrors));
+    let sensing = sensor.is_some();
     let host = Host {
         name: cfg.name.clone(),
         hostname: crate::config::Config::hostname(),
@@ -554,11 +583,14 @@ pub fn start(cfg: Config) -> anyhow::Result<(Handle, async_channel::Receiver<Age
         links: HashMap::new(),
         peers: HashMap::new(),
         served: HashMap::new(),
-        place: super::place::Placer::new(&node_name, place_epoch, kiln_ci::facts::RunnerFacts { os: std::env::consts::OS.to_owned(), arch: std::env::consts::ARCH.to_owned(), ..kiln_ci::facts::RunnerFacts::default() }, Vec::new(), kiln_ci::place::ask::Sample::default(), kiln_ci::place::runner::Settings::default(), crate::util::now_ms()),
+        place: super::place::Placer::new(&node_name, place_epoch, kiln_ci::facts::RunnerFacts { os: std::env::consts::OS.to_owned(), arch: std::env::consts::ARCH.to_owned(), ..kiln_ci::facts::RunnerFacts::default() }, Vec::new(), kiln_ci::place::ask::Sample::default(), kiln_ci::place::runner::Settings::default(), crate::util::now_ms()).sensing(sensor),
         placing: HashMap::new(),
         place_at: None,
-        measured: false,
+        // Placement admits against what it measures itself, at once.
+        measured: sensing,
         place_later: Vec::new(),
+        hints: false,
+        place_touched: false,
     };
     let busy = Arc::new(AtomicU64::new(0));
     let counted = Arc::clone(&busy);
@@ -790,6 +822,11 @@ struct Node {
     /// What placement is to do that came up where doing it at once would loop back (a link
     /// dropping): done once the input is.
     place_later: Vec<super::place::Out>,
+    /// The server takes admission hints (`offers`); placement did something in this input, so
+    /// its hint may have changed (AUDIT O1: said only then, and only if it changed something
+    /// decided by).
+    hints: bool,
+    place_touched: bool,
 }
 
 impl Node {
@@ -800,6 +837,8 @@ impl Node {
             In::Unread(takes) => self.server_unread = takes,
             In::Server(up) => {
                 self.server = up;
+                // It says again whether it takes hints once it's back (`Features`).
+                self.hints &= up;
                 // It says again what it takes once it's back.
                 self.server_unread &= up;
                 // Whatever the directory said may have changed while away: ask again.
@@ -854,10 +893,24 @@ impl Node {
                 let outs = self.place.tick(crate::util::now_ms());
                 self.place_do(outs).await;
             }
+            In::Offers(takes) => {
+                if takes && !self.hints {
+                    self.place.hints_anew();
+                    self.place_touched = true;
+                }
+                self.hints = takes;
+            }
+            In::Hint(json) => self.place.hinted(&json),
         }
         while !self.place_later.is_empty() {
             let outs = std::mem::take(&mut self.place_later);
             self.place_do(outs).await;
+        }
+        if std::mem::take(&mut self.place_touched)
+            && self.hints
+            && let Some(json) = self.place.hint_due(crate::util::now_ms(), self.place.strain())
+        {
+            self.send_out(AgentMsg::Offers { json }).await;
         }
         self.place_timer();
     }
@@ -882,6 +935,7 @@ impl Node {
     /// to the local runs that asked.
     async fn place_do(&mut self, outs: Vec<super::place::Out>) {
         use super::place::{Out, Placed};
+        self.place_touched = true;
         for o in outs {
             match o {
                 Out::Tell { peer, json } => {
@@ -1920,6 +1974,15 @@ impl Node {
                     let outs = self.place.ask(*ask, crate::util::now_ms());
                     self.place_do(outs).await;
                 }
+            }
+            Local::Leg { ask, reply } => {
+                let (verdict, outs) = self.place.leg(*ask, crate::util::now_ms());
+                let _ = reply.send(verdict);
+                self.place_do(outs).await;
+            }
+            Local::LegEnded { run, ok } => {
+                let outs = self.place.leg_ended(&run, ok, crate::util::now_ms());
+                self.place_do(outs).await;
             }
             Local::PlaceStarting { run, runner, fence, reply } => {
                 let (ok, outs) = self.place.starting(&run, &runner, fence, crate::util::now_ms());

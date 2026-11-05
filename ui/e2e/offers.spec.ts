@@ -1,5 +1,5 @@
 /**
- * Runners → Offers (docs/reach.md §2.1; AUDIT O1, O2), in the production build against the mock's
+ * Runners → Offers (docs/reach.md §2.2; AUDIT O1, O2), in the production build against the mock's
  * fleet: each runner with what it can take (its answer for each ask size, when it would start),
  * why one isn't taking work, one before offers and one offline; what waits, by need and size, a
  * page as long as the fleet, the next from its last group. The page reads again only when the

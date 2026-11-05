@@ -1,5 +1,5 @@
 /**
- * Runners → Offers in words (docs/reach.md §2.1): amounts as people say them, a runner's answer
+ * Runners → Offers in words (docs/reach.md §2.2): amounts as people say them, a runner's answer
  * for an ask size, when it would start (in the unit the server shows it in, counted from when the
  * runner said it, so the page needn't change as time passes), and what waits. Pure, so it's
  * tested (tests/offers-words.test.ts).

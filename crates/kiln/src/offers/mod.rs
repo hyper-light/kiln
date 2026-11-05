@@ -285,12 +285,19 @@ impl Offers {
 
 /// Runner `runner`'s hint as it sent it (`AgentMsg::Offers { json }`): one line in the hub's
 /// handler. One that can't be read is noted and dropped; the runner's admission is unaffected.
-pub fn heard(hub: &Hub, runner: &str, json: &str) {
+/// What it says of its room, for the hub to pass on to the other runners' owners
+/// (`hint::Room`, `ServerMsg::Offers`).
+pub fn heard(hub: &Hub, runner: &str, json: &str) -> Option<hint::Room> {
     match serde_json::from_str::<Hint>(json) {
         Ok(h) => {
+            let room = hint::Room::of(runner, &h);
             hub.offers.heard(runner, h, crate::util::now_ms());
+            Some(room)
         }
-        Err(e) => tracing::debug!(runner, error = %e, "an offers hint that can't be read"),
+        Err(e) => {
+            tracing::debug!(runner, error = %e, "an offers hint that can't be read");
+            None
+        }
     }
 }
 

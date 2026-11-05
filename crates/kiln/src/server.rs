@@ -123,7 +123,7 @@ pub async fn run(cfg: Config, shutdown: Shutdown) -> anyhow::Result<()> {
     crate::blobs::start(&hub).await;
     // The CI engine (docs/ci.md), when turned on.
     crate::ci::dispatch::spawn(hub.clone());
-    // What runners can take and what waits: told to the pages as it changes (docs/reach.md §2.1).
+    // What runners can take and what waits: told to the pages as it changes (docs/reach.md §2.2).
     crate::offers::spawn(hub.clone());
     // Terminal sessions' names, kept across restarts.
     hub.terminals.keep_names_in(cfg.server.data_dir.join("terminal-names.json"));

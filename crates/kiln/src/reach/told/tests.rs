@@ -59,7 +59,7 @@ fn t04_e1_when_the_server_takes_news_anew_every_run_still_followed_goes_again() 
     server_features(&[FEATURE.to_owned()]);
     server_up();
     assert_eq!(unsent(), [("c".to_owned(), RunEvent::Ended), ("a".to_owned(), RunEvent::Going), ("b".to_owned(), RunEvent::Started)], "what waited first, then each run still followed");
-    answered("s1", &news("c", RunEvent::Ended), false);
+    answered("s1", &news("c", RunEvent::Ended), false, false);
     assert!(STATE.lock().entries.iter().all(|e| e.news.key != "c"), "a run over that the server has is followed no more");
     server_down();
 }
@@ -76,7 +76,7 @@ fn t09_t10_the_outbox_keeps_each_run_s_latest_news_in_order() {
     say("s1", news("a", RunEvent::Ended), Some(7));
     say("s1", news("a", RunEvent::Started), Some(7));
     assert_eq!(unsent(), [("b".to_owned(), RunEvent::Going), ("a".to_owned(), RunEvent::Ended)]);
-    answered("s1", &news("a", RunEvent::Ended), false);
+    answered("s1", &news("a", RunEvent::Ended), false, false);
     say("s1", news("a", RunEvent::Ended), Some(7));
     assert_eq!(unsent(), [("b".to_owned(), RunEvent::Going)], "said again by the MCP server that told it was over");
 }
@@ -104,7 +104,7 @@ fn t03_e2_detached_follows_outlive_a_runner_restart() -> anyhow::Result<()> {
     let _turn = fresh();
     let dir = tempfile::tempdir()?;
     let file = dir.path().join("told.json");
-    let remote = Entry { session: "s1".into(), news: RunNews { how: DETACHED.into(), ..news("d1", RunEvent::Started) }, sent: true, seq: 1, by: None, resume: Some(Resume { peer: "mac".into(), session: "reach-s".into(), run: 7 }), tail: "building…".into() };
+    let remote = Entry { session: "s1".into(), news: RunNews { how: DETACHED.into(), ..news("d1", RunEvent::Started) }, sent: true, seq: 1, by: None, resume: Some(Resume { peer: "mac".into(), session: "reach-s".into(), run: 7 }), tail: "building…".into(), answer: false };
     let here = Entry { news: news("d2", RunEvent::Going), seq: 2, resume: Some(Resume::default()), ..remote.clone() };
     let here_resume = here.resume.clone();
     let over = Entry { news: news("e1", RunEvent::Ended), seq: 3, sent: false, resume: None, ..remote.clone() };

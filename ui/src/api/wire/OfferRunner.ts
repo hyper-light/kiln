@@ -5,4 +5,27 @@ import type { OfferAnswer } from "./OfferAnswer";
 import type { OfferCount } from "./OfferCount";
 import type { OfferHealth } from "./OfferHealth";
 
-export type OfferRunner = { name: string, label?: string, platform: string, connected: boolean, said: boolean, heard?: number, budget?: OfferAmounts, room?: OfferAmounts, queued: Array<OfferCount>, health: OfferHealth, answers: Array<OfferAnswer>, };
+/**
+ * A runner, and what it can take.
+ */
+export type OfferRunner = { name: string, label?: string, platform: string, connected: boolean, 
+/**
+ * It said what its admission holds (a runner before offers says nothing).
+ */
+said: boolean, 
+/**
+ * When what's shown was said (the server's clock, unix ms).
+ */
+heard?: number, budget?: OfferAmounts, 
+/**
+ * What was free for an ordinary run as it was said.
+ */
+room?: OfferAmounts, 
+/**
+ * How many wait in its line, by class (those with any).
+ */
+queued: Array<OfferCount>, health: OfferHealth, 
+/**
+ * Its answer for each of the view's sizes, in their order.
+ */
+answers: Array<OfferAnswer>, };

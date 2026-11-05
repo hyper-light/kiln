@@ -1,5 +1,5 @@
 /**
- * Runners → Offers (GET /api/reach/offers, docs/reach.md §2.1): four runners (one taking work, one
+ * Runners → Offers (GET /api/reach/offers, docs/reach.md §2.2): four runners (one taking work, one
  * strained, one before offers, one offline) and six groups of waiting work, a page as long as the
  * fleet. Its ETag is its version, answered 304 when the page has it. For the browser tests:
  * `POST /api/mock/offers/change` changes what waits and says so (an `offers` event of the next version);

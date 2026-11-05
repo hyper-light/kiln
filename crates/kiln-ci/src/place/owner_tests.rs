@@ -88,6 +88,23 @@ fn offered(o: &mut Owner, runner: &str, run: &str, fence: Fence, now: i64) -> Ve
     acts
 }
 
+/// AUDIT L1, L2: a probed runner whose machine is strained, or whose health bars the work, isn't
+/// waited at as a queue is: the owner probes others drawn afresh, as past a never, so retries
+/// don't land where the gate would yield or the work would fail for the machine's sake.
+#[test]
+fn l1_l2_a_strained_or_barred_runner_is_widened_past() -> Result<(), String> {
+    let mut o = Owner::new("me", 1);
+    let _ = o.machines((0..4).map(|i| machine(&format!("lin-{i}"), "linux", "x86_64", 8, 16)).collect());
+    let probes = |acts: &[Act]| told(acts).into_iter().filter(|(_, w)| *w == "probe").map(|(r, _)| r).collect::<Vec<String>>();
+    let first = probes(&o.ask(ask("r1", "linux/amd64,cpus=2")?, 0));
+    let [a, b] = first.as_slice() else { return Err(format!("two drawn: {first:?}")) };
+    let _ = o.heard(a, waiting("r1", Reason::Strained { why: "stalled".into() }, 1, Estimate::default(), res(0, 0)), 1);
+    let more = probes(&o.heard(b, waiting("r1", Reason::Barred { cause: "disk".into(), why: "its work volume ran full".into() }, 1, Estimate::default(), res(8, 16)), 2));
+    assert_eq!(more.len(), 2, "the other two probed: {more:?}");
+    assert!(more.iter().all(|r| !first.contains(r)), "{first:?} then {more:?}");
+    Ok(())
+}
+
 /// Never names the need no runner meets and the runner nearest to it; a Linux run is probed at the
 /// Linux runners alone; one whose link is down isn't probed, and counts as link down.
 #[test]

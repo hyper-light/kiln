@@ -317,6 +317,13 @@ impl Instances {
         }
     }
 
+    /// The runner processes that named feature `name` ([`crate::proto::AgentMsg::Features`]).
+    pub fn speaking(&self, name: &str) -> Vec<PeerId> {
+        let mut v: Vec<PeerId> = self.by_peer.iter().filter(|(_, i)| crate::proto::feature::speaks(&i.features, name)).map(|(p, _)| *p).collect();
+        v.sort_unstable();
+        v
+    }
+
     pub fn get(&self, peer: PeerId) -> Option<&Instance> {
         self.by_peer.get(&peer)
     }

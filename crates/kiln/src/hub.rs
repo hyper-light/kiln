@@ -1582,6 +1582,18 @@ impl Hub {
         sent
     }
 
+    /// The room a runner's hint said (from its process `from`) goes on to every other runner
+    /// process that named `offers`, for its owner to choose where to probe by (`ServerMsg::Offers`,
+    /// AUDIT O1). A hint as said, never a claim: the server decides nothing by it.
+    async fn pass_room_on(&self, from: PeerId, room: &crate::offers::hint::Room) {
+        let Ok(room) = serde_json::to_string(room) else { return };
+        let to = self.instances.lock().speaking(crate::proto::feature::OFFERS);
+        let msg = ServerMsg::Offers { json: room };
+        for p in to.into_iter().filter(|p| *p != from) {
+            self.send_peer(p, &msg).await;
+        }
+    }
+
     /// `msg` to runner process `peer` on reach's lane.
     async fn send_reach(&self, peer: PeerId, msg: &ServerMsg) {
         #[cfg(test)]
@@ -2365,9 +2377,13 @@ impl Hub {
             }
             // The features it speaks by name: each says them all, superseding the last.
             AgentMsg::Features { names } => self.instances.lock().set_features(peer, names),
-            // TODO(lb/offers-ui): `crate::offers::heard(self, &agent, &json)`, its one line; until it
-            // lands no server names `offers`, so no runner sends one.
-            AgentMsg::Offers { json } => tracing::debug!(%agent, bytes = json.len(), "an offers hint, with no view to take it yet"),
+            // A runner's admission hint (docs/needs.md E5, AUDIT O1): the offers view takes it, and
+            // its room goes on to the other runners' owners.
+            AgentMsg::Offers { json } => {
+                if let Some(room) = crate::offers::heard(self, &agent, &json) {
+                    self.pass_room_on(peer, &room).await;
+                }
+            }
             AgentMsg::Wire(frame) => self.on_wire(peer, &agent, frame).await,
             AgentMsg::Reach { to, link, open, data, close } => {
                 // Job pods neither send nor receive reach links: one's frame is refused, and noted.
@@ -3870,7 +3886,7 @@ pub(crate) fn v1_incoming(exclusive: bool, resources: &crate::pipeline::Resource
 }
 
 /// What a v1 job asks of its runner: its `resources:` (none: nothing).
-fn v1_asked(resources: &crate::pipeline::Resources) -> kiln_ci::sched::state::Resources {
+pub(crate) fn v1_asked(resources: &crate::pipeline::Resources) -> kiln_ci::sched::state::Resources {
     kiln_ci::sched::pools::ResourceSpec { cpu: resources.cpu.clone(), memory: resources.memory.clone(), ..Default::default() }.resources().unwrap_or_default()
 }
 

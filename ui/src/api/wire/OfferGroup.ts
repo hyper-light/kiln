@@ -3,4 +3,19 @@
 import type { OfferAmounts } from "./OfferAmounts";
 import type { OfferCount } from "./OfferCount";
 
-export type OfferGroup = { need: string, ask: OfferAmounts, runs: number, by_class: Array<OfferCount>, reasons: Array<OfferCount>, since?: number, cursor: string, };
+/**
+ * What waits of one need and size.
+ */
+export type OfferGroup = { 
+/**
+ * What the runner must be (`linux/amd64 +gpu`); empty: anything.
+ */
+need: string, ask: OfferAmounts, runs: number, by_class: Array<OfferCount>, reasons: Array<OfferCount>, 
+/**
+ * When the one waiting longest began to (the server's clock, unix ms).
+ */
+since?: number, 
+/**
+ * The page after this group starts here (`?after=`).
+ */
+cursor: string, };

@@ -694,6 +694,7 @@ mod tests {
                 adopt: None,
                 using: Arc::clone(&using),
                 objects: None,
+                sense: false,
             })?;
             let mut k = Keeper { base: base.clone(), using, handle, lock: None, saved: Saved::default(), written: None, written_at: 0, error: None };
             assert!(!k.look().await);

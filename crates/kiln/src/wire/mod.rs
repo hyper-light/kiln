@@ -291,6 +291,7 @@ classes! {
         ServerMsg::Renewed { .. } => Class::Telemetry,
         ServerMsg::Stop { .. } => PARKED,
         ServerMsg::Features { .. } => Class::Handshake,
+        ServerMsg::Offers { .. } => Class::State,
     }
 }
 

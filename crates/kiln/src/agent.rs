@@ -916,6 +916,17 @@ mod replica_tests {
 /// `name`, its sockets named by `sock`): the new build once it has taken over, or the old one again
 /// after a rollback (the paths are the same).
 #[cfg(unix)]
+/// CI leg `id`, asking `request` (`exclusive`: the runner whole), admitted against this runner's
+/// placement ledger beside the runs owners placed here (docs/needs.md E5, AUDIT M4: one ledger
+/// for CI legs, commands and sessions, so together they never pass its budget, G1): `Err(why)`
+/// when it leaves no room. Without reach, as before.
+async fn leg_room(reach: Option<&crate::reach::node::Handle>, id: &str, exclusive: bool, request: kiln_ci::sched::state::Resources) -> Result<(), String> {
+    let Some(r) = reach else { return Ok(()) };
+    let needs = kiln_ci::sched::needs::Needs { request, exclusive, ..kiln_ci::sched::needs::Needs::default() };
+    let ask = kiln_ci::place::Ask { run: id.to_owned(), needs, class: kiln_ci::sched::state::Class::Batch, ..kiln_ci::place::Ask::default() };
+    r.admit_leg(ask).await.unwrap_or(Ok(()))
+}
+
 fn serve_sockets(reach: Option<&crate::reach::node::Handle>, harness: Option<&Arc<crate::harness::host::Host>>, name: &str, sock: &str, state_dir: &std::path::Path) {
     crate::browser::set_home(state_dir);
     if let Some(r) = reach
@@ -3382,6 +3393,19 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                             uplink.msg(refusal).await;
                             continue;
                         }
+                        // Admitted against the same ledger as the runs placed here (AUDIT M4, G1):
+                        // refused, saying why, when they leave it no room. A pool's leg runs in its
+                        // executor, not on this machine's room.
+                        if !pooled
+                            && let Err(why) = leg_room(reach.as_ref(), &id, a.exclusive, a.holds.unwrap_or_default()).await
+                        {
+                            let refusal = match a.fence {
+                                Some(fence) if server_leases => AgentMsg::Refused { grant: proto::Grant::of(&id, a.attempt, fence), reason: why },
+                                _ => AgentMsg::Reject { job: id, reason: why },
+                            };
+                            uplink.msg(refusal).await;
+                            continue;
+                        }
                         // An ephemeral runner (a `k8s` pool's pod, docs/ci.md W13-R07) takes one leg,
                         // then leaves.
                         if o.ephemeral {
@@ -3789,6 +3813,11 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                             uplink.msg(AgentMsg::Reject { job: id, reason: reason.into() }).await;
                             continue;
                         }
+                        // Admitted against the same ledger as the runs placed here (AUDIT M4, G1).
+                        if let Err(why) = leg_room(reach.as_ref(), &id, a.spec.exclusive, crate::hub::v1_asked(&a.spec.resources)).await {
+                            uplink.msg(AgentMsg::Reject { job: id, reason: why }).await;
+                            continue;
+                        }
                         if o.dedicated_job.as_deref() == Some(id.as_str()) {
                             served_dedicated = true;
                         }
@@ -3865,7 +3894,18 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                     ServerMsg::Features { names } => {
                         tracing::debug!(?names, "the server speaks these features");
                         crate::reach::told::server_features(&names);
+                        // Its admission's hints go to a server that takes them (AUDIT O1).
+                        if let Some(r) = &reach {
+                            r.feed(crate::reach::node::In::Offers(proto::feature::speaks(&names, proto::feature::OFFERS))).await;
+                        }
                         server_features = names;
+                    }
+                    // Another runner's room, for this runner's owner to choose where to probe by
+                    // (docs/needs.md E5, AUDIT O1).
+                    ServerMsg::Offers { json } => {
+                        if let Some(r) = &reach {
+                            r.feed(crate::reach::node::In::Hint(json)).await;
+                        }
                     }
                     // From an epoch older than the newest this runner has seen (W05-R37): not applied.
                     ServerMsg::Stop { grant, .. } if leases.stale(grant.epoch) => {
@@ -4585,6 +4625,10 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                 }
                 if jobs.remove(&r.job).is_some() {
                     leases.ended(&r.job);
+                    // Its room in placement's ledger is free at once (AUDIT M4).
+                    if let Some(h) = &reach {
+                        h.leg_ended(&r.job, r.exit_code.is_some()).await;
+                    }
                     // Stopped for its lease: it ends so, whatever it said, as a runner's loss, so
                     // that a server that takes it before its own lease ran out tries the leg again
                     // (W05-R37, R16).

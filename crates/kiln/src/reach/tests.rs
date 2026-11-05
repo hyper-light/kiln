@@ -98,6 +98,7 @@ async fn lab_full(objects: [Option<Arc<crate::runner::work::store::Store>>; 2], 
         using: if name == "linux" { Arc::clone(&using) } else { Arc::default() },
         adopt,
         objects: None,
+        sense: false,
     };
     let (mac, mac_out) = node::start(Config { objects: mac_objects, ..cfg("mac", dirs.first().ok_or_else(|| anyhow::anyhow!("dir"))?, None) })?;
     let (linux, linux_out) = node::start(Config { objects: linux_objects, ..cfg("linux", dirs.get(1).ok_or_else(|| anyhow::anyhow!("dir"))?, Some(adopt_tx)) })?;
@@ -1410,4 +1411,98 @@ fn o5_a_queued_detached_kiln_run_hears_each_answer_and_its_line_closes() -> anyh
         assert_eq!(news.last().map(|n| n.event), Some(super::told::RunEvent::Seen), "closed as its client saw it end: {news:?}");
         anyhow::Ok(())
     })
+}
+
+/// A CI leg of `cpus` CPUs, as the runner's `Assign` admits it (AUDIT M4).
+fn leg(id: &str, cpus: u64) -> anyhow::Result<kiln_ci::place::Ask> {
+    let needs = kiln_ci::sched::needs::parse(&format!("cpus={cpus}")).map_err(anyhow::Error::msg)?;
+    Ok(kiln_ci::place::Ask { run: id.to_owned(), needs, class: kiln_ci::sched::state::Class::Batch, ..kiln_ci::place::Ask::default() })
+}
+
+/// What a runner's admission holds and may hold, in its four dimensions (`place_view`).
+async fn held_and_cap(h: &Handle) -> anyhow::Result<([u64; 4], [u64; 4])> {
+    let v = h.place_view().await?;
+    let of = |k: &str| serde_json::from_value::<[u64; 4]>(v.get(k).cloned().unwrap_or_default()).map_err(anyhow::Error::from);
+    Ok((of("held")?, of("cap")?))
+}
+
+/// AUDIT M4, G1 (docs/needs.md E5): CI legs, commands and the room they hold are one ledger on a
+/// runner. A leg admitted holds its room; a command that doesn't fit beside it waits, and starts
+/// on that runner once the leg ends (its end frees the room in the same input, nobody polling);
+/// a leg that doesn't fit beside what's held is refused, saying why, for the engine to place
+/// elsewhere. At every step what's held is within the runner's size in every dimension.
+#[cfg(unix)]
+#[test]
+fn m4_g1_ci_legs_and_commands_never_pass_a_runners_budget_together() -> anyhow::Result<()> {
+    crate::rt::block_on(async move {
+        let lab = lab_placing().await?;
+        // mac full of work kiln didn't place; linux idle: 8 CPUs, 16 GiB.
+        lab.mac.feed(In::Sampled(reading(100.0))).await;
+        lab.linux.feed(In::Sampled(reading(0.0))).await;
+        lab.mac.directory().await?;
+        lab.linux.directory().await?;
+        let within = |(held, cap): ([u64; 4], [u64; 4])| held.iter().zip(&cap).all(|(h, c)| h <= c);
+        // A leg of 6 CPUs: admitted, its room held.
+        assert_eq!(lab.linux.admit_leg(leg("leg-1", 6)?).await?, Ok(()));
+        let hc = held_and_cap(&lab.linux).await?;
+        assert!(hc.0.first() == Some(&6_000) && within(hc), "{hc:?}");
+        // A leg of 4 beside it doesn't fit: refused, saying why.
+        let refused = lab.linux.admit_leg(leg("leg-2", 4)?).await?;
+        assert!(refused.as_ref().is_err_and(|why| why.contains("cpu") || why.contains("room")), "{refused:?}");
+        // A command of 4 CPUs asked of mac: queued (2 free on linux), then started on linux once
+        // leg-1 ends; meanwhile a leg of 3 is refused beside the 6 held.
+        let (said_tx, said_rx) = async_channel::unbounded::<(Result<(), String>, ([u64; 4], [u64; 4]))>();
+        let linux = lab.linux.clone();
+        let once = std::sync::atomic::AtomicBool::new(false);
+        let req = RunReq { target: "cpus=4".into(), command: "echo after the leg".into(), ..RunReq::default() };
+        let evs = run_from_mac(&lab, req, move |e| {
+            if let Ev::Placed { json } = e
+                && json.contains("\"queued\"")
+                && !once.swap(true, std::sync::atomic::Ordering::Relaxed)
+            {
+                let (l, tx) = (linux.clone(), said_tx.clone());
+                crate::rt::spawn(async move {
+                    let third = l.admit_leg(leg("leg-3", 3).unwrap_or_default()).await.unwrap_or(Ok(()));
+                    let hc = held_and_cap(&l).await.unwrap_or_default();
+                    let _ = tx.send((third, hc)).await;
+                    l.leg_ended("leg-1", true).await;
+                });
+            }
+            None
+        })
+        .await?;
+        let (third, hc) = said_rx.recv().await?;
+        assert!(third.is_err(), "a leg of 3 beside 6 held of 8 is refused: {third:?}");
+        assert!(within(hc), "{hc:?}");
+        assert_eq!(evs.iter().filter(|e| matches!(e, Ev::Started { .. })).count(), 1, "started once: {evs:?}");
+        assert!(answers(&evs).iter().any(|a| a.contains("linux")), "on linux, once the leg ended: {:?}", answers(&evs));
+        assert_eq!(exit(&evs).map(|e| e.0), Some(Some(0)), "{evs:?}");
+        // All gone: nothing held.
+        let hc = held_and_cap(&lab.linux).await?;
+        assert_eq!(hc.0, [0, 0, 0, 0], "{hc:?}");
+        anyhow::Ok(())
+    })
+}
+
+/// AUDIT O1 (core's half), O2: a runner says its admission's hint when it changes something
+/// decided by, never per sample: its first; nothing for a reading that moves the room but no
+/// answer; again when a dimension's room goes to none (its CPUs, here), and when it's strained.
+#[test]
+fn o1_a_runners_hint_goes_only_on_a_change_decided_by() -> anyhow::Result<()> {
+    use super::place::{Placer, sample_of};
+    let mut p = Placer::new("r", 1, kiln_ci::facts::RunnerFacts::default(), Vec::new(), sample_of(&reading(10.0)), kiln_ci::place::runner::Settings::default(), 0);
+    let first = p.hint_due(0, None).ok_or_else(|| anyhow::anyhow!("its first hint"))?;
+    let h: crate::offers::hint::Hint = serde_json::from_str(&first)?;
+    assert!(h.whole && h.seq == 1 && h.room.first().is_some_and(|c| *c > 0), "{first}");
+    let _ = p.measured(sample_of(&reading(12.0)), 1);
+    assert_eq!(p.hint_due(1, None), None, "a reading that changes no answer is no news");
+    let _ = p.measured(sample_of(&reading(100.0)), 2);
+    let full: crate::offers::hint::Hint = serde_json::from_str(&p.hint_due(2, None).ok_or_else(|| anyhow::anyhow!("no room is news"))?)?;
+    assert!(full.seq == 2 && full.room.first() == Some(&0) && !full.whole, "its CPUs went to none: {full:?}");
+    let strained = p.hint_due(3, Some("stalled".into())).ok_or_else(|| anyhow::anyhow!("strain is news"))?;
+    assert!(strained.contains("strained"), "{strained}");
+    // Another runner's room goes to its owner; its own is no hint to itself.
+    p.hinted(&serde_json::to_string(&crate::offers::hint::Room { runner: "other".into(), epoch: 1, seq: 1, room: [4000, 8 << 30, 0, 0] })?);
+    p.hinted(&serde_json::to_string(&crate::offers::hint::Room { runner: "r".into(), epoch: 1, seq: 1, room: [0; 4] })?);
+    Ok(())
 }

@@ -1,5 +1,5 @@
 /**
- * Runners → Offers' data (GET /api/reach/offers, docs/reach.md §2.1): read again only when the
+ * Runners → Offers' data (GET /api/reach/offers, docs/reach.md §2.2): read again only when the
  * server says its version moved past the one shown (`offers` events carry it), and then with the
  * ETag of what's shown, so an unchanged page costs a 304 and nothing more. No timer reads it.
  */
