@@ -39,6 +39,11 @@ of its own; `/metrics` reads only those, so reading never touches a shard.
 | `kiln_shard_park_seconds{shard}` (histogram) | How long its parks lasted, each from its driver wait's call to its return, in hyper-rt's bounds (`PARK_BOUNDS_NS`: doubling from 1 µs to 8,192 µs; 16 µs the first past the cheapest wake the lab measured on fedora, a socket's on the waiting thread's own CPU at 12.6 µs, wake-2): the parks a short spin before parking would have served sooner than their wakes, against the rest. |
 | `kiln_shard_harvests_total{shard}`, `kiln_shard_arms_total{shard}`, `kiln_shard_socket_calls_total{shard,call}`, `kiln_shard_socket_calls_idle_total{shard,call}` | The rest of its system calls (`crate::shard_health::Calls`): its driver's non-blocking waits while busy (a harvest, once a quantum); its readiness registrations with its driver (epoll_ctl, kevent, an AFD poll), each a task's wait or a handle armed again for the waits left after a fire; its tasks' TCP calls, `call` `accept`, `read` or `write`; and of the reads and writes, those that moved nothing (a read that found nothing ready, a write that found the send buffer full), each with a wait after it. |
 
+The families from `kiln_shard_steps_total` to `kiln_shard_socket_calls_idle_total` (`crate::shard_health::Wakes`,
+`Calls` and `ParkTimes`) are copied at a probe's first wake and every 10th after (`shard_health::COUNTS_EVERY`):
+they move every 100 ms, the rest every wake (goal 9, plan 01a1a87b2cec step 5). Read as differences across the
+lab's window, 60 s, a copy 100 ms old moves a count by 0.3% at the most.
+
 ### Each route class's latency (`kiln_route_*`, `crate::route_latency`)
 
 `kiln_route_wait_seconds{class}` is how long the server's work waited before its handler started,
