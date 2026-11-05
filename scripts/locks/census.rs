@@ -9,6 +9,11 @@
 //! `/metrics` says it all as `kiln_lock_*` series ([`render`]), which kiln-lab keeps for each round's
 //! window and fill (`Round::locks`), and `scripts/locks.py rank` ranks.
 //!
+//! The dependencies kiln's hot path reaches that lock inside (`scripts/locks/deps.toml`) are counted
+//! by this file too, as the crate `kiln-census` (`census-deps/kiln-census` in the census tree), their
+//! copies' locks rewritten to its wrappers: their sites are named `<crate>@<version>:<file>`
+//! ([`site_file`]), so `rank` tells kiln's from a dependency's.
+//!
 //! The table is a fixed array of atomics, claimed a slot per site by compare-and-swap: counting takes
 //! no lock of its own.
 
@@ -150,13 +155,33 @@ fn address<T: ?Sized>(r: &T) -> usize {
     r as *const T as *const () as usize
 }
 
+/// Where the census's copies of the dependencies are, in the census tree: `census-deps/<crate>/<version>/`
+/// (`scripts/locks.py census-tree`).
+const DEPS: &str = "census-deps/";
+
+/// A site's file as the census names it: as rustc names it (kiln's, relative to the tree), but a
+/// dependency's copy's as `<crate>@<version>:<its file in the crate>` (goal 5, plan 01a1a59c2aae: what
+/// a dependency takes, apart from kiln's own).
+fn site_file(file: &str) -> String {
+    let file = file.replace('\\', "/");
+    dependency_site(&file).unwrap_or(file)
+}
+
+/// `<crate>@<version>:<file>` for a file of a dependency's copy (`.../census-deps/<crate>/<version>/<file>`).
+fn dependency_site(file: &str) -> Option<String> {
+    let rest = file.get(file.rfind(DEPS)? + DEPS.len()..)?;
+    let mut parts = rest.splitn(3, '/');
+    let (name, version, path) = (parts.next()?, parts.next()?, parts.next()?);
+    (!name.is_empty() && !version.is_empty()).then(|| format!("{name}@{version}:{path}"))
+}
+
 /// The census as Prometheus text: a series of each kind per site.
 pub fn render(o: &mut String) {
     use std::fmt::Write as _;
     let _ = writeln!(o, "# TYPE kiln_lock_taken_total counter");
     for s in &TABLE {
         let Some((at, kind)) = s.site.get() else { continue };
-        let labels = format!("site=\"{}:{}:{}\",kind=\"{}\"", at.file().replace('\\', "/"), at.line(), at.column(), kind.name());
+        let labels = format!("site=\"{}:{}:{}\",kind=\"{}\"", site_file(at.file()), at.line(), at.column(), kind.name());
         let addrs: Vec<String> = s.addrs.iter().map(|a| a.load(Ordering::Relaxed)).filter(|a| *a != 0).map(|a| format!("{a:x}")).collect();
         let _ = writeln!(o, "kiln_lock_taken_total{{{labels}}} {}", s.taken.load(Ordering::Relaxed));
         let _ = writeln!(o, "kiln_lock_contended_total{{{labels}}} {}", s.contended.load(Ordering::Relaxed));

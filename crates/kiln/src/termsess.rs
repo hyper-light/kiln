@@ -933,7 +933,7 @@ mod tests {
     #[test]
     fn g4_s5_a_terminals_input_holds_its_places_in_order_whatever_each_carries() {
         let (s, input) = Session::new("local".into(), None, 80, 24);
-        let paste = |n: usize| n % 256 == 0;
+        let paste = |n: usize| n.is_multiple_of(256);
         for n in 0..INPUTS {
             s.send(Input::Data(if paste(n) { vec![b'p'; 1 << 20] } else { n.to_string().into_bytes() }));
         }
@@ -954,7 +954,7 @@ mod tests {
         crate::rt::block_on(async {
             let s = Session::detached("t1".into(), "agent:box".into(), None, 80, 24);
             let (tx, rx) = relay();
-            let large = |n: usize| n % 1024 == 0;
+            let large = |n: usize| n.is_multiple_of(1024);
             for n in 0..RELAY {
                 forward(&tx, Some(&s), TermOut::Data(if large(n) { vec![b'x'; 1 << 20] } else { n.to_le_bytes().to_vec() }));
             }

@@ -845,6 +845,21 @@ mod tests {
         }
     }
 
+    /// Goal 5, plan 01a1a59c2aae (its top goal), run by kiln's CI with every test: these server paths' queues are
+    /// this module's, none an async-channel's: every live command to a runner, a terminal's keystrokes among them
+    /// (`wire/commands.rs`), each frame reach's relay passes between runners (`reach/relay.rs`), and WebRTC's
+    /// loop and what it tells its viewers' sockets (`harness/webrtc.rs`).
+    #[test]
+    fn g5_the_servers_command_relay_and_webrtc_paths_make_no_async_channel() {
+        let files = [("wire/commands.rs", include_str!("../wire/commands.rs")), ("reach/relay.rs", include_str!("../reach/relay.rs")), ("harness/webrtc.rs", include_str!("../harness/webrtc.rs"))];
+        for (file, src) in files {
+            let code = code_of(src);
+            for made in ["async_channel::bounded", "async_channel::unbounded"] {
+                assert!(!code.contains(made), "{file} makes an async-channel, whose waits take a lock ({made})");
+            }
+        }
+    }
+
     /// An item of a test's: its sender, its number, and `n` bytes counted.
     struct Tagged(usize, usize, usize);
 

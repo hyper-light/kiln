@@ -748,7 +748,7 @@ impl Events {
     /// going on from a number read every chunk of its copy again (inflating, reading back from its spill file
     /// and parsing each event) on its owner's shard, at every runner's reconnect, to keep them all.
     pub(super) fn keep_first(&mut self, keeps: impl Fn(&Meta) -> bool) -> Option<(usize, Vec<Arc<str>>)> {
-        let kept = self.metas().take_while(|m| keeps(*m)).count();
+        let kept = self.metas().take_while(|m| keeps(m)).count();
         if self.metas().skip(kept).any(&keeps) {
             return None;
         }

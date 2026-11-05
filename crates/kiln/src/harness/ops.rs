@@ -67,31 +67,44 @@ async fn seen(cx: &Cx, id: &str) -> Result<Info, Fail> {
 async fn list(cx: Cx, v: Value) -> Out {
     let s = |k: &str| v.get(k).and_then(Value::as_str).map(str::trim).filter(|x| !x.is_empty()).map(str::to_owned);
     let (machine, harness, state, parent, run) = (s("machine"), s("harness"), s("state"), s("parent"), s("plan_run"));
-    // Every session's info, and the brief of each one the filters keep, made on the compute pool: each
-    // `agents_list` copied every session's info and wrote a brief of each on its request's shard, which its
-    // answer's JSON then held too, about a millisecond a call in g9p7 (goal 9, plan 01a1a87b2cec step 3).
-    let hub = std::sync::Arc::clone(&cx.hub);
-    let (all, briefs) = crate::rt::compute(move || {
-        let all = hub.harness.list();
-        let briefs: Vec<(String, Value)> = all
-            .iter()
-            // A card's helper (`super::about`) is the card's: no agent of these.
-            .filter(|i| i.helper.is_none())
-            .filter(|i| machine.as_deref().is_none_or(|m| wait::machine(&i.target) == m || (m == "server" && i.target == "local")))
-            .filter(|i| harness.as_deref().is_none_or(|h| i.kind == h))
-            .filter(|i| parent.as_deref().is_none_or(|p| i.parent.as_deref() == Some(p)))
-            .filter(|i| run.as_deref().is_none_or(|r| i.plan_run.as_deref() == Some(r)))
-            .map(|i| (i.id.clone(), wait::brief(i)))
-            .filter(|(_, b)| state.as_deref().is_none_or(|st| b.get("stand").and_then(Value::as_str) == Some(st) || b.get("status").and_then(Value::as_str) == Some(st)))
-            .collect();
-        (all, briefs)
-    })
-    .await
-    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("the agents couldn't be listed: {e:#}")))?;
-    // Those the caller sees, in their order (`lineage::seen` reads the lineage of them all).
-    let seen: std::collections::HashSet<String> = lineage::seen(&cx.hub, &cx.caller, all).await.into_iter().map(|i| i.id).collect();
-    let agents: Vec<Value> = briefs.into_iter().filter(|(id, _)| seen.contains(id)).map(|(_, b)| b).collect();
+    // Whoever sees every session reads each info as its owner shares it, none copied (goal 9, plan 01a1a87b2cec step 5);
+    // anyone else, those `lineage::seen` lets them.
+    let (shared, seen);
+    let all: Vec<&Info> = if lineage::sees_all(&cx.caller) {
+        shared = cx.hub.harness.list_shared();
+        shared.iter().map(|i| &**i).collect()
+    } else {
+        seen = lineage::seen(&cx.hub, &cx.caller, cx.hub.harness.list()).await;
+        seen.iter().collect()
+    };
+    let keep = |i: &Info| {
+        // A card's helper (`super::about`) is the card's: no agent of these.
+        i.helper.is_none()
+            && machine.as_deref().is_none_or(|m| wait::machine(&i.target) == m || (m == "server" && i.target == "local"))
+            && harness.as_deref().is_none_or(|h| i.kind == h)
+            && parent.as_deref().is_none_or(|p| i.parent.as_deref() == Some(p))
+            && run.as_deref().is_none_or(|r| i.plan_run.as_deref() == Some(r))
+    };
+    let wanted = |b: &Value| state.as_deref().is_none_or(|st| b.get("stand").and_then(Value::as_str) == Some(st) || b.get("status").and_then(Value::as_str) == Some(st));
+    let agents = briefs(all, keep, wanted, crate::rt::consume_budget).await;
     Ok(json!({"agents": agents}))
+}
+
+/// The briefs (`wait::brief`) of the agents of `infos` that `keep` keeps and whose brief `wanted` wants, in their
+/// order, one a piece: after each, `turn`, the shard's (`crate::rt::consume_budget`: its turn given up once spent,
+/// while something else wants the shard). Goal 10, plan 01a1a87b2dae step 5: `agents_list` made them all in one
+/// poll, holding its shard 1.2 ms a call at the mean and 7 ms at the longest in g11alloc2's calm rounds, the longest
+/// of any request there, and every read on that shard waited behind it.
+async fn briefs<'a, F: std::future::Future<Output = ()>>(infos: impl IntoIterator<Item = &'a Info>, keep: impl Fn(&Info) -> bool, wanted: impl Fn(&Value) -> bool, mut turn: impl FnMut() -> F) -> Vec<Value> {
+    let mut out = Vec::new();
+    for i in infos.into_iter().filter(|i| keep(i)) {
+        let b = wait::brief(i);
+        if wanted(&b) {
+            out.push(b);
+        }
+        turn().await;
+    }
+    out
 }
 
 /// What a state says that `agents.get` leaves out: catalogs and lists only a console needs.
@@ -1128,6 +1141,37 @@ pub mod input {
 mod tests {
     use super::*;
 
+    /// Goal 10, plan 01a1a87b2dae step 5: `agents.list` makes each agent's brief a piece of its own, the shard's turn
+    /// taken after each one made, so a long list gives its shard up between agents as a long computation does; the
+    /// agents it gives, their order and its filters are as they were.
+    #[test]
+    fn g10_s5_agents_list_takes_its_shards_turn_between_agents() {
+        let info = |n: usize| Info { id: format!("a{n}"), kind: if n % 2 == 0 { "claude" } else { "codex" }.into(), ..Info::default() };
+        let infos: Vec<Info> = (0..5).map(info).chain(std::iter::once(Info { helper: Some("a card's".into()), ..info(6) })).collect();
+        let at_once = |keep: &dyn Fn(&Info) -> bool, wanted: &dyn Fn(&Value) -> bool| infos.iter().filter(|i| keep(i)).map(wait::brief).filter(|b| wanted(b)).collect::<Vec<Value>>();
+        let turns = std::cell::Cell::new(0usize);
+        let turn = || {
+            turns.set(turns.get() + 1);
+            std::future::ready(())
+        };
+        // As `list` keeps them: every agent but a card's helper.
+        let keep = |i: &Info| i.helper.is_none();
+        let all = |_: &Value| true;
+        let made = futures::FutureExt::now_or_never(briefs(&infos, keep, all, turn));
+        assert_eq!(made, Some(at_once(&keep, &all)), "the same briefs, in order");
+        assert_eq!(turns.get(), 5, "a turn after each agent's brief");
+        // A filter on what it is, and one on its brief: a turn for each brief made, whether wanted or not.
+        turns.set(0);
+        let claude = |i: &Info| i.helper.is_none() && i.kind == "claude";
+        let none = |_: &Value| false;
+        assert_eq!(futures::FutureExt::now_or_never(briefs(&infos, claude, none, turn)), Some(Vec::new()));
+        assert_eq!(turns.get(), 3, "three claude agents' briefs made");
+        turns.set(0);
+        let made = futures::FutureExt::now_or_never(briefs(&infos, claude, all, turn));
+        assert_eq!(made, Some(at_once(&claude, &all)));
+        assert_eq!(made.map(|m| m.len()), Some(3));
+    }
+
     #[test]
     fn about_asks_what_was_tapped_in_the_four_parts_the_card_reads() {
         let path = "crates/kiln/src/http/client.rs";
@@ -1257,6 +1301,24 @@ mod end_to_end {
         });
         hub.harness.set_test_program("/nonexistent/kiln-test-no-harness");
         Ok(hub)
+    }
+
+    /// Goal 9, plan 01a1a87b2cec step 5: a person who sees every session gets the agents listed from their infos as each
+    /// owner shares them (`Registry::list_shared`, none copied), and what the copied list gave: the same agents, in order.
+    #[test]
+    fn g9_s5_a_list_for_whoever_sees_every_session_is_the_copied_lists() -> anyhow::Result<()> {
+        run(async {
+            let hub = hub_with(|_| {}).await?;
+            let (a, b) = (parent(&hub, "default", true).await?, parent(&hub, "default", true).await?);
+            let person = Cx { hub: Arc::clone(&hub), caller: crate::authz::Caller::owner() };
+            let listed = call(person, "agents.list", json!({})).await.map_err(|(s, m)| anyhow::anyhow!("{s} {m}"))?;
+            let ids: Vec<String> = listed.get("agents").and_then(Value::as_array).map(|all| all.iter().filter_map(|x| x.get("id").and_then(Value::as_str).map(str::to_owned)).collect()).unwrap_or_default();
+            let copied: Vec<String> = hub.harness.list().into_iter().filter(|i| i.helper.is_none()).map(|i| i.id).collect();
+            anyhow::ensure!(ids == copied && ids.contains(&a) && ids.contains(&b), "{listed}");
+            let shared: Vec<String> = hub.harness.list_shared().iter().map(|i| i.id.clone()).collect();
+            anyhow::ensure!(shared == hub.harness.list().into_iter().map(|i| i.id).collect::<Vec<_>>(), "the same sessions, in the same order");
+            Ok(())
+        })
     }
 
     #[test]
@@ -1779,12 +1841,12 @@ mod end_to_end {
         })
     }
 
-    /// Goal 9, plan 01a1a87b2cec step 3: `agents.list`, every session's info and the briefs it keeps made on the
-    /// compute pool, then what its caller sees by lineage, lists what it listed when it did it all on its shard:
+    /// Goal 9, plan 01a1a87b2cec step 3: `agents.list`, its briefs made in turns of the shard's and a person's infos read
+    /// as their owners share them (goals 10 and 9's), lists what it listed when it did it all in one poll:
     /// for an agent (its own children and itself, its person's other agents), another agent of the same person,
     /// and the owner; with no filter, by parent, by state, and by a harness none runs; in the registry's order.
     #[test]
-    fn g9_s3_agents_list_made_off_the_shard_lists_as_it_did() -> anyhow::Result<()> {
+    fn g9_s3_agents_list_lists_what_it_listed_for_agents_and_people() -> anyhow::Result<()> {
         use crate::harness::{lineage, wait};
         run(async {
             let hub = hub_with(|_| {}).await?;

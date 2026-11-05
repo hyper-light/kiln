@@ -91,7 +91,7 @@ fn follow_logs(hub: Arc<Hub>, cd: Arc<super::Cd>, input: Value, req: Request) ->
     use crate::wire::unread::Wire;
     let person = req.extensions().get::<crate::authz::Caller>().map_or_else(|| "admin".to_owned(), |c| c.name.clone());
     let sock = crate::wire::ui::Socket::of(Wire::LogUp, Wire::LogDown, &person, None);
-    let (resp, upgrade) = ws::accept(req).map_err(|r| (r.status, r.reason.to_owned()))?;
+    let (resp, upgrade) = ws::accept_commands(req).map_err(|r| (r.status, r.reason.to_owned()))?;
     crate::rt::spawn(async move {
         let socket = match upgrade.await {
             Ok(s) => s,

@@ -127,16 +127,23 @@ pub enum RunnerLeg {
     /// From that hand-over to the owner taking the update: the wait for room in its inbox, then for the
     /// owner, on its own shard.
     ToOwner,
+    /// Not a message's wait but what makes the next one's: the hub's loop's time with each event it takes,
+    /// from taking it to being done with it, whatever it waited on meanwhile (the compute pool, an owner's
+    /// inbox, the net thread's queue, another task's answer), every event's. Goal 10, plan 01a1a87b2dae step 5:
+    /// `to_loop` was 6.1 ms at p99 where a frame's own legs at the loop came to 1.3 ms at p99.9, and only this
+    /// tells the loop held by its events from the loop waiting for its shard.
+    Held,
 }
 
 impl RunnerLeg {
-    pub const ALL: [RunnerLeg; 3] = [RunnerLeg::ToLoop, RunnerLeg::InLoop, RunnerLeg::ToOwner];
+    pub const ALL: [RunnerLeg; 4] = [RunnerLeg::ToLoop, RunnerLeg::InLoop, RunnerLeg::ToOwner, RunnerLeg::Held];
 
     pub fn name(self) -> &'static str {
         match self {
             RunnerLeg::ToLoop => "to_loop",
             RunnerLeg::InLoop => "in_loop",
             RunnerLeg::ToOwner => "to_owner",
+            RunnerLeg::Held => "held",
         }
     }
 
@@ -145,13 +152,14 @@ impl RunnerLeg {
             RunnerLeg::ToLoop => 0,
             RunnerLeg::InLoop => 1,
             RunnerLeg::ToOwner => 2,
+            RunnerLeg::Held => 3,
         }
     }
 }
 
 /// Each leg's histogram, in [`RunnerLeg::ALL`]'s order, to the microsecond below a few milliseconds as the
 /// shards' delay is (`crate::shard_health::DELAY_BUCKETS`): a leg's p99 sits about a millisecond.
-pub struct Legs([Histogram; 3]);
+pub struct Legs([Histogram; RunnerLeg::ALL.len()]);
 
 impl Legs {
     fn new() -> Self {
@@ -226,6 +234,9 @@ pub fn label_of(method: &Method, path: &str, upgrade: bool) -> &'static hyper_rt
     static OPEN: Label = Label { name: "websocket open" };
     static PAGE: Label = Label { name: "page" };
     static ROOT: Label = Label { name: "read /<kiln's own>" };
+    // A scrape of the server's figures apart from kiln's other own reads: the lab's own scrape at its window's start is
+    // counted in that window (goal 10, plan 01a1a87b2dae step 5: g9p7's 2.5 ms `read /<kiln's own>`).
+    static METRICS: Label = Label { name: "read /metrics" };
     static OTHER_READ: Label = Label { name: "read /api/<other>" };
     static OTHER_WRITE: Label = Label { name: "write /api/<other>" };
     static ROOT_WRITE: Label = Label { name: "write /<other>" };
@@ -249,6 +260,9 @@ pub fn label_of(method: &Method, path: &str, upgrade: bool) -> &'static hyper_rt
     let mut segs = path.split('/').filter(|s| !s.is_empty());
     let (first, second, third) = (segs.next(), segs.next(), segs.next());
     if first != Some("api") {
+        if read && first == Some("metrics") && second.is_none() {
+            return &METRICS;
+        }
         return match (read, class_of(method, path, false)) {
             (true, Some(Class::Page)) => &PAGE,
             (true, _) => &ROOT,
@@ -306,7 +320,7 @@ pub fn render(o: &mut String) {
     }
     let _ = writeln!(
         o,
-        "# HELP kiln_runner_wait_leg_seconds A runner's message's wait, by leg: to_loop (to the hub's loop taking its frame, every frame's), in_loop (that loop handing an agent session's update to its owner's inbox), to_owner (that owner taking it).\n# TYPE kiln_runner_wait_leg_seconds histogram"
+        "# HELP kiln_runner_wait_leg_seconds A runner's message's wait, by leg: to_loop (to the hub's loop taking its frame, every frame's), in_loop (that loop handing an agent session's update to its owner's inbox), to_owner (that owner taking it); and held, the loop's own time with each event it takes, its waits included (what the frames behind it wait for), every event's.\n# TYPE kiln_runner_wait_leg_seconds histogram"
     );
     let l = legs();
     for leg in RunnerLeg::ALL {
@@ -368,7 +382,8 @@ mod tests {
         assert_eq!(name(&get, "/api/nothing-here/x"), "read /api/<other>");
         assert_eq!(name(&Method::DELETE, "/api/nothing-here"), "write /api/<other>");
         assert_eq!(name(&get, "/agents/01a19ff6"), "page");
-        assert_eq!(name(&get, "/metrics"), "read /<kiln's own>");
+        assert_eq!(name(&get, "/metrics"), "read /metrics", "goal 10 step 5: a scrape apart from kiln's other own reads");
+        assert_eq!(name(&get, "/healthz"), "read /<kiln's own>");
         assert_eq!(name(&post, "/agents"), "write /<other>");
         assert_eq!(label_of(&get, "/api/harness/sessions/s1/ws", true).name, "websocket open");
         assert!(std::ptr::eq(label_of(&get, "/api/runs", false), label_of(&Method::HEAD, "/api/runs/7", false)));
@@ -407,7 +422,7 @@ mod tests {
         l.observe(RunnerLeg::ToOwner, Duration::from_micros(900));
         l.observe(RunnerLeg::ToOwner, Duration::from_micros(1100));
         let counts: Vec<u64> = RunnerLeg::ALL.iter().map(|leg| l.of(*leg).map_or(0, Histogram::count)).collect();
-        assert_eq!(counts, vec![0, 1, 2]);
+        assert_eq!(counts, vec![0, 1, 2, 0]);
         // Finer than a millisecond: 0.9 ms and 1.1 ms land in buckets apart.
         let at = |bound: f64| l.of(RunnerLeg::ToOwner).and_then(|h| h.cumulative().into_iter().find(|(b, _)| (*b - bound).abs() < 1e-12).map(|(_, n)| n));
         assert_eq!((at(0.001), at(0.00125)), (Some(1), Some(2)));
@@ -418,5 +433,25 @@ mod tests {
             assert!(o.contains(&format!("kiln_runner_wait_leg_seconds_count{{leg=\"{}\"}}", leg.name())), "{} rendered", leg.name());
         }
         assert!(o.contains("kiln_runner_wait_leg_seconds_bucket{leg=\"to_loop\",le=\"0.00001\"}"), "the shards' delay buckets");
+    }
+
+    /// Goal 10, plan 01a1a87b2dae step 5: the hub's loop's hold of each event is a leg of its own, named `held`, the
+    /// last of them (the legs before it keep their places), on its own histogram to the microsecond, and rendered
+    /// with the others.
+    #[test]
+    fn g10_s5_the_loops_hold_of_each_event_is_a_leg_of_its_own() {
+        assert_eq!(RunnerLeg::ALL.iter().map(|l| l.name()).collect::<Vec<_>>(), vec!["to_loop", "in_loop", "to_owner", "held"]);
+        assert_eq!(RunnerLeg::ALL.iter().map(|l| l.index()).collect::<Vec<_>>(), vec![0, 1, 2, 3]);
+        let l = Legs::new();
+        l.observe(RunnerLeg::Held, Duration::from_micros(150));
+        l.observe(RunnerLeg::Held, Duration::from_micros(6_000));
+        let counts: Vec<u64> = RunnerLeg::ALL.iter().map(|leg| l.of(*leg).map_or(0, Histogram::count)).collect();
+        assert_eq!(counts, vec![0, 0, 0, 2]);
+        let under = |bound: f64| l.of(RunnerLeg::Held).and_then(|h| h.cumulative().into_iter().find(|(b, _)| (*b - bound).abs() < 1e-12).map(|(_, n)| n));
+        assert_eq!((under(0.00025), under(0.001)), (Some(1), Some(1)), "150 µs under a quarter millisecond, 6 ms past a millisecond");
+        let mut o = String::new();
+        observe_leg(RunnerLeg::Held, Duration::from_micros(150));
+        render(&mut o);
+        assert!(o.contains("kiln_runner_wait_leg_seconds_count{leg=\"held\"}"), "held rendered");
     }
 }
