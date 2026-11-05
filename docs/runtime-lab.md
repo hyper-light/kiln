@@ -1313,6 +1313,61 @@ topic isn't something kiln can ask it. The bounds it derives:
 Its scripts (`bus-lab.sh`, `bus-hook.sh`, `bus-summary.py`) come with goal 11's step 3 hand-overs, to go
 under `scripts/memory_lab/` with their first run.
 
+### The allocator (step 4)
+
+fedora, 2026-11-05 13:24 to 14:45 UTC, the realistic profile, calm, 4 shards, the server on CPUs 16-23 and
+the lab on 0-7: train 4's tree (`4b429f1a05c`), its glibc build and its static musl build (production's),
+in A/Bs of interleaved rounds (`g11alloc.sh`). Resident memory at the window's end, MB, the median of
+rounds; and what moved beyond noise, B against A, of the 203 numbers kiln-lab compares:
+
+| A against B | rounds | resident, A to B | anonymous | the binary's pages | latency beyond noise |
+| --- | --- | --- | --- | --- | --- |
+| glibc against musl | 8, 8 | 576 to 541 (within noise) | 449 to 415 | 128 to 127 | worse on musl: attach p50 3.5 to 4.7 ms; the server's wait p99 for API reads, writes and pages 0.10 to 0.25-0.28 ms |
+| glibc against `MALLOC_ARENA_MAX=2` | 8, 8 | 545 to 420 (-23%) | 419 to 293 | 128 to 129 | worse: bus delivery p99 0.25 to 0.50 ms (p99.9 0.74 to 1.69); websocket frames' server wait p99 0.25 to 0.50 ms; runners' messages took p99 0.21 to 0.33 ms (+56%); slow polls +42% |
+| glibc against `MALLOC_ARENA_MAX=5` | 7, 8 | 523 to 459 (-12%) | 396 to 333 | 129 to 128 | none |
+| glibc against jemalloc preloaded | 8, 8 | | | | |
+| musl against musl-jemalloc (kiln's `jemalloc` feature, `os::alloc`'s settings) | 8, 8 | | | | |
+
+(glibc's side of the `MALLOC_ARENA_MAX=5` A/B lost its last round to a full disk. The two jemalloc rows are
+run once the queue reaches them.) Before these: one round of the glibc build under jemalloc preloaded, its
+heap profile on, held 261 MB anonymous for 165 MB live (step 1); mimalloc, tried before, held 22.7% more
+resident memory, and idle 3.4 times glibc's anonymous memory (183 against 54 MB, research f18).
+
+glibc's default is eight arenas for every core: in the lab, 88, one for nearly each of the server's
+threads, each keeping what its threads freed (438 MB taken, 297 MB of it free). musl's malloc held about
+the same as glibc's. So:
+
+- **glibc builds** (`*-linux-gnu`, built from source): at most 5 arenas, the shards' 4 and glibc's main
+  one, by `mallopt(M_ARENA_MAX)` as the process starts (`kiln::os::alloc::init`, `main`'s first call),
+  unless `MALLOC_ARENA_MAX` or `GLIBC_TUNABLES` says how many (so a lab can still A/B them). 5 held
+  every latency number with 12% less resident memory. 2 took 23% off but doubled the bus delivery's p99,
+  so it isn't 2.
+- **Production's static musl build**: musl's malloc until the jemalloc A/B picks jemalloc. Then the
+  default of `ci/release/build.sh`'s one switch, `KILN_LINUX_ALLOCATOR` (`musl` or `jemalloc`), moves to
+  `jemalloc`, and the image and releases (`.kiln/image.yaml`, `.kiln/release.yaml`) build with kiln's
+  `jemalloc` feature. Both Linux targets build with it under zig's cc (zig 0.17.0 and cargo-zigbuild
+  0.23.4, as `build.sh` pins them): jemalloc's configure finds background threads, `MADV_DONTNEED` and
+  `MADV_FREE`, and the binaries stay static. A cross build can't ask its target's page size and takes
+  4 KiB, and jemalloc refuses to start under a larger one ("Unsupported system page size"). arm64 Linux
+  runs 4, 16 or 64 KiB pages (16 on Apple silicon and the Raspberry Pi 5's kernel), so its jemalloc takes
+  64 KiB (tikv-jemalloc-sys's `JEMALLOC_SYS_WITH_LG_PAGE=16`, for that target alone).
+
+jemalloc's settings (`kiln::os::alloc`, its `malloc_conf`; `_RJEM_MALLOC_CONF` in the environment
+overrides them, so a lab can A/B them on one build). A unit test holds the string to the settings, and
+one with the feature has jemalloc read each back:
+
+| Setting | Value | Basis |
+| --- | --- | --- |
+| `background_thread` | true | Without them jemalloc purges an arena only as that arena allocates and frees, so what a quiet server holds after a burst stays. A purge's `madvise` then runs on jemalloc's own thread, never inline on a shard that freed (jemalloc's TUNING.md). On the static musl build (adacachy, a check program), a burst of 64 MiB freed and left alone went from 54 MB resident to 0.9 MB within 9.5 s; with jemalloc's defaults it stayed at 54 MB. A quiet server's burst goes within about twice the decay: having found nothing to purge, the background thread sleeps the decay's length before it looks again |
+| `narenas` | 5 | The shards' 4 and one more: the count glibc held every latency number with (above). jemalloc's default is four for every CPU (32 in the lab, 128 on a 32-CPU machine), each keeping what its threads freed. jemalloc takes an arena's locks only past a thread's own cache (up to 200 of a small size, against glibc's 7) |
+| `dirty_decay_ms` | 5000 | jemalloc keeps about what was freed in the last half of it (its decay curve is symmetric about the middle): 2.5 s, as often as the lab's work recurs (an attach every 2.7 s, an agent's turn about every 3 s), so that work reuses its pages rather than faulting new ones in. What's idle longer goes within the 5 s of the lab's warm-up after the fill. Half jemalloc's default (10 s), as its TUNING.md suggests where memory comes first |
+| `muzzy_decay_ms` | 0 | A page given back with `MADV_FREE` stays resident until the kernel wants memory (smaps' `LazyFree`), so resident memory doesn't count it as given back. At 0, what decays goes with `MADV_DONTNEED` at once. jemalloc 5.3's code has 0 too, though its manual says 10 s |
+| `thp` | never | fedora gives transparent huge pages only where asked (`madvise`), so the lab measures jemalloc without them. adacachy gives them to every anonymous mapping (`always`), and its khugepaged makes a 2 MiB range with 103 of its 512 pages in use one huge page again (`max_ptes_none` 409), filling in what purges gave back. With `never` (`MADV_NOHUGEPAGE` on jemalloc's mappings), production's heap runs as the lab measured it. The check program's glibc build on adacachy started at 6.3 MB anonymous with jemalloc's default (6 MB of it huge pages) and 0.5 MB with `never`. Its static musl build got huge pages only some runs: a fault takes one only when a free one is at hand |
+
+What the musl-jemalloc A/B decides: with resident memory below musl's beyond noise and no latency number
+worse, the switch's default moves to `jemalloc`. Variants are an environment away on the same build, for
+example `--env-b _RJEM_MALLOC_CONF=narenas:8` or `dirty_decay_ms:1000`.
+
 ## Goal 10: API reads and frames in under a millisecond
 
 Goal 10 of the API runtime program (plan `01a1a87b2dae`): every read the lab makes answers from memory,
