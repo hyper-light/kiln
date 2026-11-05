@@ -505,7 +505,9 @@ run out, and two lines can't take the same one by accident as they could a bit.
   probe it with over links (docs/needs.md E5), and an owner places by probing. `offers`: a runner sends
   its admission hint (`AgentMsg::Offers`) when it changes something decided by; a server reads it (the
   offers view) and passes each runner's room on to the others that named it (`ServerMsg::Offers`), for
-  their owners to choose where to probe by. `place.sessions`: the runner owns an agent session's start
+  their owners to choose where to probe by. `place.health`: the owner reads a runner's health in placement's words
+  (`Strained`, `Barred`); to an owner on a link that didn't name it, a runner says them as `Draining`,
+  which it reads. `place.sessions`: the runner owns an agent session's start
   when the server asks it (`ServerMsg::Place`, `AgentMsg::Placed`) and holds a session's claim while
   it runs. `told`: news of queued and
   started runs to the asking agent (lb/told, in place of its branch's bit 58). `reach.sizes`: sizes

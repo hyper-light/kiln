@@ -694,9 +694,14 @@ pub mod feature {
     /// Agent sessions placed by a runner's owner (AUDIT M4): a runner that says it takes
     /// [`super::ServerMsg::Place`] and holds a session's claim while it runs.
     pub const SESSIONS: &str = "place.sessions";
+    /// An owner that reads a runner's health in its words (AUDIT L1, L2:
+    /// `kiln_ci::place::msg::Reason::{Strained, Barred}`, appended to placement's reasons). To an
+    /// owner on a link that didn't name it, a runner says them as `Draining`, a reason it reads:
+    /// it waits there, taking nothing new.
+    pub const PLACE_HEALTH: &str = "place.health";
 
     /// Every name this build speaks, in the order it says them.
-    pub const ALL: &[&str] = &[PLACE, LINK_FEATURES, OFFERS, TOLD, SIZES, SESSIONS];
+    pub const ALL: &[&str] = &[PLACE, LINK_FEATURES, OFFERS, TOLD, SIZES, SESSIONS, PLACE_HEALTH];
 
     /// [`ALL`], as a message carries them.
     pub fn all() -> Vec<String> {

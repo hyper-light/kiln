@@ -67,6 +67,20 @@ pub enum SessionWord {
     Fallback { runners: Vec<String> },
 }
 
+/// A runner's word `json` (`Say::Place`) as an owner from before `place.health` reads it
+/// (AUDIT L1, L2): a reason it doesn't know (`Strained`, `Barred`, appended after it) is said as
+/// `Draining`, which it does (it waits there, taking nothing new), rather than as a word it can't
+/// read and drops; every other word as it is.
+pub fn for_older_owner(json: String) -> String {
+    use kiln_ci::place::msg::Reason;
+    let Ok(mut e) = serde_json::from_str::<Envelope<ToOwner>>(&json) else { return json };
+    match &mut e.msg {
+        ToOwner::Waiting { reason, .. } if matches!(reason, Reason::Strained { .. } | Reason::Barred { .. }) => *reason = Reason::Draining,
+        _ => return json,
+    }
+    serde_json::to_string(&e).unwrap_or(json)
+}
+
 /// A waiting reason's kind as `kiln_ci::place::msg::Reason` names it (the hint's quotes).
 fn reason_kind(r: &kiln_ci::place::msg::Reason) -> &'static str {
     use kiln_ci::place::msg::Reason;
@@ -973,6 +987,23 @@ impl Placer {
 #[cfg(test)]
 mod key_tests {
     use super::*;
+
+    /// AUDIT L1, L2 for owners from before: a runner's strained or barred word goes to an owner
+    /// that didn't name `place.health` as `Draining`, a reason it reads, keeping its place, start
+    /// and room; any other word goes as it is.
+    #[test]
+    fn an_owner_from_before_hears_strained_and_barred_as_draining() -> anyhow::Result<()> {
+        use kiln_ci::place::msg::{Estimate, Place, Reason};
+        let say = |reason: Reason| serde_json::to_string(&Envelope { epoch: 3, spec: None, msg: ToOwner::Waiting { run: "r1".into(), reason, place: Place::of(2), start: Estimate::default(), predicted: None, free: Resources::default() } });
+        for r in [Reason::Strained { why: "stalled".into() }, Reason::Barred { cause: "disk".into(), why: "full".into() }] {
+            let older: Envelope<ToOwner> = serde_json::from_str(&for_older_owner(say(r)?))?;
+            anyhow::ensure!(older.epoch == 3 && matches!(older.msg, ToOwner::Waiting { reason: Reason::Draining, place, .. } if place == Place::of(2)), "{older:?}");
+        }
+        let line = say(Reason::Line)?;
+        anyhow::ensure!(for_older_owner(line.clone()) == line, "a reason it reads goes as it is");
+        anyhow::ensure!(crate::proto::feature::speaks(&crate::proto::feature::all(), crate::proto::feature::PLACE_HEALTH), "this build reads them");
+        Ok(())
+    }
 
     /// AUDIT L2 by run key: a probe carries its asker's key for its kind of work; once this runner
     /// ran a run of that kind (keyed here by its command in its folder here, not its asker's), the

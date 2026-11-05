@@ -980,9 +980,11 @@ impl Node {
                 }
                 Out::Say { peer, json } => {
                     // To the owner's session that speaks placement, on its link.
-                    let link = self.served.iter().filter(|((p, _), s)| *p == peer && crate::proto::feature::speaks(&s.features, crate::proto::feature::PLACE)).find_map(|(_, s)| s.link.clone());
+                    let link = self.served.iter().filter(|((p, _), s)| *p == peer && crate::proto::feature::speaks(&s.features, crate::proto::feature::PLACE)).find_map(|(_, s)| s.link.clone().map(|l| (l, crate::proto::feature::speaks(&s.features, crate::proto::feature::PLACE_HEALTH))));
                     match link {
-                        Some(link) => {
+                        Some((link, health)) => {
+                            // An owner from before health's words reads them as draining (L1, L2).
+                            let json = if health { json } else { super::place::for_older_owner(json) };
                             self.say_on(&link, &Say::Place { json }).await;
                         }
                         None => tracing::debug!(%peer, "a placement word for an owner with no link: it hears where its runs stand when it's back"),
