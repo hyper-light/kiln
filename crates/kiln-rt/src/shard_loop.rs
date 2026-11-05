@@ -326,6 +326,10 @@ struct Core {
     /// each step's reading of the driver's clock is carried forward by it (`ShardContext::carried`).
     counter_scale: Option<u64>,
     fixed_quantum_ns: u64,
+    /// The shard thread's run time, read with no call at each poll's start (`crate::task_clock`; kiln's goal 9, plan
+    /// 01a1a87b2cec step 3): a slow poll's time on the CPU beside its hold. None off Linux, in a simulation, and where
+    /// the OS refused the event.
+    task_clock: Option<crate::task_clock::TaskClock>,
     /// Whether the driver's clock is real time (the simulation's is not).
     real_time: bool,
     driver_lost: bool,
@@ -504,6 +508,8 @@ impl Shard {
             last_driver_ns: now_ns,
             harvest_owed: false,
             real_time: !is_sim,
+            // Opened on the shard's own thread, which builds it: the clock measures the thread that opens it.
+            task_clock: if is_sim { None } else { crate::task_clock::TaskClock::open() },
             attribution: Tracker::default(),
             deferred: Vec::with_capacity(config.batch.max(1)),
             batch: config.batch.max(1),
@@ -1960,6 +1966,8 @@ impl Shard {
             entry.watch.begin(word.word());
         }
         let entered = registry::enter_in(current, &self.desk);
+        // The thread's run time as the poll starts, for a slow poll's time on the CPU (`crate::task_clock`).
+        let cpu_from = self.core.task_clock.as_ref().and_then(crate::task_clock::TaskClock::run_ns);
         // The poll is the task's code: inside an unwind boundary of the shard's own, so a task that
         // panics ends there, typed, and costs the shard and its other tasks nothing (CLAUDE.md §1).
         let poll = crate::unwind::contained(|| future.poll(&mut cx));
@@ -1996,7 +2004,8 @@ impl Shard {
             None
         };
         if elapsed > crate::slow::SLOW_POLL_NS {
-            self.note_slow(slot, elapsed, matches!(attributed, Some(crate::attribution::Attribution::Preempted)));
+            let cpu = cpu_from.and_then(|from| Some(self.core.task_clock.as_ref()?.run_ns()?.saturating_sub(from)));
+            self.note_slow(slot, elapsed, cpu, matches!(attributed, Some(crate::attribution::Attribution::Preempted)));
         }
         let Some(poll) = poll else {
             self.unwound(slot, future, word, current);
@@ -2071,9 +2080,9 @@ impl Shard {
     /// against the task's spawn site and the label its code set (kiln's goal 9, plan 01a1a87b2cec step 2), and
     /// as the host's when the poll was found preempted (`host`; steps 3 and 4).
     #[cold]
-    fn note_slow(&self, slot: u32, elapsed: u64, host: bool) {
+    fn note_slow(&self, slot: u32, elapsed: u64, cpu: Option<u64>, host: bool) {
         if let Some(entry) = self.desk.entry {
-            entry.slow.note(entry.spawned_at(slot), self.desk.label.get(), elapsed, host);
+            entry.slow.note_with_cpu(entry.spawned_at(slot), self.desk.label.get(), elapsed, cpu, host);
         }
     }
 

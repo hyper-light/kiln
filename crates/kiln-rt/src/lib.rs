@@ -90,6 +90,7 @@ pub mod sim;
 pub mod stdio;
 pub mod sync;
 pub mod task;
+mod task_clock;
 mod thread_clock;
 pub use thread_clock::CpuReading;
 pub mod tcp;
