@@ -40,12 +40,47 @@ async function staticFile(req: Request): Promise<Response | null> {
   return new Response(file, { headers: { "cache-control": immutable ? "public, max-age=31536000, immutable" : "no-cache" } });
 }
 
+/**
+ * The import map the build's chunks name each other through (scripts/stable-names.mjs, goal 8 step
+ * 4): every page needs it before its first module, so it goes in right after `<head>`.
+ */
+const IMPORT_MAP = await (async () => {
+  const f = Bun.file(new URL("client/_importmap.json", DIST));
+  return (await f.exists()) ? `<script type="importmap">${await f.text()}</script>` : "";
+})();
+
+function withImportMap(res: Response): Response {
+  if (!IMPORT_MAP || !res.body || !(res.headers.get("content-type") ?? "").includes("text/html")) return res;
+  const enc = new TextEncoder();
+  const dec = new TextDecoder();
+  let head = "";
+  let done = false;
+  const body = res.body.pipeThrough(
+    new TransformStream<Uint8Array, Uint8Array>({
+      transform(chunk, out) {
+        if (done) return out.enqueue(chunk);
+        head += dec.decode(chunk, { stream: true });
+        const at = head.indexOf("<head>");
+        if (at < 0 && head.length < 65536) return;
+        done = true;
+        out.enqueue(enc.encode(at < 0 ? head : head.slice(0, at + 6) + IMPORT_MAP + head.slice(at + 6)));
+      },
+      flush(out) {
+        if (!done) out.enqueue(enc.encode(head + dec.decode()));
+      },
+    }),
+  );
+  const headers = new Headers(res.headers);
+  headers.delete("content-length");
+  return new Response(body, { status: res.status, statusText: res.statusText, headers });
+}
+
 const server = Bun.serve({
   hostname: HOST,
   port: PORT,
   async fetch(req) {
     try {
-      return (await staticFile(req)) ?? (await start.fetch(asAsked(req)));
+      return (await staticFile(req)) ?? withImportMap(await start.fetch(asAsked(req)));
     } catch (e) {
       console.error("ui server:", e);
       return new Response("kiln's UI server failed on this request", { status: 500 });

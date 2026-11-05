@@ -21,67 +21,91 @@
     "signin": {
       "first": {
         "total_br": 235971,
-        "js_br": 158513,
+        "js_br": 155544,
         "css_br": 25335,
         "font_br": 54581,
-        "html_br": 3686,
+        "html_br": 8220,
         "requests": 47,
         "waves": 5
+      },
+      "deploy": {
+        "deploy_br": 8213,
+        "case": "a one-line change in the conversation view (ci/ui/two_builds.sh)"
       }
     },
     "overview": {
       "first": {
         "total_br": 231713,
-        "js_br": 154255,
+        "js_br": 151411,
         "css_br": 25335,
         "font_br": 54581,
-        "html_br": 3686,
+        "html_br": 8220,
         "requests": 44,
         "waves": 4
+      },
+      "deploy": {
+        "deploy_br": 8213,
+        "case": "a one-line change in the conversation view (ci/ui/two_builds.sh)"
       }
     },
     "mission": {
       "first": {
-        "total_br": 480098,
-        "js_br": 366572,
+        "total_br": 479768,
+        "js_br": 361708,
         "css_br": 61403,
         "font_br": 54581,
-        "html_br": 3686,
+        "html_br": 8220,
         "requests": 98,
         "waves": 4
+      },
+      "deploy": {
+        "deploy_br": 8213,
+        "case": "a one-line change in the conversation view (ci/ui/two_builds.sh)"
       }
     },
     "conversation": {
       "first": {
-        "total_br": 533948,
-        "js_br": 417711,
+        "total_br": 533261,
+        "js_br": 412490,
         "css_br": 64114,
         "font_br": 54581,
-        "html_br": 3686,
+        "html_br": 8220,
         "requests": 103,
         "waves": 4
+      },
+      "deploy": {
+        "deploy_br": 81855,
+        "case": "a one-line change in the conversation view (ci/ui/two_builds.sh)"
       }
     },
     "runs": {
       "first": {
         "total_br": 486711,
-        "js_br": 377116,
+        "js_br": 373010,
         "css_br": 57472,
         "font_br": 54581,
-        "html_br": 3686,
+        "html_br": 8220,
         "requests": 87,
         "waves": 4
+      },
+      "deploy": {
+        "deploy_br": 8213,
+        "case": "a one-line change in the conversation view (ci/ui/two_builds.sh)"
       }
     },
     "run": {
       "first": {
         "total_br": 251819,
-        "js_br": 173612,
+        "js_br": 170538,
         "css_br": 26084,
         "font_br": 54581,
-        "html_br": 3686,
+        "html_br": 8220,
         "requests": 51,
         "waves": 4
+      },
+      "deploy": {
+        "deploy_br": 8213,
+        "case": "a one-line change in the conversation view (ci/ui/two_builds.sh)"
       }
     }
   }

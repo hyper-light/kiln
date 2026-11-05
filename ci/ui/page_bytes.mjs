@@ -4,7 +4,7 @@
  * budget (goal 8, plan 01a1a832ebfd step 2). A page is the shell (what _shell.html names, with what
  * that imports) plus its route: the route's chunk, the files its import preloads (`__vite__mapDeps`)
  * and what they import, plus the Latin fonts its stylesheets name. Sizes are Brotli's, as kiln sends
- * them (the build's own `.br` beside a file when there is one, else Brotli 11 made here).
+ * them (Brotli 11, as kiln's build packs them).
  *
  *   node ci/ui/page_bytes.mjs [--dist ui/dist] [--json] [--check] [--budgets ci/ui/page_budgets.json]
  *                             [--ratchet]
@@ -38,9 +38,10 @@ const DYNAMIC_IMPORT = /import\(\s*["'`]([^"'`]+?\.js)["'`]\s*\)\s*,\s*__vite__m
 const DYNAMIC_BARE = /import\(\s*["'`]([^"'`]+?\.js)["'`]\s*\)/g;
 const MAP_DEPS = /m\.f\s*=\s*(\[[^\]]*\])/;
 
-/** `x` as a file of assets/: `./a.js`, `/assets/a.js`, `assets/a.js`, or a name the import map maps. */
+/** `x` as a file of assets/: `./a.js`, `/assets/a.js`, `assets/a.js`, or a key the import map maps (`./k/a.js`, goal 8 step 4). */
 function fileOf(spec, map) {
-  const to = map?.[spec] ?? spec;
+  const k = /(?:^|\/)k\/([^/]+\.js)$/.exec(spec);
+  const to = k ? (map?.[`/assets/k/${k[1]}`] ?? spec) : spec;
   return path.basename(to.split("?")[0]);
 }
 
@@ -55,10 +56,8 @@ export function importMap(html) {
   }
 }
 
-/** Brotli 11 of a file as kiln sends it: the build's `.br` when it has one. */
-function brSize(file, data) {
-  const pre = `${file}.br`;
-  if (existsSync(pre)) return readFileSync(pre).length;
+/** Brotli 11 of a file, as kiln's build packs it (crates/kiln/build.rs, crates/kiln/src/ui_pack.rs). */
+function brSize(data) {
   return brotliCompressSync(data, { params: { [constants.BROTLI_PARAM_QUALITY]: 11, [constants.BROTLI_PARAM_SIZE_HINT]: data.length } }).length;
 }
 
@@ -126,7 +125,7 @@ export function measure(dist) {
   const sizeOf = (f) => {
     if (!size.has(f)) {
       const p = f === "_shell.html" ? htmlPath : path.join(assets, f);
-      size.set(f, existsSync(p) ? brSize(p, readFileSync(p)) : 0);
+      size.set(f, existsSync(p) ? brSize(readFileSync(p)) : 0);
     }
     return size.get(f);
   };
@@ -169,7 +168,9 @@ export function measure(dist) {
       const kind = f === "_shell.html" ? "html" : f.endsWith(".js") ? "js" : f.endsWith(".css") ? "css" : "font";
       by[kind] += sizeOf(f);
     }
+    const sizes = Object.fromEntries([...files.keys()].sort().map((f) => [f, sizeOf(f)]));
     out[page] = {
+      sizes,
       html_br: by.html,
       js_br: by.js,
       css_br: by.css,
@@ -184,6 +185,21 @@ export function measure(dist) {
 }
 
 const MEASURES = ["total_br", "js_br", "css_br", "font_br", "html_br", "requests", "waves"];
+
+/**
+ * What a visit after a deploy downloads again, per page: the files of `after`'s page that `before`'s
+ * didn't have (by name: a file whose name didn't change is in the cache), and the shell, which
+ * always changes. Goal 8 step 4's after-deploy bytes.
+ */
+export function resent(before, after) {
+  const out = {};
+  for (const [page, m] of Object.entries(after)) {
+    const had = new Set(before[page]?.files ?? []);
+    const again = m.files.filter((f) => f === "_shell.html" || !had.has(f));
+    out[page] = { deploy_br: again.reduce((a, f) => a + (m.sizes[f] ?? 0), 0), files: again };
+  }
+  return out;
+}
 
 /** Every page over its budget: [page, measure, budget, measured]. */
 export function over(measured, budgets) {
@@ -230,6 +246,19 @@ function main(argv) {
         `${page.padEnd(13)} total ${kib(m.total_br).padStart(10)}  js ${kib(m.js_br).padStart(10)}  css ${kib(m.css_br).padStart(9)}  fonts ${kib(m.font_br).padStart(8)}  html ${kib(m.html_br).padStart(8)}  ${String(m.requests).padStart(3)} requests  ${m.waves} waves`,
       );
   const budgets = existsSync(budgetsPath) ? JSON.parse(readFileSync(budgetsPath, "utf8")) : { pages: {} };
+  // --since <dist>: what a visit after a deploy from that build to this one downloads again.
+  const since = flag("--since", null);
+  if (since) {
+    const again = resent(measure(path.resolve(since)), measured);
+    let failed = 0;
+    for (const [page, r] of Object.entries(again)) {
+      const b = budgets.pages?.[page]?.deploy?.deploy_br;
+      const over_ = typeof b === "number" && r.deploy_br > b;
+      failed += over_ ? 1 : 0;
+      console.log(`${page.padEnd(13)} after a deploy ${kib(r.deploy_br).padStart(10)} again${typeof b === "number" ? ` (budget ${kib(b)})` : ""}${over_ ? " OVER" : ""}: ${r.files.join(" ")}`);
+    }
+    if (argv.includes("--check") && failed) return 1;
+  }
   if (argv.includes("--ratchet")) {
     writeFileSync(budgetsPath, `${JSON.stringify(ratchet(measured, budgets, budgets.headroom_br ?? 2048), null, 2)}\n`);
     console.log(`budgets ratcheted: ${budgetsPath}`);

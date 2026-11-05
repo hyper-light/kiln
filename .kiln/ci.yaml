@@ -67,6 +67,10 @@ jobs:
       # 01a1a832ebfd step 2: ci/ui/page_budgets.json, docs/browser-lab.md "UI page loads").
       - name: page budgets
         run: node --test ci/ui/page_bytes.test.mjs && node ci/ui/page_bytes.mjs --dist ui/dist --check
+      # A one-line change renames at most 2 hashed files, and what a visit after it downloads
+      # again stays within each page's deploy budget (goal 8 step 4: names from content alone).
+      - name: two builds
+        run: ci/ui/two_builds.sh
       # Against the wire types made from Rust (ui/src/api/wire, held to the Rust by `wire::ts`). The
       # tests one file at a time (`test:ci`): each syntax samples' file compiles its grammars'
       # WebAssembly, up to 3.3 GiB, and side by side they outgrew this job's 4 GiB (2026-11-02).

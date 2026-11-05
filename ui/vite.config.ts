@@ -7,6 +7,7 @@ import { fileURLToPath, URL } from "node:url";
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { dirname, join as joinPath, resolve as resolvePath } from "node:path";
 import { gunzipSync } from "node:zlib";
+import { createHash } from "node:crypto";
 
 // The kiln server the dev server sends /api to.
 const target = process.env.KILN_URL ?? "http://127.0.0.1:7070";
@@ -60,10 +61,44 @@ function plainGrammars(): Plugin {
   };
 }
 
+/**
+ * What each client chunk is, for scripts/stable-names.mjs (goal 8, plan 01a1a832ebfd step 4): its
+ * name and a digest of the modules in it (`.kiln-chunks.json`, read and removed after the build),
+ * so a chunk keeps the same key from build to build however its content or its imports' change.
+ */
+function chunkKeys(): Plugin {
+  return {
+    name: "kiln:chunk-keys",
+    apply: "build",
+    applyToEnvironment: (env) => env.config.consumer === "client",
+    generateBundle: {
+      order: "post",
+      handler(_options, bundle) {
+        const root = fileURLToPath(new URL(".", import.meta.url));
+        const chunks: Record<string, { name: string; modules: string }> = {};
+        for (const out of Object.values(bundle)) {
+          if (out.type !== "chunk") continue;
+          const ids = (out.facadeModuleId ? [out.facadeModuleId] : [...out.moduleIds]).map((id) => id.replace(root, "").replace(/\0/g, "")).sort();
+          chunks[out.fileName] = { name: out.name, modules: createHash("sha256").update(ids.join("\n")).digest("base64url").slice(0, 6) };
+        }
+        this.emitFile({ type: "asset", fileName: ".kiln-chunks.json", source: JSON.stringify(chunks) });
+      },
+    },
+  };
+}
+
 export default defineConfig({
   // TanStack Start renders pages and server components (React Server Components); React's plugin
   // goes after it.
-  plugins: [flightOnDemand(), plainGrammars(), tailwindcss(), tanstackStart({ rsc: { enabled: true }, spa: { enabled: true, prerender: { outputPath: "/_shell.html" } } }), rsc(), react()],
+  plugins: [
+    flightOnDemand(),
+    plainGrammars(),
+    chunkKeys(),
+    tailwindcss(),
+    tanstackStart({ rsc: { enabled: true }, spa: { enabled: true, prerender: { outputPath: "/_shell.html" } } }),
+    rsc(),
+    react(),
+  ],
   resolve: {
     alias: { "@": fileURLToPath(new URL("./src", import.meta.url)) },
   },
