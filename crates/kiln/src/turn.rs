@@ -106,7 +106,7 @@ impl Gate {
 
     /// One turn off the count, if it has one.
     fn take_free(&self) -> bool {
-        self.free.fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| n.checked_sub(1)).is_ok()
+        self.free.try_update(Ordering::AcqRel, Ordering::Acquire, |n| n.checked_sub(1)).is_ok()
     }
 
     /// A turn given back: to the first place still waiting, else to the count, and the line looked at again after
@@ -352,7 +352,7 @@ const GONE: usize = usize::MAX;
 impl<V> Users<V> {
     /// One more user, unless it's gone.
     fn join(&self) -> bool {
-        self.count.fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| n.checked_add(1).filter(|m| *m != GONE)).is_ok()
+        self.count.try_update(Ordering::AcqRel, Ordering::Acquire, |n| n.checked_add(1).filter(|m| *m != GONE)).is_ok()
     }
 }
 
