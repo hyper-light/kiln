@@ -1,0 +1,110 @@
+# Trial only, never on main (goal 11, plan 01a1a87b2e56 steps 1 to 4): the lab's realistic profile, calm, as an
+# A/B of the platform's allocator against mimalloc, with an idle server of each first; the server's memory
+# sampled through each round (smaps with each 20 s window's referenced pages). Everything the lab runs is
+# niced, so the runner's own agent keeps a CPU (trial 1 lost its runner mid-round), and the idle results are
+# pushed before the rounds start. Results go to g11-memory-idle2b and g11-memory-results2b.
+name: g11-memory-try2b
+
+on:
+  push:
+    branches: [g11-memory-try2b]
+
+permissions:
+  contents: write
+
+concurrency:
+  group: g11-memory-try2b
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: never
+  CARGO_INCREMENTAL: "0"
+  KILN_UI_SERVER: "off"
+
+jobs:
+  lab:
+    name: lab memory (idle and realistic, glibc against mimalloc)
+    runs-on: ubuntu-latest
+    timeout-minutes: 330
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Room
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL || true
+          sudo fallocate -l 16G /mnt/g11-swap && sudo chmod 600 /mnt/g11-swap && sudo mkswap /mnt/g11-swap && sudo swapon /mnt/g11-swap || true
+          sudo mkdir -p /mnt/target /mnt/lab /mnt/bin && sudo chown "$USER" /mnt/target /mnt/lab /mnt/bin
+          cat /sys/kernel/mm/transparent_hugepage/enabled; df -h / /mnt; free -g; nproc
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: ui/package-lock.json
+      - name: UI
+        working-directory: ui
+        run: npm ci --no-audit --no-fund --loglevel=error && npm run build
+      - name: Rust
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+      - name: Build (release, symbols kept; the platform's allocator, then mimalloc)
+        timeout-minutes: 200
+        env:
+          CARGO_PROFILE_RELEASE_STRIP: "false"
+          CARGO_TARGET_DIR: /mnt/target
+        run: |
+          set -o pipefail
+          cargo build --locked --release -p kiln -p kiln-lab --bin kiln --bin kiln-lab -j 3 2>&1 | grep -v -E '^ *(Compiling|Downloaded|Downloading) ' | tail -40
+          cp /mnt/target/release/kiln /mnt/bin/kiln-glibc && cp /mnt/target/release/kiln-lab /mnt/bin/kiln-lab
+          cargo build --locked --release -p kiln --features mimalloc --bin kiln -j 3 2>&1 | grep -v -E '^ *(Compiling|Downloaded|Downloading) ' | tail -40
+          cp /mnt/target/release/kiln /mnt/bin/kiln-mimalloc
+          ls -la /mnt/bin
+          nm -n -C --defined-only /mnt/bin/kiln-glibc | awk '$2 ~ /^[tTwW]$/' > /mnt/lab/syms.txt
+          readelf -lW /mnt/bin/kiln-glibc > /mnt/lab/segments.txt
+          readelf -SW /mnt/bin/kiln-glibc > /mnt/lab/sections.txt
+          for b in glibc mimalloc; do printf '#!/usr/bin/env bash\nexport G11_KILN=/mnt/bin/kiln-%s\nexec bash %s "$@"\n' "$b" "$GITHUB_WORKSPACE/.github/g11/kiln-wrap.sh" > /mnt/bin/wrap-$b.sh; chmod +x /mnt/bin/wrap-$b.sh; done
+      - name: Idle servers
+        timeout-minutes: 20
+        run: |
+          set +e
+          chmod +x .github/g11/*.sh
+          for spec in "glibc kiln-glibc" "mimalloc kiln-mimalloc" "glibc-tasks1024 kiln-glibc KILN_RT_TASKS=1024" "glibc-arena2 kiln-glibc MALLOC_ARENA_MAX=2"; do
+            set -- $spec; label=$1 bin=$2; shift 2
+            echo "=== idle $label"; nice -n 10 bash .github/g11/idle.sh /mnt/bin/$bin /mnt/lab/idle-$label "$@" 2>&1 | tee /mnt/lab/idle-$label.txt
+          done
+          R=$RUNNER_TEMP/idle; mkdir -p "$R"; cp /mnt/lab/idle-*.txt "$R/" 2>/dev/null
+          for d in /mnt/lab/idle-*/; do label=$(basename "$d"); mkdir -p "$R/$label"; cp "$d/metrics.txt" "$R/$label/" 2>/dev/null; gzip -c "$d/smaps" > "$R/$label/smaps.gz" 2>/dev/null; tail -50 "$d/server.log" > "$R/$label/server.log.txt" 2>/dev/null; done
+          echo "${{ github.sha }}" > "$R/COMMIT"
+          cd "$RUNNER_TEMP" && git init -q idle-out && cd idle-out && cp -r "$R" results
+          git config user.name "kiln g11 lab" && git config user.email "g11-lab@users.noreply.github.com"
+          git add results && git commit -q -m "g11 idle results for ${{ github.sha }}"
+          git push -f "https://x-access-token:${{ github.token }}@github.com/${{ github.repository }}.git" HEAD:refs/heads/g11-memory-idle2b
+      - name: Lab rounds (A/B, interleaved)
+        timeout-minutes: 150
+        run: |
+          set +e
+          echo "=== ab $(date -u +%T) $(free -m | awk '/Mem/ {print $7 " MB available"}')"
+          nice -n 10 timeout 8400 /mnt/bin/kiln-lab ab --a /mnt/bin/wrap-glibc.sh --b /mnt/bin/wrap-mimalloc.sh --label-a glibc --label-b mimalloc --profile realistic --rounds 2 --keep --out /mnt/lab/ab > /mnt/lab/ab.stdout 2> /mnt/lab/ab.stderr
+          echo "exit $? $(date -u +%T)"; tail -5 /mnt/lab/ab.stderr
+      - name: Summarize and commit
+        if: ${{ always() }}
+        run: |
+          set +e
+          R=$RUNNER_TEMP/results; mkdir -p "$R"
+          cp /mnt/lab/idle-*.txt "$R/" 2>/dev/null
+          for d in /mnt/lab/idle-*/; do label=$(basename "$d"); mkdir -p "$R/$label"; cp "$d/metrics.txt" "$R/$label/" 2>/dev/null; gzip -c "$d/smaps" > "$R/$label/smaps.gz" 2>/dev/null; tail -50 "$d/server.log" > "$R/$label/server.log.txt" 2>/dev/null; done
+          d=/mnt/lab/ab
+          python3 -I .github/g11/summarize.py "$d" /mnt/lab/syms.txt /mnt/lab/segments.txt > "$R/ab-summary.txt" 2>&1
+          cp "$d/run.json" "$d/report.md" "$R/" 2>/dev/null
+          cp /mnt/lab/ab.stdout "$R/ab.stdout.txt" 2>/dev/null; tail -100 /mnt/lab/ab.stderr > "$R/ab.stderr.txt" 2>/dev/null
+          for m in "$d"/mem/*/; do
+            r=$R/mem/$(basename "$m"); mkdir -p "$r"
+            cp "$m"/rss.csv "$m"/env.txt "$m"/sampler.log "$m"/smaps.index "$r/" 2>/dev/null
+            last=$(tail -1 "$m/smaps.index" 2>/dev/null | cut -d' ' -f1); [ -n "$last" ] && gzip -c "$m/smaps.$last" > "$r/smaps.last.gz"
+          done
+          for s in "$d"/rounds/*/; do tail -100 "$s/server.log" > "$R/server-$(basename "$s").log.txt" 2>/dev/null; done
+          cp /mnt/lab/sections.txt /mnt/lab/segments.txt "$R/" 2>/dev/null
+          echo "${{ github.sha }}" > "$R/COMMIT"
+          cd "$RUNNER_TEMP" && git init -q out && cd out && cp -r "$R" results
+          git config user.name "kiln g11 lab" && git config user.email "g11-lab@users.noreply.github.com"
+          git add results && git commit -q -m "g11 lab results for ${{ github.sha }}"
+          git push -f "https://x-access-token:${{ github.token }}@github.com/${{ github.repository }}.git" HEAD:refs/heads/g11-memory-results2b
