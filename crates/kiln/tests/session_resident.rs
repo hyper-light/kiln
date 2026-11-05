@@ -109,12 +109,15 @@ fn event(r: &Lcg, i: u64) -> Event {
     Event { id: format!("ev-{i:06}"), seq: i, at, parent: None, by: None, body }
 }
 
-/// A scratch server's hub, as the server's own tests make one (`benches/session_feed.rs`).
+/// A scratch server's hub, as the server's own tests make one (`benches/session_feed.rs`); with
+/// `G11_RESIDENT_CONVERSATIONS=off`, without the conversation store (`[conversations] off`), so what the
+/// store holds of the session shows apart from the rest.
 async fn scratch() -> anyhow::Result<Arc<Hub>> {
     let dir = tempfile::tempdir()?.keep();
     let mut cfg = kiln::config::Config::default();
     cfg.server.data_dir = dir.clone();
     cfg.terminal.enabled = false;
+    cfg.conversations.off = std::env::var("G11_RESIDENT_CONVERSATIONS").is_ok_and(|v| v == "off");
     let pki_dir = dir.join("pki");
     let store = kiln::rt::blocking(kiln::store::Store::in_memory).await??;
     let (pki, leaf) = kiln::rt::blocking(move || -> anyhow::Result<_> {
@@ -173,19 +176,25 @@ fn g11_s2_a_20000_event_sessions_resident_cost() -> anyhow::Result<()> {
             a.snapshot.frames().iter().filter_map(|f| serde_json::from_str::<serde_json::Value>(f).ok()).filter_map(|v| v.get("events").and_then(serde_json::Value::as_array).map(Vec::len)).sum()
         });
         let with = held(&hub).await;
+        let bus_with = hub.bus.stats().memory_used;
         ingest(&hub, &there, vec![Update::Closed]).await;
         let after = held(&hub).await;
+        let bus_after = hub.bus.stats().memory_used;
         let open = with - before;
         let per = open / i64::try_from(kept.max(1)).unwrap_or(1);
         println!(
-            "g11 resident: {EVENTS} events sent ({:.1} MB of JSON), {kept} kept; while open the server held {:.2} MB more ({per} bytes an event kept), \
-             {:.2} MB of it let go at its end (process {:.2} MB before, {:.2} MB with it, {:.2} MB after)",
+            "g11 resident (conversation store {}): {EVENTS} events sent ({:.1} MB of JSON), {kept} kept; while open the server held {:.2} MB more \
+             ({per} bytes an event kept), {:.2} MB of it let go at its end (process {:.2} MB before, {:.2} MB with it, {:.2} MB after); \
+             the bus's own count {:.2} MB with it, {:.2} MB after",
+            if hub.harness.convo.is_some() { "on" } else { "off" },
             text as f64 / 1e6,
             open as f64 / 1e6,
             (with - after) as f64 / 1e6,
             before as f64 / 1e6,
             with as f64 / 1e6,
-            after as f64 / 1e6
+            after as f64 / 1e6,
+            bus_with as f64 / 1e6,
+            bus_after as f64 / 1e6
         );
         anyhow::ensure!(kept > 0, "the session kept no events");
         Ok(())
