@@ -193,7 +193,7 @@ pub async fn put(hub: &Hub, name: &str, body: &Value) -> Result<Response, Fail> 
 async fn effect(hub: &Hub, pool: &Pool) -> (Vec<Value>, Value) {
     let mut diagnostics = Vec::new();
     let (hosts, carriers): (Vec<String>, Vec<String>) = {
-        let agents = hub.agents.lock();
+        let agents = hub.agents.load();
         let live: Vec<_> = agents.values().filter(|a| a.connected).collect();
         (
             live.iter().filter(|a| a.facts.as_ref().is_some_and(|f| f.executors.contains_key(&pool.executor))).map(|a| a.name.clone()).collect(),

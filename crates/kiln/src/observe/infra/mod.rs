@@ -455,7 +455,7 @@ impl Infra {
     fn runners(&self) -> HashMap<String, Runner> {
         let Some(hub) = &self.hub else { return HashMap::new() };
         hub.agents
-            .lock()
+            .load()
             .values()
             .map(|a| {
                 (

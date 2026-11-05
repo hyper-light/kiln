@@ -898,9 +898,7 @@ fn the_server_refuses_what_its_relay_cant_take_typed_and_notes_it() -> anyhow::R
         anyhow::ensure!(hub.sent.lock().iter().filter(|(p, _)| *p == 4).count() == 1, "the old runner is told nothing new");
         anyhow::ensure!(shown("old", Wire::Relay, Code::Malformed) && hub.reach.lock().links() == 1, "noted on its page, and the link goes on");
         // A job pod's frame: refused, and noted.
-        if let Some(a) = hub.agents.lock().get_mut("intruder") {
-            a.ephemeral = true;
-        }
+        hub.change_agent("intruder", |a| a.ephemeral = true);
         clock.advance(Duration::from_millis(100));
         hear(&hub, 3, LANE_REACH, &frame("mac", true)).await?;
         let t = told(&hub, 3);

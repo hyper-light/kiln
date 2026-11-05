@@ -1127,7 +1127,7 @@ impl Registry {
     pub fn restore_from(&self, hub: &Arc<Hub>, machine: &str) -> anyhow::Result<()> {
         let st = self.convo.as_ref().ok_or_else(|| anyhow::anyhow!("the conversation store is off"))?;
         anyhow::ensure!(self.feed.is_some(), "this server takes no conversation feeds");
-        let peer = hub.instances.lock().newest_with(machine, crate::proto::CAP_CONVO).ok_or_else(|| anyhow::anyhow!("{} isn't connected, or keeps no conversation store", hub.shown(machine)))?;
+        let peer = hub.instances.load().newest_with(machine, crate::proto::CAP_CONVO).ok_or_else(|| anyhow::anyhow!("{} isn't connected, or keeps no conversation store", hub.shown(machine)))?;
         if matches!(self.restore_view(), Restore::Asked { .. } | Restore::Copying { .. }) {
             anyhow::bail!("a restore is already under way");
         }
@@ -1373,7 +1373,7 @@ impl Registry {
             // The machine whose feed brought it, else the one its updates came from.
             let Some(machine) = u.machine.clone().or_else(|| info.target.strip_prefix("agent:").map(str::to_owned)) else { continue };
             info.target = format!("agent:{machine}");
-            if hub.agents.lock().get(&machine).is_some_and(|a| a.connected) {
+            if hub.agents.load().get(&machine).is_some_and(|a| a.connected) {
                 continue;
             }
             info.status = Status::Disconnected;
@@ -2854,7 +2854,7 @@ impl Registry {
         let message = super::session::is_message(c);
         let inbox = match self.location(id) {
             Some(Location::Local) => self.local.inbox().is_some(),
-            Some(Location::Machine(machine)) => hub.instances.lock().wide_caps_for(&machine, &crate::instances::Owned::Agent(id.to_owned())) & crate::proto::CAP_INBOX != 0,
+            Some(Location::Machine(machine)) => hub.instances.load().wide_caps_for(&machine, &crate::instances::Owned::Agent(id.to_owned())) & crate::proto::CAP_INBOX != 0,
             None => false,
         };
         super::asked::Kind { message, deduped: message && inbox && message_id(c).is_some() }
@@ -3035,7 +3035,7 @@ impl Registry {
                 }
                 // A runner with inboxes takes a message for an epoch, and answers it.
                 let (caps, away) = {
-                    let inst = hub.instances.lock();
+                    let inst = hub.instances.load();
                     (inst.wide_caps_for(&machine, &crate::instances::Owned::Agent(id.to_owned())), inst.newest(&machine).is_none())
                 };
                 let had_id = message.is_some();
@@ -3088,10 +3088,10 @@ impl Registry {
             Location::Local => return Err("it runs on the server itself, which is up: move it instead".into()),
             Location::Machine(m) => m.clone(),
         };
-        if hub.agents.lock().get(&from_name).is_some_and(|a| a.connected) {
+        if hub.agents.load().get(&from_name).is_some_and(|a| a.connected) {
             return Err(format!("{} is online: move the session from there instead", hub.shown(&from_name)));
         }
-        if !hub.agents.lock().get(to).is_some_and(|a| a.connected) {
+        if !hub.agents.load().get(to).is_some_and(|a| a.connected) {
             return Err(format!("{} isn't connected", hub.shown(to)));
         }
         if hub.runner_caps(to) & crate::proto::CAP_CONVO == 0 {
@@ -3105,7 +3105,7 @@ impl Registry {
             .map_err(|e| format!("{e:#}"))?;
         // kiln takes it for the process that held it, which can't hand it on: the package carries
         // the take, which the receipt follows as a hand-on's (docs/ci.md W27-R08).
-        let heard = hub.agents.lock().get(&from_name).map(|a| a.last_seen).unwrap_or_default();
+        let heard = hub.agents.load().get(&from_name).map(|a| a.last_seen).unwrap_or_default();
         let when = time::OffsetDateTime::from_unix_timestamp(heard).ok().and_then(|t| t.format(&time::format_description::well_known::Rfc3339).ok()).unwrap_or_else(|| "never".to_owned());
         let why = format!("resumed from kiln's copy: {} was last heard from at {when}", hub.shown(&from_name));
         match crate::custody::take_for(&hub.store, &hub.pki, id, pkg.state.epoch, &pkg.events, &why).await {
@@ -3155,7 +3155,7 @@ impl Registry {
 
     pub async fn move_local(&self, hub: &Hub, id: &str, to: &str, cwd: &str) -> Result<(), String> {
         let s = self.local.get(id).filter(|_| self.never_started(id)).ok_or_else(|| "only an agent whose harness never started on the kiln server moves from it".to_owned())?;
-        if !hub.agents.lock().get(to).is_some_and(|a| a.connected) {
+        if !hub.agents.load().get(to).is_some_and(|a| a.connected) {
             return Err(format!("{} isn't connected", hub.shown(to)));
         }
         if hub.runner_caps(to) & crate::proto::CAP_CONVO == 0 {

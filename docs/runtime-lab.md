@@ -588,6 +588,13 @@ python3 scripts/locks.py rank census/run.json
   lost processes, tool fixes and repositories asked to be polled; the metrics' labelled families (their
   series' values atomics); the UI's compressed files; Ship's model (its repositories' rows shared between
   copies); the logs' live jobs.
+- **The runners and their processes** (the hub's `agents` and `instances`), read on every runner's
+  message, every agent session's update and every command sent to one, are copies too. A runner's record
+  is its own `Arc` in the copy, so a change copies the map's pointers and that one record
+  (`Hub::change_agent`); its last word's time is written once a second at most, not once a message. The
+  processes' copy changes only as processes come and go and as what they hold changes: a session's
+  update from the process holding it, and a message about what one holds, read it without writing
+  (`Instances::routes`).
 - **Questions put to runners** waiting for their answers (`crate::rcu::Pending`): each in a take-once
   cell of its own, the cells' map an `Rcu`, so an answer and its asker's giving up take it at most once.
 - **The runners' commands** (`crate::wire::commands::Owner`): one task owns their state machine and takes
@@ -603,11 +610,9 @@ those the file lists, each with why it's off the hot path, or (`todo`) what repl
 (`.kiln/ci.yaml`'s `locks` job, `.github/workflows/ci.yml`'s), with `scripts/test_locks.py`, which plants
 a lock in a copy of the hub and holds the check to failing on it.
 
-Still on the hot path, listed so (`todo`): the hub's runners (`agents`) and runner processes
-(`instances`), which `harness/registry.rs` takes too, next now that goal 4's rewrite of it is on main;
-reach's relay (`reach`), each relayed frame's in the hub's loop; and a live job's files (`logs.rs`'s
-`files`), one per job, its writers' alone. Inside Quiver (vendored, the bus's node): its topics' map and
-each topic's tail, for Quiver's own change.
+Still on the hot path, listed so (`todo`): reach's relay (`reach`), each relayed frame's in the hub's
+loop; and a live job's files (`logs.rs`'s `files`), one per job, its writers' alone. Inside Quiver
+(vendored, the bus's node): its topics' map and each topic's tail, for Quiver's own change.
 
 ## Goal 7: placement
 

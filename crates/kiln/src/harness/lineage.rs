@@ -534,7 +534,7 @@ fn server_as_runner(hub: &Hub) -> Option<crate::reach::directory::RunnerInfo> {
 /// The machines that could run harness `kind` for `want`, best first (the idlest, as reach picks),
 /// and why each other one was passed over. The server counts as `local`.
 fn candidates(hub: &Hub, want: &crate::reach::directory::Want) -> (Vec<String>, Vec<String>) {
-    let outposts: Vec<String> = hub.agents.lock().values().filter(|a| a.outpost).map(|a| a.name.clone()).collect();
+    let outposts: Vec<String> = hub.agents.load().values().filter(|a| a.outpost).map(|a| a.name.clone()).collect();
     let mut machines = hub.reach_directory();
     machines.retain(|r| !outposts.contains(&r.name));
     machines.extend(server_as_runner(hub));
@@ -584,7 +584,7 @@ pub fn pick(hub: &Hub, on: Option<&str>, kind: &str, default: Option<&str>) -> R
         }
         // A runner kiln knows by its machine id is named by its label too (docs/machines.md).
         let name = hub.machine_named(&name).unwrap_or(name);
-        return match hub.agents.lock().get(&name) {
+        return match hub.agents.load().get(&name) {
             Some(a) if a.connected && !a.outpost && !a.ephemeral => Ok(format!("agent:{name}")),
             Some(a) => Err((StatusCode::CONFLICT, format!("{} isn't connected (or doesn't run agents): pick another machine", a.shown()))),
             None => Err((StatusCode::CONFLICT, format!("kiln has no machine named {name}"))),
@@ -650,11 +650,11 @@ pub async fn workspaces_on(hub: &Hub, target: &str) -> Result<(), String> {
     let facts = match target.strip_prefix("agent:") {
         None => crate::workspace::slates::facts().await,
         Some(machine) => {
-            let caps = hub.instances.lock().newest_with(machine, crate::proto::CAP_WORKSPACE).is_some();
+            let caps = hub.instances.load().newest_with(machine, crate::proto::CAP_WORKSPACE).is_some();
             if !caps {
                 return Err(format!("{}'s kiln is older than workspaces: upgrade it (System → Updates)", hub.shown(machine)));
             }
-            let said = hub.agents.lock().get(machine).and_then(|a| a.facts.as_ref().and_then(|f| f.workspaces.clone()));
+            let said = hub.agents.load().get(machine).and_then(|a| a.facts.as_ref().and_then(|f| f.workspaces.clone()));
             match said {
                 Some(f) => f,
                 None => return Err(format!("{} hasn't said yet whether it has Slates: try again in a minute", hub.shown(machine))),
@@ -1305,7 +1305,7 @@ mod tests {
                     .collect::<Vec<_>>()
             };
             for (name, os, arch) in [("box", "linux", "x86_64"), ("studio", "macos", "aarch64"), ("new", "linux", "x86_64")] {
-                hub.agents.lock().insert(name.into(), crate::hub::tests::live_runner(name, os, arch));
+                hub.put_agent(crate::hub::tests::live_runner(name, os, arch));
             }
             hub.harness.set_kinds("local", offering(&["claude"]));
             hub.harness.set_kinds("agent:box", offering(&["claude", "devin"]));
@@ -1339,7 +1339,7 @@ mod tests {
             let id = "5f2a9c3e0b1d4e6f8a7c9b0d1e2f3a4b";
             let mut laptop = crate::hub::tests::live_runner(id, "macos", "aarch64");
             laptop.label = Some("adas-macbook-pro-3.local".into());
-            hub.agents.lock().insert(id.into(), laptop);
+            hub.put_agent(laptop);
             let there = format!("agent:{id}");
             for on in ["adas-macbook-pro-3.local", id] {
                 anyhow::ensure!(pick(&hub, Some(on), "claude", None).ok().as_ref() == Some(&there), "{on}");
