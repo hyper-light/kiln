@@ -1,0 +1,121 @@
+# Trial only, never on main (goal 11, plan 01a1a87b2e56 step 6): the checks goal 11's landing waits on, on its
+# merge with main: the touched crates (kiln, kiln-lab), clippy on Linux, macOS and Windows, and their tests on
+# Linux, with session_resident's numbers (the conversation store on and off). Each job pushes its results to
+# g11-memory-land-<os>.
+name: g11-memory-land
+
+on:
+  push:
+    branches: [g11-memory-land]
+
+permissions:
+  contents: write
+
+concurrency:
+  group: g11-memory-land
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: never
+  CARGO_INCREMENTAL: "0"
+  KILN_UI_SERVER: "off"
+  CARGO_PROFILE_DEV_DEBUG: line-tables-only
+
+jobs:
+  linux:
+    name: linux (clippy, kiln and kiln-lab tests, session_resident)
+    runs-on: ubuntu-latest
+    timeout-minutes: 300
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Room
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL || true
+          sudo mkdir -p /mnt/target && sudo chown "$USER" /mnt/target
+      - name: Rust
+        run: |
+          rustup toolchain install stable --profile minimal --component clippy
+          rustup default stable
+      - name: Checks
+        env:
+          CARGO_TARGET_DIR: /mnt/target
+        run: |
+          set +e
+          R=$RUNNER_TEMP/r; mkdir -p "$R"
+          nice -n 10 cargo clippy --locked -p kiln -p kiln-lab --all-targets -- -D warnings > "$R/clippy.txt" 2>&1; echo "clippy exit $?" | tee -a "$R/summary.txt"
+          nice -n 10 cargo test -p kiln --locked --lib --no-run > "$R/build-lib.txt" 2>&1; echo "build lib tests exit $?" | tee -a "$R/summary.txt"
+          nice -n 10 cargo test -p kiln --locked > "$R/kiln.txt" 2>&1; echo "kiln tests exit $?" | tee -a "$R/summary.txt"
+          nice -n 10 cargo test -p kiln-lab --locked > "$R/kiln-lab.txt" 2>&1; echo "kiln-lab tests exit $?" | tee -a "$R/summary.txt"
+          nice -n 10 cargo test -p kiln --locked --test session_resident -- --nocapture > "$R/on.txt" 2>&1; echo "resident (store on) exit $?" | tee -a "$R/summary.txt"
+          G11_RESIDENT_CONVERSATIONS=off nice -n 10 cargo test -p kiln --locked --test session_resident -- --nocapture > "$R/off.txt" 2>&1; echo "resident (store off) exit $?" | tee -a "$R/summary.txt"
+          grep -h -E "g11 resident|^test result|^failures:|^    [A-Za-z_:0-9]+$|panicked at" "$R/kiln.txt" "$R/kiln-lab.txt" "$R/on.txt" "$R/off.txt" | head -150 >> "$R/summary.txt"
+          grep -E "^(error|warning)" -A 12 "$R/clippy.txt" "$R/build-lib.txt" | grep -v "focal-memory\|fetch_update\|try_update" | head -150 >> "$R/summary.txt"
+          echo "${{ github.sha }}" > "$R/COMMIT"
+          cd "$RUNNER_TEMP" && git init -q out && cd out && mkdir results && cp "$R/summary.txt" "$R/COMMIT" results/
+          for f in clippy kiln kiln-lab on off; do grep -v -E '^ *(Compiling|Checking|Downloaded|Downloading) ' "$R/$f.txt" | grep -v -E '^test .* \.\.\. ok$' | tail -300 > "results/$f.txt"; done
+          git config user.name "kiln g11 lab" && git config user.email "g11-lab@users.noreply.github.com"
+          git add results && git commit -q -m "g11 landing checks (linux) for ${{ github.sha }}"
+          git push -q -f "https://x-access-token:${GH_TOKEN}@github.com/${{ github.repository }}.git" HEAD:refs/heads/g11-memory-land-linux
+
+  macos:
+    name: macos (clippy, the mimalloc build)
+    runs-on: macos-latest
+    timeout-minutes: 240
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Rust
+        run: |
+          rustup toolchain install stable --profile minimal --component clippy
+          rustup default stable
+      - name: Checks
+        run: |
+          set +e
+          R=$RUNNER_TEMP/m; mkdir -p "$R"
+          cargo clippy -p kiln -p kiln-lab --all-targets --locked -- -D warnings > "$R/clippy.txt" 2>&1; echo "clippy exit $?" | tee -a "$R/summary.txt"
+          cargo clippy -p kiln --features mimalloc --locked -- -D warnings > "$R/clippy-mimalloc.txt" 2>&1; echo "clippy mimalloc exit $?" | tee -a "$R/summary.txt"
+          cargo build -p kiln --features mimalloc --locked > "$R/build-mimalloc.txt" 2>&1; echo "build mimalloc exit $?" | tee -a "$R/summary.txt"
+          ./target/debug/kiln --version >> "$R/summary.txt" 2>&1; echo "run mimalloc exit $?" | tee -a "$R/summary.txt"
+          grep -E "^(error|warning)" -A 12 "$R"/clippy*.txt "$R"/build-mimalloc.txt | grep -v "focal-memory\|fetch_update\|try_update" | head -100 >> "$R/summary.txt"
+          echo "${{ github.sha }}" > "$R/COMMIT"
+          cd "$RUNNER_TEMP" && git init -q out && cd out && mkdir results && cp "$R/summary.txt" "$R/COMMIT" results/
+          git config user.name "kiln g11 lab" && git config user.email "g11-lab@users.noreply.github.com"
+          git add results && git commit -q -m "g11 landing checks (macos) for ${{ github.sha }}"
+          git push -q -f "https://x-access-token:${GH_TOKEN}@github.com/${{ github.repository }}.git" HEAD:refs/heads/g11-memory-land-mac
+
+  windows:
+    name: windows (clippy, the mimalloc build)
+    runs-on: windows-latest
+    timeout-minutes: 240
+    env:
+      GH_TOKEN: ${{ github.token }}
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Rust
+        run: |
+          rustup toolchain install stable --profile minimal --component clippy
+          rustup default stable
+      - name: Checks
+        run: |
+          set +e
+          R=$RUNNER_TEMP/w; mkdir -p "$R"
+          cargo clippy -p kiln -p kiln-lab --all-targets --locked -- -D warnings > "$R/clippy.txt" 2>&1; echo "clippy exit $?" | tee -a "$R/summary.txt"
+          # main's own Windows failure (crates/kiln/src/ci/review_cli.rs's unix-only tests keep `use super::*`) stops
+          # the lib's tests before the rest is looked at: that one lint let by, every other target is checked.
+          cargo clippy -p kiln --all-targets --locked -- -D warnings -A unused-imports > "$R/clippy-past-main.txt" 2>&1; echo "clippy past main's unused import exit $?" | tee -a "$R/summary.txt"
+          cargo clippy -p kiln-lab --all-targets --locked -- -D warnings > "$R/clippy-lab.txt" 2>&1; echo "clippy kiln-lab exit $?" | tee -a "$R/summary.txt"
+          cargo clippy -p kiln --features mimalloc --locked -- -D warnings > "$R/clippy-mimalloc.txt" 2>&1; echo "clippy mimalloc exit $?" | tee -a "$R/summary.txt"
+          cargo build -p kiln --features mimalloc --locked > "$R/build-mimalloc.txt" 2>&1; echo "build mimalloc exit $?" | tee -a "$R/summary.txt"
+          ./target/debug/kiln.exe --version >> "$R/summary.txt" 2>&1; echo "run mimalloc exit $?" | tee -a "$R/summary.txt"
+          grep -E "^(error|warning)" -A 12 "$R"/clippy*.txt "$R"/build-mimalloc.txt | grep -v "focal-memory\|fetch_update\|try_update" | head -100 >> "$R/summary.txt"
+          echo "${{ github.sha }}" > "$R/COMMIT"
+          cd "$RUNNER_TEMP" && git init -q out && cd out && mkdir results && cp "$R/summary.txt" "$R/COMMIT" results/
+          git config user.name "kiln g11 lab" && git config user.email "g11-lab@users.noreply.github.com"
+          git add results && git commit -q -m "g11 landing checks (windows) for ${{ github.sha }}"
+          git push -q -f "https://x-access-token:${GH_TOKEN}@github.com/${{ github.repository }}.git" HEAD:refs/heads/g11-memory-land-win
