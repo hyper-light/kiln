@@ -94,6 +94,15 @@ pub mod pages;
 #[path = "pages_none.rs"]
 pub mod pages;
 
+/// The calling thread's own stack in resident memory: a runtime thread's kept off huge pages, a cold pool worker's
+/// unused pages given back ([`alloc`]'s hooks; Linux, elsewhere left as they are). Goal 11, plan 01a1a87b2e56 step 5.
+#[cfg(target_os = "linux")]
+#[path = "stack_linux.rs"]
+pub mod stack;
+#[cfg(not(target_os = "linux"))]
+#[path = "stack_none.rs"]
+pub mod stack;
+
 /// What a reach run's group of processes is named with (`run-<id>`, `crate::reach::serve`): a
 /// person's or an agent's, never an agent's session.
 pub const RUN_GROUP: &str = "run-";

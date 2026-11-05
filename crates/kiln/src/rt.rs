@@ -642,6 +642,9 @@ fn start() -> Result<Rt, String> {
     for holder in &holders {
         let slice = config.step_budget_ns;
         let _ = hyper_rt::runtime::submit_to_holder(*holder, async move {
+            // Its stack takes no huge pages (goal 11, plan 01a1a87b2e56 step 5; `crate::os::stack`): a shard reaches
+            // 0.40 to 0.75 MB deep (the lab's smaps), which where every anonymous mapping takes them would be 2 MB.
+            let _ = crate::os::stack::no_huge_pages();
             let took = realtime && took_realtime();
             let asks = shard_asks(took, nudge);
             if asks.slice
