@@ -1593,11 +1593,13 @@ impl Copies {
 }
 
 /// What an owner's polls taking `msg` are labeled with in the shards' table of what held them (goal 9, plan
-/// 01a1a87b2cec step 3): an update by its kind (`crate::wire::update_label`), and work on its copies as such.
+/// 01a1a87b2cec step 3): an update by its kind (`crate::wire::update_label`), a runner's as a taken one, and
+/// work on its copies as such.
 fn label_of(msg: &Msg) -> &'static hyper_rt::slow::Label {
     static WORK: hyper_rt::slow::Label = hyper_rt::slow::Label { name: "owner work on its copies" };
     match msg {
         Msg::Update(i) => crate::wire::update_label(&i.u),
+        Msg::Runner(r) => crate::wire::update_label(&r.update),
         Msg::Run(_) => &WORK,
     }
 }
