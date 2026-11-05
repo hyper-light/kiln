@@ -327,6 +327,31 @@ pub struct Sensor {
     last: Raw,
     at: Instant,
     peak_bps: Option<f64>,
+    /// The read when the load it measures last changed (placed work started or ended), and when:
+    /// strain is measured from there ([`window`]).
+    anchor: (Raw, Instant),
+    /// The last measure's pressure over that window.
+    strain: Option<Measure>,
+}
+
+/// The kernel's shortest pressure average, `avg10` (Documentation/accounting/psi.rst: the
+/// averages are over 10, 60 and 300 second windows): also the statistic the gate's guard yields on
+/// (`ci/gate.sh`). Not picked: the kernel's and the guard's.
+pub const PSI_SHORTEST: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// The pressure a placement decision weighs strain by (AUDIT L1, with no picked smoothing): over
+/// the window since the load on the machine last changed (`anchor`, `age` ago; every stall since
+/// then is the current load's, none the previous load's), once that window is at least
+/// [`PSI_SHORTEST`]; until then the kernel's own `avg10`, the shortest window it keeps and the
+/// one the gate's guard decides by. A window shorter than that says less than the guard's own
+/// statistic, which is why consecutive decisions a millisecond apart flickered.
+pub fn window(anchor: &Raw, age: std::time::Duration, now: &Raw, interval_us: u64) -> Measure {
+    if age >= PSI_SHORTEST {
+        Measure::between(anchor, now, u64::try_from(age.as_micros()).unwrap_or(u64::MAX))
+    } else {
+        // No earlier read: each stall share is the kernel's `avg10`.
+        Measure::between(&Raw::default(), now, interval_us)
+    }
 }
 
 impl Sensor {
@@ -335,7 +360,19 @@ impl Sensor {
     pub fn new(work_dir: &Path) -> Sensor {
         let mut reader = crate::os::sense::Reader::new(work_dir);
         let last = reader.read();
-        Sensor { reader, last, at: Instant::now(), peak_bps: None }
+        let at = Instant::now();
+        Sensor { reader, anchor: (last.clone(), at), last, at, peak_bps: None, strain: None }
+    }
+
+    /// The load it measures changed now (placed work started or ended here): strain is measured
+    /// from now on ([`window`]).
+    pub fn anchor(&mut self) {
+        self.anchor = (self.reader.read(), Instant::now());
+    }
+
+    /// The last measure's pressure over the window strain is weighed by ([`window`]).
+    pub fn strain(&self) -> Option<&Measure> {
+        self.strain.as_ref()
     }
 
     /// What this runner can take now, over the interval since the previous read.
@@ -349,6 +386,7 @@ impl Sensor {
             self.peak_bps = Some(self.peak_bps.map_or(bps, |p| p.max(bps))).filter(|p| *p > 0.0);
         }
         m.device_peak_bps = self.peak_bps;
+        self.strain = Some(window(&self.anchor.0, now.duration_since(self.anchor.1), &raw, interval_us));
         (self.last, self.at) = (raw, now);
         m
     }
@@ -452,6 +490,23 @@ mod tests {
 
     fn psi_file(some_us: u64, full_us: u64) -> Option<PsiFile> {
         Some(PsiFile { some: Some(PsiLine { avg10: 50.0, total_us: some_us }), full: Some(PsiLine { avg10: 50.0, total_us: full_us }) })
+    }
+
+    /// AUDIT L1, strain without flicker: a decision weighs strain over the window since the load
+    /// last changed once that's at least the kernel's shortest average (10 s), exactly; before, by
+    /// the kernel's `avg10` (the gate guard's statistic), however short the interval since the
+    /// last read, so two decisions a millisecond apart see the same figure.
+    #[test]
+    fn l1_strain_is_weighed_over_the_window_since_the_load_changed() {
+        let at = |full_us: u64| Raw { psi: PsiRaw { memory: Some(PsiFile { some: None, full: Some(PsiLine { avg10: 5.0, total_us: full_us }) }), ..PsiRaw::default() }, ..Raw::default() };
+        let (anchor, now) = (at(0), at(4_000_000));
+        // 4 s stalled of the 20 s since the load changed: 20 %.
+        let long = window(&anchor, std::time::Duration::from_secs(20), &now, 1_000);
+        assert_eq!(long.pressure.memory.full, Some(0.2));
+        // 5 s since it changed: the kernel's avg10 (5 %), not the 1 ms interval's share.
+        let short = window(&anchor, std::time::Duration::from_secs(5), &now, 1_000);
+        assert_eq!(short.pressure.memory.full, Some(0.05));
+        assert_eq!(window(&anchor, std::time::Duration::from_secs(5), &now, 7).pressure, short.pressure);
     }
 
     /// docs/needs.md: CPU idle is exact over any interval: the idle ticks' delta over all ticks'.

@@ -326,12 +326,14 @@ impl Placer {
     fn measure_now(&mut self, now: i64, said: &mut Vec<(String, ToOwner)>) {
         let Some(sensor) = self.sensor.as_mut() else { return };
         let m = sensor.measure();
+        let window = sensor.strain().cloned();
         let mut sample = sample_of_measure(&m, self.last.as_ref());
         // What each placed run here uses, from its own group, in the same moment.
         sample.runs = self.groups.iter_mut().map(|((owner, epoch, run), h)| kiln_ci::place::ask::RunUse { owner: owner.clone(), epoch: *epoch, run: run.clone(), used: group_use(h) }).collect();
         self.admission.measured(sample, now, said);
         let target = kiln_ci::sched::state::knee(m.cpus);
-        let strained = crate::sense::health::strained(&m, target);
+        // Over the window the decision is about (sense::window): since the load here last changed.
+        let strained = crate::sense::health::strained(window.as_ref().unwrap_or(&m), target);
         if let Ok(mut h) = crate::sense::health::runner().lock() {
             h.measured(&m);
         }
@@ -352,10 +354,12 @@ impl Placer {
     /// there and taken out of the machine's load, so its room isn't counted twice.
     pub fn grouped(&mut self, owner: &str, epoch: u64, run: &str, at: Group) {
         self.groups.insert((owner.to_owned(), epoch, run.to_owned()), Held { at, cpu: None });
+        self.load_changed();
     }
 
     /// The placed run a process `pid` started for: its group, found by the process.
     fn grouped_pid(&mut self, owner: &str, epoch: u64, run: &str, pid: Option<u32>) {
+        self.load_changed();
         #[cfg(target_os = "linux")]
         if let Some(dir) = pid.and_then(crate::os::contain::group_of_pid) {
             self.grouped(owner, epoch, run, Group::Dir(dir));
@@ -366,6 +370,14 @@ impl Placer {
 
     fn ungrouped(&mut self, owner: &str, epoch: u64, run: &str) {
         self.groups.remove(&(owner.to_owned(), epoch, run.to_owned()));
+        self.load_changed();
+    }
+
+    /// Placed work started or ended here: the load strain is weighed under changed now.
+    fn load_changed(&mut self) {
+        if let Some(s) = self.sensor.as_mut() {
+            s.anchor();
+        }
     }
 
     /// Why its machine is under strain now, if it is, as its last measure said (the hint's state).
@@ -643,6 +655,7 @@ impl Placer {
                 match self.admission.start(ci, &run, fence, now, &mut more) {
                     Some(Start::New) => {
                         self.admission.spawned(ci, &run, &mut more);
+                        self.load_changed();
                         #[cfg(target_os = "linux")]
                         if let Some(j) = crate::os::contain::Job::of(&run) {
                             let epoch = self.epoch;
@@ -696,6 +709,7 @@ impl Placer {
         if let Some(id) = session {
             self.grouped(&c.owner, c.epoch, &c.run, Group::Session(id.to_owned()));
         }
+        self.load_changed();
         let mut said = Vec::new();
         let started = if c.owner == self.me {
             // Its owner is this node: its start was taken as it was told to go (`starting`).
