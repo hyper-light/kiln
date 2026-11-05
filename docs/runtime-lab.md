@@ -1266,6 +1266,17 @@ reading and writing `Vec<u8>` a byte at a time. Of the whole server's CPU, a thi
   - The server's own tasks: push parses a `harness` frame's info on the compute pool (1 to 6 ms calm);
     the fleet's `builds.json` is written by the kept files' writer and read first on the blocking pool;
     observe's sender takes turns (a replica catching up was sent in one poll).
+- **What was left of those:**
+  - An owner changing an event of a compact chunk (a reconnect's events sent again) read the chunk back on its
+    shard. `Registry::apply` now stops before such an event, the owner reads the chunk back on the blocking pool
+    (the shard free meanwhile), and the rest of the update goes on from it (`Shard::want_thaw`).
+  - Custody: an agent's signed act is checked on the compute pool, the revocations read for it let go of there;
+    a refused act's and a refused word's signer, and a hand-over's reads, too (`verify_off`). kiln's take of a
+    session it resumes is signed there (`server_signed_off`), its timeline worked out where its package is made.
+    The revocations kept before are let go of on the blocking pool.
+  - The scheduler takes its turns between the jobs it walks, and reads `file:` secrets on the blocking pool.
+  - Conversation stores: the board's sample and `/metrics` on the compute pool. Host statuses: the runs a host
+    hasn't taken picked out on the store's side, and their catch-up every minute however many events come.
 
 ### Step 3's check
 

@@ -728,6 +728,22 @@ impl Events {
         Some(gone)
     }
 
+    /// Chunk `was`, still one of these as it was, in `made`'s place: the same events, read back (a compact chunk kept as
+    /// its events again, to be changed: [`Shard::want_thaw`]). Whether it was.
+    pub(super) fn swap_chunk(&mut self, was: &Arc<Chunk>, made: Chunk) -> bool {
+        if made.metas().len() != was.metas().len() || !made.metas().iter().zip(was.metas()).all(|(a, b)| a.id == b.id && a.seq == b.seq) {
+            return false;
+        }
+        let Some(at) = self.chunks.iter().position(|c| Arc::ptr_eq(c, was)) else { return false };
+        match Arc::make_mut(&mut self.chunks).get_mut(at) {
+            Some(slot) => {
+                *slot = Arc::new(made);
+                true
+            }
+            None => false,
+        }
+    }
+
     pub(super) fn retain(&mut self, mut keep: impl FnMut(&Meta) -> bool) {
         let mut all = Vec::with_capacity(self.len);
         for c in self.chunks.iter() {
@@ -1601,6 +1617,25 @@ impl Mirror {
         }
     }
 
+    /// The compact chunk that taking event `id` numbered `seq` would read back to change (`upsert`: an event it has under
+    /// that id, or under that number with another id), if one would be.
+    pub(super) fn thaw_for(&self, id: &str, seq: u64) -> Option<Arc<Chunk>> {
+        let at = match self.index.get(id) {
+            Some(at) => *at,
+            None => {
+                let top = self.events.len().checked_sub(1).and_then(|i| self.events.meta(i)).and_then(|m| m.seq)?;
+                if seq > top {
+                    return None;
+                }
+                let at = self.events.partition_point(|m| m.seq.is_some_and(|s| s < seq));
+                self.events.meta(at).filter(|m| m.seq == Some(seq))?;
+                at
+            }
+        };
+        let (c, _) = self.events.place(at)?;
+        self.events.chunks.get(c).filter(|c| c.is_compact()).cloned()
+    }
+
     /// Lets go of every event.
     pub fn clear_events(&mut self) {
         self.events.clear();
@@ -1721,11 +1756,37 @@ pub struct Shard {
     board_changed: bool,
     /// Where its copies' sealed chunks are spilled, once set (`Copies::spill_to`).
     spill: Arc<OnceLock<Arc<super::spill::Dir>>>,
+    /// A compact chunk of a session's copy that an update's next event changes, to be read back off the shard before it's
+    /// taken ([`Shard::want_thaw`]; goal 9, plan 01a1a87b2cec step 3).
+    thaw: Option<(String, Arc<Chunk>)>,
+    /// The chunk last read back so (or tried): one that's still compact as an update comes back to it is changed where it
+    /// is, as before, so an update always goes on.
+    thawed: Weak<Chunk>,
 }
 
 impl Shard {
     pub fn bus(&self) -> &Arc<dyn kiln_seams::Bus> {
         &self.bus
+    }
+
+    /// Session `id`'s update stopped before an event that changes one in compact chunk `chunk` (`Registry::apply`): its
+    /// owner reads that chunk back on the blocking pool before it takes the rest ([`own`]), where it was read back on
+    /// this shard, its every event inflated and parsed, for each such change (goal 9, plan 01a1a87b2cec step 3).
+    pub(super) fn want_thaw(&mut self, id: &str, chunk: Arc<Chunk>) {
+        self.thaw = Some((id.to_owned(), chunk));
+    }
+
+    /// The chunk last read back for a change ([`Shard::want_thaw`]), or tried: a change that finds it still compact is
+    /// made where it is.
+    pub(super) fn thawed(&self) -> Weak<Chunk> {
+        Weak::clone(&self.thawed)
+    }
+
+    /// Chunk `was` of session `id`'s copy, read back (`made`: the same events, kept as they are): it takes its place where
+    /// it's still the copy's, as it was. Whether it did.
+    fn take_thawed(&mut self, id: &str, was: &Arc<Chunk>, made: Chunk) -> bool {
+        self.thawed = Arc::downgrade(was);
+        self.mirrors.get_mut(id).is_some_and(|m| m.events.swap_chunk(was, made))
     }
 
     pub fn get(&self, id: &str) -> Option<&Mirror> {
@@ -2025,7 +2086,7 @@ impl Copies {
         let mut inboxes = Vec::with_capacity(shards);
         for me in 0..shards {
             let (tx, rx) = crate::memory::queue::bounded(&crate::memory::owners::SESSION_INBOXES, inbox);
-            let shard = Shard { me, inbox: tx.downgrade(), mirrors: HashMap::new(), boards: Arc::clone(&boards), bus: Arc::clone(&bus), board_changed: false, spill: Arc::clone(&spill) };
+            let shard = Shard { me, inbox: tx.downgrade(), mirrors: HashMap::new(), boards: Arc::clone(&boards), bus: Arc::clone(&bus), board_changed: false, spill: Arc::clone(&spill), thaw: None, thawed: Weak::new() };
             crate::rt::spawn_owner(me, own(shard, rx, Arc::clone(&hub)));
             inboxes.push(tx);
         }
@@ -2248,6 +2309,25 @@ async fn own(mut shard: Shard, rx: crate::memory::queue::Receiver<Msg>, hub: Arc
             rest = take(&mut shard, msg);
         }
         drop(h);
+        // A change to an event of a compact chunk: that chunk read back on the blocking pool, the shard given up meanwhile,
+        // before the rest of its update is taken (goal 9, plan 01a1a87b2cec step 3). This owner's next messages wait for it,
+        // as they waited for it to be read back here.
+        if let Some((id, chunk)) = shard.thaw.take() {
+            let c = Arc::clone(&chunk);
+            match crate::rt::blocking(move || c.evs().map(|evs| Chunk::of(evs.into_owned()))).await {
+                Ok(Ok(made)) => {
+                    shard.take_thawed(&id, &chunk, made);
+                }
+                Ok(Err(e)) => {
+                    tracing::warn!(session = %id, error = %e, "a session copy's packed events couldn't be read back off its shard: changed where they are");
+                    shard.thawed = Arc::downgrade(&chunk);
+                }
+                Err(e) => {
+                    tracing::warn!(session = %id, error = %format!("{e:#}"), "a session copy's packed events couldn't be read back off its shard: changed where they are");
+                    shard.thawed = Arc::downgrade(&chunk);
+                }
+            }
+        }
         // The conversation store over its bound holds this owner back before it takes more (goal 11, plan
         // 01a1a87b2e56 step 3): the updates it would take wait in its inbox, and those behind them upstream,
         // rather than their rows piling up in the store's queue. The owner's task waits; its shard's thread
@@ -3341,6 +3421,53 @@ mod tests {
                 anyhow::ensure!(std::time::Instant::now() < deadline, "the chunk the cut fell in was never taken in");
                 crate::rt::sleep(std::time::Duration::from_millis(20)).await;
             }
+        })
+    }
+
+    /// Goal 9, plan 01a1a87b2cec step 3: an update that changes an event of a long copy's compact chunk, taken by its owner,
+    /// reads nothing back on the owner's shard: the chunk is read back on the blocking pool first, the shard given up
+    /// meanwhile, and the event then changes where it is, as it did, the rest of the copy as it was.
+    #[test]
+    fn g9_s3_a_change_to_an_old_event_reads_its_chunk_back_off_the_owners_shard() -> anyhow::Result<()> {
+        use crate::harness::model::{Body, Event};
+        crate::rt::block_on(async {
+            let hub = crate::hub::tests::scratch_hub().await?;
+            let copies = Copies::start_with(sim_bus(), 1, 64 * MSG);
+            copies.bind(&hub);
+            let id = "old".to_owned();
+            let n = u64::try_from(CHUNK * 3 + 9)?;
+            let i = id.clone();
+            let compact = copies
+                .on(&id, move |s| {
+                    let m = s.entry(&i, || Mirror::new(Info { id: i.clone(), ..Info::default() }, Location::Local, sim_bus()));
+                    for q in 1..=n {
+                        m.rev = q;
+                        m.upsert(entry(&format!("e{q}"), q));
+                    }
+                    for c in m.events.chunks().iter().filter(|c| c.is_full()) {
+                        let _ = c.pack();
+                    }
+                    let home = m.home();
+                    m.events.compact(home.as_ref());
+                    m.events.chunks().first().is_some_and(|c| c.is_compact())
+                })
+                .await;
+            anyhow::ensure!(compact == Some(true), "its first chunk compact");
+            let before = copies.on(&id, |_| inflated()).await;
+            // e5, in the first chunk, said again in other words.
+            let said = Event { id: "e5".into(), seq: 5, at: 1, parent: None, by: None, body: Body::Assistant { text: "said again".into(), streaming: false } };
+            anyhow::ensure!(copies.send(&id, Msg::Update(Box::new(Ingest { from: Location::Local, id: id.clone(), u: Update::Events { events: vec![said] }, shipped: true, reported: String::new() }))).await, "sent");
+            copies.settled().await;
+            let after = copies.on(&id, |_| inflated()).await;
+            anyhow::ensure!(before.is_some() && after == before, "read back on the owner's shard: {before:?} then {after:?}");
+            let i = id.clone();
+            let now = copies
+                .on(&id, move |s| s.get(&i).map(|m| (m.events.len(), m.events.get(4).map(|e| e.entry.text().to_owned()), m.events.get(5).map(|e| e.entry.text().to_owned()))))
+                .await
+                .flatten();
+            let Some((len, Some(changed), Some(next))) = now else { anyhow::bail!("no copy: {now:?}") };
+            anyhow::ensure!(len == CHUNK * 3 + 9 && changed.contains("said again") && next == entry("e6", 6).text(), "{len} {changed} {next}");
+            Ok(())
         })
     }
 }
