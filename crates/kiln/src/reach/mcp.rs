@@ -64,7 +64,8 @@ once, returning just what failed (`const [mac, linux] = await Promise.all([kiln.
 the other machine first (only what changed; git sees the same state there), and the command runs in the matching \
 folder, so you edit here and it builds or tests there; for a command that isn't about this repository, pass sync: false (it runs \
 in that machine's home folder). `runners` lists the machines, this one first when it suits. Long commands can run in the background \
-(background: true), then `output` and `stop`. Nothing a command leaves running outlives it: what a run leaves behind \
+(background: true): when its answer says `told`, kiln tells you when it ends (where, how long, its exit code, the end of its \
+output), so end your turn rather than wait on `output`; `stop` ends one. Nothing a command leaves running outlives it: what a run leaves behind \
 (`nohup … &`, a daemon) ends when it does, and what your own shell commands leave running on their own ends when your \
 turn does; run a server or anything that must keep going as a background task of your shell tool, or a background run. To hand parts of the work to other agents (any harness, any machine), \
 `agents_start` them with a clear brief, then carry on or end your turn: kiln tells you when each is done (`agents_wait` \
@@ -236,7 +237,7 @@ fn base_tools() -> Value {
     json!([
         {
             "name": "code_run",
-            "description": "Run a JavaScript program against kiln and get back only what it returns. `await kiln.machines.run({needs, command})` runs a shell command on one of this kiln's machines that has what it needs (or `on`, one by name) (this repository synced over first, as with `run`) and resolves when it ends, with {runner, exit_code, output}; start several and `await Promise.all([...])` to run them side by side. Also `kiln.machines.list({want})`, `kiln.machines.start(...)` (background: {id}), `kiln.machines.output({id, wait_s})`, `kiln.machines.stop({id})`, and kiln's CI and deployments under `kiln.ci.*` and `kiln.cd.*` (`code_search` lists every operation and its input; `kiln.call(name, input)` calls one by name). A refused call throws an Error with `result`. `input` is given as `input`. Bounded: 10 minutes unless timeout_s says otherwise (at most an hour), 16 calls at once, 4 MiB per answer; runs a program ends without are stopped.",
+            "description": "Run a JavaScript program against kiln and get back only what it returns. `await kiln.machines.run({needs, command})` runs a shell command on one of this kiln's machines that has what it needs (or `on`, one by name) (this repository synced over first, as with `run`) and resolves when it ends, with {runner, exit_code, output}; start several and `await Promise.all([...])` to run them side by side. Also `kiln.machines.list({want})`, `kiln.machines.start(...)` (background: {id}; kiln tells you when it ends, as with `run`), `kiln.machines.output({id, wait_s})`, `kiln.machines.stop({id})`, and kiln's CI and deployments under `kiln.ci.*` and `kiln.cd.*` (`code_search` lists every operation and its input; `kiln.call(name, input)` calls one by name). A refused call throws an Error with `result`. `input` is given as `input`. Bounded: 10 minutes unless timeout_s says otherwise (at most an hour), 16 calls at once, 4 MiB per answer; runs a program ends without are stopped.",
             "inputSchema": schema("code_run"),
             "annotations": {"readOnlyHint": false, "destructiveHint": true, "openWorldHint": true},
         },
@@ -254,13 +255,13 @@ fn base_tools() -> Value {
         },
         {
             "name": "run",
-            "description": "Run a shell command (bash) on another machine, for a step this one can't do: another platform, a GPU, more memory, disk or cores than it has, or one that has to happen on that machine (everything else, run here with your own tools). `needs` picks it: what it must be and have (`linux/amd64`, `macos/arm64`, `+gpu`, `tool:cargo`, `cpus=8,mem=32g` idle and free): this machine when it suits and has room to spare, else the idlest that suits; `on` names a machine when the step has to happen on that one. By default this repository is synced there first (git-tracked and untracked-but-not-ignored files plus .git; build output like target/ stays home) and the command runs in the matching folder. What the command leaves running when it ends (`nohup … &`, a daemon) ends with it: run a server with background: true, and `stop` it when done. Returns the exit code and output (stdout and stderr interleaved, the middle cut past 30k characters). Set background to return at once with an id for `output` and `stop`.",
+            "description": "Run a shell command (bash) on another machine, for a step this one can't do: another platform, a GPU, more memory, disk or cores than it has, or one that has to happen on that machine (everything else, run here with your own tools). `needs` picks it: what it must be and have (`linux/amd64`, `macos/arm64`, `+gpu`, `tool:cargo`, `cpus=8,mem=32g` idle and free): this machine when it suits and has room to spare, else the idlest that suits; `on` names a machine when the step has to happen on that one. By default this repository is synced there first (git-tracked and untracked-but-not-ignored files plus .git; build output like target/ stays home) and the command runs in the matching folder. What the command leaves running when it ends (`nohup … &`, a daemon) ends with it: run a server with background: true, and `stop` it when done. Returns the exit code and output (stdout and stderr interleaved, the middle cut past 30k characters). Set background to return at once with an id: when its answer says `told`, kiln tells you when it ends (where, how long, its exit code and the end of its output), and when it starts if it hadn't, so end your turn rather than call `output` to wait; `output` reads its output, `stop` ends it.",
             "inputSchema": schema("run"),
             "annotations": {"readOnlyHint": false, "destructiveHint": true, "openWorldHint": true},
         },
         {
             "name": "output",
-            "description": "A background run's output since the last read, and whether it has ended (with its exit code). wait_s waits up to that long for it to end.",
+            "description": "A background run's output since the last read, and whether it has ended (with its exit code). You needn't call it to learn that a run ended: kiln tells you (when the answer that handed it over said `told`), so end your turn rather than poll. wait_s waits up to that long for it to end, for a step that can't go on without it.",
             "inputSchema": schema("output"),
             "annotations": {"readOnlyHint": true, "openWorldHint": false},
         },
@@ -311,8 +312,8 @@ fn machine_ops() -> Vec<Value> {
             false,
             true,
         ),
-        op("machines.start", "Start a shell command on a machine in the background: {id, runner, output so far}. Then machines.output and machines.stop (or the `output` and `stop` tools).", false, true),
-        op("machines.output", "A background run's output since the last read, and whether it has ended (exit_code). wait_s waits up to that long for it to end.", true, false),
+        op("machines.start", "Start a shell command on a machine in the background: {id, runner, output so far, told}. When its answer says `told`, kiln tells you when it ends (where, how long, its exit code and the end of its output): end your turn rather than poll machines.output. Then machines.output and machines.stop (or the `output` and `stop` tools).", false, true),
+        op("machines.output", "A background run's output since the last read, and whether it has ended (exit_code). kiln tells you when a background run ends (when its start's answer said `told`): don't poll it. wait_s waits up to that long for it to end, for a step that can't go on without it.", true, false),
         op("machines.stop", "Stop a background run (Ctrl-C, then terminate if it doesn't stop).", false, true),
     ]
 }
@@ -329,6 +330,8 @@ struct Run {
     exit: Option<Value>,
     error: Option<String>,
     signal: Option<std::os::unix::net::UnixStream>,
+    /// What kiln is told of it for its agent (docs/reach.md §7).
+    telling: super::told::Telling,
 }
 
 type Cell = Arc<(Mutex<Run>, std::sync::Condvar)>;
@@ -351,6 +354,7 @@ fn follow(mut client: Client, cell: Cell) {
             let ev = client.event();
             let (lock, cv) = &*cell;
             let Ok(mut r) = lock.lock() else { return };
+            { let r = &mut *r; r.telling.heard(&ev, &r.runner, &r.output); }
             match ev {
                 Ok(Some(Ev::Picked { runner, why })) => {
                     r.runner = runner;
@@ -407,6 +411,7 @@ fn report(id: &str, cell: &Cell, secs: u64, fresh: bool, max: usize) -> (Value, 
     let (lock, cv) = &**cell;
     let Ok(mut r) = lock.lock() else { return lost() };
     let deadline = Instant::now() + Duration::from_secs(secs);
+    r.telling.waits();
     while r.exit.is_none() && r.error.is_none() {
         let left = deadline.saturating_duration_since(Instant::now());
         if left.is_zero() {
@@ -421,6 +426,7 @@ fn report(id: &str, cell: &Cell, secs: u64, fresh: bool, max: usize) -> (Value, 
     r.read = r.output.len();
     let done = r.exit.is_some() || r.error.is_some();
     let mut v = json!({"runner": r.runner, "output": clip(&out, max), "running": !done});
+    { let r = &mut *r; r.telling.answered(&mut v, done, &r.runner); }
     if let Some(o) = v.as_object_mut() {
         if !done {
             o.insert("id".into(), json!(id));
@@ -512,6 +518,7 @@ impl Server {
             shell: s("shell"),
             detach: false,
             asker: None,
+            client: None,
         };
         let mut client = Client::connect(&self.sock).map_err(|e| format!("{e:#}"))?;
         let reuse = args.get("reuse").and_then(Value::as_bool).unwrap_or(false);
@@ -522,7 +529,7 @@ impl Server {
             format!("r{}", *n)
         };
         let signal = client.sender().ok();
-        let cell: Cell = Arc::new((Mutex::new(Run { signal, ..Run::default() }), std::sync::Condvar::new()));
+        let cell: Cell = Arc::new((Mutex::new(Run { signal, telling: super::told::Telling::begin(&self.sock, &id, args), ..Run::default() }), std::sync::Condvar::new()));
         if let Ok(mut runs) = self.runs.lock() {
             runs.insert(id.clone(), Arc::clone(&cell));
         }
@@ -553,6 +560,7 @@ impl Server {
         {
             let _ = super::local::send_on(w, &Req::Signal(Signal::Interrupt));
         }
+        if let Ok(mut r) = cell.0.lock() { r.telling.stopped(); }
         let (v, failed) = report(id, &cell, 5, true, max);
         if running(&v)
             && let Ok(mut r) = cell.0.lock()
@@ -917,6 +925,7 @@ impl code::Host for Program {
             "machines.list" => self.server.runners(input.get("want").and_then(Value::as_str).map(str::to_owned)).map_err(|e| err(format!("{e:#}"))),
             "machines.run" | "machines.start" => {
                 let (id, cell) = self.server.start(&input).map_err(err)?;
+                if name == "machines.start" && let Ok(mut r) = cell.0.lock() { r.telling.how("kiln.machines.start"); }
                 let (v, failed) = if name == "machines.run" {
                     if let Ok(mut m) = self.mine.lock() {
                         m.push(id.clone());
@@ -1304,7 +1313,8 @@ pub mod input {
         /// Return after this many seconds even if it is still running (it keeps running in the
         /// background; default 600).
         pub wait_s: Option<f64>,
-        /// Return at once with an id; read with `output`, end with `stop`.
+        /// Return at once with an id: kiln tells you when it ends (its answer says `told`), so end
+        /// your turn rather than poll `output`; `stop` ends it.
         pub background: Option<bool>,
     }
 
@@ -1703,7 +1713,7 @@ mod tests {
             });
             if waits && let Some(p) = props.as_object_mut() {
                 p.insert("wait_s".into(), json!({"type": "number", "description": "Return after this many seconds even if it is still running (it keeps running in the background; default 600)."}));
-                p.insert("background".into(), json!({"type": "boolean", "description": "Return at once with an id; read with `output`, end with `stop`."}));
+                p.insert("background".into(), json!({"type": "boolean", "description": "Return at once with an id: kiln tells you when it ends (its answer says `told`), so end your turn rather than poll `output`; `stop` ends it."}));
             }
             json!({"type": "object", "properties": props, "required": ["command"]})
         };

@@ -136,7 +136,8 @@ enum Cmd {
     HarnessHook(kiln::harness::cli::HarnessHookArgs),
     /// Run a command on a runner that has what it needs (`--needs cpus=8,mem=32g,linux/amd64`), or
     /// on one by name (`--on <name>`): this repo is synced over first, output streams back, and the
-    /// exit code is the command's.
+    /// exit code is the command's. With `--detach`, an agent that ran it is told how it ends should
+    /// this stop first: it ends its turn rather than wait or poll.
     Run(kiln::reach::cli::RunArgs),
     /// The runners commands can run on, best first for what you need (`kiln runners linux`); a
     /// runner's facts (`kiln runners facts <name>`, `probe <name>` to have it probe them again).

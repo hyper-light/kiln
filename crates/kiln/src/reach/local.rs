@@ -37,6 +37,10 @@ pub enum Req {
     /// A run as [`Req::Run`], unless an identical one succeeded before: then its recorded result
     /// instead (`kiln run --reuse`, `super::reuse`, docs/ci.md W24-R24). Appended last.
     RunReuse(Box<RunReq>),
+    /// News of a run an agent session's MCP server follows for it (JSON `super::told::RunNews`),
+    /// for its agent's news (docs/reach.md §7): the session is the one the client's process belongs
+    /// to. Answered with [`Ev::Answer`] (`{"told": bool}`) or [`Ev::Error`]. Appended last.
+    Told(String),
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
@@ -70,6 +74,10 @@ pub struct RunReq {
     /// wire): a run on another machine is its act, which kiln must take first (docs/ci.md W27-R08).
     #[serde(skip)]
     pub asker: Option<String>,
+    /// The client's process, as this runner tells it (never on the wire): what its runs' news is
+    /// told for (`super::told`, docs/reach.md §7).
+    #[serde(skip)]
+    pub client: Option<u32>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -329,11 +337,13 @@ async fn run_inner(handle: &Handle, me: &str, req: RunReq, ev: &async_channel::S
     let choice = pick(handle, me, &req.target).await?;
     let peer = choice.runner.name.clone();
     let _ = ev.send(Ev::Picked { runner: peer.clone(), why: choice.why.clone() }).await;
+    if let Some(note) = super::told::note(&req) { let _ = ev.send(note).await; }
     let mut spec = spec_of(&req);
+    let mut told = super::told::Watch::new(&req);
     if peer == me {
         // This machine suits best: no copy, no link — the folder as it is.
         spec.cwd = req.cwd.clone().or(req.remote_cwd.clone());
-        return run_here(spec, req.detach, ev, ctl).await;
+        return run_here(spec, req.detach, ev, ctl, told, me).await;
     }
     if !elsewhere {
         taken(peer.clone()).await?;
@@ -374,9 +384,11 @@ async fn run_inner(handle: &Handle, me: &str, req: RunReq, ev: &async_channel::S
         futures::select_biased! {
             s = says.recv().fuse() => match s {
                 Ok(Say::Started { pid, cwd, .. }) => {
+                    told.started();
                     let _ = ev.send(Ev::Started { runner: peer.clone(), pid, cwd }).await;
                 }
                 Ok(Say::Output { stream, data, .. }) => {
+                    told.output(&data);
                     let _ = ev.send(Ev::Output { err: stream == Stream::Err, data }).await;
                 }
                 Ok(Say::Exit { code, error, lost, .. }) => {
@@ -391,13 +403,11 @@ async fn run_inner(handle: &Handle, me: &str, req: RunReq, ev: &async_channel::S
                 Ok(Req::InputEnd) => { handle.send(&peer, Ask::StdinEnd { id }).await; }
                 Ok(Req::Signal(s)) => { handle.send(&peer, Ask::Signal { id, signal: s }).await; }
                 Ok(_) => {}
+                // It keeps running over there, followed on alone: its output taken and let go, its
+                // link made again after a drop, until it ends (below).
+                Err(_) if req.detach => break,
                 Err(_) => {
-                    if req.detach {
-                        // It keeps running over there, followed on alone: its output taken and
-                        // let go, its link made again after a drop, until it ends.
-                        handle.detach(&peer, id).await;
-                        return Ok(());
-                    }
+                    super::told::gone(req.client);
                     handle.send(&peer, Ask::Signal { id, signal: Signal::Terminate }).await;
                     stop_by = Some(Instant::now() + Duration::from_secs(5));
                 }
@@ -409,11 +419,13 @@ async fn run_inner(handle: &Handle, me: &str, req: RunReq, ev: &async_channel::S
             }
         }
     }
+    // Detached, its client gone: the agent that asked for it is told how it ends (docs/reach.md §7).
+    super::told::detached(handle, &peer, id, told, says).await
 }
 
 /// Run on this machine (it suited best): the same events, no link. A detached run goes on after
 /// its client, its events read to its end so that its output never makes it wait.
-async fn run_here(spec: RunSpec, detach: bool, ev: &async_channel::Sender<Ev>, ctl: async_channel::Receiver<Req>) -> anyhow::Result<()> {
+async fn run_here(spec: RunSpec, detach: bool, ev: &async_channel::Sender<Ev>, ctl: async_channel::Receiver<Req>, mut told: super::told::Watch, me: &str) -> anyhow::Result<()> {
     let cwd = super::serve::resolve_cwd(&spec, None)?;
     let (tx, rx) = async_channel::bounded::<super::serve::Event>(16);
     let shell = spec.shell.as_deref().map(|s| crate::os::home_dir().join(".kiln").join("reach").join("shells").join(s));
@@ -425,9 +437,10 @@ async fn run_here(spec: RunSpec, detach: bool, ev: &async_channel::Sender<Ev>, c
             e = rx.recv().fuse() => match e {
                 Ok(super::serve::Event::Started { pid: p, cwd }) => {
                     pid = Some(p);
+                    told.started();
                     let _ = ev.send(Ev::Started { runner: String::new(), pid: p, cwd }).await;
                 }
-                Ok(super::serve::Event::Output { stream, data }) => { let _ = ev.send(Ev::Output { err: stream == Stream::Err, data }).await; }
+                Ok(super::serve::Event::Output { stream, data }) => { told.output(&data); let _ = ev.send(Ev::Output { err: stream == Stream::Err, data }).await; }
                 Ok(super::serve::Event::Exit { code, error }) => {
                     let _ = ev.send(Ev::Exit { code, error, lost: 0 }).await;
                     return Ok(());
@@ -441,6 +454,7 @@ async fn run_here(spec: RunSpec, detach: bool, ev: &async_channel::Sender<Ev>, c
                 Ok(_) => {}
                 Err(_) if detach => break,
                 Err(_) => {
+                    super::told::gone(told.client());
                     if let Some(p) = pid {
                         super::serve::signal_group(p, Signal::Terminate);
                     }
@@ -451,13 +465,7 @@ async fn run_here(spec: RunSpec, detach: bool, ev: &async_channel::Sender<Ev>, c
     }
     // Its input ends with its client.
     drop(stdin);
-    crate::rt::spawn(async move {
-        while let Ok(e) = rx.recv().await {
-            if matches!(e, super::serve::Event::Exit { .. }) {
-                return;
-            }
-        }
-    });
+    crate::rt::spawn(super::told::follow_here(rx, told, me.to_owned()));
     Ok(())
 }
 
@@ -567,6 +575,7 @@ async fn connection(handle: Handle, me: String, fd: std::sync::Arc<std::os::fd::
     // A run's asker: the agent session the client's process belongs to, if any.
     if let Req::Run(r) | Req::RunReuse(r) = &mut first {
         let pid = peer_pid(&fd);
+        r.client = pid;
         r.asker = crate::rt::blocking(move || pid.and_then(crate::runner::custody::session_of_pid)).await.ok().flatten();
     }
     match first {
@@ -604,6 +613,7 @@ async fn connection(handle: Handle, me: String, fd: std::sync::Arc<std::os::fd::
         }
         Req::Run(r) => run(&handle, &me, *r, ev_tx.clone(), req_rx).await,
         Req::RunReuse(r) => super::reuse::run(&handle, &me, *r, ev_tx.clone(), req_rx).await,
+        Req::Told(json) => { let _ = ev_tx.send(super::told::heard(&json, peer_pid(&fd)).await).await; }
         Req::Input(_) | Req::InputEnd | Req::Signal(_) => {
             let _ = ev_tx.send(Ev::Error("nothing is running on this connection".into())).await;
         }

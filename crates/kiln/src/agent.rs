@@ -1588,6 +1588,8 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
     let reach = reach.and_then(|(using, mirrors, started)| match started {
         Ok((handle, said)) => {
             crate::reach::node::set_global(handle.clone());
+            // The runs this runner follows for its agents, kept across restarts (docs/reach.md §7, T3).
+            crate::reach::told::start(&o.state_dir.join("reach"), take_over_pending.is_some());
             // What other runners' trees left here, kept as people's rules say (docs/reach.md §5.1).
             crate::reach::keeper::start(handle.clone(), using, mirrors);
             let up = up_tx.clone();
@@ -2702,6 +2704,7 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                     }
                     if let Some(r) = &reach {
                         r.feed(crate::reach::node::In::Server(false)).await;
+                        crate::reach::told::server_down();
                     }
                     dialing_since = None;
                     redial = Some(Instant::now());
@@ -2885,6 +2888,7 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                 restoring = None;
                 if let Some(r) = &reach {
                     r.feed(crate::reach::node::In::Server(false)).await;
+                    crate::reach::told::server_down();
                 }
                 dialing_since = None;
                 redial = Some(if at_once { now } else { now + crate::sup::jitter(dial_backoff) });
@@ -3730,12 +3734,14 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                                 if let Err(e) = take_over_from(path, h, tx.clone(), me, takes).await {
                                     tracing::warn!(error = %format!("{e:#}"), "couldn't take over from the runner being upgraded");
                                 }
+                                crate::reach::told::predecessor_ended();
                                 let _ = tx.send(Bg::TakeOverEnded).await;
                             });
                         }
                         // The server knows this runner now: reach may relay (its links resume).
                         if let Some(r) = &reach {
                             r.feed(crate::reach::node::In::Server(true)).await;
+                            crate::reach::told::server_up();
                         }
                     }
                     ServerMsg::Refused { reason } => {
@@ -3753,6 +3759,7 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                         }
                         if let Some(r) = &reach {
                             r.feed(crate::reach::node::In::Server(false)).await;
+                            crate::reach::told::server_down();
                         }
                         net.command(Out::Disconnect { peer: SERVER_PEER }).await;
                         redial = Some(Instant::now() + Duration::from_secs(60));
