@@ -11,7 +11,11 @@
 //!   so phones that leave the Wi-Fi do not hold connections forever. At most [`MAX_CONNECTIONS`]
 //!   at once; the TLS handshake gets [`HANDSHAKE`], the upstream connection [`CONNECT`].
 //! * **Certificates** are swapped in place (renewal, upload): new connections get the new one,
-//!   open ones keep theirs.
+//!   open ones keep theirs. The listener's ticket keys are shared by its connections, so a
+//!   browser resumes on its next connection; a renewal keeps them ([`Shared::set_tls`]).
+//! * **No locks** on a connection's way through (the API runtime's goal 5): what it reads (the
+//!   certificate, the upstream, the peers, the replica's handler, the redirect's names and CA) is
+//!   an immutable copy swapped in whole when it changes (`crate::rcu::Rcu`).
 //! * **Ending.** Each direction ends on its reader's end and closes its writer (close_notify for
 //!   TLS); the connection is done when both are. A stopped listener ends its connections.
 
@@ -28,11 +32,11 @@ use anyhow::Context as _;
 use futures::FutureExt as _;
 use futures::io::{AsyncRead, AsyncReadExt as _, AsyncWrite, AsyncWriteExt as _};
 use http::{StatusCode, header};
-use parking_lot::RwLock;
 
 use crate::http::io::RtFuturesIo;
 use crate::http::server::{self as srv, Request, Response};
 use crate::http::tls::{ClientTls, H2, HTTP11, ServerTls, ServerTlsStream, TlsStream};
+use crate::rcu::Rcu;
 use crate::rt::Shutdown;
 
 pub const MAX_CONNECTIONS: usize = 512;
@@ -82,11 +86,12 @@ impl Upstream {
     }
 }
 
-/// What the HTTPS listener reads, swapped in place while it runs; and what it counts.
+/// What the HTTPS listener reads, each an immutable copy swapped in whole while it runs (read
+/// without a lock); and what it counts.
 #[derive(Default)]
 pub struct Shared {
-    pub tls: RwLock<Option<ServerTls>>,
-    pub upstream: RwLock<Option<Upstream>>,
+    pub tls: Rcu<Option<ServerTls>>,
+    pub upstream: Rcu<Option<Upstream>>,
     /// Connections that completed the TLS handshake.
     pub served: AtomicU64,
     pub open: AtomicUsize,
@@ -94,10 +99,25 @@ pub struct Shared {
     pub h2: AtomicBool,
     /// The clusters this one is peered with: a connection for one's address (`peer-<slug>.…`)
     /// is forwarded from here, not passed to the upstream.
-    pub peers: RwLock<Option<Arc<crate::peers::forward::Forwarder>>>,
+    pub peers: Rcu<Option<Arc<crate::peers::forward::Forwarder>>>,
     /// While this runner holds a replica of kiln's records: the handler that serves requests one
     /// by one (kept across connections, with what it learned of whose credentials are whose).
-    pub door: RwLock<Option<Arc<super::replica::Door>>>,
+    pub door: Rcu<Option<Arc<super::replica::Door>>>,
+}
+
+impl Shared {
+    /// Serve `tls` to new connections (open ones keep theirs). A renewal for the same names keeps
+    /// the ticket keys browsers resume with (goal 7 step 3); other names get keys of their own
+    /// ([`ServerTls::succeeding`]).
+    pub fn set_tls(&self, tls: ServerTls) {
+        self.tls.update(|slot| {
+            let next = match slot.as_ref() {
+                Some(old) => tls.clone().succeeding(old),
+                None => tls.clone(),
+            };
+            *slot = Some(next);
+        });
+    }
 }
 
 /// The handler for requests one by one while this runner holds a replica of kiln's records
@@ -105,14 +125,16 @@ pub struct Shared {
 fn door_for(shared: &Shared, upstream: &Upstream) -> Option<Arc<super::replica::Door>> {
     let Some(learner) = crate::store::learner::global() else {
         // None now: the one before lets its replica go.
-        shared.door.write().take();
+        if shared.door.load().is_some() {
+            shared.door.set(None);
+        }
         return None;
     };
-    if let Some(d) = shared.door.read().as_ref().filter(|d| d.serves(&learner, upstream)) {
+    if let Some(d) = Option::as_ref(&shared.door.load()).filter(|d| d.serves(&learner, upstream)) {
         return Some(Arc::clone(d));
     }
     let d = Arc::new(super::replica::Door::new(upstream.clone(), learner).ok()?);
-    *shared.door.write() = Some(Arc::clone(&d));
+    shared.door.set(Some(Arc::clone(&d)));
     Some(d)
 }
 
@@ -223,7 +245,7 @@ pub fn listen_https(port: u16, shared: &Arc<Shared>) -> io::Result<Listening> {
 async fn follow_h2(shared: Arc<Shared>, stop: Shutdown) {
     let mut asked: Option<(String, Instant)> = None;
     loop {
-        let upstream = shared.upstream.read().clone();
+        let upstream = Option::clone(&shared.upstream.load());
         match upstream {
             None => {
                 shared.h2.store(false, Ordering::Relaxed);
@@ -280,8 +302,8 @@ pub async fn speaks_h2(upstream: &Upstream) -> bool {
 /// One connection: the TLS handshake, the upstream connection, then the pipe.
 async fn proxy(tcp: hyper_rt::tcp::TcpStream, shared: &Shared) -> anyhow::Result<()> {
     let remote = tcp.peer_addr().ok();
-    let tls = shared.tls.read().clone().context("no certificate yet")?;
-    let upstream = shared.upstream.read().clone().context("no upstream")?;
+    let tls = Option::clone(&shared.tls.load()).context("no certificate yet")?;
+    let upstream = Option::clone(&shared.upstream.load()).context("no upstream")?;
     let door = door_for(shared, &upstream);
     // Served one by one, the browser's protocol is the front door's own: HTTP/2 whatever the
     // upstream speaks.
@@ -293,9 +315,10 @@ async fn proxy(tcp: hyper_rt::tcp::TcpStream, shared: &Shared) -> anyhow::Result
     // The browser's protocol passes through as it is: HTTP/2 needs an upstream that speaks it.
     let h2 = client.alpn_protocol() == Some(H2);
     shared.served.fetch_add(1, Ordering::Relaxed);
+    crate::metrics::tls().handshake("front_door", client.handshake());
     // A peered cluster's address: forwarded from this machine, request by request.
     let peer = client.server_name().map(str::to_ascii_lowercase).and_then(|sni| {
-        let f = shared.peers.read().clone()?;
+        let f = Option::clone(&shared.peers.load())?;
         let slug = f.slug_of_host(&sni)?.to_owned();
         Some(Arc::new(PeerDoor { forwarder: f, slug }))
     });
@@ -412,23 +435,24 @@ where
 
 // ------------------------------------------------------------------------------ plain HTTP
 
-/// Where the plain-HTTP redirect points, and the CA it hands out.
+/// Where the plain-HTTP redirect points, and the CA it hands out: each an immutable copy swapped
+/// in whole when the front door's settings change (read without a lock).
 #[derive(Default)]
 pub struct Redirect {
     /// Names it redirects to as asked (`Host`); any other goes to `primary`.
-    pub names: RwLock<Vec<String>>,
-    pub primary: RwLock<String>,
+    pub names: Rcu<Vec<String>>,
+    pub primary: Rcu<String>,
     pub https_port: AtomicU16,
     /// kiln's CA certificate (DER), handed out over plain HTTP: a device can't trust the front
     /// door's HTTPS before it has it, and a `.dev` name can't even be opened until then.
-    pub ca_der: RwLock<Vec<u8>>,
+    pub ca_der: Rcu<Vec<u8>>,
 }
 
 impl Redirect {
     fn location(&self, host: Option<&str>, path: &str) -> String {
         let host = host.map(strip_port).unwrap_or_default();
-        let ours = !host.is_empty() && (crate::pki::covers(&self.names.read(), &host) || host.trim_matches(['[', ']']).parse::<IpAddr>().is_ok());
-        let host = if ours { host } else { self.primary.read().clone() };
+        let ours = !host.is_empty() && (crate::pki::covers(&self.names.load(), &host) || host.trim_matches(['[', ']']).parse::<IpAddr>().is_ok());
+        let host = if ours { host } else { String::clone(&self.primary.load()) };
         let port = match self.https_port.load(Ordering::Relaxed) {
             443 => String::new(),
             p => format!(":{p}"),
@@ -462,13 +486,13 @@ fn pem_of(der: &[u8]) -> String {
 impl Redirect {
     /// kiln's CA as a file a device installs: the Apple profile, the certificate (DER), or PEM.
     fn ca_file(&self, path: &str) -> Option<Response> {
-        let der = self.ca_der.read().clone();
+        let der = self.ca_der.get();
         if der.is_empty() {
             return None;
         }
         let (mime, file, body): (&str, &str, Vec<u8>) = match path {
             "/ca.mobileconfig" => ("application/x-apple-aspen-config", "kiln-ca.mobileconfig", super::mobileconfig::profile(&der).into_bytes()),
-            "/ca.crt" => ("application/x-x509-ca-cert", "kiln-ca.crt", der),
+            "/ca.crt" => ("application/x-x509-ca-cert", "kiln-ca.crt", der.to_vec()),
             "/ca.pem" => ("application/x-pem-file", "kiln-ca.pem", pem_of(&der).into_bytes()),
             _ => return None,
         };
@@ -480,9 +504,9 @@ impl Redirect {
     /// What a device that opens the front door by its address sees: how to trust kiln's CA here,
     /// and where kiln is once it does.
     fn trust_page(&self) -> String {
-        let der = self.ca_der.read().clone();
+        let der = self.ca_der.get();
         let fingerprint = crate::util::sha256_hex(&der).to_ascii_uppercase().as_bytes().chunks(2).map(|c| String::from_utf8_lossy(c).into_owned()).collect::<Vec<_>>().join(":");
-        let primary = self.primary.read().clone();
+        let primary = self.primary.get();
         let port = match self.https_port.load(Ordering::Relaxed) {
             443 => String::new(),
             p => format!(":{p}"),
@@ -537,7 +561,7 @@ impl srv::Handler for RedirectHandler {
         }
         // At an address (a phone typing http://100.64.0.5), how to trust kiln first: HTTPS there
         // would only show a certificate warning.
-        if req.uri().path() == "/" && is_address(host) && !self.0.ca_der.read().is_empty() {
+        if req.uri().path() == "/" && is_address(host) && !self.0.ca_der.load().is_empty() {
             let r = srv::response(StatusCode::OK, "text/html; charset=utf-8", srv::full(self.0.trust_page()));
             return srv::with_header(r, header::CACHE_CONTROL, "no-cache");
         }
@@ -599,8 +623,8 @@ mod tests {
     #[test]
     fn redirects_keep_the_name_asked_when_it_is_ours() {
         let r = Redirect::default();
-        *r.names.write() = vec!["kiln.home".into(), "*.kiln.home".into(), "kiln.local".into()];
-        *r.primary.write() = "kiln.home".into();
+        r.names.set(vec!["kiln.home".into(), "*.kiln.home".into(), "kiln.local".into()]);
+        r.primary.set("kiln.home".into());
         r.https_port.store(443, Ordering::Relaxed);
         assert_eq!(r.location(Some("kiln.home"), "/runs?x=1"), "https://kiln.home/runs?x=1");
         assert_eq!(r.location(Some("KILN.local:80"), "/"), "https://kiln.local/");
@@ -620,10 +644,10 @@ mod tests {
             let dir = tempfile::tempdir()?;
             let pki = crate::pki::Pki::open(&dir.path().join("pki"))?;
             let r = Arc::new(Redirect::default());
-            *r.names.write() = vec!["kiln.test".into(), "*.kiln.test".into()];
-            *r.primary.write() = "kiln.test".into();
+            r.names.set(vec!["kiln.test".into(), "*.kiln.test".into()]);
+            r.primary.set("kiln.test".into());
             r.https_port.store(443, Ordering::Relaxed);
-            *r.ca_der.write() = pki.ca_der.clone();
+            r.ca_der.set(pki.ca_der.clone());
             let port = crate::frontdoor::test_port()?;
             let _l = listen_redirect(port, &r)?;
             let client = crate::http::client::Client::public()?;
@@ -648,7 +672,7 @@ mod tests {
             assert_eq!((named.status(), named.header("location").map(str::to_owned)), (307, Some("https://kiln.test/".to_owned())));
             assert_eq!(get("127.0.0.1", "/runs").await?.status(), 307);
             // Without a CA to hand out, an address is redirected like any name.
-            r.ca_der.write().clear();
+            r.ca_der.set(Vec::new());
             assert_eq!(get("127.0.0.1", "/").await?.status(), 307);
             assert_eq!(get("127.0.0.1", "/ca.crt").await?.status(), 307);
             Ok(())
@@ -772,8 +796,8 @@ mod tests {
             let roots = ClientTls::new(crate::http::client::Roots::Pem(pki.ca_pem.clone().into_bytes()), None)?;
             for h2_upstream in [true, false] {
                 let shared = Arc::new(Shared::default());
-                *shared.tls.write() = Some(ServerTls::from_pem(&cert, &key)?);
-                *shared.upstream.write() = Some(Upstream::parse(&format!("http://{}", upstream(h2_upstream)?), &[])?);
+                shared.tls.set(Some(ServerTls::from_pem(&cert, &key)?));
+                shared.upstream.set(Some(Upstream::parse(&format!("http://{}", upstream(h2_upstream)?), &[])?));
                 let port = crate::frontdoor::test_port()?;
                 let _l = listen_https(port, &shared)?;
                 // Asked at once.
@@ -805,6 +829,73 @@ mod tests {
                     assert_eq!(body(send.send_request(req()?).await?).await?, "HTTP/1.1 kiln.test");
                 }
             }
+            Ok(())
+        })
+    }
+
+    /// Goal 7 step 3 (plan 01a1a832ebbf7327a203df446e16ecac): the front door's ticket keys are
+    /// its listener's, so the second connection from one client configuration resumes; after a
+    /// renewal (the same names) it still resumes while a new browser gets the new certificate;
+    /// after a certificate for other names, the next connect is a full one that sees it.
+    #[test]
+    fn g7_s3_front_door_resumes_and_serves_a_changed_certificate() -> anyhow::Result<()> {
+        crate::rt::block_on(async {
+            let dir = tempfile::tempdir()?;
+            let pki = crate::pki::Pki::open(dir.path())?;
+            let issue = |names: &[&str]| -> anyhow::Result<ServerTls> {
+                let names: Vec<String> = names.iter().map(|n| (*n).to_owned()).collect();
+                let key = crate::pki::new_key_pem()?;
+                let csr = crate::pki::front_door_csr(&names, &key)?;
+                ServerTls::from_pem(&pki.sign_front_door(&csr, &names, 30)?, &key)
+            };
+            let roots = ClientTls::new(crate::http::client::Roots::Pem(pki.ca_pem.clone().into_bytes()), None)?;
+            let shared = Arc::new(Shared::default());
+            let first = issue(&["kiln.test"])?;
+            shared.set_tls(first.clone());
+            shared.upstream.set(Some(Upstream::parse(&format!("http://{}", upstream(false)?), &[])?));
+            let port = crate::frontdoor::test_port()?;
+            let _l = listen_https(port, &shared)?;
+            // One connection through the front door and an answer back: its kind, and the leaf the
+            // client holds (the one it was shown, or for a resumed session the one it was shown before).
+            async fn through(config: hyper_quic::rustls::ClientConfig, port: u16) -> anyhow::Result<(&'static str, Option<Vec<u8>>, hyper_quic::rustls::ClientConfig)> {
+                let tcp = hyper_rt::tcp::TcpStream::connect(SocketAddr::from((Ipv4Addr::LOCALHOST, port))).await.map_err(|e| anyhow::anyhow!("{e}"))?;
+                let mut tls = TlsStream::connect(RtFuturesIo::new(tcp), config, crate::http::tls::server_name("kiln.test")?).await?;
+                let kind = tls.handshake();
+                let leaf = tls.peer_certificates().and_then(|c| c.first()).map(|c| c.as_ref().to_vec());
+                tls.write_all(b"GET / HTTP/1.1\r\nHost: kiln.test\r\nConnection: close\r\n\r\n").await?;
+                tls.flush().await?;
+                let mut said = Vec::new();
+                let mut buf = [0u8; 4096];
+                while !String::from_utf8_lossy(&said).contains("HTTP/1.1 kiln.test") {
+                    let n = tls.read_some(&mut buf).await?;
+                    anyhow::ensure!(n > 0, "no answer: {}", String::from_utf8_lossy(&said));
+                    said.extend_from_slice(buf.get(..n).unwrap_or_default());
+                }
+                Ok((kind, leaf, tls.into_config()))
+            }
+            let resumed_before = crate::metrics::tls().handshakes.get(&["front_door", "resumed"]);
+            let (kind, _, config) = through(roots.config()?, port).await?;
+            assert_eq!(kind, "full");
+            let (kind, _, config) = through(config, port).await?;
+            assert_eq!(kind, "resumed", "the second connection resumes");
+            assert!(crate::metrics::tls().handshakes.get(&["front_door", "resumed"]) > resumed_before, "counted on /metrics");
+
+            // Renewed: the same names, a new key and certificate.
+            let renewed = issue(&["kiln.test"])?;
+            shared.set_tls(renewed.clone());
+            let (kind, _, config) = through(config, port).await?;
+            assert_eq!(kind, "resumed", "a renewal keeps the ticket key");
+            let (kind, leaf, _) = through(roots.config()?, port).await?;
+            assert_eq!(kind, "full");
+            assert_eq!(leaf.as_deref(), renewed.leaf(), "a new browser gets the renewed certificate");
+            assert_ne!(renewed.leaf(), first.leaf());
+
+            // Other names: a new ticket key, so the old tickets don't resume; the next connect sees the new certificate.
+            let other = issue(&["kiln.test", "other.test"])?;
+            shared.set_tls(other.clone());
+            let (kind, leaf, _) = through(config, port).await?;
+            assert_eq!(kind, "full");
+            assert_eq!(leaf.as_deref(), other.leaf());
             Ok(())
         })
     }

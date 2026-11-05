@@ -381,9 +381,49 @@ pub async fn get(hub: &Hub, agent: &str) -> R<Stack> {
     stack_of(&hub.store, agent).await
 }
 
+/// The tables an agent's goal stack is made of.
+pub const STACKS_FROM: &[&str] = &["goal_stacks", "goal_items"];
+
+/// Every agent's goal stack as `GET /api/harness/sessions/{id}/goals` answers it ([`get`]), kept in
+/// memory (`crate::reads::Kept`; goal 10, plan 01a1a87b2dae step 2): each agent's with a stack or
+/// goals encoded once, and the empty stack every other agent has, encoded but for its name.
+pub struct Stacks {
+    by: HashMap<String, bytes::Bytes>,
+    /// An empty stack's JSON after its agent's name (`{"agent":<name>` before it).
+    empty: bytes::Bytes,
+}
+
+/// Every agent's goal stack, as the store's tables hold them now, each encoded once.
+pub fn stacks(c: &rusqlite::Connection) -> anyhow::Result<Stacks> {
+    let agents = c.prepare("SELECT agent FROM goal_stacks UNION SELECT agent FROM goal_items")?.query_map([], |r| r.get::<_, String>(0))?.collect::<Result<Vec<_>, _>>()?;
+    let mut by = HashMap::with_capacity(agents.len());
+    for agent in agents {
+        let stack = load(c, &agent)?;
+        by.insert(agent, bytes::Bytes::from(serde_json::to_vec(&stack)?));
+    }
+    let none = serde_json::to_vec(&empty_stack(String::new()))?;
+    let empty = none.strip_prefix(br#"{"agent":"""#).map(<[u8]>::to_vec).ok_or_else(|| anyhow::anyhow!("an empty stack's JSON doesn't begin with its agent"))?;
+    Ok(Stacks { by, empty: empty.into() })
+}
+
+impl Stacks {
+    /// Agent `agent`'s stack as [`get`] answers it: joined, not encoded but for its name.
+    pub fn answer(&self, agent: &str) -> anyhow::Result<bytes::Bytes> {
+        if let Some(s) = self.by.get(agent) {
+            return Ok(s.clone());
+        }
+        let name = serde_json::to_vec(agent)?;
+        let mut out = Vec::with_capacity(br#"{"agent":"#.len() + name.len() + self.empty.len());
+        out.extend_from_slice(br#"{"agent":"#);
+        out.extend_from_slice(&name);
+        out.extend_from_slice(&self.empty);
+        Ok(out.into())
+    }
+}
+
 async fn stack_of(store: &crate::store::Store, agent: &str) -> R<Stack> {
     let agent = agent.to_owned();
-    Ok(store.call(move |c| load(c, &agent)).await?)
+    Ok(store.read(move |c| load(c, &agent)).await?)
 }
 
 fn load(c: &rusqlite::Connection, agent: &str) -> anyhow::Result<Stack> {
@@ -431,9 +471,17 @@ fn load(c: &rusqlite::Connection, agent: &str) -> anyhow::Result<Stack> {
             })
         })?
         .collect::<Result<Vec<_>, _>>()?;
-    let (state, reason, updated_at, dropped_at, cleared, resume_at, held_for, plan_big, side_by_side, asked) = head.unwrap_or_else(|| ("paused".into(), None, 0, 0, 0, 0, None, true, true, None));
+    let Some((state, reason, updated_at, dropped_at, cleared, resume_at, held_for, plan_big, side_by_side, asked)) = head else {
+        return Ok(Stack { items, ..empty_stack(agent.to_owned()) });
+    };
     let asked = asked.and_then(|a| serde_json::from_str(&a).ok()).unwrap_or_default();
     Ok(Stack { agent: agent.to_owned(), state, reason, items, updated_at, cleared, resume_at, held_for, plan_big, side_by_side, dropped_at, asked })
+}
+
+/// The stack of an agent with none kept: paused, its big goals planned first and those that don't wait
+/// for each other side by side.
+fn empty_stack(agent: String) -> Stack {
+    Stack { agent, state: "paused".into(), plan_big: true, side_by_side: true, ..Stack::default() }
 }
 
 /// What a goal stack last said to its agent through its queue (`say`): the message, while it may
@@ -2604,7 +2652,7 @@ pub async fn held_stacks(store: &crate::store::Store) -> HashMap<String, Held> {
 /// round of the driver later. With the stacks held (`CHANGING`), so a read from before a change
 /// can't put back what it let go.
 async fn say_held(hub: &Hub) {
-    hub.harness.set_held(hub, &held_stacks(&hub.store).await);
+    hub.harness.set_held(hub, &held_stacks(&hub.store).await).await;
 }
 
 async fn paused_for_usage(store: &crate::store::Store) -> Vec<String> {
@@ -4690,7 +4738,7 @@ mod stack_tests {
             assert_eq!(s.held_for.as_deref(), Some("pl_1"));
             assert_eq!(held().and_then(|h| h.plan).as_deref(), Some("pl_1"));
             // As each tick of the driver says it, the same.
-            hub.harness.set_held(&hub, &held_stacks(&hub.store).await);
+            hub.harness.set_held(&hub, &held_stacks(&hub.store).await).await;
             assert_eq!(held().and_then(|h| h.plan).as_deref(), Some("pl_1"));
             Ok(())
         })
@@ -5272,7 +5320,7 @@ mod stack_tests {
         let port = RegistryPort { hub: Arc::clone(&hub), sent: parking_lot::Mutex::new(Vec::new()) };
         let there = Location::Machine("box".into());
         let info = Info { id: id.into(), kind: "claude".into(), status: Status::Running, epoch: 1, ..Info::default() };
-        hub.harness.ingest(&hub, &there, id, Update::Open { info: Box::new(info.clone()), since: None });
+        hub.harness.ingest(&hub, &there, id, Update::Open { info: Box::new(info.clone()), since: None }).await;
         let state = |items: &[(&str, &str)], given: &[(&str, &str)]| Update::State {
             state: Box::new(State {
                 status: Status::Running,
@@ -5282,13 +5330,13 @@ mod stack_tests {
                 ..State::default()
             }),
         };
-        hub.harness.ingest(&hub, &there, id, state(&[], &[]));
+        hub.harness.ingest(&hub, &there, id, state(&[], &[])).await;
         let now = 1_000_000;
         // The stack's word goes, and waits behind the agent's turn; the driver looks and sees it.
         let (went, word) = say(&port, id, Some("g1"), send("/goal tests pass".into()), now).await;
         let word = word.ok_or_else(|| anyhow::anyhow!("no word"))?;
         anyhow::ensure!(went == Sent::Delivered);
-        hub.harness.ingest(&hub, &there, id, state(&[(word.as_str(), "/goal tests pass")], &[]));
+        hub.harness.ingest(&hub, &there, id, state(&[(word.as_str(), "/goal tests pass")], &[])).await;
         resay(&port, now + 1_500).await;
         // The goal reworded: an edit of the word waiting. Applied there, and the turn ends: the
         // harness is handed the word, edited.
@@ -5299,19 +5347,19 @@ mod stack_tests {
         let handed: &[(&str, &str)] = if given { &handed_now } else { &[] };
         match then {
             Then::Says | Then::Reconnects => {
-                hub.harness.ingest(&hub, &there, id, Update::Events { events: vec![user.clone()] });
-                hub.harness.ingest(&hub, &there, id, state(&[], handed));
+                hub.harness.ingest(&hub, &there, id, Update::Events { events: vec![user.clone()] }).await;
+                hub.harness.ingest(&hub, &there, id, state(&[], handed)).await;
                 if then == Then::Reconnects {
-                    hub.harness.ingest(&hub, &there, id, Update::Open { info: Box::new(info.clone()), since: Some(1) });
-                    hub.harness.ingest(&hub, &there, id, state(&[], handed));
+                    hub.harness.ingest(&hub, &there, id, Update::Open { info: Box::new(info.clone()), since: Some(1) }).await;
+                    hub.harness.ingest(&hub, &there, id, state(&[], handed)).await;
                 }
                 resay(&port, now + 3_000).await;
             }
             Then::ResumesStateFirst => {
-                hub.harness.ingest(&hub, &there, id, Update::Open { info: Box::new(info.clone()), since: Some(0) });
-                hub.harness.ingest(&hub, &there, id, state(&[], handed));
+                hub.harness.ingest(&hub, &there, id, Update::Open { info: Box::new(info.clone()), since: Some(0) }).await;
+                hub.harness.ingest(&hub, &there, id, state(&[], handed)).await;
                 resay(&port, now + 3_000).await;
-                hub.harness.ingest(&hub, &there, id, Update::Events { events: vec![user] });
+                hub.harness.ingest(&hub, &there, id, Update::Events { events: vec![user] }).await;
                 resay(&port, now + 4_500).await;
             }
         }

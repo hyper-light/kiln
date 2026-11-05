@@ -569,7 +569,11 @@ agent's approvals, questions or plans.
 
 Mission Control lists every agent kiln runs, in one flat list. The one exception is a card's helper
 (`agents.about`, below): it answers what a person tapped in a conversation, so it's no row, its
-parent isn't told of it, and kiln ends it once no card has read its answer for 90 seconds. An agent started through kiln's API
+parent isn't told of it, and kiln ends it once no card has read its answer for 90 seconds. In
+Ship, code no agent made (a person's change, a lone commit, a host's pull request) is asked of a
+helper kiln starts for the person instead (`ci.repos.about`, `POST /api/repos/:repo/about` with the
+`commit` the code is at): it gets the repository at that commit into a folder of its own, reads and
+searches it there and changes nothing, and it's the card's in the same way. An agent started through kiln's API
 is a top-level agent, whoever started it: a row of its own, in the counts, filters, conversation
 search and bulk actions, with no nesting under the agent that started it. A harness's own
 subagents stay subagents: they aren't rows, and their status and output stay inside their agent's

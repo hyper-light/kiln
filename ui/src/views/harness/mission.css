@@ -983,7 +983,8 @@ a.ms-why:hover {
   align-items: center;
   gap: 8px 14px;
   margin: 0 0 12px;
-  padding: 10px 12px;
+  /* The right edge is the ×'s (6px in, 32px wide), so nothing in the row runs under it. */
+  padding: 10px 44px 10px 12px;
   border: 1px solid #3a3326;
   border-radius: 8px;
   background: #1b1915;
@@ -993,7 +994,6 @@ a.ms-why:hover {
   touch-action: pan-y;
 }
 .ms-recover > span:first-child {
-  padding-right: 28px;
   flex: 1 1 320px;
   min-width: 0;
 }

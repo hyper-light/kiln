@@ -1,6 +1,7 @@
 # CI: the UI is built once and embedded into every Rust build (rust-embed reads ui/dist).
 # Linux runs clippy and the tests; macOS and Windows check that kiln builds (clippy covers the
-# tests' code too) on their native toolchains.
+# tests' code too) on their native toolchains, and Windows runs the priority checks only Windows
+# itself can answer (goal 3 step 1, goal 8 step 4).
 name: ci
 
 on:
@@ -59,6 +60,20 @@ jobs:
           path: ui/dist
           if-no-files-found: error
           retention-days: 7
+
+  locks:
+    # Goal 5 of the API runtime program (plan 01a1a59c2aae step 3): no Mutex, RwLock or Condvar in the
+    # modules scripts/locks/hot.toml names but those it lists with why; the check's own tests plant one.
+    name: no new lock on the API's hot path
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: The hot path's locks are those hot.toml lists
+        run: python3 scripts/locks.py check
+      - name: The check fails on a planted lock
+        run: python3 scripts/test_locks.py
 
   linux:
     name: linux (clippy, tests)
@@ -119,3 +134,60 @@ jobs:
       - name: Build
         shell: bash
         run: cargo build -p kiln --locked
+
+  # Goal 3 step 1 and goal 8 step 4, on Windows itself (the `build` job only builds there, and the
+  # release's Windows binary is cross-built with zig): the compute pool's threads run below normal,
+  # read back by GetThreadPriority (kiln-rt's compute tests); agents' and CI steps' job objects run
+  # what's in them below normal at the least CPU weight, with very low memory and I/O priority, and
+  # the server runs above normal, each read back from Windows (kiln's g8_s4 tests). Only those
+  # tests, and no UI: kiln's tests build without ui/dist.
+  windows-priority:
+    name: windows (priority checks)
+    runs-on: windows-latest
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Rust
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      # Each check builds and runs its tests in one cargo call: kiln's build script runs again at
+      # every call in a fetched checkout (it watches .git/packed-refs, which that has none of), so a
+      # build of its tests in a step before would be built again here.
+      - id: compute
+        name: The compute pool's threads run below normal (goal 3 step 1)
+        timeout-minutes: 30
+        run: cargo test -p hyper-rt --locked --test compute --test compute_beside --test compute_wait -- --nocapture 2>&1 | tee "$RUNNER_TEMP/compute.txt"
+      - id: jobs
+        name: Job objects below normal, the server above normal (goal 8 step 4)
+        if: ${{ !cancelled() }}
+        timeout-minutes: 60
+        run: cargo test -p kiln --locked --lib -- os::contain::tests::g8_s4 --nocapture 2>&1 | tee "$RUNNER_TEMP/jobs.txt"
+      # A run's logs take a GitHub sign-in to read; its annotations don't. What each check said,
+      # without cargo's progress, as one annotation: its last 150 lines, or, where no test ran (the
+      # build failed), 150 from its first error.
+      - name: Report
+        if: ${{ always() }}
+        env:
+          OUTCOMES: compute=${{ steps.compute.outcome }} jobs=${{ steps.jobs.outcome }}
+        run: |
+          set +e +o pipefail
+          for said in $OUTCOMES; do
+            step=${said%%=*} outcome=${said#*=}
+            out="$RUNNER_TEMP/$step.txt"
+            if [ ! -s "$out" ]; then continue; fi
+            plain=$(sed -e 's/\x1b\[[0-9;]*[A-Za-z]//g' -e 's/\r$//' "$out" | grep -v -E '^ *(Compiling|Blocking|Downloaded|Downloading|Updating|Locking) ')
+            text=$(printf '%s\n' "$plain" | tail -n 150)
+            if ! printf '%s\n' "$plain" | grep -q -E '^running [0-9]+ tests?$'; then
+              first=$(printf '%s\n' "$plain" | sed -n '/^error/,$p' | head -n 150)
+              if [ -n "$first" ]; then text=$first; fi
+            fi
+            level=notice
+            if [ "$outcome" != success ]; then level=error; fi
+            echo "::$level title=$step $outcome::$(printf '%s\n' "$text" | sed -e 's/%/%25/g' -e 's/\r/%0D/g' | awk 'BEGIN { ORS = "%0A" } { print }')"
+          done

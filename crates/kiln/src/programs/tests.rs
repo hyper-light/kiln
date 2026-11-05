@@ -169,10 +169,10 @@ async fn until(what: &str, holds: impl Fn() -> bool) -> anyhow::Result<()> {
 }
 
 /// Session `id`'s state changed as its machine would report it (its usage, a pause).
-fn report(hub: &Hub, id: &str, f: impl FnOnce(&mut crate::harness::model::State)) -> anyhow::Result<()> {
+async fn report(hub: &Hub, id: &str, f: impl FnOnce(&mut crate::harness::model::State)) -> anyhow::Result<()> {
     let mut st = hub.harness.state(id).ok_or_else(|| anyhow::anyhow!("no session {id}"))?;
     f(&mut st);
-    hub.harness.ingest(hub, &crate::harness::registry::Location::Local, id, crate::harness::core::Update::State { state: Box::new(st) });
+    hub.harness.ingest(hub, &crate::harness::registry::Location::Local, id, crate::harness::core::Update::State { state: Box::new(st) }).await;
     Ok(())
 }
 
@@ -382,19 +382,20 @@ fn a_program_shows_each_track_s_worker_goal_pass_and_slot_and_holds_the_usage_ru
 
         // Above 80% of a weekly window (Sends T3's account): no new goal is put under way, and the
         // track ready for one is held; above 95%, the rule pauses.
-        report(&hub, &sends, |s| s.limits = weekly_at(85.0))?;
+        report(&hub, &sends, |s| s.limits = weekly_at(85.0)).await?;
         let p = program().await?;
         assert!(matches!(&p.rule, Rule::Hold { .. }) && p.usage.as_ref().is_some_and(|u| (u.pct - 85.0).abs() < 1e-9), "{:?} {:?}", p.rule, p.usage);
         assert_eq!(track(&p, "T4")?.slot, "held");
         let e = run(session(&coordinator), "programs.assign", json!({"program": "m1", "track": "T7", "goal": t7_3})).await.err();
         assert!(e.as_ref().is_some_and(|(c, m)| *c == http::StatusCode::CONFLICT && m.contains("no new goal starts")), "{e:?}");
-        report(&hub, &sends, |s| s.limits = weekly_at(96.0))?;
+        report(&hub, &sends, |s| s.limits = weekly_at(96.0)).await?;
         assert!(matches!(&program().await?.rule, Rule::Pause { why } if why.starts_with(PAUSED_FOR_USAGE)));
         // Hex T7 paused at its session limit: T7 says so, with the window and when it starts over.
         let until_ms = crate::util::now_ms() + 3_600_000;
         report(&hub, &hex, |s| {
             s.pause = Some(crate::harness::model::Pause { reason: "limit".into(), window: Some("five_hour".into()), label: Some("Session".into()), until: Some(until_ms), by: "harness".into(), ..Default::default() });
-        })?;
+        })
+        .await?;
         let t7 = track(&program().await?, "T7")?;
         let pause = t7.worker.as_ref().and_then(|w| w.pause.clone()).ok_or_else(|| anyhow::anyhow!("T7's worker isn't paused"))?;
         assert_eq!((t7.slot.as_str(), pause.reason.as_str(), pause.window.as_deref(), pause.until), ("paused", "limit", Some("five_hour"), Some(until_ms)));
@@ -410,7 +411,7 @@ fn a_program_shows_each_track_s_worker_goal_pass_and_slot_and_holds_the_usage_ru
         // Under 80% again: a goal of T7's that's met isn't handed over again, and its next is. Said
         // met in the coordinator's stack itself (as an agent's `done` says it), a change of worker
         // isn't refused for it, and the track has none under way.
-        report(&hub, &sends, |s| s.limits = weekly_at(40.0))?;
+        report(&hub, &sends, |s| s.limits = weekly_at(40.0)).await?;
         let e = run(session(&coordinator), "programs.assign", json!({"program": "m1", "track": "T7", "goal": t7_2})).await.err();
         assert!(e.as_ref().is_some_and(|(c, m)| *c == http::StatusCode::CONFLICT && m.contains("isn't one still to come")), "{e:?}");
         ok(run(session(&coordinator), "programs.assign", json!({"program": "m1", "track": "T7", "goal": t7_3})).await)?;

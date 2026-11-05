@@ -35,21 +35,25 @@ pub fn begins_turn(e: &Value) -> bool {
 /// only a turn longer than the bounds alone is cut, at the bounds. `size` says what an event takes
 /// as sent, `turn` whether it begins a turn ([`begins_turn`]). At least one event when there's one.
 pub fn start<T>(events: &[T], end: usize, turns: usize, size: impl Fn(&T) -> usize, turn: impl Fn(&T) -> bool) -> usize {
-    let end = end.min(events.len());
+    start_at(end.min(events.len()), turns, |i| events.get(i).map(|e| (size(e), turn(e))))
+}
+
+/// [`start`] of events read by their place (`event(i)`: what event `i` takes as sent, and whether it
+/// begins a turn), for events not held in one slice (a copy's chunks).
+pub fn start_at(end: usize, turns: usize, event: impl Fn(usize) -> Option<(usize, bool)>) -> usize {
     let (mut bytes, mut rows, mut held) = (0usize, 0usize, 0usize);
     // The oldest turn's start it holds whole, so far.
     let mut whole: Option<usize> = None;
     let mut at = end;
     while let Some(i) = at.checked_sub(1) {
-        let Some(e) = events.get(i) else { break };
-        let n = size(e);
+        let Some((n, begins)) = event(i) else { break };
         if rows > 0 && (bytes.saturating_add(n) > BYTES || rows >= ROWS) {
             return whole.unwrap_or(at);
         }
         bytes = bytes.saturating_add(n);
         rows += 1;
         at = i;
-        if turn(e) {
+        if begins {
             held += 1;
             whole = Some(i);
             if held >= turns {

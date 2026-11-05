@@ -468,13 +468,17 @@ pub struct Spec {
 /// boot, drops the handshake silently; QUIC alone would keep the dial pending).
 pub const DIAL_DEADLINE: Duration = Duration::from_secs(15);
 
+/// The transport events the net thread hands its owner (the hub's loop) at most before it holds
+/// them itself.
+pub const EVENTS: usize = 16_384;
+
 /// Start a net thread. Returns the command handle and the event stream.
 pub fn start(spec: Spec) -> anyhow::Result<(NetHandle, async_channel::Receiver<NetEvent>)> {
     // Validate the TLS material up front so misconfiguration fails loudly at startup.
     let _ = Tls::mutual(&credentials(&spec.ca_der, &spec.leaf)?, spec.server)
         .map_err(|r| anyhow::anyhow!("tls config: {r}"))?;
     let (tx, rx) = async_channel::bounded::<Out>(16_384);
-    let (etx, erx) = async_channel::bounded::<NetEvent>(16_384);
+    let (etx, erx) = async_channel::bounded::<NetEvent>(EVENTS);
     let name = if spec.server { "kiln-net-server" } else { "kiln-net-agent" };
     std::thread::Builder::new().name(name.into()).spawn(move || thread_main(spec, rx, etx))?;
     Ok((NetHandle { tx }, erx))

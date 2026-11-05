@@ -2,6 +2,7 @@
 //! store, the network and the runners. Each workstream owns its submodules (docs/ci.md §5.2) and
 //! adds one line here and one arm in [`api`].
 
+pub mod about;
 pub mod actions;
 pub mod agent_fixes;
 pub mod api;
