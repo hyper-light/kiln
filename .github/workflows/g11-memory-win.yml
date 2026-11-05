@@ -1,0 +1,51 @@
+# Trial only, never on main (goal 11, plan 01a1a87b2e56): goal 11's parts checked on Windows itself: clippy of
+# kiln and kiln-lab, and kiln built with the mimalloc feature and run. Results go to the branch
+# g11-memory-win-results.
+name: g11-memory-win
+
+on:
+  push:
+    branches: [g11-memory-win]
+
+permissions:
+  contents: write
+
+concurrency:
+  group: g11-memory-win
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: never
+  CARGO_INCREMENTAL: "0"
+
+jobs:
+  windows:
+    name: windows (clippy, the mimalloc build)
+    runs-on: windows-latest
+    timeout-minutes: 240
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Rust
+        run: |
+          rustup toolchain install stable --profile minimal --component clippy
+          rustup default stable
+      - name: Clippy, and the mimalloc build run
+        run: |
+          set +e
+          R=$RUNNER_TEMP/win; mkdir -p "$R"
+          cargo clippy -p kiln -p kiln-lab --all-targets --locked -- -D warnings > "$R/clippy.txt" 2>&1; echo "clippy exit $?" | tee -a "$R/summary.txt"
+          cargo clippy -p kiln --features mimalloc --locked -- -D warnings > "$R/clippy-mimalloc.txt" 2>&1; echo "clippy mimalloc exit $?" | tee -a "$R/summary.txt"
+          cargo build -p kiln --features mimalloc --locked > "$R/build-mimalloc.txt" 2>&1; echo "build mimalloc exit $?" | tee -a "$R/summary.txt"
+          ./target/debug/kiln.exe --version > "$R/run-mimalloc.txt" 2>&1; echo "run mimalloc exit $?" | tee -a "$R/summary.txt"
+          cat "$R/run-mimalloc.txt" >> "$R/summary.txt"
+          grep -E "^(error|warning)" "$R"/clippy*.txt "$R"/build-mimalloc.txt | grep -v "focal-memory\|fetch_update" | head -60 >> "$R/summary.txt"
+          echo "${{ github.sha }}" > "$R/COMMIT"
+          cd "$RUNNER_TEMP" && git init -q out && cd out && mkdir results && cp "$R/summary.txt" "$R/COMMIT" results/
+          for f in clippy clippy-mimalloc build-mimalloc; do grep -v -E '^ *(Compiling|Checking|Downloaded|Downloading) ' "$R/$f.txt" | tail -200 > "results/$f.txt"; done
+          git config user.name "kiln g11 lab" && git config user.email "g11-lab@users.noreply.github.com"
+          git add results && git commit -q -m "g11 windows checks for ${{ github.sha }}"
+          git push -f "https://x-access-token:${{ github.token }}@github.com/${{ github.repository }}.git" HEAD:refs/heads/g11-memory-win-results
+          grep -q "clippy exit 0" "$R/summary.txt" && grep -q "clippy mimalloc exit 0" "$R/summary.txt" && grep -q "run mimalloc exit 0" "$R/summary.txt"
