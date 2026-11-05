@@ -33,7 +33,9 @@ use std::time::Duration;
 
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
-use serde_json::{Value, json};
+use serde_json::Value;
+#[cfg(unix)]
+use serde_json::json;
 
 pub use crate::harness::told::{DETACHED, LINE_SHARE, RunEvent, RunNews, Rto, clip_tail};
 
@@ -243,7 +245,7 @@ fn set_link(up: Option<bool>, takes: Option<bool>) {
 }
 
 /// News goes from this runner now (its server takes it).
-#[cfg(test)]
+#[cfg(all(test, unix))]
 fn takes() -> bool {
     let st = STATE.lock();
     st.up && st.takes
