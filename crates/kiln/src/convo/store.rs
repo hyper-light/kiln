@@ -26,7 +26,7 @@ use serde::{Deserialize, Serialize};
 use super::rows::{self, EventRow, Row};
 use super::telemetry::{CompactView, Compacted, Meter, Pruned, StoreReport, Upkeeping};
 use crate::harness::core::Update;
-use crate::harness::session::Sink;
+use crate::harness::session::{Sink, Taken};
 
 /// How long a row waits for others to share its commit.
 pub const COMMIT_MS: u64 = 50;
@@ -851,18 +851,19 @@ fn writer(mut engine: Box<dyn Engine>, rx: &mpsc::Receiver<Msg>, watchers: &Watc
 /// A sink that keeps what passes through it in `store` on its way to `sink`, in order, with the
 /// same room (a full `sink` holds the sessions back, as it always did): `room` updates, whatever each
 /// carries, on a lock-free queue (goal 5, plan 01a1a59c2aae: an async-channel's wait took
-/// event-listener's `Mutex`, each session's shard sending and the tee's waiting on its own).
+/// event-listener's `Mutex`, each session's shard sending and the tee's waiting on its own). Each goes on
+/// with when it was sent in, its wait here the runner's (goal 10, plan 01a1a87b2dae step 5: `Taken`).
 pub fn tee(sink: impl Into<Sink>, store: Store, room: usize) -> Sink {
     let sink: Sink = sink.into();
-    let (tx, rx) = crate::memory::queue::places::<(String, Update)>(&crate::memory::owners::CHANNELS, room);
+    let (tx, rx) = crate::memory::queue::places::<Taken>(&crate::memory::owners::CHANNELS, room);
     crate::rt::spawn(async move {
-        while let Ok((id, u)) = rx.recv().await {
-            store.send(&id, &u);
+        while let Ok(t) = rx.recv().await {
+            store.send(&t.session, &t.update);
             // A store over its bound holds what passes back, rather than its rows piling up (goal 11), once they're as
             // many as this runner's streams keep unanswered for the server (goal 10, plan 01a1a87b2dae step 5: the
             // disk's stall held the updates, and the frames they make, before the server ever had them).
             store.room_within(crate::wire::uplink::TOTAL_ROOM).await;
-            if sink.send((id, u)).await.is_err() {
+            if sink.send_taken(t).await.is_err() {
                 break;
             }
         }
@@ -886,7 +887,7 @@ enum Keeping {
 pub struct Held {
     keeping: Arc<Mutex<Keeping>>,
     /// The tee's way in, held weakly: the tee still ends once its senders have.
-    input: crate::memory::queue::WeakSender<(String, Update)>,
+    input: crate::memory::queue::WeakSender<Taken>,
 }
 
 impl Held {
@@ -920,21 +921,21 @@ impl Held {
 /// the store wait for it in memory; never given, they go.
 pub fn tee_held(sink: impl Into<Sink>, store: Option<Store>, room: usize) -> (Sink, Held) {
     let sink: Sink = sink.into();
-    // `room` updates, whatever each carries, on a lock-free queue, as [`tee`]'s.
-    let (tx, rx) = crate::memory::queue::places::<(String, Update)>(&crate::memory::owners::CHANNELS, room);
+    // `room` updates, whatever each carries, on a lock-free queue, as [`tee`]'s, each with when it was sent in.
+    let (tx, rx) = crate::memory::queue::places::<Taken>(&crate::memory::owners::CHANNELS, room);
     let keeping = Arc::new(Mutex::new(store.map_or_else(|| Keeping::Waiting(Vec::new()), Keeping::Store)));
     let held = Held { keeping: keeping.clone(), input: tx.downgrade() };
     crate::rt::spawn(async move {
-        while let Ok((id, u)) = rx.recv().await {
+        while let Ok(t) = rx.recv().await {
             // Kept before it goes on, under the lock a taker waits on; then, the lock let go, a store over
             // its bound holds what passes back (goal 11, plan 01a1a87b2e56 step 3).
             let kept_in = match &mut *keeping.lock().unwrap_or_else(PoisonError::into_inner) {
                 Keeping::Waiting(rows) => {
-                    rows.extend(rows::of(&id, &u, crate::util::now_ms()));
+                    rows.extend(rows::of(&t.session, &t.update, crate::util::now_ms()));
                     None
                 }
                 Keeping::Store(st) => {
-                    st.send(&id, &u);
+                    st.send(&t.session, &t.update);
                     Some(st.clone())
                 }
                 Keeping::Gone => None,
@@ -943,7 +944,8 @@ pub fn tee_held(sink: impl Into<Sink>, store: Option<Store>, room: usize) -> (Si
             if let Some(st) = kept_in {
                 st.room_within(crate::wire::uplink::TOTAL_ROOM).await;
             }
-            if sink.send((id, u)).await.is_err() {
+            // With when it was sent in, not now: its wait here was the runner's (goal 10, plan 01a1a87b2dae step 5).
+            if sink.send_taken(t).await.is_err() {
                 break;
             }
         }
@@ -1092,13 +1094,13 @@ mod tests {
     #[test]
     fn g5_a_tee_passes_every_shards_updates_on_once_in_order_within_its_room() -> anyhow::Result<()> {
         crate::rt::block_on(async move {
-            let (out, passed) = crate::memory::queue::places(&crate::memory::owners::CHANNELS, 4);
+            let (out, passed) = crate::memory::queue::places::<(String, Update)>(&crate::memory::owners::CHANNELS, 4);
             let room = 16;
             let (sink, held) = tee_held(out, None, room);
             // Looked at weakly: a sender held here would keep the tee from ever ending.
             let way_in = match &sink {
-                Sink::Bounded(q) => q.downgrade(),
-                Sink::Channel(_) => anyhow::bail!("a tee's way in isn't a queue"),
+                Sink::Stamped(q) => q.downgrade(),
+                Sink::Bounded(_) | Sink::Channel(_) => anyhow::bail!("a tee's way in isn't a queue of updates taken in"),
             };
             let (senders, per) = (8usize, 200u64);
             let mut sending = Vec::new();
@@ -1135,6 +1137,38 @@ mod tests {
             }
             anyhow::ensure!(most <= room, "its way in held {most}, past its room of {room}");
             anyhow::ensure!(held.drained(), "drained, its senders gone");
+            Ok(())
+        })
+    }
+
+    /// Goal 10, plan 01a1a87b2dae step 5: a runner's tee passes each update on with when its session sent it in, not
+    /// when the tee got to pass it on: an update that waited in the tee, behind a sink with no room, still says when
+    /// it was taken in, so its frame counts that wait as the runner's. Into a sink that keeps no such time (the
+    /// server's), it passes on as it always did.
+    #[test]
+    fn g10_s5_a_tee_passes_each_update_on_with_when_it_was_taken_in() -> anyhow::Result<()> {
+        crate::rt::block_on(async move {
+            let (out, passed) = crate::memory::queue::places::<Taken>(&crate::memory::owners::CHANNELS, 1);
+            let (sink, _held) = tee_held(out, None, 16);
+            anyhow::ensure!(matches!(sink, Sink::Stamped(_)), "its way in notes when");
+            sink.send(("a1".to_owned(), said("m1", 1, "fills what's after the tee"))).await.map_err(|_| anyhow::anyhow!("closed"))?;
+            let before = Instant::now();
+            sink.send(("a1".to_owned(), said("m2", 2, "waits in the tee"))).await.map_err(|_| anyhow::anyhow!("closed"))?;
+            let sent = Instant::now();
+            // The tee holds the second while what's after it has no room.
+            let waited = Duration::from_millis(30);
+            crate::rt::sleep(waited).await;
+            let first = crate::rt::timeout(Duration::from_secs(5), passed.recv()).await??;
+            let second = crate::rt::timeout(Duration::from_secs(5), passed.recv()).await??;
+            anyhow::ensure!(first.session == "a1" && matches!(&second.update, Update::Events { events } if events.first().is_some_and(|e| e.id == "m2")), "in order: {first:?} {second:?}");
+            anyhow::ensure!(before <= second.at && second.at <= sent, "taken in as it was sent, not as the tee passed it on");
+            anyhow::ensure!(second.at.elapsed() >= waited, "its wait in the tee is counted from then");
+            // Into a sink of plain updates, as before.
+            let (plain, got) = async_channel::unbounded();
+            let (sink, _held) = tee_held(plain, None, 16);
+            sink.send(("a2".to_owned(), said("m3", 3, "plain"))).await.map_err(|_| anyhow::anyhow!("closed"))?;
+            let (id, u) = crate::rt::timeout(Duration::from_secs(5), got.recv()).await??;
+            anyhow::ensure!(id == "a2" && u == said("m3", 3, "plain"), "passed on as it came");
             Ok(())
         })
     }
