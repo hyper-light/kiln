@@ -48,7 +48,7 @@ pub struct Target {
 }
 
 /// The version of what's learned that this build reads as its own ([`Learned::version`]).
-pub const LEARNED_VERSION: u32 = 1;
+pub const LEARNED_VERSION: u32 = 2;
 
 /// What the engine learned, kept between runs.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
@@ -58,7 +58,8 @@ pub struct Learned {
     /// found out only once kiln's write budget reached exactly zero, which only Linux, knowing what
     /// its disks take, ever got to: on macOS and Windows each probe slowed by something else halved
     /// kiln's budgets for good, and the Macs' had come down to 0.03 cores and 164 kB/s for all their
-    /// agents together (2026-11-05), which stopped them.
+    /// agents together (2026-11-05), which stopped them. Before version 2, trouble with almost
+    /// nothing of kiln's in use cut its budgets to almost nothing, and from zero they never rose.
     #[serde(default)]
     pub version: u32,
     pub detectors: BTreeMap<String, detect::Detector>,
@@ -116,7 +117,9 @@ impl Episode {
     /// was when this trouble began ([`NOT_KILN_CUT`]) that the trouble going on regardless isn't
     /// kiln's. Its write budget at zero is that too: nothing of kiln's writes at all.
     fn cut_far(&self, write_bps: f64, cpu_cores: f64, write_budget: Option<f64>) -> bool {
-        write_budget == Some(0.0) || (write_bps * NOT_KILN_CUT <= self.write_bps && cpu_cores * NOT_KILN_CUT <= self.cpu_cores)
+        // Each cut to a quarter, or to the least a cut goes to.
+        let far = |now: f64, then: f64, unit: knee::Unit| now * NOT_KILN_CUT <= then || now <= unit.least();
+        write_budget == Some(0.0) || (far(write_bps, self.write_bps, knee::Unit::Writes) && far(cpu_cores, self.cpu_cores, knee::Unit::Cpu))
     }
 }
 
@@ -907,6 +910,52 @@ mod tests {
         anyhow::ensure!(back, "trouble that isn't kiln's kept cutting it: {w:?} B/s, {c:?} cores");
         anyhow::ensure!(w.is_none() && c.is_none(), "kiln's budgets are back to no limit: {w:?} B/s, {c:?} cores");
         anyhow::ensure!(e.learned.knee.unsafe_at.is_none() && e.learned.cpu_knee.unsafe_at.is_none(), "learned from cuts that didn't help: {:?} {:?}", e.learned.knee, e.learned.cpu_knee);
+        Ok(())
+    }
+
+    /// This Mac at 04:38 on 2026-11-05, with fresh budgets: its agents waiting on their models
+    /// used about 0.01 cores and 5 kB/s between them, and one fsync took 330 ms against its usual
+    /// 8 ms. That cut them to 0.0 cores and 0 MB/s, and every agent stopped. Now trouble with that
+    /// little of kiln's in use cuts nothing, and work using more is never cut below 1 core or
+    /// 1 MB/s, from which a budget can climb back.
+    #[test]
+    fn trouble_with_next_to_nothing_of_kilns_in_use_cuts_nothing() -> anyhow::Result<()> {
+        let mut e = engine();
+        let at = |t: u64, us: f64, w: f64, c: f64| Observation {
+            now_us: t,
+            answers: vec![("disk".into(), Answer::Took(us))],
+            delivered_bps: None,
+            mem_free: 1e11,
+            running: vec![Group { cpu_cores: c, ..group("a", w, 1.0) }],
+            cores: Some(10.0),
+            ..Observation::default()
+        };
+        let mut t = 0;
+        for _ in 0..100 {
+            t += 1_000_000;
+            e.step(&at(t, 8_000.0, 5e3, 0.01));
+        }
+        for _ in 0..5 {
+            t += 1_000_000;
+            let p = e.step(&at(t, 1e6, 5e3, 0.01));
+            anyhow::ensure!(p.status.budget_bps.is_none() && p.status.cpu_budget.is_none(), "next to nothing of kiln's in use was cut: {:?}", p.events);
+        }
+        while e.alarmed() {
+            t += 1_000_000;
+            e.step(&at(t, 8_000.0, 5e3, 0.01));
+        }
+        // Work using 3 cores and 4 MB/s is cut, but not below 1 core and 1 MB/s.
+        for _ in 0..100 {
+            t += 1_000_000;
+            e.step(&at(t, 8_000.0, 4e6, 3.0));
+        }
+        let mut least = (f64::INFINITY, f64::INFINITY);
+        for _ in 0..10 {
+            t += 1_000_000;
+            let p = e.step(&at(t, 1e6, 4e6, 3.0));
+            least = (least.0.min(p.status.budget_bps.unwrap_or(f64::INFINITY)), least.1.min(p.status.cpu_budget.unwrap_or(f64::INFINITY)));
+        }
+        anyhow::ensure!(least.0 >= 1e6 && least.1 >= 1.0, "cut below the least: {least:?}");
         Ok(())
     }
 
