@@ -154,6 +154,7 @@ export async function served(originUrl, ctl, payloads) {
     for (const [kind, frames] of Object.entries(replay.streams || {})) {
       const texts = { sse: "", "fetch-stream": "" };
       const encodings = {};
+      const delays = { sse: [], "fetch-stream": [] };
       const streams = [];
       // A server may hold a compressed stream's headers until it has bytes enough to compress
       // (Caddy's encoder does), so nothing waits for them: each is read when it comes.
@@ -165,7 +166,13 @@ export async function served(originUrl, ctl, payloads) {
           encodings[carrier] = h["content-encoding"] || "identity";
           const body = h["content-encoding"] === "gzip" ? st.pipe(createGunzip({ flush: 2 })) : st;
           body.setEncoding("utf8");
-          body.on("data", (d) => (texts[carrier] += d));
+          body.on("data", (d) => {
+            texts[carrier] += d;
+            // How long each frame took from the origin's stamp to here: a server that held frames
+            // back to compress them more would show here.
+            const now = Math.round((performance.timeOrigin + performance.now()) * 1000);
+            for (const m of d.matchAll(/@lab:(\d{16})/g)) delays[carrier].push(now - Number(m[1]));
+          });
           body.on("error", () => {});
         });
       }
@@ -192,7 +199,10 @@ export async function served(originUrl, ctl, payloads) {
       for (const [carrier, got] of Object.entries(read())) {
         const bad = holds(kind, frames, got);
         if (bad.length) pass = false;
-        line[carrier] = bad.length ? { encoding: encodings[carrier], received: got.length, differ: bad.length, first: bad[0] } : `${got.length} of ${frames.length} equal (${encodings[carrier]})`;
+        const d = delays[carrier].sort((a, b) => a - b);
+        const q = (p) => (d.length ? Math.round(d[Math.min(d.length - 1, Math.floor(p * d.length))] / 100) / 10 : null);
+        const held = `stamp to here p50 ${q(0.5)} ms, p99 ${q(0.99)} ms`;
+        line[carrier] = bad.length ? { encoding: encodings[carrier], received: got.length, differ: bad.length, first: bad[0] } : `${got.length} of ${frames.length} equal (${encodings[carrier]}; ${held})`;
       }
       report.push(line);
     }

@@ -85,6 +85,8 @@ pub struct Running {
     pub kiln: Option<KilnLab>,
     /// The origin's own control socket (replays).
     pub replay_sock: Option<PathBuf>,
+    /// A reference server's access log: each request's protocol and path, as the server saw it.
+    pub access_log: Option<PathBuf>,
 }
 
 /// What a lab kiln gives the round: its admin token, its live sessions, its log job.
@@ -316,7 +318,7 @@ enabled = false
             (None, None)
         }
     };
-    Ok(Running { procs, scope, origin_scope: Some(rscope), kiln: Some(KilnLab { admin, sessions: ids, job, run, plain_port: port }), replay_sock: None })
+    Ok(Running { procs, scope, origin_scope: Some(rscope), kiln: Some(KilnLab { admin, sessions: ids, job, run, plain_port: port }), replay_sock: None, access_log: None })
 }
 
 /// A lab repository whose one job writes stamped lines for fifteen minutes: its run's and its job's
@@ -384,11 +386,14 @@ fn start_reference(e: &Env<'_>, t: &Target, dir: &Path) -> anyhow::Result<Runnin
     full.extend(argv);
     procs.push(spawn(e.lab, &scope, &t.name, &full, &[("HOME", dir.display().to_string()), ("XDG_DATA_HOME", dir.join("xdg").display().to_string()), ("XDG_CONFIG_HOME", dir.join("xdg").display().to_string())], &dir.join("server.log"))?);
     wait(Duration::from_secs(30), &t.name, || Ok(answers(port)))?;
-    Ok(Running { procs, scope, origin_scope: Some(oscope), kiln: None, replay_sock: Some(ctl) })
+    Ok(Running { procs, scope, origin_scope: Some(oscope), kiln: None, replay_sock: Some(ctl), access_log: Some(dir.join("access.log")) })
 }
 
 /// h2o's config for `t`: TLS 1.3 with the lab chain; static bodies from the docroot, compressed
-/// (brotli, then gzip) as h2o does best; streams and writes passed to the origin over its socket;
+/// (brotli, then gzip) as h2o does best; streams and writes passed to the origin over its socket,
+/// the streams gzipped (their types marked compressible: h2o's own list leaves them out; its brotli
+/// starts afresh at each flushed chunk and made a stream 4% bigger, its gzip keeps its window
+/// across them and made it 83% smaller, docs/browser-lab.md);
 /// HTTP/3 on the same port when the target is HTTP/3, its congestion controller `t.quic_cc`.
 pub fn h2o_conf(t: &Target, c: &Certs, docroot: &Path, sock: &Path, port: u16) -> String {
     let ssl = format!("    ssl:\n      certificate-file: {}\n      key-file: {}\n      minimum-version: TLSv1.3\n", c.chain.display(), c.key.display());
@@ -400,25 +405,30 @@ pub fn h2o_conf(t: &Target, c: &Certs, docroot: &Path, sock: &Path, port: u16) -
     format!(
         "# kiln browser lab: {name} ({about})\n{listen}\
          num-threads: 1\n\
+         access-log:\n  path: {log}\n  format: \"%H %U\"\n\
+         file.mime.addtypes:\n  \"text/event-stream\": {{ extensions: [ \".sse\" ], is_compressible: YES }}\n  \"application/x-ndjson\": {{ extensions: [ \".ndjson\" ], is_compressible: YES }}\n\
          http2-idle-timeout: 600\n\
          http3-idle-timeout: 600\n\
          proxy.timeout.io: 600000\n\
-         hosts:\n  \"10.77.0.1:{port}\":\n    paths:\n      /stream:\n        proxy.reverse.url: \"http://[unix:{sock}]/stream\"\n        compress: [ br, gzip ]\n      /fetch-stream:\n        proxy.reverse.url: \"http://[unix:{sock}]/fetch-stream\"\n        compress: [ br, gzip ]\n      /__lab:\n        proxy.reverse.url: \"http://[unix:{sock}]/__lab\"\n      /api/harness/sessions/lab/command:\n        proxy.reverse.url: \"http://[unix:{sock}]/api/harness/sessions/lab/command\"\n      /:\n        file.dir: {docroot}\n        file.mime.setdefaulttype: application/json\n        file.index: [ index.json ]\n        compress: [ br, gzip ]\n        header.set: \"cache-control: no-store\"\n",
+         hosts:\n  \"10.77.0.1:{port}\":\n    paths:\n      /stream:\n        proxy.reverse.url: \"http://[unix:{sock}]/stream\"\n        compress: [ gzip ]\n      /fetch-stream:\n        proxy.reverse.url: \"http://[unix:{sock}]/fetch-stream\"\n        compress: [ gzip ]\n      /__lab:\n        proxy.reverse.url: \"http://[unix:{sock}]/__lab\"\n      /api/harness/sessions/lab/command:\n        proxy.reverse.url: \"http://[unix:{sock}]/api/harness/sessions/lab/command\"\n      /:\n        file.dir: {docroot}\n        file.mime.setdefaulttype: application/json\n        file.index: [ index.json ]\n        compress: [ br, gzip ]\n        header.set: \"cache-control: no-store\"\n",
         name = t.name,
         about = t.about,
         sock = sock.display(),
         docroot = docroot.display(),
+        log = sock.with_file_name("access.log").display(),
     )
 }
 
-/// Caddy's config for `t`: the same, with HTTP/3 (quic-go, its Cubic: f35) only when the target is.
+/// Caddy's config for `t`: the same, with HTTP/3 (quic-go, its Cubic: f35) only when the target is;
+/// the streams compressed from their first byte (Caddy's encoder waits for 512 by default, which a
+/// stream's small frames never reach) and NDJSON among the types it compresses.
 pub fn caddy_conf(t: &Target, c: &Certs, docroot: &Path, sock: &Path, port: u16) -> String {
     let protocols = if t.http3 { "h1 h2 h3" } else { "h1 h2" };
     format!(
         "# kiln browser lab: {name} ({about})\n{{\n\tadmin off\n\tauto_https off\n\tservers {{\n\t\tprotocols {protocols}\n\t\ttimeouts {{\n\t\t\tidle 10m\n\t\t}}\n\t}}\n}}\n\
-         https://10.77.0.1:{port} {{\n\ttls {chain} {key} {{\n\t\tprotocols tls1.3\n\t}}\n\
+         https://10.77.0.1:{port} {{\n\ttls {chain} {key} {{\n\t\tprotocols tls1.3\n\t}}\n\tlog {{\n\t\toutput file {log}\n\t\tformat json\n\t}}\n\
          \t@origin path /stream/* /fetch-stream/* /__lab/* /api/harness/sessions/lab/command\n\
-         \thandle @origin {{\n\t\tencode zstd gzip\n\t\treverse_proxy unix/{sock} {{\n\t\t\tflush_interval -1\n\t\t}}\n\t}}\n\
+         \thandle @origin {{\n\t\tencode {{\n\t\t\tzstd\n\t\t\tgzip\n\t\t\tminimum_length 1\n\t\t\tmatch {{\n\t\t\t\theader Content-Type text/*\n\t\t\t\theader Content-Type application/json*\n\t\t\t\theader Content-Type application/x-ndjson*\n\t\t\t}}\n\t\t}}\n\t\treverse_proxy unix/{sock} {{\n\t\t\tflush_interval -1\n\t\t}}\n\t}}\n\
          \thandle {{\n\t\troot * {docroot}\n\t\theader cache-control no-store\n\t\theader content-type application/json\n\t\tencode zstd gzip\n\t\tfile_server {{\n\t\t\tindex index.json\n\t\t}}\n\t}}\n}}\n",
         name = t.name,
         about = t.about,
@@ -426,6 +436,7 @@ pub fn caddy_conf(t: &Target, c: &Certs, docroot: &Path, sock: &Path, port: u16)
         key = c.key.display(),
         sock = sock.display(),
         docroot = docroot.display(),
+        log = sock.with_file_name("access.log").display(),
     )
 }
 

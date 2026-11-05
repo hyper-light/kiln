@@ -141,6 +141,8 @@ fn job(c: &mut Ctx<'_>, r: &Running, t: &Target, browser: &str, case: &str, cond
         }
         std::thread::sleep(Duration::from_millis(500));
     }
+    // Where the server's access log stands before the job: the job's own requests come after.
+    let log_from = r.access_log.as_ref().and_then(|p| std::fs::metadata(p).ok()).map_or(0, |m| m.len());
     let mut drivers = Vec::new();
     for i in 0..c.s.k {
         let jd = dir.join(format!("c{i}"));
@@ -278,6 +280,7 @@ fn job(c: &mut Ctx<'_>, r: &Running, t: &Target, browser: &str, case: &str, cond
     }
     stop.store(true, Ordering::Relaxed);
     let cpu = sampler.join().map_err(|_| anyhow::anyhow!("the CPU sampler stopped"))?;
+    let server_protocols = r.access_log.as_ref().map(|p| logged_protocols(p, log_from)).unwrap_or_default();
     // The background again after the job, nobody attached: the job's is the mean of the two.
     let e = cpu_now(r);
     std::thread::sleep(bg);
@@ -358,6 +361,7 @@ fn job(c: &mut Ctx<'_>, r: &Running, t: &Target, browser: &str, case: &str, cond
         k: c.s.k,
         numbers: nums.numbers,
         protocols,
+        server_protocols,
         calibration_p99_us: calib,
         timer_grain_us: grain,
         background_us_per_s: background,
@@ -512,6 +516,33 @@ pub fn start_stop(s: &Settings, out: &Path, times: usize) -> anyhow::Result<(Str
     Ok((text, all))
 }
 
+/// Each path's protocol in a reference server's access log from byte `from` on: h2o's lines are
+/// `HTTP/2 /path`, Caddy's JSON with `request.proto` and `request.uri`. Ids in paths as the page
+/// names them (`:id`).
+fn logged_protocols(log: &Path, from: u64) -> std::collections::BTreeMap<String, String> {
+    let bytes = std::fs::read(log).unwrap_or_default();
+    let text = String::from_utf8_lossy(bytes.get(usize::try_from(from).unwrap_or(usize::MAX)..).unwrap_or_default());
+    let mut out = std::collections::BTreeMap::new();
+    for line in text.lines() {
+        let (proto, uri) = if let Ok(v) = serde_json::from_str::<Value>(line) {
+            (v.pointer("/request/proto").and_then(Value::as_str).unwrap_or_default().to_owned(), v.pointer("/request/uri").and_then(Value::as_str).unwrap_or_default().to_owned())
+        } else {
+            let (p, u) = line.split_once(' ').unwrap_or_default();
+            (p.to_owned(), u.to_owned())
+        };
+        let name = match proto.as_str() {
+            "HTTP/2" | "HTTP/2.0" => "h2",
+            "HTTP/3" | "HTTP/3.0" => "h3",
+            "HTTP/1.1" => "http/1.1",
+            _ => continue,
+        };
+        let path = uri.split('?').next().unwrap_or_default();
+        let path: String = path.split('/').map(|seg| if seg.len() == 32 && seg.chars().all(|c| c.is_ascii_hexdigit()) { ":id" } else { seg }).collect::<Vec<_>>().join("/");
+        out.insert(path, name.to_owned());
+    }
+    out
+}
+
 /// Whether a process's network namespace has a UDP socket bound to `port`.
 fn udp_bound(pid: u32, port: u16) -> bool {
     let hex = format!(":{port:04X}");
@@ -561,6 +592,22 @@ fn served_bodies(lab: &Lab, t: &Target, docroot: &Path) -> (usize, usize, Option
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// plan 01a1a832e9cc step 5: the protocol each path came over, from h2o's and Caddy's logs.
+    #[test]
+    fn g1_s5_access_logs_name_each_paths_protocol() {
+        let dir = std::env::temp_dir().join(format!("kiln-lab-log-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let log = dir.join("access.log");
+        let old = "HTTP/1.1 /old\n";
+        let body = format!("{old}HTTP/2 /stream/session\n{}\nnot a line\n", r#"{"request":{"proto":"HTTP/3.0","uri":"/api/harness/sessions/01a1a94fe73a77a1a8fff1e1d19098c1/command?x=1"}}"#);
+        let _ = std::fs::write(&log, body);
+        let got = logged_protocols(&log, old.len() as u64);
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(got.get("/stream/session").map(String::as_str), Some("h2"));
+        assert_eq!(got.get("/api/harness/sessions/:id/command").map(String::as_str), Some("h3"));
+        assert!(!got.contains_key("/old"));
+    }
 
     #[test]
     fn g1_s6_a_round_seed_is_the_same_for_every_target_and_differs_by_round() {

@@ -97,6 +97,10 @@ pub struct JobRecord {
     pub numbers: std::collections::BTreeMap<String, f64>,
     /// The protocol each path came over, as the page saw it.
     pub protocols: std::collections::BTreeMap<String, String>,
+    /// The same as a reference server's access log has it over the job (WebKit gives a stream the
+    /// page holds open no timing entry, so its protocol is the server's word).
+    #[serde(default)]
+    pub server_protocols: std::collections::BTreeMap<String, String>,
     /// The calibration: its offset and the p99 of its residuals (µs), the worst client's.
     pub calibration_p99_us: Option<f64>,
     /// The page's timer grain (µs): the smallest step `performance.now()` took, the coarsest

@@ -277,8 +277,17 @@ starts the origin on sockets of its own, opens every recorded stream on both car
 Events, read as a browser's EventSource reads them, and the streaming fetch, a frame a line), has
 the origin replay every frame, and holds that the replay it reads is the recording (each stream's
 frames hash to the catalogue's digest) and that every frame it sent, on each carrier, in order and
-none missing, is the replay's in normal form (stamps and ids out; a terminal's or a log's line end
-is the carrier's framing, so it is left out of both). ORIGIN_RESULT
+none missing, is the replay's in normal form (stamps and ids out), a terminal's or a log's text
+read back from the JSON string the origin sends it as. Its first run (2026-11-05) found the origin
+framing text lossily on both carriers: a terminal's frames end in CR CR LF, which an event's data
+can't hold (it ends at any CR or LF), and 10 of a log's frames hold several lines, which the
+streaming fetch's one frame a line splits; the origin now sends a terminal's and a log's text as
+a JSON string (the escapes are the carrier's cost, in its bytes). Then every frame held: 75,583
+`/api/events` frames, 23,019 of a session's, 11,981 of a log's and 6,001 of a terminal's, each on
+both carriers, the replay's digests the catalogue's (`node check-origin.mjs`, exit 0). `kiln-lab
+browser start-stop` runs the same check through each reference server, the first of its 20 starts
+(`check-origin.mjs served`: the server's HTTP/2, gzip asked for, in a client's namespace).
+SERVED_RESULT
 
 A target is a record (`crates/kiln-lab/src/browser/targets.rs`): its server, its port, whether it
 is HTTP/3, its carrier for streams, the protocol the page must have got, and the browsers it runs
@@ -306,7 +315,7 @@ Each serves the catalogue's operations with kiln's own bodies:
   lab's origin (`crates/kiln-lab/web/origin.mjs`) over a Unix socket: it replays the frames kiln
   sent in step 3's recording, in order, each stamped as it goes out (the stamp keeps its length, so
   every frame is the size kiln's was), on the schedule kiln's stand-ins keep; the stream is
-  compressed by the server as its static files are. The origin runs in a scope of its own: its CPU
+  compressed as the server does it best (below). The origin runs in a scope of its own: its CPU
   counts with the server's and is shown apart;
 - **the write** (a message to an agent) passed to the origin, which answers what kiln answered.
 
@@ -315,9 +324,17 @@ The tuning, and why:
 - TLS 1.3 only, with the lab kiln's chain (one ECDSA P-256 leaf under a lab CA), so the handshake's
   certificate bytes are the same for every target.
 - JSON compressed as each server does best, since the bar is against each protocol's best
-  practice: h2o brotli, then gzip (its `compress: [ br, gzip ]`), Caddy zstd, then gzip (`encode
-  zstd gzip`), on its static bodies and its streams alike; kiln today sends JSON uncompressed (f8),
-  as it does in production.
+  practice; kiln today sends JSON uncompressed (f8), as it does in production. Static bodies: h2o
+  brotli, then gzip (`compress: [ br, gzip ]`), Caddy zstd, then gzip (`encode zstd gzip`).
+  Streams, as measured on the lab machine (2026-11-05, a probe of each server on localhost: 51
+  `/api/events` frames 10 ms apart, 3,968 bytes uncompressed): neither server compresses an event
+  stream by default (h2o's compressible types leave out `text/event-stream` and
+  `application/x-ndjson`; Caddy's encoder waits for 512 bytes, which a stream's frames don't
+  reach, and leaves NDJSON out). So h2o marks both types compressible and gzips its streams: its
+  brotli starts afresh at each flushed chunk (4,122 bytes, 4% more than none), while its gzip keeps
+  its window across them (668 bytes, 83% less); and Caddy compresses its streams from the first
+  byte, NDJSON included (zstd: 848 bytes, 79% less). The served-streams check (below) also times
+  each frame from its stamp, so a server holding frames back to compress them would show.
 - The kernel settings kiln uses, the same for every target: kiln's server sets `TCP_NOTSENT_LOWAT`
   to 128 KiB on each connection (`crates/kiln/src/http/server.rs`), and h2o and Caddy have no
   setting for it, so the server's namespace takes it as every socket's default

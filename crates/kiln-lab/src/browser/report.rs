@@ -263,20 +263,24 @@ pub fn check_probe(run: &BrowserRun, catalogue: &serde_json::Value) -> (String, 
         if jobs.is_empty() {
             continue;
         }
-        let mut by_browser: BTreeMap<&str, (usize, Vec<String>)> = BTreeMap::new();
+        // (paths, of them from the server's log, those over another protocol)
+        let mut by_browser: BTreeMap<&str, (usize, usize, Vec<String>)> = BTreeMap::new();
         for j in &jobs {
             let e = by_browser.entry(j.browser.as_str()).or_default();
-            for (path, proto) in &j.protocols {
+            let logged = j.server_protocols.iter().filter(|(p, _)| !j.protocols.contains_key(*p) && !p.starts_with("/__lab"));
+            for (path, proto, from_log) in j.protocols.iter().map(|(p, v)| (p, v, false)).chain(logged.map(|(p, v)| (p, v, true))) {
                 e.0 += 1;
+                e.1 += usize::from(from_log);
                 if *proto != t.protocol {
-                    e.1.push(format!("{path} {proto}"));
+                    e.2.push(format!("{path} {proto}{}", if from_log { " (server's log)" } else { "" }));
                 }
             }
         }
-        for (b, (paths, odd)) in by_browser {
+        for (b, (paths, logged, odd)) in by_browser {
             let ok = paths > 0 && odd.is_empty();
             pass &= ok;
-            let _ = writeln!(o, "- protocol: {} {b}: {paths} paths over {}{}", t.name, t.protocol, if ok { String::new() } else if paths == 0 { " (**none recorded**)".to_owned() } else { format!(" (**not: {}**)", odd.join(", ")) });
+            let from_log = if logged > 0 { format!(" ({logged} of them by the server's log: the page has no timing entry for them)") } else { String::new() };
+            let _ = writeln!(o, "- protocol: {} {b}: {paths} paths over {}{from_log}{}", t.name, t.protocol, if ok { String::new() } else if paths == 0 { " (**none recorded**)".to_owned() } else { format!(" (**not: {}**)", odd.join(", ")) });
         }
     }
     let mut floors: BTreeMap<String, Vec<f64>> = BTreeMap::new();
