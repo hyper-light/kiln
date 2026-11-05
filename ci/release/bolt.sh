@@ -16,7 +16,7 @@
 #                                               perf records process <pid> (user space), with its branch stacks
 #                                               (lbr, the default: Intel's LBR, AMD's LbrExtV2) or its
 #                                               instructions alone (samples), until stopped, or for <seconds>
-#   bolt.sh profile <binary> <out.fdata> <perf.data>...
+#   bolt.sh profile <binary> <out.fdata|out.yaml> <perf.data>...
 #                                               perf2bolt each recording of <binary> (a copy of it, stripped or
 #                                               not, with its build id), the profiles merged
 #   bolt.sh instrument <binary> <out> <dump> [seconds]
@@ -37,7 +37,7 @@
 #   PERF, PERF_LIBS  the perf binary, and a directory of its libraries (as scripts/shard_lab/hook.sh)
 #   BOLT_FREQ        perf's sampling frequency (perf's own default otherwise: 4000 a second)
 #   KILN_BOLT_ICF    optimize's identical code folding: safe (the default), all or none
-#   KILN_BOLT_ARGS   more llvm-bolt options for optimize (-thread-count=4, say)
+#   KILN_BOLT_ARGS   more llvm-bolt options for instrument and optimize (-thread-count=4, say)
 #   KILN_STRIP       the strip that strips optimize's output (strip)
 set -euo pipefail
 
@@ -128,10 +128,12 @@ record() {
 }
 
 profile() {
-  local bin=$1 out=$2 dir perf data i=0 parts=() ba
+  local bin=$1 out=$2 dir perf data i=0 parts=() ba format=()
   shift 2
   [ $# -gt 0 ] || die "profile takes <binary> <out.fdata> <perf.data>..."
   dir=$(tools)
+  # YAML names functions by their code's hashes too, so another build's binary can take it (-infer-stale-profile).
+  case $out in *.yaml) format=(--profile-format=yaml) ;; esac
   perf=$(command -v "${PERF:-perf}") || die "no perf (PERF)"
   for data in "$@"; do
     i=$((i + 1))
@@ -141,7 +143,7 @@ profile() {
     perf_cmd evlist -v -i "$data" 2> /dev/null | grep BRANCH_STACK > /dev/null || ba=(--ba)
     # perf2bolt runs the perf it finds on PATH.
     if ! PATH="$(dirname "$perf"):$PATH" LD_LIBRARY_PATH=${PERF_LIBS:-${LD_LIBRARY_PATH:-}} \
-      "$dir/perf2bolt" --perfdata="$data" -o "$out.$i" ${ba[@]+"${ba[@]}"} "$bin" > "$out.$i.log" 2>&1; then
+      "$dir/perf2bolt" --perfdata="$data" -o "$out.$i" ${ba[@]+"${ba[@]}"} ${format[@]+"${format[@]}"} "$bin" > "$out.$i.log" 2>&1; then
       tail -n 20 "$out.$i.log" >&2
       die "perf2bolt failed on $data ($out.$i.log)"
     fi
@@ -158,11 +160,14 @@ profile() {
 }
 
 instrument() {
-  local bin=$1 out=$2 dump=$3 secs=${4:-5} dir
+  local bin=$1 out=$2 dump=$3 secs=${4:-5} dir extra=()
   check "$bin" > /dev/null
   dir=$(tools)
+  # KILN_BOLT_ARGS here too: a distribution's llvm-bolt unpacked elsewhere than it was built for finds its runtime
+  # by -runtime-instrumentation-lib=<libbolt_rt_instr.a>.
+  read -r -a extra <<< "${KILN_BOLT_ARGS:-}"
   "$dir/llvm-bolt" "$bin" -o "$out" -instrument -instrumentation-file="$dump" -instrumentation-file-append-pid \
-    -instrumentation-sleep-time="$secs" -instrumentation-no-counters-clear > "$out.log" 2>&1 ||
+    -instrumentation-sleep-time="$secs" -instrumentation-no-counters-clear ${extra[@]+"${extra[@]}"} > "$out.log" 2>&1 ||
     { tail -n 20 "$out.log" >&2; die "llvm-bolt -instrument failed ($out.log)"; }
   echo "$out: instrumented; each process writes $dump.<its writer's pid>.fdata every $secs s"
 }
