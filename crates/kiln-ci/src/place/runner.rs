@@ -240,6 +240,11 @@ struct Probe {
     hard: Option<i64>,
     due: Option<Due>,
     told: Option<Told>,
+    /// Its promotion's look (W05-R31), when it has one: when, and from which class. Out of
+    /// `promotions` while it isn't waiting, put back if it waits again before then (a look finding
+    /// it offered or holding room does nothing), so looks for runs long started don't pile up
+    /// for a class's bound (docs/needs.md §11, AUDIT P6).
+    look: Option<(i64, Class)>,
 }
 
 /// An owner's process, as this runner hears it.
@@ -303,7 +308,12 @@ pub struct Admission {
     fair: [Fair; 5],
     /// Offers by when they lapse; claims by predicted end and by hard end.
     deadlines: BTreeSet<(i64, u32)>,
-    ends: BTreeSet<(i64, u32)>,
+    /// Claims by predicted end, twice over (docs/needs.md §11, AUDIT P6: backfill's search and the
+    /// soonest start O(log n), not a walk of every claim): one summing what each holds (its
+    /// work's milliseconds 1; a claim of the runner whole counted untimed), one each amount times
+    /// its end (shifted by 2^63, so the sum is of whole numbers).
+    ends: Line,
+    ends_at: Line,
     hard_ends: BTreeSet<(i64, u32)>,
     records: Records,
     /// Room kept for the first in line: its slot, and from when.
@@ -331,6 +341,25 @@ fn ix(s: u32) -> usize {
 
 fn later(now: i64, ms: Ms) -> i64 {
     now.saturating_add(i64::try_from(ms).unwrap_or(i64::MAX))
+}
+
+/// Each dimension's work in `all` less in `before`.
+fn less_sums(all: &super::line::Sums, before: &super::line::Sums) -> [u128; ask::DIMS] {
+    let mut out = all.work;
+    for (o, b) in out.iter_mut().zip(&before.work) {
+        *o = o.saturating_sub(*b);
+    }
+    out
+}
+
+/// A claim's place among the claims by predicted end.
+fn end_key(at: i64, s: u32) -> Key {
+    Key { class: 0, standing: [0; LEVELS], own: i128::from(at), seq: u64::from(s) }
+}
+
+/// A time as a whole number, in its order: shifted by 2^63.
+fn shifted(t: i64) -> u64 {
+    u64::try_from(i128::from(t).saturating_sub(i128::from(i64::MIN))).unwrap_or(u64::MAX)
 }
 
 fn class_ix(c: Class) -> u8 {
@@ -368,7 +397,8 @@ impl Admission {
             came: 0,
             fair: Default::default(),
             deadlines: BTreeSet::new(),
-            ends: BTreeSet::new(),
+            ends: Line::default(),
+            ends_at: Line::default(),
             hard_ends: BTreeSet::new(),
             records,
             kept: None,
@@ -387,6 +417,19 @@ impl Admission {
     /// Its name and epoch.
     pub fn me(&self) -> (&str, u64) {
         (&self.me, self.epoch)
+    }
+
+    /// Claim `s`, holding `amounts`, is predicted to end at `at`.
+    fn add_end(&mut self, at: i64, s: u32, amounts: Amounts, whole: bool) {
+        let k = end_key(at, s);
+        self.ends.insert(k, Item { slot: s, ask: amounts, predicted: Some(1), timeout: (!whole).then_some(0) });
+        self.ends_at.insert(k, Item { slot: s, ask: amounts, predicted: Some(shifted(at)), timeout: Some(0) });
+    }
+
+    fn drop_end(&mut self, at: i64, s: u32) {
+        let k = end_key(at, s);
+        self.ends.remove(&k);
+        self.ends_at.remove(&k);
     }
 
     fn get(&self, s: u32) -> Option<&Probe> {
@@ -546,9 +589,7 @@ impl Admission {
             Kind::Ordinary => {}
         }
         match end {
-            Some(at) => {
-                self.ends.insert((at, s));
-            }
+            Some(at) => self.add_end(at, s, amounts, kind == Kind::Whole),
             None => self.unpredicted_claims = self.unpredicted_claims.saturating_add(1),
         }
         match hard {
@@ -587,9 +628,7 @@ impl Admission {
             Kind::Ordinary => {}
         }
         match end {
-            Some(at) => {
-                self.ends.remove(&(at, s));
-            }
+            Some(at) => self.drop_end(at, s),
             None => self.unpredicted_claims = self.unpredicted_claims.saturating_sub(1),
         }
         match hard {
@@ -638,6 +677,7 @@ impl Admission {
     /// Forgets a probe: out of the line, its claim freed, its slot free.
     fn drop_probe(&mut self, s: u32) {
         self.leave(s);
+        self.unlook(s);
         self.release(s);
         let Some(p) = self.slots.get_mut(ix(s)).and_then(Option::take) else { return };
         if let Some(w) = self.owners.get_mut(ix(p.owner)) {
@@ -865,7 +905,36 @@ impl Admission {
     fn promote_at(&mut self, s: u32, since: i64, class: Class) {
         let Some(seq) = self.get(s).map(|p| p.seq) else { return };
         if let (Some(bound), Some(_)) = (self.class_config(class).bound, class.up()) {
-            self.promotions.entry(later(since, bound)).or_default().push((s, seq, class));
+            self.look_at(s, seq, later(since, bound), class);
+        }
+    }
+
+    fn look_at(&mut self, s: u32, seq: u64, at: i64, class: Class) {
+        self.promotions.entry(at).or_default().push((s, seq, class));
+        if let Some(p) = self.get_mut(s) {
+            p.look = Some((at, class));
+        }
+    }
+
+    /// A run leaves the line (offered, or gone): its look is taken out, kept on the run.
+    fn unlook(&mut self, s: u32) {
+        let Some((seq, Some((at, class)))) = self.get(s).map(|p| (p.seq, p.look)) else { return };
+        if let Some(v) = self.promotions.get_mut(&at) {
+            if let Some(i) = v.iter().position(|e| *e == (s, seq, class)) {
+                v.swap_remove(i);
+            }
+            if v.is_empty() {
+                self.promotions.remove(&at);
+            }
+        }
+    }
+
+    /// A run waits again (its offer lapsed, or its owner's link went): its look is put back if
+    /// it's still to come.
+    fn relook(&mut self, s: u32, now: i64) {
+        let Some((seq, Some((at, class)))) = self.get(s).map(|p| (p.seq, p.look)) else { return };
+        if at > now && !self.promotions.get(&at).is_some_and(|v| v.contains(&(s, seq, class))) {
+            self.promotions.entry(at).or_default().push((s, seq, class));
         }
     }
 
@@ -877,13 +946,16 @@ impl Admission {
     fn promote_due(&mut self, now: i64, out: &mut Vec<Said>) {
         while let Some(at) = self.promotions.first_key_value().map(|(at, _)| *at).filter(|at| *at <= now) {
             for (s, seq, from) in self.promotions.remove(&at).unwrap_or_default() {
+                if let Some(p) = self.get_mut(s).filter(|p| p.seq == seq && p.look == Some((at, from))) {
+                    p.look = None;
+                }
                 let Some(to) = from.up() else { continue };
                 let Some(p) = self.get(s).filter(|p| p.seq == seq && p.class == from && matches!(p.state, State::Waiting | State::Aside)) else { continue };
                 let behind_done = from == Class::Interactive && p.land_due.is_some_and(|d| d <= at);
                 if !behind_done {
                     let Some(bound) = self.class_config(from).bound.map(|b| i64::try_from(b).unwrap_or(i64::MAX)) else { continue };
                     if let Some(last) = self.fair_of(from).and_then(|f| f.served).filter(|t| *t > at.saturating_sub(bound)) {
-                        self.promotions.entry(last.saturating_add(bound)).or_default().push((s, seq, from));
+                        self.look_at(s, seq, last.saturating_add(bound), from);
                         continue;
                     }
                 }
@@ -1019,10 +1091,15 @@ impl Admission {
             };
             self.kept = kept;
             let free = self.free_now();
+            // Of each class anyone waits in (its bit in the line's mask, lowest first), the first
+            // that can start.
             let mut bests: [Option<u32>; 5] = [None; 5];
-            for (c, best) in bests.iter_mut().enumerate() {
-                let class = u8::try_from(c).ok();
-                *best = self.line.find(&Query { class, after: None, free: &free, within: u64::MAX }, &mut |s| self.can_start(s) && self.respects(s, kept, now)).map(|(_, s)| s);
+            let mut mask = self.line.classes();
+            while mask != 0 {
+                let c = mask.trailing_zeros();
+                mask &= mask.wrapping_sub(1);
+                let (Some(best), Ok(class)) = (bests.get_mut(c as usize), u8::try_from(c)) else { continue };
+                *best = self.line.find(&Query { class: Some(class), after: None, free: &free, within: u64::MAX }, &mut |s| self.can_start(s) && self.respects(s, kept, now)).map(|(_, s)| s);
             }
             let mut found = Class::ALL.into_iter().zip(bests).filter_map(|(c, b)| b.map(|s| (c, s)));
             let Some((_, first)) = found.next() else { return };
@@ -1044,25 +1121,20 @@ impl Admission {
         if whole && self.sample.ci_jobs > 0 {
             return None;
         }
-        let mut free = self.free_now();
-        let (mut left, mut whole_left) = (self.claims, self.whole_claims);
-        for (end, c) in &self.ends {
-            if *end < now {
-                // Past its predicted end: when it ends isn't known.
-                continue;
+        // The first claim, by predicted end from now on, by whose end what's freed lets it in
+        // (each claim past its predicted end left out: when it ends isn't known): O(log n).
+        let free = self.free_now();
+        let (claims, whole_claims) = (self.claims, self.whole_claims);
+        let room = |sum: &super::line::Sums| {
+            let mut freed = free;
+            for (f, w) in freed.iter_mut().zip(&sum.work) {
+                *f = u64::try_from(u128::from(*f).saturating_add(*w)).unwrap_or(u64::MAX);
             }
-            let Some(claim) = self.get(*c) else { continue };
-            free = ask::plus(&free, &claim.amounts);
-            left = left.saturating_sub(1);
-            if kind_of(&claim.ask) == Kind::Whole {
-                whole_left = whole_left.saturating_sub(1);
-            }
-            let room = if whole { left == 0 } else { whole_left == 0 && ask::fits(&need, &free) };
-            if room {
-                return Some(*end);
-            }
-        }
-        None
+            let left = claims.saturating_sub(sum.count);
+            let whole_left = whole_claims.saturating_sub(sum.untimed);
+            if whole { left == 0 } else { whole_left == 0 && ask::fits(&need, &freed) }
+        };
+        self.ends.first_from(&end_key(now, 0), &mut |sum| room(sum)).and_then(|k| i64::try_from(k.own).ok())
     }
 
     /// Gives a waiting probe room: offered to its owner under a new claim, held for the owner's
@@ -1074,6 +1146,7 @@ impl Admission {
         let o = p.owner;
         let until = later(now, self.rto(o));
         self.leave(s);
+        self.unlook(s);
         if let Some(p) = self.get_mut(s) {
             p.state = State::Offered { fence, until };
         }
@@ -1209,12 +1282,13 @@ impl Admission {
     fn estimate(&self, key: &Key, now: i64) -> Estimate {
         let ahead = self.line.ahead(key);
         let soonest = if ahead.unpredicted == 0 && self.unpredicted_claims == 0 {
+            // What the claims predicted to end from now on hold until then: each amount times
+            // its end, less now times each amount (O(log n), from the sums by end).
             let mut work = ahead.work;
-            for (end, c) in &self.ends {
-                let (Some(claim), Ok(left)) = (self.get(*c), u64::try_from(end.saturating_sub(now))) else { continue };
-                for (w, a) in work.iter_mut().zip(&claim.amounts) {
-                    *w = w.saturating_add(u128::from(*a).saturating_mul(u128::from(left)));
-                }
+            let from = end_key(now, 0);
+            let (held, held_by_end) = (less_sums(&self.ends.all(), &self.ends.ahead(&from)), less_sums(&self.ends_at.all(), &self.ends_at.ahead(&from)));
+            for ((w, a), at) in work.iter_mut().zip(held).zip(held_by_end) {
+                *w = w.saturating_add(at.saturating_sub(a.saturating_mul(u128::from(shifted(now)))));
             }
             let mut wait: Option<u128> = Some(0);
             for (w, a) in work.iter().zip(&self.avail) {
@@ -1342,13 +1416,11 @@ impl Admission {
     /// A claim's predicted and hard ends, worked out again from `from`.
     fn retime(&mut self, s: u32, from: i64) {
         let Some(p) = self.get(s) else { return };
-        let (old_end, old_hard) = (p.end, p.hard);
+        let (old_end, old_hard, amounts, whole) = (p.end, p.hard, p.amounts, kind_of(&p.ask) == Kind::Whole);
         let end = p.predicted.map(|ms| later(from, ms));
         let hard = p.ask.timeout.map(|ms| later(from, ms));
         match old_end {
-            Some(at) => {
-                self.ends.remove(&(at, s));
-            }
+            Some(at) => self.drop_end(at, s),
             None => self.unpredicted_claims = self.unpredicted_claims.saturating_sub(1),
         }
         match old_hard {
@@ -1358,9 +1430,7 @@ impl Admission {
             None => self.untimed_claims = self.untimed_claims.saturating_sub(1),
         }
         match end {
-            Some(at) => {
-                self.ends.insert((at, s));
-            }
+            Some(at) => self.add_end(at, s, amounts, whole),
             None => self.unpredicted_claims = self.unpredicted_claims.saturating_add(1),
         }
         match hard {
@@ -1406,7 +1476,7 @@ impl Admission {
         self.came = self.came.saturating_add(1);
         let (seq, came, class) = (self.seq, self.came, ask.class);
         let run = ask.run.clone();
-        let p = Probe { owner: o, run: run.clone(), ask, amounts, predicted, state: State::Aside, key: None, leaf, weights, class, own, seq, came, land_due: None, charge: None, end: None, hard: None, due: None, told: None };
+        let p = Probe { owner: o, run: run.clone(), ask, amounts, predicted, state: State::Aside, key: None, leaf, weights, class, own, seq, came, land_due: None, charge: None, end: None, hard: None, due: None, told: None, look: None };
         let s = match self.spare.pop() {
             Some(s) => {
                 if let Some(slot) = self.slots.get_mut(ix(s)) {
@@ -1693,6 +1763,7 @@ impl Admission {
                     if let Some(p) = self.get_mut(s) {
                         p.state = State::Aside;
                     }
+                    self.relook(s, now);
                 }
                 _ => {}
             }
@@ -1803,6 +1874,7 @@ impl Admission {
             let Some(p) = self.get(s) else { continue };
             let (run, to) = (p.run.clone(), self.owner(p.owner).filter(|w| !w.away).map(|w| w.name.clone()));
             self.enter(s);
+            self.relook(s, now);
             if let Some(to) = to {
                 out.push((to, ToOwner::Lapsed { run, fence, why: "its offer wasn't taken in time".into() }));
             }

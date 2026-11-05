@@ -53,10 +53,12 @@ struct Args {
     steps: u64,
     seed: u64,
     out: Option<String>,
+    /// Print each call's mean time by its kind (owner and runner), to stderr.
+    profile: bool,
 }
 
 fn parse() -> Result<Args, String> {
-    let mut a = Args { algo: "place".into(), n: 0, c: 8, d: 1, rho: 0.0, steps: 200_000, seed: 1, out: None };
+    let mut a = Args { algo: "place".into(), n: 0, c: 8, d: 1, rho: 0.0, steps: 200_000, seed: 1, out: None, profile: false };
     let argv: Vec<String> = std::env::args().skip(1).collect();
     let mut it = argv.chunks(2);
     for pair in &mut it {
@@ -71,6 +73,7 @@ fn parse() -> Result<Args, String> {
             "-s" => a.steps = v.parse().map_err(|e| bad(&e))?,
             "-S" => a.seed = v.parse().map_err(|e| bad(&e))?,
             "-o" => a.out = Some(v.clone()),
+            "-P" => a.profile = v == "1",
             // cargo bench passes --bench; nothing else is ours.
             "--bench" => {}
             _ => return Err(format!("unknown flag {k}")),
@@ -199,6 +202,33 @@ struct Fleet {
     net: u64,
     /// Runs started since last looked at: their runner and run.
     starts: Vec<(usize, String)>,
+    /// With `-P 1`: each kind of call's count and total time, and the kind of the next.
+    prof: std::collections::BTreeMap<&'static str, (u64, u64)>,
+    kind: &'static str,
+}
+
+fn to_owner_kind(m: &ToOwner) -> &'static str {
+    match m {
+        ToOwner::Offer { .. } => "owner.heard offer",
+        ToOwner::Waiting { .. } => "owner.heard waiting",
+        ToOwner::Never { .. } => "owner.heard never",
+        ToOwner::Held { .. } => "owner.heard held",
+        ToOwner::Lapsed { .. } => "owner.heard lapsed",
+        ToOwner::Started { .. } => "owner.heard started",
+        ToOwner::Ran { .. } => "owner.heard ran",
+        ToOwner::Ended { .. } => "owner.heard ended",
+    }
+}
+
+fn to_runner_kind(m: &ToRunner) -> &'static str {
+    match m {
+        ToRunner::Probe { .. } => "runner.probe",
+        ToRunner::Withdraw { .. } => "runner.withdraw",
+        ToRunner::Take { .. } => "runner.take",
+        ToRunner::Decline { .. } => "runner.decline",
+        ToRunner::Start { .. } => "runner.start (restart)",
+        ToRunner::Ack { .. } => "runner.ack",
+    }
 }
 
 impl Fleet {
@@ -230,7 +260,7 @@ impl Fleet {
         let machines = names.iter().map(|name| Machine { name: name.clone(), facts: facts.clone(), labels: Vec::new(), size: Size::known(&size), epoch: 1, connected: true, places: true, idle: None }).collect();
         let _ = owner.machines(machines);
         let index = names.iter().cloned().enumerate().map(|(i, n)| (n, i)).collect();
-        Fleet { owner, runners, index, names, overhead: overhead(), owner_ns: 0, runner_ns: vec![0; usize::try_from(a.n).unwrap_or(0)], messages: 0, net: a.seed ^ 0x6e65_7477_6f72_6b21, starts: Vec::new() }
+        Fleet { owner, runners, index, names, overhead: overhead(), owner_ns: 0, runner_ns: vec![0; usize::try_from(a.n).unwrap_or(0)], messages: 0, net: a.seed ^ 0x6e65_7477_6f72_6b21, starts: Vec::new(), prof: Default::default(), kind: "" }
     }
 
     fn less(&self, t: Instant) -> u64 {
@@ -240,8 +270,16 @@ impl Fleet {
     fn owner_does(&mut self, f: impl FnOnce(&mut Owner) -> Vec<Act>) -> Vec<Act> {
         let t = Instant::now();
         let acts = f(&mut self.owner);
-        self.owner_ns += self.less(t);
+        let dt = self.less(t);
+        self.owner_ns += dt;
+        self.count(dt);
         acts
+    }
+
+    fn count(&mut self, dt: u64) {
+        let e = self.prof.entry(self.kind).or_default();
+        e.0 += 1;
+        e.1 += dt;
     }
 
     fn runner_does<R>(&mut self, i: usize, f: impl FnOnce(&mut Admission) -> R) -> Option<R> {
@@ -252,6 +290,7 @@ impl Fleet {
         if let Some(ns) = self.runner_ns.get_mut(i) {
             *ns += dt;
         }
+        self.count(dt);
         Some(out)
     }
 
@@ -269,6 +308,7 @@ impl Fleet {
                         let Some(&i) = self.index.get(&runner) else { continue };
                         self.messages += 1;
                         let mut said: Vec<Said> = Vec::new();
+                        self.kind = to_runner_kind(&msg);
                         self.runner_does(i, |r| match msg {
                             ToRunner::Probe { ask } => r.probe(peer, ask, None, now, &mut said),
                             ToRunner::Withdraw { run } => r.withdraw(peer, &run, now, &mut said),
@@ -285,10 +325,14 @@ impl Fleet {
                         let Some(&i) = self.index.get(&runner) else { continue };
                         let t = Instant::now();
                         let go = self.owner.starting(&run, &runner, fence);
-                        self.owner_ns += self.less(t);
+                        let dt = self.less(t);
+                        self.owner_ns += dt;
+                        self.kind = "owner.starting";
+                        self.count(dt);
                         if go {
                             self.messages += 1;
                             let mut said: Vec<Said> = Vec::new();
+                            self.kind = "runner.start";
                             let _ = self.runner_does(i, |r| r.start(peer, &run, fence, now, &mut said));
                             self.starts.push((i, run));
                             replies.extend(said.into_iter().map(|(_, m)| (i, m)));
@@ -308,6 +352,7 @@ impl Fleet {
             for (i, m) in replies {
                 self.messages += 1;
                 let name = self.names.get(i).cloned().unwrap_or_default();
+                self.kind = to_owner_kind(&m);
                 let more = self.owner_does(|o| o.heard(&name, m, now));
                 acts.extend(more);
             }
@@ -400,6 +445,7 @@ fn main() -> ExitCode {
         *next += 1;
         let x = ask(*next, a.d);
         let run = x.run.clone();
+        fleet.kind = "owner.ask";
         let acts = fleet.owner_does(|o| o.ask(x, now));
         fleet.carry(acts, now);
         let placed = settle(fleet, q, live, Some(&run));
@@ -410,11 +456,13 @@ fn main() -> ExitCode {
     };
     let end = |fleet: &mut Fleet, q: &mut Quality, live: &mut Vec<(usize, String)>, i: usize, run: &str, now: i64| {
         let mut said: Vec<Said> = Vec::new();
+        fleet.kind = "runner.ended";
         let _ = fleet.runner_does(i, |r| r.ended(peer, run, true, now, &mut said));
         let replies = said.into_iter().map(|(_, m)| m).collect::<Vec<_>>();
         let name = fleet.names.get(i).cloned().unwrap_or_default();
         q.drop(i);
         for m in replies {
+            fleet.kind = to_owner_kind(&m);
             let acts = fleet.owner_does(|o| o.heard(&name, m, now));
             fleet.carry(acts, now);
         }
@@ -426,6 +474,7 @@ fn main() -> ExitCode {
     }
     q.over = 0;
     q.refused = 0;
+    fleet.prof.clear();
     let steps = usize::try_from(a.steps).unwrap_or(0);
     let (mut critical, mut owner, mut total) = (Vec::with_capacity(steps), Vec::with_capacity(steps), Vec::with_capacity(steps));
     let mut messages = 0u64;
@@ -458,5 +507,10 @@ fn main() -> ExitCode {
     report(&a, "critical", k, fleet.overhead, &critical, &q, per, raw("critical"));
     report(&a, "owner", k, fleet.overhead, &owner, &q, per, raw("owner"));
     report(&a, "total", k, fleet.overhead, &total, &q, per, raw("total"));
+    if a.profile {
+        for (kind, (n, ns)) in &fleet.prof {
+            eprintln!("{kind:28} {n:>9} calls {:>9.0} ns each", *ns as f64 / (*n).max(1) as f64);
+        }
+    }
     ExitCode::SUCCESS
 }

@@ -16,7 +16,10 @@
 //! - **The first that fits**: the first in order (of one class, or of all) that fits what's free,
 //!   predicted to end within a time, and that the caller accepts ([`Line::find`]), each subtree
 //!   passed over at once when the least it asks in each dimension doesn't fit, or its shortest
-//!   predicted run is too long; a class is found by the key's order, O(log n).
+//!   predicted run is too long; a class is found by the key's order, O(log n). Which classes
+//!   have anyone waiting is a bitmask ([`Line::classes`]), so a search by class goes only to
+//!   those, the next found by its lowest bit set (find-first-set, as TLSF finds its free lists:
+//!   Masmano et al., ECRTS 2004).
 
 use super::ask::{Amounts, DIMS, fits};
 use crate::sched::state::LEVELS;
@@ -143,12 +146,20 @@ pub struct Line {
     nodes: Vec<Node>,
     spare: Vec<u32>,
     root: u32,
+    /// How many wait of each class, and a bit for each class with any (classes from 64 on share
+    /// the last bit).
+    per_class: Vec<u32>,
+    mask: u64,
 }
 
 impl Default for Line {
     fn default() -> Self {
-        Line { nodes: Vec::new(), spare: Vec::new(), root: NIL }
+        Line { nodes: Vec::new(), spare: Vec::new(), root: NIL, per_class: Vec::new(), mask: 0 }
     }
+}
+
+fn class_bit(c: u8) -> u64 {
+    1u64 << u32::from(c).min(63)
 }
 
 fn ix(t: u32) -> usize {
@@ -243,6 +254,30 @@ impl Line {
         let (a, b) = self.split(root, &key);
         let left = self.merge(a, t);
         self.root = self.merge(left, b);
+        let c = usize::from(key.class);
+        if self.per_class.len() <= c {
+            self.per_class.resize(c + 1, 0);
+        }
+        if let Some(n) = self.per_class.get_mut(c) {
+            *n = n.saturating_add(1);
+        }
+        self.mask |= class_bit(key.class);
+    }
+
+    /// The classes with anyone waiting: bit `c` for class `c` (from 63 on, bit 63).
+    pub fn classes(&self) -> u64 {
+        self.mask
+    }
+
+    fn left_class(&mut self, class: u8) {
+        let c = usize::from(class);
+        if let Some(n) = self.per_class.get_mut(c) {
+            *n = n.saturating_sub(1);
+        }
+        let any = if class >= 63 { self.per_class.iter().skip(63).any(|n| *n > 0) } else { self.per_class.get(c).is_some_and(|n| *n > 0) };
+        if !any {
+            self.mask &= !class_bit(class);
+        }
     }
 
     /// Whether `key` is in it.
@@ -284,7 +319,44 @@ impl Line {
         let mut found = false;
         let root = self.root;
         self.root = self.erase(root, key, &mut found);
+        if found {
+            self.left_class(key.class);
+        }
         found
+    }
+
+    /// The sums over every entry.
+    pub fn all(&self) -> Sums {
+        self.sums(self.root)
+    }
+
+    /// The first entry from `from` on at which `ok` holds of what's summed from `from` to it, both
+    /// included (`count`, `work` and `untimed` of the sums; the rest is left as it is for the
+    /// whole prefix): its key. `ok` must hold of every longer run from `from` once it holds of one.
+    /// O(log n), as the descent of a key is.
+    pub fn first_from(&self, from: &Key, ok: &mut dyn FnMut(&Sums) -> bool) -> Option<Key> {
+        let base = self.ahead(from);
+        let less = |a: &Sums| {
+            let mut d = *a;
+            d.count = a.count.saturating_sub(base.count);
+            d.untimed = a.untimed.saturating_sub(base.untimed);
+            for (w, b) in d.work.iter_mut().zip(&base.work) {
+                *w = w.saturating_sub(*b);
+            }
+            d
+        };
+        let (mut acc, mut best, mut t) = (Sums::NONE, None, self.root);
+        while let Some(n) = self.nodes.get(ix(t)) {
+            let through = acc.with(&self.sums(n.left)).with(&n.own);
+            if n.key >= *from && ok(&less(&through)) {
+                best = Some(n.key);
+                t = n.left;
+            } else {
+                acc = through;
+                t = n.right;
+            }
+        }
+        best
     }
 
     /// How many come before `key`.
@@ -483,6 +555,16 @@ mod tests {
                 for c in 0..3u8 {
                     prop_assert_eq!(l.count_of(c), u32::try_from(m.keys().filter(|k| k.class == c).count()).unwrap_or(0));
                 }
+                // P6: the first entry from a key on at which the count from it reaches 3 (a monotone
+                // test), as a scan finds it.
+                if let Some(from) = m.keys().next().copied() {
+                    let want = m.range(from..).nth(2).map(|(k, _)| *k);
+                    prop_assert_eq!(l.first_from(&from, &mut |s| s.count >= 3), want);
+                    let cpu_want = m.range(from..).scan(0u64, |acc, (k, i)| { *acc += i.ask[0] * i.predicted.unwrap_or(0); Some((*k, *acc)) }).find(|(_, a)| *a >= 20).map(|(k, _)| k);
+                    prop_assert_eq!(l.first_from(&from, &mut |s| s.work[0] >= 20), cpu_want);
+                }
+                // P6: the classes' mask is the classes waiting.
+                prop_assert_eq!(l.classes(), m.keys().fold(0u64, |acc, k| acc | (1u64 << k.class)));
                 for (n, (k, _)) in entries.iter().enumerate() {
                     prop_assert_eq!(l.rank(k), u32::try_from(n).unwrap_or(0));
                     prop_assert_eq!(l.select(u32::try_from(n).unwrap_or(0)).map(|(k2, _)| k2), Some(*k));
