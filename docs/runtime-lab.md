@@ -286,7 +286,7 @@ folder `<round>.hook`, kept when the round's kiln is removed): `scripts/shard_la
 record the server over the window.
 
 `--bus-memory <bytes>` writes `[bus] memory` into the kiln.toml each round's server starts with
-(kiln's default otherwise, 256 MiB), so a run measures the bus past its default (goal 11 below).
+(kiln's default otherwise, 171 MiB), so a run measures the bus past its default (goal 11 below).
 
 A new build against main's baseline is an `ab` of the two on one machine, not a `compare` with the
 files below: they hold the baseline's numbers and machine, which another machine (or this one under
@@ -1270,7 +1270,7 @@ past the count).
 | `cd_inputs` | what the deployments engine is told and hasn't taken: clusters' lists, watch events and apply answers, renders, people's and the source poll's word, each object as serde_json keeps it | 256 MiB | one answer of a cluster's API server as kiln reads it at the most (`cd::kube::BODY_LIMIT`), which most of its inputs are | the sender waits as a task: a watch stops reading its stream (the API server holds what follows), a render or answer waits to be handed in, a request waits its turn; the poll's and a rollback's inputs wait for room before the gate that keeps them in order, so none is past it |
 | `cd_actions` | what the deployments engine asked for and its dispatcher hasn't taken: applies (each its object), deletes, renders, watches, statuses, records | 256 MiB | as much as its inputs, which what it asks for is made of (an apply's object is a render's) | the engine's thread waits (its own, not the runtime's), and its inputs behind it |
 | `log_lines` | kiln's log lines waiting for the thread that writes them (`log_lines`; goal 9 step 3: a server's and a runner's) | 10,000 lines and 64 MiB | journald's burst (`RateLimitBurst`, journald.conf(5): past it journald drops a service's lines itself), and the bytes observe keeps waiting of a source's log (`WAITING_LOG_BYTES`) | let go, counted (`kiln_log_lines_dropped_total`), and said as the thread next writes: a shard that logs never waits for the log's reader |
-| `bus` | the bus's retained messages (`kiln_bus_memory_bytes`), each topic's as its retention asks (`kiln_bus_topic_bytes_peak`, the largest since start) | `[bus] memory`, 256 MiB; a topic `[bus] topic_bytes`, 16 MiB | none yet: the lab's scripts measure both (below) | a topic lets its oldest go; one it can't make room for is refused and its viewers start over |
+| `bus` | the bus's retained messages (`kiln_bus_memory_bytes`), each topic's as its retention asks (`kiln_bus_topic_bytes_peak`, the largest since start) | what its topics and subscriptions can hold (`QuiverBus::bound`: about 6.6 MB a feed), at most `[bus] memory`, 171 MiB; a topic `[bus] topic_bytes`, 5 MiB | the bus lab (below): its most for each topic held, 1,327,754 B, for production's 134 sessions every one watched; its largest topic, 3,672,418 B; each with room for one more of the largest message | a topic lets its oldest go; one it can't make room for is refused and its viewers start over |
 | `session_segments` | sealed chunks' segments kept in memory: each copy's among its newest 100 events (`copies::EVENTS_PAGE`, the events API's page without a `limit`), and those on their way to its spill | `copies::PAGE_BYTES` for each copy: 2 x 70 x 647 B, 90,580 B (~91 KB) | two chunks (`CHUNK`, 70 events) at the most hold the newest page beside the open chunk; 647 B an event packed (research f20) | the rest are spilled to the copy's spill file (`harness::spill`, below): a snapshot reads them back on the blocking pool, the events API a spilled range from the store; past the bytes, the newest page's chunks spill too |
 | (on disk) `kiln_session_spill_bytes` | the copies' spilled segments: `live` (still referred to) and `file` (the spill files whole) | `file` at most `live` and as much again | a copy starts a new file once its file's dead bytes (chunks let go of) pass its live ones; a file goes once no chunk refers to it | a write the disk refuses leaves the chunks in memory (`kiln_session_spill_failures_total{op="write"}`); one that doesn't read back as written is refused (`op="read"`), a snapshot then reading those events from the conversation store |
 
@@ -1297,27 +1297,54 @@ own) and starts before the apps kept are registered, so the engine always goes o
 
 ### Measuring the bus's bound
 
-The bus's `[bus] memory` (256 MiB) and `topic_bytes` (16 MiB) have no measurement behind them. A lab run
-samples the bus each second of every round (its bytes, limit, frames, refusals and lag notices, its largest
-topic, every memory owner, the resident memory by kind) through a `KILN_LAB_HOOK`, 8 rounds calm and 8 with
-hogs in production's layout, each round's server started with `--bus-memory` 1 GiB: twice what the
-realistic profile's 32 sessions' topics may keep at `topic_bytes` each, the rest for Quiver's framing and
-the segments readers still hold, so no round reaches it and the peaks are the load's, past 256 MiB if it
-needs that. Each topic's bytes come from its feed (`crate::harness::live`): as it publishes, it counts its
-topic's newest 2048 frames by their keys and payloads, as `topic_bytes` counts them, whether or not
-`topic_bytes` lets the bus keep them all, and raises `kiln_bus_topic_bytes_peak`; Quiver's own count of a
-topic isn't something kiln can ask it. The bounds it derives:
+The bus's `[bus] memory` (256 MiB until goal 11) and `topic_bytes` (16 MiB) had no measurement behind them.
 
-- `[bus] memory`: the largest peak, with room for one more of Quiver's largest messages (1,083,392 B),
-  never below the floor (2,166,784 B), rounded up to a MiB; proposed only when no round refused frames,
-  sent lag notices, or came within that message of its limit.
-- `[bus] topic_bytes`: the largest topic, with room for one more of the largest message a topic takes
-  (1 MiB of payload), never below it (Quiver refuses a message larger than `topic_bytes`), rounded up to a
-  MiB; a topic that asked for more than today's 16 MiB is said (its viewers fell behind after fewer than
-  2048 frames).
+**How it's measured.**
+- A lab run samples the bus each second of every round through a `KILN_LAB_HOOK`: its bytes, limit, topics,
+  frames, refusals and lag notices, its largest topic, every memory owner, and the resident memory by kind.
+- It runs 8 rounds calm and 8 with hogs, in production's layout. Each round's server starts with
+  `--bus-memory` 1 GiB: twice what the realistic profile's 32 sessions' topics could keep at 16 MiB each,
+  the rest for Quiver's framing and the segments readers still hold. So no round reaches the limit, and the
+  peaks are what the load needs.
+- Each topic's bytes come from its feed (`crate::harness::live`). As it publishes, the feed counts its topic's
+  newest 2048 frames by their keys and payloads, as `topic_bytes` counts them, whether or not `topic_bytes`
+  lets the bus keep them all, and raises `kiln_bus_topic_bytes_peak`. Kiln can't ask Quiver for its own count
+  of a topic.
 
-Its scripts (`bus-lab.sh`, `bus-hook.sh`, `bus-summary.py`) come with goal 11's step 3 hand-overs, to go
-under `scripts/memory_lab/` with their first run.
+**The run.** bus6 ran on fedora on 2026-11-05, of rt6's tree (`705fb481bfb`), with the realistic profile.
+No round refused a frame or sent a lag notice.
+
+| | calm | hogs |
+| --- | --- | --- |
+| the bus's peak, MB (window) | 9.29 to 11.94 | 9.26 to 12.16 |
+| its largest topic, MB | 2.61 to 3.66 | 2.55 to 3.67 |
+| topics at the most | 10 to 11 | 10 to 11 |
+| frames a round | 9,781 to 10,201 | 9,988 to 11,238 |
+
+- The busiest second held 12,157,694 B for 11 topics.
+- The most it held for each topic it held, at any second, was 1,327,754 B: 10,622,030 B for 8 topics, in the
+  hogs round 2.
+- The largest topic asked for 3,672,418 B.
+
+**What it gives** (`crate::bus`, derived there from these figures):
+- `[bus] topic_bytes` is 5 MiB. That's the largest topic, with room for one more of the largest message a
+  topic takes (1 MiB of payload), never below that message (Quiver refuses a message larger than
+  `topic_bytes`), and rounded up to a MiB.
+- `[bus] memory` is 171 MiB (179,306,496 B). That's the most for each topic held, times production's 134
+  sessions every one watched, with room for one more of Quiver's largest messages (1,083,392 B), never below
+  the floor (2,166,784 B), and rounded up to a MiB.
+  - The lab's own peak with that message, 13 MiB, holds its 11 topics. Those are the realistic profile's 32
+    sessions at a busy hour, not production's 134.
+  - Quiver fixes a node's memory when it's made, so the limit can't follow the topics a server holds. Rather,
+    what the bus can hold follows them: each topic is held to `topic_bytes`.
+  - `/metrics` gives that as `kiln_memory_bound_bytes{owner="bus"}`, capped at the limit. For each topic it's
+    the topic's kept messages and their framing, its oldest segment let go, and a message being taken: about
+    6.6 MB at the defaults. For each subscription it's a segment and a message. A server watching few sessions
+    is bound by those.
+
+The scripts are under `scripts/memory_lab/`: `bus-lab.sh` runs the rounds, `bus-hook.sh` samples them, and
+`bus-summary.py` gives the table and these bounds. The summary's `TOPICS` (134 by default) is the topics
+`[bus] memory` is reckoned for.
 
 ### The allocator (step 4)
 
